@@ -1,0 +1,1 @@
+REDUNDANCY_BATCH_SIZE_FACTOR = 3  # 应该最好是质数吗？
