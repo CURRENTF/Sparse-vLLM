@@ -1,19 +1,4 @@
-# DeltaKV
-
-DeltaKV is a method for **compressing the KV cache** to enable more efficient long-context inference for Transformer LLMs.
-This repository contains:
-
-- Training code for a KV compressor (Hugging Face + Accelerate/DeepSpeed).
-- Inference / benchmarking utilities (LongBench, throughput micro-benchmarks).
-- A lightweight inference framework (`sparsevllm`).
-
-
-## Highlights
-
-- **Trainable KV compressor**: freezes the base model and trains only compression-related modules.
-- **Architecture support**: Llama-family and Qwen2-family.
-- **Benchmarks included**: LongBench + SCBench + AIME + throughput scripts (see `benchmark/` and `scripts/`).
-- **Sparse-vLLM backend**: a sparse-first inference engine with a modular cache system designed for physical eviction, logical masking, and hybrid compression.
+# Sparse-vLLM & DeltaKV
 
 ## Sparse-vLLM (Sparse-first Inference Backend)
 
@@ -71,6 +56,23 @@ Sparse-vLLM includes kernel-side optimizations to keep the sparse/compress loop 
   - fused reconstruction that combines gathering references, mean computation, and residual addition to reduce bandwidth.
 
 You can benchmark Sparse-vLLM-based methods via `scripts/bench_sparse_vllm.py` (see examples below).
+
+## DeltaKV
+
+DeltaKV is a method for **compressing the KV cache** to enable more efficient long-context inference for Transformer LLMs.
+This repository contains:
+
+- Training code for a KV compressor (Hugging Face + Accelerate/DeepSpeed).
+- Inference / benchmarking utilities (LongBench, throughput micro-benchmarks).
+- A lightweight inference framework (`sparsevllm`).
+
+
+## Highlights
+
+- **Trainable KV compressor**: freezes the base model and trains only compression-related modules.
+- **Architecture support**: Llama-family and Qwen2-family.
+- **Benchmarks included**: LongBench + SCBench + AIME + throughput scripts (see `benchmark/` and `scripts/`).
+- **Sparse-vLLM backend**: a sparse-first inference engine with a modular cache system designed for physical eviction, logical masking, and hybrid compression.
 
 ## Repository layout
 
