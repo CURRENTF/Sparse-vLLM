@@ -1,5 +1,7 @@
 # Sparse-vLLM & DeltaKV
 
+**Model checkpoints, datasets, and papers are all about to be uploaded.**
+
 ## Sparse-vLLM (Sparse-first Inference Framework)
 
 Sparse-vLLM (implemented in `src/sparsevllm/`) is an inference framework built with **sparsity as the first design principle**.
