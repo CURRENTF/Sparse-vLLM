@@ -1,8 +1,8 @@
 # Sparse-vLLM & DeltaKV
 
-## Sparse-vLLM (Sparse-first Inference Backend)
+## Sparse-vLLM (Sparse-first Inference Framework)
 
-Sparse-vLLM (implemented in `src/sparsevllm/`) is an inference backend built with **sparsity as the first design principle**.
+Sparse-vLLM (implemented in `src/sparsevllm/`) is an inference framework built with **sparsity as the first design principle**.
 Instead of layering sparse methods onto a conventional KV cache, it rethinks the cache layout, controller flow, and kernels to make diverse sparse mechanisms plug in cleanly and run efficiently.
 
 ### CacheManager: extensible cache data layouts
@@ -72,7 +72,7 @@ This repository contains:
 - **Trainable KV compressor**: freezes the base model and trains only compression-related modules.
 - **Architecture support**: Llama-family and Qwen2-family.
 - **Benchmarks included**: LongBench + SCBench + AIME + throughput scripts (see `benchmark/` and `scripts/`).
-- **Sparse-vLLM backend**: a sparse-first inference engine with a modular cache system designed for physical eviction, logical masking, and hybrid compression.
+- **Sparse-vLLM Inference Framework**: a sparse-first inference engine with a modular cache system designed for physical eviction, logical masking, and hybrid compression.
 
 ## Repository layout
 
