@@ -14,14 +14,13 @@ This repo is primarily a **sparse-first inference engine** (`sparsevllm`). It al
     - [Key parameters](#key-parameters)
     - [Supported methods](#supported-methods)
   - [How to test](#how-to-test)
-    - [Correctness sanity check](#correctness-sanity-check)
     - [Throughput benchmark](#throughput-benchmark)
   - [Codebase tour (file-by-file)](#codebase-tour-file-by-file)
     - [Top-level](#top-level)
     - [Sparse-vLLM (`src/sparsevllm/`)](#sparse-vllm-srcsparsevllm)
     - [Benchmarks / scripts](#benchmarks--scripts)
     - [`scripts/` file guide](#scripts-file-guide)
-  - [DeltaKV (optional / experimental)](#deltakv-optional--experimental)
+  - [DeltaKV](#deltakv)
     - [DeltaKV code layout](#deltakv-code-layout)
     - [DeltaKV inference](#deltakv-inference)
     - [Train a compressor](#train-a-compressor)
@@ -43,6 +42,8 @@ At a high level, Sparse-vLLM supports:
 - **Logical masking** (e.g., OmniKV): tokens remain in storage but are masked at the attention level.
 - **Hybrid approaches** (DeltaKV): keep a small high-precision pool + store older tokens in a compressed pool (optional/experimental).
 
+后面会继续支持更多稀疏方法，CacheManager这种模块化设计使得单独支持稀疏方法简单且高效。
+
 ### Install
 
 ```bash
@@ -56,6 +57,8 @@ pip install -e .
 
 ### Minimal usage
 
+
+这个地方给的example可以用omnikv
 ```python
 from sparsevllm import LLM, SamplingParams
 
@@ -104,28 +107,9 @@ Set `vllm_sparse_method` to one of:
 - `"snapkv"`, `"pyramidkv"` (physical eviction)
 - `"omnikv"` (logical masking)
 
-DeltaKV-related methods exist, but are treated as **optional / experimental** in this README (see [DeltaKV](#deltakv-optional--experimental)).
+deltakv是支持的，这里可以写一下，但是标注一下还在实验中
 
 ## How to test
-
-### Correctness sanity check
-
-This runs a few end-to-end generation checks (batching isolation, long generation stability, batch consistency):
-
-```bash
-python scripts/test_sparse_vllm_correctness.py \
-  --model_path <PATH_TO_BASE_MODEL> \
-  --tp 1 \
-  --vllm_sparse_method ""
-```
-
-Try other methods:
-
-```bash
-python scripts/test_sparse_vllm_correctness.py --model_path <PATH_TO_BASE_MODEL> --tp 1 --vllm_sparse_method snapkv
-python scripts/test_sparse_vllm_correctness.py --model_path <PATH_TO_BASE_MODEL> --tp 1 --vllm_sparse_method omnikv
-python scripts/test_sparse_vllm_correctness.py --model_path <PATH_TO_BASE_MODEL> --tp 1 --vllm_sparse_method pyramidkv
-```
 
 ### Throughput benchmark
 
@@ -223,7 +207,7 @@ If you want to understand the repo by reading code, a good order is:
 | `scripts/_exp_lst.py` | OmniKV experiment list/config (currently placeholder) |
 | `scripts/run_llama_ablation.sh` | Shell script to run Llama ablations |
 
-## DeltaKV (optional / experimental)
+## DeltaKV
 
 DeltaKV is a method for **compressing the KV cache** to enable more efficient long-context inference for Transformer LLMs.
 This repo includes DeltaKV compressor training code and some inference/benchmark integrations, but DeltaKV-specific
