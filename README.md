@@ -31,6 +31,7 @@ This repo is primarily a **sparse-first inference engine** (`sparsevllm`). It al
     - [`SamplingParams` does not allow greedy decoding](#samplingparams-does-not-allow-greedy-decoding)
     - [`Mixed long/short batch detected`](#mixed-longshort-batch-detected)
     - [`Insufficient KV cache slots to admit prompt`](#insufficient-kv-cache-slots-to-admit-prompt)
+  - [Acknowledgements](#acknowledgements)
 
 ## Sparse-vLLM
 
@@ -42,7 +43,8 @@ At a high level, Sparse-vLLM supports:
 - **Logical masking** (e.g., OmniKV): tokens remain in storage but are masked at the attention level.
 - **Hybrid approaches** (DeltaKV): keep a small high-precision pool + store older tokens in a compressed pool (optional/experimental).
 
-后面会继续支持更多稀疏方法，CacheManager这种模块化设计使得单独支持稀疏方法简单且高效。
+More sparse methods can be added over time. The modular `CacheManager` design keeps it straightforward to integrate new
+methods efficiently without rewriting the whole engine.
 
 ### Install
 
@@ -57,17 +59,20 @@ pip install -e .
 
 ### Minimal usage
 
-
-这个地方给的example可以用omnikv
 ```python
 from sparsevllm import LLM, SamplingParams
 
 llm = LLM(
-    "/path/to/base_model",
+    "/path/to/Qwen2.5-7B-Instruct-1M",
     tensor_parallel_size=1,
     gpu_memory_utilization=0.8,
-    chunk_prefill_size=8192,
-    vllm_sparse_method="",
+    chunk_prefill_size=4096,
+    vllm_sparse_method="omnikv",
+    # OmniKV knobs (simple baseline; tune as needed)
+    full_attn_layers="0,1,2,4,7,14",  # layers that run full attention (must include layer 0)
+    num_top_tokens=2096,  # top-K tokens kept for sparse layers
+    num_top_tokens_in_prefill=8192,  # top-K during prefill (defaults to num_top_tokens)
+    chunk_prefill_accel_omnikv=False,  # disable OmniKV chunk-prefill acceleration for easier comparisons
 )
 
 outputs = llm.generate(
@@ -106,8 +111,7 @@ Set `vllm_sparse_method` to one of:
 - `""` (vanilla / full attention)
 - `"snapkv"`, `"pyramidkv"` (physical eviction)
 - `"omnikv"` (logical masking)
-
-deltakv是支持的，这里可以写一下，但是标注一下还在实验中
+- `"deltakv"` / `"deltakv-*"` (hybrid compression; optional / experimental, see [DeltaKV](#deltakv))
 
 ## How to test
 
@@ -338,3 +342,11 @@ Try one or more of:
 - Increase `gpu_memory_utilization`.
 - Reduce `max_model_len`, `batch_sizes`, or prompt length.
 - Reduce `num_recent_tokens` / `num_top_tokens` / `num_sink_tokens` for long-context methods.
+
+## Acknowledgements
+
+This project is inspired by and/or references ideas and implementation techniques from:
+
+- `LightLLM` (`ModelTC/LightLLM`)
+- `ShadowKV` (`ByteDance-Seed/ShadowKV`)
+- `nano-vllm` (`GeeeekExplorer/nano-vllm`)
