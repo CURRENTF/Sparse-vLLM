@@ -1,14 +1,23 @@
-# Sparse-vLLM (with optional DeltaKV)
+# Sparse-vLLM
 
-**Model checkpoints, datasets, and papers are all about to be uploaded.**
+<p align="center">
+  <a href="https://arxiv.org/abs/2602.08005">
+    <img src="https://img.shields.io/badge/arXiv-2602.08005-b31b1b.svg" alt="arXiv">
+  </a>
+  <a href="https://arxiv.org/pdf/2602.08005.pdf">
+    <img src="https://img.shields.io/badge/PDF-download-brightgreen.svg" alt="PDF">
+  </a>
+</p>
+
+**Model checkpoints and datasets are all about to be uploaded.**
 
 This repo is primarily a **sparse-first inference engine** (`sparsevllm`). It also contains DeltaKV compressor training + evaluation tooling (`deltakv`).
 
 ## Contents
 
-- [Sparse-vLLM (with optional DeltaKV)](#sparse-vllm-with-optional-deltakv)
+- [Sparse-vLLM](#sparse-vllm)
   - [Contents](#contents)
-  - [Sparse-vLLM](#sparse-vllm)
+  - [Sparse-vLLM](#sparse-vllm-1)
     - [Install](#install)
     - [Minimal usage](#minimal-usage)
     - [Key parameters](#key-parameters)
@@ -32,6 +41,7 @@ This repo is primarily a **sparse-first inference engine** (`sparsevllm`). It al
     - [`Mixed long/short batch detected`](#mixed-longshort-batch-detected)
     - [`Insufficient KV cache slots to admit prompt`](#insufficient-kv-cache-slots-to-admit-prompt)
   - [Acknowledgements](#acknowledgements)
+- [Citation](#citation)
 
 ## Sparse-vLLM
 
@@ -350,3 +360,22 @@ This project is inspired by and/or references ideas and implementation technique
 - `LightLLM` (`ModelTC/LightLLM`)
 - `ShadowKV` (`ByteDance-Seed/ShadowKV`)
 - `nano-vllm` (`GeeeekExplorer/nano-vllm`)
+
+
+# Citation
+```text
+
+@article{hao2026deltakv,
+  title={DeltaKV: Residual-Based KV Cache Compression via Long-Range Similarity},
+  author={Hao, Jitai and Huang, Qiang and Wang, Yaowei and Zhang, Min and Yu, Jun},
+  journal={arXiv preprint arXiv:2602.08005},
+  year={2026}
+}
+
+@inproceedings{hao2025omnikv,
+  title={Omnikv: Dynamic context selection for efficient long-context llms},
+  author={Hao, Jitai and Zhu, Yuke and Wang, Tian and Yu, Jun and Xin, Xin and Zheng, Bo and Ren, Zhaochun and Guo, Sheng},
+  booktitle={The Thirteenth International Conference on Learning Representations},
+  year={2025}
+}
+```
