@@ -364,7 +364,6 @@ This project is inspired by and/or references ideas and implementation technique
 
 # Citation
 ```text
-
 @article{hao2026deltakv,
   title={DeltaKV: Residual-Based KV Cache Compression via Long-Range Similarity},
   author={Hao, Jitai and Huang, Qiang and Wang, Yaowei and Zhang, Min and Yu, Jun},
