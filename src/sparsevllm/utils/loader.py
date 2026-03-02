@@ -254,10 +254,25 @@ def load_deltakv_compressors_to_cache_manager(cache_manager, path: str):
     print(f"Successfully loaded {loaded_count} DeltaKV compressor weights into cache manager from {path}")
 
 
-def load_model(model: nn.Module, path: str):
+def load_model(model: nn.Module, path: str, *, rank: int | None = None, world_size: int | None = None):
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
-    files = glob(os.path.join(path, "*.safetensors"))
+    files = sorted(glob(os.path.join(path, "*.safetensors")))
     assert len(files) > 0, f"No safetensors found in {path}"
+
+    # DeepSeek official converters often emit one file per rank:
+    #   model{rank}-mp{world_size}.safetensors
+    # In that case we should only load the local rank shard.
+    if rank is not None and world_size is not None:
+        shard = os.path.join(path, f"model{rank}-mp{world_size}.safetensors")
+        if os.path.isfile(shard):
+            files = [shard]
+        else:
+            mp_files = sorted(glob(os.path.join(path, f"model*-mp{world_size}.safetensors")))
+            if mp_files:
+                raise FileNotFoundError(
+                    "Detected per-rank weight shards but missing expected shard for this rank. "
+                    f"expected={shard} available={mp_files}"
+                )
     
     loaded_count = 0
     for file in files:

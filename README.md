@@ -151,7 +151,7 @@ If you want to understand the repo by reading code, a good order is:
 
 1. `src/sparsevllm/engine/llm_engine.py`: engine entrypoint (public API + main loop)
 2. `src/sparsevllm/engine/model_runner.py`: per-GPU-rank runner (load weights, allocate KV, run forward)
-3. `src/sparsevllm/engine/cache_manager.py`: KV cache allocation/layout/free (method-specific implementations live here)
+3. `src/sparsevllm/engine/cache_manager/`: KV cache allocation/layout/free (method-specific implementations live here)
 4. `src/sparsevllm/engine/sparse_controller.py`: sparse policy/controller (what to read/reconstruct/evict and when)
 5. `src/sparsevllm/layers/attention.py` + `src/sparsevllm/triton_kernel/`: attention integration + kernels
 
@@ -178,7 +178,7 @@ If you want to understand the repo by reading code, a good order is:
 | `src/sparsevllm/engine/model_runner.py` | Per-TP-rank runner: NCCL init, load weight shards, create `CacheManager` + `SparseController`, run forward + sampling |
 | `src/sparsevllm/engine/scheduler.py` | Scheduler: waiting/decoding queues, chunked prefill, long/short batch separation, preemption/rollback under memory pressure |
 | `src/sparsevllm/engine/sequence.py` | `Sequence`: per-request state machine (prompt/prefill progress/generated tokens/finish criteria) |
-| `src/sparsevllm/engine/cache_manager.py` | KV cache managers: Standard / SnapKV / OmniKV / PyramidKV / (optional DeltaKV variants) |
+| `src/sparsevllm/engine/cache_manager/` | KV cache managers: Standard / SnapKV / OmniKV / PyramidKV / (optional DeltaKV variants) |
 | `src/sparsevllm/engine/sparse_controller.py` | Sparse controller: builds per-layer read-view, aggregates attention scores, triggers eviction/reconstruction |
 | `src/sparsevllm/models/qwen2.py` | Qwen2 inference model wiring (custom layers/kernels + sparse controller integration) |
 | `src/sparsevllm/models/qwen3.py` | Qwen3 inference model wiring |

@@ -9,6 +9,7 @@ from sparsevllm.config import Config
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.models.qwen2 import Qwen2ForCausalLM
 from sparsevllm.models.qwen3 import Qwen3ForCausalLM
+from sparsevllm.models.deepseek_v32 import DeepSeekV32ForCausalLM
 from sparsevllm.layers.sampler import Sampler
 from sparsevllm.utils.context import set_context, get_context, reset_context
 from sparsevllm.utils.loader import load_model
@@ -48,9 +49,15 @@ class ModelRunner:
         # 加载对应的模型分片 (Shards)
         if hf_config.model_type == "qwen2":
             self.model = Qwen2ForCausalLM(hf_config)
+        elif hf_config.model_type == "deepseek_v32":
+            self.model = DeepSeekV32ForCausalLM(
+                hf_config,
+                dsa_topk=config.dsa_topk,
+                use_flash_mla=config.dsa_use_flash_mla,
+            )
         else:
             self.model = Qwen3ForCausalLM(hf_config)
-        load_model(self.model, config.model)
+        load_model(self.model, config.model, rank=rank, world_size=self.world_size)
         
         self.sampler = Sampler()
         
@@ -59,9 +66,10 @@ class ModelRunner:
 
         # 初始化稀疏控制器
         self.sparse_controller = SparseController(config, self.cache_manager)
-        # 注入模型
-        self.model.model.sparse_controller = self.sparse_controller
-        self.sparse_controller.set_modules(self.model.model.layers)
+        # 注入模型 (Qwen-style models only; DeepSeek MLA does not use SparseController callbacks)
+        if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
+            self.model.model.sparse_controller = self.sparse_controller
+            self.sparse_controller.set_modules(self.model.model.layers)
 
         # 加载 DeltaKV 压缩器
         self.load_deltakv_compressors()

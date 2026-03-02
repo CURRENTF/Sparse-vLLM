@@ -2,7 +2,7 @@ from dataclasses import dataclass
 import torch
 from sparsevllm.config import Config
 from sparsevllm.engine.sequence import Sequence
-from sparsevllm.engine.cache_manager import CacheManager, DeltaKVCacheManager
+from sparsevllm.engine.cache_manager import CacheManager
 from sparsevllm.utils.profiler import profiler
 from sparsevllm.utils.context import get_context
 from sparsevllm.utils.log import logger, log_level

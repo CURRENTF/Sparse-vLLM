@@ -1,5 +1,8 @@
 import os
+import json
 from dataclasses import dataclass
+from types import SimpleNamespace
+import torch
 from transformers import AutoConfig, Qwen3Config
 from typing import Union
 from sparsevllm.utils.log import logger
@@ -22,7 +25,7 @@ class Config:
     num_kvcache_slots: int | list = -1
 
     # Sparse Attention Config
-    vllm_sparse_method: str = ""  # "", "snapkv", "omnikv", "deltakv", "deltakv-triton", "deltakv-triton-v2", "deltakv-triton-v3", "deltakv-triton-v4", "deltakv-triton-v3-offload", "deltakv-triton-v3-cuda-offload", "pyramidkv"
+    vllm_sparse_method: str = ""  # "", "snapkv", "omnikv", "deltakv", "deltakv-triton", "deltakv-triton-v2", "deltakv-triton-v3", "deltakv-triton-v4", "deltakv-triton-v3-offload", "deltakv-triton-v3-cuda-offload", "pyramidkv", "dsa"
 
     # General Sparse Config
     num_sink_tokens: int = 64
@@ -82,6 +85,18 @@ class Config:
     # Triton kernels: group multiple KV heads per program to reduce redundant loads.
     deltakv_triton_gather_heads_per_program: int = 4
     deltakv_triton_reconstruct_heads_per_program: int = 4
+
+    # --- DeepSeek Sparse Attention (DSA) / FlashMLA knobs (optional) ---
+    # NOTE: These are primarily for DeepSeek-V3.2 style DSA, which uses a Lightning Indexer
+    # to select top-k KV entries per query token, and then runs sparse attention kernels.
+    dsa_topk: int = 2048
+    dsa_index_n_heads: int = 64
+    dsa_index_head_dim: int = 128
+    # DeepSeek-V3.2 uses YARN-style RoPE scaling in their public inference code.
+    dsa_rope_factor: float = 40.0
+    dsa_original_seq_len: int = 4096
+    # Use FlashMLA kernels when available; otherwise fall back to a (slow) torch path.
+    dsa_use_flash_mla: bool = True
     
     enable_profiler: bool = False
     throughput_log_interval_s: float = 10.0
@@ -99,7 +114,36 @@ class Config:
 
         assert os.path.isdir(self.model)
         assert 1 <= self.tensor_parallel_size <= 8
-        self.hf_config = AutoConfig.from_pretrained(self.model)
+        try:
+            # `trust_remote_code=True` keeps DeepSeek-like configs usable when the local model
+            # folder vendors config/modeling files.
+            self.hf_config = AutoConfig.from_pretrained(self.model, trust_remote_code=True)
+        except Exception as e:
+            # Fallback for configs not registered in this transformers version.
+            cfg_path = os.path.join(self.model, "config.json")
+            logger.warning(
+                "AutoConfig.from_pretrained failed; falling back to config.json. "
+                f"error={type(e).__name__}: {e} path={cfg_path}"
+            )
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            td = cfg.get("torch_dtype", None)
+            if isinstance(td, str):
+                td_l = td.lower()
+                if td_l in ("bfloat16", "bf16"):
+                    cfg["torch_dtype"] = torch.bfloat16
+                elif td_l in ("float16", "fp16", "half"):
+                    cfg["torch_dtype"] = torch.float16
+                elif td_l in ("float32", "fp32"):
+                    cfg["torch_dtype"] = torch.float32
+            if cfg.get("torch_dtype", None) is None:
+                cfg["torch_dtype"] = torch.bfloat16
+            self.hf_config = SimpleNamespace(**cfg)
+
+        # DeepSeek-V3.2 defaults: keep engine-side DSA knobs aligned unless explicitly set.
+        if getattr(self.hf_config, "model_type", "") == "deepseek_v32":
+            if self.dsa_topk == 2048 and hasattr(self.hf_config, "index_topk"):
+                self.dsa_topk = int(self.hf_config.index_topk)
         if self.max_model_len > self.hf_config.max_position_embeddings:
             logger.warning('max_model_len > model.max_position_embeddings 输出可能不正常')
             self.hf_config.max_position_embeddings = self.max_model_len
