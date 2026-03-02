@@ -187,6 +187,13 @@ class LLMEngine:
         
         # 预热 1 个 Token 的生成（包含 Prefill 和 Decode）
         sampling_params = SamplingParams(max_tokens=1)
+        max_prompt_len = max(1, int(self.config.max_model_len) - int(sampling_params.max_tokens))
+        if warmup_len > max_prompt_len:
+            logger.warning(
+                f"Warmup prompt length ({warmup_len}) exceeds max_model_len - max_tokens "
+                f"({max_prompt_len}). Clamping warmup_len to {max_prompt_len}."
+            )
+            warmup_len = max_prompt_len
         dummy_prompt = [0] * warmup_len
         
         for _ in range(num_seqs):
