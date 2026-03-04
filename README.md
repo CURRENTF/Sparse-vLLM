@@ -1,6 +1,7 @@
 # Sparse-vLLM
 
 <p align="center">
+  <a href="https://deepwiki.com/CURRENTF/Sparse-vLLM"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki"></a>
   <a href="https://arxiv.org/abs/2602.08005">
     <img src="https://img.shields.io/badge/arXiv-2602.08005-b31b1b.svg" alt="arXiv">
   </a>
@@ -9,9 +10,9 @@
   </a>
 </p>
 
-**Model checkpoints and datasets are all about to be uploaded.**
-
 This repo is primarily a **sparse-first inference engine** (`sparsevllm`). It also contains DeltaKV compressor training + evaluation tooling (`deltakv`).
+
+*Model checkpoints and datasets are all about to be uploaded.*
 
 ## Contents
 
@@ -24,13 +25,7 @@ This repo is primarily a **sparse-first inference engine** (`sparsevllm`). It al
     - [Supported methods](#supported-methods)
   - [How to test](#how-to-test)
     - [Throughput benchmark](#throughput-benchmark)
-  - [Codebase tour (file-by-file)](#codebase-tour-file-by-file)
-    - [Top-level](#top-level)
-    - [Sparse-vLLM (`src/sparsevllm/`)](#sparse-vllm-srcsparsevllm)
-    - [Benchmarks / scripts](#benchmarks--scripts)
-    - [`scripts/` file guide](#scripts-file-guide)
   - [DeltaKV](#deltakv)
-    - [DeltaKV code layout](#deltakv-code-layout)
     - [DeltaKV inference](#deltakv-inference)
     - [Train a compressor](#train-a-compressor)
     - [Evaluate on LongBench](#evaluate-on-longbench)
@@ -46,6 +41,8 @@ This repo is primarily a **sparse-first inference engine** (`sparsevllm`). It al
 ## Sparse-vLLM
 
 Sparse-vLLM (implemented in `src/sparsevllm/`) is an inference framework built with **sparsity as the first design principle**. Instead of layering sparse methods on top of a conventional KV cache, it rethinks cache layout, controller flow, and kernels so that multiple sparse mechanisms can plug in cleanly.
+
+For codebase structure and file-level navigation, use the DeepWiki badge at the top of this page.
 
 At a high level, Sparse-vLLM supports:
 
@@ -145,98 +142,11 @@ python scripts/bench_sparse_vllm.py \
   --hyper_params '{"gpu_memory_utilization": 0.9}'
 ```
 
-## Codebase tour (file-by-file)
-
-If you want to understand the repo by reading code, a good order is:
-
-1. `src/sparsevllm/engine/llm_engine.py`: engine entrypoint (public API + main loop)
-2. `src/sparsevllm/engine/model_runner.py`: per-GPU-rank runner (load weights, allocate KV, run forward)
-3. `src/sparsevllm/engine/cache_manager/`: KV cache allocation/layout/free (method-specific implementations live here)
-4. `src/sparsevllm/engine/sparse_controller.py`: sparse policy/controller (what to read/reconstruct/evict and when)
-5. `src/sparsevllm/layers/attention.py` + `src/sparsevllm/triton_kernel/`: attention integration + kernels
-
-### Top-level
-
-| Path | What it does |
-| --- | --- |
-| `README.md` | Project overview + quickstart + test entrypoints |
-| `pyproject.toml` | Python packaging; installs `deltakv-train` CLI (points to `deltakv.train_compressor:main`) |
-| `src/` | Two packages: `sparsevllm` (inference engine) and `deltakv` (optional compressor tooling) |
-| `scripts/` | Experiment scripts (throughput, correctness, bandwidth, ablations); not a stable library API |
-| `benchmark/` | Evaluation harnesses (LongBench / SCBench / math_bench / NIAH) |
-| `baselines/` | Placeholder (currently mostly empty) |
-
-### Sparse-vLLM (`src/sparsevllm/`)
-
-| Path | What it does |
-| --- | --- |
-| `src/sparsevllm/__init__.py` | Public exports: `from sparsevllm import LLM, SamplingParams` |
-| `src/sparsevllm/llm.py` | `LLM` convenience entrypoint (currently a thin alias of `LLMEngine`) |
-| `src/sparsevllm/config.py` | `Config`: inference-time knobs (chunked prefill, KV budgets, method selection, etc.) |
-| `src/sparsevllm/sampling_params.py` | `SamplingParams`: minimal sampling knobs (note: `temperature` must be > `1e-10`; greedy is not supported) |
-| `src/sparsevllm/engine/llm_engine.py` | Engine: multi-process tensor-parallel lifecycle, public API (`add_request/step/generate/exit`) |
-| `src/sparsevllm/engine/model_runner.py` | Per-TP-rank runner: NCCL init, load weight shards, create `CacheManager` + `SparseController`, run forward + sampling |
-| `src/sparsevllm/engine/scheduler.py` | Scheduler: waiting/decoding queues, chunked prefill, long/short batch separation, preemption/rollback under memory pressure |
-| `src/sparsevllm/engine/sequence.py` | `Sequence`: per-request state machine (prompt/prefill progress/generated tokens/finish criteria) |
-| `src/sparsevllm/engine/cache_manager/` | KV cache managers: Standard / SnapKV / OmniKV / PyramidKV / (optional DeltaKV variants) |
-| `src/sparsevllm/engine/sparse_controller.py` | Sparse controller: builds per-layer read-view, aggregates attention scores, triggers eviction/reconstruction |
-| `src/sparsevllm/models/qwen2.py` | Qwen2 inference model wiring (custom layers/kernels + sparse controller integration) |
-| `src/sparsevllm/models/qwen3.py` | Qwen3 inference model wiring |
-| `src/sparsevllm/layers/` | Layer building blocks (attention/linear/rmsnorm/rotary/sampler, etc.) |
-| `src/sparsevllm/triton_kernel/` | Triton kernels (flash decoding, OmniKV fused, quant pack/unpack, embedding, rmsnorm, etc.) |
-| `src/sparsevllm/cuda_kernel/` | Optional CUDA extension used by the DeltaKV CUDA-offload path (see DeltaKV section) |
-| `src/sparsevllm/utils/` | Logging, per-step context (`is_prefill`/length flags), profiler, compressor factory + weight loader, etc. |
-
-### Benchmarks / scripts
-
-| Path | What it does |
-| --- | --- |
-| `scripts/bench_sparse_vllm.py` | Throughput/TTFT/ITL/memory benchmark (supports multiple methods; pass `Config` via `--hyper_params`) |
-| `scripts/test_sparse_vllm_correctness.py` | End-to-end generation sanity checks |
-| `benchmark/long_bench/pred.py` | LongBench prediction runner (backend: `hf` or `sparsevllm`) |
-| `benchmark/scbench/run_scbench.py` | SCBench runner + glue scripts |
-| `benchmark/math_bench/pred.py` | Math benchmark prediction runner |
-| `benchmark/niah/gen_niah.py` | Generate NIAH data |
-| `benchmark/niah/test_niah.py` | Run NIAH evaluation |
-
-### `scripts/` file guide
-
-| File | What it does |
-| --- | --- |
-| `scripts/bench_sparse_vllm.py` | Sparse-vLLM throughput/TTFT/ITL benchmark (multiple methods/lengths/batch sizes) |
-| `scripts/test_sparse_vllm_correctness.py` | End-to-end generation sanity checks (long/short separation, long-gen stability, etc.) |
-| `scripts/test_compressor_chunk_loss.py` | Compressor/chunking-related loss or alignment sanity check (training-side) |
-| `scripts/test_llama_snapkv_init.py` | Llama + SnapKV init/behavior checks |
-| `scripts/test_omnikv_fused_compare.py` | OmniKV fused kernel comparison/validation |
-| `scripts/test_gqa_flash_decoding_score.py` | GQA flash-decoding score/behavior validation |
-| `scripts/test_gather_bandwidth.py` | Gather bandwidth/throughput micro-benchmark |
-| `scripts/test_pcie_bandwidth.py` | PCIe bandwidth test (useful for offload path evaluation) |
-| `scripts/test_tensor_op_overhead.py` | Tensor-op pipeline overhead test (can mimic LLM MLP scale) |
-| `scripts/test_derope.py` | RoPE/De-RoPE experiments |
-| `scripts/get_train_dataset_loss.py` | Compute average loss of a model on a tokenized dataset subset (sanity-check data/model) |
-| `scripts/stat_longbench_len.py` | LongBench length statistics and related analysis |
-| `scripts/compare_indices.py` | Compare token-selection indices across implementations (e.g., SnapKV overlap) |
-| `scripts/visualize_profiling.py` | Visualize profiling breakdowns (stacked bar charts, etc.) |
-| `scripts/tune_omnikv.py` | OmniKV experiment entrypoint (reads `scripts/_exp_lst.py`) |
-| `scripts/_exp_lst.py` | OmniKV experiment list/config (currently placeholder) |
-| `scripts/run_llama_ablation.sh` | Shell script to run Llama ablations |
-
 ## DeltaKV
 
 DeltaKV is a method for **compressing the KV cache** to enable more efficient long-context inference for Transformer LLMs.
 This repo includes DeltaKV compressor training code and some inference/benchmark integrations, but DeltaKV-specific
 speed/quality/perf trade-offs are still under active iteration.
-
-### DeltaKV code layout
-
-| Path | What it does |
-| --- | --- |
-| `src/deltakv/train_compressor.py` | Compressor training entrypoint (Fire CLI) |
-| `src/deltakv/save_trainable_trainer.py` | Custom `Trainer` that saves only trainable (`requires_grad=True`) params |
-| `src/deltakv/configs/model_config_cls.py` | HF Config extensions for compressor + sparse-method hyper-params |
-| `src/deltakv/modeling/` | Model variants/utilities (Qwen2/Llama variants, KV cache helpers, token selection, etc.) |
-| `src/deltakv/data_prepare/` | Data preparation (tokenize + pack, collators, dataset generation) |
-| `src/deltakv/analysis/` | Research analysis scripts (similarity, ablations, visualizations) |
 
 ### DeltaKV inference
 
