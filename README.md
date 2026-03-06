@@ -14,30 +14,6 @@ This repo is primarily a **sparse-first inference engine** (`sparsevllm`). It al
 
 *Model checkpoints and datasets are all about to be uploaded.*
 
-## Contents
-
-- [Sparse-vLLM](#sparse-vllm)
-  - [Contents](#contents)
-  - [Sparse-vLLM](#sparse-vllm-1)
-    - [Install](#install)
-    - [Minimal usage](#minimal-usage)
-    - [Key parameters](#key-parameters)
-    - [Supported methods](#supported-methods)
-  - [How to test](#how-to-test)
-    - [Throughput benchmark](#throughput-benchmark)
-  - [DeltaKV](#deltakv)
-    - [DeltaKV inference](#deltakv-inference)
-    - [Train a compressor](#train-a-compressor)
-    - [Evaluate on LongBench](#evaluate-on-longbench)
-    - [DeltaKV checkpoints](#deltakv-checkpoints)
-    - [CUDA gather extension (only for `*-cuda-offload`)](#cuda-gather-extension-only-for--cuda-offload)
-  - [Troubleshooting](#troubleshooting)
-    - [`SamplingParams` does not allow greedy decoding](#samplingparams-does-not-allow-greedy-decoding)
-    - [`Mixed long/short batch detected`](#mixed-longshort-batch-detected)
-    - [`Insufficient KV cache slots to admit prompt`](#insufficient-kv-cache-slots-to-admit-prompt)
-  - [Acknowledgements](#acknowledgements)
-- [Citation](#citation)
-
 ## Sparse-vLLM
 
 Sparse-vLLM (implemented in `src/sparsevllm/`) is an inference framework built with **sparsity as the first design principle**. Instead of layering sparse methods on top of a conventional KV cache, it rethinks cache layout, controller flow, and kernels so that multiple sparse mechanisms can plug in cleanly.
@@ -141,6 +117,165 @@ python scripts/bench_sparse_vllm.py \
   --methods vanilla \
   --hyper_params '{"gpu_memory_utilization": 0.9}'
 ```
+
+### Practical recipes
+
+The following commands reflect the day-to-day experiment patterns we have been using. They are written in AutoDL / GPUHub style paths, but the same structure works on any Linux box.
+
+#### AutoDL / GPUHub setup
+
+```bash
+ssh -p <PORT> root@connect.westc.gpuhub.com
+cd /root/autodl-tmp/Sparse-vLLM
+source /etc/network_turbo
+
+export XDG_CACHE_HOME=/root/autodl-fs/.cache
+export HF_HOME=/root/autodl-fs/.cache/huggingface
+export TORCH_HOME=/root/autodl-fs/.cache/torch
+export DELTAKV_DATA_DIR=/root/autodl-fs/datasets
+export DELTAKV_OUTPUT_DIR=/root/autodl-fs/deltakv_outputs
+export PYTHONPATH="$PYTHONPATH:/root/autodl-tmp/Sparse-vLLM/src"
+
+conda activate kv
+# or: /root/miniconda3/bin/conda run -n kv --no-capture-output <cmd>
+```
+
+Notes:
+
+- Keep code under `/root/autodl-tmp`, and put models / datasets / caches / benchmark outputs under `/root/autodl-fs`.
+- Run `source /etc/network_turbo` before `git pull`, `pip install`, or downloading checkpoints/datasets.
+- Use `tmux` for long jobs if you expect the SSH session to disconnect.
+
+#### Measured sparse-method comparisons
+
+The following numbers were collected on `2026-03-06` on the AutoDL server `connect.westd.seetacloud.com:37226`.
+
+Testbed:
+
+- GPU: `NVIDIA RTX PRO 6000 Blackwell Server Edition` (`~96 GB`)
+- Model: `/root/autodl-fs/models/Qwen2.5-7B-Instruct-1M`
+- Script: `scripts/bench_sparse_vllm.py`
+- Raw logs: `/root/autodl-fs/deltakv_outputs/bench_bs1_*.log`, `/root/autodl-fs/deltakv_outputs/bench_fullmem_*.log`, and `/root/autodl-fs/deltakv_outputs/bench_throughput_*.log`
+- DeltaKV checkpoint: `cluster_e2e_cs256_biasFalse_l2_ratio0.1_clusMean_before_rope_lr0.0002_cdownmlp_swiglud3072_cuplinear_0125_222950`
+
+Long single-request speed case (`prompt_len=262144`, `batch_size=1`, `output_len=512`, `gpu_memory_utilization=0.9`, `chunk_prefill_size=4096`):
+
+| Method | Key sparse settings | TTFT | Prefill | Decode | End-to-end | GPU mem |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Vanilla | full attention | `64.64s` | `4055.67 tok/s` | `27.13 tok/s` | `83.47s` | `85.30 GB` |
+| SnapKV | `num_top_tokens=2048`, `num_sink_tokens=8`, `num_recent_tokens=128`, `snapkv_window_size=32` | `65.24s` | `4018.19 tok/s` | `42.95 tok/s` | `77.14s` | `88.32 GB` |
+| OmniKV | `full_attn_layers=0,1,2,4,7,14`, `num_top_tokens_in_prefill=4096`, `num_top_tokens=2048`, `num_recent_tokens=128`, `num_sink_tokens=8` | `27.74s` | `9451.44 tok/s` | `39.83 tok/s` | `40.56s` | `85.41 GB` |
+
+Notes:
+
+- This is the stronger `bs=1` proof point: with a longer prompt and a longer decode, both SnapKV and OmniKV are faster than full attention end-to-end.
+- In this setting, SnapKV is about `1.08x` faster end-to-end than full attention and about `1.58x` faster in decode throughput.
+- OmniKV is about `2.06x` faster end-to-end than full attention, mainly from a much faster prefill stage.
+
+Full-memory throughput case (`prompt_len=262144`, `output_len=32`, `gpu_memory_utilization=0.9`, `chunk_prefill_size=4096`):
+
+| Method | Batch | Admitted prompt tokens | TTFT | Prefill | Decode | End-to-end | GPU mem | Notes |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| Vanilla | `5` | `1310720` | `308.70s` | `4246.03 tok/s` | `68.39 tok/s` | `310.96s` | `87.01 GB` | near the standard-cache admission limit |
+| SnapKV | `5` | `1310720` | `310.04s` | `4227.59 tok/s` | `197.73 tok/s` | `310.82s` | `91.39 GB` | much faster decode, but similar admission limit |
+| OmniKV | `5` | `1310720` | `130.68s` | `10030.42 tok/s` | `129.68 tok/s` | `131.87s` | `87.55 GB` | fastest same-capacity throughput on this setup |
+| DeltaKV (`deltakv-triton-v4`) | `8` | `2097152` | `238.87s` | `8779.82 tok/s` | `113.74 tok/s` | `241.04s` | `90.61 GB` | admits `1.60x` more prompt tokens than the standard-cache methods above |
+
+Additional notes:
+
+- For vanilla / SnapKV / OmniKV, `batch_size=5` is already close to the admission boundary here because `5 x 262144 = 1310720` prompt tokens and the cache manager reports `1318342` available slots.
+- Vanilla at `batch_size=8` fails immediately with `Insufficient KV cache slots to admit prompt`, while DeltaKV completes the same `262144 x 8` workload.
+- On this codebase and hardware, SnapKV and OmniKV still use the standard cache manager for prompt admission, so their main gain is speed, while DeltaKV is the method that materially increases admitted workload under the same memory budget.
+- The DeltaKV row above uses the asymmetric compressor variant (`down=mlp_swiglu(inter=3072, bias=False)`, `up=linear(bias=False)`).
+- Quick `PyramidKV` reference on the same server: at `128K, bs=1, output_len=64`, it reaches `TTFT 18.78s`, `Prefill 6981.35 tok/s`, `Decode 33.69 tok/s`, and requires `pyramidkv_least_ratio=0.05` on this setup.
+
+#### MathBench with `sparsevllm` backend
+
+These examples are convenient for quick GSM8K / AIME-style comparisons while exercising the Sparse-vLLM engine directly. For dataset details, see `benchmark/math_bench/README.md`.
+
+Full-attention baseline:
+
+```bash
+python benchmark/math_bench/pred.py \
+  --model qwen7b-full \
+  --model_path /root/autodl-fs/models/DeepSeek-R1-Distill-Qwen-7B \
+  --tokenizer_path /root/autodl-fs/models/DeepSeek-R1-Distill-Qwen-7B \
+  --ws 1 \
+  --batch_size 30 \
+  --backend sparsevllm \
+  --task aime2024 \
+  --temperature 0.6 \
+  --hyper_param '{"chunk_prefill_size": 4096, "vllm_sparse_method": ""}'
+```
+
+OmniKV:
+
+```bash
+python benchmark/math_bench/pred.py \
+  --model qwen7b-omnikv \
+  --model_path /root/autodl-fs/models/DeepSeek-R1-Distill-Qwen-7B \
+  --tokenizer_path /root/autodl-fs/models/DeepSeek-R1-Distill-Qwen-7B \
+  --ws 1 \
+  --batch_size 30 \
+  --backend sparsevllm \
+  --task aime2024 \
+  --temperature 0.6 \
+  --hyper_param '{"chunk_prefill_size": 4096, "vllm_sparse_method": "omnikv", "chunk_prefill_accel_omnikv": false, "full_attn_layers": "0,1,2,4,7,14", "num_top_tokens": 1024}'
+```
+
+DeltaKV:
+
+```bash
+python benchmark/math_bench/pred.py \
+  --model qwen7b-deltakv \
+  --model_path /root/autodl-fs/models/DeepSeek-R1-Distill-Qwen-7B \
+  --tokenizer_path /root/autodl-fs/models/DeepSeek-R1-Distill-Qwen-7B \
+  --ws 1 \
+  --batch_size 30 \
+  --backend sparsevllm \
+  --task aime2024 \
+  --temperature 0.6 \
+  --hyper_param '{"chunk_prefill_size": 512, "num_top_tokens_in_prefill": 16384, "max_num_batched_tokens": 8192, "max_num_seqs_in_batch": 30, "vllm_sparse_method": "deltakv-triton-v4", "chunk_prefill_accel_omnikv": true, "full_attn_layers": "0,1,2,4,7,14", "num_top_tokens": 1024, "deltakv_path": "/root/autodl-fs/checkpoints/compressor/<COMPRESSOR_DIR>", "kv_compressed_size": 256}'
+```
+
+When `--backend sparsevllm`, method selection happens entirely through `--hyper_param` (`vllm_sparse_method`, `deltakv_path`, etc.). `--model_cls` and `--compressor_path` are not used by the Sparse-vLLM backend.
+
+#### LongBench with `sparsevllm` backend
+
+Use this path when you want LongBench results from the actual Sparse-vLLM engine rather than the HF wrapper models.
+
+```bash
+python benchmark/long_bench/pred.py \
+  --model qwen7b-omnikv \
+  --model_path /root/autodl-fs/models/Qwen2.5-7B-Instruct-1M \
+  --tokenizer_path /root/autodl-fs/models/Qwen2.5-7B-Instruct-1M \
+  --ws 1 \
+  --batch_size 1 \
+  --backend sparsevllm \
+  --task qasper,hotpotqa,multi_news \
+  --hyper_param '{"chunk_prefill_size": 4096, "vllm_sparse_method": "omnikv", "chunk_prefill_accel_omnikv": true, "num_top_tokens_in_prefill": 4096, "num_top_tokens": 2048, "full_attn_layers": "0,1,2,4,7,14", "num_recent_tokens": 128, "num_sink_tokens": 8}'
+```
+
+For a full LongBench run, simply omit `--task`. To switch to DeltaKV, keep `--backend sparsevllm` and replace the method-specific part of `--hyper_param` with `vllm_sparse_method="deltakv"` (or `deltakv-triton-v4`) plus `deltakv_path=...`.
+
+#### LongBench with HF wrappers
+
+Use the HF backend when you want to compare against the DeltaKV / SnapKV / PyramidKV wrapper models implemented under `src/deltakv/`.
+
+```bash
+python benchmark/long_bench/pred.py \
+  --model qwen7b-deltakv \
+  --model_path /root/autodl-fs/models/Qwen2.5-7B-Instruct-1M \
+  --tokenizer_path /root/autodl-fs/models/Qwen2.5-7B-Instruct-1M \
+  --ws 1 \
+  --batch_size 1 \
+  --backend hf \
+  --model_cls deltakv \
+  --compressor_path "/root/autodl-fs/checkpoints/compressor/<COMPRESSOR_DIR>" \
+  --hyper_param '{"chunk_prefill_size": 2048000, "num_top_tokens_in_prefill": 4096, "chunk_prefill_accel_omnikv": true, "num_top_tokens": 0.11, "full_attn_layers": "0,1,2,4,7,14", "num_recent_tokens": 128, "num_sink_tokens": 8, "use_compression": true, "use_cluster": true, "cluster_ratio": 0.1}'
+```
+
+To compare other baselines, keep `--backend hf` and switch `--model_cls` / `--hyper_param`, e.g. `snapkv` with `{"num_top_tokens": 0.2, "pool_kernel_size": 7}` or `pyramidkv` with a similar token budget.
 
 ## DeltaKV
 
