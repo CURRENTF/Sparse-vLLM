@@ -12,6 +12,12 @@ from sparsevllm.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sparsevllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 from sparsevllm.utils.context import get_context
 from sparsevllm.utils.flash_mla import try_get_flash_mla, flash_mla_sparse_attn
+from sparsevllm.utils.log import logger
+
+try:
+    from flash_attn import flash_attn_func  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    flash_attn_func = None
 
 
 def _getattr(obj: Any, name: str, default: Any = None) -> Any:
@@ -118,27 +124,25 @@ def precompute_freqs_cis(
 
 
 def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor, interleaved: bool) -> torch.Tensor:
-    """Apply RoPE using complex multiplication.
+    """Apply RoPE using the same layout as the HF DeepSeek implementation.
 
     Assumption: sequence dimension is the first dimension of `x`, matching `freqs_cis.shape[0]`.
     """
     orig_dtype = x.dtype
     x = x.float()
+    cos = torch.cat([freqs_cis.real, freqs_cis.real], dim=-1)
+    sin = torch.cat([freqs_cis.imag, freqs_cis.imag], dim=-1)
+    while cos.ndim < x.ndim:
+        cos = cos.unsqueeze(1)
+        sin = sin.unsqueeze(1)
+
     if interleaved:
-        x_complex = torch.view_as_complex(x.reshape(*x.shape[:-1], -1, 2))
-        freqs = freqs_cis
-        # Broadcast freqs over any extra dims after sequence.
-        while freqs.ndim < x_complex.ndim:
-            freqs = freqs.unsqueeze(1)
-        out = x_complex * freqs
-        out = torch.view_as_real(out).reshape_as(x)
-    else:
-        x_complex = torch.view_as_complex(x.reshape(*x.shape[:-1], 2, -1).transpose(-2, -1))
-        freqs = freqs_cis
-        while freqs.ndim < x_complex.ndim:
-            freqs = freqs.unsqueeze(1)
-        out = x_complex * freqs
-        out = torch.view_as_real(out).transpose(-2, -1).reshape_as(x)
+        x = x.view(*x.shape[:-1], x.shape[-1] // 2, 2).transpose(-1, -2).reshape_as(x)
+
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    rotated = torch.cat([-x2, x1], dim=-1)
+    out = (x * cos) + (rotated * sin)
     return out.to(orig_dtype)
 
 
@@ -164,6 +168,7 @@ class DeepSeekV32Args:
     n_dense_layers: int
     n_routed_experts: int
     n_shared_experts: int
+    shared_experts_intermediate_size: int
     num_experts_per_tok: int
     routed_scaling_factor: float
     scoring_func: str
@@ -171,33 +176,40 @@ class DeepSeekV32Args:
     seq_aux: bool
     norm_topk_prob: bool
     rms_norm_eps: float
+    use_dsa: bool
 
 
 def _args_from_hf_config(hf_config: Any, *, dsa_topk: int | None = None) -> DeepSeekV32Args:
+    model_type = str(_getattr(hf_config, "model_type", "") or "")
+    if model_type != "deepseek_v32":
+        raise ValueError(f"DeepSeekV32ForCausalLM expects model_type='deepseek_v32', got {model_type!r}.")
     dim = int(_getattr(hf_config, "hidden_size"))
     n_layers = int(_getattr(hf_config, "num_hidden_layers"))
     n_heads = int(_getattr(hf_config, "num_attention_heads"))
     vocab_size = int(_getattr(hf_config, "vocab_size"))
 
-    q_lora_rank = int(_getattr(hf_config, "q_lora_rank"))
+    q_lora_rank_raw = _getattr(hf_config, "q_lora_rank", 0)
+    q_lora_rank = int(q_lora_rank_raw or 0)
     kv_lora_rank = int(_getattr(hf_config, "kv_lora_rank"))
     qk_nope_head_dim = int(_getattr(hf_config, "qk_nope_head_dim"))
     qk_rope_head_dim = int(_getattr(hf_config, "qk_rope_head_dim"))
     v_head_dim = int(_getattr(hf_config, "v_head_dim"))
 
-    index_n_heads = int(_getattr(hf_config, "index_n_heads"))
-    index_head_dim = int(_getattr(hf_config, "index_head_dim"))
-    index_topk = int(dsa_topk if dsa_topk is not None else _getattr(hf_config, "index_topk"))
+    use_dsa = True
+    index_n_heads = int(_getattr(hf_config, "index_n_heads", n_heads))
+    index_head_dim = int(_getattr(hf_config, "index_head_dim", qk_nope_head_dim + qk_rope_head_dim))
+    index_topk = int(dsa_topk if dsa_topk is not None else _getattr(hf_config, "index_topk", 0))
 
     rope_theta = float(_getattr(hf_config, "rope_theta", 10000.0))
     rope_scaling = _getattr(hf_config, "rope_scaling", None)
-    rotary_emb_interleaved = bool(_getattr(hf_config, "rotary_emb_interleaved", False))
+    rotary_emb_interleaved = bool(_getattr(hf_config, "rotary_emb_interleaved", True))
 
     intermediate_size = int(_getattr(hf_config, "intermediate_size"))
     moe_intermediate_size = int(_getattr(hf_config, "moe_intermediate_size"))
-    n_dense_layers = int(_getattr(hf_config, "n_dense_layers", 0))
+    n_dense_layers = int(_getattr(hf_config, "n_dense_layers", _getattr(hf_config, "first_k_dense_replace", 0)))
     n_routed_experts = int(_getattr(hf_config, "n_routed_experts", 0))
     n_shared_experts = int(_getattr(hf_config, "n_shared_experts", 0))
+    shared_experts_intermediate_size = int(intermediate_size * n_shared_experts)
     num_experts_per_tok = int(_getattr(hf_config, "num_experts_per_tok", 0))
     routed_scaling_factor = float(_getattr(hf_config, "routed_scaling_factor", 1.0))
     scoring_func = str(_getattr(hf_config, "scoring_func", "softmax")).lower()
@@ -227,6 +239,7 @@ def _args_from_hf_config(hf_config: Any, *, dsa_topk: int | None = None) -> Deep
         n_dense_layers=n_dense_layers,
         n_routed_experts=n_routed_experts,
         n_shared_experts=n_shared_experts,
+        shared_experts_intermediate_size=shared_experts_intermediate_size,
         num_experts_per_tok=num_experts_per_tok,
         routed_scaling_factor=routed_scaling_factor,
         scoring_func=scoring_func,
@@ -234,6 +247,7 @@ def _args_from_hf_config(hf_config: Any, *, dsa_topk: int | None = None) -> Deep
         seq_aux=seq_aux,
         norm_topk_prob=norm_topk_prob,
         rms_norm_eps=rms_norm_eps,
+        use_dsa=use_dsa,
     )
 
 
@@ -299,7 +313,7 @@ class DeepSeekV32MoE(nn.Module):
         self.experts = nn.ModuleList(
             [DeepSeekV32MLP(args.dim, args.moe_intermediate_size) for _ in range(self.n_routed_experts)]
         )
-        self.shared_experts = DeepSeekV32MLP(args.dim, args.intermediate_size * args.n_shared_experts)
+        self.shared_experts = DeepSeekV32MLP(args.dim, args.shared_experts_intermediate_size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         identity = x
@@ -327,6 +341,8 @@ class DeepSeekV32Indexer(nn.Module):
 
     def __init__(self, args: DeepSeekV32Args):
         super().__init__()
+        if int(args.q_lora_rank) <= 0:
+            raise ValueError("DeepSeekV32Indexer requires q_lora_rank > 0.")
         self.n_heads = int(args.index_n_heads)
         self.head_dim = int(args.index_head_dim)
         self.topk = int(args.index_topk)
@@ -399,11 +415,16 @@ class DeepSeekV32MLA(nn.Module):
         self.qk_rope_head_dim = int(args.qk_rope_head_dim)
         self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         self.v_head_dim = int(args.v_head_dim)
+        self.q_lora_rank = int(args.q_lora_rank)
         self.kv_lora_rank = int(args.kv_lora_rank)
+        self.use_dsa = bool(args.use_dsa)
 
-        self.wq_a = ColumnParallelLinear(args.dim, args.q_lora_rank, bias=False)
-        self.q_norm = RMSNorm(args.q_lora_rank, eps=args.rms_norm_eps)
-        self.wq_b = ColumnParallelLinear(args.q_lora_rank, self.n_heads * self.qk_head_dim, bias=False)
+        if self.q_lora_rank > 0:
+            self.wq_a = ColumnParallelLinear(args.dim, self.q_lora_rank, bias=False)
+            self.q_norm = RMSNorm(self.q_lora_rank, eps=args.rms_norm_eps)
+            self.wq_b = ColumnParallelLinear(self.q_lora_rank, self.n_heads * self.qk_head_dim, bias=False)
+        else:
+            self.wq = ColumnParallelLinear(args.dim, self.n_heads * self.qk_head_dim, bias=False)
 
         self.wkv_a = ColumnParallelLinear(args.dim, self.kv_lora_rank + self.qk_rope_head_dim, bias=False)
         self.kv_norm = RMSNorm(self.kv_lora_rank, eps=args.rms_norm_eps)
@@ -412,9 +433,25 @@ class DeepSeekV32MLA(nn.Module):
         self.wo = RowParallelLinear(self.n_heads * self.v_head_dim, args.dim, bias=False)
 
         self.softmax_scale = float(self.qk_head_dim ** -0.5)
+        if args.rope_scaling is not None:
+            mscale_all_dim = float(args.rope_scaling.get("mscale_all_dim", 0.0))
+            scaling_factor = float(args.rope_scaling.get("factor", 1.0))
+            if mscale_all_dim:
+                mscale = _yarn_get_mscale(scaling_factor, mscale_all_dim)
+                self.softmax_scale *= mscale * mscale
         self.interleaved = bool(args.rotary_emb_interleaved)
 
-        self.indexer = DeepSeekV32Indexer(args)
+        self.indexer = DeepSeekV32Indexer(args) if self.use_dsa else None
+
+    def _project_q(self, x: torch.Tensor) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor]:
+        if self.q_lora_rank > 0:
+            qr = self.wq_a(x)
+            q = self.wq_b(self.q_norm(qr)).view(-1, self.n_heads, self.qk_head_dim)
+        else:
+            qr = None
+            q = self.wq(x).view(-1, self.n_heads, self.qk_head_dim)
+        q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        return qr, q_nope, q_pe
 
     def _wkv_b_per_head(self) -> torch.Tensor:
         # (n_heads * (qk_nope+v), kv_lora_rank) -> (n_heads, qk_nope+v, kv_lora_rank)
@@ -470,6 +507,47 @@ class DeepSeekV32MLA(nn.Module):
         out_v = torch.einsum("thc,hdc->thd", out_latent, w_v)  # (T, H, v)
         return self.wo(out_v.flatten(1, -1))
 
+    def _attn_dense_prefill(
+        self,
+        q_nope: torch.Tensor,  # (T, H, qk_nope)
+        q_pe: torch.Tensor,  # (T, H, rope)
+        kv: torch.Tensor,  # (T, kv_lora)
+        k_pe: torch.Tensor,  # (T, rope)
+    ) -> torch.Tensor:
+        wkv_b = self._wkv_b_per_head()
+        w_k = wkv_b[:, : self.qk_nope_head_dim, :]
+        w_v = wkv_b[:, -self.v_head_dim :, :]
+
+        q = torch.cat([q_nope, q_pe], dim=-1).to(torch.bfloat16)
+        k_nope = torch.einsum("tc,hdc->thd", kv, w_k)
+        k = torch.cat([k_nope, k_pe.unsqueeze(1).expand(-1, self.n_heads, -1)], dim=-1).to(torch.bfloat16)
+        v = torch.einsum("tc,hdc->thd", kv, w_v).to(torch.bfloat16)
+
+        if q.is_cuda:
+            out_v = (
+                F.scaled_dot_product_attention(
+                    q.transpose(0, 1).unsqueeze(0),
+                    k.transpose(0, 1).unsqueeze(0),
+                    v.transpose(0, 1).unsqueeze(0),
+                    is_causal=True,
+                    scale=self.softmax_scale,
+                )
+                .squeeze(0)
+                .transpose(0, 1)
+                .contiguous()
+            )
+        else:
+            logits = torch.einsum("thd,shd->ths", q.float(), k.float()) * self.softmax_scale
+            causal_mask = torch.triu(
+                torch.full((q.shape[0], q.shape[0]), float("-inf"), device=q.device, dtype=logits.dtype),
+                diagonal=1,
+            )
+            logits = logits + causal_mask[:, None, :]
+            attn = torch.softmax(logits, dim=-1, dtype=torch.float32).to(torch.bfloat16)
+            out_v = torch.einsum("ths,shd->thd", attn, v)
+
+        return self.wo(out_v.flatten(1, -1))
+
     def _attn_dense_decode(
         self,
         q_nope: torch.Tensor,  # (1, H, qk_nope)
@@ -510,15 +588,18 @@ class DeepSeekV32MLA(nn.Module):
                     continue
                 start_pos = int(pos[0].item())
                 if start_pos != 0:
+                    if self.use_dsa:
+                        raise RuntimeError(
+                            "DeepSeek-V3.2 DSA path currently requires non-chunked prefill. "
+                            "Set `chunk_prefill_size` >= prompt length so prefill runs in a single chunk."
+                        )
                     raise RuntimeError(
-                        "DeepSeek-V3.2 DSA path currently requires non-chunked prefill. "
+                        "DeepSeek MLA sparsevllm path currently requires non-chunked prefill for this model. "
                         "Set `chunk_prefill_size` >= prompt length so prefill runs in a single chunk."
                     )
 
                 # Compute Q/KV for this sequence.
-                qr = self.wq_a(x)
-                q = self.wq_b(self.q_norm(qr)).view(-1, self.n_heads, self.qk_head_dim)
-                q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+                qr, q_nope, q_pe = self._project_q(x)
 
                 kv = self.wkv_a(x)
                 kv, k_pe = kv.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
@@ -534,9 +615,12 @@ class DeepSeekV32MLA(nn.Module):
                 kv_cache_layer.index_copy_(0, slots, kv)
                 pe_cache_layer.index_copy_(0, slots, k_pe)
 
-                # Top-k indices (DSA) + sparse attention prefill.
-                topk_idx = self.indexer(x, qr, freqs_cis, causal=True)
-                out = self._attn_sparse_prefill(q_nope, q_pe, kv, k_pe, topk_idx)
+                if self.use_dsa:
+                    assert qr is not None and self.indexer is not None
+                    topk_idx = self.indexer(x, qr, freqs_cis, causal=True)
+                    out = self._attn_sparse_prefill(q_nope, q_pe, kv, k_pe, topk_idx)
+                else:
+                    out = self._attn_dense_prefill(q_nope, q_pe, kv, k_pe)
                 outputs.append(out)
 
             if not outputs:
@@ -556,9 +640,7 @@ class DeepSeekV32MLA(nn.Module):
             row_idx = int(batch_states.req_indices[i].item())
 
             # Compute Q/KV for the new token and update cache.
-            qr = self.wq_a(x)
-            q = self.wq_b(self.q_norm(qr)).view(1, self.n_heads, self.qk_head_dim)
-            q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+            _, q_nope, q_pe = self._project_q(x)
 
             kv = self.wkv_a(x)
             kv, k_pe = kv.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
@@ -613,6 +695,8 @@ class DeepSeekV32DecoderLayer(nn.Module):
 class DeepSeekV32ForCausalLM(nn.Module):
     def __init__(self, hf_config: Any, *, dsa_topk: int | None = None, use_flash_mla: bool = True):
         super().__init__()
+        self.hf_model_type = str(_getattr(hf_config, "model_type", "") or "")
+        logger.warning("DeepSeek-V3.2 sparsevllm support is experimental and has not been fully validated yet.")
         self.args = _args_from_hf_config(hf_config, dsa_topk=dsa_topk)
         if dist.get_world_size() != 1:
             raise NotImplementedError("DeepSeekV32ForCausalLM currently supports tensor_parallel_size=1 only.")

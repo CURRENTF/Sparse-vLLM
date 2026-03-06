@@ -51,15 +51,18 @@ class CacheManager(ABC):
         sparse_method = config.vllm_sparse_method
         model_type = getattr(getattr(config, "hf_config", None), "model_type", "") or ""
 
-        # DeepSeek-V3.2 MLA cache layout (required for DeepSeek model wiring).
-        if model_type == "deepseek_v32" or sparse_method == "dsa":
+        # DeepSeek MLA cache layout (required for DeepSeek-V2 / V3.2 model wiring).
+        if model_type == "deepseek_v32":
+            raise NotImplementedError(
+                "DeepSeek-V3.2 sparsevllm support is disabled. "
+                "Use DeepSeek-V2 or another backend for now."
+            )
+        if model_type == "deepseek_v2":
             if sparse_method not in ("", "dsa"):
                 raise ValueError(
                     f"DeepSeek MLA cache does not support vllm_sparse_method={sparse_method!r}. "
-                    "Use vllm_sparse_method='dsa' (or leave empty)."
+                    "Use vanilla mode (empty string) or `dsa` where supported."
                 )
-            if sparse_method != "dsa":
-                config.vllm_sparse_method = "dsa"
             if sparse_method == "dsa" and model_type != "deepseek_v32":
                 raise ValueError(
                     "vllm_sparse_method='dsa' is currently only supported for DeepSeek-V3.2 "
@@ -68,6 +71,11 @@ class CacheManager(ABC):
             from .deepseek_mla import DeepSeekMLACacheManager
 
             return DeepSeekMLACacheManager(config, rank, world_size)
+        if sparse_method == "dsa":
+            raise ValueError(
+                "vllm_sparse_method='dsa' is currently only supported for DeepSeek-V3.2 "
+                f"(model_type={model_type!r})."
+            )
 
         if sparse_method == "deltakv":
             from .deltakv import DeltaKVCacheManager

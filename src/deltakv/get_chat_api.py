@@ -212,11 +212,11 @@ def get_generate_api(model_path: str, infer_config: dict, compressor_path: str,
             max_tokens = kwargs.get('max_new_tokens', kwargs.get('max_tokens', 128))
             temperature = kwargs.get('temperature', 1.0)
             
-            # 如果是 greedy (do_sample=False)，SamplingParams 需要特殊处理或由用户保证温控制
+            # greedy decoding should be exact argmax, not low-temperature sampling.
             if not kwargs.get('do_sample', True):
+                temperature = 0.0
+            elif temperature < 1e-5:
                 temperature = 1e-5
-            
-            if temperature < 1e-5: temperature = 1e-5
             
             sampling_params = SamplingParams(temperature=temperature, max_tokens=max_tokens)
             outputs = llm.generate(prompts, sampling_params, use_tqdm=False)
@@ -316,18 +316,19 @@ def get_generate_api(model_path: str, infer_config: dict, compressor_path: str,
             model_path,
             torch_dtype=torch.bfloat16,
             device_map=cuda_device,
+            trust_remote_code=True,
             attn_implementation="flash_attention_2",
         )
-        chunk_prefill_size = infer_config.get('chunk_prefill_size', None)
-        if chunk_prefill_size is not None:
+        auto_chunk_prefill_size = infer_config.get('chunk_prefill_size', None)
+        if auto_chunk_prefill_size is not None:
             from types import MethodType
 
             def chunked_forward(self, input_ids=None, past_key_values=None, **kwargs):
-                if input_ids is not None and input_ids.shape[1] > chunk_prefill_size:
+                if input_ids is not None and input_ids.shape[1] > auto_chunk_prefill_size:
                     seq_len = input_ids.shape[1]
                     outputs = None
-                    for i in range(0, seq_len, chunk_prefill_size):   # noqa
-                        chunk = input_ids[:, i:i + chunk_prefill_size]   # noqa
+                    for i in range(0, seq_len, auto_chunk_prefill_size):   # noqa
+                        chunk = input_ids[:, i:i + auto_chunk_prefill_size]   # noqa
                         outputs = self.original_forward(input_ids=chunk, past_key_values=past_key_values, **kwargs)
                         past_key_values = outputs.past_key_values
                     return outputs
@@ -490,14 +491,14 @@ def get_generate_api(model_path: str, infer_config: dict, compressor_path: str,
     else:
         raise ValueError(f"Unknown model_cls: {model_cls}")
 
-    chunk_prefill_size = int(os.environ.get('MANUAL_GEN_CHUNK_PREFILL_SIZE', 0))
-    if chunk_prefill_size > 0:
+    manual_chunk_prefill_size = int(os.environ.get('MANUAL_GEN_CHUNK_PREFILL_SIZE', 0))
+    if manual_chunk_prefill_size > 0:
         assert model_cls == 'kivi' or model_cls == 'palu' or model_cls == 'quest', '其他方法在代码内部实现了chunk prefill'
 
     model.eval()
     if tokenizer_path is None:
         tokenizer_path = model_path
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = 'left'

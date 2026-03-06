@@ -9,7 +9,7 @@ from sparsevllm.config import Config
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.models.qwen2 import Qwen2ForCausalLM
 from sparsevllm.models.qwen3 import Qwen3ForCausalLM
-from sparsevllm.models.deepseek_v32 import DeepSeekV32ForCausalLM
+from sparsevllm.models.deepseek_v2 import DeepSeekV2ForCausalLM
 from sparsevllm.layers.sampler import Sampler
 from sparsevllm.utils.context import set_context, get_context, reset_context
 from sparsevllm.utils.loader import load_model
@@ -49,11 +49,16 @@ class ModelRunner:
         # 加载对应的模型分片 (Shards)
         if hf_config.model_type == "qwen2":
             self.model = Qwen2ForCausalLM(hf_config)
-        elif hf_config.model_type == "deepseek_v32":
-            self.model = DeepSeekV32ForCausalLM(
+        elif hf_config.model_type == "deepseek_v2":
+            self.model = DeepSeekV2ForCausalLM(
                 hf_config,
                 dsa_topk=config.dsa_topk,
                 use_flash_mla=config.dsa_use_flash_mla,
+            )
+        elif hf_config.model_type == "deepseek_v32":
+            raise NotImplementedError(
+                "DeepSeek-V3.2 sparsevllm support is disabled. "
+                "Use DeepSeek-V2 or another backend for now."
             )
         else:
             self.model = Qwen3ForCausalLM(hf_config)
