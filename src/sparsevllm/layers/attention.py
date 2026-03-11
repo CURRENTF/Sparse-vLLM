@@ -103,6 +103,16 @@ class Attention(nn.Module):
                 )
             else:    # decode
                 batch_size = q.shape[0]
+                layer_active_slots, b_req_idx, layer_context_lens = sparse_controller.build_decode_view(
+                    context.now_layer_idx,
+                    q,
+                    k_cache,
+                    layer_active_slots,
+                    b_req_idx,
+                    layer_context_lens,
+                    num_kv_heads=self.num_kv_heads,
+                )
+
                 max_len_in_batch = layer_context_lens.max().item()
                 BLOCK_SEQ = 256
 

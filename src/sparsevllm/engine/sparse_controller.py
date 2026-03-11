@@ -6,6 +6,7 @@ from sparsevllm.engine.cache_manager import CacheManager
 from sparsevllm.utils.profiler import profiler
 from sparsevllm.utils.context import get_context
 from sparsevllm.utils.log import logger, log_level
+from sparsevllm.utils.quest import build_quest_decode_view
 from sparsevllm.triton_kernel.omnikv_fused import build_omnikv_keep_and_slots
 
 
@@ -142,7 +143,7 @@ class SparseController:
         """
         sparse_state = self.layer_batch_sparse_states[layer_idx]
         if (self.sparse_method in ("omnikv", "deltakv") and layer_idx in self.full_attn_layers) or \
-            self.sparse_method in ('snapkv', 'pyramidkv', ''):
+            self.sparse_method in ('snapkv', 'pyramidkv', 'quest', ''):
 
             return (
                 self.cache_manager.get_layer_buffer_req_to_token_slots(layer_idx),  # 全部 token slots
@@ -200,6 +201,37 @@ class SparseController:
             )
         else:
             raise ValueError
+
+    @torch.no_grad()
+    def build_decode_view(
+        self,
+        layer_idx: int,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        active_slots: torch.Tensor,
+        req_indices: torch.Tensor,
+        context_lens: torch.Tensor,
+        *,
+        num_kv_heads: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.sparse_method != "quest":
+            return active_slots, req_indices, context_lens
+
+        quest_view = build_quest_decode_view(
+            q,
+            k_cache,
+            active_slots,
+            req_indices,
+            context_lens,
+            num_kv_heads=num_kv_heads,
+            page_size=self.config.quest_chunk_size,
+            token_budget=self.config.quest_token_budget,
+            layer_idx=layer_idx,
+            skip_layers=self.config.quest_skip_layers,
+        )
+        if quest_view is None:
+            return active_slots, req_indices, context_lens
+        return quest_view
 
     def on_layer_end(self, layer_idx: int, context):
         """每一层结束后的动态策略 (如 OmniKV / DeltaKV)"""

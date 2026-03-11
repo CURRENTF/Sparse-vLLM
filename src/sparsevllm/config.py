@@ -25,7 +25,7 @@ class Config:
     num_kvcache_slots: int | list = -1
 
     # Sparse Attention Config
-    vllm_sparse_method: str = ""  # "", "snapkv", "omnikv", "deltakv", "deltakv-triton", "deltakv-triton-v2", "deltakv-triton-v3", "deltakv-triton-v4", "deltakv-triton-v3-offload", "deltakv-triton-v3-cuda-offload", "pyramidkv", "dsa"
+    vllm_sparse_method: str = ""  # "", "snapkv", "omnikv", "quest", "deltakv", "deltakv-triton", "deltakv-triton-v2", "deltakv-triton-v3", "deltakv-triton-v4", "deltakv-triton-v3-offload", "deltakv-triton-v3-cuda-offload", "pyramidkv", "dsa"
 
     # General Sparse Config
     num_sink_tokens: int = 64
@@ -37,6 +37,11 @@ class Config:
     full_attn_layers: str | list[int] = "0" # useful for omnikv
     chunk_prefill_accel_omnikv: bool = True
     num_top_tokens_in_prefill: int | None = None
+
+    # QuEST Config
+    quest_chunk_size: int = 16
+    quest_token_budget: int = 1024
+    quest_skip_layers: int = 2
 
     # SnapKV Config
     snapkv_window_size: int = 32
@@ -153,6 +158,13 @@ class Config:
 
         if isinstance(self.full_attn_layers, str):
             self.full_attn_layers = [int(x) for x in self.full_attn_layers.split(",")]
+
+        if self.quest_chunk_size <= 0:
+            raise ValueError("quest_chunk_size 必须 > 0")
+        if self.quest_token_budget <= 0:
+            raise ValueError("quest_token_budget 必须 > 0")
+        if self.quest_skip_layers < 0:
+            raise ValueError("quest_skip_layers 不能 < 0")
 
         # Normalize compressor type strings.
         for attr in ("compressor_down_type", "compressor_up_type"):
