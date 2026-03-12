@@ -1,4 +1,4 @@
-# Sparse-vLLM
+![sparse_vllm_throughput.png](assets/sparse_vllm_throughput.png)
 
 <p align="center">
   <a href="https://deepwiki.com/CURRENTF/Sparse-vLLM"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki"></a>
