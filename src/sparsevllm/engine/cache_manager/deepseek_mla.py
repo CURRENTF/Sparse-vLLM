@@ -57,7 +57,7 @@ class DeepSeekMLACacheManager(CacheManager):
         reserved_mem = total * (1 - config.gpu_memory_utilization)
         intermediate_size = getattr(hf_config, "intermediate_size", hf_config.hidden_size * 4)
         dtype_size = torch.tensor([], dtype=hf_config.torch_dtype).element_size()
-        estimated_max_tokens = int(reserved_mem / (intermediate_size * dtype_size * 6))
+        estimated_max_tokens = int(reserved_mem / (intermediate_size * dtype_size * 10))
         assert 2 * config.chunk_prefill_size < estimated_max_tokens, (
             f"{2 * config.chunk_prefill_size} >= {estimated_max_tokens}"
         )
@@ -290,4 +290,3 @@ class DeepSeekMLACacheManager(CacheManager):
             input_ids = torch.tensor(input_ids_list, dtype=torch.int64, device="cuda")
             positions = torch.tensor(positions_list, dtype=torch.int64, device="cuda")
             return input_ids, positions, None
-

@@ -122,6 +122,10 @@ class CacheManager(ABC):
             from .deltakv import DeltaKVCacheTritonManagerV3WithCUDAOffload
 
             return DeltaKVCacheTritonManagerV3WithCUDAOffload(config, rank, world_size)
+        if sparse_method in ("streamingllm", "attention-sink", "attention_sink"):
+            from .streamingllm import StreamingLLMCacheManager
+
+            return StreamingLLMCacheManager(config, rank, world_size)
         if sparse_method in ("snapkv", "pyramidkv"):
             from .snapkv import SnapKVCacheManager
 
@@ -150,7 +154,9 @@ class CacheManager(ABC):
         intermediate_size = getattr(hf_config, "intermediate_size", hf_config.hidden_size * 4)
         dtype_size = torch.tensor([], dtype=hf_config.torch_dtype).element_size()
 
-        estimated_max_tokens = int(reserved_mem / (intermediate_size * dtype_size * 6))
+        # Keep this heuristic conservative: large prefill batches can still peak on
+        # MLP activations and allocator fragmentation after KV cache allocation.
+        estimated_max_tokens = int(reserved_mem / (intermediate_size * dtype_size * 10))
         assert 2 * config.chunk_prefill_size < estimated_max_tokens, (
             f"{2 * config.chunk_prefill_size} >= {estimated_max_tokens}"
         )
@@ -272,11 +278,22 @@ class CacheManager(ABC):
 
     def prompt_admission_failure_action(self) -> str:
         """Action when a prompt cannot be admitted: 'raise' or 'defer'."""
-        return "raise"
+        return "defer"
 
-    def prompt_admission_budgets(self) -> dict[str, int]:
-        """Return admission budgets used by Scheduler for new prompts."""
-        return {"slots": int(self.prompt_admission_free_slots())}
+    def prompt_admission_budgets(
+        self,
+        waiting_seqs: deque[Sequence],
+        chunk_prefill_size: int,
+    ) -> dict[str, int]:
+        """Return admission budgets used by Scheduler for new prompts.
+
+        Default behavior merges the reserved-prefill headroom into the same
+        budget that gates new-prompt admission. This keeps the first budget
+        check aligned with the later logical reservation accounting.
+        """
+        reserved = int(self.reserved_prefill_slots(waiting_seqs, chunk_prefill_size))
+        free_slots = int(self.prompt_admission_free_slots())
+        return {"slots": max(0, free_slots - reserved)}
 
     def prompt_admission_costs(self, seq: Sequence) -> dict[str, int]:
         """Return admission costs (per budget) used by Scheduler for new prompts."""

@@ -306,11 +306,16 @@ class DeltaKVCacheManager(CacheManager):
         # Defer admission until other sequences finish and free full-layer slots.
         return "defer"
 
-    def prompt_admission_budgets(self) -> dict[str, int]:
+    def prompt_admission_budgets(
+        self,
+        waiting_seqs: deque[Sequence],
+        chunk_prefill_size: int,
+    ) -> dict[str, int]:
         # Gate on both full-attention pool and (future) centers budget.
+        reserved = int(self.reserved_prefill_slots(waiting_seqs, chunk_prefill_size))
         centers_free = max(0, int(self._deltakv_centers_capacity) - int(self._deltakv_centers_reserved_total))
         return {
-            "full_layers": self.num_free_slots_full_layers(),
+            "full_layers": max(0, int(self.num_free_slots_full_layers()) - reserved),
             "deltakv_centers": centers_free,
         }
 

@@ -115,6 +115,8 @@ class SparseController:
              self._deltakv_eviction(seqs)
         if not is_prefill and self.sparse_method in ('snapkv', 'pyramidkv'):
             self._snapkv_decode_eviction(seqs)
+        if not is_prefill and self.sparse_method in ("streamingllm", "attention-sink", "attention_sink"):
+            self._streamingllm_decode_eviction(seqs)
 
     @torch.no_grad()
     def on_every_chunk_prefill_end(self, seqs: list[Sequence]):
@@ -134,6 +136,8 @@ class SparseController:
 
         if self.sparse_method == 'snapkv' or self.sparse_method == 'pyramidkv':
             self._snapkv_prefill_eviction(seqs)
+        if self.sparse_method in ("streamingllm", "attention-sink", "attention_sink"):
+            self._streamingllm_prefill_eviction(seqs)
 
     def get_read_view(self, layer_idx: int):
         """
@@ -142,7 +146,7 @@ class SparseController:
         """
         sparse_state = self.layer_batch_sparse_states[layer_idx]
         if (self.sparse_method in ("omnikv", "deltakv") and layer_idx in self.full_attn_layers) or \
-            self.sparse_method in ('snapkv', 'pyramidkv', 'quest', ''):
+            self.sparse_method in ('snapkv', 'pyramidkv', 'quest', 'streamingllm', 'attention-sink', 'attention_sink', ''):
 
             return (
                 self.cache_manager.get_layer_buffer_req_to_token_slots(layer_idx),  # 全部 token slots
@@ -316,6 +320,53 @@ class SparseController:
                     attn_scores[b_idx, :kv_len], kv_len, budget
                 )
                 self.cache_manager.free_part_slots(layer_idx, seq, keep_indices)
+
+    @torch.no_grad()
+    def _streamingllm_prefill_eviction(self, seqs: list[Sequence]):
+        budget = self._get_streamingllm_budget()
+        if budget is None:
+            return
+
+        for layer_idx in range(self.num_layers):
+            state = self.layer_batch_sparse_states[layer_idx]
+            for b_idx, seq in enumerate(seqs):
+                if not seq.is_last_chunk_prefill:
+                    continue
+                kv_len = int(state.context_lens[b_idx])
+                if kv_len <= budget:
+                    continue
+                keep_indices = self._streamingllm_select_indices(kv_len)
+                self.cache_manager.free_part_slots(layer_idx, seq, keep_indices)
+
+    @torch.no_grad()
+    def _streamingllm_decode_eviction(self, seqs: list[Sequence]):
+        budget = self._get_streamingllm_budget()
+        if budget is None:
+            return
+
+        for layer_idx in range(self.num_layers):
+            state = self.layer_batch_sparse_states[layer_idx]
+            for b_idx, seq in enumerate(seqs):
+                kv_len = int(state.context_lens[b_idx])
+                if kv_len <= budget:
+                    continue
+                keep_indices = self._streamingllm_select_indices(kv_len)
+                self.cache_manager.free_part_slots(layer_idx, seq, keep_indices)
+
+    def _get_streamingllm_budget(self) -> int | None:
+        budget = self.num_sink + self.num_recent
+        if budget <= 0:
+            return None
+        return budget
+
+    def _streamingllm_select_indices(self, kv_len: int) -> torch.Tensor:
+        assert kv_len > 0
+        device = "cuda"
+        sink_end = min(self.num_sink, kv_len)
+        recent_start = max(sink_end, kv_len - self.num_recent)
+        sink_indices = torch.arange(sink_end, device=device, dtype=torch.long)
+        recent_indices = torch.arange(recent_start, kv_len, device=device, dtype=torch.long)
+        return torch.cat([sink_indices, recent_indices], dim=0)
 
     def _snapkv_select_indices(self, scores: torch.Tensor, kv_len: int, budget: int) -> torch.Tensor:
         assert kv_len > budget

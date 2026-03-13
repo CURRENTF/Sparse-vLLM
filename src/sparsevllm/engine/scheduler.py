@@ -35,6 +35,7 @@ class Scheduler:
         
         self.waiting: deque[Sequence] = deque()
         self.decoding: deque[Sequence] = deque()
+        self._admission_defer_warned_seq_ids: set[int] = set()
 
     def _long_text_threshold(self, is_prefill: bool) -> int:
         """Long-text boundary for batch partitioning.
@@ -42,7 +43,10 @@ class Scheduler:
         Prefill: based on prompt length + chunk prefill size.
         Decode: based on current total tokens (prompt + generated), without chunk size.
         """
-        base = self.num_sink_tokens + self.num_top_tokens + self.num_recent_tokens
+        if self.config.vllm_sparse_method in ("streamingllm", "attention-sink", "attention_sink"):
+            base = self.num_sink_tokens + self.num_recent_tokens
+        else:
+            base = self.num_sink_tokens + self.num_top_tokens + self.num_recent_tokens
         return base + (self.chunk_prefill_size if is_prefill else 0)
 
     def _is_long_text(self, seq: Sequence, is_prefill: bool) -> bool:
@@ -93,6 +97,26 @@ class Scheduler:
     def _reserved_prefill_tokens(self) -> int:
         return int(self.memory_oracle.reserved_prefill_slots(self.waiting, self.chunk_prefill_size))
 
+    def _raise_prompt_admission_failure(
+        self,
+        seq: Sequence,
+        failed_budget: str,
+        need: int,
+        free: int,
+        *,
+        physical_free_count: int,
+        reserved_prefill: int,
+        logical_free_count: int,
+        admission_budgets: dict[str, int],
+    ):
+        raise RuntimeError(
+            "Insufficient KV cache slots to admit prompt. "
+            f"cache_manager={type(self.memory_oracle).__name__} prompt_len={seq.num_prompt_tokens} "
+            f"failed_budget={failed_budget} need={need} free={free} budgets={admission_budgets} "
+            f"free_slots={physical_free_count} reserved_prefill={reserved_prefill} "
+            f"logical_free={logical_free_count}"
+        )
+
     def schedule(self) -> tuple[list[Sequence], bool, list[Sequence]]:
         """
         核心调度逻辑。
@@ -107,89 +131,123 @@ class Scheduler:
         
         # 逻辑可用空间计数器，用于在本轮调度中预估显存占用
         physical_free_count = self.memory_oracle.num_free_slots
-        logical_free_count = max(0, physical_free_count - self._reserved_prefill_tokens())
+        reserved_prefill = self._reserved_prefill_tokens()
+        logical_free_count = max(0, physical_free_count - reserved_prefill)
         step_free_count = physical_free_count
-        admission_budgets = dict(self.memory_oracle.prompt_admission_budgets())
+        admission_budgets = dict(
+            self.memory_oracle.prompt_admission_budgets(self.waiting, self.chunk_prefill_size)
+        )
         margin_batched_tokens = self.memory_oracle.prefill_batched_tokens_margin()
+        deferred_prompt_failure: tuple[Sequence, str, int, int] | None = None
 
         # --- 阶段 1: Prefill 调度 ---
         # 只要 waiting 队列有活，就优先处理 Prefill，因为它是计算密集型的。
-        target_is_long = self._is_long_text(self.waiting[0], is_prefill=True) if self.waiting else False
+        prefill_bucket_order: list[bool] = []
+        if self.waiting:
+            first_bucket = self._is_long_text(self.waiting[0], is_prefill=True)
+            prefill_bucket_order.append(first_bucket)
+            prefill_bucket_order.append(not first_bucket)
 
-        while (self.waiting and step_free_count > 0 and
-               num_batched_tokens <= self.max_num_batched_tokens - margin_batched_tokens and
-               num_batched_seqs < self.max_num_seqs_in_batch and len(self.decoding) < self.max_decoding_seqs):
-
-            seq = self._pop_next_prefill_seq(target_is_long)
-            if seq is None:
+        for target_is_long in prefill_bucket_order:
+            if scheduled_seqs:
                 break
-            remaining_prefill_tokens = self.memory_oracle.remaining_prefill_tokens(seq)
-            
-            # 异常处理：如果由于某种原因已经 prefill 完却还在 waiting 队列
-            if remaining_prefill_tokens <= 0:
-                raise ValueError('BUG：理论上不应该在 waiting 里')
+            bucket_scan_budget = len(self.waiting)
+            while (
+                self.waiting
+                and bucket_scan_budget > 0
+                and step_free_count > 0
+                and num_batched_tokens <= self.max_num_batched_tokens - margin_batched_tokens
+                and num_batched_seqs < self.max_num_seqs_in_batch
+                and len(self.decoding) < self.max_decoding_seqs
+            ):
+                seq = self._pop_next_prefill_seq(target_is_long)
+                if seq is None:
+                    break
+                bucket_scan_budget -= 1
+                remaining_prefill_tokens = self.memory_oracle.remaining_prefill_tokens(seq)
 
-            # 确定本次 Chunk 的大小
-            can_prefill_tokens = min(
-                remaining_prefill_tokens,
-                self.chunk_prefill_size,
-                self.max_num_batched_tokens - num_batched_tokens,
-                step_free_count,
-            )
+                # 异常处理：如果由于某种原因已经 prefill 完却还在 waiting 队列
+                if remaining_prefill_tokens <= 0:
+                    raise ValueError('BUG：理论上不应该在 waiting 里')
 
-            if can_prefill_tokens <= 0:
-                logger.debug(f'{can_prefill_tokens=} 结束 schedule prefill 请求')
-                self.waiting.appendleft(seq)
-                break
-            
-            # 逻辑显存分配检查：如果是新序列的起始，检查是否能容纳完整的 Prompt 长度。
-            # 采用保守策略：预先逻辑占位整个 Prompt，即使后续可能会有稀疏逐出。
-            # 只要我想尽可能地持续生成某个序列，那就应该提前都申请出来
-            if seq.num_prefilled_tokens == 0:
-                costs = self.memory_oracle.prompt_admission_costs(seq)
-                failed = None
-                for name, need in costs.items():
-                    free = int(admission_budgets.get(name, 0) or 0)
-                    if free < int(need):
-                        failed = (name, int(need), free)
-                        break
-                if failed is not None:
-                    action = self.memory_oracle.prompt_admission_failure_action()
-                    if action == "defer":
-                        # Queue: stop admitting new prompts; let other work free space first.
-                        self.waiting.appendleft(seq)
-                        break
-                    # Fail fast instead of returning an empty schedule (which would deadlock callers).
-                    name, need, free = failed
-                    raise RuntimeError(
-                        "Insufficient KV cache slots to admit prompt. "
-                        f"cache_manager={type(self.memory_oracle).__name__} prompt_len={seq.num_prompt_tokens} "
-                        f"failed_budget={name} need={need} free={free} budgets={admission_budgets} "
-                        f"free_slots={physical_free_count} reserved_prefill={self._reserved_prefill_tokens()} "
-                        f"logical_free={logical_free_count}"
-                    )
-                for name, need in costs.items():
-                    admission_budgets[name] = int(admission_budgets.get(name, 0) or 0) - int(need)
-                self.memory_oracle.on_prompt_admitted(seq, costs)
-                logical_need = self.memory_oracle.prompt_logical_reservation_cost(seq)
-                if logical_free_count < logical_need:
-                    # Fail fast: this cache manager requires the logical budget to hold the whole prompt.
-                    raise RuntimeError(
-                        "Insufficient logical KV cache slots to admit prompt. "
-                        f"cache_manager={type(self.memory_oracle).__name__} prompt_len={seq.num_prompt_tokens} "
-                        f"logical_need={logical_need} logical_free={logical_free_count} "
-                        f"free_slots={physical_free_count} reserved_prefill={self._reserved_prefill_tokens()}"
-                    )
-                logical_free_count -= int(logical_need)
+                # 确定本次 Chunk 的大小
+                can_prefill_tokens = min(
+                    remaining_prefill_tokens,
+                    self.chunk_prefill_size,
+                    self.max_num_batched_tokens - num_batched_tokens,
+                    step_free_count,
+                )
 
-            # 设置当前 Chunk 属性并标记状态
-            logger.debug(f'Add chunk prefill with {can_prefill_tokens} tokens.')
-            seq.current_chunk_size = can_prefill_tokens
-            num_batched_seqs += 1
-            num_batched_tokens += can_prefill_tokens
-            step_free_count -= can_prefill_tokens
-            seq.status = SequenceStatus.RUNNING
-            scheduled_seqs.append(seq)
+                if can_prefill_tokens <= 0:
+                    logger.debug(f'{can_prefill_tokens=} 结束 schedule prefill 请求')
+                    self.waiting.appendleft(seq)
+                    break
+
+                # 逻辑显存分配检查：如果是新序列的起始，检查是否能容纳完整的 Prompt 长度。
+                # 采用保守策略：预先逻辑占位整个 Prompt，即使后续可能会有稀疏逐出。
+                # 只要我想尽可能地持续生成某个序列，那就应该提前都申请出来
+                if seq.num_prefilled_tokens == 0:
+                    costs = self.memory_oracle.prompt_admission_costs(seq)
+                    failed = None
+                    for name, need in costs.items():
+                        free = int(admission_budgets.get(name, 0) or 0)
+                        if free < int(need):
+                            failed = (name, int(need), free)
+                            break
+                    if failed is not None:
+                        action = self.memory_oracle.prompt_admission_failure_action()
+                        name, need, free = failed
+                        if action == "defer":
+                            if deferred_prompt_failure is None:
+                                deferred_prompt_failure = (seq, name, need, free)
+                            if seq.seq_id not in self._admission_defer_warned_seq_ids:
+                                logger.warning(
+                                    "Prompt admission deferred because the current batch/KV budget is saturated. "
+                                    f"seq_id={seq.seq_id} prompt_len={seq.num_prompt_tokens} "
+                                    f"failed_budget={name} need={need} free={free} "
+                                    f"waiting={len(self.waiting) + 1} decoding={len(self.decoding)} "
+                                    f"scheduled_prefill={len(scheduled_seqs)} free_slots={physical_free_count} "
+                                    f"reserved_prefill={reserved_prefill}. "
+                                    "This usually means batch size is too large for the current KV budget."
+                                )
+                                self._admission_defer_warned_seq_ids.add(seq.seq_id)
+                            self.waiting.append(seq)
+                            continue
+                        self._raise_prompt_admission_failure(
+                            seq,
+                            name,
+                            need,
+                            free,
+                            physical_free_count=physical_free_count,
+                            reserved_prefill=reserved_prefill,
+                            logical_free_count=logical_free_count,
+                            admission_budgets=admission_budgets,
+                        )
+                    self._admission_defer_warned_seq_ids.discard(seq.seq_id)
+                    for name, need in costs.items():
+                        admission_budgets[name] = int(admission_budgets.get(name, 0) or 0) - int(need)
+                    self.memory_oracle.on_prompt_admitted(seq, costs)
+                    logical_need = self.memory_oracle.prompt_logical_reservation_cost(seq)
+                    if logical_free_count < logical_need:
+                        # Fail fast: admission budgets should already account for reserved prefill headroom.
+                        # Reaching this branch usually means a cache-manager-specific budget mismatch.
+                        raise RuntimeError(
+                            "Prompt admission budget mismatch after reservation check. "
+                            f"cache_manager={type(self.memory_oracle).__name__} prompt_len={seq.num_prompt_tokens} "
+                            f"logical_need={logical_need} logical_free={logical_free_count} "
+                            f"budgets={admission_budgets} costs={costs} "
+                            f"free_slots={physical_free_count} reserved_prefill={reserved_prefill}"
+                        )
+                    logical_free_count -= int(logical_need)
+
+                # 设置当前 Chunk 属性并标记状态
+                logger.debug(f'Add chunk prefill with {can_prefill_tokens} tokens.')
+                seq.current_chunk_size = can_prefill_tokens
+                num_batched_seqs += 1
+                num_batched_tokens += can_prefill_tokens
+                step_free_count -= can_prefill_tokens
+                seq.status = SequenceStatus.RUNNING
+                scheduled_seqs.append(seq)
 
         # 如果有 Prefill 请求被选中，直接返回，本次 step 只跑 Prefill。
         if scheduled_seqs:
@@ -230,6 +288,17 @@ class Scheduler:
                 # logger.debug('Add a decode req.')
         
         if not scheduled_seqs:
+            if deferred_prompt_failure is not None and not self.decoding:
+                seq, name, need, free = deferred_prompt_failure
+                raise RuntimeError(
+                    "All prompt admissions were deferred and no runnable work remains. "
+                    f"cache_manager={type(self.memory_oracle).__name__} seq_id={seq.seq_id} "
+                    f"prompt_len={seq.num_prompt_tokens} failed_budget={name} need={need} free={free} "
+                    f"free_slots={physical_free_count} reserved_prefill={reserved_prefill} "
+                    f"waiting={len(self.waiting)} decoding={len(self.decoding)}. "
+                    "Reduce batch size/max_num_seqs_in_batch/max_num_batched_tokens, "
+                    "or shorten the prompt / generation budget."
+                )
             return [], False, preempted_seqs
             
         # 将被选中的 Decode 序列放回 running 队列以保持顺序

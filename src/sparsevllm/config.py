@@ -25,7 +25,7 @@ class Config:
     num_kvcache_slots: int | list = -1
 
     # Sparse Attention Config
-    vllm_sparse_method: str = ""  # "", "snapkv", "omnikv", "quest", "deltakv", "deltakv-triton", "deltakv-triton-v2", "deltakv-triton-v3", "deltakv-triton-v4", "deltakv-triton-v3-offload", "deltakv-triton-v3-cuda-offload", "pyramidkv", "dsa"
+    vllm_sparse_method: str = ""  # "", "streamingllm", "attention-sink", "attention_sink", "snapkv", "omnikv", "quest", "deltakv", "deltakv-triton", "deltakv-triton-v2", "deltakv-triton-v3", "deltakv-triton-v4", "deltakv-triton-v3-offload", "deltakv-triton-v3-cuda-offload", "pyramidkv", "dsa"
 
     # General Sparse Config
     num_sink_tokens: int = 64
@@ -113,6 +113,8 @@ class Config:
             
         if self.vllm_sparse_method is None:
             self.vllm_sparse_method = ""
+        elif self.vllm_sparse_method in ("attention-sink", "attention_sink"):
+            self.vllm_sparse_method = "streamingllm"
         
         if self.num_top_tokens_in_prefill is None:
             self.num_top_tokens_in_prefill = self.num_top_tokens

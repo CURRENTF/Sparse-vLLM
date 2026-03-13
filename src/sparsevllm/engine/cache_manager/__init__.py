@@ -6,6 +6,7 @@ __all__ = [
     "CacheManager",
     "LayerBatchStates",
     "StandardCacheManager",
+    "StreamingLLMCacheManager",
     "SnapKVCacheManager",
     "QuestCacheManager",
     "OmniKVCacheManager",
@@ -25,6 +26,10 @@ def __getattr__(name: str):
         from .standard import StandardCacheManager
 
         return StandardCacheManager
+    if name == "StreamingLLMCacheManager":
+        from .streamingllm import StreamingLLMCacheManager
+
+        return StreamingLLMCacheManager
     if name == "SnapKVCacheManager":
         from .snapkv import SnapKVCacheManager
 

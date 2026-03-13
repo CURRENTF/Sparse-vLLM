@@ -97,6 +97,7 @@ Sparse-vLLM runtime knobs are defined in `src/sparsevllm/config.py` and can be p
 Set `vllm_sparse_method` to one of:
 
 - `""` (vanilla / full attention)
+- `"streamingllm"` / `"attention-sink"` (fixed sink + recent-window physical eviction)
 - `"snapkv"`, `"pyramidkv"` (physical eviction)
 - `"omnikv"` (logical masking)
 - `"quest"` (query-aware page selection on decode; prefill stays full attention)

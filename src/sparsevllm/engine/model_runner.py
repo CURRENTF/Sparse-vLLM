@@ -157,11 +157,14 @@ class ModelRunner:
             self.cache_manager.free_seq(seq_id)
 
     def _long_text_threshold(self, is_prefill: bool) -> int:
-        base = (
-            self.config.num_sink_tokens
-            + self.config.num_recent_tokens
-            + self.config.num_top_tokens
-        )
+        if self.config.vllm_sparse_method in ("streamingllm", "attention-sink", "attention_sink"):
+            base = self.config.num_sink_tokens + self.config.num_recent_tokens
+        else:
+            base = (
+                self.config.num_sink_tokens
+                + self.config.num_recent_tokens
+                + self.config.num_top_tokens
+            )
         return base + (self.config.chunk_prefill_size if is_prefill else 0)
 
     def _is_long_text_batch(self, seqs: list[Sequence], is_prefill: bool) -> bool:
