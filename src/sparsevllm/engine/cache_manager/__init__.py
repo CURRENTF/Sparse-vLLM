@@ -7,6 +7,7 @@ __all__ = [
     "LayerBatchStates",
     "StandardCacheManager",
     "SnapKVCacheManager",
+    "QuestCacheManager",
     "OmniKVCacheManager",
     "DeepSeekMLACacheManager",
     "DeltaKVCacheManager",
@@ -28,6 +29,10 @@ def __getattr__(name: str):
         from .snapkv import SnapKVCacheManager
 
         return SnapKVCacheManager
+    if name == "QuestCacheManager":
+        from .quest import QuestCacheManager
+
+        return QuestCacheManager
     if name == "OmniKVCacheManager":
         from .omnikv import OmniKVCacheManager
 

@@ -12,7 +12,7 @@
 
 This repo is primarily a **sparse-first inference engine** (`sparsevllm`). It also contains DeltaKV compressor training + evaluation tooling (`deltakv`).
 
-*Model checkpoints and datasets are all about to be uploaded.*
+*Model checkpoints and datasets for DeltaKV are all about to be uploaded.*
 
 ## Sparse-vLLM
 
@@ -28,6 +28,11 @@ At a high level, Sparse-vLLM supports:
 
 More sparse methods can be added over time. The modular `CacheManager` design keeps it straightforward to integrate new
 methods efficiently without rewriting the whole engine.
+
+> If you want Codex to add a new sparse method following this repo's architecture, use the repo skill
+[`$add-sparse-method`](skills/add-sparse-method/SKILL.md). It encodes the expected structure for new methods
+(`cache_manager`-first, generic `attention.py`, decode-time hooks through `build_decode_view(...)`, and method-specific
+state kept out of `utils/`).
 
 ### Install
 

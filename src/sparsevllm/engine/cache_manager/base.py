@@ -126,6 +126,10 @@ class CacheManager(ABC):
             from .snapkv import SnapKVCacheManager
 
             return SnapKVCacheManager(config, rank, world_size)
+        if sparse_method == "quest":
+            from .quest import QuestCacheManager
+
+            return QuestCacheManager(config, rank, world_size)
         if sparse_method == "omnikv":
             from .omnikv import OmniKVCacheManager
 
@@ -204,6 +208,24 @@ class CacheManager(ABC):
     @abstractmethod
     def get_layer_buffer_req_to_token_slots(self, layer_idx: int) -> torch.Tensor:
         raise NotImplementedError
+
+    def on_kv_stored(self, layer_idx: int, k: torch.Tensor, slot_mapping: torch.Tensor):
+        """Optional method-specific hook after KV has been written into cache."""
+        return None
+
+    def build_decode_view(
+        self,
+        layer_idx: int,
+        q: torch.Tensor,
+        active_slots: torch.Tensor,
+        req_indices: torch.Tensor,
+        context_lens: torch.Tensor,
+        *,
+        num_heads: int,
+        num_kv_heads: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Optional method-specific decode-time logical view builder."""
+        return active_slots, req_indices, context_lens
 
     @property
     @abstractmethod

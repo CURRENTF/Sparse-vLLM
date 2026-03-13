@@ -72,6 +72,7 @@ class Attention(nn.Module):
         # 1. 写入 KV Cache (物理行为)
         # 无论是 DeltaKV 还是全量/SnapKV，均先将当前 KV 写入物理槽位 (对于 DeltaKV，是写入 Base Pool 作为 Recent)
         store_kvcache(k, v, k_cache, v_cache, slot_mapping)
+        cache_manager.on_kv_stored(context.now_layer_idx, k, slot_mapping)
 
         # 2. 获取逻辑视图
         layer_active_slots, layer_active_indices, layer_req_indices, layer_context_lens, layer_attn_score, deltakv_temp_slots = \
@@ -103,13 +104,13 @@ class Attention(nn.Module):
                 )
             else:    # decode
                 batch_size = q.shape[0]
-                layer_active_slots, b_req_idx, layer_context_lens = sparse_controller.build_decode_view(
+                layer_active_slots, b_req_idx, layer_context_lens = cache_manager.build_decode_view(
                     context.now_layer_idx,
                     q,
-                    k_cache,
                     layer_active_slots,
                     b_req_idx,
                     layer_context_lens,
+                    num_heads=self.num_heads,
                     num_kv_heads=self.num_kv_heads,
                 )
 
