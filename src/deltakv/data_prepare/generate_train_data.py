@@ -10,7 +10,6 @@ from torch.utils.data import IterableDataset, DataLoader
 from datasets import IterableDataset as HfIterableDataset
 from datasets import Dataset, load_dataset
 from transformers import AutoTokenizer, set_seed
-from datatrove.pipeline.readers import ParquetReader
 from tqdm import tqdm
 
 set_seed(218)
@@ -155,6 +154,7 @@ def shuffle_jsonl(input_path, output_path):
 # =================== 各 Version 的数据处理函数 ===================
 
 def process_v2_4(model_cls, tkn, data_max_len, num_workers, num_samples=100_000):
+    from datatrove.pipeline.readers import ParquetReader
     data_fineweb_edu = ParquetReader("/root/autodl-fs/datasets/fineweb-edu/sample/10BT")()
     # data_hermes = get_any_dataset("../datasets/OpenHermes-2.5", tkn)["train"]
     output_path = f"/root/autodl-fs/datasets/deltakv_{model_cls}_train_num{num_samples}"
@@ -183,6 +183,7 @@ def process_v2_4(model_cls, tkn, data_max_len, num_workers, num_samples=100_000)
     print(f"有{cnt}条数据")
 
 def process_v3_0(model_cls, tkn, data_max_len, num_workers, num_samples=100_000):
+    from datatrove.pipeline.readers import ParquetReader
     # Fineweb-edu
     data_fineweb_edu = ParquetReader("/root/autodl-fs/datasets/fineweb-edu/sample/10BT")()
     # CCI3-HQ (CHI)
@@ -219,10 +220,25 @@ def process_v3_0(model_cls, tkn, data_max_len, num_workers, num_samples=100_000)
     data = Dataset.from_list(data_lst)
     data.shuffle(seed=218).save_to_disk(output_path)
 
-def process_vr1_0(model_cls, tkn, data_max_len, num_workers, num_samples=100_000):
-    dataset_path = "/autodl-fs/data/datasets/AM-DeepSeek-R1-Distilled-1.4M-am_0.5M_sample100k"
-    # 使用 load_from_disk 加载处理好的数据集
-    raw_dataset = load_dataset(dataset_path, split='train')
+def process_vr1_0(
+    model_cls,
+    tkn,
+    data_max_len,
+    num_workers,
+    num_samples=100_000,
+    dataset_path=None,
+    output_root=None,
+):
+    dataset_path = dataset_path or os.path.expanduser(
+        "~/datasets/AM-DeepSeek-R1-Distilled-1.4M-am_0.9M_sample100k"
+    )
+    output_root = output_root or os.path.expanduser("~/datasets")
+
+    parquet_glob = os.path.join(dataset_path, "data", "*.parquet")
+    if os.path.isdir(dataset_path) and os.path.isdir(os.path.join(dataset_path, "data")):
+        raw_dataset = load_dataset("parquet", data_files=parquet_glob, split="train")
+    else:
+        raw_dataset = load_dataset(dataset_path, split="train")
     
     def data_gen():
         for sample in raw_dataset:
@@ -239,7 +255,7 @@ def process_vr1_0(model_cls, tkn, data_max_len, num_workers, num_samples=100_000
                     text += f"{m['role']}: {m['content']}\n"
             yield {"text": text}
 
-    output_path = f"/root/autodl-fs/datasets/deltakv_{model_cls}_train_vr1.0_num{num_samples}"
+    output_path = os.path.join(output_root, f"deltakv_{model_cls}_train_vr1.0_num{num_samples}")
     if data_max_len != 1024:
         output_path += f"_seqlen{data_max_len}"
     os.makedirs(output_path, exist_ok=True)
@@ -266,6 +282,8 @@ def main(
     num_workers=2,
     data_max_len=1024,
     num_samples=100_000,
+    dataset_path=None,
+    output_root=None,
 ):
     tkn = AutoTokenizer.from_pretrained(tkn_path, use_fast=True)
     print("bos", tkn.bos_token)
@@ -275,6 +293,8 @@ def main(
         model_cls = "llama3"
     elif "llama-2" in tkn_path.lower():
         model_cls = "llama2"
+    elif "qwen3" in tkn_path.lower():
+        model_cls = "qwen3"
     elif "qwen" in tkn_path.lower():
         model_cls = "qwen"
     elif "phi" in tkn_path.lower():
@@ -288,7 +308,15 @@ def main(
     elif version == "v3.0":
         process_v3_0(model_cls, tkn, data_max_len, num_workers, num_samples)
     elif version == "vr1.0":
-        process_vr1_0(model_cls, tkn, data_max_len, num_workers, num_samples)
+        process_vr1_0(
+            model_cls,
+            tkn,
+            data_max_len,
+            num_workers,
+            num_samples,
+            dataset_path=dataset_path,
+            output_root=output_root,
+        )
     else:
         raise ValueError(f"Unsupported version: {version}")
 

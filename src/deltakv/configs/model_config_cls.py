@@ -1,4 +1,5 @@
 from transformers.models.qwen2.modeling_qwen2 import Qwen2Config
+from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.models.llama.modeling_llama import LlamaConfig
 from deltakv.utils.log import logger
 
@@ -133,6 +134,11 @@ class CustomConfigMixin:
 
 
 class KVQwen2Config(CustomConfigMixin, Qwen2Config):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+
+class KVQwen3Config(CustomConfigMixin, Qwen3Config):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
