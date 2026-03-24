@@ -1,0 +1,15 @@
+fire
+torch
+transformers[torch]==4.53.3
+accelerate
+deepspeed
+datasets
+matplotlib
+seaborn
+wandb
+loguru
+ansible
+flash-attn
+datatrove
+tqdm
+loguru

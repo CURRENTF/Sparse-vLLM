@@ -1,3 +1,29 @@
+Metadata-Version: 2.4
+Name: deltakv
+Version: 0.1.0
+Summary: DeltaKV: Compressing KV Cache for Efficient Inference
+Author: DeltaKV Team
+License: Apache-2.0
+Requires-Python: >=3.8
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: fire
+Requires-Dist: torch
+Requires-Dist: transformers[torch]==4.53.3
+Requires-Dist: accelerate
+Requires-Dist: deepspeed
+Requires-Dist: datasets
+Requires-Dist: matplotlib
+Requires-Dist: seaborn
+Requires-Dist: wandb
+Requires-Dist: loguru
+Requires-Dist: ansible
+Requires-Dist: flash-attn
+Requires-Dist: datatrove
+Requires-Dist: tqdm
+Requires-Dist: loguru
+Dynamic: license-file
+
 ![sparse_vllm_throughput.png](assets/sparse_vllm_throughput.png)
 
 <p align="center">

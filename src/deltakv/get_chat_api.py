@@ -12,6 +12,14 @@ def load_compressor(compressor_path, device='cuda:0'):
     return state_dict
 
 
+def _as_bool(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
+
+
 def top_k_top_p_filtering(logits, top_k=0, top_p=1.0, filter_value=-float("Inf"), min_tokens_to_keep=1):
     """ Filter a distribution of logits using top-k and/or nucleus (top-p) filtering
         Args:
@@ -488,12 +496,99 @@ def get_generate_api(model_path: str, infer_config: dict, compressor_path: str,
             gqa_support=infer_config.get('gqa_support', False),
             gqa_func=infer_config.get('gqa_func', 'mean')
         )
+    elif model_cls == 'kvzip':
+        print('💡💡💡 KVzip')
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        kvzip_base_dir = os.path.abspath(os.path.join(current_dir, "../../baselines/kvzip"))
+        if kvzip_base_dir not in sys.path:
+            sys.path.insert(0, kvzip_base_dir)
+
+        from model import ModelKVzip
+
+        kvzip_model = ModelKVzip(
+            model_path,
+            kv_type=infer_config.get('kv_type', 'evict'),
+        )
+        base_gen_kwargs = kvzip_model.gen_kwargs.copy()
+        default_prefill_chunk_size = int(
+            infer_config.get('prefill_chunk_size', infer_config.get('chunk_prefill_size', 16000))
+        )
+        default_ratio = float(infer_config.get('ratio', 0.3))
+        default_level = infer_config.get('level', 'pair')
+        default_load_score = _as_bool(infer_config.get('load_score', False))
+        default_do_score = _as_bool(infer_config.get('do_score', True))
+        default_update_cache = _as_bool(infer_config.get('update_cache', False))
+        model = kvzip_model.model
+        tokenizer = kvzip_model.tokenizer
+
+        def generate(prompt: Union[str, List[str]], past_key_values=None, **kwargs):
+            if past_key_values is not None:
+                raise ValueError('KVzip adapter does not support external past_key_values.')
+
+            if isinstance(prompt, str):
+                prompts = [prompt]
+                is_single = True
+            else:
+                prompts = prompt
+                is_single = False
+
+            prefill_chunk_size = int(kwargs.pop('prefill_chunk_size', default_prefill_chunk_size))
+            ratio = float(kwargs.pop('ratio', default_ratio))
+            level = kwargs.pop('level', default_level)
+            load_score = _as_bool(kwargs.pop('load_score', default_load_score))
+            do_score = _as_bool(kwargs.pop('do_score', default_do_score))
+            update_cache = _as_bool(kwargs.pop('update_cache', default_update_cache))
+
+            gen_kwargs = base_gen_kwargs.copy()
+            gen_kwargs.update({
+                'max_new_tokens': kwargs.pop('max_new_tokens', base_gen_kwargs.get('max_new_tokens', 512)),
+                'do_sample': kwargs.pop('do_sample', base_gen_kwargs.get('do_sample', False)),
+                'temperature': kwargs.pop('temperature', base_gen_kwargs.get('temperature', 1.0)),
+                'top_p': kwargs.pop('top_p', base_gen_kwargs.get('top_p', 1)),
+                'top_k': kwargs.pop('top_k', base_gen_kwargs.get('top_k', None)),
+            })
+
+            eos_token_id = kwargs.pop('eos_token_id', None)
+            if eos_token_id is not None:
+                gen_kwargs['eos_token_id'] = eos_token_id
+
+            if kwargs:
+                raise ValueError(f'Unsupported KVzip generation kwargs: {sorted(kwargs.keys())}')
+
+            results = []
+            old_gen_kwargs = kvzip_model.gen_kwargs
+            kvzip_model.gen_kwargs = gen_kwargs
+            try:
+                for single_prompt in prompts:
+                    kv = kvzip_model.prefill(
+                        single_prompt,
+                        prefill_chunk_size=prefill_chunk_size,
+                        load_score=load_score,
+                        do_score=do_score,
+                    )
+                    kv.prune(ratio=ratio, level=level)
+                    empty_query = torch.empty((1, 0), dtype=torch.long, device=kvzip_model.device)
+                    results.append(kvzip_model.generate(empty_query, kv=kv, update_cache=update_cache))
+            finally:
+                kvzip_model.gen_kwargs = old_gen_kwargs
+
+            if return_kv_cache:
+                return (results[0], None) if is_single else (results, None)
+            return results[0] if is_single else results
+
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = 'left'
+
+        if return_model:
+            return generate, model
+        return generate
     else:
         raise ValueError(f"Unknown model_cls: {model_cls}")
 
     manual_chunk_prefill_size = int(os.environ.get('MANUAL_GEN_CHUNK_PREFILL_SIZE', 0))
     if manual_chunk_prefill_size > 0:
-        assert model_cls == 'kivi' or model_cls == 'palu' or model_cls == 'quest', '其他方法在代码内部实现了chunk prefill'
+        assert model_cls == 'kivi' or model_cls == 'palu' or model_cls == 'quest' or model_cls == 'kvzip', '其他方法在代码内部实现了chunk prefill'
 
     model.eval()
     if tokenizer_path is None:
