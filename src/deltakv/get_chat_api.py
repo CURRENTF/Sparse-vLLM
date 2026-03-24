@@ -547,6 +547,9 @@ def get_generate_api(model_path: str, infer_config: dict, compressor_path: str,
                 'top_p': kwargs.pop('top_p', base_gen_kwargs.get('top_p', 1)),
                 'top_k': kwargs.pop('top_k', base_gen_kwargs.get('top_k', None)),
             })
+            num_beams = int(kwargs.pop('num_beams', 1))
+            if num_beams != 1:
+                raise ValueError(f'KVzip adapter only supports num_beams=1, got {num_beams}')
 
             eos_token_id = kwargs.pop('eos_token_id', None)
             if eos_token_id is not None:
@@ -560,15 +563,17 @@ def get_generate_api(model_path: str, infer_config: dict, compressor_path: str,
             kvzip_model.gen_kwargs = gen_kwargs
             try:
                 for single_prompt in prompts:
+                    prompt_ids = kvzip_model.encode(single_prompt)
+                    prefill_ids = prompt_ids[:, :-1]
+                    query_ids = prompt_ids[:, -1:]
                     kv = kvzip_model.prefill(
-                        single_prompt,
+                        prefill_ids,
                         prefill_chunk_size=prefill_chunk_size,
                         load_score=load_score,
                         do_score=do_score,
                     )
                     kv.prune(ratio=ratio, level=level)
-                    empty_query = torch.empty((1, 0), dtype=torch.long, device=kvzip_model.device)
-                    results.append(kvzip_model.generate(empty_query, kv=kv, update_cache=update_cache))
+                    results.append(kvzip_model.generate(query_ids, kv=kv, update_cache=update_cache))
             finally:
                 kvzip_model.gen_kwargs = old_gen_kwargs
 

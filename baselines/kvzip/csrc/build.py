@@ -9,6 +9,7 @@ from pathlib import Path
 
 from packaging.version import Version, parse
 from setuptools import find_packages, setup
+import torch
 from torch.utils.cpp_extension import (
     CUDA_HOME,
     BuildExtension,
@@ -22,13 +23,27 @@ PACKAGE_NAME = "tiny_pkg"
 ext_modules = []
 generator_flag = []
 cc_flag = []
+_seen_arches = set()
+
+
+def add_cuda_arch(major: int, minor: int):
+    arch = f"{major}{minor}"
+    if arch in _seen_arches:
+        return
+    _seen_arches.add(arch)
+    cc_flag.append("-gencode")
+    cc_flag.append(f"arch=compute_{arch},code=sm_{arch}")
+
+
 # 1. Target NVIDIA A100, RTX3090 (Ampere)
-cc_flag.append("-gencode")
-cc_flag.append("arch=compute_80,code=sm_80")
+add_cuda_arch(8, 0)
 
 # 2. Target NVIDIA H100 (Hopper)
-cc_flag.append("-gencode")
-cc_flag.append("arch=compute_90,code=sm_90")
+add_cuda_arch(9, 0)
+
+# 3. Also target the current build machine's GPU architecture when available.
+if torch.cuda.is_available():
+    add_cuda_arch(*torch.cuda.get_device_capability())
 
 
 # helper function to get cuda version
