@@ -1,0 +1,1 @@
+让 cache manager 管理 rope module 或者其他位置编码相关的 module
