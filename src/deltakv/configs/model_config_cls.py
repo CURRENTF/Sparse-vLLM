@@ -3,6 +3,16 @@ from transformers.models.llama.modeling_llama import LlamaConfig
 from deltakv.utils.log import logger
 
 
+def parse_full_attn_layers(full_attn_layers):
+    if full_attn_layers is None:
+        return []
+    if isinstance(full_attn_layers, str):
+        if not full_attn_layers.strip():
+            return []
+        return [int(part.strip()) for part in full_attn_layers.split(',') if part.strip()]
+    return [int(part) for part in full_attn_layers]
+
+
 class CustomConfigMixin:
     """
     提供简便的方法来批量更新自定义参数。
@@ -35,6 +45,7 @@ class CustomConfigMixin:
         num_top_tokens_in_prefill=4096,
         num_sink_tokens=8,
         omnikv_score_method='last',
+        deltakv_use_omnikv_selection=True,
         snapkv_num_full_layers=0,
         use_compression=False,
         use_cluster=False,
@@ -72,11 +83,12 @@ class CustomConfigMixin:
         self.cluster_soft_assignment = cluster_soft_assignment
         self.tail_token_size = tail_token_size
         self.tail_token_size = num_recent_tokens
-        self.full_attn_layers = full_attn_layers
+        self.full_attn_layers = parse_full_attn_layers(full_attn_layers)
         self.num_top_tokens = num_top_tokens
         self.num_top_tokens_in_prefill = num_top_tokens_in_prefill
         self.num_sink_tokens = num_sink_tokens
         self.omnikv_score_method = omnikv_score_method
+        self.deltakv_use_omnikv_selection = deltakv_use_omnikv_selection
         self.snapkv_num_full_layers = snapkv_num_full_layers
         self.use_compression = use_compression
         self.use_cluster = use_cluster
@@ -120,6 +132,8 @@ class CustomConfigMixin:
 
         for key, value in kwargs.items():
             if hasattr(self, key):
+                if key == 'full_attn_layers':
+                    value = parse_full_attn_layers(value)
                 setattr(self, key, value)
                 print(f"[Config] Setting {key} = {value}")
             else:

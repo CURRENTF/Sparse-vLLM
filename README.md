@@ -217,7 +217,7 @@ python benchmark/long_bench/pred.py \
   --hyper_param '{"chunk_prefill_size": 2048000, "num_top_tokens_in_prefill": 4096, "chunk_prefill_accel_omnikv": true, "num_top_tokens": 0.11, "full_attn_layers": "0,1,2,4,7,14", "num_recent_tokens": 128, "num_sink_tokens": 8, "use_compression": true, "use_cluster": true, "cluster_ratio": 0.1}'
 ```
 
-To compare other baselines, keep `--backend hf` and switch `--model_cls` / `--hyper_param`, e.g. `snapkv` with `{"num_top_tokens": 0.2, "pool_kernel_size": 7}`, `pyramidkv` with a similar token budget, or `kvzip` with `{"ratio": 0.3, "level": "pair", "kv_type": "evict", "prefill_chunk_size": 16000}`.
+To compare other baselines, keep `--backend hf` and switch `--model_cls` / `--hyper_param`, e.g. `omnikv` with `{"chunk_prefill_size": 4096, "num_top_tokens_in_prefill": 4096, "num_top_tokens": 2048, "full_attn_layers": "0,1,2,4,7,14", "num_recent_tokens": 128, "num_sink_tokens": 8}`, `snapkv` with `{"num_top_tokens": 0.2, "pool_kernel_size": 7}`, `pyramidkv` with a similar token budget, `kivi` with `{"k_bits": 4, "v_bits": 4, "group_size": 32, "residual_length": 128}` for Llama/Mistral checkpoints, or `kvzip` with `{"ratio": 0.3, "level": "pair", "kv_type": "evict", "prefill_chunk_size": 16000}`.
 
 For `kvzip`, the vendored baseline lives in `baselines/kvzip/`. Build its CUDA extension first:
 

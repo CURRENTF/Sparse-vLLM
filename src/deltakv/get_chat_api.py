@@ -4,6 +4,7 @@ import torch
 from typing import Union, List
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 from deltakv.configs.model_config_cls import KVQwen2Config, KVLlamaConfig
+from deltakv.baseline_adapters import load_omnikv_model, load_kivi_model
 from safetensors.torch import load_file
 
 
@@ -318,6 +319,10 @@ def get_generate_api(model_path: str, infer_config: dict, compressor_path: str,
             attn_implementation="flash_attention_2",
         )
 
+    elif model_cls == 'omnikv':
+        print('💡💡💡 OmniKV')
+        model = load_omnikv_model(model_path, infer_config, cuda_device)
+
     elif model_cls == 'auto':
         print('💡💡💡 Auto')
         model = AutoModelForCausalLM.from_pretrained(
@@ -417,34 +422,7 @@ def get_generate_api(model_path: str, infer_config: dict, compressor_path: str,
 
     elif model_cls == 'kivi':
         print('💡💡💡 KIVI')
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        kivi_base_dir = os.path.abspath(os.path.join(current_dir, "../../baselines/kivi"))
-        if kivi_base_dir not in sys.path:
-            sys.path.insert(0, kivi_base_dir)
-
-        base_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-        
-        # 配置 KIVI 参数
-        base_config.k_bits = infer_config.get('k_bits', 2)
-        base_config.v_bits = infer_config.get('v_bits', 2)
-        base_config.group_size = infer_config.get('group_size', 32)
-        base_config.residual_length = infer_config.get('residual_length', 32)
-        base_config.use_flash = True
-
-        if base_config.model_type == 'llama' or 'llama' in model_path.lower():
-            from models.llama_kivi import LlamaForCausalLM_KIVI as KVModel
-        elif base_config.model_type == 'mistral' or 'mistral' in model_path.lower():
-            from models.mistral_kivi import MistralForCausalLM_KIVI as KVModel
-        else:
-            raise ValueError(f"KIVI does not support model type: {base_config.model_type}")
-
-        model = KVModel.from_pretrained(
-            model_path,
-            config=base_config,
-            torch_dtype=torch.float16,
-            device_map=cuda_device,
-            low_cpu_mem_usage=True,
-        )
+        model = load_kivi_model(model_path, infer_config, cuda_device)
     elif model_cls == 'adakv':
         print('💡💡💡 AdaKV')
         os.environ['ENABLE_HF_GEN'] = '1'  # 生成hack流程依赖于generate函数

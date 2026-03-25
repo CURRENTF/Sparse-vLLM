@@ -6,7 +6,7 @@ from torch import nn
 import torch.nn.functional as F
 from transformers import DynamicCache
 
-from deltakv.configs.model_config_cls import KVQwen2Config
+from deltakv.configs.model_config_cls import KVQwen2Config, parse_full_attn_layers
 from sparsevllm.triton_kernel.quant import triton_quantize_and_pack_along_last_dim, unpack_4bit_to_16bit
 from sparsevllm.utils.log import log_once
 
@@ -108,15 +108,15 @@ class CompressedKVCache(BaseCache):
         self._seen_tokens = 0  # Used in `generate` to keep tally of how many tokens the cache has seen
         self.comp_kv_cache = {}
         self.bases_cache = {}
+        self.comp_kv_scales = {}
+        self.comp_kv_mins = {}
         self.buffer_key_cache = {}
         self.buffer_value_cache = {}
         self.sink_key_cache = {}
         self.sink_value_cache = {}
 
-        if isinstance(config.full_attn_layers, str):
-            config.full_attn_layers = config.full_attn_layers.split(',')
-        self.full_attn_layers = [int(_) for _ in config.full_attn_layers]
-        assert 0 in self.full_attn_layers
+        self.full_attn_layers = parse_full_attn_layers(config.full_attn_layers)
+        config.full_attn_layers = self.full_attn_layers
 
         self.layer_to_full_layer_idx = {}
         _last = None
@@ -164,6 +164,49 @@ class CompressedKVCache(BaseCache):
         # comp_states shape: (bs, num_chunks, chunk_size, comp_dim)
         # bases_states shape: (bs, num_chunks, 1, kv_dim)
         return compressor_up(comp_states) + bases_states
+
+    def _quantize_kv_tokens(self, kv_states: torch.Tensor):
+        packed, scale, mn = triton_quantize_and_pack_along_last_dim(
+            kv_states.unsqueeze(1), kv_states.shape[-1], 4
+        )
+        return packed.squeeze(1), scale.squeeze(1), mn.squeeze(1)
+
+    def _dequantize_kv_tokens(self, packed: torch.Tensor, scale: torch.Tensor, mn: torch.Tensor, kv_dim: int):
+        return unpack_4bit_to_16bit(
+            packed.unsqueeze(1),
+            scale.unsqueeze(1),
+            mn.unsqueeze(1),
+            kv_dim,
+        ).squeeze(1)
+
+    def _decompress_all_history_kv(
+        self,
+        *,
+        layer_idx: int,
+        compressor_up: Optional[nn.Module],
+        bs: int,
+        k_dim: int,
+    ):
+        if self.config.use_compression:
+            if compressor_up is None:
+                raise ValueError("compressor_up is required to reconstruct compressed history.")
+            comp_kv = self.comp_kv_cache[layer_idx]
+            bases = self.bases_cache[layer_idx]
+            recon_kv = (compressor_up(comp_kv) + bases).view(bs, -1, 2, k_dim)
+            return recon_kv[:, :, 0], recon_kv[:, :, 1]
+
+        if self.config.kv_quant_bits == 4:
+            history_kv = self._dequantize_kv_tokens(
+                self.comp_kv_cache[layer_idx],
+                self.comp_kv_scales[layer_idx],
+                self.comp_kv_mins[layer_idx],
+                2 * k_dim,
+            )
+            return history_kv.split(k_dim, dim=-1)
+
+        history_k = self.comp_kv_cache[layer_idx]
+        history_v = self.bases_cache[layer_idx]
+        return history_k, history_v
 
     def update(
             self,
@@ -230,10 +273,26 @@ class CompressedKVCache(BaseCache):
                         recon_kv = (compressor_up(imp_kv) + imp_bases).view(bs, -1, 2, k_dim)
                     recon_k, recon_v = recon_kv[:, :, 0], recon_kv[:, :, 1]
                 else:
-                    # tensor的定义略有变化
-                    history_k, history_v = self.comp_kv_cache[layer_idx], self.bases_cache[layer_idx]
-                    recon_k = history_k.gather(1, rel_token_idx[:, :, None].expand(-1, -1, history_k.shape[-1]))
-                    recon_v = history_v.gather(1, rel_token_idx[:, :, None].expand(-1, -1, history_v.shape[-1]))
+                    if self.config.kv_quant_bits == 4:
+                        packed_kv = self.comp_kv_cache[layer_idx]
+                        scales = self.comp_kv_scales[layer_idx]
+                        mins = self.comp_kv_mins[layer_idx]
+                        imp_packed_kv = packed_kv.gather(
+                            1, rel_token_idx[:, :, None].expand(-1, -1, packed_kv.shape[-1])
+                        )
+                        imp_scales = scales.gather(
+                            1, rel_token_idx[:, :, None].expand(-1, -1, scales.shape[-1])
+                        )
+                        imp_mins = mins.gather(
+                            1, rel_token_idx[:, :, None].expand(-1, -1, mins.shape[-1])
+                        )
+                        imp_kv = self._dequantize_kv_tokens(imp_packed_kv, imp_scales, imp_mins, 2 * k_dim)
+                        recon_k, recon_v = imp_kv.split(k_dim, dim=-1)
+                    else:
+                        # tensor的定义略有变化
+                        history_k, history_v = self.comp_kv_cache[layer_idx], self.bases_cache[layer_idx]
+                        recon_k = history_k.gather(1, rel_token_idx[:, :, None].expand(-1, -1, history_k.shape[-1]))
+                        recon_v = history_v.gather(1, rel_token_idx[:, :, None].expand(-1, -1, history_v.shape[-1]))
 
                 # rel_token_idx + sink_size = absolute position
                 full_idx = torch.cat([sink_idx, rel_token_idx + self.sink_size, buffer_idx], dim=1)
@@ -242,16 +301,17 @@ class CompressedKVCache(BaseCache):
                         torch.cat([self.sink_value_cache[layer_idx], recon_v, self.buffer_value_cache[layer_idx]], dim=1),
                         full_idx)
             else:
-                # 如果没有token idx，说明是第一个chunk刚刚init；也可能是没开 prefill 加速
-                if self.config.use_compression:
-                    raise NotImplementedError
-                else:
-                    # tensor的定义略有变化
-                    history_k, history_v = self.comp_kv_cache[layer_idx], self.bases_cache[layer_idx]
-                    k = torch.cat([self.sink_key_cache[layer_idx], history_k, self.buffer_key_cache[layer_idx]], dim=1)
-                    v = torch.cat([self.sink_value_cache[layer_idx], history_v, self.buffer_value_cache[layer_idx]], dim=1)
-                    full_idx = torch.arange(k.shape[1], device=k.device)[None].expand(bs, -1)
-                    this_response = (k, v, full_idx)
+                # Standalone DeltaKV: if no external selector provided token ids, reconstruct all compressed history.
+                history_k, history_v = self._decompress_all_history_kv(
+                    layer_idx=layer_idx,
+                    compressor_up=compressor_up,
+                    bs=bs,
+                    k_dim=k_dim,
+                )
+                k = torch.cat([self.sink_key_cache[layer_idx], history_k, self.buffer_key_cache[layer_idx]], dim=1)
+                v = torch.cat([self.sink_value_cache[layer_idx], history_v, self.buffer_value_cache[layer_idx]], dim=1)
+                full_idx = torch.arange(k.shape[1], device=k.device)[None].expand(bs, -1)
+                this_response = (k, v, full_idx)
         else:
             full_idx = torch.cat([sink_idx, buffer_idx], dim=1)
             this_response = (torch.cat([self.sink_key_cache[layer_idx], self.buffer_key_cache[layer_idx]], dim=1),
@@ -278,11 +338,22 @@ class CompressedKVCache(BaseCache):
                         self.comp_kv_cache[layer_idx] = torch.cat([self.comp_kv_cache[layer_idx], comp_kv], dim=1)
                         self.bases_cache[layer_idx] = torch.cat([self.bases_cache[layer_idx], bases], dim=1)
                 else:
-                    if layer_idx not in self.comp_kv_cache:
-                        self.comp_kv_cache[layer_idx], self.bases_cache[layer_idx] = _key, _val
+                    if self.config.kv_quant_bits == 4:
+                        packed_kv, scale, mn = self._quantize_kv_tokens(torch.cat([_key, _val], dim=-1))
+                        if layer_idx not in self.comp_kv_cache:
+                            self.comp_kv_cache[layer_idx] = packed_kv
+                            self.comp_kv_scales[layer_idx] = scale
+                            self.comp_kv_mins[layer_idx] = mn
+                        else:
+                            self.comp_kv_cache[layer_idx] = torch.cat([self.comp_kv_cache[layer_idx], packed_kv], dim=1)
+                            self.comp_kv_scales[layer_idx] = torch.cat([self.comp_kv_scales[layer_idx], scale], dim=1)
+                            self.comp_kv_mins[layer_idx] = torch.cat([self.comp_kv_mins[layer_idx], mn], dim=1)
                     else:
-                        self.comp_kv_cache[layer_idx] = torch.cat([self.comp_kv_cache[layer_idx], _key], dim=1)
-                        self.bases_cache[layer_idx] = torch.cat([self.bases_cache[layer_idx], _val], dim=1)
+                        if layer_idx not in self.comp_kv_cache:
+                            self.comp_kv_cache[layer_idx], self.bases_cache[layer_idx] = _key, _val
+                        else:
+                            self.comp_kv_cache[layer_idx] = torch.cat([self.comp_kv_cache[layer_idx], _key], dim=1)
+                            self.bases_cache[layer_idx] = torch.cat([self.bases_cache[layer_idx], _val], dim=1)
 
         return this_response
 
@@ -391,6 +462,85 @@ class ClusterCompressedKVCache(CompressedKVCache):
 
         return comp_kv, all_centers, topk_indices, None, None
 
+    def _reconstruct_selected_cluster_tokens(
+        self,
+        *,
+        layer_idx: int,
+        token_idx: torch.Tensor,
+        compressor_up: Optional[nn.Module],
+        bs: int,
+        k_dim: int,
+    ):
+        if compressor_up is None:
+            raise ValueError("compressor_up is required to reconstruct clustered compressed history.")
+
+        comp_kv = self.comp_kv_cache[layer_idx]
+        bases = self.bases_cache[layer_idx]
+        topk_father_idx = self.token_father_idx[layer_idx]
+        k = topk_father_idx.shape[-1]
+
+        imp_comp_kv = comp_kv.gather(1, token_idx[:, :, None].expand(-1, -1, comp_kv.shape[-1]))
+
+        if self.config.kv_quant_bits == 4:
+            scales = self.comp_kv_scales[layer_idx]
+            mins = self.comp_kv_mins[layer_idx]
+            imp_scales = scales.gather(1, token_idx[:, :, None].expand(-1, -1, scales.shape[-1]))
+            imp_mins = mins.gather(1, token_idx[:, :, None].expand(-1, -1, mins.shape[-1]))
+            imp_comp_kv = unpack_4bit_to_16bit(
+                imp_comp_kv.unsqueeze(1),
+                imp_scales.unsqueeze(1),
+                imp_mins.unsqueeze(1),
+                self.config.kv_compressed_size,
+            ).squeeze(1)
+
+        imp_topk_idx = topk_father_idx.gather(1, token_idx[:, :, None].expand(-1, -1, k))
+        flat_idx = imp_topk_idx.view(bs, -1)[:, :, None].expand(-1, -1, bases.shape[-1])
+        imp_bases = bases.gather(1, flat_idx).view(bs, token_idx.shape[1], k, -1).mean(dim=2)
+
+        if os.getenv('REMOVE_COMP'):
+            recon_kv = imp_bases.view(bs, -1, 2, k_dim)
+        elif os.getenv('REMOVE_REF'):
+            recon_kv = compressor_up(imp_comp_kv).view(bs, -1, 2, k_dim)
+        else:
+            recon_kv = (compressor_up(imp_comp_kv) + imp_bases).view(bs, -1, 2, k_dim)
+        return recon_kv[:, :, 0], recon_kv[:, :, 1]
+
+    def _reconstruct_all_cluster_tokens(
+        self,
+        *,
+        layer_idx: int,
+        compressor_up: Optional[nn.Module],
+        bs: int,
+        k_dim: int,
+    ):
+        if compressor_up is None:
+            raise ValueError("compressor_up is required to reconstruct clustered compressed history.")
+
+        comp_kv = self.comp_kv_cache[layer_idx]
+        bases = self.bases_cache[layer_idx]
+        topk_father_idx = self.token_father_idx[layer_idx]
+        num_hist = comp_kv.shape[1]
+        k = topk_father_idx.shape[-1]
+
+        if self.config.kv_quant_bits == 4:
+            comp_kv = unpack_4bit_to_16bit(
+                comp_kv.unsqueeze(1),
+                self.comp_kv_scales[layer_idx].unsqueeze(1),
+                self.comp_kv_mins[layer_idx].unsqueeze(1),
+                self.config.kv_compressed_size,
+            ).squeeze(1)
+
+        flat_idx = topk_father_idx.view(bs, -1)[:, :, None].expand(-1, -1, bases.shape[-1])
+        all_bases = bases.gather(1, flat_idx).view(bs, num_hist, k, -1).mean(dim=2)
+
+        if os.getenv('REMOVE_COMP'):
+            recon_kv = all_bases.view(bs, -1, 2, k_dim)
+        elif os.getenv('REMOVE_REF'):
+            recon_kv = compressor_up(comp_kv).view(bs, -1, 2, k_dim)
+        else:
+            recon_kv = (compressor_up(comp_kv) + all_bases).view(bs, -1, 2, k_dim)
+        return recon_kv[:, :, 0], recon_kv[:, :, 1]
+
     def update(
             self,
             key_states: torch.Tensor,
@@ -444,48 +594,16 @@ class ClusterCompressedKVCache(CompressedKVCache):
             if self.layer_to_full_layer_idx[layer_idx] in self.top_token_idx:
                 token_idx = self.top_token_idx[self.layer_to_full_layer_idx[layer_idx]]  # bs, num_imp_tokens
 
-                if self.config.use_compression:
-                    comp_kv = self.comp_kv_cache[layer_idx]
-                    bases = self.bases_cache[layer_idx]
-                    topk_father_idx = self.token_father_idx[layer_idx] # (bs, total_compressed, k)
-                    k = topk_father_idx.shape[-1]
-
-                    # 1. Gather compressed latent
-                    imp_comp_kv = comp_kv.gather(1, token_idx[:, :, None].expand(-1, -1, comp_kv.shape[-1]))
-                    
-                    # 2. 如果开启了量化，则解包还原
-                    if self.config.kv_quant_bits == 4:
-                        scales = self.comp_kv_scales[layer_idx]
-                        mins = self.comp_kv_mins[layer_idx]
-                        # Gather per-token scales and mins
-                        imp_scales = scales.gather(1, token_idx[:, :, None].expand(-1, -1, scales.shape[-1]))
-                        imp_mins = mins.gather(1, token_idx[:, :, None].expand(-1, -1, mins.shape[-1]))
-                        # 解包还原到 BF16 (隐空间) - 传入 4D
-                        imp_comp_kv = unpack_4bit_to_16bit(
-                            imp_comp_kv.unsqueeze(1), 
-                            imp_scales.unsqueeze(1), 
-                            imp_mins.unsqueeze(1), 
-                            self.config.kv_compressed_size
-                        )
-                        imp_comp_kv = imp_comp_kv.squeeze(1)
-
-                    # 3. Gather top-k father indices for selected tokens
-                    # imp_topk_idx shape: (bs, num_imp_tokens, k)
-                    imp_topk_idx = topk_father_idx.gather(1, token_idx[:, :, None].expand(-1, -1, k))
-                    
-                    # 4. Gather and average father KVs
-                    flat_idx = imp_topk_idx.view(bs, -1)[:, :, None].expand(-1, -1, bases.shape[-1])
-                    imp_bases = bases.gather(1, flat_idx).view(bs, token_idx.shape[1], k, -1).mean(dim=2)
-
-                    if os.getenv('REMOVE_COMP'):
-                        recon_kv = imp_bases.view(bs, -1, 2, k_dim)
-                    elif os.getenv('REMOVE_REF'):
-                        recon_kv = compressor_up(imp_comp_kv).view(bs, -1, 2, k_dim)
-                    else:
-                        recon_kv = (compressor_up(imp_comp_kv) + imp_bases).view(bs, -1, 2, k_dim)
-                    recon_k, recon_v = recon_kv[:, :, 0], recon_kv[:, :, 1]
-                else:
+                if not self.config.use_compression:
                     raise NotImplementedError("Cluster without compression is not implemented")
+
+                recon_k, recon_v = self._reconstruct_selected_cluster_tokens(
+                    layer_idx=layer_idx,
+                    token_idx=token_idx,
+                    compressor_up=compressor_up,
+                    bs=bs,
+                    k_dim=k_dim,
+                )
 
                 full_idx = torch.cat([sink_idx, token_idx + self.sink_size, buffer_idx], dim=1)
 
@@ -493,7 +611,23 @@ class ClusterCompressedKVCache(CompressedKVCache):
                                 torch.cat([self.sink_value_cache[layer_idx], recon_v, self.buffer_value_cache[layer_idx]], dim=1),
                                 full_idx)
             else:
-                raise NotImplementedError("Compressed data exists but no top_token_idx provided. Please enable chunk_prefill_accel_omnikv.")
+                if not self.config.use_compression:
+                    raise NotImplementedError("Cluster without compression is not implemented")
+
+                recon_k, recon_v = self._reconstruct_all_cluster_tokens(
+                    layer_idx=layer_idx,
+                    compressor_up=compressor_up,
+                    bs=bs,
+                    k_dim=k_dim,
+                )
+                num_hist = recon_k.shape[1]
+                hist_idx = torch.arange(num_hist, device=key_states.device).unsqueeze(0).expand(bs, -1) + self.sink_size
+                full_idx = torch.cat([sink_idx, hist_idx, buffer_idx], dim=1)
+                this_response = (
+                    torch.cat([self.sink_key_cache[layer_idx], recon_k, self.buffer_key_cache[layer_idx]], dim=1),
+                    torch.cat([self.sink_value_cache[layer_idx], recon_v, self.buffer_value_cache[layer_idx]], dim=1),
+                    full_idx,
+                )
         else:
             full_idx = torch.cat([sink_idx, buffer_idx], dim=1)
             this_response = (torch.cat([self.sink_key_cache[layer_idx], self.buffer_key_cache[layer_idx]], dim=1),

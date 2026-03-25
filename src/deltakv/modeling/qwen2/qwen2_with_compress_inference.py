@@ -11,7 +11,7 @@ from transformers.models.qwen2.modeling_qwen2 import (
 )   # noqa
 
 from deltakv.modeling.kv_cache import CompressedKVCache, ClusterCompressedKVCache
-from deltakv.configs.model_config_cls import KVQwen2Config
+from deltakv.configs.model_config_cls import KVQwen2Config, parse_full_attn_layers
 from deltakv.modeling.qwen2.qwen2_e2e import create_compressor
 from deltakv.modeling.token_select import omnikv_token_selection
 from dataclasses import dataclass
@@ -41,13 +41,11 @@ class Qwen2AttnKVCompress(Qwen2Attention):
     def __init__(self, config: KVQwen2Config, layer_idx: int):
         super().__init__(config, layer_idx)
 
-        if isinstance(config.full_attn_layers, str):
-            config.full_attn_layers = config.full_attn_layers.split(',')
-        full_layers = [int(_) for _ in config.full_attn_layers]
-        assert 0 in full_layers
+        full_layers = parse_full_attn_layers(config.full_attn_layers)
+        config.full_attn_layers = full_layers
 
         self.is_full_layer = (layer_idx in full_layers)
-        self.is_obs_layer = (self.is_full_layer and (layer_idx + 1) not in full_layers)
+        self.is_obs_layer = bool(full_layers) and self.is_full_layer and (layer_idx + 1) not in full_layers
 
         if self.is_obs_layer:
             all_obs_layers = sorted([idx for idx in full_layers if (idx + 1) not in full_layers])
@@ -113,7 +111,13 @@ class Qwen2AttnKVCompress(Qwen2Attention):
         is_prefill, is_decode = (q_len > 1), (q_len == 1)
 
         compressed_len = (past_key_value.get_seq_length() - self.config.tail_token_size - q_len - sink_size) // self.config.tail_token_size * self.config.tail_token_size
-        do_obs = (self.is_obs_layer and compressed_len > 0 and (self.config.chunk_prefill_accel_omnikv or is_decode))
+        use_omnikv_selection = bool(getattr(self.config, "deltakv_use_omnikv_selection", False))
+        do_obs = (
+            use_omnikv_selection
+            and self.is_obs_layer
+            and compressed_len > 0
+            and (self.config.chunk_prefill_accel_omnikv or is_decode)
+        )
 
         if self.config._attn_implementation != "eager":
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
