@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 import torch
 from collections import defaultdict
 from datasets import load_dataset
@@ -6,14 +7,29 @@ from results.metric import evaluate_answer
 from eval import set_ratios
 
 
+SCBENCH_PREPROCESSED_ROOT = os.getenv(
+    "SCBENCH_PREPROCESSED_ROOT",
+    "/root/autodl-fs/datasets/SCBench-preprocessed",
+)
+
+
+def load_scbench_preprocessed(name):
+    local_path = Path(SCBENCH_PREPROCESSED_ROOT) / f"{name}.parquet"
+    if local_path.exists():
+        return load_dataset("parquet", data_files=str(local_path), split="train")
+    return load_dataset(
+        "Jang-Hyun/SCBench-preprocessed",
+        data_files=f"{name}.parquet",
+        split="train",
+    )
+
+
 def parse_answer(name):
     answers = []
     subtasks = []
     if "many_shot" in name:
         answers = []
-        samples = load_dataset('Jang-Hyun/SCBench-preprocessed',
-                           data_files=f"{name}.parquet",
-                           split='train')
+        samples = load_scbench_preprocessed(name)
         for data in samples:
             d = []
             for q, gt in zip(data["prompts"][1:], data["ground_truth"]):
@@ -27,9 +43,7 @@ def parse_answer(name):
 
     elif "repoqa" in name:
         answers = []
-        samples = load_dataset('Jang-Hyun/SCBench-preprocessed',
-                           data_files=f"{name}.parquet",
-                           split='train')
+        samples = load_scbench_preprocessed(name)
         for data in samples:
             d = defaultdict(list)
             d["lang"] = data["lang"]
@@ -44,9 +58,7 @@ def parse_answer(name):
     elif "summary_with_needles" in name:
         answers = []
         subtasks = []
-        samples = load_dataset('Jang-Hyun/SCBench-preprocessed',
-                           data_files=f"{name}.parquet",
-                           split='train')
+        samples = load_scbench_preprocessed(name)
         for data in samples:
             d = defaultdict(list)
             subtasks.append(data["task"])

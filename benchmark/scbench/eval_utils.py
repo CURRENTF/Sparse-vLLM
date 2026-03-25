@@ -1168,12 +1168,61 @@ class GreedySearch:
         self.model = model
         self.tokenizer = tokenizer
         self.past_kv = None
+        self.backup_state = None
         self.add_eos_to_next_prompt = False
 
     def clear(self):
         self.past_kv = None
+        self.backup_state = None
         gc.collect()
         torch.cuda.empty_cache()
+
+    def _get_state_snapshot(self, cache):
+        def _recursive_snapshot(obj):
+            if isinstance(obj, torch.Tensor):
+                return obj.detach().cpu()
+            if isinstance(obj, dict):
+                return {k: _recursive_snapshot(v) for k, v in obj.items()}
+            if isinstance(obj, list):
+                return [_recursive_snapshot(v) for v in obj]
+            if isinstance(obj, tuple):
+                return tuple(_recursive_snapshot(v) for v in obj)
+            try:
+                return copy.deepcopy(obj)
+            except Exception:
+                return obj
+
+        if isinstance(cache, (list, tuple)):
+            return _recursive_snapshot(cache)
+
+        snapshot = {}
+        for k, v in vars(cache).items():
+            snapshot[k] = _recursive_snapshot(v)
+        return snapshot
+
+    def _apply_state_snapshot(self, cache, snapshot):
+        device = self.model.device
+
+        def _recursive_restore(obj):
+            if isinstance(obj, torch.Tensor):
+                return obj.to(device)
+            if isinstance(obj, dict):
+                return {k: _recursive_restore(v) for k, v in obj.items()}
+            if isinstance(obj, list):
+                return [_recursive_restore(v) for v in obj]
+            if isinstance(obj, tuple):
+                return tuple(_recursive_restore(v) for v in obj)
+            try:
+                return copy.deepcopy(obj)
+            except Exception:
+                return obj
+
+        if isinstance(snapshot, (list, tuple)):
+            return _recursive_restore(snapshot)
+
+        for k, v in snapshot.items():
+            setattr(cache, k, _recursive_restore(v))
+        return cache
 
     def _process_texts(self, input_text):
         model_inputs = {}
@@ -1216,18 +1265,20 @@ class GreedySearch:
             if idx == 0:
                 model_inputs = self._make_first_turn(prompt)
             else:
+                self.past_kv = self._apply_state_snapshot(self.past_kv, self.backup_state)
                 model_inputs = self._process_texts(prompt)
             input_ids = model_inputs["input_ids"]
 
             with torch.inference_mode():
                 if idx == 0:
                     result = self._encode(input_ids, max_length=max_length_per_turn)
+                    self.backup_state = self._get_state_snapshot(self.past_kv)
                 else:
                     result = self._decode(
                         input_ids,
                         max_length=max_length_per_turn,
                         dense_prefix=True,
-                        update_global_past_kv=False,
+                        update_global_past_kv=True,
                     )
 
                     results.append(
@@ -1284,9 +1335,19 @@ class GreedySearch:
 
     def _encode(self, input_ids, max_length=None):
         if self.past_kv is None:
-            past_key_values = self.model.prepare_inputs_for_generation(input_ids)[
-                "past_key_values"
-            ]
+            prepared_inputs = self.model.prepare_inputs_for_generation(input_ids)
+            past_key_values = prepared_inputs.get("past_key_values")
+            if past_key_values is None:
+                model_inputs = {}
+                self.model._prepare_cache_for_generation(
+                    GenerationConfig(),
+                    model_inputs,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                past_key_values = model_inputs["past_key_values"]
         else:
             past_key_values = self.past_kv
 
@@ -1315,10 +1376,11 @@ class GreedySearch:
             input_ids = input_ids[None, :]
         input_ids = input_ids.cuda()
         assert input_ids.size(0) == 1
+        config_eos = self.model.config.eos_token_id
         end_token_ids = (
             extra_end_token_ids
             + [self.tokenizer.eos_token_id]
-            + self.model.config.eos_token_id
+            + (config_eos if isinstance(config_eos, list) else [config_eos])
         )
         logits = None
         if self.past_kv is None:
@@ -1368,7 +1430,8 @@ class GreedySearch:
 
         if not update_global_past_kv or not disable_golden_context:
             self.global_kv_update_mode(True)
-            past_key_values.clear_temp_kv_cache()
+            if hasattr(past_key_values, "clear_temp_kv_cache"):
+                past_key_values.clear_temp_kv_cache()
 
         self.past_kv = past_key_values
         # should see whether the last token is eos, if not tell self.test to add it to the next prompt

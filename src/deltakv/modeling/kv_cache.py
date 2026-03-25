@@ -192,6 +192,9 @@ class CompressedKVCache(BaseCache):
                 raise ValueError("compressor_up is required to reconstruct compressed history.")
             comp_kv = self.comp_kv_cache[layer_idx]
             bases = self.bases_cache[layer_idx]
+            # `comp_kv` is stored per token while `bases` is stored per chunk.
+            # Expand chunk-level bases back to token resolution before reconstruction.
+            bases = bases.repeat_interleave(self.config.seq_chunk_size, dim=1)[:, : comp_kv.shape[1]]
             recon_kv = (compressor_up(comp_kv) + bases).view(bs, -1, 2, k_dim)
             return recon_kv[:, :, 0], recon_kv[:, :, 1]
 

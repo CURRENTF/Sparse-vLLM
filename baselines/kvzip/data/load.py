@@ -1,4 +1,24 @@
+import os
+from pathlib import Path
+
 from datasets import Dataset, load_dataset
+
+
+SCBENCH_PREPROCESSED_ROOT = os.getenv(
+    "SCBENCH_PREPROCESSED_ROOT",
+    "/root/autodl-fs/datasets/SCBench-preprocessed",
+)
+
+
+def load_scbench_preprocessed(name):
+    local_path = Path(SCBENCH_PREPROCESSED_ROOT) / f"{name}.parquet"
+    if local_path.exists():
+        return load_dataset("parquet", data_files=str(local_path), split="train")
+    return load_dataset(
+        "Jang-Hyun/SCBench-preprocessed",
+        data_files=f"{name}.parquet",
+        split="train",
+    )
 
 
 def load_dataset_all(name, tokenizer, n_data=100):
@@ -103,9 +123,7 @@ def load_gsm(tokenizer, n_data):
 
 def load_scbench(name):
     check_scbench_name(name)
-    samples = load_dataset('Jang-Hyun/SCBench-preprocessed',
-                           data_files=f"{name}.parquet",
-                           split='train')
+    samples = load_scbench_preprocessed(name)
 
     dataset = []
     for data in samples:
