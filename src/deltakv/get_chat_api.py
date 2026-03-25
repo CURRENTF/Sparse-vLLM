@@ -3,7 +3,7 @@ import sys
 import torch
 from typing import Union, List
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
-from deltakv.configs.model_config_cls import KVQwen2Config, KVLlamaConfig
+from deltakv.configs.model_config_cls import KVQwen2Config, KVQwen3Config, KVLlamaConfig
 from safetensors.torch import load_file
 
 
@@ -247,6 +247,12 @@ def get_generate_api(model_path: str, infer_config: dict, compressor_path: str,
             else:
                 from deltakv.modeling.qwen2.qwen2_e2e import Qwen2KVCompress as KVModel
             config_cls = KVQwen2Config
+        elif base_config.model_type == 'qwen3':
+            if use_cache:
+                from deltakv.modeling.qwen3.qwen3_with_compress_inference import Qwen3KVCompress as KVModel
+            else:
+                from deltakv.modeling.qwen3.qwen3_e2e import Qwen3KVCompress as KVModel
+            config_cls = KVQwen3Config
         elif base_config.model_type == 'llama':
             from deltakv.modeling.llama.llama_with_compress_inference import LlamaKVCompress as KVModel
             config_cls = KVLlamaConfig
