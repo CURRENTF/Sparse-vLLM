@@ -205,6 +205,7 @@ def get_generate_api(model_path: str, infer_config: dict, compressor_path: str,
         
         llm = LLM(
             model_path, 
+            cuda_device=cuda_device,
             **infer_config,
         )
 
