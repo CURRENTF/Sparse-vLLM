@@ -39,8 +39,19 @@ class ModelRunner:
 
         # 初始化分布式环境并绑定对应的 GPU 卡
         if not dist.is_initialized():
-            dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
-        torch.cuda.set_device(rank)
+            dist.init_process_group(
+                "nccl",
+                init_method=self.config.dist_init_method,
+                world_size=self.world_size,
+                rank=rank,
+            )
+        if self.world_size > 1:
+            torch.cuda.set_device(rank)
+        else:
+            device_index = self.config.cuda_device
+            if isinstance(device_index, str):
+                device_index = 0 if device_index == "auto" else int(device_index)
+            torch.cuda.set_device(int(device_index))
         
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
@@ -102,7 +113,8 @@ class ModelRunner:
             if self.rank == 0:
                 self.shm.unlink()
         torch.cuda.synchronize()
-        dist.destroy_process_group()
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
     def loop(self):
         """子进程的主循环：监听共享内存，解析并执行来自 Rank 0 的方法指令"""

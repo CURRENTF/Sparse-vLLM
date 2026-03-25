@@ -1,5 +1,6 @@
 import os
 import json
+import uuid
 from dataclasses import dataclass
 from types import SimpleNamespace
 import torch
@@ -19,6 +20,8 @@ class Config:
     chunk_prefill_size: int = 8192
     gpu_memory_utilization: float = 0.8
     tensor_parallel_size: int = 1
+    cuda_device: int | str = 0
+    dist_init_method: str | None = None
     enforce_eager: bool = True
     hf_config: Union[Qwen3Config, AutoConfig] | None = None
     eos: int = -1
@@ -115,6 +118,12 @@ class Config:
             self.vllm_sparse_method = ""
         elif self.vllm_sparse_method in ("attention-sink", "attention_sink"):
             self.vllm_sparse_method = "streamingllm"
+
+        if self.dist_init_method in (None, "", "auto"):
+            # Each sparsevllm instance gets its own rendezvous path so multiple
+            # benchmark workers can launch independent single-GPU engines without
+            # colliding on a fixed TCP port.
+            self.dist_init_method = f"file:///tmp/sparsevllm-dist-{os.getpid()}-{uuid.uuid4().hex}"
         
         if self.num_top_tokens_in_prefill is None:
             self.num_top_tokens_in_prefill = self.num_top_tokens
