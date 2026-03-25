@@ -241,6 +241,8 @@ def main(
             run_name_suffix += "_clusSoft"
         if not cluster_soft_assignment:
             run_name_suffix += "_clusMean"
+        if split_kv:
+            run_name_suffix += "_split"
     else:  # parallel or sequential
         raise ValueError
 

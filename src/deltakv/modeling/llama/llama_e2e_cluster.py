@@ -24,9 +24,14 @@ CURRENT_RUN_MODE = None
 class LlamaAttnKVClusterCompress(LlamaAttention):
     def __init__(self, config: KVLlamaConfig, layer_idx: int):
         super().__init__(config, layer_idx)
-        # 统一的压缩投影器
-        self.compress_down = create_compressor(is_down=True, config=config)
-        self.compress_up = create_compressor(is_down=False, config=config)
+        if config.split_kv:
+            self.k_compress_down = create_compressor(is_down=True, config=config)
+            self.k_compress_up = create_compressor(is_down=False, config=config)
+            self.v_compress_down = create_compressor(is_down=True, config=config)
+            self.v_compress_up = create_compressor(is_down=False, config=config)
+        else:
+            self.compress_down = create_compressor(is_down=True, config=config)
+            self.compress_up = create_compressor(is_down=False, config=config)
         
         self.cluster_metric = config.cluster_metric
         self.cluster_on_kv = config.cluster_on_kv
@@ -34,81 +39,92 @@ class LlamaAttnKVClusterCompress(LlamaAttention):
         self.buffer_recon_kv = None
         self.buffer_raw_kv = None
 
+    def _compute_scores(self, feat_rem, prototypes_feat):
+        if self.cluster_metric == 'l2':
+            return -torch.cdist(feat_rem, prototypes_feat)
+        if self.cluster_metric == 'dot':
+            return torch.matmul(feat_rem, prototypes_feat.transpose(-1, -2))
+        if self.cluster_metric == 'cosine':
+            feat_rem_norm = F.normalize(feat_rem, p=2, dim=-1)
+            prototypes_feat_norm = F.normalize(prototypes_feat, p=2, dim=-1)
+            return torch.matmul(feat_rem_norm, prototypes_feat_norm.transpose(-1, -2))
+        raise ValueError(f"Unknown cluster_metric: {self.cluster_metric}")
+
+    def _gather_references(self, scores, prototypes):
+        bs, seq_len_rem, _ = scores.shape
+        num_prototypes = prototypes.shape[1]
+        token_dim = prototypes.shape[-1]
+        k = max(1, self.config.seq_chunk_size)
+        topk_scores, topk_indices = torch.topk(scores, k=min(k, num_prototypes), dim=-1)
+        indices = topk_indices.view(bs, -1)[:, :, None].expand(-1, -1, token_dim)
+        gathered = prototypes.gather(dim=1, index=indices).view(bs, seq_len_rem, -1, token_dim)
+
+        if self.config.cluster_soft_assignment:
+            temp = self.config.cluster_temp
+            weights = F.softmax(topk_scores / temp, dim=-1).to(prototypes.dtype)
+            return (gathered * weights.unsqueeze(-1)).sum(dim=2)
+        return gathered.mean(dim=2)
+
     def comp_then_reconstruct(self, key_states, value_states):
         bs, seq_len, k_dim = key_states.shape
-        # kv_flat shape -> bs, seq_len, 2*k_dim
         kv_flat = torch.cat([key_states, value_states], dim=-1)
 
         sink_size = 16
         assert seq_len > sink_size, '训练 seq len 太短了'
 
-        # 1. 直接 split，去掉前16个token，作为 sink 不压缩
-        kv_sink = kv_flat[:, :sink_size, :]
-        kv_rem = kv_flat[:, sink_size:, :]
-
-        # 选择用于聚类分配的特征
-        if not self.cluster_on_kv:
-            feat = key_states
-        else:
-            feat = kv_flat
-
-        feat_rem = feat[:, sink_size:, :]
-
         # 2. 选择聚类中心 (Prototypes) - 模拟推理时的采样过程
         cluster_step = max(1, int(1 / self.config.cluster_ratio))
         
         # Sink tokens (0-15) 始终作为聚类中心
-        sink_indices = torch.arange(0, sink_size, device=feat.device)
+        sink_indices = torch.arange(0, sink_size, device=key_states.device)
         # 剩余部分按 cluster_ratio 采样
-        rem_prototype_indices = torch.arange(sink_size, seq_len, cluster_step, device=feat.device)
+        rem_prototype_indices = torch.arange(sink_size, seq_len, cluster_step, device=key_states.device)
         
         all_prototype_indices = torch.cat([sink_indices, rem_prototype_indices])
 
-        prototypes_feat = feat[:, all_prototype_indices, :]
-        prototypes_kv = kv_flat[:, all_prototype_indices, :]
-
-        # 3. 计算剩余 token 与聚类中心的得分
-        if self.cluster_metric == 'l2':
-            scores = -torch.cdist(feat_rem, prototypes_feat)
-        elif self.cluster_metric == 'dot':
-            scores = torch.matmul(feat_rem, prototypes_feat.transpose(-1, -2))
-        elif self.cluster_metric == 'cosine':
-            feat_rem_norm = F.normalize(feat_rem, p=2, dim=-1)
-            prototypes_feat_norm = F.normalize(prototypes_feat, p=2, dim=-1)
-            scores = torch.matmul(feat_rem_norm, prototypes_feat_norm.transpose(-1, -2))
-        else:
-            raise ValueError(f"Unknown cluster_metric: {self.cluster_metric}")
-
         # 4. 应用因果掩码
-        num_prototypes = prototypes_feat.shape[1]
         seq_len_rem = seq_len - sink_size
-        rows = torch.arange(seq_len_rem, device=feat.device).view(-1, 1) + sink_size
+        rows = torch.arange(seq_len_rem, device=key_states.device).view(-1, 1) + sink_size
         cols = all_prototype_indices.view(1, -1)
         mask = (cols <= rows).int()
-        scores = scores.masked_fill(mask == 0, float('-inf'))
 
-        # 5. 选取聚类中心并生成参考基
-        k = max(1, self.config.seq_chunk_size)
-        topk_scores, topk_indices = torch.topk(scores, k=min(k, num_prototypes), dim=-1)
+        if not self.config.split_kv:
+            kv_sink = kv_flat[:, :sink_size, :]
+            kv_rem = kv_flat[:, sink_size:, :]
+            feat = key_states if not self.cluster_on_kv else kv_flat
+            feat_rem = feat[:, sink_size:, :]
+            prototypes_feat = feat[:, all_prototype_indices, :]
+            prototypes_kv = kv_flat[:, all_prototype_indices, :]
 
-        indices = topk_indices.view(bs, -1)[:, :, None].expand(-1, -1, 2 * k_dim)
+            scores = self._compute_scores(feat_rem, prototypes_feat).masked_fill(mask == 0, float('-inf'))
+            gathered_fathers = self._gather_references(scores, prototypes_kv)
+            comp_kv_rem = self.compress_down(kv_rem) - self.compress_down(gathered_fathers)
+            kv_recon_rem = (self.compress_up(comp_kv_rem) + gathered_fathers).to(kv_sink.dtype)
+            self.buffer_recon_kv = torch.cat([kv_sink, kv_recon_rem], dim=1)
+            return torch.split(self.buffer_recon_kv, k_dim, dim=-1)
 
-        if self.config.cluster_soft_assignment:
-            temp = self.config.cluster_temp
-            weights = F.softmax(topk_scores / temp, dim=-1).to(prototypes_kv.dtype)
-            gathered_fathers_raw = prototypes_kv.gather(dim=1, index=indices).view(bs, seq_len_rem, -1, 2 * k_dim)
-            gathered_fathers = (gathered_fathers_raw * weights.unsqueeze(-1)).sum(dim=2)
-        else:
-            gathered_fathers = prototypes_kv.gather(dim=1, index=indices).view(bs, seq_len_rem, -1, 2 * k_dim).mean(dim=2)
+        k_sink = key_states[:, :sink_size, :]
+        v_sink = value_states[:, :sink_size, :]
+        k_rem = key_states[:, sink_size:, :]
+        v_rem = value_states[:, sink_size:, :]
 
-        # 6. 计算残差并压缩重建
-        comp_kv_rem = self.compress_down(kv_rem) - self.compress_down(gathered_fathers)
-        kv_recon_rem = (self.compress_up(comp_kv_rem) + gathered_fathers).to(kv_sink.dtype)
+        k_prototypes_feat = key_states[:, all_prototype_indices, :]
+        v_feat = value_states if self.cluster_on_kv else key_states
+        v_prototypes_feat = value_states[:, all_prototype_indices, :] if self.cluster_on_kv else k_prototypes_feat
 
-        # 7. Cat back
-        self.buffer_recon_kv = torch.cat([kv_sink, kv_recon_rem], dim=1)
+        k_scores = self._compute_scores(key_states[:, sink_size:, :], k_prototypes_feat).masked_fill(mask == 0, float('-inf'))
+        v_scores = self._compute_scores(v_feat[:, sink_size:, :], v_prototypes_feat).masked_fill(mask == 0, float('-inf'))
 
-        return torch.split(self.buffer_recon_kv, k_dim, dim=-1)
+        gathered_k = self._gather_references(k_scores, key_states[:, all_prototype_indices, :])
+        gathered_v = self._gather_references(v_scores, value_states[:, all_prototype_indices, :])
+
+        comp_k_rem = self.k_compress_down(k_rem) - self.k_compress_down(gathered_k)
+        comp_v_rem = self.v_compress_down(v_rem) - self.v_compress_down(gathered_v)
+
+        recon_k = torch.cat([k_sink, (self.k_compress_up(comp_k_rem) + gathered_k).to(k_sink.dtype)], dim=1)
+        recon_v = torch.cat([v_sink, (self.v_compress_up(comp_v_rem) + gathered_v).to(v_sink.dtype)], dim=1)
+        self.buffer_recon_kv = torch.cat([recon_k, recon_v], dim=-1)
+        return recon_k, recon_v
 
     def forward(
             self,
