@@ -502,14 +502,209 @@ def get_generate_api(model_path: str, infer_config: dict, compressor_path: str,
         default_load_score = _as_bool(infer_config.get('load_score', False))
         default_do_score = _as_bool(infer_config.get('do_score', True))
         default_update_cache = _as_bool(infer_config.get('update_cache', False))
+        default_iterative_chunk_size = int(infer_config.get('iterative_expand_chunk_size', 0) or 0)
+        default_iterative_keep_tokens = int(infer_config.get('iterative_keep_tokens', 0) or 0)
+        default_iterative_decode_chunk_size = int(
+            infer_config.get('iterative_decode_chunk_size', default_iterative_chunk_size) or 0
+        )
+        default_iterative_decode_keep_tokens = int(
+            infer_config.get('iterative_decode_keep_tokens', default_iterative_keep_tokens) or 0
+        )
         model = kvzip_model.model
         tokenizer = kvzip_model.tokenizer
 
-        def generate(prompt: Union[str, List[str]], past_key_values=None, **kwargs):
+        def _evict_dense_context_tokens(kv, keep_tokens):
+            if keep_tokens <= 0 or kv.ctx_len <= keep_tokens:
+                return 1.0
+
+            if kv.score is None:
+                raise ValueError("KVzip iterative evict requires KV scores, but kv.score is empty.")
+
+            score = torch.stack(kv.score, dim=0) if isinstance(kv.score, list) else kv.score
+            token_score = score.amax(dim=(0, 1, 2))
+            keep_tokens = min(int(keep_tokens), int(token_score.numel()))
+            topk_indices = torch.topk(token_score, keep_tokens, dim=-1).indices
+            keep_mask = torch.zeros_like(token_score, dtype=torch.bool)
+            keep_mask.scatter_(0, topk_indices, True)
+
+            full_keep_mask = torch.cat([
+                torch.ones(kv.sink, dtype=torch.bool, device=keep_mask.device),
+                keep_mask,
+            ], dim=0)
+            for layer_idx in range(len(kv.key_cache)):
+                kv.key_cache[layer_idx] = kv.key_cache[layer_idx][:, :, full_keep_mask, :].contiguous()
+                kv.value_cache[layer_idx] = kv.value_cache[layer_idx][:, :, full_keep_mask, :].contiguous()
+
+            kv.ctx_ids = kv.ctx_ids[:, keep_mask]
+            kv.prefill_ids = torch.cat([kv.prefill_ids[:, :kv.sink], kv.ctx_ids], dim=1)
+            kv.score = [layer_score[..., keep_mask] for layer_score in kv.score]
+            kv.start_idx = kv.sink
+            kv.ctx_len = kv.ctx_ids.shape[1]
+            kv.end_idx = kv.start_idx + kv.ctx_len
+            kv._seen_tokens = kv.prefill_ids.shape[1]
+            kv.pruned = False
+            return keep_tokens / max(int(token_score.numel()), 1)
+
+        def _refresh_dense_kv_metadata(kv):
+            kv.ctx_ids = kv.prefill_ids[:, kv.sink:]
+            kv.start_idx = kv.sink
+            kv.ctx_len = kv.ctx_ids.shape[1]
+            kv.end_idx = kv.start_idx + kv.ctx_len
+            kv._seen_tokens = kv.prefill_ids.shape[1]
+            kv.pruned = False
+
+        def _append_dense_tokens(kv, new_ids):
+            if new_ids is None or new_ids.numel() == 0:
+                return
+            kv.prefill_ids = torch.cat([kv.prefill_ids, new_ids], dim=1)
+            _refresh_dense_kv_metadata(kv)
+
+        def _maybe_iterative_decode_evict(kv, decode_chunk_size, decode_keep_tokens):
+            if decode_chunk_size <= 0 or decode_keep_tokens <= 0:
+                return False
+            if (kv.ctx_len + 1) <= decode_chunk_size:
+                return False
+
+            kvzip_model.scoring(kv, kv.ctx_ids, load_score=False)
+            keep_ratio = _evict_dense_context_tokens(kv, decode_keep_tokens)
+            print(f"[KVzip] iterative decode evict keep_ratio={keep_ratio:.4f}")
+            return True
+
+        def _iterative_prefill_kv(
+            prefill_ids,
+            prefill_chunk_size,
+            load_score,
+            do_score,
+            level,
+            iterative_chunk_size,
+            iterative_keep_tokens,
+        ):
+            if (iterative_chunk_size <= 0 or iterative_keep_tokens <= 0 or
+                    prefill_ids.shape[1] <= iterative_chunk_size):
+                return kvzip_model.prefill(
+                    prefill_ids,
+                    prefill_chunk_size=prefill_chunk_size,
+                    load_score=load_score,
+                    do_score=do_score,
+                )
+
+            if not do_score and not load_score:
+                raise ValueError(
+                    "KVzip iterative evict requires scoring. Set do_score=true or load_score=true."
+                )
+
+            cursor = min(iterative_chunk_size, prefill_ids.shape[1])
+            kv = kvzip_model.prefill(
+                    prefill_ids[:, :cursor],
+                    prefill_chunk_size=prefill_chunk_size,
+                    load_score=load_score,
+                    do_score=do_score,
+                )
+            if kv.ctx_len > iterative_keep_tokens:
+                keep_ratio = _evict_dense_context_tokens(kv, iterative_keep_tokens)
+                print(f"[KVzip] iterative dense evict keep_ratio={keep_ratio:.4f} ({level})")
+
+            while cursor < prefill_ids.shape[1]:
+                next_cursor = min(cursor + iterative_chunk_size, prefill_ids.shape[1])
+                next_ids = prefill_ids[:, cursor:next_cursor]
+                for input_ids in torch.split(next_ids, prefill_chunk_size, dim=1):
+                    kvzip_model.__call__(input_ids, kv, update_cache=True)
+
+                kv.ctx_ids = torch.cat([kv.ctx_ids, next_ids], dim=1)
+                kv.prefill_ids = torch.cat([kv.prefill_ids, next_ids], dim=1)
+                kv.start_idx = kv.sink
+                kv.ctx_len = kv.ctx_ids.shape[1]
+                kv.end_idx = kv.start_idx + kv.ctx_len
+                kv._seen_tokens = kv.prefill_ids.shape[1]
+
+                kvzip_model.scoring(kv, kv.ctx_ids, load_score=load_score)
+                if kv.ctx_len > iterative_keep_tokens:
+                    keep_ratio = _evict_dense_context_tokens(kv, iterative_keep_tokens)
+                    print(f"[KVzip] iterative dense evict keep_ratio={keep_ratio:.4f} ({level})")
+
+                cursor = next_cursor
+
+            return kv
+
+        def _manual_decode_with_iterative_evict(
+            query_ids,
+            kv,
+            decode_chunk_size,
+            decode_keep_tokens,
+            gen_kwargs,
+        ):
+            if query_ids.shape[0] != 1:
+                raise ValueError("KVzip iterative decode only supports batch_size=1.")
+            if query_ids.shape[1] == 0:
+                raise ValueError("KVzip iterative decode requires at least one query token.")
+            if hasattr(kv, "info") and isinstance(kv.info, dict) and kv.info.get("flatten", False):
+                raise ValueError("KVzip iterative decode evict requires a dense KV cache, but got flattened cache.")
+
+            logits = None
+            for token_idx in range(query_ids.shape[1]):
+                _maybe_iterative_decode_evict(kv, decode_chunk_size, decode_keep_tokens)
+                current_ids = query_ids[:, token_idx:token_idx + 1]
+                outputs = kvzip_model.__call__(current_ids, kv, update_cache=True, return_logits=True)
+                _append_dense_tokens(kv, current_ids)
+                logits = outputs.logits[:, -1, :]
+
+            eos_token_id = gen_kwargs.get('eos_token_id', None)
+            stop_token_ids = set()
+            if eos_token_id is not None:
+                if isinstance(eos_token_id, int):
+                    stop_token_ids.add(int(eos_token_id))
+                else:
+                    stop_token_ids.update(int(token_id) for token_id in eos_token_id)
+            for token_id in [tokenizer.eos_token_id, tokenizer.pad_token_id]:
+                if token_id is not None:
+                    stop_token_ids.add(int(token_id))
+            if hasattr(tokenizer, "eot_token_id") and tokenizer.eot_token_id is not None:
+                stop_token_ids.add(int(tokenizer.eot_token_id))
+
+            max_new_tokens = int(gen_kwargs.get('max_new_tokens', 512))
+            do_sample = bool(gen_kwargs.get('do_sample', False))
+            temperature = float(gen_kwargs.get('temperature', 1.0))
+            top_p = float(gen_kwargs.get('top_p', 1.0))
+            top_k_value = gen_kwargs.get('top_k', 0)
+            top_k = 0 if top_k_value in (None, 0) else int(top_k_value)
+
+            generated_ids = []
+            for _ in range(max_new_tokens):
+                step_logits = logits.clone()
+                if os.environ.get('BAN_EOS') and tokenizer.eos_token_id is not None:
+                    step_logits[:, tokenizer.eos_token_id] = -float('inf')
+
+                if do_sample:
+                    if temperature != 1.0:
+                        step_logits = step_logits / temperature
+                    step_logits = top_k_top_p_filtering(step_logits, top_k=top_k, top_p=top_p)
+                    probs = torch.softmax(step_logits, dim=-1)
+                    next_token = torch.multinomial(probs, num_samples=1)
+                else:
+                    next_token = torch.argmax(step_logits, dim=-1, keepdim=True)
+
+                token_id = int(next_token[0, 0])
+                if token_id in stop_token_ids:
+                    break
+
+                _maybe_iterative_decode_evict(kv, decode_chunk_size, decode_keep_tokens)
+                outputs = kvzip_model.__call__(next_token, kv, update_cache=True, return_logits=True)
+                _append_dense_tokens(kv, next_token)
+                generated_ids.append(token_id)
+                logits = outputs.logits[:, -1, :]
+
+            if not generated_ids:
+                return ""
+
+            return kvzip_model.decode(
+                torch.tensor([generated_ids], device=query_ids.device, dtype=query_ids.dtype)
+            )
+
+        def generate(prompt: Union[str, dict, List[Union[str, dict]]], past_key_values=None, **kwargs):
             if past_key_values is not None:
                 raise ValueError('KVzip adapter does not support external past_key_values.')
 
-            if isinstance(prompt, str):
+            if isinstance(prompt, (str, dict)):
                 prompts = [prompt]
                 is_single = True
             else:
@@ -522,6 +717,14 @@ def get_generate_api(model_path: str, infer_config: dict, compressor_path: str,
             load_score = _as_bool(kwargs.pop('load_score', default_load_score))
             do_score = _as_bool(kwargs.pop('do_score', default_do_score))
             update_cache = _as_bool(kwargs.pop('update_cache', default_update_cache))
+            iterative_chunk_size = int(kwargs.pop('iterative_expand_chunk_size', default_iterative_chunk_size) or 0)
+            iterative_keep_tokens = int(kwargs.pop('iterative_keep_tokens', default_iterative_keep_tokens) or 0)
+            iterative_decode_chunk_size = int(
+                kwargs.pop('iterative_decode_chunk_size', default_iterative_decode_chunk_size) or 0
+            )
+            iterative_decode_keep_tokens = int(
+                kwargs.pop('iterative_decode_keep_tokens', default_iterative_decode_keep_tokens) or 0
+            )
 
             gen_kwargs = base_gen_kwargs.copy()
             gen_kwargs.update({
@@ -547,17 +750,63 @@ def get_generate_api(model_path: str, infer_config: dict, compressor_path: str,
             kvzip_model.gen_kwargs = gen_kwargs
             try:
                 for single_prompt in prompts:
-                    prompt_ids = kvzip_model.encode(single_prompt)
-                    prefill_ids = prompt_ids[:, :-1]
-                    query_ids = prompt_ids[:, -1:]
-                    kv = kvzip_model.prefill(
-                        prefill_ids,
-                        prefill_chunk_size=prefill_chunk_size,
-                        load_score=load_score,
-                        do_score=do_score,
-                    )
-                    kv.prune(ratio=ratio, level=level)
-                    results.append(kvzip_model.generate(query_ids, kv=kv, update_cache=update_cache))
+                    old_sys_prompt_ids = kvzip_model.sys_prompt_ids
+                    old_postfix_ids = kvzip_model.postfix_ids
+                    if isinstance(single_prompt, dict):
+                        prefill_text = single_prompt.get('prefill_text')
+                        query_text = single_prompt.get('query_text')
+                        use_kvzip_template = bool(single_prompt.get('use_kvzip_template', True))
+                        if prefill_text is None or query_text is None:
+                            raise ValueError(
+                                "Structured KVzip prompt must contain 'prefill_text' and 'query_text'."
+                            )
+                        if not use_kvzip_template:
+                            kvzip_model.sys_prompt_ids = old_sys_prompt_ids[:, :0]
+                            kvzip_model.postfix_ids = old_postfix_ids[:, :0]
+                            prefill_ids = kvzip_model.encode(prefill_text)
+                            query_ids = kvzip_model.encode(query_text)
+                        else:
+                            prefill_ids = kvzip_model.encode(prefill_text)
+                            query_ids = kvzip_model.apply_template(query_text)
+                    else:
+                        # Fallback for legacy callers that pass a single prompt string.
+                        prompt_ids = kvzip_model.encode(single_prompt)
+                        prefill_ids = prompt_ids[:, :-1]
+                        query_ids = prompt_ids[:, -1:]
+                    try:
+                        kv = _iterative_prefill_kv(
+                            prefill_ids=prefill_ids,
+                            prefill_chunk_size=prefill_chunk_size,
+                            load_score=load_score,
+                            do_score=do_score,
+                            level=level,
+                            iterative_chunk_size=iterative_chunk_size,
+                            iterative_keep_tokens=iterative_keep_tokens,
+                        )
+                        if ((iterative_chunk_size > 0 and iterative_keep_tokens > 0) or
+                                (iterative_decode_chunk_size > 0 and iterative_decode_keep_tokens > 0)):
+                            if ratio < 1.0:
+                                print(
+                                    "[KVzip] skip final pair-level prune because iterative dense evict "
+                                    "is enabled."
+                                )
+                        else:
+                            kv.prune(ratio=ratio, level=level)
+                        if iterative_decode_chunk_size > 0 and iterative_decode_keep_tokens > 0:
+                            results.append(
+                                _manual_decode_with_iterative_evict(
+                                    query_ids=query_ids,
+                                    kv=kv,
+                                    decode_chunk_size=iterative_decode_chunk_size,
+                                    decode_keep_tokens=iterative_decode_keep_tokens,
+                                    gen_kwargs=gen_kwargs,
+                                )
+                            )
+                        else:
+                            results.append(kvzip_model.generate(query_ids, kv=kv, update_cache=update_cache))
+                    finally:
+                        kvzip_model.sys_prompt_ids = old_sys_prompt_ids
+                        kvzip_model.postfix_ids = old_postfix_ids
             finally:
                 kvzip_model.gen_kwargs = old_gen_kwargs
 

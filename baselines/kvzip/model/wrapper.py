@@ -277,7 +277,21 @@ class ModelKVzip():
             input_ids = torch.cat([kv.prefill_ids, input_ids], dim=1)
 
         output = self.model.generate(input_ids, past_key_values=kv, **self.gen_kwargs)
-        a_ids = output[:, len(input_ids[0]):-1]  # parse response
+        a_ids = output[:, len(input_ids[0]):]  # parse response
+        stop_token_ids = set()
+        eos_token_id = self.gen_kwargs.get("eos_token_id")
+        if eos_token_id is not None:
+            if isinstance(eos_token_id, int):
+                stop_token_ids.add(eos_token_id)
+            else:
+                stop_token_ids.update(int(token_id) for token_id in eos_token_id)
+        for token_id in [self.tokenizer.eos_token_id, self.tokenizer.pad_token_id]:
+            if token_id is not None:
+                stop_token_ids.add(int(token_id))
+        if hasattr(self.tokenizer, "eot_token_id") and self.tokenizer.eot_token_id is not None:
+            stop_token_ids.add(int(self.tokenizer.eot_token_id))
+        while a_ids.shape[1] > 0 and int(a_ids[0, -1]) in stop_token_ids:
+            a_ids = a_ids[:, :-1]
         a = self.decode(a_ids)
 
         if not update_cache:
