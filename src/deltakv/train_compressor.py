@@ -81,6 +81,9 @@ def main(
     print("Params:\n", locals())
     set_seed(42)
     accelerator = Accelerator()
+    local_rank = int(os.environ.get("LOCAL_RANK", accelerator.local_process_index))
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
 
     if gradient_checkpointing:
         assert model_type == 'e2e' or model_type == 'cluster_e2e_big', '其他训练方法在中间activation上训练，不能开gradient checkpointing'
@@ -88,10 +91,13 @@ def main(
     # --- 1. 加载模型和Tokenizer ---
     from transformers import AutoConfig
     raw_config = AutoConfig.from_pretrained(model_name_or_path)
-    is_llama = "llama" in raw_config.model_type.lower()
-    is_qwen2 = "qwen2" in raw_config.model_type.lower()
+    model_type_lower = raw_config.model_type.lower()
+    is_llama = "llama" in model_type_lower
+    is_qwen2 = "qwen2" in model_type_lower
+    is_qwen3 = "qwen3" in model_type_lower
     if os.getenv('FORCE_QWEN'):
         is_qwen2 = True
+        is_qwen3 = False
         is_llama = False
 
     if is_llama:
@@ -112,6 +118,16 @@ def main(
             from deltakv.modeling.qwen2.qwen2_e2e_cluster_for_big_model import Qwen2KVClusterCompress as KVCompressModel
         else:
             raise ValueError(f"Unknown model_type for Qwen2: {model_type}")
+    elif is_qwen3:
+        from deltakv.configs.model_config_cls import KVQwen3Config as KVConfig
+        if model_type == 'e2e':
+            from deltakv.modeling.qwen3.qwen3_e2e import Qwen3KVCompress as KVCompressModel
+        elif model_type == 'cluster_e2e':
+            from deltakv.modeling.qwen3.qwen3_e2e_cluster import Qwen3KVClusterCompress as KVCompressModel
+        elif model_type == 'cluster_e2e_big':
+            from deltakv.modeling.qwen3.qwen3_e2e_cluster_for_big_model import Qwen3KVClusterCompress as KVCompressModel
+        else:
+            raise ValueError(f"Unknown model_type for Qwen3: {model_type}")
     else:
         raise ValueError(f"Unsupported model architecture: {raw_config.model_type}")
         
@@ -174,7 +190,7 @@ def main(
         config=config,
         torch_dtype=torch.bfloat16,
         attn_implementation="flash_attention_2",
-        device_map='auto' if (use_qlora_style or use_8bit) else 'cuda',
+        device_map={"": local_rank} if torch.cuda.is_available() else None,
         quantization_config=quantization_config,
     )
 
