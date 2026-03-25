@@ -8,9 +8,9 @@ def replace_attn(model_id):
         transformers.models.llama.modeling_llama.LlamaAttention.forward = llama_qwen_attn_forward
         print("Replace llama attention with KVzip")
 
-    elif "qwen2.5" in model_id:
+    elif "qwen2.5" in model_id or "qwen2" in model_id or "distill-qwen" in model_id:
         transformers.models.qwen2.modeling_qwen2.Qwen2Attention.forward = llama_qwen_attn_forward
-        print("Replace qwen2.5 attention with KVzip")
+        print("Replace qwen2 attention with KVzip")
 
     elif "qwen3" in model_id:
         transformers.models.qwen3.modeling_qwen3.Qwen3Attention.forward = llama_qwen_attn_forward

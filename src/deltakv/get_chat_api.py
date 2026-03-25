@@ -513,6 +513,23 @@ def get_generate_api(model_path: str, infer_config: dict, compressor_path: str,
         model = kvzip_model.model
         tokenizer = kvzip_model.tokenizer
 
+        def _kvzip_debug_enabled():
+            return os.getenv("KVZIP_DEBUG", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+        def _kvzip_debug_decode(prefix, kv, step_idx=None, token_id=None):
+            if not _kvzip_debug_enabled():
+                return
+            alloc = torch.cuda.memory_allocated(model.device) / 1e9
+            reserved = torch.cuda.memory_reserved(model.device) / 1e9
+            max_alloc = torch.cuda.max_memory_allocated(model.device) / 1e9
+            print(
+                f"[KVzipDebug] {prefix} step={step_idx} token_id={token_id} "
+                f"ctx_len={getattr(kv, 'ctx_len', None)} seen={getattr(kv, '_seen_tokens', None)} "
+                f"prefill_len={None if getattr(kv, 'prefill_ids', None) is None else kv.prefill_ids.shape[1]} "
+                f"cache_mem_gb={kv._mem() if hasattr(kv, '_mem') else 'na'} "
+                f"cuda_alloc_gb={alloc:.3f} cuda_reserved_gb={reserved:.3f} cuda_max_alloc_gb={max_alloc:.3f}"
+            )
+
         def _evict_dense_context_tokens(kv, keep_tokens):
             if keep_tokens <= 0 or kv.ctx_len <= keep_tokens:
                 return 1.0
@@ -642,10 +659,12 @@ def get_generate_api(model_path: str, infer_config: dict, compressor_path: str,
 
             logits = None
             for token_idx in range(query_ids.shape[1]):
+                _kvzip_debug_decode("before-query-token", kv, step_idx=token_idx)
                 _maybe_iterative_decode_evict(kv, decode_chunk_size, decode_keep_tokens)
                 current_ids = query_ids[:, token_idx:token_idx + 1]
                 outputs = kvzip_model.__call__(current_ids, kv, update_cache=True, return_logits=True)
                 _append_dense_tokens(kv, current_ids)
+                _kvzip_debug_decode("after-query-token", kv, step_idx=token_idx, token_id=int(current_ids[0, 0]))
                 logits = outputs.logits[:, -1, :]
 
             eos_token_id = gen_kwargs.get('eos_token_id', None)
@@ -669,7 +688,7 @@ def get_generate_api(model_path: str, infer_config: dict, compressor_path: str,
             top_k = 0 if top_k_value in (None, 0) else int(top_k_value)
 
             generated_ids = []
-            for _ in range(max_new_tokens):
+            for decode_step in range(max_new_tokens):
                 step_logits = logits.clone()
                 if os.environ.get('BAN_EOS') and tokenizer.eos_token_id is not None:
                     step_logits[:, tokenizer.eos_token_id] = -float('inf')
@@ -685,12 +704,15 @@ def get_generate_api(model_path: str, infer_config: dict, compressor_path: str,
 
                 token_id = int(next_token[0, 0])
                 if token_id in stop_token_ids:
+                    _kvzip_debug_decode("stop-token", kv, step_idx=decode_step, token_id=token_id)
                     break
 
+                _kvzip_debug_decode("before-decode-token", kv, step_idx=decode_step, token_id=token_id)
                 _maybe_iterative_decode_evict(kv, decode_chunk_size, decode_keep_tokens)
                 outputs = kvzip_model.__call__(next_token, kv, update_cache=True, return_logits=True)
                 _append_dense_tokens(kv, next_token)
                 generated_ids.append(token_id)
+                _kvzip_debug_decode("after-decode-token", kv, step_idx=decode_step, token_id=token_id)
                 logits = outputs.logits[:, -1, :]
 
             if not generated_ids:
@@ -749,64 +771,65 @@ def get_generate_api(model_path: str, infer_config: dict, compressor_path: str,
             old_gen_kwargs = kvzip_model.gen_kwargs
             kvzip_model.gen_kwargs = gen_kwargs
             try:
-                for single_prompt in prompts:
-                    old_sys_prompt_ids = kvzip_model.sys_prompt_ids
-                    old_postfix_ids = kvzip_model.postfix_ids
-                    if isinstance(single_prompt, dict):
-                        prefill_text = single_prompt.get('prefill_text')
-                        query_text = single_prompt.get('query_text')
-                        use_kvzip_template = bool(single_prompt.get('use_kvzip_template', True))
-                        if prefill_text is None or query_text is None:
-                            raise ValueError(
-                                "Structured KVzip prompt must contain 'prefill_text' and 'query_text'."
-                            )
-                        if not use_kvzip_template:
-                            kvzip_model.sys_prompt_ids = old_sys_prompt_ids[:, :0]
-                            kvzip_model.postfix_ids = old_postfix_ids[:, :0]
-                            prefill_ids = kvzip_model.encode(prefill_text)
-                            query_ids = kvzip_model.encode(query_text)
-                        else:
-                            prefill_ids = kvzip_model.encode(prefill_text)
-                            query_ids = kvzip_model.apply_template(query_text)
-                    else:
-                        # Fallback for legacy callers that pass a single prompt string.
-                        prompt_ids = kvzip_model.encode(single_prompt)
-                        prefill_ids = prompt_ids[:, :-1]
-                        query_ids = prompt_ids[:, -1:]
-                    try:
-                        kv = _iterative_prefill_kv(
-                            prefill_ids=prefill_ids,
-                            prefill_chunk_size=prefill_chunk_size,
-                            load_score=load_score,
-                            do_score=do_score,
-                            level=level,
-                            iterative_chunk_size=iterative_chunk_size,
-                            iterative_keep_tokens=iterative_keep_tokens,
-                        )
-                        if ((iterative_chunk_size > 0 and iterative_keep_tokens > 0) or
-                                (iterative_decode_chunk_size > 0 and iterative_decode_keep_tokens > 0)):
-                            if ratio < 1.0:
-                                print(
-                                    "[KVzip] skip final pair-level prune because iterative dense evict "
-                                    "is enabled."
+                with torch.inference_mode():
+                    for single_prompt in prompts:
+                        old_sys_prompt_ids = kvzip_model.sys_prompt_ids
+                        old_postfix_ids = kvzip_model.postfix_ids
+                        if isinstance(single_prompt, dict):
+                            prefill_text = single_prompt.get('prefill_text')
+                            query_text = single_prompt.get('query_text')
+                            use_kvzip_template = bool(single_prompt.get('use_kvzip_template', True))
+                            if prefill_text is None or query_text is None:
+                                raise ValueError(
+                                    "Structured KVzip prompt must contain 'prefill_text' and 'query_text'."
                                 )
+                            if not use_kvzip_template:
+                                kvzip_model.sys_prompt_ids = old_sys_prompt_ids[:, :0]
+                                kvzip_model.postfix_ids = old_postfix_ids[:, :0]
+                                prefill_ids = kvzip_model.encode(prefill_text)
+                                query_ids = kvzip_model.encode(query_text)
+                            else:
+                                prefill_ids = kvzip_model.encode(prefill_text)
+                                query_ids = kvzip_model.apply_template(query_text)
                         else:
-                            kv.prune(ratio=ratio, level=level)
-                        if iterative_decode_chunk_size > 0 and iterative_decode_keep_tokens > 0:
-                            results.append(
-                                _manual_decode_with_iterative_evict(
-                                    query_ids=query_ids,
-                                    kv=kv,
-                                    decode_chunk_size=iterative_decode_chunk_size,
-                                    decode_keep_tokens=iterative_decode_keep_tokens,
-                                    gen_kwargs=gen_kwargs,
-                                )
+                            # Fallback for legacy callers that pass a single prompt string.
+                            prompt_ids = kvzip_model.encode(single_prompt)
+                            prefill_ids = prompt_ids[:, :-1]
+                            query_ids = prompt_ids[:, -1:]
+                        try:
+                            kv = _iterative_prefill_kv(
+                                prefill_ids=prefill_ids,
+                                prefill_chunk_size=prefill_chunk_size,
+                                load_score=load_score,
+                                do_score=do_score,
+                                level=level,
+                                iterative_chunk_size=iterative_chunk_size,
+                                iterative_keep_tokens=iterative_keep_tokens,
                             )
-                        else:
-                            results.append(kvzip_model.generate(query_ids, kv=kv, update_cache=update_cache))
-                    finally:
-                        kvzip_model.sys_prompt_ids = old_sys_prompt_ids
-                        kvzip_model.postfix_ids = old_postfix_ids
+                            if ((iterative_chunk_size > 0 and iterative_keep_tokens > 0) or
+                                    (iterative_decode_chunk_size > 0 and iterative_decode_keep_tokens > 0)):
+                                if ratio < 1.0:
+                                    print(
+                                        "[KVzip] skip final pair-level prune because iterative dense evict "
+                                        "is enabled."
+                                    )
+                            else:
+                                kv.prune(ratio=ratio, level=level)
+                            if iterative_decode_chunk_size > 0 and iterative_decode_keep_tokens > 0:
+                                results.append(
+                                    _manual_decode_with_iterative_evict(
+                                        query_ids=query_ids,
+                                        kv=kv,
+                                        decode_chunk_size=iterative_decode_chunk_size,
+                                        decode_keep_tokens=iterative_decode_keep_tokens,
+                                        gen_kwargs=gen_kwargs,
+                                    )
+                                )
+                            else:
+                                results.append(kvzip_model.generate(query_ids, kv=kv, update_cache=update_cache))
+                        finally:
+                            kvzip_model.sys_prompt_ids = old_sys_prompt_ids
+                            kvzip_model.postfix_ids = old_postfix_ids
             finally:
                 kvzip_model.gen_kwargs = old_gen_kwargs
 

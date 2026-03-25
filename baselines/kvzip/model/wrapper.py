@@ -120,6 +120,7 @@ class ModelKVzip():
         query_ids = torch.cat([self.encode(query), self.postfix_ids], dim=1)
         return query_ids
 
+    @torch.inference_mode()
     def __call__(
         self,
         input_ids: torch.Tensor,
@@ -245,7 +246,17 @@ class ModelKVzip():
                 kv.start_idx = kv.end_idx
 
             kv.start_idx = start_idx_tmp
-            assert kv.score[0].shape[-1] == kv.ctx_len
+            if kv.score[0].shape[-1] != kv.ctx_len:
+                score_lens = [layer_score.shape[-1] for layer_score in kv.score]
+                print(
+                    f"[KVzipDebug] scoring length mismatch model={self.name} "
+                    f"ctx_len={kv.ctx_len} score_lens={score_lens} "
+                    f"start_idx={kv.start_idx} end_idx={kv.end_idx} "
+                    f"prefill_len={None if kv.prefill_ids is None else kv.prefill_ids.shape[1]}"
+                )
+                raise AssertionError(
+                    f"KV score length mismatch: first_score_len={kv.score[0].shape[-1]}, ctx_len={kv.ctx_len}"
+                )
         else:
             kv.score = load_head_score(self.name, kv.ctx_len)
 
