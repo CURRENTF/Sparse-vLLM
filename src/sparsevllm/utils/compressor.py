@@ -41,7 +41,7 @@ def create_compressor(is_down: bool, config, bias_override: Optional[bool] = Non
     - 新版（可非对称）：compressor_down/up_type + compressor_down/up_intermediate_size
     """
     hf_config = config.hf_config
-    head_dim = hf_config.hidden_size // hf_config.num_attention_heads
+    head_dim = getattr(hf_config, "head_dim", None) or (hf_config.hidden_size // hf_config.num_attention_heads)
     kv_factor = 2 # 假设 split_kv 恒为 False
     
     # 计算输入输出维度

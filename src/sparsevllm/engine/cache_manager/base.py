@@ -76,6 +76,11 @@ class CacheManager(ABC):
                 "vllm_sparse_method='dsa' is currently only supported for DeepSeek-V3.2 "
                 f"(model_type={model_type!r})."
             )
+        if model_type == "qwen3" and isinstance(sparse_method, str) and sparse_method.startswith("deltakv"):
+            raise NotImplementedError(
+                "sparsevllm qwen3 + deltakv is disabled for now due to qk-norm/runtime mismatch. "
+                "Use the HF backend for qwen3 DeltaKV inference."
+            )
 
         if sparse_method == "deltakv":
             from .deltakv import DeltaKVCacheManager
