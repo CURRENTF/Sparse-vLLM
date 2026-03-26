@@ -15,7 +15,7 @@ from metrics import (
     code_sim_score,
 )
 
-BASE_PATH = '/root/autodl-fs/deltakv_outputs'
+BASE_PATH = os.getenv("DELTAKV_OUTPUT_DIR", "/root/autodl-fs/deltakv_outputs")
 
 dataset2metric = {
     "narrativeqa": qa_f1_score,
