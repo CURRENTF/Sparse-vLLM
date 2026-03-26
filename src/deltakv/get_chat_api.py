@@ -3,7 +3,7 @@ import sys
 import torch
 from typing import Union, List
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
-from deltakv.configs.model_config_cls import KVQwen2Config, KVQwen3Config, KVLlamaConfig
+from deltakv.configs.model_config_cls import KVQwen2Config, KVQwen3Config, KVLlamaConfig, parse_full_attn_layers
 from deltakv.baseline_adapters import load_omnikv_model, load_kivi_model
 from safetensors.torch import load_file
 
@@ -302,6 +302,35 @@ def get_generate_api(model_path: str, infer_config: dict, compressor_path: str,
             attn_implementation="flash_attention_2",
         )
 
+    elif model_cls == 'deltasnapkv':
+        base_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        if base_config.model_type != 'qwen2':
+            raise ValueError(f"deltasnapkv only supports qwen2 models, got {base_config.model_type}")
+        from deltakv.modeling.qwen2.qwen2_deltasnapkv import Qwen2DeltaSnapKVForCausalLM as KVModel
+        config_cls = KVQwen2Config
+
+        if compressor_path is None:
+            raise ValueError("deltasnapkv requires compressor_path")
+
+        config = config_cls.from_pretrained(compressor_path)
+        config.set_infer_args(**infer_config)
+        assert len(parse_full_attn_layers(config.full_attn_layers)) == 0, (
+            "deltasnapkv requires full_attn_layers to be empty; "
+            "this method does not support mixed full-attention layers."
+        )
+        model = KVModel.from_pretrained(
+            model_path,
+            config=config,
+            torch_dtype=torch.bfloat16,
+            device_map=cuda_device,
+            attn_implementation="flash_attention_2",
+        )
+        load_device = f'cuda:{cuda_device}' if isinstance(cuda_device, int) else 'cpu'
+        comp_state_dict = load_compressor(compressor_path, device=load_device)
+        _, unexpected = model.load_state_dict(comp_state_dict, strict=False)
+        assert len(unexpected) == 0, f'compressor 加载有问题: {unexpected}'
+        del comp_state_dict
+
     elif model_cls == 'pyramidkv':
         base_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
         if base_config.model_type == 'qwen2':
@@ -504,11 +533,14 @@ def get_generate_api(model_path: str, infer_config: dict, compressor_path: str,
         default_update_cache = _as_bool(infer_config.get('update_cache', False))
         default_iterative_chunk_size = int(infer_config.get('iterative_expand_chunk_size', 0) or 0)
         default_iterative_keep_tokens = int(infer_config.get('iterative_keep_tokens', 0) or 0)
+        # Keep prefill-side and decode-side iterative pruning independent.
+        # Falling back decode settings to prefill settings makes it impossible
+        # to enable only one side from `infer_config`.
         default_iterative_decode_chunk_size = int(
-            infer_config.get('iterative_decode_chunk_size', default_iterative_chunk_size) or 0
+            infer_config.get('iterative_decode_chunk_size', 0) or 0
         )
         default_iterative_decode_keep_tokens = int(
-            infer_config.get('iterative_decode_keep_tokens', default_iterative_keep_tokens) or 0
+            infer_config.get('iterative_decode_keep_tokens', 0) or 0
         )
         model = kvzip_model.model
         tokenizer = kvzip_model.tokenizer
@@ -579,7 +611,10 @@ def get_generate_api(model_path: str, infer_config: dict, compressor_path: str,
         def _maybe_iterative_decode_evict(kv, decode_chunk_size, decode_keep_tokens):
             if decode_chunk_size <= 0 or decode_keep_tokens <= 0:
                 return False
-            if (kv.ctx_len + 1) <= decode_chunk_size:
+            # Decode-side iterative eviction should behave like chunked growth:
+            # wait until the dense context grows by one decode chunk beyond the
+            # retained budget, then score once and evict back to `decode_keep_tokens`.
+            if (kv.ctx_len + 1) <= (decode_keep_tokens + decode_chunk_size):
                 return False
 
             kvzip_model.scoring(kv, kv.ctx_ids, load_score=False)
@@ -660,7 +695,6 @@ def get_generate_api(model_path: str, infer_config: dict, compressor_path: str,
             logits = None
             for token_idx in range(query_ids.shape[1]):
                 _kvzip_debug_decode("before-query-token", kv, step_idx=token_idx)
-                _maybe_iterative_decode_evict(kv, decode_chunk_size, decode_keep_tokens)
                 current_ids = query_ids[:, token_idx:token_idx + 1]
                 outputs = kvzip_model.__call__(current_ids, kv, update_cache=True, return_logits=True)
                 _append_dense_tokens(kv, current_ids)

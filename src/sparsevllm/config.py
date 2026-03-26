@@ -35,8 +35,8 @@ class Config:
     # OmniKV Config
     obs_layer_ids: list[int] = None  # None means auto-calculate based on full_attn_layers (useful for omnikv)
     full_attn_layers: str | list[int] = "0" # useful for omnikv
-    chunk_prefill_accel_omnikv: bool = True
-    num_top_tokens_in_prefill: int | None = None
+    chunk_prefill_accel_omnikv: bool = False
+    num_top_tokens_in_prefill: int | None = 8192
 
     # QuEST Config
     quest_chunk_size: int = 16

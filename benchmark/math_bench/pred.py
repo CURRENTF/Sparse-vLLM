@@ -406,6 +406,11 @@ if __name__ == "__main__":
     compressor_name = os.path.basename(args.compressor_path.rstrip("/")) if args.compressor_path else "None"
 
     datasets = [d.strip() for d in args.task.split(",") if d.strip()]
+    if args.model_cls == "kvzip" and "aime2024" in datasets:
+        raise AssertionError(
+            "KVzip is disabled for aime2024 in math_bench. "
+            "Use another model_cls or remove aime2024 from --task."
+        )
     time_tag = datetime.now().strftime("%m%d_%H%M")
     out_root = os.path.join(BASE_PATH, f"benchmark/math_bench/pred/{model_name}/{compressor_name}_{time_tag}")
     os.makedirs(out_root, exist_ok=True)
