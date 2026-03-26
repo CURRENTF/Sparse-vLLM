@@ -2,6 +2,7 @@ import os
 import json
 import sys
 import subprocess
+import re
 from typing import Union
 
 from tqdm import tqdm
@@ -15,8 +16,11 @@ import torch.distributed as dist
 from deltakv.get_chat_api import get_generate_api
 from datetime import datetime
 
-BASE_PATH = '/root/autodl-fs/deltakv_outputs'
-DATA_PREFIX_PATH = '/root/autodl-fs/datasets/LongBench/'
+BASE_PATH = os.getenv("DELTAKV_OUTPUT_DIR", "/root/autodl-fs/deltakv_outputs")
+DATA_PREFIX_PATH = os.getenv(
+    "DELTAKV_LONGBENCH_DATA_DIR",
+    os.getenv("DELTAKV_DATA_DIR", "/root/autodl-fs/datasets/LongBench/"),
+)
 
 
 def seed_everything(seed):
@@ -29,7 +33,7 @@ def seed_everything(seed):
     torch.cuda.manual_seed_all(seed)
 
 
-def build_chat(tokenizer, prompt, dataset, no_chat_template=False):
+def build_chat(tokenizer, prompt, dataset, no_chat_template=False, thinking_mode="off"):
     if dataset in ["trec", "triviaqa", "samsum", "lsht", "lcc", "repobench-p"]:
         return prompt
     if not no_chat_template and hasattr(tokenizer, 'apply_chat_template') and tokenizer.chat_template is not None:
@@ -37,10 +41,55 @@ def build_chat(tokenizer, prompt, dataset, no_chat_template=False):
             # {'role': 'system', 'content': 'You are a helpful assistant.'},
             {'role': 'user', 'content': prompt},
         ]
-        prompt = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+        enable_thinking = thinking_mode != "off"
+        prompt = tokenizer.apply_chat_template(
+            msgs,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=enable_thinking,
+        )
+        # Some local Qwen3 tokenizer templates still end with an open `<think>` block
+        # even when `enable_thinking=False`. Close it explicitly to force empty-thinking mode.
+        if thinking_mode == "off" and prompt.endswith("<think>\n"):
+            prompt += "</think>\n"
     if os.getenv('DEBUG'):
         print('input prompt:', prompt)
     return prompt
+
+
+def strip_thinking_content(text: str) -> str:
+    # When the prompt already ends with an open `<think>`, the generated text is
+    # often just the continuation of that block and only emits the closing tag.
+    if "</think>" in text:
+        text = text.split("</think>", 1)[1]
+    text = re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL)
+    text = text.lstrip()
+
+    # Some generations never emit `</think>` and instead end with a natural-
+    # language answer cue. Recover the short answer conservatively.
+    if "\n" in text and len(text) > 200:
+        for pattern in [
+            r"(?is)i['’]ll say\s+[\"“]?([^\"”\n\.\?!]+)",
+            r"(?is)i['’]ll go with\s+[\"“]?([^\"”\n\.\?!]+)",
+            r"(?is)answer would be\s+[\"“]?([^\"”\n\.\?!]+)",
+            r"(?is)so the answer is\s+[\"“]?([^\"”\n\.\?!]+)",
+            r"(?is)i think the answer is\s+[\"“]?([^\"”\n\.\?!]+)",
+            r"(?is)the answer is\s+[\"“]?([^\"”\n\.\?!]+)",
+        ]:
+            matches = re.findall(pattern, text)
+            for match in reversed(matches):
+                candidate = match.strip().strip('\'"“”')
+                lower = candidate.lower()
+                if len(candidate) > 80:
+                    continue
+                if any(
+                    phrase in lower
+                    for phrase in ["not explicitly", "not provided", "not enough information"]
+                ):
+                    continue
+                return candidate.rstrip(" .")
+
+    return text
 
 
 def load_model_and_tokenizer(rank, args):
@@ -92,7 +141,7 @@ def load_model_and_tokenizer(rank, args):
 def get_pred(rank, data, dataset_info, args, model, tokenizer, model_max_length):
     dataset = dataset_info['dataset']
     prompt_format = dataset_info['prompt_format']
-    max_gen = dataset_info['max_gen']
+    max_gen = args.max_new_tokens_override if args.max_new_tokens_override is not None else dataset_info['max_gen']
     max_length = model_max_length if model_max_length else dataset_info['max_length']
     out_path = dataset_info['out_path']
 
@@ -109,7 +158,7 @@ def get_pred(rank, data, dataset_info, args, model, tokenizer, model_max_length)
                     tokenizer.decode(tokenized_prompt[:half], skip_special_tokens=True) +
                     tokenizer.decode(tokenized_prompt[-half:], skip_special_tokens=True)
                 )
-            prompts.append(build_chat(tokenizer, prompt, dataset, args.no_chat_template))
+            prompts.append(build_chat(tokenizer, prompt, dataset, args.no_chat_template, args.thinking_mode))
 
         eos_token_id = [tokenizer.eos_token_id]
         if hasattr(tokenizer, 'eot_token_id'):
@@ -119,14 +168,18 @@ def get_pred(rank, data, dataset_info, args, model, tokenizer, model_max_length)
             prompts,
             max_new_tokens=max_gen,
             num_beams=1,
-            do_sample=False,
-            temperature=1.0,
+            do_sample=args.temperature > 0,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            top_k=args.top_k,
             eos_token_id=eos_token_id,
         )
 
         if isinstance(preds, str): preds = [preds]
 
         for json_obj, pred in zip(batch_data, preds):
+            if args.thinking_mode == "on_strip":
+                pred = strip_thinking_content(pred)
             with open(out_path, "a", encoding="utf-8") as f:
                 json.dump({
                     "pred": pred, "answers": json_obj["answers"],
@@ -180,6 +233,11 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size for inference")
     parser.add_argument("--no_chat_template", action='store_true', help="Do not use chat template")
     parser.add_argument("--hyper_param", type=str, default=None, help="Path to a JSON file or a JSON string containing hyper-parameters")
+    parser.add_argument("--temperature", type=float, default=0.7)
+    parser.add_argument("--top_p", type=float, default=0.8)
+    parser.add_argument("--top_k", type=int, default=20)
+    parser.add_argument("--thinking_mode", type=str, default="off", choices=["off", "on_strip"])
+    parser.add_argument("--max_new_tokens_override", type=int, default=None)
 
     return parser.parse_args()
 
