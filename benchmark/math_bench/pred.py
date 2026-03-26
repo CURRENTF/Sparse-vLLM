@@ -47,6 +47,34 @@ def build_chat(tokenizer, prompt: str, no_chat_template: bool) -> str:
     return prompt
 
 
+def build_kvzip_prompt_parts(tokenizer, prompt: str, no_chat_template: bool):
+    if no_chat_template or not hasattr(tokenizer, "apply_chat_template") or tokenizer.chat_template is None:
+        return None
+
+    msgs = [{"role": "user", "content": prompt}]
+    enable_thinking = os.getenv("ENABLE_THINKING", "1") not in ("0", "false", "False")
+    prefill_text = tokenizer.apply_chat_template(
+        msgs,
+        tokenize=False,
+        add_generation_prompt=False,
+        enable_thinking=enable_thinking,
+    )
+    full_text = tokenizer.apply_chat_template(
+        msgs,
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=enable_thinking,
+    )
+    if not full_text.startswith(prefill_text):
+        raise ValueError("KVzip math adapter expected add_generation_prompt=True output to extend the prefill prefix.")
+
+    return {
+        "prefill_text": prefill_text,
+        "query_text": full_text[len(prefill_text):],
+        "use_kvzip_template": False,
+    }
+
+
 def _read_json_or_jsonl(path: str):
     with open(path, "r", encoding="utf-8") as f:
         head = f.read(1)
@@ -200,6 +228,37 @@ def get_pred(rank: int, data, dataset: str, args, model, tokenizer, out_path: st
         for j, example in enumerate(batch_data):
             problem = _get_problem_text(example, dataset)
             prompt = prompt_format.format(problem=problem)
+
+            if args.model_cls == "kvzip" and args.backend == "hf":
+                prompt_parts = build_kvzip_prompt_parts(tokenizer, prompt, args.no_chat_template)
+                if prompt_parts is not None:
+                    query_ids = tokenizer(
+                        prompt_parts["query_text"],
+                        truncation=False,
+                        return_tensors="pt",
+                    ).input_ids[0]
+                    max_prefill_len = max(max_prompt_len - len(query_ids), 1)
+                    prefill_ids = tokenizer(
+                        prompt_parts["prefill_text"],
+                        truncation=False,
+                        return_tensors="pt",
+                    ).input_ids[0]
+                    if len(prefill_ids) > max_prefill_len:
+                        half = int(max_prefill_len / 2)
+                        if half == 0:
+                            prompt_parts["prefill_text"] = tokenizer.decode(
+                                prefill_ids[-max_prefill_len:],
+                                skip_special_tokens=False,
+                            )
+                        else:
+                            prompt_parts["prefill_text"] = (
+                                tokenizer.decode(prefill_ids[:half], skip_special_tokens=False)
+                                + tokenizer.decode(prefill_ids[-half:], skip_special_tokens=False)
+                            )
+                    prompts.append(prompt_parts)
+                    meta.append({"id": _get_example_id(example, i + j)})
+                    continue
+
             tokenized_prompt = tokenizer(prompt, truncation=False, return_tensors="pt").input_ids[0]
             if len(tokenized_prompt) > max_prompt_len:
                 half = int(max_prompt_len / 2)

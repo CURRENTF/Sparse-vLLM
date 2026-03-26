@@ -120,6 +120,7 @@ class ModelKVzip():
         query_ids = torch.cat([self.encode(query), self.postfix_ids], dim=1)
         return query_ids
 
+    @torch.inference_mode()
     def __call__(
         self,
         input_ids: torch.Tensor,
@@ -245,7 +246,17 @@ class ModelKVzip():
                 kv.start_idx = kv.end_idx
 
             kv.start_idx = start_idx_tmp
-            assert kv.score[0].shape[-1] == kv.ctx_len
+            if kv.score[0].shape[-1] != kv.ctx_len:
+                score_lens = [layer_score.shape[-1] for layer_score in kv.score]
+                print(
+                    f"[KVzipDebug] scoring length mismatch model={self.name} "
+                    f"ctx_len={kv.ctx_len} score_lens={score_lens} "
+                    f"start_idx={kv.start_idx} end_idx={kv.end_idx} "
+                    f"prefill_len={None if kv.prefill_ids is None else kv.prefill_ids.shape[1]}"
+                )
+                raise AssertionError(
+                    f"KV score length mismatch: first_score_len={kv.score[0].shape[-1]}, ctx_len={kv.ctx_len}"
+                )
         else:
             kv.score = load_head_score(self.name, kv.ctx_len)
 
@@ -277,7 +288,21 @@ class ModelKVzip():
             input_ids = torch.cat([kv.prefill_ids, input_ids], dim=1)
 
         output = self.model.generate(input_ids, past_key_values=kv, **self.gen_kwargs)
-        a_ids = output[:, len(input_ids[0]):-1]  # parse response
+        a_ids = output[:, len(input_ids[0]):]  # parse response
+        stop_token_ids = set()
+        eos_token_id = self.gen_kwargs.get("eos_token_id")
+        if eos_token_id is not None:
+            if isinstance(eos_token_id, int):
+                stop_token_ids.add(eos_token_id)
+            else:
+                stop_token_ids.update(int(token_id) for token_id in eos_token_id)
+        for token_id in [self.tokenizer.eos_token_id, self.tokenizer.pad_token_id]:
+            if token_id is not None:
+                stop_token_ids.add(int(token_id))
+        if hasattr(self.tokenizer, "eot_token_id") and self.tokenizer.eot_token_id is not None:
+            stop_token_ids.add(int(self.tokenizer.eot_token_id))
+        while a_ids.shape[1] > 0 and int(a_ids[0, -1]) in stop_token_ids:
+            a_ids = a_ids[:, :-1]
         a = self.decode(a_ids)
 
         if not update_cache:

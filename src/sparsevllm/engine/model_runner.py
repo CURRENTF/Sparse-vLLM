@@ -1,3 +1,4 @@
+import os
 import pickle
 import torch
 import torch.distributed as dist
@@ -39,7 +40,13 @@ class ModelRunner:
 
         # 初始化分布式环境并绑定对应的 GPU 卡
         if not dist.is_initialized():
-            dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+            master_port = int(os.getenv("SPARSEVLLM_MASTER_PORT", "2333"))
+            dist.init_process_group(
+                "nccl",
+                f"tcp://localhost:{master_port}",
+                world_size=self.world_size,
+                rank=rank,
+            )
         torch.cuda.set_device(rank)
         
         default_dtype = torch.get_default_dtype()

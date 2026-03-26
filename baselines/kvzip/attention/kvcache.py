@@ -3,6 +3,7 @@
 # Licensed under The MIT License
 # GitHub Repository: https://github.com/snu-mllab/KVzip
 # ------------------------------------------------------------------------------
+import os
 from typing import Any, Dict, Optional, Tuple
 
 import torch
@@ -37,6 +38,48 @@ class EvictCache(DynamicCache, KVScore):
                                     dtype=bool,
                                     device=self.device)
         self.info = {"flatten": False, "offset": None}
+        self._debug_updates = 0
+
+    def _debug_enabled(self):
+        return os.getenv("KVZIP_DEBUG", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+    def _debug_every(self):
+        try:
+            return max(int(os.getenv("KVZIP_DEBUG_EVERY", "1")), 1)
+        except ValueError:
+            return 1
+
+    def _debug_all_layers(self):
+        return os.getenv("KVZIP_DEBUG_ALL_LAYERS", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+    def _cuda_mem_gb(self):
+        if not torch.cuda.is_available():
+            return 0.0, 0.0, 0.0
+        alloc = torch.cuda.memory_allocated(self.device) / 1e9
+        reserved = torch.cuda.memory_reserved(self.device) / 1e9
+        max_alloc = torch.cuda.max_memory_allocated(self.device) / 1e9
+        return alloc, reserved, max_alloc
+
+    def _debug_print(self, prefix: str, layer_idx: int, key_states: Optional[torch.Tensor] = None):
+        if not self._debug_enabled():
+            return
+        if not self._debug_all_layers() and layer_idx not in (0, self.n_layers - 1):
+            return
+        if self._debug_updates % self._debug_every() != 0:
+            return
+
+        cache_shape = None
+        if len(self.key_cache) > layer_idx:
+            cache_shape = tuple(self.key_cache[layer_idx].shape)
+        key_shape = tuple(key_states.shape) if key_states is not None else None
+        alloc, reserved, max_alloc = self._cuda_mem_gb()
+        print(
+            f"[KVzipDebug] {prefix} step={self._debug_updates} layer={layer_idx} "
+            f"flatten={self.info.get('flatten', False)} ctx_len={self.ctx_len} "
+            f"seen={self._seen_tokens} key_shape={key_shape} cache_shape={cache_shape} "
+            f"cache_mem_gb={self._mem():.3f} cuda_alloc_gb={alloc:.3f} "
+            f"cuda_reserved_gb={reserved:.3f} cuda_max_alloc_gb={max_alloc:.3f}"
+        )
 
     def update(self,
                key_states: torch.Tensor,
@@ -48,34 +91,51 @@ class EvictCache(DynamicCache, KVScore):
         if layer_idx == 0:
             seen_token = cache_kwargs.get("seen_token", key_states.size(-2))
             self._seen_tokens += seen_token
+            self._debug_updates += 1
 
-        # Update the cache
-        if len(self.key_cache) <= layer_idx:
-            self.key_cache.append(key_states)
-            self.value_cache.append(value_states)
+        try:
+            # Update the cache
+            if len(self.key_cache) <= layer_idx:
+                self.key_cache.append(key_states)
+                self.value_cache.append(value_states)
 
-        elif self.info["flatten"]:
-            cu_klen = self.info["cu_len_k"][layer_idx]
-            head_lens = self.info["len_k"][layer_idx] + self.info["offset"][layer_idx]
+            elif self.info["flatten"]:
+                cu_klen = self.info["cu_len_k"][layer_idx]
+                head_lens = self.info["len_k"][layer_idx] + self.info["offset"][layer_idx]
 
-            dim = key_states.size(-1)
-            self.key_cache[layer_idx] = update_flatten_view(
-                self.key_cache[layer_idx],
-                key_states.contiguous().view(-1, dim),
-                head_lens,
-                cu_klen,
-            )
-            self.value_cache[layer_idx] = update_flatten_view(
-                self.value_cache[layer_idx],
-                value_states.contiguous().view(-1, dim),
-                head_lens,
-                cu_klen,
-            )
+                dim = key_states.size(-1)
+                self.key_cache[layer_idx] = update_flatten_view(
+                    self.key_cache[layer_idx],
+                    key_states.contiguous().view(-1, dim),
+                    head_lens,
+                    cu_klen,
+                )
+                self.value_cache[layer_idx] = update_flatten_view(
+                    self.value_cache[layer_idx],
+                    value_states.contiguous().view(-1, dim),
+                    head_lens,
+                    cu_klen,
+                )
 
-        else:
-            self.key_cache[layer_idx] = torch.cat([self.key_cache[layer_idx], key_states], dim=-2)
-            self.value_cache[layer_idx] = torch.cat([self.value_cache[layer_idx], value_states],
-                                                    dim=-2)
+            else:
+                self.key_cache[layer_idx] = torch.cat([self.key_cache[layer_idx], key_states], dim=-2)
+                self.value_cache[layer_idx] = torch.cat([self.value_cache[layer_idx], value_states],
+                                                        dim=-2)
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                alloc, reserved, max_alloc = self._cuda_mem_gb()
+                prev_shape = tuple(self.key_cache[layer_idx].shape) if len(self.key_cache) > layer_idx else None
+                print(
+                    f"[KVzipDebug] OOM in EvictCache.update layer={layer_idx} step={self._debug_updates} "
+                    f"flatten={self.info.get('flatten', False)} ctx_len={self.ctx_len} "
+                    f"seen={self._seen_tokens} prev_cache_shape={prev_shape} "
+                    f"incoming_shape={tuple(key_states.shape)} cache_mem_gb={self._mem():.3f} "
+                    f"cuda_alloc_gb={alloc:.3f} cuda_reserved_gb={reserved:.3f} "
+                    f"cuda_max_alloc_gb={max_alloc:.3f}"
+                )
+            raise
+
+        self._debug_print("update", layer_idx, key_states)
 
         return self.key_cache[layer_idx], self.value_cache[layer_idx]
 
@@ -115,7 +175,7 @@ class EvictCache(DynamicCache, KVScore):
         """ Returns the memory usage of the cache in GB.
         """
         mem = 0
-        for i in range(self.n_layers):
+        for i in range(len(self.key_cache)):
             mem += self.key_cache[i].numel() * self.key_cache[i].element_size()
         mem *= 2  # key + value
         return round(mem / 10**9, 1)
@@ -134,7 +194,11 @@ class EvictCache(DynamicCache, KVScore):
 
         self.prepare_init()
         self.pruned = True
-        print(f"ratio {r_:.2f} ({level}), {self._mem()} GB (evict {rmv.sum():.0f} pairs)")
+        alloc, reserved, max_alloc = self._cuda_mem_gb()
+        print(
+            f"ratio {r_:.2f} ({level}), {self._mem()} GB (evict {rmv.sum():.0f} pairs) "
+            f"[cuda_alloc_gb={alloc:.3f}, cuda_reserved_gb={reserved:.3f}, cuda_max_alloc_gb={max_alloc:.3f}]"
+        )
         return thres, r_
 
     def _get_valid(self, layer_idx: int, n_seq: int):

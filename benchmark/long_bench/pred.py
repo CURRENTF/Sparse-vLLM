@@ -21,7 +21,7 @@ DATA_PREFIX_PATH = os.getenv(
     "DELTAKV_LONGBENCH_DATA_DIR",
     os.getenv("DELTAKV_DATA_DIR", "/root/autodl-fs/datasets/LongBench/"),
 )
-
+NO_CHAT_TEMPLATE_DATASETS = {"trec", "triviaqa", "samsum", "lsht", "lcc", "repobench-p"}
 
 def seed_everything(seed):
     torch.manual_seed(seed)
@@ -34,7 +34,7 @@ def seed_everything(seed):
 
 
 def build_chat(tokenizer, prompt, dataset, no_chat_template=False, thinking_mode="off"):
-    if dataset in ["trec", "triviaqa", "samsum", "lsht", "lcc", "repobench-p"]:
+    if dataset in NO_CHAT_TEMPLATE_DATASETS:
         return prompt
     if not no_chat_template and hasattr(tokenizer, 'apply_chat_template') and tokenizer.chat_template is not None:
         msgs = [
@@ -90,6 +90,23 @@ def strip_thinking_content(text: str) -> str:
                 return candidate.rstrip(" .")
 
     return text
+
+
+def build_kvzip_prompt_parts(prompt_format, json_obj, use_kvzip_template=True):
+    if "{context}" not in prompt_format:
+        raise ValueError("KVzip LongBench adapter requires '{context}' in the prompt template.")
+
+    pre_context, post_context = prompt_format.split("{context}", 1)
+    format_fields = dict(json_obj)
+    context_text = format_fields.pop("context")
+
+    context_prefix = pre_context.format(**format_fields)
+    query_suffix = post_context.format(**format_fields)
+    return {
+        "prefill_text": context_prefix + context_text,
+        "query_text": query_suffix,
+        "use_kvzip_template": use_kvzip_template,
+    }
 
 
 def load_model_and_tokenizer(rank, args):
@@ -150,15 +167,47 @@ def get_pred(rank, data, dataset_info, args, model, tokenizer, model_max_length)
         batch_data = data[i:i + batch_size]
         prompts = []
         for json_obj in batch_data:
-            prompt = prompt_format.format(**json_obj)
-            tokenized_prompt = tokenizer(prompt, truncation=False, return_tensors="pt").input_ids[0]
-            if len(tokenized_prompt) > max_length:
-                half = int(max_length / 2)
-                prompt = (
-                    tokenizer.decode(tokenized_prompt[:half], skip_special_tokens=True) +
-                    tokenizer.decode(tokenized_prompt[-half:], skip_special_tokens=True)
+            if args.model_cls == "kvzip" and args.backend == "hf":
+                use_kvzip_template = not args.no_chat_template and dataset not in NO_CHAT_TEMPLATE_DATASETS
+                prompt_parts = build_kvzip_prompt_parts(
+                    prompt_format,
+                    json_obj,
+                    use_kvzip_template=use_kvzip_template,
                 )
-            prompts.append(build_chat(tokenizer, prompt, dataset, args.no_chat_template, args.thinking_mode))
+                query_ids = tokenizer(
+                    prompt_parts["query_text"],
+                    truncation=False,
+                    return_tensors="pt",
+                ).input_ids[0]
+                max_context_length = max(max_length - len(query_ids), 1)
+                context_ids = tokenizer(
+                    prompt_parts["prefill_text"],
+                    truncation=False,
+                    return_tensors="pt",
+                ).input_ids[0]
+                if len(context_ids) > max_context_length:
+                    half = int(max_context_length / 2)
+                    if half == 0:
+                        prompt_parts["prefill_text"] = tokenizer.decode(
+                            context_ids[-max_context_length:],
+                            skip_special_tokens=True,
+                        )
+                    else:
+                        prompt_parts["prefill_text"] = (
+                            tokenizer.decode(context_ids[:half], skip_special_tokens=True) +
+                            tokenizer.decode(context_ids[-half:], skip_special_tokens=True)
+                        )
+                prompts.append(prompt_parts)
+            else:
+                prompt = prompt_format.format(**json_obj)
+                tokenized_prompt = tokenizer(prompt, truncation=False, return_tensors="pt").input_ids[0]
+                if len(tokenized_prompt) > max_length:
+                    half = int(max_length / 2)
+                    prompt = (
+                            tokenizer.decode(tokenized_prompt[:half], skip_special_tokens=True) +
+                            tokenizer.decode(tokenized_prompt[-half:], skip_special_tokens=True)
+                    )
+                prompts.append(build_chat(tokenizer, prompt, dataset, args.no_chat_template, args.thinking_mode))
 
         eos_token_id = [tokenizer.eos_token_id]
         if hasattr(tokenizer, 'eot_token_id'):
