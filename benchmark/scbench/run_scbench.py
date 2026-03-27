@@ -8,11 +8,16 @@ import os
 import sys
 import time
 import copy
+import multiprocessing as mp
 from datetime import datetime
 from pathlib import Path
 from typing import Any, List, Tuple
 
-BASE_PATH = '/root/autodl-fs/deltakv_outputs'
+# Where to append scbench_eval.log. Default to repo-local outputs unless overridden.
+BASE_PATH = os.environ.get(
+    "DELTAKV_OUTPUT_DIR",
+    str(Path(__file__).resolve().parents[2] / "outputs"),
+)
 
 # Add src to sys.path
 sys.path.append(str(Path(__file__).parent.parent.parent / "src"))
@@ -91,6 +96,184 @@ def truncate_by_tokens(input, tok, max_tokens, manner: str = "middle"):
     assert len_after <= len_before
     assert len_after <= max_tokens or max_tokens < 0
     return tokens
+
+
+def _shorten_val(v: Any) -> str:
+    v = str(v)
+    if "/" in v:
+        v = os.path.basename(v.rstrip("/"))
+    if len(v) > 40:
+        v = v[:20] + ".." + v[-15:]
+    return v
+
+
+def _build_result_dir(args, real_model_name: str, scdq_mode: bool) -> tuple[Path, str, str, str]:
+    disable_golden_context = "_disable_golden_context" if args.disable_golden_context else ""
+    use_scdq = "_scdq" if scdq_mode else "_multi_turn"
+    use_llmlingua = "_lingua" if args.use_llmlingua else ""
+
+    verbalize_hyper_param = (
+        f"_{'-'.join([f'{k}={v}' for k, v in args.hyper_param.items() if k != 'best_pattern'])}"
+        if args.hyper_param
+        else ""
+    )
+    verbalize_hyper_param = _shorten_val(verbalize_hyper_param)
+
+    result_dir = Path(
+        args.output_dir,
+        f"{real_model_name}_{args.attn_type}{disable_golden_context}_{args.kv_type}{verbalize_hyper_param}",
+    )
+    real_model_name_tag = (
+        f"{real_model_name}_{args.attn_type}{use_scdq}{disable_golden_context}_{args.kv_type}{verbalize_hyper_param}"
+    )
+    return result_dir, real_model_name_tag, use_scdq, use_llmlingua
+
+
+def _merge_rank_jsonl(dst_path: Path, src_paths: list[Path]):
+    rows = []
+    for p in src_paths:
+        if not p.exists():
+            continue
+        with open(p, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                rows.append(json.loads(line))
+
+    rows.sort(key=lambda x: (x.get("id", -1), x.get("turn_idx", -1)))
+    dump_jsonl(rows, dst_path)
+
+
+def _run_scbench_worker(
+    rank: int,
+    world_size: int,
+    args,
+    data_names: list[str],
+    max_seq_length: int,
+    scdq_mode: bool,
+):
+    # DeltaKVGreedySearch uses `input_ids.cuda()` without specifying device.
+    if torch.cuda.is_available():
+        torch.cuda.set_device(rank)
+
+    hyper_param = args.hyper_param.copy() if args.hyper_param else {}
+    # Force single-GPU load per rank (avoid HF `device_map="auto"` sharding).
+    hyper_param["cuda_device"] = rank
+
+    model_name = args.model_name_or_path
+    real_model_name = model_name.split("/")[-1]
+    result_dir, _, use_scdq, use_llmlingua = _build_result_dir(args, real_model_name, scdq_mode)
+    result_dir.mkdir(exist_ok=True, parents=True)
+
+    model, tok = load_model(
+        model_name,
+        args.topk,
+        args.starting_layer,
+        args.topk_dims_file_path,
+        args.use_sparq,
+        attn_type=args.attn_type,
+        max_seq_length=max_seq_length,
+        is_search=args.is_search,
+        kv_type=args.kv_type,
+        trust_remote_code=args.trust_remote_code,
+        kv_cache_cpu=args.kv_cache_cpu,
+        kv_cache_cpu_device=args.kv_cache_cpu_device,
+        tensor_parallel_size=args.tensor_parallel_size,
+        hyper_param=hyper_param,
+        copy_on_gpu=args.copy_on_gpu,
+    )
+
+    for data_name in data_names:
+        max_new_tokens = DATA_NAME_TO_MAX_NEW_TOKENS[data_name]
+        if isinstance(max_new_tokens, dict):
+            assert (
+                max(max_new_tokens.values()) <= max_seq_length
+            ), "max_new_tokens must be less than max_seq_length"
+        elif max_new_tokens >= max_seq_length:
+            max_new_tokens = 500
+
+        output_path = result_dir / f"prediction_{data_name}{use_scdq}{use_llmlingua}.rank{rank}.jsonl"
+        examples = load_dataset("microsoft/SCBench", data_name, split="test")
+
+        if args.use_llmlingua:
+            compression_ratio = hyper_param.get("llmlingua_ratio", 3) if hyper_param else 3
+            examples = get_compressed_examples(examples, data_name, args.data_dir, rate=1 / compression_ratio)
+
+        max_turn_size = len(examples[0]["multi_turns"])
+        if args.max_turns > 0 and args.max_turns < max_turn_size:
+            examples = [{**eg, "multi_turns": eg["multi_turns"][: args.max_turns]} for eg in examples]
+            max_turn_size = args.max_turns
+
+        if args.num_eval_examples != -1:
+            num_eval_examples = min(args.num_eval_examples, len(examples))
+            if isinstance(examples, list):
+                examples = examples[:num_eval_examples]
+            else:
+                examples = examples.select(range(num_eval_examples))
+
+        preds = []
+        for i in tqdm(range(len(examples)), desc=f"[Rank {rank}] {data_name}"):
+            if i < args.start_example_id:
+                continue
+            if i % world_size != rank:
+                continue
+
+            eg = examples[i]
+
+            if isinstance(eg, str):
+                try:
+                    eg = json.loads(eg)
+                except:
+                    pass
+
+            if data_name in ["scbench_summary_with_needles", "scbench_repoqa_and_kv"]:
+                tokens_to_sum = sum(list(max_new_tokens.values())) if isinstance(max_new_tokens, dict) else max_new_tokens
+                max_input_length = max_seq_length - (tokens_to_sum * max_turn_size // 2)
+            else:
+                max_input_length = max_seq_length - max_new_tokens * max_turn_size
+
+            pred = get_pred(
+                model,
+                eg,
+                data_name,
+                max_new_tokens,
+                max_input_length=max_input_length,
+                attn_type=args.attn_type,
+                tok=tok,
+                use_chat_template=args.use_chat_template,
+                scdq_mode=scdq_mode,
+                disable_golden_context=args.disable_golden_context,
+            )
+            gts = get_ground_truth(eg, data_name)
+            for turn_idx, (ans, gt, turn) in enumerate(zip(pred["answers"], gts, eg["multi_turns"])):
+                case = {
+                    "id": i,
+                    "turn_idx": turn_idx,
+                    "prediction": ans,
+                    "ground_truth": gt,
+                }
+                if "task" in pred:
+                    case["task"] = pred["task"][turn_idx]
+                if data_name == "scbench_repoqa":
+                    case["lang"] = eg["lang"]
+                    case["repo"] = eg["repo"]
+                    case["func_name"] = turn["name"]
+                if data_name == "scbench_repoqa_and_kv":
+                    case["lang"] = eg["lang"]
+                    case["repo"] = eg["repo"]
+                    if turn["task"] == "scbench_repoqa":
+                        case["func_name"] = turn["name"]
+                if data_name == "scbench_kv_compressible":
+                    case["task"] = eg["task"]
+                preds.append(case)
+            dump_jsonl(preds, output_path)
+            torch.cuda.empty_cache()
+
+    try:
+        model.clear()
+    except Exception:
+        pass
 
 
 def get_pred(
@@ -177,6 +360,7 @@ def load_model(
         
         infer_config = hyper_param.copy()
         model_cls = infer_config.pop("model_cls", attn_type)
+        cuda_device = infer_config.pop("cuda_device", "auto")
         
         from deltakv.get_chat_api import get_generate_api
 
@@ -185,7 +369,7 @@ def load_model(
             infer_config=infer_config,
             compressor_path=compressor_path,
             model_cls=model_cls,
-            cuda_device="auto",
+            cuda_device=cuda_device,
             return_model=True
         )
         
@@ -313,6 +497,7 @@ def load_model(
 
 if __name__ == "__main__":
     args = parse_args()
+    mp.set_start_method("spawn", force=True)
 
     # check_benchmark_availability(args.data_dir)
     model_name = args.model_name_or_path
@@ -329,178 +514,165 @@ if __name__ == "__main__":
     if max_seq_length == -1:
         max_seq_length = 160_000
 
-    # Model
-    model, tok = load_model(
-        model_name,
-        args.topk,
-        args.starting_layer,
-        args.topk_dims_file_path,
-        args.use_sparq,
-        attn_type=args.attn_type,
-        max_seq_length=max_seq_length,
-        is_search=args.is_search,
-        kv_type=args.kv_type,
-        trust_remote_code=args.trust_remote_code,
-        kv_cache_cpu=args.kv_cache_cpu,
-        kv_cache_cpu_device=args.kv_cache_cpu_device,
-        tensor_parallel_size=args.tensor_parallel_size,
-        hyper_param=args.hyper_param.copy(),
-        copy_on_gpu=args.copy_on_gpu,
-    )
-
-    disable_golden_context = (
-        "_disable_golden_context" if args.disable_golden_context else ""
-    )
-
-    def shorten_val(v):
-        v = str(v)
-        if "/" in v:
-            v = os.path.basename(v.rstrip("/"))
-        if len(v) > 40:
-            v = v[:20] + ".." + v[-15:]
-        return v
-
-    verbalize_hyper_param = (
-        f"_{'-'.join([f'{k}={v}' for k, v in args.hyper_param.items() if k != 'best_pattern'])}"
-        if args.hyper_param
-        else ""
-    )
-    verbalize_hyper_param = shorten_val(verbalize_hyper_param)
-    result_dir = Path(
-        args.output_dir,
-        f"{real_model_name}_{args.attn_type}{disable_golden_context}_{args.kv_type}{verbalize_hyper_param}",
-    )
+    result_dir, real_model_name_tag, use_scdq, use_llmlingua = _build_result_dir(args, real_model_name, scdq_mode)
     result_dir.mkdir(exist_ok=True, parents=True)
-    use_scdq = "_scdq" if scdq_mode else "_multi_turn"
-    use_llmlingua = "_lingua" if args.use_llmlingua else ""
-    real_model_name = f"{real_model_name}_{args.attn_type}{use_scdq}{disable_golden_context}_{args.kv_type}{verbalize_hyper_param}"  # add all the args to the real_model_name, for easy identification
 
-    results = {}
-    for data_name in data_names:
-        max_new_tokens = DATA_NAME_TO_MAX_NEW_TOKENS[data_name]
-        if isinstance(max_new_tokens, dict):
-            assert (
-                max(max_new_tokens.values()) <= max_seq_length
-            ), "max_new_tokens must be less than max_seq_length"
-        elif max_new_tokens >= max_seq_length:
-            max_new_tokens = 500
-
-        # Data
-        output_path = (
-            result_dir / f"prediction_{data_name}{use_scdq}{use_llmlingua}.jsonl"
-        )
-        examples = load_dataset("microsoft/SCBench", data_name, split="test")
-
-        if args.use_llmlingua:
-            # do prompt compression here
-            compression_ratio = (
-                args.hyper_param.get("llmlingua_ratio", 3) if args.hyper_param else 3
+    if args.ws > 1:
+        procs = []
+        for rank in range(args.ws):
+            p = mp.Process(
+                target=_run_scbench_worker,
+                args=(rank, args.ws, args, data_names, max_seq_length, scdq_mode),
             )
-            examples = get_compressed_examples(
-                examples, data_name, args.data_dir, rate=1 / compression_ratio
-            )
-        max_turn_size = len(examples[0]["multi_turns"])
-        if args.max_turns > 0 and args.max_turns < max_turn_size:
-            examples = [
-                {**eg, "multi_turns": eg["multi_turns"][: args.max_turns]}
-                for eg in examples
+            p.start()
+            procs.append(p)
+        for p in procs:
+            p.join()
+        for p in procs:
+            if p.exitcode != 0:
+                raise RuntimeError(f"SCBench worker exited with code {p.exitcode}")
+
+        results = {}
+        for data_name in data_names:
+            merged_path = result_dir / f"prediction_{data_name}{use_scdq}{use_llmlingua}.jsonl"
+            shard_paths = [
+                result_dir / f"prediction_{data_name}{use_scdq}{use_llmlingua}.rank{rank}.jsonl"
+                for rank in range(args.ws)
             ]
-            max_turn_size = args.max_turns
-
-        if args.num_eval_examples != -1:
-            num_eval_examples = min(args.num_eval_examples, len(examples))
-            if isinstance(examples, list):
-                examples = examples[:num_eval_examples]
-            else:
-                examples = examples.select(range(num_eval_examples))
-
-        preds = []
-        print(f"==== Evaluation {data_name}====")
-        print(f"# examples: {len(examples)}")
-        print(f"Num eval examples: {args.num_eval_examples}")
-        print(f"Verbose: {args.verbose}")
-        print(f"Max new tokens: {max_new_tokens}")
-        print(f"Num of turns: {max_turn_size}")
-
-        for i in tqdm(range(len(examples))):
-            if i < args.start_example_id:
-                continue
-            
-            eg = examples[i]
-            
-            if isinstance(eg, str):
-                try:
-                    eg = json.loads(eg)
-                except:
-                    pass
-            
-            if data_name in [
-                "scbench_summary_with_needles",
-                "scbench_repoqa_and_kv",
-            ]:
-                if isinstance(max_new_tokens, dict):
-                    tokens_to_sum = sum(list(max_new_tokens.values()))
-                else:
-                    tokens_to_sum = max_new_tokens
-                max_input_length = max_seq_length - (
-                    tokens_to_sum * max_turn_size // 2
-                )
-            else:
-                max_input_length = max_seq_length - max_new_tokens * max_turn_size
-
-            pred = get_pred(
-                model,
-                eg,
+            _merge_rank_jsonl(merged_path, shard_paths)
+            score = compute_scores(
+                merged_path,
                 data_name,
-                max_new_tokens,
-                max_input_length=max_input_length,
-                attn_type=args.attn_type,
-                tok=tok,
-                use_chat_template=args.use_chat_template,
+                real_model_name_tag,
+                max_seq_length=max_seq_length,
                 scdq_mode=scdq_mode,
-                disable_golden_context=args.disable_golden_context,
             )
-            # a list of ground truth answers for each turn
-            gts = get_ground_truth(eg, data_name)
-            for turn_idx, (ans, gt, turn) in enumerate(
-                zip(pred["answers"], gts, eg["multi_turns"])
-            ):
-                case = {
-                    "id": i,
-                    "turn_idx": turn_idx,
-                    "prediction": ans,
-                    "ground_truth": gt,
-                }
-                if "task" in pred:
-                    case["task"] = pred["task"][turn_idx]
-                if data_name == "scbench_repoqa":
-                    case["lang"] = eg["lang"]
-                    case["repo"] = eg["repo"]
-                    case["func_name"] = turn["name"]
-                if data_name == "scbench_repoqa_and_kv":
-                    case["lang"] = eg["lang"]
-                    case["repo"] = eg["repo"]
-                    if turn["task"] == "scbench_repoqa":
-                        case["func_name"] = turn["name"]
-                if data_name == "scbench_kv_compressible":
-                    case["task"] = eg["task"]
-                preds.append(case)
-            dump_jsonl(preds, output_path)
-            torch.cuda.empty_cache()
-
-        score = compute_scores(
-            output_path,
-            data_name,
-            real_model_name,
+            results[data_name] = score
+    else:
+        # Model
+        model, tok = load_model(
+            model_name,
+            args.topk,
+            args.starting_layer,
+            args.topk_dims_file_path,
+            args.use_sparq,
+            attn_type=args.attn_type,
             max_seq_length=max_seq_length,
-            scdq_mode=scdq_mode,
+            is_search=args.is_search,
+            kv_type=args.kv_type,
+            trust_remote_code=args.trust_remote_code,
+            kv_cache_cpu=args.kv_cache_cpu,
+            kv_cache_cpu_device=args.kv_cache_cpu_device,
+            tensor_parallel_size=args.tensor_parallel_size,
+            hyper_param=args.hyper_param.copy(),
+            copy_on_gpu=args.copy_on_gpu,
         )
-        results[data_name] = score
+
+        results = {}
+        for data_name in data_names:
+            max_new_tokens = DATA_NAME_TO_MAX_NEW_TOKENS[data_name]
+            if isinstance(max_new_tokens, dict):
+                assert (
+                    max(max_new_tokens.values()) <= max_seq_length
+                ), "max_new_tokens must be less than max_seq_length"
+            elif max_new_tokens >= max_seq_length:
+                max_new_tokens = 500
+
+            output_path = result_dir / f"prediction_{data_name}{use_scdq}{use_llmlingua}.jsonl"
+            examples = load_dataset("microsoft/SCBench", data_name, split="test")
+
+            if args.use_llmlingua:
+                compression_ratio = args.hyper_param.get("llmlingua_ratio", 3) if args.hyper_param else 3
+                examples = get_compressed_examples(examples, data_name, args.data_dir, rate=1 / compression_ratio)
+            max_turn_size = len(examples[0]["multi_turns"])
+            if args.max_turns > 0 and args.max_turns < max_turn_size:
+                examples = [{**eg, "multi_turns": eg["multi_turns"][: args.max_turns]} for eg in examples]
+                max_turn_size = args.max_turns
+
+            if args.num_eval_examples != -1:
+                num_eval_examples = min(args.num_eval_examples, len(examples))
+                if isinstance(examples, list):
+                    examples = examples[:num_eval_examples]
+                else:
+                    examples = examples.select(range(num_eval_examples))
+
+            preds = []
+            print(f"==== Evaluation {data_name}====")
+            print(f"# examples: {len(examples)}")
+            print(f"Num eval examples: {args.num_eval_examples}")
+            print(f"Verbose: {args.verbose}")
+            print(f"Max new tokens: {max_new_tokens}")
+            print(f"Num of turns: {max_turn_size}")
+
+            for i in tqdm(range(len(examples))):
+                if i < args.start_example_id:
+                    continue
+
+                eg = examples[i]
+
+                if isinstance(eg, str):
+                    try:
+                        eg = json.loads(eg)
+                    except:
+                        pass
+
+                if data_name in ["scbench_summary_with_needles", "scbench_repoqa_and_kv"]:
+                    tokens_to_sum = sum(list(max_new_tokens.values())) if isinstance(max_new_tokens, dict) else max_new_tokens
+                    max_input_length = max_seq_length - (tokens_to_sum * max_turn_size // 2)
+                else:
+                    max_input_length = max_seq_length - max_new_tokens * max_turn_size
+
+                pred = get_pred(
+                    model,
+                    eg,
+                    data_name,
+                    max_new_tokens,
+                    max_input_length=max_input_length,
+                    attn_type=args.attn_type,
+                    tok=tok,
+                    use_chat_template=args.use_chat_template,
+                    scdq_mode=scdq_mode,
+                    disable_golden_context=args.disable_golden_context,
+                )
+                gts = get_ground_truth(eg, data_name)
+                for turn_idx, (ans, gt, turn) in enumerate(zip(pred["answers"], gts, eg["multi_turns"])):
+                    case = {
+                        "id": i,
+                        "turn_idx": turn_idx,
+                        "prediction": ans,
+                        "ground_truth": gt,
+                    }
+                    if "task" in pred:
+                        case["task"] = pred["task"][turn_idx]
+                    if data_name == "scbench_repoqa":
+                        case["lang"] = eg["lang"]
+                        case["repo"] = eg["repo"]
+                        case["func_name"] = turn["name"]
+                    if data_name == "scbench_repoqa_and_kv":
+                        case["lang"] = eg["lang"]
+                        case["repo"] = eg["repo"]
+                        if turn["task"] == "scbench_repoqa":
+                            case["func_name"] = turn["name"]
+                    if data_name == "scbench_kv_compressible":
+                        case["task"] = eg["task"]
+                    preds.append(case)
+                dump_jsonl(preds, output_path)
+                torch.cuda.empty_cache()
+
+            score = compute_scores(
+                output_path,
+                data_name,
+                real_model_name_tag,
+                max_seq_length=max_seq_length,
+                scdq_mode=scdq_mode,
+            )
+            results[data_name] = score
 
     print("==== Results ====")
     print(json.dumps(results, indent=2))
 
     # 记录评测信息到日志文件
+    os.makedirs(BASE_PATH, exist_ok=True)
     log_path = os.path.join(BASE_PATH, "scbench_eval.log")
     with open(log_path, "a", encoding="utf-8") as f:
         f.write(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")

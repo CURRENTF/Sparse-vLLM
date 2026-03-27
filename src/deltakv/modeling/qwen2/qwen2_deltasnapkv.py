@@ -357,6 +357,10 @@ class Qwen2DeltaSnapKVAttention(Qwen2Attention):
                 compressor_down=self.compress_down,
                 compressor_up=self.compress_up,
             )
+            # `device_map="auto"` may shard layers across GPUs. Make sure indices used
+            # for gather/searchsorted live on the local layer device.
+            if full_idx is not None and full_idx.device != key_states.device:
+                full_idx = full_idx.to(key_states.device)
         else:
             raise NotImplementedError
 
@@ -367,8 +371,12 @@ class Qwen2DeltaSnapKVAttention(Qwen2Attention):
         cur_cos, cur_sin = position_embeddings
         query_states = single_apply_rotary_pos_emb(query_states, cur_cos, cur_sin)
 
-        k_cos = past_key_value.cos.gather(1, full_idx.unsqueeze(-1).expand(-1, -1, self.head_dim))
-        k_sin = past_key_value.sin.gather(1, full_idx.unsqueeze(-1).expand(-1, -1, self.head_dim))
+        k_cos = past_key_value.cos.gather(
+            1, full_idx.unsqueeze(-1).expand(-1, -1, self.head_dim)
+        )
+        k_sin = past_key_value.sin.gather(
+            1, full_idx.unsqueeze(-1).expand(-1, -1, self.head_dim)
+        )
         key_states = single_apply_rotary_pos_emb(key_states, k_cos, k_sin)
 
         attention_interface: Callable = eager_attention_forward
@@ -399,6 +407,8 @@ class Qwen2DeltaSnapKVAttention(Qwen2Attention):
             candidate_abs_idx = past_key_value.get_candidate_abs_idx(self.layer_idx)
             keep_idx = None
             if candidate_abs_idx is not None and candidate_abs_idx.shape[1] > 0:
+                if candidate_abs_idx.device != full_idx.device:
+                    candidate_abs_idx = candidate_abs_idx.to(full_idx.device)
                 keep_ratio = _get_compressed_keep_ratio(self.config, self.head_dim)
                 if isinstance(keep_ratio, float) and keep_ratio <= 0:
                     keep_idx = torch.empty((bs, 0), dtype=torch.long, device=key_states.device)

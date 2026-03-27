@@ -37,6 +37,10 @@ class CustomConfigMixin:
         cluster_metric='l2',
         cluster_on_kv=True,
         cluster_ratio=0.1,
+        # Dynamic stride schedule for clustering prototypes. When >0, stride increases
+        # roughly as: stride(pos) = base_stride + stride_alpha * (pos - sink).
+        # Default 0.0 keeps the legacy fixed-stride behavior.
+        stride_alpha: float = 0.0,
         cluster_temp=10.0,
         cluster_soft_assignment=False,
         tail_token_size=128,
@@ -82,6 +86,7 @@ class CustomConfigMixin:
         self.cluster_metric = cluster_metric
         self.cluster_on_kv = cluster_on_kv
         self.cluster_ratio = cluster_ratio
+        self.stride_alpha = stride_alpha
         self.cluster_temp = cluster_temp
         self.cluster_soft_assignment = cluster_soft_assignment
         self.tail_token_size = tail_token_size

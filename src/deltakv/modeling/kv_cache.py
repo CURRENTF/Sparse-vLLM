@@ -373,6 +373,68 @@ class ClusterCompressedKVCache(CompressedKVCache):
         # 为量化准备
         self.comp_kv_scales = {}
         self.comp_kv_mins = {}
+        # Dynamic prototype sampling: keep a per-sequence cursor so stride can grow with
+        # absolute position without "resetting" at chunk boundaries.
+        self._cluster_next_center_abs_pos = None  # type: Optional[int]
+        self._cluster_center_plan_cache_key = None  # type: Optional[tuple[int, int]]
+        self._cluster_center_plan_cache_val = None  # type: Optional[torch.Tensor]
+
+    def _get_dynamic_center_rel(
+        self,
+        *,
+        abs_start_pos: int,
+        seq_len: int,
+        base_step: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Return center indices (relative to this block) for dynamic stride sampling.
+
+        For stride_alpha <= 0, returns the legacy fixed-stride centers and does not
+        touch the cursor state.
+
+        For stride_alpha > 0, we maintain a cursor `self._cluster_next_center_abs_pos`
+        so the sampling is continuous across blocks (sublinear growth in #centers).
+        The computed plan is cached per (abs_start_pos, seq_len) so multiple layers
+        sharing the same block reuse the same centers without advancing the cursor.
+        """
+        stride_alpha = float(getattr(self.config, "stride_alpha", 0.0) or 0.0)
+        if stride_alpha <= 0.0:
+            return torch.arange(0, seq_len, base_step, device=device, dtype=torch.long)
+
+        if self._cluster_next_center_abs_pos is None:
+            self._cluster_next_center_abs_pos = int(self.sink_size)
+
+        cache_key = (int(abs_start_pos), int(seq_len))
+        if (
+            self._cluster_center_plan_cache_key == cache_key
+            and self._cluster_center_plan_cache_val is not None
+        ):
+            return self._cluster_center_plan_cache_val
+
+        sink = int(self.sink_size)
+        end = int(abs_start_pos) + int(seq_len)
+        pos = int(self._cluster_next_center_abs_pos)
+        if pos < int(abs_start_pos):
+            pos = int(abs_start_pos)
+
+        rel_idx: list[int] = []
+        while pos < end:
+            rel_idx.append(pos - int(abs_start_pos))
+            t = max(0, pos - sink)
+            step = int(base_step) + int(stride_alpha * float(t))
+            if step < 1:
+                step = 1
+            pos += step
+
+        self._cluster_next_center_abs_pos = pos
+        center_rel = (
+            torch.tensor(rel_idx, device=device, dtype=torch.long)
+            if rel_idx
+            else torch.empty((0,), device=device, dtype=torch.long)
+        )
+        self._cluster_center_plan_cache_key = cache_key
+        self._cluster_center_plan_cache_val = center_rel
+        return center_rel
 
     @staticmethod
     def _metric_l2(kv_states, all_centers, use_kv=False):
@@ -400,12 +462,25 @@ class ClusterCompressedKVCache(CompressedKVCache):
         center_norm = F.normalize(all_centers, p=2, dim=-1)
         return torch.matmul(kv_norm, center_norm.transpose(-1, -2))
 
-    def compress(self, kv_states, compressor_down, existing_centers=None):
+    def compress(self, kv_states, compressor_down, existing_centers=None, *, abs_start_pos: Optional[int] = None):
         bs, seq_len, kv_dim = kv_states.shape
         cluster_step = max(1, int(1 / self.config.cluster_ratio))
+        stride_alpha = float(getattr(self.config, "stride_alpha", 0.0) or 0.0)
+        if abs_start_pos is None:
+            abs_start_pos = 0
 
         # 1. 选择聚类中心 (Prototypes)
-        new_centers = kv_states[:, ::cluster_step, :].contiguous()
+        if stride_alpha <= 0.0:
+            new_centers = kv_states[:, ::cluster_step, :].contiguous()
+            center_rel = None
+        else:
+            center_rel = self._get_dynamic_center_rel(
+                abs_start_pos=int(abs_start_pos),
+                seq_len=int(seq_len),
+                base_step=int(cluster_step),
+                device=kv_states.device,
+            )
+            new_centers = kv_states[:, center_rel.to(torch.long), :].contiguous()
         all_centers = torch.cat([existing_centers, new_centers], dim=1) if existing_centers is not None else new_centers
 
         num_existing = existing_centers.shape[1] if existing_centers is not None else 0
@@ -427,9 +502,12 @@ class ClusterCompressedKVCache(CompressedKVCache):
 
         # 3. 应用因果掩码 (防止匹配到当前块内尚未采样出的中心)
         # rows: 当前 token 在 kv_states 中的索引 (0 ~ seq_len-1)
-        # cols: new_centers 在 kv_states 中采样出来的相对索引 (0, step, 2*step, ...)
+        # cols: new_centers 在 kv_states 中采样出来的相对索引 (dynamic 或 0, step, 2*step, ...)
         rows = torch.arange(seq_len, device=kv_states.device).view(-1, 1)
-        cols = torch.arange(num_new, device=kv_states.device).view(1, -1) * cluster_step
+        if center_rel is None:
+            cols = torch.arange(num_new, device=kv_states.device).view(1, -1) * cluster_step
+        else:
+            cols = center_rel.to(torch.long).view(1, -1)
         mask_new = (cols <= rows) # (seq_len, num_new)
         
         # 现有的中心 (existing_centers) 都在过去，全部可见
@@ -573,6 +651,9 @@ class ClusterCompressedKVCache(CompressedKVCache):
             self.sink_value_cache[layer_idx], self.buffer_value_cache[layer_idx] = value_states[:, :self.sink_size], value_states[:, self.sink_size:]
             # 把 sink tokens 也作为初始聚类中心
             self.bases_cache[layer_idx] = torch.cat([self.sink_key_cache[layer_idx], self.sink_value_cache[layer_idx]], dim=-1)
+            # Initialize dynamic stride cursor after sink size is finalized.
+            if self._cluster_next_center_abs_pos is None:
+                self._cluster_next_center_abs_pos = int(self.sink_size)
         else:
             self.buffer_key_cache[layer_idx] = torch.cat([self.buffer_key_cache[layer_idx], key_states], dim=1)
             self.buffer_value_cache[layer_idx] = torch.cat([self.buffer_value_cache[layer_idx], value_states], dim=1)
@@ -649,7 +730,14 @@ class ClusterCompressedKVCache(CompressedKVCache):
                 
                 existing_centers = self.bases_cache.get(layer_idx, None)
                 # compress 内部会处理量化逻辑
-                comp_kv, all_centers, father_idx, scale, mn = self.compress(to_be_compress, compressor_down, existing_centers)
+                hist_len = int(self.comp_kv_cache[layer_idx].shape[1]) if layer_idx in self.comp_kv_cache else 0
+                abs_start_pos = int(self.sink_size + hist_len)
+                comp_kv, all_centers, father_idx, scale, mn = self.compress(
+                    to_be_compress,
+                    compressor_down,
+                    existing_centers,
+                    abs_start_pos=abs_start_pos,
+                )
                 self.bases_cache[layer_idx] = all_centers
 
                 if layer_idx not in self.comp_kv_cache:
