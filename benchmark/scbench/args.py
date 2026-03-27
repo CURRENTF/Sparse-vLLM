@@ -82,6 +82,24 @@ def parse_args() -> Namespace:
     p.add_argument("--use_v2_data", action="store_true")
     p.add_argument("--copy_on_gpu", action="store_true", help="If true, backup KV cache on GPU instead of CPU.")
     p.add_argument(
+        "--context_min_tokens",
+        type=int,
+        default=-1,
+        help="Optional lower bound (inclusive) on the tokenized context length used to filter examples.",
+    )
+    p.add_argument(
+        "--context_max_tokens",
+        type=int,
+        default=-1,
+        help="Optional upper bound (exclusive) on the tokenized context length used to filter examples.",
+    )
+    p.add_argument(
+        "--subset_indices_file",
+        type=str,
+        default=None,
+        help="Optional path to a txt/json file containing example indices to evaluate.",
+    )
+    p.add_argument(
         "--attn_type",
         type=str,
         choices=ATTN_TYPES,

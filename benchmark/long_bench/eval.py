@@ -41,6 +41,15 @@ dataset2metric = {
     "repobench-p": code_sim_score,
 }
 
+TASK_HIERARCHY = {
+    "SDQA": ["narrativeqa", "qasper", "multifieldqa_en"],
+    "MDQA": ["hotpotqa", "2wikimqa", "musique"],
+    "SUM": ["gov_report", "qmsum", "multi_news"],
+    "FewShot": ["trec", "triviaqa", "samsum"],
+    "Syn": ["passage_count", "passage_retrieval_en"],
+    "Code": ["lcc", "repobench-p"],
+}
+
 
 def parse_args(args=None):
     parser = argparse.ArgumentParser()
@@ -83,6 +92,59 @@ def scorer(dataset, predictions, answers, all_classes):
     return round(100 * total_score / len(predictions), 2)
 
 
+def _round_float(value):
+    return round(float(value), 2)
+
+
+def aggregate_category_scores(task_scores):
+    category_scores = {}
+    for category, tasks in TASK_HIERARCHY.items():
+        present_tasks = [task for task in tasks if task in task_scores]
+        if not present_tasks:
+            continue
+
+        first_score = task_scores[present_tasks[0]]
+        if isinstance(first_score, dict):
+            bucket_scores = {}
+            for bucket in first_score:
+                values = [
+                    task_scores[task][bucket]
+                    for task in present_tasks
+                    if isinstance(task_scores[task], dict) and bucket in task_scores[task]
+                ]
+                if values:
+                    bucket_scores[bucket] = _round_float(np.mean(values))
+            category_scores[category] = bucket_scores
+        else:
+            values = [
+                task_scores[task]
+                for task in present_tasks
+                if not isinstance(task_scores[task], dict)
+            ]
+            if values:
+                category_scores[category] = _round_float(np.mean(values))
+
+    if not category_scores:
+        return category_scores, None
+
+    first_category_score = next(iter(category_scores.values()))
+    if isinstance(first_category_score, dict):
+        overall_score = {}
+        for bucket in first_category_score:
+            values = [
+                score[bucket]
+                for score in category_scores.values()
+                if isinstance(score, dict) and bucket in score
+            ]
+            if values:
+                overall_score[bucket] = _round_float(np.mean(values))
+    else:
+        values = [score for score in category_scores.values() if not isinstance(score, dict)]
+        overall_score = _round_float(np.mean(values)) if values else None
+
+    return category_scores, overall_score
+
+
 if __name__ == '__main__':
     args = parse_args()
     
@@ -100,7 +162,7 @@ if __name__ == '__main__':
         else:
             path = os.path.join(BASE_PATH, f"benchmark/long_bench/pred/{args.model}/{compressor_name}")
     
-    scores = dict()
+    task_scores = dict()
     if not os.path.exists(path):
         
         print(f"Path {path} does not exist.")
@@ -126,10 +188,17 @@ if __name__ == '__main__':
                 score = scorer_e(dataset, predictions, answers, lengths, all_classes)
             else:
                 score = scorer(dataset, predictions, answers, all_classes)
-            scores[dataset] = score
+            task_scores[dataset] = score
         except:
             print(f"error in {dataset}")
             pass
+
+    category_scores, overall_category_avg = aggregate_category_scores(task_scores)
+    scores = {
+        **task_scores,
+        "category_scores": category_scores,
+        "overall_category_avg": overall_category_avg,
+    }
     
     out_path = os.path.join(path, "result.json")
     print(scores)

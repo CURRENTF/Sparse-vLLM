@@ -145,6 +145,69 @@ def _merge_rank_jsonl(dst_path: Path, src_paths: list[Path]):
     dump_jsonl(rows, dst_path)
 
 
+def _load_subset_indices(path: str | None) -> list[int] | None:
+    if not path:
+        return None
+
+    subset_path = Path(path)
+    if subset_path.suffix.lower() == ".json":
+        with open(subset_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        if isinstance(payload, dict):
+            payload = payload.get("indices", [])
+        if not isinstance(payload, list):
+            raise ValueError(f"Invalid subset index file: {path}")
+        return [int(x) for x in payload]
+
+    indices = []
+    with open(subset_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            indices.append(int(line))
+    return indices
+
+
+def _filter_examples(
+    examples,
+    tok,
+    subset_indices: list[int] | None = None,
+    context_min_tokens: int = -1,
+    context_max_tokens: int = -1,
+):
+    selected_indices = list(range(len(examples)))
+
+    if subset_indices is not None:
+        subset_set = set(int(i) for i in subset_indices)
+        selected_indices = [i for i in selected_indices if i in subset_set]
+
+    if context_min_tokens >= 0 or context_max_tokens >= 0:
+        filtered = []
+        lengths = []
+        for i in selected_indices:
+            context = examples[i]["context"]
+            n_tokens = len(tok.encode(context, add_special_tokens=False))
+            if context_min_tokens >= 0 and n_tokens < context_min_tokens:
+                continue
+            if context_max_tokens >= 0 and n_tokens >= context_max_tokens:
+                continue
+            filtered.append(i)
+            lengths.append(n_tokens)
+        selected_indices = filtered
+        if lengths:
+            print(
+                "[SCBench] Context length filter kept "
+                f"{len(lengths)} examples | min={min(lengths)} avg={sum(lengths)/len(lengths):.1f} max={max(lengths)}"
+            )
+        else:
+            print("[SCBench] Context length filter kept 0 examples")
+
+    if isinstance(examples, list):
+        return [examples[i] for i in selected_indices]
+    return examples.select(selected_indices)
+
+
 def _run_scbench_worker(
     rank: int,
     world_size: int,
@@ -183,6 +246,7 @@ def _run_scbench_worker(
         hyper_param=hyper_param,
         copy_on_gpu=args.copy_on_gpu,
     )
+    subset_indices = _load_subset_indices(args.subset_indices_file)
 
     for data_name in data_names:
         max_new_tokens = DATA_NAME_TO_MAX_NEW_TOKENS[data_name]
@@ -199,6 +263,14 @@ def _run_scbench_worker(
         if args.use_llmlingua:
             compression_ratio = hyper_param.get("llmlingua_ratio", 3) if hyper_param else 3
             examples = get_compressed_examples(examples, data_name, args.data_dir, rate=1 / compression_ratio)
+
+        examples = _filter_examples(
+            examples,
+            tok=tok,
+            subset_indices=subset_indices,
+            context_min_tokens=args.context_min_tokens,
+            context_max_tokens=args.context_max_tokens,
+        )
 
         max_turn_size = len(examples[0]["multi_turns"])
         if args.max_turns > 0 and args.max_turns < max_turn_size:
@@ -567,6 +639,7 @@ if __name__ == "__main__":
             hyper_param=args.hyper_param.copy(),
             copy_on_gpu=args.copy_on_gpu,
         )
+        subset_indices = _load_subset_indices(args.subset_indices_file)
 
         results = {}
         for data_name in data_names:
@@ -584,6 +657,14 @@ if __name__ == "__main__":
             if args.use_llmlingua:
                 compression_ratio = args.hyper_param.get("llmlingua_ratio", 3) if args.hyper_param else 3
                 examples = get_compressed_examples(examples, data_name, args.data_dir, rate=1 / compression_ratio)
+
+            examples = _filter_examples(
+                examples,
+                tok=tok,
+                subset_indices=subset_indices,
+                context_min_tokens=args.context_min_tokens,
+                context_max_tokens=args.context_max_tokens,
+            )
             max_turn_size = len(examples[0]["multi_turns"])
             if args.max_turns > 0 and args.max_turns < max_turn_size:
                 examples = [{**eg, "multi_turns": eg["multi_turns"][: args.max_turns]} for eg in examples]

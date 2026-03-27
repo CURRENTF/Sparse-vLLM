@@ -23,6 +23,42 @@ DATA_PREFIX_PATH = os.getenv(
 )
 NO_CHAT_TEMPLATE_DATASETS = {"trec", "triviaqa", "samsum", "lsht", "lcc", "repobench-p"}
 
+
+def get_longbench_data_path(dataset, use_longbench_e):
+    suffix = "_e" if use_longbench_e else ""
+    return os.path.join(DATA_PREFIX_PATH, "data", f"{dataset}{suffix}.jsonl")
+
+
+def validate_longbench_data_paths(datasets, use_longbench_e):
+    if not os.path.isdir(DATA_PREFIX_PATH):
+        raise FileNotFoundError(
+            "LongBench data root does not exist: "
+            f"{DATA_PREFIX_PATH}\n"
+            "Set DELTAKV_LONGBENCH_DATA_DIR or DELTAKV_DATA_DIR to the LongBench root "
+            "directory that contains data/*.jsonl."
+        )
+
+    data_dir = os.path.join(DATA_PREFIX_PATH, "data")
+    if not os.path.isdir(data_dir):
+        raise FileNotFoundError(
+            "LongBench data directory does not exist: "
+            f"{data_dir}\n"
+            "Set DELTAKV_LONGBENCH_DATA_DIR or DELTAKV_DATA_DIR to the LongBench root "
+            "directory that contains a data/ subdirectory."
+        )
+
+    missing_paths = [
+        get_longbench_data_path(dataset, use_longbench_e)
+        for dataset in datasets
+        if not os.path.isfile(get_longbench_data_path(dataset, use_longbench_e))
+    ]
+    if missing_paths:
+        raise FileNotFoundError(
+            "Missing LongBench dataset files:\n"
+            + "\n".join(missing_paths)
+            + "\nCheck DELTAKV_LONGBENCH_DATA_DIR / DELTAKV_DATA_DIR."
+        )
+
 def seed_everything(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
@@ -243,8 +279,11 @@ def worker(rank, world_size, datasets, dataset2prompt, dataset2maxlen, args, out
     model, tokenizer, model_max_length = load_model_and_tokenizer(rank, args)
     
     for dataset in datasets:
-        data_path = os.path.join(DATA_PREFIX_PATH, f'data/{dataset}{"_e" if args.e else ""}.jsonl')
-        if not os.path.exists(data_path): continue
+        data_path = get_longbench_data_path(dataset, args.e)
+        if not os.path.isfile(data_path):
+            raise FileNotFoundError(
+                f"LongBench dataset file not found for dataset '{dataset}': {data_path}"
+            )
         
         data = [json.loads(line) for line in open(data_path, 'r', encoding="utf-8")]
         if args.num_samples: data = data[:args.num_samples]
@@ -312,6 +351,7 @@ if __name__ == '__main__':
 
     dataset2prompt = json.load(open("benchmark/long_bench/config/dataset2prompt.json", "r"))
     dataset2maxlen = json.load(open("benchmark/long_bench/config/dataset2maxlen.json", "r"))
+    validate_longbench_data_paths(datasets, args.e)
     
     time_tag = datetime.now().strftime("%m%d_%H%M")
     out_root = os.path.join(BASE_PATH, f"benchmark/long_bench/{'pred_e' if args.e else 'pred'}/{model_name}/{compressor_name}_{time_tag}")
@@ -330,7 +370,16 @@ if __name__ == '__main__':
             p = mp.Process(target=worker, args=(rank, args.ws, datasets, dataset2prompt, dataset2maxlen, args, out_root, max_length_limit))
             p.start()
             processes.append(p)
-        for p in processes: p.join()
+        failed_ranks = []
+        for rank, p in enumerate(processes):
+            p.join()
+            if p.exitcode != 0:
+                failed_ranks.append((rank, p.exitcode))
+        if failed_ranks:
+            raise RuntimeError(
+                "LongBench worker failed; aborting evaluation. "
+                + ", ".join(f"rank={rank}, exitcode={exitcode}" for rank, exitcode in failed_ranks)
+            )
     else:
         worker(0, 1, datasets, dataset2prompt, dataset2maxlen, args, out_root, max_length_limit)
 
