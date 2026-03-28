@@ -16,6 +16,9 @@ except ImportError:
 
 if "full_deltakv" not in ATTN_TYPES:
     ATTN_TYPES.append("full_deltakv")
+if "origin_residual_quant" not in ATTN_TYPES:
+    ATTN_TYPES.append("origin_residual_quant")
+
 
 def parse_args() -> Namespace:
     p = ArgumentParser()

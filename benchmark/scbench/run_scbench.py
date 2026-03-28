@@ -427,7 +427,7 @@ def load_model(
         )
     # tok.pad_token = tok.eos_token
 
-    if attn_type in ["deltakv", "full_deltakv", "snapkv", "pyramidkv", "palu", "quest"]:
+    if attn_type in ["deltakv", "full_deltakv", "origin_residual_quant", "snapkv", "pyramidkv", "palu", "quest"]:
         compressor_path = hyper_param.get("compressor_path")
         
         infer_config = hyper_param.copy()
