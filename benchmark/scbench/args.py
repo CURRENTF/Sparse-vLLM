@@ -14,6 +14,8 @@ except ImportError:
     ATTN_TYPES = ["hf", "deltakv", "vllm", "vllm_blend", "vllm_kv", "inf_llm"]
     KV_TYPES = ["dense", "retr_attn", "kivi"]
 
+if "full_deltakv" not in ATTN_TYPES:
+    ATTN_TYPES.append("full_deltakv")
 
 def parse_args() -> Namespace:
     p = ArgumentParser()

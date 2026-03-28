@@ -279,6 +279,39 @@ def get_generate_api(model_path: str, infer_config: dict, compressor_path: str,
             assert len(unexpected) == 0, f'compressor 加载有问题: {unexpected}'
             del comp_state_dict
 
+    elif model_cls == 'full_deltakv':
+        base_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        if base_config.model_type == 'qwen2':
+            from deltakv.modeling.qwen2.qwen2_full_deltakv_compress_inference import Qwen2FullKVCompress as KVModel
+            config_cls = KVQwen2Config
+        elif base_config.model_type == 'qwen3':
+            from deltakv.modeling.qwen3.qwen3_full_deltakv_compress_inference import Qwen3FullKVCompress as KVModel
+            config_cls = KVQwen3Config
+        elif base_config.model_type == 'llama':
+            from deltakv.modeling.llama.llama_full_deltakv_compress_inference import LlamaFullKVCompress as KVModel
+            config_cls = KVLlamaConfig
+        else:
+            raise ValueError(f"Unsupported model type: {base_config.model_type}")
+
+        if compressor_path is not None:
+            config = config_cls.from_pretrained(compressor_path)
+        else:
+            config = config_cls.from_pretrained(model_path)
+        config.set_infer_args(**infer_config)
+        model = KVModel.from_pretrained(
+            model_path,
+            config=config,
+            torch_dtype=torch.bfloat16,
+            device_map=cuda_device,
+            attn_implementation="flash_attention_2",
+        )
+        if compressor_path is not None:
+            load_device = f'cuda:{cuda_device}' if isinstance(cuda_device, int) else 'cpu'
+            comp_state_dict = load_compressor(compressor_path, device=load_device)
+            _, unexpected = model.load_state_dict(comp_state_dict, strict=False)
+            assert len(unexpected) == 0, f'compressor 加载有问题: {unexpected}'
+            del comp_state_dict
+
     elif model_cls == 'snapkv':
         base_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
         if base_config.model_type == 'qwen2':
