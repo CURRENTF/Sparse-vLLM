@@ -399,7 +399,15 @@ class ClusterCompressedKVCache(CompressedKVCache):
         """
         stride_alpha = float(getattr(self.config, "stride_alpha", 0.0) or 0.0)
         if stride_alpha <= 0.0:
-            return torch.arange(0, seq_len, base_step, device=device, dtype=torch.long)
+            center_rel = torch.arange(0, seq_len, base_step, device=device, dtype=torch.long)
+            if os.getenv("DEBUG"):
+                print(
+                    "[DeltaKV DEBUG] center_plan "
+                    f"alpha={stride_alpha} abs_start={abs_start_pos} seq_len={seq_len} "
+                    f"base_step={base_step} ref_count={center_rel.numel()} sink={self.sink_size}",
+                    flush=True,
+                )
+            return center_rel
 
         if self._cluster_next_center_abs_pos is None:
             self._cluster_next_center_abs_pos = int(self.sink_size)
@@ -432,6 +440,14 @@ class ClusterCompressedKVCache(CompressedKVCache):
             if rel_idx
             else torch.empty((0,), device=device, dtype=torch.long)
         )
+        if os.getenv("DEBUG"):
+            print(
+                "[DeltaKV DEBUG] center_plan "
+                f"alpha={stride_alpha} abs_start={abs_start_pos} seq_len={seq_len} "
+                f"base_step={base_step} ref_count={center_rel.numel()} sink={self.sink_size} "
+                f"next_center_abs_pos={self._cluster_next_center_abs_pos}",
+                flush=True,
+            )
         self._cluster_center_plan_cache_key = cache_key
         self._cluster_center_plan_cache_val = center_rel
         return center_rel
@@ -442,7 +458,14 @@ class ClusterCompressedKVCache(CompressedKVCache):
             k_dim = kv_states.shape[-1] // 2
             kv_states = kv_states[..., :k_dim]
             all_centers = all_centers[..., :k_dim]
-        return torch.cdist(kv_states, all_centers)
+        if kv_states.numel() == 0 or all_centers.numel() == 0:
+            return kv_states.new_empty(kv_states.shape[:-1] + (all_centers.shape[-2],))
+
+        # Match Sparse-vLLM runtime: for fixed a, argmin ||a-b||^2 is equivalent
+        # to argmax (2 * a·b - ||b||^2). We only need ranking for top-k selection.
+        dot = torch.matmul(kv_states, all_centers.transpose(-1, -2))
+        center_norm = (all_centers * all_centers).sum(dim=-1, dtype=torch.float32).to(dot.dtype)
+        return dot.mul(2.0).sub_(center_norm.unsqueeze(-2))
 
     @staticmethod
     def _metric_dot(kv_states, all_centers, use_kv=False):
@@ -491,8 +514,7 @@ class ClusterCompressedKVCache(CompressedKVCache):
         use_kv = self.config.cluster_on_kv
         
         if metric_type == 'l2':
-            # 使用负距离以便 topk 选取最近的
-            scores = -self._metric_l2(kv_states, all_centers, use_kv=use_kv)
+            scores = self._metric_l2(kv_states, all_centers, use_kv=use_kv)
         elif metric_type == 'dot':
             scores = self._metric_dot(kv_states, all_centers, use_kv=use_kv)
         elif metric_type == 'cosine':

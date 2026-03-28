@@ -55,7 +55,7 @@ class CustomConfigMixin:
         deltasnapkv_ref_budget=-1.0,
         snapkv_num_full_layers=0,
         use_compression=False,
-        use_cluster=False,
+        use_cluster=True,
         chunk_prefill_size=100_000_000,
         snapkv_window_size=4,
         pool_kernel_size=1,
