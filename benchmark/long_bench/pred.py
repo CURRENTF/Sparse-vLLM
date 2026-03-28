@@ -4,6 +4,7 @@ import sys
 import subprocess
 import re
 from typing import Union
+from pathlib import Path
 
 from tqdm import tqdm
 import numpy as np
@@ -303,6 +304,51 @@ def worker(rank, world_size, datasets, dataset2prompt, dataset2maxlen, args, out
         torch.cuda.empty_cache()
 
 
+def launch_single_gpu_workers(args, out_root):
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible:
+        gpu_ids = [gpu.strip() for gpu in visible.split(",") if gpu.strip()]
+    else:
+        gpu_ids = [str(i) for i in range(torch.cuda.device_count())]
+
+    if len(gpu_ids) < args.ws:
+        raise ValueError(
+            f"Requested ws={args.ws}, but only {len(gpu_ids)} visible GPUs are available: {gpu_ids}"
+        )
+
+    script_path = Path(__file__).resolve()
+    child_argv = sys.argv[1:]
+    procs = []
+    for rank in range(args.ws):
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = gpu_ids[rank]
+        cmd = [
+            sys.executable,
+            "-u",
+            str(script_path),
+            *child_argv,
+            "--worker_rank",
+            str(rank),
+            "--worker_world_size",
+            str(args.ws),
+            "--output_root",
+            out_root,
+        ]
+        print(f"[Parent] launch rank={rank} gpu={gpu_ids[rank]} cmd={' '.join(cmd)}", flush=True)
+        procs.append(subprocess.Popen(cmd, env=env, cwd=str(script_path.parent.parent.parent)))
+
+    failed_ranks = []
+    for rank, proc in enumerate(procs):
+        ret = proc.wait()
+        if ret != 0:
+            failed_ranks.append((rank, ret))
+    if failed_ranks:
+        raise RuntimeError(
+            "LongBench worker failed; aborting evaluation. "
+            + ", ".join(f"rank={rank}, exitcode={ret}" for rank, ret in failed_ranks)
+        )
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', type=str, default="my_model")
@@ -326,6 +372,9 @@ def parse_args():
     parser.add_argument("--top_k", type=int, default=20)
     parser.add_argument("--thinking_mode", type=str, default="off", choices=["off", "on_strip"])
     parser.add_argument("--max_new_tokens_override", type=int, default=None)
+    parser.add_argument("--worker_rank", type=int, default=-1)
+    parser.add_argument("--worker_world_size", type=int, default=1)
+    parser.add_argument("--output_root", type=str, default=None)
 
     return parser.parse_args()
 
@@ -353,18 +402,27 @@ if __name__ == '__main__':
     dataset2maxlen = json.load(open("benchmark/long_bench/config/dataset2maxlen.json", "r"))
     validate_longbench_data_paths(datasets, args.e)
     
-    time_tag = datetime.now().strftime("%m%d_%H%M")
-    out_root = os.path.join(BASE_PATH, f"benchmark/long_bench/{'pred_e' if args.e else 'pred'}/{model_name}/{compressor_name}_{time_tag}")
+    if args.output_root:
+        out_root = args.output_root
+    else:
+        time_tag = datetime.now().strftime("%m%d_%H%M")
+        out_root = os.path.join(BASE_PATH, f"benchmark/long_bench/{'pred_e' if args.e else 'pred'}/{model_name}/{compressor_name}_{time_tag}")
     os.makedirs(out_root, exist_ok=True)
     print(f"Results will be saved in: {out_root}")
 
-    for dataset in datasets:
-        with open(os.path.join(out_root, f"{dataset}.jsonl"), 'w') as f: pass
+    if args.worker_rank < 0:
+        for dataset in datasets:
+            with open(os.path.join(out_root, f"{dataset}.jsonl"), 'w') as f:
+                pass
 
     max_length_limit = 120_000 + 1000
     args.max_model_len = max_length_limit
 
-    if args.ws > 1:
+    if args.worker_rank >= 0:
+        worker(args.worker_rank, args.worker_world_size, datasets, dataset2prompt, dataset2maxlen, args, out_root, max_length_limit)
+    elif args.ws > 1 and args.model_cls == "kvzip":
+        launch_single_gpu_workers(args, out_root)
+    elif args.ws > 1:
         processes = []
         for rank in range(args.ws):
             p = mp.Process(target=worker, args=(rank, args.ws, datasets, dataset2prompt, dataset2maxlen, args, out_root, max_length_limit))
@@ -383,40 +441,41 @@ if __name__ == '__main__':
     else:
         worker(0, 1, datasets, dataset2prompt, dataset2maxlen, args, out_root, max_length_limit)
 
-    # 记录评测信息到日志文件
-    log_path = os.path.join(BASE_PATH, "longbench_eval.log")
-    with open(log_path, "a", encoding="utf-8") as f:
-        f.write(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"Command: python {' '.join(sys.argv)}\n")
-        f.write(f"Output Root: {out_root}\n")
-        f.write(f"Args: {json.dumps(vars(args), indent=2)}\n")
-        f.write("-" * 80 + "\n")
+    if args.worker_rank < 0:
+        # 记录评测信息到日志文件
+        log_path = os.path.join(BASE_PATH, "longbench_eval.log")
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Command: python {' '.join(sys.argv)}\n")
+            f.write(f"Output Root: {out_root}\n")
+            f.write(f"Args: {json.dumps(vars(args), indent=2)}\n")
+            f.write("-" * 80 + "\n")
 
-    # 自动运行评测并记录日志
-    print(f"正在对 {out_root} 进行自动评测...")
-    eval_cmd = [
-        sys.executable,
-        "benchmark/long_bench/eval.py",
-        "--path", out_root
-    ]
-    if args.e:
-        eval_cmd.append("--e")
+        # 自动运行评测并记录日志
+        print(f"正在对 {out_root} 进行自动评测...")
+        eval_cmd = [
+            sys.executable,
+            "benchmark/long_bench/eval.py",
+            "--path", out_root
+        ]
+        if args.e:
+            eval_cmd.append("--e")
 
-    try:
-        subprocess.run(eval_cmd, check=True)
+        try:
+            subprocess.run(eval_cmd, check=True)
 
-        # 读取评测结果并写入日志
-        result_path = os.path.join(out_root, "result.json")
-        if os.path.exists(result_path):
-            with open(result_path, "r", encoding="utf-8") as f:
-                scores = json.load(f)
+            # 读取评测结果并写入日志
+            result_path = os.path.join(out_root, "result.json")
+            if os.path.exists(result_path):
+                with open(result_path, "r", encoding="utf-8") as f:
+                    scores = json.load(f)
 
-            with open(log_path, "a", encoding="utf-8") as f:
-                f.write(f"Evaluation Results ({'LongBench-E' if args.e else 'LongBench'}):\n")
-                f.write(json.dumps(scores, indent=4, ensure_ascii=False))
-                f.write("\n" + "="*80 + "\n\n")
-            print(f"评测结果已成功写入日志: {log_path}")
-        else:
-            print(f"未找到评测结果文件: {result_path}")
-    except subprocess.CalledProcessError as e:
-        print(f"评测脚本执行失败: {e}")
+                with open(log_path, "a", encoding="utf-8") as f:
+                    f.write(f"Evaluation Results ({'LongBench-E' if args.e else 'LongBench'}):\n")
+                    f.write(json.dumps(scores, indent=4, ensure_ascii=False))
+                    f.write("\n" + "="*80 + "\n\n")
+                print(f"评测结果已成功写入日志: {log_path}")
+            else:
+                print(f"未找到评测结果文件: {result_path}")
+        except subprocess.CalledProcessError as e:
+            print(f"评测脚本执行失败: {e}")
