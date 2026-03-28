@@ -4,3 +4,4 @@ __pycache__/
 *example.png
 wandb/
 /tmp/
+/outputs/
