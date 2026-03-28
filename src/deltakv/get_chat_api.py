@@ -304,10 +304,14 @@ def get_generate_api(model_path: str, infer_config: dict, compressor_path: str,
 
     elif model_cls == 'deltasnapkv':
         base_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-        if base_config.model_type != 'qwen2':
-            raise ValueError(f"deltasnapkv only supports qwen2 models, got {base_config.model_type}")
-        from deltakv.modeling.qwen2.qwen2_deltasnapkv import Qwen2DeltaSnapKVForCausalLM as KVModel
-        config_cls = KVQwen2Config
+        if base_config.model_type == 'qwen2':
+            from deltakv.modeling.qwen2.qwen2_deltasnapkv import Qwen2DeltaSnapKVForCausalLM as KVModel
+            config_cls = KVQwen2Config
+        elif base_config.model_type == 'llama':
+            from deltakv.modeling.llama.llama_deltasnapkv import LlamaDeltaSnapKVForCausalLM as KVModel
+            config_cls = KVLlamaConfig
+        else:
+            raise ValueError(f"deltasnapkv only supports qwen2/llama models, got {base_config.model_type}")
 
         if compressor_path is None:
             raise ValueError("deltasnapkv requires compressor_path")
