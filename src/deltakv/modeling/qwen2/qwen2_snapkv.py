@@ -78,7 +78,7 @@ class Qwen2SnapKVAttention(Qwen2Attention):
                 candidate_key, 
                 self.scaling, 
                 self.config.num_top_tokens, 
-                pool_kernel_size=getattr(self.config, 'pool_kernel_size', 5),
+                pool_kernel_size=self.config.pool_kernel_size,
                 output_2d=True
             )
 

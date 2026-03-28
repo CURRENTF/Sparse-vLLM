@@ -34,14 +34,14 @@ def single_apply_rotary_pos_emb(k, cos, sin, position_ids=None, unsqueeze_dim=1)
 
 
 def _get_ref_ratio(config: KVQwen2Config) -> float:
-    ref_budget = getattr(config, "deltasnapkv_ref_budget", -1.0)
+    ref_budget = config.deltasnapkv_ref_budget
     if ref_budget is None or float(ref_budget) < 0:
-        ref_budget = getattr(config, "cluster_ratio", 0.0)
+        ref_budget = config.cluster_ratio
     return max(float(ref_budget), 0.0)
 
 
 def _get_compressed_keep_ratio(config: KVQwen2Config, head_dim: int) -> Union[int, float]:
-    total_budget = getattr(config, "deltasnapkv_total_budget", -1.0)
+    total_budget = config.deltasnapkv_total_budget
     if total_budget is None or float(total_budget) <= 0:
         return config.num_top_tokens_in_prefill
 
@@ -592,7 +592,7 @@ class Qwen2DeltaSnapKVForCausalLM(Qwen2ForCausalLM):
             past_key_values = DeltaSnapKVCache(config=self.config)
 
         chunk_size = self.config.chunk_prefill_size
-        obs_window_size = getattr(self.config, "snapkv_window_size", 0)
+        obs_window_size = self.config.snapkv_window_size
         outputs = None
         if input_ids.shape[1] > 1:
             past_key_values.num_prompt_tokens = input_ids.shape[1]

@@ -45,7 +45,7 @@ class LlamaAttnKVCompress(LlamaAttention):
         bs, seq_len, dim = kv.shape
         
         # 支持 Sink Token 机制，前若干个 token 不压缩
-        sink_size = getattr(self.config, 'num_sink_tokens', 0)
+        sink_size = self.config.num_sink_tokens
         if seq_len <= sink_size:
             return kv
 

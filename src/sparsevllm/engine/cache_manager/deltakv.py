@@ -135,7 +135,7 @@ class DeltaKVCacheManager(CacheManager):
 
         # Reserve some headroom for the sparse full-KV pool (centers/buffer/temp).
         # This is important for large batch sizes, where the required temp slots can spike.
-        reserve_ratio = float(getattr(config, "deltakv_full_pool_reserve_ratio", 0.0))
+        reserve_ratio = float(config.deltakv_full_pool_reserve_ratio)
         if reserve_ratio > 0:
             reserve_ratio = max(0.0, min(0.5, reserve_ratio))
             max_tokens = max(1, int(max_tokens * (1.0 - reserve_ratio)))
@@ -321,11 +321,11 @@ class DeltaKVCacheManager(CacheManager):
 
     def _estimate_centers_for_total_len(self, total_len: int) -> int:
         total_len = int(total_len)
-        cluster_ratio = float(getattr(self.config, "cluster_ratio", 0.0) or 0.0)
+        cluster_ratio = float(self.config.cluster_ratio or 0.0)
         if cluster_ratio <= 0:
             return 0
-        sink = int(getattr(self.config, "num_sink_tokens", 0) or 0)
-        recent = int(getattr(self.config, "num_recent_tokens", 0) or 0)
+        sink = int(self.config.num_sink_tokens or 0)
+        recent = int(self.config.num_recent_tokens or 0)
         cluster_step = max(1, int(1.0 / max(1e-6, cluster_ratio)))
         # Tokens in sink + recent buffer never become centers; be conservative with ceil.
         effective = total_len - sink - recent
@@ -1647,7 +1647,7 @@ class DeltaKVCacheTritonManagerV3WithOffload(DeltaKVCacheTritonManagerV3):
     def __init__(self, config: Config, rank: int, world_size: int):
         # `DeltaKVCacheManager.__init__` will call our overridden `allocate_kv_cache()`.
         super().__init__(config, rank, world_size)
-        cpu_threads = int(getattr(config, "deltakv_offload_cpu_threads", 0) or 0)
+        cpu_threads = int(config.deltakv_offload_cpu_threads or 0)
         if cpu_threads > 0:
             torch.set_num_threads(cpu_threads)
         self._offload_prefetch_stream = torch.cuda.Stream()
@@ -1679,7 +1679,7 @@ class DeltaKVCacheTritonManagerV3WithOffload(DeltaKVCacheTritonManagerV3):
             raise ValueError("Invalid KV cache allocation configuration.")
 
         max_tokens = max(1, int(available_memory / per_token_bytes))
-        reserve_ratio = float(getattr(config, "deltakv_full_pool_reserve_ratio", 0.0))
+        reserve_ratio = float(config.deltakv_full_pool_reserve_ratio)
         if reserve_ratio > 0:
             reserve_ratio = max(0.0, min(0.5, reserve_ratio))
             max_tokens = max(1, int(max_tokens * (1.0 - reserve_ratio)))
@@ -1699,9 +1699,9 @@ class DeltaKVCacheTritonManagerV3WithOffload(DeltaKVCacheTritonManagerV3):
 
         sink = int(config.num_sink_tokens)
         recent = int(config.num_recent_tokens)
-        max_seqs = int(getattr(config, "max_num_seqs_in_batch", 1) or 1)
+        max_seqs = int(config.max_num_seqs_in_batch or 1)
         top_decode = int(config.num_top_tokens)
-        top_prefill = int(getattr(config, "num_top_tokens_in_prefill", config.num_top_tokens) or config.num_top_tokens)
+        top_prefill = int((config.num_top_tokens_in_prefill or config.num_top_tokens))
         max_prefill_seqs_by_tokens = (int(config.max_num_batched_tokens) + int(config.chunk_prefill_size) - 1) // int(
             config.chunk_prefill_size
         )
@@ -1768,8 +1768,8 @@ class DeltaKVCacheTritonManagerV3WithOffload(DeltaKVCacheTritonManagerV3):
         keep_after = int(getattr(config, "deltakv_offload_keep_after_obs_layers", 0) or 0)
         keep_layer_ids: set[int] = set()
         if keep_after > 0:
-            obs_layers = list(getattr(config, "obs_layer_ids", []) or [])
-            full_layers = set(getattr(config, "full_attn_layers", []) or [])
+            obs_layers = list(config.obs_layer_ids or [])
+            full_layers = set(config.full_attn_layers or [])
             for obs in obs_layers:
                 cnt = 0
                 for l in range(int(obs) + 1, self.num_layers):
@@ -1954,7 +1954,7 @@ class DeltaKVCacheTritonManagerV3WithOffload(DeltaKVCacheTritonManagerV3):
             idx_cpu_i64 = recon_latent.to(torch.long).to(device="cpu", non_blocking=False)
 
             # Prefetch for future layers (1..N ahead) to overlap with attention compute.
-            prefetch_n = int(getattr(self.config, "deltakv_offload_prefetch_distance", 1) or 0)
+            prefetch_n = int(self.config.deltakv_offload_prefetch_distance or 0)
             if prefetch_n > 0:
                 # Find next sparse layers until next full-attn layer.
                 full_layers = set(self.full_attn_layers)
@@ -2173,8 +2173,8 @@ class DeltaKVCacheTritonManagerV3WithCUDAOffload(DeltaKVCacheTritonManagerV3With
         # IMPORTANT: decide whether CUDA offload is usable *before* `super().__init__()`,
         # because the parent init will call `allocate_kv_cache()`, which uses our
         # `_create_cpu_latent_layer()` override.
-        self._cuda_offload_map_size = int(getattr(config, "deltakv_cuda_offload_map_size", 256) or 256)
-        self._cuda_offload_latent_dim = int(getattr(config, "kv_compressed_size", 0) or 0)
+        self._cuda_offload_map_size = int(config.deltakv_cuda_offload_map_size or 256)
+        self._cuda_offload_latent_dim = int(config.kv_compressed_size or 0)
         self._cuda_offload_latent_heads = 0
         self._cpu_gpu_transfer_cuda = None
 

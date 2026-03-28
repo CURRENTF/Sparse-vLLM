@@ -111,7 +111,7 @@ class Qwen2AttnKVCompress(Qwen2Attention):
         is_prefill, is_decode = (q_len > 1), (q_len == 1)
 
         compressed_len = (past_key_value.get_seq_length() - self.config.tail_token_size - q_len - sink_size) // self.config.tail_token_size * self.config.tail_token_size
-        use_omnikv_selection = bool(getattr(self.config, "deltakv_use_omnikv_selection", False))
+        use_omnikv_selection = bool(self.config.deltakv_use_omnikv_selection)
         do_obs = (
             use_omnikv_selection
             and self.is_obs_layer

@@ -126,11 +126,11 @@ class SnapKVCacheManager(CacheManager):
 
     def prefill_batched_tokens_margin(self) -> int:
         # Keep headroom for the "window" tokens used by SnapKV/PyramidKV logic.
-        return int(getattr(self.config, "snapkv_window_size", 0) or 0)
+        return int(self.config.snapkv_window_size)
 
     def remaining_prefill_tokens(self, seq: Sequence) -> int:
         remaining = int(seq.num_prompt_tokens - seq.num_prefilled_tokens)
-        window = int(getattr(self.config, "snapkv_window_size", 0) or 0)
+        window = int(self.config.snapkv_window_size)
         if window > 0 and remaining > window:
             return remaining - window
         return remaining
@@ -339,5 +339,4 @@ class SnapKVCacheManager(CacheManager):
             input_ids = torch.tensor(input_ids_list, dtype=torch.int64, device="cuda")
             positions = torch.tensor(positions_list, dtype=torch.int64, device="cuda")
             return input_ids, positions, None
-
 

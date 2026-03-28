@@ -18,11 +18,11 @@ class StreamingLLMCacheManager(SnapKVCacheManager):
         super().__init__(config, rank, world_size)
 
     def prefill_batched_tokens_margin(self) -> int:
-        return int(getattr(self.config, "num_recent_tokens", 0) or 0)
+        return int(self.config.num_recent_tokens)
 
     def remaining_prefill_tokens(self, seq: Sequence) -> int:
         remaining = int(seq.num_prompt_tokens - seq.num_prefilled_tokens)
-        recent = int(getattr(self.config, "num_recent_tokens", 0) or 0)
+        recent = int(self.config.num_recent_tokens)
         if recent > 0 and remaining > recent:
             return remaining - recent
         return remaining

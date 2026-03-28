@@ -59,20 +59,20 @@ def create_compressor(is_down: bool, config: KVQwen3Config):
     output_size = config.kv_compressed_size if is_down else head_dim * config.num_key_value_heads * kv_factor
 
     # 支持 compressor_linear_bias 参数
-    bias = getattr(config, 'compressor_linear_bias', True)
+    bias = config.compressor_linear_bias
 
     kind_attr = "compressor_down_type" if is_down else "compressor_up_type"
-    kind = _normalize_compressor_type(getattr(config, kind_attr, "auto"))
+    kind = _normalize_compressor_type(getattr(config, kind_attr))
     if kind == "auto":
-        kind = "mlp_gelu" if getattr(config, "use_nonlinear_compressor", False) else "linear"
+        kind = "mlp_gelu" if config.use_nonlinear_compressor else "linear"
 
     if kind == "linear":
         return nn.Linear(input_size, output_size, bias=bias)
 
     inter_attr = "compressor_down_intermediate_size" if is_down else "compressor_up_intermediate_size"
-    intermediate_size = getattr(config, inter_attr, -1)
+    intermediate_size = getattr(config, inter_attr)
     if intermediate_size <= 0:
-        intermediate_size = getattr(config, "compressor_intermediate_size", -1)
+        intermediate_size = config.compressor_intermediate_size
     if intermediate_size <= 0:
         intermediate_size = (input_size + output_size) // 2
 
@@ -124,7 +124,7 @@ class Qwen3AttnKVCompress(Qwen3Attention):
         bs, seq_len, dim = kv.shape
         
         # 支持 Sink Token 机制
-        sink_size = getattr(self.config, 'num_sink_tokens', 0)
+        sink_size = self.config.num_sink_tokens
         if seq_len <= sink_size:
             return kv
 

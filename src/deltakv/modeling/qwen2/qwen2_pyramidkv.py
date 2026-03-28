@@ -105,7 +105,7 @@ class Qwen2PyramidKVAttention(Qwen2Attention):
                 candidate_key, 
                 self.scaling, 
                 self.layer_ratio, 
-                pool_kernel_size=getattr(self.config, 'pool_kernel_size', 5),
+                pool_kernel_size=self.config.pool_kernel_size,
                 output_2d=True
             )
 

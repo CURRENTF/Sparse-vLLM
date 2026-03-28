@@ -104,7 +104,13 @@ class Qwen3AttnKVCompress(Qwen3Attention):
         compressed_len = (
             past_key_value.get_seq_length() - self.config.tail_token_size - q_len - sink_size
         ) // self.config.tail_token_size * self.config.tail_token_size
-        do_obs = (self.is_obs_layer and compressed_len > 0 and (self.config.chunk_prefill_accel_omnikv or is_decode))
+        use_omnikv_selection = bool(self.config.deltakv_use_omnikv_selection)
+        do_obs = (
+            use_omnikv_selection
+            and self.is_obs_layer
+            and compressed_len > 0
+            and (self.config.chunk_prefill_accel_omnikv or is_decode)
+        )
 
         if self.config._attn_implementation != "eager":
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
