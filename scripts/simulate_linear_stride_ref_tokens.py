@@ -48,7 +48,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--alphas",
-        default="0,0.05,0.1",
+        default="0,0.001,0.02,0.05,0.1,0.2",
         help="Comma-separated stride_alpha values.",
     )
     parser.add_argument("--cluster-ratio", type=float, default=0.1)
