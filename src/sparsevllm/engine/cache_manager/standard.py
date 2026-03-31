@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from collections import deque
 
 import numpy as np
@@ -124,6 +125,7 @@ class StandardCacheManager(CacheManager):
 
     def free_seq(self, seq_id: int):
         with profiler.record("cache_free_seq"):
+            debug_slots = os.getenv("SPARSEVLLM_DEBUG_SLOTS", "0") == "1"
             row_idx = self.seq_id_to_row.pop(seq_id, None)
             if row_idx is None:
                 raise ValueError
@@ -132,15 +134,33 @@ class StandardCacheManager(CacheManager):
             slots = self.buffer_req_to_token_slots[row_idx, :cur_len]
 
             assert cur_len > 0
+            before_free = self._num_free_slots
             ptr = self._num_free_slots
             self.free_slots_stack[ptr: ptr + cur_len] = slots
             self._num_free_slots += cur_len
+            after_free = self._num_free_slots
 
             self.buffer_req_to_token_slots[row_idx, :] = 0
             self.row_seq_lens[row_idx] = 0
             self.free_rows.append(row_idx)
 
+            if debug_slots:
+                logger.info(
+                    "free_seq seq_id={} row_idx={} freed_tokens={} free_slots_before={} free_slots_after={}",
+                    seq_id,
+                    row_idx,
+                    int(cur_len),
+                    int(before_free),
+                    int(after_free),
+                )
             if log_level == 'DEBUG': logger.debug(f'free seq {row_idx} with {cur_len} tokens')
+
+    def debug_live_seq_slots(self) -> dict[int, int]:
+        return {
+            int(seq_id): int(self.row_seq_lens[row_idx])
+            for seq_id, row_idx in self.seq_id_to_row.items()
+            if int(self.row_seq_lens[row_idx]) > 0
+        }
 
     def free_part_slots(self, layer_idx: int, seq: Sequence, keep_indices: torch.Tensor):
         raise ValueError('不需要实现该方法')
@@ -231,5 +251,3 @@ class StandardCacheManager(CacheManager):
             input_ids = torch.tensor(input_ids_list, dtype=torch.int64, device="cuda")
             positions = torch.tensor(positions_list, dtype=torch.int64, device="cuda")
             return input_ids, positions, None
-
-

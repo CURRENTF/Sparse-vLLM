@@ -161,7 +161,13 @@ class ModelRunner:
     def free_slots(self, seq_id: int):
         """通知 CacheManager 释放该序列占用的物理显存位子"""
         with profiler.record("model_free_slots"):
+            if os.getenv("SPARSEVLLM_DEBUG_SLOTS", "0") == "1":
+                before = self.cache_manager.free_slot_stats()
+                logger.info("model_runner.free_slots seq_id={} before={}", seq_id, before)
             self.cache_manager.free_seq(seq_id)
+            if os.getenv("SPARSEVLLM_DEBUG_SLOTS", "0") == "1":
+                after = self.cache_manager.free_slot_stats()
+                logger.info("model_runner.free_slots seq_id={} after={}", seq_id, after)
 
     def _long_text_threshold(self, is_prefill: bool) -> int:
         if self.config.vllm_sparse_method in ("streamingllm", "attention-sink", "attention_sink"):

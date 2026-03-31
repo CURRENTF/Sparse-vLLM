@@ -312,6 +312,10 @@ class CacheManager(ABC):
         """Return a small set of free-slot stats for logging/debugging."""
         return {"free_slots": int(self.num_free_slots)}
 
+    def debug_live_seq_slots(self) -> dict[int, int]:
+        """Return live seq_id -> occupied slot count for debugging."""
+        return {}
+
     @abstractmethod
     def free_seq(self, seq_id: int):
         raise NotImplementedError

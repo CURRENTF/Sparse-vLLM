@@ -1,3 +1,4 @@
+import os
 from collections import deque
 
 from sparsevllm.config import Config
@@ -210,6 +211,40 @@ class Scheduler:
                                     f"reserved_prefill={reserved_prefill}. "
                                     "This usually means batch size is too large for the current KV budget."
                                 )
+                                if os.getenv("SPARSEVLLM_DEBUG_SLOTS", "0") == "1" and len(self.decoding) == 0:
+                                    live_seq_slots = self.memory_oracle.debug_live_seq_slots()
+                                    live_seq_items = sorted(
+                                        ((int(seq_id), int(n_slots)) for seq_id, n_slots in live_seq_slots.items()),
+                                        key=lambda x: (-x[1], x[0]),
+                                    )[:16]
+                                    waiting_seq_ids_all = [int(s.seq_id) for s in self.waiting]
+                                    decoding_seq_ids_all = [int(s.seq_id) for s in self.decoding]
+                                    scheduled_seq_ids_all = [int(s.seq_id) for s in scheduled_seqs]
+                                    known_seq_ids = (
+                                        set(waiting_seq_ids_all)
+                                        | set(decoding_seq_ids_all)
+                                        | set(scheduled_seq_ids_all)
+                                    )
+                                    zombie_seq_ids = sorted(
+                                        int(seq_id)
+                                        for seq_id in live_seq_slots
+                                        if int(seq_id) not in known_seq_ids
+                                    )[:16]
+                                    logger.info(
+                                        "defer_with_no_decoding seq_id={} need={} free={} free_slots={} reserved_prefill={} "
+                                        "scheduled_prefill={} waiting_seq_ids={} scheduled_seq_ids={} zombie_seq_ids={} "
+                                        "live_seq_slots={}",
+                                        seq.seq_id,
+                                        int(need),
+                                        int(free),
+                                        int(physical_free_count),
+                                        int(reserved_prefill),
+                                        len(scheduled_seqs),
+                                        waiting_seq_ids_all[:16],
+                                        scheduled_seq_ids_all[:16],
+                                        zombie_seq_ids,
+                                        live_seq_items,
+                                    )
                                 self._admission_defer_warned_seq_ids.add(seq.seq_id)
                             self.waiting.append(seq)
                             continue
@@ -274,9 +309,30 @@ class Scheduler:
                 # 策略：牺牲当前 seq，并立刻返回，让上层先释放槽位再进入下一轮调度。
                 # 这样可以避免在一次 schedule() 调用中反复驱逐多个请求造成抖动。
                 victim = seq
+                debug_slots = os.getenv("SPARSEVLLM_DEBUG_SLOTS", "0") == "1"
+                if debug_slots:
+                    logger.info(
+                        "preempt seq_id={} prompt_len={} num_tokens={} prefetched={} free_slots_before={} waiting_before={} decoding_before={}",
+                        victim.seq_id,
+                        int(victim.num_prompt_tokens),
+                        int(victim.num_tokens),
+                        int(victim.num_prefilled_tokens),
+                        int(self.memory_oracle.num_free_slots),
+                        len(self.waiting),
+                        len(self.decoding),
+                    )
                 victim.status = SequenceStatus.WAITING
                 victim.num_prefilled_tokens = 0  # 重置进度，下次回来重新跑 Prefill
-                self.waiting.appendleft(victim) # 插到队首，显存释放后优先处理
+                # Requeue to the tail instead of the head. Otherwise a long sequence can
+                # be immediately re-admitted after preemption and thrash in a tight
+                # prefill->decode->preempt loop while other waiting prompts never drain.
+                self.waiting.append(victim)
+                # Any decode sequences already popped into `scheduled_seqs` in this round
+                # have not been executed yet. Put them back before returning, otherwise
+                # they disappear from scheduler queues while still occupying KV slots.
+                if scheduled_seqs:
+                    self.decoding.extendleft(reversed(scheduled_seqs))
+                    scheduled_seqs.clear()
                 preempted_seqs.append(victim)
                 logger.warning(f'驱逐请求 id = {victim.seq_id} | slots={self.memory_oracle.free_slot_stats()}')
                 return [], False, preempted_seqs
@@ -290,6 +346,43 @@ class Scheduler:
         if not scheduled_seqs:
             if deferred_prompt_failure is not None and not self.decoding:
                 seq, name, need, free = deferred_prompt_failure
+                if os.getenv("SPARSEVLLM_DEBUG_SLOTS", "0") == "1":
+                    waiting_seq_ids_all = [int(s.seq_id) for s in self.waiting]
+                    decoding_seq_ids_all = [int(s.seq_id) for s in self.decoding]
+                    scheduled_seq_ids_all = [int(s.seq_id) for s in scheduled_seqs]
+                    live_seq_slots = self.memory_oracle.debug_live_seq_slots()
+                    live_seq_items = sorted(
+                        ((int(seq_id), int(n_slots)) for seq_id, n_slots in live_seq_slots.items()),
+                        key=lambda x: (-x[1], x[0]),
+                    )[:16]
+                    waiting_prompt_lens = [int(s.num_prompt_tokens) for s in list(self.waiting)[:8]]
+                    known_seq_ids = (
+                        set(waiting_seq_ids_all)
+                        | set(decoding_seq_ids_all)
+                        | set(scheduled_seq_ids_all)
+                    )
+                    zombie_seq_ids = sorted(
+                        int(seq_id)
+                        for seq_id in live_seq_slots
+                        if int(seq_id) not in known_seq_ids
+                    )[:16]
+                    logger.info(
+                        "deferred_deadlock seq_id={} failed_budget={} need={} free={} free_slots={} reserved_prefill={} "
+                        "waiting_prompt_lens={} waiting_seq_ids={} decoding_seq_ids={} scheduled_seq_ids={} "
+                        "zombie_seq_ids={} live_seq_slots={}",
+                        seq.seq_id,
+                        name,
+                        int(need),
+                        int(free),
+                        int(physical_free_count),
+                        int(reserved_prefill),
+                        waiting_prompt_lens,
+                        waiting_seq_ids_all[:16],
+                        decoding_seq_ids_all[:16],
+                        scheduled_seq_ids_all[:16],
+                        zombie_seq_ids,
+                        live_seq_items,
+                    )
                 raise RuntimeError(
                     "All prompt admissions were deferred and no runnable work remains. "
                     f"cache_manager={type(self.memory_oracle).__name__} seq_id={seq.seq_id} "
