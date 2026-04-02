@@ -5,3 +5,4 @@ __pycache__/
 wandb/
 /tmp/
 /outputs/
+/benchmark/scbench/results/

@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import os
 
+import numpy as np
 import torch
 
 from sparsevllm.config import Config
 from sparsevllm.engine.sequence import Sequence
+from sparsevllm.utils.context import get_context
+from sparsevllm.utils.log import logger
 from sparsevllm.utils.profiler import profiler
 
 from .deltakv_standalone import DeltaKVStandaloneCacheManager
@@ -39,6 +42,112 @@ class DeltaKVSnapKVCacheManager(DeltaKVStandaloneCacheManager):
         self._snapkv_view_cache_key: tuple[int, int] | None = None
         self._snapkv_view_cache_value: dict[str, torch.Tensor | int] | None = None
 
+    def allocate_kv_cache(self):
+        available_memory, slot_bytes_per_layer = self._get_available_slots_info()
+        config = self.config
+        dtype_size = torch.tensor([], dtype=self.hf_config.torch_dtype).element_size()
+
+        num_layers = self.num_layers
+        latent_bytes = config.kv_compressed_size * dtype_size
+        cluster_ratio = max(0.0, float(config.cluster_ratio))
+
+        sink = int(config.num_sink_tokens)
+        recent = int(config.num_recent_tokens or 0) + int(config.snapkv_window_size or 0)
+        keep_budget = int(config.num_top_tokens_in_prefill or config.num_top_tokens or 0)
+        max_seqs = int(config.max_num_seqs_in_batch)
+        max_total_len = int(config.max_model_len)
+        max_step_chunk = int(min(int(config.max_num_batched_tokens), max_seqs * int(config.chunk_prefill_size)))
+        # SnapKV materializes the kept latent middle into persistent raw slots at prefill end.
+        # Reserve those slots up-front so bs24 benchmarks do not hit full-pool exhaustion later.
+        overhead_slots = max_seqs * (sink + 2 * recent + keep_budget) + max_step_chunk
+        cluster_step = max(1, int(1.0 / max(1e-6, cluster_ratio))) if cluster_ratio > 0 else 0
+        centers_per_seq = self._estimate_centers_for_total_len(max_total_len)
+        center_slack = int(np.ceil(max_step_chunk / max(1, cluster_step))) if cluster_ratio > 0 else 0
+        desired_centers = max(1, int(max_seqs * centers_per_seq + center_slack))
+        temp_decode_upper = max_seqs * max_total_len
+        reserve_ratio = float(config.deltakv_full_pool_reserve_ratio)
+        reserve_ratio = max(0.0, min(0.5, reserve_ratio))
+
+        temp_slots_override = os.getenv("SPARSEVLLM_DELTAKV_STANDALONE_TEMP_SLOTS", "").strip()
+        temp_override_i = int(temp_slots_override) if temp_slots_override else None
+        centers_capacity = desired_centers
+        full_slots = int(overhead_slots + centers_capacity)
+        temp_slots_target = int(temp_override_i) if temp_override_i is not None else int(temp_decode_upper)
+        const_bytes = temp_slots_target * slot_bytes_per_layer + full_slots * num_layers * slot_bytes_per_layer
+        bytes_budget = available_memory - const_bytes
+        if bytes_budget <= 0:
+            raise RuntimeError(
+                "Not enough GPU memory left for DeltaKV+SnapKV after reserving persistent overhead/temp margin. "
+                "Reduce chunk_prefill_size/max_num_batched_tokens or increase gpu_memory_utilization."
+            )
+
+        latent_slots = max(1, int(bytes_budget // (num_layers * latent_bytes)))
+        if reserve_ratio > 0:
+            latent_slots = max(1, int(latent_slots * (1.0 - reserve_ratio)))
+
+        total_bytes = (
+            temp_slots_target * slot_bytes_per_layer
+            + full_slots * num_layers * slot_bytes_per_layer
+            + latent_slots * num_layers * latent_bytes
+        )
+        if total_bytes > available_memory:
+            raise RuntimeError(
+                "Not enough GPU memory for DeltaKV+SnapKV caches after exact capacity check. "
+                f"required={total_bytes / 1024**3:.2f}GiB available={available_memory / 1024**3:.2f}GiB."
+            )
+
+        self.full_num_slots = 0
+        self.deltakv_latent_num_slots = int(latent_slots)
+        self.deltakv_full_num_slots = int(full_slots)
+        self._deltakv_centers_capacity = int(centers_capacity)
+        self.deltakv_temp_num_slots = int(temp_slots_target)
+        self._deltakv_temp_full_reserve = 0
+
+        logger.info(
+            f"DeltaKV+SnapKV allocation: persistent_slots={self.deltakv_full_num_slots} "
+            f"(overhead={overhead_slots}, centers={centers_capacity}, centers_per_seq={centers_per_seq}, "
+            f"keep_budget={keep_budget}); latent_slots={self.deltakv_latent_num_slots}; "
+            f"temp_slots={self.deltakv_temp_num_slots} "
+            f"(layers={num_layers}, deltakv_full_pool_reserve_ratio={reserve_ratio:.3f})."
+        )
+
+        self.deltakv_full_kv_cache = torch.empty(
+            2,
+            num_layers,
+            self.deltakv_full_num_slots,
+            self.num_kv_heads,
+            self.head_dim,
+            dtype=self.hf_config.torch_dtype,
+            device="cuda",
+        )
+        self.deltakv_temp_kv_cache = torch.empty(
+            2,
+            self.deltakv_temp_num_slots,
+            self.num_kv_heads,
+            self.head_dim,
+            dtype=self.hf_config.torch_dtype,
+            device="cuda",
+        )
+        self.deltakv_latent_cache = torch.empty(
+            num_layers,
+            self.deltakv_latent_num_slots,
+            config.kv_compressed_size,
+            dtype=self.hf_config.torch_dtype,
+            device="cuda",
+        )
+        self.deltakv_latent_to_full_slots = torch.full(
+            (num_layers, self.deltakv_latent_num_slots, config.deltakv_k_neighbors),
+            -1,
+            dtype=torch.int32,
+            device="cuda",
+        )
+        self.deltakv_slot_to_pos = torch.full(
+            (self.deltakv_full_num_slots,),
+            -1,
+            dtype=torch.int32,
+            device="cuda",
+        )
+
     def _reset_snapkv_view_cache(self):
         self._snapkv_view_cache_key = None
         self._snapkv_view_cache_value = None
@@ -59,13 +168,80 @@ class DeltaKVSnapKVCacheManager(DeltaKVStandaloneCacheManager):
 
         sink = int(self.config.num_sink_tokens or 0)
         recent = int(self._protected_recent_tokens)
+        keep_budget = int(self.config.num_top_tokens_in_prefill or self.config.num_top_tokens or 0)
         chunk = int(
             chunk_prefill_size
             if chunk_prefill_size is not None
             else (self.config.chunk_prefill_size or 0)
         )
-        persistent_upper = sink + 2 * recent + max(0, chunk)
+        persistent_upper = sink + 2 * recent + keep_budget + max(0, chunk)
         return min(prompt_len, persistent_upper)
+
+    @torch.no_grad()
+    def _materialize_kept_latent_to_raw(
+        self,
+        keep_abs: torch.Tensor,
+        keep_latent: torch.Tensor,
+    ) -> torch.Tensor:
+        keep_abs = keep_abs.to(torch.int32).contiguous()
+        keep_latent = keep_latent.to(torch.int32).contiguous()
+        num_keep = int(keep_latent.numel())
+        if num_keep == 0:
+            return torch.empty((0,), dtype=torch.int32, device="cuda")
+
+        usable = self._num_free_slots_deltakv_full - int(getattr(self, "_deltakv_temp_full_reserve", 0) or 0)
+        if usable < num_keep:
+            raise RuntimeError(
+                "DeltaKV+SnapKV cannot materialize kept latents into persistent raw slots. "
+                f"need={num_keep} free_total={self._num_free_slots_deltakv_full} free_usable={usable}."
+            )
+        ptr = self._num_free_slots_deltakv_full
+        new_raw_slots = self.free_slots_stack_deltakv_full[ptr - num_keep: ptr].to(torch.int32).contiguous()
+        self._num_free_slots_deltakv_full -= num_keep
+        self.deltakv_slot_to_pos[new_raw_slots.to(torch.long)] = keep_abs
+
+        decompress_chunk_tokens = int(
+            os.getenv("SPARSEVLLM_DELTAKV_STANDALONE_DECOMPRESS_CHUNK_TOKENS", "524288")
+        )
+        kernel_chunk_tokens = int(
+            os.getenv(
+                "SPARSEVLLM_DELTAKV_STANDALONE_KERNEL_CHUNK_TOKENS",
+                str(decompress_chunk_tokens),
+            )
+        )
+        decompress_chunk_tokens = max(1, decompress_chunk_tokens)
+        kernel_chunk_tokens = max(1, kernel_chunk_tokens)
+
+        for l_idx in range(self.num_layers):
+            k_persist = self.deltakv_full_kv_cache[0, l_idx]
+            v_persist = self.deltakv_full_kv_cache[1, l_idx]
+            father_slots_all = self.deltakv_latent_to_full_slots[l_idx, keep_latent].to(torch.int32).contiguous()
+            if (father_slots_all < 0).any():
+                raise RuntimeError("DeltaKV+SnapKV: missing father slots while materializing kept latents.")
+
+            total_recon = int(keep_latent.numel())
+            for start in range(0, total_recon, decompress_chunk_tokens):
+                end = min(start + decompress_chunk_tokens, total_recon)
+                latent = self.deltakv_latent_cache[l_idx, keep_latent[start:end]]
+                kv_delta = self.compress_up[l_idx](latent)
+
+                for local_start in range(0, int(kv_delta.shape[0]), kernel_chunk_tokens):
+                    local_end = min(local_start + kernel_chunk_tokens, int(kv_delta.shape[0]))
+                    abs_start = start + local_start
+                    abs_end = start + local_end
+                    self._deltakv_reconstruct_writeback_srcdst(
+                        kv_delta=kv_delta[local_start:local_end],
+                        father_slots=father_slots_all[abs_start:abs_end],
+                        slot_to_pos=self.deltakv_slot_to_pos,
+                        out_slots=new_raw_slots[abs_start:abs_end],
+                        out_pos=keep_abs[abs_start:abs_end],
+                        src_k_cache=k_persist,
+                        src_v_cache=v_persist,
+                        dst_k_cache=k_persist,
+                        dst_v_cache=v_persist,
+                    )
+
+        return new_raw_slots
 
     def free_seq(self, seq_id: int):
         row_idx = self.seq_id_to_row.get(seq_id, None)
@@ -158,6 +334,7 @@ class DeltaKVSnapKVCacheManager(DeltaKVStandaloneCacheManager):
             new_context_lens_list.append(total_len)
 
         active_local_slots = torch.full((bsz, max_s), -1, device="cuda", dtype=torch.int32)
+        active_physical_slots = torch.full((bsz, max_s), -1, device="cuda", dtype=torch.int32)
         raw_src = []
         raw_dst_local = []
         recon_pos = []
@@ -174,6 +351,7 @@ class DeltaKVSnapKVCacheManager(DeltaKVStandaloneCacheManager):
                 sink_slots = self.sparse_layer_raw_slots_map[row, :sink_len].to(torch.int32)
                 if (sink_slots < 0).any():
                     raise RuntimeError("DeltaKV+SnapKV: missing raw slots in sink window.")
+                active_physical_slots[b, :sink_len] = sink_slots
                 raw_src.append(sink_slots)
                 raw_dst_local.append(local_seq[:sink_len])
 
@@ -183,6 +361,7 @@ class DeltaKVSnapKVCacheManager(DeltaKVStandaloneCacheManager):
                 comp_raw_slots = self.sparse_layer_raw_slots_map[row, comp_logical_pos.to(torch.long)].to(torch.int32)
                 raw_mask = comp_raw_slots >= 0
                 if raw_mask.any():
+                    active_physical_slots[b, sink_len : sink_len + comp_len][raw_mask] = comp_raw_slots[raw_mask]
                     raw_src.append(comp_raw_slots[raw_mask])
                     raw_dst_local.append(comp_local_out[raw_mask])
                 need_mask = ~raw_mask
@@ -199,6 +378,9 @@ class DeltaKVSnapKVCacheManager(DeltaKVStandaloneCacheManager):
                 buf_slots = self.sparse_layer_raw_slots_map[row, buffer_start: buffer_start + buffer_len].to(torch.int32)
                 if (buf_slots < 0).any():
                     raise RuntimeError("DeltaKV+SnapKV: missing raw slots in buffer window.")
+                active_physical_slots[
+                    b, sink_len + comp_len : sink_len + comp_len + buffer_len
+                ] = buf_slots
                 raw_src.append(buf_slots)
                 raw_dst_local.append(local_seq[sink_len + comp_len: sink_len + comp_len + buffer_len])
 
@@ -210,6 +392,7 @@ class DeltaKVSnapKVCacheManager(DeltaKVStandaloneCacheManager):
 
         value: dict[str, torch.Tensor | int | dict[int, torch.Tensor]] = {
             "active_local_slots": active_local_slots,
+            "active_physical_slots": active_physical_slots,
             "new_context_lens": torch.tensor(new_context_lens_list, device="cuda", dtype=torch.int32),
             "local_req": torch.arange(bsz, device="cuda", dtype=torch.int32),
             "total_temp": total_temp,
@@ -247,6 +430,7 @@ class DeltaKVSnapKVCacheManager(DeltaKVStandaloneCacheManager):
                 max_s = int(plan["max_s"])
                 total_temp = int(plan["total_temp"])
                 active_local_slots = plan["active_local_slots"]
+                active_physical_slots = plan["active_physical_slots"]
                 new_context_lens = plan["new_context_lens"]
                 local_req = plan["local_req"]
                 raw_src_all = plan["raw_src_all"]
@@ -259,7 +443,13 @@ class DeltaKVSnapKVCacheManager(DeltaKVStandaloneCacheManager):
                 recon_out_local_all_i64 = plan["recon_out_local_all_i64"]
                 father_slots_by_layer = plan["father_slots_by_layer"]
 
+            use_persistent_direct = (not get_context().is_prefill) and recon_latent_all.numel() == 0
+            if use_persistent_direct:
+                self._deltakv_layer_compute_source[layer_idx] = "persistent"
+                return active_physical_slots, local_req, new_context_lens, None
+
             with profiler.record("deltakv_snapkv_reconstruct_alloc_temp"):
+                self._deltakv_layer_compute_source[layer_idx] = "temp"
                 temp_slots = self._allocate_temp_deltakv_full(total_temp).to(torch.int32)
                 active_slots = active_local_slots
 
@@ -384,18 +574,36 @@ class DeltaKVSnapKVCacheManager(DeltaKVStandaloneCacheManager):
             keep_abs = comp_abs[keep_mask]
             keep_raw = comp_raw[keep_mask]
             keep_latent = comp_latent[keep_mask]
+            materialized_latent = torch.empty((0,), dtype=torch.int32, device="cuda")
             if keep_abs.numel() > 0:
                 order = torch.argsort(keep_abs)
                 keep_abs = keep_abs[order]
                 keep_raw = keep_raw[order]
                 keep_latent = keep_latent[order]
 
+            keep_latent_mask = keep_latent >= 0
+            if keep_latent_mask.any():
+                materialized_latent = keep_latent[keep_latent_mask].to(torch.int32).contiguous()
+                materialized_slots = self._materialize_kept_latent_to_raw(
+                    keep_abs[keep_latent_mask],
+                    materialized_latent,
+                )
+                keep_raw[keep_latent_mask] = materialized_slots
+                keep_latent[keep_latent_mask] = -1
+
             drop_latent = comp_latent[~keep_mask]
             drop_latent = drop_latent[drop_latent >= 0]
-            if drop_latent.numel() > 0:
+            freed_latent = drop_latent
+            if keep_latent_mask.any():
+                freed_latent = (
+                    torch.cat([freed_latent, materialized_latent], dim=0)
+                    if drop_latent.numel() > 0
+                    else materialized_latent
+                )
+            if freed_latent.numel() > 0:
                 ptr = self._num_free_slots_deltakv_latent
-                self.free_slots_stack_deltakv_latent[ptr: ptr + drop_latent.numel()] = drop_latent.to(torch.int32)
-                self._num_free_slots_deltakv_latent += int(drop_latent.numel())
+                self.free_slots_stack_deltakv_latent[ptr: ptr + freed_latent.numel()] = freed_latent.to(torch.int32)
+                self._num_free_slots_deltakv_latent += int(freed_latent.numel())
 
             old_buffer_start = sink + comp_len
             buffer_len = total_len - old_buffer_start
@@ -413,12 +621,7 @@ class DeltaKVSnapKVCacheManager(DeltaKVStandaloneCacheManager):
 
             if new_comp_len > 0:
                 comp_dst = torch.arange(sink, sink + new_comp_len, device="cuda", dtype=torch.long)
-                keep_raw_mask = keep_raw >= 0
-                if keep_raw_mask.any():
-                    self.sparse_layer_raw_slots_map[row_idx, comp_dst[keep_raw_mask]] = keep_raw[keep_raw_mask]
-                keep_latent_mask = keep_latent >= 0
-                if keep_latent_mask.any():
-                    self.sparse_layer_latent_slots_map[row_idx, comp_dst[keep_latent_mask]] = keep_latent[keep_latent_mask]
+                self.sparse_layer_raw_slots_map[row_idx, comp_dst] = keep_raw.to(torch.int32)
                 self.row_deltakv_comp_abs_pos[row_idx, comp_dst] = keep_abs.to(torch.int32)
 
             if buffer_len > 0:

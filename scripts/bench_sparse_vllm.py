@@ -94,6 +94,7 @@ def benchmark_task(method, length, bs, args, results_dict):
         ]
         admission_wave_size = int(getattr(args, "admission_wave_size", 0) or 0)
         staged_admission = 0 < admission_wave_size < bs
+        wave_decode_gap_steps = int(getattr(args, "wave_decode_gap_steps", 0) or 0)
 
         # --- 关键修改：重置并开始正式测量 ---
         from sparsevllm.utils.profiler import profiler
@@ -118,14 +119,16 @@ def benchmark_task(method, length, bs, args, results_dict):
 
         # Manually run the generation loop to get detailed stats
         next_request_idx = 0
+        decode_steps_since_last_wave = 0
 
         def add_wave(max_new_requests: int):
-            nonlocal next_request_idx
+            nonlocal next_request_idx, decode_steps_since_last_wave
             end_idx = min(bs, next_request_idx + max_new_requests)
             for req_idx in range(next_request_idx, end_idx):
                 llm.add_request(prompt_token_ids[req_idx], sampling_params[req_idx])
             added = end_idx - next_request_idx
             next_request_idx = end_idx
+            decode_steps_since_last_wave = 0
             return added
 
         add_wave(admission_wave_size if staged_admission else bs)
@@ -133,7 +136,13 @@ def benchmark_task(method, length, bs, args, results_dict):
         has_queued = False
         zero_steps = 0
         while not llm.is_finished():
-            if staged_admission and next_request_idx < bs and len(llm.scheduler.waiting) == 0 and len(llm.scheduler.decoding) > 0:
+            if (
+                staged_admission
+                and next_request_idx < bs
+                and len(llm.scheduler.waiting) == 0
+                and len(llm.scheduler.decoding) > 0
+                and decode_steps_since_last_wave >= wave_decode_gap_steps
+            ):
                 add_wave(admission_wave_size)
 
             step_start = perf_counter()
@@ -154,6 +163,7 @@ def benchmark_task(method, length, bs, args, results_dict):
             elif num_tokens < 0:
                 # print(f'one decode step ... {perf_counter() - last_time}')
                 decode_started = True
+                decode_steps_since_last_wave += 1
                 decode_times.append(step_dt)
                 decode_tokens += (-num_tokens)
                 if full_admission_reached:
@@ -209,6 +219,7 @@ def benchmark_task(method, length, bs, args, results_dict):
         
         stage_mode = (
             f" | AdmissionWave: {admission_wave_size}"
+            f" | WaveGapSteps: {wave_decode_gap_steps}"
             f" | FullAdmit: {'yes' if full_admission_reached else 'no'}"
             f" | DecodeScope: {'full' if used_full_admission_window else 'fallback'}"
             if staged_admission
@@ -281,6 +292,12 @@ def main():
         type=int,
         default=0,
         help="If >0 in staged mode, stop after this many decode steps after full admission is reached.",
+    )
+    parser.add_argument(
+        "--wave_decode_gap_steps",
+        type=int,
+        default=0,
+        help="In staged admission mode, require this many decode steps before admitting the next wave.",
     )
     parser.add_argument(
         "--hyper_params",

@@ -74,17 +74,17 @@ class Attention(nn.Module):
         store_kvcache(k, v, store_k_cache, store_v_cache, slot_mapping)
         cache_manager.on_kv_stored(context.now_layer_idx, k, slot_mapping)
 
-        try:
-            k_cache, v_cache = cache_manager.get_layer_compute_tensors(context.now_layer_idx, sparse_controller)
-        except NotImplementedError:
-            k_cache, v_cache = cache_manager.get_layer_kv_cache(context.now_layer_idx)
-
         # 2. 获取逻辑视图
         layer_active_slots, layer_active_indices, layer_req_indices, layer_context_lens, layer_attn_score, deltakv_temp_slots = \
             sparse_controller.get_read_view(context.now_layer_idx)
 
         assert layer_active_slots is not None
         b_req_idx = layer_req_indices
+
+        try:
+            k_cache, v_cache = cache_manager.get_layer_compute_tensors(context.now_layer_idx, sparse_controller)
+        except NotImplementedError:
+            k_cache, v_cache = cache_manager.get_layer_kv_cache(context.now_layer_idx)
 
         # --- 通用稀疏/全量路径 (使用 Triton) ---
         try:

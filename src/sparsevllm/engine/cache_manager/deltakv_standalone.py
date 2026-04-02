@@ -9,6 +9,7 @@ import torch
 from sparsevllm.config import Config
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.layers.rotary_embedding import get_rope
+from sparsevllm.utils.context import get_context
 from sparsevllm.utils.log import logger
 from sparsevllm.utils.profiler import profiler
 
@@ -51,6 +52,7 @@ class DeltaKVStandaloneCacheManager(DeltaKVCacheTritonManagerV4):
         self._deltakv_centers_capacity = 0
         self._deltakv_centers_reserved_total = 0
         self._deltakv_centers_reserved_by_seq: dict[int, int] = {}
+        self._deltakv_layer_compute_source: dict[int, str] = {}
 
         self.allocate_kv_cache()
 
@@ -252,6 +254,9 @@ class DeltaKVStandaloneCacheManager(DeltaKVCacheTritonManagerV4):
         return k_cache, v_cache, state.slot_mapping
 
     def get_layer_compute_tensors(self, layer_idx: int, sparse_controller):
+        del sparse_controller
+        if self._deltakv_layer_compute_source.get(layer_idx) == "persistent":
+            return self.get_layer_kv_cache(layer_idx)
         return self.deltakv_temp_kv_cache[0], self.deltakv_temp_kv_cache[1]
 
     def get_layer_buffer_req_to_token_slots(self, layer_idx: int) -> torch.Tensor:
@@ -368,6 +373,7 @@ class DeltaKVStandaloneCacheManager(DeltaKVCacheTritonManagerV4):
     def free_seq(self, seq_id: int):
         with profiler.record("cache_free_seq"):
             self._reset_standalone_view_cache()
+            self._deltakv_layer_compute_source.clear()
             reserved = self._deltakv_centers_reserved_by_seq.pop(seq_id, 0)
             if reserved:
                 self._deltakv_centers_reserved_total -= int(reserved)
@@ -423,6 +429,7 @@ class DeltaKVStandaloneCacheManager(DeltaKVCacheTritonManagerV4):
     def _prepare_prefill(self, seqs: list[Sequence]):
         with profiler.record("cache_prepare_prefill"):
             self._reset_standalone_view_cache()
+            self._deltakv_layer_compute_source.clear()
             total_chunk_tokens = sum(seq.current_chunk_size for seq in seqs)
 
             input_ids_np = np.empty(total_chunk_tokens, dtype=np.int64)
@@ -482,6 +489,7 @@ class DeltaKVStandaloneCacheManager(DeltaKVCacheTritonManagerV4):
     def _prepare_decode(self, seqs: list[Sequence]):
         with profiler.record("cache_prepare_decode"):
             self._reset_standalone_view_cache()
+            self._deltakv_layer_compute_source.clear()
             batch_size = len(seqs)
             input_ids_list = [seq.last_token for seq in seqs]
             positions_list = [seq.num_tokens - 1 for seq in seqs]
@@ -535,6 +543,7 @@ class DeltaKVStandaloneCacheManager(DeltaKVCacheTritonManagerV4):
             new_context_lens_list.append(total_len)
 
         active_local_slots = torch.full((bsz, max_s), -1, device="cuda", dtype=torch.int32)
+        active_physical_slots = torch.full((bsz, max_s), -1, device="cuda", dtype=torch.int32)
         raw_src = []
         raw_dst = []
         recon_pos = []
@@ -551,6 +560,7 @@ class DeltaKVStandaloneCacheManager(DeltaKVCacheTritonManagerV4):
                 sink_slots = self.sparse_layer_raw_slots_map[row, :sink_len].to(torch.int32)
                 if (sink_slots < 0).any():
                     raise RuntimeError("Standalone DeltaKV: missing raw slots in sink window.")
+                active_physical_slots[b, :sink_len] = sink_slots
                 raw_src.append(sink_slots)
                 raw_dst.append(local_seq[:sink_len])
 
@@ -560,6 +570,7 @@ class DeltaKVStandaloneCacheManager(DeltaKVCacheTritonManagerV4):
                 comp_raw_slots = self.sparse_layer_raw_slots_map[row, comp_pos.to(torch.long)].to(torch.int32)
                 raw_mask = comp_raw_slots >= 0
                 if raw_mask.any():
+                    active_physical_slots[b, sink_len : sink_len + comp_len][raw_mask] = comp_raw_slots[raw_mask]
                     raw_src.append(comp_raw_slots[raw_mask])
                     raw_dst.append(comp_out[raw_mask])
                 need_mask = ~raw_mask
@@ -575,6 +586,9 @@ class DeltaKVStandaloneCacheManager(DeltaKVCacheTritonManagerV4):
                 buf_slots = self.sparse_layer_raw_slots_map[row, buffer_start : buffer_start + buffer_len].to(torch.int32)
                 if (buf_slots < 0).any():
                     raise RuntimeError("Standalone DeltaKV: missing raw slots in buffer window.")
+                active_physical_slots[
+                    b, sink_len + comp_len : sink_len + comp_len + buffer_len
+                ] = buf_slots
                 raw_src.append(buf_slots)
                 raw_dst.append(local_seq[sink_len + comp_len : sink_len + comp_len + buffer_len])
 
@@ -606,6 +620,7 @@ class DeltaKVStandaloneCacheManager(DeltaKVCacheTritonManagerV4):
 
         value: dict[str, torch.Tensor | int | dict[int, torch.Tensor]] = {
             "active_local_slots": active_local_slots,
+            "active_physical_slots": active_physical_slots,
             "new_context_lens": torch.tensor(new_context_lens_list, device="cuda", dtype=torch.int32),
             "local_req": torch.arange(bsz, device="cuda", dtype=torch.int32),
             "total_temp": total_temp,
@@ -641,6 +656,7 @@ class DeltaKVStandaloneCacheManager(DeltaKVCacheTritonManagerV4):
                 max_s = int(plan["active_local_slots"].shape[1])
                 total_temp = int(plan["total_temp"])
                 active_local_slots = plan["active_local_slots"]
+                active_physical_slots = plan["active_physical_slots"]
                 new_context_lens = plan["new_context_lens"]
                 local_req = plan["local_req"]
                 raw_src_all = plan["raw_src_all"]
@@ -651,7 +667,13 @@ class DeltaKVStandaloneCacheManager(DeltaKVCacheTritonManagerV4):
                 recon_out_all = plan["recon_out_all_i64"]
                 father_slots_by_layer = plan["father_slots_by_layer"]
 
+            use_persistent_direct = (not get_context().is_prefill) and recon_latent_all.numel() == 0
+            if use_persistent_direct:
+                self._deltakv_layer_compute_source[layer_idx] = "persistent"
+                return active_physical_slots, local_req, new_context_lens, None
+
             with profiler.record("deltakv_standalone_reconstruct_alloc_temp"):
+                self._deltakv_layer_compute_source[layer_idx] = "temp"
                 temp_slots = self._allocate_temp_deltakv_full(total_temp).to(torch.int32)
                 active_slots = active_local_slots
 
