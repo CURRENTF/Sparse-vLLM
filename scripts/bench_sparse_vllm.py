@@ -71,6 +71,8 @@ def benchmark_task(method, length, bs, args, results_dict):
         # They can be passed in --hyper_params, but will be overwritten here to keep the benchmark consistent.
         hyper_params = dict(base_hyper_params)
         hyper_params.pop("max_model_len", None)
+        hyper_params.setdefault("max_num_seqs_in_batch", int(bs))
+        hyper_params.setdefault("max_decoding_seqs", int(bs))
         chunk_prefill_size = int(hyper_params.get("chunk_prefill_size", 4096))
         
         from sparsevllm import LLM, SamplingParams
@@ -82,7 +84,14 @@ def benchmark_task(method, length, bs, args, results_dict):
         llm = LLM(args.model_path, **engine_kwargs)
 
         prompt_token_ids = [[100] * length for _ in range(bs)]
-        sampling_params = [SamplingParams(temperature=0.1, ignore_eos=True, max_tokens=args.output_len) for _ in range(bs)]
+        sampling_params = [
+            SamplingParams(
+                temperature=float(args.temperature),
+                ignore_eos=True,
+                max_tokens=args.output_len,
+            )
+            for _ in range(bs)
+        ]
         admission_wave_size = int(getattr(args, "admission_wave_size", 0) or 0)
         staged_admission = 0 < admission_wave_size < bs
 
@@ -255,6 +264,12 @@ def main():
         help="Methods to test (vanilla, streamingllm, attention-sink, snapkv, pyramidkv, omnikv, quest, deltakv, deltakv-triton, deltakv-triton-v2, deltakv-triton-v3, deltakv-triton-v3-offload, deltakv-triton-v3-cuda-offload)",
     )
     parser.add_argument("--output_len", type=int, default=512, help="Output tokens per request")
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.0,
+        help="Sampling temperature for generation. Default 0.0 (greedy) for throughput benchmarking.",
+    )
     parser.add_argument(
         "--admission_wave_size",
         type=int,

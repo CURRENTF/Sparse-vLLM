@@ -291,33 +291,43 @@ class DeltaKVSnapKVCacheManager(DeltaKVStandaloneCacheManager):
                             raise RuntimeError("DeltaKV+SnapKV: father center slot has unknown position.")
                         father_slots_by_layer[l_idx] = father_slots_all
 
-                chunk_tokens = int(os.getenv("SPARSEVLLM_DELTAKV_STANDALONE_RECON_CHUNK_TOKENS", "32768"))
-                chunk_tokens = max(1, chunk_tokens)
+                total_recon = int(recon_latent_all.numel())
+                decompress_chunk_tokens = int(
+                    os.getenv("SPARSEVLLM_DELTAKV_STANDALONE_DECOMPRESS_CHUNK_TOKENS", "524288")
+                )
+                kernel_chunk_tokens = int(
+                    os.getenv(
+                        "SPARSEVLLM_DELTAKV_STANDALONE_KERNEL_CHUNK_TOKENS",
+                        str(decompress_chunk_tokens),
+                    )
+                )
+                decompress_chunk_tokens = max(1, decompress_chunk_tokens)
+                kernel_chunk_tokens = max(1, kernel_chunk_tokens)
 
-                for start in range(0, int(recon_latent_all.numel()), chunk_tokens):
-                    end = min(start + chunk_tokens, int(recon_latent_all.numel()))
+                for start in range(0, total_recon, decompress_chunk_tokens):
+                    end = min(start + decompress_chunk_tokens, total_recon)
                     latent_idx = recon_latent_all[start:end]
-                    pos_idx = recon_pos_all[start:end]
-                    out_idx = recon_out_all[start:end]
 
                     with profiler.record("deltakv_snapkv_reconstruct_decompress"):
                         latent = self.deltakv_latent_cache[l_idx, latent_idx]
                         kv_delta = self.compress_up[l_idx](latent)
 
-                    father_slots = father_slots_all[start:end]
-
-                    with profiler.record("deltakv_snapkv_reconstruct_triton_kernel"):
-                        self._deltakv_reconstruct_writeback_srcdst(
-                            kv_delta=kv_delta,
-                            father_slots=father_slots,
-                            slot_to_pos=self.deltakv_slot_to_pos,
-                            out_slots=out_idx.to(torch.int32),
-                            out_pos=pos_idx,
-                            src_k_cache=k_persist,
-                            src_v_cache=v_persist,
-                            dst_k_cache=k_temp,
-                            dst_v_cache=v_temp,
-                        )
+                    for local_start in range(0, int(kv_delta.shape[0]), kernel_chunk_tokens):
+                        local_end = min(local_start + kernel_chunk_tokens, int(kv_delta.shape[0]))
+                        abs_start = start + local_start
+                        abs_end = start + local_end
+                        with profiler.record("deltakv_snapkv_reconstruct_triton_kernel"):
+                            self._deltakv_reconstruct_writeback_srcdst(
+                                kv_delta=kv_delta[local_start:local_end],
+                                father_slots=father_slots_all[abs_start:abs_end],
+                                slot_to_pos=self.deltakv_slot_to_pos,
+                                out_slots=recon_out_all[abs_start:abs_end].to(torch.int32),
+                                out_pos=recon_pos_all[abs_start:abs_end],
+                                src_k_cache=k_persist,
+                                src_v_cache=v_persist,
+                                dst_k_cache=k_temp,
+                                dst_v_cache=v_temp,
+                            )
 
             return active_slots, local_req, new_context_lens, temp_slots
 
