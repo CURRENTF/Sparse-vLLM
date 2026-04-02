@@ -13,7 +13,7 @@ from sparsevllm.models.qwen3 import Qwen3ForCausalLM
 from sparsevllm.models.deepseek_v2 import DeepSeekV2ForCausalLM
 from sparsevllm.layers.sampler import Sampler
 from sparsevllm.utils.context import set_context, get_context, reset_context
-from sparsevllm.utils.loader import load_model
+from sparsevllm.utils.loader import load_model, sync_deltakv_config_from_checkpoint
 
 from sparsevllm.engine.cache_manager import CacheManager
 from sparsevllm.engine.sparse_controller import SparseController
@@ -72,6 +72,10 @@ class ModelRunner:
         load_model(self.model, config.model, rank=rank, world_size=self.world_size)
         
         self.sampler = Sampler()
+
+        # DeltaKV cache allocation depends on latent dimension / compressor architecture.
+        # Sync those fields from the compressor checkpoint before creating CacheManager.
+        sync_deltakv_config_from_checkpoint(config)
         
         # 初始化 CacheManager (负责 KV Cache + 物理槽位)
         self.cache_manager = CacheManager.create(config, rank, self.world_size)

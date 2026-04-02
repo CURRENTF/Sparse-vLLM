@@ -1,3 +1,4 @@
+import json
 import os
 from glob import glob
 import torch
@@ -127,6 +128,142 @@ def _infer_single_compressor_spec(state_dict: dict[str, torch.Tensor], comp_name
     return inferred_kind, inferred_intermediate, bias, inferred_dtype
 
 
+def _infer_kv_compressed_size(state_dict: dict[str, torch.Tensor]) -> int | None:
+    for _, name, parts, weight in _iter_deltakv_compressor_items(state_dict):
+        comp_token_idx = parts.index(name)
+        sub_parts = parts[comp_token_idx + 1:]
+        if not sub_parts or sub_parts[-1] != "weight":
+            continue
+
+        head = sub_parts[0]
+        if name == "compress_down":
+            if head in ("weight", "2", "w3"):
+                return int(weight.shape[0])
+        else:
+            if head in ("weight", "0", "w12"):
+                return int(weight.shape[1])
+    return None
+
+
+def _resolve_deltakv_checkpoint_files(path: str) -> tuple[str, list[str], bool]:
+    if os.path.isdir(path):
+        files = sorted(glob(os.path.join(path, "*.safetensors")))
+        is_safetensors = len(files) > 0
+        if not is_safetensors:
+            files = sorted(glob(os.path.join(path, "*.bin")) + glob(os.path.join(path, "*.pt")))
+        ckpt_dir = path
+    elif os.path.isfile(path):
+        files = [path]
+        is_safetensors = path.endswith(".safetensors")
+        ckpt_dir = os.path.dirname(path)
+    else:
+        raise FileNotFoundError(f"No compressor weights found in {path}")
+
+    if not files:
+        raise FileNotFoundError(f"No compressor weights found in {path}")
+    return ckpt_dir, files, is_safetensors
+
+
+def _load_deltakv_state_dict(file: str, *, is_safetensors: bool) -> dict[str, torch.Tensor]:
+    if is_safetensors:
+        with safe_open(file, "pt", "cpu") as f:
+            return {k: f.get_tensor(k) for k in f.keys()}
+    return torch.load(file, map_location="cpu")
+
+
+def sync_deltakv_config_from_checkpoint(config) -> bool:
+    path = getattr(config, "deltakv_path", None)
+    method = str(getattr(config, "vllm_sparse_method", "") or "")
+    if not path or not method.startswith("deltakv"):
+        return False
+
+    ckpt_dir, files, is_safetensors = _resolve_deltakv_checkpoint_files(path)
+    updates: dict[str, object] = {}
+    config_json = os.path.join(ckpt_dir, "config.json")
+    if os.path.isfile(config_json):
+        with open(config_json, "r", encoding="utf-8") as f:
+            ckpt_cfg = json.load(f)
+
+        for key in (
+            "kv_compressed_size",
+            "use_nonlinear_compressor",
+            "compressor_intermediate_size",
+            "compressor_linear_bias",
+            "compressor_down_type",
+            "compressor_up_type",
+            "compressor_down_intermediate_size",
+            "compressor_up_intermediate_size",
+        ):
+            if key in ckpt_cfg:
+                updates[key] = ckpt_cfg[key]
+
+        if ckpt_cfg.get("split_kv", False):
+            raise NotImplementedError(
+                "Detected split_kv DeltaKV checkpoint from config.json. "
+                "sparsevllm DeltaKVCacheManager currently expects unified compress_down/compress_up."
+            )
+
+    missing_shape_keys = {
+        "kv_compressed_size",
+        "compressor_down_type",
+        "compressor_up_type",
+        "compressor_down_intermediate_size",
+        "compressor_up_intermediate_size",
+        "compressor_linear_bias",
+        "use_nonlinear_compressor",
+    }
+    need_weight_inference = bool(missing_shape_keys.difference(updates.keys()))
+    state_dict = None
+    if need_weight_inference:
+        for file in files:
+            state_dict = _load_deltakv_state_dict(file, is_safetensors=is_safetensors)
+            if any("compress_down" in key or "compress_up" in key for key in state_dict):
+                break
+            state_dict = None
+
+        if state_dict is not None:
+            kv_compressed_size = _infer_kv_compressed_size(state_dict)
+            down_kind, down_inter, down_bias, _ = _infer_single_compressor_spec(state_dict, "compress_down")
+            up_kind, up_inter, up_bias, _ = _infer_single_compressor_spec(state_dict, "compress_up")
+            if kv_compressed_size is not None and "kv_compressed_size" not in updates:
+                updates["kv_compressed_size"] = kv_compressed_size
+            if down_kind is not None and "compressor_down_type" not in updates:
+                updates["compressor_down_type"] = down_kind
+            if up_kind is not None and "compressor_up_type" not in updates:
+                updates["compressor_up_type"] = up_kind
+            if down_kind is not None and "compressor_down_intermediate_size" not in updates:
+                updates["compressor_down_intermediate_size"] = -1 if down_kind == "linear" else int(down_inter or -1)
+            if up_kind is not None and "compressor_up_intermediate_size" not in updates:
+                updates["compressor_up_intermediate_size"] = -1 if up_kind == "linear" else int(up_inter or -1)
+            if down_kind is not None and up_kind is not None and "use_nonlinear_compressor" not in updates:
+                updates["use_nonlinear_compressor"] = (down_kind != "linear" or up_kind != "linear")
+            if down_bias == up_bias and "compressor_linear_bias" not in updates:
+                updates["compressor_linear_bias"] = bool(down_bias)
+
+            for key in state_dict.keys():
+                if ".k_compress_down." in key or ".v_compress_down." in key or ".k_compress_up." in key or ".v_compress_up." in key:
+                    raise NotImplementedError(
+                        "Detected split_kv compressor checkpoint (k_compress_*/v_compress_*). "
+                        "sparsevllm DeltaKVCacheManager currently expects unified compress_down/compress_up."
+                    )
+
+    changed: dict[str, tuple[object, object]] = {}
+    for key, value in updates.items():
+        if value is None or not hasattr(config, key):
+            continue
+        current = getattr(config, key)
+        if isinstance(value, str):
+            value = value.strip().lower() or "auto"
+        if current != value:
+            setattr(config, key, value)
+            changed[key] = (current, value)
+
+    if changed:
+        changes_str = ", ".join(f"{key}: {old} -> {new}" for key, (old, new) in changed.items())
+        logger.info(f"Synced DeltaKV config from checkpoint {ckpt_dir}: {changes_str}")
+    return bool(changed)
+
+
 def _compressor_signature(mod: nn.Module):
     if isinstance(mod, nn.Linear):
         return "linear", None, (mod.bias is not None)
@@ -222,25 +359,11 @@ def load_deltakv_compressors_to_cache_manager(cache_manager, path: str):
     """
     Load DeltaKV compressor weights into cache manager compressor modules.
     """
-    files = glob(os.path.join(path, "*.safetensors"))
-    is_safetensors = len(files) > 0
-    if not is_safetensors:
-        files = glob(os.path.join(path, "*.bin")) + glob(os.path.join(path, "*.pt"))
-
-    if not files:
-        if os.path.isfile(path):
-            files = [path]
-            is_safetensors = path.endswith(".safetensors")
-        else:
-            raise FileNotFoundError(f"No compressor weights found in {path}")
+    _, files, is_safetensors = _resolve_deltakv_checkpoint_files(path)
 
     loaded_count = 0
     for file in files:
-        if is_safetensors:
-            with safe_open(file, "pt", "cpu") as f:
-                state_dict = {k: f.get_tensor(k) for k in f.keys()}
-        else:
-            state_dict = torch.load(file, map_location="cpu")
+        state_dict = _load_deltakv_state_dict(file, is_safetensors=is_safetensors)
 
         # Detect unsupported split_kv checkpoints early (k_compress_down/v_compress_down).
         for key in state_dict.keys():
