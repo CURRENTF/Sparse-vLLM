@@ -518,31 +518,33 @@ class DeltaKVStandaloneCacheManager(DeltaKVCacheTritonManagerV4):
         del active_compressed_indices, context_lens, chunk_lens
 
         with profiler.record("deltakv_standalone_reconstruct_total"):
-            rows = req_indices.to(torch.long)
-            bsz = int(rows.numel())
-            sink = int(self.config.num_sink_tokens)
+            with profiler.record("deltakv_standalone_reconstruct_plan"):
+                rows = req_indices.to(torch.long)
+                bsz = int(rows.numel())
+                sink = int(self.config.num_sink_tokens)
 
-            plans = []
-            max_s = 0
-            total_temp = 0
-            new_context_lens_list = []
-            for b in range(bsz):
-                row = int(rows[b].item())
-                total_len = int(self.row_seq_lens[row])
-                comp_len = int(self.row_deltakv_compressed_lens[row])
-                sink_len = min(sink, total_len)
-                buffer_start = (sink + comp_len) if total_len > sink else sink_len
-                buffer_len = total_len - buffer_start
-                ctx_len = total_len
-                plans.append((row, total_len, sink_len, comp_len, buffer_start, buffer_len))
-                max_s = max(max_s, ctx_len)
-                total_temp += ctx_len
-                new_context_lens_list.append(ctx_len)
+                plans = []
+                max_s = 0
+                total_temp = 0
+                new_context_lens_list = []
+                for b in range(bsz):
+                    row = int(rows[b].item())
+                    total_len = int(self.row_seq_lens[row])
+                    comp_len = int(self.row_deltakv_compressed_lens[row])
+                    sink_len = min(sink, total_len)
+                    buffer_start = (sink + comp_len) if total_len > sink else sink_len
+                    buffer_len = total_len - buffer_start
+                    ctx_len = total_len
+                    plans.append((row, total_len, sink_len, comp_len, buffer_start, buffer_len))
+                    max_s = max(max_s, ctx_len)
+                    total_temp += ctx_len
+                    new_context_lens_list.append(ctx_len)
 
-            temp_slots = self._allocate_temp_deltakv_full(total_temp).to(torch.int32)
-            active_slots = torch.full((bsz, max_s), -1, device="cuda", dtype=torch.int32)
-            local_req = torch.arange(bsz, device="cuda", dtype=torch.int32)
-            new_context_lens = torch.tensor(new_context_lens_list, device="cuda", dtype=torch.int32)
+            with profiler.record("deltakv_standalone_reconstruct_alloc_temp"):
+                temp_slots = self._allocate_temp_deltakv_full(total_temp).to(torch.int32)
+                active_slots = torch.full((bsz, max_s), -1, device="cuda", dtype=torch.int32)
+                local_req = torch.arange(bsz, device="cuda", dtype=torch.int32)
+                new_context_lens = torch.tensor(new_context_lens_list, device="cuda", dtype=torch.int32)
 
             l_idx = self.deltakv_layer_to_idx[layer_idx]
             k_persist = self.deltakv_full_kv_cache[0, l_idx]
@@ -550,59 +552,62 @@ class DeltaKVStandaloneCacheManager(DeltaKVCacheTritonManagerV4):
             k_temp = self.deltakv_temp_kv_cache[0]
             v_temp = self.deltakv_temp_kv_cache[1]
 
-            raw_src = []
-            raw_dst = []
-            recon_pos = []
-            recon_latent = []
-            recon_out = []
+            with profiler.record("deltakv_standalone_reconstruct_build_views"):
+                raw_src = []
+                raw_dst = []
+                recon_pos = []
+                recon_latent = []
+                recon_out = []
 
-            offset = 0
-            for b, (row, total_len, sink_len, comp_len, buffer_start, buffer_len) in enumerate(plans):
-                out_seq = temp_slots[offset: offset + total_len]
-                offset += total_len
-                active_slots[b, :total_len] = out_seq
+                offset = 0
+                for b, (row, total_len, sink_len, comp_len, buffer_start, buffer_len) in enumerate(plans):
+                    out_seq = temp_slots[offset: offset + total_len]
+                    offset += total_len
+                    active_slots[b, :total_len] = out_seq
 
-                if sink_len > 0:
-                    sink_slots = self.sparse_layer_raw_slots_map[row, :sink_len].to(torch.int32)
-                    if (sink_slots < 0).any():
-                        raise RuntimeError("Standalone DeltaKV: missing raw slots in sink window.")
-                    raw_src.append(sink_slots)
-                    raw_dst.append(out_seq[:sink_len])
+                    if sink_len > 0:
+                        sink_slots = self.sparse_layer_raw_slots_map[row, :sink_len].to(torch.int32)
+                        if (sink_slots < 0).any():
+                            raise RuntimeError("Standalone DeltaKV: missing raw slots in sink window.")
+                        raw_src.append(sink_slots)
+                        raw_dst.append(out_seq[:sink_len])
 
-                if comp_len > 0:
-                    comp_pos = torch.arange(sink, sink + comp_len, device="cuda", dtype=torch.int32)
-                    comp_out = out_seq[sink_len: sink_len + comp_len]
-                    comp_raw_slots = self.sparse_layer_raw_slots_map[row, comp_pos.to(torch.long)].to(torch.int32)
-                    raw_mask = comp_raw_slots >= 0
-                    if raw_mask.any():
-                        raw_src.append(comp_raw_slots[raw_mask])
-                        raw_dst.append(comp_out[raw_mask])
-                    need_mask = ~raw_mask
-                    if need_mask.any():
-                        latent_slots = self.sparse_layer_latent_slots_map[row, comp_pos[need_mask].to(torch.long)].to(torch.int32)
-                        if (latent_slots < 0).any():
-                            raise RuntimeError("Standalone DeltaKV: compressed token has neither raw nor latent slot.")
-                        recon_pos.append(comp_pos[need_mask])
-                        recon_latent.append(latent_slots)
-                        recon_out.append(comp_out[need_mask])
+                    if comp_len > 0:
+                        comp_pos = torch.arange(sink, sink + comp_len, device="cuda", dtype=torch.int32)
+                        comp_out = out_seq[sink_len: sink_len + comp_len]
+                        comp_raw_slots = self.sparse_layer_raw_slots_map[row, comp_pos.to(torch.long)].to(torch.int32)
+                        raw_mask = comp_raw_slots >= 0
+                        if raw_mask.any():
+                            raw_src.append(comp_raw_slots[raw_mask])
+                            raw_dst.append(comp_out[raw_mask])
+                        need_mask = ~raw_mask
+                        if need_mask.any():
+                            latent_slots = self.sparse_layer_latent_slots_map[row, comp_pos[need_mask].to(torch.long)].to(torch.int32)
+                            if (latent_slots < 0).any():
+                                raise RuntimeError("Standalone DeltaKV: compressed token has neither raw nor latent slot.")
+                            recon_pos.append(comp_pos[need_mask])
+                            recon_latent.append(latent_slots)
+                            recon_out.append(comp_out[need_mask])
 
-                if buffer_len > 0:
-                    buf_slots = self.sparse_layer_raw_slots_map[row, buffer_start: buffer_start + buffer_len].to(torch.int32)
-                    if (buf_slots < 0).any():
-                        raise RuntimeError("Standalone DeltaKV: missing raw slots in buffer window.")
-                    raw_src.append(buf_slots)
-                    raw_dst.append(out_seq[sink_len + comp_len: sink_len + comp_len + buffer_len])
+                    if buffer_len > 0:
+                        buf_slots = self.sparse_layer_raw_slots_map[row, buffer_start: buffer_start + buffer_len].to(torch.int32)
+                        if (buf_slots < 0).any():
+                            raise RuntimeError("Standalone DeltaKV: missing raw slots in buffer window.")
+                        raw_src.append(buf_slots)
+                        raw_dst.append(out_seq[sink_len + comp_len: sink_len + comp_len + buffer_len])
 
             if raw_src:
-                raw_src_all = torch.cat(raw_src, dim=0).to(torch.long)
-                raw_dst_all = torch.cat(raw_dst, dim=0).to(torch.long)
-                k_temp[raw_dst_all] = k_persist[raw_src_all]
-                v_temp[raw_dst_all] = v_persist[raw_src_all]
+                with profiler.record("deltakv_standalone_reconstruct_raw_copy"):
+                    raw_src_all = torch.cat(raw_src, dim=0).to(torch.long)
+                    raw_dst_all = torch.cat(raw_dst, dim=0).to(torch.long)
+                    k_temp[raw_dst_all] = k_persist[raw_src_all]
+                    v_temp[raw_dst_all] = v_persist[raw_src_all]
 
             if recon_latent:
-                recon_pos_all = torch.cat(recon_pos, dim=0).to(torch.int32)
-                recon_latent_all = torch.cat(recon_latent, dim=0).to(torch.int32)
-                recon_out_all = torch.cat(recon_out, dim=0).to(torch.long)
+                with profiler.record("deltakv_standalone_reconstruct_concat"):
+                    recon_pos_all = torch.cat(recon_pos, dim=0).to(torch.int32)
+                    recon_latent_all = torch.cat(recon_latent, dim=0).to(torch.int32)
+                    recon_out_all = torch.cat(recon_out, dim=0).to(torch.long)
 
                 chunk_tokens = int(os.getenv("SPARSEVLLM_DELTAKV_STANDALONE_RECON_CHUNK_TOKENS", "32768"))
                 chunk_tokens = max(1, chunk_tokens)
@@ -613,25 +618,28 @@ class DeltaKVStandaloneCacheManager(DeltaKVCacheTritonManagerV4):
                     pos_idx = recon_pos_all[start:end]
                     out_idx = recon_out_all[start:end]
 
-                    latent = self.deltakv_latent_cache[l_idx, latent_idx]
-                    kv_delta = self.compress_up[l_idx](latent)
+                    with profiler.record("deltakv_standalone_reconstruct_decompress"):
+                        latent = self.deltakv_latent_cache[l_idx, latent_idx]
+                        kv_delta = self.compress_up[l_idx](latent)
 
-                    father_slots = self.deltakv_latent_to_full_slots[l_idx, latent_idx].to(torch.int32)
-                    if (father_slots < 0).any():
-                        raise RuntimeError("Standalone DeltaKV: missing father slots for reconstruction.")
+                    with profiler.record("deltakv_standalone_reconstruct_father"):
+                        father_slots = self.deltakv_latent_to_full_slots[l_idx, latent_idx].to(torch.int32)
+                        if (father_slots < 0).any():
+                            raise RuntimeError("Standalone DeltaKV: missing father slots for reconstruction.")
 
-                    if (self.deltakv_slot_to_pos[father_slots] < 0).any():
-                        raise RuntimeError("Standalone DeltaKV: father center slot has unknown position.")
-                    self._deltakv_reconstruct_writeback_srcdst(
-                        kv_delta=kv_delta,
-                        father_slots=father_slots,
-                        slot_to_pos=self.deltakv_slot_to_pos,
-                        out_slots=out_idx.to(torch.int32),
-                        out_pos=pos_idx,
-                        src_k_cache=k_persist,
-                        src_v_cache=v_persist,
-                        dst_k_cache=k_temp,
-                        dst_v_cache=v_temp,
-                    )
+                        if (self.deltakv_slot_to_pos[father_slots] < 0).any():
+                            raise RuntimeError("Standalone DeltaKV: father center slot has unknown position.")
+                    with profiler.record("deltakv_standalone_reconstruct_triton_kernel"):
+                        self._deltakv_reconstruct_writeback_srcdst(
+                            kv_delta=kv_delta,
+                            father_slots=father_slots,
+                            slot_to_pos=self.deltakv_slot_to_pos,
+                            out_slots=out_idx.to(torch.int32),
+                            out_pos=pos_idx,
+                            src_k_cache=k_persist,
+                            src_v_cache=v_persist,
+                            dst_k_cache=k_temp,
+                            dst_v_cache=v_temp,
+                        )
 
             return active_slots, local_req, new_context_lens, temp_slots
