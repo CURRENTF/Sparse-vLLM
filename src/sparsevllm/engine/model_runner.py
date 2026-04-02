@@ -150,7 +150,8 @@ class ModelRunner:
 
     def load_deltakv_compressors(self):
         """加载 DeltaKV 压缩器权重"""
-        if self.config.vllm_sparse_method != 'deltakv' or self.config.deltakv_path is None:
+        method = str(self.config.vllm_sparse_method or "")
+        if not method.startswith('deltakv') or self.config.deltakv_path is None:
             return
         
         logger.info(f"Loading DeltaKV compressors from {self.config.deltakv_path}")
@@ -170,7 +171,15 @@ class ModelRunner:
                 logger.info("model_runner.free_slots seq_id={} after={}", seq_id, after)
 
     def _long_text_threshold(self, is_prefill: bool) -> int:
-        if self.config.vllm_sparse_method in ("streamingllm", "attention-sink", "attention_sink"):
+        if self.config.vllm_sparse_method == "deltakv-snapkv":
+            base = (
+                self.config.num_sink_tokens
+                + self.config.num_recent_tokens
+                + self.config.snapkv_window_size
+            )
+        elif self.config.vllm_sparse_method == "deltakv-standalone":
+            base = self.config.num_sink_tokens + self.config.num_recent_tokens
+        elif self.config.vllm_sparse_method in ("streamingllm", "attention-sink", "attention_sink"):
             base = self.config.num_sink_tokens + self.config.num_recent_tokens
         else:
             base = (

@@ -178,8 +178,24 @@ class LLMEngine:
         logger.info("Warming up the engine...")
         
         # 预热只需触发算子编译，使用固定短长度即可
-        warmup_len = self.config.num_sink_tokens + self.config.num_top_tokens_in_prefill\
-                     + self.config.num_recent_tokens + self.config.chunk_prefill_size + 1024
+        if self.config.vllm_sparse_method == "deltakv-snapkv":
+            warmup_len = (
+                self.config.num_sink_tokens
+                + self.config.num_recent_tokens
+                + self.config.snapkv_window_size
+                + self.config.chunk_prefill_size
+                + 1024
+            )
+        elif self.config.vllm_sparse_method == "deltakv-standalone":
+            warmup_len = (
+                self.config.num_sink_tokens
+                + self.config.num_recent_tokens
+                + self.config.chunk_prefill_size
+                + 1024
+            )
+        else:
+            warmup_len = self.config.num_sink_tokens + self.config.num_top_tokens_in_prefill\
+                         + self.config.num_recent_tokens + self.config.chunk_prefill_size + 1024
         # DeepSeek MLA paths often use large chunk_prefill_size to keep prefill non-chunked; keep warmup short.
         if getattr(getattr(self.config, "hf_config", None), "model_type", "") in ("deepseek_v32", "deepseek_v2"):
             warmup_len = min(1024, int(self.config.chunk_prefill_size))

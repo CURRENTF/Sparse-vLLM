@@ -44,7 +44,15 @@ class Scheduler:
         Prefill: based on prompt length + chunk prefill size.
         Decode: based on current total tokens (prompt + generated), without chunk size.
         """
-        if self.config.vllm_sparse_method in ("streamingllm", "attention-sink", "attention_sink"):
+        if self.config.vllm_sparse_method == "deltakv-snapkv":
+            base = (
+                self.num_sink_tokens
+                + self.num_recent_tokens
+                + self.config.snapkv_window_size
+            )
+        elif self.config.vllm_sparse_method == "deltakv-standalone":
+            base = self.num_sink_tokens + self.num_recent_tokens
+        elif self.config.vllm_sparse_method in ("streamingllm", "attention-sink", "attention_sink"):
             base = self.num_sink_tokens + self.num_recent_tokens
         else:
             base = self.num_sink_tokens + self.num_top_tokens + self.num_recent_tokens

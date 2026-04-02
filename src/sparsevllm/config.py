@@ -25,7 +25,7 @@ class Config:
     num_kvcache_slots: int | list = -1
 
     # Sparse Attention Config
-    vllm_sparse_method: str = ""  # "", "streamingllm", "attention-sink", "attention_sink", "snapkv", "omnikv", "quest", "deltakv", "deltakv-triton", "deltakv-triton-v2", "deltakv-triton-v3", "deltakv-triton-v4", "deltakv-triton-v3-offload", "deltakv-triton-v3-cuda-offload", "pyramidkv", "dsa"
+    vllm_sparse_method: str = ""  # "", "streamingllm", "attention-sink", "attention_sink", "snapkv", "omnikv", "quest", "deltakv", "deltakv-triton", "deltakv-triton-v2", "deltakv-triton-v3", "deltakv-triton-v4", "deltakv-triton-v3-offload", "deltakv-triton-v3-cuda-offload", "deltakv-standalone", "deltakv-snapkv", "pyramidkv", "dsa"
 
     # General Sparse Config
     num_sink_tokens: int = 64
@@ -159,7 +159,8 @@ class Config:
             logger.warning('max_num_seqs_in_batch 过大或许会占用太多显存')
 
         if isinstance(self.full_attn_layers, str):
-            self.full_attn_layers = [int(x) for x in self.full_attn_layers.split(",")]
+            layers = self.full_attn_layers.strip()
+            self.full_attn_layers = [] if not layers else [int(x) for x in layers.split(",")]
 
         if self.quest_chunk_size <= 0:
             raise ValueError("quest_chunk_size 必须 > 0")
@@ -176,12 +177,17 @@ class Config:
             v = str(v).strip().lower()
             setattr(self, attr, v if v else "auto")
 
-        if self.vllm_sparse_method == 'deltakv' and self.deltakv_path is None:
+        if isinstance(self.vllm_sparse_method, str) and self.vllm_sparse_method.startswith('deltakv') and self.deltakv_path is None:
             # 尝试在模型目录下找 deltakv_compressor.pt 或者类似文件
             # 或者让用户必须指定
             logger.warning("DeltaKV mode enabled but deltakv_path is not specified.")
 
-        if self.obs_layer_ids is None:
+        if self.vllm_sparse_method in ("deltakv-standalone", "deltakv-snapkv"):
+            # Standalone DeltaKV uses all layers uniformly and does not rely on
+            # OmniKV-style observation/full-layer routing.
+            self.full_attn_layers = []
+            self.obs_layer_ids = []
+        elif self.obs_layer_ids is None:
             self.obs_layer_ids = []
             for l in self.full_attn_layers:
                 if (l + 1) not in self.full_attn_layers:

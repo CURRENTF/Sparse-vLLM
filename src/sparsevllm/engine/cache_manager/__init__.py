@@ -18,6 +18,8 @@ __all__ = [
     "DeltaKVCacheTritonManagerV4",
     "DeltaKVCacheTritonManagerV3WithOffload",
     "DeltaKVCacheTritonManagerV3WithCUDAOffload",
+    "DeltaKVStandaloneCacheManager",
+    "DeltaKVSnapKVCacheManager",
 ]
 
 
@@ -59,5 +61,13 @@ def __getattr__(name: str):
         from . import deltakv as _deltakv
 
         return getattr(_deltakv, name)
+    if name == "DeltaKVStandaloneCacheManager":
+        from .deltakv_standalone import DeltaKVStandaloneCacheManager
+
+        return DeltaKVStandaloneCacheManager
+    if name == "DeltaKVSnapKVCacheManager":
+        from .deltakv_snapkv import DeltaKVSnapKVCacheManager
+
+        return DeltaKVSnapKVCacheManager
 
     raise AttributeError(name)

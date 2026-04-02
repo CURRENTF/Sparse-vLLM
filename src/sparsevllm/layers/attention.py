@@ -67,12 +67,17 @@ class Attention(nn.Module):
         context = get_context()
         cache_manager = context.cache_manager
         sparse_controller: SparseController = context.sparse_controller
-        k_cache, v_cache, slot_mapping = cache_manager.get_layer_store_view(context.now_layer_idx)
+        store_k_cache, store_v_cache, slot_mapping = cache_manager.get_layer_store_view(context.now_layer_idx)
 
         # 1. 写入 KV Cache (物理行为)
         # 无论是 DeltaKV 还是全量/SnapKV，均先将当前 KV 写入物理槽位 (对于 DeltaKV，是写入 Base Pool 作为 Recent)
-        store_kvcache(k, v, k_cache, v_cache, slot_mapping)
+        store_kvcache(k, v, store_k_cache, store_v_cache, slot_mapping)
         cache_manager.on_kv_stored(context.now_layer_idx, k, slot_mapping)
+
+        try:
+            k_cache, v_cache = cache_manager.get_layer_compute_tensors(context.now_layer_idx, sparse_controller)
+        except NotImplementedError:
+            k_cache, v_cache = cache_manager.get_layer_kv_cache(context.now_layer_idx)
 
         # 2. 获取逻辑视图
         layer_active_slots, layer_active_indices, layer_req_indices, layer_context_lens, layer_attn_score, deltakv_temp_slots = \

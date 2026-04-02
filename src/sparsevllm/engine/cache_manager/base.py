@@ -111,6 +111,14 @@ class CacheManager(ABC):
             from .deltakv import DeltaKVCacheTritonManagerV4
 
             return DeltaKVCacheTritonManagerV4(config, rank, world_size)
+        if sparse_method == "deltakv-standalone":
+            from .deltakv_standalone import DeltaKVStandaloneCacheManager
+
+            return DeltaKVStandaloneCacheManager(config, rank, world_size)
+        if sparse_method == "deltakv-snapkv":
+            from .deltakv_snapkv import DeltaKVSnapKVCacheManager
+
+            return DeltaKVSnapKVCacheManager(config, rank, world_size)
         if sparse_method in ("deltakv-triton-v3-offload", "deltakv-triton-v3-with-offload"):
             # Run DeltaKV logic, with Triton for reconstruction + eviction + blockwise L2-topk,
             # and offload latent cache to CPU.

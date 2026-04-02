@@ -33,6 +33,10 @@ class SparseController:
     """
     def __init__(self, config: Config, cache_manager: CacheManager):
         self.sparse_method = config.vllm_sparse_method
+        self.is_deltakv_family = isinstance(self.sparse_method, str) and self.sparse_method.startswith('deltakv')
+        self.is_deltakv_standalone = self.sparse_method == 'deltakv-standalone'
+        self.is_deltakv_snapkv = self.sparse_method == 'deltakv-snapkv'
+        self.is_deltakv_standalone_like = self.sparse_method in ('deltakv-standalone', 'deltakv-snapkv')
         
         self.config = config
         self.cache_manager = cache_manager
@@ -104,14 +108,14 @@ class SparseController:
     @torch.no_grad()
     def post_forward(self, seqs: list[Sequence], is_prefill: bool):
         """持久化压缩 (如 SnapKV / DeltaKV)"""
-        if get_context().is_long_text is False and self.sparse_method != 'deltakv':
+        if get_context().is_long_text is False and not self.is_deltakv_family:
             return
 
         if is_prefill:
             self.on_every_chunk_prefill_end(seqs)
 
         # Decode 阶段如果 Recent Buffer 溢出也需要压缩 (对于 DeltaKV)
-        if not is_prefill and self.sparse_method == 'deltakv':
+        if not is_prefill and self.is_deltakv_family:
              self._deltakv_eviction(seqs)
         if not is_prefill and self.sparse_method in ('snapkv', 'pyramidkv'):
             self._snapkv_decode_eviction(seqs)
@@ -120,13 +124,16 @@ class SparseController:
 
     @torch.no_grad()
     def on_every_chunk_prefill_end(self, seqs: list[Sequence]):
-        if get_context().is_long_text is False and self.sparse_method != 'deltakv':
+        if get_context().is_long_text is False and not self.is_deltakv_family:
             return
 
         # DeltaKV: Always try to compress incrementally (to save memory during long prefill)
-        if self.sparse_method == 'deltakv':
-            assert self.config.chunk_prefill_accel_omnikv
+        if self.is_deltakv_family:
+            if not self.is_deltakv_standalone_like:
+                assert self.config.chunk_prefill_accel_omnikv
             self._deltakv_eviction(seqs)
+            if self.is_deltakv_snapkv and any(seq.is_last_chunk_prefill for seq in seqs):
+                self._deltakv_snapkv_finalize(seqs)
             return
 
         # SnapKV / PyramidKV: Only evict at the end of prefill
@@ -186,6 +193,24 @@ class SparseController:
                 temp_slots if sparse_state.deltakv_free_temp_slots else None,
             )
 
+        if self.is_deltakv_standalone_like:
+            active_slots, local_req_indices, new_context_lens, temp_slots = self.cache_manager.deltakv_reconstruct(
+                layer_idx=layer_idx,
+                active_compressed_indices=None,
+                context_lens=sparse_state.context_lens,
+                req_indices=sparse_state.global_req_indices,
+                chunk_lens=None,
+            )
+            attn_score = sparse_state.attn_score if self.is_deltakv_snapkv else None
+            return (
+                active_slots,
+                None,
+                local_req_indices,
+                new_context_lens,
+                attn_score,
+                temp_slots,
+            )
+
         if self.sparse_method == 'omnikv':
             if sparse_state.active_slots is not None:
                 active_slots = sparse_state.active_slots
@@ -207,7 +232,7 @@ class SparseController:
 
     def on_layer_end(self, layer_idx: int, context):
         """每一层结束后的动态策略 (如 OmniKV / DeltaKV)"""
-        if get_context().is_long_text is False and self.sparse_method != 'deltakv':
+        if get_context().is_long_text is False and not self.is_deltakv_family:
             return
 
         if self.sparse_method not in ('omnikv', 'deltakv'):
@@ -241,7 +266,7 @@ class SparseController:
 
     @torch.no_grad()
     def _deltakv_eviction(self, seqs: list[Sequence]):
-        assert get_context().is_long_text or self.sparse_method == 'deltakv'
+        assert get_context().is_long_text or self.is_deltakv_family
         self.cache_manager.deltakv_evict(seqs)
 
     @torch.no_grad()
@@ -254,7 +279,7 @@ class SparseController:
         context_lens: torch.Tensor,
         req_indices: torch.Tensor
     ):
-        assert get_context().is_long_text or self.sparse_method == 'deltakv'
+        assert get_context().is_long_text or self.is_deltakv_family
         return self.cache_manager.deltakv_reconstruct(
             layer_idx=layer_idx,
             active_compressed_indices=active_indices,
@@ -392,7 +417,7 @@ class SparseController:
         return keep_indices
 
     def _update_dynamic_omnikv_indices(self, obs_layer_idx, target_layers):
-        assert get_context().is_long_text or self.sparse_method == 'deltakv'
+        assert get_context().is_long_text or self.is_deltakv_family
 
         with profiler.record("sparse_update_dynamic_indices"):
             ctx = get_context()
@@ -480,8 +505,36 @@ class SparseController:
                     target_sparse_state.deltakv_free_temp_slots = (l_idx == target_layers[-1])
             else:
                 raise ValueError
+
+    @torch.no_grad()
+    def _deltakv_snapkv_finalize(self, seqs: list[Sequence]):
+        finalize_row_idx = [i for i, seq in enumerate(seqs) if seq.is_last_chunk_prefill]
+        if not finalize_row_idx:
+            return
+        finalize_rows = torch.tensor(finalize_row_idx, device="cuda", dtype=torch.long)
+        finalize_seqs = [seqs[i] for i in finalize_row_idx]
+
+        layer_scores = []
+        for layer_idx in range(self.num_layers):
+            state = self.layer_batch_sparse_states[layer_idx]
+            attn_scores = state.attn_score
+            if attn_scores is None:
+                continue
+            if attn_scores.dim() == 3:
+                attn_scores = attn_scores.max(dim=1).values
+            layer_scores.append(attn_scores.index_select(0, finalize_rows))
+
+        if not layer_scores:
+            return
+
+        combined_scores = torch.stack(layer_scores, dim=0).max(dim=0).values
+        self.cache_manager.deltakv_snapkv_finalize_static_prune(finalize_seqs, combined_scores)
     
     def _needs_attn_score(self, layer_idx: int, is_prefill: bool, seqs: list[Sequence]) -> bool:
+        if self.sparse_method == 'deltakv-snapkv':
+            if not is_prefill or get_context().is_long_text is False:
+                return False
+            return any(seq.is_last_chunk_prefill for seq in seqs)
         if self.sparse_method in ('omnikv', 'deltakv') and layer_idx in self.obs_layer_ids:
             if is_prefill and not self.config.chunk_prefill_accel_omnikv:
                 return False

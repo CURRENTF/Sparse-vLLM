@@ -94,7 +94,6 @@ src/sparsevllm/triton_kernel/ppl_int4kv_flash_decoding.py
 src/sparsevllm/triton_kernel/ppl_int8kv_flash_decoding.py
 src/sparsevllm/triton_kernel/ppl_quant_copy_kv.py
 src/sparsevllm/triton_kernel/quant.py
-src/sparsevllm/triton_kernel/rekv_kernels.py
 src/sparsevllm/triton_kernel/rmsnorm.py
 src/sparsevllm/triton_kernel/rotary_emb.py
 src/sparsevllm/triton_kernel/silu_and_mul.py
