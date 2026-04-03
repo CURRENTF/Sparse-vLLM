@@ -68,7 +68,7 @@ def export_data():
 
         run_data.append({
             'kv_size': config.get("kv_compressed_size"),
-            'seq_chunk': config.get("seq_chunk_size"),
+            'seq_chunk': config.get("k_neighbors", config.get("seq_chunk_size")),
             'inter_size': config.get("compressor_intermediate_size"),
             'cluster_ratio': config.get("cluster_ratio"),
             'deltakv_path': deltakv_path,
@@ -133,7 +133,7 @@ def run_benchmarks():
         hp = {
             "gpu_memory_utilization": 0.9,
             "kv_compressed_size": int(row['kv_size']),
-            "deltakv_k_neighbors": int(row['seq_chunk']),  # 推理引擎中的 k_neighbors 对应训练时的 seq_chunk_size
+            "deltakv_k_neighbors": int(row['seq_chunk']),
             "compressor_intermediate_size": int(row['inter_size']),
             "cluster_ratio": float(row['cluster_ratio']),
             "num_top_tokens": 2048,

@@ -92,7 +92,7 @@ class Qwen2AttnKVClusterCompress(Qwen2Attention):
 
         # 5. 选取聚类中心并生成参考基
         # 选取最相似的 k 个聚类中心并采用 加权/直接 平均作为参考基
-        k = max(1, self.config.seq_chunk_size)
+        k = self.config.get_cluster_k_neighbors()
         topk_scores, topk_indices = torch.topk(scores, k=min(k, num_prototypes), dim=-1)
         # shape -> bs, seq_len_rem, k
 

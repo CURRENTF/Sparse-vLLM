@@ -29,6 +29,7 @@ def main(
     model_type: str = 'parallel',  # 'parallel', 'sequential', 'e2e' or 'cluster_e2e'
     kv_compressed_size: int = 64,
     seq_chunk_size: int = 1,
+    k_neighbors: int = None,
     layer_chunk_size: int = 1,
     recon_mode: str = 'delta_in_latent',  # delta_in_origin or delta_in_latent
     ref_mode: str = 'last',  # last or avg or first
@@ -139,6 +140,7 @@ def main(
     config.set_extra_args(
         kv_compressed_size=kv_compressed_size,
         seq_chunk_size=seq_chunk_size,
+        k_neighbors=k_neighbors,
         layer_chunk_size=layer_chunk_size,
         recon_mode=recon_mode,
         ref_mode=ref_mode,
@@ -156,8 +158,10 @@ def main(
         cluster_soft_assignment=cluster_soft_assignment,
         cluster_ratio=cluster_ratio,
         split_kv=split_kv,
+        use_cluster=model_type in ['cluster_e2e', 'cluster_e2e_big'],
         use_compression=True,
     )
+    config.finalize_cluster_args(warn_on_legacy_k_neighbors=False)
     print(f'[Config]\n{config=}')
 
     # --- 2. 加载模型 ---

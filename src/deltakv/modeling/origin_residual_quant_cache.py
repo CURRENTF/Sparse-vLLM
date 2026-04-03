@@ -231,7 +231,7 @@ class OriginResidualQuantClusterCompressedKVCache(ClusterCompressedKVCache):
         full_mask = torch.cat([mask_existing, mask_new], dim=1)
         scores = scores.masked_fill(~full_mask.unsqueeze(0), float("-inf"))
 
-        k = max(1, self.config.seq_chunk_size)
+        k = self.config.get_cluster_k_neighbors()
         _, topk_indices = torch.topk(scores, k=min(k, all_centers.shape[1]), dim=-1)
 
         indices = topk_indices.view(bs, -1)[:, :, None].expand(-1, -1, kv_dim)

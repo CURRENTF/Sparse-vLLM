@@ -133,7 +133,8 @@ class CompressedKVCache(BaseCache):
         if config.use_compression:
             assert config.recon_mode == 'delta_in_latent', "TODO: 完成delta_in_origin的压缩（或者不需要？）"
             assert config.layer_chunk_size == 1, "TODO: 完成层压缩"
-            assert config.ref_mode == 'avg'
+            if not getattr(config, "use_cluster", False):
+                assert config.ref_mode == 'avg'
 
     def __len__(self):
         """
@@ -539,7 +540,7 @@ class ClusterCompressedKVCache(CompressedKVCache):
         scores = scores.masked_fill(~full_mask.unsqueeze(0), float('-inf'))
 
         # 4. 选取 Top-K 中心
-        k = max(1, self.config.seq_chunk_size)
+        k = self.config.get_cluster_k_neighbors()
         topk_scores, topk_indices = torch.topk(scores, k=min(k, all_centers.shape[1]), dim=-1)
 
         # 5. 计算参考基 (均值)

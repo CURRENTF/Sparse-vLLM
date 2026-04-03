@@ -1,7 +1,7 @@
 from transformers.models.qwen2.modeling_qwen2 import Qwen2Config
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.models.llama.modeling_llama import LlamaConfig
-from deltakv.utils.log import logger
+from deltakv.utils.log import logger, log_once
 
 
 def parse_full_attn_layers(full_attn_layers):
@@ -22,6 +22,7 @@ class CustomConfigMixin:
         self,
         kv_compressed_size=128,
         seq_chunk_size=1,
+        k_neighbors=None,
         layer_chunk_size=1,
         recon_mode='delta_in_latent',
         ref_mode='avg',
@@ -71,6 +72,7 @@ class CustomConfigMixin:
         # 这个地方好像也只能设置一下默认值了，主要目的是有语法提示。
         self.kv_compressed_size = kv_compressed_size
         self.seq_chunk_size = seq_chunk_size
+        self.k_neighbors = k_neighbors
         self.layer_chunk_size = layer_chunk_size
         self.recon_mode = recon_mode
         self.ref_mode = ref_mode
@@ -115,6 +117,26 @@ class CustomConfigMixin:
         # 调用 MRO 中的下一个 __init__ (Qwen2Config 或 LlamaConfig)
         super().__init__(**kwargs)
 
+    def finalize_cluster_args(self, *, warn_on_legacy_k_neighbors: bool = False):
+        if not getattr(self, "use_cluster", False):
+            return
+
+        if getattr(self, "k_neighbors", None) is None:
+            legacy_k = getattr(self, "seq_chunk_size", None)
+            if legacy_k is None:
+                legacy_k = 1
+            self.k_neighbors = int(legacy_k)
+            if warn_on_legacy_k_neighbors:
+                log_once(
+                    f"Cluster config missing `k_neighbors`; falling back to legacy "
+                    f"`seq_chunk_size={self.k_neighbors}`. Please pass `k_neighbors` explicitly.",
+                    "WARNING",
+                )
+
+    def get_cluster_k_neighbors(self) -> int:
+        self.finalize_cluster_args(warn_on_legacy_k_neighbors=False)
+        return max(1, int(self.k_neighbors))
+
     def set_extra_args(self, **kwargs):
         legacy_keys = {
             "use_nonlinear_compressor",
@@ -154,6 +176,7 @@ class CustomConfigMixin:
 
     def set_infer_args(self, **kwargs):
         self.set_extra_args(**kwargs)
+        self.finalize_cluster_args(warn_on_legacy_k_neighbors="k_neighbors" not in kwargs)
 
 
 class KVQwen2Config(CustomConfigMixin, Qwen2Config):
