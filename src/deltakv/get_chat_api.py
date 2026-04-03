@@ -5,6 +5,7 @@ from typing import Union, List
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 from deltakv.configs.model_config_cls import KVQwen2Config, KVQwen3Config, KVLlamaConfig, parse_full_attn_layers
 from deltakv.baseline_adapters import load_omnikv_model, load_kivi_model
+from deltakv.quantization import build_model_load_kwargs, restore_modules_to_dtype
 from safetensors.torch import load_file
 
 
@@ -239,8 +240,24 @@ def get_generate_api(model_path: str, infer_config: dict, compressor_path: str,
             raise ValueError('sparse vllm 不支持 return_model=True')
         return generate
 
+    def _prepare_model_load(default_torch_dtype: torch.dtype):
+        runtime_infer_config, model_load_kwargs, target_torch_dtype = build_model_load_kwargs(
+            infer_config,
+            default_torch_dtype=default_torch_dtype,
+        )
+        quantization_config = model_load_kwargs.get("quantization_config")
+        if quantization_config is not None:
+            quant_bits = "4-bit" if quantization_config.load_in_4bit else "8-bit"
+            print(
+                f"[Quantization] Using {quant_bits} base-model quantization "
+                f"with torch_dtype={target_torch_dtype} "
+                f"and skip_modules={quantization_config.llm_int8_skip_modules}"
+            )
+        return runtime_infer_config, model_load_kwargs, target_torch_dtype
+
     assert use_cache, '还要做padding才能用训练代码推理'
     if model_cls == 'deltakv':
+        runtime_infer_config, model_load_kwargs, target_torch_dtype = _prepare_model_load(torch.bfloat16)
         base_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
         if base_config.model_type == 'qwen2':
             if use_cache:
@@ -264,13 +281,14 @@ def get_generate_api(model_path: str, infer_config: dict, compressor_path: str,
             config = config_cls.from_pretrained(compressor_path)
         else:
             config = config_cls.from_pretrained(model_path)
-        config.set_infer_args(**infer_config)
+        config.set_infer_args(**runtime_infer_config)
         model = KVModel.from_pretrained(
             model_path,
             config=config,
-            torch_dtype=torch.bfloat16,
+            torch_dtype=target_torch_dtype,
             device_map=cuda_device,
             attn_implementation="flash_attention_2",
+            **model_load_kwargs,
         )
         if compressor_path is not None:
             load_device = f'cuda:{cuda_device}' if isinstance(cuda_device, int) else 'cpu'
@@ -278,8 +296,11 @@ def get_generate_api(model_path: str, infer_config: dict, compressor_path: str,
             _, unexpected = model.load_state_dict(comp_state_dict, strict=False)
             assert len(unexpected) == 0, f'compressor 加载有问题: {unexpected}'
             del comp_state_dict
+        if model_load_kwargs:
+            restore_modules_to_dtype(model, target_torch_dtype)
 
     elif model_cls == 'full_deltakv':
+        runtime_infer_config, model_load_kwargs, target_torch_dtype = _prepare_model_load(torch.bfloat16)
         base_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
         if base_config.model_type == 'qwen2':
             from deltakv.modeling.qwen2.qwen2_full_deltakv_compress_inference import Qwen2FullKVCompress as KVModel
@@ -297,13 +318,14 @@ def get_generate_api(model_path: str, infer_config: dict, compressor_path: str,
             config = config_cls.from_pretrained(compressor_path)
         else:
             config = config_cls.from_pretrained(model_path)
-        config.set_infer_args(**infer_config)
+        config.set_infer_args(**runtime_infer_config)
         model = KVModel.from_pretrained(
             model_path,
             config=config,
-            torch_dtype=torch.bfloat16,
+            torch_dtype=target_torch_dtype,
             device_map=cuda_device,
             attn_implementation="flash_attention_2",
+            **model_load_kwargs,
         )
         if compressor_path is not None:
             load_device = f'cuda:{cuda_device}' if isinstance(cuda_device, int) else 'cpu'
@@ -311,8 +333,11 @@ def get_generate_api(model_path: str, infer_config: dict, compressor_path: str,
             _, unexpected = model.load_state_dict(comp_state_dict, strict=False)
             assert len(unexpected) == 0, f'compressor 加载有问题: {unexpected}'
             del comp_state_dict
+        if model_load_kwargs:
+            restore_modules_to_dtype(model, target_torch_dtype)
 
     elif model_cls == 'origin_residual_quant':
+        runtime_infer_config, model_load_kwargs, target_torch_dtype = _prepare_model_load(torch.bfloat16)
         base_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
         if base_config.model_type == 'qwen2':
             from deltakv.modeling.qwen2.qwen2_origin_residual_quant_inference import Qwen2OriginResidualQuant as KVModel
@@ -330,13 +355,14 @@ def get_generate_api(model_path: str, infer_config: dict, compressor_path: str,
             config = config_cls.from_pretrained(compressor_path)
         else:
             config = config_cls.from_pretrained(model_path)
-        config.set_infer_args(**infer_config)
+        config.set_infer_args(**runtime_infer_config)
         model = KVModel.from_pretrained(
             model_path,
             config=config,
-            torch_dtype=torch.bfloat16,
+            torch_dtype=target_torch_dtype,
             device_map=cuda_device,
             attn_implementation="flash_attention_2",
+            **model_load_kwargs,
         )
         if compressor_path is not None:
             load_device = f'cuda:{cuda_device}' if isinstance(cuda_device, int) else 'cpu'
@@ -344,8 +370,11 @@ def get_generate_api(model_path: str, infer_config: dict, compressor_path: str,
             _, unexpected = model.load_state_dict(comp_state_dict, strict=False)
             assert len(unexpected) == 0, f'compressor 加载有问题: {unexpected}'
             del comp_state_dict
+        if model_load_kwargs:
+            restore_modules_to_dtype(model, target_torch_dtype)
 
     elif model_cls == 'all_origin_residual_quant':
+        runtime_infer_config, model_load_kwargs, target_torch_dtype = _prepare_model_load(torch.bfloat16)
         base_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
         if base_config.model_type == 'qwen2':
             from deltakv.modeling.qwen2.qwen2_all_origin_residual_quant_inference import Qwen2AllOriginResidualQuant as KVModel
@@ -363,13 +392,14 @@ def get_generate_api(model_path: str, infer_config: dict, compressor_path: str,
             config = config_cls.from_pretrained(compressor_path)
         else:
             config = config_cls.from_pretrained(model_path)
-        config.set_infer_args(**infer_config)
+        config.set_infer_args(**runtime_infer_config)
         model = KVModel.from_pretrained(
             model_path,
             config=config,
-            torch_dtype=torch.bfloat16,
+            torch_dtype=target_torch_dtype,
             device_map=cuda_device,
             attn_implementation="flash_attention_2",
+            **model_load_kwargs,
         )
         if compressor_path is not None:
             load_device = f'cuda:{cuda_device}' if isinstance(cuda_device, int) else 'cpu'
@@ -377,8 +407,11 @@ def get_generate_api(model_path: str, infer_config: dict, compressor_path: str,
             _, unexpected = model.load_state_dict(comp_state_dict, strict=False)
             assert len(unexpected) == 0, f'compressor 加载有问题: {unexpected}'
             del comp_state_dict
+        if model_load_kwargs:
+            restore_modules_to_dtype(model, target_torch_dtype)
 
     elif model_cls == 'snapkv':
+        runtime_infer_config, model_load_kwargs, target_torch_dtype = _prepare_model_load(torch.bfloat16)
         base_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
         if base_config.model_type == 'qwen2':
             from deltakv.modeling.qwen2.qwen2_snapkv import Qwen2SnapKVForCausalLM as KVModel
@@ -391,17 +424,21 @@ def get_generate_api(model_path: str, infer_config: dict, compressor_path: str,
 
         print('💡💡💡 SnapKV')
         config = config_cls.from_pretrained(model_path)
-        config.set_infer_args(**infer_config)
+        config.set_infer_args(**runtime_infer_config)
         print(f'[Config] {config}')
         model = KVModel.from_pretrained(
             model_path,
             config=config,
-            torch_dtype=torch.bfloat16,
+            torch_dtype=target_torch_dtype,
             device_map=cuda_device,
             attn_implementation="flash_attention_2",
+            **model_load_kwargs,
         )
+        if model_load_kwargs:
+            restore_modules_to_dtype(model, target_torch_dtype)
 
     elif model_cls == 'deltasnapkv':
+        runtime_infer_config, model_load_kwargs, target_torch_dtype = _prepare_model_load(torch.bfloat16)
         base_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
         if base_config.model_type == 'qwen2':
             from deltakv.modeling.qwen2.qwen2_deltasnapkv import Qwen2DeltaSnapKVForCausalLM as KVModel
@@ -416,7 +453,7 @@ def get_generate_api(model_path: str, infer_config: dict, compressor_path: str,
             raise ValueError("deltasnapkv requires compressor_path")
 
         config = config_cls.from_pretrained(compressor_path)
-        config.set_infer_args(**infer_config)
+        config.set_infer_args(**runtime_infer_config)
         assert len(parse_full_attn_layers(config.full_attn_layers)) == 0, (
             "deltasnapkv requires full_attn_layers to be empty; "
             "this method does not support mixed full-attention layers."
@@ -424,17 +461,21 @@ def get_generate_api(model_path: str, infer_config: dict, compressor_path: str,
         model = KVModel.from_pretrained(
             model_path,
             config=config,
-            torch_dtype=torch.bfloat16,
+            torch_dtype=target_torch_dtype,
             device_map=cuda_device,
             attn_implementation="flash_attention_2",
+            **model_load_kwargs,
         )
         load_device = f'cuda:{cuda_device}' if isinstance(cuda_device, int) else 'cpu'
         comp_state_dict = load_compressor(compressor_path, device=load_device)
         _, unexpected = model.load_state_dict(comp_state_dict, strict=False)
         assert len(unexpected) == 0, f'compressor 加载有问题: {unexpected}'
         del comp_state_dict
+        if model_load_kwargs:
+            restore_modules_to_dtype(model, target_torch_dtype)
 
     elif model_cls == 'pyramidkv':
+        runtime_infer_config, model_load_kwargs, target_torch_dtype = _prepare_model_load(torch.bfloat16)
         base_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
         if base_config.model_type == 'qwen2':
             from deltakv.modeling.qwen2.qwen2_pyramidkv import Qwen2PyramidKVForCausalLM as KVModel
@@ -447,30 +488,37 @@ def get_generate_api(model_path: str, infer_config: dict, compressor_path: str,
 
         print('💡💡💡 PyramidKV')
         config = config_cls.from_pretrained(model_path)
-        config.set_infer_args(**infer_config)
+        config.set_infer_args(**runtime_infer_config)
         print(f'[Config] {config}')
         model = KVModel.from_pretrained(
             model_path,
             config=config,
-            torch_dtype=torch.bfloat16,
+            torch_dtype=target_torch_dtype,
             device_map=cuda_device,
             attn_implementation="flash_attention_2",
+            **model_load_kwargs,
         )
+        if model_load_kwargs:
+            restore_modules_to_dtype(model, target_torch_dtype)
 
     elif model_cls == 'omnikv':
         print('💡💡💡 OmniKV')
         model = load_omnikv_model(model_path, infer_config, cuda_device)
 
     elif model_cls == 'auto':
+        runtime_infer_config, model_load_kwargs, target_torch_dtype = _prepare_model_load(torch.bfloat16)
         print('💡💡💡 Auto')
         model = AutoModelForCausalLM.from_pretrained(
             model_path,
-            torch_dtype=torch.bfloat16,
+            torch_dtype=target_torch_dtype,
             device_map=cuda_device,
             trust_remote_code=True,
             attn_implementation="flash_attention_2",
+            **model_load_kwargs,
         )
-        auto_chunk_prefill_size = infer_config.get('chunk_prefill_size', None)
+        if model_load_kwargs:
+            restore_modules_to_dtype(model, target_torch_dtype)
+        auto_chunk_prefill_size = runtime_infer_config.get('chunk_prefill_size', None)
         if auto_chunk_prefill_size is not None:
             from types import MethodType
 
@@ -490,6 +538,7 @@ def get_generate_api(model_path: str, infer_config: dict, compressor_path: str,
             model.forward = MethodType(chunked_forward, model)
 
     elif model_cls == 'quest':
+        runtime_infer_config, model_load_kwargs, target_torch_dtype = _prepare_model_load(torch.bfloat16)
         print('💡💡💡 Quest')
         # 加入 quest 的路径
         current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -505,11 +554,14 @@ def get_generate_api(model_path: str, infer_config: dict, compressor_path: str,
 
         model = AutoModelForCausalLM.from_pretrained(
             model_path,
-            torch_dtype=torch.bfloat16,
+            torch_dtype=target_torch_dtype,
             device_map=cuda_device,
             trust_remote_code=True,
             attn_implementation="flash_attention_2",
+            **model_load_kwargs,
         )
+        if model_load_kwargs:
+            restore_modules_to_dtype(model, target_torch_dtype)
 
         class QuestArgs:
             def __init__(self, token_budget, chunk_size):
@@ -518,12 +570,13 @@ def get_generate_api(model_path: str, infer_config: dict, compressor_path: str,
 
         # 从 infer_config 中获取参数
         quest_args = QuestArgs(
-            token_budget=infer_config['num_top_tokens'],
-            chunk_size=infer_config.get('chunk_size', 16)
+            token_budget=runtime_infer_config['num_top_tokens'],
+            chunk_size=runtime_infer_config.get('chunk_size', 16)
         )
         enable_quest_attention_eval(model, quest_args)
 
     elif model_cls == 'palu':
+        runtime_infer_config, model_load_kwargs, target_torch_dtype = _prepare_model_load(torch.float16)
         print('💡💡💡 Palu')
         import transformers
         assert transformers.__version__ == '4.37.2'
@@ -540,28 +593,32 @@ def get_generate_api(model_path: str, infer_config: dict, compressor_path: str,
         # Palu 模型通常使用 float16，且依赖其自定义的 Triton kernel
         model = AutoModelForCausalLM.from_pretrained(
             model_path,
-            torch_dtype=torch.float16,
+            torch_dtype=target_torch_dtype,
             device_map=cuda_device,
             trust_remote_code=True,
             attn_implementation="flash_attention_2",
+            **model_load_kwargs,
         )
+        if model_load_kwargs:
+            restore_modules_to_dtype(model, target_torch_dtype)
 
         # 如果配置了低比特量化（lt_bits < 16），则进行配置
-        lt_bits = infer_config.get('lt_bits', 16)
+        lt_bits = runtime_infer_config.get('lt_bits', 16)
         if lt_bits < 16:
             configure_latent_quantizer(
                 model,
                 n_bits=lt_bits,
-                group_size=infer_config.get('lt_group_size', 0),
-                sym=infer_config.get('lt_sym', True),
-                clip_ratio=infer_config.get('lt_clip_ratio', 1.0),
-                hadamard=infer_config.get('lt_hadamard', False)
+                group_size=runtime_infer_config.get('lt_group_size', 0),
+                sym=runtime_infer_config.get('lt_sym', True),
+                clip_ratio=runtime_infer_config.get('lt_clip_ratio', 1.0),
+                hadamard=runtime_infer_config.get('lt_hadamard', False)
             )
 
     elif model_cls == 'kivi':
         print('💡💡💡 KIVI')
         model = load_kivi_model(model_path, infer_config, cuda_device)
     elif model_cls == 'adakv':
+        runtime_infer_config, model_load_kwargs, target_torch_dtype = _prepare_model_load(torch.bfloat16)
         print('💡💡💡 AdaKV')
         os.environ['ENABLE_HF_GEN'] = '1'  # 生成hack流程依赖于generate函数
         current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -576,7 +633,7 @@ def get_generate_api(model_path: str, infer_config: dict, compressor_path: str,
         )
 
         base_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-        use_adaptive = infer_config.get('use_adaptive', True)
+        use_adaptive = runtime_infer_config.get('use_adaptive', True)
 
         if base_config.model_type == 'llama':
             if use_adaptive:
@@ -593,24 +650,27 @@ def get_generate_api(model_path: str, infer_config: dict, compressor_path: str,
 
         model = AutoModelForCausalLM.from_pretrained(
             model_path,
-            torch_dtype=torch.bfloat16,
+            torch_dtype=target_torch_dtype,
             device_map=cuda_device,
             attn_implementation="flash_attention_2",
             trust_remote_code=True,
+            **model_load_kwargs,
         )
+        if model_load_kwargs:
+            restore_modules_to_dtype(model, target_torch_dtype)
 
         # config hyperparameters
         model = config_compress(
             model,
-            window_size=infer_config.get('snapkv_window_size', 32),
-            base_capacity=infer_config.get('num_top_tokens', 512),
-            kernel_size=infer_config.get('kernel_size', 7),
-            pooling=infer_config.get('pooling', 'maxpool'),
-            floor_alpha=infer_config.get('floor_alpha', 0.2),
-            pyram_mode=infer_config.get('pyram_mode', False),
-            beta=infer_config.get('pyram_beta', 20),
-            gqa_support=infer_config.get('gqa_support', False),
-            gqa_func=infer_config.get('gqa_func', 'mean')
+            window_size=runtime_infer_config.get('snapkv_window_size', 32),
+            base_capacity=runtime_infer_config.get('num_top_tokens', 512),
+            kernel_size=runtime_infer_config.get('kernel_size', 7),
+            pooling=runtime_infer_config.get('pooling', 'maxpool'),
+            floor_alpha=runtime_infer_config.get('floor_alpha', 0.2),
+            pyram_mode=runtime_infer_config.get('pyram_mode', False),
+            beta=runtime_infer_config.get('pyram_beta', 20),
+            gqa_support=runtime_infer_config.get('gqa_support', False),
+            gqa_func=runtime_infer_config.get('gqa_func', 'mean')
         )
     elif model_cls == 'kvzip':
         print('💡💡💡 KVzip')
