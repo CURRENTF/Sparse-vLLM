@@ -80,6 +80,14 @@ def parse_args() -> Namespace:
     p.add_argument("--kv_cache_cpu", action="store_true")
     p.add_argument("--kv_cache_cpu_device", type=str, default="cpu")
     p.add_argument("--trust_remote_code", action="store_true")
+    p.add_argument("--load_in_4bit", action="store_true")
+    p.add_argument("--load_in_8bit", action="store_true")
+    p.add_argument(
+        "--model_torch_dtype",
+        type=str,
+        default=None,
+        help="Optional model dtype override for non-quantized and skipped modules, e.g. bf16 or fp16.",
+    )
     p.add_argument("--use_chat_template", action="store_true")
     p.add_argument("--same_context_different_query", action="store_true")
     p.add_argument("--tensor_parallel_size", type=int, default=1)
@@ -105,6 +113,18 @@ def parse_args() -> Namespace:
         type=str,
         default=None,
         help="Optional path to a txt/json file containing example indices to evaluate.",
+    )
+    p.add_argument(
+        "--num_data_shards",
+        type=int,
+        default=1,
+        help="Split dataset indices into N modulo shards and evaluate only one shard.",
+    )
+    p.add_argument(
+        "--data_shard_id",
+        type=int,
+        default=0,
+        help="Modulo shard id in [0, num_data_shards).",
     )
     p.add_argument(
         "--attn_type",

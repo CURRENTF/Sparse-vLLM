@@ -24,6 +24,7 @@ sys.path.append(str(Path(__file__).parent.parent.parent / "src"))
 
 import torch
 from deltakv.get_chat_api import get_generate_api
+from deltakv.quantization import build_model_load_kwargs, restore_modules_to_dtype
 from args import parse_args
 from compute_scores import compute_scores
 from datasets import load_dataset
@@ -208,6 +209,29 @@ def _filter_examples(
     return examples.select(selected_indices)
 
 
+def _select_worker_cuda_device(rank: int, world_size: int) -> int:
+    visible_devices = [
+        device.strip()
+        for device in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
+        if device.strip()
+    ]
+
+    if world_size > 1 and visible_devices:
+        if rank >= len(visible_devices):
+            raise ValueError(
+                f"Rank {rank} is out of range for CUDA_VISIBLE_DEVICES={visible_devices}"
+            )
+        target_visible_device = visible_devices[rank]
+        print(
+            f"[Rank {rank}] Using CUDA visible index {rank} (physical {target_visible_device})"
+        )
+
+    if torch.cuda.is_available():
+        torch.cuda.set_device(rank)
+
+    return rank
+
+
 def _run_scbench_worker(
     rank: int,
     world_size: int,
@@ -216,13 +240,11 @@ def _run_scbench_worker(
     max_seq_length: int,
     scdq_mode: bool,
 ):
-    # DeltaKVGreedySearch uses `input_ids.cuda()` without specifying device.
-    if torch.cuda.is_available():
-        torch.cuda.set_device(rank)
+    local_cuda_device = _select_worker_cuda_device(rank, world_size)
 
     hyper_param = args.hyper_param.copy() if args.hyper_param else {}
-    # Force single-GPU load per rank (avoid HF `device_map="auto"` sharding).
-    hyper_param["cuda_device"] = rank
+    # Worker-local device index within the current visible device list.
+    hyper_param["cuda_device"] = local_cuda_device
 
     model_name = args.model_name_or_path
     real_model_name = model_name.split("/")[-1]
@@ -417,6 +439,7 @@ def load_model(
     hyper_param: dict = None,
     copy_on_gpu: bool = False,
 ):
+    hyper_param = hyper_param.copy() if hyper_param else {}
     if model_name == "THUDM/glm-4-9b-chat-1m":
         tok = AutoTokenizer.from_pretrained(
             model_name, trust_remote_code=trust_remote_code, revision="refs/pr/19"
@@ -510,6 +533,19 @@ def load_model(
                 print(f"Warning: minference is not installed. Skipping patch for {attn_type}")
         llm = GreedySearch_vLLM(llm, tok)
     else:
+        runtime_hyper_param, model_load_kwargs, target_torch_dtype = build_model_load_kwargs(
+            hyper_param,
+            default_torch_dtype=torch.bfloat16,
+        )
+        worker_cuda_device = runtime_hyper_param.pop(
+            "cuda_device",
+            hyper_param.get("cuda_device", "auto"),
+        )
+        hf_device_map = "auto"
+        if worker_cuda_device != "auto":
+            hf_device_map = {"": int(worker_cuda_device)}
+        explicit_torch_dtype = "torch_dtype" in hyper_param
+        model_torch_dtype = target_torch_dtype if (model_load_kwargs or explicit_torch_dtype) else "auto"
         if MInference is not None:
             minference_patch = MInference(
                 attn_type.replace("_sink", ""),
@@ -520,7 +556,7 @@ def load_model(
                 is_search=is_search,
                 kv_cache_cpu=kv_cache_cpu,
                 kv_cache_cpu_device=kv_cache_cpu_device,
-                attn_kwargs=hyper_param,
+                attn_kwargs=runtime_hyper_param,
             )
         else:
             minference_patch = None
@@ -529,22 +565,28 @@ def load_model(
         if "mamba" in model_name.lower() or "recurrentgemma" in model_name.lower():
             llm = AutoModelForCausalLM.from_pretrained(
                 model_name,
-                torch_dtype="auto",
-                device_map="auto",
+                torch_dtype=model_torch_dtype,
+                device_map=hf_device_map,
                 resume_download=None,
                 trust_remote_code=trust_remote_code,
+                **model_load_kwargs,
             )
+            if model_load_kwargs:
+                restore_modules_to_dtype(llm, target_torch_dtype)
             llm = GreedySearch_Mamba2(llm, tok)
 
             return llm, tok
         else:
             llm = AutoModelForCausalLM.from_pretrained(
                 model_name,
-                torch_dtype="auto",
-                device_map="auto",
+                torch_dtype=model_torch_dtype,
+                device_map=hf_device_map,
                 trust_remote_code=trust_remote_code,
                 attn_implementation="flash_attention_2",
+                **model_load_kwargs,
             )
+            if model_load_kwargs:
+                restore_modules_to_dtype(llm, target_torch_dtype)
             if minference_patch is not None:
                 llm = minference_patch(llm)
 
@@ -570,6 +612,13 @@ def load_model(
 if __name__ == "__main__":
     args = parse_args()
     mp.set_start_method("spawn", force=True)
+    args.hyper_param = args.hyper_param.copy() if args.hyper_param else {}
+    if args.load_in_4bit:
+        args.hyper_param["load_in_4bit"] = True
+    if args.load_in_8bit:
+        args.hyper_param["load_in_8bit"] = True
+    if args.model_torch_dtype:
+        args.hyper_param["torch_dtype"] = args.model_torch_dtype
 
     # check_benchmark_availability(args.data_dir)
     model_name = args.model_name_or_path
