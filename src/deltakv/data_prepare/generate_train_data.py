@@ -4,6 +4,8 @@ import json
 import os
 import math
 import subprocess
+import glob
+import uuid
 import fire
 
 from torch.utils.data import IterableDataset, DataLoader
@@ -129,6 +131,20 @@ class ShardedDataset(IterableDataset):
                 # 更新 token 缓冲区，保留剩余部分
                 token_buffer[0] = token_buffer[0][self.data_max_len:]
 
+
+class TransformIterableDataset(IterableDataset):
+    def __init__(self, data_source, transform):
+        self.data_source = data_source
+        self.transform = transform
+
+    def __iter__(self):
+        for sample in self.data_source:
+            transformed = self.transform(sample)
+            if transformed is None:
+                continue
+            yield transformed
+
+
 def get_dataloader(dataset, num_workers):
     return DataLoader(
         dataset,
@@ -136,6 +152,116 @@ def get_dataloader(dataset, num_workers):
         num_workers=num_workers,
         collate_fn=lambda x: x
     )
+
+
+def collect_loader_items(loader, target_count, desc):
+    data_lst = []
+    for item in tqdm(loader, total=target_count, desc=desc):
+        data_lst.append(item)
+        if len(data_lst) >= target_count:
+            break
+    if len(data_lst) < target_count:
+        print(f"[WARN] {desc}: collected {len(data_lst)} < target {target_count}")
+    return data_lst
+
+
+def load_local_dataset(dataset_path, split="train", streaming=False):
+    parquet_glob = os.path.join(dataset_path, "data", "*.parquet")
+    parquet_files = sorted(glob.glob(parquet_glob))
+    if parquet_files:
+        return load_dataset("parquet", data_files=parquet_files, split=split, streaming=streaming)
+    return load_dataset(dataset_path, split=split, streaming=streaming)
+
+
+def render_chat_messages(tokenizer, messages):
+    kwargs = {
+        "tokenize": False,
+        "add_generation_prompt": False,
+    }
+    try:
+        return tokenizer.apply_chat_template(messages, enable_thinking=False, **kwargs)
+    except TypeError:
+        return tokenizer.apply_chat_template(messages, **kwargs)
+
+
+def build_uuid_kv_dialog(tokenizer, min_target_tokens, max_target_tokens):
+    min_target_tokens = max(1024, int(min_target_tokens))
+    max_target_tokens = max(min_target_tokens, int(max_target_tokens))
+
+    prompt_styles = [
+        "Extract the value corresponding to the specified key in the JSON object below.",
+        "Read the JSON object below and return the value for the requested key.",
+        "Given the JSON object below, identify the exact value for the specified key.",
+    ]
+    followup_styles = [
+        'Key: "{key}"\nThe value associated with the specified key is:',
+        'Please retrieve the value for key "{key}".\nAnswer with the exact UUID:',
+        'Find the exact UUID value for the following key.\nKey: "{key}"\nValue:',
+    ]
+
+    text = None
+    for _ in range(6):
+        target_tokens = random.randint(min_target_tokens, max_target_tokens)
+        approx_entries = max(48, int(target_tokens / 68))
+        approx_entries = max(48, int(approx_entries * random.uniform(0.9, 1.1)))
+
+        kv_pairs = {
+            str(uuid.uuid4()): str(uuid.uuid4())
+            for _ in range(approx_entries)
+        }
+        keys = list(kv_pairs.keys())
+        random.shuffle(keys)
+        num_turns = min(len(keys), random.randint(4, 6))
+
+        first_prompt = (
+            f"{random.choice(prompt_styles)}\n\n"
+            f"JSON data:\n{json.dumps(kv_pairs, ensure_ascii=True)}\n\n"
+            f'{random.choice(followup_styles).format(key=keys[0])}'
+        )
+        messages = [
+            {"role": "user", "content": first_prompt},
+            {"role": "assistant", "content": kv_pairs[keys[0]]},
+        ]
+
+        for key in keys[1:num_turns]:
+            messages.append(
+                {"role": "user", "content": random.choice(followup_styles).format(key=key)}
+            )
+            messages.append({"role": "assistant", "content": kv_pairs[key]})
+
+        text = render_chat_messages(tokenizer, messages)
+        actual_tokens = len(tokenizer(text, add_special_tokens=False)["input_ids"])
+        if actual_tokens >= min_target_tokens:
+            return text
+
+    return text
+
+
+def build_reasoning_transform(tokenizer):
+    def _transform(sample):
+        messages = sample.get("messages")
+        if not messages:
+            return None
+        clean_messages = []
+        for message in messages:
+            role = message.get("role")
+            content = message.get("content")
+            if role not in {"system", "user", "assistant"} or not content:
+                continue
+            clean_messages.append({"role": role, "content": content})
+
+        if not clean_messages:
+            return None
+
+        try:
+            text = render_chat_messages(tokenizer, clean_messages)
+        except Exception:
+            text = ""
+            for message in clean_messages:
+                text += f"{message['role']}: {message['content']}\n"
+        return {"text": text}
+
+    return _transform
 
 def shuffle_jsonl(input_path, output_path):
     """
@@ -274,6 +400,137 @@ def process_vr1_0(
     data.shuffle(seed=218).save_to_disk(output_path)
     print(f"数据处理完成，保存至 {output_path}")
 
+
+def process_vi1_0(
+    model_cls,
+    tkn,
+    data_max_len,
+    num_workers,
+    num_samples=100_000,
+    fineweb_path=None,
+    reasoning_path=None,
+    output_root=None,
+    reasoning_ratio=0.08,
+    uuid_kv_ratio=0.02,
+    fineweb_skip_factor=1,
+):
+    fineweb_path = fineweb_path or os.path.expanduser("~/datasets/fineweb-edu-1B")
+    reasoning_path = reasoning_path or os.path.expanduser(
+        "~/datasets/AM-DeepSeek-R1-Distilled-1.4M-am_0.9M_sample100k"
+    )
+    output_root = output_root or os.path.expanduser("~/datasets")
+
+    if reasoning_ratio < 0 or uuid_kv_ratio < 0 or reasoning_ratio + uuid_kv_ratio >= 1:
+        raise ValueError("reasoning_ratio 和 uuid_kv_ratio 必须非负，且和小于 1")
+
+    num_reasoning = int(round(num_samples * reasoning_ratio))
+    num_uuid_kv = int(round(num_samples * uuid_kv_ratio))
+    num_fineweb = num_samples - num_reasoning - num_uuid_kv
+
+    if num_fineweb <= 0:
+        raise ValueError("FineWeb 样本数必须大于 0")
+
+    ratio_tag = (
+        f"_fw{int(round(num_fineweb / num_samples * 100)):02d}"
+        f"_r{int(round(num_reasoning / num_samples * 100)):02d}"
+        f"_uuid{int(round(num_uuid_kv / num_samples * 100)):02d}"
+    )
+    output_path = os.path.join(
+        output_root,
+        f"deltakv_{model_cls}_train_vi1.0{ratio_tag}_num{num_samples}"
+    )
+    if data_max_len != 1024:
+        output_path += f"_seqlen{data_max_len}"
+    os.makedirs(output_path, exist_ok=True)
+
+    print(
+        "[vi1.0] mixture:",
+        {
+            "fineweb": num_fineweb,
+            "reasoning": num_reasoning,
+            "synthetic_uuid_kv": num_uuid_kv,
+            "fineweb_path": fineweb_path,
+            "reasoning_path": reasoning_path,
+            "output_path": output_path,
+        },
+    )
+
+    data_lst = []
+
+    data_fineweb = load_local_dataset(fineweb_path, split="train", streaming=True)
+    if isinstance(data_fineweb, HfIterableDataset):
+        data_fineweb = data_fineweb.shuffle(seed=218, buffer_size=10_000)
+
+    loader_fineweb = get_dataloader(
+        ShardedDataset(
+            data_fineweb,
+            "general",
+            num_fineweb,
+            data_max_len,
+            tkn,
+            skip_factor=fineweb_skip_factor,
+            min_sample_len=max(64, min(128, data_max_len // 128)),
+        ),
+        num_workers,
+    )
+    data_lst.extend(collect_loader_items(loader_fineweb, num_fineweb, "Sampling FineWeb"))
+
+    if num_reasoning > 0:
+        raw_reasoning = load_local_dataset(reasoning_path, split="train", streaming=True)
+        if isinstance(raw_reasoning, HfIterableDataset):
+            raw_reasoning = raw_reasoning.shuffle(seed=218, buffer_size=10_000)
+        reasoning_dataset = TransformIterableDataset(
+            raw_reasoning,
+            build_reasoning_transform(tkn),
+        )
+        loader_reasoning = get_dataloader(
+            ShardedDataset(
+                reasoning_dataset,
+                "reasoning_chat",
+                num_reasoning,
+                data_max_len,
+                tkn,
+                min_sample_len=max(128, min(512, data_max_len // 16)),
+            ),
+            num_workers,
+        )
+        data_lst.extend(
+            collect_loader_items(loader_reasoning, num_reasoning, "Sampling Reasoning Chats")
+        )
+
+    if num_uuid_kv > 0:
+        synthetic_uuid_data = []
+        min_target_tokens = max(2048, int(data_max_len * 0.45))
+        max_target_tokens = max(min_target_tokens, int(data_max_len * 0.85))
+        for _ in tqdm(range(num_uuid_kv), desc="Generating Synthetic UUID-KV"):
+            synthetic_uuid_data.append(
+                {
+                    "text": build_uuid_kv_dialog(
+                        tkn,
+                        min_target_tokens=min_target_tokens,
+                        max_target_tokens=max_target_tokens,
+                    )
+                }
+            )
+        loader_uuid = get_dataloader(
+            ShardedDataset(
+                synthetic_uuid_data,
+                "synthetic_uuid_kv",
+                num_uuid_kv,
+                data_max_len,
+                tkn,
+                min_sample_len=max(1024, min(4096, data_max_len // 4)),
+            ),
+            num_workers,
+        )
+        data_lst.extend(
+            collect_loader_items(loader_uuid, num_uuid_kv, "Packing Synthetic UUID-KV")
+        )
+
+    data = Dataset.from_list(data_lst)
+    data.shuffle(seed=218).save_to_disk(output_path)
+    print(f"[vi1.0] 数据处理完成，保存至 {output_path}")
+
 # =================== 主函数 ===================
 
 def main(
@@ -284,6 +541,11 @@ def main(
     num_samples=100_000,
     dataset_path=None,
     output_root=None,
+    fineweb_path=None,
+    reasoning_path=None,
+    reasoning_ratio=0.08,
+    uuid_kv_ratio=0.02,
+    fineweb_skip_factor=1,
 ):
     tkn = AutoTokenizer.from_pretrained(tkn_path, use_fast=True)
     print("bos", tkn.bos_token)
@@ -316,6 +578,20 @@ def main(
             num_samples,
             dataset_path=dataset_path,
             output_root=output_root,
+        )
+    elif version == "vi1.0":
+        process_vi1_0(
+            model_cls,
+            tkn,
+            data_max_len,
+            num_workers,
+            num_samples,
+            fineweb_path=fineweb_path,
+            reasoning_path=reasoning_path,
+            output_root=output_root,
+            reasoning_ratio=reasoning_ratio,
+            uuid_kv_ratio=uuid_kv_ratio,
+            fineweb_skip_factor=fineweb_skip_factor,
         )
     else:
         raise ValueError(f"Unsupported version: {version}")
