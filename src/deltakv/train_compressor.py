@@ -24,6 +24,7 @@ def main(
     dataset_path: str = '/root/autodl-fs/datasets/fineweb-edu-tokenized',
     output_dir: str = '/root/autodl-fs/checkpoints/compressor',
     data_max_len: int = -1,
+    deepspeed: str = None,
 
     # 压缩器相关配置
     model_type: str = 'parallel',  # 'parallel', 'sequential', 'e2e' or 'cluster_e2e'
@@ -295,8 +296,15 @@ def main(
     elif use_nonlinear_compressor:
         run_name_suffix += f"_nonlinear_inter{compressor_intermediate_size}"
 
-    # 加入时间戳，避免覆盖保存
-    timestamp = datetime.now().strftime("%m%d_%H%M%S")
+    # 多卡训练时必须同步时间戳，否则不同 rank 可能跨秒写到不同目录。
+    if accelerator.is_main_process:
+        timestamp = datetime.now().strftime("%m%d_%H%M%S")
+    else:
+        timestamp = ""
+    if accelerator.num_processes > 1 and torch.distributed.is_initialized():
+        timestamp_holder = [timestamp]
+        torch.distributed.broadcast_object_list(timestamp_holder, src=0)
+        timestamp = timestamp_holder[0]
     final_output_dir = os.path.join(output_dir, f"{run_name_suffix}_{timestamp}")
 
     if accelerator.is_main_process:
@@ -304,6 +312,7 @@ def main(
         if run_name is None:
             run_name = f"{run_name_suffix}_{timestamp}"
         wandb.init(project=project_name, name=run_name, config=locals(), group=wandb_group if wandb_group else model_type)
+    accelerator.wait_for_everyone()
 
     training_args = TrainingArguments(
         output_dir=final_output_dir,
@@ -324,6 +333,7 @@ def main(
         report_to="wandb" if accelerator.is_main_process else "none",
         remove_unused_columns=False, # 我们不需要label，所以设为False
         gradient_checkpointing=gradient_checkpointing,
+        deepspeed=deepspeed,
     )
 
     trainer = SaveTrainableParamsTrainer(
