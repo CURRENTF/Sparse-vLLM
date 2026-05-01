@@ -76,23 +76,37 @@ llm.exit()
 ### Key parameters
 
 Sparse-vLLM runtime knobs are defined in `src/sparsevllm/config.py` and can be passed as keyword args to `LLM(...)`.
+For backend-agnostic DeltaKV/HF and Sparse-vLLM configs, prefer the canonical
+runtime names documented in [`docs/runtime-parameter-semantics.md`](docs/runtime-parameter-semantics.md).
+Legacy names remain supported, but canonical names fail fast on conflicting
+accuracy or speed settings.
+
+For LLaVA-OneVision visual-token experiments, see
+[`docs/llava-onevision-visual-cache-benchmarks.md`](docs/llava-onevision-visual-cache-benchmarks.md).
+The no-checkpoint keep-ratio path is a visual-token uniform-pruning baseline,
+not DeltaKV cluster/compressor inference.
 
 **Common knobs**
 
 - `tensor_parallel_size`: number of GPU ranks (processes) to spawn.
 - `gpu_memory_utilization`: fraction of total GPU memory to allocate for the KV cache.
 - `max_model_len`: max (prompt + generated) tokens allowed.
-- `chunk_prefill_size`: chunk size for long-prompt prefill (reduces peak memory and improves scheduling for long contexts).
+- `engine_prefill_chunk_size`: canonical Sparse-vLLM alias for legacy `chunk_prefill_size`; controls engine prefill scheduling and memory admission.
 - `max_num_batched_tokens`, `max_num_seqs_in_batch`, `max_decoding_seqs`: scheduler throughput/latency constraints.
 
 **Sparse knobs (method-dependent)**
 
-- `vllm_sparse_method`: method string (see below).
-- `num_sink_tokens`: always-kept “sink” tokens at the beginning.
-- `num_recent_tokens`: always-kept “recent” tail tokens.
-- `num_top_tokens`: keep top-K tokens (importance-based selection; used by OmniKV and some hybrid modes).
-- `num_top_tokens_in_prefill`: top-K used during prefill (defaults to `num_top_tokens` if unset).
-- `full_attn_layers`: comma-separated layer indices (or list) that run full attention; used by OmniKV/DeltaKV as “observation” anchors.
+- `sparse_method`: canonical method selector; maps to legacy `vllm_sparse_method` on Sparse-vLLM.
+- `deltakv_checkpoint_path`: canonical DeltaKV compressor path; maps to `deltakv_path` on Sparse-vLLM and `compressor_path` on HF.
+- `sink_keep_tokens`: always-kept prefix/sink tokens; maps to `num_sink_tokens`.
+- `recent_keep_tokens`: always-kept recent tail tokens; maps to `num_recent_tokens`.
+- `decode_keep_tokens`: decode-time top/important token budget; maps to `num_top_tokens`.
+- `prefill_keep_tokens`: prefill/finalization top/important token budget; maps to `num_top_tokens_in_prefill`.
+- `full_attention_layers`: comma-separated layer indices (or list) that run full attention; maps to `full_attn_layers`.
+
+Sparse-vLLM requires explicit integer keep budgets. Ratio-style values such as
+`decode_keep_tokens=0.17` are accepted on HF paths that support ratios, but must
+be converted to token counts before running Sparse-vLLM.
 
 ### Supported methods
 
@@ -104,6 +118,9 @@ Set `vllm_sparse_method` to one of:
 - `"omnikv"` (logical masking)
 - `"quest"` (query-aware page selection on decode; prefill stays full attention)
 - `"deltakv"` / `"deltakv-*"` (hybrid compression; optional / experimental, see [DeltaKV](#deltakv))
+
+New configs may use `sparse_method` instead; it normalizes to
+`vllm_sparse_method` for Sparse-vLLM and to `model_cls` for HF where possible.
 
 `quest` runtime knobs:
 
@@ -120,6 +137,7 @@ Use `scripts/bench_sparse_vllm.py` to measure TTFT, prefill throughput, decode t
 Notes:
 
 - Prefer `--hyper_params` to pass Sparse-vLLM `Config` values (JSON object). Flags like `--gpu_util/--chunk_size/--tp` are kept only for backward compatibility.
+- `--hyper_params` also accepts canonical runtime aliases such as `sparse_method`, `engine_prefill_chunk_size`, `decode_keep_tokens`, and `prefill_keep_tokens`; they are normalized before engine construction.
 - `--lengths` measures *prompt length*; the script sets `max_model_len = length + output_len + 100` internally.
 
 Baseline (vanilla):

@@ -8,6 +8,8 @@ import torch.multiprocessing as mp
 from sparsevllm.utils.log import logger
 import sys
 
+from deltakv.configs.runtime_params import normalize_runtime_params
+
 from sparsevllm.config import Config
 from sparsevllm.sampling_params import SamplingParams
 from sparsevllm.engine.sequence import Sequence
@@ -131,8 +133,17 @@ class LLMEngine:
 
     def __init__(self, model, **kwargs):
         # 1. 初始化配置
+        normalized_params = normalize_runtime_params(kwargs, backend="sparsevllm")
+        for warning in normalized_params.warnings:
+            logger.info(f"Runtime parameter normalization: {warning}")
+
         config_fields = {field.name for field in fields(Config)}
-        config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
+        config_kwargs = {
+            k: v for k, v in normalized_params.infer_config.items() if k in config_fields
+        }
+        ignored_keys = sorted(set(normalized_params.infer_config) - config_fields)
+        if ignored_keys:
+            logger.warning(f"Ignoring unknown Sparse-vLLM config keys: {ignored_keys}")
         config = Config(model, **config_kwargs)
         self.config = config
         

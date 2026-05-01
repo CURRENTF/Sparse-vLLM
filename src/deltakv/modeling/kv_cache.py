@@ -19,10 +19,113 @@ class BaseCache(DynamicCache):
         self.top_token_idx = {}
         self.token_scores = {}
         self.num_prompt_tokens = None
+        self.visual_token_prune_only = bool(
+            getattr(config, "visual_token_prune_only", getattr(config, "deltakv_visual_compress_only", False))
+        )
+        self.visual_compress_only = self.visual_token_prune_only
 
     def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
         """Returns the sequence length of the cached states. A layer index can be optionally passed."""
         return self._seen_tokens
+
+    @staticmethod
+    def _default_cache_position(key_states: torch.Tensor, q_len: int) -> torch.Tensor:
+        return torch.arange(q_len, device=key_states.device)
+
+    def _extract_current_metadata(
+        self,
+        key_states: torch.Tensor,
+        cache_kwargs: Optional[dict[str, Any]],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        bs, q_len = key_states.shape[:2]
+        cache_kwargs = cache_kwargs or {}
+        cache_position = cache_kwargs.get("cache_position")
+        if cache_position is None:
+            cache_position = self._default_cache_position(key_states, q_len)
+        cache_position = cache_position.to(device=key_states.device, dtype=torch.long)
+        if cache_position.dim() == 1:
+            token_pos = cache_position.unsqueeze(0).expand(bs, -1)
+        else:
+            token_pos = cache_position.to(device=key_states.device, dtype=torch.long)
+
+        visual_mask = cache_kwargs.get("deltakv_visual_token_mask")
+        if visual_mask is None:
+            visual_mask = torch.zeros((bs, q_len), device=key_states.device, dtype=torch.bool)
+        else:
+            visual_mask = visual_mask.to(device=key_states.device, dtype=torch.bool)
+            if visual_mask.dim() == 1:
+                visual_mask = visual_mask.unsqueeze(0)
+            if visual_mask.shape[0] == 1 and bs > 1:
+                visual_mask = visual_mask.expand(bs, -1)
+        return token_pos, visual_mask
+
+    @staticmethod
+    def _sort_cache_view(
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        token_pos: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        order = torch.argsort(token_pos, dim=1)
+        gather_idx = order.unsqueeze(-1)
+        sorted_key = key_states.gather(1, gather_idx.expand(-1, -1, key_states.shape[-1]))
+        sorted_value = value_states.gather(1, gather_idx.expand(-1, -1, value_states.shape[-1]))
+        sorted_pos = token_pos.gather(1, order)
+        return sorted_key, sorted_value, sorted_pos
+
+    def _build_cache_view(
+        self,
+        key_parts: list[torch.Tensor],
+        value_parts: list[torch.Tensor],
+        pos_parts: list[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        key_states = torch.cat(key_parts, dim=1)
+        value_states = torch.cat(value_parts, dim=1)
+        token_pos = torch.cat(pos_parts, dim=1)
+        return self._sort_cache_view(key_states, value_states, token_pos)
+
+    def get_compressed_positions(self, layer_idx: int, device: Optional[torch.device] = None) -> Optional[torch.Tensor]:
+        comp_pos_cache = getattr(self, "comp_pos_cache", None)
+        if not comp_pos_cache or layer_idx not in comp_pos_cache:
+            return None
+        pos = comp_pos_cache[layer_idx]
+        return pos.to(device=device) if device is not None else pos
+
+    def get_compressed_length(self, layer_idx: int) -> int:
+        comp_pos = self.get_compressed_positions(layer_idx)
+        return 0 if comp_pos is None else int(comp_pos.shape[1])
+
+    def _select_visual_store_and_drop_indices(
+        self,
+        *,
+        layer_idx: int,
+        candidate_len: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        visual_idx = torch.nonzero(
+            self.buffer_visual_mask_cache[layer_idx][0, :candidate_len],
+            as_tuple=False,
+        ).flatten()
+        if visual_idx.numel() == 0:
+            return visual_idx, visual_idx
+
+        keep_ratio = float(
+            getattr(self.config, "visual_token_keep_ratio", getattr(self.config, "deltakv_visual_keep_ratio", 1.0))
+            or 0.0
+        )
+        keep_ratio = max(0.0, min(1.0, keep_ratio))
+        if keep_ratio >= 1.0:
+            return visual_idx, visual_idx
+        if keep_ratio <= 0.0:
+            return torch.empty((0,), device=device, dtype=torch.long), visual_idx
+
+        keep_count = max(1, int(round(float(visual_idx.numel()) * keep_ratio)))
+        keep_count = min(int(visual_idx.numel()), keep_count)
+        sample_pos = torch.div(
+            torch.arange(keep_count, device=device, dtype=torch.long) * int(visual_idx.numel()),
+            keep_count,
+            rounding_mode="floor",
+        )
+        return visual_idx.index_select(0, sample_pos), visual_idx
 
 
 class SnapKVCache(BaseCache):
@@ -112,8 +215,12 @@ class CompressedKVCache(BaseCache):
         self.comp_kv_mins = {}
         self.buffer_key_cache = {}
         self.buffer_value_cache = {}
+        self.buffer_pos_cache = {}
+        self.buffer_visual_mask_cache = {}
         self.sink_key_cache = {}
         self.sink_value_cache = {}
+        self.sink_pos_cache = {}
+        self.comp_pos_cache = {}
 
         self.full_attn_layers = parse_full_attn_layers(config.full_attn_layers)
         config.full_attn_layers = self.full_attn_layers
@@ -231,29 +338,33 @@ class CompressedKVCache(BaseCache):
 
         # key shape -> bs, seq_len, k_dim
         bs, q_len, k_dim = key_states.shape
+        token_pos, visual_mask = self._extract_current_metadata(key_states, cache_kwargs)
 
         if layer_idx not in self.buffer_key_cache:
             # init
             self.sink_size = min(self.sink_size, key_states.shape[1])
             self.sink_key_cache[layer_idx], self.buffer_key_cache[layer_idx] = key_states[:, :self.sink_size], key_states[:, self.sink_size:]
             self.sink_value_cache[layer_idx], self.buffer_value_cache[layer_idx] = value_states[:, :self.sink_size], value_states[:, self.sink_size:]
+            self.sink_pos_cache[layer_idx], self.buffer_pos_cache[layer_idx] = token_pos[:, :self.sink_size], token_pos[:, self.sink_size:]
+            self.buffer_visual_mask_cache[layer_idx] = visual_mask[:, self.sink_size:]
         else:
             self.buffer_key_cache[layer_idx] = torch.cat([self.buffer_key_cache[layer_idx], key_states], dim=1)
             self.buffer_value_cache[layer_idx] = torch.cat([self.buffer_value_cache[layer_idx], value_states], dim=1)
+            self.buffer_pos_cache[layer_idx] = torch.cat([self.buffer_pos_cache[layer_idx], token_pos], dim=1)
+            self.buffer_visual_mask_cache[layer_idx] = torch.cat([self.buffer_visual_mask_cache[layer_idx], visual_mask], dim=1)
 
         # 初始化一些index
         buffer_len = self.buffer_key_cache[layer_idx].shape[1]
-        seen_tokens = self._seen_tokens
-        
-        sink_idx = torch.arange(0, self.sink_size, device=key_states.device).unsqueeze(0).expand(bs, -1)
-        buffer_idx = torch.arange(seen_tokens - buffer_len, seen_tokens, device=key_states.device).unsqueeze(0).expand(bs, -1)
+        sink_idx = self.sink_pos_cache[layer_idx]
+        buffer_idx = self.buffer_pos_cache[layer_idx]
         
         if layer_idx in self.full_attn_layers:
             # 做full attn的layer不需要压缩kv cache
-            full_idx = torch.cat([sink_idx, buffer_idx], dim=1)
-            return torch.cat([self.sink_key_cache[layer_idx], self.buffer_key_cache[layer_idx]], dim=1), \
-                   torch.cat([self.sink_value_cache[layer_idx], self.buffer_value_cache[layer_idx]], dim=1), \
-                   full_idx
+            return self._build_cache_view(
+                [self.sink_key_cache[layer_idx], self.buffer_key_cache[layer_idx]],
+                [self.sink_value_cache[layer_idx], self.buffer_value_cache[layer_idx]],
+                [sink_idx, buffer_idx],
+            )
 
         # 下面是 sparse attn layers :
         # 当前传入的 key value states 是准确的，没必要传回一个重建的。而且token idx也确实不会包含。所以先拿到返回值，再做压缩。
@@ -298,12 +409,12 @@ class CompressedKVCache(BaseCache):
                         recon_k = history_k.gather(1, rel_token_idx[:, :, None].expand(-1, -1, history_k.shape[-1]))
                         recon_v = history_v.gather(1, rel_token_idx[:, :, None].expand(-1, -1, history_v.shape[-1]))
 
-                # rel_token_idx + sink_size = absolute position
-                full_idx = torch.cat([sink_idx, rel_token_idx + self.sink_size, buffer_idx], dim=1)
-
-                this_response = (torch.cat([self.sink_key_cache[layer_idx], recon_k, self.buffer_key_cache[layer_idx]], dim=1),
-                        torch.cat([self.sink_value_cache[layer_idx], recon_v, self.buffer_value_cache[layer_idx]], dim=1),
-                        full_idx)
+                comp_pos = self.comp_pos_cache[layer_idx].gather(1, rel_token_idx)
+                this_response = self._build_cache_view(
+                    [self.sink_key_cache[layer_idx], recon_k, self.buffer_key_cache[layer_idx]],
+                    [self.sink_value_cache[layer_idx], recon_v, self.buffer_value_cache[layer_idx]],
+                    [sink_idx, comp_pos, buffer_idx],
+                )
             else:
                 # Standalone DeltaKV: if no external selector provided token ids, reconstruct all compressed history.
                 history_k, history_v = self._decompress_all_history_kv(
@@ -312,25 +423,52 @@ class CompressedKVCache(BaseCache):
                     bs=bs,
                     k_dim=k_dim,
                 )
-                k = torch.cat([self.sink_key_cache[layer_idx], history_k, self.buffer_key_cache[layer_idx]], dim=1)
-                v = torch.cat([self.sink_value_cache[layer_idx], history_v, self.buffer_value_cache[layer_idx]], dim=1)
-                full_idx = torch.arange(k.shape[1], device=k.device)[None].expand(bs, -1)
-                this_response = (k, v, full_idx)
+                this_response = self._build_cache_view(
+                    [self.sink_key_cache[layer_idx], history_k, self.buffer_key_cache[layer_idx]],
+                    [self.sink_value_cache[layer_idx], history_v, self.buffer_value_cache[layer_idx]],
+                    [sink_idx, self.comp_pos_cache[layer_idx], buffer_idx],
+                )
         else:
-            full_idx = torch.cat([sink_idx, buffer_idx], dim=1)
-            this_response = (torch.cat([self.sink_key_cache[layer_idx], self.buffer_key_cache[layer_idx]], dim=1),
-                    torch.cat([self.sink_value_cache[layer_idx], self.buffer_value_cache[layer_idx]], dim=1),
-                    full_idx)
+            this_response = self._build_cache_view(
+                [self.sink_key_cache[layer_idx], self.buffer_key_cache[layer_idx]],
+                [self.sink_value_cache[layer_idx], self.buffer_value_cache[layer_idx]],
+                [sink_idx, buffer_idx],
+            )
 
         # 如果buffer内长度超过2倍size，做压缩，只剩下 tail_token_size个token
         if buffer_len >= self.tail_token_size * 2:
-            compress_len = (buffer_len - self.tail_token_size)//self.tail_token_size * self.tail_token_size
-            if compress_len > 0:
-                _key, self.buffer_key_cache[layer_idx] = self.buffer_key_cache[layer_idx][:, :compress_len], self.buffer_key_cache[layer_idx][:, compress_len:]
-                _val, self.buffer_value_cache[layer_idx] = self.buffer_value_cache[layer_idx][:, :compress_len], self.buffer_value_cache[layer_idx][:, compress_len:]
+            if self.visual_token_prune_only:
+                if bs != 1:
+                    raise NotImplementedError("visual_token_prune_only currently supports batch_size=1.")
+                candidate_len = max(0, buffer_len - self.tail_token_size)
+                compress_idx, drop_idx = self._select_visual_store_and_drop_indices(
+                    layer_idx=layer_idx,
+                    candidate_len=candidate_len,
+                    device=key_states.device,
+                )
+                if self.config.use_compression:
+                    usable_len = (compress_idx.numel() // self.config.seq_chunk_size) * self.config.seq_chunk_size
+                    compress_idx = compress_idx[:usable_len]
+            else:
+                compress_len = (buffer_len - self.tail_token_size) // self.tail_token_size * self.tail_token_size
+                compress_idx = torch.arange(compress_len, device=key_states.device, dtype=torch.long)
+                drop_idx = compress_idx
+
+            if drop_idx.numel() > 0:
+                keep_mask = torch.ones(buffer_len, device=key_states.device, dtype=torch.bool)
+                keep_mask[drop_idx] = False
+                _key = self.buffer_key_cache[layer_idx].index_select(1, compress_idx)
+                _val = self.buffer_value_cache[layer_idx].index_select(1, compress_idx)
+                _pos = self.buffer_pos_cache[layer_idx].index_select(1, compress_idx)
+                self.buffer_key_cache[layer_idx] = self.buffer_key_cache[layer_idx][:, keep_mask]
+                self.buffer_value_cache[layer_idx] = self.buffer_value_cache[layer_idx][:, keep_mask]
+                self.buffer_pos_cache[layer_idx] = self.buffer_pos_cache[layer_idx][:, keep_mask]
+                self.buffer_visual_mask_cache[layer_idx] = self.buffer_visual_mask_cache[layer_idx][:, keep_mask]
+
+                if compress_idx.numel() == 0:
+                    return this_response
 
                 bs, _len, k_dim = _key.shape
-                assert _len == compress_len, f'{_len}, {compress_len}'
 
                 if self.config.use_compression:
                     to_be_compress = torch.cat([_key, _val], dim=-1)
@@ -338,9 +476,11 @@ class CompressedKVCache(BaseCache):
 
                     if layer_idx not in self.comp_kv_cache:
                         self.comp_kv_cache[layer_idx], self.bases_cache[layer_idx] = comp_kv, bases
+                        self.comp_pos_cache[layer_idx] = _pos
                     else:
                         self.comp_kv_cache[layer_idx] = torch.cat([self.comp_kv_cache[layer_idx], comp_kv], dim=1)
                         self.bases_cache[layer_idx] = torch.cat([self.bases_cache[layer_idx], bases], dim=1)
+                        self.comp_pos_cache[layer_idx] = torch.cat([self.comp_pos_cache[layer_idx], _pos], dim=1)
                 else:
                     if self.config.kv_quant_bits == 4:
                         packed_kv, scale, mn = self._quantize_kv_tokens(torch.cat([_key, _val], dim=-1))
@@ -348,16 +488,20 @@ class CompressedKVCache(BaseCache):
                             self.comp_kv_cache[layer_idx] = packed_kv
                             self.comp_kv_scales[layer_idx] = scale
                             self.comp_kv_mins[layer_idx] = mn
+                            self.comp_pos_cache[layer_idx] = _pos
                         else:
                             self.comp_kv_cache[layer_idx] = torch.cat([self.comp_kv_cache[layer_idx], packed_kv], dim=1)
                             self.comp_kv_scales[layer_idx] = torch.cat([self.comp_kv_scales[layer_idx], scale], dim=1)
                             self.comp_kv_mins[layer_idx] = torch.cat([self.comp_kv_mins[layer_idx], mn], dim=1)
+                            self.comp_pos_cache[layer_idx] = torch.cat([self.comp_pos_cache[layer_idx], _pos], dim=1)
                     else:
                         if layer_idx not in self.comp_kv_cache:
                             self.comp_kv_cache[layer_idx], self.bases_cache[layer_idx] = _key, _val
+                            self.comp_pos_cache[layer_idx] = _pos
                         else:
                             self.comp_kv_cache[layer_idx] = torch.cat([self.comp_kv_cache[layer_idx], _key], dim=1)
                             self.bases_cache[layer_idx] = torch.cat([self.bases_cache[layer_idx], _val], dim=1)
+                            self.comp_pos_cache[layer_idx] = torch.cat([self.comp_pos_cache[layer_idx], _pos], dim=1)
 
         return this_response
 
@@ -666,12 +810,15 @@ class ClusterCompressedKVCache(CompressedKVCache):
 
         # key shape -> bs, seq_len, k_dim
         bs, q_len, k_dim = key_states.shape
+        token_pos, visual_mask = self._extract_current_metadata(key_states, cache_kwargs)
 
         if layer_idx not in self.buffer_key_cache:
             # init
             self.sink_size = min(self.sink_size, key_states.shape[1])
             self.sink_key_cache[layer_idx], self.buffer_key_cache[layer_idx] = key_states[:, :self.sink_size], key_states[:, self.sink_size:]
             self.sink_value_cache[layer_idx], self.buffer_value_cache[layer_idx] = value_states[:, :self.sink_size], value_states[:, self.sink_size:]
+            self.sink_pos_cache[layer_idx], self.buffer_pos_cache[layer_idx] = token_pos[:, :self.sink_size], token_pos[:, self.sink_size:]
+            self.buffer_visual_mask_cache[layer_idx] = visual_mask[:, self.sink_size:]
             # 把 sink tokens 也作为初始聚类中心
             self.bases_cache[layer_idx] = torch.cat([self.sink_key_cache[layer_idx], self.sink_value_cache[layer_idx]], dim=-1)
             # Initialize dynamic stride cursor after sink size is finalized.
@@ -680,20 +827,21 @@ class ClusterCompressedKVCache(CompressedKVCache):
         else:
             self.buffer_key_cache[layer_idx] = torch.cat([self.buffer_key_cache[layer_idx], key_states], dim=1)
             self.buffer_value_cache[layer_idx] = torch.cat([self.buffer_value_cache[layer_idx], value_states], dim=1)
+            self.buffer_pos_cache[layer_idx] = torch.cat([self.buffer_pos_cache[layer_idx], token_pos], dim=1)
+            self.buffer_visual_mask_cache[layer_idx] = torch.cat([self.buffer_visual_mask_cache[layer_idx], visual_mask], dim=1)
 
         # 初始化一些index
         buffer_len = self.buffer_key_cache[layer_idx].shape[1]
-        seen_tokens = self._seen_tokens
-        
-        sink_idx = torch.arange(0, self.sink_size, device=key_states.device).unsqueeze(0).expand(bs, -1)
-        buffer_idx = torch.arange(seen_tokens - buffer_len, seen_tokens, device=key_states.device).unsqueeze(0).expand(bs, -1)
+        sink_idx = self.sink_pos_cache[layer_idx]
+        buffer_idx = self.buffer_pos_cache[layer_idx]
         
         if layer_idx in self.full_attn_layers:
             # 做full attn的layer不需要压缩kv cache
-            full_idx = torch.cat([sink_idx, buffer_idx], dim=1)
-            return torch.cat([self.sink_key_cache[layer_idx], self.buffer_key_cache[layer_idx]], dim=1), \
-                   torch.cat([self.sink_value_cache[layer_idx], self.buffer_value_cache[layer_idx]], dim=1), \
-                   full_idx
+            return self._build_cache_view(
+                [self.sink_key_cache[layer_idx], self.buffer_key_cache[layer_idx]],
+                [self.sink_value_cache[layer_idx], self.buffer_value_cache[layer_idx]],
+                [sink_idx, buffer_idx],
+            )
 
         # 下面是 sparse attn layers :
         # 根据token idx重建所需kv cache
@@ -712,11 +860,12 @@ class ClusterCompressedKVCache(CompressedKVCache):
                     k_dim=k_dim,
                 )
 
-                full_idx = torch.cat([sink_idx, token_idx + self.sink_size, buffer_idx], dim=1)
-
-                this_response = (torch.cat([self.sink_key_cache[layer_idx], recon_k, self.buffer_key_cache[layer_idx]], dim=1),
-                                torch.cat([self.sink_value_cache[layer_idx], recon_v, self.buffer_value_cache[layer_idx]], dim=1),
-                                full_idx)
+                comp_pos = self.comp_pos_cache[layer_idx].gather(1, token_idx)
+                this_response = self._build_cache_view(
+                    [self.sink_key_cache[layer_idx], recon_k, self.buffer_key_cache[layer_idx]],
+                    [self.sink_value_cache[layer_idx], recon_v, self.buffer_value_cache[layer_idx]],
+                    [sink_idx, comp_pos, buffer_idx],
+                )
             else:
                 if not self.config.use_compression:
                     raise NotImplementedError("Cluster without compression is not implemented")
@@ -727,34 +876,54 @@ class ClusterCompressedKVCache(CompressedKVCache):
                     bs=bs,
                     k_dim=k_dim,
                 )
-                num_hist = recon_k.shape[1]
-                hist_idx = torch.arange(num_hist, device=key_states.device).unsqueeze(0).expand(bs, -1) + self.sink_size
-                full_idx = torch.cat([sink_idx, hist_idx, buffer_idx], dim=1)
-                this_response = (
-                    torch.cat([self.sink_key_cache[layer_idx], recon_k, self.buffer_key_cache[layer_idx]], dim=1),
-                    torch.cat([self.sink_value_cache[layer_idx], recon_v, self.buffer_value_cache[layer_idx]], dim=1),
-                    full_idx,
+                this_response = self._build_cache_view(
+                    [self.sink_key_cache[layer_idx], recon_k, self.buffer_key_cache[layer_idx]],
+                    [self.sink_value_cache[layer_idx], recon_v, self.buffer_value_cache[layer_idx]],
+                    [sink_idx, self.comp_pos_cache[layer_idx], buffer_idx],
                 )
         else:
-            full_idx = torch.cat([sink_idx, buffer_idx], dim=1)
-            this_response = (torch.cat([self.sink_key_cache[layer_idx], self.buffer_key_cache[layer_idx]], dim=1),
-                            torch.cat([self.sink_value_cache[layer_idx], self.buffer_value_cache[layer_idx]], dim=1),
-                            full_idx)
+            this_response = self._build_cache_view(
+                [self.sink_key_cache[layer_idx], self.buffer_key_cache[layer_idx]],
+                [self.sink_value_cache[layer_idx], self.buffer_value_cache[layer_idx]],
+                [sink_idx, buffer_idx],
+            )
 
         # 如果buffer内长度超过2倍size，做压缩
         if buffer_len >= self.tail_token_size * 2:
-            compress_len = (buffer_len - self.tail_token_size) // self.tail_token_size * self.tail_token_size
-            if compress_len > 0:
-                _key, self.buffer_key_cache[layer_idx] = self.buffer_key_cache[layer_idx][:, :compress_len], self.buffer_key_cache[layer_idx][:, compress_len:]
-                _val, self.buffer_value_cache[layer_idx] = self.buffer_value_cache[layer_idx][:, :compress_len], self.buffer_value_cache[layer_idx][:, compress_len:]
+            if self.visual_token_prune_only:
+                if bs != 1:
+                    raise NotImplementedError("visual_token_prune_only currently supports batch_size=1.")
+                candidate_len = max(0, buffer_len - self.tail_token_size)
+                compress_idx, drop_idx = self._select_visual_store_and_drop_indices(
+                    layer_idx=layer_idx,
+                    candidate_len=candidate_len,
+                    device=key_states.device,
+                )
+            else:
+                compress_len = (buffer_len - self.tail_token_size) // self.tail_token_size * self.tail_token_size
+                compress_idx = torch.arange(compress_len, device=key_states.device, dtype=torch.long)
+                drop_idx = compress_idx
+
+            if drop_idx.numel() > 0:
+                keep_mask = torch.ones(buffer_len, device=key_states.device, dtype=torch.bool)
+                keep_mask[drop_idx] = False
+                _key = self.buffer_key_cache[layer_idx].index_select(1, compress_idx)
+                _val = self.buffer_value_cache[layer_idx].index_select(1, compress_idx)
+                _pos = self.buffer_pos_cache[layer_idx].index_select(1, compress_idx)
+                self.buffer_key_cache[layer_idx] = self.buffer_key_cache[layer_idx][:, keep_mask]
+                self.buffer_value_cache[layer_idx] = self.buffer_value_cache[layer_idx][:, keep_mask]
+                self.buffer_pos_cache[layer_idx] = self.buffer_pos_cache[layer_idx][:, keep_mask]
+                self.buffer_visual_mask_cache[layer_idx] = self.buffer_visual_mask_cache[layer_idx][:, keep_mask]
+
+                if compress_idx.numel() == 0:
+                    return this_response
 
                 bs, _len, k_dim = _key.shape
                 to_be_compress = torch.cat([_key, _val], dim=-1)
                 
                 existing_centers = self.bases_cache.get(layer_idx, None)
                 # compress 内部会处理量化逻辑
-                hist_len = int(self.comp_kv_cache[layer_idx].shape[1]) if layer_idx in self.comp_kv_cache else 0
-                abs_start_pos = int(self.sink_size + hist_len)
+                abs_start_pos = int(_pos[0, 0].item()) if _pos.numel() else int(self.sink_size)
                 comp_kv, all_centers, father_idx, scale, mn = self.compress(
                     to_be_compress,
                     compressor_down,
@@ -766,12 +935,14 @@ class ClusterCompressedKVCache(CompressedKVCache):
                 if layer_idx not in self.comp_kv_cache:
                     self.comp_kv_cache[layer_idx] = comp_kv
                     self.token_father_idx[layer_idx] = father_idx
+                    self.comp_pos_cache[layer_idx] = _pos
                     if scale is not None:
                         self.comp_kv_scales[layer_idx] = scale
                         self.comp_kv_mins[layer_idx] = mn
                 else:
                     self.comp_kv_cache[layer_idx] = torch.cat([self.comp_kv_cache[layer_idx], comp_kv], dim=1)
                     self.token_father_idx[layer_idx] = torch.cat([self.token_father_idx[layer_idx], father_idx], dim=1)
+                    self.comp_pos_cache[layer_idx] = torch.cat([self.comp_pos_cache[layer_idx], _pos], dim=1)
                     if scale is not None:
                         self.comp_kv_scales[layer_idx] = torch.cat([self.comp_kv_scales[layer_idx], scale], dim=1)
                         self.comp_kv_mins[layer_idx] = torch.cat([self.comp_kv_mins[layer_idx], mn], dim=1)

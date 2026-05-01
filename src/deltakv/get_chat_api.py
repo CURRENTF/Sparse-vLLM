@@ -4,6 +4,7 @@ import torch
 from typing import Union, List
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 from deltakv.configs.model_config_cls import KVQwen2Config, KVQwen3Config, KVLlamaConfig, parse_full_attn_layers
+from deltakv.configs.runtime_params import normalize_runtime_params
 from deltakv.baseline_adapters import load_omnikv_model, load_kivi_model
 from deltakv.quantization import build_model_load_kwargs, restore_modules_to_dtype
 from safetensors.torch import load_file
@@ -199,6 +200,26 @@ def get_generate_api(model_path: str, infer_config: dict, compressor_path: str,
     Returns:
         function: 一个生成函数，输入prompt和生成参数，返回生成内容。
     """
+
+    # `model_cls="deltakv"` is the historical default for this API. Treat it as
+    # unspecified when the JSON config itself carries a method selector, so a
+    # single canonical hyper_param blob can drive both backends.
+    normalization_model_cls = (
+        None
+        if model_cls == "deltakv" and ("model_cls" in infer_config or "sparse_method" in infer_config)
+        else model_cls
+    )
+    normalized_params = normalize_runtime_params(
+        infer_config,
+        backend=backend,
+        model_cls=normalization_model_cls,
+        compressor_path=compressor_path,
+    )
+    for warning in normalized_params.warnings:
+        logger.info(f"Runtime parameter normalization: {warning}")
+    infer_config = normalized_params.infer_config
+    model_cls = normalized_params.model_cls or model_cls
+    compressor_path = normalized_params.compressor_path
 
     if backend == 'sparsevllm':
         from sparsevllm import LLM, SamplingParams

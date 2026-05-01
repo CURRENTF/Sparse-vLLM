@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any
 from time import perf_counter
 
+from deltakv.configs.runtime_params import normalize_runtime_params
+
 
 def get_peak_memory():
     return torch.cuda.max_memory_allocated() / (1024 ** 3) # GB
@@ -45,7 +47,11 @@ def _build_engine_hyper_params(args) -> dict[str, Any]:
 
     hyper_params.update(_load_json_arg(args.hyper_params))
 
-    return hyper_params
+    normalized = normalize_runtime_params(hyper_params, backend="sparsevllm")
+    for warning in normalized.warnings:
+        print(f"[param-normalize] {warning}")
+
+    return normalized.infer_config
 
 
 def benchmark_task(method, length, bs, args, results_dict):

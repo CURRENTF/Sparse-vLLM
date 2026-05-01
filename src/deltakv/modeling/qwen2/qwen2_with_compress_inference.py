@@ -69,6 +69,7 @@ class Qwen2AttnKVCompress(Qwen2Attention):
             cache_position: Optional[torch.LongTensor] = None,
             **kwargs: Unpack[FlashAttentionKwargs],
     ):
+        deltakv_visual_token_mask = kwargs.pop("deltakv_visual_token_mask", None)
         input_shape = hidden_states.shape[:-1]
         bs, q_len, ___ = hidden_states.shape
 
@@ -78,7 +79,10 @@ class Qwen2AttnKVCompress(Qwen2Attention):
         # now shape --> bs, seq_len, dim
 
         if self.config.collect_kv_before_rope:
-            cache_kwargs = {"cache_position": cache_position}
+            cache_kwargs = {
+                "cache_position": cache_position,
+                "deltakv_visual_token_mask": deltakv_visual_token_mask,
+            }
             res = past_key_value.update(
                 key_states, value_states, self.layer_idx, cache_kwargs,
                 compressor_down=self.compress_down,
@@ -110,7 +114,22 @@ class Qwen2AttnKVCompress(Qwen2Attention):
         sink_size = self.config.num_sink_tokens
         is_prefill, is_decode = (q_len > 1), (q_len == 1)
 
-        compressed_len = (past_key_value.get_seq_length() - self.config.tail_token_size - q_len - sink_size) // self.config.tail_token_size * self.config.tail_token_size
+        visual_token_prune_only = bool(
+            getattr(self.config, "visual_token_prune_only", getattr(self.config, "deltakv_visual_compress_only", False))
+        )
+        candidate_abs_idx = None
+        if visual_token_prune_only:
+            target_layer_idx = None
+            comp_pos_cache = getattr(past_key_value, "comp_pos_cache", {})
+            for candidate_layer_idx in sorted(comp_pos_cache):
+                if past_key_value.layer_to_full_layer_idx.get(candidate_layer_idx) == self.layer_idx:
+                    target_layer_idx = candidate_layer_idx
+                    break
+            if target_layer_idx is not None:
+                candidate_abs_idx = past_key_value.get_compressed_positions(target_layer_idx, device=key_states.device)
+            compressed_len = 0 if candidate_abs_idx is None else int(candidate_abs_idx.shape[1])
+        else:
+            compressed_len = (past_key_value.get_seq_length() - self.config.tail_token_size - q_len - sink_size) // self.config.tail_token_size * self.config.tail_token_size
         use_omnikv_selection = bool(self.config.deltakv_use_omnikv_selection)
         do_obs = (
             use_omnikv_selection
@@ -146,7 +165,23 @@ class Qwen2AttnKVCompress(Qwen2Attention):
         # attn weights shape -> bs, heads, q_len, kv_len
         if do_obs:
             # 重新计算 attention score 以支持 Flash Attention 并处理因果掩码问题
-            candidate_key = key_states[:, :, sink_size : sink_size + compressed_len, :]
+            if visual_token_prune_only:
+                if bs != 1:
+                    raise NotImplementedError("visual_token_prune_only currently supports batch_size=1.")
+                gather_pos = torch.searchsorted(full_idx, candidate_abs_idx)
+                valid = (
+                    (gather_pos < full_idx.shape[1])
+                    & (full_idx.gather(1, gather_pos.clamp(max=full_idx.shape[1] - 1)) == candidate_abs_idx)
+                )
+                if not bool(valid.all()):
+                    gather_pos = gather_pos[valid].unsqueeze(0)
+                    compressed_len = int(gather_pos.shape[1])
+                candidate_key = key_states.gather(
+                    2,
+                    gather_pos[:, None, :, None].expand(-1, key_states.shape[1], -1, key_states.shape[-1]),
+                )
+            else:
+                candidate_key = key_states[:, :, sink_size : sink_size + compressed_len, :]
             
             num_top_tokens = self.config.num_top_tokens_in_prefill if is_prefill else self.config.num_top_tokens
             if isinstance(num_top_tokens, (list, tuple)):
@@ -207,6 +242,7 @@ class Qwen2ModelKVCompress(Qwen2Model):
             output_attentions: Optional[bool] = None,
             output_hidden_states: Optional[bool] = None,
             cache_position: Optional[torch.LongTensor] = None,
+            deltakv_visual_token_mask: Optional[torch.Tensor] = None,
             **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
     ):
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -287,6 +323,7 @@ class Qwen2ModelKVCompress(Qwen2Model):
                 use_cache=use_cache,
                 cache_position=cache_position,
                 position_embeddings=position_embeddings,
+                deltakv_visual_token_mask=deltakv_visual_token_mask,
                 **flash_attn_kwargs,
             )
 

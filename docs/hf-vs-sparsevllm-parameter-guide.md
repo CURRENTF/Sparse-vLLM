@@ -2,6 +2,9 @@
 
 This document explains how this repository currently interprets parameters when you run through the `hf` backend versus the `sparsevllm` backend.
 
+For the current canonical parameter aliases, conflict checks, and accuracy/speed
+alignment workflow, see [`runtime-parameter-semantics.md`](runtime-parameter-semantics.md).
+
 It is intentionally implementation-specific. The goal is not to describe an ideal API. The goal is to describe what the code in this repo actually does today, especially in places where:
 
 - the same parameter name means different things,

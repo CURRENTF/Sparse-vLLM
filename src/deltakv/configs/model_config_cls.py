@@ -1,6 +1,7 @@
 from transformers.models.qwen2.modeling_qwen2 import Qwen2Config
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.models.llama.modeling_llama import LlamaConfig
+from deltakv.configs.runtime_params import normalize_runtime_params
 from deltakv.utils.log import logger, log_once
 
 
@@ -66,8 +67,44 @@ class CustomConfigMixin:
         pyramidkv_least_layer=None,
         pyramidkv_least_ratio=0.01,
         kv_quant_bits=0,
+        visual_token_prune_only=None,
+        visual_token_keep_ratio=None,
+        deltakv_visual_compress_only=None,
+        deltakv_visual_keep_ratio=None,
         **kwargs
     ):
+        if visual_token_prune_only is None:
+            visual_token_prune_only = (
+                bool(deltakv_visual_compress_only)
+                if deltakv_visual_compress_only is not None
+                else False
+            )
+        elif (
+            deltakv_visual_compress_only is not None
+            and bool(visual_token_prune_only) != bool(deltakv_visual_compress_only)
+        ):
+            raise ValueError(
+                "Conflicting visual-token prune settings: "
+                f"visual_token_prune_only={visual_token_prune_only!r}, "
+                f"deltakv_visual_compress_only={deltakv_visual_compress_only!r}."
+            )
+
+        if visual_token_keep_ratio is None:
+            visual_token_keep_ratio = (
+                float(deltakv_visual_keep_ratio)
+                if deltakv_visual_keep_ratio is not None
+                else 1.0
+            )
+        elif (
+            deltakv_visual_keep_ratio is not None
+            and float(visual_token_keep_ratio) != float(deltakv_visual_keep_ratio)
+        ):
+            raise ValueError(
+                "Conflicting visual-token keep-ratio settings: "
+                f"visual_token_keep_ratio={visual_token_keep_ratio!r}, "
+                f"deltakv_visual_keep_ratio={deltakv_visual_keep_ratio!r}."
+            )
+
         # 初始化自定义属性
         # 这个地方好像也只能设置一下默认值了，主要目的是有语法提示。
         self.kv_compressed_size = kv_compressed_size
@@ -92,6 +129,7 @@ class CustomConfigMixin:
         self.cluster_temp = cluster_temp
         self.cluster_soft_assignment = cluster_soft_assignment
         self.tail_token_size = tail_token_size
+        self.num_recent_tokens = num_recent_tokens
         self.tail_token_size = num_recent_tokens
         self.full_attn_layers = parse_full_attn_layers(full_attn_layers)
         self.num_top_tokens = num_top_tokens
@@ -113,6 +151,13 @@ class CustomConfigMixin:
         self.pyramidkv_least_layer = pyramidkv_least_layer
         self.pyramidkv_least_ratio = pyramidkv_least_ratio
         self.kv_quant_bits = kv_quant_bits
+        self.visual_token_prune_only = visual_token_prune_only
+        self.visual_token_keep_ratio = visual_token_keep_ratio
+        # Backward-compatible attribute names. The canonical names above are
+        # preferred because the no-compressor path is pruning, not DeltaKV
+        # compression.
+        self.deltakv_visual_compress_only = visual_token_prune_only
+        self.deltakv_visual_keep_ratio = visual_token_keep_ratio
         
         # 调用 MRO 中的下一个 __init__ (Qwen2Config 或 LlamaConfig)
         super().__init__(**kwargs)
@@ -138,6 +183,11 @@ class CustomConfigMixin:
         return max(1, int(self.k_neighbors))
 
     def set_extra_args(self, **kwargs):
+        normalized_params = normalize_runtime_params(kwargs, backend="hf")
+        for warning in normalized_params.warnings:
+            log_once(f"Runtime parameter normalization: {warning}", "INFO")
+        kwargs = normalized_params.infer_config
+
         legacy_keys = {
             "use_nonlinear_compressor",
             "compressor_intermediate_size",
@@ -167,6 +217,12 @@ class CustomConfigMixin:
                 if key == 'full_attn_layers':
                     value = parse_full_attn_layers(value)
                 setattr(self, key, value)
+                if key == 'visual_token_prune_only':
+                    self.deltakv_visual_compress_only = value
+                if key == 'visual_token_keep_ratio':
+                    self.deltakv_visual_keep_ratio = value
+                if key == 'num_recent_tokens':
+                    self.tail_token_size = value
                 print(f"[Config] Setting {key} = {value}")
             else:
                 logger.error(f'There is NO {key} in Custom Config!')
