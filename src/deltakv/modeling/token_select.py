@@ -102,6 +102,8 @@ def omnikv_token_selection(
     pool_kernel_size: int = 5,
     last_token_scores: Optional[torch.Tensor] = None,
     score_method: str = 'last',
+    candidate_mask: Optional[torch.Tensor] = None,
+    query_mask: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     # candidate_weights shape: (bs, heads, q_len, n_candidates)
     if query_states.shape[-2] > 1:
@@ -110,8 +112,18 @@ def omnikv_token_selection(
         candidate_weights = get_qk_score(module, query_states, key_states, scaling)
     
     # Voting & Aggregation
-    # Mean over queries, max over heads
-    token_scores = candidate_weights.mean(dim=2).max(dim=1).values # (bs, n_candidates)
+    # Mean over valid queries, max over heads.
+    if query_mask is not None and query_states.shape[-2] > 1:
+        query_mask = query_mask.to(device=candidate_weights.device, dtype=torch.bool)
+        valid_query = query_mask[:, None, :, None]
+        score_sum = candidate_weights.masked_fill(~valid_query, 0).sum(dim=2)
+        denom = valid_query.sum(dim=2).clamp_min(1)
+        token_scores = (score_sum / denom).max(dim=1).values # (bs, n_candidates)
+    else:
+        token_scores = candidate_weights.mean(dim=2).max(dim=1).values # (bs, n_candidates)
+    if candidate_mask is not None:
+        candidate_mask = candidate_mask.to(device=token_scores.device, dtype=torch.bool)
+        token_scores = token_scores.masked_fill(~candidate_mask, torch.finfo(token_scores.dtype).min)
     
     # Max pooling to smooth scores
     if pool_kernel_size > 1:
@@ -122,6 +134,8 @@ def omnikv_token_selection(
             padding=pool_padding,
             stride=1
         ).squeeze(1)
+        if candidate_mask is not None:
+            token_scores = token_scores.masked_fill(~candidate_mask, torch.finfo(token_scores.dtype).min)
         
     # Score EMA (exp logic)
     if last_token_scores is not None and score_method == 'exp':

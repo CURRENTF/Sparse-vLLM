@@ -81,6 +81,7 @@ def manual_generate(model, tokenizer, prompt: Union[str, List[str]], past_key_va
         add_special_tokens = False
     inputs = tokenizer(prompts, return_tensors='pt', padding=True, add_special_tokens=add_special_tokens).to(model.device)
     input_ids = inputs.input_ids
+    attention_mask = inputs.attention_mask
 
     batch_size = input_ids.shape[0]
     unfinished_sequences = input_ids.new_ones(batch_size, device=model.device)
@@ -96,7 +97,12 @@ def manual_generate(model, tokenizer, prompt: Union[str, List[str]], past_key_va
         for j in range(0, seq_len - 1, chunk_prefill_size):
             end_idx = min(j + chunk_prefill_size, seq_len - 1)
             chunk = input_ids[:, j:end_idx]
-            outputs = model(input_ids=chunk, past_key_values=past_key_values, use_cache=True)
+            outputs = model(
+                input_ids=chunk,
+                attention_mask=attention_mask[:, :end_idx],
+                past_key_values=past_key_values,
+                use_cache=True,
+            )
             past_key_values = outputs.past_key_values
         cur_input_ids = input_ids[:, -1:]
 
@@ -106,7 +112,12 @@ def manual_generate(model, tokenizer, prompt: Union[str, List[str]], past_key_va
     eos_token_ids_tensor = torch.tensor(eos_token_ids, device=model.device)
 
     for i in range(max_new_tokens):
-        outputs = model(input_ids=cur_input_ids, past_key_values=past_key_values, use_cache=True)
+        outputs = model(
+            input_ids=cur_input_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            use_cache=True,
+        )
         logits = outputs.logits[:, -1, :]
         past_key_values = outputs.past_key_values
 
@@ -133,6 +144,7 @@ def manual_generate(model, tokenizer, prompt: Union[str, List[str]], past_key_va
             break
 
         cur_input_ids = next_tokens.unsqueeze(-1)
+        attention_mask = torch.cat([attention_mask, unfinished_sequences[:, None]], dim=1)
 
     skip_special_tokens = True
     if os.environ.get('NOT_SKIP_SPECIAL_TOKENS', False):

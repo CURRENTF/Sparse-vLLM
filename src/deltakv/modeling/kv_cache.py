@@ -21,6 +21,7 @@ class BaseCache(DynamicCache):
         self.num_prompt_tokens = None
         self.visual_token_prune_only = bool(getattr(config, "visual_token_prune_only", False))
         self.visual_compress_only = self.visual_token_prune_only
+        self.invalid_token_position = torch.iinfo(torch.long).max // 4
 
     def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
         """Returns the sequence length of the cached states. A layer index can be optionally passed."""
@@ -34,7 +35,7 @@ class BaseCache(DynamicCache):
         self,
         key_states: torch.Tensor,
         cache_kwargs: Optional[dict[str, Any]],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         bs, q_len = key_states.shape[:2]
         cache_kwargs = cache_kwargs or {}
         cache_position = cache_kwargs.get("cache_position")
@@ -55,7 +56,246 @@ class BaseCache(DynamicCache):
                 visual_mask = visual_mask.unsqueeze(0)
             if visual_mask.shape[0] == 1 and bs > 1:
                 visual_mask = visual_mask.expand(bs, -1)
-        return token_pos, visual_mask
+
+        attention_mask = cache_kwargs.get("deltakv_attention_mask")
+        if attention_mask is None:
+            token_valid_mask = torch.ones((bs, q_len), device=key_states.device, dtype=torch.bool)
+        else:
+            token_valid_mask = attention_mask.to(device=key_states.device, dtype=torch.bool)
+            if token_valid_mask.dim() == 1:
+                token_valid_mask = token_valid_mask.unsqueeze(0)
+            if token_valid_mask.shape[0] == 1 and bs > 1:
+                token_valid_mask = token_valid_mask.expand(bs, -1)
+            token_valid_mask = token_valid_mask[:, -q_len:]
+        return token_pos, visual_mask, token_valid_mask
+
+    def _invalid_pos_like(self, token_pos: torch.Tensor) -> torch.Tensor:
+        return torch.full_like(token_pos, self.invalid_token_position)
+
+    def _valid_pos_mask(self, token_pos: torch.Tensor) -> torch.Tensor:
+        return token_pos < self.invalid_token_position
+
+    def _compressible_lengths_from_buffer(self, layer_idx: int) -> torch.Tensor:
+        valid_counts = self._buffer_valid_mask(layer_idx).sum(dim=1)
+        compress_lens = torch.div(
+            (valid_counts - self.tail_token_size).clamp_min(0),
+            self.tail_token_size,
+            rounding_mode="floor",
+        ) * self.tail_token_size
+        return compress_lens.to(dtype=torch.long)
+
+    def get_buffer_compressible_lengths(self, layer_idx: int, device: Optional[torch.device] = None) -> Optional[torch.Tensor]:
+        if not hasattr(self, "buffer_pos_cache") or layer_idx not in self.buffer_pos_cache:
+            return None
+        lengths = self._compressible_lengths_from_buffer(layer_idx)
+        return lengths.to(device=device) if device is not None else lengths
+
+    def get_buffer_valid_lengths(self, layer_idx: int, device: Optional[torch.device] = None) -> Optional[torch.Tensor]:
+        if not hasattr(self, "buffer_pos_cache") or layer_idx not in self.buffer_pos_cache:
+            return None
+        lengths = self._buffer_valid_mask(layer_idx).sum(dim=1).to(dtype=torch.long)
+        return lengths.to(device=device) if device is not None else lengths
+
+    def _buffer_valid_mask(self, layer_idx: int) -> torch.Tensor:
+        if hasattr(self, "buffer_token_valid_cache") and layer_idx in self.buffer_token_valid_cache:
+            return self.buffer_token_valid_cache[layer_idx] & self._valid_pos_mask(self.buffer_pos_cache[layer_idx])
+        return self._valid_pos_mask(self.buffer_pos_cache[layer_idx])
+
+    def _dummy_positions_for_rows(self, layer_idx: int, *, pos_like: torch.Tensor) -> torch.Tensor:
+        pad_pos_cache = getattr(self, "row_pad_pos_cache", {})
+        if layer_idx not in pad_pos_cache:
+            return pos_like.new_full((pos_like.shape[0],), self.invalid_token_position)
+        return pad_pos_cache[layer_idx].to(device=pos_like.device, dtype=pos_like.dtype)
+
+    def _first_valid_buffer_mask(self, layer_idx: int, lengths: torch.Tensor) -> torch.Tensor:
+        valid = self._buffer_valid_mask(layer_idx)
+        if valid.numel() == 0:
+            return valid
+        lengths = lengths.to(device=valid.device, dtype=torch.long)
+        valid_rank = valid.to(torch.long).cumsum(dim=1) - 1
+        return valid & (valid_rank < lengths.unsqueeze(1))
+
+    def _pack_buffer_by_mask(
+        self,
+        layer_idx: int,
+        select_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        key = self.buffer_key_cache[layer_idx]
+        value = self.buffer_value_cache[layer_idx]
+        pos = self.buffer_pos_cache[layer_idx]
+        bs, _, k_dim = key.shape
+        counts = select_mask.sum(dim=1)
+        max_count = int(counts.max().item()) if counts.numel() else 0
+        dummy_pos = self._dummy_positions_for_rows(layer_idx, pos_like=pos)
+        packed_key = key.new_zeros((bs, max_count, k_dim))
+        packed_value = value.new_zeros((bs, max_count, k_dim))
+        packed_pos = dummy_pos[:, None].expand(-1, max_count).clone()
+        for b in range(bs):
+            idx = torch.nonzero(select_mask[b], as_tuple=False).flatten()
+            if idx.numel() == 0:
+                continue
+            n = int(idx.numel())
+            packed_key[b, :n] = key[b].index_select(0, idx)
+            packed_value[b, :n] = value[b].index_select(0, idx)
+            packed_pos[b, :n] = pos[b].index_select(0, idx)
+        return packed_key, packed_value, packed_pos
+
+    def get_buffer_candidate_positions(
+        self,
+        layer_idx: int,
+        lengths: torch.Tensor,
+        device: Optional[torch.device] = None,
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        if not hasattr(self, "buffer_pos_cache") or layer_idx not in self.buffer_pos_cache:
+            return None
+        select_mask = self._first_valid_buffer_mask(layer_idx, lengths)
+        pos = self.buffer_pos_cache[layer_idx]
+        counts = select_mask.sum(dim=1)
+        max_count = int(counts.max().item()) if counts.numel() else 0
+        dummy_pos = self._dummy_positions_for_rows(layer_idx, pos_like=pos)
+        packed_pos = dummy_pos[:, None].expand(-1, max_count).clone()
+        packed_valid = select_mask.new_zeros((pos.shape[0], max_count))
+        for b in range(pos.shape[0]):
+            idx = torch.nonzero(select_mask[b], as_tuple=False).flatten()
+            if idx.numel() == 0:
+                continue
+            n = int(idx.numel())
+            packed_pos[b, :n] = pos[b].index_select(0, idx)
+            packed_valid[b, :n] = True
+        if device is not None:
+            packed_pos = packed_pos.to(device=device)
+            packed_valid = packed_valid.to(device=device)
+        return packed_pos, packed_valid
+
+    def _filter_buffer_by_mask(self, layer_idx: int, keep_mask: torch.Tensor) -> None:
+        key = self.buffer_key_cache[layer_idx]
+        value = self.buffer_value_cache[layer_idx]
+        pos = self.buffer_pos_cache[layer_idx]
+        visual = self.buffer_visual_mask_cache[layer_idx]
+        bs, _, k_dim = key.shape
+        keep_counts = keep_mask.sum(dim=1)
+        max_keep = int(keep_counts.max().item()) if keep_counts.numel() else 0
+        dummy_pos = self._dummy_positions_for_rows(layer_idx, pos_like=pos)
+        new_key = key.new_zeros((bs, max_keep, k_dim))
+        new_value = value.new_zeros((bs, max_keep, k_dim))
+        new_pos = dummy_pos[:, None].expand(-1, max_keep).clone()
+        new_visual = visual.new_zeros((bs, max_keep))
+        valid_cache = getattr(self, "buffer_token_valid_cache", {}).get(layer_idx)
+        new_valid = keep_mask.new_zeros((bs, max_keep))
+        for b in range(bs):
+            idx = torch.nonzero(keep_mask[b], as_tuple=False).flatten()
+            if idx.numel() == 0:
+                continue
+            n = int(idx.numel())
+            new_key[b, :n] = key[b].index_select(0, idx)
+            new_value[b, :n] = value[b].index_select(0, idx)
+            new_pos[b, :n] = pos[b].index_select(0, idx)
+            new_visual[b, :n] = visual[b].index_select(0, idx)
+            if valid_cache is not None:
+                new_valid[b, :n] = valid_cache[b].index_select(0, idx)
+        self.buffer_key_cache[layer_idx] = new_key
+        self.buffer_value_cache[layer_idx] = new_value
+        self.buffer_pos_cache[layer_idx] = new_pos
+        self.buffer_visual_mask_cache[layer_idx] = new_visual
+        if valid_cache is not None:
+            self.buffer_token_valid_cache[layer_idx] = new_valid
+
+    def _init_pad_aware_layer_cache(
+        self,
+        *,
+        layer_idx: int,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        token_pos: torch.Tensor,
+        visual_mask: torch.Tensor,
+    ) -> None:
+        bs, _, k_dim = key_states.shape
+        sink_len = int(self.sink_size)
+        self.sink_key_cache[layer_idx] = key_states.new_zeros((bs, sink_len, k_dim))
+        self.sink_value_cache[layer_idx] = value_states.new_zeros((bs, sink_len, k_dim))
+        self.sink_pos_cache[layer_idx] = torch.full(
+            (bs, sink_len),
+            self.invalid_token_position,
+            device=key_states.device,
+            dtype=token_pos.dtype,
+        )
+        self.sink_filled_count[layer_idx] = torch.zeros((bs,), device=key_states.device, dtype=torch.long)
+        self.row_pad_pos_cache[layer_idx] = torch.full(
+            (bs,),
+            self.invalid_token_position,
+            device=key_states.device,
+            dtype=token_pos.dtype,
+        )
+        self.buffer_key_cache[layer_idx] = key_states.new_zeros((bs, 0, k_dim))
+        self.buffer_value_cache[layer_idx] = value_states.new_zeros((bs, 0, k_dim))
+        self.buffer_pos_cache[layer_idx] = token_pos.new_full((bs, 0), self.invalid_token_position)
+        self.buffer_visual_mask_cache[layer_idx] = visual_mask.new_zeros((bs, 0))
+        if hasattr(self, "buffer_token_valid_cache"):
+            self.buffer_token_valid_cache[layer_idx] = visual_mask.new_zeros((bs, 0))
+
+    def _fill_sink_and_append_buffer(
+        self,
+        *,
+        layer_idx: int,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        token_pos: torch.Tensor,
+        visual_mask: torch.Tensor,
+        token_valid_mask: torch.Tensor,
+    ) -> None:
+        sink_take_mask = torch.zeros_like(token_valid_mask, dtype=torch.bool)
+        sink_len = int(self.sink_size)
+        if hasattr(self, "row_pad_pos_cache") and layer_idx in self.row_pad_pos_cache:
+            for b in range(key_states.shape[0]):
+                if self.row_pad_pos_cache[layer_idx][b] < self.invalid_token_position:
+                    continue
+                pad_idx = torch.nonzero(~token_valid_mask[b], as_tuple=False).flatten()
+                if pad_idx.numel() > 0:
+                    self.row_pad_pos_cache[layer_idx][b] = token_pos[b, pad_idx[0]]
+
+        if sink_len > 0:
+            for b in range(key_states.shape[0]):
+                remaining = sink_len - int(self.sink_filled_count[layer_idx][b].item())
+                if remaining <= 0:
+                    continue
+                valid_idx = torch.nonzero(token_valid_mask[b], as_tuple=False).flatten()
+                if valid_idx.numel() == 0:
+                    continue
+                take_idx = valid_idx[:remaining]
+                start = int(self.sink_filled_count[layer_idx][b].item())
+                end = start + int(take_idx.numel())
+                self.sink_key_cache[layer_idx][b, start:end] = key_states[b].index_select(0, take_idx)
+                self.sink_value_cache[layer_idx][b, start:end] = value_states[b].index_select(0, take_idx)
+                self.sink_pos_cache[layer_idx][b, start:end] = token_pos[b].index_select(0, take_idx)
+                sink_take_mask[b, take_idx] = True
+                self.sink_filled_count[layer_idx][b] = end
+
+        keep_mask = ~sink_take_mask
+        keep_counts = keep_mask.sum(dim=1)
+        max_keep = int(keep_counts.max().item()) if keep_counts.numel() else 0
+        bs, _, k_dim = key_states.shape
+        buffer_key = key_states.new_zeros((bs, max_keep, k_dim))
+        buffer_value = value_states.new_zeros((bs, max_keep, k_dim))
+        buffer_pos = token_pos.new_full((bs, max_keep), self.invalid_token_position)
+        buffer_visual = visual_mask.new_zeros((bs, max_keep))
+        buffer_valid = token_valid_mask.new_zeros((bs, max_keep))
+        for b in range(bs):
+            idx = torch.nonzero(keep_mask[b], as_tuple=False).flatten()
+            if idx.numel() == 0:
+                continue
+            n = int(idx.numel())
+            buffer_key[b, :n] = key_states[b].index_select(0, idx)
+            buffer_value[b, :n] = value_states[b].index_select(0, idx)
+            buffer_pos[b, :n] = token_pos[b].index_select(0, idx)
+            buffer_visual[b, :n] = visual_mask[b].index_select(0, idx)
+            buffer_valid[b, :n] = token_valid_mask[b].index_select(0, idx)
+
+        self.buffer_key_cache[layer_idx] = torch.cat([self.buffer_key_cache[layer_idx], buffer_key], dim=1)
+        self.buffer_value_cache[layer_idx] = torch.cat([self.buffer_value_cache[layer_idx], buffer_value], dim=1)
+        self.buffer_pos_cache[layer_idx] = torch.cat([self.buffer_pos_cache[layer_idx], buffer_pos], dim=1)
+        self.buffer_visual_mask_cache[layer_idx] = torch.cat([self.buffer_visual_mask_cache[layer_idx], buffer_visual], dim=1)
+        if hasattr(self, "buffer_token_valid_cache"):
+            self.buffer_token_valid_cache[layer_idx] = torch.cat([self.buffer_token_valid_cache[layer_idx], buffer_valid], dim=1)
 
     @staticmethod
     def _sort_cache_view(
@@ -75,10 +315,17 @@ class BaseCache(DynamicCache):
         key_parts: list[torch.Tensor],
         value_parts: list[torch.Tensor],
         pos_parts: list[torch.Tensor],
+        *,
+        layer_idx: Optional[int] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         key_states = torch.cat(key_parts, dim=1)
         value_states = torch.cat(value_parts, dim=1)
         token_pos = torch.cat(pos_parts, dim=1)
+        if layer_idx is not None:
+            invalid = ~self._valid_pos_mask(token_pos)
+            if invalid.any():
+                dummy_pos = self._dummy_positions_for_rows(layer_idx, pos_like=token_pos)
+                token_pos = torch.where(invalid, dummy_pos[:, None], token_pos)
         return self._sort_cache_view(key_states, value_states, token_pos)
 
     def get_compressed_positions(self, layer_idx: int, device: Optional[torch.device] = None) -> Optional[torch.Tensor]:
@@ -212,9 +459,12 @@ class CompressedKVCache(BaseCache):
         self.buffer_value_cache = {}
         self.buffer_pos_cache = {}
         self.buffer_visual_mask_cache = {}
+        self.buffer_token_valid_cache = {}
         self.sink_key_cache = {}
         self.sink_value_cache = {}
         self.sink_pos_cache = {}
+        self.sink_filled_count = {}
+        self.row_pad_pos_cache = {}
         self.comp_pos_cache = {}
 
         self.full_attn_layers = parse_full_attn_layers(config.full_attn_layers)
@@ -333,20 +583,24 @@ class CompressedKVCache(BaseCache):
 
         # key shape -> bs, seq_len, k_dim
         bs, q_len, k_dim = key_states.shape
-        token_pos, visual_mask = self._extract_current_metadata(key_states, cache_kwargs)
+        token_pos, visual_mask, token_valid_mask = self._extract_current_metadata(key_states, cache_kwargs)
 
         if layer_idx not in self.buffer_key_cache:
-            # init
-            self.sink_size = min(self.sink_size, key_states.shape[1])
-            self.sink_key_cache[layer_idx], self.buffer_key_cache[layer_idx] = key_states[:, :self.sink_size], key_states[:, self.sink_size:]
-            self.sink_value_cache[layer_idx], self.buffer_value_cache[layer_idx] = value_states[:, :self.sink_size], value_states[:, self.sink_size:]
-            self.sink_pos_cache[layer_idx], self.buffer_pos_cache[layer_idx] = token_pos[:, :self.sink_size], token_pos[:, self.sink_size:]
-            self.buffer_visual_mask_cache[layer_idx] = visual_mask[:, self.sink_size:]
-        else:
-            self.buffer_key_cache[layer_idx] = torch.cat([self.buffer_key_cache[layer_idx], key_states], dim=1)
-            self.buffer_value_cache[layer_idx] = torch.cat([self.buffer_value_cache[layer_idx], value_states], dim=1)
-            self.buffer_pos_cache[layer_idx] = torch.cat([self.buffer_pos_cache[layer_idx], token_pos], dim=1)
-            self.buffer_visual_mask_cache[layer_idx] = torch.cat([self.buffer_visual_mask_cache[layer_idx], visual_mask], dim=1)
+            self._init_pad_aware_layer_cache(
+                layer_idx=layer_idx,
+                key_states=key_states,
+                value_states=value_states,
+                token_pos=token_pos,
+                visual_mask=visual_mask,
+            )
+        self._fill_sink_and_append_buffer(
+            layer_idx=layer_idx,
+            key_states=key_states,
+            value_states=value_states,
+            token_pos=token_pos,
+            visual_mask=visual_mask,
+            token_valid_mask=token_valid_mask,
+        )
 
         # 初始化一些index
         buffer_len = self.buffer_key_cache[layer_idx].shape[1]
@@ -359,6 +613,7 @@ class CompressedKVCache(BaseCache):
                 [self.sink_key_cache[layer_idx], self.buffer_key_cache[layer_idx]],
                 [self.sink_value_cache[layer_idx], self.buffer_value_cache[layer_idx]],
                 [sink_idx, buffer_idx],
+                layer_idx=layer_idx,
             )
 
         # 下面是 sparse attn layers :
@@ -409,6 +664,7 @@ class CompressedKVCache(BaseCache):
                     [self.sink_key_cache[layer_idx], recon_k, self.buffer_key_cache[layer_idx]],
                     [self.sink_value_cache[layer_idx], recon_v, self.buffer_value_cache[layer_idx]],
                     [sink_idx, comp_pos, buffer_idx],
+                    layer_idx=layer_idx,
                 )
             else:
                 # Standalone DeltaKV: if no external selector provided token ids, reconstruct all compressed history.
@@ -422,12 +678,14 @@ class CompressedKVCache(BaseCache):
                     [self.sink_key_cache[layer_idx], history_k, self.buffer_key_cache[layer_idx]],
                     [self.sink_value_cache[layer_idx], history_v, self.buffer_value_cache[layer_idx]],
                     [sink_idx, self.comp_pos_cache[layer_idx], buffer_idx],
+                    layer_idx=layer_idx,
                 )
         else:
             this_response = self._build_cache_view(
                 [self.sink_key_cache[layer_idx], self.buffer_key_cache[layer_idx]],
                 [self.sink_value_cache[layer_idx], self.buffer_value_cache[layer_idx]],
                 [sink_idx, buffer_idx],
+                layer_idx=layer_idx,
             )
 
         # 如果buffer内长度超过2倍size，做压缩，只剩下 tail_token_size个token
@@ -435,7 +693,8 @@ class CompressedKVCache(BaseCache):
             if self.visual_token_prune_only:
                 if bs != 1:
                     raise NotImplementedError("visual_token_prune_only currently supports batch_size=1.")
-                candidate_len = max(0, buffer_len - self.tail_token_size)
+                valid_buffer_len = int(self._buffer_valid_mask(layer_idx).sum(dim=1).max().item())
+                candidate_len = max(0, valid_buffer_len - self.tail_token_size)
                 compress_idx, drop_idx = self._select_visual_store_and_drop_indices(
                     layer_idx=layer_idx,
                     candidate_len=candidate_len,
@@ -444,24 +703,29 @@ class CompressedKVCache(BaseCache):
                 if self.config.use_compression:
                     usable_len = (compress_idx.numel() // self.config.compressor_token_group_size) * self.config.compressor_token_group_size
                     compress_idx = compress_idx[:usable_len]
-            else:
-                compress_len = (buffer_len - self.tail_token_size) // self.tail_token_size * self.tail_token_size
-                compress_idx = torch.arange(compress_len, device=key_states.device, dtype=torch.long)
-                drop_idx = compress_idx
-
-            if drop_idx.numel() > 0:
-                keep_mask = torch.ones(buffer_len, device=key_states.device, dtype=torch.bool)
-                keep_mask[drop_idx] = False
+                if drop_idx.numel() == 0:
+                    return this_response
+                keep_mask = self._buffer_valid_mask(layer_idx)
+                keep_mask[:, drop_idx] = False
                 _key = self.buffer_key_cache[layer_idx].index_select(1, compress_idx)
                 _val = self.buffer_value_cache[layer_idx].index_select(1, compress_idx)
                 _pos = self.buffer_pos_cache[layer_idx].index_select(1, compress_idx)
-                self.buffer_key_cache[layer_idx] = self.buffer_key_cache[layer_idx][:, keep_mask]
-                self.buffer_value_cache[layer_idx] = self.buffer_value_cache[layer_idx][:, keep_mask]
-                self.buffer_pos_cache[layer_idx] = self.buffer_pos_cache[layer_idx][:, keep_mask]
-                self.buffer_visual_mask_cache[layer_idx] = self.buffer_visual_mask_cache[layer_idx][:, keep_mask]
-
-                if compress_idx.numel() == 0:
+                self._filter_buffer_by_mask(layer_idx, keep_mask)
+            else:
+                compress_lens = self._compressible_lengths_from_buffer(layer_idx)
+                if self.config.use_compression:
+                    group_size = max(1, int(self.config.compressor_token_group_size))
+                    compress_lens = torch.div(compress_lens, group_size, rounding_mode="floor") * group_size
+                max_compress_len = int(compress_lens.max().item()) if compress_lens.numel() else 0
+                if max_compress_len == 0:
                     return this_response
+                compress_mask = self._first_valid_buffer_mask(layer_idx, compress_lens)
+                _key, _val, _pos = self._pack_buffer_by_mask(layer_idx, compress_mask)
+
+                keep_mask = self._buffer_valid_mask(layer_idx) & ~compress_mask
+                self._filter_buffer_by_mask(layer_idx, keep_mask)
+
+            if _pos.numel() > 0:
 
                 bs, _len, k_dim = _key.shape
 
@@ -805,25 +1069,31 @@ class ClusterCompressedKVCache(CompressedKVCache):
 
         # key shape -> bs, seq_len, k_dim
         bs, q_len, k_dim = key_states.shape
-        token_pos, visual_mask = self._extract_current_metadata(key_states, cache_kwargs)
+        token_pos, visual_mask, token_valid_mask = self._extract_current_metadata(key_states, cache_kwargs)
 
-        if layer_idx not in self.buffer_key_cache:
-            # init
-            self.sink_size = min(self.sink_size, key_states.shape[1])
-            self.sink_key_cache[layer_idx], self.buffer_key_cache[layer_idx] = key_states[:, :self.sink_size], key_states[:, self.sink_size:]
-            self.sink_value_cache[layer_idx], self.buffer_value_cache[layer_idx] = value_states[:, :self.sink_size], value_states[:, self.sink_size:]
-            self.sink_pos_cache[layer_idx], self.buffer_pos_cache[layer_idx] = token_pos[:, :self.sink_size], token_pos[:, self.sink_size:]
-            self.buffer_visual_mask_cache[layer_idx] = visual_mask[:, self.sink_size:]
-            # 把 sink tokens 也作为初始聚类中心
-            self.bases_cache[layer_idx] = torch.cat([self.sink_key_cache[layer_idx], self.sink_value_cache[layer_idx]], dim=-1)
+        is_new_layer = layer_idx not in self.buffer_key_cache
+        if is_new_layer:
+            self._init_pad_aware_layer_cache(
+                layer_idx=layer_idx,
+                key_states=key_states,
+                value_states=value_states,
+                token_pos=token_pos,
+                visual_mask=visual_mask,
+            )
             # Initialize dynamic stride cursor after sink size is finalized.
             if self._cluster_next_center_abs_pos is None:
                 self._cluster_next_center_abs_pos = int(self.sink_size)
-        else:
-            self.buffer_key_cache[layer_idx] = torch.cat([self.buffer_key_cache[layer_idx], key_states], dim=1)
-            self.buffer_value_cache[layer_idx] = torch.cat([self.buffer_value_cache[layer_idx], value_states], dim=1)
-            self.buffer_pos_cache[layer_idx] = torch.cat([self.buffer_pos_cache[layer_idx], token_pos], dim=1)
-            self.buffer_visual_mask_cache[layer_idx] = torch.cat([self.buffer_visual_mask_cache[layer_idx], visual_mask], dim=1)
+        self._fill_sink_and_append_buffer(
+            layer_idx=layer_idx,
+            key_states=key_states,
+            value_states=value_states,
+            token_pos=token_pos,
+            visual_mask=visual_mask,
+            token_valid_mask=token_valid_mask,
+        )
+        if is_new_layer:
+            # 把 sink tokens 也作为初始聚类中心
+            self.bases_cache[layer_idx] = torch.cat([self.sink_key_cache[layer_idx], self.sink_value_cache[layer_idx]], dim=-1)
 
         # 初始化一些index
         buffer_len = self.buffer_key_cache[layer_idx].shape[1]
@@ -836,6 +1106,7 @@ class ClusterCompressedKVCache(CompressedKVCache):
                 [self.sink_key_cache[layer_idx], self.buffer_key_cache[layer_idx]],
                 [self.sink_value_cache[layer_idx], self.buffer_value_cache[layer_idx]],
                 [sink_idx, buffer_idx],
+                layer_idx=layer_idx,
             )
 
         # 下面是 sparse attn layers :
@@ -860,6 +1131,7 @@ class ClusterCompressedKVCache(CompressedKVCache):
                     [self.sink_key_cache[layer_idx], recon_k, self.buffer_key_cache[layer_idx]],
                     [self.sink_value_cache[layer_idx], recon_v, self.buffer_value_cache[layer_idx]],
                     [sink_idx, comp_pos, buffer_idx],
+                    layer_idx=layer_idx,
                 )
             else:
                 if not self.config.use_compression:
@@ -875,12 +1147,14 @@ class ClusterCompressedKVCache(CompressedKVCache):
                     [self.sink_key_cache[layer_idx], recon_k, self.buffer_key_cache[layer_idx]],
                     [self.sink_value_cache[layer_idx], recon_v, self.buffer_value_cache[layer_idx]],
                     [sink_idx, self.comp_pos_cache[layer_idx], buffer_idx],
+                    layer_idx=layer_idx,
                 )
         else:
             this_response = self._build_cache_view(
                 [self.sink_key_cache[layer_idx], self.buffer_key_cache[layer_idx]],
                 [self.sink_value_cache[layer_idx], self.buffer_value_cache[layer_idx]],
                 [sink_idx, buffer_idx],
+                layer_idx=layer_idx,
             )
 
         # 如果buffer内长度超过2倍size，做压缩
@@ -888,37 +1162,43 @@ class ClusterCompressedKVCache(CompressedKVCache):
             if self.visual_token_prune_only:
                 if bs != 1:
                     raise NotImplementedError("visual_token_prune_only currently supports batch_size=1.")
-                candidate_len = max(0, buffer_len - self.tail_token_size)
+                valid_buffer_len = int(self._buffer_valid_mask(layer_idx).sum(dim=1).max().item())
+                candidate_len = max(0, valid_buffer_len - self.tail_token_size)
                 compress_idx, drop_idx = self._select_visual_store_and_drop_indices(
                     layer_idx=layer_idx,
                     candidate_len=candidate_len,
                     device=key_states.device,
                 )
-            else:
-                compress_len = (buffer_len - self.tail_token_size) // self.tail_token_size * self.tail_token_size
-                compress_idx = torch.arange(compress_len, device=key_states.device, dtype=torch.long)
-                drop_idx = compress_idx
-
-            if drop_idx.numel() > 0:
-                keep_mask = torch.ones(buffer_len, device=key_states.device, dtype=torch.bool)
-                keep_mask[drop_idx] = False
+                usable_len = (compress_idx.numel() // self.config.compressor_token_group_size) * self.config.compressor_token_group_size
+                compress_idx = compress_idx[:usable_len]
+                if drop_idx.numel() == 0:
+                    return this_response
+                keep_mask = self._buffer_valid_mask(layer_idx)
+                keep_mask[:, drop_idx] = False
                 _key = self.buffer_key_cache[layer_idx].index_select(1, compress_idx)
                 _val = self.buffer_value_cache[layer_idx].index_select(1, compress_idx)
                 _pos = self.buffer_pos_cache[layer_idx].index_select(1, compress_idx)
-                self.buffer_key_cache[layer_idx] = self.buffer_key_cache[layer_idx][:, keep_mask]
-                self.buffer_value_cache[layer_idx] = self.buffer_value_cache[layer_idx][:, keep_mask]
-                self.buffer_pos_cache[layer_idx] = self.buffer_pos_cache[layer_idx][:, keep_mask]
-                self.buffer_visual_mask_cache[layer_idx] = self.buffer_visual_mask_cache[layer_idx][:, keep_mask]
-
-                if compress_idx.numel() == 0:
+                self._filter_buffer_by_mask(layer_idx, keep_mask)
+            else:
+                compress_lens = self._compressible_lengths_from_buffer(layer_idx)
+                group_size = max(1, int(self.config.compressor_token_group_size))
+                compress_lens = torch.div(compress_lens, group_size, rounding_mode="floor") * group_size
+                max_compress_len = int(compress_lens.max().item()) if compress_lens.numel() else 0
+                if max_compress_len == 0:
                     return this_response
+                compress_mask = self._first_valid_buffer_mask(layer_idx, compress_lens)
+                _key, _val, _pos = self._pack_buffer_by_mask(layer_idx, compress_mask)
+                keep_mask = self._buffer_valid_mask(layer_idx) & ~compress_mask
+                self._filter_buffer_by_mask(layer_idx, keep_mask)
 
+            if _pos.numel() > 0:
                 bs, _len, k_dim = _key.shape
                 to_be_compress = torch.cat([_key, _val], dim=-1)
                 
                 existing_centers = self.bases_cache.get(layer_idx, None)
                 # compress 内部会处理量化逻辑
-                abs_start_pos = int(_pos[0, 0].item()) if _pos.numel() else int(self.sink_size)
+                valid_pos = _pos[self._valid_pos_mask(_pos)]
+                abs_start_pos = int(valid_pos.min().item()) if valid_pos.numel() else int(self.sink_size)
                 comp_kv, all_centers, father_idx, scale, mn = self.compress(
                     to_be_compress,
                     compressor_down,
