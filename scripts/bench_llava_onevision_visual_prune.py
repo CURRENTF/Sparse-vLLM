@@ -2,6 +2,8 @@
 import argparse
 import gc
 import json
+import re
+import string
 import time
 from pathlib import Path
 
@@ -88,6 +90,12 @@ def parse_args():
     parser.add_argument("--dataset_dir", default="/data2/haojitai/datasets/llava_onevision_visual_prune_bench")
     parser.add_argument("--source_vqa_dir", default="/data2/haojitai/datasets/VQAv2")
     parser.add_argument("--num_samples", type=int, default=4)
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=1,
+        help="Generation batch size. Currently only the vanilla HF LLaVA path supports batch_size > 1.",
+    )
     parser.add_argument("--max_new_tokens", type=int, default=16)
     parser.add_argument("--cuda_device", type=int, default=7)
     parser.add_argument(
@@ -111,6 +119,7 @@ def parse_args():
     parser.add_argument("--quantize_visual_kv", action="store_true")
     parser.add_argument("--limit_text_tokens", type=int, default=0)
     parser.add_argument("--log_every", type=int, default=1)
+    parser.add_argument("--print_records", action="store_true", help="Print per-sample records in the terminal summary.")
     return parser.parse_args()
 
 
@@ -133,13 +142,17 @@ def prepare_vqa_subset(source_vqa_dir: Path, dataset_dir: Path, num_samples: int
 
     rows = []
     for parquet_file in parquet_files:
-        table = pq.read_table(parquet_file, columns=["question_id", "image_id", "question", "multiple_choice_answer", "image"])
+        table = pq.read_table(
+            parquet_file,
+            columns=["question_id", "image_id", "question", "multiple_choice_answer", "answers", "image"],
+        )
         batch = table.to_pydict()
-        for question_id, image_id, question, answer, image in zip(
+        for question_id, image_id, question, answer, answers, image in zip(
             batch["question_id"],
             batch["image_id"],
             batch["question"],
             batch["multiple_choice_answer"],
+            batch["answers"],
             batch["image"],
         ):
             if not image or image.get("bytes") is None:
@@ -153,6 +166,7 @@ def prepare_vqa_subset(source_vqa_dir: Path, dataset_dir: Path, num_samples: int
                     "image_id": int(image_id),
                     "question": question,
                     "answer": answer,
+                    "answers": [item["answer"] for item in answers or [] if item and item.get("answer") is not None],
                     "image_path": str(image_path),
                 }
             )
@@ -166,6 +180,130 @@ def prepare_vqa_subset(source_vqa_dir: Path, dataset_dir: Path, num_samples: int
 
 def normalize_text(text: str) -> str:
     return " ".join(text.lower().strip().split())
+
+
+VQA_CONTRACTIONS = {
+    "aint": "ain't",
+    "arent": "aren't",
+    "cant": "can't",
+    "couldve": "could've",
+    "couldnt": "couldn't",
+    "didnt": "didn't",
+    "doesnt": "doesn't",
+    "dont": "don't",
+    "hadnt": "hadn't",
+    "hasnt": "hasn't",
+    "havent": "haven't",
+    "hed": "he'd",
+    "hes": "he's",
+    "howd": "how'd",
+    "howll": "how'll",
+    "hows": "how's",
+    "id": "i'd",
+    "ill": "i'll",
+    "im": "i'm",
+    "ive": "i've",
+    "isnt": "isn't",
+    "itd": "it'd",
+    "itll": "it'll",
+    "its": "it's",
+    "lets": "let's",
+    "maam": "ma'am",
+    "mightnt": "mightn't",
+    "mightve": "might've",
+    "mustnt": "mustn't",
+    "mustve": "must've",
+    "neednt": "needn't",
+    "oclock": "o'clock",
+    "shouldnt": "shouldn't",
+    "shouldve": "should've",
+    "thats": "that's",
+    "thered": "there'd",
+    "theres": "there's",
+    "theyd": "they'd",
+    "theyll": "they'll",
+    "theyre": "they're",
+    "theyve": "they've",
+    "wasnt": "wasn't",
+    "wed": "we'd",
+    "were": "we're",
+    "weve": "we've",
+    "werent": "weren't",
+    "whatd": "what'd",
+    "whatll": "what'll",
+    "whats": "what's",
+    "whenll": "when'll",
+    "whens": "when's",
+    "whered": "where'd",
+    "wherell": "where'll",
+    "wheres": "where's",
+    "whod": "who'd",
+    "wholl": "who'll",
+    "whos": "who's",
+    "whyd": "why'd",
+    "whyll": "why'll",
+    "whys": "why's",
+    "wont": "won't",
+    "wouldve": "would've",
+    "wouldnt": "wouldn't",
+    "yall": "y'all",
+    "youd": "you'd",
+    "youll": "you'll",
+    "youre": "you're",
+    "youve": "you've",
+}
+
+VQA_DIGIT_MAP = {
+    "zero": "0",
+    "one": "1",
+    "two": "2",
+    "three": "3",
+    "four": "4",
+    "five": "5",
+    "six": "6",
+    "seven": "7",
+    "eight": "8",
+    "nine": "9",
+    "ten": "10",
+}
+
+VQA_ARTICLES = {"a", "an", "the"}
+VQA_PUNCT = set(string.punctuation)
+VQA_PERIOD_STRIP = re.compile(r"(?<!\d)\.(?!\d)")
+VQA_COMMA_STRIP = re.compile(r"(?<=\d)(,)(?=\d)")
+
+
+def normalize_vqa_answer(text: str) -> str:
+    text = str(text).replace("\n", " ").replace("\t", " ").strip().lower()
+    text = VQA_COMMA_STRIP.sub("", text)
+    text = VQA_PERIOD_STRIP.sub("", text)
+    chars = []
+    for char in text:
+        if char in VQA_PUNCT and char not in {"'", ":"}:
+            chars.append(" ")
+        else:
+            chars.append(char)
+    words = []
+    for word in " ".join("".join(chars).split()).split():
+        mapped = VQA_DIGIT_MAP.get(word, word)
+        if mapped not in VQA_ARTICLES:
+            words.append(VQA_CONTRACTIONS.get(mapped, mapped))
+    return " ".join(words)
+
+
+def vqa_score(prediction: str, answers: list[str]) -> float:
+    if not answers:
+        return 0.0
+    pred = normalize_vqa_answer(prediction)
+    normalized_answers = [normalize_vqa_answer(answer) for answer in answers]
+    if len(normalized_answers) == 1:
+        return float(pred == normalized_answers[0])
+    scores = []
+    for idx, answer in enumerate(normalized_answers):
+        other_answers = normalized_answers[:idx] + normalized_answers[idx + 1 :]
+        matching = sum(pred == other_answer for other_answer in other_answers)
+        scores.append(min(1.0, matching / 3.0))
+    return sum(scores) / len(scores)
 
 
 def batch_to_device(inputs, device, dtype):
@@ -191,6 +329,20 @@ def build_prompt(processor, question: str, limit_text_tokens: int):
         }
     ]
     return processor.apply_chat_template(conversation, add_generation_prompt=True)
+
+
+def iter_batches(rows, batch_size: int):
+    for start in range(0, len(rows), batch_size):
+        yield start, rows[start : start + batch_size]
+
+
+def ensure_left_padding(processor):
+    if getattr(processor, "tokenizer", None) is None:
+        return
+    tokenizer = processor.tokenizer
+    tokenizer.padding_side = "left"
+    if tokenizer.pad_token_id is None and tokenizer.eos_token is not None:
+        tokenizer.pad_token = tokenizer.eos_token
 
 
 def resolve_compressor_path(args):
@@ -345,14 +497,29 @@ def run_method(method, model, processor, rows, args, dtype, device, policy=None,
     records = []
     total_new_tokens = 0
     total_time = 0.0
+    total_batches = 0
+
+    effective_batch_size = max(1, int(args.batch_size)) if method == "vanilla" and policy is None else 1
+    if effective_batch_size > 1:
+        ensure_left_padding(processor)
+    elif getattr(processor, "tokenizer", None) is not None and processor.tokenizer.pad_token_id is None:
+        ensure_left_padding(processor)
 
     log_every = max(1, int(args.log_every))
-    for sample_idx, row in enumerate(rows, 1):
-        image = Image.open(row["image_path"]).convert("RGB")
-        prompt = build_prompt(processor, row["question"], args.limit_text_tokens)
-        inputs = processor(text=prompt, images=image, return_tensors="pt")
+    for batch_start, batch_rows in iter_batches(rows, effective_batch_size):
+        images = [Image.open(row["image_path"]).convert("RGB") for row in batch_rows]
+        prompts = [build_prompt(processor, row["question"], args.limit_text_tokens) for row in batch_rows]
+        processor_kwargs = {"text": prompts, "images": images, "return_tensors": "pt"}
+        if len(batch_rows) > 1:
+            processor_kwargs["padding"] = True
+        inputs = processor(**processor_kwargs)
         input_len = int(inputs["input_ids"].shape[1])
-        visual_tokens = int((inputs["input_ids"] == model.config.image_token_id).sum().item())
+        attention_mask = inputs.get("attention_mask")
+        if attention_mask is not None:
+            input_token_counts = attention_mask.sum(dim=1).tolist()
+        else:
+            input_token_counts = [input_len for _ in batch_rows]
+        visual_token_counts = (inputs["input_ids"] == model.config.image_token_id).sum(dim=1).tolist()
         inputs = batch_to_device(inputs, device, dtype)
 
         torch.cuda.synchronize(device)
@@ -362,40 +529,58 @@ def run_method(method, model, processor, rows, args, dtype, device, policy=None,
             max_new_tokens=args.max_new_tokens,
             do_sample=False,
             use_cache=True,
+            pad_token_id=getattr(processor.tokenizer, "pad_token_id", None),
         )
         torch.cuda.synchronize(device)
         elapsed = time.perf_counter() - start
 
-        new_tokens = int(output_ids.shape[1] - input_len)
-        total_new_tokens += new_tokens
+        generated_ids = output_ids[:, input_len:]
+        decoded_batch = processor.batch_decode(generated_ids, skip_special_tokens=True)
+        new_tokens = int(generated_ids.shape[1])
+        batch_new_tokens = new_tokens * len(batch_rows)
+        total_new_tokens += batch_new_tokens
         total_time += elapsed
-        decoded = processor.batch_decode(output_ids[:, input_len:], skip_special_tokens=True)[0].strip()
-        answer = row["answer"]
-        hit = normalize_text(answer) in normalize_text(decoded)
-        records.append(
-            {
-                "question_id": row["question_id"],
-                "input_tokens": input_len,
-                "visual_tokens": visual_tokens,
-                "new_tokens": new_tokens,
-                "seconds": elapsed,
-                "new_tokens_per_s": new_tokens / elapsed if elapsed > 0 else 0.0,
-                "answer": answer,
-                "prediction": decoded,
-                "contains_answer": hit,
-            }
-        )
-        if sample_idx <= 5 or sample_idx == len(rows) or sample_idx % log_every == 0:
-            print(
-                f"[{method}] {sample_idx}/{len(rows)} qid={row['question_id']} "
-                f"input={input_len} visual={visual_tokens} new={new_tokens} "
-                f"time={elapsed:.3f}s tok/s={records[-1]['new_tokens_per_s']:.2f} "
-                f"hit={hit} pred={decoded[:80]!r}",
-                flush=True,
+        total_batches += 1
+        batch_tok_s = batch_new_tokens / elapsed if elapsed > 0 else 0.0
+
+        for offset, (row, decoded) in enumerate(zip(batch_rows, decoded_batch)):
+            sample_idx = batch_start + offset + 1
+            decoded = decoded.strip()
+            answer = row["answer"]
+            answers = row.get("answers") or [answer]
+            hit = normalize_text(answer) in normalize_text(decoded)
+            score = vqa_score(decoded, answers)
+            records.append(
+                {
+                    "question_id": row["question_id"],
+                    "input_tokens": int(input_token_counts[offset]),
+                    "padded_input_tokens": input_len,
+                    "visual_tokens": int(visual_token_counts[offset]),
+                    "new_tokens": new_tokens,
+                    "seconds": elapsed / len(batch_rows),
+                    "batch_seconds": elapsed,
+                    "new_tokens_per_s": new_tokens / (elapsed / len(batch_rows)) if elapsed > 0 else 0.0,
+                    "batch_new_tokens_per_s": batch_tok_s,
+                    "answer": answer,
+                    "answers": answers,
+                    "prediction": decoded,
+                    "contains_answer": hit,
+                    "vqa_score": score,
+                }
             )
+            if sample_idx <= 5 or sample_idx == len(rows) or sample_idx % log_every == 0:
+                print(
+                    f"[{method}] {sample_idx}/{len(rows)} qid={row['question_id']} "
+                    f"batch={len(batch_rows)} input={input_token_counts[offset]} padded={input_len} "
+                    f"visual={visual_token_counts[offset]} new={new_tokens} "
+                    f"batch_time={elapsed:.3f}s batch_tok/s={batch_tok_s:.2f} "
+                    f"vqa={score:.3f} hit={hit} pred={decoded[:80]!r}",
+                    flush=True,
+                )
 
     peak_gb = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
     contains_acc = sum(record["contains_answer"] for record in records) / max(len(records), 1)
+    mean_vqa_score = sum(record["vqa_score"] for record in records) / max(len(records), 1)
     visual_keep_ratio = args.visual_keep_ratio if policy is not None else 1.0
     visual_storage_ratio = 1.0
     if policy is not None:
@@ -409,12 +594,17 @@ def run_method(method, model, processor, rows, args, dtype, device, policy=None,
         "visual_keep_ratio": visual_keep_ratio,
         "visual_storage_ratio": visual_storage_ratio,
         "num_samples": len(records),
+        "batch_size": effective_batch_size,
+        "total_batches": total_batches,
         "total_new_tokens": total_new_tokens,
         "total_seconds": total_time,
         "new_tokens_per_s": total_new_tokens / total_time if total_time > 0 else 0.0,
+        "examples_per_s": len(records) / total_time if total_time > 0 else 0.0,
+        "mean_batch_seconds": total_time / max(total_batches, 1),
         "mean_seconds": total_time / max(len(records), 1),
         "peak_memory_gb": peak_gb,
         "contains_answer_acc": contains_acc,
+        "mean_vqa_score": mean_vqa_score,
         "records": records,
     }
     if policy is not None:
@@ -486,7 +676,15 @@ def main():
     out_path = Path(args.dataset_dir) / "last_benchmark_result.json"
     out_path.write_text(json.dumps(results, indent=2, ensure_ascii=False) + "\n")
     print("[summary]")
-    print(json.dumps(results, indent=2, ensure_ascii=False))
+    if args.print_records:
+        printable_results = results
+    else:
+        printable_results = []
+        for result in results:
+            item = dict(result)
+            item["records"] = f"{len(result.get('records', []))} records saved to {out_path}"
+            printable_results.append(item)
+    print(json.dumps(printable_results, indent=2, ensure_ascii=False))
     print(f"[saved] {out_path}")
 
 
