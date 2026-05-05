@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Legacy script-name entrypoint for the LLaVA-OneVision benchmark.
 
-The no-compressor path in this benchmark is visual-token uniform pruning, not
-DeltaKV clustering or learned DeltaKV compression. Use the explicitly named
-visual-prune script for new runs.
+Use the explicitly named visual-cache benchmark for new runs. It now separates
+standard checkpoint-backed DeltaKV, no-compressor delta quantization, and the
+visual-token uniform-pruning baseline.
 """
 from pathlib import Path
 import runpy
@@ -13,8 +13,8 @@ if __name__ == "__main__":
     print(
         "[deprecated] scripts/bench_llava_onevision_deltakv.py now delegates to "
         "scripts/bench_llava_onevision_visual_prune.py. "
-        "With --deltakv_checkpoint_path none this is visual-token uniform pruning, not "
-        "DeltaKV cluster/compressor inference.",
+        "Select --methods deltakv, deltakv_delta_quant, or visual_uniform_keep "
+        "explicitly.",
         flush=True,
     )
     runpy.run_path(

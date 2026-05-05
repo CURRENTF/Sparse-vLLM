@@ -186,7 +186,7 @@ class LlavaOnevisionDeltaKVModel(LlavaOnevisionModel):
                 past_key_values = CompressedKVCache(config=self.config.text_config)
 
         outputs = self.language_model(
-            attention_mask=None,
+            attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,

@@ -779,6 +779,7 @@ class ClusterCompressedKVCache(CompressedKVCache):
         self.comp_kv_mins = {}
         # Dynamic prototype sampling: keep a per-sequence cursor so stride can grow with
         # absolute position without "resetting" at chunk boundaries.
+        self.bases_valid_cache = {}
         self._cluster_next_center_abs_pos = None  # type: Optional[int]
         self._cluster_center_plan_cache_key = None  # type: Optional[tuple[int, int]]
         self._cluster_center_plan_cache_val = None  # type: Optional[torch.Tensor]
@@ -1012,6 +1013,33 @@ class ClusterCompressedKVCache(CompressedKVCache):
             recon_kv = (compressor_up(imp_comp_kv) + imp_bases).view(bs, -1, 2, k_dim)
         return recon_kv[:, :, 0], recon_kv[:, :, 1]
 
+    def _reconstruct_selected_cluster_delta_quant_tokens(
+        self,
+        *,
+        layer_idx: int,
+        token_idx: torch.Tensor,
+        bs: int,
+        k_dim: int,
+    ):
+        comp_kv = self.comp_kv_cache[layer_idx]
+        bases = self.bases_cache[layer_idx]
+        topk_father_idx = self.token_father_idx[layer_idx]
+        k = topk_father_idx.shape[-1]
+
+        residual = comp_kv.gather(1, token_idx[:, :, None].expand(-1, -1, comp_kv.shape[-1]))
+        if self.config.kv_quant_bits == 4:
+            scales = self.comp_kv_scales[layer_idx]
+            mins = self.comp_kv_mins[layer_idx]
+            residual_scales = scales.gather(1, token_idx[:, :, None].expand(-1, -1, scales.shape[-1]))
+            residual_mins = mins.gather(1, token_idx[:, :, None].expand(-1, -1, mins.shape[-1]))
+            residual = self._dequantize_kv_tokens(residual, residual_scales, residual_mins, 2 * k_dim)
+
+        father_idx = topk_father_idx.gather(1, token_idx[:, :, None].expand(-1, -1, k))
+        flat_idx = father_idx.reshape(bs, -1)[:, :, None].expand(-1, -1, bases.shape[-1])
+        refs = bases.gather(1, flat_idx).view(bs, token_idx.shape[1], k, -1).mean(dim=2)
+        recon_kv = (residual + refs).view(bs, -1, 2, k_dim)
+        return recon_kv[:, :, 0], recon_kv[:, :, 1]
+
     def _reconstruct_all_cluster_tokens(
         self,
         *,
@@ -1047,6 +1075,111 @@ class ClusterCompressedKVCache(CompressedKVCache):
         else:
             recon_kv = (compressor_up(comp_kv) + all_bases).view(bs, -1, 2, k_dim)
         return recon_kv[:, :, 0], recon_kv[:, :, 1]
+
+    def _reconstruct_all_cluster_delta_quant_tokens(
+        self,
+        *,
+        layer_idx: int,
+        bs: int,
+        k_dim: int,
+    ):
+        if self.config.kv_quant_bits == 4:
+            residual = self._dequantize_kv_tokens(
+                self.comp_kv_cache[layer_idx],
+                self.comp_kv_scales[layer_idx],
+                self.comp_kv_mins[layer_idx],
+                2 * k_dim,
+            )
+        else:
+            residual = self.comp_kv_cache[layer_idx]
+
+        bases = self.bases_cache[layer_idx]
+        topk_father_idx = self.token_father_idx[layer_idx]
+        num_hist = residual.shape[1]
+        k = topk_father_idx.shape[-1]
+        flat_idx = topk_father_idx.reshape(bs, -1)[:, :, None].expand(-1, -1, bases.shape[-1])
+        refs = bases.gather(1, flat_idx).view(bs, num_hist, k, -1).mean(dim=2)
+        recon_kv = (residual + refs).view(bs, -1, 2, k_dim)
+        return recon_kv[:, :, 0], recon_kv[:, :, 1]
+
+    def _compress_cluster_delta_quant(
+        self,
+        kv_states: torch.Tensor,
+        valid_mask: torch.Tensor,
+        existing_centers: Optional[torch.Tensor] = None,
+        existing_center_valid: Optional[torch.Tensor] = None,
+        *,
+        abs_start_pos: Optional[int] = None,
+    ):
+        bs, seq_len, kv_dim = kv_states.shape
+        cluster_step = max(1, int(1 / self.config.cluster_ratio))
+        stride_alpha = float(getattr(self.config, "stride_alpha", 0.0) or 0.0)
+        if abs_start_pos is None:
+            abs_start_pos = 0
+
+        if stride_alpha <= 0.0:
+            center_rel = torch.arange(0, seq_len, cluster_step, device=kv_states.device, dtype=torch.long)
+        else:
+            center_rel = self._get_dynamic_center_rel(
+                abs_start_pos=int(abs_start_pos),
+                seq_len=int(seq_len),
+                base_step=int(cluster_step),
+                device=kv_states.device,
+            )
+        new_centers = kv_states.index_select(1, center_rel).contiguous()
+        new_center_valid = valid_mask.index_select(1, center_rel) if center_rel.numel() else valid_mask.new_zeros((bs, 0))
+
+        if existing_centers is None:
+            all_centers = new_centers
+            all_center_valid = new_center_valid
+            num_existing = 0
+        else:
+            all_centers = torch.cat([existing_centers, new_centers], dim=1)
+            if existing_center_valid is None:
+                existing_center_valid = torch.ones(
+                    existing_centers.shape[:2],
+                    device=existing_centers.device,
+                    dtype=torch.bool,
+                )
+            all_center_valid = torch.cat([existing_center_valid.to(new_center_valid.device), new_center_valid], dim=1)
+            num_existing = existing_centers.shape[1]
+
+        if all_centers.shape[1] == 0:
+            raise RuntimeError("Delta-quant clustering has no reference centers.")
+
+        metric_type = self.config.cluster_metric
+        use_kv = self.config.cluster_on_kv
+        if metric_type == "l2":
+            scores = self._metric_l2(kv_states, all_centers, use_kv=use_kv)
+        elif metric_type == "dot":
+            scores = self._metric_dot(kv_states, all_centers, use_kv=use_kv)
+        elif metric_type == "cosine":
+            scores = self._metric_cosine(kv_states, all_centers, use_kv=use_kv)
+        else:
+            raise ValueError(f"Unknown metric type: {metric_type}")
+
+        num_new = new_centers.shape[1]
+        rows = torch.arange(seq_len, device=kv_states.device).view(-1, 1)
+        cols = center_rel.to(torch.long).view(1, -1)
+        mask_new = cols <= rows if num_new else torch.empty((seq_len, 0), device=kv_states.device, dtype=torch.bool)
+        mask_existing = torch.ones((seq_len, num_existing), device=kv_states.device, dtype=torch.bool)
+        causal_center_mask = torch.cat([mask_existing, mask_new], dim=1)
+        scores = scores.masked_fill(~causal_center_mask.unsqueeze(0), float("-inf"))
+        scores = scores.masked_fill(~all_center_valid[:, None, :], float("-inf"))
+
+        k = min(self.config.get_cluster_neighbor_count(), all_centers.shape[1])
+        safe_scores = scores.masked_fill(~valid_mask[:, :, None], 0.0)
+        topk_indices = torch.topk(safe_scores, k=k, dim=-1).indices
+
+        indices = topk_indices.reshape(bs, -1)[:, :, None].expand(-1, -1, kv_dim)
+        refs = all_centers.gather(1, indices).view(bs, seq_len, k, kv_dim).mean(dim=2)
+        residual = kv_states - refs
+        residual = residual.masked_fill(~valid_mask[:, :, None], 0.0)
+
+        if self.config.kv_quant_bits == 4:
+            packed, scale, mn = self._quantize_kv_tokens(residual)
+            return packed, all_centers, all_center_valid, topk_indices, scale, mn
+        return residual, all_centers, all_center_valid, topk_indices, None, None
 
     def update(
             self,
@@ -1094,6 +1227,7 @@ class ClusterCompressedKVCache(CompressedKVCache):
         if is_new_layer:
             # 把 sink tokens 也作为初始聚类中心
             self.bases_cache[layer_idx] = torch.cat([self.sink_key_cache[layer_idx], self.sink_value_cache[layer_idx]], dim=-1)
+            self.bases_valid_cache[layer_idx] = self._valid_pos_mask(self.sink_pos_cache[layer_idx])
 
         # 初始化一些index
         buffer_len = self.buffer_key_cache[layer_idx].shape[1]
@@ -1115,16 +1249,21 @@ class ClusterCompressedKVCache(CompressedKVCache):
             if self.layer_to_full_layer_idx[layer_idx] in self.top_token_idx:
                 token_idx = self.top_token_idx[self.layer_to_full_layer_idx[layer_idx]]  # bs, num_imp_tokens
 
-                if not self.config.use_compression:
-                    raise NotImplementedError("Cluster without compression is not implemented")
-
-                recon_k, recon_v = self._reconstruct_selected_cluster_tokens(
-                    layer_idx=layer_idx,
-                    token_idx=token_idx,
-                    compressor_up=compressor_up,
-                    bs=bs,
-                    k_dim=k_dim,
-                )
+                if self.config.use_compression:
+                    recon_k, recon_v = self._reconstruct_selected_cluster_tokens(
+                        layer_idx=layer_idx,
+                        token_idx=token_idx,
+                        compressor_up=compressor_up,
+                        bs=bs,
+                        k_dim=k_dim,
+                    )
+                else:
+                    recon_k, recon_v = self._reconstruct_selected_cluster_delta_quant_tokens(
+                        layer_idx=layer_idx,
+                        token_idx=token_idx,
+                        bs=bs,
+                        k_dim=k_dim,
+                    )
 
                 comp_pos = self.comp_pos_cache[layer_idx].gather(1, token_idx)
                 this_response = self._build_cache_view(
@@ -1134,15 +1273,19 @@ class ClusterCompressedKVCache(CompressedKVCache):
                     layer_idx=layer_idx,
                 )
             else:
-                if not self.config.use_compression:
-                    raise NotImplementedError("Cluster without compression is not implemented")
-
-                recon_k, recon_v = self._reconstruct_all_cluster_tokens(
-                    layer_idx=layer_idx,
-                    compressor_up=compressor_up,
-                    bs=bs,
-                    k_dim=k_dim,
-                )
+                if self.config.use_compression:
+                    recon_k, recon_v = self._reconstruct_all_cluster_tokens(
+                        layer_idx=layer_idx,
+                        compressor_up=compressor_up,
+                        bs=bs,
+                        k_dim=k_dim,
+                    )
+                else:
+                    recon_k, recon_v = self._reconstruct_all_cluster_delta_quant_tokens(
+                        layer_idx=layer_idx,
+                        bs=bs,
+                        k_dim=k_dim,
+                    )
                 this_response = self._build_cache_view(
                     [self.sink_key_cache[layer_idx], recon_k, self.buffer_key_cache[layer_idx]],
                     [self.sink_value_cache[layer_idx], recon_v, self.buffer_value_cache[layer_idx]],
@@ -1194,18 +1337,33 @@ class ClusterCompressedKVCache(CompressedKVCache):
             if _pos.numel() > 0:
                 bs, _len, k_dim = _key.shape
                 to_be_compress = torch.cat([_key, _val], dim=-1)
-                
+
                 existing_centers = self.bases_cache.get(layer_idx, None)
-                # compress 内部会处理量化逻辑
                 valid_pos = _pos[self._valid_pos_mask(_pos)]
                 abs_start_pos = int(valid_pos.min().item()) if valid_pos.numel() else int(self.sink_size)
-                comp_kv, all_centers, father_idx, scale, mn = self.compress(
-                    to_be_compress,
-                    compressor_down,
-                    existing_centers,
-                    abs_start_pos=abs_start_pos,
-                )
-                self.bases_cache[layer_idx] = all_centers
+                if self.config.use_compression:
+                    # compress 内部会处理量化逻辑
+                    comp_kv, all_centers, father_idx, scale, mn = self.compress(
+                        to_be_compress,
+                        compressor_down,
+                        existing_centers,
+                        abs_start_pos=abs_start_pos,
+                    )
+                    self.bases_cache[layer_idx] = all_centers
+                else:
+                    valid_mask = (
+                        torch.arange(_len, device=_pos.device).unsqueeze(0)
+                        < compress_lens.to(device=_pos.device).unsqueeze(1)
+                    )
+                    comp_kv, all_centers, all_center_valid, father_idx, scale, mn = self._compress_cluster_delta_quant(
+                        to_be_compress,
+                        valid_mask,
+                        existing_centers,
+                        self.bases_valid_cache.get(layer_idx),
+                        abs_start_pos=abs_start_pos,
+                    )
+                    self.bases_cache[layer_idx] = all_centers
+                    self.bases_valid_cache[layer_idx] = all_center_valid
 
                 if layer_idx not in self.comp_kv_cache:
                     self.comp_kv_cache[layer_idx] = comp_kv

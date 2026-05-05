@@ -398,10 +398,12 @@ class Qwen2ModelKVCompress(Qwen2Model):
                 past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
             )
 
-        if position_ids is None:
-            position_ids = cache_position.unsqueeze(0)
-
         attention_mask_2d = attention_mask if isinstance(attention_mask, torch.Tensor) and attention_mask.dim() == 2 else None
+        if position_ids is None:
+            if attention_mask_2d is not None:
+                position_ids = _position_ids_from_attention_mask(attention_mask_2d)[:, -inputs_embeds.shape[1]:]
+            else:
+                position_ids = cache_position.unsqueeze(0)
 
         # It may already have been prepared by e.g. `generate`
         if not isinstance(causal_mask_mapping := attention_mask, dict):

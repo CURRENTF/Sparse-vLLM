@@ -323,7 +323,7 @@ When `use_cluster=True`:
   dynamic stride from `stride_alpha`.
 - Each token selects up to `deltakv_neighbor_count` centers using `cluster_metric` and
   `cluster_on_kv`.
-- Standard cluster compression stores learned latent residual:
+- When `use_compression=True`, cluster compression stores learned latent residual:
 
 ```text
 compressor_down(token_kv) - compressor_down(mean(selected_centers))
@@ -331,11 +331,22 @@ compressor_down(token_kv) - compressor_down(mean(selected_centers))
 
 - If `deltakv_latent_quant_bits=4`, this quantizes the latent `comp_kv`, not the original
   full KV and not token-space residual.
-- Standard cluster reconstruction requires `use_compression=True`. The code
-  raises `NotImplementedError("Cluster without compression is not implemented")`
-  when it needs to reconstruct clustered history and `use_compression=False`.
+- When `use_compression=False`, the same cache can run the direct residual-quant
+  path:
 
-This is different from the residual-quant ablation paths below.
+```text
+residual = token_kv - mean(selected_centers)
+```
+
+- In that direct path, `deltakv_latent_quant_bits=4` quantizes the token-space
+  residual itself. No learned `compress_down` or `compress_up` module is used
+  for compression or reconstruction.
+- The direct path is pad-aware for batched left-padding runs: padding tokens are
+  stored with invalid positions and cannot become valid reference centers.
+
+This is the no-compressor variant used by the LLaVA `deltakv_delta_quant`
+benchmark. The residual-quant ablation paths below still have their own wrapper
+routing.
 
 ### 7.3 `origin_residual_quant`
 
@@ -595,9 +606,10 @@ Current implemented benchmark methods:
 | Method label | Actual behavior |
 | --- | --- |
 | `vanilla` | Standard `LlavaOnevisionForConditionalGeneration`. |
+| `deltakv` | LLaVA-OneVision DeltaKV wrapper with a real learned compressor checkpoint. Uses the checkpoint config plus CLI keep budgets. |
+| `deltakv_delta_quant` | LLaVA-OneVision DeltaKV wrapper with no learned compressor checkpoint. Uses cluster/ref reconstruction, stores token-space residuals, and int4 quantizes those residuals. |
 | `visual_uniform_keep` | DeltaKV wrapper infrastructure, but no compressor, no cluster, no ref tokens. Uniformly keeps visual tokens and drops the rest. |
 | `visual_uniform_keep_int4` | Same uniform visual token keep path, plus direct int4 storage of kept visual KV. |
-| `visual_deltakv_compressor` | Experimental wrapper path when a real `--deltakv_checkpoint_path` is supplied. Behavior depends on checkpoint config. |
 
 Important parameters:
 
@@ -606,6 +618,9 @@ Important parameters:
 | `visual_token_prune_only` | Restricts cache dropping/pruning to visual tokens. |
 | `visual_token_keep_ratio` / CLI `--visual_keep_ratio` | Fraction of eligible visual tokens kept by uniform subsampling. |
 | `--quantize_visual_kv` | Sets `deltakv_latent_quant_bits=4` in no-checkpoint fallback. |
+| `--delta_quant_bits` | Sets residual quantization bits for `deltakv_delta_quant`; currently only `4` is implemented. |
+| `--deltakv_center_ratio` | Public center/prototype sampling ratio for `deltakv_delta_quant`. |
+| `--deltakv_neighbor_count` | Number of selected ref centers for each compressed token in `deltakv_delta_quant`. |
 | `recent_keep_tokens`, `sink_keep_tokens`, `full_attention_layers` | Passed into text config and affect cache buffer behavior. |
 | `decode_keep_tokens`, `prefill_keep_tokens` | Present for wrapper compatibility; current no-checkpoint visual uniform path does not use SnapKV-style attention scoring for pruning. |
 
@@ -613,13 +628,12 @@ Current limitations:
 
 - `visual_token_prune_only` currently raises for batch size greater than 1 in
   HF cache update.
-- The no-checkpoint fallback explicitly sets `use_compression=False` and
+- `visual_uniform_keep` explicitly sets `use_compression=False` and
   `use_cluster=False`.
-- `LlavaOnevisionDeltaKVModel` currently instantiates only `CompressedKVCache`
-  or `ClusterCompressedKVCache`. It does not yet route to
-  `OriginResidualQuantClusterCompressedKVCache` or
-  `AllOriginResidualQuantClusterCompressedKVCache`.
-- Therefore "LLaVA visual keep10" without checkpoint is not using cluster/ref
+- `deltakv_delta_quant` is a no-checkpoint DeltaKV-style path, but it is not
+  visual-only pruning. It compresses the eligible text-backbone KV stream; in
+  image VQA prompts most eligible tokens are visual tokens.
+- "LLaVA visual keep10" without checkpoint is still not using cluster/ref
   tokens. It is uniform pruning.
 
 ## 14. Benchmark Entrypoints
