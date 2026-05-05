@@ -83,12 +83,33 @@ def parse_args():
     parser.add_argument("--num_samples", type=int, default=16, help="Rows to evaluate after filtering missing videos. Use -1 for all available rows.")
     parser.add_argument("--sample_start", type=int, default=0)
     parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--num_video_frames", type=int, default=8)
+    parser.add_argument(
+        "--num_video_frames",
+        type=int,
+        default=32,
+        help="Uniform video frames per query. StreamingBench's LLaVA-OneVision baseline uses 32.",
+    )
     parser.add_argument(
         "--context_seconds",
         type=float,
         default=60.0,
         help="Seconds before each query timestamp. Use -1 for all context from the start of the video.",
+    )
+    parser.add_argument(
+        "--streamingbench_profile",
+        default="custom",
+        choices=["custom", "official_60s", "official_all_context"],
+        help=(
+            "Convenience profile. official_60s sets 32 frames and 60s query context, matching "
+            "the StreamingBench main leaderboard. official_all_context sets 32 frames and all "
+            "preceding context."
+        ),
+    )
+    parser.add_argument(
+        "--frame_sampling_backend",
+        default="decord",
+        choices=["decord", "ffmpeg"],
+        help="Use decord uniform frame indices to match the official model adapter, or ffmpeg timestamp extraction.",
     )
     parser.add_argument("--max_new_tokens", type=int, default=8)
     parser.add_argument("--cuda_device", type=int, default=7)
@@ -111,6 +132,16 @@ def parse_args():
     parser.add_argument("--log_every", type=int, default=1)
     parser.add_argument("--print_records", action="store_true")
     return parser.parse_args()
+
+
+def apply_streamingbench_profile(args):
+    if args.streamingbench_profile == "official_60s":
+        args.num_video_frames = 32
+        args.context_seconds = 60.0
+    elif args.streamingbench_profile == "official_all_context":
+        args.num_video_frames = 32
+        args.context_seconds = -1.0
+    return args
 
 
 def parse_timestamp(value: str) -> float:
@@ -310,13 +341,12 @@ def ensure_frame(video_path: Path, timestamp: float, output_path: Path, fallback
     return False
 
 
-def frame_cache_key(video_path: Path, start_seconds: float, end_seconds: float, num_frames: int) -> str:
-    raw = f"{video_path.resolve()}:{start_seconds:.3f}:{end_seconds:.3f}:{num_frames}"
+def frame_cache_key(video_path: Path, start_seconds: float, end_seconds: float, num_frames: int, backend: str) -> str:
+    raw = f"{video_path.resolve()}:{start_seconds:.3f}:{end_seconds:.3f}:{num_frames}:{backend}:v2"
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:20]
 
 
-def load_video_frames(row: dict, args) -> list[Image.Image]:
-    video_path = Path(row["video_path"])
+def context_bounds(row: dict, args) -> tuple[float, float]:
     end_seconds = max(0.0, float(row["timestamp_seconds"]))
     if args.context_seconds < 0:
         start_seconds = 0.0
@@ -324,9 +354,61 @@ def load_video_frames(row: dict, args) -> list[Image.Image]:
         start_seconds = max(0.0, end_seconds - float(args.context_seconds))
     if end_seconds <= start_seconds:
         end_seconds = start_seconds + 0.2
+    return start_seconds, end_seconds
+
+
+def decord_extract_context_frames(
+    video_path: Path,
+    start_seconds: float,
+    end_seconds: float,
+    num_frames: int,
+    frame_paths: list[Path],
+) -> bool:
+    try:
+        from decord import VideoReader, cpu
+    except Exception:
+        return False
+
+    try:
+        vr = VideoReader(str(video_path), ctx=cpu(0), num_threads=1)
+        total_frames = len(vr)
+        if total_frames <= 0:
+            return False
+        fps = max(float(vr.get_avg_fps()), 1e-6)
+        start_idx = min(max(int(round(start_seconds * fps)), 0), total_frames - 1)
+        end_idx = min(max(int(round(end_seconds * fps)) - 1, start_idx), total_frames - 1)
+        if num_frames <= 1:
+            frame_indices = [(start_idx + end_idx) // 2]
+        else:
+            # Match the official StreamingBench LLaVA-OneVision adapter:
+            # np.linspace(0, total_frame_num - 1, max_frames_num, dtype=int).
+            denom = max(num_frames - 1, 1)
+            frame_indices = [
+                int(start_idx + (end_idx - start_idx) * idx / denom)
+                for idx in range(num_frames)
+            ]
+        batch = vr.get_batch(frame_indices).asnumpy()
+        if len(batch) != len(frame_paths):
+            return False
+        for frame, frame_path in zip(batch, frame_paths):
+            Image.fromarray(frame).save(frame_path, quality=95)
+        return all(path.exists() and path.stat().st_size > 0 for path in frame_paths)
+    except Exception:
+        return False
+
+
+def load_video_frames(row: dict, args) -> list[Image.Image]:
+    video_path = Path(row["video_path"])
+    start_seconds, end_seconds = context_bounds(row, args)
 
     cache_root = Path(args.frame_cache_dir) if args.frame_cache_dir else Path(args.output_dir) / "frame_cache"
-    cache_key = frame_cache_key(video_path, start_seconds, end_seconds, args.num_video_frames)
+    cache_key = frame_cache_key(
+        video_path,
+        start_seconds,
+        end_seconds,
+        args.num_video_frames,
+        args.frame_sampling_backend,
+    )
     cache_dir = cache_root / cache_key
     if cache_dir.exists() and not args.reuse_frame_cache:
         shutil.rmtree(cache_dir)
@@ -339,11 +421,27 @@ def load_video_frames(row: dict, args) -> list[Image.Image]:
         timestamps = [start_seconds + step * idx for idx in range(args.num_video_frames)]
 
     frame_paths = [cache_dir / f"frame_{idx:03d}.jpg" for idx in range(len(timestamps))]
+    if args.reuse_frame_cache and all(path.exists() and path.stat().st_size > 0 for path in frame_paths):
+        frames = []
+        for frame_path in frame_paths:
+            with Image.open(frame_path) as image:
+                frames.append(image.convert("RGB").copy())
+        return frames
+
+    for frame_path in frame_paths:
+        if frame_path.exists():
+            frame_path.unlink()
+
+    if args.frame_sampling_backend == "decord":
+        if decord_extract_context_frames(video_path, start_seconds, end_seconds, len(frame_paths), frame_paths):
+            frames = []
+            for frame_path in frame_paths:
+                with Image.open(frame_path) as image:
+                    frames.append(image.convert("RGB").copy())
+            return frames
+
     first_valid_frame = None
     for timestamp, frame_path in zip(timestamps, frame_paths):
-        if frame_path.exists() and args.reuse_frame_cache:
-            first_valid_frame = first_valid_frame or frame_path
-            continue
         fallback_timestamps = [
             max(start_seconds, timestamp - 0.5),
             max(start_seconds, timestamp - 1.0),
@@ -446,6 +544,7 @@ def run_method(method: str, model, processor, rows: list[dict], args, dtype, dev
             decoded = decoded.strip()
             prediction = extract_choice(decoded)
             correct = prediction == row["answer"]
+            context_start, context_end = context_bounds(row, args)
             records.append(
                 {
                     "task": row["task"],
@@ -454,6 +553,8 @@ def run_method(method: str, model, processor, rows: list[dict], args, dtype, dev
                     "sample_id": row["sample_id"],
                     "time_stamp": row["time_stamp"],
                     "video_path": row["video_path"],
+                    "context_start_seconds": context_start,
+                    "context_end_seconds": context_end,
                     "input_tokens": int(input_token_counts[offset]),
                     "padded_input_tokens": input_len,
                     "video_tokens": int(video_token_counts[offset]),
@@ -491,8 +592,10 @@ def run_method(method: str, model, processor, rows: list[dict], args, dtype, dev
         "method": method,
         "num_samples": len(records),
         "batch_size": effective_batch_size,
+        "streamingbench_profile": args.streamingbench_profile,
         "num_video_frames": args.num_video_frames,
         "context_seconds": args.context_seconds,
+        "frame_sampling_backend": args.frame_sampling_backend,
         "total_batches": total_batches,
         "total_new_tokens": total_new_tokens,
         "total_seconds": total_time,
@@ -523,6 +626,7 @@ def iter_methods(methods: str):
 
 def main():
     args = parse_args()
+    args = apply_streamingbench_profile(args)
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     dtype = torch.bfloat16 if args.torch_dtype == "bfloat16" else torch.float16
     device = torch.device(f"cuda:{args.cuda_device}")
