@@ -7,6 +7,7 @@ HF_BIN="${HF_BIN:-/home/haojitai/miniconda3/envs/svllm/bin/hf}"
 REPO_ID="${STREAMINGBENCH_REPO_ID:-mjuicem/StreamingBench}"
 PROXY_URL="${PROXY_URL:-http://localhost:7890}"
 MAX_WORKERS="${HF_MAX_WORKERS:-1}"
+DOWNLOAD_SCOPE="${STREAMINGBENCH_DOWNLOAD_SCOPE:-full}"
 
 if [[ ! -x "${HF_BIN}" ]]; then
   echo "[error] hf command not found or not executable: ${HF_BIN}" >&2
@@ -29,9 +30,37 @@ echo "[info] root=${ROOT}"
 echo "[info] cache=${CACHE_DIR}"
 echo "[info] proxy=${PROXY_URL}"
 echo "[info] max_workers=${MAX_WORKERS}"
+echo "[info] download_scope=${DOWNLOAD_SCOPE}"
+
+declare -a DOWNLOAD_FILES=()
+if [[ "${DOWNLOAD_SCOPE}" == "table4" ]]; then
+  DOWNLOAD_FILES=(
+    "StreamingBench/Real_Time_Visual_Understanding.csv"
+    "StreamingBench/Omni_Source_Understanding.csv"
+    "Real-Time Visual Understanding_1-50.zip"
+    "Real-Time Visual Understanding_51-100.zip"
+    "Real-Time Visual Understanding_101-150.zip"
+    "Real-Time Visual Understanding_151-200.zip"
+    "Real-Time Visual Understanding_201-250.zip"
+    "Real-Time Visual Understanding_251-300.zip"
+    "Real-Time Visual Understanding_301-350.zip"
+    "Real-Time Visual Understanding_351-400.zip"
+    "Real-Time Visual Understanding_401-450.zip"
+    "Real-Time Visual Understanding_451-500.zip"
+    "Emotion Recognition.zip"
+    "Multimodal Alignment.zip"
+    "Scene Understanding_1-25.zip"
+    "Scene Understanding_26-50.zip"
+    "Source Discrimination.zip"
+  )
+elif [[ "${DOWNLOAD_SCOPE}" != "full" ]]; then
+  echo "[error] unsupported STREAMINGBENCH_DOWNLOAD_SCOPE=${DOWNLOAD_SCOPE}; expected full or table4" >&2
+  exit 1
+fi
 
 set +e
 "${HF_BIN}" download "${REPO_ID}" \
+  "${DOWNLOAD_FILES[@]}" \
   --repo-type dataset \
   --local-dir "${ROOT}" \
   --cache-dir "${CACHE_DIR}" \
