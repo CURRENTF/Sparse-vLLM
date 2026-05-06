@@ -710,6 +710,20 @@ def compute_livevlm_table4_stats(records: list[dict]) -> dict:
             }
         )
 
+    expected_display_total = sum(item["total"] for item in subtasks)
+    expected_extra_total = sum(item["total"] for item in overall_extra_subtasks)
+    expected_display_weighted_pct = None
+    implied_extra_expected_pct = None
+    if expected_display_total > 0:
+        expected_display_weighted_pct = sum(
+            item["expected_llava_onevision_7b_pct"] * item["total"] for item in subtasks
+        ) / expected_display_total
+    if expected_extra_total > 0 and expected_display_total > 0:
+        implied_extra_expected_pct = (
+            LIVEVLM_TABLE4_EXPECTED_OVERALL * (expected_display_total + expected_extra_total)
+            - sum(item["expected_llava_onevision_7b_pct"] * item["total"] for item in subtasks)
+        ) / expected_extra_total
+
     overall_accuracy = overall["correct"] / max(overall["total"], 1)
     overall_accuracy_pct = 100.0 * overall_accuracy
     return {
@@ -721,6 +735,8 @@ def compute_livevlm_table4_stats(records: list[dict]) -> dict:
         ),
         "expected_llava_onevision_7b_overall_pct": LIVEVLM_TABLE4_EXPECTED_OVERALL,
         "expected_overall_row_count": LIVEVLM_TABLE4_EXPECTED_OVERALL_ROWS,
+        "expected_display_weighted_accuracy_pct": expected_display_weighted_pct,
+        "implied_expected_extra_subtasks_accuracy_pct": implied_extra_expected_pct,
         "overall": {
             "total": overall["total"],
             "correct": overall["correct"],

@@ -110,6 +110,8 @@ class ResearchFailFastTest(unittest.TestCase):
         self.assertEqual(stats["subtasks"][1]["status_counts"], {"parse_failed": 1})
         self.assertEqual(stats["overall_extra_subtasks"][0]["abbr"], "ACU")
         self.assertTrue(stats["overall_extra_subtasks"][0]["used_for_paper_overall"])
+        self.assertAlmostEqual(stats["expected_display_weighted_accuracy_pct"], 77.30)
+        self.assertAlmostEqual(stats["implied_expected_extra_subtasks_accuracy_pct"], 21.95)
 
     def test_streamingbench_choice_parse_modes(self):
         self.assertEqual(streamingbench.extract_choice(" A", "official_first_char"), "A")
