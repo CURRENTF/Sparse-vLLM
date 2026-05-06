@@ -15,6 +15,8 @@ POLL_SECONDS="${LIVEVLM_TABLE4_POLL_SECONDS:-60}"
 DOWNLOAD_MAX_POLLS="${LIVEVLM_TABLE4_DOWNLOAD_MAX_POLLS:-1440}"
 GPU_MAX_POLLS="${LIVEVLM_TABLE4_GPU_MAX_POLLS:-720}"
 GPU_MEMORY_READY_MIB="${LIVEVLM_TABLE4_GPU_MEMORY_READY_MIB:-2048}"
+AUDIT_JSON="${LIVEVLM_TABLE4_AUDIT_JSON:-${OUTPUT_DIR}/livevlm_table4_audit.json}"
+AUDIT_DELTA_PCT="${LIVEVLM_TABLE4_AUDIT_DELTA_PCT:-}"
 
 echo "[info] start_time=$(date -Is)"
 echo "[info] project_root=${PROJECT_ROOT}"
@@ -23,6 +25,7 @@ echo "[info] video_dir=${VIDEO_DIR}"
 echo "[info] output_dir=${OUTPUT_DIR}"
 echo "[info] model_path=${MODEL_PATH}"
 echo "[info] gpu_id=${GPU_ID}"
+echo "[info] audit_json=${AUDIT_JSON}"
 
 wait_for_download() {
   if [[ ! -f "${DOWNLOAD_PID}" ]]; then
@@ -166,3 +169,14 @@ CUDA_VISIBLE_DEVICES="${GPU_ID}" PYTHONPATH="${PROJECT_ROOT}/src" "${PYTHON_BIN}
   --log_every 50
 
 echo "[info] baseline_done=$(date -Is)"
+echo "[info] auditing LiveVLM Table 4 baseline time=$(date -Is)"
+audit_args=(
+  scripts/audit_livevlm_table4_result.py
+  --output_dir "${OUTPUT_DIR}"
+  --json_out "${AUDIT_JSON}"
+)
+if [[ -n "${AUDIT_DELTA_PCT}" ]]; then
+  audit_args+=(--require_overall_delta_within_pct "${AUDIT_DELTA_PCT}")
+fi
+"${PYTHON_BIN}" "${audit_args[@]}"
+echo "[info] audit_done=$(date -Is)"
