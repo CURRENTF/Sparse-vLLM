@@ -128,7 +128,11 @@ def parse_args():
     parser.add_argument("--deltakv_neighbor_count", type=int, default=1)
     parser.add_argument("--frame_cache_dir", default="")
     parser.add_argument("--reuse_frame_cache", action="store_true")
-    parser.add_argument("--strict_videos", action="store_true")
+    parser.add_argument(
+        "--allow_missing_videos",
+        action="store_true",
+        help="Explicitly allow shard-level evaluation by skipping annotation rows whose videos are absent.",
+    )
     parser.add_argument("--log_every", type=int, default=1)
     parser.add_argument("--print_records", action="store_true")
     return parser.parse_args()
@@ -147,7 +151,7 @@ def apply_streamingbench_profile(args):
 def parse_timestamp(value: str) -> float:
     parts = [part.strip() for part in str(value).split(":") if part.strip()]
     if not parts:
-        return 0.0
+        raise ValueError(f"StreamingBench row has an empty timestamp: {value!r}")
     seconds = 0.0
     for part in parts:
         seconds = seconds * 60.0 + float(part)
@@ -157,6 +161,8 @@ def parse_timestamp(value: str) -> float:
 def parse_options(value: str) -> list[str]:
     options = ast.literal_eval(value) if isinstance(value, str) else value
     options = [str(option).strip() for option in options]
+    if len(options) != 4:
+        raise ValueError(f"StreamingBench options must contain exactly 4 choices, got {len(options)}: {value!r}")
     labels = ["A", "B", "C", "D"]
     normalized = []
     for label, option in zip(labels, options):
@@ -241,6 +247,8 @@ def load_streamingbench_rows(args):
     dataset_dir = Path(args.dataset_dir)
     csv_dir = Path(args.csv_dir) if args.csv_dir else dataset_dir / "StreamingBench"
     video_dir = Path(args.video_dir) if args.video_dir else dataset_dir / "videos"
+    if not video_dir.exists():
+        raise FileNotFoundError(f"StreamingBench video directory does not exist: {video_dir}")
     video_index = build_video_index(video_dir)
     selected_rows = []
     missing_videos = []
@@ -260,6 +268,12 @@ def load_streamingbench_rows(args):
                 if video_path is None:
                     missing_videos.append({"task": task, "question_id": question_id, "sample_id": sample_id})
                     continue
+                answer = str(raw["answer"]).strip().upper()[:1]
+                if answer not in {"A", "B", "C", "D"}:
+                    raise ValueError(
+                        f"StreamingBench row has invalid answer={raw['answer']!r} "
+                        f"for question_id={question_id!r}."
+                    )
                 task_rows.append(
                     {
                         "task": task,
@@ -270,7 +284,7 @@ def load_streamingbench_rows(args):
                         "question": raw["question"],
                         "time_stamp": raw["time_stamp"],
                         "timestamp_seconds": parse_timestamp(raw["time_stamp"]),
-                        "answer": str(raw["answer"]).strip().upper()[:1],
+                        "answer": answer,
                         "options": parse_options(raw["options"]),
                         "frames_required": raw.get("frames_required", ""),
                         "temporal_clue_type": raw.get("temporal_clue_type", ""),
@@ -291,8 +305,13 @@ def load_streamingbench_rows(args):
 
         selected_rows.extend(task_rows)
 
-    if args.strict_videos and missing_videos:
-        raise FileNotFoundError(f"Missing videos for {len(missing_videos)} rows; first missing: {missing_videos[:5]}")
+    if missing_videos and not args.allow_missing_videos:
+        raise FileNotFoundError(
+            f"Missing videos for {len(missing_videos)} StreamingBench rows; "
+            f"first missing: {missing_videos[:5]}. "
+            "Download the required video shards or pass --allow_missing_videos "
+            "when intentionally running a partial shard."
+        )
 
     start = max(0, int(args.sample_start))
     rows = selected_rows[start:]
@@ -328,21 +347,23 @@ def ffmpeg_extract_frame(video_path: Path, timestamp: float, output_path: Path) 
     return completed.returncode == 0 and output_path.exists() and output_path.stat().st_size > 0
 
 
-def ensure_frame(video_path: Path, timestamp: float, output_path: Path, fallback_timestamps: list[float]) -> bool:
+def extract_required_frame(video_path: Path, timestamp: float, output_path: Path):
     if output_path.exists() and output_path.stat().st_size > 0:
-        return True
+        return
     if output_path.exists():
         output_path.unlink()
-    for candidate in [timestamp, *fallback_timestamps]:
-        if ffmpeg_extract_frame(video_path, candidate, output_path):
-            return True
-        if output_path.exists():
-            output_path.unlink()
-    return False
+    if ffmpeg_extract_frame(video_path, timestamp, output_path):
+        return
+    if output_path.exists():
+        output_path.unlink()
+    raise RuntimeError(
+        f"Failed to extract required StreamingBench frame: "
+        f"video={video_path} timestamp={timestamp:.3f}s output={output_path}"
+    )
 
 
 def frame_cache_key(video_path: Path, start_seconds: float, end_seconds: float, num_frames: int, backend: str) -> str:
-    raw = f"{video_path.resolve()}:{start_seconds:.3f}:{end_seconds:.3f}:{num_frames}:{backend}:v2"
+    raw = f"{video_path.resolve()}:{start_seconds:.3f}:{end_seconds:.3f}:{num_frames}:{backend}:v3"
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:20]
 
 
@@ -363,17 +384,20 @@ def decord_extract_context_frames(
     end_seconds: float,
     num_frames: int,
     frame_paths: list[Path],
-) -> bool:
+) -> None:
     try:
         from decord import VideoReader, cpu
-    except Exception:
-        return False
+    except ImportError as e:
+        raise RuntimeError(
+            "StreamingBench decord frame sampling requested, but decord is not installed. "
+            "Install decord or pass --frame_sampling_backend ffmpeg."
+        ) from e
 
     try:
         vr = VideoReader(str(video_path), ctx=cpu(0), num_threads=1)
         total_frames = len(vr)
         if total_frames <= 0:
-            return False
+            raise RuntimeError(f"Video has no readable frames: {video_path}")
         fps = max(float(vr.get_avg_fps()), 1e-6)
         start_idx = min(max(int(round(start_seconds * fps)), 0), total_frames - 1)
         end_idx = min(max(int(round(end_seconds * fps)) - 1, start_idx), total_frames - 1)
@@ -389,12 +413,20 @@ def decord_extract_context_frames(
             ]
         batch = vr.get_batch(frame_indices).asnumpy()
         if len(batch) != len(frame_paths):
-            return False
+            raise RuntimeError(
+                f"Decord returned {len(batch)} frames, expected {len(frame_paths)} "
+                f"for video={video_path}."
+            )
         for frame, frame_path in zip(batch, frame_paths):
             Image.fromarray(frame).save(frame_path, quality=95)
-        return all(path.exists() and path.stat().st_size > 0 for path in frame_paths)
-    except Exception:
-        return False
+        missing = [str(path) for path in frame_paths if not path.exists() or path.stat().st_size == 0]
+        if missing:
+            raise RuntimeError(f"Decord extraction produced missing/empty frame files: {missing[:5]}")
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to extract StreamingBench frames with decord: "
+            f"video={video_path} start={start_seconds:.3f}s end={end_seconds:.3f}s frames={num_frames}"
+        ) from e
 
 
 def load_video_frames(row: dict, args) -> list[Image.Image]:
@@ -433,30 +465,15 @@ def load_video_frames(row: dict, args) -> list[Image.Image]:
             frame_path.unlink()
 
     if args.frame_sampling_backend == "decord":
-        if decord_extract_context_frames(video_path, start_seconds, end_seconds, len(frame_paths), frame_paths):
-            frames = []
-            for frame_path in frame_paths:
-                with Image.open(frame_path) as image:
-                    frames.append(image.convert("RGB").copy())
-            return frames
+        decord_extract_context_frames(video_path, start_seconds, end_seconds, len(frame_paths), frame_paths)
+        frames = []
+        for frame_path in frame_paths:
+            with Image.open(frame_path) as image:
+                frames.append(image.convert("RGB").copy())
+        return frames
 
-    first_valid_frame = None
     for timestamp, frame_path in zip(timestamps, frame_paths):
-        fallback_timestamps = [
-            max(start_seconds, timestamp - 0.5),
-            max(start_seconds, timestamp - 1.0),
-            start_seconds,
-            max(0.0, end_seconds - 0.5),
-            0.0,
-        ]
-        if ensure_frame(video_path, timestamp, frame_path, fallback_timestamps):
-            first_valid_frame = first_valid_frame or frame_path
-            continue
-        if first_valid_frame is not None:
-            shutil.copyfile(first_valid_frame, frame_path)
-        else:
-            Image.new("RGB", (384, 384), color=(0, 0, 0)).save(frame_path)
-            first_valid_frame = frame_path
+        extract_required_frame(video_path, timestamp, frame_path)
 
     frames = []
     for frame_path in frame_paths:

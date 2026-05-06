@@ -11,13 +11,8 @@ from sparsevllm.layers.layernorm import RMSNorm
 from sparsevllm.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sparsevllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 from sparsevllm.utils.context import get_context
-from sparsevllm.utils.flash_mla import try_get_flash_mla, flash_mla_sparse_attn
+from sparsevllm.utils.flash_mla import flash_mla_sparse_attn
 from sparsevllm.utils.log import logger
-
-try:
-    from flash_attn import flash_attn_func  # type: ignore
-except Exception:  # pragma: no cover - optional dependency
-    flash_attn_func = None
 
 
 def _getattr(obj: Any, name: str, default: Any = None) -> Any:
@@ -474,8 +469,7 @@ class DeepSeekV32MLA(nn.Module):
         q_key = torch.cat([q_nope_proj, q_pe], dim=-1).to(torch.bfloat16)  # (T, H, 576)
         kv_key = torch.cat([kv, k_pe], dim=-1).to(torch.bfloat16).unsqueeze(1)  # (T, 1, 576)
 
-        # FlashMLA sparse prefill (optional).
-        if self.use_flash_mla and try_get_flash_mla() is not None:
+        if self.use_flash_mla:
             indices = topk_idx.to(torch.int32).unsqueeze(1)  # (T, 1, topk)
             out_latent = flash_mla_sparse_attn(
                 q_key,
@@ -616,7 +610,9 @@ class DeepSeekV32MLA(nn.Module):
                 pe_cache_layer.index_copy_(0, slots, k_pe)
 
                 if self.use_dsa:
-                    assert qr is not None and self.indexer is not None
+                    assert qr is not None and self.indexer is not None, (
+                        "DeepSeek-V3.2 DSA prefill requires q_lora projection and an initialized indexer."
+                    )
                     topk_idx = self.indexer(x, qr, freqs_cis, causal=True)
                     out = self._attn_sparse_prefill(q_nope, q_pe, kv, k_pe, topk_idx)
                 else:

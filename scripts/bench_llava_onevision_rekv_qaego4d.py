@@ -6,7 +6,6 @@ import hashlib
 import json
 import re
 import shutil
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -72,199 +71,60 @@ def parse_args():
     return parser.parse_args()
 
 
-def run_json(command: list[str]) -> dict:
-    completed = subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    return json.loads(completed.stdout)
-
-
-def ffprobe_video_info(video_path: Path) -> tuple[float, float, int]:
-    data = run_json(
-        [
-            "ffprobe",
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "stream=avg_frame_rate,duration,nb_frames",
-            "-of",
-            "json",
-            str(video_path),
-        ]
-    )
-    stream = data["streams"][0]
-    duration = float(stream.get("duration") or 0.0)
-    rate = stream.get("avg_frame_rate") or "0/1"
-    num, den = rate.split("/")
-    fps = float(num) / max(float(den), 1.0)
-    nb_frames = stream.get("nb_frames")
-    if nb_frames and str(nb_frames).isdigit():
-        frame_count = int(nb_frames)
-    elif duration > 0 and fps > 0:
-        frame_count = max(1, int(round(duration * fps)))
-    else:
-        frame_count = 1
-    return duration, fps, frame_count
-
-
-def ffprobe_video(video_path: Path) -> tuple[float, float]:
-    duration, fps, _ = ffprobe_video_info(video_path)
-    return duration, fps
-
-
-def ffmpeg_extract_frame(video_path: Path, timestamp: float, output_path: Path) -> bool:
-    command = [
-        "ffmpeg",
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-y",
-        "-ss",
-        f"{max(timestamp, 0.0):.3f}",
-        "-i",
-        str(video_path),
-        "-frames:v",
-        "1",
-        "-q:v",
-        "2",
-        str(output_path),
-    ]
-    completed = subprocess.run(command)
-    return completed.returncode == 0 and output_path.exists() and output_path.stat().st_size > 0
-
-
-def ensure_frame(video_path: Path, timestamp: float, output_path: Path, duration: float) -> bool:
-    if output_path.exists() and output_path.stat().st_size > 0:
-        return True
-    if output_path.exists():
-        output_path.unlink()
-    fallback_timestamps = [
-        timestamp,
-        max(0.0, timestamp - 0.5),
-        min(max(duration - 0.1, 0.0), timestamp + 0.5),
-        0.0,
-        max(duration - 0.5, 0.0),
-    ]
-    for candidate in fallback_timestamps:
-        if ffmpeg_extract_frame(video_path, candidate, output_path):
-            return True
-        if output_path.exists():
-            output_path.unlink()
-    return False
-
-
-def ffmpeg_extract_frames_by_index(video_path: Path, frame_indices: list[int], output_paths: list[Path]) -> bool:
-    if not frame_indices:
-        return False
-    if len(frame_indices) != len(output_paths):
-        raise ValueError("frame_indices and output_paths must have the same length.")
-
-    temp_dir = output_paths[0].parent / ".extract_tmp"
-    if temp_dir.exists():
-        shutil.rmtree(temp_dir)
-    temp_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        # ReKV samples by frame index through decord. A single select pass is much
-        # faster than spawning ffmpeg once per frame and keeps the same indexing.
-        select_expr = "+".join(f"eq(n\\,{idx})" for idx in frame_indices)
-        temp_pattern = temp_dir / "frame_%03d.jpg"
-        command = [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            "-i",
-            str(video_path),
-            "-vf",
-            f"select={select_expr}",
-            "-vsync",
-            "0",
-            "-q:v",
-            "2",
-            str(temp_pattern),
-        ]
-        completed = subprocess.run(command)
-        if completed.returncode != 0:
-            return False
-        extracted = sorted(temp_dir.glob("frame_*.jpg"))
-        if not extracted:
-            return False
-        first_valid = extracted[0]
-        for idx, output_path in enumerate(output_paths):
-            source = extracted[idx] if idx < len(extracted) else first_valid
-            shutil.copyfile(source, output_path)
-        return all(path.exists() and path.stat().st_size > 0 for path in output_paths)
-    finally:
-        if temp_dir.exists():
-            shutil.rmtree(temp_dir)
-
-
 def decord_context_frame_indices(video_path: Path, sample_fps: float, max_context_frames: int):
     try:
         from decord import VideoReader, cpu
-    except Exception:
-        return None
+    except ImportError as e:
+        raise RuntimeError(
+            "QAEGO4D ReKV-style frame sampling requires decord. "
+            "Install decord before running this benchmark."
+        ) from e
     try:
         vr = VideoReader(str(video_path), ctx=cpu(0), num_threads=1)
+        if len(vr) <= 0:
+            raise RuntimeError(f"Video has no readable frames: {video_path}")
         avg_fps = float(vr.get_avg_fps())
         rounded_fps = max(round(avg_fps), 1)
         step_frames = max(int(rounded_fps / sample_fps), 1)
-        frame_indices = list(range(0, len(vr), step_frames)) or [0]
+        frame_indices = list(range(0, len(vr), step_frames))
         if len(frame_indices) > max_context_frames:
             keep_indices = torch.linspace(0, len(frame_indices) - 1, steps=max_context_frames).round().long().tolist()
             frame_indices = [frame_indices[idx] for idx in keep_indices]
         frame_indices = [min(max(0, idx), max(len(vr) - 1, 0)) for idx in frame_indices]
         duration = len(vr) / max(avg_fps, 1e-6)
         return duration, avg_fps, frame_indices
-    except Exception:
-        return None
+    except Exception as e:
+        raise RuntimeError(f"Failed to read video with decord for ReKV sampling: {video_path}") from e
 
 
-def decord_extract_frames_by_index(video_path: Path, frame_indices: list[int], output_paths: list[Path]) -> bool:
+def decord_extract_frames_by_index(video_path: Path, frame_indices: list[int], output_paths: list[Path]):
     try:
         from decord import VideoReader, cpu
-    except Exception:
-        return False
+    except ImportError as e:
+        raise RuntimeError(
+            "QAEGO4D ReKV-style frame extraction requires decord. "
+            "Install decord before running this benchmark."
+        ) from e
     try:
         vr = VideoReader(str(video_path), ctx=cpu(0), num_threads=1)
+        if len(vr) <= 0:
+            raise RuntimeError(f"Video has no readable frames: {video_path}")
         safe_indices = [min(max(0, idx), max(len(vr) - 1, 0)) for idx in frame_indices]
         batch = vr.get_batch(safe_indices).asnumpy()
         if len(batch) == 0:
-            return False
+            raise RuntimeError(f"Decord returned no frames for video={video_path}")
         for frame, output_path in zip(batch, output_paths):
             Image.fromarray(frame).save(output_path, quality=95)
-        return all(path.exists() and path.stat().st_size > 0 for path in output_paths)
-    except Exception:
-        return False
+        missing = [str(path) for path in output_paths if not path.exists() or path.stat().st_size == 0]
+        if missing:
+            raise RuntimeError(f"Decord extraction produced missing/empty frame files: {missing[:5]}")
+    except Exception as e:
+        raise RuntimeError(f"Failed to extract QAEGO4D frames with decord: {video_path}") from e
 
 
 def frame_cache_key(video_path: Path, sample_fps: float, max_context_frames: int) -> str:
-    raw = f"{video_path.resolve()}:{sample_fps:.6f}:{max_context_frames}"
+    raw = f"{video_path.resolve()}:{sample_fps:.6f}:{max_context_frames}:decord:v2"
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:20]
-
-
-def rekv_context_frame_indices(video_path: Path, sample_fps: float, max_context_frames: int) -> tuple[float, float, list[int]]:
-    duration, fps, frame_count = ffprobe_video_info(video_path)
-    if duration <= 0:
-        duration = 1.0
-    if sample_fps <= 0:
-        raise ValueError(f"sample_fps must be positive, got {sample_fps}")
-
-    # ReKV uses frame_idx = range(0, len(video), int(fps / sample_fps)).
-    rounded_fps = max(round(fps), 1)
-    step_frames = max(int(rounded_fps / sample_fps), 1)
-    frame_indices = list(range(0, max(frame_count, 1), step_frames)) or [0]
-    if len(frame_indices) > max_context_frames:
-        keep_indices = torch.linspace(0, len(frame_indices) - 1, steps=max_context_frames).round().long().tolist()
-        frame_indices = [frame_indices[idx] for idx in keep_indices]
-    frame_indices = [min(max(0, idx), max(frame_count - 1, 0)) for idx in frame_indices]
-    return duration, fps, frame_indices
-
-
-def rekv_context_timestamps(video_path: Path, sample_fps: float, max_context_frames: int) -> list[float]:
-    _, fps, frame_indices = rekv_context_frame_indices(video_path, sample_fps, max_context_frames)
-    return [idx / max(fps, 1e-6) for idx in frame_indices]
 
 
 def load_video_frames(video_path: Path, args) -> list[Image.Image]:
@@ -274,29 +134,13 @@ def load_video_frames(video_path: Path, args) -> list[Image.Image]:
         shutil.rmtree(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    decord_indices = decord_context_frame_indices(video_path, args.sample_fps, args.max_context_frames)
-    if decord_indices is not None:
-        duration, fps, frame_indices = decord_indices
-    else:
-        duration, fps, frame_indices = rekv_context_frame_indices(video_path, args.sample_fps, args.max_context_frames)
-    timestamps = [idx / max(fps, 1e-6) for idx in frame_indices]
+    _duration, _fps, frame_indices = decord_context_frame_indices(video_path, args.sample_fps, args.max_context_frames)
     frame_paths = [cache_dir / f"frame_{idx:03d}.jpg" for idx in range(len(frame_indices))]
     if not (args.reuse_frame_cache and all(path.exists() and path.stat().st_size > 0 for path in frame_paths)):
         for frame_path in frame_paths:
             if frame_path.exists():
                 frame_path.unlink()
-        extracted = decord_extract_frames_by_index(video_path, frame_indices, frame_paths)
-        if not extracted and not ffmpeg_extract_frames_by_index(video_path, frame_indices, frame_paths):
-            first_valid_frame = None
-            for timestamp, frame_path in zip(timestamps, frame_paths):
-                if ensure_frame(video_path, timestamp, frame_path, duration):
-                    first_valid_frame = first_valid_frame or frame_path
-                    continue
-                if first_valid_frame is not None:
-                    shutil.copyfile(first_valid_frame, frame_path)
-                else:
-                    Image.new("RGB", (384, 384), color=(0, 0, 0)).save(frame_path)
-                    first_valid_frame = frame_path
+        decord_extract_frames_by_index(video_path, frame_indices, frame_paths)
 
     frames = []
     for frame_path in frame_paths:
@@ -329,7 +173,22 @@ def load_qaego4d_rows(args):
         video_path = resolve_video_path(video_sample["video_path"], dataset_dir, video_dir)
         for conv_idx, sample in enumerate(video_sample["conversations"]):
             choices = list(sample["choices"])
-            answer = sample["answer"] if sample["answer"] is not None else choices[0]
+            if not choices or len(choices) > len(CHOICE_LETTERS):
+                raise ValueError(
+                    f"QAEGO4D sample has invalid choices length={len(choices)}. "
+                    f"video_id={video_sample.get('video_id')!r} conv_idx={conv_idx}"
+                )
+            answer = sample["answer"]
+            if answer is None:
+                raise ValueError(
+                    f"QAEGO4D sample has answer=None; refusing to score with a default. "
+                    f"video_id={video_sample.get('video_id')!r} conv_idx={conv_idx}"
+                )
+            if answer not in choices:
+                raise ValueError(
+                    f"QAEGO4D answer is not in choices. video_id={video_sample.get('video_id')!r} "
+                    f"conv_idx={conv_idx} answer={answer!r} choices={choices!r}"
+                )
             correct_choice = CHOICE_LETTERS[choices.index(answer)]
             rows.append(
                 {

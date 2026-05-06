@@ -100,11 +100,14 @@ class Config:
     # DeepSeek-V3.2 uses YARN-style RoPE scaling in their public inference code.
     dsa_rope_factor: float = 40.0
     dsa_original_seq_len: int = 4096
-    # Use FlashMLA kernels when available; otherwise fall back to a (slow) torch path.
+    # Use FlashMLA kernels; missing FlashMLA fails fast when this is enabled.
     dsa_use_flash_mla: bool = True
     
     enable_profiler: bool = False
     throughput_log_interval_s: float = 10.0
+    allow_raw_config_fallback: bool = False
+    allow_missing_deltakv_path: bool = False
+    allow_unknown_config_keys: bool = False
 
 
     def __post_init__(self):
@@ -119,21 +122,33 @@ class Config:
         if self.num_top_tokens_in_prefill is None:
             self.num_top_tokens_in_prefill = self.num_top_tokens
 
-        assert os.path.isdir(self.model)
-        assert 1 <= self.tensor_parallel_size <= 8
+        if not os.path.isdir(self.model):
+            raise FileNotFoundError(f"Model directory does not exist: {self.model}")
+        if not 1 <= self.tensor_parallel_size <= 8:
+            raise ValueError(f"tensor_parallel_size must be in [1, 8], got {self.tensor_parallel_size}.")
+        if isinstance(self.deltakv_path, str):
+            deltakv_path = self.deltakv_path.strip()
+            self.deltakv_path = None if deltakv_path.lower() in {"", "none", "null"} else deltakv_path
+        cfg_path = os.path.join(self.model, "config.json")
         try:
             # `trust_remote_code=True` keeps DeepSeek-like configs usable when the local model
             # folder vendors config/modeling files.
             self.hf_config = AutoConfig.from_pretrained(self.model, trust_remote_code=True)
         except Exception as e:
-            # Fallback for configs not registered in this transformers version.
-            cfg_path = os.path.join(self.model, "config.json")
-            logger.warning(
-                "AutoConfig.from_pretrained failed; falling back to config.json. "
-                f"error={type(e).__name__}: {e} path={cfg_path}"
-            )
+            if not self.allow_raw_config_fallback:
+                raise RuntimeError(
+                    "AutoConfig.from_pretrained failed. Refusing to silently fall back to raw "
+                    "`config.json`; pass allow_raw_config_fallback=True only for explicitly "
+                    f"validated local configs. model={self.model} error={type(e).__name__}: {e}"
+                ) from e
             with open(cfg_path, "r", encoding="utf-8") as f:
                 cfg = json.load(f)
+            model_type = cfg.get("model_type")
+            if model_type not in {"deepseek_v2", "deepseek_v32"}:
+                raise RuntimeError(
+                    "Raw config fallback is only allowed for validated DeepSeek configs; "
+                    f"got model_type={model_type!r} at {cfg_path}."
+                ) from e
             td = cfg.get("torch_dtype", None)
             if isinstance(td, str):
                 td_l = td.lower()
@@ -144,7 +159,10 @@ class Config:
                 elif td_l in ("float32", "fp32"):
                     cfg["torch_dtype"] = torch.float32
             if cfg.get("torch_dtype", None) is None:
-                cfg["torch_dtype"] = torch.bfloat16
+                raise RuntimeError(
+                    f"Raw config fallback requires explicit torch_dtype in {cfg_path}; "
+                    "refusing to default to bfloat16."
+                )
             self.hf_config = SimpleNamespace(**cfg)
 
         # DeepSeek-V3.2 defaults: keep engine-side DSA knobs aligned unless explicitly set.
@@ -177,10 +195,18 @@ class Config:
             v = str(v).strip().lower()
             setattr(self, attr, v if v else "auto")
 
-        if isinstance(self.vllm_sparse_method, str) and self.vllm_sparse_method.startswith('deltakv') and self.deltakv_path is None:
-            # 尝试在模型目录下找 deltakv_compressor.pt 或者类似文件
-            # 或者让用户必须指定
-            logger.warning("DeltaKV mode enabled but deltakv_path is not specified.")
+        if (
+            isinstance(self.vllm_sparse_method, str)
+            and self.vllm_sparse_method.startswith("deltakv")
+            and self.vllm_sparse_method not in {"deltakv-standalone", "deltakv-snapkv"}
+            and self.deltakv_path is None
+            and not self.allow_missing_deltakv_path
+        ):
+            raise ValueError(
+                "DeltaKV compressor mode requires deltakv_path. Pass deltakv_path explicitly, "
+                "use a no-checkpoint method such as deltakv-standalone/deltakv-snapkv, or set "
+                "allow_missing_deltakv_path=True only for an explicitly validated ablation."
+            )
 
         if self.vllm_sparse_method in ("deltakv-standalone", "deltakv-snapkv"):
             # Standalone DeltaKV uses all layers uniformly and does not rely on

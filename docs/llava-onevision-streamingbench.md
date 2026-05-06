@@ -68,8 +68,8 @@ unzip -o \
 
 The script indexes videos recursively under `--video_dir`. It parses
 `sample_N` from the CSV `question_id` and selects the matching local video file.
-If only one shard is downloaded, rows from missing videos are skipped unless
-`--strict_videos` is set.
+Missing videos fail fast by default. If only one shard is downloaded and a
+partial-shard run is intentional, pass `--allow_missing_videos` explicitly.
 
 ## Methods
 
@@ -142,6 +142,7 @@ CUDA_VISIBLE_DEVICES=7 PYTHONPATH=$PWD/src \
   --batch_size 1 \
   --streamingbench_profile official_60s \
   --frame_sampling_backend decord \
+  --allow_missing_videos \
   --cuda_device 0
 ```
 
@@ -183,6 +184,7 @@ CUDA_VISIBLE_DEVICES=6 PYTHONPATH=$PWD/src \
   --batch_size 1 \
   --streamingbench_profile official_60s \
   --frame_sampling_backend decord \
+  --allow_missing_videos \
   --torch_dtype float16 \
   --attn_implementation sdpa \
   --max_new_tokens 8 \
@@ -207,6 +209,7 @@ CUDA_VISIBLE_DEVICES=7 PYTHONPATH=$PWD/src \
   --batch_size 1 \
   --streamingbench_profile official_60s \
   --frame_sampling_backend decord \
+  --allow_missing_videos \
   --torch_dtype float16 \
   --attn_implementation sdpa \
   --max_new_tokens 8 \
@@ -254,6 +257,7 @@ CUDA_VISIBLE_DEVICES=7 PYTHONPATH=$PWD/src \
   --batch_size 1 \
   --num_video_frames 8 \
   --context_seconds 60 \
+  --allow_missing_videos \
   --max_new_tokens 8 \
   --cuda_device 0 \
   --reuse_frame_cache

@@ -143,7 +143,14 @@ class LLMEngine:
         }
         ignored_keys = sorted(set(normalized_params.infer_config) - config_fields)
         if ignored_keys:
-            logger.warning(f"Ignoring unknown Sparse-vLLM config keys: {ignored_keys}")
+            if normalized_params.infer_config.get("allow_unknown_config_keys", False):
+                logger.warning(f"Ignoring unknown Sparse-vLLM config keys: {ignored_keys}")
+            else:
+                raise ValueError(
+                    f"Unknown Sparse-vLLM config keys: {ignored_keys}. "
+                    "Refusing to ignore possible experiment parameter typos. "
+                    "Set allow_unknown_config_keys=True only for explicitly validated compatibility runs."
+                )
         config = Config(model, **config_kwargs)
         self.config = config
         

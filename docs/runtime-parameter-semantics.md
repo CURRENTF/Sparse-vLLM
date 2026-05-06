@@ -450,6 +450,9 @@ Key Sparse-vLLM public names and internal fields:
 | `deltakv_offload_latent` | `False` | CPU latent offload switch. |
 | `deltakv_offload_*` | varies | Offload prefetch/threading/gather controls. |
 | `deltakv_triton_*_heads_per_program` | `4` | Triton grouping controls. |
+| `allow_unknown_config_keys` | `False` | Explicit opt-in for ignoring unknown Sparse-vLLM config keys. |
+| `allow_raw_config_fallback` | `False` | Explicit opt-in for raw `config.json` fallback when `AutoConfig` fails. Currently restricted to validated DeepSeek configs. |
+| `allow_missing_deltakv_path` | `False` | Explicit opt-in for no-checkpoint DeltaKV ablations that intentionally omit compressor weights. |
 
 Important differences from HF:
 
@@ -458,6 +461,9 @@ Important differences from HF:
 - `decode_keep_tokens` and `prefill_keep_tokens` must be integer budgets.
 - `full_attention_layers` may derive observation layers.
 - `deltakv-standalone` and `deltakv-snapkv` clear full/obs layer routing.
+- Unknown Sparse-vLLM config keys, raw config fallback, and missing DeltaKV
+  compressor paths fail fast by default. Use the `allow_*` switches only for
+  explicitly documented compatibility or ablation runs.
 - Sparse-vLLM methods can physically evict or re-map cache slots during prefill
   and decode, unlike HF `DynamicCache` wrappers.
 
