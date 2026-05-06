@@ -222,6 +222,7 @@ class ResearchFailFastTest(unittest.TestCase):
         metrics = {
             "method": "vanilla",
             "num_samples": 4000,
+            "status_counts": {"success": 4000},
             "livevlm_table4_stats": {
                 "expected_llava_onevision_7b_overall_pct": 58.85,
                 "expected_overall_row_count": 4000,

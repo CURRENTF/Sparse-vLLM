@@ -227,6 +227,15 @@ def audit_jsonl_artifacts(output_dir: Path, expected_rows: int) -> dict:
     assert_equal(len(parsed_rows), expected_rows, "parsed output row count")
     assert_equal(len(per_sample_rows), expected_rows, "per-sample row count")
 
+    raw_ids = set()
+    for idx, row in enumerate(raw_rows):
+        question_id = row.get("question_id")
+        if question_id in raw_ids:
+            raise RuntimeError(f"Duplicate raw question_id={question_id!r}")
+        raw_ids.add(question_id)
+        if "raw_prediction" not in row:
+            raise RuntimeError(f"Raw output row {idx} is missing raw_prediction.")
+
     parsed_status_counts: dict[str, int] = {}
     parsed_ids = set()
     for idx, row in enumerate(parsed_rows):
@@ -243,7 +252,12 @@ def audit_jsonl_artifacts(output_dir: Path, expected_rows: int) -> dict:
 
     per_sample_status_counts: dict[str, int] = {}
     task_type_counts: dict[str, int] = {}
+    per_sample_ids = set()
     for idx, row in enumerate(per_sample_rows):
+        question_id = row.get("question_id")
+        if question_id in per_sample_ids:
+            raise RuntimeError(f"Duplicate per-sample question_id={question_id!r}")
+        per_sample_ids.add(question_id)
         status = row.get("status")
         if status not in VALID_SAMPLE_STATUSES:
             raise RuntimeError(f"Invalid per-sample status at row {idx}: {status!r}")
@@ -254,6 +268,12 @@ def audit_jsonl_artifacts(output_dir: Path, expected_rows: int) -> dict:
             raise RuntimeError(f"Invalid per-sample answer at row {idx}: {row.get('answer')!r}")
         if "raw_prediction" not in row or "parsed_text" not in row:
             raise RuntimeError(f"Per-sample row {idx} is missing raw/parsed prediction fields.")
+
+    if raw_ids != parsed_ids or raw_ids != per_sample_ids:
+        raise RuntimeError(
+            "Artifact question_id sets differ across raw/parsed/per-sample files: "
+            f"raw={len(raw_ids)}, parsed={len(parsed_ids)}, per_sample={len(per_sample_ids)}"
+        )
 
     if parsed_status_counts != per_sample_status_counts:
         raise RuntimeError(
@@ -289,6 +309,20 @@ def audit_output_artifacts(output_dir: Path, metrics: dict, expected_model_path:
     assert_equal(last_result[0].get("num_samples"), expected_rows, "last_streamingbench_result[0].num_samples")
 
     artifact_summary = audit_jsonl_artifacts(output_dir, expected_rows)
+    metrics_status_counts = require_mapping(metrics.get("status_counts"), "aggregate_metrics.status_counts")
+    overall = require_mapping(stats.get("overall"), "livevlm_table4_stats.overall")
+    overall_status_counts = require_mapping(overall.get("status_counts"), "livevlm_table4_stats.overall.status_counts")
+    status_counts_from_jsonl = artifact_summary["status_counts_from_jsonl"]
+    assert_equal(
+        {key: int(value) for key, value in metrics_status_counts.items()},
+        status_counts_from_jsonl,
+        "aggregate_metrics.status_counts",
+    )
+    assert_equal(
+        {key: int(value) for key, value in overall_status_counts.items()},
+        status_counts_from_jsonl,
+        "livevlm_table4_stats.overall.status_counts",
+    )
     run_info_summary = audit_run_info(run_info, expected_model_path, expected_rows)
     return {
         "output_dir": str(output_dir),
