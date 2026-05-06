@@ -134,6 +134,20 @@ class ResearchFailFastTest(unittest.TestCase):
             Path("/tmp/videos/Misleading Context Understanding/sample_1.mp4"),
         )
 
+    def test_streamingbench_livevlm_table4_requires_full_row_scope(self):
+        args = SimpleNamespace(
+            streamingbench_profile="livevlm_table4",
+            num_samples=-1,
+            sample_start=0,
+            allow_missing_videos=False,
+        )
+        rows = [{"task_type": "Object Perception"}]
+        with self.assertRaisesRegex(RuntimeError, "4000-row StreamingBench scope"):
+            streamingbench.validate_livevlm_table4_rows(args, rows)
+
+        args.num_samples = 4
+        streamingbench.validate_livevlm_table4_rows(args, rows)
+
     def test_sparsevllm_raw_config_fallback_is_opt_in(self):
         with tempfile.TemporaryDirectory() as tmp:
             model_dir = Path(tmp)

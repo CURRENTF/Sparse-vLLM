@@ -316,6 +316,14 @@ def build_sqa_context(previous: list[dict]) -> str:
     return " ".join(parts)
 
 
+def count_by_key(rows: list[dict], key: str) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        value = str(row[key])
+        counts[value] = counts.get(value, 0) + 1
+    return counts
+
+
 def load_streamingbench_rows(args):
     dataset_dir = Path(args.dataset_dir)
     csv_dir = Path(args.csv_dir) if args.csv_dir else dataset_dir / "StreamingBench"
@@ -396,6 +404,9 @@ def load_streamingbench_rows(args):
         "indexed_video_count": sum(len(items) for items in video_index.values()),
         "missing_video_rows": len(missing_videos),
         "missing_video_examples": missing_videos[:10],
+        "selected_rows_before_slice": len(selected_rows),
+        "evaluated_task_counts": count_by_key(rows, "task"),
+        "evaluated_task_type_counts": count_by_key(rows, "task_type"),
     }
 
 
@@ -726,6 +737,24 @@ def compute_livevlm_table4_stats(records: list[dict]) -> dict:
     }
 
 
+def validate_livevlm_table4_rows(args, rows: list[dict]) -> None:
+    if args.streamingbench_profile != "livevlm_table4":
+        return
+    is_full_run = args.num_samples < 0 and int(args.sample_start) == 0 and not args.allow_missing_videos
+    if not is_full_run:
+        return
+
+    counts = count_by_key(rows, "task_type")
+    missing = [task_type for task_type in LIVEVLM_TABLE4_OVERALL_SUBTASKS if counts.get(task_type, 0) == 0]
+    overall_total = sum(counts.get(task_type, 0) for task_type in LIVEVLM_TABLE4_OVERALL_SUBTASKS)
+    if overall_total != LIVEVLM_TABLE4_EXPECTED_OVERALL_ROWS or missing:
+        raise RuntimeError(
+            "LiveVLM Table 4 full baseline requires the 4000-row StreamingBench scope. "
+            f"Got overall_rows={overall_total}, expected={LIVEVLM_TABLE4_EXPECTED_OVERALL_ROWS}, "
+            f"missing_task_types={missing}, counts={counts}."
+        )
+
+
 def save_method_artifacts(output_dir: Path, result: dict, run_info: dict):
     method = result["method"]
     raw_path = output_dir / f"{method}_raw_outputs.jsonl"
@@ -947,6 +976,7 @@ def main():
             "No StreamingBench rows with available videos were found. "
             f"Dataset info: {json.dumps(dataset_info, ensure_ascii=False)}"
         )
+    validate_livevlm_table4_rows(args, rows)
     print(
         "[dataset] "
         f"rows={len(rows)} tasks={args.tasks} csv_dir={dataset_info['csv_dir']} "
