@@ -232,6 +232,19 @@ CUDA_VISIBLE_DEVICES=6 PYTHONPATH=$PWD/src \
   --log_every 50
 ```
 
+Audit the completed baseline with:
+
+```bash
+/home/haojitai/miniconda3/envs/svllm/bin/python \
+  scripts/audit_livevlm_table4_result.py \
+  --output_dir /data2/haojitai/datasets/llava_onevision_streamingbench_livevlm_table4_7b_vanilla
+```
+
+The audit fails fast if the metrics file is missing, if the run is not the
+4000-row Table 4 scope, or if the visible/overall-only subtask structure is
+incomplete. To enforce a numeric tolerance against the paper's `Overall=58.85`,
+add for example `--require_overall_delta_within_pct 1.0`.
+
 ## Local Results
 
 ### 7B, Official 60s/32-Frame Real-Time Visual Understanding, sample 201-250 shard
