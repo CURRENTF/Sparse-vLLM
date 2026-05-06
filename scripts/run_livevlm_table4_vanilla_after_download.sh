@@ -86,6 +86,14 @@ task_hints = {
     "omni": ("omni", "emotion", "alignment", "source", "scene"),
     "contextual": ("context", "anomaly", "misleading"),
 }
+task_type_hints = {
+    "Emotion Recognition": ("emotion",),
+    "Multimodal Alignment": ("multimodal", "alignment"),
+    "Scene Understanding": ("scene",),
+    "Source Discrimination": ("source",),
+    "Anomaly Context Understanding": ("anomaly",),
+    "Misleading Context Recognition": ("misleading",),
+}
 total_rows = 0
 missing = []
 for task, filename in checks.items():
@@ -102,7 +110,8 @@ for task, filename in checks.items():
                 raise ValueError(f"Cannot parse sample id from question_id={question_id!r}")
             sample_id = int(match.group(1))
             candidates = video_index.get(sample_id, [])
-            if not any(any(hint in str(path).lower() for hint in task_hints[task]) for path in candidates):
+            hints = task_type_hints.get(row["task_type"], task_hints[task])
+            if not any(any(hint in str(path).lower() for hint in hints) for path in candidates):
                 missing.append({"task": task, "question_id": question_id, "sample_id": sample_id})
     total_rows += rows
     print(f"[verify] {task} rows={rows}")

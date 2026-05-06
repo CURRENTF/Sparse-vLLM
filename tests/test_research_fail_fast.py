@@ -116,6 +116,24 @@ class ResearchFailFastTest(unittest.TestCase):
         self.assertEqual(streamingbench.extract_choice("The answer is A", "official_first_char"), "T")
         self.assertEqual(streamingbench.extract_choice("The answer is A", "robust"), "A")
 
+    def test_streamingbench_video_resolution_uses_task_type_hints(self):
+        video_index = {
+            1: [
+                Path("/tmp/videos/Emotion Recognition/sample_1.mp4"),
+                Path("/tmp/videos/Source Discrimination/sample_1.mp4"),
+                Path("/tmp/videos/Anomaly Context Understanding/sample_1.mp4"),
+                Path("/tmp/videos/Misleading Context Understanding/sample_1.mp4"),
+            ]
+        }
+        self.assertEqual(
+            streamingbench.resolve_video_path(video_index, "omni", "Source Discrimination", 1),
+            Path("/tmp/videos/Source Discrimination/sample_1.mp4"),
+        )
+        self.assertEqual(
+            streamingbench.resolve_video_path(video_index, "contextual", "Misleading Context Recognition", 1),
+            Path("/tmp/videos/Misleading Context Understanding/sample_1.mp4"),
+        )
+
     def test_sparsevllm_raw_config_fallback_is_opt_in(self):
         with tempfile.TemporaryDirectory() as tmp:
             model_dir = Path(tmp)

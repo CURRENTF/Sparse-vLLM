@@ -74,6 +74,14 @@ TASK_VIDEO_HINTS = {
     "contextual": ("context", "anomaly", "misleading"),
     "sqa": ("sqa", "sequential"),
 }
+TASK_TYPE_VIDEO_HINTS = {
+    "Emotion Recognition": ("emotion",),
+    "Multimodal Alignment": ("multimodal", "alignment"),
+    "Scene Understanding": ("scene",),
+    "Source Discrimination": ("source",),
+    "Anomaly Context Understanding": ("anomaly",),
+    "Misleading Context Recognition": ("misleading",),
+}
 
 CHOICE_RE = re.compile(r"\b([ABCD])\b", re.IGNORECASE)
 SAMPLE_RE = re.compile(r"sample[_ -]?(\d+)", re.IGNORECASE)
@@ -255,10 +263,14 @@ def list_tasks(tasks: str) -> list[str]:
     return selected
 
 
-def score_video_candidate(path: Path, task: str, sample_id: int) -> tuple[int, str]:
+def video_hints_for(task: str, task_type: str) -> tuple[str, ...]:
+    return TASK_TYPE_VIDEO_HINTS.get(task_type, TASK_VIDEO_HINTS.get(task, ()))
+
+
+def score_video_candidate(path: Path, hints: tuple[str, ...], sample_id: int) -> tuple[int, str]:
     lower = str(path).lower()
     score = 0
-    for hint in TASK_VIDEO_HINTS.get(task, ()):
+    for hint in hints:
         if hint in lower:
             score += 2
     if re.search(fr"sample[_ -]?{sample_id}\b", path.stem, re.IGNORECASE):
@@ -281,11 +293,12 @@ def build_video_index(video_dir: Path) -> dict[int, list[Path]]:
     return index
 
 
-def resolve_video_path(video_index: dict[int, list[Path]], task: str, sample_id: int) -> Path | None:
+def resolve_video_path(video_index: dict[int, list[Path]], task: str, task_type: str, sample_id: int) -> Path | None:
     candidates = video_index.get(sample_id, [])
     if not candidates:
         return None
-    return sorted(candidates, key=lambda path: score_video_candidate(path, task, sample_id))[0]
+    hints = video_hints_for(task, task_type)
+    return sorted(candidates, key=lambda path: score_video_candidate(path, hints, sample_id))[0]
 
 
 def build_sqa_context(previous: list[dict]) -> str:
@@ -324,7 +337,7 @@ def load_streamingbench_rows(args):
             for raw in reader:
                 question_id = raw["question_id"]
                 sample_id = extract_sample_id(question_id)
-                video_path = resolve_video_path(video_index, task, sample_id)
+                video_path = resolve_video_path(video_index, task, raw["task_type"], sample_id)
                 if video_path is None:
                     missing_videos.append({"task": task, "question_id": question_id, "sample_id": sample_id})
                     continue
