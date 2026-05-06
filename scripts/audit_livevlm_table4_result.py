@@ -5,6 +5,26 @@ from pathlib import Path
 
 
 DEFAULT_OUTPUT_DIR = Path("/data2/haojitai/datasets/llava_onevision_streamingbench_livevlm_table4_7b_vanilla")
+EXPECTED_VISIBLE_SUBTASKS = {
+    "OP": ("Object Perception", 369),
+    "CR": ("Causal Reasoning", 128),
+    "CS": ("Clips Summarize", 317),
+    "ATP": ("Attribute Perception", 312),
+    "EU": ("Event Understanding", 159),
+    "TR": ("Text-Rich Understanding", 321),
+    "PR": ("Prospective Reasoning", 108),
+    "SU": ("Spatial Understanding", 246),
+    "ACP": ("Action Perception", 352),
+    "CT": ("Counting", 188),
+    "ER": ("Emotion Recognition", 250),
+    "SCU": ("Scene Understanding", 250),
+    "SD": ("Source Discrimination", 250),
+    "MA": ("Multimodal Alignment", 250),
+}
+EXPECTED_EXTRA_SUBTASKS = {
+    "ACU": ("Anomaly Context Understanding", 250),
+    "MCU": ("Misleading Context Recognition", 250),
+}
 
 
 def parse_args():
@@ -55,6 +75,42 @@ def weighted_accuracy_pct(items: list[dict]) -> float | None:
     return 100.0 * correct / total
 
 
+def audit_subtask_items(items: list[dict], expected: dict[str, tuple[str, int]], group_name: str) -> None:
+    abbrs = [str(item.get("abbr", "")) for item in items]
+    duplicates = sorted({abbr for abbr in abbrs if abbrs.count(abbr) > 1})
+    if duplicates:
+        raise RuntimeError(f"{group_name} subtask mismatch: duplicate abbreviations={duplicates}")
+
+    by_abbr = {abbr: item for abbr, item in zip(abbrs, items)}
+    missing = [abbr for abbr in expected if abbr not in by_abbr]
+    unexpected = sorted(abbr for abbr in by_abbr if abbr not in expected)
+    if missing or unexpected:
+        raise RuntimeError(f"{group_name} subtask mismatch: missing={missing}, unexpected={unexpected}")
+
+    mismatched = {}
+    for abbr, (task_type, expected_rows) in expected.items():
+        item = by_abbr[abbr]
+        got_task_type = item.get("task_type")
+        got_rows = int(require_number(item.get("total"), f"{abbr}.total"))
+        recorded_expected_rows = int(require_number(item.get("expected_rows"), f"{abbr}.expected_rows"))
+        if (
+            got_task_type != task_type
+            or got_rows != expected_rows
+            or recorded_expected_rows != expected_rows
+            or item.get("matches_expected_rows") is not True
+        ):
+            mismatched[abbr] = {
+                "task_type": got_task_type,
+                "expected_task_type": task_type,
+                "total": got_rows,
+                "expected_rows": expected_rows,
+                "recorded_expected_rows": recorded_expected_rows,
+                "matches_expected_rows": item.get("matches_expected_rows"),
+            }
+    if mismatched:
+        raise RuntimeError(f"{group_name} subtask row-count mismatch: {mismatched}")
+
+
 def audit_metrics(metrics: dict, require_overall_delta_within_pct: float | None = None) -> dict:
     stats = require_mapping(metrics.get("livevlm_table4_stats"), "livevlm_table4_stats")
     overall = require_mapping(stats.get("overall"), "livevlm_table4_stats.overall")
@@ -67,6 +123,8 @@ def audit_metrics(metrics: dict, require_overall_delta_within_pct: float | None 
             "Expected 2 overall-only LiveVLM Table 4 subtasks for ACU/MCU, "
             f"got {len(extra_subtasks) if isinstance(extra_subtasks, list) else type(extra_subtasks).__name__}"
         )
+    audit_subtask_items(subtasks, EXPECTED_VISIBLE_SUBTASKS, "visible")
+    audit_subtask_items(extra_subtasks, EXPECTED_EXTRA_SUBTASKS, "overall-only")
 
     expected_rows = int(require_number(stats.get("expected_overall_row_count"), "expected_overall_row_count"))
     overall_total = int(require_number(overall.get("total"), "overall.total"))

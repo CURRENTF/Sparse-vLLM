@@ -134,6 +134,14 @@ multiple-choice counter by reading the first non-whitespace generated character;
 non-`A/B/C/D` predictions are marked `parse_failed` and counted as incorrect.
 The `overall_extra_subtasks` field records the ACU/MCU rows that are not printed
 as Table 4 subitems but are included in the paper's `Overall` denominator.
+Each subtask record also stores `expected_rows` and `matches_expected_rows`.
+For full `livevlm_table4` runs, the loader fails unless the row counts are:
+
+```text
+OP 369 | CR 128 | CS 317 | ATP 312 | EU 159 | TR 321 | PR 108 |
+SU 246 | ACP 352 | CT 188 | ER 250 | SCU 250 | SD 250 | MA 250 |
+ACU 250 | MCU 250 | Overall 4000
+```
 
 The StreamingBench leaderboard also reports LLaVA-OneVision-7B with `32`
 frames. The main leaderboard setting uses 60 seconds of video context before
@@ -245,9 +253,10 @@ Audit the completed baseline with:
 ```
 
 The audit fails fast if the metrics file is missing, if the run is not the
-4000-row Table 4 scope, or if the visible/overall-only subtask structure is
-incomplete. To enforce a numeric tolerance against the paper's `Overall=58.85`,
-add for example `--require_overall_delta_within_pct 1.0`.
+4000-row Table 4 scope, if any visible/overall-only subtask is missing, or if
+any subtask row count differs from the expected counts above. To enforce a
+numeric tolerance against the paper's `Overall=58.85`, add for example
+`--require_overall_delta_within_pct 1.0`.
 
 ## Local Results
 

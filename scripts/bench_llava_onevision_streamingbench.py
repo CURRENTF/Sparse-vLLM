@@ -64,6 +64,24 @@ LIVEVLM_TABLE4_OVERALL_SUBTASKS = {
     **LIVEVLM_TABLE4_DISPLAY_SUBTASKS,
     **LIVEVLM_TABLE4_OVERALL_EXTRA_SUBTASKS,
 }
+LIVEVLM_TABLE4_EXPECTED_TASK_TYPE_COUNTS = {
+    "Object Perception": 369,
+    "Causal Reasoning": 128,
+    "Clips Summarize": 317,
+    "Attribute Perception": 312,
+    "Event Understanding": 159,
+    "Text-Rich Understanding": 321,
+    "Prospective Reasoning": 108,
+    "Spatial Understanding": 246,
+    "Action Perception": 352,
+    "Counting": 188,
+    "Emotion Recognition": 250,
+    "Scene Understanding": 250,
+    "Source Discrimination": 250,
+    "Multimodal Alignment": 250,
+    "Anomaly Context Understanding": 250,
+    "Misleading Context Recognition": 250,
+}
 LIVEVLM_TABLE4_EXPECTED_OVERALL = 58.85
 LIVEVLM_TABLE4_EXPECTED_OVERALL_ROWS = 4000
 LIVEVLM_TABLE4_REFERENCE = "LiveVLM arXiv:2505.15269 Table 4, LLaVA-OneVision-7B row"
@@ -731,6 +749,8 @@ def compute_livevlm_table4_stats(records: list[dict]) -> dict:
                 "abbr": abbr,
                 "task_type": task_type,
                 "total": stats["total"],
+                "expected_rows": LIVEVLM_TABLE4_EXPECTED_TASK_TYPE_COUNTS[task_type],
+                "matches_expected_rows": stats["total"] == LIVEVLM_TABLE4_EXPECTED_TASK_TYPE_COUNTS[task_type],
                 "correct": stats["correct"],
                 "status_counts": stats["status_counts"],
                 "accuracy": accuracy,
@@ -749,6 +769,8 @@ def compute_livevlm_table4_stats(records: list[dict]) -> dict:
                 "abbr": abbr,
                 "task_type": task_type,
                 "total": stats["total"],
+                "expected_rows": LIVEVLM_TABLE4_EXPECTED_TASK_TYPE_COUNTS[task_type],
+                "matches_expected_rows": stats["total"] == LIVEVLM_TABLE4_EXPECTED_TASK_TYPE_COUNTS[task_type],
                 "correct": stats["correct"],
                 "status_counts": stats["status_counts"],
                 "accuracy": accuracy,
@@ -809,13 +831,17 @@ def validate_livevlm_table4_rows(args, rows: list[dict]) -> None:
         return
 
     counts = count_by_key(rows, "task_type")
-    missing = [task_type for task_type in LIVEVLM_TABLE4_OVERALL_SUBTASKS if counts.get(task_type, 0) == 0]
+    mismatched = {
+        task_type: {"got": counts.get(task_type, 0), "expected": expected}
+        for task_type, expected in LIVEVLM_TABLE4_EXPECTED_TASK_TYPE_COUNTS.items()
+        if counts.get(task_type, 0) != expected
+    }
     overall_total = sum(counts.get(task_type, 0) for task_type in LIVEVLM_TABLE4_OVERALL_SUBTASKS)
-    if overall_total != LIVEVLM_TABLE4_EXPECTED_OVERALL_ROWS or missing:
+    if overall_total != LIVEVLM_TABLE4_EXPECTED_OVERALL_ROWS or mismatched:
         raise RuntimeError(
             "LiveVLM Table 4 full baseline requires the 4000-row StreamingBench scope. "
             f"Got overall_rows={overall_total}, expected={LIVEVLM_TABLE4_EXPECTED_OVERALL_ROWS}, "
-            f"missing_task_types={missing}, counts={counts}."
+            f"mismatched_task_type_counts={mismatched}, counts={counts}."
         )
 
 

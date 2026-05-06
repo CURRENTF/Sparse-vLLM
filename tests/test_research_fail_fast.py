@@ -134,9 +134,12 @@ class ResearchFailFastTest(unittest.TestCase):
         self.assertEqual(stats["expected_llava_onevision_7b_overall_pct"], 58.85)
         self.assertEqual(stats["expected_overall_row_count"], 4000)
         self.assertEqual(stats["subtasks"][0]["abbr"], "OP")
+        self.assertEqual(stats["subtasks"][0]["expected_rows"], 369)
+        self.assertFalse(stats["subtasks"][0]["matches_expected_rows"])
         self.assertEqual(stats["subtasks"][0]["expected_llava_onevision_7b_pct"], 80.38)
         self.assertEqual(stats["subtasks"][1]["status_counts"], {"parse_failed": 1})
         self.assertEqual(stats["overall_extra_subtasks"][0]["abbr"], "ACU")
+        self.assertEqual(stats["overall_extra_subtasks"][0]["expected_rows"], 250)
         self.assertTrue(stats["overall_extra_subtasks"][0]["used_for_paper_overall"])
         self.assertAlmostEqual(stats["expected_display_weighted_accuracy_pct"], 77.30)
         self.assertAlmostEqual(stats["implied_expected_extra_subtasks_accuracy_pct"], 21.95)
@@ -175,21 +178,45 @@ class ResearchFailFastTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "4000-row StreamingBench scope"):
             streamingbench.validate_livevlm_table4_rows(args, rows)
 
+        rows = []
+        for task_type, count in streamingbench.LIVEVLM_TABLE4_EXPECTED_TASK_TYPE_COUNTS.items():
+            rows.extend({"task_type": task_type} for _ in range(count))
+        streamingbench.validate_livevlm_table4_rows(args, rows)
+
+        rows[-1] = {"task_type": "Object Perception"}
+        with self.assertRaisesRegex(RuntimeError, "mismatched_task_type_counts"):
+            streamingbench.validate_livevlm_table4_rows(args, rows)
+
         args.num_samples = 4
         streamingbench.validate_livevlm_table4_rows(args, rows)
 
     def test_livevlm_table4_audit_requires_complete_metrics(self):
         subtasks = []
-        for idx in range(14):
+        for abbr, (task_type, expected_rows) in livevlm_audit.EXPECTED_VISIBLE_SUBTASKS.items():
             subtasks.append(
                 {
-                    "abbr": f"T{idx}",
-                    "task_type": f"Task {idx}",
-                    "total": 250,
-                    "correct": 125,
+                    "abbr": abbr,
+                    "task_type": task_type,
+                    "total": expected_rows,
+                    "expected_rows": expected_rows,
+                    "matches_expected_rows": True,
+                    "correct": expected_rows // 2,
                     "accuracy_pct": 50.0,
                     "expected_llava_onevision_7b_pct": 50.0,
                     "delta_vs_expected_pct": 0.0,
+                }
+            )
+        extra_subtasks = []
+        for abbr, (task_type, expected_rows) in livevlm_audit.EXPECTED_EXTRA_SUBTASKS.items():
+            extra_subtasks.append(
+                {
+                    "abbr": abbr,
+                    "task_type": task_type,
+                    "total": expected_rows,
+                    "expected_rows": expected_rows,
+                    "matches_expected_rows": True,
+                    "correct": expected_rows // 2,
+                    "accuracy_pct": 50.0,
                 }
             )
         metrics = {
@@ -208,10 +235,7 @@ class ResearchFailFastTest(unittest.TestCase):
                     "status_counts": {"success": 4000},
                 },
                 "subtasks": subtasks,
-                "overall_extra_subtasks": [
-                    {"abbr": "ACU", "task_type": "ACU", "total": 250, "correct": 125, "accuracy_pct": 50.0},
-                    {"abbr": "MCU", "task_type": "MCU", "total": 250, "correct": 125, "accuracy_pct": 50.0},
-                ],
+                "overall_extra_subtasks": extra_subtasks,
             },
         }
         summary = livevlm_audit.audit_metrics(metrics)
@@ -222,6 +246,11 @@ class ResearchFailFastTest(unittest.TestCase):
 
         metrics["livevlm_table4_stats"]["overall"]["total"] = 3999
         with self.assertRaisesRegex(RuntimeError, "Overall row count mismatch"):
+            livevlm_audit.audit_metrics(metrics)
+
+        metrics["livevlm_table4_stats"]["overall"]["total"] = 4000
+        metrics["livevlm_table4_stats"]["subtasks"][0]["total"] = 1
+        with self.assertRaisesRegex(RuntimeError, "visible subtask row-count mismatch"):
             livevlm_audit.audit_metrics(metrics)
 
     def test_visual_benchmark_saves_separate_artifacts(self):
