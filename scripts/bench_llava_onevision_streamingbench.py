@@ -5,11 +5,15 @@ import csv
 import gc
 import hashlib
 import json
+import os
+import random
 import re
+import shlex
 import shutil
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import torch
@@ -35,6 +39,26 @@ TASK_CSV_FILES = {
     "sqa": "Sequential_Question_Answering.csv",
 }
 
+LIVEVLM_TABLE4_TASKS = ("real", "omni")
+LIVEVLM_TABLE4_SUBTASKS = {
+    "Object Perception": ("OP", 80.38),
+    "Causal Reasoning": ("CR", 74.22),
+    "Clips Summarize": ("CS", 76.03),
+    "Attribute Perception": ("ATP", 80.72),
+    "Event Understanding": ("EU", 72.67),
+    "Text-Rich Understanding": ("TR", 71.65),
+    "Prospective Reasoning": ("PR", 67.59),
+    "Spatial Understanding": ("SU", 65.45),
+    "Action Perception": ("ACP", 65.72),
+    "Counting": ("CT", 45.08),
+    "Emotion Recognition": ("ER", 40.80),
+    "Scene Understanding": ("SCU", 37.20),
+    "Source Discrimination": ("SD", 33.60),
+    "Multimodal Alignment": ("MA", 44.80),
+}
+LIVEVLM_TABLE4_EXPECTED_OVERALL = 58.85
+LIVEVLM_TABLE4_REFERENCE = "LiveVLM arXiv:2505.15269 Table 4, LLaVA-OneVision-7B row"
+
 TASK_VIDEO_HINTS = {
     "real": ("real", "visual", "real-time"),
     "omni": ("omni", "emotion", "alignment", "source"),
@@ -46,8 +70,8 @@ CHOICE_RE = re.compile(r"\b([ABCD])\b", re.IGNORECASE)
 SAMPLE_RE = re.compile(r"sample[_ -]?(\d+)", re.IGNORECASE)
 
 
-PROMPT_TEMPLATE = """You are an advanced video question-answering AI assistant. You have been provided with some frames from the video and a multiple-choice question related to the video. Your task is to carefully analyze the video and provide the best answer to question, choosing from the four options provided.
-Respond with only the letter (A, B, C, or D) of the correct option.
+PROMPT_TEMPLATE = """You are an advanced video question-answering AI assistant. You have been provided with some frames from the video and a multiple-choice question related to the video. Your task is to carefully analyze the video and provide the best answer to question, choosing from the four options provided. Respond with only the letter (A, B, C, or D) of the correct option.
+
 Question: {question}
 Options:
 {options}
@@ -78,7 +102,11 @@ def parse_args():
     parser.add_argument("--csv_dir", default="")
     parser.add_argument("--video_dir", default="")
     parser.add_argument("--output_dir", default="/data2/haojitai/datasets/llava_onevision_streamingbench")
-    parser.add_argument("--tasks", default="real", help="Comma-separated tasks: real, omni, contextual, sqa.")
+    parser.add_argument(
+        "--tasks",
+        default="real",
+        help="Comma-separated tasks: real, omni, contextual, sqa. Use all_mc or livevlm_table4 for aliases.",
+    )
     parser.add_argument("--methods", default="vanilla,deltakv_delta_quant")
     parser.add_argument("--num_samples", type=int, default=16, help="Rows to evaluate after filtering missing videos. Use -1 for all available rows.")
     parser.add_argument("--sample_start", type=int, default=0)
@@ -98,11 +126,12 @@ def parse_args():
     parser.add_argument(
         "--streamingbench_profile",
         default="custom",
-        choices=["custom", "official_60s", "official_all_context"],
+        choices=["custom", "official_60s", "official_all_context", "livevlm_table4"],
         help=(
             "Convenience profile. official_60s sets 32 frames and 60s query context, matching "
             "the StreamingBench main leaderboard. official_all_context sets 32 frames and all "
-            "preceding context."
+            "preceding context. livevlm_table4 matches LiveVLM Table 4's LLaVA-OneVision-7B "
+            "baseline scope: real+omni MCQA, 32 frames, all preceding context."
         ),
     )
     parser.add_argument(
@@ -128,6 +157,7 @@ def parse_args():
     parser.add_argument("--deltakv_neighbor_count", type=int, default=1)
     parser.add_argument("--frame_cache_dir", default="")
     parser.add_argument("--reuse_frame_cache", action="store_true")
+    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--allow_missing_videos",
         action="store_true",
@@ -145,6 +175,12 @@ def apply_streamingbench_profile(args):
     elif args.streamingbench_profile == "official_all_context":
         args.num_video_frames = 32
         args.context_seconds = -1.0
+    elif args.streamingbench_profile == "livevlm_table4":
+        args.num_video_frames = 32
+        args.context_seconds = -1.0
+        args.frame_sampling_backend = "decord"
+        if args.tasks == "real":
+            args.tasks = "livevlm_table4"
     return args
 
 
@@ -189,9 +225,15 @@ def list_tasks(tasks: str) -> list[str]:
     selected = [task.strip().lower() for task in tasks.split(",") if task.strip()]
     if selected == ["all_mc"]:
         selected = ["real", "omni", "contextual", "sqa"]
+    elif selected == ["livevlm_table4"]:
+        selected = list(LIVEVLM_TABLE4_TASKS)
     unknown = [task for task in selected if task not in TASK_CSV_FILES]
     if unknown:
-        raise ValueError(f"Unknown StreamingBench task(s): {unknown}. Supported: {sorted(TASK_CSV_FILES)}")
+        aliases = ["all_mc", "livevlm_table4"]
+        raise ValueError(
+            f"Unknown StreamingBench task(s): {unknown}. "
+            f"Supported: {sorted(TASK_CSV_FILES)}; aliases: {aliases}"
+        )
     return selected
 
 
@@ -505,6 +547,179 @@ def iter_batches(rows, batch_size: int):
         yield start, rows[start : start + batch_size]
 
 
+def init_seed(seed: int):
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def get_git_commit() -> str:
+    completed = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(f"Failed to read git commit: {completed.stderr.strip()}")
+    return completed.stdout.strip()
+
+
+def build_run_info(args, dataset_info: dict, row_count: int) -> dict:
+    return {
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "command": " ".join(shlex.quote(part) for part in sys.argv),
+        "cwd": os.getcwd(),
+        "git_commit": get_git_commit(),
+        "model_path": args.model_path,
+        "methods": args.methods,
+        "dataset_dir": args.dataset_dir,
+        "csv_dir": dataset_info["csv_dir"],
+        "video_dir": dataset_info["video_dir"],
+        "tasks": args.tasks,
+        "streamingbench_profile": args.streamingbench_profile,
+        "num_video_frames": args.num_video_frames,
+        "context_seconds": args.context_seconds,
+        "frame_sampling_backend": args.frame_sampling_backend,
+        "prompt_template": PROMPT_TEMPLATE,
+        "sqa_prompt_template": SQA_PROMPT_TEMPLATE,
+        "decoding": {
+            "max_new_tokens": args.max_new_tokens,
+            "do_sample": False,
+            "torch_dtype": args.torch_dtype,
+            "attn_implementation": args.attn_implementation,
+        },
+        "seed": args.seed,
+        "sample_start": args.sample_start,
+        "num_samples_arg": args.num_samples,
+        "evaluated_sample_count": row_count,
+        "dataset_info": dataset_info,
+    }
+
+
+def status_for_prediction(prediction: str) -> str:
+    return "success" if prediction in {"A", "B", "C", "D"} else "parse_failed"
+
+
+def add_accuracy(stats: dict, correct: bool):
+    stats["total"] += 1
+    stats["correct"] += int(correct)
+
+
+def finalize_accuracy_stats(stats: dict):
+    for item in stats.values():
+        item["accuracy"] = item["correct"] / max(item["total"], 1)
+        item["accuracy_pct"] = 100.0 * item["accuracy"]
+
+
+def compute_livevlm_table4_stats(records: list[dict]) -> dict:
+    subtasks = []
+    overall = {"total": 0, "correct": 0}
+    by_task_type: dict[str, dict] = {}
+    for record in records:
+        if record["task_type"] not in LIVEVLM_TABLE4_SUBTASKS:
+            continue
+        if record["status"] != "success":
+            continue
+        stats = by_task_type.setdefault(record["task_type"], {"total": 0, "correct": 0})
+        add_accuracy(stats, bool(record["correct"]))
+        add_accuracy(overall, bool(record["correct"]))
+
+    for task_type, (abbr, expected) in LIVEVLM_TABLE4_SUBTASKS.items():
+        stats = by_task_type.get(task_type, {"total": 0, "correct": 0})
+        accuracy = stats["correct"] / max(stats["total"], 1)
+        accuracy_pct = 100.0 * accuracy
+        subtasks.append(
+            {
+                "abbr": abbr,
+                "task_type": task_type,
+                "total": stats["total"],
+                "correct": stats["correct"],
+                "accuracy": accuracy,
+                "accuracy_pct": accuracy_pct,
+                "expected_llava_onevision_7b_pct": expected,
+                "delta_vs_expected_pct": accuracy_pct - expected if stats["total"] > 0 else None,
+            }
+        )
+
+    overall_accuracy = overall["correct"] / max(overall["total"], 1)
+    overall_accuracy_pct = 100.0 * overall_accuracy
+    return {
+        "reference": LIVEVLM_TABLE4_REFERENCE,
+        "metric": "MCQA accuracy over successfully parsed predictions; parse_failed count is reported separately.",
+        "expected_llava_onevision_7b_overall_pct": LIVEVLM_TABLE4_EXPECTED_OVERALL,
+        "overall": {
+            "total": overall["total"],
+            "correct": overall["correct"],
+            "accuracy": overall_accuracy,
+            "accuracy_pct": overall_accuracy_pct,
+            "delta_vs_expected_pct": overall_accuracy_pct - LIVEVLM_TABLE4_EXPECTED_OVERALL
+            if overall["total"] > 0
+            else None,
+        },
+        "subtasks": subtasks,
+    }
+
+
+def save_method_artifacts(output_dir: Path, result: dict, run_info: dict):
+    method = result["method"]
+    raw_path = output_dir / f"{method}_raw_outputs.jsonl"
+    parsed_path = output_dir / f"{method}_parsed_outputs.jsonl"
+    records_path = output_dir / f"{method}_per_sample_results.jsonl"
+    metrics_path = output_dir / f"{method}_aggregate_metrics.json"
+    run_info_path = output_dir / "run_info.json"
+
+    with raw_path.open("w", encoding="utf-8") as handle:
+        for record in result["records"]:
+            handle.write(
+                json.dumps(
+                    {
+                        "question_id": record["question_id"],
+                        "sample_id": record["sample_id"],
+                        "task": record["task"],
+                        "task_type": record["task_type"],
+                        "raw_prediction": record["raw_prediction"],
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+
+    with parsed_path.open("w", encoding="utf-8") as handle:
+        for record in result["records"]:
+            handle.write(
+                json.dumps(
+                    {
+                        "question_id": record["question_id"],
+                        "prediction": record["prediction"],
+                        "answer": record["answer"],
+                        "status": record["status"],
+                        "correct": record["correct"],
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+
+    with records_path.open("w", encoding="utf-8") as handle:
+        for record in result["records"]:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    metrics = {key: value for key, value in result.items() if key != "records"}
+    metrics_path.write_text(json.dumps(metrics, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    run_info_path.write_text(json.dumps(run_info, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    return {
+        "raw_outputs": str(raw_path),
+        "parsed_outputs": str(parsed_path),
+        "per_sample_results": str(records_path),
+        "aggregate_metrics": str(metrics_path),
+        "run_info": str(run_info_path),
+    }
+
+
 @torch.inference_mode()
 def run_method(method: str, model, processor, rows: list[dict], args, dtype, device, policy=None):
     torch.cuda.reset_peak_memory_stats(device)
@@ -560,10 +775,12 @@ def run_method(method: str, model, processor, rows: list[dict], args, dtype, dev
             sample_idx = batch_start + offset + 1
             decoded = decoded.strip()
             prediction = extract_choice(decoded)
+            status = status_for_prediction(prediction)
             correct = prediction == row["answer"]
             context_start, context_end = context_bounds(row, args)
             records.append(
                 {
+                    "status": status,
                     "task": row["task"],
                     "task_type": row["task_type"],
                     "question_id": row["question_id"],
@@ -592,22 +809,27 @@ def run_method(method: str, model, processor, rows: list[dict], args, dtype, dev
                     f"batch={len(batch_rows)} input={input_token_counts[offset]} padded={input_len} "
                     f"video_tokens={video_token_counts[offset]} new={new_tokens} "
                     f"batch_time={elapsed:.3f}s batch_tok/s={batch_tok_s:.2f} "
-                    f"ans={row['answer']} pred={prediction or '?'} ok={correct} raw={decoded[:80]!r}",
+                    f"status={status} ans={row['answer']} pred={prediction or '?'} ok={correct} raw={decoded[:80]!r}",
                     flush=True,
                 )
 
     total = max(len(records), 1)
     task_stats = {}
+    task_type_stats = {}
+    status_counts = {}
     for record in records:
         stats = task_stats.setdefault(record["task"], {"total": 0, "correct": 0})
-        stats["total"] += 1
-        stats["correct"] += int(record["correct"])
-    for stats in task_stats.values():
-        stats["accuracy"] = stats["correct"] / max(stats["total"], 1)
+        add_accuracy(stats, bool(record["correct"]))
+        type_stats = task_type_stats.setdefault(record["task_type"], {"total": 0, "correct": 0})
+        add_accuracy(type_stats, bool(record["correct"]))
+        status_counts[record["status"]] = status_counts.get(record["status"], 0) + 1
+    finalize_accuracy_stats(task_stats)
+    finalize_accuracy_stats(task_type_stats)
 
     result = {
         "method": method,
         "num_samples": len(records),
+        "status_counts": status_counts,
         "batch_size": effective_batch_size,
         "streamingbench_profile": args.streamingbench_profile,
         "num_video_frames": args.num_video_frames,
@@ -622,7 +844,10 @@ def run_method(method: str, model, processor, rows: list[dict], args, dtype, dev
         "mean_seconds": total_time / total,
         "peak_memory_gb": torch.cuda.max_memory_allocated(device) / (1024**3),
         "accuracy": sum(record["correct"] for record in records) / total,
+        "accuracy_pct": 100.0 * sum(record["correct"] for record in records) / total,
         "task_stats": task_stats,
+        "task_type_stats": task_type_stats,
+        "livevlm_table4_stats": compute_livevlm_table4_stats(records),
         "records": records,
     }
     if policy is not None:
@@ -644,6 +869,7 @@ def iter_methods(methods: str):
 def main():
     args = parse_args()
     args = apply_streamingbench_profile(args)
+    init_seed(args.seed)
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     dtype = torch.bfloat16 if args.torch_dtype == "bfloat16" else torch.float16
     device = torch.device(f"cuda:{args.cuda_device}")
@@ -662,6 +888,7 @@ def main():
         f"missing_video_rows={dataset_info['missing_video_rows']}",
         flush=True,
     )
+    run_info = build_run_info(args, dataset_info, len(rows))
 
     processor = LlavaOnevisionProcessor.from_pretrained(args.model_path, trust_remote_code=True)
     results = []
@@ -677,6 +904,7 @@ def main():
         result = run_method(method_label, model, processor, rows, args, dtype, device, policy=policy)
         result["requested_method"] = requested_method
         result["dataset_info"] = dataset_info
+        result["artifact_paths"] = save_method_artifacts(Path(args.output_dir), result, run_info)
         results.append(result)
         del model
         gc.collect()

@@ -67,6 +67,40 @@ class ResearchFailFastTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "exactly 4 choices"):
             streamingbench.parse_options("['one', 'two']")
 
+    def test_streamingbench_livevlm_table4_scope_and_stats(self):
+        args = SimpleNamespace(
+            streamingbench_profile="livevlm_table4",
+            tasks="real",
+            num_video_frames=8,
+            context_seconds=60.0,
+            frame_sampling_backend="ffmpeg",
+        )
+        streamingbench.apply_streamingbench_profile(args)
+        self.assertEqual(args.tasks, "livevlm_table4")
+        self.assertEqual(streamingbench.list_tasks(args.tasks), ["real", "omni"])
+        self.assertEqual(args.num_video_frames, 32)
+        self.assertEqual(args.context_seconds, -1.0)
+        self.assertEqual(args.frame_sampling_backend, "decord")
+
+        records = [
+            {
+                "task_type": "Object Perception",
+                "status": "success",
+                "correct": True,
+            },
+            {
+                "task_type": "Causal Reasoning",
+                "status": "parse_failed",
+                "correct": False,
+            },
+        ]
+        stats = streamingbench.compute_livevlm_table4_stats(records)
+        self.assertEqual(stats["overall"]["total"], 1)
+        self.assertEqual(stats["overall"]["correct"], 1)
+        self.assertEqual(stats["expected_llava_onevision_7b_overall_pct"], 58.85)
+        self.assertEqual(stats["subtasks"][0]["abbr"], "OP")
+        self.assertEqual(stats["subtasks"][0]["expected_llava_onevision_7b_pct"], 80.38)
+
     def test_sparsevllm_raw_config_fallback_is_opt_in(self):
         with tempfile.TemporaryDirectory() as tmp:
             model_dir = Path(tmp)

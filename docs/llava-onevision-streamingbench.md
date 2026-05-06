@@ -19,6 +19,9 @@ requires polling a video stream and scoring both trigger time and generated
 content. Use this script for accuracy, throughput, and memory comparisons on
 the multiple-choice QA tasks.
 
+LiveVLM Table 4 only reports the `real` and `omni` MCQA portions. Use
+`--streamingbench_profile livevlm_table4` for that exact scope.
+
 ## ReKV on StreamingBench
 
 The original ReKV paper evaluates streaming video QA on RVS-Ego and RVS-Movie,
@@ -90,8 +93,42 @@ quantization.
 
 ## Full-Attention Baseline Protocol
 
-The StreamingBench leaderboard reports LLaVA-OneVision-7B with `32` frames. The
-main leaderboard setting uses 60 seconds of video context before the query.
+LiveVLM Table 4 reports LLaVA-OneVision-7B with `32` frames on the Real-Time
+Visual Understanding and Omni-Source Understanding MCQA tasks. The paper's
+LLaVA-OneVision-7B row is:
+
+```text
+OP 80.38 | CR 74.22 | CS 76.03 | ATP 80.72 | EU 72.67 | TR 71.65 |
+PR 67.59 | SU 65.45 | ACP 65.72 | CT 45.08 | ER 40.80 | SCU 37.20 |
+SD 33.60 | MA 44.80 | Overall 58.85
+```
+
+For this repo, the LiveVLM Table 4 dense/full-attention baseline is:
+
+```bash
+--methods vanilla
+--streamingbench_profile livevlm_table4
+--tasks livevlm_table4
+--frame_sampling_backend decord
+--torch_dtype float16
+--attn_implementation sdpa
+```
+
+`livevlm_table4` forces:
+
+```text
+tasks = real,omni
+num_video_frames = 32
+context_seconds = -1
+frame_sampling_backend = decord
+```
+
+The script reports `livevlm_table4_stats` with the 14 subitems and the expected
+LLaVA-OneVision-7B Table 4 values for direct comparison.
+
+The StreamingBench leaderboard also reports LLaVA-OneVision-7B with `32`
+frames. The main leaderboard setting uses 60 seconds of video context before
+the query.
 
 For this repo, the aligned dense/full-attention baseline is:
 
@@ -152,8 +189,38 @@ example `--cuda_device 7`.
 The script writes:
 
 - `last_streamingbench_result.json`: method summaries and per-question records.
+- `<method>_raw_outputs.jsonl`: raw model generations.
+- `<method>_parsed_outputs.jsonl`: parsed answers, explicit status, and labels.
+- `<method>_per_sample_results.jsonl`: per-sample records.
+- `<method>_aggregate_metrics.json`: aggregate metrics, including Table 4
+  subitem stats when applicable.
+- `run_info.json`: command, config, model, dataset, prompt/decoding settings,
+  seed, and sample count.
 - `frame_cache/`: extracted frames keyed by video path, time window, and frame
   count.
+
+LiveVLM Table 4 baseline command on physical GPU 6 after all video shards have
+been downloaded:
+
+```bash
+CUDA_VISIBLE_DEVICES=6 PYTHONPATH=$PWD/src \
+/home/haojitai/miniconda3/envs/svllm/bin/python -u \
+  scripts/bench_llava_onevision_streamingbench.py \
+  --model_path /data2/haojitai/models/llava-onevision-qwen2-7b-ov-hf \
+  --dataset_dir /data2/haojitai/datasets/StreamingBench_hf \
+  --video_dir /data2/haojitai/datasets/StreamingBench_hf/videos \
+  --output_dir /data2/haojitai/datasets/llava_onevision_streamingbench_livevlm_table4_7b_vanilla \
+  --methods vanilla \
+  --num_samples -1 \
+  --batch_size 1 \
+  --streamingbench_profile livevlm_table4 \
+  --torch_dtype float16 \
+  --attn_implementation sdpa \
+  --max_new_tokens 8 \
+  --cuda_device 0 \
+  --seed 0 \
+  --log_every 50
+```
 
 ## Local Results
 
