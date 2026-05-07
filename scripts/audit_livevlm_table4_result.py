@@ -56,6 +56,22 @@ def parse_args():
         default=str(DEFAULT_EXPECTED_MODEL_PATH),
         help="Expected LLaVA-OneVision-7B model path recorded in run_info.json.",
     )
+    parser.add_argument(
+        "--expected_attn_implementation",
+        default="flash_attention_2",
+        help="Expected attention backend recorded in run_info.json.",
+    )
+    parser.add_argument(
+        "--expected_streamingbench_profile",
+        default="livevlm_table4",
+        help="Expected StreamingBench profile recorded in run_info.json.",
+    )
+    parser.add_argument(
+        "--expected_context_seconds",
+        type=float,
+        default=-1.0,
+        help="Expected context_seconds recorded in run_info.json.",
+    )
     return parser.parse_args()
 
 
@@ -175,14 +191,21 @@ def audit_subtask_items(items: list[dict], expected: dict[str, tuple[str, int]],
         raise RuntimeError(f"{group_name} subtask row-count mismatch: {mismatched}")
 
 
-def audit_run_info(run_info: dict, expected_model_path: str, expected_rows: int) -> dict:
+def audit_run_info(
+    run_info: dict,
+    expected_model_path: str,
+    expected_rows: int,
+    expected_attn_implementation: str,
+    expected_streamingbench_profile: str,
+    expected_context_seconds: float,
+) -> dict:
     required = {
         "model_path": expected_model_path,
         "methods": "vanilla",
-        "streamingbench_profile": "livevlm_table4",
+        "streamingbench_profile": expected_streamingbench_profile,
         "tasks": "livevlm_table4",
         "num_video_frames": 32,
-        "context_seconds": -1.0,
+        "context_seconds": expected_context_seconds,
         "frame_sampling_backend": "decord",
         "choice_parse_mode": "official_first_char",
         "sample_start": 0,
@@ -197,7 +220,11 @@ def audit_run_info(run_info: dict, expected_model_path: str, expected_rows: int)
     assert_equal(decoding.get("max_new_tokens"), 8, "run_info.decoding.max_new_tokens")
     assert_equal(decoding.get("do_sample"), False, "run_info.decoding.do_sample")
     assert_equal(decoding.get("torch_dtype"), "float16", "run_info.decoding.torch_dtype")
-    assert_equal(decoding.get("attn_implementation"), "sdpa", "run_info.decoding.attn_implementation")
+    assert_equal(
+        decoding.get("attn_implementation"),
+        expected_attn_implementation,
+        "run_info.decoding.attn_implementation",
+    )
 
     dataset_info = require_mapping(run_info.get("dataset_info"), "run_info.dataset_info")
     task_counts = require_mapping(dataset_info.get("evaluated_task_type_counts"), "run_info.dataset_info.evaluated_task_type_counts")
@@ -298,7 +325,14 @@ def audit_jsonl_artifacts(output_dir: Path, expected_rows: int) -> dict:
     }
 
 
-def audit_output_artifacts(output_dir: Path, metrics: dict, expected_model_path: str) -> dict:
+def audit_output_artifacts(
+    output_dir: Path,
+    metrics: dict,
+    expected_model_path: str,
+    expected_attn_implementation: str,
+    expected_streamingbench_profile: str,
+    expected_context_seconds: float,
+) -> dict:
     stats = require_mapping(metrics.get("livevlm_table4_stats"), "livevlm_table4_stats")
     expected_rows = int(require_number(stats.get("expected_overall_row_count"), "expected_overall_row_count"))
     run_info = require_mapping(load_json(output_dir / "run_info.json", "run_info"), "run_info")
@@ -323,7 +357,14 @@ def audit_output_artifacts(output_dir: Path, metrics: dict, expected_model_path:
         status_counts_from_jsonl,
         "livevlm_table4_stats.overall.status_counts",
     )
-    run_info_summary = audit_run_info(run_info, expected_model_path, expected_rows)
+    run_info_summary = audit_run_info(
+        run_info,
+        expected_model_path,
+        expected_rows,
+        expected_attn_implementation,
+        expected_streamingbench_profile,
+        expected_context_seconds,
+    )
     return {
         "output_dir": str(output_dir),
         **artifact_summary,
@@ -421,7 +462,14 @@ def main():
     metrics_path = resolve_metrics_path(args.metrics_path, args.output_dir)
     metrics = require_mapping(load_json(metrics_path, "aggregate metrics"), str(metrics_path))
     summary = audit_metrics(metrics, require_overall_delta_within_pct=args.require_overall_delta_within_pct)
-    artifact_summary = audit_output_artifacts(metrics_path.parent, metrics, args.expected_model_path)
+    artifact_summary = audit_output_artifacts(
+        metrics_path.parent,
+        metrics,
+        args.expected_model_path,
+        args.expected_attn_implementation,
+        args.expected_streamingbench_profile,
+        args.expected_context_seconds,
+    )
     summary["artifact_audit"] = artifact_summary
     print_summary(summary)
     print(

@@ -70,6 +70,37 @@ class ResearchFailFastTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "exactly 4 choices"):
             streamingbench.parse_options("['one', 'two']")
 
+    def test_streamingbench_repairs_labeled_option_fragments_explicitly(self):
+        options, reason = streamingbench.parse_options_with_repair(
+            [
+                "A. first choice",
+                "B. second",
+                "choice",
+                "C. third choice",
+                "",
+                "D. fourth choice",
+            ]
+        )
+        self.assertEqual(reason, "reconstructed_repeated_or_fragmented_labeled_options")
+        self.assertEqual(options, ["A. first choice", "B. second choice", "C. third choice", "D. fourth choice"])
+
+        options, reason = streamingbench.parse_options_with_repair(
+            [
+                "A. truncated",
+                "B. truncated",
+                "C. third",
+                "D. fourth.A. complete first",
+                "B. complete second",
+                "C. complete third",
+                "D. complete fourth",
+            ]
+        )
+        self.assertEqual(reason, "reconstructed_repeated_or_fragmented_labeled_options")
+        self.assertEqual(
+            options,
+            ["A. complete first", "B. complete second", "C. complete third", "D. complete fourth"],
+        )
+
     def test_streamingbench_validates_runtime_args(self):
         args = SimpleNamespace(
             num_samples=1,
@@ -78,6 +109,7 @@ class ResearchFailFastTest(unittest.TestCase):
             num_video_frames=32,
             max_new_tokens=8,
             log_every=1,
+            frame_load_workers=1,
             context_seconds=60.0,
             visual_keep_ratio=1.0,
             deltakv_center_ratio=0.1,
@@ -320,7 +352,7 @@ class ResearchFailFastTest(unittest.TestCase):
                             "max_new_tokens": 8,
                             "do_sample": False,
                             "torch_dtype": "float16",
-                            "attn_implementation": "sdpa",
+                            "attn_implementation": "flash_attention_2",
                         },
                         "dataset_info": {"evaluated_task_type_counts": task_counts},
                     }
@@ -336,6 +368,9 @@ class ResearchFailFastTest(unittest.TestCase):
                 output_dir,
                 metrics,
                 str(livevlm_audit.DEFAULT_EXPECTED_MODEL_PATH),
+                "flash_attention_2",
+                "livevlm_table4",
+                -1.0,
             )
             self.assertEqual(artifact_summary["per_sample_rows"], 4000)
 

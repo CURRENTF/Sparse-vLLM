@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -23,14 +24,6 @@ from transformers import LlavaOnevisionProcessor
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
-
-from bench_llava_onevision_visual_prune import (  # noqa: E402
-    batch_to_device,
-    ensure_left_padding,
-    load_llava_delta_quant_model,
-    load_vanilla_model,
-)
-
 
 TASK_CSV_FILES = {
     "real": "Real_Time_Visual_Understanding.csv",
@@ -188,6 +181,11 @@ def parse_args():
     parser.add_argument("--cuda_device", type=int, default=7)
     parser.add_argument("--torch_dtype", default="bfloat16", choices=["bfloat16", "float16"])
     parser.add_argument("--attn_implementation", default="flash_attention_2")
+    parser.add_argument(
+        "--image_processor_use_fast",
+        action="store_true",
+        help="Use the fast Transformers image/video processor implementation when available.",
+    )
     parser.add_argument("--recent_keep_tokens", type=int, default=128)
     parser.add_argument("--sink_keep_tokens", type=int, default=8)
     parser.add_argument("--decode_keep_tokens", type=int, default=1024)
@@ -201,6 +199,12 @@ def parse_args():
     parser.add_argument("--deltakv_neighbor_count", type=int, default=1)
     parser.add_argument("--frame_cache_dir", default="")
     parser.add_argument("--reuse_frame_cache", action="store_true")
+    parser.add_argument(
+        "--frame_load_workers",
+        type=int,
+        default=1,
+        help="Thread workers for loading cached frame images within each evaluation batch.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--allow_missing_videos",
@@ -243,6 +247,8 @@ def validate_args(args) -> None:
         raise ValueError("--max_new_tokens must be >= 1.")
     if args.log_every < 1:
         raise ValueError("--log_every must be >= 1.")
+    if args.frame_load_workers < 1:
+        raise ValueError("--frame_load_workers must be >= 1.")
     if args.context_seconds < 0 and args.context_seconds != -1:
         raise ValueError("--context_seconds must be -1 for all context or a non-negative window in seconds.")
     if args.visual_keep_ratio <= 0.0 or args.visual_keep_ratio > 1.0:
@@ -272,19 +278,94 @@ def parse_timestamp(value: str) -> float:
     return seconds
 
 
-def parse_options(value: str) -> list[str]:
-    options = ast.literal_eval(value) if isinstance(value, str) else value
-    options = [str(option).strip() for option in options]
-    if len(options) != 4:
-        raise ValueError(f"StreamingBench options must contain exactly 4 choices, got {len(options)}: {value!r}")
-    labels = ["A", "B", "C", "D"]
+OPTION_LABEL_RE = re.compile(r"(?<![A-Za-z0-9])([ABCD])\s*\.\s*", re.IGNORECASE)
+OPTION_LABELS = ["A", "B", "C", "D"]
+
+
+def _normalize_labeled_options(options: list[str]) -> list[str]:
     normalized = []
-    for label, option in zip(labels, options):
+    for label, option in zip(OPTION_LABELS, options):
         if re.match(r"^[ABCD]\s*\.", option, re.IGNORECASE):
             normalized.append(option)
         else:
             normalized.append(f"{label}. {option}")
     return normalized
+
+
+def _split_labeled_option_fragments(options: list[str]) -> list[tuple[str, str]]:
+    fragments: list[tuple[str, str]] = []
+    current_label = ""
+    current_parts: list[str] = []
+
+    def flush_current() -> None:
+        nonlocal current_label, current_parts
+        if current_label:
+            text = " ".join(part for part in current_parts if part).strip()
+            fragments.append((current_label, text))
+        current_label = ""
+        current_parts = []
+
+    for option in options:
+        text = str(option).strip()
+        if not text:
+            continue
+        matches = list(OPTION_LABEL_RE.finditer(text))
+        if not matches:
+            if not current_label:
+                raise ValueError(f"StreamingBench options contain an unlabeled leading fragment: {option!r}")
+            current_parts.append(text)
+            continue
+        prefix = text[: matches[0].start()].strip()
+        if prefix:
+            if not current_label:
+                raise ValueError(f"StreamingBench options contain an unlabeled leading fragment: {option!r}")
+            current_parts.append(prefix)
+        for index, match in enumerate(matches):
+            flush_current()
+            current_label = match.group(1).upper()
+            end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+            current_parts = [text[match.start() : end].strip()]
+    flush_current()
+    return fragments
+
+
+def _repair_labeled_option_fragments(options: list[str]) -> tuple[list[str], str]:
+    fragments = _split_labeled_option_fragments(options)
+    labels = [label for label, _ in fragments]
+    complete_windows = [
+        index
+        for index in range(0, len(labels) - len(OPTION_LABELS) + 1)
+        if labels[index : index + len(OPTION_LABELS)] == OPTION_LABELS
+    ]
+    if not complete_windows:
+        raise ValueError(
+            "StreamingBench options must contain a recoverable A/B/C/D choice sequence, "
+            f"got labels={labels}."
+        )
+    start = complete_windows[-1]
+    repaired = [text for _, text in fragments[start : start + len(OPTION_LABELS)]]
+    reason = "reconstructed_repeated_or_fragmented_labeled_options"
+    if start == 0 and len(fragments) > len(OPTION_LABELS):
+        reason = "dropped_trailing_extra_labeled_options"
+    return _normalize_labeled_options(repaired), reason
+
+
+def parse_options_with_repair(value: str) -> tuple[list[str], str | None]:
+    options = ast.literal_eval(value) if isinstance(value, str) else value
+    options = [str(option).strip() for option in options]
+    if len(options) != 4:
+        try:
+            return _repair_labeled_option_fragments(options)
+        except ValueError as exc:
+            raise ValueError(
+                f"StreamingBench options must contain exactly 4 choices, got {len(options)}: {value!r}"
+            ) from exc
+    return _normalize_labeled_options(options), None
+
+
+def parse_options(value: str) -> list[str]:
+    options, _ = parse_options_with_repair(value)
+    return options
 
 
 def extract_sample_id(question_id: str) -> int:
@@ -385,6 +466,7 @@ def load_streamingbench_rows(args):
     video_index = build_video_index(video_dir)
     selected_rows = []
     missing_videos = []
+    option_repairs: list[dict] = []
 
     for task in list_tasks(args.tasks):
         csv_path = csv_dir / TASK_CSV_FILES[task]
@@ -407,6 +489,15 @@ def load_streamingbench_rows(args):
                         f"StreamingBench row has invalid answer={raw['answer']!r} "
                         f"for question_id={question_id!r}."
                     )
+                options, option_repair = parse_options_with_repair(raw["options"])
+                if option_repair:
+                    option_repairs.append(
+                        {
+                            "task": task,
+                            "question_id": question_id,
+                            "reason": option_repair,
+                        }
+                    )
                 task_rows.append(
                     {
                         "task": task,
@@ -418,7 +509,7 @@ def load_streamingbench_rows(args):
                         "time_stamp": raw["time_stamp"],
                         "timestamp_seconds": parse_timestamp(raw["time_stamp"]),
                         "answer": answer,
-                        "options": parse_options(raw["options"]),
+                        "options": options,
                         "frames_required": raw.get("frames_required", ""),
                         "temporal_clue_type": raw.get("temporal_clue_type", ""),
                         "video_path": str(video_path),
@@ -456,6 +547,8 @@ def load_streamingbench_rows(args):
         "indexed_video_count": sum(len(items) for items in video_index.values()),
         "missing_video_rows": len(missing_videos),
         "missing_video_examples": missing_videos[:10],
+        "option_repair_rows": len(option_repairs),
+        "option_repair_examples": option_repairs[:10],
         "selected_rows_before_slice": len(selected_rows),
         "evaluated_task_counts": count_by_key(rows, "task"),
         "evaluated_task_type_counts": count_by_key(rows, "task_type"),
@@ -479,7 +572,7 @@ def ffmpeg_extract_frame(video_path: Path, timestamp: float, output_path: Path) 
         "2",
         str(output_path),
     ]
-    completed = subprocess.run(command)
+    completed = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     return completed.returncode == 0 and output_path.exists() and output_path.stat().st_size > 0
 
 
@@ -565,10 +658,57 @@ def decord_extract_context_frames(
         ) from e
 
 
-def load_video_frames(row: dict, args) -> list[Image.Image]:
+def ffmpeg_reencode_context_clip(video_path: Path, start_seconds: float, end_seconds: float, output_path: Path) -> str:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if output_path.exists():
+        output_path.unlink()
+    duration_seconds = max(int(end_seconds) - int(start_seconds), 1)
+    command = [
+        "ffmpeg",
+        "-hide_banner",
+        "-nostats",
+        "-loglevel",
+        "error",
+        "-y",
+        "-ss",
+        str(int(start_seconds)),
+        "-i",
+        str(video_path),
+        "-t",
+        str(duration_seconds),
+        "-vcodec",
+        "libx264",
+        "-acodec",
+        "aac",
+        str(output_path),
+    ]
+    completed = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    if completed.returncode != 0 or not output_path.exists() or output_path.stat().st_size == 0:
+        stderr = (completed.stderr or "").strip()
+        raise RuntimeError(
+            f"Failed to re-encode StreamingBench context clip: video={video_path} "
+            f"start={start_seconds:.3f}s end={end_seconds:.3f}s rc={completed.returncode} "
+            f"stderr={stderr[-2000:]}"
+        )
+    return completed.stderr or ""
+
+
+def official_clip_extract_context_frames(
+    video_path: Path,
+    start_seconds: float,
+    end_seconds: float,
+    num_frames: int,
+    frame_paths: list[Path],
+) -> str:
+    clip_path = frame_paths[0].parent / "official_context_clip.mp4"
+    stderr = ffmpeg_reencode_context_clip(video_path, start_seconds, end_seconds, clip_path)
+    decord_extract_context_frames(clip_path, 0.0, max(end_seconds - start_seconds, 1.0), num_frames, frame_paths)
+    return stderr
+
+
+def frame_cache_paths_for_row(row: dict, args) -> tuple[Path, list[Path], float, float]:
     video_path = Path(row["video_path"])
     start_seconds, end_seconds = context_bounds(row, args)
-
     cache_root = Path(args.frame_cache_dir) if args.frame_cache_dir else Path(args.output_dir) / "frame_cache"
     cache_key = frame_cache_key(
         video_path,
@@ -589,12 +729,18 @@ def load_video_frames(row: dict, args) -> list[Image.Image]:
         timestamps = [start_seconds + step * idx for idx in range(args.num_video_frames)]
 
     frame_paths = [cache_dir / f"frame_{idx:03d}.jpg" for idx in range(len(timestamps))]
+    return cache_dir, frame_paths, start_seconds, end_seconds
+
+
+def ensure_frame_cache(row: dict, args) -> list[Path]:
+    video_path = Path(row["video_path"])
+    cache_dir, frame_paths, start_seconds, end_seconds = frame_cache_paths_for_row(row, args)
+    if cache_dir.exists() and not args.reuse_frame_cache:
+        shutil.rmtree(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
     if args.reuse_frame_cache and all(path.exists() and path.stat().st_size > 0 for path in frame_paths):
-        frames = []
-        for frame_path in frame_paths:
-            with Image.open(frame_path) as image:
-                frames.append(image.convert("RGB").copy())
-        return frames
+        return frame_paths
 
     for frame_path in frame_paths:
         if frame_path.exists():
@@ -602,20 +748,32 @@ def load_video_frames(row: dict, args) -> list[Image.Image]:
 
     if args.frame_sampling_backend == "decord":
         decord_extract_context_frames(video_path, start_seconds, end_seconds, len(frame_paths), frame_paths)
-        frames = []
-        for frame_path in frame_paths:
-            with Image.open(frame_path) as image:
-                frames.append(image.convert("RGB").copy())
-        return frames
+        return frame_paths
 
+    if args.num_video_frames <= 1:
+        timestamps = [(start_seconds + end_seconds) / 2.0]
+    else:
+        step = (end_seconds - start_seconds) / (args.num_video_frames - 1)
+        timestamps = [start_seconds + step * idx for idx in range(args.num_video_frames)]
     for timestamp, frame_path in zip(timestamps, frame_paths):
         extract_required_frame(video_path, timestamp, frame_path)
 
+    return frame_paths
+
+
+def load_video_frames(row: dict, args) -> list[Image.Image]:
+    frame_paths = ensure_frame_cache(row, args)
     frames = []
     for frame_path in frame_paths:
         with Image.open(frame_path) as image:
             frames.append(image.convert("RGB").copy())
     return frames
+
+
+def load_batch_video_frames(batch_rows: list[dict], args, executor: ThreadPoolExecutor | None) -> list[list[Image.Image]]:
+    if executor is None or len(batch_rows) <= 1:
+        return [load_video_frames(row, args) for row in batch_rows]
+    return list(executor.map(lambda row: load_video_frames(row, args), batch_rows))
 
 
 def build_prompt(processor, row: dict):
@@ -707,6 +865,7 @@ def build_run_info(args, dataset_info: dict, row_count: int) -> dict:
             "deltakv_center_ratio": args.deltakv_center_ratio,
             "deltakv_neighbor_count": args.deltakv_neighbor_count,
             "chunk_prefill_accel_omnikv": bool(args.chunk_prefill_accel_omnikv),
+            "frame_load_workers": args.frame_load_workers,
         },
     }
 
@@ -904,11 +1063,17 @@ def save_method_artifacts(output_dir: Path, result: dict, run_info: dict):
 
 @torch.inference_mode()
 def run_method(method: str, model, processor, rows: list[dict], args, dtype, device, policy=None):
+    from bench_llava_onevision_visual_prune import batch_to_device, ensure_left_padding
+
     torch.cuda.reset_peak_memory_stats(device)
     records = []
     total_new_tokens = 0
     total_time = 0.0
+    total_frame_load_time = 0.0
+    total_prompt_time = 0.0
+    total_processor_time = 0.0
     total_batches = 0
+    wall_start = time.perf_counter()
     effective_batch_size = max(1, int(args.batch_size))
     if effective_batch_size > 1:
         ensure_left_padding(processor)
@@ -916,88 +1081,111 @@ def run_method(method: str, model, processor, rows: list[dict], args, dtype, dev
         ensure_left_padding(processor)
 
     log_every = max(1, int(args.log_every))
-    for batch_start, batch_rows in iter_batches(rows, effective_batch_size):
-        videos = [load_video_frames(row, args) for row in batch_rows]
-        prompts = [build_prompt(processor, row) for row in batch_rows]
-        processor_kwargs = {"text": prompts, "videos": videos, "return_tensors": "pt"}
-        if len(batch_rows) > 1:
-            processor_kwargs["padding"] = True
-        inputs = processor(**processor_kwargs)
-        input_len = int(inputs["input_ids"].shape[1])
-        attention_mask = inputs.get("attention_mask")
-        if attention_mask is not None:
-            input_token_counts = attention_mask.sum(dim=1).tolist()
-        else:
-            input_token_counts = [input_len for _ in batch_rows]
-        video_token_counts = (inputs["input_ids"] == model.config.video_token_id).sum(dim=1).tolist()
-        inputs = batch_to_device(inputs, device, dtype)
+    frame_load_executor = (
+        ThreadPoolExecutor(max_workers=args.frame_load_workers)
+        if int(args.frame_load_workers) > 1
+        else None
+    )
+    try:
+        for batch_start, batch_rows in iter_batches(rows, effective_batch_size):
+            frame_load_start = time.perf_counter()
+            videos = load_batch_video_frames(batch_rows, args, frame_load_executor)
+            frame_load_elapsed = time.perf_counter() - frame_load_start
+            total_frame_load_time += frame_load_elapsed
 
-        torch.cuda.synchronize(device)
-        start = time.perf_counter()
-        output_ids = model.generate(
-            **inputs,
-            max_new_tokens=args.max_new_tokens,
-            do_sample=False,
-            use_cache=True,
-            pad_token_id=getattr(processor.tokenizer, "pad_token_id", None),
-        )
-        torch.cuda.synchronize(device)
-        elapsed = time.perf_counter() - start
+            prompt_start = time.perf_counter()
+            prompts = [build_prompt(processor, row) for row in batch_rows]
+            prompt_elapsed = time.perf_counter() - prompt_start
+            total_prompt_time += prompt_elapsed
 
-        generated_ids = output_ids[:, input_len:]
-        decoded_batch = processor.batch_decode(generated_ids, skip_special_tokens=True)
-        new_tokens = int(generated_ids.shape[1])
-        batch_new_tokens = new_tokens * len(batch_rows)
-        total_new_tokens += batch_new_tokens
-        total_time += elapsed
-        total_batches += 1
-        batch_tok_s = batch_new_tokens / elapsed if elapsed > 0 else 0.0
+            processor_kwargs = {"text": prompts, "videos": videos, "return_tensors": "pt"}
+            if len(batch_rows) > 1:
+                processor_kwargs["padding"] = True
+            processor_start = time.perf_counter()
+            inputs = processor(**processor_kwargs)
+            processor_elapsed = time.perf_counter() - processor_start
+            total_processor_time += processor_elapsed
+            del videos
+            input_len = int(inputs["input_ids"].shape[1])
+            attention_mask = inputs.get("attention_mask")
+            if attention_mask is not None:
+                input_token_counts = attention_mask.sum(dim=1).tolist()
+            else:
+                input_token_counts = [input_len for _ in batch_rows]
+            video_token_counts = (inputs["input_ids"] == model.config.video_token_id).sum(dim=1).tolist()
+            inputs = batch_to_device(inputs, device, dtype)
 
-        for offset, (row, decoded) in enumerate(zip(batch_rows, decoded_batch)):
-            sample_idx = batch_start + offset + 1
-            raw_decoded = decoded
-            decoded = raw_decoded.strip()
-            prediction = extract_choice(decoded, args.choice_parse_mode)
-            status = status_for_prediction(prediction)
-            correct = prediction == row["answer"]
-            context_start, context_end = context_bounds(row, args)
-            records.append(
-                {
-                    "status": status,
-                    "task": row["task"],
-                    "task_type": row["task_type"],
-                    "question_id": row["question_id"],
-                    "sample_id": row["sample_id"],
-                    "time_stamp": row["time_stamp"],
-                    "video_path": row["video_path"],
-                    "context_start_seconds": context_start,
-                    "context_end_seconds": context_end,
-                    "input_tokens": int(input_token_counts[offset]),
-                    "padded_input_tokens": input_len,
-                    "video_tokens": int(video_token_counts[offset]),
-                    "new_tokens": new_tokens,
-                    "seconds": elapsed / len(batch_rows),
-                    "batch_seconds": elapsed,
-                    "new_tokens_per_s": new_tokens / (elapsed / len(batch_rows)) if elapsed > 0 else 0.0,
-                    "batch_new_tokens_per_s": batch_tok_s,
-                    "answer": row["answer"],
-                    "prediction": prediction,
-                    "raw_prediction": raw_decoded,
-                    "parsed_text": decoded,
-                    "correct": correct,
-                }
+            torch.cuda.synchronize(device)
+            start = time.perf_counter()
+            output_ids = model.generate(
+                **inputs,
+                max_new_tokens=args.max_new_tokens,
+                do_sample=False,
+                use_cache=True,
+                pad_token_id=getattr(processor.tokenizer, "pad_token_id", None),
             )
-            if sample_idx <= 5 or sample_idx == len(rows) or sample_idx % log_every == 0:
-                print(
-                    f"[{method}] {sample_idx}/{len(rows)} task={row['task']} qid={row['question_id']} "
-                    f"batch={len(batch_rows)} input={input_token_counts[offset]} padded={input_len} "
-                    f"video_tokens={video_token_counts[offset]} new={new_tokens} "
-                    f"batch_time={elapsed:.3f}s batch_tok/s={batch_tok_s:.2f} "
-                    f"status={status} ans={row['answer']} pred={prediction or '?'} ok={correct} raw={decoded[:80]!r}",
-                    flush=True,
+            torch.cuda.synchronize(device)
+            elapsed = time.perf_counter() - start
+
+            generated_ids = output_ids[:, input_len:]
+            decoded_batch = processor.batch_decode(generated_ids, skip_special_tokens=True)
+            new_tokens = int(generated_ids.shape[1])
+            batch_new_tokens = new_tokens * len(batch_rows)
+            total_new_tokens += batch_new_tokens
+            total_time += elapsed
+            total_batches += 1
+            batch_tok_s = batch_new_tokens / elapsed if elapsed > 0 else 0.0
+
+            for offset, (row, decoded) in enumerate(zip(batch_rows, decoded_batch)):
+                sample_idx = batch_start + offset + 1
+                raw_decoded = decoded
+                decoded = raw_decoded.strip()
+                prediction = extract_choice(decoded, args.choice_parse_mode)
+                status = status_for_prediction(prediction)
+                correct = prediction == row["answer"]
+                context_start, context_end = context_bounds(row, args)
+                records.append(
+                    {
+                        "status": status,
+                        "task": row["task"],
+                        "task_type": row["task_type"],
+                        "question_id": row["question_id"],
+                        "sample_id": row["sample_id"],
+                        "time_stamp": row["time_stamp"],
+                        "video_path": row["video_path"],
+                        "context_start_seconds": context_start,
+                        "context_end_seconds": context_end,
+                        "input_tokens": int(input_token_counts[offset]),
+                        "padded_input_tokens": input_len,
+                        "video_tokens": int(video_token_counts[offset]),
+                        "new_tokens": new_tokens,
+                        "seconds": elapsed / len(batch_rows),
+                        "batch_seconds": elapsed,
+                        "new_tokens_per_s": new_tokens / (elapsed / len(batch_rows)) if elapsed > 0 else 0.0,
+                        "batch_new_tokens_per_s": batch_tok_s,
+                        "answer": row["answer"],
+                        "prediction": prediction,
+                        "raw_prediction": raw_decoded,
+                        "parsed_text": decoded,
+                        "correct": correct,
+                    }
                 )
+                if sample_idx <= 5 or sample_idx == len(rows) or sample_idx % log_every == 0:
+                    print(
+                        f"[{method}] {sample_idx}/{len(rows)} task={row['task']} qid={row['question_id']} "
+                        f"batch={len(batch_rows)} input={input_token_counts[offset]} padded={input_len} "
+                        f"video_tokens={video_token_counts[offset]} new={new_tokens} "
+                        f"batch_time={elapsed:.3f}s batch_tok/s={batch_tok_s:.2f} "
+                        f"frame_load={frame_load_elapsed:.3f}s processor={processor_elapsed:.3f}s "
+                        f"status={status} ans={row['answer']} pred={prediction or '?'} ok={correct} raw={decoded[:80]!r}",
+                        flush=True,
+                    )
+    finally:
+        if frame_load_executor is not None:
+            frame_load_executor.shutdown(wait=True)
 
     total = max(len(records), 1)
+    wall_time = time.perf_counter() - wall_start
     task_stats = {}
     task_type_stats = {}
     status_counts = {}
@@ -1023,8 +1211,13 @@ def run_method(method: str, model, processor, rows: list[dict], args, dtype, dev
         "total_batches": total_batches,
         "total_new_tokens": total_new_tokens,
         "total_seconds": total_time,
+        "total_frame_load_seconds": total_frame_load_time,
+        "total_prompt_seconds": total_prompt_time,
+        "total_processor_seconds": total_processor_time,
+        "end_to_end_seconds": wall_time,
         "new_tokens_per_s": total_new_tokens / total_time if total_time > 0 else 0.0,
         "examples_per_s": len(records) / total_time if total_time > 0 else 0.0,
+        "end_to_end_examples_per_s": len(records) / wall_time if wall_time > 0 else 0.0,
         "mean_batch_seconds": total_time / max(total_batches, 1),
         "mean_seconds": total_time / total,
         "peak_memory_gb": torch.cuda.max_memory_allocated(device) / (1024**3),
@@ -1091,14 +1284,22 @@ def main():
     )
     run_info = build_run_info(args, dataset_info, len(rows))
 
-    processor = LlavaOnevisionProcessor.from_pretrained(args.model_path, trust_remote_code=True)
+    processor = LlavaOnevisionProcessor.from_pretrained(
+        args.model_path,
+        trust_remote_code=True,
+        use_fast=args.image_processor_use_fast,
+    )
     results = []
     for requested_method, method_kind in iter_methods(args.methods):
         if method_kind == "vanilla":
+            from bench_llava_onevision_visual_prune import load_vanilla_model
+
             model = load_vanilla_model(args, dtype, device)
             method_label = "vanilla"
             policy = None
         else:
+            from bench_llava_onevision_visual_prune import load_llava_delta_quant_model
+
             model, policy = load_llava_delta_quant_model(args, dtype, device)
             method_label = policy["method"]
 
