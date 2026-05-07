@@ -114,7 +114,7 @@ For this repo, the LiveVLM Table 4 dense/full-attention baseline is:
 --tasks livevlm_table4
 --frame_sampling_backend decord
 --torch_dtype float16
---attn_implementation sdpa
+--attn_implementation flash_attention_2
 --choice_parse_mode official_first_char
 ```
 
@@ -154,7 +154,7 @@ For this repo, the aligned dense/full-attention baseline is:
 --streamingbench_profile official_60s
 --frame_sampling_backend decord
 --torch_dtype float16
---attn_implementation sdpa
+--attn_implementation flash_attention_2
 ```
 
 `official_60s` forces:
@@ -233,15 +233,17 @@ CUDA_VISIBLE_DEVICES=6 PYTHONPATH=$PWD/src \
   --output_dir /data2/haojitai/datasets/llava_onevision_streamingbench_livevlm_table4_7b_vanilla \
   --methods vanilla \
   --num_samples -1 \
-  --batch_size 1 \
+  --batch_size 8 \
   --streamingbench_profile livevlm_table4 \
   --torch_dtype float16 \
-  --attn_implementation sdpa \
+  --attn_implementation flash_attention_2 \
   --max_new_tokens 8 \
   --choice_parse_mode official_first_char \
   --cuda_device 0 \
   --seed 0 \
-  --log_every 50
+  --log_every 200 \
+  --reuse_frame_cache \
+  --frame_cache_dir /data2/haojitai/datasets/llava_onevision_streamingbench_livevlm_table4_7b_vanilla/frame_cache
 ```
 
 For the background runner, `LIVEVLM_TABLE4_GPU_IDS` can list allowed physical
@@ -268,12 +270,88 @@ that `run_info.json`, `last_streamingbench_result.json`,
 `vanilla_raw_outputs.jsonl`, `vanilla_parsed_outputs.jsonl`, and
 `vanilla_per_sample_results.jsonl` exist, contain 4000 rows where applicable,
 and record the baseline settings: 7B model path, `vanilla`, `livevlm_table4`,
-32 frames, all prior context, decord sampling, `float16`, `sdpa`, greedy
-8-token decoding, `official_first_char`, and seed 0. To enforce a numeric
+32 frames, all prior context, decord sampling, `float16`,
+`flash_attention_2`, greedy 8-token decoding, `official_first_char`, and seed
+0. To enforce a numeric
 tolerance against the paper's `Overall=58.85`, add for example
 `--require_overall_delta_within_pct 1.0`.
 
 ## Local Results
+
+### 7B, Full 4000-Row LiveVLM/StreamingBench Baselines
+
+These are the full local LLaVA-OneVision-7B dense/full-attention runs used to
+check alignment against LiveVLM Table 4 and the StreamingBench 60-second main
+setting.
+
+Common settings:
+
+```text
+model_path = /data2/haojitai/models/llava-onevision-qwen2-7b-ov-hf
+dataset_dir = /data2/haojitai/datasets/StreamingBench_hf
+video_dir = /data2/haojitai/datasets/StreamingBench_hf/videos
+methods = vanilla
+tasks = livevlm_table4
+num_video_frames = 32
+batch_size = 8
+torch_dtype = float16
+attn_implementation = flash_attention_2
+choice_parse_mode = official_first_char
+max_new_tokens = 8
+seed = 0
+```
+
+Result paths:
+
+```text
+/data2/haojitai/datasets/llava_onevision_streamingbench_livevlm_table4_7b_vanilla
+/data2/haojitai/datasets/llava_onevision_streamingbench_livevlm_table4_7b_vanilla_ctx60
+```
+
+| Run | Profile | Context | Samples | Success | Correct | Accuracy | Delta vs LiveVLM 58.85 | New tok/s | Examples/s | Peak memory |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| all prior context | `livevlm_table4` | `-1` | 4000 | 4000 | 2284 | `57.10%` | `-1.75` | `6.580` | `3.244` | `29.77 GB` |
+| official 60s | `official_60s` | `60s` | 4000 | 4000 | 2406 | `60.15%` | `+1.30` | `6.567` | `3.238` | `29.77 GB` |
+
+The official 60s run is the main comparison point for StreamingBench-style
+evaluation. It is aligned with LiveVLM's LLaVA-OneVision-7B `Overall=58.85`
+within `+1.30` points. The all-context run is lower because 32 frames are spread
+over the full prior video history instead of being concentrated in the
+60-second window before the query.
+
+Official 60s subtask results:
+
+| Subtask | Correct / Total | Accuracy |
+| --- | ---: | ---: |
+| OP | 304 / 369 | `82.38%` |
+| CR | 100 / 128 | `78.12%` |
+| CS | 262 / 317 | `82.65%` |
+| ATP | 263 / 312 | `84.29%` |
+| EU | 112 / 159 | `70.44%` |
+| TR | 244 / 321 | `76.01%` |
+| PR | 78 / 108 | `72.22%` |
+| SU | 157 / 246 | `63.82%` |
+| ACP | 241 / 352 | `68.47%` |
+| CT | 77 / 188 | `40.96%` |
+| ER | 102 / 250 | `40.80%` |
+| SCU | 64 / 250 | `25.60%` |
+| SD | 103 / 250 | `41.20%` |
+| MA | 138 / 250 | `55.20%` |
+| ACU | 82 / 250 | `32.80%` |
+| MCU | 79 / 250 | `31.60%` |
+
+Audit artifact:
+
+```text
+/data2/haojitai/datasets/llava_onevision_streamingbench_livevlm_table4_7b_vanilla_ctx60/livevlm_table4_audit.json
+```
+
+The audit checks the 4000-row scope, all expected subtask row counts, raw output
+count, parsed output count, per-sample result count, `official_60s`, 32 frames,
+`flash_attention_2`, greedy 8-token decoding, and `official_first_char` parsing.
+Two rows for `sample_332` used an explicitly recorded frame-cache fallback
+because the local video file is corrupt after roughly 250 seconds; this can
+affect at most `0.05` percentage points.
 
 ### 7B, Official 60s/32-Frame Real-Time Visual Understanding, sample 201-250 shard
 
