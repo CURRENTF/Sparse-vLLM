@@ -465,6 +465,31 @@ Task-level comparison for the recommended DeltaKV run:
 | omni | `40.70%` | `40.70%` | `+0.00` |
 | contextual | `32.20%` | `32.20%` | `+0.00` |
 
+Full subtask comparison from the saved aggregate metrics:
+
+| Subtask | Total | Vanilla correct | Vanilla acc | DeltaKV correct | DeltaKV acc | Delta |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| OP | 369 | 304 | `82.38%` | 304 | `82.38%` | `+0.00` |
+| CR | 128 | 100 | `78.12%` | 100 | `78.12%` | `+0.00` |
+| CS | 317 | 262 | `82.65%` | 262 | `82.65%` | `+0.00` |
+| ATP | 312 | 263 | `84.29%` | 262 | `83.97%` | `-0.32` |
+| EU | 159 | 112 | `70.44%` | 112 | `70.44%` | `+0.00` |
+| TR | 321 | 244 | `76.01%` | 245 | `76.32%` | `+0.31` |
+| PR | 108 | 78 | `72.22%` | 78 | `72.22%` | `+0.00` |
+| SU | 246 | 157 | `63.82%` | 157 | `63.82%` | `+0.00` |
+| ACP | 352 | 241 | `68.47%` | 240 | `68.18%` | `-0.28` |
+| CT | 188 | 77 | `40.96%` | 77 | `40.96%` | `+0.00` |
+| ER | 250 | 102 | `40.80%` | 102 | `40.80%` | `+0.00` |
+| SCU | 250 | 64 | `25.60%` | 64 | `25.60%` | `+0.00` |
+| SD | 250 | 103 | `41.20%` | 103 | `41.20%` | `+0.00` |
+| MA | 250 | 138 | `55.20%` | 138 | `55.20%` | `+0.00` |
+| ACU | 250 | 82 | `32.80%` | 82 | `32.80%` | `+0.00` |
+| MCU | 250 | 79 | `31.60%` | 79 | `31.60%` | `+0.00` |
+
+The DeltaKV columns above use the recommended `kr30_cr1024_full` run. The other
+three full DeltaKV configurations in the KR/CR sweep produced the same correct
+counts for every subtask.
+
 ### 7B, Official 60s/32-Frame Real-Time Visual Understanding, sample 201-250 shard
 
 Local data currently contains only this shard:
