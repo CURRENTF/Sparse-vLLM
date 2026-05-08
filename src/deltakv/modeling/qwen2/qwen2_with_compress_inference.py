@@ -13,6 +13,7 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from deltakv.modeling.kv_cache import CompressedKVCache, ClusterCompressedKVCache
 from deltakv.configs.model_config_cls import KVQwen2Config, parse_full_attn_layers
+from deltakv.modeling.cache_factory import create_deltakv_cache, is_deltakv_cache_instance
 from deltakv.modeling.qwen2.qwen2_e2e import create_compressor
 from deltakv.modeling.token_select import omnikv_token_selection
 from dataclasses import dataclass
@@ -212,16 +213,17 @@ class Qwen2AttnKVCompress(Qwen2Attention):
             compressible_lengths = None
             if hasattr(past_key_value, "get_buffer_valid_lengths") and self.is_obs_layer:
                 buffer_valid_lengths = past_key_value.get_buffer_valid_lengths(self.layer_idx, device=key_states.device)
-                if attention_mask_2d is None:
-                    current_valid_lengths = torch.full_like(buffer_valid_lengths, q_len)
-                else:
-                    current_valid_lengths = attention_mask_2d.to(device=key_states.device, dtype=torch.bool)[:, -q_len:].sum(dim=1)
-                history_valid_lengths = (buffer_valid_lengths - current_valid_lengths).clamp_min(0)
-                compressible_lengths = torch.div(
-                    (history_valid_lengths - self.config.tail_token_size).clamp_min(0),
-                    self.config.tail_token_size,
-                    rounding_mode="floor",
-                ) * self.config.tail_token_size
+                if buffer_valid_lengths is not None:
+                    if attention_mask_2d is None:
+                        current_valid_lengths = torch.full_like(buffer_valid_lengths, q_len)
+                    else:
+                        current_valid_lengths = attention_mask_2d.to(device=key_states.device, dtype=torch.bool)[:, -q_len:].sum(dim=1)
+                    history_valid_lengths = (buffer_valid_lengths - current_valid_lengths).clamp_min(0)
+                    compressible_lengths = torch.div(
+                        (history_valid_lengths - self.config.tail_token_size).clamp_min(0),
+                        self.config.tail_token_size,
+                        rounding_mode="floor",
+                    ) * self.config.tail_token_size
             if compressible_lengths is not None:
                 compressed_len = int(compressible_lengths.max().item())
                 if compressed_len > 0 and hasattr(past_key_value, "get_buffer_candidate_positions"):
@@ -600,11 +602,8 @@ class Qwen2KVCompress(Qwen2ForCausalLM):
 
         # --- Chunk Prefill Logic ---
         # 初始化自定义kv cache
-        if not isinstance(past_key_values, (CompressedKVCache, ClusterCompressedKVCache)):
-            if self.config.use_cluster:
-                past_key_values = ClusterCompressedKVCache(config=self.config)
-            else:
-                past_key_values = CompressedKVCache(config=self.config)
+        if not is_deltakv_cache_instance(past_key_values, self.config):
+            past_key_values = create_deltakv_cache(self.config)
 
         bs, seq_len = input_ids.shape
         base_past_len = int(past_key_values.get_seq_length())

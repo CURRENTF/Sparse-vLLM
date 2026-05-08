@@ -14,6 +14,7 @@ from transformers.models.qwen3.modeling_qwen3 import (
 )
 
 from deltakv.configs.model_config_cls import KVQwen3Config
+from deltakv.modeling.cache_factory import create_deltakv_cache, is_deltakv_cache_instance
 from deltakv.modeling.kv_cache import CompressedKVCache, ClusterCompressedKVCache
 from deltakv.modeling.qwen3.qwen3_e2e import create_compressor
 from deltakv.modeling.token_select import omnikv_token_selection
@@ -313,11 +314,8 @@ class Qwen3KVCompress(Qwen3ForCausalLM):
         assert input_ids.shape[0] == 1
         assert use_cache, "Inference model must use cache"
 
-        if not isinstance(past_key_values, (CompressedKVCache, ClusterCompressedKVCache)):
-            if self.config.use_cluster:
-                past_key_values = ClusterCompressedKVCache(config=self.config)
-            else:
-                past_key_values = CompressedKVCache(config=self.config)
+        if not is_deltakv_cache_instance(past_key_values, self.config):
+            past_key_values = create_deltakv_cache(self.config)
 
         chunk_size = self.config.chunk_prefill_size
         outputs = None

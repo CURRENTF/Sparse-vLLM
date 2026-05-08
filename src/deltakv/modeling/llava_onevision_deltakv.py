@@ -20,7 +20,7 @@ from transformers.models.llava_onevision.modeling_llava_onevision import (
 )
 
 from deltakv.configs.model_config_cls import KVQwen2Config
-from deltakv.modeling.kv_cache import ClusterCompressedKVCache, CompressedKVCache
+from deltakv.modeling.cache_factory import create_deltakv_cache, is_deltakv_cache_instance
 from deltakv.modeling.qwen2.qwen2_with_compress_inference import Qwen2ModelKVCompress
 
 
@@ -179,11 +179,8 @@ class LlavaOnevisionDeltaKVModel(LlavaOnevisionModel):
             if input_ids is not None:
                 visual_token_mask = visual_token_mask | (input_ids == self.config.video_token_id)
 
-        if use_cache and not isinstance(past_key_values, (CompressedKVCache, ClusterCompressedKVCache)):
-            if self.config.text_config.use_cluster:
-                past_key_values = ClusterCompressedKVCache(config=self.config.text_config)
-            else:
-                past_key_values = CompressedKVCache(config=self.config.text_config)
+        if use_cache and not is_deltakv_cache_instance(past_key_values, self.config.text_config):
+            past_key_values = create_deltakv_cache(self.config.text_config)
 
         outputs = self.language_model(
             attention_mask=attention_mask,
