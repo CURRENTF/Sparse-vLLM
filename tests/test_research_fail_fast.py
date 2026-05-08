@@ -110,6 +110,7 @@ class ResearchFailFastTest(unittest.TestCase):
             max_new_tokens=8,
             log_every=1,
             frame_load_workers=1,
+            preprocess_prefetch_batches=0,
             context_seconds=60.0,
             visual_keep_ratio=1.0,
             deltakv_center_ratio=0.1,
@@ -125,6 +126,10 @@ class ResearchFailFastTest(unittest.TestCase):
         args.sample_start = 0
         args.context_seconds = -2.0
         with self.assertRaisesRegex(ValueError, "context_seconds"):
+            streamingbench.validate_args(args)
+        args.context_seconds = 60.0
+        args.preprocess_prefetch_batches = 2
+        with self.assertRaisesRegex(ValueError, "preprocess_prefetch_batches"):
             streamingbench.validate_args(args)
 
     def test_streamingbench_livevlm_table4_scope_and_stats(self):

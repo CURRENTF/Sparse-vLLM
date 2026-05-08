@@ -205,6 +205,18 @@ def parse_args():
         default=1,
         help="Thread workers for loading cached frame images within each evaluation batch.",
     )
+    parser.add_argument(
+        "--preprocess_prefetch_batches",
+        type=int,
+        default=0,
+        choices=[0, 1],
+        help=(
+            "Prefetch the next processed batch on a background thread while the current batch "
+            "is generating. 0 disables prefetch; 1 overlaps frame loading and processor work "
+            "for the next batch. The prefetch worker is intentionally single-threaded to keep "
+            "processor calls ordered and auditable."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--allow_missing_videos",
@@ -249,6 +261,8 @@ def validate_args(args) -> None:
         raise ValueError("--log_every must be >= 1.")
     if args.frame_load_workers < 1:
         raise ValueError("--frame_load_workers must be >= 1.")
+    if args.preprocess_prefetch_batches not in {0, 1}:
+        raise ValueError("--preprocess_prefetch_batches must be 0 or 1.")
     if args.context_seconds < 0 and args.context_seconds != -1:
         raise ValueError("--context_seconds must be -1 for all context or a non-negative window in seconds.")
     if args.visual_keep_ratio <= 0.0 or args.visual_keep_ratio > 1.0:
@@ -802,6 +816,59 @@ def iter_batches(rows, batch_size: int):
         yield start, rows[start : start + batch_size]
 
 
+def prepare_generation_batch(
+    batch_start: int,
+    batch_rows: list[dict],
+    processor,
+    args,
+    frame_load_executor: ThreadPoolExecutor | None,
+    video_token_id: int,
+) -> dict:
+    frame_load_start = time.perf_counter()
+    videos = load_batch_video_frames(batch_rows, args, frame_load_executor)
+    frame_load_elapsed = time.perf_counter() - frame_load_start
+
+    prompt_start = time.perf_counter()
+    prompts = [build_prompt(processor, row) for row in batch_rows]
+    prompt_elapsed = time.perf_counter() - prompt_start
+
+    processor_kwargs = {"text": prompts, "videos": videos, "return_tensors": "pt"}
+    if len(batch_rows) > 1:
+        processor_kwargs["padding"] = True
+    processor_start = time.perf_counter()
+    inputs = processor(**processor_kwargs)
+    processor_elapsed = time.perf_counter() - processor_start
+    del videos
+
+    input_len = int(inputs["input_ids"].shape[1])
+    attention_mask = inputs.get("attention_mask")
+    if attention_mask is not None:
+        input_token_counts = attention_mask.sum(dim=1).tolist()
+    else:
+        input_token_counts = [input_len for _ in batch_rows]
+    video_token_counts = (inputs["input_ids"] == video_token_id).sum(dim=1).tolist()
+
+    return {
+        "batch_start": batch_start,
+        "batch_rows": batch_rows,
+        "inputs": inputs,
+        "input_len": input_len,
+        "input_token_counts": input_token_counts,
+        "video_token_counts": video_token_counts,
+        "frame_load_elapsed": frame_load_elapsed,
+        "prompt_elapsed": prompt_elapsed,
+        "processor_elapsed": processor_elapsed,
+    }
+
+
+class ReadyBatch:
+    def __init__(self, value: dict):
+        self.value = value
+
+    def result(self) -> dict:
+        return self.value
+
+
 def init_seed(seed: int):
     random.seed(seed)
     torch.manual_seed(seed)
@@ -866,6 +933,7 @@ def build_run_info(args, dataset_info: dict, row_count: int) -> dict:
             "deltakv_neighbor_count": args.deltakv_neighbor_count,
             "chunk_prefill_accel_omnikv": bool(args.chunk_prefill_accel_omnikv),
             "frame_load_workers": args.frame_load_workers,
+            "preprocess_prefetch_batches": args.preprocess_prefetch_batches,
         },
     }
 
@@ -1072,6 +1140,7 @@ def run_method(method: str, model, processor, rows: list[dict], args, dtype, dev
     total_frame_load_time = 0.0
     total_prompt_time = 0.0
     total_processor_time = 0.0
+    total_preprocess_wait_time = 0.0
     total_batches = 0
     wall_start = time.perf_counter()
     effective_batch_size = max(1, int(args.batch_size))
@@ -1086,33 +1155,61 @@ def run_method(method: str, model, processor, rows: list[dict], args, dtype, dev
         if int(args.frame_load_workers) > 1
         else None
     )
+    prefetch_executor = (
+        ThreadPoolExecutor(max_workers=1)
+        if int(args.preprocess_prefetch_batches) == 1
+        else None
+    )
+
+    def submit_preprocess(batch_item):
+        if batch_item is None:
+            return None
+        batch_start, batch_rows = batch_item
+        if prefetch_executor is None:
+            return prepare_generation_batch(
+                batch_start,
+                batch_rows,
+                processor,
+                args,
+                frame_load_executor,
+                int(model.config.video_token_id),
+            )
+        return prefetch_executor.submit(
+            prepare_generation_batch,
+            batch_start,
+            batch_rows,
+            processor,
+            args,
+            frame_load_executor,
+            int(model.config.video_token_id),
+        )
+
     try:
-        for batch_start, batch_rows in iter_batches(rows, effective_batch_size):
-            frame_load_start = time.perf_counter()
-            videos = load_batch_video_frames(batch_rows, args, frame_load_executor)
-            frame_load_elapsed = time.perf_counter() - frame_load_start
-            total_frame_load_time += frame_load_elapsed
-
-            prompt_start = time.perf_counter()
-            prompts = [build_prompt(processor, row) for row in batch_rows]
-            prompt_elapsed = time.perf_counter() - prompt_start
-            total_prompt_time += prompt_elapsed
-
-            processor_kwargs = {"text": prompts, "videos": videos, "return_tensors": "pt"}
-            if len(batch_rows) > 1:
-                processor_kwargs["padding"] = True
-            processor_start = time.perf_counter()
-            inputs = processor(**processor_kwargs)
-            processor_elapsed = time.perf_counter() - processor_start
-            total_processor_time += processor_elapsed
-            del videos
-            input_len = int(inputs["input_ids"].shape[1])
-            attention_mask = inputs.get("attention_mask")
-            if attention_mask is not None:
-                input_token_counts = attention_mask.sum(dim=1).tolist()
+        batch_iterator = iter(iter_batches(rows, effective_batch_size))
+        pending = submit_preprocess(next(batch_iterator, None))
+        while pending is not None:
+            if prefetch_executor is None:
+                prepared = pending
             else:
-                input_token_counts = [input_len for _ in batch_rows]
-            video_token_counts = (inputs["input_ids"] == model.config.video_token_id).sum(dim=1).tolist()
+                wait_start = time.perf_counter()
+                prepared = pending.result()
+                total_preprocess_wait_time += time.perf_counter() - wait_start
+
+            next_item = next(batch_iterator, None)
+            next_pending = submit_preprocess(next_item)
+
+            batch_start = prepared["batch_start"]
+            batch_rows = prepared["batch_rows"]
+            inputs = prepared["inputs"]
+            input_len = prepared["input_len"]
+            input_token_counts = prepared["input_token_counts"]
+            video_token_counts = prepared["video_token_counts"]
+            frame_load_elapsed = prepared["frame_load_elapsed"]
+            prompt_elapsed = prepared["prompt_elapsed"]
+            processor_elapsed = prepared["processor_elapsed"]
+            total_frame_load_time += frame_load_elapsed
+            total_prompt_time += prompt_elapsed
+            total_processor_time += processor_elapsed
             inputs = batch_to_device(inputs, device, dtype)
 
             torch.cuda.synchronize(device)
@@ -1126,6 +1223,12 @@ def run_method(method: str, model, processor, rows: list[dict], args, dtype, dev
             )
             torch.cuda.synchronize(device)
             elapsed = time.perf_counter() - start
+
+            if prefetch_executor is not None and next_pending is not None:
+                wait_start = time.perf_counter()
+                next_prepared = next_pending.result()
+                total_preprocess_wait_time += time.perf_counter() - wait_start
+                next_pending = ReadyBatch(next_prepared)
 
             generated_ids = output_ids[:, input_len:]
             decoded_batch = processor.batch_decode(generated_ids, skip_special_tokens=True)
@@ -1177,10 +1280,14 @@ def run_method(method: str, model, processor, rows: list[dict], args, dtype, dev
                         f"video_tokens={video_token_counts[offset]} new={new_tokens} "
                         f"batch_time={elapsed:.3f}s batch_tok/s={batch_tok_s:.2f} "
                         f"frame_load={frame_load_elapsed:.3f}s processor={processor_elapsed:.3f}s "
+                        f"prefetch_wait={total_preprocess_wait_time:.3f}s "
                         f"status={status} ans={row['answer']} pred={prediction or '?'} ok={correct} raw={decoded[:80]!r}",
                         flush=True,
                     )
+            pending = next_pending
     finally:
+        if prefetch_executor is not None:
+            prefetch_executor.shutdown(wait=True)
         if frame_load_executor is not None:
             frame_load_executor.shutdown(wait=True)
 
@@ -1214,6 +1321,7 @@ def run_method(method: str, model, processor, rows: list[dict], args, dtype, dev
         "total_frame_load_seconds": total_frame_load_time,
         "total_prompt_seconds": total_prompt_time,
         "total_processor_seconds": total_processor_time,
+        "total_preprocess_wait_seconds": total_preprocess_wait_time,
         "end_to_end_seconds": wall_time,
         "new_tokens_per_s": total_new_tokens / total_time if total_time > 0 else 0.0,
         "examples_per_s": len(records) / total_time if total_time > 0 else 0.0,

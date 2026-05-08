@@ -216,6 +216,12 @@ The script writes:
 - `frame_cache/`: extracted frames keyed by video path, time window, and frame
   count.
 
+`--frame_load_workers N` loads cached frame images for each batch with a thread
+pool. `--preprocess_prefetch_batches 1` additionally prepares the next batch on
+one background thread while the current batch is generating. The prefetch path
+keeps processor calls ordered and still fails fast if frame loading or processor
+conversion fails.
+
 When exactly two methods are run and one is `vanilla`, the candidate
 `<method>_aggregate_metrics.json` includes accuracy, speed, and memory deltas
 against the vanilla run.
@@ -353,6 +359,18 @@ Two rows for `sample_332` used an explicitly recorded frame-cache fallback
 because the local video file is corrupt after roughly 250 seconds; this can
 affect at most `0.05` percentage points.
 
+Small 0.5B prefetch correctness/speed smoke on the first 64 official-60s rows,
+GPU 7, batch size 8, `frame_load_workers=4`, and the same cached frames:
+
+| Mode | Samples | Status | Accuracy | E2E seconds | E2E examples/s | Output diff |
+| --- | ---: | --- | ---: | ---: | ---: | --- |
+| `preprocess_prefetch_batches=0` | 64 | `success: 64` | `68.75%` | `38.477` | `1.663` | reference |
+| `preprocess_prefetch_batches=1` | 64 | `success: 64` | `68.75%` | `31.817` | `2.011` | 0 mismatches |
+
+The per-sample comparison checks question id, prediction, answer, correctness,
+status, raw prediction, input-token count, padded length, and video-token count.
+The prefetch run gives `1.21x` higher end-to-end examples/s on this small smoke.
+
 ### 7B, Full 4000-Row DeltaKV KR/CR Sweep
 
 This sweep uses the same full 4000-row `official_60s` StreamingBench scope as
@@ -465,30 +483,32 @@ Task-level comparison for the recommended DeltaKV run:
 | omni | `40.70%` | `40.70%` | `+0.00` |
 | contextual | `32.20%` | `32.20%` | `+0.00` |
 
-Full subtask comparison from the saved aggregate metrics:
+Complete subtask matrix read from the saved `*_aggregate_metrics.json` files:
 
-| Subtask | Total | Vanilla correct | Vanilla acc | DeltaKV correct | DeltaKV acc | Delta |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| OP | 369 | 304 | `82.38%` | 304 | `82.38%` | `+0.00` |
-| CR | 128 | 100 | `78.12%` | 100 | `78.12%` | `+0.00` |
-| CS | 317 | 262 | `82.65%` | 262 | `82.65%` | `+0.00` |
-| ATP | 312 | 263 | `84.29%` | 262 | `83.97%` | `-0.32` |
-| EU | 159 | 112 | `70.44%` | 112 | `70.44%` | `+0.00` |
-| TR | 321 | 244 | `76.01%` | 245 | `76.32%` | `+0.31` |
-| PR | 108 | 78 | `72.22%` | 78 | `72.22%` | `+0.00` |
-| SU | 246 | 157 | `63.82%` | 157 | `63.82%` | `+0.00` |
-| ACP | 352 | 241 | `68.47%` | 240 | `68.18%` | `-0.28` |
-| CT | 188 | 77 | `40.96%` | 77 | `40.96%` | `+0.00` |
-| ER | 250 | 102 | `40.80%` | 102 | `40.80%` | `+0.00` |
-| SCU | 250 | 64 | `25.60%` | 64 | `25.60%` | `+0.00` |
-| SD | 250 | 103 | `41.20%` | 103 | `41.20%` | `+0.00` |
-| MA | 250 | 138 | `55.20%` | 138 | `55.20%` | `+0.00` |
-| ACU | 250 | 82 | `32.80%` | 82 | `32.80%` | `+0.00` |
-| MCU | 250 | 79 | `31.60%` | 79 | `31.60%` | `+0.00` |
+| Subtask | Rows | Paper LLaVA-OV-7B | Vanilla official_60s | DeltaKV kr30 cr1024 | DeltaKV kr30 cr2048 | DeltaKV kr33 center005 | DeltaKV kr33 full01 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| OP | 369 | `80.38%` | 304/369 `82.38%` | 304/369 `82.38%` | 304/369 `82.38%` | 304/369 `82.38%` | 304/369 `82.38%` |
+| CR | 128 | `74.22%` | 100/128 `78.12%` | 100/128 `78.12%` | 100/128 `78.12%` | 100/128 `78.12%` | 100/128 `78.12%` |
+| CS | 317 | `76.03%` | 262/317 `82.65%` | 262/317 `82.65%` | 262/317 `82.65%` | 262/317 `82.65%` | 262/317 `82.65%` |
+| ATP | 312 | `80.72%` | 263/312 `84.29%` | 262/312 `83.97%` | 262/312 `83.97%` | 262/312 `83.97%` | 262/312 `83.97%` |
+| EU | 159 | `72.67%` | 112/159 `70.44%` | 112/159 `70.44%` | 112/159 `70.44%` | 112/159 `70.44%` | 112/159 `70.44%` |
+| TR | 321 | `71.65%` | 244/321 `76.01%` | 245/321 `76.32%` | 245/321 `76.32%` | 245/321 `76.32%` | 245/321 `76.32%` |
+| PR | 108 | `67.59%` | 78/108 `72.22%` | 78/108 `72.22%` | 78/108 `72.22%` | 78/108 `72.22%` | 78/108 `72.22%` |
+| SU | 246 | `65.45%` | 157/246 `63.82%` | 157/246 `63.82%` | 157/246 `63.82%` | 157/246 `63.82%` | 157/246 `63.82%` |
+| ACP | 352 | `65.72%` | 241/352 `68.47%` | 240/352 `68.18%` | 240/352 `68.18%` | 240/352 `68.18%` | 240/352 `68.18%` |
+| CT | 188 | `45.08%` | 77/188 `40.96%` | 77/188 `40.96%` | 77/188 `40.96%` | 77/188 `40.96%` | 77/188 `40.96%` |
+| ER | 250 | `40.80%` | 102/250 `40.80%` | 102/250 `40.80%` | 102/250 `40.80%` | 102/250 `40.80%` | 102/250 `40.80%` |
+| SCU | 250 | `37.20%` | 64/250 `25.60%` | 64/250 `25.60%` | 64/250 `25.60%` | 64/250 `25.60%` | 64/250 `25.60%` |
+| SD | 250 | `33.60%` | 103/250 `41.20%` | 103/250 `41.20%` | 103/250 `41.20%` | 103/250 `41.20%` | 103/250 `41.20%` |
+| MA | 250 | `44.80%` | 138/250 `55.20%` | 138/250 `55.20%` | 138/250 `55.20%` | 138/250 `55.20%` | 138/250 `55.20%` |
+| ACU | 250 | n/a | 82/250 `32.80%` | 82/250 `32.80%` | 82/250 `32.80%` | 82/250 `32.80%` | 82/250 `32.80%` |
+| MCU | 250 | n/a | 79/250 `31.60%` | 79/250 `31.60%` | 79/250 `31.60%` | 79/250 `31.60%` | 79/250 `31.60%` |
+| Overall | 4000 | `58.85%` | 2406/4000 `60.15%` | 2405/4000 `60.12%` | 2405/4000 `60.12%` | 2405/4000 `60.12%` | 2405/4000 `60.12%` |
 
-The DeltaKV columns above use the recommended `kr30_cr1024_full` run. The other
-three full DeltaKV configurations in the KR/CR sweep produced the same correct
-counts for every subtask.
+`ACU` and `MCU` are included in the 4000-row overall denominator but are not
+printed as visible subtasks in LiveVLM Table 4. The four full DeltaKV
+configurations in the KR/CR sweep produced the same correct counts for every
+subtask.
 
 ### 7B, Official 60s/32-Frame Real-Time Visual Understanding, sample 201-250 shard
 
