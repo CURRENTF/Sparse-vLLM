@@ -983,6 +983,203 @@ def deltakv_reconstruct_writeback_grouped_heads_srcdst(
 
 
 @triton.jit
+def _deltakv_delta_quant_reconstruct_writeback_int4_kernel(
+    packed_delta_ptr,  # (num_latent_slots, 2*D/8), int32
+    scale_ptr,  # (num_latent_slots, 1)
+    min_ptr,  # (num_latent_slots, 1)
+    latent_slots_ptr,  # (N,)
+    father_slots_ptr,  # (N, K)
+    slot_to_pos_ptr,  # (num_slots,)
+    out_slots_ptr,  # (N,)
+    out_pos_ptr,  # (N,)
+    cos_sin_ptr,  # (max_pos, head_dim)
+    k_cache_ptr,  # (num_slots, num_kv_heads, head_dim)
+    v_cache_ptr,  # (num_slots, num_kv_heads, head_dim)
+    stride_packed_n, stride_packed_d,
+    stride_scale_n, stride_scale_g,
+    stride_min_n, stride_min_g,
+    stride_father_n, stride_father_k,
+    stride_cos_p, stride_cos_d,
+    stride_k_s, stride_k_h, stride_k_d,
+    stride_v_s, stride_v_h, stride_v_d,
+    D: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    HD2: tl.constexpr,
+    NUM_KV_HEADS: tl.constexpr,
+    K: tl.constexpr,
+    HEADS_PER_PROG: tl.constexpr,
+):
+    pid_n = tl.program_id(0)
+    pid_hb = tl.program_id(1)
+
+    latent_slot = tl.load(latent_slots_ptr + pid_n).to(tl.int32)
+    out_slot = tl.load(out_slots_ptr + pid_n).to(tl.int32)
+    out_pos = tl.load(out_pos_ptr + pid_n).to(tl.int32)
+
+    head_ids = pid_hb * HEADS_PER_PROG + tl.arange(0, HEADS_PER_PROG)
+    head_mask = head_ids < NUM_KV_HEADS
+    offs = tl.arange(0, HD2)
+
+    cos_out = tl.load(cos_sin_ptr + out_pos * stride_cos_p + offs * stride_cos_d).to(tl.float32)
+    sin_out = tl.load(cos_sin_ptr + out_pos * stride_cos_p + (offs + HD2) * stride_cos_d).to(tl.float32)
+
+    acc_k1 = tl.zeros([HEADS_PER_PROG, HD2], dtype=tl.float32)
+    acc_k2 = tl.zeros([HEADS_PER_PROG, HD2], dtype=tl.float32)
+    acc_v1 = tl.zeros([HEADS_PER_PROG, HD2], dtype=tl.float32)
+    acc_v2 = tl.zeros([HEADS_PER_PROG, HD2], dtype=tl.float32)
+
+    for kk in tl.static_range(K):
+        father_slot = tl.load(father_slots_ptr + pid_n * stride_father_n + kk * stride_father_k).to(tl.int32)
+        father_pos = tl.load(slot_to_pos_ptr + father_slot).to(tl.int32)
+
+        cos_f = tl.load(cos_sin_ptr + father_pos * stride_cos_p + offs * stride_cos_d).to(tl.float32)
+        sin_f = tl.load(cos_sin_ptr + father_pos * stride_cos_p + (offs + HD2) * stride_cos_d).to(tl.float32)
+
+        k_base = father_slot * stride_k_s + head_ids[:, None] * stride_k_h + offs[None, :] * stride_k_d
+        y1 = tl.load(k_cache_ptr + k_base, mask=head_mask[:, None], other=0.0).to(tl.float32)
+        y2 = tl.load(k_cache_ptr + k_base + (HD2 * stride_k_d), mask=head_mask[:, None], other=0.0).to(tl.float32)
+        x1 = y1 * cos_f[None, :] + y2 * sin_f[None, :]
+        x2 = y2 * cos_f[None, :] - y1 * sin_f[None, :]
+        acc_k1 += x1
+        acc_k2 += x2
+
+        v_base = father_slot * stride_v_s + head_ids[:, None] * stride_v_h + offs[None, :] * stride_v_d
+        fv1 = tl.load(v_cache_ptr + v_base, mask=head_mask[:, None], other=0.0).to(tl.float32)
+        fv2 = tl.load(v_cache_ptr + v_base + (HD2 * stride_v_d), mask=head_mask[:, None], other=0.0).to(tl.float32)
+        acc_v1 += fv1
+        acc_v2 += fv2
+
+    inv_k = 1.0 / K
+    mean_k1 = acc_k1 * inv_k
+    mean_k2 = acc_k2 * inv_k
+    mean_v1 = acc_v1 * inv_k
+    mean_v2 = acc_v2 * inv_k
+
+    scale = tl.load(scale_ptr + latent_slot * stride_scale_n).to(tl.float32)
+    mn = tl.load(min_ptr + latent_slot * stride_min_n).to(tl.float32)
+
+    feat_k1 = head_ids[:, None] * HEAD_DIM + offs[None, :]
+    feat_k2 = feat_k1 + HD2
+    feat_v1 = D + feat_k1
+    feat_v2 = feat_v1 + HD2
+
+    packed_k1 = tl.load(
+        packed_delta_ptr + latent_slot * stride_packed_n + (feat_k1 // 8) * stride_packed_d,
+        mask=head_mask[:, None],
+        other=0,
+    )
+    packed_k2 = tl.load(
+        packed_delta_ptr + latent_slot * stride_packed_n + (feat_k2 // 8) * stride_packed_d,
+        mask=head_mask[:, None],
+        other=0,
+    )
+    packed_v1 = tl.load(
+        packed_delta_ptr + latent_slot * stride_packed_n + (feat_v1 // 8) * stride_packed_d,
+        mask=head_mask[:, None],
+        other=0,
+    )
+    packed_v2 = tl.load(
+        packed_delta_ptr + latent_slot * stride_packed_n + (feat_v2 // 8) * stride_packed_d,
+        mask=head_mask[:, None],
+        other=0,
+    )
+
+    q_k1 = ((packed_k1 >> ((feat_k1 % 8) * 4)) & 15).to(tl.float32)
+    q_k2 = ((packed_k2 >> ((feat_k2 % 8) * 4)) & 15).to(tl.float32)
+    q_v1 = ((packed_v1 >> ((feat_v1 % 8) * 4)) & 15).to(tl.float32)
+    q_v2 = ((packed_v2 >> ((feat_v2 % 8) * 4)) & 15).to(tl.float32)
+
+    delta_k1 = q_k1 * scale + mn
+    delta_k2 = q_k2 * scale + mn
+    delta_v1 = q_v1 * scale + mn
+    delta_v2 = q_v2 * scale + mn
+
+    k1 = delta_k1 + mean_k1
+    k2 = delta_k2 + mean_k2
+    v1 = delta_v1 + mean_v1
+    v2 = delta_v2 + mean_v2
+
+    out_y1 = k1 * cos_out[None, :] - k2 * sin_out[None, :]
+    out_y2 = k2 * cos_out[None, :] + k1 * sin_out[None, :]
+
+    out_k_base = out_slot * stride_k_s + head_ids[:, None] * stride_k_h + offs[None, :] * stride_k_d
+    tl.store(k_cache_ptr + out_k_base, out_y1, mask=head_mask[:, None])
+    tl.store(k_cache_ptr + out_k_base + (HD2 * stride_k_d), out_y2, mask=head_mask[:, None])
+
+    out_v_base = out_slot * stride_v_s + head_ids[:, None] * stride_v_h + offs[None, :] * stride_v_d
+    tl.store(v_cache_ptr + out_v_base, v1, mask=head_mask[:, None])
+    tl.store(v_cache_ptr + out_v_base + (HD2 * stride_v_d), v2, mask=head_mask[:, None])
+
+
+@torch.no_grad()
+def deltakv_delta_quant_reconstruct_writeback_int4(
+    packed_delta_cache: torch.Tensor,  # (num_latent_slots, 2*D/8), int32
+    scale_cache: torch.Tensor,  # (num_latent_slots, 1)
+    min_cache: torch.Tensor,  # (num_latent_slots, 1)
+    latent_slots: torch.Tensor,  # (N,) int32
+    father_slots: torch.Tensor,  # (N, K) int32
+    slot_to_pos: torch.Tensor,  # (num_slots,) int32
+    out_slots: torch.Tensor,  # (N,) int32
+    out_pos: torch.Tensor,  # (N,) int32
+    cos_sin: torch.Tensor,  # (max_pos, head_dim)
+    k_cache: torch.Tensor,  # (num_slots, num_kv_heads, head_dim)
+    v_cache: torch.Tensor,  # (num_slots, num_kv_heads, head_dim)
+    *,
+    heads_per_program: int = 4,
+):
+    assert packed_delta_cache.is_cuda and scale_cache.is_cuda and min_cache.is_cuda
+    assert latent_slots.is_cuda and father_slots.is_cuda and slot_to_pos.is_cuda and out_slots.is_cuda and out_pos.is_cuda
+    assert k_cache.is_cuda and v_cache.is_cuda and cos_sin.is_cuda
+    assert packed_delta_cache.dim() == 2
+    assert scale_cache.dim() == 2 and min_cache.dim() == 2
+    assert scale_cache.shape[1] == 1 and min_cache.shape[1] == 1
+    assert latent_slots.dim() == 1
+    assert father_slots.dim() == 2
+
+    N = latent_slots.shape[0]
+    K = father_slots.shape[1]
+    num_kv_heads = k_cache.shape[1]
+    head_dim = k_cache.shape[2]
+    assert head_dim % 2 == 0
+    D = num_kv_heads * head_dim
+    assert packed_delta_cache.shape[1] == (2 * D) // 8
+
+    heads_per_program = int(heads_per_program)
+    if heads_per_program <= 0:
+        raise ValueError("heads_per_program must be a positive integer.")
+    heads_per_program = max(1, min(heads_per_program, int(num_kv_heads)))
+
+    grid = (N, triton.cdiv(num_kv_heads, heads_per_program))
+    _deltakv_delta_quant_reconstruct_writeback_int4_kernel[grid](
+        packed_delta_cache,
+        scale_cache,
+        min_cache,
+        latent_slots,
+        father_slots,
+        slot_to_pos,
+        out_slots,
+        out_pos,
+        cos_sin,
+        k_cache,
+        v_cache,
+        packed_delta_cache.stride(0), packed_delta_cache.stride(1),
+        scale_cache.stride(0), scale_cache.stride(1),
+        min_cache.stride(0), min_cache.stride(1),
+        father_slots.stride(0), father_slots.stride(1),
+        cos_sin.stride(0), cos_sin.stride(1),
+        k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
+        v_cache.stride(0), v_cache.stride(1), v_cache.stride(2),
+        D=D,
+        HEAD_DIM=head_dim,
+        HD2=head_dim // 2,
+        NUM_KV_HEADS=num_kv_heads,
+        K=K,
+        HEADS_PER_PROG=heads_per_program,
+        num_warps=4,
+    )
+
+
+@triton.jit
 def _deltakv_l2_topk_block_kernel(
     A_ptr,  # (N, D) tokens
     B_ptr,  # (M, D) centers

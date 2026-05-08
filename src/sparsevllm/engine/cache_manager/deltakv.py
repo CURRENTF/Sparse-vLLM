@@ -76,13 +76,8 @@ class DeltaKVCacheManager(CacheManager):
         self.full_layer_batch_states = LayerBatchStates()
         self.deltakv_layer_batch_states = LayerBatchStates()
 
-        from sparsevllm.utils.compressor import create_compressor
-        self.compress_down = []
-        self.compress_up = []
         num_deltakv_layers = len(self.deltakv_layer_ids)
-        for _ in range(num_deltakv_layers):
-            self.compress_down.append(create_compressor(is_down=True, config=config).cuda())
-            self.compress_up.append(create_compressor(is_down=False, config=config).cuda())
+        self._init_compressor_modules(config, num_deltakv_layers)
 
         # 初始化 RoPE 模块，用于 De-RoPE/Re-RoPE 操作
         self.rotary_emb = get_rope(
@@ -98,6 +93,15 @@ class DeltaKVCacheManager(CacheManager):
         # Per-step/per-segment cache for DeltaKV view planning (shared across layers).
         self._deltakv_view_cache_key: tuple[int, int, int, int, int] | None = None
         self._deltakv_view_cache_value = None
+
+    def _init_compressor_modules(self, config: Config, num_deltakv_layers: int):
+        from sparsevllm.utils.compressor import create_compressor
+
+        self.compress_down = []
+        self.compress_up = []
+        for _ in range(num_deltakv_layers):
+            self.compress_down.append(create_compressor(is_down=True, config=config).cuda())
+            self.compress_up.append(create_compressor(is_down=False, config=config).cuda())
 
     def _deltakv_reset_view_cache(self):
         self._deltakv_view_cache_key = None

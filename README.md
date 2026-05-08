@@ -224,6 +224,8 @@ python benchmark/long_bench/pred.py \
 For a full LongBench run, omit `--task`. To switch to DeltaKV, keep
 `--backend sparsevllm` and set `sparse_method="deltakv"` (or
 `"deltakv-triton-v4"`) plus `deltakv_checkpoint_path=...`.
+For the no-checkpoint direct residual ablation, set
+`sparse_method="deltakv-delta-quant"` and omit `deltakv_checkpoint_path`.
 
 #### LongBench with HF wrappers
 
@@ -268,17 +270,49 @@ Set `sparse_method` to one of:
 - `"deltakv"`
 - `"deltakv-triton"`, `"deltakv-triton-v2"`, `"deltakv-triton-v3"`, `"deltakv-triton-v4"`
 - `"deltakv-triton-v3-offload"` / `"deltakv-triton-v3-cuda-offload"`
+- `"deltakv-delta-quant"` for the no-checkpoint direct residual quantization ablation
 
-For DeltaKV inference, also pass
+For compressor-backed DeltaKV inference, also pass
 `deltakv_checkpoint_path="/path/to/trained_compressor_dir_or_file"`.
+`deltakv-delta-quant` does not load or require a compressor checkpoint.
 
 DeltaKV knobs you may need:
 
 - `deltakv_checkpoint_path`: path to trained compressor weights (directory containing `*.safetensors`/`*.pt`/`*.bin`, or a single file).
 - `deltakv_latent_dim`: latent dimension of compressed KV.
 - `deltakv_center_ratio`, `cluster_metric`: reference selection / clustering behavior.
+- `deltakv_neighbor_count`: number of selected center/reference tokens used for reconstruction.
+- `deltakv_latent_quant_bits`: `4` packs the DeltaKV-style cached state as int4 where supported.
 - `deltakv_offload_latent`: offload latent cache to CPU (enabled automatically by `*-offload` methods).
 - `deltakv_offload_cpu_threads`: CPU gather thread count for offload mode.
+
+`deltakv-delta-quant` is a Sparse-vLLM-only ablation that reuses DeltaKV center
+selection and sparse decode views, but stores the token-space residual directly:
+
+```text
+residual = KV_before_rope - mean(selected_center_KV_before_rope)
+```
+
+With `deltakv_latent_quant_bits=4`, that residual is packed as int4 plus
+per-token scale/min metadata. With `deltakv_latent_quant_bits=0`, the residual
+is stored in the model dtype. This path deliberately does not use learned
+`compress_down` or `compress_up` modules. The int4 reconstruction path uses a
+fused Triton kernel that dequantizes the residual, adds the selected-center
+mean, applies RoPE to K, and writes K/V back into the cache in one pass.
+
+Quick throughput smoke:
+
+```bash
+CUDA_VISIBLE_DEVICES=7 PYTHONPATH=$PWD/src \
+python scripts/bench_sparse_vllm.py \
+  --model_path /data2/haojitai/models/Qwen2.5-7B-Instruct-1M \
+  --lengths 1024 \
+  --batch_sizes 2 \
+  --methods deltakv-delta-quant \
+  --output_len 4 \
+  --temperature 0 \
+  --hyper_params '{"gpu_memory_utilization":0.9,"engine_prefill_chunk_size":512,"max_num_seqs_in_batch":2,"max_decoding_seqs":2,"max_num_batched_tokens":2048,"chunk_prefill_accel_omnikv":true,"full_attention_layers":"0,1","sink_keep_tokens":4,"recent_keep_tokens":32,"decode_keep_tokens":64,"prefill_keep_tokens":64,"deltakv_center_ratio":0.1,"deltakv_neighbor_count":1,"deltakv_latent_quant_bits":4,"deltakv_full_pool_reserve_ratio":0.2}'
+```
 
 ### Train a compressor
 

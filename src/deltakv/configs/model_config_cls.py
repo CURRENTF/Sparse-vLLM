@@ -58,6 +58,7 @@ class CustomConfigMixin:
         snapkv_num_full_layers=0,
         use_compression=False,
         use_cluster=True,
+        deltakv_cache_impl="standard",
         chunk_prefill_size=100_000_000,
         snapkv_window_size=4,
         pool_kernel_size=1,
@@ -146,6 +147,7 @@ class CustomConfigMixin:
         self.snapkv_num_full_layers = snapkv_num_full_layers
         self.use_compression = use_compression
         self.use_cluster = use_cluster
+        self.deltakv_cache_impl = deltakv_cache_impl
         self.chunk_prefill_size = chunk_prefill_size
         self.snapkv_window_size = snapkv_window_size
         self.pool_kernel_size = pool_kernel_size

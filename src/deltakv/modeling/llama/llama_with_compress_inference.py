@@ -12,6 +12,7 @@ from transformers.models.llama.modeling_llama import (
 
 from deltakv.modeling.kv_cache import CompressedKVCache, ClusterCompressedKVCache
 from deltakv.configs.model_config_cls import KVLlamaConfig, parse_full_attn_layers
+from deltakv.modeling.cache_factory import create_deltakv_cache, is_deltakv_cache_instance
 from deltakv.modeling.qwen2.qwen2_e2e import create_compressor
 from deltakv.modeling.token_select import omnikv_token_selection
 from dataclasses import dataclass
@@ -316,11 +317,8 @@ class LlamaKVCompress(LlamaForCausalLM):
         assert use_cache, "Inference model must use cache"
 
         # 初始化自定义kv cache
-        if not isinstance(past_key_values, (CompressedKVCache, ClusterCompressedKVCache)):
-            if self.config.use_cluster:
-                past_key_values = ClusterCompressedKVCache(config=self.config)
-            else:
-                past_key_values = CompressedKVCache(config=self.config)
+        if not is_deltakv_cache_instance(past_key_values, self.config):
+            past_key_values = create_deltakv_cache(self.config)
 
         chunk_size = self.config.chunk_prefill_size
         outputs = None
