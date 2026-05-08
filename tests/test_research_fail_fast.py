@@ -463,6 +463,7 @@ class ResearchFailFastTest(unittest.TestCase):
                     Config(model=tmp, vllm_sparse_method="deltakv")
                 with self.assertRaisesRegex(ValueError, "requires deltakv_path"):
                     Config(model=tmp, vllm_sparse_method="deltakv", deltakv_path="none")
+                Config(model=tmp, vllm_sparse_method="deltakv-delta-quant")
 
     def test_sparsevllm_missing_model_dir_has_clear_error(self):
         missing = "/tmp/sparsevllm-definitely-missing-model-dir"

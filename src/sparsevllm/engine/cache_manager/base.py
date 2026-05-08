@@ -86,6 +86,13 @@ class CacheManager(ABC):
             from .deltakv import DeltaKVCacheManager
 
             return DeltaKVCacheManager(config, rank, world_size)
+        if sparse_method in ("deltakv-delta-quant", "deltakv_delta_quant"):
+            # Reuse the standard DeltaKV controller semantics while swapping the
+            # cache manager to a no-checkpoint direct residual quantization path.
+            config.vllm_sparse_method = "deltakv"
+            from .deltakv_delta_quant import DeltaKVDeltaQuantCacheManager
+
+            return DeltaKVDeltaQuantCacheManager(config, rank, world_size)
         if sparse_method == "deltakv-triton":
             # Run DeltaKV logic, but use Triton for reconstruction.
             config.vllm_sparse_method = "deltakv"

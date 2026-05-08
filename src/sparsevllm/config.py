@@ -25,7 +25,7 @@ class Config:
     num_kvcache_slots: int | list = -1
 
     # Sparse Attention Config
-    vllm_sparse_method: str = ""  # "", "streamingllm", "attention-sink", "attention_sink", "snapkv", "omnikv", "quest", "deltakv", "deltakv-triton", "deltakv-triton-v2", "deltakv-triton-v3", "deltakv-triton-v4", "deltakv-triton-v3-offload", "deltakv-triton-v3-cuda-offload", "deltakv-standalone", "deltakv-snapkv", "pyramidkv", "dsa"
+    vllm_sparse_method: str = ""  # "", "streamingllm", "attention-sink", "attention_sink", "snapkv", "omnikv", "quest", "deltakv", "deltakv-triton", "deltakv-triton-v2", "deltakv-triton-v3", "deltakv-triton-v4", "deltakv-triton-v3-offload", "deltakv-triton-v3-cuda-offload", "deltakv-delta-quant", "deltakv_delta_quant", "deltakv-standalone", "deltakv-snapkv", "pyramidkv", "dsa"
 
     # General Sparse Config
     num_sink_tokens: int = 64
@@ -198,14 +198,20 @@ class Config:
         if (
             isinstance(self.vllm_sparse_method, str)
             and self.vllm_sparse_method.startswith("deltakv")
-            and self.vllm_sparse_method not in {"deltakv-standalone", "deltakv-snapkv"}
+            and self.vllm_sparse_method not in {
+                "deltakv-standalone",
+                "deltakv-snapkv",
+                "deltakv-delta-quant",
+                "deltakv_delta_quant",
+            }
             and self.deltakv_path is None
             and not self.allow_missing_deltakv_path
         ):
             raise ValueError(
                 "DeltaKV compressor mode requires deltakv_path. Pass deltakv_path explicitly, "
-                "use a no-checkpoint method such as deltakv-standalone/deltakv-snapkv, or set "
-                "allow_missing_deltakv_path=True only for an explicitly validated ablation."
+                "use a no-checkpoint method such as deltakv-standalone/deltakv-snapkv/"
+                "deltakv-delta-quant, or set allow_missing_deltakv_path=True only for an "
+                "explicitly validated ablation."
             )
 
         if self.vllm_sparse_method in ("deltakv-standalone", "deltakv-snapkv"):
