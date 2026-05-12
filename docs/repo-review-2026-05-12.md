@@ -20,7 +20,7 @@ Reviewed areas:
 | Parameter normalization | `src/deltakv/configs/runtime_params.py`, `src/deltakv/configs/model_config_cls.py`, `src/sparsevllm/config.py` |
 | HF DeltaKV caches | `src/deltakv/modeling/kv_cache.py`, `origin_residual_quant_cache.py`, `all_origin_residual_quant_cache.py`, `cache_factory.py` |
 | Sparse-vLLM engine | `src/sparsevllm/engine/`, `src/sparsevllm/models/`, `src/sparsevllm/layers/`, `src/sparsevllm/triton_kernel/` |
-| Benchmarks | `benchmark/long_bench/`, `benchmark/math_bench/`, `benchmark/scbench/`, `benchmark/niah/`, `scripts/bench_llava_onevision_*` |
+| Benchmarks | `benchmark/long_bench/`, `benchmark/math_bench/`, `benchmark/scbench/`, `benchmark/niah/`, `benchmark/multimodal/` |
 | Tests | `tests/` |
 | Existing docs | `README.md`, `docs/*.md` |
 
@@ -35,7 +35,7 @@ regression tests.
 | `src/deltakv/` | HF/Transformers-side DeltaKV integration, compressor training, custom model wrappers, cache implementations, runtime parameter normalization. | Main HF entrypoint is `get_generate_api`. Cache creation is centralized by `modeling/cache_factory.py`, which is good. `modeling/kv_cache.py` is still large and mixes buffer management, visual pruning, clustering, quantization, and reconstruction. |
 | `src/sparsevllm/` | Sparse-first inference engine with its own scheduler, model runner, cache managers, sparse controllers, kernels, and model definitions. | Public `LLM(...)` kwargs are normalized in `LLMEngine.__init__`; unknown config keys fail fast by default. Cache-manager routing is explicit in `engine/cache_manager/base.py`. |
 | `benchmark/` | LongBench, MathBench, SCBench, NIAH evaluation entrypoints. | LongBench/MathBench have been moved to canonical `sparse_method` and `deltakv_checkpoint_path` names. SCBench still includes several upstream-style silent fallback blocks that should be audited before publication-critical use. |
-| `scripts/bench_llava_onevision_*` | LLaVA-OneVision visual/video benchmarks and dataset utilities. | StreamingBench/VideoMME/QA-Ego4D scripts preserve raw outputs, parsed outputs, per-sample files, metrics, and run info. They are more reliable than the older generic benchmark scripts. |
+| `benchmark/multimodal/` | Multimodal image/video benchmark entrypoints plus shared helpers and model adapters. | StreamingBench/VideoMME/QA-Ego4D scripts preserve raw outputs, parsed outputs, per-sample files, metrics, and run info. Dataset/task logic is separated from model-specific adapters so Qwen3-VL can be added without duplicating Video-MME or StreamingBench logic. |
 | `tests/` | Lightweight regression tests for runtime normalization, checkpoint sync, visual pruning, quant helpers, fail-fast behavior, and kernel helpers. | Coverage is useful for parameter boundary behavior. It does not exercise real model loading or long benchmark correctness. |
 | `docs/` | Runtime parameter docs and benchmark-specific runbooks. | The parameter doc is the main source of truth. This review corrected one drift: Sparse-vLLM unknown keys now raise by default. |
 | `baselines/` | Imported baseline method code. | Treat as third-party or research-adapter code unless a task explicitly targets it. |
@@ -166,12 +166,12 @@ Rules that matter for experiment reliability:
 | `benchmark/scbench/run_scbench_preprocessed.py` | SCBench preprocessed path | SCBench-specific | Needs separate validation if used as the main reporting path. |
 | `benchmark/niah/test_niah.py` | Needle-in-a-haystack probe | `hf`, `sparsevllm` | Uses canonical args and backend-specific prefill chunk names. |
 | `scripts/bench_sparse_vllm.py` | Sparse-VLLM throughput/latency driver | Sparse-VLLM | Normalizes params and rejects legacy runtime names. |
-| `scripts/bench_llava_onevision_streamingbench.py` | LLaVA-OneVision StreamingBench | LLaVA/HF model path | Stronger artifact discipline: raw, parsed, per-sample, metrics, run info. Missing videos fail fast unless opt-in. |
-| `scripts/bench_llava_onevision_videomme.py` | LLaVA-OneVision VideoMME | Wraps StreamingBench runner | Adds VideoMME prompt/eval layer and preserves dry-run metadata. |
-| `scripts/bench_llava_onevision_rekv_qaego4d.py` | LLaVA-OneVision QA-Ego4D/ReKV-style eval | LLaVA/HF model path | Supports `vanilla` and `deltakv_delta_quant` style visual-cache comparisons. |
-| `scripts/bench_llava_onevision_visual_prune.py` | Visual token/cache pruning experiments | LLaVA/HF model path | Contains explicit checkpoint checks and ablation modes. |
-| `scripts/prepare_streamingbench_frame_cache.py` | Frame cache generation | Utility | Good separation from evaluation. Backend choices and fallback flags are explicit. |
-| `scripts/audit_livevlm_table4_result.py` | Audit StreamingBench/LiveVLM artifacts | Utility | Useful guardrail after long video runs. |
+| `benchmark/multimodal/video_qa/streamingbench.py` | LLaVA-OneVision StreamingBench | LLaVA/HF model path | Stronger artifact discipline: raw, parsed, per-sample, metrics, run info. Missing videos fail fast unless opt-in. |
+| `benchmark/multimodal/video_qa/videomme.py` | LLaVA-OneVision VideoMME | Wraps StreamingBench runner | Adds VideoMME prompt/eval layer and preserves dry-run metadata. |
+| `benchmark/multimodal/video_qa/qaego4d.py` | LLaVA-OneVision QA-Ego4D/ReKV-style eval | LLaVA/HF model path | Supports `vanilla` and `deltakv_delta_quant` style visual-cache comparisons. |
+| `benchmark/multimodal/visual_cache/run_visual_cache.py` | Visual token/cache pruning experiments | LLaVA/HF model path | Contains explicit checkpoint checks and ablation modes. |
+| `benchmark/multimodal/video_qa/frame_cache.py` | Frame cache generation | Utility | Good separation from evaluation. Backend choices and fallback flags are explicit. |
+| `benchmark/multimodal/video_qa/audit_livevlm_table4.py` | Audit StreamingBench/LiveVLM artifacts | Utility | Useful guardrail after long video runs. |
 
 ## Findings
 

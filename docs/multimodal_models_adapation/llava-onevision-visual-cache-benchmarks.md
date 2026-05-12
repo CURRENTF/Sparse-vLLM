@@ -108,20 +108,20 @@ results from this path separately from both `visual_uniform_keep` and
 Use the explicit benchmark entrypoint for new runs:
 
 ```bash
-python scripts/bench_llava_onevision_visual_prune.py
+python benchmark/multimodal/visual_cache/run_visual_cache.py
 ```
 
 The older entrypoint remains as a legacy script-name wrapper:
 
 ```bash
-python scripts/bench_llava_onevision_deltakv.py
+python benchmark/multimodal/visual_cache/run_visual_cache.py
 ```
 
 It delegates to the visual-pruning script and prints a deprecation warning.
 
 ## Reproducibility Artifacts
 
-`scripts/bench_llava_onevision_visual_prune.py` now writes experiment artifacts
+`benchmark/multimodal/visual_cache/run_visual_cache.py` now writes experiment artifacts
 under `--output_dir`. If `--output_dir` is omitted, it writes to `--dataset_dir`
 for compatibility with older local commands.
 

@@ -6,7 +6,7 @@ delta-quant paths on Video-MME multiple-choice video QA.
 Primary script:
 
 ```bash
-scripts/bench_llava_onevision_videomme.py
+benchmark/multimodal/video_qa/videomme.py
 ```
 
 Dataset source:
@@ -51,7 +51,7 @@ Validate annotation parsing without requiring videos:
 
 ```bash
 PYTHONPATH=$PWD/src \
-python scripts/bench_llava_onevision_videomme.py \
+python benchmark/multimodal/video_qa/videomme.py \
   --dataset_dir /data2/haojitai/datasets/Video-MME_hf \
   --output_dir /data2/haojitai/datasets/llava_onevision_videomme_dry_run \
   --dry_run_metadata \
@@ -67,7 +67,7 @@ After at least one video shard has been downloaded and unzipped:
 
 ```bash
 CUDA_VISIBLE_DEVICES=7 PYTHONPATH=$PWD/src \
-python scripts/bench_llava_onevision_videomme.py \
+python benchmark/multimodal/video_qa/videomme.py \
   --model_path /data2/haojitai/models/llava-onevision-qwen2-0.5b-ov-hf \
   --dataset_dir /data2/haojitai/datasets/Video-MME_hf \
   --output_dir /data2/haojitai/datasets/llava_onevision_videomme_smoke \

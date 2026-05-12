@@ -40,7 +40,7 @@ The full 7B run used physical GPU 7 only:
 ```bash
 CUDA_VISIBLE_DEVICES=7 PYTHONPATH=$PWD/src \
 /home/haojitai/miniconda3/envs/svllm/bin/python -u \
-scripts/bench_llava_onevision_rekv_qaego4d.py \
+benchmark/multimodal/video_qa/qaego4d.py \
   --model_path /data2/haojitai/models/llava-onevision-qwen2-7b-ov-hf \
   --dataset_dir /data2/haojitai/datasets/rekv_qaego4d \
   --output_dir /data2/haojitai/datasets/llava_onevision_rekv_qaego4d_7b_full \
@@ -134,7 +134,7 @@ Full QAEGO4D-test-mc sanity check on LLaVA-OV-0.5B:
 ```bash
 CUDA_VISIBLE_DEVICES=7 PYTHONPATH=$PWD/src \
 /home/haojitai/miniconda3/envs/svllm/bin/python -u \
-scripts/bench_llava_onevision_rekv_qaego4d.py \
+benchmark/multimodal/video_qa/qaego4d.py \
   --model_path /data2/haojitai/models/llava-onevision-qwen2-0.5b-ov-hf \
   --dataset_dir /data2/haojitai/datasets/rekv_qaego4d \
   --output_dir /data2/haojitai/datasets/llava_onevision_rekv_qaego4d_05b_kr30_full \

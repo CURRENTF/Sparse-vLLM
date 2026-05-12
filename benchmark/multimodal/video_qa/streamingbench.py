@@ -21,9 +21,9 @@ import torch
 from PIL import Image
 from transformers import LlavaOnevisionProcessor
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-if str(SCRIPT_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPT_DIR))
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 TASK_CSV_FILES = {
     "real": "Real_Time_Visual_Understanding.csv",
@@ -1131,7 +1131,7 @@ def save_method_artifacts(output_dir: Path, result: dict, run_info: dict):
 
 @torch.inference_mode()
 def run_method(method: str, model, processor, rows: list[dict], args, dtype, device, policy=None):
-    from bench_llava_onevision_visual_prune import batch_to_device, ensure_left_padding
+    from benchmark.multimodal.model_adapters.llava_onevision import batch_to_device, ensure_left_padding
 
     torch.cuda.reset_peak_memory_stats(device)
     records = []
@@ -1400,13 +1400,13 @@ def main():
     results = []
     for requested_method, method_kind in iter_methods(args.methods):
         if method_kind == "vanilla":
-            from bench_llava_onevision_visual_prune import load_vanilla_model
+            from benchmark.multimodal.model_adapters.llava_onevision import load_vanilla_model
 
             model = load_vanilla_model(args, dtype, device)
             method_label = "vanilla"
             policy = None
         else:
-            from bench_llava_onevision_visual_prune import load_llava_delta_quant_model
+            from benchmark.multimodal.model_adapters.llava_onevision import load_llava_delta_quant_model
 
             model, policy = load_llava_delta_quant_model(args, dtype, device)
             method_label = policy["method"]

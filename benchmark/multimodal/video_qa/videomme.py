@@ -14,11 +14,11 @@ import pandas as pd
 import torch
 from transformers import LlavaOnevisionProcessor
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-if str(SCRIPT_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPT_DIR))
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
-import bench_llava_onevision_streamingbench as streaming  # noqa: E402
+from benchmark.multimodal.video_qa import streamingbench as streaming
 
 
 VIDEOMME_PROMPT_TEMPLATE = """Select the best answer to the following multiple-choice question based on the video. Respond with only the letter (A, B, C, or D) of the correct option.
@@ -437,13 +437,13 @@ def main():
     results = []
     for requested_method, method_kind in streaming.iter_methods(args.methods):
         if method_kind == "vanilla":
-            from bench_llava_onevision_visual_prune import load_vanilla_model
+            from benchmark.multimodal.model_adapters.llava_onevision import load_vanilla_model
 
             model = load_vanilla_model(args, dtype, device)
             method_label = "vanilla"
             policy = None
         else:
-            from bench_llava_onevision_visual_prune import load_llava_delta_quant_model
+            from benchmark.multimodal.model_adapters.llava_onevision import load_llava_delta_quant_model
 
             model, policy = load_llava_delta_quant_model(args, dtype, device)
             method_label = policy["method"]

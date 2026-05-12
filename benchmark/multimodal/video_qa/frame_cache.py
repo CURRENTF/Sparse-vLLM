@@ -10,12 +10,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-PROJECT_DIR = SCRIPT_DIR.parent
-if str(PROJECT_DIR) not in sys.path:
-    sys.path.insert(0, str(PROJECT_DIR))
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts import bench_llava_onevision_streamingbench as streamingbench  # noqa: E402
+from benchmark.multimodal.video_qa import streamingbench
 
 
 def parse_args():

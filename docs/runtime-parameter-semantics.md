@@ -80,7 +80,7 @@ There are four main runtime entry paths.
 | `scripts/bench_sparse_vllm.py` | `--hyper_params` JSON | `normalize_runtime_params(..., backend="sparsevllm")` | `sparsevllm.Config`, `Scheduler`, `CacheManager`, `SparseController` |
 | `benchmark/long_bench/pred.py` and `benchmark/math_bench/pred.py` | `--hyper_param` JSON or file | `get_generate_api(...)` normalizes after merge | HF wrappers or Sparse-vLLM engine |
 | `benchmark/scbench/run_scbench.py` DeltaKV branch | `--hyper_param` JSON dict | `get_generate_api(...)` normalizes | HF wrappers |
-| `scripts/bench_llava_onevision_visual_prune.py` | dedicated CLI args | no global normalizer; builds `config.deltakv_infer_config` | LLaVA wrapper and `KVQwen2Config` |
+| `benchmark/multimodal/visual_cache/run_visual_cache.py` | dedicated CLI args | no global normalizer; builds `config.deltakv_infer_config` | LLaVA wrapper and `KVQwen2Config` |
 
 Core files:
 
@@ -666,7 +666,7 @@ Do not confuse base-model quantization with KV-cache quantization:
 
 Main files:
 
-- `scripts/bench_llava_onevision_visual_prune.py`
+- `benchmark/multimodal/visual_cache/run_visual_cache.py`
 - `src/deltakv/modeling/llava_onevision_deltakv.py`
 - `docs/llava-onevision-visual-cache-benchmarks.md`
 

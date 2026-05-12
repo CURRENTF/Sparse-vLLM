@@ -14,11 +14,11 @@ import torch
 from PIL import Image
 from transformers import LlavaOnevisionProcessor
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-if str(SCRIPT_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPT_DIR))
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
-from bench_llava_onevision_visual_prune import (  # noqa: E402
+from benchmark.multimodal.model_adapters.llava_onevision import (
     batch_to_device,
     ensure_left_padding,
     load_llava_delta_quant_model,

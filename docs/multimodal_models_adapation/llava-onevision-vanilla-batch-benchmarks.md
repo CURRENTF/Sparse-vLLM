@@ -7,11 +7,11 @@ paper-alignment run.
 
 Implemented scripts:
 
-- `scripts/bench_llava_onevision_visual_prune.py`: the existing VQAv2 visual-cache
+- `benchmark/multimodal/visual_cache/run_visual_cache.py`: the existing VQAv2 visual-cache
   benchmark now accepts `--batch_size` for the `vanilla` method. Non-vanilla
   visual-cache methods still run with effective batch size 1 because the current
   visual-token-prune wrapper is not batch-enabled.
-- `scripts/bench_llava_onevision_ai2d_vanilla.py`: a dedicated vanilla HF
+- `benchmark/multimodal/image_qa/ai2d.py`: a dedicated vanilla HF
   LLaVA-OneVision AI2D benchmark with batch generation.
 
 Batch behavior:
@@ -69,7 +69,7 @@ Command:
 
 ```bash
 PYTHONPATH=$PWD/src /home/haojitai/miniconda3/envs/svllm/bin/python -u \
-  scripts/bench_llava_onevision_ai2d_vanilla.py \
+  benchmark/multimodal/image_qa/ai2d.py \
   --model_path /data2/haojitai/models/llava-onevision-qwen2-0.5b-ov-hf \
   --dataset_dir /data2/haojitai/datasets/lmms-lab_ai2d \
   --dataset_cache_dir /data2/haojitai/datasets/hf_cache \
@@ -111,7 +111,7 @@ The 7B model was smoke-tested to confirm the same vanilla batch path runs:
 
 ```bash
 PYTHONPATH=$PWD/src /home/haojitai/miniconda3/envs/svllm/bin/python -u \
-  scripts/bench_llava_onevision_ai2d_vanilla.py \
+  benchmark/multimodal/image_qa/ai2d.py \
   --model_path /data2/haojitai/models/llava-onevision-qwen2-7b-ov-hf \
   --dataset_dir /data2/haojitai/datasets/lmms-lab_ai2d \
   --dataset_cache_dir /data2/haojitai/datasets/hf_cache \
@@ -150,7 +150,7 @@ the 0.5B model:
 
 ```bash
 PYTHONPATH=$PWD/src /home/haojitai/miniconda3/envs/svllm/bin/python -u \
-  scripts/bench_llava_onevision_visual_prune.py \
+  benchmark/multimodal/visual_cache/run_visual_cache.py \
   --model_path /data2/haojitai/models/llava-onevision-qwen2-0.5b-ov-hf \
   --deltakv_checkpoint_path none \
   --dataset_dir /data2/haojitai/datasets/llava_onevision_vanilla_batch_smoke \

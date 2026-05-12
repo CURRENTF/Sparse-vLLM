@@ -5,7 +5,7 @@ vanilla and DeltaKV visual-cache experiments.
 
 ## Scope
 
-`scripts/bench_llava_onevision_streamingbench.py` evaluates the
+`benchmark/multimodal/video_qa/streamingbench.py` evaluates the
 multiple-choice video QA portions of StreamingBench:
 
 - `real`: Real-Time Visual Understanding.
@@ -184,7 +184,7 @@ Run a small real-task comparison on GPU 7:
 ```bash
 CUDA_VISIBLE_DEVICES=7 PYTHONPATH=$PWD/src \
 /home/haojitai/miniconda3/envs/svllm/bin/python -u \
-  scripts/bench_llava_onevision_streamingbench.py \
+  benchmark/multimodal/video_qa/streamingbench.py \
   --model_path /data2/haojitai/models/llava-onevision-qwen2-0.5b-ov-hf \
   --dataset_dir /data2/haojitai/datasets/StreamingBench_hf \
   --video_dir /data2/haojitai/datasets/StreamingBench_hf/videos \
@@ -232,7 +232,7 @@ been downloaded:
 ```bash
 CUDA_VISIBLE_DEVICES=6 PYTHONPATH=$PWD/src \
 /home/haojitai/miniconda3/envs/svllm/bin/python -u \
-  scripts/bench_llava_onevision_streamingbench.py \
+  benchmark/multimodal/video_qa/streamingbench.py \
   --model_path /data2/haojitai/models/llava-onevision-qwen2-7b-ov-hf \
   --dataset_dir /data2/haojitai/datasets/StreamingBench_hf \
   --video_dir /data2/haojitai/datasets/StreamingBench_hf/videos \
@@ -265,7 +265,7 @@ Audit the completed baseline with:
 
 ```bash
 /home/haojitai/miniconda3/envs/svllm/bin/python \
-  scripts/audit_livevlm_table4_result.py \
+  benchmark/multimodal/video_qa/audit_livevlm_table4.py \
   --output_dir /data2/haojitai/datasets/llava_onevision_streamingbench_livevlm_table4_7b_vanilla
 ```
 
@@ -425,7 +425,7 @@ Use the lowest-budget tied configuration by default:
 ```bash
 CUDA_VISIBLE_DEVICES=6 PYTHONPATH=$PWD/src \
 /home/haojitai/miniconda3/envs/svllm/bin/python -u \
-  scripts/bench_llava_onevision_streamingbench.py \
+  benchmark/multimodal/video_qa/streamingbench.py \
   --model_path /data2/haojitai/models/llava-onevision-qwen2-7b-ov-hf \
   --dataset_dir /data2/haojitai/datasets/StreamingBench_hf \
   --video_dir /data2/haojitai/datasets/StreamingBench_hf/videos \
@@ -526,7 +526,7 @@ Vanilla full-attention command on physical GPU 6:
 ```bash
 CUDA_VISIBLE_DEVICES=6 PYTHONPATH=$PWD/src \
 /home/haojitai/miniconda3/envs/svllm/bin/python -u \
-  scripts/bench_llava_onevision_streamingbench.py \
+  benchmark/multimodal/video_qa/streamingbench.py \
   --model_path /data2/haojitai/models/llava-onevision-qwen2-7b-ov-hf \
   --dataset_dir /data2/haojitai/datasets/StreamingBench_hf \
   --video_dir /data2/haojitai/datasets/StreamingBench_hf/videos \
@@ -550,7 +550,7 @@ DeltaKV KR30 direct delta-quant command on physical GPU 7:
 ```bash
 CUDA_VISIBLE_DEVICES=7 PYTHONPATH=$PWD/src \
 /home/haojitai/miniconda3/envs/svllm/bin/python -u \
-  scripts/bench_llava_onevision_streamingbench.py \
+  benchmark/multimodal/video_qa/streamingbench.py \
   --model_path /data2/haojitai/models/llava-onevision-qwen2-7b-ov-hf \
   --dataset_dir /data2/haojitai/datasets/StreamingBench_hf \
   --video_dir /data2/haojitai/datasets/StreamingBench_hf/videos \
@@ -598,7 +598,7 @@ Command:
 ```bash
 CUDA_VISIBLE_DEVICES=7 PYTHONPATH=$PWD/src \
 /home/haojitai/miniconda3/envs/svllm/bin/python -u \
-  scripts/bench_llava_onevision_streamingbench.py \
+  benchmark/multimodal/video_qa/streamingbench.py \
   --model_path /data2/haojitai/models/llava-onevision-qwen2-7b-ov-hf \
   --dataset_dir /data2/haojitai/datasets/StreamingBench_hf \
   --video_dir /data2/haojitai/datasets/StreamingBench_hf/videos \

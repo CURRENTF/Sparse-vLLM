@@ -8,9 +8,9 @@ from unittest.mock import patch
 
 import torch
 
-from scripts import audit_livevlm_table4_result as livevlm_audit
-from scripts import bench_llava_onevision_streamingbench as streamingbench
-from scripts import bench_llava_onevision_visual_prune as visual_bench
+from benchmark.multimodal.video_qa import audit_livevlm_table4 as livevlm_audit
+from benchmark.multimodal.video_qa import streamingbench
+from benchmark.multimodal.visual_cache import run_visual_cache as visual_bench
 from sparsevllm.config import Config
 
 
