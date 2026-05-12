@@ -41,7 +41,7 @@ state kept out of `utils/`).
 ```bash
 conda create -n svllm python=3.10 -y
 conda activate svllm
-pip install torch==2.8.0 transformers[torch]==4.53.3 accelerate deepspeed==0.15.4 torchvision datasets==4.1.0
+pip install torch==2.8.0 transformers[torch]==4.53.3 accelerate deepspeed==0.15.4 torchvision datasets==4.1.0 bitsandbytes
 pip install fire matplotlib seaborn wandb loguru ansible
 MAX_JOBS=8 pip install flash-attn --no-build-isolation
 pip install -e .

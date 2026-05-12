@@ -630,7 +630,7 @@ def run_experiment(
     
     # Use relative coordinates (transAxes) for robust positioning
     # Left side (Local) - Align Left to avoid clipping
-    ax.text(0.05, 0.95, f'Local(CacheGen)\nDistance $\leq$ 16\nTokens: {local_ratio:.1f}%',
+    ax.text(0.05, 0.95, f'Local(CacheGen)\nDistance $\\leq$ 16\nTokens: {local_ratio:.1f}%',
             transform=ax.transAxes, ha='left', va='top', fontsize=8,
             color=TEXT_HIGHLIGHT_1,
             bbox=dict(boxstyle="round,pad=0.4", fc="white", ec=TEXT_HIGHLIGHT_1, alpha=0.5))

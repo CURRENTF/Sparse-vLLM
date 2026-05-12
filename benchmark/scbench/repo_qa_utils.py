@@ -69,9 +69,9 @@ from nltk.translate.bleu_score import SmoothingFunction, sentence_bleu
 def compute_function_similarity(
     candidate_function: str, reference_function: str
 ) -> float:
-    candidate_tokens = [item for item in re.split("\s+", candidate_function.strip())]
+    candidate_tokens = [item for item in re.split(r"\s+", candidate_function.strip())]
 
-    reference_tokens = [item for item in re.split("\s+", reference_function.strip())]
+    reference_tokens = [item for item in re.split(r"\s+", reference_function.strip())]
 
     chencherry = SmoothingFunction()
 

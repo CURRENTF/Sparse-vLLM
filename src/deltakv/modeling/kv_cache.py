@@ -1312,8 +1312,9 @@ class ClusterCompressedKVCache(CompressedKVCache):
                     candidate_len=candidate_len,
                     device=key_states.device,
                 )
-                usable_len = (compress_idx.numel() // self.config.compressor_token_group_size) * self.config.compressor_token_group_size
-                compress_idx = compress_idx[:usable_len]
+                if self.config.use_compression:
+                    usable_len = (compress_idx.numel() // self.config.compressor_token_group_size) * self.config.compressor_token_group_size
+                    compress_idx = compress_idx[:usable_len]
                 if drop_idx.numel() == 0:
                     return this_response
                 keep_mask = self._buffer_valid_mask(layer_idx)
@@ -1321,6 +1322,7 @@ class ClusterCompressedKVCache(CompressedKVCache):
                 _key = self.buffer_key_cache[layer_idx].index_select(1, compress_idx)
                 _val = self.buffer_value_cache[layer_idx].index_select(1, compress_idx)
                 _pos = self.buffer_pos_cache[layer_idx].index_select(1, compress_idx)
+                selected_valid_mask = self._valid_pos_mask(_pos)
                 self._filter_buffer_by_mask(layer_idx, keep_mask)
             else:
                 compress_lens = self._compressible_lengths_from_buffer(layer_idx)
@@ -1332,6 +1334,10 @@ class ClusterCompressedKVCache(CompressedKVCache):
                 compress_mask = self._first_valid_buffer_mask(layer_idx, compress_lens)
                 _key, _val, _pos = self._pack_buffer_by_mask(layer_idx, compress_mask)
                 keep_mask = self._buffer_valid_mask(layer_idx) & ~compress_mask
+                selected_valid_mask = (
+                    torch.arange(_pos.shape[1], device=_pos.device).unsqueeze(0)
+                    < compress_lens.to(device=_pos.device).unsqueeze(1)
+                )
                 self._filter_buffer_by_mask(layer_idx, keep_mask)
 
             if _pos.numel() > 0:
@@ -1351,13 +1357,9 @@ class ClusterCompressedKVCache(CompressedKVCache):
                     )
                     self.bases_cache[layer_idx] = all_centers
                 else:
-                    valid_mask = (
-                        torch.arange(_len, device=_pos.device).unsqueeze(0)
-                        < compress_lens.to(device=_pos.device).unsqueeze(1)
-                    )
                     comp_kv, all_centers, all_center_valid, father_idx, scale, mn = self._compress_cluster_delta_quant(
                         to_be_compress,
-                        valid_mask,
+                        selected_valid_mask,
                         existing_centers,
                         self.bases_valid_cache.get(layer_idx),
                         abs_start_pos=abs_start_pos,

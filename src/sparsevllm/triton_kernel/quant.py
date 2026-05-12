@@ -100,6 +100,7 @@ def unpack_tensor(v_code: torch.Tensor, bits: int, pack_dim: int):
     num = 0xFF >> (8 - bits)
     packed_indices = [slice(None)] * len(new_shape)
     packed_indices[pack_dim] = i
+    packed_indices = tuple(packed_indices)
     if pack_dim == 2:
         unpacked_v_code = ((v_code[packed_indices] >> (j * bits)[None, None, :, None]).to(torch.int16)) & num
     elif pack_dim == 3:

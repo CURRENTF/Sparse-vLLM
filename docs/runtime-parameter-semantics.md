@@ -211,7 +211,7 @@ This matters because "the command ran" does not mean "the parameter was used".
 | Backend | Current behavior |
 | --- | --- |
 | HF DeltaKV custom configs | `set_infer_args` applies keys only if the config has that attribute. Unknown keys log `There is NO <key> in Custom Config!` and are usually ignored. |
-| Sparse-vLLM | `LLMEngine.__init__` filters kwargs to dataclass fields in `sparsevllm.Config`. Unknown keys are logged as ignored. |
+| Sparse-vLLM | `LLMEngine.__init__` filters kwargs to dataclass fields in `sparsevllm.Config`. Unknown keys raise `ValueError` by default; they are only logged and ignored when `allow_unknown_config_keys=True`. |
 | LLaVA visual script | Builds a selected `infer_config`; unrelated CLI args are not in the config. |
 | SCBench DeltaKV branch | Copies `hyper_param`, pops `sparse_method` and `cuda_device`, then sends the rest to `get_generate_api`. |
 
@@ -459,6 +459,10 @@ Key Sparse-vLLM public names and internal fields:
 | `allow_unknown_config_keys` | `False` | Explicit opt-in for ignoring unknown Sparse-vLLM config keys. |
 | `allow_raw_config_fallback` | `False` | Explicit opt-in for raw `config.json` fallback when `AutoConfig` fails. Currently restricted to validated DeepSeek configs. |
 | `allow_missing_deltakv_path` | `False` | Explicit opt-in for no-checkpoint DeltaKV ablations that intentionally omit compressor weights. |
+
+`bitsandbytes` is a declared package dependency because 4-bit and 8-bit
+loading paths import it at runtime. A normal `pip install -e .` should install
+it; manually curated environments need to include it explicitly.
 
 ### 9.1 Compressor-Backed DeltaKV
 

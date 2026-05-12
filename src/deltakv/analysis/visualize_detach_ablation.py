@@ -17,7 +17,7 @@ def visualize_detach_ablation():
         "8ax9x47z": {"label": "Train Both", "color": COLOR_TERTIARY}
     }
     METRICS = ["train/loss", "train/ntp_loss", "train/mse_loss"]
-    TITLES = ["Total Loss $\downarrow$", "NTP Loss $\downarrow$", "MSE Loss $\downarrow$"]
+    TITLES = ["Total Loss $\\downarrow$", "NTP Loss $\\downarrow$", "MSE Loss $\\downarrow$"]
     OUTPUT_DIR = "/root/autodl-fs/visuals/"
     WINDOW_SIZE = 100
     

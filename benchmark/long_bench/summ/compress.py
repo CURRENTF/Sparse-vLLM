@@ -136,7 +136,7 @@ elif args.model=="Llama2":
     
 def get_word_list(s1):
 
-    regEx = re.compile('[\W]')   
+    regEx = re.compile(r'[\W]')
     res = re.compile(r"([\u4e00-\u9fa5])")    #  [\u4e00-\u9fa5] for zh
 
     p1 = regEx.split(s1.lower())
