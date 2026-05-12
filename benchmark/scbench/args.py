@@ -14,12 +14,14 @@ except ImportError:
     ATTN_TYPES = ["hf", "deltakv", "vllm", "vllm_blend", "vllm_kv", "inf_llm"]
     KV_TYPES = ["dense", "retr_attn", "kivi"]
 
-if "full_deltakv" not in ATTN_TYPES:
-    ATTN_TYPES.append("full_deltakv")
-if "origin_residual_quant" not in ATTN_TYPES:
-    ATTN_TYPES.append("origin_residual_quant")
-if "all_origin_residual_quant" not in ATTN_TYPES:
-    ATTN_TYPES.append("all_origin_residual_quant")
+for attn_type in (
+    "delta_compressed_latent_wo_full",
+    "delta_compressed_latent_w_full",
+    "delta_origin_wo_full",
+    "delta_origin_w_full",
+):
+    if attn_type not in ATTN_TYPES:
+        ATTN_TYPES.append(attn_type)
 
 
 def parse_args() -> Namespace:

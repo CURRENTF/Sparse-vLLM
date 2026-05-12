@@ -2,22 +2,23 @@ from __future__ import annotations
 
 from typing import Any
 
-from deltakv.modeling.all_origin_residual_quant_cache import AllOriginResidualQuantClusterCompressedKVCache
-from deltakv.modeling.kv_cache import ClusterCompressedKVCache, CompressedKVCache
-from deltakv.modeling.origin_residual_quant_cache import (
-    OriginResidualQuantClusterCompressedKVCache,
-    OriginResidualQuantCompressedKVCache,
+from deltakv.modeling.cache_pipeline import (
+    DELTA_COMPRESSED_LATENT_WO_FULL,
+    DELTA_COMPRESSED_LATENT_W_FULL,
+    DELTA_ORIGIN_WO_FULL,
+    DELTA_ORIGIN_W_FULL,
+    DeltaCompressedLatentWoFullCache,
+    DeltaCompressedLatentWFullCache,
+    DeltaOriginWoFullCache,
+    DeltaOriginWFullCache,
 )
 
 
-STANDARD_CACHE = "standard"
-ORIGIN_RESIDUAL_QUANT_CACHE = "origin_residual_quant"
-ALL_ORIGIN_RESIDUAL_QUANT_CACHE = "all_origin_residual_quant"
-
 _VALID_CACHE_IMPLS = {
-    STANDARD_CACHE,
-    ORIGIN_RESIDUAL_QUANT_CACHE,
-    ALL_ORIGIN_RESIDUAL_QUANT_CACHE,
+    DELTA_COMPRESSED_LATENT_WO_FULL,
+    DELTA_COMPRESSED_LATENT_W_FULL,
+    DELTA_ORIGIN_WO_FULL,
+    DELTA_ORIGIN_W_FULL,
 }
 
 
@@ -32,10 +33,10 @@ def set_deltakv_cache_impl(config: Any, cache_impl: str) -> None:
 
 
 def get_deltakv_cache_impl(config: Any) -> str:
-    cache_impl = getattr(config, "deltakv_cache_impl", STANDARD_CACHE)
-    cache_impl = STANDARD_CACHE if cache_impl is None else str(cache_impl).strip()
+    cache_impl = getattr(config, "deltakv_cache_impl", DELTA_COMPRESSED_LATENT_WO_FULL)
+    cache_impl = DELTA_COMPRESSED_LATENT_WO_FULL if cache_impl is None else str(cache_impl).strip()
     if cache_impl == "":
-        cache_impl = STANDARD_CACHE
+        cache_impl = DELTA_COMPRESSED_LATENT_WO_FULL
     if cache_impl not in _VALID_CACHE_IMPLS:
         raise ValueError(
             f"Unknown deltakv_cache_impl={cache_impl!r}. "
@@ -46,12 +47,14 @@ def get_deltakv_cache_impl(config: Any) -> str:
 
 def _expected_cache_types(config: Any) -> tuple[type, ...]:
     cache_impl = get_deltakv_cache_impl(config)
-    if cache_impl == STANDARD_CACHE:
-        return (CompressedKVCache, ClusterCompressedKVCache)
-    if cache_impl == ORIGIN_RESIDUAL_QUANT_CACHE:
-        return (OriginResidualQuantCompressedKVCache, OriginResidualQuantClusterCompressedKVCache)
-    if cache_impl == ALL_ORIGIN_RESIDUAL_QUANT_CACHE:
-        return (AllOriginResidualQuantClusterCompressedKVCache,)
+    if cache_impl == DELTA_COMPRESSED_LATENT_WO_FULL:
+        return (DeltaCompressedLatentWoFullCache,)
+    if cache_impl == DELTA_COMPRESSED_LATENT_W_FULL:
+        return (DeltaCompressedLatentWFullCache,)
+    if cache_impl == DELTA_ORIGIN_WO_FULL:
+        return (DeltaOriginWoFullCache,)
+    if cache_impl == DELTA_ORIGIN_W_FULL:
+        return (DeltaOriginWFullCache,)
     raise AssertionError(f"Unhandled deltakv_cache_impl={cache_impl!r}")
 
 
@@ -60,17 +63,15 @@ def is_deltakv_cache_instance(past_key_values: Any, config: Any) -> bool:
 
 
 def create_deltakv_cache(config: Any):
+    if not getattr(config, "use_cluster", False):
+        raise ValueError("HF DeltaKV modeling is cluster-only; set use_cluster=True or use Sparse-vLLM.")
     cache_impl = get_deltakv_cache_impl(config)
-    if cache_impl == STANDARD_CACHE:
-        return ClusterCompressedKVCache(config=config) if config.use_cluster else CompressedKVCache(config=config)
-    if cache_impl == ORIGIN_RESIDUAL_QUANT_CACHE:
-        return (
-            OriginResidualQuantClusterCompressedKVCache(config=config)
-            if config.use_cluster
-            else OriginResidualQuantCompressedKVCache(config=config)
-        )
-    if cache_impl == ALL_ORIGIN_RESIDUAL_QUANT_CACHE:
-        if not config.use_cluster:
-            raise ValueError("all_origin_residual_quant cache requires use_cluster=True.")
-        return AllOriginResidualQuantClusterCompressedKVCache(config=config)
+    if cache_impl == DELTA_COMPRESSED_LATENT_WO_FULL:
+        return DeltaCompressedLatentWoFullCache(config=config)
+    if cache_impl == DELTA_COMPRESSED_LATENT_W_FULL:
+        return DeltaCompressedLatentWFullCache(config=config)
+    if cache_impl == DELTA_ORIGIN_WO_FULL:
+        return DeltaOriginWoFullCache(config=config)
+    if cache_impl == DELTA_ORIGIN_W_FULL:
+        return DeltaOriginWFullCache(config=config)
     raise AssertionError(f"Unhandled deltakv_cache_impl={cache_impl!r}")

@@ -7,7 +7,7 @@ from tqdm import tqdm
 from transformers import AutoTokenizer
 from datasets import load_from_disk
 from deltakv.configs.model_config_cls import KVQwen2Config
-from deltakv.modeling.qwen2.qwen2_e2e_cluster import Qwen2KVClusterCompress
+from deltakv.modeling.qwen2_training import Qwen2KVClusterCompress
 from deltakv.get_chat_api import load_compressor
 from deltakv.analysis.colors import (
     COLOR_PRIMARY, COLOR_SECONDARY, COLOR_TERTIARY, COLOR_TERTIARY_LIGHT,
@@ -49,8 +49,6 @@ def analyze_range(model, tokenizer, samples, device="cuda", do_quant=True):
     model.to(device)
     model.eval()
     
-    from deltakv.modeling.qwen2 import qwen2_e2e_cluster
-    
     results = {
         "bf16_loss": [],
         "int4_loss": [],
@@ -77,7 +75,6 @@ def analyze_range(model, tokenizer, samples, device="cuda", do_quant=True):
             inputs = {"input_ids": input_ids, "attention_mask": torch.ones_like(input_ids)}
         
         # 1. BF16 模式 (默认)
-        qwen2_e2e_cluster.CURRENT_RUN_MODE = 'comp'
         with torch.no_grad():
             out_bf16 = model(**inputs, labels=inputs["input_ids"])
             
@@ -124,7 +121,8 @@ def analyze_range(model, tokenizer, samples, device="cuda", do_quant=True):
                     
                     # 更新 buffer
                     attn_module.buffer_recon_kv = torch.cat([recon_bf16[:, :sink_size, :], recon_int4], dim=1)
-                    return torch.split(attn_module.buffer_recon_kv, k_dim, dim=-1)
+                    mse = torch.nn.functional.mse_loss(attn_module.buffer_recon_kv, attn_module.buffer_raw_kv)
+                    return (*torch.split(attn_module.buffer_recon_kv, k_dim, dim=-1), mse)
                 return quant_recon
 
             for layer in model.model.layers:

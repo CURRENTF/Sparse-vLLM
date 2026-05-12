@@ -18,7 +18,7 @@ import torch
 from PIL import Image
 from transformers import LlavaOnevisionConfig, LlavaOnevisionForConditionalGeneration, LlavaOnevisionProcessor
 
-from deltakv.modeling.llava_onevision_deltakv import (
+from deltakv.modeling.llava_ov.llava_onevision_deltakv import (
     LlavaOnevisionDeltaKVForConditionalGeneration,
     load_deltakv_compressor_into_llava,
 )

@@ -27,13 +27,13 @@ def main(
     deepspeed: str = None,
 
     # 压缩器相关配置
-    model_type: str = 'parallel',  # 'parallel', 'sequential', 'e2e' or 'cluster_e2e'
+    model_type: str = 'cluster_e2e_big',
     deltakv_latent_dim: int = 64,
     compressor_token_group_size: int = 1,
     deltakv_neighbor_count: int = 1,
     layer_chunk_size: int = 1,
     recon_mode: str = 'delta_in_latent',  # delta_in_origin or delta_in_latent
-    ref_mode: str = 'last',  # last or avg or first
+    ref_mode: str = 'last',
     use_nonlinear_compressor: bool = False,
     compressor_intermediate_size: int = -1,
     compressor_down_type: str = 'auto',  # auto|linear|mlp_gelu|mlp_swiglu
@@ -87,8 +87,14 @@ def main(
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
 
-    if gradient_checkpointing:
-        assert model_type == 'e2e' or model_type == 'cluster_e2e_big', '其他训练方法在中间activation上训练，不能开gradient checkpointing'
+    if model_type == "e2e":
+        raise ValueError("non-cluster e2e training was removed; use model_type='cluster_e2e_big'.")
+    if model_type == "cluster_e2e":
+        raise ValueError("cluster_e2e was removed; use model_type='cluster_e2e_big'.")
+    if model_type != "cluster_e2e_big":
+        raise ValueError(f"Unsupported model_type={model_type!r}; only 'cluster_e2e_big' is supported.")
+    if ref_mode in {"avg", "first"}:
+        raise ValueError("ref_mode avg/first belonged to removed chunk-ref e2e training; use ref_mode='last'.")
 
     # --- 1. 加载模型和Tokenizer ---
     from transformers import AutoConfig
@@ -104,32 +110,13 @@ def main(
 
     if is_llama:
         from deltakv.configs.model_config_cls import KVLlamaConfig as KVConfig
-        if model_type == 'e2e':
-            from deltakv.modeling.llama.llama_e2e import LlamaKVCompress as KVCompressModel
-        elif model_type == 'cluster_e2e':
-            from deltakv.modeling.llama.llama_e2e_cluster import KVModelCompress as KVCompressModel
-        else:
-            raise ValueError(f"Unknown model_type for Llama: {model_type}")
+        from deltakv.modeling.llama_training import LlamaKVClusterCompress as KVCompressModel
     elif is_qwen2:
         from deltakv.configs.model_config_cls import KVQwen2Config as KVConfig
-        if model_type == 'e2e':
-            from deltakv.modeling.qwen2.qwen2_e2e import KVCompressModel
-        elif model_type == 'cluster_e2e':
-            from deltakv.modeling.qwen2.qwen2_e2e_cluster import Qwen2KVClusterCompress as KVCompressModel
-        elif model_type == 'cluster_e2e_big':
-            from deltakv.modeling.qwen2.qwen2_e2e_cluster_for_big_model import Qwen2KVClusterCompress as KVCompressModel
-        else:
-            raise ValueError(f"Unknown model_type for Qwen2: {model_type}")
+        from deltakv.modeling.qwen2_training import Qwen2KVClusterCompress as KVCompressModel
     elif is_qwen3:
         from deltakv.configs.model_config_cls import KVQwen3Config as KVConfig
-        if model_type == 'e2e':
-            from deltakv.modeling.qwen3.qwen3_e2e import Qwen3KVCompress as KVCompressModel
-        elif model_type == 'cluster_e2e':
-            from deltakv.modeling.qwen3.qwen3_e2e_cluster import Qwen3KVClusterCompress as KVCompressModel
-        elif model_type == 'cluster_e2e_big':
-            from deltakv.modeling.qwen3.qwen3_e2e_cluster_for_big_model import Qwen3KVClusterCompress as KVCompressModel
-        else:
-            raise ValueError(f"Unknown model_type for Qwen3: {model_type}")
+        from deltakv.modeling.qwen3_training import Qwen3KVClusterCompress as KVCompressModel
     else:
         raise ValueError(f"Unsupported model architecture: {raw_config.model_type}")
         
@@ -159,7 +146,7 @@ def main(
         cluster_soft_assignment=cluster_soft_assignment,
         deltakv_center_ratio=deltakv_center_ratio,
         split_kv=split_kv,
-        use_cluster=model_type in ['cluster_e2e', 'cluster_e2e_big'],
+        use_cluster=True,
         use_compression=True,
     )
     config.finalize_cluster_args()
@@ -252,22 +239,15 @@ def main(
 
     # --- 5. 配置训练器 ---
     # 根据超参数创建唯一的输出目录和运行名称
-    if model_type == 'e2e':
-        run_name_suffix = f"e2e_ref{ref_mode}_ld{deltakv_latent_dim}_ctg{compressor_token_group_size}_lcs{layer_chunk_size}"
-        if split_kv:
-            run_name_suffix += "_split"
-    elif model_type in ['cluster_e2e', 'cluster_e2e_big']:
-        run_name_suffix = f"{model_type}_ld{deltakv_latent_dim}_bias{compressor_linear_bias}_{cluster_metric}_ratio{deltakv_center_ratio}"
-        if not cluster_on_kv:
-            run_name_suffix += "_clusSoft"
-        if not cluster_soft_assignment:
-            run_name_suffix += "_clusMean"
-        if split_kv:
-            run_name_suffix += "_split"
-    else:  # parallel or sequential
-        raise ValueError
+    run_name_suffix = f"{model_type}_ld{deltakv_latent_dim}_bias{compressor_linear_bias}_{cluster_metric}_ratio{deltakv_center_ratio}"
+    if not cluster_on_kv:
+        run_name_suffix += "_clusSoft"
+    if not cluster_soft_assignment:
+        run_name_suffix += "_clusMean"
+    if split_kv:
+        run_name_suffix += "_split"
 
-    if model_type in ['e2e', 'cluster_e2e']:
+    if model_type == 'cluster_e2e_big':
         if collect_kv_before_rope:
             run_name_suffix += "_before_rope"
         else:

@@ -20,9 +20,9 @@ from transformers.models.llama.modeling_llama import (
     KwargsForCausalLM,
 )
 
-from deltakv.modeling.kv_cache import ClusterCompressedKVCache
+from deltakv.modeling.cache_pipeline import DeltaCompressedLatentWoFullCache
 from deltakv.configs.model_config_cls import KVLlamaConfig, parse_full_attn_layers
-from deltakv.modeling.qwen2.qwen2_e2e import create_compressor
+from deltakv.modeling.compressor import create_compressor
 from deltakv.modeling.token_select import omnikv_token_selection
 from pprint import pprint
 
@@ -64,7 +64,7 @@ def _get_compressed_keep_ratio(config: KVLlamaConfig, head_dim: int) -> Union[in
     return min(extra_budget / comp_token_cost, 1.0)
 
 
-class DeltaSnapKVCache(ClusterCompressedKVCache):
+class DeltaSnapKVCache(DeltaCompressedLatentWoFullCache):
     def __init__(self, config: KVLlamaConfig) -> None:
         super().__init__(config)
         self.ref_key_cache = {}

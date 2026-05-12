@@ -2,67 +2,67 @@ import unittest
 
 from deltakv.configs.model_config_cls import KVQwen2Config
 from deltakv.modeling.cache_factory import (
-    ALL_ORIGIN_RESIDUAL_QUANT_CACHE,
-    ORIGIN_RESIDUAL_QUANT_CACHE,
-    STANDARD_CACHE,
+    DELTA_COMPRESSED_LATENT_W_FULL,
+    DELTA_COMPRESSED_LATENT_WO_FULL,
+    DELTA_ORIGIN_W_FULL,
+    DELTA_ORIGIN_WO_FULL,
     create_deltakv_cache,
     get_deltakv_cache_impl,
     set_deltakv_cache_impl,
 )
-from deltakv.modeling.kv_cache import ClusterCompressedKVCache, CompressedKVCache
-from deltakv.modeling.origin_residual_quant_cache import (
-    OriginResidualQuantClusterCompressedKVCache,
-    OriginResidualQuantCompressedKVCache,
+from deltakv.modeling.cache_pipeline import (
+    DeltaCompressedLatentWFullCache,
+    DeltaCompressedLatentWoFullCache,
+    DeltaOriginWFullCache,
+    DeltaOriginWoFullCache,
 )
-from deltakv.modeling.all_origin_residual_quant_cache import AllOriginResidualQuantClusterCompressedKVCache
-from deltakv.modeling.llama.llama_all_origin_residual_quant_inference import LlamaAllOriginResidualQuant
-from deltakv.modeling.llama.llama_origin_residual_quant_inference import LlamaOriginResidualQuant
-from deltakv.modeling.qwen2.qwen2_all_origin_residual_quant_inference import Qwen2AllOriginResidualQuant
-from deltakv.modeling.qwen2.qwen2_origin_residual_quant_inference import Qwen2OriginResidualQuant
-from deltakv.modeling.qwen3.qwen3_all_origin_residual_quant_inference import Qwen3AllOriginResidualQuant
-from deltakv.modeling.qwen3.qwen3_origin_residual_quant_inference import Qwen3OriginResidualQuant
 
 
 class HfDeltaKVCacheFactoryTest(unittest.TestCase):
-    def test_standard_cache_impl_matches_use_cluster(self):
-        clustered = KVQwen2Config(use_cluster=True)
-        self.assertEqual(get_deltakv_cache_impl(clustered), STANDARD_CACHE)
-        self.assertIsInstance(create_deltakv_cache(clustered), ClusterCompressedKVCache)
+    def _config(self):
+        return KVQwen2Config(
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            hidden_size=16,
+            intermediate_size=32,
+            vocab_size=64,
+            use_cluster=True,
+            use_compression=False,
+            full_attn_layers="0",
+        )
 
-        non_clustered = KVQwen2Config(use_cluster=False)
-        self.assertIsInstance(create_deltakv_cache(non_clustered), CompressedKVCache)
+    def test_default_cache_impl_is_delta_compressed_latent_without_full(self):
+        cfg = self._config()
+        self.assertEqual(get_deltakv_cache_impl(cfg), DELTA_COMPRESSED_LATENT_WO_FULL)
+        self.assertIsInstance(create_deltakv_cache(cfg), DeltaCompressedLatentWoFullCache)
 
-    def test_origin_residual_quant_cache_impl_matches_use_cluster(self):
-        clustered = KVQwen2Config(use_cluster=True)
-        set_deltakv_cache_impl(clustered, ORIGIN_RESIDUAL_QUANT_CACHE)
-        self.assertIsInstance(create_deltakv_cache(clustered), OriginResidualQuantClusterCompressedKVCache)
+    def test_all_current_cache_impls_construct_expected_classes(self):
+        cases = {
+            DELTA_COMPRESSED_LATENT_WO_FULL: DeltaCompressedLatentWoFullCache,
+            DELTA_COMPRESSED_LATENT_W_FULL: DeltaCompressedLatentWFullCache,
+            DELTA_ORIGIN_WO_FULL: DeltaOriginWoFullCache,
+            DELTA_ORIGIN_W_FULL: DeltaOriginWFullCache,
+        }
+        for impl, expected_cls in cases.items():
+            with self.subTest(impl=impl):
+                cfg = self._config()
+                set_deltakv_cache_impl(cfg, impl)
+                self.assertEqual(get_deltakv_cache_impl(cfg), impl)
+                self.assertIsInstance(create_deltakv_cache(cfg), expected_cls)
 
-        non_clustered = KVQwen2Config(use_cluster=False)
-        set_deltakv_cache_impl(non_clustered, ORIGIN_RESIDUAL_QUANT_CACHE)
-        self.assertIsInstance(create_deltakv_cache(non_clustered), OriginResidualQuantCompressedKVCache)
+    def test_removed_cache_impl_names_are_not_accepted(self):
+        for impl in ("standard", "full", "origin", "all_origin"):
+            with self.subTest(impl=impl):
+                cfg = self._config()
+                with self.assertRaisesRegex(ValueError, "Unknown deltakv_cache_impl"):
+                    set_deltakv_cache_impl(cfg, impl)
 
-    def test_all_origin_residual_quant_requires_cluster(self):
-        cfg = KVQwen2Config(use_cluster=True)
-        set_deltakv_cache_impl(cfg, ALL_ORIGIN_RESIDUAL_QUANT_CACHE)
-        self.assertIsInstance(create_deltakv_cache(cfg), AllOriginResidualQuantClusterCompressedKVCache)
-
-        cfg = KVQwen2Config(use_cluster=False)
-        set_deltakv_cache_impl(cfg, ALL_ORIGIN_RESIDUAL_QUANT_CACHE)
-        with self.assertRaisesRegex(ValueError, "requires use_cluster"):
+    def test_hf_cache_factory_requires_cluster_path(self):
+        cfg = self._config()
+        cfg.use_cluster = False
+        with self.assertRaisesRegex(ValueError, "cluster-only"):
             create_deltakv_cache(cfg)
-
-    def test_origin_model_wrappers_reuse_base_forward(self):
-        wrappers = [
-            Qwen2OriginResidualQuant,
-            Qwen2AllOriginResidualQuant,
-            Qwen3OriginResidualQuant,
-            Qwen3AllOriginResidualQuant,
-            LlamaOriginResidualQuant,
-            LlamaAllOriginResidualQuant,
-        ]
-        for wrapper_cls in wrappers:
-            with self.subTest(wrapper_cls=wrapper_cls.__name__):
-                self.assertNotIn("forward", wrapper_cls.__dict__)
 
 
 if __name__ == "__main__":

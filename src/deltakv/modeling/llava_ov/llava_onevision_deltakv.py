@@ -21,7 +21,7 @@ from transformers.models.llava_onevision.modeling_llava_onevision import (
 
 from deltakv.configs.model_config_cls import KVQwen2Config
 from deltakv.modeling.cache_factory import create_deltakv_cache, is_deltakv_cache_instance
-from deltakv.modeling.qwen2.qwen2_with_compress_inference import Qwen2ModelKVCompress
+from deltakv.modeling.qwen2_inference import Qwen2ModelKVCompress
 
 
 def build_llava_text_deltakv_config(config) -> KVQwen2Config:

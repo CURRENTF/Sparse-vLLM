@@ -1,0 +1,54 @@
+import tempfile
+import unittest
+from pathlib import Path
+
+from benchmark.long_bench import pred as longbench_pred
+from benchmark.long_bench.metrics import classification_score, qa_f1_score
+from deltakv.configs.runtime_params import normalize_runtime_params
+from deltakv.modeling.cache_factory import (
+    DELTA_COMPRESSED_LATENT_W_FULL,
+    DELTA_COMPRESSED_LATENT_WO_FULL,
+    DELTA_ORIGIN_W_FULL,
+    DELTA_ORIGIN_WO_FULL,
+)
+
+
+class LongBenchDeltaKVContractsTest(unittest.TestCase):
+    def test_hotpotqa_and_trec_metric_contracts(self):
+        self.assertEqual(qa_f1_score("Paris", "Paris"), 1.0)
+        self.assertEqual(qa_f1_score("Paris", "London"), 0)
+        self.assertEqual(
+            classification_score(
+                "DESC",
+                "DESC",
+                all_classes=["ABBR", "DESC", "ENTY", "HUM", "LOC", "NUM"],
+            ),
+            1.0,
+        )
+
+    def test_longbench_data_validation_fails_fast_for_missing_hotpotqa_and_trec(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old_root = longbench_pred.DATA_PREFIX_PATH
+            longbench_pred.DATA_PREFIX_PATH = str(Path(tmp) / "missing")
+            try:
+                with self.assertRaisesRegex(FileNotFoundError, "LongBench data root"):
+                    longbench_pred.validate_longbench_data_paths(["hotpotqa", "trec"], use_longbench_e=False)
+            finally:
+                longbench_pred.DATA_PREFIX_PATH = old_root
+
+    def test_new_hf_sparse_methods_route_without_legacy_names(self):
+        for sparse_method in (
+            DELTA_COMPRESSED_LATENT_WO_FULL,
+            DELTA_COMPRESSED_LATENT_W_FULL,
+            DELTA_ORIGIN_WO_FULL,
+            DELTA_ORIGIN_W_FULL,
+        ):
+            with self.subTest(sparse_method=sparse_method):
+                normalized = normalize_runtime_params({"sparse_method": sparse_method}, backend="hf")
+                self.assertEqual(normalized.hf_model_cls, sparse_method)
+                self.assertNotIn("origin_residual", sparse_method)
+                self.assertNotIn("full_deltakv", sparse_method)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -5,7 +5,7 @@ from transformers.models.qwen2.modeling_qwen2 import (
     Qwen2Attention, Unpack, FlashAttentionKwargs, Callable, eager_attention_forward, ALL_ATTENTION_FUNCTIONS, Qwen2DecoderLayer, Qwen2Model, Qwen2ForCausalLM,
     KwargsForCausalLM, apply_rotary_pos_emb
 )
-from deltakv.modeling.kv_cache import SnapKVCache
+from deltakv.modeling.cache_pipeline import SnapKVCache
 from deltakv.configs.model_config_cls import KVQwen2Config
 from deltakv.modeling.token_select import snapkv_token_selection
 from sparsevllm.utils.log import log_once

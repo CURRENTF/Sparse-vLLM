@@ -3,7 +3,7 @@ import unittest
 import torch
 
 from deltakv.configs.model_config_cls import KVQwen2Config
-from deltakv.modeling.kv_cache import ClusterCompressedKVCache, CompressedKVCache
+from deltakv.modeling.cache_pipeline import DeltaCompressedLatentWoFullCache
 
 
 class VisualUniformPruningTest(unittest.TestCase):
@@ -18,15 +18,17 @@ class VisualUniformPruningTest(unittest.TestCase):
         )
         config.set_infer_args(
             use_compression=False,
-            use_cluster=False,
+            use_cluster=True,
             deltakv_latent_quant_bits=0,
             sink_keep_tokens=1,
             recent_keep_tokens=2,
             full_attention_layers="",
             visual_token_prune_only=True,
             visual_token_keep_ratio=0.5,
+            deltakv_neighbor_count=1,
+            deltakv_center_ratio=0.5,
         )
-        cache = CompressedKVCache(config)
+        cache = DeltaCompressedLatentWoFullCache(config)
 
         key = torch.randn(1, 6, 8)
         value = torch.randn(1, 6, 8)
@@ -68,7 +70,7 @@ class VisualUniformPruningTest(unittest.TestCase):
             deltakv_neighbor_count=1,
             deltakv_center_ratio=0.5,
         )
-        cache = ClusterCompressedKVCache(config)
+        cache = DeltaCompressedLatentWoFullCache(config)
 
         key = torch.randn(1, 6, 8)
         value = torch.randn(1, 6, 8)

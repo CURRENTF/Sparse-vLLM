@@ -450,7 +450,17 @@ def load_model(
         )
     # tok.pad_token = tok.eos_token
 
-    if attn_type in ["deltakv", "full_deltakv", "origin_residual_quant", "all_origin_residual_quant", "snapkv", "pyramidkv", "palu", "quest"]:
+    if attn_type in [
+        "deltakv",
+        "delta_compressed_latent_wo_full",
+        "delta_compressed_latent_w_full",
+        "delta_origin_wo_full",
+        "delta_origin_w_full",
+        "snapkv",
+        "pyramidkv",
+        "palu",
+        "quest",
+    ]:
         deltakv_checkpoint_path = hyper_param.pop("deltakv_checkpoint_path", None)
         
         infer_config = hyper_param.copy()

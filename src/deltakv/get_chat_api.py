@@ -7,9 +7,10 @@ from deltakv.configs.model_config_cls import KVQwen2Config, KVQwen3Config, KVLla
 from deltakv.configs.runtime_params import normalize_runtime_params
 from deltakv.baseline_adapters import load_omnikv_model, load_kivi_model
 from deltakv.modeling.cache_factory import (
-    ALL_ORIGIN_RESIDUAL_QUANT_CACHE,
-    ORIGIN_RESIDUAL_QUANT_CACHE,
-    STANDARD_CACHE,
+    DELTA_COMPRESSED_LATENT_W_FULL,
+    DELTA_COMPRESSED_LATENT_WO_FULL,
+    DELTA_ORIGIN_W_FULL,
+    DELTA_ORIGIN_WO_FULL,
 )
 from deltakv.quantization import build_model_load_kwargs, restore_modules_to_dtype
 from deltakv.utils.log import logger
@@ -310,69 +311,31 @@ def get_generate_api(model_path: str, infer_config: dict, deltakv_checkpoint_pat
         return runtime_infer_config, model_load_kwargs, target_torch_dtype
 
     assert use_cache, '还要做padding才能用训练代码推理'
-    if model_cls in {'deltakv', 'origin_residual_quant', 'all_origin_residual_quant'}:
+    if model_cls in {
+        'deltakv',
+        DELTA_COMPRESSED_LATENT_WO_FULL,
+        DELTA_COMPRESSED_LATENT_W_FULL,
+        DELTA_ORIGIN_WO_FULL,
+        DELTA_ORIGIN_W_FULL,
+    }:
         cache_impl_by_model_cls = {
-            'deltakv': STANDARD_CACHE,
-            'origin_residual_quant': ORIGIN_RESIDUAL_QUANT_CACHE,
-            'all_origin_residual_quant': ALL_ORIGIN_RESIDUAL_QUANT_CACHE,
+            'deltakv': DELTA_COMPRESSED_LATENT_WO_FULL,
+            DELTA_COMPRESSED_LATENT_WO_FULL: DELTA_COMPRESSED_LATENT_WO_FULL,
+            DELTA_COMPRESSED_LATENT_W_FULL: DELTA_COMPRESSED_LATENT_W_FULL,
+            DELTA_ORIGIN_WO_FULL: DELTA_ORIGIN_WO_FULL,
+            DELTA_ORIGIN_W_FULL: DELTA_ORIGIN_W_FULL,
         }
         runtime_infer_config, model_load_kwargs, target_torch_dtype = _prepare_model_load(torch.bfloat16)
         runtime_infer_config["deltakv_cache_impl"] = cache_impl_by_model_cls[model_cls]
         base_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
         if base_config.model_type == 'qwen2':
-            if use_cache:
-                from deltakv.modeling.qwen2.qwen2_with_compress_inference import Qwen2KVCompress as KVModel
-            else:
-                from deltakv.modeling.qwen2.qwen2_e2e import Qwen2KVCompress as KVModel
+            from deltakv.modeling.qwen2_inference import Qwen2KVCompress as KVModel
             config_cls = KVQwen2Config
         elif base_config.model_type == 'qwen3':
-            if use_cache:
-                from deltakv.modeling.qwen3.qwen3_with_compress_inference import Qwen3KVCompress as KVModel
-            else:
-                from deltakv.modeling.qwen3.qwen3_e2e import Qwen3KVCompress as KVModel
+            from deltakv.modeling.qwen3_inference import Qwen3KVCompress as KVModel
             config_cls = KVQwen3Config
         elif base_config.model_type == 'llama':
-            from deltakv.modeling.llama.llama_with_compress_inference import LlamaKVCompress as KVModel
-            config_cls = KVLlamaConfig
-        else:
-            raise ValueError(f"Unsupported model type: {base_config.model_type}")
-
-        if compressor_path is not None:
-            config = config_cls.from_pretrained(compressor_path)
-        else:
-            config = config_cls.from_pretrained(model_path)
-        config.set_native_args(**runtime_infer_config)
-        config.finalize_cluster_args()
-        if model_cls == 'all_origin_residual_quant' and not config.use_cluster:
-            raise ValueError("all_origin_residual_quant requires use_cluster=True.")
-        model = KVModel.from_pretrained(
-            model_path,
-            config=config,
-            torch_dtype=target_torch_dtype,
-            device_map=cuda_device,
-            attn_implementation="flash_attention_2",
-            **model_load_kwargs,
-        )
-        if compressor_path is not None:
-            load_device = f'cuda:{cuda_device}' if isinstance(cuda_device, int) else 'cpu'
-            comp_state_dict = load_compressor(compressor_path, device=load_device)
-            _, unexpected = model.load_state_dict(comp_state_dict, strict=False)
-            assert len(unexpected) == 0, f'compressor 加载有问题: {unexpected}'
-            del comp_state_dict
-        if model_load_kwargs:
-            restore_modules_to_dtype(model, target_torch_dtype)
-
-    elif model_cls == 'full_deltakv':
-        runtime_infer_config, model_load_kwargs, target_torch_dtype = _prepare_model_load(torch.bfloat16)
-        base_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-        if base_config.model_type == 'qwen2':
-            from deltakv.modeling.qwen2.qwen2_full_deltakv_compress_inference import Qwen2FullKVCompress as KVModel
-            config_cls = KVQwen2Config
-        elif base_config.model_type == 'qwen3':
-            from deltakv.modeling.qwen3.qwen3_full_deltakv_compress_inference import Qwen3FullKVCompress as KVModel
-            config_cls = KVQwen3Config
-        elif base_config.model_type == 'llama':
-            from deltakv.modeling.llama.llama_full_deltakv_compress_inference import LlamaFullKVCompress as KVModel
+            from deltakv.modeling.llama_inference import LlamaKVCompress as KVModel
             config_cls = KVLlamaConfig
         else:
             raise ValueError(f"Unsupported model type: {base_config.model_type}")

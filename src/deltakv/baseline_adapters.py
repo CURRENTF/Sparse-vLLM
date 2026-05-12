@@ -20,11 +20,11 @@ def load_omnikv_model(model_path: str, infer_config: dict, cuda_device):
     base_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
 
     if base_config.model_type == "qwen2":
-        from deltakv.modeling.qwen2.qwen2_with_compress_inference import Qwen2KVCompress as KVModel
+        from deltakv.modeling.qwen2_inference import Qwen2KVCompress as KVModel
 
         config_cls = KVQwen2Config
     elif base_config.model_type == "llama":
-        from deltakv.modeling.llama.llama_with_compress_inference import LlamaKVCompress as KVModel
+        from deltakv.modeling.llama_inference import LlamaKVCompress as KVModel
 
         config_cls = KVLlamaConfig
     else:

@@ -5,7 +5,7 @@ from transformers.models.llama.modeling_llama import (
     LlamaAttention, Unpack, FlashAttentionKwargs, Callable, eager_attention_forward, ALL_ATTENTION_FUNCTIONS, LlamaDecoderLayer, LlamaModel, LlamaForCausalLM,
     KwargsForCausalLM, apply_rotary_pos_emb
 )
-from deltakv.modeling.kv_cache import SnapKVCache
+from deltakv.modeling.cache_pipeline import SnapKVCache
 from deltakv.configs.model_config_cls import KVLlamaConfig
 from deltakv.modeling.token_select import snapkv_token_selection
 from sparsevllm.utils.log import log_once
