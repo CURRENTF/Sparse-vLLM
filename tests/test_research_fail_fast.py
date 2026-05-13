@@ -465,10 +465,23 @@ class ResearchFailFastTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with patch("sparsevllm.config.AutoConfig.from_pretrained", return_value=hf_config):
                 with self.assertRaisesRegex(ValueError, "requires deltakv_path"):
-                    Config(model=tmp, vllm_sparse_method="deltakv")
+                    Config(
+                        model=tmp,
+                        vllm_sparse_method="deltakv",
+                        prefill_schedule_policy="long_bs1full_short_batch",
+                    )
                 with self.assertRaisesRegex(ValueError, "requires deltakv_path"):
-                    Config(model=tmp, vllm_sparse_method="deltakv", deltakv_path="none")
-                Config(model=tmp, vllm_sparse_method="deltakv-delta-quant")
+                    Config(
+                        model=tmp,
+                        vllm_sparse_method="deltakv",
+                        deltakv_path="none",
+                        prefill_schedule_policy="long_bs1full_short_batch",
+                    )
+                Config(
+                    model=tmp,
+                    vllm_sparse_method="deltakv-delta-quant",
+                    prefill_schedule_policy="long_bs1full_short_batch",
+                )
 
     def test_sparsevllm_missing_model_dir_has_clear_error(self):
         missing = "/tmp/sparsevllm-definitely-missing-model-dir"

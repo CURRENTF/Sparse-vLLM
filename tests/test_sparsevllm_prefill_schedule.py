@@ -1,3 +1,4 @@
+import os
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -128,12 +129,37 @@ class SparseVLLMPrefillScheduleTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "prefill_schedule_policy"):
             _config(prefill_schedule_policy="bad-policy")
 
-    def test_deltakv_all_chunked_logs_accuracy_warning(self):
-        with patch("sparsevllm.config.logger.warning") as warning:
-            _config(vllm_sparse_method="deltakv-delta-quant", prefill_schedule_policy="all_chunked")
+    def test_deltakv_all_chunked_fails_fast_by_default(self):
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(ValueError, "DeltaKV.*all_chunked.*SVLLM_EXP_FEATURE"):
+                _config(vllm_sparse_method="deltakv-delta-quant", prefill_schedule_policy="all_chunked")
+
+    def test_deltakv_all_chunked_warns_with_experimental_flag(self):
+        with patch.dict(os.environ, {"SVLLM_EXP_FEATURE": "1"}, clear=True):
+            with patch("sparsevllm.config.logger.warning") as warning:
+                _config(vllm_sparse_method="deltakv-delta-quant", prefill_schedule_policy="all_chunked")
 
         self.assertTrue(warning.called)
         self.assertIn("all_chunked", warning.call_args.args[0])
+
+    def test_omnikv_long_policy_fails_fast_by_default(self):
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(ValueError, "OmniKV.*long_bs1full_short_batch.*SVLLM_EXP_FEATURE"):
+                _config(vllm_sparse_method="omnikv", prefill_schedule_policy="long_bs1full_short_batch")
+
+    def test_omnikv_long_policy_warns_with_experimental_flag(self):
+        with patch.dict(os.environ, {"SVLLM_EXP_FEATURE": "1"}, clear=True):
+            with patch("sparsevllm.config.logger.warning") as warning:
+                _config(vllm_sparse_method="omnikv", prefill_schedule_policy="long_bs1full_short_batch")
+
+        self.assertTrue(warning.called)
+        self.assertIn("OmniKV", warning.call_args.args[0])
+
+    def test_other_methods_can_use_long_policy_without_experimental_flag(self):
+        with patch.dict(os.environ, {}, clear=True):
+            cfg = _config(vllm_sparse_method="snapkv", prefill_schedule_policy="long_bs1full_short_batch")
+
+        self.assertEqual(cfg.prefill_schedule_policy, "long_bs1full_short_batch")
 
     def test_seq_chunk_helper_preserves_tokenwise_output(self):
         torch.manual_seed(0)

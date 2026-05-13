@@ -193,18 +193,6 @@ class Config:
             layers = self.full_attn_layers.strip()
             self.full_attn_layers = [] if not layers else [int(x) for x in layers.split(",")]
 
-        if (
-            self.prefill_schedule_policy == "all_chunked"
-            and isinstance(self.vllm_sparse_method, str)
-            and self.vllm_sparse_method.startswith("deltakv")
-        ):
-            logger.warning(
-                "DeltaKV with prefill_schedule_policy='all_chunked' compresses KV at prompt chunk "
-                "boundaries and may affect accuracy. Use "
-                "prefill_schedule_policy='long_bs1full_short_batch' to preserve full-prompt "
-                "prefill semantics for long inputs."
-            )
-
         if self.quest_chunk_size <= 0:
             raise ValueError("quest_chunk_size 必须 > 0")
         if self.quest_token_budget <= 0:
@@ -238,6 +226,35 @@ class Config:
                 "deltakv-delta-quant, or set allow_missing_deltakv_path=True only for an "
                 "explicitly validated ablation."
             )
+
+        exp_feature_enabled = bool(os.getenv("SVLLM_EXP_FEATURE"))
+
+        def _handle_experimental_prefill_policy(condition: bool, message: str):
+            if not condition:
+                return
+            if exp_feature_enabled:
+                logger.warning(f"{message} Continuing because SVLLM_EXP_FEATURE is set.")
+                return
+            raise ValueError(
+                f"{message} Set SVLLM_EXP_FEATURE=1 to run this experimental configuration."
+            )
+
+        _handle_experimental_prefill_policy(
+            self.prefill_schedule_policy == "all_chunked"
+            and isinstance(self.vllm_sparse_method, str)
+            and self.vllm_sparse_method.startswith("deltakv"),
+            "DeltaKV with prefill_schedule_policy='all_chunked' compresses KV at prompt chunk "
+            "boundaries and can change accuracy. Use "
+            "prefill_schedule_policy='long_bs1full_short_batch' for validated DeltaKV long-context "
+            "evaluations.",
+        )
+        _handle_experimental_prefill_policy(
+            self.prefill_schedule_policy == "long_bs1full_short_batch"
+            and self.vllm_sparse_method == "omnikv",
+            "OmniKV with prefill_schedule_policy='long_bs1full_short_batch' runs long prompts as "
+            "single full-prefill requests, so OmniKV prefill acceleration is disabled or degenerate. "
+            "Use prefill_schedule_policy='all_chunked' for OmniKV prefill acceleration.",
+        )
 
         if self.vllm_sparse_method in ("deltakv-standalone", "deltakv-snapkv"):
             # Standalone DeltaKV uses all layers uniformly and does not rely on
