@@ -76,6 +76,8 @@ class CustomConfigMixin:
         # Migrate those artifact fields internally so historical weights remain
         # loadable for regression checks; runtime/API parameters are still
         # rejected by normalize_runtime_params().
+        has_legacy_k_neighbors = "k_neighbors" in kwargs
+        has_explicit_neighbor_count = "deltakv_neighbor_count" in kwargs
         if "seq_chunk_size" in kwargs:
             legacy_value = kwargs.pop("seq_chunk_size")
             if compressor_token_group_size != 1 and compressor_token_group_size != legacy_value:
@@ -84,6 +86,12 @@ class CustomConfigMixin:
                     "`compressor_token_group_size` differ."
                 )
             compressor_token_group_size = legacy_value
+            if (
+                not has_legacy_k_neighbors
+                and not has_explicit_neighbor_count
+                and deltakv_neighbor_count == 1
+            ):
+                deltakv_neighbor_count = legacy_value
         if "k_neighbors" in kwargs:
             legacy_value = kwargs.pop("k_neighbors")
             if deltakv_neighbor_count != 1 and deltakv_neighbor_count != legacy_value:

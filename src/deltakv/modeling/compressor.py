@@ -73,9 +73,15 @@ def create_compressor(is_down: bool, config):
     raise AssertionError(f"Unhandled compressor type: {kind}")
 
 
-def reshape_and_apply_qk_norm(attn: nn.Module, query_states: torch.Tensor, key_states: torch.Tensor, hidden_shape: tuple[int, ...]):
-    query_states = query_states.view(hidden_shape)
-    key_states = key_states.view(hidden_shape)
+def reshape_and_apply_qk_norm(
+    attn: nn.Module,
+    query_states: torch.Tensor,
+    key_states: torch.Tensor,
+    query_hidden_shape: tuple[int, ...],
+    key_hidden_shape: tuple[int, ...] | None = None,
+):
+    query_states = query_states.view(query_hidden_shape)
+    key_states = key_states.view(key_hidden_shape or query_hidden_shape)
     if hasattr(attn, "q_norm"):
         query_states = attn.q_norm(query_states)
     if hasattr(attn, "k_norm"):

@@ -424,6 +424,12 @@ class ClusterCachePipeline(BaseCache):
         pos = self.get_compressed_positions(layer_idx)
         return 0 if pos is None else int(pos.shape[1])
 
+    def get_observable_compressed_length(self, current_q_len: int) -> int:
+        compressed_len = self._seen_tokens - self.tail_token_size - int(current_q_len) - self.sink_size
+        if compressed_len <= 0:
+            return 0
+        return (compressed_len // self.tail_token_size) * self.tail_token_size
+
     def get_buffer_valid_lengths(self, layer_idx: int, device: Optional[torch.device] = None):
         if layer_idx not in self.buffer_pos_cache:
             return None

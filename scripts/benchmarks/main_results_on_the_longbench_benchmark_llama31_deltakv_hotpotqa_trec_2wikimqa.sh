@@ -16,7 +16,7 @@ PYTHONPATH=/home/haojitai/projects/Sparse-vLLM/src:${PYTHONPATH:-} \
   --batch_size 1 \
   --backend hf \
   --sparse_method deltakv \
-  --deltakv_checkpoint_path /data2/haojitai/checkpoints/compressor/cluster_e2e_cs512_biasFalse_l2_ratio0.1_clusMean_before_rope_lr0.0002_cdownmlp_swiglud3072_cuplinear_0125_051527 \
+  --deltakv_checkpoint_path /data2/haojitai/checkpoints/compressor/Llama-3.1-8B-Instruct-Compressor \
   --temperature 0 \
   --top_p 1 \
   --top_k 0 \

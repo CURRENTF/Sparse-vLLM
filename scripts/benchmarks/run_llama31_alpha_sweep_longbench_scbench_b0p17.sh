@@ -9,7 +9,7 @@ export DELTAKV_LONGBENCH_DATA_DIR=/home/haojitai/datasets/LongBench
 export PYTHONPATH=/home/haojitai/projects/Sparse-vLLM/src:${PYTHONPATH:-}
 
 MODEL_PATH="/home/haojitai/models/Llama-3.1-8B-Instruct"
-DELTAKV_CHECKPOINT_PATH="/home/haojitai/checkpoints/compressor/cluster_e2e_cs512_biasFalse_l2_ratio0.1_clusMean_before_rope_lr0.0002_cdownmlp_swiglud3072_cuplinear_0125_051527"
+DELTAKV_CHECKPOINT_PATH="/data2/haojitai/checkpoints/compressor/Llama-3.1-8B-Instruct-Compressor"
 ALPHAS=("0.001" "0.02" "0.05" "0.1")
 SCBENCH_TASKS="scbench_kv,scbench_qa_eng,scbench_summary_with_needles,scbench_many_shot"
 

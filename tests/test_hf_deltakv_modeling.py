@@ -3,10 +3,12 @@ import unittest
 import torch
 
 from deltakv.configs.model_config_cls import KVLlamaConfig, KVQwen2Config, KVQwen3Config
+from deltakv.modeling.compressor import reshape_and_apply_qk_norm
 from deltakv.modeling.cache_factory import (
     DELTA_COMPRESSED_LATENT_W_FULL,
     DELTA_ORIGIN_W_FULL,
     DELTA_ORIGIN_WO_FULL,
+    create_deltakv_cache,
 )
 from deltakv.modeling.llama_inference import (
     LlamaDeltaCompressedLatentWFull,
@@ -84,6 +86,39 @@ class HfDeltaKVModelingTest(unittest.TestCase):
                 with torch.no_grad():
                     out = model(input_ids=torch.tensor([[5, 6, 7]], dtype=torch.long), use_cache=True)
                 self.assertEqual(out.logits.shape[:2], (1, 1))
+
+    def test_qk_norm_reshape_allows_different_query_and_key_lengths(self):
+        class AttnWithNorms:
+            q_norm = torch.nn.Identity()
+            k_norm = torch.nn.Identity()
+
+        query_states = torch.randn(1, 3, 4, 8)
+        key_states = torch.randn(1, 5, 2, 8)
+        query_out, key_out = reshape_and_apply_qk_norm(
+            AttnWithNorms(),
+            query_states.reshape(1, -1),
+            key_states.reshape(1, -1),
+            (1, 3, 4, 8),
+            (1, 5, 2, 8),
+        )
+        self.assertEqual(query_out.shape, (1, 4, 3, 8))
+        self.assertEqual(key_out.shape, (1, 2, 5, 8))
+
+    def test_obs_layer_uses_global_compressed_history_length(self):
+        cfg = _tiny_config(KVQwen2Config)
+        cfg.num_hidden_layers = 4
+        cfg.full_attn_layers = [0, 1]
+        cfg.tail_token_size = 4
+        cfg.num_sink_tokens = 1
+        cache = create_deltakv_cache(cfg)
+        cache._seen_tokens = 14
+        self.assertEqual(cache.get_compressed_length(1), 0)
+        self.assertEqual(cache.get_observable_compressed_length(current_q_len=1), 8)
+
+    def test_legacy_seq_chunk_size_preserves_cluster_neighbor_count(self):
+        cfg = KVQwen2Config(seq_chunk_size=4, use_cluster=True)
+        self.assertEqual(cfg.compressor_token_group_size, 4)
+        self.assertEqual(cfg.get_cluster_neighbor_count(), 4)
 
     def test_variant_class_names_match_current_cache_impls(self):
         cases = (

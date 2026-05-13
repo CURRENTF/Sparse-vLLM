@@ -115,6 +115,7 @@ def build_inference_classes(
                     query_states,
                     key_states,
                     hidden_shape,
+                    (bs, -1, self.config.num_key_value_heads, self.head_dim),
                 )
             else:
                 query_states = query_states.view(bs, q_len, self.config.num_attention_heads, self.head_dim).transpose(1, 2)
@@ -145,7 +146,10 @@ def build_inference_classes(
                 **extra,
             )
 
-            compressed_len = past_key_value.get_compressed_length(self.layer_idx)
+            if self.is_obs_layer:
+                compressed_len = past_key_value.get_observable_compressed_length(q_len)
+            else:
+                compressed_len = past_key_value.get_compressed_length(self.layer_idx)
             do_obs = (
                 bool(self.config.deltakv_use_omnikv_selection)
                 and self.is_obs_layer
