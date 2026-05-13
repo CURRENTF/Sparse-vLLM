@@ -265,6 +265,7 @@ def sync_deltakv_config_from_checkpoint(config) -> bool:
 
 
 def _compressor_signature(mod: nn.Module):
+    mod = getattr(mod, "module", mod)
     if isinstance(mod, nn.Linear):
         return "linear", None, (mod.bias is not None)
     if hasattr(mod, "w12") and hasattr(mod, "w3"):
@@ -411,13 +412,14 @@ def load_deltakv_compressors_to_cache_manager(cache_manager, path: str):
 
             for l_idx in target_layer_indices:
                 compressor = cache_manager.compress_down[l_idx] if comp_name == "compress_down" else cache_manager.compress_up[l_idx]
+                compressor_params = getattr(compressor, "module", compressor)
                 try:
                     # 尝试获取对应的参数
                     if '.' in sub_key:
                         prefix, name = sub_key.rsplit('.', 1)
-                        param = compressor.get_submodule(prefix).get_parameter(name)
+                        param = compressor_params.get_submodule(prefix).get_parameter(name)
                     else:
-                        param = compressor.get_parameter(sub_key)
+                        param = compressor_params.get_parameter(sub_key)
 
                     if param.shape != weight.shape:
                         raise ValueError(f"权重 {key} 形状不匹配: 预期 {param.shape}, 实际 {weight.shape}")
@@ -427,7 +429,7 @@ def load_deltakv_compressors_to_cache_manager(cache_manager, path: str):
                 except Exception as e:
                     # 尝试直接访问属性作为备选方案
                     try:
-                        target = getattr(compressor, sub_key)
+                        target = getattr(compressor_params, sub_key)
                         if isinstance(target, nn.Parameter):
                             if target.shape != weight.shape:
                                 raise ValueError(f"权重 {key} 形状不匹配: 预期 {target.shape}, 实际 {weight.shape}")

@@ -24,6 +24,7 @@ class Scheduler:
         self.max_decoding_seqs = config.max_decoding_seqs
 
         self.chunk_prefill_size = config.chunk_prefill_size
+        self.prefill_schedule_policy = config.prefill_schedule_policy
         self.eos = config.eos
 
         self.num_sink_tokens = config.num_sink_tokens
@@ -62,6 +63,12 @@ class Scheduler:
         threshold = self._long_text_threshold(is_prefill)
         seq_len = seq.num_prompt_tokens if is_prefill else seq.num_tokens
         return int(seq_len) > int(threshold)
+
+    def _use_full_prefill_for_seq(self, seq: Sequence) -> bool:
+        return (
+            self.prefill_schedule_policy == "long_bs1full_short_batch"
+            and self._is_long_text(seq, is_prefill=True)
+        )
 
     def _pop_waiting_at(self, idx: int) -> Sequence:
         if idx == 0:
@@ -179,13 +186,28 @@ class Scheduler:
                 if remaining_prefill_tokens <= 0:
                     raise ValueError('BUG：理论上不应该在 waiting 里')
 
-                # 确定本次 Chunk 的大小
-                can_prefill_tokens = min(
-                    remaining_prefill_tokens,
-                    self.chunk_prefill_size,
-                    self.max_num_batched_tokens - num_batched_tokens,
-                    step_free_count,
-                )
+                use_full_prefill = self._use_full_prefill_for_seq(seq)
+                if use_full_prefill:
+                    if scheduled_seqs:
+                        self.waiting.appendleft(seq)
+                        break
+                    if remaining_prefill_tokens > step_free_count:
+                        raise RuntimeError(
+                            "Insufficient KV cache slots for long_bs1full_short_batch full prefill. "
+                            f"seq_id={seq.seq_id} prompt_len={seq.num_prompt_tokens} "
+                            f"remaining_prefill_tokens={remaining_prefill_tokens} free_slots={step_free_count} "
+                            f"method={self.config.vllm_sparse_method}. Reduce concurrency/max_model_len, "
+                            "increase gpu_memory_utilization, or use prefill_schedule_policy='all_chunked'."
+                        )
+                    can_prefill_tokens = remaining_prefill_tokens
+                else:
+                    # 确定本次 Chunk 的大小
+                    can_prefill_tokens = min(
+                        remaining_prefill_tokens,
+                        self.chunk_prefill_size,
+                        self.max_num_batched_tokens - num_batched_tokens,
+                        step_free_count,
+                    )
 
                 if can_prefill_tokens <= 0:
                     logger.debug(f'{can_prefill_tokens=} 结束 schedule prefill 请求')
@@ -291,6 +313,8 @@ class Scheduler:
                 step_free_count -= can_prefill_tokens
                 seq.status = SequenceStatus.RUNNING
                 scheduled_seqs.append(seq)
+                if use_full_prefill:
+                    break
 
         # 如果有 Prefill 请求被选中，直接返回，本次 step 只跑 Prefill。
         if scheduled_seqs:

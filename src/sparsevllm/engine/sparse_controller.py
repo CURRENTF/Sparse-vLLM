@@ -130,7 +130,12 @@ class SparseController:
         # DeltaKV: Always try to compress incrementally (to save memory during long prefill)
         if self.is_deltakv_family:
             if not self.is_deltakv_standalone_like:
-                assert self.config.chunk_prefill_accel_omnikv
+                if not self.config.chunk_prefill_accel_omnikv and not self._is_single_pass_prefill(seqs):
+                    raise RuntimeError(
+                        "DeltaKV chunked prefill requires chunk_prefill_accel_omnikv=True. "
+                        "Use prefill_schedule_policy='long_bs1full_short_batch' for long prompts "
+                        "that should run full prefill before one final DeltaKV compression."
+                    )
             self._deltakv_eviction(seqs)
             if self.is_deltakv_snapkv and any(seq.is_last_chunk_prefill for seq in seqs):
                 self._deltakv_snapkv_finalize(seqs)
@@ -145,6 +150,13 @@ class SparseController:
             self._snapkv_prefill_eviction(seqs)
         if self.sparse_method in ("streamingllm", "attention-sink", "attention_sink"):
             self._streamingllm_prefill_eviction(seqs)
+
+    @staticmethod
+    def _is_single_pass_prefill(seqs: list[Sequence]) -> bool:
+        return bool(seqs) and all(
+            int(seq.num_prefilled_tokens) == 0 and bool(seq.is_last_chunk_prefill)
+            for seq in seqs
+        )
 
     def get_read_view(self, layer_idx: int):
         """

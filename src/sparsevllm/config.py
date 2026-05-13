@@ -17,6 +17,8 @@ class Config:
     max_decoding_seqs: int = 64
 
     chunk_prefill_size: int = 8192
+    prefill_schedule_policy: str = "all_chunked"
+    mlp_seq_chunk_size: int = 0
     gpu_memory_utilization: float = 0.8
     tensor_parallel_size: int = 1
     enforce_eager: bool = True
@@ -122,6 +124,17 @@ class Config:
         if self.num_top_tokens_in_prefill is None:
             self.num_top_tokens_in_prefill = self.num_top_tokens
 
+        self.prefill_schedule_policy = str(self.prefill_schedule_policy or "").strip().lower()
+        valid_prefill_policies = {"all_chunked", "long_bs1full_short_batch"}
+        if self.prefill_schedule_policy not in valid_prefill_policies:
+            raise ValueError(
+                "prefill_schedule_policy must be one of "
+                f"{sorted(valid_prefill_policies)}, got {self.prefill_schedule_policy!r}."
+            )
+        self.mlp_seq_chunk_size = int(self.mlp_seq_chunk_size or 0)
+        if self.mlp_seq_chunk_size < 0:
+            raise ValueError(f"mlp_seq_chunk_size must be >= 0, got {self.mlp_seq_chunk_size}.")
+
         if not os.path.isdir(self.model):
             raise FileNotFoundError(f"Model directory does not exist: {self.model}")
         if not 1 <= self.tensor_parallel_size <= 8:
@@ -179,6 +192,18 @@ class Config:
         if isinstance(self.full_attn_layers, str):
             layers = self.full_attn_layers.strip()
             self.full_attn_layers = [] if not layers else [int(x) for x in layers.split(",")]
+
+        if (
+            self.prefill_schedule_policy == "all_chunked"
+            and isinstance(self.vllm_sparse_method, str)
+            and self.vllm_sparse_method.startswith("deltakv")
+        ):
+            logger.warning(
+                "DeltaKV with prefill_schedule_policy='all_chunked' compresses KV at prompt chunk "
+                "boundaries and may affect accuracy. Use "
+                "prefill_schedule_policy='long_bs1full_short_batch' to preserve full-prompt "
+                "prefill semantics for long inputs."
+            )
 
         if self.quest_chunk_size <= 0:
             raise ValueError("quest_chunk_size 必须 > 0")

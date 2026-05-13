@@ -96,7 +96,7 @@ class DeltaKVStandaloneCacheManager(DeltaKVCacheTritonManagerV4):
             rotary_dim=self.head_dim,
             max_position=self.max_model_len,
             base=self.hf_config.rope_theta,
-            rope_scaling=None,
+            rope_scaling=getattr(self.hf_config, "rope_scaling", None),
         ).cuda()
         self.cos_sin_cache = self.rotary_emb.cos_sin_cache
         self.cos_sin_dense = self.cos_sin_cache[:, 0, :]

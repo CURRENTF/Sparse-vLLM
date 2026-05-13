@@ -10,6 +10,7 @@ from sparsevllm.layers.layernorm import RMSNorm
 from sparsevllm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
 from sparsevllm.layers.rotary_embedding import get_rope
 from sparsevllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
+from sparsevllm.layers.seq_chunk import apply_seq_chunked, current_mlp_seq_chunk_size
 
 
 class Qwen2Attention(nn.Module):
@@ -104,11 +105,14 @@ class Qwen2MLP(nn.Module):
         assert hidden_act == "silu"
         self.act_fn = SiluAndMul()
 
-    def forward(self, x):
+    def _forward_impl(self, x):
         gate_up = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x = self.down_proj(x)
         return x
+
+    def forward(self, x):
+        return apply_seq_chunked(x, current_mlp_seq_chunk_size(), self._forward_impl)
 
 
 class Qwen2DecoderLayer(nn.Module):

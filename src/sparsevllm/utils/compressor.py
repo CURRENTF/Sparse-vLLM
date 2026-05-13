@@ -3,6 +3,8 @@ from torch import nn
 import torch.nn.functional as F
 from typing import Optional
 
+from sparsevllm.layers.seq_chunk import SeqChunkedModule
+
 
 class _SwiGLUCompressor(nn.Module):
     def __init__(self, input_size: int, intermediate_size: int, output_size: int, bias: bool = True):
@@ -68,13 +70,17 @@ def create_compressor(is_down: bool, config, bias_override: Optional[bool] = Non
         intermediate_size = (input_size + output_size) // 2
 
     if kind == "mlp_gelu":
-        return nn.Sequential(
+        module = nn.Sequential(
             nn.Linear(input_size, intermediate_size, bias=bias),
             nn.GELU(),
             nn.Linear(intermediate_size, output_size, bias=bias),
         )
+        chunk_size = int(getattr(config, "mlp_seq_chunk_size", 0) or 0)
+        return SeqChunkedModule(module, chunk_size) if chunk_size > 0 else module
 
     if kind == "mlp_swiglu":
-        return _SwiGLUCompressor(input_size, intermediate_size, output_size, bias=bias)
+        module = _SwiGLUCompressor(input_size, intermediate_size, output_size, bias=bias)
+        chunk_size = int(getattr(config, "mlp_seq_chunk_size", 0) or 0)
+        return SeqChunkedModule(module, chunk_size) if chunk_size > 0 else module
 
     raise ValueError(f"Unhandled compressor type after normalization: {kind}")

@@ -54,7 +54,7 @@ class ModelRunner:
         torch.set_default_device("cuda")
         
         # 加载对应的模型分片 (Shards)
-        if hf_config.model_type == "qwen2":
+        if hf_config.model_type in ("qwen2", "llama"):
             self.model = Qwen2ForCausalLM(hf_config)
         elif hf_config.model_type == "deepseek_v2":
             self.model = DeepSeekV2ForCausalLM(

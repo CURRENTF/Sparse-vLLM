@@ -85,7 +85,7 @@ class DeltaKVCacheManager(CacheManager):
             rotary_dim=self.head_dim,
             max_position=self.max_model_len,
             base=self.hf_config.rope_theta,
-            rope_scaling=None,
+            rope_scaling=getattr(self.hf_config, "rope_scaling", None),
         ).cuda()
         # cos_sin_cache shape: (max_pos, 1, head_dim) - 包含 (cos, sin)
         self.cos_sin_cache = self.rotary_emb.cos_sin_cache
