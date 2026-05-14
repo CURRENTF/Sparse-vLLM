@@ -81,7 +81,7 @@ partial-shard run is intentional, pass `--allow_missing_videos` explicitly.
 
 `vanilla` loads `LlavaOnevisionForConditionalGeneration`.
 
-`deltakv_delta_quant` loads the LLaVA DeltaKV wrapper with no learned
+`deltakv_delta_quant` loads the HF LLaVA DeltaKV wrapper with no learned
 compressor checkpoint:
 
 - `--deltakv_checkpoint_path none`
@@ -93,6 +93,11 @@ compressor checkpoint:
 
 The method uses cluster/ref reconstruction and direct token-space residual int4
 quantization.
+
+Backend policy: HF DeltaKV multimodal is intentionally limited to
+`batch_size=1` and should be used for experiment validation and numerical
+alignment. Batched and full-scale multimodal tests should use the
+`svllm_deltakv_delta_quant` Sparse-vLLM path.
 
 ## Full-Attention Baseline Protocol
 
@@ -362,10 +367,11 @@ The per-sample comparison checks question id, prediction, answer, correctness,
 status, raw prediction, input-token count, padded length, and video-token count.
 The prefetch run gives `1.21x` higher end-to-end examples/s on this small smoke.
 
-### 7B, Full 4000-Row DeltaKV KR/CR Sweep
+### 7B, Full 4000-Row HF DeltaKV KR/CR Validation Sweep
 
 This sweep uses the same full 4000-row `official_60s` StreamingBench scope as
-the dense baseline above:
+the dense baseline above. HF DeltaKV is `batch_size=1` by design; use this path
+for validation and the Sparse-vLLM path below for batched pressure tests.
 
 ```text
 model_path = /data2/haojitai/models/llava-onevision-qwen2-7b-ov-hf
@@ -377,7 +383,7 @@ tasks = livevlm_table4
 streamingbench_profile = official_60s
 num_video_frames = 32
 frame_sampling_backend = decord
-batch_size = 8
+batch_size = 1
 torch_dtype = float16
 attn_implementation = flash_attention_2
 choice_parse_mode = official_first_char
@@ -410,8 +416,9 @@ layers.
 | `kr33_center005_full` | `0` | `0.05` | 1024 | `32.50%` | `20.92%` | 2405 / 4000 | `60.125%` | `4.313` | `2.120` | `1.151` |
 | `kr33_full01_full` | `0,1` | `0.03` | 1024 | `33.14%` | `23.85%` | 2405 / 4000 | `60.125%` | `4.122` | `2.035` | `1.130` |
 
-The best accuracy among these full runs is tied across all four configurations.
-Use the lowest-budget tied configuration by default:
+The historical artifacts below record the KR/CR sweep. The current
+reproducible HF command uses the lowest-budget tied configuration and
+`batch_size=1`:
 
 ```bash
 CUDA_VISIBLE_DEVICES=6 PYTHONPATH=$PWD/src \
@@ -420,11 +427,11 @@ CUDA_VISIBLE_DEVICES=6 PYTHONPATH=$PWD/src \
   --model_path /data2/haojitai/models/llava-onevision-qwen2-7b-ov-hf \
   --dataset_dir /data2/haojitai/datasets/StreamingBench_hf \
   --video_dir /data2/haojitai/datasets/StreamingBench_hf/videos \
-  --output_dir /data2/haojitai/datasets/llava_onevision_streamingbench_deltakv_7b_official60_kr30_cr1024_full \
+  --output_dir /data2/haojitai/datasets/llava_onevision_streamingbench_deltakv_7b_official60_kr30_cr1024_full_hf_bs1 \
   --methods deltakv_delta_quant \
   --deltakv_checkpoint_path none \
   --num_samples -1 \
-  --batch_size 8 \
+  --batch_size 1 \
   --tasks livevlm_table4 \
   --streamingbench_profile official_60s \
   --frame_sampling_backend decord \
@@ -500,6 +507,30 @@ Complete subtask matrix read from the saved `*_aggregate_metrics.json` files:
 printed as visible subtasks in LiveVLM Table 4. The four full DeltaKV
 configurations in the KR/CR sweep produced the same correct counts for every
 subtask.
+
+Current refactor rerun evidence for the HF validation path:
+
+```text
+/data2/haojitai/datasets/llava_onevision_streamingbench_deltakv_7b_official60_kr30_cr1024_full_refactor_rerun_bs1_20260514_1425
+HF DeltaKV bs1: 2403 / 4000 = 60.075%, status_counts={"success": 4000}
+```
+
+### 7B, Full 4000-Row Sparse-vLLM DeltaKV Batched Validation
+
+Sparse-vLLM is the intended backend for batched multimodal pressure tests. The
+GPU6 `batch_size=8` run below used the same LiveVLM Table 4 `official_60s`
+scope and the same KR30/CR1024 settings:
+
+```text
+/data2/haojitai/datasets/llava_onevision_streamingbench_svllm_delta_quant_7b_livevlm_table4_official60_kr30_cr1024_bs8_full_gpu6_20260514_2008
+Sparse-vLLM DeltaKV bs8: 2407 / 4000 = 60.175%, status_counts={"success": 4000}
+Task stats: real 1837/2500 = 73.48%, omni 408/1000 = 40.80%, contextual 162/500 = 32.40%
+GPU summary: mean util 57.64%, p50 util 97%, max power 711.47W, max memory 79723 MiB
+```
+
+Compared with the HF bs1 refactor rerun, the row order matched exactly
+(`id_mismatch=0`), 14 predictions changed, and correctness transitions were
+8 `false -> true` and 4 `true -> false`.
 
 ### 7B, Official 60s/32-Frame Real-Time Visual Understanding, sample 201-250 shard
 

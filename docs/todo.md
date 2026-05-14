@@ -1,8 +1,1 @@
 让 cache manager 管理 rope module 或者其他位置编码相关的 module
-
-- multimodal 代码正确性验证：覆盖 LLaVA-OneVision / StreamingBench 路径，确认 vanilla、稀疏方法入口、输出解析和结果落盘都正常。
-  - 2026-05-14 已在 GPU6 做小样本 smoke：`llava-onevision-qwen2-0.5b-ov-hf`，StreamingBench `real`，`official_60s`，`num_samples=4`，`batch_size=1`，`vanilla,deltakv_delta_quant` 均为 4/4 `success`；输出目录 `/data2/haojitai/datasets/llava_onevision_streamingbench_refactor_multimodal_correctness_gpu6_bs1_20260514_141533`。
-  - 已发现限制：HF DeltaKV multimodal 路径在 `batch_size=2` 会显式报错 `HF DeltaKV supports batch_size=1 only; use Sparse-vLLM for batched inference.`；`vanilla` 的 batch=2 路径已成功跑通。
-  - 2026-05-14 已在 GPU6 做 7B full StreamingBench/LiveVLM Table4 `official_60s` DeltaKV KR30/CR1024 重跑：旧文档 `batch_size=8` 命令当前因 HF bs1 assert 失败；改用 `batch_size=1` 后 4000/4000 `success`，2403/4000 = 60.075%，和旧 full DeltaKV 2405/4000 = 60.125% 相差 -0.05 个百分点；输出目录 `/data2/haojitai/datasets/llava_onevision_streamingbench_deltakv_7b_official60_kr30_cr1024_full_refactor_rerun_bs1_20260514_1425`。
-  - 2026-05-14 已在 GPU6 验证 Sparse-vLLM LLaVA-OneVision batched 路径：0.5B `batch_size=2`/4-frame smoke 2/2 `success`，7B `batch_size=2`/4-frame smoke 2/2 `success`，7B `official_60s`/32-frame smoke 2/2 `success`；official_60s 前 2 条预测 `D,C` 与 HF bs1 DeltaKV refactor full run 一致；official_60s 输出目录 `/data2/haojitai/datasets/llava_onevision_streamingbench_svllm_delta_quant_7b_official60_bs2_smoke_20260514_1658`，复现脚本 `scripts/benchmarks/streamingbench_official_60s_llava_onevision_7b_svllm_deltakv_delta_quant_bs2_smoke.sh`。
-  - 仍需修复或重新定义 HF DeltaKV multimodal 的 batch>1 行为；当前 full bs1 结果证明数值基本对齐，但旧 docs 的 `batch_size=8` 可复现实验命令不再可直接运行。

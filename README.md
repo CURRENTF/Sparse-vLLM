@@ -87,6 +87,8 @@ For LLaVA-OneVision visual-token experiments, see
 [`docs/llava-onevision-visual-cache-benchmarks.md`](docs/llava-onevision-visual-cache-benchmarks.md).
 The no-checkpoint keep-ratio path is a visual-token uniform-pruning baseline,
 not DeltaKV cluster/compressor inference.
+For multimodal DeltaKV, the HF backend intentionally supports `batch_size=1`
+for experiment validation; use Sparse-vLLM for batched and full-scale runs.
 
 **Common knobs**
 

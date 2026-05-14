@@ -4,8 +4,9 @@
 
 This change reduces the complexity of `src/deltakv/modeling/` and removes the
 HF batched-inference attempt. HF DeltaKV now intentionally supports only
-batch size 1, while batched inference and future benchmark work should use the
-Sparse-vLLM backend.
+batch size 1 for experiment validation and numerical alignment, while batched
+inference, full-scale tests, and future multimodal benchmark work should use
+the Sparse-vLLM backend.
 
 The previous modeling tree had many near-duplicate cache and model files for
 different experimental branches. The refactor keeps the active research paths,

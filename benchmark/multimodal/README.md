@@ -36,3 +36,7 @@ The current implemented adapter is `model_adapters/llava_onevision.py`. The
 `model_adapters/qwen3_vl.py` file is intentionally a fail-fast placeholder so
 Qwen3-VL support can be added without copying StreamingBench or Video-MME
 dataset logic.
+
+For LLaVA-OneVision DeltaKV, the HF adapter is intentionally `batch_size=1`
+only and is used for experiment validation. Batched and full-scale multimodal
+runs should use the Sparse-vLLM adapter path.
