@@ -10,6 +10,7 @@ from sparsevllm.config import Config
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.models.qwen2 import Qwen2ForCausalLM
 from sparsevllm.models.qwen3 import Qwen3ForCausalLM
+from sparsevllm.models.llava_onevision import LlavaOnevisionForCausalLM
 from sparsevllm.models.deepseek_v2 import DeepSeekV2ForCausalLM
 from sparsevllm.layers.sampler import Sampler
 from sparsevllm.utils.context import set_context, get_context, reset_context
@@ -54,7 +55,9 @@ class ModelRunner:
         torch.set_default_device("cuda")
         
         # 加载对应的模型分片 (Shards)
-        if hf_config.model_type in ("qwen2", "llama"):
+        if hf_config.model_type == "llava_onevision":
+            self.model = LlavaOnevisionForCausalLM(hf_config)
+        elif hf_config.model_type in ("qwen2", "llama"):
             self.model = Qwen2ForCausalLM(hf_config)
         elif hf_config.model_type == "deepseek_v2":
             self.model = DeepSeekV2ForCausalLM(
@@ -82,10 +85,16 @@ class ModelRunner:
 
         # 初始化稀疏控制器
         self.sparse_controller = SparseController(config, self.cache_manager)
-        # 注入模型 (Qwen-style models only; DeepSeek MLA does not use SparseController callbacks)
+        # 注入模型 (Qwen-style text backbones only; DeepSeek MLA does not use SparseController callbacks)
+        text_backbone = None
         if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
-            self.model.model.sparse_controller = self.sparse_controller
-            self.sparse_controller.set_modules(self.model.model.layers)
+            text_backbone = self.model.model
+        elif hasattr(self.model, "language_model") and hasattr(self.model.language_model, "model"):
+            if hasattr(self.model.language_model.model, "layers"):
+                text_backbone = self.model.language_model.model
+        if text_backbone is not None:
+            text_backbone.sparse_controller = self.sparse_controller
+            self.sparse_controller.set_modules(text_backbone.layers)
 
         # 加载 DeltaKV 压缩器
         self.load_deltakv_compressors()
@@ -212,13 +221,28 @@ class ModelRunner:
     def prepare_step(self, seqs: list[Sequence], is_prefill: bool):
         """准备前向上下文并设置 Context"""
         input_ids, positions, cu_seqlens_q = self.cache_manager.prepare_step(seqs, is_prefill)
+        inputs_embeds = None
+        if is_prefill and any(seq.prompt_embeds is not None for seq in seqs):
+            if not all(seq.prompt_embeds is not None for seq in seqs):
+                raise ValueError("Cannot mix prompt-embedding and token-id-only sequences in one prefill batch.")
+            embed_chunks = []
+            for seq in seqs:
+                start_idx = seq.num_prefilled_tokens
+                end_idx = start_idx + seq.current_chunk_size
+                embed_chunks.append(seq.prompt_embeds[start_idx:end_idx])
+            inputs_embeds = torch.cat(embed_chunks, dim=0).to(device=input_ids.device, non_blocking=True)
+            if inputs_embeds.shape[0] != input_ids.shape[0]:
+                raise ValueError(
+                    "Prepared prompt embeddings do not match flattened input token count: "
+                    f"{inputs_embeds.shape[0]} != {input_ids.shape[0]}"
+                )
         set_context(
             is_prefill,
             cu_seqlens_q=cu_seqlens_q,
             cache_manager=self.cache_manager,
             is_long_text=self._is_long_text_batch(seqs, is_prefill),
         )
-        return input_ids, positions
+        return input_ids, positions, inputs_embeds
 
     def prepare_sample(self, seqs: list[Sequence]):
         """准备采样超参数"""
@@ -226,11 +250,38 @@ class ModelRunner:
         return torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
 
     @torch.inference_mode()
-    def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
+    def run_model(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        is_prefill: bool,
+        inputs_embeds: torch.Tensor | None = None,
+    ):
         """物理执行逻辑：统一使用 Eager 模式"""
         _stage = 'prefill' if is_prefill else 'decode'
         with profiler.record(f"model_run_model_{_stage}"):
-            return self.model.compute_logits(self.model(input_ids, positions))
+            return self.model.compute_logits(self.model(input_ids, positions, inputs_embeds=inputs_embeds))
+
+    def _move_multimodal_inputs_to_cuda(self, inputs: dict) -> dict:
+        moved = {}
+        dtype = self.config.hf_config.torch_dtype
+        for key, value in inputs.items():
+            if torch.is_tensor(value):
+                if value.is_floating_point():
+                    moved[key] = value.to(device="cuda", dtype=dtype, non_blocking=True)
+                else:
+                    moved[key] = value.to(device="cuda", non_blocking=True)
+            else:
+                moved[key] = value
+        return moved
+
+    def prepare_multimodal_prompts(self, inputs: dict):
+        if self.world_size != 1:
+            raise ValueError("Sparse-vLLM multimodal prompt embeddings currently require tensor_parallel_size=1.")
+        if not hasattr(self.model, "prepare_prompt_embeds"):
+            raise ValueError(f"Model {type(self.model).__name__} does not support multimodal prompt embeddings.")
+        inputs = self._move_multimodal_inputs_to_cuda(dict(inputs))
+        return self.model.prepare_prompt_embeds(inputs)
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> tuple[list[int], torch.Tensor | None]:
         """单步执行主逻辑"""
@@ -238,7 +289,7 @@ class ModelRunner:
         with profiler.record(name):
             # 1. 准备前向上下文
             ctx = get_context()
-            input_ids, positions = self.prepare_step(seqs, is_prefill)
+            input_ids, positions, inputs_embeds = self.prepare_step(seqs, is_prefill)
             
             # 2. 准备稀疏化状态
             with profiler.record("model_sparse_prepare"):
@@ -248,7 +299,7 @@ class ModelRunner:
             temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
             
             # 3. 前向计算
-            logits = self.run_model(input_ids, positions, is_prefill)
+            logits = self.run_model(input_ids, positions, is_prefill, inputs_embeds=inputs_embeds)
             
             # 4. Token 采样 (仅 Rank 0)
             with profiler.record("model_sampler"):

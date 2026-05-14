@@ -197,6 +197,11 @@ def parse_args():
     parser.add_argument("--delta_quant_bits", type=int, default=4, choices=[4])
     parser.add_argument("--deltakv_center_ratio", type=float, default=0.1)
     parser.add_argument("--deltakv_neighbor_count", type=int, default=1)
+    parser.add_argument("--svllm_chunk_prefill_size", type=int, default=8192)
+    parser.add_argument("--svllm_max_num_batched_tokens", type=int, default=65536)
+    parser.add_argument("--svllm_max_num_seqs_in_batch", type=int, default=32)
+    parser.add_argument("--svllm_gpu_memory_utilization", type=float, default=0.8)
+    parser.add_argument("--svllm_mlp_seq_chunk_size", type=int, default=0)
     parser.add_argument("--frame_cache_dir", default="")
     parser.add_argument("--reuse_frame_cache", action="store_true")
     parser.add_argument(
@@ -269,6 +274,16 @@ def validate_args(args) -> None:
         raise ValueError("--visual_keep_ratio must be in (0, 1].")
     if args.deltakv_center_ratio <= 0.0 or args.deltakv_center_ratio > 1.0:
         raise ValueError("--deltakv_center_ratio must be in (0, 1].")
+    if args.svllm_chunk_prefill_size < 1:
+        raise ValueError("--svllm_chunk_prefill_size must be >= 1.")
+    if args.svllm_max_num_batched_tokens < 1:
+        raise ValueError("--svllm_max_num_batched_tokens must be >= 1.")
+    if args.svllm_max_num_seqs_in_batch < 1:
+        raise ValueError("--svllm_max_num_seqs_in_batch must be >= 1.")
+    if args.svllm_gpu_memory_utilization <= 0.0 or args.svllm_gpu_memory_utilization > 1.0:
+        raise ValueError("--svllm_gpu_memory_utilization must be in (0, 1].")
+    if args.svllm_mlp_seq_chunk_size < 0:
+        raise ValueError("--svllm_mlp_seq_chunk_size must be >= 0.")
     for name in (
         "recent_keep_tokens",
         "sink_keep_tokens",
@@ -931,6 +946,11 @@ def build_run_info(args, dataset_info: dict, row_count: int) -> dict:
             "delta_quant_bits": args.delta_quant_bits,
             "deltakv_center_ratio": args.deltakv_center_ratio,
             "deltakv_neighbor_count": args.deltakv_neighbor_count,
+            "svllm_chunk_prefill_size": args.svllm_chunk_prefill_size,
+            "svllm_max_num_batched_tokens": args.svllm_max_num_batched_tokens,
+            "svllm_max_num_seqs_in_batch": args.svllm_max_num_seqs_in_batch,
+            "svllm_gpu_memory_utilization": args.svllm_gpu_memory_utilization,
+            "svllm_mlp_seq_chunk_size": args.svllm_mlp_seq_chunk_size,
             "chunk_prefill_accel_omnikv": bool(args.chunk_prefill_accel_omnikv),
             "frame_load_workers": args.frame_load_workers,
             "preprocess_prefetch_batches": args.preprocess_prefetch_batches,
@@ -1133,7 +1153,9 @@ def save_method_artifacts(output_dir: Path, result: dict, run_info: dict):
 def run_method(method: str, model, processor, rows: list[dict], args, dtype, device, policy=None):
     from benchmark.multimodal.model_adapters.llava_onevision import batch_to_device, ensure_left_padding
 
-    torch.cuda.reset_peak_memory_stats(device)
+    is_sparsevllm = policy is not None and policy.get("backend") == "sparsevllm"
+    generation_device = getattr(model, "svllm_device", device)
+    torch.cuda.reset_peak_memory_stats(generation_device)
     records = []
     total_new_tokens = 0
     total_time = 0.0
@@ -1210,18 +1232,32 @@ def run_method(method: str, model, processor, rows: list[dict], args, dtype, dev
             total_frame_load_time += frame_load_elapsed
             total_prompt_time += prompt_elapsed
             total_processor_time += processor_elapsed
-            inputs = batch_to_device(inputs, device, dtype)
+            inputs = batch_to_device(inputs, generation_device, dtype)
 
-            torch.cuda.synchronize(device)
+            torch.cuda.synchronize(generation_device)
             start = time.perf_counter()
-            output_ids = model.generate(
-                **inputs,
-                max_new_tokens=args.max_new_tokens,
-                do_sample=False,
-                use_cache=True,
-                pad_token_id=getattr(processor.tokenizer, "pad_token_id", None),
-            )
-            torch.cuda.synchronize(device)
+            if is_sparsevllm:
+                from sparsevllm import SamplingParams
+
+                svllm_outputs = model.generate_multimodal(
+                    dict(inputs),
+                    SamplingParams(max_tokens=args.max_new_tokens, temperature=0.0),
+                    use_tqdm=False,
+                )
+                decoded_batch = [item["text"] for item in svllm_outputs]
+                new_tokens_by_sample = [len(item["token_ids"]) for item in svllm_outputs]
+            else:
+                output_ids = model.generate(
+                    **inputs,
+                    max_new_tokens=args.max_new_tokens,
+                    do_sample=False,
+                    use_cache=True,
+                    pad_token_id=getattr(processor.tokenizer, "pad_token_id", None),
+                )
+                generated_ids = output_ids[:, input_len:]
+                decoded_batch = processor.batch_decode(generated_ids, skip_special_tokens=True)
+                new_tokens_by_sample = [int(generated_ids.shape[1])] * len(batch_rows)
+            torch.cuda.synchronize(generation_device)
             elapsed = time.perf_counter() - start
 
             if prefetch_executor is not None and next_pending is not None:
@@ -1230,10 +1266,7 @@ def run_method(method: str, model, processor, rows: list[dict], args, dtype, dev
                 total_preprocess_wait_time += time.perf_counter() - wait_start
                 next_pending = ReadyBatch(next_prepared)
 
-            generated_ids = output_ids[:, input_len:]
-            decoded_batch = processor.batch_decode(generated_ids, skip_special_tokens=True)
-            new_tokens = int(generated_ids.shape[1])
-            batch_new_tokens = new_tokens * len(batch_rows)
+            batch_new_tokens = sum(new_tokens_by_sample)
             total_new_tokens += batch_new_tokens
             total_time += elapsed
             total_batches += 1
@@ -1247,6 +1280,7 @@ def run_method(method: str, model, processor, rows: list[dict], args, dtype, dev
                 status = status_for_prediction(prediction)
                 correct = prediction == row["answer"]
                 context_start, context_end = context_bounds(row, args)
+                new_tokens = int(new_tokens_by_sample[offset])
                 records.append(
                     {
                         "status": status,
@@ -1328,7 +1362,7 @@ def run_method(method: str, model, processor, rows: list[dict], args, dtype, dev
         "end_to_end_examples_per_s": len(records) / wall_time if wall_time > 0 else 0.0,
         "mean_batch_seconds": total_time / max(total_batches, 1),
         "mean_seconds": total_time / total,
-        "peak_memory_gb": torch.cuda.max_memory_allocated(device) / (1024**3),
+        "peak_memory_gb": torch.cuda.max_memory_allocated(generation_device) / (1024**3),
         "accuracy": sum(record["correct"] for record in records) / total,
         "accuracy_pct": 100.0 * sum(record["correct"] for record in records) / total,
         "task_stats": task_stats,
@@ -1362,8 +1396,13 @@ def iter_methods(methods: str):
             yield "vanilla", "vanilla"
         elif method in {"deltakv_delta_quant", "delta_quant", "llava_deltakv_delta_quant"}:
             yield raw_method, "deltakv_delta_quant"
+        elif method in {"svllm_deltakv_delta_quant", "sparsevllm_deltakv_delta_quant"}:
+            yield raw_method, "svllm_deltakv_delta_quant"
         else:
-            raise ValueError("StreamingBench script currently supports methods: vanilla, deltakv_delta_quant.")
+            raise ValueError(
+                "StreamingBench script currently supports methods: "
+                "vanilla, deltakv_delta_quant, svllm_deltakv_delta_quant."
+            )
 
 
 def main():
@@ -1405,16 +1444,23 @@ def main():
             model = load_vanilla_model(args, dtype, device)
             method_label = "vanilla"
             policy = None
-        else:
+        elif method_kind == "deltakv_delta_quant":
             from benchmark.multimodal.model_adapters.llava_onevision import load_llava_delta_quant_model
 
             model, policy = load_llava_delta_quant_model(args, dtype, device)
+            method_label = policy["method"]
+        else:
+            from benchmark.multimodal.model_adapters.llava_onevision import load_svllm_delta_quant_model
+
+            model, policy = load_svllm_delta_quant_model(args, dtype, device)
             method_label = policy["method"]
 
         result = run_method(method_label, model, processor, rows, args, dtype, device, policy=policy)
         result["requested_method"] = requested_method
         result["dataset_info"] = dataset_info
         results.append(result)
+        if hasattr(model, "exit"):
+            model.exit()
         del model
         gc.collect()
         torch.cuda.empty_cache()

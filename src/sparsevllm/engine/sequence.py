@@ -1,7 +1,7 @@
-import torch
 from copy import copy
 from enum import Enum, auto
 from itertools import count
+import torch
 
 from sparsevllm.sampling_params import SamplingParams
 
@@ -16,7 +16,12 @@ class SequenceStatus(Enum):
 class Sequence:
     counter = count()
 
-    def __init__(self, token_ids: list[int], sampling_params = SamplingParams()):
+    def __init__(
+        self,
+        token_ids: list[int],
+        sampling_params = SamplingParams(),
+        prompt_embeds: torch.Tensor | None = None,
+    ):
         self.seq_id = next(Sequence.counter)
         self.status = SequenceStatus.WAITING
         self.token_ids = copy(token_ids)
@@ -29,6 +34,12 @@ class Sequence:
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
+        self.prompt_embeds = prompt_embeds
+        if self.prompt_embeds is not None and self.prompt_embeds.shape[0] != self.num_prompt_tokens:
+            raise ValueError(
+                "prompt_embeds first dimension must match prompt token count: "
+                f"{self.prompt_embeds.shape[0]} != {self.num_prompt_tokens}"
+            )
 
     def __len__(self):
         return self.num_tokens
@@ -74,6 +85,11 @@ class Sequence:
 
     def __getstate__(self):
         # 优化 IPC：不发送 slot_mapping，只发送元数据和必要的 token
+        if self.prompt_embeds is not None:
+            raise ValueError(
+                "Multimodal prompt embeddings cannot be pickled for tensor-parallel workers. "
+                "Use tensor_parallel_size=1 for Sparse-vLLM multimodal generation."
+            )
         if self.num_completion_tokens == 0:
             chunk_size = self.current_chunk_size if self.current_chunk_size is not None else self.num_prompt_tokens
             data = self.token_ids[self.num_prefilled_tokens : self.num_prefilled_tokens + chunk_size]

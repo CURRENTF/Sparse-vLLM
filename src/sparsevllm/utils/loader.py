@@ -11,6 +11,13 @@ def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
     param.data.copy_(loaded_weight)
 
 
+def _try_get_parameter(model: nn.Module, param_name: str) -> nn.Parameter | None:
+    try:
+        return model.get_parameter(param_name)
+    except AttributeError:
+        return None
+
+
 def _translate_deepseek_weight_name(model: nn.Module, weight_name: str) -> str | None:
     if getattr(model, "hf_model_type", "") not in ("deepseek_v2", "deepseek_v32"):
         return None
@@ -470,20 +477,25 @@ def load_model(model: nn.Module, path: str, *, rank: int | None = None, world_si
         with safe_open(file, "pt", "cpu") as f:
             for source_weight_name in f.keys():
                 param_name = _translate_deepseek_weight_name(model, source_weight_name) or source_weight_name
+                packed = False
                 for k in packed_modules_mapping:
                     if k in param_name:
                         v, shard_id = packed_modules_mapping[k]
                         packed_param_name = param_name.replace(k, v)
-                        param = model.get_parameter(packed_param_name)
+                        param = _try_get_parameter(model, packed_param_name)
+                        if param is None:
+                            continue
                         weight_loader = getattr(param, "weight_loader")
                         weight_loader(param, f.get_tensor(source_weight_name), shard_id)
                         loaded_count += 1
+                        packed = True
                         break
-                else:
-                    param = model.get_parameter(param_name)
-                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                    weight_loader(param, f.get_tensor(source_weight_name))
-                    loaded_count += 1
+                if packed:
+                    continue
+                param = model.get_parameter(param_name)
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, f.get_tensor(source_weight_name))
+                loaded_count += 1
     
     assert loaded_count > 0, f"No weights were loaded from {path}"
     print(f"Successfully loaded {loaded_count} weights from {path}")

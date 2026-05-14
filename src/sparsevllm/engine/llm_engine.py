@@ -4,6 +4,7 @@ from time import perf_counter
 import threading
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, Qwen2Tokenizer
+import torch
 import torch.multiprocessing as mp
 from sparsevllm.utils.log import logger
 import sys
@@ -255,9 +256,16 @@ class LLMEngine:
                     p.terminate()
                 p.join()
 
-    def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
+    def add_request(
+        self,
+        prompt: str | list[int],
+        sampling_params: SamplingParams,
+        prompt_embeds: torch.Tensor | None = None,
+    ):
         """将一个新的推理请求加入系统"""
         if isinstance(prompt, str):
+            if prompt_embeds is not None:
+                raise ValueError("prompt_embeds can only be used with token-id prompts, not string prompts.")
             prompt = self.tokenizer.encode(prompt)
         prompt_len = len(prompt)
         max_tokens = sampling_params.max_tokens
@@ -268,7 +276,7 @@ class LLMEngine:
                 "Reduce prompt/decoding length or increase max_model_len if the model supports it."
             )
         logger.debug(f'add prompt with {len(prompt)} tokens.')
-        seq = Sequence(prompt, sampling_params)
+        seq = Sequence(prompt, sampling_params, prompt_embeds=prompt_embeds)
         self.scheduler.add(seq)
 
     def step(self):
@@ -420,6 +428,68 @@ class LLMEngine:
         results = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
         results = [{"text": self.tokenizer.decode(tids, skip_special_tokens=True), "token_ids": tids} for tids in results]
         
+        if use_tqdm:
+            pbar.close()
+        return results
+
+    def generate_multimodal(
+        self,
+        inputs: dict,
+        sampling_params: SamplingParams | list[SamplingParams],
+        use_tqdm: bool = True,
+    ) -> list[dict]:
+        """Generate from padded multimodal processor inputs.
+
+        The model prepares prompt embeddings once per request batch, then the
+        normal Sparse-vLLM scheduler/cache/attention path handles prefill and decode.
+        """
+        if self.config.tensor_parallel_size != 1:
+            raise ValueError("generate_multimodal currently requires tensor_parallel_size=1.")
+        if not hasattr(self.model_runner.model, "prepare_prompt_embeds"):
+            raise ValueError(f"Model {type(self.model_runner.model).__name__} does not support multimodal inputs.")
+
+        token_id_lists, prompt_embeds = self.model_runner.call("prepare_multimodal_prompts", inputs)
+        if len(token_id_lists) != len(prompt_embeds):
+            raise ValueError("Prepared multimodal token/embedding batch has mismatched lengths.")
+
+        if use_tqdm:
+            pbar = tqdm(total=len(token_id_lists), desc="Generating", dynamic_ncols=True)
+
+        if not isinstance(sampling_params, list):
+            sampling_params = [sampling_params] * len(token_id_lists)
+        if len(sampling_params) != len(token_id_lists):
+            raise ValueError(
+                f"sampling_params length must match batch size: {len(sampling_params)} != {len(token_id_lists)}"
+            )
+
+        for prompt, embeds, sp in zip(token_id_lists, prompt_embeds, sampling_params):
+            self.add_request(prompt, sp, prompt_embeds=embeds)
+
+        outputs = {}
+        prefill_throughput = decode_throughput = 0.0
+        while not self.is_finished():
+            t = perf_counter()
+            output, num_tokens = self.step()
+
+            if use_tqdm:
+                dt = perf_counter() - t
+                if num_tokens > 0:
+                    prefill_throughput = num_tokens / dt
+                else:
+                    decode_throughput = -num_tokens / dt
+                pbar.set_postfix({
+                    "Prefill": f"{int(prefill_throughput)}tok/s",
+                    "Decode": f"{int(decode_throughput)}tok/s",
+                })
+
+            for seq_id, token_ids in output:
+                outputs[seq_id] = token_ids
+                if use_tqdm:
+                    pbar.update(1)
+
+        results = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
+        results = [{"text": self.tokenizer.decode(tids, skip_special_tokens=True), "token_ids": tids} for tids in results]
+
         if use_tqdm:
             pbar.close()
         return results

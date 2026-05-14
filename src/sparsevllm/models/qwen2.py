@@ -179,8 +179,17 @@ class Qwen2Model(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
+        inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        hidden_states = self.embed_tokens(input_ids)
+        if inputs_embeds is not None:
+            if inputs_embeds.shape[0] != input_ids.shape[0]:
+                raise ValueError(
+                    "inputs_embeds and input_ids must have the same flattened token count: "
+                    f"{inputs_embeds.shape[0]} != {input_ids.shape[0]}"
+                )
+            hidden_states = inputs_embeds
+        else:
+            hidden_states = self.embed_tokens(input_ids)
         residual = None
         context = get_context()
         
@@ -219,8 +228,9 @@ class Qwen2ForCausalLM(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
+        inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return self.model(input_ids, positions)
+        return self.model(input_ids, positions, inputs_embeds=inputs_embeds)
 
     def compute_logits(
         self,

@@ -23,6 +23,7 @@ class Config:
     tensor_parallel_size: int = 1
     enforce_eager: bool = True
     hf_config: Union[Qwen3Config, AutoConfig] | None = None
+    torch_dtype: Union[str, torch.dtype, None] = None
     eos: int = -1
     num_kvcache_slots: int | list = -1
 
@@ -178,6 +179,39 @@ class Config:
                 )
             self.hf_config = SimpleNamespace(**cfg)
 
+        if self.torch_dtype is not None:
+            dtype_name = str(self.torch_dtype).replace("torch.", "").lower()
+            if dtype_name in ("bfloat16", "bf16"):
+                resolved_dtype = torch.bfloat16
+            elif dtype_name in ("float16", "fp16", "half"):
+                resolved_dtype = torch.float16
+            elif dtype_name in ("float32", "fp32"):
+                resolved_dtype = torch.float32
+            else:
+                raise ValueError(f"Unsupported torch_dtype={self.torch_dtype!r}.")
+            self.torch_dtype = resolved_dtype
+            self.hf_config.torch_dtype = resolved_dtype
+            if hasattr(self.hf_config, "text_config"):
+                self.hf_config.text_config.torch_dtype = resolved_dtype
+
+        if getattr(self.hf_config, "model_type", "") == "llava_onevision":
+            text_config = getattr(self.hf_config, "text_config", None)
+            if text_config is None:
+                raise ValueError("LLaVA-OneVision config is missing text_config.")
+            for attr in (
+                "max_position_embeddings",
+                "hidden_size",
+                "intermediate_size",
+                "num_attention_heads",
+                "num_key_value_heads",
+                "num_hidden_layers",
+                "rope_theta",
+                "rope_scaling",
+                "vocab_size",
+            ):
+                if not hasattr(self.hf_config, attr) and hasattr(text_config, attr):
+                    setattr(self.hf_config, attr, getattr(text_config, attr))
+
         # DeepSeek-V3.2 defaults: keep engine-side DSA knobs aligned unless explicitly set.
         if getattr(self.hf_config, "model_type", "") == "deepseek_v32":
             if self.dsa_topk == 2048 and hasattr(self.hf_config, "index_topk"):
@@ -185,6 +219,8 @@ class Config:
         if self.max_model_len > self.hf_config.max_position_embeddings:
             logger.warning('max_model_len > model.max_position_embeddings 输出可能不正常')
             self.hf_config.max_position_embeddings = self.max_model_len
+            if hasattr(self.hf_config, "text_config"):
+                self.hf_config.text_config.max_position_embeddings = self.max_model_len
 
         if self.max_num_seqs_in_batch > 32:
             logger.warning('max_num_seqs_in_batch 过大或许会占用太多显存')
