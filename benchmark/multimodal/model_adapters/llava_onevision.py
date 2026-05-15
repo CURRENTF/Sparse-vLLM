@@ -35,6 +35,8 @@ def build_svllm_delta_quant_policy(args):
 
 
 def load_svllm_delta_quant_model(args, dtype, device):
+    if getattr(args, "stride_alpha", None) not in {None, 0.0}:
+        raise ValueError("SVLLM DeltaKV delta-quant does not support dynamic stride; use HF backend for stride_alpha.")
     if resolve_compressor_path(args) is not None:
         raise ValueError(
             "svllm_deltakv_delta_quant does not use a learned compressor checkpoint. "
@@ -72,6 +74,7 @@ def load_svllm_delta_quant_model(args, dtype, device):
         engine_prefill_chunk_size=args.svllm_chunk_prefill_size,
         max_num_batched_tokens=args.svllm_max_num_batched_tokens,
         max_num_seqs_in_batch=args.svllm_max_num_seqs_in_batch,
+        max_decoding_seqs=args.svllm_max_decoding_seqs,
         gpu_memory_utilization=args.svllm_gpu_memory_utilization,
         mlp_seq_chunk_size=args.svllm_mlp_seq_chunk_size,
         prefill_schedule_policy="long_bs1full_short_batch",

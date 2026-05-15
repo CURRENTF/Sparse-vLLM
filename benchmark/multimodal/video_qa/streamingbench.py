@@ -25,6 +25,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from benchmark.multimodal.common.hyper_params import (
+    add_multimodal_hyper_param_arg,
+    apply_multimodal_hyper_params,
+)
+
 TASK_CSV_FILES = {
     "real": "Real_Time_Visual_Understanding.csv",
     "omni": "Omni_Source_Understanding.csv",
@@ -181,6 +186,7 @@ def parse_args():
     parser.add_argument("--cuda_device", type=int, default=7)
     parser.add_argument("--torch_dtype", default="bfloat16", choices=["bfloat16", "float16"])
     parser.add_argument("--attn_implementation", default="flash_attention_2")
+    add_multimodal_hyper_param_arg(parser)
     parser.add_argument(
         "--image_processor_use_fast",
         action="store_true",
@@ -197,13 +203,33 @@ def parse_args():
     parser.add_argument("--delta_quant_bits", type=int, default=4, choices=[4])
     parser.add_argument("--deltakv_center_ratio", type=float, default=0.1)
     parser.add_argument("--deltakv_neighbor_count", type=int, default=1)
+    parser.add_argument(
+        "--stride_alpha",
+        type=float,
+        default=None,
+        help="Dynamic DeltaKV center stride alpha. Defaults to checkpoint value for deltakv and 0.0 for delta_quant.",
+    )
     parser.add_argument("--svllm_chunk_prefill_size", type=int, default=8192)
     parser.add_argument("--svllm_max_num_batched_tokens", type=int, default=65536)
     parser.add_argument("--svllm_max_num_seqs_in_batch", type=int, default=32)
+    parser.add_argument("--svllm_max_decoding_seqs", type=int, default=64)
     parser.add_argument("--svllm_gpu_memory_utilization", type=float, default=0.8)
     parser.add_argument("--svllm_mlp_seq_chunk_size", type=int, default=0)
     parser.add_argument("--frame_cache_dir", default="")
     parser.add_argument("--reuse_frame_cache", action="store_true")
+    parser.add_argument(
+        "--ffmpeg_fallback_on_decord_error",
+        action="store_true",
+        help="If decord frame extraction fails, retry by extracting individual frames with ffmpeg.",
+    )
+    parser.add_argument(
+        "--official_clip_fallback_on_decord_error",
+        action="store_true",
+        help=(
+            "If decord frame extraction fails, retry by first re-encoding the context clip with "
+            "the StreamingBench-style ffmpeg path, then sampling that clip with decord."
+        ),
+    )
     parser.add_argument(
         "--frame_load_workers",
         type=int,
@@ -230,7 +256,7 @@ def parse_args():
     )
     parser.add_argument("--log_every", type=int, default=1)
     parser.add_argument("--print_records", action="store_true")
-    return parser.parse_args()
+    return apply_multimodal_hyper_params(parser.parse_args())
 
 
 def apply_streamingbench_profile(args):
@@ -274,12 +300,18 @@ def validate_args(args) -> None:
         raise ValueError("--visual_keep_ratio must be in (0, 1].")
     if args.deltakv_center_ratio <= 0.0 or args.deltakv_center_ratio > 1.0:
         raise ValueError("--deltakv_center_ratio must be in (0, 1].")
+    if args.stride_alpha is not None and args.stride_alpha < 0.0:
+        raise ValueError("--stride_alpha must be non-negative.")
+    if args.delta_quant_bits != 4:
+        raise ValueError("--delta_quant_bits currently supports only 4 for multimodal direct residual quantization.")
     if args.svllm_chunk_prefill_size < 1:
         raise ValueError("--svllm_chunk_prefill_size must be >= 1.")
     if args.svllm_max_num_batched_tokens < 1:
         raise ValueError("--svllm_max_num_batched_tokens must be >= 1.")
     if args.svllm_max_num_seqs_in_batch < 1:
         raise ValueError("--svllm_max_num_seqs_in_batch must be >= 1.")
+    if args.svllm_max_decoding_seqs < 1:
+        raise ValueError("--svllm_max_decoding_seqs must be >= 1.")
     if args.svllm_gpu_memory_utilization <= 0.0 or args.svllm_gpu_memory_utilization > 1.0:
         raise ValueError("--svllm_gpu_memory_utilization must be in (0, 1].")
     if args.svllm_mlp_seq_chunk_size < 0:
@@ -295,6 +327,11 @@ def validate_args(args) -> None:
             raise ValueError(f"--{name} must be non-negative.")
     if args.hf_prefill_chunk_size < 1:
         raise ValueError("--hf_prefill_chunk_size must be >= 1.")
+    if args.ffmpeg_fallback_on_decord_error and args.official_clip_fallback_on_decord_error:
+        raise ValueError(
+            "Choose only one decord fallback: --ffmpeg_fallback_on_decord_error or "
+            "--official_clip_fallback_on_decord_error."
+        )
 
 
 def parse_timestamp(value: str) -> float:
@@ -735,6 +772,56 @@ def official_clip_extract_context_frames(
     return stderr
 
 
+def ffmpeg_extract_context_frames(
+    video_path: Path,
+    start_seconds: float,
+    end_seconds: float,
+    frame_paths: list[Path],
+) -> None:
+    if len(frame_paths) <= 1:
+        timestamps = [(start_seconds + end_seconds) / 2.0]
+    else:
+        step = (end_seconds - start_seconds) / (len(frame_paths) - 1)
+        timestamps = [start_seconds + step * idx for idx in range(len(frame_paths))]
+    for timestamp, frame_path in zip(timestamps, frame_paths):
+        extract_required_frame(video_path, timestamp, frame_path)
+
+
+def require_complete_frame_cache(frame_paths: list[Path], context: str) -> None:
+    missing = [str(path) for path in frame_paths if not path.exists() or path.stat().st_size == 0]
+    if missing:
+        raise RuntimeError(f"{context} produced missing/empty frame files: {missing[:5]}")
+
+
+def write_frame_fallback_metadata(
+    cache_dir: Path,
+    row: dict,
+    start_seconds: float,
+    end_seconds: float,
+    num_video_frames: int,
+    fallback: str,
+    error: str,
+    stderr: str = "",
+) -> None:
+    metadata = {
+        "fallback": fallback,
+        "error": error,
+        "ffmpeg_stderr_tail": stderr[-2000:],
+        "task": row["task"],
+        "task_type": row["task_type"],
+        "question_id": row["question_id"],
+        "sample_id": row["sample_id"],
+        "video_path": row["video_path"],
+        "start_seconds": start_seconds,
+        "end_seconds": end_seconds,
+        "num_video_frames": int(num_video_frames),
+    }
+    (cache_dir / "fallback_metadata.json").write_text(
+        json.dumps(metadata, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
+
 def frame_cache_paths_for_row(row: dict, args) -> tuple[Path, list[Path], float, float]:
     video_path = Path(row["video_path"])
     start_seconds, end_seconds = context_bounds(row, args)
@@ -747,9 +834,6 @@ def frame_cache_paths_for_row(row: dict, args) -> tuple[Path, list[Path], float,
         args.frame_sampling_backend,
     )
     cache_dir = cache_root / cache_key
-    if cache_dir.exists() and not args.reuse_frame_cache:
-        shutil.rmtree(cache_dir)
-    cache_dir.mkdir(parents=True, exist_ok=True)
 
     if args.num_video_frames <= 1:
         timestamps = [(start_seconds + end_seconds) / 2.0]
@@ -776,33 +860,97 @@ def ensure_frame_cache(row: dict, args) -> list[Path]:
             frame_path.unlink()
 
     if args.frame_sampling_backend == "decord":
-        decord_extract_context_frames(video_path, start_seconds, end_seconds, len(frame_paths), frame_paths)
+        try:
+            decord_extract_context_frames(video_path, start_seconds, end_seconds, len(frame_paths), frame_paths)
+        except Exception as exc:
+            if args.official_clip_fallback_on_decord_error:
+                fallback = "official_clip_after_decord_error"
+                stderr = official_clip_extract_context_frames(
+                    video_path,
+                    start_seconds,
+                    end_seconds,
+                    len(frame_paths),
+                    frame_paths,
+                )
+                require_complete_frame_cache(frame_paths, fallback)
+                write_frame_fallback_metadata(
+                    cache_dir,
+                    row,
+                    start_seconds,
+                    end_seconds,
+                    len(frame_paths),
+                    fallback,
+                    repr(exc),
+                    stderr,
+                )
+                return frame_paths
+            if args.ffmpeg_fallback_on_decord_error:
+                fallback = "ffmpeg_after_decord_error"
+                ffmpeg_extract_context_frames(video_path, start_seconds, end_seconds, frame_paths)
+                require_complete_frame_cache(frame_paths, fallback)
+                write_frame_fallback_metadata(
+                    cache_dir,
+                    row,
+                    start_seconds,
+                    end_seconds,
+                    len(frame_paths),
+                    fallback,
+                    repr(exc),
+                )
+                return frame_paths
+            raise
+        require_complete_frame_cache(frame_paths, "decord extraction")
         return frame_paths
 
-    if args.num_video_frames <= 1:
-        timestamps = [(start_seconds + end_seconds) / 2.0]
-    else:
-        step = (end_seconds - start_seconds) / (args.num_video_frames - 1)
-        timestamps = [start_seconds + step * idx for idx in range(args.num_video_frames)]
-    for timestamp, frame_path in zip(timestamps, frame_paths):
-        extract_required_frame(video_path, timestamp, frame_path)
-
+    ffmpeg_extract_context_frames(video_path, start_seconds, end_seconds, frame_paths)
+    require_complete_frame_cache(frame_paths, "ffmpeg extraction")
     return frame_paths
 
 
-def load_video_frames(row: dict, args) -> list[Image.Image]:
+def read_frame_cache_metadata(row: dict, args) -> dict:
+    cache_dir, frame_paths, start_seconds, end_seconds = frame_cache_paths_for_row(row, args)
+    metadata_path = cache_dir / "fallback_metadata.json"
+    metadata = {
+        "cache_dir": str(cache_dir),
+        "fallback": "",
+        "status": "success",
+        "start_seconds": start_seconds,
+        "end_seconds": end_seconds,
+        "frame_count": len(frame_paths),
+    }
+    if metadata_path.exists():
+        saved = json.loads(metadata_path.read_text(encoding="utf-8"))
+        metadata.update(
+            {
+                "fallback": saved.get("fallback", ""),
+                "fallback_error": saved.get("error", ""),
+                "fallback_metadata_path": str(metadata_path),
+            }
+        )
+    return metadata
+
+
+def load_video_frames(row: dict, args) -> tuple[list[Image.Image], dict]:
     frame_paths = ensure_frame_cache(row, args)
     frames = []
     for frame_path in frame_paths:
         with Image.open(frame_path) as image:
             frames.append(image.convert("RGB").copy())
-    return frames
+    return frames, read_frame_cache_metadata(row, args)
 
 
-def load_batch_video_frames(batch_rows: list[dict], args, executor: ThreadPoolExecutor | None) -> list[list[Image.Image]]:
+def load_batch_video_frames(
+    batch_rows: list[dict],
+    args,
+    executor: ThreadPoolExecutor | None,
+) -> tuple[list[list[Image.Image]], list[dict]]:
     if executor is None or len(batch_rows) <= 1:
-        return [load_video_frames(row, args) for row in batch_rows]
-    return list(executor.map(lambda row: load_video_frames(row, args), batch_rows))
+        loaded = [load_video_frames(row, args) for row in batch_rows]
+    else:
+        loaded = list(executor.map(lambda row: load_video_frames(row, args), batch_rows))
+    videos = [item[0] for item in loaded]
+    frame_cache_info = [item[1] for item in loaded]
+    return videos, frame_cache_info
 
 
 def build_prompt(processor, row: dict):
@@ -840,7 +988,7 @@ def prepare_generation_batch(
     video_token_id: int,
 ) -> dict:
     frame_load_start = time.perf_counter()
-    videos = load_batch_video_frames(batch_rows, args, frame_load_executor)
+    videos, frame_cache_info = load_batch_video_frames(batch_rows, args, frame_load_executor)
     frame_load_elapsed = time.perf_counter() - frame_load_start
 
     prompt_start = time.perf_counter()
@@ -870,6 +1018,7 @@ def prepare_generation_batch(
         "input_len": input_len,
         "input_token_counts": input_token_counts,
         "video_token_counts": video_token_counts,
+        "frame_cache_info": frame_cache_info,
         "frame_load_elapsed": frame_load_elapsed,
         "prompt_elapsed": prompt_elapsed,
         "processor_elapsed": processor_elapsed,
@@ -921,6 +1070,10 @@ def build_run_info(args, dataset_info: dict, row_count: int) -> dict:
         "num_video_frames": args.num_video_frames,
         "context_seconds": args.context_seconds,
         "frame_sampling_backend": args.frame_sampling_backend,
+        "frame_cache_dir": args.frame_cache_dir,
+        "reuse_frame_cache": bool(args.reuse_frame_cache),
+        "ffmpeg_fallback_on_decord_error": bool(args.ffmpeg_fallback_on_decord_error),
+        "official_clip_fallback_on_decord_error": bool(args.official_clip_fallback_on_decord_error),
         "choice_parse_mode": args.choice_parse_mode,
         "prompt_template": PROMPT_TEMPLATE,
         "sqa_prompt_template": SQA_PROMPT_TEMPLATE,
@@ -946,14 +1099,17 @@ def build_run_info(args, dataset_info: dict, row_count: int) -> dict:
             "delta_quant_bits": args.delta_quant_bits,
             "deltakv_center_ratio": args.deltakv_center_ratio,
             "deltakv_neighbor_count": args.deltakv_neighbor_count,
+            "stride_alpha": args.stride_alpha,
             "svllm_chunk_prefill_size": args.svllm_chunk_prefill_size,
             "svllm_max_num_batched_tokens": args.svllm_max_num_batched_tokens,
             "svllm_max_num_seqs_in_batch": args.svllm_max_num_seqs_in_batch,
+            "svllm_max_decoding_seqs": args.svllm_max_decoding_seqs,
             "svllm_gpu_memory_utilization": args.svllm_gpu_memory_utilization,
             "svllm_mlp_seq_chunk_size": args.svllm_mlp_seq_chunk_size,
             "chunk_prefill_accel_omnikv": bool(args.chunk_prefill_accel_omnikv),
             "frame_load_workers": args.frame_load_workers,
             "preprocess_prefetch_batches": args.preprocess_prefetch_batches,
+            "hyper_param": args.hyper_param_dict,
         },
     }
 
@@ -1226,6 +1382,7 @@ def run_method(method: str, model, processor, rows: list[dict], args, dtype, dev
             input_len = prepared["input_len"]
             input_token_counts = prepared["input_token_counts"]
             video_token_counts = prepared["video_token_counts"]
+            frame_cache_info = prepared["frame_cache_info"]
             frame_load_elapsed = prepared["frame_load_elapsed"]
             prompt_elapsed = prepared["prompt_elapsed"]
             processor_elapsed = prepared["processor_elapsed"]
@@ -1295,6 +1452,7 @@ def run_method(method: str, model, processor, rows: list[dict], args, dtype, dev
                         "input_tokens": int(input_token_counts[offset]),
                         "padded_input_tokens": input_len,
                         "video_tokens": int(video_token_counts[offset]),
+                        "frame_cache": frame_cache_info[offset],
                         "new_tokens": new_tokens,
                         "seconds": elapsed / len(batch_rows),
                         "batch_seconds": elapsed,
@@ -1330,12 +1488,16 @@ def run_method(method: str, model, processor, rows: list[dict], args, dtype, dev
     task_stats = {}
     task_type_stats = {}
     status_counts = {}
+    frame_fallback_counts = {}
     for record in records:
         stats = task_stats.setdefault(record["task"], {"total": 0, "correct": 0})
         add_accuracy(stats, bool(record["correct"]))
         type_stats = task_type_stats.setdefault(record["task_type"], {"total": 0, "correct": 0})
         add_accuracy(type_stats, bool(record["correct"]))
         status_counts[record["status"]] = status_counts.get(record["status"], 0) + 1
+        fallback = record.get("frame_cache", {}).get("fallback", "")
+        if fallback:
+            frame_fallback_counts[fallback] = frame_fallback_counts.get(fallback, 0) + 1
     finalize_accuracy_stats(task_stats)
     finalize_accuracy_stats(task_type_stats)
 
@@ -1343,6 +1505,7 @@ def run_method(method: str, model, processor, rows: list[dict], args, dtype, dev
         "method": method,
         "num_samples": len(records),
         "status_counts": status_counts,
+        "frame_fallback_counts": frame_fallback_counts,
         "batch_size": effective_batch_size,
         "streamingbench_profile": args.streamingbench_profile,
         "num_video_frames": args.num_video_frames,

@@ -18,6 +18,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from benchmark.multimodal.common.hyper_params import (
+    add_multimodal_hyper_param_arg,
+    apply_multimodal_hyper_params,
+)
 from benchmark.multimodal.video_qa import streamingbench as streaming
 
 
@@ -69,6 +73,7 @@ def parse_args():
     parser.add_argument("--torch_dtype", default="bfloat16", choices=["bfloat16", "float16"])
     parser.add_argument("--attn_implementation", default="flash_attention_2")
     parser.add_argument("--image_processor_use_fast", action="store_true")
+    add_multimodal_hyper_param_arg(parser)
     parser.add_argument("--recent_keep_tokens", type=int, default=128)
     parser.add_argument("--sink_keep_tokens", type=int, default=8)
     parser.add_argument("--decode_keep_tokens", type=int, default=1024)
@@ -80,6 +85,18 @@ def parse_args():
     parser.add_argument("--delta_quant_bits", type=int, default=4, choices=[4])
     parser.add_argument("--deltakv_center_ratio", type=float, default=0.1)
     parser.add_argument("--deltakv_neighbor_count", type=int, default=1)
+    parser.add_argument(
+        "--stride_alpha",
+        type=float,
+        default=None,
+        help="Dynamic DeltaKV center stride alpha. Defaults to checkpoint value for deltakv and 0.0 for delta_quant.",
+    )
+    parser.add_argument("--svllm_chunk_prefill_size", type=int, default=8192)
+    parser.add_argument("--svllm_max_num_batched_tokens", type=int, default=65536)
+    parser.add_argument("--svllm_max_num_seqs_in_batch", type=int, default=32)
+    parser.add_argument("--svllm_max_decoding_seqs", type=int, default=64)
+    parser.add_argument("--svllm_gpu_memory_utilization", type=float, default=0.8)
+    parser.add_argument("--svllm_mlp_seq_chunk_size", type=int, default=0)
     parser.add_argument("--frame_cache_dir", default="")
     parser.add_argument("--reuse_frame_cache", action="store_true")
     parser.add_argument("--frame_load_workers", type=int, default=1)
@@ -91,7 +108,7 @@ def parse_args():
     parser.add_argument("--dry_run_metadata", action="store_true")
     parser.add_argument("--log_every", type=int, default=1)
     parser.add_argument("--print_records", action="store_true")
-    return parser.parse_args()
+    return apply_multimodal_hyper_params(parser.parse_args())
 
 
 def validate_args(args):
@@ -115,6 +132,22 @@ def validate_args(args):
         raise ValueError("--visual_keep_ratio must be in (0, 1].")
     if args.deltakv_center_ratio <= 0.0 or args.deltakv_center_ratio > 1.0:
         raise ValueError("--deltakv_center_ratio must be in (0, 1].")
+    if args.stride_alpha is not None and args.stride_alpha < 0.0:
+        raise ValueError("--stride_alpha must be non-negative.")
+    if args.delta_quant_bits != 4:
+        raise ValueError("--delta_quant_bits currently supports only 4 for multimodal direct residual quantization.")
+    if args.svllm_chunk_prefill_size < 1:
+        raise ValueError("--svllm_chunk_prefill_size must be >= 1.")
+    if args.svllm_max_num_batched_tokens < 1:
+        raise ValueError("--svllm_max_num_batched_tokens must be >= 1.")
+    if args.svllm_max_num_seqs_in_batch < 1:
+        raise ValueError("--svllm_max_num_seqs_in_batch must be >= 1.")
+    if args.svllm_max_decoding_seqs < 1:
+        raise ValueError("--svllm_max_decoding_seqs must be >= 1.")
+    if args.svllm_gpu_memory_utilization <= 0.0 or args.svllm_gpu_memory_utilization > 1.0:
+        raise ValueError("--svllm_gpu_memory_utilization must be in (0, 1].")
+    if args.svllm_mlp_seq_chunk_size < 0:
+        raise ValueError("--svllm_mlp_seq_chunk_size must be >= 0.")
 
 
 def selected_values(raw: str, valid: set[str], *, field: str) -> set[str] | None:
@@ -363,9 +396,17 @@ def build_run_info(args, dataset_info: dict, row_count: int) -> dict:
             "delta_quant_bits": args.delta_quant_bits,
             "deltakv_center_ratio": args.deltakv_center_ratio,
             "deltakv_neighbor_count": args.deltakv_neighbor_count,
+            "stride_alpha": args.stride_alpha,
+            "svllm_chunk_prefill_size": args.svllm_chunk_prefill_size,
+            "svllm_max_num_batched_tokens": args.svllm_max_num_batched_tokens,
+            "svllm_max_num_seqs_in_batch": args.svllm_max_num_seqs_in_batch,
+            "svllm_max_decoding_seqs": args.svllm_max_decoding_seqs,
+            "svllm_gpu_memory_utilization": args.svllm_gpu_memory_utilization,
+            "svllm_mlp_seq_chunk_size": args.svllm_mlp_seq_chunk_size,
             "chunk_prefill_accel_omnikv": bool(args.chunk_prefill_accel_omnikv),
             "frame_load_workers": args.frame_load_workers,
             "preprocess_prefetch_batches": args.preprocess_prefetch_batches,
+            "hyper_param": args.hyper_param_dict,
         },
     }
 
@@ -442,10 +483,15 @@ def main():
             model = load_vanilla_model(args, dtype, device)
             method_label = "vanilla"
             policy = None
-        else:
+        elif method_kind == "deltakv_delta_quant":
             from benchmark.multimodal.model_adapters.llava_onevision import load_llava_delta_quant_model
 
             model, policy = load_llava_delta_quant_model(args, dtype, device)
+            method_label = policy["method"]
+        else:
+            from benchmark.multimodal.model_adapters.llava_onevision import load_svllm_delta_quant_model
+
+            model, policy = load_svllm_delta_quant_model(args, dtype, device)
             method_label = policy["method"]
 
         result = streaming.run_method(method_label, model, processor, rows, args, dtype, device, policy=policy)
@@ -453,6 +499,8 @@ def main():
         result["dataset_info"] = dataset_info
         add_videomme_fields_and_stats(result, rows)
         results.append(result)
+        if hasattr(model, "exit"):
+            model.exit()
         del model
         gc.collect()
         torch.cuda.empty_cache()

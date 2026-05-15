@@ -18,6 +18,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from benchmark.multimodal.common.hyper_params import (
+    add_multimodal_hyper_param_arg,
+    apply_multimodal_hyper_params,
+)
 from benchmark.multimodal.model_adapters.llava_onevision import (
     batch_to_device,
     ensure_left_padding,
@@ -53,6 +57,7 @@ def parse_args():
     parser.add_argument("--cuda_device", type=int, default=7)
     parser.add_argument("--torch_dtype", default="float16", choices=["bfloat16", "float16"])
     parser.add_argument("--attn_implementation", default="flash_attention_2")
+    add_multimodal_hyper_param_arg(parser)
     parser.add_argument("--recent_keep_tokens", type=int, default=128)
     parser.add_argument("--sink_keep_tokens", type=int, default=8)
     parser.add_argument("--decode_keep_tokens", type=int, default=1024)
@@ -64,11 +69,17 @@ def parse_args():
     parser.add_argument("--delta_quant_bits", type=int, default=4, choices=[4])
     parser.add_argument("--deltakv_center_ratio", type=float, default=0.1)
     parser.add_argument("--deltakv_neighbor_count", type=int, default=1)
+    parser.add_argument(
+        "--stride_alpha",
+        type=float,
+        default=None,
+        help="Dynamic DeltaKV center stride alpha. Defaults to checkpoint value for deltakv and 0.0 for delta_quant.",
+    )
     parser.add_argument("--frame_cache_dir", default="")
     parser.add_argument("--reuse_frame_cache", action="store_true")
     parser.add_argument("--log_every", type=int, default=10)
     parser.add_argument("--print_records", action="store_true")
-    return parser.parse_args()
+    return apply_multimodal_hyper_params(parser.parse_args())
 
 
 def decord_context_frame_indices(video_path: Path, sample_fps: float, max_context_frames: int):

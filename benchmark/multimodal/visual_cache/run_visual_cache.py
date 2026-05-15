@@ -13,11 +13,19 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 import pyarrow.parquet as pq
 import torch
 from PIL import Image
 from transformers import LlavaOnevisionConfig, LlavaOnevisionForConditionalGeneration, LlavaOnevisionProcessor
 
+from benchmark.multimodal.common.hyper_params import (
+    add_multimodal_hyper_param_arg,
+    apply_multimodal_hyper_params,
+)
 from deltakv.modeling.llava_ov.llava_onevision_deltakv import (
     LlavaOnevisionDeltaKVForConditionalGeneration,
     load_deltakv_compressor_into_llava,
@@ -121,6 +129,7 @@ def parse_args():
     )
     parser.add_argument("--torch_dtype", default="bfloat16", choices=["bfloat16", "float16"])
     parser.add_argument("--attn_implementation", default="flash_attention_2")
+    add_multimodal_hyper_param_arg(parser)
     parser.add_argument("--recent_keep_tokens", type=int, default=128)
     parser.add_argument("--sink_keep_tokens", type=int, default=8)
     parser.add_argument("--decode_keep_tokens", type=int, default=1024)
@@ -132,12 +141,18 @@ def parse_args():
     parser.add_argument("--delta_quant_bits", type=int, default=4, choices=[4])
     parser.add_argument("--deltakv_center_ratio", type=float, default=0.1)
     parser.add_argument("--deltakv_neighbor_count", type=int, default=1)
+    parser.add_argument(
+        "--stride_alpha",
+        type=float,
+        default=None,
+        help="Dynamic DeltaKV center stride alpha. Defaults to checkpoint value for deltakv and 0.0 for delta_quant.",
+    )
     parser.add_argument("--quantize_visual_kv", action="store_true")
     parser.add_argument("--limit_text_tokens", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--log_every", type=int, default=1)
     parser.add_argument("--print_records", action="store_true", help="Print per-sample records in the terminal summary.")
-    return parser.parse_args()
+    return apply_multimodal_hyper_params(parser.parse_args())
 
 
 def validate_args(args) -> None:
@@ -157,6 +172,10 @@ def validate_args(args) -> None:
         raise ValueError("--visual_keep_ratio must be in (0, 1].")
     if args.deltakv_center_ratio <= 0.0 or args.deltakv_center_ratio > 1.0:
         raise ValueError("--deltakv_center_ratio must be in (0, 1].")
+    if args.stride_alpha is not None and args.stride_alpha < 0.0:
+        raise ValueError("--stride_alpha must be non-negative.")
+    if args.delta_quant_bits != 4:
+        raise ValueError("--delta_quant_bits currently supports only 4 for multimodal direct residual quantization.")
     for name in (
         "recent_keep_tokens",
         "sink_keep_tokens",
@@ -223,9 +242,11 @@ def build_run_info(args, output_dir: Path, row_count: int) -> dict:
             "delta_quant_bits": args.delta_quant_bits,
             "deltakv_center_ratio": args.deltakv_center_ratio,
             "deltakv_neighbor_count": args.deltakv_neighbor_count,
+            "stride_alpha": args.stride_alpha,
             "quantize_visual_kv": bool(args.quantize_visual_kv),
             "chunk_prefill_accel_omnikv": bool(args.chunk_prefill_accel_omnikv),
             "limit_text_tokens": args.limit_text_tokens,
+            "hyper_param": args.hyper_param_dict,
         },
     }
 
@@ -502,6 +523,7 @@ def build_llava_deltakv_policy(infer_config):
         "uses_visual_uniform_pruning": False,
         "supports_batch_generation": True,
         "kv_quant_bits": kv_quant_bits,
+        "stride_alpha": float(infer_config.get("stride_alpha", 0.0) or 0.0),
         "note": (
             "Uses the LLaVA-OneVision DeltaKV wrapper with the same standard "
             "DeltaKV cache/compressor path as text inference. It is not visual "
@@ -525,6 +547,7 @@ def build_llava_delta_quant_policy(infer_config):
         "uses_visual_uniform_pruning": False,
         "supports_batch_generation": True,
         "kv_quant_bits": kv_quant_bits,
+        "stride_alpha": float(infer_config.get("stride_alpha", 0.0) or 0.0),
         "note": (
             "Uses DeltaKV-style cluster/ref reconstruction and stores token-space "
             "residuals with direct quantization. It does not load or use a learned "
@@ -631,6 +654,9 @@ def load_llava_deltakv_model(args, dtype, device):
             "chunk_prefill_accel_omnikv": bool(args.chunk_prefill_accel_omnikv),
         }
     )
+    stride_alpha = getattr(args, "stride_alpha", None)
+    if stride_alpha is not None:
+        infer_config["stride_alpha"] = stride_alpha
     policy = build_llava_deltakv_policy(infer_config)
     model, policy = _load_llava_deltakv_wrapper(args, dtype, device, config, infer_config, True, policy)
     incompatible = load_deltakv_compressor_into_llava(model, str(compressor_path), device="cpu")
@@ -663,6 +689,7 @@ def load_llava_delta_quant_model(args, dtype, device):
         "prefill_keep_tokens": args.prefill_keep_tokens,
         "hf_prefill_chunk_size": args.hf_prefill_chunk_size,
         "chunk_prefill_accel_omnikv": bool(args.chunk_prefill_accel_omnikv),
+        "stride_alpha": 0.0 if getattr(args, "stride_alpha", None) is None else args.stride_alpha,
     }
     policy = build_llava_delta_quant_policy(infer_config)
     model, policy = _load_llava_deltakv_wrapper(args, dtype, device, config, infer_config, False, policy)
