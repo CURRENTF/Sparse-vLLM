@@ -87,6 +87,22 @@ class HfDeltaKVModelingTest(unittest.TestCase):
                     out = model(input_ids=torch.tensor([[5, 6, 7]], dtype=torch.long), use_cache=True)
                 self.assertEqual(out.logits.shape[:2], (1, 1))
 
+    def test_hf_deltakv_short_prompt_smaller_than_sink_budget(self):
+        for name, model_cls, config_cls in self.MODEL_CASES:
+            with self.subTest(model=name):
+                torch.manual_seed(0)
+                cfg = _tiny_config(config_cls)
+                cfg.num_sink_tokens = 8
+                model = model_cls(cfg).eval()
+                with torch.no_grad():
+                    out = model(input_ids=torch.tensor([[5, 6, 7]], dtype=torch.long), use_cache=True)
+                self.assertEqual(out.logits.shape[:2], (1, 1))
+                cache = out.past_key_values
+                self.assertEqual(cache.sink_filled_count[0], 3)
+                key_view, _, pos_view = cache._view(0, compressor_up=None, k_dim=8)
+                self.assertEqual(key_view.shape[1], 3)
+                self.assertEqual(pos_view.shape[1], 3)
+
     def test_qk_norm_reshape_allows_different_query_and_key_lengths(self):
         class AttnWithNorms:
             q_norm = torch.nn.Identity()

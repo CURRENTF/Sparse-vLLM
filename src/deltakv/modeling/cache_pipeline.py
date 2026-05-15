@@ -191,7 +191,14 @@ class ClusterCachePipeline(BaseCache):
             self.buffer_visual_mask_cache[layer_idx] = torch.cat([self.buffer_visual_mask_cache[layer_idx], visual_mask[:, take:]], dim=1)
 
     def _sink_kv(self, layer_idx: int) -> torch.Tensor:
-        return torch.cat([self.sink_key_cache[layer_idx], self.sink_value_cache[layer_idx]], dim=-1)
+        filled = int(self.sink_filled_count[layer_idx])
+        return torch.cat(
+            [
+                self.sink_key_cache[layer_idx][:, :filled],
+                self.sink_value_cache[layer_idx][:, :filled],
+            ],
+            dim=-1,
+        )
 
     @staticmethod
     def _metric_l2(kv_states, all_centers, use_kv=False):
@@ -366,8 +373,9 @@ class ClusterCachePipeline(BaseCache):
         return self._reconstruct(layer_idx, token_idx=None, compressor_up=compressor_up, k_dim=k_dim)
 
     def _view(self, layer_idx: int, compressor_up: Optional[nn.Module], k_dim: int):
-        keys = [self.sink_key_cache[layer_idx]]
-        values = [self.sink_value_cache[layer_idx]]
+        filled = int(self.sink_filled_count[layer_idx])
+        keys = [self.sink_key_cache[layer_idx][:, :filled]]
+        values = [self.sink_value_cache[layer_idx][:, :filled]]
         pos = [self.sink_pos_cache[layer_idx]]
         if layer_idx in self.comp_kv_cache:
             selector = self.layer_to_full_layer_idx.get(layer_idx)
