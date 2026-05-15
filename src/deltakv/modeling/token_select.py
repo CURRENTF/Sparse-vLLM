@@ -106,10 +106,10 @@ def omnikv_token_selection(
     query_mask: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     # candidate_weights shape: (bs, heads, q_len, n_candidates)
-    if query_states.shape[-2] > 1:
-        candidate_weights = get_qk_score(module, query_states, key_states, scaling, no_softmax=True)
-    else:
-        candidate_weights = get_qk_score(module, query_states, key_states, scaling)
+    # Sparse-VLLM's OmniKV/DeltaKV observation kernels collect raw QK logits for
+    # both prefill and decode. Keep the HF path on the same scoring semantics so
+    # top-token views are comparable.
+    candidate_weights = get_qk_score(module, query_states, key_states, scaling, no_softmax=True)
     
     # Voting & Aggregation
     # Mean over valid queries, max over heads.

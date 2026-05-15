@@ -7,7 +7,9 @@ from deltakv.modeling.cache_factory import (
     DELTA_ORIGIN_W_FULL,
     DELTA_ORIGIN_WO_FULL,
     create_deltakv_cache,
+    create_hf_sparse_cache,
     get_deltakv_cache_impl,
+    is_hf_sparse_cache_instance,
     set_deltakv_cache_impl,
 )
 from deltakv.modeling.cache_pipeline import (
@@ -15,6 +17,8 @@ from deltakv.modeling.cache_pipeline import (
     DeltaCompressedLatentWoFullCache,
     DeltaOriginWFullCache,
     DeltaOriginWoFullCache,
+    HF_SPARSE_CACHE_OMNIKV,
+    OmniKVRawCache,
 )
 
 
@@ -63,6 +67,15 @@ class HfDeltaKVCacheFactoryTest(unittest.TestCase):
         cfg.use_cluster = False
         with self.assertRaisesRegex(ValueError, "cluster-only"):
             create_deltakv_cache(cfg)
+
+    def test_hf_sparse_cache_factory_allows_omnikv_raw_cache(self):
+        cfg = self._config()
+        cfg.use_cluster = False
+        cfg.use_compression = False
+        cfg.hf_sparse_cache_impl = HF_SPARSE_CACHE_OMNIKV
+        cache = create_hf_sparse_cache(cfg)
+        self.assertIsInstance(cache, OmniKVRawCache)
+        self.assertTrue(is_hf_sparse_cache_instance(cache, cfg))
 
 
 if __name__ == "__main__":

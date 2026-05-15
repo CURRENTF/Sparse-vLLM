@@ -16,6 +16,7 @@ DELTA_COMPRESSED_LATENT_WO_FULL = "delta_compressed_latent_wo_full"
 DELTA_COMPRESSED_LATENT_W_FULL = "delta_compressed_latent_w_full"
 DELTA_ORIGIN_WO_FULL = "delta_origin_wo_full"
 DELTA_ORIGIN_W_FULL = "delta_origin_w_full"
+HF_SPARSE_CACHE_OMNIKV = "omnikv"
 
 
 def _bs1(key_states: torch.Tensor) -> None:
@@ -467,6 +468,140 @@ class ClusterCachePipeline(BaseCache):
             self.bases_cache[layer_idx] = self._sink_kv(layer_idx)
         response = self._view(layer_idx, compressor_up, key_states.shape[-1])
         self._flush(layer_idx, compressor_down)
+        return response
+
+
+class OmniKVRawCache(BaseCache):
+    """HF OmniKV cache: persistent raw sink/history/recent KV plus dynamic top-k views."""
+
+    def __init__(self, config) -> None:
+        super().__init__(config)
+        self.full_attn_layers = parse_full_attn_layers(config.full_attn_layers)
+        config.full_attn_layers = self.full_attn_layers
+        self.layer_to_full_layer_idx = {}
+        last_full = None
+        for layer_idx in range(config.num_hidden_layers):
+            if layer_idx in self.full_attn_layers:
+                last_full = layer_idx
+            self.layer_to_full_layer_idx[layer_idx] = last_full
+
+        self.sink_key_cache = {}
+        self.sink_value_cache = {}
+        self.sink_pos_cache = {}
+        self.sink_filled_count = {}
+        self.history_key_cache = {}
+        self.history_value_cache = {}
+        self.history_pos_cache = {}
+        self.buffer_key_cache = {}
+        self.buffer_value_cache = {}
+        self.buffer_pos_cache = {}
+        self.cos = None
+        self.sin = None
+
+    def _token_pos(self, key_states: torch.Tensor, cache_kwargs: Optional[dict]) -> torch.Tensor:
+        q_len = key_states.shape[1]
+        cache_position = (cache_kwargs or {}).get("cache_position")
+        if cache_position is None:
+            cache_position = torch.arange(self._seen_tokens, self._seen_tokens + q_len, device=key_states.device)
+        cache_position = cache_position.to(device=key_states.device, dtype=torch.long)
+        return cache_position.unsqueeze(0) if cache_position.dim() == 1 else cache_position
+
+    def _ensure_layer(self, layer_idx: int, key_states: torch.Tensor, value_states: torch.Tensor, token_pos: torch.Tensor) -> None:
+        if layer_idx in self.buffer_key_cache:
+            return
+        bs, _, k_dim = key_states.shape
+        self.sink_key_cache[layer_idx] = key_states.new_zeros((bs, self.sink_size, k_dim))
+        self.sink_value_cache[layer_idx] = value_states.new_zeros((bs, self.sink_size, k_dim))
+        self.sink_pos_cache[layer_idx] = token_pos.new_empty((bs, 0))
+        self.sink_filled_count[layer_idx] = 0
+        self.history_key_cache[layer_idx] = key_states.new_empty((bs, 0, k_dim))
+        self.history_value_cache[layer_idx] = value_states.new_empty((bs, 0, k_dim))
+        self.history_pos_cache[layer_idx] = token_pos.new_empty((bs, 0))
+        self.buffer_key_cache[layer_idx] = key_states.new_empty((bs, 0, k_dim))
+        self.buffer_value_cache[layer_idx] = value_states.new_empty((bs, 0, k_dim))
+        self.buffer_pos_cache[layer_idx] = token_pos.new_empty((bs, 0))
+
+    def _append(self, layer_idx: int, key_states: torch.Tensor, value_states: torch.Tensor, token_pos: torch.Tensor) -> None:
+        filled = int(self.sink_filled_count[layer_idx])
+        take = max(0, min(self.sink_size - filled, key_states.shape[1]))
+        if take:
+            end = filled + take
+            self.sink_key_cache[layer_idx][:, filled:end] = key_states[:, :take]
+            self.sink_value_cache[layer_idx][:, filled:end] = value_states[:, :take]
+            self.sink_pos_cache[layer_idx] = torch.cat([self.sink_pos_cache[layer_idx], token_pos[:, :take]], dim=1)
+            self.sink_filled_count[layer_idx] = end
+        if take < key_states.shape[1]:
+            self.buffer_key_cache[layer_idx] = torch.cat([self.buffer_key_cache[layer_idx], key_states[:, take:]], dim=1)
+            self.buffer_value_cache[layer_idx] = torch.cat([self.buffer_value_cache[layer_idx], value_states[:, take:]], dim=1)
+            self.buffer_pos_cache[layer_idx] = torch.cat([self.buffer_pos_cache[layer_idx], token_pos[:, take:]], dim=1)
+
+    def _view(self, layer_idx: int):
+        filled = int(self.sink_filled_count[layer_idx])
+        keys = [self.sink_key_cache[layer_idx][:, :filled]]
+        values = [self.sink_value_cache[layer_idx][:, :filled]]
+        pos = [self.sink_pos_cache[layer_idx]]
+
+        history_k = self.history_key_cache[layer_idx]
+        if history_k.shape[1]:
+            selector = self.layer_to_full_layer_idx.get(layer_idx)
+            token_idx = None if layer_idx in self.full_attn_layers else self.top_token_idx.get(selector)
+            if token_idx is None:
+                keys.append(history_k)
+                values.append(self.history_value_cache[layer_idx])
+                pos.append(self.history_pos_cache[layer_idx])
+            elif token_idx.numel():
+                token_idx = token_idx.to(device=history_k.device, dtype=torch.long)
+                gather = token_idx[:, :, None]
+                keys.append(history_k.gather(1, gather.expand(-1, -1, history_k.shape[-1])))
+                values.append(
+                    self.history_value_cache[layer_idx].gather(
+                        1, gather.expand(-1, -1, self.history_value_cache[layer_idx].shape[-1])
+                    )
+                )
+                pos.append(self.history_pos_cache[layer_idx].gather(1, token_idx))
+
+        keys.append(self.buffer_key_cache[layer_idx])
+        values.append(self.buffer_value_cache[layer_idx])
+        pos.append(self.buffer_pos_cache[layer_idx])
+        return torch.cat(keys, dim=1), torch.cat(values, dim=1), torch.cat(pos, dim=1)
+
+    def _flush(self, layer_idx: int) -> None:
+        buffer_len = self.buffer_key_cache[layer_idx].shape[1]
+        if buffer_len <= self.tail_token_size:
+            return
+        compress_len = buffer_len - self.tail_token_size
+        if compress_len <= 0:
+            return
+
+        hist_key = self.buffer_key_cache[layer_idx][:, :compress_len]
+        hist_value = self.buffer_value_cache[layer_idx][:, :compress_len]
+        hist_pos = self.buffer_pos_cache[layer_idx][:, :compress_len]
+        self.history_key_cache[layer_idx] = torch.cat([self.history_key_cache[layer_idx], hist_key], dim=1)
+        self.history_value_cache[layer_idx] = torch.cat([self.history_value_cache[layer_idx], hist_value], dim=1)
+        self.history_pos_cache[layer_idx] = torch.cat([self.history_pos_cache[layer_idx], hist_pos], dim=1)
+        self.buffer_key_cache[layer_idx] = self.buffer_key_cache[layer_idx][:, compress_len:]
+        self.buffer_value_cache[layer_idx] = self.buffer_value_cache[layer_idx][:, compress_len:]
+        self.buffer_pos_cache[layer_idx] = self.buffer_pos_cache[layer_idx][:, compress_len:]
+
+    def get_compressed_length(self, layer_idx: int) -> int:
+        return 0 if layer_idx not in self.history_key_cache else int(self.history_key_cache[layer_idx].shape[1])
+
+    def get_observable_compressed_length(self, current_q_len: int) -> int:
+        compressed_len = self._seen_tokens - self.tail_token_size - int(current_q_len) - self.sink_size
+        if compressed_len <= 0:
+            return 0
+        return int(compressed_len)
+
+    def update(self, key_states, value_states, layer_idx, cache_kwargs=None, compressor_down: Optional[nn.Module] = None, compressor_up: Optional[nn.Module] = None):
+        del compressor_down, compressor_up
+        _bs1(key_states)
+        if layer_idx == 0:
+            self._seen_tokens += key_states.shape[1]
+        token_pos = self._token_pos(key_states, cache_kwargs)
+        self._ensure_layer(layer_idx, key_states, value_states, token_pos)
+        self._append(layer_idx, key_states, value_states, token_pos)
+        response = self._view(layer_idx)
+        self._flush(layer_idx)
         return response
 
 

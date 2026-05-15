@@ -10,7 +10,7 @@ from transformers import DynamicCache
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 
 from deltakv.configs.model_config_cls import parse_full_attn_layers
-from deltakv.modeling.cache_factory import create_deltakv_cache, is_deltakv_cache_instance, set_deltakv_cache_impl
+from deltakv.modeling.cache_factory import create_hf_sparse_cache, is_hf_sparse_cache_instance, set_deltakv_cache_impl
 from deltakv.modeling.compressor import create_compressor, reshape_and_apply_qk_norm
 from deltakv.modeling.token_select import omnikv_token_selection
 
@@ -213,8 +213,8 @@ def build_inference_classes(
                 assert_hf_bs1(tuple(inputs_embeds.shape[:2]), attention_mask)
             if self.gradient_checkpointing and self.training and use_cache:
                 raise RuntimeError("HF DeltaKV inference model should not be used for training with gradient checkpointing.")
-            if not is_deltakv_cache_instance(past_key_values, self.config):
-                raise TypeError(f"{prefix}ModelKVCompress expects a DeltaKV cache created by create_deltakv_cache().")
+            if not is_hf_sparse_cache_instance(past_key_values, self.config):
+                raise TypeError(f"{prefix}ModelKVCompress expects an HF sparse cache created by create_hf_sparse_cache().")
             if cache_position is None:
                 past_seen = past_key_values.get_seq_length()
                 cache_position = torch.arange(past_seen, past_seen + inputs_embeds.shape[1], device=inputs_embeds.device)
@@ -299,8 +299,8 @@ def build_inference_classes(
             use_cache = True if use_cache is None else use_cache
             if not use_cache:
                 raise ValueError("DeltaKV inference model must use cache.")
-            if not is_deltakv_cache_instance(past_key_values, self.config):
-                past_key_values = create_deltakv_cache(self.config)
+            if not is_hf_sparse_cache_instance(past_key_values, self.config):
+                past_key_values = create_hf_sparse_cache(self.config)
             outputs = None
             for chunk_ids in input_ids.split(max(1, int(self.config.chunk_prefill_size)), dim=-1):
                 outputs = lm_cls.forward(

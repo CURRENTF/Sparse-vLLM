@@ -91,6 +91,55 @@ Files:
   The failing run info is under
   `/data2/haojitai/outputs/sparsevllm_logits_align/quick_short_omnikv`.
 
+## HF OmniKV Fix
+
+Branch: `fix/hf-omnikv-alignment`
+
+The HF OmniKV path now uses an explicit `OmniKVRawCache` instead of trying to
+instantiate the cluster-only DeltaKV cache. The cache stores raw sink, exact
+history, and recent tail KV, and the HF selection path uses raw QK logits for
+decode to match Sparse-VLLM's observation kernels. The logits comparison script
+also now runs Sparse-VLLM prefill according to the resolved
+`prefill_schedule_policy`; for OmniKV this is `all_chunked` with
+`chunk_prefill_size=4096`.
+
+Final OmniKV alignment run:
+
+```bash
+CUDA_VISIBLE_DEVICES=6 PYTHONPATH=$PWD/src conda run -n svllm \
+  python scripts/debug/compare_logits_hf_sparsevllm.py \
+  --cases short,long \
+  --methods omnikv \
+  --output_dir /data2/haojitai/outputs/sparsevllm_logits_align/quick_omnikv_fixed_policychunk_exact_rawscore
+```
+
+Long vanilla policy-chunk baseline:
+
+```bash
+CUDA_VISIBLE_DEVICES=6 PYTHONPATH=$PWD/src conda run -n svllm \
+  python scripts/debug/compare_logits_hf_sparsevllm.py \
+  --cases long \
+  --methods vanilla \
+  --output_dir /data2/haojitai/outputs/sparsevllm_logits_align/quick_long_vanilla_policychunk
+```
+
+Output directories:
+
+- `/data2/haojitai/outputs/sparsevllm_logits_align/quick_omnikv_fixed_policychunk_exact_rawscore`
+- `/data2/haojitai/outputs/sparsevllm_logits_align/quick_long_vanilla_policychunk`
+
+Decode results from the final OmniKV run:
+
+| Case | Prompt tokens | Method | max abs diff | mean abs diff | p99 abs diff | argmax match | top-1 | top-10 | top-50 |
+| --- | ---: | --- | ---: | ---: | ---: | --- | ---: | ---: | ---: |
+| short | 5 | OmniKV | 0.21875 | 0.032235 | 0.109375 | true | 1.00 | 1.00 | 0.96 |
+| long | 9000 | OmniKV | 0.28125 | 0.041316 | 0.125 | true | 1.00 | 0.90 | 1.00 |
+| long | 9000 | vanilla baseline | 0.1875 | 0.027787 | 0.09375 | true | 1.00 | 0.90 | 1.00 |
+
+The remaining long OmniKV decode gap is close to the vanilla HF/Sparse-VLLM
+kernel baseline and no longer shows the earlier sparse-view-scale mismatch
+(`mean_abs_diff` was about `0.174466` before the raw-QK decode scoring fix).
+
 ## Fixes Added
 
 - Added `scripts/debug/compare_logits_hf_sparsevllm.py`.
@@ -98,6 +147,8 @@ Files:
   view now exposes only filled sink slots, avoiding RoPE position/view length
   mismatch.
 - Added a regression test for that short-prompt sink-budget boundary.
+- Added HF OmniKV raw-cache construction, exact-history recent-tail handling,
+  and raw-QK OmniKV selection tests.
 
 ## Verification
 

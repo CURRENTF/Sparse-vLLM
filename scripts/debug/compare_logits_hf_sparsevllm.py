@@ -19,6 +19,10 @@ from deltakv.get_chat_api import get_generate_api
 from sparsevllm.config import Config
 from sparsevllm.engine.model_runner import ModelRunner
 from sparsevllm.engine.sequence import Sequence
+from sparsevllm.method_registry import (
+    PREFILL_POLICY_ALL_CHUNKED,
+    PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
+)
 from sparsevllm.sampling_params import SamplingParams
 from sparsevllm.utils.context import get_context, reset_context
 
@@ -162,15 +166,8 @@ def _hf_infer_config(args: argparse.Namespace, method: str, prompt_len: int) -> 
     if not isinstance(args.decode_keep_tokens, int) or not isinstance(args.prefill_keep_tokens, int):
         raise TypeError("HF/Sparse-VLLM top token budgets must be explicit integers.")
 
-    # HF DeltaKV should not chunk this logits-alignment prefill unless explicitly requested.
-    hf_prefill_chunk_size = int(args.hf_prefill_chunk_size)
-    if hf_prefill_chunk_size <= prompt_len:
-        raise ValueError(
-            "hf_prefill_chunk_size must exceed the prompt length for this alignment run. "
-            f"got hf_prefill_chunk_size={hf_prefill_chunk_size}, prompt_len={prompt_len}"
-        )
-
     if method == "omnikv":
+        hf_prefill_chunk_size = int(args.hf_prefill_chunk_size or args.engine_prefill_chunk_size)
         return {
             "sparse_method": "omnikv",
             "chunk_prefill_accel_omnikv": bool(args.chunk_prefill_accel_omnikv),
@@ -181,6 +178,14 @@ def _hf_infer_config(args: argparse.Namespace, method: str, prompt_len: int) -> 
             "full_attention_layers": args.full_attention_layers,
             "hf_prefill_chunk_size": hf_prefill_chunk_size,
         }
+
+    # HF DeltaKV should not chunk this logits-alignment prefill unless explicitly requested.
+    hf_prefill_chunk_size = int(args.hf_prefill_chunk_size or 100_000_000)
+    if hf_prefill_chunk_size <= prompt_len:
+        raise ValueError(
+            "hf_prefill_chunk_size must exceed the prompt length for this DeltaKV alignment run. "
+            f"got hf_prefill_chunk_size={hf_prefill_chunk_size}, prompt_len={prompt_len}"
+        )
 
     return {
         "sparse_method": "deltakv",
@@ -290,23 +295,58 @@ def _make_sparse_runner(args: argparse.Namespace, method: str) -> tuple[ModelRun
     return runner, public_config
 
 
+def _sparse_long_text_threshold(config: Config, *, is_prefill: bool) -> int:
+    if config.vllm_sparse_method == "deltakv-snapkv":
+        base = config.num_sink_tokens + config.num_recent_tokens + config.snapkv_window_size
+    elif config.vllm_sparse_method == "deltakv-standalone":
+        base = config.num_sink_tokens + config.num_recent_tokens
+    elif config.vllm_sparse_method in ("streamingllm", "attention-sink", "attention_sink"):
+        base = config.num_sink_tokens + config.num_recent_tokens
+    else:
+        base = config.num_sink_tokens + config.num_recent_tokens + config.num_top_tokens
+    return int(base) + (int(config.chunk_prefill_size) if is_prefill else 0)
+
+
+def _sparse_prefill_chunk_size(config: Config, seq: Sequence) -> int:
+    remaining = int(seq.num_prompt_tokens) - int(seq.num_prefilled_tokens)
+    if remaining <= 0:
+        raise ValueError(f"Invalid sparse prefill state: remaining={remaining}")
+
+    if config.prefill_schedule_policy == PREFILL_POLICY_ALL_CHUNKED:
+        return min(int(config.chunk_prefill_size), remaining)
+
+    if config.prefill_schedule_policy == PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH:
+        threshold = _sparse_long_text_threshold(config, is_prefill=True)
+        if int(seq.num_prompt_tokens) > int(threshold):
+            return remaining
+        return min(int(config.chunk_prefill_size), remaining)
+
+    raise ValueError(f"Unknown Sparse-VLLM prefill_schedule_policy={config.prefill_schedule_policy!r}")
+
+
 def _sparse_prefill(
     runner: ModelRunner,
     input_ids: list[int],
 ) -> tuple[torch.Tensor, Sequence]:
     seq = Sequence(input_ids, SamplingParams(temperature=0.0, max_tokens=2, ignore_eos=True))
-    seq.current_chunk_size = len(input_ids)
-    try:
-        input_tensor, positions = runner.prepare_step([seq], is_prefill=True)
-        ctx = get_context()
-        ctx.sparse_controller = runner.sparse_controller
-        runner.sparse_controller.prepare_forward([seq], is_prefill=True)
-        logits = runner.run_model(input_tensor, positions, is_prefill=True).detach().cpu()
-        runner.sparse_controller.post_forward([seq], is_prefill=True)
-        seq.num_prefilled_tokens = seq.num_prompt_tokens
-        return logits[-1:].contiguous(), seq
-    finally:
-        reset_context()
+    last_logits = None
+    while int(seq.num_prefilled_tokens) < int(seq.num_prompt_tokens):
+        seq.current_chunk_size = _sparse_prefill_chunk_size(runner.config, seq)
+        try:
+            input_tensor, positions = runner.prepare_step([seq], is_prefill=True)
+            ctx = get_context()
+            ctx.sparse_controller = runner.sparse_controller
+            runner.sparse_controller.prepare_forward([seq], is_prefill=True)
+            logits = runner.run_model(input_tensor, positions, is_prefill=True).detach().cpu()
+            runner.sparse_controller.post_forward([seq], is_prefill=True)
+            seq.num_prefilled_tokens += int(seq.current_chunk_size)
+            last_logits = logits[-1:].contiguous()
+        finally:
+            reset_context()
+
+    if last_logits is None:
+        raise RuntimeError("Sparse-VLLM prefill produced no logits.")
+    return last_logits, seq
 
 
 def _sparse_decode(
@@ -424,7 +464,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--deltakv_latent_quant_bits", type=int, default=0)
     parser.add_argument("--deltakv_neighbor_count", type=int, default=4)
     parser.add_argument("--engine_prefill_chunk_size", type=int, default=4096)
-    parser.add_argument("--hf_prefill_chunk_size", type=int, default=100_000_000)
+    parser.add_argument("--hf_prefill_chunk_size", type=int, default=None)
     parser.add_argument("--chunk_prefill_accel_omnikv", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--gpu_memory_utilization", type=float, default=0.9)
     parser.add_argument("--deltakv_full_pool_reserve_ratio", type=float, default=0.2)
