@@ -39,6 +39,9 @@ Tested but rejected:
   throughput regressed
 - routing RMSNorm through Triton kernels: standalone microbenchmarks looked
   promising, but end-to-end 128k bs4 decode regressed and was reverted
+- compiling the isolated Qwen2 MLP with `torch.compile(mode="reduce-overhead")`:
+  microbenchmark was effectively neutral (`0.163 ms` eager vs `0.160 ms`
+  compiled for BS4), so no code change was made
 
 ## Environment
 
