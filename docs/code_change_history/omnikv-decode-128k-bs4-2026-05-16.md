@@ -37,6 +37,8 @@ Tested but rejected:
 - swapping the existing compiled RoPE and in-place SiLU paths to the repo's
   Triton kernels: decode logits stayed aligned, but both vanilla and OmniKV
   throughput regressed
+- routing RMSNorm through Triton kernels: standalone microbenchmarks looked
+  promising, but end-to-end 128k bs4 decode regressed and was reverted
 
 ## Environment
 
@@ -92,6 +94,8 @@ Resolved OmniKV parameters:
 | Triton RoPE/SiLU rejected | omnikv | 128000 | 4 | 133.43 | 29.98 | reverted after regression | same as above |
 | final retained | vanilla | 128000 | 4 | 152.04 | 26.31 | retained max-len/top-k/workspace/greedy path | `/data2/haojitai/outputs/Sparse-vLLM/omnikv_decode_128k_bs4/final_retained_20260516_045011/vanilla_omnikv_128k_bs4_out64.log` |
 | final retained | omnikv | 128000 | 4 | 142.10 | 28.15 | final measured speedup `0.93x` vs vanilla | same as above |
+| Triton RMSNorm rejected | vanilla | 128000 | 4 | 139.50 | 28.67 | reverted after regression | `/data2/haojitai/outputs/Sparse-vLLM/omnikv_decode_128k_bs4/triton_rmsnorm_20260516_045852/vanilla_omnikv_128k_bs4_out64.log` |
+| Triton RMSNorm rejected | omnikv | 128000 | 4 | 135.23 | 29.58 | reverted after regression | same as above |
 
 The target based on the final full-attention baseline is
 `152.04 * 2.5 = 380.10 tok/s`. The final retained OmniKV run reaches
@@ -155,6 +159,15 @@ The rejected Triton RoPE/SiLU variant was checked before reverting:
   `mean_abs_diff=0.059485841542482376`, `argmax_match=true`
 - Rejected because the corresponding 128k bs4 throughput run regressed to
   `133.43 tok/s` for OmniKV.
+
+The rejected Triton RMSNorm variant was checked before reverting:
+
+- Result file:
+  `/data2/haojitai/outputs/Sparse-vLLM/omnikv_decode_128k_bs4/logits_smoke_triton_rmsnorm_20260516_045808/long_omnikv.json`
+- Decode result: `max_abs_diff=0.5`,
+  `mean_abs_diff=0.03933897614479065`, `argmax_match=true`
+- Rejected because the corresponding 128k bs4 throughput run regressed to
+  `135.23 tok/s` for OmniKV.
 
 ## Profiling Notes
 
