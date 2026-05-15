@@ -23,6 +23,16 @@ Retained code changes:
 - reuse decode stage1/stage2 workspace buffers within a decode step
 - fast-path greedy sampling to avoid building the stochastic sampling path when
   every sequence uses `temperature=0`
+- add an explicit `omnikv_decode_cuda_graph` path for fixed-batch greedy OmniKV
+  decode on TP=1:
+  - engine warmup pre-captures `run_model + argmax` for `max_decoding_seqs`
+  - decode steps update stable-address `input_ids`, `positions`,
+    `slot_mapping`, `context_lens`, and `req_indices` buffers before graph
+    replay
+  - graph keepalive retains captured sparse-view tensors so later real prefill
+    cannot invalidate graph addresses
+  - ordinary HF/Sparse-VLLM logits comparison still uses the non-graph
+    `run_model()` path
 
 Tested but rejected:
 
@@ -48,6 +58,13 @@ Tested but rejected:
 - aggressive OmniKV ablation with `full_attention_layers="0"`: reduced TTFT
   and kept decode argmax aligned in the smoke case, but logit drift increased
   and 128k bs4 decode still reached only `147.18 tok/s`
+- fixed-view CUDA Graph replay of OmniKV `run_model()` after a completed 128k
+  bs4 prefill: a feasibility probe reduced model-only decode time from
+  `26.72 ms` to `9.80 ms`, but it was not a correct generation loop because
+  token ids, positions, slot mappings, sparse views, cache state, and sampling
+  metadata were captured from one static step
+- graph decode `BLOCK_SEQ=512`: still slower than 256 on the 128k bs4 graph
+  path (`335.67 tok/s` at out512), so the retained path keeps 256
 
 ## Environment
 
@@ -73,8 +90,14 @@ CUDA_VISIBLE_DEVICES=6 PYTHONPATH=$PWD/src conda run -n svllm \
   --methods <vanilla|omnikv> \
   --lengths 128000 \
   --batch_sizes 4 \
-  --output_len 64 \
+  --output_len <64|512|2048|4096> \
   --hyper_params '{"gpu_memory_utilization":0.9,"engine_prefill_chunk_size":4096,"tensor_parallel_size":1,"max_num_seqs_in_batch":4,"max_decoding_seqs":4,"decode_keep_tokens":4096,"prefill_keep_tokens":4096,"sink_keep_tokens":8,"recent_keep_tokens":128,"full_attention_layers":"0,1,2,4,7,14","chunk_prefill_accel_omnikv":true,"mlp_chunk_size":16384,"throughput_log_interval_s":0.0}'
+```
+
+For the retained graph run, OmniKV additionally sets:
+
+```json
+{"omnikv_decode_cuda_graph": true}
 ```
 
 Resolved OmniKV parameters:
@@ -108,13 +131,25 @@ Resolved OmniKV parameters:
 | empty decode score rejected | vanilla | 128000 | 4 | 148.08 | 27.01 | same-run baseline | `/data2/haojitai/outputs/Sparse-vLLM/omnikv_decode_128k_bs4/decode_score_empty_20260516_050852/vanilla_omnikv_128k_bs4_out64.log` |
 | empty decode score rejected | omnikv | 128000 | 4 | 124.99 | 32.00 | reverted after regression | same as above |
 | aggressive full0 ablation | omnikv | 128000 | 4 | 147.18 | 27.18 | `full_attention_layers="0"`, not the paper/default path | `/data2/haojitai/outputs/Sparse-vLLM/omnikv_decode_128k_bs4/aggressive_full0_20260516_051516/omnikv_128k_bs4_out64.log` |
+| fixed-view graph probe | omnikv | 128000 | 4 | model-only 408.3 est. | 9.80 model ms | not a correct generation loop | `/data2/haojitai/outputs/Sparse-vLLM/omnikv_decode_128k_bs4/cudagraph_feasibility_20260516_051814/summary.json` |
+| graph no prewarm | omnikv | 128000 | 4 | 305.68 | 13.09 | out512; first decode includes warmup/capture | `/data2/haojitai/outputs/Sparse-vLLM/omnikv_decode_128k_bs4/graph_128k_bs4_out512_20260516_053030/omnikv_128k_bs4_out512_graph.log` |
+| graph no prewarm | omnikv | 128000 | 4 | 368.45 | 10.86 | out2048; capture amortized but still below target | `/data2/haojitai/outputs/Sparse-vLLM/omnikv_decode_128k_bs4/graph_128k_bs4_out2048_20260516_053200/omnikv_128k_bs4_out2048_graph.log` |
+| graph no prewarm | omnikv | 128000 | 4 | 375.55 | 10.65 | out4096; below same-length 2.5x target | `/data2/haojitai/outputs/Sparse-vLLM/omnikv_decode_128k_bs4/graph_128k_bs4_out4096_20260516_053332/omnikv_128k_bs4_out4096_graph.log` |
+| same-length baseline | vanilla | 128000 | 4 | 153.92 | 25.99 | out4096 full-attention baseline | `/data2/haojitai/outputs/Sparse-vLLM/omnikv_decode_128k_bs4/vanilla_128k_bs4_out4096_20260516_053523/vanilla_128k_bs4_out4096.log` |
+| retained graph prewarm | omnikv | 128000 | 4 | 395.72 | 10.11 | out4096; warmup pre-captures graph, formal decode is replay-only | `/data2/haojitai/outputs/Sparse-vLLM/omnikv_decode_128k_bs4/graph_prewarm_128k_bs4_out4096_20260516_054817/omnikv_128k_bs4_out4096_graph_prewarm.log` |
 
-The target based on the final full-attention baseline is
-`152.04 * 2.5 = 380.10 tok/s`. The final retained OmniKV run reaches
-`142.10 tok/s`, or `0.93x` of full attention. The short-context dense probe
-reaches only `153.71 tok/s`, so the present eager per-layer execution path has
-a dense-model launch/linear/lm-head floor far above the 2.5x target. Sparse
-attention optimizations alone are therefore insufficient for this target.
+Same-length target for the final retained run:
+
+- Vanilla full-attention baseline, out4096: `153.92 tok/s`
+- Required `2.5x`: `153.92 * 2.5 = 384.80 tok/s`
+- Retained OmniKV graph-prewarm run: `395.72 tok/s`
+- Final speedup: `395.72 / 153.92 = 2.57x`
+
+The earlier eager retained path reached only `142.10 tok/s` at out64, or
+`0.93x` of full attention. The short-context dense probe reached only
+`153.71 tok/s`, so sparse attention changes alone were insufficient; the
+successful path is reducing per-token launch overhead with a fixed-batch CUDA
+Graph while preserving OmniKV's paper/default layer routing.
 
 ## Logits Checks
 
@@ -202,6 +237,26 @@ diagnostic, not as the retained/paper path:
 - Throughput result: `147.18 tok/s`, still below the retained full-attention
   baseline `152.04 tok/s`.
 
+After adding the graph-prewarm path, the non-graph logits comparison was rerun
+against the unchanged HF OmniKV backend:
+
+- Result file:
+  `/data2/haojitai/outputs/Sparse-vLLM/omnikv_decode_128k_bs4/logits_smoke_graph_branch_20260516_055109/long_omnikv.json`
+- Decode result: `max_abs_diff=0.28125`,
+  `mean_abs_diff=0.030360523611307144`, `argmax_match=true`
+- top-k overlap: top-1 `1.0`, top-5 `1.0`, top-10 `0.9`,
+  top-50 `1.0`
+
+Graph replay was also compared against the eager Sparse-VLLM OmniKV greedy
+token path in separate processes:
+
+- Compare result:
+  `/data2/haojitai/outputs/Sparse-vLLM/omnikv_decode_128k_bs4/graph_vs_eager_tokens_separate_20260516_055008/compare.json`
+- Config: 2048-token prompts, bs4, `max_tokens=32`, `decode_keep_tokens=256`,
+  `prefill_keep_tokens=256`, `sink_keep_tokens=8`, `recent_keep_tokens=64`,
+  `full_attention_layers="0,1,2,4,7,14"`
+- Result: exact token match between graph and eager Sparse-VLLM OmniKV
+
 ## Profiling Notes
 
 High-level synchronized profile after max-len/top-k optimization:
@@ -218,6 +273,22 @@ many small eager model kernels plus score-bearing observation attention, not by
 Python view construction alone. The short-context dense probe confirms that the
 current eager dense model path already sits around 26 ms/step at BS4.
 
+CUDA Graph feasibility probe:
+
+- Output:
+  `/data2/haojitai/outputs/Sparse-vLLM/omnikv_decode_128k_bs4/cudagraph_feasibility_20260516_051814/summary.json`
+- Config: OmniKV, 128k context, bs4, `output_len=3` setup to reach decode
+  state, paper/default `full_attention_layers="0,1,2,4,7,14"`,
+  `decode_keep_tokens=4096`, `prefill_keep_tokens=4096`,
+  `chunk_prefill_accel_omnikv=True`, `mlp_chunk_size=16384`
+- Result: eager model-only decode `26.7199 ms`; fixed-view graph replay
+  `9.7963 ms`; prefill completed in 32 chunked steps
+- Interpretation: graph capture has enough launch-overhead headroom for the
+  target, but the probe intentionally reused one captured decode view. A
+  retained implementation must use stable-address decode metadata buffers and
+  update their contents before graph replay so each generated token observes
+  the correct ids, positions, cache slots, and sparse decode views.
+
 ## Verification
 
 Commands run during this iteration:
@@ -226,9 +297,13 @@ Commands run during this iteration:
 conda run -n svllm python -m py_compile \
   src/sparsevllm/engine/cache_manager/base.py \
   src/sparsevllm/engine/cache_manager/standard.py \
+  src/sparsevllm/engine/llm_engine.py \
+  src/sparsevllm/engine/model_runner.py \
   src/sparsevllm/engine/sparse_controller.py \
+  src/sparsevllm/config.py \
   src/sparsevllm/layers/attention.py \
   src/sparsevllm/triton_kernel/omnikv_fused.py \
+  src/sparsevllm/utils/profiler.py \
   src/sparsevllm/utils/context.py
 
 git diff --check
@@ -244,11 +319,17 @@ conda run -n svllm python -m unittest discover -s tests -p 'test*.py'
 Result:
 
 - `compileall`: passed
-- unittest discover: 70 tests, OK
+- unittest discover: 72 tests, OK
 
 Additional focused checks:
 
 - `python -m py_compile src/sparsevllm/engine/sparse_controller.py`: passed
 - `python -m py_compile src/sparsevllm/layers/attention.py`: passed
+- graph-vs-eager Sparse-VLLM token smoke:
+  `/data2/haojitai/outputs/Sparse-vLLM/omnikv_decode_128k_bs4/graph_vs_eager_tokens_separate_20260516_055008/compare.json`,
+  `match=true`
+- HF logits smoke:
+  `/data2/haojitai/outputs/Sparse-vLLM/omnikv_decode_128k_bs4/logits_smoke_graph_branch_20260516_055109/long_omnikv.json`,
+  decode `argmax_match=true`
 - `python -m unittest tests.test_mlp_chunking tests.test_sampler`: passed
 - `git diff --check`: passed

@@ -214,10 +214,15 @@ class LLMEngine:
         else:
             warmup_len = self.config.num_sink_tokens + self.config.num_top_tokens_in_prefill\
                          + self.config.num_recent_tokens + self.config.chunk_prefill_size + 1024
-        num_seqs = 1
+        graph_warmup = bool(getattr(self.config, "omnikv_decode_cuda_graph", False))
+        num_seqs = int(self.config.max_decoding_seqs) if graph_warmup else 1
         
         # 预热 1 个 Token 的生成（包含 Prefill 和 Decode）
-        sampling_params = SamplingParams(max_tokens=1)
+        sampling_params = SamplingParams(
+            max_tokens=2 if graph_warmup else 1,
+            temperature=0.0,
+            ignore_eos=graph_warmup,
+        )
         max_prompt_len = max(1, int(self.config.max_model_len) - int(sampling_params.max_tokens))
         if warmup_len > max_prompt_len:
             logger.warning(
@@ -227,11 +232,18 @@ class LLMEngine:
             warmup_len = max_prompt_len
         dummy_prompt = [0] * warmup_len
         
-        for _ in range(num_seqs):
-            self.add_request(dummy_prompt, sampling_params)
-            
-        while not self.is_finished():
-            self.step()
+        if graph_warmup:
+            self.model_runner.set_omnikv_decode_graph_max_context_len_override(self.config.max_model_len)
+
+        try:
+            for _ in range(num_seqs):
+                self.add_request(dummy_prompt, sampling_params)
+
+            while not self.is_finished():
+                self.step()
+        finally:
+            if graph_warmup:
+                self.model_runner.set_omnikv_decode_graph_max_context_len_override(None)
         logger.info("Warmup finished.")
 
     def exit(self):

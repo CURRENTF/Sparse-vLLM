@@ -153,6 +153,21 @@ class PrefillPolicyConfigTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Unsupported prefill_schedule_policy"):
             self.make_config(vllm_sparse_method="snapkv", prefill_schedule_policy="old_chunk_mode")
 
+    def test_omnikv_decode_cuda_graph_requires_omnikv(self):
+        cfg = self.make_config(vllm_sparse_method="omnikv", omnikv_decode_cuda_graph=True)
+        self.assertTrue(cfg.omnikv_decode_cuda_graph)
+
+        with self.assertRaisesRegex(ValueError, "only valid"):
+            self.make_config(vllm_sparse_method="snapkv", omnikv_decode_cuda_graph=True)
+
+    def test_omnikv_decode_cuda_graph_requires_single_tp(self):
+        with self.assertRaisesRegex(ValueError, "tensor_parallel_size=1"):
+            self.make_config(
+                vllm_sparse_method="omnikv",
+                omnikv_decode_cuda_graph=True,
+                tensor_parallel_size=2,
+            )
+
 
 class SchedulerPrefillPolicyTest(unittest.TestCase):
     def test_all_chunked_keeps_long_and_short_separate(self):

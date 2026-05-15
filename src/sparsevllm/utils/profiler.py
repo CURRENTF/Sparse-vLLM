@@ -27,11 +27,13 @@ class Profiler:
             yield
             return
         
-        if self.cuda_sync:
+        capturing = torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        if self.cuda_sync and not capturing:
             torch.cuda.synchronize()
         t1 = time.perf_counter()
         yield
-        if self.cuda_sync:
+        capturing = torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        if self.cuda_sync and not capturing:
             torch.cuda.synchronize()
         t2 = time.perf_counter()
         

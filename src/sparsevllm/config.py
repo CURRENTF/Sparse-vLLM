@@ -42,6 +42,7 @@ class Config:
     full_attn_layers: str | list[int] = "0" # useful for omnikv
     chunk_prefill_accel_omnikv: bool = False
     num_top_tokens_in_prefill: int | None = 8192
+    omnikv_decode_cuda_graph: bool = False
 
     # QuEST Config
     quest_chunk_size: int = 16
@@ -124,6 +125,14 @@ class Config:
             raise FileNotFoundError(f"Model directory does not exist: {self.model}")
         if not 1 <= self.tensor_parallel_size <= 8:
             raise ValueError(f"tensor_parallel_size must be in [1, 8], got {self.tensor_parallel_size}.")
+        self.omnikv_decode_cuda_graph = bool(self.omnikv_decode_cuda_graph)
+        if self.omnikv_decode_cuda_graph:
+            if self.vllm_sparse_method != "omnikv":
+                raise ValueError(
+                    "omnikv_decode_cuda_graph is only valid with vllm_sparse_method='omnikv'."
+                )
+            if self.tensor_parallel_size != 1:
+                raise ValueError("omnikv_decode_cuda_graph currently supports tensor_parallel_size=1 only.")
         if isinstance(self.deltakv_path, str):
             deltakv_path = self.deltakv_path.strip()
             self.deltakv_path = None if deltakv_path.lower() in {"", "none", "null"} else deltakv_path

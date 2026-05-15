@@ -253,3 +253,44 @@ class StandardCacheManager(CacheManager):
             input_ids = torch.tensor(input_ids_list, dtype=torch.int64, device="cuda")
             positions = torch.tensor(positions_list, dtype=torch.int64, device="cuda")
             return input_ids, positions, None
+
+    def prepare_decode_static(
+        self,
+        seqs: list[Sequence],
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        context_lens: torch.Tensor,
+        req_indices: torch.Tensor,
+    ):
+        """Prepare decode metadata into caller-owned static CUDA buffers.
+
+        Used by CUDA Graph decode replay: tensor addresses must stay stable, so
+        this avoids the ordinary per-step metadata tensor allocation path.
+        """
+        with profiler.record("cache_prepare_decode"):
+            batch_size = len(seqs)
+            if input_ids.numel() != batch_size or positions.numel() != batch_size:
+                raise ValueError("Static decode input buffers must match the decode batch size.")
+            if slot_mapping.numel() != batch_size or context_lens.numel() != batch_size or req_indices.numel() != batch_size:
+                raise ValueError("Static decode metadata buffers must match the decode batch size.")
+
+            input_ids_list = [seq.last_token for seq in seqs]
+            positions_list = [seq.num_tokens - 1 for seq in seqs]
+            seq_ids = [seq.seq_id for seq in seqs]
+
+            new_slots_batch = self._allocate_batch(seq_ids, 1)
+            row_indices = [self.seq_id_to_row[sid] for sid in seq_ids]
+
+            input_ids.copy_(torch.tensor(input_ids_list, dtype=torch.int64, device="cuda"))
+            positions.copy_(torch.tensor(positions_list, dtype=torch.int64, device="cuda"))
+            slot_mapping.copy_(new_slots_batch)
+            context_lens.copy_(torch.tensor(self.row_seq_lens[row_indices], dtype=torch.int32, device="cuda"))
+            req_indices.copy_(torch.tensor(row_indices, dtype=torch.int32, device="cuda"))
+
+            self.layer_batch_state.slot_mapping = slot_mapping
+            self.layer_batch_state.context_lens = context_lens
+            self.layer_batch_state.max_context_len = int(max(self.row_seq_lens[row_indices])) if row_indices else 0
+            self.layer_batch_state.req_indices = req_indices
+
+            return input_ids, positions, None
