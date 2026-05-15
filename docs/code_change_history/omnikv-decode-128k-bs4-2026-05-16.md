@@ -42,6 +42,9 @@ Tested but rejected:
 - compiling the isolated Qwen2 MLP with `torch.compile(mode="reduce-overhead")`:
   microbenchmark was effectively neutral (`0.163 ms` eager vs `0.160 ms`
   compiled for BS4), so no code change was made
+- using `torch.empty` instead of `torch.full(-1e20)` for OmniKV decode
+  attention-score buffers: logits stayed aligned, but 128k bs4 decode
+  regressed and was reverted
 
 ## Environment
 
@@ -99,6 +102,8 @@ Resolved OmniKV parameters:
 | final retained | omnikv | 128000 | 4 | 142.10 | 28.15 | final measured speedup `0.93x` vs vanilla | same as above |
 | Triton RMSNorm rejected | vanilla | 128000 | 4 | 139.50 | 28.67 | reverted after regression | `/data2/haojitai/outputs/Sparse-vLLM/omnikv_decode_128k_bs4/triton_rmsnorm_20260516_045852/vanilla_omnikv_128k_bs4_out64.log` |
 | Triton RMSNorm rejected | omnikv | 128000 | 4 | 135.23 | 29.58 | reverted after regression | same as above |
+| empty decode score rejected | vanilla | 128000 | 4 | 148.08 | 27.01 | same-run baseline | `/data2/haojitai/outputs/Sparse-vLLM/omnikv_decode_128k_bs4/decode_score_empty_20260516_050852/vanilla_omnikv_128k_bs4_out64.log` |
+| empty decode score rejected | omnikv | 128000 | 4 | 124.99 | 32.00 | reverted after regression | same as above |
 
 The target based on the final full-attention baseline is
 `152.04 * 2.5 = 380.10 tok/s`. The final retained OmniKV run reaches
@@ -171,6 +176,15 @@ The rejected Triton RMSNorm variant was checked before reverting:
   `mean_abs_diff=0.03933897614479065`, `argmax_match=true`
 - Rejected because the corresponding 128k bs4 throughput run regressed to
   `135.23 tok/s` for OmniKV.
+
+The rejected empty decode-score buffer variant was checked before reverting:
+
+- Result file:
+  `/data2/haojitai/outputs/Sparse-vLLM/omnikv_decode_128k_bs4/logits_smoke_decode_score_empty_20260516_050807/long_omnikv.json`
+- Decode result: `max_abs_diff=0.28125`,
+  `mean_abs_diff=0.030360523611307144`, `argmax_match=true`
+- Rejected because the corresponding 128k bs4 throughput run regressed to
+  `124.99 tok/s` for OmniKV.
 
 ## Profiling Notes
 
