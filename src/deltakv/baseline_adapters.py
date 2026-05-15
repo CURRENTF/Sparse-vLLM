@@ -5,6 +5,7 @@ import torch
 from transformers import AutoConfig
 
 from deltakv.configs.model_config_cls import KVQwen2Config, KVLlamaConfig
+from deltakv.modeling.cache_pipeline import HF_SPARSE_CACHE_OMNIKV
 
 
 def _prepend_sys_path(path: str):
@@ -36,6 +37,8 @@ def load_omnikv_model(model_path: str, infer_config: dict, cuda_device):
     # OmniKV is the no-compression / no-cluster path over the same runtime model family.
     config.use_compression = False
     config.use_cluster = False
+    config.kv_quant_bits = 0
+    config.hf_sparse_cache_impl = HF_SPARSE_CACHE_OMNIKV
 
     return KVModel.from_pretrained(
         model_path,
