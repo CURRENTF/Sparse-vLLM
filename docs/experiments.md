@@ -242,7 +242,61 @@ conda run -n svllm python -u benchmark/long_bench/pred.py \
 | snapkv | 0 | 200 | 0 | 59.31 | `/data2/haojitai/outputs/benchmark/long_bench/hotpotqa_correctness_sparsevllm_20260516_2305/snapkv` |
 | pyramidkv | 0 | 200 | 0 | 46.94 | `/data2/haojitai/outputs/benchmark/long_bench/hotpotqa_correctness_sparsevllm_20260516_2305/pyramidkv` |
 | quest | 0 | 200 | 0 | 59.53 | `/data2/haojitai/outputs/benchmark/long_bench/hotpotqa_correctness_sparsevllm_20260516_2305/quest` |
-| omnikv | 0 | 200 | 0 | 54.75 | `/data2/haojitai/outputs/benchmark/long_bench/hotpotqa_correctness_sparsevllm_20260516_2305/omnikv` |
+| omnikv (`chunk_prefill_accel_omnikv=true`) | 0 | 200 | 0 | 54.75 | `/data2/haojitai/outputs/benchmark/long_bench/hotpotqa_correctness_sparsevllm_20260516_2305/omnikv` |
+| omnikv (`chunk_prefill_accel_omnikv=false`) | 0 | 200 | 0 | 59.65 | `/data2/haojitai/outputs/benchmark/long_bench/hotpotqa_omnikv_prefill_accel_ablation_20260516_2344/sparsevllm-omnikv-no-prefill-accel` |
 
 - Reference anchors: previous full LongBench DeltaKV HotPotQA record in `docs/code_change_history/prefill-schedule-policy-2026-05-16.md` is `59.69`; local archived `qwen25_7b_deltakv_cr30/result.json` has `hotpotqa=58.35`.
-- Notes: All completed methods produced 200 JSONL rows with no empty predictions, so the output/eval path is healthy. Vanilla, SnapKV, Quest, and OmniKV are broadly aligned with the reference range. StreamingLLM and PyramidKV are lower on HotPotQA under these retention settings, but they completed normally and should be treated as quality differences rather than pipeline failures.
+- Notes: All completed methods produced 200 JSONL rows with no empty predictions, so the output/eval path is healthy. The OmniKV correctness score should use `chunk_prefill_accel_omnikv=false`, which is the config default and gives `59.65`, aligned with vanilla, SnapKV, Quest, and the reference range. The `54.75` OmniKV result was caused by explicitly enabling the experimental OmniKV prefill acceleration in this LongBench command and should not be used as the correctness score. StreamingLLM and PyramidKV are lower on HotPotQA under these retention settings, but they completed normally and should be treated as quality differences rather than pipeline failures.
+
+### 2026-05-16 23:40 CST - omnikv-hotpotqa-prefill-accel-ablation
+
+- Status: completed
+- Goal: Check whether the low Sparse-VLLM OmniKV HotPotQA score came from enabling OmniKV prefill acceleration, and compare against the HF OmniKV path.
+- Working dir: `/home/haojitai/projects/Sparse-vLLM`
+- Commands:
+
+```bash
+CUDA_VISIBLE_DEVICES=5 \
+DELTAKV_OUTPUT_DIR=/data2/haojitai/outputs \
+DELTAKV_LONGBENCH_DATA_DIR=/data2/haojitai/datasets/LongBench \
+PYTHONPATH=/home/haojitai/projects/Sparse-vLLM/src:${PYTHONPATH:-} \
+conda run -n svllm python -u benchmark/long_bench/pred.py \
+  --model qwen25-7b-hf-omnikv-hotpotqa \
+  --model_path /data2/haojitai/models/Qwen2.5-7B-Instruct-1M \
+  --tokenizer_path /data2/haojitai/models/Qwen2.5-7B-Instruct-1M \
+  --ws 1 --batch_size 1 --backend hf \
+  --sparse_method omnikv \
+  --task hotpotqa \
+  --temperature 0 --top_p 1 --top_k 20 --thinking_mode off \
+  --hyper_param '{"gpu_memory_utilization":0.9,"engine_prefill_chunk_size":4096,"max_num_batched_tokens":65536,"decode_cuda_graph":false,"sink_keep_tokens":8,"recent_keep_tokens":128,"decode_keep_tokens":4096,"prefill_keep_tokens":4096,"quest_token_budget":4096,"chunk_prefill_accel_omnikv":true,"full_attention_layers":"0,1,2,4,7,14"}' \
+  --output_root /data2/haojitai/outputs/benchmark/long_bench/hotpotqa_hf_svllm_omnikv_compare_20260516_2340/hf-omnikv
+
+CUDA_VISIBLE_DEVICES=5 \
+DELTAKV_OUTPUT_DIR=/data2/haojitai/outputs \
+DELTAKV_LONGBENCH_DATA_DIR=/data2/haojitai/datasets/LongBench \
+PYTHONPATH=/home/haojitai/projects/Sparse-vLLM/src:${PYTHONPATH:-} \
+conda run -n svllm python -u benchmark/long_bench/pred.py \
+  --model qwen25-7b-sparsevllm-omnikv-no-prefill-accel-hotpotqa \
+  --model_path /data2/haojitai/models/Qwen2.5-7B-Instruct-1M \
+  --tokenizer_path /data2/haojitai/models/Qwen2.5-7B-Instruct-1M \
+  --ws 1 --batch_size 1 --backend sparsevllm \
+  --sparse_method omnikv \
+  --task hotpotqa \
+  --temperature 0 --top_p 1 --top_k 20 --thinking_mode off \
+  --hyper_param '{"gpu_memory_utilization":0.9,"engine_prefill_chunk_size":4096,"max_num_batched_tokens":65536,"decode_cuda_graph":false,"sink_keep_tokens":8,"recent_keep_tokens":128,"decode_keep_tokens":4096,"prefill_keep_tokens":4096,"quest_token_budget":4096,"chunk_prefill_accel_omnikv":false,"full_attention_layers":"0,1,2,4,7,14"}' \
+  --output_root /data2/haojitai/outputs/benchmark/long_bench/hotpotqa_omnikv_prefill_accel_ablation_20260516_2344/sparsevllm-omnikv-no-prefill-accel
+```
+
+- Code: `main` / `49920ae6d18c83a45d0c7d043c4a72ad6fca9f90`; worktree clean at run start.
+- Environment: `guest-KR6288-X2-A0-R0-00`, conda env `svllm`, GPU `CUDA_VISIBLE_DEVICES=5` (`NVIDIA H100 80GB HBM3`), TP=1.
+- Data: `/data2/haojitai/datasets/LongBench/data/hotpotqa.jsonl`, 200 examples.
+- Model: `/data2/haojitai/models/Qwen2.5-7B-Instruct-1M`, greedy decode with `temperature=0`, `top_p=1`, `top_k=20`, `batch_size=1`, `thinking_mode=off`.
+- Results:
+
+| Variant | Rows | Empty pred | HotPotQA score | Output dir |
+|---|---:|---:|---:|---|
+| HF OmniKV, prefill accel true | 200 | 0 | 59.23 | `/data2/haojitai/outputs/benchmark/long_bench/hotpotqa_hf_svllm_omnikv_compare_20260516_2340/hf-omnikv` |
+| Sparse-VLLM OmniKV, prefill accel true | 200 | 0 | 54.75 | `/data2/haojitai/outputs/benchmark/long_bench/hotpotqa_correctness_sparsevllm_20260516_2305/omnikv` |
+| Sparse-VLLM OmniKV, prefill accel false | 200 | 0 | 59.65 | `/data2/haojitai/outputs/benchmark/long_bench/hotpotqa_omnikv_prefill_accel_ablation_20260516_2344/sparsevllm-omnikv-no-prefill-accel` |
+
+- Notes: Sparse-VLLM OmniKV aligns with HF and the expected HotPotQA range when `chunk_prefill_accel_omnikv=false`. The low `54.75` score is isolated to the Sparse-VLLM experimental prefill-acceleration path, so LongBench correctness runs should leave that option disabled.
