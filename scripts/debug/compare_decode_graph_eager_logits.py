@@ -161,7 +161,20 @@ def _run_decode_logits_isolated(**kwargs) -> torch.Tensor:
 def main():
     parser = argparse.ArgumentParser(description="Compare Sparse-VLLM eager decode logits with decode CUDA Graph logits.")
     parser.add_argument("--model_path", required=True)
-    parser.add_argument("--method", default="vanilla", choices=("vanilla", "omnikv"))
+    parser.add_argument(
+        "--method",
+        default="vanilla",
+        choices=(
+            "vanilla",
+            "streamingllm",
+            "attention-sink",
+            "attention_sink",
+            "snapkv",
+            "pyramidkv",
+            "quest",
+            "omnikv",
+        ),
+    )
     parser.add_argument("--prompt_len", type=int, default=2048)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--max_tokens", type=int, default=3)

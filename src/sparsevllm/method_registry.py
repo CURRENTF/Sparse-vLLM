@@ -37,6 +37,10 @@ CANONICAL_SPARSE_METHODS = {
 
 SUPPORTED_SPARSE_METHODS = set(CANONICAL_SPARSE_METHODS)
 
+DECODE_CUDA_GRAPH_SUPPORTED_METHODS = {
+    method for method in CANONICAL_SPARSE_METHODS if not method.startswith("deltakv")
+}
+
 _DEFAULT_PREFILL_POLICY_BY_METHOD = {
     "": PREFILL_POLICY_ALL_CHUNKED,
     "streamingllm": PREFILL_POLICY_ALL_CHUNKED,
@@ -72,6 +76,10 @@ def normalize_sparse_method(method: str | None) -> str:
 
 def is_deltakv_method(method: str | None) -> bool:
     return normalize_sparse_method(method).startswith("deltakv")
+
+
+def is_decode_cuda_graph_supported(method: str | None) -> bool:
+    return normalize_sparse_method(method) in DECODE_CUDA_GRAPH_SUPPORTED_METHODS
 
 
 def get_default_prefill_schedule_policy(method: str | None) -> str:

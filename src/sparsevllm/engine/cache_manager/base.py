@@ -233,6 +233,17 @@ class CacheManager(ABC):
         """Optional method-specific decode-time logical view builder."""
         return active_slots, req_indices, context_lens
 
+    def set_decode_static_max_context_len(self, max_context_len: int):
+        """Pin graph-captured decode kernels to a fixed max context length."""
+        max_context_len = int(max_context_len)
+        layer_batch_state = getattr(self, "layer_batch_state", None)
+        if layer_batch_state is not None:
+            layer_batch_state.max_context_len = max_context_len
+        layer_batch_states = getattr(self, "layer_batch_states", None)
+        if layer_batch_states is not None:
+            for state in layer_batch_states:
+                state.max_context_len = max_context_len
+
     @property
     @abstractmethod
     def num_free_slots(self) -> int:

@@ -31,6 +31,7 @@ class DecodeCudaGraphState:
     logits: torch.Tensor | None = None
     token_ids: torch.Tensor | None = None
     keepalive: list[object] = field(default_factory=list)
+    sparse_state_refs: dict[int, dict[str, object]] = field(default_factory=dict)
 
 
 class DecodeCudaGraphRunner:
@@ -153,14 +154,38 @@ class DecodeCudaGraphRunner:
             is_long_text=bool(is_long_text),
         )
 
-        layer_batch_state = getattr(self.cache_manager, "layer_batch_state", None)
-        if layer_batch_state is not None:
-            layer_batch_state.slot_mapping = state.slot_mapping
-            layer_batch_state.context_lens = state.context_lens
-            layer_batch_state.max_context_len = int(state.key.max_context_len)
-            layer_batch_state.req_indices = state.req_indices
+        self.cache_manager.set_decode_static_max_context_len(int(state.key.max_context_len))
 
         return input_ids, positions
+
+    def _snapshot_sparse_state_refs(self) -> dict[int, dict[str, object]]:
+        refs: dict[int, dict[str, object]] = {}
+        for layer_idx, sparse_state in self.sparse_controller.layer_batch_sparse_states.items():
+            refs[int(layer_idx)] = {
+                "attn_score": sparse_state.attn_score,
+                "active_indices": sparse_state.active_indices,
+                "active_slots": sparse_state.active_slots,
+                "req_indices": sparse_state.req_indices,
+                "context_lens": sparse_state.context_lens,
+                "max_context_len": sparse_state.max_context_len,
+                "active_compressed_indices": sparse_state.active_compressed_indices,
+                "global_req_indices": sparse_state.global_req_indices,
+                "deltakv_free_temp_slots": sparse_state.deltakv_free_temp_slots,
+            }
+        return refs
+
+    def _restore_sparse_state_refs(self, state: DecodeCudaGraphState):
+        """Restore Python sparse-state pointers captured by this graph.
+
+        CUDA Graph replay uses the tensor addresses captured during warmup. A
+        real request's prefill can overwrite SparseController Python fields
+        before decode; restoring here keeps post-forward sparse eviction reading
+        the same stable tensors that prepare_decode_static updates in place.
+        """
+        for layer_idx, refs in state.sparse_state_refs.items():
+            sparse_state = self.sparse_controller.layer_batch_sparse_states[layer_idx]
+            for name, value in refs.items():
+                setattr(sparse_state, name, value)
 
     def _capture(
         self,
@@ -196,6 +221,7 @@ class DecodeCudaGraphRunner:
         state.graph = graph
         state.logits = logits
         state.token_ids = token_ids
+        state.sparse_state_refs = self._snapshot_sparse_state_refs()
 
         keepalive: list[object] = [
             ctx,
@@ -260,6 +286,7 @@ class DecodeCudaGraphRunner:
             return logits, token_ids
 
         assert state.logits is not None
+        self._restore_sparse_state_refs(state)
         with profiler.record("decode_cuda_graph_replay"):
             state.graph.replay()
         logits = state.logits[:real_batch_size]

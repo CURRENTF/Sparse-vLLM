@@ -16,6 +16,7 @@ from sparsevllm.method_registry import (
     PREFILL_POLICY_BY_METHOD,
     PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
     get_default_prefill_schedule_policy,
+    is_decode_cuda_graph_supported,
 )
 
 
@@ -153,10 +154,21 @@ class PrefillPolicyConfigTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Unsupported prefill_schedule_policy"):
             self.make_config(vllm_sparse_method="snapkv", prefill_schedule_policy="old_chunk_mode")
 
-    def test_decode_cuda_graph_supports_vanilla_and_omnikv(self):
-        cfg = self.make_config(vllm_sparse_method="vanilla", decode_cuda_graph=True)
-        self.assertTrue(cfg.decode_cuda_graph)
-        self.assertEqual(cfg.vllm_sparse_method, "")
+    def test_decode_cuda_graph_supports_non_deltakv_methods(self):
+        for method in (
+            "vanilla",
+            "streamingllm",
+            "attention-sink",
+            "attention_sink",
+            "snapkv",
+            "pyramidkv",
+            "quest",
+            "omnikv",
+        ):
+            with self.subTest(method=method):
+                cfg = self.make_config(vllm_sparse_method=method, decode_cuda_graph=True)
+                self.assertTrue(cfg.decode_cuda_graph)
+                self.assertTrue(is_decode_cuda_graph_supported(cfg.vllm_sparse_method))
 
         cfg = self.make_config(vllm_sparse_method="omnikv", omnikv_decode_cuda_graph=True)
         self.assertTrue(cfg.decode_cuda_graph)
@@ -165,8 +177,21 @@ class PrefillPolicyConfigTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "only valid"):
             self.make_config(vllm_sparse_method="snapkv", omnikv_decode_cuda_graph=True)
 
-        with self.assertRaisesRegex(ValueError, "vanilla and omnikv"):
-            self.make_config(vllm_sparse_method="snapkv", decode_cuda_graph=True)
+    def test_decode_cuda_graph_rejects_deltakv_family(self):
+        for method in (
+            "deltakv",
+            "deltakv-triton",
+            "deltakv-triton-v2",
+            "deltakv-triton-v3",
+            "deltakv-triton-v4",
+            "deltakv-delta-quant",
+            "deltakv_delta_quant",
+            "deltakv-standalone",
+            "deltakv-snapkv",
+        ):
+            with self.subTest(method=method):
+                with self.assertRaisesRegex(ValueError, "does not support DeltaKV"):
+                    self.make_config(vllm_sparse_method=method, decode_cuda_graph=True)
 
     def test_decode_cuda_graph_requires_single_tp(self):
         with self.assertRaisesRegex(ValueError, "tensor_parallel_size=1"):

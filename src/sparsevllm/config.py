@@ -3,8 +3,11 @@ from dataclasses import dataclass
 from transformers import AutoConfig, Qwen3Config
 from typing import Union
 from sparsevllm.method_registry import (
+    DECODE_CUDA_GRAPH_SUPPORTED_METHODS,
     PREFILL_POLICY_AUTO,
     SUPPORTED_SPARSE_METHODS,
+    is_decode_cuda_graph_supported,
+    is_deltakv_method,
     normalize_sparse_method,
     resolve_prefill_schedule_policy,
 )
@@ -196,8 +199,16 @@ class Config:
         if self.decode_cuda_graph_capture_sampling and not self.decode_cuda_graph:
             raise ValueError("decode_cuda_graph_capture_sampling requires decode_cuda_graph=True.")
         if self.decode_cuda_graph:
-            if self.vllm_sparse_method not in {"", "omnikv"}:
-                raise ValueError("decode_cuda_graph currently supports vanilla and omnikv only.")
+            if not is_decode_cuda_graph_supported(self.vllm_sparse_method):
+                if is_deltakv_method(self.vllm_sparse_method):
+                    raise ValueError("decode_cuda_graph does not support DeltaKV methods yet.")
+                supported = ", ".join(
+                    repr(method) for method in sorted(DECODE_CUDA_GRAPH_SUPPORTED_METHODS) if method
+                )
+                raise ValueError(
+                    "decode_cuda_graph supports non-DeltaKV methods only. "
+                    f"Supported methods: '', {supported}."
+                )
             if self.tensor_parallel_size != 1:
                 raise ValueError("decode_cuda_graph currently supports tensor_parallel_size=1 only.")
             self.decode_cuda_graph_capture_sizes = _resolve_decode_cuda_graph_capture_sizes(

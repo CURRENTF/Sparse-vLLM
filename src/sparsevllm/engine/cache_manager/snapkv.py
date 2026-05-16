@@ -26,6 +26,7 @@ class SnapKVCacheManager(CacheManager):
         self.free_rows = []
         self.row_seq_lens = []
         self.layer_batch_states = [LayerBatchStates() for _ in range(self.num_layers)]
+        self._decode_static_buffers: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 
         for layer_id in range(self.num_layers):
             num_slots = (
@@ -340,3 +341,94 @@ class SnapKVCacheManager(CacheManager):
             positions = torch.tensor(positions_list, dtype=torch.int64, device="cuda")
             return input_ids, positions, None
 
+    def _get_decode_static_buffers(
+        self,
+        graph_batch_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        graph_batch_size = int(graph_batch_size)
+        buffers = self._decode_static_buffers.get(graph_batch_size)
+        if buffers is None:
+            buffers = (
+                torch.empty((self.num_layers, graph_batch_size), dtype=torch.int32, device="cuda"),
+                torch.empty((self.num_layers, graph_batch_size), dtype=torch.int32, device="cuda"),
+                torch.empty((self.num_layers, graph_batch_size), dtype=torch.int32, device="cuda"),
+            )
+            self._decode_static_buffers[graph_batch_size] = buffers
+        return buffers
+
+    @torch.no_grad()
+    def prepare_decode_static(
+        self,
+        seqs: list[Sequence],
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        context_lens: torch.Tensor,
+        req_indices: torch.Tensor,
+    ):
+        """Prepare per-layer decode metadata into graph-stable CUDA buffers."""
+        with profiler.record("cache_prepare_decode"):
+            real_batch_size = len(seqs)
+            graph_batch_size = int(input_ids.numel())
+            if real_batch_size <= 0:
+                raise ValueError("Static decode requires a non-empty real decode batch.")
+            if positions.numel() != graph_batch_size:
+                raise ValueError("Static decode input buffers must have the same graph batch size.")
+            if (
+                slot_mapping.numel() != graph_batch_size
+                or context_lens.numel() != graph_batch_size
+                or req_indices.numel() != graph_batch_size
+            ):
+                raise ValueError("Static decode metadata buffers must have the same graph batch size.")
+            if real_batch_size > graph_batch_size:
+                raise ValueError(
+                    "Static decode graph batch is smaller than the real decode batch: "
+                    f"graph={graph_batch_size}, real={real_batch_size}."
+                )
+
+            input_ids_list = [seq.last_token for seq in seqs]
+            positions_list = [seq.num_tokens - 1 for seq in seqs]
+            seq_ids = [seq.seq_id for seq in seqs]
+
+            input_ids[:real_batch_size].copy_(torch.tensor(input_ids_list, dtype=torch.int64, device="cuda"))
+            positions[:real_batch_size].copy_(torch.tensor(positions_list, dtype=torch.int64, device="cuda"))
+            if graph_batch_size > real_batch_size:
+                input_ids[real_batch_size:].fill_(int(input_ids_list[0]))
+                positions[real_batch_size:].fill_(int(positions_list[0]))
+
+            layers_slot_mapping, layers_context_lens, layers_req_indices = self._get_decode_static_buffers(
+                graph_batch_size
+            )
+
+            for layer_id in range(self.num_layers):
+                new_slots_batch = self._allocate_batch(layer_id, seq_ids, 1)
+                row_indices = [self.seq_id_to_row[layer_id][sid] for sid in seq_ids]
+                real_context_lens = self.row_seq_lens[layer_id][row_indices]
+
+                layer_slot_mapping = layers_slot_mapping[layer_id]
+                layer_context_lens = layers_context_lens[layer_id]
+                layer_req_indices = layers_req_indices[layer_id]
+                layer_slot_mapping[:real_batch_size].copy_(new_slots_batch)
+                layer_context_lens[:real_batch_size].copy_(
+                    torch.tensor(real_context_lens, dtype=torch.int32, device="cuda")
+                )
+                layer_req_indices[:real_batch_size].copy_(
+                    torch.tensor(row_indices, dtype=torch.int32, device="cuda")
+                )
+
+                if graph_batch_size > real_batch_size:
+                    layer_slot_mapping[real_batch_size:].fill_(-1)
+                    layer_context_lens[real_batch_size:].fill_(int(real_context_lens[0]))
+                    layer_req_indices[real_batch_size:].fill_(int(row_indices[0]))
+
+                state = self.layer_batch_states[layer_id]
+                state.slot_mapping = layer_slot_mapping
+                state.context_lens = layer_context_lens
+                state.max_context_len = int(max(real_context_lens)) if row_indices else 0
+                state.req_indices = layer_req_indices
+
+            slot_mapping.copy_(layers_slot_mapping[0])
+            context_lens.copy_(layers_context_lens[0])
+            req_indices.copy_(layers_req_indices[0])
+
+            return input_ids, positions, None
