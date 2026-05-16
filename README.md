@@ -14,7 +14,7 @@
 
 This repo is primarily a **sparse-first inference engine** (`sparsevllm`). It also contains DeltaKV compressor training + evaluation tooling (`deltakv`).
 
-*Model checkpoints and datasets for DeltaKV are all about to be uploaded.*
+Public DeltaKV compressor checkpoints are available on Hugging Face. Benchmark datasets are still configured by each benchmark entrypoint and its documented data paths.
 
 ## Sparse-vLLM
 
@@ -46,6 +46,51 @@ pip install fire matplotlib seaborn wandb loguru ansible
 MAX_JOBS=8 pip install flash-attn --no-build-isolation
 pip install -e .
 ```
+
+### Download DeltaKV compressor checkpoints
+
+Compressor-backed DeltaKV runs require a local checkpoint directory. Download
+the compressor that matches the base model before passing
+`deltakv_checkpoint_path`; the current loaders read `model.safetensors` from the
+local filesystem.
+
+| Base model | Compressor checkpoint |
+| --- | --- |
+| `Qwen/Qwen2.5-7B-Instruct-1M` | [`JitaiHao/Qwen2.5-7B-Instruct-1M-Compressor`](https://huggingface.co/JitaiHao/Qwen2.5-7B-Instruct-1M-Compressor) |
+| `Qwen/Qwen2.5-32B-Instruct` | [`JitaiHao/Qwen2.5-32B-Instruct-Compressor`](https://huggingface.co/JitaiHao/Qwen2.5-32B-Instruct-Compressor) |
+| `meta-llama/Llama-3.1-8B-Instruct` | [`JitaiHao/Llama-3.1-8B-Instruct-Compressor`](https://huggingface.co/JitaiHao/Llama-3.1-8B-Instruct-Compressor) |
+
+Example download location used by commands below:
+
+```bash
+export DELTAKV_CKPT_ROOT=/root/autodl-fs/checkpoints/compressor
+mkdir -p "$DELTAKV_CKPT_ROOT"
+
+huggingface-cli download JitaiHao/Qwen2.5-7B-Instruct-1M-Compressor \
+  --local-dir "$DELTAKV_CKPT_ROOT/Qwen2.5-7B-Instruct-1M-Compressor"
+
+huggingface-cli download JitaiHao/Qwen2.5-32B-Instruct-Compressor \
+  --local-dir "$DELTAKV_CKPT_ROOT/Qwen2.5-32B-Instruct-Compressor"
+
+huggingface-cli download JitaiHao/Llama-3.1-8B-Instruct-Compressor \
+  --local-dir "$DELTAKV_CKPT_ROOT/Llama-3.1-8B-Instruct-Compressor"
+```
+
+Use the downloaded local directory as `deltakv_checkpoint_path`. Do not reuse a
+compressor checkpoint with a different base model unless it was trained for that
+model and its layer/head dimensions match.
+
+### Documentation map
+
+- [`docs/README.md`](docs/README.md): stable docs index.
+- [`docs/architecture.md`](docs/architecture.md): Sparse-vLLM and HF DeltaKV
+  runtime flow.
+- [`docs/reproducibility.md`](docs/reproducibility.md): environment,
+  checkpoint, data path, smoke test, and artifact checklist.
+- [`docs/runtime-parameter-semantics.md`](docs/runtime-parameter-semantics.md):
+  canonical parameters and backend-specific semantics.
+- Historical implementation notes and exact local run records live under
+  [`docs/dev-notes/`](docs/dev-notes/).
 
 ### Minimal usage
 
@@ -84,7 +129,7 @@ Legacy runtime names such as `chunk_prefill_size`, `vllm_sparse_method`,
 runtime/API boundaries. Use the canonical names below.
 
 For LLaVA-OneVision visual-token experiments, see
-[`docs/llava-onevision-visual-cache-benchmarks.md`](docs/llava-onevision-visual-cache-benchmarks.md).
+[`docs/multimodal_models_adapation/llava-onevision-visual-cache-benchmarks.md`](docs/multimodal_models_adapation/llava-onevision-visual-cache-benchmarks.md).
 The no-checkpoint keep-ratio path is a visual-token uniform-pruning baseline,
 not DeltaKV cluster/compressor inference.
 
@@ -99,7 +144,7 @@ not DeltaKV cluster/compressor inference.
 **Sparse knobs (method-dependent)**
 
 - `sparse_method`: method selector.
-- `deltakv_checkpoint_path`: DeltaKV compressor checkpoint directory or file.
+- `deltakv_checkpoint_path`: local DeltaKV compressor checkpoint directory or file.
 - `sink_keep_tokens`: always-kept prefix/sink tokens.
 - `recent_keep_tokens`: always-kept recent tail tokens.
 - `decode_keep_tokens`: decode-time top/important token budget.
@@ -187,7 +232,9 @@ python benchmark/math_bench/pred.py \
   --hyper_param '{"engine_prefill_chunk_size": 4096, "sparse_method": "omnikv", "chunk_prefill_accel_omnikv": false, "full_attention_layers": "0,1,2,4,7,14", "decode_keep_tokens": 1024}'
 ```
 
-DeltaKV:
+DeltaKV requires a compressor trained for the same base model. The public
+checkpoints above are for Qwen2.5-7B-1M, Qwen2.5-32B, and Llama-3.1-8B; replace
+the checkpoint path below with a matching compressor for the model you run.
 
 ```bash
 python benchmark/math_bench/pred.py \
@@ -199,7 +246,7 @@ python benchmark/math_bench/pred.py \
   --backend sparsevllm \
   --task aime2024 \
   --temperature 0.6 \
-  --hyper_param '{"engine_prefill_chunk_size": 512, "prefill_keep_tokens": 16384, "max_num_batched_tokens": 8192, "max_num_seqs_in_batch": 30, "sparse_method": "deltakv-triton-v4", "chunk_prefill_accel_omnikv": true, "full_attention_layers": "0,1,2,4,7,14", "decode_keep_tokens": 1024, "deltakv_checkpoint_path": "/root/autodl-fs/checkpoints/compressor/<COMPRESSOR_DIR>", "deltakv_latent_dim": 256}'
+  --hyper_param '{"engine_prefill_chunk_size": 512, "prefill_keep_tokens": 16384, "max_num_batched_tokens": 8192, "max_num_seqs_in_batch": 30, "sparse_method": "deltakv-triton-v4", "chunk_prefill_accel_omnikv": true, "full_attention_layers": "0,1,2,4,7,14", "decode_keep_tokens": 1024, "deltakv_checkpoint_path": "/root/autodl-fs/checkpoints/compressor/<MATCHING_COMPRESSOR_DIR>", "deltakv_latent_dim": 256}'
 ```
 
 When `--backend sparsevllm`, method selection happens through `sparse_method`
@@ -223,7 +270,8 @@ python benchmark/long_bench/pred.py \
 
 For a full LongBench run, omit `--task`. To switch to DeltaKV, keep
 `--backend sparsevllm` and set `sparse_method="deltakv"` (or
-`"deltakv-triton-v4"`) plus `deltakv_checkpoint_path=...`.
+`"deltakv-triton-v4"`) plus a matching `deltakv_checkpoint_path`, for example
+`/root/autodl-fs/checkpoints/compressor/Qwen2.5-7B-Instruct-1M-Compressor`.
 For the no-checkpoint direct residual ablation, set
 `sparse_method="deltakv-delta-quant"` and omit `deltakv_checkpoint_path`.
 
@@ -240,7 +288,7 @@ python benchmark/long_bench/pred.py \
   --batch_size 1 \
   --backend hf \
   --sparse_method deltakv \
-  --deltakv_checkpoint_path "/root/autodl-fs/checkpoints/compressor/<COMPRESSOR_DIR>" \
+  --deltakv_checkpoint_path "/root/autodl-fs/checkpoints/compressor/Qwen2.5-7B-Instruct-1M-Compressor" \
   --hyper_param '{"hf_prefill_chunk_size": 2048000, "prefill_keep_tokens": 4096, "chunk_prefill_accel_omnikv": true, "decode_keep_tokens": 0.11, "full_attention_layers": "0,1,2,4,7,14", "recent_keep_tokens": 128, "sink_keep_tokens": 8, "use_compression": true, "use_cluster": true, "deltakv_center_ratio": 0.1}'
 ```
 
@@ -272,12 +320,12 @@ Set `sparse_method` to one of:
 - `"deltakv-delta-quant"` for the no-checkpoint direct residual quantization ablation
 
 For compressor-backed DeltaKV inference, also pass
-`deltakv_checkpoint_path="/path/to/trained_compressor_dir_or_file"`.
+`deltakv_checkpoint_path="/path/to/local/trained_compressor_dir_or_file"`.
 `deltakv-delta-quant` does not load or require a compressor checkpoint.
 
 DeltaKV knobs you may need:
 
-- `deltakv_checkpoint_path`: path to trained compressor weights (directory containing `*.safetensors`/`*.pt`/`*.bin`, or a single file).
+- `deltakv_checkpoint_path`: local path to trained compressor weights (directory containing `*.safetensors`/`*.pt`/`*.bin`, or a single file).
 - `deltakv_latent_dim`: latent dimension of compressed KV.
 - `deltakv_center_ratio`, `cluster_metric`: reference selection / clustering behavior.
 - `deltakv_neighbor_count`: number of selected center/reference tokens used for reconstruction.
@@ -365,7 +413,7 @@ python benchmark/long_bench/pred.py \
   --batch_size 1 \
   --backend hf \
   --sparse_method deltakv \
-  --deltakv_checkpoint_path "<PATH_TO_TRAINED_COMPRESSOR_DIR>" \
+  --deltakv_checkpoint_path "<LOCAL_PATH_TO_TRAINED_COMPRESSOR_DIR>" \
   --hyper_param '{"hf_prefill_chunk_size": 2048000, "prefill_keep_tokens": 4096,
   "chunk_prefill_accel_omnikv": true, "decode_keep_tokens": 0.17, "full_attention_layers": "0,1,2,8,18",
   "recent_keep_tokens": 128, "sink_keep_tokens": 8, "use_compression": true, "use_cluster": true, "deltakv_center_ratio": 0.1}'
@@ -379,7 +427,8 @@ Notes:
 
 ### DeltaKV checkpoints
 
-- `deltakv_checkpoint_path` can point to either a directory (the loader scans `*.safetensors` first, then `*.bin`/`*.pt`) or a single checkpoint file.
+- Public compressor checkpoints are listed in [Download DeltaKV compressor checkpoints](#download-deltakv-compressor-checkpoints).
+- `deltakv_checkpoint_path` can point to either a local directory (the loader scans `*.safetensors` first, then `*.bin`/`*.pt`) or a single checkpoint file.
 - Split-KV checkpoints (`k_compress_*` / `v_compress_*`) are currently not supported by the Sparse-vLLM loader.
 
 ## Troubleshooting

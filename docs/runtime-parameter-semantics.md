@@ -661,7 +661,7 @@ Main files:
 
 - `benchmark/multimodal/visual_cache/run_visual_cache.py`
 - `src/deltakv/modeling/llava_onevision_deltakv.py`
-- `docs/llava-onevision-visual-cache-benchmarks.md`
+- `docs/multimodal_models_adapation/llava-onevision-visual-cache-benchmarks.md`
 
 Current implemented benchmark methods:
 
