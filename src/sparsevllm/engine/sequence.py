@@ -27,6 +27,7 @@ class Sequence:
         self.current_chunk_size = None
 
         self.temperature = sampling_params.temperature
+        self.top_p = sampling_params.top_p
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
 
@@ -88,6 +89,7 @@ class Sequence:
             self.num_prefilled_tokens,
             self.current_chunk_size,
             self.temperature,
+            self.top_p,
             self.max_tokens,
             self.ignore_eos,
             data,
@@ -96,7 +98,7 @@ class Sequence:
     def __setstate__(self, state):
         (self.seq_id, self.status, self.num_tokens, self.num_prompt_tokens,
          self.num_prefilled_tokens, self.current_chunk_size, self.temperature,
-         self.max_tokens, self.ignore_eos, data) = state
+         self.top_p, self.max_tokens, self.ignore_eos, data) = state
 
         if self.num_completion_tokens == 0:
             self.token_ids = data

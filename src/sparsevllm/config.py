@@ -11,6 +11,59 @@ from sparsevllm.method_registry import (
 from sparsevllm.utils.log import logger
 
 
+def _default_decode_cuda_graph_capture_sizes(max_decoding_seqs: int) -> list[int]:
+    max_decoding_seqs = int(max_decoding_seqs)
+    if max_decoding_seqs <= 0:
+        raise ValueError(f"max_decoding_seqs must be > 0, got {max_decoding_seqs}.")
+
+    sizes: list[int] = []
+    size = 1
+    while size < max_decoding_seqs:
+        sizes.append(size)
+        size *= 2
+    sizes.append(size)
+    return sizes
+
+
+def _resolve_decode_cuda_graph_capture_sizes(
+    value: str | int | list[int] | tuple[int, ...] | None,
+    max_decoding_seqs: int,
+) -> list[int]:
+    if value is None:
+        sizes = _default_decode_cuda_graph_capture_sizes(max_decoding_seqs)
+    elif isinstance(value, str):
+        raw = value.strip().lower()
+        if raw in {"", "auto"}:
+            sizes = _default_decode_cuda_graph_capture_sizes(max_decoding_seqs)
+        else:
+            try:
+                sizes = [int(part.strip()) for part in value.split(",") if part.strip()]
+            except ValueError as exc:
+                raise ValueError(
+                    "decode_cuda_graph_capture_sizes must be 'auto' or a comma-separated "
+                    f"integer list, got {value!r}."
+                ) from exc
+    elif isinstance(value, int):
+        sizes = [int(value)]
+    elif isinstance(value, (list, tuple)):
+        sizes = [int(item) for item in value]
+    else:
+        raise ValueError(
+            "decode_cuda_graph_capture_sizes must be 'auto', an int, a list/tuple of ints, "
+            f"or None, got {type(value).__name__}."
+        )
+
+    sizes = sorted(set(sizes))
+    if not sizes or any(size <= 0 for size in sizes):
+        raise ValueError(f"decode_cuda_graph_capture_sizes must contain positive integers, got {sizes}.")
+    if sizes[-1] < int(max_decoding_seqs):
+        raise ValueError(
+            "decode_cuda_graph_capture_sizes must cover max_decoding_seqs: "
+            f"max capture size {sizes[-1]} < max_decoding_seqs {int(max_decoding_seqs)}."
+        )
+    return sizes
+
+
 @dataclass
 class Config:
     model: str
@@ -42,6 +95,9 @@ class Config:
     full_attn_layers: str | list[int] = "0" # useful for omnikv
     chunk_prefill_accel_omnikv: bool = False
     num_top_tokens_in_prefill: int | None = 8192
+    decode_cuda_graph: bool = False
+    decode_cuda_graph_capture_sampling: bool = False
+    decode_cuda_graph_capture_sizes: str | int | list[int] | tuple[int, ...] | None = "auto"
     omnikv_decode_cuda_graph: bool = False
 
     # QuEST Config
@@ -123,16 +179,31 @@ class Config:
 
         if not os.path.isdir(self.model):
             raise FileNotFoundError(f"Model directory does not exist: {self.model}")
+        if int(self.max_decoding_seqs) <= 0:
+            raise ValueError(f"max_decoding_seqs must be > 0, got {self.max_decoding_seqs}.")
+        self.max_decoding_seqs = int(self.max_decoding_seqs)
         if not 1 <= self.tensor_parallel_size <= 8:
             raise ValueError(f"tensor_parallel_size must be in [1, 8], got {self.tensor_parallel_size}.")
+        self.decode_cuda_graph = bool(self.decode_cuda_graph)
+        self.decode_cuda_graph_capture_sampling = bool(self.decode_cuda_graph_capture_sampling)
         self.omnikv_decode_cuda_graph = bool(self.omnikv_decode_cuda_graph)
         if self.omnikv_decode_cuda_graph:
             if self.vllm_sparse_method != "omnikv":
                 raise ValueError(
                     "omnikv_decode_cuda_graph is only valid with vllm_sparse_method='omnikv'."
                 )
+            self.decode_cuda_graph = True
+        if self.decode_cuda_graph_capture_sampling and not self.decode_cuda_graph:
+            raise ValueError("decode_cuda_graph_capture_sampling requires decode_cuda_graph=True.")
+        if self.decode_cuda_graph:
+            if self.vllm_sparse_method not in {"", "omnikv"}:
+                raise ValueError("decode_cuda_graph currently supports vanilla and omnikv only.")
             if self.tensor_parallel_size != 1:
-                raise ValueError("omnikv_decode_cuda_graph currently supports tensor_parallel_size=1 only.")
+                raise ValueError("decode_cuda_graph currently supports tensor_parallel_size=1 only.")
+            self.decode_cuda_graph_capture_sizes = _resolve_decode_cuda_graph_capture_sizes(
+                self.decode_cuda_graph_capture_sizes,
+                self.max_decoding_seqs,
+            )
         if isinstance(self.deltakv_path, str):
             deltakv_path = self.deltakv_path.strip()
             self.deltakv_path = None if deltakv_path.lower() in {"", "none", "null"} else deltakv_path

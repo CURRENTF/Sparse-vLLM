@@ -12,6 +12,30 @@ from sparsevllm.layers.rotary_embedding import get_rope
 from sparsevllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 
 
+def _get_rope_theta(config: Qwen3Config) -> float:
+    if hasattr(config, "rope_theta"):
+        return config.rope_theta
+    rope_parameters = getattr(config, "rope_parameters", None)
+    if isinstance(rope_parameters, dict) and "rope_theta" in rope_parameters:
+        return rope_parameters["rope_theta"]
+    return 10000
+
+
+def _get_rope_scaling(config: Qwen3Config):
+    rope_scaling = getattr(config, "rope_scaling", None)
+    if rope_scaling is None:
+        return None
+
+    if isinstance(rope_scaling, dict):
+        rope_type = rope_scaling.get("rope_type", rope_scaling.get("type"))
+        is_default_rope = rope_type in (None, "default")
+        allowed_default_keys = {"rope_type", "type", "rope_theta"}
+        if is_default_rope and set(rope_scaling).issubset(allowed_default_keys):
+            return None
+
+    raise NotImplementedError(f"Unsupported Qwen3 rope_scaling={rope_scaling!r}.")
+
+
 class Qwen3Attention(nn.Module):
 
     def __init__(
@@ -147,8 +171,8 @@ class Qwen3DecoderLayer(nn.Module):
             rms_norm_eps=config.rms_norm_eps,
             qkv_bias=config.attention_bias,
             head_dim=config.head_dim,
-            rope_theta=config.rope_theta,
-            rope_scaling=config.rope_scaling,
+            rope_theta=_get_rope_theta(config),
+            rope_scaling=_get_rope_scaling(config),
         )
         self.mlp = Qwen3MLP(
             hidden_size=config.hidden_size,

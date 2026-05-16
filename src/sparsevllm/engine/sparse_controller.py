@@ -100,7 +100,10 @@ class SparseController:
 
             # 为需要收集注意力分数的层分配 attn score 的对应 tensor
             if self._needs_attn_score(i, is_prefill, seqs):
-                batch_size = len(seqs)
+                if getattr(ctx, "decode_cuda_graph_static", False) and state.context_lens is not None:
+                    batch_size = int(state.context_lens.numel())
+                else:
+                    batch_size = len(seqs)
                 num_heads = self.config.hf_config.num_attention_heads // self.config.tensor_parallel_size
                 max_len = self._state_max_context_len(state)
                 # TODO 开销比较大的 attn score 初始化？

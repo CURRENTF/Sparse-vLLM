@@ -153,19 +153,59 @@ class PrefillPolicyConfigTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Unsupported prefill_schedule_policy"):
             self.make_config(vllm_sparse_method="snapkv", prefill_schedule_policy="old_chunk_mode")
 
-    def test_omnikv_decode_cuda_graph_requires_omnikv(self):
+    def test_decode_cuda_graph_supports_vanilla_and_omnikv(self):
+        cfg = self.make_config(vllm_sparse_method="vanilla", decode_cuda_graph=True)
+        self.assertTrue(cfg.decode_cuda_graph)
+        self.assertEqual(cfg.vllm_sparse_method, "")
+
         cfg = self.make_config(vllm_sparse_method="omnikv", omnikv_decode_cuda_graph=True)
+        self.assertTrue(cfg.decode_cuda_graph)
         self.assertTrue(cfg.omnikv_decode_cuda_graph)
 
         with self.assertRaisesRegex(ValueError, "only valid"):
             self.make_config(vllm_sparse_method="snapkv", omnikv_decode_cuda_graph=True)
 
-    def test_omnikv_decode_cuda_graph_requires_single_tp(self):
+        with self.assertRaisesRegex(ValueError, "vanilla and omnikv"):
+            self.make_config(vllm_sparse_method="snapkv", decode_cuda_graph=True)
+
+    def test_decode_cuda_graph_requires_single_tp(self):
         with self.assertRaisesRegex(ValueError, "tensor_parallel_size=1"):
             self.make_config(
                 vllm_sparse_method="omnikv",
-                omnikv_decode_cuda_graph=True,
+                decode_cuda_graph=True,
                 tensor_parallel_size=2,
+            )
+
+    def test_decode_cuda_graph_capture_sampling_requires_graph(self):
+        with self.assertRaisesRegex(ValueError, "requires decode_cuda_graph"):
+            self.make_config(
+                vllm_sparse_method="omnikv",
+                decode_cuda_graph_capture_sampling=True,
+            )
+
+    def test_decode_cuda_graph_auto_capture_sizes_pad_to_power_of_two(self):
+        cfg = self.make_config(
+            vllm_sparse_method="omnikv",
+            decode_cuda_graph=True,
+            max_decoding_seqs=6,
+        )
+        self.assertEqual(cfg.decode_cuda_graph_capture_sizes, [1, 2, 4, 8])
+
+    def test_decode_cuda_graph_explicit_capture_sizes_are_validated(self):
+        cfg = self.make_config(
+            vllm_sparse_method="omnikv",
+            decode_cuda_graph=True,
+            max_decoding_seqs=6,
+            decode_cuda_graph_capture_sizes="1,4,8,8",
+        )
+        self.assertEqual(cfg.decode_cuda_graph_capture_sizes, [1, 4, 8])
+
+        with self.assertRaisesRegex(ValueError, "cover max_decoding_seqs"):
+            self.make_config(
+                vllm_sparse_method="omnikv",
+                decode_cuda_graph=True,
+                max_decoding_seqs=6,
+                decode_cuda_graph_capture_sizes=[1, 2, 4],
             )
 
 

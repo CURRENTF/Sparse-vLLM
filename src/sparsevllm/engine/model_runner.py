@@ -15,6 +15,7 @@ from sparsevllm.utils.context import set_context, get_context, reset_context
 from sparsevllm.utils.loader import load_model, sync_deltakv_config_from_checkpoint
 
 from sparsevllm.engine.cache_manager import CacheManager
+from sparsevllm.engine.decode_cuda_graph import DecodeCudaGraphRunner
 from sparsevllm.engine.sparse_controller import SparseController
 from sparsevllm.utils.profiler import profiler
 
@@ -80,17 +81,17 @@ class ModelRunner:
         # 加载 DeltaKV 压缩器
         self.load_deltakv_compressors()
 
-        self._omnikv_decode_graph = None
-        self._omnikv_decode_graph_batch_size: int | None = None
-        self._omnikv_decode_graph_input_ids: torch.Tensor | None = None
-        self._omnikv_decode_graph_positions: torch.Tensor | None = None
-        self._omnikv_decode_graph_slot_mapping: torch.Tensor | None = None
-        self._omnikv_decode_graph_context_lens: torch.Tensor | None = None
-        self._omnikv_decode_graph_req_indices: torch.Tensor | None = None
-        self._omnikv_decode_graph_token_ids: torch.Tensor | None = None
-        self._omnikv_decode_graph_max_context_len: int | None = None
-        self._omnikv_decode_graph_max_context_len_override: int | None = None
-        self._omnikv_decode_graph_keepalive: list[object] = []
+        self.decode_cuda_graph_runner = None
+        if self.config.decode_cuda_graph:
+            self.decode_cuda_graph_runner = DecodeCudaGraphRunner(
+                cache_manager=self.cache_manager,
+                sparse_controller=self.sparse_controller,
+                run_model=self.run_model,
+                is_long_text_batch=self._is_long_text_batch,
+                method=self.config.vllm_sparse_method,
+                rank=self.rank,
+                capture_sizes=self.config.decode_cuda_graph_capture_sizes,
+            )
 
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
@@ -225,173 +226,18 @@ class ModelRunner:
     def prepare_sample(self, seqs: list[Sequence]):
         """准备采样超参数"""
         temperatures = [seq.temperature for seq in seqs]
-        return torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
+        top_ps = [seq.top_p for seq in seqs]
+        return (
+            torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True),
+            torch.tensor(top_ps, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True),
+        )
 
-    def _ensure_omnikv_decode_graph_static_buffers(self, seqs: list[Sequence]):
-        batch_size = len(seqs)
-        if batch_size <= 0:
-            raise ValueError("omnikv_decode_cuda_graph requires a non-empty decode batch.")
-
-        state = getattr(self.cache_manager, "layer_batch_state", None)
-        if state is None:
-            raise TypeError(
-                "omnikv_decode_cuda_graph requires a StandardCacheManager-compatible layer_batch_state."
-            )
-
-        if self._omnikv_decode_graph_batch_size is None:
-            self._omnikv_decode_graph_batch_size = batch_size
-            requested_max_context_len = max(
-                int(seq.num_prompt_tokens) + int(seq.max_tokens) for seq in seqs
-            )
-            if self._omnikv_decode_graph_max_context_len_override is not None:
-                requested_max_context_len = max(
-                    requested_max_context_len,
-                    int(self._omnikv_decode_graph_max_context_len_override),
-                )
-            self._omnikv_decode_graph_max_context_len = requested_max_context_len
-            self._omnikv_decode_graph_input_ids = torch.empty((batch_size,), dtype=torch.int64, device="cuda")
-            self._omnikv_decode_graph_positions = torch.empty((batch_size,), dtype=torch.int64, device="cuda")
-            self._omnikv_decode_graph_slot_mapping = torch.empty((batch_size,), dtype=torch.int32, device="cuda")
-            self._omnikv_decode_graph_context_lens = torch.empty((batch_size,), dtype=torch.int32, device="cuda")
-            self._omnikv_decode_graph_req_indices = torch.empty((batch_size,), dtype=torch.int32, device="cuda")
-        elif batch_size != self._omnikv_decode_graph_batch_size:
-            raise ValueError(
-                "omnikv_decode_cuda_graph captured a fixed decode batch size: "
-                f"captured={self._omnikv_decode_graph_batch_size}, current={batch_size}."
-            )
-        else:
-            max_context_len = max(int(seq.num_prompt_tokens) + int(seq.max_tokens) for seq in seqs)
-            assert self._omnikv_decode_graph_max_context_len is not None
-            if max_context_len > self._omnikv_decode_graph_max_context_len:
-                raise ValueError(
-                    "omnikv_decode_cuda_graph captured a fixed max decode context length: "
-                    f"captured={self._omnikv_decode_graph_max_context_len}, current={max_context_len}."
-                )
-
-        assert self._omnikv_decode_graph_input_ids is not None
-        assert self._omnikv_decode_graph_positions is not None
-        assert self._omnikv_decode_graph_slot_mapping is not None
-        assert self._omnikv_decode_graph_context_lens is not None
-        assert self._omnikv_decode_graph_req_indices is not None
-
-        return state
+    def set_decode_cuda_graph_max_context_len_override(self, max_context_len: int | None):
+        if self.decode_cuda_graph_runner is not None:
+            self.decode_cuda_graph_runner.set_max_context_len_override(max_context_len)
 
     def set_omnikv_decode_graph_max_context_len_override(self, max_context_len: int | None):
-        self._omnikv_decode_graph_max_context_len_override = (
-            None if max_context_len is None else int(max_context_len)
-        )
-
-    def _prepare_omnikv_decode_graph_static_step(
-        self,
-        seqs: list[Sequence],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        state = self._ensure_omnikv_decode_graph_static_buffers(seqs)
-
-        prepare_decode_static = getattr(self.cache_manager, "prepare_decode_static", None)
-        if prepare_decode_static is None:
-            raise TypeError("omnikv_decode_cuda_graph requires cache_manager.prepare_decode_static().")
-
-        assert self._omnikv_decode_graph_input_ids is not None
-        assert self._omnikv_decode_graph_positions is not None
-        assert self._omnikv_decode_graph_slot_mapping is not None
-        assert self._omnikv_decode_graph_context_lens is not None
-        assert self._omnikv_decode_graph_req_indices is not None
-
-        input_ids, positions, _ = prepare_decode_static(
-            seqs,
-            self._omnikv_decode_graph_input_ids,
-            self._omnikv_decode_graph_positions,
-            self._omnikv_decode_graph_slot_mapping,
-            self._omnikv_decode_graph_context_lens,
-            self._omnikv_decode_graph_req_indices,
-        )
-
-        set_context(
-            False,
-            cu_seqlens_q=None,
-            cache_manager=self.cache_manager,
-            is_long_text=self._is_long_text_batch(seqs, is_prefill=False),
-        )
-
-        state.slot_mapping = self._omnikv_decode_graph_slot_mapping
-        state.context_lens = self._omnikv_decode_graph_context_lens
-        assert self._omnikv_decode_graph_max_context_len is not None
-        state.max_context_len = int(self._omnikv_decode_graph_max_context_len)
-        state.req_indices = self._omnikv_decode_graph_req_indices
-        return self._omnikv_decode_graph_input_ids, self._omnikv_decode_graph_positions
-
-    def _capture_omnikv_decode_graph(
-        self,
-        seqs: list[Sequence],
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-    ) -> list[int]:
-        ctx = get_context()
-        ctx.sparse_controller = self.sparse_controller
-        ctx.decode_cuda_graph_static = True
-
-        # Warm decode-only kernels and compiled RMSNorm shapes before capture. The
-        # warmup writes the same one-token KV slots that capture will overwrite.
-        with profiler.record("omnikv_decode_cuda_graph_warmup"):
-            self.sparse_controller.prepare_forward(seqs, is_prefill=False)
-            warmup_logits = self.run_model(input_ids, positions, is_prefill=False)
-            _ = warmup_logits.argmax(dim=-1)
-        torch.cuda.synchronize()
-
-        with profiler.record("omnikv_decode_cuda_graph_capture"):
-            self.sparse_controller.prepare_forward(seqs, is_prefill=False)
-            graph = torch.cuda.CUDAGraph()
-            try:
-                with torch.cuda.graph(graph):
-                    logits = self.run_model(input_ids, positions, is_prefill=False)
-                    token_ids = logits.argmax(dim=-1)
-            except Exception as exc:
-                raise RuntimeError(f"omnikv_decode_cuda_graph capture failed: {exc!r}") from exc
-
-        self._omnikv_decode_graph = graph
-        self._omnikv_decode_graph_token_ids = token_ids
-        keepalive: list[object] = [
-            ctx,
-            logits,
-            token_ids,
-            ctx.decode_mid_o,
-            ctx.decode_mid_o_logexpsum,
-            self._omnikv_decode_graph_input_ids,
-            self._omnikv_decode_graph_positions,
-            self._omnikv_decode_graph_slot_mapping,
-            self._omnikv_decode_graph_context_lens,
-            self._omnikv_decode_graph_req_indices,
-        ]
-        for state in self.sparse_controller.layer_batch_sparse_states.values():
-            for value in (
-                state.attn_score,
-                state.active_indices,
-                state.active_slots,
-                state.req_indices,
-                state.context_lens,
-                state.active_compressed_indices,
-                state.global_req_indices,
-            ):
-                if isinstance(value, torch.Tensor):
-                    keepalive.append(value)
-        self._omnikv_decode_graph_keepalive = keepalive
-        return token_ids.tolist()
-
-    def _run_omnikv_decode_graph(self, seqs: list[Sequence]) -> list[int]:
-        if self.rank != 0:
-            raise ValueError("omnikv_decode_cuda_graph currently supports rank 0 / TP=1 only.")
-        if any(seq.temperature > 1e-10 for seq in seqs):
-            raise ValueError("omnikv_decode_cuda_graph currently supports greedy decode only.")
-
-        input_ids, positions = self._prepare_omnikv_decode_graph_static_step(seqs)
-
-        if self._omnikv_decode_graph is None:
-            return self._capture_omnikv_decode_graph(seqs, input_ids, positions)
-
-        assert self._omnikv_decode_graph_token_ids is not None
-        with profiler.record("omnikv_decode_cuda_graph_replay"):
-            self._omnikv_decode_graph.replay()
-        return self._omnikv_decode_graph_token_ids.tolist()
+        self.set_decode_cuda_graph_max_context_len_override(max_context_len)
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
@@ -404,9 +250,29 @@ class ModelRunner:
         """单步执行主逻辑"""
         name = "model_run_prefill" if is_prefill else "model_run_decode"
         with profiler.record(name):
-            if self.config.omnikv_decode_cuda_graph and not is_prefill:
+            if self.config.decode_cuda_graph and not is_prefill:
                 try:
-                    token_ids = self._run_omnikv_decode_graph(seqs)
+                    if self.decode_cuda_graph_runner is None:
+                        raise RuntimeError("decode_cuda_graph is enabled but runner was not initialized.")
+                    logits, graph_token_ids = self.decode_cuda_graph_runner.run(
+                        seqs,
+                        capture_sampling=self.config.decode_cuda_graph_capture_sampling,
+                    )
+                    with profiler.record("model_sampler"):
+                        if graph_token_ids is not None:
+                            token_ids = graph_token_ids.tolist()
+                        else:
+                            all_greedy = all(seq.temperature <= 1e-10 for seq in seqs)
+                            temperatures = None
+                            top_ps = None
+                            if not all_greedy:
+                                temperatures, top_ps = self.prepare_sample(seqs)
+                            token_ids = self.sampler(
+                                logits,
+                                temperatures,
+                                top_ps,
+                                all_greedy=all_greedy,
+                            ).tolist()
                     with profiler.record("model_sparse_post"):
                         self.sparse_controller.post_forward(seqs, is_prefill)
                     return token_ids, None
@@ -423,14 +289,17 @@ class ModelRunner:
                 self.sparse_controller.prepare_forward(seqs, is_prefill)
             
             all_greedy = all(seq.temperature <= 1e-10 for seq in seqs) if self.rank == 0 else False
-            temperatures = None if (self.rank != 0 or all_greedy) else self.prepare_sample(seqs)
+            temperatures = None
+            top_ps = None
+            if self.rank == 0 and not all_greedy:
+                temperatures, top_ps = self.prepare_sample(seqs)
             
             # 3. 前向计算
             logits = self.run_model(input_ids, positions, is_prefill)
             
             # 4. Token 采样 (仅 Rank 0)
             with profiler.record("model_sampler"):
-                token_ids = self.sampler(logits, temperatures, all_greedy=all_greedy).tolist() if self.rank == 0 else None
+                token_ids = self.sampler(logits, temperatures, top_ps, all_greedy=all_greedy).tolist() if self.rank == 0 else None
 
             # 5. 后置稀疏处理 (如 SnapKV 驱逐)
             with profiler.record("model_sparse_post"):

@@ -269,11 +269,23 @@ class StandardCacheManager(CacheManager):
         this avoids the ordinary per-step metadata tensor allocation path.
         """
         with profiler.record("cache_prepare_decode"):
-            batch_size = len(seqs)
-            if input_ids.numel() != batch_size or positions.numel() != batch_size:
-                raise ValueError("Static decode input buffers must match the decode batch size.")
-            if slot_mapping.numel() != batch_size or context_lens.numel() != batch_size or req_indices.numel() != batch_size:
-                raise ValueError("Static decode metadata buffers must match the decode batch size.")
+            real_batch_size = len(seqs)
+            graph_batch_size = int(input_ids.numel())
+            if real_batch_size <= 0:
+                raise ValueError("Static decode requires a non-empty real decode batch.")
+            if positions.numel() != graph_batch_size:
+                raise ValueError("Static decode input buffers must have the same graph batch size.")
+            if (
+                slot_mapping.numel() != graph_batch_size
+                or context_lens.numel() != graph_batch_size
+                or req_indices.numel() != graph_batch_size
+            ):
+                raise ValueError("Static decode metadata buffers must have the same graph batch size.")
+            if real_batch_size > graph_batch_size:
+                raise ValueError(
+                    "Static decode graph batch is smaller than the real decode batch: "
+                    f"graph={graph_batch_size}, real={real_batch_size}."
+                )
 
             input_ids_list = [seq.last_token for seq in seqs]
             positions_list = [seq.num_tokens - 1 for seq in seqs]
@@ -281,16 +293,29 @@ class StandardCacheManager(CacheManager):
 
             new_slots_batch = self._allocate_batch(seq_ids, 1)
             row_indices = [self.seq_id_to_row[sid] for sid in seq_ids]
+            real_context_lens = self.row_seq_lens[row_indices]
 
-            input_ids.copy_(torch.tensor(input_ids_list, dtype=torch.int64, device="cuda"))
-            positions.copy_(torch.tensor(positions_list, dtype=torch.int64, device="cuda"))
-            slot_mapping.copy_(new_slots_batch)
-            context_lens.copy_(torch.tensor(self.row_seq_lens[row_indices], dtype=torch.int32, device="cuda"))
-            req_indices.copy_(torch.tensor(row_indices, dtype=torch.int32, device="cuda"))
+            input_ids[:real_batch_size].copy_(torch.tensor(input_ids_list, dtype=torch.int64, device="cuda"))
+            positions[:real_batch_size].copy_(torch.tensor(positions_list, dtype=torch.int64, device="cuda"))
+            slot_mapping[:real_batch_size].copy_(new_slots_batch)
+            context_lens[:real_batch_size].copy_(torch.tensor(real_context_lens, dtype=torch.int32, device="cuda"))
+            req_indices[:real_batch_size].copy_(torch.tensor(row_indices, dtype=torch.int32, device="cuda"))
+
+            if graph_batch_size > real_batch_size:
+                # CUDA Graph replay is shape-static. Padded rows mirror the first
+                # real request for read-only attention work, but use slot -1 so
+                # they never write KV or consume persistent cache capacity.
+                first_context_len = int(real_context_lens[0])
+                first_row_idx = int(row_indices[0])
+                input_ids[real_batch_size:].fill_(int(input_ids_list[0]))
+                positions[real_batch_size:].fill_(int(positions_list[0]))
+                slot_mapping[real_batch_size:].fill_(-1)
+                context_lens[real_batch_size:].fill_(first_context_len)
+                req_indices[real_batch_size:].fill_(first_row_idx)
 
             self.layer_batch_state.slot_mapping = slot_mapping
             self.layer_batch_state.context_lens = context_lens
-            self.layer_batch_state.max_context_len = int(max(self.row_seq_lens[row_indices])) if row_indices else 0
+            self.layer_batch_state.max_context_len = int(max(real_context_lens)) if row_indices else 0
             self.layer_batch_state.req_indices = req_indices
 
             return input_ids, positions, None

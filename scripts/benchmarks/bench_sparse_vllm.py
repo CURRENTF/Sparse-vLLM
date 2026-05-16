@@ -96,6 +96,7 @@ def benchmark_task(method, length, bs, args, results_dict):
         sampling_params = [
             SamplingParams(
                 temperature=float(args.temperature),
+                top_p=float(args.top_p),
                 ignore_eos=True,
                 max_tokens=args.output_len,
             )
@@ -278,6 +279,12 @@ def main():
         type=float,
         default=0.0,
         help="Sampling temperature for generation. Default 0.0 (greedy) for throughput benchmarking.",
+    )
+    parser.add_argument(
+        "--top_p",
+        type=float,
+        default=1.0,
+        help="Nucleus sampling top-p. Only used when temperature > 0.",
     )
     parser.add_argument(
         "--admission_wave_size",
