@@ -299,4 +299,57 @@ conda run -n svllm python -u benchmark/long_bench/pred.py \
 | Sparse-VLLM OmniKV, prefill accel true | 200 | 0 | 54.75 | `/data2/haojitai/outputs/benchmark/long_bench/hotpotqa_correctness_sparsevllm_20260516_2305/omnikv` |
 | Sparse-VLLM OmniKV, prefill accel false | 200 | 0 | 59.65 | `/data2/haojitai/outputs/benchmark/long_bench/hotpotqa_omnikv_prefill_accel_ablation_20260516_2344/sparsevllm-omnikv-no-prefill-accel` |
 
-- Notes: Sparse-VLLM OmniKV aligns with HF and the expected HotPotQA range when `chunk_prefill_accel_omnikv=false`. The low `54.75` score is isolated to the Sparse-VLLM experimental prefill-acceleration path, so LongBench correctness runs should leave that option disabled.
+- Notes: Sparse-VLLM OmniKV aligns with the expected HotPotQA range when `chunk_prefill_accel_omnikv=false`. Later alias-controlled follow-up on 2026-05-17 showed this section's HF row was not chunked as intended: HF ignored `engine_prefill_chunk_size` and retained its default near-full `chunk_prefill_size=100000000`. Use the 2026-05-17 chunk-alignment entry below for the apples-to-apples interpretation.
+
+### 2026-05-17 00:17 CST - omnikv-hotpotqa-prefill-chunk-alignment
+
+- Status: completed
+- Goal: Determine whether the OmniKV HotPotQA score gap comes from a Sparse-VLLM implementation mismatch or from different prefill chunking budgets between HF and Sparse-VLLM.
+- Working dir: `/home/haojitai/projects/Sparse-vLLM`
+- Commands:
+
+```bash
+CUDA_VISIBLE_DEVICES=5 \
+DELTAKV_OUTPUT_DIR=/data2/haojitai/outputs \
+DELTAKV_LONGBENCH_DATA_DIR=/data2/haojitai/datasets/LongBench \
+PYTHONPATH=/home/haojitai/projects/Sparse-vLLM/src:${PYTHONPATH:-} \
+conda run -n svllm python -u benchmark/long_bench/pred.py \
+  --model qwen25-7b-hf-omnikv-hf-prefill-chunk4096-hotpotqa \
+  --model_path /data2/haojitai/models/Qwen2.5-7B-Instruct-1M \
+  --tokenizer_path /data2/haojitai/models/Qwen2.5-7B-Instruct-1M \
+  --ws 1 --batch_size 1 --backend hf \
+  --sparse_method omnikv \
+  --task hotpotqa \
+  --temperature 0 --top_p 1 --top_k 20 --thinking_mode off \
+  --hyper_param '{"gpu_memory_utilization":0.9,"hf_prefill_chunk_size":4096,"max_num_batched_tokens":65536,"decode_cuda_graph":false,"sink_keep_tokens":8,"recent_keep_tokens":128,"decode_keep_tokens":4096,"prefill_keep_tokens":4096,"quest_token_budget":4096,"chunk_prefill_accel_omnikv":true,"full_attention_layers":"0,1,2,4,7,14"}' \
+  --output_root /data2/haojitai/outputs/benchmark/long_bench/hotpotqa_omnikv_prefill_chunk_align_20260517_001700/hf-omnikv-hf-prefill-chunk4096
+
+CUDA_VISIBLE_DEVICES=6 \
+DELTAKV_OUTPUT_DIR=/data2/haojitai/outputs \
+DELTAKV_LONGBENCH_DATA_DIR=/data2/haojitai/datasets/LongBench \
+PYTHONPATH=/home/haojitai/projects/Sparse-vLLM/src:${PYTHONPATH:-} \
+conda run -n svllm python -u benchmark/long_bench/pred.py \
+  --model qwen25-7b-svllm-omnikv-engine-prefill-chunk32768-hotpotqa \
+  --model_path /data2/haojitai/models/Qwen2.5-7B-Instruct-1M \
+  --tokenizer_path /data2/haojitai/models/Qwen2.5-7B-Instruct-1M \
+  --ws 1 --batch_size 1 --backend sparsevllm \
+  --sparse_method omnikv \
+  --task hotpotqa \
+  --temperature 0 --top_p 1 --top_k 20 --thinking_mode off \
+  --hyper_param '{"gpu_memory_utilization":0.65,"engine_prefill_chunk_size":32768,"max_num_batched_tokens":65536,"decode_cuda_graph":false,"sink_keep_tokens":8,"recent_keep_tokens":128,"decode_keep_tokens":4096,"prefill_keep_tokens":4096,"quest_token_budget":4096,"chunk_prefill_accel_omnikv":true,"full_attention_layers":"0,1,2,4,7,14"}' \
+  --output_root /data2/haojitai/outputs/benchmark/long_bench/hotpotqa_omnikv_prefill_chunk_align_20260517_001700/sparsevllm-omnikv-engine-prefill-chunk32768
+```
+
+- Code: `main` / `75b8f80`; worktree clean at run start.
+- Environment: `guest-KR6288-X2-A0-R0-00`, conda env `svllm`, GPUs `CUDA_VISIBLE_DEVICES=5,6` (`NVIDIA H100 80GB HBM3`), TP=1.
+- Data: `/data2/haojitai/datasets/LongBench/data/hotpotqa.jsonl`, 200 examples. Tokenized prompt lengths before chat template: max `17655`, so Sparse-VLLM `engine_prefill_chunk_size=32768` covers each HotPotQA prompt in one prefill step.
+- Model: `/data2/haojitai/models/Qwen2.5-7B-Instruct-1M`, greedy decode with `temperature=0`, `top_p=1`, `top_k=20`, `batch_size=1`, `thinking_mode=off`.
+- Logs: `/data2/haojitai/outputs/benchmark/long_bench/hotpotqa_omnikv_prefill_chunk_align_20260517_001700/logs/`.
+- Results:
+
+| Variant | Resolved prefill chunk | Rows | HotPotQA score | Output dir |
+|---|---:|---:|---:|---|
+| HF OmniKV, `hf_prefill_chunk_size=4096`, prefill accel true | 4096 | 200 | 55.11 | `/data2/haojitai/outputs/benchmark/long_bench/hotpotqa_omnikv_prefill_chunk_align_20260517_001700/hf-omnikv-hf-prefill-chunk4096` |
+| Sparse-VLLM OmniKV, `engine_prefill_chunk_size=32768`, prefill accel true | 32768, full for this dataset | 200 | 59.65 | `/data2/haojitai/outputs/benchmark/long_bench/hotpotqa_omnikv_prefill_chunk_align_20260517_001700/sparsevllm-omnikv-engine-prefill-chunk32768` |
+
+- Notes: HF with the correct HF-side alias logs `hf_prefill_chunk_size` normalized to `chunk_prefill_size` and then drops to `55.11`, close to Sparse-VLLM's earlier `54.75` when `engine_prefill_chunk_size=4096`. Sparse-VLLM recovers to `59.65` when its prefill chunk budget is increased enough to avoid mid-prompt chunk-boundary compression. The quality gap is therefore caused by chunked OmniKV prefill acceleration semantics, not by `prefill_keep_tokens` or `topk(sorted=True)`.
