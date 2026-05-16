@@ -124,6 +124,40 @@ class SparseController:
         return self.layer_batch_sparse_states[layer_idx].max_context_len
 
     @torch.no_grad()
+    def on_layer_attention_end(self, layer_idx: int):
+        """Layer-local sparse finalization for methods that use temporary prefill KV."""
+        ctx = get_context()
+        if not ctx.is_prefill or self.sparse_method != "pyramidkv":
+            return
+        if not self.cache_manager.has_prefill_staging_view(layer_idx):
+            return
+
+        state = self.layer_batch_sparse_states[layer_idx]
+        attn_scores = state.attn_score
+        if attn_scores is None:
+            raise RuntimeError("PyramidKV full-prefill staging requires layer attention scores.")
+        if attn_scores.dim() == 3:
+            attn_scores = attn_scores.max(dim=1).values
+        budget = self._get_layer_budget(layer_idx, is_prefill=True)
+        if budget is None:
+            raise RuntimeError("PyramidKV full-prefill staging requires a layer budget.")
+
+        seqs = getattr(ctx, "seqs", None)
+        if seqs is None:
+            raise RuntimeError("PyramidKV full-prefill staging requires current seqs in context.")
+        for b_idx, seq in enumerate(seqs):
+            if not seq.is_last_chunk_prefill:
+                raise RuntimeError("PyramidKV full-prefill staging should only run on the final prefill chunk.")
+            kv_len = int(state.context_lens[b_idx])
+            if kv_len <= budget:
+                keep_indices = torch.arange(kv_len, device="cuda", dtype=torch.long)
+            else:
+                keep_indices = self._snapkv_select_indices(
+                    attn_scores[b_idx, :kv_len], kv_len, budget
+                )
+            self.cache_manager.materialize_prefill_staging_layer(layer_idx, seq, keep_indices)
+
+    @torch.no_grad()
     def post_forward(self, seqs: list[Sequence], is_prefill: bool):
         """持久化压缩 (如 SnapKV / DeltaKV)"""
         if get_context().is_long_text is False and not self.is_deltakv_family:
@@ -157,6 +191,9 @@ class SparseController:
         # SnapKV / PyramidKV: Only evict at the end of prefill
         is_last_chunk = any(seq.is_last_chunk_prefill for seq in seqs)
         if not is_last_chunk:
+            return
+
+        if self.sparse_method == "pyramidkv" and getattr(self.cache_manager, "prefill_staging_was_active", lambda: False)():
             return
 
         if self.sparse_method == 'snapkv' or self.sparse_method == 'pyramidkv':

@@ -152,6 +152,7 @@ class DecodeCudaGraphRunner:
             cu_seqlens_q=None,
             cache_manager=self.cache_manager,
             is_long_text=bool(is_long_text),
+            seqs=seqs,
         )
 
         self.cache_manager.set_decode_static_max_context_len(int(state.key.max_context_len))

@@ -87,8 +87,9 @@ class PrefillPolicyRegistryTest(unittest.TestCase):
                 )
                 self.assertEqual(get_default_prefill_schedule_policy(method), policy)
 
-    def test_deltakv_family_defaults_to_long_bs1full(self):
+    def test_full_prefill_methods_default_to_long_bs1full(self):
         for method in (
+            "pyramidkv",
             "deltakv",
             "deltakv-triton",
             "deltakv-triton-v2",
@@ -105,8 +106,8 @@ class PrefillPolicyRegistryTest(unittest.TestCase):
                     PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
                 )
 
-    def test_non_deltakv_defaults_to_all_chunked(self):
-        for method in ("", "vanilla", "streamingllm", "attention-sink", "snapkv", "pyramidkv", "quest", "omnikv"):
+    def test_other_non_deltakv_defaults_to_all_chunked(self):
+        for method in ("", "vanilla", "streamingllm", "attention-sink", "snapkv", "quest", "omnikv"):
             with self.subTest(method=method):
                 self.assertEqual(get_default_prefill_schedule_policy(method), PREFILL_POLICY_ALL_CHUNKED)
 
@@ -136,6 +137,9 @@ class PrefillPolicyConfigTest(unittest.TestCase):
         cfg = self.make_config(vllm_sparse_method="deltakv-standalone", prefill_schedule_policy="")
         self.assertEqual(cfg.prefill_schedule_policy, PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH)
 
+        cfg = self.make_config(vllm_sparse_method="pyramidkv", prefill_schedule_policy=None)
+        self.assertEqual(cfg.prefill_schedule_policy, PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH)
+
     def test_explicit_matching_policy_passes(self):
         cfg = self.make_config(
             vllm_sparse_method="snapkv",
@@ -147,6 +151,12 @@ class PrefillPolicyConfigTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "registry default"):
             self.make_config(
                 vllm_sparse_method="deltakv-standalone",
+                prefill_schedule_policy=PREFILL_POLICY_ALL_CHUNKED,
+            )
+
+        with self.assertRaisesRegex(ValueError, "registry default"):
+            self.make_config(
+                vllm_sparse_method="pyramidkv",
                 prefill_schedule_policy=PREFILL_POLICY_ALL_CHUNKED,
             )
 

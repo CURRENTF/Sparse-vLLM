@@ -7,6 +7,7 @@ import torch
 
 from sparsevllm.config import Config
 from sparsevllm.engine.sequence import Sequence
+from sparsevllm.method_registry import PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH
 from sparsevllm.utils.log import logger, log_level
 from sparsevllm.utils.profiler import profiler
 
@@ -16,6 +17,15 @@ from .base import CacheManager, LayerBatchStates
 class SnapKVCacheManager(CacheManager):
     def __init__(self, config: Config, rank: int, world_size: int):
         super().__init__(config, rank, world_size)
+        self.pyramidkv_prefill_staging_num_slots = 0
+        self.pyramidkv_prefill_staging_kv_cache = None
+        self._pyramidkv_prefill_staging_active = False
+        self._pyramidkv_prefill_staging_was_active = False
+        self._pyramidkv_prefill_staging_slot_mapping = None
+        self._pyramidkv_prefill_staging_active_slots = None
+        self._pyramidkv_prefill_staging_req_indices = None
+        self._pyramidkv_prefill_staging_context_lens = None
+        self._pyramidkv_prefill_staging_materialized_layers: set[int] = set()
         self.allocate_kv_cache()
 
         self.layer_num_slots = []
@@ -50,12 +60,60 @@ class SnapKVCacheManager(CacheManager):
             self.free_rows.append(deque(range(self.max_buffer_rows)))
             self.row_seq_lens.append(np.zeros((self.max_buffer_rows,), dtype=np.int32))
 
+    def _pyramidkv_can_use_full_prefill_staging(self) -> bool:
+        return (
+            self.config.vllm_sparse_method == "pyramidkv"
+            and self.config.pyramid_layer_ratios is not None
+            and self.config.prefill_schedule_policy == PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH
+        )
+
+    def _pyramidkv_reset_full_prefill_staging(self):
+        self._pyramidkv_prefill_staging_active = False
+        self._pyramidkv_prefill_staging_was_active = False
+        self._pyramidkv_prefill_staging_slot_mapping = None
+        self._pyramidkv_prefill_staging_active_slots = None
+        self._pyramidkv_prefill_staging_req_indices = None
+        self._pyramidkv_prefill_staging_context_lens = None
+        self._pyramidkv_prefill_staging_materialized_layers = set()
+
+    def _should_use_pyramidkv_full_prefill_staging(self, seqs: list[Sequence]) -> bool:
+        if not self._pyramidkv_can_use_full_prefill_staging():
+            return False
+        if self.pyramidkv_prefill_staging_kv_cache is None or len(seqs) != 1:
+            return False
+        seq = seqs[0]
+        remaining = int(seq.num_prompt_tokens - seq.num_prefilled_tokens)
+        return (
+            int(seq.num_prefilled_tokens) == 0
+            and int(seq.current_chunk_size) == remaining
+            and remaining > int(self.config.chunk_prefill_size)
+        )
+
     def allocate_kv_cache(self):
         available_memory, slot_bytes_per_layer = self._get_available_slots_info()
         config = self.config
         num_layers = self.num_layers
 
         if config.pyramid_layer_ratios is not None:
+            if self._pyramidkv_can_use_full_prefill_staging():
+                self.pyramidkv_prefill_staging_num_slots = int(config.max_model_len)
+                staging_bytes = int(self.pyramidkv_prefill_staging_num_slots) * int(slot_bytes_per_layer)
+                available_memory = int(available_memory) - staging_bytes
+                if available_memory <= 0:
+                    raise RuntimeError(
+                        "Not enough GPU memory for PyramidKV full-prefill staging KV. "
+                        f"staging_slots={self.pyramidkv_prefill_staging_num_slots} "
+                        f"required={staging_bytes / 1024**3:.2f}GiB."
+                    )
+                self.pyramidkv_prefill_staging_kv_cache = torch.empty(
+                    2,
+                    self.pyramidkv_prefill_staging_num_slots,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    dtype=self.hf_config.torch_dtype,
+                    device="cuda",
+                )
+
             # PyramidKV: 根据比例分配每层不同大小的 cache
             total_ratio = sum(config.pyramid_layer_ratios)
             base_slots = available_memory // (slot_bytes_per_layer * total_ratio)
@@ -80,7 +138,10 @@ class SnapKVCacheManager(CacheManager):
                 self.kv_cache.append((k_cache, v_cache))
 
             config.num_kvcache_slots = layer_slots
-            logger.info(f"PyramidKV: Layer slots = {layer_slots}, base_slots = {base_slots}")
+            logger.info(
+                f"PyramidKV: Layer slots = {layer_slots}, base_slots = {base_slots}, "
+                f"prefill_staging_slots={self.pyramidkv_prefill_staging_num_slots}"
+            )
         else:
             # 标准模式：所有层使用相同大小
             slot_bytes = num_layers * slot_bytes_per_layer
@@ -112,11 +173,43 @@ class SnapKVCacheManager(CacheManager):
             raise ValueError
 
     def get_layer_store_view(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.has_prefill_staging_view(layer_idx):
+            return (
+                self.pyramidkv_prefill_staging_kv_cache[0],
+                self.pyramidkv_prefill_staging_kv_cache[1],
+                self._pyramidkv_prefill_staging_slot_mapping,
+            )
         k_cache, v_cache = self.get_layer_kv_cache(layer_idx)
         return k_cache, v_cache, self.layer_batch_states[layer_idx].slot_mapping
 
     def get_layer_compute_tensors(self, layer_idx: int, sparse_controller):
+        del sparse_controller
+        if self.has_prefill_staging_view(layer_idx):
+            return self.pyramidkv_prefill_staging_kv_cache[0], self.pyramidkv_prefill_staging_kv_cache[1]
         raise NotImplementedError
+
+    def has_prefill_staging_view(self, layer_idx: int) -> bool:
+        return bool(
+            self._pyramidkv_prefill_staging_active
+            and self.config.vllm_sparse_method == "pyramidkv"
+            and 0 <= int(layer_idx) < int(self.num_layers)
+        )
+
+    def get_prefill_staging_view(
+        self,
+        layer_idx: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        if not self.has_prefill_staging_view(layer_idx):
+            raise NotImplementedError("PyramidKV prefill staging view is not active for this layer.")
+        return (
+            self._pyramidkv_prefill_staging_active_slots,
+            self._pyramidkv_prefill_staging_req_indices,
+            self._pyramidkv_prefill_staging_context_lens,
+            None,
+        )
+
+    def prefill_staging_was_active(self) -> bool:
+        return bool(self._pyramidkv_prefill_staging_was_active)
 
     def get_layer_buffer_req_to_token_slots(self, layer_idx: int) -> torch.Tensor:
         return self.buffer_req_to_token_slots[layer_idx]
@@ -125,12 +218,53 @@ class SnapKVCacheManager(CacheManager):
     def num_free_slots(self) -> int:
         return min(self._num_free_slots)
 
+    def _pyramidkv_layer_budget(self, layer_idx: int, is_prefill: bool) -> int:
+        num_top = int(self.config.num_top_tokens_in_prefill if is_prefill else self.config.num_top_tokens)
+        ratio = float(self.config.pyramid_layer_ratios[layer_idx])
+        base_ratio = float(self.config.pyramid_layer_ratios[0])
+        scaled_top_tokens = int(num_top * ratio / base_ratio)
+        return int(self.config.num_sink_tokens) + scaled_top_tokens + int(self.config.num_recent_tokens)
+
+    def _pyramidkv_prompt_admission_cost(self, seq: Sequence) -> int:
+        prompt_len = int(seq.num_prompt_tokens)
+        if prompt_len <= 0:
+            return 0
+        return max(
+            min(prompt_len, self._pyramidkv_layer_budget(layer_idx, is_prefill=True))
+            for layer_idx in range(self.num_layers)
+        )
+
+    def prompt_admission_cost(self, seq: Sequence) -> int:
+        if self._pyramidkv_can_use_full_prefill_staging():
+            return self._pyramidkv_prompt_admission_cost(seq)
+        return super().prompt_admission_cost(seq)
+
+    def prompt_logical_reservation_cost(self, seq: Sequence) -> int:
+        if self._pyramidkv_can_use_full_prefill_staging():
+            return self._pyramidkv_prompt_admission_cost(seq)
+        return super().prompt_logical_reservation_cost(seq)
+
+    def reserved_prefill_slots(self, waiting_seqs, chunk_prefill_size: int) -> int:
+        if not self._pyramidkv_can_use_full_prefill_staging():
+            return super().reserved_prefill_slots(waiting_seqs, chunk_prefill_size)
+        reserved = 0
+        for seq in waiting_seqs:
+            if 0 < seq.num_prefilled_tokens < seq.num_prompt_tokens:
+                reserved += self._pyramidkv_prompt_admission_cost(seq)
+        return int(reserved)
+
     def prefill_batched_tokens_margin(self) -> int:
         # Keep headroom for the "window" tokens used by SnapKV/PyramidKV logic.
         return int(self.config.snapkv_window_size)
 
     def remaining_prefill_tokens(self, seq: Sequence) -> int:
         remaining = int(seq.num_prompt_tokens - seq.num_prefilled_tokens)
+        if (
+            self._pyramidkv_can_use_full_prefill_staging()
+            and int(seq.num_prefilled_tokens) == 0
+            and remaining > int(self.config.chunk_prefill_size)
+        ):
+            return remaining
         window = int(self.config.snapkv_window_size)
         if window > 0 and remaining > window:
             return remaining - window
@@ -247,17 +381,65 @@ class SnapKVCacheManager(CacheManager):
                 f"context_len={int(cur_len)} -> {int(new_slots.numel())}"
             )
 
+    def materialize_prefill_staging_layer(self, layer_idx: int, seq: Sequence, keep_indices: torch.Tensor):
+        if not self.has_prefill_staging_view(layer_idx):
+            raise RuntimeError("PyramidKV prefill staging is not active.")
+        if layer_idx in self._pyramidkv_prefill_staging_materialized_layers:
+            raise RuntimeError(f"PyramidKV prefill staging layer materialized twice: layer={layer_idx}.")
+
+        row_idx = self.seq_id_to_row[layer_idx].get(seq.seq_id)
+        if row_idx is None:
+            raise RuntimeError(f"PyramidKV staging row is missing: layer={layer_idx} seq_id={seq.seq_id}.")
+        if int(self.row_seq_lens[layer_idx][row_idx]) != 0:
+            raise RuntimeError(
+                "PyramidKV full-prefill staging expects an empty persistent row before materialization. "
+                f"layer={layer_idx} seq_id={seq.seq_id} row_len={int(self.row_seq_lens[layer_idx][row_idx])}."
+            )
+
+        keep_indices = keep_indices.to(device="cuda", dtype=torch.long).contiguous()
+        num_keep = int(keep_indices.numel())
+        if num_keep <= 0:
+            raise RuntimeError("PyramidKV staging materialization cannot keep zero tokens.")
+
+        slots = self._allocate(layer_idx, seq.seq_id, num_keep).to(torch.long)
+        k_cache, v_cache = self.get_layer_kv_cache(layer_idx)
+        k_stage = self.pyramidkv_prefill_staging_kv_cache[0]
+        v_stage = self.pyramidkv_prefill_staging_kv_cache[1]
+        k_cache[slots] = k_stage[keep_indices]
+        v_cache[slots] = v_stage[keep_indices]
+
+        self._pyramidkv_prefill_staging_materialized_layers.add(int(layer_idx))
+        if len(self._pyramidkv_prefill_staging_materialized_layers) == int(self.num_layers):
+            self._pyramidkv_prefill_staging_active = False
+
+    def prepare_step(self, seqs: list[Sequence], is_prefill: bool):
+        self._pyramidkv_reset_full_prefill_staging()
+        return super().prepare_step(seqs, is_prefill)
+
     def _prepare_prefill(self, seqs: list[Sequence]):
         with profiler.record("cache_prepare_prefill"):
+            use_full_prefill_staging = self._should_use_pyramidkv_full_prefill_staging(seqs)
             total_chunk_tokens = sum(seq.current_chunk_size for seq in seqs)
+            if use_full_prefill_staging and total_chunk_tokens > int(self.pyramidkv_prefill_staging_num_slots):
+                raise RuntimeError(
+                    "PyramidKV full-prefill staging capacity is too small for this step. "
+                    f"tokens={total_chunk_tokens} staging_slots={self.pyramidkv_prefill_staging_num_slots}."
+                )
 
             input_ids_np = np.empty(total_chunk_tokens, dtype=np.int64)
             positions_np = np.empty(total_chunk_tokens, dtype=np.int64)
             cu_seqlens_q = [0]
 
-            layers_slot_mapping_cuda = torch.empty(
-                (self.num_layers, total_chunk_tokens), dtype=torch.int32, device="cuda"
-            )
+            if use_full_prefill_staging:
+                layers_slot_mapping_cuda = torch.arange(
+                    total_chunk_tokens,
+                    dtype=torch.int32,
+                    device="cuda",
+                ).expand(self.num_layers, -1)
+            else:
+                layers_slot_mapping_cuda = torch.empty(
+                    (self.num_layers, total_chunk_tokens), dtype=torch.int32, device="cuda"
+                )
             context_lens_list = [[] for _ in range(self.num_layers)]
 
             token_offset = 0
@@ -276,10 +458,16 @@ class SnapKVCacheManager(CacheManager):
                                 f"row_seq_len={self.row_seq_lens[layer_id][row_idx]} "
                                 f"start_idx={start_idx}"
                             )
-                    self._allocate(layer_id, seq.seq_id, chunk_size)
+                    if use_full_prefill_staging:
+                        if start_idx != 0:
+                            raise RuntimeError("PyramidKV full-prefill staging only supports first-prefill prompts.")
+                        self._get_free_row(layer_id, seq.seq_id)
+                    else:
+                        self._allocate(layer_id, seq.seq_id, chunk_size)
                     row_idx = self.seq_id_to_row[layer_id][seq.seq_id]
-                    layers_slot_mapping_cuda[layer_id, token_offset: token_offset + chunk_size] = \
-                        self.buffer_req_to_token_slots[layer_id][row_idx, start_idx:end_idx]
+                    if not use_full_prefill_staging:
+                        layers_slot_mapping_cuda[layer_id, token_offset: token_offset + chunk_size] = \
+                            self.buffer_req_to_token_slots[layer_id][row_idx, start_idx:end_idx]
                     context_lens_list[layer_id].append(end_idx)
 
                 chunk_tokens = seq.token_ids
@@ -298,8 +486,42 @@ class SnapKVCacheManager(CacheManager):
                 state = self.layer_batch_states[layer_id]
                 state.slot_mapping = layers_slot_mapping_cuda[layer_id]
                 state.context_lens = layers_context_lens_cuda[layer_id]
+                state.max_context_len = int(max(context_lens_list[layer_id])) if context_lens_list[layer_id] else 0
                 req_ids = [self.seq_id_to_row[layer_id][seq.seq_id] for seq in seqs]
                 state.req_indices = torch.tensor(req_ids, dtype=torch.int32, device="cuda")
+
+            if use_full_prefill_staging:
+                self._pyramidkv_prefill_staging_active = True
+                self._pyramidkv_prefill_staging_was_active = True
+                self._pyramidkv_prefill_staging_slot_mapping = layers_slot_mapping_cuda[0]
+                max_context_len = int(max(max(lens) for lens in context_lens_list if lens))
+                active_slots = torch.full(
+                    (len(seqs), max_context_len),
+                    -1,
+                    dtype=torch.int32,
+                    device="cuda",
+                )
+                offset = 0
+                for b_idx, seq in enumerate(seqs):
+                    chunk_size = int(seq.current_chunk_size)
+                    active_slots[b_idx, :chunk_size] = torch.arange(
+                        offset,
+                        offset + chunk_size,
+                        dtype=torch.int32,
+                        device="cuda",
+                    )
+                    offset += chunk_size
+                self._pyramidkv_prefill_staging_active_slots = active_slots
+                self._pyramidkv_prefill_staging_req_indices = torch.arange(
+                    len(seqs),
+                    dtype=torch.int32,
+                    device="cuda",
+                )
+                self._pyramidkv_prefill_staging_context_lens = torch.tensor(
+                    [int(seq.num_prefilled_tokens + seq.current_chunk_size) for seq in seqs],
+                    dtype=torch.int32,
+                    device="cuda",
+                )
 
             input_ids = torch.from_numpy(input_ids_np).to("cuda")
             positions = torch.from_numpy(positions_np).to("cuda")

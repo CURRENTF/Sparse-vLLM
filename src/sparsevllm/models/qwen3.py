@@ -49,6 +49,7 @@ class Qwen3Attention(nn.Module):
         qkv_bias: bool = False,
         rope_theta: float = 10000,
         rope_scaling: tuple | None = None,
+        proj_chunk_size: int = 16384,
     ) -> None:
         super().__init__()
         tp_size = dist.get_world_size()
@@ -63,6 +64,9 @@ class Qwen3Attention(nn.Module):
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim ** -0.5
         self.qkv_bias = qkv_bias
+        self.proj_chunk_size = int(proj_chunk_size)
+        if self.proj_chunk_size <= 0:
+            raise ValueError(f"proj_chunk_size must be > 0, got {proj_chunk_size}.")
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -93,6 +97,16 @@ class Qwen3Attention(nn.Module):
             self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
             self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
 
+    def _o_proj_chunked(self, x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+        chunk_size = int(self.proj_chunk_size)
+        if int(x.shape[0]) <= chunk_size:
+            out.copy_(self.o_proj(x))
+            return out
+        for start in range(0, int(x.shape[0]), chunk_size):
+            end = min(start + chunk_size, int(x.shape[0]))
+            out[start:end].copy_(self.o_proj(x[start:end]))
+        return out
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -108,8 +122,7 @@ class Qwen3Attention(nn.Module):
             k = self.k_norm(k)
         q, k = self.rotary_emb(positions, q, k)
         o = self.attn(q, k, v)
-        output = self.o_proj(o.flatten(1, -1))
-        return output
+        return self._o_proj_chunked(o.flatten(1, -1), hidden_states)
 
 
 class Qwen3MLP(nn.Module):
@@ -173,6 +186,7 @@ class Qwen3DecoderLayer(nn.Module):
             head_dim=config.head_dim,
             rope_theta=_get_rope_theta(config),
             rope_scaling=_get_rope_scaling(config),
+            proj_chunk_size=getattr(config, "mlp_chunk_size", 16384),
         )
         self.mlp = Qwen3MLP(
             hidden_size=config.hidden_size,

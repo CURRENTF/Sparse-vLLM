@@ -220,6 +220,7 @@ class ModelRunner:
             cu_seqlens_q=cu_seqlens_q,
             cache_manager=self.cache_manager,
             is_long_text=self._is_long_text_batch(seqs, is_prefill),
+            seqs=seqs,
         )
         return input_ids, positions
 

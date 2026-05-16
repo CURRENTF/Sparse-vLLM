@@ -75,3 +75,64 @@ CUDA_VISIBLE_DEVICES=5 PYTHONUNBUFFERED=1 conda run -n svllm python scripts/benc
 | omnikv | 128000 | 4 | 17.37 | 29472.2 | 530.4 | 7.54 | 4.0 | 72.39 | 2.42x |
 
 - Notes: Rerun results match the previous run within small variance. Pre-run GPU 5 was idle: 4 MiB used, 0% utilization, and no compute apps. During the run there was a temporary GPU-idle interval while `torch/_inductor` compile workers were active, then the benchmark resumed on GPU 5. `pyramidkv` failed for the same prompt-admission reason as the previous run: the smallest layer had only 34297 free slots, below the 128000-token prompt admission requirement.
+
+### 2026-05-16 22:11 CST - pyramidkv-128k-bs4-full-prefill-staging-first-smoke
+
+- Status: failed
+- Goal: Verify PyramidKV with `long_bs1full_short_batch` plus shared full-prefill staging on 128k context, batch size 4, before adding chunked attention output projection.
+- Working dir: `/home/haojitai/projects/Sparse-vLLM`
+- Command:
+
+```bash
+CUDA_VISIBLE_DEVICES=5 PYTHONUNBUFFERED=1 conda run -n svllm python scripts/benchmarks/bench_sparse_vllm.py \
+  --model_path /data2/haojitai/models/Qwen2.5-7B-Instruct-1M \
+  --methods pyramidkv \
+  --lengths 128000 \
+  --batch_sizes 4 \
+  --output_len 32 \
+  --temperature 0.0 \
+  --top_p 1.0 \
+  --hyper_params '{"gpu_memory_utilization":0.9,"engine_prefill_chunk_size":4096,"max_num_batched_tokens":65536,"decode_cuda_graph":true,"decode_cuda_graph_capture_sizes":4,"decode_cuda_graph_capture_sampling":false,"sink_keep_tokens":8,"recent_keep_tokens":128,"decode_keep_tokens":4096,"prefill_keep_tokens":4096,"quest_token_budget":4096,"chunk_prefill_accel_omnikv":true,"full_attention_layers":"0"}'
+```
+
+- Code: `perf/omnikv-decode-128k-bs4` / `b0aa540d7812d152fb8fd59b87dcb00a78ffb44d`; worktree had 8 relevant changed paths.
+- Environment: `guest-KR6288-X2-A0-R0-00`, conda env `svllm`, GPU `CUDA_VISIBLE_DEVICES=5` (`NVIDIA H100 80GB HBM3`), TP=1. Pre-run GPU 5 state: 4 MiB used, 0% utilization, no compute apps observed.
+- Data: synthetic prompt token ids, 4 requests, 128000 prompt tokens each, greedy decode for 32 output tokens each.
+- Model: `/data2/haojitai/models/Qwen2.5-7B-Instruct-1M`, resolved as `model_type='qwen2'`, bf16 config, Sparse-VLLM backend.
+- Hyperparameters: bs=4, length=128000, output_len=32, `prefill_schedule_policy='long_bs1full_short_batch'`, `engine_prefill_chunk_size=4096`, `decode_cuda_graph=true`, capture size 4, `decode_keep_tokens=4096`, `prefill_keep_tokens=4096`, `sink_keep_tokens=8`, `recent_keep_tokens=128`, `full_attention_layers="0"`.
+- Logs: `/data2/haojitai/outputs/sparsevllm_pyramidkv_128k_bs4_staging_smoke_20260516_2211/bench.log`; run metadata `/data2/haojitai/outputs/sparsevllm_pyramidkv_128k_bs4_staging_smoke_20260516_2211/run_metadata.txt`.
+- Results: failed after warmup with CUDA OOM in Qwen2 attention `o_proj` (`src/sparsevllm/layers/linear.py`, `F.linear`) while trying to allocate 876 MiB. PyramidKV admission and staging were active: log recorded `prefill_schedule_policy='long_bs1full_short_batch'` and `prefill_staging_slots=128132`.
+- Notes: This failure isolated a full-prefill activation peak, not persistent KV admission. It motivated chunking the attention output projection in the Qwen2/Qwen3 attention modules.
+
+### 2026-05-16 22:15 CST - pyramidkv-128k-bs4-full-prefill-staging-o-proj-chunked
+
+- Status: completed
+- Goal: Re-run PyramidKV 128k context, batch size 4 after chunking attention output projection, validating that shared full-prefill staging plus `long_bs1full_short_batch` completes.
+- Working dir: `/home/haojitai/projects/Sparse-vLLM`
+- Command:
+
+```bash
+CUDA_VISIBLE_DEVICES=5 PYTHONUNBUFFERED=1 conda run -n svllm python scripts/benchmarks/bench_sparse_vllm.py \
+  --model_path /data2/haojitai/models/Qwen2.5-7B-Instruct-1M \
+  --methods pyramidkv \
+  --lengths 128000 \
+  --batch_sizes 4 \
+  --output_len 32 \
+  --temperature 0.0 \
+  --top_p 1.0 \
+  --hyper_params '{"gpu_memory_utilization":0.9,"engine_prefill_chunk_size":4096,"max_num_batched_tokens":65536,"decode_cuda_graph":true,"decode_cuda_graph_capture_sizes":4,"decode_cuda_graph_capture_sampling":false,"sink_keep_tokens":8,"recent_keep_tokens":128,"decode_keep_tokens":4096,"prefill_keep_tokens":4096,"quest_token_budget":4096,"chunk_prefill_accel_omnikv":true,"full_attention_layers":"0"}'
+```
+
+- Code: `perf/omnikv-decode-128k-bs4` / `b0aa540d7812d152fb8fd59b87dcb00a78ffb44d`; worktree had 10 relevant changed paths.
+- Environment: `guest-KR6288-X2-A0-R0-00`, conda env `svllm`, GPU `CUDA_VISIBLE_DEVICES=5` (`NVIDIA H100 80GB HBM3`), TP=1. Pre-run GPU 5 state: 4 MiB used, 0% utilization, no compute apps observed.
+- Data: synthetic prompt token ids, 4 requests, 128000 prompt tokens each, greedy decode for 32 output tokens each.
+- Model: `/data2/haojitai/models/Qwen2.5-7B-Instruct-1M`, resolved as `model_type='qwen2'`, bf16 config, Sparse-VLLM backend.
+- Hyperparameters: bs=4, length=128000, output_len=32, `prefill_schedule_policy='long_bs1full_short_batch'`, `engine_prefill_chunk_size=4096`, `decode_cuda_graph=true`, capture size 4, `decode_keep_tokens=4096`, `prefill_keep_tokens=4096`, `sink_keep_tokens=8`, `recent_keep_tokens=128`, `full_attention_layers="0"`.
+- Logs: `/data2/haojitai/outputs/sparsevllm_pyramidkv_128k_bs4_staging_smoke_20260516_2215/bench.log`; run metadata `/data2/haojitai/outputs/sparsevllm_pyramidkv_128k_bs4_staging_smoke_20260516_2215/run_metadata.txt`.
+- Results: source `/data2/haojitai/outputs/sparsevllm_pyramidkv_128k_bs4_staging_smoke_20260516_2215/bench.log`.
+
+| Method | Len | BS | TTFT(s) | Prefill tok/s | Decode tok/s | ITL(ms) | AvgBS | Mem(GB) | Decode speedup |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| pyramidkv | 128000 | 4 | 21.49 | 6019.6 | 331.2 | 12.08 | 3.9 | 77.86 | 1.00x |
+
+- Notes: Logs confirm the run used `prefill_schedule_policy='long_bs1full_short_batch'` and `prefill_staging_slots=128132`. Runtime throughput logs show long full-prefill steps with `prefill_tokens=128000` and decreasing `prf(L/S)=3/0`, `2/0`, `1/0`, which matches bs1 full-prefill scheduling for long prompts.

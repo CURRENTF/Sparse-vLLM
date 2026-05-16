@@ -206,6 +206,7 @@ class Attention(nn.Module):
                 o = torch.empty_like(q)
                 flash_decode_stage2(mid_o, mid_o_logexpsum, layer_context_lens, o, BLOCK_SEQ)
 
+            sparse_controller.on_layer_attention_end(layer_idx)
             cache_manager.on_layer_attention_end(layer_idx)
             return o
         finally:
