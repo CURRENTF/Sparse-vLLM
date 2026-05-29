@@ -8,8 +8,7 @@
   </p>
 </div>
 
-Sparse-vLLM is a sparse-first inference engine for long-context LLM serving.
-The repository also includes DeltaKV compressor training and evaluation tooling.
+A sparse-first inference engine for long-context LLM serving, which also includes DeltaKV compressor training and evaluation tooling.
 
 <div align="center">
   <img src="docs/assets/sparse_vllm_throughput.png" alt="Sparse-vLLM throughput" style="width:86%; height:auto;">
