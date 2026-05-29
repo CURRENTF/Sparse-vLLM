@@ -48,7 +48,7 @@ New Sparse-vLLM sparse methods should follow the cache-manager-first design:
 - `src/sparsevllm/layers/attention.py` should only call generic hooks or shared
   kernels.
 - Public runtime arguments should use canonical names documented in
-  [runtime-parameter-semantics.md](runtime-parameter-semantics.md).
+  [runtime-parameter-semantics.md](../configuration/runtime-parameter-semantics.md).
 
 When adding a first-class method, use the repo-local `$add-sparse-method` skill.
 It encodes the expected file placement, cache-manager hooks, and validation

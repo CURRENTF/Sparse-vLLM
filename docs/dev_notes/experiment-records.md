@@ -245,7 +245,7 @@ conda run -n svllm python -u benchmark/long_bench/pred.py \
 | omnikv (`chunk_prefill_accel_omnikv=true`) | 0 | 200 | 0 | 54.75 | `/data2/haojitai/outputs/benchmark/long_bench/hotpotqa_correctness_sparsevllm_20260516_2305/omnikv` |
 | omnikv (`chunk_prefill_accel_omnikv=false`) | 0 | 200 | 0 | 59.65 | `/data2/haojitai/outputs/benchmark/long_bench/hotpotqa_omnikv_prefill_accel_ablation_20260516_2344/sparsevllm-omnikv-no-prefill-accel` |
 
-- Reference anchors: previous full LongBench DeltaKV HotPotQA record in `docs/dev-notes/code-change-history/prefill-schedule-policy-2026-05-16.md` is `59.69`; local archived `qwen25_7b_deltakv_cr30/result.json` has `hotpotqa=58.35`.
+- Reference anchors: previous full LongBench DeltaKV HotPotQA record in `docs/dev_notes/code-change-history/prefill-schedule-policy-2026-05-16.md` is `59.69`; local archived `qwen25_7b_deltakv_cr30/result.json` has `hotpotqa=58.35`.
 - Notes: All completed methods produced 200 JSONL rows with no empty predictions, so the output/eval path is healthy. The OmniKV correctness score should use `chunk_prefill_accel_omnikv=false`, which is the config default and gives `59.65`, aligned with vanilla, SnapKV, Quest, and the reference range. The `54.75` OmniKV result was caused by explicitly enabling the experimental OmniKV prefill acceleration in this LongBench command and should not be used as the correctness score. StreamingLLM and PyramidKV are lower on HotPotQA under these retention settings, but they completed normally and should be treated as quality differences rather than pipeline failures.
 
 ### 2026-05-16 23:40 CST - omnikv-hotpotqa-prefill-accel-ablation

@@ -1,7 +1,7 @@
 # Reproducibility
 
 Use this page as the stable checklist for reproducing Sparse-vLLM experiments.
-For exact historical runs, see [dev-notes/experiment-records.md](dev-notes/experiment-records.md).
+For exact historical runs, see [dev_notes/experiment-records.md](../dev_notes/experiment-records.md).
 
 ## Environment
 
@@ -20,7 +20,7 @@ relevant uncommitted changes with every reported benchmark.
 
 Base models and DeltaKV compressor checkpoints must match. Public compressor
 checkpoints are listed in the README section
-[Download DeltaKV compressor checkpoints](../README.md#download-deltakv-compressor-checkpoints).
+[Download DeltaKV compressor checkpoints](README.md#deltakv-checkpoints).
 
 Pass the downloaded local directory as `deltakv_checkpoint_path`. Current
 loaders read local `model.safetensors` files; do not assume a Hugging Face repo
@@ -55,7 +55,7 @@ Use canonical public parameter names:
 Do not use legacy public keys such as `chunk_prefill_size`,
 `vllm_sparse_method`, `model_cls`, `compressor_path`, `deltakv_path`,
 `num_top_tokens`, or `seq_chunk_size` in new commands. See
-[runtime-parameter-semantics.md](runtime-parameter-semantics.md) for the full
+[runtime-parameter-semantics.md](../configuration/runtime-parameter-semantics.md) for the full
 alias map and backend-specific behavior.
 
 Sparse-vLLM requires explicit integer keep budgets. HF paths may accept ratios

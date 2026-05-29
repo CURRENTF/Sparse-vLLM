@@ -7,7 +7,7 @@ Review environment: `/root/autodl-tmp/conda-envs/svllm-review`
 This document is the engineering review index for the current branch. It
 summarizes repository structure, runtime parameters, supported method paths,
 benchmark entrypoints, concrete findings, and maintenance priorities. Detailed
-parameter semantics remain in `docs/runtime-parameter-semantics.md`.
+parameter semantics remain in `docs/configuration/runtime-parameter-semantics.md`.
 
 ## Scope
 
@@ -178,7 +178,7 @@ Rules that matter for experiment reliability:
 | P0 | Fixed in this review | `bitsandbytes` was imported by quantized load paths but was not declared as an install dependency. | `pip install -e .` could produce an environment that fails during 4-bit/8-bit model loading. | Keep `bitsandbytes` in dependencies and README install notes. |
 | P0 | Fixed in this review | `ClusterCompressedKVCache.update()` could reference `compress_lens` when `visual_token_prune_only=True`, `use_cluster=True`, and `use_compression=False`. | Visual-only no-compressor cluster ablation could crash during cache update. | Regression test added in `tests/test_visual_uniform_pruning.py`. |
 | P1 | Fixed in this review | `unpack_tensor` used list-based multidimensional tensor indexing. | PyTorch emits a future warning and future releases may change behavior. | Convert list indices to tuple before indexing. |
-| P1 | Fixed in docs | `docs/runtime-parameter-semantics.md` said Sparse-VLLM unknown keys are logged and ignored. Current code raises by default. | Misleading docs can hide experiment typo expectations. | Documentation now states default fail-fast behavior and the explicit opt-in flag. |
+| P1 | Fixed in docs | `docs/configuration/runtime-parameter-semantics.md` said Sparse-VLLM unknown keys are logged and ignored. Current code raises by default. | Misleading docs can hide experiment typo expectations. | Documentation now states default fail-fast behavior and the explicit opt-in flag. |
 | P1 | Open | HF `set_native_args` logs unknown config keys instead of raising. | Direct internal callers can silently ignore experiment parameter typos. | Add a strict mode or switch public experiment scripts to a strict setter after checking legacy checkpoint compatibility. |
 | P1 | Open | SCBench and parts of LongBench contain broad `except` or `except/pass` fallback blocks. | Evaluation setup errors can be hidden, especially around tokenizer/model metadata, repo QA parsing, or optional components. | Tighten exceptions in the exact paths used for reported results; write failed-case artifacts instead of swallowing errors. |
 | P1 | Open | Sparse-VLLM method routing mutates `config.vllm_sparse_method` for DeltaKV Triton/offload variants. | Downstream logs and artifacts can lose the originally requested method. | Add a separate immutable `requested_sparse_method` or record the original method in run info before mutation. |
@@ -227,7 +227,7 @@ No warnings were emitted by the final compile check.
 
 ## Maintenance Priorities
 
-1. Keep `docs/runtime-parameter-semantics.md` as the canonical parameter doc.
+1. Keep `docs/configuration/runtime-parameter-semantics.md` as the canonical parameter doc.
    Every new runtime flag should be documented there before being used in a
    benchmark command.
 2. Prefer semantic public names in README, docs, scripts, and benchmark JSON:
