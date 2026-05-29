@@ -17,10 +17,7 @@ The repository also includes DeltaKV compressor training and evaluation tooling.
 
 ## Project Overview
 
-Sparse-vLLM implements the inference runtime in `src/sparsevllm/`. Instead of
-adding sparse policies on top of a conventional KV cache, it organizes cache
-layout, sparse controllers, scheduler flow, and kernels around sparsity as a
-first-class design goal.
+Sparse-vLLM is an inference framework built with sparsity as the first design principle. Instead of layering sparse methods on top of a conventional KV cache, it rethinks cache layout, controller flow, and kernels so that multiple sparse mechanisms can plug in cleanly.
 
 DeltaKV-related compressor training, HF wrapper comparisons, and benchmark
 adapters live under `src/deltakv/` and `benchmark/`.
@@ -99,6 +96,9 @@ This project is inspired by and/or references ideas and implementation technique
 - `ShadowKV` (`ByteDance-Seed/ShadowKV`)
 - `nano-vllm` (`GeeeekExplorer/nano-vllm`)
 
+## License
+
+[Apache License 2.0](LICENSE)
 
 ## Citation
 ```text
@@ -116,7 +116,3 @@ This project is inspired by and/or references ideas and implementation technique
   year={2025}
 }
 ```
-
-## License
-
-[Apache License 2.0](LICENSE)
