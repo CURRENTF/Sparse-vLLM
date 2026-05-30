@@ -105,15 +105,19 @@ results from this path separately from both `visual_uniform_keep` and
 
 ## Entry Points
 
-Use this benchmark entrypoint for new runs:
+Use the explicit benchmark entrypoint for new runs:
 
 ```bash
 python benchmark/multimodal/visual_cache/run_visual_cache.py
 ```
 
-Older local notes may mention legacy wrapper names. Treat
-`benchmark/multimodal/visual_cache/run_visual_cache.py` as the canonical
-entrypoint in new commands.
+The older entrypoint remains as a legacy script-name wrapper:
+
+```bash
+python benchmark/multimodal/visual_cache/run_visual_cache.py
+```
+
+It delegates to the visual-pruning script and prints a deprecation warning.
 
 ## Reproducibility Artifacts
 

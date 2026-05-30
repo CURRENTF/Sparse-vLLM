@@ -18,5 +18,6 @@ Path placeholders used in archived commands:
 
 - [Experiment Records](experiment-records.md)
 - [Code Change History](code-change-history/)
+- [Benchmark Run History](benchmark-run-history/)
 - [Repository Review 2026-05-12](repo-review-2026-05-12.md)
 - [Maintenance TODO](maintenance-todo.md)
