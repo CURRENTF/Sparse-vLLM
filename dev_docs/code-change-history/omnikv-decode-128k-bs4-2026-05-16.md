@@ -69,15 +69,15 @@ Tested but rejected:
 ## Environment
 
 - Host: local `guest-KR6288-X2-A0-R0-00`
-- Working dir: `/home/haojitai/projects/Sparse-vLLM`
+- Working dir: `<PROJECT_ROOT>`
 - GPU: `CUDA_VISIBLE_DEVICES=6`, NVIDIA H100 80GB HBM3
 - Conda env: `svllm`
-- Base model: `/data2/haojitai/models/Qwen2.5-7B-Instruct-1M`
+- Base model: `<MODEL_ROOT>/Qwen2.5-7B-Instruct-1M`
 - Compressor path used by logits script:
-  `/data2/haojitai/checkpoints/compressor/Qwen2.5-7B-Instruct-1M-Compressor`
+  `<CHECKPOINT_ROOT>/Qwen2.5-7B-Instruct-1M-Compressor`
 - Code base at start of this optimization branch: `86c9485`
 - Output root:
-  `/data2/haojitai/outputs/Sparse-vLLM/omnikv_decode_128k_bs4`
+  `<OUTPUT_ROOT>/Sparse-vLLM/omnikv_decode_128k_bs4`
 
 ## Main Benchmark Config
 
@@ -86,7 +86,7 @@ Shared command shape:
 ```bash
 CUDA_VISIBLE_DEVICES=6 PYTHONPATH=$PWD/src conda run -n svllm \
   python scripts/benchmarks/bench_sparse_vllm.py \
-  --model_path /data2/haojitai/models/Qwen2.5-7B-Instruct-1M \
+  --model_path <MODEL_ROOT>/Qwen2.5-7B-Instruct-1M \
   --methods <vanilla|omnikv> \
   --lengths 128000 \
   --batch_sizes 4 \
@@ -114,29 +114,29 @@ Resolved OmniKV parameters:
 
 | Run | Method | Context | BS | Decode tok/s | ITL ms | Notes | Log |
 | --- | --- | ---: | ---: | ---: | ---: | --- | --- |
-| baseline | vanilla | 128000 | 4 | 139.0 | 28.78 | before this branch's perf edits | `/data2/haojitai/outputs/Sparse-vLLM/omnikv_decode_128k_bs4/baseline_20260516_034411/baseline_vanilla_omnikv_128k_bs4_out64.log` |
+| baseline | vanilla | 128000 | 4 | 139.0 | 28.78 | before this branch's perf edits | `<OUTPUT_ROOT>/Sparse-vLLM/omnikv_decode_128k_bs4/baseline_20260516_034411/baseline_vanilla_omnikv_128k_bs4_out64.log` |
 | baseline | omnikv | 128000 | 4 | 117.7 | 34.00 | before this branch's perf edits | same as above |
-| after maxlen/topk | omnikv | 128000 | 4 | 139.45 | 28.68 | removed decode max-len sync and vectorized OmniKV top-k | `/data2/haojitai/outputs/Sparse-vLLM/omnikv_decode_128k_bs4/after_vector_topk_maxlen_clean_20260516_040810/omnikv_128k_bs4_out64.log` |
-| current full baseline | vanilla | 128000 | 4 | 151.71 | 26.37 | same branch after max-len optimization | `/data2/haojitai/outputs/Sparse-vLLM/omnikv_decode_128k_bs4/vanilla_after_maxlen_20260516_041107/vanilla_128k_bs4_out64.log` |
-| workspace reuse | omnikv | 128000 | 4 | 141.39 | 28.29 | retained workspace reuse | `/data2/haojitai/outputs/Sparse-vLLM/omnikv_decode_128k_bs4/after_decode_workspace_reuse_20260516_042539/omnikv_128k_bs4_out64.log` |
-| dense lower-bound probe | vanilla | 1024 | 4 | 153.71 | 26.02 | short context, attention cost near-minimal | `/data2/haojitai/outputs/Sparse-vLLM/omnikv_decode_128k_bs4/dense_lower_bound_len1024_20260516_042718/vanilla_1k_bs4_out64.log` |
-| greedy sampler re-run | vanilla | 128000 | 4 | 152.67 | 26.20 | greedy sampler fast path, fair combined run | `/data2/haojitai/outputs/Sparse-vLLM/omnikv_decode_128k_bs4/after_greedy_sampler_20260516_043423/vanilla_omnikv_128k_bs4_out64.log` |
+| after maxlen/topk | omnikv | 128000 | 4 | 139.45 | 28.68 | removed decode max-len sync and vectorized OmniKV top-k | `<OUTPUT_ROOT>/Sparse-vLLM/omnikv_decode_128k_bs4/after_vector_topk_maxlen_clean_20260516_040810/omnikv_128k_bs4_out64.log` |
+| current full baseline | vanilla | 128000 | 4 | 151.71 | 26.37 | same branch after max-len optimization | `<OUTPUT_ROOT>/Sparse-vLLM/omnikv_decode_128k_bs4/vanilla_after_maxlen_20260516_041107/vanilla_128k_bs4_out64.log` |
+| workspace reuse | omnikv | 128000 | 4 | 141.39 | 28.29 | retained workspace reuse | `<OUTPUT_ROOT>/Sparse-vLLM/omnikv_decode_128k_bs4/after_decode_workspace_reuse_20260516_042539/omnikv_128k_bs4_out64.log` |
+| dense lower-bound probe | vanilla | 1024 | 4 | 153.71 | 26.02 | short context, attention cost near-minimal | `<OUTPUT_ROOT>/Sparse-vLLM/omnikv_decode_128k_bs4/dense_lower_bound_len1024_20260516_042718/vanilla_1k_bs4_out64.log` |
+| greedy sampler re-run | vanilla | 128000 | 4 | 152.67 | 26.20 | greedy sampler fast path, fair combined run | `<OUTPUT_ROOT>/Sparse-vLLM/omnikv_decode_128k_bs4/after_greedy_sampler_20260516_043423/vanilla_omnikv_128k_bs4_out64.log` |
 | greedy sampler re-run | omnikv | 128000 | 4 | 138.26 | 28.93 | same run as above | same as above |
-| Triton RoPE/SiLU rejected | vanilla | 128000 | 4 | 141.60 | 28.25 | reverted after regression | `/data2/haojitai/outputs/Sparse-vLLM/omnikv_decode_128k_bs4/after_triton_rope_silu_20260516_044122/vanilla_omnikv_128k_bs4_out64.log` |
+| Triton RoPE/SiLU rejected | vanilla | 128000 | 4 | 141.60 | 28.25 | reverted after regression | `<OUTPUT_ROOT>/Sparse-vLLM/omnikv_decode_128k_bs4/after_triton_rope_silu_20260516_044122/vanilla_omnikv_128k_bs4_out64.log` |
 | Triton RoPE/SiLU rejected | omnikv | 128000 | 4 | 133.43 | 29.98 | reverted after regression | same as above |
-| final retained | vanilla | 128000 | 4 | 152.04 | 26.31 | retained max-len/top-k/workspace/greedy path | `/data2/haojitai/outputs/Sparse-vLLM/omnikv_decode_128k_bs4/final_retained_20260516_045011/vanilla_omnikv_128k_bs4_out64.log` |
+| final retained | vanilla | 128000 | 4 | 152.04 | 26.31 | retained max-len/top-k/workspace/greedy path | `<OUTPUT_ROOT>/Sparse-vLLM/omnikv_decode_128k_bs4/final_retained_20260516_045011/vanilla_omnikv_128k_bs4_out64.log` |
 | final retained | omnikv | 128000 | 4 | 142.10 | 28.15 | final measured speedup `0.93x` vs vanilla | same as above |
-| Triton RMSNorm rejected | vanilla | 128000 | 4 | 139.50 | 28.67 | reverted after regression | `/data2/haojitai/outputs/Sparse-vLLM/omnikv_decode_128k_bs4/triton_rmsnorm_20260516_045852/vanilla_omnikv_128k_bs4_out64.log` |
+| Triton RMSNorm rejected | vanilla | 128000 | 4 | 139.50 | 28.67 | reverted after regression | `<OUTPUT_ROOT>/Sparse-vLLM/omnikv_decode_128k_bs4/triton_rmsnorm_20260516_045852/vanilla_omnikv_128k_bs4_out64.log` |
 | Triton RMSNorm rejected | omnikv | 128000 | 4 | 135.23 | 29.58 | reverted after regression | same as above |
-| empty decode score rejected | vanilla | 128000 | 4 | 148.08 | 27.01 | same-run baseline | `/data2/haojitai/outputs/Sparse-vLLM/omnikv_decode_128k_bs4/decode_score_empty_20260516_050852/vanilla_omnikv_128k_bs4_out64.log` |
+| empty decode score rejected | vanilla | 128000 | 4 | 148.08 | 27.01 | same-run baseline | `<OUTPUT_ROOT>/Sparse-vLLM/omnikv_decode_128k_bs4/decode_score_empty_20260516_050852/vanilla_omnikv_128k_bs4_out64.log` |
 | empty decode score rejected | omnikv | 128000 | 4 | 124.99 | 32.00 | reverted after regression | same as above |
-| aggressive full0 ablation | omnikv | 128000 | 4 | 147.18 | 27.18 | `full_attention_layers="0"`, not the paper/default path | `/data2/haojitai/outputs/Sparse-vLLM/omnikv_decode_128k_bs4/aggressive_full0_20260516_051516/omnikv_128k_bs4_out64.log` |
-| fixed-view graph probe | omnikv | 128000 | 4 | model-only 408.3 est. | 9.80 model ms | not a correct generation loop | `/data2/haojitai/outputs/Sparse-vLLM/omnikv_decode_128k_bs4/cudagraph_feasibility_20260516_051814/summary.json` |
-| graph no prewarm | omnikv | 128000 | 4 | 305.68 | 13.09 | out512; first decode includes warmup/capture | `/data2/haojitai/outputs/Sparse-vLLM/omnikv_decode_128k_bs4/graph_128k_bs4_out512_20260516_053030/omnikv_128k_bs4_out512_graph.log` |
-| graph no prewarm | omnikv | 128000 | 4 | 368.45 | 10.86 | out2048; capture amortized but still below target | `/data2/haojitai/outputs/Sparse-vLLM/omnikv_decode_128k_bs4/graph_128k_bs4_out2048_20260516_053200/omnikv_128k_bs4_out2048_graph.log` |
-| graph no prewarm | omnikv | 128000 | 4 | 375.55 | 10.65 | out4096; below same-length 2.5x target | `/data2/haojitai/outputs/Sparse-vLLM/omnikv_decode_128k_bs4/graph_128k_bs4_out4096_20260516_053332/omnikv_128k_bs4_out4096_graph.log` |
-| same-length baseline | vanilla | 128000 | 4 | 153.92 | 25.99 | out4096 full-attention baseline | `/data2/haojitai/outputs/Sparse-vLLM/omnikv_decode_128k_bs4/vanilla_128k_bs4_out4096_20260516_053523/vanilla_128k_bs4_out4096.log` |
-| retained graph prewarm | omnikv | 128000 | 4 | 395.72 | 10.11 | out4096; warmup pre-captures graph, formal decode is replay-only | `/data2/haojitai/outputs/Sparse-vLLM/omnikv_decode_128k_bs4/graph_prewarm_128k_bs4_out4096_20260516_054817/omnikv_128k_bs4_out4096_graph_prewarm.log` |
+| aggressive full0 ablation | omnikv | 128000 | 4 | 147.18 | 27.18 | `full_attention_layers="0"`, not the paper/default path | `<OUTPUT_ROOT>/Sparse-vLLM/omnikv_decode_128k_bs4/aggressive_full0_20260516_051516/omnikv_128k_bs4_out64.log` |
+| fixed-view graph probe | omnikv | 128000 | 4 | model-only 408.3 est. | 9.80 model ms | not a correct generation loop | `<OUTPUT_ROOT>/Sparse-vLLM/omnikv_decode_128k_bs4/cudagraph_feasibility_20260516_051814/summary.json` |
+| graph no prewarm | omnikv | 128000 | 4 | 305.68 | 13.09 | out512; first decode includes warmup/capture | `<OUTPUT_ROOT>/Sparse-vLLM/omnikv_decode_128k_bs4/graph_128k_bs4_out512_20260516_053030/omnikv_128k_bs4_out512_graph.log` |
+| graph no prewarm | omnikv | 128000 | 4 | 368.45 | 10.86 | out2048; capture amortized but still below target | `<OUTPUT_ROOT>/Sparse-vLLM/omnikv_decode_128k_bs4/graph_128k_bs4_out2048_20260516_053200/omnikv_128k_bs4_out2048_graph.log` |
+| graph no prewarm | omnikv | 128000 | 4 | 375.55 | 10.65 | out4096; below same-length 2.5x target | `<OUTPUT_ROOT>/Sparse-vLLM/omnikv_decode_128k_bs4/graph_128k_bs4_out4096_20260516_053332/omnikv_128k_bs4_out4096_graph.log` |
+| same-length baseline | vanilla | 128000 | 4 | 153.92 | 25.99 | out4096 full-attention baseline | `<OUTPUT_ROOT>/Sparse-vLLM/omnikv_decode_128k_bs4/vanilla_128k_bs4_out4096_20260516_053523/vanilla_128k_bs4_out4096.log` |
+| retained graph prewarm | omnikv | 128000 | 4 | 395.72 | 10.11 | out4096; warmup pre-captures graph, formal decode is replay-only | `<OUTPUT_ROOT>/Sparse-vLLM/omnikv_decode_128k_bs4/graph_prewarm_128k_bs4_out4096_20260516_054817/omnikv_128k_bs4_out4096_graph_prewarm.log` |
 
 Same-length target for the final retained run:
 
@@ -159,9 +159,9 @@ implementation was checked against HF OmniKV on the long case:
 ```bash
 CUDA_VISIBLE_DEVICES=6 PYTHONPATH=$PWD/src conda run -n svllm \
   python scripts/debug/compare_logits_hf_sparsevllm.py \
-  --model_path /data2/haojitai/models/Qwen2.5-7B-Instruct-1M \
-  --compressor_path /data2/haojitai/checkpoints/compressor/Qwen2.5-7B-Instruct-1M-Compressor \
-  --output_dir /data2/haojitai/outputs/Sparse-vLLM/omnikv_decode_128k_bs4/logits_smoke_vector_topk_20260516_040515 \
+  --model_path <MODEL_ROOT>/Qwen2.5-7B-Instruct-1M \
+  --compressor_path <CHECKPOINT_ROOT>/Qwen2.5-7B-Instruct-1M-Compressor \
+  --output_dir <OUTPUT_ROOT>/Sparse-vLLM/omnikv_decode_128k_bs4/logits_smoke_vector_topk_20260516_040515 \
   --cases long \
   --methods omnikv \
   --cuda_visible_devices 6 \
@@ -181,7 +181,7 @@ CUDA_VISIBLE_DEVICES=6 PYTHONPATH=$PWD/src conda run -n svllm \
 
 Result file:
 
-- `/data2/haojitai/outputs/Sparse-vLLM/omnikv_decode_128k_bs4/logits_smoke_vector_topk_20260516_040515/long_omnikv.json`
+- `<OUTPUT_ROOT>/Sparse-vLLM/omnikv_decode_128k_bs4/logits_smoke_vector_topk_20260516_040515/long_omnikv.json`
 
 Decode result:
 
@@ -193,7 +193,7 @@ Decode result:
 The final retained unsorted-topk path was also checked on the long case:
 
 - Result file:
-  `/data2/haojitai/outputs/Sparse-vLLM/omnikv_decode_128k_bs4/logits_smoke_topk_unsorted_20260516_044750/long_omnikv.json`
+  `<OUTPUT_ROOT>/Sparse-vLLM/omnikv_decode_128k_bs4/logits_smoke_topk_unsorted_20260516_044750/long_omnikv.json`
 - Decode result: `max_abs_diff=0.28125`,
   `mean_abs_diff=0.030360523611307144`, `argmax_match=true`
 - top-k overlap: top-1 `1.0`, top-5 `1.0`, top-10 `0.9`, top-50 `1.0`
@@ -201,7 +201,7 @@ The final retained unsorted-topk path was also checked on the long case:
 The rejected Triton RoPE/SiLU variant was checked before reverting:
 
 - Result file:
-  `/data2/haojitai/outputs/Sparse-vLLM/omnikv_decode_128k_bs4/logits_smoke_triton_rope_silu_20260516_043920/long_omnikv.json`
+  `<OUTPUT_ROOT>/Sparse-vLLM/omnikv_decode_128k_bs4/logits_smoke_triton_rope_silu_20260516_043920/long_omnikv.json`
 - Decode result: `max_abs_diff=0.3125`,
   `mean_abs_diff=0.059485841542482376`, `argmax_match=true`
 - Rejected because the corresponding 128k bs4 throughput run regressed to
@@ -210,7 +210,7 @@ The rejected Triton RoPE/SiLU variant was checked before reverting:
 The rejected Triton RMSNorm variant was checked before reverting:
 
 - Result file:
-  `/data2/haojitai/outputs/Sparse-vLLM/omnikv_decode_128k_bs4/logits_smoke_triton_rmsnorm_20260516_045808/long_omnikv.json`
+  `<OUTPUT_ROOT>/Sparse-vLLM/omnikv_decode_128k_bs4/logits_smoke_triton_rmsnorm_20260516_045808/long_omnikv.json`
 - Decode result: `max_abs_diff=0.5`,
   `mean_abs_diff=0.03933897614479065`, `argmax_match=true`
 - Rejected because the corresponding 128k bs4 throughput run regressed to
@@ -219,7 +219,7 @@ The rejected Triton RMSNorm variant was checked before reverting:
 The rejected empty decode-score buffer variant was checked before reverting:
 
 - Result file:
-  `/data2/haojitai/outputs/Sparse-vLLM/omnikv_decode_128k_bs4/logits_smoke_decode_score_empty_20260516_050807/long_omnikv.json`
+  `<OUTPUT_ROOT>/Sparse-vLLM/omnikv_decode_128k_bs4/logits_smoke_decode_score_empty_20260516_050807/long_omnikv.json`
 - Decode result: `max_abs_diff=0.28125`,
   `mean_abs_diff=0.030360523611307144`, `argmax_match=true`
 - Rejected because the corresponding 128k bs4 throughput run regressed to
@@ -229,7 +229,7 @@ The aggressive `full_attention_layers="0"` ablation was checked as a
 diagnostic, not as the retained/paper path:
 
 - Result file:
-  `/data2/haojitai/outputs/Sparse-vLLM/omnikv_decode_128k_bs4/logits_smoke_aggressive_full0_20260516_051430/long_omnikv.json`
+  `<OUTPUT_ROOT>/Sparse-vLLM/omnikv_decode_128k_bs4/logits_smoke_aggressive_full0_20260516_051430/long_omnikv.json`
 - Decode result: `max_abs_diff=1.375`,
   `mean_abs_diff=0.21411097049713135`, `argmax_match=true`
 - top-k overlap: top-1 `1.0`, top-5 `0.8`, top-10 `0.9`,
@@ -241,7 +241,7 @@ After adding the graph-prewarm path, the non-graph logits comparison was rerun
 against the unchanged HF OmniKV backend:
 
 - Result file:
-  `/data2/haojitai/outputs/Sparse-vLLM/omnikv_decode_128k_bs4/logits_smoke_graph_branch_20260516_055109/long_omnikv.json`
+  `<OUTPUT_ROOT>/Sparse-vLLM/omnikv_decode_128k_bs4/logits_smoke_graph_branch_20260516_055109/long_omnikv.json`
 - Decode result: `max_abs_diff=0.28125`,
   `mean_abs_diff=0.030360523611307144`, `argmax_match=true`
 - top-k overlap: top-1 `1.0`, top-5 `1.0`, top-10 `0.9`,
@@ -251,7 +251,7 @@ Graph replay was also compared against the eager Sparse-VLLM OmniKV greedy
 token path in separate processes:
 
 - Compare result:
-  `/data2/haojitai/outputs/Sparse-vLLM/omnikv_decode_128k_bs4/graph_vs_eager_tokens_separate_20260516_055008/compare.json`
+  `<OUTPUT_ROOT>/Sparse-vLLM/omnikv_decode_128k_bs4/graph_vs_eager_tokens_separate_20260516_055008/compare.json`
 - Config: 2048-token prompts, bs4, `max_tokens=32`, `decode_keep_tokens=256`,
   `prefill_keep_tokens=256`, `sink_keep_tokens=8`, `recent_keep_tokens=64`,
   `full_attention_layers="0,1,2,4,7,14"`
@@ -262,7 +262,7 @@ token path in separate processes:
 High-level synchronized profile after max-len/top-k optimization:
 
 - Log:
-  `/data2/haojitai/outputs/Sparse-vLLM/omnikv_decode_128k_bs4/profile_highlevel_after_maxlen_20260516_041236/omnikv_128k_bs4_out16_profile.log`
+  `<OUTPUT_ROOT>/Sparse-vLLM/omnikv_decode_128k_bs4/profile_highlevel_after_maxlen_20260516_041236/omnikv_128k_bs4_out16_profile.log`
 - `model_run_decode`: `32.8568 ms`
 - `model_run_model_decode`: `30.9914 ms`
 - `sparse_update_dynamic_indices`: `0.5803 ms` per observation call
@@ -276,7 +276,7 @@ current eager dense model path already sits around 26 ms/step at BS4.
 CUDA Graph feasibility probe:
 
 - Output:
-  `/data2/haojitai/outputs/Sparse-vLLM/omnikv_decode_128k_bs4/cudagraph_feasibility_20260516_051814/summary.json`
+  `<OUTPUT_ROOT>/Sparse-vLLM/omnikv_decode_128k_bs4/cudagraph_feasibility_20260516_051814/summary.json`
 - Config: OmniKV, 128k context, bs4, `output_len=3` setup to reach decode
   state, paper/default `full_attention_layers="0,1,2,4,7,14"`,
   `decode_keep_tokens=4096`, `prefill_keep_tokens=4096`,
@@ -326,10 +326,10 @@ Additional focused checks:
 - `python -m py_compile src/sparsevllm/engine/sparse_controller.py`: passed
 - `python -m py_compile src/sparsevllm/layers/attention.py`: passed
 - graph-vs-eager Sparse-VLLM token smoke:
-  `/data2/haojitai/outputs/Sparse-vLLM/omnikv_decode_128k_bs4/graph_vs_eager_tokens_separate_20260516_055008/compare.json`,
+  `<OUTPUT_ROOT>/Sparse-vLLM/omnikv_decode_128k_bs4/graph_vs_eager_tokens_separate_20260516_055008/compare.json`,
   `match=true`
 - HF logits smoke:
-  `/data2/haojitai/outputs/Sparse-vLLM/omnikv_decode_128k_bs4/logits_smoke_graph_branch_20260516_055109/long_omnikv.json`,
+  `<OUTPUT_ROOT>/Sparse-vLLM/omnikv_decode_128k_bs4/logits_smoke_graph_branch_20260516_055109/long_omnikv.json`,
   decode `argmax_match=true`
 - `python -m unittest tests.test_mlp_chunking tests.test_sampler`: passed
 - `git diff --check`: passed

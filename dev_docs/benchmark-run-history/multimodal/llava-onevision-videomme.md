@@ -22,7 +22,7 @@ one annotation parquet, `subtitle.zip`, and 20 video zip shards.
 The local default root is:
 
 ```text
-/data2/haojitai/datasets/Video-MME_hf
+<DATA_ROOT>/Video-MME_hf
 ```
 
 Download metadata only:
@@ -35,15 +35,15 @@ bash scripts/data/download_videomme_full.sh
 Download the full dataset in the background:
 
 ```bash
-VIDEOMME_ROOT=/data2/haojitai/datasets/Video-MME_hf \
+VIDEOMME_ROOT=<DATA_ROOT>/Video-MME_hf \
 HF_MAX_WORKERS=1 \
 PROXY_URL=http://localhost:7890 \
 bash scripts/data/tmux_download_videomme_full.sh
 ```
 
 The script uses `hf download`, keeps Hugging Face cache under
-`/data2/haojitai/.cache/huggingface`, and unzips `subtitle.zip` plus
-`videos_chunked_*.zip` after the download finishes.
+`<HF_CACHE_ROOT>`, and unzips `subtitle.zip` plus `videos_chunked_*.zip` after
+the download finishes.
 
 ## Dry Run
 
@@ -52,8 +52,8 @@ Validate annotation parsing without requiring videos:
 ```bash
 PYTHONPATH=$PWD/src \
 python benchmark/multimodal/video_qa/videomme.py \
-  --dataset_dir /data2/haojitai/datasets/Video-MME_hf \
-  --output_dir /data2/haojitai/datasets/llava_onevision_videomme_dry_run \
+  --dataset_dir <DATA_ROOT>/Video-MME_hf \
+  --output_dir <DATA_ROOT>/llava_onevision_videomme_dry_run \
   --dry_run_metadata \
   --num_samples 5
 ```
@@ -68,9 +68,9 @@ After at least one video shard has been downloaded and unzipped:
 ```bash
 CUDA_VISIBLE_DEVICES=7 PYTHONPATH=$PWD/src \
 python benchmark/multimodal/video_qa/videomme.py \
-  --model_path /data2/haojitai/models/llava-onevision-qwen2-0.5b-ov-hf \
-  --dataset_dir /data2/haojitai/datasets/Video-MME_hf \
-  --output_dir /data2/haojitai/datasets/llava_onevision_videomme_smoke \
+  --model_path <MODEL_ROOT>/llava-onevision-qwen2-0.5b-ov-hf \
+  --dataset_dir <DATA_ROOT>/Video-MME_hf \
+  --output_dir <DATA_ROOT>/llava_onevision_videomme_smoke \
   --methods vanilla,deltakv_delta_quant \
   --num_samples 8 \
   --batch_size 1 \

@@ -10,19 +10,19 @@ It aligns these ReKV evaluation details:
 - Video sampling: `sample_fps=0.5`
 - Context budget: 64 video context frames, matching ReKV `retrieve_size=64`
 - Prompt: ReKV MC prompt ending with `Best option: (`
-- Evaluator: `/tmp/ReKV/video_qa/eval/eval_multiple_choice.py`
+- Evaluator: `<REKV_ROOT>/video_qa/eval/eval_multiple_choice.py`
 
 This is not a reproduction of ReKV retrieval itself. It evaluates our vanilla and
 DeltaKV paths using the ReKV dataset, prompt, frame budget, and official CSV metric.
 
 ## Data
 
-Downloaded under `/data2/haojitai/datasets`:
+Downloaded under `<DATA_ROOT>`:
 
 ```bash
-/data2/haojitai/datasets/rekv_qaego4d/test_mc.json
-/data2/haojitai/datasets/rekv_qaego4d/videos.zip
-/data2/haojitai/datasets/rekv_qaego4d/videos/*.mp4
+<DATA_ROOT>/rekv_qaego4d/test_mc.json
+<DATA_ROOT>/rekv_qaego4d/videos.zip
+<DATA_ROOT>/rekv_qaego4d/videos/*.mp4
 ```
 
 The archive contains 148 videos and the annotation contains 500 QA pairs.
@@ -30,7 +30,7 @@ The archive contains 148 videos and the annotation contains 500 QA pairs.
 Frame cache used by the full run:
 
 ```bash
-/data2/haojitai/datasets/rekv_qaego4d_frame_cache_fps05_64
+<DATA_ROOT>/rekv_qaego4d_frame_cache_fps05_64
 ```
 
 ## Command
@@ -39,11 +39,11 @@ The full 7B run used physical GPU 7 only:
 
 ```bash
 CUDA_VISIBLE_DEVICES=7 PYTHONPATH=$PWD/src \
-/home/haojitai/miniconda3/envs/svllm/bin/python -u \
+<SVLLM_PYTHON> -u \
 benchmark/multimodal/video_qa/qaego4d.py \
-  --model_path /data2/haojitai/models/llava-onevision-qwen2-7b-ov-hf \
-  --dataset_dir /data2/haojitai/datasets/rekv_qaego4d \
-  --output_dir /data2/haojitai/datasets/llava_onevision_rekv_qaego4d_7b_full \
+  --model_path <MODEL_ROOT>/llava-onevision-qwen2-7b-ov-hf \
+  --dataset_dir <DATA_ROOT>/rekv_qaego4d \
+  --output_dir <DATA_ROOT>/llava_onevision_rekv_qaego4d_7b_full \
   --methods vanilla,deltakv_delta_quant \
   --num_samples -1 \
   --batch_size 1 \
@@ -51,20 +51,20 @@ benchmark/multimodal/video_qa/qaego4d.py \
   --max_context_frames 64 \
   --cuda_device 0 \
   --reuse_frame_cache \
-  --frame_cache_dir /data2/haojitai/datasets/rekv_qaego4d_frame_cache_fps05_64 \
+  --frame_cache_dir <DATA_ROOT>/rekv_qaego4d_frame_cache_fps05_64 \
   --log_every 25
 ```
 
 Official ReKV evaluator checks:
 
 ```bash
-/home/haojitai/miniconda3/envs/svllm/bin/python \
-/tmp/ReKV/video_qa/eval/eval_multiple_choice.py \
-  --results_path /data2/haojitai/datasets/llava_onevision_rekv_qaego4d_7b_full/vanilla_results.csv
+<SVLLM_PYTHON> \
+<REKV_ROOT>/video_qa/eval/eval_multiple_choice.py \
+  --results_path <DATA_ROOT>/llava_onevision_rekv_qaego4d_7b_full/vanilla_results.csv
 
-/home/haojitai/miniconda3/envs/svllm/bin/python \
-/tmp/ReKV/video_qa/eval/eval_multiple_choice.py \
-  --results_path /data2/haojitai/datasets/llava_onevision_rekv_qaego4d_7b_full/llava_deltakv_delta_quant_results.csv
+<SVLLM_PYTHON> \
+<REKV_ROOT>/video_qa/eval/eval_multiple_choice.py \
+  --results_path <DATA_ROOT>/llava_onevision_rekv_qaego4d_7b_full/llava_deltakv_delta_quant_results.csv
 ```
 
 ## Result
@@ -72,9 +72,9 @@ Official ReKV evaluator checks:
 Output files:
 
 ```bash
-/data2/haojitai/datasets/llava_onevision_rekv_qaego4d_7b_full/last_rekv_qaego4d_result.json
-/data2/haojitai/datasets/llava_onevision_rekv_qaego4d_7b_full/vanilla_results.csv
-/data2/haojitai/datasets/llava_onevision_rekv_qaego4d_7b_full/llava_deltakv_delta_quant_results.csv
+<DATA_ROOT>/llava_onevision_rekv_qaego4d_7b_full/last_rekv_qaego4d_result.json
+<DATA_ROOT>/llava_onevision_rekv_qaego4d_7b_full/vanilla_results.csv
+<DATA_ROOT>/llava_onevision_rekv_qaego4d_7b_full/llava_deltakv_delta_quant_results.csv
 ```
 
 | Method | Samples | QA Acc | New tok/s | Examples/s | Peak memory |
@@ -133,11 +133,11 @@ Full QAEGO4D-test-mc sanity check on LLaVA-OV-0.5B:
 
 ```bash
 CUDA_VISIBLE_DEVICES=7 PYTHONPATH=$PWD/src \
-/home/haojitai/miniconda3/envs/svllm/bin/python -u \
+<SVLLM_PYTHON> -u \
 benchmark/multimodal/video_qa/qaego4d.py \
-  --model_path /data2/haojitai/models/llava-onevision-qwen2-0.5b-ov-hf \
-  --dataset_dir /data2/haojitai/datasets/rekv_qaego4d \
-  --output_dir /data2/haojitai/datasets/llava_onevision_rekv_qaego4d_05b_kr30_full \
+  --model_path <MODEL_ROOT>/llava-onevision-qwen2-0.5b-ov-hf \
+  --dataset_dir <DATA_ROOT>/rekv_qaego4d \
+  --output_dir <DATA_ROOT>/llava_onevision_rekv_qaego4d_05b_kr30_full \
   --methods vanilla,deltakv_delta_quant \
   --num_samples -1 \
   --batch_size 1 \
@@ -145,7 +145,7 @@ benchmark/multimodal/video_qa/qaego4d.py \
   --max_context_frames 64 \
   --cuda_device 0 \
   --reuse_frame_cache \
-  --frame_cache_dir /data2/haojitai/datasets/rekv_qaego4d_frame_cache_fps05_64 \
+  --frame_cache_dir <DATA_ROOT>/rekv_qaego4d_frame_cache_fps05_64 \
   --full_attention_layers 0 \
   --deltakv_center_ratio 0.03 \
   --decode_keep_tokens 1024 \
@@ -161,8 +161,8 @@ benchmark/multimodal/video_qa/qaego4d.py \
 The 7B candidate output is:
 
 ```bash
-/data2/haojitai/datasets/llava_onevision_rekv_qaego4d_7b_kr30_candidate/last_rekv_qaego4d_result.json
-/data2/haojitai/datasets/llava_onevision_rekv_qaego4d_7b_kr30_candidate/llava_deltakv_delta_quant_results.csv
+<DATA_ROOT>/llava_onevision_rekv_qaego4d_7b_kr30_candidate/last_rekv_qaego4d_result.json
+<DATA_ROOT>/llava_onevision_rekv_qaego4d_7b_kr30_candidate/llava_deltakv_delta_quant_results.csv
 ```
 
 Official ReKV evaluator reported `%Errors: 0.00` for the 0.5B CSV files and

@@ -35,14 +35,14 @@ Retained code changes:
 ## Environment
 
 - Host: local `guest-KR6288-X2-A0-R0-00`
-- Working dir: `/home/haojitai/projects/Sparse-vLLM`
+- Working dir: `<PROJECT_ROOT>`
 - GPU: `CUDA_VISIBLE_DEVICES=1`, NVIDIA H100 80GB HBM3
 - Conda env: `svllm`
-- Base model: `/data2/haojitai/models/Qwen2.5-7B-Instruct-1M`
+- Base model: `<MODEL_ROOT>/Qwen2.5-7B-Instruct-1M`
 - Compressor path for HF logits check:
-  `/data2/haojitai/checkpoints/compressor/Qwen2.5-7B-Instruct-1M-Compressor`
+  `<CHECKPOINT_ROOT>/Qwen2.5-7B-Instruct-1M-Compressor`
 - Output root:
-  `/data2/haojitai/outputs/Sparse-vLLM/decode_cuda_graph_forward_20260516_141124`
+  `<OUTPUT_ROOT>/Sparse-vLLM/decode_cuda_graph_forward_20260516_141124`
 
 ## Validation
 
@@ -72,7 +72,7 @@ Graph-vs-eager decode logits, small smoke:
 ```bash
 CUDA_VISIBLE_DEVICES=1 PYTHONPATH=$PWD/src conda run -n svllm \
   python scripts/debug/compare_decode_graph_eager_logits.py \
-  --model_path /data2/haojitai/models/Qwen2.5-7B-Instruct-1M \
+  --model_path <MODEL_ROOT>/Qwen2.5-7B-Instruct-1M \
   --method <vanilla|omnikv> \
   --prompt_len 2048 \
   --batch_size 2 \
@@ -85,13 +85,13 @@ Results:
 
 | Method | Result file | max abs diff | mean abs diff | Argmax | Top-k |
 | --- | --- | ---: | ---: | --- | --- |
-| vanilla | `/data2/haojitai/outputs/Sparse-vLLM/decode_cuda_graph_forward_20260516_141124/vanilla_graph_vs_eager_logits.json` | 0.0 | 0.0 | match | top1/5/10/50 all 1.0 |
-| omnikv | `/data2/haojitai/outputs/Sparse-vLLM/decode_cuda_graph_forward_20260516_141124/omnikv_graph_vs_eager_logits.json` | 0.0 | 0.0 | match | top1/5/10/50 all 1.0 |
+| vanilla | `<OUTPUT_ROOT>/Sparse-vLLM/decode_cuda_graph_forward_20260516_141124/vanilla_graph_vs_eager_logits.json` | 0.0 | 0.0 | match | top1/5/10/50 all 1.0 |
+| omnikv | `<OUTPUT_ROOT>/Sparse-vLLM/decode_cuda_graph_forward_20260516_141124/omnikv_graph_vs_eager_logits.json` | 0.0 | 0.0 | match | top1/5/10/50 all 1.0 |
 
 HF-vs-Sparse-VLLM eager OmniKV logits:
 
 - Output:
-  `/data2/haojitai/outputs/Sparse-vLLM/decode_cuda_graph_forward_20260516_141124/hf_vs_sparse_eager_logits/long_omnikv.json`
+  `<OUTPUT_ROOT>/Sparse-vLLM/decode_cuda_graph_forward_20260516_141124/hf_vs_sparse_eager_logits/long_omnikv.json`
 - Decode result: `max_abs_diff=0.28125`,
   `mean_abs_diff=0.030360523611307144`, `argmax_match=true`
 - Decode top-k overlap: top1 `1.0`, top5 `1.0`, top10 `0.9`, top50 `1.0`
@@ -101,7 +101,7 @@ Top-p graph smoke:
 - Command used `decode_cuda_graph=true`, `temperature=0.7`, `top_p=0.9`,
   `length=2048`, `bs=2`, `output_len=4`.
 - Log:
-  `/data2/haojitai/outputs/Sparse-vLLM/decode_cuda_graph_forward_20260516_141124/top_p_graph_smoke.log`
+  `<OUTPUT_ROOT>/Sparse-vLLM/decode_cuda_graph_forward_20260516_141124/top_p_graph_smoke.log`
 - Result: vanilla and OmniKV completed successfully with sampling outside the
   graph.
 
@@ -118,7 +118,7 @@ Shared command shape:
 ```bash
 CUDA_VISIBLE_DEVICES=1 PYTHONPATH=$PWD/src conda run -n svllm \
   python scripts/benchmarks/bench_sparse_vllm.py \
-  --model_path /data2/haojitai/models/Qwen2.5-7B-Instruct-1M \
+  --model_path <MODEL_ROOT>/Qwen2.5-7B-Instruct-1M \
   --methods vanilla,omnikv \
   --lengths 128000 \
   --batch_sizes 4 \
@@ -143,11 +143,11 @@ Results:
 
 | Run | Method | Decode graph | Sampling captured | Decode tok/s | ITL ms | TTFT s | Log |
 | --- | --- | --- | --- | ---: | ---: | ---: | --- |
-| eager | vanilla | no | no | 150.98 | 26.49 | 57.49 | `/data2/haojitai/outputs/Sparse-vLLM/decode_cuda_graph_forward_20260516_141124/eager_128k_bs4_out4096.log` |
+| eager | vanilla | no | no | 150.98 | 26.49 | 57.49 | `<OUTPUT_ROOT>/Sparse-vLLM/decode_cuda_graph_forward_20260516_141124/eager_128k_bs4_out4096.log` |
 | eager | omnikv | no | no | 139.83 | 28.61 | 28.73 | same |
-| forward graph | vanilla | yes | no | 219.11 | 18.26 | 57.43 | `/data2/haojitai/outputs/Sparse-vLLM/decode_cuda_graph_forward_20260516_141124/graph_forward_128k_bs4_out4096.log` |
+| forward graph | vanilla | yes | no | 219.11 | 18.26 | 57.43 | `<OUTPUT_ROOT>/Sparse-vLLM/decode_cuda_graph_forward_20260516_141124/graph_forward_128k_bs4_out4096.log` |
 | forward graph | omnikv | yes | no | 399.24 | 10.02 | 28.84 | same |
-| graph+argmax | vanilla | yes | yes | 218.51 | 18.31 | 58.03 | `/data2/haojitai/outputs/Sparse-vLLM/decode_cuda_graph_forward_20260516_141124/graph_argmax_128k_bs4_out4096.log` |
+| graph+argmax | vanilla | yes | yes | 218.51 | 18.31 | 58.03 | `<OUTPUT_ROOT>/Sparse-vLLM/decode_cuda_graph_forward_20260516_141124/graph_argmax_128k_bs4_out4096.log` |
 | graph+argmax | omnikv | yes | yes | 397.80 | 10.06 | 28.99 | same |
 
 Interpretation:
@@ -216,40 +216,40 @@ GPU smoke environment:
 - Host: local `guest-KR6288-X2-A0-R0-00`
 - GPU: `CUDA_VISIBLE_DEVICES=5`, NVIDIA H100 80GB HBM3
 - Conda env: `svllm`
-- Model: `/data2/haojitai/models/Qwen2.5-7B-Instruct-1M`
+- Model: `<MODEL_ROOT>/Qwen2.5-7B-Instruct-1M`
 - Output root:
-  `/data2/haojitai/outputs/Sparse-vLLM/decode_cuda_graph_vllm_padding_20260516_1646`
+  `<OUTPUT_ROOT>/Sparse-vLLM/decode_cuda_graph_vllm_padding_20260516_1646`
 
 GPU smoke commands:
 
 ```bash
 CUDA_VISIBLE_DEVICES=5 PYTHONPATH=$PWD/src conda run -n svllm \
   python scripts/debug/compare_decode_graph_eager_logits.py \
-  --model_path /data2/haojitai/models/Qwen2.5-7B-Instruct-1M \
+  --model_path <MODEL_ROOT>/Qwen2.5-7B-Instruct-1M \
   --method vanilla \
   --prompt_len 1024 \
   --batch_size 6 \
   --max_tokens 3 \
   --hyper_params '{"gpu_memory_utilization":0.9,"engine_prefill_chunk_size":512,"tensor_parallel_size":1,"throughput_log_interval_s":0.0}' \
-  --output /data2/haojitai/outputs/Sparse-vLLM/decode_cuda_graph_vllm_padding_20260516_1646/vanilla_bs6_graph8_logits.json
+  --output <OUTPUT_ROOT>/Sparse-vLLM/decode_cuda_graph_vllm_padding_20260516_1646/vanilla_bs6_graph8_logits.json
 
 CUDA_VISIBLE_DEVICES=5 PYTHONPATH=$PWD/src conda run -n svllm \
   python scripts/debug/compare_decode_graph_eager_logits.py \
-  --model_path /data2/haojitai/models/Qwen2.5-7B-Instruct-1M \
+  --model_path <MODEL_ROOT>/Qwen2.5-7B-Instruct-1M \
   --method omnikv \
   --prompt_len 1024 \
   --batch_size 6 \
   --max_tokens 3 \
   --hyper_params '{"gpu_memory_utilization":0.9,"engine_prefill_chunk_size":512,"tensor_parallel_size":1,"decode_keep_tokens":256,"prefill_keep_tokens":256,"sink_keep_tokens":8,"recent_keep_tokens":64,"full_attention_layers":"0,1,2,4,7,14","chunk_prefill_accel_omnikv":true,"mlp_chunk_size":4096,"throughput_log_interval_s":0.0}' \
-  --output /data2/haojitai/outputs/Sparse-vLLM/decode_cuda_graph_vllm_padding_20260516_1646/omnikv_bs6_graph8_logits.json
+  --output <OUTPUT_ROOT>/Sparse-vLLM/decode_cuda_graph_vllm_padding_20260516_1646/omnikv_bs6_graph8_logits.json
 ```
 
 GPU smoke results:
 
 | Method | real bs | auto capture sizes | graph bs | max abs diff | mean abs diff | argmax | result |
 | --- | ---: | --- | ---: | ---: | ---: | --- | --- |
-| vanilla | 6 | `[1,2,4,8]` | 8 | 0.0 | 0.0 | match | `/data2/haojitai/outputs/Sparse-vLLM/decode_cuda_graph_vllm_padding_20260516_1646/vanilla_bs6_graph8_logits.json` |
-| omnikv | 6 | `[1,2,4,8]` | 8 | 0.0 | 0.0 | match | `/data2/haojitai/outputs/Sparse-vLLM/decode_cuda_graph_vllm_padding_20260516_1646/omnikv_bs6_graph8_logits.json` |
+| vanilla | 6 | `[1,2,4,8]` | 8 | 0.0 | 0.0 | match | `<OUTPUT_ROOT>/Sparse-vLLM/decode_cuda_graph_vllm_padding_20260516_1646/vanilla_bs6_graph8_logits.json` |
+| omnikv | 6 | `[1,2,4,8]` | 8 | 0.0 | 0.0 | match | `<OUTPUT_ROOT>/Sparse-vLLM/decode_cuda_graph_vllm_padding_20260516_1646/omnikv_bs6_graph8_logits.json` |
 
 Notes: GPU 1 and GPU 6 were busy during this small smoke, so the run used GPU
 5. This was a correctness smoke only, not a throughput benchmark.
@@ -268,15 +268,15 @@ Remote environment:
 
 - Host: `autodl-container-nqmeqbvtjn-072cfeb1`
 - SSH target: `root@connect.westb.seetacloud.com:51823`
-- Working dir: `/root/autodl-tmp/Sparse-vLLM`
+- Working dir: `<PROJECT_ROOT>`
 - Output dir:
-  `/root/autodl-fs/outputs/Sparse-vLLM/remote_128k_bs1_6_graph_20260516_172815`
+  `<OUTPUT_ROOT>/Sparse-vLLM/remote_128k_bs1_6_graph_20260516_172815`
 - Local watcher dir:
-  `/data2/haojitai/outputs/Sparse-vLLM/remote_watch_128k_bs1_6_20260516_172815_fixedprobe`
+  `<OUTPUT_ROOT>/Sparse-vLLM/remote_watch_128k_bs1_6_20260516_172815_fixedprobe`
 - GPU: NVIDIA RTX PRO 6000 Blackwell Server Edition, 97887 MiB,
   driver `595.58.03`
 - Conda env: `kv`, Python `3.12.3`
-- Model: `/root/autodl-fs/models/Qwen2.5-7B-Instruct-1M`
+- Model: `<MODEL_ROOT>/Qwen2.5-7B-Instruct-1M`
 - Code: branch `perf/omnikv-decode-128k-bs4`, base commit `d5aacd1`;
   relevant working-tree changes were synced to the remote before running.
 
@@ -306,17 +306,17 @@ Failure notes before the completed run:
 Command:
 
 ```bash
-cd /root/autodl-tmp/Sparse-vLLM
-CUDA_VISIBLE_DEVICES=0 PYTHONPATH=$PWD/src /root/miniconda3/bin/conda run -n kv --no-capture-output \
+cd <PROJECT_ROOT>
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH=$PWD/src <CONDA_BIN> run -n kv --no-capture-output \
   python scripts/benchmarks/bench_sparse_vllm.py \
-  --model_path /root/autodl-fs/models/Qwen2.5-7B-Instruct-1M \
+  --model_path <MODEL_ROOT>/Qwen2.5-7B-Instruct-1M \
   --methods vanilla,omnikv \
   --lengths 128000 \
   --batch_sizes 1,2,3,4,5,6 \
   --output_len 512 \
   --temperature 0 \
   --top_p 1 \
-  --hyper_params @/root/autodl-fs/outputs/Sparse-vLLM/remote_128k_bs1_6_graph_20260516_172815/hyper_params.json
+  --hyper_params @<OUTPUT_ROOT>/Sparse-vLLM/remote_128k_bs1_6_graph_20260516_172815/hyper_params.json
 ```
 
 Hyperparameters:

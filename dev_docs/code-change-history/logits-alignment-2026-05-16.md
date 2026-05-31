@@ -24,13 +24,13 @@ CUDA_VISIBLE_DEVICES=6 PYTHONPATH=$PWD/src conda run -n svllm \
   python scripts/debug/compare_logits_hf_sparsevllm.py \
   --cases short,long \
   --methods vanilla,deltakv \
-  --output_dir /data2/haojitai/outputs/sparsevllm_logits_align/20260516_0304_qwen25_7b_q0
+  --output_dir <OUTPUT_ROOT>/sparsevllm_logits_align/20260516_0304_qwen25_7b_q0
 ```
 
 ## Key Config
 
-- Model: `/data2/haojitai/models/Qwen2.5-7B-Instruct-1M`
-- Compressor: `/data2/haojitai/checkpoints/compressor/Qwen2.5-7B-Instruct-1M-Compressor`
+- Model: `<MODEL_ROOT>/Qwen2.5-7B-Instruct-1M`
+- Compressor: `<CHECKPOINT_ROOT>/Qwen2.5-7B-Instruct-1M-Compressor`
 - Sparse-VLLM DeltaKV method request: `deltakv-triton-v4`
 - Resolved cache manager: `DeltaKVCacheTritonManagerV4`
 - `decode_keep_tokens`: `4096`
@@ -53,7 +53,7 @@ The HF side explicitly normalizes `decode_keep_tokens` to `num_top_tokens` and
 Main output directory:
 
 ```text
-/data2/haojitai/outputs/sparsevllm_logits_align/20260516_0304_qwen25_7b_q0
+<OUTPUT_ROOT>/sparsevllm_logits_align/20260516_0304_qwen25_7b_q0
 ```
 
 Files:
@@ -89,7 +89,7 @@ Files:
   `load_omnikv_model()` sets `use_cluster=False`, while the shared HF
   `Qwen2KVCompress.forward()` path now creates a cluster-only DeltaKV cache.
   The failing run info is under
-  `/data2/haojitai/outputs/sparsevllm_logits_align/quick_short_omnikv`.
+  `<OUTPUT_ROOT>/sparsevllm_logits_align/quick_short_omnikv`.
 
 ## HF OmniKV Fix
 
@@ -110,7 +110,7 @@ CUDA_VISIBLE_DEVICES=6 PYTHONPATH=$PWD/src conda run -n svllm \
   python scripts/debug/compare_logits_hf_sparsevllm.py \
   --cases short,long \
   --methods omnikv \
-  --output_dir /data2/haojitai/outputs/sparsevllm_logits_align/quick_omnikv_fixed_policychunk_exact_rawscore
+  --output_dir <OUTPUT_ROOT>/sparsevllm_logits_align/quick_omnikv_fixed_policychunk_exact_rawscore
 ```
 
 Long vanilla policy-chunk baseline:
@@ -120,13 +120,13 @@ CUDA_VISIBLE_DEVICES=6 PYTHONPATH=$PWD/src conda run -n svllm \
   python scripts/debug/compare_logits_hf_sparsevllm.py \
   --cases long \
   --methods vanilla \
-  --output_dir /data2/haojitai/outputs/sparsevllm_logits_align/quick_long_vanilla_policychunk
+  --output_dir <OUTPUT_ROOT>/sparsevllm_logits_align/quick_long_vanilla_policychunk
 ```
 
 Output directories:
 
-- `/data2/haojitai/outputs/sparsevllm_logits_align/quick_omnikv_fixed_policychunk_exact_rawscore`
-- `/data2/haojitai/outputs/sparsevllm_logits_align/quick_long_vanilla_policychunk`
+- `<OUTPUT_ROOT>/sparsevllm_logits_align/quick_omnikv_fixed_policychunk_exact_rawscore`
+- `<OUTPUT_ROOT>/sparsevllm_logits_align/quick_long_vanilla_policychunk`
 
 Decode results from the final OmniKV run:
 

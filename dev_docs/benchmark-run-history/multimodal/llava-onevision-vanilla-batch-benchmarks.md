@@ -50,17 +50,17 @@ Paper targets encoded in the script:
 ## Dataset Download
 
 ```bash
-/home/haojitai/miniconda3/envs/svllm/bin/hf download lmms-lab/ai2d \
+<HF_BIN> download lmms-lab/ai2d \
   --repo-type dataset \
-  --local-dir /data2/haojitai/datasets/lmms-lab_ai2d \
-  --cache-dir /data2/haojitai/datasets/hf_cache \
+  --local-dir <DATA_ROOT>/lmms-lab_ai2d \
+  --cache-dir <DATA_ROOT>/hf_cache \
   --max-workers 8
 ```
 
 Downloaded location:
 
 ```text
-/data2/haojitai/datasets/lmms-lab_ai2d
+<DATA_ROOT>/lmms-lab_ai2d
 ```
 
 ## Full 0.5B AI2D Run
@@ -68,12 +68,12 @@ Downloaded location:
 Command:
 
 ```bash
-PYTHONPATH=$PWD/src /home/haojitai/miniconda3/envs/svllm/bin/python -u \
+PYTHONPATH=$PWD/src <SVLLM_PYTHON> -u \
   benchmark/multimodal/image_qa/ai2d.py \
-  --model_path /data2/haojitai/models/llava-onevision-qwen2-0.5b-ov-hf \
-  --dataset_dir /data2/haojitai/datasets/lmms-lab_ai2d \
-  --dataset_cache_dir /data2/haojitai/datasets/hf_cache \
-  --output_dir /data2/haojitai/datasets/llava_onevision_ai2d_vanilla_05b_full_bs16 \
+  --model_path <MODEL_ROOT>/llava-onevision-qwen2-0.5b-ov-hf \
+  --dataset_dir <DATA_ROOT>/lmms-lab_ai2d \
+  --dataset_cache_dir <DATA_ROOT>/hf_cache \
+  --output_dir <DATA_ROOT>/llava_onevision_ai2d_vanilla_05b_full_bs16 \
   --num_samples -1 \
   --batch_size 16 \
   --max_new_tokens 16 \
@@ -98,7 +98,7 @@ Result:
 Result file:
 
 ```text
-/data2/haojitai/datasets/llava_onevision_ai2d_vanilla_05b_full_bs16/last_ai2d_vanilla_result.json
+<DATA_ROOT>/llava_onevision_ai2d_vanilla_05b_full_bs16/last_ai2d_vanilla_result.json
 ```
 
 The 0.5B full AI2D result is within 0.27 points of the reported paper score,
@@ -110,12 +110,12 @@ aligned on AI2D.
 The 7B model was smoke-tested to confirm the same vanilla batch path runs:
 
 ```bash
-PYTHONPATH=$PWD/src /home/haojitai/miniconda3/envs/svllm/bin/python -u \
+PYTHONPATH=$PWD/src <SVLLM_PYTHON> -u \
   benchmark/multimodal/image_qa/ai2d.py \
-  --model_path /data2/haojitai/models/llava-onevision-qwen2-7b-ov-hf \
-  --dataset_dir /data2/haojitai/datasets/lmms-lab_ai2d \
-  --dataset_cache_dir /data2/haojitai/datasets/hf_cache \
-  --output_dir /data2/haojitai/datasets/llava_onevision_ai2d_vanilla_7b_sanity_bs2 \
+  --model_path <MODEL_ROOT>/llava-onevision-qwen2-7b-ov-hf \
+  --dataset_dir <DATA_ROOT>/lmms-lab_ai2d \
+  --dataset_cache_dir <DATA_ROOT>/hf_cache \
+  --output_dir <DATA_ROOT>/llava_onevision_ai2d_vanilla_7b_sanity_bs2 \
   --num_samples 8 \
   --batch_size 2 \
   --max_new_tokens 4 \
@@ -138,7 +138,7 @@ Result:
 Result file:
 
 ```text
-/data2/haojitai/datasets/llava_onevision_ai2d_vanilla_7b_sanity_bs2/last_ai2d_vanilla_result.json
+<DATA_ROOT>/llava_onevision_ai2d_vanilla_7b_sanity_bs2/last_ai2d_vanilla_result.json
 ```
 
 This is a batch-path sanity check only; it is not a full 7B paper-alignment run.
@@ -149,12 +149,12 @@ The existing visual-cache benchmark's `vanilla` method was smoke-tested with
 the 0.5B model:
 
 ```bash
-PYTHONPATH=$PWD/src /home/haojitai/miniconda3/envs/svllm/bin/python -u \
+PYTHONPATH=$PWD/src <SVLLM_PYTHON> -u \
   benchmark/multimodal/visual_cache/run_visual_cache.py \
-  --model_path /data2/haojitai/models/llava-onevision-qwen2-0.5b-ov-hf \
+  --model_path <MODEL_ROOT>/llava-onevision-qwen2-0.5b-ov-hf \
   --deltakv_checkpoint_path none \
-  --dataset_dir /data2/haojitai/datasets/llava_onevision_vanilla_batch_smoke \
-  --source_vqa_dir /data2/haojitai/datasets/VQAv2 \
+  --dataset_dir <DATA_ROOT>/llava_onevision_vanilla_batch_smoke \
+  --source_vqa_dir <DATA_ROOT>/VQAv2 \
   --num_samples 2 \
   --max_new_tokens 4 \
   --batch_size 2 \

@@ -151,13 +151,13 @@ Removed:
 Commands run:
 
 ```bash
-conda run -p /root/autodl-tmp/conda-envs/svllm-review \
+conda run -p <REVIEW_CONDA_ENV> \
   env PYTHONPATH=src python -m compileall -q \
   src/deltakv/modeling src/deltakv/get_chat_api.py \
   src/deltakv/train_compressor.py \
   src/deltakv/analysis/analyze_comp_kv_range.py
 
-conda run -p /root/autodl-tmp/conda-envs/svllm-review \
+conda run -p <REVIEW_CONDA_ENV> \
   env PYTHONPATH=src:. python -m pytest -q \
   tests/test_hf_deltakv_cache_factory.py \
   tests/test_hf_deltakv_modeling.py \
@@ -166,14 +166,14 @@ conda run -p /root/autodl-tmp/conda-envs/svllm-review \
   tests/test_longbench_deltakv_contracts.py \
   tests/test_visual_uniform_pruning.py
 
-conda run -p /root/autodl-tmp/conda-envs/svllm-review \
+conda run -p <REVIEW_CONDA_ENV> \
   env PYTHONPATH=src:. python -m pytest -q \
   tests/test_deltakv_checkpoint_config_sync.py \
   tests/test_quantization_helpers.py \
   tests/test_runtime_param_normalization.py \
   tests/test_research_fail_fast.py
 
-conda run -p /root/autodl-tmp/conda-envs/svllm-review \
+conda run -p <REVIEW_CONDA_ENV> \
   env PYTHONPATH=src:. python -m pytest -q \
   tests/test_deltakv_delta_quant_kernel.py
 ```

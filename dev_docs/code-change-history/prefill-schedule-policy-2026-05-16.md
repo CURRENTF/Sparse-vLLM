@@ -79,29 +79,29 @@ Long full-prefill exposed two additional peak issues:
 
 Local environment:
 
-- Repo: `/home/haojitai/projects/Sparse-vLLM`
+- Repo: `<PROJECT_ROOT>`
 - Conda env: `svllm`
 - Main local GPU used: GPU 6
-- Model: `/data2/haojitai/models/Qwen2.5-7B-Instruct-1M`
+- Model: `<MODEL_ROOT>/Qwen2.5-7B-Instruct-1M`
 - Local DeltaKV compressor:
-  `/data2/haojitai/checkpoints/compressor/Qwen2.5-7B-Instruct-1M-Compressor`
+  `<CHECKPOINT_ROOT>/Qwen2.5-7B-Instruct-1M-Compressor`
 - Local output root:
-  `/data2/haojitai/outputs/sparsevllm_prefill_policy_20260515_2314`
+  `<OUTPUT_ROOT>/sparsevllm_prefill_policy_20260515_2314`
 
 Remote LongBench environment:
 
 - Host: `ssh -p 26037 root@connect.westb.seetacloud.com`
 - Repo copy:
-  `/root/autodl-tmp/Sparse-vLLM-prefill-policy-20260515-2341`
-- Conda env: `/root/autodl-tmp/conda-envs/svllm-review`
+  `<PROJECT_ROOT>-prefill-policy-20260515-2341`
+- Conda env: `<REVIEW_CONDA_ENV>`
 - GPU: NVIDIA RTX PRO 6000 Blackwell Server Edition, 97GB
-- Model: `/root/autodl-fs/models/Qwen2.5-7B-Instruct-1M`
+- Model: `<MODEL_ROOT>/Qwen2.5-7B-Instruct-1M`
 - Remote DeltaKV compressor:
-  `/root/autodl-fs/checkpoints/compressor/cluster_e2e_cs256_biasFalse_l2_ratio0.1_clusMean_before_rope_lr0.0002_cdownmlp_swiglud3072_cuplinear_0125_222950`
+  `<CHECKPOINT_ROOT>/cluster_e2e_cs256_biasFalse_l2_ratio0.1_clusMean_before_rope_lr0.0002_cdownmlp_swiglud3072_cuplinear_0125_222950`
 - Remote output root:
-  `/root/autodl-fs/outputs/sparsevllm_prefill_policy_20260515_2314`
+  `<OUTPUT_ROOT>/sparsevllm_prefill_policy_20260515_2314`
 - Remote log root:
-  `/root/autodl-fs/logs/sparsevllm_prefill_policy_20260515_2314`
+  `<AUTODL_FS>/logs/sparsevllm_prefill_policy_20260515_2314`
 
 ### Compile And Unit Tests
 
@@ -124,7 +124,7 @@ Command shape:
 
 ```bash
 CUDA_VISIBLE_DEVICES=6 PYTHONPATH=$PWD/src conda run -n svllm python scripts/benchmarks/bench_sparse_vllm.py \
-  --model_path /data2/haojitai/models/Qwen2.5-7B-Instruct-1M \
+  --model_path <MODEL_ROOT>/Qwen2.5-7B-Instruct-1M \
   --lengths 2048 \
   --batch_sizes 2 \
   --methods vanilla,deltakv-triton-v4 \
@@ -133,7 +133,7 @@ CUDA_VISIBLE_DEVICES=6 PYTHONPATH=$PWD/src conda run -n svllm python scripts/ben
 
 Log:
 
-- `/data2/haojitai/outputs/sparsevllm_prefill_policy_20260515_2314/smoke_2048_vanilla_deltakv_triton_v4.log`
+- `<OUTPUT_ROOT>/sparsevllm_prefill_policy_20260515_2314/smoke_2048_vanilla_deltakv_triton_v4.log`
 
 Result:
 
@@ -145,7 +145,7 @@ Result:
 
 Vanilla command log:
 
-- `/data2/haojitai/outputs/sparsevllm_prefill_policy_20260515_2314/smoke_128k_vanilla_local_gpu6_after_mlpchunk.log`
+- `<OUTPUT_ROOT>/sparsevllm_prefill_policy_20260515_2314/smoke_128k_vanilla_local_gpu6_after_mlpchunk.log`
 
 Vanilla result:
 
@@ -155,7 +155,7 @@ Vanilla result:
 
 DeltaKV command log:
 
-- `/data2/haojitai/outputs/sparsevllm_prefill_policy_20260515_2314/smoke_128k_deltakv_triton_v4_local_gpu6_chunk_gather.log`
+- `<OUTPUT_ROOT>/sparsevllm_prefill_policy_20260515_2314/smoke_128k_deltakv_triton_v4_local_gpu6_chunk_gather.log`
 
 DeltaKV result:
 
@@ -176,18 +176,18 @@ Earlier failed 128k attempts before the final fixes:
 Sparse-vLLM backend one-sample smoke:
 
 - Output:
-  `/root/autodl-fs/outputs/sparsevllm_prefill_policy_20260515_2314/longbench_smoke_qasper_1_sparsevllm_deltakv`
+  `<OUTPUT_ROOT>/sparsevllm_prefill_policy_20260515_2314/longbench_smoke_qasper_1_sparsevllm_deltakv`
 - Log:
-  `/root/autodl-fs/logs/sparsevllm_prefill_policy_20260515_2314/longbench_smoke_qasper_1_sparsevllm_deltakv.log`
+  `<AUTODL_FS>/logs/sparsevllm_prefill_policy_20260515_2314/longbench_smoke_qasper_1_sparsevllm_deltakv.log`
 - Result: qasper 1-sample smoke passed and auto-eval produced `qasper: 25.0`
 
 Full LongBench stress run:
 
 ```bash
 tmux new-session -d -s sparsevllm_lb_bs64 \
-  'cd /root/autodl-tmp/Sparse-vLLM-prefill-policy-20260515-2341 && \
+  'cd <PROJECT_ROOT>-prefill-policy-20260515-2341 && \
    bash scripts/tmp/run_longbench_full_bs64.sh > \
-   /root/autodl-fs/logs/sparsevllm_prefill_policy_20260515_2314/longbench_full_sparsevllm_deltakv_triton_v4_bs64.log 2>&1'
+   <AUTODL_FS>/logs/sparsevllm_prefill_policy_20260515_2314/longbench_full_sparsevllm_deltakv_triton_v4_bs64.log 2>&1'
 ```
 
 Config:
@@ -211,11 +211,11 @@ Config:
 
 Output:
 
-- `/root/autodl-fs/outputs/sparsevllm_prefill_policy_20260515_2314/longbench_full_sparsevllm_deltakv_triton_v4_bs64`
+- `<OUTPUT_ROOT>/sparsevllm_prefill_policy_20260515_2314/longbench_full_sparsevllm_deltakv_triton_v4_bs64`
 
 Log:
 
-- `/root/autodl-fs/logs/sparsevllm_prefill_policy_20260515_2314/longbench_full_sparsevllm_deltakv_triton_v4_bs64.log`
+- `<AUTODL_FS>/logs/sparsevllm_prefill_policy_20260515_2314/longbench_full_sparsevllm_deltakv_triton_v4_bs64.log`
 
 Expected row counts from the remote LongBench data files:
 
@@ -240,7 +240,7 @@ Final status:
 
 Result file:
 
-- `/root/autodl-fs/outputs/sparsevllm_prefill_policy_20260515_2314/longbench_full_sparsevllm_deltakv_triton_v4_bs64/result.json`
+- `<OUTPUT_ROOT>/sparsevllm_prefill_policy_20260515_2314/longbench_full_sparsevllm_deltakv_triton_v4_bs64/result.json`
 
 Scores:
 

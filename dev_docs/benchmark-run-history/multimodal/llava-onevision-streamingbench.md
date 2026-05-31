@@ -48,11 +48,11 @@ Download the small CSV annotation files:
 
 ```bash
 source /etc/network_turbo
-/home/haojitai/miniconda3/envs/svllm/bin/hf download \
+<HF_BIN> download \
   mjuicem/StreamingBench \
   --repo-type dataset \
   --include 'StreamingBench/*.csv' \
-  --local-dir /data2/haojitai/datasets/StreamingBench_hf
+  --local-dir <DATA_ROOT>/StreamingBench_hf
 ```
 
 Download and unzip the video shards needed for the task you want to evaluate.
@@ -60,16 +60,16 @@ For example, the first 50 real-time visual understanding videos:
 
 ```bash
 source /etc/network_turbo
-/home/haojitai/miniconda3/envs/svllm/bin/hf download \
+<HF_BIN> download \
   mjuicem/StreamingBench \
   'Real-Time Visual Understanding_1-50.zip' \
   --repo-type dataset \
-  --local-dir /data2/haojitai/datasets/StreamingBench_hf
+  --local-dir <DATA_ROOT>/StreamingBench_hf
 
-mkdir -p /data2/haojitai/datasets/StreamingBench_hf/videos/real_1_50
+mkdir -p <DATA_ROOT>/StreamingBench_hf/videos/real_1_50
 unzip -o \
-  '/data2/haojitai/datasets/StreamingBench_hf/Real-Time Visual Understanding_1-50.zip' \
-  -d /data2/haojitai/datasets/StreamingBench_hf/videos/real_1_50
+  '<DATA_ROOT>/StreamingBench_hf/Real-Time Visual Understanding_1-50.zip' \
+  -d <DATA_ROOT>/StreamingBench_hf/videos/real_1_50
 ```
 
 The script indexes videos recursively under `--video_dir`. It parses
@@ -183,12 +183,12 @@ Run a small real-task comparison on GPU 7:
 
 ```bash
 CUDA_VISIBLE_DEVICES=7 PYTHONPATH=$PWD/src \
-/home/haojitai/miniconda3/envs/svllm/bin/python -u \
+<SVLLM_PYTHON> -u \
   benchmark/multimodal/video_qa/streamingbench.py \
-  --model_path /data2/haojitai/models/llava-onevision-qwen2-0.5b-ov-hf \
-  --dataset_dir /data2/haojitai/datasets/StreamingBench_hf \
-  --video_dir /data2/haojitai/datasets/StreamingBench_hf/videos \
-  --output_dir /data2/haojitai/datasets/llava_onevision_streamingbench_real_smoke \
+  --model_path <MODEL_ROOT>/llava-onevision-qwen2-0.5b-ov-hf \
+  --dataset_dir <DATA_ROOT>/StreamingBench_hf \
+  --video_dir <DATA_ROOT>/StreamingBench_hf/videos \
+  --output_dir <DATA_ROOT>/llava_onevision_streamingbench_real_smoke \
   --tasks real \
   --methods vanilla,deltakv_delta_quant \
   --deltakv_checkpoint_path none \
@@ -231,12 +231,12 @@ been downloaded:
 
 ```bash
 CUDA_VISIBLE_DEVICES=6 PYTHONPATH=$PWD/src \
-/home/haojitai/miniconda3/envs/svllm/bin/python -u \
+<SVLLM_PYTHON> -u \
   benchmark/multimodal/video_qa/streamingbench.py \
-  --model_path /data2/haojitai/models/llava-onevision-qwen2-7b-ov-hf \
-  --dataset_dir /data2/haojitai/datasets/StreamingBench_hf \
-  --video_dir /data2/haojitai/datasets/StreamingBench_hf/videos \
-  --output_dir /data2/haojitai/datasets/llava_onevision_streamingbench_livevlm_table4_7b_vanilla \
+  --model_path <MODEL_ROOT>/llava-onevision-qwen2-7b-ov-hf \
+  --dataset_dir <DATA_ROOT>/StreamingBench_hf \
+  --video_dir <DATA_ROOT>/StreamingBench_hf/videos \
+  --output_dir <DATA_ROOT>/llava_onevision_streamingbench_livevlm_table4_7b_vanilla \
   --methods vanilla \
   --num_samples -1 \
   --batch_size 8 \
@@ -249,15 +249,15 @@ CUDA_VISIBLE_DEVICES=6 PYTHONPATH=$PWD/src \
   --seed 0 \
   --log_every 200 \
   --reuse_frame_cache \
-  --frame_cache_dir /data2/haojitai/datasets/llava_onevision_streamingbench_livevlm_table4_7b_vanilla/frame_cache
+  --frame_cache_dir <DATA_ROOT>/llava_onevision_streamingbench_livevlm_table4_7b_vanilla/frame_cache
 ```
 
 Audit the completed baseline with:
 
 ```bash
-/home/haojitai/miniconda3/envs/svllm/bin/python \
+<SVLLM_PYTHON> \
   benchmark/multimodal/video_qa/audit_livevlm_table4.py \
-  --output_dir /data2/haojitai/datasets/llava_onevision_streamingbench_livevlm_table4_7b_vanilla
+  --output_dir <DATA_ROOT>/llava_onevision_streamingbench_livevlm_table4_7b_vanilla
 ```
 
 The audit fails fast if the metrics file is missing, if the run is not the
@@ -284,9 +284,9 @@ setting.
 Common settings:
 
 ```text
-model_path = /data2/haojitai/models/llava-onevision-qwen2-7b-ov-hf
-dataset_dir = /data2/haojitai/datasets/StreamingBench_hf
-video_dir = /data2/haojitai/datasets/StreamingBench_hf/videos
+model_path = <MODEL_ROOT>/llava-onevision-qwen2-7b-ov-hf
+dataset_dir = <DATA_ROOT>/StreamingBench_hf
+video_dir = <DATA_ROOT>/StreamingBench_hf/videos
 methods = vanilla
 tasks = livevlm_table4
 num_video_frames = 32
@@ -301,8 +301,8 @@ seed = 0
 Result paths:
 
 ```text
-/data2/haojitai/datasets/llava_onevision_streamingbench_livevlm_table4_7b_vanilla
-/data2/haojitai/datasets/llava_onevision_streamingbench_livevlm_table4_7b_vanilla_ctx60
+<DATA_ROOT>/llava_onevision_streamingbench_livevlm_table4_7b_vanilla
+<DATA_ROOT>/llava_onevision_streamingbench_livevlm_table4_7b_vanilla_ctx60
 ```
 
 | Run | Profile | Context | Samples | Success | Correct | Accuracy | Delta vs LiveVLM 58.85 | New tok/s | Examples/s | Peak memory |
@@ -340,7 +340,7 @@ Official 60s subtask results:
 Audit artifact:
 
 ```text
-/data2/haojitai/datasets/llava_onevision_streamingbench_livevlm_table4_7b_vanilla_ctx60/livevlm_table4_audit.json
+<DATA_ROOT>/llava_onevision_streamingbench_livevlm_table4_7b_vanilla_ctx60/livevlm_table4_audit.json
 ```
 
 The audit checks the 4000-row scope, all expected subtask row counts, raw output
@@ -368,9 +368,9 @@ This sweep uses the same full 4000-row `official_60s` StreamingBench scope as
 the dense baseline above:
 
 ```text
-model_path = /data2/haojitai/models/llava-onevision-qwen2-7b-ov-hf
-dataset_dir = /data2/haojitai/datasets/StreamingBench_hf
-video_dir = /data2/haojitai/datasets/StreamingBench_hf/videos
+model_path = <MODEL_ROOT>/llava-onevision-qwen2-7b-ov-hf
+dataset_dir = <DATA_ROOT>/StreamingBench_hf
+video_dir = <DATA_ROOT>/StreamingBench_hf/videos
 methods = deltakv_delta_quant
 deltakv_checkpoint_path = none
 tasks = livevlm_table4
@@ -383,7 +383,7 @@ attn_implementation = flash_attention_2
 choice_parse_mode = official_first_char
 max_new_tokens = 8
 seed = 0
-frame_cache_dir = /data2/haojitai/datasets/llava_onevision_streamingbench_livevlm_table4_7b_vanilla_ctx60/frame_cache
+frame_cache_dir = <DATA_ROOT>/llava_onevision_streamingbench_livevlm_table4_7b_vanilla_ctx60/frame_cache
 ```
 
 The commands were launched on physical GPUs 6 and 7 with
@@ -415,12 +415,12 @@ Use the lowest-budget tied configuration by default:
 
 ```bash
 CUDA_VISIBLE_DEVICES=6 PYTHONPATH=$PWD/src \
-/home/haojitai/miniconda3/envs/svllm/bin/python -u \
+<SVLLM_PYTHON> -u \
   benchmark/multimodal/video_qa/streamingbench.py \
-  --model_path /data2/haojitai/models/llava-onevision-qwen2-7b-ov-hf \
-  --dataset_dir /data2/haojitai/datasets/StreamingBench_hf \
-  --video_dir /data2/haojitai/datasets/StreamingBench_hf/videos \
-  --output_dir /data2/haojitai/datasets/llava_onevision_streamingbench_deltakv_7b_official60_kr30_cr1024_full \
+  --model_path <MODEL_ROOT>/llava-onevision-qwen2-7b-ov-hf \
+  --dataset_dir <DATA_ROOT>/StreamingBench_hf \
+  --video_dir <DATA_ROOT>/StreamingBench_hf/videos \
+  --output_dir <DATA_ROOT>/llava_onevision_streamingbench_deltakv_7b_official60_kr30_cr1024_full \
   --methods deltakv_delta_quant \
   --deltakv_checkpoint_path none \
   --num_samples -1 \
@@ -436,7 +436,7 @@ CUDA_VISIBLE_DEVICES=6 PYTHONPATH=$PWD/src \
   --seed 0 \
   --log_every 400 \
   --reuse_frame_cache \
-  --frame_cache_dir /data2/haojitai/datasets/llava_onevision_streamingbench_livevlm_table4_7b_vanilla_ctx60/frame_cache \
+  --frame_cache_dir <DATA_ROOT>/llava_onevision_streamingbench_livevlm_table4_7b_vanilla_ctx60/frame_cache \
   --frame_load_workers 4 \
   --full_attention_layers 0 \
   --deltakv_center_ratio 0.03 \
@@ -448,10 +448,10 @@ CUDA_VISIBLE_DEVICES=6 PYTHONPATH=$PWD/src \
 Result paths:
 
 ```text
-/data2/haojitai/datasets/llava_onevision_streamingbench_deltakv_7b_official60_kr30_cr1024_full
-/data2/haojitai/datasets/llava_onevision_streamingbench_deltakv_7b_official60_kr30_cr2048_full
-/data2/haojitai/datasets/llava_onevision_streamingbench_deltakv_7b_official60_kr33_center005_full
-/data2/haojitai/datasets/llava_onevision_streamingbench_deltakv_7b_official60_kr33_full01_full
+<DATA_ROOT>/llava_onevision_streamingbench_deltakv_7b_official60_kr30_cr1024_full
+<DATA_ROOT>/llava_onevision_streamingbench_deltakv_7b_official60_kr30_cr2048_full
+<DATA_ROOT>/llava_onevision_streamingbench_deltakv_7b_official60_kr33_center005_full
+<DATA_ROOT>/llava_onevision_streamingbench_deltakv_7b_official60_kr33_full01_full
 ```
 
 For each full run, `raw_outputs.jsonl`, `parsed_outputs.jsonl`, and
@@ -506,7 +506,7 @@ subtask.
 Local data currently contains only this shard:
 
 ```text
-/data2/haojitai/datasets/StreamingBench_hf/videos/real_201_250
+<DATA_ROOT>/StreamingBench_hf/videos/real_201_250
 ```
 
 That is 50 videos and 250 QA rows. The full StreamingBench dataset is larger,
@@ -516,12 +516,12 @@ Vanilla full-attention command on physical GPU 6:
 
 ```bash
 CUDA_VISIBLE_DEVICES=6 PYTHONPATH=$PWD/src \
-/home/haojitai/miniconda3/envs/svllm/bin/python -u \
+<SVLLM_PYTHON> -u \
   benchmark/multimodal/video_qa/streamingbench.py \
-  --model_path /data2/haojitai/models/llava-onevision-qwen2-7b-ov-hf \
-  --dataset_dir /data2/haojitai/datasets/StreamingBench_hf \
-  --video_dir /data2/haojitai/datasets/StreamingBench_hf/videos \
-  --output_dir /data2/haojitai/datasets/llava_onevision_streamingbench_real_7b_official60_fullattn32_vanilla \
+  --model_path <MODEL_ROOT>/llava-onevision-qwen2-7b-ov-hf \
+  --dataset_dir <DATA_ROOT>/StreamingBench_hf \
+  --video_dir <DATA_ROOT>/StreamingBench_hf/videos \
+  --output_dir <DATA_ROOT>/llava_onevision_streamingbench_real_7b_official60_fullattn32_vanilla \
   --tasks real \
   --methods vanilla \
   --num_samples -1 \
@@ -540,12 +540,12 @@ DeltaKV KR30 direct delta-quant command on physical GPU 7:
 
 ```bash
 CUDA_VISIBLE_DEVICES=7 PYTHONPATH=$PWD/src \
-/home/haojitai/miniconda3/envs/svllm/bin/python -u \
+<SVLLM_PYTHON> -u \
   benchmark/multimodal/video_qa/streamingbench.py \
-  --model_path /data2/haojitai/models/llava-onevision-qwen2-7b-ov-hf \
-  --dataset_dir /data2/haojitai/datasets/StreamingBench_hf \
-  --video_dir /data2/haojitai/datasets/StreamingBench_hf/videos \
-  --output_dir /data2/haojitai/datasets/llava_onevision_streamingbench_real_7b_official60_kr30_delta_quant \
+  --model_path <MODEL_ROOT>/llava-onevision-qwen2-7b-ov-hf \
+  --dataset_dir <DATA_ROOT>/StreamingBench_hf \
+  --video_dir <DATA_ROOT>/StreamingBench_hf/videos \
+  --output_dir <DATA_ROOT>/llava_onevision_streamingbench_real_7b_official60_kr30_delta_quant \
   --tasks real \
   --methods deltakv_delta_quant \
   --deltakv_checkpoint_path none \
@@ -570,8 +570,8 @@ CUDA_VISIBLE_DEVICES=7 PYTHONPATH=$PWD/src \
 Result files:
 
 ```text
-/data2/haojitai/datasets/llava_onevision_streamingbench_real_7b_official60_fullattn32_vanilla/last_streamingbench_result.json
-/data2/haojitai/datasets/llava_onevision_streamingbench_real_7b_official60_kr30_delta_quant/last_streamingbench_result.json
+<DATA_ROOT>/llava_onevision_streamingbench_real_7b_official60_fullattn32_vanilla/last_streamingbench_result.json
+<DATA_ROOT>/llava_onevision_streamingbench_real_7b_official60_kr30_delta_quant/last_streamingbench_result.json
 ```
 
 | Method | Frames | Context | Samples | Accuracy | New tok/s | Examples/s | Peak memory |
@@ -588,12 +588,12 @@ Command:
 
 ```bash
 CUDA_VISIBLE_DEVICES=7 PYTHONPATH=$PWD/src \
-/home/haojitai/miniconda3/envs/svllm/bin/python -u \
+<SVLLM_PYTHON> -u \
   benchmark/multimodal/video_qa/streamingbench.py \
-  --model_path /data2/haojitai/models/llava-onevision-qwen2-7b-ov-hf \
-  --dataset_dir /data2/haojitai/datasets/StreamingBench_hf \
-  --video_dir /data2/haojitai/datasets/StreamingBench_hf/videos \
-  --output_dir /data2/haojitai/datasets/llava_onevision_streamingbench_real_7b_shard201_250 \
+  --model_path <MODEL_ROOT>/llava-onevision-qwen2-7b-ov-hf \
+  --dataset_dir <DATA_ROOT>/StreamingBench_hf \
+  --video_dir <DATA_ROOT>/StreamingBench_hf/videos \
+  --output_dir <DATA_ROOT>/llava_onevision_streamingbench_real_7b_shard201_250 \
   --tasks real \
   --methods vanilla,deltakv_delta_quant \
   --deltakv_checkpoint_path none \
@@ -610,7 +610,7 @@ CUDA_VISIBLE_DEVICES=7 PYTHONPATH=$PWD/src \
 Result file:
 
 ```text
-/data2/haojitai/datasets/llava_onevision_streamingbench_real_7b_shard201_250/last_streamingbench_result.json
+<DATA_ROOT>/llava_onevision_streamingbench_real_7b_shard201_250/last_streamingbench_result.json
 ```
 
 | Method | Accuracy | New tok/s | Examples/s | Peak memory |
@@ -626,7 +626,7 @@ memory at this sequence length.
 An earlier 32-question prefix run is saved at:
 
 ```text
-/data2/haojitai/datasets/llava_onevision_streamingbench_real_7b_n32/last_streamingbench_result.json
+<DATA_ROOT>/llava_onevision_streamingbench_real_7b_n32/last_streamingbench_result.json
 ```
 
 ### 0.5B Smoke
@@ -641,5 +641,5 @@ The 0.5B smoke run used the same task/shard with `--num_samples 8`:
 Result file:
 
 ```text
-/data2/haojitai/datasets/llava_onevision_streamingbench_real_05b_smoke/last_streamingbench_result.json
+<DATA_ROOT>/llava_onevision_streamingbench_real_05b_smoke/last_streamingbench_result.json
 ```
