@@ -45,3 +45,16 @@ This is a research codebase. The priority is trustworthy experimental results.
 7. Validate inputs at config, dataset, model-loading, parsing, and metric boundaries.
 8. Save enough run information to reproduce the experiment: config, command, model, dataset split, prompt, decoding parameters, seed, and sample count.
 9. Make the smallest correct change. Avoid unrelated refactors, new dependencies, and renamed interfaces.
+
+# Git Rules
+
+## Git Commit Messages Rules
+1. **Specification**: Strictly follow the Conventional Commits specification.
+2. **Format**: Use the format `<type>: <short description>` (e.g., `feat: add hybrid attention support`).
+3. **Allowed Types**: `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `chore`.
+4. **Style**: 
+   - Write the description in English, using the imperative mood (e.g., "add" not "added").
+   - Start the description with a lowercase letter.
+   - Do NOT end the message with a period.
+   - Keep the entire line under 50 characters.
+5. **Constraint**: Return ONLY the single line of the commit message. Do NOT include any markdown code blocks, introductory text, or explanations.
