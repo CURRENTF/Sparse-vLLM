@@ -72,11 +72,12 @@ Important rules:
 
 ## 2. Runtime Parameter Flow
 
-There are four main runtime entry paths.
+There are five main runtime entry paths.
 
 | Entry | Parameter container | Normalization | Main consumers |
 | --- | --- | --- | --- |
 | `scripts/benchmarks/bench_sparse_vllm.py` | `--hyper_params` JSON | `normalize_runtime_params(..., backend="sparsevllm")` | `sparsevllm.Config`, `Scheduler`, `CacheManager`, `SparseController` |
+| `sparsevllm-openai-server` / `python -m sparsevllm.entrypoints.openai.api_server` | CLI flags plus OpenAI JSON request body | CLI engine kwargs are passed to `LLM(..., **kwargs)`, which normalizes via `normalize_runtime_params(..., backend="sparsevllm")`; request sampling params build `SamplingParams` directly | `LLMEngine`, `AsyncEngineDispatcher`, `/v1/completions` |
 | `benchmark/long_bench/pred.py` and `benchmark/math_bench/pred.py` | `--hyper_param` JSON or file | `get_generate_api(...)` normalizes after merge | HF wrappers or Sparse-vLLM engine |
 | `benchmark/scbench/run_scbench.py` DeltaKV branch | `--hyper_param` JSON dict | `get_generate_api(...)` normalizes | HF wrappers |
 | `benchmark/multimodal/visual_cache/run_visual_cache.py` | dedicated CLI args | no global normalizer; builds `config.deltakv_infer_config` | LLaVA wrapper and `KVQwen2Config` |
@@ -714,9 +715,141 @@ Current limitations:
 - "LLaVA visual keep10" without checkpoint is still not using cluster/ref
   tokens. It is uniform pruning.
 
-## 14. Benchmark Entrypoints
+## 14. OpenAI-Compatible Serving
 
-### 14.1 LongBench And MathBench
+The OpenAI-compatible online serving entrypoint is:
+
+```bash
+sparsevllm-openai-server \
+  --model /path/to/local/Qwen2.5-1.5B-Instruct \
+  --served-model-name Qwen/Qwen2.5-1.5B-Instruct \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+If the console script has not been refreshed in the active virtual
+environment, the equivalent module entrypoint is:
+
+```bash
+python -m sparsevllm.entrypoints.openai.api_server \
+  --model /path/to/local/Qwen2.5-1.5B-Instruct \
+  --served-model-name Qwen/Qwen2.5-1.5B-Instruct \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+`--model` is the local model directory passed to `sparsevllm.Config.model`.
+`--served-model-name` is the external OpenAI API model id accepted in request
+JSON. They may differ; requests must use the served name.
+
+### 14.1 Serving CLI Parameters
+
+The serving entrypoint has four dedicated server flags:
+
+| CLI flag | Default | Meaning |
+| --- | --- | --- |
+| `--model` | required | Local model directory loaded by Sparse-vLLM. |
+| `--served-model-name` | `--model` value | Model id exposed through `/v1/models` and accepted by `/v1/completions`. |
+| `--host` | `0.0.0.0` | Uvicorn bind host. |
+| `--port` | `8000` | Uvicorn bind port. |
+
+Additional `--kebab-case` flags are parsed as Sparse-vLLM engine kwargs. Use
+the canonical semantic keys accepted by
+`normalize_runtime_params(..., backend="sparsevllm")` for public runtime
+controls. Non-legacy `src/sparsevllm/config.py` fields such as
+`max_model_len`, `max_num_seqs_in_batch`, `gpu_memory_utilization`, and
+`throughput_log_interval_s` may also be passed. Legacy public names listed in
+Section 3 are still rejected during engine initialization even if the serving
+parser can recognize their spelling.
+
+Example:
+
+```bash
+sparsevllm-openai-server \
+  --model /models/Qwen2.5-1.5B-Instruct \
+  --served-model-name Qwen/Qwen2.5-1.5B-Instruct \
+  --max-model-len 32768 \
+  --max-num-seqs-in-batch 8 \
+  --gpu-memory-utilization 0.9 \
+  --sparse-method snapkv \
+  --sink-keep-tokens 64 \
+  --recent-keep-tokens 512
+```
+
+Important serving defaults:
+
+| Engine parameter | Serving default | Notes |
+| --- | --- | --- |
+| `sparse_method` / `vllm_sparse_method` | `""` | Dense/vanilla path unless explicitly set. |
+| `tensor_parallel_size` | `1` | Use `CUDA_VISIBLE_DEVICES=...` plus `--tensor-parallel-size N` for multi-GPU TP. |
+| `gpu_memory_utilization` | `0.8` | Inherited from `Config`. |
+| `max_model_len` | `128000` | Inherited from `Config`; prompt length plus `max_tokens` must fit. |
+| `max_num_batched_tokens` | `65536` | Inherited from `Config`. |
+| `max_num_seqs_in_batch` | `32` | Inherited from `Config`. |
+| `max_decoding_seqs` | `64` | Inherited from `Config`. |
+| `engine_prefill_chunk_size` / `chunk_prefill_size` | `8192` | Use the semantic `--engine-prefill-chunk-size` on the CLI. |
+| `throughput_log_interval_s` | `0.0` in serving | The server disables periodic `Avg TP` logs by default and logs per request instead. Pass `--throughput-log-interval-s 10` to re-enable periodic throughput logs. |
+
+DeltaKV-family sparse methods are intentionally not exposed through the OpenAI
+server yet. Values whose normalized method starts with `deltakv` fail fast at
+server startup. Use offline experiment entrypoints for those methods until
+serving correctness and memory behavior are validated.
+
+### 14.2 `/v1/completions` Request Parameters
+
+The implemented endpoint is OpenAI-style text completions:
+
+```bash
+curl http://localhost:8000/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen/Qwen2.5-1.5B-Instruct",
+    "prompt": "San Francisco is a",
+    "max_tokens": 7,
+    "temperature": 0
+  }'
+```
+
+Streaming uses SSE:
+
+```bash
+curl -N http://localhost:8000/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen/Qwen2.5-1.5B-Instruct",
+    "prompt": "San Francisco is a",
+    "max_tokens": 7,
+    "temperature": 0,
+    "stream": true
+  }'
+```
+
+Supported JSON fields:
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `model` | required | Must equal `--served-model-name` if provided, otherwise the `--model` value. |
+| `prompt` | required | String, token id list, list of strings, or list of token id lists. |
+| `max_tokens` | `16` | Maps to `SamplingParams.max_tokens`; must be positive. |
+| `temperature` | `1.0` | Maps to `SamplingParams.temperature`; `0` means greedy sampling. |
+| `top_p` | `1.0` | Maps to `SamplingParams.top_p`; must be in `(0, 1]`. |
+| `top_k` | `0` | Maps to `SamplingParams.top_k`; `0` disables top-k filtering. |
+| `n` | `1` | Only `1` is currently supported. |
+| `stream` | `false` | `true` returns `text/event-stream` chunks ending with `data: [DONE]`. |
+| `ignore_eos` | `false` | Continue until `max_tokens` even if EOS is generated. |
+| `stop` | `null` | Present in schema but rejected when set; stop strings are not implemented yet. |
+| `logprobs` | `null` | Present in schema but rejected when set; logprobs are not implemented yet. |
+
+Unknown JSON fields are rejected instead of silently ignored. This is stricter
+than some OpenAI-compatible servers, but it avoids accepting parameters that do
+not affect research results.
+
+The server logs one request-start line and one request-finish or request-cancel
+line per `/v1/completions` request. It does not log every generated token.
+
+## 15. Benchmark Entrypoints
+
+### 15.1 LongBench And MathBench
 
 `benchmark/long_bench/pred.py` and `benchmark/math_bench/pred.py`:
 
@@ -738,7 +871,7 @@ Backend differences after `get_generate_api` returns:
 | `eos_token_id` | Used by HF generation. | Not forwarded by current wrapper. |
 | `past_key_values` | Manual HF path can use it. | Accepted for signature compatibility but ignored. |
 
-### 14.2 NIAH
+### 15.2 NIAH
 
 `benchmark/niah/test_niah.py` builds an `infer_config` manually from function
 arguments. It now uses canonical keys such as `sparse_method`,
@@ -749,7 +882,7 @@ This is convenient for quick experiments, but it increases the chance that one
 backend ignores keys intended for the other. Use canonical names when adding new
 NIAH runs.
 
-### 14.3 SCBench
+### 15.3 SCBench
 
 `benchmark/scbench/run_scbench.py` has a DeltaKV branch for:
 
@@ -763,7 +896,7 @@ It copies `hyper_param`, extracts `deltakv_checkpoint_path`, pops `sparse_method
 is HF-oriented. Sparse-vLLM-style engine parameters in this branch usually do
 not apply.
 
-## 15. Known Ambiguities And Recommended Names
+## 16. Known Ambiguities And Recommended Names
 
 | Removed legacy name | Problem | Canonical name |
 | --- | --- | --- |
@@ -780,9 +913,9 @@ not apply.
 | `deltakv_visual_compress_only` | Says DeltaKV/compress even for uniform pruning. | `visual_token_prune_only`. |
 | `deltakv_visual_keep_ratio` | Tied to misleading visual compress name. | `visual_token_keep_ratio`. |
 
-## 16. Alignment Workflow
+## 17. Alignment Workflow
 
-### 16.1 Accuracy Alignment
+### 17.1 Accuracy Alignment
 
 Before comparing accuracy, match:
 
@@ -821,7 +954,7 @@ python benchmark/long_bench/pred.py \
   --hyper_param '{"sparse_method":"deltakv","deltakv_checkpoint_path":"<COMPRESSOR>","decode_keep_tokens":22282,"sink_keep_tokens":8,"recent_keep_tokens":128,"full_attention_layers":"0,1,2,8,18","engine_prefill_chunk_size":512,"gpu_memory_utilization":0.9}'
 ```
 
-### 16.2 Speed Alignment
+### 17.2 Speed Alignment
 
 Before comparing speed, separate three classes of settings:
 
@@ -858,7 +991,7 @@ python scripts/benchmarks/bench_sparse_vllm.py \
   --hyper_params '{"gpu_memory_utilization":0.9,"engine_prefill_chunk_size":4096,"sink_keep_tokens":4,"recent_keep_tokens":32,"decode_keep_tokens":4096}'
 ```
 
-## 17. Environment Variables
+## 18. Environment Variables
 
 Environment variables are not normalized by `normalize_runtime_params`. Treat
 them as process-level switches and always record them with benchmark results.
@@ -926,7 +1059,7 @@ python benchmark/long_bench/pred.py \
   --hyper_param '{"hf_prefill_chunk_size":32768,"decode_keep_tokens":0.17,"prefill_keep_tokens":4096,"sink_keep_tokens":8,"recent_keep_tokens":128,"full_attention_layers":"0,1,2,8,18"}'
 ```
 
-## 18. Safe Config Checklist
+## 19. Safe Config Checklist
 
 Before launching a run:
 
