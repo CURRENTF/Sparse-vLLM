@@ -3,6 +3,8 @@ import importlib.util
 import json
 import threading
 import unittest
+from unittest.mock import patch
+from unittest.mock import AsyncMock
 
 
 @unittest.skipIf(
@@ -79,6 +81,36 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(_parse_engine_kwargs(["--sparse-method", "snapkv"]), {"sparse_method": "snapkv"})
 
+    def test_create_app_disables_periodic_throughput_logs_by_default(self):
+        from sparsevllm.entrypoints.openai import api_server
+
+        class Engine:
+            config = type("Config", (), {"vllm_sparse_method": ""})()
+
+            def __init__(self, _model, **kwargs):
+                self.kwargs = kwargs
+
+            def exit(self):
+                pass
+
+        with patch.object(api_server, "LLM", Engine):
+            app = api_server.create_app("/tmp/model", served_model_name="model")
+            try:
+                self.assertEqual(app.state.dispatcher.engine.kwargs["throughput_log_interval_s"], 0.0)
+            finally:
+                app.state.dispatcher.close()
+
+        with patch.object(api_server, "LLM", Engine):
+            app = api_server.create_app(
+                "/tmp/model",
+                {"throughput_log_interval_s": 5.0},
+                served_model_name="model",
+            )
+            try:
+                self.assertEqual(app.state.dispatcher.engine.kwargs["throughput_log_interval_s"], 5.0)
+            finally:
+                app.state.dispatcher.close()
+
     async def test_cancel_during_admission_aborts_after_seq_id_exists(self):
         from sparsevllm.entrypoints.openai.api_server import AsyncEngineDispatcher
 
@@ -143,6 +175,52 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(handle_0.cancelled.is_set())
         self.assertTrue(handle_1.cancelled.is_set())
+
+    async def test_non_streaming_cancel_logs_request_cancel(self):
+        from sparsevllm.entrypoints.openai import api_server
+
+        class Tokenizer:
+            def encode(self, _prompt):
+                return [1]
+
+            def decode(self, token_ids, skip_special_tokens=True):
+                return "".join(str(token_id) for token_id in token_ids)
+
+        class Engine:
+            config = type("Config", (), {"vllm_sparse_method": ""})()
+
+            def __init__(self):
+                self.tokenizer = Tokenizer()
+                self.last_step_token_outputs = []
+
+            def add_request(self, _prompt, _sampling_params):
+                return 1
+
+            def abort_request(self, _seq_id):
+                pass
+
+            def step(self):
+                return [], 0
+
+            def exit(self):
+                pass
+
+        app = api_server.create_app("/tmp/model", served_model_name="model", engine=Engine())
+        endpoint = next(route.endpoint for route in app.routes if getattr(route, "path", None) == "/v1/completions")
+        request = api_server.CompletionRequest(model="model", prompt="p")
+        try:
+            with patch.object(
+                api_server,
+                "_completion_response",
+                AsyncMock(side_effect=asyncio.CancelledError),
+            ), patch.object(api_server.logger, "info") as log_info:
+                with self.assertRaises(asyncio.CancelledError):
+                    await endpoint(request)
+        finally:
+            app.state.dispatcher.close()
+
+        messages = [call.args[0] for call in log_info.call_args_list]
+        self.assertIn("request_cancel id={} model={} stream=false elapsed_s={:.3f}", messages)
 
     async def test_dispatcher_streaming_delta_uses_cumulative_suffix(self):
         from sparsevllm.entrypoints.openai.api_server import AsyncEngineDispatcher, _ActiveRequest

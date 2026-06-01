@@ -16,6 +16,7 @@ from sparsevllm.config import Config
 from sparsevllm.llm import LLM
 from sparsevllm.method_registry import normalize_sparse_method
 from sparsevllm.sampling_params import SamplingParams
+from sparsevllm.utils.log import logger
 
 
 UNSUPPORTED_SERVING_METHOD_PREFIXES = ("deltakv",)
@@ -283,8 +284,11 @@ def create_app(
     engine: LLM | None = None,
 ) -> FastAPI:
     served_model_name = served_model_name or model
-    _validate_serving_method(engine_kwargs or {}, engine)
-    engine = engine or LLM(model, **(engine_kwargs or {}))
+    engine_kwargs = dict(engine_kwargs or {})
+    if engine is None:
+        engine_kwargs.setdefault("throughput_log_interval_s", 0.0)
+    _validate_serving_method(engine_kwargs, engine)
+    engine = engine or LLM(model, **engine_kwargs)
     dispatcher = AsyncEngineDispatcher(engine)
 
     app = FastAPI(title="Sparse-vLLM OpenAI-compatible API")
@@ -319,7 +323,19 @@ def create_app(
         _validate_request(request, served_model_name)
         request_id = f"cmpl-{uuid.uuid4().hex}"
         created = int(time.time())
+        started = time.perf_counter()
         prompts = _normalize_prompts(request.prompt)
+        logger.info(
+            "request_start id={} model={} stream={} prompts={} max_tokens={} temperature={} top_p={} top_k={}",
+            request_id,
+            request.model,
+            request.stream,
+            len(prompts),
+            request.max_tokens,
+            request.temperature,
+            request.top_p,
+            request.top_k,
+        )
         sampling_params = SamplingParams(
             temperature=request.temperature,
             top_p=request.top_p,
@@ -335,7 +351,7 @@ def create_app(
 
         if request.stream:
             return StreamingResponse(
-                _completion_stream(dispatcher, request_id, created, request.model, handles),
+                _completion_stream(dispatcher, request_id, created, request.model, handles, started),
                 media_type="text/event-stream",
             )
 
@@ -344,11 +360,27 @@ def create_app(
         except asyncio.CancelledError:
             for handle in handles:
                 dispatcher.cancel(handle)
+            logger.info(
+                "request_cancel id={} model={} stream=false elapsed_s={:.3f}",
+                request_id,
+                request.model,
+                time.perf_counter() - started,
+            )
             raise
         except Exception:
             for handle in handles:
                 dispatcher.cancel(handle)
             raise
+        usage = response["usage"]
+        logger.info(
+            "request_finish id={} model={} stream=false prompt_tokens={} completion_tokens={} total_tokens={} elapsed_s={:.3f}",
+            request_id,
+            request.model,
+            usage["prompt_tokens"],
+            usage["completion_tokens"],
+            usage["total_tokens"],
+            time.perf_counter() - started,
+        )
         return JSONResponse(response)
 
     return app
@@ -439,8 +471,10 @@ async def _completion_stream(
     created: int,
     model: str,
     handles: list[RequestHandle],
+    started: float | None = None,
 ):
     pending = {index: handle for index, handle in enumerate(handles)}
+    completion_tokens = 0
     try:
         while pending:
             tasks = {
@@ -457,6 +491,7 @@ async def _completion_stream(
                     pending.pop(tasks[task], None)
                     continue
                 if item["type"] == "token":
+                    completion_tokens += len(item["token_ids"])
                     yield _sse(
                         {
                             "id": request_id,
@@ -492,9 +527,24 @@ async def _completion_stream(
                     )
                     pending.pop(tasks[task], None)
         yield "data: [DONE]\n\n"
+        if started is not None:
+            logger.info(
+                "request_finish id={} model={} stream=true completion_tokens={} elapsed_s={:.3f}",
+                request_id,
+                model,
+                completion_tokens,
+                time.perf_counter() - started,
+            )
     except asyncio.CancelledError:
         for handle in pending.values():
             dispatcher.cancel(handle)
+        logger.info(
+            "request_cancel id={} model={} stream=true completion_tokens={} elapsed_s={:.3f}",
+            request_id,
+            model,
+            completion_tokens,
+            time.perf_counter() - started if started is not None else 0.0,
+        )
         raise
 
 
