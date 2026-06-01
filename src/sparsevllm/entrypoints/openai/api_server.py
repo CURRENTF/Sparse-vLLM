@@ -372,14 +372,17 @@ def create_app(
                 dispatcher.cancel(handle)
             raise
         usage = response["usage"]
+        elapsed_s = time.perf_counter() - started
         logger.info(
-            "request_finish id={} model={} stream=false prompt_tokens={} completion_tokens={} total_tokens={} elapsed_s={:.3f}",
+            "request_finish id={} model={} stream=false prompt_tokens={} completion_tokens={} total_tokens={} elapsed_s={:.3f} completion_tps={:.2f} total_tps={:.2f}",
             request_id,
             request.model,
             usage["prompt_tokens"],
             usage["completion_tokens"],
             usage["total_tokens"],
-            time.perf_counter() - started,
+            elapsed_s,
+            _tokens_per_second(usage["completion_tokens"], elapsed_s),
+            _tokens_per_second(usage["total_tokens"], elapsed_s),
         )
         return JSONResponse(response)
 
@@ -474,6 +477,7 @@ async def _completion_stream(
     started: float | None = None,
 ):
     pending = {index: handle for index, handle in enumerate(handles)}
+    prompt_tokens = 0
     completion_tokens = 0
     try:
         while pending:
@@ -509,6 +513,7 @@ async def _completion_stream(
                         }
                     )
                 elif item["type"] == "final":
+                    prompt_tokens += item["prompt_tokens"]
                     yield _sse(
                         {
                             "id": request_id,
@@ -528,12 +533,18 @@ async def _completion_stream(
                     pending.pop(tasks[task], None)
         yield "data: [DONE]\n\n"
         if started is not None:
+            elapsed_s = time.perf_counter() - started
+            total_tokens = prompt_tokens + completion_tokens
             logger.info(
-                "request_finish id={} model={} stream=true completion_tokens={} elapsed_s={:.3f}",
+                "request_finish id={} model={} stream=true prompt_tokens={} completion_tokens={} total_tokens={} elapsed_s={:.3f} completion_tps={:.2f} total_tps={:.2f}",
                 request_id,
                 model,
+                prompt_tokens,
                 completion_tokens,
-                time.perf_counter() - started,
+                total_tokens,
+                elapsed_s,
+                _tokens_per_second(completion_tokens, elapsed_s),
+                _tokens_per_second(total_tokens, elapsed_s),
             )
     except asyncio.CancelledError:
         for handle in pending.values():
@@ -559,6 +570,12 @@ async def _wait_final(queue_item: asyncio.Queue) -> dict[str, Any]:
 
 def _sse(payload: dict[str, Any]) -> str:
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def _tokens_per_second(tokens: int, elapsed_s: float) -> float:
+    if elapsed_s <= 0:
+        return 0.0
+    return tokens / elapsed_s
 
 
 def _parse_engine_kwargs(raw_args: list[str]) -> dict[str, Any]:

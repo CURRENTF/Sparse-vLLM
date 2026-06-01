@@ -2,6 +2,7 @@ import asyncio
 import importlib.util
 import json
 import threading
+import time
 import unittest
 from unittest.mock import patch
 from unittest.mock import AsyncMock
@@ -257,6 +258,55 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(item["text"], "b")
         self.assertEqual(active[7].completion_token_ids, [1, 2])
+
+    async def test_streaming_finish_log_includes_tps_metrics(self):
+        from sparsevllm.entrypoints.openai import api_server
+
+        queue = asyncio.Queue()
+        await queue.put(
+            {
+                "type": "token",
+                "index": 0,
+                "text": "x",
+                "token_ids": [1, 2],
+            }
+        )
+        await queue.put(
+            {
+                "type": "final",
+                "index": 0,
+                "text": "x",
+                "finish_reason": "stop",
+                "prompt_tokens": 3,
+                "completion_tokens": 2,
+                "token_ids": [1, 2],
+            }
+        )
+        handle = api_server.RequestHandle(output_queue=queue, cancelled=threading.Event())
+
+        class Dispatcher:
+            def cancel(self, _handle):
+                raise AssertionError("finished stream should not be cancelled")
+
+        with patch.object(api_server.logger, "info") as log_info:
+            chunks = [
+                chunk
+                async for chunk in api_server._completion_stream(
+                    Dispatcher(),
+                    "cmpl-test",
+                    123,
+                    "model",
+                    [handle],
+                    started=time.perf_counter() - 1.0,
+                )
+            ]
+
+        self.assertEqual(chunks[-1], "data: [DONE]\n\n")
+        messages = [call.args[0] for call in log_info.call_args_list]
+        self.assertIn(
+            "request_finish id={} model={} stream=true prompt_tokens={} completion_tokens={} total_tokens={} elapsed_s={:.3f} completion_tps={:.2f} total_tps={:.2f}",
+            messages,
+        )
 
 
 if __name__ == "__main__":
