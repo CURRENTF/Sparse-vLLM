@@ -213,6 +213,7 @@ class LLMEngine:
         
         self._exited = False
         self._throughput_logger = _ThroughputIntervalLogger(config.throughput_log_interval_s)
+        self.last_step_token_outputs: list[tuple[int, list[int]]] = []
         # 注册退出钩子，确保程序崩溃或结束时能正确释放多进程资源
         atexit.register(self.exit)
 
@@ -315,6 +316,13 @@ class LLMEngine:
         logger.debug(f'add prompt with {len(prompt)} tokens.')
         seq = Sequence(prompt, sampling_params)
         self.scheduler.add(seq)
+        return seq.seq_id
+
+    def abort_request(self, seq_id: int):
+        """Abort a queued or running request and release any owned KV slots."""
+        should_free = self.scheduler.abort(seq_id)
+        if should_free:
+            self.model_runner.call("free_slots", seq_id)
 
     def step(self):
         """
@@ -322,6 +330,7 @@ class LLMEngine:
         包含：调度、抢占处理、模型前向计算、状态更新、资源回收。
         """
         with profiler.record("step"):
+            self.last_step_token_outputs = []
             # 1. 调度：决定哪些序列进入本次 Batch
             with profiler.record("schedule"):
                 seqs, is_prefill, preempted_seqs = self.scheduler.schedule()
@@ -370,10 +379,16 @@ class LLMEngine:
             # Rank 0 会驱动所有 Rank 进程同步运行本地的 ModelRunner.run
             with profiler.record("model_run_call"):
                 token_ids, attn_score = self.model_runner.call("run", seqs, is_prefill)
+
+            token_outputs: list[tuple[int, list[int]]] = []
+            for seq, token_id in zip(seqs, token_ids):
+                if not is_prefill or seq.is_last_chunk_prefill:
+                    token_outputs.append((seq.seq_id, [int(token_id)]))
             
             # 4. 逻辑后处理：更新序列的 Token 列表和状态机
             with profiler.record("postprocess"):
                 self.scheduler.postprocess(seqs, token_ids, is_prefill)
+            self.last_step_token_outputs = token_outputs
             
             # 5. 完成序列的资源回收：
             # 遍历序列，如果已达到 EOS 或最大长度，则通知所有进程释放物理槽位

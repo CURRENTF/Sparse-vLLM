@@ -29,10 +29,14 @@ dependencies = [
     "datatrove",
     "tqdm",
     "loguru",
+    "fastapi",
+    "uvicorn[standard]",
+    "pydantic",
 ]
 
 [project.scripts]
 deltakv-train = "deltakv.train_compressor:main"
+sparsevllm-openai-server = "sparsevllm.entrypoints.openai.api_server:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

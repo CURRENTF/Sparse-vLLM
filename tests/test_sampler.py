@@ -3,6 +3,7 @@ import unittest
 import torch
 
 from sparsevllm.layers.sampler import Sampler
+from sparsevllm.sampling_params import SamplingParams
 
 
 class SamplerTest(unittest.TestCase):
@@ -38,6 +39,34 @@ class SamplerTest(unittest.TestCase):
         out = sampler(logits, temperatures=temperatures, top_ps=top_ps, all_greedy=False)
 
         self.assertEqual(out.tolist(), [1])
+
+    def test_top_k_limits_sampling_candidates(self):
+        sampler = Sampler()
+        logits = torch.tensor([[1.0, 5.0, 4.0]])
+        temperatures = torch.tensor([1.0])
+        top_ps = torch.tensor([1.0])
+        top_ks = torch.tensor([1])
+
+        out = sampler(logits, temperatures=temperatures, top_ps=top_ps, top_ks=top_ks, all_greedy=False)
+
+        self.assertEqual(out.tolist(), [1])
+
+    def test_sampling_params_reject_invalid_values(self):
+        with self.assertRaises(ValueError):
+            SamplingParams(top_k=-1)
+        with self.assertRaises(ValueError):
+            SamplingParams(max_tokens=0)
+
+    def test_top_k_zero_and_large_values_are_unlimited(self):
+        sampler = Sampler()
+        logits = torch.tensor([[1.0, 5.0, 4.0], [1.0, 5.0, 4.0]])
+        temperatures = torch.tensor([1.0, 1.0])
+        top_ps = torch.tensor([0.01, 0.01])
+        top_ks = torch.tensor([0, 99])
+
+        out = sampler(logits, temperatures=temperatures, top_ps=top_ps, top_ks=top_ks, all_greedy=False)
+
+        self.assertEqual(out.tolist(), [1, 1])
 
 
 if __name__ == "__main__":

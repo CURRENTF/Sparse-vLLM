@@ -106,6 +106,22 @@ class Scheduler:
         """将新请求加入等待队列"""
         self.waiting.append(seq)
 
+    def abort(self, seq_id: int) -> bool:
+        """Remove a request from scheduler queues.
+
+        Returns True when the sequence may own KV slots and the caller should
+        notify ModelRunner.free_slots(seq_id).
+        """
+        for queue in (self.waiting, self.decoding):
+            for seq in list(queue):
+                if seq.seq_id != seq_id:
+                    continue
+                queue.remove(seq)
+                seq.status = SequenceStatus.FINISHED
+                self._admission_defer_warned_seq_ids.discard(seq_id)
+                return seq.num_prefilled_tokens > 0 or queue is self.decoding
+        return False
+
     def _reserved_prefill_tokens(self) -> int:
         return int(self.memory_oracle.reserved_prefill_slots(self.waiting, self.chunk_prefill_size))
 

@@ -278,9 +278,11 @@ class ModelRunner:
         """准备采样超参数"""
         temperatures = [seq.temperature for seq in seqs]
         top_ps = [seq.top_p for seq in seqs]
+        top_ks = [seq.top_k for seq in seqs]
         return (
             torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True),
             torch.tensor(top_ps, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True),
+            torch.tensor(top_ks, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True),
         )
 
     def set_decode_cuda_graph_max_context_len_override(self, max_context_len: int | None):
@@ -335,12 +337,14 @@ class ModelRunner:
                             all_greedy = all(seq.temperature <= 1e-10 for seq in seqs)
                             temperatures = None
                             top_ps = None
+                            top_ks = None
                             if not all_greedy:
-                                temperatures, top_ps = self.prepare_sample(seqs)
+                                temperatures, top_ps, top_ks = self.prepare_sample(seqs)
                             token_ids = self.sampler(
                                 logits,
                                 temperatures,
                                 top_ps,
+                                top_ks,
                                 all_greedy=all_greedy,
                             ).tolist()
                     with profiler.record("model_sparse_post"):
@@ -361,15 +365,16 @@ class ModelRunner:
             all_greedy = all(seq.temperature <= 1e-10 for seq in seqs) if self.rank == 0 else False
             temperatures = None
             top_ps = None
+            top_ks = None
             if self.rank == 0 and not all_greedy:
-                temperatures, top_ps = self.prepare_sample(seqs)
+                temperatures, top_ps, top_ks = self.prepare_sample(seqs)
             
             # 3. 前向计算
             logits = self.run_model(input_ids, positions, is_prefill)
             
             # 4. Token 采样 (仅 Rank 0)
             with profiler.record("model_sampler"):
-                token_ids = self.sampler(logits, temperatures, top_ps, all_greedy=all_greedy).tolist() if self.rank == 0 else None
+                token_ids = self.sampler(logits, temperatures, top_ps, top_ks, all_greedy=all_greedy).tolist() if self.rank == 0 else None
 
             # 5. 后置稀疏处理 (如 SnapKV 驱逐)
             with profiler.record("model_sparse_post"):
