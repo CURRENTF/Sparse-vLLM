@@ -4,13 +4,27 @@ This repository includes a repo-local Codex skill.
 
 ## Available skills
 
-- `add-sparse-method`: Add or refactor a first-class Sparse-vLLM sparse method following this repo's architecture. Use when Codex needs to introduce a new `vllm_sparse_method`, move method logic out of `attention.py` or `utils/`, add method-specific cache metadata or decode-time view building, and preserve the cache-manager-first design. File: `skills/add-sparse-method/SKILL.md`
+- `add-sparse-method`: Add or refactor a first-class Sparse-vLLM sparse method following this repo's architecture. Use when Codex needs to introduce a new `vllm_sparse_method`, move method logic out of `attention.py` or `utils/`, add method-specific cache metadata or decode-time view building, and preserve the cache-manager-first design. File: `.agents/skills/add-sparse-method/SKILL.md`
 
 ## How to use
 
 - In this repo, invoke the skill as `$add-sparse-method`.
 - Keep method-specific runtime state in `src/sparsevllm/engine/cache_manager/`.
 - Keep `src/sparsevllm/layers/attention.py` generic and hook new methods through shared cache-manager interfaces when possible.
+
+# Project Structure
+
+- `src/sparsevllm/`: core Sparse-vLLM implementation, including engine, cache managers, layers, models, and Triton kernels.
+- `src/deltakv/`: DeltaKV-specific modeling, training, analysis, and config code.
+- `benchmark/`: benchmark drivers and evaluation scripts for text, multimodal, and SCBench-style workloads.
+- `scripts/`: analysis, validation, profiling, debugging, and benchmark entry scripts.
+- `tests/`: unit and contract tests for runtime behavior, checkpoints, and research invariants.
+- `docs/`: design notes, configuration guides, benchmarking docs, and governance notes.
+- `baselines/`: external baseline implementations and wrappers.
+
+# Task Running Rules
+
+1. Before running a task, check whether each device is idle. Select an idle device when one is available. If all devices are busy, wait first; if the wait becomes too long, report the situation instead of starting the task on a busy device.
 
 # Research Code Skill
 
