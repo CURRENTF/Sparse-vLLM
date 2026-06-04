@@ -536,6 +536,7 @@ queueing, and whether a benchmark measures the intended batch.
 | `max_num_batched_tokens` | Sparse-vLLM | Scheduler cap for tokens in one step. Auto-raised to at least `2 * engine_prefill_chunk_size` after normalization. May also be reduced by memory heuristics. |
 | `max_num_seqs_in_batch` | Sparse-vLLM | Max active sequences in a prefill/decode step. |
 | `max_decoding_seqs` | Sparse-vLLM | Max sequences in decode queue. |
+| `prefill_schedule_policy` | Sparse-vLLM | Method-specific prefill policy resolved from `src/sparsevllm/method_registry.py`; explicit mismatches fail fast. |
 | `gpu_memory_utilization` | Sparse-vLLM | Fraction of total GPU memory used for cache planning. |
 | `tensor_parallel_size` | Sparse-vLLM | Number of TP ranks/processes. |
 | `num_kvcache_slots` | Sparse-vLLM | Optional explicit KV slot override. |
@@ -564,7 +565,31 @@ Sparse-vLLM meaning:
 
 Do not copy the same numeric value across backends.
 
-### 10.2 Benchmark Queueing And Wave Admission
+### 10.2 Prefill Schedule Policy
+
+Sparse-vLLM prefill scheduling is a method contract, not a benchmark-local
+knob. `src/sparsevllm/method_registry.py` maps each method to its default
+policy, and `Config` resolves `None`, empty string, or `auto` to that default.
+An explicit policy that does not match the registry default raises a
+configuration error.
+
+Supported policies:
+
+| Policy | Meaning |
+| --- | --- |
+| `all_chunked` | Every prefill request is capped by `engine_prefill_chunk_size` and normal scheduler batch limits. |
+| `long_bs1full_short_batch` | Long requests run as complete prefill with batch size 1; short requests still use chunked batching. |
+
+Use `long_bs1full_short_batch` only for methods whose intended sparse/cache
+transformation depends on a complete long-prefill representation. Current
+defaults put `pyramidkv` and DeltaKV-family methods on this policy; dense,
+StreamingLLM, SnapKV, QuEST, and OmniKV paths use `all_chunked`.
+
+If a run intentionally overrides this policy for an ablation, record the
+override with the benchmark result together with method, prompt length,
+batch size, `engine_prefill_chunk_size`, and checkpoint information.
+
+### 10.3 Benchmark Queueing And Wave Admission
 
 `scripts/benchmarks/bench_sparse_vllm.py` reports:
 

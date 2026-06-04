@@ -54,6 +54,24 @@ When adding a first-class method, use the repo-local `$add-sparse-method` skill.
 It encodes the expected file placement, cache-manager hooks, and validation
 workflow.
 
+## Scheduling Ownership
+
+Prefill scheduling is part of the method contract. Default policies live in
+`src/sparsevllm/method_registry.py`, `Config` resolves and validates the policy,
+and `src/sparsevllm/engine/scheduler.py` implements the scheduling behavior.
+
+The engine currently supports:
+
+- `all_chunked`: all prefill requests are chunked and batched through the normal
+  scheduler limits.
+- `long_bs1full_short_batch`: a special policy for methods that need a complete
+  long-prefill representation; long requests run full-prefill with batch size 1,
+  while short requests remain chunked and batched.
+
+Do not encode a method's prefill policy in benchmark scripts or one-off config
+defaults. Add the method-to-policy mapping to the registry and update
+`tests/test_prefill_schedule_policy.py`.
+
 ## Important Files
 
 - `src/deltakv/configs/runtime_params.py`: public runtime parameter aliases and

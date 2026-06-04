@@ -21,6 +21,23 @@ Sparse-vLLM is an inference framework built with sparsity as the first design pr
 DeltaKV-related compressor training, HF wrapper comparisons, and benchmark
 adapters live under `src/deltakv/` and `benchmark/`.
 
+## Key Runtime Principles
+
+- Public commands and `LLM(...)` kwargs should use `sparse_method`; Sparse-vLLM
+  normalizes it internally to `vllm_sparse_method`.
+- Sparse method runtime state belongs in
+  `src/sparsevllm/engine/cache_manager/`; `attention.py` should stay generic.
+- Prefill scheduling is method-specific and registry-owned. The source of
+  truth is `src/sparsevllm/method_registry.py`, not benchmark scripts.
+- Sparse-vLLM currently uses two prefill policies: `all_chunked` and the
+  special `long_bs1full_short_batch` policy.
+- `long_bs1full_short_batch` is only for methods that are registered to need a
+  complete long-prefill pass before their sparse/cache transformation. Long
+  requests run as full prefill with batch size 1; short requests still use
+  chunked batching.
+- Benchmark reports should record the sparse method, prefill policy, prefill
+  chunk size, prompt length, batch size, and any DeltaKV checkpoint.
+
 ## Core Sparse Methods
 
 Sparse-vLLM supports physical eviction, logical masking, query-aware selection,
@@ -84,7 +101,7 @@ New sparse methods should keep method-specific runtime state in
 `src/sparsevllm/layers/attention.py` generic.
 
 For Codex-assisted method work, use the repo-local
-[`$add-sparse-method`](skills/add-sparse-method/SKILL.md) skill.
+[`$add-sparse-method`](.agents/skills/add-sparse-method/SKILL.md) skill.
 
 
 ## Acknowledgements

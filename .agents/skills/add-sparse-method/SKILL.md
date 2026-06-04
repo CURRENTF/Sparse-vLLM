@@ -43,13 +43,23 @@ Use these rules before editing code.
 ## Editing Workflow
 
 1. Add config knobs to `src/sparsevllm/config.py`.
-2. Register the method in `src/sparsevllm/engine/cache_manager/base.py` and `src/sparsevllm/engine/cache_manager/__init__.py` if needed.
-3. Create or update `src/sparsevllm/engine/cache_manager/<method>.py`.
-4. Touch `src/sparsevllm/engine/sparse_controller.py` only for controller responsibilities.
-5. Touch `src/sparsevllm/layers/attention.py` only to use generic hooks or shared kernels.
-6. Update README and benchmark examples after the method runs.
-7. Compile touched Python files with `python -m py_compile`.
-8. Run at least one correctness-oriented task and one throughput benchmark.
+2. Register the method name and default prefill policy in `src/sparsevllm/method_registry.py`.
+3. Register the method in `src/sparsevllm/engine/cache_manager/base.py` and `src/sparsevllm/engine/cache_manager/__init__.py` if needed.
+4. Create or update `src/sparsevllm/engine/cache_manager/<method>.py`.
+5. Touch `src/sparsevllm/engine/sparse_controller.py` only for controller responsibilities.
+6. Touch `src/sparsevllm/layers/attention.py` only to use generic hooks or shared kernels.
+7. Update README and benchmark examples after the method runs.
+8. Compile touched Python files with `python -m py_compile`.
+9. Run at least one correctness-oriented task and one throughput benchmark.
+
+## Prefill Policy Rules
+
+Prefill policy is part of the method contract and must be owned by `src/sparsevllm/method_registry.py`.
+
+- Use `all_chunked` for methods that can prefill every request in scheduler chunks.
+- Use `long_bs1full_short_batch` only for methods whose correctness or intended cache transformation depends on a complete long-prefill pass. Long requests run full-prefill with batch size 1; short requests still use chunked batching.
+- Do not override a method's policy in benchmark scripts or one-off config defaults unless the user is running an explicit ablation.
+- Add or update `tests/test_prefill_schedule_policy.py` when adding or changing a method's policy.
 
 ## Architecture Guardrails
 

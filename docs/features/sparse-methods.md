@@ -24,6 +24,22 @@ Set `sparse_method` to one of the following method names.
 Sparse-vLLM internally stores this as `vllm_sparse_method`, but public commands
 and `LLM(...)` kwargs should use `sparse_method`.
 
+## Prefill Scheduling Policies
+
+Prefill scheduling is method-specific and registry-owned. The source of truth
+is `src/sparsevllm/method_registry.py`; benchmark scripts and user configs
+should not redefine method semantics.
+
+| Policy | Runtime Semantics | Current Default Methods |
+| --- | --- | --- |
+| `all_chunked` | Every prefill request is capped by `chunk_prefill_size` and normal scheduler batch limits. | `vanilla`, `streamingllm`, `attention-sink`, `snapkv`, `quest`, `omnikv` |
+| `long_bs1full_short_batch` | Long requests run as one complete prefill with batch size 1; short requests still use chunked batching. This is for methods whose intended sparse/cache transformation depends on a complete long-prefill representation. | `pyramidkv` and DeltaKV-family methods |
+
+`Config` resolves `None`, empty string, and `auto` to the registry default. An
+explicit policy that does not match the method default fails fast so experiments
+do not silently change scheduler semantics. Treat any policy override as an
+explicit ablation and document it with the benchmark result.
+
 ## Runtime Ownership
 
 - Method-specific runtime state belongs in `src/sparsevllm/engine/cache_manager/`.
@@ -31,6 +47,9 @@ and `LLM(...)` kwargs should use `sparse_method`.
   `src/sparsevllm/engine/sparse_controller.py`.
 - `src/sparsevllm/layers/attention.py` should stay generic and call shared
   hooks.
+- New first-class methods must register their default prefill policy in
+  `src/sparsevllm/method_registry.py` and cover it in
+  `tests/test_prefill_schedule_policy.py`.
 
 For new first-class methods, use the repo-local
 [`$add-sparse-method`](../../.agents/skills/add-sparse-method/SKILL.md) skill.
