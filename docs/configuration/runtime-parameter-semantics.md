@@ -813,15 +813,26 @@ curl http://localhost:8000/v1/completions \
 Streaming uses SSE:
 
 ```bash
-curl -N http://localhost:8000/v1/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "Qwen/Qwen2.5-1.5B-Instruct",
-    "prompt": "San Francisco is a",
-    "max_tokens": 7,
-    "temperature": 0,
-    "stream": true
-  }'
+sparsevllm-openai-client \
+  --base-url http://localhost:8000/v1 \
+  --model Qwen/Qwen2.5-1.5B-Instruct \
+  --prompt "San Francisco is a" \
+  --max-tokens 7 \
+  --temperature 0
+```
+
+The raw HTTP stream remains standard SSE (`data: {...}` frames ending with
+`data: [DONE]`). The helper client parses those frames and prints only the
+incremental text.
+
+Chat completions are also exposed:
+
+```bash
+sparsevllm-openai-client \
+  --base-url http://localhost:8000/v1 \
+  --model Qwen/Qwen2.5-1.5B-Instruct \
+  --chat \
+  --prompt "Explain Sparse-vLLM in one sentence."
 ```
 
 Supported JSON fields:
@@ -837,12 +848,23 @@ Supported JSON fields:
 | `n` | `1` | Only `1` is currently supported. |
 | `stream` | `false` | `true` returns `text/event-stream` chunks ending with `data: [DONE]`. |
 | `ignore_eos` | `false` | Continue until `max_tokens` even if EOS is generated. |
-| `stop` | `null` | Present in schema but rejected when set; stop strings are not implemented yet. |
-| `logprobs` | `null` | Present in schema but rejected when set; logprobs are not implemented yet. |
+| `stop` | `null` | String or list of strings. Stop text is omitted from the returned completion. |
+| `logprobs` | `null` | Non-negative integer. Returns sampled-token logprobs and up to this many top logprobs. |
 
 Unknown JSON fields are rejected instead of silently ignored. This is stricter
 than some OpenAI-compatible servers, but it avoids accepting parameters that do
 not affect research results.
+
+`stop` and `logprobs` are supported independently. Requests that set both fail
+fast because text-level stop trimming can otherwise make returned token logprobs
+disagree with the visible output.
+
+`/v1/chat/completions` supports the same sampling fields plus `messages`.
+Messages must use `system`, `user`, `assistant`, or `tool` roles. When the
+loaded tokenizer exposes a chat template, the server renders messages with
+`apply_chat_template(..., add_generation_prompt=True)`; otherwise it uses a
+simple role-prefixed prompt. Chat `logprobs=true` enables sampled-token
+logprobs, and `top_logprobs` controls the number of top alternatives.
 
 The server logs one request-start line and one request-finish or request-cancel
 line per `/v1/completions` request. It does not log every generated token.

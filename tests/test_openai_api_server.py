@@ -1,6 +1,7 @@
 import asyncio
 import importlib.util
 import json
+from pathlib import Path
 import threading
 import time
 import unittest
@@ -73,6 +74,45 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(ValidationError):
             CompletionRequest(model="m", prompt="p", suffix="ignored")
+
+    def test_stop_with_logprobs_fails_fast(self):
+        from fastapi import HTTPException
+
+        from sparsevllm.entrypoints.openai.api_server import (
+            ChatCompletionRequest,
+            CompletionRequest,
+            _validate_chat_request,
+            _validate_request,
+        )
+
+        with self.assertRaises(HTTPException):
+            _validate_request(
+                CompletionRequest(model="m", prompt="p", stop="END", logprobs=1),
+                "m",
+            )
+        with self.assertRaises(HTTPException):
+            _validate_chat_request(
+                ChatCompletionRequest(
+                    model="m",
+                    messages=[{"role": "user", "content": "p"}],
+                    stop="END",
+                    logprobs=True,
+                ),
+                "m",
+            )
+
+    def test_chat_prompt_uses_fallback_without_chat_template(self):
+        from sparsevllm.entrypoints.openai.api_server import ChatMessage, _chat_prompt
+
+        class Tokenizer:
+            chat_template = None
+
+            def apply_chat_template(self, *_args, **_kwargs):
+                raise AssertionError("chat_template is not configured")
+
+        prompt = _chat_prompt(Tokenizer(), [ChatMessage(role="user", content="hello")])
+
+        self.assertEqual(prompt, "user: hello\nassistant:")
 
     def test_missing_non_bool_engine_arg_fails_fast(self):
         from sparsevllm.entrypoints.openai.api_server import _parse_engine_kwargs
@@ -233,6 +273,7 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         class Engine:
             tokenizer = Tokenizer()
             last_step_token_outputs = [(7, [2])]
+            last_step_logprob_outputs = [(7, [None], [None])]
 
             def exit(self):
                 pass
@@ -246,7 +287,10 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
                 output_queue=output_queue,
                 prompt_token_ids=[10],
                 max_tokens=2,
+                stop=[],
                 completion_token_ids=[1],
+                completion_token_logprobs=[],
+                completion_top_logprobs=[],
                 emitted_text_len=1,
             )
         }
@@ -269,6 +313,8 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
                 "index": 0,
                 "text": "x",
                 "token_ids": [1, 2],
+                "token_logprobs": [None, None],
+                "top_logprobs": [None, None],
             }
         )
         await queue.put(
@@ -280,6 +326,8 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
                 "prompt_tokens": 3,
                 "completion_tokens": 2,
                 "token_ids": [1, 2],
+                "token_logprobs": [None, None],
+                "top_logprobs": [None, None],
             }
         )
         handle = api_server.RequestHandle(output_queue=queue, cancelled=threading.Event())
@@ -307,6 +355,177 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
             "request_finish id={} model={} stream=true prompt_tokens={} completion_tokens={} total_tokens={} elapsed_s={:.3f} completion_tps={:.2f} total_tps={:.2f}",
             messages,
         )
+
+    async def test_dispatcher_stop_buffers_partial_stop_prefix(self):
+        from sparsevllm.entrypoints.openai.api_server import AsyncEngineDispatcher, _ActiveRequest
+
+        class Tokenizer:
+            def decode(self, token_ids, skip_special_tokens=True):
+                return {(): "", (1,): "a", (1, 2): "ab", (1, 2, 3): "abSTOP"}[tuple(token_ids)]
+
+        class Engine:
+            tokenizer = Tokenizer()
+
+            def __init__(self):
+                self.last_step_token_outputs = [(7, [2])]
+                self.last_step_logprob_outputs = [(7, [None], [None])]
+                self.aborted = []
+
+            def abort_request(self, seq_id):
+                self.aborted.append(seq_id)
+
+            def exit(self):
+                pass
+
+        engine = Engine()
+        dispatcher = AsyncEngineDispatcher(engine)
+        output_queue = asyncio.Queue()
+        active = {
+            7: _ActiveRequest(
+                index=0,
+                loop=asyncio.get_running_loop(),
+                output_queue=output_queue,
+                prompt_token_ids=[10],
+                max_tokens=4,
+                stop=["bSTOP"],
+                completion_token_ids=[1],
+                completion_token_logprobs=[],
+                completion_top_logprobs=[],
+                emitted_text_len=0,
+            )
+        }
+        try:
+            dispatcher._publish_token_deltas(active)
+            token_item = await asyncio.wait_for(output_queue.get(), timeout=1)
+            self.assertEqual(token_item["text"], "a")
+            engine.last_step_token_outputs = [(7, [3])]
+            engine.last_step_logprob_outputs = [(7, [None], [None])]
+            dispatcher._publish_token_deltas(active)
+            final_item = await asyncio.wait_for(output_queue.get(), timeout=1)
+        finally:
+            dispatcher.close()
+
+        self.assertEqual(final_item["type"], "final")
+        self.assertEqual(final_item["text"], "a")
+        self.assertEqual(final_item["text_delta"], "")
+        self.assertEqual(engine.aborted, [7])
+
+    async def test_chat_completion_response_shape(self):
+        from sparsevllm.entrypoints.openai.api_server import RequestHandle, _chat_completion_response
+
+        queue = asyncio.Queue()
+        await queue.put(
+            {
+                "type": "final",
+                "index": 0,
+                "text": "hello",
+                "finish_reason": "stop",
+                "prompt_tokens": 4,
+                "completion_tokens": 1,
+                "token_ids": [1],
+                "token_logprobs": [None],
+                "top_logprobs": [None],
+            }
+        )
+        response = await _chat_completion_response(
+            "chatcmpl-test",
+            123,
+            "model",
+            [RequestHandle(output_queue=queue, cancelled=threading.Event())],
+        )
+
+        self.assertEqual(response["object"], "chat.completion")
+        self.assertEqual(response["choices"][0]["message"], {"role": "assistant", "content": "hello"})
+        self.assertEqual(response["usage"], {"prompt_tokens": 4, "completion_tokens": 1, "total_tokens": 5})
+
+    async def test_chat_stream_starts_with_assistant_role(self):
+        from sparsevllm.entrypoints.openai import api_server
+
+        queue = asyncio.Queue()
+        await queue.put(
+            {
+                "type": "final",
+                "index": 0,
+                "text": "",
+                "text_delta": "",
+                "finish_reason": "stop",
+                "prompt_tokens": 3,
+                "completion_tokens": 0,
+                "token_ids": [],
+                "token_logprobs": [],
+                "top_logprobs": [],
+            }
+        )
+        handle = api_server.RequestHandle(output_queue=queue, cancelled=threading.Event())
+
+        class Dispatcher:
+            def cancel(self, _handle):
+                raise AssertionError("finished stream should not be cancelled")
+
+        chunks = [
+            chunk
+            async for chunk in api_server._chat_completion_stream(
+                Dispatcher(),
+                "chatcmpl-test",
+                123,
+                "model",
+                [handle],
+            )
+        ]
+
+        first = json.loads(chunks[0].removeprefix("data: "))
+        self.assertEqual(first["choices"][0]["delta"], {"role": "assistant"})
+
+    def test_completion_logprobs_serializes_sampled_tokens(self):
+        from sparsevllm.entrypoints.openai.api_server import _completion_logprobs
+
+        class Tokenizer:
+            def decode(self, token_ids, skip_special_tokens=True):
+                return {1: "a", 2: "b", 3: "c"}[token_ids[0]]
+
+        logprobs = _completion_logprobs(
+            Tokenizer(),
+            [1, 2],
+            [-0.1, -0.2],
+            [{1: -0.1, 3: -1.0}, None],
+        )
+
+        self.assertEqual(logprobs["tokens"], ["a", "b"])
+        self.assertEqual(logprobs["token_logprobs"], [-0.1, -0.2])
+        self.assertEqual(logprobs["top_logprobs"][0], {"a": -0.1, "c": -1.0})
+
+    def test_chat_logprobs_true_requests_sampled_logprobs(self):
+        from sparsevllm.entrypoints.openai.api_server import ChatCompletionRequest, _sampling_params_from_request
+
+        request = ChatCompletionRequest(
+            model="model",
+            messages=[{"role": "user", "content": "hello"}],
+            logprobs=True,
+        )
+
+        self.assertEqual(_sampling_params_from_request(request).logprobs, 0)
+
+
+class OpenAIClientTest(unittest.TestCase):
+    def test_stream_client_prints_text_without_sse_frames(self):
+        client_path = Path(__file__).resolve().parents[1] / "src/sparsevllm/entrypoints/openai/client.py"
+        spec = importlib.util.spec_from_file_location("sparsevllm_openai_client_test", client_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        lines = [
+            'data: {"choices": [{"text": " local"}]}\n',
+            "\n",
+            'data: {"choices": [{"text": "_attention"}]}\n',
+            "data: [DONE]\n",
+        ]
+
+        with patch("builtins.print") as mocked_print:
+            output = module.print_stream_text(lines)
+
+        self.assertEqual(output, " local_attention")
+        self.assertEqual(mocked_print.call_args_list[0].args, (" local",))
+        self.assertEqual(mocked_print.call_args_list[1].args, ("_attention",))
 
 
 if __name__ == "__main__":

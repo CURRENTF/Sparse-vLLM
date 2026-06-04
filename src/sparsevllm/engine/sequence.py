@@ -31,6 +31,9 @@ class Sequence:
         self.top_k = sampling_params.top_k
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
+        self.logprobs = sampling_params.logprobs
+        self.completion_token_logprobs: list[float | None] = []
+        self.completion_top_logprobs: list[dict[int, float] | None] = []
 
     def __len__(self):
         return self.num_tokens
@@ -69,8 +72,16 @@ class Sequence:
     def is_last_chunk_prefill(self):
         return (self.num_prefilled_tokens + self.current_chunk_size) >= self.num_prompt_tokens
 
-    def append_token(self, token_id: int):
+    def append_token(
+        self,
+        token_id: int,
+        logprob: float | None = None,
+        top_logprobs: dict[int, float] | None = None,
+    ):
         self.token_ids.append(token_id)
+        if self.num_completion_tokens >= 0:
+            self.completion_token_logprobs.append(logprob)
+            self.completion_top_logprobs.append(top_logprobs)
         self.last_token = token_id
         self.num_tokens += 1
 
@@ -94,13 +105,16 @@ class Sequence:
             self.top_k,
             self.max_tokens,
             self.ignore_eos,
+            self.logprobs,
             data,
         )
 
     def __setstate__(self, state):
         (self.seq_id, self.status, self.num_tokens, self.num_prompt_tokens,
          self.num_prefilled_tokens, self.current_chunk_size, self.temperature,
-         self.top_p, self.top_k, self.max_tokens, self.ignore_eos, data) = state
+         self.top_p, self.top_k, self.max_tokens, self.ignore_eos, self.logprobs, data) = state
+        self.completion_token_logprobs = []
+        self.completion_top_logprobs = []
 
         if self.num_completion_tokens == 0:
             self.token_ids = data

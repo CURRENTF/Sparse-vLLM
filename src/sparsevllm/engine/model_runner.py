@@ -316,7 +316,46 @@ class ModelRunner:
         finally:
             reset_context()
 
-    def run(self, seqs: list[Sequence], is_prefill: bool) -> tuple[list[int], torch.Tensor | None]:
+    def _collect_logprobs(
+        self,
+        logits: torch.Tensor,
+        token_ids: list[int],
+        seqs: list[Sequence],
+    ) -> tuple[list[float | None], list[dict[int, float] | None]] | tuple[None, None]:
+        if not any(seq.logprobs is not None for seq in seqs):
+            return None, None
+
+        log_probs = torch.log_softmax(logits.float(), dim=-1)
+        token_tensor = torch.tensor(token_ids, device=log_probs.device, dtype=torch.long)
+        sampled = log_probs.gather(1, token_tensor.unsqueeze(1)).squeeze(1)
+        sampled_logprobs: list[float | None] = sampled.detach().cpu().tolist()
+
+        max_top_logprobs = max(int(seq.logprobs or 0) for seq in seqs)
+        top_logprobs: list[dict[int, float] | None]
+        if max_top_logprobs <= 0:
+            top_logprobs = [None] * len(seqs)
+        else:
+            top_values, top_indices = torch.topk(
+                log_probs,
+                k=min(max_top_logprobs, log_probs.shape[-1]),
+                dim=-1,
+            )
+            top_logprobs = []
+            for row, seq in enumerate(seqs):
+                requested = int(seq.logprobs or 0)
+                if requested <= 0:
+                    top_logprobs.append(None)
+                    continue
+                values = top_values[row, :requested].detach().cpu().tolist()
+                indices = top_indices[row, :requested].detach().cpu().tolist()
+                top_logprobs.append({int(token_id): float(value) for token_id, value in zip(indices, values)})
+        return sampled_logprobs, top_logprobs
+
+    def run(
+        self,
+        seqs: list[Sequence],
+        is_prefill: bool,
+    ) -> tuple[list[int], tuple[list[float | None], list[dict[int, float] | None]] | None]:
         """单步执行主逻辑"""
         name = "model_run_prefill" if is_prefill else "model_run_decode"
         with profiler.record(name):
@@ -347,9 +386,10 @@ class ModelRunner:
                                 top_ks,
                                 all_greedy=all_greedy,
                             ).tolist()
+                    logprob_outputs = self._collect_logprobs(logits, token_ids, seqs)
                     with profiler.record("model_sparse_post"):
                         self.sparse_controller.post_forward(seqs, is_prefill)
-                    return token_ids, None
+                    return token_ids, logprob_outputs
                 finally:
                     reset_context()
 
@@ -375,10 +415,11 @@ class ModelRunner:
             # 4. Token 采样 (仅 Rank 0)
             with profiler.record("model_sampler"):
                 token_ids = self.sampler(logits, temperatures, top_ps, top_ks, all_greedy=all_greedy).tolist() if self.rank == 0 else None
+            logprob_outputs = self._collect_logprobs(logits, token_ids, seqs) if self.rank == 0 else None
 
             # 5. 后置稀疏处理 (如 SnapKV 驱逐)
             with profiler.record("model_sparse_post"):
                 self.sparse_controller.post_forward(seqs, is_prefill)
 
             reset_context()
-            return token_ids, None # attn_score 不再作为返回值
+            return token_ids, logprob_outputs

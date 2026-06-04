@@ -516,15 +516,24 @@ class Scheduler:
         self.decoding.extendleft(reversed(scheduled_seqs))
         return scheduled_seqs, False, preempted_seqs
 
-    def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool):
+    def postprocess(
+        self,
+        seqs: list[Sequence],
+        token_ids: list[int],
+        is_prefill: bool,
+        token_logprobs: list[float | None] | None = None,
+        top_logprobs: list[dict[int, float] | None] | None = None,
+    ):
         """
         模型运行后的后处理工作。
         1. 更新 Token 序列。
         2. 更新 Prefill 进度。
         3. 处理序列完成状态 (EOS 或 Max Tokens)。
         """
+        token_logprobs = token_logprobs or [None] * len(seqs)
+        top_logprobs = top_logprobs or [None] * len(seqs)
         if is_prefill:
-            for seq, token_id in zip(seqs, token_ids):
+            for seq, token_id, token_logprob, top_logprob in zip(seqs, token_ids, token_logprobs, top_logprobs):
                 seq.num_prefilled_tokens += seq.current_chunk_size
                 # 检查 Chunked Prefill 是否完成
                 if seq.num_prefilled_tokens < seq.num_prompt_tokens:
@@ -536,7 +545,7 @@ class Scheduler:
                     seq.status = SequenceStatus.RUNNING
                     self.decoding.append(seq)
                     # 记录模型生成的第一个 Token
-                    seq.append_token(token_id)
+                    seq.append_token(token_id, token_logprob, top_logprob)
                     # 检查是否命中结束条件
                     if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
                         seq.status = SequenceStatus.FINISHED
@@ -544,8 +553,8 @@ class Scheduler:
             return
 
         # 处理 Decode 步骤
-        for seq, token_id in zip(seqs, token_ids):
-            seq.append_token(token_id)
+        for seq, token_id, token_logprob, top_logprob in zip(seqs, token_ids, token_logprobs, top_logprobs):
+            seq.append_token(token_id, token_logprob, top_logprob)
             if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
                 seq.status = SequenceStatus.FINISHED
                 if seq in self.decoding:

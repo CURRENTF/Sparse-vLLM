@@ -8,6 +8,7 @@ class SamplingParams:
     top_k: int = 0
     max_tokens: int = 64
     ignore_eos: bool = False
+    logprobs: int | None = None
 
     def __post_init__(self):
         if self.temperature < 0.0:
@@ -18,3 +19,5 @@ class SamplingParams:
             raise ValueError("top_k must be non-negative")
         if self.max_tokens <= 0:
             raise ValueError("max_tokens must be positive")
+        if self.logprobs is not None and self.logprobs < 0:
+            raise ValueError("logprobs must be non-negative")
