@@ -1,0 +1,4 @@
+interface:
+  display_name: "Code Review"
+  short_description: "Review Sparse-vLLM diffs"
+  default_prompt: "Use $code-review to review Sparse-vLLM changes for correctness, architecture, scheduling, reproducibility, performance, and tests."
