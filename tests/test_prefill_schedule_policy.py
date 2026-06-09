@@ -32,10 +32,22 @@ from sparsevllm.method_registry import (
 
 
 class FakeMemoryOracle:
-    def __init__(self, free_slots=1_000_000, *, step_free_slots=None, force_full_prefill=False):
+    def __init__(
+        self,
+        free_slots=1_000_000,
+        *,
+        step_free_slots=None,
+        force_full_prefill=False,
+        prefix_hit_len=0,
+        prefix_hit_blocks=0,
+    ):
         self._free_slots = int(free_slots)
         self._step_free_slots = int(step_free_slots) if step_free_slots is not None else int(free_slots)
         self._force_full_prefill = bool(force_full_prefill)
+        self.prefix_hit_len = int(prefix_hit_len)
+        self.prefix_hit_blocks = int(prefix_hit_blocks)
+        self.refresh_calls = 0
+        self.clear_calls = 0
 
     @property
     def num_free_slots(self):
@@ -50,11 +62,15 @@ class FakeMemoryOracle:
     def is_full_prefill_step(self, seqs):
         return False
 
+    def decode_step_free_slots(self):
+        return self._free_slots
+
     def reserved_prefill_slots(self, waiting, chunk_prefill_size):
         return 0
 
     def remaining_prefill_tokens(self, seq):
-        return int(seq.num_prompt_tokens - seq.num_prefilled_tokens)
+        virtual_prefilled = max(seq.num_prefilled_tokens, seq.prefix_cache_hit_len)
+        return int(seq.num_prompt_tokens - virtual_prefilled)
 
     def prefill_batched_tokens_margin(self):
         return 0
@@ -63,7 +79,7 @@ class FakeMemoryOracle:
         return {"slots": self._free_slots}
 
     def prompt_admission_costs(self, seq):
-        return {"slots": int(seq.num_prompt_tokens)}
+        return {"slots": int(seq.num_prompt_tokens - seq.prefix_cache_hit_len)}
 
     def prompt_admission_failure_action(self):
         return "raise"
@@ -72,7 +88,23 @@ class FakeMemoryOracle:
         return None
 
     def prompt_logical_reservation_cost(self, seq):
-        return int(seq.num_prompt_tokens)
+        return int(seq.num_prompt_tokens - seq.prefix_cache_hit_len)
+
+    def refresh_prefix_cache_hit(self, seq):
+        self.refresh_calls += 1
+        seq.clear_prefix_cache_hit()
+        if self.prefix_hit_len <= 0:
+            return
+        seq.prefix_cache_enabled = True
+        seq.prefix_cache_hit_len = self.prefix_hit_len
+        seq.prefix_cache_hit_blocks = self.prefix_hit_blocks
+        seq.prefix_cache_hit_last_key = b"test"
+        seq.prefix_cache_block_size = 4
+        seq.prefix_cache_method = ""
+
+    def clear_prefix_cache_hit(self, seq):
+        self.clear_calls += 1
+        seq.clear_prefix_cache_hit()
 
 
 def make_scheduler(policy, *, method="", chunk=5, max_tokens=10, oracle=None):
@@ -107,6 +139,23 @@ def make_sparse_controller_config():
         decode_keep_tokens=4,
         sparse_attn_score_dtype="float32",
     )
+
+
+def make_scheduler_with_oracle(policy, oracle, *, method="", chunk=5, max_tokens=10):
+    cfg = SimpleNamespace(
+        max_num_seqs_in_batch=4,
+        max_num_batched_tokens=max_tokens,
+        max_decoding_seqs=16,
+        chunk_prefill_size=chunk,
+        prefill_schedule_policy=policy,
+        eos=-1,
+        num_sink_tokens=1,
+        num_recent_tokens=1,
+        decode_keep_tokens=4,
+        snapkv_window_size=2,
+        vllm_sparse_method=method,
+    )
+    return Scheduler(cfg, oracle)
 
 
 def seq_with_len(n):
@@ -752,6 +801,90 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
         self.assertTrue(is_prefill)
         self.assertEqual(scheduled, [short_seq])
         self.assertEqual(short_seq.current_chunk_size, 8192)
+
+    def test_prefix_cache_hit_reduces_prefill_work_for_fresh_prompt(self):
+        oracle = FakeMemoryOracle(prefix_hit_len=8, prefix_hit_blocks=2)
+        scheduler = make_scheduler_with_oracle(
+            PREFILL_POLICY_ALL_CHUNKED,
+            oracle,
+            method="",
+            chunk=5,
+            max_tokens=20,
+        )
+        seq = seq_with_len(20)
+        scheduler.add(seq)
+
+        scheduled, is_prefill, _ = scheduler.schedule()
+
+        self.assertTrue(is_prefill)
+        self.assertEqual(scheduled, [seq])
+        self.assertEqual(oracle.refresh_calls, 1)
+        self.assertTrue(seq.prefix_cache_enabled)
+        self.assertEqual(seq.num_prefilled_tokens, 8)
+        self.assertEqual(seq.current_chunk_size, 5)
+
+    def test_prefix_cache_lookup_skips_preempted_completion_replay(self):
+        oracle = FakeMemoryOracle(prefix_hit_len=8, prefix_hit_blocks=2)
+        scheduler = make_scheduler_with_oracle(
+            PREFILL_POLICY_ALL_CHUNKED,
+            oracle,
+            method="",
+            chunk=5,
+            max_tokens=20,
+        )
+        seq = seq_with_len(20)
+        seq.append_token(99)
+        seq.num_prefilled_tokens = 0
+        scheduler.add(seq)
+
+        scheduled, is_prefill, _ = scheduler.schedule()
+
+        self.assertTrue(is_prefill)
+        self.assertEqual(scheduled, [seq])
+        self.assertEqual(oracle.refresh_calls, 0)
+        self.assertFalse(seq.prefix_cache_enabled)
+        self.assertEqual(seq.num_prefilled_tokens, 0)
+
+    def test_decode_preemption_after_generation_fails_fast(self):
+        oracle = FakeMemoryOracle(free_slots=0)
+        scheduler = make_scheduler_with_oracle(
+            PREFILL_POLICY_ALL_CHUNKED,
+            oracle,
+            method="",
+            chunk=5,
+            max_tokens=20,
+        )
+        seq = seq_with_len(8)
+        seq.num_prefilled_tokens = seq.num_prompt_tokens
+        seq.append_token(99)
+        scheduler.decoding.append(seq)
+
+        with self.assertRaisesRegex(RuntimeError, "Decode preemption replay"):
+            scheduler.schedule()
+
+    def test_sequence_setstate_accepts_pre_prefix_cache_ipc_state(self):
+        seq = seq_with_len(4)
+        seq.current_chunk_size = 4
+        old_state = (
+            seq.seq_id,
+            seq.status,
+            seq.num_tokens,
+            seq.num_prompt_tokens,
+            seq.num_prefilled_tokens,
+            seq.current_chunk_size,
+            seq.temperature,
+            seq.top_p,
+            seq.top_k,
+            seq.max_tokens,
+            seq.ignore_eos,
+            seq.logprobs,
+            seq.token_ids,
+        )
+        restored = object.__new__(Sequence)
+        restored.__setstate__(old_state)
+
+        self.assertFalse(restored.prefix_cache_enabled)
+        self.assertEqual(restored.prefix_cache_hit_len, 0)
 
 
 class DeltaKVFullPrefillStagingTest(unittest.TestCase):

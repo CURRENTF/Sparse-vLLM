@@ -225,7 +225,7 @@ class Scheduler:
         # 逻辑可用空间计数器，用于在本轮调度中预估显存占用
         physical_free_count = self.memory_oracle.num_free_slots
         reserved_prefill = self._reserved_prefill_tokens()
-        logical_free_count = max(0, physical_free_count - reserved_prefill)
+        logical_free_count = max(0, int(self.memory_oracle.decode_step_free_slots()) - reserved_prefill)
         step_free_count = int(self.memory_oracle.prefill_step_free_slots())
         admission_budgets = dict(
             self.memory_oracle.prompt_admission_budgets(self.waiting, self.chunk_prefill_size)
@@ -261,6 +261,8 @@ class Scheduler:
                 if seq is None:
                     break
                 bucket_scan_budget -= 1
+                if seq.num_prefilled_tokens == 0 and seq.num_completion_tokens == 0:
+                    self.memory_oracle.refresh_prefix_cache_hit(seq)
                 remaining_prefill_tokens = self.memory_oracle.remaining_prefill_tokens(seq)
 
                 # 异常处理：如果由于某种原因已经 prefill 完却还在 waiting 队列
@@ -364,6 +366,8 @@ class Scheduler:
                     for name, need in costs.items():
                         admission_budgets[name] = int(admission_budgets.get(name, 0) or 0) - int(need)
                     self.memory_oracle.on_prompt_admitted(seq, costs)
+                    if int(getattr(seq, "prefix_cache_hit_len", 0) or 0) > 0:
+                        seq.num_prefilled_tokens = int(seq.prefix_cache_hit_len)
                     logical_need = self.memory_oracle.prompt_logical_reservation_cost(seq)
                     if logical_free_count < logical_need:
                         # Fail fast: admission budgets should already account for reserved prefill headroom.
@@ -416,6 +420,14 @@ class Scheduler:
                 # 策略：牺牲当前 seq，并立刻返回，让上层先释放槽位再进入下一轮调度。
                 # 这样可以避免在一次 schedule() 调用中反复驱逐多个请求造成抖动。
                 victim = seq
+                if victim.num_completion_tokens > 0:
+                    raise RuntimeError(
+                        "Decode preemption replay after generation is not supported yet. "
+                        f"seq_id={victim.seq_id} prompt_len={victim.num_prompt_tokens} "
+                        f"num_tokens={victim.num_tokens} completion_tokens={victim.num_completion_tokens} "
+                        f"free_slots={physical_free_count} reserved_prefill={reserved_prefill}. "
+                        "Reduce batch size or KV pressure instead of silently replaying an incomplete context."
+                    )
                 debug_slots = os.getenv("SPARSEVLLM_DEBUG_SLOTS", "0") == "1"
                 if debug_slots:
                     logger.info(
@@ -430,6 +442,7 @@ class Scheduler:
                     )
                 victim.status = SequenceStatus.WAITING
                 victim.num_prefilled_tokens = 0  # 重置进度，下次回来重新跑 Prefill
+                self.memory_oracle.clear_prefix_cache_hit(victim)
                 # Requeue to the tail instead of the head. Otherwise a long sequence can
                 # be immediately re-admitted after preemption and thrash in a tight
                 # prefill->decode->preempt loop while other waiting prompts never drain.

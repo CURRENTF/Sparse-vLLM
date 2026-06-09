@@ -2,16 +2,64 @@ from __future__ import annotations
 
 import os
 from collections import deque
+from dataclasses import dataclass
 
 import numpy as np
 import torch
 
 from sparsevllm.config import Config
 from sparsevllm.engine.sequence import Sequence
+from sparsevllm.engine.prefix_cache import (
+    PrefixCacheBlock,
+    PrefixCacheIndex,
+    build_prefix_cache_fingerprint,
+    usable_prefix_cache_tokens,
+)
 from sparsevllm.utils.log import logger, log_level
 from sparsevllm.utils.profiler import profiler
 
 from .base import CacheManager, LayerBatchStates, SparseSelection
+
+
+@dataclass
+class PrefixRuntimeState:
+    parent_key: bytes | None
+    next_logical_block_idx: int
+    pending_tokens: list[int]
+    pending_slots: list[torch.Tensor]
+
+
+@dataclass
+class PendingPrefixBlock:
+    key: bytes
+    parent_key: bytes | None
+    logical_block_idx: int
+    slots: torch.Tensor
+    token_ids: list[int]
+
+
+def _merge_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    if not ranges:
+        return []
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted((int(s), int(e)) for s, e in ranges if int(e) > int(s)):
+        if not merged or start > merged[-1][1]:
+            merged.append((start, end))
+        else:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+    return merged
+
+
+def _complement_ranges(start: int, end: int, ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    cur = int(start)
+    result: list[tuple[int, int]] = []
+    for range_start, range_end in _merge_ranges(ranges):
+        if cur < range_start:
+            result.append((cur, range_start))
+        cur = max(cur, range_end)
+    if cur < int(end):
+        result.append((cur, int(end)))
+    return result
 
 
 class StandardCacheManager(CacheManager):
@@ -32,6 +80,23 @@ class StandardCacheManager(CacheManager):
         self.free_rows = deque(range(self.max_buffer_rows))
         self.row_seq_lens = np.zeros((self.max_buffer_rows,), dtype=np.int32)
         self.layer_batch_state = LayerBatchStates()
+
+        self.enable_prefix_caching = bool(
+            config.enable_prefix_caching and config.vllm_sparse_method in ("", "omnikv")
+        )
+        self.prefix_cache_block_size = int(config.prefix_cache_block_size)
+        self.prefix_cache: PrefixCacheIndex | None = None
+        if self.enable_prefix_caching:
+            self.prefix_cache = PrefixCacheIndex(
+                block_size=self.prefix_cache_block_size,
+                fingerprint=build_prefix_cache_fingerprint(config, self.prefix_cache_block_size),
+                max_blocks=config.prefix_cache_max_blocks,
+            )
+        self.seq_id_to_prefix_blocks: dict[int, list[PrefixCacheBlock]] = {}
+        self.seq_id_to_materialized_blocks: dict[int, list[PrefixCacheBlock]] = {}
+        self.seq_id_to_cached_ranges: dict[int, list[tuple[int, int]]] = {}
+        self.prefix_runtime_states: dict[int, PrefixRuntimeState] = {}
+        self.pending_prefix_blocks: dict[int, list[PendingPrefixBlock]] = {}
 
     def allocate_kv_cache(self):
         available_memory, slot_bytes_per_layer = self._get_available_slots_info()
@@ -95,7 +160,210 @@ class StandardCacheManager(CacheManager):
     def free_slot_stats(self) -> dict[str, int]:
         stats = super().free_slot_stats()
         stats["free_rows"] = int(self.num_free_rows)
+        if self.prefix_cache is not None:
+            stats.update(self.prefix_cache.stats())
+            stats["prefix_cache_evictable_slots"] = int(self._prefix_evictable_slots())
         return stats
+
+    def _require_prefix_cache(self) -> PrefixCacheIndex:
+        if self.prefix_cache is None:
+            raise RuntimeError("prefix cache is not enabled for this cache manager.")
+        return self.prefix_cache
+
+    def _prefix_evictable_slots(self) -> int:
+        if self.prefix_cache is None:
+            return 0
+        return int(self.prefix_cache.evictable_blocks() * self.prefix_cache_block_size)
+
+    def prefill_step_free_slots(self) -> int:
+        return int(self.num_free_slots + self._prefix_evictable_slots())
+
+    def decode_step_free_slots(self) -> int:
+        return int(self.num_free_slots + self._prefix_evictable_slots())
+
+    def prompt_admission_free_slots(self) -> int:
+        return int(self.num_free_slots + self._prefix_evictable_slots())
+
+    def _prefix_hit_evictable_slots(self, seq: Sequence) -> int:
+        if self.prefix_cache is None or int(getattr(seq, "prefix_cache_hit_len", 0) or 0) <= 0:
+            return 0
+        if seq.prefix_cache_hit_last_key is None:
+            raise RuntimeError(f"seq_id={seq.seq_id} has prefix hit length but no last key.")
+        chain = self.prefix_cache.get_chain(seq.prefix_cache_hit_last_key, int(seq.prefix_cache_hit_blocks))
+        return sum(
+            self.prefix_cache_block_size
+            for block in chain
+            if PrefixCacheIndex.can_evict(block)
+        )
+
+    def prompt_admission_cost(self, seq: Sequence) -> int:
+        hit_len = int(getattr(seq, "prefix_cache_hit_len", 0) or 0)
+        suffix_len = int(seq.num_prompt_tokens - hit_len)
+        return suffix_len + self._prefix_hit_evictable_slots(seq)
+
+    def prompt_logical_reservation_cost(self, seq: Sequence) -> int:
+        return int(self.prompt_admission_cost(seq))
+
+    def refresh_prefix_cache_hit(self, seq: Sequence) -> None:
+        self.clear_prefix_cache_hit(seq)
+        if not self.enable_prefix_caching or self.prefix_cache is None:
+            return
+        if seq.num_prefilled_tokens != 0 or seq.num_completion_tokens != 0:
+            return
+        usable_tokens = usable_prefix_cache_tokens(seq.num_prompt_tokens, self.prefix_cache_block_size)
+        if usable_tokens <= 0:
+            return
+        hit_len, last_key, hit_blocks = self.prefix_cache.lookup_longest_prefix(
+            seq.prompt_token_ids,
+            max_usable_tokens=usable_tokens,
+        )
+        if hit_len <= 0:
+            return
+        if last_key is None or hit_blocks <= 0:
+            raise RuntimeError("Prefix cache lookup returned an invalid hit.")
+        if hit_len >= seq.num_prompt_tokens or hit_len % self.prefix_cache_block_size != 0:
+            raise RuntimeError(
+                "Prefix cache lookup returned an unusable hit length: "
+                f"seq_id={seq.seq_id} hit_len={hit_len} prompt_len={seq.num_prompt_tokens} "
+                f"block_size={self.prefix_cache_block_size}."
+            )
+        seq.prefix_cache_enabled = True
+        seq.prefix_cache_hit_len = int(hit_len)
+        seq.prefix_cache_hit_blocks = int(hit_blocks)
+        seq.prefix_cache_hit_last_key = last_key
+        seq.prefix_cache_block_size = self.prefix_cache_block_size
+        seq.prefix_cache_method = str(self.config.vllm_sparse_method or "")
+
+    def _release_prefix_blocks(self, blocks: list[PrefixCacheBlock]) -> None:
+        for block in blocks:
+            block.ref_count -= 1
+            if block.ref_count < 0:
+                raise RuntimeError("Prefix cache block ref_count became negative.")
+
+    def _free_prefix_cache_blocks(self, blocks: list[PrefixCacheBlock]) -> None:
+        for block in blocks:
+            if block.slots is None:
+                raise RuntimeError("Standard prefix cache block is missing token slots.")
+            slots = block.slots.to(dtype=torch.int32)
+            count = int(slots.numel())
+            ptr = self._num_free_slots
+            self.free_slots_stack[ptr: ptr + count] = slots
+            self._num_free_slots += count
+
+    def _evict_prefix_cache_until_free(self, needed_slots: int) -> None:
+        if not self.enable_prefix_caching or self.prefix_cache is None:
+            return
+        needed_slots = int(needed_slots)
+        if self._num_free_slots >= needed_slots:
+            return
+        missing_slots = needed_slots - int(self._num_free_slots)
+        needed_blocks = (missing_slots + self.prefix_cache_block_size - 1) // self.prefix_cache_block_size
+        evicted = self.prefix_cache.evict_until_freeable(needed_blocks)
+        self._free_prefix_cache_blocks(evicted)
+
+    def _evict_prefix_cache_for_insert(self, needed_blocks: int = 1) -> None:
+        if not self.enable_prefix_caching or self.prefix_cache is None:
+            return
+        evicted = self.prefix_cache.ensure_insert_capacity(needed_blocks)
+        self._free_prefix_cache_blocks(evicted)
+
+    def _attach_prefix_cache_if_needed(self, seq: Sequence) -> None:
+        if not self.enable_prefix_caching or self.prefix_cache is None:
+            return
+        hit_len = int(getattr(seq, "prefix_cache_hit_len", 0) or 0)
+        if hit_len <= 0:
+            return
+        if seq.seq_id in self.seq_id_to_prefix_blocks:
+            return
+        if seq.prefix_cache_hit_last_key is None:
+            raise RuntimeError(f"seq_id={seq.seq_id} has prefix hit length but no last key.")
+        if hit_len % self.prefix_cache_block_size != 0:
+            raise RuntimeError(
+                f"seq_id={seq.seq_id} prefix hit length is not block aligned: "
+                f"hit_len={hit_len} block_size={self.prefix_cache_block_size}."
+            )
+        chain = self.prefix_cache.get_chain(seq.prefix_cache_hit_last_key, int(seq.prefix_cache_hit_blocks))
+        if len(chain) * self.prefix_cache_block_size != hit_len:
+            raise RuntimeError(
+                "Prefix cache chain length does not match scheduler metadata: "
+                f"seq_id={seq.seq_id} hit_len={hit_len} blocks={len(chain)} "
+                f"block_size={self.prefix_cache_block_size}."
+            )
+        row_idx = self._get_free_row(seq.seq_id)
+        if int(self.row_seq_lens[row_idx]) != 0:
+            raise RuntimeError(
+                f"Cannot attach prefix cache to non-empty row: seq_id={seq.seq_id} "
+                f"row_idx={row_idx} row_len={int(self.row_seq_lens[row_idx])}."
+            )
+
+        cached_ranges = self.seq_id_to_cached_ranges.setdefault(seq.seq_id, [])
+        for block in chain:
+            if block.slots is None or int(block.slots.numel()) != self.prefix_cache_block_size:
+                raise RuntimeError(
+                    f"Invalid Standard prefix cache block slots for seq_id={seq.seq_id}: "
+                    f"logical_block_idx={block.logical_block_idx}."
+                )
+            start = int(block.logical_block_idx) * self.prefix_cache_block_size
+            end = start + self.prefix_cache_block_size
+            self.buffer_req_to_token_slots[row_idx, start:end] = block.slots
+            block.ref_count += 1
+            cached_ranges.append((start, end))
+
+        self.row_seq_lens[row_idx] = hit_len
+        self.seq_id_to_prefix_blocks[seq.seq_id] = chain
+        self.prefix_cache.touch_chain(chain)
+
+    def _record_prefix_materialization(
+        self,
+        seq: Sequence,
+        token_ids: list[int],
+        slots: torch.Tensor,
+    ) -> None:
+        if not self.enable_prefix_caching or self.prefix_cache is None:
+            return
+        if seq.num_completion_tokens != 0:
+            return
+        if len(token_ids) != int(slots.numel()):
+            raise RuntimeError(
+                f"Prefix materialization token/slot mismatch: seq_id={seq.seq_id} "
+                f"tokens={len(token_ids)} slots={int(slots.numel())}."
+            )
+
+        state = self.prefix_runtime_states.get(seq.seq_id)
+        if state is None:
+            hit_blocks = int(getattr(seq, "prefix_cache_hit_blocks", 0) or 0)
+            parent_key = getattr(seq, "prefix_cache_hit_last_key", None)
+            state = PrefixRuntimeState(
+                parent_key=parent_key,
+                next_logical_block_idx=hit_blocks,
+                pending_tokens=[],
+                pending_slots=[],
+            )
+            self.prefix_runtime_states[seq.seq_id] = state
+
+        pending_blocks = self.pending_prefix_blocks.setdefault(seq.seq_id, [])
+        for token_id, slot in zip(token_ids, slots):
+            state.pending_tokens.append(int(token_id))
+            state.pending_slots.append(slot.detach().clone().reshape(()))
+            if len(state.pending_tokens) != self.prefix_cache_block_size:
+                continue
+
+            block_tokens = list(state.pending_tokens)
+            block_slots = torch.stack(state.pending_slots).to(dtype=torch.int32)
+            key = self.prefix_cache.hash_block(block_tokens, state.parent_key)
+            pending_blocks.append(
+                PendingPrefixBlock(
+                    key=key,
+                    parent_key=state.parent_key,
+                    logical_block_idx=state.next_logical_block_idx,
+                    slots=block_slots,
+                    token_ids=block_tokens,
+                )
+            )
+            state.parent_key = key
+            state.next_logical_block_idx += 1
+            state.pending_tokens = []
+            state.pending_slots = []
 
     def _get_free_row(self, seq_id: int) -> int:
         if seq_id in self.seq_id_to_row:
@@ -109,6 +377,7 @@ class StandardCacheManager(CacheManager):
     @torch.no_grad()
     def _allocate(self, seq_id: int, size: int) -> torch.Tensor:
         with profiler.record("cache_allocate"):
+            self._evict_prefix_cache_until_free(size)
             assert self._num_free_slots >= size, (
                 f"Out of KV cache slots: need {size}, free {self._num_free_slots}"
             )
@@ -129,6 +398,7 @@ class StandardCacheManager(CacheManager):
     def _allocate_batch(self, seq_ids: list[int], size: int) -> torch.Tensor:
         assert size == 1, "Batch allocation currently only supports size=1 (Decode)"
         batch_size = len(seq_ids)
+        self._evict_prefix_cache_until_free(batch_size)
         assert self._num_free_slots >= batch_size, (
             f"Out of KV cache slots: need {batch_size}, free {self._num_free_slots}"
         )
@@ -155,13 +425,22 @@ class StandardCacheManager(CacheManager):
                 raise ValueError
 
             cur_len = self.row_seq_lens[row_idx]
-            slots = self.buffer_req_to_token_slots[row_idx, :cur_len]
+            cached_ranges = _merge_ranges(self.seq_id_to_cached_ranges.pop(seq_id, []))
 
             assert cur_len > 0
             before_free = self._num_free_slots
-            ptr = self._num_free_slots
-            self.free_slots_stack[ptr: ptr + cur_len] = slots
-            self._num_free_slots += cur_len
+            freed_tokens = 0
+            for start, end in _complement_ranges(0, int(cur_len), cached_ranges):
+                slots = self.buffer_req_to_token_slots[row_idx, start:end]
+                count = int(end - start)
+                ptr = self._num_free_slots
+                self.free_slots_stack[ptr: ptr + count] = slots
+                self._num_free_slots += count
+                freed_tokens += count
+            self._release_prefix_blocks(self.seq_id_to_prefix_blocks.pop(seq_id, []))
+            self._release_prefix_blocks(self.seq_id_to_materialized_blocks.pop(seq_id, []))
+            self.prefix_runtime_states.pop(seq_id, None)
+            self.pending_prefix_blocks.pop(seq_id, None)
             after_free = self._num_free_slots
 
             self.buffer_req_to_token_slots[row_idx, :] = 0
@@ -173,7 +452,7 @@ class StandardCacheManager(CacheManager):
                     "free_seq seq_id={} row_idx={} freed_tokens={} free_slots_before={} free_slots_after={}",
                     seq_id,
                     row_idx,
-                    int(cur_len),
+                    int(freed_tokens),
                     int(before_free),
                     int(after_free),
                 )
@@ -191,6 +470,9 @@ class StandardCacheManager(CacheManager):
 
     def _prepare_prefill(self, seqs: list[Sequence]):
         with profiler.record("cache_prepare_prefill"):
+            for seq in seqs:
+                self._attach_prefix_cache_if_needed(seq)
+
             total_chunk_tokens = sum(seq.current_chunk_size for seq in seqs)
 
             input_ids_np = np.empty(total_chunk_tokens, dtype=np.int64)
@@ -216,7 +498,7 @@ class StandardCacheManager(CacheManager):
                             f"start_idx={start_idx}"
                         )
 
-                self._allocate(seq.seq_id, chunk_size)
+                allocated_slots = self._allocate(seq.seq_id, chunk_size)
                 row_idx = self.seq_id_to_row[seq.seq_id]
                 slot_mapping[token_offset: token_offset + chunk_size] = self.buffer_req_to_token_slots[row_idx, start_idx:end_idx]
                 context_lens_list.append(end_idx)
@@ -225,9 +507,11 @@ class StandardCacheManager(CacheManager):
                 chunk_tokens = seq.token_ids
                 if len(chunk_tokens) > chunk_size:
                     chunk_tokens = chunk_tokens[start_idx:end_idx]
+                chunk_tokens = list(chunk_tokens)
 
                 input_ids_np[token_offset: token_offset + chunk_size] = chunk_tokens
                 positions_np[token_offset: token_offset + chunk_size] = np.arange(start_idx, end_idx)
+                self._record_prefix_materialization(seq, chunk_tokens, allocated_slots)
 
                 cu_seqlens_q.append(cu_seqlens_q[-1] + chunk_size)
                 token_offset += chunk_size
@@ -247,6 +531,51 @@ class StandardCacheManager(CacheManager):
             positions = torch.from_numpy(positions_np).to("cuda")
             cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, device="cuda")
             return input_ids, positions, cu_seqlens_q
+
+    def on_forward_end(self, seqs: list[Sequence], is_prefill: bool):
+        if not is_prefill or not self.enable_prefix_caching or self.prefix_cache is None:
+            return
+        with profiler.record("prefix_cache_materialize"):
+            for seq in seqs:
+                pending_blocks = self.pending_prefix_blocks.pop(seq.seq_id, [])
+                if not pending_blocks:
+                    continue
+                cached_ranges = self.seq_id_to_cached_ranges.setdefault(seq.seq_id, [])
+                materialized = self.seq_id_to_materialized_blocks.setdefault(seq.seq_id, [])
+                protected: list[PrefixCacheBlock] = []
+                protected_keys = {
+                    key
+                    for pending in pending_blocks
+                    for key in (pending.parent_key, pending.key)
+                    if key is not None and self.prefix_cache.has_block(key)
+                }
+                for key in protected_keys:
+                    block = self.prefix_cache.get_block(key)
+                    if block is None:
+                        continue
+                    block.ref_count += 1
+                    protected.append(block)
+                try:
+                    for pending in pending_blocks:
+                        if not self.prefix_cache.has_block(pending.key):
+                            self._evict_prefix_cache_for_insert(1)
+                        block = PrefixCacheBlock(
+                            key=pending.key,
+                            parent_key=pending.parent_key,
+                            block_size=self.prefix_cache_block_size,
+                            logical_block_idx=pending.logical_block_idx,
+                            slots=pending.slots,
+                            token_ids=tuple(pending.token_ids),
+                        )
+                        inserted = self.prefix_cache.insert_block(block)
+                        if inserted is not block:
+                            continue
+                        inserted.ref_count = 1
+                        materialized.append(inserted)
+                        start = int(inserted.logical_block_idx) * self.prefix_cache_block_size
+                        cached_ranges.append((start, start + self.prefix_cache_block_size))
+                finally:
+                    self._release_prefix_blocks(protected)
 
     def _prepare_decode(self, seqs: list[Sequence]):
         with profiler.record("cache_prepare_decode"):

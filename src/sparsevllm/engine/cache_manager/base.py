@@ -415,6 +415,10 @@ class CacheManager(ABC):
         """Whether this method should bypass graph replay for diagnostics."""
         return False
 
+    def on_forward_end(self, seqs: list[Sequence], is_prefill: bool):
+        """Optional hook after all layers have stored KV for a forward step."""
+        return None
+
     def has_prefill_staging_view(self, layer_idx: int) -> bool:
         """Whether the current prefill layer should read from a temporary staging KV view."""
         return False
@@ -537,7 +541,11 @@ class CacheManager(ABC):
 
     def remaining_prefill_tokens(self, seq: Sequence) -> int:
         """Effective remaining prefill tokens for scheduling decisions."""
-        return int(seq.num_prompt_tokens - seq.num_prefilled_tokens)
+        virtual_prefilled = max(
+            int(seq.num_prefilled_tokens),
+            int(getattr(seq, "prefix_cache_hit_len", 0) or 0),
+        )
+        return int(seq.num_prompt_tokens - virtual_prefilled)
 
     def reserved_prefill_slots(self, waiting_seqs: deque[Sequence], chunk_prefill_size: int) -> int:
         """Persistent slots reserved by waiting/running prefills.
@@ -566,17 +574,22 @@ class CacheManager(ABC):
         """Whether the current prepared prefill step is backed by a full-prefill staging view."""
         return False
 
+    def decode_step_free_slots(self) -> int:
+        """Writable KV capacity for one decode step."""
+        return int(self.num_free_slots)
+
     def prompt_admission_free_slots(self) -> int:
         """Slots pool used to decide whether a new prompt can be admitted."""
         return int(self.num_free_slots)
 
     def prompt_admission_cost(self, seq: Sequence) -> int:
         """Persistent slots needed to admit a complete prompt to its final representation."""
-        return int(seq.num_prompt_tokens)
+        hit_len = int(getattr(seq, "prefix_cache_hit_len", 0) or 0)
+        return int(seq.num_prompt_tokens - hit_len)
 
     def prompt_logical_reservation_cost(self, seq: Sequence) -> int:
         """Logical slots reserved when a new prompt is admitted (scheduler-side accounting)."""
-        return int(seq.num_prompt_tokens)
+        return int(self.prompt_admission_cost(seq))
 
     def prompt_admission_failure_action(self) -> str:
         """Action when a prompt cannot be admitted: 'raise' or 'defer'."""
@@ -604,6 +617,14 @@ class CacheManager(ABC):
     def on_prompt_admitted(self, seq: Sequence, costs: dict[str, int]):
         """Hook called when Scheduler admits a new prompt."""
         return
+
+    def refresh_prefix_cache_hit(self, seq: Sequence) -> None:
+        """Populate scheduler-visible prefix hit metadata for a fresh prompt."""
+        self.clear_prefix_cache_hit(seq)
+
+    def clear_prefix_cache_hit(self, seq: Sequence) -> None:
+        """Clear scheduler-visible prefix hit metadata."""
+        seq.clear_prefix_cache_hit()
 
     def free_slot_stats(self) -> dict[str, int]:
         """Return a small set of free-slot stats for logging/debugging."""

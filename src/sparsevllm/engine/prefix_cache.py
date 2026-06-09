@@ -122,6 +122,12 @@ class PrefixCacheIndex:
     def __len__(self) -> int:
         return len(self._blocks)
 
+    def has_block(self, key: bytes) -> bool:
+        return key in self._blocks
+
+    def get_block(self, key: bytes) -> PrefixCacheBlock | None:
+        return self._blocks.get(key)
+
     def _tick(self) -> int:
         self._clock += 1
         return self._clock
@@ -165,7 +171,6 @@ class PrefixCacheIndex:
             hit_len = len(hit_blocks) * self.block_size
             self.hit_tokens += hit_len
             self.hit_blocks += len(hit_blocks)
-            self.touch_chain(hit_blocks)
             return hit_len, hit_blocks[-1].key, len(hit_blocks)
         return 0, None, 0
 

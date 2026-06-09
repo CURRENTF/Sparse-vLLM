@@ -1,12 +1,16 @@
 import tempfile
+from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
 import pytest
 import torch
 
 from sparsevllm.config import Config
+from sparsevllm.engine.cache_manager.standard import StandardCacheManager
+from sparsevllm.engine.sequence import Sequence
 from sparsevllm.engine.prefix_cache import (
     PrefixCacheBlock,
     PrefixCacheIndex,
@@ -77,6 +81,28 @@ def _make_config(**kwargs):
             return Config(model=str(model_dir), **kwargs)
 
 
+def _make_standard_manager_for_prefix(block_size=2):
+    cfg = _cfg(block_size=block_size)
+    fingerprint = build_prefix_cache_fingerprint(cfg, block_size)
+    manager = object.__new__(StandardCacheManager)
+    manager.config = cfg
+    manager.enable_prefix_caching = True
+    manager.prefix_cache_block_size = block_size
+    manager.prefix_cache = PrefixCacheIndex(block_size=block_size, fingerprint=fingerprint)
+    manager.buffer_req_to_token_slots = torch.zeros((2, 16), dtype=torch.int32)
+    manager.free_slots_stack = torch.arange(100, dtype=torch.int32)
+    manager._num_free_slots = 90
+    manager.seq_id_to_row = {}
+    manager.free_rows = deque([0, 1])
+    manager.row_seq_lens = np.zeros((2,), dtype=np.int32)
+    manager.seq_id_to_prefix_blocks = {}
+    manager.seq_id_to_materialized_blocks = {}
+    manager.seq_id_to_cached_ranges = {}
+    manager.prefix_runtime_states = {}
+    manager.pending_prefix_blocks = {}
+    return manager
+
+
 def test_usable_prefix_cache_tokens_leaves_logits_work():
     assert usable_prefix_cache_tokens(128, 16) == 112
     assert usable_prefix_cache_tokens(129, 16) == 128
@@ -120,6 +146,18 @@ def test_lookup_returns_longest_full_block_prefix():
     assert hit_blocks == 2
     chain = index.get_chain(hit_last_key, hit_blocks)
     assert [block.logical_block_idx for block in chain] == [0, 1]
+
+
+def test_lookup_does_not_touch_lru_state():
+    fp = build_prefix_cache_fingerprint(_cfg(), 4)
+    index = PrefixCacheIndex(block_size=4, fingerprint=fp)
+    last_key = _insert_tokens(index, [1, 2, 3, 4])
+    block = index.get_chain(last_key, 1)[0]
+    last_access = block.last_access
+
+    index.lookup_longest_prefix([1, 2, 3, 4, 5], max_usable_tokens=4)
+
+    assert block.last_access == last_access
 
 
 def test_leaf_only_eviction_preserves_parent_until_child_is_removed():
@@ -227,3 +265,92 @@ def test_config_rejects_unvalidated_prefix_cache_options():
         _make_config(prefix_cache_block_size=16.9)
     with pytest.raises(ValueError, match="prefix_cache_max_blocks"):
         _make_config(prefix_cache_max_blocks="16.9")
+
+
+def test_standard_attach_pins_prefix_slots_and_free_seq_keeps_cached_slots():
+    manager = _make_standard_manager_for_prefix(block_size=2)
+    seq = Sequence([1, 2, 3])
+    key = manager.prefix_cache.hash_block([1, 2], None)
+    block = PrefixCacheBlock(
+        key=key,
+        parent_key=None,
+        block_size=2,
+        logical_block_idx=0,
+        slots=torch.tensor([10, 11], dtype=torch.int32),
+        token_ids=(1, 2),
+    )
+    manager.prefix_cache.insert_block(block)
+    seq.prefix_cache_enabled = True
+    seq.prefix_cache_hit_len = 2
+    seq.prefix_cache_hit_blocks = 1
+    seq.prefix_cache_hit_last_key = key
+    seq.prefix_cache_block_size = 2
+    seq.prefix_cache_method = ""
+
+    manager._attach_prefix_cache_if_needed(seq)
+    assert manager.row_seq_lens[0] == 2
+    assert manager.buffer_req_to_token_slots[0, :2].tolist() == [10, 11]
+    assert block.ref_count == 1
+
+    manager._allocate(seq.seq_id, 1)
+    assert manager.row_seq_lens[0] == 3
+    assert manager._num_free_slots == 89
+
+    manager.free_seq(seq.seq_id)
+    assert manager._num_free_slots == 90
+    assert block.ref_count == 0
+    assert manager.seq_id_to_row == {}
+
+
+def test_standard_materializes_blocks_only_after_forward_end():
+    manager = _make_standard_manager_for_prefix(block_size=2)
+    seq = Sequence([1, 2])
+    slots = torch.tensor([20, 21], dtype=torch.int32)
+
+    manager._record_prefix_materialization(seq, [1, 2], slots)
+    assert len(manager.prefix_cache) == 0
+
+    manager.on_forward_end([seq], is_prefill=True)
+    assert len(manager.prefix_cache) == 1
+    block = next(iter(manager.prefix_cache._blocks.values()))
+    assert block.ref_count == 1
+    assert block.slots.tolist() == [20, 21]
+    assert manager.seq_id_to_cached_ranges[seq.seq_id] == [(0, 2)]
+
+
+def test_standard_pending_slots_do_not_alias_free_stack_storage():
+    manager = _make_standard_manager_for_prefix(block_size=2)
+    seq = Sequence([1, 2])
+    first_slot_view = manager.free_slots_stack[89:90]
+
+    manager._record_prefix_materialization(seq, [1], first_slot_view)
+    manager.free_slots_stack[89] = 777
+    manager._record_prefix_materialization(seq, [2], torch.tensor([88], dtype=torch.int32))
+
+    pending = manager.pending_prefix_blocks[seq.seq_id][0]
+    assert pending.slots.tolist() == [89, 88]
+
+
+def test_standard_admission_reserves_evictable_hit_blocks():
+    manager = _make_standard_manager_for_prefix(block_size=2)
+    manager._num_free_slots = 1
+    seq = Sequence([1, 2, 3])
+    key = manager.prefix_cache.hash_block([1, 2], None)
+    block = PrefixCacheBlock(
+        key=key,
+        parent_key=None,
+        block_size=2,
+        logical_block_idx=0,
+        slots=torch.tensor([10, 11], dtype=torch.int32),
+        token_ids=(1, 2),
+    )
+    manager.prefix_cache.insert_block(block)
+    seq.prefix_cache_hit_len = 2
+    seq.prefix_cache_hit_blocks = 1
+    seq.prefix_cache_hit_last_key = key
+
+    assert manager.prompt_admission_free_slots() == 3
+    assert manager.prompt_admission_cost(seq) == 3
+
+    block.ref_count = 1
+    assert manager.prompt_admission_cost(seq) == 1

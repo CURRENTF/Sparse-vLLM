@@ -389,6 +389,7 @@ class ModelRunner:
                     logprob_outputs = self._collect_logprobs(logits, token_ids, seqs)
                     with profiler.record("model_sparse_post"):
                         self.sparse_controller.post_forward(seqs, is_prefill)
+                        self.cache_manager.on_forward_end(seqs, is_prefill)
                     return token_ids, logprob_outputs
                 finally:
                     reset_context()
@@ -420,6 +421,7 @@ class ModelRunner:
             # 5. 后置稀疏处理 (如 SnapKV 驱逐)
             with profiler.record("model_sparse_post"):
                 self.sparse_controller.post_forward(seqs, is_prefill)
+                self.cache_manager.on_forward_end(seqs, is_prefill)
 
             reset_context()
             return token_ids, logprob_outputs
