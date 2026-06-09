@@ -65,6 +65,10 @@ Important rules:
 - `sparse_method` is the public method selector for both HF and Sparse-vLLM.
 - `deltakv_checkpoint_path` is the public DeltaKV checkpoint path for both HF
   and Sparse-vLLM.
+- Sparse-vLLM prefix-cache controls are direct engine config fields:
+  `enable_prefix_caching`, `prefix_cache_block_size`,
+  `prefix_cache_max_blocks`, `prefix_cache_salt`, and
+  `prefix_cache_cache_decode_blocks`. They are not HF parameters.
 - `compressor_token_group_size` is for compressor token grouping.
   `deltakv_neighbor_count` is for selected reference/prototype count.
 - LLaVA `--deltakv_checkpoint_path none` plus `visual_uniform_keep` is not
@@ -125,6 +129,11 @@ user-facing runtime parameters.
 | `engine_prefill_chunk_size` | none | `chunk_prefill_size` | Sparse-vLLM scheduler chunk size. |
 | `visual_token_prune_only` | same | none | LLaVA visual-token-only cache dropping/pruning. |
 | `visual_token_keep_ratio` | same | none | LLaVA ratio of eligible visual tokens to keep. |
+| `enable_prefix_caching` | none | same | Enables Sparse-vLLM prompt prefix KV reuse for supported methods. |
+| `prefix_cache_block_size` | none | same | Prefix-cache hash/materialization block size. Defaults to 16 except QuEST. |
+| `prefix_cache_max_blocks` | none | same | Optional cap on live prefix-cache blocks; evicts only unreferenced leaf blocks. |
+| `prefix_cache_salt` | none | same | Extra fingerprint salt to isolate otherwise compatible cache entries. |
+| `prefix_cache_cache_decode_blocks` | none | same | Reserved switch for decode-token block caching; currently must be `false`. |
 
 Rejected legacy runtime names:
 
@@ -195,6 +204,79 @@ reporting benchmark results.
 Use `sparse_method="deltakv"` in new commands. Real Sparse-vLLM DeltaKV runs
 require a matching `deltakv_checkpoint_path`; missing checkpoints are only for
 construction-only tests that explicitly set `allow_missing_deltakv_path=True`.
+
+### 4.3 Sparse-vLLM Prefix Cache
+
+Prefix cache is a Sparse-vLLM engine feature, not a generic HF runtime feature.
+It reuses prompt KV blocks across requests within the same live engine process.
+It does not persist across process restarts.
+
+Supported methods:
+
+| `sparse_method` | Prefix-cache storage unit | Notes |
+| --- | --- | --- |
+| `vanilla` / `""` | token block | Uses `StandardCacheManager`. |
+| `omnikv` | token block | Reuses `StandardCacheManager`; fingerprint still includes `omnikv` settings. |
+| `quest` | QuEST page | Requires `prefix_cache_block_size == quest_chunk_size`. |
+
+Unsupported methods fail fast when `enable_prefix_caching=true`: StreamingLLM,
+attention-sink aliases, SnapKV, PyramidKV, and all DeltaKV-family methods. The
+unsupported methods physically prune, compress, reconstruct, or remap KV in
+ways that are not equivalent to reusing a complete prompt KV prefix.
+
+Parameter semantics:
+
+| Parameter | Meaning |
+| --- | --- |
+| `enable_prefix_caching` | Boolean or explicit true/false string. Enables scheduler lookup plus cache-manager attach/materialize/free/evict hooks. |
+| `prefix_cache_block_size` | Positive integer or `null`. Defaults to 16 for vanilla/OmniKV. For QuEST it resolves to `quest_chunk_size`; any different explicit value is rejected. |
+| `prefix_cache_max_blocks` | Optional positive integer cap. When set, insertions evict unreferenced leaf blocks only; referenced blocks are never evicted. |
+| `prefix_cache_salt` | String folded into the cache fingerprint. Use it to intentionally isolate runs that should not share cache entries. |
+| `prefix_cache_cache_decode_blocks` | Must be `false`; decode-token block caching is intentionally disabled until separately validated. |
+
+Correctness constraints:
+
+- Cache keys include model path, model type, dtype, tensor-parallel size, sparse
+  method, block size, salt, and method-specific sparse settings.
+- Full-prompt hits are not used directly; at least one suffix token is recomputed
+  so logits for the first generated token are produced normally.
+- Blocks are materialized only after all model layers have written KV for a
+  prefill forward.
+- Active cached blocks are refcounted and cannot be evicted or returned to the
+  free-slot/page pool while referenced.
+- `decode_cuda_graph=true` with prefix cache is rejected until that combination
+  is validated.
+
+For API serving, pass these as `--kebab-case` engine flags:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 MASTER_ADDR=127.0.0.1 MASTER_PORT=2346 \
+PYTHONPATH=src .venv/bin/python -m sparsevllm.entrypoints.openai.api_server \
+  --model /models/Qwen2.5-7B-Instruct-1M \
+  --served-model-name qwen25-7b-1m \
+  --sparse-method vanilla \
+  --enable-prefix-caching true \
+  --prefix-cache-block-size 16 \
+  --engine-prefill-chunk-size 4096 \
+  --max-model-len 32768 \
+  --max-num-batched-tokens 32768
+```
+
+For benchmark JSON, use the same snake_case field names:
+
+```json
+{
+  "sparse_method": "vanilla",
+  "enable_prefix_caching": true,
+  "prefix_cache_block_size": 16,
+  "prefix_cache_max_blocks": 4096,
+  "engine_prefill_chunk_size": 4096
+}
+```
+
+To measure prefix-cache benefit, send repeated requests with an identical prompt
+prefix to the same engine process. A benchmark that constructs a new engine for
+each sample will not measure cache reuse.
 
 ## 5. Unknown-Key Behavior
 
@@ -561,6 +643,11 @@ queueing, and whether a benchmark measures the intended batch.
 | `gpu_memory_utilization` | Sparse-vLLM | Fraction of total GPU memory used for cache planning. |
 | `tensor_parallel_size` | Sparse-vLLM | Number of TP ranks/processes. |
 | `num_kvcache_slots` | Sparse-vLLM | Optional explicit KV slot override. |
+| `enable_prefix_caching` | Sparse-vLLM | Enables prompt prefix KV reuse for vanilla, OmniKV, and QuEST only. |
+| `prefix_cache_block_size` | Sparse-vLLM | Prefix-cache block size; must equal `quest_chunk_size` for QuEST. |
+| `prefix_cache_max_blocks` | Sparse-vLLM | Optional live-block cap for prefix cache. |
+| `prefix_cache_salt` | Sparse-vLLM | Additional fingerprint salt for cache isolation. |
+| `prefix_cache_cache_decode_blocks` | Sparse-vLLM | Reserved; currently rejected when true. |
 | `admission_wave_size` | `scripts/benchmarks/bench_sparse_vllm.py` | Benchmark-only staged admission. |
 | `wave_decode_gap_steps` | `scripts/benchmarks/bench_sparse_vllm.py` | Benchmark-only delay before adding next wave. |
 | `max_decode_steps_after_full` | `scripts/benchmarks/bench_sparse_vllm.py` | Benchmark-only decode window cap after full admission. |
@@ -788,6 +875,11 @@ Important serving defaults:
 | `max_num_seqs_in_batch` | `32` | Inherited from `Config`. |
 | `max_decoding_seqs` | `64` | Inherited from `Config`. |
 | `engine_prefill_chunk_size` / `chunk_prefill_size` | `8192` | Use the semantic `--engine-prefill-chunk-size` on the CLI. |
+| `enable_prefix_caching` | `false` | Pass `--enable-prefix-caching true` to enable prompt prefix KV reuse. |
+| `prefix_cache_block_size` | `16` for vanilla/OmniKV, `quest_chunk_size` for QuEST | Use `--prefix-cache-block-size`; QuEST rejects values different from `quest_chunk_size`. |
+| `prefix_cache_max_blocks` | unset | Optional cache capacity cap. |
+| `prefix_cache_salt` | `""` | Optional cache fingerprint isolation salt. |
+| `prefix_cache_cache_decode_blocks` | `false` | Do not enable; true is rejected. |
 | `throughput_log_interval_s` | `0.0` in serving | The server disables periodic `Avg TP` logs by default and logs per request instead. Pass `--throughput-log-interval-s 10` to re-enable periodic throughput logs. |
 
 DeltaKV-family sparse methods are intentionally not exposed through the OpenAI
@@ -1090,6 +1182,11 @@ Before launching a run:
   `chunk_prefill_size` in new shared configs.
 - If `use_cluster=True`, set `deltakv_neighbor_count` explicitly.
 - If using Sparse-vLLM, convert all ratio budgets to token counts.
+- If using prefix cache, keep `sparse_method` in `vanilla`, `omnikv`, or
+  `quest`; keep `prefix_cache_cache_decode_blocks=false`; and disable
+  `decode_cuda_graph`.
+- For QuEST prefix cache, set `prefix_cache_block_size` equal to
+  `quest_chunk_size` or omit it.
 - If using LLaVA no-checkpoint path, label it as visual uniform pruning, not
   DeltaKV compressor inference.
 - Record whether `deltakv_latent_quant_bits=2` or `4` quantized latent state, raw KV, or residual.
