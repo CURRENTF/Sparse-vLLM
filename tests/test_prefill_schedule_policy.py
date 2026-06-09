@@ -90,6 +90,9 @@ class FakeMemoryOracle:
     def prompt_admission_budgets(self, waiting, chunk_prefill_size):
         return {"slots": self._free_slots}
 
+    def prompt_admission_free_slots(self):
+        return self._free_slots
+
     def prompt_admission_costs(self, seq):
         return {"slots": int(seq.num_prompt_tokens - seq.prefix_cache_hit_len)}
 
