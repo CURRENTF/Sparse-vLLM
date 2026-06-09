@@ -36,6 +36,8 @@ CANONICAL_SPARSE_METHODS = {
 SUPPORTED_SPARSE_METHODS = set(CANONICAL_SPARSE_METHODS)
 SUPPORTED_SPARSE_METHOD_ALIASES = {str(k) for k in METHOD_ALIASES if k is not None and str(k)}
 
+PREFIX_CACHE_SUPPORTED_METHODS = {"", "omnikv", "quest"}
+
 # All shipped cache managers now expose a graph-stable decode preparation path.
 DECODE_CUDA_GRAPH_SUPPORTED_METHODS = set(CANONICAL_SPARSE_METHODS)
 
