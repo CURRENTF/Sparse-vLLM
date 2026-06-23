@@ -25,12 +25,15 @@ from sparsevllm import LLM, SamplingParams
 def _load_json_arg(value: str | None) -> dict[str, Any]:
     if not value:
         return {}
-    path = Path(value)
-    if path.exists():
+    stripped = value.strip()
+    if stripped.startswith("{"):
+        data = json.loads(stripped)
+    else:
+        path = Path(value)
+        if not path.exists():
+            raise FileNotFoundError(f"--engine-kwargs path does not exist: {value}")
         with path.open("r", encoding="utf-8") as f:
             data = json.load(f)
-    else:
-        data = json.loads(value)
     if not isinstance(data, dict):
         raise ValueError("--engine-kwargs must resolve to a JSON object")
     return data
@@ -145,8 +148,6 @@ class SparseVLLMOpenAIServer:
             json.dump(payload, f, ensure_ascii=False, indent=2)
 
     def chat_completion(self, request: dict[str, Any]) -> dict[str, Any]:
-        if request.get("stream", False):
-            raise ValueError("stream=true is not supported by Sparse-vLLM OpenAI shim")
         if int(request.get("n", 1)) != 1:
             raise ValueError("Only n=1 is supported")
         if request.get("tools") and request.get("tool_choice") not in (None, "none"):
@@ -208,6 +209,51 @@ class SparseVLLMOpenAIServer:
         }
 
 
+def _stream_chunks(response: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return OpenAI-compatible SSE chunks after full Sparse-vLLM generation."""
+    choice = response["choices"][0]
+    message = choice["message"]
+    base = {
+        "id": response["id"],
+        "object": "chat.completion.chunk",
+        "created": response["created"],
+        "model": response["model"],
+    }
+    return [
+        {
+            **base,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"role": "assistant"},
+                    "finish_reason": None,
+                }
+            ],
+        },
+        {
+            **base,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"content": message["content"]},
+                    "finish_reason": None,
+                }
+            ],
+        },
+        {
+            **base,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": choice["finish_reason"],
+                }
+            ],
+            "usage": response["usage"],
+        },
+    ]
+
+
 def _make_handler(server_state: SparseVLLMOpenAIServer):
     class Handler(BaseHTTPRequestHandler):
         server_version = "SparseVLLMOpenAI/0.1"
@@ -219,6 +265,18 @@ def _make_handler(server_state: SparseVLLMOpenAIServer):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+
+        def _send_sse(self, response: dict[str, Any]) -> None:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            for chunk in _stream_chunks(response):
+                data = json.dumps(chunk, ensure_ascii=False).encode("utf-8")
+                self.wfile.write(b"data: " + data + b"\n\n")
+                self.wfile.flush()
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
 
         def _read_json_body(self) -> dict[str, Any]:
             length = int(self.headers.get("Content-Length", "0"))
@@ -271,7 +329,10 @@ def _make_handler(server_state: SparseVLLMOpenAIServer):
                         "response": response,
                     }
                 )
-                self._send_json(200, response)
+                if request.get("stream", False):
+                    self._send_sse(response)
+                else:
+                    self._send_json(200, response)
             except FileNotFoundError as exc:
                 self._send_json(404, {"error": {"message": str(exc)}})
             except Exception as exc:

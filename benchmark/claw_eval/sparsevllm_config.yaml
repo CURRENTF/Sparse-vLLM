@@ -10,7 +10,7 @@ model:
 
 judge:
   api_key: ${OPENROUTER_API_KEY}
-  base_url: https://openrouter.ai/api/v1
+  base_url: ${CLAW_EVAL_JUDGE_BASE_URL}
   model_id: ${CLAW_EVAL_JUDGE_MODEL}
   enabled: true
 
