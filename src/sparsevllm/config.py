@@ -10,7 +10,7 @@ from sparsevllm.method_registry import (
     normalize_sparse_method,
     resolve_prefill_schedule_policy,
 )
-from sparsevllm.utils.log import logger
+from sparsevllm.utils.log import logger, log_once
 
 try:
     from transformers import Qwen3Config
@@ -467,6 +467,11 @@ class Config:
             setattr(self, attr, v if v else "auto")
 
         if self.vllm_sparse_method == "deltakv":
+            log_once(
+                "DeltaKV support in Sparse-vLLM is still experimental and not fully mature; "
+                "verify results carefully before treating them as final.",
+                level="WARNING",
+            )
             if not bool(getattr(self, "use_compression", True)):
                 raise ValueError("DeltaKV runtime is compressor-only; set use_compression=True.")
             if bool(getattr(self, "enable_sparse_ref_fp8", False)):
