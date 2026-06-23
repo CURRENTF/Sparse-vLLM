@@ -340,6 +340,226 @@ Source artifacts:
 [`status.tsv`](/root/autodl-tmp/outputs/deltakv/qwen25_7b_svllm_vanilla_deltakv_maxbs_decode_20260620_after_scbench_d0p1_retry/status.tsv),
 [`deltakv_len65536_bs1.log`](/root/autodl-tmp/outputs/deltakv/qwen25_7b_svllm_vanilla_deltakv_maxbs_decode_20260620_after_scbench_d0p1_retry/logs/deltakv_len65536_bs1.log).
 
+### 2026-06-24 Qwen2.5 7B Vanilla 128k No-Graph Full-Output Sweep
+
+This was an ad hoc Sparse-VLLM vanilla throughput check on
+`guest-KR6288-X2-A0-R0-00`, GPU4. The user target was no decode CUDA graph,
+`128k` prompt length, max batch size `4`, and `512` output tokens per request.
+The max-batch sweep tested batch sizes `1`, `2`, and `4`; because `bs4`
+succeeded, the result is a lower bound rather than the true maximum batch size.
+
+- status: completed, `EXIT_CODE=0`
+- run root:
+  `/data2/haojitai/outputs/deltakv/sparsevllm_max_batch_throughput/qwen25_7b_vanilla_nograph_128k_fullout512_maxbs4_gpu4_20260624`
+- launcher (local file ignored by `.gitignore`):
+  `scripts/tmp/run_qwen25_7b_vanilla_nograph_128k_out512_maxbs4_gpu4.sh`
+- model:
+  `/data2/haojitai/models/Qwen2.5-7B-Instruct-1M`
+- code:
+  `codex/svllm-throughput` / `f9b712a4b096015abbc4b046596f157443bc4531`;
+  worktree clean at launch
+- environment:
+  Python `3.10.20`, Torch `2.8.0+cu128`, H100 80GB GPU4
+- common settings:
+  `--methods vanilla`, `--lengths 128000`, `--max_batch_size 4`,
+  `--output_len 512`, `--max_decode_steps_after_full 0`,
+  `--disable_decode_cuda_graph`, `engine_prefill_chunk_size=8192`,
+  `max_num_batched_tokens=65536`, `gpu_memory_utilization=0.9`
+
+Command:
+
+```bash
+/home/haojitai/miniconda3/envs/svllm/bin/python -u scripts/benchmarks/run_sparsevllm_max_batch_throughput.py \
+  --model_path /data2/haojitai/models/Qwen2.5-7B-Instruct-1M \
+  --compressor_path /data2/haojitai/checkpoints/compressor/Qwen2.5-7B-Instruct-1M-Compressor \
+  --methods vanilla \
+  --lengths 128000 \
+  --gpus 4 \
+  --output_root /data2/haojitai/outputs/deltakv/sparsevllm_max_batch_throughput \
+  --run_id qwen25_7b_vanilla_nograph_128k_fullout512_maxbs4_gpu4_20260624 \
+  --max_batch_size 4 \
+  --output_len 512 \
+  --max_decode_steps_after_full 0 \
+  --probe_timeout_s 3600 \
+  --gpu_memory_utilization 0.9 \
+  --engine_prefill_chunk_size 8192 \
+  --mlp_chunk_size 16384 \
+  --max_num_batched_tokens 65536 \
+  --disable_decode_cuda_graph \
+  --master_port_base 29800
+```
+
+| BS | Status | Decode tok/s | Prefill tok/s | TTFT s | ITL ms | Avg BS | Mem GB | Full admission | Preemptions | Decode graph active |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | --- |
+| 1 | SUCCESS | 28.267 | 9066.9 | 14.118 | 35.38 | 0.998 | 71.522 | yes | 0 | no |
+| 2 | SUCCESS | 56.716 | 9182.5 | 27.880 | 35.26 | 1.996 | 72.375 | yes | 0 | no |
+| 4 | SUCCESS | 100.076 | 9246.0 | 36.360 | 39.97 | 3.992 | 72.690 | yes | 0 | no |
+
+Source artifacts:
+[`summary.json`](/data2/haojitai/outputs/deltakv/sparsevllm_max_batch_throughput/qwen25_7b_vanilla_nograph_128k_fullout512_maxbs4_gpu4_20260624/summary.json),
+[`summary.md`](/data2/haojitai/outputs/deltakv/sparsevllm_max_batch_throughput/qwen25_7b_vanilla_nograph_128k_fullout512_maxbs4_gpu4_20260624/summary.md),
+[`status.tsv`](/data2/haojitai/outputs/deltakv/sparsevllm_max_batch_throughput/qwen25_7b_vanilla_nograph_128k_fullout512_maxbs4_gpu4_20260624/status.tsv),
+[`bs4 result.jsonl`](/data2/haojitai/outputs/deltakv/sparsevllm_max_batch_throughput/qwen25_7b_vanilla_nograph_128k_fullout512_maxbs4_gpu4_20260624/probes/vanilla/len128000/bs4/result.jsonl).
+
+The first launcher attempt at
+`/data2/haojitai/outputs/deltakv/sparsevllm_max_batch_throughput/qwen25_7b_vanilla_nograph_128k_out512_maxbs4_gpu4_20260624`
+was aborted manually and is not a comparable result: it used
+`max_decode_steps_after_full=64`, so it only measured a 64-step decode window
+despite passing `--output_len 512`.
+
+### 2026-06-24 Qwen2.5 7B Vanilla Commit Throughput Scan
+
+This was a commit-dimension throughput scan after the user clarified that
+"bisect" meant moving backward through commits, not searching for max batch
+size. Each successful row used the same benchmark shape: `GPU4`,
+`Qwen2.5-7B-Instruct-1M`, Sparse-VLLM `vanilla`, no decode CUDA graph,
+prompt length `128000`, batch size `4`, `output_len=512`, and
+`max_decode_steps_after_full=0`.
+
+- status: completed, `EXIT_CODE=0`
+- run root:
+  `/data2/haojitai/outputs/deltakv/svllm_commit_throughput/qwen25_7b_vanilla_nograph_128k_bs4_out512_commit_scan_gpu4_20260624`
+- launcher (local file ignored by `.gitignore`):
+  `scripts/tmp/run_svllm_vanilla_commit_scan_gpu4.sh`
+- model:
+  `/data2/haojitai/models/Qwen2.5-7B-Instruct-1M`
+- environment:
+  Python `3.10.20`, Torch `2.8.0+cu128`, H100 80GB GPU4
+- common runtime params:
+  `enforce_eager=false`, `gpu_memory_utilization=0.9`,
+  `engine_prefill_chunk_size=8192`, `max_num_batched_tokens=65536`,
+  `max_num_seqs_in_batch=4`, `max_decoding_seqs=4`,
+  `mlp_chunk_size=16384`
+
+| Commit | Subject | Status | Decode tok/s | Prefill tok/s | TTFT s | ITL ms | Avg BS | Mem GB |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `f9b712a` | Warn about experimental DeltaKV support | SUCCESS | 100.225 | 9245.916 | 36.344 | 39.910 | 3.992 | 72.690 |
+| `1113e37` | chore: import sparsevllm snapshot with pruned docs | SUCCESS | 100.222 | 9237.617 | 36.352 | 39.911 | 3.992 | 72.690 |
+| `30e62e4` | Remove tracked .DS_Store files | SUCCESS | 134.720 | 9232.550 | 36.370 | 29.690 | 4.000 | 72.690 |
+| `50131ee` | Support PyramidKV full-prefill staging | SUCCESS | 147.390 | 9229.740 | 36.400 | 27.140 | 4.000 | 72.690 |
+| `b0aa540` | Enable decode CUDA graphs for sparse methods | SUCCESS | 155.130 | 9277.120 | 36.200 | 25.780 | 4.000 | 72.690 |
+| `774a71e` | Add decode CUDA graph batch padding | SUCCESS | 154.360 | 9273.750 | 36.210 | 25.910 | 4.000 | 72.690 |
+| `d5aacd1` | Optimize OmniKV decode with CUDA graph prewarm | SUCCESS | 154.540 | 9257.120 | 36.290 | 25.880 | 4.000 | 72.690 |
+| `e329ce6` | Optimize OmniKV decode bookkeeping | SUCCESS | 153.530 | 9165.610 | 36.870 | 26.050 | 4.000 | 72.690 |
+| `44e26e8` | Implement prefill scheduling policy | SUCCESS | 144.860 | 8974.680 | 37.970 | 27.610 | 4.000 | 72.690 |
+
+Interpretation:
+
+- `f9b712a` and `1113e37` are effectively identical for this vanilla
+  throughput case, so the latest warning-only commit did not cause the drop.
+- The major observed drop is between `30e62e4` (`134.720` tok/s) and
+  `1113e37` (`100.222` tok/s). That interval is not fine-bisectable on this
+  branch because `1113e37` is a large imported snapshot touching
+  `scripts/benchmarks/bench_sparse_vllm.py`, scheduler/model runner/cache
+  manager paths, attention kernels, and Sparse-VLLM model files.
+- `50131ee..30e62e4` changes only `src/sparsevllm/.DS_Store`, so the
+  `147.390 -> 134.720` difference should be treated as a measurement point that
+  may need repeat sampling, not as a source-code causal claim.
+- `d5aacd1` was corrected with a second run at
+  `cases/6b_d5aacd1_corrected`; it lands in the same throughput band as
+  `774a71e` and `e329ce6`. The first invalid probe remains at `cases/6_d5aacd1`
+  and only failed because that older commit did not yet have the generic
+  `decode_cuda_graph` config key.
+
+Source artifacts:
+[`summary.md`](/data2/haojitai/outputs/deltakv/svllm_commit_throughput/qwen25_7b_vanilla_nograph_128k_bs4_out512_commit_scan_gpu4_20260624/summary.md),
+[`summary.json`](/data2/haojitai/outputs/deltakv/svllm_commit_throughput/qwen25_7b_vanilla_nograph_128k_bs4_out512_commit_scan_gpu4_20260624/summary.json),
+[`status.tsv`](/data2/haojitai/outputs/deltakv/svllm_commit_throughput/qwen25_7b_vanilla_nograph_128k_bs4_out512_commit_scan_gpu4_20260624/status.tsv).
+
+### 2026-06-24 Qwen2.5 7B Vanilla Decode Regression Diagnosis
+
+This diagnosis investigated whether the no-graph vanilla throughput drop was
+caused by CUDA graph support. It used temporary detached worktrees under
+`/data2/haojitai/outputs/deltakv/svllm_commit_throughput/diagnostics_*` and
+kept the formal benchmark shape unchanged unless noted.
+
+Diagnostic results:
+
+| Probe | Variant | Decode tok/s | Finding |
+| --- | --- | ---: | --- |
+| baseline | `f9b712a`, no graph | 100.225 | Reproduces the slow current path. |
+| path A/B | `f9b712a` with no-graph decode forced back to the ordinary eager branch | 99.840 | Static runner dispatch is not the main cause. |
+| layernorm A/B | `f9b712a` with `RMSNorm` reverted to the `30e62e4` implementation | 102.300 | The graph-capture-friendly RMSNorm change is not the main cause. |
+| scalar-check A/B | `f9b712a` with two decode-time `.max().item()` bounds checks removed | 145.680 | The CPU scalar reads explain most of the regression. |
+
+Profiler evidence:
+
+- Built-in profiler on 64 decode steps with `CUDA_SYNC_SVLLM=1` showed
+  `model_run_model_decode` increased from `25.810 ms/step` at `30e62e4` to
+  `40.521 ms/step` at `f9b712a`; `cache_prepare_decode` decreased from
+  `4.198 ms/step` to `0.301 ms/step`, so the regression is inside model
+  forward, not scheduling or cache preparation.
+- `torch.profiler` over 16 decode steps showed the main CUDA kernels were
+  effectively unchanged: GQA stage1 was `~165 ms/16 steps`, stage2 was
+  `~29.5 ms/16 steps`, and GEMM was `~79 ms/16 steps` in both commits.
+- The new path added `aten::item` / `_local_scalar_dense` calls:
+  `896` calls over `16` decode steps, which equals `16 steps * 28 layers * 2`
+  scalar reads. They cost `~157 ms` CPU time over those `16` steps, or about
+  `9.8 ms/step`, matching the observed decode-time regression.
+
+Concrete source locations in `f9b712a`:
+
+- `src/sparsevllm/layers/attention.py`: the decode branch reads
+  `decode_view.context_lens.max().item()` for a bounds check on every layer and
+  decode step.
+- `src/sparsevllm/triton_kernel/flash_decoding_stage2.py`: `flash_decode_stage2`
+  reads `B_Seqlen.max().item()` for another bounds check on every layer and
+  decode step.
+
+Conclusion:
+
+The regression is not caused by enabling CUDA graphs. Earlier commits that
+already include decode CUDA graph support (`b0aa540`, `774a71e`, `d5aacd1`) are
+still in the `154-155 tok/s` band when `decode_cuda_graph=false`. The measured
+drop in `1113e37`/`f9b712a` is mainly caused by graph/static-decode safety
+checks that still execute on the no-graph vanilla path and force repeated
+GPU-to-CPU scalar synchronization.
+
+Diagnostic artifacts:
+[`f9_restore_ordinary_eager_decode`](/data2/haojitai/outputs/deltakv/svllm_commit_throughput/qwen25_7b_vanilla_nograph_128k_bs4_out512_commit_scan_gpu4_20260624/diagnostics/f9_restore_ordinary_eager_decode/run.log),
+[`f9_old_layernorm_only`](/data2/haojitai/outputs/deltakv/svllm_commit_throughput/qwen25_7b_vanilla_nograph_128k_bs4_out512_commit_scan_gpu4_20260624/diagnostics/f9_old_layernorm_only/run.log),
+[`profiler_64steps`](/data2/haojitai/outputs/deltakv/svllm_commit_throughput/qwen25_7b_vanilla_nograph_128k_bs4_out512_commit_scan_gpu4_20260624/diagnostics/profiler_64steps),
+[`torch_profiler_decode16`](/data2/haojitai/outputs/deltakv/svllm_commit_throughput/qwen25_7b_vanilla_nograph_128k_bs4_out512_commit_scan_gpu4_20260624/diagnostics/torch_profiler_decode16),
+[`f9_removed_decode_item_checks`](/data2/haojitai/outputs/deltakv/svllm_commit_throughput/qwen25_7b_vanilla_nograph_128k_bs4_out512_commit_scan_gpu4_20260624/diagnostics/f9_removed_decode_item_checks/run.log).
+
+### 2026-06-24 Decode Bounds Check Fix Validation
+
+The fix gates the decode-time GPU-to-CPU scalar bounds checks behind
+`SVLLM_DEBUG_DECODE_BOUNDS=1`. Default decode no longer calls
+`context_lens.max().item()` in `src/sparsevllm/layers/attention.py` or
+`B_Seqlen.max().item()` in `src/sparsevllm/triton_kernel/flash_decoding_stage2.py`;
+the debug path still performs the checks when explicitly requested.
+
+- status: completed, all cases exited successfully
+- run root:
+  `/data2/haojitai/outputs/deltakv/svllm_decode_bounds_fix_validation_20260624`
+- model:
+  `/data2/haojitai/models/Qwen2.5-7B-Instruct-1M`
+- environment:
+  `guest-KR6288-X2-A0-R0-00`, GPU4, conda env `svllm`
+- common runtime params:
+  Sparse-VLLM `vanilla`, `enforce_eager=false`,
+  `engine_prefill_chunk_size=8192`, `gpu_memory_utilization=0.9`,
+  `max_num_batched_tokens=65536`, `max_num_seqs_in_batch=4`,
+  `max_decoding_seqs=4`, `mlp_chunk_size=16384`
+
+| Case | Decode graph | Debug bounds | Context | BS | Output tokens | Decode tok/s | Status |
+| --- | --- | --- | ---: | ---: | ---: | ---: | --- |
+| `smoke_len4096_bs1_out16` | false | off | 4096 | 1 | 16 | 16.26 | SUCCESS |
+| `smoke_len8192_bs2_out16` | false | off | 8192 | 2 | 16 | 64.19 | SUCCESS |
+| `smoke_len16384_bs4_out16` | false | off | 16384 | 4 | 16 | 123.21 | SUCCESS |
+| `debug_bounds_len4096_bs2_out8` | false | on | 4096 | 2 | 8 | 36.01 | SUCCESS |
+| `perf_len128000_bs4_out512` | false | off | 128000 | 4 | 512 | 147.07 | SUCCESS |
+| `graph_smoke_len4096_bs2_out8` | true | off | 4096 | 2 | 8 | 55.01 | SUCCESS |
+
+Source artifacts:
+[`smoke_len4096_bs1_out16`](/data2/haojitai/outputs/deltakv/svllm_decode_bounds_fix_validation_20260624/smoke_len4096_bs1_out16/run.log),
+[`smoke_len8192_bs2_out16`](/data2/haojitai/outputs/deltakv/svllm_decode_bounds_fix_validation_20260624/smoke_len8192_bs2_out16/run.log),
+[`smoke_len16384_bs4_out16`](/data2/haojitai/outputs/deltakv/svllm_decode_bounds_fix_validation_20260624/smoke_len16384_bs4_out16/run.log),
+[`debug_bounds_len4096_bs2_out8`](/data2/haojitai/outputs/deltakv/svllm_decode_bounds_fix_validation_20260624/debug_bounds_len4096_bs2_out8/run.log),
+[`perf_len128000_bs4_out512`](/data2/haojitai/outputs/deltakv/svllm_decode_bounds_fix_validation_20260624/perf_len128000_bs4_out512/run.log),
+[`graph_smoke_len4096_bs2_out8`](/data2/haojitai/outputs/deltakv/svllm_decode_bounds_fix_validation_20260624/graph_smoke_len4096_bs2_out8/run.log).
+
 ## OmniKV Full-Layer Selection
 
 OmniKV full layers are model-specific. Use

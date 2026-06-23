@@ -1,3 +1,5 @@
+import os
+
 import torch
 from torch import nn
 
@@ -132,7 +134,10 @@ class Attention(nn.Module):
                 max_len_in_batch = int(max_context_len)
                 if decode_view.active_slots.dim() == 2:
                     slot_table_len = int(decode_view.active_slots.shape[1])
-                    if not (torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()):
+                    if (
+                        os.environ.get("SVLLM_DEBUG_DECODE_BOUNDS", "0") == "1"
+                        and not (torch.cuda.is_available() and torch.cuda.is_current_stream_capturing())
+                    ):
                         actual_max_len = int(decode_view.context_lens.max().item()) if decode_view.context_lens.numel() > 0 else 0
                         if actual_max_len > slot_table_len:
                             raise RuntimeError(
