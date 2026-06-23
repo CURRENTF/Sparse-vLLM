@@ -228,6 +228,31 @@ For a full LongBench run, omit `--task`. To switch to DeltaKV, keep
 For the no-checkpoint direct residual ablation, set
 `sparse_method="deltakv-less-memory"` and omit `deltakv_checkpoint_path`.
 
+#### Claw-Eval with a local Sparse-vLLM OpenAI API
+
+Claw-Eval drives models through an OpenAI-compatible chat API. This repo
+provides a text-only Sparse-vLLM shim at
+`benchmark/claw_eval/serve_sparsevllm_openai.py` and a reproducible runner at
+`benchmark/claw_eval/run_sparsevllm_claw_eval.sh`.
+
+On the `guest-KR6288` evaluation host, the runner defaults to GPUs `4,5,6`,
+writes logs/traces under `/data2/haojitai/outputs/Sparse-vLLM/claw-eval`, and
+uses the Clash download-only proxy on `127.0.0.1:7898` for Claw-Eval cloning,
+fixtures, and package downloads.
+The default `ENGINE_KWARGS` uses `tensor_parallel_size=1`; increase it only for
+models whose tensor-parallel dimensions divide evenly across the requested GPUs.
+
+```bash
+OPENROUTER_API_KEY=... \
+MODEL_PATH=/data2/haojitai/models/Qwen2.5-7B-Instruct-1M \
+ENGINE_KWARGS='{"tensor_parallel_size":1,"gpu_memory_utilization":0.88,"max_model_len":131072,"engine_prefill_chunk_size":4096,"sparse_method":"vanilla"}' \
+bash benchmark/claw_eval/run_sparsevllm_claw_eval.sh
+```
+
+The shim supports text chat completions only. It explicitly rejects streaming,
+server-side tool/function calling, and multimodal content so unsupported
+Claw-Eval splits fail visibly instead of producing misleading scores.
+
 #### LongBench with HF wrappers
 
 Use the HF backend when you want to compare against the DeltaKV / SnapKV / PyramidKV wrapper models implemented under `src/deltakv/`.
