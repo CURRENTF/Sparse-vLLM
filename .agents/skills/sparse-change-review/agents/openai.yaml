@@ -1,0 +1,7 @@
+interface:
+  display_name: "Sparse Change Review"
+  short_description: "Mandatory subagent review for Sparse-vLLM diffs"
+  default_prompt: "Use $sparse-change-review to review the current Sparse-vLLM diff with a mandatory independent subagent pass."
+
+policy:
+  allow_implicit_invocation: true
