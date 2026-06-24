@@ -141,11 +141,13 @@ class CacheManager(ABC):
         # 动态估计 max_num_batched_tokens
         reserved_mem = total * (1 - config.gpu_memory_utilization)
         intermediate_size = getattr(hf_config, "intermediate_size", hf_config.hidden_size * 4)
+        # MLP TP layers already assert intermediate_size is divisible by world_size.
+        intermediate_size_per_rank = intermediate_size // self.world_size
         dtype_size = torch.tensor([], dtype=hf_config.torch_dtype).element_size()
 
         # Keep this heuristic conservative: large prefill batches can still peak on
         # MLP activations and allocator fragmentation after KV cache allocation.
-        estimated_max_tokens = int(reserved_mem / (intermediate_size * dtype_size * 10))
+        estimated_max_tokens = int(reserved_mem / (intermediate_size_per_rank * dtype_size * 10))
         assert 2 * config.chunk_prefill_size < estimated_max_tokens, (
             f"{2 * config.chunk_prefill_size} >= {estimated_max_tokens}"
         )
