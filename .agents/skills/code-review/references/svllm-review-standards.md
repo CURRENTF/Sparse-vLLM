@@ -9,6 +9,7 @@ Use these checks for Sparse-vLLM's Python/Triton research engine.
 - `SparseController` owns cross-layer observation, attention-score collection, and scheduler-facing coordination, not method-owned cache metadata.
 - Public APIs should use `sparse_method`; Sparse-vLLM normalizes to internal `vllm_sparse_method`.
 - New first-class methods should update config, `method_registry.py`, cache-manager routing, exports, docs, and policy tests.
+- DeltaKV-family runtime behavior should stay cache-manager-first. Review method state in `src/sparsevllm/engine/cache_manager/`, not ad hoc branches in `attention.py`, `utils/`, or benchmark scripts.
 
 Flag method logic hidden in `utils/`, method branches added directly to `attention.py`, or benchmark scripts redefining method semantics.
 
@@ -29,6 +30,19 @@ Cache-manager capacity hooks must agree: `num_free_slots`, `reserved_prefill_slo
 
 Prefer fail-fast errors with method/cache-manager name, prompt length, needed/free slots, and budgets.
 
+## OpenAI-Compatible Serving
+
+Serving changes must preserve Sparse-vLLM engine semantics instead of adding server-only execution paths.
+
+- Request JSON should reject unknown fields and validate `model`, `n`, `max_tokens`, `temperature`, `top_p`, `top_k`, `stop`, and `logprobs` before entering the engine.
+- `CompletionRequest` and chat request handling should map directly to `SamplingParams`; sampler changes need coverage for greedy, top-p, top-k, and logprob behavior.
+- Request admission, cancellation, streaming disconnects, and non-streaming errors must call `abort_request(...)` or otherwise release owned KV slots. Finished requests should use the engine's normal free path.
+- Streaming responses must emit valid SSE frames, terminate with `data: [DONE]`, and avoid exposing partial stop text or inconsistent logprobs.
+- DeltaKV-family methods must stay disabled for OpenAI serving unless serving correctness and memory behavior are explicitly validated.
+- Per-request logging should report prompt/completion/total tokens and bounded TPS metrics without per-token noise or unbounded background loops.
+
+Expected focused coverage: `tests/test_openai_api_server.py` for request validation, lifecycle, streaming, cancellation, and logprobs; `tests/test_sampler.py` for sampling contract changes.
+
 ## Research Reliability
 
 Evaluation and benchmark code must not hide failures.
@@ -48,6 +62,7 @@ Expected validation:
 - Python changes: `python -m py_compile` touched files.
 - Scheduler/policy changes: `tests/test_prefill_schedule_policy.py`.
 - Runtime parameter changes: `tests/test_runtime_param_normalization.py`.
+- OpenAI serving or sampler changes: `tests/test_openai_api_server.py` and `tests/test_sampler.py`.
 - Research fail-fast changes: `tests/test_research_fail_fast.py`.
 - Sparse method changes: one correctness-oriented run before throughput benchmarks.
 

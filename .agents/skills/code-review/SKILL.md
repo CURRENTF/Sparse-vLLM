@@ -27,6 +27,8 @@ Read [svllm-review-standards.md](references/svllm-review-standards.md).
 
 For sparse-method additions or refactors, also read [`$add-sparse-method`](../add-sparse-method/SKILL.md). For policy changes, inspect `src/sparsevllm/method_registry.py`, `src/sparsevllm/engine/scheduler.py`, and `tests/test_prefill_schedule_policy.py`.
 
+For OpenAI-compatible serving or client changes, inspect `src/sparsevllm/entrypoints/openai/api_server.py`, `src/sparsevllm/entrypoints/openai/client.py`, `src/sparsevllm/sampling_params.py`, `src/sparsevllm/layers/sampler.py`, and `tests/test_openai_api_server.py`.
+
 ### Step 3: Review
 
 Prioritize:
@@ -34,6 +36,7 @@ Prioritize:
 - inference correctness and tensor/cache invariants
 - Sparse-vLLM architecture boundaries
 - prefill policy, long/short split, and `long_bs1full_short_batch`
+- OpenAI-compatible request lifecycle, streaming, cancellation, and sampling contracts
 - research reproducibility and fail-fast behavior
 - hot-path performance and tests
 
