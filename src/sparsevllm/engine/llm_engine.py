@@ -291,13 +291,44 @@ class LLMEngine:
         if hasattr(self, "_throughput_logger"):
             self._throughput_logger.stop()
         if hasattr(self, "model_runner"):
-            self.model_runner.call("exit")
+            model_runner = self.model_runner
+            timeout_s = float(os.getenv("SPARSEVLLM_ENGINE_EXIT_TIMEOUT_S", "10"))
+            errors: list[BaseException] = []
+
+            def call_model_runner_exit():
+                try:
+                    model_runner.call("exit")
+                except BaseException as exc:  # pragma: no cover - surfaced by warning below.
+                    errors.append(exc)
+
+            exit_thread = threading.Thread(
+                target=call_model_runner_exit,
+                name="sparsevllm-engine-exit",
+                daemon=True,
+            )
+            exit_thread.start()
+            exit_thread.join(timeout=max(0.0, timeout_s))
+            if exit_thread.is_alive():
+                logger.warning(
+                    "Timed out waiting {:.1f}s for ModelRunner exit RPC; terminating workers.",
+                    timeout_s,
+                )
+            elif errors:
+                logger.warning("ModelRunner exit RPC failed during shutdown: {}", repr(errors[0]))
             del self.model_runner
         if hasattr(self, "ps"):
+            join_timeout_s = float(os.getenv("SPARSEVLLM_WORKER_JOIN_TIMEOUT_S", "5"))
             for p in self.ps:
                 if p.is_alive():
                     p.terminate()
-                p.join()
+                p.join(timeout=max(0.0, join_timeout_s))
+                if p.is_alive():
+                    logger.warning(
+                        "Worker process pid={} did not stop after terminate; killing.",
+                        p.pid,
+                    )
+                    p.kill()
+                    p.join(timeout=max(0.0, join_timeout_s))
 
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
         """将一个新的推理请求加入系统"""

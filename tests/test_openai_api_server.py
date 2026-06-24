@@ -1,6 +1,7 @@
 import asyncio
 import importlib.util
 import json
+import os
 from pathlib import Path
 import threading
 import time
@@ -194,6 +195,57 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(engine.aborted, [123])
         finally:
             dispatcher.close()
+
+    async def test_dispatcher_close_times_out_blocked_step_and_exits_engine(self):
+        from sparsevllm.entrypoints.openai.api_server import AsyncEngineDispatcher
+
+        class Tokenizer:
+            def encode(self, _prompt):
+                return [1]
+
+            def decode(self, token_ids, skip_special_tokens=True):
+                return "".join(str(token_id) for token_id in token_ids)
+
+        class Engine:
+            tokenizer = Tokenizer()
+
+            def __init__(self):
+                self.step_started = threading.Event()
+                self.release_step = threading.Event()
+                self.exited = threading.Event()
+                self.last_step_token_outputs = []
+                self.last_step_logprob_outputs = []
+                self.aborted = []
+
+            def add_request(self, _prompt, _sampling_params):
+                return 123
+
+            def step(self):
+                self.step_started.set()
+                self.release_step.wait()
+                return [], 0
+
+            def abort_request(self, seq_id):
+                self.aborted.append(seq_id)
+
+            def exit(self):
+                self.exited.set()
+
+        engine = Engine()
+        dispatcher = AsyncEngineDispatcher(engine)
+        try:
+            await dispatcher.submit("prompt", type("Sampling", (), {"max_tokens": 1000})(), 0)
+            self.assertTrue(await asyncio.to_thread(engine.step_started.wait, 2))
+            with patch.dict(os.environ, {"SPARSEVLLM_OPENAI_SHUTDOWN_TIMEOUT_S": "0.05"}):
+                started = time.perf_counter()
+                dispatcher.close()
+                elapsed = time.perf_counter() - started
+            self.assertLess(elapsed, 1.0)
+            self.assertTrue(engine.exited.is_set())
+            self.assertTrue(dispatcher._thread.is_alive())
+        finally:
+            engine.release_step.set()
+            dispatcher._thread.join(timeout=1.0)
 
     async def test_completion_route_error_cancels_sibling_handles(self):
         from fastapi import HTTPException

@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import json
+import os
 import queue
 import threading
 import time
@@ -156,7 +157,13 @@ class AsyncEngineDispatcher:
     def close(self):
         self._closing.set()
         self._pending.put(None)
-        self._thread.join()
+        timeout_s = float(os.getenv("SPARSEVLLM_OPENAI_SHUTDOWN_TIMEOUT_S", "5"))
+        self._thread.join(timeout=max(0.0, timeout_s))
+        if self._thread.is_alive():
+            logger.warning(
+                "OpenAI dispatcher did not stop within {:.1f}s; forcing engine shutdown.",
+                timeout_s,
+            )
         self.engine.exit()
 
     def _put(self, request: _ActiveRequest | _QueuedRequest, item: dict[str, Any]):
