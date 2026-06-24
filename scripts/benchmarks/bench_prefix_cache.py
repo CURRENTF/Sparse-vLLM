@@ -82,6 +82,107 @@ class RequestState:
     error_message: str = ""
 
 
+def _cache_hit_metric_error(
+    spec: RequestSpec,
+    *,
+    cached_tokens: int,
+    cached_blocks: int,
+    block_size: int,
+) -> str:
+    if cached_tokens < 0:
+        return f"runtime reported negative cached_tokens={cached_tokens}."
+    if cached_blocks < 0:
+        return f"runtime reported negative cached_blocks={cached_blocks}."
+    if cached_tokens == 0 and cached_blocks == 0:
+        return ""
+    if block_size <= 0:
+        return f"invalid prefix cache block_size={block_size}."
+    if cached_tokens % block_size != 0:
+        return (
+            f"cached_tokens={cached_tokens} is not aligned to prefix cache block_size={block_size}."
+        )
+    if cached_blocks * block_size != cached_tokens:
+        return (
+            f"cached_blocks={cached_blocks} does not match cached_tokens={cached_tokens} "
+            f"with block_size={block_size}."
+        )
+    if cached_tokens > int(spec.eligible_cache_tokens):
+        return (
+            f"cached_tokens={cached_tokens} exceeds planned_eligible_cache_tokens="
+            f"{int(spec.eligible_cache_tokens)}."
+        )
+    if cached_tokens > int(spec.expected_reuse_tokens):
+        return (
+            f"cached_tokens={cached_tokens} exceeds expected_reuse_tokens="
+            f"{int(spec.expected_reuse_tokens)}."
+        )
+    return ""
+
+
+def _write_request_records(
+    *,
+    states: dict[int, RequestState],
+    tokenizer: Any,
+    per_turn_path: Path,
+    raw_output_path: Path,
+    batch_start_s: float,
+    block_size: int,
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    with per_turn_path.open("a", encoding="utf-8") as per_turn, raw_output_path.open("a", encoding="utf-8") as raw_output:
+        for seq_id in sorted(states):
+            state = states[seq_id]
+            spec = state.spec
+            first_token_s = state.first_token_s or state.finish_s or time.perf_counter()
+            finish_s = state.finish_s or first_token_s
+            generated = state.generated_token_ids[: int(spec.output_len)]
+            cached_tokens = int(state.prefix_cache_hit_len)
+            cached_blocks = int(state.prefix_cache_hit_blocks)
+            planned_eligible_tokens = int(spec.eligible_cache_tokens)
+            status = state.status
+            error_message = state.error_message
+            metric_error = _cache_hit_metric_error(
+                spec,
+                cached_tokens=cached_tokens,
+                cached_blocks=cached_blocks,
+                block_size=block_size,
+            )
+            if metric_error:
+                status = "metric_failed"
+                error_message = metric_error if not error_message else f"{error_message}; {metric_error}"
+            record = {
+                "request_key": spec.request_key,
+                "seq_id": seq_id,
+                "workload": spec.workload,
+                "phase": spec.phase,
+                "session_id": spec.session_id,
+                "turn": spec.turn,
+                "status": status,
+                "prompt_tokens": len(spec.prompt_token_ids),
+                "max_new_tokens": int(spec.output_len),
+                "generated_tokens": len(generated),
+                "planned_eligible_cache_tokens": planned_eligible_tokens,
+                "eligible_cache_tokens": planned_eligible_tokens,
+                "expected_reuse_tokens": int(spec.expected_reuse_tokens),
+                "cached_tokens": cached_tokens,
+                "cached_blocks": cached_blocks,
+                "ttft_s": float(first_token_s - state.add_s),
+                "latency_s": float(finish_s - state.add_s),
+                "batch_elapsed_s": float(finish_s - batch_start_s),
+                "error_message": error_message,
+            }
+            raw = {
+                **record,
+                "prompt_token_ids": spec.prompt_token_ids,
+                "generated_token_ids": generated,
+                "generated_text": tokenizer.decode(generated, skip_special_tokens=True) if generated else "",
+            }
+            per_turn.write(json.dumps(record, ensure_ascii=False) + "\n")
+            raw_output.write(json.dumps(raw, ensure_ascii=False) + "\n")
+            records.append(record)
+    return records
+
+
 def _load_json_arg(value: str | None) -> dict[str, Any]:
     if not value:
         return {}
@@ -469,6 +570,7 @@ def _run_request_batch(
     tokenizer: Any,
     per_turn_path: Path,
     raw_output_path: Path,
+    block_size: int,
     max_steps: int,
 ) -> list[dict[str, Any]]:
     from sparsevllm import SamplingParams
@@ -476,95 +578,89 @@ def _run_request_batch(
 
     states: dict[int, RequestState] = {}
     batch_start_s = time.perf_counter()
-    for spec in specs:
-        sampling_params = SamplingParams(
-            temperature=0.0,
-            top_p=1.0,
-            ignore_eos=True,
-            max_tokens=int(spec.output_len),
-        )
-        seq_id = llm.add_request(spec.prompt_token_ids, sampling_params)
-        states[int(seq_id)] = RequestState(spec=spec, seq_id=int(seq_id), add_s=time.perf_counter())
-
     active = set(states)
     step_count = 0
     zero_progress_steps = 0
-    while active:
-        if step_count >= max_steps:
-            raise RuntimeError(f"Exceeded max_steps={max_steps} while running active requests.")
-        step_count += 1
-        _finished_outputs, num_tokens = llm.step()
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
+    failure: Exception | None = None
+    try:
+        for spec in specs:
+            sampling_params = SamplingParams(
+                temperature=0.0,
+                top_p=1.0,
+                ignore_eos=True,
+                max_tokens=int(spec.output_len),
+            )
+            seq_id = llm.add_request(spec.prompt_token_ids, sampling_params)
+            states[int(seq_id)] = RequestState(spec=spec, seq_id=int(seq_id), add_s=time.perf_counter())
+            active.add(int(seq_id))
+
+        while active:
+            if step_count >= max_steps:
+                raise RuntimeError(f"Exceeded max_steps={max_steps} while running active requests.")
+            step_count += 1
+            _finished_outputs, num_tokens = llm.step()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            now_s = time.perf_counter()
+
+            if num_tokens == 0:
+                zero_progress_steps += 1
+                if zero_progress_steps >= 50:
+                    raise RuntimeError("llm.step() returned 0 repeatedly; scheduler may be stuck.")
+            else:
+                zero_progress_steps = 0
+
+            for seq_id, token_ids in llm.last_step_token_outputs:
+                seq_id = int(seq_id)
+                if seq_id not in states:
+                    continue
+                state = states[seq_id]
+                if state.first_token_s is None:
+                    state.first_token_s = now_s
+                    seq = _find_live_seq(llm, seq_id)
+                    if seq is not None:
+                        state.prefix_cache_hit_len = int(getattr(seq, "prefix_cache_hit_len", 0) or 0)
+                        state.prefix_cache_hit_blocks = int(getattr(seq, "prefix_cache_hit_blocks", 0) or 0)
+                state.generated_token_ids.extend(int(token_id) for token_id in token_ids)
+
+            for seq_id in list(active):
+                state = states[seq_id]
+                if len(state.generated_token_ids) >= int(state.spec.output_len):
+                    state.finish_s = now_s
+                    active.discard(seq_id)
+    except Exception as exc:
+        failure = exc
         now_s = time.perf_counter()
-
-        if num_tokens == 0:
-            zero_progress_steps += 1
-            if zero_progress_steps >= 50:
-                raise RuntimeError("llm.step() returned 0 repeatedly; scheduler may be stuck.")
-        else:
-            zero_progress_steps = 0
-
-        for seq_id, token_ids in llm.last_step_token_outputs:
-            seq_id = int(seq_id)
-            if seq_id not in states:
+        existing_keys = {state.spec.request_key for state in states.values()}
+        for seq_id in active:
+            state = states[seq_id]
+            state.status = "model_failed"
+            state.error_message = repr(exc)
+            state.finish_s = state.finish_s or now_s
+        next_failed_seq_id = -1
+        for spec in specs:
+            if spec.request_key in existing_keys:
                 continue
-            state = states[seq_id]
-            if state.first_token_s is None:
-                state.first_token_s = now_s
-                seq = _find_live_seq(llm, seq_id)
-                if seq is not None:
-                    state.prefix_cache_hit_len = int(getattr(seq, "prefix_cache_hit_len", 0) or 0)
-                    state.prefix_cache_hit_blocks = int(getattr(seq, "prefix_cache_hit_blocks", 0) or 0)
-            state.generated_token_ids.extend(int(token_id) for token_id in token_ids)
+            states[next_failed_seq_id] = RequestState(
+                spec=spec,
+                seq_id=next_failed_seq_id,
+                add_s=batch_start_s,
+                finish_s=now_s,
+                status="model_failed",
+                error_message=repr(exc),
+            )
+            next_failed_seq_id -= 1
 
-        for seq_id in list(active):
-            state = states[seq_id]
-            if len(state.generated_token_ids) >= int(state.spec.output_len):
-                state.finish_s = now_s
-                active.discard(seq_id)
-
-    records: list[dict[str, Any]] = []
-    with per_turn_path.open("a", encoding="utf-8") as per_turn, raw_output_path.open("a", encoding="utf-8") as raw_output:
-        for seq_id in sorted(states):
-            state = states[seq_id]
-            spec = state.spec
-            first_token_s = state.first_token_s or state.finish_s or time.perf_counter()
-            finish_s = state.finish_s or first_token_s
-            generated = state.generated_token_ids[: int(spec.output_len)]
-            cached_tokens = int(state.prefix_cache_hit_len)
-            planned_eligible_tokens = int(spec.eligible_cache_tokens)
-            observed_eligible_tokens = max(planned_eligible_tokens, cached_tokens)
-            record = {
-                "request_key": spec.request_key,
-                "seq_id": seq_id,
-                "workload": spec.workload,
-                "phase": spec.phase,
-                "session_id": spec.session_id,
-                "turn": spec.turn,
-                "status": state.status,
-                "prompt_tokens": len(spec.prompt_token_ids),
-                "max_new_tokens": int(spec.output_len),
-                "generated_tokens": len(generated),
-                "planned_eligible_cache_tokens": planned_eligible_tokens,
-                "eligible_cache_tokens": observed_eligible_tokens,
-                "expected_reuse_tokens": int(spec.expected_reuse_tokens),
-                "cached_tokens": cached_tokens,
-                "cached_blocks": int(state.prefix_cache_hit_blocks),
-                "ttft_s": float(first_token_s - state.add_s),
-                "latency_s": float(finish_s - state.add_s),
-                "batch_elapsed_s": float(finish_s - batch_start_s),
-                "error_message": state.error_message,
-            }
-            raw = {
-                **record,
-                "prompt_token_ids": spec.prompt_token_ids,
-                "generated_token_ids": generated,
-                "generated_text": tokenizer.decode(generated, skip_special_tokens=True),
-            }
-            per_turn.write(json.dumps(record, ensure_ascii=False) + "\n")
-            raw_output.write(json.dumps(raw, ensure_ascii=False) + "\n")
-            records.append(record)
+    records = _write_request_records(
+        states=states,
+        tokenizer=tokenizer,
+        per_turn_path=per_turn_path,
+        raw_output_path=raw_output_path,
+        batch_start_s=batch_start_s,
+        block_size=int(block_size),
+    )
+    if failure is not None:
+        raise failure
     return records
 
 
@@ -612,6 +708,7 @@ def _run_multiturn_workload(
             tokenizer=tokenizer,
             per_turn_path=per_turn_path,
             raw_output_path=raw_output_path,
+            block_size=block_size,
             max_steps=int(args.max_steps_per_round),
         )
         records.extend(round_records)
@@ -672,6 +769,7 @@ def _run_shared_prefix_workload(
                 tokenizer=tokenizer,
                 per_turn_path=per_turn_path,
                 raw_output_path=raw_output_path,
+                block_size=block_size,
                 max_steps=int(args.max_steps_per_round),
             )
         )
@@ -700,6 +798,7 @@ def _run_shared_prefix_workload(
             tokenizer=tokenizer,
             per_turn_path=per_turn_path,
             raw_output_path=raw_output_path,
+            block_size=block_size,
             max_steps=int(args.max_steps_per_round),
         )
     )

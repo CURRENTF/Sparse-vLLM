@@ -210,6 +210,53 @@ class Scheduler:
             f"logical_free={logical_free_count}"
         )
 
+    def _preempt_decode_victim(
+        self,
+        victim: Sequence,
+        scheduled_seqs: list[Sequence],
+        preempted_seqs: list[Sequence],
+        *,
+        physical_free_count: int,
+        reserved_prefill: int,
+    ) -> tuple[list[Sequence], bool, list[Sequence]]:
+        if victim.num_completion_tokens > 0:
+            raise RuntimeError(
+                "Decode preemption replay after generation is not supported yet. "
+                f"seq_id={victim.seq_id} prompt_len={victim.num_prompt_tokens} "
+                f"num_tokens={victim.num_tokens} completion_tokens={victim.num_completion_tokens} "
+                f"free_slots={physical_free_count} reserved_prefill={reserved_prefill}. "
+                "Reduce batch size or KV pressure instead of silently replaying an incomplete context."
+            )
+        debug_slots = os.getenv("SPARSEVLLM_DEBUG_SLOTS", "0") == "1"
+        if debug_slots:
+            logger.info(
+                "preempt seq_id={} prompt_len={} num_tokens={} prefetched={} free_slots_before={} waiting_before={} decoding_before={}",
+                victim.seq_id,
+                int(victim.num_prompt_tokens),
+                int(victim.num_tokens),
+                int(victim.num_prefilled_tokens),
+                int(self.memory_oracle.num_free_slots),
+                len(self.waiting),
+                len(self.decoding),
+            )
+        victim.status = SequenceStatus.WAITING
+        victim.num_prefilled_tokens = 0  # 重置进度，下次回来重新跑 Prefill
+        self.memory_oracle.clear_prefix_cache_hit(victim)
+        # Requeue to the tail instead of the head. Otherwise a long sequence can
+        # be immediately re-admitted after preemption and thrash in a tight
+        # prefill->decode->preempt loop while other waiting prompts never drain.
+        self.waiting.append(victim)
+        # Any decode sequences already popped into `scheduled_seqs` in this round
+        # have not been executed yet. Put them back before returning, otherwise
+        # they disappear from scheduler queues while still occupying KV slots.
+        if scheduled_seqs:
+            self.decoding.extendleft(reversed(scheduled_seqs))
+            scheduled_seqs.clear()
+        preempted_seqs.append(victim)
+        self.total_preemptions += 1
+        logger.warning(f'驱逐请求 id = {victim.seq_id} | slots={self.memory_oracle.free_slot_stats()}')
+        return [], False, preempted_seqs
+
     def schedule(self) -> tuple[list[Sequence], bool, list[Sequence]]:
         """
         核心调度逻辑。
@@ -237,6 +284,7 @@ class Scheduler:
         margin_batched_tokens = self.memory_oracle.prefill_batched_tokens_margin()
         deferred_prompt_failure: tuple[Sequence, str, int, int] | None = None
         deferred_prefill_step_failure: tuple[Sequence, int, int] | None = None
+        deferred_prefill_capacity_failure: tuple[Sequence, int, int, int] | None = None
 
         # --- 阶段 1: Prefill 调度 ---
         # 只要 waiting 队列有活，就优先处理 Prefill，因为它是计算密集型的。
@@ -286,6 +334,14 @@ class Scheduler:
                 )
 
                 if can_prefill_tokens <= 0:
+                    if candidate_step_free_count <= 0 and step_free_count > 0:
+                        if deferred_prefill_capacity_failure is None:
+                            deferred_prefill_capacity_failure = (
+                                seq,
+                                int(remaining_prefill_tokens),
+                                int(candidate_step_free_count),
+                                int(step_free_count),
+                            )
                     if self._requires_whole_short_prefill_step(target_is_long):
                         available = min(
                             self.max_num_batched_tokens - num_batched_tokens,
@@ -422,6 +478,7 @@ class Scheduler:
         else:
             target_is_long_decode = False
         decode_scan_budget = len(self.decoding)
+        blocked_decode_victim: Sequence | None = None
         while self.decoding and decode_scan_budget > 0 and num_batched_seqs < self.max_num_seqs_in_batch:
             seq = self._pop_next_decoding_seq(target_is_long_decode)
             if seq is None:
@@ -436,49 +493,20 @@ class Scheduler:
             decode_reservation_cost = int(self.memory_oracle.decode_step_reservation_cost(seq))
             if candidate_decode_free < decode_reservation_cost:
                 if decode_logical_free_count > 0:
+                    if blocked_decode_victim is None:
+                        blocked_decode_victim = seq
                     self.decoding.append(seq)
                     continue
                 # 显存耗尽，触发驱逐/抢占逻辑
                 # 策略：牺牲当前 seq，并立刻返回，让上层先释放槽位再进入下一轮调度。
                 # 这样可以避免在一次 schedule() 调用中反复驱逐多个请求造成抖动。
-                victim = seq
-                if victim.num_completion_tokens > 0:
-                    raise RuntimeError(
-                        "Decode preemption replay after generation is not supported yet. "
-                        f"seq_id={victim.seq_id} prompt_len={victim.num_prompt_tokens} "
-                        f"num_tokens={victim.num_tokens} completion_tokens={victim.num_completion_tokens} "
-                        f"free_slots={physical_free_count} reserved_prefill={reserved_prefill}. "
-                        "Reduce batch size or KV pressure instead of silently replaying an incomplete context."
-                    )
-                debug_slots = os.getenv("SPARSEVLLM_DEBUG_SLOTS", "0") == "1"
-                if debug_slots:
-                    logger.info(
-                        "preempt seq_id={} prompt_len={} num_tokens={} prefetched={} free_slots_before={} waiting_before={} decoding_before={}",
-                        victim.seq_id,
-                        int(victim.num_prompt_tokens),
-                        int(victim.num_tokens),
-                        int(victim.num_prefilled_tokens),
-                        int(self.memory_oracle.num_free_slots),
-                        len(self.waiting),
-                        len(self.decoding),
-                    )
-                victim.status = SequenceStatus.WAITING
-                victim.num_prefilled_tokens = 0  # 重置进度，下次回来重新跑 Prefill
-                self.memory_oracle.clear_prefix_cache_hit(victim)
-                # Requeue to the tail instead of the head. Otherwise a long sequence can
-                # be immediately re-admitted after preemption and thrash in a tight
-                # prefill->decode->preempt loop while other waiting prompts never drain.
-                self.waiting.append(victim)
-                # Any decode sequences already popped into `scheduled_seqs` in this round
-                # have not been executed yet. Put them back before returning, otherwise
-                # they disappear from scheduler queues while still occupying KV slots.
-                if scheduled_seqs:
-                    self.decoding.extendleft(reversed(scheduled_seqs))
-                    scheduled_seqs.clear()
-                preempted_seqs.append(victim)
-                self.total_preemptions += 1
-                logger.warning(f'驱逐请求 id = {victim.seq_id} | slots={self.memory_oracle.free_slot_stats()}')
-                return [], False, preempted_seqs
+                return self._preempt_decode_victim(
+                    seq,
+                    scheduled_seqs,
+                    preempted_seqs,
+                    physical_free_count=physical_free_count,
+                    reserved_prefill=reserved_prefill,
+                )
             else:
                 # Reserve the cache-manager-specific decode capacity for this step.
                 decode_logical_free_count -= decode_reservation_cost
@@ -487,6 +515,18 @@ class Scheduler:
                 # logger.debug('Add a decode req.')
         
         if not scheduled_seqs:
+            if blocked_decode_victim is not None:
+                try:
+                    self.decoding.remove(blocked_decode_victim)
+                except ValueError:
+                    pass
+                return self._preempt_decode_victim(
+                    blocked_decode_victim,
+                    scheduled_seqs,
+                    preempted_seqs,
+                    physical_free_count=physical_free_count,
+                    reserved_prefill=reserved_prefill,
+                )
             if deferred_prefill_step_failure is not None and not self.decoding:
                 seq, need, free = deferred_prefill_step_failure
                 raise RuntimeError(
@@ -496,6 +536,18 @@ class Scheduler:
                     f"chunk_prefill_size={self.chunk_prefill_size} "
                     f"max_num_batched_tokens={self.max_num_batched_tokens}. "
                     "Increase the raw KV budget / max_num_batched_tokens or reduce short-batch size."
+                )
+            if deferred_prefill_capacity_failure is not None and not self.decoding:
+                seq, need, seq_free, global_free = deferred_prefill_capacity_failure
+                raise RuntimeError(
+                    "No prefill candidate can use the remaining cache capacity. "
+                    f"cache_manager={type(self.memory_oracle).__name__} seq_id={seq.seq_id} "
+                    f"prompt_len={seq.num_prompt_tokens} remaining_prefill_tokens={need} "
+                    f"candidate_step_free={seq_free} global_step_free={global_free} "
+                    f"free_slots={physical_free_count} reserved_prefill={reserved_prefill} "
+                    f"waiting={len(self.waiting)} decoding={len(self.decoding)}. "
+                    "This usually means the only remaining capacity belongs to another sequence's partial page; "
+                    "reduce concurrency or free a decode sequence first."
                 )
             if deferred_prompt_failure is not None and not self.decoding:
                 seq, name, need, free = deferred_prompt_failure

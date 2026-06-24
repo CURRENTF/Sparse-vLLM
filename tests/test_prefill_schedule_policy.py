@@ -121,6 +121,9 @@ class FakeMemoryOracle:
         self.clear_calls += 1
         seq.clear_prefix_cache_hit()
 
+    def free_slot_stats(self):
+        return {"free_slots": int(self._free_slots), "step_free_slots": int(self._step_free_slots)}
+
 
 def make_scheduler(policy, *, method="", chunk=5, max_tokens=10, oracle=None):
     cfg = SimpleNamespace(
@@ -875,6 +878,56 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
         scheduler.decoding.append(seq)
 
         with self.assertRaisesRegex(RuntimeError, "Decode preemption replay"):
+            scheduler.schedule()
+
+    def test_decode_preempts_when_no_candidate_can_use_partial_capacity(self):
+        class PartialPageOracle(FakeMemoryOracle):
+            def decode_step_free_slots(self):
+                return 1
+
+            def decode_step_free_slots_for(self, seq):
+                return 0
+
+        oracle = PartialPageOracle(free_slots=0)
+        scheduler = make_scheduler_with_oracle(
+            PREFILL_POLICY_ALL_CHUNKED,
+            oracle,
+            method="quest",
+            chunk=5,
+            max_tokens=20,
+        )
+        seq = seq_with_len(8)
+        seq.num_prefilled_tokens = seq.num_prompt_tokens
+        scheduler.decoding.append(seq)
+
+        scheduled, is_prefill, preempted = scheduler.schedule()
+
+        self.assertEqual(scheduled, [])
+        self.assertFalse(is_prefill)
+        self.assertEqual(preempted, [seq])
+        self.assertEqual(list(scheduler.decoding), [])
+        self.assertEqual(list(scheduler.waiting), [seq])
+        self.assertEqual(scheduler.total_preemptions, 1)
+
+    def test_prefill_fails_fast_when_no_candidate_can_use_partial_capacity(self):
+        class PartialPageOracle(FakeMemoryOracle):
+            def prefill_step_free_slots(self):
+                return 1
+
+            def prefill_step_free_slots_for(self, seq):
+                return 0
+
+        oracle = PartialPageOracle(free_slots=0, step_free_slots=1)
+        scheduler = make_scheduler_with_oracle(
+            PREFILL_POLICY_ALL_CHUNKED,
+            oracle,
+            method="quest",
+            chunk=5,
+            max_tokens=20,
+        )
+        scheduler.add(seq_with_len(8))
+
+        with self.assertRaisesRegex(RuntimeError, "No prefill candidate can use"):
             scheduler.schedule()
 
     def test_sequence_setstate_accepts_pre_prefix_cache_ipc_state(self):

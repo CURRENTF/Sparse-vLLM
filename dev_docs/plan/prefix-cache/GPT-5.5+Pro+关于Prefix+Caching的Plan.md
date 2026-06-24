@@ -2,8 +2,8 @@
 
 核心设计改成：
 
-`vanilla` 和 `omnikv` 共享同一套 token-block prefix cache，实现放在 `StandardCacheManager`。  
-`quest` 复用同一个 prefix cache index，但 attach/materialize/free/evict 以 page 为单位，额外维护 `buffer_req_to_page_slots` 和 `metadata_cache`。  
+`vanilla` 和 `omnikv` 共享同一套 token-block prefix cache，实现放在 `StandardCacheManager`。
+`quest` 复用同一个 prefix cache index，但 attach/materialize/free/evict 以 page 为单位，额外维护 `buffer_req_to_page_slots` 和 `metadata_cache`。
 不支持会 drop / prune / compress 物理 KV 的方法，例如 `streamingllm`、`snapkv`、`pyramidkv`、`deltakv*`。
 
 ### **1. 支持范围**
@@ -55,18 +55,18 @@ if enable_prefix_caching:
 
 它负责：
 
-prefix block hash  
-longest-prefix lookup  
-block chain 恢复  
-refcount  
-LRU  
-eviction 候选管理  
+prefix block hash
+longest-prefix lookup
+block chain 恢复
+refcount
+LRU
+eviction 候选管理
 统计信息
 
 第二层：cache-manager 适配。
 
-`StandardCacheManager` 负责 token-slot 级别 attach / materialize / free。  
-`OmniKVCacheManager` 继续继承 `StandardCacheManager`，基本不需要单独写逻辑。  
+`StandardCacheManager` 负责 token-slot 级别 attach / materialize / free。
+`OmniKVCacheManager` 继续继承 `StandardCacheManager`，基本不需要单独写逻辑。
 `QuestCacheManager` 负责 page-slot 级别 attach / materialize / free，并复用 Quest page metadata。
 
 结构大概是：
@@ -160,7 +160,7 @@ hash fingerprint 建议包含：
 
 不要把 `rank` 放进 fingerprint，因为 TP 多 rank 需要用同一个 block hash chain。可以包含 `tp_size`，但不要包含 `rank`。
 
-### 
+###
 
 ### **5. 新增通用模块**
 
@@ -266,7 +266,7 @@ prompt_len = 15,  block_size = 16 -> usable_hit_len = 0
 
 这样至少会重新 prefill 一个 suffix token，保证能拿到首个 generated token 的 logits。
 
-### 
+###
 
 ### **7. 修改**
 
@@ -471,7 +471,7 @@ seq_id_to_cached_ranges[seq_id].append((block_start, block_end))
 
 这样后续 `_allocate(seq_id, chunk_size)` 会从 `hit_len` 之后继续分配 suffix slots。
 
-vanilla 的 full attention read view 会自然读到完整 prefix + suffix。  
+vanilla 的 full attention read view 会自然读到完整 prefix + suffix。
 OmniKV 的 sparse read view 也会自然基于同一个 `buffer_req_to_token_slots` 工作。
 
 ### **12. Standard materialize 流程**
