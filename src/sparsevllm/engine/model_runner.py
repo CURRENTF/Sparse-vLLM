@@ -1,6 +1,7 @@
 import os
 import pickle
 import time
+import uuid
 import torch
 import torch.distributed as dist
 from sparsevllm.utils.log import logger
@@ -29,13 +30,20 @@ try:
 except ImportError:
     Qwen3ForCausalLM = None
 
+
+TP_SHM_NAME_PREFIX = "sparsevllm_"
+
+
+def make_tp_shm_name() -> str:
+    return f"{TP_SHM_NAME_PREFIX}{os.getpid()}_{uuid.uuid4().hex}"
+
 class ModelRunner:
     """
     负责模型执行的类。每个 GPU Rank 进程都拥有一个 ModelRunner 实例。
     主要职责：权重加载、显存分配 (KV Cache)、槽位管理 (Rank-Local)、前向计算。
     """
 
-    def __init__(self, config: Config, rank: int, event: Event | list[Event]):
+    def __init__(self, config: Config, rank: int, event: Event | list[Event], tp_shm_name: str | None = None):
         self.config = config
         # Inference-only engine: disable autograd graph construction globally in this process.
         # (This is process-local; must be set inside every spawned TP worker.)
@@ -47,6 +55,7 @@ class ModelRunner:
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
+        self.tp_shm_name = tp_shm_name
 
         # 初始化分布式环境并绑定对应的 GPU 卡
         torch.cuda.set_device(rank)
@@ -125,14 +134,16 @@ class ModelRunner:
 
         # TP 场景下的多进程指令同步
         if self.world_size > 1:
+            if not self.tp_shm_name:
+                raise ValueError("tp_shm_name is required when tensor_parallel_size > 1.")
             if rank == 0:
                 # Rank 0 创建共享内存用于发送方法调用指令
-                self.shm = SharedMemory(name="sparsevllm", create=True, size=2**20)
+                self.shm = SharedMemory(name=self.tp_shm_name, create=True, size=2**20)
                 dist.barrier(device_ids=[rank])
             else:
                 # 其他 Rank 监听共享内存中的指令
                 dist.barrier(device_ids=[rank])
-                self.shm = SharedMemory(name="sparsevllm")
+                self.shm = SharedMemory(name=self.tp_shm_name)
                 self.loop()
 
     def exit(self):

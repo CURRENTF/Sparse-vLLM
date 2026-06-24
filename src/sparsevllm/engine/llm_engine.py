@@ -15,7 +15,7 @@ from sparsevllm.config import Config
 from sparsevllm.sampling_params import SamplingParams
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.engine.scheduler import Scheduler
-from sparsevllm.engine.model_runner import ModelRunner
+from sparsevllm.engine.model_runner import ModelRunner, make_tp_shm_name
 from sparsevllm.method_registry import normalize_sparse_method
 from sparsevllm.utils.profiler import profiler
 
@@ -190,17 +190,18 @@ class LLMEngine:
         self.ps = []
         self.events = []
         ctx = mp.get_context("spawn")
+        tp_shm_name = make_tp_shm_name() if config.tensor_parallel_size > 1 else None
         for i in range(1, config.tensor_parallel_size):
             event = ctx.Event()
             # 为每一个非零 Rank 启动一个独立的 ModelRunner 进程
-            process = ctx.Process(target=ModelRunner, args=(config, i, event))
+            process = ctx.Process(target=ModelRunner, args=(config, i, event, tp_shm_name))
             process.start()
             self.ps.append(process)
             self.events.append(event)
         
         # 3. 初始化主进程的 ModelRunner (Rank 0)
         # 注意：必须先初始化 ModelRunner 以便在本地 GPU 分配 KV Cache 账本
-        self.model_runner = ModelRunner(config, 0, self.events)
+        self.model_runner = ModelRunner(config, 0, self.events, tp_shm_name)
         
         # 加载分词器
         self.tokenizer: Qwen2Tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)

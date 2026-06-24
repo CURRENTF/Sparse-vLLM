@@ -6,7 +6,7 @@ from multiprocessing.shared_memory import SharedMemory
 from types import SimpleNamespace
 from uuid import uuid4
 
-from sparsevllm.engine.model_runner import ModelRunner
+from sparsevllm.engine.model_runner import ModelRunner, TP_SHM_NAME_PREFIX, make_tp_shm_name
 
 
 def test_write_shm_waits_until_worker_reads_command():
@@ -48,6 +48,14 @@ def test_write_shm_waits_until_worker_reads_command():
         writer.join(timeout=1.0)
         shm.close()
         shm.unlink()
+
+
+def test_tp_shm_name_is_unique_per_engine_instance():
+    names = {make_tp_shm_name() for _ in range(3)}
+
+    assert len(names) == 3
+    assert all(name.startswith(TP_SHM_NAME_PREFIX) for name in names)
+    assert "sparsevllm" not in names
 
 
 def test_free_slots_batch_releases_each_seq_id():
