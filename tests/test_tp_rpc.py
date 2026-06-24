@@ -63,3 +63,28 @@ def test_free_slots_batch_releases_each_seq_id():
     ModelRunner.free_slots_batch(runner, [3, 5, 8])
 
     assert freed == [3, 5, 8]
+
+
+def test_tp_worker_decode_skips_rank0_sampling_path():
+    calls: list[str] = []
+
+    runner = object.__new__(ModelRunner)
+    runner.rank = 1
+    runner.config = SimpleNamespace(decode_cuda_graph=False)
+    runner.decode_cuda_graph_runner = SimpleNamespace(
+        run_eager_static=lambda seqs: calls.append("decode") or None
+    )
+    runner.sparse_controller = SimpleNamespace(
+        post_forward=lambda seqs, is_prefill: calls.append(f"sparse_post:{is_prefill}")
+    )
+    runner.cache_manager = SimpleNamespace(
+        on_forward_end=lambda seqs, is_prefill: calls.append(f"cache_post:{is_prefill}")
+    )
+    runner.sampler = lambda *args, **kwargs: calls.append("sample")
+    runner._collect_logprobs = lambda *args, **kwargs: calls.append("logprobs")
+
+    token_ids, logprobs = ModelRunner.run(runner, [SimpleNamespace()], is_prefill=False)
+
+    assert token_ids is None
+    assert logprobs is None
+    assert calls == ["decode", "sparse_post:False", "cache_post:False"]

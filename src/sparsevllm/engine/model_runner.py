@@ -369,6 +369,11 @@ class ModelRunner:
                     else:
                         logits = self.decode_cuda_graph_runner.run_eager_static(seqs)
                         graph_token_ids = None
+                    if self.rank != 0:
+                        with profiler.record("model_sparse_post"):
+                            self.sparse_controller.post_forward(seqs, is_prefill)
+                            self.cache_manager.on_forward_end(seqs, is_prefill)
+                        return None, None
                     with profiler.record("model_sampler"):
                         if graph_token_ids is not None:
                             token_ids = graph_token_ids.tolist()

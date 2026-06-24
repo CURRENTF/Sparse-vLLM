@@ -544,6 +544,38 @@ class DecodeCudaGraphCapacityPolicyTest(unittest.TestCase):
         self.assertEqual(runner.last_state_key.context_capacity, 1024)
         self.assertEqual(runner.last_static_max_context_len, 1024)
 
+    def test_eager_static_allows_tp_worker_without_logits(self):
+        runner = self.make_runner("vanilla")
+        calls = []
+        runner.cache_manager = SimpleNamespace(
+            select_decode_cuda_graph_batch_size=lambda real_size, sizes: real_size,
+            set_decode_static_max_context_len=lambda value: calls.append(f"context:{value}"),
+            prepare_decode_static=lambda seqs, input_ids, positions, slot_mapping, context_lens, req_indices: (
+                input_ids,
+                positions,
+                None,
+            ),
+        )
+        runner.sparse_controller = SimpleNamespace(
+            prepare_forward=lambda seqs, is_prefill: calls.append(f"prepare:{is_prefill}")
+        )
+        runner.is_long_text_batch = lambda seqs, is_prefill: False
+        runner.run_model = lambda input_ids, positions, is_prefill: None
+        runner.last_state_key = None
+        runner.last_real_batch_size = None
+        seqs = [self.make_seq(prompt_len=8, max_tokens=4, num_tokens=9)]
+        real_empty = torch.empty
+
+        def empty_on_cpu(shape, *, dtype=None, device=None):
+            del device
+            return real_empty(shape, dtype=dtype)
+
+        with patch("sparsevllm.engine.decode_cuda_graph.torch.empty", side_effect=empty_on_cpu):
+            logits = runner.run_eager_static(seqs)
+
+        self.assertIsNone(logits)
+        self.assertEqual(calls, ["context:1024", "context:1024", "prepare:False"])
+
     def test_exact_current_policy_does_not_reuse_larger_warmup_state(self):
         runner = self.make_runner("quest")
         warmup_key = DecodeCudaGraphKey("quest", 1, 16384, False, False)

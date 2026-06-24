@@ -7,9 +7,21 @@ from sparsevllm.engine.llm_engine import LLMEngine
 
 
 def test_engine_exit_timeout_still_terminates_workers():
+    class SharedMemory:
+        def __init__(self):
+            self.closed = False
+            self.unlinked = False
+
+        def close(self):
+            self.closed = True
+
+        def unlink(self):
+            self.unlinked = True
+
     class BlockingRunner:
         def __init__(self):
             self.call_started = threading.Event()
+            self.shm = SharedMemory()
 
         def call(self, method_name):
             assert method_name == "exit"
@@ -58,5 +70,7 @@ def test_engine_exit_timeout_still_terminates_workers():
 
     assert elapsed < 1.0
     assert runner.call_started.is_set()
+    assert runner.shm.closed
+    assert runner.shm.unlinked
     assert worker.terminated
     assert not worker.killed

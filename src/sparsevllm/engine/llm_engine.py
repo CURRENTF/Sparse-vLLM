@@ -281,6 +281,22 @@ class LLMEngine:
             sparse_controller.clear_decode_attn_score_buffers()
             logger.info("Cleared decode attention score buffers after warmup.")
 
+    @staticmethod
+    def _cleanup_model_runner_shared_memory(model_runner):
+        shm = getattr(model_runner, "shm", None)
+        if shm is None:
+            return
+        try:
+            shm.close()
+        except Exception as exc:
+            logger.warning("Failed to close ModelRunner shared memory during shutdown: {}", repr(exc))
+        try:
+            shm.unlink()
+        except FileNotFoundError:
+            pass
+        except Exception as exc:
+            logger.warning("Failed to unlink ModelRunner shared memory during shutdown: {}", repr(exc))
+
     def exit(self):
         """优雅地退出所有子进程并清理共享内存"""
         if self._exited:
@@ -313,8 +329,10 @@ class LLMEngine:
                     "Timed out waiting {:.1f}s for ModelRunner exit RPC; terminating workers.",
                     timeout_s,
                 )
+                self._cleanup_model_runner_shared_memory(model_runner)
             elif errors:
                 logger.warning("ModelRunner exit RPC failed during shutdown: {}", repr(errors[0]))
+                self._cleanup_model_runner_shared_memory(model_runner)
             del self.model_runner
         if hasattr(self, "ps"):
             join_timeout_s = float(os.getenv("SPARSEVLLM_WORKER_JOIN_TIMEOUT_S", "5"))

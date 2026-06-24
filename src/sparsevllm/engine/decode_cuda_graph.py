@@ -495,7 +495,7 @@ class DecodeCudaGraphRunner:
         token_ids = state.token_ids[:real_batch_size] if state.token_ids is not None else None
         return logits, token_ids
 
-    def run_eager_static(self, seqs: list[Sequence]) -> torch.Tensor:
+    def run_eager_static(self, seqs: list[Sequence]) -> torch.Tensor | None:
         """Run decode eagerly through the same static-compatible path used by graphs."""
         if not seqs:
             raise ValueError("static decode requires a non-empty decode batch.")
@@ -521,4 +521,6 @@ class DecodeCudaGraphRunner:
         with profiler.record("model_sparse_prepare"):
             self.sparse_controller.prepare_forward(seqs, is_prefill=False)
         logits = self.run_model(input_ids, positions, is_prefill=False)
+        if logits is None:
+            return None
         return logits[:real_batch_size]
