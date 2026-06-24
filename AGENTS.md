@@ -66,7 +66,7 @@ This is a research codebase. The priority is trustworthy experimental results.
 1. **Specification**: Strictly follow the Conventional Commits specification.
 2. **Format**: Use the format `<type>: <short description>` (e.g., `feat: add hybrid attention support`).
 3. **Allowed Types**: `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `chore`.
-4. **Style**: 
+4. **Style**:
    - Write the description in English, using the imperative mood (e.g., "add" not "added").
    - Start the description with a lowercase letter.
    - Do NOT end the message with a period.
