@@ -399,6 +399,29 @@ class PrefillPolicyConfigTest(unittest.TestCase):
             max_decoding_seqs=6,
         )
         self.assertEqual(cfg.decode_cuda_graph_capture_sizes, [1, 2, 4, 8])
+        self.assertTrue(cfg.decode_graph)
+        self.assertEqual(cfg.decode_graph_capture_sizes, [1, 2, 4, 8])
+
+    def test_decode_graph_aliases_normalize_to_legacy_fields(self):
+        cfg = self.make_config(
+            vllm_sparse_method="omnikv",
+            decode_graph=True,
+            decode_graph_capture_sizes="1,4",
+            decode_graph_capture_sampling=True,
+            omnikv_decode_graph=True,
+            max_decoding_seqs=4,
+            device_memory_utilization=0.7,
+        )
+        self.assertTrue(cfg.decode_cuda_graph)
+        self.assertTrue(cfg.decode_graph)
+        self.assertTrue(cfg.decode_cuda_graph_capture_sampling)
+        self.assertTrue(cfg.decode_graph_capture_sampling)
+        self.assertEqual(cfg.decode_cuda_graph_capture_sizes, [1, 4])
+        self.assertEqual(cfg.decode_graph_capture_sizes, [1, 4])
+        self.assertTrue(cfg.omnikv_decode_cuda_graph)
+        self.assertTrue(cfg.omnikv_decode_graph)
+        self.assertEqual(cfg.gpu_memory_utilization, 0.7)
+        self.assertEqual(cfg.device_memory_utilization, 0.7)
 
     def test_decode_cuda_graph_explicit_capture_sizes_are_validated(self):
         cfg = self.make_config(

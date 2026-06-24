@@ -69,11 +69,11 @@ class StandardCacheManager(CacheManager):
         self.allocate_kv_cache()
 
         num_slots = config.num_kvcache_slots
-        self.free_slots_stack = torch.arange(num_slots, dtype=torch.int32, device="cuda")
+        self.free_slots_stack = torch.arange(num_slots, dtype=torch.int32, device=self.device)
         self._num_free_slots = num_slots
 
         self.buffer_req_to_token_slots = torch.zeros(
-            (self.max_buffer_rows, self.max_model_len), dtype=torch.int32, device="cuda"
+            (self.max_buffer_rows, self.max_model_len), dtype=torch.int32, device=self.device
         )
 
         self.seq_id_to_row: dict[int, int] = {}
@@ -116,7 +116,7 @@ class StandardCacheManager(CacheManager):
             self.num_kv_heads,
             self.head_dim,
             dtype=self.hf_config.torch_dtype,
-            device="cuda",
+            device=self.device,
         )
 
     def get_layer_batch_states(self, layer_idx: int) -> LayerBatchStates:
@@ -410,8 +410,8 @@ class StandardCacheManager(CacheManager):
         select_indices = self.free_slots_stack[ptr - batch_size: ptr]
         self._num_free_slots -= batch_size
 
-        rows_gpu = torch.tensor(row_indices, dtype=torch.long, device="cuda")
-        cols_gpu = torch.tensor(cur_lens, dtype=torch.long, device="cuda")
+        rows_gpu = torch.tensor(row_indices, dtype=torch.long, device=self.device)
+        cols_gpu = torch.tensor(cur_lens, dtype=torch.long, device=self.device)
         self.buffer_req_to_token_slots[rows_gpu, cols_gpu] = select_indices
         self.row_seq_lens[row_indices] += 1
 
@@ -479,7 +479,7 @@ class StandardCacheManager(CacheManager):
             positions_np = np.empty(total_chunk_tokens, dtype=np.int64)
             cu_seqlens_q = [0]
 
-            slot_mapping = torch.empty(total_chunk_tokens, dtype=torch.int32, device="cuda")
+            slot_mapping = torch.empty(total_chunk_tokens, dtype=torch.int32, device=self.device)
             context_lens_list = []
             req_indices = []
 
@@ -516,8 +516,8 @@ class StandardCacheManager(CacheManager):
                 cu_seqlens_q.append(cu_seqlens_q[-1] + chunk_size)
                 token_offset += chunk_size
 
-            context_lens = torch.tensor(context_lens_list, dtype=torch.int32, device="cuda")
-            req_indices_tensor = torch.tensor(req_indices, dtype=torch.int32, device="cuda")
+            context_lens = torch.tensor(context_lens_list, dtype=torch.int32, device=self.device)
+            req_indices_tensor = torch.tensor(req_indices, dtype=torch.int32, device=self.device)
 
             self.layer_batch_state.slot_mapping = slot_mapping
             self.layer_batch_state.context_lens = context_lens
@@ -527,9 +527,9 @@ class StandardCacheManager(CacheManager):
             if log_level == 'DEBUG':
                 logger.debug(f'{context_lens_list=}   {req_indices=}  {slot_mapping[:10].tolist()=}  {slot_mapping[-10:].tolist()=}')
 
-            input_ids = torch.from_numpy(input_ids_np).to("cuda")
-            positions = torch.from_numpy(positions_np).to("cuda")
-            cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, device="cuda")
+            input_ids = torch.from_numpy(input_ids_np).to(self.device)
+            positions = torch.from_numpy(positions_np).to(self.device)
+            cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, device=self.device)
             return input_ids, positions, cu_seqlens_q
 
     def on_forward_end(self, seqs: list[Sequence], is_prefill: bool):
@@ -589,11 +589,11 @@ class StandardCacheManager(CacheManager):
             context_lens = torch.tensor(
                 self.row_seq_lens[row_indices],
                 dtype=torch.int32,
-                device="cuda",
+                device=self.device,
             )
-            req_indices = torch.tensor(row_indices, dtype=torch.int32, device="cuda")
+            req_indices = torch.tensor(row_indices, dtype=torch.int32, device=self.device)
 
-            slot_mapping = torch.empty((batch_size,), dtype=torch.int32, device="cuda")
+            slot_mapping = torch.empty((batch_size,), dtype=torch.int32, device=self.device)
             slot_mapping[:] = new_slots_batch
 
             self.layer_batch_state.slot_mapping = slot_mapping
@@ -603,8 +603,8 @@ class StandardCacheManager(CacheManager):
 
             logger.debug(f'{slot_mapping=}   {context_lens.tolist()=}  {slot_mapping[:10]=}  {slot_mapping[-10:]=}')
 
-            input_ids = torch.tensor(input_ids_list, dtype=torch.int64, device="cuda")
-            positions = torch.tensor(positions_list, dtype=torch.int64, device="cuda")
+            input_ids = torch.tensor(input_ids_list, dtype=torch.int64, device=self.device)
+            positions = torch.tensor(positions_list, dtype=torch.int64, device=self.device)
             return input_ids, positions, None
 
     def prepare_decode_static(
@@ -648,11 +648,11 @@ class StandardCacheManager(CacheManager):
             row_indices = [self.seq_id_to_row[sid] for sid in seq_ids]
             real_context_lens = self.row_seq_lens[row_indices]
 
-            input_ids[:real_batch_size].copy_(torch.tensor(input_ids_list, dtype=torch.int64, device="cuda"))
-            positions[:real_batch_size].copy_(torch.tensor(positions_list, dtype=torch.int64, device="cuda"))
+            input_ids[:real_batch_size].copy_(torch.tensor(input_ids_list, dtype=torch.int64, device=self.device))
+            positions[:real_batch_size].copy_(torch.tensor(positions_list, dtype=torch.int64, device=self.device))
             slot_mapping[:real_batch_size].copy_(new_slots_batch)
-            context_lens[:real_batch_size].copy_(torch.tensor(real_context_lens, dtype=torch.int32, device="cuda"))
-            req_indices[:real_batch_size].copy_(torch.tensor(row_indices, dtype=torch.int32, device="cuda"))
+            context_lens[:real_batch_size].copy_(torch.tensor(real_context_lens, dtype=torch.int32, device=self.device))
+            req_indices[:real_batch_size].copy_(torch.tensor(row_indices, dtype=torch.int32, device=self.device))
 
             if graph_batch_size > real_batch_size:
                 # CUDA Graph replay is shape-static. Padded rows mirror the first

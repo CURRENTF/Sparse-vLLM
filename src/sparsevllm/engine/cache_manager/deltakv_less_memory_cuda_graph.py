@@ -101,9 +101,11 @@ class DeltaKVLessMemoryCudaGraphCacheManager(DeltaKVLessMemoryCacheManager):
     def _extra_workspace_reserve_bytes(self) -> int:
         return self._decode_cuda_graph_memory_reserve_bytes()
 
-    @staticmethod
-    def _is_cuda_graph_capturing() -> bool:
-        return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+    def _is_cuda_graph_capturing(self) -> bool:
+        platform = getattr(self, "platform", None)
+        if platform is not None:
+            return platform.is_stream_capturing()
+        return bool(torch.cuda.is_available() and torch.cuda.is_current_stream_capturing())
 
     def _raise_if_capture_allocation(self, workspace: str, shape: object) -> None:
         if self._is_cuda_graph_capturing():
@@ -186,7 +188,7 @@ class DeltaKVLessMemoryCudaGraphCacheManager(DeltaKVLessMemoryCacheManager):
             slots = cache.get(key)
             if slots is None:
                 self._raise_if_capture_allocation("empty decode temp-slot", (batch_size, k_max))
-                slots = torch.empty((batch_size, 0), device="cuda", dtype=torch.int32)
+                slots = torch.empty((batch_size, 0), device=self.device, dtype=torch.int32)
                 cache[key] = slots
             return slots
 
@@ -365,7 +367,7 @@ class DeltaKVLessMemoryCudaGraphCacheManager(DeltaKVLessMemoryCacheManager):
                 self.num_kv_heads,
                 self.head_dim,
                 dtype=self.hf_config.torch_dtype,
-                device="cuda",
+                device=self.device,
             )
             self._full_layer_quant_v_cache = torch.empty_like(self._full_layer_quant_k_cache)
             return

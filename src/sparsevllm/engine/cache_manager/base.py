@@ -12,6 +12,7 @@ from sparsevllm.engine.sequence import Sequence
 from sparsevllm.constant import REDUNDANCY_BATCH_SIZE_FACTOR
 from sparsevllm.method_registry import SUPPORTED_SPARSE_METHODS, normalize_sparse_method
 from sparsevllm.triton_kernel.store_kvcache import store_kvcache
+import sparsevllm.platforms as platforms
 from sparsevllm.utils.log import logger, log_level
 
 
@@ -82,6 +83,8 @@ class CacheManager(ABC):
         self.config = config
         self.rank = rank
         self.world_size = world_size
+        self.platform = platforms.current_platform
+        self.device = self.platform.get_device(rank)
         self.hf_config = config.hf_config
         self.num_layers = self.hf_config.num_hidden_layers
 
@@ -97,6 +100,12 @@ class CacheManager(ABC):
 
         self.kv_cache = None
         self._decode_static_max_context_len: int | None = None
+
+    def _is_stream_capturing(self) -> bool:
+        platform = getattr(self, "platform", None)
+        if platform is not None:
+            return platform.is_stream_capturing()
+        return bool(torch.cuda.is_available() and torch.cuda.is_current_stream_capturing())
 
     @staticmethod
     def create(config: Config, rank: int, world_size: int) -> "CacheManager":
@@ -136,7 +145,7 @@ class CacheManager(ABC):
         """返回 (可用显存字节数, 每层每 token 的字节数)"""
         config = self.config
         hf_config = config.hf_config
-        free, total = torch.cuda.mem_get_info()
+        free, total = self.platform.get_available_memory(self.device.index or 0)
 
         # 动态估计 max_num_batched_tokens
         reserved_mem = total * (1 - config.gpu_memory_utilization)
@@ -162,8 +171,9 @@ class CacheManager(ABC):
         logger.info(f"Set dynamically max_num_batched_tokens = {config.max_num_batched_tokens}")
 
         used = total - free
-        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
-        current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+        allocator_stats = self.platform.get_allocator_stats(self.device)
+        peak = allocator_stats.peak_allocated_bytes
+        current = allocator_stats.current_allocated_bytes
 
         available_memory = int(total * config.gpu_memory_utilization - used - peak + current)
         slot_bytes_per_layer = 2 * self.num_kv_heads * self.head_dim * dtype_size

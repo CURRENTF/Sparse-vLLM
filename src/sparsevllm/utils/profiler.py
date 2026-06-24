@@ -4,6 +4,7 @@ from collections import defaultdict
 from contextlib import contextmanager
 
 import torch
+import sparsevllm.platforms as platforms
 from sparsevllm.utils.log import logger
 
 class Profiler:
@@ -12,8 +13,11 @@ class Profiler:
         self.counts = defaultdict(int)
         self.enabled = False
         self.rank = 0
-        # 通过环境变量 CUDA_SYNC_SVLLM=1 开启 CUDA 同步，以准确测量 GPU 耗时
-        self.cuda_sync = os.environ.get("CUDA_SYNC_SVLLM", "0") == "1"
+        # 通过环境变量开启设备同步，以准确测量设备耗时；保留旧 CUDA 名称兼容。
+        self.device_sync = (
+            os.environ.get("SPARSEVLLM_SYNC_DEVICE", "0") == "1"
+            or os.environ.get("CUDA_SYNC_SVLLM", "0") == "1"
+        )
 
     def set_enabled(self, enabled: bool):
         self.enabled = enabled
@@ -27,14 +31,15 @@ class Profiler:
             yield
             return
         
-        capturing = torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
-        if self.cuda_sync and not capturing:
-            torch.cuda.synchronize()
+        platform = platforms.current_platform
+        capturing = platform.is_stream_capturing()
+        if self.device_sync and not capturing:
+            platform.synchronize()
         t1 = time.perf_counter()
         yield
-        capturing = torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
-        if self.cuda_sync and not capturing:
-            torch.cuda.synchronize()
+        capturing = platform.is_stream_capturing()
+        if self.device_sync and not capturing:
+            platform.synchronize()
         t2 = time.perf_counter()
         
         self.times[name] += (t2 - t1)

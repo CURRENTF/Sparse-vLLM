@@ -7,6 +7,7 @@ from typing import Callable
 import torch
 
 from sparsevllm.engine.sequence import Sequence
+import sparsevllm.platforms as platforms
 from sparsevllm.utils.context import get_context, set_context
 from sparsevllm.utils.profiler import profiler
 
@@ -95,6 +96,7 @@ class DecodeCudaGraphRunner:
         self.is_long_text_batch = is_long_text_batch
         self.method = str(method or "")
         self.rank = int(rank)
+        self.platform = platforms.current_platform
         self.capture_sizes = sorted(set(int(size) for size in capture_sizes))
         if not self.capture_sizes or any(size <= 0 for size in self.capture_sizes):
             raise ValueError(f"decode_cuda_graph capture_sizes must be positive, got {capture_sizes}.")
@@ -243,11 +245,16 @@ class DecodeCudaGraphRunner:
             capture_sampling=capture_sampling,
         )
         state = DecodeCudaGraphState(key=key)
-        state.input_ids = torch.empty((batch_size,), dtype=torch.int64, device="cuda")
-        state.positions = torch.empty((batch_size,), dtype=torch.int64, device="cuda")
-        state.slot_mapping = torch.empty((batch_size,), dtype=torch.int32, device="cuda")
-        state.context_lens = torch.empty((batch_size,), dtype=torch.int32, device="cuda")
-        state.req_indices = torch.empty((batch_size,), dtype=torch.int32, device="cuda")
+        device = getattr(
+            self.cache_manager,
+            "device",
+            torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+        )
+        state.input_ids = torch.empty((batch_size,), dtype=torch.int64, device=device)
+        state.positions = torch.empty((batch_size,), dtype=torch.int64, device=device)
+        state.slot_mapping = torch.empty((batch_size,), dtype=torch.int32, device=device)
+        state.context_lens = torch.empty((batch_size,), dtype=torch.int32, device=device)
+        state.req_indices = torch.empty((batch_size,), dtype=torch.int32, device=device)
         self._graphs[key] = state
         self._evict_cached_graphs(key)
         return state
@@ -388,6 +395,8 @@ class DecodeCudaGraphRunner:
         input_ids: torch.Tensor,
         positions: torch.Tensor,
     ) -> DecodeCudaGraphState:
+        if not self.platform.supports_graph_capture():
+            raise RuntimeError(f"Platform {self.platform.name!r} does not support decode CUDA graph capture.")
         ctx = get_context()
         ctx.sparse_controller = self.sparse_controller
 
@@ -396,7 +405,7 @@ class DecodeCudaGraphRunner:
             logits = self.run_model(input_ids, positions, is_prefill=False)
             if state.key.capture_sampling:
                 _ = logits.argmax(dim=-1)
-        torch.cuda.synchronize()
+        self.platform.synchronize()
 
         with profiler.record("decode_cuda_graph_capture"):
             self.sparse_controller.prepare_forward(seqs, is_prefill=False)

@@ -279,12 +279,13 @@ def _maybe_rebuild_cache_manager_compressors(cache_manager, state_dict: dict[str
     from sparsevllm.utils.compressor import create_compressor
 
     num_layers = len(cache_manager.compress_down)
+    device = cache_manager.device
     cache_manager.compress_down = [
-        create_compressor(is_down=True, config=config, bias_override=down_bias).to(device="cuda", dtype=target_dtype)
+        create_compressor(is_down=True, config=config, bias_override=down_bias).to(device=device, dtype=target_dtype)
         for _ in range(num_layers)
     ]
     cache_manager.compress_up = [
-        create_compressor(is_down=False, config=config, bias_override=up_bias).to(device="cuda", dtype=target_dtype)
+        create_compressor(is_down=False, config=config, bias_override=up_bias).to(device=device, dtype=target_dtype)
         for _ in range(num_layers)
     ]
 

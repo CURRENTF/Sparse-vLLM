@@ -181,6 +181,7 @@ class Config:
     mlp_chunk_size: int = 16384
     prefill_schedule_policy: str = PREFILL_POLICY_AUTO
     gpu_memory_utilization: float = 0.8
+    device_memory_utilization: float | None = None
     tensor_parallel_size: int = 1
     enforce_eager: bool = True
     hf_config: Union[Qwen3Config, AutoConfig] | None = None
@@ -219,6 +220,10 @@ class Config:
     decode_cuda_graph_max_cached_graphs: int | None = None
     omnikv_decode_cuda_graph: bool = False
     sparse_attn_score_dtype: str = "float32"
+    decode_graph: bool | None = None
+    decode_graph_capture_sampling: bool | None = None
+    decode_graph_capture_sizes: str | int | list[int] | tuple[int, ...] | None = None
+    omnikv_decode_graph: bool | None = None
 
     # QuEST Config
     quest_chunk_size: int = 16
@@ -297,6 +302,43 @@ class Config:
     allow_missing_deltakv_path: bool = False
     allow_unknown_config_keys: bool = False
 
+    def _normalize_platform_aliases(self):
+        if self.device_memory_utilization is not None:
+            self.gpu_memory_utilization = float(self.device_memory_utilization)
+        self.device_memory_utilization = float(self.gpu_memory_utilization)
+
+        if self.decode_graph is not None:
+            self.decode_cuda_graph = _coerce_bool_config("decode_graph", self.decode_graph)
+        else:
+            self.decode_cuda_graph = _coerce_bool_config("decode_cuda_graph", self.decode_cuda_graph)
+        self.decode_graph = bool(self.decode_cuda_graph)
+
+        if self.decode_graph_capture_sampling is not None:
+            self.decode_cuda_graph_capture_sampling = _coerce_bool_config(
+                "decode_graph_capture_sampling",
+                self.decode_graph_capture_sampling,
+            )
+        else:
+            self.decode_cuda_graph_capture_sampling = _coerce_bool_config(
+                "decode_cuda_graph_capture_sampling",
+                self.decode_cuda_graph_capture_sampling,
+            )
+        self.decode_graph_capture_sampling = bool(self.decode_cuda_graph_capture_sampling)
+
+        if self.decode_graph_capture_sizes is not None:
+            self.decode_cuda_graph_capture_sizes = self.decode_graph_capture_sizes
+
+        if self.omnikv_decode_graph is not None:
+            self.omnikv_decode_cuda_graph = _coerce_bool_config(
+                "omnikv_decode_graph",
+                self.omnikv_decode_graph,
+            )
+        else:
+            self.omnikv_decode_cuda_graph = _coerce_bool_config(
+                "omnikv_decode_cuda_graph",
+                self.omnikv_decode_cuda_graph,
+            )
+        self.omnikv_decode_graph = bool(self.omnikv_decode_cuda_graph)
 
     def __post_init__(self):
         if os.getenv("PROFILER_SVLLM"):
@@ -446,11 +488,10 @@ class Config:
         self.max_decoding_seqs = int(self.max_decoding_seqs)
         if not 1 <= self.tensor_parallel_size <= 8:
             raise ValueError(f"tensor_parallel_size must be in [1, 8], got {self.tensor_parallel_size}.")
-        self.decode_cuda_graph = bool(self.decode_cuda_graph)
+        self._normalize_platform_aliases()
         if legacy_deltakv_graph_method:
             self.decode_cuda_graph = True
-        self.decode_cuda_graph_capture_sampling = bool(self.decode_cuda_graph_capture_sampling)
-        self.omnikv_decode_cuda_graph = bool(self.omnikv_decode_cuda_graph)
+            self.decode_graph = True
         if self.decode_cuda_graph_max_cached_graphs is not None:
             self.decode_cuda_graph_max_cached_graphs = int(self.decode_cuda_graph_max_cached_graphs)
             if self.decode_cuda_graph_max_cached_graphs <= 0:
@@ -487,6 +528,10 @@ class Config:
                 self.decode_cuda_graph_context_sizes,
                 self.max_model_len,
             )
+        self.decode_graph = bool(self.decode_cuda_graph)
+        self.decode_graph_capture_sampling = bool(self.decode_cuda_graph_capture_sampling)
+        self.decode_graph_capture_sizes = self.decode_cuda_graph_capture_sizes
+        self.omnikv_decode_graph = bool(self.omnikv_decode_cuda_graph)
         if isinstance(self.deltakv_path, str):
             deltakv_path = self.deltakv_path.strip()
             self.deltakv_path = None if deltakv_path.lower() in {"", "none", "null"} else deltakv_path

@@ -45,19 +45,19 @@ class QuestCacheManager(CacheManager):
         super().__init__(config, rank, world_size)
         self.page_size = int(config.quest_chunk_size)
         self.max_pages_per_row = (self.max_model_len + self.page_size - 1) // self.page_size
-        self.page_offsets_i32 = torch.arange(self.page_size, dtype=torch.int32, device="cuda")
+        self.page_offsets_i32 = torch.arange(self.page_size, dtype=torch.int32, device=self.device)
         self.page_offsets_i64 = self.page_offsets_i32.to(torch.int64)
 
         self.allocate_kv_cache()
 
-        self.free_pages_stack = torch.arange(self.num_pages, dtype=torch.int32, device="cuda")
+        self.free_pages_stack = torch.arange(self.num_pages, dtype=torch.int32, device=self.device)
         self._num_free_pages = self.num_pages
 
         self.buffer_req_to_token_slots = torch.zeros(
-            (self.max_buffer_rows, self.max_model_len), dtype=torch.int32, device="cuda"
+            (self.max_buffer_rows, self.max_model_len), dtype=torch.int32, device=self.device
         )
         self.buffer_req_to_page_slots = torch.full(
-            (self.max_buffer_rows, self.max_pages_per_row), -1, dtype=torch.int32, device="cuda"
+            (self.max_buffer_rows, self.max_pages_per_row), -1, dtype=torch.int32, device=self.device
         )
 
         self.seq_id_to_row: dict[int, int] = {}
@@ -92,7 +92,7 @@ class QuestCacheManager(CacheManager):
             self.num_kv_heads,
             self.head_dim,
             dtype=self.hf_config.torch_dtype,
-            device="cuda",
+            device=self.device,
         )
 
     def allocate_kv_cache(self):
@@ -114,7 +114,7 @@ class QuestCacheManager(CacheManager):
             self.num_kv_heads,
             self.head_dim,
             dtype=self.hf_config.torch_dtype,
-            device="cuda",
+            device=self.device,
         )
 
     def get_layer_batch_states(self, layer_idx: int) -> LayerBatchStates:
@@ -550,7 +550,7 @@ class QuestCacheManager(CacheManager):
             positions_np = np.empty(total_chunk_tokens, dtype=np.int64)
             cu_seqlens_q = [0]
 
-            slot_mapping = torch.empty(total_chunk_tokens, dtype=torch.int32, device="cuda")
+            slot_mapping = torch.empty(total_chunk_tokens, dtype=torch.int32, device=self.device)
             context_lens_list = []
             req_indices = []
 
@@ -587,16 +587,16 @@ class QuestCacheManager(CacheManager):
                 cu_seqlens_q.append(cu_seqlens_q[-1] + chunk_size)
                 token_offset += chunk_size
 
-            context_lens = torch.tensor(context_lens_list, dtype=torch.int32, device="cuda")
-            req_indices_tensor = torch.tensor(req_indices, dtype=torch.int32, device="cuda")
+            context_lens = torch.tensor(context_lens_list, dtype=torch.int32, device=self.device)
+            req_indices_tensor = torch.tensor(req_indices, dtype=torch.int32, device=self.device)
 
             self.layer_batch_state.slot_mapping = slot_mapping
             self.layer_batch_state.context_lens = context_lens
             self.layer_batch_state.req_indices = req_indices_tensor
 
-            input_ids = torch.from_numpy(input_ids_np).to("cuda")
-            positions = torch.from_numpy(positions_np).to("cuda")
-            cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, device="cuda")
+            input_ids = torch.from_numpy(input_ids_np).to(self.device)
+            positions = torch.from_numpy(positions_np).to(self.device)
+            cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, device=self.device)
             return input_ids, positions, cu_seqlens_q
 
     def on_forward_end(self, seqs: list[Sequence], is_prefill: bool):
@@ -657,19 +657,19 @@ class QuestCacheManager(CacheManager):
             context_lens = torch.tensor(
                 self.row_seq_lens[row_indices],
                 dtype=torch.int32,
-                device="cuda",
+                device=self.device,
             )
-            req_indices = torch.tensor(row_indices, dtype=torch.int32, device="cuda")
+            req_indices = torch.tensor(row_indices, dtype=torch.int32, device=self.device)
 
-            slot_mapping = torch.empty((batch_size,), dtype=torch.int32, device="cuda")
+            slot_mapping = torch.empty((batch_size,), dtype=torch.int32, device=self.device)
             slot_mapping[:] = new_slots_batch
 
             self.layer_batch_state.slot_mapping = slot_mapping
             self.layer_batch_state.context_lens = context_lens
             self.layer_batch_state.req_indices = req_indices
 
-            input_ids = torch.tensor(input_ids_list, dtype=torch.int64, device="cuda")
-            positions = torch.tensor(positions_list, dtype=torch.int64, device="cuda")
+            input_ids = torch.tensor(input_ids_list, dtype=torch.int64, device=self.device)
+            positions = torch.tensor(positions_list, dtype=torch.int64, device=self.device)
             return input_ids, positions, None
 
     @torch.no_grad()
@@ -710,11 +710,11 @@ class QuestCacheManager(CacheManager):
             row_indices = [self.seq_id_to_row[sid] for sid in seq_ids]
             real_context_lens = self.row_seq_lens[row_indices]
 
-            input_ids[:real_batch_size].copy_(torch.tensor(input_ids_list, dtype=torch.int64, device="cuda"))
-            positions[:real_batch_size].copy_(torch.tensor(positions_list, dtype=torch.int64, device="cuda"))
+            input_ids[:real_batch_size].copy_(torch.tensor(input_ids_list, dtype=torch.int64, device=self.device))
+            positions[:real_batch_size].copy_(torch.tensor(positions_list, dtype=torch.int64, device=self.device))
             slot_mapping[:real_batch_size].copy_(new_slots_batch)
-            context_lens[:real_batch_size].copy_(torch.tensor(real_context_lens, dtype=torch.int32, device="cuda"))
-            req_indices[:real_batch_size].copy_(torch.tensor(row_indices, dtype=torch.int32, device="cuda"))
+            context_lens[:real_batch_size].copy_(torch.tensor(real_context_lens, dtype=torch.int32, device=self.device))
+            req_indices[:real_batch_size].copy_(torch.tensor(row_indices, dtype=torch.int32, device=self.device))
 
             if graph_batch_size > real_batch_size:
                 input_ids[real_batch_size:].fill_(int(input_ids_list[0]))
@@ -742,7 +742,7 @@ class QuestCacheManager(CacheManager):
         if not get_context().is_prefill:
             self._on_kv_stored_decode_static(layer_idx, slot_mapping)
             return
-        if torch.cuda.is_current_stream_capturing():
+        if self._is_stream_capturing():
             self._on_kv_stored_prefill_capture(layer_idx, k, slot_mapping)
             return
 

@@ -59,7 +59,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         """
         if active_slots.numel() == 0:
             return active_slots, torch.empty((0,), device=active_slots.device, dtype=torch.int32)
-        if not get_context().is_prefill or torch.cuda.is_current_stream_capturing():
+        if not get_context().is_prefill or self._is_stream_capturing():
             return self._materialize_deltakv_active_postrope_view_static(
                 layer_idx,
                 active_slots,
@@ -171,7 +171,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         safe_raw_slots = torch.where(raw_mask, flat_active, torch.zeros_like(flat_active)).to(torch.long)
         raw_pos = self.deltakv_slot_to_pos[safe_raw_slots].to(torch.long)
 
-        is_capturing = torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        is_capturing = self._is_stream_capturing()
         if not is_capturing and ((raw_pos < 0) & raw_mask).any():
             raise RuntimeError(f"DeltaKV less-memory static sparse raw slot has unknown position, layer={layer_idx}.")
         safe_pos = torch.where(raw_mask, raw_pos, torch.zeros_like(raw_pos))
@@ -388,7 +388,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
 
         slots_i32 = slots.to(layer_mask.device).to(torch.int32).flatten()
         valid = (slots_i32 >= 0) & (slots_i32 < int(layer_mask.shape[0]))
-        is_capturing = torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        is_capturing = self._is_stream_capturing()
         if is_capturing:
             raise RuntimeError(
                 "DeltaKV less-memory is not CUDA Graph capture-safe. "
@@ -421,7 +421,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         if slots is not None:
             return slots
         if batch_size == 0 or k_max == 0:
-            slots = torch.empty((batch_size, k_max), device="cuda", dtype=torch.int32)
+            slots = torch.empty((batch_size, k_max), device=self.device, dtype=torch.int32)
         else:
             slots = self._allocate_temp_deltakv_full(batch_size * k_max).to(torch.int32).view(batch_size, k_max)
             self._deltakv_static_temp_slots_reserved_total = int(
@@ -434,7 +434,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         """Return expensive slot provenance details for invariant failures only."""
         if slots.numel() == 0:
             return "slot_debug=empty"
-        slots_i32 = slots.to(device="cuda", dtype=torch.int32).flatten()
+        slots_i32 = slots.to(device=self.device, dtype=torch.int32).flatten()
         slot_list = [int(x) for x in slots_i32.detach().cpu().tolist()]
         details: list[str] = []
 
@@ -919,7 +919,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
             self.num_kv_heads,
             self.head_dim,
             dtype=self.hf_config.torch_dtype,
-            device="cuda",
+            device=self.device,
         )
         self.deltakv_full_kv_cache = torch.empty(
             2,
@@ -928,7 +928,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
             self.num_kv_heads,
             self.head_dim,
             dtype=self.hf_config.torch_dtype,
-            device="cuda",
+            device=self.device,
         )
         self.deltakv_full_pre_rope_k_cache = None
         self.deltakv_full_ref_v_cache = None
@@ -938,13 +938,13 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
             self.num_kv_heads,
             self.head_dim,
             dtype=self.hf_config.torch_dtype,
-            device="cuda",
+            device=self.device,
         )
         self._deltakv_postrope_slot_mask = torch.zeros(
             num_deltakv_layers,
             self.deltakv_full_num_slots,
             dtype=torch.bool,
-            device="cuda",
+            device=self.device,
         )
         self._deltakv_materialized_active_slots = None
         self._deltakv_materialized_local_req = None
@@ -955,14 +955,14 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
             self.num_kv_heads,
             self.head_dim,
             dtype=self.hf_config.torch_dtype,
-            device="cuda",
+            device=self.device,
         )
         self.deltakv_prefill_staging_pre_rope_k_cache = torch.empty(
             self.deltakv_prefill_staging_num_slots,
             self.num_kv_heads,
             self.head_dim,
             dtype=self.hf_config.torch_dtype,
-            device="cuda",
+            device=self.device,
         )
         self.full_layer_kivi_prefill_k_cache_fp32 = None
 
@@ -973,7 +973,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
             self.deltakv_latent_num_slots,
             latent_width,
             dtype=latent_dtype,
-            device="cuda",
+            device=self.device,
         )
         if quant_bits:
             sparse_num_groups = sparse_payload_dim // sparse_group_size
@@ -982,7 +982,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
                 self.deltakv_latent_num_slots,
                 sparse_num_groups,
                 dtype=self.hf_config.torch_dtype,
-                device="cuda",
+                device=self.device,
             )
             self.deltakv_latent_mins = torch.empty_like(self.deltakv_latent_scales)
         else:
@@ -993,19 +993,19 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
             (num_deltakv_layers, self.deltakv_latent_num_slots, config.deltakv_k_neighbors),
             -1,
             dtype=torch.int32,
-            device="cuda",
+            device=self.device,
         )
         self.deltakv_slot_to_pos = torch.full(
             (self.deltakv_full_num_slots,),
             -1,
             dtype=torch.int32,
-            device="cuda",
+            device=self.device,
         )
         self.full_layer_slot_to_pos = torch.full(
             (self.full_num_slots,),
             -1,
             dtype=torch.int32,
-            device="cuda",
+            device=self.device,
         )
 
         if full_quant_enabled:
@@ -1016,33 +1016,33 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
                 self.full_layer_latent_num_slots,
                 full_latent_width,
                 dtype=torch.int32,
-                device="cuda",
+                device=self.device,
             )
             self.full_layer_latent_scales = torch.empty(
                 num_full_layers,
                 self.full_layer_latent_num_slots,
                 full_num_groups,
                 dtype=self.hf_config.torch_dtype,
-                device="cuda",
+                device=self.device,
             )
             self.full_layer_latent_mins = torch.empty_like(self.full_layer_latent_scales)
             self.full_layer_latent_to_full_slots = torch.full(
                 (num_full_layers, self.full_layer_latent_num_slots, config.deltakv_k_neighbors),
                 -1,
                 dtype=torch.int32,
-                device="cuda",
+                device=self.device,
             )
             self.free_slots_stack_full_layer_latent = torch.arange(
                 self.full_layer_latent_num_slots,
                 dtype=torch.int32,
-                device="cuda",
+                device=self.device,
             )
             self._num_free_slots_full_layer_latent = self.full_layer_latent_num_slots
             self.full_layer_latent_slots_map = torch.full(
                 (self.max_buffer_rows, self.max_model_len),
                 -1,
                 dtype=torch.int32,
-                device="cuda",
+                device=self.device,
             )
             self.row_full_layer_compressed_lens = torch.zeros(
                 (self.max_buffer_rows,), dtype=torch.int32, device="cpu"
@@ -1077,7 +1077,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
                 self.head_dim,
                 key_packed_width,
                 dtype=torch.int32,
-                device="cuda",
+                device=self.device,
             )
             self.full_layer_kivi_key_scales = torch.empty(
                 num_full_layers,
@@ -1085,7 +1085,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
                 self.num_kv_heads,
                 self.head_dim,
                 dtype=torch.float32,
-                device="cuda",
+                device=self.device,
             )
             self.full_layer_kivi_key_mins = torch.empty_like(self.full_layer_kivi_key_scales)
             self.full_layer_kivi_value_packed = torch.empty(
@@ -1095,7 +1095,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
                 full_kivi_group_size,
                 value_packed_width,
                 dtype=torch.int32,
-                device="cuda",
+                device=self.device,
             )
             self.full_layer_kivi_value_scales = torch.empty(
                 num_full_layers,
@@ -1104,22 +1104,22 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
                 full_kivi_group_size,
                 value_groups,
                 dtype=self.hf_config.torch_dtype,
-                device="cuda",
+                device=self.device,
             )
             self.full_layer_kivi_value_mins = torch.empty_like(self.full_layer_kivi_value_scales)
-            self.free_slots_stack_full_layer_kivi = torch.arange(kivi_blocks, dtype=torch.int32, device="cuda")
+            self.free_slots_stack_full_layer_kivi = torch.arange(kivi_blocks, dtype=torch.int32, device=self.device)
             self._num_free_slots_full_layer_kivi = kivi_blocks
             self.full_layer_kivi_block_slots_map = torch.full(
                 (self.max_buffer_rows, self.max_model_len),
                 -1,
                 dtype=torch.int32,
-                device="cuda",
+                device=self.device,
             )
             self.full_layer_kivi_block_start_pos = torch.full(
                 (kivi_blocks,),
                 -1,
                 dtype=torch.int32,
-                device="cuda",
+                device=self.device,
             )
             self._full_layer_kivi_full_prefill_plans = {}
             self._full_layer_kivi_full_prefill_materialized_layers = set()
@@ -1142,7 +1142,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
             else None
         )
         self.row_full_layer_kivi_quantized_lens_gpu = (
-            torch.zeros((self.max_buffer_rows,), dtype=torch.int32, device="cuda")
+            torch.zeros((self.max_buffer_rows,), dtype=torch.int32, device=self.device)
             if self._full_layer_kivi_enabled()
             else None
         )
@@ -1155,8 +1155,8 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         self.compress_down = []
         self.compress_up = []
         for _ in range(num_deltakv_layers):
-            self.compress_down.append(create_compressor(is_down=True, config=config).cuda())
-            self.compress_up.append(create_compressor(is_down=False, config=config).cuda())
+            self.compress_down.append(create_compressor(is_down=True, config=config).to(device=self.device))
+            self.compress_up.append(create_compressor(is_down=False, config=config).to(device=self.device))
 
     def _collect_k_norm_weights(self, layers, layer_ids: list[int]):
         weights = []
@@ -1166,7 +1166,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
             k_norm = getattr(attn, "k_norm", None)
             if k_norm is None:
                 return None, None
-            weights.append(k_norm.weight.detach().to(device="cuda", dtype=self.hf_config.torch_dtype).clone())
+            weights.append(k_norm.weight.detach().to(device=self.device, dtype=self.hf_config.torch_dtype).clone())
             eps = float(getattr(k_norm, "eps", 1e-6))
         return torch.stack(weights, dim=0) if weights else None, eps
 
@@ -1368,11 +1368,11 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
             base_step=self._full_layer_base_cluster_step(),
         )
         if not centers:
-            return torch.empty((0,), dtype=torch.long, device="cuda")
+            return torch.empty((0,), dtype=torch.long, device=self.device)
         rel = [pos - int(start) for pos in centers if int(start) <= pos < int(end)]
         if not rel:
-            return torch.empty((0,), dtype=torch.long, device="cuda")
-        return torch.tensor(rel, dtype=torch.long, device="cuda")
+            return torch.empty((0,), dtype=torch.long, device=self.device)
+        return torch.tensor(rel, dtype=torch.long, device=self.device)
 
     def _estimate_full_layer_centers_for_total_len(self, total_len: int) -> int:
         total_len = int(total_len)
@@ -1500,7 +1500,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
                     "Full-layer KIVI full-prefill staging capacity is too small: "
                     f"tokens={size}, staging_slots={self.deltakv_prefill_staging_num_slots}."
                 )
-            staging_slots = torch.arange(int(size), dtype=torch.int32, device="cuda")
+            staging_slots = torch.arange(int(size), dtype=torch.int32, device=self.device)
             self.full_layer_slots_map[row_idx, cur_len: cur_len + int(size)] = staging_slots
             return staging_slots
         return super()._allocate_full(seq_id, size)
@@ -1534,7 +1534,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         if keep_pos.numel() > 0:
             self.full_layer_slots_map[row_idx, keep_pos.to(torch.long)] = keep_slots
         if block_slots.numel() > 0:
-            offsets = torch.arange(group_size, device="cuda", dtype=torch.long)
+            offsets = torch.arange(group_size, device=self.device, dtype=torch.long)
             block_pos = block_start_pos.to(torch.long)[:, None] + offsets[None, :]
             block_slot_values = block_slots.to(torch.int32)[:, None].expand(-1, group_size)
             self.full_layer_kivi_block_slots_map[row_idx, block_pos.reshape(-1)] = block_slot_values.reshape(-1)
@@ -1577,7 +1577,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
                 block_starts = plan["block_start_pos"].to(torch.long)
                 block_slots = plan["block_slots"].to(torch.long)
                 if block_slots.numel() > 0:
-                    offsets = torch.arange(group_size, device="cuda", dtype=torch.long)
+                    offsets = torch.arange(group_size, device=self.device, dtype=torch.long)
                     with profiler.record("deltakv_full_prefill_kivi_store_blocks"):
                         for start in range(0, int(block_slots.numel()), block_chunk_size):
                             end = min(int(block_slots.numel()), start + block_chunk_size)
@@ -1600,10 +1600,10 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
 
     @torch.no_grad()
     def _allocate_full_positions(self, seq_id: int, positions: torch.Tensor) -> torch.Tensor:
-        positions = positions.to(device="cuda", dtype=torch.int32).contiguous()
+        positions = positions.to(device=self.device, dtype=torch.int32).contiguous()
         size = int(positions.numel())
         if size == 0:
-            return torch.empty((0,), dtype=torch.int32, device="cuda")
+            return torch.empty((0,), dtype=torch.int32, device=self.device)
         if self._num_free_slots_full < size:
             raise RuntimeError(
                 "Out of full-layer raw cache slots for KIVI keep tokens: "
@@ -1622,7 +1622,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
     def _allocate_full_layer_kivi_blocks(self, size: int) -> torch.Tensor:
         size = int(size)
         if size == 0:
-            return torch.empty((0,), dtype=torch.int32, device="cuda")
+            return torch.empty((0,), dtype=torch.int32, device=self.device)
         if self._num_free_slots_full_layer_kivi < size:
             raise RuntimeError(
                 "Out of full-layer KIVI packed blocks: "
@@ -1816,7 +1816,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
                 "DeltaKV less-memory latent residual store shape mismatch: "
                 f"slots={int(latent_slots.numel())}, residual_rows={int(residual.shape[0])}."
             )
-        capturing = torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        capturing = self._is_stream_capturing()
         if not capturing:
             latent_cap = int(self.deltakv_latent_cache.shape[1])
             bad_latent = (latent_slots < 0) | (latent_slots >= latent_cap)
@@ -1938,7 +1938,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
                 f"source_tokens={int(source_k.shape[0])}, k_tokens={int(k.shape[0])}."
             )
         valid = (slot_mapping >= 0) & (slot_mapping < int(self.deltakv_prefill_staging_num_slots))
-        capturing = torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        capturing = self._is_stream_capturing()
         if capturing:
             self.deltakv_prefill_staging_pre_rope_k_cache[slot_mapping.to(torch.long)] = source_k.to(
                 self.deltakv_prefill_staging_pre_rope_k_cache.dtype
@@ -1977,7 +1977,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
 
     def _stage_pre_rope_kv_by_pos(self, pos: torch.Tensor) -> torch.Tensor:
         pos_i64 = pos.to(torch.long)
-        if not torch.cuda.is_current_stream_capturing() and (
+        if not self._is_stream_capturing() and (
             (pos_i64 < 0).any() or (pos_i64 >= int(self.deltakv_prefill_staging_num_slots)).any()
         ):
             raise RuntimeError("DeltaKV pre-RoPE staging position is outside staging cache.")
@@ -2143,7 +2143,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
             )
         if int(store_indices_all.numel()) == 0:
             return
-        if not torch.cuda.is_current_stream_capturing():
+        if not self._is_stream_capturing():
             if bool((store_indices_all < 0).any()) or bool((store_indices_all >= int(evict_pos.numel())).any()):
                 raise RuntimeError("DeltaKV full-prefill store indices are outside the evict block.")
             if int(store_indices_all.numel()) > 1 and bool((store_indices_all[1:] < store_indices_all[:-1]).any()):
@@ -2204,7 +2204,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
             if next_cursor == store_cursor:
                 continue
             selected_global = store_indices_all[store_cursor:next_cursor]
-            if not torch.cuda.is_current_stream_capturing() and (
+            if not self._is_stream_capturing() and (
                 bool((selected_global < start).any()) or bool((selected_global >= end).any())
             ):
                 raise RuntimeError("DeltaKV full-prefill store index fell outside its chunk.")
@@ -2297,11 +2297,11 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
             return torch.empty(
                 (0, 2 * self.num_kv_heads * self.head_dim),
                 dtype=self.hf_config.torch_dtype,
-                device="cuda",
+                device=self.device,
             )
         slots_i32 = slots.to(torch.int32)
         pos = self.deltakv_slot_to_pos[slots_i32.to(torch.long)].to(torch.long)
-        capturing = torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        capturing = self._is_stream_capturing()
         if not capturing and (pos < 0).any():
             raise RuntimeError("DeltaKV less-memory: reference slot has unknown position.")
         if self._prefill_pre_rope_stage_active() and (
@@ -2340,7 +2340,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
             new_center_rel = torch.arange(0, n, max(1, int(cluster_step)), device=kv_states.device, dtype=torch.long)
         else:
             new_center_rel = new_center_rel.to(device=kv_states.device, dtype=torch.long)
-        capturing = torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        capturing = self._is_stream_capturing()
         if (
             not capturing
             and new_center_rel.numel() > 0
@@ -2445,7 +2445,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         active_compressed_indices: torch.Tensor | None,
         req_indices: torch.Tensor,
     ):
-        if not get_context().is_prefill or torch.cuda.is_current_stream_capturing():
+        if not get_context().is_prefill or self._is_stream_capturing():
             return self._deltakv_build_view_and_plan_reconstruct_static(
                 layer_idx,
                 active_compressed_indices,
@@ -2578,7 +2578,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
                 self.num_kv_heads,
                 self.head_dim,
                 dtype=self.hf_config.torch_dtype,
-                device="cuda",
+                device=self.device,
             )
             self._full_layer_quant_v_cache = torch.empty_like(self._full_layer_quant_k_cache)
 
@@ -2597,7 +2597,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
                 self.num_kv_heads,
                 self.head_dim,
                 dtype=torch.float32,
-                device="cuda",
+                device=self.device,
             )
             self._full_layer_score_v_scratch_fp32 = torch.empty_like(self._full_layer_score_k_cache_fp32)
 
@@ -2615,21 +2615,21 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
                 batch_size,
                 max_len,
                 dtype=torch.int32,
-                device="cuda",
+                device=self.device,
             )
         needs_local_req = (
             self._full_layer_quant_local_req is None
             or int(self._full_layer_quant_local_req.numel()) < batch_size
         )
         if needs_local_req:
-            self._full_layer_quant_local_req = torch.arange(batch_size, dtype=torch.int32, device="cuda")
+            self._full_layer_quant_local_req = torch.arange(batch_size, dtype=torch.int32, device=self.device)
         positions = getattr(self, "_full_layer_quant_positions", None)
         if positions is None or int(positions.numel()) < max_len:
-            self._full_layer_quant_positions = torch.arange(max_len, dtype=torch.int32, device="cuda")
+            self._full_layer_quant_positions = torch.arange(max_len, dtype=torch.int32, device=self.device)
         out_slots = getattr(self, "_full_layer_quant_out_slots", None)
         total_slots = batch_size * max_len
         if out_slots is None or int(out_slots.numel()) < total_slots:
-            self._full_layer_quant_out_slots = torch.arange(total_slots, dtype=torch.int32, device="cuda")
+            self._full_layer_quant_out_slots = torch.arange(total_slots, dtype=torch.int32, device=self.device)
 
     def _deltakv_decode_static_max_buffer(self) -> int:
         recent = int(self.config.num_recent_tokens)
@@ -2647,7 +2647,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
             return torch.empty(
                 (0, 2 * self.num_kv_heads * self.head_dim),
                 dtype=self.hf_config.torch_dtype,
-                device="cuda",
+                device=self.device,
             )
         l_idx = self.full_layer_to_idx[layer_idx]
         slots_i32 = slots.to(torch.int32)
@@ -2781,12 +2781,12 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         kv_dim = 2 * kv_dim_half
         residual = self._load_full_layer_residual(l_idx, latent_slots, kv_dim)
         father_slots = self.full_layer_latent_to_full_slots[l_idx, latent_slots].to(torch.int32)
-        if not torch.cuda.is_current_stream_capturing():
+        if not self._is_stream_capturing():
             check_father_slots = father_slots if validate_mask is None else father_slots[validate_mask]
             if (check_father_slots < 0).any():
                 raise RuntimeError("Full-layer residual quantization: missing father slots.")
         father_pos = self.full_layer_slot_to_pos[father_slots].to(torch.long)
-        if not torch.cuda.is_current_stream_capturing():
+        if not self._is_stream_capturing():
             check_father_pos = father_pos if validate_mask is None else father_pos[validate_mask]
             if (check_father_pos < 0).any():
                 raise RuntimeError("Full-layer residual quantization: father slot has unknown position.")
@@ -2819,17 +2819,17 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if not self.has_full_layer_quantized_view(layer_idx):
             raise NotImplementedError
-        if not get_context().is_prefill or torch.cuda.is_current_stream_capturing():
+        if not get_context().is_prefill or self._is_stream_capturing():
             return self._build_full_layer_quantized_view_static(layer_idx, req_indices, context_lens)
         bsz = int(req_indices.numel())
         if bsz == 0:
-            empty = torch.empty((0,), dtype=torch.int32, device="cuda")
-            return torch.empty((0, 0), dtype=torch.int32, device="cuda"), empty, empty
+            empty = torch.empty((0,), dtype=torch.int32, device=self.device)
+            return torch.empty((0, 0), dtype=torch.int32, device=self.device), empty, empty
         max_len = int(context_lens.max().item())
         total_slots = bsz * max_len
         self._ensure_full_layer_quant_temp_cache(total_slots)
-        active_slots = torch.full((bsz, max_len), -1, dtype=torch.int32, device="cuda")
-        local_req = torch.arange(bsz, dtype=torch.int32, device="cuda")
+        active_slots = torch.full((bsz, max_len), -1, dtype=torch.int32, device=self.device)
+        local_req = torch.arange(bsz, dtype=torch.int32, device=self.device)
         l_idx = self.full_layer_to_idx[layer_idx]
 
         req_cpu = req_indices.cpu().numpy()
@@ -2839,7 +2839,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
             if total_len <= 0:
                 continue
             out_start = b * max_len
-            out_slots = torch.arange(out_start, out_start + total_len, dtype=torch.int32, device="cuda")
+            out_slots = torch.arange(out_start, out_start + total_len, dtype=torch.int32, device=self.device)
             active_slots[b, :total_len] = out_slots
 
             raw_slots = self.full_layer_slots_map[row, :total_len].to(torch.int32)
@@ -2852,7 +2852,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
 
             need = ~raw_mask
             if need.any():
-                pos = torch.arange(total_len, dtype=torch.int32, device="cuda")[need]
+                pos = torch.arange(total_len, dtype=torch.int32, device=self.device)[need]
                 latent_slots = self.full_layer_latent_slots_map[row, pos.to(torch.long)].to(torch.int32)
                 if (latent_slots < 0).any():
                     raise RuntimeError("Full-layer quantized view found a token with neither raw nor residual slot.")
@@ -2873,8 +2873,8 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         bsz = int(req_indices.numel())
         if bsz == 0:
-            empty = torch.empty((0,), dtype=torch.int32, device="cuda")
-            return torch.empty((0, 0), dtype=torch.int32, device="cuda"), empty, empty
+            empty = torch.empty((0,), dtype=torch.int32, device=self.device)
+            return torch.empty((0, 0), dtype=torch.int32, device=self.device), empty, empty
         max_len = getattr(self, "_decode_static_max_context_len", None)
         if max_len is None:
             max_len = self.full_layer_batch_states.max_context_len
@@ -2883,7 +2883,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         max_len = int(max_len)
         if max_len <= 0:
             raise RuntimeError(f"Full-layer quantized static decode got invalid max_context_len={max_len}.")
-        if not torch.cuda.is_current_stream_capturing():
+        if not self._is_stream_capturing():
             actual_max_len = int(context_lens.max().item())
             if actual_max_len > max_len:
                 raise RuntimeError(
@@ -2924,7 +2924,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         need = valid & ~raw_mask
         flat_need = need.reshape(-1)
         latent_slots = self.full_layer_latent_slots_map[rows.unsqueeze(1), pos_i64.unsqueeze(0)].to(torch.int32)
-        if not torch.cuda.is_current_stream_capturing() and (latent_slots[need] < 0).any():
+        if not self._is_stream_capturing() and (latent_slots[need] < 0).any():
             raise RuntimeError("Full-layer quantized static view found a token with neither raw nor residual slot.")
         flat_latent_slots = latent_slots.reshape(-1)
         safe_latent_slots = torch.where(flat_need, flat_latent_slots, torch.zeros_like(flat_latent_slots)).to(torch.long)
@@ -3004,10 +3004,10 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
             return None
         bsz = int(req_indices.numel())
         if bsz == 0:
-            return torch.empty((0, 0, self.num_kv_heads, self.head_dim), dtype=torch.float32, device="cuda")
+            return torch.empty((0, 0, self.num_kv_heads, self.head_dim), dtype=torch.float32, device=self.device)
         max_comp_len = int(compressed_lens.max().item()) if compressed_lens.numel() else 0
         if max_comp_len <= 0:
-            return torch.empty((bsz, 0, self.num_kv_heads, self.head_dim), dtype=torch.float32, device="cuda")
+            return torch.empty((bsz, 0, self.num_kv_heads, self.head_dim), dtype=torch.float32, device=self.device)
 
         self._ensure_full_layer_score_key_workspace(bsz, max_comp_len)
         score_k = self._full_layer_score_k_cache_fp32
@@ -3022,8 +3022,8 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
             if comp_len <= 0:
                 continue
             out_start = b * max_comp_len
-            out_slots = torch.arange(out_start, out_start + comp_len, dtype=torch.int32, device="cuda")
-            pos = torch.arange(sink, sink + comp_len, dtype=torch.int32, device="cuda")
+            out_slots = torch.arange(out_start, out_start + comp_len, dtype=torch.int32, device=self.device)
+            pos = torch.arange(sink, sink + comp_len, dtype=torch.int32, device=self.device)
             raw_slots = self.full_layer_slots_map[row, pos.to(torch.long)].to(torch.int32)
             raw_mask = raw_slots >= 0
             if raw_mask.any():
@@ -3093,7 +3093,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
                             key_post_rope=self.full_kv_cache[0, l_idx, raw_i64],
                             value=self.full_kv_cache[1, l_idx, raw_i64],
                         )
-                    pos = torch.arange(start, end, device="cuda", dtype=torch.long)
+                    pos = torch.arange(start, end, device=self.device, dtype=torch.long)
                     self.full_layer_kivi_block_slots_map[row_idx, pos] = block_slot
                     self.full_layer_kivi_block_start_pos[block_slot.to(torch.long)] = int(start)
 
@@ -3173,14 +3173,14 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
                             sink_slots if existing is None else existing.to(torch.int32)
                         )
 
-                    is_center = torch.zeros((evict_len,), device="cuda", dtype=torch.bool)
+                    is_center = torch.zeros((evict_len,), device=self.device, dtype=torch.bool)
                     is_center[center_rel] = True
-                    to_store_mask = torch.ones((evict_len,), device="cuda", dtype=torch.bool)
+                    to_store_mask = torch.ones((evict_len,), device=self.device, dtype=torch.bool)
                     to_free_mask = ~is_center
 
                 with profiler.record("deltakv_less_memory_evict_alloc_latent"):
                     latent_slots = self._allocate_deltakv_latent(evict_len).to(torch.int32)
-                    pos_all = torch.arange(evict_start, evict_end, device="cuda", dtype=torch.int32)
+                    pos_all = torch.arange(evict_start, evict_end, device=self.device, dtype=torch.int32)
                     pos_to_free = pos_all[to_free_mask]
                     self.sparse_layer_latent_slots_map[row_idx, pos_all.to(torch.long)] = latent_slots
                     raw_slots_block_i32 = raw_slots_block.to(torch.int32)
@@ -3375,7 +3375,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
                 existing = self.row_deltakv_center_slots[row_idx][layer_idx]
                 prev_center_slots_by_layer[layer_idx] = sink_slots if existing is None else existing.to(torch.int32)
 
-            is_center = torch.zeros((evict_len,), device="cuda", dtype=torch.bool)
+            is_center = torch.zeros((evict_len,), device=self.device, dtype=torch.bool)
             if center_rel.numel() > 0:
                 is_center[center_rel] = True
             to_compress_mask = ~is_center
@@ -3390,7 +3390,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
                 continue
 
             latent_slots = self._allocate_full_layer_latent(num_to_compress).to(torch.int32)
-            pos_all = torch.arange(evict_start, evict_end, device="cuda", dtype=torch.int32)
+            pos_all = torch.arange(evict_start, evict_end, device=self.device, dtype=torch.int32)
             pos_to_compress = pos_all[to_compress_mask]
             self.full_layer_latent_slots_map[row_idx, pos_to_compress.to(torch.long)] = latent_slots
 

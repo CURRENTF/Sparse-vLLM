@@ -7,7 +7,12 @@ from sparsevllm.engine.cache_manager import CacheManager, SparseSelection
 from sparsevllm.utils.profiler import profiler
 from sparsevllm.utils.context import get_context
 from sparsevllm.utils.log import logger, log_level
-from sparsevllm.triton_kernel.omnikv_fused import build_omnikv_keep_and_slots
+
+
+def build_omnikv_keep_and_slots(*args, **kwargs):
+    from sparsevllm.triton_kernel.omnikv_fused import build_omnikv_keep_and_slots as _build
+
+    return _build(*args, **kwargs)
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -61,6 +66,11 @@ class SparseController:
         
         self.config = config
         self.cache_manager = cache_manager
+        self.device = getattr(
+            cache_manager,
+            "device",
+            torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+        )
 
         self.obs_layer_ids = self.config.obs_layer_ids
         self.full_attn_layers = self.config.full_attn_layers
@@ -206,7 +216,7 @@ class SparseController:
                             (batch_size, num_heads, max_len),
                             _val,
                             dtype=self.attn_score_dtype,
-                            device="cuda",
+                            device=self.device,
                         )
                     else:
                         state.attn_score = self._get_decode_attn_score_buffer(
@@ -239,7 +249,7 @@ class SparseController:
         needs_alloc = (
             buf is None
             or buf.dtype != self.attn_score_dtype
-            or not buf.is_cuda
+            or buf.device != self.device
             or int(buf.shape[0]) < int(batch_size)
             or int(buf.shape[1]) < int(num_heads)
             or int(buf.shape[2]) < int(max_len)
@@ -248,7 +258,7 @@ class SparseController:
             buf = torch.empty(
                 (int(batch_size), int(num_heads), int(max_len)),
                 dtype=self.attn_score_dtype,
-                device="cuda",
+                device=self.device,
             )
             self._decode_attn_score_buffers[int(layer_idx)] = buf
         view = buf[:batch_size, :num_heads, :max_len]
@@ -290,7 +300,7 @@ class SparseController:
                 raise RuntimeError("PyramidKV full-prefill staging should only run on the final prefill chunk.")
             kv_len = int(state.context_lens[b_idx])
             if kv_len <= budget:
-                keep_indices = torch.arange(kv_len, device="cuda", dtype=torch.long)
+                keep_indices = torch.arange(kv_len, device=self.device, dtype=torch.long)
             else:
                 keep_indices = self._snapkv_select_indices(
                     attn_scores[b_idx, :kv_len], kv_len, budget
@@ -597,7 +607,7 @@ class SparseController:
 
     def _streamingllm_select_indices(self, kv_len: int) -> torch.Tensor:
         assert kv_len > 0
-        device = "cuda"
+        device = self.device
         sink_end = min(self.num_sink, kv_len)
         recent_start = max(sink_end, kv_len - self.num_recent)
         sink_indices = torch.arange(sink_end, device=device, dtype=torch.long)
@@ -667,7 +677,7 @@ class SparseController:
                 raise ValueError
 
             # 2. 掩码处理 (处理不等长 + 防止 topk 选到 buffer/chunk 区域)
-            mask = torch.arange(search_scores.size(1), device="cuda") >= rel_hist_lens.unsqueeze(1)
+            mask = torch.arange(search_scores.size(1), device=self.device) >= rel_hist_lens.unsqueeze(1)
             search_scores.masked_fill_(mask, -1e10)
             if (
                 self.dynamic_deltakv_topk_tiebreak
@@ -694,7 +704,7 @@ class SparseController:
                     if k_max > 0:
                         topk_indices = search_scores.topk(k_max, dim=1, sorted=True).indices.to(torch.int32)
                     else:
-                        topk_indices = torch.empty((batch_size, 0), device="cuda", dtype=torch.int32)
+                        topk_indices = torch.empty((batch_size, 0), device=self.device, dtype=torch.int32)
                 else:
                     topk_list = []
                     k_list = []
@@ -703,19 +713,19 @@ class SparseController:
                         k_b = min(int(decode_keep), int(search_scores.size(1)), max(0, avail))
                         k_list.append(k_b)
                         if k_b <= 0:
-                            topk_list.append(torch.empty((0,), device="cuda", dtype=torch.int32))
+                            topk_list.append(torch.empty((0,), device=self.device, dtype=torch.int32))
                         else:
                             idx = search_scores[b].topk(k_b, dim=0).indices.to(torch.int32)
                             topk_list.append(idx)
                     k_max = max(k_list) if k_list else 0
                     if k_max > 0:
-                        topk_indices = torch.full((batch_size, k_max), -1, device="cuda", dtype=torch.int32)
+                        topk_indices = torch.full((batch_size, k_max), -1, device=self.device, dtype=torch.int32)
                         for b in range(batch_size):
                             k_b = k_list[b]
                             if k_b > 0:
                                 topk_indices[b, :k_b] = topk_list[b]
                     else:
-                        topk_indices = torch.empty((batch_size, 0), device="cuda", dtype=torch.int32)
+                        topk_indices = torch.empty((batch_size, 0), device=self.device, dtype=torch.int32)
                 if self.debug_dynamic_selection_detail:
                     debug_k = min(16, int(search_scores.shape[1]))
                     detail = {
@@ -738,15 +748,15 @@ class SparseController:
 
             # 4. 根据方法更新目标层状态
             if self.sparse_method == 'omnikv':
-                local_req_indices = torch.arange(batch_size, dtype=torch.int32, device="cuda")
+                local_req_indices = torch.arange(batch_size, dtype=torch.int32, device=self.device)
                 decode_keep = int(decode_keep)
                 k_max = min(decode_keep, int(search_scores.size(1)))
                 if k_max > 0:
                     topk_lens = rel_hist_lens.clamp(min=0, max=k_max).to(torch.int32)
                     topk_indices = search_scores.topk(k_max, dim=1, sorted=False).indices.to(torch.int32) + self.num_sink
                 else:
-                    topk_lens = torch.zeros((batch_size,), dtype=torch.int32, device="cuda")
-                    topk_indices = torch.empty((batch_size, 0), device="cuda", dtype=torch.int32)
+                    topk_lens = torch.zeros((batch_size,), dtype=torch.int32, device=self.device)
+                    topk_indices = torch.empty((batch_size, 0), device=self.device, dtype=torch.int32)
 
                 if ctx.is_prefill:
                     chunk_lens = ctx.cu_seqlens_q[1:] - ctx.cu_seqlens_q[:-1]
