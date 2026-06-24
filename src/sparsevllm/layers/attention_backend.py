@@ -7,8 +7,13 @@ from sparsevllm.triton_kernel.context_flashattention_nopad import context_attent
 from sparsevllm.triton_kernel.flash_decoding_stage1 import flash_decode_stage1 as mha_flash_decode_stage1
 from sparsevllm.triton_kernel.flash_decoding_stage1 import flash_decode_stage1_with_score as mha_flash_decode_stage1_with_score
 from sparsevllm.triton_kernel.flash_decoding_stage2 import flash_decode_stage2
+from sparsevllm.triton_kernel.flash_decoding_stage2_hd256 import flash_decode_stage2 as flash_decode_stage2_hd256
 from sparsevllm.triton_kernel.gqa_flash_decoding_stage1 import flash_decode_stage1 as gqa_flash_decode_stage1
 from sparsevllm.triton_kernel.gqa_flash_decoding_stage1 import flash_decode_stage1_with_score as gqa_flash_decode_stage1_with_score
+from sparsevllm.triton_kernel.gqa_flash_decoding_stage1_hd256 import flash_decode_stage1 as gqa_flash_decode_stage1_hd256
+from sparsevllm.triton_kernel.gqa_flash_decoding_stage1_hd256 import (
+    flash_decode_stage1_with_score as gqa_flash_decode_stage1_hd256_with_score,
+)
 
 
 class TritonAttentionBackend:
@@ -68,8 +73,23 @@ class TritonAttentionBackend:
 
         self._debug_check_decode_bounds(view)
         is_gqa = int(num_heads) > int(num_kv_heads)
+        use_gqa_hd256 = is_gqa and int(q.shape[-1]) == 256
         if view.attn_score is not None:
-            if is_gqa:
+            if use_gqa_hd256:
+                gqa_flash_decode_stage1_hd256_with_score(
+                    q,
+                    view.k_cache,
+                    view.v_cache,
+                    view.active_slots,
+                    view.req_indices,
+                    view.context_lens,
+                    max_len_in_batch,
+                    mid_o,
+                    mid_o_logexpsum,
+                    view.attn_score,
+                    block_seq,
+                )
+            elif is_gqa:
                 gqa_flash_decode_stage1_with_score(
                     q,
                     view.k_cache,
@@ -98,7 +118,20 @@ class TritonAttentionBackend:
                     block_seq,
                 )
         else:
-            if is_gqa:
+            if use_gqa_hd256:
+                gqa_flash_decode_stage1_hd256(
+                    q,
+                    view.k_cache,
+                    view.v_cache,
+                    view.active_slots,
+                    view.req_indices,
+                    view.context_lens,
+                    max_len_in_batch,
+                    mid_o,
+                    mid_o_logexpsum,
+                    block_seq,
+                )
+            elif is_gqa:
                 gqa_flash_decode_stage1(
                     q,
                     view.k_cache,
@@ -126,7 +159,10 @@ class TritonAttentionBackend:
                 )
 
         o = torch.empty_like(q)
-        flash_decode_stage2(mid_o, mid_o_logexpsum, view.context_lens, o, block_seq)
+        if use_gqa_hd256:
+            flash_decode_stage2_hd256(mid_o, mid_o_logexpsum, view.context_lens, o, block_seq)
+        else:
+            flash_decode_stage2(mid_o, mid_o_logexpsum, view.context_lens, o, block_seq)
         return o
 
     def _run_full_layer_kivi_decode_stage1(
