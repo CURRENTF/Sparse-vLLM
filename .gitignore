@@ -11,3 +11,4 @@ wandb/
 /outputs/
 /benchmark/scbench/results/
 /reference/
+/benchmark/results/
