@@ -15,7 +15,10 @@ authors = [
 dependencies = [
     "fire",
     "torch",
-    "transformers[torch]==4.53.3",
+    "transformers==5.12.1",
+    "triton==3.4.0",
+    "torchvision",
+    "pillow",
     "accelerate",
     "deepspeed",
     "datasets",
@@ -25,13 +28,13 @@ dependencies = [
     "loguru",
     "ansible",
     "bitsandbytes",
-    "flash-attn",
     "datatrove",
     "tqdm",
     "loguru",
     "fastapi",
     "uvicorn[standard]",
     "pydantic",
+    "pytest",
 ]
 
 [project.scripts]

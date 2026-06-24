@@ -75,12 +75,19 @@ The full documentation index is maintained in [docs/README.md](docs/README.md).
 Install the package from the repository root:
 
 ```bash
-conda create -n svllm python=3.10 -y
-conda activate svllm
-pip install torch==2.8.0 transformers[torch]==4.53.3 accelerate deepspeed==0.15.4 torchvision datasets==4.1.0 bitsandbytes
-pip install fire matplotlib seaborn wandb loguru ansible
-MAX_JOBS=8 pip install flash-attn --no-build-isolation
-pip install -e .
+uv venv --python 3.12 .venv
+source .venv/bin/activate
+
+uv pip install torch==2.8.0 torchvision==0.23.0
+uv pip install \
+  transformers==5.12.1 pillow accelerate deepspeed datasets matplotlib \
+  seaborn wandb loguru ansible bitsandbytes datatrove tqdm fire fastapi \
+  "uvicorn[standard]" pydantic
+uv pip install -e . --no-deps
+
+# Optional CUDA kernels. Install only after the base environment works.
+# MAX_JOBS=8 uv pip install flash-attn --no-build-isolation
+# uv pip install "flash-linear-attention[cuda,conv1d]==0.5.1"
 ```
 
 For the full dependency list and a minimal `LLM(...)` example, see
