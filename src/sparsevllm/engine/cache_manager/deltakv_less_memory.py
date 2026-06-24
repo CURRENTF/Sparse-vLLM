@@ -87,7 +87,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
             src_slots = active_slots[b, :view_len].to(torch.long)
             if (src_slots < 0).any():
                 raise RuntimeError(f"DeltaKV less-memory: active sparse view contains negative slot, layer={layer_idx}.")
-            already = self._already_postrope_mask(layer_idx, src_slots)
+            already = self._already_postrope_mask(layer_idx, src_slots, already_postrope_slots)
             raw_idx = torch.nonzero(~already, as_tuple=False).flatten()
             if raw_idx.numel() == 0:
                 continue
@@ -147,11 +147,9 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         DeltaKV static-materialization cache, and invalid/padded entries preserve
         previous cache contents through masked writes.
         """
-        # Static decode tracks post-RoPE status through the per-layer slot mask.
-        # The already_postrope_slots argument is kept for signature compatibility;
-        # doing an active_width × reconstructed_width membership check here is too
-        # expensive for graph decode and is redundant with the mask.
-        del already_postrope_slots
+        # Runtime decode tracks post-RoPE status through the per-layer slot mask.
+        # Tests and partial object construction may not initialize that mask, so
+        # _already_postrope_mask falls back to the explicit slots in that case.
         l_idx = self.deltakv_layer_to_idx[layer_idx]
         k_cache = self.deltakv_full_kv_cache[0, l_idx]
         v_cache = self.deltakv_full_kv_cache[1, l_idx]
@@ -168,7 +166,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
             visible = torch.ones_like(flat_active, dtype=torch.bool)
 
         valid = visible & (flat_active >= 0)
-        already = self._already_postrope_mask(layer_idx, flat_active)
+        already = self._already_postrope_mask(layer_idx, flat_active, already_postrope_slots)
         raw_mask = valid & ~already
         safe_raw_slots = torch.where(raw_mask, flat_active, torch.zeros_like(flat_active)).to(torch.long)
         raw_pos = self.deltakv_slot_to_pos[safe_raw_slots].to(torch.long)
@@ -356,11 +354,23 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         max_decode_visible = int(sink) + int(top_decode) + max(2 * int(recent), int(recent) + 1)
         return max(1, int(max_seqs) * max_decode_visible, int(getattr(self.config, "max_num_batched_tokens", 0) or 0))
 
-    def _already_postrope_mask(self, layer_idx: int, slots: torch.Tensor) -> torch.Tensor:
+    def _already_postrope_mask(
+        self,
+        layer_idx: int,
+        slots: torch.Tensor,
+        already_postrope_slots: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         valid = slots >= 0
         masks = getattr(self, "_deltakv_postrope_slot_mask", None)
         if masks is None:
-            return torch.zeros_like(valid, dtype=torch.bool)
+            if already_postrope_slots is None or already_postrope_slots.numel() == 0:
+                return torch.zeros_like(valid, dtype=torch.bool)
+            already = already_postrope_slots.to(device=slots.device, dtype=slots.dtype).flatten()
+            already = already[already >= 0]
+            if already.numel() == 0:
+                return torch.zeros_like(valid, dtype=torch.bool)
+            membership = slots.reshape(-1, 1) == already.reshape(1, -1)
+            return valid & membership.any(dim=1).view_as(slots)
         l_idx = self.deltakv_layer_to_idx[int(layer_idx)]
         layer_mask = masks[l_idx]
         safe_slots = slots.to(torch.long).clamp(0, int(layer_mask.shape[0]) - 1)

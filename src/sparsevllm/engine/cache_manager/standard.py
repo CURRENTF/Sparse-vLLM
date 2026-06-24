@@ -160,18 +160,18 @@ class StandardCacheManager(CacheManager):
     def free_slot_stats(self) -> dict[str, int]:
         stats = super().free_slot_stats()
         stats["free_rows"] = int(self.num_free_rows)
-        if self.prefix_cache is not None:
+        if getattr(self, "prefix_cache", None) is not None:
             stats.update(self.prefix_cache.stats())
             stats["prefix_cache_evictable_slots"] = int(self._prefix_evictable_slots())
         return stats
 
     def _require_prefix_cache(self) -> PrefixCacheIndex:
-        if self.prefix_cache is None:
+        if getattr(self, "prefix_cache", None) is None:
             raise RuntimeError("prefix cache is not enabled for this cache manager.")
         return self.prefix_cache
 
     def _prefix_evictable_slots(self) -> int:
-        if self.prefix_cache is None:
+        if getattr(self, "prefix_cache", None) is None:
             return 0
         return int(self.prefix_cache.evictable_blocks() * self.prefix_cache_block_size)
 
@@ -185,7 +185,7 @@ class StandardCacheManager(CacheManager):
         return int(self.num_free_slots + self._prefix_evictable_slots())
 
     def _prefix_hit_evictable_slots(self, seq: Sequence) -> int:
-        if self.prefix_cache is None or int(getattr(seq, "prefix_cache_hit_len", 0) or 0) <= 0:
+        if getattr(self, "prefix_cache", None) is None or int(getattr(seq, "prefix_cache_hit_len", 0) or 0) <= 0:
             return 0
         if seq.prefix_cache_hit_last_key is None:
             raise RuntimeError(f"seq_id={seq.seq_id} has prefix hit length but no last key.")
