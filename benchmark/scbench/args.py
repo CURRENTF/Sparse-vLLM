@@ -15,6 +15,7 @@ except ImportError:
     KV_TYPES = ["dense", "retr_attn", "kivi"]
 
 for attn_type in (
+    "sparsevllm",
     "snapkv",
     "pyramidkv",
     "palu",

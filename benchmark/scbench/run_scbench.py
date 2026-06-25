@@ -59,6 +59,8 @@ from transformers import (
 from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.utils.import_utils import _is_package_available
 
+SPARSEVLLM_ATTN_TYPE = "sparsevllm"
+
 LLM = None
 SamplingParams = None
 if _is_package_available("vllm"):
@@ -82,6 +84,404 @@ try:
     from minference import MInference
 except ImportError:
     MInference = None
+
+
+def _numeric_stats_delta(before: dict[str, int], after: dict[str, int]) -> dict[str, int]:
+    return {
+        key: int(after.get(key, 0)) - int(before.get(key, 0))
+        for key in sorted(set(before) | set(after))
+    }
+
+
+def _usable_prefix_cache_tokens(prompt_len: int, block_size: int) -> int:
+    prompt_len = int(prompt_len)
+    block_size = int(block_size)
+    if block_size <= 0 or prompt_len <= 1:
+        return 0
+    return ((prompt_len - 1) // block_size) * block_size
+
+
+def _eligible_cache_tokens(reusable_prefix_tokens: int, current_prompt_len: int, block_size: int) -> int:
+    reusable = (int(reusable_prefix_tokens) // int(block_size)) * int(block_size)
+    return min(reusable, _usable_prefix_cache_tokens(current_prompt_len, block_size))
+
+
+def _prefix_trace_path(
+    result_dir: Path,
+    data_name: str,
+    use_scdq: str,
+    use_llmlingua: str,
+    *,
+    rank: int | None = None,
+) -> Path:
+    suffix = f".rank{rank}" if rank is not None else ""
+    return result_dir / f"prefix_cache_trace_{data_name}{use_scdq}{use_llmlingua}{suffix}.jsonl"
+
+
+def _prefix_summary_path(
+    result_dir: Path,
+    data_name: str,
+    use_scdq: str,
+    use_llmlingua: str,
+) -> Path:
+    return result_dir / f"prefix_cache_summary_{data_name}{use_scdq}{use_llmlingua}.json"
+
+
+def _write_jsonl(records: list[dict[str, Any]], path: Path, *, append: bool = True) -> None:
+    if not records:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    mode = "a" if append else "w"
+    with path.open(mode, encoding="utf-8") as f:
+        for record in records:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def _flush_sparsevllm_prefix_trace(
+    model: Any,
+    path: Path,
+    *,
+    data_name: str,
+    example_id: int,
+) -> list[dict[str, Any]]:
+    pop_records = getattr(model, "pop_prefix_cache_trace_records", None)
+    if pop_records is None:
+        return []
+    records = pop_records()
+    for record in records:
+        record["data_name"] = data_name
+        record["example_id"] = int(example_id)
+    _write_jsonl(records, path, append=True)
+    return records
+
+
+def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    records: list[dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                records.append(json.loads(line))
+    return records
+
+
+def _write_sparsevllm_prefix_summary(trace_path: Path, summary_path: Path) -> dict[str, Any]:
+    records = _read_jsonl(trace_path)
+    success = [record for record in records if record.get("status") == "success"]
+    failures = [record for record in records if record.get("status") != "success"]
+    total_prompt_tokens = sum(int(record.get("prompt_tokens", 0) or 0) for record in success)
+    total_generated_tokens = sum(int(record.get("generated_tokens", 0) or 0) for record in success)
+    total_cached_tokens = sum(int(record.get("cached_tokens", 0) or 0) for record in success)
+    total_cached_blocks = sum(int(record.get("cached_blocks", 0) or 0) for record in success)
+    total_eligible_tokens = sum(int(record.get("eligible_cache_tokens", 0) or 0) for record in success)
+    request_elapsed_s = sum(float(record.get("latency_s", 0.0) or 0.0) for record in success)
+
+    status_counts: dict[str, int] = {}
+    for record in records:
+        status = str(record.get("status", "metric_failed"))
+        status_counts[status] = status_counts.get(status, 0) + 1
+
+    final_stats = records[-1].get("prefix_cache_stats_after", {}) if records else {}
+    stats_delta: dict[str, int] = {}
+    if records:
+        first_before = records[0].get("prefix_cache_stats_before", {}) or {}
+        stats_delta = _numeric_stats_delta(first_before, final_stats)
+
+    summary = {
+        "status": "success" if records and not failures else ("skipped_by_policy" if not records else "metric_failed"),
+        "trace_path": str(trace_path),
+        "request_count": len(records),
+        "success_requests": len(success),
+        "failed_requests": len(failures),
+        "status_counts": status_counts,
+        "total_prompt_tokens": total_prompt_tokens,
+        "total_generated_tokens": total_generated_tokens,
+        "total_cached_tokens": total_cached_tokens,
+        "total_cached_blocks": total_cached_blocks,
+        "total_eligible_cache_tokens": total_eligible_tokens,
+        "hit_requests": sum(1 for record in success if int(record.get("cached_tokens", 0) or 0) > 0),
+        "cache_hit_rate": total_cached_tokens / total_prompt_tokens if total_prompt_tokens else 0.0,
+        "eligible_cache_hit_rate": (
+            total_cached_tokens / total_eligible_tokens if total_eligible_tokens else 0.0
+        ),
+        "request_elapsed_s": request_elapsed_s,
+        "request_throughput": len(success) / request_elapsed_s if request_elapsed_s > 0 else 0.0,
+        "input_token_throughput": total_prompt_tokens / request_elapsed_s if request_elapsed_s > 0 else 0.0,
+        "recomputed_prompt_tokens": total_prompt_tokens - total_cached_tokens,
+        "prefix_cache_stats_final": final_stats,
+        "prefix_cache_stats_delta": stats_delta,
+    }
+    summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return summary
+
+
+def _maybe_write_sparsevllm_prefix_summary(
+    model: Any,
+    trace_path: Path,
+    summary_path: Path,
+) -> dict[str, Any] | None:
+    if not hasattr(model, "pop_prefix_cache_trace_records"):
+        return None
+    return _write_sparsevllm_prefix_summary(trace_path, summary_path)
+
+
+class SparseVLLMSCBenchSearch:
+    def __init__(self, llm: Any, tokenizer: Any, *, max_steps: int = 200_000):
+        self.llm = llm
+        self.tokenizer = tokenizer
+        self.max_steps = int(max_steps)
+        self._trace_records: list[dict[str, Any]] = []
+        self._request_counter = 0
+        self._closed = False
+
+    def _cache_stats(self) -> dict[str, int]:
+        model_runner = getattr(self.llm, "model_runner", None)
+        cache_manager = getattr(model_runner, "cache_manager", None)
+        if cache_manager is None or not hasattr(cache_manager, "free_slot_stats"):
+            return {}
+        raw_stats = cache_manager.free_slot_stats()
+        return {
+            str(key): int(value)
+            for key, value in raw_stats.items()
+            if isinstance(value, (int, float, bool))
+        }
+
+    def _prefix_cache_block_size(self) -> int:
+        config = getattr(self.llm, "config", None)
+        return int(getattr(config, "prefix_cache_block_size", 16) or 16)
+
+    def _find_live_seq(self, seq_id: int) -> Any | None:
+        scheduler = getattr(self.llm, "scheduler", None)
+        if scheduler is None:
+            return None
+        for queue_name in ("waiting", "decoding"):
+            for seq in getattr(scheduler, queue_name, []):
+                if int(getattr(seq, "seq_id", -1)) == int(seq_id):
+                    return seq
+        return None
+
+    def _trace_metric_error(
+        self,
+        *,
+        cached_tokens: int,
+        cached_blocks: int,
+        eligible_cache_tokens: int,
+        block_size: int,
+    ) -> str:
+        if cached_tokens < 0:
+            return f"cached_tokens={cached_tokens} is negative."
+        if cached_blocks < 0:
+            return f"cached_blocks={cached_blocks} is negative."
+        if cached_tokens == 0 and cached_blocks == 0:
+            return ""
+        if block_size <= 0:
+            return f"invalid prefix_cache_block_size={block_size}."
+        if cached_tokens % block_size != 0:
+            return f"cached_tokens={cached_tokens} is not block-aligned to {block_size}."
+        if cached_blocks * block_size != cached_tokens:
+            return f"cached_blocks={cached_blocks} does not match cached_tokens={cached_tokens}."
+        if cached_tokens > eligible_cache_tokens:
+            return (
+                f"cached_tokens={cached_tokens} exceeds eligible_cache_tokens="
+                f"{eligible_cache_tokens}."
+            )
+        return ""
+
+    def _run_one_request(
+        self,
+        prompt_token_ids: list[int],
+        *,
+        max_tokens: int,
+        mode: str,
+        turn_idx: int,
+        reusable_prefix_tokens: int,
+    ) -> str:
+        from sparsevllm import SamplingParams as SparseSamplingParams
+
+        prompt_token_ids = [int(token_id) for token_id in prompt_token_ids]
+        max_tokens = int(max_tokens)
+        block_size = self._prefix_cache_block_size()
+        eligible_tokens = _eligible_cache_tokens(
+            reusable_prefix_tokens,
+            len(prompt_token_ids),
+            block_size,
+        )
+        stats_before = self._cache_stats()
+        start_s = time.perf_counter()
+        seq_id = self.llm.add_request(
+            prompt_token_ids,
+            SparseSamplingParams(
+                temperature=0.0,
+                top_p=1.0,
+                max_tokens=max_tokens,
+            ),
+        )
+        self._request_counter += 1
+        first_token_s: float | None = None
+        finish_s: float | None = None
+        generated_token_ids: list[int] = []
+        cached_tokens = 0
+        cached_blocks = 0
+        status = "success"
+        error_message = ""
+
+        try:
+            step_count = 0
+            zero_progress_steps = 0
+            while not self.llm.is_finished():
+                if step_count >= self.max_steps:
+                    raise RuntimeError(
+                        f"Sparse-vLLM SCBench request exceeded max_steps={self.max_steps}."
+                    )
+                step_count += 1
+                finished_outputs, num_tokens = self.llm.step()
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                now_s = time.perf_counter()
+
+                if num_tokens == 0:
+                    zero_progress_steps += 1
+                    if zero_progress_steps >= 50:
+                        raise RuntimeError("Sparse-vLLM scheduler made no progress for 50 steps.")
+                else:
+                    zero_progress_steps = 0
+
+                for output_seq_id, _token_ids in getattr(self.llm, "last_step_token_outputs", []):
+                    if int(output_seq_id) != int(seq_id) or first_token_s is not None:
+                        continue
+                    first_token_s = now_s
+                    seq = self._find_live_seq(seq_id)
+                    if seq is not None:
+                        cached_tokens = int(getattr(seq, "prefix_cache_hit_len", 0) or 0)
+                        cached_blocks = int(getattr(seq, "prefix_cache_hit_block_count", 0) or 0)
+
+                for output_seq_id, output_token_ids, _logprobs, _top_logprobs in finished_outputs:
+                    if int(output_seq_id) == int(seq_id):
+                        generated_token_ids = [int(token_id) for token_id in output_token_ids]
+                        finish_s = now_s
+        except Exception as exc:
+            status = "model_failed"
+            error_message = repr(exc)
+            finish_s = time.perf_counter()
+            raise
+        finally:
+            end_s = finish_s or time.perf_counter()
+            if first_token_s is None:
+                first_token_s = end_s
+            metric_error = self._trace_metric_error(
+                cached_tokens=cached_tokens,
+                cached_blocks=cached_blocks,
+                eligible_cache_tokens=eligible_tokens,
+                block_size=block_size,
+            )
+            if metric_error:
+                status = "metric_failed"
+                error_message = metric_error if not error_message else f"{error_message}; {metric_error}"
+            stats_after = self._cache_stats()
+            record = {
+                "request_idx": self._request_counter,
+                "seq_id": int(seq_id),
+                "mode": mode,
+                "turn_idx": int(turn_idx),
+                "status": status,
+                "prompt_tokens": len(prompt_token_ids),
+                "max_new_tokens": max_tokens,
+                "generated_tokens": len(generated_token_ids),
+                "planned_reusable_prefix_tokens": int(reusable_prefix_tokens),
+                "eligible_cache_tokens": int(eligible_tokens),
+                "cached_tokens": int(cached_tokens),
+                "cached_blocks": int(cached_blocks),
+                "ttft_s": float(first_token_s - start_s),
+                "latency_s": float(end_s - start_s),
+                "error_message": error_message,
+                "prefix_cache_stats_before": stats_before,
+                "prefix_cache_stats_after": stats_after,
+                "prefix_cache_stats_delta": _numeric_stats_delta(stats_before, stats_after),
+            }
+            self._trace_records.append(record)
+
+        return self.tokenizer.decode(generated_token_ids, skip_special_tokens=True)
+
+    def pop_prefix_cache_trace_records(self) -> list[dict[str, Any]]:
+        records = self._trace_records
+        self._trace_records = []
+        return records
+
+    def test_scdq(self, example, max_length=100):
+        results = []
+        init_prompt_ids: list[int] | None = None
+        for idx, prompt in enumerate(example["prompts"]):
+            if idx == 0:
+                init_prompt_ids = [int(token_id) for token_id in prompt]
+                continue
+            if isinstance(max_length, dict):
+                max_length_per_turn = max_length[example["task"][idx - 1]]
+            else:
+                max_length_per_turn = max_length
+            if init_prompt_ids is None:
+                raise RuntimeError("SCDQ prompt is missing the shared context prompt.")
+            current_ids = self.tokenizer.encode(prompt, add_special_tokens=False)
+            input_ids = init_prompt_ids + current_ids
+            results.append(
+                self._run_one_request(
+                    input_ids,
+                    max_tokens=int(max_length_per_turn),
+                    mode="scdq",
+                    turn_idx=idx - 1,
+                    reusable_prefix_tokens=len(init_prompt_ids),
+                )
+            )
+        output = {"answers": results, "gt": example["ground_truth"]}
+        if isinstance(max_length, dict):
+            output["task"] = example["task"]
+        return output
+
+    def test(self, example, max_length=100, disable_golden_context=False):
+        results = []
+        input_ids: list[int] | None = None
+        for idx, prompt in enumerate(example["prompts"]):
+            if isinstance(max_length, dict):
+                max_length_per_turn = max_length[example["task"][idx]]
+            else:
+                max_length_per_turn = max_length
+
+            reusable_prefix_tokens = len(input_ids) if input_ids is not None else 0
+            if idx == 0:
+                input_ids = [int(token_id) for token_id in prompt]
+            else:
+                current_ids = self.tokenizer.encode(prompt, add_special_tokens=False)
+                if input_ids is None:
+                    input_ids = []
+                if disable_golden_context and results:
+                    input_ids = (
+                        input_ids
+                        + self.tokenizer.encode(results[-1], add_special_tokens=False)
+                        + [self.tokenizer.eos_token_id]
+                    )
+                    reusable_prefix_tokens = len(input_ids)
+                input_ids = input_ids + current_ids
+
+            answer = self._run_one_request(
+                input_ids,
+                max_tokens=int(max_length_per_turn),
+                mode="multi_turn",
+                turn_idx=idx,
+                reusable_prefix_tokens=reusable_prefix_tokens,
+            )
+            results.append(answer)
+        output = {"answers": results, "gt": example["ground_truth"]}
+        if isinstance(max_length, dict):
+            output["task"] = example["task"]
+        return output
+
+    def clear(self):
+        if self._closed:
+            return
+        self._closed = True
+        exit_fn = getattr(self.llm, "exit", None)
+        if exit_fn is not None:
+            exit_fn()
 
 
 # sampling_params = SamplingParams(temperature=0.8, top_p=0.95)
@@ -153,6 +553,29 @@ def _merge_rank_jsonl(dst_path: Path, src_paths: list[Path]):
                 rows.append(json.loads(line))
 
     rows.sort(key=lambda x: (x.get("id", -1), x.get("turn_idx", -1)))
+    dump_jsonl(rows, dst_path)
+
+
+def _merge_prefix_trace_jsonl(dst_path: Path, src_paths: list[Path]):
+    rows = []
+    for p in src_paths:
+        if not p.exists():
+            continue
+        with open(p, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                rows.append(json.loads(line))
+
+    rows.sort(
+        key=lambda x: (
+            x.get("example_id", -1),
+            x.get("turn_idx", -1),
+            x.get("request_idx", -1),
+            x.get("seq_id", -1),
+        )
+    )
     dump_jsonl(rows, dst_path)
 
 
@@ -311,6 +734,15 @@ def _run_scbench_worker(
             max_new_tokens = 500
 
         output_path = result_dir / f"prediction_{data_name}{use_scdq}{use_llmlingua}.rank{rank}.jsonl"
+        trace_path = _prefix_trace_path(
+            result_dir,
+            data_name,
+            use_scdq,
+            use_llmlingua,
+            rank=rank,
+        )
+        if hasattr(model, "pop_prefix_cache_trace_records"):
+            trace_path.write_text("", encoding="utf-8")
         examples = _load_scbench_dataset(data_name)
 
         if args.use_llmlingua:
@@ -393,6 +825,12 @@ def _run_scbench_worker(
                     case["task"] = eg["task"]
                 preds.append(case)
             dump_jsonl(preds, output_path)
+            _flush_sparsevllm_prefix_trace(
+                model,
+                trace_path,
+                data_name=data_name,
+                example_id=i,
+            )
             torch.cuda.empty_cache()
 
     try:
@@ -480,6 +918,26 @@ def load_model(
             model_name, trust_remote_code=trust_remote_code
         )
     # tok.pad_token = tok.eos_token
+
+    if attn_type == SPARSEVLLM_ATTN_TYPE:
+        from sparsevllm import LLM as SparseLLM
+
+        sparse_hyper_param = hyper_param.copy()
+        scbench_max_steps = int(sparse_hyper_param.pop("scbench_max_steps", 200_000))
+        cuda_device = sparse_hyper_param.pop("cuda_device", "auto")
+        if cuda_device != "auto" and torch.cuda.is_available():
+            torch.cuda.set_device(int(cuda_device))
+
+        if max_seq_length is not None:
+            sparse_hyper_param.setdefault("max_model_len", int(max_seq_length))
+        sparse_hyper_param.setdefault("tensor_parallel_size", int(tensor_parallel_size))
+        sparse_hyper_param.setdefault("enforce_eager", True)
+        sparse_hyper_param.setdefault("throughput_log_interval_s", 0.0)
+
+        llm = SparseLLM(model_name, **sparse_hyper_param)
+        llm = SparseVLLMSCBenchSearch(llm, tok, max_steps=scbench_max_steps)
+        print("Sparse-vLLM model and tokenizer loaded.")
+        return llm, tok
 
     if attn_type in [
         "deltakv",
@@ -708,6 +1166,23 @@ if __name__ == "__main__":
                 for rank in range(args.ws)
             ]
             _merge_rank_jsonl(merged_path, shard_paths)
+            if args.attn_type == SPARSEVLLM_ATTN_TYPE:
+                trace_path = _prefix_trace_path(result_dir, data_name, use_scdq, use_llmlingua)
+                trace_shard_paths = [
+                    _prefix_trace_path(
+                        result_dir,
+                        data_name,
+                        use_scdq,
+                        use_llmlingua,
+                        rank=rank,
+                    )
+                    for rank in range(args.ws)
+                ]
+                _merge_prefix_trace_jsonl(trace_path, trace_shard_paths)
+                _write_sparsevllm_prefix_summary(
+                    trace_path,
+                    _prefix_summary_path(result_dir, data_name, use_scdq, use_llmlingua),
+                )
             score = compute_scores(
                 merged_path,
                 data_name,
@@ -748,6 +1223,10 @@ if __name__ == "__main__":
                 max_new_tokens = 500
 
             output_path = result_dir / f"prediction_{data_name}{use_scdq}{use_llmlingua}.jsonl"
+            trace_path = _prefix_trace_path(result_dir, data_name, use_scdq, use_llmlingua)
+            trace_summary_path = _prefix_summary_path(result_dir, data_name, use_scdq, use_llmlingua)
+            if hasattr(model, "pop_prefix_cache_trace_records"):
+                trace_path.write_text("", encoding="utf-8")
             examples = _load_scbench_dataset(data_name)
 
             if args.use_llmlingua:
@@ -834,6 +1313,12 @@ if __name__ == "__main__":
                         case["task"] = eg["task"]
                     preds.append(case)
                 dump_jsonl(preds, output_path)
+                _flush_sparsevllm_prefix_trace(
+                    model,
+                    trace_path,
+                    data_name=data_name,
+                    example_id=i,
+                )
                 torch.cuda.empty_cache()
 
             score = compute_scores(
@@ -843,6 +1328,7 @@ if __name__ == "__main__":
                 max_seq_length=max_seq_length,
                 scdq_mode=scdq_mode,
             )
+            _maybe_write_sparsevllm_prefix_summary(model, trace_path, trace_summary_path)
             results[data_name] = score
 
     print("==== Results ====")
