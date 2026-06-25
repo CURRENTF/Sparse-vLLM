@@ -346,6 +346,53 @@ def _stress_command(
     ]
 
 
+def _scbench_command(
+    *,
+    manifest_path: Path,
+    model_id: str,
+    method_ids: list[str],
+    scbench: dict[str, Any],
+    output_dir: Path,
+) -> list[str]:
+    cmd = [
+        sys.executable,
+        "scripts/benchmarks/run_scbench_sparsevllm_methods.py",
+        "--manifest",
+        str(manifest_path),
+        "--model_id",
+        model_id,
+        "--methods",
+        ",".join(method_ids),
+        "--tasks",
+        ",".join(str(task) for task in scbench["tasks"]),
+        "--output_dir",
+        str(output_dir),
+        "--num_eval_examples",
+        str(int(scbench["num_eval_examples"])),
+        "--max_turns",
+        str(int(scbench["max_turns"])),
+        "--max_seq_length",
+        str(int(scbench["max_seq_length"])),
+        "--batch_size",
+        str(int(scbench["batch_size"])),
+        "--prefix_cache_block_size",
+        str(int(scbench.get("prefix_cache_block_size", 16))),
+    ]
+    if scbench.get("trust_remote_code", False):
+        cmd.append("--trust_remote_code")
+    if scbench.get("use_chat_template", False):
+        cmd.append("--use_chat_template")
+    if scbench.get("disable_golden_context", False):
+        cmd.append("--disable_golden_context")
+    if "context_min_tokens" in scbench:
+        cmd.extend(["--context_min_tokens", str(int(scbench["context_min_tokens"]))])
+    if "context_max_tokens" in scbench:
+        cmd.extend(["--context_max_tokens", str(int(scbench["context_max_tokens"]))])
+    if "gpu_memory_utilization" in scbench:
+        cmd.extend(["--gpu_memory_utilization", str(float(scbench["gpu_memory_utilization"]))])
+    return cmd
+
+
 def _load_result_json(path: Path) -> dict[str, Any] | None:
     result_path = path / "result.json"
     if not result_path.exists():
@@ -380,7 +427,7 @@ def _grade_quality_pair(vanilla_root: Path, sparse_root: Path) -> GateGrade:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run fixed Sparse-VLLM regression gates.")
     parser.add_argument("--manifest", default=None)
-    parser.add_argument("--layer", default="validate", choices=["validate", "quality", "logits", "perf", "stress", "nightly", "pre-refactor"])
+    parser.add_argument("--layer", default="validate", choices=["validate", "quality", "logits", "perf", "stress", "scbench", "nightly", "pre-refactor"])
     parser.add_argument("--models", default=None, help="Comma-separated model ids from the manifest.")
     parser.add_argument("--methods", default=None, help="Comma-separated method ids from the manifest.")
     parser.add_argument("--run_id", default=None)
@@ -426,6 +473,7 @@ def main() -> int:
     logits_records: list[dict[str, Any]] = []
     memory_records: list[dict[str, Any]] = []
     stress_records: list[dict[str, Any]] = []
+    scbench_records: list[dict[str, Any]] = []
 
     cwd = Path.cwd()
     try:
@@ -435,6 +483,7 @@ def main() -> int:
             _write_json(output_root / "logits_alignment.json", {"records": logits_records})
             _write_json(output_root / "memory.json", {"records": memory_records})
             _write_json(output_root / "stress.json", {"records": stress_records})
+            _write_json(output_root / "scbench.json", {"records": scbench_records})
             _write_json(output_root / "grade_summary.json", summary)
             _ensure_artifacts(output_root, list(resolved["outputs"]))
             print(f"[validate] manifest ok: {output_root}")
@@ -461,6 +510,7 @@ def main() -> int:
         run_logits = args.layer in {"logits", "nightly", "pre-refactor"}
         run_perf = args.layer in {"perf", "nightly", "pre-refactor"}
         run_stress = args.layer in {"stress", "pre-refactor"}
+        run_scbench = args.layer == "scbench"
 
         quality_roots: dict[tuple[str, str], Path] = {}
         if run_quality:
@@ -691,6 +741,49 @@ def main() -> int:
                         }
                     )
 
+        if run_scbench:
+            scbench = resolved["scbench"]
+            scbench_model_id = str(scbench["model"])
+            selected_pair_set = set(selected_pairs)
+            method_ids_for_scbench = [
+                method_id
+                for method_id in scbench["methods"]
+                if method_id in method_ids and (scbench_model_id, method_id) in selected_pair_set
+            ]
+            if scbench_model_id not in model_ids or not method_ids_for_scbench:
+                summary["skipped"].append(
+                    {
+                        "model": scbench_model_id,
+                        "methods": method_ids_for_scbench,
+                        "status": "skipped_by_policy",
+                        "reason": "SCBench configured model/methods are not selected or lack runtime inputs.",
+                    }
+                )
+            else:
+                out_dir = output_root / "scbench" / scbench_model_id
+                manifest_path = Path(args.manifest) if args.manifest else Path(__file__).with_name("manifest.json")
+                cmd = _scbench_command(
+                    manifest_path=manifest_path,
+                    model_id=scbench_model_id,
+                    method_ids=method_ids_for_scbench,
+                    scbench=scbench,
+                    output_dir=out_dir,
+                )
+                summary["commands"].append(
+                    _run_command(cmd, cwd=cwd, dry_run=args.dry_run, log_path=out_dir / "run.log")
+                )
+                summary_path = out_dir / "scbench_methods_summary.json"
+                if summary_path.exists():
+                    with summary_path.open("r", encoding="utf-8") as handle:
+                        scbench_summary = json.load(handle)
+                    scbench_records.append(scbench_summary)
+                    for sample_path in sorted(out_dir.glob("*/*/sample_results_*_multi_turn.jsonl")):
+                        _append_jsonl_file(
+                            output_root / "sample_results.jsonl",
+                            sample_path,
+                            {"model": scbench_model_id},
+                        )
+
         grade_objs = [
             GateGrade(item["name"], item["grade"], item["status"], item["metrics"], item.get("reason", ""))
             for item in summary["grades"]
@@ -701,6 +794,7 @@ def main() -> int:
         _write_json(output_root / "logits_alignment.json", {"records": logits_records})
         _write_json(output_root / "memory.json", {"records": memory_records})
         _write_json(output_root / "stress.json", {"records": stress_records})
+        _write_json(output_root / "scbench.json", {"records": scbench_records})
         _write_json(output_root / "grade_summary.json", summary)
         _ensure_artifacts(output_root, list(resolved["outputs"]))
         print(f"[done] wrote {output_root}")
@@ -712,6 +806,7 @@ def main() -> int:
         _write_json(output_root / "logits_alignment.json", {"records": logits_records})
         _write_json(output_root / "memory.json", {"records": memory_records})
         _write_json(output_root / "stress.json", {"records": stress_records})
+        _write_json(output_root / "scbench.json", {"records": scbench_records})
         _write_json(output_root / "grade_summary.json", summary)
         _ensure_artifacts(output_root, list(resolved["outputs"]))
         raise

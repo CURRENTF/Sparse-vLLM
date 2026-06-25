@@ -37,6 +37,7 @@ REQUIRED_ARTIFACTS = [
     "perf.jsonl",
     "memory.json",
     "stress.json",
+    "scbench.json",
     "grade_summary.json",
 ]
 
@@ -56,7 +57,7 @@ def load_manifest(path: str | Path | None = None) -> dict[str, Any]:
 def validate_manifest(manifest: dict[str, Any]) -> None:
     if not isinstance(manifest, dict):
         raise ManifestError("manifest must be a JSON object.")
-    for key in ("models", "methods", "quality", "logits", "performance", "stress", "outputs"):
+    for key in ("models", "methods", "quality", "logits", "performance", "stress", "scbench", "outputs"):
         if key not in manifest:
             raise ManifestError(f"manifest is missing required key: {key}")
 
@@ -117,6 +118,25 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
     missing_artifacts = sorted(set(REQUIRED_ARTIFACTS) - set(outputs))
     if missing_artifacts:
         raise ManifestError(f"manifest outputs missing required artifacts: {missing_artifacts}")
+
+    scbench = manifest["scbench"]
+    if not isinstance(scbench, dict):
+        raise ManifestError("manifest scbench must be a JSON object.")
+    if scbench.get("model") not in models:
+        raise ManifestError(f"scbench model must reference a known model, got {scbench.get('model')!r}.")
+    scbench_methods = scbench.get("methods")
+    if not isinstance(scbench_methods, list) or not scbench_methods:
+        raise ManifestError("scbench methods must be a non-empty list.")
+    unknown_scbench_methods = sorted(set(scbench_methods) - set(methods))
+    if unknown_scbench_methods:
+        raise ManifestError(f"scbench methods reference unknown methods: {unknown_scbench_methods}")
+    scbench_tasks = scbench.get("tasks")
+    if not isinstance(scbench_tasks, list) or not scbench_tasks:
+        raise ManifestError("scbench tasks must be a non-empty list.")
+    for int_key in ("num_eval_examples", "max_turns", "max_seq_length", "batch_size"):
+        value = scbench.get(int_key)
+        if not isinstance(value, int) or value <= 0:
+            raise ManifestError(f"scbench {int_key} must be a positive integer.")
 
 
 def select_entries(manifest: dict[str, Any], models: list[str] | None, methods: list[str] | None):

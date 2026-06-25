@@ -336,6 +336,18 @@
     "max_decoding_seqs": 80,
     "max_decode_steps_after_full": 32
   },
+  "scbench": {
+    "model": "qwen3_4b",
+    "methods": ["vanilla", "omnikv", "quest"],
+    "tasks": ["scbench_kv", "scbench_qa_eng"],
+    "num_eval_examples": 4,
+    "max_turns": 2,
+    "max_seq_length": 4096,
+    "batch_size": 4,
+    "prefix_cache_block_size": 16,
+    "gpu_memory_utilization": 0.5,
+    "trust_remote_code": true
+  },
   "outputs": [
     "resolved_manifest.json",
     "raw_outputs.jsonl",
@@ -346,6 +358,7 @@
     "perf.jsonl",
     "memory.json",
     "stress.json",
+    "scbench.json",
     "grade_summary.json"
   ]
 }

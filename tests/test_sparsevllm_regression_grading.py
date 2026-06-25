@@ -28,7 +28,7 @@ from benchmark.sparsevllm_regression.manifest import (
     resolve_manifest_paths,
     validate_manifest,
 )
-from benchmark.sparsevllm_regression.run_suite import _perf_command, _stress_command
+from benchmark.sparsevllm_regression.run_suite import _perf_command, _scbench_command, _stress_command
 from benchmark.sparsevllm_regression.run_suite import _quality_command
 from sparsevllm.engine.cache_manager.base import CacheManager
 
@@ -156,6 +156,10 @@ class SparseVLLMRegressionGradingTest(unittest.TestCase):
         self.assertEqual(manifest["stress"]["request_counts"], [80])
         self.assertEqual(manifest["stress"]["max_num_seqs_in_batch"], 80)
         self.assertEqual(manifest["stress"]["max_decoding_seqs"], 80)
+        self.assertEqual(manifest["scbench"]["model"], "qwen3_4b")
+        self.assertEqual(manifest["scbench"]["methods"], ["vanilla", "omnikv", "quest"])
+        self.assertEqual(manifest["scbench"]["tasks"], ["scbench_kv", "scbench_qa_eng"])
+        self.assertEqual(manifest["scbench"]["batch_size"], 4)
 
     def test_omnikv_and_deltakv_full_layers_are_model_specific(self):
         manifest = load_manifest()
@@ -218,6 +222,24 @@ class SparseVLLMRegressionGradingTest(unittest.TestCase):
                     cmd = command_builder(**kwargs)
                     hyper_params = json.loads(cmd[cmd.index("--hyper_params") + 1])
                     self.assertIs(hyper_params["decode_cuda_graph"], expected)
+
+    def test_scbench_regression_command_uses_batched_multiturn_subset(self):
+        manifest = load_manifest()
+        cmd = _scbench_command(
+            manifest_path=Path("/tmp/manifest.json"),
+            model_id="qwen3_4b",
+            method_ids=["vanilla", "omnikv", "quest"],
+            scbench=manifest["scbench"],
+            output_dir=Path("/tmp/out"),
+        )
+
+        self.assertIn("scripts/benchmarks/run_scbench_sparsevllm_methods.py", cmd)
+        self.assertEqual(cmd[cmd.index("--model_id") + 1], "qwen3_4b")
+        self.assertEqual(cmd[cmd.index("--methods") + 1], "vanilla,omnikv,quest")
+        self.assertEqual(cmd[cmd.index("--tasks") + 1], "scbench_kv,scbench_qa_eng")
+        self.assertEqual(cmd[cmd.index("--batch_size") + 1], "4")
+        self.assertEqual(cmd[cmd.index("--max_turns") + 1], "2")
+        self.assertIn("--trust_remote_code", cmd)
 
     def test_quality_grade_thresholds(self):
         self.assertEqual(grade_quality(50.0, 50.0).grade, "A")

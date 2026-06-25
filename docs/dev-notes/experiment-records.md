@@ -574,3 +574,35 @@ tmux new-session -d -s math500_rkv_strict_i1024_gpu4_20260625 \
 - Performance: `generated_text_tokens=1,800,813`, `generation_elapsed_s=1717.811`, `generated_text_tokens_per_s=1048.32`; decode CUDA Graph active with graph count `16`, last key `DecodeCudaGraphKey(method='rkv', batch_size=1, context_capacity=32768, is_long_text=True, capture_sampling=False)`.
 - Runtime notes: the run submitted all 500 prompts in one outer batch and let Sparse-VLLM queue internally up to `64` decode sequences. The middle high-concurrency windows were around `1100-2200 tok/s`, while the final long-answer tail dropped from `461` to `80 tok/s` as only a few long sequences remained.
 - Interpretation: this run is stricter on the R-KV redundancy range than the prior `rkv_redundancy_window=64` run, but the score drops from `83.0` to `68.8`. The likely cause is not scorer/parser failure (`success=500`, `missing_extracted=0`) but an algorithm/runtime-semantics mismatch introduced by combining full candidate redundancy with the current online eviction schedule and `rkv_compression_interval=1024`. It is therefore not aligned with the paper's reported high-budget Llama-family MATH result yet, despite using the strict full-candidate redundancy range.
+
+### 2026-06-25 20:23 Asia/Shanghai - scbench-prefix-cache-regression-qwen3-4b-gpu4
+
+- Status: completed.
+- Goal: validate the new block-level radix prefix cache on a small SCBench multi-turn subset and add the same workload as an explicit Sparse-VLLM regression layer covering `vanilla`, `omnikv`, and `quest`.
+- Working dir: `/home/haojitai/projects/Sparse-vLLM-radix-prefix-cache`.
+- Code: `codex/radix-prefix-cache` / `b3e58593ef8e9e6ac1d861bd301b174138ddfb30`; worktree had relevant uncommitted SCBench runner, regression-suite, manifest, test, and experiment-record changes.
+- Environment: host `guest-KR6288-X2-A0-R0-00`; GPU `CUDA_VISIBLE_DEVICES=4`, NVIDIA H100 80GB HBM3; Python `/home/haojitai/miniconda3/envs/svllm/bin/python`; `PYTHONPATH=$PWD:$PWD/src`; `SPARSEVLLM_MASTER_PORT=25376`.
+- Data: local SCBench snapshot `/data2/haojitai/hf_cache/hub/datasets--microsoft--SCBench/snapshots/283310bb8c5ba6909dd9a6b1be087d2937f76f6d`; tasks `scbench_kv` and `scbench_qa_eng`; `4` examples per task; `2` turns per example; multi-turn mode, not SCDQ.
+- Model: `/data2/haojitai/models/Qwen3-4B-Instruct-2507`; tokenizer same path; backend `sparsevllm`; methods `vanilla`, `omnikv`, `quest`; prefix cache enabled for all methods.
+- Runtime knobs: `max_seq_length=4096`, `batch_size=4`, `max_num_seqs_in_batch=4`, `max_decoding_seqs=4`, `max_num_batched_tokens=16384`, `prefix_cache_block_size=16`, `gpu_memory_utilization=0.5`, `decode_cuda_graph=false`, `enforce_eager=true`. QuEST used `quest_chunk_size=16`, so the prefix-cache block size matched the QuEST chunk/block size.
+- Command:
+
+```bash
+tmux new-session -d -s svllm_scbench_reg_gpu4 \
+  "cd /home/haojitai/projects/Sparse-vLLM-radix-prefix-cache && RUN_TAG=sparsevllm_scbench_regression_20260625_gpu4 CUDA_VISIBLE_DEVICES=4 SPARSEVLLM_MASTER_PORT=25376 bash scripts/tmp/run_scbench_regression_gpu4.sh; echo EXIT_CODE=\$?; sleep 300"
+```
+
+- Result artifacts: regression root `/data2/haojitai/outputs/sparsevllm_scbench_regression_20260625_gpu4/regression/sparsevllm_regression/sparsevllm_scbench_regression_20260625_gpu4`; aggregate SCBench result `/data2/haojitai/outputs/sparsevllm_scbench_regression_20260625_gpu4/regression/sparsevllm_regression/sparsevllm_scbench_regression_20260625_gpu4/scbench.json`; child SCBench log `/data2/haojitai/outputs/sparsevllm_scbench_regression_20260625_gpu4/regression/sparsevllm_regression/sparsevllm_scbench_regression_20260625_gpu4/scbench/qwen3_4b/run.log`; launcher log `/data2/haojitai/outputs/sparsevllm_scbench_regression_20260625_gpu4/run.log`; status `/data2/haojitai/outputs/sparsevllm_scbench_regression_20260625_gpu4/status.tsv`.
+- Validation: tmux pane printed `EXIT_CODE=0`; launcher status completed at `2026-06-25T20:26:58+08:00`; artifact validator found one SCBench record with methods `vanilla`, `omnikv`, and `quest`; every method/task pair had `request_count=8`, `status=success`, and prefix summary `status=success`.
+- Results:
+
+| Method | Task | Score by turn | Requests | Hit requests | Cached tokens | Cached blocks | Eligible hit rate |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `vanilla` | `scbench_kv` | `50.000,25.000` | `8` | `4` | `15168` | `948` | `1.000` |
+| `vanilla` | `scbench_qa_eng` | `25.000,0.000` | `8` | `4` | `16064` | `1004` | `1.000` |
+| `omnikv` | `scbench_kv` | `50.000,25.000` | `8` | `4` | `15168` | `948` | `1.000` |
+| `omnikv` | `scbench_qa_eng` | `25.000,0.000` | `8` | `4` | `16064` | `1004` | `1.000` |
+| `quest` | `scbench_kv` | `50.000,25.000` | `8` | `4` | `15168` | `948` | `1.000` |
+| `quest` | `scbench_qa_eng` | `25.000,0.000` | `8` | `4` | `16064` | `1004` | `1.000` |
+
+- Notes: a one-example smoke on GPU4 first confirmed all three methods could generate and reuse prefix cache in SCBench multi-turn mode. The initial multi-method runner attempted to load all methods sequentially in one Python process; OmniKV then failed cache-slot initialization because method teardown did not fully reset CUDA/NCCL allocator state. The runner was changed so the parent command launches one child Python process per method, while preserving a single aggregate `scbench_methods_summary.json`.
