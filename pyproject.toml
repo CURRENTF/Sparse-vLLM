@@ -31,9 +31,9 @@ dependencies = [
     "datatrove",
     "tqdm",
     "loguru",
-    "fastapi",
+    "fastapi>=0.100",
     "uvicorn[standard]",
-    "pydantic",
+    "pydantic>=2",
     "pytest",
     "math-verify==0.9.0",
 ]

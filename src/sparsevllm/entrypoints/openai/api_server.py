@@ -2,10 +2,12 @@ import argparse
 import asyncio
 import json
 import os
+from pathlib import Path
 import queue
 import threading
 import time
 import uuid
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
 from typing import Literal
@@ -49,12 +51,21 @@ class CompletionRequest(BaseModel):
     stream: bool = False
     ignore_eos: bool = False
     stop: str | list[str] | None = None
-    logprobs: int | None = Field(default=None, ge=0)
+    logprobs: int | None = Field(default=None, ge=0, le=5)
+
+
+class ChatContentPart(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["text"]
+    text: str
 
 
 class ChatMessage(BaseModel):
-    role: Literal["system", "user", "assistant", "tool"]
-    content: str
+    model_config = ConfigDict(extra="forbid")
+
+    role: Literal["developer", "system", "user", "assistant", "tool"]
+    content: str | list[ChatContentPart]
 
 
 class ChatCompletionRequest(BaseModel):
@@ -63,6 +74,7 @@ class ChatCompletionRequest(BaseModel):
     model: str
     messages: list[ChatMessage]
     max_tokens: int = Field(default=16, ge=1)
+    max_completion_tokens: int | None = Field(default=None, ge=1)
     temperature: float = Field(default=1.0, ge=0.0)
     top_p: float = Field(default=1.0, gt=0.0, le=1.0)
     top_k: int = Field(default=0, ge=0)
@@ -71,7 +83,21 @@ class ChatCompletionRequest(BaseModel):
     ignore_eos: bool = False
     stop: str | list[str] | None = None
     logprobs: bool = False
-    top_logprobs: int | None = Field(default=None, ge=0)
+    top_logprobs: int | None = Field(default=None, ge=0, le=20)
+
+
+def _field_was_set(request: BaseModel, name: str) -> bool:
+    return name in request.model_fields_set
+
+
+def _chat_template_role(role: str) -> str:
+    return "system" if role == "developer" else role
+
+
+def _chat_content_text(content: str | list[ChatContentPart]) -> str:
+    if isinstance(content, str):
+        return content
+    return "\n".join(part.text for part in content)
 
 
 @dataclass
@@ -105,6 +131,19 @@ class _ActiveRequest:
     completion_token_logprobs: list[float | None]
     completion_top_logprobs: list[dict[int, float] | None]
     emitted_text_len: int = 0
+
+
+def _model_dump_json(model: BaseModel) -> dict[str, Any]:
+    return model.model_dump(mode="json")
+
+
+def _write_request_log(request_log_dir: Path | None, payload: dict[str, Any]):
+    if request_log_dir is None:
+        return
+    path = request_log_dir / f"{int(time.time() * 1000)}_{uuid.uuid4().hex}.json"
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2, sort_keys=True)
+        f.write("\n")
 
 
 class AsyncEngineDispatcher:
@@ -202,7 +241,7 @@ class AsyncEngineDispatcher:
                 self._failed_message = f"{type(exc).__name__}: {exc}"
                 for request in list(active.values()):
                     self._put(request, {"type": "error", "message": self._failed_message})
-                active.clear()
+                self._abort_all(active)
                 self._drain_pending_after_failure()
                 break
 
@@ -379,6 +418,7 @@ def create_app(
     *,
     served_model_name: str | None = None,
     engine: LLM | None = None,
+    request_log_dir: str | None = None,
 ) -> FastAPI:
     served_model_name = served_model_name or model
     engine_kwargs = dict(engine_kwargs or {})
@@ -387,14 +427,21 @@ def create_app(
     _validate_serving_method(engine_kwargs, engine)
     engine = engine or LLM(model, **engine_kwargs)
     dispatcher = AsyncEngineDispatcher(engine)
+    request_log_path = Path(request_log_dir) if request_log_dir else None
+    if request_log_path is not None:
+        request_log_path.mkdir(parents=True, exist_ok=True)
 
-    app = FastAPI(title="Sparse-vLLM OpenAI-compatible API")
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        try:
+            yield
+        finally:
+            dispatcher.close()
+
+    app = FastAPI(title="Sparse-vLLM OpenAI-compatible API", lifespan=lifespan)
     app.state.dispatcher = dispatcher
     app.state.served_model_name = served_model_name
-
-    @app.on_event("shutdown")
-    def _shutdown():
-        dispatcher.close()
+    app.state.request_log_dir = request_log_path
 
     @app.get("/health")
     def health():
@@ -435,6 +482,16 @@ def create_app(
         )
         sampling_params = _sampling_params_from_request(request)
         stop = _normalize_stop(request.stop)
+        if request.stream:
+            _write_request_log(
+                request_log_path,
+                {
+                    "status": "stream_started",
+                    "endpoint": "/v1/completions",
+                    "request_id": request_id,
+                    "request": _model_dump_json(request),
+                },
+            )
 
         handles = [
             await dispatcher.submit(prompt, sampling_params, index, stop)
@@ -476,6 +533,17 @@ def create_app(
             _tokens_per_second(usage["completion_tokens"], elapsed_s),
             _tokens_per_second(usage["total_tokens"], elapsed_s),
         )
+        _write_request_log(
+            request_log_path,
+            {
+                "status": "success",
+                "endpoint": "/v1/completions",
+                "request_id": request_id,
+                "elapsed_s": elapsed_s,
+                "request": _model_dump_json(request),
+                "response": response,
+            },
+        )
         return JSONResponse(response)
 
     @app.post("/v1/chat/completions")
@@ -498,6 +566,16 @@ def create_app(
         sampling_params = _sampling_params_from_request(request)
         stop = _normalize_stop(request.stop)
         prompt = _chat_prompt(engine.tokenizer, request.messages)
+        if request.stream:
+            _write_request_log(
+                request_log_path,
+                {
+                    "status": "stream_started",
+                    "endpoint": "/v1/chat/completions",
+                    "request_id": request_id,
+                    "request": _model_dump_json(request),
+                },
+            )
         handle = await dispatcher.submit(prompt, sampling_params, 0, stop)
         handles = [handle]
 
@@ -533,6 +611,17 @@ def create_app(
             elapsed_s,
             _tokens_per_second(usage["completion_tokens"], elapsed_s),
             _tokens_per_second(usage["total_tokens"], elapsed_s),
+        )
+        _write_request_log(
+            request_log_path,
+            {
+                "status": "success",
+                "endpoint": "/v1/chat/completions",
+                "request_id": request_id,
+                "elapsed_s": elapsed_s,
+                "request": _model_dump_json(request),
+                "response": response,
+            },
         )
         return JSONResponse(response)
 
@@ -575,6 +664,15 @@ def _validate_chat_request(request: ChatCompletionRequest, served_model_name: st
         raise HTTPException(status_code=400, detail="messages must not be empty.")
     if request.n != 1:
         raise HTTPException(status_code=400, detail="Sparse-vLLM chat completions currently supports n=1 only.")
+    if (
+        request.max_completion_tokens is not None
+        and _field_was_set(request, "max_tokens")
+        and request.max_tokens != request.max_completion_tokens
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="max_tokens and max_completion_tokens disagree; set only one value.",
+        )
     if request.top_logprobs is not None and not request.logprobs:
         raise HTTPException(status_code=400, detail="top_logprobs requires logprobs=true.")
     if request.stop and request.logprobs:
@@ -583,17 +681,20 @@ def _validate_chat_request(request: ChatCompletionRequest, served_model_name: st
 
 def _sampling_params_from_request(request: CompletionRequest | ChatCompletionRequest) -> SamplingParams:
     logprobs = request.logprobs
+    max_tokens = request.max_tokens
     if isinstance(request, ChatCompletionRequest):
         logprobs = (
             request.top_logprobs
             if request.top_logprobs is not None
             else 0
         ) if request.logprobs else None
+        if request.max_completion_tokens is not None:
+            max_tokens = request.max_completion_tokens
     return SamplingParams(
         temperature=request.temperature,
         top_p=request.top_p,
         top_k=request.top_k,
-        max_tokens=request.max_tokens,
+        max_tokens=max_tokens,
         ignore_eos=request.ignore_eos,
         logprobs=logprobs,
     )
@@ -608,12 +709,18 @@ def _normalize_stop(stop: str | list[str] | None) -> list[str]:
 
 
 def _chat_prompt(tokenizer: Any, messages: list[ChatMessage]) -> str:
-    chat = [{"role": message.role, "content": message.content} for message in messages]
+    chat = [
+        {
+            "role": _chat_template_role(message.role),
+            "content": _chat_content_text(message.content),
+        }
+        for message in messages
+    ]
     if getattr(tokenizer, "chat_template", None) and hasattr(tokenizer, "apply_chat_template"):
         return tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True)
     rendered = []
-    for message in messages:
-        rendered.append(f"{message.role}: {message.content}")
+    for message in chat:
+        rendered.append(f"{message['role']}: {message['content']}")
     rendered.append("assistant:")
     return "\n".join(rendered)
 
@@ -1047,6 +1154,23 @@ def _tokens_per_second(tokens: int, elapsed_s: float) -> float:
     return tokens / elapsed_s
 
 
+def _load_engine_kwargs_arg(value: str | None) -> dict[str, Any]:
+    if not value:
+        return {}
+    stripped = value.strip()
+    if stripped.startswith("{"):
+        data = json.loads(stripped)
+    else:
+        path = Path(value)
+        if not path.exists():
+            raise FileNotFoundError(f"--engine-kwargs path does not exist: {value}")
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError("--engine-kwargs must resolve to a JSON object")
+    return data
+
+
 def _parse_engine_kwargs(raw_args: list[str]) -> dict[str, Any]:
     config_fields = Config.__dataclass_fields__
     allowed_fields = set(config_fields) | SEMANTIC_ENGINE_ARGS
@@ -1095,14 +1219,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--served-model-name", default=None, help="Model name accepted by /v1/completions.")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--engine-kwargs", default=None, help="JSON object or JSON file with Sparse-vLLM engine kwargs.")
+    parser.add_argument("--request-log-dir", default=None, help="Optional directory for per-request JSON logs.")
     return parser
 
 
 def main():
     parser = build_arg_parser()
     args, raw_engine_args = parser.parse_known_args()
-    engine_kwargs = _parse_engine_kwargs(raw_engine_args)
-    app = create_app(args.model, engine_kwargs, served_model_name=args.served_model_name)
+    engine_kwargs = _load_engine_kwargs_arg(args.engine_kwargs)
+    cli_engine_kwargs = _parse_engine_kwargs(raw_engine_args)
+    duplicate_keys = sorted(set(engine_kwargs) & set(cli_engine_kwargs))
+    if duplicate_keys:
+        raise ValueError(
+            "--engine-kwargs and CLI engine flags both set the same keys: "
+            f"{duplicate_keys}"
+        )
+    engine_kwargs.update(cli_engine_kwargs)
+    app = create_app(
+        args.model,
+        engine_kwargs,
+        served_model_name=args.served_model_name,
+        request_log_dir=args.request_log_dir,
+    )
 
     import uvicorn
 

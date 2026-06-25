@@ -831,7 +831,7 @@ JSON. They may differ; requests must use the served name.
 
 ### 14.1 Serving CLI Parameters
 
-The serving entrypoint has four dedicated server flags:
+The serving entrypoint has dedicated server flags:
 
 | CLI flag | Default | Meaning |
 | --- | --- | --- |
@@ -839,6 +839,8 @@ The serving entrypoint has four dedicated server flags:
 | `--served-model-name` | `--model` value | Model id exposed through `/v1/models` and accepted by `/v1/completions`. |
 | `--host` | `0.0.0.0` | Uvicorn bind host. |
 | `--port` | `8000` | Uvicorn bind port. |
+| `--engine-kwargs` | unset | JSON object or path to a JSON object with Sparse-vLLM engine kwargs. |
+| `--request-log-dir` | unset | Optional directory for per-request JSON logs. |
 
 Additional `--kebab-case` flags are parsed as Sparse-vLLM engine kwargs. Use
 the canonical semantic keys accepted by
@@ -847,7 +849,9 @@ controls. Non-legacy `src/sparsevllm/config.py` fields such as
 `max_model_len`, `max_num_seqs_in_batch`, `gpu_memory_utilization`, and
 `throughput_log_interval_s` may also be passed. Legacy public names listed in
 Section 3 are still rejected during engine initialization even if the serving
-parser can recognize their spelling.
+parser can recognize their spelling. If `--engine-kwargs` and explicit CLI
+engine flags set the same key, startup fails instead of silently choosing one
+value.
 
 Example:
 
@@ -934,6 +938,7 @@ Supported JSON fields:
 | `model` | required | Must equal `--served-model-name` if provided, otherwise the `--model` value. |
 | `prompt` | required | String, token id list, list of strings, or list of token id lists. |
 | `max_tokens` | `16` | Maps to `SamplingParams.max_tokens`; must be positive. |
+| `max_completion_tokens` | `null` | Chat-only OpenAI-compatible alias for `max_tokens`; requests that explicitly set both to different values fail fast. |
 | `temperature` | `1.0` | Maps to `SamplingParams.temperature`; `0` means greedy sampling. |
 | `top_p` | `1.0` | Maps to `SamplingParams.top_p`; must be in `(0, 1]`. |
 | `top_k` | `0` | Maps to `SamplingParams.top_k`; `0` disables top-k filtering. |
@@ -941,7 +946,7 @@ Supported JSON fields:
 | `stream` | `false` | `true` returns `text/event-stream` chunks ending with `data: [DONE]`. |
 | `ignore_eos` | `false` | Continue until `max_tokens` even if EOS is generated. |
 | `stop` | `null` | String or list of strings. Stop text is omitted from the returned completion. |
-| `logprobs` | `null` | Non-negative integer. Returns sampled-token logprobs and up to this many top logprobs. |
+| `logprobs` | `null` | Non-negative integer up to 5 for `/v1/completions`; returns sampled-token logprobs and up to this many top logprobs. |
 
 Unknown JSON fields are rejected instead of silently ignored. This is stricter
 than some OpenAI-compatible servers, but it avoids accepting parameters that do
@@ -952,11 +957,15 @@ fast because text-level stop trimming can otherwise make returned token logprobs
 disagree with the visible output.
 
 `/v1/chat/completions` supports the same sampling fields plus `messages`.
-Messages must use `system`, `user`, `assistant`, or `tool` roles. When the
-loaded tokenizer exposes a chat template, the server renders messages with
+Messages must use `developer`, `system`, `user`, `assistant`, or `tool` roles.
+String content and text-only content-part lists are supported; unknown nested
+message fields are rejected. The `developer` role is rendered as `system` for
+Hugging Face chat templates because most local tokenizer templates do not
+define a separate developer role. When the loaded tokenizer exposes a chat
+template, the server renders messages with
 `apply_chat_template(..., add_generation_prompt=True)`; otherwise it uses a
 simple role-prefixed prompt. Chat `logprobs=true` enables sampled-token
-logprobs, and `top_logprobs` controls the number of top alternatives.
+logprobs, and `top_logprobs` controls the number of top alternatives up to 20.
 
 The server logs one request-start line and one request-finish or request-cancel
 line per `/v1/completions` request. It does not log every generated token.

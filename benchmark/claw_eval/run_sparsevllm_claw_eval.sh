@@ -309,8 +309,8 @@ main() {
   export no_proxy="127.0.0.1,localhost,::1"
 
   echo "[INFO] Starting Sparse-vLLM OpenAI server on GPUs ${CUDA_VISIBLE_DEVICES}"
-  "${SPARSEVLLM_PYTHON_BIN}" -u "${REPO_ROOT}/benchmark/claw_eval/serve_sparsevllm_openai.py" \
-    --model-path "${MODEL_PATH}" \
+  "${SPARSEVLLM_PYTHON_BIN}" -u -m sparsevllm.entrypoints.openai.api_server \
+    --model "${MODEL_PATH}" \
     --served-model-name "${SERVED_MODEL_NAME}" \
     --host "${SERVER_HOST}" \
     --port "${SERVER_PORT}" \

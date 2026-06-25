@@ -71,10 +71,30 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
     def test_completion_request_rejects_unknown_fields(self):
         from pydantic import ValidationError
 
-        from sparsevllm.entrypoints.openai.api_server import CompletionRequest
+        from sparsevllm.entrypoints.openai.api_server import ChatCompletionRequest, CompletionRequest
 
         with self.assertRaises(ValidationError):
             CompletionRequest(model="m", prompt="p", suffix="ignored")
+        with self.assertRaises(ValidationError):
+            ChatCompletionRequest(
+                model="m",
+                messages=[{"role": "assistant", "content": "p", "tool_calls": []}],
+            )
+
+    def test_logprob_request_limits_match_openai_bounds(self):
+        from pydantic import ValidationError
+
+        from sparsevllm.entrypoints.openai.api_server import ChatCompletionRequest, CompletionRequest
+
+        with self.assertRaises(ValidationError):
+            CompletionRequest(model="m", prompt="p", logprobs=6)
+        with self.assertRaises(ValidationError):
+            ChatCompletionRequest(
+                model="m",
+                messages=[{"role": "user", "content": "p"}],
+                logprobs=True,
+                top_logprobs=21,
+            )
 
     def test_stop_with_logprobs_fails_fast(self):
         from fastapi import HTTPException
@@ -114,6 +134,65 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         prompt = _chat_prompt(Tokenizer(), [ChatMessage(role="user", content="hello")])
 
         self.assertEqual(prompt, "user: hello\nassistant:")
+
+    def test_chat_prompt_maps_developer_and_text_parts_for_templates(self):
+        from sparsevllm.entrypoints.openai.api_server import ChatMessage, _chat_prompt
+
+        class Tokenizer:
+            chat_template = "template"
+
+            def __init__(self):
+                self.chat = None
+
+            def apply_chat_template(self, chat, **_kwargs):
+                self.chat = chat
+                return "rendered"
+
+        tokenizer = Tokenizer()
+        prompt = _chat_prompt(
+            tokenizer,
+            [
+                ChatMessage(
+                    role="developer",
+                    content=[
+                        {"type": "text", "text": "policy"},
+                        {"type": "text", "text": "details"},
+                    ],
+                )
+            ],
+        )
+
+        self.assertEqual(prompt, "rendered")
+        self.assertEqual(tokenizer.chat, [{"role": "system", "content": "policy\ndetails"}])
+
+    def test_chat_max_completion_tokens_maps_to_sampling_params(self):
+        from fastapi import HTTPException
+
+        from sparsevllm.entrypoints.openai.api_server import (
+            ChatCompletionRequest,
+            _sampling_params_from_request,
+            _validate_chat_request,
+        )
+
+        request = ChatCompletionRequest(
+            model="m",
+            messages=[{"role": "user", "content": "p"}],
+            max_completion_tokens=32,
+        )
+
+        _validate_chat_request(request, "m")
+        self.assertEqual(_sampling_params_from_request(request).max_tokens, 32)
+
+        with self.assertRaises(HTTPException):
+            _validate_chat_request(
+                ChatCompletionRequest(
+                    model="m",
+                    messages=[{"role": "user", "content": "p"}],
+                    max_tokens=16,
+                    max_completion_tokens=32,
+                ),
+                "m",
+            )
 
     def test_missing_non_bool_engine_arg_fails_fast(self):
         from sparsevllm.entrypoints.openai.api_server import _parse_engine_kwargs
@@ -193,6 +272,49 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
             engine.release_add.set()
             await asyncio.sleep(0.1)
             self.assertEqual(engine.aborted, [123])
+        finally:
+            dispatcher.close()
+
+    async def test_step_failure_aborts_active_request(self):
+        from sparsevllm.entrypoints.openai.api_server import AsyncEngineDispatcher
+
+        class Tokenizer:
+            def encode(self, _prompt):
+                return [1]
+
+            def decode(self, token_ids, skip_special_tokens=True):
+                return "".join(str(token_id) for token_id in token_ids)
+
+        class Engine:
+            tokenizer = Tokenizer()
+            last_step_token_outputs = []
+            last_step_logprob_outputs = []
+
+            def __init__(self):
+                self.step_started = threading.Event()
+                self.aborted = []
+
+            def add_request(self, _prompt, _sampling_params):
+                return 77
+
+            def step(self):
+                self.step_started.set()
+                raise RuntimeError("boom")
+
+            def abort_request(self, seq_id):
+                self.aborted.append(seq_id)
+
+            def exit(self):
+                pass
+
+        engine = Engine()
+        dispatcher = AsyncEngineDispatcher(engine)
+        try:
+            handle = await dispatcher.submit("prompt", type("Sampling", (), {"max_tokens": 4})(), 0)
+            self.assertTrue(await asyncio.to_thread(engine.step_started.wait, 2))
+            item = await asyncio.wait_for(handle.output_queue.get(), timeout=1)
+            self.assertEqual(item["type"], "error")
+            self.assertEqual(engine.aborted, [77])
         finally:
             dispatcher.close()
 
