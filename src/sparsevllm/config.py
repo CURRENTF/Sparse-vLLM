@@ -249,6 +249,7 @@ class Config:
 
     # R-KV Config
     rkv_compression_interval: int = 128
+    rkv_observation_tokens: int = 8
     rkv_alpha: float = 0.1
     rkv_similarity_threshold: float = 0.8
     rkv_recent_similar_keep: int = 1
@@ -620,6 +621,22 @@ class Config:
             raise ValueError(
                 f"rkv_compression_interval must be > 0, got {self.rkv_compression_interval}."
             )
+        self.rkv_observation_tokens = int(self.rkv_observation_tokens or 0)
+        if self.rkv_observation_tokens <= 0:
+            raise ValueError(
+                f"rkv_observation_tokens must be > 0, got {self.rkv_observation_tokens}."
+            )
+        if self.rkv_observation_tokens > 128:
+            raise ValueError(
+                "rkv_observation_tokens must be <= 128 because the prefill score kernel "
+                f"supports at most 128 query tokens, got {self.rkv_observation_tokens}."
+            )
+        if self.rkv_observation_tokens > self.rkv_compression_interval:
+            raise ValueError(
+                "rkv_observation_tokens must be <= rkv_compression_interval so the query cache "
+                "can be refreshed between decode evictions, "
+                f"got observation={self.rkv_observation_tokens} interval={self.rkv_compression_interval}."
+            )
         self.rkv_alpha = float(self.rkv_alpha)
         if not 0.0 <= self.rkv_alpha <= 1.0:
             raise ValueError(f"rkv_alpha must be in [0, 1], got {self.rkv_alpha}.")
@@ -648,6 +665,15 @@ class Config:
             raise ValueError(
                 "rkv_redundancy_window must be <= rkv_max_redundancy_tokens, "
                 f"got window={self.rkv_redundancy_window} max={self.rkv_max_redundancy_tokens}."
+            )
+        if self.vllm_sparse_method == "rkv":
+            log_once(
+                "R-KV support is an approximation of the official implementation: "
+                "Sparse-VLLM uses one shared physical token index set across KV heads, "
+                "so official per-KV-head token selection is not fully reproduced. "
+                f"rkv_redundancy_window={self.rkv_redundancy_window}; values > 0 score "
+                "redundancy only over the trailing candidate tokens.",
+                level="WARNING",
             )
         self.skipkv_compression_interval = int(self.skipkv_compression_interval or 0)
         if self.skipkv_compression_interval <= 0:

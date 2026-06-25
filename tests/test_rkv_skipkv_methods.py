@@ -1,9 +1,13 @@
+import tempfile
+from pathlib import Path
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 import torch
 
+from sparsevllm.config import Config
+from sparsevllm.engine.cache_manager.base import LayerBatchStates
 from sparsevllm.engine.cache_manager.rkv import RKVCacheManager
 from sparsevllm.engine.cache_manager.skipkv import (
     SkipKVCacheManager,
@@ -20,12 +24,43 @@ from sparsevllm.method_registry import (
 
 
 class RKVSkipKVMethodTest(unittest.TestCase):
+    def _hf_config(self):
+        return SimpleNamespace(
+            model_type="qwen2",
+            torch_dtype=torch.float16,
+            max_position_embeddings=32768,
+            hidden_size=8,
+            intermediate_size=32,
+            num_hidden_layers=2,
+        )
+
     def test_rkv_aliases_and_prefill_policy(self):
         self.assertEqual(normalize_sparse_method("r-kv"), "rkv")
         self.assertEqual(normalize_sparse_method("r_kv"), "rkv")
         self.assertEqual(normalize_sparse_method("skip-kv"), "skipkv")
         self.assertEqual(get_default_prefill_schedule_policy("r-kv"), PREFILL_POLICY_ALL_CHUNKED)
         self.assertEqual(get_default_prefill_schedule_policy("skipkv"), PREFILL_POLICY_ALL_CHUNKED)
+
+    def test_rkv_config_warns_about_approximate_official_adaptation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            model_dir = Path(tmp)
+            with (
+                patch("sparsevllm.config.AutoConfig.from_pretrained", return_value=self._hf_config()),
+                patch("sparsevllm.config.log_once") as log_once,
+            ):
+                Config(
+                    model=str(model_dir),
+                    vllm_sparse_method="rkv",
+                    max_model_len=32768,
+                    rkv_redundancy_window=64,
+                )
+
+        log_once.assert_called()
+        warning, level = log_once.call_args.args[0], log_once.call_args.kwargs["level"]
+        self.assertEqual(level, "WARNING")
+        self.assertIn("approximation of the official implementation", warning)
+        self.assertIn("per-KV-head token selection", warning)
+        self.assertIn("rkv_redundancy_window=64", warning)
 
     def test_rkv_redundancy_scoring_fails_fast_when_unbounded(self):
         keys = torch.randn(5, 1, 4)
@@ -260,6 +295,110 @@ class RKVSkipKVMethodTest(unittest.TestCase):
 
         self.assertEqual(seen_key_lengths, [6])
         self.assertEqual(int(keep.numel()), 5)
+
+    def test_rkv_query_cache_tracks_observation_tokens_not_interval(self):
+        manager = object.__new__(RKVCacheManager)
+        manager._rkv_observation_tokens = 3
+        manager.device = torch.device("cpu")
+        manager._rkv_query_cache = [torch.zeros((1, 3, 1, 2), dtype=torch.float32)]
+        manager._rkv_query_positions = [torch.full((1, 3), -1, dtype=torch.int32)]
+
+        q_prefill = torch.arange(10, dtype=torch.float32).view(5, 1, 2)
+        view = SimpleNamespace(
+            req_indices=torch.tensor([0], dtype=torch.int32),
+            context_lens=torch.tensor([5], dtype=torch.int32),
+        )
+        manager.record_prefill_query(
+            0,
+            q_prefill,
+            view,
+            b_start_loc=torch.tensor([0], dtype=torch.int32),
+            chunk_lens=torch.tensor([5], dtype=torch.int32),
+        )
+
+        cols = torch.tensor([2, 0, 1], dtype=torch.long)
+        self.assertEqual(manager._rkv_query_positions[0][0, cols].tolist(), [2, 3, 4])
+        torch.testing.assert_close(manager._rkv_query_cache[0][0, cols], q_prefill[2:5])
+
+        manager.layer_batch_states = [
+            LayerBatchStates(
+                req_indices=torch.tensor([0], dtype=torch.int32),
+                context_lens=torch.tensor([6], dtype=torch.int32),
+            )
+        ]
+        q_decode = torch.tensor([[[100.0, 101.0]]], dtype=torch.float32)
+        manager.record_decode_query(0, q_decode)
+
+        cols = torch.tensor([0, 1, 2], dtype=torch.long)
+        self.assertEqual(manager._rkv_query_positions[0][0, cols].tolist(), [3, 4, 5])
+        expected = torch.cat((q_prefill[3:5], q_decode), dim=0)
+        torch.testing.assert_close(manager._rkv_query_cache[0][0, cols], expected)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for R-KV query score kernel tests.")
+    def test_rkv_query_attention_scores_reuse_prefill_score_kernel(self):
+        from tests.test_prefill_score_kernel import _prefill_score_baseline
+
+        torch.manual_seed(29)
+        device = torch.device("cuda")
+        dtype = torch.float32
+        kv_len = 6
+        num_heads = 4
+        num_kv_heads = 2
+        head_dim = 16
+        observation_tokens = 2
+        candidate_start = 1
+        num_recent_tokens = 1
+
+        seq = Sequence([1])
+        manager = object.__new__(RKVCacheManager)
+        manager.config = SimpleNamespace(
+            rkv_observation_tokens=observation_tokens,
+            sparse_attn_score_dtype="float32",
+        )
+        manager.device = device
+        manager._rkv_observation_tokens = observation_tokens
+        manager.seq_id_to_row = [{seq.seq_id: 0}]
+        manager.buffer_req_to_token_slots = [
+            torch.arange(kv_len, dtype=torch.int32, device=device).view(1, kv_len)
+        ]
+        k_cache = torch.randn((kv_len, num_kv_heads, head_dim), dtype=dtype, device=device)
+        manager.kv_cache = [(k_cache, torch.empty_like(k_cache))]
+        manager._rkv_query_cache = [
+            torch.empty((1, observation_tokens, num_heads, head_dim), dtype=dtype, device=device)
+        ]
+        manager._rkv_query_positions = [
+            torch.full((1, observation_tokens), -1, dtype=torch.int32, device=device)
+        ]
+
+        q_window = torch.randn((observation_tokens, num_heads, head_dim), dtype=dtype, device=device)
+        positions = torch.tensor([4, 5], dtype=torch.long, device=device)
+        cols = positions.remainder(observation_tokens)
+        manager._rkv_query_cache[0][0, cols] = q_window
+        manager._rkv_query_positions[0][0, cols] = positions.to(torch.int32)
+
+        scores = manager.rkv_query_attention_scores(
+            0,
+            seq,
+            kv_len,
+            candidate_start=candidate_start,
+            num_recent_tokens=num_recent_tokens,
+        )
+        torch.cuda.synchronize()
+
+        expected = _prefill_score_baseline(
+            q_window,
+            k_cache,
+            manager.buffer_req_to_token_slots[0],
+            torch.tensor([0], dtype=torch.int32, device=device),
+            torch.tensor([0], dtype=torch.int32, device=device),
+            torch.tensor([kv_len], dtype=torch.int32, device=device),
+            torch.tensor([kv_len - observation_tokens], dtype=torch.int32, device=device),
+            torch.tensor([kv_len - observation_tokens], dtype=torch.int32, device=device),
+            torch.tensor([kv_len], dtype=torch.int32, device=device),
+            candidate_start,
+            num_recent_tokens,
+        )[0, :kv_len]
+        torch.testing.assert_close(scores, expected, rtol=2e-2, atol=2e-2)
 
 
 if __name__ == "__main__":

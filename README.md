@@ -156,6 +156,7 @@ and `LLM(...)` kwargs should use `sparse_method`.
 `rkv` runtime knobs:
 
 - `rkv_compression_interval`: generated-token buffer size before decode eviction (default `128`; use larger values such as `1024` for fewer, larger paper-style decode evictions)
+- `rkv_observation_tokens`: query-cache observation window used to score candidate KV tokens (default `8`; must be `<= 128` and `<= rkv_compression_interval`)
 - `rkv_alpha`: paper-style joint score lambda, `alpha * importance - (1 - alpha) * redundancy` (default `0.1`)
 - `rkv_similarity_threshold`: cosine threshold used to count key-token redundancy (default `0.8`)
 - `rkv_recent_similar_keep`: preserve links to the most recent similar tokens when estimating redundancy (default `1`)

@@ -114,6 +114,13 @@ class Attention(nn.Module):
                     b_start_loc=b_start_loc,
                     chunk_lens=chunk_lens,
                 )
+                cache_manager.record_prefill_query(
+                    layer_idx,
+                    q,
+                    prefill_view,
+                    b_start_loc=b_start_loc,
+                    chunk_lens=chunk_lens,
+                )
             else:    # decode
                 batch_size = q.shape[0]
                 selection = sparse_controller.get_decode_selection(
@@ -180,6 +187,7 @@ class Attention(nn.Module):
                     num_heads=self.num_heads,
                     num_kv_heads=self.num_kv_heads,
                 )
+                cache_manager.record_decode_query(layer_idx, q)
 
             sparse_controller.on_layer_attention_end(layer_idx)
             cache_manager.on_layer_attention_end(layer_idx)

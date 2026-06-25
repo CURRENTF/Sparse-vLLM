@@ -373,6 +373,24 @@ class CacheManager(ABC):
         del layer_idx, q, view, b_start_loc, chunk_lens
         return None
 
+    def record_prefill_query(
+        self,
+        layer_idx: int,
+        q: torch.Tensor,
+        view: PrefillComputeView,
+        *,
+        b_start_loc: torch.Tensor,
+        chunk_lens: torch.Tensor,
+    ):
+        """Optional method-owned prefill query cache update after attention output is computed."""
+        del layer_idx, q, view, b_start_loc, chunk_lens
+        return None
+
+    def record_decode_query(self, layer_idx: int, q: torch.Tensor):
+        """Optional method-owned decode query cache update after attention output is computed."""
+        del layer_idx, q
+        return None
+
     def pop_prefill_attention_score(self, layer_idx: int, seq: Sequence) -> torch.Tensor | None:
         """Return and clear a method-owned prefill score for one completed sequence."""
         del layer_idx, seq

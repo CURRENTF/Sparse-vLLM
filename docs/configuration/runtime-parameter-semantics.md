@@ -192,6 +192,8 @@ Known Sparse-vLLM method strings:
 | `pyramidkv` | SnapKV cache manager with PyramidKV layer budgets. |
 | `omnikv` | OmniKV cache manager. |
 | `quest` | Quest cache manager. |
+| `rkv`, `r-kv`, `r_kv` | R-KV cache manager with physical decode eviction, query-cache attention importance scoring, and key-redundancy scoring. |
+| `skipkv`, `skip-kv` | SkipKV cache manager with physical decode eviction and sentence-aware redundancy signals. |
 | `deltakv` | Maintained compressor-backed DeltaKV runtime. |
 | `deltakv-less-memory`, `deltakv-less-memory-cudagraph` | Legacy aliases retained for old configs and regression manifests. They normalize to `deltakv`; the cudagraph alias also requests decode CUDA graph. |
 
@@ -386,6 +388,22 @@ is not equivalent to:
 ```json
 {"backend": "sparsevllm", "sparse_method": "quest", "quest_token_budget": 1024, "quest_chunk_size": 16}
 ```
+
+### 6.4 R-KV
+
+Sparse-vLLM R-KV keeps a small per-layer query cache in the cache manager and
+uses it to score candidate KV tokens during decode eviction.
+
+| Parameter | Main consumer | Meaning |
+| --- | --- | --- |
+| `rkv_compression_interval` | SparseController | Generated-token buffer size between R-KV decode evictions. |
+| `rkv_observation_tokens` | RKVCacheManager | Number of recent query states used as the R-KV observation window. It is separate from `rkv_compression_interval`, defaults to `8`, and must be `<= 128` and `<= rkv_compression_interval`. |
+| `rkv_alpha` | RKVCacheManager | Paper-style joint score lambda: `alpha * importance - (1 - alpha) * redundancy`. |
+| `rkv_redundancy_window` | RKVCacheManager | Candidate window scored for key redundancy. `0` scores the full candidate set; positive values opt into a trailing-window approximation. |
+
+R-KV importance scores are computed from cached observation queries and the
+current K cache via the shared prefill score kernel. The decode attention-score
+buffer is not the R-KV source of truth.
 
 ## 7. DeltaKV HF Cache Semantics
 

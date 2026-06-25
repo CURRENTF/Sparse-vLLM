@@ -656,13 +656,21 @@ class SparseController:
             raise RuntimeError(
                 f"Cache manager {type(self.cache_manager).__name__} does not implement {select_fn_name}."
             )
+        use_query_cache_scores = self.sparse_method == "rkv"
+        query_score_fn = getattr(self.cache_manager, "rkv_query_attention_scores", None)
+        if use_query_cache_scores and query_score_fn is None:
+            raise RuntimeError(
+                f"Cache manager {type(self.cache_manager).__name__} does not implement rkv_query_attention_scores."
+            )
 
         with profiler.record(profiler_name):
             for layer_idx in range(self.num_layers):
                 state = self.layer_batch_sparse_states[layer_idx]
-                attn_scores = state.attn_score
-                if attn_scores is None:
-                    continue
+                attn_scores = None
+                if not use_query_cache_scores:
+                    attn_scores = state.attn_score
+                    if attn_scores is None:
+                        continue
 
                 triggered: list[tuple[int, Sequence, int]] = []
                 for b_idx, seq in enumerate(seqs):
@@ -674,7 +682,7 @@ class SparseController:
                 if not triggered:
                     continue
 
-                if attn_scores.dim() == 3:
+                if attn_scores is not None and attn_scores.dim() == 3:
                     attn_scores = self._decode_softmax_token_scores(
                         attn_scores,
                         candidate_start=self.num_sink,
@@ -692,10 +700,20 @@ class SparseController:
                             budget,
                             trigger_len,
                         )
+                    if use_query_cache_scores:
+                        importance_scores = query_score_fn(
+                            layer_idx,
+                            seq,
+                            kv_len,
+                            candidate_start=self.num_sink,
+                            num_recent_tokens=self.num_recent,
+                        )
+                    else:
+                        importance_scores = attn_scores[b_idx, :kv_len]
                     keep_indices = select_fn(
                         layer_idx,
                         seq,
-                        attn_scores[b_idx, :kv_len],
+                        importance_scores,
                         kv_len,
                         budget,
                     )
@@ -979,7 +997,9 @@ class SparseController:
             top_budget = budget - self.num_sink - self.num_recent
             trigger_len = int(2.0 * top_budget)
             return bool(((state.context_lens >= trigger_len) & (state.context_lens > budget)).any())
-        if self.sparse_method in ("rkv", "skipkv"):
+        if self.sparse_method == "rkv":
+            return False
+        if self.sparse_method == "skipkv":
             if is_prefill:
                 return False
             budget = self._get_joint_decode_budget()
@@ -987,22 +1007,18 @@ class SparseController:
                 return False
             if bool(getattr(self.config, "decode_cuda_graph", False)):
                 # Graph replay reuses the tensors captured on the first decode
-                # step.  R-KV/SkipKV eviction may trigger only after more tokens
-                # are generated, so capture the score path up front instead of
+                # step.  SkipKV eviction may trigger only after more tokens are
+                # generated, so capture the score path up front instead of
                 # silently losing later score-dependent evictions.
                 return True
             state = self.layer_batch_sparse_states[layer_idx]
             if state.context_lens is None:
                 return False
-            interval = (
-                int(self.config.rkv_compression_interval)
-                if self.sparse_method == "rkv"
-                else int(self.config.skipkv_compression_interval)
-            )
+            interval = int(self.config.skipkv_compression_interval)
             trigger_len = int(budget) + int(interval)
             return bool(((state.context_lens >= trigger_len) & (state.context_lens > budget)).any())
         return False
-    
+
     def _get_layer_budget(self, layer_idx: int, is_prefill: bool) -> int | None:
         if layer_idx < self.config.snapkv_num_full_layers:
             return None
