@@ -294,6 +294,7 @@ def get_generate_api(model_path: str, infer_config: dict, deltakv_checkpoint_pat
             # 将 HF 风格参数映射到 SamplingParams
             max_tokens = kwargs.get('max_new_tokens', kwargs.get('max_tokens', 128))
             temperature = kwargs.get('temperature', 1.0)
+            top_p = kwargs.get('top_p', 1.0)
             
             # greedy decoding should be exact argmax, not low-temperature sampling.
             if not kwargs.get('do_sample', True):
@@ -301,13 +302,16 @@ def get_generate_api(model_path: str, infer_config: dict, deltakv_checkpoint_pat
             elif temperature < 1e-5:
                 temperature = 1e-5
             
-            sampling_params = SamplingParams(temperature=temperature, max_tokens=max_tokens)
+            sampling_params = SamplingParams(temperature=temperature, top_p=top_p, max_tokens=max_tokens)
             outputs = llm.generate(prompts, sampling_params, use_tqdm=False)
             
             results = [out['text'] for out in outputs]
             if return_kv_cache:
                 return (results[0], None) if is_single else (results, None)
             return results[0] if is_single else results
+
+        generate._sparsevllm_llm = llm
+        generate._sparsevllm_infer_config = dict(public_infer_config)
         
         if return_model:
             raise ValueError('sparse vllm 不支持 return_model=True')

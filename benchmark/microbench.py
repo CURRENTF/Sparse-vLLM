@@ -284,7 +284,22 @@ def benchmark_task(method, length, bs, args, results_dict):
     sparse_kwargs: dict[str, Any] = {"sparse_method": "vanilla"}
     if method == "vanilla":
         sparse_kwargs["sparse_method"] = "vanilla"
-    elif method in ("streamingllm", "attention-sink", "attention_sink", "snapkv", "pyramidkv", "omnikv", "quest", "deltakv"):
+    elif method in (
+        "streamingllm",
+        "attention-sink",
+        "attention_sink",
+        "snapkv",
+        "pyramidkv",
+        "omnikv",
+        "quest",
+        "rkv",
+        "r-kv",
+        "r_kv",
+        "skipkv",
+        "skip-kv",
+        "skip_kv",
+        "deltakv",
+    ):
         sparse_kwargs["sparse_method"] = method
     elif "deltakv" in method:
         sparse_kwargs["sparse_method"] = method
@@ -532,7 +547,7 @@ def main():
         default="vanilla,snapkv,omnikv",
         help=(
             "Methods to test (vanilla, streamingllm, attention-sink, snapkv, pyramidkv, "
-            "omnikv, quest, deltakv; deltakv-less-memory* are legacy aliases)"
+            "omnikv, quest, rkv, skipkv, deltakv; deltakv-less-memory* are legacy aliases)"
         ),
     )
     parser.add_argument("--output_len", type=int, default=512, help="Output tokens per request")

@@ -87,9 +87,23 @@ _SPARSE_METHOD_TO_HF_MODEL_CLS: dict[str, str] = {
     "pyramidkv": "pyramidkv",
     "omnikv": "omnikv",
     "quest": "quest",
+    "rkv": "rkv",
+    "r-kv": "rkv",
+    "r_kv": "rkv",
+    "skipkv": "skipkv",
+    "skip-kv": "skipkv",
+    "skip_kv": "skipkv",
     "streamingllm": "streamingllm",
     "attention-sink": "streamingllm",
     "attention_sink": "streamingllm",
+}
+
+_SPARSEVLLM_METHOD_ALIASES: dict[str, str] = {
+    "vanilla": "",
+    "r-kv": "rkv",
+    "r_kv": "rkv",
+    "skip-kv": "skipkv",
+    "skip_kv": "skipkv",
 }
 
 def _canonical_backend(backend: str | None) -> str | None:
@@ -191,7 +205,7 @@ def normalize_runtime_params(
     if sparse_method is not None:
         sparse_method = str(sparse_method)
         if backend == "sparsevllm":
-            sparsevllm_method = "" if sparse_method == "vanilla" else sparse_method
+            sparsevllm_method = _SPARSEVLLM_METHOD_ALIASES.get(sparse_method, sparse_method)
             normalized["vllm_sparse_method"] = sparsevllm_method
             warnings.append("`sparse_method` was normalized to `vllm_sparse_method`.")
         elif backend == "hf":

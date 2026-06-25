@@ -22,6 +22,10 @@ Touch these files when the method becomes a supported `vllm_sparse_method`.
   Register `CacheManager.create(...)` routing and add generic hooks only if the existing hooks are insufficient.
 - `src/sparsevllm/engine/cache_manager/__init__.py`
   Export the new cache manager when appropriate.
+- `src/sparsevllm/engine/activation_controller.py`
+  Put method-specific hidden-state steering or activation capture here, with
+  `SparseController` owning the lifecycle and model files calling only a generic
+  hook.
 - `README.md`
   Document method semantics, knobs, and benchmark examples.
 
@@ -35,6 +39,11 @@ Edit `src/sparsevllm/engine/sparse_controller.py` when the method:
 - changes scheduler-facing sparse state
 
 Do not move method-owned cache metadata here.
+
+If the method needs hidden-state steering, keep the steering math and per-seq
+activation state in `activation_controller.py`; `SparseController` should only
+create the controller, call its prepare/post hooks, and expose a generic model
+hook.
 
 ## Touch `attention.py` Only for Generic Hooks
 
@@ -59,6 +68,16 @@ Touch `src/sparsevllm/triton_kernel/` or another explicit kernel module when:
 After editing code:
 
 1. Compile touched Python files with `python -m py_compile`.
-2. Run one small correctness task.
+2. Run one small correctness-oriented benchmark or regression task that actually
+   loads the public method, generates outputs, and saves status/artifacts.
 3. Run one throughput benchmark.
-4. Compare against at least one existing method on the same machine.
+4. Cover multiple batch sizes: at minimum `bs=1` and one `bs>1` run. Treat an
+   untested or failing `bs>1` path as a documented limitation or blocker.
+5. Compare against at least one existing method on the same machine.
+6. Treat poor decode speed as an implementation blocker, not just a benchmark note.
+   Use matched settings against `vanilla` and the closest existing sparse method;
+   do not use eager-only, bs=1, or tiny-context smoke results as evidence that the
+   method is performance-ready.
+7. Do not use very short generations as decode-speed evidence. Runs with small
+   `output_len` are useful for debug only; use `output_len >= 128` for quick
+   performance checks and prefer `output_len >= 256` for meaningful comparisons.

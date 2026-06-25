@@ -205,7 +205,19 @@ class PrefillPolicyRegistryTest(unittest.TestCase):
                 )
 
     def test_other_non_deltakv_defaults_to_all_chunked(self):
-        for method in ("", "vanilla", "streamingllm", "attention-sink", "snapkv", "quest", "omnikv"):
+        for method in (
+            "",
+            "vanilla",
+            "streamingllm",
+            "attention-sink",
+            "snapkv",
+            "quest",
+            "rkv",
+            "r-kv",
+            "skipkv",
+            "skip-kv",
+            "omnikv",
+        ):
             with self.subTest(method=method):
                 self.assertEqual(get_default_prefill_schedule_policy(method), PREFILL_POLICY_ALL_CHUNKED)
 

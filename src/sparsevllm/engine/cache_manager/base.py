@@ -128,6 +128,14 @@ class CacheManager(ABC):
             from .snapkv import SnapKVCacheManager
 
             return SnapKVCacheManager(config, rank, world_size)
+        if sparse_method == "rkv":
+            from .rkv import RKVCacheManager
+
+            return RKVCacheManager(config, rank, world_size)
+        if sparse_method == "skipkv":
+            from .skipkv import SkipKVCacheManager
+
+            return SkipKVCacheManager(config, rank, world_size)
         if sparse_method == "quest":
             from .quest import QuestCacheManager
 

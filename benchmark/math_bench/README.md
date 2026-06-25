@@ -36,10 +36,10 @@ python benchmark/math_bench/pred.py \
 Outputs:
 
 - Predictions: `$DELTAKV_OUTPUT_DIR/benchmark/math_bench/pred/<model>/<compressor>_<time>/`
-- Eval result: `result.json` in the output folder, plus `$DELTAKV_OUTPUT_DIR/mathbench_eval.log`
+- Eval result: `result.json` in the output folder, `*_parsed_outputs.jsonl`, `*_per_sample_results.jsonl`, plus `$DELTAKV_OUTPUT_DIR/mathbench_eval.log`
 
 Notes:
 
-- Evaluation extracts the final answer from the last `\boxed{...}` by default. Use `python benchmark/math_bench/eval.py --path ... --allow_unboxed` to enable a fallback that matches the last number when no `\boxed{}` is found.
+- Evaluation uses `math-verify==0.9.0` for answer parsing and equivalence checking. Predictions use `ExprExtractionConfig(), LatexExtractionConfig(boxed_match_priority=0)`; MATH-500 gold uses `solution` with `answer` fallback. The previous regex/string-equality scorer has been removed.
 - This runner uses sampling (`do_sample=True`) and enforces `--temperature` within `[0.5, 0.7]` (recommended `0.6`).
 - It enforces outputs to start with `<think>\n` by default; disable with `--no_force_think_prefix`.

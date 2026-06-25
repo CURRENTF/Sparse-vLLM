@@ -53,6 +53,19 @@ def _coerce_optional_positive_int(name: str, value: Any) -> int | None:
     return parsed
 
 
+SUPPORTED_SKIPKV_MODEL_NAMES = frozenset(
+    {
+        "DeepSeek-R1-Distill-Llama-8B",
+        "DeepSeek-R1-Distill-Qwen-7B",
+        "DeepSeek-R1-Distill-Qwen-14B",
+    }
+)
+
+
+def _model_path_basename(model_path: str) -> str:
+    return str(model_path).rstrip("/").split("/")[-1]
+
+
 def _default_decode_cuda_graph_capture_sizes(max_decoding_seqs: int) -> list[int]:
     max_decoding_seqs = int(max_decoding_seqs)
     if max_decoding_seqs <= 0:
@@ -189,7 +202,7 @@ class Config:
     num_kvcache_slots: int | list = -1
 
     # Sparse Attention Config
-    vllm_sparse_method: str = ""  # "", "streamingllm", "snapkv", "pyramidkv", "omnikv", "quest", "deltakv"; legacy deltakv-less-memory aliases normalize to deltakv.
+    vllm_sparse_method: str = ""  # "", "streamingllm", "snapkv", "pyramidkv", "omnikv", "quest", "rkv", "skipkv", "deltakv"; legacy deltakv-less-memory aliases normalize to deltakv.
 
     # Prefix Cache Config
     enable_prefix_caching: bool = False
@@ -233,6 +246,36 @@ class Config:
     # SnapKV Config
     snapkv_window_size: int = 32
     snapkv_num_full_layers: int = 0  # 前多少层不进行驱逐
+
+    # R-KV Config
+    rkv_compression_interval: int = 128
+    rkv_alpha: float = 0.1
+    rkv_similarity_threshold: float = 0.8
+    rkv_recent_similar_keep: int = 1
+    rkv_max_redundancy_tokens: int = 4096
+    # 0 means score the full candidate set, matching R-KV's budget-candidate selection.
+    # Positive values are an explicit speed/quality approximation.
+    rkv_redundancy_window: int = 0
+
+    # SkipKV Config.
+    skipkv_compression_interval: int = 128
+    skipkv_alpha: float = 0.1
+    skipkv_similarity_threshold: float = 0.95
+    skipkv_segment_size: int = 32
+    skipkv_max_redundancy_tokens: int = 4096
+    skipkv_redundancy_window: int = 64
+    skipkv_enable_sentence_scoring: bool = True
+    skipkv_sentence_score_weight: float = 1.0
+    skipkv_sentence_min_tokens: int = 4
+    skipkv_sentence_max_tokens: int = 256
+    skipkv_sentence_embedding_layer: int = -1
+    skipkv_max_tracked_sentences: int = 256
+    skipkv_enable_activation_steering: bool = False
+    skipkv_steering_vector_path: str | None = None
+    skipkv_steering_layer: int = -1
+    skipkv_steering_alpha: float = 0.0
+    skipkv_steering_alpha_increment: float = 0.0
+    skipkv_steering_alpha_max: float = 0.0
     
     # PyramidKV Config
     pyramid_layer_ratios: list[float] | None = None  # 每层的 KV budget 比例
@@ -483,6 +526,14 @@ class Config:
 
         if not os.path.isdir(self.model):
             raise FileNotFoundError(f"Model directory does not exist: {self.model}")
+        if self.vllm_sparse_method == "skipkv":
+            model_name = _model_path_basename(self.model)
+            if model_name not in SUPPORTED_SKIPKV_MODEL_NAMES:
+                supported = ", ".join(sorted(SUPPORTED_SKIPKV_MODEL_NAMES))
+                raise ValueError(
+                    "SkipKV is supported only for the official models with released steering vectors: "
+                    f"{supported}. Got model basename {model_name!r} from model path {self.model!r}."
+                )
         if int(self.max_decoding_seqs) <= 0:
             raise ValueError(f"max_decoding_seqs must be > 0, got {self.max_decoding_seqs}.")
         self.max_decoding_seqs = int(self.max_decoding_seqs)
@@ -564,6 +615,112 @@ class Config:
             raise ValueError("quest_token_budget 必须 > 0")
         if self.quest_skip_layers < 0:
             raise ValueError("quest_skip_layers 不能 < 0")
+        self.rkv_compression_interval = int(self.rkv_compression_interval or 0)
+        if self.rkv_compression_interval <= 0:
+            raise ValueError(
+                f"rkv_compression_interval must be > 0, got {self.rkv_compression_interval}."
+            )
+        self.rkv_alpha = float(self.rkv_alpha)
+        if not 0.0 <= self.rkv_alpha <= 1.0:
+            raise ValueError(f"rkv_alpha must be in [0, 1], got {self.rkv_alpha}.")
+        self.rkv_similarity_threshold = float(self.rkv_similarity_threshold)
+        if not 0.0 <= self.rkv_similarity_threshold <= 1.0:
+            raise ValueError(
+                "rkv_similarity_threshold must be in [0, 1], "
+                f"got {self.rkv_similarity_threshold}."
+            )
+        self.rkv_recent_similar_keep = int(self.rkv_recent_similar_keep)
+        if self.rkv_recent_similar_keep < 0:
+            raise ValueError(
+                f"rkv_recent_similar_keep must be >= 0, got {self.rkv_recent_similar_keep}."
+            )
+        self.rkv_max_redundancy_tokens = int(self.rkv_max_redundancy_tokens or 0)
+        if self.rkv_max_redundancy_tokens <= 0:
+            raise ValueError(
+                f"rkv_max_redundancy_tokens must be > 0, got {self.rkv_max_redundancy_tokens}."
+            )
+        self.rkv_redundancy_window = int(self.rkv_redundancy_window or 0)
+        if self.rkv_redundancy_window < 0:
+            raise ValueError(
+                f"rkv_redundancy_window must be >= 0, got {self.rkv_redundancy_window}."
+            )
+        if 0 < self.rkv_redundancy_window > self.rkv_max_redundancy_tokens:
+            raise ValueError(
+                "rkv_redundancy_window must be <= rkv_max_redundancy_tokens, "
+                f"got window={self.rkv_redundancy_window} max={self.rkv_max_redundancy_tokens}."
+            )
+        self.skipkv_compression_interval = int(self.skipkv_compression_interval or 0)
+        if self.skipkv_compression_interval <= 0:
+            raise ValueError(
+                "skipkv_compression_interval must be > 0, "
+                f"got {self.skipkv_compression_interval}."
+            )
+        self.skipkv_alpha = float(self.skipkv_alpha)
+        if self.skipkv_alpha < 0.0:
+            raise ValueError(f"skipkv_alpha must be >= 0, got {self.skipkv_alpha}.")
+        self.skipkv_similarity_threshold = float(self.skipkv_similarity_threshold)
+        if not 0.0 <= self.skipkv_similarity_threshold <= 1.0:
+            raise ValueError(
+                "skipkv_similarity_threshold must be in [0, 1], "
+                f"got {self.skipkv_similarity_threshold}."
+            )
+        self.skipkv_segment_size = int(self.skipkv_segment_size or 0)
+        if self.skipkv_segment_size <= 0:
+            raise ValueError(f"skipkv_segment_size must be > 0, got {self.skipkv_segment_size}.")
+        self.skipkv_max_redundancy_tokens = int(self.skipkv_max_redundancy_tokens or 0)
+        if self.skipkv_max_redundancy_tokens <= 0:
+            raise ValueError(
+                "skipkv_max_redundancy_tokens must be > 0, "
+                f"got {self.skipkv_max_redundancy_tokens}."
+            )
+        self.skipkv_redundancy_window = int(self.skipkv_redundancy_window or 0)
+        if self.skipkv_redundancy_window <= 0:
+            raise ValueError(
+                "skipkv_redundancy_window must be > 0, "
+                f"got {self.skipkv_redundancy_window}."
+            )
+        if self.skipkv_redundancy_window > self.skipkv_max_redundancy_tokens:
+            raise ValueError(
+                "skipkv_redundancy_window must be <= skipkv_max_redundancy_tokens, "
+                f"got window={self.skipkv_redundancy_window} max={self.skipkv_max_redundancy_tokens}."
+            )
+        self.skipkv_enable_sentence_scoring = bool(self.skipkv_enable_sentence_scoring)
+        self.skipkv_sentence_score_weight = float(self.skipkv_sentence_score_weight)
+        if self.skipkv_sentence_score_weight < 0.0:
+            raise ValueError(
+                "skipkv_sentence_score_weight must be >= 0, "
+                f"got {self.skipkv_sentence_score_weight}."
+            )
+        self.skipkv_sentence_min_tokens = int(self.skipkv_sentence_min_tokens or 0)
+        if self.skipkv_sentence_min_tokens <= 0:
+            raise ValueError(
+                "skipkv_sentence_min_tokens must be > 0, "
+                f"got {self.skipkv_sentence_min_tokens}."
+            )
+        self.skipkv_sentence_max_tokens = int(self.skipkv_sentence_max_tokens or 0)
+        if self.skipkv_sentence_max_tokens < self.skipkv_sentence_min_tokens:
+            raise ValueError(
+                "skipkv_sentence_max_tokens must be >= skipkv_sentence_min_tokens, "
+                f"got max={self.skipkv_sentence_max_tokens} min={self.skipkv_sentence_min_tokens}."
+            )
+        self.skipkv_sentence_embedding_layer = int(self.skipkv_sentence_embedding_layer)
+        self.skipkv_max_tracked_sentences = int(self.skipkv_max_tracked_sentences or 0)
+        if self.skipkv_max_tracked_sentences <= 0:
+            raise ValueError(
+                "skipkv_max_tracked_sentences must be > 0, "
+                f"got {self.skipkv_max_tracked_sentences}."
+            )
+        self.skipkv_enable_activation_steering = bool(self.skipkv_enable_activation_steering)
+        self.skipkv_steering_layer = int(self.skipkv_steering_layer)
+        self.skipkv_steering_alpha = float(self.skipkv_steering_alpha)
+        self.skipkv_steering_alpha_increment = float(self.skipkv_steering_alpha_increment)
+        self.skipkv_steering_alpha_max = float(self.skipkv_steering_alpha_max)
+        if self.skipkv_enable_activation_steering and not self.skipkv_steering_vector_path:
+            raise ValueError(
+                "skipkv_enable_activation_steering=True requires skipkv_steering_vector_path. "
+                "Official SkipKV support is limited to the released steering vectors for "
+                f"{', '.join(sorted(SUPPORTED_SKIPKV_MODEL_NAMES))}."
+            )
         self.prefix_cache_block_size = resolve_prefix_cache_block_size(self)
 
         # Normalize compressor type strings.

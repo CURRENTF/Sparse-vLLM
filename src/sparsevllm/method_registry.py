@@ -15,6 +15,10 @@ METHOD_ALIASES = {
     "vanilla": "",
     "attention-sink": "streamingllm",
     "attention_sink": "streamingllm",
+    "r-kv": "rkv",
+    "r_kv": "rkv",
+    "skip-kv": "skipkv",
+    "skip_kv": "skipkv",
     # DeltaKV now has one public runtime.  The old names stay as aliases so old
     # config files still load, but all code routes through vllm_sparse_method="deltakv".
     "deltakv-less-memory": "deltakv",
@@ -30,6 +34,8 @@ CANONICAL_SPARSE_METHODS = {
     "pyramidkv",
     "omnikv",
     "quest",
+    "rkv",
+    "skipkv",
     "deltakv",
 }
 
@@ -48,6 +54,8 @@ _DEFAULT_PREFILL_POLICY_BY_METHOD = {
     "pyramidkv": PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
     "omnikv": PREFILL_POLICY_ALL_CHUNKED,
     "quest": PREFILL_POLICY_ALL_CHUNKED,
+    "rkv": PREFILL_POLICY_ALL_CHUNKED,
+    "skipkv": PREFILL_POLICY_ALL_CHUNKED,
     "deltakv": PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
 }
 
@@ -56,6 +64,10 @@ PREFILL_POLICY_BY_METHOD = {
     "vanilla": PREFILL_POLICY_ALL_CHUNKED,
     "attention-sink": PREFILL_POLICY_ALL_CHUNKED,
     "attention_sink": PREFILL_POLICY_ALL_CHUNKED,
+    "r-kv": PREFILL_POLICY_ALL_CHUNKED,
+    "r_kv": PREFILL_POLICY_ALL_CHUNKED,
+    "skip-kv": PREFILL_POLICY_ALL_CHUNKED,
+    "skip_kv": PREFILL_POLICY_ALL_CHUNKED,
     "deltakv-less-memory": PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
     "deltakv_less_memory": PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
     "deltakv-less-memory-cudagraph": PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,

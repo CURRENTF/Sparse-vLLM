@@ -105,6 +105,13 @@ class RuntimeParamNormalizationTest(unittest.TestCase):
         normalized = normalize_runtime_params({"sparse_method": "vanilla"}, backend="sparsevllm")
         self.assertEqual(normalized.infer_config["vllm_sparse_method"], "")
 
+    def test_sparsevllm_rkv_alias_maps_to_canonical_method(self):
+        normalized = normalize_runtime_params({"sparse_method": "r-kv"}, backend="sparsevllm")
+        self.assertEqual(normalized.infer_config["vllm_sparse_method"], "rkv")
+
+        normalized = normalize_runtime_params({"sparse_method": "skip-kv"}, backend="sparsevllm")
+        self.assertEqual(normalized.infer_config["vllm_sparse_method"], "skipkv")
+
     def test_hf_less_memory_routes_to_deltakv_model(self):
         normalized = normalize_runtime_params({"sparse_method": "deltakv-less-memory"}, backend="hf")
         self.assertEqual(normalized.hf_model_cls, "deltakv")

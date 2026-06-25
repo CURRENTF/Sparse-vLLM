@@ -131,6 +131,48 @@
       },
       "memory": {"expected_savings": 0.3}
     },
+    "rkv": {
+      "sparse_method": "rkv",
+      "requires_compressor": false,
+      "hf_logits_reference": false,
+      "config": {
+        "sparse_method": "rkv",
+        "engine_prefill_chunk_size": 4096,
+        "sink_keep_tokens": 0,
+        "recent_keep_tokens": 32,
+        "decode_keep_tokens": 3072,
+        "rkv_compression_interval": 128,
+        "rkv_alpha": 0.1,
+        "rkv_similarity_threshold": 0.8,
+        "rkv_recent_similar_keep": 1,
+        "rkv_max_redundancy_tokens": 4096,
+        "rkv_redundancy_window": 64,
+        "gpu_memory_utilization": 0.9
+      },
+      "memory": {"expected_savings": 0.3}
+    },
+    "skipkv": {
+      "sparse_method": "skipkv",
+      "requires_compressor": false,
+      "hf_logits_reference": false,
+      "config": {
+        "sparse_method": "skipkv",
+        "engine_prefill_chunk_size": 4096,
+        "sink_keep_tokens": 0,
+        "recent_keep_tokens": 32,
+        "decode_keep_tokens": 3072,
+        "skipkv_compression_interval": 128,
+        "skipkv_alpha": 0.1,
+        "skipkv_similarity_threshold": 0.95,
+        "skipkv_segment_size": 32,
+        "skipkv_max_redundancy_tokens": 4096,
+        "skipkv_redundancy_window": 64,
+        "rkv_similarity_threshold": 0.8,
+        "rkv_recent_similar_keep": 1,
+        "gpu_memory_utilization": 0.9
+      },
+      "memory": {"expected_savings": 0.3}
+    },
     "deltakv": {
       "sparse_method": "deltakv",
       "requires_compressor": true,

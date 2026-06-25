@@ -450,6 +450,9 @@ class DecodeCudaGraphRunner:
                     if isinstance(value, torch.Tensor):
                         keepalive.append(value)
         keepalive.extend(self.cache_manager.decode_cuda_graph_keepalive_tensors())
+        sparse_keepalive = getattr(self.sparse_controller, "decode_cuda_graph_keepalive_tensors", None)
+        if sparse_keepalive is not None:
+            keepalive.extend(sparse_keepalive())
         state.keepalive = keepalive
         return state
 

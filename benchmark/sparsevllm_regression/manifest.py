@@ -13,6 +13,8 @@ REQUIRED_METHODS = {
     "pyramidkv",
     "omnikv",
     "quest",
+    "rkv",
+    "skipkv",
     "deltakv",
     "deltakv-less-memory",
     "deltakv-less-memory-cudagraph",

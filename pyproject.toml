@@ -35,6 +35,7 @@ dependencies = [
     "uvicorn[standard]",
     "pydantic",
     "pytest",
+    "math-verify==0.9.0",
 ]
 
 [project.scripts]

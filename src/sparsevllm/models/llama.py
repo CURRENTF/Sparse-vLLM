@@ -248,6 +248,13 @@ class LlamaModel(nn.Module):
         for i, layer in enumerate(self.layers):
             context.now_layer_idx = i
             hidden_states, residual = layer(positions, hidden_states, residual)
+            if self.sparse_controller is not None:
+                hidden_states, residual = self.sparse_controller.apply_activation_hook(
+                    i,
+                    hidden_states,
+                    residual,
+                    context,
+                )
             if debug_layers is not None and i in debug_layers:
                 self.debug_last_hidden_states[int(i)] = hidden_states[-1:].detach().clone()
             if self.sparse_controller is not None:

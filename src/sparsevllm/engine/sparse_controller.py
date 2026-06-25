@@ -3,6 +3,7 @@ import os
 import torch
 import torch.nn.functional as F
 from sparsevllm.config import Config
+from sparsevllm.engine.activation_controller import ActivationController
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.engine.cache_manager import CacheManager, SparseSelection
 from sparsevllm.utils.profiler import profiler
@@ -72,6 +73,7 @@ class SparseController:
             "device",
             torch.device("cuda" if torch.cuda.is_available() else "cpu"),
         )
+        self.activation_controller = ActivationController.create(config, cache_manager)
 
         self.obs_layer_ids = self.config.obs_layer_ids
         self.full_attn_layers = self.config.full_attn_layers
@@ -111,8 +113,22 @@ class SparseController:
 
         self.layers = None
 
+    def set_tokenizer_metadata(
+        self,
+        *,
+        delimiter_token_ids: list[int] | set[int] | tuple[int, ...] | None = None,
+        non_execution_token_ids: list[int] | set[int] | tuple[int, ...] | None = None,
+    ):
+        self.activation_controller.set_tokenizer_metadata(
+            delimiter_token_ids=delimiter_token_ids,
+            non_execution_token_ids=non_execution_token_ids,
+        )
+
     def clear_decode_attn_score_buffers(self):
         self._decode_attn_score_buffers.clear()
+
+    def decode_cuda_graph_keepalive_tensors(self) -> list[torch.Tensor]:
+        return self.activation_controller.decode_cuda_graph_keepalive_tensors()
 
     def _debug_record_dynamic_selection(self, bucket: str, layer_idx: int, **fields):
         entry = self.debug_dynamic_selection.setdefault(bucket, {}).setdefault(str(int(layer_idx)), {"calls": 0})
@@ -177,6 +193,7 @@ class SparseController:
         # 每步 prefill or decode 前会执行
         ctx = get_context()
         ctx.sparse_config = self.sparse_config if self.sparse_method else None
+        self.activation_controller.prepare_forward(seqs, is_prefill)
 
         for i in range(self.num_layers):
             state = self.layer_batch_sparse_states[i]
@@ -230,6 +247,20 @@ class SparseController:
 
     def set_modules(self, modules):
         self.layers = modules
+
+    def apply_activation_hook(
+        self,
+        layer_idx: int,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+        context,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        return self.activation_controller.apply_layer_hook(
+            layer_idx,
+            hidden_states,
+            residual,
+            context,
+        )
 
     def _get_decode_attn_score_buffer(
         self,
@@ -317,6 +348,8 @@ class SparseController:
     @torch.no_grad()
     def post_forward(self, seqs: list[Sequence], is_prefill: bool):
         """持久化压缩 (如 SnapKV / DeltaKV)"""
+        self.activation_controller.post_forward(seqs, is_prefill)
+
         if get_context().is_long_text is False and not self.is_deltakv_family:
             return
 
@@ -328,6 +361,10 @@ class SparseController:
              self._deltakv_eviction(seqs)
         if not is_prefill and self.sparse_method in ('snapkv', 'pyramidkv'):
             self._snapkv_decode_eviction(seqs)
+        if not is_prefill and self.sparse_method == "rkv":
+            self._rkv_decode_eviction(seqs)
+        if not is_prefill and self.sparse_method == "skipkv":
+            self._skipkv_decode_eviction(seqs)
         if not is_prefill and self.sparse_method in ("streamingllm", "attention-sink", "attention_sink"):
             self._streamingllm_decode_eviction(seqs)
 
@@ -360,7 +397,17 @@ class SparseController:
         ctx = get_context()
         is_dynamic_deltakv = self.is_deltakv_family
         if ((self.sparse_method == "omnikv" or is_dynamic_deltakv) and layer_idx in self.full_attn_layers) or \
-            self.sparse_method in ('snapkv', 'pyramidkv', 'quest', 'streamingllm', 'attention-sink', 'attention_sink', ''):
+            self.sparse_method in (
+                'snapkv',
+                'pyramidkv',
+                'quest',
+                'rkv',
+                'skipkv',
+                'streamingllm',
+                'attention-sink',
+                'attention_sink',
+                '',
+            ):
             return SparseSelection(
                 kind="full",
                 req_indices=sparse_state.global_req_indices
@@ -574,6 +621,87 @@ class SparseController:
                 self.cache_manager.free_part_slots(layer_idx, seq, keep_indices)
 
     @torch.no_grad()
+    def _rkv_decode_eviction(self, seqs: list[Sequence]):
+        self._joint_decode_eviction(
+            seqs,
+            profiler_name="rkv_decode_eviction",
+            select_fn_name="select_rkv_indices",
+            interval=int(self.config.rkv_compression_interval),
+        )
+
+    @torch.no_grad()
+    def _skipkv_decode_eviction(self, seqs: list[Sequence]):
+        self._joint_decode_eviction(
+            seqs,
+            profiler_name="skipkv_decode_eviction",
+            select_fn_name="select_skipkv_indices",
+            interval=int(self.config.skipkv_compression_interval),
+        )
+
+    @torch.no_grad()
+    def _joint_decode_eviction(
+        self,
+        seqs: list[Sequence],
+        *,
+        profiler_name: str,
+        select_fn_name: str,
+        interval: int,
+    ):
+        budget = self._get_joint_decode_budget()
+        if budget is None:
+            return
+        trigger_len = int(budget) + int(interval)
+        select_fn = getattr(self.cache_manager, select_fn_name, None)
+        if select_fn is None:
+            raise RuntimeError(
+                f"Cache manager {type(self.cache_manager).__name__} does not implement {select_fn_name}."
+            )
+
+        with profiler.record(profiler_name):
+            for layer_idx in range(self.num_layers):
+                state = self.layer_batch_sparse_states[layer_idx]
+                attn_scores = state.attn_score
+                if attn_scores is None:
+                    continue
+
+                triggered: list[tuple[int, Sequence, int]] = []
+                for b_idx, seq in enumerate(seqs):
+                    kv_len = int(state.context_lens[b_idx])
+                    if kv_len <= budget or kv_len < trigger_len:
+                        continue
+                    triggered.append((b_idx, seq, kv_len))
+
+                if not triggered:
+                    continue
+
+                if attn_scores.dim() == 3:
+                    attn_scores = self._decode_softmax_token_scores(
+                        attn_scores,
+                        candidate_start=self.num_sink,
+                        candidate_lens=(state.context_lens - self.num_sink).clamp_min(0),
+                    )
+
+                for b_idx, seq, kv_len in triggered:
+                    if log_level == 'DEBUG':
+                        logger.debug(
+                            "[{}] decode eviction: layer={} seq_id={} kv_len={} budget={} trigger_len={}",
+                            self.sparse_method,
+                            layer_idx,
+                            seq.seq_id,
+                            kv_len,
+                            budget,
+                            trigger_len,
+                        )
+                    keep_indices = select_fn(
+                        layer_idx,
+                        seq,
+                        attn_scores[b_idx, :kv_len],
+                        kv_len,
+                        budget,
+                    )
+                    self.cache_manager.free_part_slots(layer_idx, seq, keep_indices)
+
+    @torch.no_grad()
     def _streamingllm_prefill_eviction(self, seqs: list[Sequence]):
         budget = self._get_streamingllm_budget()
         if budget is None:
@@ -664,6 +792,12 @@ class SparseController:
             keep_indices = torch.cat([sink_indices, recent_indices])
             
         return keep_indices
+
+    def _get_joint_decode_budget(self) -> int | None:
+        budget = int(self.num_sink) + int(self.decode_keep_tokens) + int(self.num_recent)
+        if budget <= 0:
+            return None
+        return budget
 
     def _update_dynamic_omnikv_indices(self, obs_layer_idx, target_layers):
         assert get_context().is_long_text or self.is_deltakv_family
@@ -844,6 +978,28 @@ class SparseController:
                 return False
             top_budget = budget - self.num_sink - self.num_recent
             trigger_len = int(2.0 * top_budget)
+            return bool(((state.context_lens >= trigger_len) & (state.context_lens > budget)).any())
+        if self.sparse_method in ("rkv", "skipkv"):
+            if is_prefill:
+                return False
+            budget = self._get_joint_decode_budget()
+            if budget is None:
+                return False
+            if bool(getattr(self.config, "decode_cuda_graph", False)):
+                # Graph replay reuses the tensors captured on the first decode
+                # step.  R-KV/SkipKV eviction may trigger only after more tokens
+                # are generated, so capture the score path up front instead of
+                # silently losing later score-dependent evictions.
+                return True
+            state = self.layer_batch_sparse_states[layer_idx]
+            if state.context_lens is None:
+                return False
+            interval = (
+                int(self.config.rkv_compression_interval)
+                if self.sparse_method == "rkv"
+                else int(self.config.skipkv_compression_interval)
+            )
+            trigger_len = int(budget) + int(interval)
             return bool(((state.context_lens >= trigger_len) & (state.context_lens > budget)).any())
         return False
     

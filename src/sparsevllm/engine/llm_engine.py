@@ -206,6 +206,11 @@ class LLMEngine:
         # 加载分词器
         self.tokenizer: Qwen2Tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
+        self.model_runner.call(
+            "set_tokenizer_metadata",
+            self._build_delimiter_token_ids(self.tokenizer),
+            self._build_non_execution_token_ids(self.tokenizer),
+        )
         
         # 4. 初始化调度器
         # 关键设计：将 Rank 0 的 CacheManager 传给 Scheduler。
@@ -226,6 +231,48 @@ class LLMEngine:
         if os.getenv("SPARSEVLLM_PROFILER_RESET_AFTER_WARMUP", "0") == "1":
             profiler.reset()
         self._throughput_logger.start()
+
+    @staticmethod
+    def _build_delimiter_token_ids(tokenizer) -> list[int]:
+        # Match SkipKV's official newline-oriented split set. Plain "." or "?"
+        # would trigger steering far more often than the paper implementation.
+        delimiter_texts = [
+            "\n",
+            ".\n",
+            ")\n",
+            "\n\n",
+            ".\n\n",
+            ")\n\n",
+            "?\n\n",
+        ]
+        token_ids: set[int] = set()
+        for text in delimiter_texts:
+            try:
+                ids = tokenizer.encode(text, add_special_tokens=False)
+            except Exception:
+                ids = []
+            if ids:
+                token_ids.add(int(ids[-1]))
+        return sorted(token_ids)
+
+    @staticmethod
+    def _build_non_execution_token_ids(tokenizer) -> list[int]:
+        marker_texts = [
+            "Alternatively",
+            "Wait",
+            "again",
+        ]
+        token_ids: set[int] = set()
+        for text in marker_texts:
+            candidates = {text, " " + text, text.lower(), " " + text.lower()}
+            for candidate in candidates:
+                try:
+                    ids = tokenizer.encode(candidate, add_special_tokens=False)
+                except Exception:
+                    ids = []
+                if ids:
+                    token_ids.add(int(ids[-1]))
+        return sorted(token_ids)
 
     def _warmup(self):
         """预热模型，确保所有算子和显存都已就绪"""

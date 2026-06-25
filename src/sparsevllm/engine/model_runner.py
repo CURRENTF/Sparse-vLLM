@@ -249,6 +249,22 @@ class ModelRunner:
                 after = self.cache_manager.free_slot_stats()
                 logger.info("model_runner.free_slots_batch seq_ids={} after={}", seq_ids, after)
 
+    def set_tokenizer_metadata(
+        self,
+        delimiter_token_ids: list[int],
+        non_execution_token_ids: list[int] | None = None,
+    ):
+        setter = getattr(self.sparse_controller, "set_tokenizer_metadata", None)
+        if setter is not None:
+            setter(
+                delimiter_token_ids=[int(x) for x in delimiter_token_ids],
+                non_execution_token_ids=(
+                    None
+                    if non_execution_token_ids is None
+                    else [int(x) for x in non_execution_token_ids]
+                ),
+            )
+
     def _long_text_threshold(self, is_prefill: bool) -> int:
         if self.config.vllm_sparse_method in ("streamingllm", "attention-sink", "attention_sink"):
             base = self.config.num_sink_tokens + self.config.num_recent_tokens
