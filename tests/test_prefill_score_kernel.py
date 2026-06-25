@@ -178,6 +178,63 @@ class PrefillScoreKernelTest(unittest.TestCase):
         )
         torch.testing.assert_close(acc, expected, rtol=2e-2, atol=2e-2)
 
+    def test_prefill_score_matches_torch_for_gqa_seven_heads(self):
+        from sparsevllm.triton_kernel.prefill_score import prefill_score_fwd
+
+        torch.manual_seed(17)
+        device = "cuda"
+        dtype = torch.bfloat16
+        num_heads = 28
+        num_kv_heads = 4
+        head_dim = 32
+        prompt_len = 96
+        window = 32
+        prompt_cache_len = prompt_len - window
+        req_to_tokens = torch.arange(0, prompt_len, dtype=torch.int32, device=device).unsqueeze(0)
+        b_req_idx = torch.tensor([0], dtype=torch.int32, device=device)
+        q = torch.randn((window, num_heads, head_dim), dtype=dtype, device=device)
+        k_cache = torch.randn((prompt_len, num_kv_heads, head_dim), dtype=dtype, device=device)
+        acc = torch.zeros((1, prompt_len), dtype=torch.float32, device=device)
+        context_lens = torch.tensor([prompt_len], dtype=torch.int32, device=device)
+        prompt_cache_lens = torch.tensor([prompt_cache_len], dtype=torch.int32, device=device)
+        b_start_loc = torch.tensor([0], dtype=torch.int32, device=device)
+        score_starts = torch.tensor([prompt_cache_len], dtype=torch.int32, device=device)
+        score_ends = torch.tensor([prompt_len], dtype=torch.int32, device=device)
+        candidate_start = 3
+        num_recent_tokens = 9
+
+        prefill_score_fwd(
+            q,
+            k_cache,
+            acc,
+            b_req_idx,
+            b_start_loc,
+            context_lens,
+            prompt_cache_lens,
+            window,
+            req_to_tokens,
+            score_starts,
+            score_ends,
+            candidate_start=candidate_start,
+            num_recent_tokens=num_recent_tokens,
+        )
+        torch.cuda.synchronize()
+
+        expected = _prefill_score_baseline(
+            q,
+            k_cache,
+            req_to_tokens,
+            b_req_idx,
+            b_start_loc,
+            context_lens,
+            prompt_cache_lens,
+            score_starts,
+            score_ends,
+            candidate_start,
+            num_recent_tokens,
+        )
+        torch.testing.assert_close(acc, expected, rtol=2e-2, atol=2e-2)
+
 
 if __name__ == "__main__":
     unittest.main()
