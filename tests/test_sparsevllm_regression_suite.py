@@ -84,6 +84,36 @@ class SparseVLLMRegressionSuiteTest(unittest.TestCase):
                 output_root=Path("/tmp/sparsevllm-quality"),
             )
 
+    def test_scbench_command_can_enable_decode_graph_without_changing_default(self):
+        base = {
+            "tasks": ["scbench_kv"],
+            "num_eval_examples": 1,
+            "max_turns": 2,
+            "max_seq_length": 1024,
+            "batch_size": 2,
+            "prefix_cache_block_size": 16,
+        }
+
+        default_cmd = run_suite._scbench_command(
+            manifest_path=Path("/tmp/manifest.json"),
+            model_id="qwen3_4b",
+            method_ids=["vanilla"],
+            scbench=base,
+            output_dir=Path("/tmp/scbench"),
+        )
+        self.assertNotIn("--decode_cuda_graph", default_cmd)
+        self.assertNotIn("--no-enforce_eager", default_cmd)
+
+        graph_cmd = run_suite._scbench_command(
+            manifest_path=Path("/tmp/manifest.json"),
+            model_id="qwen3_4b",
+            method_ids=["vanilla"],
+            scbench={**base, "decode_cuda_graph": True, "enforce_eager": False},
+            output_dir=Path("/tmp/scbench"),
+        )
+        self.assertIn("--decode_cuda_graph", graph_cmd)
+        self.assertIn("--no-enforce_eager", graph_cmd)
+
     def test_validate_layer_runs_as_a_standard_test_and_writes_required_artifacts(self):
         # Keep the default tests on the cheap validate layer only. Full
         # quality/logits/perf/stress regression runs require model paths,

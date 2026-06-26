@@ -61,8 +61,8 @@ A learned DeltaKV compressor whose compression path and reconstruction path inte
 _Avoid_: untied compressor weights
 
 **Prefix Cache Block**:
-A block-aligned segment of prompt tokens that is eligible for prefix-cache reuse across requests. Prefix-cache matching happens at this block granularity; it is a shared prefix-caching concept, not a method-specific storage representation.
-_Avoid_: Quest page, token slot payload, method payload
+A block-aligned segment of request context tokens that is eligible for prefix-cache reuse by later requests. Prefix-cache matching happens at this block granularity; it is a shared prefix-caching concept, not a method-specific storage representation or a current-step decode cache.
+_Avoid_: prompt-only block, decode cache, Quest page, token slot payload, method payload
 
 **Prefix Cache Control Plane**:
 A management surface for inspecting and influencing prefix-cache residency without exposing tree nodes, tensors, or method-specific payloads. It is separate from the runtime attention path.

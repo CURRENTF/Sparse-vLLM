@@ -436,6 +436,10 @@ def _scbench_command(
         cmd.extend(["--context_max_tokens", str(int(scbench["context_max_tokens"]))])
     if "gpu_memory_utilization" in scbench:
         cmd.extend(["--gpu_memory_utilization", str(float(scbench["gpu_memory_utilization"]))])
+    if bool(scbench.get("decode_cuda_graph", False)):
+        cmd.append("--decode_cuda_graph")
+    if "enforce_eager" in scbench:
+        cmd.append("--enforce_eager" if bool(scbench["enforce_eager"]) else "--no-enforce_eager")
     return cmd
 
 
@@ -489,6 +493,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--dry_run", action="store_true")
     parser.add_argument("--allow_skipped_policy", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--scbench_decode_cuda_graph",
+        action="store_true",
+        help="Run the SCBench regression subset with decode CUDA graph enabled.",
+    )
+    parser.add_argument(
+        "--scbench_enforce_eager",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override SCBench Sparse-VLLM enforce_eager. Defaults to false when graph is enabled.",
+    )
     return parser.parse_args()
 
 
@@ -496,6 +511,14 @@ def main() -> int:
     args = parse_args()
     manifest = load_manifest(args.manifest)
     resolved = resolve_manifest_paths(manifest)
+    if args.scbench_decode_cuda_graph or args.scbench_enforce_eager is not None:
+        scbench_cfg = dict(resolved.get("scbench") or {})
+        if args.scbench_decode_cuda_graph:
+            scbench_cfg["decode_cuda_graph"] = True
+            scbench_cfg.setdefault("enforce_eager", False)
+        if args.scbench_enforce_eager is not None:
+            scbench_cfg["enforce_eager"] = bool(args.scbench_enforce_eager)
+        resolved["scbench"] = scbench_cfg
     if args.tensor_parallel_size is not None:
         if int(args.tensor_parallel_size) <= 0:
             raise ValueError(f"--tensor_parallel_size must be > 0, got {args.tensor_parallel_size}.")

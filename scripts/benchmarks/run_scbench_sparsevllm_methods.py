@@ -35,7 +35,6 @@ from benchmark.sparsevllm_regression.manifest import (  # noqa: E402
 from eval_utils import (  # noqa: E402
     DATA_NAME_TO_MAX_NEW_TOKENS,
     create_multiturn_prompt,
-    get_ground_truth,
 )
 
 
@@ -90,6 +89,21 @@ def common_prefix_len(left: Sequence[int], right: Sequence[int]) -> int:
             break
         count += 1
     return count
+
+
+def list_field(example: dict[str, Any], field: str) -> list[Any]:
+    value = example[field]
+    if isinstance(value, str):
+        value = json.loads(value)
+    if not isinstance(value, list):
+        raise ValueError(f"SCBench field {field!r} must be a list, got {type(value).__name__}.")
+    return value
+
+
+def encode_prompt_fragment(fragment: Any, tokenizer: Any) -> list[int]:
+    if isinstance(fragment, list):
+        return [int(token_id) for token_id in fragment]
+    return [int(token_id) for token_id in tokenizer.encode(str(fragment), add_special_tokens=False)]
 
 
 def eligible_cache_tokens(reusable_prefix_tokens: int, current_prompt_len: int, block_size: int) -> int:
@@ -151,8 +165,11 @@ def select_examples(
         if isinstance(eg, str):
             eg = json.loads(eg)
         eg = dict(eg)
-        context = str(eg.get("context", eg.get("input", "")))
-        n_tokens = len(tokenizer.encode(context, add_special_tokens=False))
+        context = eg.get("context", eg.get("input", ""))
+        if not context and "prompts" in eg:
+            prompts = list_field(eg, "prompts")
+            context = prompts[0] if prompts else ""
+        n_tokens = len(encode_prompt_fragment(context, tokenizer))
         if context_min_tokens >= 0 and n_tokens < context_min_tokens:
             continue
         if context_max_tokens >= 0 and n_tokens >= context_max_tokens:
@@ -181,6 +198,8 @@ def method_runtime_config(
     gpu_memory_utilization: float | None,
     scbench_max_steps: int,
     prefix_cache_salt: str,
+    decode_cuda_graph: bool = False,
+    enforce_eager: bool | None = None,
 ) -> dict[str, Any]:
     method = manifest["methods"][method_id]
     cfg = dict(method.get("config") or {})
@@ -188,8 +207,10 @@ def method_runtime_config(
     cfg.pop("hf_sparse_method", None)
     cfg["sparse_method"] = method["sparse_method"]
     cfg["enable_prefix_caching"] = True
-    cfg["decode_cuda_graph"] = False
-    cfg["enforce_eager"] = True
+    cfg["decode_cuda_graph"] = bool(decode_cuda_graph)
+    cfg["enforce_eager"] = bool(not decode_cuda_graph) if enforce_eager is None else bool(enforce_eager)
+    if decode_cuda_graph:
+        cfg["decode_cuda_graph_capture_sampling"] = False
     cfg["max_model_len"] = int(max_seq_length)
     cfg["tensor_parallel_size"] = int(tensor_parallel_size)
     cfg["max_num_seqs_in_batch"] = int(batch_size)
@@ -462,6 +483,25 @@ def prefix_summary(trace_path: Path, summary_path: Path) -> dict[str, Any]:
     return summary
 
 
+def decode_cuda_graph_status(llm: Any) -> dict[str, Any]:
+    runner = getattr(getattr(llm, "model_runner", None), "decode_cuda_graph_runner", None)
+    states = getattr(runner, "_graphs", {}) if runner is not None else {}
+    graph_count = sum(
+        1
+        for state in getattr(states, "values", lambda: [])()
+        if getattr(state, "graph", None) is not None
+    )
+    configured = bool(getattr(getattr(llm, "config", None), "decode_cuda_graph", False))
+    return {
+        "decode_cuda_graph_configured": configured,
+        "decode_cuda_graph_runner_initialized": runner is not None,
+        "decode_cuda_graph_state_count": int(len(states)) if states is not None else 0,
+        "decode_cuda_graph_graph_count": int(graph_count),
+        "decode_cuda_graph_last_state_key": str(getattr(runner, "last_state_key", None)) if runner is not None else None,
+        "decode_cuda_graph_active": bool(configured and graph_count > 0),
+    }
+
+
 def prepare_states(
     *,
     data_name: str,
@@ -474,20 +514,59 @@ def prepare_states(
 ) -> list[ExampleState]:
     states: list[ExampleState] = []
     for source_idx, eg in examples:
-        turns = eg["multi_turns"]
-        if isinstance(turns, str):
-            turns = json.loads(turns)
-        if max_turns > 0 and len(turns) > max_turns:
-            eg = {**eg, "multi_turns": turns[:max_turns]}
-        encoded = create_multiturn_prompt(
-            eg,
-            data_name=data_name,
-            tok=tokenizer,
-            use_chat_template=use_chat_template,
-            use_vllm=False,
-            disable_golden_context=disable_golden_context,
-        )
-        encoded["prompts"][0] = truncate_by_tokens(encoded["prompts"][0], tokenizer, max_input_length)
+        if "multi_turns" in eg:
+            turns = list_field(eg, "multi_turns")
+            if max_turns > 0 and len(turns) > max_turns:
+                eg = {**eg, "multi_turns": turns[:max_turns]}
+            encoded = create_multiturn_prompt(
+                eg,
+                data_name=data_name,
+                tok=tokenizer,
+                use_chat_template=use_chat_template,
+                use_vllm=False,
+                disable_golden_context=disable_golden_context,
+            )
+            encoded["prompts"][0] = truncate_by_tokens(encoded["prompts"][0], tokenizer, max_input_length)
+        elif "prompts" in eg and "ground_truth" in eg:
+            prompts = list_field(eg, "prompts")
+            ground_truth = list_field(eg, "ground_truth")
+            if len(prompts) == len(ground_truth) + 1:
+                context_tokens = encode_prompt_fragment(
+                    truncate_token_ids(encode_prompt_fragment(prompts[0], tokenizer), max_input_length),
+                    tokenizer,
+                )
+                turn_prompts = prompts[1:]
+                if max_turns > 0:
+                    turn_prompts = turn_prompts[:max_turns]
+                    ground_truth = ground_truth[:max_turns]
+                encoded = {
+                    "prompts": turn_prompts,
+                    "ground_truth": ground_truth,
+                    "context_token_ids": context_tokens,
+                    "prompt_format": "preprocessed_scdq",
+                }
+            elif len(prompts) == len(ground_truth):
+                if max_turns > 0:
+                    prompts = prompts[:max_turns]
+                    ground_truth = ground_truth[:max_turns]
+                prompts = list(prompts)
+                prompts[0] = truncate_token_ids(encode_prompt_fragment(prompts[0], tokenizer), max_input_length)
+                encoded = {
+                    "prompts": prompts,
+                    "ground_truth": ground_truth,
+                    "prompt_format": "preprocessed_multiturn",
+                }
+            else:
+                raise ValueError(
+                    "Preprocessed SCBench prompts must either match ground_truth length or contain "
+                    f"one context prompt plus one prompt per answer: prompts={len(prompts)}, "
+                    f"ground_truth={len(ground_truth)}."
+                )
+            if "task" in eg:
+                task = list_field(eg, "task") if isinstance(eg["task"], (str, list)) else eg["task"]
+                encoded["task"] = task[: len(encoded["ground_truth"])] if isinstance(task, list) else task
+        else:
+            raise KeyError("SCBench example must contain either 'multi_turns' or 'prompts'/'ground_truth'.")
         states.append(ExampleState(source_idx=int(source_idx), example=eg, encoded=encoded))
     return states
 
@@ -510,8 +589,22 @@ def build_turn_specs(
             max_tokens = int(max_new_tokens)
 
         if turn_idx == 0:
-            prompt_token_ids = [int(token_id) for token_id in encoded["prompts"][0]]
+            if "context_token_ids" in encoded:
+                prompt_token_ids = [int(token_id) for token_id in encoded["context_token_ids"]]
+                prompt_token_ids += encode_prompt_fragment(encoded["prompts"][0], tokenizer)
+            else:
+                prompt_token_ids = encode_prompt_fragment(encoded["prompts"][0], tokenizer)
             reusable_prefix_tokens = 0
+        elif "context_token_ids" in encoded:
+            context_ids = [int(token_id) for token_id in encoded["context_token_ids"]]
+            current_ids = encode_prompt_fragment(encoded["prompts"][turn_idx], tokenizer)
+            prompt_token_ids = context_ids + current_ids
+            prior_cache_prefix = (
+                state.cache_prefix_token_ids
+                if state.cache_prefix_token_ids is not None
+                else context_ids
+            )
+            reusable_prefix_tokens = common_prefix_len(prior_cache_prefix, prompt_token_ids)
         else:
             if state.input_ids is None:
                 state.input_ids = []
@@ -521,7 +614,7 @@ def build_turn_specs(
                     + tokenizer.encode(state.answers[-1], add_special_tokens=False)
                     + [int(tokenizer.eos_token_id)]
                 )
-            current_ids = tokenizer.encode(encoded["prompts"][turn_idx], add_special_tokens=False)
+            current_ids = encode_prompt_fragment(encoded["prompts"][turn_idx], tokenizer)
             prompt_token_ids = [int(token_id) for token_id in state.input_ids + current_ids]
             prior_cache_prefix = (
                 state.cache_prefix_token_ids
@@ -647,7 +740,7 @@ def run_task(
                     int(token_id) for token_id in trace.get("generated_token_ids", [])
                 ]
                 state.answers.append(answer)
-                ground_truth = get_ground_truth(state.example, data_name)[spec.turn_idx]
+                ground_truth = state.encoded["ground_truth"][spec.turn_idx]
                 row = {
                     "id": int(state.source_idx),
                     "turn_idx": int(spec.turn_idx),
@@ -721,6 +814,8 @@ def run_method(
         gpu_memory_utilization=args.gpu_memory_utilization,
         scbench_max_steps=int(args.scbench_max_steps),
         prefix_cache_salt=f"{args.prefix_cache_salt}:{model_id}:{method_id}",
+        decode_cuda_graph=bool(args.decode_cuda_graph),
+        enforce_eager=args.enforce_eager,
     )
     write_json(method_dir / "runtime_config.json", runtime_cfg)
 
@@ -734,6 +829,7 @@ def run_method(
     generator = BatchedSparseVLLMGenerator(llm, tokenizer, max_steps=scbench_max_steps)
     model_name_tag = f"{Path(model['model_path']).name}_{method_id}_sparsevllm_multi_turn_prefix"
     task_results: dict[str, Any] = {}
+    graph_status: dict[str, Any] = {}
     started_s = time.perf_counter()
     try:
         for data_name in tasks:
@@ -755,6 +851,12 @@ def run_method(
                 batch_size=int(args.batch_size),
                 model_name_tag=model_name_tag,
             )
+        graph_status = decode_cuda_graph_status(llm)
+        if bool(runtime_cfg.get("decode_cuda_graph")) and not bool(graph_status["decode_cuda_graph_active"]):
+            raise RuntimeError(
+                "decode_cuda_graph=True was configured for SCBench, but no active decode CUDA graph "
+                f"was captured. graph_status={graph_status}."
+            )
     finally:
         exit_fn = getattr(llm, "exit", None)
         if exit_fn is not None:
@@ -772,6 +874,7 @@ def run_method(
         "tasks": task_results,
         "elapsed_s": float(time.perf_counter() - started_s),
         "runtime_config_path": str(method_dir / "runtime_config.json"),
+        "decode_cuda_graph_status": graph_status,
     }
     write_json(method_dir / "method_summary.json", result)
     return result
@@ -815,6 +918,10 @@ def child_command(args: argparse.Namespace, method_id: str) -> list[str]:
         str(int(args.context_max_tokens)),
         "--single_method_child",
     ]
+    if args.decode_cuda_graph:
+        cmd.append("--decode_cuda_graph")
+    if args.enforce_eager is not None:
+        cmd.append("--enforce_eager" if args.enforce_eager else "--no-enforce_eager")
     if args.gpu_memory_utilization is not None:
         cmd.extend(["--gpu_memory_utilization", str(float(args.gpu_memory_utilization))])
     if args.trust_remote_code:
@@ -843,6 +950,8 @@ def run_methods_in_subprocesses(
         "max_turns": int(args.max_turns),
         "max_seq_length": int(args.max_seq_length),
         "batch_size": int(args.batch_size),
+        "decode_cuda_graph": bool(args.decode_cuda_graph),
+        "enforce_eager": args.enforce_eager,
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
         "scbench_local_data_dir": os.environ.get("SCBENCH_LOCAL_DATA_DIR"),
         "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -891,6 +1000,7 @@ def run_methods_in_subprocesses(
                     "data_name": data_name,
                     "score": task_result["score"],
                     "prefix_summary": task_result["prefix_summary"],
+                    "decode_cuda_graph_status": method_result.get("decode_cuda_graph_status", {}),
                     "elapsed_s": method_result["elapsed_s"],
                 },
             )
@@ -915,6 +1025,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prefix_cache_salt", default="scbench-regression")
     parser.add_argument("--gpu_memory_utilization", type=float, default=None)
     parser.add_argument("--scbench_max_steps", type=int, default=200_000)
+    parser.add_argument("--decode_cuda_graph", action="store_true")
+    parser.add_argument("--enforce_eager", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--context_min_tokens", type=int, default=-1)
     parser.add_argument("--context_max_tokens", type=int, default=-1)
     parser.add_argument("--trust_remote_code", action="store_true")
@@ -961,6 +1073,8 @@ def main() -> int:
         "max_turns": int(args.max_turns),
         "max_seq_length": int(args.max_seq_length),
         "batch_size": int(args.batch_size),
+        "decode_cuda_graph": bool(args.decode_cuda_graph),
+        "enforce_eager": args.enforce_eager,
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
         "scbench_local_data_dir": os.environ.get("SCBENCH_LOCAL_DATA_DIR"),
         "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -994,6 +1108,7 @@ def main() -> int:
                     "data_name": data_name,
                     "score": task_result["score"],
                     "prefix_summary": task_result["prefix_summary"],
+                    "decode_cuda_graph_status": method_result.get("decode_cuda_graph_status", {}),
                     "elapsed_s": method_result["elapsed_s"],
                 },
             )

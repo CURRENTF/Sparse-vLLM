@@ -209,7 +209,7 @@ construction-only tests that explicitly set `allow_missing_deltakv_path=True`.
 ### 4.3 Sparse-vLLM Prefix Cache
 
 Prefix cache is a Sparse-vLLM engine feature, not a generic HF runtime feature.
-It reuses prompt KV blocks across requests within the same live engine process.
+It reuses request-context KV blocks across requests within the same live engine process.
 It does not persist across process restarts.
 
 Supported methods:
@@ -223,7 +223,7 @@ Supported methods:
 Unsupported methods fail fast when `enable_prefix_caching=true`: StreamingLLM,
 attention-sink aliases, SnapKV, PyramidKV, and all DeltaKV-family methods. The
 unsupported methods physically prune, compress, reconstruct, or remap KV in
-ways that are not equivalent to reusing a complete prompt KV prefix.
+ways that are not equivalent to reusing a complete request-context KV prefix.
 
 Parameter semantics:
 
@@ -246,8 +246,10 @@ Correctness constraints:
   incomplete trailing blocks are discarded when the request is freed.
 - Active cached blocks are refcounted and cannot be evicted or returned to the
   free-slot/page pool while referenced.
-- `decode_cuda_graph=true` with prefix cache is rejected until that combination
-  is validated.
+- `decode_cuda_graph=true` with prefix cache is supported only when
+  `tensor_parallel_size=1` and `decode_cuda_graph_capture_sampling=false`.
+  Prefix-cache decode graph with TP>1 remains rejected until separate
+  validation.
 
 For API serving, pass these as `--kebab-case` engine flags:
 
@@ -1209,7 +1211,8 @@ Before launching a run:
 - If using Sparse-vLLM, convert all ratio budgets to token counts.
 - If using prefix cache, keep `sparse_method` in `vanilla`, `omnikv`, or
   `quest`; generated decode input tokens are cached by default once they
-  complete full prefix-cache blocks; and disable `decode_cuda_graph`.
+  complete full prefix-cache blocks; and use `decode_cuda_graph=true` only at
+  `tensor_parallel_size=1` with `decode_cuda_graph_capture_sampling=false`.
 - For QuEST prefix cache, set `prefix_cache_block_size` equal to
   `quest_chunk_size` or omit it.
 - If using LLaVA no-checkpoint path, label it as visual uniform pruning, not

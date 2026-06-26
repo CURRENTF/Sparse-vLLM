@@ -455,8 +455,18 @@ def test_config_rejects_unsupported_prefix_cache_methods():
 
 
 def test_config_rejects_unvalidated_prefix_cache_options():
-    with pytest.raises(ValueError, match="decode_cuda_graph"):
-        _make_config(enable_prefix_caching=True, decode_cuda_graph=True)
+    with pytest.raises(ValueError, match="capture_sampling"):
+        _make_config(
+            enable_prefix_caching=True,
+            decode_cuda_graph=True,
+            decode_cuda_graph_capture_sampling=True,
+        )
+    with pytest.raises(ValueError, match="tensor_parallel_size=1"):
+        _make_config(
+            enable_prefix_caching=True,
+            decode_cuda_graph=True,
+            tensor_parallel_size=2,
+        )
     with pytest.raises(ValueError, match="quest_chunk_size"):
         _make_config(
             vllm_sparse_method="quest",
@@ -470,6 +480,32 @@ def test_config_rejects_unvalidated_prefix_cache_options():
         _make_config(prefix_cache_block_size=16.9)
     with pytest.raises(ValueError, match="prefix_cache_max_blocks"):
         _make_config(prefix_cache_max_blocks="16.9")
+
+
+def test_config_allows_prefix_cache_decode_cuda_graph_tp1_methods():
+    vanilla = _make_config(enable_prefix_caching=True, decode_cuda_graph=True)
+    assert vanilla.enable_prefix_caching is True
+    assert vanilla.decode_cuda_graph is True
+    assert vanilla.decode_cuda_graph_capture_sampling is False
+
+    omnikv = _make_config(
+        vllm_sparse_method="omnikv",
+        enable_prefix_caching=True,
+        decode_cuda_graph=True,
+    )
+    assert omnikv.enable_prefix_caching is True
+    assert omnikv.decode_cuda_graph is True
+
+    quest = _make_config(
+        vllm_sparse_method="quest",
+        enable_prefix_caching=True,
+        decode_cuda_graph=True,
+        quest_chunk_size=8,
+        prefix_cache_block_size=None,
+    )
+    assert quest.enable_prefix_caching is True
+    assert quest.decode_cuda_graph is True
+    assert quest.prefix_cache_block_size == 8
 
 
 def test_standard_attach_pins_prefix_slots_and_free_seq_keeps_cached_slots():
@@ -688,6 +724,59 @@ def test_standard_decode_token_completes_pending_prefix_block_by_default():
     assert manager.seq_id_to_cached_ranges[seq.seq_id] == [(0, 4)]
 
 
+def test_standard_static_decode_padding_does_not_materialize_padded_rows():
+    manager = _make_standard_manager_for_prefix(block_size=4)
+    seq = Sequence([1, 2, 3])
+    prompt_slots = manager._allocate(seq.seq_id, 3)
+    manager._record_prefix_materialization(seq, [1, 2, 3], prompt_slots)
+    seq.num_prefilled_tokens = seq.num_prompt_tokens
+    seq.append_token(4)
+
+    input_ids = torch.empty((4,), dtype=torch.int64)
+    positions = torch.empty((4,), dtype=torch.int64)
+    slot_mapping = torch.empty((4,), dtype=torch.int32)
+    context_lens = torch.empty((4,), dtype=torch.int32)
+    req_indices = torch.empty((4,), dtype=torch.int32)
+
+    manager.prepare_decode_static([seq], input_ids, positions, slot_mapping, context_lens, req_indices)
+    manager.on_forward_end([seq], is_prefill=False)
+
+    assert input_ids.tolist() == [4, 4, 4, 4]
+    assert positions.tolist() == [3, 3, 3, 3]
+    assert slot_mapping.tolist()[1:] == [-1, -1, -1]
+    assert context_lens.tolist() == [4, 4, 4, 4]
+    assert req_indices.tolist() == [0, 0, 0, 0]
+    assert len(manager.prefix_cache) == 1
+    block = next(iter(manager.prefix_cache.blocks.values()))
+    assert block.token_ids == (1, 2, 3, 4)
+    assert block.payload.token_slots.numel() == 4
+    assert manager._num_free_slots == 86
+
+
+def test_standard_decode_materialized_block_can_seed_later_prefix_hit():
+    manager = _make_standard_manager_for_prefix(block_size=4)
+    first = Sequence([1, 2, 3])
+    prompt_slots = manager._allocate(first.seq_id, 3)
+    manager._record_prefix_materialization(first, [1, 2, 3], prompt_slots)
+    first.num_prefilled_tokens = first.num_prompt_tokens
+    first.append_token(4)
+    manager._prepare_decode([first])
+    manager.on_forward_end([first], is_prefill=False)
+
+    second = Sequence([1, 2, 3, 4, 5])
+    manager.refresh_prefix_cache_hit(second)
+
+    assert second.prefix_cache_hit_len == 4
+    assert second.prefix_cache_hit_block_count == 1
+    manager._attach_prefix_cache_if_needed(second)
+    row_idx = manager.seq_id_to_row[second.seq_id]
+    assert manager.row_seq_lens[row_idx] == 4
+    assert manager.buffer_req_to_token_slots[row_idx, :4].tolist() == [87, 88, 89, 86]
+    block = manager.prefix_cache.get_block(second.prefix_cache_hit_last_block_id)
+    assert block is not None
+    assert block.ref_count == 2
+
+
 def test_standard_reset_prefix_cache_clears_warmup_blocks_and_restores_allocator():
     manager = _make_standard_manager_for_prefix(block_size=2)
     seq = Sequence([1, 2, 3, 4])
@@ -713,6 +802,21 @@ def test_standard_reset_after_warmup_restores_allocator_without_prefix_cache():
 
     manager.reset_after_warmup()
 
+    assert manager._num_free_slots == 90
+    assert manager.free_slots_stack[:90].tolist() == list(range(90))
+
+
+def test_standard_reset_after_warmup_clears_prefix_cache_and_allocator():
+    manager = _make_standard_manager_for_prefix(block_size=2)
+    seq = Sequence([1, 2, 3, 4])
+    slots = manager._allocate(seq.seq_id, 4)
+    manager._record_prefix_materialization(seq, [1, 2, 3, 4], slots)
+    manager.on_forward_end([seq], is_prefill=True)
+    manager.free_seq(seq.seq_id)
+
+    manager.reset_after_warmup()
+
+    assert len(manager.prefix_cache) == 0
     assert manager._num_free_slots == 90
     assert manager.free_slots_stack[:90].tolist() == list(range(90))
 
@@ -852,6 +956,62 @@ def test_quest_decode_token_completes_pending_prefix_page_by_default():
     assert manager.seq_id_to_cached_pages[seq.seq_id] == {0}
 
 
+def test_quest_static_decode_padding_does_not_materialize_padded_rows():
+    manager = _make_quest_manager_for_prefix(page_size=4)
+    seq = Sequence([1, 2, 3])
+    prompt_slots = manager._allocate(seq.seq_id, 3)
+    manager._record_prefix_materialization(seq, [1, 2, 3], prompt_slots)
+    seq.num_prefilled_tokens = seq.num_prompt_tokens
+    seq.append_token(4)
+
+    input_ids = torch.empty((4,), dtype=torch.int64)
+    positions = torch.empty((4,), dtype=torch.int64)
+    slot_mapping = torch.empty((4,), dtype=torch.int32)
+    context_lens = torch.empty((4,), dtype=torch.int32)
+    req_indices = torch.empty((4,), dtype=torch.int32)
+
+    manager.prepare_decode_static([seq], input_ids, positions, slot_mapping, context_lens, req_indices)
+    manager.on_forward_end([seq], is_prefill=False)
+
+    assert input_ids.tolist() == [4, 4, 4, 4]
+    assert positions.tolist() == [3, 3, 3, 3]
+    assert slot_mapping.tolist()[1:] == [-1, -1, -1]
+    assert context_lens.tolist() == [4, 4, 4, 4]
+    assert req_indices.tolist() == [0, 0, 0, 0]
+    assert len(manager.prefix_cache) == 1
+    block = next(iter(manager.prefix_cache.blocks.values()))
+    assert block.token_ids == (1, 2, 3, 4)
+    assert isinstance(block.payload, QuestPrefixBlockPayload)
+    assert block.payload.block_slot == 9
+    assert block.payload.token_slots.tolist() == [36, 37, 38, 39]
+    assert manager._num_free_pages == 9
+
+
+def test_quest_decode_materialized_page_can_seed_later_prefix_hit():
+    manager = _make_quest_manager_for_prefix(page_size=4)
+    first = Sequence([1, 2, 3])
+    prompt_slots = manager._allocate(first.seq_id, 3)
+    manager._record_prefix_materialization(first, [1, 2, 3], prompt_slots)
+    first.num_prefilled_tokens = first.num_prompt_tokens
+    first.append_token(4)
+    manager._prepare_decode([first])
+    manager.on_forward_end([first], is_prefill=False)
+
+    second = Sequence([1, 2, 3, 4, 5])
+    manager.refresh_prefix_cache_hit(second)
+
+    assert second.prefix_cache_hit_len == 4
+    assert second.prefix_cache_hit_block_count == 1
+    manager._attach_prefix_cache_if_needed(second)
+    row_idx = manager.seq_id_to_row[second.seq_id]
+    assert manager.row_seq_lens[row_idx] == 4
+    assert manager.buffer_req_to_page_slots[row_idx, 0].item() == 9
+    assert manager.buffer_req_to_token_slots[row_idx, :4].tolist() == [36, 37, 38, 39]
+    block = manager.prefix_cache.get_block(second.prefix_cache_hit_last_block_id)
+    assert block is not None
+    assert block.ref_count == 2
+
+
 def test_quest_reset_prefix_cache_clears_warmup_pages_and_restores_allocator():
     manager = _make_quest_manager_for_prefix(page_size=2)
     seq = Sequence([1, 2, 3, 4])
@@ -877,6 +1037,21 @@ def test_quest_reset_after_warmup_restores_allocator_without_prefix_cache():
 
     manager.reset_after_warmup()
 
+    assert manager._num_free_pages == 10
+    assert manager.free_pages_stack[:10].tolist() == list(range(10))
+
+
+def test_quest_reset_after_warmup_clears_prefix_cache_and_allocator():
+    manager = _make_quest_manager_for_prefix(page_size=2)
+    seq = Sequence([1, 2, 3, 4])
+    slots = manager._allocate(seq.seq_id, 4)
+    manager._record_prefix_materialization(seq, [1, 2, 3, 4], slots)
+    manager.on_forward_end([seq], is_prefill=True)
+    manager.free_seq(seq.seq_id)
+
+    manager.reset_after_warmup()
+
+    assert len(manager.prefix_cache) == 0
     assert manager._num_free_pages == 10
     assert manager.free_pages_stack[:10].tolist() == list(range(10))
 

@@ -360,6 +360,10 @@ runner. The graph key is method × batch bucket × context bucket × long/short
 batch state × sampling-capture mode, so `snapkv`, `pyramidkv`, `streamingllm`,
 `quest`, `omnikv`, vanilla, and `deltakv` all use the same bucketed capture
 policy.
+With prefix cache enabled, decode CUDA Graph is supported for `vanilla`,
+`omnikv`, and `quest` at `tensor_parallel_size=1` with
+`decode_cuda_graph_capture_sampling=false`; TP>1 prefix-cache graph support is
+validated separately.
 
 For the HF backend, `deltakv_cache_impl="delta_compressed_quant_kivi_full_fp8_ref"`
 keeps DeltaKV center selection, but stores sparse-layer learned-compressor latent

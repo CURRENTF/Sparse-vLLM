@@ -35,6 +35,7 @@ def test_method_runtime_config_enables_prefix_cache_and_aligns_quest_blocks():
     )
     assert vanilla_cfg["enable_prefix_caching"] is True
     assert vanilla_cfg["decode_cuda_graph"] is False
+    assert vanilla_cfg["enforce_eager"] is True
     assert vanilla_cfg["max_num_seqs_in_batch"] == 4
     assert vanilla_cfg["gpu_memory_utilization"] == 0.5
     assert vanilla_cfg["prefix_cache_block_size"] == 16
@@ -53,6 +54,24 @@ def test_method_runtime_config_enables_prefix_cache_and_aligns_quest_blocks():
     )
     assert quest_cfg["quest_chunk_size"] == 16
     assert quest_cfg["prefix_cache_block_size"] == 16
+
+    graph_cfg = runner.method_runtime_config(
+        manifest,
+        model_id="qwen3_4b",
+        method_id="quest",
+        batch_size=4,
+        max_seq_length=4096,
+        tensor_parallel_size=1,
+        prefix_cache_block_size=16,
+        gpu_memory_utilization=0.5,
+        scbench_max_steps=123,
+        prefix_cache_salt="unit",
+        decode_cuda_graph=True,
+    )
+    assert graph_cfg["enable_prefix_caching"] is True
+    assert graph_cfg["decode_cuda_graph"] is True
+    assert graph_cfg["decode_cuda_graph_capture_sampling"] is False
+    assert graph_cfg["enforce_eager"] is False
 
 
 def test_build_turn_specs_reuses_multiturn_history_prefix():
@@ -117,6 +136,60 @@ def test_build_turn_specs_counts_cached_decode_continuation_prefix():
         ord("A"),
     )
     assert specs[0].reusable_prefix_tokens == 6
+
+
+def test_prepare_states_supports_preprocessed_scdq_prompts():
+    tokenizer = FakeTokenizer()
+    states = runner.prepare_states(
+        data_name="scbench_kv",
+        examples=[
+            (
+                3,
+                {
+                    "prompts": ["abcdef", " question one", " question two"],
+                    "ground_truth": ["gt0", "gt1"],
+                },
+            )
+        ],
+        tokenizer=tokenizer,
+        use_chat_template=False,
+        disable_golden_context=False,
+        max_input_length=4,
+        max_turns=2,
+    )
+
+    state = states[0]
+    assert state.encoded["prompt_format"] == "preprocessed_scdq"
+    assert state.encoded["context_token_ids"] == [ord("a"), ord("b"), ord("e"), ord("f")]
+    assert state.encoded["prompts"] == [" question one", " question two"]
+    assert state.encoded["ground_truth"] == ["gt0", "gt1"]
+
+    first_specs = runner.build_turn_specs(
+        states,
+        data_name="scbench_kv",
+        tokenizer=tokenizer,
+        turn_idx=0,
+        max_new_tokens=5,
+        disable_golden_context=False,
+    )
+    assert first_specs[0].prompt_token_ids == tuple(
+        [ord("a"), ord("b"), ord("e"), ord("f")] + [ord(ch) for ch in " question one"]
+    )
+    assert first_specs[0].reusable_prefix_tokens == 0
+
+    state.cache_prefix_token_ids = list(first_specs[0].prompt_token_ids) + [111, 222]
+    second_specs = runner.build_turn_specs(
+        states,
+        data_name="scbench_kv",
+        tokenizer=tokenizer,
+        turn_idx=1,
+        max_new_tokens=5,
+        disable_golden_context=False,
+    )
+    assert second_specs[0].prompt_token_ids == tuple(
+        [ord("a"), ord("b"), ord("e"), ord("f")] + [ord(ch) for ch in " question two"]
+    )
+    assert second_specs[0].reusable_prefix_tokens == 14
 
 
 def test_prefix_summary_reports_cache_reuse(tmp_path):
