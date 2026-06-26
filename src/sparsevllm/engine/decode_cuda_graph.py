@@ -86,7 +86,10 @@ class DecodeCudaGraphRunner:
         sparse_controller,
         run_model: Callable[[torch.Tensor, torch.Tensor, bool], torch.Tensor],
         is_long_text_batch: Callable[[list[Sequence], bool], bool],
-        run_piecewise_model: Callable[[torch.Tensor, torch.Tensor, DecodeCudaGraphState, bool], torch.Tensor | None] | None = None,
+        run_piecewise_model: Callable[
+            [torch.Tensor, torch.Tensor, DecodeCudaGraphState, bool, bool],
+            torch.Tensor | None,
+        ] | None = None,
         method: str,
         rank: int,
         capture_sizes: list[int],
@@ -525,6 +528,7 @@ class DecodeCudaGraphRunner:
         seqs: list[Sequence],
         *,
         capture_sampling: bool = False,
+        force_piecewise_capture_alignment: bool = False,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         if not seqs:
             raise ValueError("decode_cuda_graph requires a non-empty decode batch.")
@@ -533,7 +537,11 @@ class DecodeCudaGraphRunner:
 
         real_batch_size = len(seqs)
         if self.run_piecewise_model is not None:
-            logits = self._run_piecewise_graph(seqs, capture_sampling=bool(capture_sampling))
+            logits = self._run_piecewise_graph(
+                seqs,
+                capture_sampling=bool(capture_sampling),
+                force_capture_alignment=bool(force_piecewise_capture_alignment),
+            )
             return logits, None
 
         force_eager = getattr(self.cache_manager, "decode_cuda_graph_force_eager", None)
@@ -577,7 +585,13 @@ class DecodeCudaGraphRunner:
         token_ids = state.token_ids[:real_batch_size] if state.token_ids is not None else None
         return logits, token_ids
 
-    def _run_piecewise_graph(self, seqs: list[Sequence], *, capture_sampling: bool) -> torch.Tensor | None:
+    def _run_piecewise_graph(
+        self,
+        seqs: list[Sequence],
+        *,
+        capture_sampling: bool,
+        force_capture_alignment: bool = False,
+    ) -> torch.Tensor | None:
         if capture_sampling:
             raise ValueError("piecewise decode_cuda_graph does not support capture_sampling yet.")
 
@@ -599,7 +613,13 @@ class DecodeCudaGraphRunner:
 
         ctx = get_context()
         ctx.sparse_controller = self.sparse_controller
-        logits = self.run_piecewise_model(input_ids, positions, state, bool(state.piecewise_state is None))
+        logits = self.run_piecewise_model(
+            input_ids,
+            positions,
+            state,
+            bool(state.piecewise_state is None),
+            bool(force_capture_alignment),
+        )
         if logits is None:
             return None
         return logits[:real_batch_size]

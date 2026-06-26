@@ -569,6 +569,16 @@ class Qwen3MoePiecewiseDecodeCudaGraphState:
     def _select_capture_mode(self) -> str:
         return "piecewise"
 
+    def _barrier_ep_ranks(self) -> None:
+        if get_ep_size() <= 1:
+            return
+        if not dist.is_available() or not dist.is_initialized():
+            raise RuntimeError("Qwen3-MoE piecewise decode graph alignment requires initialized distributed ranks.")
+        if torch.cuda.is_available():
+            dist.barrier(group=get_ep_group(), device_ids=[torch.cuda.current_device()])
+        else:
+            dist.barrier(group=get_ep_group())
+
     def _run_mlp_and_hooks(
         self,
         layer_idx: int,
@@ -924,9 +934,19 @@ class Qwen3MoePiecewiseDecodeCudaGraphState:
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         sparse_controller,
+        force_capture_alignment: bool = False,
     ) -> torch.Tensor | None:
-        if not self.captured:
+        needs_capture = not self.captured
+        if needs_capture:
             self.capture(input_ids, positions, sparse_controller)
+        elif bool(force_capture_alignment) and self._uses_deepep_v2():
+            with profiler.record("decode_cuda_graph_piecewise_capture_align_warmup"):
+                self._run_warmup(input_ids, positions, sparse_controller)
+
+        if bool(force_capture_alignment) and self._uses_deepep_v2():
+            with profiler.record("decode_cuda_graph_piecewise_capture_align_barrier"):
+                self._barrier_ep_ranks()
+
         if self.mode == "final_only":
             return self._replay_final_only(input_ids, positions, sparse_controller)
         return self.replay(sparse_controller)
@@ -1108,7 +1128,10 @@ class Qwen3MoeForCausalLM(nn.Module):
         *,
         graph_pool,
         sparse_controller,
+        needs_capture: bool = False,
+        force_capture_alignment: bool = False,
     ) -> torch.Tensor | None:
+        del needs_capture
         piecewise_state = graph_state.piecewise_state
         if piecewise_state is None:
             piecewise_state = Qwen3MoePiecewiseDecodeCudaGraphState(
@@ -1122,4 +1145,9 @@ class Qwen3MoeForCausalLM(nn.Module):
                 "Qwen3-MoE decode graph state was created by an incompatible piecewise runner: "
                 f"{type(piecewise_state).__name__}."
             )
-        return piecewise_state.run(input_ids, positions, sparse_controller)
+        return piecewise_state.run(
+            input_ids,
+            positions,
+            sparse_controller,
+            force_capture_alignment=bool(force_capture_alignment),
+        )

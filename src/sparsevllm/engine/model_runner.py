@@ -348,12 +348,18 @@ class ModelRunner:
             context.deepep_v2_pre_dispatch_barrier = True
         try:
             num_passes = 2 if use_graph_compatible_decode and decode_graph_needs_capture else 1
-            for _ in range(num_passes):
+            for pass_idx in range(num_passes):
                 for layer_idx, layer in enumerate(layers):
                     context.now_layer_idx = int(layer_idx)
                     mlp = getattr(layer, "mlp", None)
                     if isinstance(mlp, Qwen3MoeSparseMoeBlock):
                         mlp(empty_hidden)
+                if num_passes > 1 and pass_idx == 0 and dist.is_initialized():
+                    from sparsevllm.utils.parallel_context import get_ep_group
+
+                    group = get_ep_group()
+                    if group is not None:
+                        dist.barrier(group=group, device_ids=[torch.cuda.current_device()])
         finally:
             if use_graph_compatible_decode:
                 if previous_disable_cpu_sync is None:
@@ -555,8 +561,8 @@ class ModelRunner:
         positions: torch.Tensor,
         graph_state,
         needs_capture: bool,
+        force_capture_alignment: bool = False,
     ) -> torch.Tensor | None:
-        del needs_capture
         runner = getattr(self.model, "run_decode_piecewise_cuda_graph", None)
         if runner is None:
             raise RuntimeError("Model does not implement run_decode_piecewise_cuda_graph().")
@@ -565,6 +571,8 @@ class ModelRunner:
                 input_ids,
                 positions,
                 graph_state,
+                needs_capture=bool(needs_capture),
+                force_capture_alignment=bool(force_capture_alignment),
                 graph_pool=self.cuda_graph_pool,
                 sparse_controller=self.sparse_controller,
             )
@@ -626,6 +634,7 @@ class ModelRunner:
         self,
         seqs: list[Sequence],
         is_prefill: bool,
+        decode_graph_needs_capture: bool = False,
     ) -> tuple[list[int], tuple[list[float | None], list[dict[int, float] | None]] | None]:
         """单步执行主逻辑"""
         name = "model_run_prefill" if is_prefill else "model_run_decode"
@@ -637,6 +646,7 @@ class ModelRunner:
                         logits, graph_token_ids = self.decode_cuda_graph_runner.run(
                             seqs,
                             capture_sampling=self.config.decode_cuda_graph_capture_sampling,
+                            force_piecewise_capture_alignment=bool(decode_graph_needs_capture),
                         )
                     else:
                         logits = self.decode_cuda_graph_runner.run_eager_static(seqs)
@@ -721,7 +731,11 @@ class ModelRunner:
         local_seqs = rank_batches[self.rank]
         decode_graph_needs_capture = self._sync_decode_cuda_graph_needs_capture(local_seqs, is_prefill)
         if local_seqs:
-            token_ids, logprob_outputs = self.run(local_seqs, is_prefill)
+            token_ids, logprob_outputs = self.run(
+                local_seqs,
+                is_prefill,
+                decode_graph_needs_capture=decode_graph_needs_capture,
+            )
             token_ids = [] if token_ids is None else [int(token_id) for token_id in token_ids]
             if logprob_outputs is None:
                 logprob_outputs = ([None] * len(local_seqs), [None] * len(local_seqs))

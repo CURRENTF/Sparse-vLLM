@@ -648,9 +648,9 @@ class DecodeCudaGraphCapacityPolicyTest(unittest.TestCase):
             AssertionError("piecewise graph should not call monolithic run_model")
         )
 
-        def run_piecewise(input_ids, positions, state, needs_capture):
+        def run_piecewise(input_ids, positions, state, needs_capture, force_capture_alignment):
             del positions, state
-            calls.append(f"piecewise:{needs_capture}")
+            calls.append(f"piecewise:{needs_capture}:{force_capture_alignment}")
             return torch.ones((input_ids.shape[0], 4))
 
         runner.run_piecewise_model = run_piecewise
@@ -663,7 +663,41 @@ class DecodeCudaGraphCapacityPolicyTest(unittest.TestCase):
 
         self.assertIsNone(token_ids)
         self.assertEqual(logits.shape, torch.Size([1, 4]))
-        self.assertEqual(calls, ["context:1024", "context:1024", "piecewise:True"])
+        self.assertEqual(calls, ["context:1024", "context:1024", "piecewise:True:False"])
+
+    def test_piecewise_graph_propagates_capture_alignment(self):
+        runner = self.make_runner("vanilla")
+        calls = []
+        runner.cache_manager = SimpleNamespace(
+            device=torch.device("cpu"),
+            select_decode_cuda_graph_batch_size=lambda real_size, sizes: real_size,
+            set_decode_static_max_context_len=lambda value: None,
+            prepare_decode_static=lambda seqs, input_ids, positions, slot_mapping, context_lens, req_indices: (
+                input_ids,
+                positions,
+                None,
+            ),
+        )
+        runner.sparse_controller = SimpleNamespace()
+        runner.is_long_text_batch = lambda seqs, is_prefill: False
+        runner.run_model = lambda input_ids, positions, is_prefill: (_ for _ in ()).throw(
+            AssertionError("piecewise graph should not call monolithic run_model")
+        )
+
+        def run_piecewise(input_ids, positions, state, needs_capture, force_capture_alignment):
+            del input_ids, positions, state
+            calls.append((bool(needs_capture), bool(force_capture_alignment)))
+            return torch.ones((1, 4))
+
+        runner.run_piecewise_model = run_piecewise
+        runner.last_state_key = None
+        runner.last_real_batch_size = None
+        runner.graph_pool = None
+        seqs = [self.make_seq(prompt_len=8, max_tokens=4, num_tokens=9)]
+
+        runner.run(seqs, force_piecewise_capture_alignment=True)
+
+        self.assertEqual(calls, [(True, True)])
 
     def test_exact_current_policy_does_not_reuse_larger_warmup_state(self):
         runner = self.make_runner("quest")
