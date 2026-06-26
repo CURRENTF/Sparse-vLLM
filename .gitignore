@@ -13,3 +13,4 @@ wandb/
 /reference/
 /benchmark/results/
 /dev_docs/
+docs/dev-notes/experiment-records.md
