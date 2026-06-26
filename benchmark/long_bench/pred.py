@@ -4,6 +4,7 @@ import sys
 import subprocess
 import re
 import traceback
+import socket
 from typing import Any, Union
 from pathlib import Path
 
@@ -305,6 +306,50 @@ def load_model_and_tokenizer(rank, args):
     return generate_fn, tokenizer, max_length
 
 
+def load_extra_config_from_hyper_param(hyper_param: str | None) -> dict:
+    if not hyper_param:
+        return {}
+    if os.path.exists(hyper_param):
+        with open(hyper_param, 'r') as f:
+            return json.load(f)
+    try:
+        return json.loads(hyper_param)
+    except json.JSONDecodeError as e:
+        raise ValueError(
+            f"Failed to parse --hyper_param '{hyper_param}'. "
+            f"It is neither a valid file path nor a valid JSON string. Error: {e}"
+        )
+
+
+def sparsevllm_worker_gpu_groups(args, gpu_ids: list[str]) -> list[list[str]]:
+    extra_config = load_extra_config_from_hyper_param(args.hyper_param)
+    tp_size = int(extra_config.get("tensor_parallel_size", 1) or 1)
+    ep_size = int(extra_config.get("expert_parallel_size", 1) or 1)
+    worker_world_size = tp_size * ep_size
+    if worker_world_size <= 0:
+        raise ValueError(
+            "tensor_parallel_size * expert_parallel_size must be positive, "
+            f"got tensor_parallel_size={tp_size}, expert_parallel_size={ep_size}."
+        )
+    required_gpus = int(args.ws) * int(worker_world_size)
+    if len(gpu_ids) < required_gpus:
+        raise ValueError(
+            f"Requested ws={args.ws} with Sparse-vLLM worker_world_size={worker_world_size} "
+            f"(tensor_parallel_size={tp_size}, expert_parallel_size={ep_size}), "
+            f"requiring {required_gpus} visible GPUs, but only {len(gpu_ids)} are available: {gpu_ids}"
+        )
+    return [
+        gpu_ids[i * worker_world_size : (i + 1) * worker_world_size]
+        for i in range(int(args.ws))
+    ]
+
+
+def find_free_tcp_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
 def get_pred(rank, data, dataset_info, args, model, tokenizer, model_max_length):
     dataset = dataset_info['dataset']
     prompt_format = dataset_info['prompt_format']
@@ -587,17 +632,16 @@ def launch_single_gpu_workers(args, out_root):
     else:
         gpu_ids = [str(i) for i in range(torch.cuda.device_count())]
 
-    if len(gpu_ids) < args.ws:
-        raise ValueError(
-            f"Requested ws={args.ws}, but only {len(gpu_ids)} visible GPUs are available: {gpu_ids}"
-        )
+    gpu_groups = sparsevllm_worker_gpu_groups(args, gpu_ids)
 
     script_path = Path(__file__).resolve()
     child_argv = sys.argv[1:]
     procs = []
-    for rank in range(args.ws):
+    for rank, gpu_group in enumerate(gpu_groups):
         env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = gpu_ids[rank]
+        env["CUDA_VISIBLE_DEVICES"] = ",".join(gpu_group)
+        base_master_port = int(env.get("SPARSEVLLM_MASTER_PORT", "0") or 0)
+        env["SPARSEVLLM_MASTER_PORT"] = str(base_master_port + rank if base_master_port else find_free_tcp_port())
         cmd = [
             sys.executable,
             "-u",
@@ -610,7 +654,11 @@ def launch_single_gpu_workers(args, out_root):
             "--output_root",
             out_root,
         ]
-        print(f"[Parent] launch rank={rank} gpu={gpu_ids[rank]} cmd={' '.join(cmd)}", flush=True)
+        print(
+            f"[Parent] launch rank={rank} gpus={env['CUDA_VISIBLE_DEVICES']} "
+            f"master_port={env['SPARSEVLLM_MASTER_PORT']} cmd={' '.join(cmd)}",
+            flush=True,
+        )
         procs.append(subprocess.Popen(cmd, env=env, cwd=str(script_path.parent.parent.parent)))
 
     failed_ranks = []

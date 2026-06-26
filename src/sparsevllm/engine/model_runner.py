@@ -19,6 +19,7 @@ from sparsevllm.models.llama import LlamaForCausalLM
 from sparsevllm.layers.sampler import Sampler
 from sparsevllm.utils.context import set_context, get_context, reset_context
 from sparsevllm.utils.loader import load_model, sync_deltakv_config_from_checkpoint
+from sparsevllm.utils.parallel_context import build_parallel_context, set_parallel_context
 
 from sparsevllm.engine.cache_manager import CacheManager
 from sparsevllm.engine.decode_cuda_graph import DecodeCudaGraphRunner
@@ -30,6 +31,11 @@ try:
     from sparsevllm.models.qwen3 import Qwen3ForCausalLM
 except ImportError:
     Qwen3ForCausalLM = None
+
+try:
+    from sparsevllm.models.qwen3_moe import Qwen3MoeForCausalLM
+except ImportError:
+    Qwen3MoeForCausalLM = None
 
 
 TP_SHM_NAME_PREFIX = "sparsevllm_"
@@ -55,29 +61,40 @@ class ModelRunner:
         # Inference-only engine: disable autograd graph construction globally in this process.
         # (This is process-local; must be set inside every spawned TP worker.)
         torch.set_grad_enabled(False)
-        profiler.set_rank(rank)
-        profiler.set_enabled(config.enable_profiler and rank == 0)
+        parallel_context = build_parallel_context(config, rank)
+        self.parallel_context = parallel_context
+        profiler.set_rank(parallel_context.global_rank)
+        profiler.set_enabled(config.enable_profiler and parallel_context.is_global_rank0)
         hf_config = config.hf_config
         self.enforce_eager = config.enforce_eager
-        self.world_size = config.tensor_parallel_size
-        self.rank = rank
+        self.world_size = parallel_context.global_world_size
+        self.rank = parallel_context.global_rank
+        self.tp_size = parallel_context.tp_size
+        self.tp_rank = parallel_context.tp_rank
+        self.ep_size = parallel_context.ep_size
+        self.ep_rank = parallel_context.ep_rank
         self.event = event
         self.tp_shm_name = tp_shm_name
         self.platform = platforms.current_platform
         self.platform.validate_inference()
         self.platform.init_backend()
-        self.device = self.platform.get_device(rank)
+        self.device = self.platform.get_device(parallel_context.local_rank)
 
         # 初始化分布式环境并绑定对应的设备
         self.platform.set_device(self.device)
-        if not dist.is_initialized():
-            master_port = int(os.getenv("SPARSEVLLM_MASTER_PORT", "2333"))
+        if self.world_size > 1 and not dist.is_initialized():
+            master_port = int(
+                getattr(config, "distributed_master_port", None)
+                or os.getenv("SPARSEVLLM_MASTER_PORT", "2333")
+            )
             dist.init_process_group(
                 self.platform.get_distributed_backend(),
                 f"tcp://localhost:{master_port}",
                 world_size=self.world_size,
-                rank=rank,
+                rank=self.rank,
             )
+        self.parallel_context = build_parallel_context(config, self.rank)
+        set_parallel_context(self.parallel_context)
         
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
@@ -93,11 +110,18 @@ class ModelRunner:
                     "Use a Transformers version with Qwen3 support for Qwen3 models."
                 )
             self.model = Qwen3ForCausalLM(hf_config)
+        elif hf_config.model_type == "qwen3_moe":
+            if Qwen3MoeForCausalLM is None:
+                raise ImportError(
+                    "Qwen3MoeForCausalLM is unavailable in this Transformers installation. "
+                    "Use a Transformers version with Qwen3-MoE support for Qwen3-MoE models."
+                )
+            self.model = Qwen3MoeForCausalLM(hf_config)
         elif hf_config.model_type == "llama":
             self.model = LlamaForCausalLM(hf_config)
         else:
             raise NotImplementedError(f"Unsupported Sparse-vLLM model_type={hf_config.model_type!r}.")
-        load_model(self.model, config.model, rank=rank, world_size=self.world_size)
+        load_model(self.model, config.model, rank=self.tp_rank, world_size=self.tp_size)
         
         self.sampler = Sampler()
 
@@ -106,7 +130,7 @@ class ModelRunner:
         sync_deltakv_config_from_checkpoint(config)
         
         # 初始化 CacheManager (负责 KV Cache + 物理槽位)
-        self.cache_manager = CacheManager.create(config, rank, self.world_size)
+        self.cache_manager = CacheManager.create(config, self.rank, self.tp_size)
 
         # 初始化稀疏控制器
         self.sparse_controller = SparseController(config, self.cache_manager)
@@ -146,14 +170,14 @@ class ModelRunner:
         # TP 场景下的多进程指令同步
         if self.world_size > 1:
             if not self.tp_shm_name:
-                raise ValueError("tp_shm_name is required when tensor_parallel_size > 1.")
-            if rank == 0:
+                raise ValueError("tp_shm_name is required when parallel_world_size > 1.")
+            if self.rank == 0:
                 # Rank 0 创建共享内存用于发送方法调用指令
                 self.shm = SharedMemory(name=self.tp_shm_name, create=True, size=2**20)
-                dist.barrier(device_ids=self.platform.barrier_device_ids(rank))
+                dist.barrier(device_ids=self.platform.barrier_device_ids(self.rank))
             else:
                 # 其他 Rank 监听共享内存中的指令
-                dist.barrier(device_ids=self.platform.barrier_device_ids(rank))
+                dist.barrier(device_ids=self.platform.barrier_device_ids(self.rank))
                 self.shm = SharedMemory(name=self.tp_shm_name)
                 self.loop()
 
@@ -165,7 +189,8 @@ class ModelRunner:
             if self.rank == 0:
                 self.shm.unlink()
         self.platform.synchronize()
-        dist.destroy_process_group()
+        if dist.is_available() and dist.is_initialized():
+            dist.destroy_process_group()
 
     def loop(self):
         """子进程的主循环：监听共享内存，解析并执行来自 Rank 0 的方法指令"""

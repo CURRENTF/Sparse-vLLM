@@ -1,5 +1,6 @@
 import atexit
 import os
+import socket
 from dataclasses import fields
 from time import perf_counter
 import threading
@@ -18,6 +19,13 @@ from sparsevllm.engine.scheduler import Scheduler
 from sparsevllm.engine.model_runner import ModelRunner, make_tp_shm_name
 from sparsevllm.method_registry import normalize_sparse_method
 from sparsevllm.utils.profiler import profiler
+
+
+def _find_free_tcp_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
 
 def _deltakv_graph_warmup_profile(config: Config) -> str:
     graph_warmup = bool(getattr(config, "decode_cuda_graph", False))
@@ -186,14 +194,18 @@ class LLMEngine:
         # 初始化 Profiler
         profiler.set_enabled(config.enable_profiler)
         
-        # 2. 启动多进程张量并行 (TP) 环境
+        # 2. 启动并行 ModelRunner 环境。EP v1 的多进程 world 不能再等同于 TP world。
         self.ps = []
         self.events = []
         ctx = mp.get_context("spawn")
-        tp_shm_name = make_tp_shm_name() if config.tensor_parallel_size > 1 else None
-        for i in range(1, config.tensor_parallel_size):
+        parallel_world_size = int(config.parallel_world_size)
+        if parallel_world_size > 1 and config.distributed_master_port is None:
+            env_master_port = os.getenv("SPARSEVLLM_MASTER_PORT")
+            config.distributed_master_port = int(env_master_port) if env_master_port else _find_free_tcp_port()
+        tp_shm_name = make_tp_shm_name() if parallel_world_size > 1 else None
+        for i in range(1, parallel_world_size):
             event = ctx.Event()
-            # 为每一个非零 Rank 启动一个独立的 ModelRunner 进程
+            # 为每一个非零 parallel rank 启动一个独立的 ModelRunner 进程
             process = ctx.Process(target=ModelRunner, args=(config, i, event, tp_shm_name))
             process.start()
             self.ps.append(process)

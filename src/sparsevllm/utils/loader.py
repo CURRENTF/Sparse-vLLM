@@ -380,6 +380,8 @@ def load_deltakv_compressors_to_cache_manager(cache_manager, path: str):
 
 def load_model(model: nn.Module, path: str, *, rank: int | None = None, world_size: int | None = None):
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
+    model_weight_loader = getattr(model, "load_weight_from_safetensors", None)
+    model_finalize_weight_loading = getattr(model, "finalize_weight_loading", None)
     files = sorted(glob(os.path.join(path, "*.safetensors")))
     assert len(files) > 0, f"No safetensors found in {path}"
 
@@ -402,6 +404,18 @@ def load_model(model: nn.Module, path: str, *, rank: int | None = None, world_si
     for file in files:
         with safe_open(file, "pt", "cpu") as f:
             for source_weight_name in f.keys():
+                if model_weight_loader is not None:
+                    load_result = model_weight_loader(source_weight_name, f)
+                    if load_result == "loaded":
+                        loaded_count += 1
+                        continue
+                    if load_result == "skipped":
+                        continue
+                    if load_result not in (None, "unhandled"):
+                        raise ValueError(
+                            "model load_weight_from_safetensors must return "
+                            f"'loaded', 'skipped', 'unhandled', or None, got {load_result!r}."
+                        )
                 param_name = source_weight_name
                 for k in packed_modules_mapping:
                     if k in param_name:
@@ -419,4 +433,6 @@ def load_model(model: nn.Module, path: str, *, rank: int | None = None, world_si
                     loaded_count += 1
     
     assert loaded_count > 0, f"No weights were loaded from {path}"
+    if model_finalize_weight_loading is not None:
+        model_finalize_weight_loading()
     print(f"Successfully loaded {loaded_count} weights from {path}")

@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 
 from sparsevllm.utils.context import get_context
+from sparsevllm.utils.parallel_context import get_tp_group, get_tp_rank, get_tp_size
 
 
 class VocabParallelEmbedding(nn.Module):
@@ -14,8 +15,8 @@ class VocabParallelEmbedding(nn.Module):
         embedding_dim: int,
     ):
         super().__init__()
-        self.tp_rank = dist.get_rank()
-        self.tp_size = dist.get_world_size()
+        self.tp_rank = get_tp_rank()
+        self.tp_size = get_tp_size()
         assert num_embeddings % self.tp_size == 0
         self.num_embeddings = num_embeddings
         self.num_embeddings_per_partition = self.num_embeddings // self.tp_size
@@ -38,7 +39,7 @@ class VocabParallelEmbedding(nn.Module):
         y = F.embedding(x, self.weight)
         if self.tp_size > 1:
             y = mask.unsqueeze(1) * y
-            dist.all_reduce(y)
+            dist.all_reduce(y, group=get_tp_group())
         return y
 
 
@@ -61,6 +62,6 @@ class ParallelLMHead(VocabParallelEmbedding):
         logits = F.linear(x, self.weight)
         if self.tp_size > 1:
             all_logits = [torch.empty_like(logits) for _ in range(self.tp_size)] if self.tp_rank == 0 else None
-            dist.gather(logits, all_logits, 0)
+            dist.gather(logits, all_logits, 0, group=get_tp_group())
             logits = torch.cat(all_logits, -1) if self.tp_rank == 0 else None
         return logits

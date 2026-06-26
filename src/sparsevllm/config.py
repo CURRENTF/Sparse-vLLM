@@ -54,6 +54,13 @@ def _coerce_optional_positive_int(name: str, value: Any) -> int | None:
     return parsed
 
 
+def _coerce_positive_int_config(name: str, value: Any) -> int:
+    parsed = _coerce_optional_positive_int(name, value)
+    if parsed is None:
+        raise ValueError(f"{name} must be a positive integer, got None.")
+    return parsed
+
+
 SUPPORTED_SKIPKV_MODEL_NAMES = frozenset(
     {
         "DeepSeek-R1-Distill-Llama-8B",
@@ -197,6 +204,10 @@ class Config:
     gpu_memory_utilization: float = 0.8
     device_memory_utilization: float | None = None
     tensor_parallel_size: int = 1
+    expert_parallel_size: int = 1
+    expert_parallel_backend: str = "all_reduce"
+    expert_placement_policy: str = "contiguous"
+    distributed_master_port: int | None = None
     enforce_eager: bool = True
     hf_config: Union[Qwen3Config, AutoConfig] | None = None
     eos: int = -1
@@ -345,6 +356,10 @@ class Config:
     throughput_log_interval_s: float = 10.0
     allow_missing_deltakv_path: bool = False
     allow_unknown_config_keys: bool = False
+
+    @property
+    def parallel_world_size(self) -> int:
+        return int(self.tensor_parallel_size) * int(self.expert_parallel_size)
 
     def _normalize_platform_aliases(self):
         if self.device_memory_utilization is not None:
@@ -532,8 +547,43 @@ class Config:
         if int(self.max_decoding_seqs) <= 0:
             raise ValueError(f"max_decoding_seqs must be > 0, got {self.max_decoding_seqs}.")
         self.max_decoding_seqs = int(self.max_decoding_seqs)
+        self.tensor_parallel_size = _coerce_positive_int_config(
+            "tensor_parallel_size",
+            self.tensor_parallel_size,
+        )
         if not 1 <= self.tensor_parallel_size <= 8:
             raise ValueError(f"tensor_parallel_size must be in [1, 8], got {self.tensor_parallel_size}.")
+        self.expert_parallel_size = _coerce_positive_int_config(
+            "expert_parallel_size",
+            self.expert_parallel_size,
+        )
+        if not 1 <= self.expert_parallel_size <= 8:
+            raise ValueError(f"expert_parallel_size must be in [1, 8], got {self.expert_parallel_size}.")
+        self.expert_parallel_backend = str(self.expert_parallel_backend or "all_reduce").strip().lower()
+        if self.expert_parallel_backend != "all_reduce":
+            raise ValueError(
+                "expert_parallel_backend supports 'all_reduce' only in EP v1, "
+                f"got {self.expert_parallel_backend!r}."
+            )
+        self.expert_placement_policy = str(self.expert_placement_policy or "contiguous").strip().lower()
+        if self.expert_placement_policy != "contiguous":
+            raise ValueError(
+                "expert_placement_policy supports 'contiguous' only in EP v1, "
+                f"got {self.expert_placement_policy!r}."
+            )
+        if self.tensor_parallel_size > 1 and self.expert_parallel_size > 1:
+            raise ValueError(
+                "EP v1 does not support TP+EP hybrid: "
+                f"tensor_parallel_size={self.tensor_parallel_size}, "
+                f"expert_parallel_size={self.expert_parallel_size}."
+            )
+        if self.distributed_master_port is not None:
+            self.distributed_master_port = int(self.distributed_master_port)
+            if not 0 < self.distributed_master_port < 65536:
+                raise ValueError(
+                    "distributed_master_port must be in [1, 65535], "
+                    f"got {self.distributed_master_port}."
+                )
         self._normalize_platform_aliases()
         if legacy_deltakv_graph_method:
             self.decode_cuda_graph = True
@@ -551,6 +601,11 @@ class Config:
                     "omnikv_decode_cuda_graph is only valid with vllm_sparse_method='omnikv'."
                 )
             self.decode_cuda_graph = True
+        if self.expert_parallel_size > 1 and self.decode_cuda_graph:
+            raise ValueError(
+                "expert_parallel_size > 1 disables decode_cuda_graph in EP v1; "
+                "set decode_cuda_graph=False or run without EP."
+            )
         if self.decode_cuda_graph_capture_sampling and not self.decode_cuda_graph:
             raise ValueError("decode_cuda_graph_capture_sampling requires decode_cuda_graph=True.")
         self.decode_cuda_graph_context_policy = _normalize_decode_cuda_graph_context_policy(
@@ -620,7 +675,7 @@ class Config:
         if getattr(self.hf_config, "model_type", "") in {"deepseek_v2", "deepseek_v32"}:
             raise NotImplementedError(
                 f"Unsupported Sparse-vLLM model_type={self.hf_config.model_type!r}. "
-                "Supported model types: qwen2, qwen3, llama."
+                "Supported model types: qwen2, qwen3, qwen3_moe, llama."
             )
         if self.max_model_len > self.hf_config.max_position_embeddings:
             logger.warning('max_model_len > model.max_position_embeddings 输出可能不正常')

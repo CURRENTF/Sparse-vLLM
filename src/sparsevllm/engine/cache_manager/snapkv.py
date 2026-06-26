@@ -262,6 +262,17 @@ class SnapKVCacheManager(CacheManager):
     def remaining_prefill_tokens(self, seq: Sequence) -> int:
         return int(seq.num_prompt_tokens - seq.num_prefilled_tokens)
 
+    def min_final_prefill_chunk_tokens(self, seq: Sequence) -> int:
+        window = int(getattr(self.config, "snapkv_window_size", 0) or 0)
+        if window <= 0 or self.config.vllm_sparse_method not in ("snapkv", "pyramidkv"):
+            return 0
+        prompt_len = int(seq.num_prompt_tokens)
+        for layer_idx in range(int(self.num_layers)):
+            budget = self._prefill_score_layer_budget(layer_idx)
+            if budget is not None and prompt_len > int(budget):
+                return min(window, prompt_len)
+        return 0
+
     def _prefill_score_dtype(self) -> torch.dtype:
         score_dtype_name = str(getattr(self.config, "sparse_attn_score_dtype", "float32") or "float32").lower()
         try:

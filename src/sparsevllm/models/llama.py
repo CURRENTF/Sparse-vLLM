@@ -2,7 +2,6 @@ import os
 
 import torch
 from torch import nn
-import torch.distributed as dist
 from transformers import LlamaConfig
 
 from sparsevllm.layers.activation import SiluAndMul
@@ -12,6 +11,7 @@ from sparsevllm.layers.linear import QKVParallelLinear, MergedColumnParallelLine
 from sparsevllm.layers.rotary_embedding import get_rope
 from sparsevllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 from sparsevllm.utils.context import get_context
+from sparsevllm.utils.parallel_context import get_tp_size
 
 
 def _get_rope_theta(config: LlamaConfig) -> float:
@@ -65,7 +65,7 @@ class LlamaAttention(nn.Module):
         proj_chunk_size: int = 16384,
     ) -> None:
         super().__init__()
-        tp_size = dist.get_world_size()
+        tp_size = get_tp_size()
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size

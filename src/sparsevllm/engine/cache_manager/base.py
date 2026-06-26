@@ -14,6 +14,7 @@ from sparsevllm.method_registry import SUPPORTED_SPARSE_METHODS, normalize_spars
 from sparsevllm.triton_kernel.store_kvcache import store_kvcache
 import sparsevllm.platforms as platforms
 from sparsevllm.utils.log import logger, log_level
+from sparsevllm.utils.parallel_context import get_parallel_context
 
 
 @dataclass
@@ -84,7 +85,7 @@ class CacheManager(ABC):
         self.rank = rank
         self.world_size = world_size
         self.platform = platforms.current_platform
-        self.device = self.platform.get_device(rank)
+        self.device = self.platform.get_device(get_parallel_context().local_rank)
         self.hf_config = config.hf_config
         self.num_layers = self.hf_config.num_hidden_layers
 
@@ -659,6 +660,10 @@ class CacheManager(ABC):
     def prefill_step_reservation_cost(self, seq: Sequence, scheduled_tokens: int) -> int:
         """Scheduler-side capacity consumed by scheduling a prefill chunk."""
         return int(scheduled_tokens)
+
+    def min_final_prefill_chunk_tokens(self, seq: Sequence) -> int:
+        """Minimum size the final prefill chunk must keep for method-specific observers."""
+        return 0
 
     def decode_step_free_slots(self) -> int:
         """Writable KV capacity for one decode step."""

@@ -24,6 +24,22 @@ _Avoid_: all historical baselines, HF-only baselines, StreamingLLM by default, f
 A text-only Sparse-VLLM inference capability for running DeltaKV-family methods on a Qwen3 language model with a fixed full-layer policy. First-stage support includes both compressor-backed DeltaKV with a matching compressor and no-checkpoint DeltaKV Delta-Quant; it does not include Qwen3-VL, Tensor Parallel support, or Thinking-model validation unless those are named separately.
 _Avoid_: Qwen3-VL support, all Qwen3 variants, TP-ready Qwen3 DeltaKV
 
+**Sparse-VLLM Qwen3-MoE Support**:
+A text-only Sparse-VLLM inference capability for Qwen3 mixture-of-experts language models. First-stage support does not imply Qwen3-VL, dense Qwen3 support, Thinking-model validation, or hybrid TP+EP support unless those are named separately.
+_Avoid_: dense Qwen3 support, Qwen3-VL support, TP+EP support by default
+
+**Expert Parallel Support**:
+An MoE inference capability where multiple ranks cooperate on routed expert computation for one request. It is distinct from Tensor Parallel support. In first-stage Sparse-VLLM Qwen3-MoE work, EP runs with TP size 1, keeps the cache manager EP-unaware, and may later be wrapped by data-parallel replicas; it does not imply TP+EP hybrid support.
+_Avoid_: data parallel benchmark sharding, Tensor Parallel support, native data-parallel scheduler support by default, expert load balancing
+
+**Parallel Context**:
+The runtime object or equivalent state that separates global process-world rank/size from tensor-parallel and expert-parallel rank/size. Qwen3-MoE EP work depends on this separation so dense layers and cache manager do not interpret EP workers as TP shards.
+_Avoid_: global world as TP world, local rank only, distributed initialized equals TP-ready
+
+**Qwen3-MoE Checkpoint Adapter**:
+A model-specific loader adapter that classifies Qwen3-MoE checkpoint keys as local expert, non-local expert, router, non-expert dense, or unsupported before generic packed-module loading runs. It is responsible for expert ownership, explicit non-local expert skips, and fused expert tensor slice loading.
+_Avoid_: generic packed loader for expert keys, full expert tensor load then local slice
+
 **TP-Local Sparse Selection**:
 A tensor-parallel sparse decode semantics where ranks share execution schedule and cache lifecycle, while each rank makes sparse-token decisions from its own local attention heads or KV heads without cross-rank sparse-index aggregation. It is not algorithmically equivalent to a single-rank or global-head sparse selection unless separately validated.
 _Avoid_: global sparse-index aggregation, TP-equivalent sparse selection

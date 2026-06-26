@@ -41,12 +41,14 @@ class FakeMemoryOracle:
         force_full_prefill=False,
         prefix_hit_len=0,
         prefix_hit_blocks=0,
+        min_final_prefill_tokens=0,
     ):
         self._free_slots = int(free_slots)
         self._step_free_slots = int(step_free_slots) if step_free_slots is not None else int(free_slots)
         self._force_full_prefill = bool(force_full_prefill)
         self.prefix_hit_len = int(prefix_hit_len)
         self.prefix_hit_blocks = int(prefix_hit_blocks)
+        self._min_final_prefill_tokens = int(min_final_prefill_tokens)
         self.refresh_calls = 0
         self.clear_calls = 0
 
@@ -68,6 +70,9 @@ class FakeMemoryOracle:
 
     def prefill_step_reservation_cost(self, seq, scheduled_tokens):
         return int(scheduled_tokens)
+
+    def min_final_prefill_chunk_tokens(self, seq):
+        return min(self._min_final_prefill_tokens, int(seq.num_prompt_tokens))
 
     def decode_step_free_slots(self):
         return self._free_slots
@@ -804,6 +809,27 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
 
         self.assertTrue(is_prefill)
         self.assertTrue(all(seq.current_chunk_size <= 5 for seq in scheduled))
+
+    def test_all_chunked_preserves_min_final_prefill_chunk(self):
+        scheduler = make_scheduler(
+            PREFILL_POLICY_ALL_CHUNKED,
+            method="snapkv",
+            chunk=4096,
+            max_tokens=8192,
+            oracle=FakeMemoryOracle(min_final_prefill_tokens=32),
+        )
+        seq = seq_with_len(8193)
+        scheduler.add(seq)
+        chunk_sizes = []
+
+        while seq.num_prefilled_tokens < seq.num_prompt_tokens:
+            scheduled, is_prefill, _ = scheduler.schedule()
+            self.assertTrue(is_prefill)
+            self.assertEqual(scheduled, [seq])
+            chunk_sizes.append(seq.current_chunk_size)
+            scheduler.postprocess(scheduled, [0], is_prefill)
+
+        self.assertEqual(chunk_sizes, [4096, 4065, 32])
 
     def test_long_bs1full_policy_schedules_long_as_single_full_prefill(self):
         scheduler = make_scheduler(

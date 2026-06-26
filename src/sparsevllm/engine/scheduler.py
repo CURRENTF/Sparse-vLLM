@@ -159,18 +159,20 @@ class Scheduler:
     def _prefill_step_tokens(
         self,
         *,
+        seq: Sequence,
         target_is_long: bool,
         remaining_prefill_tokens: int,
         num_batched_tokens: int,
         step_free_count: int,
     ) -> int:
         if self.prefill_schedule_policy == PREFILL_POLICY_ALL_CHUNKED:
-            return min(
+            tokens = min(
                 remaining_prefill_tokens,
                 self.chunk_prefill_size,
                 self.max_num_batched_tokens - num_batched_tokens,
                 step_free_count,
             )
+            return self._apply_min_final_prefill_chunk(seq, int(remaining_prefill_tokens), int(tokens))
         if self.prefill_schedule_policy == PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH:
             if target_is_long:
                 return int(remaining_prefill_tokens)
@@ -182,13 +184,34 @@ class Scheduler:
                 if remaining_prefill_tokens <= self.chunk_prefill_size and remaining_prefill_tokens <= available:
                     return int(remaining_prefill_tokens)
                 return 0
-            return min(
+            tokens = min(
                 remaining_prefill_tokens,
                 self.chunk_prefill_size,
                 self.max_num_batched_tokens - num_batched_tokens,
                 step_free_count,
             )
+            return self._apply_min_final_prefill_chunk(seq, int(remaining_prefill_tokens), int(tokens))
         raise ValueError(f"Unknown prefill_schedule_policy={self.prefill_schedule_policy!r}")
+
+    def _apply_min_final_prefill_chunk(
+        self,
+        seq: Sequence,
+        remaining_prefill_tokens: int,
+        scheduled_tokens: int,
+    ) -> int:
+        if scheduled_tokens <= 0 or scheduled_tokens >= remaining_prefill_tokens:
+            return int(scheduled_tokens)
+        min_final = int(self.memory_oracle.min_final_prefill_chunk_tokens(seq))
+        if min_final <= 0:
+            return int(scheduled_tokens)
+        min_final = min(min_final, int(seq.num_prompt_tokens))
+        remaining_after_step = int(remaining_prefill_tokens) - int(scheduled_tokens)
+        if remaining_after_step == 0 or remaining_after_step >= min_final:
+            return int(scheduled_tokens)
+        adjusted = int(remaining_prefill_tokens) - int(min_final)
+        if adjusted <= 0:
+            return int(scheduled_tokens)
+        return min(int(scheduled_tokens), adjusted)
 
     def _raise_prompt_admission_failure(
         self,
@@ -327,6 +350,7 @@ class Scheduler:
 
                 # 确定本次 Chunk 的大小
                 can_prefill_tokens = self._prefill_step_tokens(
+                    seq=seq,
                     target_is_long=target_is_long,
                     remaining_prefill_tokens=remaining_prefill_tokens,
                     num_batched_tokens=num_batched_tokens,
