@@ -65,7 +65,9 @@ class ChatMessage(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     role: Literal["developer", "system", "user", "assistant", "tool"]
-    content: str | list[ChatContentPart]
+    content: str | list[ChatContentPart] | None = None
+    tool_call_id: str | None = None
+    tool_calls: list[dict[str, Any]] | None = None
 
 
 class ChatCompletionRequest(BaseModel):
@@ -84,6 +86,10 @@ class ChatCompletionRequest(BaseModel):
     stop: str | list[str] | None = None
     logprobs: bool = False
     top_logprobs: int | None = Field(default=None, ge=0, le=20)
+    stream_options: dict[str, Any] | None = None
+    tools: list[dict[str, Any]] | None = None
+    tool_choice: str | dict[str, Any] | None = None
+    parallel_tool_calls: bool | None = None
 
 
 class PrefixCacheInspectRequest(BaseModel):
@@ -117,7 +123,9 @@ def _chat_template_role(role: str) -> str:
     return "system" if role == "developer" else role
 
 
-def _chat_content_text(content: str | list[ChatContentPart]) -> str:
+def _chat_content_text(content: str | list[ChatContentPart] | None) -> str:
+    if content is None:
+        return ""
     if isinstance(content, str):
         return content
     return "\n".join(part.text for part in content)
@@ -697,7 +705,16 @@ def create_app(
 
         if request.stream:
             return StreamingResponse(
-                _chat_completion_stream(dispatcher, request_id, created, request.model, handles, started, engine.tokenizer),
+                _chat_completion_stream(
+                    dispatcher,
+                    request_id,
+                    created,
+                    request.model,
+                    handles,
+                    started,
+                    engine.tokenizer,
+                    _stream_include_usage(request.stream_options),
+                ),
                 media_type="text/event-stream",
             )
 
@@ -829,6 +846,12 @@ def _validate_chat_request(request: ChatCompletionRequest, served_model_name: st
         raise HTTPException(status_code=400, detail="top_logprobs requires logprobs=true.")
     if request.stop and request.logprobs:
         raise HTTPException(status_code=400, detail="stop with logprobs is not supported yet.")
+
+
+def _stream_include_usage(stream_options: dict[str, Any] | None) -> bool:
+    if stream_options is None:
+        return False
+    return bool(stream_options.get("include_usage"))
 
 
 def _sampling_params_from_request(request: CompletionRequest | ChatCompletionRequest) -> SamplingParams:
@@ -1152,6 +1175,7 @@ async def _chat_completion_stream(
     handles: list[RequestHandle],
     started: float | None = None,
     tokenizer: Any | None = None,
+    include_usage: bool = False,
 ):
     pending = {index: handle for index, handle in enumerate(handles)}
     prompt_tokens = 0
@@ -1259,6 +1283,21 @@ async def _chat_completion_stream(
                         }
                     )
                     pending.pop(tasks[task], None)
+        if include_usage:
+            yield _sse(
+                {
+                    "id": request_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [],
+                    "usage": {
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": completion_tokens,
+                        "total_tokens": prompt_tokens + completion_tokens,
+                    },
+                }
+            )
         yield "data: [DONE]\n\n"
         if started is not None:
             elapsed_s = time.perf_counter() - started

@@ -79,7 +79,45 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
             ChatCompletionRequest(
                 model="m",
                 messages=[{"role": "assistant", "content": "p", "tool_calls": []}],
+                metadata={"trace": "x"},
             )
+
+    def test_chat_request_accepts_claw_eval_tool_metadata(self):
+        from sparsevllm.entrypoints.openai.api_server import ChatCompletionRequest, ChatMessage
+
+        request = ChatCompletionRequest(
+            model="m",
+            messages=[
+                {"role": "user", "content": "p"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "web_search", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "result"},
+            ],
+            stream=True,
+            stream_options={"include_usage": True},
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "web_search",
+                        "description": "Search",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ],
+        )
+
+        self.assertTrue(request.stream_options["include_usage"])
+        self.assertEqual(ChatMessage(role="assistant").content, None)
 
     def test_logprob_request_limits_match_openai_bounds(self):
         from pydantic import ValidationError
