@@ -581,7 +581,7 @@ class Config:
                     )
                     raise ValueError(
                         "decode_cuda_graph with tensor_parallel_size > 1 supports these methods only: "
-                        f"'', {supported}. v1 excludes DeltaKV and QuEST."
+                        f"'', {supported}. DeltaKV is not supported."
                     )
                 log_once(
                     "decode_cuda_graph with tensor_parallel_size > 1 uses TP-local sparse selection: "

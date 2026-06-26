@@ -147,7 +147,7 @@ def _decode_cuda_graph_for_method(
         if not is_tp_decode_cuda_graph_supported(method["sparse_method"]):
             raise ValueError(
                 "decode_cuda_graph with tensor_parallel_size > 1 is a v1 gate for "
-                "vanilla, streamingllm, snapkv, pyramidkv, omnikv, rkv, and skipkv only; "
+                "vanilla, streamingllm, snapkv, pyramidkv, omnikv, quest, rkv, and skipkv only; "
                 f"got sparse_method={method['sparse_method']!r}."
             )
         return True

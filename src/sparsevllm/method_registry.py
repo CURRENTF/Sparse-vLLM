@@ -52,6 +52,7 @@ TP_DECODE_CUDA_GRAPH_SUPPORTED_METHODS = {
     "snapkv",
     "pyramidkv",
     "omnikv",
+    "quest",
     "rkv",
     "skipkv",
 }

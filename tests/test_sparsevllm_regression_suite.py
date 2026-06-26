@@ -68,21 +68,25 @@ class SparseVLLMRegressionSuiteTest(unittest.TestCase):
         self.assertTrue(hyper_params["decode_cuda_graph"])
         self.assertFalse(hyper_params["decode_cuda_graph_capture_sampling"])
 
-    def test_tp_decode_graph_command_rejects_quest_v1(self):
-        with self.assertRaisesRegex(ValueError, "v1 gate"):
-            run_suite._quality_command(
-                model_id="qwen25_7b",
-                method_id="quest",
-                model={"model_path": "/models/qwen", "tokenizer_path": "/models/qwen"},
-                method={"sparse_method": "quest", "config": {"sparse_method": "quest"}},
-                quality=self._quality_cfg(),
-                performance={
-                    "decode_cuda_graph": True,
-                    "enforce_eager": False,
-                    "tensor_parallel_size": 2,
-                },
-                output_root=Path("/tmp/sparsevllm-quality"),
-            )
+    def test_tp_decode_graph_command_accepts_quest_v11(self):
+        cmd = run_suite._quality_command(
+            model_id="qwen25_7b",
+            method_id="quest",
+            model={"model_path": "/models/qwen", "tokenizer_path": "/models/qwen"},
+            method={"sparse_method": "quest", "config": {"sparse_method": "quest"}},
+            quality=self._quality_cfg(),
+            performance={
+                "decode_cuda_graph": True,
+                "enforce_eager": False,
+                "tensor_parallel_size": 2,
+            },
+            output_root=Path("/tmp/sparsevllm-quality"),
+        )
+
+        hyper_params = json.loads(cmd[cmd.index("--hyper_param") + 1])
+        self.assertEqual(hyper_params["tensor_parallel_size"], 2)
+        self.assertTrue(hyper_params["decode_cuda_graph"])
+        self.assertFalse(hyper_params["decode_cuda_graph_capture_sampling"])
 
     def test_scbench_command_can_enable_decode_graph_without_changing_default(self):
         base = {

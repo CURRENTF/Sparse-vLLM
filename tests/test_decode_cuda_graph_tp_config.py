@@ -37,7 +37,7 @@ class DecodeCudaGraphTPConfigTest(unittest.TestCase):
                 )
 
     def test_tp_decode_cuda_graph_accepts_v1_methods(self):
-        for method in ["vanilla", "streamingllm", "snapkv", "pyramidkv", "omnikv", "rkv"]:
+        for method in ["vanilla", "streamingllm", "snapkv", "pyramidkv", "omnikv", "quest", "rkv"]:
             with self.subTest(method=method):
                 cfg = self._config(method)
                 self.assertTrue(cfg.decode_cuda_graph)
@@ -46,12 +46,13 @@ class DecodeCudaGraphTPConfigTest(unittest.TestCase):
         cfg = self._config("skipkv", model_name="DeepSeek-R1-Distill-Qwen-7B")
         self.assertEqual(cfg.vllm_sparse_method, "skipkv")
 
-    def test_tp_decode_cuda_graph_rejects_deltakv_and_quest_v1(self):
-        with self.assertRaisesRegex(ValueError, "v1 excludes DeltaKV and QuEST"):
+    def test_tp_decode_cuda_graph_rejects_deltakv(self):
+        with self.assertRaisesRegex(ValueError, "DeltaKV is not supported"):
             self._config("deltakv", allow_missing_deltakv_path=True)
 
-        with self.assertRaisesRegex(ValueError, "v1 excludes DeltaKV and QuEST"):
-            self._config("quest")
+    def test_tp_decode_cuda_graph_rejects_prefix_cache_for_quest(self):
+        with self.assertRaisesRegex(ValueError, "prefix caching with decode_cuda_graph supports tensor_parallel_size=1"):
+            self._config("quest", enable_prefix_caching=True)
 
     def test_tp_decode_cuda_graph_rejects_capture_sampling(self):
         with self.assertRaisesRegex(ValueError, "capture_sampling is disabled"):

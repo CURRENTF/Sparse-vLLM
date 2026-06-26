@@ -398,12 +398,12 @@ class PrefillPolicyConfigTest(unittest.TestCase):
         )
         self.assertTrue(cfg.decode_cuda_graph)
 
-        with self.assertRaisesRegex(ValueError, "v1 excludes DeltaKV and QuEST"):
-            self.make_config(
-                vllm_sparse_method="quest",
-                decode_cuda_graph=True,
-                tensor_parallel_size=2,
-            )
+        cfg = self.make_config(
+            vllm_sparse_method="quest",
+            decode_cuda_graph=True,
+            tensor_parallel_size=2,
+        )
+        self.assertTrue(cfg.decode_cuda_graph)
 
     def test_decode_cuda_graph_capture_sampling_requires_graph(self):
         with self.assertRaisesRegex(ValueError, "requires decode_cuda_graph"):
