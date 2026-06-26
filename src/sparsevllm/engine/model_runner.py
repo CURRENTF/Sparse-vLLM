@@ -39,16 +39,35 @@ except ImportError:
 
 
 TP_SHM_NAME_PREFIX = "sparsevllm_"
+DEFAULT_TP_RPC_SHM_BYTES = 2**20
 PREFIX_CACHE_CONTROL_RPC_METHODS = {
     "prefix_cache_inspect",
     "prefix_cache_delete_subtree",
     "prefix_cache_set_eviction_priority",
 }
-TP_RPC_STATUS_SYNC_METHODS = PREFIX_CACHE_CONTROL_RPC_METHODS | {"run"}
+TP_RPC_STATUS_SYNC_METHODS = PREFIX_CACHE_CONTROL_RPC_METHODS | {
+    "run",
+    "run_rank_batches",
+    "free_rank_slots_batch",
+}
 
 
 def make_tp_shm_name() -> str:
     return f"{TP_SHM_NAME_PREFIX}{os.getpid()}_{uuid.uuid4().hex}"
+
+
+def resolve_tp_rpc_shm_size() -> int:
+    raw_value = os.getenv("SPARSEVLLM_TP_RPC_SHM_BYTES")
+    if raw_value is None or raw_value == "":
+        return DEFAULT_TP_RPC_SHM_BYTES
+    try:
+        size = int(raw_value)
+    except ValueError as exc:
+        raise ValueError(f"SPARSEVLLM_TP_RPC_SHM_BYTES must be an integer, got {raw_value!r}.") from exc
+    if size < 4096:
+        raise ValueError(f"SPARSEVLLM_TP_RPC_SHM_BYTES must be >= 4096, got {size}.")
+    return size
+
 
 class ModelRunner:
     """
@@ -73,6 +92,8 @@ class ModelRunner:
         self.tp_rank = parallel_context.tp_rank
         self.ep_size = parallel_context.ep_size
         self.ep_rank = parallel_context.ep_rank
+        self.dp_size = parallel_context.dp_size
+        self.dp_rank = parallel_context.dp_rank
         self.event = event
         self.tp_shm_name = tp_shm_name
         self.platform = platforms.current_platform
@@ -173,7 +194,11 @@ class ModelRunner:
                 raise ValueError("tp_shm_name is required when parallel_world_size > 1.")
             if self.rank == 0:
                 # Rank 0 创建共享内存用于发送方法调用指令
-                self.shm = SharedMemory(name=self.tp_shm_name, create=True, size=2**20)
+                self.shm = SharedMemory(
+                    name=self.tp_shm_name,
+                    create=True,
+                    size=resolve_tp_rpc_shm_size(),
+                )
                 dist.barrier(device_ids=self.platform.barrier_device_ids(self.rank))
             else:
                 # 其他 Rank 监听共享内存中的指令
@@ -222,7 +247,8 @@ class ModelRunner:
         n = len(data)
         if n + 4 > len(self.shm.buf):
             raise RuntimeError(
-                f"Shared memory command is too large: {n + 4} > {len(self.shm.buf)}"
+                f"Shared memory command is too large: {n + 4} > {len(self.shm.buf)}. "
+                "Increase SPARSEVLLM_TP_RPC_SHM_BYTES for large multi-rank batches."
             )
         self.shm.buf[0:4] = n.to_bytes(4, "little")
         self.shm.buf[4:n+4] = data
@@ -284,6 +310,28 @@ class ModelRunner:
     ) -> None:
         self._sync_tp_rpc_status(method_name, local_error)
 
+    def _sample_outputs_on_this_rank(self) -> bool:
+        return self.rank == 0 or bool(getattr(self.config, "expert_parallel_overlap_data_parallel", False))
+
+    def _run_empty_deepep_v2_collectives(self) -> None:
+        if str(getattr(self.config, "expert_parallel_backend", "") or "").lower() != "deepep_v2":
+            return
+        if not bool(getattr(self.config, "expert_parallel_overlap_data_parallel", False)):
+            return
+        if self.ep_size <= 1:
+            return
+        if getattr(getattr(self.config, "hf_config", None), "model_type", "") != "qwen3_moe":
+            return
+        from sparsevllm.models.qwen3_moe import Qwen3MoeSparseMoeBlock
+
+        hidden_size = int(self.config.hf_config.hidden_size)
+        empty_hidden = torch.empty((0, hidden_size), dtype=self.config.hf_config.torch_dtype, device=self.device)
+        layers = getattr(getattr(self.model, "model", None), "layers", [])
+        for layer in layers:
+            mlp = getattr(layer, "mlp", None)
+            if isinstance(mlp, Qwen3MoeSparseMoeBlock):
+                mlp(empty_hidden)
+
     def load_deltakv_compressors(self):
         """加载 DeltaKV 压缩器权重"""
         method = str(self.config.vllm_sparse_method or "")
@@ -320,6 +368,16 @@ class ModelRunner:
             if os.getenv("SPARSEVLLM_DEBUG_SLOTS", "0") == "1":
                 after = self.cache_manager.free_slot_stats()
                 logger.info("model_runner.free_slots_batch seq_ids={} after={}", seq_ids, after)
+
+    def free_rank_slots_batch(self, rank_seq_ids: list[list[int]]):
+        """Release only the sequence slots owned by this overlapped DP rank."""
+        if not bool(getattr(self.config, "expert_parallel_overlap_data_parallel", False)):
+            raise RuntimeError("free_rank_slots_batch is valid only for overlapped DP+EP execution.")
+        if len(rank_seq_ids) != self.world_size:
+            raise ValueError(
+                f"rank_seq_ids length must match world_size={self.world_size}, got {len(rank_seq_ids)}."
+            )
+        self.free_slots_batch(rank_seq_ids[self.rank])
 
     def set_tokenizer_metadata(
         self,
@@ -498,6 +556,7 @@ class ModelRunner:
         """单步执行主逻辑"""
         name = "model_run_prefill" if is_prefill else "model_run_decode"
         with profiler.record(name):
+            sample_this_rank = self._sample_outputs_on_this_rank()
             if not is_prefill:
                 try:
                     if self.config.decode_cuda_graph:
@@ -508,7 +567,7 @@ class ModelRunner:
                     else:
                         logits = self.decode_cuda_graph_runner.run_eager_static(seqs)
                         graph_token_ids = None
-                    if self.rank != 0:
+                    if not sample_this_rank:
                         with profiler.record("model_sparse_post"):
                             self.sparse_controller.post_forward(seqs, is_prefill)
                             self.cache_manager.on_forward_end(seqs, is_prefill)
@@ -547,20 +606,24 @@ class ModelRunner:
                 ctx.sparse_controller = self.sparse_controller
                 self.sparse_controller.prepare_forward(seqs, is_prefill)
             
-            all_greedy = all(seq.temperature <= 1e-10 for seq in seqs) if self.rank == 0 else False
+            all_greedy = all(seq.temperature <= 1e-10 for seq in seqs) if sample_this_rank else False
             temperatures = None
             top_ps = None
             top_ks = None
-            if self.rank == 0 and not all_greedy:
+            if sample_this_rank and not all_greedy:
                 temperatures, top_ps, top_ks = self.prepare_sample(seqs)
             
             # 3. 前向计算
             logits = self.run_model(input_ids, positions, is_prefill)
             
-            # 4. Token 采样 (仅 Rank 0)
+            # 4. Token 采样。TP 路径仅 rank0 采样；overlapped DP+EP 路径每个 owner rank 采样。
             with profiler.record("model_sampler"):
-                token_ids = self.sampler(logits, temperatures, top_ps, top_ks, all_greedy=all_greedy).tolist() if self.rank == 0 else None
-            logprob_outputs = self._collect_logprobs(logits, token_ids, seqs) if self.rank == 0 else None
+                token_ids = (
+                    self.sampler(logits, temperatures, top_ps, top_ks, all_greedy=all_greedy).tolist()
+                    if sample_this_rank
+                    else None
+                )
+            logprob_outputs = self._collect_logprobs(logits, token_ids, seqs) if sample_this_rank else None
 
             # 5. 后置稀疏处理 (如 SnapKV 驱逐)
             with profiler.record("model_sparse_post"):
@@ -569,3 +632,38 @@ class ModelRunner:
 
             reset_context()
             return token_ids, logprob_outputs
+
+    def run_rank_batches(
+        self,
+        rank_batches: list[list[Sequence]],
+        is_prefill: bool,
+    ):
+        if not bool(getattr(self.config, "expert_parallel_overlap_data_parallel", False)):
+            raise RuntimeError("run_rank_batches is valid only for overlapped DP+EP execution.")
+        if len(rank_batches) != self.world_size:
+            raise ValueError(
+                f"rank_batches length must match world_size={self.world_size}, got {len(rank_batches)}."
+            )
+        local_seqs = rank_batches[self.rank]
+        if local_seqs:
+            token_ids, logprob_outputs = self.run(local_seqs, is_prefill)
+            token_ids = [] if token_ids is None else [int(token_id) for token_id in token_ids]
+            if logprob_outputs is None:
+                logprob_outputs = ([None] * len(local_seqs), [None] * len(local_seqs))
+        else:
+            self._run_empty_deepep_v2_collectives()
+            token_ids = []
+            logprob_outputs = ([], [])
+
+        payload = {
+            "rank": int(self.rank),
+            "seq_ids": [int(seq.seq_id) for seq in local_seqs],
+            "token_ids": token_ids,
+            "token_logprobs": logprob_outputs[0],
+            "top_logprobs": logprob_outputs[1],
+        }
+        if self.world_size <= 1:
+            return [payload]
+        gathered = [None for _ in range(self.world_size)] if self.rank == 0 else None
+        dist.gather_object(payload, object_gather_list=gathered, dst=0)
+        return gathered if self.rank == 0 else None

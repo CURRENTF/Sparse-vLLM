@@ -10,7 +10,14 @@ from uuid import uuid4
 import torch
 import torch.distributed as dist
 
-from sparsevllm.engine.model_runner import ModelRunner, TP_SHM_NAME_PREFIX, make_tp_shm_name
+from sparsevllm.engine.llm_engine import LLMEngine
+from sparsevllm.engine.model_runner import (
+    DEFAULT_TP_RPC_SHM_BYTES,
+    ModelRunner,
+    TP_SHM_NAME_PREFIX,
+    make_tp_shm_name,
+    resolve_tp_rpc_shm_size,
+)
 
 
 def test_write_shm_waits_until_worker_reads_command():
@@ -62,6 +69,32 @@ def test_tp_shm_name_is_unique_per_engine_instance():
     assert "sparsevllm" not in names
 
 
+def test_tp_rpc_shm_size_can_be_overridden():
+    with patch.dict(os.environ, {}, clear=True):
+        assert resolve_tp_rpc_shm_size() == DEFAULT_TP_RPC_SHM_BYTES
+
+    with patch.dict(os.environ, {"SPARSEVLLM_TP_RPC_SHM_BYTES": str(64 * 1024 * 1024)}):
+        assert resolve_tp_rpc_shm_size() == 64 * 1024 * 1024
+
+
+def test_tp_rpc_shm_size_rejects_invalid_values():
+    with patch.dict(os.environ, {"SPARSEVLLM_TP_RPC_SHM_BYTES": "bad"}):
+        try:
+            resolve_tp_rpc_shm_size()
+        except ValueError as exc:
+            assert "must be an integer" in str(exc)
+        else:
+            raise AssertionError("expected invalid shm size to fail")
+
+    with patch.dict(os.environ, {"SPARSEVLLM_TP_RPC_SHM_BYTES": "128"}):
+        try:
+            resolve_tp_rpc_shm_size()
+        except ValueError as exc:
+            assert "must be >= 4096" in str(exc)
+        else:
+            raise AssertionError("expected tiny shm size to fail")
+
+
 def test_free_slots_batch_releases_each_seq_id():
     freed: list[int] = []
 
@@ -75,6 +108,35 @@ def test_free_slots_batch_releases_each_seq_id():
     ModelRunner.free_slots_batch(runner, [3, 5, 8])
 
     assert freed == [3, 5, 8]
+
+
+def test_free_rank_slots_batch_releases_only_local_owner_ids():
+    freed: list[int] = []
+    runner = object.__new__(ModelRunner)
+    runner.config = SimpleNamespace(expert_parallel_overlap_data_parallel=True)
+    runner.world_size = 3
+    runner.rank = 1
+    runner.free_slots_batch = lambda seq_ids: freed.extend(int(seq_id) for seq_id in seq_ids)
+
+    ModelRunner.free_rank_slots_batch(runner, [[3], [5, 8], [13]])
+
+    assert freed == [5, 8]
+
+
+def test_llm_engine_overlapped_free_routes_seq_ids_to_owner_ranks():
+    calls: list[tuple[str, list[list[int]]]] = []
+    engine = object.__new__(LLMEngine)
+    engine.config = SimpleNamespace(
+        expert_parallel_overlap_data_parallel=True,
+        parallel_world_size=3,
+    )
+    engine.model_runner = SimpleNamespace(call=lambda method, arg: calls.append((method, arg)))
+    engine._dp_seq_owner = {10: 2, 11: 0}
+
+    LLMEngine._free_seq_slots(engine, [10, 11])
+
+    assert calls == [("free_rank_slots_batch", [[11], [], [10]])]
+    assert engine._dp_seq_owner == {}
 
 
 def test_prefix_cache_control_rpc_reports_any_tp_worker_failure():

@@ -176,6 +176,27 @@ class Qwen3MoeTest(unittest.TestCase):
 
         self.assertEqual(output.shape, hidden_states.shape)
 
+    def test_local_expert_apply_ignores_negative_expert_slots(self):
+        torch.manual_seed(2)
+        cfg = tiny_moe_config(num_experts=4, num_experts_per_tok=2)
+        block = Qwen3MoeSparseMoeBlock(cfg)
+        with torch.no_grad():
+            block.experts.gate_up_proj.copy_(torch.randn_like(block.experts.gate_up_proj))
+            block.experts.down_proj.copy_(torch.randn_like(block.experts.down_proj))
+        hidden_states = torch.randn(3, cfg.hidden_size)
+        selected_experts = torch.tensor([[0, -1], [1, -1], [-1, -1]])
+        routing_weights = torch.tensor([[0.7, 0.3], [1.0, 0.0], [0.5, 0.5]], dtype=hidden_states.dtype)
+
+        actual = block.experts._apply_local_experts(hidden_states, selected_experts, routing_weights)
+
+        expected = torch.zeros_like(hidden_states)
+        for token_idx, expert_idx in ((0, 0), (1, 1)):
+            token = hidden_states[token_idx : token_idx + 1]
+            gate, up = F.linear(token, block.experts.gate_up_proj[expert_idx]).chunk(2, dim=-1)
+            expert_out = F.linear(F.silu(gate) * up, block.experts.down_proj[expert_idx])
+            expected[token_idx] += expert_out.squeeze(0) * routing_weights[token_idx, 0]
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+
     def test_sparse_moe_block_accepts_qwen3_moe_num_local_experts_config(self):
         cfg = tiny_moe_config()
         cfg.num_local_experts = cfg.num_experts

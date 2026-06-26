@@ -76,10 +76,39 @@ class ExpertParallelPhase1Test(unittest.TestCase):
         cfg = self._config(expert_parallel_size=4)
 
         self.assertEqual(cfg.tensor_parallel_size, 1)
+        self.assertEqual(cfg.data_parallel_size, 1)
         self.assertEqual(cfg.expert_parallel_size, 4)
         self.assertEqual(cfg.parallel_world_size, 4)
         self.assertEqual(cfg.expert_parallel_backend, "all_reduce")
         self.assertEqual(cfg.expert_placement_policy, "contiguous")
+
+    def test_deepep_v2_overlap_config_maps_dp_to_ep_world(self):
+        cfg = self._config(
+            expert_parallel_size=4,
+            expert_parallel_backend="deep_ep_v2",
+            expert_parallel_overlap_data_parallel=True,
+            decode_graph=True,
+        )
+
+        self.assertEqual(cfg.expert_parallel_backend, "deepep_v2")
+        self.assertEqual(cfg.data_parallel_size, 4)
+        self.assertEqual(cfg.parallel_world_size, 4)
+        self.assertTrue(cfg.decode_cuda_graph)
+        self.assertEqual(cfg.hf_config.expert_parallel_backend, "deepep_v2")
+        self.assertEqual(cfg.hf_config.data_parallel_size, 4)
+        self.assertEqual(cfg.hf_config.expert_parallel_size, 4)
+        self.assertTrue(cfg.hf_config.expert_parallel_overlap_data_parallel)
+
+    def test_rejects_data_parallel_without_overlap(self):
+        with self.assertRaisesRegex(NotImplementedError, "data_parallel_size > 1"):
+            self._config(data_parallel_size=2)
+
+    def test_overlap_requires_deepep_backend(self):
+        with self.assertRaisesRegex(ValueError, "requires expert_parallel_backend='deepep_v2'"):
+            self._config(
+                expert_parallel_size=2,
+                expert_parallel_overlap_data_parallel=True,
+            )
 
     def test_expert_parallel_rejects_tp_hybrid_v1(self):
         with self.assertRaisesRegex(ValueError, "does not support TP\\+EP hybrid"):
@@ -121,6 +150,26 @@ class ExpertParallelPhase1Test(unittest.TestCase):
         self.assertEqual(ctx.tp_rank, 0)
         self.assertEqual(ctx.ep_size, 4)
         self.assertEqual(ctx.ep_rank, 3)
+        self.assertEqual(ctx.dp_size, 1)
+        self.assertEqual(ctx.dp_rank, 0)
+
+    def test_parallel_context_maps_overlapped_dp_ep_rank(self):
+        cfg = self._config(
+            expert_parallel_size=4,
+            expert_parallel_backend="deepep_v2",
+            expert_parallel_overlap_data_parallel=True,
+        )
+        ctx = build_parallel_context(cfg, global_rank=2)
+
+        self.assertEqual(ctx.global_rank, 2)
+        self.assertEqual(ctx.global_world_size, 4)
+        self.assertEqual(ctx.tp_size, 1)
+        self.assertEqual(ctx.tp_rank, 0)
+        self.assertEqual(ctx.ep_size, 4)
+        self.assertEqual(ctx.ep_rank, 2)
+        self.assertEqual(ctx.dp_size, 4)
+        self.assertEqual(ctx.dp_rank, 2)
+        self.assertTrue(ctx.overlap_data_parallel)
 
     def test_dense_layers_do_not_shard_under_ep_context(self):
         ctx = ParallelContext(

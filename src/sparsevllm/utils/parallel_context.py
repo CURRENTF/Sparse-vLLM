@@ -18,6 +18,10 @@ class ParallelContext:
     local_rank: int
     tp_group: object | None = None
     ep_group: object | None = None
+    dp_size: int = 1
+    dp_rank: int = 0
+    dp_group: object | None = None
+    overlap_data_parallel: bool = False
 
     @property
     def is_global_rank0(self) -> bool:
@@ -37,8 +41,10 @@ def _dist_world_group_or_none(size: int) -> object | None:
 
 def build_parallel_context(config, global_rank: int) -> ParallelContext:
     tp_size = int(getattr(config, "tensor_parallel_size", 1))
+    dp_size = int(getattr(config, "data_parallel_size", 1))
     ep_size = int(getattr(config, "expert_parallel_size", 1))
-    global_world_size = tp_size * ep_size
+    overlap_data_parallel = bool(getattr(config, "expert_parallel_overlap_data_parallel", False))
+    global_world_size = int(getattr(config, "parallel_world_size", tp_size * ep_size * dp_size))
     global_rank = int(global_rank)
     if global_rank < 0 or global_rank >= global_world_size:
         raise ValueError(
@@ -46,13 +52,20 @@ def build_parallel_context(config, global_rank: int) -> ParallelContext:
             f"rank={global_rank} world_size={global_world_size}."
         )
 
-    tp_rank = global_rank % tp_size
-    ep_rank = global_rank // tp_size
+    if overlap_data_parallel:
+        tp_rank = 0
+        ep_rank = global_rank
+        dp_rank = global_rank
+    else:
+        tp_rank = global_rank % tp_size
+        ep_rank = (global_rank // tp_size) % ep_size
+        dp_rank = global_rank // (tp_size * ep_size)
 
     # TP+EP hybrid is rejected by Config in v1. For the supported layouts,
     # the active multi-rank group is the process world and singleton groups are unused.
     tp_group = _dist_world_group_or_none(tp_size)
     ep_group = _dist_world_group_or_none(ep_size)
+    dp_group = _dist_world_group_or_none(dp_size)
     return ParallelContext(
         global_rank=global_rank,
         global_world_size=global_world_size,
@@ -63,6 +76,10 @@ def build_parallel_context(config, global_rank: int) -> ParallelContext:
         local_rank=global_rank,
         tp_group=tp_group,
         ep_group=ep_group,
+        dp_size=dp_size,
+        dp_rank=dp_rank,
+        dp_group=dp_group,
+        overlap_data_parallel=overlap_data_parallel,
     )
 
 
@@ -80,6 +97,10 @@ def default_parallel_context() -> ParallelContext:
             local_rank=rank,
             tp_group=_dist_world_group_or_none(world_size),
             ep_group=None,
+            dp_size=1,
+            dp_rank=0,
+            dp_group=None,
+            overlap_data_parallel=False,
         )
     return ParallelContext(
         global_rank=0,
@@ -91,6 +112,10 @@ def default_parallel_context() -> ParallelContext:
         local_rank=0,
         tp_group=None,
         ep_group=None,
+        dp_size=1,
+        dp_rank=0,
+        dp_group=None,
+        overlap_data_parallel=False,
     )
 
 
@@ -143,3 +168,19 @@ def get_ep_rank() -> int:
 
 def get_ep_group() -> object | None:
     return get_parallel_context().ep_group
+
+
+def get_dp_size() -> int:
+    return get_parallel_context().dp_size
+
+
+def get_dp_rank() -> int:
+    return get_parallel_context().dp_rank
+
+
+def get_dp_group() -> object | None:
+    return get_parallel_context().dp_group
+
+
+def is_overlapped_data_parallel() -> bool:
+    return get_parallel_context().overlap_data_parallel

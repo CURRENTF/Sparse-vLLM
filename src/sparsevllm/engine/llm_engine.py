@@ -235,6 +235,7 @@ class LLMEngine:
         self.last_step_logprob_outputs: list[
             tuple[int, list[float | None], list[dict[int, float] | None]]
         ] = []
+        self._dp_seq_owner: dict[int, int] = {}
         # 注册退出钩子，确保程序崩溃或结束时能正确释放多进程资源
         atexit.register(self.exit)
 
@@ -441,9 +442,130 @@ class LLMEngine:
 
     def abort_request(self, seq_id: int):
         """Abort a queued or running request and release any owned KV slots."""
+        seq_id = int(seq_id)
         should_free = self.scheduler.abort(seq_id)
         if should_free:
-            self.model_runner.call("free_slots", seq_id)
+            self._free_seq_slots([seq_id])
+        else:
+            self._dp_seq_owner.pop(seq_id, None)
+
+    def _use_overlapped_dp_ep(self) -> bool:
+        return bool(getattr(self.config, "expert_parallel_overlap_data_parallel", False))
+
+    def _owner_rank_for_seq(self, seq: Sequence) -> int:
+        seq_id = int(seq.seq_id)
+        owner = self._dp_seq_owner.get(seq_id)
+        if owner is not None:
+            return int(owner)
+        dp_size = int(getattr(self.config, "data_parallel_size", 1) or 1)
+        if dp_size <= 1:
+            owner = 0
+        else:
+            owner_counts = [0 for _ in range(dp_size)]
+            live_seq_ids = {int(s.seq_id) for s in self.scheduler.waiting}
+            live_seq_ids.update(int(s.seq_id) for s in self.scheduler.decoding)
+            live_seq_ids.add(seq_id)
+            for live_seq_id, live_owner in self._dp_seq_owner.items():
+                if int(live_seq_id) in live_seq_ids and 0 <= int(live_owner) < dp_size:
+                    owner_counts[int(live_owner)] += 1
+            owner = min(range(dp_size), key=lambda rank: (owner_counts[rank], rank))
+        self._dp_seq_owner[seq_id] = int(owner)
+        return int(owner)
+
+    def _build_rank_batches(self, seqs: list[Sequence]) -> list[list[Sequence]]:
+        world_size = int(self.config.parallel_world_size)
+        rank_batches: list[list[Sequence]] = [[] for _ in range(world_size)]
+        for seq in seqs:
+            owner = self._owner_rank_for_seq(seq)
+            if owner < 0 or owner >= world_size:
+                raise RuntimeError(
+                    f"Invalid overlapped DP owner rank {owner} for seq_id={seq.seq_id}; "
+                    f"world_size={world_size}."
+                )
+            rank_batches[owner].append(seq)
+        return rank_batches
+
+    def _free_seq_slots(self, seq_ids: list[int]) -> None:
+        seq_ids = [int(seq_id) for seq_id in seq_ids]
+        if not seq_ids:
+            return
+        if not self._use_overlapped_dp_ep():
+            self.model_runner.call("free_slots_batch", seq_ids)
+            for seq_id in seq_ids:
+                self._dp_seq_owner.pop(seq_id, None)
+            return
+
+        world_size = int(self.config.parallel_world_size)
+        rank_seq_ids: list[list[int]] = [[] for _ in range(world_size)]
+        for seq_id in seq_ids:
+            owner = self._dp_seq_owner.get(seq_id)
+            if owner is None:
+                raise RuntimeError(f"Missing overlapped DP owner rank for seq_id={seq_id} during free.")
+            owner = int(owner)
+            if owner < 0 or owner >= world_size:
+                raise RuntimeError(
+                    f"Invalid overlapped DP owner rank {owner} for seq_id={seq_id}; "
+                    f"world_size={world_size}."
+                )
+            rank_seq_ids[owner].append(seq_id)
+        self.model_runner.call("free_rank_slots_batch", rank_seq_ids)
+        for seq_id in seq_ids:
+            self._dp_seq_owner.pop(seq_id, None)
+
+    def _run_overlapped_dp_step(
+        self,
+        seqs: list[Sequence],
+        is_prefill: bool,
+    ) -> tuple[list[int], tuple[list[float | None], list[dict[int, float] | None]]]:
+        rank_batches = self._build_rank_batches(seqs)
+        gathered = self.model_runner.call("run_rank_batches", rank_batches, is_prefill)
+        if not isinstance(gathered, list) or len(gathered) != int(self.config.parallel_world_size):
+            raise RuntimeError(
+                "Overlapped DP+EP run did not gather one payload per rank: "
+                f"got {type(gathered).__name__} len={len(gathered) if isinstance(gathered, list) else 'n/a'}."
+            )
+
+        token_by_seq: dict[int, int] = {}
+        token_logprob_by_seq: dict[int, float | None] = {}
+        top_logprob_by_seq: dict[int, dict[int, float] | None] = {}
+        for payload in gathered:
+            if payload is None:
+                raise RuntimeError("Overlapped DP+EP gathered an empty rank payload.")
+            seq_ids = [int(seq_id) for seq_id in payload["seq_ids"]]
+            token_ids = [int(token_id) for token_id in payload["token_ids"]]
+            token_logprobs = list(payload["token_logprobs"])
+            top_logprobs = list(payload["top_logprobs"])
+            if not (
+                len(seq_ids)
+                == len(token_ids)
+                == len(token_logprobs)
+                == len(top_logprobs)
+            ):
+                raise RuntimeError(
+                    "Overlapped DP+EP rank payload length mismatch: "
+                    f"rank={payload.get('rank')} seq_ids={len(seq_ids)} "
+                    f"token_ids={len(token_ids)} token_logprobs={len(token_logprobs)} "
+                    f"top_logprobs={len(top_logprobs)}."
+                )
+            for seq_id, token_id, token_logprob, top_logprob in zip(
+                seq_ids,
+                token_ids,
+                token_logprobs,
+                top_logprobs,
+            ):
+                if seq_id in token_by_seq:
+                    raise RuntimeError(f"Duplicate overlapped DP token output for seq_id={seq_id}.")
+                token_by_seq[seq_id] = token_id
+                token_logprob_by_seq[seq_id] = token_logprob
+                top_logprob_by_seq[seq_id] = top_logprob
+
+        missing = [int(seq.seq_id) for seq in seqs if int(seq.seq_id) not in token_by_seq]
+        if missing:
+            raise RuntimeError(f"Missing overlapped DP token outputs for seq_ids={missing[:16]}.")
+        token_ids = [int(token_by_seq[int(seq.seq_id)]) for seq in seqs]
+        token_logprobs = [token_logprob_by_seq[int(seq.seq_id)] for seq in seqs]
+        top_logprobs = [top_logprob_by_seq[int(seq.seq_id)] for seq in seqs]
+        return token_ids, (token_logprobs, top_logprobs)
 
     def prefix_cache_inspect(
         self,
@@ -490,7 +612,7 @@ class LLMEngine:
             with profiler.record("preempt_free"):
                 preempted_seq_ids = [int(seq.seq_id) for seq in preempted_seqs]
                 if preempted_seq_ids:
-                    self.model_runner.call("free_slots_batch", preempted_seq_ids)
+                    self._free_seq_slots(preempted_seq_ids)
                 
             if not seqs:
                 # No progress can be made; avoid infinite busy-looping in callers.
@@ -525,10 +647,13 @@ class LLMEngine:
                     f"waiting={len(self.scheduler.waiting)} decoding={len(self.scheduler.decoding)}"
                 )
                 
-            # 3. 跨进程广播并执行推理：
-            # Rank 0 会驱动所有 Rank 进程同步运行本地的 ModelRunner.run
+            # 3. 跨进程执行推理。普通 TP/EP correctness 路径广播同一 batch；
+            # overlapped DP+EP 路径按 seq owner rank 分发本地 batch 后收集采样结果。
             with profiler.record("model_run_call"):
-                token_ids, logprob_outputs = self.model_runner.call("run", seqs, is_prefill)
+                if self._use_overlapped_dp_ep():
+                    token_ids, logprob_outputs = self._run_overlapped_dp_step(seqs, is_prefill)
+                else:
+                    token_ids, logprob_outputs = self.model_runner.call("run", seqs, is_prefill)
             token_logprobs, top_logprobs = (
                 logprob_outputs if logprob_outputs is not None else (None, None)
             )
@@ -578,7 +703,7 @@ class LLMEngine:
                             )
                         )
                 if finished_seq_ids:
-                    self.model_runner.call("free_slots_batch", finished_seq_ids)
+                    self._free_seq_slots(finished_seq_ids)
         
         # 计算吞吐量统计数据 (正数表示 Prefill，负数表示 Decode)
         num_tokens = sum(seq.current_chunk_size for seq in seqs) if is_prefill else -len(seqs)

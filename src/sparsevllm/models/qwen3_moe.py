@@ -125,6 +125,9 @@ class Qwen3MoeExperts(nn.Module):
         self.intermediate_dim = int(config.moe_intermediate_size)
         self.ep_size = get_ep_size()
         self.ep_rank = get_ep_rank()
+        self.expert_parallel_backend = str(
+            getattr(config, "expert_parallel_backend", "all_reduce") or "all_reduce"
+        ).strip().lower()
         if self.num_experts % self.ep_size != 0:
             raise ValueError(
                 "Qwen3-MoE EP v1 requires num_experts divisible by expert_parallel_size, "
@@ -154,7 +157,7 @@ class Qwen3MoeExperts(nn.Module):
             )
         param.data.copy_(loaded_weight)
 
-    def forward(
+    def _apply_local_experts(
         self,
         hidden_states: torch.Tensor,
         selected_experts: torch.Tensor,
@@ -162,7 +165,12 @@ class Qwen3MoeExperts(nn.Module):
     ) -> torch.Tensor:
         final_hidden_states = torch.zeros_like(hidden_states)
         with torch.no_grad():
-            expert_mask = F.one_hot(selected_experts, num_classes=self.num_experts)
+            valid_expert_mask = selected_experts >= 0
+            expert_mask = F.one_hot(
+                torch.clamp(selected_experts, min=0),
+                num_classes=self.num_experts,
+            )
+            expert_mask = expert_mask * valid_expert_mask.unsqueeze(-1)
             expert_mask = expert_mask.permute(2, 1, 0)
             expert_hits = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
 
@@ -178,6 +186,54 @@ class Qwen3MoeExperts(nn.Module):
             current_hidden_states = F.linear(current_hidden_states, self.down_proj[local_expert_idx])
             current_hidden_states = current_hidden_states * routing_weights[token_idx, top_k_pos, None]
             final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
+        return final_hidden_states
+
+    def _apply_deepep_v2(
+        self,
+        hidden_states: torch.Tensor,
+        selected_experts: torch.Tensor,
+        routing_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.ep_size <= 1:
+            return self._apply_local_experts(hidden_states, selected_experts, routing_weights)
+        if not dist.is_available() or not dist.is_initialized():
+            raise RuntimeError("Qwen3-MoE DeepEP v2 backend requires initialized torch.distributed.")
+
+        from sparsevllm.engine.expert_parallel import deepep_v2
+
+        dispatched = deepep_v2.dispatch(
+            hidden_states=hidden_states,
+            selected_experts=selected_experts,
+            routing_weights=routing_weights,
+            num_experts=self.num_experts,
+        )
+        num_recv_tokens = int(dispatched.num_recv_tokens)
+        recv_selected_experts = dispatched.recv_topk_idx[:num_recv_tokens] + self.local_expert_start
+        recv_selected_experts = torch.where(
+            dispatched.recv_topk_idx[:num_recv_tokens] >= 0,
+            recv_selected_experts,
+            torch.full_like(recv_selected_experts, -1),
+        )
+        if dispatched.recv_topk_weights is None:
+            raise RuntimeError("DeepEP v2 dispatch did not return routing weights.")
+        local_output = torch.zeros_like(dispatched.recv_x)
+        if num_recv_tokens > 0:
+            local_output[:num_recv_tokens] = self._apply_local_experts(
+                dispatched.recv_x[:num_recv_tokens],
+                recv_selected_experts,
+                dispatched.recv_topk_weights[:num_recv_tokens].to(dispatched.recv_x.dtype),
+            )
+        return deepep_v2.combine(local_output, dispatched.handle)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        selected_experts: torch.Tensor,
+        routing_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.expert_parallel_backend == "deepep_v2":
+            return self._apply_deepep_v2(hidden_states, selected_experts, routing_weights)
+        final_hidden_states = self._apply_local_experts(hidden_states, selected_experts, routing_weights)
         if self.ep_size > 1:
             if not dist.is_available() or not dist.is_initialized():
                 raise RuntimeError("Qwen3-MoE expert_parallel_size > 1 requires initialized torch.distributed.")
