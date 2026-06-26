@@ -12,6 +12,8 @@ from sparsevllm.layers.layernorm import RMSNorm
 from sparsevllm.layers.linear import MergedColumnParallelLinear, RowParallelLinear
 from sparsevllm.models.qwen3 import Qwen3Attention, _get_rope_scaling, _get_rope_theta
 from sparsevllm.utils.context import get_context
+from sparsevllm.utils.log import logger
+from sparsevllm.utils.profiler import profiler
 from sparsevllm.utils.parallel_context import get_ep_group, get_ep_rank, get_ep_size
 
 
@@ -137,6 +139,7 @@ class Qwen3MoeExperts(nn.Module):
         self.local_expert_start = self.ep_rank * self.num_local_experts
         self.local_expert_end = self.local_expert_start + self.num_local_experts
         self.global_expert_ids = list(range(self.local_expert_start, self.local_expert_end))
+        self._deepep_debug_call_id = 0
         self.gate_up_proj = nn.Parameter(
             torch.empty(self.num_local_experts, 2 * self.intermediate_dim, self.hidden_dim)
         )
@@ -165,9 +168,9 @@ class Qwen3MoeExperts(nn.Module):
     ) -> torch.Tensor:
         final_hidden_states = torch.zeros_like(hidden_states)
         with torch.no_grad():
-            valid_expert_mask = selected_experts >= 0
+            valid_expert_mask = (selected_experts >= 0) & (selected_experts < self.num_experts)
             expert_mask = F.one_hot(
-                torch.clamp(selected_experts, min=0),
+                torch.clamp(selected_experts, min=0, max=self.num_experts - 1),
                 num_classes=self.num_experts,
             )
             expert_mask = expert_mask * valid_expert_mask.unsqueeze(-1)
@@ -201,13 +204,56 @@ class Qwen3MoeExperts(nn.Module):
 
         from sparsevllm.engine.expert_parallel import deepep_v2
 
+        debug_deepep = str(os.environ.get("SPARSEVLLM_DEEPEP_DEBUG", "")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        context = get_context()
+        layer_idx = int(getattr(context, "now_layer_idx", -1))
+        previous_event = getattr(context, "deepep_v2_previous_event", None)
+        allocate_on_comm_stream = bool(getattr(context, "deepep_v2_allocate_on_comm_stream", False))
+        disable_cpu_sync = bool(getattr(context, "deepep_v2_disable_cpu_sync", False))
+        pre_dispatch_barrier = bool(getattr(context, "deepep_v2_pre_dispatch_barrier", False))
+        debug_call_id = -1
+        if debug_deepep and layer_idx == 0:
+            debug_call_id = self._deepep_debug_call_id
+            self._deepep_debug_call_id += 1
+            logger.info(
+                "DeepEP debug layer={} call={} before dispatch hidden={} topk={} weights={} previous_event={} disable_cpu_sync={} barrier={}",
+                layer_idx,
+                debug_call_id,
+                tuple(hidden_states.shape),
+                tuple(selected_experts.shape),
+                tuple(routing_weights.shape),
+                previous_event is not None,
+                disable_cpu_sync,
+                pre_dispatch_barrier,
+            )
+        if pre_dispatch_barrier:
+            ep_group = get_ep_group()
+            if ep_group is None:
+                raise RuntimeError("DeepEP v2 pre-dispatch barrier requires an EP process group.")
+            dist.barrier(group=ep_group)
         dispatched = deepep_v2.dispatch(
             hidden_states=hidden_states,
             selected_experts=selected_experts,
             routing_weights=routing_weights,
             num_experts=self.num_experts,
+            previous_event=previous_event,
+            allocate_on_comm_stream=allocate_on_comm_stream,
+            disable_cpu_sync=disable_cpu_sync,
         )
         num_recv_tokens = int(dispatched.num_recv_tokens)
+        if debug_deepep and layer_idx == 0:
+            logger.info(
+                "DeepEP debug layer={} call={} after dispatch recv_x={} num_recv={}",
+                layer_idx,
+                debug_call_id,
+                tuple(dispatched.recv_x.shape),
+                num_recv_tokens,
+            )
         recv_selected_experts = dispatched.recv_topk_idx[:num_recv_tokens] + self.local_expert_start
         recv_selected_experts = torch.where(
             dispatched.recv_topk_idx[:num_recv_tokens] >= 0,
@@ -218,12 +264,52 @@ class Qwen3MoeExperts(nn.Module):
             raise RuntimeError("DeepEP v2 dispatch did not return routing weights.")
         local_output = torch.zeros_like(dispatched.recv_x)
         if num_recv_tokens > 0:
+            if dispatched.valid_recv_tokens is not None:
+                valid_rows = torch.arange(
+                    num_recv_tokens,
+                    device=dispatched.recv_topk_idx.device,
+                    dtype=dispatched.valid_recv_tokens.dtype,
+                ) < dispatched.valid_recv_tokens
+                recv_selected_experts = torch.where(
+                    valid_rows[:, None],
+                    recv_selected_experts,
+                    torch.full_like(recv_selected_experts, -1),
+                )
+            if debug_deepep and layer_idx == 0:
+                logger.info(
+                    "DeepEP debug layer={} call={} before local experts num_recv={}",
+                    layer_idx,
+                    debug_call_id,
+                    num_recv_tokens,
+                )
             local_output[:num_recv_tokens] = self._apply_local_experts(
                 dispatched.recv_x[:num_recv_tokens],
                 recv_selected_experts,
                 dispatched.recv_topk_weights[:num_recv_tokens].to(dispatched.recv_x.dtype),
             )
-        return deepep_v2.combine(local_output, dispatched.handle)
+        combine_previous_event = deepep_v2.capture_event() if allocate_on_comm_stream else None
+        if debug_deepep and layer_idx == 0:
+            logger.info(
+                "DeepEP debug layer={} call={} before combine local_output={} previous_event={}",
+                layer_idx,
+                debug_call_id,
+                tuple(local_output.shape),
+                combine_previous_event is not None,
+            )
+        combined = deepep_v2.combine(
+            local_output,
+            dispatched.handle,
+            previous_event=combine_previous_event,
+            allocate_on_comm_stream=allocate_on_comm_stream,
+        )
+        if debug_deepep and layer_idx == 0:
+            logger.info(
+                "DeepEP debug layer={} call={} after combine output={}",
+                layer_idx,
+                debug_call_id,
+                tuple(combined.shape),
+            )
+        return combined
 
     def forward(
         self,
@@ -365,6 +451,485 @@ class Qwen3MoeModel(nn.Module):
         if debug_layers is not None:
             self.debug_last_hidden_states[self.config.num_hidden_layers] = hidden_states[-1:].detach().clone()
         return hidden_states
+
+    def decode_dense_before_moe(
+        self,
+        layer_idx: int,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        layer = self.layers[int(layer_idx)]
+        context = get_context()
+        context.now_layer_idx = int(layer_idx)
+        if residual is None:
+            hidden_states, residual = layer.input_layernorm(hidden_states), hidden_states
+        else:
+            hidden_states, residual = layer.input_layernorm(hidden_states, residual)
+        hidden_states = layer.self_attn(positions, hidden_states)
+        hidden_states, residual = layer.post_attention_layernorm(hidden_states, residual)
+        return hidden_states, residual
+
+    def decode_final_hidden(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> torch.Tensor:
+        hidden_states, _ = self.norm(hidden_states, residual)
+        return hidden_states
+
+
+class Qwen3MoePiecewiseDecodeCudaGraphState:
+    """CUDA graph dense decode segments while keeping MoE execution eager."""
+
+    def __init__(
+        self,
+        owner: "Qwen3MoeForCausalLM",
+        graph_state,
+        *,
+        graph_pool,
+    ) -> None:
+        self.owner = owner
+        self.graph_key = graph_state.key
+        self.graph_pool = graph_pool
+        self.captured = False
+        self.layer_graphs: list[torch.cuda.CUDAGraph] = []
+        self.final_graph: torch.cuda.CUDAGraph | None = None
+        self.layer_input_hidden: list[torch.Tensor | None] = []
+        self.moe_input_hidden: list[torch.Tensor] = []
+        self.dense_hidden: list[torch.Tensor] = []
+        self.dense_residual: list[torch.Tensor] = []
+        self.final_hidden_input: torch.Tensor | None = None
+        self.final_residual_input: torch.Tensor | None = None
+        self.logits: torch.Tensor | None = None
+        self.keepalive: list[object] = []
+        self._logged_replay_moe = False
+        self.mode = "piecewise"
+
+    def clear(self) -> None:
+        self.layer_graphs.clear()
+        self.final_graph = None
+        self.layer_input_hidden.clear()
+        self.moe_input_hidden.clear()
+        self.dense_hidden.clear()
+        self.dense_residual.clear()
+        self.final_hidden_input = None
+        self.final_residual_input = None
+        self.logits = None
+        self.keepalive.clear()
+        self._logged_replay_moe = False
+        self.captured = False
+
+    @property
+    def batch_size(self) -> int:
+        return int(self.graph_key.batch_size)
+
+    @property
+    def num_layers(self) -> int:
+        return len(self.owner.model.layers)
+
+    def _allocate_inputs(self, input_ids: torch.Tensor) -> None:
+        dtype = self.owner.model.embed_tokens.weight.dtype
+        device = input_ids.device
+        hidden_size = int(self.owner.config.hidden_size)
+        self.layer_input_hidden = [None]
+        self.moe_input_hidden = []
+        self.dense_hidden = []
+        self.dense_residual = []
+        for _ in range(1, self.num_layers):
+            self.layer_input_hidden.append(
+                torch.empty((self.batch_size, hidden_size), dtype=dtype, device=device)
+            )
+        for _ in range(self.num_layers):
+            self.moe_input_hidden.append(
+                torch.empty((self.batch_size, hidden_size), dtype=dtype, device=device)
+            )
+            self.dense_hidden.append(
+                torch.empty((self.batch_size, hidden_size), dtype=dtype, device=device)
+            )
+            self.dense_residual.append(
+                torch.empty((self.batch_size, hidden_size), dtype=dtype, device=device)
+            )
+        self.final_hidden_input = torch.empty((self.batch_size, hidden_size), dtype=dtype, device=device)
+        self.final_residual_input = torch.empty((self.batch_size, hidden_size), dtype=dtype, device=device)
+
+    def _allocate_final_inputs(self, input_ids: torch.Tensor) -> None:
+        dtype = self.owner.model.embed_tokens.weight.dtype
+        device = input_ids.device
+        hidden_size = int(self.owner.config.hidden_size)
+        self.final_hidden_input = torch.empty((self.batch_size, hidden_size), dtype=dtype, device=device)
+        self.final_residual_input = torch.empty((self.batch_size, hidden_size), dtype=dtype, device=device)
+
+    def _uses_deepep_v2(self) -> bool:
+        if get_ep_size() <= 1 or not self.owner.model.layers:
+            return False
+        experts = getattr(getattr(self.owner.model.layers[0], "mlp", None), "experts", None)
+        return str(getattr(experts, "expert_parallel_backend", "")).strip().lower() == "deepep_v2"
+
+    def _select_capture_mode(self) -> str:
+        return "piecewise"
+
+    def _run_mlp_and_hooks(
+        self,
+        layer_idx: int,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        sparse_controller,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        layer = self.owner.model.layers[int(layer_idx)]
+        context = get_context()
+        context.now_layer_idx = int(layer_idx)
+        hidden_states = layer.mlp(hidden_states)
+        if sparse_controller is not None:
+            hidden_states, residual = sparse_controller.apply_activation_hook(
+                int(layer_idx),
+                hidden_states,
+                residual,
+                context,
+            )
+            sparse_controller.on_layer_end(int(layer_idx), context)
+        return hidden_states, residual
+
+    def _sync_ep_ranks_before_capture_moe(self, layer_idx: int) -> None:
+        if get_ep_size() <= 1:
+            return
+        if not dist.is_available() or not dist.is_initialized():
+            raise RuntimeError("Qwen3-MoE piecewise decode graph capture requires initialized distributed ranks.")
+        if torch.cuda.is_available():
+            dist.barrier(group=get_ep_group(), device_ids=[torch.cuda.current_device()])
+        else:
+            dist.barrier(group=get_ep_group())
+        if int(layer_idx) == 0:
+            logger.info("Synchronized EP ranks before piecewise decode graph MoE capture.")
+
+    def _run_warmup(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        sparse_controller,
+    ) -> None:
+        context = get_context()
+        context.sparse_controller = sparse_controller
+        use_graph_compatible_deepep = self._uses_deepep_v2()
+        previous_disable_cpu_sync = getattr(context, "deepep_v2_disable_cpu_sync", None)
+        previous_pre_dispatch_barrier = getattr(context, "deepep_v2_pre_dispatch_barrier", None)
+        if use_graph_compatible_deepep:
+            context.deepep_v2_disable_cpu_sync = True
+            context.deepep_v2_pre_dispatch_barrier = True
+        if sparse_controller is not None:
+            sparse_controller.prepare_forward(context.seqs, is_prefill=False)
+        try:
+            hidden_states = self.owner.model.embed_tokens(input_ids)
+            residual = None
+            for layer_idx in range(self.num_layers):
+                if layer_idx > 0:
+                    layer_input = self.layer_input_hidden[layer_idx]
+                    if layer_input is None:
+                        raise RuntimeError(f"Missing Qwen3-MoE piecewise input buffer for layer={layer_idx}.")
+                    layer_input.copy_(hidden_states)
+                hidden_states, residual = self.owner.model.decode_dense_before_moe(
+                    layer_idx,
+                    positions,
+                    hidden_states,
+                    residual,
+                )
+                self.dense_hidden[layer_idx].copy_(hidden_states)
+                self.dense_residual[layer_idx].copy_(residual)
+                hidden_states, residual = self._run_mlp_and_hooks(
+                    layer_idx,
+                    hidden_states,
+                    residual,
+                    sparse_controller,
+                )
+            if self.final_hidden_input is None:
+                raise RuntimeError("Missing Qwen3-MoE piecewise final input buffer during warmup.")
+            self.final_hidden_input.copy_(hidden_states)
+            hidden_states = self.owner.model.decode_final_hidden(hidden_states, residual)
+            _ = self.owner.compute_logits(hidden_states)
+        finally:
+            if use_graph_compatible_deepep:
+                if previous_disable_cpu_sync is None:
+                    context.deepep_v2_disable_cpu_sync = False
+                else:
+                    context.deepep_v2_disable_cpu_sync = previous_disable_cpu_sync
+                if previous_pre_dispatch_barrier is None:
+                    context.deepep_v2_pre_dispatch_barrier = False
+                else:
+                    context.deepep_v2_pre_dispatch_barrier = previous_pre_dispatch_barrier
+
+    def _run_layers_eager(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        sparse_controller,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        context = get_context()
+        context.sparse_controller = sparse_controller
+        use_graph_compatible_deepep = self._uses_deepep_v2()
+        previous_disable_cpu_sync = getattr(context, "deepep_v2_disable_cpu_sync", None)
+        previous_pre_dispatch_barrier = getattr(context, "deepep_v2_pre_dispatch_barrier", None)
+        if use_graph_compatible_deepep:
+            context.deepep_v2_disable_cpu_sync = True
+            context.deepep_v2_pre_dispatch_barrier = True
+        if sparse_controller is not None:
+            sparse_controller.prepare_forward(context.seqs, is_prefill=False)
+        try:
+            hidden_states = self.owner.model.embed_tokens(input_ids)
+            residual = None
+            for layer_idx in range(self.num_layers):
+                hidden_states, residual = self.owner.model.decode_dense_before_moe(
+                    layer_idx,
+                    positions,
+                    hidden_states,
+                    residual,
+                )
+                hidden_states, residual = self._run_mlp_and_hooks(
+                    layer_idx,
+                    hidden_states,
+                    residual,
+                    sparse_controller,
+                )
+            if residual is None:
+                raise RuntimeError("Qwen3-MoE final-only graph reached final norm without residual state.")
+            return hidden_states, residual
+        finally:
+            if use_graph_compatible_deepep:
+                if previous_disable_cpu_sync is None:
+                    context.deepep_v2_disable_cpu_sync = False
+                else:
+                    context.deepep_v2_disable_cpu_sync = previous_disable_cpu_sync
+                if previous_pre_dispatch_barrier is None:
+                    context.deepep_v2_pre_dispatch_barrier = False
+                else:
+                    context.deepep_v2_pre_dispatch_barrier = previous_pre_dispatch_barrier
+
+    def _capture_layer(
+        self,
+        layer_idx: int,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> torch.cuda.CUDAGraph:
+        graph = torch.cuda.CUDAGraph()
+        context = get_context()
+        context.now_layer_idx = int(layer_idx)
+        dense_hidden_buffer = self.dense_hidden[int(layer_idx)]
+        dense_residual_buffer = self.dense_residual[int(layer_idx)]
+        try:
+            with torch.cuda.graph(graph, pool=self.graph_pool):
+                if int(layer_idx) == 0:
+                    hidden_states = self.owner.model.embed_tokens(input_ids)
+                    residual = None
+                else:
+                    hidden_states = self.layer_input_hidden[int(layer_idx)]
+                    residual = self.dense_residual[int(layer_idx) - 1]
+                dense_hidden, dense_residual = self.owner.model.decode_dense_before_moe(
+                    layer_idx,
+                    positions,
+                    hidden_states,
+                    residual,
+                )
+                dense_hidden_buffer.copy_(dense_hidden)
+                dense_residual_buffer.copy_(dense_residual)
+        except Exception as exc:
+            raise RuntimeError(
+                f"qwen3_moe piecewise decode_cuda_graph capture failed at layer={layer_idx}: {exc!r}"
+            ) from exc
+        return graph
+
+    def _capture_final(self) -> tuple[torch.cuda.CUDAGraph, torch.Tensor]:
+        if self.final_hidden_input is None:
+            raise RuntimeError("Qwen3-MoE piecewise graph final input buffer is not allocated.")
+        if self.mode == "final_only":
+            if self.final_residual_input is None:
+                raise RuntimeError("Qwen3-MoE final-only graph final residual buffer is not allocated.")
+            final_residual = self.final_residual_input
+        else:
+            if not self.dense_residual:
+                raise RuntimeError("Qwen3-MoE piecewise graph final residual buffer is not allocated.")
+            final_residual = self.dense_residual[-1]
+        graph = torch.cuda.CUDAGraph()
+        try:
+            with torch.cuda.graph(graph, pool=self.graph_pool):
+                hidden_states = self.owner.model.decode_final_hidden(
+                    self.final_hidden_input,
+                    final_residual,
+                )
+                logits = self.owner.compute_logits(hidden_states)
+        except Exception as exc:
+            raise RuntimeError(f"qwen3_moe piecewise final decode_cuda_graph capture failed: {exc!r}") from exc
+        return graph, logits
+
+    def _capture_final_only(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        sparse_controller,
+    ) -> None:
+        self._allocate_final_inputs(input_ids)
+        with profiler.record("decode_cuda_graph_final_only_warmup"):
+            hidden_states, residual = self._run_layers_eager(input_ids, positions, sparse_controller)
+            if self.final_hidden_input is None or self.final_residual_input is None:
+                raise RuntimeError("Missing Qwen3-MoE final-only graph buffers during warmup.")
+            self.final_hidden_input.copy_(hidden_states)
+            self.final_residual_input.copy_(residual)
+            _ = self.owner.compute_logits(self.owner.model.decode_final_hidden(hidden_states, residual))
+        torch.cuda.synchronize(input_ids.device)
+        with profiler.record("decode_cuda_graph_final_only_capture"):
+            logger.info(
+                "Using Qwen3-MoE DeepEP-safe decode CUDA graph mode: MoE and attention run eager; "
+                "final norm/lm_head are captured. Set SPARSEVLLM_QWEN3_MOE_DEEPEP_PIECEWISE_GRAPH=1 "
+                "to retry full piecewise graph capture."
+            )
+            self.final_graph, self.logits = self._capture_final()
+        self.keepalive = [
+            self.final_hidden_input,
+            self.final_residual_input,
+            self.logits,
+            self.final_graph,
+        ]
+        self.captured = True
+
+    def _replay_final_only(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        sparse_controller,
+    ) -> torch.Tensor | None:
+        if not self.captured or self.final_graph is None:
+            raise RuntimeError("Qwen3-MoE final-only decode_cuda_graph was not captured.")
+        if self.final_hidden_input is None or self.final_residual_input is None:
+            raise RuntimeError("Qwen3-MoE final-only decode_cuda_graph buffers are missing.")
+        with profiler.record("decode_cuda_graph_final_only_replay"):
+            hidden_states, residual = self._run_layers_eager(input_ids, positions, sparse_controller)
+            self.final_hidden_input.copy_(hidden_states)
+            self.final_residual_input.copy_(residual)
+            self.final_graph.replay()
+        return self.logits
+
+    def capture(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        sparse_controller,
+    ) -> None:
+        if not torch.cuda.is_available():
+            raise RuntimeError("Qwen3-MoE piecewise decode_cuda_graph requires CUDA.")
+        self.mode = self._select_capture_mode()
+        if self.mode == "final_only":
+            self._capture_final_only(input_ids, positions, sparse_controller)
+            return
+        self._allocate_inputs(input_ids)
+        with profiler.record("decode_cuda_graph_piecewise_warmup"):
+            self._run_warmup(input_ids, positions, sparse_controller)
+        torch.cuda.synchronize(input_ids.device)
+
+        context = get_context()
+        context.sparse_controller = sparse_controller
+        if sparse_controller is not None:
+            sparse_controller.prepare_forward(context.seqs, is_prefill=False)
+        with profiler.record("decode_cuda_graph_piecewise_capture"):
+            logger.info(
+                "Capturing Qwen3-MoE piecewise decode CUDA graphs: layers={} batch={} context_cap={}",
+                self.num_layers,
+                self.batch_size,
+                self.graph_key.context_capacity,
+            )
+            for layer_idx in range(self.num_layers):
+                graph = self._capture_layer(layer_idx, input_ids, positions)
+                self.layer_graphs.append(graph)
+                if (layer_idx + 1) % 8 == 0 or layer_idx + 1 == self.num_layers:
+                    logger.info(
+                        "Captured Qwen3-MoE piecewise decode CUDA graph layer {}/{}.",
+                        layer_idx + 1,
+                        self.num_layers,
+                    )
+            self.final_graph, self.logits = self._capture_final()
+            logger.info("Captured Qwen3-MoE piecewise decode CUDA graphs without eager MoE in capture.")
+
+        self.keepalive = [
+            self.layer_input_hidden,
+            self.moe_input_hidden,
+            self.dense_hidden,
+            self.dense_residual,
+            self.final_hidden_input,
+            self.final_residual_input,
+            self.logits,
+            *self.layer_graphs,
+            self.final_graph,
+        ]
+        self.captured = True
+
+    def replay(
+        self,
+        sparse_controller,
+    ) -> torch.Tensor | None:
+        if not self.captured or self.final_graph is None:
+            raise RuntimeError("Qwen3-MoE piecewise decode_cuda_graph was not captured.")
+        if self.final_hidden_input is None:
+            raise RuntimeError("Qwen3-MoE piecewise decode_cuda_graph final buffer is missing.")
+        if self.mode == "final_only":
+            raise RuntimeError("Qwen3-MoE final-only graph replay requires input_ids and positions.")
+
+        context = get_context()
+        context.sparse_controller = sparse_controller
+        with profiler.record("decode_cuda_graph_piecewise_replay"):
+            for layer_idx, graph in enumerate(self.layer_graphs):
+                context.now_layer_idx = int(layer_idx)
+                graph.replay()
+                moe_input = self.moe_input_hidden[layer_idx]
+                moe_input.copy_(self.dense_hidden[layer_idx])
+                layer = self.owner.model.layers[int(layer_idx)]
+                experts = getattr(getattr(layer, "mlp", None), "experts", None)
+                use_deepep_event = (
+                    experts is not None
+                    and str(getattr(experts, "expert_parallel_backend", "")).strip().lower() == "deepep_v2"
+                    and get_ep_size() > 1
+                )
+                if use_deepep_event:
+                    torch.cuda.current_stream(moe_input.device).synchronize()
+                    context.deepep_v2_previous_event = None
+                    context.deepep_v2_allocate_on_comm_stream = False
+                    context.deepep_v2_disable_cpu_sync = True
+                    context.deepep_v2_pre_dispatch_barrier = True
+                if layer_idx == 0 and not self._logged_replay_moe:
+                    logger.info("Running eager Qwen3-MoE block after first piecewise graph replay.")
+                try:
+                    hidden_states, _ = self._run_mlp_and_hooks(
+                        layer_idx,
+                        moe_input,
+                        self.dense_residual[layer_idx],
+                        sparse_controller,
+                    )
+                finally:
+                    if use_deepep_event:
+                        context.deepep_v2_previous_event = None
+                        context.deepep_v2_allocate_on_comm_stream = False
+                        context.deepep_v2_disable_cpu_sync = False
+                        context.deepep_v2_pre_dispatch_barrier = False
+                if layer_idx == 0 and not self._logged_replay_moe:
+                    logger.info("Finished eager Qwen3-MoE block after first piecewise graph replay.")
+                    self._logged_replay_moe = True
+                if layer_idx + 1 < self.num_layers:
+                    next_hidden = self.layer_input_hidden[layer_idx + 1]
+                    if next_hidden is None:
+                        raise RuntimeError(f"Missing Qwen3-MoE piecewise input buffer for layer={layer_idx + 1}.")
+                    next_hidden.copy_(hidden_states)
+                else:
+                    self.final_hidden_input.copy_(hidden_states)
+            self.final_graph.replay()
+        return self.logits
+
+    def run(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        sparse_controller,
+    ) -> torch.Tensor | None:
+        if not self.captured:
+            self.capture(input_ids, positions, sparse_controller)
+        if self.mode == "final_only":
+            return self._replay_final_only(input_ids, positions, sparse_controller)
+        return self.replay(sparse_controller)
 
 
 class Qwen3MoeForCausalLM(nn.Module):
@@ -534,3 +1099,27 @@ class Qwen3MoeForCausalLM(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         return self.lm_head(hidden_states)
+
+    def run_decode_piecewise_cuda_graph(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        graph_state,
+        *,
+        graph_pool,
+        sparse_controller,
+    ) -> torch.Tensor | None:
+        piecewise_state = graph_state.piecewise_state
+        if piecewise_state is None:
+            piecewise_state = Qwen3MoePiecewiseDecodeCudaGraphState(
+                self,
+                graph_state,
+                graph_pool=graph_pool,
+            )
+            graph_state.piecewise_state = piecewise_state
+        if not isinstance(piecewise_state, Qwen3MoePiecewiseDecodeCudaGraphState):
+            raise TypeError(
+                "Qwen3-MoE decode graph state was created by an incompatible piecewise runner: "
+                f"{type(piecewise_state).__name__}."
+            )
+        return piecewise_state.run(input_ids, positions, sparse_controller)

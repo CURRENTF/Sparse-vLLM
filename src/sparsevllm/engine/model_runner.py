@@ -174,10 +174,18 @@ class ModelRunner:
             self.config.max_model_len,
         )
         self.cuda_graph_pool = torch.cuda.graph_pool_handle() if self.config.decode_cuda_graph else None
+        run_piecewise_model = None
+        if (
+            self.config.decode_cuda_graph
+            and getattr(hf_config, "model_type", "") == "qwen3_moe"
+            and str(self.config.vllm_sparse_method or "") == ""
+        ):
+            run_piecewise_model = self.run_piecewise_decode_model
         self.decode_cuda_graph_runner = DecodeCudaGraphRunner(
             cache_manager=self.cache_manager,
             sparse_controller=self.sparse_controller,
             run_model=self.run_model,
+            run_piecewise_model=run_piecewise_model,
             is_long_text_batch=self._is_long_text_batch,
             method=self.config.vllm_sparse_method,
             rank=self.rank,
@@ -317,7 +325,7 @@ class ModelRunner:
     def _sample_outputs_on_this_rank(self) -> bool:
         return self.rank == 0 or bool(getattr(self.config, "expert_parallel_overlap_data_parallel", False))
 
-    def _run_empty_deepep_v2_collectives(self) -> None:
+    def _run_empty_deepep_v2_collectives(self, is_prefill: bool, *, decode_graph_needs_capture: bool = False) -> None:
         if str(getattr(self.config, "expert_parallel_backend", "") or "").lower() != "deepep_v2":
             return
         if not bool(getattr(self.config, "expert_parallel_overlap_data_parallel", False)):
@@ -331,10 +339,51 @@ class ModelRunner:
         hidden_size = int(self.config.hf_config.hidden_size)
         empty_hidden = torch.empty((0, hidden_size), dtype=self.config.hf_config.torch_dtype, device=self.device)
         layers = getattr(getattr(self.model, "model", None), "layers", [])
-        for layer in layers:
-            mlp = getattr(layer, "mlp", None)
-            if isinstance(mlp, Qwen3MoeSparseMoeBlock):
-                mlp(empty_hidden)
+        context = get_context()
+        use_graph_compatible_decode = bool(self.config.decode_cuda_graph and not is_prefill)
+        previous_disable_cpu_sync = getattr(context, "deepep_v2_disable_cpu_sync", None)
+        previous_pre_dispatch_barrier = getattr(context, "deepep_v2_pre_dispatch_barrier", None)
+        if use_graph_compatible_decode:
+            context.deepep_v2_disable_cpu_sync = True
+            context.deepep_v2_pre_dispatch_barrier = True
+        try:
+            num_passes = 2 if use_graph_compatible_decode and decode_graph_needs_capture else 1
+            for _ in range(num_passes):
+                for layer_idx, layer in enumerate(layers):
+                    context.now_layer_idx = int(layer_idx)
+                    mlp = getattr(layer, "mlp", None)
+                    if isinstance(mlp, Qwen3MoeSparseMoeBlock):
+                        mlp(empty_hidden)
+        finally:
+            if use_graph_compatible_decode:
+                if previous_disable_cpu_sync is None:
+                    context.deepep_v2_disable_cpu_sync = False
+                else:
+                    context.deepep_v2_disable_cpu_sync = previous_disable_cpu_sync
+                if previous_pre_dispatch_barrier is None:
+                    context.deepep_v2_pre_dispatch_barrier = False
+                else:
+                    context.deepep_v2_pre_dispatch_barrier = previous_pre_dispatch_barrier
+            context.now_layer_idx = -1
+
+    def _sync_decode_cuda_graph_needs_capture(self, local_seqs: list[Sequence], is_prefill: bool) -> bool:
+        local_needs_capture = False
+        if bool(self.config.decode_cuda_graph) and not is_prefill and local_seqs:
+            local_needs_capture = bool(
+                self.decode_cuda_graph_runner.would_capture(
+                    local_seqs,
+                    capture_sampling=bool(self.config.decode_cuda_graph_capture_sampling),
+                )
+            )
+        if self.world_size <= 1 or not dist.is_initialized():
+            return local_needs_capture
+        flag = torch.tensor(
+            [1 if local_needs_capture else 0],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+        return bool(int(flag.item()))
 
     def load_deltakv_compressors(self):
         """加载 DeltaKV 压缩器权重"""
@@ -499,6 +548,27 @@ class ModelRunner:
         with profiler.record(f"model_run_model_{_stage}"):
             return self.model.compute_logits(self.model(input_ids, positions))
 
+    @torch.inference_mode()
+    def run_piecewise_decode_model(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        graph_state,
+        needs_capture: bool,
+    ) -> torch.Tensor | None:
+        del needs_capture
+        runner = getattr(self.model, "run_decode_piecewise_cuda_graph", None)
+        if runner is None:
+            raise RuntimeError("Model does not implement run_decode_piecewise_cuda_graph().")
+        with profiler.record("model_run_model_decode_piecewise_graph"):
+            return runner(
+                input_ids,
+                positions,
+                graph_state,
+                graph_pool=self.cuda_graph_pool,
+                sparse_controller=self.sparse_controller,
+            )
+
     def run_logits_for_compare(self, seqs: list[Sequence], is_prefill: bool) -> torch.Tensor | None:
         """Debug logits-alignment path: execute one step and return rank-0 logits without sampling."""
         try:
@@ -649,6 +719,7 @@ class ModelRunner:
                 f"rank_batches length must match world_size={self.world_size}, got {len(rank_batches)}."
             )
         local_seqs = rank_batches[self.rank]
+        decode_graph_needs_capture = self._sync_decode_cuda_graph_needs_capture(local_seqs, is_prefill)
         if local_seqs:
             token_ids, logprob_outputs = self.run(local_seqs, is_prefill)
             token_ids = [] if token_ids is None else [int(token_id) for token_id in token_ids]
@@ -661,7 +732,10 @@ class ModelRunner:
                     [None] * len(local_seqs) if top_logprobs is None else top_logprobs,
                 )
         else:
-            self._run_empty_deepep_v2_collectives()
+            self._run_empty_deepep_v2_collectives(
+                is_prefill,
+                decode_graph_needs_capture=decode_graph_needs_capture,
+            )
             token_ids = []
             logprob_outputs = ([], [])
 

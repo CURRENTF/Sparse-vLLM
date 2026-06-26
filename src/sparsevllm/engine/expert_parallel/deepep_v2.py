@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import importlib.metadata as importlib_metadata
+import os
 import re
 from typing import Any
 
@@ -24,6 +25,7 @@ class DeepEPV2Dispatch:
     handle: Any
     num_max_tokens_per_rank: int
     num_recv_tokens: int
+    valid_recv_tokens: torch.Tensor | None = None
 
 
 def _nccl_version_tuple() -> tuple[int, ...]:
@@ -114,12 +116,59 @@ def _is_cuda_graph_capturing() -> bool:
     return bool(torch.cuda.is_available() and torch.cuda.is_current_stream_capturing())
 
 
+def _async_with_compute_stream() -> bool:
+    value = os.environ.get("SPARSEVLLM_DEEPEP_V2_ASYNC_WITH_COMPUTE", "0")
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _wait_current_stream(event: Any) -> None:
+    if getattr(event, "event", None) is not None:
+        event.current_stream_wait()
+
+
 def _resolve_num_max_tokens_per_rank(num_local_tokens: int, device: torch.device, group: object) -> int:
     if _is_cuda_graph_capturing():
         return max(1, int(num_local_tokens))
     local_tokens = torch.tensor([int(num_local_tokens)], device=device, dtype=torch.int32)
     dist.all_reduce(local_tokens, op=dist.ReduceOp.MAX, group=group)
     return max(1, int(local_tokens.item()))
+
+
+def _resolve_num_recv_tokens(
+    handle: Any,
+    recv_x: torch.Tensor,
+    *,
+    graph_capturing: bool,
+    graph_compatible: bool,
+) -> int:
+    if not graph_compatible:
+        return int(handle.psum_num_recv_tokens_per_scaleup_rank[-1].item())
+    if graph_capturing:
+        return int(recv_x.shape[0])
+
+    psum_num_recv_tokens_per_expert = getattr(handle, "psum_num_recv_tokens_per_expert", None)
+    if not isinstance(psum_num_recv_tokens_per_expert, torch.Tensor):
+        raise RuntimeError(
+            "DeepEP v2 graph-compatible dispatch requires "
+            "handle.psum_num_recv_tokens_per_expert to resolve valid received tokens."
+        )
+    if psum_num_recv_tokens_per_expert.numel() == 0:
+        return 0
+    return int(psum_num_recv_tokens_per_expert[-1].item())
+
+
+def _valid_recv_tokens_tensor(handle: Any) -> torch.Tensor | None:
+    psum_num_recv_tokens_per_expert = getattr(handle, "psum_num_recv_tokens_per_expert", None)
+    if psum_num_recv_tokens_per_expert is None:
+        return None
+    if not isinstance(psum_num_recv_tokens_per_expert, torch.Tensor):
+        raise RuntimeError(
+            "DeepEP v2 graph-compatible dispatch requires "
+            "handle.psum_num_recv_tokens_per_expert to mask padded receive rows."
+        )
+    if psum_num_recv_tokens_per_expert.numel() == 0:
+        return torch.zeros((), dtype=torch.int64, device=psum_num_recv_tokens_per_expert.device)
+    return psum_num_recv_tokens_per_expert[-1]
 
 
 def get_buffer(
@@ -204,6 +253,9 @@ def dispatch(
     selected_experts: torch.Tensor,
     routing_weights: torch.Tensor,
     num_experts: int,
+    previous_event: Any | None = None,
+    allocate_on_comm_stream: bool = False,
+    disable_cpu_sync: bool = False,
 ) -> DeepEPV2Dispatch:
     if hidden_states.dim() != 2:
         raise ValueError(
@@ -240,8 +292,10 @@ def dispatch(
         num_experts=int(num_experts),
     )
     graph_capturing = _is_cuda_graph_capturing()
+    graph_compatible = bool(graph_capturing or disable_cpu_sync)
     topk_idx = selected_experts if selected_experts.dtype == torch.int64 else selected_experts.to(torch.int64)
     topk_weights = routing_weights if routing_weights.dtype == torch.float32 else routing_weights.float()
+    async_with_compute_stream = bool(_async_with_compute_stream() or allocate_on_comm_stream)
     recv_x, recv_topk_idx, recv_topk_weights, handle, event = buffer.dispatch(
         hidden_states,
         topk_idx=topk_idx,
@@ -249,13 +303,26 @@ def dispatch(
         num_experts=int(num_experts),
         num_max_tokens_per_rank=int(num_max_tokens_per_rank),
         expert_alignment=1,
-        async_with_compute_stream=True,
-        do_handle_copy=not graph_capturing,
-        do_cpu_sync=not graph_capturing,
+        previous_event=previous_event,
+        async_with_compute_stream=async_with_compute_stream,
+        allocate_on_comm_stream=bool(allocate_on_comm_stream),
+        do_handle_copy=not graph_compatible,
+        do_cpu_sync=not graph_compatible,
         do_expand=False,
     )
-    event.current_stream_wait()
-    num_recv_tokens = int(recv_x.shape[0]) if graph_capturing else int(handle.psum_num_recv_tokens_per_scaleup_rank[-1].item())
+    _wait_current_stream(event)
+    valid_recv_tokens = None
+    if graph_compatible:
+        num_recv_tokens = int(recv_x.shape[0])
+        if not graph_capturing:
+            valid_recv_tokens = _valid_recv_tokens_tensor(handle)
+    else:
+        num_recv_tokens = _resolve_num_recv_tokens(
+            handle,
+            recv_x,
+            graph_capturing=graph_capturing,
+            graph_compatible=graph_compatible,
+        )
     return DeepEPV2Dispatch(
         recv_x=recv_x,
         recv_topk_idx=recv_topk_idx,
@@ -263,10 +330,22 @@ def dispatch(
         handle=handle,
         num_max_tokens_per_rank=num_max_tokens_per_rank,
         num_recv_tokens=num_recv_tokens,
+        valid_recv_tokens=valid_recv_tokens,
     )
 
 
-def combine(local_output: torch.Tensor, handle: Any) -> torch.Tensor:
+def capture_event() -> Any:
+    deep_ep = _import_deepep()
+    return deep_ep.ElasticBuffer.capture()
+
+
+def combine(
+    local_output: torch.Tensor,
+    handle: Any,
+    *,
+    previous_event: Any | None = None,
+    allocate_on_comm_stream: bool = False,
+) -> torch.Tensor:
     deep_ep = _import_deepep()
     _check_nccl_version(deep_ep)
     buffer = get_buffer(
@@ -275,10 +354,13 @@ def combine(local_output: torch.Tensor, handle: Any) -> torch.Tensor:
         num_topk=int(handle.topk_idx.shape[-1]),
         num_experts=int(handle.num_experts),
     )
+    async_with_compute_stream = bool(_async_with_compute_stream() or allocate_on_comm_stream)
     combined_x, _, event = buffer.combine(
         local_output,
         handle=handle,
-        async_with_compute_stream=True,
+        previous_event=previous_event,
+        async_with_compute_stream=async_with_compute_stream,
+        allocate_on_comm_stream=bool(allocate_on_comm_stream),
     )
-    event.current_stream_wait()
+    _wait_current_stream(event)
     return combined_x

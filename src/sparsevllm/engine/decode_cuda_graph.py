@@ -66,6 +66,7 @@ class DecodeCudaGraphState:
     token_ids: torch.Tensor | None = None
     keepalive: list[object] = field(default_factory=list)
     sparse_state_refs: dict[int, dict[str, object]] = field(default_factory=dict)
+    piecewise_state: object | None = None
 
 
 class DecodeCudaGraphRunner:
@@ -85,6 +86,7 @@ class DecodeCudaGraphRunner:
         sparse_controller,
         run_model: Callable[[torch.Tensor, torch.Tensor, bool], torch.Tensor],
         is_long_text_batch: Callable[[list[Sequence], bool], bool],
+        run_piecewise_model: Callable[[torch.Tensor, torch.Tensor, DecodeCudaGraphState, bool], torch.Tensor | None] | None = None,
         method: str,
         rank: int,
         capture_sizes: list[int],
@@ -94,6 +96,7 @@ class DecodeCudaGraphRunner:
         self.cache_manager = cache_manager
         self.sparse_controller = sparse_controller
         self.run_model = run_model
+        self.run_piecewise_model = run_piecewise_model
         self.is_long_text_batch = is_long_text_batch
         self.method = str(method or "")
         self.rank = int(rank)
@@ -143,6 +146,12 @@ class DecodeCudaGraphRunner:
         state.token_ids = None
         state.keepalive.clear()
         state.sparse_state_refs.clear()
+        piecewise_state = state.piecewise_state
+        if piecewise_state is not None:
+            clear = getattr(piecewise_state, "clear", None)
+            if clear is not None:
+                clear()
+        state.piecewise_state = None
 
     def _touch_graph_state(self, key: DecodeCudaGraphKey):
         move_to_end = getattr(self._graphs, "move_to_end", None)
@@ -221,20 +230,15 @@ class DecodeCudaGraphRunner:
         capture_sampling: bool,
         allow_larger_context_capacity: bool = True,
     ) -> DecodeCudaGraphState:
-        candidates = [
-            state
-            for key, state in self._graphs.items()
-            if key.method == method
-            and key.batch_size == batch_size
-            and key.is_long_text == is_long_text
-            and key.capture_sampling == capture_sampling
-            and (
-                key.context_capacity == context_capacity
-                or (allow_larger_context_capacity and key.context_capacity >= context_capacity)
-            )
-        ]
-        if candidates:
-            state = min(candidates, key=lambda state: state.key.context_capacity)
+        state = self._find_state(
+            method=method,
+            batch_size=batch_size,
+            context_capacity=context_capacity,
+            is_long_text=is_long_text,
+            capture_sampling=capture_sampling,
+            allow_larger_context_capacity=allow_larger_context_capacity,
+        )
+        if state is not None:
             self._touch_graph_state(state.key)
             return state
 
@@ -259,6 +263,61 @@ class DecodeCudaGraphRunner:
         self._graphs[key] = state
         self._evict_cached_graphs(key)
         return state
+
+    def _find_state(
+        self,
+        *,
+        method: str,
+        batch_size: int,
+        context_capacity: int,
+        is_long_text: bool,
+        capture_sampling: bool,
+        allow_larger_context_capacity: bool = True,
+    ) -> DecodeCudaGraphState | None:
+        candidates = [
+            state
+            for key, state in self._graphs.items()
+            if key.method == method
+            and key.batch_size == batch_size
+            and key.is_long_text == is_long_text
+            and key.capture_sampling == capture_sampling
+            and (
+                key.context_capacity == context_capacity
+                or (allow_larger_context_capacity and key.context_capacity >= context_capacity)
+            )
+        ]
+        if not candidates:
+            return None
+        return min(candidates, key=lambda state: state.key.context_capacity)
+
+    def would_capture(self, seqs: list[Sequence], *, capture_sampling: bool = False) -> bool:
+        if not seqs:
+            return False
+        if capture_sampling and any(seq.temperature > 1e-10 for seq in seqs):
+            raise ValueError("decode_cuda_graph capture_sampling currently supports greedy decode only.")
+
+        if self.run_piecewise_model is None:
+            force_eager = getattr(self.cache_manager, "decode_cuda_graph_force_eager", None)
+            if force_eager is not None and force_eager():
+                return False
+
+        real_batch_size = len(seqs)
+        graph_batch_size = self._select_graph_batch_size(real_batch_size)
+        is_long_text = self.is_long_text_batch(seqs, False)
+        context_capacity, allow_larger_context_capacity = self._graph_context_capacity_policy(seqs)
+        state = self._find_state(
+            method=self.method,
+            batch_size=graph_batch_size,
+            context_capacity=context_capacity,
+            is_long_text=is_long_text,
+            capture_sampling=bool(capture_sampling) if self.run_piecewise_model is None else False,
+            allow_larger_context_capacity=allow_larger_context_capacity,
+        )
+        if state is None:
+            return True
+        if self.run_piecewise_model is not None:
+            return state.piecewise_state is None
+        return state.graph is None
 
     def _prepare_static_step(
         self,
@@ -473,6 +532,10 @@ class DecodeCudaGraphRunner:
             raise ValueError("decode_cuda_graph capture_sampling currently supports greedy decode only.")
 
         real_batch_size = len(seqs)
+        if self.run_piecewise_model is not None:
+            logits = self._run_piecewise_graph(seqs, capture_sampling=bool(capture_sampling))
+            return logits, None
+
         force_eager = getattr(self.cache_manager, "decode_cuda_graph_force_eager", None)
         if force_eager is not None and force_eager():
             log_once(
@@ -513,6 +576,33 @@ class DecodeCudaGraphRunner:
         logits = state.logits[:real_batch_size] if state.logits is not None else None
         token_ids = state.token_ids[:real_batch_size] if state.token_ids is not None else None
         return logits, token_ids
+
+    def _run_piecewise_graph(self, seqs: list[Sequence], *, capture_sampling: bool) -> torch.Tensor | None:
+        if capture_sampling:
+            raise ValueError("piecewise decode_cuda_graph does not support capture_sampling yet.")
+
+        real_batch_size = len(seqs)
+        graph_batch_size = self._select_graph_batch_size(real_batch_size)
+        is_long_text = self.is_long_text_batch(seqs, False)
+        context_capacity, allow_larger_context_capacity = self._graph_context_capacity_policy(seqs)
+        state = self._select_state(
+            method=self.method,
+            batch_size=graph_batch_size,
+            context_capacity=context_capacity,
+            is_long_text=is_long_text,
+            capture_sampling=False,
+            allow_larger_context_capacity=allow_larger_context_capacity,
+        )
+        self.last_state_key = state.key
+        self.last_real_batch_size = real_batch_size
+        input_ids, positions = self._prepare_static_step(state, seqs, is_long_text)
+
+        ctx = get_context()
+        ctx.sparse_controller = self.sparse_controller
+        logits = self.run_piecewise_model(input_ids, positions, state, bool(state.piecewise_state is None))
+        if logits is None:
+            return None
+        return logits[:real_batch_size]
 
     def run_eager_static(self, seqs: list[Sequence]) -> torch.Tensor | None:
         """Run decode eagerly through the same static-compatible path used by graphs."""
