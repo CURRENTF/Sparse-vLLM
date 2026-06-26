@@ -21,6 +21,8 @@ from sparsevllm.engine.decode_cuda_graph import DecodeCudaGraphKey, DecodeCudaGr
 from sparsevllm.engine.llm_engine import (
     _decode_graph_warmup_prompt_len,
     _deltakv_graph_warmup_profile,
+    _OverlappedDPSchedulerOracle,
+    LLMEngine,
     _use_graph_scaled_warmup,
 )
 from sparsevllm.engine.scheduler import Scheduler
@@ -937,6 +939,61 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
             scheduler.postprocess(scheduled, [0], is_prefill)
 
         self.assertEqual(chunk_sizes, [4096, 4065, 32])
+
+    def test_overlapped_dp_oracle_limits_prefill_to_min_rank_capacity(self):
+        proxy = _OverlappedDPSchedulerOracle(FakeMemoryOracle(free_slots=100, step_free_slots=100))
+        proxy.update_snapshots([
+            {
+                "num_free_slots": 100,
+                "prefill_step_free_slots": 100,
+                "decode_step_free_slots": 100,
+                "prompt_admission_free_slots": 100,
+                "prompt_admission_budgets": {"slots": 100},
+            },
+            {
+                "num_free_slots": 7,
+                "prefill_step_free_slots": 7,
+                "decode_step_free_slots": 7,
+                "prompt_admission_free_slots": 7,
+                "prompt_admission_budgets": {"slots": 7},
+            },
+        ])
+        scheduler = make_scheduler_with_oracle(
+            PREFILL_POLICY_ALL_CHUNKED,
+            proxy,
+            method="",
+            chunk=5,
+            max_tokens=20,
+        )
+        seq_a = seq_with_len(20)
+        seq_b = seq_with_len(20)
+        seq_a.num_prefilled_tokens = 5
+        seq_b.num_prefilled_tokens = 5
+        scheduler.add(seq_a)
+        scheduler.add(seq_b)
+
+        scheduled, is_prefill, _ = scheduler.schedule()
+
+        self.assertTrue(is_prefill)
+        self.assertEqual(scheduled, [seq_a, seq_b])
+        self.assertEqual([seq.current_chunk_size for seq in scheduled], [5, 2])
+        self.assertLessEqual(sum(seq.current_chunk_size for seq in scheduled), 7)
+
+    def test_overlapped_dp_owner_balances_by_live_prompt_load(self):
+        engine = object.__new__(LLMEngine)
+        engine.config = SimpleNamespace(data_parallel_size=2)
+        large = seq_with_len(100)
+        small = seq_with_len(10)
+        new_seq = seq_with_len(20)
+        engine.scheduler = SimpleNamespace(waiting=[large, small, new_seq], decoding=[])
+        engine._dp_seq_owner = {
+            int(large.seq_id): 0,
+            int(small.seq_id): 1,
+        }
+
+        owner = LLMEngine._owner_rank_for_seq(engine, new_seq)
+
+        self.assertEqual(owner, 1)
 
     def test_long_bs1full_policy_schedules_long_as_single_full_prefill(self):
         scheduler = make_scheduler(

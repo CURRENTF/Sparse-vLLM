@@ -194,6 +194,106 @@ class _ThroughputIntervalLogger:
                 last_batch=last_batch,
             )
 
+
+class _OverlappedDPSchedulerOracle:
+    """Rank-0 cache-manager proxy with conservative DP-rank capacity limits."""
+
+    def __init__(self, delegate):
+        self._delegate = delegate
+        self._snapshots: list[dict] = []
+        self._admission_budgets: dict[str, int] = {}
+
+    def __getattr__(self, name):
+        return getattr(self._delegate, name)
+
+    def update_snapshots(self, snapshots: list[dict]) -> None:
+        self._snapshots = [dict(snapshot) for snapshot in snapshots if snapshot is not None]
+        budget_keys: set[str] = set()
+        for snapshot in self._snapshots:
+            budgets = snapshot.get("prompt_admission_budgets") or {}
+            budget_keys.update(str(key) for key in budgets)
+        self._admission_budgets = {}
+        for key in budget_keys:
+            values = []
+            for snapshot in self._snapshots:
+                budgets = snapshot.get("prompt_admission_budgets") or {}
+                if key in budgets:
+                    values.append(int(budgets[key]))
+            if values:
+                self._admission_budgets[key] = min(values)
+
+    def _min_snapshot_value(self, key: str, fallback: int) -> int:
+        values = [
+            int(snapshot[key])
+            for snapshot in self._snapshots
+            if key in snapshot and snapshot[key] is not None
+        ]
+        if not values:
+            return int(fallback)
+        return min(int(fallback), min(values))
+
+    @property
+    def num_free_slots(self) -> int:
+        return self._min_snapshot_value("num_free_slots", int(self._delegate.num_free_slots))
+
+    def num_free_slots_full_layers(self) -> int:
+        return self._min_snapshot_value(
+            "num_free_slots_full_layers",
+            int(self._delegate.num_free_slots_full_layers()),
+        )
+
+    def prefill_step_free_slots(self) -> int:
+        return self._min_snapshot_value(
+            "prefill_step_free_slots",
+            int(self._delegate.prefill_step_free_slots()),
+        )
+
+    def prefill_step_free_slots_for(self, seq: Sequence) -> int:
+        return min(
+            int(self._delegate.prefill_step_free_slots_for(seq)),
+            int(self.prefill_step_free_slots()),
+        )
+
+    def decode_step_free_slots(self) -> int:
+        return self._min_snapshot_value(
+            "decode_step_free_slots",
+            int(self._delegate.decode_step_free_slots()),
+        )
+
+    def decode_step_free_slots_for(self, seq: Sequence) -> int:
+        return min(
+            int(self._delegate.decode_step_free_slots_for(seq)),
+            int(self.decode_step_free_slots()),
+        )
+
+    def prompt_admission_free_slots(self) -> int:
+        return self._min_snapshot_value(
+            "prompt_admission_free_slots",
+            int(self._delegate.prompt_admission_free_slots()),
+        )
+
+    def prompt_admission_budgets(self, waiting, chunk_prefill_size: int) -> dict[str, int]:
+        budgets = {
+            str(key): int(value)
+            for key, value in self._delegate.prompt_admission_budgets(
+                waiting,
+                int(chunk_prefill_size),
+            ).items()
+        }
+        for key, value in self._admission_budgets.items():
+            budgets[key] = min(int(budgets.get(key, value)), int(value))
+        return budgets
+
+    def free_slot_stats(self) -> dict[str, int]:
+        stats = dict(self._delegate.free_slot_stats())
+        stats["dp_min_free_slots"] = int(self.num_free_slots)
+        stats["dp_min_prefill_step_free_slots"] = int(self.prefill_step_free_slots())
+        stats["dp_min_decode_step_free_slots"] = int(self.decode_step_free_slots())
+        for key, value in self._admission_budgets.items():
+            stats[f"dp_min_admission_{key}"] = int(value)
+        return stats
+
+
 class LLMEngine:
     """
     Sparse-vLLM 推理引擎的核心入口类。
@@ -257,10 +357,14 @@ class LLMEngine:
             self._build_non_execution_token_ids(self.tokenizer),
         )
         
-        # 4. 初始化调度器
-        # 关键设计：将 Rank 0 的 CacheManager 传给 Scheduler。
-        # Scheduler 通过它来感知全局显存的余量，从而做出调度和抢占决策。
-        self.scheduler = Scheduler(config, self.model_runner.cache_manager)
+        # 4. 初始化调度器。普通路径使用 rank 0 CacheManager；overlapped DP+EP
+        # 路径每个 DP rank 都有独立 KV cache，因此调度预算取所有 rank 的保守最小值。
+        self._scheduler_oracle = None
+        scheduler_oracle = self.model_runner.cache_manager
+        if bool(getattr(config, "expert_parallel_overlap_data_parallel", False)):
+            self._scheduler_oracle = _OverlappedDPSchedulerOracle(self.model_runner.cache_manager)
+            scheduler_oracle = self._scheduler_oracle
+        self.scheduler = Scheduler(config, scheduler_oracle)
         
         self._exited = False
         self._throughput_logger = _ThroughputIntervalLogger(config.throughput_log_interval_s)
@@ -496,6 +600,31 @@ class LLMEngine:
     def _use_overlapped_dp_ep(self) -> bool:
         return bool(getattr(self.config, "expert_parallel_overlap_data_parallel", False))
 
+    def _refresh_scheduler_capacity_snapshot(self) -> None:
+        if not self._use_overlapped_dp_ep():
+            return
+        oracle = getattr(self, "_scheduler_oracle", None)
+        if oracle is None:
+            return
+        snapshots = self.model_runner.call(
+            "scheduler_capacity_snapshot",
+            list(self.scheduler.waiting),
+            int(self.config.chunk_prefill_size),
+        )
+        if not isinstance(snapshots, list) or len(snapshots) != int(self.config.parallel_world_size):
+            raise RuntimeError(
+                "Overlapped DP+EP scheduler capacity snapshot did not return one payload per rank: "
+                f"got {type(snapshots).__name__} len={len(snapshots) if isinstance(snapshots, list) else 'n/a'}."
+            )
+        oracle.update_snapshots(snapshots)
+
+    @staticmethod
+    def _seq_owner_load(seq: Sequence) -> int:
+        prompt_tokens = int(getattr(seq, "num_prompt_tokens", 0) or 0)
+        completion_budget = int(getattr(seq, "max_tokens", 0) or 0)
+        generated_tokens = int(getattr(seq, "num_completion_tokens", 0) or 0)
+        return max(1, prompt_tokens + max(completion_budget, generated_tokens))
+
     def _owner_rank_for_seq(self, seq: Sequence) -> int:
         seq_id = int(seq.seq_id)
         owner = self._dp_seq_owner.get(seq_id)
@@ -505,14 +634,18 @@ class LLMEngine:
         if dp_size <= 1:
             owner = 0
         else:
-            owner_counts = [0 for _ in range(dp_size)]
-            live_seq_ids = {int(s.seq_id) for s in self.scheduler.waiting}
-            live_seq_ids.update(int(s.seq_id) for s in self.scheduler.decoding)
+            owner_loads = [0 for _ in range(dp_size)]
+            live_seqs = list(self.scheduler.waiting) + list(self.scheduler.decoding)
+            live_seq_ids = {int(s.seq_id) for s in live_seqs}
             live_seq_ids.add(seq_id)
+            live_seq_by_id = {int(s.seq_id): s for s in live_seqs}
             for live_seq_id, live_owner in self._dp_seq_owner.items():
                 if int(live_seq_id) in live_seq_ids and 0 <= int(live_owner) < dp_size:
-                    owner_counts[int(live_owner)] += 1
-            owner = min(range(dp_size), key=lambda rank: (owner_counts[rank], rank))
+                    live_seq = live_seq_by_id.get(int(live_seq_id))
+                    if live_seq is None and int(live_seq_id) == seq_id:
+                        live_seq = seq
+                    owner_loads[int(live_owner)] += self._seq_owner_load(live_seq) if live_seq is not None else 1
+            owner = min(range(dp_size), key=lambda rank: (owner_loads[rank], rank))
         self._dp_seq_owner[seq_id] = int(owner)
         return int(owner)
 
@@ -649,6 +782,7 @@ class LLMEngine:
             self.last_step_logprob_outputs = []
             # 1. 调度：决定哪些序列进入本次 Batch
             with profiler.record("schedule"):
+                self._refresh_scheduler_capacity_snapshot()
                 seqs, is_prefill, preempted_seqs = self.scheduler.schedule()
             
             # 2. 显式处理抢占 (Eviction)：

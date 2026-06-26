@@ -4,6 +4,7 @@ import time
 import uuid
 import torch
 import torch.distributed as dist
+from collections import deque
 from sparsevllm.utils.log import logger
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
@@ -49,6 +50,7 @@ TP_RPC_STATUS_SYNC_METHODS = PREFIX_CACHE_CONTROL_RPC_METHODS | {
     "run",
     "run_rank_batches",
     "free_rank_slots_batch",
+    "scheduler_capacity_snapshot",
 }
 
 
@@ -341,10 +343,8 @@ class ModelRunner:
         layers = getattr(getattr(self.model, "model", None), "layers", [])
         context = get_context()
         use_graph_compatible_decode = bool(self.config.decode_cuda_graph and not is_prefill)
-        previous_disable_cpu_sync = getattr(context, "deepep_v2_disable_cpu_sync", None)
         previous_pre_dispatch_barrier = getattr(context, "deepep_v2_pre_dispatch_barrier", None)
         if use_graph_compatible_decode:
-            context.deepep_v2_disable_cpu_sync = True
             context.deepep_v2_pre_dispatch_barrier = True
         try:
             num_passes = 2 if use_graph_compatible_decode and decode_graph_needs_capture else 1
@@ -362,10 +362,6 @@ class ModelRunner:
                         dist.barrier(group=group, device_ids=[torch.cuda.current_device()])
         finally:
             if use_graph_compatible_decode:
-                if previous_disable_cpu_sync is None:
-                    context.deepep_v2_disable_cpu_sync = False
-                else:
-                    context.deepep_v2_disable_cpu_sync = previous_disable_cpu_sync
                 if previous_pre_dispatch_barrier is None:
                     context.deepep_v2_pre_dispatch_barrier = False
                 else:
@@ -437,6 +433,46 @@ class ModelRunner:
                 f"rank_seq_ids length must match world_size={self.world_size}, got {len(rank_seq_ids)}."
             )
         self.free_slots_batch(rank_seq_ids[self.rank])
+
+    def scheduler_capacity_snapshot(
+        self,
+        waiting_seqs: list[Sequence],
+        chunk_prefill_size: int,
+    ):
+        """Gather rank-local KV scheduler budgets for overlapped DP+EP.
+
+        The central scheduler lives on rank 0, but in overlapped DP+EP each rank
+        owns an independent attention/KV cache.  Rank 0 must therefore schedule
+        from the most constrained rank-local capacity, not from its own cache
+        manager alone.
+        """
+        cache_manager = self.cache_manager
+        waiting = deque(waiting_seqs or [])
+        payload = {
+            "rank": int(self.rank),
+            "num_free_slots": int(cache_manager.num_free_slots),
+            "num_free_slots_full_layers": int(cache_manager.num_free_slots_full_layers()),
+            "prefill_step_free_slots": int(cache_manager.prefill_step_free_slots()),
+            "decode_step_free_slots": int(cache_manager.decode_step_free_slots()),
+            "prompt_admission_free_slots": int(cache_manager.prompt_admission_free_slots()),
+            "prompt_admission_budgets": {
+                str(key): int(value)
+                for key, value in cache_manager.prompt_admission_budgets(
+                    waiting,
+                    int(chunk_prefill_size),
+                ).items()
+            },
+            "free_slot_stats": {
+                str(key): int(value)
+                for key, value in cache_manager.free_slot_stats().items()
+                if isinstance(value, (int, bool))
+            },
+        }
+        if self.world_size <= 1:
+            return [payload]
+        gathered = [None for _ in range(self.world_size)] if self.rank == 0 else None
+        dist.gather_object(payload, object_gather_list=gathered, dst=0)
+        return gathered if self.rank == 0 else None
 
     def set_tokenizer_metadata(
         self,

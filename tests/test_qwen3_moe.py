@@ -4,6 +4,7 @@ from multiprocessing import get_context
 from queue import Empty
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
@@ -14,6 +15,7 @@ from sparsevllm.models.qwen3_moe import (
     Qwen3MoeDecoderLayer,
     Qwen3MoeForCausalLM,
     Qwen3MoeMLP,
+    Qwen3MoePiecewiseDecodeCudaGraphState,
     Qwen3MoeSparseMoeBlock,
 )
 from sparsevllm.utils.loader import load_model
@@ -206,6 +208,82 @@ class Qwen3MoeTest(unittest.TestCase):
 
         self.assertEqual(block.gate.num_experts, 3)
         self.assertEqual(block.experts.num_experts, 3)
+
+    def test_deepep_decode_graph_defaults_to_final_only(self):
+        ctx = ParallelContext(
+            global_rank=0,
+            global_world_size=2,
+            tp_size=1,
+            tp_rank=0,
+            ep_size=2,
+            ep_rank=0,
+            local_rank=0,
+        )
+        owner = SimpleNamespace(
+            model=SimpleNamespace(
+                layers=[
+                    SimpleNamespace(
+                        mlp=SimpleNamespace(
+                            experts=SimpleNamespace(expert_parallel_backend="deepep_v2")
+                        )
+                    )
+                ]
+            )
+        )
+        graph_state = SimpleNamespace(key=SimpleNamespace(batch_size=1, context_capacity=1024))
+
+        with parallel_context_scope(ctx), patch.dict(
+            "os.environ",
+            {"SPARSEVLLM_QWEN3_MOE_DEEPEP_PIECEWISE_GRAPH": ""},
+            clear=False,
+        ):
+            state = Qwen3MoePiecewiseDecodeCudaGraphState(owner, graph_state, graph_pool=None)
+            self.assertEqual(state._select_capture_mode(), "final_only")
+
+        with parallel_context_scope(ctx), patch.dict(
+            "os.environ",
+            {"SPARSEVLLM_QWEN3_MOE_DEEPEP_PIECEWISE_GRAPH": "1"},
+            clear=False,
+        ):
+            state = Qwen3MoePiecewiseDecodeCudaGraphState(owner, graph_state, graph_pool=None)
+            self.assertEqual(state._select_capture_mode(), "piecewise")
+
+    def test_final_only_capture_alignment_uses_eager_layers(self):
+        ctx = ParallelContext(
+            global_rank=0,
+            global_world_size=2,
+            tp_size=1,
+            tp_rank=0,
+            ep_size=2,
+            ep_rank=0,
+            local_rank=0,
+        )
+        owner = SimpleNamespace(
+            model=SimpleNamespace(
+                layers=[
+                    SimpleNamespace(
+                        mlp=SimpleNamespace(
+                            experts=SimpleNamespace(expert_parallel_backend="deepep_v2")
+                        )
+                    )
+                ]
+            )
+        )
+        graph_state = SimpleNamespace(key=SimpleNamespace(batch_size=1, context_capacity=1024))
+        calls = []
+
+        with parallel_context_scope(ctx):
+            state = Qwen3MoePiecewiseDecodeCudaGraphState(owner, graph_state, graph_pool=None)
+            state.captured = True
+            state.mode = "final_only"
+            state._run_layers_eager = lambda input_ids, positions, sparse_controller: calls.append("eager")
+            state._run_warmup = lambda input_ids, positions, sparse_controller: calls.append("warmup")
+            state._barrier_ep_ranks = lambda: calls.append("barrier")
+            state._replay_final_only = lambda input_ids, positions, sparse_controller: calls.append("replay")
+
+            state.run(object(), object(), None, force_capture_alignment=True)
+
+        self.assertEqual(calls, ["eager", "barrier", "replay"])
 
     def test_decoder_layer_respects_mlp_only_and_sparse_step(self):
         ctx = ParallelContext(

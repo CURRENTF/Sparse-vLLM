@@ -292,7 +292,8 @@ def dispatch(
         num_experts=int(num_experts),
     )
     graph_capturing = _is_cuda_graph_capturing()
-    graph_compatible = bool(graph_capturing or disable_cpu_sync)
+    graph_compatible = bool(graph_capturing)
+    no_cpu_sync = bool(graph_compatible)
     topk_idx = selected_experts if selected_experts.dtype == torch.int64 else selected_experts.to(torch.int64)
     topk_weights = routing_weights if routing_weights.dtype == torch.float32 else routing_weights.float()
     async_with_compute_stream = bool(_async_with_compute_stream() or allocate_on_comm_stream)
@@ -306,8 +307,8 @@ def dispatch(
         previous_event=previous_event,
         async_with_compute_stream=async_with_compute_stream,
         allocate_on_comm_stream=bool(allocate_on_comm_stream),
-        do_handle_copy=not graph_compatible,
-        do_cpu_sync=not graph_compatible,
+        do_handle_copy=not no_cpu_sync,
+        do_cpu_sync=not no_cpu_sync,
         do_expand=False,
     )
     _wait_current_stream(event)

@@ -567,6 +567,12 @@ class Qwen3MoePiecewiseDecodeCudaGraphState:
         return str(getattr(experts, "expert_parallel_backend", "")).strip().lower() == "deepep_v2"
 
     def _select_capture_mode(self) -> str:
+        if self._uses_deepep_v2():
+            piecewise_enabled = str(
+                os.environ.get("SPARSEVLLM_QWEN3_MOE_DEEPEP_PIECEWISE_GRAPH", "")
+            ).strip().lower() in {"1", "true", "yes", "on"}
+            if not piecewise_enabled:
+                return "final_only"
         return "piecewise"
 
     def _barrier_ep_ranks(self) -> None:
@@ -621,10 +627,8 @@ class Qwen3MoePiecewiseDecodeCudaGraphState:
         context = get_context()
         context.sparse_controller = sparse_controller
         use_graph_compatible_deepep = self._uses_deepep_v2()
-        previous_disable_cpu_sync = getattr(context, "deepep_v2_disable_cpu_sync", None)
         previous_pre_dispatch_barrier = getattr(context, "deepep_v2_pre_dispatch_barrier", None)
         if use_graph_compatible_deepep:
-            context.deepep_v2_disable_cpu_sync = True
             context.deepep_v2_pre_dispatch_barrier = True
         if sparse_controller is not None:
             sparse_controller.prepare_forward(context.seqs, is_prefill=False)
@@ -658,10 +662,6 @@ class Qwen3MoePiecewiseDecodeCudaGraphState:
             _ = self.owner.compute_logits(hidden_states)
         finally:
             if use_graph_compatible_deepep:
-                if previous_disable_cpu_sync is None:
-                    context.deepep_v2_disable_cpu_sync = False
-                else:
-                    context.deepep_v2_disable_cpu_sync = previous_disable_cpu_sync
                 if previous_pre_dispatch_barrier is None:
                     context.deepep_v2_pre_dispatch_barrier = False
                 else:
@@ -676,10 +676,8 @@ class Qwen3MoePiecewiseDecodeCudaGraphState:
         context = get_context()
         context.sparse_controller = sparse_controller
         use_graph_compatible_deepep = self._uses_deepep_v2()
-        previous_disable_cpu_sync = getattr(context, "deepep_v2_disable_cpu_sync", None)
         previous_pre_dispatch_barrier = getattr(context, "deepep_v2_pre_dispatch_barrier", None)
         if use_graph_compatible_deepep:
-            context.deepep_v2_disable_cpu_sync = True
             context.deepep_v2_pre_dispatch_barrier = True
         if sparse_controller is not None:
             sparse_controller.prepare_forward(context.seqs, is_prefill=False)
@@ -704,10 +702,6 @@ class Qwen3MoePiecewiseDecodeCudaGraphState:
             return hidden_states, residual
         finally:
             if use_graph_compatible_deepep:
-                if previous_disable_cpu_sync is None:
-                    context.deepep_v2_disable_cpu_sync = False
-                else:
-                    context.deepep_v2_disable_cpu_sync = previous_disable_cpu_sync
                 if previous_pre_dispatch_barrier is None:
                     context.deepep_v2_pre_dispatch_barrier = False
                 else:
@@ -899,7 +893,6 @@ class Qwen3MoePiecewiseDecodeCudaGraphState:
                     torch.cuda.current_stream(moe_input.device).synchronize()
                     context.deepep_v2_previous_event = None
                     context.deepep_v2_allocate_on_comm_stream = False
-                    context.deepep_v2_disable_cpu_sync = True
                     context.deepep_v2_pre_dispatch_barrier = True
                 if layer_idx == 0 and not self._logged_replay_moe:
                     logger.info("Running eager Qwen3-MoE block after first piecewise graph replay.")
@@ -914,7 +907,6 @@ class Qwen3MoePiecewiseDecodeCudaGraphState:
                     if use_deepep_event:
                         context.deepep_v2_previous_event = None
                         context.deepep_v2_allocate_on_comm_stream = False
-                        context.deepep_v2_disable_cpu_sync = False
                         context.deepep_v2_pre_dispatch_barrier = False
                 if layer_idx == 0 and not self._logged_replay_moe:
                     logger.info("Finished eager Qwen3-MoE block after first piecewise graph replay.")
@@ -941,7 +933,10 @@ class Qwen3MoePiecewiseDecodeCudaGraphState:
             self.capture(input_ids, positions, sparse_controller)
         elif bool(force_capture_alignment) and self._uses_deepep_v2():
             with profiler.record("decode_cuda_graph_piecewise_capture_align_warmup"):
-                self._run_warmup(input_ids, positions, sparse_controller)
+                if self.mode == "final_only":
+                    self._run_layers_eager(input_ids, positions, sparse_controller)
+                else:
+                    self._run_warmup(input_ids, positions, sparse_controller)
 
         if bool(force_capture_alignment) and self._uses_deepep_v2():
             with profiler.record("decode_cuda_graph_piecewise_capture_align_barrier"):

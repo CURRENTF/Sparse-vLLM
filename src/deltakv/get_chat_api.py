@@ -47,6 +47,32 @@ def _as_bool(value):
     return bool(value)
 
 
+def _pop_sparsevllm_generate_micro_batch_size(infer_config: dict) -> int | None:
+    value = infer_config.pop("sparsevllm_generate_micro_batch_size", None)
+    if value is None:
+        value = os.environ.get("SPARSEVLLM_GENERATE_MICRO_BATCH_SIZE")
+    if value is None or value == "":
+        return None
+    size = int(value)
+    if size <= 0:
+        raise ValueError(
+            "sparsevllm_generate_micro_batch_size must be a positive integer "
+            f"or unset, got {value!r}."
+        )
+    return size
+
+
+def _sparsevllm_generate_outputs(llm, prompts, sampling_params, micro_batch_size: int | None):
+    if micro_batch_size is None or len(prompts) <= micro_batch_size:
+        return llm.generate(prompts, sampling_params, use_tqdm=False)
+
+    outputs = []
+    for start in range(0, len(prompts), micro_batch_size):
+        chunk = prompts[start:start + micro_batch_size]
+        outputs.extend(llm.generate(chunk, sampling_params, use_tqdm=False))
+    return outputs
+
+
 def top_k_top_p_filtering(logits, top_k=0, top_p=1.0, filter_value=-float("Inf"), min_tokens_to_keep=1):
     """ Filter a distribution of logits using top-k and/or nucleus (top-p) filtering
         Args:
@@ -263,6 +289,9 @@ def get_generate_api(model_path: str, infer_config: dict, deltakv_checkpoint_pat
         infer_config["deltakv_checkpoint_path"] = deltakv_checkpoint_path
 
     public_infer_config = dict(infer_config)
+    sparsevllm_generate_micro_batch_size = None
+    if str(backend).strip().lower() in {"sparsevllm", "sparse-vllm", "sparse_vllm"}:
+        sparsevllm_generate_micro_batch_size = _pop_sparsevllm_generate_micro_batch_size(public_infer_config)
     normalized_params = normalize_runtime_params(
         public_infer_config,
         backend=backend,
@@ -277,6 +306,11 @@ def get_generate_api(model_path: str, infer_config: dict, deltakv_checkpoint_pat
         # Sparse-vLLM's public LLM entrypoint owns the final normalization. Pass
         # semantic names here so legacy internal field names are not exposed as
         # user-facing kwargs.
+        if sparsevllm_generate_micro_batch_size is not None:
+            logger.info(
+                "Sparse-vLLM generate micro-batching enabled: size={}",
+                sparsevllm_generate_micro_batch_size,
+            )
         
         llm = LLM(
             model_path, 
@@ -303,7 +337,12 @@ def get_generate_api(model_path: str, infer_config: dict, deltakv_checkpoint_pat
                 temperature = 1e-5
             
             sampling_params = SamplingParams(temperature=temperature, top_p=top_p, max_tokens=max_tokens)
-            outputs = llm.generate(prompts, sampling_params, use_tqdm=False)
+            outputs = _sparsevllm_generate_outputs(
+                llm,
+                prompts,
+                sampling_params,
+                sparsevllm_generate_micro_batch_size,
+            )
             
             results = [out['text'] for out in outputs]
             if return_kv_cache:
