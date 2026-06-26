@@ -11,7 +11,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import torch
 from datasets import load_dataset
@@ -81,6 +81,15 @@ def usable_prefix_cache_tokens(prompt_len: int, block_size: int) -> int:
     if block_size <= 0 or prompt_len <= 1:
         return 0
     return ((prompt_len - 1) // block_size) * block_size
+
+
+def common_prefix_len(left: Sequence[int], right: Sequence[int]) -> int:
+    count = 0
+    for left_token, right_token in zip(left, right):
+        if int(left_token) != int(right_token):
+            break
+        count += 1
+    return count
 
 
 def eligible_cache_tokens(reusable_prefix_tokens: int, current_prompt_len: int, block_size: int) -> int:
@@ -208,6 +217,7 @@ class ExampleState:
     example: dict[str, Any]
     encoded: dict[str, Any]
     input_ids: list[int] | None = None
+    cache_prefix_token_ids: list[int] | None = None
     answers: list[str] = field(default_factory=list)
 
 
@@ -391,6 +401,7 @@ class BatchedSparseVLLMGenerator:
                     "prompt_tokens": len(spec.prompt_token_ids),
                     "max_new_tokens": int(spec.max_tokens),
                     "generated_tokens": len(generated_token_ids),
+                    "generated_token_ids": generated_token_ids,
                     "planned_reusable_prefix_tokens": int(spec.reusable_prefix_tokens),
                     "eligible_cache_tokens": int(runtime["eligible_tokens"]),
                     "cached_tokens": cached_tokens,
@@ -498,9 +509,9 @@ def build_turn_specs(
         else:
             max_tokens = int(max_new_tokens)
 
-        reusable_prefix_tokens = len(state.input_ids) if state.input_ids is not None else 0
         if turn_idx == 0:
             prompt_token_ids = [int(token_id) for token_id in encoded["prompts"][0]]
+            reusable_prefix_tokens = 0
         else:
             if state.input_ids is None:
                 state.input_ids = []
@@ -510,9 +521,14 @@ def build_turn_specs(
                     + tokenizer.encode(state.answers[-1], add_special_tokens=False)
                     + [int(tokenizer.eos_token_id)]
                 )
-                reusable_prefix_tokens = len(state.input_ids)
             current_ids = tokenizer.encode(encoded["prompts"][turn_idx], add_special_tokens=False)
             prompt_token_ids = [int(token_id) for token_id in state.input_ids + current_ids]
+            prior_cache_prefix = (
+                state.cache_prefix_token_ids
+                if state.cache_prefix_token_ids is not None
+                else state.input_ids
+            )
+            reusable_prefix_tokens = common_prefix_len(prior_cache_prefix, prompt_token_ids)
 
         specs.append(
             RequestSpec(
@@ -627,6 +643,9 @@ def run_task(
                 state = states[spec.local_idx]
                 answer = seq_outputs[int(trace["seq_id"])]
                 state.input_ids = list(spec.prompt_token_ids)
+                state.cache_prefix_token_ids = list(spec.prompt_token_ids) + [
+                    int(token_id) for token_id in trace.get("generated_token_ids", [])
+                ]
                 state.answers.append(answer)
                 ground_truth = get_ground_truth(state.example, data_name)[spec.turn_idx]
                 row = {

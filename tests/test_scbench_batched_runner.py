@@ -88,6 +88,37 @@ def test_build_turn_specs_reuses_multiturn_history_prefix():
     assert second_specs[0].reusable_prefix_tokens == 2
 
 
+def test_build_turn_specs_counts_cached_decode_continuation_prefix():
+    tokenizer = FakeTokenizer()
+    state = runner.ExampleState(
+        source_idx=7,
+        example={"multi_turns": [{"answer": "gt0"}, {"answer": "gt1"}]},
+        encoded={"prompts": [[1, 2], "predA"], "ground_truth": ["gt0", "gt1"]},
+        input_ids=[1, 2],
+        cache_prefix_token_ids=[1, 2, ord("p"), ord("r"), ord("e"), ord("d")],
+    )
+
+    specs = runner.build_turn_specs(
+        [state],
+        data_name="scbench_kv",
+        tokenizer=tokenizer,
+        turn_idx=1,
+        max_new_tokens=5,
+        disable_golden_context=False,
+    )
+
+    assert specs[0].prompt_token_ids == (
+        1,
+        2,
+        ord("p"),
+        ord("r"),
+        ord("e"),
+        ord("d"),
+        ord("A"),
+    )
+    assert specs[0].reusable_prefix_tokens == 6
+
+
 def test_prefix_summary_reports_cache_reuse(tmp_path):
     trace_path = tmp_path / "prefix_cache_trace_scbench_kv_multi_turn.jsonl"
     summary_path = tmp_path / "prefix_cache_summary_scbench_kv_multi_turn.json"

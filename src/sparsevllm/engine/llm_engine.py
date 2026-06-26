@@ -316,6 +316,15 @@ class LLMEngine:
 
     def _after_warmup_debug_cleanup(self):
         model_runner = getattr(self, "model_runner", None)
+        cache_manager = getattr(model_runner, "cache_manager", None)
+        reset_after_warmup = getattr(cache_manager, "reset_after_warmup", None)
+        if callable(reset_after_warmup):
+            reset_after_warmup()
+        else:
+            reset_prefix_cache = getattr(cache_manager, "reset_prefix_cache", None)
+            if callable(reset_prefix_cache):
+                reset_prefix_cache()
+
         runner = getattr(model_runner, "decode_cuda_graph_runner", None)
         if runner is not None and os.getenv("SPARSEVLLM_DELTAKV_CLEAR_GRAPHS_AFTER_WARMUP", "0") == "1":
             runner.clear_captured_graphs()

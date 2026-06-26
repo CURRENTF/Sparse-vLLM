@@ -19,23 +19,7 @@ from sparsevllm.utils.log import logger, log_level
 from sparsevllm.utils.profiler import profiler
 
 from .base import CacheManager, LayerBatchStates, SparseSelection
-
-
-@dataclass
-class PrefixRuntimeState:
-    parent_block_id: bytes | None
-    next_logical_block_idx: int
-    pending_tokens: list[int]
-    pending_slots: list[torch.Tensor]
-
-
-@dataclass
-class PendingPrefixBlock:
-    stable_block_id: bytes
-    parent_block_id: bytes | None
-    logical_block_idx: int
-    slots: torch.Tensor
-    token_ids: list[int]
+from .prefix_cache_mixin import PrefixCacheMixin
 
 
 @dataclass
@@ -67,7 +51,7 @@ def _complement_ranges(start: int, end: int, ranges: list[tuple[int, int]]) -> l
     return result
 
 
-class StandardCacheManager(CacheManager):
+class StandardCacheManager(PrefixCacheMixin, CacheManager):
 
     def __init__(self, config: Config, rank: int, world_size: int):
         super().__init__(config, rank, world_size)
@@ -98,10 +82,8 @@ class StandardCacheManager(CacheManager):
                 max_blocks=config.prefix_cache_max_blocks,
             )
         self.seq_id_to_prefix_blocks: dict[int, list[PrefixCacheBlock]] = {}
-        self.seq_id_to_materialized_blocks: dict[int, list[PrefixCacheBlock]] = {}
         self.seq_id_to_cached_ranges: dict[int, list[tuple[int, int]]] = {}
-        self.prefix_runtime_states: dict[int, PrefixRuntimeState] = {}
-        self.pending_prefix_blocks: dict[int, list[PendingPrefixBlock]] = {}
+        self._init_prefix_cache_runtime()
 
     def allocate_kv_cache(self):
         available_memory, slot_bytes_per_layer = self._get_available_slots_info()
@@ -271,12 +253,6 @@ class StandardCacheManager(CacheManager):
         seq.prefix_cache_block_size = self.prefix_cache_block_size
         seq.prefix_cache_method = str(self.config.vllm_sparse_method or "")
 
-    def _release_prefix_blocks(self, blocks: list[PrefixCacheBlock]) -> None:
-        for block in blocks:
-            block.ref_count -= 1
-            if block.ref_count < 0:
-                raise RuntimeError("Prefix cache block ref_count became negative.")
-
     def _free_prefix_cache_blocks(self, blocks: list[PrefixCacheBlock]) -> None:
         for block in blocks:
             payload = block.payload
@@ -287,6 +263,28 @@ class StandardCacheManager(CacheManager):
             ptr = self._num_free_slots
             self.free_slots_stack[ptr: ptr + count] = slots
             self._num_free_slots += count
+
+    def _make_prefix_block_payload(self, slots: torch.Tensor) -> StandardPrefixBlockPayload:
+        return StandardPrefixBlockPayload(token_slots=slots)
+
+    def _mark_materialized_prefix_block(self, seq: Sequence, block: PrefixCacheBlock) -> None:
+        cached_ranges = self.seq_id_to_cached_ranges.setdefault(seq.seq_id, [])
+        start = int(block.logical_block_idx) * self.prefix_cache_block_size
+        cached_ranges.append((start, start + self.prefix_cache_block_size))
+
+    def _reset_prefix_cache_allocator_after_clear(self) -> None:
+        if self.seq_id_to_row:
+            raise RuntimeError("Cannot reset prefix cache while Standard sequences are active.")
+        num_slots = int(self.config.num_kvcache_slots)
+        self.free_slots_stack[:num_slots] = torch.arange(num_slots, dtype=torch.int32, device=self.device)
+        self._num_free_slots = num_slots
+        self.seq_id_to_cached_ranges.clear()
+
+    def reset_after_warmup(self) -> None:
+        if self.enable_prefix_caching and self.prefix_cache is not None:
+            self.reset_prefix_cache()
+            return
+        self._reset_prefix_cache_allocator_after_clear()
 
     def _evict_prefix_cache_until_free(self, needed_slots: int) -> None:
         if not self.enable_prefix_caching or self.prefix_cache is None:
@@ -357,58 +355,6 @@ class StandardCacheManager(CacheManager):
         self.row_seq_lens[row_idx] = hit_len
         self.seq_id_to_prefix_blocks[seq.seq_id] = chain
         self.prefix_cache.touch_chain(chain)
-
-    def _record_prefix_materialization(
-        self,
-        seq: Sequence,
-        token_ids: list[int],
-        slots: torch.Tensor,
-    ) -> None:
-        if not self.enable_prefix_caching or self.prefix_cache is None:
-            return
-        if seq.num_completion_tokens != 0:
-            return
-        if len(token_ids) != int(slots.numel()):
-            raise RuntimeError(
-                f"Prefix materialization token/slot mismatch: seq_id={seq.seq_id} "
-                f"tokens={len(token_ids)} slots={int(slots.numel())}."
-            )
-
-        state = self.prefix_runtime_states.get(seq.seq_id)
-        if state is None:
-            hit_blocks = int(getattr(seq, "prefix_cache_hit_block_count", 0) or 0)
-            parent_block_id = getattr(seq, "prefix_cache_hit_last_block_id", None)
-            state = PrefixRuntimeState(
-                parent_block_id=parent_block_id,
-                next_logical_block_idx=hit_blocks,
-                pending_tokens=[],
-                pending_slots=[],
-            )
-            self.prefix_runtime_states[seq.seq_id] = state
-
-        pending_blocks = self.pending_prefix_blocks.setdefault(seq.seq_id, [])
-        for token_id, slot in zip(token_ids, slots):
-            state.pending_tokens.append(int(token_id))
-            state.pending_slots.append(slot.detach().clone().reshape(()))
-            if len(state.pending_tokens) != self.prefix_cache_block_size:
-                continue
-
-            block_tokens = list(state.pending_tokens)
-            block_slots = torch.stack(state.pending_slots).to(dtype=torch.int32)
-            stable_block_id = self.prefix_cache.stable_block_id(block_tokens, state.parent_block_id)
-            pending_blocks.append(
-                PendingPrefixBlock(
-                    stable_block_id=stable_block_id,
-                    parent_block_id=state.parent_block_id,
-                    logical_block_idx=state.next_logical_block_idx,
-                    slots=block_slots,
-                    token_ids=block_tokens,
-                )
-            )
-            state.parent_block_id = stable_block_id
-            state.next_logical_block_idx += 1
-            state.pending_tokens = []
-            state.pending_slots = []
 
     def _get_free_row(self, seq_id: int) -> int:
         if seq_id in self.seq_id_to_row:
@@ -577,51 +523,6 @@ class StandardCacheManager(CacheManager):
             cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, device=self.device)
             return input_ids, positions, cu_seqlens_q
 
-    def on_forward_end(self, seqs: list[Sequence], is_prefill: bool):
-        if not is_prefill or not self.enable_prefix_caching or self.prefix_cache is None:
-            return
-        with profiler.record("prefix_cache_materialize"):
-            for seq in seqs:
-                pending_blocks = self.pending_prefix_blocks.pop(seq.seq_id, [])
-                if not pending_blocks:
-                    continue
-                cached_ranges = self.seq_id_to_cached_ranges.setdefault(seq.seq_id, [])
-                materialized = self.seq_id_to_materialized_blocks.setdefault(seq.seq_id, [])
-                protected: list[PrefixCacheBlock] = []
-                protected_block_ids = {
-                    block_id
-                    for pending in pending_blocks
-                    for block_id in (pending.parent_block_id, pending.stable_block_id)
-                    if block_id is not None and self.prefix_cache.has_block(block_id)
-                }
-                for block_id in protected_block_ids:
-                    block = self.prefix_cache.get_block(block_id)
-                    if block is None:
-                        continue
-                    block.ref_count += 1
-                    protected.append(block)
-                try:
-                    for pending in pending_blocks:
-                        if not self.prefix_cache.has_block(pending.stable_block_id):
-                            self._evict_prefix_cache_for_insert(1)
-                        block = PrefixCacheBlock(
-                            stable_block_id=pending.stable_block_id,
-                            parent_block_id=pending.parent_block_id,
-                            block_size=self.prefix_cache_block_size,
-                            logical_block_idx=pending.logical_block_idx,
-                            payload=StandardPrefixBlockPayload(token_slots=pending.slots),
-                            token_ids=tuple(pending.token_ids),
-                        )
-                        inserted = self.prefix_cache.insert_block(block)
-                        if inserted is not block:
-                            continue
-                        inserted.ref_count = 1
-                        materialized.append(inserted)
-                        start = int(inserted.logical_block_idx) * self.prefix_cache_block_size
-                        cached_ranges.append((start, start + self.prefix_cache_block_size))
-                finally:
-                    self._release_prefix_blocks(protected)
-
     def _prepare_decode(self, seqs: list[Sequence]):
         with profiler.record("cache_prepare_decode"):
             batch_size = len(seqs)
@@ -631,6 +532,8 @@ class StandardCacheManager(CacheManager):
 
             new_slots_batch = self._allocate_batch(seq_ids, 1)
             row_indices = [self.seq_id_to_row[sid] for sid in seq_ids]
+            for seq, slot in zip(seqs, new_slots_batch):
+                self._record_prefix_materialization(seq, [int(seq.last_token)], slot.reshape(1))
             context_lens = torch.tensor(
                 self.row_seq_lens[row_indices],
                 dtype=torch.int32,
@@ -691,6 +594,8 @@ class StandardCacheManager(CacheManager):
 
             new_slots_batch = self._allocate_batch(seq_ids, 1)
             row_indices = [self.seq_id_to_row[sid] for sid in seq_ids]
+            for seq, slot in zip(seqs, new_slots_batch):
+                self._record_prefix_materialization(seq, [int(seq.last_token)], slot.reshape(1))
             real_context_lens = self.row_seq_lens[row_indices]
 
             input_ids[:real_batch_size].copy_(torch.tensor(input_ids_list, dtype=torch.int64, device=self.device))

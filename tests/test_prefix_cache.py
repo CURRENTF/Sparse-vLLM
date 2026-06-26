@@ -86,12 +86,15 @@ def _make_config(**kwargs):
 
 def _make_standard_manager_for_prefix(block_size=2):
     cfg = _cfg(block_size=block_size)
+    cfg.num_kvcache_slots = 90
     fingerprint = build_prefix_cache_fingerprint(cfg, block_size)
     manager = object.__new__(StandardCacheManager)
     manager.config = cfg
+    manager.device = torch.device("cpu")
     manager.enable_prefix_caching = True
     manager.prefix_cache_block_size = block_size
     manager.prefix_cache = RadixPrefixIndex(block_size=block_size, fingerprint=fingerprint)
+    manager.layer_batch_state = SimpleNamespace()
     manager.buffer_req_to_token_slots = torch.zeros((2, 16), dtype=torch.int32)
     manager.free_slots_stack = torch.arange(100, dtype=torch.int32)
     manager._num_free_slots = 90
@@ -99,10 +102,8 @@ def _make_standard_manager_for_prefix(block_size=2):
     manager.free_rows = deque([0, 1])
     manager.row_seq_lens = np.zeros((2,), dtype=np.int32)
     manager.seq_id_to_prefix_blocks = {}
-    manager.seq_id_to_materialized_blocks = {}
     manager.seq_id_to_cached_ranges = {}
-    manager.prefix_runtime_states = {}
-    manager.pending_prefix_blocks = {}
+    manager._init_prefix_cache_runtime()
     return manager
 
 
@@ -111,11 +112,13 @@ def _make_quest_manager_for_prefix(page_size=2):
     fingerprint = build_prefix_cache_fingerprint(cfg, page_size)
     manager = object.__new__(QuestCacheManager)
     manager.config = cfg
+    manager.device = torch.device("cpu")
     manager.enable_prefix_caching = True
     manager.page_size = page_size
     manager.num_pages = 10
     manager.prefix_cache_block_size = page_size
     manager.prefix_cache = RadixPrefixIndex(block_size=page_size, fingerprint=fingerprint)
+    manager.layer_batch_state = SimpleNamespace()
     manager.page_offsets_i32 = torch.arange(page_size, dtype=torch.int32)
     manager.buffer_req_to_token_slots = torch.zeros((2, 16), dtype=torch.int32)
     manager.buffer_req_to_page_slots = torch.full((2, 8), -1, dtype=torch.int32)
@@ -125,10 +128,8 @@ def _make_quest_manager_for_prefix(page_size=2):
     manager.free_rows = deque([0, 1])
     manager.row_seq_lens = np.zeros((2,), dtype=np.int32)
     manager.seq_id_to_prefix_blocks = {}
-    manager.seq_id_to_materialized_blocks = {}
     manager.seq_id_to_cached_pages = {}
-    manager.prefix_runtime_states = {}
-    manager.pending_prefix_blocks = {}
+    manager._init_prefix_cache_runtime()
     return manager
 
 
@@ -454,8 +455,6 @@ def test_config_rejects_unsupported_prefix_cache_methods():
 
 
 def test_config_rejects_unvalidated_prefix_cache_options():
-    with pytest.raises(ValueError, match="decode_blocks"):
-        _make_config(enable_prefix_caching=True, prefix_cache_cache_decode_blocks=True)
     with pytest.raises(ValueError, match="decode_cuda_graph"):
         _make_config(enable_prefix_caching=True, decode_cuda_graph=True)
     with pytest.raises(ValueError, match="quest_chunk_size"):
@@ -665,6 +664,59 @@ def test_standard_materializes_child_after_prefix_hit_with_parent_sensitive_id()
     assert [block.stable_block_id for block in manager.prefix_cache.get_chain(child_id, 2)] == [root_id, child_id]
 
 
+def test_standard_decode_token_completes_pending_prefix_block_by_default():
+    manager = _make_standard_manager_for_prefix(block_size=4)
+    seq = Sequence([1, 2, 3])
+    prompt_slots = manager._allocate(seq.seq_id, 3)
+    manager._record_prefix_materialization(seq, [1, 2, 3], prompt_slots)
+    assert len(manager.prefix_cache) == 0
+    assert manager.pending_prefix_blocks[seq.seq_id] == []
+
+    seq.num_prefilled_tokens = seq.num_prompt_tokens
+    seq.append_token(4)
+    manager._prepare_decode([seq])
+    manager.on_forward_end([seq], is_prefill=False)
+
+    block_id = manager.prefix_cache.stable_block_id([1, 2, 3, 4], None)
+    block = manager.prefix_cache.get_block(block_id)
+    assert block is not None
+    assert block.token_ids == (1, 2, 3, 4)
+    assert block.logical_block_idx == 0
+    assert block.ref_count == 1
+    assert isinstance(block.payload, StandardPrefixBlockPayload)
+    assert block.payload.token_slots.tolist() == [87, 88, 89, 86]
+    assert manager.seq_id_to_cached_ranges[seq.seq_id] == [(0, 4)]
+
+
+def test_standard_reset_prefix_cache_clears_warmup_blocks_and_restores_allocator():
+    manager = _make_standard_manager_for_prefix(block_size=2)
+    seq = Sequence([1, 2, 3, 4])
+    slots = manager._allocate(seq.seq_id, 4)
+    manager._record_prefix_materialization(seq, [1, 2, 3, 4], slots)
+    manager.on_forward_end([seq], is_prefill=True)
+    manager.free_seq(seq.seq_id)
+    assert len(manager.prefix_cache) == 2
+    assert manager._num_free_slots == 86
+
+    manager.reset_prefix_cache()
+
+    assert len(manager.prefix_cache) == 0
+    assert manager._num_free_slots == 90
+    assert manager.free_slots_stack[:90].tolist() == list(range(90))
+
+
+def test_standard_reset_after_warmup_restores_allocator_without_prefix_cache():
+    manager = _make_standard_manager_for_prefix(block_size=2)
+    manager.enable_prefix_caching = False
+    manager.prefix_cache = None
+    manager.free_slots_stack[:90] = torch.tensor(list(range(86)) + [89, 88, 87, 86], dtype=torch.int32)
+
+    manager.reset_after_warmup()
+
+    assert manager._num_free_slots == 90
+    assert manager.free_slots_stack[:90].tolist() == list(range(90))
+
+
 def test_quest_attach_pins_pages_and_free_seq_keeps_cached_page():
     manager = _make_quest_manager_for_prefix(page_size=2)
     seq = Sequence([1, 2, 3])
@@ -774,6 +826,59 @@ def test_quest_materializes_pages_only_after_forward_end():
     assert block.payload.block_slot == 2
     assert block.payload.token_slots.tolist() == [4, 5]
     assert manager.seq_id_to_cached_pages[seq.seq_id] == {0}
+
+
+def test_quest_decode_token_completes_pending_prefix_page_by_default():
+    manager = _make_quest_manager_for_prefix(page_size=4)
+    seq = Sequence([1, 2, 3])
+    prompt_slots = manager._allocate(seq.seq_id, 3)
+    manager._record_prefix_materialization(seq, [1, 2, 3], prompt_slots)
+    assert len(manager.prefix_cache) == 0
+
+    seq.num_prefilled_tokens = seq.num_prompt_tokens
+    seq.append_token(4)
+    manager._prepare_decode([seq])
+    manager.on_forward_end([seq], is_prefill=False)
+
+    block_id = manager.prefix_cache.stable_block_id([1, 2, 3, 4], None)
+    block = manager.prefix_cache.get_block(block_id)
+    assert block is not None
+    assert block.token_ids == (1, 2, 3, 4)
+    assert block.logical_block_idx == 0
+    assert block.ref_count == 1
+    assert isinstance(block.payload, QuestPrefixBlockPayload)
+    assert block.payload.block_slot == 9
+    assert block.payload.token_slots.tolist() == [36, 37, 38, 39]
+    assert manager.seq_id_to_cached_pages[seq.seq_id] == {0}
+
+
+def test_quest_reset_prefix_cache_clears_warmup_pages_and_restores_allocator():
+    manager = _make_quest_manager_for_prefix(page_size=2)
+    seq = Sequence([1, 2, 3, 4])
+    slots = manager._allocate(seq.seq_id, 4)
+    manager._record_prefix_materialization(seq, [1, 2, 3, 4], slots)
+    manager.on_forward_end([seq], is_prefill=True)
+    manager.free_seq(seq.seq_id)
+    assert len(manager.prefix_cache) == 2
+    assert manager._num_free_pages == 8
+
+    manager.reset_prefix_cache()
+
+    assert len(manager.prefix_cache) == 0
+    assert manager._num_free_pages == 10
+    assert manager.free_pages_stack[:10].tolist() == list(range(10))
+
+
+def test_quest_reset_after_warmup_restores_allocator_without_prefix_cache():
+    manager = _make_quest_manager_for_prefix(page_size=2)
+    manager.enable_prefix_caching = False
+    manager.prefix_cache = None
+    manager.free_pages_stack[:10] = torch.tensor([0, 1, 2, 3, 4, 5, 6, 7, 9, 8], dtype=torch.int32)
+
+    manager.reset_after_warmup()
+
+    assert manager._num_free_pages == 10
+    assert manager.free_pages_stack[:10].tolist() == list(range(10))
 
 
 def test_quest_safe_delete_releases_payload_block_slot():

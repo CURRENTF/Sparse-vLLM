@@ -11,7 +11,7 @@ import copy
 import multiprocessing as mp
 from datetime import datetime
 from pathlib import Path
-from typing import Any, List, Tuple
+from typing import Any, List, Sequence, Tuple
 
 # Where to append scbench_eval.log. Default to repo-local outputs unless overridden.
 BASE_PATH = os.environ.get(
@@ -99,6 +99,15 @@ def _usable_prefix_cache_tokens(prompt_len: int, block_size: int) -> int:
     if block_size <= 0 or prompt_len <= 1:
         return 0
     return ((prompt_len - 1) // block_size) * block_size
+
+
+def _common_prefix_len(left: Sequence[int], right: Sequence[int]) -> int:
+    count = 0
+    for left_token, right_token in zip(left, right):
+        if int(left_token) != int(right_token):
+            break
+        count += 1
+    return count
 
 
 def _eligible_cache_tokens(reusable_prefix_tokens: int, current_prompt_len: int, block_size: int) -> int:
@@ -233,6 +242,7 @@ class SparseVLLMSCBenchSearch:
         self.max_steps = int(max_steps)
         self._trace_records: list[dict[str, Any]] = []
         self._request_counter = 0
+        self._last_cache_prefix_token_ids: list[int] | None = None
         self._closed = False
 
     def _cache_stats(self) -> dict[str, int]:
@@ -388,6 +398,7 @@ class SparseVLLMSCBenchSearch:
                 "prompt_tokens": len(prompt_token_ids),
                 "max_new_tokens": max_tokens,
                 "generated_tokens": len(generated_token_ids),
+                "generated_token_ids": generated_token_ids,
                 "planned_reusable_prefix_tokens": int(reusable_prefix_tokens),
                 "eligible_cache_tokens": int(eligible_tokens),
                 "cached_tokens": int(cached_tokens),
@@ -400,6 +411,8 @@ class SparseVLLMSCBenchSearch:
                 "prefix_cache_stats_delta": _numeric_stats_delta(stats_before, stats_after),
             }
             self._trace_records.append(record)
+            if status == "success":
+                self._last_cache_prefix_token_ids = prompt_token_ids + generated_token_ids
 
         return self.tokenizer.decode(generated_token_ids, skip_special_tokens=True)
 
@@ -411,6 +424,7 @@ class SparseVLLMSCBenchSearch:
     def test_scdq(self, example, max_length=100):
         results = []
         init_prompt_ids: list[int] | None = None
+        cache_prefix_token_ids: list[list[int]] = []
         for idx, prompt in enumerate(example["prompts"]):
             if idx == 0:
                 init_prompt_ids = [int(token_id) for token_id in prompt]
@@ -423,15 +437,23 @@ class SparseVLLMSCBenchSearch:
                 raise RuntimeError("SCDQ prompt is missing the shared context prompt.")
             current_ids = self.tokenizer.encode(prompt, add_special_tokens=False)
             input_ids = init_prompt_ids + current_ids
+            reusable_prefix_tokens = len(init_prompt_ids)
+            if cache_prefix_token_ids:
+                reusable_prefix_tokens = max(
+                    _common_prefix_len(prefix, input_ids) for prefix in cache_prefix_token_ids
+                )
             results.append(
                 self._run_one_request(
                     input_ids,
                     max_tokens=int(max_length_per_turn),
                     mode="scdq",
                     turn_idx=idx - 1,
-                    reusable_prefix_tokens=len(init_prompt_ids),
+                    reusable_prefix_tokens=reusable_prefix_tokens,
                 )
             )
+            last_cache_prefix = getattr(self, "_last_cache_prefix_token_ids", None)
+            if last_cache_prefix is not None:
+                cache_prefix_token_ids.append(list(last_cache_prefix))
         output = {"answers": results, "gt": example["ground_truth"]}
         if isinstance(max_length, dict):
             output["task"] = example["task"]
@@ -440,27 +462,33 @@ class SparseVLLMSCBenchSearch:
     def test(self, example, max_length=100, disable_golden_context=False):
         results = []
         input_ids: list[int] | None = None
+        cache_prefix_token_ids: list[int] | None = None
         for idx, prompt in enumerate(example["prompts"]):
             if isinstance(max_length, dict):
                 max_length_per_turn = max_length[example["task"][idx]]
             else:
                 max_length_per_turn = max_length
 
-            reusable_prefix_tokens = len(input_ids) if input_ids is not None else 0
             if idx == 0:
                 input_ids = [int(token_id) for token_id in prompt]
+                reusable_prefix_tokens = 0
             else:
                 current_ids = self.tokenizer.encode(prompt, add_special_tokens=False)
                 if input_ids is None:
                     input_ids = []
+                prior_input_ids = input_ids
                 if disable_golden_context and results:
                     input_ids = (
                         input_ids
                         + self.tokenizer.encode(results[-1], add_special_tokens=False)
                         + [self.tokenizer.eos_token_id]
                     )
-                    reusable_prefix_tokens = len(input_ids)
+                    prior_input_ids = input_ids
                 input_ids = input_ids + current_ids
+                reusable_prefix_tokens = _common_prefix_len(
+                    cache_prefix_token_ids if cache_prefix_token_ids is not None else prior_input_ids,
+                    input_ids,
+                )
 
             answer = self._run_one_request(
                 input_ids,
@@ -470,6 +498,9 @@ class SparseVLLMSCBenchSearch:
                 reusable_prefix_tokens=reusable_prefix_tokens,
             )
             results.append(answer)
+            last_cache_prefix = getattr(self, "_last_cache_prefix_token_ids", None)
+            if last_cache_prefix is not None:
+                cache_prefix_token_ids = list(last_cache_prefix)
         output = {"answers": results, "gt": example["ground_truth"]}
         if isinstance(max_length, dict):
             output["task"] = example["task"]

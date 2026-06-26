@@ -210,7 +210,6 @@ class Config:
     prefix_cache_block_size: int | None = None
     prefix_cache_max_blocks: int | None = None
     prefix_cache_salt: str = ""
-    prefix_cache_cache_decode_blocks: bool = False
 
     # General Sparse Config
     num_sink_tokens: int = 64
@@ -404,10 +403,6 @@ class Config:
                 f"Supported methods: '', {supported}."
             )
         self.enable_prefix_caching = _coerce_bool_config("enable_prefix_caching", self.enable_prefix_caching)
-        self.prefix_cache_cache_decode_blocks = _coerce_bool_config(
-            "prefix_cache_cache_decode_blocks",
-            self.prefix_cache_cache_decode_blocks,
-        )
         self.prefix_cache_block_size = _coerce_optional_positive_int(
             "prefix_cache_block_size",
             self.prefix_cache_block_size,
@@ -418,8 +413,6 @@ class Config:
         )
         if self.enable_prefix_caching and self.vllm_sparse_method not in PREFIX_CACHE_SUPPORTED_METHODS:
             raise ValueError("prefix caching only supports vanilla, omnikv, quest.")
-        if self.prefix_cache_cache_decode_blocks:
-            raise ValueError("prefix_cache_cache_decode_blocks is not supported yet.")
         self.prefix_cache_salt = str(self.prefix_cache_salt or "")
         self.prefill_schedule_policy = resolve_prefill_schedule_policy(
             self.vllm_sparse_method,
