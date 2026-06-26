@@ -470,6 +470,9 @@ class CacheManager(ABC):
 
     def decode_cuda_graph_force_eager(self) -> bool:
         """Whether this method should bypass graph replay for diagnostics."""
+        hf_config = getattr(self.config, "hf_config", None)
+        if getattr(hf_config, "model_type", "") == "qwen3_moe":
+            return True
         return False
 
     def on_forward_end(self, seqs: list[Sequence], is_prefill: bool):

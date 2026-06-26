@@ -9,6 +9,7 @@ import torch
 from sparsevllm.engine.sequence import Sequence
 import sparsevllm.platforms as platforms
 from sparsevllm.utils.context import get_context, set_context
+from sparsevllm.utils.log import log_once
 from sparsevllm.utils.profiler import profiler
 
 
@@ -474,6 +475,12 @@ class DecodeCudaGraphRunner:
         real_batch_size = len(seqs)
         force_eager = getattr(self.cache_manager, "decode_cuda_graph_force_eager", None)
         if force_eager is not None and force_eager():
+            log_once(
+                "decode_cuda_graph is enabled, but this model/cache path requested static eager decode. "
+                "Current Qwen3-MoE expert execution is not monolithic CUDA graph capture-safe; "
+                "piecewise graph capture must keep MoE outside captured regions.",
+                level="WARNING",
+            )
             return self.run_eager_static(seqs), None
 
         graph_batch_size = self._select_graph_batch_size(real_batch_size)

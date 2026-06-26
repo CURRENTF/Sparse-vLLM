@@ -208,6 +208,10 @@ class ModelRunner:
 
     def exit(self):
         """释放资源并注销分布式进程组"""
+        if str(getattr(self.config, "expert_parallel_backend", "") or "").lower() == "deepep_v2":
+            from sparsevllm.engine.expert_parallel.deepep_v2 import destroy_cached_buffers
+
+            destroy_cached_buffers()
         if self.world_size > 1:
             self.shm.close()
             dist.barrier(device_ids=self.platform.barrier_device_ids(self.rank))
@@ -650,6 +654,12 @@ class ModelRunner:
             token_ids = [] if token_ids is None else [int(token_id) for token_id in token_ids]
             if logprob_outputs is None:
                 logprob_outputs = ([None] * len(local_seqs), [None] * len(local_seqs))
+            else:
+                token_logprobs, top_logprobs = logprob_outputs
+                logprob_outputs = (
+                    [None] * len(local_seqs) if token_logprobs is None else token_logprobs,
+                    [None] * len(local_seqs) if top_logprobs is None else top_logprobs,
+                )
         else:
             self._run_empty_deepep_v2_collectives()
             token_ids = []

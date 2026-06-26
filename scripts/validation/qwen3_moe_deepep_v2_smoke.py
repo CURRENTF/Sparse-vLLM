@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.metadata as importlib_metadata
 import json
 import os
 import socket
@@ -12,14 +13,22 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
+from sparsevllm.engine.expert_parallel.deepep_v2 import destroy_cached_buffers
 from sparsevllm.models.qwen3_moe import Qwen3MoeSparseMoeBlock
 from sparsevllm.utils.parallel_context import ParallelContext, parallel_context_scope
+
+
+def package_version(name: str) -> str | None:
+    try:
+        return importlib_metadata.version(name)
+    except importlib_metadata.PackageNotFoundError:
+        return None
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Validate Qwen3-MoE DeepEP v2 dispatch/combine.")
     parser.add_argument("--output-json", type=Path, required=True)
-    parser.add_argument("--hidden-size", type=int, default=8)
+    parser.add_argument("--hidden-size", type=int, default=256)
     parser.add_argument("--intermediate-size", type=int, default=4)
     parser.add_argument("--num-experts", type=int, default=4)
     parser.add_argument("--top-k", type=int, default=2)
@@ -29,6 +38,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def tiny_config(args: argparse.Namespace) -> SimpleNamespace:
+    if int(args.hidden_size) % 256 != 0:
+        raise ValueError("DeepEP v2 smoke requires hidden_size to be a multiple of 256.")
     return SimpleNamespace(
         hidden_size=int(args.hidden_size),
         intermediate_size=int(args.intermediate_size) * 2,
@@ -212,6 +223,12 @@ def main() -> None:
             "torch_version": torch.__version__,
             "torch_cuda": torch.version.cuda,
             "nccl_version": str(torch.cuda.nccl.version()),
+            "nvidia_nccl_cu13": package_version("nvidia-nccl-cu13"),
+            "nvidia_nccl_cu12": package_version("nvidia-nccl-cu12"),
+            "nvidia_nvshmem_cu13": package_version("nvidia-nvshmem-cu13"),
+            "nvidia_nvshmem_cu12": package_version("nvidia-nvshmem-cu12"),
+            "ep_disable_gin": os.environ.get("EP_DISABLE_GIN"),
+            "ep_jit_cache_dir": os.environ.get("EP_JIT_CACHE_DIR"),
             "rtol": float(args.rtol),
             "atol": float(args.atol),
             "ranks": gathered,
@@ -221,6 +238,7 @@ def main() -> None:
         args.output_json.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         print(json.dumps(result, indent=2, sort_keys=True))
 
+    destroy_cached_buffers()
     dist.barrier()
     dist.destroy_process_group()
     if int(failed.item()) != 0:

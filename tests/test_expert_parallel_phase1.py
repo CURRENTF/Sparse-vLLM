@@ -223,6 +223,13 @@ class ExpertParallelPhase1Test(unittest.TestCase):
 
         self.assertEqual(cache_manager.device, cache_manager.platform.get_device(0))
 
+    def test_qwen3_moe_decode_graph_forces_static_eager_until_piecewise_graph(self):
+        cfg = self._config()
+        cfg.hf_config.model_type = "qwen3_moe"
+        cache_manager = DummyCacheManager(cfg, rank=0, world_size=cfg.tensor_parallel_size)
+
+        self.assertTrue(cache_manager.decode_cuda_graph_force_eager())
+
 
 if __name__ == "__main__":
     unittest.main()

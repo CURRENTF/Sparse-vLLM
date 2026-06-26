@@ -54,6 +54,39 @@ def _use_graph_scaled_warmup(config: Config) -> bool:
     return _deltakv_graph_warmup_profile(config) == "graph"
 
 
+def _decode_graph_warmup_prompt_len(
+    config: Config,
+    requested_len: int,
+    num_seqs: int,
+    graph_sized_batch: bool,
+) -> int:
+    requested_len = int(requested_len)
+    if requested_len <= 0:
+        raise ValueError(f"warmup requested_len must be > 0, got {requested_len}.")
+    num_seqs = int(num_seqs)
+    if num_seqs <= 0:
+        raise ValueError(f"warmup num_seqs must be > 0, got {num_seqs}.")
+
+    explicit_len = getattr(config, "decode_cuda_graph_warmup_prompt_len", None)
+    if explicit_len is not None:
+        explicit_len = int(explicit_len)
+        if explicit_len <= 0:
+            raise ValueError(
+                "decode_cuda_graph_warmup_prompt_len must be > 0 when set, "
+                f"got {explicit_len}."
+            )
+        return explicit_len
+
+    if graph_sized_batch and num_seqs > 1:
+        max_num_batched_tokens = int(getattr(config, "max_num_batched_tokens", requested_len) or requested_len)
+        if max_num_batched_tokens <= 0:
+            raise ValueError(f"max_num_batched_tokens must be > 0, got {max_num_batched_tokens}.")
+        batch_budget_len = max(1, max_num_batched_tokens // num_seqs)
+        return min(requested_len, batch_budget_len)
+
+    return requested_len
+
+
 class _ThroughputIntervalLogger:
     def __init__(self, interval_s: float):
         self._interval_s = float(interval_s)
@@ -292,12 +325,23 @@ class LLMEngine:
         logger.info("Warming up the engine...")
         
         # 预热只需触发算子编译，使用固定短长度即可
-        warmup_len = self.config.num_sink_tokens + self.config.decode_keep_tokens\
-                     + self.config.num_recent_tokens + self.config.chunk_prefill_size + 1024
+        requested_warmup_len = self.config.num_sink_tokens + self.config.decode_keep_tokens\
+                               + self.config.num_recent_tokens + self.config.chunk_prefill_size + 1024
         warmup_profile = _deltakv_graph_warmup_profile(self.config)
         graph_sized_batch = warmup_profile in ("graph", "big_prefill_only")
         decode_warmup = warmup_profile in ("graph", "decode_1seq")
         num_seqs = int(self.config.max_decoding_seqs) if graph_sized_batch else 1
+        warmup_len = _decode_graph_warmup_prompt_len(
+            self.config,
+            requested_warmup_len,
+            num_seqs,
+            graph_sized_batch,
+        )
+        if warmup_len < requested_warmup_len:
+            logger.info(
+                f"Capped graph warmup prompt length from {requested_warmup_len} to {warmup_len} "
+                f"for num_seqs={num_seqs} and max_num_batched_tokens={self.config.max_num_batched_tokens}."
+            )
         
         # 预热 1 个 Token 的生成（包含 Prefill 和 Decode）
         sampling_params = SamplingParams(

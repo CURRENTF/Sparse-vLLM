@@ -18,7 +18,11 @@ from sparsevllm.engine.cache_manager.deltakv_less_memory_cuda_graph import (
 )
 from sparsevllm.engine.cache_manager.snapkv import SnapKVCacheManager
 from sparsevllm.engine.decode_cuda_graph import DecodeCudaGraphKey, DecodeCudaGraphRunner, DecodeCudaGraphState
-from sparsevllm.engine.llm_engine import _deltakv_graph_warmup_profile, _use_graph_scaled_warmup
+from sparsevllm.engine.llm_engine import (
+    _decode_graph_warmup_prompt_len,
+    _deltakv_graph_warmup_profile,
+    _use_graph_scaled_warmup,
+)
 from sparsevllm.engine.scheduler import Scheduler
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.engine.sparse_controller import SparseController
@@ -740,6 +744,38 @@ class DecodeCudaGraphWarmupPolicyTest(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(_deltakv_graph_warmup_profile(self.make_config(method="omnikv")), "graph")
             self.assertTrue(_use_graph_scaled_warmup(self.make_config(method="omnikv")))
+
+    def test_graph_sized_warmup_caps_prompt_to_batch_budget(self):
+        cfg = SimpleNamespace(
+            decode_cuda_graph_warmup_prompt_len=None,
+            max_num_batched_tokens=65536,
+        )
+
+        self.assertEqual(
+            _decode_graph_warmup_prompt_len(
+                cfg,
+                requested_len=9792,
+                num_seqs=500,
+                graph_sized_batch=True,
+            ),
+            131,
+        )
+
+    def test_graph_warmup_prompt_override_is_respected(self):
+        cfg = SimpleNamespace(
+            decode_cuda_graph_warmup_prompt_len=16,
+            max_num_batched_tokens=65536,
+        )
+
+        self.assertEqual(
+            _decode_graph_warmup_prompt_len(
+                cfg,
+                requested_len=9792,
+                num_seqs=500,
+                graph_sized_batch=True,
+            ),
+            16,
+        )
 
 
 class DeltaKVLessMemoryCudaGraphReserveTest(unittest.TestCase):

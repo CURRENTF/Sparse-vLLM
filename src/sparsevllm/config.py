@@ -244,6 +244,9 @@ class Config:
     decode_cuda_graph_context_policy: str = "current"
     # Optional LRU cap for captured graphs.  None keeps all bucketed graphs.
     decode_cuda_graph_max_cached_graphs: int | None = None
+    # Optional synthetic prompt length used only by engine warmup before decode
+    # CUDA graph capture. None uses a batch-budgeted length.
+    decode_cuda_graph_warmup_prompt_len: int | None = None
     omnikv_decode_cuda_graph: bool = False
     sparse_attn_score_dtype: str = "float32"
     decode_graph: bool | None = None
@@ -640,6 +643,10 @@ class Config:
                     "decode_cuda_graph_max_cached_graphs must be a positive integer or None, "
                     f"got {self.decode_cuda_graph_max_cached_graphs}."
                 )
+        self.decode_cuda_graph_warmup_prompt_len = _coerce_optional_positive_int(
+            "decode_cuda_graph_warmup_prompt_len",
+            self.decode_cuda_graph_warmup_prompt_len,
+        )
         if self.omnikv_decode_cuda_graph:
             if self.vllm_sparse_method != "omnikv":
                 raise ValueError(
