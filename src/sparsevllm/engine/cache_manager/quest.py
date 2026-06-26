@@ -276,10 +276,11 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
         usable_tokens = usable_prefix_cache_tokens(seq.num_prompt_tokens, self.page_size)
         if usable_tokens <= 0:
             return
-        hit_len, last_block_id, hit_blocks = self.prefix_cache.lookup_longest_prefix(
-            seq.prompt_token_ids,
-            max_usable_tokens=usable_tokens,
-        )
+        with profiler.record("quest_prefix_cache_lookup"):
+            hit_len, last_block_id, hit_blocks = self.prefix_cache.lookup_longest_prefix(
+                seq.prompt_token_ids,
+                max_usable_tokens=usable_tokens,
+            )
         if hit_len <= 0:
             return
         if last_block_id is None or hit_blocks <= 0:
@@ -373,13 +374,15 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
             return
         missing_slots = needed_slots - int(self.num_free_slots)
         needed_pages = (missing_slots + self.page_size - 1) // self.page_size
-        evicted = self.prefix_cache.evict_until_freeable(needed_pages)
+        with profiler.record("quest_prefix_cache_evict"):
+            evicted = self.prefix_cache.evict_until_freeable(needed_pages)
         self._free_prefix_cache_blocks(evicted)
 
     def _evict_prefix_cache_for_insert(self, needed_blocks: int = 1) -> None:
         if not self.enable_prefix_caching or self.prefix_cache is None:
             return
-        evicted = self.prefix_cache.ensure_insert_capacity(needed_blocks)
+        with profiler.record("quest_prefix_cache_evict"):
+            evicted = self.prefix_cache.ensure_insert_capacity(needed_blocks)
         self._free_prefix_cache_blocks(evicted)
 
     def _attach_prefix_cache_if_needed(self, seq: Sequence) -> None:
@@ -390,51 +393,52 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
             return
         if seq.seq_id in self.seq_id_to_prefix_blocks:
             return
-        if seq.prefix_cache_hit_last_block_id is None:
-            raise RuntimeError(f"seq_id={seq.seq_id} has Quest prefix hit length but no last block id.")
-        if hit_len % self.page_size != 0:
-            raise RuntimeError(
-                f"seq_id={seq.seq_id} Quest prefix hit length is not page aligned: "
-                f"hit_len={hit_len} page_size={self.page_size}."
-            )
-        chain = self.prefix_cache.get_chain(
-            seq.prefix_cache_hit_last_block_id,
-            int(seq.prefix_cache_hit_block_count),
-        )
-        if len(chain) * self.page_size != hit_len:
-            raise RuntimeError(
-                "Quest prefix cache chain length does not match scheduler metadata: "
-                f"seq_id={seq.seq_id} hit_len={hit_len} blocks={len(chain)} page_size={self.page_size}."
-            )
-        row_idx = self._get_free_row(seq.seq_id)
-        if int(self.row_seq_lens[row_idx]) != 0:
-            raise RuntimeError(
-                f"Cannot attach Quest prefix cache to non-empty row: seq_id={seq.seq_id} "
-                f"row_idx={row_idx} row_len={int(self.row_seq_lens[row_idx])}."
-            )
-
-        cached_pages = self.seq_id_to_cached_pages.setdefault(seq.seq_id, set())
-        for block in chain:
-            payload = block.payload
-            if not isinstance(payload, QuestPrefixBlockPayload):
+        with profiler.record("quest_prefix_cache_attach"):
+            if seq.prefix_cache_hit_last_block_id is None:
+                raise RuntimeError(f"seq_id={seq.seq_id} has Quest prefix hit length but no last block id.")
+            if hit_len % self.page_size != 0:
                 raise RuntimeError(
-                    f"Invalid Quest prefix cache block page for seq_id={seq.seq_id}: "
-                    f"logical_block_idx={block.logical_block_idx}."
+                    f"seq_id={seq.seq_id} Quest prefix hit length is not page aligned: "
+                    f"hit_len={hit_len} page_size={self.page_size}."
                 )
-            page_idx = int(block.logical_block_idx)
-            start = page_idx * self.page_size
-            end = start + self.page_size
-            page_slot = int(payload.block_slot)
-            self.buffer_req_to_page_slots[row_idx, page_idx] = page_slot
-            self._validate_page_slots(payload.token_slots, page_slot)
-            slots = payload.token_slots
-            self.buffer_req_to_token_slots[row_idx, start:end] = slots
-            block.ref_count += 1
-            cached_pages.add(page_idx)
+            chain = self.prefix_cache.get_chain(
+                seq.prefix_cache_hit_last_block_id,
+                int(seq.prefix_cache_hit_block_count),
+            )
+            if len(chain) * self.page_size != hit_len:
+                raise RuntimeError(
+                    "Quest prefix cache chain length does not match scheduler metadata: "
+                    f"seq_id={seq.seq_id} hit_len={hit_len} blocks={len(chain)} page_size={self.page_size}."
+                )
+            row_idx = self._get_free_row(seq.seq_id)
+            if int(self.row_seq_lens[row_idx]) != 0:
+                raise RuntimeError(
+                    f"Cannot attach Quest prefix cache to non-empty row: seq_id={seq.seq_id} "
+                    f"row_idx={row_idx} row_len={int(self.row_seq_lens[row_idx])}."
+                )
 
-        self.row_seq_lens[row_idx] = hit_len
-        self.seq_id_to_prefix_blocks[seq.seq_id] = chain
-        self.prefix_cache.touch_chain(chain)
+            cached_pages = self.seq_id_to_cached_pages.setdefault(seq.seq_id, set())
+            for block in chain:
+                payload = block.payload
+                if not isinstance(payload, QuestPrefixBlockPayload):
+                    raise RuntimeError(
+                        f"Invalid Quest prefix cache block page for seq_id={seq.seq_id}: "
+                        f"logical_block_idx={block.logical_block_idx}."
+                    )
+                page_idx = int(block.logical_block_idx)
+                start = page_idx * self.page_size
+                end = start + self.page_size
+                page_slot = int(payload.block_slot)
+                self.buffer_req_to_page_slots[row_idx, page_idx] = page_slot
+                self._validate_page_slots(payload.token_slots, page_slot)
+                slots = payload.token_slots
+                self.buffer_req_to_token_slots[row_idx, start:end] = slots
+                block.ref_count += 1
+                cached_pages.add(page_idx)
+
+            self.row_seq_lens[row_idx] = hit_len
+            self.seq_id_to_prefix_blocks[seq.seq_id] = chain
+            self.prefix_cache.touch_chain(chain)
 
     def _get_free_row(self, seq_id: int) -> int:
         if seq_id in self.seq_id_to_row:

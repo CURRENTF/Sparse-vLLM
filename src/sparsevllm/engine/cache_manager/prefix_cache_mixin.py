@@ -100,6 +100,8 @@ class PrefixCacheMixin:
                 f"{self._prefix_cache_materialization_subject()} token/slot mismatch: "
                 f"seq_id={seq.seq_id} tokens={len(token_ids)} slots={int(slots.numel())}."
             )
+        if not token_ids:
+            return
 
         state = self.prefix_runtime_states.get(seq.seq_id)
         if state is None:
@@ -115,14 +117,10 @@ class PrefixCacheMixin:
 
         pending_blocks = self.pending_prefix_blocks.setdefault(seq.seq_id, [])
         block_size = int(self.prefix_cache_block_size)
-        for token_id, slot in zip(token_ids, slots):
-            state.pending_tokens.append(int(token_id))
-            state.pending_slots.append(slot.detach().clone().reshape(()))
-            if len(state.pending_tokens) != block_size:
-                continue
+        token_ids = [int(token_id) for token_id in token_ids]
+        slots = slots.detach().to(dtype=torch.int32).reshape(-1).clone()
 
-            block_tokens = list(state.pending_tokens)
-            block_slots = torch.stack(state.pending_slots).to(dtype=torch.int32)
+        def add_block(block_tokens: list[int], block_slots: torch.Tensor) -> None:
             stable_block_id = self.prefix_cache.stable_block_id(block_tokens, state.parent_block_id)
             pending_blocks.append(
                 PendingPrefixBlock(
@@ -136,6 +134,36 @@ class PrefixCacheMixin:
             )
             state.parent_block_id = stable_block_id
             state.next_logical_block_idx += 1
+
+        offset = 0
+        if state.pending_tokens:
+            need = block_size - len(state.pending_tokens)
+            take = min(need, len(token_ids))
+            state.pending_tokens.extend(token_ids[:take])
+            state.pending_slots.append(slots[:take])
+            offset = take
+            if len(state.pending_tokens) == block_size:
+                block_tokens = list(state.pending_tokens)
+                block_slots = torch.cat(state.pending_slots, dim=0)
+                add_block(block_tokens, block_slots)
+                state.pending_tokens = []
+                state.pending_slots = []
+            else:
+                return
+
+        full_tokens = ((len(token_ids) - offset) // block_size) * block_size
+        end_full = offset + full_tokens
+        for block_start in range(offset, end_full, block_size):
+            block_end = block_start + block_size
+            add_block(
+                token_ids[block_start:block_end],
+                slots[block_start:block_end],
+            )
+
+        if end_full < len(token_ids):
+            state.pending_tokens = token_ids[end_full:]
+            state.pending_slots = [slots[end_full:]]
+        else:
             state.pending_tokens = []
             state.pending_slots = []
 

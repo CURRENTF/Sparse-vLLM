@@ -232,10 +232,11 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
         usable_tokens = usable_prefix_cache_tokens(seq.num_prompt_tokens, self.prefix_cache_block_size)
         if usable_tokens <= 0:
             return
-        hit_len, last_block_id, hit_blocks = self.prefix_cache.lookup_longest_prefix(
-            seq.prompt_token_ids,
-            max_usable_tokens=usable_tokens,
-        )
+        with profiler.record("prefix_cache_lookup"):
+            hit_len, last_block_id, hit_blocks = self.prefix_cache.lookup_longest_prefix(
+                seq.prompt_token_ids,
+                max_usable_tokens=usable_tokens,
+            )
         if hit_len <= 0:
             return
         if last_block_id is None or hit_blocks <= 0:
@@ -294,13 +295,15 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
             return
         missing_slots = needed_slots - int(self._num_free_slots)
         needed_blocks = (missing_slots + self.prefix_cache_block_size - 1) // self.prefix_cache_block_size
-        evicted = self.prefix_cache.evict_until_freeable(needed_blocks)
+        with profiler.record("prefix_cache_evict"):
+            evicted = self.prefix_cache.evict_until_freeable(needed_blocks)
         self._free_prefix_cache_blocks(evicted)
 
     def _evict_prefix_cache_for_insert(self, needed_blocks: int = 1) -> None:
         if not self.enable_prefix_caching or self.prefix_cache is None:
             return
-        evicted = self.prefix_cache.ensure_insert_capacity(needed_blocks)
+        with profiler.record("prefix_cache_evict"):
+            evicted = self.prefix_cache.ensure_insert_capacity(needed_blocks)
         self._free_prefix_cache_blocks(evicted)
 
     def _attach_prefix_cache_if_needed(self, seq: Sequence) -> None:
@@ -311,50 +314,51 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
             return
         if seq.seq_id in self.seq_id_to_prefix_blocks:
             return
-        if seq.prefix_cache_hit_last_block_id is None:
-            raise RuntimeError(f"seq_id={seq.seq_id} has prefix hit length but no last block id.")
-        if hit_len % self.prefix_cache_block_size != 0:
-            raise RuntimeError(
-                f"seq_id={seq.seq_id} prefix hit length is not block aligned: "
-                f"hit_len={hit_len} block_size={self.prefix_cache_block_size}."
-            )
-        chain = self.prefix_cache.get_chain(
-            seq.prefix_cache_hit_last_block_id,
-            int(seq.prefix_cache_hit_block_count),
-        )
-        if len(chain) * self.prefix_cache_block_size != hit_len:
-            raise RuntimeError(
-                "Prefix cache chain length does not match scheduler metadata: "
-                f"seq_id={seq.seq_id} hit_len={hit_len} blocks={len(chain)} "
-                f"block_size={self.prefix_cache_block_size}."
-            )
-        row_idx = self._get_free_row(seq.seq_id)
-        if int(self.row_seq_lens[row_idx]) != 0:
-            raise RuntimeError(
-                f"Cannot attach prefix cache to non-empty row: seq_id={seq.seq_id} "
-                f"row_idx={row_idx} row_len={int(self.row_seq_lens[row_idx])}."
-            )
-
-        cached_ranges = self.seq_id_to_cached_ranges.setdefault(seq.seq_id, [])
-        for block in chain:
-            payload = block.payload
-            if (
-                not isinstance(payload, StandardPrefixBlockPayload)
-                or int(payload.token_slots.numel()) != self.prefix_cache_block_size
-            ):
+        with profiler.record("prefix_cache_attach"):
+            if seq.prefix_cache_hit_last_block_id is None:
+                raise RuntimeError(f"seq_id={seq.seq_id} has prefix hit length but no last block id.")
+            if hit_len % self.prefix_cache_block_size != 0:
                 raise RuntimeError(
-                    f"Invalid Standard prefix cache block slots for seq_id={seq.seq_id}: "
-                    f"logical_block_idx={block.logical_block_idx}."
+                    f"seq_id={seq.seq_id} prefix hit length is not block aligned: "
+                    f"hit_len={hit_len} block_size={self.prefix_cache_block_size}."
                 )
-            start = int(block.logical_block_idx) * self.prefix_cache_block_size
-            end = start + self.prefix_cache_block_size
-            self.buffer_req_to_token_slots[row_idx, start:end] = payload.token_slots
-            block.ref_count += 1
-            cached_ranges.append((start, end))
+            chain = self.prefix_cache.get_chain(
+                seq.prefix_cache_hit_last_block_id,
+                int(seq.prefix_cache_hit_block_count),
+            )
+            if len(chain) * self.prefix_cache_block_size != hit_len:
+                raise RuntimeError(
+                    "Prefix cache chain length does not match scheduler metadata: "
+                    f"seq_id={seq.seq_id} hit_len={hit_len} blocks={len(chain)} "
+                    f"block_size={self.prefix_cache_block_size}."
+                )
+            row_idx = self._get_free_row(seq.seq_id)
+            if int(self.row_seq_lens[row_idx]) != 0:
+                raise RuntimeError(
+                    f"Cannot attach prefix cache to non-empty row: seq_id={seq.seq_id} "
+                    f"row_idx={row_idx} row_len={int(self.row_seq_lens[row_idx])}."
+                )
 
-        self.row_seq_lens[row_idx] = hit_len
-        self.seq_id_to_prefix_blocks[seq.seq_id] = chain
-        self.prefix_cache.touch_chain(chain)
+            cached_ranges = self.seq_id_to_cached_ranges.setdefault(seq.seq_id, [])
+            for block in chain:
+                payload = block.payload
+                if (
+                    not isinstance(payload, StandardPrefixBlockPayload)
+                    or int(payload.token_slots.numel()) != self.prefix_cache_block_size
+                ):
+                    raise RuntimeError(
+                        f"Invalid Standard prefix cache block slots for seq_id={seq.seq_id}: "
+                        f"logical_block_idx={block.logical_block_idx}."
+                    )
+                start = int(block.logical_block_idx) * self.prefix_cache_block_size
+                end = start + self.prefix_cache_block_size
+                self.buffer_req_to_token_slots[row_idx, start:end] = payload.token_slots
+                block.ref_count += 1
+                cached_ranges.append((start, end))
+
+            self.row_seq_lens[row_idx] = hit_len
+            self.seq_id_to_prefix_blocks[seq.seq_id] = chain
+            self.prefix_cache.touch_chain(chain)
 
     def _get_free_row(self, seq_id: int) -> int:
         if seq_id in self.seq_id_to_row:

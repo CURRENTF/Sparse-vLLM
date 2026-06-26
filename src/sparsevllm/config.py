@@ -563,10 +563,6 @@ class Config:
                         "prefix caching with decode_cuda_graph does not support "
                         "decode_cuda_graph_capture_sampling=True yet."
                     )
-                if self.tensor_parallel_size > 1:
-                    raise ValueError(
-                        "prefix caching with decode_cuda_graph supports tensor_parallel_size=1 only."
-                    )
             if self.tensor_parallel_size > 1:
                 if self.decode_cuda_graph_capture_sampling:
                     raise ValueError(

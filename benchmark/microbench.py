@@ -277,6 +277,37 @@ def _decode_cuda_graph_status(llm) -> dict[str, Any]:
     }
 
 
+def _cache_stats(llm) -> dict[str, int]:
+    cache_manager = getattr(getattr(llm, "model_runner", None), "cache_manager", None)
+    if cache_manager is None or not hasattr(cache_manager, "free_slot_stats"):
+        return {}
+    raw_stats = cache_manager.free_slot_stats()
+    return {
+        str(key): int(value)
+        for key, value in raw_stats.items()
+        if isinstance(value, (int, float, bool))
+    }
+
+
+def _numeric_delta(before: dict[str, int], after: dict[str, int]) -> dict[str, int]:
+    return {
+        key: int(after.get(key, 0)) - int(before.get(key, 0))
+        for key in sorted(set(before) | set(after))
+    }
+
+
+def _observe_prefix_cache_hits(llm, hits_by_seq_id: dict[int, int]) -> None:
+    scheduler = getattr(llm, "scheduler", None)
+    if scheduler is None:
+        return
+    for queue_name in ("waiting", "decoding"):
+        for seq in getattr(scheduler, queue_name, []):
+            seq_id = int(getattr(seq, "seq_id", -1))
+            hit_len = int(getattr(seq, "prefix_cache_hit_len", 0) or 0)
+            if seq_id >= 0 and hit_len > 0:
+                hits_by_seq_id[seq_id] = max(hit_len, int(hits_by_seq_id.get(seq_id, 0)))
+
+
 def benchmark_task(method, length, bs, args, results_dict):
     # 为每个子进程重置显存统计
     torch.cuda.reset_peak_memory_stats()
@@ -352,6 +383,7 @@ def benchmark_task(method, length, bs, args, results_dict):
             **sparse_kwargs,
         }
         llm = LLM(args.model_path, **engine_kwargs)
+        prefix_cache_stats_before = _cache_stats(llm)
 
         prompt_token_ids = [[100] * length for _ in range(bs)]
         sampling_params = [
@@ -391,12 +423,15 @@ def benchmark_task(method, length, bs, args, results_dict):
         # Manually run the generation loop to get detailed stats
         next_request_idx = 0
         decode_steps_since_last_wave = 0
+        request_seq_ids: list[int] = []
+        prefix_hits_by_seq_id: dict[int, int] = {}
 
         def add_wave(max_new_requests: int):
             nonlocal next_request_idx, decode_steps_since_last_wave
             end_idx = min(bs, next_request_idx + max_new_requests)
             for req_idx in range(next_request_idx, end_idx):
-                llm.add_request(prompt_token_ids[req_idx], sampling_params[req_idx])
+                seq_id = llm.add_request(prompt_token_ids[req_idx], sampling_params[req_idx])
+                request_seq_ids.append(int(seq_id))
             added = end_idx - next_request_idx
             next_request_idx = end_idx
             decode_steps_since_last_wave = 0
@@ -406,19 +441,25 @@ def benchmark_task(method, length, bs, args, results_dict):
 
         has_queued = False
         zero_steps = 0
-        while not llm.is_finished():
+        while next_request_idx < bs or not llm.is_finished():
             if (
                 staged_admission
                 and next_request_idx < bs
                 and len(llm.scheduler.waiting) == 0
-                and len(llm.scheduler.decoding) > 0
-                and decode_steps_since_last_wave >= wave_decode_gap_steps
+                and (
+                    (
+                        len(llm.scheduler.decoding) > 0
+                        and decode_steps_since_last_wave >= wave_decode_gap_steps
+                    )
+                    or (len(llm.scheduler.decoding) == 0 and llm.is_finished())
+                )
             ):
                 add_wave(admission_wave_size)
 
             step_start = perf_counter()
             finished_outputs, num_tokens = llm.step()
             step_dt = perf_counter() - step_start
+            _observe_prefix_cache_hits(llm, prefix_hits_by_seq_id)
             
             if num_tokens > 0:
                 prefill_tokens += num_tokens
@@ -470,6 +511,22 @@ def benchmark_task(method, length, bs, args, results_dict):
         duration = t_end - t_start
         peak_mem = get_peak_memory()
         graph_status = _decode_cuda_graph_status(llm)
+        prefix_cache_stats_after = _cache_stats(llm)
+        prefix_cache_stats_delta = _numeric_delta(prefix_cache_stats_before, prefix_cache_stats_after)
+        observed_prefix_hit_tokens = int(sum(prefix_hits_by_seq_id.values()))
+        observed_prefix_hit_requests = int(sum(1 for value in prefix_hits_by_seq_id.values() if int(value) > 0))
+        stats_prefix_hit_tokens = int(prefix_cache_stats_delta.get("prefix_cache_hit_tokens", 0))
+        stats_prefix_hit_requests = int(prefix_cache_stats_delta.get("prefix_cache_hit_requests", 0))
+        if bool(getattr(args, "require_prefix_cache_hit", False)) and max(
+            observed_prefix_hit_tokens,
+            stats_prefix_hit_tokens,
+        ) <= 0:
+            raise RuntimeError(
+                "Prefix-cache stress did not observe any prefix cache hit: "
+                f"observed_prefix_hit_tokens={observed_prefix_hit_tokens}, "
+                f"stats_prefix_hit_tokens={stats_prefix_hit_tokens}, "
+                f"request_seq_ids={request_seq_ids[:8]}."
+            )
         preemptions = int(getattr(getattr(llm, "scheduler", None), "total_preemptions", 0) or 0)
         cache_manager = getattr(getattr(llm, "model_runner", None), "cache_manager", None)
         if cache_manager is None or not hasattr(cache_manager, "memory_accounting"):
@@ -527,6 +584,18 @@ def benchmark_task(method, length, bs, args, results_dict):
             "scheduler_preemptions": preemptions,
             "decode_cuda_graph_expected": bool(base_hyper_params.get("decode_cuda_graph")),
             **graph_status,
+            "prefix_cache_required": bool(getattr(args, "require_prefix_cache_hit", False)),
+            "prefix_cache_stats_before": prefix_cache_stats_before,
+            "prefix_cache_stats_after": prefix_cache_stats_after,
+            "prefix_cache_stats_delta": prefix_cache_stats_delta,
+            "prefix_cache_hit_tokens": stats_prefix_hit_tokens,
+            "prefix_cache_hit_requests": stats_prefix_hit_requests,
+            "observed_prefix_cache_hit_tokens": observed_prefix_hit_tokens,
+            "observed_prefix_cache_hit_requests": observed_prefix_hit_requests,
+            "observed_prefix_cache_hit_by_seq": {
+                str(seq_id): int(hit_len)
+                for seq_id, hit_len in sorted(prefix_hits_by_seq_id.items())
+            },
             "memory_accounting": memory_accounting,
             "engine_hyper_params": engine_kwargs,
             "status": "SUCCESS"
@@ -593,6 +662,11 @@ def main():
         type=int,
         default=0,
         help="In staged admission mode, require this many decode steps before admitting the next wave.",
+    )
+    parser.add_argument(
+        "--require_prefix_cache_hit",
+        action="store_true",
+        help="Fail the benchmark case unless at least one prefix-cache hit is observed.",
     )
     parser.add_argument(
         "--hyper_params",

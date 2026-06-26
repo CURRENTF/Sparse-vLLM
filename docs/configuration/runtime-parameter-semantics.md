@@ -246,10 +246,10 @@ Correctness constraints:
   incomplete trailing blocks are discarded when the request is freed.
 - Active cached blocks are refcounted and cannot be evicted or returned to the
   free-slot/page pool while referenced.
-- `decode_cuda_graph=true` with prefix cache is supported only when
-  `tensor_parallel_size=1` and `decode_cuda_graph_capture_sampling=false`.
-  Prefix-cache decode graph with TP>1 remains rejected until separate
-  validation.
+- `decode_cuda_graph=true` with prefix cache is supported for `vanilla`,
+  `omnikv`, and `quest` when `decode_cuda_graph_capture_sampling=false`.
+  With `tensor_parallel_size>1`, every rank keeps a rank-local mirrored prefix
+  cache with stable logical block ids and rank-local KV payloads.
 
 For API serving, pass these as `--kebab-case` engine flags:
 
@@ -1211,8 +1211,8 @@ Before launching a run:
 - If using Sparse-vLLM, convert all ratio budgets to token counts.
 - If using prefix cache, keep `sparse_method` in `vanilla`, `omnikv`, or
   `quest`; generated decode input tokens are cached by default once they
-  complete full prefix-cache blocks; and use `decode_cuda_graph=true` only at
-  `tensor_parallel_size=1` with `decode_cuda_graph_capture_sampling=false`.
+  complete full prefix-cache blocks; and keep
+  `decode_cuda_graph_capture_sampling=false` when using `decode_cuda_graph`.
 - For QuEST prefix cache, set `prefix_cache_block_size` equal to
   `quest_chunk_size` or omit it.
 - If using LLaVA no-checkpoint path, label it as visual uniform pruning, not

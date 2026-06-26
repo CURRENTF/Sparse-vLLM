@@ -75,3 +75,19 @@ _Avoid_: single-block deletion, arbitrary token range deletion, forced live-pref
 **Prefix Cache Eviction Priority**:
 A control-plane value on prefix-cache blocks that determines eviction preference. Negative values mean protected from safe deletion and eviction, zero is default, and positive values prefer eviction.
 _Avoid_: soft lock, LRU score, cache hit score
+
+**TP Prefix-Graph Support**:
+A Sparse-VLLM capability where tensor-parallel execution, prefix KV reuse, and decode CUDA graph execution are validated together for a sparse method. It means the method has compatible cache lifecycle semantics across ranks, not merely that three configuration flags can be parsed together.
+_Avoid_: allowlist-only support, config-toggle compatibility
+
+**Rank-Local Mirrored Prefix Cache**:
+A tensor-parallel prefix-cache model where every rank owns a local prefix index with the same stable block identities while storing rank-local KV payloads. It is not a shared rank-0 physical cache or a cross-rank payload transfer mechanism.
+_Avoid_: central prefix cache, shared physical KV cache, rank-0-owned prefix cache
+
+**Rank-0 Prefix Cache View**:
+The user-visible tensor-parallel prefix-cache control view returned by rank 0 after all ranks have executed the control action successfully. It represents logical prefix-cache state, not every rank's physical KV slot or page layout.
+_Avoid_: aggregated physical cache view, all-rank payload dump
+
+**Prefix-Cache Stress Run**:
+A stress validation run that repeatedly exercises real prefix-cache hits while the target runtime mode is enabled. A generic long-context or high-concurrency decode run is not a prefix-cache stress run unless reused prefix blocks are observed.
+_Avoid_: graph-only stress, decode-only stress, no-hit prefix configuration

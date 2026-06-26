@@ -149,6 +149,75 @@ override:
 This compares sparse methods against TP vanilla in the same run. A/B/C grades
 are recorded; crashes or D grades fail the TP graph quality gate.
 
+For the fast TP prefix-cache + decode-graph regression gate, keep the same
+method coverage but use explicit small-sample overrides and a child-command
+timeout. This still exercises LongBench quality, SCBench quality, and stress,
+but it is a smoke/regression gate rather than the full 50-sample-per-task
+quality suite:
+
+```bash
+/root/miniconda3/bin/conda run -n kv --no-capture-output \
+  python benchmark/sparsevllm_regression/run_suite.py \
+  --layer quality \
+  --models qwen3_4b \
+  --methods vanilla,omnikv,quest \
+  --tensor_parallel_size 2 \
+  --enable_prefix_caching \
+  --prefix_cache_block_size 16 \
+  --quality_tasks qasper,hotpotqa \
+  --quality_batch_size 2 \
+  --quality_samples_per_task 2 \
+  --quality_min_required_samples 2 \
+  --quality_sparsevllm_max_num_seqs_in_batch 2 \
+  --quality_sparsevllm_max_decoding_seqs 2 \
+  --command_timeout_s 600 \
+  --run_id tp_prefix_graph_quality_quick_$(date -u +%Y%m%d_%H%M%S) \
+  --output_root /root/autodl-tmp/outputs/deltakv
+```
+
+Then run the matching SCBench quality and prefix-hit stress layers:
+
+```bash
+/root/miniconda3/bin/conda run -n kv --no-capture-output \
+  python benchmark/sparsevllm_regression/run_suite.py \
+  --layer scbench \
+  --models qwen3_4b \
+  --methods vanilla,omnikv,quest \
+  --tensor_parallel_size 2 \
+  --enable_prefix_caching \
+  --prefix_cache_block_size 16 \
+  --scbench_decode_cuda_graph \
+  --scbench_tasks scbench_kv \
+  --scbench_num_eval_examples 1 \
+  --scbench_max_turns 2 \
+  --scbench_max_seq_length 1024 \
+  --scbench_batch_size 1 \
+  --command_timeout_s 600 \
+  --run_id tp_prefix_graph_scbench_quick_$(date -u +%Y%m%d_%H%M%S) \
+  --output_root /root/autodl-tmp/outputs/deltakv
+
+/root/miniconda3/bin/conda run -n kv --no-capture-output \
+  python benchmark/sparsevllm_regression/run_suite.py \
+  --layer stress \
+  --models qwen3_4b \
+  --methods vanilla,omnikv,quest \
+  --tensor_parallel_size 2 \
+  --enable_prefix_caching \
+  --prefix_cache_block_size 16 \
+  --require_prefix_cache_hit \
+  --stress_length 256 \
+  --stress_request_counts 2 \
+  --stress_output_len 2 \
+  --stress_max_num_seqs_in_batch 2 \
+  --stress_max_decoding_seqs 2 \
+  --stress_max_decode_steps_after_full 1 \
+  --stress_admission_wave_size 1 \
+  --stress_wave_decode_gap_steps 1 \
+  --command_timeout_s 600 \
+  --run_id tp_prefix_graph_stress_quick_$(date -u +%Y%m%d_%H%M%S) \
+  --output_root /root/autodl-tmp/outputs/deltakv
+```
+
 ### Correctness / Logits
 
 `logits` compares HF sparse reference outputs with SparseVLLM for methods that

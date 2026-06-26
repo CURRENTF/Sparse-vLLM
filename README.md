@@ -361,9 +361,9 @@ batch state × sampling-capture mode, so `snapkv`, `pyramidkv`, `streamingllm`,
 `quest`, `omnikv`, vanilla, and `deltakv` all use the same bucketed capture
 policy.
 With prefix cache enabled, decode CUDA Graph is supported for `vanilla`,
-`omnikv`, and `quest` at `tensor_parallel_size=1` with
-`decode_cuda_graph_capture_sampling=false`; TP>1 prefix-cache graph support is
-validated separately.
+`omnikv`, and `quest` with `decode_cuda_graph_capture_sampling=false`.
+When `tensor_parallel_size>1`, each rank keeps a rank-local mirrored prefix
+cache with stable logical block ids and rank-local KV payloads.
 
 For the HF backend, `deltakv_cache_impl="delta_compressed_quant_kivi_full_fp8_ref"`
 keeps DeltaKV center selection, but stores sparse-layer learned-compressor latent

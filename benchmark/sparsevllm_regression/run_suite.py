@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -27,10 +28,32 @@ from benchmark.sparsevllm_regression.manifest import (
     resolve_manifest_paths,
     select_entries,
 )
-from sparsevllm.method_registry import is_decode_cuda_graph_supported, is_tp_decode_cuda_graph_supported
+from sparsevllm.method_registry import (
+    PREFIX_CACHE_SUPPORTED_METHODS,
+    is_decode_cuda_graph_supported,
+    is_tp_decode_cuda_graph_supported,
+    normalize_sparse_method,
+)
 
 
 DEFAULT_OUTPUT_ROOT = os.getenv("DELTAKV_OUTPUT_DIR", "/root/autodl-fs/deltakv_outputs")
+
+
+class CommandExecutionError(RuntimeError):
+    def __init__(self, message: str, record: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.record = record
+
+
+def _parse_csv(value: str) -> list[str]:
+    return [item.strip() for item in str(value).split(",") if item.strip()]
+
+
+def _parse_int_csv(value: str) -> list[int]:
+    items = _parse_csv(value)
+    if not items:
+        raise ValueError("Expected a non-empty comma-separated integer list.")
+    return [int(item) for item in items]
 
 
 def _write_json(path: Path, payload: Any) -> None:
@@ -88,8 +111,42 @@ def _git_status_short() -> str:
     return subprocess.check_output(["git", "status", "--short"], text=True).strip()
 
 
-def _run_command(cmd: list[str], *, cwd: Path, dry_run: bool, log_path: Path) -> dict[str, Any]:
-    record = {"cmd": cmd, "cwd": str(cwd), "log_path": str(log_path), "dry_run": dry_run}
+def _terminate_process_group(pid: int, log: Any) -> None:
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    except Exception as exc:  # pragma: no cover - defensive logging for stuck GPU jobs.
+        log.write(f"\n[run_suite] failed to terminate process group {pid}: {exc!r}\n")
+        log.flush()
+
+
+def _kill_process_group(pid: int, log: Any) -> None:
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    except Exception as exc:  # pragma: no cover - defensive logging for stuck GPU jobs.
+        log.write(f"\n[run_suite] failed to kill process group {pid}: {exc!r}\n")
+        log.flush()
+
+
+def _run_command(
+    cmd: list[str],
+    *,
+    cwd: Path,
+    dry_run: bool,
+    log_path: Path,
+    timeout_s: float | None = None,
+) -> dict[str, Any]:
+    timeout_value = float(timeout_s or 0.0)
+    record = {
+        "cmd": cmd,
+        "cwd": str(cwd),
+        "log_path": str(log_path),
+        "dry_run": dry_run,
+        "timeout_s": timeout_value if timeout_value > 0 else None,
+    }
     if dry_run:
         return {**record, "status": "skipped_by_policy", "returncode": None}
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -99,12 +156,53 @@ def _run_command(cmd: list[str], *, cwd: Path, dry_run: bool, log_path: Path) ->
         pythonpath_parts.append(env["PYTHONPATH"])
     env["PYTHONPATH"] = os.pathsep.join(pythonpath_parts)
     with log_path.open("w", encoding="utf-8") as log:
-        proc = subprocess.run(cmd, cwd=str(cwd), env=env, stdout=log, stderr=subprocess.STDOUT, text=True)
-    record["returncode"] = int(proc.returncode)
-    record["status"] = "success" if proc.returncode == 0 else "model_failed"
-    if proc.returncode != 0:
-        raise RuntimeError(f"Command failed with exit code {proc.returncode}: {' '.join(cmd)}")
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(cwd),
+            env=env,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            returncode = proc.wait(timeout=timeout_value if timeout_value > 0 else None)
+        except subprocess.TimeoutExpired:
+            log.write(f"\n[run_suite] command exceeded timeout_s={timeout_value}; terminating process group.\n")
+            log.flush()
+            _terminate_process_group(proc.pid, log)
+            try:
+                returncode = proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                log.write("\n[run_suite] process group did not exit after SIGTERM; sending SIGKILL.\n")
+                log.flush()
+                _kill_process_group(proc.pid, log)
+                returncode = proc.wait(timeout=30)
+            record["returncode"] = int(returncode)
+            record["status"] = "timeout"
+            raise CommandExecutionError(f"Command exceeded timeout_s={timeout_value}: {' '.join(cmd)}", record)
+    record["returncode"] = int(returncode)
+    record["status"] = "success" if returncode == 0 else "model_failed"
+    if returncode != 0:
+        raise CommandExecutionError(f"Command failed with exit code {returncode}: {' '.join(cmd)}", record)
     return record
+
+
+def _run_and_record(
+    summary: dict[str, Any],
+    cmd: list[str],
+    *,
+    cwd: Path,
+    dry_run: bool,
+    log_path: Path,
+    timeout_s: float | None,
+) -> None:
+    try:
+        record = _run_command(cmd, cwd=cwd, dry_run=dry_run, log_path=log_path, timeout_s=timeout_s)
+    except CommandExecutionError as exc:
+        summary["commands"].append(exc.record)
+        raise
+    summary["commands"].append(record)
 
 
 def _method_config(
@@ -133,6 +231,51 @@ def _tensor_parallel_size_from_config(*configs: dict[str, Any] | None) -> int:
                 raise ValueError(f"tensor_parallel_size must be > 0, got {value}.")
             return value
     return 1
+
+
+def _apply_prefix_cache_config(
+    cfg: dict[str, Any],
+    method: dict[str, Any],
+    *configs: dict[str, Any] | None,
+    default_salt: str,
+) -> None:
+    prefix_cfg: dict[str, Any] = {}
+    for source in configs:
+        if not source:
+            continue
+        for key in (
+            "enable_prefix_caching",
+            "prefix_cache_block_size",
+            "prefix_cache_max_blocks",
+            "prefix_cache_salt",
+        ):
+            if key in source:
+                prefix_cfg[key] = source[key]
+
+    if not bool(prefix_cfg.get("enable_prefix_caching", False)):
+        return
+
+    sparse_method = normalize_sparse_method(method["sparse_method"])
+    if sparse_method not in PREFIX_CACHE_SUPPORTED_METHODS:
+        supported = ", ".join(repr(name or "vanilla") for name in sorted(PREFIX_CACHE_SUPPORTED_METHODS))
+        raise ValueError(
+            "enable_prefix_caching in regression runtime config supports these methods only: "
+            f"{supported}. got sparse_method={method['sparse_method']!r}."
+        )
+
+    cfg["enable_prefix_caching"] = True
+    if "prefix_cache_block_size" in prefix_cfg:
+        cfg["prefix_cache_block_size"] = int(prefix_cfg["prefix_cache_block_size"])
+    if "prefix_cache_max_blocks" in prefix_cfg:
+        cfg["prefix_cache_max_blocks"] = int(prefix_cfg["prefix_cache_max_blocks"])
+    cfg["prefix_cache_salt"] = str(prefix_cfg.get("prefix_cache_salt") or default_salt)
+
+
+def _apply_profiler_config(cfg: dict[str, Any], *configs: dict[str, Any] | None) -> None:
+    for source in configs:
+        if source and bool(source.get("enable_profiler", False)):
+            cfg["enable_profiler"] = True
+            return
 
 
 def _decode_cuda_graph_for_method(
@@ -175,6 +318,14 @@ def _quality_command(
         bool((performance or {}).get("decode_cuda_graph", False)),
         tensor_parallel_size=tensor_parallel_size,
     )
+    _apply_prefix_cache_config(
+        cfg,
+        method,
+        quality,
+        performance,
+        default_salt=f"regression-quality:{model_id}:{method_id}",
+    )
+    _apply_profiler_config(cfg, quality, performance)
     if tensor_parallel_size > 1:
         cfg["decode_cuda_graph_capture_sampling"] = False
     cfg["enforce_eager"] = bool((performance or {}).get("enforce_eager", False))
@@ -314,6 +465,13 @@ def _perf_command(
     # not forward it into SparseVLLM perf runs, where unknown keys fail fast.
     method_cfg.pop("hf_sparse_method", None)
     hyper_params.update(method_cfg)
+    _apply_prefix_cache_config(
+        hyper_params,
+        method,
+        performance,
+        default_salt=f"regression-perf:{model_id}:{method_id}",
+    )
+    _apply_profiler_config(hyper_params, performance)
     methods_arg = "vanilla" if method_id == "vanilla" else f"vanilla,{method_id}"
     return [
         sys.executable,
@@ -368,7 +526,24 @@ def _stress_command(
     # not forward it into SparseVLLM stress runs, where unknown keys fail fast.
     method_cfg.pop("hf_sparse_method", None)
     hyper_params.update(method_cfg)
-    return [
+    _apply_prefix_cache_config(
+        hyper_params,
+        method,
+        stress,
+        performance,
+        default_salt=f"regression-stress:{model_id}:{method_id}",
+    )
+    _apply_profiler_config(hyper_params, stress, performance)
+    prefix_cache_stress = bool(hyper_params.get("enable_prefix_caching", False))
+    admission_wave_size = int(stress.get("admission_wave_size", 0) or 0)
+    if prefix_cache_stress and admission_wave_size <= 0:
+        max_request_count = max(request_counts)
+        if max_request_count <= 1:
+            raise ValueError("Prefix-cache stress requires request_counts greater than 1.")
+        admission_wave_size = max(1, max_request_count // 2)
+    wave_decode_gap_steps = int(stress.get("wave_decode_gap_steps", 1 if prefix_cache_stress else 0) or 0)
+    require_prefix_cache_hit = bool(stress.get("require_prefix_cache_hit", prefix_cache_stress))
+    cmd = [
         sys.executable,
         "scripts/benchmarks/bench_sparse_vllm.py",
         "--model_path",
@@ -390,6 +565,13 @@ def _stress_command(
         "--output_jsonl",
         str(output_jsonl),
     ]
+    if admission_wave_size > 0:
+        cmd.extend(["--admission_wave_size", str(admission_wave_size)])
+    if wave_decode_gap_steps > 0:
+        cmd.extend(["--wave_decode_gap_steps", str(wave_decode_gap_steps)])
+    if require_prefix_cache_hit:
+        cmd.append("--require_prefix_cache_hit")
+    return cmd
 
 
 def _scbench_command(
@@ -421,6 +603,8 @@ def _scbench_command(
         str(int(scbench["max_seq_length"])),
         "--batch_size",
         str(int(scbench["batch_size"])),
+        "--tensor_parallel_size",
+        str(int(scbench.get("tensor_parallel_size", 1))),
         "--prefix_cache_block_size",
         str(int(scbench.get("prefix_cache_block_size", 16))),
     ]
@@ -504,6 +688,52 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Override SCBench Sparse-VLLM enforce_eager. Defaults to false when graph is enabled.",
     )
+    parser.add_argument(
+        "--enable_prefix_caching",
+        action="store_true",
+        help=(
+            "Enable prefix caching for selected regression methods that support it. "
+            "Use with methods vanilla, omnikv, and quest for TP prefix-graph validation."
+        ),
+    )
+    parser.add_argument("--prefix_cache_block_size", type=int, default=None)
+    parser.add_argument("--prefix_cache_salt", default=None)
+    parser.add_argument(
+        "--require_prefix_cache_hit",
+        action="store_true",
+        help="Require stress rows to observe at least one prefix-cache hit.",
+    )
+    parser.add_argument(
+        "--enable_profiler",
+        action="store_true",
+        help="Enable Sparse-VLLM profiler in quality, performance, and stress child commands.",
+    )
+    parser.add_argument(
+        "--command_timeout_s",
+        type=float,
+        default=None,
+        help="Per child command timeout. Timed-out command process groups are terminated and recorded as failed.",
+    )
+    parser.add_argument("--quality_tasks", default=None, help="Override LongBench quality tasks with a comma list.")
+    parser.add_argument("--quality_batch_size", type=int, default=None)
+    parser.add_argument("--quality_samples_per_task", type=int, default=None)
+    parser.add_argument("--quality_min_required_samples", type=int, default=None)
+    parser.add_argument("--quality_min_prompt_tokens", type=int, default=None)
+    parser.add_argument("--quality_sparsevllm_max_num_seqs_in_batch", type=int, default=None)
+    parser.add_argument("--quality_sparsevllm_max_decoding_seqs", type=int, default=None)
+    parser.add_argument("--scbench_tasks", default=None, help="Override SCBench tasks with a comma list.")
+    parser.add_argument("--scbench_num_eval_examples", type=int, default=None)
+    parser.add_argument("--scbench_max_turns", type=int, default=None)
+    parser.add_argument("--scbench_max_seq_length", type=int, default=None)
+    parser.add_argument("--scbench_batch_size", type=int, default=None)
+    parser.add_argument("--stress_length", type=int, default=None)
+    parser.add_argument("--stress_request_counts", default=None)
+    parser.add_argument("--stress_output_len", type=int, default=None)
+    parser.add_argument("--stress_max_num_seqs_in_batch", type=int, default=None)
+    parser.add_argument("--stress_max_decoding_seqs", type=int, default=None)
+    parser.add_argument("--stress_max_decode_steps_after_full", type=int, default=None)
+    parser.add_argument("--stress_admission_wave_size", type=int, default=None)
+    parser.add_argument("--stress_wave_decode_gap_steps", type=int, default=None)
     return parser.parse_args()
 
 
@@ -511,6 +741,91 @@ def main() -> int:
     args = parse_args()
     manifest = load_manifest(args.manifest)
     resolved = resolve_manifest_paths(manifest)
+    quality_overrides: dict[str, Any] = {}
+    if args.quality_tasks is not None:
+        quality_overrides["tasks"] = _parse_csv(args.quality_tasks)
+    for arg_name, cfg_key in (
+        ("quality_batch_size", "batch_size"),
+        ("quality_samples_per_task", "samples_per_task"),
+        ("quality_min_required_samples", "min_required_samples"),
+        ("quality_min_prompt_tokens", "min_prompt_tokens"),
+        ("quality_sparsevllm_max_num_seqs_in_batch", "sparsevllm_max_num_seqs_in_batch"),
+        ("quality_sparsevllm_max_decoding_seqs", "sparsevllm_max_decoding_seqs"),
+    ):
+        value = getattr(args, arg_name)
+        if value is not None:
+            quality_overrides[cfg_key] = int(value)
+    if quality_overrides:
+        quality_cfg = dict(resolved.get("quality") or {})
+        quality_cfg.update(quality_overrides)
+        if not quality_cfg.get("tasks"):
+            raise ValueError("--quality_tasks must include at least one task.")
+        for key in (
+            "batch_size",
+            "samples_per_task",
+            "min_required_samples",
+            "sparsevllm_max_num_seqs_in_batch",
+            "sparsevllm_max_decoding_seqs",
+        ):
+            if key in quality_cfg and int(quality_cfg[key]) <= 0:
+                raise ValueError(f"quality {key} must be > 0, got {quality_cfg[key]}.")
+        resolved["quality"] = quality_cfg
+
+    scbench_overrides: dict[str, Any] = {}
+    if args.scbench_tasks is not None:
+        scbench_overrides["tasks"] = _parse_csv(args.scbench_tasks)
+    for arg_name, cfg_key in (
+        ("scbench_num_eval_examples", "num_eval_examples"),
+        ("scbench_max_turns", "max_turns"),
+        ("scbench_max_seq_length", "max_seq_length"),
+        ("scbench_batch_size", "batch_size"),
+    ):
+        value = getattr(args, arg_name)
+        if value is not None:
+            scbench_overrides[cfg_key] = int(value)
+    if scbench_overrides:
+        scbench_cfg = dict(resolved.get("scbench") or {})
+        scbench_cfg.update(scbench_overrides)
+        if not scbench_cfg.get("tasks"):
+            raise ValueError("--scbench_tasks must include at least one task.")
+        for key in ("num_eval_examples", "max_turns", "max_seq_length", "batch_size"):
+            if key in scbench_cfg and int(scbench_cfg[key]) <= 0:
+                raise ValueError(f"scbench {key} must be > 0, got {scbench_cfg[key]}.")
+        resolved["scbench"] = scbench_cfg
+
+    stress_overrides: dict[str, Any] = {}
+    if args.stress_request_counts is not None:
+        stress_overrides["request_counts"] = _parse_int_csv(args.stress_request_counts)
+    for arg_name, cfg_key in (
+        ("stress_length", "length"),
+        ("stress_output_len", "output_len"),
+        ("stress_max_num_seqs_in_batch", "max_num_seqs_in_batch"),
+        ("stress_max_decoding_seqs", "max_decoding_seqs"),
+        ("stress_max_decode_steps_after_full", "max_decode_steps_after_full"),
+        ("stress_admission_wave_size", "admission_wave_size"),
+        ("stress_wave_decode_gap_steps", "wave_decode_gap_steps"),
+    ):
+        value = getattr(args, arg_name)
+        if value is not None:
+            stress_overrides[cfg_key] = int(value)
+    if stress_overrides:
+        stress_cfg = dict(resolved.get("stress") or {})
+        stress_cfg.update(stress_overrides)
+        if not stress_cfg.get("request_counts"):
+            raise ValueError("stress request_counts must include at least one request count.")
+        for key in (
+            "length",
+            "output_len",
+            "max_num_seqs_in_batch",
+            "max_decoding_seqs",
+            "max_decode_steps_after_full",
+        ):
+            if key in stress_cfg and int(stress_cfg[key]) <= 0:
+                raise ValueError(f"stress {key} must be > 0, got {stress_cfg[key]}.")
+        if any(int(value) <= 0 for value in stress_cfg["request_counts"]):
+            raise ValueError(f"stress request_counts must be > 0, got {stress_cfg['request_counts']}.")
+        resolved["stress"] = stress_cfg
+
     if args.scbench_decode_cuda_graph or args.scbench_enforce_eager is not None:
         scbench_cfg = dict(resolved.get("scbench") or {})
         if args.scbench_decode_cuda_graph:
@@ -519,10 +834,37 @@ def main() -> int:
         if args.scbench_enforce_eager is not None:
             scbench_cfg["enforce_eager"] = bool(args.scbench_enforce_eager)
         resolved["scbench"] = scbench_cfg
+    if args.enable_prefix_caching:
+        for section in ("quality", "performance", "stress"):
+            section_cfg = dict(resolved.get(section) or {})
+            section_cfg["enable_prefix_caching"] = True
+            if args.prefix_cache_block_size is not None:
+                section_cfg["prefix_cache_block_size"] = int(args.prefix_cache_block_size)
+            if args.prefix_cache_salt is not None:
+                section_cfg["prefix_cache_salt"] = str(args.prefix_cache_salt)
+            if section == "stress":
+                section_cfg["require_prefix_cache_hit"] = True
+            resolved[section] = section_cfg
+        scbench_cfg = dict(resolved.get("scbench") or {})
+        if args.prefix_cache_block_size is not None:
+            scbench_cfg["prefix_cache_block_size"] = int(args.prefix_cache_block_size)
+        resolved["scbench"] = scbench_cfg
+    elif args.require_prefix_cache_hit:
+        stress_cfg = dict(resolved.get("stress") or {})
+        stress_cfg["require_prefix_cache_hit"] = True
+        resolved["stress"] = stress_cfg
+    if args.enable_profiler:
+        for section in ("quality", "performance", "stress"):
+            section_cfg = dict(resolved.get(section) or {})
+            section_cfg["enable_profiler"] = True
+            resolved[section] = section_cfg
     if args.tensor_parallel_size is not None:
         if int(args.tensor_parallel_size) <= 0:
             raise ValueError(f"--tensor_parallel_size must be > 0, got {args.tensor_parallel_size}.")
         resolved.setdefault("performance", {})["tensor_parallel_size"] = int(args.tensor_parallel_size)
+        scbench_cfg = dict(resolved.get("scbench") or {})
+        scbench_cfg["tensor_parallel_size"] = int(args.tensor_parallel_size)
+        resolved["scbench"] = scbench_cfg
     model_ids, method_ids = select_entries(
         resolved,
         [item for item in (args.models or "").split(",") if item] or None,
@@ -547,6 +889,7 @@ def main() -> int:
         "models": model_ids,
         "methods": method_ids,
         "tensor_parallel_size": _tensor_parallel_size_from_config(resolved.get("performance")),
+        "command_timeout_s": float(args.command_timeout_s) if args.command_timeout_s else None,
         "dry_run": bool(args.dry_run),
         "grades": [],
         "commands": [],
@@ -610,8 +953,13 @@ def main() -> int:
                     performance=resolved["performance"],
                     output_root=out_dir,
                 )
-                summary["commands"].append(
-                    _run_command(cmd, cwd=cwd, dry_run=args.dry_run, log_path=out_dir / "run.log")
+                _run_and_record(
+                    summary,
+                    cmd,
+                    cwd=cwd,
+                    dry_run=args.dry_run,
+                    log_path=out_dir / "run.log",
+                    timeout_s=args.command_timeout_s,
                 )
                 quality_roots[(model_id, method_id)] = out_dir
                 _append_jsonl_file(
@@ -659,8 +1007,13 @@ def main() -> int:
                     performance=resolved["performance"],
                     output_dir=out_dir,
                 )
-                summary["commands"].append(
-                    _run_command(cmd, cwd=cwd, dry_run=args.dry_run, log_path=out_dir / "run.log")
+                _run_and_record(
+                    summary,
+                    cmd,
+                    cwd=cwd,
+                    dry_run=args.dry_run,
+                    log_path=out_dir / "run.log",
+                    timeout_s=args.command_timeout_s,
                 )
                 summary_path = out_dir / "summary.json"
                 metrics = None
@@ -692,13 +1045,13 @@ def main() -> int:
                         performance=resolved["performance"],
                         output_jsonl=out_path,
                     )
-                    summary["commands"].append(
-                        _run_command(
-                            cmd,
-                            cwd=cwd,
-                            dry_run=args.dry_run,
-                            log_path=output_root / "perf" / model_id / f"{method_id}.log",
-                        )
+                    _run_and_record(
+                        summary,
+                        cmd,
+                        cwd=cwd,
+                        dry_run=args.dry_run,
+                        log_path=output_root / "perf" / model_id / f"{method_id}.log",
+                        timeout_s=args.command_timeout_s,
                     )
                     rows = _read_jsonl(out_path)
                     for row in rows:
@@ -766,13 +1119,13 @@ def main() -> int:
                     stress=resolved["stress"],
                     output_jsonl=out_path,
                 )
-                summary["commands"].append(
-                    _run_command(
-                        cmd,
-                        cwd=cwd,
-                        dry_run=args.dry_run,
-                        log_path=output_root / "stress" / model_id / f"{method_id}.log",
-                    )
+                _run_and_record(
+                    summary,
+                    cmd,
+                    cwd=cwd,
+                    dry_run=args.dry_run,
+                    log_path=output_root / "stress" / model_id / f"{method_id}.log",
+                    timeout_s=args.command_timeout_s,
                 )
                 rows = _read_jsonl(out_path)
                 if args.dry_run:
@@ -854,8 +1207,13 @@ def main() -> int:
                     scbench=scbench,
                     output_dir=out_dir,
                 )
-                summary["commands"].append(
-                    _run_command(cmd, cwd=cwd, dry_run=args.dry_run, log_path=out_dir / "run.log")
+                _run_and_record(
+                    summary,
+                    cmd,
+                    cwd=cwd,
+                    dry_run=args.dry_run,
+                    log_path=out_dir / "run.log",
+                    timeout_s=args.command_timeout_s,
                 )
                 summary_path = out_dir / "scbench_methods_summary.json"
                 if summary_path.exists():

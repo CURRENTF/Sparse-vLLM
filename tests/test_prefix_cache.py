@@ -259,6 +259,83 @@ def test_radix_backend_removes_leaf_from_compressed_segment_and_preserves_siblin
     assert set(backend.leaf_block_ids()) == {b"c", b"y", b"q"}
 
 
+def test_radix_backend_maintains_locations_incrementally(monkeypatch):
+    backend = RadixTreeBackend()
+
+    def fail_rebuild():
+        raise AssertionError("Radix insert/remove should maintain locations incrementally.")
+
+    monkeypatch.setattr(backend, "_rebuild_locations", fail_rebuild)
+
+    backend.insert((b"a", b"b"))
+    assert backend.path_to_block(b"b") == (b"a", b"b")
+
+    backend.insert((b"a",))
+    assert backend.path_to_block(b"a") == (b"a",)
+    assert backend.path_to_block(b"b") == (b"a", b"b")
+
+    backend.insert((b"a", b"c"))
+    assert backend.child_count(b"a") == 2
+    assert set(backend.leaf_block_ids()) == {b"b", b"c"}
+
+    backend.remove_block(b"c")
+    assert backend.child_count(b"a") == 1
+    assert backend.path_to_block(b"b") == (b"a", b"b")
+    with pytest.raises(KeyError):
+        backend.path_to_block(b"c")
+
+
+def test_radix_backend_insert_child_splits_compressed_parent_segment():
+    backend = RadixTreeBackend()
+    backend.insert((b"a", b"b", b"c"))
+
+    backend.insert_child(b"b", b"x")
+
+    assert backend.path_to_block(b"c") == (b"a", b"b", b"c")
+    assert backend.path_to_block(b"x") == (b"a", b"b", b"x")
+    assert backend.child_count(b"b") == 2
+    assert set(backend.leaf_block_ids()) == {b"c", b"x"}
+
+
+def test_prefix_index_insert_block_appends_without_recovering_parent_path(monkeypatch):
+    fp = build_prefix_cache_fingerprint(_cfg(), 4)
+    index = RadixPrefixIndex(block_size=4, fingerprint=fp)
+
+    def fail_path_to_block(_block_id):
+        raise AssertionError("insert_block should append through parent locations directly.")
+
+    def fail_insert(_block_ids):
+        raise AssertionError("insert_block should not rebuild and reinsert a full path.")
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(index.backend, "path_to_block", fail_path_to_block)
+        scoped.setattr(index.backend, "insert", fail_insert)
+        last_block_id = _insert_tokens(index, list(range(12)))
+
+    hit_len, hit_last_block_id, hit_blocks = index.lookup_longest_prefix(
+        list(range(13)),
+        max_usable_tokens=usable_prefix_cache_tokens(13, 4),
+    )
+
+    assert hit_len == 12
+    assert hit_last_block_id == last_block_id
+    assert hit_blocks == 3
+
+
+def test_radix_backend_stats_handles_deep_prefix_chain_iteratively():
+    backend = RadixTreeBackend()
+    parent = None
+    for i in range(2000):
+        block_id = f"block-{i}".encode()
+        backend.insert_child(parent, block_id)
+        parent = block_id
+
+    assert backend.stats() == {
+        "prefix_cache_tree_nodes": 2001,
+        "prefix_cache_tree_edges": 2000,
+    }
+
+
 def test_lookup_does_not_touch_lru_state():
     fp = build_prefix_cache_fingerprint(_cfg(), 4)
     index = RadixPrefixIndex(block_size=4, fingerprint=fp)
@@ -283,6 +360,66 @@ def test_leaf_only_eviction_preserves_parent_until_child_is_removed():
     evicted = index.evict_until_freeable(1)
     assert [block.logical_block_idx for block in evicted] == [0]
     assert len(index) == 0
+
+
+def test_bulk_eviction_scans_initial_leaves_once(monkeypatch):
+    fp = build_prefix_cache_fingerprint(_cfg(), 4)
+    index = RadixPrefixIndex(block_size=4, fingerprint=fp)
+    for i in range(32):
+        block_id = index.stable_block_id([i, i, i, i], None)
+        index.insert_block(
+            PrefixCacheBlock(
+                stable_block_id=block_id,
+                parent_block_id=None,
+                block_size=4,
+                logical_block_idx=i,
+                payload=SimpleNamespace(name="dummy"),
+                token_ids=(i, i, i, i),
+            )
+        )
+
+    leaf_calls = 0
+    original_leaf_block_ids = index.backend.leaf_block_ids
+
+    def counted_leaf_block_ids():
+        nonlocal leaf_calls
+        leaf_calls += 1
+        return original_leaf_block_ids()
+
+    monkeypatch.setattr(index.backend, "leaf_block_ids", counted_leaf_block_ids)
+
+    evicted = index.evict_until_freeable(16)
+
+    assert len(evicted) == 16
+    assert leaf_calls == 1
+
+
+def test_bulk_eviction_queues_new_parent_leaf_with_priority_ordering():
+    fp = build_prefix_cache_fingerprint(_cfg(), 4)
+    index = RadixPrefixIndex(block_size=4, fingerprint=fp)
+    chain_last = _insert_tokens(index, list(range(8)))
+    sibling_id = index.stable_block_id([8, 9, 10, 11], None)
+    index.insert_block(
+        PrefixCacheBlock(
+            stable_block_id=sibling_id,
+            parent_block_id=None,
+            block_size=4,
+            logical_block_idx=0,
+            payload=SimpleNamespace(name="sibling"),
+            token_ids=(8, 9, 10, 11),
+        )
+    )
+    parent, child = index.get_chain(chain_last, 2)
+    sibling = index.get_block(sibling_id)
+    assert sibling is not None
+    parent.eviction_priority = 10
+    child.eviction_priority = 0
+    sibling.eviction_priority = 0
+
+    evicted = index.evict_until_freeable(2)
+
+    assert evicted == [child, parent]
+    assert sibling_id in index.blocks
 
 
 def test_referenced_blocks_are_not_evictable():
@@ -461,12 +598,6 @@ def test_config_rejects_unvalidated_prefix_cache_options():
             decode_cuda_graph=True,
             decode_cuda_graph_capture_sampling=True,
         )
-    with pytest.raises(ValueError, match="tensor_parallel_size=1"):
-        _make_config(
-            enable_prefix_caching=True,
-            decode_cuda_graph=True,
-            tensor_parallel_size=2,
-        )
     with pytest.raises(ValueError, match="quest_chunk_size"):
         _make_config(
             vllm_sparse_method="quest",
@@ -482,8 +613,12 @@ def test_config_rejects_unvalidated_prefix_cache_options():
         _make_config(prefix_cache_max_blocks="16.9")
 
 
-def test_config_allows_prefix_cache_decode_cuda_graph_tp1_methods():
-    vanilla = _make_config(enable_prefix_caching=True, decode_cuda_graph=True)
+def test_config_allows_prefix_cache_decode_cuda_graph_tp_methods():
+    vanilla = _make_config(
+        enable_prefix_caching=True,
+        decode_cuda_graph=True,
+        tensor_parallel_size=2,
+    )
     assert vanilla.enable_prefix_caching is True
     assert vanilla.decode_cuda_graph is True
     assert vanilla.decode_cuda_graph_capture_sampling is False
@@ -492,6 +627,7 @@ def test_config_allows_prefix_cache_decode_cuda_graph_tp1_methods():
         vllm_sparse_method="omnikv",
         enable_prefix_caching=True,
         decode_cuda_graph=True,
+        tensor_parallel_size=2,
     )
     assert omnikv.enable_prefix_caching is True
     assert omnikv.decode_cuda_graph is True
@@ -500,6 +636,7 @@ def test_config_allows_prefix_cache_decode_cuda_graph_tp1_methods():
         vllm_sparse_method="quest",
         enable_prefix_caching=True,
         decode_cuda_graph=True,
+        tensor_parallel_size=2,
         quest_chunk_size=8,
         prefix_cache_block_size=None,
     )

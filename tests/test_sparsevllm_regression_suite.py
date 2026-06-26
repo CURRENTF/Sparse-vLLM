@@ -1,5 +1,6 @@
 import io
 import json
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -45,6 +46,53 @@ class SparseVLLMRegressionSuiteTest(unittest.TestCase):
         self.assertEqual(hyper_params["tensor_parallel_size"], 2)
         self.assertTrue(hyper_params["decode_cuda_graph"])
         self.assertFalse(hyper_params["decode_cuda_graph_capture_sampling"])
+
+    def test_quality_command_can_enable_tp_prefix_graph_for_supported_methods(self):
+        cmd = run_suite._quality_command(
+            model_id="qwen25_7b",
+            method_id="quest",
+            model={"model_path": "/models/qwen", "tokenizer_path": "/models/qwen"},
+            method={
+                "sparse_method": "quest",
+                "config": {"sparse_method": "quest", "quest_chunk_size": 16},
+            },
+            quality={
+                **self._quality_cfg(),
+                "enable_prefix_caching": True,
+                "prefix_cache_block_size": 16,
+                "enable_profiler": True,
+            },
+            performance={
+                "decode_cuda_graph": True,
+                "enforce_eager": False,
+                "tensor_parallel_size": 2,
+            },
+            output_root=Path("/tmp/sparsevllm-quality"),
+        )
+
+        hyper_params = json.loads(cmd[cmd.index("--hyper_param") + 1])
+        self.assertEqual(hyper_params["tensor_parallel_size"], 2)
+        self.assertTrue(hyper_params["decode_cuda_graph"])
+        self.assertTrue(hyper_params["enable_prefix_caching"])
+        self.assertTrue(hyper_params["enable_profiler"])
+        self.assertEqual(hyper_params["prefix_cache_block_size"], 16)
+        self.assertFalse(hyper_params["decode_cuda_graph_capture_sampling"])
+
+    def test_quality_command_rejects_prefix_cache_for_unsupported_methods(self):
+        with self.assertRaisesRegex(ValueError, "enable_prefix_caching"):
+            run_suite._quality_command(
+                model_id="qwen25_7b",
+                method_id="snapkv",
+                model={"model_path": "/models/qwen", "tokenizer_path": "/models/qwen"},
+                method={"sparse_method": "snapkv", "config": {"sparse_method": "snapkv"}},
+                quality={**self._quality_cfg(), "enable_prefix_caching": True},
+                performance={
+                    "decode_cuda_graph": True,
+                    "enforce_eager": False,
+                    "tensor_parallel_size": 2,
+                },
+                output_root=Path("/tmp/sparsevllm-quality"),
+            )
 
     def test_perf_command_uses_tp_decode_graph_hyper_params(self):
         cmd = run_suite._perf_command(
@@ -112,11 +160,47 @@ class SparseVLLMRegressionSuiteTest(unittest.TestCase):
             manifest_path=Path("/tmp/manifest.json"),
             model_id="qwen3_4b",
             method_ids=["vanilla"],
-            scbench={**base, "decode_cuda_graph": True, "enforce_eager": False},
+            scbench={**base, "decode_cuda_graph": True, "enforce_eager": False, "tensor_parallel_size": 2},
             output_dir=Path("/tmp/scbench"),
         )
         self.assertIn("--decode_cuda_graph", graph_cmd)
         self.assertIn("--no-enforce_eager", graph_cmd)
+        self.assertEqual(graph_cmd[graph_cmd.index("--tensor_parallel_size") + 1], "2")
+
+    def test_stress_command_can_require_prefix_cache_hit(self):
+        cmd = run_suite._stress_command(
+            model_id="qwen25_7b",
+            model={"model_path": "/models/qwen", "tokenizer_path": "/models/qwen"},
+            method_id="omnikv",
+            method={
+                "sparse_method": "omnikv",
+                "config": {"sparse_method": "omnikv"},
+            },
+            performance={
+                "decode_cuda_graph": True,
+                "enforce_eager": False,
+                "tensor_parallel_size": 2,
+            },
+            stress={
+                "length": 1024,
+                "request_counts": [4],
+                "output_len": 8,
+                "max_decode_steps_after_full": 2,
+                "enable_prefix_caching": True,
+                "prefix_cache_block_size": 16,
+                "require_prefix_cache_hit": True,
+                "enable_profiler": True,
+            },
+            output_jsonl=Path("/tmp/stress.jsonl"),
+        )
+
+        hyper_params = json.loads(cmd[cmd.index("--hyper_params") + 1])
+        self.assertTrue(hyper_params["enable_prefix_caching"])
+        self.assertTrue(hyper_params["enable_profiler"])
+        self.assertTrue(hyper_params["decode_cuda_graph"])
+        self.assertEqual(hyper_params["tensor_parallel_size"], 2)
+        self.assertIn("--require_prefix_cache_hit", cmd)
+        self.assertEqual(cmd[cmd.index("--admission_wave_size") + 1], "2")
 
     def test_validate_layer_runs_as_a_standard_test_and_writes_required_artifacts(self):
         # Keep the default tests on the cheap validate layer only. Full
@@ -159,6 +243,97 @@ class SparseVLLMRegressionSuiteTest(unittest.TestCase):
 
             for jsonl_name in ("raw_outputs.jsonl", "parsed_outputs.jsonl", "sample_results.jsonl", "perf.jsonl"):
                 self.assertEqual((run_root / jsonl_name).read_text(encoding="utf-8"), "")
+
+    def test_validate_layer_records_quick_regression_overrides(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            argv = [
+                "run_suite.py",
+                "--layer",
+                "validate",
+                "--models",
+                "qwen3_4b",
+                "--methods",
+                "vanilla",
+                "--quality_tasks",
+                "qasper,hotpotqa",
+                "--quality_batch_size",
+                "2",
+                "--quality_samples_per_task",
+                "2",
+                "--quality_min_required_samples",
+                "2",
+                "--quality_sparsevllm_max_num_seqs_in_batch",
+                "2",
+                "--quality_sparsevllm_max_decoding_seqs",
+                "2",
+                "--scbench_tasks",
+                "scbench_kv",
+                "--scbench_num_eval_examples",
+                "1",
+                "--scbench_batch_size",
+                "1",
+                "--stress_length",
+                "512",
+                "--stress_request_counts",
+                "2",
+                "--stress_output_len",
+                "2",
+                "--stress_max_num_seqs_in_batch",
+                "2",
+                "--stress_max_decoding_seqs",
+                "2",
+                "--stress_max_decode_steps_after_full",
+                "1",
+                "--enable_profiler",
+                "--run_id",
+                "unit_quick_overrides",
+                "--output_root",
+                tmp,
+            ]
+
+            with patch("sys.argv", argv), redirect_stdout(io.StringIO()):
+                self.assertEqual(run_suite.main(), 0)
+
+            run_root = Path(tmp) / "sparsevllm_regression" / "unit_quick_overrides"
+            with (run_root / "resolved_manifest.json").open("r", encoding="utf-8") as handle:
+                resolved = json.load(handle)
+
+            self.assertEqual(resolved["quality"]["tasks"], ["qasper", "hotpotqa"])
+            self.assertEqual(resolved["quality"]["batch_size"], 2)
+            self.assertEqual(resolved["quality"]["samples_per_task"], 2)
+            self.assertEqual(resolved["quality"]["min_required_samples"], 2)
+            self.assertEqual(resolved["quality"]["sparsevllm_max_num_seqs_in_batch"], 2)
+            self.assertEqual(resolved["quality"]["sparsevllm_max_decoding_seqs"], 2)
+            self.assertEqual(resolved["scbench"]["tasks"], ["scbench_kv"])
+            self.assertEqual(resolved["scbench"]["num_eval_examples"], 1)
+            self.assertEqual(resolved["scbench"]["batch_size"], 1)
+            self.assertEqual(resolved["stress"]["length"], 512)
+            self.assertEqual(resolved["stress"]["request_counts"], [2])
+            self.assertEqual(resolved["stress"]["output_len"], 2)
+            self.assertEqual(resolved["stress"]["max_num_seqs_in_batch"], 2)
+            self.assertEqual(resolved["stress"]["max_decoding_seqs"], 2)
+            self.assertEqual(resolved["stress"]["max_decode_steps_after_full"], 1)
+            self.assertTrue(resolved["quality"]["enable_profiler"])
+            self.assertTrue(resolved["performance"]["enable_profiler"])
+            self.assertTrue(resolved["stress"]["enable_profiler"])
+
+    def test_run_command_timeout_records_and_terminates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "timeout.log"
+            cmd = [sys.executable, "-c", "import time; time.sleep(10)"]
+
+            with self.assertRaises(run_suite.CommandExecutionError) as raised:
+                run_suite._run_command(
+                    cmd,
+                    cwd=Path.cwd(),
+                    dry_run=False,
+                    log_path=log_path,
+                    timeout_s=0.1,
+                )
+
+            self.assertEqual(raised.exception.record["status"], "timeout")
+            self.assertEqual(raised.exception.record["timeout_s"], 0.1)
+            self.assertIn("command exceeded timeout_s=0.1", log_path.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

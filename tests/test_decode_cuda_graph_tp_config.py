@@ -50,9 +50,13 @@ class DecodeCudaGraphTPConfigTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "DeltaKV is not supported"):
             self._config("deltakv", allow_missing_deltakv_path=True)
 
-    def test_tp_decode_cuda_graph_rejects_prefix_cache_for_quest(self):
-        with self.assertRaisesRegex(ValueError, "prefix caching with decode_cuda_graph supports tensor_parallel_size=1"):
-            self._config("quest", enable_prefix_caching=True)
+    def test_tp_decode_cuda_graph_accepts_prefix_cache_methods(self):
+        for method in ["vanilla", "omnikv", "quest"]:
+            with self.subTest(method=method):
+                cfg = self._config(method, enable_prefix_caching=True)
+                self.assertTrue(cfg.decode_cuda_graph)
+                self.assertTrue(cfg.enable_prefix_caching)
+                self.assertFalse(cfg.decode_cuda_graph_capture_sampling)
 
     def test_tp_decode_cuda_graph_rejects_capture_sampling(self):
         with self.assertRaisesRegex(ValueError, "capture_sampling is disabled"):

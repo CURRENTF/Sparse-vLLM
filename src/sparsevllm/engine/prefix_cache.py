@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import heapq
 import json
 import struct
 from dataclasses import dataclass, field
@@ -117,6 +118,67 @@ class RadixTreeBackend:
     def __init__(self):
         self.root = RadixTreeNode()
         self._locations: dict[bytes, tuple[RadixTreeNode, int]] = {}
+        self._leaf_block_ids: set[bytes] = set()
+
+    def _index_segment(self, node: RadixTreeNode) -> None:
+        for index, block_id in enumerate(node.segment):
+            self._locations[block_id] = (node, index)
+
+    def _unindex_segment(self, segment: tuple[bytes, ...]) -> None:
+        for block_id in segment:
+            self._locations.pop(block_id, None)
+
+    def _discard_leaf(self, node: RadixTreeNode) -> None:
+        if node.segment:
+            self._leaf_block_ids.discard(node.segment[-1])
+
+    def _add_leaf(self, node: RadixTreeNode) -> None:
+        if node.segment and not node.children:
+            self._leaf_block_ids.add(node.segment[-1])
+
+    def _split_after(self, node: RadixTreeNode, index: int) -> RadixTreeNode:
+        old_segment = node.segment
+        prefix = old_segment[: index + 1]
+        suffix = old_segment[index + 1:]
+        if not suffix:
+            return node
+        old_children = node.children
+        self._unindex_segment(old_segment)
+
+        suffix_node = RadixTreeNode(segment=suffix, parent=node, children=old_children)
+        for child in suffix_node.children.values():
+            child.parent = suffix_node
+        node.segment = prefix
+        node.children = {suffix[0]: suffix_node}
+        self._index_segment(node)
+        self._index_segment(suffix_node)
+        return node
+
+    def insert_child(self, parent_block_id: bytes | None, block_id: bytes) -> None:
+        if block_id in self._locations:
+            return
+        if parent_block_id is None:
+            if block_id in self.root.children:
+                raise RuntimeError("Radix tree root child exists without a block location.")
+            child = RadixTreeNode(segment=(block_id,), parent=self.root)
+            self.root.children[block_id] = child
+            self._index_segment(child)
+            self._add_leaf(child)
+            return
+
+        location = self._locations.get(parent_block_id)
+        if location is None:
+            raise KeyError("Prefix cache parent block id is not present in radix tree.")
+        parent_node, index = location
+        parent_node = self._split_after(parent_node, index)
+        if not parent_node.children:
+            self._discard_leaf(parent_node)
+        if block_id in parent_node.children:
+            raise RuntimeError("Radix tree child exists without a block location.")
+        child = RadixTreeNode(segment=(block_id,), parent=parent_node)
+        parent_node.children[block_id] = child
+        self._index_segment(child)
+        self._add_leaf(child)
 
     def lookup(self, block_ids: list[bytes] | tuple[bytes, ...], max_blocks: int) -> RadixLookupResult:
         node = self.root
@@ -144,8 +206,12 @@ class RadixTreeBackend:
         while offset < len(block_ids):
             child = node.children.get(block_ids[offset])
             if child is None:
-                node.children[block_ids[offset]] = RadixTreeNode(segment=block_ids[offset:], parent=node)
-                self._rebuild_locations()
+                if not node.children:
+                    self._discard_leaf(node)
+                child = RadixTreeNode(segment=block_ids[offset:], parent=node)
+                node.children[block_ids[offset]] = child
+                self._index_segment(child)
+                self._add_leaf(child)
                 return
 
             common = 0
@@ -164,6 +230,8 @@ class RadixTreeBackend:
             if common <= 0:
                 raise RuntimeError("Radix tree child map is inconsistent with edge segment.")
 
+            old_segment = child.segment
+            self._unindex_segment(old_segment)
             prefix = child.segment[:common]
             suffix = child.segment[common:]
             split = RadixTreeNode(segment=prefix, parent=node)
@@ -175,11 +243,15 @@ class RadixTreeBackend:
             offset += common
             if offset < len(block_ids):
                 new_segment = block_ids[offset:]
-                split.children[new_segment[0]] = RadixTreeNode(segment=new_segment, parent=split)
-            self._rebuild_locations()
+                new_child = RadixTreeNode(segment=new_segment, parent=split)
+                split.children[new_segment[0]] = new_child
+                self._index_segment(new_child)
+                self._add_leaf(new_child)
+            self._index_segment(split)
+            self._index_segment(child)
             return
 
-        self._rebuild_locations()
+        return
 
     def remove_block(self, block_id: bytes) -> None:
         location = self._locations.get(block_id)
@@ -190,11 +262,15 @@ class RadixTreeBackend:
             raise RuntimeError("Cannot remove a prefix cache tree block with live children.")
         if node.parent is None:
             raise RuntimeError("Cannot remove radix tree root.")
+        self._locations.pop(block_id, None)
+        self._leaf_block_ids.discard(block_id)
         if len(node.segment) == 1:
-            del node.parent.children[node.segment[0]]
+            parent = node.parent
+            del parent.children[node.segment[0]]
+            self._add_leaf(parent)
         else:
             node.segment = node.segment[:-1]
-        self._rebuild_locations()
+            self._add_leaf(node)
 
     def path_to_block(self, block_id: bytes) -> tuple[bytes, ...]:
         location = self._locations.get(block_id)
@@ -232,33 +308,35 @@ class RadixTreeBackend:
         return len(node.children)
 
     def leaf_block_ids(self) -> tuple[bytes, ...]:
-        leaves: list[bytes] = []
-        for block_id, (node, index) in self._locations.items():
-            if index == len(node.segment) - 1 and not node.children:
-                leaves.append(block_id)
-        return tuple(leaves)
+        return tuple(self._leaf_block_ids)
 
     def stats(self) -> dict[str, int]:
+        node_count = 0
+        edge_count = 0
+        stack = [self.root]
+        while stack:
+            node = stack.pop()
+            node_count += 1
+            edge_count += len(node.children)
+            stack.extend(node.children.values())
         return {
-            "prefix_cache_tree_nodes": int(self._count_nodes(self.root)),
-            "prefix_cache_tree_edges": int(self._count_edges(self.root)),
+            "prefix_cache_tree_nodes": int(node_count),
+            "prefix_cache_tree_edges": int(edge_count),
         }
 
     def _rebuild_locations(self) -> None:
         locations: dict[bytes, tuple[RadixTreeNode, int]] = {}
+        leaf_block_ids: set[bytes] = set()
         stack = list(self.root.children.values())
         while stack:
             node = stack.pop()
             for index, block_id in enumerate(node.segment):
                 locations[block_id] = (node, index)
+            if node.segment and not node.children:
+                leaf_block_ids.add(node.segment[-1])
             stack.extend(node.children.values())
         self._locations = locations
-
-    def _count_nodes(self, node: RadixTreeNode) -> int:
-        return 1 + sum(self._count_nodes(child) for child in node.children.values())
-
-    def _count_edges(self, node: RadixTreeNode) -> int:
-        return len(node.children) + sum(self._count_edges(child) for child in node.children.values())
+        self._leaf_block_ids = leaf_block_ids
 
 
 @dataclass(frozen=True)
@@ -438,15 +516,12 @@ class RadixPrefixIndex:
                 f"live_blocks={len(self.blocks)} max_blocks={self.max_blocks} "
                 f"evictable_blocks={self.evictable_blocks()}."
             )
-        if block.parent_block_id is None:
-            path = (block.stable_block_id,)
-        else:
+        if block.parent_block_id is not None:
             if block.parent_block_id not in self.blocks:
                 raise KeyError("Cannot insert prefix cache block because parent is missing.")
-            path = self.backend.path_to_block(block.parent_block_id) + (block.stable_block_id,)
         block.last_access = self._tick()
         self.blocks[block.stable_block_id] = block
-        self.backend.insert(path)
+        self.backend.insert_child(block.parent_block_id, block.stable_block_id)
         self.committed_blocks += 1
         return block
 
@@ -464,7 +539,13 @@ class RadixPrefixIndex:
         return self.child_count(block.stable_block_id) == 0
 
     def evictable_blocks(self) -> int:
-        return sum(1 for block in self.blocks.values() if self.can_evict(block))
+        return sum(
+            1
+            for block_id in self.backend.leaf_block_ids()
+            if (block := self.blocks.get(block_id)) is not None
+            and int(block.ref_count) == 0
+            and int(block.eviction_priority) >= 0
+        )
 
     def _remove_block_from_index(self, stable_block_id: bytes) -> PrefixCacheBlock:
         block = self.blocks.get(stable_block_id)
@@ -483,13 +564,37 @@ class RadixPrefixIndex:
     def evict_until_freeable(self, needed_blocks: int) -> list[PrefixCacheBlock]:
         evicted: list[PrefixCacheBlock] = []
         needed_blocks = int(needed_blocks)
+        candidate_heap: list[tuple[int, int, bytes]] = []
+        queued: set[bytes] = set()
+
+        def queue_if_evictable(block_id: bytes | None) -> None:
+            if block_id is None or block_id in queued:
+                return
+            block = self.blocks.get(block_id)
+            if block is None or not self.can_evict(block):
+                return
+            heapq.heappush(
+                candidate_heap,
+                (-int(block.eviction_priority), int(block.last_access), block_id),
+            )
+            queued.add(block_id)
+
+        for block_id in self.backend.leaf_block_ids():
+            queue_if_evictable(block_id)
+
         while len(evicted) < needed_blocks:
-            candidates = [block for block in self.blocks.values() if self.can_evict(block)]
-            if not candidates:
+            while candidate_heap:
+                _, _, block_id = heapq.heappop(candidate_heap)
+                queued.discard(block_id)
+                block = self.blocks.get(block_id)
+                if block is not None and self.can_evict(block):
+                    break
+            else:
                 break
-            block = min(candidates, key=lambda candidate: (-int(candidate.eviction_priority), candidate.last_access))
+            parent_block_id = block.parent_block_id
             evicted.append(self._remove_block_from_index(block.stable_block_id))
             self.evicted_blocks += 1
+            queue_if_evictable(parent_block_id)
         return evicted
 
     def inspect_prefix(
