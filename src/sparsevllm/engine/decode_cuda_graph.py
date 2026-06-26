@@ -404,6 +404,8 @@ class DecodeCudaGraphRunner:
             self.sparse_controller.prepare_forward(seqs, is_prefill=False)
             logits = self.run_model(input_ids, positions, is_prefill=False)
             if state.key.capture_sampling:
+                if logits is None:
+                    raise RuntimeError("decode_cuda_graph capture_sampling requires rank-0 logits.")
                 _ = logits.argmax(dim=-1)
         self.platform.synchronize()
 
@@ -420,6 +422,8 @@ class DecodeCudaGraphRunner:
                     self._reset_graph_input_attn_scores(graph_input_sparse_state_refs)
                     logits = self.run_model(input_ids, positions, is_prefill=False)
                     if state.key.capture_sampling:
+                        if logits is None:
+                            raise RuntimeError("decode_cuda_graph capture_sampling requires rank-0 logits.")
                         token_ids = logits.argmax(dim=-1)
                     else:
                         token_ids = None
@@ -461,9 +465,7 @@ class DecodeCudaGraphRunner:
         seqs: list[Sequence],
         *,
         capture_sampling: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        if self.rank != 0:
-            raise ValueError("decode_cuda_graph currently supports rank 0 / TP=1 only.")
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         if not seqs:
             raise ValueError("decode_cuda_graph requires a non-empty decode batch.")
         if capture_sampling and any(seq.temperature > 1e-10 for seq in seqs):
@@ -491,19 +493,17 @@ class DecodeCudaGraphRunner:
 
         if state.graph is None:
             state = self._capture(state, seqs, input_ids, positions)
-            assert state.logits is not None
             self._restore_sparse_state_refs(state)
             with profiler.record("decode_cuda_graph_replay_after_capture"):
                 state.graph.replay()
-            logits = state.logits[:real_batch_size]
+            logits = state.logits[:real_batch_size] if state.logits is not None else None
             token_ids = state.token_ids[:real_batch_size] if state.token_ids is not None else None
             return logits, token_ids
 
-        assert state.logits is not None
         self._restore_sparse_state_refs(state)
         with profiler.record("decode_cuda_graph_replay"):
             state.graph.replay()
-        logits = state.logits[:real_batch_size]
+        logits = state.logits[:real_batch_size] if state.logits is not None else None
         token_ids = state.token_ids[:real_batch_size] if state.token_ids is not None else None
         return logits, token_ids
 

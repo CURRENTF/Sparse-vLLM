@@ -131,6 +131,24 @@ For a full non-32B quality run:
   --output_root /root/autodl-tmp/outputs/deltakv
 ```
 
+For TP decode CUDA graph v1 quality validation, keep LongBench data-worker
+parallelism at its default and pass engine TP through the regression-suite
+override:
+
+```bash
+/root/miniconda3/bin/conda run -n kv --no-capture-output \
+  python benchmark/sparsevllm_regression/run_suite.py \
+  --layer quality \
+  --models qwen25_7b \
+  --methods vanilla,streamingllm,snapkv,pyramidkv,omnikv,rkv,skipkv \
+  --tensor_parallel_size 2 \
+  --run_id tp2_graph_quality_v1_$(date -u +%Y%m%d_%H%M%S) \
+  --output_root /root/autodl-tmp/outputs/deltakv
+```
+
+This compares sparse methods against TP vanilla in the same run. A/B/C grades
+are recorded; crashes or D grades fail the TP graph quality gate.
+
 ### Correctness / Logits
 
 `logits` compares HF sparse reference outputs with SparseVLLM for methods that
@@ -168,6 +186,22 @@ suite can compute decode speedup.
   --run_id omnikv_perf_$(date -u +%Y%m%d_%H%M%S) \
   --output_root /root/autodl-tmp/outputs/deltakv
 ```
+
+For TP decode CUDA graph v1 performance validation:
+
+```bash
+/root/miniconda3/bin/conda run -n kv --no-capture-output \
+  python benchmark/sparsevllm_regression/run_suite.py \
+  --layer perf \
+  --models qwen25_7b \
+  --methods vanilla,streamingllm,snapkv,pyramidkv,omnikv,rkv,skipkv \
+  --tensor_parallel_size 2 \
+  --run_id tp2_graph_perf_v1_$(date -u +%Y%m%d_%H%M%S) \
+  --output_root /root/autodl-tmp/outputs/deltakv
+```
+
+Inspect `perf.jsonl` for `decode_cuda_graph_expected=true` and
+`decode_cuda_graph_active=true`.
 
 ### Stress
 

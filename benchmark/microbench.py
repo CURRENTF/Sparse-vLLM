@@ -19,7 +19,11 @@ if src_path not in sys.path:
     sys.path.insert(0, src_path)
 
 from deltakv.configs.runtime_params import normalize_runtime_params
-from sparsevllm.method_registry import is_decode_cuda_graph_supported, normalize_sparse_method
+from sparsevllm.method_registry import (
+    is_decode_cuda_graph_supported,
+    is_tp_decode_cuda_graph_supported,
+    normalize_sparse_method,
+)
 
 
 def get_peak_memory():
@@ -305,20 +309,29 @@ def benchmark_task(method, length, bs, args, results_dict):
         sparse_kwargs["sparse_method"] = method
 
     normalized_method = normalize_sparse_method(sparse_kwargs["sparse_method"])
-    if bool(base_hyper_params.get("decode_cuda_graph")) and not is_decode_cuda_graph_supported(normalized_method):
+    tensor_parallel_size = int(base_hyper_params.get("tensor_parallel_size", 1) or 1)
+    graph_supported = (
+        is_tp_decode_cuda_graph_supported(normalized_method)
+        if tensor_parallel_size > 1
+        else is_decode_cuda_graph_supported(normalized_method)
+    )
+    if bool(base_hyper_params.get("decode_cuda_graph")) and not graph_supported:
         results_dict[(method, length, bs)] = {
             "method": method,
             "sparse_method": normalized_method,
             "length": int(length),
             "batch_size": int(bs),
             "status": "SKIPPED_BY_POLICY",
-            "reason": f"decode_cuda_graph is not supported for sparse_method={normalized_method!r}.",
+            "reason": (
+                "decode_cuda_graph is not supported for "
+                f"sparse_method={normalized_method!r}, tensor_parallel_size={tensor_parallel_size}."
+            ),
             "decode_cuda_graph_expected": True,
             "decode_cuda_graph_active": False,
         }
         print(
             f"[{method.upper()}] SKIPPED_BY_POLICY: decode_cuda_graph is not supported "
-            f"for sparse_method={normalized_method!r}."
+            f"for sparse_method={normalized_method!r}, tensor_parallel_size={tensor_parallel_size}."
         )
         return
     

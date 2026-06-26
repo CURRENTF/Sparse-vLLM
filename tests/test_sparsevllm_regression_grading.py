@@ -261,6 +261,7 @@ class SparseVLLMRegressionGradingTest(unittest.TestCase):
         self.assertEqual(grade_logits(metrics, p99_threshold=0.1).grade, "A")
         self.assertEqual(grade_logits(None).grade, "N/A")
         self.assertEqual(grade_perf(1.1, graph_expected=True, graph_active=True).grade, "C")
+        self.assertEqual(grade_perf(0.8, graph_expected=True, graph_active=True, require_speedup=False).grade, "A")
         self.assertEqual(grade_perf(2.1, graph_expected=True, graph_active=False).grade, "D")
         self.assertEqual(grade_memory(expected_savings=0.3, observed_savings=0.21).grade, "B")
         self.assertEqual(grade_memory(expected_savings=0.3, observed_savings=0.05).grade, "D")

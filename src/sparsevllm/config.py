@@ -10,6 +10,7 @@ from sparsevllm.method_registry import (
     PREFIX_CACHE_SUPPORTED_METHODS,
     SUPPORTED_SPARSE_METHODS,
     is_decode_cuda_graph_supported,
+    is_tp_decode_cuda_graph_supported,
     normalize_sparse_method,
     resolve_prefill_schedule_policy,
 )
@@ -565,13 +566,34 @@ class Config:
         if self.decode_cuda_graph:
             if self.enable_prefix_caching:
                 raise ValueError("prefix caching with decode_cuda_graph will be enabled after validation.")
-            if not is_decode_cuda_graph_supported(self.vllm_sparse_method):
+            if self.tensor_parallel_size > 1:
+                if self.decode_cuda_graph_capture_sampling:
+                    raise ValueError(
+                        "decode_cuda_graph_capture_sampling is disabled when tensor_parallel_size > 1 "
+                        "because TP workers do not materialize rank-0 gathered logits."
+                    )
+                if not is_tp_decode_cuda_graph_supported(self.vllm_sparse_method):
+                    supported = ", ".join(
+                        repr(method)
+                        for method in sorted(DECODE_CUDA_GRAPH_SUPPORTED_METHODS)
+                        if method and is_tp_decode_cuda_graph_supported(method)
+                    )
+                    raise ValueError(
+                        "decode_cuda_graph with tensor_parallel_size > 1 supports these methods only: "
+                        f"'', {supported}. v1 excludes DeltaKV and QuEST."
+                    )
+                log_once(
+                    "decode_cuda_graph with tensor_parallel_size > 1 uses TP-local sparse selection: "
+                    "each rank selects sparse tokens from its local heads/KV heads without cross-rank "
+                    "sparse-index aggregation, so sparse behavior is not guaranteed equivalent to TP=1 "
+                    "or global-head sparse selection.",
+                    level="WARNING",
+                )
+            elif not is_decode_cuda_graph_supported(self.vllm_sparse_method):
                 supported = ", ".join(
                     repr(method) for method in sorted(DECODE_CUDA_GRAPH_SUPPORTED_METHODS) if method
                 )
                 raise ValueError(f"decode_cuda_graph supports these methods only: '', {supported}.")
-            if self.tensor_parallel_size != 1:
-                raise ValueError("decode_cuda_graph currently supports tensor_parallel_size=1 only.")
             self.decode_cuda_graph_capture_sizes = _resolve_decode_cuda_graph_capture_sizes(
                 self.decode_cuda_graph_capture_sizes,
                 self.max_decoding_seqs,

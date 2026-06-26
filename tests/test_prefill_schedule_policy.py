@@ -390,10 +390,17 @@ class PrefillPolicyConfigTest(unittest.TestCase):
                 allow_missing_deltakv_path=True,
             )
 
-    def test_decode_cuda_graph_requires_single_tp(self):
-        with self.assertRaisesRegex(ValueError, "tensor_parallel_size=1"):
+    def test_decode_cuda_graph_tp_v1_method_scope(self):
+        cfg = self.make_config(
+            vllm_sparse_method="omnikv",
+            decode_cuda_graph=True,
+            tensor_parallel_size=2,
+        )
+        self.assertTrue(cfg.decode_cuda_graph)
+
+        with self.assertRaisesRegex(ValueError, "v1 excludes DeltaKV and QuEST"):
             self.make_config(
-                vllm_sparse_method="omnikv",
+                vllm_sparse_method="quest",
                 decode_cuda_graph=True,
                 tensor_parallel_size=2,
             )

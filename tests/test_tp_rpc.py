@@ -95,6 +95,24 @@ def test_prefix_cache_control_rpc_reports_any_tp_worker_failure():
             raise AssertionError("expected worker failure to be surfaced on rank 0")
 
 
+def test_run_rpc_reports_any_tp_worker_failure():
+    runner = object.__new__(ModelRunner)
+    runner.world_size = 2
+    runner.device = torch.device("cpu")
+
+    def mark_failed(tensor, op=None):
+        assert op == dist.ReduceOp.MAX
+        tensor.fill_(1)
+
+    with patch.object(dist, "is_initialized", return_value=True), patch.object(dist, "all_reduce", side_effect=mark_failed):
+        try:
+            ModelRunner._sync_tp_rpc_status(runner, "run", None)
+        except RuntimeError as exc:
+            assert "At least one TP worker failed during run" in str(exc)
+        else:
+            raise AssertionError("expected worker failure to be surfaced on rank 0")
+
+
 def test_tp_worker_decode_skips_rank0_sampling_path():
     calls: list[str] = []
 

@@ -38,6 +38,7 @@ PREFIX_CACHE_CONTROL_RPC_METHODS = {
     "prefix_cache_delete_subtree",
     "prefix_cache_set_eviction_priority",
 }
+TP_RPC_STATUS_SYNC_METHODS = PREFIX_CACHE_CONTROL_RPC_METHODS | {"run"}
 
 
 def make_tp_shm_name() -> str:
@@ -220,7 +221,7 @@ class ModelRunner:
         method = getattr(self, method_name, None)
         # Ensure *all* runner-side ops (including sparse post-processing like DeltaKV eviction)
         # run without autograd bookkeeping to avoid large activation graphs / OOM.
-        if method_name in PREFIX_CACHE_CONTROL_RPC_METHODS:
+        if method_name in TP_RPC_STATUS_SYNC_METHODS:
             local_error: BaseException | None = None
             result = None
             try:
@@ -228,14 +229,14 @@ class ModelRunner:
                     result = method(*args)
             except BaseException as exc:
                 local_error = exc
-            self._sync_prefix_cache_control_rpc_status(method_name, local_error)
+            self._sync_tp_rpc_status(method_name, local_error)
             if local_error is not None:
                 raise local_error
             return result
         with torch.inference_mode():
             return method(*args)
 
-    def _sync_prefix_cache_control_rpc_status(
+    def _sync_tp_rpc_status(
         self,
         method_name: str,
         local_error: BaseException | None,
@@ -250,6 +251,13 @@ class ModelRunner:
         dist.all_reduce(failed, op=dist.ReduceOp.MAX)
         if int(failed.item()) != 0 and local_error is None:
             raise RuntimeError(f"At least one TP worker failed during {method_name}.")
+
+    def _sync_prefix_cache_control_rpc_status(
+        self,
+        method_name: str,
+        local_error: BaseException | None,
+    ) -> None:
+        self._sync_tp_rpc_status(method_name, local_error)
 
     def load_deltakv_compressors(self):
         """加载 DeltaKV 压缩器权重"""

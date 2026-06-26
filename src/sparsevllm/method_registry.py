@@ -46,6 +46,15 @@ PREFIX_CACHE_SUPPORTED_METHODS = {"", "omnikv", "quest"}
 
 # All shipped cache managers now expose a graph-stable decode preparation path.
 DECODE_CUDA_GRAPH_SUPPORTED_METHODS = set(CANONICAL_SPARSE_METHODS)
+TP_DECODE_CUDA_GRAPH_SUPPORTED_METHODS = {
+    "",
+    "streamingllm",
+    "snapkv",
+    "pyramidkv",
+    "omnikv",
+    "rkv",
+    "skipkv",
+}
 
 _DEFAULT_PREFILL_POLICY_BY_METHOD = {
     "": PREFILL_POLICY_ALL_CHUNKED,
@@ -88,6 +97,10 @@ def is_deltakv_method(method: str | None) -> bool:
 
 def is_decode_cuda_graph_supported(method: str | None) -> bool:
     return normalize_sparse_method(method) in DECODE_CUDA_GRAPH_SUPPORTED_METHODS
+
+
+def is_tp_decode_cuda_graph_supported(method: str | None) -> bool:
+    return normalize_sparse_method(method) in TP_DECODE_CUDA_GRAPH_SUPPORTED_METHODS
 
 
 def get_default_prefill_schedule_policy(method: str | None) -> str:

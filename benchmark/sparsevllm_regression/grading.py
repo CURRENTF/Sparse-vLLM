@@ -101,15 +101,39 @@ def grade_logits(metrics: dict[str, Any] | None, *, p99_threshold: float | None 
     )
 
 
-def grade_perf(speedup: float, *, graph_expected: bool = True, graph_active: bool = True) -> GateGrade:
+def grade_perf(
+    speedup: float,
+    *,
+    graph_expected: bool = True,
+    graph_active: bool = True,
+    require_speedup: bool = True,
+) -> GateGrade:
     speedup = _require_number(speedup, "speedup")
     if graph_expected and not graph_active:
         return GateGrade(
             "performance",
             "D",
             "failed",
-            {"speedup": speedup, "graph_expected": graph_expected, "graph_active": graph_active},
+            {
+                "speedup": speedup,
+                "graph_expected": graph_expected,
+                "graph_active": graph_active,
+                "require_speedup": require_speedup,
+            },
             "decode CUDA graph was expected but not active.",
+        )
+    if not require_speedup:
+        return GateGrade(
+            "performance",
+            "A",
+            "success",
+            {
+                "speedup": speedup,
+                "graph_expected": graph_expected,
+                "graph_active": graph_active,
+                "require_speedup": require_speedup,
+            },
+            "Speedup is recorded but not required by this performance gate.",
         )
     if speedup >= 2.0:
         grade = "A"
@@ -123,7 +147,12 @@ def grade_perf(speedup: float, *, graph_expected: bool = True, graph_active: boo
         "performance",
         grade,
         "success" if grade != "D" else "failed",
-        {"speedup": speedup, "graph_expected": graph_expected, "graph_active": graph_active},
+        {
+            "speedup": speedup,
+            "graph_expected": graph_expected,
+            "graph_active": graph_active,
+            "require_speedup": require_speedup,
+        },
     )
 
 
@@ -188,4 +217,3 @@ def worst_required_grade(grades: list[GateGrade]) -> str:
     if not required:
         return "N/A"
     return min(required, key=lambda grade: GRADE_ORDER[grade])
-

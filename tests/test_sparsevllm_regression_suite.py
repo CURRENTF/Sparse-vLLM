@@ -11,6 +11,79 @@ from benchmark.sparsevllm_regression.manifest import REQUIRED_ARTIFACTS
 
 
 class SparseVLLMRegressionSuiteTest(unittest.TestCase):
+    def _quality_cfg(self):
+        return {
+            "tasks": ["hotpotqa"],
+            "batch_size": 4,
+            "sparsevllm_max_num_seqs_in_batch": 4,
+            "sparsevllm_max_decoding_seqs": 4,
+            "min_prompt_tokens": 0,
+            "samples_per_task": 2,
+            "min_required_samples": 2,
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "top_k": 1,
+        }
+
+    def test_quality_command_uses_engine_tp_without_changing_longbench_workers(self):
+        cmd = run_suite._quality_command(
+            model_id="qwen25_7b",
+            method_id="snapkv",
+            model={"model_path": "/models/qwen", "tokenizer_path": "/models/qwen"},
+            method={"sparse_method": "snapkv", "config": {"sparse_method": "snapkv"}},
+            quality=self._quality_cfg(),
+            performance={
+                "decode_cuda_graph": True,
+                "enforce_eager": False,
+                "tensor_parallel_size": 2,
+            },
+            output_root=Path("/tmp/sparsevllm-quality"),
+        )
+
+        self.assertEqual(cmd[cmd.index("--ws") + 1], "1")
+        hyper_params = json.loads(cmd[cmd.index("--hyper_param") + 1])
+        self.assertEqual(hyper_params["tensor_parallel_size"], 2)
+        self.assertTrue(hyper_params["decode_cuda_graph"])
+        self.assertFalse(hyper_params["decode_cuda_graph_capture_sampling"])
+
+    def test_perf_command_uses_tp_decode_graph_hyper_params(self):
+        cmd = run_suite._perf_command(
+            model_id="qwen25_7b",
+            model={"model_path": "/models/qwen", "tokenizer_path": "/models/qwen"},
+            method_id="snapkv",
+            method={"sparse_method": "snapkv", "config": {"sparse_method": "snapkv"}},
+            performance={
+                "lengths": [1024],
+                "batch_sizes": [2],
+                "output_len": 8,
+                "decode_cuda_graph": True,
+                "enforce_eager": False,
+                "tensor_parallel_size": 2,
+            },
+            output_jsonl=Path("/tmp/perf.jsonl"),
+        )
+
+        hyper_params = json.loads(cmd[cmd.index("--hyper_params") + 1])
+        self.assertEqual(hyper_params["tensor_parallel_size"], 2)
+        self.assertTrue(hyper_params["decode_cuda_graph"])
+        self.assertFalse(hyper_params["decode_cuda_graph_capture_sampling"])
+
+    def test_tp_decode_graph_command_rejects_quest_v1(self):
+        with self.assertRaisesRegex(ValueError, "v1 gate"):
+            run_suite._quality_command(
+                model_id="qwen25_7b",
+                method_id="quest",
+                model={"model_path": "/models/qwen", "tokenizer_path": "/models/qwen"},
+                method={"sparse_method": "quest", "config": {"sparse_method": "quest"}},
+                quality=self._quality_cfg(),
+                performance={
+                    "decode_cuda_graph": True,
+                    "enforce_eager": False,
+                    "tensor_parallel_size": 2,
+                },
+                output_root=Path("/tmp/sparsevllm-quality"),
+            )
+
     def test_validate_layer_runs_as_a_standard_test_and_writes_required_artifacts(self):
         # Keep the default tests on the cheap validate layer only. Full
         # quality/logits/perf/stress regression runs require model paths,

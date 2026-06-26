@@ -27,7 +27,7 @@ from benchmark.sparsevllm_regression.manifest import (
     resolve_manifest_paths,
     select_entries,
 )
-from sparsevllm.method_registry import is_decode_cuda_graph_supported
+from sparsevllm.method_registry import is_decode_cuda_graph_supported, is_tp_decode_cuda_graph_supported
 
 
 DEFAULT_OUTPUT_ROOT = os.getenv("DELTAKV_OUTPUT_DIR", "/root/autodl-fs/deltakv_outputs")
@@ -125,8 +125,33 @@ def _method_config(
     return cfg
 
 
-def _decode_cuda_graph_for_method(method: dict[str, Any], requested: bool) -> bool:
-    return bool(requested) and is_decode_cuda_graph_supported(method["sparse_method"])
+def _tensor_parallel_size_from_config(*configs: dict[str, Any] | None) -> int:
+    for cfg in configs:
+        if cfg and "tensor_parallel_size" in cfg:
+            value = int(cfg["tensor_parallel_size"])
+            if value <= 0:
+                raise ValueError(f"tensor_parallel_size must be > 0, got {value}.")
+            return value
+    return 1
+
+
+def _decode_cuda_graph_for_method(
+    method: dict[str, Any],
+    requested: bool,
+    *,
+    tensor_parallel_size: int = 1,
+) -> bool:
+    if not requested:
+        return False
+    if int(tensor_parallel_size) > 1:
+        if not is_tp_decode_cuda_graph_supported(method["sparse_method"]):
+            raise ValueError(
+                "decode_cuda_graph with tensor_parallel_size > 1 is a v1 gate for "
+                "vanilla, streamingllm, snapkv, pyramidkv, omnikv, rkv, and skipkv only; "
+                f"got sparse_method={method['sparse_method']!r}."
+            )
+        return True
+    return is_decode_cuda_graph_supported(method["sparse_method"])
 
 
 def _quality_command(
@@ -143,10 +168,15 @@ def _quality_command(
     # Quality runs only the SparseVLLM backend.  HF reference keys are consumed
     # by the logits comparator and should not be forwarded to SparseVLLM config.
     cfg.pop("hf_sparse_method", None)
+    tensor_parallel_size = _tensor_parallel_size_from_config(quality, performance)
+    cfg["tensor_parallel_size"] = int(tensor_parallel_size)
     cfg["decode_cuda_graph"] = _decode_cuda_graph_for_method(
         method,
         bool((performance or {}).get("decode_cuda_graph", False)),
+        tensor_parallel_size=tensor_parallel_size,
     )
+    if tensor_parallel_size > 1:
+        cfg["decode_cuda_graph_capture_sampling"] = False
     cfg["enforce_eager"] = bool((performance or {}).get("enforce_eager", False))
     if "sparsevllm_max_num_seqs_in_batch" in quality:
         cfg["max_num_seqs_in_batch"] = int(quality["sparsevllm_max_num_seqs_in_batch"])
@@ -162,7 +192,7 @@ def _quality_command(
         "--tokenizer_path",
         model["tokenizer_path"],
         "--ws",
-        "1",
+        str(int(quality.get("worker_world_size", quality.get("ws", 1)))),
         "--batch_size",
         str(int(quality.get("batch_size", 1))),
         "--backend",
@@ -266,11 +296,19 @@ def _perf_command(
     performance: dict[str, Any],
     output_jsonl: Path,
 ) -> list[str]:
+    tensor_parallel_size = _tensor_parallel_size_from_config(performance)
     hyper_params = {
         "enforce_eager": bool(performance["enforce_eager"]),
-        "decode_cuda_graph": _decode_cuda_graph_for_method(method, bool(performance["decode_cuda_graph"])),
+        "decode_cuda_graph": _decode_cuda_graph_for_method(
+            method,
+            bool(performance["decode_cuda_graph"]),
+            tensor_parallel_size=tensor_parallel_size,
+        ),
+        "tensor_parallel_size": int(tensor_parallel_size),
         "throughput_log_interval_s": 0.0,
     }
+    if tensor_parallel_size > 1:
+        hyper_params["decode_cuda_graph_capture_sampling"] = False
     method_cfg = _method_config(method, model=model, model_id=model_id, include_method=False)
     # HF reference routing is only meaningful for the logits comparator.  Do
     # not forward it into SparseVLLM perf runs, where unknown keys fail fast.
@@ -310,13 +348,21 @@ def _stress_command(
     output_jsonl: Path,
 ) -> list[str]:
     request_counts = [int(x) for x in stress["request_counts"]]
+    tensor_parallel_size = _tensor_parallel_size_from_config(stress, performance)
     hyper_params = {
         "enforce_eager": bool(performance.get("enforce_eager", False)),
-        "decode_cuda_graph": _decode_cuda_graph_for_method(method, bool(performance.get("decode_cuda_graph", True))),
+        "decode_cuda_graph": _decode_cuda_graph_for_method(
+            method,
+            bool(performance.get("decode_cuda_graph", True)),
+            tensor_parallel_size=tensor_parallel_size,
+        ),
+        "tensor_parallel_size": int(tensor_parallel_size),
         "throughput_log_interval_s": 0.0,
         "max_num_seqs_in_batch": int(stress.get("max_num_seqs_in_batch", max(request_counts))),
         "max_decoding_seqs": int(stress.get("max_decoding_seqs", max(request_counts))),
     }
+    if tensor_parallel_size > 1:
+        hyper_params["decode_cuda_graph_capture_sampling"] = False
     method_cfg = _method_config(method, model=model, model_id=model_id, include_method=False)
     # HF reference routing is only meaningful for the logits comparator.  Do
     # not forward it into SparseVLLM stress runs, where unknown keys fail fast.
@@ -432,6 +478,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--methods", default=None, help="Comma-separated method ids from the manifest.")
     parser.add_argument("--run_id", default=None)
     parser.add_argument("--output_root", default=None)
+    parser.add_argument(
+        "--tensor_parallel_size",
+        type=int,
+        default=None,
+        help=(
+            "Override Sparse-VLLM engine tensor_parallel_size for regression commands. "
+            "This is separate from LongBench --ws data-worker parallelism."
+        ),
+    )
     parser.add_argument("--dry_run", action="store_true")
     parser.add_argument("--allow_skipped_policy", action=argparse.BooleanOptionalAction, default=True)
     return parser.parse_args()
@@ -441,6 +496,10 @@ def main() -> int:
     args = parse_args()
     manifest = load_manifest(args.manifest)
     resolved = resolve_manifest_paths(manifest)
+    if args.tensor_parallel_size is not None:
+        if int(args.tensor_parallel_size) <= 0:
+            raise ValueError(f"--tensor_parallel_size must be > 0, got {args.tensor_parallel_size}.")
+        resolved.setdefault("performance", {})["tensor_parallel_size"] = int(args.tensor_parallel_size)
     model_ids, method_ids = select_entries(
         resolved,
         [item for item in (args.models or "").split(",") if item] or None,
@@ -464,6 +523,7 @@ def main() -> int:
         "git_status_short": _git_status_short(),
         "models": model_ids,
         "methods": method_ids,
+        "tensor_parallel_size": _tensor_parallel_size_from_config(resolved.get("performance")),
         "dry_run": bool(args.dry_run),
         "grades": [],
         "commands": [],
@@ -632,10 +692,12 @@ def main() -> int:
                         if not vanilla:
                             continue
                         speedup = float(row["decode_tp"]) / max(float(vanilla["decode_tp"]), 1e-9)
+                        tensor_parallel_size = _tensor_parallel_size_from_config(resolved.get("performance"))
                         grade = grade_perf(
                             speedup,
                             graph_expected=bool(row.get("decode_cuda_graph_expected")),
                             graph_active=bool(row.get("decode_cuda_graph_active")),
+                            require_speedup=tensor_parallel_size <= 1,
                         )
                         summary["grades"].append(
                             {
