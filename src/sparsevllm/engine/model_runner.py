@@ -49,6 +49,8 @@ PREFIX_CACHE_CONTROL_RPC_METHODS = {
 TP_RPC_STATUS_SYNC_METHODS = PREFIX_CACHE_CONTROL_RPC_METHODS | {
     "run",
     "run_rank_batches",
+    "run_logits_for_compare",
+    "run_rank_logits_for_compare",
     "free_rank_slots_batch",
     "scheduler_capacity_snapshot",
 }
@@ -325,12 +327,10 @@ class ModelRunner:
         self._sync_tp_rpc_status(method_name, local_error)
 
     def _sample_outputs_on_this_rank(self) -> bool:
-        return self.rank == 0 or bool(getattr(self.config, "expert_parallel_overlap_data_parallel", False))
+        return self.rank == 0 or int(getattr(self.config, "data_parallel_size", 1) or 1) > 1
 
     def _run_empty_deepep_v2_collectives(self, is_prefill: bool, *, decode_graph_needs_capture: bool = False) -> None:
         if str(getattr(self.config, "expert_parallel_backend", "") or "").lower() != "deepep_v2":
-            return
-        if not bool(getattr(self.config, "expert_parallel_overlap_data_parallel", False)):
             return
         if self.ep_size <= 1:
             return
@@ -425,9 +425,9 @@ class ModelRunner:
                 logger.info("model_runner.free_slots_batch seq_ids={} after={}", seq_ids, after)
 
     def free_rank_slots_batch(self, rank_seq_ids: list[list[int]]):
-        """Release only the sequence slots owned by this overlapped DP rank."""
-        if not bool(getattr(self.config, "expert_parallel_overlap_data_parallel", False)):
-            raise RuntimeError("free_rank_slots_batch is valid only for overlapped DP+EP execution.")
+        """Release only the sequence slots owned by this native DP rank."""
+        if int(getattr(self.config, "data_parallel_size", 1) or 1) <= 1:
+            raise RuntimeError("free_rank_slots_batch is valid only for native data parallel execution.")
         if len(rank_seq_ids) != self.world_size:
             raise ValueError(
                 f"rank_seq_ids length must match world_size={self.world_size}, got {len(rank_seq_ids)}."
@@ -439,9 +439,9 @@ class ModelRunner:
         waiting_seqs: list[Sequence],
         chunk_prefill_size: int,
     ):
-        """Gather rank-local KV scheduler budgets for overlapped DP+EP.
+        """Gather rank-local KV scheduler budgets for native DP.
 
-        The central scheduler lives on rank 0, but in overlapped DP+EP each rank
+        The central scheduler lives on rank 0, but in native DP each rank
         owns an independent attention/KV cache.  Rank 0 must therefore schedule
         from the most constrained rank-local capacity, not from its own cache
         manager alone.
@@ -631,6 +631,61 @@ class ModelRunner:
         finally:
             reset_context()
 
+    def run_rank_logits_for_compare(
+        self,
+        rank_batches: list[list[Sequence]],
+        is_prefill: bool,
+    ):
+        """Debug logits-alignment path for native DP rank-local batches."""
+        if int(getattr(self.config, "data_parallel_size", 1) or 1) <= 1:
+            raise RuntimeError("run_rank_logits_for_compare is valid only for native data parallel execution.")
+        if len(rank_batches) != self.world_size:
+            raise ValueError(
+                f"rank_batches length must match world_size={self.world_size}, got {len(rank_batches)}."
+            )
+        local_seqs = rank_batches[self.rank]
+        decode_graph_needs_capture = self._sync_decode_cuda_graph_needs_capture(local_seqs, is_prefill)
+        if local_seqs:
+            try:
+                if is_prefill:
+                    ctx = get_context()
+                    input_ids, positions = self.prepare_step(local_seqs, is_prefill)
+                    with profiler.record("model_sparse_prepare"):
+                        ctx.sparse_controller = self.sparse_controller
+                        self.sparse_controller.prepare_forward(local_seqs, is_prefill)
+                    logits = self.run_model(input_ids, positions, is_prefill)
+                else:
+                    if self.config.decode_cuda_graph:
+                        logits, _graph_token_ids = self.decode_cuda_graph_runner.run(
+                            local_seqs,
+                            capture_sampling=self.config.decode_cuda_graph_capture_sampling,
+                            force_piecewise_capture_alignment=bool(decode_graph_needs_capture),
+                        )
+                    else:
+                        logits = self.decode_cuda_graph_runner.run_eager_static(local_seqs)
+                with profiler.record("model_sparse_post"):
+                    self.sparse_controller.post_forward(local_seqs, is_prefill)
+                logits_cpu = None if logits is None else logits.detach().float().cpu().contiguous()
+            finally:
+                reset_context()
+        else:
+            self._run_empty_deepep_v2_collectives(
+                is_prefill,
+                decode_graph_needs_capture=decode_graph_needs_capture,
+            )
+            logits_cpu = None
+
+        payload = {
+            "rank": int(self.rank),
+            "seq_ids": [int(seq.seq_id) for seq in local_seqs],
+            "logits": logits_cpu,
+        }
+        if self.world_size <= 1:
+            return [payload]
+        gathered = [None for _ in range(self.world_size)] if self.rank == 0 else None
+        dist.gather_object(payload, object_gather_list=gathered, dst=0)
+        return gathered if self.rank == 0 else None
+
     def _collect_logprobs(
         self,
         logits: torch.Tensor,
@@ -736,7 +791,7 @@ class ModelRunner:
             # 3. 前向计算
             logits = self.run_model(input_ids, positions, is_prefill)
             
-            # 4. Token 采样。TP 路径仅 rank0 采样；overlapped DP+EP 路径每个 owner rank 采样。
+            # 4. Token 采样。TP 路径仅 rank0 采样；native DP 路径每个 owner rank 采样。
             with profiler.record("model_sampler"):
                 token_ids = (
                     self.sampler(logits, temperatures, top_ps, top_ks, all_greedy=all_greedy).tolist()
@@ -758,8 +813,8 @@ class ModelRunner:
         rank_batches: list[list[Sequence]],
         is_prefill: bool,
     ):
-        if not bool(getattr(self.config, "expert_parallel_overlap_data_parallel", False)):
-            raise RuntimeError("run_rank_batches is valid only for overlapped DP+EP execution.")
+        if int(getattr(self.config, "data_parallel_size", 1) or 1) <= 1:
+            raise RuntimeError("run_rank_batches is valid only for native data parallel execution.")
         if len(rank_batches) != self.world_size:
             raise ValueError(
                 f"rank_batches length must match world_size={self.world_size}, got {len(rank_batches)}."

@@ -1,13 +1,9 @@
 import tempfile
 import unittest
-from multiprocessing import get_context
-from queue import Empty
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import torch
-import torch.distributed as dist
 import torch.nn.functional as F
 from safetensors.torch import save_file
 
@@ -71,87 +67,6 @@ def reference_moe(block: Qwen3MoeSparseMoeBlock, hidden_states: torch.Tensor) ->
     return output.reshape(batch_size, sequence_length, hidden_dim)
 
 
-def reference_moe_from_tensors(
-    cfg,
-    hidden_states: torch.Tensor,
-    router_weight: torch.Tensor,
-    gate_up_proj: torch.Tensor,
-    down_proj: torch.Tensor,
-) -> torch.Tensor:
-    hidden_flat = hidden_states.reshape(-1, cfg.hidden_size)
-    router_logits = F.linear(hidden_flat, router_weight)
-    router_probs = F.softmax(router_logits, dim=-1, dtype=torch.float)
-    routing_weights, selected_experts = torch.topk(router_probs, cfg.num_experts_per_tok, dim=-1)
-    if cfg.norm_topk_prob:
-        routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
-    routing_weights = routing_weights.to(router_logits.dtype)
-
-    output = torch.zeros_like(hidden_flat)
-    for token_idx in range(hidden_flat.shape[0]):
-        token = hidden_flat[token_idx : token_idx + 1]
-        for top_k_pos in range(cfg.num_experts_per_tok):
-            expert_idx = int(selected_experts[token_idx, top_k_pos].item())
-            gate, up = F.linear(token, gate_up_proj[expert_idx]).chunk(2, dim=-1)
-            expert_out = F.linear(F.silu(gate) * up, down_proj[expert_idx])
-            output[token_idx] += expert_out.squeeze(0) * routing_weights[token_idx, top_k_pos]
-    return output.reshape(hidden_states.shape)
-
-
-def synthetic_ep_tensors():
-    cfg = tiny_moe_config(num_experts=4, num_experts_per_tok=1, norm_topk_prob=False)
-    router_weight = torch.tensor(
-        [
-            [4.0, 0.0, 0.0, 0.0],
-            [0.0, 4.0, 0.0, 0.0],
-            [0.0, 0.0, 4.0, 0.0],
-            [0.0, 0.0, 0.0, 4.0],
-        ],
-        dtype=torch.float32,
-    )
-    gate_up_proj = torch.arange(4 * 6 * 4, dtype=torch.float32).reshape(4, 6, 4) / 100.0
-    down_proj = torch.arange(4 * 4 * 3, dtype=torch.float32).reshape(4, 4, 3) / 100.0
-    hidden_states = torch.eye(4, dtype=torch.float32)
-    return cfg, hidden_states, router_weight, gate_up_proj, down_proj
-
-
-def ep_all_reduce_worker(rank: int, init_file: str, result_queue) -> None:
-    dist.init_process_group("gloo", init_method=f"file://{init_file}", rank=rank, world_size=2)
-    try:
-        cfg, hidden_states, router_weight, gate_up_proj, down_proj = synthetic_ep_tensors()
-        context = ParallelContext(
-            global_rank=rank,
-            global_world_size=2,
-            tp_size=1,
-            tp_rank=0,
-            ep_size=2,
-            ep_rank=rank,
-            local_rank=rank,
-            ep_group=dist.group.WORLD,
-        )
-        local_start = rank * 2
-        local_end = local_start + 2
-        with parallel_context_scope(context):
-            block = Qwen3MoeSparseMoeBlock(cfg)
-            with torch.no_grad():
-                block.gate.weight.copy_(router_weight)
-                block.experts.gate_up_proj.copy_(gate_up_proj[local_start:local_end])
-                block.experts.down_proj.copy_(down_proj[local_start:local_end])
-            actual = block(hidden_states).detach().cpu()
-        expected = reference_moe_from_tensors(
-            cfg,
-            hidden_states,
-            router_weight,
-            gate_up_proj,
-            down_proj,
-        ).detach().cpu()
-        result_queue.put((rank, actual.tolist(), expected.tolist(), None))
-    except BaseException as exc:  # pragma: no cover - surfaced in parent.
-        result_queue.put((rank, None, None, repr(exc)))
-        raise
-    finally:
-        dist.destroy_process_group()
-
-
 class Qwen3MoeTest(unittest.TestCase):
     def test_sparse_moe_block_matches_reference(self):
         torch.manual_seed(0)
@@ -199,6 +114,51 @@ class Qwen3MoeTest(unittest.TestCase):
             expected[token_idx] += expert_out.squeeze(0) * routing_weights[token_idx, 0]
         torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
 
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for torch._grouped_mm")
+    def test_local_expert_grouped_mm_matches_reference_cuda(self):
+        torch.manual_seed(3)
+        cfg = tiny_moe_config(
+            hidden_size=16,
+            intermediate_size=32,
+            moe_intermediate_size=16,
+            num_experts=4,
+            num_experts_per_tok=3,
+        )
+        block = Qwen3MoeSparseMoeBlock(cfg).to(device="cuda", dtype=torch.bfloat16)
+        with torch.no_grad():
+            block.experts.gate_up_proj.copy_(torch.randn_like(block.experts.gate_up_proj))
+            block.experts.down_proj.copy_(torch.randn_like(block.experts.down_proj))
+        hidden_states = torch.randn(7, cfg.hidden_size, device="cuda", dtype=torch.bfloat16)
+        selected_experts = torch.tensor(
+            [
+                [0, 1, -1],
+                [2, 3, 1],
+                [3, -1, -1],
+                [1, 0, 2],
+                [2, 0, 3],
+                [-1, -1, -1],
+                [0, 2, 1],
+            ],
+            device="cuda",
+            dtype=torch.long,
+        )
+        routing_weights = torch.rand(
+            selected_experts.shape,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        routing_weights = routing_weights / routing_weights.float().sum(dim=-1, keepdim=True).to(torch.bfloat16)
+
+        self.assertTrue(block.experts._use_grouped_mm(hidden_states))
+        actual = block.experts._apply_local_experts(hidden_states, selected_experts, routing_weights)
+        expected = block.experts._apply_local_experts_reference(
+            hidden_states,
+            selected_experts,
+            routing_weights,
+        )
+
+        torch.testing.assert_close(actual.float(), expected.float(), rtol=5e-2, atol=5e-2)
+
     def test_sparse_moe_block_accepts_qwen3_moe_num_local_experts_config(self):
         cfg = tiny_moe_config()
         cfg.num_local_experts = cfg.num_experts
@@ -209,7 +169,7 @@ class Qwen3MoeTest(unittest.TestCase):
         self.assertEqual(block.gate.num_experts, 3)
         self.assertEqual(block.experts.num_experts, 3)
 
-    def test_deepep_decode_graph_defaults_to_final_only(self):
+    def test_deepep_decode_graph_uses_piecewise_without_env_gate(self):
         ctx = ParallelContext(
             global_rank=0,
             global_world_size=2,
@@ -232,23 +192,12 @@ class Qwen3MoeTest(unittest.TestCase):
         )
         graph_state = SimpleNamespace(key=SimpleNamespace(batch_size=1, context_capacity=1024))
 
-        with parallel_context_scope(ctx), patch.dict(
-            "os.environ",
-            {"SPARSEVLLM_QWEN3_MOE_DEEPEP_PIECEWISE_GRAPH": ""},
-            clear=False,
-        ):
+        with parallel_context_scope(ctx):
             state = Qwen3MoePiecewiseDecodeCudaGraphState(owner, graph_state, graph_pool=None)
-            self.assertEqual(state._select_capture_mode(), "final_only")
+            self.assertTrue(state._uses_deepep_v2())
+            self.assertFalse(hasattr(state, "_select_capture_mode"))
 
-        with parallel_context_scope(ctx), patch.dict(
-            "os.environ",
-            {"SPARSEVLLM_QWEN3_MOE_DEEPEP_PIECEWISE_GRAPH": "1"},
-            clear=False,
-        ):
-            state = Qwen3MoePiecewiseDecodeCudaGraphState(owner, graph_state, graph_pool=None)
-            self.assertEqual(state._select_capture_mode(), "piecewise")
-
-    def test_final_only_capture_alignment_uses_eager_layers(self):
+    def test_piecewise_capture_alignment_uses_warmup(self):
         ctx = ParallelContext(
             global_rank=0,
             global_world_size=2,
@@ -275,15 +224,15 @@ class Qwen3MoeTest(unittest.TestCase):
         with parallel_context_scope(ctx):
             state = Qwen3MoePiecewiseDecodeCudaGraphState(owner, graph_state, graph_pool=None)
             state.captured = True
-            state.mode = "final_only"
-            state._run_layers_eager = lambda input_ids, positions, sparse_controller: calls.append("eager")
+            state.final_graph = object()
+            state.final_hidden_input = object()
             state._run_warmup = lambda input_ids, positions, sparse_controller: calls.append("warmup")
             state._barrier_ep_ranks = lambda: calls.append("barrier")
-            state._replay_final_only = lambda input_ids, positions, sparse_controller: calls.append("replay")
+            state.replay = lambda sparse_controller: calls.append("replay")
 
             state.run(object(), object(), None, force_capture_alignment=True)
 
-        self.assertEqual(calls, ["eager", "barrier", "replay"])
+        self.assertEqual(calls, ["warmup", "barrier", "replay"])
 
     def test_decoder_layer_respects_mlp_only_and_sparse_step(self):
         ctx = ParallelContext(
@@ -324,7 +273,9 @@ class Qwen3MoeTest(unittest.TestCase):
             local_rank=1,
         )
         with parallel_context_scope(ctx):
-            block = Qwen3MoeSparseMoeBlock(tiny_moe_config(num_experts=4))
+            block = Qwen3MoeSparseMoeBlock(
+                tiny_moe_config(num_experts=4, expert_parallel_backend="deepep_v2")
+            )
 
         self.assertEqual(block.experts.global_expert_ids, [2, 3])
         self.assertEqual(block.experts.gate_up_proj.shape, torch.Size([2, 6, 4]))
@@ -352,7 +303,9 @@ class Qwen3MoeTest(unittest.TestCase):
                 str(model_dir / "model.safetensors"),
             )
             with parallel_context_scope(ctx):
-                model = Qwen3MoeForCausalLM(tiny_moe_config(num_experts=4))
+                model = Qwen3MoeForCausalLM(
+                    tiny_moe_config(num_experts=4, expert_parallel_backend="deepep_v2")
+                )
                 load_model(model, str(model_dir), rank=0, world_size=1)
 
         torch.testing.assert_close(
@@ -394,7 +347,9 @@ class Qwen3MoeTest(unittest.TestCase):
             model_dir = Path(tmp)
             save_file(expert_tensors, str(model_dir / "model.safetensors"))
             with parallel_context_scope(ctx):
-                model = Qwen3MoeForCausalLM(tiny_moe_config(num_experts=4))
+                model = Qwen3MoeForCausalLM(
+                    tiny_moe_config(num_experts=4, expert_parallel_backend="deepep_v2")
+                )
                 load_model(model, str(model_dir), rank=0, world_size=1)
 
         gate_up = model.model.layers[0].mlp.experts.gate_up_proj.detach().cpu()
@@ -429,37 +384,11 @@ class Qwen3MoeTest(unittest.TestCase):
                 str(model_dir / "model.safetensors"),
             )
             with parallel_context_scope(ctx):
-                model = Qwen3MoeForCausalLM(tiny_moe_config(num_experts=4))
+                model = Qwen3MoeForCausalLM(
+                    tiny_moe_config(num_experts=4, expert_parallel_backend="deepep_v2")
+                )
                 with self.assertRaisesRegex(RuntimeError, "Incomplete Qwen3-MoE expert checkpoint"):
                     load_model(model, str(model_dir), rank=0, world_size=1)
-
-    def test_ep_all_reduce_matches_full_expert_reference(self):
-        process_context = get_context("spawn")
-        with tempfile.TemporaryDirectory() as tmp:
-            init_file = str(Path(tmp) / "dist_init")
-            result_queue = process_context.Queue()
-            processes = [
-                process_context.Process(target=ep_all_reduce_worker, args=(rank, init_file, result_queue))
-                for rank in range(2)
-            ]
-            for process in processes:
-                process.start()
-            for process in processes:
-                process.join(timeout=20)
-            for process in processes:
-                self.assertFalse(process.is_alive(), "EP all-reduce worker timed out")
-                self.assertEqual(process.exitcode, 0)
-
-            results = []
-            for _ in range(2):
-                try:
-                    results.append(result_queue.get(timeout=2))
-                except Empty as exc:
-                    raise AssertionError("missing EP all-reduce worker result") from exc
-
-        for rank, actual, expected, error in results:
-            self.assertIsNone(error, f"rank {rank} failed with {error}")
-            torch.testing.assert_close(torch.tensor(actual), torch.tensor(expected), rtol=1e-5, atol=1e-5)
 
 
 if __name__ == "__main__":

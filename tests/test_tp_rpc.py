@@ -113,7 +113,7 @@ def test_free_slots_batch_releases_each_seq_id():
 def test_free_rank_slots_batch_releases_only_local_owner_ids():
     freed: list[int] = []
     runner = object.__new__(ModelRunner)
-    runner.config = SimpleNamespace(expert_parallel_overlap_data_parallel=True)
+    runner.config = SimpleNamespace(data_parallel_size=3)
     runner.world_size = 3
     runner.rank = 1
     runner.free_slots_batch = lambda seq_ids: freed.extend(int(seq_id) for seq_id in seq_ids)
@@ -123,11 +123,11 @@ def test_free_rank_slots_batch_releases_only_local_owner_ids():
     assert freed == [5, 8]
 
 
-def test_llm_engine_overlapped_free_routes_seq_ids_to_owner_ranks():
+def test_llm_engine_native_dp_free_routes_seq_ids_to_owner_ranks():
     calls: list[tuple[str, list[list[int]]]] = []
     engine = object.__new__(LLMEngine)
     engine.config = SimpleNamespace(
-        expert_parallel_overlap_data_parallel=True,
+        data_parallel_size=3,
         parallel_world_size=3,
     )
     engine.model_runner = SimpleNamespace(call=lambda method, arg: calls.append((method, arg)))

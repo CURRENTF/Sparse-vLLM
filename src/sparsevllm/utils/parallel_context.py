@@ -43,7 +43,8 @@ def build_parallel_context(config, global_rank: int) -> ParallelContext:
     tp_size = int(getattr(config, "tensor_parallel_size", 1))
     dp_size = int(getattr(config, "data_parallel_size", 1))
     ep_size = int(getattr(config, "expert_parallel_size", 1))
-    overlap_data_parallel = bool(getattr(config, "expert_parallel_overlap_data_parallel", False))
+    backend = str(getattr(config, "expert_parallel_backend", "torch") or "torch").strip().lower()
+    overlap_data_parallel = backend == "deepep_v2"
     global_world_size = int(getattr(config, "parallel_world_size", tp_size * ep_size * dp_size))
     global_rank = int(global_rank)
     if global_rank < 0 or global_rank >= global_world_size:
@@ -52,14 +53,14 @@ def build_parallel_context(config, global_rank: int) -> ParallelContext:
             f"rank={global_rank} world_size={global_world_size}."
         )
 
-    if overlap_data_parallel:
+    if backend == "deepep_v2":
         tp_rank = 0
         ep_rank = global_rank
         dp_rank = global_rank
     else:
         tp_rank = global_rank % tp_size
-        ep_rank = (global_rank // tp_size) % ep_size
-        dp_rank = global_rank // (tp_size * ep_size)
+        ep_rank = 0
+        dp_rank = global_rank // tp_size
 
     # TP+EP hybrid is rejected by Config in v1. For the supported layouts,
     # the active multi-rank group is the process world and singleton groups are unused.

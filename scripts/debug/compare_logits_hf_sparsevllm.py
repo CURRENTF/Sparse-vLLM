@@ -20,7 +20,7 @@ from deltakv.configs.runtime_params import normalize_runtime_params
 from deltakv.get_chat_api import get_generate_api
 from benchmark.long_bench.pred import build_chat
 from sparsevllm.config import Config
-from sparsevllm.engine.model_runner import ModelRunner
+from sparsevllm.engine.model_runner import ModelRunner, make_tp_shm_name
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.method_registry import (
     PREFILL_POLICY_ALL_CHUNKED,
@@ -1799,6 +1799,10 @@ def _sparse_infer_config(args: argparse.Namespace, method: str) -> dict[str, Any
         ),
         "gpu_memory_utilization": args.gpu_memory_utilization,
         "tensor_parallel_size": int(args.tensor_parallel_size),
+        "data_parallel_size": int(args.data_parallel_size),
+        "expert_parallel_size": int(args.expert_parallel_size),
+        "expert_parallel_backend": str(args.expert_parallel_backend),
+        "expert_placement_policy": str(args.expert_placement_policy),
         "enforce_eager": bool(args.enforce_eager),
         "decode_cuda_graph": bool(args.decode_cuda_graph),
         "decode_cuda_graph_capture_sizes": args.decode_cuda_graph_capture_sizes,
@@ -2007,13 +2011,15 @@ def _make_sparse_runner(args: argparse.Namespace, method: str) -> tuple[ModelRun
     events = []
     ctx = mp.get_context("spawn")
     try:
-        for rank in range(1, int(config.tensor_parallel_size)):
+        parallel_world_size = int(config.parallel_world_size)
+        tp_shm_name = make_tp_shm_name() if parallel_world_size > 1 else None
+        for rank in range(1, parallel_world_size):
             event = ctx.Event()
-            process = ctx.Process(target=ModelRunner, args=(config, rank, event))
+            process = ctx.Process(target=ModelRunner, args=(config, rank, event, tp_shm_name))
             process.start()
             processes.append(process)
             events.append(event)
-        runner = ModelRunner(config, 0, events)
+        runner = ModelRunner(config, 0, events, tp_shm_name)
     except Exception:
         for process in processes:
             if process.is_alive():
@@ -2051,22 +2057,119 @@ def _sparse_prefill_chunk_size(config: Config, seq: Sequence) -> int:
     raise ValueError(f"Unknown Sparse-VLLM prefill_schedule_policy={config.prefill_schedule_policy!r}")
 
 
+def _uses_native_dp(runner: ModelRunner) -> bool:
+    return int(getattr(runner.config, "data_parallel_size", 1) or 1) > 1
+
+
+def _assign_compare_owner_ranks(runner: ModelRunner, seqs: list[Sequence]) -> None:
+    if not _uses_native_dp(runner):
+        return
+    world_size = int(runner.config.parallel_world_size)
+    if world_size <= 0:
+        raise ValueError(f"Invalid parallel_world_size={world_size}.")
+    for idx, seq in enumerate(seqs):
+        if not hasattr(seq, "_compare_owner_rank"):
+            setattr(seq, "_compare_owner_rank", int(idx % world_size))
+
+
+def _rank_batches_for_compare(runner: ModelRunner, seqs: list[Sequence]) -> list[list[Sequence]]:
+    world_size = int(runner.config.parallel_world_size)
+    rank_batches: list[list[Sequence]] = [[] for _ in range(world_size)]
+    for seq in seqs:
+        if not hasattr(seq, "_compare_owner_rank"):
+            raise RuntimeError(f"Missing compare owner rank for seq_id={seq.seq_id}.")
+        owner = int(getattr(seq, "_compare_owner_rank"))
+        if owner < 0 or owner >= world_size:
+            raise RuntimeError(
+                f"Invalid compare owner rank {owner} for seq_id={seq.seq_id}; world_size={world_size}."
+            )
+        rank_batches[owner].append(seq)
+    return rank_batches
+
+
+def _run_logits_batch_for_compare(
+    runner: ModelRunner,
+    seqs: list[Sequence],
+    is_prefill: bool,
+) -> torch.Tensor:
+    if not seqs:
+        raise ValueError("Sparse-VLLM logits compare requires a non-empty batch.")
+    if not _uses_native_dp(runner):
+        try:
+            logits = runner.call("run_logits_for_compare", seqs, is_prefill)
+            if logits is None:
+                raise RuntimeError("Sparse-VLLM logits compare returned no rank-0 logits.")
+            logits = logits.detach().cpu().contiguous()
+        finally:
+            reset_context()
+        return logits
+
+    _assign_compare_owner_ranks(runner, seqs)
+    gathered = runner.call("run_rank_logits_for_compare", _rank_batches_for_compare(runner, seqs), is_prefill)
+    if not isinstance(gathered, list) or len(gathered) != int(runner.config.parallel_world_size):
+        raise RuntimeError(
+            "Native DP logits compare did not gather one payload per rank: "
+            f"got {type(gathered).__name__} len={len(gathered) if isinstance(gathered, list) else 'n/a'}."
+        )
+    logits_by_seq: dict[int, torch.Tensor] = {}
+    for payload in gathered:
+        if payload is None:
+            raise RuntimeError("Native DP logits compare gathered an empty rank payload.")
+        seq_ids = [int(seq_id) for seq_id in payload["seq_ids"]]
+        logits = payload["logits"]
+        if not seq_ids:
+            if logits is not None:
+                raise RuntimeError("Empty DP rank returned non-empty logits payload.")
+            continue
+        if logits is None:
+            raise RuntimeError(f"DP rank {payload.get('rank')} returned no logits for seq_ids={seq_ids}.")
+        logits = logits.detach().cpu().contiguous()
+        if int(logits.shape[0]) != len(seq_ids):
+            raise RuntimeError(
+                "DP rank logits row count mismatch: "
+                f"rank={payload.get('rank')} seq_ids={seq_ids} logits_shape={tuple(logits.shape)}."
+            )
+        for row_idx, seq_id in enumerate(seq_ids):
+            logits_by_seq[int(seq_id)] = logits[row_idx : row_idx + 1].contiguous()
+    missing = [int(seq.seq_id) for seq in seqs if int(seq.seq_id) not in logits_by_seq]
+    if missing:
+        raise RuntimeError(f"Missing native DP logits for seq_ids={missing}.")
+    return torch.cat([logits_by_seq[int(seq.seq_id)] for seq in seqs], dim=0)
+
+
+def _free_compare_seqs(runner: ModelRunner, seqs: list[Sequence]) -> None:
+    if not seqs:
+        return
+    if not _uses_native_dp(runner):
+        runner.call("free_slots_batch", [int(seq.seq_id) for seq in seqs])
+        reset_context()
+        return
+    world_size = int(runner.config.parallel_world_size)
+    rank_seq_ids: list[list[int]] = [[] for _ in range(world_size)]
+    for seq in seqs:
+        if not hasattr(seq, "_compare_owner_rank"):
+            raise RuntimeError(f"Missing compare owner rank for seq_id={seq.seq_id} during free.")
+        owner = int(getattr(seq, "_compare_owner_rank"))
+        if owner < 0 or owner >= world_size:
+            raise RuntimeError(
+                f"Invalid compare owner rank {owner} for seq_id={seq.seq_id}; world_size={world_size}."
+            )
+        rank_seq_ids[owner].append(int(seq.seq_id))
+    runner.call("free_rank_slots_batch", rank_seq_ids)
+    reset_context()
+
+
 def _sparse_prefill(
     runner: ModelRunner,
     input_ids: list[int],
     max_tokens: int,
 ) -> tuple[torch.Tensor, Sequence]:
     seq = Sequence(input_ids, SamplingParams(temperature=0.0, max_tokens=max_tokens, ignore_eos=True))
+    _assign_compare_owner_ranks(runner, [seq])
     last_logits = None
     while int(seq.num_prefilled_tokens) < int(seq.num_prompt_tokens):
         seq.current_chunk_size = _sparse_prefill_chunk_size(runner.config, seq)
-        try:
-            logits = runner.call("run_logits_for_compare", [seq], True)
-            if logits is None:
-                raise RuntimeError("Sparse-VLLM logits compare step returned no rank-0 logits.")
-            logits = logits.detach().cpu()
-        finally:
-            reset_context()
+        logits = _run_logits_batch_for_compare(runner, [seq], True)
         seq.num_prefilled_tokens += int(seq.current_chunk_size)
         last_logits = logits[-1:].contiguous()
 
@@ -2081,26 +2184,8 @@ def _sparse_decode(
     forced_token_id: int,
 ) -> torch.Tensor:
     seq.append_token(forced_token_id)
-    if runner.config.decode_cuda_graph:
-        if runner.decode_cuda_graph_runner is None:
-            raise RuntimeError("decode_cuda_graph is enabled but the runner was not initialized.")
-        try:
-            logits, _ = runner.decode_cuda_graph_runner.run(
-                [seq],
-                capture_sampling=runner.config.decode_cuda_graph_capture_sampling,
-            )
-            runner.sparse_controller.post_forward([seq], is_prefill=False)
-            return logits[-1:].detach().cpu().contiguous()
-        finally:
-            reset_context()
-    try:
-        logits = runner.call("run_logits_for_compare", [seq], False)
-        if logits is None:
-            raise RuntimeError("Sparse-VLLM logits compare decode returned no rank-0 logits.")
-        logits = logits.detach().cpu()
-        return logits[-1:].contiguous()
-    finally:
-        reset_context()
+    logits = _run_logits_batch_for_compare(runner, [seq], False)
+    return logits[-1:].contiguous()
 
 
 def _sparse_prefill_batch(
@@ -2114,6 +2199,7 @@ def _sparse_prefill_batch(
         Sequence(input_ids, SamplingParams(temperature=0.0, max_tokens=max_tokens, ignore_eos=True))
         for input_ids in input_ids_batch
     ]
+    _assign_compare_owner_ranks(runner, seqs)
     last_logits_by_seq: list[torch.Tensor | None] = [None for _ in seqs]
     while True:
         active = [(idx, seq) for idx, seq in enumerate(seqs) if int(seq.num_prefilled_tokens) < int(seq.num_prompt_tokens)]
@@ -2133,13 +2219,7 @@ def _sparse_prefill_batch(
             active = [full_prefill_singletons[0]]
         active_seqs = [seq for _, seq in active]
         expected_rows = len(active_seqs)
-        try:
-            logits = runner.call("run_logits_for_compare", active_seqs, True)
-            if logits is None:
-                raise RuntimeError("Sparse-VLLM logits compare batch prefill returned no rank-0 logits.")
-            logits = logits.detach().cpu()
-        finally:
-            reset_context()
+        logits = _run_logits_batch_for_compare(runner, active_seqs, True)
         if int(logits.shape[0]) != int(expected_rows):
             raise RuntimeError(
                 "Sparse-VLLM batch prefill logits row count mismatch: "
@@ -2168,26 +2248,7 @@ def _sparse_decode_batch(
         raise ValueError(f"Decode batch size mismatch: seqs={len(seqs)} forced_token_ids={len(forced_token_ids)}.")
     for seq, forced_token_id in zip(seqs, forced_token_ids):
         seq.append_token(int(forced_token_id))
-    if runner.config.decode_cuda_graph:
-        if runner.decode_cuda_graph_runner is None:
-            raise RuntimeError("decode_cuda_graph is enabled but the runner was not initialized.")
-        try:
-            logits, _ = runner.decode_cuda_graph_runner.run(
-                seqs,
-                capture_sampling=runner.config.decode_cuda_graph_capture_sampling,
-            )
-            runner.sparse_controller.post_forward(seqs, is_prefill=False)
-            logits = logits.detach().cpu().contiguous()
-        finally:
-            reset_context()
-    else:
-        try:
-            logits = runner.call("run_logits_for_compare", seqs, False)
-            if logits is None:
-                raise RuntimeError("Sparse-VLLM logits compare batch decode returned no rank-0 logits.")
-            logits = logits.detach().cpu().contiguous()
-        finally:
-            reset_context()
+    logits = _run_logits_batch_for_compare(runner, seqs, False)
     if int(logits.shape[0]) != len(seqs):
         raise RuntimeError(
             "Sparse-VLLM batch decode logits row count mismatch: "
@@ -2272,6 +2333,13 @@ def _sparse_resolved_config_summary(
         "max_num_seqs_in_batch": config.max_num_seqs_in_batch,
         "max_decoding_seqs": config.max_decoding_seqs,
         "max_num_batched_tokens": config.max_num_batched_tokens,
+        "tensor_parallel_size": config.tensor_parallel_size,
+        "data_parallel_size": config.data_parallel_size,
+        "expert_parallel_size": config.expert_parallel_size,
+        "expert_parallel_backend": config.expert_parallel_backend,
+        "expert_placement_policy": config.expert_placement_policy,
+        "native_data_parallel": int(config.data_parallel_size) > 1,
+        "parallel_world_size": config.parallel_world_size,
         "decode_cuda_graph": config.decode_cuda_graph,
         "decode_cuda_graph_capture_sizes": config.decode_cuda_graph_capture_sizes,
         "full_layer_kv_quant_bits": config.full_layer_kv_quant_bits,
@@ -2327,8 +2395,7 @@ def _sparse_logits_for_longbench_batches(
                 )
             finally:
                 if seqs:
-                    runner.call("free_slots_batch", [seq.seq_id for seq in seqs])
-                    reset_context()
+                    _free_compare_seqs(runner, seqs)
         return {
             "batches": batch_outputs,
             "public_config": public_config,
@@ -2565,8 +2632,7 @@ def _sparse_greedy_rollout_for_longbench_batches(
                 )
             finally:
                 if seqs:
-                    runner.call("free_slots_batch", [seq.seq_id for seq in seqs])
-                    reset_context()
+                    _free_compare_seqs(runner, seqs)
         return {
             "batches": batch_outputs,
             "public_config": public_config,
@@ -3208,6 +3274,13 @@ def _run_one(args: argparse.Namespace, tokenizer, case_name: str, method: str, o
             "cache_manager_class": sparse_cache_manager_class,
             "prefill_schedule_policy": sparse_resolved_config.prefill_schedule_policy,
             "hidden_debug_stage": args.hidden_debug_stage,
+            "tensor_parallel_size": sparse_resolved_config.tensor_parallel_size,
+            "data_parallel_size": sparse_resolved_config.data_parallel_size,
+            "expert_parallel_size": sparse_resolved_config.expert_parallel_size,
+            "expert_parallel_backend": sparse_resolved_config.expert_parallel_backend,
+            "expert_placement_policy": sparse_resolved_config.expert_placement_policy,
+            "native_data_parallel": int(sparse_resolved_config.data_parallel_size) > 1,
+            "parallel_world_size": sparse_resolved_config.parallel_world_size,
             "decode_keep_tokens": sparse_resolved_config.decode_keep_tokens,
             "num_sink_tokens": sparse_resolved_config.num_sink_tokens,
             "num_recent_tokens": sparse_resolved_config.num_recent_tokens,
@@ -3244,6 +3317,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cases", default="short,long")
     parser.add_argument("--methods", default="vanilla,deltakv")
     parser.add_argument("--cuda_visible_devices", default=None)
+    parser.add_argument("--hf_attn_implementation", default=None)
     parser.add_argument("--master_port", type=int, default=29561)
     parser.add_argument("--max_model_len", type=int, default=16384)
     parser.add_argument("--long_tokens", type=int, default=9000)
@@ -3330,6 +3404,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_decoding_seqs", type=int, default=1)
     parser.add_argument("--max_num_batched_tokens", type=int, default=None)
     parser.add_argument("--tensor_parallel_size", type=int, default=1)
+    parser.add_argument("--data_parallel_size", type=int, default=1)
+    parser.add_argument("--expert_parallel_size", type=int, default=1)
+    parser.add_argument("--expert_parallel_backend", default="torch", choices=["torch", "deepep_v2"])
+    parser.add_argument("--expert_placement_policy", default="contiguous", choices=["contiguous"])
     return parser.parse_args()
 
 
@@ -3342,6 +3420,8 @@ def main() -> int:
             f"Expected CUDA_VISIBLE_DEVICES={args.cuda_visible_devices!r}, got {visible!r}."
         )
 
+    if args.hf_attn_implementation:
+        os.environ["DELTAKV_HF_ATTN_IMPLEMENTATION"] = str(args.hf_attn_implementation)
     os.environ.setdefault("SPARSEVLLM_MASTER_PORT", str(args.master_port))
     _require_path(args.model_path, "model_path")
     methods = [part.strip() for part in args.methods.split(",") if part.strip()]

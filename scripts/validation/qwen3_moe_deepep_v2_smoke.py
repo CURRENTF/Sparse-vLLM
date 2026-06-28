@@ -63,7 +63,6 @@ def tiny_config(args: argparse.Namespace) -> SimpleNamespace:
         vocab_size=32,
         tie_word_embeddings=False,
         expert_parallel_backend="deepep_v2",
-        expert_parallel_overlap_data_parallel=True,
     )
 
 

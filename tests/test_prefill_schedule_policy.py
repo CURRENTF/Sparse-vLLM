@@ -21,7 +21,7 @@ from sparsevllm.engine.decode_cuda_graph import DecodeCudaGraphKey, DecodeCudaGr
 from sparsevllm.engine.llm_engine import (
     _decode_graph_warmup_prompt_len,
     _deltakv_graph_warmup_profile,
-    _OverlappedDPSchedulerOracle,
+    _NativeDPSchedulerOracle,
     LLMEngine,
     _use_graph_scaled_warmup,
 )
@@ -940,8 +940,8 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
 
         self.assertEqual(chunk_sizes, [4096, 4065, 32])
 
-    def test_overlapped_dp_oracle_limits_prefill_to_min_rank_capacity(self):
-        proxy = _OverlappedDPSchedulerOracle(FakeMemoryOracle(free_slots=100, step_free_slots=100))
+    def test_native_dp_oracle_limits_prefill_to_min_rank_capacity(self):
+        proxy = _NativeDPSchedulerOracle(FakeMemoryOracle(free_slots=100, step_free_slots=100))
         proxy.update_snapshots([
             {
                 "num_free_slots": 100,
@@ -979,7 +979,7 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
         self.assertEqual([seq.current_chunk_size for seq in scheduled], [5, 2])
         self.assertLessEqual(sum(seq.current_chunk_size for seq in scheduled), 7)
 
-    def test_overlapped_dp_owner_balances_by_live_prompt_load(self):
+    def test_native_dp_owner_balances_by_live_prompt_load(self):
         engine = object.__new__(LLMEngine)
         engine.config = SimpleNamespace(data_parallel_size=2)
         large = seq_with_len(100)

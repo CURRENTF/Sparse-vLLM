@@ -206,9 +206,8 @@ class Config:
     tensor_parallel_size: int = 1
     data_parallel_size: int = 1
     expert_parallel_size: int = 1
-    expert_parallel_backend: str = "all_reduce"
+    expert_parallel_backend: str = "torch"
     expert_placement_policy: str = "contiguous"
-    expert_parallel_overlap_data_parallel: bool = False
     distributed_master_port: int | None = None
     enforce_eager: bool = True
     hf_config: Union[Qwen3Config, AutoConfig] | None = None
@@ -364,9 +363,9 @@ class Config:
 
     @property
     def parallel_world_size(self) -> int:
-        if bool(self.expert_parallel_overlap_data_parallel):
+        if str(self.expert_parallel_backend).strip().lower() == "deepep_v2":
             return int(self.expert_parallel_size)
-        return int(self.tensor_parallel_size) * int(self.expert_parallel_size) * int(self.data_parallel_size)
+        return int(self.tensor_parallel_size) * int(self.data_parallel_size)
 
     def _normalize_platform_aliases(self):
         if self.device_memory_utilization is not None:
@@ -572,12 +571,18 @@ class Config:
         )
         if not 1 <= self.expert_parallel_size <= 8:
             raise ValueError(f"expert_parallel_size must be in [1, 8], got {self.expert_parallel_size}.")
-        self.expert_parallel_backend = str(self.expert_parallel_backend or "all_reduce").strip().lower()
+        self.expert_parallel_backend = str(self.expert_parallel_backend or "torch").strip().lower()
         if self.expert_parallel_backend in {"deep_ep_v2", "deepep-v2", "deep_ep-v2"}:
             self.expert_parallel_backend = "deepep_v2"
-        if self.expert_parallel_backend not in {"all_reduce", "deepep_v2"}:
+        if self.expert_parallel_backend == "all_reduce":
             raise ValueError(
-                "expert_parallel_backend supports 'all_reduce' and 'deepep_v2', "
+                "expert_parallel_backend='all_reduce' was removed. "
+                "Use expert_parallel_backend='torch' for the non-EP fallback or "
+                "expert_parallel_backend='deepep_v2' for expert parallelism."
+            )
+        if self.expert_parallel_backend not in {"torch", "deepep_v2"}:
+            raise ValueError(
+                "expert_parallel_backend supports 'torch' and 'deepep_v2', "
                 f"got {self.expert_parallel_backend!r}."
             )
         self.expert_placement_policy = str(self.expert_placement_policy or "contiguous").strip().lower()
@@ -586,45 +591,37 @@ class Config:
                 "expert_placement_policy supports 'contiguous' only in EP v1, "
                 f"got {self.expert_placement_policy!r}."
             )
-        self.expert_parallel_overlap_data_parallel = _coerce_bool_config(
-            "expert_parallel_overlap_data_parallel",
-            self.expert_parallel_overlap_data_parallel,
-        )
-        if self.expert_parallel_overlap_data_parallel:
-            if self.expert_parallel_backend != "deepep_v2":
+        if self.expert_parallel_backend == "torch":
+            if self.expert_parallel_size != 1:
                 raise ValueError(
-                    "expert_parallel_overlap_data_parallel requires "
-                    "expert_parallel_backend='deepep_v2'."
+                    "expert_parallel_backend='torch' is the non-EP fallback and requires "
+                    f"expert_parallel_size=1, got {self.expert_parallel_size}. "
+                    "Use expert_parallel_backend='deepep_v2' for expert parallelism."
                 )
+            if self.tensor_parallel_size > 1 and self.data_parallel_size > 1:
+                raise ValueError(
+                    "Native data_parallel_size > 1 cannot be combined with tensor_parallel_size > 1 "
+                    "in the narrowed Qwen3-MoE implementation."
+                )
+        else:
             if self.tensor_parallel_size != 1:
                 raise ValueError(
-                    "expert_parallel_overlap_data_parallel currently requires tensor_parallel_size=1, "
+                    "expert_parallel_backend='deepep_v2' requires tensor_parallel_size=1, "
                     f"got tensor_parallel_size={self.tensor_parallel_size}."
                 )
             if self.expert_parallel_size <= 1:
                 raise ValueError(
-                    "expert_parallel_overlap_data_parallel requires expert_parallel_size > 1."
+                    "expert_parallel_backend='deepep_v2' requires expert_parallel_size > 1."
                 )
             if self.data_parallel_size == 1:
                 self.data_parallel_size = self.expert_parallel_size
             elif self.data_parallel_size != self.expert_parallel_size:
                 raise ValueError(
-                    "overlapped DP+EP uses the same process ranks for data and expert parallelism, "
+                    "DeepEP v2 uses the same process ranks for data and expert parallelism, "
                     f"so data_parallel_size must equal expert_parallel_size; got "
                     f"data_parallel_size={self.data_parallel_size}, "
                     f"expert_parallel_size={self.expert_parallel_size}."
                 )
-        elif self.data_parallel_size != 1:
-            raise NotImplementedError(
-                "data_parallel_size > 1 is supported only with "
-                "expert_parallel_overlap_data_parallel=True in this implementation."
-            )
-        if self.tensor_parallel_size > 1 and self.expert_parallel_size > 1:
-            raise ValueError(
-                "EP v1 does not support TP+EP hybrid: "
-                f"tensor_parallel_size={self.tensor_parallel_size}, "
-                f"expert_parallel_size={self.expert_parallel_size}."
-            )
         if self.distributed_master_port is not None:
             self.distributed_master_port = int(self.distributed_master_port)
             if not 0 < self.distributed_master_port < 65536:
@@ -656,21 +653,12 @@ class Config:
         if (
             self.expert_parallel_size > 1
             and self.decode_cuda_graph
-            and self.expert_parallel_backend != "deepep_v2"
-        ):
-            raise ValueError(
-                "expert_parallel_size > 1 disables decode_cuda_graph in EP v1; "
-                "set decode_cuda_graph=False, use expert_parallel_backend='deepep_v2', "
-                "or run without EP."
-            )
-        if (
-            self.expert_parallel_size > 1
-            and self.decode_cuda_graph
             and self.expert_parallel_backend == "deepep_v2"
         ):
             log_once(
-                "decode_cuda_graph with expert_parallel_backend='deepep_v2' is experimental; "
-                "DeepEP dispatch/combine must remain graph-compatible for the selected workload.",
+                "decode_cuda_graph with expert_parallel_backend='deepep_v2' uses Qwen3-MoE "
+                "piecewise graph capture. Dense/attention segments are captured and MoE/DeepEP "
+                "execution stays eager.",
                 level="WARNING",
             )
         if self.decode_cuda_graph_capture_sampling and not self.decode_cuda_graph:
@@ -749,7 +737,6 @@ class Config:
             "data_parallel_size",
             "expert_parallel_size",
             "expert_parallel_backend",
-            "expert_parallel_overlap_data_parallel",
         ):
             setattr(self.hf_config, name, getattr(self, name))
         if self.max_model_len > self.hf_config.max_position_embeddings:

@@ -72,21 +72,32 @@ class ExpertParallelPhase1Test(unittest.TestCase):
             with patch("sparsevllm.config.AutoConfig.from_pretrained", return_value=self.hf_config()):
                 return Config(model=str(model_dir), **kwargs)
 
-    def test_expert_parallel_config_sets_parallel_world_size(self):
-        cfg = self._config(expert_parallel_size=4)
+    def test_torch_backend_supports_native_data_parallel(self):
+        cfg = self._config(data_parallel_size=3)
 
         self.assertEqual(cfg.tensor_parallel_size, 1)
-        self.assertEqual(cfg.data_parallel_size, 1)
-        self.assertEqual(cfg.expert_parallel_size, 4)
-        self.assertEqual(cfg.parallel_world_size, 4)
-        self.assertEqual(cfg.expert_parallel_backend, "all_reduce")
+        self.assertEqual(cfg.data_parallel_size, 3)
+        self.assertEqual(cfg.expert_parallel_size, 1)
+        self.assertEqual(cfg.parallel_world_size, 3)
+        self.assertEqual(cfg.expert_parallel_backend, "torch")
         self.assertEqual(cfg.expert_placement_policy, "contiguous")
 
-    def test_deepep_v2_overlap_config_maps_dp_to_ep_world(self):
+    def test_torch_backend_rejects_expert_parallel(self):
+        with self.assertRaisesRegex(ValueError, "requires expert_parallel_size=1"):
+            self._config(expert_parallel_size=4)
+
+    def test_all_reduce_backend_was_removed(self):
+        with self.assertRaisesRegex(ValueError, "all_reduce.*removed"):
+            self._config(expert_parallel_backend="all_reduce")
+
+    def test_overlap_flag_was_removed_from_config_api(self):
+        with self.assertRaisesRegex(TypeError, "expert_parallel_overlap_data_parallel"):
+            self._config(expert_parallel_overlap_data_parallel=True)
+
+    def test_deepep_v2_config_maps_dp_to_ep_world(self):
         cfg = self._config(
             expert_parallel_size=4,
             expert_parallel_backend="deep_ep_v2",
-            expert_parallel_overlap_data_parallel=True,
             decode_graph=True,
         )
 
@@ -97,67 +108,62 @@ class ExpertParallelPhase1Test(unittest.TestCase):
         self.assertEqual(cfg.hf_config.expert_parallel_backend, "deepep_v2")
         self.assertEqual(cfg.hf_config.data_parallel_size, 4)
         self.assertEqual(cfg.hf_config.expert_parallel_size, 4)
-        self.assertTrue(cfg.hf_config.expert_parallel_overlap_data_parallel)
 
-    def test_rejects_data_parallel_without_overlap(self):
-        with self.assertRaisesRegex(NotImplementedError, "data_parallel_size > 1"):
-            self._config(data_parallel_size=2)
-
-    def test_overlap_requires_deepep_backend(self):
-        with self.assertRaisesRegex(ValueError, "requires expert_parallel_backend='deepep_v2'"):
+    def test_deepep_v2_rejects_mismatched_dp_ep(self):
+        with self.assertRaisesRegex(ValueError, "must equal expert_parallel_size"):
             self._config(
+                data_parallel_size=3,
                 expert_parallel_size=2,
-                expert_parallel_overlap_data_parallel=True,
+                expert_parallel_backend="deepep_v2",
             )
 
-    def test_expert_parallel_rejects_tp_hybrid_v1(self):
-        with self.assertRaisesRegex(ValueError, "does not support TP\\+EP hybrid"):
-            self._config(tensor_parallel_size=2, expert_parallel_size=2)
+    def test_deepep_v2_requires_expert_parallel(self):
+        with self.assertRaisesRegex(ValueError, "requires expert_parallel_size > 1"):
+            self._config(
+                expert_parallel_backend="deepep_v2",
+            )
+
+    def test_deepep_v2_rejects_tp_hybrid_v1(self):
+        with self.assertRaisesRegex(ValueError, "requires tensor_parallel_size=1"):
+            self._config(tensor_parallel_size=2, expert_parallel_size=2, expert_parallel_backend="deepep_v2")
+
+    def test_native_dp_rejects_tp_hybrid_v1(self):
+        with self.assertRaisesRegex(ValueError, "cannot be combined with tensor_parallel_size > 1"):
+            self._config(tensor_parallel_size=2, data_parallel_size=2)
 
     def test_distributed_master_port_validation(self):
-        cfg = self._config(expert_parallel_size=2, distributed_master_port=29501)
+        cfg = self._config(distributed_master_port=29501)
 
         self.assertEqual(cfg.distributed_master_port, 29501)
         with self.assertRaisesRegex(ValueError, "distributed_master_port must be in"):
-            self._config(expert_parallel_size=2, distributed_master_port=70000)
+            self._config(distributed_master_port=70000)
 
-    def test_expert_parallel_rejects_decode_graph_aliases(self):
-        with self.assertRaisesRegex(ValueError, "expert_parallel_size > 1 disables decode_cuda_graph"):
-            self._config(expert_parallel_size=2, decode_graph=True)
+    def test_deepep_v2_accepts_decode_graph_alias(self):
+        cfg = self._config(
+            expert_parallel_size=2,
+            expert_parallel_backend="deepep_v2",
+            decode_graph=True,
+        )
 
-        with self.assertRaisesRegex(ValueError, "expert_parallel_size > 1 disables decode_cuda_graph"):
-            self._config(
-                expert_parallel_size=2,
-                vllm_sparse_method="omnikv",
-                omnikv_decode_graph=True,
-            )
+        self.assertTrue(cfg.decode_cuda_graph)
 
-    def test_expert_parallel_rejects_legacy_forced_decode_graph(self):
-        with self.assertRaisesRegex(ValueError, "expert_parallel_size > 1 disables decode_cuda_graph"):
-            self._config(
-                expert_parallel_size=2,
-                vllm_sparse_method="deltakv_less_memory_cudagraph",
-                allow_missing_deltakv_path=True,
-            )
-
-    def test_parallel_context_maps_ep_world_without_tp_shard(self):
-        cfg = self._config(expert_parallel_size=4)
+    def test_parallel_context_maps_native_dp_world_without_tp_shard(self):
+        cfg = self._config(data_parallel_size=4)
         ctx = build_parallel_context(cfg, global_rank=3)
 
         self.assertEqual(ctx.global_rank, 3)
         self.assertEqual(ctx.global_world_size, 4)
         self.assertEqual(ctx.tp_size, 1)
         self.assertEqual(ctx.tp_rank, 0)
-        self.assertEqual(ctx.ep_size, 4)
-        self.assertEqual(ctx.ep_rank, 3)
-        self.assertEqual(ctx.dp_size, 1)
-        self.assertEqual(ctx.dp_rank, 0)
+        self.assertEqual(ctx.ep_size, 1)
+        self.assertEqual(ctx.ep_rank, 0)
+        self.assertEqual(ctx.dp_size, 4)
+        self.assertEqual(ctx.dp_rank, 3)
 
-    def test_parallel_context_maps_overlapped_dp_ep_rank(self):
+    def test_parallel_context_maps_deepep_dp_ep_rank(self):
         cfg = self._config(
             expert_parallel_size=4,
             expert_parallel_backend="deepep_v2",
-            expert_parallel_overlap_data_parallel=True,
         )
         ctx = build_parallel_context(cfg, global_rank=2)
 
@@ -200,14 +206,20 @@ class ExpertParallelPhase1Test(unittest.TestCase):
         self.assertEqual(embed.weight.shape, torch.Size([32, 8]))
 
     def test_cache_manager_uses_tp_size_not_ep_world_size(self):
-        cfg = self._config(expert_parallel_size=4)
+        cfg = self._config(
+            expert_parallel_size=4,
+            expert_parallel_backend="deepep_v2",
+        )
         cache_manager = DummyCacheManager(cfg, rank=2, world_size=cfg.tensor_parallel_size)
 
         self.assertEqual(cache_manager.world_size, 1)
         self.assertEqual(cache_manager.num_kv_heads, cfg.hf_config.num_key_value_heads)
 
     def test_cache_manager_uses_parallel_context_local_rank_for_device(self):
-        cfg = self._config(expert_parallel_size=4)
+        cfg = self._config(
+            expert_parallel_size=4,
+            expert_parallel_backend="deepep_v2",
+        )
         ctx = ParallelContext(
             global_rank=2,
             global_world_size=4,

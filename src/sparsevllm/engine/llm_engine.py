@@ -195,7 +195,7 @@ class _ThroughputIntervalLogger:
             )
 
 
-class _OverlappedDPSchedulerOracle:
+class _NativeDPSchedulerOracle:
     """Rank-0 cache-manager proxy with conservative DP-rank capacity limits."""
 
     def __init__(self, delegate):
@@ -357,12 +357,12 @@ class LLMEngine:
             self._build_non_execution_token_ids(self.tokenizer),
         )
         
-        # 4. 初始化调度器。普通路径使用 rank 0 CacheManager；overlapped DP+EP
+        # 4. 初始化调度器。普通路径使用 rank 0 CacheManager；native DP
         # 路径每个 DP rank 都有独立 KV cache，因此调度预算取所有 rank 的保守最小值。
         self._scheduler_oracle = None
         scheduler_oracle = self.model_runner.cache_manager
-        if bool(getattr(config, "expert_parallel_overlap_data_parallel", False)):
-            self._scheduler_oracle = _OverlappedDPSchedulerOracle(self.model_runner.cache_manager)
+        if int(getattr(config, "data_parallel_size", 1) or 1) > 1:
+            self._scheduler_oracle = _NativeDPSchedulerOracle(self.model_runner.cache_manager)
             scheduler_oracle = self._scheduler_oracle
         self.scheduler = Scheduler(config, scheduler_oracle)
         
@@ -597,11 +597,11 @@ class LLMEngine:
         else:
             self._dp_seq_owner.pop(seq_id, None)
 
-    def _use_overlapped_dp_ep(self) -> bool:
-        return bool(getattr(self.config, "expert_parallel_overlap_data_parallel", False))
+    def _use_native_data_parallel(self) -> bool:
+        return int(getattr(self.config, "data_parallel_size", 1) or 1) > 1
 
     def _refresh_scheduler_capacity_snapshot(self) -> None:
-        if not self._use_overlapped_dp_ep():
+        if not self._use_native_data_parallel():
             return
         oracle = getattr(self, "_scheduler_oracle", None)
         if oracle is None:
@@ -613,7 +613,7 @@ class LLMEngine:
         )
         if not isinstance(snapshots, list) or len(snapshots) != int(self.config.parallel_world_size):
             raise RuntimeError(
-                "Overlapped DP+EP scheduler capacity snapshot did not return one payload per rank: "
+                "Native DP scheduler capacity snapshot did not return one payload per rank: "
                 f"got {type(snapshots).__name__} len={len(snapshots) if isinstance(snapshots, list) else 'n/a'}."
             )
         oracle.update_snapshots(snapshots)
@@ -656,7 +656,7 @@ class LLMEngine:
             owner = self._owner_rank_for_seq(seq)
             if owner < 0 or owner >= world_size:
                 raise RuntimeError(
-                    f"Invalid overlapped DP owner rank {owner} for seq_id={seq.seq_id}; "
+                    f"Invalid native DP owner rank {owner} for seq_id={seq.seq_id}; "
                     f"world_size={world_size}."
                 )
             rank_batches[owner].append(seq)
@@ -666,7 +666,7 @@ class LLMEngine:
         seq_ids = [int(seq_id) for seq_id in seq_ids]
         if not seq_ids:
             return
-        if not self._use_overlapped_dp_ep():
+        if not self._use_native_data_parallel():
             self.model_runner.call("free_slots_batch", seq_ids)
             for seq_id in seq_ids:
                 self._dp_seq_owner.pop(seq_id, None)
@@ -677,11 +677,11 @@ class LLMEngine:
         for seq_id in seq_ids:
             owner = self._dp_seq_owner.get(seq_id)
             if owner is None:
-                raise RuntimeError(f"Missing overlapped DP owner rank for seq_id={seq_id} during free.")
+                raise RuntimeError(f"Missing native DP owner rank for seq_id={seq_id} during free.")
             owner = int(owner)
             if owner < 0 or owner >= world_size:
                 raise RuntimeError(
-                    f"Invalid overlapped DP owner rank {owner} for seq_id={seq_id}; "
+                    f"Invalid native DP owner rank {owner} for seq_id={seq_id}; "
                     f"world_size={world_size}."
                 )
             rank_seq_ids[owner].append(seq_id)
@@ -689,7 +689,7 @@ class LLMEngine:
         for seq_id in seq_ids:
             self._dp_seq_owner.pop(seq_id, None)
 
-    def _run_overlapped_dp_step(
+    def _run_native_dp_step(
         self,
         seqs: list[Sequence],
         is_prefill: bool,
@@ -698,7 +698,7 @@ class LLMEngine:
         gathered = self.model_runner.call("run_rank_batches", rank_batches, is_prefill)
         if not isinstance(gathered, list) or len(gathered) != int(self.config.parallel_world_size):
             raise RuntimeError(
-                "Overlapped DP+EP run did not gather one payload per rank: "
+                "Native DP run did not gather one payload per rank: "
                 f"got {type(gathered).__name__} len={len(gathered) if isinstance(gathered, list) else 'n/a'}."
             )
 
@@ -707,7 +707,7 @@ class LLMEngine:
         top_logprob_by_seq: dict[int, dict[int, float] | None] = {}
         for payload in gathered:
             if payload is None:
-                raise RuntimeError("Overlapped DP+EP gathered an empty rank payload.")
+                raise RuntimeError("Native DP gathered an empty rank payload.")
             seq_ids = [int(seq_id) for seq_id in payload["seq_ids"]]
             token_ids = [int(token_id) for token_id in payload["token_ids"]]
             token_logprobs = list(payload["token_logprobs"])
@@ -719,7 +719,7 @@ class LLMEngine:
                 == len(top_logprobs)
             ):
                 raise RuntimeError(
-                    "Overlapped DP+EP rank payload length mismatch: "
+                    "Native DP rank payload length mismatch: "
                     f"rank={payload.get('rank')} seq_ids={len(seq_ids)} "
                     f"token_ids={len(token_ids)} token_logprobs={len(token_logprobs)} "
                     f"top_logprobs={len(top_logprobs)}."
@@ -731,14 +731,14 @@ class LLMEngine:
                 top_logprobs,
             ):
                 if seq_id in token_by_seq:
-                    raise RuntimeError(f"Duplicate overlapped DP token output for seq_id={seq_id}.")
+                    raise RuntimeError(f"Duplicate native DP token output for seq_id={seq_id}.")
                 token_by_seq[seq_id] = token_id
                 token_logprob_by_seq[seq_id] = token_logprob
                 top_logprob_by_seq[seq_id] = top_logprob
 
         missing = [int(seq.seq_id) for seq in seqs if int(seq.seq_id) not in token_by_seq]
         if missing:
-            raise RuntimeError(f"Missing overlapped DP token outputs for seq_ids={missing[:16]}.")
+            raise RuntimeError(f"Missing native DP token outputs for seq_ids={missing[:16]}.")
         token_ids = [int(token_by_seq[int(seq.seq_id)]) for seq in seqs]
         token_logprobs = [token_logprob_by_seq[int(seq.seq_id)] for seq in seqs]
         top_logprobs = [top_logprob_by_seq[int(seq.seq_id)] for seq in seqs]
@@ -825,11 +825,11 @@ class LLMEngine:
                     f"waiting={len(self.scheduler.waiting)} decoding={len(self.scheduler.decoding)}"
                 )
                 
-            # 3. 跨进程执行推理。普通 TP/EP correctness 路径广播同一 batch；
-            # overlapped DP+EP 路径按 seq owner rank 分发本地 batch 后收集采样结果。
+            # 3. 跨进程执行推理。普通 TP 路径广播同一 batch；
+            # native DP 路径按 seq owner rank 分发本地 batch 后收集采样结果。
             with profiler.record("model_run_call"):
-                if self._use_overlapped_dp_ep():
-                    token_ids, logprob_outputs = self._run_overlapped_dp_step(seqs, is_prefill)
+                if self._use_native_data_parallel():
+                    token_ids, logprob_outputs = self._run_native_dp_step(seqs, is_prefill)
                 else:
                     token_ids, logprob_outputs = self.model_runner.call("run", seqs, is_prefill)
             token_logprobs, top_logprobs = (
