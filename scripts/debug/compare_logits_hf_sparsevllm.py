@@ -35,7 +35,16 @@ DEFAULT_MODEL = "/data2/haojitai/models/Qwen2.5-7B-Instruct-1M"
 DEFAULT_COMPRESSOR = "/data2/haojitai/checkpoints/compressor/Qwen2.5-7B-Instruct-1M-Compressor"
 DEFAULT_OUTPUT_ROOT = "/data2/haojitai/outputs/sparsevllm_logits_align"
 
-DIRECT_HF_METHODS = {"vanilla", "omnikv", "snapkv", "pyramidkv", "streamingllm", "attention-sink", "attention_sink"}
+DIRECT_HF_METHODS = {
+    "vanilla",
+    "omnikv",
+    "snapkv",
+    "pyramidkv",
+    "quest",
+    "streamingllm",
+    "attention-sink",
+    "attention_sink",
+}
 STANDARD_SPARSE_METHODS = {
     "vanilla",
     "streamingllm",
@@ -1749,6 +1758,13 @@ def _hf_infer_config(args: argparse.Namespace, method: str, prompt_len: int) -> 
             "prefill_keep_tokens": int(args.prefill_keep_tokens),
             "sink_keep_tokens": int(args.sink_keep_tokens),
             "recent_keep_tokens": int(args.recent_keep_tokens),
+        }
+
+    if method == "quest":
+        return {
+            "sparse_method": "quest",
+            "decode_keep_tokens": int(args.quest_token_budget),
+            "chunk_size": int(args.quest_chunk_size),
         }
 
     # HF DeltaKV should not chunk this logits-alignment prefill unless explicitly requested.

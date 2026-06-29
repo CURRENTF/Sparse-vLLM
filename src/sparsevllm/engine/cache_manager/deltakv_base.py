@@ -1526,6 +1526,7 @@ class DeltaKVCacheManager(CacheManager):
             "to_compress_mask": to_compress_mask,
             "latent_store_mask": latent_store_mask,
             "latent_store_indices": latent_store_indices,
+            "latent_store_indices_contiguous": bool(plan_cpu.evict_len > 0),
         }
 
     def _after_full_prefill_plan_prepared(

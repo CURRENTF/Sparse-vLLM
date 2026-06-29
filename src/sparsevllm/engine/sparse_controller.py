@@ -314,36 +314,39 @@ class SparseController:
         if not self.cache_manager.has_prefill_staging_view(layer_idx):
             return
 
-        state = self.layer_batch_sparse_states[layer_idx]
-        budget = self._get_layer_budget(layer_idx, is_prefill=True)
-        if budget is None:
-            raise RuntimeError("PyramidKV full-prefill staging requires a layer budget.")
+        with profiler.record("pyramidkv_staging_materialize_layer"):
+            state = self.layer_batch_sparse_states[layer_idx]
+            budget = self._get_layer_budget(layer_idx, is_prefill=True)
+            if budget is None:
+                raise RuntimeError("PyramidKV full-prefill staging requires a layer budget.")
 
-        seqs = getattr(ctx, "seqs", None)
-        if seqs is None:
-            raise RuntimeError("PyramidKV full-prefill staging requires current seqs in context.")
-        for b_idx, seq in enumerate(seqs):
-            if not seq.is_last_chunk_prefill:
-                raise RuntimeError("PyramidKV full-prefill staging should only run on the final prefill chunk.")
-            kv_len = int(state.context_lens[b_idx])
-            if kv_len <= budget:
-                keep_indices = torch.arange(kv_len, device=self.device, dtype=torch.long)
-            else:
-                attn_scores = self.cache_manager.pop_prefill_attention_score(layer_idx, seq)
-                if attn_scores is None:
-                    raise RuntimeError(
-                        "PyramidKV full-prefill staging requires prefill attention scores. "
-                        f"layer={layer_idx} seq_id={seq.seq_id}"
+            seqs = getattr(ctx, "seqs", None)
+            if seqs is None:
+                raise RuntimeError("PyramidKV full-prefill staging requires current seqs in context.")
+            seq_keep_indices = []
+            for b_idx, seq in enumerate(seqs):
+                if not seq.is_last_chunk_prefill:
+                    raise RuntimeError("PyramidKV full-prefill staging should only run on the final prefill chunk.")
+                kv_len = int(state.context_lens[b_idx])
+                if kv_len <= budget:
+                    keep_indices = torch.arange(kv_len, device=self.device, dtype=torch.long)
+                else:
+                    attn_scores = self.cache_manager.pop_prefill_attention_score(layer_idx, seq)
+                    if attn_scores is None:
+                        raise RuntimeError(
+                            "PyramidKV full-prefill staging requires prefill attention scores. "
+                            f"layer={layer_idx} seq_id={seq.seq_id}"
+                        )
+                    if attn_scores.dim() == 2:
+                        attn_scores = attn_scores.max(dim=0).values
+                    keep_indices = self._snapkv_select_indices(
+                        attn_scores[:kv_len],
+                        kv_len,
+                        budget,
+                        pool_kernel_size=int(getattr(self.config, "pool_kernel_size", 1) or 1),
                     )
-                if attn_scores.dim() == 2:
-                    attn_scores = attn_scores.max(dim=0).values
-                keep_indices = self._snapkv_select_indices(
-                    attn_scores[:kv_len],
-                    kv_len,
-                    budget,
-                    pool_kernel_size=int(getattr(self.config, "pool_kernel_size", 1) or 1),
-                )
-            self.cache_manager.materialize_prefill_staging_layer(layer_idx, seq, keep_indices)
+                seq_keep_indices.append((seq, keep_indices))
+            self.cache_manager.materialize_prefill_staging_layer_batch(layer_idx, seq_keep_indices)
 
     @torch.no_grad()
     def post_forward(self, seqs: list[Sequence], is_prefill: bool):
@@ -592,33 +595,111 @@ class SparseController:
 
     @torch.no_grad()
     def _snapkv_decode_eviction(self, seqs: list[Sequence]):
-        for layer_idx in range(self.num_layers):
-            state = self.layer_batch_sparse_states[layer_idx]
-            attn_scores = state.attn_score
-            if attn_scores is None:
-                continue
-            if attn_scores.dim() == 3:
-                attn_scores = attn_scores.max(dim=1).values
+        with profiler.record("snapkv_decode_eviction"):
+            pending_compactions: dict[
+                tuple[tuple[int, ...], tuple[int, ...]],
+                list[tuple[int, list[Sequence], torch.Tensor]],
+            ] = {}
+            can_compact_layers = (
+                self.sparse_method == "snapkv"
+                and hasattr(self.cache_manager, "free_part_slots_batch_layers")
+            )
 
-            budget = self._get_layer_budget(layer_idx, is_prefill=False)
-            if budget is None:
-                continue
-
-            top_budget = budget - self.num_sink - self.num_recent
-            trigger_len = int(2.0 * top_budget)
-            for b_idx, seq in enumerate(seqs):
-                kv_len = int(state.context_lens[b_idx])
-                if kv_len <= budget or kv_len < trigger_len:
+            for layer_idx in range(self.num_layers):
+                state = self.layer_batch_sparse_states[layer_idx]
+                attn_scores = state.attn_score
+                if attn_scores is None:
                     continue
-                if log_level == 'DEBUG':
-                    logger.debug(
-                        "[SnapKV] decode eviction: "
-                        f"layer={layer_idx} seq_id={seq.seq_id} kv_len={kv_len} budget={budget} trigger_len={trigger_len}"
+
+                budget = self._get_layer_budget(layer_idx, is_prefill=False)
+                if budget is None:
+                    continue
+
+                trigger_len = self._snapkv_decode_trigger_len(budget)
+                max_context_len = state.max_context_len
+                if max_context_len is not None and (
+                    int(max_context_len) <= int(budget) or int(max_context_len) < int(trigger_len)
+                ):
+                    continue
+
+                kv_len_fn = getattr(self.cache_manager, "decode_kv_lens_for_layer", None)
+                if kv_len_fn is not None:
+                    kv_lens = kv_len_fn(layer_idx, seqs)
+                else:
+                    kv_lens = [int(state.context_lens[b_idx]) for b_idx in range(len(seqs))]
+                triggered: list[tuple[int, Sequence, int]] = []
+                for b_idx, (seq, kv_len) in enumerate(zip(seqs, kv_lens)):
+                    if kv_len <= budget or kv_len < trigger_len:
+                        continue
+                    triggered.append((b_idx, seq, kv_len))
+
+                if not triggered:
+                    continue
+                if attn_scores.dim() == 3:
+                    with profiler.record("snapkv_decode_score_reduce"):
+                        attn_scores = attn_scores.max(dim=1).values
+
+                by_kv_len: dict[int, list[tuple[int, Sequence]]] = {}
+                for b_idx, seq, kv_len in triggered:
+                    by_kv_len.setdefault(int(kv_len), []).append((b_idx, seq))
+
+                for kv_len, group in by_kv_len.items():
+                    if log_level == 'DEBUG':
+                        for _b_idx, seq in group:
+                            logger.debug(
+                                "[SnapKV] decode eviction: "
+                                f"layer={layer_idx} seq_id={seq.seq_id} kv_len={kv_len} budget={budget} trigger_len={trigger_len}"
+                            )
+                    if len(group) == 1:
+                        b_idx, seq = group[0]
+                        with profiler.record("snapkv_decode_select"):
+                            keep_indices = self._snapkv_select_indices(
+                                attn_scores[b_idx, :kv_len], kv_len, budget
+                            )
+                        with profiler.record("snapkv_decode_compact"):
+                            self.cache_manager.free_part_slots(layer_idx, seq, keep_indices)
+                        continue
+
+                    batch_indices = torch.tensor(
+                        [b_idx for b_idx, _seq in group],
+                        dtype=torch.long,
+                        device=attn_scores.device,
                     )
-                keep_indices = self._snapkv_select_indices(
-                    attn_scores[b_idx, :kv_len], kv_len, budget
-                )
-                self.cache_manager.free_part_slots(layer_idx, seq, keep_indices)
+                    with profiler.record("snapkv_decode_select"):
+                        keep_indices = self._snapkv_select_indices_batch(
+                            attn_scores.index_select(0, batch_indices)[:, :kv_len],
+                            kv_len,
+                            budget,
+                    )
+                    free_batch = getattr(self.cache_manager, "free_part_slots_batch", None)
+                    group_seqs = [seq for _b_idx, seq in group]
+                    if can_compact_layers:
+                        key = (
+                            tuple(int(seq.seq_id) for seq in group_seqs),
+                            tuple(int(dim) for dim in keep_indices.shape),
+                        )
+                        pending_compactions.setdefault(key, []).append((layer_idx, group_seqs, keep_indices))
+                    else:
+                        with profiler.record("snapkv_decode_compact"):
+                            if free_batch is None:
+                                for row_idx, (_b_idx, seq) in enumerate(group):
+                                    self.cache_manager.free_part_slots(layer_idx, seq, keep_indices[row_idx])
+                            else:
+                                free_batch(layer_idx, group_seqs, keep_indices)
+
+            if pending_compactions:
+                free_layers = getattr(self.cache_manager, "free_part_slots_batch_layers")
+                for entries in pending_compactions.values():
+                    if len(entries) == 1:
+                        layer_idx, group_seqs, keep_indices = entries[0]
+                        with profiler.record("snapkv_decode_compact"):
+                            self.cache_manager.free_part_slots_batch(layer_idx, group_seqs, keep_indices)
+                        continue
+                    layer_indices = [layer_idx for layer_idx, _group_seqs, _keep_indices in entries]
+                    group_seqs = entries[0][1]
+                    keep_indices = torch.stack([entry[2] for entry in entries], dim=0)
+                    with profiler.record("snapkv_decode_compact_layers"):
+                        free_layers(layer_indices, group_seqs, keep_indices)
 
     @torch.no_grad()
     def _rkv_decode_eviction(self, seqs: list[Sequence]):
@@ -658,12 +739,20 @@ class SparseController:
             )
         use_query_cache_scores = self.sparse_method == "rkv"
         query_score_fn = getattr(self.cache_manager, "rkv_query_attention_scores", None)
+        query_score_batch_fn = getattr(self.cache_manager, "rkv_query_attention_scores_batch", None)
         if use_query_cache_scores and query_score_fn is None:
             raise RuntimeError(
                 f"Cache manager {type(self.cache_manager).__name__} does not implement rkv_query_attention_scores."
             )
+        select_batch_fn = getattr(self.cache_manager, f"{select_fn_name}_batch", None)
+        free_batch = getattr(self.cache_manager, "free_part_slots_batch", None)
+        free_layers = getattr(self.cache_manager, "free_part_slots_batch_layers", None)
 
         with profiler.record(profiler_name):
+            pending_layer_compactions: dict[
+                tuple[tuple[int, ...], int],
+                tuple[list[Sequence], list[int], list[torch.Tensor]],
+            ] = {}
             for layer_idx in range(self.num_layers):
                 state = self.layer_batch_sparse_states[layer_idx]
                 attn_scores = None
@@ -689,7 +778,46 @@ class SparseController:
                         candidate_lens=(state.context_lens - self.num_sink).clamp_min(0),
                     )
 
-                for b_idx, seq, kv_len in triggered:
+                batch_importance_scores = None
+                if use_query_cache_scores and query_score_batch_fn is not None:
+                    batch_importance_scores = query_score_batch_fn(
+                        layer_idx,
+                        [seq for _, seq, _ in triggered],
+                        [kv_len for _, _, kv_len in triggered],
+                        candidate_start=self.num_sink,
+                        num_recent_tokens=self.num_recent,
+                    )
+                batch_keep_indices = None
+                triggered_seqs = [seq for _, seq, _ in triggered]
+                triggered_kv_lens = [kv_len for _, _, kv_len in triggered]
+                if (
+                    select_batch_fn is not None
+                    and len(set(int(kv_len) for kv_len in triggered_kv_lens)) == 1
+                ):
+                    if batch_importance_scores is not None:
+                        select_importance_scores = batch_importance_scores
+                    elif attn_scores is not None:
+                        batch_indices = torch.tensor(
+                            [b_idx for b_idx, _seq, _kv_len in triggered],
+                            dtype=torch.long,
+                            device=attn_scores.device,
+                        )
+                        select_importance_scores = attn_scores.index_select(0, batch_indices)
+                    else:
+                        select_importance_scores = None
+                else:
+                    select_importance_scores = None
+                if select_importance_scores is not None:
+                    batch_keep_indices = select_batch_fn(
+                        layer_idx,
+                        triggered_seqs,
+                        select_importance_scores,
+                        triggered_kv_lens,
+                        budget,
+                    )
+                keep_batch: list[torch.Tensor] = []
+                seq_batch: list[Sequence] = []
+                for local_trigger_idx, (b_idx, seq, kv_len) in enumerate(triggered):
                     if log_level == 'DEBUG':
                         logger.debug(
                             "[{}] decode eviction: layer={} seq_id={} kv_len={} budget={} trigger_len={}",
@@ -700,24 +828,58 @@ class SparseController:
                             budget,
                             trigger_len,
                         )
-                    if use_query_cache_scores:
-                        importance_scores = query_score_fn(
+                    if batch_keep_indices is not None:
+                        keep_indices = batch_keep_indices[local_trigger_idx]
+                    else:
+                        if batch_importance_scores is not None:
+                            importance_scores = batch_importance_scores[local_trigger_idx, :kv_len]
+                        elif use_query_cache_scores:
+                            importance_scores = query_score_fn(
+                                layer_idx,
+                                seq,
+                                kv_len,
+                                candidate_start=self.num_sink,
+                                num_recent_tokens=self.num_recent,
+                            )
+                        else:
+                            importance_scores = attn_scores[b_idx, :kv_len]
+                        keep_indices = select_fn(
                             layer_idx,
                             seq,
+                            importance_scores,
                             kv_len,
-                            candidate_start=self.num_sink,
-                            num_recent_tokens=self.num_recent,
+                            budget,
                         )
-                    else:
-                        importance_scores = attn_scores[b_idx, :kv_len]
-                    keep_indices = select_fn(
-                        layer_idx,
-                        seq,
-                        importance_scores,
-                        kv_len,
-                        budget,
+                    keep_batch.append(keep_indices)
+                    seq_batch.append(seq)
+
+                use_layer_batch = (
+                    use_query_cache_scores
+                    and free_layers is not None
+                    and len(seq_batch) > 1
+                    and all(int(keep.numel()) == int(keep_batch[0].numel()) for keep in keep_batch)
+                )
+                if use_layer_batch:
+                    key = (
+                        tuple(int(seq.seq_id) for seq in seq_batch),
+                        int(keep_batch[0].numel()),
                     )
-                    self.cache_manager.free_part_slots(layer_idx, seq, keep_indices)
+                    entry = pending_layer_compactions.get(key)
+                    if entry is None:
+                        entry = (list(seq_batch), [], [])
+                        pending_layer_compactions[key] = entry
+                    entry[1].append(int(layer_idx))
+                    entry[2].append(torch.stack(keep_batch, dim=0))
+                elif free_batch is not None and len(seq_batch) > 1:
+                    keep_indices = torch.stack(keep_batch, dim=0)
+                    free_batch(layer_idx, seq_batch, keep_indices)
+                else:
+                    for seq, keep_indices in zip(seq_batch, keep_batch):
+                        self.cache_manager.free_part_slots(layer_idx, seq, keep_indices)
+
+            for seq_batch, layer_indices, keep_batches in pending_layer_compactions.values():
+                keep_indices = torch.stack(keep_batches, dim=0)
+                free_layers(layer_indices, seq_batch, keep_indices)
 
     @torch.no_grad()
     def _streamingllm_prefill_eviction(self, seqs: list[Sequence]):
@@ -725,16 +887,78 @@ class SparseController:
         if budget is None:
             return
 
-        for layer_idx in range(self.num_layers):
-            state = self.layer_batch_sparse_states[layer_idx]
-            for b_idx, seq in enumerate(seqs):
-                if not seq.is_last_chunk_prefill:
+        with profiler.record("streamingllm_prefill_eviction"):
+            free_prefix_recent = getattr(self.cache_manager, "free_prefix_recent_slots_batch_layers", None)
+            free_layers = getattr(self.cache_manager, "free_part_slots_batch_layers", None)
+            free_batch = getattr(self.cache_manager, "free_part_slots_batch", None)
+            pending_prefix_recent: dict[
+                tuple[tuple[int, ...], int],
+                list[tuple[int, list[Sequence]]],
+            ] = {}
+            pending_compactions: dict[
+                tuple[tuple[int, ...], int],
+                list[tuple[int, list[Sequence], torch.Tensor]],
+            ] = {}
+
+            for layer_idx in range(self.num_layers):
+                state = self.layer_batch_sparse_states[layer_idx]
+                triggered: list[tuple[int, Sequence, int]] = []
+                for b_idx, seq in enumerate(seqs):
+                    if not seq.is_last_chunk_prefill:
+                        continue
+                    kv_len = int(state.context_lens[b_idx])
+                    if kv_len <= budget:
+                        continue
+                    triggered.append((b_idx, seq, kv_len))
+
+                if not triggered:
                     continue
-                kv_len = int(state.context_lens[b_idx])
-                if kv_len <= budget:
-                    continue
-                keep_indices = self._streamingllm_select_indices(kv_len)
-                self.cache_manager.free_part_slots(layer_idx, seq, keep_indices)
+
+                by_kv_len: dict[int, list[tuple[int, Sequence]]] = {}
+                for b_idx, seq, kv_len in triggered:
+                    by_kv_len.setdefault(int(kv_len), []).append((b_idx, seq))
+
+                for kv_len, group in by_kv_len.items():
+                    group_seqs = [seq for _b_idx, seq in group]
+                    if free_prefix_recent is not None:
+                        key = (tuple(int(seq.seq_id) for seq in group_seqs), int(kv_len))
+                        pending_prefix_recent.setdefault(key, []).append((layer_idx, group_seqs))
+                        continue
+                    keep_indices = self._streamingllm_select_indices(kv_len).expand(len(group), -1)
+                    if free_layers is not None:
+                        key = (tuple(int(seq.seq_id) for seq in group_seqs), int(kv_len))
+                        pending_compactions.setdefault(key, []).append((layer_idx, group_seqs, keep_indices))
+                    elif free_batch is not None:
+                        free_batch(layer_idx, group_seqs, keep_indices)
+                    else:
+                        for row_idx, (_b_idx, seq) in enumerate(group):
+                            self.cache_manager.free_part_slots(layer_idx, seq, keep_indices[row_idx])
+
+            if pending_prefix_recent:
+                for (_seq_ids, kv_len), entries in pending_prefix_recent.items():
+                    layer_indices = [layer_idx for layer_idx, _group_seqs in entries]
+                    group_seqs = entries[0][1]
+                    free_prefix_recent(
+                        layer_indices,
+                        group_seqs,
+                        kv_len=kv_len,
+                        num_sink_tokens=self.num_sink,
+                        num_recent_tokens=self.num_recent,
+                    )
+            if pending_compactions:
+                for entries in pending_compactions.values():
+                    if len(entries) == 1:
+                        layer_idx, group_seqs, keep_indices = entries[0]
+                        if free_batch is not None:
+                            free_batch(layer_idx, group_seqs, keep_indices)
+                        else:
+                            for row_idx, seq in enumerate(group_seqs):
+                                self.cache_manager.free_part_slots(layer_idx, seq, keep_indices[row_idx])
+                        continue
+                    layer_indices = [layer_idx for layer_idx, _group_seqs, _keep_indices in entries]
+                    group_seqs = entries[0][1]
+                    keep_indices = torch.stack([entry[2] for entry in entries], dim=0)
+                    free_layers(layer_indices, group_seqs, keep_indices)
 
     @torch.no_grad()
     def _streamingllm_decode_eviction(self, seqs: list[Sequence]):
@@ -743,20 +967,93 @@ class SparseController:
             return
         trigger_len = int(2.0 * budget)
 
-        for layer_idx in range(self.num_layers):
-            state = self.layer_batch_sparse_states[layer_idx]
-            for b_idx, seq in enumerate(seqs):
-                kv_len = int(state.context_lens[b_idx])
-                if kv_len <= budget or kv_len < trigger_len:
+        with profiler.record("streamingllm_decode_eviction"):
+            free_prefix_recent = getattr(self.cache_manager, "free_prefix_recent_slots_batch_layers", None)
+            free_layers = getattr(self.cache_manager, "free_part_slots_batch_layers", None)
+            free_batch = getattr(self.cache_manager, "free_part_slots_batch", None)
+            pending_prefix_recent: dict[
+                tuple[tuple[int, ...], int],
+                list[tuple[int, list[Sequence]]],
+            ] = {}
+            pending_compactions: dict[
+                tuple[tuple[int, ...], int],
+                list[tuple[int, list[Sequence], torch.Tensor]],
+            ] = {}
+
+            for layer_idx in range(self.num_layers):
+                state = self.layer_batch_sparse_states[layer_idx]
+                max_context_len = state.max_context_len
+                if max_context_len is not None and (
+                    int(max_context_len) <= int(budget) or int(max_context_len) < int(trigger_len)
+                ):
                     continue
-                if log_level == 'DEBUG':
-                    logger.debug(
-                        "[StreamingLLM] decode eviction: "
-                        f"layer={layer_idx} seq_id={seq.seq_id} kv_len={kv_len} "
-                        f"budget={budget} trigger_len={trigger_len}"
+                kv_len_fn = getattr(self.cache_manager, "decode_kv_lens_for_layer", None)
+                if kv_len_fn is not None:
+                    kv_lens = kv_len_fn(layer_idx, seqs)
+                else:
+                    kv_lens = [int(state.context_lens[b_idx]) for b_idx in range(len(seqs))]
+
+                triggered: list[tuple[int, Sequence, int]] = []
+                for b_idx, (seq, kv_len) in enumerate(zip(seqs, kv_lens)):
+                    if kv_len <= budget or kv_len < trigger_len:
+                        continue
+                    triggered.append((b_idx, seq, int(kv_len)))
+
+                if not triggered:
+                    continue
+
+                by_kv_len: dict[int, list[tuple[int, Sequence]]] = {}
+                for b_idx, seq, kv_len in triggered:
+                    by_kv_len.setdefault(int(kv_len), []).append((b_idx, seq))
+
+                for kv_len, group in by_kv_len.items():
+                    if log_level == 'DEBUG':
+                        for _b_idx, seq in group:
+                            logger.debug(
+                                "[StreamingLLM] decode eviction: "
+                                f"layer={layer_idx} seq_id={seq.seq_id} kv_len={kv_len} "
+                                f"budget={budget} trigger_len={trigger_len}"
+                            )
+                    group_seqs = [seq for _b_idx, seq in group]
+                    if free_prefix_recent is not None:
+                        key = (tuple(int(seq.seq_id) for seq in group_seqs), int(kv_len))
+                        pending_prefix_recent.setdefault(key, []).append((layer_idx, group_seqs))
+                        continue
+                    keep_indices = self._streamingllm_select_indices(kv_len).expand(len(group), -1)
+                    if free_layers is not None:
+                        key = (tuple(int(seq.seq_id) for seq in group_seqs), int(kv_len))
+                        pending_compactions.setdefault(key, []).append((layer_idx, group_seqs, keep_indices))
+                    elif free_batch is not None:
+                        free_batch(layer_idx, group_seqs, keep_indices)
+                    else:
+                        for row_idx, (_b_idx, seq) in enumerate(group):
+                            self.cache_manager.free_part_slots(layer_idx, seq, keep_indices[row_idx])
+
+            if pending_prefix_recent:
+                for (_seq_ids, kv_len), entries in pending_prefix_recent.items():
+                    layer_indices = [layer_idx for layer_idx, _group_seqs in entries]
+                    group_seqs = entries[0][1]
+                    free_prefix_recent(
+                        layer_indices,
+                        group_seqs,
+                        kv_len=kv_len,
+                        num_sink_tokens=self.num_sink,
+                        num_recent_tokens=self.num_recent,
                     )
-                keep_indices = self._streamingllm_select_indices(kv_len)
-                self.cache_manager.free_part_slots(layer_idx, seq, keep_indices)
+            if pending_compactions:
+                for entries in pending_compactions.values():
+                    if len(entries) == 1:
+                        layer_idx, group_seqs, keep_indices = entries[0]
+                        if free_batch is not None:
+                            free_batch(layer_idx, group_seqs, keep_indices)
+                        else:
+                            for row_idx, seq in enumerate(group_seqs):
+                                self.cache_manager.free_part_slots(layer_idx, seq, keep_indices[row_idx])
+                        continue
+                    layer_indices = [layer_idx for layer_idx, _group_seqs, _keep_indices in entries]
+                    group_seqs = entries[0][1]
+                    keep_indices = torch.stack([entry[2] for entry in entries], dim=0)
+                    free_layers(layer_indices, group_seqs, keep_indices)
 
     def _get_streamingllm_budget(self) -> int | None:
         budget = self.num_sink + self.num_recent
@@ -810,6 +1107,47 @@ class SparseController:
             keep_indices = torch.cat([sink_indices, recent_indices])
             
         return keep_indices
+
+    def _snapkv_select_indices_batch(
+        self,
+        scores: torch.Tensor,
+        kv_len: int,
+        budget: int,
+        *,
+        pool_kernel_size: int = 1,
+    ) -> torch.Tensor:
+        if scores.dim() != 2:
+            raise ValueError(f"Expected batched SnapKV scores with shape [B, L], got {tuple(scores.shape)}.")
+        assert kv_len > budget
+        if int(scores.shape[1]) < int(kv_len):
+            raise ValueError(
+                f"SnapKV batched scores are shorter than kv_len: scores={tuple(scores.shape)} kv_len={kv_len}."
+            )
+        device = scores.device
+        batch_size = int(scores.shape[0])
+
+        sink_indices = torch.arange(self.num_sink, device=device).expand(batch_size, -1)
+        recent_start = kv_len - self.num_recent
+        recent_indices = torch.arange(recent_start, kv_len, device=device).expand(batch_size, -1)
+
+        num_topk = budget - self.num_sink - self.num_recent
+        if num_topk > 0 and recent_start > self.num_sink:
+            middle_scores = scores[:, self.num_sink:recent_start]
+            pool_kernel_size = int(pool_kernel_size)
+            if pool_kernel_size > 1:
+                middle_scores = F.max_pool1d(
+                    middle_scores[:, None, :],
+                    kernel_size=pool_kernel_size,
+                    padding=pool_kernel_size // 2,
+                    stride=1,
+                ).squeeze(1)
+            topk_indices_relative = middle_scores.topk(
+                min(num_topk, middle_scores.shape[1]),
+                dim=-1,
+            ).indices
+            topk_indices = topk_indices_relative + self.num_sink
+            return torch.cat([sink_indices, topk_indices, recent_indices], dim=1)
+        return torch.cat([sink_indices, recent_indices], dim=1)
 
     def _get_joint_decode_budget(self) -> int | None:
         budget = int(self.num_sink) + int(self.decode_keep_tokens) + int(self.num_recent)
@@ -991,11 +1329,18 @@ class SparseController:
             budget = self._get_layer_budget(layer_idx, is_prefill=False)
             if budget is None:
                 return False
+            trigger_len = self._snapkv_decode_trigger_len(budget)
+            kv_lens_fn = getattr(self.cache_manager, "decode_kv_lens_for_layer", None)
+            if kv_lens_fn is not None:
+                kv_lens = kv_lens_fn(layer_idx, seqs)
+                return any(int(kv_len) >= int(trigger_len) and int(kv_len) > int(budget) for kv_len in kv_lens)
+
             state = self.layer_batch_sparse_states[layer_idx]
             if state.context_lens is None:
                 return False
-            top_budget = budget - self.num_sink - self.num_recent
-            trigger_len = int(2.0 * top_budget)
+            max_context_len = state.max_context_len
+            if max_context_len is not None:
+                return int(max_context_len) >= int(trigger_len) and int(max_context_len) > int(budget)
             return bool(((state.context_lens >= trigger_len) & (state.context_lens > budget)).any())
         if self.sparse_method == "rkv":
             return False
@@ -1031,3 +1376,9 @@ class SparseController:
         elif self.sparse_method == 'snapkv':
             return self.num_sink + decode_keep + self.num_recent
         return None
+
+    def _snapkv_decode_trigger_len(self, budget: int) -> int:
+        top_budget = int(budget) - int(self.num_sink) - int(self.num_recent)
+        if self.sparse_method == "pyramidkv":
+            return int(budget) + int(top_budget)
+        return int(2.0 * top_budget)

@@ -16,6 +16,7 @@ from benchmark.sparsevllm_regression.grading import (
     grade_perf,
     grade_quality,
     grade_stress,
+    grade_stress_v2,
 )
 from benchmark.sparsevllm_regression.longbench_mini import select_longbench_mini_samples
 from benchmark.sparsevllm_regression.manifest import (
@@ -28,7 +29,7 @@ from benchmark.sparsevllm_regression.manifest import (
     resolve_manifest_paths,
     validate_manifest,
 )
-from benchmark.sparsevllm_regression.run_suite import _perf_command, _scbench_command, _stress_command
+from benchmark.sparsevllm_regression.run_suite import _perf_command, _scbench_command, _stress_command, _stress_v2_command
 from benchmark.sparsevllm_regression.run_suite import _quality_command
 from sparsevllm.engine.cache_manager.base import CacheManager
 
@@ -156,6 +157,10 @@ class SparseVLLMRegressionGradingTest(unittest.TestCase):
         self.assertEqual(manifest["stress"]["request_counts"], [80])
         self.assertEqual(manifest["stress"]["max_num_seqs_in_batch"], 80)
         self.assertEqual(manifest["stress"]["max_decoding_seqs"], 80)
+        self.assertEqual(manifest["stress_v2"]["workloads"], "shared_prefix,multiturn")
+        self.assertEqual(manifest["stress_v2"]["sessions"], 8)
+        self.assertEqual(manifest["stress_v2"]["max_active_requests"], 8)
+        self.assertLess(manifest["stress_v2"]["user_min_len"], manifest["stress_v2"]["user_len"])
         self.assertEqual(manifest["scbench"]["model"], "qwen3_4b")
         self.assertEqual(manifest["scbench"]["methods"], ["vanilla", "omnikv", "quest"])
         self.assertEqual(manifest["scbench"]["tasks"], ["scbench_kv", "scbench_qa_eng"])
@@ -241,6 +246,26 @@ class SparseVLLMRegressionGradingTest(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("--max_turns") + 1], "2")
         self.assertIn("--trust_remote_code", cmd)
 
+    def test_stress_v2_command_uses_prefix_cache_serving_trace(self):
+        manifest = load_manifest()
+        cmd = _stress_v2_command(
+            model_id="qwen3_4b",
+            model={"model_path": "/tmp/model", "tokenizer_path": "/tmp/model"},
+            method_id="omnikv",
+            method=manifest["methods"]["omnikv"],
+            stress_v2={**manifest["stress_v2"], "sessions": 2, "shared_prompts": 2},
+            output_dir=Path("/tmp/stress-v2"),
+        )
+
+        self.assertIn("scripts/benchmarks/bench_prefix_cache.py", cmd)
+        self.assertEqual(cmd[cmd.index("--cases") + 1], "prefix_omnikv")
+        self.assertEqual(cmd[cmd.index("--workloads") + 1], "shared_prefix,multiturn")
+        self.assertEqual(cmd[cmd.index("--session_prefix_min_len") + 1], "1024")
+        self.assertEqual(cmd[cmd.index("--user_min_len") + 1], "128")
+        self.assertEqual(cmd[cmd.index("--shared_suffix_min_len") + 1], "512")
+        self.assertEqual(cmd[cmd.index("--max_active_requests") + 1], "8")
+        self.assertEqual(cmd[cmd.index("--output_dir") + 1], "/tmp/stress-v2")
+
     def test_quality_grade_thresholds(self):
         self.assertEqual(grade_quality(50.0, 50.0).grade, "A")
         self.assertEqual(grade_quality(50.0, 49.6).grade, "B")
@@ -285,6 +310,32 @@ class SparseVLLMRegressionGradingTest(unittest.TestCase):
             ).grade,
             "C",
         )
+        stress_v2_summary = {
+            "status": "success",
+            "cases": [
+                {
+                    "case": "prefix_full",
+                    "status": "success",
+                    "enable_prefix_caching": True,
+                    "hit_requests": 3,
+                    "total_cached_tokens": 1024,
+                    "total_eligible_cache_tokens": 1024,
+                    "eligible_cache_hit_rate": 1.0,
+                    "min_prompt_tokens": 1024,
+                    "max_prompt_tokens": 2048,
+                    "unique_prompt_lengths": 2,
+                }
+            ],
+        }
+        self.assertEqual(grade_stress_v2(stress_v2_summary).grade, "A")
+        no_hits = copy.deepcopy(stress_v2_summary)
+        no_hits["cases"][0]["hit_requests"] = 0
+        self.assertEqual(grade_stress_v2(no_hits).grade, "D")
+        fixed_lengths = copy.deepcopy(stress_v2_summary)
+        fixed_lengths["cases"][0]["min_prompt_tokens"] = 1024
+        fixed_lengths["cases"][0]["max_prompt_tokens"] = 1024
+        fixed_lengths["cases"][0]["unique_prompt_lengths"] = 1
+        self.assertEqual(grade_stress_v2(fixed_lengths).grade, "D")
 
     def test_longbench_mini_selects_fixed_long_samples(self):
         data = [

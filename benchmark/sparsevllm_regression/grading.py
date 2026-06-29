@@ -212,6 +212,59 @@ def grade_stress(
     return GateGrade("stress", grade, "success", metrics)
 
 
+def grade_stress_v2(summary: dict[str, Any] | None) -> GateGrade:
+    if not isinstance(summary, dict):
+        return GateGrade("stress_v2", "D", "failed", {}, "Missing stress_v2 aggregate summary.")
+    cases = summary.get("cases")
+    if not isinstance(cases, list) or not cases:
+        return GateGrade("stress_v2", "D", "failed", summary, "No stress_v2 cases were recorded.")
+
+    failed_cases = [case for case in cases if case.get("status") != "success"]
+    cache_cases = [case for case in cases if bool(case.get("enable_prefix_caching", False))]
+    cache_hit_failures = [
+        case.get("case", "")
+        for case in cache_cases
+        if int(case.get("hit_requests", 0) or 0) <= 0 or int(case.get("total_cached_tokens", 0) or 0) <= 0
+    ]
+    variable_length_cases = [
+        case
+        for case in cases
+        if int(case.get("unique_prompt_lengths", 0) or 0) > 1
+        or int(case.get("max_prompt_tokens", 0) or 0) > int(case.get("min_prompt_tokens", 0) or 0)
+    ]
+    eligible_hit_rates = [
+        float(case.get("eligible_cache_hit_rate", 0.0) or 0.0)
+        for case in cache_cases
+        if float(case.get("total_eligible_cache_tokens", 0.0) or 0.0) > 0.0
+    ]
+    min_eligible_hit_rate = min(eligible_hit_rates) if eligible_hit_rates else 0.0
+    metrics = {
+        "completed": summary.get("status") == "success" and not failed_cases,
+        "case_count": len(cases),
+        "failed_cases": [case.get("case", "") for case in failed_cases],
+        "cache_case_count": len(cache_cases),
+        "cache_hit_failures": cache_hit_failures,
+        "variable_length_case_count": len(variable_length_cases),
+        "min_eligible_cache_hit_rate": min_eligible_hit_rate,
+    }
+    if summary.get("status") != "success" or failed_cases:
+        return GateGrade("stress_v2", "D", "failed", metrics, "One or more serving-trace cases failed.")
+    if not cache_cases:
+        return GateGrade("stress_v2", "D", "failed", metrics, "No prefix-cache-enabled cases were run.")
+    if cache_hit_failures:
+        return GateGrade("stress_v2", "D", "failed", metrics, "Prefix-cache cases did not observe cache hits.")
+    if not variable_length_cases:
+        return GateGrade("stress_v2", "D", "failed", metrics, "Serving trace did not vary prompt lengths.")
+
+    if min_eligible_hit_rate >= 0.80:
+        grade = "A"
+    elif min_eligible_hit_rate >= 0.50:
+        grade = "B"
+    else:
+        grade = "C"
+    return GateGrade("stress_v2", grade, "success", metrics)
+
+
 def worst_required_grade(grades: list[GateGrade]) -> str:
     required = [grade.grade for grade in grades if grade.grade != "N/A"]
     if not required:

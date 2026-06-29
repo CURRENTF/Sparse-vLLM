@@ -1577,7 +1577,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
                 block_starts = plan["block_start_pos"].to(torch.long)
                 block_slots = plan["block_slots"].to(torch.long)
                 if block_slots.numel() > 0:
-                    offsets = torch.arange(group_size, device=self.device, dtype=torch.long)
+                    offsets = torch.arange(group_size, device=k_stage.device, dtype=torch.long)
                     with profiler.record("deltakv_full_prefill_kivi_store_blocks"):
                         for start in range(0, int(block_slots.numel()), block_chunk_size):
                             end = min(int(block_slots.numel()), start + block_chunk_size)
@@ -2175,6 +2175,9 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         new_center_rel = (center_pos - evict_start).to(device=evict_pos.device, dtype=torch.long)
         store_cursor = 0
         store_chunk_size = self._deltakv_latent_store_chunk_size()
+        contiguous_store_indices = bool(plan.get("latent_store_indices_contiguous", False)) and (
+            int(store_indices_all.numel()) == int(evict_pos.numel())
+        )
         for start in range(0, int(evict_pos.numel()), store_chunk_size):
             end = min(int(evict_pos.numel()), start + store_chunk_size)
             evict_chunk = evict_pos[start:end]
@@ -2194,13 +2197,16 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
                     row_start=start,
                 )
 
-            next_cursor = int(
-                torch.searchsorted(
-                    store_indices_all,
-                    torch.tensor(end, device=store_indices_all.device, dtype=store_indices_all.dtype),
-                    right=False,
-                ).item()
-            )
+            if contiguous_store_indices:
+                next_cursor = end
+            else:
+                next_cursor = int(
+                    torch.searchsorted(
+                        store_indices_all,
+                        torch.tensor(end, device=store_indices_all.device, dtype=store_indices_all.dtype),
+                        right=False,
+                    ).item()
+                )
             if next_cursor == store_cursor:
                 continue
             selected_global = store_indices_all[store_cursor:next_cursor]
@@ -2446,11 +2452,31 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         req_indices: torch.Tensor,
     ):
         if not get_context().is_prefill or self._is_stream_capturing():
-            return self._deltakv_build_view_and_plan_reconstruct_static(
-                layer_idx,
-                active_compressed_indices,
-                req_indices,
-            )
+            req_ptr = int(req_indices.data_ptr()) if req_indices is not None and req_indices.numel() > 0 else 0
+            req_n = int(req_indices.numel()) if req_indices is not None else 0
+            if active_compressed_indices is None:
+                act_ptr = 0
+                act_b = req_n
+                act_k = 0
+            else:
+                act_ptr = int(active_compressed_indices.data_ptr())
+                act_b = int(active_compressed_indices.shape[0])
+                act_k = int(active_compressed_indices.shape[1])
+
+            key = (req_ptr, req_n, act_ptr, act_b, act_k)
+            if self._deltakv_view_cache_key == key and self._deltakv_view_cache_value is not None:
+                with profiler.record("deltakv_build_view_cache_hit"):
+                    return self._deltakv_view_cache_value
+
+            with profiler.record("deltakv_build_view_total"):
+                out = self._deltakv_build_view_and_plan_reconstruct_static(
+                    layer_idx,
+                    active_compressed_indices,
+                    req_indices,
+                )
+            self._deltakv_view_cache_key = key
+            self._deltakv_view_cache_value = out
+            return out
         return super()._deltakv_build_view_and_plan_reconstruct(layer_idx, active_compressed_indices, req_indices)
 
     def _deltakv_build_view_and_plan_reconstruct_static(

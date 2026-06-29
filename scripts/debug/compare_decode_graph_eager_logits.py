@@ -271,6 +271,8 @@ def main():
             "attention_sink",
             "snapkv",
             "pyramidkv",
+            "rkv",
+            "skipkv",
             "quest",
             "omnikv",
             "deltakv",

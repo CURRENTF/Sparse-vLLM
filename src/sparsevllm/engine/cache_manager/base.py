@@ -648,6 +648,10 @@ class CacheManager(ABC):
         """Whether scheduler should route this first prefill as a full bs1 step."""
         return False
 
+    def requires_full_prefill_step(self, seq: Sequence) -> bool:
+        """Whether this prefill candidate must run its remaining tokens in one step."""
+        return False
+
     def is_full_prefill_step(self, seqs: list[Sequence]) -> bool:
         """Whether the current prepared prefill step is backed by a full-prefill staging view."""
         return False

@@ -72,6 +72,20 @@ class RKVSkipKVMethodTest(unittest.TestCase):
                 max_tokens=4,
             )
 
+    def test_rkv_query_cache_is_skipped_when_eviction_cannot_trigger(self):
+        cfg = SimpleNamespace(
+            rkv_observation_tokens=8,
+            num_sink_tokens=64,
+            decode_keep_tokens=4096,
+            num_recent_tokens=512,
+            rkv_compression_interval=128,
+            max_model_len=4791,
+        )
+        self.assertFalse(RKVCacheManager._query_cache_needed_for_config(cfg))
+
+        cfg.max_model_len = 4800
+        self.assertTrue(RKVCacheManager._query_cache_needed_for_config(cfg))
+
     def test_rkv_joint_retention_score_uses_paper_lambda(self):
         importance = torch.tensor([0.2, 0.8], dtype=torch.float32)
         redundancy = torch.tensor([0.9, 0.1], dtype=torch.float32)
@@ -235,6 +249,29 @@ class RKVSkipKVMethodTest(unittest.TestCase):
         self.assertGreater(float(penalty[2]), 0.9)
         self.assertEqual(float(penalty[3]), 0.0)
 
+    def test_skipkv_batch_free_updates_gen_indices(self):
+        manager = object.__new__(SkipKVCacheManager)
+        manager.config = SimpleNamespace()
+        manager.device = torch.device("cpu")
+        seqs = [Sequence([1]), Sequence([2])]
+        manager.seq_id_to_row = [{seqs[0].seq_id: 0, seqs[1].seq_id: 1}]
+        manager.row_seq_lens = [torch.tensor([6, 6], dtype=torch.int32)]
+        manager.buffer_req_to_token_slots = [torch.arange(12, dtype=torch.int32).view(2, 6)]
+        manager.buffer_req_to_token_slots_tensor = None
+        manager.free_slots_stack = [torch.empty(16, dtype=torch.int32)]
+        manager.free_slots_stack_tensor = None
+        manager._num_free_slots = [0]
+        manager._uniform_decode_metadata = True
+        manager._rkv_query_cache_enabled = False
+        manager._skipkv_row_gen_indices = [{0: [10, 11, 12, 13, 14, 15], 1: [20, 21, 22, 23, 24, 25]}]
+        manager._skipkv_seq_states = {}
+
+        keep = torch.tensor([[0, 2, 5], [1, 3, 4]], dtype=torch.long)
+        manager.free_part_slots_batch(0, seqs, keep)
+
+        self.assertEqual(manager._skipkv_row_gen_indices[0][0], [10, 12, 15])
+        self.assertEqual(manager._skipkv_row_gen_indices[0][1], [21, 23, 24])
+
     def test_rkv_selection_preserves_sink_recent_and_budget(self):
         manager = object.__new__(RKVCacheManager)
         manager.config = SimpleNamespace(
@@ -295,6 +332,122 @@ class RKVSkipKVMethodTest(unittest.TestCase):
 
         self.assertEqual(seen_key_lengths, [6])
         self.assertEqual(int(keep.numel()), 5)
+
+    def test_rkv_batch_selection_matches_single_selection(self):
+        torch.manual_seed(23)
+        manager = object.__new__(RKVCacheManager)
+        manager.config = SimpleNamespace(
+            num_sink_tokens=1,
+            num_recent_tokens=1,
+            rkv_similarity_threshold=0.8,
+            rkv_recent_similar_keep=1,
+            rkv_max_redundancy_tokens=16,
+            rkv_redundancy_window=4,
+            rkv_alpha=0.1,
+        )
+        seqs = [Sequence([1]), Sequence([2])]
+        kv_len = 8
+        manager.seq_id_to_row = [{seq.seq_id: idx for idx, seq in enumerate(seqs)}]
+        manager.buffer_req_to_token_slots = [
+            torch.arange(len(seqs) * kv_len, dtype=torch.int32).view(len(seqs), kv_len)
+        ]
+        manager.kv_cache = [
+            (
+                torch.randn(len(seqs) * kv_len, 1, 4),
+                torch.randn(len(seqs) * kv_len, 1, 4),
+            )
+        ]
+        importance = torch.stack(
+            [
+                torch.linspace(0.0, 1.0, steps=kv_len),
+                torch.linspace(1.0, 0.0, steps=kv_len),
+            ],
+            dim=0,
+        )
+
+        batch_keep = manager.select_rkv_indices_batch(
+            0,
+            seqs,
+            importance,
+            [kv_len, kv_len],
+            budget=5,
+        )
+        single_keep = torch.stack(
+            [
+                manager.select_rkv_indices(
+                    0,
+                    seq,
+                    importance[idx],
+                    kv_len=kv_len,
+                    budget=5,
+                )
+                for idx, seq in enumerate(seqs)
+            ],
+            dim=0,
+        )
+
+        for row in range(len(seqs)):
+            self.assertEqual(set(batch_keep[row].tolist()), set(single_keep[row].tolist()))
+
+    def test_skipkv_batch_selection_matches_single_selection_without_sentences(self):
+        torch.manual_seed(29)
+        manager = object.__new__(SkipKVCacheManager)
+        manager.config = SimpleNamespace(
+            num_sink_tokens=1,
+            num_recent_tokens=1,
+            skipkv_alpha=0.1,
+            skipkv_similarity_threshold=0.95,
+            skipkv_segment_size=2,
+            skipkv_max_redundancy_tokens=16,
+            skipkv_redundancy_window=4,
+            rkv_similarity_threshold=0.8,
+            rkv_recent_similar_keep=1,
+        )
+        seqs = [Sequence([1]), Sequence([2])]
+        kv_len = 8
+        manager.seq_id_to_row = [{seq.seq_id: idx for idx, seq in enumerate(seqs)}]
+        manager.buffer_req_to_token_slots = [
+            torch.arange(len(seqs) * kv_len, dtype=torch.int32).view(len(seqs), kv_len)
+        ]
+        manager.kv_cache = [
+            (
+                torch.randn(len(seqs) * kv_len, 1, 4),
+                torch.randn(len(seqs) * kv_len, 1, 4),
+            )
+        ]
+        manager._skipkv_seq_states = {}
+        importance = torch.stack(
+            [
+                torch.linspace(0.0, 1.0, steps=kv_len),
+                torch.linspace(1.0, 0.0, steps=kv_len),
+            ],
+            dim=0,
+        )
+
+        batch_keep = manager.select_skipkv_indices_batch(
+            0,
+            seqs,
+            importance,
+            [kv_len, kv_len],
+            budget=5,
+        )
+        single_keep = torch.stack(
+            [
+                manager.select_skipkv_indices(
+                    0,
+                    seq,
+                    importance[idx],
+                    kv_len=kv_len,
+                    budget=5,
+                )
+                for idx, seq in enumerate(seqs)
+            ],
+            dim=0,
+        )
+
+        self.assertIsNotNone(batch_keep)
+        for row in range(len(seqs)):
+            self.assertEqual(set(batch_keep[row].tolist()), set(single_keep[row].tolist()))
 
     def test_rkv_query_cache_tracks_observation_tokens_not_interval(self):
         manager = object.__new__(RKVCacheManager)
@@ -399,6 +552,70 @@ class RKVSkipKVMethodTest(unittest.TestCase):
             num_recent_tokens,
         )[0, :kv_len]
         torch.testing.assert_close(scores, expected, rtol=2e-2, atol=2e-2)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for R-KV query score kernel tests.")
+    def test_rkv_query_attention_scores_batch_matches_single_path(self):
+        torch.manual_seed(31)
+        device = torch.device("cuda")
+        dtype = torch.float32
+        batch_size = 2
+        kv_len = 7
+        num_heads = 4
+        num_kv_heads = 2
+        head_dim = 16
+        observation_tokens = 3
+
+        seqs = [Sequence([1]), Sequence([2])]
+        manager = object.__new__(RKVCacheManager)
+        manager.config = SimpleNamespace(
+            rkv_observation_tokens=observation_tokens,
+            sparse_attn_score_dtype="float32",
+        )
+        manager.device = device
+        manager._rkv_observation_tokens = observation_tokens
+        manager.seq_id_to_row = [{seq.seq_id: idx for idx, seq in enumerate(seqs)}]
+        manager.buffer_req_to_token_slots = [
+            torch.arange(batch_size * kv_len, dtype=torch.int32, device=device).view(batch_size, kv_len)
+        ]
+        k_cache = torch.randn((batch_size * kv_len, num_kv_heads, head_dim), dtype=dtype, device=device)
+        manager.kv_cache = [(k_cache, torch.empty_like(k_cache))]
+        manager._rkv_query_cache = [
+            torch.empty((batch_size, observation_tokens, num_heads, head_dim), dtype=dtype, device=device)
+        ]
+        manager._rkv_query_positions = [
+            torch.full((batch_size, observation_tokens), -1, dtype=torch.int32, device=device)
+        ]
+
+        positions = torch.arange(kv_len - observation_tokens, kv_len, dtype=torch.long, device=device)
+        cols = positions.remainder(observation_tokens)
+        for row_idx in range(batch_size):
+            q_window = torch.randn((observation_tokens, num_heads, head_dim), dtype=dtype, device=device)
+            manager._rkv_query_cache[0][row_idx, cols] = q_window
+            manager._rkv_query_positions[0][row_idx, cols] = positions.to(torch.int32)
+
+        batch_scores = manager.rkv_query_attention_scores_batch(
+            0,
+            seqs,
+            [kv_len, kv_len],
+            candidate_start=1,
+            num_recent_tokens=1,
+        )
+        single_scores = torch.stack(
+            [
+                manager.rkv_query_attention_scores(
+                    0,
+                    seq,
+                    kv_len,
+                    candidate_start=1,
+                    num_recent_tokens=1,
+                )
+                for seq in seqs
+            ],
+            dim=0,
+        )
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(batch_scores[:, :kv_len], single_scores, rtol=2e-2, atol=2e-2)
 
 
 if __name__ == "__main__":

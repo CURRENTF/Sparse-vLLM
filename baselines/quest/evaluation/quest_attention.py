@@ -119,9 +119,7 @@ def forward(
             kv_seq_len += past_key_value[0].shape[-2]
     
     cos, sin = self.rotary_emb(value_states, position_ids.to(value_states.device))
-    query_states, key_states = apply_rotary_pos_emb(
-        query_states, key_states, cos, sin, position_ids
-    )
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
     # [bsz, nh, t, hd]
 
     # New cache format

@@ -1,4 +1,6 @@
 import json
+import random
+import types
 
 import pytest
 
@@ -46,6 +48,42 @@ def test_prefix_cache_bench_flags_impossible_cache_hit(tmp_path):
     assert records[0]["status"] == "metric_failed"
     assert records[0]["eligible_cache_tokens"] == 4
     assert "exceeds planned_eligible_cache_tokens" in records[0]["error_message"]
+
+
+def test_prefix_cache_bench_token_plan_uses_max_bounds():
+    args = types.SimpleNamespace(
+        system_prompt_len=100,
+        session_prefix_min_len=10,
+        session_prefix_len=20,
+        user_min_len=3,
+        user_len=7,
+        output_len=5,
+        turns=3,
+        shared_prefix_len=50,
+        shared_suffix_min_len=4,
+        shared_suffix_len=9,
+    )
+
+    plan = bench._token_count_plan(args)
+
+    assert plan["session_prefix_min"] == 10
+    assert plan["session_prefix_max"] == 20
+    assert plan["user_min"] == 3
+    assert plan["user_max"] == 7
+    assert plan["shared_suffix_min"] == 4
+    assert plan["shared_suffix_max"] == 9
+    assert plan["multiturn_first_prompt"] == 127
+    assert plan["multiturn_max_prompt"] == 100 + 20 + 3 * (7 + 5)
+    assert plan["shared_prefix_max_prompt"] == 59
+
+
+def test_prefix_cache_bench_sample_length_validates_bounds():
+    rng = random.Random(1)
+
+    for _ in range(20):
+        assert 4 <= bench._sample_length(rng, 9, 4) <= 9
+    with pytest.raises(ValueError, match="min must be <= max"):
+        bench._sample_length(rng, 3, 4)
 
 
 def test_prefix_cache_bench_writes_failed_samples_on_batch_error(tmp_path):

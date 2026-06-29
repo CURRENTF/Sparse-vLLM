@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
 import torch
 
 from sparsevllm.config import Config
@@ -19,6 +20,7 @@ from sparsevllm.engine.cache_manager.deltakv_less_memory_cuda_graph import (
 from sparsevllm.engine.cache_manager.snapkv import SnapKVCacheManager
 from sparsevllm.engine.decode_cuda_graph import DecodeCudaGraphKey, DecodeCudaGraphRunner, DecodeCudaGraphState
 from sparsevllm.engine.llm_engine import _deltakv_graph_warmup_profile, _use_graph_scaled_warmup
+from sparsevllm.engine.model_runner import ModelRunner
 from sparsevllm.engine.scheduler import Scheduler
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.engine.sparse_controller import SparseController
@@ -39,12 +41,14 @@ class FakeMemoryOracle:
         *,
         step_free_slots=None,
         force_full_prefill=False,
+        force_whole_prefill=False,
         prefix_hit_len=0,
         prefix_hit_blocks=0,
     ):
         self._free_slots = int(free_slots)
         self._step_free_slots = int(step_free_slots) if step_free_slots is not None else int(free_slots)
         self._force_full_prefill = bool(force_full_prefill)
+        self._force_whole_prefill = bool(force_whole_prefill)
         self.prefix_hit_len = int(prefix_hit_len)
         self.prefix_hit_blocks = int(prefix_hit_blocks)
         self.refresh_calls = 0
@@ -59,6 +63,9 @@ class FakeMemoryOracle:
 
     def should_schedule_full_prefill(self, seq):
         return self._force_full_prefill and int(seq.num_prefilled_tokens) == 0
+
+    def requires_full_prefill_step(self, seq):
+        return self._force_whole_prefill and int(seq.num_prefilled_tokens) == 0
 
     def is_full_prefill_step(self, seqs):
         return False
@@ -239,6 +246,108 @@ class PrefillPolicyRegistryTest(unittest.TestCase):
         with patch.dict(os.environ, {"SPARSEVLLM_DELTAKV_DETERMINISTIC_TOPK_TIEBREAK": "maybe"}, clear=True):
             with self.assertRaisesRegex(ValueError, "SPARSEVLLM_DELTAKV_DETERMINISTIC_TOPK_TIEBREAK"):
                 SparseController(make_sparse_controller_config(), SimpleNamespace())
+
+    def test_pyramidkv_decode_trigger_includes_fixed_tokens(self):
+        cfg = make_sparse_controller_config()
+        cfg.vllm_sparse_method = "pyramidkv"
+        cfg.num_sink_tokens = 64
+        cfg.num_recent_tokens = 512
+        cfg.decode_keep_tokens = 4096
+        controller = SparseController(cfg, SimpleNamespace())
+
+        low_layer_budget = 64 + 68 + 512
+        self.assertEqual(controller._snapkv_decode_trigger_len(low_layer_budget), low_layer_budget + 68)
+
+    def test_snapkv_decode_trigger_preserves_top_budget_rule(self):
+        cfg = make_sparse_controller_config()
+        cfg.vllm_sparse_method = "snapkv"
+        cfg.num_sink_tokens = 64
+        cfg.num_recent_tokens = 512
+        cfg.decode_keep_tokens = 4096
+        controller = SparseController(cfg, SimpleNamespace())
+
+        budget = 64 + 4096 + 512
+        self.assertEqual(controller._snapkv_decode_trigger_len(budget), 8192)
+
+    def test_streamingllm_decode_eviction_batches_layer_compaction(self):
+        class FakeStreamingManager:
+            device = torch.device("cpu")
+
+            def __init__(self):
+                self.layer_calls = []
+
+            def decode_kv_lens_for_layer(self, layer_idx, seqs):
+                return [12 for _seq in seqs]
+
+            def free_part_slots_batch_layers(self, layer_indices, seqs, keep_indices):
+                self.layer_calls.append((list(layer_indices), list(seqs), keep_indices.clone()))
+
+        cfg = make_sparse_controller_config()
+        cfg.vllm_sparse_method = "streamingllm"
+        cfg.hf_config.num_hidden_layers = 3
+        cfg.num_sink_tokens = 2
+        cfg.num_recent_tokens = 3
+        manager = FakeStreamingManager()
+        controller = SparseController(cfg, manager)
+
+        seq_a = Sequence([1])
+        seq_b = Sequence([2])
+        seq_a.seq_id = 10
+        seq_b.seq_id = 11
+        for layer_idx in range(3):
+            state = controller.layer_batch_sparse_states[layer_idx]
+            state.context_lens = torch.tensor([12, 12], dtype=torch.int32)
+            state.max_context_len = 12
+
+        controller._streamingllm_decode_eviction([seq_a, seq_b])
+
+        self.assertEqual(len(manager.layer_calls), 1)
+        layer_indices, seqs, keep_indices = manager.layer_calls[0]
+        self.assertEqual(layer_indices, [0, 1, 2])
+        self.assertEqual([seq.seq_id for seq in seqs], [10, 11])
+        self.assertEqual(tuple(keep_indices.shape), (3, 2, 5))
+        self.assertEqual(keep_indices[0, 0].tolist(), [0, 1, 9, 10, 11])
+        self.assertTrue(torch.equal(keep_indices[0], keep_indices[1]))
+
+    def test_streamingllm_prefill_eviction_batches_layer_compaction(self):
+        class FakeStreamingManager:
+            device = torch.device("cpu")
+
+            def __init__(self):
+                self.layer_calls = []
+
+            def free_part_slots_batch_layers(self, layer_indices, seqs, keep_indices):
+                self.layer_calls.append((list(layer_indices), list(seqs), keep_indices.clone()))
+
+        cfg = make_sparse_controller_config()
+        cfg.vllm_sparse_method = "streamingllm"
+        cfg.hf_config.num_hidden_layers = 2
+        cfg.num_sink_tokens = 2
+        cfg.num_recent_tokens = 3
+        manager = FakeStreamingManager()
+        controller = SparseController(cfg, manager)
+
+        seq_a = Sequence(list(range(12)))
+        seq_b = Sequence(list(range(12)))
+        seq_a.seq_id = 20
+        seq_b.seq_id = 21
+        seq_a.num_prefilled_tokens = 8
+        seq_b.num_prefilled_tokens = 8
+        seq_a.current_chunk_size = 4
+        seq_b.current_chunk_size = 4
+        for layer_idx in range(2):
+            state = controller.layer_batch_sparse_states[layer_idx]
+            state.context_lens = torch.tensor([12, 12], dtype=torch.int32)
+            state.max_context_len = 12
+
+        controller._streamingllm_prefill_eviction([seq_a, seq_b])
+
+        self.assertEqual(len(manager.layer_calls), 1)
+        layer_indices, seqs, keep_indices = manager.layer_calls[0]
+        self.assertEqual(layer_indices, [0, 1])
+        self.assertEqual([seq.seq_id for seq in seqs], [20, 21])
+        self.assertEqual(tuple(keep_indices.shape), (2, 2, 5))
+        self.assertEqual(keep_indices[0, 0].tolist(), [0, 1, 9, 10, 11])
 
 
 class StandardCacheManagerAdmissionTest(unittest.TestCase):
@@ -442,6 +551,42 @@ class PrefillPolicyConfigTest(unittest.TestCase):
         self.assertTrue(cfg.omnikv_decode_graph)
         self.assertEqual(cfg.gpu_memory_utilization, 0.7)
         self.assertEqual(cfg.device_memory_utilization, 0.7)
+
+    def test_auto_capture_greedy_sampling_scope(self):
+        runner = object.__new__(ModelRunner)
+        seqs = [
+            SimpleNamespace(temperature=0.0),
+            SimpleNamespace(temperature=0.0),
+        ]
+
+        runner.config = SimpleNamespace(
+            decode_cuda_graph_capture_sampling=False,
+            tensor_parallel_size=1,
+            enable_prefix_caching=False,
+            vllm_sparse_method="",
+        )
+        self.assertTrue(runner._auto_capture_greedy_sampling(seqs))
+
+        runner.config.vllm_sparse_method = "omnikv"
+        self.assertTrue(runner._auto_capture_greedy_sampling(seqs))
+
+        runner.config.vllm_sparse_method = "quest"
+        self.assertFalse(runner._auto_capture_greedy_sampling(seqs))
+
+        runner.config.vllm_sparse_method = ""
+        seqs[0].temperature = 0.7
+        self.assertFalse(runner._auto_capture_greedy_sampling(seqs))
+
+        seqs[0].temperature = 0.0
+        runner.config.enable_prefix_caching = True
+        self.assertFalse(runner._auto_capture_greedy_sampling(seqs))
+
+        runner.config.enable_prefix_caching = False
+        runner.config.tensor_parallel_size = 2
+        self.assertFalse(runner._auto_capture_greedy_sampling(seqs))
+
+        runner.config.decode_cuda_graph_capture_sampling = True
+        self.assertTrue(runner._auto_capture_greedy_sampling(seqs))
 
     def test_decode_cuda_graph_explicit_capture_sizes_are_validated(self):
         cfg = self.make_config(
@@ -710,15 +855,15 @@ class DecodeCudaGraphWarmupPolicyTest(unittest.TestCase):
             decode_cuda_graph=decode_cuda_graph,
         )
 
-    def test_deltakv_graph_defaults_to_eager_sized_engine_warmup(self):
+    def test_deltakv_graph_defaults_to_graph_sized_engine_warmup(self):
         with patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(_deltakv_graph_warmup_profile(self.make_config()), "prefill_only")
-            self.assertFalse(_use_graph_scaled_warmup(self.make_config()))
-
-    def test_deltakv_graph_warmup_can_reproduce_old_policy(self):
-        with patch.dict(os.environ, {"SPARSEVLLM_DELTAKV_GRAPH_WARMUP": "graph"}, clear=True):
             self.assertEqual(_deltakv_graph_warmup_profile(self.make_config()), "graph")
             self.assertTrue(_use_graph_scaled_warmup(self.make_config()))
+
+    def test_deltakv_graph_warmup_can_reproduce_old_policy(self):
+        with patch.dict(os.environ, {"SPARSEVLLM_DELTAKV_GRAPH_WARMUP": "prefill_only"}, clear=True):
+            self.assertEqual(_deltakv_graph_warmup_profile(self.make_config()), "prefill_only")
+            self.assertFalse(_use_graph_scaled_warmup(self.make_config()))
 
     def test_deltakv_graph_warmup_supports_diagnostic_profiles(self):
         for env_value, expected in (
@@ -875,6 +1020,271 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
         seq.num_prefilled_tokens = 5
         self.assertEqual(SnapKVCacheManager.remaining_prefill_tokens(manager, seq), 15)
 
+    def test_snapkv_batch_free_part_slots_compacts_rows_and_releases_slots(self):
+        manager = object.__new__(SnapKVCacheManager)
+        manager.device = torch.device("cpu")
+        manager._uniform_decode_metadata = True
+        manager.buffer_req_to_token_slots_tensor = torch.empty((1, 2, 6), dtype=torch.int32)
+        manager.seq_id_to_row = [{10: 0, 11: 1}]
+        manager.row_seq_lens = [np.array([6, 6], dtype=np.int32)]
+        manager.buffer_req_to_token_slots = [
+            torch.tensor(
+                [
+                    [100, 101, 102, 103, 104, 105],
+                    [200, 201, 202, 203, 204, 205],
+                ],
+                dtype=torch.int32,
+            )
+        ]
+        manager.free_slots_stack = [torch.zeros((16,), dtype=torch.int32)]
+        manager._num_free_slots = [0]
+
+        seq_a = Sequence([1])
+        seq_b = Sequence([2])
+        seq_a.seq_id = 10
+        seq_b.seq_id = 11
+
+        manager.free_part_slots_batch(
+            0,
+            [seq_a, seq_b],
+            torch.tensor([[5, 0, 2], [3, 1, 5]], dtype=torch.long),
+        )
+
+        self.assertFalse(manager._uniform_decode_metadata)
+        self.assertEqual(manager.row_seq_lens[0].tolist(), [3, 3])
+        self.assertEqual(manager.buffer_req_to_token_slots[0][0].tolist(), [100, 102, 105, 0, 0, 0])
+        self.assertEqual(manager.buffer_req_to_token_slots[0][1].tolist(), [201, 203, 205, 0, 0, 0])
+        self.assertEqual(manager._num_free_slots[0], 6)
+        self.assertEqual(
+            sorted(manager.free_slots_stack[0][:6].tolist()),
+            [101, 103, 104, 200, 202, 204],
+        )
+
+    def test_snapkv_layer_batch_free_part_slots_compacts_rows_and_releases_slots(self):
+        manager = object.__new__(SnapKVCacheManager)
+        manager.device = torch.device("cpu")
+        manager._uniform_decode_metadata = True
+        manager.seq_id_to_row = [{10: 0, 11: 1}, {10: 0, 11: 1}]
+        manager.row_seq_lens = [
+            np.array([6, 6], dtype=np.int32),
+            np.array([6, 6], dtype=np.int32),
+        ]
+        manager.buffer_req_to_token_slots_tensor = torch.tensor(
+            [
+                [
+                    [100, 101, 102, 103, 104, 105],
+                    [200, 201, 202, 203, 204, 205],
+                ],
+                [
+                    [300, 301, 302, 303, 304, 305],
+                    [400, 401, 402, 403, 404, 405],
+                ],
+            ],
+            dtype=torch.int32,
+        )
+        manager.buffer_req_to_token_slots = [
+            manager.buffer_req_to_token_slots_tensor[0],
+            manager.buffer_req_to_token_slots_tensor[1],
+        ]
+        manager.free_slots_stack_tensor = torch.zeros((2, 16), dtype=torch.int32)
+        manager.free_slots_stack = [
+            manager.free_slots_stack_tensor[0],
+            manager.free_slots_stack_tensor[1],
+        ]
+        manager._num_free_slots = [0, 0]
+
+        seq_a = Sequence([1])
+        seq_b = Sequence([2])
+        seq_a.seq_id = 10
+        seq_b.seq_id = 11
+
+        manager.free_part_slots_batch_layers(
+            [0, 1],
+            [seq_a, seq_b],
+            torch.tensor(
+                [
+                    [[5, 0, 2], [3, 1, 5]],
+                    [[4, 0, 1], [2, 0, 5]],
+                ],
+                dtype=torch.long,
+            ),
+        )
+
+        self.assertFalse(manager._uniform_decode_metadata)
+        self.assertEqual(manager.row_seq_lens[0].tolist(), [3, 3])
+        self.assertEqual(manager.row_seq_lens[1].tolist(), [3, 3])
+        self.assertEqual(manager.buffer_req_to_token_slots_tensor[0, 0].tolist(), [100, 102, 105, 0, 0, 0])
+        self.assertEqual(manager.buffer_req_to_token_slots_tensor[0, 1].tolist(), [201, 203, 205, 0, 0, 0])
+        self.assertEqual(manager.buffer_req_to_token_slots_tensor[1, 0].tolist(), [300, 301, 304, 0, 0, 0])
+        self.assertEqual(manager.buffer_req_to_token_slots_tensor[1, 1].tolist(), [400, 402, 405, 0, 0, 0])
+        self.assertEqual(manager._num_free_slots, [6, 6])
+        self.assertEqual(
+            sorted(manager.free_slots_stack_tensor[0, :6].tolist()),
+            [101, 103, 104, 200, 202, 204],
+        )
+        self.assertEqual(
+            sorted(manager.free_slots_stack_tensor[1, :6].tolist()),
+            [302, 303, 305, 401, 403, 404],
+        )
+
+    def test_snapkv_prefix_recent_layer_batch_compacts_contiguous_middle(self):
+        manager = object.__new__(SnapKVCacheManager)
+        manager.device = torch.device("cpu")
+        manager._uniform_decode_metadata = True
+        manager.seq_id_to_row = [{10: 0, 11: 1}, {10: 0, 11: 1}]
+        manager.row_seq_lens = [
+            np.array([8, 8], dtype=np.int32),
+            np.array([8, 8], dtype=np.int32),
+        ]
+        manager.buffer_req_to_token_slots_tensor = torch.tensor(
+            [
+                [
+                    [100, 101, 102, 103, 104, 105, 106, 107],
+                    [200, 201, 202, 203, 204, 205, 206, 207],
+                ],
+                [
+                    [300, 301, 302, 303, 304, 305, 306, 307],
+                    [400, 401, 402, 403, 404, 405, 406, 407],
+                ],
+            ],
+            dtype=torch.int32,
+        )
+        manager.buffer_req_to_token_slots = [
+            manager.buffer_req_to_token_slots_tensor[0],
+            manager.buffer_req_to_token_slots_tensor[1],
+        ]
+        manager.free_slots_stack_tensor = torch.zeros((2, 16), dtype=torch.int32)
+        manager.free_slots_stack = [
+            manager.free_slots_stack_tensor[0],
+            manager.free_slots_stack_tensor[1],
+        ]
+        manager._num_free_slots = [0, 0]
+
+        seq_a = Sequence([1])
+        seq_b = Sequence([2])
+        seq_a.seq_id = 10
+        seq_b.seq_id = 11
+
+        manager.free_prefix_recent_slots_batch_layers(
+            [0, 1],
+            [seq_a, seq_b],
+            kv_len=8,
+            num_sink_tokens=2,
+            num_recent_tokens=3,
+        )
+
+        self.assertFalse(manager._uniform_decode_metadata)
+        self.assertEqual(manager.row_seq_lens[0].tolist(), [5, 5])
+        self.assertEqual(manager.row_seq_lens[1].tolist(), [5, 5])
+        self.assertEqual(manager.buffer_req_to_token_slots_tensor[0, 0].tolist(), [100, 101, 105, 106, 107, 0, 0, 0])
+        self.assertEqual(manager.buffer_req_to_token_slots_tensor[0, 1].tolist(), [200, 201, 205, 206, 207, 0, 0, 0])
+        self.assertEqual(manager.buffer_req_to_token_slots_tensor[1, 0].tolist(), [300, 301, 305, 306, 307, 0, 0, 0])
+        self.assertEqual(manager.buffer_req_to_token_slots_tensor[1, 1].tolist(), [400, 401, 405, 406, 407, 0, 0, 0])
+        self.assertEqual(manager._num_free_slots, [6, 6])
+        self.assertEqual(
+            sorted(manager.free_slots_stack_tensor[0, :6].tolist()),
+            [102, 103, 104, 202, 203, 204],
+        )
+        self.assertEqual(
+            sorted(manager.free_slots_stack_tensor[1, :6].tolist()),
+            [302, 303, 304, 402, 403, 404],
+        )
+
+    def test_snapkv_prefill_batch_all_layers_preserves_stack_order(self):
+        manager = object.__new__(SnapKVCacheManager)
+        manager.device = torch.device("cpu")
+        manager.num_layers = 2
+        manager.max_model_len = 8
+        manager.seq_id_to_row = [{}, {}]
+        manager.free_rows = [deque([0, 1]), deque([0, 1])]
+        manager.row_seq_lens = [
+            np.zeros((2,), dtype=np.int32),
+            np.zeros((2,), dtype=np.int32),
+        ]
+        manager.free_slots_stack_tensor = torch.stack(
+            [
+                torch.arange(20, dtype=torch.int32),
+                torch.arange(100, 120, dtype=torch.int32),
+            ],
+            dim=0,
+        )
+        manager.free_slots_stack = [
+            manager.free_slots_stack_tensor[0],
+            manager.free_slots_stack_tensor[1],
+        ]
+        manager._num_free_slots = [20, 20]
+        manager.buffer_req_to_token_slots_tensor = torch.zeros((2, 2, 8), dtype=torch.int32)
+        manager.buffer_req_to_token_slots = [
+            manager.buffer_req_to_token_slots_tensor[0],
+            manager.buffer_req_to_token_slots_tensor[1],
+        ]
+
+        seq_a = Sequence([1, 2])
+        seq_b = Sequence([3, 4])
+        seq_a.seq_id = 10
+        seq_b.seq_id = 11
+        seq_a.current_chunk_size = 2
+        seq_b.current_chunk_size = 2
+        layers_slot_mapping = torch.empty((2, 4), dtype=torch.int32)
+
+        used_fast_path = manager._allocate_prefill_batch_same_size_all_layers(
+            [seq_a, seq_b],
+            layers_slot_mapping,
+        )
+
+        self.assertTrue(used_fast_path)
+        self.assertEqual(manager._num_free_slots, [16, 16])
+        self.assertEqual(manager.row_seq_lens[0].tolist(), [2, 2])
+        self.assertEqual(manager.row_seq_lens[1].tolist(), [2, 2])
+        self.assertEqual(layers_slot_mapping[0].tolist(), [18, 19, 16, 17])
+        self.assertEqual(layers_slot_mapping[1].tolist(), [118, 119, 116, 117])
+        self.assertEqual(manager.buffer_req_to_token_slots_tensor[0, 0, :2].tolist(), [18, 19])
+        self.assertEqual(manager.buffer_req_to_token_slots_tensor[0, 1, :2].tolist(), [16, 17])
+        self.assertEqual(manager.buffer_req_to_token_slots_tensor[1, 0, :2].tolist(), [118, 119])
+        self.assertEqual(manager.buffer_req_to_token_slots_tensor[1, 1, :2].tolist(), [116, 117])
+
+    def test_pyramidkv_batch_materialize_updates_rows_and_kv(self):
+        manager = object.__new__(SnapKVCacheManager)
+        manager.config = SimpleNamespace(vllm_sparse_method="pyramidkv")
+        manager.device = torch.device("cpu")
+        manager.num_layers = 1
+        manager.max_model_len = 8
+        manager._pyramidkv_prefill_staging_active = True
+        manager._pyramidkv_prefill_staging_materialized_layers = set()
+        manager.seq_id_to_row = [{10: 0, 11: 1}]
+        manager.row_seq_lens = [np.zeros((2,), dtype=np.int32)]
+        manager.free_slots_stack = [torch.arange(8, dtype=torch.int32)]
+        manager._num_free_slots = [8]
+        manager.buffer_req_to_token_slots = [torch.zeros((2, 8), dtype=torch.int32)]
+
+        k_cache = torch.zeros((8, 1, 1), dtype=torch.float32)
+        v_cache = torch.zeros((8, 1, 1), dtype=torch.float32)
+        manager.kv_cache = [(k_cache, v_cache)]
+        k_stage = torch.arange(8, dtype=torch.float32).view(8, 1, 1) + 10
+        v_stage = torch.arange(8, dtype=torch.float32).view(8, 1, 1) + 20
+        manager.pyramidkv_prefill_staging_kv_cache = (k_stage, v_stage)
+
+        seq_a = Sequence([1])
+        seq_b = Sequence([2])
+        seq_a.seq_id = 10
+        seq_b.seq_id = 11
+        manager._pyramidkv_prefill_staging_seq_offsets = {10: 0, 11: 4}
+
+        manager.materialize_prefill_staging_layer_batch(
+            0,
+            [
+                (seq_a, torch.tensor([0, 2], dtype=torch.long)),
+                (seq_b, torch.tensor([1, 3], dtype=torch.long)),
+            ],
+        )
+
+        self.assertFalse(manager._pyramidkv_prefill_staging_active)
+        self.assertEqual(manager.row_seq_lens[0].tolist(), [2, 2])
+        self.assertEqual(manager.buffer_req_to_token_slots[0][0, :2].tolist(), [6, 7])
+        self.assertEqual(manager.buffer_req_to_token_slots[0][1, :2].tolist(), [4, 5])
+        self.assertEqual(k_cache[[6, 7, 4, 5], 0, 0].tolist(), [10.0, 12.0, 15.0, 17.0])
+        self.assertEqual(v_cache[[6, 7, 4, 5], 0, 0].tolist(), [20.0, 22.0, 25.0, 27.0])
+
     def test_deltakv_short_prefill_fails_fast_when_no_work_can_free_slots(self):
         scheduler = make_scheduler(
             PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
@@ -905,6 +1315,27 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
         self.assertTrue(is_prefill)
         self.assertEqual(scheduled, [short_seq])
         self.assertEqual(short_seq.current_chunk_size, 8192)
+
+    def test_whole_prefill_hook_keeps_batched_short_prefills(self):
+        scheduler = make_scheduler(
+            PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
+            method="pyramidkv",
+            chunk=4096,
+            max_tokens=10_000,
+            oracle=FakeMemoryOracle(step_free_slots=10_000, force_whole_prefill=True),
+        )
+        scheduler.decode_keep_tokens = 4096
+        seq_a = seq_with_len(4258)
+        seq_b = seq_with_len(4258)
+        scheduler.add(seq_a)
+        scheduler.add(seq_b)
+
+        scheduled, is_prefill, _ = scheduler.schedule()
+
+        self.assertTrue(is_prefill)
+        self.assertEqual(scheduled, [seq_a, seq_b])
+        self.assertEqual(seq_a.current_chunk_size, 4258)
+        self.assertEqual(seq_b.current_chunk_size, 4258)
 
     def test_prefix_cache_hit_reduces_prefill_work_for_fresh_prompt(self):
         oracle = FakeMemoryOracle(prefix_hit_len=8, prefix_hit_blocks=2)

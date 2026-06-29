@@ -421,19 +421,49 @@ def _sample_tokens(vocab_ids: list[int], rng: random.Random, length: int) -> lis
     return [int(token_id) for token_id in rng.choices(vocab_ids, k=length)]
 
 
+def _sample_length(rng: random.Random, max_len: int, min_len: int | None = None) -> int:
+    max_value = int(max_len)
+    min_value = max_value if min_len is None else int(min_len)
+    if min_value < 0 or max_value < 0:
+        raise ValueError(f"Length bounds must be non-negative, got min={min_value}, max={max_value}.")
+    if min_value > max_value:
+        raise ValueError(f"Length min must be <= max, got min={min_value}, max={max_value}.")
+    return int(rng.randint(min_value, max_value))
+
+
+def _length_bounds(args: argparse.Namespace, max_name: str, min_name: str) -> tuple[int, int]:
+    max_value = int(getattr(args, max_name))
+    min_raw = getattr(args, min_name, None)
+    min_value = max_value if min_raw is None else int(min_raw)
+    if min_value < 0 or max_value < 0:
+        raise ValueError(f"{min_name}/{max_name} must be non-negative, got {min_value}/{max_value}.")
+    if min_value > max_value:
+        raise ValueError(f"{min_name} must be <= {max_name}, got {min_value} > {max_value}.")
+    return min_value, max_value
+
+
 def _token_count_plan(args: argparse.Namespace) -> dict[str, int]:
+    session_prefix_min, session_prefix_max = _length_bounds(args, "session_prefix_len", "session_prefix_min_len")
+    user_min, user_max = _length_bounds(args, "user_len", "user_min_len")
+    shared_suffix_min, shared_suffix_max = _length_bounds(args, "shared_suffix_len", "shared_suffix_min_len")
     multiturn_first_prompt = (
         int(args.system_prompt_len)
-        + int(args.session_prefix_len)
-        + int(args.user_len)
+        + session_prefix_max
+        + user_max
     )
     multiturn_max_prompt = (
         int(args.system_prompt_len)
-        + int(args.session_prefix_len)
-        + int(args.turns) * (int(args.user_len) + int(args.output_len))
+        + session_prefix_max
+        + int(args.turns) * (user_max + int(args.output_len))
     )
-    shared_prefix_max_prompt = int(args.shared_prefix_len) + int(args.shared_suffix_len)
+    shared_prefix_max_prompt = int(args.shared_prefix_len) + shared_suffix_max
     return {
+        "session_prefix_min": session_prefix_min,
+        "session_prefix_max": session_prefix_max,
+        "user_min": user_min,
+        "user_max": user_max,
+        "shared_suffix_min": shared_suffix_min,
+        "shared_suffix_max": shared_suffix_max,
         "multiturn_first_prompt": multiturn_first_prompt,
         "multiturn_max_prompt": multiturn_max_prompt,
         "shared_prefix_max_prompt": shared_prefix_max_prompt,
@@ -678,7 +708,8 @@ def _run_multiturn_workload(
     shared_system = _sample_tokens(vocab_ids, rng, args.system_prompt_len)
     histories: dict[int, list[int]] = {}
     for session_id in range(int(args.sessions)):
-        histories[session_id] = shared_system + _sample_tokens(vocab_ids, rng, args.session_prefix_len)
+        session_prefix_len = _sample_length(rng, args.session_prefix_len, args.session_prefix_min_len)
+        histories[session_id] = shared_system + _sample_tokens(vocab_ids, rng, session_prefix_len)
 
     records: list[dict[str, Any]] = []
     for turn in range(int(args.turns)):
@@ -686,7 +717,8 @@ def _run_multiturn_workload(
         prompt_by_session: dict[int, list[int]] = {}
         for session_id in range(int(args.sessions)):
             reusable_prefix_len = len(histories[session_id]) if turn > 0 else 0
-            user_tokens = _sample_tokens(vocab_ids, rng, args.user_len)
+            user_len = _sample_length(rng, args.user_len, args.user_min_len)
+            user_tokens = _sample_tokens(vocab_ids, rng, user_len)
             prompt = histories[session_id] + user_tokens
             prompt_by_session[session_id] = prompt
             specs.append(
@@ -776,7 +808,8 @@ def _run_shared_prefix_workload(
 
     specs: list[RequestSpec] = []
     for req_idx in range(int(args.shared_prompts)):
-        suffix = _sample_tokens(vocab_ids, rng, args.shared_suffix_len)
+        suffix_len = _sample_length(rng, args.shared_suffix_len, args.shared_suffix_min_len)
+        suffix = _sample_tokens(vocab_ids, rng, suffix_len)
         prompt = shared_prefix + suffix
         specs.append(
             RequestSpec(
@@ -882,6 +915,9 @@ def _summarize_records(
         "total_generated_tokens": total_generated_tokens,
         "total_cached_tokens": total_cached_tokens,
         "total_eligible_cache_tokens": total_eligible_tokens,
+        "min_prompt_tokens": min(prompt_tokens) if prompt_tokens else 0,
+        "max_prompt_tokens": max(prompt_tokens) if prompt_tokens else 0,
+        "unique_prompt_lengths": len(set(prompt_tokens)),
         "cache_hit_rate": total_cached_tokens / total_prompt_tokens if total_prompt_tokens else 0.0,
         "eligible_cache_hit_rate": total_cached_tokens / total_eligible_tokens if total_eligible_tokens else 0.0,
         "physical_kv_reuse_rate": total_cached_tokens / total_prompt_tokens if total_prompt_tokens else 0.0,
@@ -1086,9 +1122,12 @@ def _append_ledger(output_dir: Path, summaries: list[dict[str, Any]], args: argp
                 "sessions": args.sessions,
                 "turns": args.turns,
                 "system_prompt_len": args.system_prompt_len,
+                "session_prefix_min_len": args.session_prefix_min_len,
                 "session_prefix_len": args.session_prefix_len,
+                "user_min_len": args.user_min_len,
                 "user_len": args.user_len,
                 "shared_prefix_len": args.shared_prefix_len,
+                "shared_suffix_min_len": args.shared_suffix_min_len,
                 "shared_suffix_len": args.shared_suffix_len,
                 "output_len": args.output_len,
                 "history_update": args.history_update,
@@ -1136,11 +1175,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--turns", type=int, default=4)
     parser.add_argument("--system_prompt_len", type=int, default=16384)
     parser.add_argument("--session_prefix_len", type=int, default=2048)
+    parser.add_argument("--session_prefix_min_len", type=int, default=None)
     parser.add_argument("--user_len", type=int, default=256)
+    parser.add_argument("--user_min_len", type=int, default=None)
     parser.add_argument("--output_len", type=int, default=128)
     parser.add_argument("--shared_prompts", type=int, default=4)
     parser.add_argument("--shared_prefix_len", type=int, default=16384)
     parser.add_argument("--shared_suffix_len", type=int, default=2048)
+    parser.add_argument("--shared_suffix_min_len", type=int, default=None)
 
     parser.add_argument("--gpu_memory_utilization", type=float, default=0.65)
     parser.add_argument("--tensor_parallel_size", type=int, default=1)

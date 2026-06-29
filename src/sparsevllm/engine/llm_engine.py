@@ -25,7 +25,7 @@ def _deltakv_graph_warmup_profile(config: Config) -> str:
     if not graph_warmup:
         return "prefill_only"
     if method == "deltakv":
-        warmup_policy = os.getenv("SPARSEVLLM_DELTAKV_GRAPH_WARMUP", "prefill_only").strip().lower()
+        warmup_policy = os.getenv("SPARSEVLLM_DELTAKV_GRAPH_WARMUP", "graph").strip().lower()
         if warmup_policy in ("eager", "minimal", "current", "prefill", "prefill_only"):
             return "prefill_only"
         if warmup_policy in ("decode_1seq", "decode-1seq", "decode"):

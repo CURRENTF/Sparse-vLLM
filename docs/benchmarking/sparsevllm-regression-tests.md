@@ -10,7 +10,10 @@ The harness is intended for reproducible method/model checks across:
 - `quality`: LongBench-mini generation quality.
 - `logits`: HF-reference vs SparseVLLM logits alignment.
 - `perf`: prefill/decode throughput and memory accounting.
-- `stress`: high-concurrency SparseVLLM admission/decode stress.
+- `stress`: fixed-length high-concurrency SparseVLLM admission/decode stress.
+- `stress_v2`: synthetic serving-trace stress with shared-prefix and multi-turn
+  workloads, variable prompt lengths, and prefix-cache hit validation for
+  supported methods.
 - `validate`: manifest and output-artifact validation.
 
 The test plan is controlled by
@@ -293,6 +296,43 @@ Stress currently uses:
   --output_root /root/autodl-tmp/outputs/deltakv
 ```
 
+### Stress V2
+
+`stress_v2` uses `scripts/benchmarks/bench_prefix_cache.py` as a regression
+layer for serving-like traces. Unlike fixed `stress`, it runs seeded synthetic
+requests with:
+
+- workloads: `shared_prefix,multiturn`
+- supported methods: `vanilla`, `omnikv`, `quest`
+- `vanilla` cases: `baseline_full,prefix_full`
+- `omnikv` case: `prefix_omnikv`
+- `quest` case: `prefix_quest`
+- sessions / turns: `8 / 4`
+- shared-prefix requests: `8`
+- output tokens: `64`
+- max active requests: `8`
+- variable multi-turn user lengths: `128..1024`
+- variable session-prefix lengths: `1024..4096`
+- variable shared suffix lengths: `512..4096`
+- max prompt length: about `16.5k` tokens for multi-turn and `12.3k` for
+  shared-prefix
+- prefix-cache block size: `16`
+
+The gate fails if a prefix-cache-enabled case does not observe cache hits or if
+the realized prompt lengths do not vary. Unsupported methods are recorded as
+`skipped_by_policy` because this layer specifically validates prefix-cache
+serving behavior.
+
+```bash
+/root/miniconda3/bin/conda run -n kv --no-capture-output \
+  python benchmark/sparsevllm_regression/run_suite.py \
+  --layer stress_v2 \
+  --models qwen3_4b \
+  --methods vanilla,omnikv,quest \
+  --run_id stress_v2_qwen3_serving_$(date -u +%Y%m%d_%H%M%S) \
+  --output_root /root/autodl-tmp/outputs/deltakv
+```
+
 ### Combined Layers
 
 `nightly` runs quality, logits, and performance. It does not run stress.
@@ -397,6 +437,7 @@ Each run writes:
 - `perf.jsonl`: flattened performance rows.
 - `memory.json`: memory grades derived from performance rows.
 - `stress.json`: stress rows and stress grades.
+- `stress_v2.json`: serving-trace stress rows and stress_v2 grades.
 - `raw_outputs.jsonl`, `parsed_outputs.jsonl`, `sample_results.jsonl`: quality
   generation artifacts, when quality is run.
 - Layer-specific logs:

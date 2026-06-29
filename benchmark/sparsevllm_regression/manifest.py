@@ -37,6 +37,7 @@ REQUIRED_ARTIFACTS = [
     "perf.jsonl",
     "memory.json",
     "stress.json",
+    "stress_v2.json",
     "scbench.json",
     "grade_summary.json",
 ]
@@ -57,7 +58,7 @@ def load_manifest(path: str | Path | None = None) -> dict[str, Any]:
 def validate_manifest(manifest: dict[str, Any]) -> None:
     if not isinstance(manifest, dict):
         raise ManifestError("manifest must be a JSON object.")
-    for key in ("models", "methods", "quality", "logits", "performance", "stress", "scbench", "outputs"):
+    for key in ("models", "methods", "quality", "logits", "performance", "stress", "stress_v2", "scbench", "outputs"):
         if key not in manifest:
             raise ManifestError(f"manifest is missing required key: {key}")
 

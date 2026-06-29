@@ -159,11 +159,20 @@ class Scheduler:
     def _prefill_step_tokens(
         self,
         *,
+        seq: Sequence,
         target_is_long: bool,
         remaining_prefill_tokens: int,
         num_batched_tokens: int,
         step_free_count: int,
     ) -> int:
+        if self.memory_oracle.requires_full_prefill_step(seq):
+            available = min(
+                self.max_num_batched_tokens - num_batched_tokens,
+                step_free_count,
+            )
+            if remaining_prefill_tokens <= available:
+                return int(remaining_prefill_tokens)
+            return 0
         if self.prefill_schedule_policy == PREFILL_POLICY_ALL_CHUNKED:
             return min(
                 remaining_prefill_tokens,
@@ -327,6 +336,7 @@ class Scheduler:
 
                 # 确定本次 Chunk 的大小
                 can_prefill_tokens = self._prefill_step_tokens(
+                    seq=seq,
                     target_is_long=target_is_long,
                     remaining_prefill_tokens=remaining_prefill_tokens,
                     num_batched_tokens=num_batched_tokens,
@@ -348,6 +358,17 @@ class Scheduler:
                             step_free_count,
                         )
                         deferred_prefill_step_failure = (seq, int(remaining_prefill_tokens), int(available))
+                    elif self.memory_oracle.requires_full_prefill_step(seq):
+                        available = min(
+                            self.max_num_batched_tokens - num_batched_tokens,
+                            candidate_step_free_count,
+                        )
+                        deferred_prefill_capacity_failure = (
+                            seq,
+                            int(remaining_prefill_tokens),
+                            int(available),
+                            int(step_free_count),
+                        )
                     logger.debug(f'{can_prefill_tokens=} 结束 schedule prefill 请求')
                     self.waiting.append(seq)
                     continue

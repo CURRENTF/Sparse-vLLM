@@ -19,6 +19,7 @@ from benchmark.sparsevllm_regression.grading import (
     grade_perf,
     grade_quality,
     grade_stress,
+    grade_stress_v2,
     worst_required_grade,
 )
 from benchmark.sparsevllm_regression.manifest import (
@@ -90,6 +91,15 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
         if line.strip():
             rows.append(json.loads(line))
     return rows
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"Expected JSON object in {path}, got {type(payload).__name__}.")
+    return payload
 
 
 def _ensure_artifacts(output_root: Path, outputs: list[str]) -> None:
@@ -574,6 +584,152 @@ def _stress_command(
     return cmd
 
 
+def _stress_v2_cases(method_id: str, method: dict[str, Any]) -> list[str]:
+    sparse_method = normalize_sparse_method(method.get("sparse_method", method_id))
+    if sparse_method == "":
+        sparse_method = "vanilla"
+    if sparse_method == "vanilla":
+        return ["baseline_full", "prefix_full"]
+    if sparse_method == "omnikv":
+        return ["prefix_omnikv"]
+    if sparse_method == "quest":
+        return ["prefix_quest"]
+    return []
+
+
+def _stress_v2_command(
+    *,
+    model_id: str,
+    model: dict[str, Any],
+    method_id: str,
+    method: dict[str, Any],
+    stress_v2: dict[str, Any],
+    output_dir: Path,
+) -> list[str]:
+    cases = _stress_v2_cases(method_id, method)
+    if not cases:
+        raise ValueError(f"stress_v2 does not support method {method_id!r}.")
+
+    method_cfg = _method_config(method, model=model, model_id=model_id, include_method=False)
+    method_cfg.pop("hf_sparse_method", None)
+    full_attention_layers = method_cfg.get("full_attention_layers", stress_v2.get("full_attention_layers", "0,1,2,4,7,14"))
+    bench_hyper_params = dict(method_cfg)
+    for managed_key in (
+        "gpu_memory_utilization",
+        "engine_prefill_chunk_size",
+        "sink_keep_tokens",
+        "recent_keep_tokens",
+        "decode_keep_tokens",
+        "prefill_keep_tokens",
+        "chunk_prefill_accel_omnikv",
+        "full_attention_layers",
+        "quest_chunk_size",
+        "quest_token_budget",
+        "prefix_cache_block_size",
+        "prefix_cache_max_blocks",
+        "prefix_cache_salt",
+        "enable_prefix_caching",
+        "sparse_method",
+        "max_num_seqs_in_batch",
+        "max_decoding_seqs",
+        "max_num_batched_tokens",
+        "max_model_len",
+        "tensor_parallel_size",
+    ):
+        bench_hyper_params.pop(managed_key, None)
+    cmd = [
+        sys.executable,
+        "scripts/benchmarks/bench_prefix_cache.py",
+        "--model_path",
+        model["model_path"],
+        "--cases",
+        ",".join(cases),
+        "--workloads",
+        str(stress_v2["workloads"]),
+        "--output_dir",
+        str(output_dir),
+        "--feature",
+        "sparsevllm_regression_stress_v2",
+        "--objective",
+        f"run SparseVLLM stress_v2 serving trace for {model_id}/{method_id}",
+        "--seed",
+        str(int(stress_v2["seed"])),
+        "--history_update",
+        str(stress_v2["history_update"]),
+        "--sessions",
+        str(int(stress_v2["sessions"])),
+        "--turns",
+        str(int(stress_v2["turns"])),
+        "--system_prompt_len",
+        str(int(stress_v2["system_prompt_len"])),
+        "--session_prefix_len",
+        str(int(stress_v2["session_prefix_len"])),
+        "--user_len",
+        str(int(stress_v2["user_len"])),
+        "--output_len",
+        str(int(stress_v2["output_len"])),
+        "--shared_prompts",
+        str(int(stress_v2["shared_prompts"])),
+        "--shared_prefix_len",
+        str(int(stress_v2["shared_prefix_len"])),
+        "--shared_suffix_len",
+        str(int(stress_v2["shared_suffix_len"])),
+        "--gpu_memory_utilization",
+        str(float(stress_v2["gpu_memory_utilization"])),
+        "--tensor_parallel_size",
+        str(_tensor_parallel_size_from_config(stress_v2)),
+        "--max_active_requests",
+        str(int(stress_v2["max_active_requests"])),
+        "--max_num_batched_tokens",
+        str(int(stress_v2["max_num_batched_tokens"])),
+        "--chunk_prefill_size",
+        str(int(method_cfg.get("engine_prefill_chunk_size", stress_v2["chunk_prefill_size"]))),
+        "--max_model_len_margin",
+        str(int(stress_v2["max_model_len_margin"])),
+        "--prefix_cache_block_size",
+        str(int(stress_v2["prefix_cache_block_size"])),
+        "--prefix_cache_salt",
+        str(stress_v2.get("prefix_cache_salt") or f"regression-stress-v2:{model_id}:{method_id}"),
+        "--quest_chunk_size",
+        str(int(method_cfg.get("quest_chunk_size", stress_v2["quest_chunk_size"]))),
+        "--quest_token_budget",
+        str(int(method_cfg.get("quest_token_budget", stress_v2["quest_token_budget"]))),
+        "--num_sink_tokens",
+        str(int(method_cfg.get("sink_keep_tokens", stress_v2["num_sink_tokens"]))),
+        "--num_recent_tokens",
+        str(int(method_cfg.get("recent_keep_tokens", stress_v2["num_recent_tokens"]))),
+        "--num_top_tokens",
+        str(int(method_cfg.get("decode_keep_tokens", stress_v2["num_top_tokens"]))),
+        "--num_top_tokens_in_prefill",
+        str(int(method_cfg.get("prefill_keep_tokens", stress_v2["num_top_tokens_in_prefill"]))),
+        "--full_attention_layers",
+        str(full_attention_layers),
+        "--min_performance_prompt_len",
+        str(int(stress_v2["min_performance_prompt_len"])),
+        "--min_cacheable_prefix_len",
+        str(int(stress_v2["min_cacheable_prefix_len"])),
+        "--case_timeout_s",
+        str(float(stress_v2["case_timeout_s"])),
+        "--hyper_params",
+        json.dumps(bench_hyper_params, sort_keys=True),
+    ]
+    for cfg_key, flag in (
+        ("session_prefix_min_len", "--session_prefix_min_len"),
+        ("user_min_len", "--user_min_len"),
+        ("shared_suffix_min_len", "--shared_suffix_min_len"),
+        ("prefix_cache_max_blocks", "--prefix_cache_max_blocks"),
+    ):
+        if cfg_key in stress_v2 and stress_v2[cfg_key] is not None:
+            cmd.extend([flag, str(stress_v2[cfg_key])])
+    if bool(stress_v2.get("allow_short_trace", False)):
+        cmd.append("--allow_short_trace")
+    if bool(stress_v2.get("continue_on_failure", False)):
+        cmd.append("--continue_on_failure")
+    if not bool(stress_v2.get("chunk_prefill_accel_omnikv", True)):
+        cmd.append("--no-chunk_prefill_accel_omnikv")
+    return cmd
+
+
 def _scbench_command(
     *,
     manifest_path: Path,
@@ -661,7 +817,7 @@ def _grade_quality_pair(vanilla_root: Path, sparse_root: Path) -> GateGrade:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run fixed Sparse-VLLM regression gates.")
     parser.add_argument("--manifest", default=None)
-    parser.add_argument("--layer", default="validate", choices=["validate", "quality", "logits", "perf", "stress", "scbench", "nightly", "pre-refactor"])
+    parser.add_argument("--layer", default="validate", choices=["validate", "quality", "logits", "perf", "stress", "stress_v2", "scbench", "nightly", "pre-refactor"])
     parser.add_argument("--models", default=None, help="Comma-separated model ids from the manifest.")
     parser.add_argument("--methods", default=None, help="Comma-separated method ids from the manifest.")
     parser.add_argument("--run_id", default=None)
@@ -734,6 +890,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stress_max_decode_steps_after_full", type=int, default=None)
     parser.add_argument("--stress_admission_wave_size", type=int, default=None)
     parser.add_argument("--stress_wave_decode_gap_steps", type=int, default=None)
+    parser.add_argument("--stress_v2_workloads", default=None)
+    parser.add_argument("--stress_v2_seed", type=int, default=None)
+    parser.add_argument("--stress_v2_sessions", type=int, default=None)
+    parser.add_argument("--stress_v2_turns", type=int, default=None)
+    parser.add_argument("--stress_v2_system_prompt_len", type=int, default=None)
+    parser.add_argument("--stress_v2_session_prefix_len", type=int, default=None)
+    parser.add_argument("--stress_v2_session_prefix_min_len", type=int, default=None)
+    parser.add_argument("--stress_v2_user_len", type=int, default=None)
+    parser.add_argument("--stress_v2_user_min_len", type=int, default=None)
+    parser.add_argument("--stress_v2_output_len", type=int, default=None)
+    parser.add_argument("--stress_v2_shared_prompts", type=int, default=None)
+    parser.add_argument("--stress_v2_shared_prefix_len", type=int, default=None)
+    parser.add_argument("--stress_v2_shared_suffix_len", type=int, default=None)
+    parser.add_argument("--stress_v2_shared_suffix_min_len", type=int, default=None)
+    parser.add_argument("--stress_v2_max_active_requests", type=int, default=None)
+    parser.add_argument("--stress_v2_case_timeout_s", type=float, default=None)
     return parser.parse_args()
 
 
@@ -826,6 +998,52 @@ def main() -> int:
             raise ValueError(f"stress request_counts must be > 0, got {stress_cfg['request_counts']}.")
         resolved["stress"] = stress_cfg
 
+    stress_v2_overrides: dict[str, Any] = {}
+    if args.stress_v2_workloads is not None:
+        stress_v2_overrides["workloads"] = str(args.stress_v2_workloads)
+    for arg_name, cfg_key in (
+        ("stress_v2_seed", "seed"),
+        ("stress_v2_sessions", "sessions"),
+        ("stress_v2_turns", "turns"),
+        ("stress_v2_system_prompt_len", "system_prompt_len"),
+        ("stress_v2_session_prefix_len", "session_prefix_len"),
+        ("stress_v2_session_prefix_min_len", "session_prefix_min_len"),
+        ("stress_v2_user_len", "user_len"),
+        ("stress_v2_user_min_len", "user_min_len"),
+        ("stress_v2_output_len", "output_len"),
+        ("stress_v2_shared_prompts", "shared_prompts"),
+        ("stress_v2_shared_prefix_len", "shared_prefix_len"),
+        ("stress_v2_shared_suffix_len", "shared_suffix_len"),
+        ("stress_v2_shared_suffix_min_len", "shared_suffix_min_len"),
+        ("stress_v2_max_active_requests", "max_active_requests"),
+        ("stress_v2_case_timeout_s", "case_timeout_s"),
+    ):
+        value = getattr(args, arg_name)
+        if value is not None:
+            stress_v2_overrides[cfg_key] = value
+    if stress_v2_overrides:
+        stress_v2_cfg = dict(resolved.get("stress_v2") or {})
+        stress_v2_cfg.update(stress_v2_overrides)
+        for key in (
+            "seed",
+            "sessions",
+            "turns",
+            "system_prompt_len",
+            "session_prefix_len",
+            "user_len",
+            "output_len",
+            "shared_prompts",
+            "shared_prefix_len",
+            "shared_suffix_len",
+            "max_active_requests",
+        ):
+            if key in stress_v2_cfg and int(stress_v2_cfg[key]) <= 0:
+                raise ValueError(f"stress_v2 {key} must be > 0, got {stress_v2_cfg[key]}.")
+        for key in ("session_prefix_min_len", "user_min_len", "shared_suffix_min_len"):
+            if key in stress_v2_cfg and stress_v2_cfg[key] is not None and int(stress_v2_cfg[key]) < 0:
+                raise ValueError(f"stress_v2 {key} must be >= 0, got {stress_v2_cfg[key]}.")
+        resolved["stress_v2"] = stress_v2_cfg
+
     if args.scbench_decode_cuda_graph or args.scbench_enforce_eager is not None:
         scbench_cfg = dict(resolved.get("scbench") or {})
         if args.scbench_decode_cuda_graph:
@@ -899,6 +1117,7 @@ def main() -> int:
     logits_records: list[dict[str, Any]] = []
     memory_records: list[dict[str, Any]] = []
     stress_records: list[dict[str, Any]] = []
+    stress_v2_records: list[dict[str, Any]] = []
     scbench_records: list[dict[str, Any]] = []
 
     cwd = Path.cwd()
@@ -909,6 +1128,7 @@ def main() -> int:
             _write_json(output_root / "logits_alignment.json", {"records": logits_records})
             _write_json(output_root / "memory.json", {"records": memory_records})
             _write_json(output_root / "stress.json", {"records": stress_records})
+            _write_json(output_root / "stress_v2.json", {"records": stress_v2_records})
             _write_json(output_root / "scbench.json", {"records": scbench_records})
             _write_json(output_root / "grade_summary.json", summary)
             _ensure_artifacts(output_root, list(resolved["outputs"]))
@@ -936,6 +1156,7 @@ def main() -> int:
         run_logits = args.layer in {"logits", "nightly", "pre-refactor"}
         run_perf = args.layer in {"perf", "nightly", "pre-refactor"}
         run_stress = args.layer in {"stress", "pre-refactor"}
+        run_stress_v2 = args.layer == "stress_v2"
         run_scbench = args.layer == "scbench"
 
         quality_roots: dict[tuple[str, str], Path] = {}
@@ -1173,11 +1394,69 @@ def main() -> int:
                         {
                             **grade.to_dict(),
                             "model": model_id,
-                            "method": method_id,
-                            "length": row.get("length"),
-                            "batch_size": row.get("batch_size"),
-                        }
+	                            "method": method_id,
+	                            "length": row.get("length"),
+	                            "batch_size": row.get("batch_size"),
+	                        }
+	                    )
+
+        if run_stress_v2:
+            for model_id, method_id in selected_pairs:
+                method = resolved["methods"][method_id]
+                cases = _stress_v2_cases(method_id, method)
+                if not cases:
+                    grade = GateGrade(
+                        "stress_v2",
+                        "N/A",
+                        "skipped_by_policy",
+                        {"method": method_id},
+                        "stress_v2 only supports prefix-cache serving traces for vanilla, omnikv, and quest.",
                     )
+                    stress_v2_records.append(
+                        {"model": model_id, "method": method_id, "status": "skipped_by_policy", "grade": grade.to_dict()}
+                    )
+                    summary["grades"].append({**grade.to_dict(), "model": model_id, "method": method_id})
+                    continue
+                out_dir = output_root / "stress_v2" / model_id / method_id
+                cmd = _stress_v2_command(
+                    model_id=model_id,
+                    model=resolved["models"][model_id],
+                    method_id=method_id,
+                    method=method,
+                    stress_v2=resolved["stress_v2"],
+                    output_dir=out_dir,
+                )
+                _run_and_record(
+                    summary,
+                    cmd,
+                    cwd=cwd,
+                    dry_run=args.dry_run,
+                    log_path=out_dir / "run.log",
+                    timeout_s=args.command_timeout_s,
+                )
+                if args.dry_run:
+                    grade = GateGrade("stress_v2", "N/A", "skipped_by_policy", {}, "dry run")
+                    summary["grades"].append({**grade.to_dict(), "model": model_id, "method": method_id})
+                    continue
+                aggregate = _read_json(out_dir / "aggregate_metrics.json")
+                grade = grade_stress_v2(aggregate)
+                for row in _read_jsonl(out_dir / "performance.jsonl"):
+                    _append_jsonl(output_root / "perf.jsonl", {"model": model_id, "method": method_id, "stress_v2": True, **row})
+                for case_dir in sorted(path for path in out_dir.iterdir() if path.is_dir()):
+                    _append_jsonl_file(
+                        output_root / "raw_outputs.jsonl",
+                        case_dir / "raw_outputs.jsonl",
+                        {"model": model_id, "method": method_id, "stress_v2_case": case_dir.name},
+                    )
+                    _append_jsonl_file(
+                        output_root / "sample_results.jsonl",
+                        case_dir / "per_turn_results.jsonl",
+                        {"model": model_id, "method": method_id, "stress_v2_case": case_dir.name},
+                    )
+                stress_v2_records.append(
+                    {"model": model_id, "method": method_id, "cases": cases, "summary": aggregate, "grade": grade.to_dict()}
+                )
+                summary["grades"].append({**grade.to_dict(), "model": model_id, "method": method_id})
 
         if run_scbench:
             scbench = resolved["scbench"]
@@ -1237,6 +1516,7 @@ def main() -> int:
         _write_json(output_root / "logits_alignment.json", {"records": logits_records})
         _write_json(output_root / "memory.json", {"records": memory_records})
         _write_json(output_root / "stress.json", {"records": stress_records})
+        _write_json(output_root / "stress_v2.json", {"records": stress_v2_records})
         _write_json(output_root / "scbench.json", {"records": scbench_records})
         _write_json(output_root / "grade_summary.json", summary)
         _ensure_artifacts(output_root, list(resolved["outputs"]))
@@ -1249,6 +1529,7 @@ def main() -> int:
         _write_json(output_root / "logits_alignment.json", {"records": logits_records})
         _write_json(output_root / "memory.json", {"records": memory_records})
         _write_json(output_root / "stress.json", {"records": stress_records})
+        _write_json(output_root / "stress_v2.json", {"records": stress_v2_records})
         _write_json(output_root / "scbench.json", {"records": scbench_records})
         _write_json(output_root / "grade_summary.json", summary)
         _ensure_artifacts(output_root, list(resolved["outputs"]))

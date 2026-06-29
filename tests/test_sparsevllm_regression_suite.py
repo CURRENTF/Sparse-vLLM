@@ -202,6 +202,56 @@ class SparseVLLMRegressionSuiteTest(unittest.TestCase):
         self.assertIn("--require_prefix_cache_hit", cmd)
         self.assertEqual(cmd[cmd.index("--admission_wave_size") + 1], "2")
 
+    def test_stress_v2_command_uses_vanilla_prefix_pair(self):
+        cmd = run_suite._stress_v2_command(
+            model_id="qwen25_7b",
+            model={"model_path": "/models/qwen", "tokenizer_path": "/models/qwen"},
+            method_id="vanilla",
+            method={"sparse_method": "vanilla", "config": {"sparse_method": "vanilla"}},
+            stress_v2={
+                "workloads": "shared_prefix,multiturn",
+                "seed": 1,
+                "history_update": "synthetic",
+                "sessions": 2,
+                "turns": 2,
+                "system_prompt_len": 128,
+                "session_prefix_min_len": 16,
+                "session_prefix_len": 32,
+                "user_min_len": 8,
+                "user_len": 16,
+                "output_len": 2,
+                "shared_prompts": 2,
+                "shared_prefix_len": 128,
+                "shared_suffix_min_len": 8,
+                "shared_suffix_len": 16,
+                "gpu_memory_utilization": 0.5,
+                "tensor_parallel_size": 1,
+                "max_active_requests": 2,
+                "max_num_batched_tokens": 256,
+                "chunk_prefill_size": 128,
+                "max_model_len_margin": 4,
+                "prefix_cache_block_size": 16,
+                "prefix_cache_salt": "unit",
+                "prefix_cache_max_blocks": None,
+                "quest_chunk_size": 16,
+                "quest_token_budget": 64,
+                "num_sink_tokens": 0,
+                "num_recent_tokens": 16,
+                "num_top_tokens": 64,
+                "num_top_tokens_in_prefill": 64,
+                "chunk_prefill_accel_omnikv": True,
+                "min_performance_prompt_len": 0,
+                "min_cacheable_prefix_len": 0,
+                "case_timeout_s": 0,
+            },
+            output_dir=Path("/tmp/stress-v2"),
+        )
+
+        self.assertEqual(cmd[cmd.index("--cases") + 1], "baseline_full,prefix_full")
+        self.assertEqual(cmd[cmd.index("--session_prefix_min_len") + 1], "16")
+        self.assertEqual(cmd[cmd.index("--user_min_len") + 1], "8")
+        self.assertEqual(cmd[cmd.index("--shared_suffix_min_len") + 1], "8")
+
     def test_validate_layer_runs_as_a_standard_test_and_writes_required_artifacts(self):
         # Keep the default tests on the cheap validate layer only. Full
         # quality/logits/perf/stress regression runs require model paths,
@@ -284,6 +334,16 @@ class SparseVLLMRegressionSuiteTest(unittest.TestCase):
                 "2",
                 "--stress_max_decode_steps_after_full",
                 "1",
+                "--stress_v2_sessions",
+                "2",
+                "--stress_v2_turns",
+                "2",
+                "--stress_v2_user_min_len",
+                "4",
+                "--stress_v2_user_len",
+                "8",
+                "--stress_v2_shared_prompts",
+                "2",
                 "--enable_profiler",
                 "--run_id",
                 "unit_quick_overrides",
@@ -313,6 +373,11 @@ class SparseVLLMRegressionSuiteTest(unittest.TestCase):
             self.assertEqual(resolved["stress"]["max_num_seqs_in_batch"], 2)
             self.assertEqual(resolved["stress"]["max_decoding_seqs"], 2)
             self.assertEqual(resolved["stress"]["max_decode_steps_after_full"], 1)
+            self.assertEqual(resolved["stress_v2"]["sessions"], 2)
+            self.assertEqual(resolved["stress_v2"]["turns"], 2)
+            self.assertEqual(resolved["stress_v2"]["user_min_len"], 4)
+            self.assertEqual(resolved["stress_v2"]["user_len"], 8)
+            self.assertEqual(resolved["stress_v2"]["shared_prompts"], 2)
             self.assertTrue(resolved["quality"]["enable_profiler"])
             self.assertTrue(resolved["performance"]["enable_profiler"])
             self.assertTrue(resolved["stress"]["enable_profiler"])

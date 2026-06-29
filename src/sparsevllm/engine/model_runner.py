@@ -399,6 +399,17 @@ class ModelRunner:
             ),
         )
 
+    def _auto_capture_greedy_sampling(self, seqs: list[Sequence]) -> bool:
+        if self.config.decode_cuda_graph_capture_sampling:
+            return True
+        if self.config.tensor_parallel_size != 1:
+            return False
+        if self.config.enable_prefix_caching:
+            return False
+        if str(self.config.vllm_sparse_method or "") not in {"", "omnikv"}:
+            return False
+        return all(seq.temperature <= 1e-10 for seq in seqs)
+
     def set_decode_cuda_graph_max_context_len_override(self, max_context_len: int | None):
         self.decode_cuda_graph_runner.set_max_context_len_override(max_context_len)
 
@@ -429,6 +440,13 @@ class ModelRunner:
             return logits if self.rank == 0 else None
         finally:
             reset_context()
+
+    def _post_sparse_forward(self, seqs: list[Sequence], is_prefill: bool) -> None:
+        with profiler.record("model_sparse_post"):
+            with profiler.record("sparse_post_forward"):
+                self.sparse_controller.post_forward(seqs, is_prefill)
+            with profiler.record("cache_on_forward_end"):
+                self.cache_manager.on_forward_end(seqs, is_prefill)
 
     def _collect_logprobs(
         self,
@@ -478,16 +496,15 @@ class ModelRunner:
                     if self.config.decode_cuda_graph:
                         logits, graph_token_ids = self.decode_cuda_graph_runner.run(
                             seqs,
-                            capture_sampling=self.config.decode_cuda_graph_capture_sampling,
+                            capture_sampling=self._auto_capture_greedy_sampling(seqs),
                         )
                     else:
                         logits = self.decode_cuda_graph_runner.run_eager_static(seqs)
                         graph_token_ids = None
                     if self.rank != 0:
-                        with profiler.record("model_sparse_post"):
-                            self.sparse_controller.post_forward(seqs, is_prefill)
-                            self.cache_manager.on_forward_end(seqs, is_prefill)
+                        self._post_sparse_forward(seqs, is_prefill)
                         return None, None
+                    self._post_sparse_forward(seqs, is_prefill)
                     with profiler.record("model_sampler"):
                         if graph_token_ids is not None:
                             token_ids = graph_token_ids.tolist()
@@ -506,9 +523,6 @@ class ModelRunner:
                                 all_greedy=all_greedy,
                             ).tolist()
                     logprob_outputs = self._collect_logprobs(logits, token_ids, seqs)
-                    with profiler.record("model_sparse_post"):
-                        self.sparse_controller.post_forward(seqs, is_prefill)
-                        self.cache_manager.on_forward_end(seqs, is_prefill)
                     return token_ids, logprob_outputs
                 finally:
                     reset_context()
@@ -538,9 +552,7 @@ class ModelRunner:
             logprob_outputs = self._collect_logprobs(logits, token_ids, seqs) if self.rank == 0 else None
 
             # 5. 后置稀疏处理 (如 SnapKV 驱逐)
-            with profiler.record("model_sparse_post"):
-                self.sparse_controller.post_forward(seqs, is_prefill)
-                self.cache_manager.on_forward_end(seqs, is_prefill)
+            self._post_sparse_forward(seqs, is_prefill)
 
             reset_context()
             return token_ids, logprob_outputs

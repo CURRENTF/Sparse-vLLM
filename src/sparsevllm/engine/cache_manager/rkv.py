@@ -16,28 +16,50 @@ class RKVCacheManager(SnapKVCacheManager):
     def __init__(self, config: Config, rank: int, world_size: int):
         super().__init__(config, rank, world_size)
         self._rkv_observation_tokens = int(config.rkv_observation_tokens)
-        self._rkv_query_cache = [
-            torch.empty(
-                (
-                    self.max_buffer_rows,
-                    self._rkv_observation_tokens,
-                    self._rkv_num_query_heads(),
-                    self.head_dim,
-                ),
-                dtype=self._rkv_query_cache_dtype(),
-                device=self.device,
-            )
-            for _ in range(self.num_layers)
-        ]
-        self._rkv_query_positions = [
-            torch.full(
-                (self.max_buffer_rows, self._rkv_observation_tokens),
-                -1,
-                dtype=torch.int32,
-                device=self.device,
-            )
-            for _ in range(self.num_layers)
-        ]
+        self._rkv_query_cache_enabled = self._query_cache_needed_for_config(config)
+        self._rkv_vectorized_prefill_query_cache = True
+        self._rkv_batch_clear_query_cache_rows = True
+        self._rkv_query_cache = []
+        self._rkv_query_positions = []
+        if self._rkv_query_cache_enabled:
+            self._rkv_query_cache = [
+                torch.empty(
+                    (
+                        self.max_buffer_rows,
+                        self._rkv_observation_tokens,
+                        self._rkv_num_query_heads(),
+                        self.head_dim,
+                    ),
+                    dtype=self._rkv_query_cache_dtype(),
+                    device=self.device,
+                )
+                for _ in range(self.num_layers)
+            ]
+            self._rkv_query_positions = [
+                torch.full(
+                    (self.max_buffer_rows, self._rkv_observation_tokens),
+                    -1,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                for _ in range(self.num_layers)
+            ]
+
+    @staticmethod
+    def _query_cache_needed_for_config(config: Config) -> bool:
+        obs = int(getattr(config, "rkv_observation_tokens", 0) or 0)
+        if obs <= 0:
+            return False
+        budget = (
+            int(getattr(config, "num_sink_tokens", 0) or 0)
+            + int(getattr(config, "decode_keep_tokens", 0) or 0)
+            + int(getattr(config, "num_recent_tokens", 0) or 0)
+        )
+        trigger_len = budget + int(getattr(config, "rkv_compression_interval", 0) or 0)
+        return int(getattr(config, "max_model_len", 0) or 0) >= trigger_len
+
+    def _is_rkv_query_cache_enabled(self) -> bool:
+        return bool(getattr(self, "_rkv_query_cache_enabled", True))
 
     def _rkv_query_cache_dtype(self) -> torch.dtype:
         dtype = getattr(self.hf_config, "torch_dtype", torch.float16)
@@ -47,6 +69,8 @@ class RKVCacheManager(SnapKVCacheManager):
         return int(self.hf_config.num_attention_heads) // int(self.world_size)
 
     def _rkv_query_cache_bytes(self) -> int:
+        if not self._is_rkv_query_cache_enabled():
+            return 0
         obs = int(getattr(self.config, "rkv_observation_tokens", 0) or 0)
         if obs <= 0:
             return 0
@@ -75,7 +99,18 @@ class RKVCacheManager(SnapKVCacheManager):
         return int(available_memory - query_cache_bytes), int(slot_bytes_per_layer)
 
     def _clear_rkv_query_cache_row(self, layer_idx: int, row_idx: int):
+        if not self._is_rkv_query_cache_enabled():
+            return
         self._rkv_query_positions[int(layer_idx)][int(row_idx)].fill_(-1)
+
+    def _clear_rkv_query_cache_rows(self, layer_idx: int, row_indices: list[int | None]):
+        if not self._is_rkv_query_cache_enabled():
+            return
+        rows = [int(row_idx) for row_idx in row_indices if row_idx is not None]
+        if not rows:
+            return
+        rows_tensor = torch.tensor(rows, dtype=torch.long, device=self.device)
+        self._rkv_query_positions[int(layer_idx)][rows_tensor].fill_(-1)
 
     def free_seq(self, seq_id: int):
         row_by_layer = [
@@ -87,19 +122,85 @@ class RKVCacheManager(SnapKVCacheManager):
                 self._clear_rkv_query_cache_row(layer_idx, row_idx)
         return super().free_seq(seq_id)
 
-    def free_part_slots(self, layer_idx: int, seq: Sequence, keep_indices: torch.Tensor):
+    def free_part_slots(
+        self,
+        layer_idx: int,
+        seq: Sequence,
+        keep_indices: torch.Tensor,
+        *,
+        keep_indices_sorted: bool = False,
+    ):
         row_idx = self.seq_id_to_row[int(layer_idx)].get(seq.seq_id)
-        result = super().free_part_slots(layer_idx, seq, keep_indices)
+        result = super().free_part_slots(
+            layer_idx,
+            seq,
+            keep_indices,
+            keep_indices_sorted=keep_indices_sorted,
+        )
         if row_idx is not None:
             self._clear_rkv_query_cache_row(layer_idx, row_idx)
         return result
 
-    def decode_cuda_graph_keepalive_tensors(self) -> list[torch.Tensor]:
-        return (
-            super().decode_cuda_graph_keepalive_tensors()
-            + list(self._rkv_query_cache)
-            + list(self._rkv_query_positions)
+    def free_part_slots_batch(
+        self,
+        layer_idx: int,
+        seqs: list[Sequence],
+        keep_indices: torch.Tensor,
+        *,
+        keep_indices_sorted: bool = False,
+    ):
+        row_indices = [
+            self.seq_id_to_row[int(layer_idx)].get(seq.seq_id)
+            for seq in seqs
+        ]
+        result = super().free_part_slots_batch(
+            layer_idx,
+            seqs,
+            keep_indices,
+            keep_indices_sorted=keep_indices_sorted,
         )
+        if bool(getattr(self, "_rkv_batch_clear_query_cache_rows", True)):
+            self._clear_rkv_query_cache_rows(layer_idx, row_indices)
+        else:
+            for row_idx in row_indices:
+                if row_idx is not None:
+                    self._clear_rkv_query_cache_row(layer_idx, row_idx)
+        return result
+
+    def free_part_slots_batch_layers(
+        self,
+        layer_indices: list[int],
+        seqs: list[Sequence],
+        keep_indices: torch.Tensor,
+        *,
+        keep_indices_sorted: bool = False,
+    ):
+        row_indices_by_layer = [
+            [
+                self.seq_id_to_row[int(layer_idx)].get(seq.seq_id)
+                for seq in seqs
+            ]
+            for layer_idx in layer_indices
+        ]
+        result = super().free_part_slots_batch_layers(
+            layer_indices,
+            seqs,
+            keep_indices,
+            keep_indices_sorted=keep_indices_sorted,
+        )
+        for layer_idx, row_indices in zip(layer_indices, row_indices_by_layer):
+            if bool(getattr(self, "_rkv_batch_clear_query_cache_rows", True)):
+                self._clear_rkv_query_cache_rows(int(layer_idx), row_indices)
+            else:
+                for row_idx in row_indices:
+                    if row_idx is not None:
+                        self._clear_rkv_query_cache_row(int(layer_idx), row_idx)
+        return result
+
+    def decode_cuda_graph_keepalive_tensors(self) -> list[torch.Tensor]:
+        if not self._is_rkv_query_cache_enabled():
+            return super().decode_cuda_graph_keepalive_tensors()
+        return super().decode_cuda_graph_keepalive_tensors() + list(self._rkv_query_cache) + list(self._rkv_query_positions)
 
     @torch.no_grad()
     def record_prefill_query(
@@ -112,41 +213,61 @@ class RKVCacheManager(SnapKVCacheManager):
         chunk_lens: torch.Tensor,
     ):
         obs = int(self._rkv_observation_tokens)
-        if obs <= 0 or q.numel() == 0:
+        if not self._is_rkv_query_cache_enabled() or obs <= 0 or q.numel() == 0:
             return None
 
         layer_idx = int(layer_idx)
         cache = self._rkv_query_cache[layer_idx]
         positions_cache = self._rkv_query_positions[layer_idx]
-        batch = int(view.context_lens.numel())
-        for b_idx in range(batch):
-            context_len = int(view.context_lens[b_idx].item())
-            chunk_len = int(chunk_lens[b_idx].item())
-            if context_len <= 0 or chunk_len <= 0:
-                continue
-            chunk_start = context_len - chunk_len
-            record_start = max(chunk_start, context_len - obs)
-            record_len = context_len - record_start
-            if record_len <= 0:
-                continue
+        if not bool(getattr(self, "_rkv_vectorized_prefill_query_cache", True)):
+            batch = int(view.context_lens.numel())
+            for b_idx in range(batch):
+                context_len = int(view.context_lens[b_idx].item())
+                chunk_len = int(chunk_lens[b_idx].item())
+                if context_len <= 0 or chunk_len <= 0:
+                    continue
+                chunk_start = context_len - chunk_len
+                record_start = max(chunk_start, context_len - obs)
+                record_len = context_len - record_start
+                if record_len <= 0:
+                    continue
 
-            row_idx = int(view.req_indices[b_idx].item())
-            q_start = int(b_start_loc[b_idx].item()) + (record_start - chunk_start)
-            token_positions = torch.arange(
-                record_start,
-                context_len,
-                dtype=torch.long,
-                device=q.device,
-            )
-            cols = token_positions.remainder(obs)
-            cache[row_idx, cols] = q[q_start : q_start + record_len]
-            positions_cache[row_idx, cols] = token_positions.to(torch.int32)
+                row_idx = int(view.req_indices[b_idx].item())
+                q_start = int(b_start_loc[b_idx].item()) + (record_start - chunk_start)
+                token_positions = torch.arange(
+                    record_start,
+                    context_len,
+                    dtype=torch.long,
+                    device=q.device,
+                )
+                cols = token_positions.remainder(obs)
+                cache[row_idx, cols] = q[q_start : q_start + record_len]
+                positions_cache[row_idx, cols] = token_positions.to(torch.int32)
+            return None
+
+        context_lens = view.context_lens.to(device=q.device, dtype=torch.long)
+        chunk_lens = chunk_lens.to(device=q.device, dtype=torch.long)
+        req_indices = view.req_indices.to(device=q.device, dtype=torch.long)
+        b_start_loc = b_start_loc.to(device=q.device, dtype=torch.long)
+
+        offsets = torch.arange(obs, dtype=torch.long, device=q.device)
+        record_lens = torch.minimum(chunk_lens.clamp_min(0), torch.full_like(chunk_lens, obs))
+        record_starts = context_lens - record_lens
+        valid = offsets.unsqueeze(0) < record_lens.unsqueeze(1)
+        positions = record_starts.unsqueeze(1) + offsets.unsqueeze(0)
+        cols = positions.remainder(obs)
+        q_starts = b_start_loc + (chunk_lens - record_lens)
+        q_indices = q_starts.unsqueeze(1) + offsets.unsqueeze(0)
+
+        rows = req_indices.unsqueeze(1).expand_as(cols)
+        cache[rows[valid], cols[valid]] = q[q_indices[valid]]
+        positions_cache[rows[valid], cols[valid]] = positions[valid].to(torch.int32)
         return None
 
     @torch.no_grad()
     def record_decode_query(self, layer_idx: int, q: torch.Tensor):
         obs = int(self._rkv_observation_tokens)
-        if obs <= 0 or q.numel() == 0:
+        if not self._is_rkv_query_cache_enabled() or obs <= 0 or q.numel() == 0:
             return None
 
         layer_idx = int(layer_idx)
@@ -173,6 +294,11 @@ class RKVCacheManager(SnapKVCacheManager):
         num_recent_tokens: int,
     ) -> torch.Tensor:
         layer_idx = int(layer_idx)
+        if not self._is_rkv_query_cache_enabled():
+            raise RuntimeError(
+                "R-KV query cache is disabled because max_model_len is below the "
+                "decode-eviction trigger; query attention scores should not be requested."
+            )
         kv_len = int(kv_len)
         obs = int(self._rkv_observation_tokens)
         score_end = kv_len
@@ -228,6 +354,94 @@ class RKVCacheManager(SnapKVCacheManager):
         )
         return attn_score[0]
 
+    @torch.no_grad()
+    def rkv_query_attention_scores_batch(
+        self,
+        layer_idx: int,
+        seqs: list[Sequence],
+        kv_lens: list[int],
+        *,
+        candidate_start: int,
+        num_recent_tokens: int,
+    ) -> torch.Tensor:
+        layer_idx = int(layer_idx)
+        if not self._is_rkv_query_cache_enabled():
+            raise RuntimeError(
+                "R-KV query cache is disabled because max_model_len is below the "
+                "decode-eviction trigger; query attention scores should not be requested."
+            )
+        if not seqs:
+            return torch.empty((0, 0), dtype=self._prefill_score_dtype(), device=self.device)
+        if len(seqs) != len(kv_lens):
+            raise RuntimeError(
+                "rkv_query_attention_scores_batch expected one kv_len per sequence: "
+                f"seqs={len(seqs)} kv_lens={len(kv_lens)}"
+            )
+
+        obs = int(self._rkv_observation_tokens)
+        if obs <= 0:
+            return torch.zeros((len(seqs), max(int(x) for x in kv_lens)), dtype=self._prefill_score_dtype(), device=self.device)
+
+        row_indices = []
+        for seq in seqs:
+            row_idx = self.seq_id_to_row[layer_idx].get(seq.seq_id)
+            if row_idx is None:
+                raise RuntimeError(f"Missing R-KV row: layer={layer_idx} seq_id={seq.seq_id}.")
+            row_indices.append(int(row_idx))
+
+        rows = torch.tensor(row_indices, dtype=torch.long, device=self.device)
+        kv_lens_tensor = torch.tensor(kv_lens, dtype=torch.long, device=self.device)
+        score_ends = kv_lens_tensor
+        score_starts = (score_ends - obs).clamp_min(0)
+        score_lens = score_ends - score_starts
+        max_score_len = int(score_lens.max().item())
+        max_kv_len = int(kv_lens_tensor.max().item())
+        if max_score_len <= 0:
+            return torch.zeros((len(seqs), max_kv_len), dtype=self._prefill_score_dtype(), device=self.device)
+
+        offsets = torch.arange(max_score_len, dtype=torch.long, device=self.device)
+        positions = score_starts[:, None] + offsets[None, :]
+        valid_positions = offsets[None, :] < score_lens[:, None]
+        cols = positions.remainder(obs)
+        stored_positions = self._rkv_query_positions[layer_idx][rows[:, None], cols].to(torch.long)
+        positions_ok = ((stored_positions == positions) | ~valid_positions).all()
+        if positions_ok.is_cuda:
+            torch._assert_async(positions_ok)
+        elif not bool(positions_ok.item()):
+            raise RuntimeError(
+                "R-KV query cache missing observation positions in batch: "
+                f"layer={layer_idx} kv_lens={[int(x) for x in kv_lens]}."
+            )
+
+        q_window = self._rkv_query_cache[layer_idx][rows[:, None], cols].contiguous()
+        q_window = q_window.view(len(seqs) * max_score_len, q_window.shape[2], q_window.shape[3])
+        k_cache, _ = self.get_layer_kv_cache(layer_idx)
+        attn_score = torch.zeros(
+            (len(seqs), max_kv_len),
+            dtype=self._prefill_score_dtype(),
+            device=self.device,
+        )
+        b_start_loc = (
+            torch.arange(len(seqs), dtype=torch.int32, device=self.device)
+            * int(max_score_len)
+        )
+        prefill_score_fwd(
+            q_window,
+            k_cache,
+            attn_score,
+            rows.to(torch.int32),
+            b_start_loc,
+            kv_lens_tensor.to(torch.int32),
+            score_starts.to(torch.int32),
+            int(max_score_len),
+            self.buffer_req_to_token_slots[layer_idx],
+            score_starts.to(torch.int32),
+            score_ends.to(torch.int32),
+            candidate_start=int(candidate_start),
+            num_recent_tokens=int(num_recent_tokens),
+        )
+        return attn_score
+
     @staticmethod
     def redundancy_scores_from_keys(
         keys: torch.Tensor,
@@ -269,6 +483,49 @@ class RKVCacheManager(SnapKVCacheManager):
         return torch.softmax(avg_sim, dim=0)
 
     @staticmethod
+    def redundancy_scores_from_keys_batch(
+        keys: torch.Tensor,
+        *,
+        similarity_threshold: float,
+        recent_similar_keep: int,
+        max_tokens: int,
+    ) -> torch.Tensor:
+        batch_size = int(keys.shape[0])
+        token_count = int(keys.shape[1])
+        if token_count == 0:
+            return torch.empty((batch_size, 0), dtype=torch.float32, device=keys.device)
+        if token_count > int(max_tokens):
+            raise RuntimeError(
+                "R-KV redundancy scoring is quadratic in candidate tokens. "
+                f"candidate_tokens={token_count} exceeds rkv_max_redundancy_tokens={int(max_tokens)}. "
+                "Reduce decode_keep_tokens/rkv_compression_interval or raise the explicit limit."
+            )
+
+        flat_keys = keys.float().reshape(batch_size, token_count, -1)
+        flat_keys = torch.nn.functional.normalize(flat_keys, p=2, dim=-1, eps=1.0e-6)
+        sim = torch.bmm(flat_keys, flat_keys.transpose(1, 2))
+        diag = torch.arange(token_count, device=keys.device)
+        sim[:, diag, diag] = 0.0
+
+        threshold = float(similarity_threshold)
+        if threshold > 0.0:
+            sim = torch.where(sim >= threshold, sim, torch.zeros_like(sim))
+
+        keep = int(recent_similar_keep)
+        if keep > 0 and token_count > 1:
+            upper = torch.triu(
+                torch.ones((token_count, token_count), dtype=torch.bool, device=keys.device),
+                diagonal=1,
+            )
+            high_future = (sim > 0) & upper.unsqueeze(0)
+            future_rank_from_right = high_future.flip(2).to(torch.int32).cumsum(2).flip(2)
+            keep_recent_links = high_future & (future_rank_from_right <= keep)
+            sim = sim.masked_fill(keep_recent_links, 0.0)
+
+        avg_sim = sim.mean(dim=2)
+        return torch.softmax(avg_sim, dim=1)
+
+    @staticmethod
     def joint_retention_scores(
         importance: torch.Tensor,
         redundancy: torch.Tensor,
@@ -307,7 +564,6 @@ class RKVCacheManager(SnapKVCacheManager):
         row_idx = self.seq_id_to_row[layer_idx].get(seq.seq_id)
         if row_idx is None:
             raise RuntimeError(f"Missing R-KV row: layer={layer_idx} seq_id={seq.seq_id}.")
-        logical_indices = torch.arange(candidate_start, candidate_end, dtype=torch.long, device=importance_scores.device)
         slots = self.buffer_req_to_token_slots[layer_idx][row_idx, candidate_start:candidate_end].to(torch.long)
         candidate_importance = importance_scores[candidate_start:candidate_end].float()
         final_scores = candidate_importance.clone()
@@ -332,5 +588,85 @@ class RKVCacheManager(SnapKVCacheManager):
 
         keep_count = min(int(num_top), int(final_scores.numel()))
         top_rel = final_scores.topk(keep_count, dim=0, sorted=False).indices
-        top_indices = logical_indices.index_select(0, top_rel)
+        top_indices = top_rel + int(candidate_start)
         return torch.cat((sink_indices, top_indices, recent_indices), dim=0)
+
+    def select_rkv_indices_batch(
+        self,
+        layer_idx: int,
+        seqs: list[Sequence],
+        importance_scores: torch.Tensor,
+        kv_lens: list[int],
+        budget: int,
+    ) -> torch.Tensor:
+        if not seqs:
+            return torch.empty((0, 0), dtype=torch.long, device=importance_scores.device)
+        if len(seqs) != len(kv_lens):
+            raise RuntimeError(
+                "select_rkv_indices_batch expected one kv_len per sequence: "
+                f"seqs={len(seqs)} kv_lens={len(kv_lens)}"
+            )
+        kv_len = int(kv_lens[0])
+        if any(int(x) != kv_len for x in kv_lens):
+            raise RuntimeError(
+                "select_rkv_indices_batch requires uniform kv_lens. "
+                f"kv_lens={[int(x) for x in kv_lens]}"
+            )
+        budget = int(budget)
+        if kv_len <= budget:
+            keep = torch.arange(kv_len, dtype=torch.long, device=importance_scores.device)
+            return keep.unsqueeze(0).expand(len(seqs), -1).contiguous()
+
+        num_sink = min(int(self.config.num_sink_tokens), kv_len)
+        num_recent = min(int(self.config.num_recent_tokens), max(0, kv_len - num_sink))
+        recent_start = kv_len - num_recent
+        candidate_start = num_sink
+        candidate_end = max(candidate_start, recent_start)
+        num_top = max(0, budget - num_sink - num_recent)
+
+        sink_indices = torch.arange(0, num_sink, dtype=torch.long, device=importance_scores.device)
+        recent_indices = torch.arange(recent_start, kv_len, dtype=torch.long, device=importance_scores.device)
+        if num_top <= 0 or candidate_end <= candidate_start:
+            keep = torch.cat((sink_indices, recent_indices), dim=0)
+            return keep.unsqueeze(0).expand(len(seqs), -1).contiguous()
+
+        row_indices = []
+        for seq in seqs:
+            row_idx = self.seq_id_to_row[layer_idx].get(seq.seq_id)
+            if row_idx is None:
+                raise RuntimeError(f"Missing R-KV row: layer={layer_idx} seq_id={seq.seq_id}.")
+            row_indices.append(int(row_idx))
+
+        rows = torch.tensor(row_indices, dtype=torch.long, device=importance_scores.device)
+        slots = self.buffer_req_to_token_slots[layer_idx][rows, candidate_start:candidate_end].to(torch.long)
+        final_scores = importance_scores[:, candidate_start:candidate_end].float().clone()
+
+        configured_window = int(self.config.rkv_redundancy_window)
+        window = int(slots.shape[1]) if configured_window == 0 else min(configured_window, int(slots.shape[1]))
+        if window > 0:
+            k_cache, _ = self.get_layer_kv_cache(layer_idx)
+            window_slots = slots[:, -window:]
+            window_keys = k_cache.index_select(0, window_slots.reshape(-1)).view(
+                len(seqs),
+                window,
+                k_cache.shape[1],
+                k_cache.shape[2],
+            )
+            redundancy = self.redundancy_scores_from_keys_batch(
+                window_keys,
+                similarity_threshold=float(self.config.rkv_similarity_threshold),
+                recent_similar_keep=int(self.config.rkv_recent_similar_keep),
+                max_tokens=int(self.config.rkv_max_redundancy_tokens),
+            )
+            final_scores[:, -window:] = self.joint_retention_scores(
+                importance_scores[:, candidate_start:candidate_end][:, -window:],
+                redundancy,
+                alpha=float(self.config.rkv_alpha),
+            )
+
+        keep_count = min(int(num_top), int(final_scores.shape[1]))
+        top_rel = final_scores.topk(keep_count, dim=1, sorted=False).indices
+        top_indices = top_rel + int(candidate_start)
+        sink_batch = sink_indices.unsqueeze(0).expand(len(seqs), -1)
+        recent_batch = recent_indices.unsqueeze(0).expand(len(seqs), -1)
+        return torch.cat((sink_batch, top_indices, recent_batch), dim=1)

@@ -69,6 +69,7 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
         self.free_rows = deque(range(self.max_buffer_rows))
         self.row_seq_lens = np.zeros((self.max_buffer_rows,), dtype=np.int32)
         self.layer_batch_state = LayerBatchStates()
+        self._decode_static_index_buffers: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
 
         self.enable_prefix_caching = bool(
             config.enable_prefix_caching and config.vllm_sparse_method in ("", "omnikv")
@@ -413,6 +414,48 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
 
         return select_indices
 
+    def _get_decode_static_index_buffers(self, graph_batch_size: int) -> tuple[torch.Tensor, torch.Tensor]:
+        graph_batch_size = int(graph_batch_size)
+        buffers = self._decode_static_index_buffers.get(graph_batch_size)
+        if buffers is None:
+            buffers = (
+                torch.empty((graph_batch_size,), dtype=torch.long, device=self.device),
+                torch.empty((graph_batch_size,), dtype=torch.long, device=self.device),
+            )
+            self._decode_static_index_buffers[graph_batch_size] = buffers
+        return buffers
+
+    @torch.no_grad()
+    def _allocate_decode_batch_static(
+        self,
+        seq_ids: list[int],
+        graph_batch_size: int,
+    ) -> tuple[torch.Tensor, np.ndarray, np.ndarray]:
+        batch_size = len(seq_ids)
+        self._evict_prefix_cache_until_free(batch_size)
+        if self._num_free_slots < batch_size:
+            raise RuntimeError(
+                f"Out of KV cache slots: need {batch_size}, free {self._num_free_slots}"
+            )
+
+        row_indices = np.asarray([self._get_free_row(sid) for sid in seq_ids], dtype=np.int64)
+        cur_lens = self.row_seq_lens[row_indices]
+
+        ptr = self._num_free_slots
+        select_indices = self.free_slots_stack[ptr - batch_size: ptr]
+        self._num_free_slots -= batch_size
+
+        rows_gpu, cols_gpu = self._get_decode_static_index_buffers(graph_batch_size)
+        rows_gpu[:batch_size].copy_(torch.from_numpy(row_indices))
+        cols_gpu[:batch_size].copy_(torch.from_numpy(cur_lens.astype(np.int64, copy=False)))
+        self.buffer_req_to_token_slots[
+            rows_gpu[:batch_size],
+            cols_gpu[:batch_size],
+        ] = select_indices
+        self.row_seq_lens[row_indices] += 1
+
+        return select_indices, self.row_seq_lens[row_indices], row_indices
+
     def free_seq(self, seq_id: int):
         with profiler.record("cache_free_seq"):
             debug_slots = os.getenv("SPARSEVLLM_DEBUG_SLOTS", "0") == "1"
@@ -554,7 +597,8 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
             self.layer_batch_state.max_context_len = int(max(self.row_seq_lens[row_indices])) if row_indices else 0
             self.layer_batch_state.req_indices = req_indices
 
-            logger.debug(f'{slot_mapping=}   {context_lens.tolist()=}  {slot_mapping[:10]=}  {slot_mapping[-10:]=}')
+            if log_level == 'DEBUG':
+                logger.debug(f'{slot_mapping=}   {context_lens.tolist()=}  {slot_mapping[:10]=}  {slot_mapping[-10:]=}')
 
             input_ids = torch.tensor(input_ids_list, dtype=torch.int64, device=self.device)
             positions = torch.tensor(positions_list, dtype=torch.int64, device=self.device)
@@ -597,17 +641,22 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
             positions_list = [seq.num_tokens - 1 for seq in seqs]
             seq_ids = [seq.seq_id for seq in seqs]
 
-            new_slots_batch = self._allocate_batch(seq_ids, 1)
-            row_indices = [self.seq_id_to_row[sid] for sid in seq_ids]
+            new_slots_batch, real_context_lens, row_indices = self._allocate_decode_batch_static(
+                seq_ids,
+                graph_batch_size,
+            )
             for seq, slot in zip(seqs, new_slots_batch):
                 self._record_prefix_materialization(seq, [int(seq.last_token)], slot.reshape(1))
-            real_context_lens = self.row_seq_lens[row_indices]
 
-            input_ids[:real_batch_size].copy_(torch.tensor(input_ids_list, dtype=torch.int64, device=self.device))
-            positions[:real_batch_size].copy_(torch.tensor(positions_list, dtype=torch.int64, device=self.device))
+            input_ids[:real_batch_size].copy_(torch.tensor(input_ids_list, dtype=torch.int64))
+            positions[:real_batch_size].copy_(torch.tensor(positions_list, dtype=torch.int64))
             slot_mapping[:real_batch_size].copy_(new_slots_batch)
-            context_lens[:real_batch_size].copy_(torch.tensor(real_context_lens, dtype=torch.int32, device=self.device))
-            req_indices[:real_batch_size].copy_(torch.tensor(row_indices, dtype=torch.int32, device=self.device))
+            context_lens[:real_batch_size].copy_(
+                torch.from_numpy(real_context_lens.astype(np.int32, copy=False))
+            )
+            req_indices[:real_batch_size].copy_(
+                torch.from_numpy(row_indices.astype(np.int32, copy=False))
+            )
 
             if graph_batch_size > real_batch_size:
                 # CUDA Graph replay is shape-static. Padded rows mirror the first
@@ -623,7 +672,7 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
 
             self.layer_batch_state.slot_mapping = slot_mapping
             self.layer_batch_state.context_lens = context_lens
-            self.layer_batch_state.max_context_len = int(max(real_context_lens)) if row_indices else 0
+            self.layer_batch_state.max_context_len = int(real_context_lens.max()) if real_batch_size > 0 else 0
             self.layer_batch_state.req_indices = req_indices
 
             return input_ids, positions, None

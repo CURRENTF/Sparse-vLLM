@@ -158,9 +158,16 @@ class DeltaKVLessMemoryCudaGraphCacheManager(DeltaKVLessMemoryCacheManager):
         top_k = self._decode_graph_topk_width_capacity(0)
         max_buffer = self._deltakv_decode_static_max_buffer()
 
-        # Sparse layers before the first observation layer can see K=0; sparse
-        # layers after an observation layer see the fixed decode top-k width.
-        for k_max in sorted({0, int(top_k)}):
+        k_values = {int(top_k)}
+        obs_layers = [int(layer) for layer in getattr(self.config, "obs_layer_ids", []) or []]
+        if not obs_layers:
+            k_values.add(0)
+        else:
+            first_obs_layer = min(obs_layers)
+            if any(int(layer_idx) < first_obs_layer for layer_idx in getattr(self, "deltakv_layer_ids", [])):
+                k_values.add(0)
+
+        for k_max in sorted(k_values):
             max_s = sink + int(k_max) + int(max_buffer)
             self._ensure_decode_static_temp_slots(graph_batch_size, k_max)
             self._ensure_decode_static_plan_buffers(graph_batch_size, k_max, max_s, device)
