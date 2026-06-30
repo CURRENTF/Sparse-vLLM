@@ -21,6 +21,7 @@ class RKVCacheManager(SnapKVCacheManager):
         self._rkv_batch_clear_query_cache_rows = True
         self._rkv_query_cache = []
         self._rkv_query_positions = []
+        self._rkv_query_score_static_buffers: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]] = {}
         if self._rkv_query_cache_enabled:
             self._rkv_query_cache = [
                 torch.empty(
@@ -97,6 +98,25 @@ class RKVCacheManager(SnapKVCacheManager):
                 "Reduce rkv_observation_tokens or max_num_seqs_in_batch."
             )
         return int(available_memory - query_cache_bytes), int(slot_bytes_per_layer)
+
+    def _get_rkv_query_score_static_buffers(
+        self,
+        batch_size: int,
+        max_score_len: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        key = (int(batch_size), int(max_score_len))
+        if not hasattr(self, "_rkv_query_score_static_buffers"):
+            self._rkv_query_score_static_buffers = {}
+        buffers = self._rkv_query_score_static_buffers.get(key)
+        if buffers is None:
+            offsets = torch.arange(int(max_score_len), dtype=torch.long, device=self.device)
+            b_start_loc = (
+                torch.arange(int(batch_size), dtype=torch.int32, device=self.device)
+                * int(max_score_len)
+            )
+            buffers = (offsets, b_start_loc)
+            self._rkv_query_score_static_buffers[key] = buffers
+        return buffers
 
     def _clear_rkv_query_cache_row(self, layer_idx: int, row_idx: int):
         if not self._is_rkv_query_cache_enabled():
@@ -389,17 +409,25 @@ class RKVCacheManager(SnapKVCacheManager):
                 raise RuntimeError(f"Missing R-KV row: layer={layer_idx} seq_id={seq.seq_id}.")
             row_indices.append(int(row_idx))
 
+        kv_lens_cpu = [int(kv_len) for kv_len in kv_lens]
+        score_ends_cpu = kv_lens_cpu
+        score_starts_cpu = [max(0, int(kv_len) - obs) for kv_len in score_ends_cpu]
+        score_lens_cpu = [
+            int(score_end) - int(score_start)
+            for score_start, score_end in zip(score_starts_cpu, score_ends_cpu)
+        ]
+        max_score_len = max(score_lens_cpu) if score_lens_cpu else 0
+        max_kv_len = max(kv_lens_cpu) if kv_lens_cpu else 0
+
         rows = torch.tensor(row_indices, dtype=torch.long, device=self.device)
-        kv_lens_tensor = torch.tensor(kv_lens, dtype=torch.long, device=self.device)
+        kv_lens_tensor = torch.tensor(kv_lens_cpu, dtype=torch.long, device=self.device)
         score_ends = kv_lens_tensor
-        score_starts = (score_ends - obs).clamp_min(0)
-        score_lens = score_ends - score_starts
-        max_score_len = int(score_lens.max().item())
-        max_kv_len = int(kv_lens_tensor.max().item())
+        score_starts = torch.tensor(score_starts_cpu, dtype=torch.long, device=self.device)
+        score_lens = torch.tensor(score_lens_cpu, dtype=torch.long, device=self.device)
         if max_score_len <= 0:
             return torch.zeros((len(seqs), max_kv_len), dtype=self._prefill_score_dtype(), device=self.device)
 
-        offsets = torch.arange(max_score_len, dtype=torch.long, device=self.device)
+        offsets, b_start_loc = self._get_rkv_query_score_static_buffers(len(seqs), max_score_len)
         positions = score_starts[:, None] + offsets[None, :]
         valid_positions = offsets[None, :] < score_lens[:, None]
         cols = positions.remainder(obs)
@@ -420,10 +448,6 @@ class RKVCacheManager(SnapKVCacheManager):
             (len(seqs), max_kv_len),
             dtype=self._prefill_score_dtype(),
             device=self.device,
-        )
-        b_start_loc = (
-            torch.arange(len(seqs), dtype=torch.int32, device=self.device)
-            * int(max_score_len)
         )
         prefill_score_fwd(
             q_window,

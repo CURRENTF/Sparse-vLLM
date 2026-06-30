@@ -57,6 +57,7 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
         self.free_rows = deque(range(self.max_buffer_rows))
         self.row_seq_lens = np.zeros((self.max_buffer_rows,), dtype=np.int32)
         self.layer_batch_state = LayerBatchStates()
+        self._decode_static_index_buffers: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
         self.enable_prefix_caching = bool(config.enable_prefix_caching and config.vllm_sparse_method == "quest")
         self.prefix_cache_block_size = int(config.prefix_cache_block_size)
         if self.enable_prefix_caching and self.prefix_cache_block_size != self.page_size:
@@ -363,6 +364,8 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
         if self.seq_id_to_row:
             raise RuntimeError("Cannot reset prefix cache while QuEST sequences are active.")
         self.free_pages_stack[: self.num_pages] = torch.arange(self.num_pages, dtype=torch.int32, device=self.device)
+        if not hasattr(self, "free_pages_cpu_stack"):
+            self.free_pages_cpu_stack = np.arange(self.num_pages, dtype=np.int32)
         self.free_pages_cpu_stack[: self.num_pages] = np.arange(self.num_pages, dtype=np.int32)
         self._num_free_pages = int(self.num_pages)
         self.seq_id_to_cached_pages.clear()
@@ -487,11 +490,12 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
 
             row_idx = self._get_free_row(seq_id)
             cur_len = int(self.row_seq_lens[row_idx])
-            if cur_len + size > int(self.max_model_len):
+            max_model_len = int(getattr(self, "max_model_len", self.buffer_req_to_token_slots.shape[1]))
+            if cur_len + size > max_model_len:
                 raise RuntimeError(
                     "KV row length exceeds max_model_len in QuEST _allocate: "
                     f"seq_id={seq_id} row={row_idx} cur_len={cur_len} size={size} "
-                    f"max_model_len={int(self.max_model_len)}"
+                    f"max_model_len={max_model_len}"
                 )
 
             if needed_pages > 0:
@@ -525,16 +529,23 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
             return allocated_slots
 
     @torch.no_grad()
-    def _allocate_batch(self, seq_ids: list[int], size: int) -> torch.Tensor:
+    def _allocate_batch(
+        self,
+        seq_ids: list[int],
+        size: int,
+        *,
+        graph_batch_size: int | None = None,
+    ) -> torch.Tensor:
         assert size == 1, "Batch allocation currently only supports size=1 (Decode)"
         with profiler.record("cache_allocate"):
             batch_size = len(seq_ids)
             row_indices = np.asarray([self._get_free_row(seq_id) for seq_id in seq_ids], dtype=np.int64)
             cur_lens = self.row_seq_lens[row_indices]
-            if len(cur_lens) > 0 and int(max(cur_lens)) + 1 > int(self.max_model_len):
+            max_model_len = int(getattr(self, "max_model_len", self.buffer_req_to_token_slots.shape[1]))
+            if len(cur_lens) > 0 and int(max(cur_lens)) + 1 > max_model_len:
                 raise RuntimeError(
                     "KV row length exceeds max_model_len in QuEST _allocate_batch: "
-                    f"max_cur_len={int(max(cur_lens))} max_model_len={int(self.max_model_len)}"
+                    f"max_cur_len={int(max(cur_lens))} max_model_len={max_model_len}"
                 )
 
             page_indices = cur_lens // self.page_size
@@ -548,8 +559,20 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
                 f"size={batch_size}, free_slots={self.num_free_slots}"
             )
 
-            rows_gpu = torch.tensor(row_indices, dtype=torch.long, device=self.device)
-            page_indices_gpu = torch.tensor(page_indices, dtype=torch.long, device=self.device)
+            if graph_batch_size is None:
+                rows_gpu = torch.tensor(row_indices, dtype=torch.long, device=self.device)
+                page_indices_gpu = torch.tensor(page_indices, dtype=torch.long, device=self.device)
+                cur_lens_gpu = torch.tensor(cur_lens, dtype=torch.long, device=self.device)
+            else:
+                rows_gpu, page_indices_gpu, cur_lens_gpu = self._get_decode_static_index_buffers(
+                    int(graph_batch_size)
+                )
+                rows_gpu[:batch_size].copy_(torch.from_numpy(row_indices))
+                page_indices_gpu[:batch_size].copy_(torch.from_numpy(page_indices.astype(np.int64, copy=False)))
+                cur_lens_gpu[:batch_size].copy_(torch.from_numpy(cur_lens.astype(np.int64, copy=False)))
+                rows_gpu = rows_gpu[:batch_size]
+                page_indices_gpu = page_indices_gpu[:batch_size]
+                cur_lens_gpu = cur_lens_gpu[:batch_size]
             if needed_pages > 0:
                 ptr = self._num_free_pages
                 if self.enable_prefix_caching:
@@ -571,7 +594,6 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
                     page_indices_gpu.index_select(0, new_pos_gpu),
                 ] = new_page_slots
 
-            cur_lens_gpu = torch.tensor(cur_lens, dtype=torch.long, device=self.device)
             if needed_pages == 0:
                 allocated_slots = self.buffer_req_to_token_slots[rows_gpu, cur_lens_gpu - 1] + 1
             elif self.enable_prefix_caching:
@@ -588,6 +610,23 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
             self.buffer_req_to_token_slots[rows_gpu, cur_lens_gpu] = allocated_slots
             self.row_seq_lens[row_indices] += 1
             return allocated_slots.to(torch.int32)
+
+    def _get_decode_static_index_buffers(
+        self,
+        graph_batch_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        graph_batch_size = int(graph_batch_size)
+        if not hasattr(self, "_decode_static_index_buffers"):
+            self._decode_static_index_buffers = {}
+        buffers = self._decode_static_index_buffers.get(graph_batch_size)
+        if buffers is None:
+            buffers = (
+                torch.empty((graph_batch_size,), dtype=torch.long, device=self.device),
+                torch.empty((graph_batch_size,), dtype=torch.long, device=self.device),
+                torch.empty((graph_batch_size,), dtype=torch.long, device=self.device),
+            )
+            self._decode_static_index_buffers[graph_batch_size] = buffers
+        return buffers
 
     def free_seq(self, seq_id: int):
         with profiler.record("cache_free_seq"):
@@ -622,7 +661,8 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
 
             self.buffer_req_to_token_slots[row_idx, :] = 0
             self.buffer_req_to_page_slots[row_idx, :] = -1
-            self.buffer_req_to_page_slots_cpu[row_idx, :] = -1
+            if hasattr(self, "buffer_req_to_page_slots_cpu"):
+                self.buffer_req_to_page_slots_cpu[row_idx, :] = -1
             self.row_seq_lens[row_idx] = 0
             self.free_rows.append(row_idx)
 
@@ -761,16 +801,20 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
             positions_list = [seq.num_tokens - 1 for seq in seqs]
             seq_ids = [seq.seq_id for seq in seqs]
 
-            new_slots_batch = self._allocate_batch(seq_ids, 1)
+            new_slots_batch = self._allocate_batch(seq_ids, 1, graph_batch_size=graph_batch_size)
             row_indices = [self.seq_id_to_row[sid] for sid in seq_ids]
             for seq, slot in zip(seqs, new_slots_batch):
                 self._record_prefix_materialization(seq, [int(seq.last_token)], slot.reshape(1))
             real_context_lens = self.row_seq_lens[row_indices]
-            input_ids[:real_batch_size].copy_(torch.tensor(input_ids_list, dtype=torch.int64, device=self.device))
-            positions[:real_batch_size].copy_(torch.tensor(positions_list, dtype=torch.int64, device=self.device))
+            input_ids[:real_batch_size].copy_(torch.tensor(input_ids_list, dtype=torch.int64))
+            positions[:real_batch_size].copy_(torch.tensor(positions_list, dtype=torch.int64))
             slot_mapping[:real_batch_size].copy_(new_slots_batch)
-            context_lens[:real_batch_size].copy_(torch.tensor(real_context_lens, dtype=torch.int32, device=self.device))
-            req_indices[:real_batch_size].copy_(torch.tensor(row_indices, dtype=torch.int32, device=self.device))
+            context_lens[:real_batch_size].copy_(
+                torch.from_numpy(real_context_lens.astype(np.int32, copy=False))
+            )
+            req_indices[:real_batch_size].copy_(
+                torch.tensor(row_indices, dtype=torch.int32)
+            )
 
             if graph_batch_size > real_batch_size:
                 input_ids[real_batch_size:].fill_(int(input_ids_list[0]))
@@ -796,7 +840,11 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
         if slot_mapping is None or slot_mapping.numel() == 0:
             return
         if not get_context().is_prefill:
-            self._on_kv_stored_decode_static(layer_idx, slot_mapping)
+            # Decode metadata is page-level. Updating it inside the captured
+            # decode graph would rescan one full page for every layer on every
+            # token, even though metadata only changes when a page is completed.
+            # `on_forward_end()` refreshes completed pages after replay/eager
+            # decode, before the next step can score previous pages.
             return
         if self._is_stream_capturing():
             self._on_kv_stored_prefill_capture(layer_idx, k, slot_mapping)
@@ -892,41 +940,58 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
             page_min_cache.index_copy_(0, full_page_slots, page_min)
 
     @torch.no_grad()
-    def _on_kv_stored_decode_static(self, layer_idx: int, slot_mapping: torch.Tensor):
-        with profiler.record("quest_update_metadata_static"):
-            page_max_cache = self.metadata_cache[0, layer_idx]
-            page_min_cache = self.metadata_cache[1, layer_idx]
-            k_cache = self.kv_cache[0, layer_idx]
+    def on_forward_end(self, seqs: list[Sequence], is_prefill: bool):
+        super().on_forward_end(seqs, is_prefill)
+        if is_prefill or not seqs:
+            return
+        if not hasattr(self, "metadata_cache") or getattr(self, "kv_cache", None) is None:
+            return
 
-            valid = slot_mapping >= 0
-            safe_slots = slot_mapping.clamp_min(0)
-            page_slots = torch.div(safe_slots, self.page_size, rounding_mode="floor").to(torch.long)
-            page_offsets = torch.remainder(safe_slots, self.page_size)
-            completed = valid & (page_offsets == self.page_size - 1)
+        completed_rows: list[int] = []
+        completed_page_indices: list[int] = []
+        for seq in seqs:
+            row_idx = self.seq_id_to_row.get(seq.seq_id)
+            if row_idx is None:
+                continue
+            row_len = int(self.row_seq_lens[row_idx])
+            if row_len > 0 and row_len % self.page_size == 0:
+                completed_rows.append(int(row_idx))
+                completed_page_indices.append(row_len // self.page_size - 1)
+
+        if not completed_rows:
+            return
+
+        with profiler.record("quest_update_metadata_decode_pages"):
+            if self.enable_prefix_caching:
+                rows_gpu = torch.tensor(completed_rows, dtype=torch.long, device=self.device)
+                pages_gpu = torch.tensor(completed_page_indices, dtype=torch.long, device=self.device)
+                page_slots = self.buffer_req_to_page_slots[rows_gpu, pages_gpu].to(torch.long)
+            else:
+                page_slots_cpu = self.buffer_req_to_page_slots_cpu[
+                    np.asarray(completed_rows, dtype=np.int64),
+                    np.asarray(completed_page_indices, dtype=np.int64),
+                ]
+                page_slots = torch.from_numpy(page_slots_cpu.astype(np.int64, copy=False)).to(self.device)
+
+            if bool((page_slots < 0).any().item()):
+                raise RuntimeError(
+                    "QuEST decode completed a page with an invalid physical page slot: "
+                    f"rows={completed_rows}, page_indices={completed_page_indices}."
+                )
 
             page_token_indices = page_slots[:, None] * self.page_size + self.page_offsets_i64[None, :]
-            full_page_k = k_cache.index_select(0, page_token_indices.reshape(-1)).view(
-                slot_mapping.numel(),
-                self.page_size,
-                self.num_kv_heads,
-                self.head_dim,
-            )
-            page_max = full_page_k.amax(dim=1)
-            page_min = full_page_k.amin(dim=1)
-
-            max_src = torch.where(
-                completed[:, None, None],
-                page_max,
-                torch.full_like(page_max, -float("inf")),
-            )
-            min_src = torch.where(
-                completed[:, None, None],
-                page_min,
-                torch.full_like(page_min, float("inf")),
-            )
-            dst = page_slots[:, None, None].expand(-1, self.num_kv_heads, self.head_dim)
-            page_max_cache.scatter_reduce_(0, dst, max_src, reduce="amax", include_self=True)
-            page_min_cache.scatter_reduce_(0, dst, min_src, reduce="amin", include_self=True)
+            flat_page_token_indices = page_token_indices.reshape(-1)
+            for layer_idx in range(self.num_layers):
+                k_cache = self.kv_cache[0, layer_idx]
+                full_page_k = k_cache.index_select(0, flat_page_token_indices).view(
+                    len(completed_rows),
+                    self.page_size,
+                    self.num_kv_heads,
+                    self.head_dim,
+                )
+                page_min, page_max = torch.aminmax(full_page_k, dim=1)
+                self.metadata_cache[0, layer_idx].index_copy_(0, page_slots, page_max)
+                self.metadata_cache[1, layer_idx].index_copy_(0, page_slots, page_min)
 
     @staticmethod
     def _score_pages_batched(

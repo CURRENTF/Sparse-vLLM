@@ -315,7 +315,6 @@ class SparseController:
             return
 
         with profiler.record("pyramidkv_staging_materialize_layer"):
-            state = self.layer_batch_sparse_states[layer_idx]
             budget = self._get_layer_budget(layer_idx, is_prefill=True)
             if budget is None:
                 raise RuntimeError("PyramidKV full-prefill staging requires a layer budget.")
@@ -324,10 +323,10 @@ class SparseController:
             if seqs is None:
                 raise RuntimeError("PyramidKV full-prefill staging requires current seqs in context.")
             seq_keep_indices = []
-            for b_idx, seq in enumerate(seqs):
+            for seq in seqs:
                 if not seq.is_last_chunk_prefill:
                     raise RuntimeError("PyramidKV full-prefill staging should only run on the final prefill chunk.")
-                kv_len = int(state.context_lens[b_idx])
+                kv_len = int(seq.num_prefilled_tokens) + int(seq.current_chunk_size)
                 if kv_len <= budget:
                     keep_indices = torch.arange(kv_len, device=self.device, dtype=torch.long)
                 else:
@@ -562,14 +561,13 @@ class SparseController:
     @torch.no_grad()
     def _snapkv_prefill_eviction(self, seqs: list[Sequence]):
         for layer_idx in range(self.num_layers):
-            state = self.layer_batch_sparse_states[layer_idx]
             budget = self._get_layer_budget(layer_idx, is_prefill=True)
             if budget is None:
                 continue
-            for b_idx, seq in enumerate(seqs):
+            for seq in seqs:
                 if not seq.is_last_chunk_prefill:
                     continue
-                kv_len = int(state.context_lens[b_idx])
+                kv_len = int(seq.num_prefilled_tokens) + int(seq.current_chunk_size)
                 if kv_len <= budget:
                     continue
                 seq_scores = self.cache_manager.pop_prefill_attention_score(layer_idx, seq)
@@ -753,6 +751,7 @@ class SparseController:
                 tuple[tuple[int, ...], int],
                 tuple[list[Sequence], list[int], list[torch.Tensor]],
             ] = {}
+            kv_len_fn = getattr(self.cache_manager, "decode_kv_lens_for_layer", None)
             for layer_idx in range(self.num_layers):
                 state = self.layer_batch_sparse_states[layer_idx]
                 attn_scores = None
@@ -761,12 +760,15 @@ class SparseController:
                     if attn_scores is None:
                         continue
 
+                if kv_len_fn is not None:
+                    kv_lens = kv_len_fn(layer_idx, seqs)
+                else:
+                    kv_lens = [int(state.context_lens[b_idx]) for b_idx in range(len(seqs))]
                 triggered: list[tuple[int, Sequence, int]] = []
-                for b_idx, seq in enumerate(seqs):
-                    kv_len = int(state.context_lens[b_idx])
+                for b_idx, (seq, kv_len) in enumerate(zip(seqs, kv_lens)):
                     if kv_len <= budget or kv_len < trigger_len:
                         continue
-                    triggered.append((b_idx, seq, kv_len))
+                    triggered.append((b_idx, seq, int(kv_len)))
 
                 if not triggered:
                     continue

@@ -416,6 +416,8 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
 
     def _get_decode_static_index_buffers(self, graph_batch_size: int) -> tuple[torch.Tensor, torch.Tensor]:
         graph_batch_size = int(graph_batch_size)
+        if not hasattr(self, "_decode_static_index_buffers"):
+            self._decode_static_index_buffers = {}
         buffers = self._decode_static_index_buffers.get(graph_batch_size)
         if buffers is None:
             buffers = (
