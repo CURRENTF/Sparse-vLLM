@@ -462,47 +462,15 @@ for grade in data.get("grades", []):
 PY
 ```
 
-## Grade Meanings
+## Regression Rubrics
 
-The gate rules live in `benchmark/sparsevllm_regression/grading.py`.
+The executable gate rules live in `benchmark/sparsevllm_regression/grading.py`.
+The stable human-facing rubric lives in
+`benchmark/sparsevllm_regression/rubrics.md`.
 
-- Quality:
-  - A: sparse score loss `< 0.1` vs vanilla.
-  - B: loss `<= 0.5`.
-  - C: loss `<= 1.0`.
-  - D: loss `> 1.0`, missing score, or failed quality run.
-- Logits:
-  - A: all decode top-1 match, mean top-5 overlap `>= 0.8`, mean top-10 overlap
-    `>= 0.9`, and p99 diff is within threshold.
-  - B: top-1 match and mean top-5 overlap `>= 0.8`, but misses A.
-  - C: top-1 match, but misses B/A.
-  - D: top-1 mismatch, missing decode metrics, or run failure.
-  - N/A: no HF logits reference exists for that method.
-- Performance:
-  - A: decode speedup `>= 2.0` and required decode CUDA graph active.
-  - B: speedup `>= 1.5`.
-  - C: speedup `> 1.0`.
-  - D: speedup `<= 1.0`, run failure, or expected CUDA graph inactive.
-- Memory:
-  - A/B/C depend on positive observed saving and absolute error from expected
-    saving within `0.05/0.10/0.20`.
-  - D: missing accounting, non-positive saving, or error `> 0.20`.
-- Stress:
-  - A: completed, no crash, no preemptions, full admission window reached, and
-    utilization OK.
-  - B: completed with no preemptions, but not all A conditions met.
-  - C: completed with preemptions.
-  - D: crashed, stuck, failed rows, or did not finish.
-
-## Updating The Bug Matrix
-
-Use `benchmark/sparsevllm_regression/BUGS_20260613.md` for the current
-ABCD gate matrix and open blockers. When rerunning a subset, update only the
-affected model/method rows and record the new run IDs near the execution
-summary.
-
-For a new campaign date, create a new `BUGS_YYYYMMDD.md` instead of overwriting
-the old report.
+Update `benchmark/sparsevllm_regression/rubrics.md` only when stable ABCD
+rubric definitions change. Do not add dated campaign results, open blockers,
+run IDs, or remote log paths to the rubric file.
 
 ## Troubleshooting
 
@@ -518,7 +486,7 @@ the old report.
 - GPU memory failures:
   - Do not add fallback behavior inside the harness.
   - Record the exact run ID, model, method, layer, log path, and error in the
-    bug report.
+    campaign report or issue note.
 - A command exits early:
   - Inspect `<run_id>/grade_summary.json`; failed commands are recorded with
     `returncode`, `cmd`, and `log_path`.
