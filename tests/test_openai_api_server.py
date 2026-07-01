@@ -349,6 +349,77 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(payload["include_subtree"])
         self.assertEqual(payload["thread"], "sparsevllm-openai-dispatcher")
 
+    async def test_prefix_cache_match_accepts_chat_messages(self):
+        from sparsevllm.entrypoints.openai import api_server
+
+        class Tokenizer:
+            bos_token = None
+            chat_template = "template"
+
+            def apply_chat_template(self, chat, **_kwargs):
+                return "|".join(f"{item['role']}:{item['content']}" for item in chat)
+
+            def encode(self, text, add_special_tokens=False):
+                del add_special_tokens
+                return [ord(ch) for ch in text]
+
+        class Engine:
+            tokenizer = Tokenizer()
+            config = type("Config", (), {"vllm_sparse_method": ""})()
+
+            def prefix_cache_match(self, token_ids):
+                return {
+                    "token_ids": list(token_ids),
+                    "thread": threading.current_thread().name,
+                    "supported": True,
+                    "enabled": True,
+                }
+
+            def exit(self):
+                pass
+
+        app = api_server.create_app("/tmp/model", served_model_name="model", engine=Engine())
+        endpoint = next(route.endpoint for route in app.routes if getattr(route, "path", None) == "/v1/prefix_cache/match")
+        try:
+            response = await endpoint(
+                api_server.PrefixCacheMatchRequest(messages=[{"role": "user", "content": "hello"}])
+            )
+        finally:
+            app.state.dispatcher.close()
+
+        payload = json.loads(response.body)
+        self.assertEqual(payload["token_ids"], [ord(ch) for ch in "user:hello"])
+        self.assertEqual(payload["thread"], "sparsevllm-openai-dispatcher")
+
+    async def test_worker_info_and_load_routes(self):
+        from sparsevllm.entrypoints.openai import api_server
+
+        class Engine:
+            tokenizer = object()
+            config = type("Config", (), {"vllm_sparse_method": ""})()
+
+            def worker_info(self, served_model_name=None, tags=None):
+                return {"served_model_name": served_model_name, "tags": list(tags or [])}
+
+            def worker_load(self):
+                return {"active_requests": 3, "thread": threading.current_thread().name}
+
+            def exit(self):
+                pass
+
+        app = api_server.create_app("/tmp/model", served_model_name="model", engine=Engine())
+        info_endpoint = next(route.endpoint for route in app.routes if getattr(route, "path", None) == "/v1/worker/info")
+        load_endpoint = next(route.endpoint for route in app.routes if getattr(route, "path", None) == "/v1/worker/load")
+        try:
+            with patch.dict(os.environ, {"SPARSEVLLM_WORKER_TAGS": "dialog, omnikv"}):
+                info_response = info_endpoint()
+            load_response = await load_endpoint()
+        finally:
+            app.state.dispatcher.close()
+
+        self.assertEqual(json.loads(info_response.body), {"served_model_name": "model", "tags": ["dialog", "omnikv"]})
+        self.assertEqual(json.loads(load_response.body), {"active_requests": 3, "thread": "sparsevllm-openai-dispatcher"})
+
     async def test_prefix_cache_text_selector_tokenizes_server_side(self):
         from sparsevllm.entrypoints.openai import api_server
 

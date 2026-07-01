@@ -444,6 +444,12 @@ class LLMEngine:
             bool(include_subtree),
         )
 
+    def prefix_cache_match(self, token_ids: list[int]) -> dict[str, object]:
+        return self.model_runner.call(
+            "prefix_cache_match",
+            [int(token_id) for token_id in token_ids],
+        )
+
     def prefix_cache_delete_subtree(self, token_ids: list[int]) -> dict[str, object]:
         return self.model_runner.call(
             "prefix_cache_delete_subtree",
@@ -460,6 +466,41 @@ class LLMEngine:
             [int(token_id) for token_id in token_ids],
             int(priority),
         )
+
+    def worker_info(
+        self,
+        served_model_name: str | None = None,
+        tags: list[str] | None = None,
+    ) -> dict[str, object]:
+        config = self.config
+        return {
+            "served_model_name": served_model_name or str(config.model),
+            "model": str(config.model),
+            "model_type": str(getattr(config.hf_config, "model_type", "")),
+            "sparse_method": str(getattr(config, "vllm_sparse_method", "") or ""),
+            "tensor_parallel_size": int(getattr(config, "tensor_parallel_size", 1)),
+            "max_model_len": int(getattr(config, "max_model_len", 0) or 0),
+            "max_num_seqs_in_batch": int(getattr(config, "max_num_seqs_in_batch", 0) or 0),
+            "max_decoding_seqs": int(getattr(config, "max_decoding_seqs", 0) or 0),
+            "prefix_cache_enabled": bool(getattr(config, "enable_prefix_caching", False)),
+            "prefix_cache_block_size": getattr(config, "prefix_cache_block_size", None),
+            "tags": sorted(str(tag) for tag in (tags or []) if str(tag)),
+        }
+
+    def worker_load(self) -> dict[str, object]:
+        scheduler = self.scheduler
+        waiting = len(scheduler.waiting)
+        decoding = len(scheduler.decoding)
+        cache_stats = self.model_runner.cache_manager.free_slot_stats()
+        return {
+            "waiting_requests": int(waiting),
+            "decoding_requests": int(decoding),
+            "active_requests": int(waiting + decoding),
+            "total_preemptions": int(getattr(scheduler, "total_preemptions", 0)),
+            "max_num_seqs_in_batch": int(getattr(scheduler, "max_num_seqs_in_batch", 0)),
+            "max_decoding_seqs": int(getattr(scheduler, "max_decoding_seqs", 0)),
+            "cache": {str(key): int(value) for key, value in cache_stats.items() if isinstance(value, int)},
+        }
 
     def step(self):
         """

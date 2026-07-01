@@ -484,6 +484,17 @@ class CacheManager(ABC):
         del token_ids, include_subtree
         raise RuntimeError("prefix cache is not enabled or not supported by this cache manager.")
 
+    def prefix_cache_match(self, token_ids: list[int]) -> dict[str, object]:
+        del token_ids
+        return {
+            "supported": False,
+            "enabled": False,
+            "matched_tokens": 0,
+            "matched_blocks": 0,
+            "match_ratio": 0.0,
+            "reason": "prefix cache is not supported by this cache manager.",
+        }
+
     def prefix_cache_delete_subtree(self, token_ids: list[int]) -> dict[str, object]:
         del token_ids
         raise RuntimeError("prefix cache is not enabled or not supported by this cache manager.")

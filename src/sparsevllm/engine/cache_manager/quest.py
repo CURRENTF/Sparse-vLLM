@@ -256,6 +256,37 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
             include_subtree=include_subtree,
         )
 
+    def prefix_cache_match(self, token_ids: list[int]) -> dict[str, object]:
+        if getattr(self, "prefix_cache", None) is None:
+            return {
+                "supported": True,
+                "enabled": False,
+                "method": str(getattr(self.config, "vllm_sparse_method", "") or ""),
+                "matched_tokens": 0,
+                "matched_blocks": 0,
+                "match_ratio": 0.0,
+                "reason": "prefix cache is not enabled for this cache manager.",
+            }
+        token_ids = [int(token_id) for token_id in token_ids]
+        usable_tokens = usable_prefix_cache_tokens(len(token_ids), self.prefix_cache_block_size)
+        hit_len, hit_last_block_id, hit_blocks = self.prefix_cache.match_longest_prefix(
+            token_ids,
+            max_usable_tokens=usable_tokens,
+        )
+        return {
+            "supported": True,
+            "enabled": True,
+            "method": str(getattr(self.config, "vllm_sparse_method", "") or ""),
+            "block_size": int(self.prefix_cache_block_size),
+            "prompt_tokens": int(len(token_ids)),
+            "usable_tokens": int(usable_tokens),
+            "matched_tokens": int(hit_len),
+            "matched_blocks": int(hit_blocks),
+            "match_ratio": 0.0 if usable_tokens <= 0 else float(hit_len) / float(usable_tokens),
+            "last_block_id": None if hit_last_block_id is None else hit_last_block_id.hex(),
+            "live_blocks": int(len(self.prefix_cache)),
+        }
+
     def prefix_cache_delete_subtree(self, token_ids: list[int]) -> dict[str, object]:
         result = self._require_prefix_cache().safe_delete_subtree(
             [int(token_id) for token_id in token_ids],
