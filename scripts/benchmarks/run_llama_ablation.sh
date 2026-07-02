@@ -1,13 +1,19 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+MODEL_ROOT="${DELTAKV_MODEL_ROOT:-${REPO_ROOT}/models}"
+DATA_ROOT="${DELTAKV_DATA_DIR:-${REPO_ROOT}/data}"
+COMPRESSOR_ROOT="${DELTAKV_COMPRESSOR_ROOT:-${REPO_ROOT}/checkpoints/compressor}"
 
 # 执行一次 git pull
 echo "Updating code..."
-git pull
+git -C "${REPO_ROOT}" pull --ff-only
 
 # 基础路径和固定参数
-MODEL_PATH="/root/autodl-fs/models/Llama-3.1-8B-Instruct"
-DATASET_PATH="/root/autodl-fs/datasets/deltakv_llama3_train_num40000_seqlen8192"
-BASE_OUTPUT_DIR="/root/autodl-fs/checkpoints/compressor"
+MODEL_PATH="${MODEL_PATH:-${MODEL_ROOT}/Llama-3.1-8B-Instruct}"
+DATASET_PATH="${DATASET_PATH:-${DATA_ROOT}/deltakv_llama3_train_num40000_seqlen8192}"
+BASE_OUTPUT_DIR="${BASE_OUTPUT_DIR:-${COMPRESSOR_ROOT}}"
 BASE_WANDB_GROUP="llama_hyperparams_ablation_v1"
 
 # 默认（基准）值

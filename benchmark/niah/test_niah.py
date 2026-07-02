@@ -15,7 +15,7 @@ from transformers import AutoTokenizer
 from deltakv.get_chat_api import get_generate_api
 from benchmark.niah.gen_niah import generate_text
 
-BASE_PATH = os.environ.get("DELTAKV_OUTPUT_BASE", '/root/autodl-fs/deltakv_outputs')
+BASE_PATH = os.environ.get("DELTAKV_OUTPUT_BASE", os.path.join(os.getcwd(), "outputs", "niah"))
 
 
 def _load_or_generate_data(

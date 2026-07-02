@@ -8,6 +8,8 @@ import numpy as np
 import fire
 from tqdm import tqdm
 
+from deltakv.configs.default_paths import longbench_root, model_path as default_model_path
+
 
 def patch_model(model):
     # 这里的 raw_forward 已经是绑定到 model 实例的方法了
@@ -354,8 +356,8 @@ def vis_layer_similarity_matrix(
 
 
 def main(
-        model_path="../models/Llama-3-8B-Instruct-262k",
-        data_path="/autodl-fs/data/datasets/LongBench/data/hotpotqa.jsonl",
+        model_path=default_model_path("Llama-3-8B-Instruct-262k"),
+        data_path=f"{longbench_root()}/data/hotpotqa.jsonl",
         sample_num=50,
         max_new_tokens_generation=20
 ):

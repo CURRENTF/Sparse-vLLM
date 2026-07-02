@@ -2,12 +2,13 @@
 set -euo pipefail
 
 SESSION="${VIDEOMME_TMUX_SESSION:-videomme_download}"
-ROOT="${VIDEOMME_ROOT:-/data2/haojitai/datasets/Video-MME_hf}"
+project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+DATA_ROOT="${DELTAKV_DATA_DIR:-${project_dir}/data}"
+ROOT="${VIDEOMME_ROOT:-${DATA_ROOT}/Video-MME_hf}"
 LOG_DIR="${VIDEOMME_LOG_DIR:-${ROOT}/logs}"
 mkdir -p "${LOG_DIR}"
 
 log_path="${LOG_DIR}/download_videomme_full_tmux.log"
-project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 if tmux has-session -t "${SESSION}" 2>/dev/null; then
   echo "[error] tmux session already exists: ${SESSION}" >&2

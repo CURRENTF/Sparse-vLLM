@@ -35,9 +35,10 @@ from sparsevllm.method_registry import (
     is_tp_decode_cuda_graph_supported,
     normalize_sparse_method,
 )
+from deltakv.configs.default_paths import output_path
 
 
-DEFAULT_OUTPUT_ROOT = os.getenv("DELTAKV_OUTPUT_DIR", "/root/autodl-fs/deltakv_outputs")
+DEFAULT_OUTPUT_ROOT = os.getenv("DELTAKV_OUTPUT_DIR", output_path())
 
 
 class CommandExecutionError(RuntimeError):

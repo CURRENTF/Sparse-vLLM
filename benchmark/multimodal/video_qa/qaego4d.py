@@ -4,6 +4,7 @@ import csv
 import gc
 import hashlib
 import json
+import os
 import re
 import shutil
 import sys
@@ -17,6 +18,10 @@ from transformers import LlavaOnevisionProcessor
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+DEFAULT_MODEL_ROOT = Path(os.getenv("DELTAKV_MODEL_ROOT", PROJECT_ROOT / "models"))
+DEFAULT_DATA_ROOT = Path(os.getenv("DELTAKV_DATA_DIR", PROJECT_ROOT / "data"))
+DEFAULT_OUTPUT_ROOT = Path(os.getenv("DELTAKV_OUTPUT_DIR", PROJECT_ROOT / "outputs"))
 
 from benchmark.multimodal.model_adapters.llava_onevision import (
     batch_to_device,
@@ -37,12 +42,12 @@ def parse_args():
             "ReKV-style prompt, and accuracy."
         )
     )
-    parser.add_argument("--model_path", default="/data2/haojitai/models/llava-onevision-qwen2-7b-ov-hf")
+    parser.add_argument("--model_path", default=str(DEFAULT_MODEL_ROOT / "llava-onevision-qwen2-7b-ov-hf"))
     parser.add_argument("--deltakv_checkpoint_path", default="none")
-    parser.add_argument("--dataset_dir", default="/data2/haojitai/datasets/rekv_qaego4d")
+    parser.add_argument("--dataset_dir", default=str(DEFAULT_DATA_ROOT / "rekv_qaego4d"))
     parser.add_argument("--anno_path", default="")
     parser.add_argument("--video_dir", default="")
-    parser.add_argument("--output_dir", default="/data2/haojitai/datasets/llava_onevision_rekv_qaego4d")
+    parser.add_argument("--output_dir", default=str(DEFAULT_OUTPUT_ROOT / "deltakv_multimodal" / "rekv_qaego4d"))
     parser.add_argument("--methods", default="vanilla")
     parser.add_argument("--num_samples", type=int, default=32, help="Number of QA pairs to evaluate. Use -1 for all 500.")
     parser.add_argument("--sample_start", type=int, default=0)

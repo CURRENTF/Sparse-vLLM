@@ -28,39 +28,42 @@ SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
+DEFAULT_MODEL_ROOT = Path(os.getenv("DELTAKV_MODEL_ROOT", PROJECT_ROOT / "models"))
+DEFAULT_DATA_ROOT = Path(os.getenv("DELTAKV_DATA_DIR", PROJECT_ROOT / "data"))
+DEFAULT_OUTPUT_ROOT = Path(os.getenv("DELTAKV_OUTPUT_DIR", PROJECT_ROOT / "outputs"))
 
 BENCHMARKS = {
     "scienceqa_img": {
         "repo_id": "lmms-lab/ScienceQA-IMG",
-        "default_dir": "/data2/haojitai/datasets/ScienceQA-IMG_hf",
+        "default_dir": str(DEFAULT_DATA_ROOT / "ScienceQA-IMG_hf"),
         "default_split": "validation",
         "splits": {"train", "validation", "test"},
         "metric": "choice_accuracy",
     },
     "pope": {
         "repo_id": "lmms-lab/POPE",
-        "default_dir": "/data2/haojitai/datasets/POPE_hf",
+        "default_dir": str(DEFAULT_DATA_ROOT / "POPE_hf"),
         "default_split": "test",
         "splits": {"test"},
         "metric": "yes_no_accuracy",
     },
     "mmbench_en": {
         "repo_id": "lmms-lab/MMBench_EN",
-        "default_dir": "/data2/haojitai/datasets/MMBench_EN_hf",
+        "default_dir": str(DEFAULT_DATA_ROOT / "MMBench_EN_hf"),
         "default_split": "dev",
         "splits": {"dev", "test"},
         "metric": "choice_accuracy",
     },
     "mme": {
         "repo_id": "lmms-lab/MME",
-        "default_dir": "/data2/haojitai/datasets/MME_hf",
+        "default_dir": str(DEFAULT_DATA_ROOT / "MME_hf"),
         "default_split": "test",
         "splits": {"test"},
         "metric": "yes_no_accuracy",
     },
     "mmmu": {
         "repo_id": "lmms-lab/MMMU",
-        "default_dir": "/data2/haojitai/datasets/MMMU_hf",
+        "default_dir": str(DEFAULT_DATA_ROOT / "MMMU_hf"),
         "default_split": "validation",
         "splits": {"dev", "validation"},
         "metric": "mixed_accuracy",
@@ -77,7 +80,7 @@ def parse_args() -> argparse.Namespace:
         description="Small single-image benchmarks for LLaVA-OneVision: ScienceQA-IMG and POPE."
     )
     parser.add_argument("--benchmark", required=True, choices=sorted(BENCHMARKS))
-    parser.add_argument("--model_path", default="/data2/haojitai/models/llava-onevision-qwen2-7b-ov-hf")
+    parser.add_argument("--model_path", default=str(DEFAULT_MODEL_ROOT / "llava-onevision-qwen2-7b-ov-hf"))
     parser.add_argument(
         "--pact_official_repo_dir",
         default=str(PROJECT_ROOT / "baselines/PACT"),
@@ -154,7 +157,7 @@ def validate_args(args: argparse.Namespace) -> None:
     if not args.dataset_dir:
         args.dataset_dir = spec["default_dir"]
     if not args.output_dir:
-        args.output_dir = f"/data2/haojitai/outputs/deltakv_multimodal/{args.benchmark}"
+        args.output_dir = str(DEFAULT_OUTPUT_ROOT / "deltakv_multimodal" / args.benchmark)
     if args.split not in spec["splits"]:
         raise ValueError(f"{args.benchmark} split must be one of {sorted(spec['splits'])}, got {args.split!r}.")
     if args.num_samples < -1:

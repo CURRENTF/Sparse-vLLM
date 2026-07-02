@@ -19,14 +19,12 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 from benchmark.long_bench.pred import build_chat
 from deltakv.baseline_adapters import load_omnikv_model
+from deltakv.configs.default_paths import longbench_root, model_path, output_path
 
 
-DEFAULT_MODEL_PATH = "/data2/haojitai/models/Qwen2.5-7B-Instruct-1M"
-DEFAULT_LONGBENCH_ROOT = os.getenv(
-    "DELTAKV_LONGBENCH_DATA_DIR",
-    os.getenv("DELTAKV_DATA_DIR", "/data2/haojitai/datasets/LongBench"),
-)
-DEFAULT_OUTPUT_ROOT = "/data2/haojitai/outputs/deltakv/omnikv_full_layer_calibration"
+DEFAULT_MODEL_PATH = model_path("Qwen2.5-7B-Instruct-1M")
+DEFAULT_LONGBENCH_ROOT = longbench_root()
+DEFAULT_OUTPUT_ROOT = output_path("deltakv", "omnikv_full_layer_calibration")
 DEFAULT_CONFIG_DIR = "benchmark/long_bench/config"
 
 

@@ -15,10 +15,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from deltakv.configs.default_paths import compressor_path, model_path, output_path
 
-DEFAULT_MODEL_PATH = "/data2/haojitai/models/Qwen2.5-7B-Instruct-1M"
-DEFAULT_COMPRESSOR_PATH = "/data2/haojitai/checkpoints/compressor/Qwen2.5-7B-Instruct-1M-Compressor"
-DEFAULT_OUTPUT_ROOT = "/data2/haojitai/outputs/deltakv/sparsevllm_max_batch_throughput"
+DEFAULT_MODEL_PATH = model_path("Qwen2.5-7B-Instruct-1M")
+DEFAULT_COMPRESSOR_PATH = compressor_path("Qwen2.5-7B-Instruct-1M-Compressor")
+DEFAULT_OUTPUT_ROOT = output_path("deltakv", "sparsevllm_max_batch_throughput")
 DEFAULT_LENGTHS = "64000,128000,256000,512000,900000"
 DEFAULT_METHODS = "deltakv-less-memory-cudagraph,omnikv,snapkv,vanilla"
 DEFAULT_GPUS = "4,5,6,7"

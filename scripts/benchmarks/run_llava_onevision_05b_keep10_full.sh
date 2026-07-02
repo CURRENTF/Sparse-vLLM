@@ -1,15 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-cd /home/haojitai/projects/Sparse-vLLM
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "${REPO_ROOT}"
 
-export PYTHONPATH=/home/haojitai/projects/Sparse-vLLM/src:${PYTHONPATH:-}
+MODEL_ROOT="${DELTAKV_MODEL_ROOT:-${REPO_ROOT}/models}"
+DATA_ROOT="${DELTAKV_DATA_DIR:-${REPO_ROOT}/data}"
+PYTHON_BIN="${PYTHON:-python3}"
 
-/home/haojitai/miniconda3/envs/svllm/bin/python -u scripts/bench_llava_onevision_visual_prune.py \
-  --model_path /data2/haojitai/models/llava-onevision-qwen2-0.5b-ov-hf \
+export PYTHONPATH="${REPO_ROOT}/src:${PYTHONPATH:-}"
+
+"${PYTHON_BIN}" -u scripts/bench_llava_onevision_visual_prune.py \
+  --model_path "${MODEL_ROOT}/llava-onevision-qwen2-0.5b-ov-hf" \
   --deltakv_checkpoint_path none \
-  --dataset_dir /data2/haojitai/datasets/llava_onevision_visual_uniform_keep10_full \
-  --source_vqa_dir /data2/haojitai/datasets/VQAv2 \
+  --dataset_dir "${DATA_ROOT}/llava_onevision_visual_uniform_keep10_full" \
+  --source_vqa_dir "${DATA_ROOT}/VQAv2" \
   --num_samples -1 \
   --max_new_tokens 8 \
   --cuda_device 7 \

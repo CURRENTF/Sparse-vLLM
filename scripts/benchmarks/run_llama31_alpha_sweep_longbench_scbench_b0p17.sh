@@ -1,15 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-cd /home/haojitai/projects/Sparse-vLLM
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "${REPO_ROOT}"
 
 export CUDA_VISIBLE_DEVICES=4,5,6,7
-export DELTAKV_OUTPUT_DIR=/home/haojitai/outputs
-export DELTAKV_LONGBENCH_DATA_DIR=/home/haojitai/datasets/LongBench
-export PYTHONPATH=/home/haojitai/projects/Sparse-vLLM/src:${PYTHONPATH:-}
+export DELTAKV_OUTPUT_DIR="${DELTAKV_OUTPUT_DIR:-${REPO_ROOT}/outputs}"
+export DELTAKV_LONGBENCH_DATA_DIR="${DELTAKV_LONGBENCH_DATA_DIR:-${DELTAKV_DATA_DIR:-${REPO_ROOT}/data}/LongBench}"
+export PYTHONPATH="${REPO_ROOT}/src:${PYTHONPATH:-}"
 
-MODEL_PATH="/home/haojitai/models/Llama-3.1-8B-Instruct"
-DELTAKV_CHECKPOINT_PATH="/data2/haojitai/checkpoints/compressor/Llama-3.1-8B-Instruct-Compressor"
+MODEL_ROOT="${DELTAKV_MODEL_ROOT:-${REPO_ROOT}/models}"
+COMPRESSOR_ROOT="${DELTAKV_COMPRESSOR_ROOT:-${REPO_ROOT}/checkpoints/compressor}"
+MODEL_PATH="${MODEL_PATH:-${MODEL_ROOT}/Llama-3.1-8B-Instruct}"
+DELTAKV_CHECKPOINT_PATH="${DELTAKV_CHECKPOINT_PATH:-${COMPRESSOR_ROOT}/Llama-3.1-8B-Instruct-Compressor}"
+PYTHON_BIN="${PYTHON:-python3}"
 ALPHAS=("0.001" "0.02" "0.05" "0.1")
 SCBENCH_TASKS="scbench_kv,scbench_qa_eng,scbench_summary_with_needles,scbench_many_shot"
 
@@ -21,7 +25,7 @@ JSON
 )
 
   echo "[$(date '+%F %T')] alpha=${alpha} longbench start"
-  /home/haojitai/miniconda3/envs/svllm/bin/python -u benchmark/long_bench/pred.py \
+  "${PYTHON_BIN}" -u benchmark/long_bench/pred.py \
     --model "llama31-8b-hf-deltakv-longbench-b0p17-alpha${alpha_label}" \
     --model_path "${MODEL_PATH}" \
     --deltakv_checkpoint_path "${DELTAKV_CHECKPOINT_PATH}" \
@@ -36,10 +40,10 @@ JSON
   echo "[$(date '+%F %T')] alpha=${alpha} longbench done"
 
   echo "[$(date '+%F %T')] alpha=${alpha} scbench start"
-  /home/haojitai/miniconda3/envs/svllm/bin/python -u benchmark/scbench/run_scbench.py \
+  "${PYTHON_BIN}" -u benchmark/scbench/run_scbench.py \
     --task "${SCBENCH_TASKS}" \
     --model_name_or_path "${MODEL_PATH}" \
-    --output_dir "/home/haojitai/outputs/benchmark/scbench_alpha_llama/llama31-8b-scbench-merged-b0p17-alpha${alpha_label}" \
+    --output_dir "${DELTAKV_OUTPUT_DIR}/benchmark/scbench_alpha_llama/llama31-8b-scbench-merged-b0p17-alpha${alpha_label}" \
     --attn_type deltakv \
     --kv_type dense \
     --use_chat_template \

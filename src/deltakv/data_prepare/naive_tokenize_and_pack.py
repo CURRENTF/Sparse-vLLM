@@ -9,6 +9,8 @@ import logging
 from multiprocessing import Pool
 from typing import Iterator, List
 
+from deltakv.configs.default_paths import dataset_path as default_dataset_path
+
 # 设置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -75,7 +77,7 @@ class Processor:
     def process_and_save(self,
                          dataset_name: str = 'HuggingFaceFW/fineweb-edu',
                          # dataset_sub_name: str = 'sample-10BT',
-                         output_dir: str = '/root/autodl-fs/datasets/fineweb-edu-tokenized',
+                         output_dir: str = default_dataset_path("fineweb-edu-tokenized"),
                          max_seq_len: int = 2048,
                          num_proc: int = 8,
                          text_batch_size: int = 1000):

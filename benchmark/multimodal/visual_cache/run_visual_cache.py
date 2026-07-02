@@ -23,6 +23,10 @@ from deltakv.modeling.llava_ov.llava_onevision_deltakv import (
     load_deltakv_compressor_into_llava,
 )
 
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+DEFAULT_MODEL_ROOT = Path(os.getenv("DELTAKV_MODEL_ROOT", PROJECT_ROOT / "models"))
+DEFAULT_DATA_ROOT = Path(os.getenv("DELTAKV_DATA_DIR", PROJECT_ROOT / "data"))
+
 
 CUSTOM_CONFIG_KEYS = {
     "kv_compressed_size",
@@ -91,7 +95,7 @@ def parse_args():
             "no-checkpoint visual-token uniform-pruning baseline."
         )
     )
-    parser.add_argument("--model_path", default="/data2/haojitai/models/llava-onevision-qwen2-7b-ov-hf")
+    parser.add_argument("--model_path", default=str(DEFAULT_MODEL_ROOT / "llava-onevision-qwen2-7b-ov-hf"))
     parser.add_argument(
         "--deltakv_checkpoint_path",
         default="none",
@@ -101,8 +105,8 @@ def parse_args():
             "method deltakv."
         ),
     )
-    parser.add_argument("--dataset_dir", default="/data2/haojitai/datasets/llava_onevision_visual_prune_bench")
-    parser.add_argument("--source_vqa_dir", default="/data2/haojitai/datasets/VQAv2")
+    parser.add_argument("--dataset_dir", default=str(DEFAULT_DATA_ROOT / "llava_onevision_visual_prune_bench"))
+    parser.add_argument("--source_vqa_dir", default=str(DEFAULT_DATA_ROOT / "VQAv2"))
     parser.add_argument(
         "--output_dir",
         default="",

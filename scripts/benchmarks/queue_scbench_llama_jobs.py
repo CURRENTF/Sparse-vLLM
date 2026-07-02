@@ -13,26 +13,31 @@ from typing import Any
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-PYTHON = "/home/haojitai/miniconda3/envs/svllm/bin/python"
+MODEL_ROOT = Path(os.getenv("DELTAKV_MODEL_ROOT", REPO_ROOT / "models"))
+DATA_ROOT = Path(os.getenv("DELTAKV_DATA_DIR", REPO_ROOT / "data"))
+COMPRESSOR_ROOT = Path(os.getenv("DELTAKV_COMPRESSOR_ROOT", REPO_ROOT / "checkpoints" / "compressor"))
+PYTHON = os.getenv("PYTHON", "python3")
 
-QWEN_MODEL_PATH = "/home/haojitai/models/Qwen2.5-7B-Instruct-1M"
+QWEN_MODEL_PATH = str(MODEL_ROOT / "Qwen2.5-7B-Instruct-1M")
 QWEN_TOKENIZER_PATH = QWEN_MODEL_PATH
 QWEN_DELTAKV_CHECKPOINT_PATH = (
-    "/home/haojitai/checkpoints/compressor/"
+    str(COMPRESSOR_ROOT)
+    + "/"
     "cluster_e2e_cs256_biasFalse_l2_ratio0.1_clusMean_before_rope_lr0.0002_"
     "cdownmlp_swiglud3072_cuplinear_0125_222950"
 )
-LONG_BENCH_DATA_ROOT = "/home/haojitai/datasets/LongBench"
+LONG_BENCH_DATA_ROOT = os.getenv("DELTAKV_LONGBENCH_DATA_DIR", str(DATA_ROOT / "LongBench"))
 
-LLAMA_MODEL_PATH = "/home/haojitai/models/Llama-3.1-8B-Instruct"
+LLAMA_MODEL_PATH = str(MODEL_ROOT / "Llama-3.1-8B-Instruct")
 LLAMA_DELTAKV_CHECKPOINT_PATH = (
-    "/home/haojitai/checkpoints/compressor/"
+    str(COMPRESSOR_ROOT)
+    + "/"
     "cluster_e2e_cs512_biasFalse_l2_ratio0.1_clusMean_before_rope_lr0.0002_"
     "cdownmlp_swiglud3072_cuplinear_0125_051527"
 )
 
-SCBENCH_PREPROCESSED_ROOT = "/home/haojitai/datasets/SCBench-preprocessed"
-OUTPUT_ROOT = Path("/home/haojitai/outputs")
+SCBENCH_PREPROCESSED_ROOT = str(DATA_ROOT / "SCBench-preprocessed")
+OUTPUT_ROOT = Path(os.getenv("DELTAKV_OUTPUT_DIR", REPO_ROOT / "outputs"))
 
 FIXED_GPU_IDS = [4, 5, 6, 7]
 FIXED_VISIBLE_GPUS = ",".join(str(gpu) for gpu in FIXED_GPU_IDS)

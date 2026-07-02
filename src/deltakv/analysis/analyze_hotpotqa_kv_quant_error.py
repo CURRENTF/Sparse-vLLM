@@ -18,6 +18,7 @@ from tqdm import tqdm
 from transformers import AutoConfig, AutoTokenizer
 
 from benchmark.long_bench.pred import build_chat
+from deltakv.configs.default_paths import longbench_root, model_path, output_path
 from deltakv.get_chat_api import get_generate_api
 from deltakv.modeling.cache_pipeline import ClusterCachePipeline
 
@@ -603,9 +604,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "current HF cache implementation and hyperparameters."
         )
     )
-    parser.add_argument("--model_path", default="/data2/haojitai/models/Qwen2.5-7B-Instruct-1M")
+    parser.add_argument("--model_path", default=model_path("Qwen2.5-7B-Instruct-1M"))
     parser.add_argument("--tokenizer_path", default=None)
-    parser.add_argument("--data_root", default=os.getenv("DELTAKV_LONGBENCH_DATA_DIR", "/data2/haojitai/datasets/LongBench"))
+    parser.add_argument("--data_root", default=longbench_root())
     parser.add_argument("--hyper_param", default=None, help="Optional JSON file or JSON string overriding current defaults.")
     parser.add_argument("--output_path", default=None)
     parser.add_argument("--analysis_mode", choices=["deltakv", "kivi", "both"], default="deltakv")
@@ -714,8 +715,7 @@ def main() -> None:
     }
 
     if args.output_path is None:
-        output_dir = Path(os.getenv("DELTAKV_OUTPUT_DIR", "/data2/haojitai/outputs/deltakv"))
-        output_dir = output_dir / "analysis"
+        output_dir = Path(output_path("deltakv", "analysis"))
         output_dir.mkdir(parents=True, exist_ok=True)
         output_path = output_dir / "hotpotqa_kv_quant_error.json"
     else:

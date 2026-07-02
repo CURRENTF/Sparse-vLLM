@@ -17,6 +17,7 @@ import torch.multiprocessing as mp
 from transformers import AutoTokenizer
 
 from deltakv.configs.runtime_params import normalize_runtime_params
+from deltakv.configs.default_paths import compressor_path, model_path, output_path
 from deltakv.get_chat_api import get_generate_api
 from benchmark.long_bench.pred import build_chat
 from sparsevllm.config import Config
@@ -31,9 +32,9 @@ from sparsevllm.sampling_params import SamplingParams
 from sparsevllm.utils.context import get_context, reset_context
 
 
-DEFAULT_MODEL = "/data2/haojitai/models/Qwen2.5-7B-Instruct-1M"
-DEFAULT_COMPRESSOR = "/data2/haojitai/checkpoints/compressor/Qwen2.5-7B-Instruct-1M-Compressor"
-DEFAULT_OUTPUT_ROOT = "/data2/haojitai/outputs/sparsevllm_logits_align"
+DEFAULT_MODEL = model_path("Qwen2.5-7B-Instruct-1M")
+DEFAULT_COMPRESSOR = compressor_path("Qwen2.5-7B-Instruct-1M-Compressor")
+DEFAULT_OUTPUT_ROOT = output_path("sparsevllm_logits_align")
 
 DIRECT_HF_METHODS = {
     "vanilla",

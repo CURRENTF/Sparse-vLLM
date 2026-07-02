@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import os
 from pathlib import Path
 
 
-DEFAULT_OUTPUT_DIR = Path("/data2/haojitai/datasets/llava_onevision_streamingbench_livevlm_table4_7b_vanilla")
-DEFAULT_EXPECTED_MODEL_PATH = Path("/data2/haojitai/models/llava-onevision-qwen2-7b-ov-hf")
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+DEFAULT_MODEL_ROOT = Path(os.getenv("DELTAKV_MODEL_ROOT", PROJECT_ROOT / "models"))
+DEFAULT_OUTPUT_ROOT = Path(os.getenv("DELTAKV_OUTPUT_DIR", PROJECT_ROOT / "outputs"))
+
+DEFAULT_OUTPUT_DIR = DEFAULT_OUTPUT_ROOT / "deltakv_multimodal" / "streamingbench_livevlm_table4_7b_vanilla"
+DEFAULT_EXPECTED_MODEL_PATH = DEFAULT_MODEL_ROOT / "llava-onevision-qwen2-7b-ov-hf"
 VALID_SAMPLE_STATUSES = {
     "success",
     "invalid_input",

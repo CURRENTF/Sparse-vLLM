@@ -1,12 +1,16 @@
 import os
 import torch
 import argparse
+from pathlib import Path
 from sparsevllm import LLM, SamplingParams
 from transformers import AutoTokenizer
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_MODEL_ROOT = Path(os.getenv("DELTAKV_MODEL_ROOT", PROJECT_ROOT / "models"))
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_path", type=str, default="/root/autodl-fs/models/Qwen3-0.6B")
+    parser.add_argument("--model_path", type=str, default=str(DEFAULT_MODEL_ROOT / "Qwen3-0.6B"))
     parser.add_argument("--tp", type=int, default=1)
     parser.add_argument("--sparse_method", type=str, default="vanilla")
     parser.add_argument("--no_tqdm", action="store_true")
@@ -14,12 +18,7 @@ def main():
     
     path = args.model_path
     if not os.path.exists(path):
-        # 兜底逻辑
-        alt_path = "/root/autodl-fs/models/Qwen3-0.6B"
-        if os.path.exists(alt_path):
-            path = alt_path
-        else:
-            raise FileNotFoundError(f"Model path {path} not found.")
+        raise FileNotFoundError(f"Model path {path} not found.")
     
     print(f"Loading model from: {path}")
     tokenizer = AutoTokenizer.from_pretrained(path)

@@ -14,6 +14,7 @@ from deltakv.analysis.colors import (
     COLOR_NEUTRAL, COLOR_GRID, COLOR_BLACK, 
     TEXT_HIGHLIGHT_1, TEXT_HIGHLIGHT_2
 )
+from deltakv.configs.default_paths import longbench_root, output_path
 
 # Set style for academic plotting
 plt.style.use('seaborn-v0_8-paper')
@@ -94,10 +95,10 @@ def parse_alpha_values(alpha_values):
 
 
 def resolve_data_path(data_path):
+    default_data_path = os.path.join(longbench_root(), "data", "narrativeqa.jsonl")
     candidates = [
         data_path,
-        "/home/haojitai/datasets/LongBench/data/narrativeqa.jsonl",
-        "/root/autodl-fs/datasets/LongBench/data/narrativeqa.jsonl",
+        default_data_path,
     ]
     for candidate in candidates:
         if candidate and os.path.exists(candidate):
@@ -428,7 +429,7 @@ def load_data(data_path, sample_num=1):
 
 def run_experiment(
     model_path="Qwen/Qwen2.5-0.5B-Instruct",
-    output_dir="/root/autodl-fs/visuals/insight_experiments",
+    output_dir=output_path("visuals", "insight_experiments"),
     data_path=None,
     seq_len=2048,
     sample_num=20,

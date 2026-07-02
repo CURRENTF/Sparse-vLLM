@@ -9,6 +9,8 @@ import fire
 from tqdm import tqdm
 import torch.nn.functional as F
 
+from deltakv.configs.default_paths import longbench_root
+
 # 用于存储抓取到的 QKV 状态
 class QKVCollector:
     def __init__(self):
@@ -77,7 +79,7 @@ def calculate_cosine_sim_matrix(tensor):
 
 def main(
     model_path,
-    data_path="/root/autodl-fs/datasets/LongBench/data/hotpotqa.jsonl",
+    data_path=f"{longbench_root()}/data/hotpotqa.jsonl",
     sample_num=50,
     max_seq_len=1024,
     ks=[16, 32, 64],
@@ -95,8 +97,7 @@ def main(
                     d = json.loads(line.strip())
                     data_samples.append(f"Context: {d['context']}\nQuestion: {d['input']}\n")
         else:
-            print(f"Data path {data_path} not found, using dummy data.")
-            data_samples = ["Dummy text for analysis. " * 100] * sample_num
+            raise FileNotFoundError(f"Data path not found: {data_path}")
     except Exception as e:
         print(f"Error loading data: {e}")
         return

@@ -15,18 +15,19 @@ from deltakv.analysis.colors import (
     TEXT_HIGHLIGHT_1,
     TEXT_HIGHLIGHT_2,
 )
+from deltakv.configs.default_paths import model_path, output_path
 
 # --- 配置 ---
 PROJECT = "ReKV"
 GROUP = "llama_hyperparams_ablation_v1"
-OUTPUT_JSON = "/root/autodl-fs/deltakv_outputs/ablation_results.json"
-VISUALS_DIR = "/root/autodl-fs/visuals/"
-BENCH_LOG = "/root/autodl-fs/deltakv_outputs/ablation_decode_tp.log"
+OUTPUT_JSON = output_path("deltakv_outputs", "ablation_results.json")
+VISUALS_DIR = output_path("visuals")
+BENCH_LOG = output_path("deltakv_outputs", "ablation_decode_tp.log")
 METRIC = "train/ntp_loss"
 ORIGINAL_BASELINE = 2.335
 
 # 默认测试模型和参数
-DEFAULT_MODEL = "/root/autodl-fs/models/Llama-3.1-8B-Instruct-Qwen-ver"
+DEFAULT_MODEL = model_path("Llama-3.1-8B-Instruct-Qwen-ver")
 DEFAULT_LENGTH = 120000
 DEFAULT_BS = 8
 

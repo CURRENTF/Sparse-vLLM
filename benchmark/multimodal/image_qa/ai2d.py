@@ -26,6 +26,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+DEFAULT_MODEL_ROOT = Path(os.getenv("DELTAKV_MODEL_ROOT", PROJECT_ROOT / "models"))
+DEFAULT_DATA_ROOT = Path(os.getenv("DELTAKV_DATA_DIR", PROJECT_ROOT / "data"))
+DEFAULT_OUTPUT_ROOT = Path(os.getenv("DELTAKV_OUTPUT_DIR", PROJECT_ROOT / "outputs"))
+DEFAULT_HF_CACHE = Path(os.getenv("HF_HOME", PROJECT_ROOT / ".hf_cache"))
+
 
 PAPER_AI2D_TARGETS = {
     "llava-onevision-qwen2-0.5b-ov-hf": 57.1,
@@ -40,12 +45,12 @@ def parse_args() -> argparse.Namespace:
             "prompt format used by the LLaVA-OneVision paper."
         )
     )
-    parser.add_argument("--model_path", default="/data2/haojitai/models/llava-onevision-qwen2-0.5b-ov-hf")
+    parser.add_argument("--model_path", default=str(DEFAULT_MODEL_ROOT / "llava-onevision-qwen2-0.5b-ov-hf"))
     parser.add_argument("--deltakv_checkpoint_path", default="none")
     parser.add_argument("--dataset_path", default="lmms-lab/ai2d")
-    parser.add_argument("--dataset_dir", default="/data2/haojitai/datasets/lmms-lab_ai2d")
-    parser.add_argument("--dataset_cache_dir", default="/data2/haojitai/datasets/hf_cache")
-    parser.add_argument("--output_dir", default="/data2/haojitai/outputs/deltakv_multimodal/ai2d")
+    parser.add_argument("--dataset_dir", default=str(DEFAULT_DATA_ROOT / "lmms-lab_ai2d"))
+    parser.add_argument("--dataset_cache_dir", default=str(DEFAULT_HF_CACHE / "datasets"))
+    parser.add_argument("--output_dir", default=str(DEFAULT_OUTPUT_ROOT / "deltakv_multimodal" / "ai2d"))
     parser.add_argument("--methods", default="vanilla", help="Comma-separated: vanilla,deltakv.")
     parser.add_argument("--num_samples", type=int, default=32, help="Use -1 for the full AI2D test split.")
     parser.add_argument("--sample_start", type=int, default=0)
