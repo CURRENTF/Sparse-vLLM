@@ -12,6 +12,7 @@ from sparsevllm.triton_kernel.quant import (
     triton_quantize_and_pack_along_last_dim,
     unpack_quantized_to_16bit,
 )
+from sparsevllm.triton_kernel.deltakv_kernels import deltakv_materialize_sparse_view
 from sparsevllm.layers.rotary_embedding import apply_rotary_emb
 from sparsevllm.utils.compressor import create_compressor
 from sparsevllm.utils.context import get_context
@@ -1336,22 +1337,42 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         if total == 0:
             return k_out, v_out, local_active_slots, local_req, context_lens
 
-        flat_slots = active_slots.reshape(-1).to(torch.long).clamp_min(0)
         l_idx = self.deltakv_layer_to_idx[layer_idx]
-        raw_k = self.deltakv_full_kv_cache[0, l_idx, flat_slots]
-        raw_v = self.deltakv_full_kv_cache[1, l_idx, flat_slots]
-        pos = self.deltakv_slot_to_pos[flat_slots].to(torch.long).clamp_min(0)
-        k_normed = self._apply_sparse_k_norm_if_needed(l_idx, raw_k)
-
-        from sparsevllm.layers.rotary_embedding import apply_rotary_emb
-
-        cos_sin = self.cos_sin_cache[pos]
-        cos, sin = cos_sin.chunk(2, dim=-1)
-        k_postrope = apply_rotary_emb(k_normed, cos, sin)
-        already_postrope = self._already_postrope_mask(layer_idx, flat_slots)
-        k_postrope = torch.where(already_postrope.view(-1, 1, 1), raw_k, k_postrope)
-        k_out.copy_(k_postrope.to(k_out.dtype))
-        v_out.copy_(raw_v.to(v_out.dtype))
+        with profiler.record("deltakv_materialize_sparse_view"):
+            if active_slots.is_cuda:
+                k_norm_weight = getattr(self, "deltakv_k_norm_weight", None)
+                if k_norm_weight is not None:
+                    k_norm_weight = k_norm_weight[int(l_idx)]
+                postrope_mask = getattr(self, "_deltakv_postrope_slot_mask", None)
+                if postrope_mask is not None:
+                    postrope_mask = postrope_mask[int(l_idx)]
+                deltakv_materialize_sparse_view(
+                    active_slots=active_slots,
+                    context_lens=context_lens,
+                    slot_to_pos=self.deltakv_slot_to_pos,
+                    postrope_mask=postrope_mask,
+                    k_cache=self.deltakv_full_kv_cache[0, l_idx],
+                    v_cache=self.deltakv_full_kv_cache[1, l_idx],
+                    out_k=k_out,
+                    out_v=v_out,
+                    cos_sin=self.cos_sin_cache,
+                    k_norm_weight=k_norm_weight,
+                    k_norm_eps=float(getattr(self, "deltakv_k_norm_eps", 1e-6) or 1e-6),
+                    block_tokens=int(getattr(self.config, "deltakv_triton_materialize_block_tokens", 16) or 16),
+                )
+            else:
+                flat_slots = active_slots.reshape(-1).to(torch.long).clamp_min(0)
+                raw_k = self.deltakv_full_kv_cache[0, l_idx, flat_slots]
+                raw_v = self.deltakv_full_kv_cache[1, l_idx, flat_slots]
+                pos = self.deltakv_slot_to_pos[flat_slots].to(torch.long).clamp_min(0)
+                k_normed = self._apply_sparse_k_norm_if_needed(l_idx, raw_k)
+                cos_sin = self.cos_sin_cache[pos]
+                cos, sin = cos_sin.chunk(2, dim=-1)
+                k_postrope = apply_rotary_emb(k_normed, cos, sin)
+                already_postrope = self._already_postrope_mask(layer_idx, flat_slots)
+                k_postrope = torch.where(already_postrope.view(-1, 1, 1), raw_k, k_postrope)
+                k_out.copy_(k_postrope.to(k_out.dtype))
+                v_out.copy_(raw_v.to(v_out.dtype))
         return k_out, v_out, local_active_slots, local_req, context_lens
 
     def _full_layer_base_cluster_step(self) -> int:
@@ -2580,13 +2601,20 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
                     "num_stages": int(getattr(self.config, "full_layer_kivi_decode_num_stages", 3) or 3),
                 },
             )
-        return super().build_decode_compute_view(
+        view = super().build_decode_compute_view(
             layer_idx,
             q,
             selection,
             num_heads=num_heads,
             num_kv_heads=num_kv_heads,
         )
+        if (
+            layer_idx in self.deltakv_layer_to_idx
+            and not self.has_prefill_staging_view(layer_idx)
+            and getattr(self.config, "deltakv_sparse_decode_backend", "custom") == "fa2"
+        ):
+            view.backend = "flash_attn_contiguous"
+        return view
 
     def get_layer_compute_tensors(self, layer_idx: int, selection: SparseSelection | None = None):
         del selection

@@ -382,6 +382,15 @@ class PrefillPolicyConfigTest(unittest.TestCase):
             with patch("sparsevllm.config.AutoConfig.from_pretrained", return_value=self.hf_config()):
                 return Config(model=str(model_dir), **kwargs)
 
+    def test_obs_layers_are_derived_from_full_attention_layers(self):
+        cfg = self.make_config(vllm_sparse_method="vanilla", full_attn_layers="0,1,3")
+        self.assertEqual(cfg.full_attn_layers, [0, 1, 3])
+        self.assertEqual(cfg.obs_layer_ids, [1, 3])
+
+    def test_obs_layer_ids_is_not_a_config_argument(self):
+        with self.assertRaisesRegex(TypeError, "obs_layer_ids"):
+            Config(model="/tmp/unused", obs_layer_ids=[0])
+
     def test_auto_and_empty_policy_resolve_from_registry(self):
         cfg = self.make_config(vllm_sparse_method="vanilla", prefill_schedule_policy=PREFILL_POLICY_AUTO)
         self.assertEqual(cfg.vllm_sparse_method, "")
@@ -446,6 +455,67 @@ class PrefillPolicyConfigTest(unittest.TestCase):
             enable_full_layer_kivi_dense_decode=True,
         )
         self.assertTrue(cfg.enable_full_layer_kivi_dense_decode)
+
+    def test_deltakv_allows_dense_full_layers_with_int4_sparse_latents(self):
+        cfg = self.make_config(
+            vllm_sparse_method="deltakv-less-memory",
+            allow_missing_deltakv_path=True,
+            full_layer_kv_quant_bits=0,
+            kv_quant_bits=4,
+            enable_full_layer_kivi_quant=False,
+        )
+        self.assertEqual(cfg.full_layer_kv_quant_bits, 0)
+        self.assertEqual(cfg.kv_quant_bits, 4)
+
+    def test_deltakv_sparse_decode_backend_auto_uses_custom_without_flash_attn(self):
+        with patch("sparsevllm.config._flash_attn_available", return_value=False):
+            cfg = self.make_config(
+                vllm_sparse_method="deltakv-less-memory",
+                allow_missing_deltakv_path=True,
+                kv_quant_bits=0,
+            )
+
+        self.assertEqual(cfg.deltakv_sparse_decode_backend, "custom")
+
+    def test_deltakv_sparse_decode_backend_auto_uses_fa2_when_available(self):
+        with patch("sparsevllm.config._flash_attn_available", return_value=True):
+            cfg = self.make_config(
+                vllm_sparse_method="deltakv-less-memory",
+                allow_missing_deltakv_path=True,
+                kv_quant_bits=0,
+            )
+
+        self.assertEqual(cfg.deltakv_sparse_decode_backend, "fa2")
+
+    def test_deltakv_sparse_decode_backend_explicit_custom_does_not_require_flash_attn(self):
+        with patch("sparsevllm.config._flash_attn_available", return_value=False):
+            cfg = self.make_config(
+                vllm_sparse_method="deltakv-less-memory",
+                allow_missing_deltakv_path=True,
+                kv_quant_bits=0,
+                deltakv_sparse_decode_backend="custom",
+            )
+
+        self.assertEqual(cfg.deltakv_sparse_decode_backend, "custom")
+
+    def test_deltakv_sparse_decode_backend_explicit_fa2_requires_flash_attn(self):
+        with patch("sparsevllm.config._flash_attn_available", return_value=False):
+            with self.assertRaisesRegex(ValueError, "requires the flash_attn package"):
+                self.make_config(
+                    vllm_sparse_method="deltakv-less-memory",
+                    allow_missing_deltakv_path=True,
+                    kv_quant_bits=0,
+                    deltakv_sparse_decode_backend="fa2",
+                )
+
+    def test_deltakv_sparse_decode_backend_rejects_unknown_value(self):
+        with self.assertRaisesRegex(ValueError, "deltakv_sparse_decode_backend"):
+            self.make_config(
+                vllm_sparse_method="deltakv-less-memory",
+                allow_missing_deltakv_path=True,
+                kv_quant_bits=0,
+                deltakv_sparse_decode_backend="flash",
+            )
 
     def test_decode_cuda_graph_supports_non_deltakv_methods(self):
         for method in (
@@ -1466,6 +1536,53 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
 
 
 class DeltaKVFullPrefillStagingTest(unittest.TestCase):
+    def test_deltakv_sparse_decode_backend_controls_fa2_view(self):
+        from sparsevllm.engine.cache_manager import DecodeComputeView
+        from sparsevllm.engine.cache_manager.deltakv_base import DeltaKVCacheTritonManagerV4
+        from sparsevllm.engine.cache_manager.deltakv_less_memory import DeltaKVLessMemoryCacheManager
+
+        q = torch.empty((1, 1, 4), dtype=torch.float32)
+        selection = SimpleNamespace(
+            req_indices=torch.tensor([0], dtype=torch.int32),
+            context_lens=torch.tensor([2], dtype=torch.int32),
+            attn_score=None,
+            max_context_len=2,
+        )
+
+        cases = (
+            ("fa2", False, "flash_attn_contiguous"),
+            ("custom", False, "dense"),
+            ("fa2", True, "dense"),
+        )
+        for backend, staging_active, expected in cases:
+            with self.subTest(backend=backend, staging_active=staging_active):
+                manager = object.__new__(DeltaKVLessMemoryCacheManager)
+                manager.config = SimpleNamespace(deltakv_sparse_decode_backend=backend)
+                manager.full_layer_to_idx = {}
+                manager._full_layer_kivi_enabled = lambda: False
+                manager.deltakv_layer_to_idx = {1: 0}
+                manager.has_prefill_staging_view = lambda layer_idx, active=staging_active: active
+                view = DecodeComputeView(
+                    k_cache=torch.empty((2, 1, 4), dtype=torch.float32),
+                    v_cache=torch.empty((2, 1, 4), dtype=torch.float32),
+                    active_slots=torch.tensor([[0, 1]], dtype=torch.int32),
+                    req_indices=selection.req_indices,
+                    context_lens=selection.context_lens,
+                    backend="dense",
+                )
+
+                with patch.object(DeltaKVCacheTritonManagerV4, "build_decode_compute_view", return_value=view):
+                    out = DeltaKVLessMemoryCacheManager.build_decode_compute_view(
+                        manager,
+                        1,
+                        q,
+                        selection,
+                        num_heads=1,
+                        num_kv_heads=1,
+                    )
+
+                self.assertEqual(out.backend, expected)
+
     def test_static_decode_resets_deltakv_view_cache_before_validation(self):
         manager = object.__new__(DeltaKVCacheManager)
         manager._deltakv_view_cache_key = (1, 1, 2, 1, 4)

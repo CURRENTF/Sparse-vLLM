@@ -14,6 +14,7 @@ from sparsevllm.triton_kernel.gqa_flash_decoding_stage1_hd256 import flash_decod
 from sparsevllm.triton_kernel.gqa_flash_decoding_stage1_hd256 import (
     flash_decode_stage1_with_score as gqa_flash_decode_stage1_hd256_with_score,
 )
+from sparsevllm.utils.profiler import profiler
 
 
 class TritonAttentionBackend:
@@ -70,99 +71,126 @@ class TritonAttentionBackend:
             o = torch.empty_like(q)
             flash_decode_stage2(mid_o, mid_o_logexpsum, view.context_lens, o, block_seq)
             return o
+        if view.backend == "flash_attn_contiguous":
+            from flash_attn import flash_attn_with_kvcache
+
+            if view.active_slots.dim() != 2:
+                raise RuntimeError("flash_attn_contiguous decode expects a 2D active slot table.")
+            batch, width = int(view.active_slots.shape[0]), int(view.active_slots.shape[1])
+            expected = batch * width
+            if int(view.k_cache.shape[0]) < expected or int(view.v_cache.shape[0]) < expected:
+                raise RuntimeError(
+                    "flash_attn_contiguous decode got a cache smaller than the materialized active view: "
+                    f"cache={int(view.k_cache.shape[0])}/{int(view.v_cache.shape[0])} expected={expected}."
+                )
+            k_cache = view.k_cache[:expected].view(batch, width, int(view.k_cache.shape[1]), int(view.k_cache.shape[2]))
+            v_cache = view.v_cache[:expected].view(batch, width, int(view.v_cache.shape[1]), int(view.v_cache.shape[2]))
+            with profiler.record("decode_attention_flash_attn_sparse"):
+                # Decode uses q_len=1 and the materialized KV view contains no future tokens.
+                out = flash_attn_with_kvcache(
+                    q.unsqueeze(1),
+                    k_cache,
+                    v_cache,
+                    cache_seqlens=view.context_lens.to(torch.int32),
+                    causal=False,
+                )
+            return out.squeeze(1)
 
         self._debug_check_decode_bounds(view)
+        profile_kind = "full" if int(max_len_in_batch) > 8192 else "sparse"
         is_gqa = int(num_heads) > int(num_kv_heads)
         use_gqa_hd256 = is_gqa and int(q.shape[-1]) == 256
-        if view.attn_score is not None:
-            if use_gqa_hd256:
-                gqa_flash_decode_stage1_hd256_with_score(
-                    q,
-                    view.k_cache,
-                    view.v_cache,
-                    view.active_slots,
-                    view.req_indices,
-                    view.context_lens,
-                    max_len_in_batch,
-                    mid_o,
-                    mid_o_logexpsum,
-                    view.attn_score,
-                    block_seq,
-                )
-            elif is_gqa:
-                gqa_flash_decode_stage1_with_score(
-                    q,
-                    view.k_cache,
-                    view.v_cache,
-                    view.active_slots,
-                    view.req_indices,
-                    view.context_lens,
-                    max_len_in_batch,
-                    mid_o,
-                    mid_o_logexpsum,
-                    view.attn_score,
-                    block_seq,
-                )
+        with profiler.record(f"decode_attention_stage1_{profile_kind}"):
+            if view.attn_score is not None:
+                if use_gqa_hd256:
+                    gqa_flash_decode_stage1_hd256_with_score(
+                        q,
+                        view.k_cache,
+                        view.v_cache,
+                        view.active_slots,
+                        view.req_indices,
+                        view.context_lens,
+                        max_len_in_batch,
+                        mid_o,
+                        mid_o_logexpsum,
+                        view.attn_score,
+                        block_seq,
+                    )
+                elif is_gqa:
+                    gqa_flash_decode_stage1_with_score(
+                        q,
+                        view.k_cache,
+                        view.v_cache,
+                        view.active_slots,
+                        view.req_indices,
+                        view.context_lens,
+                        max_len_in_batch,
+                        mid_o,
+                        mid_o_logexpsum,
+                        view.attn_score,
+                        block_seq,
+                    )
+                else:
+                    mha_flash_decode_stage1_with_score(
+                        q,
+                        view.k_cache,
+                        view.v_cache,
+                        view.active_slots,
+                        view.req_indices,
+                        view.context_lens,
+                        max_len_in_batch,
+                        mid_o,
+                        mid_o_logexpsum,
+                        view.attn_score,
+                        block_seq,
+                    )
             else:
-                mha_flash_decode_stage1_with_score(
-                    q,
-                    view.k_cache,
-                    view.v_cache,
-                    view.active_slots,
-                    view.req_indices,
-                    view.context_lens,
-                    max_len_in_batch,
-                    mid_o,
-                    mid_o_logexpsum,
-                    view.attn_score,
-                    block_seq,
-                )
-        else:
-            if use_gqa_hd256:
-                gqa_flash_decode_stage1_hd256(
-                    q,
-                    view.k_cache,
-                    view.v_cache,
-                    view.active_slots,
-                    view.req_indices,
-                    view.context_lens,
-                    max_len_in_batch,
-                    mid_o,
-                    mid_o_logexpsum,
-                    block_seq,
-                )
-            elif is_gqa:
-                gqa_flash_decode_stage1(
-                    q,
-                    view.k_cache,
-                    view.v_cache,
-                    view.active_slots,
-                    view.req_indices,
-                    view.context_lens,
-                    max_len_in_batch,
-                    mid_o,
-                    mid_o_logexpsum,
-                    block_seq,
-                )
-            else:
-                mha_flash_decode_stage1(
-                    q,
-                    view.k_cache,
-                    view.v_cache,
-                    view.active_slots,
-                    view.req_indices,
-                    view.context_lens,
-                    max_len_in_batch,
-                    mid_o,
-                    mid_o_logexpsum,
-                    block_seq,
-                )
+                if use_gqa_hd256:
+                    gqa_flash_decode_stage1_hd256(
+                        q,
+                        view.k_cache,
+                        view.v_cache,
+                        view.active_slots,
+                        view.req_indices,
+                        view.context_lens,
+                        max_len_in_batch,
+                        mid_o,
+                        mid_o_logexpsum,
+                        block_seq,
+                    )
+                elif is_gqa:
+                    gqa_flash_decode_stage1(
+                        q,
+                        view.k_cache,
+                        view.v_cache,
+                        view.active_slots,
+                        view.req_indices,
+                        view.context_lens,
+                        max_len_in_batch,
+                        mid_o,
+                        mid_o_logexpsum,
+                        block_seq,
+                    )
+                else:
+                    mha_flash_decode_stage1(
+                        q,
+                        view.k_cache,
+                        view.v_cache,
+                        view.active_slots,
+                        view.req_indices,
+                        view.context_lens,
+                        max_len_in_batch,
+                        mid_o,
+                        mid_o_logexpsum,
+                        block_seq,
+                    )
 
         o = torch.empty_like(q)
-        if use_gqa_hd256:
-            flash_decode_stage2_hd256(mid_o, mid_o_logexpsum, view.context_lens, o, block_seq)
-        else:
-            flash_decode_stage2(mid_o, mid_o_logexpsum, view.context_lens, o, block_seq)
+        with profiler.record(f"decode_attention_stage2_{profile_kind}"):
+            if use_gqa_hd256:
+                flash_decode_stage2_hd256(mid_o, mid_o_logexpsum, view.context_lens, o, block_seq)
+            else:
+                flash_decode_stage2(mid_o, mid_o_logexpsum, view.context_lens, o, block_seq)
         return o
 
     def _run_full_layer_kivi_decode_stage1(

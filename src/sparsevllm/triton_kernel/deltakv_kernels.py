@@ -3409,6 +3409,213 @@ def deltakv_less_memory_reconstruct_writeback_int4(
     )
 
 
+@torch.no_grad()
+def deltakv_materialize_sparse_view(
+    active_slots: torch.Tensor,
+    context_lens: torch.Tensor,
+    slot_to_pos: torch.Tensor,
+    postrope_mask: torch.Tensor | None,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    out_k: torch.Tensor,
+    out_v: torch.Tensor,
+    cos_sin: torch.Tensor,
+    *,
+    k_norm_weight: torch.Tensor | None = None,
+    k_norm_eps: float = 1e-6,
+    block_tokens: int = 16,
+):
+    assert active_slots.is_cuda and context_lens.is_cuda and slot_to_pos.is_cuda
+    assert k_cache.is_cuda and v_cache.is_cuda and out_k.is_cuda and out_v.is_cuda and cos_sin.is_cuda
+    assert active_slots.dim() == 2
+    assert context_lens.dim() == 1 and context_lens.shape[0] == active_slots.shape[0]
+    assert k_cache.dim() == 3 and v_cache.shape == k_cache.shape
+    assert out_k.dim() == 3 and out_v.shape == out_k.shape
+
+    batch, width = active_slots.shape
+    total = int(batch) * int(width)
+    if total == 0:
+        return
+    if out_k.shape[0] < total or out_v.shape[0] < total:
+        raise RuntimeError(
+            "DeltaKV materialize sparse view output is too small: "
+            f"out={tuple(out_k.shape)}/{tuple(out_v.shape)} need={total}."
+        )
+    num_kv_heads = int(k_cache.shape[1])
+    head_dim = int(k_cache.shape[2])
+    if head_dim % 2 != 0:
+        raise RuntimeError(f"DeltaKV materialize sparse view requires an even head_dim, got {head_dim}.")
+
+    if cos_sin.dim() == 3:
+        cos_sin = cos_sin[:, 0, :]
+    assert cos_sin.dim() == 2 and cos_sin.shape[1] == head_dim
+
+    apply_k_norm = k_norm_weight is not None
+    if apply_k_norm:
+        assert k_norm_weight.is_cuda
+        assert k_norm_weight.dim() == 1 and k_norm_weight.shape[0] == head_dim
+    else:
+        k_norm_weight = cos_sin
+
+    has_postrope_mask = postrope_mask is not None
+    if has_postrope_mask:
+        assert postrope_mask.is_cuda
+        assert postrope_mask.dim() == 1 and postrope_mask.shape[0] >= k_cache.shape[0]
+    else:
+        postrope_mask = slot_to_pos
+
+    block_tokens = max(1, int(block_tokens))
+    grid = (triton.cdiv(total, block_tokens), num_kv_heads)
+    _deltakv_materialize_sparse_view_block_kernel[grid](
+        active_slots,
+        context_lens,
+        slot_to_pos,
+        postrope_mask,
+        k_cache,
+        v_cache,
+        out_k,
+        out_v,
+        cos_sin,
+        k_norm_weight,
+        active_slots.stride(0),
+        active_slots.stride(1),
+        k_cache.stride(0),
+        k_cache.stride(1),
+        k_cache.stride(2),
+        v_cache.stride(0),
+        v_cache.stride(1),
+        v_cache.stride(2),
+        out_k.stride(0),
+        out_k.stride(1),
+        out_k.stride(2),
+        out_v.stride(0),
+        out_v.stride(1),
+        out_v.stride(2),
+        cos_sin.stride(0),
+        cos_sin.stride(1),
+        k_norm_weight.stride(0),
+        TOTAL=total,
+        WIDTH=int(width),
+        BLOCK_N=block_tokens,
+        NUM_SLOTS=int(k_cache.shape[0]),
+        HEAD_DIM=head_dim,
+        HD2=head_dim // 2,
+        NUM_KV_HEADS=num_kv_heads,
+        APPLY_K_NORM=apply_k_norm,
+        HAS_POSTROPE_MASK=has_postrope_mask,
+        K_NORM_EPS=float(k_norm_eps),
+        num_warps=4,
+    )
+
+
+@triton.jit
+def _deltakv_materialize_sparse_view_block_kernel(
+    active_slots_ptr,
+    context_lens_ptr,
+    slot_to_pos_ptr,
+    postrope_mask_ptr,
+    k_cache_ptr,
+    v_cache_ptr,
+    out_k_ptr,
+    out_v_ptr,
+    cos_sin_ptr,
+    k_norm_weight_ptr,
+    stride_active_b,
+    stride_active_w,
+    stride_k_s,
+    stride_k_h,
+    stride_k_d,
+    stride_v_s,
+    stride_v_h,
+    stride_v_d,
+    stride_ok_n,
+    stride_ok_h,
+    stride_ok_d,
+    stride_ov_n,
+    stride_ov_h,
+    stride_ov_d,
+    stride_cos_p,
+    stride_cos_d,
+    stride_norm_d,
+    TOTAL: tl.constexpr,
+    WIDTH: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    NUM_SLOTS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    HD2: tl.constexpr,
+    NUM_KV_HEADS: tl.constexpr,
+    APPLY_K_NORM: tl.constexpr,
+    HAS_POSTROPE_MASK: tl.constexpr,
+    K_NORM_EPS: tl.constexpr,
+):
+    pid_n = tl.program_id(0)
+    head_id = tl.program_id(1)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    token_mask = offs_n < TOTAL
+    batch_ids = offs_n // WIDTH
+    cols = offs_n - batch_ids * WIDTH
+
+    slots = tl.load(
+        active_slots_ptr + batch_ids * stride_active_b + cols * stride_active_w,
+        mask=token_mask,
+        other=0,
+    ).to(tl.int32)
+    valid_slot = token_mask & (slots >= 0) & (slots < NUM_SLOTS)
+    safe_slots = tl.minimum(tl.maximum(slots, 0), NUM_SLOTS - 1)
+    pos = tl.load(slot_to_pos_ptr + safe_slots, mask=token_mask, other=0).to(tl.int32)
+    safe_pos = tl.maximum(pos, 0)
+
+    already_postrope = tl.full((BLOCK_N,), False, tl.int1)
+    if HAS_POSTROPE_MASK:
+        already_postrope = tl.load(postrope_mask_ptr + safe_slots, mask=valid_slot, other=0).to(tl.int1)
+
+    offs_d = tl.arange(0, HD2)
+    k_base = safe_slots[:, None] * stride_k_s + head_id * stride_k_h + offs_d[None, :] * stride_k_d
+    k1 = tl.load(k_cache_ptr + k_base, mask=token_mask[:, None], other=0.0).to(tl.float32)
+    k2 = tl.load(
+        k_cache_ptr + k_base + (HD2 * stride_k_d),
+        mask=token_mask[:, None],
+        other=0.0,
+    ).to(tl.float32)
+
+    if APPLY_K_NORM:
+        norm_w1 = tl.load(k_norm_weight_ptr + offs_d * stride_norm_d).to(tl.float32)
+        norm_w2 = tl.load(k_norm_weight_ptr + (offs_d + HD2) * stride_norm_d).to(tl.float32)
+        var = tl.sum(k1 * k1 + k2 * k2, axis=1) / HEAD_DIM
+        rstd = tl.rsqrt(var + K_NORM_EPS)
+        norm_k1 = k1 * rstd[:, None] * norm_w1[None, :]
+        norm_k2 = k2 * rstd[:, None] * norm_w2[None, :]
+    else:
+        norm_k1 = k1
+        norm_k2 = k2
+
+    cos = tl.load(
+        cos_sin_ptr + safe_pos[:, None] * stride_cos_p + offs_d[None, :] * stride_cos_d,
+        mask=token_mask[:, None],
+        other=1.0,
+    ).to(tl.float32)
+    sin = tl.load(
+        cos_sin_ptr + safe_pos[:, None] * stride_cos_p + (offs_d[None, :] + HD2) * stride_cos_d,
+        mask=token_mask[:, None],
+        other=0.0,
+    ).to(tl.float32)
+    rope_k1 = norm_k1 * cos - norm_k2 * sin
+    rope_k2 = norm_k2 * cos + norm_k1 * sin
+    out_k1 = tl.where(already_postrope[:, None], k1, rope_k1)
+    out_k2 = tl.where(already_postrope[:, None], k2, rope_k2)
+
+    out_k_base = offs_n[:, None] * stride_ok_n + head_id * stride_ok_h + offs_d[None, :] * stride_ok_d
+    tl.store(out_k_ptr + out_k_base, out_k1, mask=token_mask[:, None])
+    tl.store(out_k_ptr + out_k_base + (HD2 * stride_ok_d), out_k2, mask=token_mask[:, None])
+
+    v_base = safe_slots[:, None] * stride_v_s + head_id * stride_v_h + offs_d[None, :] * stride_v_d
+    v1 = tl.load(v_cache_ptr + v_base, mask=token_mask[:, None], other=0.0)
+    v2 = tl.load(v_cache_ptr + v_base + (HD2 * stride_v_d), mask=token_mask[:, None], other=0.0)
+    out_v_base = offs_n[:, None] * stride_ov_n + head_id * stride_ov_h + offs_d[None, :] * stride_ov_d
+    tl.store(out_v_ptr + out_v_base, v1, mask=token_mask[:, None])
+    tl.store(out_v_ptr + out_v_base + (HD2 * stride_ov_d), v2, mask=token_mask[:, None])
+
+
 @triton.jit
 def _deltakv_static_decode_plan_kernel(
     raw_slots_map_ptr,  # (num_rows, max_positions), int32

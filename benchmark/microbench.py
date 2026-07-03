@@ -277,6 +277,43 @@ def _decode_cuda_graph_status(llm) -> dict[str, Any]:
     }
 
 
+def _jsonable_config_value(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_jsonable_config_value(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _jsonable_config_value(item) for key, item in value.items()}
+    return _json_default(value)
+
+
+def _resolved_engine_config(llm) -> dict[str, Any]:
+    config = getattr(llm, "config", None)
+    if config is None:
+        return {}
+    keys = (
+        "vllm_sparse_method",
+        "prefill_schedule_policy",
+        "chunk_prefill_size",
+        "decode_cuda_graph",
+        "decode_cuda_graph_capture_sampling",
+        "deltakv_sparse_decode_backend",
+        "deltakv_triton_materialize_block_tokens",
+        "deltakv_triton_gather_heads_per_program",
+        "deltakv_triton_reconstruct_heads_per_program",
+        "full_layer_kv_quant_bits",
+        "kv_quant_bits",
+        "kv_quant_group_size",
+        "full_attn_layers",
+        "obs_layer_ids",
+    )
+    return {
+        key: _jsonable_config_value(getattr(config, key))
+        for key in keys
+        if hasattr(config, key)
+    }
+
+
 def _cache_stats(llm) -> dict[str, int]:
     cache_manager = getattr(getattr(llm, "model_runner", None), "cache_manager", None)
     if cache_manager is None or not hasattr(cache_manager, "free_slot_stats"):
@@ -367,6 +404,7 @@ def benchmark_task(method, length, bs, args, results_dict):
         return
     
     llm = None
+    resolved_engine_config: dict[str, Any] = {}
     try:
         m_len = length + args.output_len + 100
         # Note: max_model_len is derived from (length, bs, output_len, engine_prefill_chunk_size).
@@ -383,6 +421,7 @@ def benchmark_task(method, length, bs, args, results_dict):
             **sparse_kwargs,
         }
         llm = LLM(args.model_path, **engine_kwargs)
+        resolved_engine_config = _resolved_engine_config(llm)
         prefix_cache_stats_before = _cache_stats(llm)
 
         prompt_token_ids = [[100] * length for _ in range(bs)]
@@ -598,6 +637,7 @@ def benchmark_task(method, length, bs, args, results_dict):
             },
             "memory_accounting": memory_accounting,
             "engine_hyper_params": engine_kwargs,
+            "resolved_engine_config": resolved_engine_config,
             "status": "SUCCESS"
         }
 
@@ -612,6 +652,7 @@ def benchmark_task(method, length, bs, args, results_dict):
             "status": "FAILED",
             "error": repr(e),
             "traceback": traceback.format_exc(),
+            "resolved_engine_config": _resolved_engine_config(llm) if llm is not None else resolved_engine_config,
         }
     finally:
         if llm is not None and hasattr(llm, "exit"):

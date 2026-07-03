@@ -34,7 +34,6 @@ SEMANTIC_ENGINE_ARGS = {
     "full_attention_layers",
     "engine_prefill_chunk_size",
     "deltakv_neighbor_count",
-    "observation_layers",
 }
 
 
@@ -1421,7 +1420,11 @@ def _load_engine_kwargs_arg(value: str | None) -> dict[str, Any]:
 
 
 def _parse_engine_kwargs(raw_args: list[str]) -> dict[str, Any]:
-    config_fields = Config.__dataclass_fields__
+    config_fields = {
+        name: config_field
+        for name, config_field in Config.__dataclass_fields__.items()
+        if config_field.init
+    }
     allowed_fields = set(config_fields) | SEMANTIC_ENGINE_ARGS
     kwargs: dict[str, Any] = {}
     idx = 0

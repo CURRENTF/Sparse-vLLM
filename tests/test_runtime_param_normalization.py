@@ -14,7 +14,6 @@ class RuntimeParamNormalizationTest(unittest.TestCase):
                 "sink_keep_tokens": 8,
                 "recent_keep_tokens": 128,
                 "full_attention_layers": "0,1,2,8,18",
-                "observation_layers": [2, 8, 18],
                 "deltakv_neighbor_count": 4,
                 "deltakv_center_ratio": 0.1,
                 "deltakv_latent_dim": 256,
@@ -36,7 +35,6 @@ class RuntimeParamNormalizationTest(unittest.TestCase):
                 "num_sink_tokens": 8,
                 "num_recent_tokens": 128,
                 "full_attn_layers": "0,1,2,8,18",
-                "obs_layer_ids": [2, 8, 18],
                 "deltakv_k_neighbors": 4,
                 "cluster_ratio": 0.1,
                 "kv_compressed_size": 256,
@@ -125,6 +123,14 @@ class RuntimeParamNormalizationTest(unittest.TestCase):
     def test_sparsevllm_rejects_ratio_style_keep_budgets(self):
         with self.assertRaisesRegex(ValueError, "explicit token count"):
             normalize_runtime_params({"decode_keep_tokens": 0.17}, backend="sparsevllm")
+
+    def test_sparsevllm_observation_layer_keys_are_unknown(self):
+        from sparsevllm import LLM
+
+        for key in ("observation_layers", "obs_layer_ids"):
+            with self.subTest(key=key):
+                with self.assertRaisesRegex(ValueError, "Unknown Sparse-vLLM config keys"):
+                    LLM("/tmp/unused-model", **{key: [0]})
 
     def test_hf_config_accepts_canonical_aliases(self):
         cfg = KVQwen2Config()

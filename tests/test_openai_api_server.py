@@ -238,6 +238,12 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "Missing value"):
             _parse_engine_kwargs(["--max-model-len"])
 
+        with self.assertRaisesRegex(ValueError, "Unknown Sparse-vLLM engine argument"):
+            _parse_engine_kwargs(["--observation-layers", "0"])
+
+        with self.assertRaisesRegex(ValueError, "Unknown Sparse-vLLM engine argument"):
+            _parse_engine_kwargs(["--obs-layer-ids", "0"])
+
         self.assertEqual(_parse_engine_kwargs(["--sparse-method", "snapkv"]), {"sparse_method": "snapkv"})
 
     def test_create_app_disables_periodic_throughput_logs_by_default(self):

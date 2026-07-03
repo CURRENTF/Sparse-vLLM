@@ -166,7 +166,7 @@ class LLMEngine:
         for warning in normalized_params.warnings:
             logger.info(f"Runtime parameter normalization: {warning}")
 
-        config_fields = {field.name for field in fields(Config)}
+        config_fields = {field.name for field in fields(Config) if field.init}
         config_kwargs = {
             k: v for k, v in normalized_params.infer_config.items() if k in config_fields
         }
@@ -293,6 +293,23 @@ class LLMEngine:
             ignore_eos=decode_warmup,
         )
         max_prompt_len = max(1, int(self.config.max_model_len) - int(sampling_params.max_tokens))
+        warmup_len_override = os.getenv("SPARSEVLLM_DELTAKV_GRAPH_WARMUP_PROMPT_LEN", "").strip().lower()
+        if warmup_len_override:
+            if warmup_len_override in {"max", "full", "max_model_len", "max-model-len"}:
+                warmup_len = max_prompt_len
+            else:
+                try:
+                    warmup_len = int(warmup_len_override)
+                except ValueError as exc:
+                    raise ValueError(
+                        "SPARSEVLLM_DELTAKV_GRAPH_WARMUP_PROMPT_LEN must be a positive integer or 'max', "
+                        f"got {warmup_len_override!r}."
+                    ) from exc
+                if warmup_len <= 0:
+                    raise ValueError(
+                        "SPARSEVLLM_DELTAKV_GRAPH_WARMUP_PROMPT_LEN must be positive, "
+                        f"got {warmup_len}."
+                    )
         if warmup_len > max_prompt_len:
             logger.warning(
                 f"Warmup prompt length ({warmup_len}) exceeds max_model_len - max_tokens "
