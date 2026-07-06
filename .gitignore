@@ -9,6 +9,7 @@ wandb/
 /tmp/
 /scripts/tmp/
 /outputs/
+/.kanna/
 /benchmark/scbench/results/
 /reference/
 /benchmark/results/
