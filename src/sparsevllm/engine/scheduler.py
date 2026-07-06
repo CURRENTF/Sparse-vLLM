@@ -6,6 +6,7 @@ from sparsevllm.engine.sequence import Sequence, SequenceStatus
 from sparsevllm.engine.cache_manager import CacheManager
 from sparsevllm.method_registry import (
     PREFILL_POLICY_ALL_CHUNKED,
+    PREFILL_POLICY_LONG_BS1CHUNKED_DEFERRED_SHORT_BATCH,
     PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
     is_deltakv_method,
 )
@@ -139,9 +140,17 @@ class Scheduler:
             return False
         if len(self.decoding) >= self.max_decoding_seqs:
             return False
-        if self.prefill_schedule_policy == PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH and target_is_long:
-            # Long DeltaKV-family prefills are full-prefill, bs=1. They may exceed
-            # max_num_batched_tokens by design; admission budgets guard persistent KV.
+        if (
+            self.prefill_schedule_policy
+            in (
+                PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
+                PREFILL_POLICY_LONG_BS1CHUNKED_DEFERRED_SHORT_BATCH,
+            )
+            and target_is_long
+        ):
+            # Long DeltaKV-family prefills are isolated as bs=1. The legacy
+            # full policy may exceed max_num_batched_tokens; the deferred policy
+            # still caps the step in _prefill_step_tokens().
             return not scheduled_seqs and step_free_count > 0
         return (
             step_free_count > 0
@@ -151,10 +160,24 @@ class Scheduler:
 
     def _requires_whole_short_prefill_step(self, target_is_long: bool) -> bool:
         return (
-            self.prefill_schedule_policy == PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH
+            self.prefill_schedule_policy
+            in (
+                PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
+                PREFILL_POLICY_LONG_BS1CHUNKED_DEFERRED_SHORT_BATCH,
+            )
             and is_deltakv_method(self.config.vllm_sparse_method)
             and not target_is_long
         )
+
+    def _uses_deferred_long_prefill(self, seq: Sequence) -> bool:
+        if self.prefill_schedule_policy != PREFILL_POLICY_LONG_BS1CHUNKED_DEFERRED_SHORT_BATCH:
+            return False
+        uses_staging_step_capacity = getattr(
+            self.memory_oracle,
+            "uses_prefill_staging_step_capacity",
+            None,
+        )
+        return bool(callable(uses_staging_step_capacity) and uses_staging_step_capacity(seq))
 
     def _prefill_step_tokens(
         self,
@@ -174,6 +197,23 @@ class Scheduler:
                 return int(remaining_prefill_tokens)
             return 0
         if self.prefill_schedule_policy == PREFILL_POLICY_ALL_CHUNKED:
+            return min(
+                remaining_prefill_tokens,
+                self.chunk_prefill_size,
+                self.max_num_batched_tokens - num_batched_tokens,
+                step_free_count,
+            )
+        if self.prefill_schedule_policy == PREFILL_POLICY_LONG_BS1CHUNKED_DEFERRED_SHORT_BATCH:
+            if target_is_long and not self._uses_deferred_long_prefill(seq):
+                return int(remaining_prefill_tokens)
+            if self._requires_whole_short_prefill_step(target_is_long):
+                available = min(
+                    self.max_num_batched_tokens - num_batched_tokens,
+                    step_free_count,
+                )
+                if remaining_prefill_tokens <= self.chunk_prefill_size and remaining_prefill_tokens <= available:
+                    return int(remaining_prefill_tokens)
+                return 0
             return min(
                 remaining_prefill_tokens,
                 self.chunk_prefill_size,
@@ -325,10 +365,14 @@ class Scheduler:
                 if seq.num_prefilled_tokens == 0 and seq.num_completion_tokens == 0:
                     self.memory_oracle.refresh_prefix_cache_hit(seq)
                 remaining_prefill_tokens = self.memory_oracle.remaining_prefill_tokens(seq)
-                candidate_step_free_count = min(
-                    int(step_free_count),
-                    int(self.memory_oracle.prefill_step_free_slots_for(seq)),
+                candidate_step_free_count = int(self.memory_oracle.prefill_step_free_slots_for(seq))
+                uses_staging_step_capacity = getattr(
+                    self.memory_oracle,
+                    "uses_prefill_staging_step_capacity",
+                    None,
                 )
+                if not (callable(uses_staging_step_capacity) and uses_staging_step_capacity(seq)):
+                    candidate_step_free_count = min(int(step_free_count), int(candidate_step_free_count))
 
                 # 异常处理：如果由于某种原因已经 prefill 完却还在 waiting 队列
                 if remaining_prefill_tokens <= 0:
@@ -479,7 +523,11 @@ class Scheduler:
                 seq.status = SequenceStatus.RUNNING
                 scheduled_seqs.append(seq)
                 if (
-                    self.prefill_schedule_policy == PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH
+                    self.prefill_schedule_policy
+                    in (
+                        PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
+                        PREFILL_POLICY_LONG_BS1CHUNKED_DEFERRED_SHORT_BATCH,
+                    )
                     and target_is_long
                 ):
                     break

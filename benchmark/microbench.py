@@ -237,6 +237,7 @@ def _write_output_dir(args, rows: list[dict[str, Any]]) -> None:
     ]
     for record in records:
         ok = record["status"] == "success"
+        speedup = record.get("speedup_vs_vanilla_decode")
         report_lines.append(
             "| {method} | {prompt} | {batch} | {status} | {ttft} | {prefill} | {decode} | {mem} | {speedup} |".format(
                 method=record.get("method", ""),
@@ -247,7 +248,7 @@ def _write_output_dir(args, rows: list[dict[str, Any]]) -> None:
                 prefill=f"{record.get('prefill_tok_s', 0.0):.1f}" if ok else "",
                 decode=f"{record.get('decode_tok_s', 0.0):.1f}" if ok else "",
                 mem=f"{record.get('peak_memory_gb', 0.0):.2f}" if ok else "",
-                speedup=f"{record.get('speedup_vs_vanilla_decode', 0.0):.2f}" if ok else "",
+                speedup=("n/a" if speedup is None else f"{float(speedup):.2f}") if ok else "",
             )
         )
 
@@ -343,6 +344,13 @@ def _observe_prefix_cache_hits(llm, hits_by_seq_id: dict[int, int]) -> None:
             hit_len = int(getattr(seq, "prefix_cache_hit_len", 0) or 0)
             if seq_id >= 0 and hit_len > 0:
                 hits_by_seq_id[seq_id] = max(hit_len, int(hits_by_seq_id.get(seq_id, 0)))
+
+
+def _finished_outputs_have_tokens(finished_outputs) -> bool:
+    for output in finished_outputs:
+        if len(output) >= 2 and output[1]:
+            return True
+    return False
 
 
 def benchmark_task(method, length, bs, args, results_dict):
@@ -509,7 +517,10 @@ def benchmark_task(method, length, bs, args, results_dict):
                 # In this engine, the first completion token is sampled during the *last* prefill
                 # step of each sequence (Scheduler.postprocess appends it in the prefill branch).
                 # So TTFT should be captured on a prefill step, not on the first decode step.
-                if ttft is None and (llm.scheduler.decoding or any(tids for _, tids in finished_outputs)):
+                if ttft is None and (
+                    llm.scheduler.decoding
+                    or _finished_outputs_have_tokens(finished_outputs)
+                ):
                     ttft = perf_counter() - t_start
             elif num_tokens < 0:
                 # print(f'one decode step ... {perf_counter() - last_time}')
@@ -792,12 +803,13 @@ def main():
                 
                 speedup = 1.0
                 if (length, bs) in vanilla_stats:
-                    speedup = dec_tp / vanilla_stats[(length, bs)]
-                
-                speedup_str = f"{speedup:.2f}x"
+                    vanilla_decode_tp = float(vanilla_stats[(length, bs)])
+                    speedup = dec_tp / vanilla_decode_tp if vanilla_decode_tp > 0 else None
+
+                speedup_str = "n/a" if speedup is None else f"{speedup:.2f}x"
                 print(f"{method:<12} {length:<8} {bs_str:<4} {ttft:<10.2f} {pre_tp:<12.1f} {dec_tp:<12.1f} {itl:<10.2f} {avg_bs:<8.1f} {mem:<10.2f} {speedup_str}")
                 row = dict(res)
-                row["speedup_vs_vanilla_decode"] = float(speedup)
+                row["speedup_vs_vanilla_decode"] = None if speedup is None else float(speedup)
                 jsonl_rows.append(row)
     print(f"{ '='*140}\n")
     _write_jsonl(args.output_jsonl, jsonl_rows)

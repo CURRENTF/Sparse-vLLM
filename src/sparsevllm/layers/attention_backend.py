@@ -3,6 +3,7 @@ import os
 import torch
 
 from sparsevllm.engine.cache_manager import DecodeComputeView, PrefillComputeView
+from sparsevllm.utils.context import get_context
 from sparsevllm.triton_kernel.context_flashattention_nopad import context_attention_fwd
 from sparsevllm.triton_kernel.flash_decoding_stage1 import flash_decode_stage1 as mha_flash_decode_stage1
 from sparsevllm.triton_kernel.flash_decoding_stage1 import flash_decode_stage1_with_score as mha_flash_decode_stage1_with_score
@@ -31,6 +32,7 @@ class TritonAttentionBackend:
     ) -> torch.Tensor:
         b_seq_len = view.context_lens
         b_prompt_cache_len = b_seq_len - chunk_lens
+        self._debug_check_prefill_bounds(q, view, chunk_lens=chunk_lens)
         o = torch.empty_like(q)
         context_attention_fwd(
             q,
@@ -46,6 +48,66 @@ class TritonAttentionBackend:
             attn_score=view.attn_score,
         )
         return o
+
+    def _debug_check_prefill_bounds(
+        self,
+        q: torch.Tensor,
+        view: PrefillComputeView,
+        *,
+        chunk_lens: torch.Tensor,
+    ):
+        if os.environ.get("SVLLM_DEBUG_PREFILL_BOUNDS", "0") != "1":
+            return
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            return
+        if view.active_slots.dim() != 2:
+            raise RuntimeError(
+                f"prefill bounds check expects 2D active_slots, got shape={tuple(view.active_slots.shape)}"
+            )
+        rows = view.req_indices.to(torch.long)
+        row_min = int(rows.min().item()) if rows.numel() > 0 else 0
+        row_max = int(rows.max().item()) if rows.numel() > 0 else -1
+        if row_min < 0 or row_max >= int(view.active_slots.shape[0]):
+            raise RuntimeError(
+                "prefill req row index out of bounds: "
+                f"row_min={row_min} row_max={row_max} num_rows={int(view.active_slots.shape[0])}"
+            )
+        if int(chunk_lens.sum().item()) != int(q.shape[0]):
+            raise RuntimeError(
+                "prefill q/chunk length mismatch: "
+                f"q_tokens={int(q.shape[0])} chunk_tokens={int(chunk_lens.sum().item())}"
+            )
+        if bool((view.context_lens < chunk_lens).any().item()):
+            raise RuntimeError(
+                "prefill context_lens shorter than chunk_lens: "
+                f"context_lens={view.context_lens.detach().cpu().tolist()} "
+                f"chunk_lens={chunk_lens.detach().cpu().tolist()}"
+            )
+        visible_len = int(view.context_lens.max().item()) if view.context_lens.numel() > 0 else 0
+        if visible_len > int(view.active_slots.shape[1]):
+            raise RuntimeError(
+                "prefill visible length exceeds active slot table width: "
+                f"visible_len={visible_len} active_slots_width={int(view.active_slots.shape[1])}"
+            )
+        visible_slots = view.active_slots.index_select(0, rows)[:, :visible_len]
+        pos = torch.arange(visible_len, device=visible_slots.device)[None, :]
+        valid_pos = pos < view.context_lens[:, None]
+        slot_cap = int(view.k_cache.shape[0])
+        bad = ((visible_slots < 0) | (visible_slots >= slot_cap)) & valid_pos
+        if bool(bad.any().item()):
+            layer_idx = getattr(get_context(), "now_layer_idx", None)
+            loc = bad.nonzero(as_tuple=False)[0]
+            bad_b = int(loc[0].item())
+            bad_pos = int(loc[1].item())
+            bad_slot = int(visible_slots[bad_b, bad_pos].item())
+            bad_req_row = int(rows[bad_b].item())
+            raise RuntimeError(
+                "prefill physical slot out of bounds before attention: "
+                f"layer={layer_idx} batch={bad_b} req_row={bad_req_row} pos={bad_pos} "
+                f"slot={bad_slot} slot_cap={slot_cap} context_len={int(view.context_lens[bad_b].item())} "
+                f"k_shape={tuple(view.k_cache.shape)} v_shape={tuple(view.v_cache.shape)} "
+                f"active_slots_shape={tuple(view.active_slots.shape)}"
+            )
 
     def run_decode(
         self,

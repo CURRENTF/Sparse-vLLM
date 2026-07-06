@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from collections import deque
 from dataclasses import dataclass
 from abc import ABC, abstractmethod
@@ -165,16 +166,33 @@ class CacheManager(ABC):
         # Keep this heuristic conservative: large prefill batches can still peak on
         # MLP activations and allocator fragmentation after KV cache allocation.
         estimated_max_tokens = int(reserved_mem / (intermediate_size_per_rank * dtype_size * 10))
-        assert 2 * config.chunk_prefill_size < estimated_max_tokens, (
-            f"{2 * config.chunk_prefill_size} >= {estimated_max_tokens}"
-        )
+        allow_large_prefill_chunk = os.getenv("SPARSEVLLM_ALLOW_LARGE_PREFILL_CHUNK", "0") == "1"
+        if 2 * config.chunk_prefill_size >= estimated_max_tokens:
+            msg = (
+                f"2*chunk_prefill_size={2 * config.chunk_prefill_size} >= "
+                f"estimated_max_tokens={estimated_max_tokens}"
+            )
+            if not allow_large_prefill_chunk:
+                raise AssertionError(msg)
+            logger.warning(
+                "{}; continuing because SPARSEVLLM_ALLOW_LARGE_PREFILL_CHUNK=1. "
+                "This is an explicit experiment override and may OOM.",
+                msg,
+            )
 
-        if estimated_max_tokens < config.max_num_batched_tokens:
+        if estimated_max_tokens < config.max_num_batched_tokens and not allow_large_prefill_chunk:
             logger.warning(
                 f"Estimated max_num_batched_tokens ({estimated_max_tokens}) is smaller than config "
                 f"({config.max_num_batched_tokens}). Updating to avoid OOM."
             )
             config.max_num_batched_tokens = estimated_max_tokens
+        elif estimated_max_tokens < config.max_num_batched_tokens:
+            logger.warning(
+                "Keeping max_num_batched_tokens={} above estimated {} because "
+                "SPARSEVLLM_ALLOW_LARGE_PREFILL_CHUNK=1.",
+                config.max_num_batched_tokens,
+                estimated_max_tokens,
+            )
 
         logger.info(f"Set dynamically max_num_batched_tokens = {config.max_num_batched_tokens}")
 
@@ -385,6 +403,15 @@ class CacheManager(ABC):
         """Optional method-owned prefill query cache update after attention output is computed."""
         del layer_idx, q, view, b_start_loc, chunk_lens
         return None
+
+    def before_prefill_layer_attention(self, layer_idx: int, selection: SparseSelection):
+        """Optional hook immediately before building a prefill layer compute view."""
+        del layer_idx, selection
+        return None
+
+    def defer_prefill_eviction(self) -> bool:
+        """Whether the current method should skip chunk-end sparse eviction."""
+        return False
 
     def record_decode_query(self, layer_idx: int, q: torch.Tensor):
         """Optional method-owned decode query cache update after attention output is computed."""
@@ -670,6 +697,11 @@ class CacheManager(ABC):
     def prefill_step_free_slots_for(self, seq: Sequence) -> int:
         """Writable KV capacity for a specific prefill candidate."""
         return int(self.prefill_step_free_slots())
+
+    def uses_prefill_staging_step_capacity(self, seq: Sequence) -> bool:
+        """Whether this prefill candidate uses a temporary staging/offload step capacity."""
+        del seq
+        return False
 
     def prefill_step_reservation_cost(self, seq: Sequence, scheduled_tokens: int) -> int:
         """Scheduler-side capacity consumed by scheduling a prefill chunk."""

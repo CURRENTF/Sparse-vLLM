@@ -28,6 +28,7 @@ from sparsevllm.method_registry import (
     PREFILL_POLICY_ALL_CHUNKED,
     PREFILL_POLICY_AUTO,
     PREFILL_POLICY_BY_METHOD,
+    PREFILL_POLICY_LONG_BS1CHUNKED_DEFERRED_SHORT_BATCH,
     PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
     get_default_prefill_schedule_policy,
     is_decode_cuda_graph_supported,
@@ -44,6 +45,7 @@ class FakeMemoryOracle:
         force_whole_prefill=False,
         prefix_hit_len=0,
         prefix_hit_blocks=0,
+        deferred_prefill=False,
     ):
         self._free_slots = int(free_slots)
         self._step_free_slots = int(step_free_slots) if step_free_slots is not None else int(free_slots)
@@ -51,6 +53,7 @@ class FakeMemoryOracle:
         self._force_whole_prefill = bool(force_whole_prefill)
         self.prefix_hit_len = int(prefix_hit_len)
         self.prefix_hit_blocks = int(prefix_hit_blocks)
+        self._deferred_prefill = bool(deferred_prefill)
         self.refresh_calls = 0
         self.clear_calls = 0
 
@@ -69,6 +72,9 @@ class FakeMemoryOracle:
 
     def is_full_prefill_step(self, seqs):
         return False
+
+    def uses_prefill_staging_step_capacity(self, seq):
+        return self._deferred_prefill
 
     def prefill_step_free_slots_for(self, seq):
         return self._free_slots
@@ -194,21 +200,30 @@ class PrefillPolicyRegistryTest(unittest.TestCase):
             with self.subTest(method=method):
                 self.assertIn(
                     get_default_prefill_schedule_policy(method),
-                    {PREFILL_POLICY_ALL_CHUNKED, PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH},
+                    {
+                        PREFILL_POLICY_ALL_CHUNKED,
+                        PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
+                        PREFILL_POLICY_LONG_BS1CHUNKED_DEFERRED_SHORT_BATCH,
+                    },
                 )
                 self.assertEqual(get_default_prefill_schedule_policy(method), policy)
 
     def test_full_prefill_methods_default_to_long_bs1full(self):
+        self.assertEqual(
+            get_default_prefill_schedule_policy("pyramidkv"),
+            PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
+        )
+
+    def test_deltakv_defaults_to_deferred_chunked_prefill(self):
         for method in (
-            "pyramidkv",
             "deltakv",
             "deltakv-less-memory",
-            "deltakv",
+            "deltakv_less_memory",
         ):
             with self.subTest(method=method):
                 self.assertEqual(
                     get_default_prefill_schedule_policy(method),
-                    PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
+                    PREFILL_POLICY_LONG_BS1CHUNKED_DEFERRED_SHORT_BATCH,
                 )
 
     def test_other_non_deltakv_defaults_to_all_chunked(self):
@@ -402,7 +417,7 @@ class PrefillPolicyConfigTest(unittest.TestCase):
             allow_missing_deltakv_path=True,
             kv_quant_bits=0,
         )
-        self.assertEqual(cfg.prefill_schedule_policy, PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH)
+        self.assertEqual(cfg.prefill_schedule_policy, PREFILL_POLICY_LONG_BS1CHUNKED_DEFERRED_SHORT_BATCH)
 
         cfg = self.make_config(vllm_sparse_method="pyramidkv", prefill_schedule_policy=None)
         self.assertEqual(cfg.prefill_schedule_policy, PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH)
@@ -1039,6 +1054,43 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
         self.assertEqual(long_a.current_chunk_size, 20)
         self.assertEqual(long_b.current_chunk_size, None)
 
+    def test_deltakv_deferred_policy_schedules_long_as_single_chunk(self):
+        scheduler = make_scheduler(
+            PREFILL_POLICY_LONG_BS1CHUNKED_DEFERRED_SHORT_BATCH,
+            method="deltakv",
+            chunk=5,
+            max_tokens=10,
+            oracle=FakeMemoryOracle(deferred_prefill=True),
+        )
+        long_a = seq_with_len(20)
+        long_b = seq_with_len(30)
+        scheduler.add(long_a)
+        scheduler.add(long_b)
+
+        scheduled, is_prefill, _ = scheduler.schedule()
+
+        self.assertTrue(is_prefill)
+        self.assertEqual(scheduled, [long_a])
+        self.assertEqual(long_a.current_chunk_size, 5)
+        self.assertEqual(long_b.current_chunk_size, None)
+
+    def test_deltakv_deferred_policy_keeps_non_deferred_long_as_full_prefill(self):
+        scheduler = make_scheduler(
+            PREFILL_POLICY_LONG_BS1CHUNKED_DEFERRED_SHORT_BATCH,
+            method="deltakv",
+            chunk=5,
+            max_tokens=10,
+            oracle=FakeMemoryOracle(deferred_prefill=False),
+        )
+        long_seq = seq_with_len(20)
+        scheduler.add(long_seq)
+
+        scheduled, is_prefill, _ = scheduler.schedule()
+
+        self.assertTrue(is_prefill)
+        self.assertEqual(scheduled, [long_seq])
+        self.assertEqual(long_seq.current_chunk_size, 20)
+
     def test_long_bs1full_policy_batches_short_chunked_prefill(self):
         scheduler = make_scheduler(
             PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
@@ -1060,11 +1112,11 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
 
     def test_deltakv_short_prefill_defers_when_step_free_cannot_fit_whole_prompt(self):
         scheduler = make_scheduler(
-            PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
+            PREFILL_POLICY_LONG_BS1CHUNKED_DEFERRED_SHORT_BATCH,
             method="deltakv-less-memory",
             chunk=8192,
             max_tokens=16384,
-            oracle=FakeMemoryOracle(step_free_slots=32),
+            oracle=FakeMemoryOracle(step_free_slots=32, deferred_prefill=False),
         )
         short_seq = seq_with_len(8192)
         decode_seq = seq_with_len(3)
@@ -1357,7 +1409,7 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
 
     def test_deltakv_short_prefill_fails_fast_when_no_work_can_free_slots(self):
         scheduler = make_scheduler(
-            PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
+            PREFILL_POLICY_LONG_BS1CHUNKED_DEFERRED_SHORT_BATCH,
             method="deltakv",
             chunk=8192,
             max_tokens=16384,

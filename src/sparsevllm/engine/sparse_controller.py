@@ -377,6 +377,8 @@ class SparseController:
 
         # DeltaKV: Always try to compress incrementally (to save memory during long prefill)
         if self.is_deltakv_family:
+            if getattr(self.cache_manager, "defer_prefill_eviction", lambda: False)():
+                return
             self._deltakv_eviction(seqs)
             return
 

@@ -238,10 +238,12 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         ratio = float(getattr(self.config, "full_layer_cluster_ratio", 0.0) or 0.0)
         return ratio if ratio > 0.0 else float(self.config.cluster_ratio or 0.0)
 
-    def _deltakv_reset_full_prefill_staging(self):
-        super()._deltakv_reset_full_prefill_staging()
+    def _deltakv_reset_full_prefill_staging(self, *, clear_plans: bool = True):
+        super()._deltakv_reset_full_prefill_staging(clear_plans=clear_plans)
+        self._deltakv_clear_deferred_prefetch()
         if hasattr(self, "_full_layer_kivi_full_prefill_plans"):
-            self._full_layer_kivi_full_prefill_plans = {}
+            if clear_plans:
+                self._full_layer_kivi_full_prefill_plans = {}
             self._full_layer_kivi_full_prefill_materialized_layers = set()
 
     def _should_use_full_prefill_staging(self, seqs: list[Sequence]) -> bool:
@@ -290,7 +292,11 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
     def prepare_step(self, seqs: list[Sequence], is_prefill: bool):
         self._deltakv_less_memory_prepare_seqs = seqs
         self._deltakv_less_memory_prepare_full_prefill_staging = bool(
-            is_prefill and self._should_use_full_prefill_staging(seqs)
+            is_prefill
+            and (
+                self._should_use_full_prefill_staging(seqs)
+                or self._should_use_deferred_prefill_staging(seqs)
+            )
         )
         try:
             return super().prepare_step(seqs, is_prefill)
@@ -1504,11 +1510,9 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         # staging step.
         if not bool(getattr(self, "_deltakv_less_memory_prepare_full_prefill_staging", False)):
             return False
-        if int(seq.num_prefilled_tokens) != 0:
-            return False
         if int(size) != int(seq.current_chunk_size):
             return False
-        return self._should_use_full_prefill_staging([seq])
+        return self._should_use_full_prefill_staging([seq]) or self._should_use_deferred_prefill_staging([seq])
 
     @torch.no_grad()
     def _allocate_full(self, seq_id: int, size: int) -> torch.Tensor:
@@ -1520,15 +1524,17 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         if seq is not None and self._should_stage_full_layer_kivi_prefill(seq, size):
             row_idx = self._get_free_row(seq_id)
             cur_len = int(self.row_seq_lens[row_idx])
-            if cur_len != 0:
+            is_deferred = self._should_use_deferred_prefill_staging([seq])
+            if cur_len != 0 and not is_deferred:
                 raise RuntimeError("Full-layer KIVI full-prefill staging only supports first-prefill prompts.")
-            if int(size) > int(self.deltakv_prefill_staging_num_slots):
+            if cur_len + int(size) > int(self.deltakv_prefill_staging_num_slots):
                 raise RuntimeError(
                     "Full-layer KIVI full-prefill staging capacity is too small: "
-                    f"tokens={size}, staging_slots={self.deltakv_prefill_staging_num_slots}."
+                    f"context_len={cur_len + int(size)}, staging_slots={self.deltakv_prefill_staging_num_slots}."
                 )
-            staging_slots = torch.arange(int(size), dtype=torch.int32, device=self.device)
-            self.full_layer_slots_map[row_idx, cur_len: cur_len + int(size)] = staging_slots
+            staging_slots = torch.arange(cur_len, cur_len + int(size), dtype=torch.int32, device=self.device)
+            if not is_deferred:
+                self.full_layer_slots_map[row_idx, cur_len: cur_len + int(size)] = staging_slots
             return staging_slots
         return super()._allocate_full(seq_id, size)
 
@@ -1708,8 +1714,255 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         self.full_layer_kivi_value_scales[l_idx, block_slots] = scale_v.to(self.full_layer_kivi_value_scales.dtype)
         self.full_layer_kivi_value_mins[l_idx, block_slots] = mn_v.to(self.full_layer_kivi_value_mins.dtype)
 
+    def _deltakv_deferred_kind(self, layer_idx: int) -> str:
+        if layer_idx in self.deltakv_layer_to_idx:
+            return "sparse_pre_rope"
+        if self._full_layer_kivi_enabled() and layer_idx in self.full_layer_to_idx:
+            return "full_post_rope"
+        raise RuntimeError(f"DeltaKV deferred prefill does not own layer={layer_idx}.")
+
+    def _deltakv_deferred_layer_order(self) -> list[int]:
+        layers = set(int(layer_idx) for layer_idx in self.deltakv_layer_to_idx)
+        if self._full_layer_kivi_enabled():
+            layers.update(int(layer_idx) for layer_idx in self.full_layer_to_idx)
+        return sorted(layers)
+
+    def _deltakv_next_deferred_layer(self, layer_idx: int) -> int | None:
+        for candidate in self._deltakv_deferred_layer_order():
+            if candidate > int(layer_idx):
+                return candidate
+        return None
+
+    def _deltakv_deferred_prefetch_enabled(self) -> bool:
+        if os.getenv("SPARSEVLLM_RAWKV_PREFETCH", "0") == "0":
+            return False
+        return torch.cuda.is_available() and torch.device(self.device).type == "cuda"
+
+    def _deltakv_deferred_prefetch_depth(self) -> int:
+        raw = os.getenv("SPARSEVLLM_RAWKV_PREFETCH_DEPTH", "2")
+        try:
+            return max(1, int(raw))
+        except ValueError as exc:
+            raise ValueError(f"SPARSEVLLM_RAWKV_PREFETCH_DEPTH must be an integer, got {raw!r}.") from exc
+
+    def _deltakv_clear_deferred_prefetch(self):
+        states = getattr(self, "_deltakv_deferred_prefetch_states", None)
+        if states is None:
+            state = getattr(self, "_deltakv_deferred_prefetch_state", None)
+            states = {} if state is None else {self._deltakv_prefetch_key_from_state(state): state}
+        for state in list(states.values()):
+            event = state.get("event")
+            if event is not None:
+                torch.cuda.current_stream(self.device).wait_event(event)
+        self._deltakv_deferred_prefetch_states = {}
+        self._deltakv_deferred_prefetch_state = None
+
+    @staticmethod
+    def _deltakv_prefetch_key_from_state(state: dict) -> tuple[int, int, str, int]:
+        return (
+            int(state["layer_idx"]),
+            int(state["row_idx"]),
+            str(state["kind"]),
+            int(state["end"]),
+        )
+
+    def _deltakv_drop_deferred_prefetch(self, key: tuple[int, int, str, int]):
+        states = getattr(self, "_deltakv_deferred_prefetch_states", None) or {}
+        state = states.pop(key, None)
+        if state is not None:
+            event = state.get("event")
+            if event is not None:
+                torch.cuda.current_stream(self.device).wait_event(event)
+        self._deltakv_deferred_prefetch_states = states
+
+    def _deltakv_get_deferred_prefix(
+        self,
+        *,
+        layer_idx: int,
+        row_idx: int,
+        kind: str,
+        end: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        key = (int(layer_idx), int(row_idx), str(kind), int(end))
+        states = getattr(self, "_deltakv_deferred_prefetch_states", None)
+        if states is None:
+            old_state = getattr(self, "_deltakv_deferred_prefetch_state", None)
+            states = {} if old_state is None else {self._deltakv_prefetch_key_from_state(old_state): old_state}
+            self._deltakv_deferred_prefetch_states = states
+            self._deltakv_deferred_prefetch_state = None
+        state = states.pop(key, None)
+        if state is not None:
+            with profiler.record("deltakv_deferred_prefetch_wait"):
+                torch.cuda.current_stream(self.device).wait_event(state["event"])
+                k_hist = state["k"]
+                v_hist = state["v"]
+                self._deltakv_deferred_prefetch_states = states
+                return k_hist, v_hist
+
+        with profiler.record("deltakv_deferred_restore_prefix"):
+            return self.raw_kv_offload_buffer.restore_prefix(
+                layer_idx=layer_idx,
+                row_idx=row_idx,
+                kind=kind,
+                end=end,
+                device=self.device,
+                dtype=self.deltakv_prefill_staging_kv_cache.dtype,
+            )
+
+    def _deltakv_schedule_next_deferred_prefetch(self, *, layer_idx: int, row_idx: int, end: int):
+        if int(end) <= 0 or not self._deltakv_deferred_prefetch_enabled():
+            return
+        future_layers = [
+            candidate
+            for candidate in self._deltakv_deferred_layer_order()
+            if int(candidate) > int(layer_idx)
+        ][: self._deltakv_deferred_prefetch_depth()]
+        if not future_layers:
+            return
+        states = getattr(self, "_deltakv_deferred_prefetch_states", None) or {}
+        keep_layers = set(int(layer) for layer in future_layers)
+        for key in list(states):
+            key_layer, key_row, _key_kind, key_end = key
+            if key_layer <= int(layer_idx) or key_row != int(row_idx) or key_end != int(end) or key_layer not in keep_layers:
+                self._deltakv_drop_deferred_prefetch(key)
+                states = getattr(self, "_deltakv_deferred_prefetch_states", None) or {}
+        stream = getattr(self, "_deltakv_deferred_prefetch_stream", None)
+        if stream is None:
+            stream = torch.cuda.Stream(device=self.device)
+            self._deltakv_deferred_prefetch_stream = stream
+        dtype = self.deltakv_prefill_staging_kv_cache.dtype
+        for next_layer in future_layers:
+            kind = self._deltakv_deferred_kind(next_layer)
+            key = (int(next_layer), int(row_idx), kind, int(end))
+            if key in states:
+                continue
+            with profiler.record("deltakv_deferred_prefetch_schedule"):
+                k_cpu, v_cpu = self.raw_kv_offload_buffer.get_prefix_cpu(
+                    layer_idx=next_layer,
+                    row_idx=row_idx,
+                    kind=kind,
+                    end=end,
+                )
+                with torch.cuda.stream(stream):
+                    k_gpu = torch.empty(tuple(k_cpu.shape), device=self.device, dtype=dtype)
+                    v_gpu = torch.empty(tuple(v_cpu.shape), device=self.device, dtype=dtype)
+                    k_gpu.copy_(k_cpu, non_blocking=True)
+                    v_gpu.copy_(v_cpu, non_blocking=True)
+                    event = torch.cuda.Event()
+                    event.record(stream)
+            states[key] = {
+                "layer_idx": int(next_layer),
+                "row_idx": int(row_idx),
+                "kind": kind,
+                "end": int(end),
+                "k": k_gpu,
+                "v": v_gpu,
+                "event": event,
+            }
+        self._deltakv_deferred_prefetch_states = states
+
+    @torch.no_grad()
+    def before_prefill_layer_attention(self, layer_idx: int, selection: SparseSelection):
+        del selection
+        if not bool(getattr(self, "_deltakv_deferred_prefill_step_active", False)):
+            return None
+        if not self.has_prefill_staging_view(layer_idx):
+            return None
+        start = int(getattr(self, "_deltakv_deferred_prefill_start", 0) or 0)
+        if start <= 0:
+            return None
+        row_idx = int(getattr(self, "_deltakv_deferred_prefill_row_idx", -1))
+        if row_idx < 0:
+            raise RuntimeError("DeltaKV deferred prefill restore has no active row.")
+
+        kind = self._deltakv_deferred_kind(layer_idx)
+        with profiler.record("deltakv_deferred_before_attention_restore"):
+            k_hist, v_hist = self._deltakv_get_deferred_prefix(
+                layer_idx=layer_idx,
+                row_idx=row_idx,
+                kind=kind,
+                end=start,
+            )
+        with profiler.record("deltakv_deferred_before_attention_prefetch"):
+            self._deltakv_schedule_next_deferred_prefetch(
+                layer_idx=layer_idx,
+                row_idx=row_idx,
+                end=start,
+            )
+        if kind == "sparse_pre_rope":
+            l_idx = self.deltakv_layer_to_idx[layer_idx]
+            with profiler.record("deltakv_deferred_restore_sparse_stage_copy"):
+                self.deltakv_prefill_staging_pre_rope_k_cache[:start] = k_hist.to(
+                    self.deltakv_prefill_staging_pre_rope_k_cache.dtype
+                )
+                self.deltakv_prefill_staging_kv_cache[1, :start] = v_hist.to(
+                    self.deltakv_prefill_staging_kv_cache.dtype
+                )
+            with profiler.record("deltakv_deferred_restore_sparse_rerope"):
+                pos = torch.arange(start, dtype=torch.long, device=self.device)
+                cos_sin = self.cos_sin_cache[pos]
+                cos, sin = cos_sin.chunk(2, dim=-1)
+                k_normed = self._apply_sparse_k_norm_if_needed(l_idx, k_hist)
+                k_postrope = apply_rotary_emb(k_normed, cos, sin)
+                self.deltakv_prefill_staging_kv_cache[0, :start] = k_postrope.to(
+                    self.deltakv_prefill_staging_kv_cache.dtype
+                )
+        else:
+            with profiler.record("deltakv_deferred_restore_full_stage_copy"):
+                self.deltakv_prefill_staging_kv_cache[0, :start] = k_hist.to(
+                    self.deltakv_prefill_staging_kv_cache.dtype
+                )
+                self.deltakv_prefill_staging_kv_cache[1, :start] = v_hist.to(
+                    self.deltakv_prefill_staging_kv_cache.dtype
+                )
+        return None
+
+    @torch.no_grad()
+    def _offload_deferred_prefill_layer(self, layer_idx: int):
+        start = int(getattr(self, "_deltakv_deferred_prefill_start", 0) or 0)
+        end = int(getattr(self, "_deltakv_deferred_prefill_end", 0) or 0)
+        total_len = int(getattr(self, "_deltakv_deferred_prefill_total_len", 0) or 0)
+        row_idx = int(getattr(self, "_deltakv_deferred_prefill_row_idx", -1))
+        if row_idx < 0 or end <= start:
+            raise RuntimeError(
+                "DeltaKV deferred prefill offload has invalid range: "
+                f"row={row_idx} start={start} end={end}."
+            )
+        kind = self._deltakv_deferred_kind(layer_idx)
+        if kind == "sparse_pre_rope":
+            k = self.deltakv_prefill_staging_pre_rope_k_cache[start:end]
+            v = self.deltakv_prefill_staging_kv_cache[1, start:end]
+        else:
+            k = self.deltakv_prefill_staging_kv_cache[0, start:end]
+            v = self.deltakv_prefill_staging_kv_cache[1, start:end]
+        with profiler.record("deltakv_deferred_offload_ensure_entry"):
+            self.raw_kv_offload_buffer.ensure_entry(
+                layer_idx=layer_idx,
+                row_idx=row_idx,
+                kind=kind,
+                total_len=total_len,
+                k_shape_tail=tuple(k.shape[1:]),
+                v_shape_tail=tuple(v.shape[1:]),
+                dtype=k.dtype,
+            )
+        with profiler.record("deltakv_deferred_offload_put_range"):
+            self.raw_kv_offload_buffer.put_range(
+                layer_idx=layer_idx,
+                row_idx=row_idx,
+                kind=kind,
+                start=start,
+                k=k,
+                v=v,
+            )
+
     def on_layer_attention_end(self, layer_idx: int):
         if not self.has_prefill_staging_view(layer_idx):
+            return
+
+        if bool(getattr(self, "_deltakv_deferred_prefill_step_active", False)) and not bool(
+            getattr(self, "_deltakv_deferred_prefill_is_last_chunk", False)
+        ):
+            self._offload_deferred_prefill_layer(layer_idx)
             return
 
         if self._full_layer_kivi_enabled() and layer_idx in self.full_layer_to_idx:
@@ -3505,6 +3758,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
                 row_idx = self.seq_id_to_row.pop(seq_id, None)
                 if row_idx is None:
                     raise ValueError
+                self.raw_kv_offload_buffer.release_row(int(row_idx))
 
                 cur_len = int(self.row_seq_lens[row_idx])
                 if cur_len <= 0:
@@ -3583,6 +3837,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
             row_idx = self.seq_id_to_row.pop(seq_id, None)
             if row_idx is None:
                 raise ValueError
+            self.raw_kv_offload_buffer.release_row(int(row_idx))
 
             cur_len = self.row_seq_lens[row_idx]
             if cur_len <= 0:
