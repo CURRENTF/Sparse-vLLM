@@ -104,3 +104,174 @@ Therefore the theoretical overlap argument is valid for the chunk sizes we actua
 - This is a single-layer microbenchmark. It does not include all vLLM scheduler overhead, DeltaKV final compression, Python hook overhead, allocator behavior, or full-model layer scheduling.
 - Interpolated rows are for shape intuition. Exact validation for chunk index 10 and 14 at every chunk size should be run when GPUs 4-7 are idle.
 - A real overlap implementation still needs proof from end-to-end profiling: H2D should be issued on a separate CUDA stream with pinned memory and `non_blocking=True`, and the consumer stream should only wait immediately before the attention backend needs the buffer.
+
+## 2026-07-06 current prefetch-path diagnosis
+
+- Status: completed.
+- Goal: explain why `SPARSEVLLM_RAWKV_PREFETCH=1` was slower end-to-end even though raw H2D load is smaller than chunk attention compute.
+- Script: `scripts/profiling/bench_rawkv_prefetch_path.py`
+- Launcher: `scripts/tmp/run_rawkv_prefetch_path_profile_20260706.sh`
+- Run root: `/data2/haojitai/outputs/Sparse-vLLM/rawkv_prefetch_path_20260706/full_gpu5_20260706_140334`
+- GPU: `CUDA_VISIBLE_DEVICES=5`; GPU5 was idle before launch.
+- Code: `f13a37a22d619decfaf95a1b38baa0a281b89bdd`; worktree had the new profiling script uncommitted.
+- Shape: Qwen2.5-7B GQA raw KV, `kv_heads=4`, `head_dim=128`, `bf16`; storage chunk size `65536`.
+
+The benchmark separates five costs:
+
+- `cpu_reassembly_ms`: `RawKVOffloadBuffer.get_prefix_cpu()` on chunked storage. This allocates a new pinned CPU contiguous prefix and copies all historical CPU chunks into it.
+- `current_prefetch_ms`: the historical `_deltakv_schedule_next_long_prefill_offload_prefetch()` pattern at the time of this run: call `get_prefix_cpu()`, allocate temporary GPU tensors, copy CPU prefix to GPU on a prefetch stream, then wait for measurement.
+- `restore_prefix_ms`: direct `RawKVOffloadBuffer.restore_prefix()` from CPU chunks into GPU output tensors, without first constructing a contiguous CPU prefix.
+- `ideal_h2d_ms`: copy from an already contiguous pinned CPU K+V prefix to GPU.
+- `attn_ms`: one FlashAttention chunk call in the same harness.
+
+| history n | chunk | CPU reassembly ms | current prefetch ms | restore_prefix ms | ideal H2D ms | attn ms | current/ideal | attn/current |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 65536 | 32768 | 0.85 | 4.73 | 2.58 | 2.50 | 92.03 | 1.90 | 19.44 |
+| 65536 | 65536 | 0.85 | 4.73 | 2.58 | 2.50 | 216.19 | 1.90 | 45.66 |
+| 294912 | 32768 | 15.50 | 30.61 | 11.85 | 10.99 | 344.44 | 2.78 | 11.25 |
+| 294912 | 65536 | 15.50 | 30.61 | 11.85 | 10.99 | 719.67 | 2.78 | 23.51 |
+| 589824 | 32768 | 30.05 | 56.50 | 23.43 | 22.38 | 669.54 | 2.52 | 11.85 |
+| 589824 | 65536 | 30.05 | 56.50 | 23.43 | 22.38 | 1363.04 | 2.52 | 24.13 |
+| 900000 | 32768 | 43.33 | 87.86 | 34.25 | 33.38 | 1011.92 | 2.63 | 11.52 |
+| 900000 | 65536 | 43.33 | 87.86 | 34.25 | 33.38 | 2039.90 | 2.63 | 23.22 |
+
+Diagnosis:
+
+The slowdown is not caused by raw PCIe/H2D bandwidth. At `history_n=900000`, direct chunked `restore_prefix()` is `34.25 ms`, essentially the same as ideal contiguous H2D at `33.38 ms`. The current prefetch path is `87.86 ms`, about `2.63x` ideal, because it first runs `get_prefix_cpu()` and spends `43.33 ms` constructing a new contiguous pinned CPU prefix. That CPU reassembly happens before the CUDA prefetch stream is issued, so it cannot overlap with current-layer FlashAttention.
+
+The code path responsible is:
+
+- Historical `src/sparsevllm/engine/cache_manager/deltakv_less_memory.py::_deltakv_schedule_next_long_prefill_offload_prefetch()`: called `raw_kv_offload_buffer.get_prefix_cpu()` before entering `torch.cuda.stream(stream)`.
+- `src/sparsevllm/engine/cache_manager/raw_kv_offload.py::get_prefix_cpu()`: for chunked mode, allocates `k_out`/`v_out` pinned CPU tensors and copies every chunk into that contiguous prefix.
+
+There is a second-order cost: the prefetched GPU tensors are temporary. When the layer is consumed, `before_prefill_layer_attention()` still copies `k_hist`/`v_hist` into `deltakv_prefill_staging_*` and, for sparse layers, reruns RoPE before attention. The prefetch therefore does not directly populate the final attention staging buffers.
+
+Recommended fix direction:
+
+Avoid `get_prefix_cpu()` in the prefetch path. Either copy CPU chunks directly into the destination GPU prefix tensor on the prefetch stream, or prefetch directly into the final staging cache slice that attention will read. The consumer should wait on a CUDA event only immediately before the final staging buffer is needed.
+
+## 2026-07-06 direct-stage prefetch fix validation
+
+- Status: completed.
+- Code change: `RawKVOffloadBuffer.copy_prefix_to()` copies chunked CPU backing chunks directly into caller-provided destination tensors. DeltaKV long-prefill offload prefetch now schedules the nearest future layer after the current layer attention has finished, copies directly into the shared final staging slices on a CUDA stream, records an event, and the future layer only waits for that event before consuming the staging buffer.
+- Safety constraint: direct staging uses the shared `deltakv_prefill_staging_kv_cache`, so only one future layer can be prefetched safely. The production scheduler always chooses the nearest next offload layer to avoid layer N+2 overwriting layer N+1's staged prefix.
+- Profiling artifact: `/data2/haojitai/outputs/Sparse-vLLM/rawkv_prefetch_path_20260706/direct_stage_after_fix_gpu5.jsonl`
+- End-to-end smoke artifact: `/data2/haojitai/outputs/Sparse-vLLM/rawkv_prefetch_path_20260706/e2e_smoke_direct_stage_gpu5_20260706_141531`
+
+Single-point 900k validation on GPU5:
+
+| history n | chunk | old current prefetch ms | direct-stage prefetch ms | ideal H2D ms | direct/ideal | attn/direct |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 900000 | 32768 | 206.04 | 33.53 | 33.31 | 1.01 | 30.16 |
+| 900000 | 65536 | 206.04 | 33.53 | 33.31 | 1.01 | 60.84 |
+
+The old current-prefetch number in this after-fix harness still runs the historical `get_prefix_cpu()` pattern for comparison. Its absolute value can vary with allocator and CPU-memory state, but the direct-stage path is stable: it is effectively identical to ideal pinned H2D and removes the CPU contiguous-prefix reassembly from the prefetch critical path.
+
+End-to-end smoke:
+
+```bash
+CUDA_VISIBLE_DEVICES=5 \
+SPARSEVLLM_LONG_PREFILL_OFFLOAD_MIN_TOKENS=1 \
+SPARSEVLLM_RAWKV_PREFETCH=1 \
+SPARSEVLLM_RAWKV_BUFFER_MODE=chunked \
+PYTHONPATH=$PWD:$PWD/src \
+TOKENIZERS_PARALLELISM=false \
+/home/haojitai/miniconda3/envs/svllm/bin/python benchmark/microbench.py \
+  --model_path /data2/haojitai/models/Qwen2.5-7B-Instruct-1M \
+  --methods deltakv \
+  --lengths 2048 \
+  --batch_sizes 1 \
+  --output_len 1 \
+  --hyper_params '{"deltakv_checkpoint_path":"/data2/haojitai/checkpoints/compressor/Qwen2.5-7B-Instruct-1M-Compressor","gpu_memory_utilization":0.75,"engine_prefill_chunk_size":1024,"max_num_seqs_in_batch":1,"max_decoding_seqs":1,"decode_cuda_graph":false,"enforce_eager":true,"full_attention_layers":"0,2,4,11,16,22","enable_full_layer_kivi_quant":true,"full_layer_kv_quant_bits":4,"deltakv_latent_quant_bits":4,"deltakv_center_ratio":0.1}'
+```
+
+Result: `status=SUCCESS`, `ttft=0.431s`, `prefill_tp=4749.23 tok/s`, peak memory `15.69 GB`. This smoke forces the long-prefill offload path on a short 2048-token prompt by setting `SPARSEVLLM_LONG_PREFILL_OFFLOAD_MIN_TOKENS=1`; it validates the control flow but is not a long-context throughput result.
+
+## 2026-07-06 DeltaKV 900k max-batch sweep
+
+- Status: completed; max successful batch size is `3`, first failing batch size is `4`.
+- Goal: measure the largest batch size that can run at `ctxlen=900000` after the direct-stage raw-KV prefetch fix.
+- Launcher: `scripts/tmp/run_deltakv_900k_max_bs_sweep_20260706.sh`
+- Run root: `/data2/haojitai/outputs/Sparse-vLLM/deltakv_900k_max_bs_direct_stage_20260706_gpu5`
+- Summary: `/data2/haojitai/outputs/Sparse-vLLM/deltakv_900k_max_bs_direct_stage_20260706_gpu5/summary.json`
+- Log: `/data2/haojitai/outputs/Sparse-vLLM/deltakv_900k_max_bs_direct_stage_20260706_gpu5/run.log`
+- GPU: `CUDA_VISIBLE_DEVICES=5`; GPU5 was idle before launch. GPU4 had existing memory use, and GPU6/GPU7 were busy, so they were not used for this sweep.
+- Code: branch `codex/deltakv-varlen-vram`, commit `f13a37a22d619decfaf95a1b38baa0a281b89bdd`, with uncommitted direct-stage prefetch and profiling changes.
+- Model: `/data2/haojitai/models/Qwen2.5-7B-Instruct-1M`
+- Compressor: `/data2/haojitai/checkpoints/compressor/Qwen2.5-7B-Instruct-1M-Compressor`
+- Key runtime knobs at the time of this pre-merge artifact: `vllm_sparse_method=deltakv`, `length=900000`, `output_len=1`, `chunk_prefill_size=65536`, `max_num_batched_tokens=131072`, the historical third prefill-policy name used during development, `gpu_memory_utilization=0.9`, `SPARSEVLLM_RAWKV_BUFFER_MODE=chunked`, `SPARSEVLLM_RAWKV_PREFETCH=1`, full layers `0,2,4,11,16,22`, KIVI full-layer quant enabled, latent/full KV quant bits `4`. Current code uses public `prefill_schedule_policy=long_bs1full_short_batch` plus the cache-manager `requires_long_prefill_offload()` hook for the same long-context offload behavior.
+
+| bs | status | TTFT s | prefill tok/s | benchmark mem GB | allocated tensors GiB | result |
+| ---: | --- | ---: | ---: | ---: | ---: | --- |
+| 1 | SUCCESS | 633.26 | 1421.22 | 39.74 | 16.24 | `/data2/haojitai/outputs/Sparse-vLLM/deltakv_900k_max_bs_direct_stage_20260706_gpu5/bs1/result.jsonl` |
+| 2 | SUCCESS | 633.29 | 1373.91 | 52.72 | 29.23 | `/data2/haojitai/outputs/Sparse-vLLM/deltakv_900k_max_bs_direct_stage_20260706_gpu5/bs2/result.jsonl` |
+| 3 | SUCCESS | 633.36 | 1328.97 | 65.71 | 42.21 | `/data2/haojitai/outputs/Sparse-vLLM/deltakv_900k_max_bs_direct_stage_20260706_gpu5/bs3/result.jsonl` |
+| 4 | FAILED | - | - | - | - | `/data2/haojitai/outputs/Sparse-vLLM/deltakv_900k_max_bs_direct_stage_20260706_gpu5/bs4/result.jsonl` |
+
+The `bs=4` run passed cache allocation but failed during prefill in `DeltaKVCacheManager.before_prefill_layer_attention()` while applying RoPE to the staged K prefix:
+
+```text
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 1.25 GiB. GPU 0 had 918.25 MiB free.
+```
+
+The failing line was `apply_rotary_emb(k_normed, cos, sin)`, whose implementation builds a concatenated post-rope tensor. This makes `bs=4` a runtime activation failure, not an admission-time cache-allocation failure.
+
+## 2026-07-06 RawKV load path cleanup
+
+- Status: implementation updated after the max-batch sweep.
+- Goal: remove the remaining runtime load inefficiencies now that direct-stage prefetch is validated.
+- Code paths:
+  - `RawKVOffloadBuffer.copy_prefix_to()` is now the only production RawKV load primitive.
+  - The legacy `RawKVOffloadBuffer.get_prefix_cpu()` API was removed from production code. The profiling script keeps a local legacy helper only to reproduce historical measurements.
+  - The old miss fallback `restore_prefix() -> temporary GPU tensor -> staging copy` was removed from production code.
+  - A prefetch miss now synchronously calls `copy_prefix_to()` into the final staging tensors, then continues with the existing sparse-layer RoPE step when needed.
+- Runtime default: long-prefill raw-KV prefetch is enabled by default. `SPARSEVLLM_RAWKV_PREFETCH=0` remains as an explicit debug opt-out, but normal runs no longer need to set `SPARSEVLLM_RAWKV_PREFETCH=1`.
+- Depth behavior: direct staging still uses one shared final staging buffer, so only the nearest next offload layer is prefetched safely.
+
+Expected effect:
+
+- Prefetch hit path: async CPU-chunk to final-staging copy plus one event wait.
+- Prefetch miss path: synchronous CPU-chunk to final-staging copy, with no temporary GPU prefix allocation and no second staging copy.
+- Layer-0 non-first chunks can still miss, but their miss path is now the same direct-stage copy primitive.
+
+Smoke validation:
+
+```bash
+CUDA_VISIBLE_DEVICES=5 \
+SPARSEVLLM_LONG_PREFILL_OFFLOAD_MIN_TOKENS=1 \
+SPARSEVLLM_RAWKV_BUFFER_MODE=chunked \
+PYTHONPATH=$PWD:$PWD/src \
+TOKENIZERS_PARALLELISM=false \
+/home/haojitai/miniconda3/envs/svllm/bin/python benchmark/microbench.py \
+  --model_path /data2/haojitai/models/Qwen2.5-7B-Instruct-1M \
+  --methods deltakv \
+  --lengths 2048 \
+  --batch_sizes 1 \
+  --output_len 1 \
+  --hyper_params '{"deltakv_checkpoint_path":"/data2/haojitai/checkpoints/compressor/Qwen2.5-7B-Instruct-1M-Compressor","gpu_memory_utilization":0.75,"engine_prefill_chunk_size":1024,"max_num_seqs_in_batch":1,"max_decoding_seqs":1,"decode_cuda_graph":false,"enforce_eager":true,"full_attention_layers":"0,2,4,11,16,22","enable_full_layer_kivi_quant":true,"full_layer_kv_quant_bits":4,"deltakv_latent_quant_bits":4,"deltakv_center_ratio":0.1}'
+```
+
+Artifact: `/data2/haojitai/outputs/Sparse-vLLM/rawkv_prefetch_path_20260706/direct_stage_miss_cleanup_smoke_gpu5_20260706_155330/run.log`
+
+Result: `status=SUCCESS`, `ttft=0.19s`, `prefill_tp=10861.25 tok/s`, peak memory `15.69 GB`. The command intentionally does not set `SPARSEVLLM_RAWKV_PREFETCH=1`; it validates the default-enabled prefetch path and direct-stage miss cleanup on a short forced long-prefill offload smoke, not long-context throughput.
+
+## 2026-07-06 policy-merge smoke
+
+- Status: completed.
+- Goal: validate that the public DeltaKV policy is now `long_bs1full_short_batch` and the ultra-long chunked path is selected through the cache-manager `requires_long_prefill_offload()` hook.
+- GPU: `CUDA_VISIBLE_DEVICES=7`; GPU7 was idle before launch.
+- Artifact: `/data2/haojitai/outputs/Sparse-vLLM/rawkv_prefetch_path_20260706/policy_merge_smoke_gpu7_20260706_161844/run.log`
+- Command used `SPARSEVLLM_LONG_PREFILL_OFFLOAD_MIN_TOKENS=1`, `SPARSEVLLM_RAWKV_BUFFER_MODE=chunked`, and did not set the removed historical third policy name.
+
+Result: `status=SUCCESS`, resolved config `prefill_schedule_policy='long_bs1full_short_batch'`, `ttft=0.18s`, `prefill_tp=11439.98 tok/s`, peak memory `15.69 GB`. This is a short forced-offload smoke, not a long-context throughput result.
+
+## 2026-07-06 PyramidKV policy-merge smoke
+
+- Status: completed after one failed attempt.
+- Goal: validate that PyramidKV can use the same public `long_bs1full_short_batch` policy with the cache-manager `requires_long_prefill_offload()` hook, restoring historical RawKV into staging across prefill chunks and materializing the selected final KV on the last chunk.
+- GPU: `CUDA_VISIBLE_DEVICES=7`; GPU7 was idle before launch.
+- Successful artifact: `/data2/haojitai/outputs/Sparse-vLLM/pyramidkv_long_prefill_offload_smoke_20260706_164417_gpu7/run.log`
+- Failed warmup artifact before the score-collection fix: `/data2/haojitai/outputs/Sparse-vLLM/pyramidkv_long_prefill_offload_smoke_20260706_164313_gpu7/run.log`
+- Command used `SPARSEVLLM_LONG_PREFILL_OFFLOAD_MIN_TOKENS=1`, `SPARSEVLLM_RAWKV_BUFFER_MODE=chunked`, `--methods pyramidkv`, `--lengths 8192`, `--batch_sizes 1`, `--output_len 1`, `engine_prefill_chunk_size=4096`, `decode_cuda_graph=false`, and `enforce_eager=true`.
+
+Result: `status=SUCCESS`, resolved config `prefill_schedule_policy='long_bs1full_short_batch'`, `ttft=1.60s`, `prefill_tp=5129.17 tok/s`, peak memory `59.27 GB`. This is a short forced-offload smoke that exercises PyramidKV chunked staging and final materialization; it is not a long-context throughput result.

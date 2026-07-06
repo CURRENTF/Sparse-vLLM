@@ -28,7 +28,7 @@ Conclusion: for realistic chunk sizes (`>=2048`, and especially the current `327
 
 - Status: the chunked CPU RawKV offload mode meets the active throughput target at 900k context while avoiding the original DeltaKV full-prefill OOM.
 - Working dir: `/home/haojitai/projects/Sparse-vLLM-deltakv-varlen-vram`
-- Code: `de85dd3923318bd446fd99095c435eed1d18805c` plus uncommitted RawKVOffloadBuffer/deferred-prefill changes.
+- Code: `de85dd3923318bd446fd99095c435eed1d18805c` plus uncommitted RawKVOffloadBuffer long-prefill offload changes.
 - Model: `/data2/haojitai/models/Qwen2.5-7B-Instruct-1M`
 - DeltaKV compressor: `/data2/haojitai/checkpoints/compressor/Qwen2.5-7B-Instruct-1M-Compressor`
 - Common config: `batch_sizes=1`, `lengths=900000`, `output_len=1`, `tensor_parallel_size=1`, `gpu_memory_utilization=0.9`, `max_num_seqs_in_batch=1`, `max_decoding_seqs=1`, `full_attn_layers=0,2,4,11,16,22`, `enable_full_layer_kivi_quant=true`, `full_layer_kv_quant_bits=4`, `kv_quant_bits=4`, `cluster_ratio=0.1`, `decode_cuda_graph=false`, `enforce_eager=true`.
@@ -46,7 +46,7 @@ Conclusion: for realistic chunk sizes (`>=2048`, and especially the current `327
 | `/data2/haojitai/outputs/Sparse-vLLM/deltakv_rawkv_directfull_900k_chunk64k_20260704_gpu5` | aborted | 65536 | DeltaKV | n/a | n/a | n/a | Full-layer direct restore did not finish faster than baseline and was stopped. |
 | `/data2/haojitai/outputs/Sparse-vLLM/deltakv_rawkv_prefill_after_fix_900k_chunk32k_20260704_gpu5` | completed | 32768 | Vanilla | 587.22s | 1532.65 | 72.99 GB | Vanilla comparison; 90% target is 1379.39 tok/s. |
 
-Conclusion: chunked CPU RawKV storage is required for the 900k target. Contiguous pinned CPU backing store spends too much time on large per-layer allocations and writes; with chunked storage, DeltaKV reaches 1411.50 tok/s, above the 1379.39 tok/s target. Current CPU prefetch is not a useful optimization: depth 1 drops to 1050.05 tok/s and depth 2 drops to 1132.92 tok/s while increasing memory. The end-to-end run still shows long non-token intervals from deferred restore/finalize work, so future tuning should profile those phases instead of only increasing chunk size.
+Conclusion: chunked CPU RawKV storage is required for the 900k target. Contiguous pinned CPU backing store spends too much time on large per-layer allocations and writes; with chunked storage, DeltaKV reaches 1411.50 tok/s, above the 1379.39 tok/s target. The old CPU prefetch path was not a useful optimization: depth 1 drops to 1050.05 tok/s and depth 2 drops to 1132.92 tok/s while increasing memory. The end-to-end run still shows long non-token intervals from long-prefill offload restore/finalize work, so future tuning should profile those phases instead of only increasing chunk size.
 
 ## 2026-07-04 - LongBench Quality Regression
 
@@ -57,7 +57,7 @@ Conclusion: chunked CPU RawKV storage is required for the 900k target. Contiguou
 | Run | Status | Vanilla | DeltaKV | Delta vs baseline DeltaKV | Notes |
 | --- | --- | ---: | ---: | ---: | --- |
 | Baseline full quality | completed | 58.28 | 57.96 | 0.00 | Pre-change reference. |
-| Intermediate chunked-deferred quality | failed quality gate | 58.28 | 9.38 | -48.58 | Deferred policy accidentally chunked ordinary LongBench prompts. |
-| Final quality after deferred threshold fix | completed | 58.28 | 57.96 | 0.00 | Restores old full-prefill staging for prompts below 262144 tokens. |
+| Intermediate ungated offload quality | failed quality gate | 58.28 | 9.38 | -48.58 | Long-prefill offload accidentally chunked ordinary LongBench prompts. |
+| Final quality after offload threshold fix | completed | 58.28 | 57.96 | 0.00 | Restores full-prefill staging for prompts below 262144 tokens. |
 
-Correctness conclusion: the raw-KV deferred path must be gated to truly long prompts. The default threshold is `SPARSEVLLM_DEFERRED_PREFILL_MIN_TOKENS=262144`; prompts below that keep the legacy DeltaKV full-prefill staging semantics, while 900k prompts still use chunked deferred prefill.
+Correctness conclusion: the raw-KV offload path must be gated to truly long prompts. The default threshold is `SPARSEVLLM_LONG_PREFILL_OFFLOAD_MIN_TOKENS=262144`; prompts below that keep the DeltaKV full-prefill staging semantics, while 900k prompts still use chunked long-prefill offload staging.

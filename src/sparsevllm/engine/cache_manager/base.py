@@ -698,8 +698,8 @@ class CacheManager(ABC):
         """Writable KV capacity for a specific prefill candidate."""
         return int(self.prefill_step_free_slots())
 
-    def uses_prefill_staging_step_capacity(self, seq: Sequence) -> bool:
-        """Whether this prefill candidate uses a temporary staging/offload step capacity."""
+    def requires_long_prefill_offload(self, seq: Sequence) -> bool:
+        """Whether this long prefill should be internally chunked through offload staging."""
         del seq
         return False
 

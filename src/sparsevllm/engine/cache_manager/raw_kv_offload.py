@@ -143,16 +143,16 @@ class RawKVOffloadBuffer:
         entry.filled_until = max(int(entry.filled_until), end)
 
     @torch.no_grad()
-    def restore_prefix(
+    def copy_prefix_to(
         self,
         *,
         layer_idx: int,
         row_idx: int,
         kind: str,
         end: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        k_out: torch.Tensor,
+        v_out: torch.Tensor,
+    ) -> None:
         key = (int(layer_idx), int(row_idx), str(kind))
         entry = self._entries.get(key)
         if entry is None:
@@ -160,12 +160,21 @@ class RawKVOffloadBuffer:
         end = int(end)
         if end < 0 or end > int(entry.filled_until):
             raise RuntimeError(
-                "RawKVOffloadBuffer restore_prefix reads an unwritten range: "
+                "RawKVOffloadBuffer copy_prefix_to reads an unwritten range: "
                 f"key={key} end={end} filled_until={int(entry.filled_until)}."
             )
+        if int(k_out.shape[0]) < end or int(v_out.shape[0]) < end:
+            raise RuntimeError(
+                "RawKVOffloadBuffer copy_prefix_to destination is too short: "
+                f"key={key} end={end} k_out={tuple(k_out.shape)} v_out={tuple(v_out.shape)}."
+            )
+        if tuple(k_out.shape[1:]) != tuple(entry.k_shape_tail) or tuple(v_out.shape[1:]) != tuple(entry.v_shape_tail):
+            raise RuntimeError(
+                "RawKVOffloadBuffer copy_prefix_to destination tail mismatch: "
+                f"key={key} k_out={tuple(k_out.shape)} expected_k_tail={entry.k_shape_tail} "
+                f"v_out={tuple(v_out.shape)} expected_v_tail={entry.v_shape_tail}."
+            )
         if entry.chunks is not None:
-            k_out = torch.empty((end, *entry.k_shape_tail), device=device, dtype=dtype)
-            v_out = torch.empty((end, *entry.v_shape_tail), device=device, dtype=dtype)
             cursor = 0
             for chunk_start in sorted(entry.chunks):
                 k_chunk, v_chunk = entry.chunks[chunk_start]
@@ -173,7 +182,7 @@ class RawKVOffloadBuffer:
                 chunk_end = chunk_start + int(k_chunk.shape[0])
                 if chunk_start > cursor:
                     raise RuntimeError(
-                        "RawKVOffloadBuffer chunked restore_prefix found a gap: "
+                        "RawKVOffloadBuffer chunked copy_prefix_to found a gap: "
                         f"key={key} cursor={cursor} next_start={chunk_start}."
                     )
                 if chunk_end <= cursor:
@@ -190,66 +199,14 @@ class RawKVOffloadBuffer:
                     break
             if cursor != end:
                 raise RuntimeError(
-                    "RawKVOffloadBuffer chunked restore_prefix did not fill requested prefix: "
+                    "RawKVOffloadBuffer chunked copy_prefix_to did not fill requested prefix: "
                     f"key={key} cursor={cursor} end={end}."
                 )
-            return k_out, v_out
+            return
         if entry.k is None or entry.v is None:
             raise RuntimeError(f"RawKVOffloadBuffer contiguous entry is missing tensors for key={key}.")
-        return (
-            entry.k[:end].to(device=device, dtype=dtype, non_blocking=True),
-            entry.v[:end].to(device=device, dtype=dtype, non_blocking=True),
-        )
-
-    def get_prefix_cpu(
-        self,
-        *,
-        layer_idx: int,
-        row_idx: int,
-        kind: str,
-        end: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        key = (int(layer_idx), int(row_idx), str(kind))
-        entry = self._entries.get(key)
-        if entry is None:
-            raise RuntimeError(f"RawKVOffloadBuffer entry is missing for key={key}.")
-        end = int(end)
-        if end < 0 or end > int(entry.filled_until):
-            raise RuntimeError(
-                "RawKVOffloadBuffer get_prefix_cpu reads an unwritten range: "
-                f"key={key} end={end} filled_until={int(entry.filled_until)}."
-            )
-        if entry.chunks is not None:
-            k_out = torch.empty((end, *entry.k_shape_tail), dtype=entry.dtype, device="cpu", pin_memory=self.pin_memory)
-            v_out = torch.empty((end, *entry.v_shape_tail), dtype=entry.dtype, device="cpu", pin_memory=self.pin_memory)
-            cursor = 0
-            for chunk_start in sorted(entry.chunks):
-                k_chunk, v_chunk = entry.chunks[chunk_start]
-                chunk_start = int(chunk_start)
-                chunk_end = chunk_start + int(k_chunk.shape[0])
-                if chunk_start > cursor:
-                    raise RuntimeError(
-                        "RawKVOffloadBuffer chunked get_prefix_cpu found a gap: "
-                        f"key={key} cursor={cursor} next_start={chunk_start}."
-                    )
-                copy_end = min(end, chunk_end)
-                if cursor < copy_end:
-                    src_start = cursor - chunk_start
-                    src_end = copy_end - chunk_start
-                    k_out[cursor:copy_end].copy_(k_chunk[src_start:src_end], non_blocking=True)
-                    v_out[cursor:copy_end].copy_(v_chunk[src_start:src_end], non_blocking=True)
-                    cursor = copy_end
-                if cursor >= end:
-                    break
-            if cursor != end:
-                raise RuntimeError(
-                    "RawKVOffloadBuffer chunked get_prefix_cpu did not fill requested prefix: "
-                    f"key={key} cursor={cursor} end={end}."
-                )
-            return k_out, v_out
-        if entry.k is None or entry.v is None:
-            raise RuntimeError(f"RawKVOffloadBuffer contiguous entry is missing tensors for key={key}.")
-        return entry.k[:end], entry.v[:end]
+        k_out[:end].copy_(entry.k[:end], non_blocking=True)
+        v_out[:end].copy_(entry.v[:end], non_blocking=True)
 
     def release_layer(self, *, layer_idx: int, row_idx: int, kind: str | None = None) -> None:
         prefix = (int(layer_idx), int(row_idx))

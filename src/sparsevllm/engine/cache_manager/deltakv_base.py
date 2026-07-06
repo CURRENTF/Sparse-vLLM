@@ -10,7 +10,6 @@ import torch
 from sparsevllm.config import Config
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.method_registry import (
-    PREFILL_POLICY_LONG_BS1CHUNKED_DEFERRED_SHORT_BATCH,
     PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
 )
 from sparsevllm.utils.context import get_context
@@ -164,12 +163,12 @@ class DeltaKVCacheManager(CacheManager):
         self._deltakv_full_prefill_plans: dict[int, dict[str, torch.Tensor | int]] = {}
         self._deltakv_full_prefill_compressed_layers: set[int] = set()
         self.raw_kv_offload_buffer = RawKVOffloadBuffer(pin_memory=torch.cuda.is_available())
-        self._deltakv_deferred_prefill_step_active = False
-        self._deltakv_deferred_prefill_row_idx: int | None = None
-        self._deltakv_deferred_prefill_start = 0
-        self._deltakv_deferred_prefill_end = 0
-        self._deltakv_deferred_prefill_total_len = 0
-        self._deltakv_deferred_prefill_is_last_chunk = False
+        self._deltakv_long_prefill_offload_step_active = False
+        self._deltakv_long_prefill_offload_row_idx: int | None = None
+        self._deltakv_long_prefill_offload_start = 0
+        self._deltakv_long_prefill_offload_end = 0
+        self._deltakv_long_prefill_offload_total_len = 0
+        self._deltakv_long_prefill_offload_is_last_chunk = False
 
     def _init_compressor_modules(self, config: Config, num_deltakv_layers: int):
         from sparsevllm.utils.compressor import create_compressor
@@ -193,11 +192,11 @@ class DeltaKVCacheManager(CacheManager):
         if clear_plans:
             self._deltakv_full_prefill_plans = {}
         self._deltakv_full_prefill_compressed_layers = set()
-        self._deltakv_deferred_prefill_row_idx = None
-        self._deltakv_deferred_prefill_start = 0
-        self._deltakv_deferred_prefill_end = 0
-        self._deltakv_deferred_prefill_total_len = 0
-        self._deltakv_deferred_prefill_is_last_chunk = False
+        self._deltakv_long_prefill_offload_row_idx = None
+        self._deltakv_long_prefill_offload_start = 0
+        self._deltakv_long_prefill_offload_end = 0
+        self._deltakv_long_prefill_offload_total_len = 0
+        self._deltakv_long_prefill_offload_is_last_chunk = False
 
     def _use_decode_static_paths(self) -> bool:
         if get_context().is_prefill:
@@ -278,26 +277,18 @@ class DeltaKVCacheManager(CacheManager):
         return torch.tensor(rel, dtype=torch.long, device=self.device)
 
     def _should_use_full_prefill_staging(self, seqs: list[Sequence]) -> bool:
-        # DeltaKV's default prefill policy is long_bs1full_short_batch. Long prompts
-        # are isolated into a single-sequence full-prefill step and written through
-        # the max_model_len-sized staging workspace, then compressed only after the
-        # layer attention has consumed raw/full KV context. Short prompts are the
-        # scheduler bucket with prompt_len <= chunk_prefill_size; they use the raw
-        # KV pool directly; the scheduler must run each short prompt's remaining
-        # prefill in one step or defer it, rather than chunking it and allowing
-        # DeltaKV eviction to create compressed prefill context. This is enforced
-        # through scheduling/free-slot budgets, not through a separate
-        # prefill_bs * chunk_prefill_size <= max_model_len validation.
+        # DeltaKV's public prefill policy is long_bs1full_short_batch. Most long
+        # prompts are isolated into a single-sequence full-prefill staging step.
+        # Ultra-long prompts may instead use the same policy with an internal
+        # RawKV offload staging path, so the scheduler chunks the long prompt
+        # while DeltaKV keeps eviction/compression postponed until the final chunk.
         policy = getattr(self.config, "prefill_schedule_policy", None)
-        if policy not in (
-            PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
-            PREFILL_POLICY_LONG_BS1CHUNKED_DEFERRED_SHORT_BATCH,
-        ):
+        if policy != PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH:
             return False
         if not self.deltakv_layer_ids or len(seqs) != 1:
             return False
         seq = seqs[0]
-        if policy == PREFILL_POLICY_LONG_BS1CHUNKED_DEFERRED_SHORT_BATCH and self._is_deferred_prefill_candidate(seq):
+        if self.requires_long_prefill_offload(seq):
             return False
         remaining = int(seq.num_prompt_tokens - seq.num_prefilled_tokens)
         return (
@@ -306,41 +297,48 @@ class DeltaKVCacheManager(CacheManager):
             and remaining > int(self.config.chunk_prefill_size)
         )
 
-    def _deferred_prefill_min_tokens(self) -> int:
-        raw = os.getenv("SPARSEVLLM_DEFERRED_PREFILL_MIN_TOKENS", "262144")
+    def _long_prefill_offload_min_tokens(self) -> int:
+        raw = os.getenv("SPARSEVLLM_LONG_PREFILL_OFFLOAD_MIN_TOKENS")
+        legacy_raw = os.getenv("SPARSEVLLM_DEFERRED_PREFILL_MIN_TOKENS")
+        if raw is not None and legacy_raw is not None and raw != legacy_raw:
+            raise ValueError(
+                "SPARSEVLLM_LONG_PREFILL_OFFLOAD_MIN_TOKENS and "
+                "SPARSEVLLM_DEFERRED_PREFILL_MIN_TOKENS are both set with different values."
+            )
+        raw = raw if raw is not None else (legacy_raw if legacy_raw is not None else "262144")
         try:
             value = int(raw)
         except ValueError as exc:
             raise ValueError(
-                f"SPARSEVLLM_DEFERRED_PREFILL_MIN_TOKENS must be an integer, got {raw!r}."
+                f"SPARSEVLLM_LONG_PREFILL_OFFLOAD_MIN_TOKENS must be an integer, got {raw!r}."
             ) from exc
         return max(0, value)
 
-    def _is_deferred_prefill_candidate(self, seq: Sequence) -> bool:
+    def requires_long_prefill_offload(self, seq: Sequence) -> bool:
         if (
             getattr(self.config, "prefill_schedule_policy", None)
-            != PREFILL_POLICY_LONG_BS1CHUNKED_DEFERRED_SHORT_BATCH
+            != PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH
         ):
             return False
         remaining = int(seq.num_prompt_tokens) - int(seq.num_prefilled_tokens)
         prompt_len = int(seq.num_prompt_tokens)
         return (
             prompt_len > int(self.config.chunk_prefill_size)
-            and prompt_len >= self._deferred_prefill_min_tokens()
+            and prompt_len >= self._long_prefill_offload_min_tokens()
             and remaining > 0
         )
 
-    def _should_use_deferred_prefill_staging(self, seqs: list[Sequence]) -> bool:
+    def _should_use_long_prefill_offload_staging(self, seqs: list[Sequence]) -> bool:
         if not self.deltakv_layer_ids or len(seqs) != 1:
             return False
         seq = seqs[0]
-        return self._is_deferred_prefill_candidate(seq) and int(seq.current_chunk_size or 0) > 0
+        return self.requires_long_prefill_offload(seq) and int(seq.current_chunk_size or 0) > 0
 
     def is_full_prefill_step(self, seqs: list[Sequence]) -> bool:
         return self._should_use_full_prefill_staging(seqs)
 
     def defer_prefill_eviction(self) -> bool:
-        return bool(getattr(self, "_deltakv_deferred_prefill_step_active", False))
+        return bool(getattr(self, "_deltakv_long_prefill_offload_step_active", False))
 
     @staticmethod
     def _deltakv_full_prefill_plan_cpu(
@@ -430,10 +428,10 @@ class DeltaKVCacheManager(CacheManager):
     def prepare_step(self, seqs: list[Sequence], is_prefill: bool):
         # Reset per-step cache to avoid stale views across steps.
         self._deltakv_reset_view_cache()
-        use_deferred_prefill = bool(is_prefill and self._should_use_deferred_prefill_staging(seqs))
-        self._deltakv_deferred_prefill_step_active = use_deferred_prefill
-        self._deltakv_reset_full_prefill_staging(clear_plans=not use_deferred_prefill)
-        self._deltakv_deferred_prefill_step_active = use_deferred_prefill
+        use_long_prefill_offload = bool(is_prefill and self._should_use_long_prefill_offload_staging(seqs))
+        self._deltakv_long_prefill_offload_step_active = use_long_prefill_offload
+        self._deltakv_reset_full_prefill_staging(clear_plans=not use_long_prefill_offload)
+        self._deltakv_long_prefill_offload_step_active = use_long_prefill_offload
         return super().prepare_step(seqs, is_prefill)
 
     def allocate_kv_cache(self):
@@ -874,7 +872,7 @@ class DeltaKVCacheManager(CacheManager):
         context_lens: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if self.has_prefill_staging_view(layer_idx):
-            if bool(getattr(self, "_deltakv_deferred_prefill_step_active", False)):
+            if bool(getattr(self, "_deltakv_long_prefill_offload_step_active", False)):
                 visible_len = int(context_lens.max().item()) if context_lens.numel() > 0 else 0
                 if visible_len > int(k_current.shape[0]):
                     return (
@@ -1024,17 +1022,14 @@ class DeltaKVCacheManager(CacheManager):
         # checked in _prepare_prefill() and decode reconstruction reserve is excluded.
         return int(self.num_free_slots)
 
-    def uses_prefill_staging_step_capacity(self, seq: Sequence) -> bool:
-        return self._is_deferred_prefill_candidate(seq)
-
     def prefill_step_free_slots_for(self, seq: Sequence) -> int:
-        if self._is_deferred_prefill_candidate(seq):
+        if self.requires_long_prefill_offload(seq):
             staging_slots = int(getattr(self, "deltakv_prefill_staging_num_slots", 0) or 0)
             return max(0, staging_slots - int(seq.num_prefilled_tokens))
         return super().prefill_step_free_slots_for(seq)
 
     def prefill_step_reservation_cost(self, seq: Sequence, scheduled_tokens: int) -> int:
-        if self._is_deferred_prefill_candidate(seq):
+        if self.requires_long_prefill_offload(seq):
             return 0
         return super().prefill_step_reservation_cost(seq, scheduled_tokens)
 
@@ -1755,8 +1750,8 @@ class DeltaKVCacheManager(CacheManager):
 
     def _prepare_prefill(self, seqs: list[Sequence]):
         with profiler.record("cache_prepare_prefill"):
-            use_deferred_prefill_staging = self._should_use_deferred_prefill_staging(seqs)
-            use_full_prefill_staging = self._should_use_full_prefill_staging(seqs) or use_deferred_prefill_staging
+            use_long_prefill_offload_staging = self._should_use_long_prefill_offload_staging(seqs)
+            use_full_prefill_staging = self._should_use_full_prefill_staging(seqs) or use_long_prefill_offload_staging
             total_chunk_tokens = sum(seq.current_chunk_size for seq in seqs)
             if use_full_prefill_staging and total_chunk_tokens > int(self.deltakv_prefill_staging_num_slots):
                 raise RuntimeError(
@@ -1794,27 +1789,27 @@ class DeltaKVCacheManager(CacheManager):
                 self._allocate_full(seq.seq_id, chunk_size)
                 row_idx = self.seq_id_to_row[seq.seq_id]
                 if use_full_prefill_staging:
-                    if not use_deferred_prefill_staging and start_idx != 0:
+                    if not use_long_prefill_offload_staging and start_idx != 0:
                         raise RuntimeError("DeltaKV full-prefill staging only supports first-prefill prompts.")
                     staging_range = torch.arange(
-                        start_idx if use_deferred_prefill_staging else token_offset,
-                        end_idx if use_deferred_prefill_staging else token_offset + chunk_size,
+                        start_idx if use_long_prefill_offload_staging else token_offset,
+                        end_idx if use_long_prefill_offload_staging else token_offset + chunk_size,
                         dtype=torch.int32,
                         device=self.device,
                     )
                     full_slot_mapping[token_offset: token_offset + chunk_size] = staging_range
                     deltakv_slot_mapping[token_offset: token_offset + chunk_size] = staging_range
-                    if use_deferred_prefill_staging:
+                    if use_long_prefill_offload_staging:
                         if end_idx > int(self.deltakv_prefill_staging_num_slots):
                             raise RuntimeError(
-                                "DeltaKV deferred prefill staging capacity is too small for this chunk. "
+                                "DeltaKV long-prefill offload staging capacity is too small for this chunk. "
                                 f"context_len={end_idx} staging_slots={self.deltakv_prefill_staging_num_slots}."
                             )
                         if start_idx == 0:
                             self._prepare_full_prefill_staging_plan(seq, row_idx, seq.num_prompt_tokens)
                         elif row_idx not in self._deltakv_full_prefill_plans:
                             raise RuntimeError(
-                                "DeltaKV deferred prefill lost its full-prefill plan between chunks. "
+                                "DeltaKV long-prefill offload lost its full-prefill plan between chunks. "
                                 f"seq_id={seq.seq_id} row={row_idx} start={start_idx}."
                             )
                     else:
@@ -1827,12 +1822,12 @@ class DeltaKVCacheManager(CacheManager):
                         self.sparse_layer_raw_slots_map[row_idx, start_idx:end_idx]
 
                 self.row_seq_lens[row_idx] += chunk_size
-                if use_deferred_prefill_staging:
-                    self._deltakv_deferred_prefill_row_idx = int(row_idx)
-                    self._deltakv_deferred_prefill_start = int(start_idx)
-                    self._deltakv_deferred_prefill_end = int(end_idx)
-                    self._deltakv_deferred_prefill_total_len = int(seq.num_prompt_tokens)
-                    self._deltakv_deferred_prefill_is_last_chunk = bool(seq.is_last_chunk_prefill)
+                if use_long_prefill_offload_staging:
+                    self._deltakv_long_prefill_offload_row_idx = int(row_idx)
+                    self._deltakv_long_prefill_offload_start = int(start_idx)
+                    self._deltakv_long_prefill_offload_end = int(end_idx)
+                    self._deltakv_long_prefill_offload_total_len = int(seq.num_prompt_tokens)
+                    self._deltakv_long_prefill_offload_is_last_chunk = bool(seq.is_last_chunk_prefill)
                 context_lens_list.append(end_idx)
                 req_indices.append(row_idx)
 
@@ -1874,8 +1869,8 @@ class DeltaKVCacheManager(CacheManager):
                 offset = 0
                 for b_idx, seq in enumerate(seqs):
                     chunk_size = int(seq.current_chunk_size)
-                    visible_len = int(seq.num_prefilled_tokens) + chunk_size if use_deferred_prefill_staging else chunk_size
-                    slot_start = 0 if use_deferred_prefill_staging else offset
+                    visible_len = int(seq.num_prefilled_tokens) + chunk_size if use_long_prefill_offload_staging else chunk_size
+                    slot_start = 0 if use_long_prefill_offload_staging else offset
                     active_slots[b_idx, :visible_len] = torch.arange(
                         slot_start,
                         slot_start + visible_len,
