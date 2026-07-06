@@ -151,13 +151,6 @@ class Scheduler:
             and num_batched_seqs < self.max_num_seqs_in_batch
         )
 
-    def _requires_whole_short_prefill_step(self, target_is_long: bool) -> bool:
-        return (
-            self.prefill_schedule_policy == PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH
-            and is_deltakv_method(self.config.vllm_sparse_method)
-            and not target_is_long
-        )
-
     def _requires_long_prefill_offload(self, seq: Sequence) -> bool:
         if self.prefill_schedule_policy != PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH:
             return False
@@ -202,14 +195,6 @@ class Scheduler:
                         step_free_count,
                     )
                 return int(remaining_prefill_tokens)
-            if self._requires_whole_short_prefill_step(target_is_long):
-                available = min(
-                    self.max_num_batched_tokens - num_batched_tokens,
-                    step_free_count,
-                )
-                if remaining_prefill_tokens <= self.chunk_prefill_size and remaining_prefill_tokens <= available:
-                    return int(remaining_prefill_tokens)
-                return 0
             return min(
                 remaining_prefill_tokens,
                 self.chunk_prefill_size,
@@ -370,23 +355,12 @@ class Scheduler:
                                 int(candidate_step_free_count),
                                 int(step_free_count),
                             )
-                    if self._requires_whole_short_prefill_step(target_is_long):
-                        available = min(
-                            self.max_num_batched_tokens - num_batched_tokens,
-                            step_free_count,
-                        )
-                        blocked_prefill_step_failure = (seq, int(remaining_prefill_tokens), int(available))
-                    elif self.memory_oracle.requires_full_prefill_step(seq):
+                    if self.memory_oracle.requires_full_prefill_step(seq):
                         available = min(
                             self.max_num_batched_tokens - num_batched_tokens,
                             candidate_step_free_count,
                         )
-                        blocked_prefill_capacity_failure = (
-                            seq,
-                            int(remaining_prefill_tokens),
-                            int(available),
-                            int(step_free_count),
-                        )
+                        blocked_prefill_step_failure = (seq, int(remaining_prefill_tokens), int(available))
                     logger.debug(f'{can_prefill_tokens=} 结束 schedule prefill 请求')
                     self.waiting.append(seq)
                     continue
@@ -569,7 +543,8 @@ class Scheduler:
             if blocked_prefill_step_failure is not None and not self.decoding:
                 seq, need, free = blocked_prefill_step_failure
                 raise RuntimeError(
-                    "DeltaKV short prefill cannot be split across multiple steps. "
+                    "Prefill candidate requires an atomic prefill step but cannot fit. "
+                    f"cache_manager={type(self.memory_oracle).__name__} "
                     f"seq_id={seq.seq_id} prompt_len={seq.num_prompt_tokens} "
                     f"remaining_prefill_tokens={need} available_step_tokens={free} "
                     f"chunk_prefill_size={self.chunk_prefill_size} "

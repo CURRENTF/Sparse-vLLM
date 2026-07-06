@@ -28,6 +28,7 @@ if str(SCBENCH_DIR) not in sys.path:
     sys.path.insert(0, str(SCBENCH_DIR))
 
 from benchmark.sparsevllm_regression.manifest import (  # noqa: E402
+    compressor_path_for,
     load_manifest,
     missing_runtime_inputs,
     resolve_manifest_paths,
@@ -206,7 +207,10 @@ def method_runtime_config(
     cfg.update((method.get("model_configs") or {}).get(model_id, {}))
     cfg.pop("hf_sparse_method", None)
     cfg["sparse_method"] = method["sparse_method"]
-    cfg["enable_prefix_caching"] = True
+    compressor_path = compressor_path_for(manifest["models"][model_id], method)
+    if compressor_path:
+        cfg.setdefault("deltakv_checkpoint_path", compressor_path)
+    cfg["enable_prefix_caching"] = method["sparse_method"] in {"vanilla", "omnikv", "quest"}
     cfg["decode_cuda_graph"] = bool(decode_cuda_graph)
     cfg["enforce_eager"] = bool(not decode_cuda_graph) if enforce_eager is None else bool(enforce_eager)
     if decode_cuda_graph:

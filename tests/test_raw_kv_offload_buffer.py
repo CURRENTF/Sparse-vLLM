@@ -1,11 +1,44 @@
 import unittest
+from unittest.mock import patch
 
 import torch
 
-from sparsevllm.engine.cache_manager.raw_kv_offload import RawKVOffloadBuffer
+from sparsevllm.engine.cache_manager.raw_kv_offload import (
+    RawKVOffloadBuffer,
+    resolve_long_prefill_offload_min_tokens,
+)
 
 
 class RawKVOffloadBufferTest(unittest.TestCase):
+    def test_resolve_long_prefill_offload_min_tokens(self):
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(resolve_long_prefill_offload_min_tokens(), 262144)
+
+        with patch.dict(
+            "os.environ",
+            {"SPARSEVLLM_LONG_PREFILL_OFFLOAD_MIN_TOKENS": "123"},
+            clear=True,
+        ):
+            self.assertEqual(resolve_long_prefill_offload_min_tokens(), 123)
+
+        with patch.dict(
+            "os.environ",
+            {"SPARSEVLLM_DEFERRED_PREFILL_MIN_TOKENS": "456"},
+            clear=True,
+        ):
+            self.assertEqual(resolve_long_prefill_offload_min_tokens(), 456)
+
+        with patch.dict(
+            "os.environ",
+            {
+                "SPARSEVLLM_LONG_PREFILL_OFFLOAD_MIN_TOKENS": "123",
+                "SPARSEVLLM_DEFERRED_PREFILL_MIN_TOKENS": "456",
+            },
+            clear=True,
+        ):
+            with self.assertRaisesRegex(ValueError, "both set"):
+                resolve_long_prefill_offload_min_tokens()
+
     def test_chunked_mode_is_default(self):
         buffer = RawKVOffloadBuffer(pin_memory=False)
 
@@ -59,6 +92,59 @@ class RawKVOffloadBufferTest(unittest.TestCase):
 
                 self.assertTrue(torch.equal(k_out, torch.cat([k0, k1], dim=0)))
                 self.assertTrue(torch.equal(v_out, torch.cat([v0, v1], dim=0)))
+                entry = buffer._entries[(3, 1, "sparse_pre_rope")]
+                self.assertEqual(entry.producer_events, {})
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for stream dependency coverage")
+    def test_cuda_put_range_producer_event_orders_cross_stream_copy_prefix(self):
+        device = torch.device("cuda")
+        for mode in ("chunked", "contiguous"):
+            with self.subTest(mode=mode):
+                buffer = RawKVOffloadBuffer(pin_memory=True, mode=mode)
+                buffer.ensure_entry(
+                    layer_idx=0,
+                    row_idx=0,
+                    kind="sparse_pre_rope",
+                    total_len=4,
+                    k_shape_tail=(1, 2),
+                    v_shape_tail=(1, 2),
+                    dtype=torch.float32,
+                )
+                producer_stream = torch.cuda.Stream(device=device)
+                consumer_stream = torch.cuda.Stream(device=device)
+                expected_k = torch.arange(8, dtype=torch.float32).reshape(4, 1, 2)
+                expected_v = expected_k + 100
+
+                with torch.cuda.stream(producer_stream):
+                    k = expected_k.to(device=device)
+                    v = expected_v.to(device=device)
+                    buffer.put_range(
+                        layer_idx=0,
+                        row_idx=0,
+                        kind="sparse_pre_rope",
+                        start=0,
+                        k=k,
+                        v=v,
+                    )
+
+                entry = buffer._entries[(0, 0, "sparse_pre_rope")]
+                self.assertIn(0, entry.producer_events)
+
+                k_out = torch.empty((4, 1, 2), dtype=torch.float32, device=device)
+                v_out = torch.empty((4, 1, 2), dtype=torch.float32, device=device)
+                with torch.cuda.stream(consumer_stream):
+                    buffer.copy_prefix_to(
+                        layer_idx=0,
+                        row_idx=0,
+                        kind="sparse_pre_rope",
+                        end=4,
+                        k_out=k_out,
+                        v_out=v_out,
+                    )
+                consumer_stream.synchronize()
+
+                self.assertTrue(torch.equal(k_out.cpu(), expected_k))
+                self.assertTrue(torch.equal(v_out.cpu(), expected_v))
 
     def test_chunked_mode_rejects_gaps(self):
         buffer = RawKVOffloadBuffer(pin_memory=False, mode="chunked")

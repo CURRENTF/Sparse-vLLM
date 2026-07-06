@@ -6,6 +6,25 @@ import os
 import torch
 
 
+def resolve_long_prefill_offload_min_tokens(default: int = 262144) -> int:
+    raw = os.getenv("SPARSEVLLM_LONG_PREFILL_OFFLOAD_MIN_TOKENS")
+    legacy_raw = os.getenv("SPARSEVLLM_DEFERRED_PREFILL_MIN_TOKENS")
+    if raw is not None and legacy_raw is not None and raw != legacy_raw:
+        raise ValueError(
+            "SPARSEVLLM_LONG_PREFILL_OFFLOAD_MIN_TOKENS and "
+            "SPARSEVLLM_DEFERRED_PREFILL_MIN_TOKENS are both set with different values."
+        )
+    if raw is None:
+        raw = legacy_raw if legacy_raw is not None else str(int(default))
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"SPARSEVLLM_LONG_PREFILL_OFFLOAD_MIN_TOKENS must be an integer, got {raw!r}."
+        ) from exc
+    return max(0, value)
+
+
 @dataclass
 class _RawKVEntry:
     k: torch.Tensor | None
@@ -16,6 +35,7 @@ class _RawKVEntry:
     v_shape_tail: tuple[int, ...] = ()
     dtype: torch.dtype | None = None
     chunks: dict[int, tuple[torch.Tensor, torch.Tensor]] | None = None
+    producer_events: dict[int, tuple[int, torch.cuda.Event]] | None = None
 
 
 class RawKVOffloadBuffer:
@@ -74,6 +94,7 @@ class RawKVOffloadBuffer:
                 v_shape_tail=tuple(v_shape_tail),
                 dtype=dtype,
                 chunks={},
+                producer_events={},
             )
         else:
             self._entries[key] = _RawKVEntry(
@@ -93,7 +114,53 @@ class RawKVOffloadBuffer:
                 k_shape_tail=tuple(k_shape_tail),
                 v_shape_tail=tuple(v_shape_tail),
                 dtype=dtype,
+                producer_events={},
             )
+
+    @staticmethod
+    def _record_producer_event(
+        entry: _RawKVEntry,
+        *,
+        start: int,
+        end: int,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> None:
+        if entry.producer_events is None or (not k.is_cuda and not v.is_cuda):
+            return
+        device = k.device if k.is_cuda else v.device
+        event = torch.cuda.Event()
+        event.record(torch.cuda.current_stream(device=device))
+        entry.producer_events[int(start)] = (int(end), event)
+
+    @staticmethod
+    def _wait_for_producer_event(event: torch.cuda.Event, dst: torch.Tensor) -> None:
+        if dst.is_cuda:
+            torch.cuda.current_stream(device=dst.device).wait_event(event)
+        else:
+            event.synchronize()
+
+    @classmethod
+    def _wait_for_range_producers(
+        cls,
+        entry: _RawKVEntry,
+        *,
+        start: int,
+        end: int,
+        dst: torch.Tensor,
+    ) -> None:
+        if entry.producer_events is None:
+            return
+        start = int(start)
+        end = int(end)
+        for event_start, (event_end, event) in sorted(entry.producer_events.items()):
+            event_start = int(event_start)
+            event_end = int(event_end)
+            if event_start >= end:
+                break
+            if event_end <= start:
+                continue
+            cls._wait_for_producer_event(event, dst)
 
     @torch.no_grad()
     def put_range(
@@ -135,11 +202,13 @@ class RawKVOffloadBuffer:
             k_cpu.copy_(k.detach().to(dtype=entry.dtype), non_blocking=True)
             v_cpu.copy_(v.detach().to(dtype=entry.dtype), non_blocking=True)
             entry.chunks[start] = (k_cpu, v_cpu)
+            self._record_producer_event(entry, start=start, end=end, k=k, v=v)
         else:
             if entry.k is None or entry.v is None:
                 raise RuntimeError(f"RawKVOffloadBuffer contiguous entry is missing tensors for key={key}.")
-            entry.k[start:end].copy_(k.detach().to(device="cpu", dtype=entry.k.dtype), non_blocking=True)
-            entry.v[start:end].copy_(v.detach().to(device="cpu", dtype=entry.v.dtype), non_blocking=True)
+            entry.k[start:end].copy_(k.detach().to(dtype=entry.k.dtype), non_blocking=True)
+            entry.v[start:end].copy_(v.detach().to(dtype=entry.v.dtype), non_blocking=True)
+            self._record_producer_event(entry, start=start, end=end, k=k, v=v)
         entry.filled_until = max(int(entry.filled_until), end)
 
     @torch.no_grad()
@@ -192,6 +261,12 @@ class RawKVOffloadBuffer:
                 if copy_start < copy_end:
                     src_start = copy_start - chunk_start
                     src_end = copy_end - chunk_start
+                    self._wait_for_range_producers(
+                        entry,
+                        start=copy_start,
+                        end=copy_end,
+                        dst=k_out,
+                    )
                     k_out[copy_start:copy_end].copy_(k_chunk[src_start:src_end], non_blocking=True)
                     v_out[copy_start:copy_end].copy_(v_chunk[src_start:src_end], non_blocking=True)
                     cursor = copy_end
@@ -205,6 +280,7 @@ class RawKVOffloadBuffer:
             return
         if entry.k is None or entry.v is None:
             raise RuntimeError(f"RawKVOffloadBuffer contiguous entry is missing tensors for key={key}.")
+        self._wait_for_range_producers(entry, start=0, end=end, dst=k_out)
         k_out[:end].copy_(entry.k[:end], non_blocking=True)
         v_out[:end].copy_(entry.v[:end], non_blocking=True)
 

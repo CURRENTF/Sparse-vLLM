@@ -165,12 +165,16 @@ class CacheManager(ABC):
 
         # Keep this heuristic conservative: large prefill batches can still peak on
         # MLP activations and allocator fragmentation after KV cache allocation.
-        estimated_max_tokens = int(reserved_mem / (intermediate_size_per_rank * dtype_size * 10))
+        estimated_max_tokens = int(reserved_mem / (intermediate_size_per_rank * dtype_size * 4))
         allow_large_prefill_chunk = os.getenv("SPARSEVLLM_ALLOW_LARGE_PREFILL_CHUNK", "0") == "1"
-        if 2 * config.chunk_prefill_size >= estimated_max_tokens:
+        prefill_policy = getattr(config, "prefill_schedule_policy", None)
+        chunk_guard_multiplier = 1 if prefill_policy == "long_bs1full_short_batch" else 2
+        guarded_chunk_tokens = chunk_guard_multiplier * int(config.chunk_prefill_size)
+        if guarded_chunk_tokens >= estimated_max_tokens:
             msg = (
-                f"2*chunk_prefill_size={2 * config.chunk_prefill_size} >= "
-                f"estimated_max_tokens={estimated_max_tokens}"
+                f"{chunk_guard_multiplier}*chunk_prefill_size={guarded_chunk_tokens} >= "
+                f"estimated_max_tokens={estimated_max_tokens} "
+                f"(prefill_schedule_policy={prefill_policy!r})"
             )
             if not allow_large_prefill_chunk:
                 raise AssertionError(msg)

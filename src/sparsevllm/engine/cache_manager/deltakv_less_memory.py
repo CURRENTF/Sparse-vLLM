@@ -1642,6 +1642,12 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         group_size = self._full_layer_kivi_group_size()
         return max(1, token_chunk_size // group_size)
 
+    def _deltakv_finish_full_prefill_staging(self):
+        super()._deltakv_finish_full_prefill_staging()
+        self._deltakv_clear_long_prefill_offload_prefetch()
+        self._full_layer_kivi_full_prefill_plans = {}
+        self._full_layer_kivi_full_prefill_materialized_layers = set()
+
     @torch.no_grad()
     def _allocate_full_positions(self, seq_id: int, positions: torch.Tensor) -> torch.Tensor:
         positions = positions.to(device=self.device, dtype=torch.int32).contiguous()

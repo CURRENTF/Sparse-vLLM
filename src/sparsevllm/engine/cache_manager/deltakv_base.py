@@ -18,7 +18,7 @@ from sparsevllm.utils.profiler import profiler
 from sparsevllm.layers.rotary_embedding import get_rope, apply_rotary_emb
 
 from .base import CacheManager, DecodeComputeView, LayerBatchStates, PrefillComputeView, SparseSelection
-from .raw_kv_offload import RawKVOffloadBuffer
+from .raw_kv_offload import RawKVOffloadBuffer, resolve_long_prefill_offload_min_tokens
 
 
 @dataclass(frozen=True)
@@ -298,21 +298,7 @@ class DeltaKVCacheManager(CacheManager):
         )
 
     def _long_prefill_offload_min_tokens(self) -> int:
-        raw = os.getenv("SPARSEVLLM_LONG_PREFILL_OFFLOAD_MIN_TOKENS")
-        legacy_raw = os.getenv("SPARSEVLLM_DEFERRED_PREFILL_MIN_TOKENS")
-        if raw is not None and legacy_raw is not None and raw != legacy_raw:
-            raise ValueError(
-                "SPARSEVLLM_LONG_PREFILL_OFFLOAD_MIN_TOKENS and "
-                "SPARSEVLLM_DEFERRED_PREFILL_MIN_TOKENS are both set with different values."
-            )
-        raw = raw if raw is not None else (legacy_raw if legacy_raw is not None else "262144")
-        try:
-            value = int(raw)
-        except ValueError as exc:
-            raise ValueError(
-                f"SPARSEVLLM_LONG_PREFILL_OFFLOAD_MIN_TOKENS must be an integer, got {raw!r}."
-            ) from exc
-        return max(0, value)
+        return resolve_long_prefill_offload_min_tokens()
 
     def requires_long_prefill_offload(self, seq: Sequence) -> bool:
         if (
@@ -333,6 +319,18 @@ class DeltaKVCacheManager(CacheManager):
             return False
         seq = seqs[0]
         return self.requires_long_prefill_offload(seq) and int(seq.current_chunk_size or 0) > 0
+
+    def requires_full_prefill_step(self, seq: Sequence) -> bool:
+        if (
+            getattr(self.config, "prefill_schedule_policy", None)
+            != PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH
+        ):
+            return False
+        if self.requires_long_prefill_offload(seq):
+            return False
+        prompt_len = int(seq.num_prompt_tokens)
+        remaining = prompt_len - int(seq.num_prefilled_tokens)
+        return 0 < remaining and prompt_len <= int(self.config.chunk_prefill_size)
 
     def is_full_prefill_step(self, seqs: list[Sequence]) -> bool:
         return self._should_use_full_prefill_staging(seqs)
@@ -507,12 +505,13 @@ class DeltaKVCacheManager(CacheManager):
         #   num_seqs_in_batch * top_k_per_seq
         # For prefill, num_seqs_in_batch is also bounded by (max_num_batched_tokens / chunk_size)
         # when chunks are full; cap by max_seqs to avoid over-estimation.
-        max_prefill_seqs_by_tokens = (int(config.max_num_batched_tokens) + int(config.chunk_prefill_size) - 1) // int(
-            config.chunk_prefill_size
+        max_prefill_seqs_by_tokens = max(
+            1,
+            int(config.max_num_batched_tokens) // int(config.chunk_prefill_size),
         )
         max_prefill_seqs = min(max_admission_seqs, max_prefill_seqs_by_tokens)
         total_top_slots = max(max_seqs * top_tokens, max_prefill_seqs * top_tokens)
-        max_step_chunk = int(min(int(config.max_num_batched_tokens), max_admission_seqs * int(config.chunk_prefill_size)))
+        max_step_chunk = int(min(int(config.max_num_batched_tokens), max_prefill_seqs * int(config.chunk_prefill_size)))
         overhead_slots = max_admission_seqs * (sink + 2 * recent) + total_top_slots + max_step_chunk
         if max_deltakv_full_slots <= overhead_slots:
             raise RuntimeError(
@@ -1740,6 +1739,8 @@ class DeltaKVCacheManager(CacheManager):
             keep_pos = plan["keep_pos"].to(device=keep_slots.device, dtype=torch.int32)
             self.deltakv_slot_to_pos[keep_slots] = keep_pos
         self._deltakv_prefill_staging_active = False
+        self._deltakv_full_prefill_plans = {}
+        self._deltakv_full_prefill_compressed_layers = set()
 
     def on_layer_attention_end(self, layer_idx: int):
         if not self.has_prefill_staging_view(layer_idx):

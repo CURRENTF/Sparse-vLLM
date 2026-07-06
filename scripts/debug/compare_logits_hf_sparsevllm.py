@@ -21,6 +21,7 @@ from deltakv.configs.default_paths import compressor_path, model_path, output_pa
 from deltakv.get_chat_api import get_generate_api
 from benchmark.long_bench.pred import build_chat
 from sparsevllm.config import Config
+from sparsevllm.engine.cache_manager.raw_kv_offload import resolve_long_prefill_offload_min_tokens
 from sparsevllm.engine.model_runner import ModelRunner
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.method_registry import (
@@ -2051,24 +2052,6 @@ def _sparse_long_text_threshold(config: Config, *, is_prefill: bool) -> int:
     return int(base) + (int(config.chunk_prefill_size) if is_prefill else 0)
 
 
-def _long_prefill_offload_min_tokens() -> int:
-    raw = os.getenv("SPARSEVLLM_LONG_PREFILL_OFFLOAD_MIN_TOKENS")
-    legacy_raw = os.getenv("SPARSEVLLM_DEFERRED_PREFILL_MIN_TOKENS")
-    if raw is not None and legacy_raw is not None and raw != legacy_raw:
-        raise ValueError(
-            "SPARSEVLLM_LONG_PREFILL_OFFLOAD_MIN_TOKENS and "
-            "SPARSEVLLM_DEFERRED_PREFILL_MIN_TOKENS are both set with different values."
-        )
-    raw = raw if raw is not None else (legacy_raw if legacy_raw is not None else "262144")
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise ValueError(
-            f"SPARSEVLLM_LONG_PREFILL_OFFLOAD_MIN_TOKENS must be an integer, got {raw!r}."
-        ) from exc
-    return max(0, value)
-
-
 def _sparse_prefill_chunk_size(config: Config, seq: Sequence) -> int:
     remaining = int(seq.num_prompt_tokens) - int(seq.num_prefilled_tokens)
     if remaining <= 0:
@@ -2082,7 +2065,7 @@ def _sparse_prefill_chunk_size(config: Config, seq: Sequence) -> int:
         if int(seq.num_prompt_tokens) > int(threshold):
             if (
                 is_deltakv_method(config.vllm_sparse_method)
-                and int(seq.num_prompt_tokens) >= _long_prefill_offload_min_tokens()
+                and int(seq.num_prompt_tokens) >= resolve_long_prefill_offload_min_tokens()
             ):
                 return min(int(config.chunk_prefill_size), remaining)
             return remaining

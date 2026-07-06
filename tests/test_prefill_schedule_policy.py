@@ -1114,7 +1114,11 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
             method="deltakv-less-memory",
             chunk=8192,
             max_tokens=16384,
-            oracle=FakeMemoryOracle(step_free_slots=32, long_prefill_offload=False),
+            oracle=FakeMemoryOracle(
+                step_free_slots=32,
+                force_whole_prefill=True,
+                long_prefill_offload=False,
+            ),
         )
         short_seq = seq_with_len(8192)
         decode_seq = seq_with_len(3)
@@ -1460,12 +1464,12 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
             method="deltakv",
             chunk=8192,
             max_tokens=16384,
-            oracle=FakeMemoryOracle(step_free_slots=32),
+            oracle=FakeMemoryOracle(step_free_slots=32, force_whole_prefill=True),
         )
         short_seq = seq_with_len(8192)
         scheduler.add(short_seq)
 
-        with self.assertRaisesRegex(RuntimeError, "DeltaKV short prefill cannot be split"):
+        with self.assertRaisesRegex(RuntimeError, "atomic prefill step"):
             scheduler.schedule()
 
     def test_full_prefill_hook_routes_short_bucket_as_single_full_prefill(self):
@@ -1737,6 +1741,23 @@ class DeltaKVFullPrefillStagingTest(unittest.TestCase):
         manager.config.prefill_schedule_policy = PREFILL_POLICY_ALL_CHUNKED
         self.assertFalse(DeltaKVCacheManager._should_use_full_prefill_staging(manager, [seq]))
 
+    def test_deltakv_short_atomic_prefill_requirement_is_cache_manager_owned(self):
+        manager = object.__new__(DeltaKVCacheManager)
+        manager.config = SimpleNamespace(
+            prefill_schedule_policy=PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
+            chunk_prefill_size=8192,
+        )
+        manager.deltakv_layer_ids = [0]
+
+        short_seq = seq_with_len(8192)
+        self.assertTrue(DeltaKVCacheManager.requires_full_prefill_step(manager, short_seq))
+
+        long_seq = seq_with_len(9000)
+        self.assertFalse(DeltaKVCacheManager.requires_full_prefill_step(manager, long_seq))
+
+        with patch.dict(os.environ, {"SPARSEVLLM_LONG_PREFILL_OFFLOAD_MIN_TOKENS": "1"}, clear=False):
+            self.assertFalse(DeltaKVCacheManager.requires_full_prefill_step(manager, long_seq))
+
     def test_full_prefill_plan_keeps_only_persistent_final_representation(self):
         plan = DeltaKVCacheManager._deltakv_full_prefill_plan_cpu(
             20,
@@ -1810,6 +1831,59 @@ class DeltaKVFullPrefillStagingTest(unittest.TestCase):
 
         self.assertEqual(calls, [0])
         self.assertFalse(manager._deltakv_prefill_staging_active)
+
+    def test_finish_full_prefill_staging_clears_completed_plans(self):
+        manager = object.__new__(DeltaKVCacheManager)
+        released_rows = []
+        manager.raw_kv_offload_buffer = SimpleNamespace(
+            release_row=lambda row_idx: released_rows.append(int(row_idx))
+        )
+        manager._deltakv_prefill_staging_active = True
+        manager._deltakv_full_prefill_compressed_layers = {0}
+        manager._deltakv_full_prefill_plans = {
+            3: {
+                "row_idx": 3,
+                "keep_slots": torch.empty((0,), dtype=torch.int32),
+                "keep_pos": torch.empty((0,), dtype=torch.int32),
+            }
+        }
+        manager.deltakv_slot_to_pos = torch.empty((0,), dtype=torch.int32)
+
+        DeltaKVCacheManager._deltakv_finish_full_prefill_staging(manager)
+
+        self.assertEqual(released_rows, [3])
+        self.assertFalse(manager._deltakv_prefill_staging_active)
+        self.assertEqual(manager._deltakv_full_prefill_plans, {})
+        self.assertEqual(manager._deltakv_full_prefill_compressed_layers, set())
+
+    def test_less_memory_finish_full_prefill_staging_clears_kivi_plans(self):
+        manager = object.__new__(DeltaKVLessMemoryCacheManager)
+        released_rows = []
+        manager.raw_kv_offload_buffer = SimpleNamespace(
+            release_row=lambda row_idx: released_rows.append(int(row_idx))
+        )
+        manager._deltakv_prefill_staging_active = True
+        manager._deltakv_full_prefill_compressed_layers = {1}
+        manager._deltakv_full_prefill_plans = {
+            4: {
+                "row_idx": 4,
+                "keep_slots": torch.empty((0,), dtype=torch.int32),
+                "keep_pos": torch.empty((0,), dtype=torch.int32),
+            }
+        }
+        manager.deltakv_slot_to_pos = torch.empty((0,), dtype=torch.int32)
+        manager._full_layer_kivi_full_prefill_plans = {4: {"row_idx": 4}}
+        manager._full_layer_kivi_full_prefill_materialized_layers = {0}
+        manager._deltakv_clear_long_prefill_offload_prefetch = lambda: None
+
+        DeltaKVLessMemoryCacheManager._deltakv_finish_full_prefill_staging(manager)
+
+        self.assertEqual(released_rows, [4])
+        self.assertFalse(manager._deltakv_prefill_staging_active)
+        self.assertEqual(manager._deltakv_full_prefill_plans, {})
+        self.assertEqual(manager._deltakv_full_prefill_compressed_layers, set())
+        self.assertEqual(manager._full_layer_kivi_full_prefill_plans, {})
+        self.assertEqual(manager._full_layer_kivi_full_prefill_materialized_layers, set())
 
 
 class DeltaKVLessMemoryStorageContractTest(unittest.TestCase):

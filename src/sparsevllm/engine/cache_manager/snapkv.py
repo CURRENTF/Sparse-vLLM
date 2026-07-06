@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from collections import deque
 
 import numpy as np
@@ -15,7 +14,7 @@ from sparsevllm.utils.log import logger, log_level
 from sparsevllm.utils.profiler import profiler
 
 from .base import CacheManager, LayerBatchStates, PrefillComputeView, SparseSelection
-from .raw_kv_offload import RawKVOffloadBuffer
+from .raw_kv_offload import RawKVOffloadBuffer, resolve_long_prefill_offload_min_tokens
 
 
 class SnapKVCacheManager(CacheManager):
@@ -128,21 +127,7 @@ class SnapKVCacheManager(CacheManager):
         self._pyramidkv_long_prefill_offload_is_last_chunk = False
 
     def _long_prefill_offload_min_tokens(self) -> int:
-        raw = os.getenv("SPARSEVLLM_LONG_PREFILL_OFFLOAD_MIN_TOKENS")
-        legacy_raw = os.getenv("SPARSEVLLM_DEFERRED_PREFILL_MIN_TOKENS")
-        if raw is not None and legacy_raw is not None and raw != legacy_raw:
-            raise ValueError(
-                "SPARSEVLLM_LONG_PREFILL_OFFLOAD_MIN_TOKENS and "
-                "SPARSEVLLM_DEFERRED_PREFILL_MIN_TOKENS are both set with different values."
-            )
-        raw = raw if raw is not None else (legacy_raw if legacy_raw is not None else "262144")
-        try:
-            value = int(raw)
-        except ValueError as exc:
-            raise ValueError(
-                f"SPARSEVLLM_LONG_PREFILL_OFFLOAD_MIN_TOKENS must be an integer, got {raw!r}."
-            ) from exc
-        return max(0, value)
+        return resolve_long_prefill_offload_min_tokens()
 
     def requires_long_prefill_offload(self, seq: Sequence) -> bool:
         if not self._pyramidkv_can_use_full_prefill_staging():
