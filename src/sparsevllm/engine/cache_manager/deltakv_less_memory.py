@@ -1859,7 +1859,10 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
             if key in states:
                 continue
             with profiler.record("deltakv_long_prefill_offload_prefetch_schedule"):
+                staging_available_event = torch.cuda.Event()
+                staging_available_event.record(torch.cuda.current_stream(self.device))
                 with torch.cuda.stream(stream):
+                    stream.wait_event(staging_available_event)
                     if kind == "sparse_pre_rope":
                         k_dst = self.deltakv_prefill_staging_pre_rope_k_cache[:end]
                         v_dst = self.deltakv_prefill_staging_kv_cache[1, :end]
@@ -1882,6 +1885,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
                 "kind": kind,
                 "end": int(end),
                 "direct_stage": True,
+                "staging_available_event": staging_available_event,
                 "event": event,
             }
         self._deltakv_long_prefill_offload_prefetch_states = states

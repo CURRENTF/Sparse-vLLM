@@ -18,6 +18,30 @@ from sparsevllm.triton_kernel.gqa_flash_decoding_stage1_hd256 import (
 from sparsevllm.utils.profiler import profiler
 
 
+def _fake_attention_enabled() -> bool:
+    value = os.environ.get("SPARSEVLLM_FAKE_ATTENTION", "")
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _fake_attention_output(q: torch.Tensor) -> torch.Tensor:
+    mode = os.environ.get("SPARSEVLLM_FAKE_ATTENTION_MODE", "zero").strip().lower()
+    if mode in {"zero", "zeros"}:
+        return torch.zeros_like(q)
+    if mode == "copy":
+        return q.clone()
+    if mode == "empty":
+        return torch.empty_like(q)
+    raise ValueError(
+        "SPARSEVLLM_FAKE_ATTENTION_MODE must be one of 'zero', 'copy', or 'empty', "
+        f"got {mode!r}."
+    )
+
+
+def _fill_fake_attention_score(attn_score: torch.Tensor | None) -> None:
+    if attn_score is not None:
+        attn_score.zero_()
+
+
 class TritonAttentionBackend:
     """Thin backend wrapper around the existing Sparse-vLLM Triton attention kernels."""
 
@@ -33,6 +57,9 @@ class TritonAttentionBackend:
         b_seq_len = view.context_lens
         b_prompt_cache_len = b_seq_len - chunk_lens
         self._debug_check_prefill_bounds(q, view, chunk_lens=chunk_lens)
+        if _fake_attention_enabled():
+            _fill_fake_attention_score(view.attn_score)
+            return _fake_attention_output(q)
         o = torch.empty_like(q)
         context_attention_fwd(
             q,
@@ -121,6 +148,9 @@ class TritonAttentionBackend:
         num_heads: int,
         num_kv_heads: int,
     ) -> torch.Tensor:
+        if _fake_attention_enabled():
+            _fill_fake_attention_score(view.attn_score)
+            return _fake_attention_output(q)
         if view.backend == "full_layer_kivi":
             self._run_full_layer_kivi_decode_stage1(
                 q,

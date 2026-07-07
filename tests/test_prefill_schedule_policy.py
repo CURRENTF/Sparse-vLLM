@@ -1887,6 +1887,91 @@ class DeltaKVFullPrefillStagingTest(unittest.TestCase):
 
 
 class DeltaKVLessMemoryStorageContractTest(unittest.TestCase):
+    def test_long_prefill_offload_prefetch_waits_for_current_stream_before_staging_write(self):
+        manager = object.__new__(DeltaKVLessMemoryCacheManager)
+        manager.device = "cuda:0"
+        manager._deltakv_long_prefill_offload_prefetch_stream = None
+        manager._deltakv_long_prefill_offload_prefetch_states = {}
+        manager._deltakv_long_prefill_offload_layer_order = lambda: [0, 1]
+        manager._deltakv_long_prefill_offload_kind = lambda layer_idx: "sparse_pre_rope"
+        manager._deltakv_long_prefill_offload_prefetch_enabled = lambda: True
+        manager.deltakv_prefill_staging_pre_rope_k_cache = torch.empty((4, 1, 1))
+        manager.deltakv_prefill_staging_kv_cache = torch.empty((2, 4, 1, 1))
+
+        calls = []
+        created_events = []
+
+        class FakeEvent:
+            def __init__(self):
+                self.name = f"event{len(created_events)}"
+                created_events.append(self)
+
+            def record(self, stream=None):
+                calls.append(("record", self.name, getattr(stream, "name", None)))
+
+        class FakeStream:
+            def __init__(self, device=None, *, name="prefetch"):
+                self.device = device
+                self.name = name
+
+            def wait_event(self, event):
+                calls.append(("wait", self.name, event.name))
+
+        class FakeStreamContext:
+            def __init__(self, stream):
+                self.stream = stream
+
+            def __enter__(self):
+                calls.append(("enter", self.stream.name))
+                return self.stream
+
+            def __exit__(self, exc_type, exc, tb):
+                calls.append(("exit", self.stream.name))
+                return False
+
+        def fake_current_stream(device=None):
+            return FakeStream(device=device, name="current")
+
+        def fake_copy_prefix_to(**kwargs):
+            calls.append(("copy_prefix_to", int(kwargs["layer_idx"]), int(kwargs["end"])))
+
+        manager.raw_kv_offload_buffer = SimpleNamespace(copy_prefix_to=fake_copy_prefix_to)
+
+        with (
+            patch("sparsevllm.engine.cache_manager.deltakv_less_memory.torch.cuda.Event", FakeEvent),
+            patch("sparsevllm.engine.cache_manager.deltakv_less_memory.torch.cuda.Stream", FakeStream),
+            patch(
+                "sparsevllm.engine.cache_manager.deltakv_less_memory.torch.cuda.stream",
+                lambda stream: FakeStreamContext(stream),
+            ),
+            patch(
+                "sparsevllm.engine.cache_manager.deltakv_less_memory.torch.cuda.current_stream",
+                fake_current_stream,
+            ),
+        ):
+            DeltaKVLessMemoryCacheManager._deltakv_schedule_next_long_prefill_offload_prefetch(
+                manager,
+                layer_idx=0,
+                row_idx=3,
+                end=2,
+            )
+
+        self.assertEqual(
+            calls,
+            [
+                ("record", "event0", "current"),
+                ("enter", "prefetch"),
+                ("wait", "prefetch", "event0"),
+                ("copy_prefix_to", 1, 2),
+                ("record", "event1", "prefetch"),
+                ("exit", "prefetch"),
+            ],
+        )
+        key = (1, 3, "sparse_pre_rope", 2)
+        state = manager._deltakv_long_prefill_offload_prefetch_states[key]
+        self.assertIs(state["staging_available_event"], created_events[0])
+        self.assertIs(state["event"], created_events[1])
+
     def test_compressor_residual_quant_group_size_uses_payload_dim(self):
         from sparsevllm.engine.cache_manager.deltakv_less_memory import DeltaKVLessMemoryCacheManager
 
