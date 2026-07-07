@@ -37,6 +37,8 @@ class SnapKVCacheManager(CacheManager):
         self._pyramidkv_long_prefill_offload_end = 0
         self._pyramidkv_long_prefill_offload_total_len = 0
         self._pyramidkv_long_prefill_offload_is_last_chunk = False
+        self._pyramidkv_long_prefill_offload_prefetch_stream = None
+        self._pyramidkv_long_prefill_offload_prefetch_states: dict[tuple[int, int, str, int], dict] = {}
         self.allocate_kv_cache()
 
         self.layer_num_slots = []
@@ -112,6 +114,7 @@ class SnapKVCacheManager(CacheManager):
         )
 
     def _pyramidkv_reset_full_prefill_staging(self):
+        self._pyramidkv_clear_long_prefill_offload_prefetch()
         self._pyramidkv_prefill_staging_active = False
         self._pyramidkv_prefill_staging_was_active = False
         self._pyramidkv_prefill_staging_slot_mapping = None
@@ -752,6 +755,7 @@ class SnapKVCacheManager(CacheManager):
     def free_seq(self, seq_id: int):
         with profiler.record("cache_free_seq"):
             self._clear_prefill_attention_scores(seq_id)
+            self._pyramidkv_clear_long_prefill_offload_prefetch()
             for layer_idx in range(self.num_layers):
                 row_idx = self.seq_id_to_row[layer_idx].pop(seq_id, None)
                 if row_idx is None:
@@ -1254,6 +1258,7 @@ class SnapKVCacheManager(CacheManager):
     def _release_pyramidkv_long_prefill_offload_rows(self):
         if getattr(self, "_pyramidkv_long_prefill_offload_seq_id", None) is None:
             return
+        self._pyramidkv_clear_long_prefill_offload_prefetch()
         seq_id = int(self._pyramidkv_long_prefill_offload_seq_id)
         seen_rows = set()
         for layer_idx in range(int(self.num_layers)):
@@ -1278,6 +1283,105 @@ class SnapKVCacheManager(CacheManager):
             )
         return int(row_idx)
 
+    def _pyramidkv_long_prefill_offload_prefetch_enabled(self) -> bool:
+        return torch.cuda.is_available() and torch.device(self.device).type == "cuda"
+
+    def _pyramidkv_clear_long_prefill_offload_prefetch(self):
+        states = getattr(self, "_pyramidkv_long_prefill_offload_prefetch_states", None) or {}
+        for state in list(states.values()):
+            event = state.get("event")
+            if event is not None:
+                torch.cuda.current_stream(self.device).wait_event(event)
+        self._pyramidkv_long_prefill_offload_prefetch_states = {}
+
+    def _pyramidkv_drop_long_prefill_offload_prefetch(self, key: tuple[int, int, str, int]):
+        states = getattr(self, "_pyramidkv_long_prefill_offload_prefetch_states", None) or {}
+        state = states.pop(key, None)
+        if state is not None:
+            event = state.get("event")
+            if event is not None:
+                torch.cuda.current_stream(self.device).wait_event(event)
+        self._pyramidkv_long_prefill_offload_prefetch_states = states
+
+    def _pyramidkv_consume_long_prefill_offload_staged_prefetch(
+        self,
+        *,
+        layer_idx: int,
+        row_idx: int,
+        end: int,
+    ) -> bool:
+        kind = self._pyramidkv_long_prefill_offload_kind()
+        key = (int(layer_idx), int(row_idx), kind, int(end))
+        states = getattr(self, "_pyramidkv_long_prefill_offload_prefetch_states", None) or {}
+        state = states.pop(key, None)
+        if state is None:
+            self._pyramidkv_long_prefill_offload_prefetch_states = states
+            return False
+        with profiler.record("pyramidkv_long_prefill_offload_prefetch_wait"):
+            torch.cuda.current_stream(self.device).wait_event(state["event"])
+        self._pyramidkv_long_prefill_offload_prefetch_states = states
+        return True
+
+    def _pyramidkv_schedule_next_long_prefill_offload_prefetch(self, *, layer_idx: int, end: int):
+        if int(end) <= 0 or not self._pyramidkv_long_prefill_offload_prefetch_enabled():
+            return
+        next_layer = int(layer_idx) + 1
+        if next_layer >= int(self.num_layers):
+            return
+        row_idx = self._pyramidkv_long_prefill_offload_row(next_layer)
+        kind = self._pyramidkv_long_prefill_offload_kind()
+        key = (next_layer, int(row_idx), kind, int(end))
+        states = getattr(self, "_pyramidkv_long_prefill_offload_prefetch_states", None) or {}
+        keep_keys = {key}
+        for old_key in list(states):
+            if old_key not in keep_keys:
+                self._pyramidkv_drop_long_prefill_offload_prefetch(old_key)
+                states = getattr(self, "_pyramidkv_long_prefill_offload_prefetch_states", None) or {}
+        if key in states:
+            return
+
+        stream = getattr(self, "_pyramidkv_long_prefill_offload_prefetch_stream", None)
+        if stream is None:
+            stream = torch.cuda.Stream(device=self.device)
+            self._pyramidkv_long_prefill_offload_prefetch_stream = stream
+
+        with profiler.record("pyramidkv_long_prefill_offload_prefetch_schedule"):
+            staging_available_event = torch.cuda.Event()
+            staging_available_event.record(torch.cuda.current_stream(self.device))
+            with torch.cuda.stream(stream):
+                stream.wait_event(staging_available_event)
+                self.raw_kv_offload_buffer.copy_prefix_to(
+                    layer_idx=next_layer,
+                    row_idx=row_idx,
+                    kind=kind,
+                    end=end,
+                    k_out=self.pyramidkv_prefill_staging_kv_cache[0, :end],
+                    v_out=self.pyramidkv_prefill_staging_kv_cache[1, :end],
+                )
+                event = torch.cuda.Event()
+                event.record(stream)
+        states[key] = {
+            "layer_idx": next_layer,
+            "row_idx": int(row_idx),
+            "kind": kind,
+            "end": int(end),
+            "staging_available_event": staging_available_event,
+            "event": event,
+        }
+        self._pyramidkv_long_prefill_offload_prefetch_states = states
+
+    def _pyramidkv_schedule_post_layer_long_prefill_offload_prefetch(self, layer_idx: int):
+        if not bool(getattr(self, "_pyramidkv_long_prefill_offload_step_active", False)):
+            return
+        start = int(getattr(self, "_pyramidkv_long_prefill_offload_start", 0) or 0)
+        if start <= 0:
+            return
+        with profiler.record("pyramidkv_long_prefill_offload_after_attention_prefetch"):
+            self._pyramidkv_schedule_next_long_prefill_offload_prefetch(
+                layer_idx=layer_idx,
+                end=start,
+            )
+
     @torch.no_grad()
     def before_prefill_layer_attention(self, layer_idx: int, selection: SparseSelection):
         del selection
@@ -1289,6 +1393,14 @@ class SnapKVCacheManager(CacheManager):
         if start <= 0:
             return None
         row_idx = self._pyramidkv_long_prefill_offload_row(layer_idx)
+        with profiler.record("pyramidkv_long_prefill_offload_wait_or_restore"):
+            staged = self._pyramidkv_consume_long_prefill_offload_staged_prefetch(
+                layer_idx=layer_idx,
+                row_idx=row_idx,
+                end=start,
+            )
+            if staged:
+                return None
         with profiler.record("pyramidkv_long_prefill_offload_restore_prefix"):
             self.raw_kv_offload_buffer.copy_prefix_to(
                 layer_idx=layer_idx,
@@ -1344,6 +1456,7 @@ class SnapKVCacheManager(CacheManager):
                 self._release_pyramidkv_long_prefill_offload_rows()
             return
         self._offload_pyramidkv_long_prefill_layer(layer_idx)
+        self._pyramidkv_schedule_post_layer_long_prefill_offload_prefetch(layer_idx)
 
     def prepare_step(self, seqs: list[Sequence], is_prefill: bool):
         self._pyramidkv_reset_full_prefill_staging()

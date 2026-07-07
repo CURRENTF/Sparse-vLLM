@@ -1458,6 +1458,108 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
         self.assertEqual(manager.pyramidkv_prefill_staging_kv_cache[0, :2, 0, 0].tolist(), [1.0, 2.0])
         self.assertEqual(manager.pyramidkv_prefill_staging_kv_cache[1, :2, 0, 0].tolist(), [11.0, 12.0])
 
+    def test_pyramidkv_long_prefill_offload_uses_staged_prefetch(self):
+        manager = object.__new__(SnapKVCacheManager)
+        manager.config = SimpleNamespace(vllm_sparse_method="pyramidkv")
+        manager.device = torch.device("cpu")
+        manager.seq_id_to_row = [{10: 0}]
+        manager.pyramidkv_prefill_staging_kv_cache = torch.zeros((2, 4, 1, 1), dtype=torch.float32)
+        manager._pyramidkv_prefill_staging_active = True
+        manager._pyramidkv_long_prefill_offload_step_active = True
+        manager._pyramidkv_long_prefill_offload_seq_id = 10
+        manager._pyramidkv_long_prefill_offload_start = 2
+        manager.has_prefill_staging_view = lambda layer_idx: True
+        manager._pyramidkv_consume_long_prefill_offload_staged_prefetch = lambda **kwargs: True
+        manager.raw_kv_offload_buffer = SimpleNamespace(
+            copy_prefix_to=lambda **kwargs: (_ for _ in ()).throw(AssertionError("unexpected synchronous restore"))
+        )
+
+        SnapKVCacheManager.before_prefill_layer_attention(manager, 0, None)
+
+    def test_pyramidkv_long_prefill_offload_prefetch_waits_for_current_stream_before_staging_write(self):
+        manager = object.__new__(SnapKVCacheManager)
+        manager.device = "cuda:0"
+        manager.num_layers = 2
+        manager._pyramidkv_long_prefill_offload_prefetch_stream = None
+        manager._pyramidkv_long_prefill_offload_prefetch_states = {}
+        manager._pyramidkv_long_prefill_offload_seq_id = 10
+        manager.seq_id_to_row = [{10: 0}, {10: 5}]
+        manager._pyramidkv_long_prefill_offload_prefetch_enabled = lambda: True
+        manager.pyramidkv_prefill_staging_kv_cache = torch.empty((2, 4, 1, 1))
+
+        calls = []
+        created_events = []
+
+        class FakeEvent:
+            def __init__(self):
+                self.name = f"event{len(created_events)}"
+                created_events.append(self)
+
+            def record(self, stream=None):
+                calls.append(("record", self.name, getattr(stream, "name", None)))
+
+        class FakeStream:
+            def __init__(self, device=None, *, name="prefetch"):
+                self.device = device
+                self.name = name
+
+            def wait_event(self, event):
+                calls.append(("wait", self.name, event.name))
+
+        class FakeStreamContext:
+            def __init__(self, stream):
+                self.stream = stream
+
+            def __enter__(self):
+                calls.append(("enter", self.stream.name))
+                return self.stream
+
+            def __exit__(self, exc_type, exc, tb):
+                calls.append(("exit", self.stream.name))
+                return False
+
+        def fake_current_stream(device=None):
+            return FakeStream(device=device, name="current")
+
+        def fake_copy_prefix_to(**kwargs):
+            calls.append(("copy_prefix_to", int(kwargs["layer_idx"]), int(kwargs["row_idx"]), int(kwargs["end"])))
+
+        manager.raw_kv_offload_buffer = SimpleNamespace(copy_prefix_to=fake_copy_prefix_to)
+
+        with (
+            patch("sparsevllm.engine.cache_manager.snapkv.torch.cuda.Event", FakeEvent),
+            patch("sparsevllm.engine.cache_manager.snapkv.torch.cuda.Stream", FakeStream),
+            patch(
+                "sparsevllm.engine.cache_manager.snapkv.torch.cuda.stream",
+                lambda stream: FakeStreamContext(stream),
+            ),
+            patch(
+                "sparsevllm.engine.cache_manager.snapkv.torch.cuda.current_stream",
+                fake_current_stream,
+            ),
+        ):
+            SnapKVCacheManager._pyramidkv_schedule_next_long_prefill_offload_prefetch(
+                manager,
+                layer_idx=0,
+                end=2,
+            )
+
+        self.assertEqual(
+            calls,
+            [
+                ("record", "event0", "current"),
+                ("enter", "prefetch"),
+                ("wait", "prefetch", "event0"),
+                ("copy_prefix_to", 1, 5, 2),
+                ("record", "event1", "prefetch"),
+                ("exit", "prefetch"),
+            ],
+        )
+        key = (1, 5, "pyramidkv_post_rope", 2)
+        state = manager._pyramidkv_long_prefill_offload_prefetch_states[key]
+        self.assertIs(state["staging_available_event"], created_events[0])
+        self.assertIs(state["event"], created_events[1])
+
     def test_deltakv_short_prefill_fails_fast_when_no_work_can_free_slots(self):
         scheduler = make_scheduler(
             PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
