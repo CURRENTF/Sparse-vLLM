@@ -783,14 +783,21 @@ def _full_layer_kivi_flash_decode_stage1_kernel(
             other=-1,
         ).to(tl.int32)
         raw_mask = raw_slots >= 0
+        safe_raw_slots = tl.maximum(raw_slots, 0)
 
         raw_k = tl.load(
-            Raw_K + raw_slots[None, :] * stride_raw_ks + cur_kv_head * stride_raw_kh + offs_d[:, None] * stride_raw_kd,
+            Raw_K
+            + safe_raw_slots[None, :] * stride_raw_ks
+            + cur_kv_head * stride_raw_kh
+            + offs_d[:, None] * stride_raw_kd,
             mask=valid_n[None, :] & raw_mask[None, :],
             other=0.0,
         )
         raw_v = tl.load(
-            Raw_V + raw_slots[:, None] * stride_raw_vs + cur_kv_head * stride_raw_vh + offs_d[None, :] * stride_raw_vd,
+            Raw_V
+            + safe_raw_slots[:, None] * stride_raw_vs
+            + cur_kv_head * stride_raw_vh
+            + offs_d[None, :] * stride_raw_vd,
             mask=valid_n[:, None] & raw_mask[:, None],
             other=0.0,
         )
@@ -798,37 +805,42 @@ def _full_layer_kivi_flash_decode_stage1_kernel(
         block_slots = tl.load(
             Kivi_Block_Slots_Map + cur_row * stride_kivi_map_r + offs_n_new * stride_kivi_map_p,
             mask=valid_n & (~raw_mask),
-            other=0,
+            other=-1,
         ).to(tl.int32)
-        block_starts = tl.load(Kivi_Block_Start_Pos + block_slots, mask=valid_n & (~raw_mask), other=0).to(tl.int32)
+        kivi_mask = valid_n & (~raw_mask) & (block_slots >= 0)
+        safe_block_slots = tl.maximum(block_slots, 0)
+        block_starts = tl.load(Kivi_Block_Start_Pos + safe_block_slots, mask=kivi_mask, other=0).to(tl.int32)
         local_t = offs_n_new.to(tl.int32) - block_starts
+        kivi_mask = kivi_mask & (local_t >= 0) & (local_t < GROUP_SIZE)
+        safe_local_t = tl.maximum(local_t, 0)
+        slot_valid = valid_n & (raw_mask | kivi_mask)
 
-        key_pack_idx = local_t // FEAT_PER_INT
-        key_shift = (local_t % FEAT_PER_INT) * 4
+        key_pack_idx = safe_local_t // FEAT_PER_INT
+        key_shift = (safe_local_t % FEAT_PER_INT) * 4
         key_code = tl.load(
             Key_Packed
-            + block_slots[None, :] * stride_kpb
+            + safe_block_slots[None, :] * stride_kpb
                 + cur_kv_head * stride_kph
                 + offs_d[:, None] * stride_kpd
                 + key_pack_idx[None, :] * stride_kpp,
-            mask=valid_n[None, :] & (~raw_mask[None, :]),
+            mask=kivi_mask[None, :],
             other=0,
         )
         key_q = ((key_code >> key_shift[None, :]) & QUANT_MASK).to(tl.float32)
         key_scale = tl.load(
             Key_Scales
-            + block_slots[None, :] * stride_ksb
+            + safe_block_slots[None, :] * stride_ksb
             + cur_kv_head * stride_ksh
             + offs_d[:, None] * stride_ksd,
-            mask=valid_n[None, :] & (~raw_mask[None, :]),
+            mask=kivi_mask[None, :],
             other=0.0,
         ).to(tl.float32)
         key_min = tl.load(
             Key_Mins
-            + block_slots[None, :] * stride_ksb
+            + safe_block_slots[None, :] * stride_ksb
             + cur_kv_head * stride_ksh
             + offs_d[:, None] * stride_ksd,
-            mask=valid_n[None, :] & (~raw_mask[None, :]),
+            mask=kivi_mask[None, :],
             other=0.0,
         ).to(tl.float32)
         kivi_k = key_q * key_scale + key_min
@@ -839,51 +851,56 @@ def _full_layer_kivi_flash_decode_stage1_kernel(
         value_group = offs_d // GROUP_SIZE
         value_code = tl.load(
             Value_Packed
-            + block_slots[:, None] * stride_vpb
+            + safe_block_slots[:, None] * stride_vpb
                 + cur_kv_head * stride_vph
-                + local_t[:, None] * stride_vpt
+                + safe_local_t[:, None] * stride_vpt
                 + value_pack_idx[None, :] * stride_vpp,
-            mask=valid_n[:, None] & (~raw_mask[:, None]),
+            mask=kivi_mask[:, None],
             other=0,
         )
         value_q = ((value_code >> value_shift[None, :]) & QUANT_MASK).to(tl.float32)
         value_scale = tl.load(
             Value_Scales
-            + block_slots[:, None] * stride_vsb
+            + safe_block_slots[:, None] * stride_vsb
                 + cur_kv_head * stride_vsh
-                + local_t[:, None] * stride_vst
+                + safe_local_t[:, None] * stride_vst
                 + value_group[None, :] * stride_vsg,
-            mask=valid_n[:, None] & (~raw_mask[:, None]),
+            mask=kivi_mask[:, None],
             other=0.0,
         ).to(tl.float32)
         value_min = tl.load(
             Value_Mins
-            + block_slots[:, None] * stride_vsb
+            + safe_block_slots[:, None] * stride_vsb
                 + cur_kv_head * stride_vsh
-                + local_t[:, None] * stride_vst
+                + safe_local_t[:, None] * stride_vst
                 + value_group[None, :] * stride_vsg,
-            mask=valid_n[:, None] & (~raw_mask[:, None]),
+            mask=kivi_mask[:, None],
             other=0.0,
         ).to(tl.float32)
         kivi_v = value_q * value_scale + value_min
         v = tl.where(raw_mask[:, None], raw_v, kivi_v).to(q.dtype)
 
         att_value = tl.dot(q, k)
+        att_value = tl.where(slot_valid[None, :], att_value, float("-inf"))
         if STORE_SCORE:
             off_as = cur_batch * stride_asb + cur_q_head_range[:, None] * stride_ash + offs_n_new[None, :] * stride_asl
             tl.store(
                 Attn_Score + off_as,
                 att_value,
-                mask=(cur_q_head_range[:, None] < (cur_kv_head + 1) * gqa_group_size) & valid_n[None, :],
+                mask=(
+                    (cur_q_head_range[:, None] < (cur_kv_head + 1) * gqa_group_size)
+                    & slot_valid[None, :]
+                ),
             )
 
         att_value *= sm_scale
-        att_value = tl.where(valid_n[None, :], att_value, float("-inf"))
 
+        block_has_valid = tl.max(slot_valid.to(tl.int32), axis=0) > 0
         cur_max_logic = tl.max(att_value, axis=1)
-        new_max_logic = tl.maximum(cur_max_logic, max_logic)
-        exp_logic = tl.exp(att_value - new_max_logic[:, None])
-        logic_scale = tl.exp(max_logic - new_max_logic)
+        candidate_max_logic = tl.maximum(cur_max_logic, max_logic)
+        new_max_logic = tl.where(block_has_valid, candidate_max_logic, max_logic)
+        exp_logic = tl.where(slot_valid[None, :], tl.exp(att_value - new_max_logic[:, None]), 0.0)
+        logic_scale = tl.where(block_has_valid, tl.exp(max_logic - new_max_logic), 1.0)
         acc *= logic_scale[:, None]
         acc += tl.dot(exp_logic.to(v.dtype), v)
 
@@ -912,6 +929,47 @@ def _full_layer_kivi_flash_decode_stage1_kernel(
 
 
 @torch.no_grad()
+def _validate_full_layer_kivi_decode_maps(
+    *,
+    raw_slots_map: torch.Tensor,
+    kivi_block_slots_map: torch.Tensor,
+    req_indices: torch.Tensor,
+    context_lens: torch.Tensor,
+    max_len_in_batch: int,
+) -> None:
+    if int(req_indices.numel()) == 0 or int(max_len_in_batch) <= 0:
+        return
+    if tuple(raw_slots_map.shape) != tuple(kivi_block_slots_map.shape):
+        raise ValueError(
+            "Full-layer KIVI raw and block slot maps must have identical shapes, "
+            f"got raw={tuple(raw_slots_map.shape)} block={tuple(kivi_block_slots_map.shape)}."
+        )
+    if int(max_len_in_batch) > int(raw_slots_map.shape[1]):
+        raise ValueError(
+            "Full-layer KIVI max_len_in_batch exceeds map width: "
+            f"max_len={int(max_len_in_batch)} width={int(raw_slots_map.shape[1])}."
+        )
+    rows = req_indices.to(device=raw_slots_map.device, dtype=torch.long)
+    if bool(((rows < 0) | (rows >= int(raw_slots_map.shape[0]))).any().item()):
+        bad = rows[((rows < 0) | (rows >= int(raw_slots_map.shape[0])))][:8].detach().cpu().tolist()
+        raise RuntimeError(
+            "Full-layer KIVI decode has out-of-range req_indices: "
+            f"rows={bad} num_rows={int(raw_slots_map.shape[0])}."
+        )
+    positions = torch.arange(int(max_len_in_batch), device=raw_slots_map.device, dtype=torch.long)
+    context_lens_dev = context_lens.to(device=raw_slots_map.device, dtype=torch.long)
+    valid = positions.unsqueeze(0) < context_lens_dev.unsqueeze(1)
+    raw_slots = raw_slots_map[rows.unsqueeze(1), positions.unsqueeze(0)]
+    block_slots = kivi_block_slots_map[rows.unsqueeze(1), positions.unsqueeze(0)]
+    missing = valid & (raw_slots < 0) & (block_slots < 0)
+    if bool(missing.any().item()):
+        bad = missing.nonzero(as_tuple=False)[:8].detach().cpu().tolist()
+        raise RuntimeError(
+            "Full-layer KIVI decode map has valid tokens with neither raw nor packed block slots: "
+            f"batch_pos={bad}."
+        )
+
+
 def full_layer_kivi_flash_decode_stage1(
     *,
     q: torch.Tensor,
@@ -952,6 +1010,11 @@ def full_layer_kivi_flash_decode_stage1(
         raise ValueError(f"Expected q/raw_k/raw_v rank-3 tensors, got {q.dim()}, {raw_k.dim()}, {raw_v.dim()}.")
     if raw_slots_map.dim() != 2 or kivi_block_slots_map.dim() != 2:
         raise ValueError("Full-layer KIVI decode maps must be rank-2 tensors.")
+    if tuple(raw_slots_map.shape) != tuple(kivi_block_slots_map.shape):
+        raise ValueError(
+            "Full-layer KIVI raw and block slot maps must have identical shapes, "
+            f"got raw={tuple(raw_slots_map.shape)} block={tuple(kivi_block_slots_map.shape)}."
+        )
     batch = int(q.shape[0])
     if int(req_indices.numel()) != batch or int(context_lens.numel()) != batch:
         raise ValueError("Full-layer KIVI decode expects one req index/context length per batch item.")
@@ -979,6 +1042,19 @@ def full_layer_kivi_flash_decode_stage1(
     max_len_in_batch = int(max_len_in_batch)
     if max_len_in_batch <= 0:
         return
+    if max_len_in_batch > int(raw_slots_map.shape[1]):
+        raise ValueError(
+            "Full-layer KIVI max_len_in_batch exceeds map width: "
+            f"max_len={max_len_in_batch} width={int(raw_slots_map.shape[1])}."
+        )
+    if os.getenv("SPARSEVLLM_VALIDATE_KIVI_DECODE_MAP", "0") == "1":
+        _validate_full_layer_kivi_decode_maps(
+            raw_slots_map=raw_slots_map,
+            kivi_block_slots_map=kivi_block_slots_map,
+            req_indices=req_indices,
+            context_lens=context_lens,
+            max_len_in_batch=max_len_in_batch,
+        )
 
     num_kv_heads = int(raw_k.shape[1])
     if int(raw_v.shape[1]) != num_kv_heads:

@@ -5,6 +5,7 @@ import unittest
 import torch
 
 from sparsevllm.triton_kernel.deltakv_kernels import (
+    _validate_full_layer_kivi_decode_maps,
     deltakv_less_memory_reconstruct_writeback_quantized,
     deltakv_l2_topk_blockwise,
     deltakv_materialize_sparse_view,
@@ -31,6 +32,23 @@ from sparsevllm.triton_kernel.quant import (
 
 def test_materialize_sparse_view_has_no_heads_per_program_parameter():
     assert "heads_per_program" not in inspect.signature(deltakv_materialize_sparse_view).parameters
+
+
+def test_full_layer_kivi_decode_map_validation_rejects_unmapped_valid_token():
+    raw_slots_map = torch.tensor([[0, -1, -1]], dtype=torch.int32)
+    kivi_block_slots_map = torch.tensor([[-1, -1, 2]], dtype=torch.int32)
+    try:
+        _validate_full_layer_kivi_decode_maps(
+            raw_slots_map=raw_slots_map,
+            kivi_block_slots_map=kivi_block_slots_map,
+            req_indices=torch.tensor([0], dtype=torch.int32),
+            context_lens=torch.tensor([3], dtype=torch.int32),
+            max_len_in_batch=3,
+        )
+    except RuntimeError as exc:
+        assert "neither raw nor packed block slots" in str(exc)
+    else:
+        raise AssertionError("expected full-layer KIVI decode map validation to fail")
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for DeltaKV Triton kernel tests.")

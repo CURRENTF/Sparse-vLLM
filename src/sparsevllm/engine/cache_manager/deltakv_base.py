@@ -102,6 +102,8 @@ class DeltaKVCacheManager(CacheManager):
         self._deltakv_centers_reserved_by_seq: dict[int, int] = {}
         self._deltakv_latent_reserved_total = 0
         self._deltakv_latent_reserved_by_seq: dict[int, int] = {}
+        self._full_layers_reserved_total = 0
+        self._full_layers_reserved_by_seq: dict[int, int] = {}
         self._full_layer_kivi_reserved_total = 0
         self._full_layer_kivi_reserved_by_seq: dict[int, int] = {}
 
@@ -649,7 +651,9 @@ class DeltaKVCacheManager(CacheManager):
         return x.to(orig_dtype) * weight[int(l_idx)].to(dtype=orig_dtype)
 
     def _apply_sparse_rope_to_key(self, positions: torch.Tensor, key: torch.Tensor) -> torch.Tensor:
-        return self.rotary_emb(positions, key, key)[1]
+        cos_sin = self.rotary_emb.cos_sin_cache[positions]
+        cos, sin = cos_sin.chunk(2, dim=-1)
+        return apply_rotary_emb(key, cos, sin)
 
     def get_layer_store_tensors(
         self,
@@ -1074,8 +1078,9 @@ class DeltaKVCacheManager(CacheManager):
         centers_free = max(0, int(self._deltakv_centers_capacity) - int(self._deltakv_centers_reserved_total))
         temp_reserve = self._deltakv_unallocated_temp_full_reserve()
         raw_free = max(0, int(self._num_free_slots_deltakv_full) - temp_reserve - reserved)
+        full_layers_reserved = int(getattr(self, "_full_layers_reserved_total", 0) or 0)
         return {
-            "full_layers": max(0, int(self.num_free_slots_full_layers()) - reserved),
+            "full_layers": max(0, int(self.num_free_slots_full_layers()) - full_layers_reserved),
             "deltakv_centers": centers_free,
             "deltakv_raw": raw_free,
         }
@@ -1149,12 +1154,24 @@ class DeltaKVCacheManager(CacheManager):
         seq_id = int(seq.seq_id)
         if seq_id in self._deltakv_centers_reserved_by_seq:
             return
+        full_layers = int(costs.get("full_layers", 0) or 0)
+        self._full_layers_reserved_by_seq[seq_id] = full_layers
+        self._full_layers_reserved_total += full_layers
         centers = int(costs.get("deltakv_centers", 0) or 0)
         self._deltakv_centers_reserved_by_seq[seq_id] = centers
         self._deltakv_centers_reserved_total += centers
 
     def _release_prompt_admission_reservations(self, seq_id: int):
         seq_id = int(seq_id)
+        full_layers = getattr(self, "_full_layers_reserved_by_seq", {}).pop(seq_id, 0)
+        if full_layers:
+            total_reserved = int(getattr(self, "_full_layers_reserved_total", 0) or 0)
+            if total_reserved < int(full_layers):
+                raise RuntimeError(
+                    "DeltaKV full-layer reservation release underflow: "
+                    f"seq_id={seq_id} release={int(full_layers)} total_reserved={total_reserved}."
+                )
+            self._full_layers_reserved_total -= int(full_layers)
         centers = self._deltakv_centers_reserved_by_seq.pop(seq_id, 0)
         if centers:
             self._deltakv_centers_reserved_total -= int(centers)
@@ -1164,6 +1181,31 @@ class DeltaKVCacheManager(CacheManager):
         kivi = getattr(self, "_full_layer_kivi_reserved_by_seq", {}).pop(seq_id, 0)
         if kivi:
             self._full_layer_kivi_reserved_total -= int(kivi)
+
+    def _consume_full_layer_reservation(self, seq_id: int, size: int):
+        size = int(size)
+        if size <= 0:
+            return
+        reserved_by_seq = getattr(self, "_full_layers_reserved_by_seq", None)
+        if not reserved_by_seq:
+            return
+        seq_id = int(seq_id)
+        remaining = int(reserved_by_seq.get(seq_id, 0) or 0)
+        if remaining <= 0:
+            return
+        consumed = min(size, remaining)
+        next_remaining = remaining - consumed
+        if next_remaining:
+            reserved_by_seq[seq_id] = next_remaining
+        else:
+            reserved_by_seq.pop(seq_id, None)
+        total_reserved = int(getattr(self, "_full_layers_reserved_total", 0) or 0)
+        if total_reserved < consumed:
+            raise RuntimeError(
+                "DeltaKV full-layer reservation accounting underflow: "
+                f"seq_id={seq_id} consume={consumed} total_reserved={total_reserved}."
+            )
+        self._full_layers_reserved_total = total_reserved - consumed
 
     @torch.no_grad()
     def _allocate_temp_deltakv_full(self, size: int) -> torch.Tensor:
@@ -1295,6 +1337,7 @@ class DeltaKVCacheManager(CacheManager):
         full_slot_to_pos = getattr(self, "full_layer_slot_to_pos", None)
         if full_slot_to_pos is not None:
             full_slot_to_pos[select_index] = torch.arange(cur_len, cur_len + size, device=self.device, dtype=torch.int32)
+        self._consume_full_layer_reservation(seq_id, size)
         return select_index
 
     @torch.no_grad()
@@ -1371,6 +1414,8 @@ class DeltaKVCacheManager(CacheManager):
         full_slot_to_pos = getattr(self, "full_layer_slot_to_pos", None)
         if full_slot_to_pos is not None:
             full_slot_to_pos[select_indices] = cols_gpu.to(torch.int32)
+        for seq_id in seq_ids:
+            self._consume_full_layer_reservation(seq_id, 1)
         return select_indices
 
     @torch.no_grad()
@@ -1503,10 +1548,13 @@ class DeltaKVCacheManager(CacheManager):
         centers_cap = int(getattr(self, "_deltakv_centers_capacity", 0) or 0)
         centers_reserved = int(getattr(self, "_deltakv_centers_reserved_total", 0) or 0)
         centers_free = max(0, centers_cap - centers_reserved)
+        full_layers_reserved = int(getattr(self, "_full_layers_reserved_total", 0) or 0)
         active = int(len(getattr(self, "seq_id_to_row", {}) or {}))
         return {
             "free_slots": int(self.num_free_slots),
             "full_free": full_free,
+            "full_reserved": full_layers_reserved,
+            "full_free_after_reserved": max(0, full_free - full_layers_reserved),
             "deltakv_full_free_total": deltakv_full_free_total,
             "deltakv_full_free_usable": deltakv_full_free_usable,
             "deltakv_decode_reconstruct_reserve": temp_reserve,
@@ -1790,8 +1838,9 @@ class DeltaKVCacheManager(CacheManager):
                             f"start_idx={start_idx}"
                         )
 
-                self._allocate_full(seq.seq_id, chunk_size)
+                full_slots = self._allocate_full(seq.seq_id, chunk_size)
                 row_idx = self.seq_id_to_row[seq.seq_id]
+                full_slot_mapping[token_offset: token_offset + chunk_size] = full_slots
                 if use_full_prefill_staging:
                     if not use_long_prefill_offload_staging and start_idx != 0:
                         raise RuntimeError("DeltaKV full-prefill staging only supports first-prefill prompts.")
@@ -1801,7 +1850,6 @@ class DeltaKVCacheManager(CacheManager):
                         dtype=torch.int32,
                         device=self.device,
                     )
-                    full_slot_mapping[token_offset: token_offset + chunk_size] = staging_range
                     deltakv_slot_mapping[token_offset: token_offset + chunk_size] = staging_range
                     if use_long_prefill_offload_staging:
                         if end_idx > int(self.deltakv_prefill_staging_num_slots):
@@ -1819,8 +1867,6 @@ class DeltaKVCacheManager(CacheManager):
                     else:
                         self._prepare_full_prefill_staging_plan(seq, row_idx, end_idx)
                 else:
-                    full_slot_mapping[token_offset: token_offset + chunk_size] = \
-                        self.full_layer_slots_map[row_idx, start_idx:end_idx]
                     self._allocate_deltakv_full(seq.seq_id, chunk_size)
                     deltakv_slot_mapping[token_offset: token_offset + chunk_size] = \
                         self.sparse_layer_raw_slots_map[row_idx, start_idx:end_idx]

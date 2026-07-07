@@ -1677,6 +1677,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         self.full_layer_slots_map[row_idx, positions.to(torch.long)] = select_index
         if self.full_layer_slot_to_pos is not None:
             self.full_layer_slot_to_pos[select_index.to(torch.long)] = positions
+        self._consume_full_layer_reservation(seq_id, size)
         return select_index
 
     @torch.no_grad()
@@ -1917,6 +1918,24 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
                 end=start,
             )
 
+    def _deltakv_long_prefill_restore_block_tokens(self) -> int:
+        config = getattr(self, "config", None)
+        configured = int(getattr(config, "chunk_prefill_size", 65536) or 65536)
+        return max(1, min(configured, 65536))
+
+    def _deltakv_restore_sparse_prefix_to_staging(self, layer_idx: int, start: int) -> None:
+        l_idx = self.deltakv_layer_to_idx[layer_idx]
+        block_tokens = self._deltakv_long_prefill_restore_block_tokens()
+        k_src = self.deltakv_prefill_staging_pre_rope_k_cache
+        k_dst = self.deltakv_prefill_staging_kv_cache[0]
+        for lo in range(0, int(start), int(block_tokens)):
+            hi = min(int(start), lo + int(block_tokens))
+            pos = torch.arange(lo, hi, dtype=torch.long, device=self.device)
+            k_normed = self._apply_sparse_k_norm_if_needed(l_idx, k_src[lo:hi])
+            k_postrope = self._apply_sparse_rope_to_key(pos, k_normed)
+            k_dst[lo:hi] = k_postrope.to(k_dst.dtype)
+            del pos, k_normed, k_postrope
+
     @torch.no_grad()
     def before_prefill_layer_attention(self, layer_idx: int, selection: SparseSelection):
         del selection
@@ -1947,15 +1966,8 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
                     end=start,
                 )
         if kind == "sparse_pre_rope":
-            l_idx = self.deltakv_layer_to_idx[layer_idx]
-            k_hist = self.deltakv_prefill_staging_pre_rope_k_cache[:start]
             with profiler.record("deltakv_long_prefill_offload_restore_sparse_rerope"):
-                pos = torch.arange(start, dtype=torch.long, device=self.device)
-                k_normed = self._apply_sparse_k_norm_if_needed(l_idx, k_hist)
-                k_postrope = self._apply_sparse_rope_to_key(pos, k_normed)
-                self.deltakv_prefill_staging_kv_cache[0, :start] = k_postrope.to(
-                    self.deltakv_prefill_staging_kv_cache.dtype
-                )
+                self._deltakv_restore_sparse_prefix_to_staging(layer_idx, start)
         return None
 
     @torch.no_grad()
