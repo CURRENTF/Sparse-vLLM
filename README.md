@@ -100,9 +100,6 @@ New sparse methods should keep method-specific runtime state in
 `src/sparsevllm/engine/cache_manager/` and keep
 `src/sparsevllm/layers/attention.py` generic.
 
-For Codex-assisted method work, use the repo-local
-[`$add-sparse-method`](.agents/skills/add-sparse-method/SKILL.md) skill.
-
 
 ## Acknowledgements
 

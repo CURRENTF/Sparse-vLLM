@@ -2,19 +2,12 @@
 
 This repository is research code. The main goal is trustworthy and reproducible experimental results, not production-style abstraction.
 
-## Repo-Local Skill
+## Sparse Method Contributions
 
-This repo includes one Codex skill:
-
-- `add-sparse-method`: use this when adding or refactoring a first-class Sparse-vLLM sparse method.
-
-Usage rules:
-
-- Invoke it as `$add-sparse-method`.
-- Keep method-specific runtime state in `src/sparsevllm/engine/cache_manager/`.
-- Keep `src/sparsevllm/layers/attention.py` generic.
-- Hook new methods through shared cache-manager interfaces when possible.
-- Prefer cache-manager-first design over putting method logic directly in `attention.py` or generic utility modules.
+When adding or refactoring a first-class Sparse-vLLM sparse method, keep
+method-specific runtime state in `src/sparsevllm/engine/cache_manager/`, keep
+`src/sparsevllm/layers/attention.py` generic, and hook new behavior through
+shared cache-manager interfaces when possible.
 
 ## Research Code Priorities
 

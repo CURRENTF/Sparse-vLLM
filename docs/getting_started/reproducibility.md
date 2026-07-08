@@ -1,8 +1,8 @@
 # Reproducibility
 
 Use this page as the stable checklist for reproducing Sparse-vLLM experiments.
-Keep dated private run ledgers and personal note indexes out of this repo; when
-a repo-facing result needs evidence, cite the original run artifact path.
+Keep local run ledgers out of this repo; when a repo-facing result needs
+evidence, cite the original run artifact path.
 
 ## Environment
 

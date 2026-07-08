@@ -244,8 +244,8 @@ Notes:
 - Use `SETUP_ONLY=1` to prepare the external repo, environments, config, engine
   kwargs file, and run manifest without launching the benchmark.
 - Default outputs go under
-  `/data2/haojitai/outputs/Sparse-vLLM/claw-eval/<RUN_NAME>/`; override
-  `OUTPUT_ROOT` or `RUN_NAME` when needed.
+  `<OUTPUT_ROOT>/claw-eval/<RUN_NAME>/`; override `OUTPUT_ROOT` or
+  `RUN_NAME` when needed.
 
 ## Multimodal
 

@@ -21,43 +21,42 @@ The test plan is controlled by
 
 ## Prerequisites
 
-Observed working environment on 2026-06-13:
+Configure these paths for the machine running the suite:
 
-- Working directory: `/root/autodl-tmp/DeltaKV`
-- Conda env: `kv`
-- Output root: `/root/autodl-tmp/outputs/deltakv`
-- LongBench data: `/root/autodl-fs/datasets/LongBench`
+- Working directory: `<REPO_ROOT>`
+- Conda env: `<CONDA_ENV>`
+- Output root: `<OUTPUT_ROOT>`
+- LongBench data: `<LONGBENCH_ROOT>`
 - Models:
-  - `/root/autodl-fs/models/Qwen2.5-7B-Instruct-1M`
-  - `/root/autodl-fs/models/Qwen3-4B-Instruct-2507`
-  - `/root/autodl-fs/models/Llama-3.1-8B-Instruct`
+  - `<MODEL_ROOT>/Qwen2.5-7B-Instruct-1M`
+  - `<MODEL_ROOT>/Qwen3-4B-Instruct-2507`
+  - `<MODEL_ROOT>/Llama-3.1-8B-Instruct`
 - Compressor checkpoints:
-  - `/root/autodl-fs/checkpoints/compressor/Qwen2.5-7B-Instruct-1M-Compressor`
-  - `/root/autodl-fs/checkpoints/compressor/Qwen3-4B-Instruct-2507-Compressor`
-  - `/root/autodl-fs/checkpoints/compressor/Llama-3.1-8B-Instruct-Compressor`
+  - `<CHECKPOINT_ROOT>/Qwen2.5-7B-Instruct-1M-Compressor`
+  - `<CHECKPOINT_ROOT>/Qwen3-4B-Instruct-2507-Compressor`
+  - `<CHECKPOINT_ROOT>/Llama-3.1-8B-Instruct-Compressor`
 
 Set the environment before running the suite:
 
 ```bash
-cd /root/autodl-tmp/DeltaKV
+cd <REPO_ROOT>
 
-export DELTAKV_OUTPUT_DIR=/root/autodl-tmp/outputs/deltakv
-export DELTAKV_LONGBENCH_DATA_DIR=/root/autodl-fs/datasets/LongBench
+export DELTAKV_OUTPUT_DIR=<OUTPUT_ROOT>
+export DELTAKV_LONGBENCH_DATA_DIR=<LONGBENCH_ROOT>
 
-export DELTAKV_MODEL_QWEN25_7B=/root/autodl-fs/models/Qwen2.5-7B-Instruct-1M
-export DELTAKV_MODEL_QWEN3_4B=/root/autodl-fs/models/Qwen3-4B-Instruct-2507
-export DELTAKV_MODEL_LLAMA31_8B=/root/autodl-fs/models/Llama-3.1-8B-Instruct
+export DELTAKV_MODEL_QWEN25_7B=<MODEL_ROOT>/Qwen2.5-7B-Instruct-1M
+export DELTAKV_MODEL_QWEN3_4B=<MODEL_ROOT>/Qwen3-4B-Instruct-2507
+export DELTAKV_MODEL_LLAMA31_8B=<MODEL_ROOT>/Llama-3.1-8B-Instruct
 
-export DELTAKV_COMPRESSOR_QWEN25_7B=/root/autodl-fs/checkpoints/compressor/Qwen2.5-7B-Instruct-1M-Compressor
-export DELTAKV_COMPRESSOR_QWEN3_4B=/root/autodl-fs/checkpoints/compressor/Qwen3-4B-Instruct-2507-Compressor
-export DELTAKV_COMPRESSOR_LLAMA31_8B=/root/autodl-fs/checkpoints/compressor/Llama-3.1-8B-Instruct-Compressor
+export DELTAKV_COMPRESSOR_QWEN25_7B=<CHECKPOINT_ROOT>/Qwen2.5-7B-Instruct-1M-Compressor
+export DELTAKV_COMPRESSOR_QWEN3_4B=<CHECKPOINT_ROOT>/Qwen3-4B-Instruct-2507-Compressor
+export DELTAKV_COMPRESSOR_LLAMA31_8B=<CHECKPOINT_ROOT>/Llama-3.1-8B-Instruct-Compressor
 
-export PYTHONPATH=/root/autodl-tmp/DeltaKV:/root/autodl-tmp/DeltaKV/src:${PYTHONPATH:-}
+export PYTHONPATH=<REPO_ROOT>:<REPO_ROOT>/src:${PYTHONPATH:-}
 ```
 
-The manifest also contains `qwen25_32b`, but the current local regression
-commands should omit it unless there is enough GPU memory and the corresponding
-model/checkpoint environment variables are set.
+The manifest also contains `qwen25_32b`; omit it unless there is enough GPU
+memory and the corresponding model/checkpoint environment variables are set.
 
 ## Quick Unit Tests
 
@@ -65,7 +64,7 @@ Run the unit tests that protect the regression harness, grading, manifest
 policy, and OmniKV full-layer selector:
 
 ```bash
-/root/miniconda3/bin/conda run -n kv --no-capture-output \
+conda run -n <CONDA_ENV> --no-capture-output \
   python -m unittest \
   tests.test_sparsevllm_regression_grading \
   tests.test_omnikv_full_layer_selector \
@@ -80,13 +79,13 @@ Use `validate` before long GPU runs. It resolves runtime paths, writes the
 resolved manifest, and creates empty required artifact files.
 
 ```bash
-/root/miniconda3/bin/conda run -n kv --no-capture-output \
+conda run -n <CONDA_ENV> --no-capture-output \
   python benchmark/sparsevllm_regression/run_suite.py \
   --layer validate \
   --models qwen25_7b,qwen3_4b,llama31_8b \
   --methods omnikv \
   --run_id validate_omnikv_$(date -u +%Y%m%d_%H%M%S) \
-  --output_root /root/autodl-tmp/outputs/deltakv
+  --output_root <OUTPUT_ROOT>
 ```
 
 Use `--no-allow_skipped_policy` when missing model/checkpoint paths should fail
@@ -97,7 +96,7 @@ the run instead of being recorded as skipped.
 All commands write to:
 
 ```text
-<output_root>/sparsevllm_regression/<run_id>/
+<OUTPUT_ROOT>/sparsevllm_regression/<run_id>/
 ```
 
 ### Quality
@@ -113,25 +112,25 @@ Quality is LongBench-mini with:
 Run OmniKV against vanilla baselines:
 
 ```bash
-/root/miniconda3/bin/conda run -n kv --no-capture-output \
+conda run -n <CONDA_ENV> --no-capture-output \
   python benchmark/sparsevllm_regression/run_suite.py \
   --layer quality \
   --models qwen25_7b,qwen3_4b,llama31_8b \
   --methods vanilla,omnikv \
   --run_id omnikv_quality_$(date -u +%Y%m%d_%H%M%S) \
-  --output_root /root/autodl-tmp/outputs/deltakv
+  --output_root <OUTPUT_ROOT>
 ```
 
 For a full non-32B quality run:
 
 ```bash
-/root/miniconda3/bin/conda run -n kv --no-capture-output \
+conda run -n <CONDA_ENV> --no-capture-output \
   python benchmark/sparsevllm_regression/run_suite.py \
   --layer quality \
   --models qwen25_7b,qwen3_4b,llama31_8b \
   --methods vanilla,streamingllm,snapkv,pyramidkv,omnikv,quest,deltakv,deltakv-less-memory \
   --run_id quality_3models_all_methods_$(date -u +%Y%m%d_%H%M%S) \
-  --output_root /root/autodl-tmp/outputs/deltakv
+  --output_root <OUTPUT_ROOT>
 ```
 
 For TP decode CUDA graph v1 quality validation, keep LongBench data-worker
@@ -139,14 +138,14 @@ parallelism at its default and pass engine TP through the regression-suite
 override:
 
 ```bash
-/root/miniconda3/bin/conda run -n kv --no-capture-output \
+conda run -n <CONDA_ENV> --no-capture-output \
   python benchmark/sparsevllm_regression/run_suite.py \
   --layer quality \
   --models qwen25_7b \
   --methods vanilla,streamingllm,snapkv,pyramidkv,omnikv,rkv,skipkv \
   --tensor_parallel_size 2 \
   --run_id tp2_graph_quality_v1_$(date -u +%Y%m%d_%H%M%S) \
-  --output_root /root/autodl-tmp/outputs/deltakv
+  --output_root <OUTPUT_ROOT>
 ```
 
 This compares sparse methods against TP vanilla in the same run. A/B/C grades
@@ -159,7 +158,7 @@ but it is a smoke/regression gate rather than the full 50-sample-per-task
 quality suite:
 
 ```bash
-/root/miniconda3/bin/conda run -n kv --no-capture-output \
+conda run -n <CONDA_ENV> --no-capture-output \
   python benchmark/sparsevllm_regression/run_suite.py \
   --layer quality \
   --models qwen3_4b \
@@ -175,13 +174,13 @@ quality suite:
   --quality_sparsevllm_max_decoding_seqs 2 \
   --command_timeout_s 600 \
   --run_id tp_prefix_graph_quality_quick_$(date -u +%Y%m%d_%H%M%S) \
-  --output_root /root/autodl-tmp/outputs/deltakv
+  --output_root <OUTPUT_ROOT>
 ```
 
 Then run the matching SCBench quality and prefix-hit stress layers:
 
 ```bash
-/root/miniconda3/bin/conda run -n kv --no-capture-output \
+conda run -n <CONDA_ENV> --no-capture-output \
   python benchmark/sparsevllm_regression/run_suite.py \
   --layer scbench \
   --models qwen3_4b \
@@ -197,9 +196,9 @@ Then run the matching SCBench quality and prefix-hit stress layers:
   --scbench_batch_size 1 \
   --command_timeout_s 600 \
   --run_id tp_prefix_graph_scbench_quick_$(date -u +%Y%m%d_%H%M%S) \
-  --output_root /root/autodl-tmp/outputs/deltakv
+  --output_root <OUTPUT_ROOT>
 
-/root/miniconda3/bin/conda run -n kv --no-capture-output \
+conda run -n <CONDA_ENV> --no-capture-output \
   python benchmark/sparsevllm_regression/run_suite.py \
   --layer stress \
   --models qwen3_4b \
@@ -218,7 +217,7 @@ Then run the matching SCBench quality and prefix-hit stress layers:
   --stress_wave_decode_gap_steps 1 \
   --command_timeout_s 600 \
   --run_id tp_prefix_graph_stress_quick_$(date -u +%Y%m%d_%H%M%S) \
-  --output_root /root/autodl-tmp/outputs/deltakv
+  --output_root <OUTPUT_ROOT>
 ```
 
 ### Correctness / Logits
@@ -228,13 +227,13 @@ declare `hf_logits_reference=true`. Methods without an HF reference are graded
 `N/A` by policy.
 
 ```bash
-/root/miniconda3/bin/conda run -n kv --no-capture-output \
+conda run -n <CONDA_ENV> --no-capture-output \
   python benchmark/sparsevllm_regression/run_suite.py \
   --layer logits \
   --models qwen25_7b,qwen3_4b,llama31_8b \
   --methods omnikv \
   --run_id omnikv_logits_$(date -u +%Y%m%d_%H%M%S) \
-  --output_root /root/autodl-tmp/outputs/deltakv
+  --output_root <OUTPUT_ROOT>
 ```
 
 ### Performance
@@ -250,26 +249,26 @@ For sparse methods, the benchmark also runs vanilla for the same shape so the
 suite can compute decode speedup.
 
 ```bash
-/root/miniconda3/bin/conda run -n kv --no-capture-output \
+conda run -n <CONDA_ENV> --no-capture-output \
   python benchmark/sparsevllm_regression/run_suite.py \
   --layer perf \
   --models qwen25_7b,qwen3_4b,llama31_8b \
   --methods omnikv \
   --run_id omnikv_perf_$(date -u +%Y%m%d_%H%M%S) \
-  --output_root /root/autodl-tmp/outputs/deltakv
+  --output_root <OUTPUT_ROOT>
 ```
 
 For TP decode CUDA graph v1 performance validation:
 
 ```bash
-/root/miniconda3/bin/conda run -n kv --no-capture-output \
+conda run -n <CONDA_ENV> --no-capture-output \
   python benchmark/sparsevllm_regression/run_suite.py \
   --layer perf \
   --models qwen25_7b \
   --methods vanilla,streamingllm,snapkv,pyramidkv,omnikv,rkv,skipkv \
   --tensor_parallel_size 2 \
   --run_id tp2_graph_perf_v1_$(date -u +%Y%m%d_%H%M%S) \
-  --output_root /root/autodl-tmp/outputs/deltakv
+  --output_root <OUTPUT_ROOT>
 ```
 
 Inspect `perf.jsonl` for `decode_cuda_graph_expected=true` and
@@ -287,13 +286,13 @@ Stress currently uses:
 - max decode steps after full admission: `32`
 
 ```bash
-/root/miniconda3/bin/conda run -n kv --no-capture-output \
+conda run -n <CONDA_ENV> --no-capture-output \
   python benchmark/sparsevllm_regression/run_suite.py \
   --layer stress \
   --models qwen25_7b,qwen3_4b,llama31_8b \
   --methods omnikv \
   --run_id omnikv_stress80_$(date -u +%Y%m%d_%H%M%S) \
-  --output_root /root/autodl-tmp/outputs/deltakv
+  --output_root <OUTPUT_ROOT>
 ```
 
 ### Stress V2
@@ -324,13 +323,13 @@ the realized prompt lengths do not vary. Unsupported methods are recorded as
 serving behavior.
 
 ```bash
-/root/miniconda3/bin/conda run -n kv --no-capture-output \
+conda run -n <CONDA_ENV> --no-capture-output \
   python benchmark/sparsevllm_regression/run_suite.py \
   --layer stress_v2 \
   --models qwen3_4b \
   --methods vanilla,omnikv,quest \
   --run_id stress_v2_qwen3_serving_$(date -u +%Y%m%d_%H%M%S) \
-  --output_root /root/autodl-tmp/outputs/deltakv
+  --output_root <OUTPUT_ROOT>
 ```
 
 ### Combined Layers
@@ -338,13 +337,13 @@ serving behavior.
 `nightly` runs quality, logits, and performance. It does not run stress.
 
 ```bash
-/root/miniconda3/bin/conda run -n kv --no-capture-output \
+conda run -n <CONDA_ENV> --no-capture-output \
   python benchmark/sparsevllm_regression/run_suite.py \
   --layer nightly \
   --models qwen25_7b,qwen3_4b,llama31_8b \
   --methods vanilla,omnikv \
   --run_id nightly_omnikv_$(date -u +%Y%m%d_%H%M%S) \
-  --output_root /root/autodl-tmp/outputs/deltakv
+  --output_root <OUTPUT_ROOT>
 ```
 
 `pre-refactor` runs quality, logits, performance, and stress.
@@ -352,7 +351,7 @@ serving behavior.
 ## Result Records
 
 Keep this file as the stable regression runbook. Do not add chronological
-experiment records or private result indexes here. If a repo-facing result claim
+experiment records or local result indexes here. If a repo-facing result claim
 is needed, cite the original run artifact path directly.
 
 ## OmniKV Full-Layer Selection
@@ -369,13 +368,13 @@ the selected string must be passed back as `full_attention_layers`.
 Example for Qwen2.5-7B with six full layers:
 
 ```bash
-/root/miniconda3/bin/conda run -n kv --no-capture-output \
+conda run -n <CONDA_ENV> --no-capture-output \
   python scripts/analysis/select_omnikv_full_layers.py \
-  --model-path /root/autodl-fs/models/Qwen2.5-7B-Instruct-1M \
-  --longbench-root /root/autodl-fs/datasets/LongBench \
+  --model-path <MODEL_ROOT>/Qwen2.5-7B-Instruct-1M \
+  --longbench-root <LONGBENCH_ROOT> \
   --config-dir benchmark/long_bench/config \
   --dataset narrativeqa \
-  --output-dir /root/autodl-tmp/outputs/deltakv/omnikv_full_layer_calibration_$(date -u +%Y%m%d)/qwen25_7b_full6 \
+  --output-dir <OUTPUT_ROOT>/omnikv_full_layer_calibration_$(date -u +%Y%m%d)/qwen25_7b_full6 \
   --num-full-layers 6 \
   --num-samples 32 \
   --topk 2048 \
@@ -453,7 +452,7 @@ python - <<'PY'
 import json
 from pathlib import Path
 
-root = Path("/root/autodl-tmp/outputs/deltakv/sparsevllm_regression/<run_id>")
+root = Path("<OUTPUT_ROOT>/sparsevllm_regression/<run_id>")
 data = json.loads((root / "grade_summary.json").read_text())
 print("status:", data["status"])
 print("worst_required_grade:", data.get("worst_required_grade"))
@@ -479,14 +478,14 @@ run IDs, or remote log paths to the rubric file.
   - Check `resolved_manifest.json`.
   - If a run should fail on missing paths, pass `--no-allow_skipped_policy`.
 - Import errors:
-  - Ensure `PYTHONPATH=/root/autodl-tmp/DeltaKV:/root/autodl-tmp/DeltaKV/src:${PYTHONPATH:-}`.
-  - Use the `kv` conda env on the observed AutoDL machine.
+  - Ensure `PYTHONPATH=<REPO_ROOT>:<REPO_ROOT>/src:${PYTHONPATH:-}`.
+  - Use an environment with the dependencies from [Getting Started](../getting_started/README.md).
 - Quality dataset errors:
-  - Set `DELTAKV_LONGBENCH_DATA_DIR=/root/autodl-fs/datasets/LongBench`.
+  - Set `DELTAKV_LONGBENCH_DATA_DIR=<LONGBENCH_ROOT>`.
 - GPU memory failures:
   - Do not add fallback behavior inside the harness.
   - Record the exact run ID, model, method, layer, log path, and error in the
-    campaign report or issue note.
+    issue note.
 - A command exits early:
   - Inspect `<run_id>/grade_summary.json`; failed commands are recorded with
     `returncode`, `cmd`, and `log_path`.

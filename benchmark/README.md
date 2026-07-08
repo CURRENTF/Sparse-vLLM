@@ -16,7 +16,6 @@ as a lightweight source-tree map.
 | `niah/` | `test_niah.py`, `gen_niah.py` | Needle-in-a-haystack generation and evaluation utility. |
 | `sparsevllm_regression/` | `run_suite.py` | Fixed Sparse-vLLM quality/logits/perf/stress regression harness. |
 
-Do not store private experiment ledgers in this directory. Put reproducible
+Do not store local experiment ledgers in this directory. Put reproducible
 commands, stable runbook notes, and result-interpretation rules in
-`docs/benchmarking/`; put dated personal experiment records in the research
-vault when available.
+`docs/benchmarking/`.

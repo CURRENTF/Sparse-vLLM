@@ -5,7 +5,7 @@ this repository. It is written for two readers:
 
 - Humans who need to run or compare experiments without silently changing the
   method.
-- Agents that need to edit this repo later without repeating old parameter
+- Maintainers who need to edit this repo later without repeating old parameter
   mistakes.
 
 The scope is runtime and experiment parameters that affect inference behavior,
@@ -626,13 +626,13 @@ Example Sparse-vLLM smoke command:
 ```bash
 CUDA_VISIBLE_DEVICES=7 PYTHONPATH=$PWD/src \
 python scripts/benchmarks/bench_sparse_vllm.py \
-  --model_path /data2/haojitai/models/Qwen2.5-7B-Instruct-1M \
+  --model_path <MODEL_ROOT>/Qwen2.5-7B-Instruct-1M \
   --lengths 1024 \
   --batch_sizes 2 \
   --methods deltakv \
   --output_len 4 \
   --temperature 0 \
-  --hyper_params '{"gpu_memory_utilization":0.9,"engine_prefill_chunk_size":512,"max_num_seqs_in_batch":2,"max_decoding_seqs":2,"max_num_batched_tokens":2048,"full_attention_layers":"0,1","sink_keep_tokens":4,"recent_keep_tokens":32,"decode_keep_tokens":64,"deltakv_checkpoint_path":"/data2/haojitai/checkpoints/compressor/Qwen2.5-7B-Instruct-1M-Compressor","deltakv_center_ratio":0.1,"deltakv_neighbor_count":1,"deltakv_latent_dim":256,"deltakv_latent_quant_bits":4,"full_layer_kv_quant_bits":4,"enable_full_layer_kivi_quant":true,"deltakv_full_pool_reserve_ratio":0.2}'
+  --hyper_params '{"gpu_memory_utilization":0.9,"engine_prefill_chunk_size":512,"max_num_seqs_in_batch":2,"max_decoding_seqs":2,"max_num_batched_tokens":2048,"full_attention_layers":"0,1","sink_keep_tokens":4,"recent_keep_tokens":32,"decode_keep_tokens":64,"deltakv_checkpoint_path":"<CHECKPOINT_ROOT>/Qwen2.5-7B-Instruct-1M-Compressor","deltakv_center_ratio":0.1,"deltakv_neighbor_count":1,"deltakv_latent_dim":256,"deltakv_latent_quant_bits":4,"full_layer_kv_quant_bits":4,"enable_full_layer_kivi_quant":true,"deltakv_full_pool_reserve_ratio":0.2}'
 ```
 
 Important differences from HF:
@@ -1188,8 +1188,8 @@ python scripts/benchmarks/bench_sparse_vllm.py \
 Benchmark output/data example:
 
 ```bash
-DELTAKV_OUTPUT_DIR=/data2/haojitai/outputs \
-DELTAKV_DATA_DIR=/data2/haojitai/datasets \
+DELTAKV_OUTPUT_DIR=<OUTPUT_ROOT> \
+DELTAKV_DATA_DIR=<DATA_ROOT> \
 PYTHONPATH=$PWD/src:$PYTHONPATH \
 python benchmark/long_bench/pred.py \
   --model qwen25-deltakv \

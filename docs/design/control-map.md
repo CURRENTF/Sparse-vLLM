@@ -1,19 +1,16 @@
 # Sparse-VLLM Control Map
 
-Updated: 2026-06-24
-
-This is a working map for recovering control of the Sparse-VLLM side of the
-repo. It is not a benchmark result and should not be cited as evidence for a
-method claim. Use it to decide where a change belongs, which docs to trust, and
-which checks to run before reporting results.
+This page maps Sparse-VLLM runtime ownership and control flow. It is not a
+benchmark result and should not be cited as evidence for a method claim. Use it
+to decide where a change belongs, which docs to trust, and which checks to run
+before reporting results.
 
 ## Documentation Map
 
 - Start from `docs/README.md` when choosing where documentation belongs.
 - Stable runbooks and contracts live under the topical `docs/` directories.
-- Keep dated run records, private experiment ledgers, and private doc indexes
-  out of repo docs. Use the run artifacts themselves when a repo-facing claim
-  needs evidence.
+- Keep local run ledgers out of repo docs. Use the run artifacts themselves
+  when a repo-facing claim needs evidence.
 - `docs/configuration/runtime-parameter-semantics.md` is the canonical parameter contract.
   Keep it synchronized before adding new public run configs.
 
@@ -119,9 +116,9 @@ Before changing Sparse-VLLM runtime code:
 6. Any fallback must be explicit and documented. Do not silently ignore bad
    configs, missing checkpoints, missing datasets, failed parses, or failed
    metrics.
-7. If adding or refactoring a sparse method, follow
-  `skills/add-sparse-method/SKILL.md`: cache-manager first, generic
-   `attention.py`, method state out of `utils/`.
+7. If adding or refactoring a sparse method, keep the implementation
+   cache-manager first: generic `attention.py`, method state out of `utils/`,
+   and method defaults registered in `src/sparsevllm/method_registry.py`.
 
 ## Minimal Local Checks
 
@@ -195,8 +192,8 @@ These are control-restoring tasks, not urgent correctness fixes:
 2. Make RoPE ownership explicit in cache managers. The Qwen3 theta/dtype fixes
    show why cache managers need clear ownership of RoPE or related position
    modules.
-3. Keep repo docs focused on stable contracts and runbooks. Do not add private
-   experiment ledgers or personal note indexes to repo docs.
+3. Keep repo docs focused on stable contracts and runbooks. Do not add local
+   experiment ledgers to repo docs.
 4. Avoid splitting the giant DeltaKV cache managers until a functional change
    touches the exact region. When splitting, preserve tests around allocation,
    staging, graph metadata, and reconstruction separately.

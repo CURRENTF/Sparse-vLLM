@@ -49,9 +49,6 @@ explicit ablation and document it with the benchmark result.
   `src/sparsevllm/method_registry.py` and cover it in
   `tests/test_prefill_schedule_policy.py`.
 
-For new first-class methods, use the repo-local
-[`$add-sparse-method`](../../skills/add-sparse-method/SKILL.md) skill.
-
 ## Query-Aware Knobs
 
 `quest` runtime knobs:

@@ -5,8 +5,8 @@ feature descriptions, architecture notes, configuration references, and
 benchmark runbooks.
 
 Keep `docs/` focused on stable project guides, contracts, and runbooks. Do not
-add private experiment ledgers or personal note indexes here; cite concrete
-repo artifacts directly when a repo-facing result claim needs evidence.
+add local experiment ledgers here; cite concrete repo artifacts directly when a
+repo-facing result claim needs evidence.
 
 ## Stable Docs
 

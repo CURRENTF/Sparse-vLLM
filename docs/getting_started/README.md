@@ -27,7 +27,7 @@ the compressor that matches the base model before passing
 | `meta-llama/Llama-3.1-8B-Instruct` | [`JitaiHao/Llama-3.1-8B-Instruct-Compressor`](https://huggingface.co/JitaiHao/Llama-3.1-8B-Instruct-Compressor) |
 
 ```bash
-export DELTAKV_CKPT_ROOT=<AUTODL_FS>/checkpoints/compressor
+export DELTAKV_CKPT_ROOT=<CHECKPOINT_ROOT>/compressor
 mkdir -p "$DELTAKV_CKPT_ROOT"
 
 huggingface-cli download JitaiHao/Qwen2.5-7B-Instruct-1M-Compressor \

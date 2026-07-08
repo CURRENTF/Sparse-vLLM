@@ -1,8 +1,8 @@
 # Multimodal Benchmarks
 
 This page is the stable entry point for multimodal benchmark commands. Keep
-dated runs, old paper-comparison notes, and private result history out of this
-repo doc; cite the actual run artifacts when reporting a result.
+local run histories and old paper-comparison notes out of this repo doc; cite
+the actual run artifacts when reporting a result.
 
 ## Current Entry Points
 
