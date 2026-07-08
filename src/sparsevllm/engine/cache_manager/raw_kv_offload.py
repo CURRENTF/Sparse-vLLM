@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import os
+from typing import Any
 
 import torch
+
+from sparsevllm.platforms import device_runtime
 
 
 def resolve_long_prefill_offload_min_tokens(default: int = 262144) -> int:
@@ -35,7 +38,7 @@ class _RawKVEntry:
     v_shape_tail: tuple[int, ...] = ()
     dtype: torch.dtype | None = None
     chunks: dict[int, tuple[torch.Tensor, torch.Tensor]] | None = None
-    producer_events: dict[int, tuple[int, torch.cuda.Event]] | None = None
+    producer_events: dict[int, tuple[int, Any]] | None = None
 
 
 class RawKVOffloadBuffer:
@@ -129,16 +132,21 @@ class RawKVOffloadBuffer:
         if entry.producer_events is None or (not k.is_cuda and not v.is_cuda):
             return
         device = k.device if k.is_cuda else v.device
-        event = torch.cuda.Event()
-        event.record(torch.cuda.current_stream(device=device))
+        event = device_runtime.new_event(device=device)
+        if event is None:
+            raise RuntimeError(
+                "RawKVOffloadBuffer needs a device event for asynchronous CUDA offload, "
+                f"but the active platform does not support streams for device={device}."
+            )
+        device_runtime.record_event(event, device=device)
         entry.producer_events[int(start)] = (int(end), event)
 
     @staticmethod
-    def _wait_for_producer_event(event: torch.cuda.Event, dst: torch.Tensor) -> None:
+    def _wait_for_producer_event(event: Any, dst: torch.Tensor) -> None:
         if dst.is_cuda:
-            torch.cuda.current_stream(device=dst.device).wait_event(event)
+            device_runtime.wait_event(event, device=dst.device)
         else:
-            event.synchronize()
+            device_runtime.synchronize_event(event)
 
     @classmethod
     def _wait_for_range_producers(

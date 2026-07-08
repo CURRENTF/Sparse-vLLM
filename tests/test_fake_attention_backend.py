@@ -9,19 +9,24 @@ from sparsevllm.layers.attention_backend import TritonAttentionBackend
 
 
 class FakeAttentionBackendTest(unittest.TestCase):
+    _ENV_KEYS = (
+        "SPARSEVLLM_FAKE_ATTENTION",
+        "SPARSEVLLM_FAKE_PREFILL_ATTENTION",
+        "SPARSEVLLM_FAKE_DECODE_ATTENTION",
+        "SPARSEVLLM_FAKE_ATTENTION_MODE",
+        "SPARSEVLLM_ALLOW_FAKE_ATTENTION",
+        "SVLLM_DEBUG_DECODE_BOUNDS",
+    )
+
     def setUp(self):
-        self._old_enabled = os.environ.get("SPARSEVLLM_FAKE_ATTENTION")
-        self._old_mode = os.environ.get("SPARSEVLLM_FAKE_ATTENTION_MODE")
+        self._old_env = {key: os.environ.get(key) for key in self._ENV_KEYS}
 
     def tearDown(self):
-        if self._old_enabled is None:
-            os.environ.pop("SPARSEVLLM_FAKE_ATTENTION", None)
-        else:
-            os.environ["SPARSEVLLM_FAKE_ATTENTION"] = self._old_enabled
-        if self._old_mode is None:
-            os.environ.pop("SPARSEVLLM_FAKE_ATTENTION_MODE", None)
-        else:
-            os.environ["SPARSEVLLM_FAKE_ATTENTION_MODE"] = self._old_mode
+        for key, value in self._old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
     def _make_prefill_view(self, *, attn_score=None):
         return PrefillComputeView(
@@ -47,6 +52,7 @@ class FakeAttentionBackendTest(unittest.TestCase):
 
     def test_fake_prefill_returns_zeros_and_skips_kernel(self):
         os.environ["SPARSEVLLM_FAKE_ATTENTION"] = "1"
+        os.environ["SPARSEVLLM_ALLOW_FAKE_ATTENTION"] = "1"
         q = torch.ones(3, 2, 4)
         attn_score = torch.full((1, 2, 3), 9.0)
         view = self._make_prefill_view(attn_score=attn_score)
@@ -68,6 +74,7 @@ class FakeAttentionBackendTest(unittest.TestCase):
 
     def test_fake_decode_copy_mode_skips_kernels(self):
         os.environ["SPARSEVLLM_FAKE_ATTENTION"] = "1"
+        os.environ["SPARSEVLLM_ALLOW_FAKE_ATTENTION"] = "1"
         os.environ["SPARSEVLLM_FAKE_ATTENTION_MODE"] = "copy"
         q = torch.arange(8, dtype=torch.float32).view(1, 2, 4)
         attn_score = torch.full((1, 2, 3), -1e20)
@@ -97,6 +104,46 @@ class FakeAttentionBackendTest(unittest.TestCase):
         self.assertIsNot(out, q)
         self.assertTrue(torch.equal(out, q))
         self.assertTrue(torch.equal(attn_score, torch.zeros_like(attn_score)))
+
+    def test_debug_decode_bounds_checks_flash_attn_contiguous(self):
+        os.environ["SVLLM_DEBUG_DECODE_BOUNDS"] = "1"
+        q = torch.zeros(1, 2, 4)
+        view = DecodeComputeView(
+            k_cache=torch.ones(3, 2, 4),
+            v_cache=torch.ones(3, 2, 4),
+            active_slots=torch.tensor([[0, 1, 99]], dtype=torch.int32),
+            req_indices=torch.tensor([0], dtype=torch.int32),
+            context_lens=torch.tensor([3], dtype=torch.int32),
+            max_context_len=3,
+            backend="flash_attn_contiguous",
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "decode physical slot out of bounds"):
+            TritonAttentionBackend().run_decode(
+                q,
+                view,
+                mid_o=torch.empty(1, 2, 1, 4),
+                mid_o_logexpsum=torch.empty(1, 2, 1),
+                max_len_in_batch=3,
+                block_seq=256,
+                num_heads=2,
+                num_kv_heads=1,
+            )
+
+    def test_fake_attention_requires_explicit_allow(self):
+        os.environ["SPARSEVLLM_FAKE_ATTENTION"] = "1"
+        os.environ.pop("SPARSEVLLM_ALLOW_FAKE_ATTENTION", None)
+        q = torch.ones(3, 2, 4)
+        view = self._make_prefill_view()
+
+        with self.assertRaisesRegex(RuntimeError, "SPARSEVLLM_ALLOW_FAKE_ATTENTION"):
+            TritonAttentionBackend().run_prefill(
+                q,
+                view,
+                b_start_loc=torch.tensor([0], dtype=torch.int32),
+                chunk_lens=torch.tensor([3], dtype=torch.int32),
+                max_input_len=3,
+            )
 
     def test_fake_prefill_only_keeps_decode_kernels(self):
         os.environ["SPARSEVLLM_FAKE_PREFILL_ATTENTION"] = "1"

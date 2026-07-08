@@ -1518,8 +1518,22 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
                 calls.append(("exit", self.stream.name))
                 return False
 
-        def fake_current_stream(device=None):
-            return FakeStream(device=device, name="current")
+        current_stream = [FakeStream(device=manager.device, name="current")]
+
+        def fake_record_event(event, device=None):
+            del device
+            event.record(current_stream[0])
+
+        class FakeRuntimeStreamContext(FakeStreamContext):
+            def __enter__(self):
+                current_stream[0] = self.stream
+                return super().__enter__()
+
+            def __exit__(self, exc_type, exc, tb):
+                try:
+                    return super().__exit__(exc_type, exc, tb)
+                finally:
+                    current_stream[0] = FakeStream(device=manager.device, name="current")
 
         def fake_copy_prefix_to(**kwargs):
             calls.append(("copy_prefix_to", int(kwargs["layer_idx"]), int(kwargs["row_idx"]), int(kwargs["end"])))
@@ -1527,15 +1541,22 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
         manager.raw_kv_offload_buffer = SimpleNamespace(copy_prefix_to=fake_copy_prefix_to)
 
         with (
-            patch("sparsevllm.engine.cache_manager.snapkv.torch.cuda.Event", FakeEvent),
-            patch("sparsevllm.engine.cache_manager.snapkv.torch.cuda.Stream", FakeStream),
             patch(
-                "sparsevllm.engine.cache_manager.snapkv.torch.cuda.stream",
-                lambda stream: FakeStreamContext(stream),
+                "sparsevllm.engine.cache_manager.snapkv.device_runtime.new_event",
+                lambda device=None: FakeEvent(),
             ),
             patch(
-                "sparsevllm.engine.cache_manager.snapkv.torch.cuda.current_stream",
-                fake_current_stream,
+                "sparsevllm.engine.cache_manager.snapkv.device_runtime.new_stream",
+                lambda device=None: FakeStream(device=device),
+            ),
+            patch("sparsevllm.engine.cache_manager.snapkv.device_runtime.record_event", fake_record_event),
+            patch(
+                "sparsevllm.engine.cache_manager.snapkv.device_runtime.stream_context",
+                lambda stream: FakeRuntimeStreamContext(stream),
+            ),
+            patch(
+                "sparsevllm.engine.cache_manager.snapkv.device_runtime.stream_wait_event",
+                lambda stream, event: stream.wait_event(event),
             ),
         ):
             SnapKVCacheManager._pyramidkv_schedule_next_long_prefill_offload_prefetch(
@@ -2296,8 +2317,22 @@ class DeltaKVLessMemoryStorageContractTest(unittest.TestCase):
                 calls.append(("exit", self.stream.name))
                 return False
 
-        def fake_current_stream(device=None):
-            return FakeStream(device=device, name="current")
+        current_stream = [FakeStream(device=manager.device, name="current")]
+
+        def fake_record_event(event, device=None):
+            del device
+            event.record(current_stream[0])
+
+        class FakeRuntimeStreamContext(FakeStreamContext):
+            def __enter__(self):
+                current_stream[0] = self.stream
+                return super().__enter__()
+
+            def __exit__(self, exc_type, exc, tb):
+                try:
+                    return super().__exit__(exc_type, exc, tb)
+                finally:
+                    current_stream[0] = FakeStream(device=manager.device, name="current")
 
         def fake_copy_prefix_to(**kwargs):
             calls.append(("copy_prefix_to", int(kwargs["layer_idx"]), int(kwargs["end"])))
@@ -2305,15 +2340,25 @@ class DeltaKVLessMemoryStorageContractTest(unittest.TestCase):
         manager.raw_kv_offload_buffer = SimpleNamespace(copy_prefix_to=fake_copy_prefix_to)
 
         with (
-            patch("sparsevllm.engine.cache_manager.deltakv_less_memory.torch.cuda.Event", FakeEvent),
-            patch("sparsevllm.engine.cache_manager.deltakv_less_memory.torch.cuda.Stream", FakeStream),
             patch(
-                "sparsevllm.engine.cache_manager.deltakv_less_memory.torch.cuda.stream",
-                lambda stream: FakeStreamContext(stream),
+                "sparsevllm.engine.cache_manager.deltakv_less_memory.device_runtime.new_event",
+                lambda device=None: FakeEvent(),
             ),
             patch(
-                "sparsevllm.engine.cache_manager.deltakv_less_memory.torch.cuda.current_stream",
-                fake_current_stream,
+                "sparsevllm.engine.cache_manager.deltakv_less_memory.device_runtime.new_stream",
+                lambda device=None: FakeStream(device=device),
+            ),
+            patch(
+                "sparsevllm.engine.cache_manager.deltakv_less_memory.device_runtime.record_event",
+                fake_record_event,
+            ),
+            patch(
+                "sparsevllm.engine.cache_manager.deltakv_less_memory.device_runtime.stream_context",
+                lambda stream: FakeRuntimeStreamContext(stream),
+            ),
+            patch(
+                "sparsevllm.engine.cache_manager.deltakv_less_memory.device_runtime.stream_wait_event",
+                lambda stream, event: stream.wait_event(event),
             ),
         ):
             DeltaKVLessMemoryCacheManager._deltakv_schedule_next_long_prefill_offload_prefetch(

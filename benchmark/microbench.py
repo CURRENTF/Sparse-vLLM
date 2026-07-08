@@ -142,6 +142,14 @@ def _selected_env_snapshot() -> dict[str, str]:
         "SVLLM_BENCHMARK_DATA_DIR",
         "DELTAKV_OUTPUT_DIR",
         "DELTAKV_DATA_DIR",
+        "SPARSEVLLM_FAKE_ATTENTION",
+        "SPARSEVLLM_FAKE_PREFILL_ATTENTION",
+        "SPARSEVLLM_FAKE_DECODE_ATTENTION",
+        "SPARSEVLLM_FAKE_ATTENTION_MODE",
+        "SPARSEVLLM_ALLOW_FAKE_ATTENTION",
+        "SPARSEVLLM_LONG_PREFILL_OFFLOAD_MIN_TOKENS",
+        "SPARSEVLLM_RAWKV_BUFFER_MODE",
+        "SPARSEVLLM_RAWKV_PREFETCH",
     ]
     return {key: os.environ[key] for key in keys if key in os.environ}
 

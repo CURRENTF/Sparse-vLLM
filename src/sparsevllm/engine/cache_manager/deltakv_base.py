@@ -16,6 +16,7 @@ from sparsevllm.utils.context import get_context
 from sparsevllm.utils.log import logger, log_level
 from sparsevllm.utils.profiler import profiler
 from sparsevllm.layers.rotary_embedding import get_rope, apply_rotary_emb
+from sparsevllm.platforms import device_runtime
 
 from .base import CacheManager, DecodeComputeView, LayerBatchStates, PrefillComputeView, SparseSelection
 from .raw_kv_offload import RawKVOffloadBuffer, resolve_long_prefill_offload_min_tokens
@@ -164,7 +165,7 @@ class DeltaKVCacheManager(CacheManager):
         self._deltakv_prefill_staging_context_lens = None
         self._deltakv_full_prefill_plans: dict[int, dict[str, torch.Tensor | int]] = {}
         self._deltakv_full_prefill_compressed_layers: set[int] = set()
-        self.raw_kv_offload_buffer = RawKVOffloadBuffer(pin_memory=torch.cuda.is_available())
+        self.raw_kv_offload_buffer = RawKVOffloadBuffer(pin_memory=device_runtime.supports_pin_memory())
         self._deltakv_long_prefill_offload_step_active = False
         self._deltakv_long_prefill_offload_row_idx: int | None = None
         self._deltakv_long_prefill_offload_start = 0

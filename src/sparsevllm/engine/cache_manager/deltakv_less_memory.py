@@ -14,6 +14,7 @@ from sparsevllm.triton_kernel.quant import (
 )
 from sparsevllm.triton_kernel.deltakv_kernels import deltakv_materialize_sparse_view
 from sparsevllm.layers.rotary_embedding import apply_rotary_emb
+from sparsevllm.platforms import device_runtime
 from sparsevllm.utils.compressor import create_compressor
 from sparsevllm.utils.context import get_context
 from sparsevllm.utils.log import logger
@@ -1758,7 +1759,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
     def _deltakv_long_prefill_offload_prefetch_enabled(self) -> bool:
         if os.getenv("SPARSEVLLM_RAWKV_PREFETCH", "1") == "0":
             return False
-        return torch.cuda.is_available() and torch.device(self.device).type == "cuda"
+        return device_runtime.supports_streams(self.device)
 
     def _deltakv_clear_long_prefill_offload_prefetch(self):
         states = getattr(self, "_deltakv_long_prefill_offload_prefetch_states", None)
@@ -1768,7 +1769,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         for state in list(states.values()):
             event = state.get("event")
             if event is not None:
-                torch.cuda.current_stream(self.device).wait_event(event)
+                device_runtime.wait_event(event, device=self.device)
         self._deltakv_long_prefill_offload_prefetch_states = {}
         self._deltakv_long_prefill_offload_prefetch_state = None
 
@@ -1787,7 +1788,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         if state is not None:
             event = state.get("event")
             if event is not None:
-                torch.cuda.current_stream(self.device).wait_event(event)
+                device_runtime.wait_event(event, device=self.device)
         self._deltakv_long_prefill_offload_prefetch_states = states
 
     def _deltakv_consume_long_prefill_offload_staged_prefetch(
@@ -1812,11 +1813,11 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
             # Backward-compatible cleanup for any stale temporary-tensor state.
             event = state.get("event")
             if event is not None:
-                torch.cuda.current_stream(self.device).wait_event(event)
+                device_runtime.wait_event(event, device=self.device)
             self._deltakv_long_prefill_offload_prefetch_states = states
             return False
         with profiler.record("deltakv_long_prefill_offload_prefetch_wait"):
-            torch.cuda.current_stream(self.device).wait_event(state["event"])
+            device_runtime.wait_event(state["event"], device=self.device)
         self._deltakv_long_prefill_offload_prefetch_states = states
         return True
 
@@ -1863,7 +1864,12 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
                 states = getattr(self, "_deltakv_long_prefill_offload_prefetch_states", None) or {}
         stream = getattr(self, "_deltakv_long_prefill_offload_prefetch_stream", None)
         if stream is None:
-            stream = torch.cuda.Stream(device=self.device)
+            stream = device_runtime.new_stream(device=self.device)
+            if stream is None:
+                raise RuntimeError(
+                    "DeltaKV long-prefill offload prefetch is enabled, but the active platform "
+                    f"does not support streams for device={self.device}."
+                )
             self._deltakv_long_prefill_offload_prefetch_stream = stream
         for next_layer in future_layers:
             kind = self._deltakv_long_prefill_offload_kind(next_layer)
@@ -1871,10 +1877,15 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
             if key in states:
                 continue
             with profiler.record("deltakv_long_prefill_offload_prefetch_schedule"):
-                staging_available_event = torch.cuda.Event()
-                staging_available_event.record(torch.cuda.current_stream(self.device))
-                with torch.cuda.stream(stream):
-                    stream.wait_event(staging_available_event)
+                staging_available_event = device_runtime.new_event(device=self.device)
+                if staging_available_event is None:
+                    raise RuntimeError(
+                        "DeltaKV long-prefill offload prefetch could not create a staging event "
+                        f"for device={self.device}."
+                    )
+                device_runtime.record_event(staging_available_event, device=self.device)
+                with device_runtime.stream_context(stream):
+                    device_runtime.stream_wait_event(stream, staging_available_event)
                     if kind == "sparse_pre_rope":
                         k_dst = self.deltakv_prefill_staging_pre_rope_k_cache[:end]
                         v_dst = self.deltakv_prefill_staging_kv_cache[1, :end]
@@ -1889,8 +1900,13 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
                         k_out=k_dst,
                         v_out=v_dst,
                     )
-                    event = torch.cuda.Event()
-                    event.record(stream)
+                    event = device_runtime.new_event(device=self.device)
+                    if event is None:
+                        raise RuntimeError(
+                            "DeltaKV long-prefill offload prefetch could not create a completion event "
+                            f"for device={self.device}."
+                        )
+                    device_runtime.record_event(event, device=self.device)
             states[key] = {
                 "layer_idx": int(next_layer),
                 "row_idx": int(row_idx),

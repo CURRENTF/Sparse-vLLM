@@ -3,8 +3,9 @@ import triton
 import triton.language as tl
 import math
 import torch.nn.functional as F
+from sparsevllm.platforms import device_runtime
 
-TESLA = "Tesla" in torch.cuda.get_device_name(0)
+TESLA = "Tesla" in device_runtime.optional_device_name(0)
 
 
 @triton.jit

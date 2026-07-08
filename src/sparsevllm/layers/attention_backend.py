@@ -15,22 +15,44 @@ from sparsevllm.triton_kernel.gqa_flash_decoding_stage1_hd256 import flash_decod
 from sparsevllm.triton_kernel.gqa_flash_decoding_stage1_hd256 import (
     flash_decode_stage1_with_score as gqa_flash_decode_stage1_hd256_with_score,
 )
+from sparsevllm.utils.log import log_once
 from sparsevllm.utils.profiler import profiler
 
 
-def _fake_attention_enabled() -> bool:
-    value = os.environ.get("SPARSEVLLM_FAKE_ATTENTION", "")
+def _env_truthy(name: str) -> bool:
+    value = os.environ.get(name, "")
     return value.lower() in {"1", "true", "yes", "on"}
 
 
+def _fake_attention_enabled() -> bool:
+    return _env_truthy("SPARSEVLLM_FAKE_ATTENTION")
+
+
+def _allow_fake_attention() -> None:
+    if not _env_truthy("SPARSEVLLM_ALLOW_FAKE_ATTENTION"):
+        raise RuntimeError(
+            "Sparse-vLLM fake attention was requested, but it is disabled by default because it "
+            "invalidates correctness and benchmark results. Set SPARSEVLLM_ALLOW_FAKE_ATTENTION=1 "
+            "only for explicit fake-attention tests or profiling."
+        )
+    log_once(
+        "Sparse-vLLM fake attention is enabled; outputs are not valid for correctness or benchmark results.",
+        level="WARNING",
+    )
+
+
 def _fake_prefill_attention_enabled() -> bool:
-    value = os.environ.get("SPARSEVLLM_FAKE_PREFILL_ATTENTION", "")
-    return value.lower() in {"1", "true", "yes", "on"} or _fake_attention_enabled()
+    enabled = _env_truthy("SPARSEVLLM_FAKE_PREFILL_ATTENTION") or _fake_attention_enabled()
+    if enabled:
+        _allow_fake_attention()
+    return enabled
 
 
 def _fake_decode_attention_enabled() -> bool:
-    value = os.environ.get("SPARSEVLLM_FAKE_DECODE_ATTENTION", "")
-    return value.lower() in {"1", "true", "yes", "on"} or _fake_attention_enabled()
+    enabled = _env_truthy("SPARSEVLLM_FAKE_DECODE_ATTENTION") or _fake_attention_enabled()
+    if enabled:
+        _allow_fake_attention()
+    return enabled
 
 
 def _fake_attention_output(q: torch.Tensor) -> torch.Tensor:
@@ -173,6 +195,7 @@ class TritonAttentionBackend:
             o = torch.empty_like(q)
             flash_decode_stage2(mid_o, mid_o_logexpsum, view.context_lens, o, block_seq)
             return o
+        self._debug_check_decode_bounds(view)
         if view.backend == "flash_attn_contiguous":
             from flash_attn import flash_attn_with_kvcache
 
@@ -198,7 +221,6 @@ class TritonAttentionBackend:
                 )
             return out.squeeze(1)
 
-        self._debug_check_decode_bounds(view)
         profile_kind = "full" if int(max_len_in_batch) > 8192 else "sparse"
         is_gqa = int(num_heads) > int(num_kv_heads)
         use_gqa_hd256 = is_gqa and int(q.shape[-1]) == 256
@@ -339,7 +361,7 @@ class TritonAttentionBackend:
     def _debug_check_decode_bounds(self, view: DecodeComputeView):
         if os.environ.get("SVLLM_DEBUG_DECODE_BOUNDS", "0") != "1":
             return
-        if view.backend != "dense":
+        if view.backend not in {"dense", "flash_attn_contiguous"}:
             return
         if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
             return
@@ -373,7 +395,7 @@ class TritonAttentionBackend:
             bad_slot = int(visible_slots[bad_b, bad_pos].item())
             bad_req_row = int(rows[bad_b].item())
             raise RuntimeError(
-                "decode physical slot out of bounds before stage1: "
+                "decode physical slot out of bounds before attention: "
                 f"batch={bad_b} req_row={bad_req_row} pos={bad_pos} "
                 f"slot={bad_slot} slot_cap={slot_cap} context_len={int(view.context_lens[bad_b].item())}"
             )

@@ -8,6 +8,7 @@ import torch
 from sparsevllm.config import Config
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.method_registry import PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH
+from sparsevllm.platforms import device_runtime
 from sparsevllm.triton_kernel.prefill_score import prefill_score_fwd
 from sparsevllm.utils.context import get_context
 from sparsevllm.utils.log import logger, log_level
@@ -30,7 +31,7 @@ class SnapKVCacheManager(CacheManager):
         self._pyramidkv_prefill_staging_context_lens = None
         self._pyramidkv_prefill_staging_seq_offsets: dict[int, int] = {}
         self._pyramidkv_prefill_staging_materialized_layers: set[tuple[int, int]] = set()
-        self.raw_kv_offload_buffer = RawKVOffloadBuffer(pin_memory=torch.cuda.is_available())
+        self.raw_kv_offload_buffer = RawKVOffloadBuffer(pin_memory=device_runtime.supports_pin_memory())
         self._pyramidkv_long_prefill_offload_step_active = False
         self._pyramidkv_long_prefill_offload_seq_id: int | None = None
         self._pyramidkv_long_prefill_offload_start = 0
@@ -1284,14 +1285,14 @@ class SnapKVCacheManager(CacheManager):
         return int(row_idx)
 
     def _pyramidkv_long_prefill_offload_prefetch_enabled(self) -> bool:
-        return torch.cuda.is_available() and torch.device(self.device).type == "cuda"
+        return device_runtime.supports_streams(self.device)
 
     def _pyramidkv_clear_long_prefill_offload_prefetch(self):
         states = getattr(self, "_pyramidkv_long_prefill_offload_prefetch_states", None) or {}
         for state in list(states.values()):
             event = state.get("event")
             if event is not None:
-                torch.cuda.current_stream(self.device).wait_event(event)
+                device_runtime.wait_event(event, device=self.device)
         self._pyramidkv_long_prefill_offload_prefetch_states = {}
 
     def _pyramidkv_drop_long_prefill_offload_prefetch(self, key: tuple[int, int, str, int]):
@@ -1300,7 +1301,7 @@ class SnapKVCacheManager(CacheManager):
         if state is not None:
             event = state.get("event")
             if event is not None:
-                torch.cuda.current_stream(self.device).wait_event(event)
+                device_runtime.wait_event(event, device=self.device)
         self._pyramidkv_long_prefill_offload_prefetch_states = states
 
     def _pyramidkv_consume_long_prefill_offload_staged_prefetch(
@@ -1318,7 +1319,7 @@ class SnapKVCacheManager(CacheManager):
             self._pyramidkv_long_prefill_offload_prefetch_states = states
             return False
         with profiler.record("pyramidkv_long_prefill_offload_prefetch_wait"):
-            torch.cuda.current_stream(self.device).wait_event(state["event"])
+            device_runtime.wait_event(state["event"], device=self.device)
         self._pyramidkv_long_prefill_offload_prefetch_states = states
         return True
 
@@ -1342,14 +1343,24 @@ class SnapKVCacheManager(CacheManager):
 
         stream = getattr(self, "_pyramidkv_long_prefill_offload_prefetch_stream", None)
         if stream is None:
-            stream = torch.cuda.Stream(device=self.device)
+            stream = device_runtime.new_stream(device=self.device)
+            if stream is None:
+                raise RuntimeError(
+                    "PyramidKV long-prefill offload prefetch is enabled, but the active platform "
+                    f"does not support streams for device={self.device}."
+                )
             self._pyramidkv_long_prefill_offload_prefetch_stream = stream
 
         with profiler.record("pyramidkv_long_prefill_offload_prefetch_schedule"):
-            staging_available_event = torch.cuda.Event()
-            staging_available_event.record(torch.cuda.current_stream(self.device))
-            with torch.cuda.stream(stream):
-                stream.wait_event(staging_available_event)
+            staging_available_event = device_runtime.new_event(device=self.device)
+            if staging_available_event is None:
+                raise RuntimeError(
+                    "PyramidKV long-prefill offload prefetch could not create a staging event "
+                    f"for device={self.device}."
+                )
+            device_runtime.record_event(staging_available_event, device=self.device)
+            with device_runtime.stream_context(stream):
+                device_runtime.stream_wait_event(stream, staging_available_event)
                 self.raw_kv_offload_buffer.copy_prefix_to(
                     layer_idx=next_layer,
                     row_idx=row_idx,
@@ -1358,8 +1369,13 @@ class SnapKVCacheManager(CacheManager):
                     k_out=self.pyramidkv_prefill_staging_kv_cache[0, :end],
                     v_out=self.pyramidkv_prefill_staging_kv_cache[1, :end],
                 )
-                event = torch.cuda.Event()
-                event.record(stream)
+                event = device_runtime.new_event(device=self.device)
+                if event is None:
+                    raise RuntimeError(
+                        "PyramidKV long-prefill offload prefetch could not create a completion event "
+                        f"for device={self.device}."
+                    )
+                device_runtime.record_event(event, device=self.device)
         states[key] = {
             "layer_idx": next_layer,
             "row_idx": int(row_idx),
