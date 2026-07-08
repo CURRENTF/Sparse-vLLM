@@ -316,18 +316,20 @@ class SparseController:
 
         with profiler.record("pyramidkv_staging_materialize_layer"):
             budget = self._get_layer_budget(layer_idx, is_prefill=True)
-            if budget is None:
-                raise RuntimeError("PyramidKV full-prefill staging requires a layer budget.")
-
             seqs = getattr(ctx, "seqs", None)
             if seqs is None:
                 raise RuntimeError("PyramidKV full-prefill staging requires current seqs in context.")
+            if any(not seq.is_last_chunk_prefill for seq in seqs):
+                if any(
+                    getattr(self.cache_manager, "requires_long_prefill_offload", lambda _seq: False)(seq)
+                    for seq in seqs
+                ):
+                    return
+                raise RuntimeError("PyramidKV full-prefill staging should only run on the final prefill chunk.")
             seq_keep_indices = []
             for seq in seqs:
-                if not seq.is_last_chunk_prefill:
-                    raise RuntimeError("PyramidKV full-prefill staging should only run on the final prefill chunk.")
                 kv_len = int(seq.num_prefilled_tokens) + int(seq.current_chunk_size)
-                if kv_len <= budget:
+                if budget is None or kv_len <= budget:
                     keep_indices = torch.arange(kv_len, device=self.device, dtype=torch.long)
                 else:
                     attn_scores = self.cache_manager.pop_prefill_attention_score(layer_idx, seq)
@@ -377,6 +379,8 @@ class SparseController:
 
         # DeltaKV: Always try to compress incrementally (to save memory during long prefill)
         if self.is_deltakv_family:
+            if getattr(self.cache_manager, "defer_prefill_eviction", lambda: False)():
+                return
             self._deltakv_eviction(seqs)
             return
 

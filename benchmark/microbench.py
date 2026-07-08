@@ -237,6 +237,7 @@ def _write_output_dir(args, rows: list[dict[str, Any]]) -> None:
     ]
     for record in records:
         ok = record["status"] == "success"
+        speedup = record.get("speedup_vs_vanilla_decode")
         report_lines.append(
             "| {method} | {prompt} | {batch} | {status} | {ttft} | {prefill} | {decode} | {mem} | {speedup} |".format(
                 method=record.get("method", ""),
@@ -247,7 +248,7 @@ def _write_output_dir(args, rows: list[dict[str, Any]]) -> None:
                 prefill=f"{record.get('prefill_tok_s', 0.0):.1f}" if ok else "",
                 decode=f"{record.get('decode_tok_s', 0.0):.1f}" if ok else "",
                 mem=f"{record.get('peak_memory_gb', 0.0):.2f}" if ok else "",
-                speedup=f"{record.get('speedup_vs_vanilla_decode', 0.0):.2f}" if ok else "",
+                speedup=("n/a" if speedup is None else f"{float(speedup):.2f}") if ok else "",
             )
         )
 
@@ -274,6 +275,43 @@ def _decode_cuda_graph_status(llm) -> dict[str, Any]:
         "decode_cuda_graph_graph_count": int(graph_count),
         "decode_cuda_graph_last_state_key": str(getattr(runner, "last_state_key", None)) if runner is not None else None,
         "decode_cuda_graph_active": bool(configured and graph_count > 0),
+    }
+
+
+def _jsonable_config_value(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_jsonable_config_value(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _jsonable_config_value(item) for key, item in value.items()}
+    return _json_default(value)
+
+
+def _resolved_engine_config(llm) -> dict[str, Any]:
+    config = getattr(llm, "config", None)
+    if config is None:
+        return {}
+    keys = (
+        "vllm_sparse_method",
+        "prefill_schedule_policy",
+        "chunk_prefill_size",
+        "decode_cuda_graph",
+        "decode_cuda_graph_capture_sampling",
+        "deltakv_sparse_decode_backend",
+        "deltakv_triton_materialize_block_tokens",
+        "deltakv_triton_gather_heads_per_program",
+        "deltakv_triton_reconstruct_heads_per_program",
+        "full_layer_kv_quant_bits",
+        "kv_quant_bits",
+        "kv_quant_group_size",
+        "full_attn_layers",
+        "obs_layer_ids",
+    )
+    return {
+        key: _jsonable_config_value(getattr(config, key))
+        for key in keys
+        if hasattr(config, key)
     }
 
 
@@ -306,6 +344,13 @@ def _observe_prefix_cache_hits(llm, hits_by_seq_id: dict[int, int]) -> None:
             hit_len = int(getattr(seq, "prefix_cache_hit_len", 0) or 0)
             if seq_id >= 0 and hit_len > 0:
                 hits_by_seq_id[seq_id] = max(hit_len, int(hits_by_seq_id.get(seq_id, 0)))
+
+
+def _finished_outputs_have_tokens(finished_outputs) -> bool:
+    for output in finished_outputs:
+        if len(output) >= 2 and output[1]:
+            return True
+    return False
 
 
 def benchmark_task(method, length, bs, args, results_dict):
@@ -367,8 +412,16 @@ def benchmark_task(method, length, bs, args, results_dict):
         return
     
     llm = None
+    resolved_engine_config: dict[str, Any] = {}
     try:
         m_len = length + args.output_len + 100
+        if args.max_model_len_override is not None:
+            if args.max_model_len_override < length + args.output_len:
+                raise ValueError(
+                    "max_model_len_override must be >= length + output_len; "
+                    f"got {args.max_model_len_override} < {length + args.output_len}."
+                )
+            m_len = int(args.max_model_len_override)
         # Note: max_model_len is derived from (length, bs, output_len, engine_prefill_chunk_size).
         # They can be passed in --hyper_params, but will be overwritten here to keep the benchmark consistent.
         hyper_params = dict(base_hyper_params)
@@ -383,6 +436,7 @@ def benchmark_task(method, length, bs, args, results_dict):
             **sparse_kwargs,
         }
         llm = LLM(args.model_path, **engine_kwargs)
+        resolved_engine_config = _resolved_engine_config(llm)
         prefix_cache_stats_before = _cache_stats(llm)
 
         prompt_token_ids = [[100] * length for _ in range(bs)]
@@ -470,7 +524,10 @@ def benchmark_task(method, length, bs, args, results_dict):
                 # In this engine, the first completion token is sampled during the *last* prefill
                 # step of each sequence (Scheduler.postprocess appends it in the prefill branch).
                 # So TTFT should be captured on a prefill step, not on the first decode step.
-                if ttft is None and (llm.scheduler.decoding or any(tids for _, tids in finished_outputs)):
+                if ttft is None and (
+                    llm.scheduler.decoding
+                    or _finished_outputs_have_tokens(finished_outputs)
+                ):
                     ttft = perf_counter() - t_start
             elif num_tokens < 0:
                 # print(f'one decode step ... {perf_counter() - last_time}')
@@ -598,6 +655,7 @@ def benchmark_task(method, length, bs, args, results_dict):
             },
             "memory_accounting": memory_accounting,
             "engine_hyper_params": engine_kwargs,
+            "resolved_engine_config": resolved_engine_config,
             "status": "SUCCESS"
         }
 
@@ -612,6 +670,7 @@ def benchmark_task(method, length, bs, args, results_dict):
             "status": "FAILED",
             "error": repr(e),
             "traceback": traceback.format_exc(),
+            "resolved_engine_config": _resolved_engine_config(llm) if llm is not None else resolved_engine_config,
         }
     finally:
         if llm is not None and hasattr(llm, "exit"):
@@ -633,6 +692,12 @@ def main():
         ),
     )
     parser.add_argument("--output_len", type=int, default=512, help="Output tokens per request")
+    parser.add_argument(
+        "--max_model_len_override",
+        type=int,
+        default=None,
+        help="Optional fixed max_model_len for diagnostic runs; defaults to length + output_len + 100.",
+    )
     parser.add_argument(
         "--temperature",
         type=float,
@@ -751,12 +816,13 @@ def main():
                 
                 speedup = 1.0
                 if (length, bs) in vanilla_stats:
-                    speedup = dec_tp / vanilla_stats[(length, bs)]
-                
-                speedup_str = f"{speedup:.2f}x"
+                    vanilla_decode_tp = float(vanilla_stats[(length, bs)])
+                    speedup = dec_tp / vanilla_decode_tp if vanilla_decode_tp > 0 else None
+
+                speedup_str = "n/a" if speedup is None else f"{speedup:.2f}x"
                 print(f"{method:<12} {length:<8} {bs_str:<4} {ttft:<10.2f} {pre_tp:<12.1f} {dec_tp:<12.1f} {itl:<10.2f} {avg_bs:<8.1f} {mem:<10.2f} {speedup_str}")
                 row = dict(res)
-                row["speedup_vs_vanilla_decode"] = float(speedup)
+                row["speedup_vs_vanilla_decode"] = None if speedup is None else float(speedup)
                 jsonl_rows.append(row)
     print(f"{ '='*140}\n")
     _write_jsonl(args.output_jsonl, jsonl_rows)

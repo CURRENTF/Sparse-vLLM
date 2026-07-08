@@ -17,9 +17,11 @@ import torch.multiprocessing as mp
 from transformers import AutoTokenizer
 
 from deltakv.configs.runtime_params import normalize_runtime_params
+from deltakv.configs.default_paths import compressor_path, model_path, output_path
 from deltakv.get_chat_api import get_generate_api
 from benchmark.long_bench.pred import build_chat
 from sparsevllm.config import Config
+from sparsevllm.engine.cache_manager.raw_kv_offload import resolve_long_prefill_offload_min_tokens
 from sparsevllm.engine.model_runner import ModelRunner
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.method_registry import (
@@ -31,9 +33,9 @@ from sparsevllm.sampling_params import SamplingParams
 from sparsevllm.utils.context import get_context, reset_context
 
 
-DEFAULT_MODEL = "/data2/haojitai/models/Qwen2.5-7B-Instruct-1M"
-DEFAULT_COMPRESSOR = "/data2/haojitai/checkpoints/compressor/Qwen2.5-7B-Instruct-1M-Compressor"
-DEFAULT_OUTPUT_ROOT = "/data2/haojitai/outputs/sparsevllm_logits_align"
+DEFAULT_MODEL = model_path("Qwen2.5-7B-Instruct-1M")
+DEFAULT_COMPRESSOR = compressor_path("Qwen2.5-7B-Instruct-1M-Compressor")
+DEFAULT_OUTPUT_ROOT = output_path("sparsevllm_logits_align")
 
 DIRECT_HF_METHODS = {
     "vanilla",
@@ -2061,6 +2063,11 @@ def _sparse_prefill_chunk_size(config: Config, seq: Sequence) -> int:
     if config.prefill_schedule_policy == PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH:
         threshold = _sparse_long_text_threshold(config, is_prefill=True)
         if int(seq.num_prompt_tokens) > int(threshold):
+            if (
+                is_deltakv_method(config.vllm_sparse_method)
+                and int(seq.num_prompt_tokens) >= resolve_long_prefill_offload_min_tokens()
+            ):
+                return min(int(config.chunk_prefill_size), remaining)
             return remaining
         return min(int(config.chunk_prefill_size), remaining)
 

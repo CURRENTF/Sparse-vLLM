@@ -35,6 +35,7 @@ except ImportError:
 TP_SHM_NAME_PREFIX = "sparsevllm_"
 PREFIX_CACHE_CONTROL_RPC_METHODS = {
     "prefix_cache_inspect",
+    "prefix_cache_match",
     "prefix_cache_delete_subtree",
     "prefix_cache_set_eviction_priority",
 }
@@ -320,6 +321,11 @@ class ModelRunner:
         return self.cache_manager.prefix_cache_inspect(
             [int(token_id) for token_id in token_ids],
             include_subtree=bool(include_subtree),
+        )
+
+    def prefix_cache_match(self, token_ids: list[int]) -> dict[str, object]:
+        return self.cache_manager.prefix_cache_match(
+            [int(token_id) for token_id in token_ids],
         )
 
     def prefix_cache_delete_subtree(self, token_ids: list[int]) -> dict[str, object]:

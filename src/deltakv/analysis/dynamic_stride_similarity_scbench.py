@@ -36,6 +36,7 @@ from deltakv.analysis.colors import (
     COLOR_SECONDARY,
     COLOR_TERTIARY,
 )
+from deltakv.configs.default_paths import dataset_path as default_dataset_path
 
 
 SUCCESS = "success"
@@ -754,7 +755,7 @@ def run(args: argparse.Namespace) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-path", required=True)
-    parser.add_argument("--data-dir", default="/data2/haojitai/datasets/SCBench-preprocessed")
+    parser.add_argument("--data-dir", default=default_dataset_path("SCBench-preprocessed"))
     parser.add_argument(
         "--tasks",
         default="scbench_kv,scbench_repoqa,scbench_summary_with_needles,scbench_many_shot",

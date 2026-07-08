@@ -17,6 +17,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+DEFAULT_MODEL_ROOT = Path(os.getenv("DELTAKV_MODEL_ROOT", PROJECT_ROOT / "models"))
+DEFAULT_DATA_ROOT = Path(os.getenv("DELTAKV_DATA_DIR", PROJECT_ROOT / "data"))
+DEFAULT_OUTPUT_ROOT = Path(os.getenv("DELTAKV_OUTPUT_DIR", PROJECT_ROOT / "outputs"))
+
 from benchmark.multimodal.video_qa import streamingbench as streaming
 
 
@@ -40,13 +44,13 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Benchmark LLaVA-OneVision vanilla and DeltaKV less-memory on Video-MME."
     )
-    parser.add_argument("--model_path", default="/data2/haojitai/models/llava-onevision-qwen2-0.5b-ov-hf")
+    parser.add_argument("--model_path", default=str(DEFAULT_MODEL_ROOT / "llava-onevision-qwen2-0.5b-ov-hf"))
     parser.add_argument("--deltakv_checkpoint_path", default="none")
-    parser.add_argument("--dataset_dir", default="/data2/haojitai/datasets/Video-MME_hf")
+    parser.add_argument("--dataset_dir", default=str(DEFAULT_DATA_ROOT / "Video-MME_hf"))
     parser.add_argument("--annotation_path", default="")
     parser.add_argument("--video_dir", default="")
     parser.add_argument("--subtitle_dir", default="")
-    parser.add_argument("--output_dir", default="/data2/haojitai/datasets/llava_onevision_videomme")
+    parser.add_argument("--output_dir", default=str(DEFAULT_OUTPUT_ROOT / "deltakv_multimodal" / "videomme"))
     parser.add_argument(
         "--durations",
         default="all",

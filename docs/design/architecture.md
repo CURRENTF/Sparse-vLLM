@@ -68,6 +68,13 @@ The engine currently supports:
   long-prefill representation; long requests run full-prefill with batch size 1,
   while short requests remain chunked and batched.
 
+Methods with a `long_bs1full_short_batch` contract can still chunk ultra-long
+prompts internally when their cache manager implements
+`requires_long_prefill_offload()`. DeltaKV and PyramidKV use this hook to back
+chunked long-prefill steps with RawKV offload staging while keeping the same
+public policy name. This is an internal cache-manager implementation detail, not
+a third public prefill policy.
+
 Do not encode a method's prefill policy in benchmark scripts or one-off config
 defaults. Add the method-to-policy mapping to the registry and update
 `tests/test_prefill_schedule_policy.py`.

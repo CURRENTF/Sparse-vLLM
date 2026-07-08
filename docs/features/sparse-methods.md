@@ -33,6 +33,13 @@ should not redefine method semantics.
 | `all_chunked` | Every prefill request is capped by `chunk_prefill_size` and normal scheduler batch limits. | `vanilla`, `streamingllm`, `attention-sink`, `snapkv`, `quest`, `omnikv` |
 | `long_bs1full_short_batch` | Long requests run as one complete prefill with batch size 1; short requests still use chunked batching. This is for methods whose intended sparse/cache transformation depends on a complete long-prefill representation. | `pyramidkv` and DeltaKV-family methods |
 
+DeltaKV-family methods and PyramidKV keep `long_bs1full_short_batch` as the only
+public policy. For prompts above the long-prefill offload threshold, their cache
+managers use `requires_long_prefill_offload()` to ask the scheduler for chunked
+long-prefill steps backed by RawKV offload staging. That path exists to avoid
+full-prefill activation OOM at extreme context lengths; it is not a separate
+policy name and should not be set in configs.
+
 `Config` resolves `None`, empty string, and `auto` to the registry default. An
 explicit policy that does not match the method default fails fast so experiments
 do not silently change scheduler semantics. Treat any policy override as an

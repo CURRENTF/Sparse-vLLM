@@ -2,8 +2,12 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+MODEL_ROOT="${DELTAKV_MODEL_ROOT:-${REPO_ROOT}/models}"
+OUTPUT_BASE="${DELTAKV_OUTPUT_DIR:-${REPO_ROOT}/outputs}"
+CACHE_ROOT="${DELTAKV_CACHE_DIR:-${REPO_ROOT}/.cache}"
+CONDA_ENVS_ROOT="${CONDA_ENVS_ROOT:-${HOME}/.conda/envs}"
 RUN_NAME="${RUN_NAME:-claw_eval_$(date +%Y%m%d_%H%M%S)}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-/data2/haojitai/outputs/Sparse-vLLM/claw-eval}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-${OUTPUT_BASE}/Sparse-vLLM/claw-eval}"
 RUN_DIR="${OUTPUT_ROOT}/${RUN_NAME}"
 LOG_DIR="${RUN_DIR}/logs"
 TRACE_DIR="${RUN_DIR}/traces"
@@ -12,7 +16,7 @@ ENGINE_KWARGS_FILE="${ENGINE_KWARGS_FILE:-${RUN_DIR}/engine_kwargs.json}"
 RUN_MANIFEST="${RUN_MANIFEST:-${RUN_DIR}/run_manifest.json}"
 mkdir -p "${LOG_DIR}" "${TRACE_DIR}" "${REQUEST_LOG_DIR}"
 
-MODEL_PATH="${MODEL_PATH:-/data2/haojitai/models/Qwen2.5-7B-Instruct-1M}"
+MODEL_PATH="${MODEL_PATH:-${MODEL_ROOT}/Qwen2.5-7B-Instruct-1M}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-sparsevllm-claw}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-4,5,6}"
 SERVER_HOST="${SERVER_HOST:-127.0.0.1}"
@@ -24,15 +28,15 @@ SPARSEVLLM_CONTEXT_WINDOW="${SPARSEVLLM_CONTEXT_WINDOW:-131072}"
 CLAW_EVAL_JUDGE_MODEL="${CLAW_EVAL_JUDGE_MODEL:-google/gemini-3-flash-preview}"
 CLAW_EVAL_JUDGE_BASE_URL="${CLAW_EVAL_JUDGE_BASE_URL:-https://openrouter.ai/api/v1}"
 
-CLAW_EVAL_DIR="${CLAW_EVAL_DIR:-/data2/haojitai/repos/claw-eval}"
+CLAW_EVAL_DIR="${CLAW_EVAL_DIR:-${REPO_ROOT}/../claw-eval}"
 CLAW_EVAL_REF="${CLAW_EVAL_REF:-main}"
 CLAW_EVAL_CONFIG_TEMPLATE="${CLAW_EVAL_CONFIG_TEMPLATE:-${REPO_ROOT}/benchmark/claw_eval/sparsevllm_config.yaml}"
 CLAW_EVAL_CONFIG="${RUN_DIR}/sparsevllm_config.yaml"
 CLAW_EVAL_ARGS="${CLAW_EVAL_ARGS:-batch --config ${CLAW_EVAL_CONFIG} --sandbox --trials 3 --parallel 1}"
 SETUP_ONLY="${SETUP_ONLY:-0}"
 
-SPARSEVLLM_CONDA_ENV="${SPARSEVLLM_CONDA_ENV:-/data2/haojitai/conda_envs/sparse-vllm-tf530}"
-CLAW_EVAL_CONDA_ENV="${CLAW_EVAL_CONDA_ENV:-/data2/haojitai/conda_envs/claw-eval-py311}"
+SPARSEVLLM_CONDA_ENV="${SPARSEVLLM_CONDA_ENV:-${CONDA_ENVS_ROOT}/sparse-vllm-tf530}"
+CLAW_EVAL_CONDA_ENV="${CLAW_EVAL_CONDA_ENV:-${CONDA_ENVS_ROOT}/claw-eval-py311}"
 SPARSEVLLM_MASTER_PORT="${SPARSEVLLM_MASTER_PORT:-2333}"
 if [[ -z "${ENGINE_KWARGS:-}" ]]; then
   ENGINE_KWARGS="{\"tensor_parallel_size\":1,\"gpu_memory_utilization\":0.88,\"max_model_len\":${SPARSEVLLM_CONTEXT_WINDOW},\"engine_prefill_chunk_size\":4096,\"sparse_method\":\"vanilla\"}"
@@ -137,7 +141,7 @@ prepare_claw_eval_repo() {
 
 prepare_claw_eval_env() {
   start_download_clash_if_needed
-  export PIP_CACHE_DIR="${PIP_CACHE_DIR:-/data2/haojitai/pip_cache}"
+  export PIP_CACHE_DIR="${PIP_CACHE_DIR:-${CACHE_ROOT}/pip}"
   mkdir -p "${PIP_CACHE_DIR}"
   if [[ ! -x "${CLAW_EVAL_CONDA_ENV}/bin/python" ]]; then
     echo "[INFO] Creating Claw-Eval Python 3.11 env at ${CLAW_EVAL_CONDA_ENV}"
@@ -298,9 +302,9 @@ main() {
   activate_conda_env "${SPARSEVLLM_CONDA_ENV}"
   export CUDA_VISIBLE_DEVICES
   export PYTHONPATH="${REPO_ROOT}/src:${PYTHONPATH:-}"
-  export HF_HOME="${HF_HOME:-/data2/haojitai/hf_cache}"
-  export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-/data2/haojitai/hf_cache}"
-  export TORCH_HOME="${TORCH_HOME:-/data2/haojitai/torch_cache}"
+  export HF_HOME="${HF_HOME:-${CACHE_ROOT}/huggingface}"
+  export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-${HF_HOME}}"
+  export TORCH_HOME="${TORCH_HOME:-${CACHE_ROOT}/torch}"
   export http_proxy="${DOWNLOAD_HTTP_PROXY}"
   export https_proxy="${DOWNLOAD_HTTPS_PROXY}"
   export HTTP_PROXY="${DOWNLOAD_HTTP_PROXY}"

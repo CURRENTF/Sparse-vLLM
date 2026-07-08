@@ -1,16 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="${STREAMINGBENCH_ROOT:-/data2/haojitai/datasets/StreamingBench_hf}"
-CACHE_DIR="${HF_CACHE_DIR:-/data2/haojitai/.cache/huggingface}"
-HF_BIN="${HF_BIN:-/home/haojitai/miniconda3/envs/svllm/bin/hf}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+DATA_ROOT="${DELTAKV_DATA_DIR:-${REPO_ROOT}/data}"
+
+ROOT="${STREAMINGBENCH_ROOT:-${DATA_ROOT}/StreamingBench_hf}"
+CACHE_DIR="${HF_CACHE_DIR:-${HF_HOME:-${REPO_ROOT}/.hf_cache}}"
+HF_BIN="${HF_BIN:-hf}"
 REPO_ID="${STREAMINGBENCH_REPO_ID:-mjuicem/StreamingBench}"
 PROXY_URL="${PROXY_URL:-http://localhost:7890}"
 MAX_WORKERS="${HF_MAX_WORKERS:-1}"
 DOWNLOAD_SCOPE="${STREAMINGBENCH_DOWNLOAD_SCOPE:-full}"
 
-if [[ ! -x "${HF_BIN}" ]]; then
-  echo "[error] hf command not found or not executable: ${HF_BIN}" >&2
+if ! command -v "${HF_BIN}" >/dev/null 2>&1; then
+  echo "[error] hf command not found: ${HF_BIN}" >&2
   exit 1
 fi
 

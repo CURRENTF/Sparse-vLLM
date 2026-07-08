@@ -166,7 +166,7 @@ class LLMEngine:
         for warning in normalized_params.warnings:
             logger.info(f"Runtime parameter normalization: {warning}")
 
-        config_fields = {field.name for field in fields(Config)}
+        config_fields = {field.name for field in fields(Config) if field.init}
         config_kwargs = {
             k: v for k, v in normalized_params.infer_config.items() if k in config_fields
         }
@@ -293,6 +293,23 @@ class LLMEngine:
             ignore_eos=decode_warmup,
         )
         max_prompt_len = max(1, int(self.config.max_model_len) - int(sampling_params.max_tokens))
+        warmup_len_override = os.getenv("SPARSEVLLM_DELTAKV_GRAPH_WARMUP_PROMPT_LEN", "").strip().lower()
+        if warmup_len_override:
+            if warmup_len_override in {"max", "full", "max_model_len", "max-model-len"}:
+                warmup_len = max_prompt_len
+            else:
+                try:
+                    warmup_len = int(warmup_len_override)
+                except ValueError as exc:
+                    raise ValueError(
+                        "SPARSEVLLM_DELTAKV_GRAPH_WARMUP_PROMPT_LEN must be a positive integer or 'max', "
+                        f"got {warmup_len_override!r}."
+                    ) from exc
+                if warmup_len <= 0:
+                    raise ValueError(
+                        "SPARSEVLLM_DELTAKV_GRAPH_WARMUP_PROMPT_LEN must be positive, "
+                        f"got {warmup_len}."
+                    )
         if warmup_len > max_prompt_len:
             logger.warning(
                 f"Warmup prompt length ({warmup_len}) exceeds max_model_len - max_tokens "
@@ -444,6 +461,12 @@ class LLMEngine:
             bool(include_subtree),
         )
 
+    def prefix_cache_match(self, token_ids: list[int]) -> dict[str, object]:
+        return self.model_runner.call(
+            "prefix_cache_match",
+            [int(token_id) for token_id in token_ids],
+        )
+
     def prefix_cache_delete_subtree(self, token_ids: list[int]) -> dict[str, object]:
         return self.model_runner.call(
             "prefix_cache_delete_subtree",
@@ -460,6 +483,41 @@ class LLMEngine:
             [int(token_id) for token_id in token_ids],
             int(priority),
         )
+
+    def worker_info(
+        self,
+        served_model_name: str | None = None,
+        tags: list[str] | None = None,
+    ) -> dict[str, object]:
+        config = self.config
+        return {
+            "served_model_name": served_model_name or str(config.model),
+            "model": str(config.model),
+            "model_type": str(getattr(config.hf_config, "model_type", "")),
+            "sparse_method": str(getattr(config, "vllm_sparse_method", "") or ""),
+            "tensor_parallel_size": int(getattr(config, "tensor_parallel_size", 1)),
+            "max_model_len": int(getattr(config, "max_model_len", 0) or 0),
+            "max_num_seqs_in_batch": int(getattr(config, "max_num_seqs_in_batch", 0) or 0),
+            "max_decoding_seqs": int(getattr(config, "max_decoding_seqs", 0) or 0),
+            "prefix_cache_enabled": bool(getattr(config, "enable_prefix_caching", False)),
+            "prefix_cache_block_size": getattr(config, "prefix_cache_block_size", None),
+            "tags": sorted(str(tag) for tag in (tags or []) if str(tag)),
+        }
+
+    def worker_load(self) -> dict[str, object]:
+        scheduler = self.scheduler
+        waiting = len(scheduler.waiting)
+        decoding = len(scheduler.decoding)
+        cache_stats = self.model_runner.cache_manager.free_slot_stats()
+        return {
+            "waiting_requests": int(waiting),
+            "decoding_requests": int(decoding),
+            "active_requests": int(waiting + decoding),
+            "total_preemptions": int(getattr(scheduler, "total_preemptions", 0)),
+            "max_num_seqs_in_batch": int(getattr(scheduler, "max_num_seqs_in_batch", 0)),
+            "max_decoding_seqs": int(getattr(scheduler, "max_decoding_seqs", 0)),
+            "cache": {str(key): int(value) for key, value in cache_stats.items() if isinstance(value, int)},
+        }
 
     def step(self):
         """

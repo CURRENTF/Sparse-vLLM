@@ -139,9 +139,11 @@ class Scheduler:
             return False
         if len(self.decoding) >= self.max_decoding_seqs:
             return False
-        if self.prefill_schedule_policy == PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH and target_is_long:
-            # Long DeltaKV-family prefills are full-prefill, bs=1. They may exceed
-            # max_num_batched_tokens by design; admission budgets guard persistent KV.
+        if (
+            self.prefill_schedule_policy == PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH and target_is_long
+        ):
+            # Long full-prefill methods are isolated as bs=1. Methods that need
+            # long-prefill offload still cap the step in _prefill_step_tokens().
             return not scheduled_seqs and step_free_count > 0
         return (
             step_free_count > 0
@@ -149,12 +151,15 @@ class Scheduler:
             and num_batched_seqs < self.max_num_seqs_in_batch
         )
 
-    def _requires_whole_short_prefill_step(self, target_is_long: bool) -> bool:
-        return (
-            self.prefill_schedule_policy == PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH
-            and is_deltakv_method(self.config.vllm_sparse_method)
-            and not target_is_long
+    def _requires_long_prefill_offload(self, seq: Sequence) -> bool:
+        if self.prefill_schedule_policy != PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH:
+            return False
+        requires_offload = getattr(
+            self.memory_oracle,
+            "requires_long_prefill_offload",
+            None,
         )
+        return bool(callable(requires_offload) and requires_offload(seq))
 
     def _prefill_step_tokens(
         self,
@@ -182,15 +187,14 @@ class Scheduler:
             )
         if self.prefill_schedule_policy == PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH:
             if target_is_long:
+                if self._requires_long_prefill_offload(seq):
+                    return min(
+                        remaining_prefill_tokens,
+                        self.chunk_prefill_size,
+                        self.max_num_batched_tokens - num_batched_tokens,
+                        step_free_count,
+                    )
                 return int(remaining_prefill_tokens)
-            if self._requires_whole_short_prefill_step(target_is_long):
-                available = min(
-                    self.max_num_batched_tokens - num_batched_tokens,
-                    step_free_count,
-                )
-                if remaining_prefill_tokens <= self.chunk_prefill_size and remaining_prefill_tokens <= available:
-                    return int(remaining_prefill_tokens)
-                return 0
             return min(
                 remaining_prefill_tokens,
                 self.chunk_prefill_size,
@@ -292,8 +296,8 @@ class Scheduler:
         )
         margin_batched_tokens = self.memory_oracle.prefill_batched_tokens_margin()
         deferred_prompt_failure: tuple[Sequence, str, int, int] | None = None
-        deferred_prefill_step_failure: tuple[Sequence, int, int] | None = None
-        deferred_prefill_capacity_failure: tuple[Sequence, int, int, int] | None = None
+        blocked_prefill_step_failure: tuple[Sequence, int, int] | None = None
+        blocked_prefill_capacity_failure: tuple[Sequence, int, int, int] | None = None
 
         # --- 阶段 1: Prefill 调度 ---
         # 只要 waiting 队列有活，就优先处理 Prefill，因为它是计算密集型的。
@@ -325,10 +329,15 @@ class Scheduler:
                 if seq.num_prefilled_tokens == 0 and seq.num_completion_tokens == 0:
                     self.memory_oracle.refresh_prefix_cache_hit(seq)
                 remaining_prefill_tokens = self.memory_oracle.remaining_prefill_tokens(seq)
-                candidate_step_free_count = min(
-                    int(step_free_count),
-                    int(self.memory_oracle.prefill_step_free_slots_for(seq)),
+                candidate_step_free_count = int(self.memory_oracle.prefill_step_free_slots_for(seq))
+                uses_full_prefill_staging = bool(
+                    self.memory_oracle.should_schedule_full_prefill(seq)
                 )
+                if (
+                    not self._requires_long_prefill_offload(seq)
+                    and not uses_full_prefill_staging
+                ):
+                    candidate_step_free_count = min(int(step_free_count), int(candidate_step_free_count))
 
                 # 异常处理：如果由于某种原因已经 prefill 完却还在 waiting 队列
                 if remaining_prefill_tokens <= 0:
@@ -345,30 +354,19 @@ class Scheduler:
 
                 if can_prefill_tokens <= 0:
                     if candidate_step_free_count <= 0 and step_free_count > 0:
-                        if deferred_prefill_capacity_failure is None:
-                            deferred_prefill_capacity_failure = (
+                        if blocked_prefill_capacity_failure is None:
+                            blocked_prefill_capacity_failure = (
                                 seq,
                                 int(remaining_prefill_tokens),
                                 int(candidate_step_free_count),
                                 int(step_free_count),
                             )
-                    if self._requires_whole_short_prefill_step(target_is_long):
-                        available = min(
-                            self.max_num_batched_tokens - num_batched_tokens,
-                            step_free_count,
-                        )
-                        deferred_prefill_step_failure = (seq, int(remaining_prefill_tokens), int(available))
-                    elif self.memory_oracle.requires_full_prefill_step(seq):
+                    if self.memory_oracle.requires_full_prefill_step(seq):
                         available = min(
                             self.max_num_batched_tokens - num_batched_tokens,
                             candidate_step_free_count,
                         )
-                        deferred_prefill_capacity_failure = (
-                            seq,
-                            int(remaining_prefill_tokens),
-                            int(available),
-                            int(step_free_count),
-                        )
+                        blocked_prefill_step_failure = (seq, int(remaining_prefill_tokens), int(available))
                     logger.debug(f'{can_prefill_tokens=} 结束 schedule prefill 请求')
                     self.waiting.append(seq)
                     continue
@@ -548,18 +546,19 @@ class Scheduler:
                     physical_free_count=physical_free_count,
                     reserved_prefill=reserved_prefill,
                 )
-            if deferred_prefill_step_failure is not None and not self.decoding:
-                seq, need, free = deferred_prefill_step_failure
+            if blocked_prefill_step_failure is not None and not self.decoding:
+                seq, need, free = blocked_prefill_step_failure
                 raise RuntimeError(
-                    "DeltaKV short prefill cannot be split across multiple steps. "
+                    "Prefill candidate requires an atomic prefill step but cannot fit. "
+                    f"cache_manager={type(self.memory_oracle).__name__} "
                     f"seq_id={seq.seq_id} prompt_len={seq.num_prompt_tokens} "
                     f"remaining_prefill_tokens={need} available_step_tokens={free} "
                     f"chunk_prefill_size={self.chunk_prefill_size} "
                     f"max_num_batched_tokens={self.max_num_batched_tokens}. "
                     "Increase the raw KV budget / max_num_batched_tokens or reduce short-batch size."
                 )
-            if deferred_prefill_capacity_failure is not None and not self.decoding:
-                seq, need, seq_free, global_free = deferred_prefill_capacity_failure
+            if blocked_prefill_capacity_failure is not None and not self.decoding:
+                seq, need, seq_free, global_free = blocked_prefill_capacity_failure
                 raise RuntimeError(
                     "No prefill candidate can use the remaining cache capacity. "
                     f"cache_manager={type(self.memory_oracle).__name__} seq_id={seq.seq_id} "

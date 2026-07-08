@@ -79,6 +79,7 @@ class Attention(nn.Module):
         try:
             if context.is_prefill:
                 selection = sparse_controller.get_prefill_selection(layer_idx)
+                cache_manager.before_prefill_layer_attention(layer_idx, selection)
                 prefill_view = cache_manager.build_prefill_compute_view(
                     layer_idx,
                     k,

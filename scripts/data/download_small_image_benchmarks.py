@@ -3,36 +3,40 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
 from huggingface_hub import HfApi, snapshot_download
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_DATA_ROOT = str(PROJECT_ROOT / "data")
+DEFAULT_HF_CACHE = os.getenv("HF_HOME", str(PROJECT_ROOT / ".hf_cache"))
 
 DATASETS = {
     "scienceqa_img": {
         "repo_id": "lmms-lab/ScienceQA-IMG",
-        "local_dir": "/data2/haojitai/datasets/ScienceQA-IMG_hf",
+        "local_dir": "ScienceQA-IMG_hf",
         "patterns": ["README.md", "data/validation-*.parquet", "data/test-*.parquet"],
     },
     "pope": {
         "repo_id": "lmms-lab/POPE",
-        "local_dir": "/data2/haojitai/datasets/POPE_hf",
+        "local_dir": "POPE_hf",
         "patterns": ["README.md", "data/test-*.parquet"],
     },
     "mmbench_en": {
         "repo_id": "lmms-lab/MMBench_EN",
-        "local_dir": "/data2/haojitai/datasets/MMBench_EN_hf",
+        "local_dir": "MMBench_EN_hf",
         "patterns": ["README.md", "data/dev-*.parquet"],
     },
     "mme": {
         "repo_id": "lmms-lab/MME",
-        "local_dir": "/data2/haojitai/datasets/MME_hf",
+        "local_dir": "MME_hf",
         "patterns": ["README.md", "data/test-*.parquet"],
     },
     "mmmu": {
         "repo_id": "lmms-lab/MMMU",
-        "local_dir": "/data2/haojitai/datasets/MMMU_hf",
+        "local_dir": "MMMU_hf",
         "patterns": ["README.md", "data/dev-*.parquet", "data/validation-*.parquet"],
     },
 }
@@ -41,8 +45,8 @@ DATASETS = {
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Download small image QA benchmark parquet datasets.")
     parser.add_argument("--benchmark", default="all", choices=["all", *sorted(DATASETS)])
-    parser.add_argument("--data_root", default="/data2/haojitai/datasets")
-    parser.add_argument("--cache_dir", default="/data2/haojitai/hf_cache")
+    parser.add_argument("--data_root", default=os.getenv("DELTAKV_DATA_DIR", DEFAULT_DATA_ROOT))
+    parser.add_argument("--cache_dir", default=DEFAULT_HF_CACHE)
     parser.add_argument("--max_workers", type=int, default=4)
     parser.add_argument("--local_dir", default="", help="Override local dir for a single benchmark.")
     parser.add_argument("--token", default=None)
@@ -60,9 +64,7 @@ def local_dir_for(args: argparse.Namespace, name: str) -> Path:
             raise ValueError("--local_dir can only be used with a single --benchmark.")
         return Path(args.local_dir)
     default = Path(DATASETS[name]["local_dir"])
-    if str(default).startswith("/data2/haojitai/datasets"):
-        return Path(args.data_root) / default.name
-    return default
+    return default if default.is_absolute() else Path(args.data_root) / default
 
 
 def matches(path: str, patterns: list[str]) -> bool:

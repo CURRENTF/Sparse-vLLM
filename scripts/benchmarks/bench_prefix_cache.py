@@ -226,6 +226,20 @@ def _eligible_cache_tokens(reusable_prefix_len: int, current_prompt_len: int, bl
     return min(reusable_blocks, _usable_prefix_cache_tokens(current_prompt_len, block_size))
 
 
+def _multiturn_reusable_prefix_len(
+    *,
+    turn: int,
+    session_id: int,
+    shared_system_len: int,
+    history_len: int,
+) -> int:
+    if int(turn) > 0:
+        return int(history_len)
+    if int(session_id) > 0:
+        return int(shared_system_len)
+    return 0
+
+
 def _percentile(values: list[float], pct: float) -> float:
     if not values:
         return 0.0
@@ -377,8 +391,6 @@ def _case_engine_kwargs(args: argparse.Namespace, case_name: str, max_prompt_len
         "sink_keep_tokens": int(args.num_sink_tokens),
         "recent_keep_tokens": int(args.num_recent_tokens),
         "decode_keep_tokens": int(args.num_top_tokens),
-        "prefill_keep_tokens": int(args.num_top_tokens_in_prefill),
-        "chunk_prefill_accel_omnikv": bool(args.chunk_prefill_accel_omnikv),
         "full_attention_layers": args.full_attention_layers,
         "quest_chunk_size": int(args.quest_chunk_size),
         "quest_token_budget": int(args.quest_token_budget),
@@ -396,7 +408,6 @@ def _case_engine_kwargs(args: argparse.Namespace, case_name: str, max_prompt_len
     hyper_params["sparse_method"] = preset["method"]
     hyper_params["quest_chunk_size"] = int(args.quest_chunk_size)
     hyper_params["quest_token_budget"] = int(args.quest_token_budget)
-    hyper_params["chunk_prefill_accel_omnikv"] = bool(args.chunk_prefill_accel_omnikv)
     hyper_params["full_attention_layers"] = args.full_attention_layers
     hyper_params["prefix_cache_block_size"] = _case_block_size(args, case_name)
     hyper_params["max_model_len"] = int(max_prompt_len + args.output_len + args.max_model_len_margin)
@@ -716,7 +727,12 @@ def _run_multiturn_workload(
         specs: list[RequestSpec] = []
         prompt_by_session: dict[int, list[int]] = {}
         for session_id in range(int(args.sessions)):
-            reusable_prefix_len = len(histories[session_id]) if turn > 0 else 0
+            reusable_prefix_len = _multiturn_reusable_prefix_len(
+                turn=turn,
+                session_id=session_id,
+                shared_system_len=len(shared_system),
+                history_len=len(histories[session_id]),
+            )
             user_len = _sample_length(rng, args.user_len, args.user_min_len)
             user_tokens = _sample_tokens(vocab_ids, rng, user_len)
             prompt = histories[session_id] + user_tokens

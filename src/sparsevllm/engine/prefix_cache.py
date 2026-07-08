@@ -445,6 +445,19 @@ class RadixPrefixIndex:
             parent_block_id = block_id
         return block_ids
 
+    def match_longest_prefix(
+        self,
+        token_ids: list[int],
+        *,
+        max_usable_tokens: int,
+    ) -> tuple[int, bytes | None, int]:
+        block_ids = self.block_ids_for_tokens(token_ids, max_tokens=max_usable_tokens)
+        result = self.backend.lookup(block_ids, len(block_ids))
+        if result.hit_block_count <= 0:
+            return 0, None, 0
+        hit_len = result.hit_block_count * self.block_size
+        return hit_len, result.last_block_id, result.hit_block_count
+
     def lookup_longest_prefix(
         self,
         token_ids: list[int],
@@ -452,15 +465,16 @@ class RadixPrefixIndex:
         max_usable_tokens: int,
     ) -> tuple[int, bytes | None, int]:
         self.lookup_requests += 1
-        block_ids = self.block_ids_for_tokens(token_ids, max_tokens=max_usable_tokens)
-        result = self.backend.lookup(block_ids, len(block_ids))
-        if result.hit_block_count <= 0:
+        hit_len, last_block_id, hit_blocks = self.match_longest_prefix(
+            token_ids,
+            max_usable_tokens=max_usable_tokens,
+        )
+        if hit_blocks <= 0:
             return 0, None, 0
-        hit_len = result.hit_block_count * self.block_size
         self.hit_requests += 1
         self.hit_tokens += hit_len
-        self.hit_blocks += result.hit_block_count
-        return hit_len, result.last_block_id, result.hit_block_count
+        self.hit_blocks += hit_blocks
+        return hit_len, last_block_id, hit_blocks
 
     def get_chain(self, last_block_id: bytes, block_count: int) -> list[PrefixCacheBlock]:
         block_count = int(block_count)

@@ -9,6 +9,8 @@ import fire
 from tqdm import tqdm
 import torch.nn.functional as F
 
+from deltakv.configs.default_paths import longbench_root
+
 # 用于存储抓取到的 QKV 状态
 class QKVCollector:
     def __init__(self):
@@ -149,7 +151,7 @@ def vis_matrix(matrix, title, filename, output_dir):
 
 def main(
     model_path,
-    data_path="/root/autodl-fs/datasets/LongBench/data/hotpotqa.jsonl",
+    data_path=f"{longbench_root()}/data/hotpotqa.jsonl",
     sample_num=50,
     max_new_tokens=20,
     output_dir="visualization/qkv_sim"

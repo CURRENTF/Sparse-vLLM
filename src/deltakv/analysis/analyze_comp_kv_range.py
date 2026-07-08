@@ -9,6 +9,9 @@ from datasets import load_from_disk
 from deltakv.configs.model_config_cls import KVQwen2Config
 from deltakv.modeling.qwen2_training import Qwen2KVClusterCompress
 from deltakv.get_chat_api import load_compressor
+from deltakv.configs.default_paths import dataset_path as default_dataset_path
+from deltakv.configs.default_paths import model_path as default_model_path
+from deltakv.configs.default_paths import output_path as default_output_path
 from deltakv.analysis.colors import (
     COLOR_PRIMARY, COLOR_SECONDARY, COLOR_TERTIARY, COLOR_TERTIARY_LIGHT,
     COLOR_PRIMARY_LIGHT, COLOR_SECONDARY_LIGHT, COLOR_NEUTRAL, COLOR_SPECIAL
@@ -348,11 +351,11 @@ def plot_distribution(layer_stats, all_values, all_raw_values, all_ideal_res_val
     print(f"[Visualization] Individual plots saved to {output_dir}")
 
 def main(
-    model_path="/root/autodl-fs/models/Qwen2.5-7B-Instruct-1M",
+    model_path=default_model_path("Qwen2.5-7B-Instruct-1M"),
     deltakv_checkpoint_path=None,
-    dataset_path="/root/autodl-fs/datasets/deltakv_qwen_train_num80000_seqlen8192/",
+    dataset_path=default_dataset_path("deltakv_qwen_train_num80000_seqlen8192"),
     num_samples=10,
-    output_dir="/root/autodl-fs/visuals/comp_kv_range",
+    output_dir=default_output_path("visuals", "comp_kv_range"),
     text=None,
     device="cuda" if torch.cuda.is_available() else "cpu"
 ):

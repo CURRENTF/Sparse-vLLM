@@ -15,10 +15,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from deltakv.configs.default_paths import compressor_path, model_path, output_path
 
-DEFAULT_MODEL_PATH = "/data2/haojitai/models/Qwen2.5-7B-Instruct-1M"
-DEFAULT_COMPRESSOR_PATH = "/data2/haojitai/checkpoints/compressor/Qwen2.5-7B-Instruct-1M-Compressor"
-DEFAULT_OUTPUT_ROOT = "/data2/haojitai/outputs/deltakv/sparsevllm_max_batch_throughput"
+DEFAULT_MODEL_PATH = model_path("Qwen2.5-7B-Instruct-1M")
+DEFAULT_COMPRESSOR_PATH = compressor_path("Qwen2.5-7B-Instruct-1M-Compressor")
+DEFAULT_OUTPUT_ROOT = output_path("deltakv", "sparsevllm_max_batch_throughput")
 DEFAULT_LENGTHS = "64000,128000,256000,512000,900000"
 DEFAULT_METHODS = "deltakv-less-memory-cudagraph,omnikv,snapkv,vanilla"
 DEFAULT_GPUS = "4,5,6,7"
@@ -118,12 +119,12 @@ def _base_hparams(args: argparse.Namespace, method: str, batch_size: int) -> dic
                 "deltakv_latent_dim": args.deltakv_latent_dim,
                 "deltakv_center_ratio": args.deltakv_center_ratio,
                 "deltakv_neighbor_count": args.deltakv_neighbor_count,
-                "deltakv_latent_quant_bits": 4,
+                "deltakv_latent_quant_bits": args.deltakv_latent_quant_bits,
                 "deltakv_latent_quant_group_size": args.deltakv_latent_quant_group_size,
-                "full_layer_kv_quant_bits": 4,
+                "full_layer_kv_quant_bits": args.full_layer_kv_quant_bits,
                 "full_layer_kivi_group_size": args.full_layer_kivi_group_size,
                 "full_layer_kivi_residual_length": args.full_layer_kivi_residual_length,
-                "enable_full_layer_kivi_quant": True,
+                "enable_full_layer_kivi_quant": not args.disable_full_layer_kivi_quant,
                 "enable_sparse_ref_fp8": False,
                 "cluster_metric": args.cluster_metric,
                 "use_compression": True,
@@ -402,9 +403,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--deltakv_latent_dim", type=int, default=256)
     parser.add_argument("--deltakv_center_ratio", type=float, default=0.1)
     parser.add_argument("--deltakv_neighbor_count", type=int, default=4)
+    parser.add_argument("--deltakv_latent_quant_bits", type=int, default=4)
     parser.add_argument("--deltakv_latent_quant_group_size", type=int, default=32)
+    parser.add_argument("--full_layer_kv_quant_bits", type=int, default=4)
     parser.add_argument("--full_layer_kivi_group_size", type=int, default=32)
     parser.add_argument("--full_layer_kivi_residual_length", type=int, default=32)
+    parser.add_argument("--disable_full_layer_kivi_quant", action="store_true")
     parser.add_argument("--deltakv_full_pool_reserve_ratio", type=float, default=0.2)
     parser.add_argument("--deltakv_cluster_gather_chunk_size", type=int, default=16384)
     parser.add_argument("--cluster_metric", default="l2")

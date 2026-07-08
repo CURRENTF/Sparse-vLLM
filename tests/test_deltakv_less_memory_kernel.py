@@ -1,11 +1,14 @@
+import inspect
 import os
 import unittest
 
 import torch
 
 from sparsevllm.triton_kernel.deltakv_kernels import (
+    _validate_full_layer_kivi_decode_maps,
     deltakv_less_memory_reconstruct_writeback_quantized,
     deltakv_l2_topk_blockwise,
+    deltakv_materialize_sparse_view,
     deltakv_reconstruct_writeback_grouped_heads,
     deltakv_static_decode_plan,
     full_layer_kivi_build_dense_decode_view,
@@ -25,6 +28,27 @@ from sparsevllm.triton_kernel.quant import (
     triton_quantize_and_pack_along_last_dim,
     unpack_quantized_to_16bit,
 )
+
+
+def test_materialize_sparse_view_has_no_heads_per_program_parameter():
+    assert "heads_per_program" not in inspect.signature(deltakv_materialize_sparse_view).parameters
+
+
+def test_full_layer_kivi_decode_map_validation_rejects_unmapped_valid_token():
+    raw_slots_map = torch.tensor([[0, -1, -1]], dtype=torch.int32)
+    kivi_block_slots_map = torch.tensor([[-1, -1, 2]], dtype=torch.int32)
+    try:
+        _validate_full_layer_kivi_decode_maps(
+            raw_slots_map=raw_slots_map,
+            kivi_block_slots_map=kivi_block_slots_map,
+            req_indices=torch.tensor([0], dtype=torch.int32),
+            context_lens=torch.tensor([3], dtype=torch.int32),
+            max_len_in_batch=3,
+        )
+    except RuntimeError as exc:
+        assert "neither raw nor packed block slots" in str(exc)
+    else:
+        raise AssertionError("expected full-layer KIVI decode map validation to fail")
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for DeltaKV Triton kernel tests.")
@@ -326,6 +350,60 @@ class DeltaKVLessMemoryKernelTest(unittest.TestCase):
         self.assertTrue(torch.equal(recon_pos_out, recon_pos_ref))
         self.assertTrue(torch.equal(recon_latent_out, recon_latent_ref))
         self.assertTrue(torch.equal(recon_out_slot_out, recon_out_slot_ref))
+
+    def test_materialize_sparse_view_writes_padded_rows(self):
+        from sparsevllm.layers.rotary_embedding import apply_rotary_emb
+
+        torch.manual_seed(1)
+        device = "cuda"
+        dtype = torch.float16
+        batch_size = 3
+        width = 16
+        num_slots = 64
+        num_heads = 2
+        head_dim = 8
+
+        k_cache = torch.randn(num_slots, num_heads, head_dim, device=device, dtype=dtype)
+        v_cache = torch.randn_like(k_cache)
+        active_slots = torch.randint(1, num_slots, (batch_size, width), device=device, dtype=torch.int32)
+        context_lens = torch.tensor([16, 7, 11], device=device, dtype=torch.int32)
+        active_slots[1, 7:] = active_slots[1, 0]
+        active_slots[2, 11:] = active_slots[2, 0]
+        slot_to_pos = torch.arange(num_slots, device=device, dtype=torch.int32)
+        postrope_mask = torch.zeros(num_slots, device=device, dtype=torch.bool)
+
+        cos = torch.randn(128, head_dim // 2, device=device)
+        sin = torch.randn(128, head_dim // 2, device=device)
+        norm = torch.sqrt(cos * cos + sin * sin).clamp_min(1e-6)
+        cos_sin = torch.cat([cos / norm, sin / norm], dim=-1).to(dtype).unsqueeze(1)
+
+        out_k = torch.full((batch_size * width, num_heads, head_dim), float("nan"), device=device, dtype=dtype)
+        out_v = torch.full_like(out_k, float("nan"))
+        deltakv_materialize_sparse_view(
+            active_slots=active_slots,
+            context_lens=context_lens,
+            slot_to_pos=slot_to_pos,
+            postrope_mask=postrope_mask,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            out_k=out_k,
+            out_v=out_v,
+            cos_sin=cos_sin,
+            block_tokens=8,
+        )
+        torch.cuda.synchronize()
+
+        flat_slots = active_slots.reshape(-1).to(torch.long).clamp_min(0)
+        raw_k = k_cache[flat_slots]
+        raw_v = v_cache[flat_slots]
+        pos = slot_to_pos[flat_slots].to(torch.long).clamp_min(0)
+        cos_ref, sin_ref = cos_sin[pos].chunk(2, dim=-1)
+        expected_k = apply_rotary_emb(raw_k, cos_ref, sin_ref)
+
+        self.assertFalse(bool(torch.isnan(out_k).any()))
+        self.assertFalse(bool(torch.isnan(out_v).any()))
+        self.assertTrue(torch.equal(out_k, expected_k))
+        self.assertTrue(torch.equal(out_v, raw_v))
 
     def test_fused_quantized_reconstruct_matches_unpack_then_reconstruct(self):
         torch.manual_seed(0)

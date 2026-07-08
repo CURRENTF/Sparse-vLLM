@@ -3,36 +3,40 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 from huggingface_hub import HfApi, snapshot_download
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_DATA_ROOT = str(PROJECT_ROOT / "data")
+DEFAULT_HF_CACHE = os.getenv("HF_HOME", str(PROJECT_ROOT / ".hf_cache"))
 
 DATASETS = {
     "mvbench": {
         "repo_id": "OpenGVLab/MVBench",
-        "local_dir": "/data2/haojitai/datasets/MVBench_hf",
+        "local_dir": "MVBench_hf",
         "metadata": ["README.md", "json/**"],
         "full": ["README.md", "json/**", "video/**"],
     },
     "longvideobench": {
         "repo_id": "longvideobench/LongVideoBench",
-        "local_dir": "/data2/haojitai/datasets/LongVideoBench_hf",
+        "local_dir": "LongVideoBench_hf",
         "metadata": ["README.md", "*.json", "*.parquet", "subtitles.tar"],
         "full": ["README.md", "*.json", "*.parquet", "subtitles.tar", "videos.tar.part.*"],
         "gated": True,
     },
     "mlvu": {
         "repo_id": "sy1998/MLVU",
-        "local_dir": "/data2/haojitai/datasets/MLVU_hf",
+        "local_dir": "MLVU_hf",
         "metadata": ["README.md", "MC/MC.parquet", "MLVU/json/**"],
         "full": ["README.md", "MC/MC.parquet", "MLVU/json/**", "MLVU/video/**"],
     },
     "videomme": {
         "repo_id": "lmms-lab/Video-MME",
-        "local_dir": "/data2/haojitai/datasets/Video-MME_hf",
+        "local_dir": "Video-MME_hf",
         "metadata": ["README.md", "videomme/test-00000-of-00001.parquet", "subtitle.zip"],
         "full": ["README.md", "videomme/test-00000-of-00001.parquet", "subtitle.zip", "videos_chunked_*.zip"],
     },
@@ -43,8 +47,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Download video QA benchmark metadata or full media.")
     parser.add_argument("--benchmark", default="all", choices=["all", *sorted(DATASETS)])
     parser.add_argument("--scope", default="metadata", choices=["metadata", "full"])
-    parser.add_argument("--data_root", default="/data2/haojitai/datasets")
-    parser.add_argument("--cache_dir", default="/data2/haojitai/hf_cache")
+    parser.add_argument("--data_root", default=os.getenv("DELTAKV_DATA_DIR", DEFAULT_DATA_ROOT))
+    parser.add_argument("--cache_dir", default=DEFAULT_HF_CACHE)
     parser.add_argument("--max_workers", type=int, default=4)
     parser.add_argument("--local_dir", default="", help="Override local dir for single-benchmark downloads.")
     parser.add_argument("--token", default=None)
@@ -62,9 +66,7 @@ def local_dir_for(args: argparse.Namespace, name: str) -> Path:
             raise ValueError("--local_dir can only be used with a single --benchmark.")
         return Path(args.local_dir)
     default = Path(DATASETS[name]["local_dir"])
-    if str(default).startswith("/data2/haojitai/datasets"):
-        return Path(args.data_root) / default.name
-    return default
+    return default if default.is_absolute() else Path(args.data_root) / default
 
 
 def main() -> None:

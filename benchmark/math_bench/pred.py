@@ -14,11 +14,12 @@ import torch.multiprocessing as mp
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
+from deltakv.configs.default_paths import dataset_path, output_path
 from deltakv.get_chat_api import get_generate_api
 
 # Keep defaults consistent with benchmark/long_bench/pred.py, but allow env overrides.
-BASE_PATH = os.getenv("DELTAKV_OUTPUT_DIR", "/root/autodl-fs/deltakv_outputs")
-DATA_PREFIX_PATH = os.getenv("DELTAKV_DATA_DIR", "/root/autodl-fs/datasets")
+BASE_PATH = os.getenv("DELTAKV_OUTPUT_DIR", output_path())
+DATA_PREFIX_PATH = os.getenv("DELTAKV_DATA_DIR", dataset_path())
 DEFAULT_GSM8K_DATASET = ("openai/gsm8k", "main", "test")
 DEFAULT_AIME2024_DATASET = ("Maxwell-Jia/AIME_2024", None, "train")
 DEFAULT_MATH500_DATASET = ("HuggingFaceH4/MATH-500", None, "test")

@@ -36,7 +36,6 @@ _BACKEND_ALIASES: dict[str, dict[str, str]] = {
     "sparsevllm": {
         "engine_prefill_chunk_size": "chunk_prefill_size",
         "deltakv_neighbor_count": "deltakv_k_neighbors",
-        "observation_layers": "obs_layer_ids",
     },
 }
 
@@ -54,7 +53,6 @@ _LEGACY_RUNTIME_KEYS: dict[str, str] = {
     "tail_token_size": "recent_keep_tokens",
     # Layer routing.
     "full_attn_layers": "full_attention_layers",
-    "obs_layer_ids": "observation_layers",
     # DeltaKV naming.
     "k_neighbors": "deltakv_neighbor_count",
     "deltakv_k_neighbors": "deltakv_neighbor_count",

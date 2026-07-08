@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from collections import deque
 from dataclasses import dataclass
 from abc import ABC, abstractmethod
@@ -164,17 +165,38 @@ class CacheManager(ABC):
 
         # Keep this heuristic conservative: large prefill batches can still peak on
         # MLP activations and allocator fragmentation after KV cache allocation.
-        estimated_max_tokens = int(reserved_mem / (intermediate_size_per_rank * dtype_size * 10))
-        assert 2 * config.chunk_prefill_size < estimated_max_tokens, (
-            f"{2 * config.chunk_prefill_size} >= {estimated_max_tokens}"
-        )
+        estimated_max_tokens = int(reserved_mem / (intermediate_size_per_rank * dtype_size * 4))
+        allow_large_prefill_chunk = os.getenv("SPARSEVLLM_ALLOW_LARGE_PREFILL_CHUNK", "0") == "1"
+        prefill_policy = getattr(config, "prefill_schedule_policy", None)
+        chunk_guard_multiplier = 1 if prefill_policy == "long_bs1full_short_batch" else 2
+        guarded_chunk_tokens = chunk_guard_multiplier * int(config.chunk_prefill_size)
+        if guarded_chunk_tokens >= estimated_max_tokens:
+            msg = (
+                f"{chunk_guard_multiplier}*chunk_prefill_size={guarded_chunk_tokens} >= "
+                f"estimated_max_tokens={estimated_max_tokens} "
+                f"(prefill_schedule_policy={prefill_policy!r})"
+            )
+            if not allow_large_prefill_chunk:
+                raise AssertionError(msg)
+            logger.warning(
+                "{}; continuing because SPARSEVLLM_ALLOW_LARGE_PREFILL_CHUNK=1. "
+                "This is an explicit experiment override and may OOM.",
+                msg,
+            )
 
-        if estimated_max_tokens < config.max_num_batched_tokens:
+        if estimated_max_tokens < config.max_num_batched_tokens and not allow_large_prefill_chunk:
             logger.warning(
                 f"Estimated max_num_batched_tokens ({estimated_max_tokens}) is smaller than config "
                 f"({config.max_num_batched_tokens}). Updating to avoid OOM."
             )
             config.max_num_batched_tokens = estimated_max_tokens
+        elif estimated_max_tokens < config.max_num_batched_tokens:
+            logger.warning(
+                "Keeping max_num_batched_tokens={} above estimated {} because "
+                "SPARSEVLLM_ALLOW_LARGE_PREFILL_CHUNK=1.",
+                config.max_num_batched_tokens,
+                estimated_max_tokens,
+            )
 
         logger.info(f"Set dynamically max_num_batched_tokens = {config.max_num_batched_tokens}")
 
@@ -386,6 +408,15 @@ class CacheManager(ABC):
         del layer_idx, q, view, b_start_loc, chunk_lens
         return None
 
+    def before_prefill_layer_attention(self, layer_idx: int, selection: SparseSelection):
+        """Optional hook immediately before building a prefill layer compute view."""
+        del layer_idx, selection
+        return None
+
+    def defer_prefill_eviction(self) -> bool:
+        """Whether the current method should skip chunk-end sparse eviction."""
+        return False
+
     def record_decode_query(self, layer_idx: int, q: torch.Tensor):
         """Optional method-owned decode query cache update after attention output is computed."""
         del layer_idx, q
@@ -483,6 +514,17 @@ class CacheManager(ABC):
     ) -> dict[str, object]:
         del token_ids, include_subtree
         raise RuntimeError("prefix cache is not enabled or not supported by this cache manager.")
+
+    def prefix_cache_match(self, token_ids: list[int]) -> dict[str, object]:
+        del token_ids
+        return {
+            "supported": False,
+            "enabled": False,
+            "matched_tokens": 0,
+            "matched_blocks": 0,
+            "match_ratio": 0.0,
+            "reason": "prefix cache is not supported by this cache manager.",
+        }
 
     def prefix_cache_delete_subtree(self, token_ids: list[int]) -> dict[str, object]:
         del token_ids
@@ -659,6 +701,11 @@ class CacheManager(ABC):
     def prefill_step_free_slots_for(self, seq: Sequence) -> int:
         """Writable KV capacity for a specific prefill candidate."""
         return int(self.prefill_step_free_slots())
+
+    def requires_long_prefill_offload(self, seq: Sequence) -> bool:
+        """Whether this long prefill should be internally chunked through offload staging."""
+        del seq
+        return False
 
     def prefill_step_reservation_cost(self, seq: Sequence, scheduled_tokens: int) -> int:
         """Scheduler-side capacity consumed by scheduling a prefill chunk."""

@@ -120,7 +120,6 @@ user-facing runtime parameters.
 | `sink_keep_tokens` | `num_sink_tokens` | `num_sink_tokens` | Prefix tokens always kept. |
 | `recent_keep_tokens` | `num_recent_tokens` | `num_recent_tokens` | Recent tail tokens always kept. |
 | `full_attention_layers` | `full_attn_layers` | `full_attn_layers` | Layers that stay full, or observation anchors depending on method. |
-| `observation_layers` | not supported | `obs_layer_ids` | Explicit Sparse-vLLM observation layers. |
 | `deltakv_neighbor_count` | same | `deltakv_k_neighbors` | Number of reference/prototype neighbors. |
 | `deltakv_center_ratio` | `cluster_ratio` | `cluster_ratio` | Fraction or stride-derived rate for reference centers. |
 | `deltakv_latent_dim` | `kv_compressed_size` | `kv_compressed_size` | DeltaKV latent width. |
@@ -143,7 +142,7 @@ Rejected legacy runtime names:
 | `chunk_prefill_size` | `hf_prefill_chunk_size` or `engine_prefill_chunk_size` | Same spelling meant different speed/capacity behavior on each backend. |
 | `num_top_tokens`, `num_top_tokens_in_prefill` | `decode_keep_tokens`; HF-only `prefill_keep_tokens` | Count/ratio/per-layer semantics differed by backend. |
 | `num_sink_tokens`, `num_recent_tokens`, `tail_token_size` | `sink_keep_tokens`, `recent_keep_tokens` | Internal cache names leaked into experiment configs. |
-| `full_attn_layers`, `obs_layer_ids` | `full_attention_layers`, `observation_layers` | Internal layer-routing names leaked into shared configs. |
+| `full_attn_layers` | `full_attention_layers` | Internal layer-routing names leaked into shared configs. |
 | `seq_chunk_size` | `compressor_token_group_size` | It described token grouping but was also used as a cluster-neighbor fallback. |
 | `k_neighbors`, `deltakv_k_neighbors` | `deltakv_neighbor_count` | Backend/internal names hid the selected-reference meaning. |
 | `cluster_ratio` | `deltakv_center_ratio` | DeltaKV-specific center/prototype rate. |
@@ -319,8 +318,7 @@ int(131072 * 0.17) = 22282
 
 | Parameter | HF behavior | Sparse-vLLM behavior |
 | --- | --- | --- |
-| `full_attention_layers` | Parsed into a list in `CustomConfigMixin`. Standard DeltaKV uses these as full-attention layers and selection anchors. | Parsed into a list internally. If `observation_layers` is absent, Sparse-vLLM derives observation layers from full layers. |
-| `observation_layers` | Not a generic HF custom config field. | Explicit Sparse-vLLM observation-layer override. |
+| `full_attention_layers` | Parsed into a list in `CustomConfigMixin`. Standard DeltaKV uses these as full-attention layers and selection anchors. | Parsed into a list internally. Sparse-vLLM derives observation layers from this value. |
 | `snapkv_num_full_layers` | HF SnapKV-related knob. | SnapKV manager can reserve early full layers. |
 
 Special case:
@@ -363,8 +361,8 @@ The selector writes `<OUTPUT_DIR>/selected_full_layers.json`; use its
 ```
 
 This is an offline calibration step, not an automatic `LLM(...)` runtime mode.
-After setting `full_attention_layers`, Sparse-vLLM derives `observation_layers`
-from it unless an explicit `observation_layers` override is provided.
+After setting `full_attention_layers`, Sparse-vLLM derives its internal
+observation layers from it. `observation_layers` is not a supported runtime key.
 
 ### 6.3 SnapKV, PyramidKV, OmniKV, Quest
 
@@ -578,17 +576,24 @@ Key Sparse-vLLM public names and internal fields:
 | `deltakv_checkpoint_path` | `deltakv_path` | `None` | DeltaKV checkpoint path for compressor weights/config. |
 | `deltakv_neighbor_count` | `deltakv_k_neighbors` | `4` | Number of centers used for reconstruction. |
 | `deltakv_center_ratio` | `cluster_ratio` | `0.1` | Center/prototype rate and capacity input. |
-| `cluster_metric` | `l2` | Center scoring metric. |
+| `cluster_metric` | same | `l2` | Center scoring metric. |
 | `deltakv_latent_dim` | `kv_compressed_size` | `128` | Latent dimension. |
 | `deltakv_latent_quant_bits` | `kv_quant_bits` | `4` | Quantization bits for DeltaKV-style state. |
-| `deltakv_full_pool_reserve_ratio` | `0.1` | Fraction of KV memory reserved for full-KV pool. |
-| `deltakv_triton_*_heads_per_program` | `4` | Triton grouping controls. |
-| `allow_unknown_config_keys` | `False` | Explicit opt-in for ignoring unknown Sparse-vLLM config keys. |
-| `allow_missing_deltakv_path` | `False` | Construction-only test escape hatch for missing compressor weights. Do not use for reportable benchmark runs. |
+| `deltakv_full_pool_reserve_ratio` | same | `0.1` | Fraction of KV memory reserved for full-KV pool. |
+| `deltakv_sparse_decode_backend` | same | `auto` | Sparse decode backend. `auto` resolves at `Config` construction to `fa2` when `flash_attn` is installed, otherwise `custom`. |
+| `deltakv_triton_gather_heads_per_program`, `deltakv_triton_reconstruct_heads_per_program` | same | `4` | Triton grouping controls for the gather/reconstruct kernels. They do not control the materialized sparse-view kernel. |
+| `deltakv_triton_materialize_block_tokens` | same | `16` | Token block size for the materialized sparse-view kernel. |
+| `allow_unknown_config_keys` | same | `False` | Explicit opt-in for ignoring unknown Sparse-vLLM config keys. |
+| `allow_missing_deltakv_path` | same | `False` | Construction-only test escape hatch for missing compressor weights. Do not use for reportable benchmark runs. |
 
 `bitsandbytes` is a declared package dependency because 4-bit and 8-bit
 loading paths import it at runtime. A normal `pip install -e .` should install
 it; manually curated environments need to include it explicitly.
+
+`benchmark/microbench.py` records both input `engine_hyper_params` and
+post-construction `resolved_engine_config` in each result row. Use
+`resolved_engine_config.deltakv_sparse_decode_backend` to audit whether an
+`auto` backend run actually used `fa2` or `custom`.
 
 ### 9.1 Compressor-Backed DeltaKV
 

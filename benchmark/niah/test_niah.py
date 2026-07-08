@@ -15,7 +15,7 @@ from transformers import AutoTokenizer
 from deltakv.get_chat_api import get_generate_api
 from benchmark.niah.gen_niah import generate_text
 
-BASE_PATH = os.environ.get("DELTAKV_OUTPUT_BASE", '/root/autodl-fs/deltakv_outputs')
+BASE_PATH = os.environ.get("DELTAKV_OUTPUT_BASE", os.path.join(os.getcwd(), "outputs", "niah"))
 
 
 def _load_or_generate_data(
@@ -72,6 +72,9 @@ def test(
     context_lengths: str = "16,32,64",
     max_new_tokens: int = 20,
     min_new_tokens: int = 1,
+    temperature: float = 0.0,
+    top_p: float = 1.0,
+    do_sample: bool = False,
     sparse_method: str = 'deltakv',
     deltakv_checkpoint_path: str = None,
     use_cache: bool = True,
@@ -95,6 +98,14 @@ def test(
     engine_prefill_chunk_size: int = 32768,
     gpu_memory_utilization: float = 0.8,
     max_model_len: int = 128000,
+    max_num_seqs_in_batch: int = 1,
+    max_decoding_seqs: int = 1,
+    max_num_batched_tokens: int = 0,
+    deltakv_latent_dim: int = 128,
+    deltakv_latent_quant_bits: int = 4,
+    deltakv_latent_quant_group_size: int = 0,
+    full_layer_kv_quant_bits: int = 0,
+    enable_full_layer_kivi_quant: bool = True,
     pyramid_last_layer_ratio: float = None,
     enforce_eager: bool = True,
 
@@ -113,6 +124,9 @@ def test(
 
     评测可以从现有数据集加载，也可以在线实时生成。
     """
+    if isinstance(full_attention_layers, (list, tuple)):
+        full_attention_layers = ",".join(str(int(layer)) for layer in full_attention_layers)
+
     prefill_chunk_key = "engine_prefill_chunk_size" if backend == "sparsevllm" else "hf_prefill_chunk_size"
     prefill_chunk_value = engine_prefill_chunk_size if backend == "sparsevllm" else hf_prefill_chunk_size
 
@@ -142,6 +156,34 @@ def test(
         infer_config['stride_alpha'] = stride_alpha
         infer_config['prefill_keep_tokens'] = prefill_keep_tokens
         infer_config['chunk_prefill_accel_omnikv'] = chunk_prefill_accel_omnikv
+    else:
+        # Keep SparseVLLM strict-config checks meaningful: do not forward
+        # compatibility knobs that only HF wrappers or other benchmark methods use.
+        for key in (
+            "deltakv_use_omnikv_selection",
+            "omnikv_score_method",
+            "pyramid_last_layer_ratio",
+            "use_cluster",
+            "lt_bits",
+            "lt_group_size",
+            "lt_sym",
+            "lt_clip_ratio",
+            "lt_hadamard",
+        ):
+            infer_config.pop(key, None)
+        infer_config.update(
+            {
+                "max_num_seqs_in_batch": max_num_seqs_in_batch,
+                "max_decoding_seqs": max_decoding_seqs,
+                "deltakv_latent_dim": deltakv_latent_dim,
+                "deltakv_latent_quant_bits": deltakv_latent_quant_bits,
+                "deltakv_latent_quant_group_size": deltakv_latent_quant_group_size,
+                "full_layer_kv_quant_bits": full_layer_kv_quant_bits,
+                "enable_full_layer_kivi_quant": enable_full_layer_kivi_quant,
+            }
+        )
+        if max_num_batched_tokens > 0:
+            infer_config["max_num_batched_tokens"] = max_num_batched_tokens
     chat = get_generate_api(
         model_path,
         infer_config,
@@ -162,8 +204,10 @@ def test(
     output_dir = os.path.join(BASE_PATH, output_path, f"{compressor_name}_{time_tag}")
     os.makedirs(output_dir, exist_ok=True)
     json_save_path = os.path.join(output_dir, "accuracy_rates.json")
+    sample_save_path = os.path.join(output_dir, "sample_results.jsonl")
     heatmap_save_path = os.path.join(output_dir, "accuracy_heatmap.pdf")
     print(f"Results will be saved in: {output_dir}")
+    open(sample_save_path, "w", encoding="utf-8").close()
 
     # 如果min_new_tokens > 1，则强制生成固定长度的token
     if min_new_tokens > 1:
@@ -204,7 +248,13 @@ def test(
         start_time = time.time()
 
         # 模型生成回复
-        response = chat(item["task"], max_new_tokens=max_new_tokens)
+        response = chat(
+            item["task"],
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            do_sample=do_sample,
+        )
 
         # 准备用于统计的key
         depth_ratio = round(item["ratio"], 3)
@@ -214,10 +264,31 @@ def test(
         print(f"Context(k)-Depth: {accuracy_key}, Response: {response}")
 
         # 检查答案是否正确
-        if item["answer"] in response:
+        elapsed_time = round(time.time() - start_time, 3)
+        is_correct = item["answer"] in response
+        with open(sample_save_path, "a", encoding="utf-8") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "context_depth_key": accuracy_key,
+                        "context_k": int(context_k),
+                        "depth_ratio": float(depth_ratio),
+                        "total_tokens": int(item["total_tokens"]),
+                        "answer": item["answer"],
+                        "response": response,
+                        "correct": bool(is_correct),
+                        "elapsed_s": elapsed_time,
+                        "temperature": float(temperature),
+                        "top_p": float(top_p),
+                        "do_sample": bool(do_sample),
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+        if is_correct:
             correct_predictions += 1
             accuracies[accuracy_key] += 1
-            elapsed_time = round(time.time() - start_time, 3)
             overall_accuracy = round(correct_predictions / total_iterations, 3)
             print(
                 f"✅ Correct! | Key: {accuracy_key} | Time: {elapsed_time}s | Overall Acc: {overall_accuracy}"

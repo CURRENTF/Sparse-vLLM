@@ -1,5 +1,6 @@
+import importlib.util
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Union
 
 from transformers import AutoConfig
@@ -52,6 +53,33 @@ def _coerce_optional_positive_int(name: str, value: Any) -> int | None:
     if parsed <= 0:
         raise ValueError(f"{name} must be > 0 when set, got {parsed}.")
     return parsed
+
+
+def _flash_attn_available() -> bool:
+    return importlib.util.find_spec("flash_attn") is not None
+
+
+def _resolve_deltakv_sparse_decode_backend(value: Any) -> str:
+    backend = str(value or "auto").strip().lower()
+    if backend not in {"auto", "custom", "fa2"}:
+        raise ValueError(
+            "deltakv_sparse_decode_backend must be one of 'auto', 'custom', or 'fa2', "
+            f"got {value!r}."
+        )
+    if backend == "auto":
+        resolved = "fa2" if _flash_attn_available() else "custom"
+        reason = "flash_attn available" if resolved == "fa2" else "flash_attn not available"
+        log_once(
+            f"DeltaKV sparse decode backend auto-selected {resolved!r} ({reason}).",
+            level="INFO",
+        )
+        return resolved
+    if backend == "fa2" and not _flash_attn_available():
+        raise ValueError(
+            "deltakv_sparse_decode_backend='fa2' requires the flash_attn package; "
+            "use 'custom' or leave it as 'auto' when flash_attn is not installed."
+        )
+    return backend
 
 
 SUPPORTED_SKIPKV_MODEL_NAMES = frozenset(
@@ -217,7 +245,7 @@ class Config:
     decode_keep_tokens: int = 4096
 
     # OmniKV Config
-    obs_layer_ids: list[int] = None  # None means auto-calculate based on full_attn_layers (useful for omnikv)
+    obs_layer_ids: list[int] = field(default=None, init=False)
     full_attn_layers: str | list[int] = "0" # useful for omnikv
     decode_cuda_graph: bool = False
     decode_cuda_graph_capture_sampling: bool = False
@@ -339,6 +367,8 @@ class Config:
     # Triton kernels: group multiple KV heads per program to reduce redundant loads.
     deltakv_triton_gather_heads_per_program: int = 4
     deltakv_triton_reconstruct_heads_per_program: int = 4
+    deltakv_triton_materialize_block_tokens: int = 16
+    deltakv_sparse_decode_backend: str = "auto"
     deltakv_cluster_gather_chunk_size: int = 16384
     
     enable_profiler: bool = False
@@ -803,26 +833,48 @@ class Config:
                 )
             if self.kv_quant_bits == 4 and self.kv_quant_group_size == 0:
                 self.kv_quant_group_size = 32
+            self.deltakv_triton_materialize_block_tokens = int(
+                self.deltakv_triton_materialize_block_tokens or 16
+            )
+            if (
+                self.deltakv_triton_materialize_block_tokens <= 0
+                or self.deltakv_triton_materialize_block_tokens % 8 != 0
+            ):
+                raise ValueError(
+                    "deltakv_triton_materialize_block_tokens must be a positive multiple of 8, "
+                    f"got {self.deltakv_triton_materialize_block_tokens}."
+                )
+            self.deltakv_sparse_decode_backend = _resolve_deltakv_sparse_decode_backend(
+                self.deltakv_sparse_decode_backend
+            )
             is_bf16_full_compressor_sparse = (
                 self.full_layer_kv_quant_bits == 0 and self.kv_quant_bits == 0
+            )
+            is_bf16_full_int4_compressor_sparse = (
+                self.full_layer_kv_quant_bits == 0 and self.kv_quant_bits == 4
             )
             is_kivi4_full_int4_compressor_sparse = (
                 self.full_layer_kv_quant_bits == 4
                 and self.kv_quant_bits == 4
                 and bool(getattr(self, "enable_full_layer_kivi_quant", True))
             )
-            if not (is_bf16_full_compressor_sparse or is_kivi4_full_int4_compressor_sparse):
+            if not (
+                is_bf16_full_compressor_sparse
+                or is_bf16_full_int4_compressor_sparse
+                or is_kivi4_full_int4_compressor_sparse
+            ):
                 raise ValueError(
-                    "DeltaKV slim runtime supports exactly two paths: "
+                    "DeltaKV slim runtime supports exactly three paths: "
                     "(full_layer_kv_quant_bits=0, kv_quant_bits=0) and "
+                    "(full_layer_kv_quant_bits=0, kv_quant_bits=4) and "
                     "(full_layer_kv_quant_bits=4, kv_quant_bits=4, enable_full_layer_kivi_quant=True)."
                 )
 
-        if self.obs_layer_ids is None:
-            self.obs_layer_ids = []
-            for l in self.full_attn_layers:
-                if (l + 1) not in self.full_attn_layers:
-                    self.obs_layer_ids.append(l)
+        self.obs_layer_ids = [
+            int(layer)
+            for layer in self.full_attn_layers
+            if (int(layer) + 1) not in self.full_attn_layers
+        ]
         
         # 确保调度吞吐量限制不小于单次分块大小
         if self.max_num_batched_tokens < 2 * self.chunk_prefill_size:

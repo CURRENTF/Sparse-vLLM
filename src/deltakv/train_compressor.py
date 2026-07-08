@@ -11,6 +11,11 @@ from transformers import (
     set_seed
 )
 from datasets import load_dataset, load_from_disk, Dataset
+from deltakv.configs.default_paths import (
+    dataset_path as default_dataset_path,
+    model_path as default_model_path,
+    output_path as default_output_path,
+)
 from deltakv.data_prepare.data_collator import get_naive_collator
 from deltakv.data_prepare.llava_onevision_collator import LlavaOnevisionOnlineCollator
 from deltakv.save_trainable_trainer import SaveTrainableParamsTrainer
@@ -43,9 +48,9 @@ def _load_llava_onevision_dataset(dataset_path: str, *, shuffle_buffer_size: int
 
 def main(
     # 模型与数据路径
-    model_name_or_path: str = '/root/autodl-fs/models/Qwen2.5-7B-Instruct-1M',
-    dataset_path: str = '/root/autodl-fs/datasets/fineweb-edu-tokenized',
-    output_dir: str = '/root/autodl-fs/checkpoints/compressor',
+    model_name_or_path: str = default_model_path("Qwen2.5-7B-Instruct-1M"),
+    dataset_path: str = default_dataset_path("fineweb-edu-tokenized"),
+    output_dir: str = default_output_path("checkpoints", "compressor"),
     data_max_len: int = -1,
     deepspeed: str = None,
     training_backend: str = "text",

@@ -25,6 +25,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+DEFAULT_MODEL_ROOT = Path(os.getenv("DELTAKV_MODEL_ROOT", PROJECT_ROOT / "models"))
+DEFAULT_DATA_ROOT = Path(os.getenv("DELTAKV_DATA_DIR", PROJECT_ROOT / "data"))
+DEFAULT_OUTPUT_ROOT = Path(os.getenv("DELTAKV_OUTPUT_DIR", PROJECT_ROOT / "outputs"))
+
 TASK_CSV_FILES = {
     "real": "Real_Time_Visual_Understanding.csv",
     "omni": "Omni_Source_Understanding.csv",
@@ -125,12 +129,12 @@ def parse_args():
             "with vanilla HF generation and standard DeltaKV."
         )
     )
-    parser.add_argument("--model_path", default="/data2/haojitai/models/llava-onevision-qwen2-0.5b-ov-hf")
+    parser.add_argument("--model_path", default=str(DEFAULT_MODEL_ROOT / "llava-onevision-qwen2-0.5b-ov-hf"))
     parser.add_argument("--deltakv_checkpoint_path", default="none")
-    parser.add_argument("--dataset_dir", default="/data2/haojitai/datasets/StreamingBench_hf")
+    parser.add_argument("--dataset_dir", default=str(DEFAULT_DATA_ROOT / "StreamingBench_hf"))
     parser.add_argument("--csv_dir", default="")
     parser.add_argument("--video_dir", default="")
-    parser.add_argument("--output_dir", default="/data2/haojitai/datasets/llava_onevision_streamingbench")
+    parser.add_argument("--output_dir", default=str(DEFAULT_OUTPUT_ROOT / "deltakv_multimodal" / "streamingbench"))
     parser.add_argument(
         "--tasks",
         default="real",

@@ -4,6 +4,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import os
 from deltakv.analysis.colors import COLOR_GRID, TEXT_HIGHLIGHT_1, TEXT_HIGHLIGHT_2, TEXT_HIGHLIGHT_3
+from deltakv.configs.default_paths import output_path
 
 def visualize_detach_ablation():
     # --- 配置 ---
@@ -18,7 +19,7 @@ def visualize_detach_ablation():
     }
     METRICS = ["train/loss", "train/ntp_loss", "train/mse_loss"]
     TITLES = ["Total Loss $\\downarrow$", "NTP Loss $\\downarrow$", "MSE Loss $\\downarrow$"]
-    OUTPUT_DIR = "/root/autodl-fs/visuals/"
+    OUTPUT_DIR = output_path("visuals")
     WINDOW_SIZE = 100
     
     os.makedirs(OUTPUT_DIR, exist_ok=True)

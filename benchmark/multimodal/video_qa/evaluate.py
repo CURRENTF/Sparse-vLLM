@@ -24,19 +24,22 @@ if str(SRC_ROOT) not in sys.path:
 from benchmark.multimodal.video_qa import streamingbench as streaming
 from benchmark.multimodal.video_qa.datasets import load_video_qa_rows
 
+DEFAULT_MODEL_ROOT = Path(os.getenv("DELTAKV_MODEL_ROOT", PROJECT_ROOT / "models"))
+DEFAULT_DATA_ROOT = Path(os.getenv("DELTAKV_DATA_DIR", PROJECT_ROOT / "data"))
+DEFAULT_OUTPUT_ROOT = Path(os.getenv("DELTAKV_OUTPUT_DIR", PROJECT_ROOT / "outputs"))
 
 DEFAULT_DATASET_DIRS = {
-    "mvbench": "/data2/haojitai/datasets/MVBench_hf",
-    "longvideobench": "/data2/haojitai/datasets/LongVideoBench_hf",
-    "mlvu": "/data2/haojitai/datasets/MLVU_hf",
-    "videomme": "/data2/haojitai/datasets/Video-MME_modelscope",
+    "mvbench": str(DEFAULT_DATA_ROOT / "MVBench_hf"),
+    "longvideobench": str(DEFAULT_DATA_ROOT / "LongVideoBench_hf"),
+    "mlvu": str(DEFAULT_DATA_ROOT / "MLVU_hf"),
+    "videomme": str(DEFAULT_DATA_ROOT / "Video-MME_modelscope"),
 }
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Unified LLaVA-OneVision video QA evaluator.")
     parser.add_argument("--benchmark", required=True, choices=sorted(DEFAULT_DATASET_DIRS))
-    parser.add_argument("--model_path", default="/data2/haojitai/models/llava-onevision-qwen2-7b-ov-hf")
+    parser.add_argument("--model_path", default=str(DEFAULT_MODEL_ROOT / "llava-onevision-qwen2-7b-ov-hf"))
     parser.add_argument(
         "--fastvid_official_repo_dir",
         default=str(PROJECT_ROOT / "baselines/FastVID/fastvid_llavaonevision"),
@@ -322,7 +325,7 @@ def main() -> None:
     if not args.dataset_dir:
         args.dataset_dir = DEFAULT_DATASET_DIRS[benchmark]
     if not args.output_dir:
-        args.output_dir = f"/data2/haojitai/outputs/deltakv_multimodal/{benchmark}_unified_eval"
+        args.output_dir = str(DEFAULT_OUTPUT_ROOT / "deltakv_multimodal" / f"{benchmark}_unified_eval")
     args.streamingbench_profile = f"unified_{benchmark}"
     args.tasks = "all"
     validate_args(args)

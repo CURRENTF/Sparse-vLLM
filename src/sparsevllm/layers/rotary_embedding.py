@@ -84,24 +84,13 @@ class RotaryEmbedding(nn.Module):
         key = apply_rotary_emb(key, cos, sin)
         return query, key
 
-    @torch.compile
-    def compiled_forward(
-        self,
-        positions: torch.Tensor,
-        query: torch.Tensor,
-        key: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        return self._forward_impl(positions, query, key)
-
     def forward(
         self,
         positions: torch.Tensor,
         query: torch.Tensor,
         key: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
-            return self._forward_impl(positions, query, key)
-        return self.compiled_forward(positions, query, key)
+        return self._forward_impl(positions, query, key)
 
 
 @lru_cache(1)

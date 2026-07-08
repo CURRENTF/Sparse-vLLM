@@ -14,6 +14,8 @@ from datasets import Dataset, load_dataset
 from transformers import AutoTokenizer, set_seed
 from tqdm import tqdm
 
+from deltakv.configs.default_paths import dataset_path as default_dataset_path
+
 set_seed(218)
 random.seed(218)
 
@@ -281,9 +283,9 @@ def shuffle_jsonl(input_path, output_path):
 
 def process_v2_4(model_cls, tkn, data_max_len, num_workers, num_samples=100_000):
     from datatrove.pipeline.readers import ParquetReader
-    data_fineweb_edu = ParquetReader("/root/autodl-fs/datasets/fineweb-edu/sample/10BT")()
+    data_fineweb_edu = ParquetReader(default_dataset_path("fineweb-edu", "sample", "10BT"))()
     # data_hermes = get_any_dataset("../datasets/OpenHermes-2.5", tkn)["train"]
-    output_path = f"/root/autodl-fs/datasets/deltakv_{model_cls}_train_num{num_samples}"
+    output_path = default_dataset_path(f"deltakv_{model_cls}_train_num{num_samples}")
     if data_max_len != 1024:
         output_path += f"_seqlen{data_max_len}"
     os.makedirs(output_path, exist_ok=True)
@@ -311,12 +313,12 @@ def process_v2_4(model_cls, tkn, data_max_len, num_workers, num_samples=100_000)
 def process_v3_0(model_cls, tkn, data_max_len, num_workers, num_samples=100_000):
     from datatrove.pipeline.readers import ParquetReader
     # Fineweb-edu
-    data_fineweb_edu = ParquetReader("/root/autodl-fs/datasets/fineweb-edu/sample/10BT")()
+    data_fineweb_edu = ParquetReader(default_dataset_path("fineweb-edu", "sample", "10BT"))()
     # CCI3-HQ (CHI)
-    data_chi = load_dataset("/autodl-fs/data/datasets/CCI3-HQ", split="train", streaming=True)
+    data_chi = load_dataset(default_dataset_path("CCI3-HQ"), split="train", streaming=True)
     data_chi = data_chi.shuffle(seed=218, buffer_size=10000)
     
-    output_path = f"/root/autodl-fs/datasets/deltakv_{model_cls}_train_v3.0_num{num_samples}"
+    output_path = default_dataset_path(f"deltakv_{model_cls}_train_v3.0_num{num_samples}")
     if data_max_len != 1024:
         output_path += f"_seqlen{data_max_len}"
     os.makedirs(output_path, exist_ok=True)
