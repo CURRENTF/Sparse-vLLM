@@ -300,6 +300,100 @@ def run_requests(args: argparse.Namespace, router_url: str, worker_urls: list[st
     return results
 
 
+def _route_reason(record: dict[str, Any]) -> str | None:
+    headers = record.get("headers")
+    if not isinstance(headers, dict):
+        return None
+    reason = headers.get("reason")
+    return str(reason) if reason is not None else None
+
+
+def _route_worker(record: dict[str, Any]) -> str | None:
+    headers = record.get("headers")
+    if not isinstance(headers, dict):
+        return None
+    worker = headers.get("worker")
+    return str(worker) if worker is not None else None
+
+
+def validate_summary(summary: dict[str, Any], args: argparse.Namespace):
+    required_records = ["warmup", "balanced_prefix_route", "overload_probe_route"]
+    for key in required_records:
+        record = summary.get(key)
+        if not isinstance(record, dict):
+            raise RuntimeError(f"router smoke missing {key}")
+        if int(record.get("choice_count", 0) or 0) <= 0:
+            raise RuntimeError(f"router smoke {key} returned no choices: {record}")
+        if not _route_worker(record):
+            raise RuntimeError(f"router smoke {key} missing X-SparseVLLM-Worker header: {record}")
+        if not _route_reason(record):
+            raise RuntimeError(f"router smoke {key} missing X-SparseVLLM-Route-Reason header: {record}")
+
+    warm_reason = _route_reason(summary["warmup"])
+    if warm_reason != "target_worker":
+        raise RuntimeError(f"warmup should target worker 0, got reason={warm_reason!r}")
+
+    match_payload = (summary.get("prefix_match_after_warmup") or {}).get("payload") or {}
+    if (summary.get("prefix_match_after_warmup") or {}).get("status") != 200:
+        raise RuntimeError(f"prefix match after warmup failed: {summary.get('prefix_match_after_warmup')}")
+    if args.require_prefix_route:
+        if not bool(match_payload.get("supported")) or not bool(match_payload.get("enabled")):
+            raise RuntimeError(f"prefix cache match is not supported/enabled: {match_payload}")
+        if int(match_payload.get("matched_tokens", 0) or 0) <= 0:
+            raise RuntimeError(f"warmup did not create a positive prefix-cache match: {match_payload}")
+        balanced_reason = _route_reason(summary["balanced_prefix_route"])
+        if balanced_reason != "best_prefix_match":
+            raise RuntimeError(f"balanced request should choose prefix match, got reason={balanced_reason!r}")
+
+    if args.require_overload_reroute:
+        overload_reason = _route_reason(summary["overload_probe_route"])
+        if overload_reason != "prefix_match_overloaded_lowest_load":
+            raise RuntimeError(f"overload probe should reroute to lowest load, got reason={overload_reason!r}")
+        if _route_worker(summary["overload_probe_route"]) == _route_worker(summary["warmup"]):
+            raise RuntimeError(
+                "overload probe stayed on the warmup worker despite --require-overload-reroute: "
+                f"warmup={summary['warmup']} overload={summary['overload_probe_route']}"
+            )
+
+    busy_results = summary.get("busy_results") or []
+    if len(busy_results) != int(args.busy_requests):
+        raise RuntimeError(f"expected {args.busy_requests} busy results, got {len(busy_results)}")
+    balance_burst = summary.get("balance_burst") or []
+    if len(balance_burst) != int(args.balance_requests):
+        raise RuntimeError(f"expected {args.balance_requests} balance results, got {len(balance_burst)}")
+    random_requests = summary.get("requests") or []
+    if len(random_requests) != int(args.random_requests):
+        raise RuntimeError(f"expected {args.random_requests} random requests, got {len(random_requests)}")
+
+    delete_subtree = summary.get("delete_subtree") or {}
+    if delete_subtree.get("status") != 200:
+        raise RuntimeError(f"delete_subtree failed validation: {delete_subtree}")
+
+
+def build_failure_summary(
+    partial_summary: dict[str, Any],
+    args: argparse.Namespace,
+    methods: list[str],
+    gpus: list[str],
+    ports: list[int],
+    exc: BaseException,
+) -> dict[str, Any]:
+    summary = dict(partial_summary)
+    summary.update(
+        {
+            "status": "failed",
+            "error": f"{type(exc).__name__}: {exc}",
+            "methods": methods,
+            "gpus": gpus,
+            "worker_ports": ports,
+            "router_port": args.router_port,
+            "model": args.model,
+            "served_model_name": args.served_model_name,
+        }
+    )
+    return summary
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run a real two-worker Sparse-vLLM OpenAI router smoke test.")
     parser.add_argument("--model", required=True)
@@ -323,6 +417,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-random-output-tokens", type=int, default=4)
     parser.add_argument("--seed", type=int, default=20260630)
     parser.add_argument("--startup-timeout-s", type=float, default=420.0)
+    parser.add_argument("--require-prefix-route", action="store_true")
+    parser.add_argument("--require-overload-reroute", action="store_true")
     return parser.parse_args()
 
 
@@ -339,6 +435,7 @@ def main() -> int:
     worker_urls = [f"http://127.0.0.1:{port}" for port in ports]
     router_url = f"http://127.0.0.1:{args.router_port}"
     processes: list[subprocess.Popen] = []
+    summary: dict[str, Any] = {}
     env_base = os.environ.copy()
     pythonpath = os.pathsep.join([str(Path.cwd()), str(Path.cwd() / "src"), env_base.get("PYTHONPATH", "")])
     env_base["PYTHONPATH"] = pythonpath
@@ -421,21 +518,14 @@ def main() -> int:
                 "served_model_name": args.served_model_name,
             }
         )
+        validate_summary(summary, args)
         write_json(output_dir / "router_smoke_summary.json", summary)
         print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
         return 0
     except Exception as exc:
         write_json(
             output_dir / "router_smoke_summary.json",
-            {
-                "status": "failed",
-                "error": f"{type(exc).__name__}: {exc}",
-                "methods": methods,
-                "gpus": gpus,
-                "worker_ports": ports,
-                "router_port": args.router_port,
-                "model": args.model,
-            },
+            build_failure_summary(summary, args, methods, gpus, ports, exc),
         )
         raise
     finally:

@@ -1,5 +1,7 @@
+import asyncio
 import importlib.util
 import unittest
+from unittest.mock import patch
 
 
 @unittest.skipIf(
@@ -144,6 +146,81 @@ class OpenAISmartRouterTest(unittest.TestCase):
             match_payload_for_request("/v1/completions", {"prompt": ["a", "b"]}),
             {"text": "a"},
         )
+
+    def test_streaming_upstream_http_error_is_returned_before_sse_response(self):
+        from sparsevllm.entrypoints.openai import smart_router
+
+        router = smart_router.SmartRouter(
+            worker_urls=["http://worker-a"],
+            request_timeout_s=1.0,
+            overload_load_factor=1.5,
+            load_abs_threshold=1,
+            profiles={},
+            route_log_dir=None,
+        )
+        router.workers[0].info = {"served_model_name": "model", "sparse_method": "omnikv"}
+
+        async def refresh_worker_info():
+            return None
+
+        router.refresh_worker_info = refresh_worker_info
+        upstream_error = smart_router.UpstreamError(
+            status=400,
+            headers={"Content-Type": "application/json"},
+            body=b'{"error":"bad request"}',
+        )
+
+        with patch.object(smart_router, "_open_stream_response", return_value=upstream_error):
+            response = asyncio.run(
+                router.route_openai_request(
+                    "/v1/completions",
+                    {
+                        "model": "model",
+                        "prompt": "hello",
+                        "stream": True,
+                        "svllm_target_worker": "0",
+                    },
+                )
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.body, b'{"error":"bad request"}')
+        self.assertEqual(response.headers["x-sparsevllm-worker"], "http://worker-a")
+        self.assertEqual(response.headers["x-sparsevllm-route-reason"], "target_worker")
+        self.assertEqual(router.workers[0].local_inflight, 0)
+
+    def test_streaming_open_exception_releases_local_inflight(self):
+        from sparsevllm.entrypoints.openai import smart_router
+
+        router = smart_router.SmartRouter(
+            worker_urls=["http://worker-a"],
+            request_timeout_s=1.0,
+            overload_load_factor=1.5,
+            load_abs_threshold=1,
+            profiles={},
+            route_log_dir=None,
+        )
+        router.workers[0].info = {"served_model_name": "model", "sparse_method": "omnikv"}
+
+        async def refresh_worker_info():
+            return None
+
+        router.refresh_worker_info = refresh_worker_info
+        with patch.object(smart_router, "_open_stream_response", side_effect=ValueError("boom")):
+            with self.assertRaisesRegex(ValueError, "boom"):
+                asyncio.run(
+                    router.route_openai_request(
+                        "/v1/completions",
+                        {
+                            "model": "model",
+                            "prompt": "hello",
+                            "stream": True,
+                            "svllm_target_worker": "0",
+                        },
+                    )
+                )
+
+        self.assertEqual(router.workers[0].local_inflight, 0)
 
 
 if __name__ == "__main__":

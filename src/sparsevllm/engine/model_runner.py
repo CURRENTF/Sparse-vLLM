@@ -35,6 +35,7 @@ except ImportError:
 TP_SHM_NAME_PREFIX = "sparsevllm_"
 PREFIX_CACHE_CONTROL_RPC_METHODS = {
     "prefix_cache_inspect",
+    "prefix_cache_match",
     "prefix_cache_delete_subtree",
     "prefix_cache_set_eviction_priority",
 }

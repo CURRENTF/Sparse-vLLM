@@ -4,7 +4,6 @@ import json
 import time
 import uuid
 from dataclasses import dataclass
-from functools import partial
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError
@@ -62,6 +61,19 @@ class WorkerProbe:
         if not (self.match.get("supported") and self.match.get("enabled")):
             return 0
         return int(self.match.get("matched_tokens", 0) or 0)
+
+
+@dataclass(frozen=True)
+class UpstreamStream:
+    response: Any
+    headers: dict[str, str]
+
+
+@dataclass(frozen=True)
+class UpstreamError:
+    status: int
+    headers: dict[str, str]
+    body: bytes
 
 
 def create_app(
@@ -190,7 +202,7 @@ class SmartRouter:
         worker, forward_payload, route = await self.select_worker(endpoint, payload)
         stream = bool(forward_payload.get("stream", False))
         if stream:
-            return self.forward_stream(worker, endpoint, forward_payload, route)
+            return await self.forward_stream(worker, endpoint, forward_payload, route)
         response = await self.forward_json(worker, endpoint, forward_payload)
         return _with_route_headers(response, route)
 
@@ -311,26 +323,60 @@ class SmartRouter:
             worker.local_inflight -= 1
         return Response(content=body, status_code=status, headers=_content_headers(headers))
 
-    def forward_stream(
+    async def forward_stream(
         self,
         worker: WorkerState,
         endpoint: str,
         payload: dict[str, Any],
         route: dict[str, Any],
-    ) -> StreamingResponse:
-        async def _stream():
-            worker.local_inflight += 1
-            try:
-                async for chunk in _stream_request(f"{worker.url}{endpoint}", payload, self.request_timeout_s):
-                    yield chunk
-            finally:
-                worker.local_inflight -= 1
+    ) -> Response:
+        worker.local_inflight += 1
+        stream_handoff = False
+        opened_response = None
+        try:
+            upstream = await asyncio.to_thread(
+                _open_stream_response,
+                f"{worker.url}{endpoint}",
+                payload,
+                self.request_timeout_s,
+            )
+            if isinstance(upstream, UpstreamError):
+                return Response(
+                    content=upstream.body,
+                    status_code=upstream.status,
+                    headers={**_content_headers(upstream.headers), **route_headers(route)},
+                )
+            opened_response = upstream.response
+            response_headers = {**_content_headers(upstream.headers), **route_headers(route)}
 
-        return StreamingResponse(
-            _stream(),
-            media_type="text/event-stream",
-            headers=route_headers(route),
-        )
+            async def _stream():
+                try:
+                    async for chunk in _stream_response_chunks(opened_response):
+                        yield chunk
+                finally:
+                    try:
+                        opened_response.close()
+                    finally:
+                        worker.local_inflight -= 1
+
+            response = StreamingResponse(
+                _stream(),
+                media_type="text/event-stream",
+                headers=response_headers,
+            )
+            stream_handoff = True
+            return response
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        finally:
+            if not stream_handoff:
+                if opened_response is not None:
+                    try:
+                        opened_response.close()
+                    finally:
+                        worker.local_inflight -= 1
+                else:
+                    worker.local_inflight -= 1
 
     async def broadcast_json(self, endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
         await self.refresh_worker_info()
@@ -536,21 +582,28 @@ def _request_bytes(
         raise RuntimeError(str(exc)) from exc
 
 
-async def _stream_request(url: str, payload: dict[str, Any], timeout_s: float):
+def _open_stream_response(
+    url: str,
+    payload: dict[str, Any],
+    timeout_s: float,
+) -> UpstreamStream | UpstreamError:
     data = json.dumps(payload).encode("utf-8")
     request = UrlRequest(url, data=data, method="POST", headers={"Content-Type": "application/json"})
     try:
-        response = await asyncio.to_thread(partial(urlopen, request, timeout=timeout_s))
-    except Exception as exc:
+        response = urlopen(request, timeout=timeout_s)
+        return UpstreamStream(response=response, headers=dict(response.headers.items()))
+    except HTTPError as exc:
+        return UpstreamError(status=int(exc.code), headers=dict(exc.headers.items()), body=exc.read())
+    except URLError as exc:
         raise RuntimeError(f"Failed to open upstream stream {url}: {type(exc).__name__}: {exc}") from exc
-    try:
-        while True:
-            chunk = await asyncio.to_thread(response.read, 8192)
-            if not chunk:
-                break
-            yield chunk
-    finally:
-        response.close()
+
+
+async def _stream_response_chunks(response: Any):
+    while True:
+        chunk = await asyncio.to_thread(response.read, 8192)
+        if not chunk:
+            break
+        yield chunk
 
 
 def _content_headers(headers: dict[str, str]) -> dict[str, str]:

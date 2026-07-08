@@ -10,7 +10,13 @@ from uuid import uuid4
 import torch
 import torch.distributed as dist
 
-from sparsevllm.engine.model_runner import ModelRunner, TP_SHM_NAME_PREFIX, make_tp_shm_name
+from sparsevllm.engine.model_runner import (
+    ModelRunner,
+    PREFIX_CACHE_CONTROL_RPC_METHODS,
+    TP_RPC_STATUS_SYNC_METHODS,
+    TP_SHM_NAME_PREFIX,
+    make_tp_shm_name,
+)
 
 
 def test_write_shm_waits_until_worker_reads_command():
@@ -93,6 +99,11 @@ def test_prefix_cache_control_rpc_reports_any_tp_worker_failure():
             assert "At least one TP worker failed" in str(exc)
         else:
             raise AssertionError("expected worker failure to be surfaced on rank 0")
+
+
+def test_prefix_cache_match_uses_tp_failure_synchronized_control_path():
+    assert "prefix_cache_match" in PREFIX_CACHE_CONTROL_RPC_METHODS
+    assert "prefix_cache_match" in TP_RPC_STATUS_SYNC_METHODS
 
 
 def test_run_rpc_reports_any_tp_worker_failure():
