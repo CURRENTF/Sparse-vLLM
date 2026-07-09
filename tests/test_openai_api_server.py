@@ -1502,6 +1502,69 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual("".join(output_deltas), "<think>reason</think>answer")
 
+    async def test_response_stream_qwen3_thinking_off_streams_plain_answer(self):
+        from sparsevllm.entrypoints.openai.api_server import RequestHandle, ResponseRequest, _response_stream
+
+        queue = asyncio.Queue()
+        await queue.put(
+            {
+                "type": "token",
+                "index": 0,
+                "text": "hel",
+                "raw_text_delta": "hel",
+                "token_ids": [1],
+                "token_logprobs": [None],
+                "top_logprobs": [None],
+            }
+        )
+        await queue.put(
+            {
+                "type": "final",
+                "index": 0,
+                "text": "hello",
+                "raw_text": "hello",
+                "finish_reason": "stop",
+                "prompt_tokens": 1,
+                "completion_tokens": 2,
+                "token_ids": [1, 2],
+                "token_logprobs": [None, None],
+                "top_logprobs": [None, None],
+            }
+        )
+
+        class Dispatcher:
+            def cancel(self, _handle):
+                raise AssertionError("finished response stream should not be cancelled")
+
+        events = _response_sse_events(
+            [
+                chunk
+                async for chunk in _response_stream(
+                    Dispatcher(),
+                    "resp_test",
+                    123,
+                    "model",
+                    RequestHandle(output_queue=queue, cancelled=threading.Event()),
+                    time.perf_counter(),
+                    None,
+                    ResponseRequest(model="model", input="hello", stream=True, reasoning={"effort": "none"}),
+                    reasoning_parser_name="qwen3",
+                )
+            ]
+        )
+
+        event_types = [event for event, _payload in events]
+        output_deltas = [
+            payload["delta"]
+            for event, payload in events
+            if event == "response.output_text.delta"
+        ]
+        self.assertLess(
+            event_types.index("response.output_text.delta"),
+            event_types.index("response.completed"),
+        )
+        self.assertEqual("".join(output_deltas), "hello")
+
     async def test_response_stream_reasoning_length_finishes_incomplete(self):
         from sparsevllm.entrypoints.openai.api_server import RequestHandle, ResponseRequest, _response_stream
 
@@ -1749,9 +1812,9 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("reasoning_done", [event.kind for event in events])
 
     def test_qwen3_reasoning_stream_parser_handles_template_opened_think(self):
-        from sparsevllm.entrypoints.openai.responses.reasoning import get_reasoning_stream_parser
+        from sparsevllm.entrypoints.openai.responses.reasoning import Qwen3ReasoningStreamParser
 
-        parser = get_reasoning_stream_parser("qwen3")
+        parser = Qwen3ReasoningStreamParser(buffer_initial_content=True)
         events = []
         for delta in ["reason", "</thi", "nk>\n\nanswer"]:
             events.extend(parser.feed(delta))
@@ -1793,6 +1856,33 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         ])
         self.assertEqual(events[0].name, "get_weather")
         self.assertEqual(events[1].arguments_delta, '{"city":"Paris"}')
+
+    def test_qwen3_tool_call_stream_parser_handles_sequential_split_blocks(self):
+        from sparsevllm.entrypoints.openai.responses.tools import ToolCallStreamParser
+
+        parser = ToolCallStreamParser()
+        events = []
+        events.extend(
+            parser.feed(
+                '<tool_call>{"name":"first","arguments":{"x":1}}</tool_call>'
+            )
+        )
+        events.extend(
+            parser.feed(
+                '<tool_call>{"name":"second","arguments":{"y":2}}</tool_call>'
+            )
+        )
+        events.extend(parser.finish("stop"))
+
+        started = [event.name for event in events if event.kind == "tool_call_started"]
+        arguments = [
+            event.arguments_delta
+            for event in events
+            if event.kind == "tool_call_arguments_delta"
+        ]
+
+        self.assertEqual(started, ["first", "second"])
+        self.assertEqual(arguments, ['{"x":1}', '{"y":2}'])
 
     def test_qwen3_tool_call_stream_parser_fails_malformed_json(self):
         from sparsevllm.entrypoints.openai.responses.tools import ToolCallParseError

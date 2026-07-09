@@ -153,6 +153,8 @@ class ToolCallStreamParser:
         if self._state == "tool":
             self._buffer += text_delta
             return self._try_finish_tool_call()
+        if self._state == "after_tool":
+            return self._feed_after_tool(text_delta)
         if self._state == "done":
             if text_delta.strip():
                 raise ToolCallParseError("tool call output contains text after completed tool call.")
@@ -168,9 +170,13 @@ class ToolCallStreamParser:
             return [ToolCallStreamEvent("answer_delta", text=text)] if text else []
         if self._state == "tool":
             events = self._try_finish_tool_call()
-            if self._state != "done":
+            if self._state not in {"after_tool", "done"}:
                 raise ToolCallParseError("tool call output ended before closing tool call tag.")
             return events
+        if self._state == "after_tool":
+            if self._buffer.strip():
+                raise ToolCallParseError("tool call output contains text after completed tool call.")
+            return []
         return []
 
     def _feed_content(self, text_delta: str) -> list[ToolCallStreamEvent]:
@@ -188,6 +194,21 @@ class ToolCallStreamParser:
         self._buffer = ""
         self._state = "answer"
         return [ToolCallStreamEvent("answer_delta", text=text)]
+
+    def _feed_after_tool(self, text_delta: str) -> list[ToolCallStreamEvent]:
+        self._buffer += text_delta
+        stripped = self._buffer.lstrip()
+        if not stripped:
+            self._buffer = ""
+            return []
+        if stripped.startswith("<tool_call>"):
+            self._buffer = stripped
+            self._state = "tool"
+            return self._try_finish_tool_call()
+        if "<tool_call>".startswith(stripped):
+            self._buffer = stripped
+            return []
+        raise ToolCallParseError("tool call output contains text after completed tool call.")
 
     def _try_finish_tool_call(self) -> list[ToolCallStreamEvent]:
         if self._buffer.startswith("<tool_calls>"):
@@ -212,7 +233,7 @@ class ToolCallStreamParser:
             raise ToolCallParseError("tool call output contains text outside <tool_call> blocks.")
         calls = parse_tool_calls(self._buffer)
         self._buffer = ""
-        self._state = "done"
+        self._state = "after_tool"
         return _tool_call_stream_events(calls or [])
 
 

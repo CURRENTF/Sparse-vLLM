@@ -200,7 +200,10 @@ async def _response_stream(
     reasoning_parser_name: str | None,
 ):
     state = _ResponseStreamState(request_id, created_at, model)
-    reasoning_parser = get_reasoning_stream_parser(reasoning_parser_name)
+    reasoning_parser = get_reasoning_stream_parser(
+        reasoning_parser_name,
+        buffer_initial_content=_buffer_initial_response_reasoning(request, reasoning_parser_name),
+    )
     tool_parser = ToolCallStreamParser()
     raw_text_len = 0
     visible_text_len = 0
@@ -425,6 +428,16 @@ def _usage_from_final(final: dict[str, Any]) -> dict[str, int]:
         "output_tokens": final["completion_tokens"],
         "total_tokens": final["prompt_tokens"] + final["completion_tokens"],
     }
+
+
+def _buffer_initial_response_reasoning(
+    request: ResponseRequest,
+    reasoning_parser_name: str | None,
+) -> bool:
+    if reasoning_parser_name != "qwen3":
+        return False
+    kwargs = resolve_response_chat_template_kwargs(request) or {}
+    return kwargs.get("enable_thinking") is not False
 
 
 def _response_output_items(

@@ -35,11 +35,11 @@ def get_reasoning_parser(name: str | None) -> ReasoningParser | None:
     raise ValueError(f"Unsupported reasoning parser {name!r}.")
 
 
-def get_reasoning_stream_parser(name: str | None):
+def get_reasoning_stream_parser(name: str | None, *, buffer_initial_content: bool = False):
     if name is None:
         return PlainReasoningStreamParser()
     if name == "qwen3":
-        return Qwen3ReasoningStreamParser()
+        return Qwen3ReasoningStreamParser(buffer_initial_content=buffer_initial_content)
     raise ValueError(f"Unsupported reasoning parser {name!r}.")
 
 
@@ -94,9 +94,10 @@ class PlainReasoningStreamParser:
 
 
 class Qwen3ReasoningStreamParser:
-    def __init__(self):
+    def __init__(self, *, buffer_initial_content: bool = False):
         self._state = "content"
         self._buffer = ""
+        self._buffer_initial_content = buffer_initial_content
         self._answer_filter = _SpecialTokenFilter(_SPECIAL_OUTPUT_TOKENS)
         self.incomplete_reasoning = False
 
@@ -153,7 +154,13 @@ class Qwen3ReasoningStreamParser:
             events.append(ReasoningStreamEvent("reasoning_done"))
             return events + self._answer_delta(answer_text)
 
-        return []
+        if self._buffer_initial_content:
+            return []
+
+        answer_text = self._buffer
+        self._buffer = ""
+        self._state = "answer"
+        return self._answer_delta(answer_text)
 
     def _feed_reasoning(self, text_delta: str) -> list[ReasoningStreamEvent]:
         combined = self._buffer + text_delta
