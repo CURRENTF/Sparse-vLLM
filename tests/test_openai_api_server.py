@@ -1195,6 +1195,20 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(ctx.exception.status_code, 400)
 
+    def test_response_unimplemented_control_fields_fail_fast(self):
+        from fastapi import HTTPException
+
+        from sparsevllm.entrypoints.openai.api_server import ResponseRequest, _validate_response_request
+
+        for request in [
+            ResponseRequest(model="model", input="hello", tool_choice="required"),
+            ResponseRequest(model="model", input="hello", parallel_tool_calls=False),
+            ResponseRequest(model="model", input="hello", reasoning={"summary": "auto"}),
+        ]:
+            with self.assertRaises(HTTPException) as ctx:
+                _validate_response_request(request, "model")
+            self.assertEqual(ctx.exception.status_code, 400)
+
     def test_response_max_output_tokens_maps_to_sampling_params(self):
         from sparsevllm.entrypoints.openai.api_server import ResponseRequest, _sampling_params_from_response_request
 

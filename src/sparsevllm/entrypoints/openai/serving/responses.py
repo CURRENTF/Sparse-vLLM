@@ -118,6 +118,12 @@ def _validate_response_request(request: ResponseRequest, served_model_name: str)
         normalize_tools(request.tools)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if request.tool_choice not in (None, "auto"):
+        raise HTTPException(status_code=400, detail="Responses tool_choice only supports null or 'auto' in this implementation.")
+    if request.parallel_tool_calls not in (None, True):
+        raise HTTPException(status_code=400, detail="Responses parallel_tool_calls=false is not implemented yet.")
+    if request.reasoning is not None and request.reasoning.summary is not None:
+        raise HTTPException(status_code=400, detail="Responses reasoning.summary is not implemented yet.")
 
 
 async def _response_response(

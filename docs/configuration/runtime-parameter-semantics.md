@@ -1003,7 +1003,9 @@ output. The first implementation supports text input, text-only message items,
 `function_call_output` input items, function tool schemas, `reasoning.effort`,
 and non-streaming responses. `max_output_tokens` maps to
 `SamplingParams.max_tokens`; `temperature`, `top_p`, and `top_k` map directly
-to sampling parameters. `stream=true` fails explicitly until Responses SSE
+to sampling parameters. `tool_choice` is limited to `null` or `"auto"`;
+`parallel_tool_calls=false` and `reasoning.summary` fail explicitly until those
+semantics are implemented. `stream=true` fails explicitly until Responses SSE
 events are implemented.
 
 When `--reasoning-parser qwen3` is enabled, `/v1/responses` parses model output
