@@ -27,6 +27,27 @@ def _route_endpoint(app, path):
     raise AssertionError(f"route not found: {path}")
 
 
+def _response_sse_events(chunks):
+    text = "".join(chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk for chunk in chunks)
+    events = []
+    for frame in text.split("\n\n"):
+        if not frame:
+            continue
+        lines = frame.splitlines()
+        data_lines = [line for line in lines if line.startswith("data: ")]
+        if not data_lines:
+            continue
+        data = data_lines[-1].removeprefix("data: ")
+        if data == "[DONE]":
+            events.append(("[DONE]", None))
+            continue
+        event_lines = [line for line in lines if line.startswith("event: ")]
+        event_type = event_lines[-1].removeprefix("event: ") if event_lines else None
+        payload = json.loads(data)
+        events.append((event_type, payload))
+    return events
+
+
 @unittest.skipIf(
     importlib.util.find_spec("fastapi") is None or importlib.util.find_spec("pydantic") is None,
     "OpenAI API server dependencies are not installed",
@@ -865,6 +886,7 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
                 completion_token_logprobs=[],
                 completion_top_logprobs=[],
                 emitted_text_len=1,
+                emitted_raw_text_len=1,
             )
         }
         try:
@@ -874,6 +896,7 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
             dispatcher.close()
 
         self.assertEqual(item["text"], "b")
+        self.assertEqual(item["raw_text_delta"], "b")
         self.assertEqual(active[7].completion_token_ids, [1, 2])
 
     async def test_streaming_finish_log_includes_tps_metrics(self):
@@ -965,6 +988,7 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
                 completion_token_logprobs=[],
                 completion_top_logprobs=[],
                 emitted_text_len=0,
+                emitted_raw_text_len=1,
             )
         }
         try:
@@ -1286,22 +1310,296 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response["output"][0]["text"], "reason")
         self.assertEqual(response["output"][1]["content"][0]["text"], "answer")
 
-    async def test_response_stream_true_fails_explicitly(self):
-        from fastapi import HTTPException
-
-        from sparsevllm.entrypoints.openai.api_server import ResponseRequest
+    async def test_response_stream_true_returns_responses_sse(self):
+        from sparsevllm.entrypoints.openai.api_server import RequestHandle, ResponseRequest
         from sparsevllm.entrypoints.openai.serving.responses import serve_response
 
-        with self.assertRaises(HTTPException) as ctx:
-            await serve_response(
+        queue = asyncio.Queue()
+        await queue.put(
+            {
+                "type": "token",
+                "index": 0,
+                "text": "hel",
+                "token_ids": [1],
+                "token_logprobs": [None],
+                "top_logprobs": [None],
+            }
+        )
+        await queue.put(
+            {
+                "type": "final",
+                "index": 0,
+                "text": "hello",
+                "finish_reason": "stop",
+                "prompt_tokens": 4,
+                "completion_tokens": 2,
+                "token_ids": [1, 2],
+                "token_logprobs": [None, None],
+                "top_logprobs": [None, None],
+            }
+        )
+
+        class Dispatcher:
+            async def submit(self, prompt, _sampling_params, index, stop):
+                self.prompt = prompt
+                self.index = index
+                self.stop = stop
+                return RequestHandle(output_queue=queue, cancelled=threading.Event())
+
+            def cancel(self, _handle):
+                raise AssertionError("finished response stream should not be cancelled")
+
+        class Tokenizer:
+            chat_template = None
+
+        response = await serve_response(
+            ResponseRequest(model="model", input="hello", stream=True),
+            dispatcher=Dispatcher(),
+            tokenizer=Tokenizer(),
+            served_model_name="model",
+            request_log_path=None,
+            reasoning_parser_name=None,
+        )
+        chunks = [chunk async for chunk in response.body_iterator]
+        events = _response_sse_events(chunks)
+        event_types = [event for event, _payload in events]
+
+        self.assertEqual(response.media_type, "text/event-stream")
+        self.assertIn("response.created", event_types)
+        self.assertIn("response.output_item.added", event_types)
+        self.assertIn("response.content_part.added", event_types)
+        self.assertIn("response.output_text.delta", event_types)
+        self.assertIn("response.output_text.done", event_types)
+        self.assertIn("response.content_part.done", event_types)
+        self.assertIn("response.output_item.done", event_types)
+        self.assertEqual(event_types[-2:], ["response.completed", "[DONE]"])
+        completed = events[-2][1]["response"]
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(completed["output"][0]["content"][0]["text"], "hello")
+        self.assertEqual(completed["usage"], {"input_tokens": 4, "output_tokens": 2, "total_tokens": 6})
+
+    async def test_response_stream_qwen3_reasoning_uses_raw_delta(self):
+        from sparsevllm.entrypoints.openai.api_server import RequestHandle, ResponseRequest, _response_stream
+
+        queue = asyncio.Queue()
+        for delta in ["<thi", "nk>rea", "son</thi", "nk>answer"]:
+            await queue.put(
+                {
+                    "type": "token",
+                    "index": 0,
+                    "text": "",
+                    "raw_text_delta": delta,
+                    "token_ids": [1],
+                    "token_logprobs": [None],
+                    "top_logprobs": [None],
+                }
+            )
+        await queue.put(
+            {
+                "type": "final",
+                "index": 0,
+                "text": "answer",
+                "raw_text": "<think>reason</think>answer",
+                "finish_reason": "stop",
+                "prompt_tokens": 3,
+                "completion_tokens": 4,
+                "token_ids": [1, 2, 3, 4],
+                "token_logprobs": [None, None, None, None],
+                "top_logprobs": [None, None, None, None],
+            }
+        )
+
+        class Dispatcher:
+            def cancel(self, _handle):
+                raise AssertionError("finished response stream should not be cancelled")
+
+        chunks = [
+            chunk
+            async for chunk in _response_stream(
+                Dispatcher(),
+                "resp_test",
+                123,
+                "model",
+                RequestHandle(output_queue=queue, cancelled=threading.Event()),
+                time.perf_counter() - 1.0,
+                None,
                 ResponseRequest(model="model", input="hello", stream=True),
-                dispatcher=object(),
-                tokenizer=object(),
-                served_model_name="model",
-                request_log_path=None,
+                reasoning_parser_name="qwen3",
+            )
+        ]
+
+        events = _response_sse_events(chunks)
+        reasoning_deltas = [
+            payload["delta"]
+            for event, payload in events
+            if event == "response.reasoning_text.delta"
+        ]
+        output_deltas = [
+            payload["delta"]
+            for event, payload in events
+            if event == "response.output_text.delta"
+        ]
+        completed = [payload["response"] for event, payload in events if event == "response.completed"][0]
+
+        self.assertEqual("".join(reasoning_deltas), "reason")
+        self.assertEqual("".join(output_deltas), "answer")
+        self.assertEqual(completed["output"][0]["type"], "reasoning")
+        self.assertEqual(completed["output"][1]["content"][0]["text"], "answer")
+
+    async def test_response_stream_parser_disabled_returns_raw_visible_text(self):
+        from sparsevllm.entrypoints.openai.api_server import RequestHandle, ResponseRequest, _response_stream
+
+        queue = asyncio.Queue()
+        await queue.put(
+            {
+                "type": "token",
+                "index": 0,
+                "text": "<think>reason</think>answer",
+                "raw_text_delta": "<think>reason</think>answer",
+                "token_ids": [1],
+                "token_logprobs": [None],
+                "top_logprobs": [None],
+            }
+        )
+        await queue.put(
+            {
+                "type": "final",
+                "index": 0,
+                "text": "<think>reason</think>answer",
+                "raw_text": "<think>reason</think>answer",
+                "finish_reason": "stop",
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+                "token_ids": [1],
+                "token_logprobs": [None],
+                "top_logprobs": [None],
+            }
+        )
+
+        class Dispatcher:
+            def cancel(self, _handle):
+                raise AssertionError("finished response stream should not be cancelled")
+
+        chunks = [
+            chunk
+            async for chunk in _response_stream(
+                Dispatcher(),
+                "resp_test",
+                123,
+                "model",
+                RequestHandle(output_queue=queue, cancelled=threading.Event()),
+                time.perf_counter(),
+                None,
+                ResponseRequest(model="model", input="hello", stream=True),
                 reasoning_parser_name=None,
             )
-        self.assertEqual(ctx.exception.status_code, 400)
+        ]
+
+        output_deltas = [
+            payload["delta"]
+            for event, payload in _response_sse_events(chunks)
+            if event == "response.output_text.delta"
+        ]
+        self.assertEqual("".join(output_deltas), "<think>reason</think>answer")
+
+    async def test_response_stream_reasoning_length_finishes_incomplete(self):
+        from sparsevllm.entrypoints.openai.api_server import RequestHandle, ResponseRequest, _response_stream
+
+        queue = asyncio.Queue()
+        await queue.put(
+            {
+                "type": "token",
+                "index": 0,
+                "text": "",
+                "raw_text_delta": "<think>partial",
+                "token_ids": [1, 2],
+                "token_logprobs": [None, None],
+                "top_logprobs": [None, None],
+            }
+        )
+        await queue.put(
+            {
+                "type": "final",
+                "index": 0,
+                "text": "",
+                "raw_text": "<think>partial",
+                "finish_reason": "length",
+                "prompt_tokens": 2,
+                "completion_tokens": 2,
+                "token_ids": [1, 2],
+                "token_logprobs": [None, None],
+                "top_logprobs": [None, None],
+            }
+        )
+
+        class Dispatcher:
+            def cancel(self, _handle):
+                raise AssertionError("finished response stream should not be cancelled")
+
+        events = _response_sse_events(
+            [
+                chunk
+                async for chunk in _response_stream(
+                    Dispatcher(),
+                    "resp_test",
+                    123,
+                    "model",
+                    RequestHandle(output_queue=queue, cancelled=threading.Event()),
+                    time.perf_counter(),
+                    None,
+                    ResponseRequest(model="model", input="hello", stream=True),
+                    reasoning_parser_name="qwen3",
+                )
+            ]
+        )
+
+        completed = [payload["response"] for event, payload in events if event == "response.completed"][0]
+        self.assertEqual(completed["status"], "incomplete")
+        self.assertEqual(completed["incomplete_details"], {"reason": "max_output_tokens"})
+        self.assertEqual(completed["output"][0]["text"], "partial")
+
+    async def test_response_stream_unclosed_reasoning_stop_fails_fast(self):
+        from sparsevllm.entrypoints.openai.api_server import RequestHandle, ResponseRequest, _response_stream
+
+        queue = asyncio.Queue()
+        await queue.put(
+            {
+                "type": "final",
+                "index": 0,
+                "text": "",
+                "raw_text": "<think>partial",
+                "finish_reason": "stop",
+                "prompt_tokens": 2,
+                "completion_tokens": 1,
+            }
+        )
+
+        cancelled = threading.Event()
+
+        class Dispatcher:
+            def cancel(self, _handle):
+                cancelled.set()
+
+        events = _response_sse_events(
+            [
+                chunk
+                async for chunk in _response_stream(
+                    Dispatcher(),
+                    "resp_test",
+                    123,
+                    "model",
+                    RequestHandle(output_queue=queue, cancelled=threading.Event()),
+                    time.perf_counter(),
+                    None,
+                    ResponseRequest(model="model", input="hello", stream=True),
+                    reasoning_parser_name="qwen3",
+                )
+            ]
+        )
+
+        failed = [payload for event, payload in events if event == "response.failed"][0]
+        self.assertIn("did not close", failed["error"]["message"])
+        self.assertTrue(cancelled.is_set())
 
     def test_response_route_returns_non_streaming_response(self):
         from fastapi.testclient import TestClient
@@ -1433,6 +1731,213 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(ToolCallParseError):
             _response_output_items('<tool_call>{"name":</tool_call>', "stop", reasoning_parser_name=None)
+
+    def test_qwen3_reasoning_stream_parser_handles_split_tags(self):
+        from sparsevllm.entrypoints.openai.responses.reasoning import get_reasoning_stream_parser
+
+        parser = get_reasoning_stream_parser("qwen3")
+        events = []
+        for delta in ["<thi", "nk>rea", "son</thi", "nk>\n\nanswer<|im_end|>"]:
+            events.extend(parser.feed(delta))
+        events.extend(parser.finish("stop"))
+
+        reasoning = "".join(event.text for event in events if event.kind == "reasoning_delta")
+        answer = "".join(event.text for event in events if event.kind == "answer_delta")
+
+        self.assertEqual(reasoning, "reason")
+        self.assertEqual(answer, "answer")
+        self.assertIn("reasoning_done", [event.kind for event in events])
+
+    def test_qwen3_reasoning_stream_parser_rejects_unclosed_stop(self):
+        from sparsevllm.entrypoints.openai.responses.reasoning import ReasoningParseError
+        from sparsevllm.entrypoints.openai.responses.reasoning import get_reasoning_stream_parser
+
+        parser = get_reasoning_stream_parser("qwen3")
+        parser.feed("<think>partial")
+
+        with self.assertRaises(ReasoningParseError):
+            parser.finish("stop")
+
+    def test_qwen3_tool_call_stream_parser_handles_split_json(self):
+        from sparsevllm.entrypoints.openai.responses.tools import ToolCallStreamParser
+
+        parser = ToolCallStreamParser()
+        events = []
+        for delta in [
+            "<tool_",
+            'call>{"name":"get_weather",',
+            '"arguments":{"city":"Paris"}}</tool_call>',
+        ]:
+            events.extend(parser.feed(delta))
+        events.extend(parser.finish("stop"))
+
+        self.assertEqual([event.kind for event in events], [
+            "tool_call_started",
+            "tool_call_arguments_delta",
+            "tool_call_done",
+        ])
+        self.assertEqual(events[0].name, "get_weather")
+        self.assertEqual(events[1].arguments_delta, '{"city":"Paris"}')
+
+    def test_qwen3_tool_call_stream_parser_fails_malformed_json(self):
+        from sparsevllm.entrypoints.openai.responses.tools import ToolCallParseError
+        from sparsevllm.entrypoints.openai.responses.tools import ToolCallStreamParser
+
+        parser = ToolCallStreamParser()
+
+        with self.assertRaises(ToolCallParseError):
+            parser.feed('<tool_call>{"name":</tool_call>')
+
+    async def test_response_stream_tool_call_outputs_function_events(self):
+        from sparsevllm.entrypoints.openai.api_server import RequestHandle, ResponseRequest, _response_stream
+
+        queue = asyncio.Queue()
+        await queue.put(
+            {
+                "type": "token",
+                "index": 0,
+                "text": '<tool_call>{"name":"get_weather","arguments":{"city":"Paris"}}</tool_call>',
+                "raw_text_delta": '<tool_call>{"name":"get_weather","arguments":{"city":"Paris"}}</tool_call>',
+                "token_ids": [1],
+                "token_logprobs": [None],
+                "top_logprobs": [None],
+            }
+        )
+        await queue.put(
+            {
+                "type": "final",
+                "index": 0,
+                "text": '<tool_call>{"name":"get_weather","arguments":{"city":"Paris"}}</tool_call>',
+                "finish_reason": "stop",
+                "prompt_tokens": 3,
+                "completion_tokens": 1,
+                "token_ids": [1],
+                "token_logprobs": [None],
+                "top_logprobs": [None],
+            }
+        )
+
+        class Dispatcher:
+            def cancel(self, _handle):
+                raise AssertionError("finished response stream should not be cancelled")
+
+        events = _response_sse_events(
+            [
+                chunk
+                async for chunk in _response_stream(
+                    Dispatcher(),
+                    "resp_test",
+                    123,
+                    "model",
+                    RequestHandle(output_queue=queue, cancelled=threading.Event()),
+                    time.perf_counter(),
+                    None,
+                    ResponseRequest(model="model", input="hello", stream=True),
+                    reasoning_parser_name=None,
+                )
+            ]
+        )
+        event_types = [event for event, _payload in events]
+        completed = [payload["response"] for event, payload in events if event == "response.completed"][0]
+
+        self.assertIn("response.function_call_arguments.delta", event_types)
+        self.assertIn("response.function_call_arguments.done", event_types)
+        self.assertEqual(completed["output"][0]["type"], "function_call")
+        self.assertEqual(completed["output"][0]["name"], "get_weather")
+        self.assertEqual(completed["output"][0]["arguments"], '{"city":"Paris"}')
+
+    async def test_response_stream_reasoning_then_tool_call(self):
+        from sparsevllm.entrypoints.openai.api_server import RequestHandle, ResponseRequest, _response_stream
+
+        raw = '<think>reason</think><tool_call>{"name":"get_weather","arguments":{"city":"Paris"}}</tool_call>'
+        queue = asyncio.Queue()
+        for delta in ["<think>reason</think><tool_", 'call>{"name":"get_weather","arguments":{"city":"Paris"}}</tool_call>']:
+            await queue.put(
+                {
+                    "type": "token",
+                    "index": 0,
+                    "text": "",
+                    "raw_text_delta": delta,
+                    "token_ids": [1],
+                    "token_logprobs": [None],
+                    "top_logprobs": [None],
+                }
+            )
+        await queue.put(
+            {
+                "type": "final",
+                "index": 0,
+                "text": "",
+                "raw_text": raw,
+                "finish_reason": "stop",
+                "prompt_tokens": 3,
+                "completion_tokens": 2,
+                "token_ids": [1, 2],
+                "token_logprobs": [None, None],
+                "top_logprobs": [None, None],
+            }
+        )
+
+        class Dispatcher:
+            def cancel(self, _handle):
+                raise AssertionError("finished response stream should not be cancelled")
+
+        events = _response_sse_events(
+            [
+                chunk
+                async for chunk in _response_stream(
+                    Dispatcher(),
+                    "resp_test",
+                    123,
+                    "model",
+                    RequestHandle(output_queue=queue, cancelled=threading.Event()),
+                    time.perf_counter(),
+                    None,
+                    ResponseRequest(model="model", input="hello", stream=True),
+                    reasoning_parser_name="qwen3",
+                )
+            ]
+        )
+        completed = [payload["response"] for event, payload in events if event == "response.completed"][0]
+
+        self.assertEqual([item["type"] for item in completed["output"]], ["reasoning", "function_call"])
+        self.assertEqual(completed["output"][0]["text"], "reason")
+        self.assertEqual(completed["output"][1]["arguments"], '{"city":"Paris"}')
+
+    async def test_response_stream_cancel_releases_dispatcher_request(self):
+        from sparsevllm.entrypoints.openai.api_server import RequestHandle, ResponseRequest, _response_stream
+
+        queue = asyncio.Queue()
+        handle = RequestHandle(output_queue=queue, cancelled=threading.Event())
+        cancelled = threading.Event()
+        outer = self
+
+        class Dispatcher:
+            def cancel(self, observed_handle):
+                outer.assertIs(observed_handle, handle)
+                cancelled.set()
+
+        stream = _response_stream(
+            Dispatcher(),
+            "resp_test",
+            123,
+            "model",
+            handle,
+            time.perf_counter(),
+            None,
+            ResponseRequest(model="model", input="hello", stream=True),
+            reasoning_parser_name=None,
+        )
+
+        first = await stream.__anext__()
+        self.assertIn("response.created", first)
+        pending = asyncio.create_task(stream.__anext__())
+        await asyncio.sleep(0)
+        pending.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await pending
+
+        self.assertTrue(cancelled.is_set())
 
     async def test_prefix_cache_match_accepts_response_selector(self):
         from sparsevllm.entrypoints.openai import api_server

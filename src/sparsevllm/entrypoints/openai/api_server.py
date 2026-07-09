@@ -60,6 +60,7 @@ from sparsevllm.entrypoints.openai.serving.prefix_cache import _prefix_cache_tok
 from sparsevllm.entrypoints.openai.serving.prefix_cache import _run_prefix_cache_control
 from sparsevllm.entrypoints.openai.serving.responses import _response_output_items
 from sparsevllm.entrypoints.openai.serving.responses import _response_response
+from sparsevllm.entrypoints.openai.serving.responses import _response_stream
 from sparsevllm.entrypoints.openai.serving.responses import _validate_response_request
 from sparsevllm.entrypoints.openai.serving.worker import _worker_tags
 from sparsevllm.llm import LLM

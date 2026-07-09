@@ -43,6 +43,7 @@ class _ActiveRequest:
     completion_token_logprobs: list[float | None]
     completion_top_logprobs: list[dict[int, float] | None]
     emitted_text_len: int = 0
+    emitted_raw_text_len: int = 0
 
 
 @dataclass
@@ -262,6 +263,12 @@ class AsyncEngineDispatcher:
             request.completion_token_ids.extend(token_ids)
             request.completion_token_logprobs.extend(token_logprobs)
             request.completion_top_logprobs.extend(top_logprobs)
+            raw_full_text = self.engine.tokenizer.decode(
+                request.completion_token_ids,
+                skip_special_tokens=False,
+            )
+            raw_text_delta = raw_full_text[request.emitted_raw_text_len:]
+            request.emitted_raw_text_len = len(raw_full_text)
             full_text = self.engine.tokenizer.decode(request.completion_token_ids, skip_special_tokens=True)
             stop_index = _find_stop_index(full_text, request.stop)
             visible_text = full_text if stop_index is None else full_text[:stop_index]
@@ -272,13 +279,14 @@ class AsyncEngineDispatcher:
             )
             text = visible_text[request.emitted_text_len:emit_len]
             request.emitted_text_len = emit_len
-            if text:
+            if text or (stop_index is None and raw_text_delta):
                 self._put(
                     request,
                     {
                         "type": "token",
                         "index": request.index,
                         "text": text,
+                        "raw_text_delta": raw_text_delta,
                         "token_ids": token_ids,
                         "token_logprobs": token_logprobs,
                         "top_logprobs": top_logprobs,

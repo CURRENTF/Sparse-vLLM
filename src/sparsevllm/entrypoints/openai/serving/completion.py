@@ -199,6 +199,8 @@ async def _completion_stream(
                     continue
                 if item["type"] == "token":
                     completion_tokens += len(item["token_ids"])
+                    if not item["text"]:
+                        continue
                     yield _sse(
                         {
                             "id": request_id,

@@ -249,6 +249,8 @@ async def _chat_completion_stream(
                     continue
                 if item["type"] == "token":
                     completion_tokens += len(item["token_ids"])
+                    if not item["text"]:
+                        continue
                     delta: dict[str, Any] = {"content": item["text"]}
                     if first_chunk:
                         delta["role"] = "assistant"
