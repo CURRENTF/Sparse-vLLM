@@ -1341,6 +1341,20 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(output[0]["text"], "reason")
         self.assertEqual(output[1]["content"][0]["text"], "answer")
 
+    def test_qwen3_reasoning_parser_handles_template_opened_think(self):
+        from sparsevllm.entrypoints.openai.api_server import _response_output_items
+
+        output, incomplete = _response_output_items(
+            "reason</think>\n\nanswer<|im_end|>",
+            "stop",
+            reasoning_parser_name="qwen3",
+        )
+
+        self.assertFalse(incomplete)
+        self.assertEqual(output[0]["type"], "reasoning")
+        self.assertEqual(output[0]["text"], "reason")
+        self.assertEqual(output[1]["content"][0]["text"], "answer")
+
     def test_qwen3_reasoning_parser_handles_incomplete_length(self):
         from sparsevllm.entrypoints.openai.api_server import _response_output_items
 
