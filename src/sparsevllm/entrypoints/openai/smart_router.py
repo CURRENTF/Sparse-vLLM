@@ -138,6 +138,10 @@ def create_app(
     async def chat_completions(request: Request):
         return await router.route_openai_request("/v1/chat/completions", await request.json())
 
+    @app.post("/v1/responses")
+    async def responses(request: Request):
+        return await router.route_openai_request("/v1/responses", await request.json())
+
     @app.post("/v1/prefix_cache/inspect")
     async def prefix_cache_inspect(request: Request):
         payload = await request.json()
@@ -492,6 +496,8 @@ def infer_route_profile(endpoint: str, payload: dict[str, Any]) -> str:
 
 
 def match_payload_for_request(endpoint: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+    if endpoint == "/v1/responses":
+        return {"response": payload}
     if endpoint == "/v1/chat/completions":
         messages = payload.get("messages")
         if isinstance(messages, list) and messages:
