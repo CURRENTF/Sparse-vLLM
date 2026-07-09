@@ -2,6 +2,7 @@ import json
 import re
 from dataclasses import dataclass
 from typing import Any
+from typing import Literal
 
 
 class ToolCallParseError(ValueError):
@@ -14,7 +15,21 @@ class ParsedToolCall:
     arguments: str
 
 
+@dataclass(frozen=True)
+class ToolCallStreamEvent:
+    kind: Literal[
+        "tool_call_started",
+        "tool_call_arguments_delta",
+        "tool_call_done",
+        "answer_delta",
+    ]
+    name: str | None = None
+    arguments_delta: str = ""
+    text: str = ""
+
+
 _TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
+_TOOL_STARTS = ("<tool_call>", "<tool_calls>")
 
 
 def normalize_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
@@ -121,3 +136,97 @@ def _parse_tool_call_object(data: Any) -> ParsedToolCall:
     else:
         raise ToolCallParseError("tool call arguments must be a JSON object or JSON string.")
     return ParsedToolCall(name=name, arguments=arguments_text)
+
+
+class ToolCallStreamParser:
+    def __init__(self):
+        self._state = "content"
+        self._buffer = ""
+
+    def feed(self, text_delta: str) -> list[ToolCallStreamEvent]:
+        if not text_delta:
+            return []
+        if self._state == "answer":
+            return [ToolCallStreamEvent("answer_delta", text=text_delta)]
+        if self._state == "content":
+            return self._feed_content(text_delta)
+        if self._state == "tool":
+            self._buffer += text_delta
+            return self._try_finish_tool_call()
+        if self._state == "done":
+            if text_delta.strip():
+                raise ToolCallParseError("tool call output contains text after completed tool call.")
+            return []
+        raise AssertionError(f"unknown tool call stream state {self._state!r}")
+
+    def finish(self, finish_reason: str | None) -> list[ToolCallStreamEvent]:
+        del finish_reason
+        if self._state == "content":
+            text = self._buffer
+            self._buffer = ""
+            self._state = "answer"
+            return [ToolCallStreamEvent("answer_delta", text=text)] if text else []
+        if self._state == "tool":
+            events = self._try_finish_tool_call()
+            if self._state != "done":
+                raise ToolCallParseError("tool call output ended before closing tool call tag.")
+            return events
+        return []
+
+    def _feed_content(self, text_delta: str) -> list[ToolCallStreamEvent]:
+        self._buffer += text_delta
+        stripped = self._buffer.lstrip()
+        if not stripped:
+            return []
+        if stripped.startswith(_TOOL_STARTS):
+            self._buffer = stripped
+            self._state = "tool"
+            return self._try_finish_tool_call()
+        if any(start.startswith(stripped) for start in _TOOL_STARTS):
+            return []
+        text = self._buffer
+        self._buffer = ""
+        self._state = "answer"
+        return [ToolCallStreamEvent("answer_delta", text=text)]
+
+    def _try_finish_tool_call(self) -> list[ToolCallStreamEvent]:
+        if self._buffer.startswith("<tool_calls>"):
+            end = self._buffer.find("</tool_calls>")
+            if end < 0:
+                return []
+            tail = self._buffer[end + len("</tool_calls>"):].strip()
+            if tail:
+                raise ToolCallParseError("tool call output contains text outside <tool_calls>.")
+            calls = parse_tool_calls(self._buffer)
+            self._buffer = ""
+            self._state = "done"
+            return _tool_call_stream_events(calls or [])
+
+        matches = list(_TOOL_CALL_RE.finditer(self._buffer))
+        if not matches:
+            return []
+        tail = self._buffer[matches[-1].end():].strip()
+        if tail:
+            if any(start.startswith(tail) for start in _TOOL_STARTS):
+                return []
+            raise ToolCallParseError("tool call output contains text outside <tool_call> blocks.")
+        calls = parse_tool_calls(self._buffer)
+        self._buffer = ""
+        self._state = "done"
+        return _tool_call_stream_events(calls or [])
+
+
+def _tool_call_stream_events(calls: list[ParsedToolCall]) -> list[ToolCallStreamEvent]:
+    events: list[ToolCallStreamEvent] = []
+    for call in calls:
+        events.append(ToolCallStreamEvent("tool_call_started", name=call.name))
+        if call.arguments:
+            events.append(
+                ToolCallStreamEvent(
+                    "tool_call_arguments_delta",
+                    name=call.name,
+                    arguments_delta=call.arguments,
+                )
+            )
+        events.append(ToolCallStreamEvent("tool_call_done", name=call.name))
+    return events
