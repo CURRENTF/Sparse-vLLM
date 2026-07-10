@@ -51,9 +51,12 @@ from sparsevllm.entrypoints.openai.serving.base import _tokens_per_second
 from sparsevllm.entrypoints.openai.serving.base import _wait_final
 from sparsevllm.entrypoints.openai.serving.base import _write_request_log
 from sparsevllm.entrypoints.openai.serving.chat import _chat_completion_response
+from sparsevllm.entrypoints.openai.serving.chat import _chat_message
 from sparsevllm.entrypoints.openai.serving.chat import _chat_completion_stream
 from sparsevllm.entrypoints.openai.serving.chat import _stream_include_usage
 from sparsevllm.entrypoints.openai.serving.chat import _validate_chat_request
+from sparsevllm.entrypoints.openai.serving.chat_parsing import ParsedChatOutput
+from sparsevllm.entrypoints.openai.serving.chat_parsing import parse_chat_output
 from sparsevllm.entrypoints.openai.serving.completion import _completion_response
 from sparsevllm.entrypoints.openai.serving.completion import _completion_stream
 from sparsevllm.entrypoints.openai.serving.completion import _validate_request

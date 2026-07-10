@@ -16,4 +16,5 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         request.app.state.engine.tokenizer,
         request.app.state.served_model_name,
         request.app.state.request_log_dir,
+        request.app.state.reasoning_parser,
     )

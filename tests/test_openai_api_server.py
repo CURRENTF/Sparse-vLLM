@@ -2017,6 +2017,209 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response["choices"][0]["message"], {"role": "assistant", "content": "hello"})
         self.assertEqual(response["usage"], {"prompt_tokens": 4, "completion_tokens": 1, "total_tokens": 5})
 
+    async def test_chat_completion_parses_qwen3_reasoning(self):
+        from sparsevllm.entrypoints.openai.api_server import RequestHandle, _chat_completion_response
+
+        queue = asyncio.Queue()
+        await queue.put(
+            {
+                "type": "final",
+                "index": 0,
+                "text": "answer",
+                "raw_text": "reason</think>\n\nanswer<|im_end|>",
+                "finish_reason": "stop",
+                "prompt_tokens": 4,
+                "completion_tokens": 3,
+                "token_ids": [1, 2, 3],
+                "token_logprobs": [None, None, None],
+                "top_logprobs": [None, None, None],
+            }
+        )
+
+        response = await _chat_completion_response(
+            "chatcmpl-test",
+            123,
+            "model",
+            [RequestHandle(output_queue=queue, cancelled=threading.Event())],
+            reasoning_parser_name="qwen3",
+        )
+
+        choice = response["choices"][0]
+        self.assertEqual(choice["message"]["reasoning_content"], "reason")
+        self.assertEqual(choice["message"]["content"], "answer")
+        self.assertEqual(choice["finish_reason"], "stop")
+
+    async def test_chat_completion_parses_reasoning_and_tool_calls(self):
+        from sparsevllm.entrypoints.openai.api_server import RequestHandle, _chat_completion_response
+
+        raw_text = (
+            "<think>need weather</think>"
+            '<tool_call>{"name":"get_weather","arguments":{"city":"Paris"}}</tool_call>'
+        )
+        queue = asyncio.Queue()
+        await queue.put(
+            {
+                "type": "final",
+                "index": 0,
+                "text": raw_text,
+                "raw_text": raw_text,
+                "finish_reason": "stop",
+                "prompt_tokens": 4,
+                "completion_tokens": 5,
+                "token_ids": [1, 2, 3, 4, 5],
+                "token_logprobs": [None] * 5,
+                "top_logprobs": [None] * 5,
+            }
+        )
+
+        response = await _chat_completion_response(
+            "chatcmpl-test",
+            123,
+            "model",
+            [RequestHandle(output_queue=queue, cancelled=threading.Event())],
+            reasoning_parser_name="qwen3",
+            parse_tools=True,
+        )
+
+        choice = response["choices"][0]
+        message = choice["message"]
+        self.assertEqual(message["reasoning_content"], "need weather")
+        self.assertIsNone(message["content"])
+        self.assertTrue(message["tool_calls"][0]["id"].startswith("call_"))
+        self.assertEqual(message["tool_calls"][0]["function"]["name"], "get_weather")
+        self.assertEqual(message["tool_calls"][0]["function"]["arguments"], '{"city":"Paris"}')
+        self.assertEqual(choice["finish_reason"], "tool_calls")
+
+    async def test_chat_completion_parses_multiple_tool_calls(self):
+        from sparsevllm.entrypoints.openai.api_server import RequestHandle, _chat_completion_response
+
+        text = (
+            '<tool_call>{"name":"first","arguments":{"x":1}}</tool_call>'
+            '<tool_call>{"name":"second","arguments":{"y":2}}</tool_call>'
+        )
+        queue = asyncio.Queue()
+        await queue.put(
+            {
+                "type": "final",
+                "index": 0,
+                "text": text,
+                "finish_reason": "stop",
+                "prompt_tokens": 1,
+                "completion_tokens": 2,
+                "token_ids": [1, 2],
+                "token_logprobs": [None, None],
+                "top_logprobs": [None, None],
+            }
+        )
+
+        response = await _chat_completion_response(
+            "chatcmpl-test",
+            123,
+            "model",
+            [RequestHandle(output_queue=queue, cancelled=threading.Event())],
+            parse_tools=True,
+        )
+
+        calls = response["choices"][0]["message"]["tool_calls"]
+        self.assertEqual([call["function"]["name"] for call in calls], ["first", "second"])
+
+    async def test_chat_completion_reasoning_length_remains_explicit(self):
+        from sparsevllm.entrypoints.openai.api_server import RequestHandle, _chat_completion_response
+
+        queue = asyncio.Queue()
+        await queue.put(
+            {
+                "type": "final",
+                "index": 0,
+                "text": "",
+                "raw_text": "<think>partial",
+                "finish_reason": "length",
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+                "token_ids": [1],
+                "token_logprobs": [None],
+                "top_logprobs": [None],
+            }
+        )
+
+        response = await _chat_completion_response(
+            "chatcmpl-test",
+            123,
+            "model",
+            [RequestHandle(output_queue=queue, cancelled=threading.Event())],
+            reasoning_parser_name="qwen3",
+        )
+
+        choice = response["choices"][0]
+        self.assertEqual(choice["message"]["reasoning_content"], "partial")
+        self.assertEqual(choice["message"]["content"], "")
+        self.assertEqual(choice["finish_reason"], "length")
+
+    async def test_chat_completion_parse_failures_are_explicit(self):
+        from fastapi import HTTPException
+
+        from sparsevllm.entrypoints.openai.api_server import RequestHandle, _chat_completion_response
+
+        async def parse(text, *, reasoning_parser_name=None, parse_tools=False):
+            queue = asyncio.Queue()
+            await queue.put(
+                {
+                    "type": "final",
+                    "index": 0,
+                    "text": text,
+                    "raw_text": text,
+                    "finish_reason": "stop",
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "token_ids": [1],
+                    "token_logprobs": [None],
+                    "top_logprobs": [None],
+                }
+            )
+            return await _chat_completion_response(
+                "chatcmpl-test",
+                123,
+                "model",
+                [RequestHandle(output_queue=queue, cancelled=threading.Event())],
+                reasoning_parser_name=reasoning_parser_name,
+                parse_tools=parse_tools,
+            )
+
+        with self.assertRaisesRegex(HTTPException, "did not close"):
+            await parse("<think>partial", reasoning_parser_name="qwen3")
+        with self.assertRaisesRegex(HTTPException, "JSON parse failed"):
+            await parse('<tool_call>{"name":</tool_call>', parse_tools=True)
+
+    def test_chat_logprobs_reject_parsed_outputs(self):
+        from fastapi import HTTPException
+
+        from sparsevllm.entrypoints.openai.api_server import ChatCompletionRequest, _validate_chat_request
+
+        base = {
+            "model": "m",
+            "messages": [{"role": "user", "content": "p"}],
+            "logprobs": True,
+        }
+        with self.assertRaisesRegex(HTTPException, "cannot be aligned"):
+            _validate_chat_request(
+                ChatCompletionRequest(**base),
+                "m",
+                reasoning_parser_name="qwen3",
+            )
+        with self.assertRaisesRegex(HTTPException, "cannot be aligned"):
+            _validate_chat_request(
+                ChatCompletionRequest(
+                    **base,
+                    tools=[
+                        {
+                            "type": "function",
+                            "function": {"name": "search", "parameters": {}},
+                        }
+                    ],
+                ),
+                "m",
+            )
+
     async def test_chat_stream_starts_with_assistant_role(self):
         from sparsevllm.entrypoints.openai import api_server
 
