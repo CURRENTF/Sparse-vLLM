@@ -867,6 +867,11 @@ The serving entrypoint has dedicated server flags:
 | `--request-log-dir` | unset | Optional directory for per-request JSON logs. |
 | `--reasoning-parser` | unset | Optional Chat Completions and Responses parser. The first supported value is `qwen3`, which parses `<think>...</think>` output into endpoint-specific Sparse-vLLM reasoning fields. |
 
+The `/v1/models` entry also advertises the engine's effective
+`max_model_len`. vLLM-compatible clients use this extension to discover the
+real context window instead of treating it as unknown. A smart router reports
+the smallest context window among healthy workers serving the same model.
+
 Additional `--kebab-case` flags are parsed as Sparse-vLLM engine kwargs. Use
 the canonical semantic keys accepted by
 `normalize_runtime_params(..., backend="sparsevllm")` for public runtime
