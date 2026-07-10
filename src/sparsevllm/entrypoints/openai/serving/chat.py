@@ -48,18 +48,18 @@ async def serve_chat_completion(
     request_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
     started = time.perf_counter()
+    sampling_params = _sampling_params_from_request(request)
     logger.info(
         "request_start id={} model={} endpoint=chat stream={} messages={} max_tokens={} temperature={} top_p={} top_k={}",
         request_id,
         request.model,
         request.stream,
         len(request.messages),
-        request.max_tokens,
+        sampling_params.max_tokens,
         request.temperature,
         request.top_p,
         request.top_k,
     )
-    sampling_params = _sampling_params_from_request(request)
     stop = _normalize_stop(request.stop)
     try:
         prompt = _chat_request_prompt(tokenizer, request)
@@ -321,80 +321,74 @@ async def _chat_completion_stream(
             {"role": "assistant"},
         )
         while pending:
-            tasks = {
-                asyncio.create_task(handle.output_queue.get()): index
-                for index, handle in pending.items()
-            }
-            done, pending_tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-            for task in pending_tasks:
-                task.cancel()
-            for task in done:
-                item = task.result()
-                if item["type"] == "error":
-                    yield _sse({"object": "error", "message": item["message"]})
-                    pending.pop(tasks[task], None)
-                    continue
-                if item["type"] == "token":
-                    completion_tokens += len(item["token_ids"])
-                    logprobs = (
-                        _chat_logprobs(
-                            tokenizer,
-                            item.get("token_ids", []),
-                            item.get("token_logprobs", []),
-                            item.get("top_logprobs", []),
-                        )
-                        if tokenizer is not None
-                        else None
+            handle = next(iter(pending.values()))
+            item = await handle.output_queue.get()
+            if item["type"] == "error":
+                yield _sse({"object": "error", "message": item["message"]})
+                pending.clear()
+                continue
+            if item["type"] == "token":
+                completion_tokens += len(item["token_ids"])
+                logprobs = (
+                    _chat_logprobs(
+                        tokenizer,
+                        item.get("token_ids", []),
+                        item.get("token_logprobs", []),
+                        item.get("top_logprobs", []),
                     )
-                    if reasoning_parser_name:
-                        text_delta = item.get("raw_text_delta", item.get("text", ""))
-                        raw_text_len += len(text_delta)
-                    else:
-                        text_delta = item.get("text", "")
-                        visible_text_len += len(text_delta)
-                    deltas = parser.feed(text_delta)
-                    if not deltas and logprobs is not None:
-                        deltas = [{"content": ""}]
-                    for delta_index, delta in enumerate(deltas):
-                        yield _chat_stream_chunk(
-                            request_id,
-                            created,
-                            model,
-                            item["index"],
-                            delta,
-                            logprobs=logprobs if delta_index == 0 else None,
-                        )
-                elif item["type"] == "final":
-                    prompt_tokens += item["prompt_tokens"]
-                    completion_tokens = max(completion_tokens, item["completion_tokens"])
-                    parser_text = (
-                        item.get("raw_text", item["text"])
-                        if reasoning_parser_name
-                        else item["text"]
-                    )
-                    consumed = raw_text_len if reasoning_parser_name else visible_text_len
-                    deltas = parser.feed(parser_text[consumed:])
-                    deltas.extend(parser.finish(item["finish_reason"]))
-                    for delta in deltas:
-                        yield _chat_stream_chunk(
-                            request_id,
-                            created,
-                            model,
-                            item["index"],
-                            delta,
-                        )
-                    finish_reason = item["finish_reason"]
-                    if parser.tools_called and finish_reason == "stop":
-                        finish_reason = "tool_calls"
+                    if tokenizer is not None
+                    else None
+                )
+                if reasoning_parser_name:
+                    text_delta = item.get("raw_text_delta", item.get("text", ""))
+                    raw_text_len += len(text_delta)
+                else:
+                    text_delta = item.get("text", "")
+                    visible_text_len += len(text_delta)
+                deltas = parser.feed(text_delta)
+                if not deltas and logprobs is not None:
+                    deltas = [{"content": ""}]
+                for delta_index, delta in enumerate(deltas):
                     yield _chat_stream_chunk(
                         request_id,
                         created,
                         model,
                         item["index"],
-                        {},
-                        finish_reason=finish_reason,
+                        delta,
+                        logprobs=logprobs if delta_index == 0 else None,
                     )
-                    pending.pop(tasks[task], None)
+                continue
+            if item["type"] == "final":
+                prompt_tokens += item["prompt_tokens"]
+                completion_tokens = max(completion_tokens, item["completion_tokens"])
+                parser_text = (
+                    item.get("raw_text", item["text"])
+                    if reasoning_parser_name
+                    else item["text"]
+                )
+                consumed = raw_text_len if reasoning_parser_name else visible_text_len
+                deltas = parser.feed(parser_text[consumed:])
+                deltas.extend(parser.finish(item["finish_reason"]))
+                for delta in deltas:
+                    yield _chat_stream_chunk(
+                        request_id,
+                        created,
+                        model,
+                        item["index"],
+                        delta,
+                    )
+                finish_reason = item["finish_reason"]
+                if parser.tools_called and finish_reason == "stop":
+                    finish_reason = "tool_calls"
+                yield _chat_stream_chunk(
+                    request_id,
+                    created,
+                    model,
+                    item["index"],
+                    {},
+                    finish_reason=finish_reason,
+                )
+                pending.clear()
         if include_usage:
             yield _sse(
                 {

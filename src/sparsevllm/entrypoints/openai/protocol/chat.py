@@ -33,6 +33,8 @@ class ChatMessage(BaseModel):
             raise ValueError("tool_call_id is only valid for tool messages.")
         if self.role == "tool" and not self.tool_call_id:
             raise ValueError("tool messages require tool_call_id.")
+        if self.role == "tool" and self.content is None:
+            raise ValueError("tool messages require content.")
         for tool_call in self.tool_calls or []:
             _validate_message_tool_call(tool_call)
         return self

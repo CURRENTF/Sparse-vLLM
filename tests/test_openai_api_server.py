@@ -424,6 +424,8 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
             ChatMessage(role="assistant", content="answer", tool_call_id="call_1")
         with self.assertRaisesRegex(ValidationError, "require tool_call_id"):
             ChatMessage(role="tool", content="result")
+        with self.assertRaisesRegex(ValidationError, "require content"):
+            ChatMessage(role="tool", tool_call_id="call_1")
         with self.assertRaisesRegex(ValidationError, "non-empty id"):
             ChatMessage(
                 role="assistant",
