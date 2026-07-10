@@ -968,6 +968,97 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         finally:
             dispatcher.close()
 
+    async def test_final_detokenizer_error_reaches_client(self):
+        from sparsevllm.entrypoints.openai.api_server import AsyncEngineDispatcher
+
+        tokenizer = _byte_level_tokenizer()
+        streamed_token_id = tokenizer.encode("a")[0]
+        mismatched_final_id = tokenizer.encode("b")[0]
+
+        class Engine:
+            def __init__(self):
+                self.tokenizer = tokenizer
+                self.last_step_token_outputs = []
+                self.last_step_logprob_outputs = []
+                self.aborted = []
+
+            def add_request(self, _prompt, _sampling_params):
+                return 7
+
+            def step(self):
+                self.last_step_token_outputs = [(7, [streamed_token_id])]
+                self.last_step_logprob_outputs = [(7, [None], [None])]
+                return [(7, [mismatched_final_id], [None], [None])], 0
+
+            def abort_request(self, seq_id):
+                self.aborted.append(seq_id)
+
+            def exit(self):
+                pass
+
+        engine = Engine()
+        dispatcher = AsyncEngineDispatcher(engine)
+        try:
+            handle = await dispatcher.submit(
+                "prompt",
+                type("Sampling", (), {"max_tokens": 1})(),
+                0,
+            )
+            token_item = await asyncio.wait_for(handle.output_queue.get(), timeout=1)
+            error_item = await asyncio.wait_for(handle.output_queue.get(), timeout=1)
+        finally:
+            dispatcher.close()
+
+        self.assertEqual(token_item["type"], "token")
+        self.assertEqual(error_item["type"], "error")
+        self.assertIn("token history mismatch", error_item["message"])
+        self.assertEqual(engine.aborted, [7])
+
+    async def test_stop_detokenizer_error_reaches_client(self):
+        from sparsevllm.entrypoints.openai.api_server import AsyncEngineDispatcher
+
+        tokenizer = _byte_level_tokenizer()
+        token_id = tokenizer.encode("a")[0]
+        tokenizer.decode = lambda _ids, skip_special_tokens=True: "different"
+
+        class Engine:
+            def __init__(self):
+                self.tokenizer = tokenizer
+                self.last_step_token_outputs = []
+                self.last_step_logprob_outputs = []
+                self.aborted = []
+
+            def add_request(self, _prompt, _sampling_params):
+                return 7
+
+            def step(self):
+                self.last_step_token_outputs = [(7, [token_id])]
+                self.last_step_logprob_outputs = [(7, [None], [None])]
+                return [], 0
+
+            def abort_request(self, seq_id):
+                self.aborted.append(seq_id)
+
+            def exit(self):
+                pass
+
+        engine = Engine()
+        dispatcher = AsyncEngineDispatcher(engine)
+        try:
+            handle = await dispatcher.submit(
+                "prompt",
+                type("Sampling", (), {"max_tokens": 2})(),
+                0,
+                ["a"],
+            )
+            error_item = await asyncio.wait_for(handle.output_queue.get(), timeout=1)
+        finally:
+            dispatcher.close()
+
+        self.assertEqual(error_item["type"], "error")
+        self.assertIn("not a prefix", error_item["message"])
+        self.assertEqual(engine.aborted, [7])
+
     async def test_dispatcher_close_times_out_blocked_step_and_exits_engine(self):
         from sparsevllm.entrypoints.openai.api_server import AsyncEngineDispatcher
 

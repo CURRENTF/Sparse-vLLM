@@ -305,9 +305,9 @@ class AsyncEngineDispatcher:
                     },
                 )
             if stop_index is not None:
+                final = request.detokenizer.finish(request.completion_token_ids)
                 active.pop(seq_id, None)
                 self.engine.abort_request(seq_id)
-                final = request.detokenizer.finish(request.completion_token_ids)
                 self._put(
                     request,
                     {
@@ -365,10 +365,11 @@ class AsyncEngineDispatcher:
         ],
     ):
         for seq_id, completion_token_ids, token_logprobs, top_logprobs in finished_outputs:
-            request = active.pop(seq_id, None)
+            request = active.get(seq_id)
             if request is None:
                 continue
             final = request.detokenizer.finish(completion_token_ids)
+            active.pop(seq_id, None)
             request.completion_token_ids = list(completion_token_ids)
             request.completion_token_logprobs = list(token_logprobs)
             request.completion_top_logprobs = list(top_logprobs)
