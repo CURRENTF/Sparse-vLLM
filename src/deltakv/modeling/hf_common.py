@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import inspect
 import os
 from typing import Optional
 
@@ -14,49 +13,6 @@ from deltakv.configs.model_config_cls import parse_full_attn_layers
 from deltakv.modeling.cache_factory import create_hf_sparse_cache, is_hf_sparse_cache_instance, set_deltakv_cache_impl
 from deltakv.modeling.compressor import create_compressor, reshape_and_apply_qk_norm
 from deltakv.modeling.token_select import omnikv_token_selection
-
-
-_MASK_ARGUMENTS = {
-    "config",
-    "inputs_embeds",
-    "input_embeds",
-    "attention_mask",
-    "cache_position",
-    "past_key_values",
-    "position_ids",
-}
-
-
-def _mask_signature(mask_factory) -> tuple[str, frozenset[str]]:
-    parameters = inspect.signature(mask_factory).parameters
-    embed_arg = None
-    for name in ("inputs_embeds", "input_embeds"):
-        if name in parameters:
-            embed_arg = name
-            break
-    if embed_arg is None:
-        raise TypeError(
-            f"{mask_factory.__name__} must accept either 'inputs_embeds' or 'input_embeds'."
-        )
-    unsupported_required = [
-        name
-        for name, parameter in parameters.items()
-        if name not in _MASK_ARGUMENTS
-        and parameter.default is inspect.Parameter.empty
-        and parameter.kind not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
-    ]
-    if unsupported_required:
-        raise TypeError(
-            f"{mask_factory.__name__} has unsupported required arguments: {unsupported_required}."
-        )
-    return embed_arg, frozenset(parameters)
-
-
-def _call_mask_factory(mask_factory, signature, inputs_embeds, mask_kwargs):
-    embed_arg, accepted_args = signature
-    kwargs = {name: value for name, value in mask_kwargs.items() if name in accepted_args}
-    kwargs[embed_arg] = inputs_embeds
-    return mask_factory(**kwargs)
 
 
 def assert_hf_bs1(input_shape: tuple[int, int], attention_mask: Optional[torch.Tensor]) -> None:
@@ -129,13 +85,6 @@ def build_inference_classes(
     use_qk_norm: bool = False,
     pass_sliding_window: bool = True,
 ):
-    causal_mask_signature = _mask_signature(create_causal_mask)
-    sliding_mask_signature = (
-        _mask_signature(create_sliding_window_causal_mask)
-        if create_sliding_window_causal_mask is not None
-        else None
-    )
-
     class AttnKVCompress(attention_cls):
         def __init__(self, config, layer_idx: int):
             super().__init__(config, layer_idx)
@@ -376,23 +325,15 @@ def build_inference_classes(
 
             mask_kwargs = {
                 "config": self.config,
+                "input_embeds": inputs_embeds,
                 "attention_mask": None,
                 "cache_position": cache_position,
                 "past_key_values": past_key_values,
                 "position_ids": position_ids,
             }
-            causal_mask_mapping = {
-                "full_attention": _call_mask_factory(
-                    create_causal_mask, causal_mask_signature, inputs_embeds, mask_kwargs
-                )
-            }
+            causal_mask_mapping = {"full_attention": create_causal_mask(**mask_kwargs)}
             if create_sliding_window_causal_mask is not None and getattr(self, "has_sliding_layers", False):
-                causal_mask_mapping["sliding_attention"] = _call_mask_factory(
-                    create_sliding_window_causal_mask,
-                    sliding_mask_signature,
-                    inputs_embeds,
-                    mask_kwargs,
-                )
+                causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
 
             hidden_states = inputs_embeds
             position_embeddings = self.rotary_emb(hidden_states, position_ids)
@@ -507,12 +448,6 @@ def build_cluster_training_classes(
     use_qk_norm: bool = False,
     pass_sliding_window: bool = True,
 ):
-    causal_mask_signature = _mask_signature(create_causal_mask)
-    sliding_mask_signature = (
-        _mask_signature(create_sliding_window_causal_mask)
-        if create_sliding_window_causal_mask is not None
-        else None
-    )
     run_mode = {"value": "comp"}
 
     class AttnKVClusterCompress(attention_cls):
@@ -726,23 +661,15 @@ def build_cluster_training_classes(
                 position_ids = cache_position.unsqueeze(0)
             mask_kwargs = {
                 "config": self.config,
+                "input_embeds": inputs_embeds,
                 "attention_mask": attention_mask,
                 "cache_position": cache_position,
                 "past_key_values": past_key_values,
                 "position_ids": position_ids,
             }
-            masks = {
-                "full_attention": _call_mask_factory(
-                    create_causal_mask, causal_mask_signature, inputs_embeds, mask_kwargs
-                )
-            }
+            masks = {"full_attention": create_causal_mask(**mask_kwargs)}
             if create_sliding_window_causal_mask is not None and getattr(self, "has_sliding_layers", False):
-                masks["sliding_attention"] = _call_mask_factory(
-                    create_sliding_window_causal_mask,
-                    sliding_mask_signature,
-                    inputs_embeds,
-                    mask_kwargs,
-                )
+                masks["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
             hidden_states = inputs_embeds
             position_embeddings = self.rotary_emb(hidden_states, position_ids)
             all_hidden_states = () if output_hidden_states else None
