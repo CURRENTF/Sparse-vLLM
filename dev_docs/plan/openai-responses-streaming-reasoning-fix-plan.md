@@ -461,6 +461,44 @@ CUDA_VISIBLE_DEVICES=<idle_gpu> sparsevllm-openai-server \
 - output item done 事件。
 - completed 或 incomplete 终止事件。
 
+### 2026-07-10 真实模型验证记录
+
+使用空闲的 GPU 0（NVIDIA H100 80GB）和
+`/data2/pretrain_models/Qwen3-4B-Thinking-2507` 完成验证。worker 监听
+`127.0.0.1:18080`，smart router 监听 `127.0.0.1:18081`；worker 使用
+`--reasoning-parser qwen3`、`gpu_memory_utilization=0.9` 和
+`max_model_len=8192`。验证结果如下：
+
+- `/health` 和 `/v1/models` 返回 200，served model 正确。
+- 非流式 thinking on 返回 completed response，output 为 reasoning item 和
+  message item，usage 为 28/390/418。
+- 非流式 thinking off 只返回 message item；64 token 上限触发显式
+  `status="incomplete"`、`reason="max_output_tokens"` 和 24/64/88 usage。
+- 确定性流式 thinking on 依次产生 reasoning item 事件、1631 字符 reasoning
+  delta、message item 事件和正文 `323`，最终 completed usage 为 24/673/697。
+- 流式 thinking off 只产生 message/output text 事件，不产生 reasoning 事件；
+  达到 token 上限时正确携带 incomplete 状态和 usage。
+- 流式工具请求产生 reasoning item 和 `function_call` item，包含
+  `response.function_call_arguments.delta/done`、output item done，参数为
+  `{"city":"Paris"}`，最终 completed usage 为 181/110/291。
+- 回填对应的 `function_call` 与 `function_call_output` 后，第二轮返回 reasoning
+  item 和最终天气 message，completed usage 为 211/206/417。
+- Chat Completions 的 `chat_template_kwargs.enable_thinking=false` 请求返回 200，
+  可见正文不包含 `<think>` 或 `</think>` 标签。
+- smart router 对 Responses SSE 原样转发，返回
+  `content-type: text/event-stream`、`x-sparsevllm-worker` 和
+  `x-sparsevllm-route-reason`；Chat Completions 和 Completions 经同一 worker
+  转发也均返回 200。
+- 客户端在 streaming 中途断开后，worker 的 waiting、decoding 和 active
+  request 数量均恢复为 0，KV cache 空闲槽恢复。
+
+该 checkpoint 的 README 明确声明它只支持 thinking mode。因此
+`reasoning.effort="none"` 和 `enable_thinking=false` 在本次验证中只能确认 API
+映射、输出结构、标签可见性和终止状态，不能证明模型语义上停止自然语言推导。
+特别是关闭 Responses reasoning parser 后的工具请求，模型仍生成思考正文、
+`</think>` 和 `<tool_call>`，服务端按 fail-visible 原则将其保留为 message；真实
+tool-call 事件验收使用该模型支持的默认 thinking mode 完成。
+
 ## 完成标准
 
 - `stream=true` 不再返回 “Responses streaming is not implemented yet.”
