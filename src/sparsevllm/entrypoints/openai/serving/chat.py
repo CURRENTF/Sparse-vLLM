@@ -25,6 +25,7 @@ from sparsevllm.entrypoints.openai.serving.base import _sse
 from sparsevllm.entrypoints.openai.serving.base import _tokens_per_second
 from sparsevllm.entrypoints.openai.serving.base import _wait_final
 from sparsevllm.entrypoints.openai.serving.base import _write_request_log
+from sparsevllm.entrypoints.openai.serving.chat_parsing import ChatStreamParser
 from sparsevllm.entrypoints.openai.serving.chat_parsing import ParsedChatOutput
 from sparsevllm.entrypoints.openai.serving.chat_parsing import parse_chat_output
 from sparsevllm.utils.log import logger
@@ -62,6 +63,7 @@ async def serve_chat_completion(
     stop = _normalize_stop(request.stop)
     try:
         prompt = _chat_request_prompt(tokenizer, request)
+        chat_tools = resolve_chat_tools(request)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if request.stream:
@@ -88,6 +90,12 @@ async def serve_chat_completion(
                 started,
                 tokenizer,
                 _stream_include_usage(request.stream_options),
+                reasoning_parser_name=reasoning_parser_name,
+                parse_tools=bool(chat_tools),
+                buffer_initial_reasoning=_buffer_initial_chat_reasoning(
+                    request,
+                    reasoning_parser_name,
+                ),
             ),
             media_type="text/event-stream",
         )
@@ -100,7 +108,7 @@ async def serve_chat_completion(
             handles,
             tokenizer,
             reasoning_parser_name=reasoning_parser_name,
-            parse_tools=bool(resolve_chat_tools(request)),
+            parse_tools=bool(chat_tools),
         )
     except asyncio.CancelledError:
         dispatcher.cancel(handle)
@@ -231,7 +239,11 @@ async def _chat_completion_response(
                 )
                 if tokenizer is not None
                 else None,
-                "finish_reason": "tool_calls" if parsed.tool_calls else final["finish_reason"],
+                "finish_reason": (
+                    "tool_calls"
+                    if parsed.tool_calls and final["finish_reason"] == "stop"
+                    else final["finish_reason"]
+                ),
             }
         ],
         "usage": {
@@ -264,6 +276,16 @@ def _chat_message(parsed: ParsedChatOutput) -> dict[str, Any]:
     return message
 
 
+def _buffer_initial_chat_reasoning(
+    request: ChatCompletionRequest,
+    reasoning_parser_name: str | None,
+) -> bool:
+    if reasoning_parser_name != "qwen3":
+        return False
+    kwargs = resolve_chat_template_kwargs(request) or {}
+    return kwargs.get("enable_thinking") is not False
+
+
 async def _chat_completion_stream(
     dispatcher: AsyncEngineDispatcher,
     request_id: str,
@@ -273,27 +295,30 @@ async def _chat_completion_stream(
     started: float | None = None,
     tokenizer: Any | None = None,
     include_usage: bool = False,
+    *,
+    reasoning_parser_name: str | None = None,
+    parse_tools: bool = False,
+    buffer_initial_reasoning: bool = False,
 ):
+    if len(handles) != 1:
+        raise HTTPException(status_code=500, detail="chat completions expects exactly one request handle.")
     pending = {index: handle for index, handle in enumerate(handles)}
+    parser = ChatStreamParser(
+        reasoning_parser_name=reasoning_parser_name,
+        parse_tools=parse_tools,
+        buffer_initial_reasoning=buffer_initial_reasoning,
+    )
     prompt_tokens = 0
     completion_tokens = 0
-    first_chunk = False
+    raw_text_len = 0
+    visible_text_len = 0
     try:
-        yield _sse(
-            {
-                "id": request_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": model,
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": {"role": "assistant"},
-                        "logprobs": None,
-                        "finish_reason": None,
-                    }
-                ],
-            }
+        yield _chat_stream_chunk(
+            request_id,
+            created,
+            model,
+            0,
+            {"role": "assistant"},
         )
         while pending:
             tasks = {
@@ -321,68 +346,53 @@ async def _chat_completion_stream(
                         if tokenizer is not None
                         else None
                     )
-                    if not item["text"] and logprobs is None:
-                        continue
-                    delta: dict[str, Any] = {"content": item["text"]}
-                    if first_chunk:
-                        delta["role"] = "assistant"
-                        first_chunk = False
-                    yield _sse(
-                        {
-                            "id": request_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": model,
-                            "choices": [
-                                {
-                                    "index": item["index"],
-                                    "delta": delta,
-                                    "logprobs": logprobs,
-                                    "finish_reason": None,
-                                }
-                            ],
-                        }
-                    )
+                    if reasoning_parser_name:
+                        text_delta = item.get("raw_text_delta", item.get("text", ""))
+                        raw_text_len += len(text_delta)
+                    else:
+                        text_delta = item.get("text", "")
+                        visible_text_len += len(text_delta)
+                    deltas = parser.feed(text_delta)
+                    if not deltas and logprobs is not None:
+                        deltas = [{"content": ""}]
+                    for delta_index, delta in enumerate(deltas):
+                        yield _chat_stream_chunk(
+                            request_id,
+                            created,
+                            model,
+                            item["index"],
+                            delta,
+                            logprobs=logprobs if delta_index == 0 else None,
+                        )
                 elif item["type"] == "final":
                     prompt_tokens += item["prompt_tokens"]
                     completion_tokens = max(completion_tokens, item["completion_tokens"])
-                    text_delta = item.get("text_delta", "")
-                    if text_delta:
-                        delta = {"content": text_delta}
-                        if first_chunk:
-                            delta["role"] = "assistant"
-                            first_chunk = False
-                        yield _sse(
-                            {
-                                "id": request_id,
-                                "object": "chat.completion.chunk",
-                                "created": created,
-                                "model": model,
-                                "choices": [
-                                    {
-                                        "index": item["index"],
-                                        "delta": delta,
-                                        "logprobs": None,
-                                        "finish_reason": None,
-                                    }
-                                ],
-                            }
+                    parser_text = (
+                        item.get("raw_text", item["text"])
+                        if reasoning_parser_name
+                        else item["text"]
+                    )
+                    consumed = raw_text_len if reasoning_parser_name else visible_text_len
+                    deltas = parser.feed(parser_text[consumed:])
+                    deltas.extend(parser.finish(item["finish_reason"]))
+                    for delta in deltas:
+                        yield _chat_stream_chunk(
+                            request_id,
+                            created,
+                            model,
+                            item["index"],
+                            delta,
                         )
-                    yield _sse(
-                        {
-                            "id": request_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": model,
-                            "choices": [
-                                {
-                                    "index": item["index"],
-                                    "delta": {},
-                                    "logprobs": None,
-                                    "finish_reason": item["finish_reason"],
-                                }
-                            ],
-                        }
+                    finish_reason = item["finish_reason"]
+                    if parser.tools_called and finish_reason == "stop":
+                        finish_reason = "tool_calls"
+                    yield _chat_stream_chunk(
+                        request_id,
+                        created,
+                        model,
+                        item["index"],
+                        {},
+                        finish_reason=finish_reason,
                     )
                     pending.pop(tasks[task], None)
         if include_usage:
@@ -426,3 +436,44 @@ async def _chat_completion_stream(
             time.perf_counter() - started if started is not None else 0.0,
         )
         raise
+    except (ReasoningParseError, ToolCallParseError) as exc:
+        for handle in pending.values():
+            dispatcher.cancel(handle)
+        message = f"Chat Completions parse failed: {exc}"
+        yield _sse({"object": "error", "message": message})
+        yield "data: [DONE]\n\n"
+        logger.info(
+            "request_failure id={} model={} stream=true elapsed_s={:.3f} error={}",
+            request_id,
+            model,
+            time.perf_counter() - started if started is not None else 0.0,
+            message,
+        )
+
+
+def _chat_stream_chunk(
+    request_id: str,
+    created: int,
+    model: str,
+    index: int,
+    delta: dict[str, Any],
+    *,
+    logprobs: dict[str, Any] | None = None,
+    finish_reason: str | None = None,
+) -> str:
+    return _sse(
+        {
+            "id": request_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [
+                {
+                    "index": index,
+                    "delta": delta,
+                    "logprobs": logprobs,
+                    "finish_reason": finish_reason,
+                }
+            ],
+        }
+    )

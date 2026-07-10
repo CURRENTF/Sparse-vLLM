@@ -2258,6 +2258,296 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         first = json.loads(chunks[0].removeprefix("data: "))
         self.assertEqual(first["choices"][0]["delta"], {"role": "assistant"})
 
+    async def test_chat_stream_parses_reasoning_and_tool_calls(self):
+        from sparsevllm.entrypoints.openai.api_server import RequestHandle, _chat_completion_stream
+
+        raw_text = (
+            "reason</think>"
+            '<tool_call>{"name":"get_weather","arguments":{"city":"Paris"}}</tool_call>'
+        )
+        queue = asyncio.Queue()
+        for delta in (
+            "rea",
+            "son</think><tool_",
+            'call>{"name":"get_weather","arguments":{"city":"Paris"}}</tool_call>',
+        ):
+            await queue.put(
+                {
+                    "type": "token",
+                    "index": 0,
+                    "text": delta,
+                    "raw_text_delta": delta,
+                    "token_ids": [1],
+                    "token_logprobs": [None],
+                    "top_logprobs": [None],
+                }
+            )
+        await queue.put(
+            {
+                "type": "final",
+                "index": 0,
+                "text": raw_text,
+                "raw_text": raw_text,
+                "finish_reason": "stop",
+                "prompt_tokens": 3,
+                "completion_tokens": 3,
+                "token_ids": [1, 2, 3],
+                "token_logprobs": [None] * 3,
+                "top_logprobs": [None] * 3,
+            }
+        )
+
+        class Dispatcher:
+            def cancel(self, _handle):
+                raise AssertionError("finished stream should not be cancelled")
+
+        chunks = [
+            chunk
+            async for chunk in _chat_completion_stream(
+                Dispatcher(),
+                "chatcmpl-test",
+                123,
+                "model",
+                [RequestHandle(output_queue=queue, cancelled=threading.Event())],
+                include_usage=True,
+                reasoning_parser_name="qwen3",
+                parse_tools=True,
+                buffer_initial_reasoning=True,
+            )
+        ]
+        payloads = [
+            payload
+            for event, payload in _response_sse_events(chunks)
+            if event != "[DONE]"
+        ]
+        deltas = [choice["delta"] for payload in payloads for choice in payload.get("choices", [])]
+
+        self.assertEqual(
+            "".join(delta.get("reasoning_content", "") for delta in deltas),
+            "reason",
+        )
+        tool_deltas = [delta["tool_calls"][0] for delta in deltas if delta.get("tool_calls")]
+        self.assertEqual(tool_deltas[0]["index"], 0)
+        self.assertTrue(tool_deltas[0]["id"].startswith("call_"))
+        self.assertEqual(tool_deltas[0]["function"], {"name": "get_weather", "arguments": ""})
+        self.assertEqual(tool_deltas[1]["function"]["arguments"], '{"city":"Paris"}')
+        final_choice = [
+            choice
+            for payload in payloads
+            for choice in payload.get("choices", [])
+            if choice["finish_reason"] is not None
+        ][0]
+        self.assertEqual(final_choice["finish_reason"], "tool_calls")
+        usage = [payload["usage"] for payload in payloads if not payload.get("choices")][0]
+        self.assertEqual(usage, {"prompt_tokens": 3, "completion_tokens": 3, "total_tokens": 6})
+
+    async def test_chat_stream_parser_disabled_preserves_raw_content(self):
+        from sparsevllm.entrypoints.openai.api_server import RequestHandle, _chat_completion_stream
+
+        text = "<think>reason</think>answer"
+        queue = asyncio.Queue()
+        await queue.put(
+            {
+                "type": "token",
+                "index": 0,
+                "text": text,
+                "raw_text_delta": text,
+                "token_ids": [1],
+                "token_logprobs": [None],
+                "top_logprobs": [None],
+            }
+        )
+        await queue.put(
+            {
+                "type": "final",
+                "index": 0,
+                "text": text,
+                "raw_text": text,
+                "finish_reason": "stop",
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+                "token_ids": [1],
+                "token_logprobs": [None],
+                "top_logprobs": [None],
+            }
+        )
+
+        class Dispatcher:
+            def cancel(self, _handle):
+                raise AssertionError("finished stream should not be cancelled")
+
+        chunks = [
+            chunk
+            async for chunk in _chat_completion_stream(
+                Dispatcher(),
+                "chatcmpl-test",
+                123,
+                "model",
+                [RequestHandle(output_queue=queue, cancelled=threading.Event())],
+            )
+        ]
+        content = "".join(
+            (payload["choices"][0]["delta"] or {}).get("content", "")
+            for event, payload in _response_sse_events(chunks)
+            if event != "[DONE]" and payload.get("choices")
+        )
+        self.assertEqual(content, text)
+
+    def test_chat_stream_parser_indexes_multiple_tool_calls(self):
+        from sparsevllm.entrypoints.openai.serving.chat_parsing import ChatStreamParser
+
+        parser = ChatStreamParser(
+            reasoning_parser_name=None,
+            parse_tools=True,
+            buffer_initial_reasoning=False,
+        )
+        deltas = parser.feed(
+            '<tool_call>{"name":"first","arguments":{"x":1}}</tool_call>'
+        )
+        deltas.extend(
+            parser.feed(
+                '<tool_call>{"name":"second","arguments":{"y":2}}</tool_call>'
+            )
+        )
+        deltas.extend(parser.finish("stop"))
+
+        starts = [
+            delta["tool_calls"][0]
+            for delta in deltas
+            if delta.get("tool_calls") and "id" in delta["tool_calls"][0]
+        ]
+        self.assertEqual([start["index"] for start in starts], [0, 1])
+        self.assertNotEqual(starts[0]["id"], starts[1]["id"])
+
+    async def test_chat_stream_reasoning_length_finishes_explicitly(self):
+        from sparsevllm.entrypoints.openai.api_server import RequestHandle, _chat_completion_stream
+
+        queue = asyncio.Queue()
+        await queue.put(
+            {
+                "type": "final",
+                "index": 0,
+                "text": "",
+                "raw_text": "<think>partial",
+                "finish_reason": "length",
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+                "token_ids": [1],
+                "token_logprobs": [None],
+                "top_logprobs": [None],
+            }
+        )
+
+        class Dispatcher:
+            def cancel(self, _handle):
+                raise AssertionError("finished stream should not be cancelled")
+
+        chunks = [
+            chunk
+            async for chunk in _chat_completion_stream(
+                Dispatcher(),
+                "chatcmpl-test",
+                123,
+                "model",
+                [RequestHandle(output_queue=queue, cancelled=threading.Event())],
+                reasoning_parser_name="qwen3",
+                buffer_initial_reasoning=True,
+            )
+        ]
+        payloads = [
+            payload
+            for event, payload in _response_sse_events(chunks)
+            if event != "[DONE]"
+        ]
+        self.assertEqual(
+            "".join(
+                choice["delta"].get("reasoning_content", "")
+                for payload in payloads
+                for choice in payload.get("choices", [])
+            ),
+            "partial",
+        )
+        self.assertEqual(
+            [
+                choice["finish_reason"]
+                for payload in payloads
+                for choice in payload.get("choices", [])
+                if choice["finish_reason"] is not None
+            ],
+            ["length"],
+        )
+
+    async def test_chat_stream_parse_failure_is_visible_and_cancels(self):
+        from sparsevllm.entrypoints.openai.api_server import RequestHandle, _chat_completion_stream
+
+        queue = asyncio.Queue()
+        await queue.put(
+            {
+                "type": "final",
+                "index": 0,
+                "text": '<tool_call>{"name":</tool_call>',
+                "finish_reason": "stop",
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+                "token_ids": [1],
+                "token_logprobs": [None],
+                "top_logprobs": [None],
+            }
+        )
+        handle = RequestHandle(output_queue=queue, cancelled=threading.Event())
+        cancelled = threading.Event()
+
+        class Dispatcher:
+            def cancel(self, observed_handle):
+                self_observed = observed_handle
+                if self_observed is handle:
+                    cancelled.set()
+
+        chunks = [
+            chunk
+            async for chunk in _chat_completion_stream(
+                Dispatcher(),
+                "chatcmpl-test",
+                123,
+                "model",
+                [handle],
+                parse_tools=True,
+            )
+        ]
+        events = _response_sse_events(chunks)
+        errors = [payload for event, payload in events if event != "[DONE]" and payload.get("object") == "error"]
+        self.assertIn("JSON parse failed", errors[0]["message"])
+        self.assertEqual(events[-1], ("[DONE]", None))
+        self.assertTrue(cancelled.is_set())
+
+    async def test_chat_stream_cancel_releases_dispatcher_request(self):
+        from sparsevllm.entrypoints.openai.api_server import RequestHandle, _chat_completion_stream
+
+        queue = asyncio.Queue()
+        handle = RequestHandle(output_queue=queue, cancelled=threading.Event())
+        cancelled = threading.Event()
+
+        class Dispatcher:
+            def cancel(self, observed_handle):
+                if observed_handle is handle:
+                    cancelled.set()
+
+        stream = _chat_completion_stream(
+            Dispatcher(),
+            "chatcmpl-test",
+            123,
+            "model",
+            [handle],
+        )
+        await stream.__anext__()
+        pending = asyncio.create_task(stream.__anext__())
+        await asyncio.sleep(0)
+        pending.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await pending
+
+        self.assertTrue(cancelled.is_set())
+
     def test_completion_logprobs_serializes_sampled_tokens(self):
         from sparsevllm.entrypoints.openai.api_server import _completion_logprobs
 
