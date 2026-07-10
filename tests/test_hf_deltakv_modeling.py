@@ -5,6 +5,7 @@ import torch
 
 from deltakv.configs.model_config_cls import KVLlamaConfig, KVQwen2Config, KVQwen3Config
 from deltakv.modeling.compressor import reshape_and_apply_qk_norm
+from deltakv.modeling.hf_common import _mask_signature
 from deltakv.modeling.cache_factory import (
     DELTA_COMPRESSED_LATENT_W_FULL,
     DELTA_COMPRESSED_QUANT_KIVI_FULL_FP8_REF,
@@ -68,6 +69,21 @@ def _tiny_config(config_cls):
 
 
 class HfDeltaKVModelingTest(unittest.TestCase):
+    def test_mask_embed_arg_accepts_singular_and_plural_names(self):
+        def singular(input_embeds):
+            return input_embeds
+
+        def plural(inputs_embeds):
+            return inputs_embeds
+
+        def unsupported(hidden_states):
+            return hidden_states
+
+        self.assertEqual(_mask_signature(singular)[0], "input_embeds")
+        self.assertEqual(_mask_signature(plural)[0], "inputs_embeds")
+        with self.assertRaisesRegex(TypeError, "inputs_embeds.*input_embeds"):
+            _mask_signature(unsupported)
+
     MODEL_CASES = (
         ("qwen2", Qwen2KVCompress, KVQwen2Config),
         ("qwen3", Qwen3KVCompress, KVQwen3Config),

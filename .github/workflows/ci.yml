@@ -45,7 +45,7 @@ jobs:
           retention-days: 7
 
   test:
-    name: Full test suite
+    name: CPU test suite
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
