@@ -7,7 +7,6 @@ class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
 
-    @torch.compile
     def _sample(
         self,
         logits: torch.Tensor,
