@@ -110,24 +110,9 @@ def create_app(
     async def models():
         await router.refresh_worker_info()
         created = int(time.time())
-        model_ids = sorted(
-            {
-                str(worker.info.get("served_model_name"))
-                for worker in router.workers
-                if worker.healthy and worker.info.get("served_model_name")
-            }
-        )
         return {
             "object": "list",
-            "data": [
-                {
-                    "id": model_id,
-                    "object": "model",
-                    "created": created,
-                    "owned_by": "sparsevllm-router",
-                }
-                for model_id in model_ids
-            ],
+            "data": _router_model_cards(router.workers, created),
         }
 
     @app.post("/v1/completions")
@@ -161,6 +146,28 @@ def create_app(
         return JSONResponse(await router.broadcast_json("/v1/prefix_cache/set_eviction_priority", await request.json()))
 
     return app
+
+
+def _router_model_cards(workers: list[WorkerState], created: int) -> list[dict[str, Any]]:
+    model_workers: dict[str, list[WorkerState]] = {}
+    for worker in workers:
+        model_id = worker.info.get("served_model_name")
+        if worker.healthy and model_id:
+            model_workers.setdefault(str(model_id), []).append(worker)
+
+    cards = []
+    for model_id, serving_workers in sorted(model_workers.items()):
+        card = {
+            "id": model_id,
+            "object": "model",
+            "created": created,
+            "owned_by": "sparsevllm-router",
+        }
+        max_model_lens = [int(worker.info.get("max_model_len", 0) or 0) for worker in serving_workers]
+        if all(max_model_len > 0 for max_model_len in max_model_lens):
+            card["max_model_len"] = min(max_model_lens)
+        cards.append(card)
+    return cards
 
 
 class SmartRouter:

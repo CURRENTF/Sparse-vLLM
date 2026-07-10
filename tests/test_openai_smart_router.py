@@ -10,6 +10,25 @@ from unittest.mock import patch
     "OpenAI smart router dependencies are not installed",
 )
 class OpenAISmartRouterTest(unittest.TestCase):
+    def test_model_cards_use_smallest_worker_context(self):
+        from sparsevllm.entrypoints.openai.smart_router import _router_model_cards
+        from sparsevllm.entrypoints.openai.smart_router import WorkerState
+
+        cards = _router_model_cards(
+            [
+                WorkerState(url="http://a", info={"served_model_name": "model", "max_model_len": 128000}),
+                WorkerState(url="http://b", info={"served_model_name": "model", "max_model_len": 64000}),
+                WorkerState(
+                    url="http://unhealthy",
+                    info={"served_model_name": "model", "max_model_len": 32000},
+                    healthy=False,
+                ),
+            ],
+            123,
+        )
+
+        self.assertEqual(cards[0]["max_model_len"], 64000)
+
     def test_choose_worker_prefers_prefix_match_when_load_is_close(self):
         from sparsevllm.entrypoints.openai.smart_router import WorkerProbe, WorkerState, choose_worker
 

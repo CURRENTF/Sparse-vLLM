@@ -886,6 +886,33 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(_parse_engine_kwargs(["--sparse-method", "snapkv"]), {"sparse_method": "snapkv"})
 
+    def test_models_route_advertises_context_window(self):
+        from sparsevllm.entrypoints.openai.routes.models import models
+
+        class Request:
+            app = type(
+                "App",
+                (),
+                {
+                    "state": type(
+                        "State",
+                        (),
+                        {
+                            "served_model_name": "model",
+                            "engine": type(
+                                "Engine",
+                                (),
+                                {"config": type("Config", (), {"max_model_len": 128000})()},
+                            )(),
+                        },
+                    )(),
+                },
+            )()
+
+        payload = models(Request())
+
+        self.assertEqual(payload["data"][0]["max_model_len"], 128000)
+
     def test_create_app_disables_periodic_throughput_logs_by_default(self):
         from sparsevllm.entrypoints.openai import api_server
 
