@@ -801,7 +801,12 @@ def _overall_score(result: dict[str, Any] | None) -> float | None:
     return None
 
 
-def _grade_quality_pair(vanilla_root: Path, sparse_root: Path) -> GateGrade:
+def _grade_quality_pair(
+    vanilla_root: Path,
+    sparse_root: Path,
+    *,
+    minimum_vanilla_score: float,
+) -> GateGrade:
     vanilla_score = _overall_score(_load_result_json(vanilla_root))
     sparse_score = _overall_score(_load_result_json(sparse_root))
     if vanilla_score is None or sparse_score is None:
@@ -812,7 +817,11 @@ def _grade_quality_pair(vanilla_root: Path, sparse_root: Path) -> GateGrade:
             {"vanilla_score": vanilla_score, "sparse_score": sparse_score},
             "Missing LongBench-mini aggregate score.",
         )
-    return grade_quality(vanilla_score, sparse_score)
+    return grade_quality(
+        vanilla_score,
+        sparse_score,
+        minimum_vanilla_score=minimum_vanilla_score,
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -1210,7 +1219,11 @@ def main() -> int:
                 for method_id in method_ids:
                     if method_id == "vanilla" or (model_id, method_id) not in quality_roots:
                         continue
-                    grade = _grade_quality_pair(vanilla_root, quality_roots[(model_id, method_id)])
+                    grade = _grade_quality_pair(
+                        vanilla_root,
+                        quality_roots[(model_id, method_id)],
+                        minimum_vanilla_score=float(resolved["quality"]["minimum_vanilla_score"]),
+                    )
                     summary["grades"].append({**grade.to_dict(), "model": model_id, "method": method_id})
 
         if run_logits:

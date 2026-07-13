@@ -1,9 +1,9 @@
 import os
+from typing import Any
 
 import torch
 from torch import nn
 import torch.distributed as dist
-from transformers import LlamaConfig
 
 from sparsevllm.layers.activation import SiluAndMul
 from sparsevllm.layers.attention import Attention
@@ -14,7 +14,7 @@ from sparsevllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 from sparsevllm.utils.context import get_context
 
 
-def _get_rope_theta(config: LlamaConfig) -> float:
+def _get_rope_theta(config: Any) -> float:
     if hasattr(config, "rope_theta"):
         return float(config.rope_theta)
     rope_parameters = getattr(config, "rope_parameters", None)
@@ -23,7 +23,7 @@ def _get_rope_theta(config: LlamaConfig) -> float:
     return 10000.0
 
 
-def _get_rope_scaling(config: LlamaConfig) -> tuple[tuple[str, object], ...] | None:
+def _get_rope_scaling(config: Any) -> tuple[tuple[str, object], ...] | None:
     rope_scaling = getattr(config, "rope_scaling", None)
     if rope_scaling is None:
         rope_scaling = getattr(config, "rope_parameters", None)
@@ -184,7 +184,7 @@ class LlamaMLP(nn.Module):
 
 
 class LlamaDecoderLayer(nn.Module):
-    def __init__(self, config: LlamaConfig) -> None:
+    def __init__(self, config: Any) -> None:
         super().__init__()
         head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
         self.self_attn = LlamaAttention(
@@ -225,7 +225,7 @@ class LlamaDecoderLayer(nn.Module):
 
 
 class LlamaModel(nn.Module):
-    def __init__(self, config: LlamaConfig) -> None:
+    def __init__(self, config: Any) -> None:
         super().__init__()
         self.config = config
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
@@ -275,7 +275,7 @@ class LlamaForCausalLM(nn.Module):
         "up_proj": ("gate_up_proj", 1),
     }
 
-    def __init__(self, config: LlamaConfig) -> None:
+    def __init__(self, config: Any) -> None:
         super().__init__()
         self.model = LlamaModel(config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)

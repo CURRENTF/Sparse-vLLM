@@ -5,6 +5,7 @@ class Context:
         self.cu_seqlens_q = None
         self.now_layer_idx = 0
         self.cache_manager = None
+        self.recurrent_state_manager = None
         self.sparse_controller = None
         self.sparse_config = None
         self.seqs = None
@@ -19,13 +20,21 @@ def get_context():
     return _CONTEXT
 
 
-def set_context(is_prefill, cu_seqlens_q=None, cache_manager=None, is_long_text=False, seqs=None):
+def set_context(
+    is_prefill,
+    cu_seqlens_q=None,
+    cache_manager=None,
+    is_long_text=False,
+    seqs=None,
+    recurrent_state_manager=None,
+):
     global _CONTEXT
     _CONTEXT.is_prefill = is_prefill
     _CONTEXT.is_long_text = is_long_text
     _CONTEXT.cu_seqlens_q = cu_seqlens_q
     _CONTEXT.now_layer_idx = 0
     _CONTEXT.cache_manager = cache_manager
+    _CONTEXT.recurrent_state_manager = recurrent_state_manager
     _CONTEXT.seqs = seqs
 
 def reset_context():

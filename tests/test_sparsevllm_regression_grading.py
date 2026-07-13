@@ -19,6 +19,7 @@ from benchmark.sparsevllm_regression.grading import (
     grade_stress_v2,
 )
 from benchmark.sparsevllm_regression.longbench_mini import select_longbench_mini_samples
+from benchmark.long_bench.pred import build_chat, strip_thinking_content
 from benchmark.sparsevllm_regression.manifest import (
     ManifestError,
     REQUIRED_METHODS,
@@ -112,6 +113,13 @@ class SparseVLLMRegressionGradingTest(unittest.TestCase):
         broken["methods"].pop("quest")
         with self.assertRaises(ManifestError):
             validate_manifest(broken)
+
+    def test_manifest_requires_absolute_vanilla_quality_floor(self):
+        manifest = copy.deepcopy(load_manifest())
+        manifest["quality"].pop("minimum_vanilla_score")
+
+        with self.assertRaisesRegex(ManifestError, "minimum_vanilla_score"):
+            validate_manifest(manifest)
 
     def test_model_specific_compressor_path_resolution(self):
         manifest = copy.deepcopy(load_manifest())
@@ -267,11 +275,46 @@ class SparseVLLMRegressionGradingTest(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("--output_dir") + 1], "/tmp/stress-v2")
 
     def test_quality_grade_thresholds(self):
-        self.assertEqual(grade_quality(50.0, 50.0).grade, "A")
-        self.assertEqual(grade_quality(50.0, 49.6).grade, "B")
-        self.assertEqual(grade_quality(50.0, 49.1).grade, "C")
-        self.assertEqual(grade_quality(50.0, 48.9).grade, "D")
-        self.assertEqual(grade_quality(50.0, 51.0).grade, "A")
+        self.assertEqual(grade_quality(50.0, 50.0, minimum_vanilla_score=25.0).grade, "A")
+        self.assertEqual(grade_quality(50.0, 49.6, minimum_vanilla_score=25.0).grade, "B")
+        self.assertEqual(grade_quality(50.0, 49.1, minimum_vanilla_score=25.0).grade, "C")
+        self.assertEqual(grade_quality(50.0, 48.9, minimum_vanilla_score=25.0).grade, "D")
+        self.assertEqual(grade_quality(50.0, 51.0, minimum_vanilla_score=25.0).grade, "A")
+
+    def test_quality_grade_rejects_broken_vanilla_baseline(self):
+        grade = grade_quality(20.37, 20.37, minimum_vanilla_score=25.0)
+
+        self.assertEqual(grade.grade, "D")
+        self.assertEqual(grade.status, "failed")
+        self.assertIn("below minimum", grade.reason)
+
+    def test_thinking_off_applies_chat_template_to_legacy_raw_prompt_tasks(self):
+        class QwenTokenizer:
+            chat_template = "template"
+
+            def apply_chat_template(self, messages, **kwargs):
+                self.messages = messages
+                self.kwargs = kwargs
+                return "templated<think>\n"
+
+        tokenizer = QwenTokenizer()
+
+        prompt = build_chat(tokenizer, "classify this", "trec", thinking_mode="off")
+
+        self.assertEqual(prompt, "templated<think>\n</think>\n")
+        self.assertFalse(tokenizer.kwargs["enable_thinking"])
+        self.assertEqual(
+            build_chat(tokenizer, "classify this", "trec", no_chat_template=True, thinking_mode="off"),
+            "classify this",
+        )
+
+    def test_strip_thinking_content_requires_complete_reasoning(self):
+        self.assertEqual(
+            strip_thinking_content("reasoning\n</think>\nfinal answer"),
+            "final answer",
+        )
+        with self.assertRaisesRegex(ValueError, "ended before </think>"):
+            strip_thinking_content("truncated reasoning")
 
     def test_logits_perf_memory_and_stress_grades(self):
         metrics = {

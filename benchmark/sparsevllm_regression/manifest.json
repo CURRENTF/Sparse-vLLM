@@ -303,6 +303,7 @@
     }
   },
   "quality": {
+    "minimum_vanilla_score": 55.0,
     "tasks": ["qasper", "hotpotqa", "multi_news", "trec", "passage_retrieval_en", "lcc"],
     "batch_size": 100,
     "sparsevllm_max_num_seqs_in_batch": 16,

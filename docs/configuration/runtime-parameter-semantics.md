@@ -370,8 +370,8 @@ observation layers from it. `observation_layers` is not a supported runtime key.
 | --- | --- | --- |
 | `snapkv_window_size` | HF SnapKV/PyramidKV and Sparse-vLLM SnapKV/DeltaKV-SnapKV | Local observation/recent window. |
 | `pool_kernel_size` | HF token selection and some Sparse-vLLM methods | Score smoothing kernel. The consumer differs by method. |
-| `pyramid_layer_ratios` | Sparse-vLLM PyramidKV | Explicit per-layer keep ratios. Length must equal number of layers. |
-| `pyramidkv_start_layer`, `pyramidkv_start_ratio`, `pyramidkv_least_layer`, `pyramidkv_least_ratio` | HF and Sparse-vLLM PyramidKV-style paths | Auto-generate layer budget schedule. |
+| `pyramid_layer_ratios` | Sparse-vLLM PyramidKV | Explicit per-KV/full-attention-layer keep ratios. A legacy full Transformer-layer list is projected onto KV layers for mixed-attention models. |
+| `pyramidkv_start_layer`, `pyramidkv_start_ratio`, `pyramidkv_least_layer`, `pyramidkv_least_ratio` | HF and Sparse-vLLM PyramidKV-style paths | Auto-generate the budget schedule; layer positions count KV/full-attention layers. |
 | `quest_chunk_size` | Sparse-vLLM Quest | Quest page size. |
 | `quest_token_budget` | Sparse-vLLM Quest | Quest token budget. |
 | `chunk_size` | HF Quest adapter | Quest chunk/page size on HF. |

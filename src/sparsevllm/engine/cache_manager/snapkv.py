@@ -59,7 +59,7 @@ class SnapKVCacheManager(CacheManager):
         self._prefill_score_bounds: tuple[torch.Tensor, torch.Tensor] | None = None
         self._uniform_decode_metadata = self._sparse_eviction_never_triggers()
         self.buffer_req_to_token_slots_tensor = torch.zeros(
-            (self.num_layers, self.max_buffer_rows, self.max_model_len),
+            (self.num_kv_layers, self.max_buffer_rows, self.max_model_len),
             dtype=torch.int32,
             device=self.device,
         )
@@ -69,14 +69,24 @@ class SnapKVCacheManager(CacheManager):
                 num_slots,
                 dtype=torch.int32,
                 device=self.device,
-            ).expand(self.num_layers, -1).clone()
+            ).expand(self.num_kv_layers, -1).clone()
             self._free_slots_layer_indices = torch.arange(
-                self.num_layers,
+                self.num_kv_layers,
                 dtype=torch.long,
                 device=self.device,
             )
 
         for layer_id in range(self.num_layers):
+            if not self.is_full_attention_layer(layer_id):
+                self.layer_num_slots.append(0)
+                self.free_slots_stack.append(None)
+                self._num_free_slots.append(0)
+                self.buffer_req_to_token_slots.append(None)
+                self.seq_id_to_row.append({})
+                self.free_rows.append(deque(range(self.max_buffer_rows)))
+                self.row_seq_lens.append(np.zeros((self.max_buffer_rows,), dtype=np.int32))
+                continue
+            kv_idx = self.kv_layer_index(layer_id)
             num_slots = (
                 config.num_kvcache_slots[layer_id]
                 if isinstance(config.num_kvcache_slots, list)
@@ -84,13 +94,13 @@ class SnapKVCacheManager(CacheManager):
             )
             self.layer_num_slots.append(num_slots)
             if self.free_slots_stack_tensor is not None:
-                self.free_slots_stack.append(self.free_slots_stack_tensor[layer_id])
+                self.free_slots_stack.append(self.free_slots_stack_tensor[kv_idx])
             else:
                 self.free_slots_stack.append(
                     torch.arange(num_slots, dtype=torch.int32, device=self.device)
                 )
             self._num_free_slots.append(num_slots)
-            self.buffer_req_to_token_slots.append(self.buffer_req_to_token_slots_tensor[layer_id])
+            self.buffer_req_to_token_slots.append(self.buffer_req_to_token_slots_tensor[kv_idx])
             self.seq_id_to_row.append({})
             self.free_rows.append(deque(range(self.max_buffer_rows)))
             self.row_seq_lens.append(np.zeros((self.max_buffer_rows,), dtype=np.int32))
@@ -188,7 +198,7 @@ class SnapKVCacheManager(CacheManager):
     def allocate_kv_cache(self):
         available_memory, slot_bytes_per_layer = self._get_available_slots_info()
         config = self.config
-        num_layers = self.num_layers
+        num_layers = self.num_kv_layers
 
         if config.pyramid_layer_ratios is not None:
             if self._pyramidkv_can_use_full_prefill_staging():
@@ -214,18 +224,22 @@ class SnapKVCacheManager(CacheManager):
                 )
 
             # PyramidKV: 根据比例分配每层不同大小的 cache
-            total_ratio = sum(config.pyramid_layer_ratios)
-            base_slots = available_memory // (slot_bytes_per_layer * total_ratio)
+            kv_layer_ids = list(self.runtime_layout.kv_idx_to_layer_idx)
+            total_ratio = sum(float(ratio) for ratio in config.pyramid_layer_ratios)
+            base_slots = int(available_memory // (slot_bytes_per_layer * total_ratio))
             assert base_slots > 0, "可用显存不足以分配 KV Cache"
 
-            layer_slots = [int(base_slots * ratio) for ratio in config.pyramid_layer_ratios]
-            assert layer_slots[0] == max(layer_slots), (
-                f"Layer 0 必须是最胖层，但 layer_slots[0]={layer_slots[0]}, max={max(layer_slots)}"
+            kv_layer_slots = [int(base_slots * ratio) for ratio in config.pyramid_layer_ratios]
+            assert kv_layer_slots[0] == max(kv_layer_slots), (
+                "The first KV layer must have the largest PyramidKV allocation, but "
+                f"first={kv_layer_slots[0]}, max={max(kv_layer_slots)}."
             )
+            layer_slots = [0] * self.num_layers
 
             self.kv_cache = []
-            for layer_idx in range(num_layers):
-                num_slots = layer_slots[layer_idx]
+            for kv_idx, layer_idx in enumerate(kv_layer_ids):
+                num_slots = kv_layer_slots[kv_idx]
+                layer_slots[layer_idx] = num_slots
                 k_cache = torch.empty(
                     num_slots, self.num_kv_heads, self.head_dim,
                     dtype=self.hf_config.torch_dtype, device=self.device
@@ -238,7 +252,8 @@ class SnapKVCacheManager(CacheManager):
 
             config.num_kvcache_slots = layer_slots
             logger.info(
-                f"PyramidKV: Layer slots = {layer_slots}, base_slots = {base_slots}, "
+                f"PyramidKV: KV layer slots = {list(zip(kv_layer_ids, kv_layer_slots))}, "
+                f"base_slots = {base_slots}, "
                 f"prefill_staging_slots={self.pyramidkv_prefill_staging_num_slots}"
             )
         else:
@@ -261,13 +276,15 @@ class SnapKVCacheManager(CacheManager):
             )
 
     def get_layer_batch_states(self, layer_idx: int) -> LayerBatchStates:
+        self.kv_layer_index(layer_idx)
         return self.layer_batch_states[layer_idx]
 
     def get_layer_kv_cache(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        kv_idx = self.kv_layer_index(layer_idx)
         if isinstance(self.kv_cache, list):
-            return self.kv_cache[layer_idx]
+            return self.kv_cache[kv_idx]
         elif isinstance(self.kv_cache, torch.Tensor):
-            return self.kv_cache[0, layer_idx], self.kv_cache[1, layer_idx]
+            return self.kv_cache[0, kv_idx], self.kv_cache[1, kv_idx]
         else:
             raise ValueError
 
@@ -292,6 +309,7 @@ class SnapKVCacheManager(CacheManager):
             self._pyramidkv_prefill_staging_active
             and self.config.vllm_sparse_method == "pyramidkv"
             and 0 <= int(layer_idx) < int(self.num_layers)
+            and self.is_full_attention_layer(layer_idx)
         )
 
     def get_prefill_staging_view(
@@ -311,15 +329,16 @@ class SnapKVCacheManager(CacheManager):
         return bool(self._pyramidkv_prefill_staging_was_active)
 
     def get_layer_buffer_req_to_token_slots(self, layer_idx: int) -> torch.Tensor:
+        self.kv_layer_index(layer_idx)
         return self.buffer_req_to_token_slots[layer_idx]
 
     @property
     def num_free_slots(self) -> int:
-        return min(self._num_free_slots)
+        return min(self._num_free_slots[layer_idx] for layer_idx in self.kv_transformer_layer_indices())
 
     def _pyramidkv_layer_budget(self, layer_idx: int) -> int:
         decode_keep = int(self.config.decode_keep_tokens)
-        ratio = float(self.config.pyramid_layer_ratios[layer_idx])
+        ratio = float(self.config.pyramid_layer_ratios[self.kv_layer_index(layer_idx)])
         base_ratio = float(self.config.pyramid_layer_ratios[0])
         scaled_top_tokens = int(decode_keep * ratio / base_ratio)
         return int(self.config.num_sink_tokens) + scaled_top_tokens + int(self.config.num_recent_tokens)
@@ -330,7 +349,7 @@ class SnapKVCacheManager(CacheManager):
             return 0
         return max(
             min(prompt_len, self._pyramidkv_layer_budget(layer_idx))
-            for layer_idx in range(self.num_layers)
+            for layer_idx in self.kv_transformer_layer_indices()
         )
 
     def prompt_admission_cost(self, seq: Sequence) -> int:
@@ -345,7 +364,10 @@ class SnapKVCacheManager(CacheManager):
 
     def prompt_admission_free_slots(self) -> int:
         if self._pyramidkv_can_use_full_prefill_staging():
-            return max(int(free) for free in self._num_free_slots)
+            return max(
+                int(self._num_free_slots[layer_idx])
+                for layer_idx in self.kv_transformer_layer_indices()
+            )
         return super().prompt_admission_free_slots()
 
     def prompt_admission_budgets(self, waiting_seqs, chunk_prefill_size: int) -> dict[str, int]:
@@ -353,7 +375,7 @@ class SnapKVCacheManager(CacheManager):
             return super().prompt_admission_budgets(waiting_seqs, chunk_prefill_size)
         return {
             f"layer_{layer_idx}": int(self._num_free_slots[layer_idx])
-            for layer_idx in range(self.num_layers)
+            for layer_idx in self.kv_transformer_layer_indices()
         }
 
     def prompt_admission_costs(self, seq: Sequence) -> dict[str, int]:
@@ -362,7 +384,7 @@ class SnapKVCacheManager(CacheManager):
         prompt_len = int(seq.num_prompt_tokens)
         return {
             f"layer_{layer_idx}": min(prompt_len, self._pyramidkv_layer_budget(layer_idx))
-            for layer_idx in range(self.num_layers)
+            for layer_idx in self.kv_transformer_layer_indices()
         }
 
     def prefill_step_free_slots(self) -> int:
@@ -410,7 +432,7 @@ class SnapKVCacheManager(CacheManager):
             ) from exc
 
     def _prefill_score_layer_budget(self, layer_idx: int) -> int | None:
-        if int(layer_idx) < int(getattr(self.config, "snapkv_num_full_layers", 0) or 0):
+        if self.kv_layer_index(layer_idx) < int(getattr(self.config, "snapkv_num_full_layers", 0) or 0):
             return None
         if self.config.vllm_sparse_method == "pyramidkv":
             if self.config.pyramid_layer_ratios is None:
@@ -683,17 +705,20 @@ class SnapKVCacheManager(CacheManager):
 
         batch_size = len(seqs)
         total_size = batch_size * chunk_size
+        layer_ids = self.kv_transformer_layer_indices()
+        if not layer_ids:
+            return False
         with profiler.record("cache_allocate"):
-            min_free = min(int(free) for free in self._num_free_slots)
+            min_free = min(int(self._num_free_slots[layer_id]) for layer_id in layer_ids)
             if min_free < total_size:
                 raise RuntimeError(
                     "Out of KV cache slots in batched prefill allocation: "
                     f"need={total_size} free={min_free}"
                 )
 
-            row_indices = np.empty((self.num_layers, batch_size), dtype=np.int64)
-            start_lens = np.empty((self.num_layers, batch_size), dtype=np.int64)
-            for layer_id in range(self.num_layers):
+            row_indices = np.empty((len(layer_ids), batch_size), dtype=np.int64)
+            start_lens = np.empty((len(layer_ids), batch_size), dtype=np.int64)
+            for local_layer, layer_id in enumerate(layer_ids):
                 for seq_idx, seq in enumerate(seqs):
                     row_idx = self._get_free_row(layer_id, int(seq.seq_id))
                     expected_start = int(seq.num_prefilled_tokens)
@@ -710,19 +735,25 @@ class SnapKVCacheManager(CacheManager):
                             f"layer={layer_id} seq_id={seq.seq_id} row={row_idx} "
                             f"cur_len={row_len} size={chunk_size} max_model_len={int(self.max_model_len)}"
                         )
-                    row_indices[layer_id, seq_idx] = int(row_idx)
-                    start_lens[layer_id, seq_idx] = row_len
+                    row_indices[local_layer, seq_idx] = int(row_idx)
+                    start_lens[local_layer, seq_idx] = row_len
 
-            layers_gpu = torch.arange(self.num_layers, dtype=torch.long, device=self.device)
-            if all(int(free) == int(self._num_free_slots[0]) for free in self._num_free_slots):
-                ptr = int(self._num_free_slots[0])
-                selected_slots = self.free_slots_stack_tensor[:, ptr - total_size: ptr].view(
-                    self.num_layers,
+            layers_gpu = torch.tensor(layer_ids, dtype=torch.long, device=self.device)
+            kv_layers_gpu = torch.tensor(
+                [self.kv_layer_index(layer_id) for layer_id in layer_ids],
+                dtype=torch.long,
+                device=self.device,
+            )
+            first_layer = int(layer_ids[0])
+            if all(int(self._num_free_slots[layer_id]) == int(self._num_free_slots[first_layer]) for layer_id in layer_ids):
+                ptr = int(self._num_free_slots[first_layer])
+                selected_slots = self.free_slots_stack_tensor[kv_layers_gpu, ptr - total_size: ptr].view(
+                    len(layer_ids),
                     batch_size,
                     chunk_size,
                 ).flip(1)
             else:
-                ptrs = np.asarray(self._num_free_slots, dtype=np.int64)
+                ptrs = np.asarray([self._num_free_slots[layer_id] for layer_id in layer_ids], dtype=np.int64)
                 seq_offsets = (batch_size - 1 - np.arange(batch_size, dtype=np.int64)) * chunk_size
                 token_offsets = np.arange(chunk_size, dtype=np.int64)
                 slot_offsets = (
@@ -733,7 +764,7 @@ class SnapKVCacheManager(CacheManager):
                 )
                 slot_offsets_gpu = torch.from_numpy(slot_offsets).to(device=self.device, dtype=torch.long)
                 selected_slots = self.free_slots_stack_tensor[
-                    layers_gpu[:, None, None],
+                    kv_layers_gpu[:, None, None],
                     slot_offsets_gpu,
                 ]
 
@@ -743,21 +774,21 @@ class SnapKVCacheManager(CacheManager):
                 + torch.arange(chunk_size, dtype=torch.long, device=self.device)[None, None, :]
             )
             self.buffer_req_to_token_slots_tensor[
-                layers_gpu[:, None, None],
+                kv_layers_gpu[:, None, None],
                 rows_gpu[:, :, None],
                 cols_gpu,
             ] = selected_slots.to(torch.int32)
-            layers_slot_mapping[:, :total_size] = selected_slots.reshape(self.num_layers, total_size)
-            for layer_id in range(self.num_layers):
+            layers_slot_mapping[layers_gpu, :total_size] = selected_slots.reshape(len(layer_ids), total_size)
+            for local_layer, layer_id in enumerate(layer_ids):
                 self._num_free_slots[layer_id] -= total_size
-                self.row_seq_lens[layer_id][row_indices[layer_id]] += chunk_size
+                self.row_seq_lens[layer_id][row_indices[local_layer]] += chunk_size
             return True
 
     def free_seq(self, seq_id: int):
         with profiler.record("cache_free_seq"):
             self._clear_prefill_attention_scores(seq_id)
             self._pyramidkv_clear_long_prefill_offload_prefetch()
-            for layer_idx in range(self.num_layers):
+            for layer_idx in self.kv_transformer_layer_indices():
                 row_idx = self.seq_id_to_row[layer_idx].pop(seq_id, None)
                 if row_idx is None:
                     raise ValueError
@@ -780,6 +811,7 @@ class SnapKVCacheManager(CacheManager):
                 self.free_rows[layer_idx].append(row_idx)
 
     def decode_kv_lens_for_layer(self, layer_idx: int, seqs: list[Sequence]) -> list[int]:
+        self.kv_layer_index(layer_idx)
         kv_lens = []
         for seq in seqs:
             row_idx = self.seq_id_to_row[layer_idx].get(seq.seq_id)
@@ -801,6 +833,7 @@ class SnapKVCacheManager(CacheManager):
         if keep_indices is None:
             return
 
+        self.kv_layer_index(layer_idx)
         self._uniform_decode_metadata = False
         row_idx = self.seq_id_to_row[layer_idx].get(seq.seq_id)
         if row_idx is None:
@@ -866,6 +899,7 @@ class SnapKVCacheManager(CacheManager):
             return
         if not seqs:
             return
+        self.kv_layer_index(layer_idx)
         if len(seqs) == 1:
             self.free_part_slots(
                 layer_idx,
@@ -953,6 +987,8 @@ class SnapKVCacheManager(CacheManager):
             return
         if not layer_indices or not seqs:
             return
+        for layer_idx in layer_indices:
+            self.kv_layer_index(int(layer_idx))
         if len(layer_indices) == 1:
             self.free_part_slots_batch(
                 int(layer_indices[0]),
@@ -1008,10 +1044,14 @@ class SnapKVCacheManager(CacheManager):
 
         if not keep_indices_sorted:
             keep_indices = torch.sort(keep_indices, dim=2).values
-        layers_gpu = torch.tensor(layer_indices, dtype=torch.long, device=self.device)
+        kv_layers_gpu = torch.tensor(
+            [self.kv_layer_index(int(layer_idx)) for layer_idx in layer_indices],
+            dtype=torch.long,
+            device=self.device,
+        )
         rows_gpu = torch.from_numpy(row_indices).to(device=self.device, dtype=torch.long)
         old_slots = self.buffer_req_to_token_slots_tensor[
-            layers_gpu[:, None],
+            kv_layers_gpu[:, None],
             rows_gpu,
             :cur_len,
         ]
@@ -1026,7 +1066,7 @@ class SnapKVCacheManager(CacheManager):
                 ptrs = np.asarray([self._num_free_slots[int(layer_idx)] for layer_idx in layer_indices], dtype=np.int64)
                 offsets = ptrs[:, None] + np.arange(drop_count, dtype=np.int64)[None, :]
                 self.free_slots_stack_tensor[
-                    layers_gpu[:, None],
+                    kv_layers_gpu[:, None],
                     torch.from_numpy(offsets).to(device=self.device, dtype=torch.long),
                 ] = dropped_per_layer.to(torch.int32)
             else:
@@ -1045,14 +1085,14 @@ class SnapKVCacheManager(CacheManager):
         new_len = int(new_slots.shape[2])
         new_cols = torch.arange(new_len, dtype=torch.long, device=self.device)
         self.buffer_req_to_token_slots_tensor[
-            layers_gpu[:, None, None],
+            kv_layers_gpu[:, None, None],
             rows_gpu[:, :, None],
             new_cols[None, None, :],
         ] = new_slots
         if new_len < cur_len:
             tail_cols = torch.arange(new_len, cur_len, dtype=torch.long, device=self.device)
             self.buffer_req_to_token_slots_tensor[
-                layers_gpu[:, None, None],
+                kv_layers_gpu[:, None, None],
                 rows_gpu[:, :, None],
                 tail_cols[None, None, :],
             ] = 0
@@ -1071,6 +1111,8 @@ class SnapKVCacheManager(CacheManager):
         if not layer_indices or not seqs:
             return
 
+        for layer_idx in layer_indices:
+            self.kv_layer_index(int(layer_idx))
         self._uniform_decode_metadata = False
         kv_len = int(kv_len)
         sink_end = min(int(num_sink_tokens), kv_len)
@@ -1099,11 +1141,15 @@ class SnapKVCacheManager(CacheManager):
                 f"kv_len={kv_len} observed={cur_lens.tolist()}"
             )
 
-        layers_gpu = torch.tensor(layer_indices, dtype=torch.long, device=self.device)
+        kv_layers_gpu = torch.tensor(
+            [self.kv_layer_index(int(layer_idx)) for layer_idx in layer_indices],
+            dtype=torch.long,
+            device=self.device,
+        )
         rows_gpu = torch.from_numpy(row_indices).to(device=self.device, dtype=torch.long)
         drop_cols = torch.arange(sink_end, recent_start, dtype=torch.long, device=self.device)
         dropped_per_layer = self.buffer_req_to_token_slots_tensor[
-            layers_gpu[:, None, None],
+            kv_layers_gpu[:, None, None],
             rows_gpu[:, :, None],
             drop_cols[None, None, :],
         ].reshape(num_layers, -1)
@@ -1113,7 +1159,7 @@ class SnapKVCacheManager(CacheManager):
                 ptrs = np.asarray([self._num_free_slots[int(layer_idx)] for layer_idx in layer_indices], dtype=np.int64)
                 offsets = ptrs[:, None] + np.arange(drop_count, dtype=np.int64)[None, :]
                 self.free_slots_stack_tensor[
-                    layers_gpu[:, None],
+                    kv_layers_gpu[:, None],
                     torch.from_numpy(offsets).to(device=self.device, dtype=torch.long),
                 ] = dropped_per_layer.to(torch.int32)
             else:
@@ -1128,18 +1174,18 @@ class SnapKVCacheManager(CacheManager):
             recent_cols = torch.arange(recent_start, kv_len, dtype=torch.long, device=self.device)
             dst_cols = torch.arange(sink_end, new_len, dtype=torch.long, device=self.device)
             recent_slots = self.buffer_req_to_token_slots_tensor[
-                layers_gpu[:, None, None],
+                kv_layers_gpu[:, None, None],
                 rows_gpu[:, :, None],
                 recent_cols[None, None, :],
             ]
             self.buffer_req_to_token_slots_tensor[
-                layers_gpu[:, None, None],
+                kv_layers_gpu[:, None, None],
                 rows_gpu[:, :, None],
                 dst_cols[None, None, :],
             ] = recent_slots
         tail_cols = torch.arange(new_len, kv_len, dtype=torch.long, device=self.device)
         self.buffer_req_to_token_slots_tensor[
-            layers_gpu[:, None, None],
+            kv_layers_gpu[:, None, None],
             rows_gpu[:, :, None],
             tail_cols[None, None, :],
         ] = 0
@@ -1147,6 +1193,7 @@ class SnapKVCacheManager(CacheManager):
             self.row_seq_lens[int(layer_idx)][row_indices[local_layer]] = new_len
 
     def materialize_prefill_staging_layer(self, layer_idx: int, seq: Sequence, keep_indices: torch.Tensor):
+        self.kv_layer_index(layer_idx)
         if not self.has_prefill_staging_view(layer_idx):
             raise RuntimeError("PyramidKV prefill staging is not active.")
         materialized_key = (int(layer_idx), int(seq.seq_id))
@@ -1180,7 +1227,7 @@ class SnapKVCacheManager(CacheManager):
         v_cache[slots] = v_stage[staging_indices]
 
         self._pyramidkv_prefill_staging_materialized_layers.add(materialized_key)
-        expected_materializations = int(self.num_layers) * len(self._pyramidkv_prefill_staging_seq_offsets)
+        expected_materializations = int(self.num_kv_layers) * len(self._pyramidkv_prefill_staging_seq_offsets)
         if len(self._pyramidkv_prefill_staging_materialized_layers) == expected_materializations:
             self._pyramidkv_prefill_staging_active = False
             self._release_pyramidkv_long_prefill_offload_rows()
@@ -1196,6 +1243,7 @@ class SnapKVCacheManager(CacheManager):
             seq, keep_indices = seq_keep_indices[0]
             self.materialize_prefill_staging_layer(layer_idx, seq, keep_indices)
             return
+        self.kv_layer_index(layer_idx)
         if not self.has_prefill_staging_view(layer_idx):
             raise RuntimeError("PyramidKV prefill staging is not active.")
 
@@ -1248,7 +1296,7 @@ class SnapKVCacheManager(CacheManager):
         v_cache[slots] = v_stage[staging_indices]
 
         self._pyramidkv_prefill_staging_materialized_layers.update(materialized_keys)
-        expected_materializations = int(self.num_layers) * len(self._pyramidkv_prefill_staging_seq_offsets)
+        expected_materializations = int(self.num_kv_layers) * len(self._pyramidkv_prefill_staging_seq_offsets)
         if len(self._pyramidkv_prefill_staging_materialized_layers) == expected_materializations:
             self._pyramidkv_prefill_staging_active = False
             self._release_pyramidkv_long_prefill_offload_rows()
@@ -1262,7 +1310,7 @@ class SnapKVCacheManager(CacheManager):
         self._pyramidkv_clear_long_prefill_offload_prefetch()
         seq_id = int(self._pyramidkv_long_prefill_offload_seq_id)
         seen_rows = set()
-        for layer_idx in range(int(self.num_layers)):
+        for layer_idx in self.kv_transformer_layer_indices():
             row_idx = self.seq_id_to_row[layer_idx].get(seq_id)
             if row_idx is None:
                 continue
@@ -1326,9 +1374,14 @@ class SnapKVCacheManager(CacheManager):
     def _pyramidkv_schedule_next_long_prefill_offload_prefetch(self, *, layer_idx: int, end: int):
         if int(end) <= 0 or not self._pyramidkv_long_prefill_offload_prefetch_enabled():
             return
-        next_layer = int(layer_idx) + 1
-        if next_layer >= int(self.num_layers):
+        next_layers = [
+            candidate
+            for candidate in self.kv_transformer_layer_indices()
+            if int(candidate) > int(layer_idx)
+        ]
+        if not next_layers:
             return
+        next_layer = int(next_layers[0])
         row_idx = self._pyramidkv_long_prefill_offload_row(next_layer)
         kind = self._pyramidkv_long_prefill_offload_kind()
         key = (next_layer, int(row_idx), kind, int(end))
@@ -1484,6 +1537,7 @@ class SnapKVCacheManager(CacheManager):
     def _prepare_prefill(self, seqs: list[Sequence]):
         with profiler.record("cache_prepare_prefill"):
             self._decode_static_state_binding_key = None
+            layer_ids = self.kv_transformer_layer_indices()
             for seq in seqs:
                 if int(seq.num_prefilled_tokens) == 0:
                     self._clear_prefill_attention_scores(seq.seq_id)
@@ -1523,10 +1577,10 @@ class SnapKVCacheManager(CacheManager):
                 and self._allocate_prefill_batch_same_size_all_layers(seqs, layers_slot_mapping_cuda)
             )
             if use_batched_prefill_alloc:
-                context_lens_list = [
-                    [int(seq.num_prefilled_tokens + seq.current_chunk_size) for seq in seqs]
-                    for _layer_id in range(self.num_layers)
-                ]
+                for layer_id in layer_ids:
+                    context_lens_list[layer_id] = [
+                        int(seq.num_prefilled_tokens + seq.current_chunk_size) for seq in seqs
+                    ]
 
             token_offset = 0
             for seq in seqs:
@@ -1535,7 +1589,7 @@ class SnapKVCacheManager(CacheManager):
                 end_idx = start_idx + chunk_size
 
                 if not use_batched_prefill_alloc:
-                    for layer_id in range(self.num_layers):
+                    for layer_id in layer_ids:
                         if seq.seq_id in self.seq_id_to_row[layer_id]:
                             row_idx = self.seq_id_to_row[layer_id][seq.seq_id]
                             expected_row_len = 0 if use_long_prefill_offload_staging else start_idx
@@ -1568,9 +1622,15 @@ class SnapKVCacheManager(CacheManager):
                 cu_seqlens_q.append(cu_seqlens_q[-1] + chunk_size)
                 token_offset += chunk_size
 
-            layers_context_lens_cuda = torch.tensor(context_lens_list, dtype=torch.int32, device=self.device)
+            layers_context_lens_np = np.zeros((self.num_layers, len(seqs)), dtype=np.int32)
+            for layer_id in layer_ids:
+                layers_context_lens_np[layer_id] = context_lens_list[layer_id]
+            layers_context_lens_cuda = torch.from_numpy(layers_context_lens_np).to(
+                device=self.device,
+                dtype=torch.int32,
+            )
 
-            for layer_id in range(self.num_layers):
+            for layer_id in layer_ids:
                 state = self.layer_batch_states[layer_id]
                 state.slot_mapping = layers_slot_mapping_cuda[layer_id]
                 state.context_lens = layers_context_lens_cuda[layer_id]
@@ -1629,6 +1689,7 @@ class SnapKVCacheManager(CacheManager):
     def _prepare_decode(self, seqs: list[Sequence]):
         with profiler.record("cache_prepare_decode"):
             self._decode_static_state_binding_key = None
+            layer_ids = self.kv_transformer_layer_indices()
             batch_size = len(seqs)
             input_ids_list = [seq.last_token for seq in seqs]
             positions_list = [seq.num_tokens - 1 for seq in seqs]
@@ -1639,27 +1700,30 @@ class SnapKVCacheManager(CacheManager):
             )
             layers_context_lens = []
 
-            for layer_id in range(self.num_layers):
+            for layer_id in layer_ids:
                 new_slots_batch = self._allocate_batch(layer_id, seq_ids, 1)
                 layers_slot_mapping_cuda[layer_id] = new_slots_batch
 
                 row_indices = [self.seq_id_to_row[layer_id][sid] for sid in seq_ids]
                 layers_context_lens.append(self.row_seq_lens[layer_id][row_indices])
 
-            layers_context_lens_cuda = torch.from_numpy(np.array(layers_context_lens)).to(
+            layers_context_lens_np = np.zeros((self.num_layers, batch_size), dtype=np.int32)
+            for local_layer, layer_id in enumerate(layer_ids):
+                layers_context_lens_np[layer_id] = layers_context_lens[local_layer]
+            layers_context_lens_cuda = torch.from_numpy(layers_context_lens_np).to(
                 device=self.device,
                 dtype=torch.int32,
             )
 
-            for layer_id in range(self.num_layers):
+            for layer_id in layer_ids:
                 state = self.layer_batch_states[layer_id]
                 state.slot_mapping = layers_slot_mapping_cuda[layer_id]
                 state.context_lens = layers_context_lens_cuda[layer_id]
                 # row_seq_lens is layer-wise after prefill/decode eviction; attention
                 # uses this to size flash decode stage1/stage2 workspaces.
                 state.max_context_len = (
-                    int(max(layers_context_lens[layer_id]))
-                    if len(layers_context_lens[layer_id]) > 0
+                    int(max(layers_context_lens_np[layer_id]))
+                    if len(layers_context_lens_np[layer_id]) > 0
                     else 0
                 )
                 req_ids = [self.seq_id_to_row[layer_id][seq.seq_id] for seq in seqs]
@@ -1714,13 +1778,13 @@ class SnapKVCacheManager(CacheManager):
             int(layers_req_indices.data_ptr()),
         )
         if self._decode_static_state_binding_key != binding_key:
-            for layer_id in range(self.num_layers):
+            for layer_id in self.kv_transformer_layer_indices():
                 state = self.layer_batch_states[layer_id]
                 state.slot_mapping = layers_slot_mapping[layer_id]
                 state.context_lens = layers_context_lens[layer_id]
                 state.req_indices = layers_req_indices[layer_id]
             self._decode_static_state_binding_key = binding_key
-        for layer_id in range(self.num_layers):
+        for layer_id in self.kv_transformer_layer_indices():
             self.layer_batch_states[layer_id].max_context_len = int(max_context_lens[layer_id])
 
     def _prepare_decode_static_uniform(
@@ -1737,38 +1801,49 @@ class SnapKVCacheManager(CacheManager):
         input_ids_list = [seq.last_token for seq in seqs]
         positions_list = [seq.num_tokens - 1 for seq in seqs]
         seq_ids = [seq.seq_id for seq in seqs]
-        row_indices = [self.seq_id_to_row[0][sid] for sid in seq_ids]
+        layer_ids = self.kv_transformer_layer_indices()
+        first_layer = int(layer_ids[0])
+        row_indices = [self.seq_id_to_row[first_layer][sid] for sid in seq_ids]
         if any(
             self.seq_id_to_row[layer_id].get(sid) != row_idx
-            for layer_id in range(1, self.num_layers)
+            for layer_id in layer_ids[1:]
             for sid, row_idx in zip(seq_ids, row_indices)
         ):
             self._uniform_decode_metadata = False
             return None
 
-        cur_lens = self.row_seq_lens[0][row_indices]
+        cur_lens = self.row_seq_lens[first_layer][row_indices]
         if len(cur_lens) > 0 and int(max(cur_lens)) + 1 > int(self.max_model_len):
             raise RuntimeError(
                 "KV row length exceeds max_model_len in uniform prepare_decode_static: "
                 f"max_cur_len={int(max(cur_lens))} max_model_len={int(self.max_model_len)}"
             )
-        if any(int(free) < real_batch_size for free in self._num_free_slots):
+        if any(int(self._num_free_slots[layer_id]) < real_batch_size for layer_id in layer_ids):
             raise RuntimeError(
                 "Out of KV cache slots in uniform prepare_decode_static: "
-                f"need={real_batch_size} free={min(self._num_free_slots)}"
+                f"need={real_batch_size} free={min(int(self._num_free_slots[layer_id]) for layer_id in layer_ids)}"
             )
 
-        ptr = int(self._num_free_slots[0])
-        new_slots_batch = self.free_slots_stack[0][ptr - real_batch_size : ptr]
-        for layer_id in range(self.num_layers):
+        ptr = int(self._num_free_slots[first_layer])
+        new_slots_batch = self.free_slots_stack[first_layer][ptr - real_batch_size : ptr]
+        for layer_id in layer_ids:
             self._num_free_slots[layer_id] -= real_batch_size
 
         rows_gpu = torch.tensor(row_indices, dtype=torch.long, device=self.device)
         cols_gpu = torch.tensor(cur_lens, dtype=torch.long, device=self.device)
-        self.buffer_req_to_token_slots_tensor[:, rows_gpu, cols_gpu] = new_slots_batch.to(torch.int32).unsqueeze(0)
-        for layer_id in range(self.num_layers):
+        kv_layers_gpu = torch.tensor(
+            [self.kv_layer_index(layer_id) for layer_id in layer_ids],
+            dtype=torch.long,
+            device=self.device,
+        )
+        self.buffer_req_to_token_slots_tensor[
+            kv_layers_gpu[:, None],
+            rows_gpu[None, :],
+            cols_gpu[None, :],
+        ] = new_slots_batch.to(torch.int32).unsqueeze(0)
+        for layer_id in layer_ids:
             self.row_seq_lens[layer_id][row_indices] += 1
-        real_context_lens = self.row_seq_lens[0][row_indices]
+        real_context_lens = self.row_seq_lens[first_layer][row_indices]
         real_max_context_len = int(max(real_context_lens)) if row_indices else 0
 
         input_ids[:real_batch_size].copy_(torch.tensor(input_ids_list, dtype=torch.int64, device=self.device))
@@ -1783,7 +1858,8 @@ class SnapKVCacheManager(CacheManager):
             context_lens[real_batch_size:].fill_(int(real_context_lens[0]))
             req_indices[real_batch_size:].fill_(int(row_indices[0]))
 
-        for state in self.layer_batch_states:
+        for layer_id in layer_ids:
+            state = self.layer_batch_states[layer_id]
             state.slot_mapping = slot_mapping
             state.context_lens = context_lens
             state.max_context_len = real_max_context_len
@@ -1799,14 +1875,16 @@ class SnapKVCacheManager(CacheManager):
         slot_output: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, np.ndarray, np.ndarray, bool]:
         batch_size = len(seq_ids)
-        row_indices = np.empty((self.num_layers, batch_size), dtype=np.int64)
-        cur_lens = np.empty((self.num_layers, batch_size), dtype=np.int64)
-        for layer_id in range(self.num_layers):
+        layer_ids = self.kv_transformer_layer_indices()
+        row_indices = np.zeros((self.num_layers, batch_size), dtype=np.int64)
+        cur_lens = np.zeros((self.num_layers, batch_size), dtype=np.int64)
+        for layer_id in layer_ids:
             rows = [self._get_free_row(layer_id, sid) for sid in seq_ids]
             row_indices[layer_id] = rows
             cur_lens[layer_id] = self.row_seq_lens[layer_id][rows]
 
-        max_cur_len = int(cur_lens.max()) if cur_lens.size else 0
+        active_cur_lens = cur_lens[list(layer_ids)] if layer_ids else cur_lens
+        max_cur_len = int(active_cur_lens.max()) if active_cur_lens.size else 0
         if max_cur_len + 1 > int(self.max_model_len):
             raise RuntimeError(
                 "KV row length exceeds max_model_len in batched static decode allocation: "
@@ -1816,6 +1894,7 @@ class SnapKVCacheManager(CacheManager):
         if static_cap is not None:
             max_context_lens = next_lens.max(axis=1) if next_lens.size else np.zeros(self.num_layers)
             too_long = np.nonzero(max_context_lens > int(static_cap))[0]
+            too_long = np.asarray([layer_id for layer_id in too_long if layer_id in set(layer_ids)], dtype=np.int64)
             if too_long.size > 0:
                 layer_id = int(too_long[0])
                 raise RuntimeError(
@@ -1823,52 +1902,66 @@ class SnapKVCacheManager(CacheManager):
                     f"layer={layer_id} real_max_context_len={int(max_context_lens[layer_id])} "
                     f"static_cap={int(static_cap)}"
                 )
-        min_free = min(int(free) for free in self._num_free_slots)
+        min_free = min(int(self._num_free_slots[layer_id]) for layer_id in layer_ids)
         if min_free < batch_size:
             raise RuntimeError(
                 "Out of KV cache slots in batched static decode allocation: "
                 f"need={batch_size} free={min_free}"
             )
 
+        layer_index = torch.tensor(layer_ids, dtype=torch.long, device=self.device)
+        kv_layer_indices = torch.tensor(
+            [self.kv_layer_index(layer_id) for layer_id in layer_ids],
+            dtype=torch.long,
+            device=self.device,
+        )
         if self.free_slots_stack_tensor is not None:
-            ptrs = np.asarray(self._num_free_slots, dtype=np.int64)
+            ptrs = np.asarray([self._num_free_slots[layer_id] for layer_id in layer_ids], dtype=np.int64)
             slot_offsets = ptrs[:, None] - batch_size + np.arange(batch_size, dtype=np.int64)[None, :]
-            slot_offsets_gpu, rows_gpu, cols_gpu = self._get_decode_static_index_buffers(batch_size)
-            slot_offsets_gpu.copy_(torch.from_numpy(slot_offsets))
+            _slot_offsets_gpu, _rows_gpu, _cols_gpu = self._get_decode_static_index_buffers(batch_size)
+            slot_offsets_active = torch.from_numpy(slot_offsets).to(device=self.device, dtype=torch.long)
+            selected_active = torch.gather(
+                self.free_slots_stack_tensor.index_select(0, kv_layer_indices),
+                1,
+                slot_offsets_active,
+            )
             if slot_output is not None:
-                selected_slots = slot_output[:, :batch_size]
-                torch.gather(self.free_slots_stack_tensor, 1, slot_offsets_gpu, out=selected_slots)
+                selected_slots = slot_output
+                active_rows = selected_slots.index_select(0, layer_index)
+                active_rows[:, :batch_size] = selected_active
+                selected_slots.index_copy_(0, layer_index, active_rows)
                 wrote_slot_output = True
             else:
-                selected_slots = self.free_slots_stack_tensor[
-                    self._free_slots_layer_indices[:, None],
-                    slot_offsets_gpu,
-                ]
+                selected_slots = torch.empty((self.num_layers, batch_size), dtype=torch.int32, device=self.device)
+                selected_slots.fill_(-1)
+                selected_slots.index_copy_(0, layer_index, selected_active)
                 wrote_slot_output = False
-            for layer_id in range(self.num_layers):
+            for layer_id in layer_ids:
                 self._num_free_slots[layer_id] -= batch_size
         else:
             _slot_offsets_gpu, rows_gpu, cols_gpu = self._get_decode_static_index_buffers(batch_size)
             if slot_output is not None:
-                selected_slots = slot_output[:, :batch_size]
+                selected_slots = slot_output
                 wrote_slot_output = True
             else:
                 selected_slots = torch.empty((self.num_layers, batch_size), dtype=torch.int32, device=self.device)
+                selected_slots.fill_(-1)
                 wrote_slot_output = False
-            for layer_id in range(self.num_layers):
+            for layer_id in layer_ids:
                 ptr = int(self._num_free_slots[layer_id])
-                selected_slots[layer_id].copy_(self.free_slots_stack[layer_id][ptr - batch_size: ptr])
+                selected_slots[layer_id, :batch_size].copy_(self.free_slots_stack[layer_id][ptr - batch_size: ptr])
                 self._num_free_slots[layer_id] -= batch_size
 
-        if self._free_slots_layer_indices is not None:
-            layers_gpu = self._free_slots_layer_indices[:, None]
-        else:
-            layers_gpu = torch.arange(self.num_layers, dtype=torch.long, device=self.device)[:, None]
-        rows_gpu.copy_(torch.from_numpy(row_indices))
-        cols_gpu.copy_(torch.from_numpy(cur_lens))
-        self.buffer_req_to_token_slots_tensor[layers_gpu, rows_gpu, cols_gpu] = selected_slots
+        rows_active = torch.from_numpy(row_indices[list(layer_ids)]).to(device=self.device, dtype=torch.long)
+        cols_active = torch.from_numpy(cur_lens[list(layer_ids)]).to(device=self.device, dtype=torch.long)
+        selected_active = selected_slots.index_select(0, layer_index)[:, :batch_size]
+        self.buffer_req_to_token_slots_tensor[
+            kv_layer_indices[:, None],
+            rows_active,
+            cols_active,
+        ] = selected_active
 
-        for layer_id in range(self.num_layers):
+        for layer_id in layer_ids:
             self.row_seq_lens[layer_id][row_indices[layer_id]] += 1
         return selected_slots, next_lens, row_indices, wrote_slot_output
 
@@ -1961,8 +2054,9 @@ class SnapKVCacheManager(CacheManager):
                 max_context_lens,
             )
 
-            slot_mapping.copy_(layers_slot_mapping[0])
-            context_lens.copy_(layers_context_lens[0])
-            req_indices.copy_(layers_req_indices[0])
+            first_layer = int(self.kv_transformer_layer_indices()[0])
+            slot_mapping.copy_(layers_slot_mapping[first_layer])
+            context_lens.copy_(layers_context_lens[first_layer])
+            req_indices.copy_(layers_req_indices[first_layer])
 
             return input_ids, positions, None

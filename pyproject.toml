@@ -14,10 +14,10 @@ authors = [
 ]
 dependencies = [
     "fire",
-    "torch",
+    "torch==2.8.0",
     "transformers==5.12.1",
     "triton==3.4.0",
-    "torchvision",
+    "torchvision==0.23.0",
     "pillow",
     "accelerate",
     "deepspeed",
@@ -36,6 +36,13 @@ dependencies = [
     "pydantic>=2",
     "pytest",
     "math-verify==0.9.0",
+]
+
+[project.optional-dependencies]
+qwen35 = [
+    "kernels==0.14.1",
+    "einops",
+    "sglang-kernel @ https://github.com/sgl-project/whl/releases/download/v0.3.14.post1/sgl_kernel-0.3.14.post1%2Bcu128-cp310-abi3-manylinux2014_x86_64.whl",
 ]
 
 [project.scripts]

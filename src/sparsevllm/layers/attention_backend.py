@@ -87,6 +87,15 @@ class TritonAttentionBackend:
         max_input_len: int,
     ) -> torch.Tensor:
         b_seq_len = view.context_lens
+        if b_seq_len.numel() != chunk_lens.numel():
+            layer_idx = getattr(get_context(), "now_layer_idx", None)
+            raise RuntimeError(
+                "prefill context_lens/chunk_lens batch mismatch: "
+                f"layer={layer_idx} context_lens_shape={tuple(b_seq_len.shape)} "
+                f"chunk_lens_shape={tuple(chunk_lens.shape)} q_shape={tuple(q.shape)} "
+                f"req_indices_shape={tuple(view.req_indices.shape)} "
+                f"active_slots_shape={tuple(view.active_slots.shape)}"
+            )
         b_prompt_cache_len = b_seq_len - chunk_lens
         self._debug_check_prefill_bounds(q, view, chunk_lens=chunk_lens)
         if _fake_prefill_attention_enabled():

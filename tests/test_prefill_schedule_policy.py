@@ -23,6 +23,7 @@ from sparsevllm.engine.llm_engine import _deltakv_graph_warmup_profile, _use_gra
 from sparsevllm.engine.model_runner import ModelRunner
 from sparsevllm.engine.scheduler import Scheduler
 from sparsevllm.engine.sequence import Sequence
+from sparsevllm.sampling_params import SamplingParams
 from sparsevllm.engine.sparse_controller import SparseController
 from sparsevllm.method_registry import (
     PREFILL_POLICY_ALL_CHUNKED,
@@ -172,6 +173,14 @@ def make_sparse_controller_config():
     )
 
 
+def identity_runtime_layout(num_layers):
+    return SimpleNamespace(
+        kv_idx_to_layer_idx=tuple(range(num_layers)),
+        kv_layer_index=lambda layer_idx: int(layer_idx),
+        is_full_attention=lambda layer_idx: 0 <= int(layer_idx) < int(num_layers),
+    )
+
+
 def make_scheduler_with_oracle(policy, oracle, *, method="", chunk=5, max_tokens=10):
     cfg = SimpleNamespace(
         max_num_seqs_in_batch=4,
@@ -194,6 +203,16 @@ def seq_with_len(n):
 
 
 class PrefillPolicyRegistryTest(unittest.TestCase):
+    def test_scheduler_stops_on_any_request_eos_token(self):
+        scheduler = make_scheduler(PREFILL_POLICY_ALL_CHUNKED)
+        seq = Sequence([1, 2], SamplingParams(max_tokens=8, eos_token_ids=(10, 11)))
+        seq.current_chunk_size = 2
+
+        scheduler.postprocess([seq], [11], is_prefill=True)
+
+        self.assertTrue(seq.is_finished)
+        self.assertNotIn(seq, scheduler.decoding)
+
     def test_all_supported_methods_have_one_default_policy(self):
         for method, policy in PREFILL_POLICY_BY_METHOD.items():
             with self.subTest(method=method):
@@ -396,9 +415,12 @@ class PrefillPolicyConfigTest(unittest.TestCase):
                 return Config(model=str(model_dir), **kwargs)
 
     def test_obs_layers_are_derived_from_full_attention_layers(self):
-        cfg = self.make_config(vllm_sparse_method="vanilla", full_attn_layers="0,1,3")
-        self.assertEqual(cfg.full_attn_layers, [0, 1, 3])
-        self.assertEqual(cfg.obs_layer_ids, [1, 3])
+        cfg = self.make_config(vllm_sparse_method="vanilla", full_attn_layers="0")
+        self.assertEqual(cfg.full_attn_layers, [0])
+        self.assertEqual(cfg.obs_layer_ids, [0])
+
+        cfg = self.make_config(vllm_sparse_method="vanilla", full_attn_layers="0,1")
+        self.assertEqual(cfg.obs_layer_ids, [])
 
     def test_obs_layer_ids_is_not_a_config_argument(self):
         with self.assertRaisesRegex(TypeError, "obs_layer_ids"):
@@ -719,6 +741,8 @@ class DecodeCudaGraphCapacityPolicyTest(unittest.TestCase):
         runner = object.__new__(DecodeCudaGraphRunner)
         runner.method = method
         runner.cache_manager = cache_manager if cache_manager is not None else SimpleNamespace()
+        runner.runtime_state = runner.cache_manager
+        runner.recurrent_state_manager = None
         runner.max_context_len_override = None
         runner._graphs = {}
         runner.capture_sizes = [1, 2, 4, 8, 16]
@@ -794,6 +818,9 @@ class DecodeCudaGraphCapacityPolicyTest(unittest.TestCase):
                 None,
             ),
         )
+        runner.runtime_state = SimpleNamespace(
+            prepare_decode_static=runner.cache_manager.prepare_decode_static,
+        )
         runner.sparse_controller = SimpleNamespace(prepare_forward=lambda seqs, is_prefill: None)
         runner.is_long_text_batch = lambda seqs, is_prefill: False
         runner.run_model = lambda input_ids, positions, is_prefill: torch.zeros((input_ids.shape[0], 4))
@@ -826,6 +853,9 @@ class DecodeCudaGraphCapacityPolicyTest(unittest.TestCase):
                 positions,
                 None,
             ),
+        )
+        runner.runtime_state = SimpleNamespace(
+            prepare_decode_static=runner.cache_manager.prepare_decode_static,
         )
         runner.sparse_controller = SimpleNamespace(
             prepare_forward=lambda seqs, is_prefill: calls.append(f"prepare:{is_prefill}")
@@ -1146,6 +1176,7 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
 
     def test_snapkv_batch_free_part_slots_compacts_rows_and_releases_slots(self):
         manager = object.__new__(SnapKVCacheManager)
+        manager.runtime_layout = identity_runtime_layout(1)
         manager.device = torch.device("cpu")
         manager._uniform_decode_metadata = True
         manager.buffer_req_to_token_slots_tensor = torch.empty((1, 2, 6), dtype=torch.int32)
@@ -1186,6 +1217,7 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
 
     def test_snapkv_layer_batch_free_part_slots_compacts_rows_and_releases_slots(self):
         manager = object.__new__(SnapKVCacheManager)
+        manager.runtime_layout = identity_runtime_layout(2)
         manager.device = torch.device("cpu")
         manager._uniform_decode_metadata = True
         manager.seq_id_to_row = [{10: 0, 11: 1}, {10: 0, 11: 1}]
@@ -1253,6 +1285,7 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
 
     def test_snapkv_prefix_recent_layer_batch_compacts_contiguous_middle(self):
         manager = object.__new__(SnapKVCacheManager)
+        manager.runtime_layout = identity_runtime_layout(2)
         manager.device = torch.device("cpu")
         manager._uniform_decode_metadata = True
         manager.seq_id_to_row = [{10: 0, 11: 1}, {10: 0, 11: 1}]
@@ -1316,6 +1349,7 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
 
     def test_snapkv_prefill_batch_all_layers_preserves_stack_order(self):
         manager = object.__new__(SnapKVCacheManager)
+        manager.runtime_layout = identity_runtime_layout(2)
         manager.device = torch.device("cpu")
         manager.num_layers = 2
         manager.max_model_len = 8
@@ -1369,9 +1403,11 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
 
     def test_pyramidkv_batch_materialize_updates_rows_and_kv(self):
         manager = object.__new__(SnapKVCacheManager)
+        manager.runtime_layout = identity_runtime_layout(1)
         manager.config = SimpleNamespace(vllm_sparse_method="pyramidkv")
         manager.device = torch.device("cpu")
         manager.num_layers = 1
+        manager.num_kv_layers = 1
         manager.max_model_len = 8
         manager._pyramidkv_prefill_staging_active = True
         manager._pyramidkv_prefill_staging_materialized_layers = set()
@@ -1432,6 +1468,7 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
         from sparsevllm.engine.cache_manager.raw_kv_offload import RawKVOffloadBuffer
 
         manager = object.__new__(SnapKVCacheManager)
+        manager.runtime_layout = identity_runtime_layout(1)
         manager.config = SimpleNamespace(vllm_sparse_method="pyramidkv")
         manager.device = torch.device("cpu")
         manager.num_layers = 1
@@ -1478,6 +1515,7 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
 
     def test_pyramidkv_long_prefill_offload_prefetch_waits_for_current_stream_before_staging_write(self):
         manager = object.__new__(SnapKVCacheManager)
+        manager.runtime_layout = identity_runtime_layout(2)
         manager.device = "cuda:0"
         manager.num_layers = 2
         manager._pyramidkv_long_prefill_offload_prefetch_stream = None

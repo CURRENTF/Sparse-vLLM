@@ -113,6 +113,18 @@ class SparseController:
 
         self.layers = None
 
+    def _is_kv_layer(self, layer_idx: int) -> bool:
+        runtime_layout = getattr(self.config, "runtime_layout", None)
+        if runtime_layout is None:
+            return True
+        return bool(runtime_layout.is_full_attention(int(layer_idx)))
+
+    def _kv_layer_index(self, layer_idx: int) -> int:
+        runtime_layout = getattr(self.config, "runtime_layout", None)
+        if runtime_layout is None:
+            return int(layer_idx)
+        return int(runtime_layout.kv_layer_index(int(layer_idx)))
+
     def set_tokenizer_metadata(
         self,
         *,
@@ -197,6 +209,17 @@ class SparseController:
 
         for i in range(self.num_layers):
             state = self.layer_batch_sparse_states[i]
+            if not self._is_kv_layer(i):
+                state.context_lens = None
+                state.max_context_len = None
+                state.req_indices = None
+                state.global_req_indices = None
+                state.attn_score = None
+                state.active_indices = None
+                state.active_slots = None
+                state.active_compressed_indices = None
+                state.deltakv_free_temp_slots = False
+                continue
             batch_state = self.cache_manager.get_layer_batch_states(i)
             
             # 统一语义：context_lens 代表当前 attn 可见长度 （即使是动态稀疏方法）
@@ -308,6 +331,8 @@ class SparseController:
     @torch.no_grad()
     def on_layer_attention_end(self, layer_idx: int):
         """Layer-local sparse finalization for methods that use temporary prefill KV."""
+        if not self._is_kv_layer(layer_idx):
+            return
         ctx = get_context()
         if not ctx.is_prefill or self.sparse_method != "pyramidkv":
             return
@@ -399,6 +424,8 @@ class SparseController:
 
     def _build_selection(self, layer_idx: int, *, is_prefill: bool, q: torch.Tensor | None = None) -> SparseSelection:
         """Return logical sparse selection only; cache managers build physical views."""
+        if not self._is_kv_layer(layer_idx):
+            raise RuntimeError(f"layer_idx={layer_idx} is linear_attention and has no KV sparse selection")
         sparse_state = self.layer_batch_sparse_states[layer_idx]
         ctx = get_context()
         is_dynamic_deltakv = self.is_deltakv_family
@@ -486,6 +513,9 @@ class SparseController:
 
     def on_layer_end(self, layer_idx: int, context):
         """每一层结束后的动态策略 (如 OmniKV / DeltaKV)"""
+        if not self._is_kv_layer(layer_idx):
+            self._debug_record_dynamic_selection("on_layer_end", layer_idx, skipped="linear_attention")
+            return
         if get_context().is_long_text is False and not self.is_deltakv_family:
             self._debug_record_dynamic_selection("on_layer_end", layer_idx, skipped="short_text")
             return
@@ -551,9 +581,16 @@ class SparseController:
 
             target_layers = []
             for j in range(layer_idx + 1, self.num_layers):
+                if not self._is_kv_layer(j):
+                    continue
                 if j in self.full_attn_layers: break
                 target_layers.append(j)
-            assert len(target_layers) > 0
+            if not target_layers:
+                raise RuntimeError(
+                    "Dynamic sparse observation layer has no target KV layers: "
+                    f"method={self.sparse_method} observation_layer={layer_idx} "
+                    f"full_attn_layers={self.full_attn_layers}."
+                )
 
             self._update_dynamic_omnikv_indices(layer_idx, target_layers)
 
@@ -565,6 +602,8 @@ class SparseController:
     @torch.no_grad()
     def _snapkv_prefill_eviction(self, seqs: list[Sequence]):
         for layer_idx in range(self.num_layers):
+            if not self._is_kv_layer(layer_idx):
+                continue
             budget = self._get_layer_budget(layer_idx, is_prefill=True)
             if budget is None:
                 continue
@@ -608,6 +647,8 @@ class SparseController:
             )
 
             for layer_idx in range(self.num_layers):
+                if not self._is_kv_layer(layer_idx):
+                    continue
                 state = self.layer_batch_sparse_states[layer_idx]
                 attn_scores = state.attn_score
                 if attn_scores is None:
@@ -757,6 +798,8 @@ class SparseController:
             ] = {}
             kv_len_fn = getattr(self.cache_manager, "decode_kv_lens_for_layer", None)
             for layer_idx in range(self.num_layers):
+                if not self._is_kv_layer(layer_idx):
+                    continue
                 state = self.layer_batch_sparse_states[layer_idx]
                 attn_scores = None
                 if not use_query_cache_scores:
@@ -907,6 +950,8 @@ class SparseController:
             ] = {}
 
             for layer_idx in range(self.num_layers):
+                if not self._is_kv_layer(layer_idx):
+                    continue
                 state = self.layer_batch_sparse_states[layer_idx]
                 triggered: list[tuple[int, Sequence, int]] = []
                 for b_idx, seq in enumerate(seqs):
@@ -987,6 +1032,8 @@ class SparseController:
             ] = {}
 
             for layer_idx in range(self.num_layers):
+                if not self._is_kv_layer(layer_idx):
+                    continue
                 state = self.layer_batch_sparse_states[layer_idx]
                 max_context_len = state.max_context_len
                 if max_context_len is not None and (
@@ -1288,12 +1335,13 @@ class SparseController:
                 else:
                     max_recent_or_chunk = int(self.num_recent)
                 max_sparse_context_len = int(self.num_sink) + int(k_max) + max_recent_or_chunk
+                slot_source_layer = int(target_layers[0])
                 keep_indices, active_slots, new_context_lens = build_omnikv_keep_and_slots(
                     topk_indices,
                     topk_lens,
                     hist_lens,
                     obs_sparse_state.context_lens - hist_lens,  # lens of recent and chunk
-                    self.cache_manager.get_layer_buffer_req_to_token_slots(obs_layer_idx + 1),
+                    self.cache_manager.get_layer_buffer_req_to_token_slots(slot_source_layer),
                     obs_sparse_state.req_indices,
                     self.num_sink,
                     max_s=max_sparse_context_len,
@@ -1371,11 +1419,12 @@ class SparseController:
         return False
 
     def _get_layer_budget(self, layer_idx: int, is_prefill: bool) -> int | None:
-        if layer_idx < self.config.snapkv_num_full_layers:
+        kv_layer_idx = self._kv_layer_index(layer_idx)
+        if kv_layer_idx < self.config.snapkv_num_full_layers:
             return None
         decode_keep = self.decode_keep_tokens
         if self.config.pyramid_layer_ratios is not None:
-            ratio = self.config.pyramid_layer_ratios[layer_idx]
+            ratio = self.config.pyramid_layer_ratios[kv_layer_idx]
             base_ratio = self.config.pyramid_layer_ratios[0]
             scaled_top_tokens = int(decode_keep * ratio / base_ratio)
             return self.num_sink + scaled_top_tokens + self.num_recent

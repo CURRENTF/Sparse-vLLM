@@ -25,6 +25,8 @@ from .prefix_cache_mixin import PrefixCacheMixin
 @dataclass
 class StandardPrefixBlockPayload:
     token_slots: torch.Tensor
+    block_start: int = 0
+    block_end: int = 0
 
 
 def _merge_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
@@ -73,6 +75,7 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
 
         self.enable_prefix_caching = bool(
             config.enable_prefix_caching and config.vllm_sparse_method in ("", "omnikv")
+            and not getattr(getattr(config, "runtime_layout", None), "linear_attention_layer_indices", ())
         )
         self.prefix_cache_block_size = int(config.prefix_cache_block_size)
         self.prefix_cache: RadixPrefixIndex | None = None
@@ -88,7 +91,7 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
 
     def allocate_kv_cache(self):
         available_memory, slot_bytes_per_layer = self._get_available_slots_info()
-        num_layers = self.num_layers
+        num_layers = self.num_kv_layers
 
         slot_bytes = num_layers * slot_bytes_per_layer
         self.config.num_kvcache_slots = available_memory // slot_bytes
@@ -111,16 +114,19 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
         return self.layer_batch_state
 
     def get_layer_kv_cache(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.kv_cache[0, layer_idx], self.kv_cache[1, layer_idx]
+        kv_idx = self.kv_layer_index(layer_idx)
+        return self.kv_cache[0, kv_idx], self.kv_cache[1, kv_idx]
 
     def get_layer_store_view(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return self.kv_cache[0, layer_idx], self.kv_cache[1, layer_idx], self.layer_batch_state.slot_mapping
+        kv_idx = self.kv_layer_index(layer_idx)
+        return self.kv_cache[0, kv_idx], self.kv_cache[1, kv_idx], self.layer_batch_state.slot_mapping
 
     def get_layer_compute_tensors(self, layer_idx: int, selection: SparseSelection | None = None):
         del selection
         raise NotImplementedError
 
     def get_layer_buffer_req_to_token_slots(self, layer_idx: int) -> torch.Tensor:
+        self.kv_layer_index(layer_idx)
         return self.buffer_req_to_token_slots
 
     @property
@@ -299,12 +305,112 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
             self._num_free_slots += count
 
     def _make_prefix_block_payload(self, slots: torch.Tensor) -> StandardPrefixBlockPayload:
-        return StandardPrefixBlockPayload(token_slots=slots)
+        return StandardPrefixBlockPayload(
+            token_slots=slots,
+            block_start=0,
+            block_end=int(slots.numel()),
+        )
 
     def _mark_materialized_prefix_block(self, seq: Sequence, block: PrefixCacheBlock) -> None:
         cached_ranges = self.seq_id_to_cached_ranges.setdefault(seq.seq_id, [])
         start = int(block.logical_block_idx) * self.prefix_cache_block_size
         cached_ranges.append((start, start + self.prefix_cache_block_size))
+
+    def build_prefix_kv_payload(self, seq: Sequence, block_start: int, block_end: int) -> StandardPrefixBlockPayload:
+        block_start = int(block_start)
+        block_end = int(block_end)
+        if block_end <= block_start:
+            raise ValueError(f"Invalid prefix KV payload range: {block_start}:{block_end}.")
+        row_idx = self.seq_id_to_row.get(int(seq.seq_id))
+        if row_idx is None:
+            raise RuntimeError(f"Cannot build prefix KV payload for unknown seq_id={seq.seq_id}.")
+        row_len = int(self.row_seq_lens[row_idx])
+        if block_end > row_len:
+            raise RuntimeError(
+                "Cannot build prefix KV payload beyond materialized row length: "
+                f"seq_id={seq.seq_id} block={block_start}:{block_end} row_len={row_len}."
+            )
+        slots = self.buffer_req_to_token_slots[row_idx, block_start:block_end].detach().to(
+            dtype=torch.int32,
+        ).clone()
+        return StandardPrefixBlockPayload(
+            token_slots=slots,
+            block_start=block_start,
+            block_end=block_end,
+        )
+
+    def attach_prefix_kv_payload(self, seq: Sequence, payload: object) -> None:
+        if not isinstance(payload, StandardPrefixBlockPayload):
+            raise RuntimeError("Standard mixed prefix KV payload is missing token slots.")
+        slots = payload.token_slots.to(device=self.device, dtype=torch.int32).reshape(-1)
+        count = int(slots.numel())
+        if count <= 0:
+            raise RuntimeError("Standard mixed prefix KV payload is empty.")
+        if count % int(self.config.prefix_cache_block_size) != 0:
+            raise RuntimeError(
+                f"Standard mixed prefix KV payload size must be block-aligned, got {count}."
+            )
+        row_idx = self._get_free_row(int(seq.seq_id))
+        cur_len = int(self.row_seq_lens[row_idx])
+        if int(payload.block_start) != cur_len:
+            raise RuntimeError(
+                "Standard mixed prefix KV payload attach must be contiguous: "
+                f"seq_id={seq.seq_id} block_start={int(payload.block_start)} row_len={cur_len}."
+            )
+        start = cur_len
+        end = start + count
+        if int(payload.block_end) not in {0, end}:
+            raise RuntimeError(
+                "Standard mixed prefix KV payload has inconsistent block_end: "
+                f"payload_end={int(payload.block_end)} expected={end}."
+            )
+        if end > int(self.max_model_len):
+            raise RuntimeError(
+                "Attaching mixed prefix KV payload exceeds max_model_len: "
+                f"seq_id={seq.seq_id} end={end} max_model_len={self.max_model_len}."
+            )
+        self.buffer_req_to_token_slots[row_idx, start:end] = slots
+        self.row_seq_lens[row_idx] = end
+        cached_ranges = self.seq_id_to_cached_ranges.setdefault(int(seq.seq_id), [])
+        cached_ranges.append((start, end))
+
+    def free_prefix_kv_payload(self, payload: object) -> None:
+        if not isinstance(payload, StandardPrefixBlockPayload):
+            raise RuntimeError("Standard mixed prefix KV payload is missing token slots.")
+        slots = payload.token_slots.to(device=self.device, dtype=torch.int32).reshape(-1)
+        count = int(slots.numel())
+        ptr = self._num_free_slots
+        self.free_slots_stack[ptr: ptr + count] = slots
+        self._num_free_slots += count
+
+    def prefix_kv_payload_nbytes(self, payload: object) -> int:
+        if not isinstance(payload, StandardPrefixBlockPayload):
+            raise RuntimeError("Standard mixed prefix KV payload is missing token slots.")
+        dtype_size = self._cache_slot_dtype_size()
+        return int(
+            payload.token_slots.numel()
+            * self.num_kv_layers
+            * 2
+            * self.num_kv_heads
+            * self.head_dim
+            * dtype_size
+        )
+
+    def mark_materialized_prefix_kv_payload(self, seq: Sequence, payload: object) -> None:
+        if not isinstance(payload, StandardPrefixBlockPayload):
+            raise RuntimeError("Standard mixed prefix KV payload is missing token slots.")
+        row_idx = self.seq_id_to_row.get(int(seq.seq_id))
+        if row_idx is None:
+            raise RuntimeError(f"Cannot mark mixed prefix payload for unknown seq_id={seq.seq_id}.")
+        start = int(payload.block_start)
+        end = int(payload.block_end)
+        row_len = int(self.row_seq_lens[row_idx])
+        if start < 0 or end <= start or end > row_len:
+            raise RuntimeError(
+                "Cannot mark mixed prefix payload: "
+                f"seq_id={seq.seq_id} range={start}:{end} row_len={row_len}."
+            )
+        self.seq_id_to_cached_ranges.setdefault(int(seq.seq_id), []).append((start, end))
 
     def _reset_prefix_cache_allocator_after_clear(self) -> None:
         if self.seq_id_to_row:

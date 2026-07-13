@@ -71,12 +71,12 @@ def test_tp_shm_name_is_unique_per_engine_instance():
 def test_free_slots_batch_releases_each_seq_id():
     freed: list[int] = []
 
-    class FakeCacheManager:
+    class FakeRuntimeState:
         def free_seq(self, seq_id: int):
             freed.append(int(seq_id))
 
     runner = object.__new__(ModelRunner)
-    runner.cache_manager = FakeCacheManager()
+    runner.runtime_state = FakeRuntimeState()
 
     ModelRunner.free_slots_batch(runner, [3, 5, 8])
 
@@ -136,7 +136,7 @@ def test_tp_worker_decode_skips_rank0_sampling_path():
     runner.sparse_controller = SimpleNamespace(
         post_forward=lambda seqs, is_prefill: calls.append(f"sparse_post:{is_prefill}")
     )
-    runner.cache_manager = SimpleNamespace(
+    runner.runtime_state = SimpleNamespace(
         on_forward_end=lambda seqs, is_prefill: calls.append(f"cache_post:{is_prefill}")
     )
     runner.sampler = lambda *args, **kwargs: calls.append("sample")

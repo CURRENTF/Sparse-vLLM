@@ -11,6 +11,84 @@ def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
     param.data.copy_(loaded_weight)
 
 
+def _module_for_parameter(model: nn.Module, param_name: str) -> nn.Module:
+    module_name, sep, _ = param_name.rpartition(".")
+    if not sep:
+        return model
+    return model.get_submodule(module_name)
+
+
+def _scale_key_for_weight_key(weight_key: str) -> str:
+    if not weight_key.endswith(".weight"):
+        raise ValueError(f"Expected a weight key ending in '.weight', got {weight_key!r}.")
+    return weight_key[: -len(".weight")] + ".weight_scale_inv"
+
+
+def _target_weight_name_for_model(model: nn.Module, source_weight_name: str) -> str | None:
+    ignored_prefixes = tuple(getattr(model, "ignored_weight_prefixes", ()))
+    if source_weight_name.startswith(ignored_prefixes):
+        return None
+    mapper = getattr(model, "map_weight_name", None)
+    target_weight_name = mapper(source_weight_name) if callable(mapper) else source_weight_name
+    if target_weight_name is not None and not isinstance(target_weight_name, str):
+        raise TypeError(
+            f"map_weight_name() must return str or None, got {type(target_weight_name).__name__}."
+        )
+    return target_weight_name
+
+
+def _load_grouped_quantized_weight(
+    *,
+    model: nn.Module,
+    module: nn.Module,
+    source_weight_name: str,
+    target_weight_name: str,
+    loaded_weight: torch.Tensor,
+    loaded_scale: torch.Tensor | None,
+    loaded_shard_id=None,
+) -> bool:
+    del model
+    if not source_weight_name.endswith(".weight"):
+        return False
+    has_quantized_loader = hasattr(module, "load_quantized_weight")
+    if loaded_scale is None:
+        if bool(getattr(module, "quantized", False)):
+            raise ValueError(
+                f"Missing FP8 weight_scale_inv for quantized weight {source_weight_name!r} "
+                f"(target {target_weight_name!r})."
+            )
+        return False
+    if not has_quantized_loader:
+        raise ValueError(
+            f"Found {source_weight_name!r} with weight_scale_inv, but target module "
+            f"{type(module).__name__} does not support grouped quantized loading."
+        )
+    if not bool(getattr(module, "quantized", False)):
+        raise ValueError(
+            f"Found FP8 weight_scale_inv for {source_weight_name!r}, but target module "
+            f"{type(module).__name__} was not constructed with quantization enabled."
+        )
+    module.load_quantized_weight(loaded_weight, loaded_scale, loaded_shard_id)
+    return True
+
+
+def _validate_all_quantized_weights_loaded(model: nn.Module) -> None:
+    missing = []
+    for name, module in model.named_modules():
+        if bool(getattr(module, "quantized", False)) and not bool(
+            getattr(module, "_quantized_weight_loaded", False)
+        ):
+            loaded_ranges = getattr(module, "_quantized_loaded_ranges", [])
+            missing.append(
+                f"{name or '<root>'} ({type(module).__name__}, loaded_ranges={loaded_ranges})"
+            )
+    if missing:
+        raise ValueError(
+            "Missing FP8 weight loads for quantized Linear modules: "
+            f"{missing[:8]}."
+        )
+
+
 def _iter_deltakv_compressor_items(state_dict: dict[str, torch.Tensor]):
     for key, weight in state_dict.items():
         parts = key.split(".")
@@ -401,22 +479,93 @@ def load_model(model: nn.Module, path: str, *, rank: int | None = None, world_si
     loaded_count = 0
     for file in files:
         with safe_open(file, "pt", "cpu") as f:
-            for source_weight_name in f.keys():
-                param_name = source_weight_name
+            keys = list(f.keys())
+            scale_keys = {key for key in keys if key.endswith(".weight_scale_inv")}
+            consumed_scale_keys: set[str] = set()
+            for source_weight_name in keys:
+                if source_weight_name.endswith(".weight_scale_inv"):
+                    continue
+                scale_key = None
+                loaded_scale = None
+                if source_weight_name.endswith(".weight"):
+                    scale_key = _scale_key_for_weight_key(source_weight_name)
+                    loaded_scale = f.get_tensor(scale_key) if scale_key in scale_keys else None
+                param_name = _target_weight_name_for_model(model, source_weight_name)
+                if param_name is None:
+                    if scale_key is not None and loaded_scale is not None:
+                        consumed_scale_keys.add(scale_key)
+                    continue
+                special_loader = getattr(model, "load_special_weight", None)
+                special_suffixes = tuple(getattr(model, "special_weight_loaders", ()))
+                if callable(special_loader) and param_name.endswith(special_suffixes):
+                    special_count = int(
+                        special_loader(
+                            param_name,
+                            f.get_tensor(source_weight_name),
+                            loaded_scale,
+                        )
+                    )
+                    if special_count < 0:
+                        raise ValueError(
+                            f"load_special_weight() returned a negative count for {param_name!r}."
+                        )
+                    if special_count:
+                        if scale_key is not None and loaded_scale is not None:
+                            consumed_scale_keys.add(scale_key)
+                        loaded_count += special_count
+                        continue
                 for k in packed_modules_mapping:
                     if k in param_name:
                         v, shard_id = packed_modules_mapping[k]
                         packed_param_name = param_name.replace(k, v)
-                        param = model.get_parameter(packed_param_name)
-                        weight_loader = getattr(param, "weight_loader")
-                        weight_loader(param, f.get_tensor(source_weight_name), shard_id)
+                        module = _module_for_parameter(model, packed_param_name)
+                        scale_key = _scale_key_for_weight_key(source_weight_name)
+                        loaded_scale = f.get_tensor(scale_key) if scale_key in scale_keys else None
+                        if _load_grouped_quantized_weight(
+                            model=model,
+                            module=module,
+                            source_weight_name=source_weight_name,
+                            target_weight_name=packed_param_name,
+                            loaded_weight=f.get_tensor(source_weight_name),
+                            loaded_scale=loaded_scale,
+                            loaded_shard_id=shard_id,
+                        ):
+                            consumed_scale_keys.add(scale_key)
+                        else:
+                            param = model.get_parameter(packed_param_name)
+                            weight_loader = getattr(param, "weight_loader")
+                            weight_loader(param, f.get_tensor(source_weight_name), shard_id)
                         loaded_count += 1
                         break
                 else:
+                    module = _module_for_parameter(model, param_name)
+                    loaded_scale = None
+                    if source_weight_name.endswith(".weight"):
+                        scale_key = _scale_key_for_weight_key(source_weight_name)
+                        loaded_scale = f.get_tensor(scale_key) if scale_key in scale_keys else None
+                    if loaded_scale is not None:
+                        consumed_scale_keys.add(scale_key)
+                    if _load_grouped_quantized_weight(
+                        model=model,
+                        module=module,
+                        source_weight_name=source_weight_name,
+                        target_weight_name=param_name,
+                        loaded_weight=f.get_tensor(source_weight_name),
+                        loaded_scale=loaded_scale,
+                    ):
+                        loaded_count += 1
+                        continue
                     param = model.get_parameter(param_name)
                     weight_loader = getattr(param, "weight_loader", default_weight_loader)
                     weight_loader(param, f.get_tensor(source_weight_name))
                     loaded_count += 1
+            unused_scale_keys = sorted(scale_keys - consumed_scale_keys)
+            if unused_scale_keys:
+                raise ValueError(
+                    "Found weight_scale_inv tensors without a grouped FP8 weight load: "
+                    f"{unused_scale_keys[:5]}."
+                )
     
     assert loaded_count > 0, f"No weights were loaded from {path}"
+    _validate_all_quantized_weights_loaded(model)
     print(f"Successfully loaded {loaded_count} weights from {path}")

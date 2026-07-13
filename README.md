@@ -83,6 +83,13 @@ MAX_JOBS=8 pip install flash-attn --no-build-isolation
 pip install -e .
 ```
 
+Qwen3.5/Qwen3.6 FP8 mixed-attention inference additionally requires the
+CUDA-specific optional dependencies:
+
+```bash
+pip install -e ".[qwen35]"
+```
+
 For the full dependency list and a minimal `LLM(...)` example, see
 [Getting Started](docs/getting_started/README.md).
 

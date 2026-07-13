@@ -330,7 +330,7 @@ class HfDeltaKVModelingTest(unittest.TestCase):
         cache = DeltaKVLessMemoryCacheManager.__new__(DeltaKVLessMemoryCacheManager)
         self.assertFalse(hasattr(cache, "has_direct_full_layer_decode_attention"))
 
-    def test_full_layer_quantized_view_excludes_kivi_direct_decode(self):
+    def test_full_layer_quantized_view_is_removed_from_slim_runtime(self):
         from sparsevllm.engine.cache_manager.deltakv_less_memory import DeltaKVLessMemoryCacheManager
 
         cache = DeltaKVLessMemoryCacheManager.__new__(DeltaKVLessMemoryCacheManager)
@@ -344,7 +344,7 @@ class HfDeltaKVModelingTest(unittest.TestCase):
 
         cache.config.enable_full_layer_kivi_quant = False
         cache.config.full_layer_kv_quant_bits = 4
-        self.assertTrue(cache.has_full_layer_quantized_view(0))
+        self.assertFalse(cache.has_full_layer_quantized_view(0))
 
     def test_deltakv_static_decode_buffer_covers_eviction_remainder(self):
         from sparsevllm.engine.cache_manager.deltakv_less_memory import DeltaKVLessMemoryCacheManager

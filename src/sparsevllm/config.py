@@ -1,6 +1,8 @@
 import importlib.util
+import json
 import os
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any, Union
 
 from transformers import AutoConfig
@@ -211,6 +213,350 @@ def _normalize_decode_cuda_graph_context_policy(value: str | None) -> str:
     return policy
 
 
+def _config_get(config: Any, name: str, default: Any = None) -> Any:
+    if config is None:
+        return default
+    if isinstance(config, dict):
+        return config.get(name, default)
+    return getattr(config, name, default)
+
+
+def _config_to_namespace(config: dict[str, Any]) -> SimpleNamespace:
+    return SimpleNamespace(**config)
+
+
+def _load_raw_qwen35_config(model_path: str, error: Exception) -> SimpleNamespace:
+    config_path = os.path.join(model_path, "config.json")
+    if not os.path.isfile(config_path):
+        raise RuntimeError(
+            "AutoConfig.from_pretrained failed and no config.json exists for explicit "
+            f"qwen3_5 fallback. model={model_path} error={type(error).__name__}: {error}"
+        ) from error
+    with open(config_path, "r", encoding="utf-8") as f:
+        raw_config = json.load(f)
+    if not _is_qwen35_outer_config(raw_config):
+        raise RuntimeError(
+            "AutoConfig.from_pretrained failed. Refusing to silently fall back to raw "
+            f"`config.json` for non-qwen3_5 model. model={model_path} "
+            f"error={type(error).__name__}: {error}"
+        ) from error
+    log_once(
+        "AutoConfig.from_pretrained failed for qwen3_5/qwen3_6; loading raw config.json "
+        "through Sparse-vLLM's explicit mixed-runtime parser.",
+        level="WARNING",
+    )
+    return _config_to_namespace(raw_config)
+
+
+def _coerce_int_list(name: str, value: Any, *, allow_none: bool = False) -> list[int] | None:
+    if value is None:
+        if allow_none:
+            return None
+        raise ValueError(f"{name} is required.")
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return []
+        parts = [part.strip() for part in raw.split(",") if part.strip()]
+        return [int(part) for part in parts]
+    if isinstance(value, (list, tuple)):
+        return [int(item) for item in value]
+    raise ValueError(f"{name} must be a list/tuple of ints or a comma-separated string, got {value!r}.")
+
+
+def _attention_type_is_full(value: Any) -> bool:
+    text = str(value).strip().lower()
+    return text in {"full", "full_attention", "attention", "self_attention", "sliding_attention"}
+
+
+def _attention_type_is_linear(value: Any) -> bool:
+    text = str(value).strip().lower()
+    return text in {"linear", "linear_attention", "recurrent", "recurrent_attention", "gated_delta", "gated_delta_net"}
+
+
+@dataclass(frozen=True)
+class QuantizationConfig:
+    enabled: bool = False
+    quant_method: str = ""
+    weight_dtype: str = ""
+    activation_scheme: str = ""
+    weight_block_size: tuple[int, int] | None = None
+    backend: str = "auto"
+
+    @classmethod
+    def disabled(cls) -> "QuantizationConfig":
+        return cls()
+
+    def to_dict(self) -> dict[str, Any]:
+        if not self.enabled:
+            return {}
+        payload: dict[str, Any] = {
+            "quant_method": self.quant_method,
+            "fmt": self.weight_dtype,
+            "activation_scheme": self.activation_scheme,
+            "backend": self.backend,
+        }
+        if self.weight_block_size is not None:
+            payload["weight_block_size"] = list(self.weight_block_size)
+        return payload
+
+    @classmethod
+    def from_hf_config(cls, value: Any, *, required_fp8: bool = False) -> "QuantizationConfig":
+        if value is None:
+            if required_fp8:
+                raise ValueError("qwen3_5 requires FP8 quantization_config; BF16/FP16 fallback is not supported.")
+            return cls.disabled()
+
+        quant_method = str(
+            _config_get(value, "quant_method", _config_get(value, "method", ""))
+            or ""
+        ).strip().lower()
+        if quant_method not in {"fp8", "fbgemm_fp8"}:
+            if required_fp8:
+                raise ValueError(
+                    "qwen3_5 requires quantization_config.quant_method='fp8', "
+                    f"got {quant_method!r}."
+                )
+            return cls.disabled()
+
+        weight_dtype = str(
+            _config_get(
+                value,
+                "weight_dtype",
+                _config_get(value, "fmt", _config_get(value, "format", "e4m3")),
+            )
+            or ""
+        ).strip().lower()
+        if "e4m3" not in weight_dtype:
+            raise ValueError(
+                "Sparse-vLLM qwen3_5 FP8 supports e4m3 weights only, "
+                f"got weight_dtype={weight_dtype!r}."
+            )
+
+        activation_scheme = str(
+            _config_get(value, "activation_scheme", _config_get(value, "activation", "dynamic"))
+            or ""
+        ).strip().lower()
+        if activation_scheme != "dynamic":
+            raise ValueError(
+                "Sparse-vLLM qwen3_5 FP8 supports dynamic activation only, "
+                f"got activation_scheme={activation_scheme!r}."
+            )
+
+        block_size = _config_get(
+            value,
+            "weight_block_size",
+            _config_get(value, "weight_block_shape", _config_get(value, "block_size", (128, 128))),
+        )
+        if isinstance(block_size, int):
+            block_tuple = (int(block_size), int(block_size))
+        elif isinstance(block_size, (list, tuple)) and len(block_size) == 2:
+            block_tuple = (int(block_size[0]), int(block_size[1]))
+        else:
+            raise ValueError(f"weight_block_size must be a pair, got {block_size!r}.")
+        if block_tuple != (128, 128):
+            raise ValueError(
+                "Sparse-vLLM qwen3_5 FP8 supports weight_block_size=(128, 128) only, "
+                f"got {block_tuple}."
+            )
+
+        backend = str(_config_get(value, "backend", "auto") or "auto").strip().lower()
+        return cls(
+            enabled=True,
+            quant_method="fp8",
+            weight_dtype="e4m3",
+            activation_scheme="dynamic",
+            weight_block_size=block_tuple,
+            backend=backend,
+        )
+
+
+@dataclass(frozen=True)
+class RuntimeLayout:
+    num_layers: int
+    num_kv_layers: int
+    full_attention_layer_indices: tuple[int, ...]
+    linear_attention_layer_indices: tuple[int, ...]
+    layer_idx_to_kv_idx: tuple[int | None, ...]
+    kv_idx_to_layer_idx: tuple[int, ...]
+
+    @classmethod
+    def dense(cls, num_layers: int) -> "RuntimeLayout":
+        num_layers = int(num_layers)
+        layers = tuple(range(num_layers))
+        return cls(
+            num_layers=num_layers,
+            num_kv_layers=num_layers,
+            full_attention_layer_indices=layers,
+            linear_attention_layer_indices=(),
+            layer_idx_to_kv_idx=tuple(range(num_layers)),
+            kv_idx_to_layer_idx=layers,
+        )
+
+    @classmethod
+    def from_config(cls, hf_config: Any, *, require_mixed: bool = False) -> "RuntimeLayout":
+        num_layers = int(_config_get(hf_config, "num_hidden_layers"))
+        layer_types = _config_get(hf_config, "layer_types", None)
+        full_layers = _coerce_int_list(
+            "full_attention_layer_indices",
+            _config_get(
+                hf_config,
+                "full_attention_layer_indices",
+                _config_get(hf_config, "attention_layer_indices", None),
+            ),
+            allow_none=True,
+        )
+        linear_layers = _coerce_int_list(
+            "linear_attention_layer_indices",
+            _config_get(hf_config, "linear_attention_layer_indices", None),
+            allow_none=True,
+        )
+
+        if layer_types is not None:
+            if len(layer_types) != num_layers:
+                raise ValueError(
+                    f"runtime layer_types length must equal num_hidden_layers: "
+                    f"{len(layer_types)} != {num_layers}."
+                )
+            inferred_full: list[int] = []
+            inferred_linear: list[int] = []
+            for idx, layer_type in enumerate(layer_types):
+                if _attention_type_is_full(layer_type):
+                    inferred_full.append(idx)
+                elif _attention_type_is_linear(layer_type):
+                    inferred_linear.append(idx)
+                else:
+                    raise ValueError(f"Unsupported qwen3_5 layer_types[{idx}]={layer_type!r}.")
+            full_layers = inferred_full if full_layers is None else full_layers
+            linear_layers = inferred_linear if linear_layers is None else linear_layers
+
+        if full_layers is None and linear_layers is None:
+            if require_mixed:
+                raise ValueError(
+                    "qwen3_5 requires a mixed attention layer map: provide layer_types or "
+                    "full_attention_layer_indices/linear_attention_layer_indices."
+                )
+            return cls.dense(num_layers)
+        if full_layers is None:
+            linear_set = set(linear_layers or [])
+            full_layers = [idx for idx in range(num_layers) if idx not in linear_set]
+        if linear_layers is None:
+            full_set = set(full_layers or [])
+            linear_layers = [idx for idx in range(num_layers) if idx not in full_set]
+
+        full_tuple = tuple(sorted(int(idx) for idx in full_layers))
+        linear_tuple = tuple(sorted(int(idx) for idx in linear_layers))
+        full_set = set(full_tuple)
+        linear_set = set(linear_tuple)
+        expected = set(range(num_layers))
+        if full_set & linear_set:
+            overlap = sorted(full_set & linear_set)
+            raise ValueError(f"RuntimeLayout full and linear layer sets overlap: {overlap}.")
+        if full_set | linear_set != expected:
+            missing = sorted(expected - (full_set | linear_set))
+            extra = sorted((full_set | linear_set) - expected)
+            raise ValueError(f"RuntimeLayout layer map is incomplete: missing={missing}, extra={extra}.")
+
+        raw_layer_to_kv = _config_get(hf_config, "layer_idx_to_kv_idx", None)
+        if raw_layer_to_kv is None:
+            layer_to_kv: list[int | None] = [None] * num_layers
+            for kv_idx, layer_idx in enumerate(full_tuple):
+                layer_to_kv[layer_idx] = kv_idx
+        else:
+            if len(raw_layer_to_kv) != num_layers:
+                raise ValueError(
+                    "layer_idx_to_kv_idx length must equal num_hidden_layers: "
+                    f"{len(raw_layer_to_kv)} != {num_layers}."
+                )
+            layer_to_kv = []
+            for idx, value in enumerate(raw_layer_to_kv):
+                if value is None or int(value) < 0:
+                    layer_to_kv.append(None)
+                else:
+                    layer_to_kv.append(int(value))
+            for layer_idx in linear_tuple:
+                if layer_to_kv[layer_idx] is not None:
+                    raise ValueError(
+                        f"layer_idx_to_kv_idx[{layer_idx}] must be None/-1 for linear_attention layers."
+                    )
+
+        kv_pairs = [(kv_idx, layer_idx) for layer_idx, kv_idx in enumerate(layer_to_kv) if kv_idx is not None]
+        if len(kv_pairs) != len(full_tuple):
+            raise ValueError(
+                "RuntimeLayout must assign exactly one KV index to each full_attention layer: "
+                f"full_layers={len(full_tuple)} assigned={len(kv_pairs)}."
+            )
+        kv_pairs.sort()
+        kv_indices = [kv_idx for kv_idx, _ in kv_pairs]
+        if kv_indices != list(range(len(kv_pairs))):
+            raise ValueError(f"KV layer indices must be contiguous from 0, got {kv_indices}.")
+        kv_tuple = tuple(layer_idx for _, layer_idx in kv_pairs)
+
+        configured_num_kv_layers = _config_get(hf_config, "num_kv_layers", None)
+        if configured_num_kv_layers is not None and int(configured_num_kv_layers) != len(kv_tuple):
+            raise ValueError(
+                f"num_kv_layers={configured_num_kv_layers} does not match full_attention layers={len(kv_tuple)}."
+            )
+        return cls(
+            num_layers=num_layers,
+            num_kv_layers=len(kv_tuple),
+            full_attention_layer_indices=full_tuple,
+            linear_attention_layer_indices=linear_tuple,
+            layer_idx_to_kv_idx=tuple(layer_to_kv),
+            kv_idx_to_layer_idx=kv_tuple,
+        )
+
+    def is_full_attention(self, layer_idx: int) -> bool:
+        return self.layer_idx_to_kv_idx[int(layer_idx)] is not None
+
+    def is_linear_attention(self, layer_idx: int) -> bool:
+        return self.layer_idx_to_kv_idx[int(layer_idx)] is None
+
+    def kv_layer_index(self, layer_idx: int) -> int:
+        layer_idx = int(layer_idx)
+        kv_idx = self.layer_idx_to_kv_idx[layer_idx]
+        if kv_idx is None:
+            raise RuntimeError(f"layer_idx={layer_idx} is linear_attention and has no KV cache")
+        return int(kv_idx)
+
+
+def _is_qwen35_outer_config(config: Any) -> bool:
+    return str(_config_get(config, "model_type", "") or "").strip().lower() in {"qwen3_5", "qwen3_6"}
+
+
+def _extract_text_config(config: Any) -> Any:
+    text_config = _config_get(config, "text_config", None)
+    if text_config is None:
+        return config
+    if isinstance(text_config, dict):
+        return _config_to_namespace(text_config)
+    return text_config
+
+
+def _qwen35_deltakv_message() -> str:
+    return (
+        "DeltaKV for qwen3_5 requires a qwen3_5-compatible deltakv_path. "
+        "Use vllm_sparse_method='' to run quantized vanilla inference."
+    )
+
+
+def _is_qwen35_deltakv_checkpoint(path: str | None) -> bool:
+    if path is None or not os.path.exists(path):
+        return False
+    config_path = os.path.join(path, "config.json") if os.path.isdir(path) else None
+    if config_path is None or not os.path.isfile(config_path):
+        return False
+    with open(config_path, "r", encoding="utf-8") as f:
+        checkpoint_config = json.load(f)
+    candidates = [
+        checkpoint_config.get("model_type"),
+        checkpoint_config.get("base_model_type"),
+        checkpoint_config.get("target_model_type"),
+        checkpoint_config.get("runtime_model_type"),
+    ]
+    return any(str(value).strip().lower() in {"qwen3_5", "qwen3_6"} for value in candidates if value)
+
+
 @dataclass
 class Config:
     model: str
@@ -227,7 +573,11 @@ class Config:
     tensor_parallel_size: int = 1
     enforce_eager: bool = True
     hf_config: Union[Qwen3Config, AutoConfig] | None = None
+    outer_hf_config: Any | None = None
+    runtime_layout: RuntimeLayout | None = None
+    quantization_config: QuantizationConfig = field(default_factory=QuantizationConfig.disabled)
     eos: int = -1
+    eos_token_ids: tuple[int, ...] = field(default_factory=tuple)
     num_kvcache_slots: int | list = -1
 
     # Sparse Attention Config
@@ -237,6 +587,7 @@ class Config:
     enable_prefix_caching: bool = False
     prefix_cache_block_size: int | None = None
     prefix_cache_max_blocks: int | None = None
+    prefix_cache_max_recurrent_bytes: int = 1 << 30
     prefix_cache_salt: str = ""
 
     # General Sparse Config
@@ -441,6 +792,12 @@ class Config:
             "prefix_cache_max_blocks",
             self.prefix_cache_max_blocks,
         )
+        self.prefix_cache_max_recurrent_bytes = _coerce_optional_positive_int(
+            "prefix_cache_max_recurrent_bytes",
+            self.prefix_cache_max_recurrent_bytes,
+        )
+        if self.prefix_cache_max_recurrent_bytes is None:
+            raise ValueError("prefix_cache_max_recurrent_bytes must be a positive integer.")
         if self.enable_prefix_caching and self.vllm_sparse_method not in PREFIX_CACHE_SUPPORTED_METHODS:
             raise ValueError("prefix caching only supports vanilla, omnikv, quest.")
         self.prefix_cache_salt = str(self.prefix_cache_salt or "")
@@ -637,17 +994,39 @@ class Config:
             deltakv_path = self.deltakv_path.strip()
             self.deltakv_path = None if deltakv_path.lower() in {"", "none", "null"} else deltakv_path
         try:
-            self.hf_config = AutoConfig.from_pretrained(self.model, trust_remote_code=True)
+            self.outer_hf_config = AutoConfig.from_pretrained(self.model, trust_remote_code=True)
         except Exception as e:
-            raise RuntimeError(
-                "AutoConfig.from_pretrained failed. Refusing to silently fall back to raw "
-                f"`config.json`. model={self.model} error={type(e).__name__}: {e}"
-            ) from e
+            self.outer_hf_config = _load_raw_qwen35_config(self.model, e)
+        is_qwen35 = _is_qwen35_outer_config(self.outer_hf_config)
+        self.hf_config = _extract_text_config(self.outer_hf_config)
+        if is_qwen35:
+            setattr(self.hf_config, "model_type", "qwen3_5")
+        raw_quantization_config = _config_get(
+            self.hf_config,
+            "quantization_config",
+            _config_get(self.outer_hf_config, "quantization_config", None),
+        )
+        self.quantization_config = QuantizationConfig.from_hf_config(
+            raw_quantization_config,
+            required_fp8=is_qwen35,
+        )
+        setattr(self.hf_config, "quantization_config", self.quantization_config)
         if getattr(self.hf_config, "model_type", "") in {"deepseek_v2", "deepseek_v32"}:
             raise NotImplementedError(
                 f"Unsupported Sparse-vLLM model_type={self.hf_config.model_type!r}. "
-                "Supported model types: qwen2, qwen3, llama."
+                "Supported model types: qwen2, qwen3, qwen3_5, llama."
             )
+        if (
+            self.vllm_sparse_method == "deltakv"
+            and not is_qwen35
+            and self.deltakv_path is None
+            and not self.allow_missing_deltakv_path
+        ):
+            raise ValueError(
+                "DeltaKV requires deltakv_path for compressor sparse layers. "
+                "Set allow_missing_deltakv_path=True only for construction-only tests."
+            )
+        self.runtime_layout = RuntimeLayout.from_config(self.hf_config, require_mixed=is_qwen35)
         if self.max_model_len > self.hf_config.max_position_embeddings:
             logger.warning('max_model_len > model.max_position_embeddings 输出可能不正常')
             self.hf_config.max_position_embeddings = self.max_model_len
@@ -796,7 +1175,15 @@ class Config:
                 "Official SkipKV support is limited to the released steering vectors for "
                 f"{', '.join(sorted(SUPPORTED_SKIPKV_MODEL_NAMES))}."
             )
+        if is_qwen35 and self.enable_prefix_caching and self.prefix_cache_block_size is None:
+            self.prefix_cache_block_size = 4096
         self.prefix_cache_block_size = resolve_prefix_cache_block_size(self)
+        if is_qwen35 and self.enable_prefix_caching:
+            if self.prefix_cache_block_size < 4096 or self.prefix_cache_block_size % 4096 != 0:
+                raise ValueError(
+                    "qwen3_5 mixed prefix cache requires prefix_cache_block_size to be "
+                    f"4096*N, got {self.prefix_cache_block_size}."
+                )
 
         # Normalize compressor type strings.
         for attr in ("compressor_down_type", "compressor_up_type"):
@@ -812,6 +1199,8 @@ class Config:
                 "verify results carefully before treating them as final.",
                 level="WARNING",
             )
+            if is_qwen35 and not _is_qwen35_deltakv_checkpoint(self.deltakv_path):
+                raise ValueError(_qwen35_deltakv_message())
             if not bool(getattr(self, "use_compression", True)):
                 raise ValueError("DeltaKV runtime is compressor-only; set use_compression=True.")
             if bool(getattr(self, "enable_sparse_ref_fp8", False)):
@@ -870,11 +1259,23 @@ class Config:
                     "(full_layer_kv_quant_bits=4, kv_quant_bits=4, enable_full_layer_kivi_quant=True)."
                 )
 
-        self.obs_layer_ids = [
-            int(layer)
-            for layer in self.full_attn_layers
-            if (int(layer) + 1) not in self.full_attn_layers
-        ]
+        configured_full_layers = {int(layer) for layer in self.full_attn_layers}
+        kv_layers = tuple(int(layer) for layer in self.runtime_layout.kv_idx_to_layer_idx)
+        kv_positions = {layer: index for index, layer in enumerate(kv_layers)}
+        unknown_full_layers = sorted(configured_full_layers - set(kv_layers))
+        if unknown_full_layers and self.vllm_sparse_method in {"omnikv", "deltakv"}:
+            raise ValueError(
+                "full_attn_layers must contain KV/full-attention layer indices for "
+                f"{self.vllm_sparse_method}; non-KV layers={unknown_full_layers}."
+            )
+        self.obs_layer_ids = []
+        for layer in self.full_attn_layers:
+            layer = int(layer)
+            kv_position = kv_positions.get(layer)
+            if kv_position is None or kv_position + 1 >= len(kv_layers):
+                continue
+            if kv_layers[kv_position + 1] not in configured_full_layers:
+                self.obs_layer_ids.append(layer)
         
         # 确保调度吞吐量限制不小于单次分块大小
         if self.max_num_batched_tokens < 2 * self.chunk_prefill_size:
@@ -882,15 +1283,30 @@ class Config:
 
         # PyramidKV 配置验证与智能生成
         if 'pyramidkv' == self.vllm_sparse_method:
+            num_layers = int(self.runtime_layout.num_layers)
+            num_kv_layers = int(self.runtime_layout.num_kv_layers)
             if self.pyramid_layer_ratios is None:
-                num_layers = self.hf_config.num_hidden_layers
-                start_l = self.pyramidkv_start_layer
-                least_l = self.pyramidkv_least_layer if self.pyramidkv_least_layer is not None else num_layers - 1
-                start_r = self.pyramidkv_start_ratio
-                least_r = self.pyramidkv_least_ratio
+                start_l = int(self.pyramidkv_start_layer)
+                least_l = (
+                    int(self.pyramidkv_least_layer)
+                    if self.pyramidkv_least_layer is not None
+                    else num_kv_layers - 1
+                )
+                start_r = float(self.pyramidkv_start_ratio)
+                least_r = float(self.pyramidkv_least_ratio)
+                if not 0 <= start_l < num_kv_layers:
+                    raise ValueError(
+                        f"pyramidkv_start_layer must be a KV layer position in [0, {num_kv_layers}), "
+                        f"got {start_l}."
+                    )
+                if not start_l <= least_l < num_kv_layers:
+                    raise ValueError(
+                        "pyramidkv_least_layer must be a KV layer position between "
+                        f"start_layer={start_l} and {num_kv_layers - 1}, got {least_l}."
+                    )
                 
-                ratios = [1.0] * num_layers
-                for i in range(start_l, num_layers):
+                ratios = [1.0] * num_kv_layers
+                for i in range(start_l, num_kv_layers):
                     if i <= least_l:
                         if least_l > start_l:
                             ratio = start_r - (start_r - least_r) * (i - start_l) / (least_l - start_l)
@@ -900,18 +1316,27 @@ class Config:
                     else:
                         ratios[i] = least_r
                 self.pyramid_layer_ratios = ratios
-                logger.info(f"PyramidKV 自动生成 layer_ratios = {[f'{r:.3f}' for r in self.pyramid_layer_ratios]}")
+                logger.info(f"PyramidKV 自动生成 KV layer_ratios = {[f'{r:.3f}' for r in ratios]}")
+            else:
+                ratios = [float(ratio) for ratio in self.pyramid_layer_ratios]
+                if len(ratios) == num_layers and num_layers != num_kv_layers:
+                    ratios = [ratios[layer_idx] for layer_idx in self.runtime_layout.kv_idx_to_layer_idx]
+                self.pyramid_layer_ratios = ratios
         
         if self.pyramid_layer_ratios is not None:
             # PyramidKV 模式自动启用 SnapKV 逻辑
             if 'pyramidkv' != self.vllm_sparse_method:
                 raise ValueError('vllm_sparse_method 应为 pyramidkv')
 
-            num_layers = self.hf_config.num_hidden_layers
-            if len(self.pyramid_layer_ratios) != num_layers:
-                raise ValueError(f"pyramid_layer_ratios 长度 ({len(self.pyramid_layer_ratios)}) 必须等于模型层数 ({num_layers})")
+            num_kv_layers = int(self.runtime_layout.num_kv_layers)
+            if len(self.pyramid_layer_ratios) != num_kv_layers:
+                raise ValueError(
+                    f"pyramid_layer_ratios length ({len(self.pyramid_layer_ratios)}) must equal "
+                    f"the number of KV/full-attention layers ({num_kv_layers})."
+                )
 
             if any(r <= 0 or r > 1.0 for r in self.pyramid_layer_ratios):
                 raise ValueError("pyramid_layer_ratios 的所有值必须在 (0, 1.0] 范围内")
         
         logger.info(f"LLM Config: {self}".replace('\n', ' '))
+        setattr(self.hf_config, "runtime_layout", self.runtime_layout)

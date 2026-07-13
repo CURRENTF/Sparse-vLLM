@@ -36,6 +36,16 @@ def resolve_prefix_cache_block_size(config: Any) -> int:
     method = str(getattr(config, "vllm_sparse_method", "") or "")
     if method == "quest":
         quest_chunk_size = int(getattr(config, "quest_chunk_size"))
+        runtime_layout = getattr(config, "runtime_layout", None)
+        is_mixed = bool(getattr(runtime_layout, "linear_attention_layer_indices", ()))
+        if is_mixed:
+            block_size = quest_chunk_size if configured is None else configured
+            if block_size <= 0 or block_size % quest_chunk_size != 0:
+                raise ValueError(
+                    "mixed Quest prefix_cache_block_size must be a positive multiple of quest_chunk_size: "
+                    f"prefix_cache_block_size={block_size}, quest_chunk_size={quest_chunk_size}."
+                )
+            return block_size
         if configured is not None and configured != quest_chunk_size:
             raise ValueError(
                 "prefix_cache_block_size must equal quest_chunk_size for quest prefix caching: "

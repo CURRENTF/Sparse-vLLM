@@ -87,11 +87,11 @@ class SkipKVCacheManager(RKVCacheManager):
         seq_id = int(seq_id)
         rows = [
             self.seq_id_to_row[layer_idx].get(seq_id)
-            for layer_idx in range(self.num_layers)
+            for layer_idx in self.kv_transformer_layer_indices()
         ]
         super().free_seq(seq_id)
         self._skipkv_seq_states.pop(seq_id, None)
-        for layer_idx, row_idx in enumerate(rows):
+        for layer_idx, row_idx in zip(self.kv_transformer_layer_indices(), rows):
             if row_idx is not None:
                 self._skipkv_row_gen_indices[layer_idx].pop(int(row_idx), None)
 
@@ -105,7 +105,7 @@ class SkipKVCacheManager(RKVCacheManager):
             seq_chunks.append((int(seq.seq_id), list(range(start, start + size))))
         if not seq_chunks:
             return
-        for layer_idx in range(self.num_layers):
+        for layer_idx in self.kv_transformer_layer_indices():
             for seq_id, gen_indices in seq_chunks:
                 row_idx = self.seq_id_to_row[layer_idx].get(seq_id)
                 if row_idx is None:
@@ -115,7 +115,7 @@ class SkipKVCacheManager(RKVCacheManager):
                 )
 
     def _append_decode_gen_indices(self, seqs: list[Sequence]):
-        for layer_idx in range(self.num_layers):
+        for layer_idx in self.kv_transformer_layer_indices():
             for seq in seqs:
                 row_idx = self.seq_id_to_row[layer_idx].get(seq.seq_id)
                 if row_idx is None:
@@ -349,6 +349,7 @@ class SkipKVCacheManager(RKVCacheManager):
         return torch.repeat_interleave(segment_penalty, segment_size, dim=1)[:, :token_count]
 
     def free_part_slots(self, layer_idx: int, seq: Sequence, keep_indices: torch.Tensor):
+        self.kv_layer_index(layer_idx)
         row_idx = self.seq_id_to_row[layer_idx].get(seq.seq_id)
         old_gen_indices = None
         if row_idx is not None:
@@ -376,6 +377,7 @@ class SkipKVCacheManager(RKVCacheManager):
         seqs: list[Sequence],
         keep_indices: torch.Tensor,
     ):
+        self.kv_layer_index(layer_idx)
         if not seqs:
             return
         if len(seqs) == 1:
@@ -424,6 +426,8 @@ class SkipKVCacheManager(RKVCacheManager):
     ):
         if not layer_indices or not seqs:
             return
+        for layer_idx in layer_indices:
+            self.kv_layer_index(int(layer_idx))
         if len(layer_indices) == 1:
             self.free_part_slots_batch(int(layer_indices[0]), seqs, keep_indices[0])
             return

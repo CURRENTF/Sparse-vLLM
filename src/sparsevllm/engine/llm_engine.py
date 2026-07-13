@@ -4,7 +4,7 @@ from dataclasses import fields
 from time import perf_counter
 import threading
 from tqdm.auto import tqdm
-from transformers import AutoTokenizer, Qwen2Tokenizer
+from transformers import AutoTokenizer, GenerationConfig, Qwen2Tokenizer
 import torch.multiprocessing as mp
 from sparsevllm.utils.log import logger
 import sys
@@ -205,7 +205,18 @@ class LLMEngine:
         
         # 加载分词器
         self.tokenizer: Qwen2Tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
-        config.eos = self.tokenizer.eos_token_id
+        generation_config = GenerationConfig.from_pretrained(config.model)
+        eos_values = generation_config.eos_token_id
+        if eos_values is None:
+            eos_values = []
+        elif isinstance(eos_values, int):
+            eos_values = [eos_values]
+        else:
+            eos_values = list(eos_values)
+        if self.tokenizer.eos_token_id is not None:
+            eos_values.append(int(self.tokenizer.eos_token_id))
+        config.eos_token_ids = tuple(dict.fromkeys(int(token_id) for token_id in eos_values))
+        config.eos = config.eos_token_ids[0] if config.eos_token_ids else -1
         self.model_runner.call(
             "set_tokenizer_metadata",
             self._build_delimiter_token_ids(self.tokenizer),
@@ -215,7 +226,7 @@ class LLMEngine:
         # 4. 初始化调度器
         # 关键设计：将 Rank 0 的 CacheManager 传给 Scheduler。
         # Scheduler 通过它来感知全局显存的余量，从而做出调度和抢占决策。
-        self.scheduler = Scheduler(config, self.model_runner.cache_manager)
+        self.scheduler = Scheduler(config, self.model_runner.runtime_state)
         
         self._exited = False
         self._throughput_logger = _ThroughputIntervalLogger(config.throughput_log_interval_s)
@@ -333,14 +344,19 @@ class LLMEngine:
 
     def _after_warmup_debug_cleanup(self):
         model_runner = getattr(self, "model_runner", None)
-        cache_manager = getattr(model_runner, "cache_manager", None)
-        reset_after_warmup = getattr(cache_manager, "reset_after_warmup", None)
+        runtime_state = getattr(model_runner, "runtime_state", None)
+        reset_after_warmup = getattr(runtime_state, "reset_after_warmup", None)
         if callable(reset_after_warmup):
             reset_after_warmup()
         else:
-            reset_prefix_cache = getattr(cache_manager, "reset_prefix_cache", None)
-            if callable(reset_prefix_cache):
-                reset_prefix_cache()
+            cache_manager = getattr(model_runner, "cache_manager", None)
+            reset_cache = getattr(cache_manager, "reset_after_warmup", None)
+            if callable(reset_cache):
+                reset_cache()
+            else:
+                reset_prefix_cache = getattr(cache_manager, "reset_prefix_cache", None)
+                if callable(reset_prefix_cache):
+                    reset_prefix_cache()
 
         runner = getattr(model_runner, "decode_cuda_graph_runner", None)
         if runner is not None and os.getenv("SPARSEVLLM_DELTAKV_CLEAR_GRAPHS_AFTER_WARMUP", "0") == "1":
@@ -508,7 +524,7 @@ class LLMEngine:
         scheduler = self.scheduler
         waiting = len(scheduler.waiting)
         decoding = len(scheduler.decoding)
-        cache_stats = self.model_runner.cache_manager.free_slot_stats()
+        cache_stats = self.model_runner.runtime_state.free_slot_stats()
         return {
             "waiting_requests": int(waiting),
             "decoding_requests": int(decoding),
@@ -567,7 +583,7 @@ class LLMEngine:
                 raise RuntimeError(
                     "Scheduler returned no runnable sequences and no preemptions; "
                     "this would hang the generation loop. "
-                    f"method={self.config.vllm_sparse_method} free_slots={self.model_runner.cache_manager.num_free_slots} "
+                    f"method={self.config.vllm_sparse_method} free_slots={self.model_runner.runtime_state.num_free_slots} "
                     f"waiting={len(self.scheduler.waiting)} decoding={len(self.scheduler.decoding)}"
                 )
                 

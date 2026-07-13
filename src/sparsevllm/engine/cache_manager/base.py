@@ -88,6 +88,12 @@ class CacheManager(ABC):
         self.device = self.platform.get_device(rank)
         self.hf_config = config.hf_config
         self.num_layers = self.hf_config.num_hidden_layers
+        self.runtime_layout = getattr(config, "runtime_layout", None)
+        if self.runtime_layout is None:
+            from sparsevllm.config import RuntimeLayout
+
+            self.runtime_layout = RuntimeLayout.dense(self.num_layers)
+        self.num_kv_layers = int(self.runtime_layout.num_kv_layers)
 
         self.num_kv_heads = self.hf_config.num_key_value_heads // world_size
         self.head_dim = getattr(
@@ -101,6 +107,18 @@ class CacheManager(ABC):
 
         self.kv_cache = None
         self._decode_static_max_context_len: int | None = None
+
+    def is_full_attention_layer(self, layer_idx: int) -> bool:
+        return bool(self.runtime_layout.is_full_attention(int(layer_idx)))
+
+    def is_linear_attention_layer(self, layer_idx: int) -> bool:
+        return bool(self.runtime_layout.is_linear_attention(int(layer_idx)))
+
+    def kv_layer_index(self, layer_idx: int) -> int:
+        return int(self.runtime_layout.kv_layer_index(int(layer_idx)))
+
+    def kv_transformer_layer_indices(self) -> tuple[int, ...]:
+        return tuple(int(layer_idx) for layer_idx in self.runtime_layout.kv_idx_to_layer_idx)
 
     def _is_stream_capturing(self) -> bool:
         platform = getattr(self, "platform", None)
@@ -771,6 +789,26 @@ class CacheManager(ABC):
         """Clear scheduler-visible prefix hit metadata."""
         seq.clear_prefix_cache_hit()
 
+    def build_prefix_kv_payload(self, seq: Sequence, block_start: int, block_end: int) -> object:
+        del seq, block_start, block_end
+        raise RuntimeError("This cache manager does not support mixed prefix KV payloads.")
+
+    def attach_prefix_kv_payload(self, seq: Sequence, payload: object) -> None:
+        del seq, payload
+        raise RuntimeError("This cache manager does not support mixed prefix KV payload attach.")
+
+    def free_prefix_kv_payload(self, payload: object) -> None:
+        del payload
+        raise RuntimeError("This cache manager does not support mixed prefix KV payload free.")
+
+    def prefix_kv_payload_nbytes(self, payload: object) -> int:
+        del payload
+        raise RuntimeError("This cache manager does not support mixed prefix KV payload accounting.")
+
+    def mark_materialized_prefix_kv_payload(self, seq: Sequence, payload: object) -> None:
+        del seq, payload
+        return None
+
     def free_slot_stats(self) -> dict[str, int]:
         """Return a small set of free-slot stats for logging/debugging."""
         return {"free_slots": int(self.num_free_slots)}
@@ -797,7 +835,7 @@ class CacheManager(ABC):
     def _dense_baseline_bytes(self) -> int:
         dtype_size = self._cache_slot_dtype_size()
         slots = self._dense_baseline_slots()
-        return int(slots * self.num_layers * 2 * self.num_kv_heads * self.head_dim * dtype_size)
+        return int(slots * self.num_kv_layers * 2 * self.num_kv_heads * self.head_dim * dtype_size)
 
     @staticmethod
     def _tensor_storage_key(tensor: torch.Tensor) -> tuple[Any, ...]:
@@ -868,7 +906,7 @@ class CacheManager(ABC):
         except Exception:
             return 0
         dtype_size = self._cache_slot_dtype_size()
-        return int(live_tokens * self.num_layers * 2 * self.num_kv_heads * self.head_dim * dtype_size)
+        return int(live_tokens * self.num_kv_layers * 2 * self.num_kv_heads * self.head_dim * dtype_size)
 
     def memory_accounting(self) -> dict[str, Any]:
         """Return read-only tensor memory accounting for regression gates.
@@ -936,6 +974,7 @@ class CacheManager(ABC):
             "dense_baseline": {
                 "slots": int(self._dense_baseline_slots()),
                 "layers": int(self.num_layers),
+                "kv_layers": int(self.num_kv_layers),
                 "num_kv_heads": int(self.num_kv_heads),
                 "head_dim": int(self.head_dim),
                 "dtype_size": int(self._cache_slot_dtype_size()),

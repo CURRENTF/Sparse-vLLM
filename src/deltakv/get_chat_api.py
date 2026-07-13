@@ -295,6 +295,10 @@ def get_generate_api(model_path: str, infer_config: dict, deltakv_checkpoint_pat
             max_tokens = kwargs.get('max_new_tokens', kwargs.get('max_tokens', 128))
             temperature = kwargs.get('temperature', 1.0)
             top_p = kwargs.get('top_p', 1.0)
+            top_k = kwargs.get('top_k', 0)
+            if top_k < 0:
+                top_k = 0
+            eos_token_ids = kwargs.get('eos_token_id')
             
             # greedy decoding should be exact argmax, not low-temperature sampling.
             if not kwargs.get('do_sample', True):
@@ -302,7 +306,13 @@ def get_generate_api(model_path: str, infer_config: dict, deltakv_checkpoint_pat
             elif temperature < 1e-5:
                 temperature = 1e-5
             
-            sampling_params = SamplingParams(temperature=temperature, top_p=top_p, max_tokens=max_tokens)
+            sampling_params = SamplingParams(
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                max_tokens=max_tokens,
+                eos_token_ids=eos_token_ids,
+            )
             outputs = llm.generate(prompts, sampling_params, use_tqdm=False)
             
             results = [out['text'] for out in outputs]

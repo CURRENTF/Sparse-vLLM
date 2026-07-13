@@ -22,6 +22,9 @@ from sparsevllm.utils.loader import load_model, sync_deltakv_config_from_checkpo
 
 from sparsevllm.engine.cache_manager import CacheManager
 from sparsevllm.engine.decode_cuda_graph import DecodeCudaGraphRunner
+from sparsevllm.engine.prefix_cache_coordinator import PrefixCacheCoordinator
+from sparsevllm.engine.recurrent_state_manager import RecurrentStateManager, RecurrentStateSpec
+from sparsevllm.engine.runtime_state import RuntimeState
 from sparsevllm.engine.sparse_controller import SparseController
 import sparsevllm.platforms as platforms
 from sparsevllm.utils.profiler import profiler
@@ -30,6 +33,13 @@ try:
     from sparsevllm.models.qwen3 import Qwen3ForCausalLM
 except ImportError:
     Qwen3ForCausalLM = None
+
+try:
+    from sparsevllm.models.qwen3_5 import Qwen35ForCausalLM
+    _QWEN35_IMPORT_ERROR = None
+except ImportError as exc:
+    Qwen35ForCausalLM = None
+    _QWEN35_IMPORT_ERROR = exc
 
 
 TP_SHM_NAME_PREFIX = "sparsevllm_"
@@ -94,6 +104,13 @@ class ModelRunner:
                     "Use a Transformers version with Qwen3 support for Qwen3 models."
                 )
             self.model = Qwen3ForCausalLM(hf_config)
+        elif hf_config.model_type == "qwen3_5":
+            if Qwen35ForCausalLM is None:
+                raise ImportError(
+                    "Qwen35ForCausalLM is unavailable. Install the qwen3_5 runtime "
+                    f"dependencies and verify vendored kernels import correctly: {_QWEN35_IMPORT_ERROR}"
+                ) from _QWEN35_IMPORT_ERROR
+            self.model = Qwen35ForCausalLM(hf_config)
         elif hf_config.model_type == "llama":
             self.model = LlamaForCausalLM(hf_config)
         else:
@@ -108,12 +125,45 @@ class ModelRunner:
         
         # 初始化 CacheManager (负责 KV Cache + 物理槽位)
         self.cache_manager = CacheManager.create(config, rank, self.world_size)
+        has_linear_layers = bool(getattr(config.runtime_layout, "linear_attention_layer_indices", ()))
+        state_spec_provider = getattr(self.model, "recurrent_state_spec", None)
+        if has_linear_layers and not callable(state_spec_provider):
+            raise RuntimeError(
+                f"Model {type(self.model).__name__} declares linear-attention layers but does not "
+                "provide recurrent_state_spec()."
+            )
+        state_spec = state_spec_provider() if has_linear_layers else None
+        if state_spec is not None and not isinstance(state_spec, RecurrentStateSpec):
+            raise TypeError(
+                f"recurrent_state_spec() must return RecurrentStateSpec, got {type(state_spec).__name__}."
+            )
+        self.recurrent_state_manager = None
+        if state_spec is not None:
+            self.recurrent_state_manager = RecurrentStateManager(
+                config,
+                rank,
+                self.world_size,
+                state_spec=state_spec,
+            )
+        self.prefix_cache_coordinator = (
+            PrefixCacheCoordinator(config, self.cache_manager, self.recurrent_state_manager)
+            if has_linear_layers and bool(config.enable_prefix_caching)
+            else None
+        )
+        self.runtime_state = RuntimeState(
+            config,
+            self.cache_manager,
+            self.recurrent_state_manager,
+            self.prefix_cache_coordinator,
+        )
 
         # 初始化稀疏控制器
         self.sparse_controller = SparseController(config, self.cache_manager)
         # 注入模型
         if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
             self.model.model.sparse_controller = self.sparse_controller
+            if self.recurrent_state_manager is not None:
+                self.model.model.recurrent_state_manager = self.recurrent_state_manager
             self.sparse_controller.set_modules(self.model.model.layers)
             if hasattr(self.cache_manager, "set_model_layers"):
                 self.cache_manager.set_model_layers(self.model.model.layers)
@@ -131,7 +181,9 @@ class ModelRunner:
         )
         self.cuda_graph_pool = torch.cuda.graph_pool_handle() if self.config.decode_cuda_graph else None
         self.decode_cuda_graph_runner = DecodeCudaGraphRunner(
+            runtime_state=self.runtime_state,
             cache_manager=self.cache_manager,
+            recurrent_state_manager=self.recurrent_state_manager,
             sparse_controller=self.sparse_controller,
             run_model=self.run_model,
             is_long_text_batch=self._is_long_text_batch,
@@ -277,7 +329,7 @@ class ModelRunner:
             if os.getenv("SPARSEVLLM_DEBUG_SLOTS", "0") == "1":
                 before = self.cache_manager.free_slot_stats()
                 logger.info("model_runner.free_slots seq_id={} before={}", seq_id, before)
-            self.cache_manager.free_seq(seq_id)
+            self.runtime_state.free_seq(seq_id)
             if os.getenv("SPARSEVLLM_DEBUG_SLOTS", "0") == "1":
                 after = self.cache_manager.free_slot_stats()
                 logger.info("model_runner.free_slots seq_id={} after={}", seq_id, after)
@@ -292,7 +344,7 @@ class ModelRunner:
                 before = self.cache_manager.free_slot_stats()
                 logger.info("model_runner.free_slots_batch seq_ids={} before={}", seq_ids, before)
             for seq_id in seq_ids:
-                self.cache_manager.free_seq(seq_id)
+                self.runtime_state.free_seq(seq_id)
             if os.getenv("SPARSEVLLM_DEBUG_SLOTS", "0") == "1":
                 after = self.cache_manager.free_slot_stats()
                 logger.info("model_runner.free_slots_batch seq_ids={} after={}", seq_ids, after)
@@ -318,18 +370,18 @@ class ModelRunner:
         token_ids: list[int],
         include_subtree: bool = False,
     ) -> dict[str, object]:
-        return self.cache_manager.prefix_cache_inspect(
+        return self.runtime_state.prefix_cache_inspect(
             [int(token_id) for token_id in token_ids],
             include_subtree=bool(include_subtree),
         )
 
     def prefix_cache_match(self, token_ids: list[int]) -> dict[str, object]:
-        return self.cache_manager.prefix_cache_match(
+        return self.runtime_state.prefix_cache_match(
             [int(token_id) for token_id in token_ids],
         )
 
     def prefix_cache_delete_subtree(self, token_ids: list[int]) -> dict[str, object]:
-        return self.cache_manager.prefix_cache_delete_subtree(
+        return self.runtime_state.prefix_cache_delete_subtree(
             [int(token_id) for token_id in token_ids],
         )
 
@@ -338,7 +390,7 @@ class ModelRunner:
         token_ids: list[int],
         priority: int,
     ) -> dict[str, object]:
-        return self.cache_manager.prefix_cache_set_eviction_priority(
+        return self.runtime_state.prefix_cache_set_eviction_priority(
             [int(token_id) for token_id in token_ids],
             priority=int(priority),
         )
@@ -374,13 +426,14 @@ class ModelRunner:
 
     def prepare_step(self, seqs: list[Sequence], is_prefill: bool):
         """准备前向上下文并设置 Context"""
-        input_ids, positions, cu_seqlens_q = self.cache_manager.prepare_step(seqs, is_prefill)
+        input_ids, positions, cu_seqlens_q = self.runtime_state.prepare_step(seqs, is_prefill)
         set_context(
             is_prefill,
             cu_seqlens_q=cu_seqlens_q,
             cache_manager=self.cache_manager,
             is_long_text=self._is_long_text_batch(seqs, is_prefill),
             seqs=seqs,
+            recurrent_state_manager=self.recurrent_state_manager,
         )
         return input_ids, positions
 
@@ -452,7 +505,7 @@ class ModelRunner:
             with profiler.record("sparse_post_forward"):
                 self.sparse_controller.post_forward(seqs, is_prefill)
             with profiler.record("cache_on_forward_end"):
-                self.cache_manager.on_forward_end(seqs, is_prefill)
+                self.runtime_state.on_forward_end(seqs, is_prefill)
 
     def _collect_logprobs(
         self,

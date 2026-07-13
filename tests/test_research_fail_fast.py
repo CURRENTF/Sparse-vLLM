@@ -487,6 +487,7 @@ class ResearchFailFastTest(unittest.TestCase):
             max_position_embeddings=32768,
             hidden_size=8,
             intermediate_size=32,
+            num_hidden_layers=2,
         )
         with tempfile.TemporaryDirectory() as tmp:
             with patch("sparsevllm.config.AutoConfig.from_pretrained", return_value=hf_config):
@@ -500,6 +501,7 @@ class ResearchFailFastTest(unittest.TestCase):
             max_position_embeddings=32768,
             hidden_size=8,
             intermediate_size=32,
+            num_hidden_layers=2,
         )
         with tempfile.TemporaryDirectory() as tmp:
             with patch("sparsevllm.config.AutoConfig.from_pretrained", return_value=hf_config):

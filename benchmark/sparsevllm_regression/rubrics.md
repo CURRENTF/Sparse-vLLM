@@ -19,7 +19,8 @@ summary of those rules.
 
 ## Quality
 
-Quality compares LongBench-mini sparse score against the vanilla score from the
+Quality first requires the vanilla LongBench-mini score to meet the manifest's
+absolute baseline floor, then compares sparse score against vanilla from the
 same run.
 
 | Grade | Rule |
@@ -27,7 +28,7 @@ same run.
 | `A` | Sparse score loss `< 0.1` vs vanilla. |
 | `B` | Sparse score loss `<= 0.5`. |
 | `C` | Sparse score loss `<= 1.0`. |
-| `D` | Sparse score loss `> 1.0`, missing aggregate score, or failed quality run. |
+| `D` | Vanilla is below the absolute baseline floor, sparse score loss `> 1.0`, missing aggregate score, or failed quality run. |
 
 ## Logits
 

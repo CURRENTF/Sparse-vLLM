@@ -37,6 +37,7 @@ class Sequence:
         self.top_k = sampling_params.top_k
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
+        self.eos_token_ids = tuple(sampling_params.eos_token_ids)
         self.logprobs = sampling_params.logprobs
         self.completion_token_logprobs: list[float | None] = []
         self.completion_top_logprobs: list[dict[int, float] | None] = []
@@ -119,6 +120,7 @@ class Sequence:
             self.top_k,
             self.max_tokens,
             self.ignore_eos,
+            self.eos_token_ids,
             self.logprobs,
             data,
             self.prefix_cache_enabled,
@@ -132,7 +134,8 @@ class Sequence:
     def __setstate__(self, state):
         (self.seq_id, self.status, self.num_tokens, self.num_prompt_tokens,
          self.num_prefilled_tokens, self.current_chunk_size, self.temperature,
-         self.top_p, self.top_k, self.max_tokens, self.ignore_eos, self.logprobs, data,
+         self.top_p, self.top_k, self.max_tokens, self.ignore_eos, self.eos_token_ids,
+         self.logprobs, data,
          self.prefix_cache_enabled, self.prefix_cache_hit_len, self.prefix_cache_hit_block_count,
          self.prefix_cache_hit_last_block_id, self.prefix_cache_block_size, self.prefix_cache_method) = state
         self.completion_token_logprobs = []

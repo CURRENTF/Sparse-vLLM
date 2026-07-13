@@ -74,6 +74,13 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
     if missing_methods:
         raise ManifestError(f"manifest is missing required methods: {missing_methods}")
 
+    quality = manifest["quality"]
+    if not isinstance(quality, dict):
+        raise ManifestError("manifest quality must be a JSON object.")
+    minimum_vanilla_score = quality.get("minimum_vanilla_score")
+    if not isinstance(minimum_vanilla_score, (int, float)) or minimum_vanilla_score <= 0:
+        raise ManifestError("quality minimum_vanilla_score must be a positive number.")
+
     for model_id, model in models.items():
         if "model_path_env" not in model:
             raise ManifestError(f"model {model_id!r} is missing model_path_env.")

@@ -13,7 +13,7 @@ import random
 import argparse
 import torch.multiprocessing as mp
 import torch
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, GenerationConfig
 import torch.distributed as dist
 from deltakv.get_chat_api import get_generate_api
 from datetime import datetime
@@ -90,9 +90,9 @@ def seed_everything(seed):
 
 
 def build_chat(tokenizer, prompt, dataset, no_chat_template=False, thinking_mode="off"):
-    if dataset in NO_CHAT_TEMPLATE_DATASETS:
+    if no_chat_template or (dataset in NO_CHAT_TEMPLATE_DATASETS and thinking_mode != "off"):
         return prompt
-    if not no_chat_template and hasattr(tokenizer, 'apply_chat_template') and tokenizer.chat_template is not None:
+    if hasattr(tokenizer, 'apply_chat_template') and tokenizer.chat_template is not None:
         msgs = [
             # {'role': 'system', 'content': 'You are a helpful assistant.'},
             {'role': 'user', 'content': prompt},
@@ -114,38 +114,13 @@ def build_chat(tokenizer, prompt, dataset, no_chat_template=False, thinking_mode
 
 
 def strip_thinking_content(text: str) -> str:
-    # When the prompt already ends with an open `<think>`, the generated text is
-    # often just the continuation of that block and only emits the closing tag.
-    if "</think>" in text:
-        text = text.split("</think>", 1)[1]
-    text = re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL)
-    text = text.lstrip()
-
-    # Some generations never emit `</think>` and instead end with a natural-
-    # language answer cue. Recover the short answer conservatively.
-    if "\n" in text and len(text) > 200:
-        for pattern in [
-            r"(?is)i['’]ll say\s+[\"“]?([^\"”\n\.\?!]+)",
-            r"(?is)i['’]ll go with\s+[\"“]?([^\"”\n\.\?!]+)",
-            r"(?is)answer would be\s+[\"“]?([^\"”\n\.\?!]+)",
-            r"(?is)so the answer is\s+[\"“]?([^\"”\n\.\?!]+)",
-            r"(?is)i think the answer is\s+[\"“]?([^\"”\n\.\?!]+)",
-            r"(?is)the answer is\s+[\"“]?([^\"”\n\.\?!]+)",
-        ]:
-            matches = re.findall(pattern, text)
-            for match in reversed(matches):
-                candidate = match.strip().strip('\'"“”')
-                lower = candidate.lower()
-                if len(candidate) > 80:
-                    continue
-                if any(
-                    phrase in lower
-                    for phrase in ["not explicitly", "not provided", "not enough information"]
-                ):
-                    continue
-                return candidate.rstrip(" .")
-
-    return text
+    closing_tag = "</think>"
+    if closing_tag not in text:
+        raise ValueError(
+            "Thinking output ended before </think>; increase max_new_tokens instead "
+            "of scoring truncated reasoning."
+        )
+    return text.split(closing_tag, 1)[1].lstrip()
 
 
 def _append_jsonl(path: str | os.PathLike[str], record: dict[str, Any]) -> None:
@@ -302,10 +277,24 @@ def load_model_and_tokenizer(rank, args):
     except:
         max_length = 32000
 
-    return generate_fn, tokenizer, max_length
+    generation_config = GenerationConfig.from_pretrained(args.model_path, trust_remote_code=True)
+    eos_token_ids = generation_config.eos_token_id
+    if eos_token_ids is None:
+        eos_token_ids = []
+    elif isinstance(eos_token_ids, int):
+        eos_token_ids = [eos_token_ids]
+    else:
+        eos_token_ids = list(eos_token_ids)
+    if tokenizer.eos_token_id is not None:
+        eos_token_ids.append(int(tokenizer.eos_token_id))
+    if getattr(tokenizer, "eot_token_id", None) is not None:
+        eos_token_ids.append(int(tokenizer.eot_token_id))
+    eos_token_ids = list(dict.fromkeys(int(token_id) for token_id in eos_token_ids))
+
+    return generate_fn, tokenizer, max_length, eos_token_ids
 
 
-def get_pred(rank, data, dataset_info, args, model, tokenizer, model_max_length):
+def get_pred(rank, data, dataset_info, args, model, tokenizer, model_max_length, eos_token_ids):
     dataset = dataset_info['dataset']
     prompt_format = dataset_info['prompt_format']
     max_gen = args.max_new_tokens_override if args.max_new_tokens_override is not None else dataset_info['max_gen']
@@ -405,10 +394,6 @@ def get_pred(rank, data, dataset_info, args, model, tokenizer, model_max_length)
         if failures:
             break
 
-        eos_token_id = [tokenizer.eos_token_id]
-        if hasattr(tokenizer, 'eot_token_id'):
-            eos_token_id.append(tokenizer.eot_token_id)
-
         try:
             preds = model(
                 prompts,
@@ -418,7 +403,7 @@ def get_pred(rank, data, dataset_info, args, model, tokenizer, model_max_length)
                 temperature=args.temperature,
                 top_p=args.top_p,
                 top_k=args.top_k,
-                eos_token_id=eos_token_id,
+                eos_token_id=eos_token_ids,
             )
         except Exception as exc:
             for record in prepared_records:
@@ -461,7 +446,12 @@ def get_pred(rank, data, dataset_info, args, model, tokenizer, model_max_length)
             try:
                 if not isinstance(raw_pred, str):
                     raise TypeError(f"Model prediction must be str, got {type(raw_pred).__name__}.")
-                parsed_pred = strip_thinking_content(raw_pred) if args.thinking_mode == "on_strip" else raw_pred
+                should_strip_thinking = (
+                    args.thinking_mode == "on_strip"
+                    and not args.no_chat_template
+                    and dataset not in NO_CHAT_TEMPLATE_DATASETS
+                )
+                parsed_pred = strip_thinking_content(raw_pred) if should_strip_thinking else raw_pred
             except Exception as exc:
                 failed = dict(record)
                 failed.update(
@@ -500,7 +490,7 @@ def get_pred(rank, data, dataset_info, args, model, tokenizer, model_max_length)
 
 def worker(rank, world_size, datasets, dataset2prompt, dataset2maxlen, args, out_root, max_length_limit):
     seed_everything(42)
-    model, tokenizer, model_max_length = load_model_and_tokenizer(rank, args)
+    model, tokenizer, model_max_length, eos_token_ids = load_model_and_tokenizer(rank, args)
     
     for dataset in datasets:
         data_path = get_longbench_data_path(dataset, args.e)
@@ -576,7 +566,16 @@ def worker(rank, world_size, datasets, dataset2prompt, dataset2maxlen, args, out
             'out_root': out_root,
         }
         
-        get_pred(rank, data_subset, dataset_info, args, model, tokenizer, model_max_length)
+        get_pred(
+            rank,
+            data_subset,
+            dataset_info,
+            args,
+            model,
+            tokenizer,
+            model_max_length,
+            eos_token_ids,
+        )
         torch.cuda.empty_cache()
 
 

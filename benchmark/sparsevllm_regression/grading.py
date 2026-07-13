@@ -31,9 +31,30 @@ def _require_number(value: Any, name: str) -> float:
     return float(value)
 
 
-def grade_quality(vanilla_score: float, sparse_score: float) -> GateGrade:
+def grade_quality(
+    vanilla_score: float,
+    sparse_score: float,
+    *,
+    minimum_vanilla_score: float,
+) -> GateGrade:
     vanilla = _require_number(vanilla_score, "vanilla_score")
     sparse = _require_number(sparse_score, "sparse_score")
+    minimum_vanilla = _require_number(minimum_vanilla_score, "minimum_vanilla_score")
+    if vanilla < minimum_vanilla:
+        return GateGrade(
+            name="quality",
+            grade="D",
+            status="failed",
+            metrics={
+                "vanilla_score": vanilla,
+                "sparse_score": sparse,
+                "minimum_vanilla_score": minimum_vanilla,
+            },
+            reason=(
+                "Vanilla score is below minimum required baseline: "
+                f"vanilla_score={vanilla} minimum_vanilla_score={minimum_vanilla}."
+            ),
+        )
     score_loss = max(0.0, vanilla - sparse)
     if score_loss < 0.1:
         grade = "A"
@@ -51,6 +72,7 @@ def grade_quality(vanilla_score: float, sparse_score: float) -> GateGrade:
             "vanilla_score": vanilla,
             "sparse_score": sparse,
             "score_loss": score_loss,
+            "minimum_vanilla_score": minimum_vanilla,
         },
     )
 

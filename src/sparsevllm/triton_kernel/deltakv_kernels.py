@@ -1858,13 +1858,13 @@ def _full_layer_kivi_flash_decode_stage1_grouped_kernel(
             value_q = ((value_code >> value_shift[None, :]) & QUANT_MASK).to(tl.float32)
             value_scale = tl.zeros((GROUP_SIZE, BLOCK_DMODEL), dtype=tl.float32)
             value_min = tl.zeros((GROUP_SIZE, BLOCK_DMODEL), dtype=tl.float32)
-            for group_i in tl.static_range(0, BLOCK_DMODEL // GROUP_SIZE):
+            for value_group_i in tl.static_range(0, BLOCK_DMODEL // GROUP_SIZE):
                 value_scale_i = tl.load(
                     Value_Scales
                     + block_slot * stride_vsb
                     + cur_kv_head * stride_vsh
                     + offs_t * stride_vst
-                    + group_i * stride_vsg,
+                    + value_group_i * stride_vsg,
                     mask=(block_slot >= 0) & valid_t,
                     other=0.0,
                 ).to(tl.float32)
@@ -1873,12 +1873,12 @@ def _full_layer_kivi_flash_decode_stage1_grouped_kernel(
                     + block_slot * stride_vsb
                     + cur_kv_head * stride_vsh
                     + offs_t * stride_vst
-                    + group_i * stride_vsg,
+                    + value_group_i * stride_vsg,
                     mask=(block_slot >= 0) & valid_t,
                     other=0.0,
                 ).to(tl.float32)
-                value_scale = tl.where(value_group[None, :] == group_i, value_scale_i[:, None], value_scale)
-                value_min = tl.where(value_group[None, :] == group_i, value_min_i[:, None], value_min)
+                value_scale = tl.where(value_group[None, :] == value_group_i, value_scale_i[:, None], value_scale)
+                value_min = tl.where(value_group[None, :] == value_group_i, value_min_i[:, None], value_min)
             v = (value_q * value_scale + value_min).to(q.dtype)
 
             if STORE_SCORE:

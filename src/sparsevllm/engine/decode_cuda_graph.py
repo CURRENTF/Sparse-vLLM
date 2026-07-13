@@ -80,7 +80,9 @@ class DecodeCudaGraphRunner:
     def __init__(
         self,
         *,
+        runtime_state,
         cache_manager,
+        recurrent_state_manager,
         sparse_controller,
         run_model: Callable[[torch.Tensor, torch.Tensor, bool], torch.Tensor],
         is_long_text_batch: Callable[[list[Sequence], bool], bool],
@@ -90,7 +92,9 @@ class DecodeCudaGraphRunner:
         context_sizes: list[int] | tuple[int, ...] | str | int | None = None,
         graph_pool=None,
     ):
+        self.runtime_state = runtime_state
         self.cache_manager = cache_manager
+        self.recurrent_state_manager = recurrent_state_manager
         self.sparse_controller = sparse_controller
         self.run_model = run_model
         self.is_long_text_batch = is_long_text_batch
@@ -265,9 +269,9 @@ class DecodeCudaGraphRunner:
         seqs: list[Sequence],
         is_long_text: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        prepare_decode_static = getattr(self.cache_manager, "prepare_decode_static", None)
+        prepare_decode_static = getattr(self.runtime_state, "prepare_decode_static", None)
         if prepare_decode_static is None:
-            raise TypeError("decode_cuda_graph requires cache_manager.prepare_decode_static().")
+            raise TypeError("decode_cuda_graph requires runtime_state.prepare_decode_static().")
 
         assert state.input_ids is not None
         assert state.positions is not None
@@ -291,6 +295,7 @@ class DecodeCudaGraphRunner:
             cache_manager=self.cache_manager,
             is_long_text=bool(is_long_text),
             seqs=seqs,
+            recurrent_state_manager=self.recurrent_state_manager,
         )
         self.cache_manager.set_decode_static_max_context_len(int(state.key.context_capacity))
 

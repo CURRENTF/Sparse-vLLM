@@ -3,7 +3,7 @@ from collections import deque
 
 from sparsevllm.config import Config
 from sparsevllm.engine.sequence import Sequence, SequenceStatus
-from sparsevllm.engine.cache_manager import CacheManager
+from sparsevllm.engine.runtime_state import MemoryOracle
 from sparsevllm.method_registry import (
     PREFILL_POLICY_ALL_CHUNKED,
     PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
@@ -21,7 +21,7 @@ class Scheduler:
     3. 管理逻辑显存额度，并在显存不足时触发抢占 (Preemption/Eviction)。
     """
 
-    def __init__(self, config: Config, memory_oracle: CacheManager):
+    def __init__(self, config: Config, memory_oracle: MemoryOracle):
         self.config = config
         self.max_num_seqs_in_batch = config.max_num_seqs_in_batch
         self.max_num_batched_tokens = config.max_num_batched_tokens
@@ -31,6 +31,10 @@ class Scheduler:
         self.chunk_prefill_size = config.chunk_prefill_size
         self.prefill_schedule_policy = config.prefill_schedule_policy
         self.eos = config.eos
+        configured_eos = tuple(int(token_id) for token_id in getattr(config, "eos_token_ids", ()) or ())
+        if not configured_eos and int(self.eos) >= 0:
+            configured_eos = (int(self.eos),)
+        self.eos_token_ids = frozenset(configured_eos)
 
         self.num_sink_tokens = config.num_sink_tokens
         self.num_recent_tokens = config.num_recent_tokens
@@ -654,7 +658,8 @@ class Scheduler:
                     # 记录模型生成的第一个 Token
                     seq.append_token(token_id, token_logprob, top_logprob)
                     # 检查是否命中结束条件
-                    if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
+                    request_eos = frozenset(seq.eos_token_ids) or self.eos_token_ids
+                    if (not seq.ignore_eos and token_id in request_eos) or seq.num_completion_tokens == seq.max_tokens:
                         seq.status = SequenceStatus.FINISHED
                         self.decoding.remove(seq)
             return
@@ -662,7 +667,8 @@ class Scheduler:
         # 处理 Decode 步骤
         for seq, token_id, token_logprob, top_logprob in zip(seqs, token_ids, token_logprobs, top_logprobs):
             seq.append_token(token_id, token_logprob, top_logprob)
-            if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
+            request_eos = frozenset(seq.eos_token_ids) or self.eos_token_ids
+            if (not seq.ignore_eos and token_id in request_eos) or seq.num_completion_tokens == seq.max_tokens:
                 seq.status = SequenceStatus.FINISHED
                 if seq in self.decoding:
                     self.decoding.remove(seq)

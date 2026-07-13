@@ -13,6 +13,8 @@ The README contains the current install command. The expected baseline is:
 - `transformers[torch]==4.53.3`.
 - `flash-attn` installed with `MAX_JOBS=8 pip install flash-attn --no-build-isolation`.
 - Editable install from the repository root with `pip install -e .`.
+- Qwen3.5/Qwen3.6 FP8 runs install the CUDA-specific extra with
+  `pip install -e ".[qwen35]"`.
 
 Record CUDA version, GPU type/count, visible GPU ids, branch, commit, and any
 relevant uncommitted changes with every reported benchmark.

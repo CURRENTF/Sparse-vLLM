@@ -73,9 +73,22 @@ class DeltaKVCacheManager(CacheManager):
         assert world_size == 1, "DeltaKVCacheManager currently only supports world_size=1 (No TP support for compressors)"
 
         self.full_attn_layers = config.full_attn_layers
-        assert isinstance(self.full_attn_layers, list) and isinstance(self.full_attn_layers[0], int)
-        self.deltakv_layer_ids = [i for i in range(self.num_layers) if i not in self.full_attn_layers]
-        self.full_layer_ids = [i for i in range(self.num_layers) if i in self.full_attn_layers]
+        if not isinstance(self.full_attn_layers, list) or not all(
+            isinstance(layer_idx, int) for layer_idx in self.full_attn_layers
+        ):
+            raise ValueError("DeltaKV full_attn_layers must be a list of transformer layer indices.")
+        if not self.full_attn_layers:
+            raise ValueError("DeltaKV requires at least one configured full_attn_layers entry.")
+        kv_layer_ids = list(self.kv_transformer_layer_indices())
+        kv_layer_set = set(kv_layer_ids)
+        invalid_full_layers = sorted(set(self.full_attn_layers) - kv_layer_set)
+        if invalid_full_layers:
+            raise ValueError(
+                "DeltaKV full_attn_layers must refer to full-attention KV layers only; "
+                f"invalid_or_linear_layers={invalid_full_layers} kv_layers={kv_layer_ids}."
+            )
+        self.deltakv_layer_ids = [i for i in kv_layer_ids if i not in self.full_attn_layers]
+        self.full_layer_ids = [i for i in kv_layer_ids if i in self.full_attn_layers]
         self.deltakv_layer_to_idx = {l: i for i, l in enumerate(self.deltakv_layer_ids)}
         self.full_layer_to_idx = {l: i for i, l in enumerate(self.full_layer_ids)}
 

@@ -14,6 +14,13 @@ MAX_JOBS=8 pip install flash-attn --no-build-isolation
 pip install -e .
 ```
 
+For Qwen3.5/Qwen3.6 FP8 mixed-attention inference, install the CUDA-specific
+optional dependencies as well:
+
+```bash
+pip install -e ".[qwen35]"
+```
+
 ## DeltaKV Checkpoints
 
 Compressor-backed DeltaKV runs require a local checkpoint directory. Download

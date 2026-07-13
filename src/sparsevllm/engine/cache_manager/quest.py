@@ -23,8 +23,11 @@ from .prefix_cache_mixin import PrefixCacheMixin
 
 @dataclass
 class QuestPrefixBlockPayload:
-    block_slot: int
+    block_slot: int | None
     token_slots: torch.Tensor
+    block_start: int = 0
+    block_end: int = 0
+    block_slots: torch.Tensor | None = None
 
 
 class QuestCacheManager(PrefixCacheMixin, CacheManager):
@@ -58,7 +61,11 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
         self.row_seq_lens = np.zeros((self.max_buffer_rows,), dtype=np.int32)
         self.layer_batch_state = LayerBatchStates()
         self._decode_static_index_buffers: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
-        self.enable_prefix_caching = bool(config.enable_prefix_caching and config.vllm_sparse_method == "quest")
+        self.enable_prefix_caching = bool(
+            config.enable_prefix_caching
+            and config.vllm_sparse_method == "quest"
+            and not getattr(getattr(config, "runtime_layout", None), "linear_attention_layer_indices", ())
+        )
         self.prefix_cache_block_size = int(config.prefix_cache_block_size)
         if self.enable_prefix_caching and self.prefix_cache_block_size != self.page_size:
             raise ValueError(
@@ -80,7 +87,7 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
         # [2, L, P, H_kv, D] -> 0:max, 1:min
         self.metadata_cache = torch.empty(
             2,
-            self.num_layers,
+            self.num_kv_layers,
             self.num_pages,
             self.num_kv_heads,
             self.head_dim,
@@ -93,7 +100,7 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
 
         # QuEST keeps one extra min/max page summary per physical page.
         effective_slot_bytes = int(slot_bytes_per_layer * (1.0 + 1.0 / self.page_size))
-        total_token_slots = available_memory // (self.num_layers * effective_slot_bytes)
+        total_token_slots = available_memory // (self.num_kv_layers * effective_slot_bytes)
         total_token_slots = (total_token_slots // self.page_size) * self.page_size
         assert total_token_slots > 0, "Available memory is insufficient for QuEST paged KV cache"
 
@@ -102,7 +109,7 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
 
         self.kv_cache = torch.empty(
             2,
-            self.num_layers,
+            self.num_kv_layers,
             total_token_slots,
             self.num_kv_heads,
             self.head_dim,
@@ -114,16 +121,19 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
         return self.layer_batch_state
 
     def get_layer_kv_cache(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.kv_cache[0, layer_idx], self.kv_cache[1, layer_idx]
+        kv_idx = self.kv_layer_index(layer_idx)
+        return self.kv_cache[0, kv_idx], self.kv_cache[1, kv_idx]
 
     def get_layer_store_view(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return self.kv_cache[0, layer_idx], self.kv_cache[1, layer_idx], self.layer_batch_state.slot_mapping
+        kv_idx = self.kv_layer_index(layer_idx)
+        return self.kv_cache[0, kv_idx], self.kv_cache[1, kv_idx], self.layer_batch_state.slot_mapping
 
     def get_layer_compute_tensors(self, layer_idx: int, selection: SparseSelection | None = None):
         del selection
         raise NotImplementedError
 
     def get_layer_buffer_req_to_token_slots(self, layer_idx: int) -> torch.Tensor:
+        self.kv_layer_index(layer_idx)
         return self.buffer_req_to_token_slots
 
     @property
@@ -341,9 +351,7 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
             payload = block.payload
             if not isinstance(payload, QuestPrefixBlockPayload):
                 raise RuntimeError("Quest prefix cache block is missing block slot payload.")
-            ptr = self._num_free_pages
-            self.free_pages_stack[ptr] = int(payload.block_slot)
-            self._num_free_pages += 1
+            self._release_prefix_payload_pages(payload)
 
     def _prefix_cache_materialization_subject(self) -> str:
         return "Quest prefix materialization"
@@ -381,15 +389,175 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
             raise RuntimeError("Quest prefix block token slots are not a contiguous full page.")
         return first_page_slot
 
+    def _validate_page_slot_matrix(
+        self,
+        slots: torch.Tensor,
+        expected_page_slots: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        num_slots = int(slots.numel())
+        if num_slots <= 0 or num_slots % self.page_size != 0:
+            raise RuntimeError(
+                "Quest prefix payload must contain contiguous full pages: "
+                f"num_slots={num_slots} page_size={self.page_size}."
+            )
+        slots_i32 = slots.to(device=self.device, dtype=torch.int32).reshape(-1, self.page_size)
+        page_slots = torch.div(slots_i32[:, 0], self.page_size, rounding_mode="floor")
+        expected_slots = (
+            page_slots[:, None] * self.page_size
+            + self.page_offsets_i32.to(device=slots_i32.device)[None, :]
+        )
+        valid = torch.all(slots_i32 == expected_slots)
+        if expected_page_slots is not None:
+            expected_page_slots = expected_page_slots.to(
+                device=slots_i32.device,
+                dtype=torch.int32,
+            ).reshape(-1)
+            if int(expected_page_slots.numel()) != int(page_slots.numel()):
+                raise RuntimeError(
+                    "Quest prefix payload page count does not match page metadata: "
+                    f"payload_pages={int(page_slots.numel())} "
+                    f"metadata_pages={int(expected_page_slots.numel())}."
+                )
+            valid = valid & torch.all(page_slots == expected_page_slots)
+        if hasattr(self, "num_pages"):
+            valid = valid & torch.all((page_slots >= 0) & (page_slots < int(self.num_pages)))
+        if not bool(valid.item()):
+            raise RuntimeError(
+                "Quest prefix payload contains non-contiguous, mismatched, or out-of-range page slots."
+            )
+        return page_slots.contiguous()
+
     def _make_prefix_block_payload(self, slots: torch.Tensor) -> QuestPrefixBlockPayload:
         return QuestPrefixBlockPayload(
             block_slot=self._validate_page_slots(slots),
             token_slots=slots,
         )
 
+    def _payload_page_slots(self, payload: QuestPrefixBlockPayload) -> torch.Tensor:
+        if payload.block_slots is None:
+            if payload.block_slot is None:
+                raise RuntimeError("Quest single-page prefix payload is missing block_slot.")
+            page_slots = torch.tensor([int(payload.block_slot)], dtype=torch.int32, device=self.device)
+        else:
+            page_slots = payload.block_slots.to(device=self.device, dtype=torch.int32).reshape(-1)
+        expected_pages = int(payload.token_slots.numel()) // self.page_size
+        if int(payload.token_slots.numel()) % self.page_size != 0 or int(page_slots.numel()) != expected_pages:
+            raise RuntimeError(
+                "Quest prefix payload page metadata does not match token slots: "
+                f"token_slots={int(payload.token_slots.numel())} page_size={self.page_size} "
+                f"page_slots={int(page_slots.numel())}."
+            )
+        return page_slots
+
+    def _release_prefix_payload_pages(self, payload: QuestPrefixBlockPayload) -> None:
+        if payload.block_slots is None:
+            if payload.block_slot is None:
+                raise RuntimeError("Quest single-page prefix payload is missing block_slot.")
+            self.free_pages_stack[self._num_free_pages] = int(payload.block_slot)
+            self._num_free_pages += 1
+            return
+        page_slots = self._payload_page_slots(payload)
+        start = int(self._num_free_pages)
+        end = start + int(page_slots.numel())
+        if end > int(self.free_pages_stack.numel()):
+            raise RuntimeError(
+                "Quest prefix page free stack overflow: "
+                f"start={start} pages={int(page_slots.numel())} "
+                f"capacity={int(self.free_pages_stack.numel())}."
+            )
+        self.free_pages_stack[start:end].copy_(page_slots)
+        self._num_free_pages = end
+
     def _mark_materialized_prefix_block(self, seq: Sequence, block: PrefixCacheBlock) -> None:
         cached_pages = self.seq_id_to_cached_pages.setdefault(seq.seq_id, set())
         cached_pages.add(int(block.logical_block_idx))
+
+    def build_prefix_kv_payload(self, seq: Sequence, block_start: int, block_end: int) -> QuestPrefixBlockPayload:
+        block_start = int(block_start)
+        block_end = int(block_end)
+        if block_end <= block_start:
+            raise ValueError(f"Invalid Quest prefix KV payload range: {block_start}:{block_end}.")
+        if block_start % self.page_size != 0 or block_end % self.page_size != 0:
+            raise RuntimeError(
+                "Quest mixed prefix payload must be page aligned: "
+                f"range={block_start}:{block_end} page_size={self.page_size}."
+            )
+        row_idx = self.seq_id_to_row.get(int(seq.seq_id))
+        if row_idx is None:
+            raise RuntimeError(f"Cannot build Quest prefix KV payload for unknown seq_id={seq.seq_id}.")
+        row_len = int(self.row_seq_lens[row_idx])
+        if block_end > row_len:
+            raise RuntimeError(
+                "Cannot build Quest prefix KV payload beyond materialized row length: "
+                f"seq_id={seq.seq_id} block={block_start}:{block_end} row_len={row_len}."
+            )
+        slots = self.buffer_req_to_token_slots[row_idx, block_start:block_end].detach().to(
+            dtype=torch.int32,
+        ).clone()
+        page_slots = self._validate_page_slot_matrix(slots)
+        return QuestPrefixBlockPayload(
+            block_slot=None,
+            token_slots=slots,
+            block_start=block_start,
+            block_end=block_end,
+            block_slots=page_slots,
+        )
+
+    def attach_prefix_kv_payload(self, seq: Sequence, payload: object) -> None:
+        if not isinstance(payload, QuestPrefixBlockPayload):
+            raise RuntimeError("Quest mixed prefix KV payload is missing page payload.")
+        slots = payload.token_slots.to(device=self.device, dtype=torch.int32).reshape(-1)
+        expected_tokens = int(payload.block_end) - int(payload.block_start)
+        if expected_tokens <= 0 or int(slots.numel()) != expected_tokens:
+            raise RuntimeError(
+                "Quest mixed prefix KV payload token count does not match its range: "
+                f"range={int(payload.block_start)}:{int(payload.block_end)} "
+                f"slots={int(slots.numel())}."
+            )
+        row_idx = self._get_free_row(int(seq.seq_id))
+        cur_len = int(self.row_seq_lens[row_idx])
+        if int(payload.block_start) != cur_len:
+            raise RuntimeError(
+                "Quest mixed prefix KV payload attach must be contiguous: "
+                f"seq_id={seq.seq_id} block_start={int(payload.block_start)} row_len={cur_len}."
+            )
+        page_slots = self._payload_page_slots(payload)
+        page_slots = self._validate_page_slot_matrix(slots, page_slots)
+        page_count = int(page_slots.numel())
+        start_page = cur_len // self.page_size
+        end_page = start_page + page_count
+        cached_pages = self.seq_id_to_cached_pages.setdefault(int(seq.seq_id), set())
+        self.buffer_req_to_page_slots[row_idx, start_page:end_page].copy_(page_slots)
+        cached_pages.update(range(start_page, end_page))
+        self.buffer_req_to_token_slots[row_idx, cur_len : cur_len + int(slots.numel())] = slots
+        self.row_seq_lens[row_idx] = cur_len + int(slots.numel())
+
+    def free_prefix_kv_payload(self, payload: object) -> None:
+        if not isinstance(payload, QuestPrefixBlockPayload):
+            raise RuntimeError("Quest mixed prefix KV payload is missing page payload.")
+        self._release_prefix_payload_pages(payload)
+
+    def prefix_kv_payload_nbytes(self, payload: object) -> int:
+        if not isinstance(payload, QuestPrefixBlockPayload):
+            raise RuntimeError("Quest mixed prefix KV payload is missing page payload.")
+        dtype_size = self._cache_slot_dtype_size()
+        return int(
+            payload.token_slots.numel()
+            * self.num_kv_layers
+            * 2
+            * self.num_kv_heads
+            * self.head_dim
+            * dtype_size
+        )
+
+    def mark_materialized_prefix_kv_payload(self, seq: Sequence, payload: object) -> None:
+        if not isinstance(payload, QuestPrefixBlockPayload):
+            raise RuntimeError("Quest mixed prefix KV payload is missing page payload.")
+        start_page = int(payload.block_start) // int(self.page_size)
+        page_count = int(payload.token_slots.numel()) // int(self.page_size)
+        self.seq_id_to_cached_pages.setdefault(int(seq.seq_id), set()).update(
+            range(start_page, start_page + page_count)
+        )
 
     def _reset_prefix_cache_allocator_after_clear(self) -> None:
         if self.seq_id_to_row:
@@ -868,6 +1036,7 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
         k: torch.Tensor,
         slot_mapping: torch.Tensor,
     ):
+        kv_idx = self.kv_layer_index(layer_idx)
         if slot_mapping is None or slot_mapping.numel() == 0:
             return
         if not get_context().is_prefill:
@@ -883,8 +1052,8 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
 
         with profiler.record("quest_update_metadata"):
             if self._prefill_metadata_full_pages:
-                page_max_cache = self.metadata_cache[0, layer_idx]
-                page_min_cache = self.metadata_cache[1, layer_idx]
+                page_max_cache = self.metadata_cache[0, kv_idx]
+                page_min_cache = self.metadata_cache[1, kv_idx]
                 full_page_slots = torch.div(
                     slot_mapping[:: self.page_size],
                     self.page_size,
@@ -904,9 +1073,9 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
             page_slots = torch.div(slot_mapping, self.page_size, rounding_mode="floor")
             page_offsets = torch.remainder(slot_mapping, self.page_size)
             unique_pages, counts = torch.unique_consecutive(page_slots, return_counts=True)
-            page_max_cache = self.metadata_cache[0, layer_idx]
-            page_min_cache = self.metadata_cache[1, layer_idx]
-            k_cache = self.kv_cache[0, layer_idx]
+            page_max_cache = self.metadata_cache[0, kv_idx]
+            page_min_cache = self.metadata_cache[1, kv_idx]
+            k_cache = self.kv_cache[0, kv_idx]
             run_starts = counts.cumsum(0) - counts
             start_offsets = page_offsets.index_select(0, run_starts)
             end_offsets = start_offsets + counts
@@ -949,12 +1118,13 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
         without metadata, matching the eager path until that page is completed.
         """
         with profiler.record("quest_update_metadata_capture"):
+            kv_idx = self.kv_layer_index(layer_idx)
             full_token_count = (int(slot_mapping.numel()) // self.page_size) * self.page_size
             if full_token_count <= 0:
                 return
 
-            page_max_cache = self.metadata_cache[0, layer_idx]
-            page_min_cache = self.metadata_cache[1, layer_idx]
+            page_max_cache = self.metadata_cache[0, kv_idx]
+            page_min_cache = self.metadata_cache[1, kv_idx]
             full_page_slots = torch.div(
                 slot_mapping[:full_token_count:self.page_size],
                 self.page_size,
@@ -1012,8 +1182,8 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
 
             page_token_indices = page_slots[:, None] * self.page_size + self.page_offsets_i64[None, :]
             flat_page_token_indices = page_token_indices.reshape(-1)
-            for layer_idx in range(self.num_layers):
-                k_cache = self.kv_cache[0, layer_idx]
+            for kv_idx in range(self.num_kv_layers):
+                k_cache = self.kv_cache[0, kv_idx]
                 full_page_k = k_cache.index_select(0, flat_page_token_indices).view(
                     len(completed_rows),
                     self.page_size,
@@ -1021,8 +1191,8 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
                     self.head_dim,
                 )
                 page_min, page_max = torch.aminmax(full_page_k, dim=1)
-                self.metadata_cache[0, layer_idx].index_copy_(0, page_slots, page_max)
-                self.metadata_cache[1, layer_idx].index_copy_(0, page_slots, page_min)
+                self.metadata_cache[0, kv_idx].index_copy_(0, page_slots, page_max)
+                self.metadata_cache[1, kv_idx].index_copy_(0, page_slots, page_min)
 
     @staticmethod
     def _score_pages_batched(
@@ -1096,6 +1266,7 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
         num_kv_heads: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         with profiler.record("quest_build_decode_view_static"):
+            kv_idx = self.kv_layer_index(layer_idx)
             page_budget_base = max(3, int(token_budget) // self.page_size)
             max_keep = max(int(token_budget), page_budget_base * self.page_size, self.page_size)
             max_context_len = self.layer_batch_state.max_context_len
@@ -1124,11 +1295,11 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
             prev_page_slots = row_page_slots[:, : max_pages - 1].to(torch.long)
             safe_prev_page_slots = prev_page_slots.clamp_min_(0)
 
-            prev_page_max = self.metadata_cache[0, layer_idx].index_select(
+            prev_page_max = self.metadata_cache[0, kv_idx].index_select(
                 0,
                 safe_prev_page_slots.reshape(-1),
             ).view(batch_size, max_pages - 1, num_kv_heads, self.head_dim).permute(0, 2, 1, 3)
-            prev_page_min = self.metadata_cache[1, layer_idx].index_select(
+            prev_page_min = self.metadata_cache[1, kv_idx].index_select(
                 0,
                 safe_prev_page_slots.reshape(-1),
             ).view(batch_size, max_pages - 1, num_kv_heads, self.head_dim).permute(0, 2, 1, 3)

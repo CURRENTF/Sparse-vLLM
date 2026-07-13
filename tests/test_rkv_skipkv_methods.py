@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 import torch
 
-from sparsevllm.config import Config
+from sparsevllm.config import Config, RuntimeLayout
 from sparsevllm.engine.cache_manager.base import LayerBatchStates
 from sparsevllm.engine.cache_manager.rkv import RKVCacheManager
 from sparsevllm.engine.cache_manager.skipkv import (
@@ -251,6 +251,7 @@ class RKVSkipKVMethodTest(unittest.TestCase):
 
     def test_skipkv_batch_free_updates_gen_indices(self):
         manager = object.__new__(SkipKVCacheManager)
+        manager.runtime_layout = RuntimeLayout.dense(1)
         manager.config = SimpleNamespace()
         manager.device = torch.device("cpu")
         seqs = [Sequence([1]), Sequence([2])]
@@ -274,6 +275,7 @@ class RKVSkipKVMethodTest(unittest.TestCase):
 
     def test_rkv_selection_preserves_sink_recent_and_budget(self):
         manager = object.__new__(RKVCacheManager)
+        manager.runtime_layout = RuntimeLayout.dense(1)
         manager.config = SimpleNamespace(
             num_sink_tokens=1,
             num_recent_tokens=1,
@@ -302,6 +304,7 @@ class RKVSkipKVMethodTest(unittest.TestCase):
 
     def test_rkv_zero_redundancy_window_scores_full_candidate_set(self):
         manager = object.__new__(RKVCacheManager)
+        manager.runtime_layout = RuntimeLayout.dense(1)
         manager.config = SimpleNamespace(
             num_sink_tokens=1,
             num_recent_tokens=1,
@@ -336,6 +339,7 @@ class RKVSkipKVMethodTest(unittest.TestCase):
     def test_rkv_batch_selection_matches_single_selection(self):
         torch.manual_seed(23)
         manager = object.__new__(RKVCacheManager)
+        manager.runtime_layout = RuntimeLayout.dense(1)
         manager.config = SimpleNamespace(
             num_sink_tokens=1,
             num_recent_tokens=1,
@@ -392,6 +396,7 @@ class RKVSkipKVMethodTest(unittest.TestCase):
     def test_skipkv_batch_selection_matches_single_selection_without_sentences(self):
         torch.manual_seed(29)
         manager = object.__new__(SkipKVCacheManager)
+        manager.runtime_layout = RuntimeLayout.dense(1)
         manager.config = SimpleNamespace(
             num_sink_tokens=1,
             num_recent_tokens=1,
@@ -451,6 +456,7 @@ class RKVSkipKVMethodTest(unittest.TestCase):
 
     def test_rkv_query_cache_tracks_observation_tokens_not_interval(self):
         manager = object.__new__(RKVCacheManager)
+        manager.runtime_layout = RuntimeLayout.dense(1)
         manager._rkv_observation_tokens = 3
         manager.device = torch.device("cpu")
         manager._rkv_query_cache = [torch.zeros((1, 3, 1, 2), dtype=torch.float32)]
@@ -504,6 +510,7 @@ class RKVSkipKVMethodTest(unittest.TestCase):
 
         seq = Sequence([1])
         manager = object.__new__(RKVCacheManager)
+        manager.runtime_layout = RuntimeLayout.dense(1)
         manager.config = SimpleNamespace(
             rkv_observation_tokens=observation_tokens,
             sparse_attn_score_dtype="float32",
@@ -567,6 +574,7 @@ class RKVSkipKVMethodTest(unittest.TestCase):
 
         seqs = [Sequence([1]), Sequence([2])]
         manager = object.__new__(RKVCacheManager)
+        manager.runtime_layout = RuntimeLayout.dense(1)
         manager.config = SimpleNamespace(
             rkv_observation_tokens=observation_tokens,
             sparse_attn_score_dtype="float32",
