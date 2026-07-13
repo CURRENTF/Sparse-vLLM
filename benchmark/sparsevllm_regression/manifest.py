@@ -89,6 +89,9 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
         compressor_env = model.get("compressor_path_env")
         if compressor_env is not None and not isinstance(compressor_env, str):
             raise ManifestError(f"model {model_id!r} compressor_path_env must be a string.")
+        mixed_attention = model.get("mixed_attention", False)
+        if not isinstance(mixed_attention, bool):
+            raise ManifestError(f"model {model_id!r} mixed_attention must be a boolean.")
 
     for method_id, method in methods.items():
         if "sparse_method" not in method:

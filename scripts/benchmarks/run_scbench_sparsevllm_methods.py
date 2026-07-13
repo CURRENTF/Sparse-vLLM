@@ -230,7 +230,16 @@ def method_runtime_config(
     if method["sparse_method"] == "quest":
         quest_chunk_size = int(cfg.get("quest_chunk_size", prefix_cache_block_size))
         cfg["quest_chunk_size"] = quest_chunk_size
-        cfg["prefix_cache_block_size"] = quest_chunk_size
+        if bool(manifest["models"][model_id].get("mixed_attention", False)):
+            block_size = int(prefix_cache_block_size)
+            if block_size <= 0 or block_size % quest_chunk_size != 0:
+                raise ValueError(
+                    "Mixed-attention Quest prefix cache block size must be a positive multiple "
+                    f"of quest_chunk_size: block_size={block_size}, quest_chunk_size={quest_chunk_size}."
+                )
+            cfg["prefix_cache_block_size"] = block_size
+        else:
+            cfg["prefix_cache_block_size"] = quest_chunk_size
     else:
         cfg["prefix_cache_block_size"] = int(prefix_cache_block_size)
     return cfg

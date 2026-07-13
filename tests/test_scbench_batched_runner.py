@@ -55,6 +55,21 @@ def test_method_runtime_config_enables_prefix_cache_and_aligns_quest_blocks():
     assert quest_cfg["quest_chunk_size"] == 16
     assert quest_cfg["prefix_cache_block_size"] == 16
 
+    mixed_quest_cfg = runner.method_runtime_config(
+        manifest,
+        model_id="qwen36",
+        method_id="quest",
+        batch_size=4,
+        max_seq_length=32768,
+        tensor_parallel_size=1,
+        prefix_cache_block_size=4096,
+        gpu_memory_utilization=0.8,
+        scbench_max_steps=123,
+        prefix_cache_salt="unit",
+    )
+    assert mixed_quest_cfg["quest_chunk_size"] == 16
+    assert mixed_quest_cfg["prefix_cache_block_size"] == 4096
+
     graph_cfg = runner.method_runtime_config(
         manifest,
         model_id="qwen3_4b",

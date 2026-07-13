@@ -173,6 +173,11 @@ class SparseVLLMRegressionGradingTest(unittest.TestCase):
         self.assertEqual(manifest["scbench"]["methods"], ["vanilla", "omnikv", "quest"])
         self.assertEqual(manifest["scbench"]["tasks"], ["scbench_kv", "scbench_qa_eng"])
         self.assertEqual(manifest["scbench"]["batch_size"], 4)
+        self.assertTrue(manifest["models"]["qwen36"]["mixed_attention"])
+        self.assertEqual(
+            manifest["methods"]["omnikv"]["model_configs"]["qwen36"]["full_attention_layers"],
+            "3,11,23,31,35,47,59",
+        )
 
     def test_omnikv_and_deltakv_full_layers_are_model_specific(self):
         manifest = load_manifest()
