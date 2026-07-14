@@ -17,3 +17,7 @@ judge:
 defaults:
   trace_dir: ${CLAW_EVAL_TRACE_DIR}
   tasks_dir: tasks
+
+sandbox:
+  enabled: false
+  image: ${CLAW_EVAL_SANDBOX_IMAGE}

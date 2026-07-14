@@ -10,6 +10,7 @@ as a lightweight source-tree map.
 | `math_bench/` | `pred.py`, `eval.py` | GSM8K, AIME 2024, MATH-500, and HMMT Nov tasks. |
 | `scbench/` | `run_scbench.py`, `run_scbench_preprocessed.py`, `compute_scores.py`, `run_kvzip_preprocessed.py` | SCBench standard, preprocessed, scoring, and KVZip routes. |
 | `claw_eval/` | `run_sparsevllm_claw_eval.sh` | Claw-Eval through the shared Sparse-vLLM OpenAI-compatible server. |
+| `swe_bench_lite/` | `run.py` | Thin mini-SWE-agent generator and official SWE-bench Lite evaluator. |
 | `microbench.py` | `microbench.py` | Synthetic prompt-length throughput benchmark for TTFT, prefill/decode tok/s, ITL, and peak memory. |
 | `multimodal/` | `video_qa/`, `image_qa/`, `visual_cache/` | Video QA, image QA, and visual-cache benchmark runners. |
 | `ruler_vt/` | `pred.py` | Self-contained RULER variable-tracking runner. |

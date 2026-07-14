@@ -21,6 +21,8 @@ SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-sparsevllm-claw}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-4,5,6}"
 SERVER_HOST="${SERVER_HOST:-127.0.0.1}"
 SERVER_PORT="${SERVER_PORT:-18000}"
+SERVER_HEALTH_URL="${SERVER_HEALTH_URL:-http://${SERVER_HOST}:${SERVER_PORT}/health}"
+START_SPARSEVLLM_SERVER="${START_SPARSEVLLM_SERVER:-1}"
 SPARSEVLLM_OPENAI_BASE_URL="${SPARSEVLLM_OPENAI_BASE_URL:-http://${SERVER_HOST}:${SERVER_PORT}/v1}"
 SPARSEVLLM_OPENAI_API_KEY="${SPARSEVLLM_OPENAI_API_KEY:-local-sparsevllm}"
 SPARSEVLLM_CLAW_MODEL_ID="${SPARSEVLLM_CLAW_MODEL_ID:-${SERVED_MODEL_NAME}}"
@@ -33,6 +35,14 @@ CLAW_EVAL_REF="${CLAW_EVAL_REF:-main}"
 CLAW_EVAL_CONFIG_TEMPLATE="${CLAW_EVAL_CONFIG_TEMPLATE:-${REPO_ROOT}/benchmark/claw_eval/sparsevllm_config.yaml}"
 CLAW_EVAL_CONFIG="${RUN_DIR}/sparsevllm_config.yaml"
 CLAW_EVAL_ARGS="${CLAW_EVAL_ARGS:-batch --config ${CLAW_EVAL_CONFIG} --sandbox --trials 3 --parallel 1}"
+CLAW_EVAL_UPDATE_REPO="${CLAW_EVAL_UPDATE_REPO:-1}"
+CLAW_EVAL_SANDBOX_IMAGE="${CLAW_EVAL_SANDBOX_IMAGE:-claw-eval-agent:latest}"
+CLAW_EVAL_BUILD_SANDBOX_IMAGE="${CLAW_EVAL_BUILD_SANDBOX_IMAGE:-0}"
+CLAW_EVAL_DOCKER_BUILD_ARGS="${CLAW_EVAL_DOCKER_BUILD_ARGS:-}"
+CLAW_EVAL_COMMIT=""
+CLAW_EVAL_EFFECTIVE_SANDBOX_IMAGE=""
+CLAW_EVAL_SANDBOX_IMAGE_ID=""
+CLAW_EVAL_SANDBOX_IMAGE_SIZE_BYTES=""
 SETUP_ONLY="${SETUP_ONLY:-0}"
 
 SPARSEVLLM_CONDA_ENV="${SPARSEVLLM_CONDA_ENV:-${CONDA_ENVS_ROOT}/sparse-vllm-tf530}"
@@ -57,6 +67,8 @@ export REQUEST_LOG_DIR
 export MODEL_PATH
 export SERVED_MODEL_NAME
 export CUDA_VISIBLE_DEVICES
+export SERVER_HEALTH_URL
+export START_SPARSEVLLM_SERVER
 export SPARSEVLLM_OPENAI_BASE_URL
 export SPARSEVLLM_CLAW_MODEL_ID
 export SPARSEVLLM_CONTEXT_WINDOW
@@ -65,6 +77,13 @@ export CLAW_EVAL_JUDGE_MODEL
 export CLAW_EVAL_DIR
 export CLAW_EVAL_CONFIG
 export CLAW_EVAL_ARGS
+export CLAW_EVAL_UPDATE_REPO
+export CLAW_EVAL_SANDBOX_IMAGE
+export CLAW_EVAL_BUILD_SANDBOX_IMAGE
+export CLAW_EVAL_COMMIT
+export CLAW_EVAL_EFFECTIVE_SANDBOX_IMAGE
+export CLAW_EVAL_SANDBOX_IMAGE_ID
+export CLAW_EVAL_SANDBOX_IMAGE_SIZE_BYTES
 export SPARSEVLLM_CONDA_ENV
 export CLAW_EVAL_CONDA_ENV
 export SPARSEVLLM_MASTER_PORT
@@ -81,24 +100,40 @@ require_file() {
   fi
 }
 
+require_bool() {
+  local name="$1"
+  local value="$2"
+  if [[ "${value}" != "0" && "${value}" != "1" ]]; then
+    echo "[ERROR] ${name} must be 0 or 1, got: ${value}" >&2
+    exit 2
+  fi
+}
+
 start_download_clash_if_needed() {
-  if ss -ltn 2>/dev/null | grep -qE '127\.0\.0\.1:7898|:7898 '; then
+  local proxy_address="${DOWNLOAD_HTTP_PROXY#*://}"
+  proxy_address="${proxy_address%%/*}"
+  local proxy_port="${proxy_address##*:}"
+  if [[ ! "${proxy_port}" =~ ^[0-9]+$ ]]; then
+    echo "[ERROR] DOWNLOAD_HTTP_PROXY must include a numeric port: ${DOWNLOAD_HTTP_PROXY}" >&2
+    exit 3
+  fi
+  if ss -ltn 2>/dev/null | grep -qE ":${proxy_port}[[:space:]]"; then
     return
   fi
   require_file "${CLASH_DIR}/clash" "Clash binary"
   require_file "${CLASH_DOWNLOAD_CONFIG}" "download-only Clash config"
-  echo "[INFO] Starting download-only Clash on 127.0.0.1:7898"
+  echo "[INFO] Starting download-only Clash for ${DOWNLOAD_HTTP_PROXY}"
   (
     cd "${CLASH_DIR}"
     nohup ./clash -d "${CLASH_DIR}" -f "${CLASH_DOWNLOAD_CONFIG}" >"${CLASH_DOWNLOAD_LOG}" 2>&1 &
   )
   for _ in $(seq 1 30); do
-    if ss -ltn 2>/dev/null | grep -qE '127\.0\.0\.1:7898|:7898 '; then
+    if ss -ltn 2>/dev/null | grep -qE ":${proxy_port}[[:space:]]"; then
       return
     fi
     sleep 1
   done
-  echo "[ERROR] download-only Clash did not open port 7898. See ${CLASH_DOWNLOAD_LOG}" >&2
+  echo "[ERROR] download-only Clash did not open port ${proxy_port}. See ${CLASH_DOWNLOAD_LOG}" >&2
   exit 3
 }
 
@@ -125,8 +160,16 @@ deactivate_conda_env() {
 }
 
 prepare_claw_eval_repo() {
-  start_download_clash_if_needed
   mkdir -p "$(dirname "${CLAW_EVAL_DIR}")"
+  if [[ "${CLAW_EVAL_UPDATE_REPO}" == "0" ]]; then
+    require_file "${CLAW_EVAL_DIR}/.git" "existing Claw-Eval checkout"
+    CLAW_EVAL_COMMIT="$(git -C "${CLAW_EVAL_DIR}" rev-parse HEAD)"
+    export CLAW_EVAL_COMMIT
+    echo "[INFO] Reusing Claw-Eval checkout at ${CLAW_EVAL_COMMIT}"
+    return
+  fi
+
+  start_download_clash_if_needed
   if [[ -d "${CLAW_EVAL_DIR}/.git" ]]; then
     echo "[INFO] Updating Claw-Eval repo at ${CLAW_EVAL_DIR}"
     download_env git -C "${CLAW_EVAL_DIR}" fetch origin "${CLAW_EVAL_REF}"
@@ -137,13 +180,15 @@ prepare_claw_eval_repo() {
     download_env git clone https://github.com/claw-eval/claw-eval "${CLAW_EVAL_DIR}"
     download_env git -C "${CLAW_EVAL_DIR}" checkout "${CLAW_EVAL_REF}"
   fi
+  CLAW_EVAL_COMMIT="$(git -C "${CLAW_EVAL_DIR}" rev-parse HEAD)"
+  export CLAW_EVAL_COMMIT
 }
 
 prepare_claw_eval_env() {
-  start_download_clash_if_needed
   export PIP_CACHE_DIR="${PIP_CACHE_DIR:-${CACHE_ROOT}/pip}"
   mkdir -p "${PIP_CACHE_DIR}"
   if [[ ! -x "${CLAW_EVAL_CONDA_ENV}/bin/python" ]]; then
+    start_download_clash_if_needed
     echo "[INFO] Creating Claw-Eval Python 3.11 env at ${CLAW_EVAL_CONDA_ENV}"
     download_env conda create -y -p "${CLAW_EVAL_CONDA_ENV}" python=3.11 pip
   fi
@@ -154,6 +199,7 @@ import importlib.util
 raise SystemExit(0 if importlib.util.find_spec("claw_eval") else 1)
 PY
   then
+    start_download_clash_if_needed
     echo "[INFO] Installing Claw-Eval into ${CLAW_EVAL_CONDA_ENV}"
     download_env python -m pip install -U pip
     download_env python -m pip install -e "${CLAW_EVAL_DIR}[mock,sandbox]"
@@ -182,6 +228,7 @@ with open(src, "r", encoding="utf-8") as f:
 rendered = Template(text).substitute(os.environ)
 with open(dst, "w", encoding="utf-8") as f:
     f.write(rendered)
+os.chmod(dst, 0o600)
 PY
 }
 
@@ -223,18 +270,147 @@ print(Template(os.environ["CLAW_EVAL_ARGS_TEMPLATE"]).safe_substitute(os.environ
 PY
 }
 
+resolve_effective_sandbox_image() {
+  CLAW_EVAL_ARGS_RAW="${CLAW_EVAL_ARGS}" \
+    CLAW_EVAL_SANDBOX_IMAGE="${CLAW_EVAL_SANDBOX_IMAGE}" \
+    "${CLAW_EVAL_CONDA_ENV}/bin/python" - <<'PY'
+import os
+import shlex
+
+args = shlex.split(os.environ["CLAW_EVAL_ARGS_RAW"])
+if "--sandbox" not in args:
+    print("")
+    raise SystemExit(0)
+
+image = os.environ["CLAW_EVAL_SANDBOX_IMAGE"]
+for index, arg in enumerate(args):
+    if arg == "--sandbox-image":
+        if index + 1 >= len(args):
+            raise SystemExit("--sandbox-image requires a value")
+        image = args[index + 1]
+    elif arg.startswith("--sandbox-image="):
+        image = arg.split("=", 1)[1]
+if not image:
+    raise SystemExit("sandbox image must not be empty")
+print(image)
+PY
+}
+
+prepare_sandbox_image() {
+  CLAW_EVAL_EFFECTIVE_SANDBOX_IMAGE="$(resolve_effective_sandbox_image)"
+  export CLAW_EVAL_EFFECTIVE_SANDBOX_IMAGE
+  if [[ -z "${CLAW_EVAL_EFFECTIVE_SANDBOX_IMAGE}" ]]; then
+    echo "[INFO] Claw-Eval sandbox is disabled for this run"
+    return
+  fi
+
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "[ERROR] --sandbox requires the docker command" >&2
+    exit 6
+  fi
+  if ! docker info >/dev/null 2>&1; then
+    echo "[ERROR] --sandbox requires a running Docker daemon" >&2
+    exit 6
+  fi
+
+  if ! docker image inspect "${CLAW_EVAL_EFFECTIVE_SANDBOX_IMAGE}" >/dev/null 2>&1; then
+    if [[ "${CLAW_EVAL_BUILD_SANDBOX_IMAGE}" != "1" ]]; then
+      echo "[ERROR] Missing sandbox image ${CLAW_EVAL_EFFECTIVE_SANDBOX_IMAGE}." >&2
+      echo "[ERROR] Set CLAW_EVAL_BUILD_SANDBOX_IMAGE=1 to build it explicitly." >&2
+      exit 6
+    fi
+    require_file "${CLAW_EVAL_DIR}/Dockerfile.agent" "Claw-Eval Dockerfile.agent"
+    local -a build_args=()
+    if [[ -n "${CLAW_EVAL_DOCKER_BUILD_ARGS}" ]]; then
+      mapfile -t build_args < <(
+        BUILD_ARGS="${CLAW_EVAL_DOCKER_BUILD_ARGS}" \
+          "${CLAW_EVAL_CONDA_ENV}/bin/python" - <<'PY'
+import os
+import shlex
+
+for arg in shlex.split(os.environ["BUILD_ARGS"]):
+    print(arg)
+PY
+      )
+    fi
+    echo "[INFO] Building sandbox image ${CLAW_EVAL_EFFECTIVE_SANDBOX_IMAGE}"
+    docker build \
+      --file "${CLAW_EVAL_DIR}/Dockerfile.agent" \
+      --tag "${CLAW_EVAL_EFFECTIVE_SANDBOX_IMAGE}" \
+      "${build_args[@]}" \
+      "${CLAW_EVAL_DIR}" 2>&1 | tee "${LOG_DIR}/sandbox_image_build.log"
+  else
+    echo "[INFO] Using existing sandbox image ${CLAW_EVAL_EFFECTIVE_SANDBOX_IMAGE}"
+  fi
+
+  docker image inspect "${CLAW_EVAL_EFFECTIVE_SANDBOX_IMAGE}" \
+    > "${RUN_DIR}/sandbox_image.json"
+  CLAW_EVAL_SANDBOX_IMAGE_ID="$(
+    docker image inspect "${CLAW_EVAL_EFFECTIVE_SANDBOX_IMAGE}" --format '{{.Id}}'
+  )"
+  CLAW_EVAL_SANDBOX_IMAGE_SIZE_BYTES="$(
+    docker image inspect "${CLAW_EVAL_EFFECTIVE_SANDBOX_IMAGE}" --format '{{.Size}}'
+  )"
+  export CLAW_EVAL_SANDBOX_IMAGE_ID
+  export CLAW_EVAL_SANDBOX_IMAGE_SIZE_BYTES
+
+  echo "[INFO] Starting sandbox preflight container"
+  CLAW_EVAL_EFFECTIVE_SANDBOX_IMAGE="${CLAW_EVAL_EFFECTIVE_SANDBOX_IMAGE}" \
+    "${CLAW_EVAL_CONDA_ENV}/bin/python" - <<'PY' \
+    2>&1 | tee "${LOG_DIR}/sandbox_preflight.log"
+import os
+
+import docker
+import httpx
+
+from claw_eval.config import SandboxConfig
+from claw_eval.runner.sandbox_runner import SandboxRunner
+
+image = os.environ["CLAW_EVAL_EFFECTIVE_SANDBOX_IMAGE"]
+runner = SandboxRunner(SandboxConfig(enabled=True, image=image), image=image)
+handle = None
+run_id = f"preflight-{os.getpid()}"
+try:
+    handle = runner.start_container(run_id=run_id)
+    health = httpx.get(f"{handle.sandbox_url}/health", timeout=5.0)
+    health.raise_for_status()
+    assert health.json() == {"status": "ok"}, health.text
+    result = httpx.post(
+        f"{handle.sandbox_url}/exec",
+        json={
+            "command": "python --version && test ! -e /workspace/grader.py && printf sandbox-ok",
+            "timeout_seconds": 10,
+        },
+        timeout=15.0,
+    )
+    result.raise_for_status()
+    payload = result.json()
+    assert payload["exit_code"] == 0, payload
+    assert "sandbox-ok" in payload["stdout"], payload
+    print(f"sandbox_preflight=passed image={image}")
+finally:
+    if handle is not None:
+        runner.stop_container(handle)
+    else:
+        try:
+            docker.from_env().containers.get(f"claw-agent-{run_id}").remove(force=True)
+        except docker.errors.NotFound:
+            pass
+PY
+}
+
 wait_for_server() {
   for _ in $(seq 1 180); do
-    if curl -fsS "http://${SERVER_HOST}:${SERVER_PORT}/health" >/dev/null 2>&1; then
+    if curl -fsS "${SERVER_HEALTH_URL}" >/dev/null 2>&1; then
       return
     fi
-    if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
+    if [[ "${START_SPARSEVLLM_SERVER}" == "1" ]] && ! kill -0 "${SERVER_PID}" 2>/dev/null; then
       echo "[ERROR] Sparse-vLLM OpenAI server exited early. See ${LOG_DIR}/sparsevllm_openai_server.log" >&2
       exit 4
     fi
     sleep 2
   done
-  echo "[ERROR] Sparse-vLLM OpenAI server did not become healthy" >&2
+  echo "[ERROR] OpenAI server did not become healthy at ${SERVER_HEALTH_URL}" >&2
   exit 5
 }
 
@@ -252,6 +428,7 @@ manifest = {
     "run_name": os.environ["RUN_NAME"],
     "repo_root": os.environ["REPO_ROOT"],
     "claw_eval_dir": os.environ["CLAW_EVAL_DIR"],
+    "claw_eval_commit": os.environ["CLAW_EVAL_COMMIT"],
     "sparsevllm_conda_env": os.environ["SPARSEVLLM_CONDA_ENV"],
     "claw_eval_conda_env": os.environ["CLAW_EVAL_CONDA_ENV"],
     "model_path": os.environ["MODEL_PATH"],
@@ -260,10 +437,21 @@ manifest = {
     "engine_kwargs_file": str(engine_kwargs_file),
     "engine_kwargs": engine_kwargs,
     "server_base_url": os.environ["SPARSEVLLM_OPENAI_BASE_URL"],
+    "server_health_url": os.environ["SERVER_HEALTH_URL"],
+    "start_sparsevllm_server": os.environ["START_SPARSEVLLM_SERVER"] == "1",
     "judge_base_url": os.environ["CLAW_EVAL_JUDGE_BASE_URL"],
     "judge_model": os.environ["CLAW_EVAL_JUDGE_MODEL"],
     "sparsevllm_master_port": os.environ["SPARSEVLLM_MASTER_PORT"],
     "claw_eval_args": os.environ["CLAW_EVAL_ARGS"],
+    "sandbox_enabled": bool(os.environ["CLAW_EVAL_EFFECTIVE_SANDBOX_IMAGE"]),
+    "sandbox_image": os.environ["CLAW_EVAL_EFFECTIVE_SANDBOX_IMAGE"] or None,
+    "sandbox_image_id": os.environ["CLAW_EVAL_SANDBOX_IMAGE_ID"] or None,
+    "sandbox_image_size_bytes": (
+        int(os.environ["CLAW_EVAL_SANDBOX_IMAGE_SIZE_BYTES"])
+        if os.environ["CLAW_EVAL_SANDBOX_IMAGE_SIZE_BYTES"]
+        else None
+    ),
+    "build_sandbox_image": os.environ["CLAW_EVAL_BUILD_SANDBOX_IMAGE"] == "1",
     "setup_only": os.environ["SETUP_ONLY"],
     "download_http_proxy": os.environ["DOWNLOAD_HTTP_PROXY"],
     "trace_dir": os.environ["TRACE_DIR"],
@@ -277,12 +465,15 @@ with dst.open("w", encoding="utf-8") as f:
 PY
 }
 
+claw_eval_judge_enabled() {
+  [[ " ${CLAW_EVAL_ARGS} " != *" --no-judge "* ]]
+}
+
 main() {
-  require_file "${MODEL_PATH}" "model path"
-  if [[ "${SETUP_ONLY}" != "1" && -z "${OPENROUTER_API_KEY:-}" ]]; then
-    echo "[ERROR] OPENROUTER_API_KEY is required for the default Claw-Eval judge config." >&2
-    exit 2
-  fi
+  require_bool "SETUP_ONLY" "${SETUP_ONLY}"
+  require_bool "START_SPARSEVLLM_SERVER" "${START_SPARSEVLLM_SERVER}"
+  require_bool "CLAW_EVAL_UPDATE_REPO" "${CLAW_EVAL_UPDATE_REPO}"
+  require_bool "CLAW_EVAL_BUILD_SANDBOX_IMAGE" "${CLAW_EVAL_BUILD_SANDBOX_IMAGE}"
 
   source "${HOME}/miniconda3/etc/profile.d/conda.sh"
 
@@ -292,6 +483,7 @@ main() {
   write_engine_kwargs_file
   CLAW_EVAL_ARGS="$(resolve_claw_eval_args)"
   export CLAW_EVAL_ARGS
+  prepare_sandbox_image
   write_run_manifest
 
   if [[ "${SETUP_ONLY}" == "1" ]]; then
@@ -299,9 +491,11 @@ main() {
     exit 0
   fi
 
-  activate_conda_env "${SPARSEVLLM_CONDA_ENV}"
-  export CUDA_VISIBLE_DEVICES
-  export PYTHONPATH="${REPO_ROOT}/src:${PYTHONPATH:-}"
+  if claw_eval_judge_enabled && [[ -z "${OPENROUTER_API_KEY:-}" ]]; then
+    echo "[ERROR] OPENROUTER_API_KEY is required unless CLAW_EVAL_ARGS includes --no-judge." >&2
+    exit 2
+  fi
+
   export HF_HOME="${HF_HOME:-${CACHE_ROOT}/huggingface}"
   export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-${HF_HOME}}"
   export TORCH_HOME="${TORCH_HOME:-${CACHE_ROOT}/torch}"
@@ -312,18 +506,26 @@ main() {
   export NO_PROXY="127.0.0.1,localhost,::1"
   export no_proxy="127.0.0.1,localhost,::1"
 
-  echo "[INFO] Starting Sparse-vLLM OpenAI server on GPUs ${CUDA_VISIBLE_DEVICES}"
-  "${SPARSEVLLM_PYTHON_BIN}" -u -m sparsevllm.entrypoints.openai.api_server \
-    --model "${MODEL_PATH}" \
-    --served-model-name "${SERVED_MODEL_NAME}" \
-    --host "${SERVER_HOST}" \
-    --port "${SERVER_PORT}" \
-    --engine-kwargs "${ENGINE_KWARGS_FILE}" \
-    --request-log-dir "${REQUEST_LOG_DIR}" \
-    >"${LOG_DIR}/sparsevllm_openai_server.log" 2>&1 &
-  SERVER_PID="$!"
-  echo "${SERVER_PID}" >"${RUN_DIR}/sparsevllm_openai_server.pid"
-  trap 'kill "${SERVER_PID}" 2>/dev/null || true' EXIT
+  if [[ "${START_SPARSEVLLM_SERVER}" == "1" ]]; then
+    require_file "${MODEL_PATH}" "model path"
+    activate_conda_env "${SPARSEVLLM_CONDA_ENV}"
+    export CUDA_VISIBLE_DEVICES
+    export PYTHONPATH="${REPO_ROOT}/src:${PYTHONPATH:-}"
+    echo "[INFO] Starting Sparse-vLLM OpenAI server on GPUs ${CUDA_VISIBLE_DEVICES}"
+    "${SPARSEVLLM_PYTHON_BIN}" -u -m sparsevllm.entrypoints.openai.api_server \
+      --model "${MODEL_PATH}" \
+      --served-model-name "${SERVED_MODEL_NAME}" \
+      --host "${SERVER_HOST}" \
+      --port "${SERVER_PORT}" \
+      --engine-kwargs "${ENGINE_KWARGS_FILE}" \
+      --request-log-dir "${REQUEST_LOG_DIR}" \
+      >"${LOG_DIR}/sparsevllm_openai_server.log" 2>&1 &
+    SERVER_PID="$!"
+    echo "${SERVER_PID}" >"${RUN_DIR}/sparsevllm_openai_server.pid"
+    trap 'kill "${SERVER_PID}" 2>/dev/null || true' EXIT
+  else
+    echo "[INFO] Using external OpenAI server at ${SPARSEVLLM_OPENAI_BASE_URL}"
+  fi
   wait_for_server
 
   echo "[INFO] Running claw-eval ${CLAW_EVAL_ARGS}"
@@ -335,4 +537,6 @@ main() {
   ) 2>&1 | tee "${LOG_DIR}/claw_eval.log"
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
