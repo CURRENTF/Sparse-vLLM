@@ -114,8 +114,13 @@ def _oracle(
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
     local_expert_start: int,
+    output_dtype: torch.dtype,
 ) -> torch.Tensor:
-    output = torch.zeros_like(hidden_states)
+    output = torch.zeros(
+        hidden_states.shape,
+        dtype=output_dtype,
+        device=hidden_states.device,
+    )
     for local_expert_id in range(int(w13_weight.shape[0])):
         global_expert_id = local_expert_start + local_expert_id
         token_ids, topk_slots = torch.where(topk_ids == global_expert_id)
@@ -165,6 +170,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--atol", type=float, default=0.05)
     parser.add_argument("--rtol", type=float, default=0.05)
     parser.add_argument("--configs", default=None)
+    parser.add_argument(
+        "--output-dtype",
+        choices=("bfloat16", "float32", "float64"),
+        default="bfloat16",
+        help="Final TopK-sum dtype. Qwen3MoE EP uses float64 before its final cast.",
+    )
     return parser.parse_args()
 
 
@@ -202,6 +213,11 @@ def main() -> None:
     torch.cuda.manual_seed_all(args.seed)
     device = torch.device("cuda", torch.cuda.current_device())
     dtype = torch.bfloat16
+    output_dtype = {
+        "bfloat16": torch.bfloat16,
+        "float32": torch.float32,
+        "float64": torch.float64,
+    }[args.output_dtype]
     num_local_experts = args.num_experts // args.ep_size
     local_expert_start = args.ep_rank * num_local_experts
     w13_weight = (
@@ -260,6 +276,7 @@ def main() -> None:
                 topk_ids,
                 topk_weights,
                 local_expert_start,
+                output_dtype,
             )
             oracle_ms = _time_ms(
                 lambda: _oracle(
@@ -269,6 +286,7 @@ def main() -> None:
                     topk_ids,
                     topk_weights,
                     local_expert_start,
+                    output_dtype,
                 ),
                 warmup=1,
                 iterations=args.oracle_iterations,
@@ -308,6 +326,7 @@ def main() -> None:
                         topk_weights,
                         num_experts=args.num_experts,
                         local_expert_start=local_expert_start,
+                        output_dtype=output_dtype,
                     )
                     torch.cuda.synchronize()
                     first_call_ms = 1000.0 * (time.perf_counter() - first_call_started)
@@ -324,6 +343,7 @@ def main() -> None:
                             topk_weights,
                             num_experts=args.num_experts,
                             local_expert_start=local_expert_start,
+                            output_dtype=output_dtype,
                         ),
                         warmup=args.warmup,
                         iterations=args.iterations,
@@ -401,6 +421,7 @@ def main() -> None:
         "triton_version": triton.__version__,
         "device": torch.cuda.get_device_name(device),
         "dtype": str(dtype),
+        "output_dtype": str(output_dtype),
         "seed": args.seed,
         "tokens": list(tokens),
         "num_experts": args.num_experts,
