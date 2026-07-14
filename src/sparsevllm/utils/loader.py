@@ -483,6 +483,7 @@ def load_model(
                 )
     
     loaded_count = 0
+    loaded_parameter_names: set[str] = set()
     for file in files:
         with safe_open(file, "pt", "cpu") as f:
             keys = list(f.keys())
@@ -544,6 +545,7 @@ def load_model(
                             param = model.get_parameter(packed_param_name)
                             weight_loader = getattr(param, "weight_loader")
                             weight_loader(param, f.get_tensor(source_weight_name), shard_id)
+                        loaded_parameter_names.add(packed_param_name)
                         loaded_count += 1
                         break
                 else:
@@ -567,6 +569,7 @@ def load_model(
                     param = model.get_parameter(param_name)
                     weight_loader = getattr(param, "weight_loader", default_weight_loader)
                     weight_loader(param, f.get_tensor(source_weight_name))
+                    loaded_parameter_names.add(param_name)
                     loaded_count += 1
             unused_scale_keys = sorted(scale_keys - consumed_scale_keys)
             if unused_scale_keys:
@@ -577,4 +580,7 @@ def load_model(
     
     assert loaded_count > 0, f"No weights were loaded from {path}"
     _validate_all_quantized_weights_loaded(model)
+    strict_validator = getattr(model, "validate_loaded_weights", None)
+    if callable(strict_validator):
+        strict_validator(loaded_parameter_names)
     print(f"Successfully loaded {loaded_count} weights from {path}")

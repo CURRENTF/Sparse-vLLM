@@ -1136,6 +1136,37 @@ class Config:
                     "Qwen3MoE requires num_experts divisible by expert_parallel_size, "
                     f"got num_experts={num_experts}, EP={self.expert_parallel_size}."
                 )
+            top_k = int(getattr(self.hf_config, "num_experts_per_tok", 0) or 0)
+            if not 1 <= top_k <= num_experts:
+                raise ValueError(
+                    "Qwen3MoE num_experts_per_tok must be in [1, num_experts], "
+                    f"got top_k={top_k}, num_experts={num_experts}."
+                )
+            decoder_sparse_step = int(
+                getattr(self.hf_config, "decoder_sparse_step", 1) or 1
+            )
+            mlp_only_layers = tuple(
+                int(layer_idx)
+                for layer_idx in (getattr(self.hf_config, "mlp_only_layers", ()) or ())
+            )
+            if decoder_sparse_step != 1 or mlp_only_layers:
+                raise NotImplementedError(
+                    "Qwen3MoE v1 requires every decoder layer to be MoE, got "
+                    f"decoder_sparse_step={decoder_sparse_step}, "
+                    f"mlp_only_layers={list(mlp_only_layers)}."
+                )
+            shared_intermediate_size = int(
+                getattr(self.hf_config, "shared_expert_intermediate_size", 0) or 0
+            )
+            if shared_intermediate_size != 0:
+                raise NotImplementedError(
+                    "Qwen3MoE v1 does not support shared experts, got "
+                    f"shared_expert_intermediate_size={shared_intermediate_size}."
+                )
+            if self.quantization_config.enabled:
+                raise NotImplementedError(
+                    "Qwen3MoE v1 supports BF16/FP16 expert weights only; quantized MoE is unsupported."
+                )
         elif self.expert_parallel_size != 1 or self.data_parallel_size != 1:
             raise ValueError(
                 f"Dense model_type={model_type!r} requires EP=1 and DP=1, got "

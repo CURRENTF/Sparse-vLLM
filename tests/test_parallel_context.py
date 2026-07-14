@@ -79,6 +79,9 @@ def _hf_config(model_type: str = "qwen3_moe", *, num_experts: int = 8):
         num_attention_heads=4,
         num_key_value_heads=2,
         num_experts=num_experts,
+        num_experts_per_tok=2,
+        decoder_sparse_step=1,
+        mlp_only_layers=[],
     )
 
 

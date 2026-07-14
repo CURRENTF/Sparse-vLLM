@@ -37,6 +37,11 @@ except ImportError:
     Qwen3ForCausalLM = None
 
 try:
+    from sparsevllm.models.qwen3_moe import Qwen3MoeForCausalLM
+except ImportError:
+    Qwen3MoeForCausalLM = None
+
+try:
     from sparsevllm.models.qwen3_5 import Qwen35ForCausalLM
     _QWEN35_IMPORT_ERROR = None
 except ImportError as exc:
@@ -105,6 +110,7 @@ class ModelRunner:
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device(self.device)
+        setattr(hf_config, "mlp_chunk_size", config.mlp_chunk_size)
         
         # 加载对应的模型分片 (Shards)
         if hf_config.model_type == "qwen2":
@@ -116,6 +122,13 @@ class ModelRunner:
                     "Use a Transformers version with Qwen3 support for Qwen3 models."
                 )
             self.model = Qwen3ForCausalLM(hf_config)
+        elif hf_config.model_type == "qwen3_moe":
+            if Qwen3MoeForCausalLM is None:
+                raise ImportError(
+                    "Qwen3MoeForCausalLM is unavailable in this Transformers installation. "
+                    "Use a Transformers version with Qwen3MoE config support."
+                )
+            self.model = Qwen3MoeForCausalLM(hf_config)
         elif hf_config.model_type == "qwen3_5":
             if Qwen35ForCausalLM is None:
                 raise ImportError(

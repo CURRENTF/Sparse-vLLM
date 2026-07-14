@@ -203,7 +203,7 @@ class Qwen3MLP(nn.Module):
         return out
 
 
-class Qwen3DecoderLayer(nn.Module):
+class Qwen3DecoderLayerBase(nn.Module):
 
     def __init__(
         self,
@@ -221,12 +221,6 @@ class Qwen3DecoderLayer(nn.Module):
             rope_theta=_get_rope_theta(config),
             rope_scaling=_get_rope_scaling(config),
             proj_chunk_size=getattr(config, "mlp_chunk_size", 16384),
-        )
-        self.mlp = Qwen3MLP(
-            hidden_size=config.hidden_size,
-            intermediate_size=config.intermediate_size,
-            hidden_act=config.hidden_act,
-            mlp_chunk_size=getattr(config, "mlp_chunk_size", 16384),
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -246,16 +240,29 @@ class Qwen3DecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
-class Qwen3Model(nn.Module):
+
+class Qwen3DecoderLayer(Qwen3DecoderLayerBase):
+    def __init__(self, config: Qwen3Config) -> None:
+        super().__init__(config)
+        self.mlp = Qwen3MLP(
+            hidden_size=config.hidden_size,
+            intermediate_size=config.intermediate_size,
+            hidden_act=config.hidden_act,
+            mlp_chunk_size=getattr(config, "mlp_chunk_size", 16384),
+        )
+
+
+class Qwen3ModelBase(nn.Module):
 
     def __init__(
         self,
         config: Qwen3Config,
+        layer_cls: type[nn.Module],
     ) -> None:
         super().__init__()
         self.config = config
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
-        self.layers = nn.ModuleList([Qwen3DecoderLayer(config) for _ in range(config.num_hidden_layers)])
+        self.layers = nn.ModuleList([layer_cls(config) for _ in range(config.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         # 稀疏策略控制器，由 ModelRunner 动态注入
@@ -299,6 +306,11 @@ class Qwen3Model(nn.Module):
         if debug_layers is not None:
             self.debug_last_hidden_states[self.config.num_hidden_layers] = hidden_states[-1:].detach().clone()
         return hidden_states
+
+
+class Qwen3Model(Qwen3ModelBase):
+    def __init__(self, config: Qwen3Config) -> None:
+        super().__init__(config, Qwen3DecoderLayer)
 
 
 class Qwen3ForCausalLM(nn.Module):
