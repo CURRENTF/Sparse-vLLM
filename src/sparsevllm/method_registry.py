@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 PREFILL_POLICY_ALL_CHUNKED = "all_chunked"
 PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH = "long_bs1full_short_batch"
 PREFILL_POLICY_AUTO = "auto"
@@ -43,6 +45,35 @@ SUPPORTED_SPARSE_METHODS = set(CANONICAL_SPARSE_METHODS)
 SUPPORTED_SPARSE_METHOD_ALIASES = {str(k) for k in METHOD_ALIASES if k is not None and str(k)}
 
 PREFIX_CACHE_SUPPORTED_METHODS = {"", "omnikv", "quest"}
+
+
+@dataclass(frozen=True)
+class ModelRuntimeCompatibility:
+    parallel_mode: str
+    sparse_methods: frozenset[str]
+    prefix_cache_methods: frozenset[str]
+    requires_eager: bool = True
+
+
+QWEN3_MOE_EP_COMPATIBILITY = ModelRuntimeCompatibility(
+    parallel_mode="ep_replicated_kv",
+    sparse_methods=frozenset(
+        {
+            "",
+            "streamingllm",
+            "snapkv",
+            "pyramidkv",
+            "omnikv",
+            "quest",
+            "rkv",
+        }
+    ),
+    prefix_cache_methods=frozenset({"", "omnikv", "quest"}),
+)
+
+MODEL_RUNTIME_COMPATIBILITY = {
+    "qwen3_moe": QWEN3_MOE_EP_COMPATIBILITY,
+}
 
 # All shipped cache managers now expose a graph-stable decode preparation path.
 DECODE_CUDA_GRAPH_SUPPORTED_METHODS = set(CANONICAL_SPARSE_METHODS)
@@ -102,6 +133,65 @@ def is_decode_cuda_graph_supported(method: str | None) -> bool:
 
 def is_tp_decode_cuda_graph_supported(method: str | None) -> bool:
     return normalize_sparse_method(method) in TP_DECODE_CUDA_GRAPH_SUPPORTED_METHODS
+
+
+def validate_model_runtime_compatibility(
+    *,
+    model_type: str,
+    sparse_method: str | None,
+    tensor_parallel_size: int,
+    expert_parallel_size: int,
+    data_parallel_size: int,
+    enforce_eager: bool,
+    decode_cuda_graph: bool,
+    enable_prefix_caching: bool,
+) -> ModelRuntimeCompatibility | None:
+    model_type = str(model_type or "").strip().lower()
+    compatibility = MODEL_RUNTIME_COMPATIBILITY.get(model_type)
+    if compatibility is None:
+        return None
+
+    method = normalize_sparse_method(sparse_method)
+    if int(tensor_parallel_size) != 1 or int(data_parallel_size) != 1:
+        raise ValueError(
+            f"{model_type} {compatibility.parallel_mode} requires TP=1 and DP=1, got "
+            f"TP={tensor_parallel_size}, EP={expert_parallel_size}, DP={data_parallel_size}."
+        )
+    if int(expert_parallel_size) <= 0:
+        raise ValueError(
+            f"{model_type} requires a positive expert_parallel_size, got {expert_parallel_size}."
+        )
+    if compatibility.requires_eager and not bool(enforce_eager):
+        raise ValueError(f"{model_type} v1 requires enforce_eager=True.")
+    if bool(decode_cuda_graph):
+        raise ValueError(f"{model_type} v1 does not support decode_cuda_graph.")
+    if method == "skipkv":
+        raise NotImplementedError(
+            "Qwen3MoE + SkipKV requires a Qwen3MoE-matched steering asset and validation; "
+            "no compatible asset is currently registered."
+        )
+    if method == "deltakv":
+        raise NotImplementedError(
+            "Qwen3MoE + DeltaKV is not part of the validated v1 compatibility matrix."
+        )
+    if method not in compatibility.sparse_methods:
+        supported = ", ".join(
+            "'vanilla'" if item == "" else repr(item)
+            for item in sorted(compatibility.sparse_methods)
+        )
+        raise ValueError(
+            f"Unsupported {model_type} {compatibility.parallel_mode} sparse method "
+            f"{method!r}; validated methods: {supported}."
+        )
+    if bool(enable_prefix_caching) and method not in compatibility.prefix_cache_methods:
+        supported = ", ".join(
+            "'vanilla'" if item == "" else repr(item)
+            for item in sorted(compatibility.prefix_cache_methods)
+        )
+        raise ValueError(
+            f"{model_type} prefix caching is validated only for {supported}; got method={method!r}."
+        )
+    return compatibility
 
 
 def get_default_prefill_schedule_policy(method: str | None) -> str:

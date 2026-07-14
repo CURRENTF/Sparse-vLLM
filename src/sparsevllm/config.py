@@ -17,6 +17,7 @@ from sparsevllm.method_registry import (
     is_tp_decode_cuda_graph_supported,
     normalize_sparse_method,
     resolve_prefill_schedule_policy,
+    validate_model_runtime_compatibility,
 )
 from sparsevllm.engine.prefix_cache import resolve_prefix_cache_block_size
 from sparsevllm.utils.log import logger, log_once
@@ -1174,6 +1175,16 @@ class Config:
                 raise NotImplementedError(
                     "Qwen3MoE v1 supports BF16/FP16 expert weights only; quantized MoE is unsupported."
                 )
+            validate_model_runtime_compatibility(
+                model_type=model_type,
+                sparse_method=self.vllm_sparse_method,
+                tensor_parallel_size=self.tensor_parallel_size,
+                expert_parallel_size=self.expert_parallel_size,
+                data_parallel_size=self.data_parallel_size,
+                enforce_eager=self.enforce_eager,
+                decode_cuda_graph=self.decode_cuda_graph,
+                enable_prefix_caching=self.enable_prefix_caching,
+            )
         elif self.expert_parallel_size != 1 or self.data_parallel_size != 1:
             raise ValueError(
                 f"Dense model_type={model_type!r} requires EP=1 and DP=1, got "
