@@ -591,6 +591,8 @@ class Config:
     gpu_memory_utilization: float = 0.8
     device_memory_utilization: float | None = None
     tensor_parallel_size: int = 1
+    expert_parallel_size: int = 1
+    data_parallel_size: int = 1
     enforce_eager: bool = True
     hf_config: Union[Qwen3Config, AutoConfig] | None = None
     outer_hf_config: Any | None = None
@@ -747,6 +749,14 @@ class Config:
     throughput_log_interval_s: float = 10.0
     allow_missing_deltakv_path: bool = False
     allow_unknown_config_keys: bool = False
+
+    @property
+    def world_size(self) -> int:
+        return (
+            int(self.tensor_parallel_size)
+            * int(self.expert_parallel_size)
+            * int(self.data_parallel_size)
+        )
 
     def _normalize_platform_aliases(self):
         if self.device_memory_utilization is not None:
@@ -1004,8 +1014,19 @@ class Config:
         if int(self.max_decoding_seqs) <= 0:
             raise ValueError(f"max_decoding_seqs must be > 0, got {self.max_decoding_seqs}.")
         self.max_decoding_seqs = int(self.max_decoding_seqs)
+        self.tensor_parallel_size = int(self.tensor_parallel_size)
+        self.expert_parallel_size = int(self.expert_parallel_size)
+        self.data_parallel_size = int(self.data_parallel_size)
         if not 1 <= self.tensor_parallel_size <= 8:
             raise ValueError(f"tensor_parallel_size must be in [1, 8], got {self.tensor_parallel_size}.")
+        if self.expert_parallel_size <= 0:
+            raise ValueError(
+                f"expert_parallel_size must be positive, got {self.expert_parallel_size}."
+            )
+        if self.data_parallel_size <= 0:
+            raise ValueError(
+                f"data_parallel_size must be positive, got {self.data_parallel_size}."
+            )
         self._normalize_platform_aliases()
         if legacy_deltakv_graph_method:
             self.decode_cuda_graph = True
@@ -1093,6 +1114,33 @@ class Config:
             raise NotImplementedError(
                 f"Unsupported Sparse-vLLM model_type={self.hf_config.model_type!r}. "
                 "Supported model types: qwen2, qwen3, qwen3_5, llama."
+            )
+        model_type = str(getattr(self.hf_config, "model_type", "") or "")
+        if model_type == "qwen3_moe":
+            if self.tensor_parallel_size != 1 or self.data_parallel_size != 1:
+                raise ValueError(
+                    "Qwen3MoE v1 only supports TP=1 and DP=1, got "
+                    f"TP={self.tensor_parallel_size}, EP={self.expert_parallel_size}, "
+                    f"DP={self.data_parallel_size}."
+                )
+            num_experts = int(getattr(self.hf_config, "num_experts", 0) or 0)
+            if num_experts <= 0:
+                raise ValueError(f"Qwen3MoE requires a positive num_experts, got {num_experts}.")
+            if self.expert_parallel_size > num_experts:
+                raise ValueError(
+                    "expert_parallel_size must not exceed num_experts, "
+                    f"got EP={self.expert_parallel_size}, num_experts={num_experts}."
+                )
+            if num_experts % self.expert_parallel_size != 0:
+                raise ValueError(
+                    "Qwen3MoE requires num_experts divisible by expert_parallel_size, "
+                    f"got num_experts={num_experts}, EP={self.expert_parallel_size}."
+                )
+        elif self.expert_parallel_size != 1 or self.data_parallel_size != 1:
+            raise ValueError(
+                f"Dense model_type={model_type!r} requires EP=1 and DP=1, got "
+                f"TP={self.tensor_parallel_size}, EP={self.expert_parallel_size}, "
+                f"DP={self.data_parallel_size}."
             )
         if (
             self.vllm_sparse_method == "deltakv"
