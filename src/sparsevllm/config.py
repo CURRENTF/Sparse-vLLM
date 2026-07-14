@@ -593,6 +593,7 @@ class Config:
     tensor_parallel_size: int = 1
     expert_parallel_size: int = 1
     data_parallel_size: int = 1
+    moe_backend: str = "triton"
     enforce_eager: bool = True
     hf_config: Union[Qwen3Config, AutoConfig] | None = None
     outer_hf_config: Any | None = None
@@ -1017,6 +1018,7 @@ class Config:
         self.tensor_parallel_size = int(self.tensor_parallel_size)
         self.expert_parallel_size = int(self.expert_parallel_size)
         self.data_parallel_size = int(self.data_parallel_size)
+        self.moe_backend = str(self.moe_backend or "").strip().lower()
         if not 1 <= self.tensor_parallel_size <= 8:
             raise ValueError(f"tensor_parallel_size must be in [1, 8], got {self.tensor_parallel_size}.")
         if self.expert_parallel_size <= 0:
@@ -1026,6 +1028,11 @@ class Config:
         if self.data_parallel_size <= 0:
             raise ValueError(
                 f"data_parallel_size must be positive, got {self.data_parallel_size}."
+            )
+        if self.moe_backend not in {"pytorch", "triton"}:
+            raise ValueError(
+                "moe_backend must be 'pytorch' or 'triton', "
+                f"got {self.moe_backend!r}."
             )
         self._normalize_platform_aliases()
         if legacy_deltakv_graph_method:

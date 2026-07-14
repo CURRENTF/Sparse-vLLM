@@ -106,6 +106,31 @@ def test_pytorch_moe_block_matches_transformers_reference():
     assert torch.allclose(output, expected, atol=1e-6, rtol=1e-6)
 
 
+def test_moe_block_dispatches_only_the_selected_backend():
+    config = _config()
+    config.moe_backend = "triton"
+    context = _ep_context(0, 1)
+    with patch("sparsevllm.models.qwen3_moe.get_parallel_context", return_value=context):
+        block = Qwen3MoeSparseMoeBlock(config)
+    hidden_states = torch.randn(3, config.hidden_size)
+    expected = torch.randn_like(hidden_states)
+
+    with (
+        patch.object(block.gate, "forward", return_value=(
+            torch.empty(3, config.num_experts),
+            torch.empty(3, config.num_experts_per_tok),
+            torch.empty(3, config.num_experts_per_tok, dtype=torch.int64),
+        )),
+        patch.object(block.experts, "forward_pytorch") as pytorch_forward,
+        patch.object(block.experts, "forward_triton", return_value=expected) as triton_forward,
+    ):
+        actual = block(hidden_states)
+
+    assert torch.equal(actual, expected)
+    triton_forward.assert_called_once()
+    pytorch_forward.assert_not_called()
+
+
 def test_packed_expert_weight_mapping_and_oracle():
     torch.manual_seed(1)
     config = _config()

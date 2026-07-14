@@ -58,6 +58,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--atol", type=float, default=0.05)
     parser.add_argument("--rtol", type=float, default=0.05)
+    parser.add_argument(
+        "--moe-backend",
+        choices=("pytorch", "triton"),
+        default="triton",
+    )
     return parser.parse_args()
 
 
@@ -100,6 +105,7 @@ def main() -> None:
         raise ValueError(
             f"num_experts={hf_config.num_experts} is not divisible by EP={world_size}."
         )
+    hf_config.moe_backend = args.moe_backend
     layers = _parse_layers(args.layers, int(hf_config.num_hidden_layers))
 
     previous_dtype = torch.get_default_dtype()
@@ -204,6 +210,7 @@ def main() -> None:
         "model": str(model_path),
         "model_config": hf_config.to_dict(),
         "dtype": str(hf_config.torch_dtype),
+        "moe_backend": args.moe_backend,
         "seed": args.seed,
         "num_tokens": args.num_tokens,
         "layers": list(layers),

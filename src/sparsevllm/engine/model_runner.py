@@ -111,6 +111,7 @@ class ModelRunner:
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device(self.device)
         setattr(hf_config, "mlp_chunk_size", config.mlp_chunk_size)
+        setattr(hf_config, "moe_backend", config.moe_backend)
         
         # 加载对应的模型分片 (Shards)
         if hf_config.model_type == "qwen2":

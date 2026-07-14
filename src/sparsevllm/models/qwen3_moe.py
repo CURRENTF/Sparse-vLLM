@@ -150,6 +150,24 @@ class Qwen3MoePackedExperts(nn.Module):
             local_output.index_add_(0, token_ids, expert_output.to(local_output.dtype))
         return local_output
 
+    def forward_triton(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        from sparsevllm.triton_kernel.moe import fused_moe
+
+        return fused_moe(
+            hidden_states,
+            self.w13_weight,
+            self.w2_weight,
+            topk_ids,
+            topk_weights,
+            num_experts=self.num_experts,
+            local_expert_start=self.local_expert_start,
+        )
+
 
 class Qwen3MoeSparseMoeBlock(nn.Module):
     def __init__(self, config: Qwen3MoeConfig) -> None:
@@ -157,6 +175,12 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self.parallel_context = get_parallel_context()
         self.gate = Qwen3MoeRouter(config)
         self.experts = Qwen3MoePackedExperts(config)
+        self.moe_backend = str(getattr(config, "moe_backend", "pytorch")).strip().lower()
+        if self.moe_backend not in {"pytorch", "triton"}:
+            raise ValueError(
+                "Qwen3MoeSparseMoeBlock moe_backend must be 'pytorch' or 'triton', "
+                f"got {self.moe_backend!r}."
+            )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if hidden_states.dim() != 2:
@@ -165,8 +189,13 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             )
         with profiler.record("moe_router"):
             router_logits, topk_weights, topk_ids = self.gate(hidden_states)
-        with profiler.record("moe_experts_pytorch"):
-            local_output = self.experts.forward_pytorch(
+        expert_forward = (
+            self.experts.forward_pytorch
+            if self.moe_backend == "pytorch"
+            else self.experts.forward_triton
+        )
+        with profiler.record(f"moe_experts_{self.moe_backend}"):
+            local_output = expert_forward(
                 hidden_states,
                 topk_ids,
                 topk_weights,
