@@ -123,3 +123,50 @@ def test_engine_exit_timeout_still_terminates_workers():
     assert runner.shm.unlinked
     assert worker.terminated
     assert not worker.killed
+
+
+def test_engine_exit_joins_graceful_worker_before_terminate():
+    class Runner:
+        def call(self, method_name):
+            assert method_name == "exit"
+
+    class Worker:
+        pid = 12346
+
+        def __init__(self):
+            self.alive = True
+            self.terminated = False
+            self.closed = False
+
+        def join(self, timeout=None):
+            assert timeout == 0.05
+            self.alive = False
+
+        def is_alive(self):
+            return self.alive
+
+        def terminate(self):
+            self.terminated = True
+
+        def close(self):
+            self.closed = True
+
+    worker = Worker()
+    engine = object.__new__(LLMEngine)
+    engine._exited = False
+    engine.model_runner = Runner()
+    engine.ps = [worker]
+    engine.events = [object()]
+
+    with patch.dict(
+        os.environ,
+        {
+            "SPARSEVLLM_ENGINE_EXIT_TIMEOUT_S": "0.05",
+            "SPARSEVLLM_WORKER_JOIN_TIMEOUT_S": "0.05",
+        },
+    ):
+        engine.exit()
+
+    assert not worker.terminated
+    assert worker.closed
+    assert engine.events == []

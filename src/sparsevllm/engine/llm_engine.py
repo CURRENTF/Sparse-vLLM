@@ -434,9 +434,17 @@ class LLMEngine:
         if hasattr(self, "ps"):
             join_timeout_s = float(os.getenv("SPARSEVLLM_WORKER_JOIN_TIMEOUT_S", "5"))
             for p in self.ps:
-                if p.is_alive():
-                    p.terminate()
+                # The exit RPC has already asked each worker to leave its loop.
+                # Give it time to release distributed/Event resources before using
+                # terminate(), which can leave multiprocessing semaphores registered.
                 p.join(timeout=max(0.0, join_timeout_s))
+                if p.is_alive():
+                    logger.warning(
+                        "Worker process pid={} did not stop after the exit RPC; terminating.",
+                        p.pid,
+                    )
+                    p.terminate()
+                    p.join(timeout=max(0.0, join_timeout_s))
                 if p.is_alive():
                     logger.warning(
                         "Worker process pid={} did not stop after terminate; killing.",
@@ -444,6 +452,11 @@ class LLMEngine:
                     )
                     p.kill()
                     p.join(timeout=max(0.0, join_timeout_s))
+                close = getattr(p, "close", None)
+                if callable(close) and not p.is_alive():
+                    close()
+        if hasattr(self, "events"):
+            self.events.clear()
         return runner_exit_completed, runner_platform
 
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
