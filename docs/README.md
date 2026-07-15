@@ -28,7 +28,6 @@ repo-facing result claim needs evidence.
 - [Research code guidelines](governance/research-code-guidelines.md)
 - [HF vs Sparse-vLLM backend parameter guide](configuration/hf-vs-sparsevllm-parameter-guide.md)
 - [Runtime parameter semantics](configuration/runtime-parameter-semantics.md)
-- [Qwen3MoE expert parallelism](features/qwen3-moe-ep.md)
 - [Sparse-vLLM control map](design/control-map.md)
 
 ## Benchmark Runbooks

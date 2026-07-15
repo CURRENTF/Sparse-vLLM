@@ -68,7 +68,6 @@ Read the method overview and integration rules in
 | Runtime parameter semantics | [Runtime Parameter Semantics](docs/configuration/runtime-parameter-semantics.md) |
 | Benchmark commands | [Benchmarks](docs/benchmarking/README.md) |
 | DeltaKV inference and training | [DeltaKV](docs/features/deltakv.md) |
-| Qwen3MoE expert parallelism | [Qwen3MoE EP](docs/features/qwen3-moe-ep.md) |
 | Reproducibility checklist | [Reproducibility](docs/getting_started/reproducibility.md) |
 
 The full documentation index is maintained in [docs/README.md](docs/README.md).
