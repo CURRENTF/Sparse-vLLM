@@ -14,8 +14,6 @@ from sparsevllm.entrypoints.openai.protocol.chat import ChatCompletionRequest
 from sparsevllm.entrypoints.openai.render import _chat_request_prompt
 from sparsevllm.entrypoints.openai.render import resolve_chat_template_kwargs
 from sparsevllm.entrypoints.openai.render import resolve_chat_tools
-from sparsevllm.entrypoints.openai.responses.reasoning import ReasoningParseError
-from sparsevllm.entrypoints.openai.responses.tools import ToolCallParseError
 from sparsevllm.entrypoints.openai.sampling import _field_was_set
 from sparsevllm.entrypoints.openai.sampling import _normalize_stop
 from sparsevllm.entrypoints.openai.sampling import _sampling_params_from_request
@@ -25,9 +23,9 @@ from sparsevllm.entrypoints.openai.serving.base import _sse
 from sparsevllm.entrypoints.openai.serving.base import _tokens_per_second
 from sparsevllm.entrypoints.openai.serving.base import _wait_final
 from sparsevllm.entrypoints.openai.serving.base import _write_request_log
-from sparsevllm.entrypoints.openai.serving.chat_parsing import ChatStreamParser
-from sparsevllm.entrypoints.openai.serving.chat_parsing import ParsedChatOutput
-from sparsevllm.entrypoints.openai.serving.chat_parsing import parse_chat_output
+from sparsevllm.entrypoints.openai.serving.response_parsing import ParsedModelResponse
+from sparsevllm.entrypoints.openai.serving.response_parsing import ResponseParseError
+from sparsevllm.entrypoints.openai.serving.response_parsing import TransformersResponseParser
 from sparsevllm.utils.log import logger
 
 
@@ -38,12 +36,14 @@ async def serve_chat_completion(
     served_model_name: str,
     request_log_path: Path | None,
     reasoning_parser_name: str | None = None,
+    response_parser: TransformersResponseParser | None = None,
 ):
     _validate_chat_request(
         request,
         served_model_name,
         tokenizer,
         reasoning_parser_name=reasoning_parser_name,
+        response_parser=response_parser,
     )
     request_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
@@ -90,12 +90,10 @@ async def serve_chat_completion(
                 started,
                 tokenizer,
                 _stream_include_usage(request.stream_options),
+                prompt=prompt,
                 reasoning_parser_name=reasoning_parser_name,
                 parse_tools=bool(chat_tools),
-                buffer_initial_reasoning=_buffer_initial_chat_reasoning(
-                    request,
-                    reasoning_parser_name,
-                ),
+                response_parser=response_parser,
             ),
             media_type="text/event-stream",
         )
@@ -107,8 +105,10 @@ async def serve_chat_completion(
             request.model,
             handles,
             tokenizer,
+            prompt=prompt,
             reasoning_parser_name=reasoning_parser_name,
             parse_tools=bool(chat_tools),
+            response_parser=response_parser,
         )
     except asyncio.CancelledError:
         dispatcher.cancel(handle)
@@ -155,6 +155,7 @@ def _validate_chat_request(
     tokenizer: Any | None = None,
     *,
     reasoning_parser_name: str | None = None,
+    response_parser: TransformersResponseParser | None = None,
 ):
     if request.model != served_model_name:
         raise HTTPException(
@@ -185,7 +186,16 @@ def _validate_chat_request(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if chat_template_kwargs and tokenizer is not None and not getattr(tokenizer, "chat_template", None):
         raise HTTPException(status_code=400, detail="chat_template_kwargs requires a tokenizer chat_template.")
-    if request.logprobs and (reasoning_parser_name is not None or tools):
+    parse_response = reasoning_parser_name is not None or bool(tools)
+    if parse_response and response_parser is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "This tokenizer does not provide a compatible Transformers response template "
+                "for parsed reasoning or tool calls."
+            ),
+        )
+    if request.logprobs and parse_response:
         raise HTTPException(
             status_code=400,
             detail="Chat logprobs cannot be aligned with parsed reasoning or tool calls.",
@@ -205,22 +215,29 @@ async def _chat_completion_response(
     handles: list[RequestHandle],
     tokenizer: Any | None = None,
     *,
+    prompt: str = "",
     reasoning_parser_name: str | None = None,
     parse_tools: bool = False,
+    response_parser: TransformersResponseParser | None = None,
 ) -> dict[str, Any]:
     if len(handles) != 1:
         raise HTTPException(status_code=500, detail="chat completions expects exactly one request handle.")
     final = await _wait_final(handles[0].output_queue)
-    parser_input = final.get("raw_text", final["text"]) if reasoning_parser_name else final["text"]
-    try:
-        parsed = parse_chat_output(
-            parser_input,
-            final["finish_reason"],
-            reasoning_parser_name=reasoning_parser_name,
-            parse_tools=parse_tools,
-        )
-    except (ReasoningParseError, ToolCallParseError) as exc:
-        raise HTTPException(status_code=500, detail=f"Chat Completions parse failed: {exc}") from exc
+    should_parse = reasoning_parser_name is not None or parse_tools
+    if should_parse:
+        if response_parser is None:
+            raise HTTPException(status_code=500, detail="Chat response parser is not configured.")
+        try:
+            parsed = response_parser.parse(
+                final.get("raw_text", final["text"]),
+                prefix=prompt,
+                parse_tools=parse_tools,
+                finish_reason=final["finish_reason"],
+            )
+        except ResponseParseError as exc:
+            raise HTTPException(status_code=500, detail=f"Chat Completions parse failed: {exc}") from exc
+    else:
+        parsed = ParsedModelResponse(None, final["text"], [])
     message = _chat_message(parsed)
     return {
         "id": request_id,
@@ -254,7 +271,7 @@ async def _chat_completion_response(
     }
 
 
-def _chat_message(parsed: ParsedChatOutput) -> dict[str, Any]:
+def _chat_message(parsed: ParsedModelResponse) -> dict[str, Any]:
     message: dict[str, Any] = {
         "role": "assistant",
         "content": None if parsed.tool_calls else parsed.content,
@@ -267,23 +284,13 @@ def _chat_message(parsed: ParsedChatOutput) -> dict[str, Any]:
                 "id": f"call_{uuid.uuid4().hex}",
                 "type": "function",
                 "function": {
-                    "name": tool_call.name,
-                    "arguments": tool_call.arguments,
+                    "name": tool_call["function"]["name"],
+                    "arguments": tool_call["function"]["arguments"],
                 },
             }
             for tool_call in parsed.tool_calls
         ]
     return message
-
-
-def _buffer_initial_chat_reasoning(
-    request: ChatCompletionRequest,
-    reasoning_parser_name: str | None,
-) -> bool:
-    if reasoning_parser_name != "qwen3":
-        return False
-    kwargs = resolve_chat_template_kwargs(request) or {}
-    return kwargs.get("enable_thinking") is not False
 
 
 async def _chat_completion_stream(
@@ -296,18 +303,18 @@ async def _chat_completion_stream(
     tokenizer: Any | None = None,
     include_usage: bool = False,
     *,
+    prompt: str = "",
     reasoning_parser_name: str | None = None,
     parse_tools: bool = False,
-    buffer_initial_reasoning: bool = False,
+    response_parser: TransformersResponseParser | None = None,
 ):
     if len(handles) != 1:
         raise HTTPException(status_code=500, detail="chat completions expects exactly one request handle.")
     pending = {index: handle for index, handle in enumerate(handles)}
-    parser = ChatStreamParser(
-        reasoning_parser_name=reasoning_parser_name,
-        parse_tools=parse_tools,
-        buffer_initial_reasoning=buffer_initial_reasoning,
-    )
+    should_parse = reasoning_parser_name is not None or parse_tools
+    if should_parse and response_parser is None:
+        raise HTTPException(status_code=500, detail="Chat response parser is not configured.")
+    parser = response_parser.stream(prefix=prompt, parse_tools=parse_tools) if should_parse else None
     prompt_tokens = 0
     completion_tokens = 0
     raw_text_len = 0
@@ -339,13 +346,14 @@ async def _chat_completion_stream(
                     if tokenizer is not None
                     else None
                 )
-                if reasoning_parser_name:
+                if parser is not None:
                     text_delta = item.get("raw_text_delta", item.get("text", ""))
                     raw_text_len += len(text_delta)
+                    deltas = parser.feed(text_delta)
                 else:
                     text_delta = item.get("text", "")
                     visible_text_len += len(text_delta)
-                deltas = parser.feed(text_delta)
+                    deltas = [{"content": text_delta}] if text_delta else []
                 if not deltas and logprobs is not None:
                     deltas = [{"content": ""}]
                 for delta_index, delta in enumerate(deltas):
@@ -361,14 +369,14 @@ async def _chat_completion_stream(
             if item["type"] == "final":
                 prompt_tokens += item["prompt_tokens"]
                 completion_tokens = max(completion_tokens, item["completion_tokens"])
-                parser_text = (
-                    item.get("raw_text", item["text"])
-                    if reasoning_parser_name
-                    else item["text"]
-                )
-                consumed = raw_text_len if reasoning_parser_name else visible_text_len
-                deltas = parser.feed(parser_text[consumed:])
-                deltas.extend(parser.finish(item["finish_reason"]))
+                if parser is not None:
+                    parser_text = item.get("raw_text", item["text"])
+                    deltas = parser.feed(parser_text[raw_text_len:])
+                    deltas.extend(parser.finish(item["finish_reason"]))
+                else:
+                    parser_text = item["text"]
+                    suffix = parser_text[visible_text_len:]
+                    deltas = [{"content": suffix}] if suffix else []
                 for delta in deltas:
                     yield _chat_stream_chunk(
                         request_id,
@@ -378,7 +386,7 @@ async def _chat_completion_stream(
                         delta,
                     )
                 finish_reason = item["finish_reason"]
-                if parser.tools_called and finish_reason == "stop":
+                if parser is not None and parser.tools_called and finish_reason == "stop":
                     finish_reason = "tool_calls"
                 yield _chat_stream_chunk(
                     request_id,
@@ -430,7 +438,7 @@ async def _chat_completion_stream(
             time.perf_counter() - started if started is not None else 0.0,
         )
         raise
-    except (ReasoningParseError, ToolCallParseError) as exc:
+    except ResponseParseError as exc:
         for handle in pending.values():
             dispatcher.cancel(handle)
         message = f"Chat Completions parse failed: {exc}"

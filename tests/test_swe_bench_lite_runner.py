@@ -10,6 +10,7 @@ from benchmark.swe_bench_lite.run import (
     RunnerError,
     SweBenchLiteRunner,
     _canonical_hash,
+    _instance_image_names,
     _reject_secrets,
     _require_local_images,
     assert_runtime_provenance_matches,
@@ -49,6 +50,12 @@ def _write_trajectory(batch_dir: Path, instance_id: str, exit_status: str) -> No
 
 
 class SweBenchLiteRunnerTest(unittest.TestCase):
+    def test_instance_image_names_use_official_swebench_key_format(self):
+        self.assertEqual(
+            _instance_image_names([{"instance_id": "astropy__astropy-12907"}]),
+            ["swebench/sweb.eval.x86_64.astropy_1776_astropy-12907:latest"],
+        )
+
     def test_extra_mini_config_is_snapshotted_and_rejects_api_keys(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -92,9 +99,23 @@ class SweBenchLiteRunnerTest(unittest.TestCase):
 
         self.assertIn('api_base: "http://127.0.0.1:18000/v1"', config)
         self.assertIn('cost_tracking: "ignore_errors"', config)
+        self.assertIn(
+            "model_class: benchmark.swe_bench_lite.model.SparseVLLMLitellmModel",
+            config,
+        )
         self.assertIn("step_limit: 80", config)
         self.assertNotIn("api_key", config)
         self.assertNotIn("thinking", config)
+
+    def test_model_environment_makes_benchmark_adapter_importable(self):
+        runner = object.__new__(SweBenchLiteRunner)
+        runner.repo_root = Path("/adapter").resolve()
+        runner.args = Namespace(api_proxy_from_environment=False, offline_dataset=False)
+
+        with mock.patch.dict("os.environ", {"PYTHONPATH": "/existing"}, clear=True):
+            env = runner._model_env()
+
+        self.assertEqual(env["PYTHONPATH"], f"{runner.repo_root}:/existing")
 
     def test_validate_predictions_rejects_missing_and_extra_ids(self):
         with self.assertRaisesRegex(RunnerError, "missing=.*b.*extra=.*c"):

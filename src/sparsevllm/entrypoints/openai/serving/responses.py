@@ -12,23 +12,17 @@ from sparsevllm.entrypoints.openai.dispatcher import AsyncEngineDispatcher
 from sparsevllm.entrypoints.openai.dispatcher import RequestHandle
 from sparsevllm.entrypoints.openai.protocol.responses import ResponseRequest
 from sparsevllm.entrypoints.openai.render import _response_prompt
+from sparsevllm.entrypoints.openai.render import normalize_tools
 from sparsevllm.entrypoints.openai.render import resolve_response_chat_template_kwargs
 from sparsevllm.entrypoints.openai.responses import events as response_events
-from sparsevllm.entrypoints.openai.responses.reasoning import ParsedReasoning
-from sparsevllm.entrypoints.openai.responses.reasoning import ReasoningParseError
-from sparsevllm.entrypoints.openai.responses.reasoning import get_reasoning_parser
-from sparsevllm.entrypoints.openai.responses.reasoning import get_reasoning_stream_parser
-from sparsevllm.entrypoints.openai.responses.reasoning import ReasoningStreamEvent
-from sparsevllm.entrypoints.openai.responses.tools import ToolCallParseError
-from sparsevllm.entrypoints.openai.responses.tools import ToolCallStreamEvent
-from sparsevllm.entrypoints.openai.responses.tools import ToolCallStreamParser
-from sparsevllm.entrypoints.openai.responses.tools import normalize_tools
-from sparsevllm.entrypoints.openai.responses.tools import parse_tool_calls
 from sparsevllm.entrypoints.openai.sampling import _sampling_params_from_response_request
 from sparsevllm.entrypoints.openai.serving.base import _model_dump_json
 from sparsevllm.entrypoints.openai.serving.base import _tokens_per_second
 from sparsevllm.entrypoints.openai.serving.base import _wait_final
 from sparsevllm.entrypoints.openai.serving.base import _write_request_log
+from sparsevllm.entrypoints.openai.serving.response_parsing import ParsedModelResponse
+from sparsevllm.entrypoints.openai.serving.response_parsing import ResponseParseError
+from sparsevllm.entrypoints.openai.serving.response_parsing import TransformersResponseParser
 from sparsevllm.utils.log import logger
 
 
@@ -39,8 +33,14 @@ async def serve_response(
     served_model_name: str,
     request_log_path: Path | None,
     reasoning_parser_name: str | None,
+    response_parser: TransformersResponseParser | None = None,
 ):
-    _validate_response_request(request, served_model_name)
+    _validate_response_request(
+        request,
+        served_model_name,
+        reasoning_parser_name=reasoning_parser_name,
+        response_parser=response_parser,
+    )
 
     request_id = f"resp_{uuid.uuid4().hex}"
     created_at = int(time.time())
@@ -81,7 +81,9 @@ async def serve_response(
                 started,
                 request_log_path,
                 request,
+                prompt=prompt,
                 reasoning_parser_name=reasoning_parser_name,
+                response_parser=response_parser,
             ),
             media_type="text/event-stream",
         )
@@ -92,7 +94,10 @@ async def serve_response(
             created_at,
             request.model,
             handle,
+            prompt=prompt,
             reasoning_parser_name=reasoning_parser_name,
+            parse_tools=bool(request.tools),
+            response_parser=response_parser,
         )
     except asyncio.CancelledError:
         dispatcher.cancel(handle)
@@ -137,7 +142,13 @@ async def serve_response(
     return JSONResponse(response)
 
 
-def _validate_response_request(request: ResponseRequest, served_model_name: str):
+def _validate_response_request(
+    request: ResponseRequest,
+    served_model_name: str,
+    *,
+    reasoning_parser_name: str | None = None,
+    response_parser: TransformersResponseParser | None = None,
+):
     if request.model != served_model_name:
         raise HTTPException(
             status_code=400,
@@ -156,6 +167,14 @@ def _validate_response_request(request: ResponseRequest, served_model_name: str)
         raise HTTPException(status_code=400, detail="Responses parallel_tool_calls=false is not implemented yet.")
     if request.reasoning is not None and request.reasoning.summary is not None:
         raise HTTPException(status_code=400, detail="Responses reasoning.summary is not implemented yet.")
+    if (reasoning_parser_name is not None or request.tools) and response_parser is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "This tokenizer does not provide a compatible Transformers response template "
+                "for parsed reasoning or tool calls."
+            ),
+        )
 
 
 async def _response_response(
@@ -164,20 +183,29 @@ async def _response_response(
     model: str,
     handle: RequestHandle,
     *,
+    prompt: str = "",
     reasoning_parser_name: str | None,
+    parse_tools: bool = False,
+    response_parser: TransformersResponseParser | None = None,
 ) -> dict[str, Any]:
     final = await _wait_final(handle.output_queue)
-    parser_input = final.get("raw_text", final["text"]) if reasoning_parser_name else final["text"]
-    try:
-        output, incomplete_reasoning = _response_output_items(
-            parser_input,
-            final["finish_reason"],
-            reasoning_parser_name=reasoning_parser_name,
-        )
-    except (ReasoningParseError, ToolCallParseError) as exc:
-        raise HTTPException(status_code=500, detail=f"Responses parse failed: {exc}") from exc
-
-    incomplete = final["finish_reason"] == "length" or incomplete_reasoning
+    should_parse = reasoning_parser_name is not None or parse_tools
+    if should_parse:
+        if response_parser is None:
+            raise HTTPException(status_code=500, detail="Responses parser is not configured.")
+        try:
+            parsed = response_parser.parse(
+                final.get("raw_text", final["text"]),
+                prefix=prompt,
+                parse_tools=parse_tools,
+                finish_reason=final["finish_reason"],
+            )
+        except ResponseParseError as exc:
+            raise HTTPException(status_code=500, detail=f"Responses parse failed: {exc}") from exc
+    else:
+        parsed = ParsedModelResponse(None, final["text"], [])
+    output = _response_output_items(parsed)
+    incomplete = final["finish_reason"] == "length"
     return response_events.response_object(
         request_id,
         created_at,
@@ -199,14 +227,19 @@ async def _response_stream(
     request_log_path: Path | None,
     request: ResponseRequest,
     *,
+    prompt: str = "",
     reasoning_parser_name: str | None,
+    response_parser: TransformersResponseParser | None = None,
 ):
     state = _ResponseStreamState(request_id, created_at, model)
-    reasoning_parser = get_reasoning_stream_parser(
-        reasoning_parser_name,
-        buffer_initial_content=_buffer_initial_response_reasoning(request, reasoning_parser_name),
+    should_parse = reasoning_parser_name is not None or bool(request.tools)
+    if should_parse and response_parser is None:
+        raise HTTPException(status_code=500, detail="Responses parser is not configured.")
+    parser = (
+        response_parser.stream(prefix=prompt, parse_tools=bool(request.tools))
+        if should_parse
+        else None
     )
-    tool_parser = ToolCallStreamParser()
     raw_text_len = 0
     visible_text_len = 0
     completion_tokens = 0
@@ -231,44 +264,33 @@ async def _response_stream(
 
             if item["type"] == "token":
                 completion_tokens += len(item.get("token_ids", []))
-                if reasoning_parser_name:
+                if parser is not None:
                     delta = item.get("raw_text_delta", item.get("text", ""))
                     raw_text_len += len(delta)
+                    parsed_deltas = parser.feed(delta)
                 else:
                     delta = item.get("text", "")
                     visible_text_len += len(delta)
-                for frame in _response_stream_delta(state, reasoning_parser, tool_parser, delta):
+                    parsed_deltas = [{"content": delta}] if delta else []
+                for frame in _response_stream_deltas(state, parsed_deltas):
                     yield frame
                 continue
 
             if item["type"] == "final":
-                parser_text = item.get("raw_text", item["text"]) if reasoning_parser_name else item["text"]
-                consumed = raw_text_len if reasoning_parser_name else visible_text_len
-                for frame in _response_stream_delta(
-                    state,
-                    reasoning_parser,
-                    tool_parser,
-                    parser_text[consumed:],
-                ):
-                    yield frame
-                for frame in _response_stream_reasoning_events(
-                    state,
-                    tool_parser,
-                    reasoning_parser.finish(item["finish_reason"]),
-                ):
-                    yield frame
-                for frame in _response_stream_tool_events(
-                    state,
-                    tool_parser.finish(item["finish_reason"]),
-                ):
+                if parser is not None:
+                    parser_text = item.get("raw_text", item["text"])
+                    parsed_deltas = parser.feed(parser_text[raw_text_len:])
+                    parsed_deltas.extend(parser.finish(item["finish_reason"]))
+                else:
+                    suffix = item["text"][visible_text_len:]
+                    parsed_deltas = [{"content": suffix}] if suffix else []
+                for frame in _response_stream_deltas(state, parsed_deltas):
                     yield frame
                 for frame in state.finish_open_items():
                     yield frame
 
                 usage = _usage_from_final(item)
-                incomplete = item["finish_reason"] == "length" or bool(
-                    getattr(reasoning_parser, "incomplete_reasoning", False)
-                )
+                incomplete = item["finish_reason"] == "length"
                 response = state.response(
                     "incomplete" if incomplete else "completed",
                     usage=usage,
@@ -337,53 +359,23 @@ async def _response_stream(
         )
 
 
-def _response_stream_delta(
+def _response_stream_deltas(
     state: "_ResponseStreamState",
-    reasoning_parser: Any,
-    tool_parser: ToolCallStreamParser,
-    delta: str,
-) -> list[str]:
-    return _response_stream_reasoning_events(
-        state,
-        tool_parser,
-        reasoning_parser.feed(delta),
-    )
-
-
-def _response_stream_reasoning_events(
-    state: "_ResponseStreamState",
-    tool_parser: ToolCallStreamParser,
-    reasoning_events: list[ReasoningStreamEvent],
+    deltas: list[dict[str, Any]],
 ) -> list[str]:
     frames: list[str] = []
-    for event in reasoning_events:
-        if event.kind == "reasoning_delta":
-            frames.extend(state.reasoning_delta(event.text))
-        elif event.kind == "reasoning_done":
-            frames.extend(state.reasoning_done())
-        elif event.kind == "answer_delta":
-            frames.extend(_response_stream_tool_events(state, tool_parser.feed(event.text)))
-        else:
-            raise AssertionError(f"unknown reasoning stream event {event.kind!r}")
-    return frames
-
-
-def _response_stream_tool_events(
-    state: "_ResponseStreamState",
-    tool_events: list[ToolCallStreamEvent],
-) -> list[str]:
-    frames: list[str] = []
-    for event in tool_events:
-        if event.kind == "answer_delta":
-            frames.extend(state.message_delta(event.text))
-        elif event.kind == "tool_call_started":
-            frames.extend(state.function_call_started(event.name or ""))
-        elif event.kind == "tool_call_arguments_delta":
-            frames.extend(state.function_call_arguments_delta(event.arguments_delta))
-        elif event.kind == "tool_call_done":
+    for delta in deltas:
+        if reasoning := delta.get("reasoning_content"):
+            frames.extend(state.reasoning_delta(reasoning))
+        if content := delta.get("content"):
+            frames.extend(state.finish_reasoning())
+            frames.extend(state.message_delta(content))
+        for tool_call in delta.get("tool_calls", []):
+            frames.extend(state.finish_reasoning())
+            function = tool_call["function"]
+            frames.extend(state.function_call_started(function["name"]))
+            frames.extend(state.function_call_arguments_delta(function["arguments"]))
             frames.extend(state.function_call_done())
-        else:
-            raise AssertionError(f"unknown tool call stream event {event.kind!r}")
     return frames
 
 
@@ -432,51 +424,34 @@ def _usage_from_final(final: dict[str, Any]) -> dict[str, int]:
     }
 
 
-def _buffer_initial_response_reasoning(
-    request: ResponseRequest,
-    reasoning_parser_name: str | None,
-) -> bool:
-    if reasoning_parser_name != "qwen3":
-        return False
-    kwargs = resolve_response_chat_template_kwargs(request) or {}
-    return kwargs.get("enable_thinking") is not False
-
-
-def _response_output_items(
-    text: str,
-    finish_reason: str | None,
-    *,
-    reasoning_parser_name: str | None,
-) -> tuple[list[dict[str, Any]], bool]:
-    parser = get_reasoning_parser(reasoning_parser_name)
-    parsed = parser(text, finish_reason) if parser is not None else ParsedReasoning(None, text)
+def _response_output_items(parsed: ParsedModelResponse) -> list[dict[str, Any]]:
     output: list[dict[str, Any]] = []
-    if parsed.reasoning_text is not None:
+    if parsed.reasoning_content is not None:
         output.append(
             {
                 "id": f"rs_{uuid.uuid4().hex}",
                 "type": "reasoning",
-                "text": parsed.reasoning_text,
+                "text": parsed.reasoning_content,
                 "summary": [],
             }
         )
 
-    tool_calls = parse_tool_calls(parsed.output_text)
-    if tool_calls:
-        for tool_call in tool_calls:
+    if parsed.tool_calls:
+        for tool_call in parsed.tool_calls:
+            function = tool_call["function"]
             output.append(
                 {
                     "id": f"fc_{uuid.uuid4().hex}",
                     "type": "function_call",
                     "call_id": f"call_{uuid.uuid4().hex}",
-                    "name": tool_call.name,
-                    "arguments": tool_call.arguments,
+                    "name": function["name"],
+                    "arguments": function["arguments"],
                     "status": "completed",
                 }
             )
-    elif parsed.output_text or parsed.reasoning_text is None:
-        output.append(_message_output_item(parsed.output_text))
-    return output, parsed.incomplete_reasoning
+    elif parsed.content or parsed.reasoning_content is None:
+        output.append(_message_output_item(parsed.content))
+    return output
 
 
 def _message_output_item(text: str) -> dict[str, Any]:
@@ -573,11 +548,16 @@ class _ResponseStreamState:
         self._reasoning_done = True
         return frames
 
+    def finish_reasoning(self) -> list[str]:
+        if self._reasoning_item is None or self._reasoning_done:
+            return []
+        return self.reasoning_done()
+
     def function_call_started(self, name: str) -> list[str]:
         if not name:
-            raise ToolCallParseError("tool call stream event missing function name.")
+            raise ResponseParseError("tool call stream event missing function name.")
         if self._function_item is not None:
-            raise ToolCallParseError("new tool call started before previous tool call finished.")
+            raise ResponseParseError("new tool call started before previous tool call finished.")
         self._function_index = len(self.output)
         self._function_item = {
             "id": f"fc_{uuid.uuid4().hex}",
@@ -593,7 +573,7 @@ class _ResponseStreamState:
 
     def function_call_arguments_delta(self, arguments_delta: str) -> list[str]:
         if self._function_item is None or self._function_index is None:
-            raise ToolCallParseError("tool call arguments arrived before tool call item.")
+            raise ResponseParseError("tool call arguments arrived before tool call item.")
         if not arguments_delta:
             return []
         self._function_arguments += arguments_delta
@@ -608,7 +588,7 @@ class _ResponseStreamState:
 
     def function_call_done(self) -> list[str]:
         if self._function_item is None or self._function_index is None:
-            raise ToolCallParseError("tool call done arrived before tool call item.")
+            raise ResponseParseError("tool call done arrived before tool call item.")
         self._function_item["status"] = "completed"
         frames = [
             response_events.function_call_arguments_done(

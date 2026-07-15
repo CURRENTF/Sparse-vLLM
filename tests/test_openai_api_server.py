@@ -26,6 +26,35 @@ class _FastTokenizerAdapter:
         return self._tokenizer.decode(token_ids, skip_special_tokens=skip_special_tokens)
 
 
+class _TransformersResponseTokenizer:
+    response_template = None
+
+    def __init__(self, *, xml_tools=False):
+        self.chat_template = "<think><tool_call>"
+        if xml_tools:
+            self.chat_template += "<function=name><parameter=key>"
+
+    def parse_response(self, response, schema, *, prefix=None):
+        from transformers.utils.chat_parsing import parse_response
+
+        return parse_response(response, schema, prefix=prefix)
+
+    def get_response_parser(self, response_template=None, *, prefix=None):
+        from transformers.utils.chat_parsing import ResponseParser
+
+        return ResponseParser(response_template, prefix=prefix)
+
+
+def _transformers_response_parser(*, xml_tools=False):
+    from sparsevllm.entrypoints.openai.serving.response_parsing import TransformersResponseParser
+
+    parser = TransformersResponseParser.from_tokenizer(
+        _TransformersResponseTokenizer(xml_tools=xml_tools)
+    )
+    assert parser is not None
+    return parser
+
+
 def _byte_level_tokenizer(*, special_tokens=()):
     from tokenizers import ByteLevelBPETokenizer
 
@@ -744,8 +773,32 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(_chat_request_prompt(tokenizer, request), "rendered")
         self.assertEqual(tokenizer.chat[1]["reasoning_content"], "need a lookup")
         self.assertEqual(tokenizer.chat[1]["tool_calls"][0]["id"], "call_1")
+        self.assertEqual(tokenizer.chat[1]["tool_calls"][0]["function"]["arguments"], {"city": "Paris"})
         self.assertEqual(tokenizer.chat[2]["tool_call_id"], "call_1")
         self.assertEqual(tokenizer.tools[0]["name"], "get_weather")
+
+    def test_chat_prompt_rejects_invalid_tool_history_arguments(self):
+        from sparsevllm.entrypoints.openai.api_server import ChatMessage, _chat_prompt
+
+        class Tokenizer:
+            chat_template = "template"
+
+            def apply_chat_template(self, _chat, **_kwargs):
+                raise AssertionError("invalid tool history must fail before rendering")
+
+        message = ChatMessage(
+            role="assistant",
+            tool_calls=[
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": "not-json"},
+                }
+            ],
+        )
+
+        with self.assertRaisesRegex(ValueError, "not valid JSON"):
+            _chat_prompt(Tokenizer(), [message])
 
     def test_chat_tool_controls_and_template_support_fail_fast(self):
         from fastapi import HTTPException
@@ -1978,8 +2031,14 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
                 RequestHandle(output_queue=queue, cancelled=threading.Event()),
                 time.perf_counter(),
                 None,
-                ResponseRequest(model="model", input="hello", stream=True),
+                ResponseRequest(
+                    model="model",
+                    input="hello",
+                    stream=True,
+                    tools=[{"type": "function", "name": "查询", "parameters": {}}],
+                ),
                 reasoning_parser_name="qwen3",
+                response_parser=_transformers_response_parser(),
             )
         ]
         events = _response_sse_events(chunks)
@@ -2164,7 +2223,9 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
             123,
             "model",
             [RequestHandle(output_queue=queue, cancelled=threading.Event())],
+            prompt="<|im_start|>assistant\n<think>\n",
             reasoning_parser_name="qwen3",
+            response_parser=_transformers_response_parser(),
         )
 
         choice = response["choices"][0]
@@ -2202,6 +2263,7 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
             [RequestHandle(output_queue=queue, cancelled=threading.Event())],
             reasoning_parser_name="qwen3",
             parse_tools=True,
+            response_parser=_transformers_response_parser(),
         )
 
         choice = response["choices"][0]
@@ -2241,10 +2303,54 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
             "model",
             [RequestHandle(output_queue=queue, cancelled=threading.Event())],
             parse_tools=True,
+            response_parser=_transformers_response_parser(),
         )
 
         calls = response["choices"][0]["message"]["tool_calls"]
         self.assertEqual([call["function"]["name"] for call in calls], ["first", "second"])
+
+    async def test_chat_completion_parses_qwen_xml_tool_call_with_transformers(self):
+        from sparsevllm.entrypoints.openai.api_server import RequestHandle, _chat_completion_response
+
+        raw_text = (
+            "reason</think>\n\nTHOUGHT: inspect\n\n"
+            "<tool_call>\n<function=bash>\n"
+            "<parameter=command>\nfind . -maxdepth 2\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        queue = asyncio.Queue()
+        await queue.put(
+            {
+                "type": "final",
+                "index": 0,
+                "text": raw_text,
+                "raw_text": raw_text,
+                "finish_reason": "stop",
+                "prompt_tokens": 4,
+                "completion_tokens": 5,
+                "token_ids": [1, 2, 3, 4, 5],
+                "token_logprobs": [None] * 5,
+                "top_logprobs": [None] * 5,
+            }
+        )
+
+        response = await _chat_completion_response(
+            "chatcmpl-test",
+            123,
+            "model",
+            [RequestHandle(output_queue=queue, cancelled=threading.Event())],
+            prompt="<|im_start|>assistant\n<think>\n",
+            parse_tools=True,
+            response_parser=_transformers_response_parser(xml_tools=True),
+        )
+
+        choice = response["choices"][0]
+        self.assertEqual(choice["message"]["reasoning_content"], "reason")
+        self.assertEqual(choice["message"]["tool_calls"][0]["function"], {
+            "name": "bash",
+            "arguments": '{"command":"find . -maxdepth 2"}',
+        })
+        self.assertEqual(choice["finish_reason"], "tool_calls")
 
     async def test_chat_completion_reasoning_length_remains_explicit(self):
         from sparsevllm.entrypoints.openai.api_server import RequestHandle, _chat_completion_response
@@ -2271,6 +2377,7 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
             "model",
             [RequestHandle(output_queue=queue, cancelled=threading.Event())],
             reasoning_parser_name="qwen3",
+            response_parser=_transformers_response_parser(),
         )
 
         choice = response["choices"][0]
@@ -2306,11 +2413,12 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
                 [RequestHandle(output_queue=queue, cancelled=threading.Event())],
                 reasoning_parser_name=reasoning_parser_name,
                 parse_tools=parse_tools,
+                response_parser=_transformers_response_parser(),
             )
 
         with self.assertRaisesRegex(HTTPException, "did not close"):
             await parse("<think>partial", reasoning_parser_name="qwen3")
-        with self.assertRaisesRegex(HTTPException, "JSON parse failed"):
+        with self.assertRaisesRegex(HTTPException, "could not parse region as JSON"):
             await parse('<tool_call>{"name":</tool_call>', parse_tools=True)
 
     def test_chat_logprobs_reject_parsed_outputs(self):
@@ -2328,6 +2436,7 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
                 ChatCompletionRequest(**base),
                 "m",
                 reasoning_parser_name="qwen3",
+                response_parser=_transformers_response_parser(),
             )
         with self.assertRaisesRegex(HTTPException, "cannot be aligned"):
             _validate_chat_request(
@@ -2341,6 +2450,7 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
                     ],
                 ),
                 "m",
+                response_parser=_transformers_response_parser(),
             )
 
     async def test_chat_stream_starts_with_assistant_role(self):
@@ -2433,9 +2543,10 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
                 "model",
                 [RequestHandle(output_queue=queue, cancelled=threading.Event())],
                 include_usage=True,
+                prompt="<|im_start|>assistant\n<think>\n",
                 reasoning_parser_name="qwen3",
                 parse_tools=True,
-                buffer_initial_reasoning=True,
+                response_parser=_transformers_response_parser(),
             )
         ]
         payloads = [
@@ -2452,8 +2563,10 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         tool_deltas = [delta["tool_calls"][0] for delta in deltas if delta.get("tool_calls")]
         self.assertEqual(tool_deltas[0]["index"], 0)
         self.assertTrue(tool_deltas[0]["id"].startswith("call_"))
-        self.assertEqual(tool_deltas[0]["function"], {"name": "get_weather", "arguments": ""})
-        self.assertEqual(tool_deltas[1]["function"]["arguments"], '{"city":"Paris"}')
+        self.assertEqual(
+            tool_deltas[0]["function"],
+            {"name": "get_weather", "arguments": '{"city":"Paris"}'},
+        )
         final_choice = [
             choice
             for payload in payloads
@@ -2517,13 +2630,7 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(content, text)
 
     def test_chat_stream_parser_indexes_multiple_tool_calls(self):
-        from sparsevllm.entrypoints.openai.serving.chat_parsing import ChatStreamParser
-
-        parser = ChatStreamParser(
-            reasoning_parser_name=None,
-            parse_tools=True,
-            buffer_initial_reasoning=False,
-        )
+        parser = _transformers_response_parser().stream(prefix="", parse_tools=True)
         deltas = parser.feed(
             '<tool_call>{"name":"first","arguments":{"x":1}}</tool_call>'
         )
@@ -2574,7 +2681,7 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
                 "model",
                 [RequestHandle(output_queue=queue, cancelled=threading.Event())],
                 reasoning_parser_name="qwen3",
-                buffer_initial_reasoning=True,
+                response_parser=_transformers_response_parser(),
             )
         ]
         payloads = [
@@ -2635,11 +2742,12 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
                 "model",
                 [handle],
                 parse_tools=True,
+                response_parser=_transformers_response_parser(),
             )
         ]
         events = _response_sse_events(chunks)
         errors = [payload for event, payload in events if event != "[DONE]" and payload.get("object") == "error"]
-        self.assertIn("JSON parse failed", errors[0]["message"])
+        self.assertIn("could not parse region as JSON", errors[0]["message"])
         self.assertEqual(events[-1], ("[DONE]", None))
         self.assertTrue(cancelled.is_set())
 
@@ -2922,6 +3030,7 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
             "model",
             RequestHandle(output_queue=queue, cancelled=threading.Event()),
             reasoning_parser_name="qwen3",
+            response_parser=_transformers_response_parser(),
         )
 
         self.assertEqual(response["output"][0]["type"], "reasoning")
@@ -3043,6 +3152,7 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
                 None,
                 ResponseRequest(model="model", input="hello", stream=True),
                 reasoning_parser_name="qwen3",
+                response_parser=_transformers_response_parser(),
             )
         ]
 
@@ -3167,6 +3277,7 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
                     None,
                     ResponseRequest(model="model", input="hello", stream=True, reasoning={"effort": "none"}),
                     reasoning_parser_name="qwen3",
+                    response_parser=_transformers_response_parser(),
                 )
             ]
         )
@@ -3230,6 +3341,7 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
                     None,
                     ResponseRequest(model="model", input="hello", stream=True),
                     reasoning_parser_name="qwen3",
+                    response_parser=_transformers_response_parser(),
                 )
             ]
         )
@@ -3274,6 +3386,7 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
                     None,
                     ResponseRequest(model="model", input="hello", stream=True),
                     reasoning_parser_name="qwen3",
+                    response_parser=_transformers_response_parser(),
                 )
             ]
         )
@@ -3341,13 +3454,14 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
     def test_qwen3_reasoning_parser_builds_reasoning_item(self):
         from sparsevllm.entrypoints.openai.api_server import _response_output_items
 
-        output, incomplete = _response_output_items(
+        parsed = _transformers_response_parser().parse(
             "<think>reason</think>answer",
-            "stop",
-            reasoning_parser_name="qwen3",
+            prefix="",
+            parse_tools=False,
+            finish_reason="stop",
         )
+        output = _response_output_items(parsed)
 
-        self.assertFalse(incomplete)
         self.assertEqual(output[0]["type"], "reasoning")
         self.assertEqual(output[0]["text"], "reason")
         self.assertEqual(output[1]["content"][0]["text"], "answer")
@@ -3355,13 +3469,14 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
     def test_qwen3_reasoning_parser_handles_template_opened_think(self):
         from sparsevllm.entrypoints.openai.api_server import _response_output_items
 
-        output, incomplete = _response_output_items(
+        parsed = _transformers_response_parser().parse(
             "reason</think>\n\nanswer<|im_end|>",
-            "stop",
-            reasoning_parser_name="qwen3",
+            prefix="<|im_start|>assistant\n<think>\n",
+            parse_tools=False,
+            finish_reason="stop",
         )
+        output = _response_output_items(parsed)
 
-        self.assertFalse(incomplete)
         self.assertEqual(output[0]["type"], "reasoning")
         self.assertEqual(output[0]["text"], "reason")
         self.assertEqual(output[1]["content"][0]["text"], "answer")
@@ -3369,152 +3484,80 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
     def test_qwen3_reasoning_parser_handles_incomplete_length(self):
         from sparsevllm.entrypoints.openai.api_server import _response_output_items
 
-        output, incomplete = _response_output_items(
+        parsed = _transformers_response_parser().parse(
             "<think>partial",
-            "length",
-            reasoning_parser_name="qwen3",
+            prefix="",
+            parse_tools=False,
+            finish_reason="length",
         )
+        output = _response_output_items(parsed)
 
-        self.assertTrue(incomplete)
         self.assertEqual(output, [{"id": output[0]["id"], "type": "reasoning", "text": "partial", "summary": []}])
 
     def test_qwen3_reasoning_parser_rejects_unclosed_stop(self):
-        from sparsevllm.entrypoints.openai.responses.reasoning import ReasoningParseError
-        from sparsevllm.entrypoints.openai.api_server import _response_output_items
+        from sparsevllm.entrypoints.openai.serving.response_parsing import ResponseParseError
 
-        with self.assertRaises(ReasoningParseError):
-            _response_output_items("<think>partial", "stop", reasoning_parser_name="qwen3")
+        with self.assertRaises(ResponseParseError):
+            _transformers_response_parser().parse(
+                "<think>partial",
+                prefix="",
+                parse_tools=False,
+                finish_reason="stop",
+            )
 
     def test_reasoning_parser_disabled_returns_raw_text(self):
         from sparsevllm.entrypoints.openai.api_server import _response_output_items
 
-        output, incomplete = _response_output_items(
-            "<think>reason</think>answer",
-            "stop",
-            reasoning_parser_name=None,
+        from sparsevllm.entrypoints.openai.serving.response_parsing import ParsedModelResponse
+
+        output = _response_output_items(
+            ParsedModelResponse(None, "<think>reason</think>answer", [])
         )
 
-        self.assertFalse(incomplete)
         self.assertEqual(output[0]["content"][0]["text"], "<think>reason</think>answer")
 
     def test_tool_call_output_item_is_parsed(self):
         from sparsevllm.entrypoints.openai.api_server import _response_output_items
 
-        output, incomplete = _response_output_items(
+        parsed = _transformers_response_parser().parse(
             '<tool_call>{"name":"get_weather","arguments":{"city":"Paris"}}</tool_call>',
-            "stop",
-            reasoning_parser_name=None,
+            prefix="",
+            parse_tools=True,
+            finish_reason="stop",
         )
+        output = _response_output_items(parsed)
 
-        self.assertFalse(incomplete)
         self.assertEqual(output[0]["type"], "function_call")
         self.assertEqual(output[0]["name"], "get_weather")
         self.assertEqual(output[0]["arguments"], '{"city":"Paris"}')
 
     def test_malformed_tool_call_json_fails_fast(self):
-        from sparsevllm.entrypoints.openai.responses.tools import ToolCallParseError
-        from sparsevllm.entrypoints.openai.api_server import _response_output_items
+        from sparsevllm.entrypoints.openai.serving.response_parsing import ResponseParseError
 
-        with self.assertRaises(ToolCallParseError):
-            _response_output_items('<tool_call>{"name":</tool_call>', "stop", reasoning_parser_name=None)
+        with self.assertRaises(ResponseParseError):
+            _transformers_response_parser().parse(
+                '<tool_call>{"name":</tool_call>',
+                prefix="",
+                parse_tools=True,
+                finish_reason="stop",
+            )
 
-    def test_qwen3_reasoning_stream_parser_handles_split_tags(self):
-        from sparsevllm.entrypoints.openai.responses.reasoning import get_reasoning_stream_parser
-
-        parser = get_reasoning_stream_parser("qwen3")
-        events = []
-        for delta in ["<thi", "nk>rea", "son</thi", "nk>\n\nanswer<|im_end|>"]:
-            events.extend(parser.feed(delta))
-        events.extend(parser.finish("stop"))
-
-        reasoning = "".join(event.text for event in events if event.kind == "reasoning_delta")
-        answer = "".join(event.text for event in events if event.kind == "answer_delta")
-
-        self.assertEqual(reasoning, "reason")
-        self.assertEqual(answer, "answer")
-        self.assertIn("reasoning_done", [event.kind for event in events])
-
-    def test_qwen3_reasoning_stream_parser_handles_template_opened_think(self):
-        from sparsevllm.entrypoints.openai.responses.reasoning import Qwen3ReasoningStreamParser
-
-        parser = Qwen3ReasoningStreamParser(buffer_initial_content=True)
-        events = []
-        for delta in ["reason", "</thi", "nk>\n\nanswer"]:
-            events.extend(parser.feed(delta))
-        events.extend(parser.finish("stop"))
-
-        reasoning = "".join(event.text for event in events if event.kind == "reasoning_delta")
-        answer = "".join(event.text for event in events if event.kind == "answer_delta")
-
-        self.assertEqual(reasoning, "reason")
-        self.assertEqual(answer, "answer")
-
-    def test_qwen3_reasoning_stream_parser_rejects_unclosed_stop(self):
-        from sparsevllm.entrypoints.openai.responses.reasoning import ReasoningParseError
-        from sparsevllm.entrypoints.openai.responses.reasoning import get_reasoning_stream_parser
-
-        parser = get_reasoning_stream_parser("qwen3")
-        parser.feed("<think>partial")
-
-        with self.assertRaises(ReasoningParseError):
-            parser.finish("stop")
-
-    def test_qwen3_tool_call_stream_parser_handles_split_json(self):
-        from sparsevllm.entrypoints.openai.responses.tools import ToolCallStreamParser
-
-        parser = ToolCallStreamParser()
-        events = []
-        for delta in [
-            "<tool_",
-            'call>{"name":"get_weather",',
-            '"arguments":{"city":"Paris"}}</tool_call>',
+    def test_transformers_response_stream_parser_handles_split_regions(self):
+        parser = _transformers_response_parser().stream(prefix="", parse_tools=True)
+        deltas = []
+        for chunk in [
+            "<thi",
+            "nk>reason</think><tool_",
+            'call>{"name":"get_weather","arguments":{"city":"Paris"}}</tool_call>',
         ]:
-            events.extend(parser.feed(delta))
-        events.extend(parser.finish("stop"))
+            deltas.extend(parser.feed(chunk))
+        deltas.extend(parser.finish("stop"))
 
-        self.assertEqual([event.kind for event in events], [
-            "tool_call_started",
-            "tool_call_arguments_delta",
-            "tool_call_done",
-        ])
-        self.assertEqual(events[0].name, "get_weather")
-        self.assertEqual(events[1].arguments_delta, '{"city":"Paris"}')
-
-    def test_qwen3_tool_call_stream_parser_handles_sequential_split_blocks(self):
-        from sparsevllm.entrypoints.openai.responses.tools import ToolCallStreamParser
-
-        parser = ToolCallStreamParser()
-        events = []
-        events.extend(
-            parser.feed(
-                '<tool_call>{"name":"first","arguments":{"x":1}}</tool_call>'
-            )
-        )
-        events.extend(
-            parser.feed(
-                '<tool_call>{"name":"second","arguments":{"y":2}}</tool_call>'
-            )
-        )
-        events.extend(parser.finish("stop"))
-
-        started = [event.name for event in events if event.kind == "tool_call_started"]
-        arguments = [
-            event.arguments_delta
-            for event in events
-            if event.kind == "tool_call_arguments_delta"
-        ]
-
-        self.assertEqual(started, ["first", "second"])
-        self.assertEqual(arguments, ['{"x":1}', '{"y":2}'])
-
-    def test_qwen3_tool_call_stream_parser_fails_malformed_json(self):
-        from sparsevllm.entrypoints.openai.responses.tools import ToolCallParseError
-        from sparsevllm.entrypoints.openai.responses.tools import ToolCallStreamParser
-
-        parser = ToolCallStreamParser()
-
-        with self.assertRaises(ToolCallParseError):
-            parser.feed('<tool_call>{"name":</tool_call>')
+        reasoning = "".join(delta.get("reasoning_content", "") for delta in deltas)
+        calls = [delta["tool_calls"][0] for delta in deltas if "tool_calls" in delta]
+        self.assertEqual(reasoning, "reason")
+        self.assertEqual(calls[0]["function"]["name"], "get_weather")
+        self.assertEqual(calls[0]["function"]["arguments"], '{"city":"Paris"}')
 
     async def test_response_stream_tool_call_outputs_function_events(self):
         from sparsevllm.entrypoints.openai.api_server import RequestHandle, ResponseRequest, _response_stream
@@ -3560,8 +3603,14 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
                     RequestHandle(output_queue=queue, cancelled=threading.Event()),
                     time.perf_counter(),
                     None,
-                    ResponseRequest(model="model", input="hello", stream=True),
+                    ResponseRequest(
+                        model="model",
+                        input="hello",
+                        stream=True,
+                        tools=[{"type": "function", "name": "get_weather", "parameters": {}}],
+                    ),
                     reasoning_parser_name=None,
+                    response_parser=_transformers_response_parser(),
                 )
             ]
         )
@@ -3621,8 +3670,14 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
                     RequestHandle(output_queue=queue, cancelled=threading.Event()),
                     time.perf_counter(),
                     None,
-                    ResponseRequest(model="model", input="hello", stream=True),
+                    ResponseRequest(
+                        model="model",
+                        input="hello",
+                        stream=True,
+                        tools=[{"type": "function", "name": "get_weather", "parameters": {}}],
+                    ),
                     reasoning_parser_name="qwen3",
+                    response_parser=_transformers_response_parser(),
                 )
             ]
         )

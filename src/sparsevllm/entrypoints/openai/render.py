@@ -1,14 +1,59 @@
 import inspect
+import json
 from typing import Any
 
 from sparsevllm.entrypoints.openai.protocol.chat import ChatContentPart
 from sparsevllm.entrypoints.openai.protocol.chat import ChatCompletionRequest
 from sparsevllm.entrypoints.openai.protocol.chat import ChatMessage
 from sparsevllm.entrypoints.openai.protocol.responses import ResponseRequest
-from sparsevllm.entrypoints.openai.responses.tools import normalize_tools
 
 
 BOOLEAN_CHAT_TEMPLATE_KWARGS = {"enable_thinking", "preserve_thinking"}
+
+
+def normalize_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
+    if tools is None:
+        return None
+    normalized = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            raise ValueError("tools entries must be JSON objects.")
+        tool_type = tool.get("type")
+        if tool_type != "function":
+            raise ValueError(f"Unsupported tool type: {tool_type!r}.")
+        function = tool.get("function")
+        if function is not None:
+            if not isinstance(function, dict):
+                raise ValueError("function tool.function must be a JSON object.")
+            name = function.get("name")
+            description = function.get("description")
+            parameters = function.get("parameters", {})
+            strict = function.get("strict", tool.get("strict", False))
+        else:
+            name = tool.get("name")
+            description = tool.get("description")
+            parameters = tool.get("parameters", {})
+            strict = tool.get("strict", False)
+
+        if not isinstance(name, str) or not name:
+            raise ValueError("function tool name must be a non-empty string.")
+        if description is not None and not isinstance(description, str):
+            raise ValueError("function tool description must be a string.")
+        if not isinstance(parameters, dict):
+            raise ValueError("function tool parameters must be a JSON object.")
+        if not isinstance(strict, bool):
+            raise ValueError("function tool strict must be a bool.")
+
+        item = {
+            "type": "function",
+            "name": name,
+            "parameters": parameters,
+            "strict": strict,
+        }
+        if description is not None:
+            item["description"] = description
+        normalized.append(item)
+    return normalized
 
 
 def _chat_template_role(role: str) -> str:
@@ -101,7 +146,7 @@ def _chat_prompt(
         if message.reasoning_content is not None:
             rendered_message["reasoning_content"] = message.reasoning_content
         if message.tool_calls is not None:
-            rendered_message["tool_calls"] = message.tool_calls
+            rendered_message["tool_calls"] = _chat_template_tool_calls(message.tool_calls)
         if message.tool_call_id is not None:
             rendered_message["tool_call_id"] = message.tool_call_id
         chat.append(rendered_message)
@@ -130,6 +175,27 @@ def _chat_prompt(
         rendered.append(f"{message['role']}: {message['content'] or ''}")
     rendered.append("assistant:")
     return "\n".join(rendered)
+
+
+def _chat_template_tool_calls(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rendered = []
+    for tool_call in tool_calls:
+        normalized = dict(tool_call)
+        function = dict(normalized["function"])
+        try:
+            arguments = json.loads(function["arguments"])
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"assistant tool call {function['name']!r} arguments is not valid JSON: {exc}"
+            ) from exc
+        if not isinstance(arguments, dict):
+            raise ValueError(
+                f"assistant tool call {function['name']!r} arguments must decode to a JSON object."
+            )
+        function["arguments"] = arguments
+        normalized["function"] = function
+        rendered.append(normalized)
+    return rendered
 
 
 def _response_prompt(tokenizer: Any, request: ResponseRequest) -> str:

@@ -36,6 +36,7 @@ FINAL_STATUSES = {
     "metric_failed",
     "skipped_by_policy",
 }
+MINI_MODEL_CLASS = "benchmark.swe_bench_lite.model.SparseVLLMLitellmModel"
 LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
 SECRET_PATTERNS = (
     re.compile(r"sk-[A-Za-z0-9_-]{16,}"),
@@ -278,11 +279,12 @@ def select_rows(
 
 
 def _instance_image_names(rows: Sequence[dict[str, Any]]) -> list[str]:
-    try:
-        from swebench.harness.test_spec.test_spec import make_test_spec
-    except ImportError as exc:
-        raise RunnerError("Cannot import SWE-bench test spec support") from exc
-    return [make_test_spec(row, namespace="swebench").instance_image_key for row in rows]
+    names = []
+    for row in rows:
+        instance_id = row["instance_id"]
+        image = f"swebench/sweb.eval.x86_64.{instance_id.lower()}:latest"
+        names.append(image.replace("__", "_1776_"))
+    return names
 
 
 def _require_local_images(image_names: Sequence[str]) -> None:
@@ -437,6 +439,7 @@ def render_mini_config(
         f"  cost_limit: {cost_limit}",
         f"  wall_time_limit_seconds: {wall_time_limit_seconds}",
         "model:",
+        f"  model_class: {MINI_MODEL_CLASS}",
         f"  cost_tracking: {json.dumps(cost_tracking)}",
         "  model_kwargs:",
         "    drop_params: true",
@@ -856,6 +859,10 @@ class SweBenchLiteRunner:
 
     def _model_env(self) -> dict[str, str]:
         env = os.environ.copy()
+        python_path = [str(self.repo_root)]
+        if env.get("PYTHONPATH"):
+            python_path.append(env["PYTHONPATH"])
+        env["PYTHONPATH"] = os.pathsep.join(python_path)
         if not self.args.api_proxy_from_environment:
             for key in PROXY_ENV_VARS:
                 env.pop(key, None)

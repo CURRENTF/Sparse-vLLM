@@ -28,7 +28,6 @@ from sparsevllm.entrypoints.openai.render import _response_prompt
 from sparsevllm.entrypoints.openai.render import resolve_chat_template_kwargs
 from sparsevllm.entrypoints.openai.render import resolve_chat_tools
 from sparsevllm.entrypoints.openai.render import validate_chat_template_kwargs
-from sparsevllm.entrypoints.openai.responses.reasoning import get_reasoning_parser
 from sparsevllm.entrypoints.openai.routes.chat import router as chat_router
 from sparsevllm.entrypoints.openai.routes.completion import router as completion_router
 from sparsevllm.entrypoints.openai.routes.models import router as models_router
@@ -55,8 +54,7 @@ from sparsevllm.entrypoints.openai.serving.chat import _chat_message
 from sparsevllm.entrypoints.openai.serving.chat import _chat_completion_stream
 from sparsevllm.entrypoints.openai.serving.chat import _stream_include_usage
 from sparsevllm.entrypoints.openai.serving.chat import _validate_chat_request
-from sparsevllm.entrypoints.openai.serving.chat_parsing import ParsedChatOutput
-from sparsevllm.entrypoints.openai.serving.chat_parsing import parse_chat_output
+from sparsevllm.entrypoints.openai.serving.response_parsing import TransformersResponseParser
 from sparsevllm.entrypoints.openai.serving.completion import _completion_response
 from sparsevllm.entrypoints.openai.serving.completion import _completion_stream
 from sparsevllm.entrypoints.openai.serving.completion import _validate_request
@@ -102,9 +100,13 @@ def create_app(
     if engine is None:
         engine_kwargs.setdefault("throughput_log_interval_s", 0.0)
     _validate_serving_method(engine_kwargs, engine)
-    get_reasoning_parser(reasoning_parser)
+    if reasoning_parser not in (None, "qwen3"):
+        raise ValueError(f"Unsupported reasoning parser {reasoning_parser!r}.")
     engine = engine or LLM(model, **engine_kwargs)
     dispatcher = AsyncEngineDispatcher(engine)
+    response_parser = TransformersResponseParser.from_tokenizer(
+        getattr(engine, "tokenizer", None)
+    )
     request_log_path = Path(request_log_dir) if request_log_dir else None
     if request_log_path is not None:
         request_log_path.mkdir(parents=True, exist_ok=True)
@@ -122,6 +124,7 @@ def create_app(
     app.state.served_model_name = served_model_name
     app.state.request_log_dir = request_log_path
     app.state.reasoning_parser = reasoning_parser
+    app.state.response_parser = response_parser
     app.include_router(models_router)
     app.include_router(worker_router)
     app.include_router(prefix_cache_router)

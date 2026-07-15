@@ -15,7 +15,7 @@ authors = [
 dependencies = [
     "fire",
     "torch==2.8.0",
-    "transformers==5.12.1",
+    "transformers==5.13.1",
     "triton==3.4.0",
     "torchvision==0.23.0",
     "pillow",
@@ -40,7 +40,7 @@ dependencies = [
 
 [project.optional-dependencies]
 qwen35 = [
-    "kernels==0.14.1",
+    "kernels==0.15.2",
     "einops",
     "sglang-kernel @ https://github.com/sgl-project/whl/releases/download/v0.3.14.post1/sgl_kernel-0.3.14.post1%2Bcu128-cp310-abi3-manylinux2014_x86_64.whl",
 ]
