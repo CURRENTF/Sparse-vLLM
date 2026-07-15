@@ -227,6 +227,3 @@ python scripts/validation/validate_qwen3_moe_manual_qa.py \
   --expert-parallel-size 2 \
   --reference /path/to/results/manual-qa-ep1/raw_outputs.json
 ```
-
-For implementation decisions and the delivery evidence, see the
-[dated implementation report](../../dev_docs/reports/qwen3_moe_ep_implementation_20260715.md).
