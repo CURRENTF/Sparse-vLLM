@@ -8,7 +8,7 @@ import triton.language as tl
 
 from sparsevllm.triton_kernel.silu_and_mul import silu_and_mul_fwd
 from sparsevllm.triton_kernel.moe_config import (
-    device_capability,
+    device_info,
     resolve_moe_gemm_config,
 )
 
@@ -713,7 +713,7 @@ def fused_moe(
     local_expert_end = local_expert_start + int(w13_weight.shape[0])
 
     num_local_experts = int(w13_weight.shape[0])
-    capability = device_capability(
+    device_name, capability = device_info(
         hidden_states.device.type,
         int(hidden_states.device.index),
     )
@@ -725,6 +725,7 @@ def fused_moe(
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
         stage="w13",
+        device_name=device_name,
         device_capability=capability,
     ).as_triton_kwargs()
     alignment = _prepare_expert_assignment(
@@ -760,6 +761,7 @@ def fused_moe(
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
         stage="w2",
+        device_name=device_name,
         device_capability=capability,
     ).as_triton_kwargs()
     w2_config["BLOCK_SIZE_M"] = alignment.block_size
