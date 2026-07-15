@@ -228,7 +228,15 @@ class LLMEngine:
         # 4. 初始化调度器
         # 关键设计：将 Rank 0 的 CacheManager 传给 Scheduler。
         # Scheduler 通过它来感知全局显存的余量，从而做出调度和抢占决策。
-        self.scheduler = Scheduler(config, self.model_runner.runtime_state)
+        self.scheduler = Scheduler(
+            config,
+            self.model_runner.runtime_state,
+            prefix_cache_hit_refresher=(
+                self._refresh_prefix_cache_hit
+                if config.enable_prefix_caching
+                else None
+            ),
+        )
         
         self._exited = False
         self._throughput_logger = _ThroughputIntervalLogger(config.throughput_log_interval_s)
@@ -459,6 +467,9 @@ class LLMEngine:
         seq = Sequence(prompt, sampling_params)
         self.scheduler.add(seq)
         return seq.seq_id
+
+    def _refresh_prefix_cache_hit(self, seq: Sequence) -> None:
+        self.model_runner.call("refresh_prefix_cache_hit", seq)
 
     def abort_request(self, seq_id: int):
         """Abort a queued or running request and release any owned KV slots."""

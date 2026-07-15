@@ -1,5 +1,6 @@
 import os
 from collections import deque
+from collections.abc import Callable
 
 from sparsevllm.config import Config
 from sparsevllm.engine.sequence import Sequence, SequenceStatus
@@ -20,7 +21,12 @@ class Scheduler:
     3. 管理逻辑显存额度，并在显存不足时触发抢占 (Preemption/Eviction)。
     """
 
-    def __init__(self, config: Config, memory_oracle: MemoryOracle):
+    def __init__(
+        self,
+        config: Config,
+        memory_oracle: MemoryOracle,
+        prefix_cache_hit_refresher: Callable[[Sequence], None] | None = None,
+    ):
         self.config = config
         self.max_num_seqs_in_batch = config.max_num_seqs_in_batch
         self.max_num_batched_tokens = config.max_num_batched_tokens
@@ -42,6 +48,11 @@ class Scheduler:
         # memory_oracle 引用 Rank 0 的 CacheManager，作为全局显存余量参考。
         # 对多层异构预算，采用更保守的可用空间估计。
         self.memory_oracle = memory_oracle
+        self.prefix_cache_hit_refresher = (
+            memory_oracle.refresh_prefix_cache_hit
+            if prefix_cache_hit_refresher is None
+            else prefix_cache_hit_refresher
+        )
         
         self.waiting: deque[Sequence] = deque()
         self.decoding: deque[Sequence] = deque()
@@ -333,7 +344,7 @@ class Scheduler:
                     break
                 bucket_scan_budget -= 1
                 if seq.num_prefilled_tokens == 0 and seq.num_completion_tokens == 0:
-                    self.memory_oracle.refresh_prefix_cache_hit(seq)
+                    self.prefix_cache_hit_refresher(seq)
                 remaining_prefill_tokens = self.memory_oracle.remaining_prefill_tokens(seq)
                 candidate_step_free_count = int(self.memory_oracle.prefill_step_free_slots_for(seq))
                 uses_full_prefill_staging = bool(

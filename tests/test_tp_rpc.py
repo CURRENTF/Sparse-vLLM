@@ -134,6 +134,87 @@ def test_warmup_reset_uses_failure_synchronized_world_rpc():
     assert "reset_after_warmup" in TP_RPC_STATUS_SYNC_METHODS
 
 
+def test_prefix_cache_lookup_uses_failure_synchronized_world_rpc():
+    assert "refresh_prefix_cache_hit" in TP_RPC_STATUS_SYNC_METHODS
+
+
+def test_prefix_cache_lookup_rpc_checks_rank_results():
+    runner = object.__new__(ModelRunner)
+    runner.world_size = 1
+    runner.rank = 0
+    calls = []
+    result = {"enabled": False, "hit_len": 0}
+    runner.refresh_prefix_cache_hit = lambda seq: calls.append(("lookup", seq)) or result
+    runner._sync_tp_rpc_status = lambda method, error: calls.append(("status", method, error))
+    runner._sync_prefix_cache_lookup_result = lambda value: calls.append(("result", value))
+
+    seq = object()
+    actual = ModelRunner.call(runner, "refresh_prefix_cache_hit", seq)
+
+    assert actual is result
+    assert calls == [
+        ("lookup", seq),
+        ("status", "refresh_prefix_cache_hit", None),
+        ("result", result),
+    ]
+
+
+def test_prefix_cache_lookup_rejects_rank_divergence():
+    runner = object.__new__(ModelRunner)
+    runner.world_size = 2
+    runner.parallel_context = SimpleNamespace(
+        world=SimpleNamespace(process_group=object())
+    )
+
+    def gather(results, local_result, group=None):
+        assert group is runner.parallel_context.world.process_group
+        results[:] = [local_result, {**local_result, "hit_len": 0}]
+
+    with patch.object(dist, "all_gather_object", side_effect=gather):
+        try:
+            ModelRunner._sync_prefix_cache_lookup_result(
+                runner,
+                {"enabled": True, "hit_len": 8},
+            )
+        except RuntimeError as exc:
+            assert "lookup diverged across world ranks" in str(exc)
+        else:
+            raise AssertionError("expected divergent prefix-cache lookup to fail")
+
+
+def test_model_runner_prefix_cache_lookup_returns_sequence_metadata():
+    runner = object.__new__(ModelRunner)
+
+    def refresh(seq):
+        seq.prefix_cache_enabled = True
+        seq.prefix_cache_hit_len = 8
+        seq.prefix_cache_hit_block_count = 2
+        seq.prefix_cache_hit_last_block_id = b"block"
+        seq.prefix_cache_block_size = 4
+        seq.prefix_cache_method = "quest"
+
+    runner.runtime_state = SimpleNamespace(refresh_prefix_cache_hit=refresh)
+    seq = SimpleNamespace(
+        prefix_cache_enabled=False,
+        prefix_cache_hit_len=0,
+        prefix_cache_hit_block_count=0,
+        prefix_cache_hit_last_block_id=None,
+        prefix_cache_block_size=0,
+        prefix_cache_method="",
+    )
+
+    result = ModelRunner.refresh_prefix_cache_hit(runner, seq)
+
+    assert result == {
+        "enabled": True,
+        "hit_len": 8,
+        "hit_block_count": 2,
+        "hit_last_block_id": b"block",
+        "block_size": 4,
+        "method": "quest",
+    }
+
+
 def test_hidden_state_debug_uses_failure_synchronized_world_rpc():
     assert "debug_hidden_states_cpu" in TP_RPC_STATUS_SYNC_METHODS
     assert "debug_moe_states_cpu" in TP_RPC_STATUS_SYNC_METHODS

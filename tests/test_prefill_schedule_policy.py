@@ -181,7 +181,15 @@ def identity_runtime_layout(num_layers):
     )
 
 
-def make_scheduler_with_oracle(policy, oracle, *, method="", chunk=5, max_tokens=10):
+def make_scheduler_with_oracle(
+    policy,
+    oracle,
+    *,
+    method="",
+    chunk=5,
+    max_tokens=10,
+    prefix_cache_hit_refresher=None,
+):
     cfg = SimpleNamespace(
         max_num_seqs_in_batch=4,
         max_num_batched_tokens=max_tokens,
@@ -195,7 +203,11 @@ def make_scheduler_with_oracle(policy, oracle, *, method="", chunk=5, max_tokens
         snapkv_window_size=2,
         vllm_sparse_method=method,
     )
-    return Scheduler(cfg, oracle)
+    return Scheduler(
+        cfg,
+        oracle,
+        prefix_cache_hit_refresher=prefix_cache_hit_refresher,
+    )
 
 
 def seq_with_len(n):
@@ -1852,6 +1864,37 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
         self.assertTrue(seq.prefix_cache_enabled)
         self.assertEqual(seq.num_prefilled_tokens, 8)
         self.assertEqual(seq.current_chunk_size, 5)
+
+    def test_prefix_cache_lookup_uses_scheduler_refresher(self):
+        oracle = FakeMemoryOracle(prefix_hit_len=8, prefix_hit_blocks=2)
+        refresh_calls = []
+
+        def refresh(seq):
+            refresh_calls.append(seq.seq_id)
+            seq.prefix_cache_enabled = True
+            seq.prefix_cache_hit_len = 4
+            seq.prefix_cache_hit_block_count = 1
+            seq.prefix_cache_hit_last_block_id = b"world"
+            seq.prefix_cache_block_size = 4
+
+        scheduler = make_scheduler_with_oracle(
+            PREFILL_POLICY_ALL_CHUNKED,
+            oracle,
+            method="",
+            chunk=5,
+            max_tokens=20,
+            prefix_cache_hit_refresher=refresh,
+        )
+        seq = seq_with_len(20)
+        scheduler.add(seq)
+
+        scheduled, is_prefill, _ = scheduler.schedule()
+
+        self.assertTrue(is_prefill)
+        self.assertEqual(scheduled, [seq])
+        self.assertEqual(refresh_calls, [seq.seq_id])
+        self.assertEqual(oracle.refresh_calls, 0)
+        self.assertEqual(seq.num_prefilled_tokens, 4)
 
     def test_prefix_cache_lookup_skips_preempted_completion_replay(self):
         oracle = FakeMemoryOracle(prefix_hit_len=8, prefix_hit_blocks=2)

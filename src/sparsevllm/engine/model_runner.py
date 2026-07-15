@@ -60,6 +60,7 @@ PREFIX_CACHE_CONTROL_RPC_METHODS = {
 TP_RPC_STATUS_SYNC_METHODS = PREFIX_CACHE_CONTROL_RPC_METHODS | {
     "debug_hidden_states_cpu",
     "debug_moe_states_cpu",
+    "refresh_prefix_cache_hit",
     "reset_after_warmup",
     "run",
 }
@@ -337,6 +338,8 @@ class ModelRunner:
             self._sync_tp_rpc_status(method_name, local_error)
             if local_error is not None:
                 raise local_error
+            if method_name == "refresh_prefix_cache_hit":
+                self._sync_prefix_cache_lookup_result(result)
             return result
         with torch.inference_mode():
             return method(*args)
@@ -363,6 +366,21 @@ class ModelRunner:
         local_error: BaseException | None,
     ) -> None:
         self._sync_tp_rpc_status(method_name, local_error)
+
+    def _sync_prefix_cache_lookup_result(self, local_result: dict[str, object]) -> None:
+        if self.world_size <= 1:
+            return
+        results = [None] * self.world_size
+        dist.all_gather_object(
+            results,
+            local_result,
+            group=self.parallel_context.world.process_group,
+        )
+        if any(result != results[0] for result in results[1:]):
+            raise RuntimeError(
+                "Prefix-cache lookup diverged across world ranks: "
+                f"results={results!r}."
+            )
 
     def load_deltakv_compressors(self):
         """加载 DeltaKV 压缩器权重"""
@@ -444,6 +462,17 @@ class ModelRunner:
             [int(token_id) for token_id in token_ids],
             include_subtree=bool(include_subtree),
         )
+
+    def refresh_prefix_cache_hit(self, seq: Sequence) -> dict[str, object]:
+        self.runtime_state.refresh_prefix_cache_hit(seq)
+        return {
+            "enabled": bool(seq.prefix_cache_enabled),
+            "hit_len": int(seq.prefix_cache_hit_len),
+            "hit_block_count": int(seq.prefix_cache_hit_block_count),
+            "hit_last_block_id": seq.prefix_cache_hit_last_block_id,
+            "block_size": int(seq.prefix_cache_block_size),
+            "method": str(seq.prefix_cache_method),
+        }
 
     def prefix_cache_match(self, token_ids: list[int]) -> dict[str, object]:
         return self.runtime_state.prefix_cache_match(
