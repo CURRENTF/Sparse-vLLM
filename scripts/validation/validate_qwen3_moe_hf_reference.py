@@ -82,7 +82,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", required=True)
     parser.add_argument("--engine-reference", required=True)
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--attention-implementation", default="flash_attention_2")
+    parser.add_argument("--attention-implementation", default="sdpa")
     parser.add_argument("--atol", type=float, default=0.05)
     parser.add_argument("--rtol", type=float, default=0.05)
     return parser.parse_args()
