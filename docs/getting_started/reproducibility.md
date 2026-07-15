@@ -15,6 +15,11 @@ The README contains the current install command. The expected baseline is:
 - Editable install from the repository root with `pip install -e .`.
 - Qwen3.5/Qwen3.6 FP8 runs install the CUDA-specific extra with
   `pip install -e ".[qwen35]"`.
+- Qwen3.5/Qwen3.6 FP8 warmup may query the Hugging Face kernel registry to
+  resolve `kernels-community/finegrained-fp8`, even for a local model path.
+  Record `HF_ENDPOINT` and proxy overrides. A SOCKS `ALL_PROXY` requires the
+  `httpx` SOCKS extra/`socksio`; otherwise clear the unusable override before
+  launching the benchmark.
 
 Record CUDA version, GPU type/count, visible GPU ids, branch, commit, and any
 relevant uncommitted changes with every reported benchmark.

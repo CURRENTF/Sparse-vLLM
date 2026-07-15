@@ -21,6 +21,15 @@ optional dependencies as well:
 pip install -e ".[qwen35]"
 ```
 
+The Qwen3.5/Qwen3.6 FP8 backend resolves the
+`kernels-community/finegrained-fp8` Hub kernel on the first FP8 forward in each
+fresh process. This version lookup may contact the Hugging Face kernel registry
+even when the model checkpoint is local. Make sure the configured Hugging Face
+endpoint is reachable. If `ALL_PROXY` uses a SOCKS URL, either install the
+`httpx` SOCKS extra (which provides `socksio`) or remove that override for the
+run; an unusable inherited SOCKS proxy fails during engine warmup before any
+sparse method executes.
+
 ## DeltaKV Checkpoints
 
 Compressor-backed DeltaKV runs require a local checkpoint directory. Download
