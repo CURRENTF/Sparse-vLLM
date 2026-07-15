@@ -7,6 +7,10 @@ import triton
 import triton.language as tl
 
 from sparsevllm.triton_kernel.silu_and_mul import silu_and_mul_fwd
+from sparsevllm.triton_kernel.moe_config import (
+    device_capability,
+    resolve_moe_gemm_config,
+)
 
 
 _SUPPORTED_DTYPES = (torch.bfloat16, torch.float16)
@@ -122,6 +126,49 @@ def _validate_alignment_inputs(
         )
 
 
+@triton.jit
+def _alignment_prefix_kernel(
+    counts_ptr,
+    expert_offsets_ptr,
+    write_positions_ptr,
+    num_tokens_post_padded_ptr,
+    block_size: tl.constexpr,
+    NUM_LOCAL_EXPERTS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    offsets = tl.arange(0, BLOCK_SIZE)
+    counts = tl.load(counts_ptr + offsets, mask=offsets < NUM_LOCAL_EXPERTS, other=0)
+    padded_counts = tl.cdiv(counts, block_size) * block_size
+    padded_ends = tl.cumsum(padded_counts, axis=0)
+    tl.store(
+        expert_offsets_ptr + offsets + 1,
+        padded_ends,
+        mask=offsets < NUM_LOCAL_EXPERTS,
+    )
+    tl.store(
+        write_positions_ptr + offsets,
+        padded_ends - padded_counts,
+        mask=offsets < NUM_LOCAL_EXPERTS,
+    )
+    tl.store(expert_offsets_ptr, 0)
+    tl.store(num_tokens_post_padded_ptr, tl.sum(padded_counts, axis=0))
+
+
+@triton.jit
+def _fill_expert_blocks_kernel(
+    expert_offsets_ptr,
+    expert_ids_ptr,
+    block_size: tl.constexpr,
+    MAX_BLOCKS_PER_EXPERT: tl.constexpr,
+):
+    expert_id = tl.program_id(0)
+    block_offsets = tl.arange(0, MAX_BLOCKS_PER_EXPERT)
+    first_block = tl.load(expert_offsets_ptr + expert_id) // block_size
+    end_block = tl.load(expert_offsets_ptr + expert_id + 1) // block_size
+    blocks = first_block + block_offsets
+    tl.store(expert_ids_ptr + blocks, expert_id, mask=blocks < end_block)
+
+
 def moe_align_block_size(
     topk_ids: torch.Tensor,
     block_size: int,
@@ -130,18 +177,11 @@ def moe_align_block_size(
     local_expert_start: int = 0,
     local_expert_end: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Group local token/expert assignments into padded expert-homogeneous blocks.
-
-    ``sorted_token_ids`` stores indices into flattened ``topk_ids``. Padding uses
-    ``topk_ids.numel()`` as an invalid assignment. ``expert_ids`` contains local
-    expert indices, not global expert indices. Remote EP assignments are omitted.
-    """
-
     block_size = int(block_size)
     num_experts = int(num_experts)
-    local_expert_start = int(local_expert_start)
     if local_expert_end is None:
         local_expert_end = num_experts
+    local_expert_start = int(local_expert_start)
     local_expert_end = int(local_expert_end)
     _validate_alignment_inputs(
         topk_ids,
@@ -150,89 +190,66 @@ def moe_align_block_size(
         local_expert_start,
         local_expert_end,
     )
-
     num_assignments = int(topk_ids.numel())
     num_local_experts = local_expert_end - local_expert_start
-    counts = torch.zeros(
-        num_local_experts,
-        dtype=torch.int32,
-        device=topk_ids.device,
+    max_num_tokens_padded = triton.cdiv(
+        num_assignments + num_local_experts * (block_size - 1),
+        block_size,
+    ) * block_size
+    max_num_blocks = max_num_tokens_padded // block_size
+    counts = torch.zeros(num_local_experts, dtype=torch.int32, device=topk_ids.device)
+    expert_offsets = torch.empty(
+        num_local_experts + 1, dtype=torch.int32, device=topk_ids.device
     )
-    count_block_size = 256
-    _count_local_assignments_kernel[
-        (triton.cdiv(num_assignments, count_block_size),)
-    ](
+    write_positions = torch.empty(
+        num_local_experts, dtype=torch.int32, device=topk_ids.device
+    )
+    num_tokens_post_padded = torch.empty(1, dtype=torch.int32, device=topk_ids.device)
+    sorted_token_ids = torch.full(
+        (max_num_tokens_padded,), num_assignments, dtype=torch.int32, device=topk_ids.device
+    )
+    expert_ids = torch.full(
+        (max_num_blocks,), -1, dtype=torch.int32, device=topk_ids.device
+    )
+
+    assignment_block = 256
+    _count_local_assignments_kernel[(triton.cdiv(num_assignments, assignment_block),)](
         topk_ids,
         counts,
         num_assignments,
         local_expert_start,
         local_expert_end,
-        BLOCK_SIZE=count_block_size,
+        BLOCK_SIZE=assignment_block,
     )
-
-    padded_counts = torch.div(
-        counts + block_size - 1,
-        block_size,
-        rounding_mode="floor",
-    ) * block_size
-    padded_ends = torch.cumsum(padded_counts, dim=0, dtype=torch.int32)
-    expert_offsets = torch.cat(
-        (
-            torch.zeros(1, dtype=torch.int32, device=topk_ids.device),
-            padded_ends,
-        )
+    _alignment_prefix_kernel[(1,)](
+        counts,
+        expert_offsets,
+        write_positions,
+        num_tokens_post_padded,
+        block_size=block_size,
+        NUM_LOCAL_EXPERTS=num_local_experts,
+        BLOCK_SIZE=triton.next_power_of_2(num_local_experts),
+        num_warps=4,
     )
-
-    max_num_tokens_padded = num_assignments + num_local_experts * (block_size - 1)
-    max_num_tokens_padded = triton.cdiv(max_num_tokens_padded, block_size) * block_size
-    sorted_token_ids = torch.full(
-        (max_num_tokens_padded,),
-        num_assignments,
-        dtype=torch.int32,
-        device=topk_ids.device,
+    _fill_expert_blocks_kernel[(num_local_experts,)](
+        expert_offsets,
+        expert_ids,
+        block_size=block_size,
+        MAX_BLOCKS_PER_EXPERT=triton.next_power_of_2(
+            max(1, triton.cdiv(num_assignments, block_size))
+        ),
+        num_warps=4,
     )
-    write_positions = expert_offsets[:-1].clone()
-    _fill_local_assignments_kernel[
-        (triton.cdiv(num_assignments, count_block_size),)
-    ](
+    _fill_local_assignments_kernel[(triton.cdiv(num_assignments, assignment_block),)](
         topk_ids,
         write_positions,
         sorted_token_ids,
         num_assignments,
         local_expert_start,
         local_expert_end,
-        BLOCK_SIZE=count_block_size,
-    )
-
-    block_starts = torch.arange(
-        max_num_tokens_padded // block_size,
-        dtype=torch.int32,
-        device=topk_ids.device,
-    ) * block_size
-    expert_ids = torch.searchsorted(padded_ends, block_starts, right=True).to(
-        torch.int32
-    )
-    num_tokens_post_padded = padded_ends[-1:].contiguous()
-    expert_ids = torch.where(
-        block_starts < num_tokens_post_padded,
-        expert_ids,
-        torch.full_like(expert_ids, -1),
+        BLOCK_SIZE=assignment_block,
     )
     return sorted_token_ids, expert_ids, num_tokens_post_padded
-
-
-def _gemm_launch_config(num_assignments: int, output_size: int) -> dict[str, int]:
-    block_m = 16
-    is_small_batch = num_assignments <= 32
-    block_n = 128 if is_small_batch or output_size > 4096 else 64
-    return {
-        "BLOCK_SIZE_M": block_m,
-        "BLOCK_SIZE_N": block_n,
-        "BLOCK_SIZE_K": 32 if is_small_batch else 64,
-        "GROUP_SIZE_M": 8,
-        "num_warps": 4,
-        "num_stages": 4 if is_small_batch else 3,
-    }
 
 
 def _prepare_expert_assignment(
@@ -524,7 +541,7 @@ def _moe_sum(
 ) -> torch.Tensor:
     num_tokens, top_k, hidden_size = (int(dim) for dim in inputs.shape)
     block_m = 1 if num_tokens <= 4 else 8
-    block_n = 256
+    block_n = 256 if hidden_size == 2048 and top_k == 8 else 128
     if output_dtype is None:
         output_dtype = inputs.dtype
     if output_dtype not in (*_SUPPORTED_DTYPES, torch.float32):
@@ -695,7 +712,21 @@ def fused_moe(
     hidden_size = int(hidden_states.shape[1])
     local_expert_end = local_expert_start + int(w13_weight.shape[0])
 
-    w13_config = _gemm_launch_config(num_assignments, 2 * intermediate_size)
+    num_local_experts = int(w13_weight.shape[0])
+    capability = device_capability(
+        hidden_states.device.type,
+        int(hidden_states.device.index),
+    )
+    w13_config = resolve_moe_gemm_config(
+        dtype=hidden_states.dtype,
+        num_tokens=num_tokens,
+        top_k=top_k,
+        num_local_experts=num_local_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        stage="w13",
+        device_capability=capability,
+    ).as_triton_kwargs()
     alignment = _prepare_expert_assignment(
         topk_ids,
         block_size=w13_config["BLOCK_SIZE_M"],
@@ -721,7 +752,16 @@ def fused_moe(
     )
     activated = silu_and_mul_fwd(w13_output)
 
-    w2_config = dict(_gemm_launch_config(num_assignments, hidden_size))
+    w2_config = resolve_moe_gemm_config(
+        dtype=hidden_states.dtype,
+        num_tokens=num_tokens,
+        top_k=top_k,
+        num_local_experts=num_local_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        stage="w2",
+        device_capability=capability,
+    ).as_triton_kwargs()
     w2_config["BLOCK_SIZE_M"] = alignment.block_size
     w2_output = torch.empty(
         (num_assignments, hidden_size),

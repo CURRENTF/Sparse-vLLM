@@ -13,7 +13,6 @@ from sparsevllm.layers.embed_head import ParallelLMHead
 from sparsevllm.models.qwen3 import Qwen3DecoderLayerBase, Qwen3ModelBase
 from sparsevllm.platforms import device_runtime
 from sparsevllm.utils.log import logger
-from sparsevllm.utils.profiler import profiler
 
 
 _EXPERT_SOURCE_RE = re.compile(
@@ -33,18 +32,44 @@ class Qwen3MoeRouter(nn.Module):
         self.num_experts = int(config.num_experts)
         self.top_k = int(config.num_experts_per_tok)
         self.norm_topk_prob = bool(config.norm_topk_prob)
+        self.backend = str(getattr(config, "moe_backend", "pytorch")).strip().lower()
+        if self.backend not in {"pytorch", "triton"}:
+            raise ValueError(
+                "Qwen3MoE backend must be 'pytorch' or 'triton', "
+                f"got {self.backend!r}."
+            )
+        if self.backend == "triton":
+            from sparsevllm.triton_kernel.moe_topk import topk_softmax
+
+            self.topk_impl = topk_softmax
+        else:
+            self.topk_impl = self._topk_pytorch
         self.weight = nn.Parameter(torch.empty(self.num_experts, self.hidden_size))
+
+    @staticmethod
+    def _topk_pytorch(
+        router_logits: torch.Tensor,
+        *,
+        top_k: int,
+        norm_topk_prob: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        router_probs = F.softmax(router_logits, dtype=torch.float32, dim=-1)
+        topk_weights, topk_ids = torch.topk(router_probs, top_k, dim=-1)
+        if norm_topk_prob:
+            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+        return topk_weights.to(router_logits.dtype), topk_ids
 
     def forward(
         self,
         hidden_states: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         router_logits = F.linear(hidden_states, self.weight)
-        router_probs = F.softmax(router_logits, dtype=torch.float32, dim=-1)
-        topk_weights, topk_ids = torch.topk(router_probs, self.top_k, dim=-1)
-        if self.norm_topk_prob:
-            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-        return router_logits, topk_weights.to(router_logits.dtype), topk_ids
+        topk_weights, topk_ids = self.topk_impl(
+            router_logits,
+            top_k=self.top_k,
+            norm_topk_prob=self.norm_topk_prob,
+        )
+        return router_logits, topk_weights, topk_ids
 
 
 class Qwen3MoePackedExperts(nn.Module):
@@ -182,6 +207,11 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 "Qwen3MoeSparseMoeBlock moe_backend must be 'pytorch' or 'triton', "
                 f"got {self.moe_backend!r}."
             )
+        self.expert_forward = (
+            self.experts.forward_pytorch
+            if self.moe_backend == "pytorch"
+            else self.experts.forward_triton
+        )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if hidden_states.dim() != 2:
@@ -191,19 +221,12 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         debug_enabled = os.getenv("SPARSEVLLM_DEBUG_MOE", "0") == "1"
         if debug_enabled:
             self.debug_last_input = hidden_states.detach().clone()
-        with profiler.record("moe_router"):
-            router_logits, topk_weights, topk_ids = self.gate(hidden_states)
-        expert_forward = (
-            self.experts.forward_pytorch
-            if self.moe_backend == "pytorch"
-            else self.experts.forward_triton
+        router_logits, topk_weights, topk_ids = self.gate(hidden_states)
+        local_output = self.expert_forward(
+            hidden_states,
+            topk_ids,
+            topk_weights,
         )
-        with profiler.record(f"moe_experts_{self.moe_backend}"):
-            local_output = expert_forward(
-                hidden_states,
-                topk_ids,
-                topk_weights,
-            )
 
         if debug_enabled:
             self.debug_last_router_logits = router_logits.detach().clone()
@@ -215,8 +238,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             )
             self.debug_last_local_hit_count = int(local_mask.sum().item())
 
-        with profiler.record("moe_ep_all_reduce"):
-            output = self.parallel_context.ep_all_reduce(local_output)
+        output = self.parallel_context.ep_all_reduce(local_output)
         if debug_enabled:
             self.debug_last_output = output.detach().clone()
         return output
@@ -242,10 +264,9 @@ class Qwen3MoeDecoderLayer(Qwen3DecoderLayerBase):
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
 
         if self.parallel_context.ep_size > 1:
-            with profiler.record("moe_ep_replicated_state_sync"):
-                replicated_state = torch.stack((hidden_states, residual), dim=0)
-                self.parallel_context.ep_broadcast(replicated_state, src_ep_rank=0)
-                hidden_states, residual = replicated_state.unbind(dim=0)
+            replicated_state = torch.stack((hidden_states, residual), dim=0)
+            self.parallel_context.ep_broadcast(replicated_state, src_ep_rank=0)
+            hidden_states, residual = replicated_state.unbind(dim=0)
 
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual

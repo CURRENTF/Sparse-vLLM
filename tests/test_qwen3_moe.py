@@ -107,11 +107,15 @@ def test_pytorch_moe_block_matches_transformers_reference():
 
 
 def test_moe_block_dispatches_only_the_selected_backend():
+    from sparsevllm.triton_kernel.moe_topk import topk_softmax
+
     config = _config()
     config.moe_backend = "triton"
     context = _ep_context(0, 1)
     with patch("sparsevllm.models.qwen3_moe.get_parallel_context", return_value=context):
         block = Qwen3MoeSparseMoeBlock(config)
+    assert block.gate.topk_impl is topk_softmax
+    assert block.expert_forward.__func__ is Qwen3MoePackedExperts.forward_triton
     hidden_states = torch.randn(3, config.hidden_size)
     expected = torch.randn_like(hidden_states)
 
@@ -121,14 +125,12 @@ def test_moe_block_dispatches_only_the_selected_backend():
             torch.empty(3, config.num_experts_per_tok),
             torch.empty(3, config.num_experts_per_tok, dtype=torch.int64),
         )),
-        patch.object(block.experts, "forward_pytorch") as pytorch_forward,
-        patch.object(block.experts, "forward_triton", return_value=expected) as triton_forward,
+        patch.object(block, "expert_forward", return_value=expected) as triton_forward,
     ):
         actual = block(hidden_states)
 
     assert torch.equal(actual, expected)
     triton_forward.assert_called_once()
-    pytorch_forward.assert_not_called()
 
 
 def test_moe_block_reduces_in_activation_dtype():
@@ -150,7 +152,7 @@ def test_moe_block_reduces_in_activation_dtype():
                 torch.empty(3, config.num_experts_per_tok, dtype=torch.int64),
             ),
         ),
-        patch.object(block.experts, "forward_triton", return_value=local_output),
+        patch.object(block, "expert_forward", return_value=local_output),
     ):
         output = block(hidden_states)
 
