@@ -1085,6 +1085,12 @@ class DecodeCudaGraphWarmupPolicyTest(unittest.TestCase):
             self.assertEqual(_deltakv_graph_warmup_profile(self.make_config()), "graph")
             self.assertTrue(_use_graph_scaled_warmup(self.make_config()))
 
+    def test_eager_defaults_to_single_sequence_decode_warmup(self):
+        with patch.dict(os.environ, {}, clear=True):
+            config = self.make_config(decode_cuda_graph=False)
+            self.assertEqual(_deltakv_graph_warmup_profile(config), "decode_1seq")
+            self.assertFalse(_use_graph_scaled_warmup(config))
+
     def test_deltakv_graph_warmup_can_reproduce_old_policy(self):
         with patch.dict(os.environ, {"SPARSEVLLM_DELTAKV_GRAPH_WARMUP": "prefill_only"}, clear=True):
             self.assertEqual(_deltakv_graph_warmup_profile(self.make_config()), "prefill_only")

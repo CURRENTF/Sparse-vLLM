@@ -25,7 +25,7 @@ def _deltakv_graph_warmup_profile(config: Config) -> str:
     graph_warmup = bool(getattr(config, "decode_cuda_graph", False))
     method = normalize_sparse_method(getattr(config, "vllm_sparse_method", "") or "")
     if not graph_warmup:
-        return "prefill_only"
+        return "decode_1seq"
     if method == "deltakv":
         warmup_policy = os.getenv("SPARSEVLLM_DELTAKV_GRAPH_WARMUP", "graph").strip().lower()
         if warmup_policy in ("eager", "minimal", "current", "prefill", "prefill_only"):
