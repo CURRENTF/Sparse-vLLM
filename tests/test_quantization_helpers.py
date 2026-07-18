@@ -1,8 +1,12 @@
+import tempfile
 import unittest
+from pathlib import Path
 
 import torch
+from safetensors.torch import save_file
 
 from deltakv.quantization import build_model_load_kwargs, restore_modules_to_dtype
+from sparsevllm.utils.loader import load_model
 
 
 class _DummyModel(torch.nn.Module):
@@ -17,7 +21,38 @@ class _DummyModel(torch.nn.Module):
         self.nested.v_compress_up = torch.nn.Linear(4, 4, bias=False, dtype=torch.float32)
 
 
+class _PackedBiasModel(torch.nn.Module):
+    packed_modules_mapping = {"k_proj": ("qkv_proj", "k")}
+
+    def __init__(self):
+        super().__init__()
+        self.model = torch.nn.Module()
+        self.model.layers = torch.nn.ModuleList([torch.nn.Module()])
+        self.model.layers[0].self_attn = torch.nn.Module()
+        self.model.layers[0].self_attn.qkv_proj = torch.nn.Linear(2, 2, bias=True)
+        bias = self.model.layers[0].self_attn.qkv_proj.bias
+
+        def weight_loader(param, loaded_weight, shard_id):
+            self.loaded_shard_id = shard_id
+            param.data.copy_(loaded_weight)
+
+        bias.weight_loader = weight_loader
+
+
 class QuantizationHelperTests(unittest.TestCase):
+    def test_load_model_accepts_bias_for_a_packed_projection(self):
+        model = _PackedBiasModel()
+        expected = torch.tensor([1.5, -2.0])
+        with tempfile.TemporaryDirectory() as tmp:
+            save_file(
+                {"model.layers.0.self_attn.k_proj.bias": expected},
+                str(Path(tmp) / "model.safetensors"),
+            )
+            load_model(model, tmp)
+
+        self.assertEqual(model.loaded_shard_id, "k")
+        torch.testing.assert_close(model.model.layers[0].self_attn.qkv_proj.bias, expected)
+
     def test_build_model_load_kwargs_for_4bit(self):
         runtime_cfg, load_kwargs, target_dtype = build_model_load_kwargs(
             {

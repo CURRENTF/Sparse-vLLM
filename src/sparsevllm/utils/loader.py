@@ -519,8 +519,11 @@ def load_model(model: nn.Module, path: str, *, rank: int | None = None, world_si
                         v, shard_id = packed_modules_mapping[k]
                         packed_param_name = param_name.replace(k, v)
                         module = _module_for_parameter(model, packed_param_name)
-                        scale_key = _scale_key_for_weight_key(source_weight_name)
-                        loaded_scale = f.get_tensor(scale_key) if scale_key in scale_keys else None
+                        scale_key = None
+                        loaded_scale = None
+                        if source_weight_name.endswith(".weight"):
+                            scale_key = _scale_key_for_weight_key(source_weight_name)
+                            loaded_scale = f.get_tensor(scale_key) if scale_key in scale_keys else None
                         if _load_grouped_quantized_weight(
                             model=model,
                             module=module,
