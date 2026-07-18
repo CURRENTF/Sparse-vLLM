@@ -322,6 +322,31 @@ def test_qwen35_rmsnorm_residual_path_uses_hf_offset_weight_semantics():
     assert torch.allclose(residual, merged)
 
 
+@pytest.mark.parametrize("with_residual", [False, True])
+def test_qwen35_rmsnorm_capture_uses_compiled_path(with_residual):
+    norm = Qwen35RMSNorm(4, eps=1.0e-6)
+    x = torch.ones((1, 4), dtype=torch.float32)
+    residual = torch.full_like(x, 2.0) if with_residual else None
+    expected = (torch.full_like(x, 3.0), residual) if with_residual else torch.full_like(x, 4.0)
+    compiled_name = "add_rms_forward" if with_residual else "rms_forward"
+    raw_name = "_add_rms_forward_impl" if with_residual else "_rms_forward_impl"
+
+    with (
+        patch("torch.cuda.is_available", return_value=True),
+        patch("torch.cuda.is_current_stream_capturing", return_value=True),
+        patch.object(norm, compiled_name, return_value=expected) as compiled,
+        patch.object(norm, raw_name, side_effect=AssertionError("capture bypassed the compiled RMSNorm path")),
+    ):
+        actual = norm(x, residual) if with_residual else norm(x)
+
+    compiled.assert_called_once()
+    if with_residual:
+        assert actual[0] is expected[0]
+        assert actual[1] is expected[1]
+    else:
+        assert actual is expected
+
+
 def test_qwen35_linear_attention_repeats_qk_to_value_heads():
     from sparsevllm.models.qwen3_5 import Qwen35LinearAttention
 

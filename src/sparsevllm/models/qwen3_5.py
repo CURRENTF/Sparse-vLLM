@@ -354,10 +354,6 @@ class Qwen35RMSNorm(nn.Module):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
-            if residual is None:
-                return self._rms_forward_impl(x)
-            return self._add_rms_forward_impl(x, residual)
         if residual is None:
             return self.rms_forward(x)
         return self.add_rms_forward(x, residual)
