@@ -75,6 +75,33 @@ class LongBenchDeltaKVContractsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "smaller than"):
             longbench_pred._prompt_token_budget(32, 64, 32)
 
+    def test_longbench_raw_artifact_preserves_model_prompt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            task_path = output_dir / "hotpotqa.jsonl"
+            longbench_pred._write_sample_record(
+                out_root=str(output_dir),
+                task_out_path=str(task_path),
+                record={
+                    "dataset": "hotpotqa",
+                    "sample_idx": 0,
+                    "source_idx": 3,
+                    "status": "success",
+                    "prompt_tokens": 4,
+                    "prompt": "final model prompt",
+                    "raw_pred": "Paris",
+                    "pred": "Paris",
+                    "answers": ["Paris"],
+                    "all_classes": [],
+                    "length": 4,
+                },
+            )
+
+            raw = json.loads(
+                (output_dir / "raw_outputs.jsonl").read_text(encoding="utf-8")
+            )
+            self.assertEqual(raw["prompt"], "final model prompt")
+
     def test_longbench_eval_rejects_skipped_task(self):
         with tempfile.TemporaryDirectory() as tmp:
             output_dir = Path(tmp)

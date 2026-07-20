@@ -182,6 +182,7 @@ def _write_sample_record(
             "source_idx",
             "status",
             "prompt_tokens",
+            "prompt",
             "raw_pred",
             "error",
             "traceback",
@@ -415,14 +416,14 @@ def get_pred(rank, data, dataset_info, args, model, tokenizer, model_max_length,
                             f"prompt_tokens={prompt_tokens}, budget={prompt_token_budget}."
                         )
                 prompts.append(prompt)
-                prepared_records.append(
-                    _sample_base_record(
-                        dataset=dataset,
-                        batch_offset=selected_idx,
-                        json_obj=json_obj,
-                        prompt_tokens=prompt_tokens,
-                    )
+                prepared = _sample_base_record(
+                    dataset=dataset,
+                    batch_offset=selected_idx,
+                    json_obj=json_obj,
+                    prompt_tokens=prompt_tokens,
                 )
+                prepared["prompt"] = prompt
+                prepared_records.append(prepared)
             except Exception as exc:
                 record = _sample_base_record(
                     dataset=dataset,
