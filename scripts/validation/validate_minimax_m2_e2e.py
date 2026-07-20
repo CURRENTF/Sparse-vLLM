@@ -34,7 +34,9 @@ DEBUG_ENV_KEYS = (
 
 
 class MetricFailure(RuntimeError):
-    pass
+    def __init__(self, message: str, *, metrics: dict[str, Any] | None = None):
+        super().__init__(message)
+        self.metrics = metrics
 
 
 class ParseFailure(RuntimeError):
@@ -213,17 +215,25 @@ def _compare_case(
     max_relative_l2: float,
     max_router_relative_l2: float,
 ) -> dict[str, Any]:
-    if actual["generated_token_ids"] != expected["generated_token_ids"]:
-        raise MetricFailure(
+    metrics: dict[str, Any] = {
+        "greedy_tokens": {
+            "exact": actual["generated_token_ids"]
+            == expected["generated_token_ids"],
+            "actual": actual["generated_token_ids"],
+            "expected": expected["generated_token_ids"],
+        }
+    }
+    failures = []
+    if not metrics["greedy_tokens"]["exact"]:
+        failures.append(
             "Greedy token mismatch: "
             f"actual={actual['generated_token_ids']}, "
             f"expected={expected['generated_token_ids']}."
         )
-    metrics: dict[str, Any] = {}
     logits_metrics = _relative_metrics(torch, actual["logits"], expected["logits"])
     metrics["logits"] = logits_metrics
     if logits_metrics["relative_l2_error"] > max_relative_l2:
-        raise MetricFailure(f"Logits correctness gate failed: {logits_metrics}.")
+        failures.append(f"Logits correctness gate failed: {logits_metrics}.")
 
     for group_name in ("hidden_states", "attention_states"):
         if group_name not in actual:
@@ -246,7 +256,7 @@ def _compare_case(
                     )
                     tensor_metrics[name] = result
                     if result["relative_l2_error"] > max_relative_l2:
-                        raise MetricFailure(
+                        failures.append(
                             f"{group_name}/{layer_idx}/{name} gate failed: {result}."
                         )
                 group_metrics[str(layer_idx)] = tensor_metrics
@@ -258,7 +268,7 @@ def _compare_case(
                 )
                 group_metrics[str(layer_idx)] = result
                 if result["relative_l2_error"] > max_relative_l2:
-                    raise MetricFailure(
+                    failures.append(
                         f"{group_name}/{layer_idx} gate failed: {result}."
                     )
         metrics[group_name] = group_metrics
@@ -271,9 +281,12 @@ def _compare_case(
             oracle_tensors = expected["moe_states"].get(layer_idx)
             if oracle_tensors is None:
                 raise MetricFailure(f"Oracle is missing MoE layer {layer_idx}.")
-            if not torch.equal(tensors["topk_ids"], oracle_tensors["topk_ids"]):
-                raise MetricFailure(f"Router expert IDs differ at layer {layer_idx}.")
-            layer_metrics = {}
+            topk_ids_exact = torch.equal(
+                tensors["topk_ids"], oracle_tensors["topk_ids"]
+            )
+            layer_metrics = {"topk_ids": {"exact": topk_ids_exact}}
+            if not topk_ids_exact:
+                failures.append(f"Router expert IDs differ at layer {layer_idx}.")
             for name in ("input", "router_logits", "topk_weights", "output"):
                 result = _relative_metrics(
                     torch,
@@ -287,11 +300,13 @@ def _compare_case(
                     else max_relative_l2
                 )
                 if result["relative_l2_error"] > threshold:
-                    raise MetricFailure(
+                    failures.append(
                         f"moe_states/{layer_idx}/{name} gate failed: {result}."
                     )
             moe_metrics[str(layer_idx)] = layer_metrics
         metrics["moe_states"] = moe_metrics
+    if failures:
+        raise MetricFailure(" ".join(failures), metrics=metrics)
     return metrics
 
 
@@ -851,6 +866,7 @@ def main() -> int:
         llm = LLM(str(args.model_path), **engine_kwargs)
 
         def run_case(case_id: str, prompts: list[list[int]]) -> dict[str, Any]:
+            request_result = None
             try:
                 request_result = _run_requests(
                     llm,
@@ -917,17 +933,37 @@ def main() -> int:
                 )
                 raise
             except MetricFailure as exc:
-                records.append(
-                    {
-                        "case_id": case_id,
-                        "status": "metric_failed",
-                        "prompt_length": len(prompts[0]),
-                        "batch_size": len(prompts),
-                        "error": repr(exc),
-                        "traceback": traceback.format_exc(),
-                    }
-                )
-                raise
+                record = {
+                    "case_id": case_id,
+                    "status": "metric_failed",
+                    "prompt_length": len(prompts[0]),
+                    "batch_size": len(prompts),
+                    "error": repr(exc),
+                    "traceback": traceback.format_exc(),
+                    "correctness_vs_oracle": exc.metrics,
+                }
+                if request_result is not None:
+                    record.update(
+                        {
+                            "generated_token_ids": request_result[
+                                "generated_token_ids"
+                            ],
+                            "prefix_cache_hit_lengths": request_result[
+                                "prefix_cache_hit_lengths"
+                            ],
+                            "cache_stats_delta": request_result["cache_stats_delta"],
+                            "graph_state_count": len(request_result["graph_states"]),
+                            "last_graph_state": (
+                                request_result["graph_states"][-1]
+                                if request_result["graph_states"]
+                                else None
+                            ),
+                        }
+                    )
+                records.append(record)
+                if request_result is None:
+                    raise
+                return request_result
             except Exception as exc:
                 records.append(
                     {
@@ -1033,11 +1069,21 @@ def main() -> int:
         invalid_statuses = sorted(set(statuses) - SAMPLE_STATUSES)
         if invalid_statuses:
             raise RuntimeError(f"Invalid result statuses: {invalid_statuses}.")
-        aggregate_status = (
-            "success"
-            if statuses and set(statuses) == {"success"}
-            else (statuses[-1] if statuses else "model_failed")
-        )
+        if any(status == "metric_failed" for status in statuses):
+            exit_code = 1
+        aggregate_status = "success"
+        for status in (
+            "model_failed",
+            "invalid_input",
+            "parse_failed",
+            "metric_failed",
+            "skipped_by_policy",
+        ):
+            if status in statuses:
+                aggregate_status = status
+                break
+        if not statuses:
+            aggregate_status = "model_failed"
         run_config["completed_at"] = datetime.now().astimezone().isoformat()
         aggregate = {
             "status": aggregate_status,
