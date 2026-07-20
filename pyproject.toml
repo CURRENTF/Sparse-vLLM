@@ -44,6 +44,9 @@ qwen35 = [
     "einops",
     "sglang-kernel @ https://github.com/sgl-project/whl/releases/download/v0.3.14.post1/sgl_kernel-0.3.14.post1%2Bcu128-cp310-abi3-manylinux2014_x86_64.whl",
 ]
+minimax_m2 = [
+    "kernels==0.15.2",
+]
 
 [project.scripts]
 deltakv-train = "deltakv.train_compressor:main"
