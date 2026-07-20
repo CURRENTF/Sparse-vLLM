@@ -550,6 +550,14 @@ class LLMEngine:
             )
         return snapshots
 
+    def debug_attention_states(self) -> dict[int, dict[str, torch.Tensor]]:
+        snapshots = self.model_runner.call("debug_attention_states_cpu")
+        if not isinstance(snapshots, dict):
+            raise RuntimeError(
+                f"Rank 0 did not return attention snapshots: {snapshots!r}."
+            )
+        return snapshots
+
     def debug_moe_states(self) -> dict[int, dict[str, torch.Tensor]]:
         snapshots = self.model_runner.call("debug_moe_states_cpu")
         if not isinstance(snapshots, dict):
