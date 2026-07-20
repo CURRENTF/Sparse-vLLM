@@ -2439,7 +2439,7 @@ class DeltaKVLessMemoryStorageContractTest(unittest.TestCase):
         self.assertIs(calls[0][0], key)
         torch.testing.assert_close(out, key + 7)
 
-    def test_rotary_embedding_forward_uses_single_eager_path(self):
+    def test_rotary_embedding_forward_uses_compiled_path(self):
         from sparsevllm.layers.rotary_embedding import RotaryEmbedding
 
         rotary_emb = RotaryEmbedding(head_size=4, rotary_dim=4, max_position_embeddings=2, base=10000.0)
@@ -2452,10 +2452,18 @@ class DeltaKVLessMemoryStorageContractTest(unittest.TestCase):
             calls.append((x, cos, sin))
             return x + len(calls)
 
-        with patch("sparsevllm.layers.rotary_embedding.apply_rotary_emb", fake_apply_rotary_emb):
+        unwrapped_forward = rotary_emb.compiled_forward.__wrapped__
+
+        def eager_forward(*args):
+            return unwrapped_forward(rotary_emb, *args)
+
+        with (
+            patch("sparsevllm.layers.rotary_embedding.apply_rotary_emb", fake_apply_rotary_emb),
+            patch.object(rotary_emb, "compiled_forward", wraps=eager_forward) as compiled,
+        ):
             query_out, key_out = rotary_emb(positions, query, key)
 
-        self.assertFalse(hasattr(rotary_emb, "compiled_forward"))
+        compiled.assert_called_once_with(positions, query, key)
         self.assertEqual(len(calls), 2)
         self.assertIs(calls[0][0], query)
         self.assertIs(calls[1][0], key)

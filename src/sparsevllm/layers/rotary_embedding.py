@@ -72,7 +72,8 @@ class RotaryEmbedding(nn.Module):
         cache = torch.cat((cos, sin), dim=-1).unsqueeze_(1)
         self.register_buffer("cos_sin_cache", cache, persistent=False)
 
-    def _forward_impl(
+    @torch.compile(fullgraph=True, dynamic=True)
+    def compiled_forward(
         self,
         positions: torch.Tensor,
         query: torch.Tensor,
@@ -90,7 +91,7 @@ class RotaryEmbedding(nn.Module):
         query: torch.Tensor,
         key: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return self._forward_impl(positions, query, key)
+        return self.compiled_forward(positions, query, key)
 
 
 @lru_cache(1)
