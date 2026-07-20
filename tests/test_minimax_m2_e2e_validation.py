@@ -45,7 +45,10 @@ def test_e2e_validator_compares_tokens_router_and_tensor_groups():
     assert metrics["logits"]["relative_l2_error"] == 0.0
 
     actual["generated_token_ids"] = [[2, 1]]
-    with pytest.raises(validation.MetricFailure, match="Greedy token mismatch"):
+    actual["hidden_states"][0] += 1.0
+    with pytest.raises(
+        validation.MetricFailure, match="Greedy token mismatch"
+    ) as error:
         validation._compare_case(
             torch,
             actual,
@@ -53,6 +56,9 @@ def test_e2e_validator_compares_tokens_router_and_tensor_groups():
             max_relative_l2=0.1,
             max_router_relative_l2=1.0e-4,
         )
+    assert error.value.metrics["greedy_tokens"]["exact"] is False
+    assert error.value.metrics["hidden_states"]["0"]["relative_l2_error"] > 0.1
+    assert error.value.metrics["moe_states"]["0"]["topk_ids"]["exact"] is True
 
 
 def test_e2e_validator_checks_prefix_hits_and_graph_key_reuse():
