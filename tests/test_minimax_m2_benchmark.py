@@ -78,3 +78,12 @@ def test_minimax_benchmark_report_records_cold_and_steady_metrics(tmp_path):
     assert "12.000" in report
     assert "1.500" in report
     assert "1.000000e-02" in report
+
+
+def test_minimax_benchmark_aggregate_preserves_earlier_failure():
+    assert benchmark._aggregate_status(
+        [
+            {"status": "metric_failed"},
+            {"status": "success"},
+        ]
+    ) == "metric_failed"

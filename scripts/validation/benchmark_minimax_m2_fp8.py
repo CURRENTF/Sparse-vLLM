@@ -29,10 +29,6 @@ SAMPLE_STATUSES = {
 }
 
 
-class MetricFailure(RuntimeError):
-    pass
-
-
 def _parse_int_csv(value: str) -> list[int]:
     values = [int(part.strip()) for part in value.split(",") if part.strip()]
     if not values or any(item <= 0 for item in values):
@@ -150,6 +146,22 @@ def _tensor_summary(tensor) -> dict[str, Any]:
         "abs_mean": float(values.abs().mean()),
         "finite": bool(values.isfinite().all()),
     }
+
+
+def _aggregate_status(records: list[dict[str, Any]]) -> str:
+    statuses = [record["status"] for record in records]
+    if statuses and set(statuses) == {"success"}:
+        return "success"
+    for status in (
+        "model_failed",
+        "invalid_input",
+        "parse_failed",
+        "metric_failed",
+        "skipped_by_policy",
+    ):
+        if status in statuses:
+            return status
+    return "model_failed"
 
 
 def _parallel_context(local_experts: int):
@@ -632,19 +644,14 @@ def main() -> int:
                     records.append(record)
                     parsed_outputs[f"{case_id}/{backend}"] = _tensor_summary(output)
                     raw_outputs[f"{case_id}/{backend}"] = output[:2].detach().cpu()
-                    if record["status"] != "success":
-                        raise MetricFailure(
-                            f"Correctness gate failed for {case_id}/{backend}: "
-                            f"{record['correctness_vs_reference']}."
-                        )
                     del experts, output
                     torch.cuda.empty_cache()
                 if reference_output is not None:
                     del reference_output
                 del case
                 torch.cuda.empty_cache()
-    except MetricFailure:
-        exit_code = 1
+        if any(record["status"] == "metric_failed" for record in records):
+            exit_code = 1
     except (ValueError, FileNotFoundError) as exc:
         exit_code = 2
         records.append(
@@ -669,9 +676,7 @@ def main() -> int:
         statuses = [record["status"] for record in records]
         if any(status not in SAMPLE_STATUSES for status in statuses):
             raise RuntimeError(f"Invalid result statuses: {statuses}.")
-        aggregate_status = "success" if statuses and set(statuses) == {"success"} else (
-            statuses[-1] if statuses else "model_failed"
-        )
+        aggregate_status = _aggregate_status(records)
         run_config["completed_at"] = datetime.now().astimezone().isoformat()
         _write_json(args.output_dir / "run_config.json", run_config)
         _write_json(args.output_dir / "parsed_outputs.json", parsed_outputs)
