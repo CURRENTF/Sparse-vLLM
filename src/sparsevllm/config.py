@@ -417,7 +417,7 @@ _MINIMAX_M2_FIXED_FIELDS = {
     "rotary_dim": 64,
     "num_local_experts": 256,
     "num_experts_per_tok": 8,
-    "max_position_embeddings": 196608,
+    "max_position_embeddings": 204800,
     "shared_intermediate_size": 0,
     "mtp_transformer_layers": 1,
     "num_mtp_modules": 3,
