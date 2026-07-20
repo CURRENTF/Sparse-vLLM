@@ -701,6 +701,7 @@ class ModelRunner:
             block = _debug_moe_block(layer)
             required = {
                 "input": getattr(block, "debug_last_input", None),
+                "router_logits": getattr(block, "debug_last_router_logits", None),
                 "topk_ids": getattr(block, "debug_last_topk_ids", None),
                 "topk_weights": getattr(block, "debug_last_topk_weights", None),
                 "output": getattr(block, "debug_last_output", None),

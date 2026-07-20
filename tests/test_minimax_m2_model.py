@@ -249,6 +249,10 @@ def test_minimax_moe_debug_state_is_available_through_model_runner(monkeypatch):
 
     assert set(snapshots) == {0}
     assert torch.equal(snapshots[0]["input"], hidden_states)
+    assert snapshots[0]["router_logits"].shape == (
+        3,
+        config.num_local_experts,
+    )
     assert snapshots[0]["topk_ids"].shape == (3, config.num_experts_per_tok)
     assert snapshots[0]["topk_weights"].shape == (3, config.num_experts_per_tok)
     assert snapshots[0]["output"].shape == hidden_states.shape
