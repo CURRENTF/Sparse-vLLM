@@ -8,7 +8,10 @@ from sparsevllm.quantization.fp8 import (
     fp8_blockwise_dequantize,
     fp8_blockwise_linear_reference,
 )
-from sparsevllm.triton_kernel.minimax_m2_moe_fp8 import fused_moe_fp8
+from sparsevllm.triton_kernel.minimax_m2_moe_fp8 import (
+    _expert_order_moe_sum,
+    fused_moe_fp8,
+)
 
 
 def _inputs():
@@ -167,6 +170,56 @@ def test_routed_fp8_matches_explicit_dequant_oracle():
     )
     relative_l2 = torch.linalg.vector_norm(error) / torch.linalg.vector_norm(expected)
     assert float(relative_l2) < 0.06
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for this test.")
+def test_expert_order_sum_matches_official_bf16_accumulation():
+    torch.manual_seed(23)
+    num_tokens = 5
+    num_experts = 8
+    hidden_size = 128
+    topk_ids = torch.stack(
+        [
+            torch.randperm(num_experts, device="cuda")
+            for _ in range(num_tokens)
+        ]
+    ).contiguous()
+    slot_scales = torch.tensor(
+        [1.0, 0.01, -1.0, 0.005, 0.5, -0.5, 0.02, -0.02],
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    inputs = (
+        torch.randn(
+            num_tokens,
+            num_experts,
+            hidden_size,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        * slot_scales[None, :, None]
+    ).contiguous()
+
+    expected = torch.zeros(
+        num_tokens,
+        hidden_size,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    for expert_id in range(num_experts):
+        token_ids, topk_slots = torch.where(topk_ids == expert_id)
+        expected.index_add_(0, token_ids, inputs[token_ids, topk_slots])
+
+    actual = _expert_order_moe_sum(
+        inputs,
+        topk_ids,
+        num_experts=num_experts,
+        local_expert_start=0,
+        local_expert_end=num_experts,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(actual, expected)
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for this test.")

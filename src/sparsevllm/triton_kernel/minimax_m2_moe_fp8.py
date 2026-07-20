@@ -2,12 +2,135 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 
 from sparsevllm.quantization.fp8 import load_finegrained_fp8_kernel
-from sparsevllm.triton_kernel.moe import moe_sum
 
 
 _SUPPORTED_ACTIVATION_DTYPES = (torch.bfloat16, torch.float16)
+
+
+@triton.jit(
+    do_not_specialize=[
+        "num_tokens",
+        "num_experts",
+        "local_expert_start",
+        "local_expert_end",
+    ]
+)
+def _expert_order_moe_sum_kernel(
+    inputs_ptr,
+    topk_ids_ptr,
+    output_ptr,
+    num_tokens,
+    num_experts,
+    local_expert_start,
+    local_expert_end,
+    hidden_size: tl.constexpr,
+    top_k: tl.constexpr,
+    stride_im,
+    stride_ik,
+    stride_in,
+    stride_om,
+    stride_on,
+    OUTPUT_BF16: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+):
+    token_offsets = tl.program_id(0) * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    hidden_offsets = tl.program_id(1) * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    topk_slots = tl.arange(0, top_k)
+    valid_tokens = token_offsets < num_tokens
+    output_mask = valid_tokens[:, None] & (
+        hidden_offsets[None, :] < hidden_size
+    )
+
+    expert_ids = tl.load(
+        topk_ids_ptr
+        + token_offsets[:, None] * top_k
+        + topk_slots[None, :],
+        mask=valid_tokens[:, None],
+        other=num_experts,
+    ).to(tl.int32)
+    packed = expert_ids * (top_k + 1) + topk_slots[None, :]
+    packed = tl.sort(packed, dim=1)
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for expert_order in tl.static_range(top_k):
+        selected = packed[:, expert_order]
+        expert_id = selected // (top_k + 1)
+        topk_slot = selected % (top_k + 1)
+        is_local = valid_tokens & (expert_id >= local_expert_start) & (
+            expert_id < local_expert_end
+        )
+        values = tl.load(
+            inputs_ptr
+            + token_offsets[:, None] * stride_im
+            + topk_slot[:, None] * stride_ik
+            + hidden_offsets[None, :] * stride_in,
+            mask=output_mask & is_local[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        rounded = accumulator + values
+        if OUTPUT_BF16:
+            rounded = rounded.to(tl.bfloat16).to(tl.float32)
+        else:
+            rounded = rounded.to(tl.float16).to(tl.float32)
+        accumulator = tl.where(is_local[:, None], rounded, accumulator)
+
+    tl.store(
+        output_ptr
+        + token_offsets[:, None] * stride_om
+        + hidden_offsets[None, :] * stride_on,
+        accumulator,
+        mask=output_mask,
+    )
+
+
+def _expert_order_moe_sum(
+    inputs: torch.Tensor,
+    topk_ids: torch.Tensor,
+    *,
+    num_experts: int,
+    local_expert_start: int,
+    local_expert_end: int,
+) -> torch.Tensor:
+    num_tokens, top_k, hidden_size = (int(dim) for dim in inputs.shape)
+    if top_k <= 0 or top_k & (top_k - 1):
+        raise ValueError(
+            "MiniMax expert-order sum requires power-of-two top_k, "
+            f"got {top_k}."
+        )
+    block_m = 1 if num_tokens <= 4 else 8
+    block_n = 128
+    output = torch.empty_like(inputs[:, 0])
+    grid = (
+        triton.cdiv(num_tokens, block_m),
+        triton.cdiv(hidden_size, block_n),
+    )
+    _expert_order_moe_sum_kernel[grid](
+        inputs,
+        topk_ids,
+        output,
+        num_tokens,
+        int(num_experts),
+        int(local_expert_start),
+        int(local_expert_end),
+        hidden_size=hidden_size,
+        top_k=top_k,
+        stride_im=inputs.stride(0),
+        stride_ik=inputs.stride(1),
+        stride_in=inputs.stride(2),
+        stride_om=output.stride(0),
+        stride_on=output.stride(1),
+        OUTPUT_BF16=inputs.dtype == torch.bfloat16,
+        BLOCK_SIZE_M=block_m,
+        BLOCK_SIZE_N=block_n,
+        num_warps=4 if block_m <= 4 else 8,
+        num_stages=2,
+    )
+    return output
 
 
 def _validate_fused_moe_fp8_inputs(
@@ -185,11 +308,10 @@ def fused_moe_fp8(
         [128, 128],
     )
     weighted = down * topk_weights.reshape(-1, 1).to(down.dtype)
-    return moe_sum(
+    return _expert_order_moe_sum(
         weighted.view(num_tokens, top_k, hidden_states.shape[1]),
         topk_ids,
         num_experts=num_experts,
         local_expert_start=local_expert_start,
         local_expert_end=local_expert_end,
-        output_dtype=hidden_states.dtype,
     )
