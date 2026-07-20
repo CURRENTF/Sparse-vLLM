@@ -58,7 +58,10 @@ def _expert_order_moe_sum_kernel(
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for expert_order in tl.static_range(top_k):
-        selected = packed[:, expert_order]
+        selected = tl.sum(
+            tl.where(topk_slots[None, :] == expert_order, packed, 0),
+            axis=1,
+        )
         expert_id = selected // (top_k + 1)
         topk_slot = selected % (top_k + 1)
         is_local = valid_tokens & (expert_id >= local_expert_start) & (
