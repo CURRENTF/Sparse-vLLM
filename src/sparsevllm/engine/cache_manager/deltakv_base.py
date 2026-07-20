@@ -19,7 +19,7 @@ from sparsevllm.layers.rotary_embedding import get_rope, apply_rotary_emb
 from sparsevllm.platforms import device_runtime
 
 from .base import CacheManager, DecodeComputeView, LayerBatchStates, PrefillComputeView, SparseSelection
-from .raw_kv_offload import RawKVOffloadBuffer, resolve_long_prefill_offload_threshold
+from .raw_kv_offload import RawKVOffloadBuffer
 
 
 @dataclass(frozen=True)
@@ -293,28 +293,13 @@ class DeltaKVCacheManager(CacheManager):
         return torch.tensor(rel, dtype=torch.long, device=self.device)
 
     def _should_use_full_prefill_staging(self, seqs: list[Sequence]) -> bool:
-        # DeltaKV's public prefill policy is long_bs1full_short_batch. Most long
-        # prompts are isolated into a single-sequence full-prefill staging step.
-        # Ultra-long prompts may instead use the same policy with an internal
-        # RawKV offload staging path, so the scheduler chunks the long prompt
-        # while DeltaKV keeps eviction/compression postponed until the final chunk.
-        policy = getattr(self.config, "prefill_schedule_policy", None)
-        if policy != PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH:
-            return False
-        if not self.deltakv_layer_ids or len(seqs) != 1:
-            return False
-        seq = seqs[0]
-        if self.requires_long_prefill_offload(seq):
-            return False
-        remaining = int(seq.num_prompt_tokens - seq.num_prefilled_tokens)
-        return (
-            int(seq.num_prefilled_tokens) == 0
-            and int(seq.current_chunk_size) == remaining
-            and remaining > int(self.config.chunk_prefill_size)
-        )
+        # Base DeltaKV has no middle full-prefill region: prompts above the
+        # chunk boundary use RawKV offload. Subclasses may stage short prefills
+        # for method-specific storage formats.
+        return False
 
     def _long_prefill_offload_threshold(self) -> int:
-        return resolve_long_prefill_offload_threshold(self.config.max_num_batched_tokens)
+        return int(self.config.chunk_prefill_size)
 
     def requires_long_prefill_offload(self, seq: Sequence) -> bool:
         if (

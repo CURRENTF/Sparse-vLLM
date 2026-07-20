@@ -186,11 +186,17 @@ class CacheManager(ABC):
         estimated_max_tokens = int(reserved_mem / (intermediate_size_per_rank * dtype_size * 4))
         allow_large_prefill_chunk = os.getenv("SPARSEVLLM_ALLOW_LARGE_PREFILL_CHUNK", "0") == "1"
         prefill_policy = getattr(config, "prefill_schedule_policy", None)
-        chunk_guard_multiplier = 1 if prefill_policy == "long_bs1full_short_batch" else 2
-        guarded_chunk_tokens = chunk_guard_multiplier * int(config.chunk_prefill_size)
-        if guarded_chunk_tokens >= estimated_max_tokens:
+        if estimated_max_tokens <= 0:
+            raise RuntimeError(
+                "Estimated prefill token capacity must be positive: "
+                f"estimated_max_tokens={estimated_max_tokens}."
+            )
+        if (
+            prefill_policy == "long_bs1full_short_batch"
+            and int(config.chunk_prefill_size) > estimated_max_tokens
+        ):
             msg = (
-                f"{chunk_guard_multiplier}*chunk_prefill_size={guarded_chunk_tokens} >= "
+                f"chunk_prefill_size={int(config.chunk_prefill_size)} > "
                 f"estimated_max_tokens={estimated_max_tokens} "
                 f"(prefill_schedule_policy={prefill_policy!r})"
             )

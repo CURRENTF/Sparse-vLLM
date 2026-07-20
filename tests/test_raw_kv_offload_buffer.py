@@ -1,66 +1,11 @@
 import unittest
-from unittest.mock import patch
 
 import torch
 
-from sparsevllm.engine.cache_manager.raw_kv_offload import (
-    RawKVOffloadBuffer,
-    resolve_long_prefill_offload_min_tokens,
-    resolve_long_prefill_offload_threshold,
-)
+from sparsevllm.engine.cache_manager.raw_kv_offload import RawKVOffloadBuffer
 
 
 class RawKVOffloadBufferTest(unittest.TestCase):
-    def test_resolve_long_prefill_offload_min_tokens(self):
-        with patch.dict("os.environ", {}, clear=True):
-            self.assertEqual(resolve_long_prefill_offload_min_tokens(), 262144)
-
-        with patch.dict(
-            "os.environ",
-            {"SPARSEVLLM_LONG_PREFILL_OFFLOAD_MIN_TOKENS": "123"},
-            clear=True,
-        ):
-            self.assertEqual(resolve_long_prefill_offload_min_tokens(), 123)
-
-        with patch.dict(
-            "os.environ",
-            {"SPARSEVLLM_DEFERRED_PREFILL_MIN_TOKENS": "456"},
-            clear=True,
-        ):
-            self.assertEqual(resolve_long_prefill_offload_min_tokens(), 456)
-
-        with patch.dict(
-            "os.environ",
-            {
-                "SPARSEVLLM_LONG_PREFILL_OFFLOAD_MIN_TOKENS": "123",
-                "SPARSEVLLM_DEFERRED_PREFILL_MIN_TOKENS": "456",
-            },
-            clear=True,
-        ):
-            with self.assertRaisesRegex(ValueError, "both set"):
-                resolve_long_prefill_offload_min_tokens()
-
-    def test_offload_threshold_cannot_exceed_step_token_cap(self):
-        with patch.dict("os.environ", {}, clear=True):
-            self.assertEqual(resolve_long_prefill_offload_threshold(65536), 65536)
-
-        with patch.dict(
-            "os.environ",
-            {"SPARSEVLLM_LONG_PREFILL_OFFLOAD_MIN_TOKENS": "32768"},
-            clear=True,
-        ):
-            self.assertEqual(resolve_long_prefill_offload_threshold(65536), 32768)
-
-        with patch.dict(
-            "os.environ",
-            {"SPARSEVLLM_LONG_PREFILL_OFFLOAD_MIN_TOKENS": "131072"},
-            clear=True,
-        ):
-            self.assertEqual(resolve_long_prefill_offload_threshold(65536), 65536)
-
-        with self.assertRaisesRegex(ValueError, "max_num_batched_tokens"):
-            resolve_long_prefill_offload_threshold(0)
-
     def test_chunked_mode_is_default(self):
         buffer = RawKVOffloadBuffer(pin_memory=False)
 

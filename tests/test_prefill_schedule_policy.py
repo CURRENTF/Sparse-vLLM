@@ -449,6 +449,75 @@ class PrefillPolicyConfigTest(unittest.TestCase):
         )
         self.assertEqual(cfg.prefill_schedule_policy, PREFILL_POLICY_ALL_CHUNKED)
 
+    def test_all_chunked_keeps_configured_batch_cap_below_chunk_size(self):
+        cfg = self.make_config(
+            vllm_sparse_method="vanilla",
+            max_num_batched_tokens=1024,
+            chunk_prefill_size=4096,
+        )
+
+        self.assertEqual(cfg.max_num_batched_tokens, 1024)
+        self.assertEqual(cfg.chunk_prefill_size, 4096)
+
+    def test_all_chunked_keeps_8192_default_chunk_size(self):
+        cfg = self.make_config(vllm_sparse_method="vanilla")
+
+        self.assertEqual(cfg.chunk_prefill_size, 8192)
+
+    def test_all_chunked_ignores_long_prefill_offload_env(self):
+        with patch.dict(
+            os.environ,
+            {"SPARSEVLLM_LONG_PREFILL_OFFLOAD_MIN_TOKENS": "not-an-integer"},
+            clear=True,
+        ):
+            cfg = self.make_config(
+                vllm_sparse_method="vanilla",
+                chunk_prefill_size=4096,
+            )
+
+        self.assertEqual(cfg.chunk_prefill_size, 4096)
+
+    def test_long_policy_derives_chunk_and_batch_cap_from_offload_threshold(self):
+        with patch.dict(os.environ, {}, clear=True):
+            cfg = self.make_config(
+                vllm_sparse_method="pyramidkv",
+                max_num_batched_tokens=1024,
+                chunk_prefill_size=4096,
+                long_prefill_offload_threshold=8192,
+            )
+
+        self.assertEqual(cfg.long_prefill_offload_threshold, 8192)
+        self.assertEqual(cfg.chunk_prefill_size, 8192)
+        self.assertEqual(cfg.max_num_batched_tokens, 8192)
+
+    def test_long_policy_offload_threshold_defaults_to_96k(self):
+        with patch.dict(os.environ, {}, clear=True):
+            cfg = self.make_config(vllm_sparse_method="pyramidkv")
+
+        self.assertEqual(cfg.long_prefill_offload_threshold, 96 * 1024)
+        self.assertEqual(cfg.chunk_prefill_size, 96 * 1024)
+        self.assertEqual(cfg.max_num_batched_tokens, 96 * 1024)
+
+    def test_long_policy_offload_threshold_env_overrides_config(self):
+        with patch.dict(
+            os.environ,
+            {"SPARSEVLLM_LONG_PREFILL_OFFLOAD_MIN_TOKENS": "12288"},
+            clear=True,
+        ):
+            cfg = self.make_config(
+                vllm_sparse_method="pyramidkv",
+                long_prefill_offload_threshold=8192,
+            )
+
+        self.assertEqual(cfg.long_prefill_offload_threshold, 12288)
+        self.assertEqual(cfg.chunk_prefill_size, 12288)
+
+    def test_prefill_token_limits_must_be_positive(self):
+        with self.assertRaisesRegex(ValueError, "max_num_batched_tokens must be > 0"):
+            self.make_config(vllm_sparse_method="vanilla", max_num_batched_tokens=0)
+        with self.assertRaisesRegex(ValueError, "chunk_prefill_size must be > 0"):
+            self.make_config(vllm_sparse_method="vanilla", chunk_prefill_size=0)
+
     def test_explicit_mismatched_policy_fails_fast(self):
         with self.assertRaisesRegex(ValueError, "registry default"):
             self.make_config(
@@ -1033,6 +1102,23 @@ class DeltaKVLessMemoryCudaGraphReserveTest(unittest.TestCase):
 
 
 class SchedulerPrefillPolicyTest(unittest.TestCase):
+    def test_model_runner_uses_policy_chunk_as_long_prefill_boundary(self):
+        runner = object.__new__(ModelRunner)
+        runner.config = SimpleNamespace(
+            prefill_schedule_policy=PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
+            chunk_prefill_size=8192,
+            vllm_sparse_method="pyramidkv",
+            num_sink_tokens=64,
+            num_recent_tokens=128,
+            decode_keep_tokens=4096,
+        )
+
+        self.assertEqual(ModelRunner._long_text_threshold(runner, is_prefill=True), 8192)
+        self.assertEqual(
+            ModelRunner._long_text_threshold(runner, is_prefill=False),
+            64 + 128 + 4096,
+        )
+
     def test_all_chunked_keeps_long_and_short_separate(self):
         scheduler = make_scheduler(PREFILL_POLICY_ALL_CHUNKED, method="")
         long_seq = seq_with_len(20)
@@ -1059,26 +1145,23 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
         self.assertTrue(is_prefill)
         self.assertTrue(all(seq.current_chunk_size <= 5 for seq in scheduled))
 
-    def test_long_bs1full_policy_schedules_long_as_single_full_prefill(self):
+    def test_all_chunked_uses_batch_cap_when_it_is_below_chunk_size(self):
         scheduler = make_scheduler(
-            PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
-            method="deltakv",
-            chunk=5,
-            max_tokens=10,
+            PREFILL_POLICY_ALL_CHUNKED,
+            method="",
+            chunk=8,
+            max_tokens=4,
         )
-        long_a = seq_with_len(20)
-        long_b = seq_with_len(30)
-        scheduler.add(long_a)
-        scheduler.add(long_b)
+        seq = seq_with_len(8)
+        scheduler.add(seq)
 
         scheduled, is_prefill, _ = scheduler.schedule()
 
         self.assertTrue(is_prefill)
-        self.assertEqual(scheduled, [long_a])
-        self.assertEqual(long_a.current_chunk_size, 20)
-        self.assertEqual(long_b.current_chunk_size, None)
+        self.assertEqual(scheduled, [seq])
+        self.assertEqual(seq.current_chunk_size, 4)
 
-    def test_long_bs1full_policy_chunks_long_when_offload_required(self):
+    def test_long_bs1full_policy_chunks_long_as_single_offload_prefill(self):
         scheduler = make_scheduler(
             PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
             method="deltakv",
@@ -1098,7 +1181,27 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
         self.assertEqual(long_a.current_chunk_size, 5)
         self.assertEqual(long_b.current_chunk_size, None)
 
-    def test_long_bs1full_policy_keeps_non_offloaded_long_as_full_prefill(self):
+    def test_long_bs1full_policy_chunks_long_when_offload_required(self):
+        scheduler = make_scheduler(
+            PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
+            method="pyramidkv",
+            chunk=5,
+            max_tokens=10,
+            oracle=FakeMemoryOracle(long_prefill_offload=True),
+        )
+        long_a = seq_with_len(20)
+        long_b = seq_with_len(30)
+        scheduler.add(long_a)
+        scheduler.add(long_b)
+
+        scheduled, is_prefill, _ = scheduler.schedule()
+
+        self.assertTrue(is_prefill)
+        self.assertEqual(scheduled, [long_a])
+        self.assertEqual(long_a.current_chunk_size, 5)
+        self.assertEqual(long_b.current_chunk_size, None)
+
+    def test_long_bs1full_policy_keeps_chunk_boundary_in_short_mode(self):
         scheduler = make_scheduler(
             PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
             method="deltakv",
@@ -1106,14 +1209,14 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
             max_tokens=10,
             oracle=FakeMemoryOracle(long_prefill_offload=False),
         )
-        long_seq = seq_with_len(20)
-        scheduler.add(long_seq)
+        boundary_seq = seq_with_len(5)
+        scheduler.add(boundary_seq)
 
         scheduled, is_prefill, _ = scheduler.schedule()
 
         self.assertTrue(is_prefill)
-        self.assertEqual(scheduled, [long_seq])
-        self.assertEqual(long_seq.current_chunk_size, 20)
+        self.assertEqual(scheduled, [boundary_seq])
+        self.assertEqual(boundary_seq.current_chunk_size, 5)
 
     def test_long_bs1full_policy_batches_short_chunked_prefill(self):
         scheduler = make_scheduler(
@@ -1455,13 +1558,12 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
 
         seq = seq_with_len(2048)
         seq.current_chunk_size = 1024
-        with patch.dict(os.environ, {"SPARSEVLLM_LONG_PREFILL_OFFLOAD_MIN_TOKENS": "1"}, clear=False):
-            self.assertTrue(SnapKVCacheManager.requires_long_prefill_offload(manager, seq))
-            self.assertFalse(SnapKVCacheManager.requires_full_prefill_step(manager, seq))
-            self.assertFalse(SnapKVCacheManager._should_use_pyramidkv_full_prefill_staging(manager, [seq]))
-            self.assertTrue(SnapKVCacheManager._should_use_pyramidkv_long_prefill_offload_staging(manager, [seq]))
+        self.assertTrue(SnapKVCacheManager.requires_long_prefill_offload(manager, seq))
+        self.assertFalse(SnapKVCacheManager.requires_full_prefill_step(manager, seq))
+        self.assertFalse(SnapKVCacheManager._should_use_pyramidkv_full_prefill_staging(manager, [seq]))
+        self.assertTrue(SnapKVCacheManager._should_use_pyramidkv_long_prefill_offload_staging(manager, [seq]))
 
-    def test_long_prefill_step_cap_forces_offload_below_default_threshold(self):
+    def test_long_prefill_offload_threshold_equals_chunk_size(self):
         pyramid = object.__new__(SnapKVCacheManager)
         pyramid.config = SimpleNamespace(
             vllm_sparse_method="pyramidkv",
@@ -1480,11 +1582,13 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
             max_num_batched_tokens=128000,
         )
 
-        seq = seq_with_len(128000)
-        with patch.dict(os.environ, {}, clear=True):
-            self.assertTrue(SnapKVCacheManager.requires_long_prefill_offload(pyramid, seq))
-            self.assertFalse(SnapKVCacheManager.requires_full_prefill_step(pyramid, seq))
-            self.assertTrue(DeltaKVCacheManager.requires_long_prefill_offload(deltakv, seq))
+        boundary_seq = seq_with_len(4096)
+        long_seq = seq_with_len(4097)
+        self.assertFalse(SnapKVCacheManager.requires_long_prefill_offload(pyramid, boundary_seq))
+        self.assertFalse(DeltaKVCacheManager.requires_long_prefill_offload(deltakv, boundary_seq))
+        self.assertTrue(SnapKVCacheManager.requires_long_prefill_offload(pyramid, long_seq))
+        self.assertFalse(SnapKVCacheManager.requires_full_prefill_step(pyramid, long_seq))
+        self.assertTrue(DeltaKVCacheManager.requires_long_prefill_offload(deltakv, long_seq))
 
     def test_pyramidkv_long_prefill_offload_restores_prefix_to_staging(self):
         from sparsevllm.engine.cache_manager.raw_kv_offload import RawKVOffloadBuffer
@@ -1681,8 +1785,8 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
             oracle=FakeMemoryOracle(step_free_slots=10_000, force_whole_prefill=True),
         )
         scheduler.decode_keep_tokens = 4096
-        seq_a = seq_with_len(4258)
-        seq_b = seq_with_len(4258)
+        seq_a = seq_with_len(4000)
+        seq_b = seq_with_len(4000)
         scheduler.add(seq_a)
         scheduler.add(seq_b)
 
@@ -1690,8 +1794,8 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
 
         self.assertTrue(is_prefill)
         self.assertEqual(scheduled, [seq_a, seq_b])
-        self.assertEqual(seq_a.current_chunk_size, 4258)
-        self.assertEqual(seq_b.current_chunk_size, 4258)
+        self.assertEqual(seq_a.current_chunk_size, 4000)
+        self.assertEqual(seq_b.current_chunk_size, 4000)
 
     def test_prefix_cache_hit_reduces_prefill_work_for_fresh_prompt(self):
         oracle = FakeMemoryOracle(prefix_hit_len=8, prefix_hit_blocks=2)
@@ -1907,31 +2011,23 @@ class DeltaKVFullPrefillStagingTest(unittest.TestCase):
         manager._deltakv_long_prefill_offload_is_last_chunk = False
         return manager
 
-    def test_raw_full_layer_full_prefill_staging_uses_persistent_slots(self):
+    def test_raw_full_layer_short_prefill_uses_persistent_slots(self):
         manager = self._make_raw_deltakv_prefill_manager()
-        seq = seq_with_len(4)
-        seq.current_chunk_size = 4
+        seq = seq_with_len(2)
+        seq.current_chunk_size = 2
 
-        with patch.dict(
-            os.environ,
-            {
-                "SPARSEVLLM_LONG_PREFILL_OFFLOAD_MIN_TOKENS": "999999",
-                "SPARSEVLLM_DEFERRED_PREFILL_MIN_TOKENS": "999999",
-            },
-            clear=False,
-        ):
-            DeltaKVCacheManager._prepare_prefill(manager, [seq])
+        DeltaKVCacheManager._prepare_prefill(manager, [seq])
 
         row_idx = manager.seq_id_to_row[seq.seq_id]
-        persistent_slots = manager.full_layer_slots_map[row_idx, :4].clone()
+        persistent_slots = manager.full_layer_slots_map[row_idx, :2].clone()
         torch.testing.assert_close(manager.full_layer_batch_states.slot_mapping, persistent_slots)
         self.assertNotEqual(
             manager.full_layer_batch_states.slot_mapping.tolist(),
-            torch.arange(4, dtype=torch.int32).tolist(),
+            torch.arange(2, dtype=torch.int32).tolist(),
         )
         torch.testing.assert_close(
             manager.deltakv_layer_batch_states.slot_mapping,
-            torch.arange(4, dtype=torch.int32),
+            manager.sparse_layer_raw_slots_map[row_idx, :2],
         )
 
     def test_raw_full_layer_long_offload_staging_uses_persistent_slots(self):
@@ -1939,15 +2035,7 @@ class DeltaKVFullPrefillStagingTest(unittest.TestCase):
         seq = seq_with_len(6)
         seq.current_chunk_size = 2
 
-        with patch.dict(
-            os.environ,
-            {
-                "SPARSEVLLM_LONG_PREFILL_OFFLOAD_MIN_TOKENS": "1",
-                "SPARSEVLLM_DEFERRED_PREFILL_MIN_TOKENS": "1",
-            },
-            clear=False,
-        ):
-            DeltaKVCacheManager._prepare_prefill(manager, [seq])
+        DeltaKVCacheManager._prepare_prefill(manager, [seq])
 
         row_idx = manager.seq_id_to_row[seq.seq_id]
         persistent_slots = manager.full_layer_slots_map[row_idx, :2].clone()
@@ -2036,7 +2124,7 @@ class DeltaKVFullPrefillStagingTest(unittest.TestCase):
         self.assertIsNone(manager._deltakv_view_cache_key)
         self.assertIsNone(manager._deltakv_view_cache_value)
 
-    def test_full_prefill_staging_only_for_single_complete_long_prefill(self):
+    def test_base_deltakv_has_no_middle_full_prefill_staging(self):
         manager = object.__new__(DeltaKVCacheManager)
         manager.config = SimpleNamespace(
             prefill_schedule_policy=PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
@@ -2046,23 +2134,9 @@ class DeltaKVFullPrefillStagingTest(unittest.TestCase):
         manager.deltakv_layer_ids = [0]
         seq = seq_with_len(20)
 
-        seq.current_chunk_size = 20
-        self.assertTrue(DeltaKVCacheManager._should_use_full_prefill_staging(manager, [seq]))
-
         seq.current_chunk_size = 5
         self.assertFalse(DeltaKVCacheManager._should_use_full_prefill_staging(manager, [seq]))
-
-        seq.current_chunk_size = 20
-        seq.num_prefilled_tokens = 5
-        self.assertFalse(DeltaKVCacheManager._should_use_full_prefill_staging(manager, [seq]))
-
-        seq.num_prefilled_tokens = 0
-        other = seq_with_len(20)
-        other.current_chunk_size = 20
-        self.assertFalse(DeltaKVCacheManager._should_use_full_prefill_staging(manager, [seq, other]))
-
-        manager.config.prefill_schedule_policy = PREFILL_POLICY_ALL_CHUNKED
-        self.assertFalse(DeltaKVCacheManager._should_use_full_prefill_staging(manager, [seq]))
+        self.assertTrue(DeltaKVCacheManager.requires_long_prefill_offload(manager, seq))
 
     def test_deltakv_short_atomic_prefill_requirement_is_cache_manager_owned(self):
         manager = object.__new__(DeltaKVCacheManager)
@@ -2078,9 +2152,7 @@ class DeltaKVFullPrefillStagingTest(unittest.TestCase):
 
         long_seq = seq_with_len(9000)
         self.assertFalse(DeltaKVCacheManager.requires_full_prefill_step(manager, long_seq))
-
-        with patch.dict(os.environ, {"SPARSEVLLM_LONG_PREFILL_OFFLOAD_MIN_TOKENS": "1"}, clear=False):
-            self.assertFalse(DeltaKVCacheManager.requires_full_prefill_step(manager, long_seq))
+        self.assertTrue(DeltaKVCacheManager.requires_long_prefill_offload(manager, long_seq))
 
     def test_full_prefill_plan_keeps_only_persistent_final_representation(self):
         plan = DeltaKVCacheManager._deltakv_full_prefill_plan_cpu(
@@ -2551,10 +2623,9 @@ class DeltaKVLessMemoryStorageContractTest(unittest.TestCase):
 
         seq = seq_with_len(2048)
         seq.current_chunk_size = 1024
-        with patch.dict(os.environ, {"SPARSEVLLM_LONG_PREFILL_OFFLOAD_MIN_TOKENS": "1"}, clear=False):
-            self.assertFalse(DeltaKVLessMemoryCacheManager.should_schedule_full_prefill(manager, seq))
-            self.assertFalse(DeltaKVLessMemoryCacheManager._should_use_full_prefill_staging(manager, [seq]))
-            self.assertTrue(DeltaKVLessMemoryCacheManager._should_use_long_prefill_offload_staging(manager, [seq]))
+        self.assertFalse(DeltaKVLessMemoryCacheManager.should_schedule_full_prefill(manager, seq))
+        self.assertFalse(DeltaKVLessMemoryCacheManager._should_use_full_prefill_staging(manager, [seq]))
+        self.assertTrue(DeltaKVLessMemoryCacheManager._should_use_long_prefill_offload_staging(manager, [seq]))
 
     def test_delta_quant_raw_overhead_does_not_depend_on_prefill_chunk(self):
         from sparsevllm.engine.cache_manager.deltakv_less_memory import DeltaKVLessMemoryCacheManager

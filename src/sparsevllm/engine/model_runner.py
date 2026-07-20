@@ -26,6 +26,7 @@ from sparsevllm.engine.prefix_cache_coordinator import PrefixCacheCoordinator
 from sparsevllm.engine.recurrent_state_manager import RecurrentStateManager, RecurrentStateSpec
 from sparsevllm.engine.runtime_state import RuntimeState
 from sparsevllm.engine.sparse_controller import SparseController
+from sparsevllm.method_registry import PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH
 import sparsevllm.platforms as platforms
 from sparsevllm.utils.profiler import profiler
 
@@ -396,6 +397,12 @@ class ModelRunner:
         )
 
     def _long_text_threshold(self, is_prefill: bool) -> int:
+        if (
+            is_prefill
+            and self.config.prefill_schedule_policy
+            == PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH
+        ):
+            return int(self.config.chunk_prefill_size)
         if self.config.vllm_sparse_method in ("streamingllm", "attention-sink", "attention_sink"):
             base = self.config.num_sink_tokens + self.config.num_recent_tokens
         else:

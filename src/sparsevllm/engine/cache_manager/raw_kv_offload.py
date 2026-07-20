@@ -9,44 +9,6 @@ import torch
 from sparsevllm.platforms import device_runtime
 
 
-def resolve_long_prefill_offload_min_tokens(default: int = 262144) -> int:
-    raw = os.getenv("SPARSEVLLM_LONG_PREFILL_OFFLOAD_MIN_TOKENS")
-    legacy_raw = os.getenv("SPARSEVLLM_DEFERRED_PREFILL_MIN_TOKENS")
-    if raw is not None and legacy_raw is not None and raw != legacy_raw:
-        raise ValueError(
-            "SPARSEVLLM_LONG_PREFILL_OFFLOAD_MIN_TOKENS and "
-            "SPARSEVLLM_DEFERRED_PREFILL_MIN_TOKENS are both set with different values."
-        )
-    if raw is None:
-        raw = legacy_raw if legacy_raw is not None else str(int(default))
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise ValueError(
-            f"SPARSEVLLM_LONG_PREFILL_OFFLOAD_MIN_TOKENS must be an integer, got {raw!r}."
-        ) from exc
-    return max(0, value)
-
-
-def resolve_long_prefill_offload_threshold(
-    max_num_batched_tokens: int,
-    default: int = 262144,
-) -> int:
-    """Resolve the prompt length that must use chunked RawKV offload.
-
-    The environment threshold may force offload earlier, but it cannot allow a
-    full-prefill step to exceed the scheduler's per-step token cap.
-    """
-    max_num_batched_tokens = int(max_num_batched_tokens)
-    if max_num_batched_tokens <= 0:
-        raise ValueError(
-            "max_num_batched_tokens must be > 0 when resolving long-prefill offload, "
-            f"got {max_num_batched_tokens}."
-        )
-    configured_threshold = resolve_long_prefill_offload_min_tokens(default)
-    return min(configured_threshold, max_num_batched_tokens)
-
-
 @dataclass
 class _RawKVEntry:
     k: torch.Tensor | None

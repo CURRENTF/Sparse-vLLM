@@ -7,7 +7,6 @@ from sparsevllm.engine.runtime_state import MemoryOracle
 from sparsevllm.method_registry import (
     PREFILL_POLICY_ALL_CHUNKED,
     PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
-    is_deltakv_method,
 )
 from sparsevllm.utils.log import logger
 
@@ -55,7 +54,10 @@ class Scheduler:
         Prefill: based on prompt length + chunk prefill size.
         Decode: based on current total tokens (prompt + generated), without chunk size.
         """
-        if is_prefill and is_deltakv_method(self.config.vllm_sparse_method):
+        if (
+            is_prefill
+            and self.prefill_schedule_policy == PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH
+        ):
             return int(self.chunk_prefill_size)
         if self.config.vllm_sparse_method in ("streamingllm", "attention-sink", "attention_sink"):
             base = self.num_sink_tokens + self.num_recent_tokens

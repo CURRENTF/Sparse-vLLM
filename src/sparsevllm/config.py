@@ -10,6 +10,7 @@ from transformers import AutoConfig
 from sparsevllm.method_registry import (
     DECODE_CUDA_GRAPH_SUPPORTED_METHODS,
     PREFILL_POLICY_AUTO,
+    PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
     PREFIX_CACHE_SUPPORTED_METHODS,
     SUPPORTED_SPARSE_METHODS,
     is_decode_cuda_graph_supported,
@@ -55,6 +56,24 @@ def _coerce_optional_positive_int(name: str, value: Any) -> int | None:
     if parsed <= 0:
         raise ValueError(f"{name} must be > 0 when set, got {parsed}.")
     return parsed
+
+
+def _resolve_long_prefill_offload_threshold(configured: Any) -> int:
+    raw = os.getenv("SPARSEVLLM_LONG_PREFILL_OFFLOAD_MIN_TOKENS")
+    legacy_raw = os.getenv("SPARSEVLLM_DEFERRED_PREFILL_MIN_TOKENS")
+    if raw is not None and legacy_raw is not None and raw != legacy_raw:
+        raise ValueError(
+            "SPARSEVLLM_LONG_PREFILL_OFFLOAD_MIN_TOKENS and "
+            "SPARSEVLLM_DEFERRED_PREFILL_MIN_TOKENS are both set with different values."
+        )
+    value = raw if raw is not None else legacy_raw
+    resolved = _coerce_optional_positive_int(
+        "long_prefill_offload_threshold",
+        configured if value is None else value,
+    )
+    if resolved is None:
+        raise ValueError("long_prefill_offload_threshold must be a positive integer.")
+    return int(resolved)
 
 
 def _flash_attn_available() -> bool:
@@ -565,7 +584,8 @@ class Config:
     max_model_len: int = 128_000
     max_decoding_seqs: int = 64
 
-    chunk_prefill_size: int = 8192
+    chunk_prefill_size: int | None = None
+    long_prefill_offload_threshold: int = 96 * 1024
     mlp_chunk_size: int = 16384
     prefill_schedule_policy: str = PREFILL_POLICY_AUTO
     gpu_memory_utilization: float = 0.8
@@ -793,6 +813,59 @@ class Config:
             self.vllm_sparse_method,
             self.prefill_schedule_policy,
         )
+        self.max_num_batched_tokens = int(self.max_num_batched_tokens)
+        if self.max_num_batched_tokens <= 0:
+            raise ValueError(
+                "max_num_batched_tokens must be > 0, "
+                f"got {self.max_num_batched_tokens}."
+            )
+        configured_chunk_prefill_size = (
+            None if self.chunk_prefill_size is None else int(self.chunk_prefill_size)
+        )
+        if self.prefill_schedule_policy == PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH:
+            self.long_prefill_offload_threshold = _resolve_long_prefill_offload_threshold(
+                self.long_prefill_offload_threshold
+            )
+            if (
+                configured_chunk_prefill_size is not None
+                and configured_chunk_prefill_size != self.long_prefill_offload_threshold
+            ):
+                log_once(
+                    "long_bs1full_short_batch derives chunk_prefill_size from "
+                    "long_prefill_offload_threshold; ignoring "
+                    f"chunk_prefill_size={configured_chunk_prefill_size} and using "
+                    f"{self.long_prefill_offload_threshold}.",
+                    level="WARNING",
+                )
+            self.chunk_prefill_size = self.long_prefill_offload_threshold
+        else:
+            resolved_offload_threshold = _coerce_optional_positive_int(
+                "long_prefill_offload_threshold",
+                self.long_prefill_offload_threshold,
+            )
+            if resolved_offload_threshold is None:
+                raise ValueError("long_prefill_offload_threshold must be a positive integer.")
+            self.long_prefill_offload_threshold = int(resolved_offload_threshold)
+            self.chunk_prefill_size = (
+                8192
+                if configured_chunk_prefill_size is None
+                else configured_chunk_prefill_size
+            )
+        if self.chunk_prefill_size <= 0:
+            raise ValueError(
+                f"chunk_prefill_size must be > 0, got {self.chunk_prefill_size}."
+            )
+        if (
+            self.prefill_schedule_policy == PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH
+            and self.max_num_batched_tokens < self.chunk_prefill_size
+        ):
+            log_once(
+                "long_bs1full_short_batch requires one short-boundary prefill to fit; "
+                f"raising max_num_batched_tokens from {self.max_num_batched_tokens} "
+                f"to {self.chunk_prefill_size}.",
+                level="WARNING",
+            )
+            self.max_num_batched_tokens = self.chunk_prefill_size
         
         if int(self.mlp_chunk_size) <= 0:
             raise ValueError(f"mlp_chunk_size must be > 0, got {self.mlp_chunk_size}.")
@@ -1258,10 +1331,6 @@ class Config:
             if kv_layers[kv_position + 1] not in configured_full_layers:
                 self.obs_layer_ids.append(layer)
         
-        # 确保调度吞吐量限制不小于单次分块大小
-        if self.max_num_batched_tokens < 2 * self.chunk_prefill_size:
-            self.max_num_batched_tokens = 2 * self.chunk_prefill_size
-
         # PyramidKV 配置验证与智能生成
         if 'pyramidkv' == self.vllm_sparse_method:
             num_layers = int(self.runtime_layout.num_layers)

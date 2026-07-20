@@ -21,7 +21,6 @@ from deltakv.configs.default_paths import compressor_path, model_path, output_pa
 from deltakv.get_chat_api import get_generate_api
 from benchmark.long_bench.pred import build_chat
 from sparsevllm.config import Config
-from sparsevllm.engine.cache_manager.raw_kv_offload import resolve_long_prefill_offload_min_tokens
 from sparsevllm.engine.model_runner import ModelRunner
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.method_registry import (
@@ -2043,7 +2042,10 @@ def _make_sparse_runner(args: argparse.Namespace, method: str) -> tuple[ModelRun
 
 
 def _sparse_long_text_threshold(config: Config, *, is_prefill: bool) -> int:
-    if is_prefill and is_deltakv_method(config.vllm_sparse_method):
+    if (
+        is_prefill
+        and config.prefill_schedule_policy == PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH
+    ):
         return int(config.chunk_prefill_size)
     if config.vllm_sparse_method in ("streamingllm", "attention-sink", "attention_sink"):
         base = config.num_sink_tokens + config.num_recent_tokens
@@ -2063,12 +2065,7 @@ def _sparse_prefill_chunk_size(config: Config, seq: Sequence) -> int:
     if config.prefill_schedule_policy == PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH:
         threshold = _sparse_long_text_threshold(config, is_prefill=True)
         if int(seq.num_prompt_tokens) > int(threshold):
-            if (
-                is_deltakv_method(config.vllm_sparse_method)
-                and int(seq.num_prompt_tokens) >= resolve_long_prefill_offload_min_tokens()
-            ):
-                return min(int(config.chunk_prefill_size), remaining)
-            return remaining
+            return min(int(config.chunk_prefill_size), remaining)
         return min(int(config.chunk_prefill_size), remaining)
 
     raise ValueError(f"Unknown Sparse-VLLM prefill_schedule_policy={config.prefill_schedule_policy!r}")

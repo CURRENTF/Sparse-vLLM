@@ -64,24 +64,18 @@ The engine currently supports:
 
 - `all_chunked`: all prefill requests are chunked and batched through the normal
   scheduler limits.
-- `long_bs1full_short_batch`: a special policy for methods that need a complete
-  long-prefill representation; long requests run full-prefill with batch size 1,
-  while short requests remain chunked and batched.
+- `long_bs1full_short_batch`: prompts at or below `chunk_prefill_size` use
+  complete batched prefill, while prompts above it run alone as chunked RawKV
+  offload prefill.
 
-Methods with a `long_bs1full_short_batch` contract can still chunk ultra-long
-prompts internally when their cache manager implements
-`requires_long_prefill_offload()`. DeltaKV and PyramidKV use this hook to back
-chunked long-prefill steps with RawKV offload staging while keeping the same
-public policy name. This is an internal cache-manager implementation detail, not
-a third public prefill policy.
-
-For those methods, the effective offload threshold cannot exceed
-`max_num_batched_tokens`. The optional
-`SPARSEVLLM_LONG_PREFILL_OFFLOAD_MIN_TOKENS` setting may force offload earlier,
-but it cannot force a full-prefill step above the scheduler token cap. Once
-offload is active, each single-sequence step is capped independently by
-`chunk_prefill_size` and `max_num_batched_tokens`; the two settings do not need
-to be equal.
+DeltaKV and PyramidKV implement the long branch through
+`requires_long_prefill_offload()`. The offload threshold is exactly
+`chunk_prefill_size`, so there is no hidden range of isolated full-prefill
+prompts between the short and offload branches. `Config` derives both from
+`long_prefill_offload_threshold`, whose default is `98304` tokens (96K), and
+raises `max_num_batched_tokens` to that one-chunk boundary when necessary. Do
+not set `chunk_prefill_size` separately for this policy. `all_chunked` continues
+to use its independently configured chunk size.
 
 Do not encode a method's prefill policy in benchmark scripts or one-off config
 defaults. Add the method-to-policy mapping to the registry and update
