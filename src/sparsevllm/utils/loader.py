@@ -610,6 +610,7 @@ def load_model(
     loaded_count = 0
     loaded_tensor_bytes = 0
     loaded_parameter_names: set[str] = set()
+    seen_source_keys: set[str] = set()
     show_progress = tp_rank is None or tp_rank == 0
     description = (
         "Multi-thread loading shards"
@@ -633,6 +634,13 @@ def load_model(
                 for tensor in tensors.values()
             )
             keys = list(tensors)
+            duplicate_source_keys = sorted(seen_source_keys.intersection(keys))
+            if duplicate_source_keys:
+                raise ValueError(
+                    "Checkpoint contains duplicate tensor keys across safetensor shards: "
+                    f"{duplicate_source_keys[:5]}."
+                )
+            seen_source_keys.update(keys)
             scale_keys = {key for key in keys if key.endswith(".weight_scale_inv")}
             consumed_scale_keys: set[str] = set()
             for source_weight_name in keys:
@@ -645,6 +653,9 @@ def load_model(
                     loaded_scale = tensors.get(scale_key)
                 param_name = _target_weight_name_for_model(model, source_weight_name)
                 if param_name is None:
+                    skipped_weight_hook = getattr(model, "record_skipped_weight", None)
+                    if callable(skipped_weight_hook):
+                        skipped_weight_hook(source_weight_name, loaded_scale)
                     if scale_key is not None and loaded_scale is not None:
                         consumed_scale_keys.add(scale_key)
                     continue
@@ -710,6 +721,7 @@ def load_model(
                         loaded_weight=tensors[source_weight_name],
                         loaded_scale=loaded_scale,
                     ):
+                        loaded_parameter_names.add(param_name)
                         loaded_count += 1
                         continue
                     param = model.get_parameter(param_name)
