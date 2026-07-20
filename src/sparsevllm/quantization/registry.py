@@ -18,4 +18,5 @@ class QuantizationRegistry:
         return Fp8BlockScaledLinearBackend(
             block_size=tuple(quantization.weight_block_size),
             backend=getattr(quantization, "backend", "auto"),
+            model_name=getattr(quantization, "model_name", "qwen3_5"),
         )
