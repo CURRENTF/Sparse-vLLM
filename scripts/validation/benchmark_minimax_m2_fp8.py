@@ -555,6 +555,7 @@ def main() -> int:
         from sparsevllm.quantization.fp8 import (
             FINEGRAINED_FP8_KERNEL_REPO,
             FINEGRAINED_FP8_KERNEL_REVISION,
+            FINEGRAINED_FP8_KERNEL_SOURCE_SHA256,
             FINEGRAINED_FP8_KERNEL_VERSION,
         )
 
@@ -562,6 +563,7 @@ def main() -> int:
             "repo": FINEGRAINED_FP8_KERNEL_REPO,
             "version": FINEGRAINED_FP8_KERNEL_VERSION,
             "revision": FINEGRAINED_FP8_KERNEL_REVISION,
+            "source_sha256": FINEGRAINED_FP8_KERNEL_SOURCE_SHA256,
             "local_override": os.getenv("SPARSEVLLM_FINEGRAINED_FP8_KERNEL_PATH"),
         }
         run_config["software"] = _software_versions(torch)
