@@ -1294,6 +1294,11 @@ class Config:
             setattr(self.hf_config, "model_type", "qwen3_5")
         model_type = str(getattr(self.hf_config, "model_type", "") or "")
         is_minimax_m2 = model_type == "minimax_m2"
+        if self.moe_backend == "native" and not is_minimax_m2:
+            raise ValueError(
+                "moe_backend='native' is supported only for MiniMax M2.7, "
+                f"got model_type={model_type!r}."
+            )
         if self.tiny_random:
             from sparsevllm.debug.tiny_random import apply_tiny_random_overrides
 
@@ -1333,10 +1338,6 @@ class Config:
                 "Supported model types: qwen2, qwen3, qwen3_5, llama."
             )
         if model_type == "qwen3_moe":
-            if self.moe_backend == "native":
-                raise ValueError(
-                    "Qwen3MoE moe_backend supports 'pytorch' or 'triton', got 'native'."
-                )
             if self.tensor_parallel_size != 1 or self.data_parallel_size != 1:
                 raise ValueError(
                     "Qwen3MoE v1 only supports TP=1 and DP=1, got "
