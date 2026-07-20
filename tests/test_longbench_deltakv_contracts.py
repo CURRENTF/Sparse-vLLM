@@ -67,6 +67,14 @@ class LongBenchDeltaKVContractsTest(unittest.TestCase):
         finally:
             longbench_pred.DATA_PREFIX_PATH = old_root
 
+    def test_longbench_prompt_budget_reserves_generation_tokens(self):
+        self.assertEqual(
+            longbench_pred._prompt_token_budget(204_800, 121_000, 64),
+            120_936,
+        )
+        with self.assertRaisesRegex(ValueError, "smaller than"):
+            longbench_pred._prompt_token_budget(32, 64, 32)
+
     def test_longbench_eval_rejects_skipped_task(self):
         with tempfile.TemporaryDirectory() as tmp:
             output_dir = Path(tmp)

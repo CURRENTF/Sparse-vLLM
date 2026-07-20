@@ -238,6 +238,21 @@ def build_kvzip_prompt_parts(prompt_format, json_obj, use_kvzip_template=True):
     }
 
 
+def _prompt_token_budget(
+    model_max_length: int,
+    engine_max_length: int,
+    max_new_tokens: int,
+) -> int:
+    total_limit = min(int(model_max_length), int(engine_max_length))
+    budget = total_limit - int(max_new_tokens)
+    if budget <= 0:
+        raise ValueError(
+            "LongBench max_new_tokens must be smaller than the effective model "
+            f"limit: max_new_tokens={max_new_tokens}, limit={total_limit}."
+        )
+    return budget
+
+
 def load_model_and_tokenizer(rank, args):
     infer_config = {
         'max_model_len': args.max_model_len,
@@ -304,7 +319,11 @@ def get_pred(rank, data, dataset_info, args, model, tokenizer, model_max_length,
     dataset = dataset_info['dataset']
     prompt_format = dataset_info['prompt_format']
     max_gen = args.max_new_tokens_override if args.max_new_tokens_override is not None else dataset_info['max_gen']
-    max_length = model_max_length if model_max_length else dataset_info['max_length']
+    prompt_token_budget = _prompt_token_budget(
+        model_max_length,
+        dataset_info['max_length'],
+        max_gen,
+    )
     out_path = dataset_info['out_path']
     out_root = dataset_info['out_root']
 
@@ -337,14 +356,18 @@ def get_pred(rank, data, dataset_info, args, model, tokenizer, model_max_length,
                         truncation=False,
                         return_tensors="pt",
                     ).input_ids[0]
-                    max_context_length = max(max_length - len(query_ids), 1)
+                    if len(query_ids) >= prompt_token_budget:
+                        raise ValueError(
+                            "KVzip LongBench query exhausts the prompt token budget: "
+                            f"query_tokens={len(query_ids)}, "
+                            f"budget={prompt_token_budget}."
+                        )
+                    max_context_length = prompt_token_budget - len(query_ids)
                     context_ids = tokenizer(
                         prompt_parts["prefill_text"],
                         truncation=False,
                         return_tensors="pt",
                     ).input_ids[0]
-                    if prompt_tokens is None:
-                        prompt_tokens = int(len(context_ids) + len(query_ids))
                     if len(context_ids) > max_context_length:
                         half = int(max_context_length / 2)
                         if half == 0:
@@ -358,21 +381,39 @@ def get_pred(rank, data, dataset_info, args, model, tokenizer, model_max_length,
                                 tokenizer.decode(context_ids[-half:], skip_special_tokens=True)
                             )
                     prompt = prompt_parts
+                    prompt_tokens = min(len(context_ids), max_context_length) + len(
+                        query_ids
+                    )
                 else:
                     prompt = prompt_format.format(**json_obj)
+                    prompt = build_chat(
+                        tokenizer,
+                        prompt,
+                        dataset,
+                        args.no_chat_template,
+                        args.thinking_mode,
+                    )
                     tokenized_prompt = tokenizer(prompt, truncation=False, return_tensors="pt").input_ids[0]
-                    if len(tokenized_prompt) > max_length:
-                        half = int(max_length / 2)
+                    if len(tokenized_prompt) > prompt_token_budget:
+                        half = int(prompt_token_budget / 2)
                         prompt = (
                                 tokenizer.decode(tokenized_prompt[:half], skip_special_tokens=True) +
                                 tokenizer.decode(tokenized_prompt[-half:], skip_special_tokens=True)
                         )
-                    prompt = build_chat(tokenizer, prompt, dataset, args.no_chat_template, args.thinking_mode)
-                    if prompt_tokens is None:
-                        add_special_tokens = True
-                        if tokenizer.bos_token is None or prompt.startswith(tokenizer.bos_token):
-                            add_special_tokens = False
-                        prompt_tokens = len(tokenizer.encode(prompt, add_special_tokens=add_special_tokens))
+                    add_special_tokens = True
+                    if tokenizer.bos_token is None or prompt.startswith(tokenizer.bos_token):
+                        add_special_tokens = False
+                    prompt_tokens = len(
+                        tokenizer.encode(
+                            prompt,
+                            add_special_tokens=add_special_tokens,
+                        )
+                    )
+                    if prompt_tokens > prompt_token_budget:
+                        raise ValueError(
+                            "Prepared LongBench prompt exceeds its token budget: "
+                            f"prompt_tokens={prompt_tokens}, budget={prompt_token_budget}."
+                        )
                 prompts.append(prompt)
                 prepared_records.append(
                     _sample_base_record(
