@@ -303,6 +303,11 @@ def test_prefix_history_does_not_consume_resident_slots_but_hit_request_does():
     assert runtime_state.prompt_admission_budgets(deque(), 2)["resident_seqs"] == 1
 
 
+def test_qwen35_rejects_minimax_native_moe_backend(tmp_path):
+    with pytest.raises(ValueError, match="only for MiniMax M2.7"):
+        _make_config(tmp_path, moe_backend="native")
+
+
 @pytest.mark.parametrize(
     ("world_size", "conv_shape", "recurrent_shape", "snapshot_bytes"),
     [
