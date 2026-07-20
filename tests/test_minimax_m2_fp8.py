@@ -13,6 +13,7 @@ from sparsevllm.layers.rotary_embedding import (
     apply_rotary_emb,
 )
 from sparsevllm.quantization.fp8 import (
+    finegrained_fp8_source_sha256,
     fp8_blockwise_dequantize,
     fp8_blockwise_linear_reference,
 )
@@ -65,6 +66,25 @@ def test_block_fp8_dequant_rejects_wrong_scale_axis():
     weight = torch.ones(129, 257).to(torch.float8_e4m3fn)
     with pytest.raises(RuntimeError, match="shape mismatch"):
         fp8_blockwise_dequantize(weight, torch.ones(3, 2))
+
+
+def test_finegrained_fp8_source_hash_ignores_generated_files(tmp_path):
+    (tmp_path / "README.md").write_text("source\n", encoding="utf-8")
+    source_dir = tmp_path / "build" / "torch-cuda"
+    source_dir.mkdir(parents=True)
+    (source_dir / "kernel.py").write_text("kernel = 1\n", encoding="utf-8")
+    first = finegrained_fp8_source_sha256(tmp_path)
+
+    cache_dir = source_dir / "__pycache__"
+    cache_dir.mkdir()
+    (cache_dir / "kernel.pyc").write_bytes(b"generated")
+    git_dir = tmp_path / ".git"
+    git_dir.mkdir()
+    (git_dir / "HEAD").write_text("ignored\n", encoding="utf-8")
+
+    assert finegrained_fp8_source_sha256(tmp_path) == first
+    (source_dir / "kernel.py").write_text("kernel = 2\n", encoding="utf-8")
+    assert finegrained_fp8_source_sha256(tmp_path) != first
 
 
 def test_partial_rope_preserves_pass_through_features_bitwise():

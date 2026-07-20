@@ -841,6 +841,20 @@ def main() -> int:
             oracle_cases = oracle_payload["cases"]
 
         from sparsevllm import LLM, SamplingParams
+        from sparsevllm.quantization.fp8 import (
+            FINEGRAINED_FP8_KERNEL_REPO,
+            FINEGRAINED_FP8_KERNEL_REVISION,
+            FINEGRAINED_FP8_KERNEL_SOURCE_SHA256,
+            FINEGRAINED_FP8_KERNEL_VERSION,
+        )
+
+        run_config["fp8_kernel"] = {
+            "repo": FINEGRAINED_FP8_KERNEL_REPO,
+            "version": FINEGRAINED_FP8_KERNEL_VERSION,
+            "revision": FINEGRAINED_FP8_KERNEL_REVISION,
+            "source_sha256": FINEGRAINED_FP8_KERNEL_SOURCE_SHA256,
+            "local_override": os.getenv("SPARSEVLLM_FINEGRAINED_FP8_KERNEL_PATH"),
+        }
 
         engine_kwargs = {
             "tensor_parallel_size": 1,

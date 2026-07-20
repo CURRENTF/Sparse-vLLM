@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 from dataclasses import dataclass
 from functools import lru_cache
@@ -15,6 +16,30 @@ FINEGRAINED_FP8_KERNEL_VERSION = 2
 # Kernel-registry revision resolved from version 2. The corresponding source
 # repository revision is 061130fedf845f320c56de4425f7404f6512c87e.
 FINEGRAINED_FP8_KERNEL_REVISION = "b73afcaafe864016f23a2c44ced47d2a8da103f3"
+FINEGRAINED_FP8_KERNEL_SOURCE_SHA256 = (
+    "734622e96a54ceabecd05843b7240a5559cca15ce05e7bdbee4ca47286f51230"
+)
+
+
+def finegrained_fp8_source_sha256(root: Path) -> str:
+    root = Path(root).expanduser().resolve()
+    if not root.is_dir():
+        raise FileNotFoundError(f"FP8 kernel source directory does not exist: {root}.")
+    files = sorted(
+        path
+        for path in root.rglob("*")
+        if path.is_file()
+        and ".git" not in path.relative_to(root).parts
+        and "__pycache__" not in path.relative_to(root).parts
+    )
+    if not files:
+        raise ValueError(f"FP8 kernel source directory contains no files: {root}.")
+    combined = hashlib.sha256()
+    for path in files:
+        file_digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        relative_path = path.relative_to(root).as_posix()
+        combined.update(f"{file_digest}  ./{relative_path}\n".encode())
+    return combined.hexdigest()
 
 
 def _has_native_fp8_dtype() -> bool:
@@ -65,7 +90,15 @@ def load_finegrained_fp8_kernel() -> ModuleType:
 
     local_path = os.getenv("SPARSEVLLM_FINEGRAINED_FP8_KERNEL_PATH")
     if local_path:
-        kernel = get_local_kernel(Path(local_path))
+        local_root = Path(local_path).expanduser().resolve()
+        source_sha256 = finegrained_fp8_source_sha256(local_root)
+        if source_sha256 != FINEGRAINED_FP8_KERNEL_SOURCE_SHA256:
+            raise RuntimeError(
+                "Local finegrained-fp8 source checksum mismatch: "
+                f"path={local_root}, expected={FINEGRAINED_FP8_KERNEL_SOURCE_SHA256}, "
+                f"actual={source_sha256}."
+            )
+        kernel = get_local_kernel(local_root)
     else:
         try:
             kernel = load_kernel(
