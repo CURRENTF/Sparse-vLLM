@@ -226,7 +226,7 @@ if __name__ == '__main__':
         non_success = sum(
             count
             for status, count in status_counts.items()
-            if status not in {"success", "skipped_by_policy"}
+            if status != "success"
         )
         if invalid_statuses:
             failed_tasks.append(dataset)
@@ -252,8 +252,7 @@ if __name__ == '__main__':
                 "status_counts": dict(status_counts),
                 "error": None if only_skipped else "No successful predictions to score.",
             }
-            if not only_skipped:
-                failed_tasks.append(dataset)
+            failed_tasks.append(dataset)
             continue
 
         if args.e and len(lengths) != len(predictions):

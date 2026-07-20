@@ -299,7 +299,7 @@ class SparseVLLMRegressionGradingTest(unittest.TestCase):
         self.assertEqual(grade.status, "failed")
         self.assertIn("below minimum", grade.reason)
 
-    def test_thinking_off_applies_chat_template_to_legacy_raw_prompt_tasks(self):
+    def test_thinking_off_preserves_no_chat_dataset_prompt(self):
         class QwenTokenizer:
             chat_template = "template"
 
@@ -312,8 +312,8 @@ class SparseVLLMRegressionGradingTest(unittest.TestCase):
 
         prompt = build_chat(tokenizer, "classify this", "trec", thinking_mode="off")
 
-        self.assertEqual(prompt, "templated<think>\n</think>\n")
-        self.assertFalse(tokenizer.kwargs["enable_thinking"])
+        self.assertEqual(prompt, "classify this")
+        self.assertFalse(hasattr(tokenizer, "kwargs"))
         self.assertEqual(
             build_chat(tokenizer, "classify this", "trec", no_chat_template=True, thinking_mode="off"),
             "classify this",
