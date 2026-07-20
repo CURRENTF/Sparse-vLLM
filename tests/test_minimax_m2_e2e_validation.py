@@ -177,3 +177,26 @@ def test_e2e_validator_enables_debug_for_spawned_workers(monkeypatch):
         "SPARSEVLLM_DEBUG_MOE": "1",
         "SPARSEVLLM_DEBUG_MINIMAX_M2": "1",
     }
+
+
+def test_e2e_validator_records_raw_before_parse_failure():
+    raw_cases = {}
+    parsed_outputs = {}
+    raw_case = _raw_case()
+
+    with patch.object(
+        validation,
+        "_parsed_case",
+        side_effect=ValueError("parse failed"),
+    ):
+        with pytest.raises(validation.ParseFailure, match="case-0") as error:
+            validation._record_case_artifacts(
+                "case-0",
+                raw_case,
+                raw_cases,
+                parsed_outputs,
+            )
+
+    assert raw_cases == {"case-0": raw_case}
+    assert parsed_outputs == {}
+    assert isinstance(error.value.__cause__, ValueError)
