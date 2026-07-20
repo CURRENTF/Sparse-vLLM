@@ -59,8 +59,8 @@ def load_finegrained_fp8_kernel() -> ModuleType:
         from kernels import get_local_kernel, load_kernel
     except ImportError as exc:
         raise RuntimeError(
-            "FP8 execution requires kernels==0.15.2; install the qwen35 optional "
-            "dependencies in the active uv environment."
+            "FP8 execution requires kernels==0.15.2; install the model's FP8 "
+            "optional dependencies in the active uv environment."
         ) from exc
 
     local_path = os.getenv("SPARSEVLLM_FINEGRAINED_FP8_KERNEL_PATH")
