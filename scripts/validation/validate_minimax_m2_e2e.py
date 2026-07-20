@@ -37,6 +37,14 @@ class MetricFailure(RuntimeError):
     pass
 
 
+def _enable_debug_runtime() -> None:
+    # Spawned EP workers inherit their environment during LLM construction.
+    os.environ["SPARSEVLLM_DEBUG_RUNTIME"] = "1"
+    os.environ["SPARSEVLLM_DEBUG_HIDDEN_LAYERS"] = "0,30,61"
+    os.environ["SPARSEVLLM_DEBUG_MOE"] = "1"
+    os.environ["SPARSEVLLM_DEBUG_MINIMAX_M2"] = "1"
+
+
 def _parse_int_csv(value: str, *, allow_zero: bool = False) -> list[int]:
     values = [int(part.strip()) for part in value.split(",") if part.strip()]
     lower_bound = 0 if allow_zero else 1
@@ -765,12 +773,13 @@ def main() -> int:
         if existing_debug_env:
             raise ValueError(
                 "Unset MiniMax debug environment variables before startup; the "
-                f"script enables them only after eager warmup: {existing_debug_env}."
+                f"script owns their values for worker startup: {existing_debug_env}."
             )
         os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(index) for index in gpu_indices)
         os.environ["SPARSEVLLM_DELTAKV_GRAPH_WARMUP_PROMPT_LEN"] = str(
             args.warmup_prompt_len
         )
+        _enable_debug_runtime()
         sys.path.insert(0, str(REPO_ROOT))
         sys.path.insert(0, str(REPO_ROOT / "src"))
         import torch as torch_module
@@ -821,10 +830,6 @@ def main() -> int:
         }
         run_config["engine_kwargs"] = engine_kwargs
         llm = LLM(str(args.model_path), **engine_kwargs)
-        os.environ["SPARSEVLLM_DEBUG_RUNTIME"] = "1"
-        os.environ["SPARSEVLLM_DEBUG_HIDDEN_LAYERS"] = "0,30,61"
-        os.environ["SPARSEVLLM_DEBUG_MOE"] = "1"
-        os.environ["SPARSEVLLM_DEBUG_MINIMAX_M2"] = "1"
 
         def run_case(case_id: str, prompts: list[list[int]]) -> dict[str, Any]:
             try:

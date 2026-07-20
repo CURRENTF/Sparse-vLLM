@@ -161,3 +161,19 @@ def test_e2e_validator_requires_ep_replica_consistency():
     ] = True
     with pytest.raises(validation.MetricFailure, match="router IDs"):
         validation._validate_replica_consistency([summary])
+
+
+def test_e2e_validator_enables_debug_for_spawned_workers(monkeypatch):
+    for key in validation.DEBUG_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+
+    validation._enable_debug_runtime()
+
+    assert {
+        key: validation.os.environ[key] for key in validation.DEBUG_ENV_KEYS
+    } == {
+        "SPARSEVLLM_DEBUG_RUNTIME": "1",
+        "SPARSEVLLM_DEBUG_HIDDEN_LAYERS": "0,30,61",
+        "SPARSEVLLM_DEBUG_MOE": "1",
+        "SPARSEVLLM_DEBUG_MINIMAX_M2": "1",
+    }
