@@ -282,7 +282,7 @@ def test_mixed_cache_manager_rows_do_not_exceed_recurrent_pool(
     manager = object.__new__(manager_cls)
 
     with patch.object(platforms, "_current_platform", CpuPlatform()):
-        CacheManager.__init__(manager, config, rank=0, world_size=1)
+        CacheManager.__init__(manager, config, _single_process_parallel_context())
 
     assert manager.max_buffer_rows == 12
 
@@ -304,7 +304,7 @@ def test_dense_cache_manager_keeps_redundant_row_capacity():
     manager = object.__new__(StandardCacheManager)
 
     with patch.object(platforms, "_current_platform", CpuPlatform()):
-        CacheManager.__init__(manager, config, rank=0, world_size=1)
+        CacheManager.__init__(manager, config, _single_process_parallel_context())
 
     assert manager.max_buffer_rows == 24
 
@@ -383,6 +383,7 @@ def _budget_test_manager(
         prefix_recurrent_bytes_per_block=400 if prefix_on else 0,
     )
     manager.world_size = 1
+    manager.tp_size = 1
     manager.device = torch.device("cpu")
     manager.num_kv_heads = 1
     manager.head_dim = 10
@@ -469,12 +470,21 @@ def test_model_runner_resets_inherited_allocator_peak_before_model_construction(
     config = SimpleNamespace(
         enable_profiler=False,
         enforce_eager=True,
+        world_size=1,
         tensor_parallel_size=1,
+        expert_parallel_size=1,
+        data_parallel_size=1,
+        mlp_chunk_size=16384,
+        moe_backend="triton",
         hf_config=SimpleNamespace(model_type="qwen2", torch_dtype=torch.float32),
     )
     with (
         patch.object(platforms, "_current_platform", platform),
         patch("sparsevllm.engine.model_runner.dist.is_initialized", return_value=True),
+        patch(
+            "sparsevllm.engine.model_runner.init_parallel_context",
+            return_value=_single_process_parallel_context(),
+        ),
         patch("sparsevllm.engine.model_runner.Qwen2ForCausalLM", side_effect=stop_at_model_construction),
         pytest.raises(RuntimeError, match="stop after model construction boundary"),
     ):
