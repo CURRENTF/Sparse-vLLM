@@ -37,6 +37,10 @@ class MetricFailure(RuntimeError):
     pass
 
 
+class ParseFailure(RuntimeError):
+    pass
+
+
 def _enable_debug_runtime() -> None:
     # Spawned EP workers inherit their environment during LLM construction.
     os.environ["SPARSEVLLM_DEBUG_RUNTIME"] = "1"
@@ -451,6 +455,21 @@ def _parsed_case(raw_case: dict[str, Any]) -> dict[str, Any]:
     return parsed
 
 
+def _record_case_artifacts(
+    case_id: str,
+    raw_case: dict[str, Any],
+    raw_cases: dict[str, dict[str, Any]],
+    parsed_outputs: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    raw_cases[case_id] = raw_case
+    try:
+        parsed = _parsed_case(raw_case)
+    except Exception as exc:
+        raise ParseFailure(f"Failed to parse artifacts for {case_id}.") from exc
+    parsed_outputs[case_id] = parsed
+    return parsed
+
+
 def _graph_key_tuple(request_result: dict[str, Any]):
     states = request_result["graph_states"]
     if not states:
@@ -845,7 +864,12 @@ def main() -> int:
                     request_result,
                     use_graph=args.decode_cuda_graph,
                 )
-                parsed = _parsed_case(raw_case)
+                parsed = _record_case_artifacts(
+                    case_id,
+                    raw_case,
+                    raw_cases,
+                    parsed_outputs,
+                )
                 correctness = None
                 if oracle_cases is not None:
                     expected = oracle_cases.get(case_id)
@@ -860,8 +884,6 @@ def main() -> int:
                     )
                 elif not parsed["logits"]["finite"]:
                     raise MetricFailure(f"Non-finite logits for {case_id}.")
-                raw_cases[case_id] = raw_case
-                parsed_outputs[case_id] = parsed
                 record = {
                     "case_id": case_id,
                     "status": "success",
@@ -882,6 +904,18 @@ def main() -> int:
                 }
                 records.append(record)
                 return request_result
+            except ParseFailure as exc:
+                records.append(
+                    {
+                        "case_id": case_id,
+                        "status": "parse_failed",
+                        "prompt_length": len(prompts[0]),
+                        "batch_size": len(prompts),
+                        "error": repr(exc),
+                        "traceback": traceback.format_exc(),
+                    }
+                )
+                raise
             except MetricFailure as exc:
                 records.append(
                     {
