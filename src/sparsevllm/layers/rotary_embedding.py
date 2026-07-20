@@ -15,6 +15,43 @@ def apply_rotary_emb(
     return torch.cat((y1, y2), dim=-1).to(x.dtype)
 
 
+def apply_partial_rotary_emb(
+    rotary_emb: "RotaryEmbedding",
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    rotary_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply RoPE to a leading Q/K slice and preserve the remaining features."""
+
+    rotary_dim = int(rotary_dim)
+    query_dim = int(query.shape[-1])
+    key_dim = int(key.shape[-1])
+    if rotary_dim <= 0 or rotary_dim % 2 != 0:
+        raise ValueError(f"rotary_dim must be a positive even integer, got {rotary_dim}.")
+    if rotary_dim > query_dim or rotary_dim > key_dim:
+        raise ValueError(
+            f"rotary_dim={rotary_dim} exceeds Q/K dimensions "
+            f"query={query_dim}, key={key_dim}."
+        )
+    if rotary_dim == query_dim == key_dim:
+        return rotary_emb(positions, query, key)
+
+    cos_sin = rotary_emb.cos_sin_cache[positions]
+    if int(cos_sin.shape[-1]) != rotary_dim:
+        raise RuntimeError(
+            "Rotary cache dimension does not match partial rotary_dim: "
+            f"cache={cos_sin.shape[-1]}, rotary_dim={rotary_dim}."
+        )
+    cos, sin = cos_sin.chunk(2, dim=-1)
+    query_rotated = apply_rotary_emb(query[..., :rotary_dim], cos, sin)
+    key_rotated = apply_rotary_emb(key[..., :rotary_dim], cos, sin)
+    return (
+        torch.cat((query_rotated, query[..., rotary_dim:]), dim=-1),
+        torch.cat((key_rotated, key[..., rotary_dim:]), dim=-1),
+    )
+
+
 def reverse_rotary_emb(
     x: torch.Tensor,
     cos: torch.Tensor,

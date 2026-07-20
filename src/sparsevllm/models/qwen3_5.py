@@ -16,7 +16,7 @@ from sparsevllm.layers.linear import (
     RowParallelLinear,
     divide,
 )
-from sparsevllm.layers.rotary_embedding import get_rope, apply_rotary_emb
+from sparsevllm.layers.rotary_embedding import apply_partial_rotary_emb, get_rope
 from sparsevllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 from sparsevllm.utils.context import get_context
 from sparsevllm.engine.recurrent_state_manager import RecurrentStateSpec, RecurrentTensorSpec
@@ -73,21 +73,6 @@ def _get_rotary_dim(config, head_dim: int) -> int:
             f"Invalid qwen3_5 rotary_dim={rotary_dim} for head_dim={head_dim}."
         )
     return rotary_dim
-
-
-def _apply_partial_rope(rotary_emb, positions: torch.Tensor, q: torch.Tensor, k: torch.Tensor, rotary_dim: int):
-    rotary_dim = int(rotary_dim)
-    if rotary_dim == int(q.shape[-1]):
-        return rotary_emb(positions, q, k)
-    if rotary_dim <= 0 or rotary_dim > int(q.shape[-1]) or rotary_dim > int(k.shape[-1]):
-        raise ValueError(
-            f"Invalid qwen3_5 rotary_dim={rotary_dim} for q={tuple(q.shape)} k={tuple(k.shape)}."
-        )
-    cos_sin = rotary_emb.cos_sin_cache[positions]
-    cos, sin = cos_sin.chunk(2, dim=-1)
-    q_rot = apply_rotary_emb(q[..., :rotary_dim], cos, sin)
-    k_rot = apply_rotary_emb(k[..., :rotary_dim], cos, sin)
-    return torch.cat((q_rot, q[..., rotary_dim:]), dim=-1), torch.cat((k_rot, k[..., rotary_dim:]), dim=-1)
 
 
 class Qwen35QKVGatedParallelLinear(ColumnParallelLinear):
@@ -291,7 +276,13 @@ class Qwen35FullAttention(nn.Module):
         cache_manager.save_raw_kv_if_needed(layer_idx, pre_rope_k, v)
         q = self.q_norm(q)
         k = self.k_norm(k)
-        q, k = _apply_partial_rope(self.rotary_emb, positions, q, k, self.rotary_dim)
+        q, k = apply_partial_rotary_emb(
+            self.rotary_emb,
+            positions,
+            q,
+            k,
+            self.rotary_dim,
+        )
         cache_manager.save_rope_kv_if_needed(layer_idx, k, v)
         o = self.attn(q, k, v)
         o = o.flatten(1, -1) * torch.sigmoid(gate)
