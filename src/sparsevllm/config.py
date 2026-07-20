@@ -1422,6 +1422,12 @@ class Config:
                     f"expert_parallel_size, got {num_experts} and "
                     f"{self.expert_parallel_size}."
                 )
+            if self.decode_cuda_graph and self.moe_backend != "triton":
+                raise ValueError(
+                    "MiniMax M2.7 decode CUDA Graph requires "
+                    "moe_backend='triton'; the pytorch and native backends use "
+                    "data-dependent eager expert dispatch."
+                )
             validate_model_runtime_compatibility(
                 model_type=model_type,
                 sparse_method=self.vllm_sparse_method,
