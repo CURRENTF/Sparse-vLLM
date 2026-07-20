@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -9,6 +10,8 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import (
 )
 
 from sparsevllm.distributed import ParallelContext, ParallelGroup
+from sparsevllm.layers.layernorm import RMSNorm
+from sparsevllm.models.qwen3 import Qwen3Attention
 from sparsevllm.models.qwen3_moe import (
     Qwen3MoeForCausalLM,
     Qwen3MoePackedExperts,
@@ -61,6 +64,69 @@ def _instantiate_model(config, context):
         patch("sparsevllm.layers.embed_head.get_parallel_context", return_value=context),
     ):
         return Qwen3MoeForCausalLM(config)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_qwen3_rmsnorm_does_not_modify_input(dtype):
+    norm = RMSNorm(4)
+    x = torch.randn(3, 4, dtype=dtype)
+    original = x.clone()
+
+    norm(x)
+
+    assert torch.equal(x, original)
+
+
+def test_qwen3_attention_passes_raw_key_without_clone():
+    class FixedProjection(torch.nn.Module):
+        def __init__(self, output):
+            super().__init__()
+            self.output = output
+
+        def forward(self, _):
+            return self.output
+
+    class PairIdentity(torch.nn.Module):
+        def forward(self, _positions, query, key):
+            return query, key
+
+    class AttentionIdentity(torch.nn.Module):
+        def forward(self, query, _key, _value):
+            return query
+
+    class CacheRecorder:
+        def save_raw_kv_if_needed(self, _layer_idx, key, _value):
+            self.raw_key = key
+            self.saved_raw_key = key.clone()
+
+        def save_rope_kv_if_needed(self, _layer_idx, _key, _value):
+            pass
+
+    attention = Qwen3Attention.__new__(Qwen3Attention)
+    torch.nn.Module.__init__(attention)
+    qkv = torch.randn(2, 16)
+    expected_raw_key = qkv[:, 8:12].view(2, 1, 4)
+    attention.qkv_proj = FixedProjection(qkv)
+    attention.o_proj = torch.nn.Identity()
+    attention.q_norm = torch.nn.Identity()
+    attention.k_norm = torch.nn.Identity()
+    attention.rotary_emb = PairIdentity()
+    attention.attn = AttentionIdentity()
+    attention.q_size = 8
+    attention.kv_size = 4
+    attention.num_heads = 2
+    attention.num_kv_heads = 1
+    attention.head_dim = 4
+    attention.qkv_bias = False
+    attention.proj_chunk_size = 16
+    cache = CacheRecorder()
+    context = SimpleNamespace(cache_manager=cache, now_layer_idx=0)
+
+    with patch("sparsevllm.models.qwen3.get_context", return_value=context):
+        attention(torch.arange(2), torch.empty(2, 8))
+
+    assert cache.raw_key.data_ptr() == expected_raw_key.data_ptr()
+    assert torch.equal(cache.saved_raw_key, expected_raw_key)
 
 
 def test_router_matches_qwen3_moe_reference_math():

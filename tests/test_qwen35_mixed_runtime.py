@@ -764,6 +764,17 @@ def test_qwen35_rmsnorm_uses_hf_offset_weight_semantics():
     assert torch.allclose(out, expected)
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_qwen35_rmsnorm_does_not_modify_input(dtype):
+    norm = Qwen35RMSNorm(4, eps=1.0e-6)
+    x = torch.randn(3, 4, dtype=dtype)
+    original = x.clone()
+
+    norm(x)
+
+    assert torch.equal(x, original)
+
+
 def test_qwen35_rmsnorm_residual_path_uses_hf_offset_weight_semantics():
     norm = Qwen35RMSNorm(4, eps=1.0e-6)
     norm.weight.data.copy_(torch.tensor([0.5, -0.25, 0.0, 1.0]))

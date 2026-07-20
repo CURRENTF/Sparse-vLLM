@@ -286,7 +286,7 @@ class Qwen35FullAttention(nn.Module):
         context = get_context()
         layer_idx = context.now_layer_idx
         cache_manager = context.cache_manager
-        pre_rope_k = k.clone()
+        pre_rope_k = k
         cache_manager.save_raw_kv_if_needed(layer_idx, pre_rope_k, v)
         q = self.q_norm(q)
         k = self.k_norm(k)

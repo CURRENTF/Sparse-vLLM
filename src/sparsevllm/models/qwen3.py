@@ -123,9 +123,7 @@ class Qwen3Attention(nn.Module):
         cache_manager = context.cache_manager
         layer_idx = context.now_layer_idx
         # DeltaKV compressors are trained on raw K/V before QK norm and RoPE.
-        # Clone K before RMSNorm because the local RMSNorm implementation can use
-        # in-place operations depending on dtype.
-        pre_rope_k = k.clone()
+        pre_rope_k = k
         pre_rope_v = v
         cache_manager.save_raw_kv_if_needed(layer_idx, pre_rope_k, pre_rope_v)
         debug_layers = os.getenv("SPARSEVLLM_DEBUG_CAPTURE_PRE_ROPE_LAYERS")
