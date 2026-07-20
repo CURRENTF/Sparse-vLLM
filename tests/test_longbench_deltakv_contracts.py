@@ -1,3 +1,6 @@
+import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -99,6 +102,42 @@ class LongBenchDeltaKVContractsTest(unittest.TestCase):
             [env["SPARSEVLLM_MASTER_PORT"] for _command, env, _cwd in launched],
             ["24300", "24301", "24302", "24303"],
         )
+
+    def test_longbench_eval_rejects_skipped_task(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            (output_dir / "hotpotqa.jsonl").write_text(
+                json.dumps(
+                    {
+                        "status": "skipped_by_policy",
+                        "pred": "",
+                        "answers": None,
+                        "all_classes": None,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "benchmark/long_bench/eval.py",
+                    "--path",
+                    str(output_dir),
+                ],
+                cwd=longbench_pred.REPO_ROOT,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            metrics = json.loads((output_dir / "result.json").read_text())
+            self.assertEqual(metrics["status"], "failed")
+            self.assertEqual(
+                metrics["task_statuses"]["hotpotqa"]["status"],
+                "skipped_by_policy",
+            )
 
     def test_new_hf_sparse_methods_route_without_legacy_names(self):
         for sparse_method in (

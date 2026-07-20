@@ -365,6 +365,7 @@ class SparseVLLMRegressionGradingTest(unittest.TestCase):
         prompt = build_chat(tokenizer, "classify this", "trec", thinking_mode="off")
 
         self.assertEqual(prompt, "classify this")
+        self.assertFalse(hasattr(tokenizer, "kwargs"))
         self.assertEqual(
             build_chat(tokenizer, "classify this", "trec", no_chat_template=True, thinking_mode="off"),
             "classify this",

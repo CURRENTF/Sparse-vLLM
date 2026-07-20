@@ -273,13 +273,15 @@ def load_model_and_tokenizer(rank, args):
     tokenizer_path = args.tokenizer_path if args.tokenizer_path else args.model_path
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
     
-    # 尝试从模型配置中获取 max_position_embeddings
     try:
         from transformers import AutoConfig
         config = AutoConfig.from_pretrained(args.model_path, trust_remote_code=True)
-        max_length = getattr(config, "max_position_embeddings", 32000)
-    except:
-        max_length = 32000
+        max_length = int(config.max_position_embeddings)
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to resolve max_position_embeddings from the model config: "
+            f"{args.model_path}."
+        ) from exc
 
     generation_config = GenerationConfig.from_pretrained(args.model_path, trust_remote_code=True)
     eos_token_ids = generation_config.eos_token_id
