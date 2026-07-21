@@ -36,6 +36,15 @@ def _parse_int_csv(value: str) -> list[int]:
     return values
 
 
+def _parse_nonnegative_int_csv(value: str) -> list[int]:
+    values = [int(part.strip()) for part in value.split(",") if part.strip()]
+    if not values or any(item < 0 for item in values):
+        raise ValueError(
+            f"Expected non-negative comma-separated integers, got {value!r}."
+        )
+    return values
+
+
 def _parse_str_csv(value: str) -> list[str]:
     values = [part.strip().lower() for part in value.split(",") if part.strip()]
     if not values:
@@ -164,16 +173,19 @@ def _aggregate_status(records: list[dict[str, Any]]) -> str:
     return "model_failed"
 
 
-def _parallel_context(local_experts: int):
+def _parallel_context(local_experts: int, ep_rank: int = 0):
     from sparsevllm.distributed import ParallelContext, ParallelGroup
 
     ep_size = 256 // int(local_experts)
+    ep_rank = int(ep_rank)
+    if not 0 <= ep_rank < ep_size:
+        raise ValueError(f"ep_rank must be in [0, {ep_size}), got {ep_rank}.")
     ranks = tuple(range(ep_size))
     return ParallelContext(
-        world=ParallelGroup(None, ranks, 0, ep_size),
-        tensor=ParallelGroup(None, (0,), 0, 1),
-        expert=ParallelGroup(None, ranks, 0, ep_size),
-        data=ParallelGroup(None, (0,), 0, 1),
+        world=ParallelGroup(None, ranks, ep_rank, ep_size),
+        tensor=ParallelGroup(None, (ep_rank,), 0, 1),
+        expert=ParallelGroup(None, ranks, ep_rank, ep_size),
+        data=ParallelGroup(None, (ep_rank,), 0, 1),
     )
 
 
@@ -198,12 +210,17 @@ def _expert_config(backend: str):
     )
 
 
-def _make_experts(backend: str, local_experts: int, source: dict[str, Any]):
+def _make_experts(
+    backend: str,
+    local_experts: int,
+    ep_rank: int,
+    source: dict[str, Any],
+):
     from sparsevllm.models.minimax_m2 import MiniMaxM2PackedExperts
 
     with patch(
         "sparsevllm.models.minimax_m2.get_parallel_context",
-        return_value=_parallel_context(local_experts),
+        return_value=_parallel_context(local_experts, ep_rank),
     ):
         experts = MiniMaxM2PackedExperts(_expert_config(backend)).cuda()
     experts.w13_weight.data.copy_(source["w13_weight"])
@@ -436,6 +453,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gpu-index", type=int, default=None)
     parser.add_argument("--token-counts", default="1,2,4,8,16,32,128,512,2048,8192")
     parser.add_argument("--local-experts", default="32,64")
+    parser.add_argument("--ep-ranks", default="0")
     parser.add_argument("--backends", default="reference,native,routed")
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=30)
@@ -445,7 +463,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-utilization-percent", type=int, default=5)
     parser.add_argument(
         "--trace-case",
-        default="tokens_32_local_experts_32/routed",
+        default="tokens_32_local_experts_32_ep_rank_0/routed",
         help=(
             "Export a profiler trace for this case/backend key; use an empty "
             "value to disable."
@@ -471,6 +489,7 @@ def main() -> int:
         "seed": args.seed,
         "token_counts": _parse_int_csv(args.token_counts),
         "local_experts": _parse_int_csv(args.local_experts),
+        "ep_ranks": _parse_nonnegative_int_csv(args.ep_ranks),
         "backends": _parse_str_csv(args.backends),
         "warmup": args.warmup,
         "iterations": args.iterations,
@@ -519,10 +538,20 @@ def main() -> int:
                     "MiniMax milestone benchmark supports local_experts 32/64, "
                     f"got {local_experts}."
                 )
+            ep_size = 256 // local_experts
+            invalid_ep_ranks = [
+                rank for rank in run_config["ep_ranks"] if not 0 <= rank < ep_size
+            ]
+            if invalid_ep_ranks:
+                raise ValueError(
+                    f"ep-ranks must be in [0, {ep_size}) for "
+                    f"local_experts={local_experts}, got {invalid_ep_ranks}."
+                )
         scheduled_keys = {
-            f"tokens_{token_count}_local_experts_{local_experts}/{backend}"
+            f"tokens_{token_count}_local_experts_{local_experts}_ep_rank_{ep_rank}/{backend}"
             for token_count in run_config["token_counts"]
             for local_experts in run_config["local_experts"]
+            for ep_rank in run_config["ep_ranks"]
             for backend in run_config["backends"]
         }
         if run_config["trace_case"] and run_config["trace_case"] not in scheduled_keys:
@@ -571,87 +600,104 @@ def main() -> int:
         torch.cuda.manual_seed_all(args.seed)
 
         for local_experts in run_config["local_experts"]:
-            for token_count in run_config["token_counts"]:
-                case_id = f"tokens_{token_count}_local_experts_{local_experts}"
-                case = _random_case(
-                    torch,
-                    token_count=token_count,
-                    local_experts=local_experts,
-                    seed=args.seed + token_count + local_experts,
-                )
-                reference_output = None
-                for backend in run_config["backends"]:
-                    implementation_backend = {
-                        "reference": "pytorch",
-                        "native": "native",
-                        "routed": "triton",
-                    }[backend]
-                    torch.cuda.synchronize()
-                    construction_started = time.perf_counter()
-                    experts = _make_experts(
-                        implementation_backend,
-                        local_experts,
-                        case,
+            for ep_rank in run_config["ep_ranks"]:
+                for token_count in run_config["token_counts"]:
+                    case_id = (
+                        f"tokens_{token_count}_local_experts_{local_experts}"
+                        f"_ep_rank_{ep_rank}"
                     )
-                    torch.cuda.synchronize()
-                    construction_ms = (
-                        time.perf_counter() - construction_started
-                    ) * 1000.0
-                    forward = lambda experts=experts, case=case: _forward(experts, case)
-                    cold_forward_started = time.perf_counter()
-                    output = forward()
-                    torch.cuda.synchronize()
-                    cold_forward_ms = (
-                        time.perf_counter() - cold_forward_started
-                    ) * 1000.0
-                    if backend == "reference":
-                        reference_output = output.detach().clone()
-                    trace_path = None
-                    benchmark_key = f"{case_id}/{backend}"
-                    if benchmark_key == run_config["trace_case"]:
-                        trace_path = args.output_dir / "profiler" / "trace.json"
-                    metrics = _measure(
+                    case = _random_case(
                         torch,
-                        forward,
-                        warmup=args.warmup,
-                        iterations=args.iterations,
-                        trace_path=trace_path,
+                        token_count=token_count,
+                        local_experts=local_experts,
+                        seed=(
+                            args.seed
+                            + token_count
+                            + local_experts
+                            + 10_000 * ep_rank
+                        ),
                     )
-                    record = {
-                        "case_id": case_id,
-                        "status": "success",
-                        "backend": backend,
-                        "token_count": token_count,
-                        "local_experts": local_experts,
-                        "ep_size": 256 // local_experts,
-                        "construction_ms": construction_ms,
-                        "cold_forward_ms": cold_forward_ms,
-                        "cold_start_ms": construction_ms + cold_forward_ms,
-                        **metrics,
-                    }
-                    if reference_output is not None and backend != "reference":
-                        record["correctness_vs_reference"] = _correctness(
-                            torch,
-                            output,
-                            reference_output,
+                    reference_output = None
+                    for backend in run_config["backends"]:
+                        implementation_backend = {
+                            "reference": "pytorch",
+                            "native": "native",
+                            "routed": "triton",
+                        }[backend]
+                        torch.cuda.synchronize()
+                        construction_started = time.perf_counter()
+                        experts = _make_experts(
+                            implementation_backend,
+                            local_experts,
+                            ep_rank,
+                            case,
                         )
-                        relative_l2 = record["correctness_vs_reference"][
-                            "relative_l2_error"
-                        ]
-                        if (
-                            not math.isfinite(relative_l2)
-                            or relative_l2 > args.max_relative_l2
-                        ):
-                            record["status"] = "metric_failed"
-                    records.append(record)
-                    parsed_outputs[f"{case_id}/{backend}"] = _tensor_summary(output)
-                    raw_outputs[f"{case_id}/{backend}"] = output[:2].detach().cpu()
-                    del experts, output
+                        torch.cuda.synchronize()
+                        construction_ms = (
+                            time.perf_counter() - construction_started
+                        ) * 1000.0
+                        forward = lambda experts=experts, case=case: _forward(
+                            experts, case
+                        )
+                        cold_forward_started = time.perf_counter()
+                        output = forward()
+                        torch.cuda.synchronize()
+                        cold_forward_ms = (
+                            time.perf_counter() - cold_forward_started
+                        ) * 1000.0
+                        if backend == "reference":
+                            reference_output = output.detach().clone()
+                        trace_path = None
+                        benchmark_key = f"{case_id}/{backend}"
+                        if benchmark_key == run_config["trace_case"]:
+                            trace_path = args.output_dir / "profiler" / "trace.json"
+                        metrics = _measure(
+                            torch,
+                            forward,
+                            warmup=args.warmup,
+                            iterations=args.iterations,
+                            trace_path=trace_path,
+                        )
+                        record = {
+                            "case_id": case_id,
+                            "status": "success",
+                            "backend": backend,
+                            "token_count": token_count,
+                            "local_experts": local_experts,
+                            "ep_rank": ep_rank,
+                            "ep_size": 256 // local_experts,
+                            "construction_ms": construction_ms,
+                            "cold_forward_ms": cold_forward_ms,
+                            "cold_start_ms": construction_ms + cold_forward_ms,
+                            **metrics,
+                        }
+                        if reference_output is not None and backend != "reference":
+                            record["correctness_vs_reference"] = _correctness(
+                                torch,
+                                output,
+                                reference_output,
+                            )
+                            relative_l2 = record["correctness_vs_reference"][
+                                "relative_l2_error"
+                            ]
+                            if (
+                                not math.isfinite(relative_l2)
+                                or relative_l2 > args.max_relative_l2
+                            ):
+                                record["status"] = "metric_failed"
+                        records.append(record)
+                        parsed_outputs[f"{case_id}/{backend}"] = _tensor_summary(
+                            output
+                        )
+                        raw_outputs[f"{case_id}/{backend}"] = (
+                            output[:2].detach().cpu()
+                        )
+                        del experts, output
+                        torch.cuda.empty_cache()
+                    if reference_output is not None:
+                        del reference_output
+                    del case
                     torch.cuda.empty_cache()
-                if reference_output is not None:
-                    del reference_output
-                del case
-                torch.cuda.empty_cache()
         if any(record["status"] == "metric_failed" for record in records):
             exit_code = 1
     except (ValueError, FileNotFoundError) as exc:
