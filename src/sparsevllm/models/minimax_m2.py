@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+import sparsevllm.platforms as platforms
 from sparsevllm.distributed import get_parallel_context
 from sparsevllm.layers.attention import Attention
 from sparsevllm.layers.embed_head import ParallelLMHead
@@ -378,8 +379,7 @@ class MiniMaxM2SparseMoeBlock(nn.Module):
             local_hit_count = local_mask.sum()
             self.debug_last_local_hit_count = (
                 local_hit_count
-                if torch.cuda.is_available()
-                and torch.cuda.is_current_stream_capturing()
+                if platforms.current_platform.is_stream_capturing()
                 else int(local_hit_count.item())
             )
         output = self.parallel_context.ep_all_reduce(local_output)
@@ -592,6 +592,8 @@ class MiniMaxM2ForCausalLM(nn.Module):
     def record_skipped_weight(
         self,
         source_weight_name: str,
+        loaded_weight_shape: tuple[int, ...] | None,
+        loaded_weight_dtype: str | None,
         loaded_scale_shape: tuple[int, ...] | None,
         loaded_scale_dtype: str | None,
     ) -> None:
@@ -605,6 +607,16 @@ class MiniMaxM2ForCausalLM(nn.Module):
         if experts.is_local_expert(int(global_expert_id)):
             raise ValueError(
                 f"MiniMax loader skipped local expert weight {source_weight_name!r}."
+            )
+        if loaded_weight_shape is None or loaded_weight_dtype is None:
+            raise ValueError(
+                f"Skipped remote MiniMax expert is missing weight metadata: "
+                f"{source_weight_name!r}."
+            )
+        if loaded_weight_dtype != "F8_E4M3":
+            raise TypeError(
+                "Remote MiniMax expert weight must be FP8 E4M3, got "
+                f"safetensors dtype {loaded_weight_dtype}."
             )
         if loaded_scale_shape is None or loaded_scale_dtype is None:
             raise ValueError(
@@ -621,6 +633,17 @@ class MiniMaxM2ForCausalLM(nn.Module):
             if projection == "w2"
             else (experts.intermediate_size // 128, experts.hidden_size // 128)
         )
+        expected_weight_shape = (
+            (experts.hidden_size, experts.intermediate_size)
+            if projection == "w2"
+            else (experts.intermediate_size, experts.hidden_size)
+        )
+        if loaded_weight_shape != expected_weight_shape:
+            raise ValueError(
+                "Remote MiniMax expert weight shape mismatch for "
+                f"{source_weight_name!r}: expected={expected_weight_shape}, "
+                f"got={loaded_weight_shape}."
+            )
         if loaded_scale_shape != expected_shape:
             raise ValueError(
                 "Remote MiniMax expert scale shape mismatch for "

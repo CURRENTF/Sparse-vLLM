@@ -653,9 +653,16 @@ def load_model(
                 if param_name is None:
                     skipped_weight_hook = getattr(model, "record_skipped_weight", None)
                     if callable(skipped_weight_hook):
+                        weight_tensor = tensors[source_weight_name]
                         scale_tensor = tensors.get(scale_key)
                         skipped_weight_hook(
                             source_weight_name,
+                            tuple(int(dim) for dim in weight_tensor.shape),
+                            (
+                                "F8_E4M3"
+                                if weight_tensor.dtype == torch.float8_e4m3fn
+                                else str(weight_tensor.dtype)
+                            ),
                             (
                                 tuple(int(dim) for dim in scale_tensor.shape)
                                 if scale_tensor is not None
@@ -673,11 +680,6 @@ def load_model(
                     continue
                 loaded_scale = (
                     tensors.get(scale_key)
-                    if scale_key is not None and scale_key in scale_keys
-                    else None
-                )
-                loaded_scale = (
-                    f.get_tensor(scale_key)
                     if scale_key is not None and scale_key in scale_keys
                     else None
                 )

@@ -473,7 +473,30 @@ def test_remote_expert_without_scale_fails_immediately():
 
     assert model.map_weight_name(source_name) is None
     with pytest.raises(ValueError, match="missing weight_scale_inv"):
-        model.record_skipped_weight(source_name, None, None)
+        model.record_skipped_weight(source_name, (128, 128), "F8_E4M3", None, None)
+
+
+def test_remote_expert_metadata_rejects_bad_weight_dtype_and_shape():
+    config = _config()
+    model = _instantiate_model(config, _ep_context(1, 2))
+    source_name = "model.layers.0.block_sparse_moe.experts.0.w1.weight"
+
+    with pytest.raises(TypeError, match="must be FP8 E4M3"):
+        model.record_skipped_weight(
+            source_name,
+            (128, 128),
+            "BF16",
+            (1, 1),
+            "F32",
+        )
+    with pytest.raises(ValueError, match="weight shape mismatch"):
+        model.record_skipped_weight(
+            source_name,
+            (64, 128),
+            "F8_E4M3",
+            (1, 1),
+            "F32",
+        )
 
 
 def test_local_expert_loader_rejects_missing_duplicate_and_bad_tensors():
