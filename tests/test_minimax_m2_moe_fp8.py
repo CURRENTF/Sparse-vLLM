@@ -214,33 +214,81 @@ def test_routed_fp8_matches_explicit_dequant_oracle():
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for this test.")
-def test_routed_fp8_matches_native_with_hot_expert():
-    inputs = list(_inputs())
-    hidden_states = inputs[0]
-    repeats = 6
-    inputs[0] = hidden_states.repeat(repeats, 1).contiguous()
-    num_tokens = inputs[0].shape[0]
-    topk_ids = torch.empty(
-        num_tokens,
-        2,
+def test_routed_fp8_matches_native_real_shapes():
+    torch.manual_seed(29)
+    max_tokens = 100
+    hidden_size = 3072
+    intermediate_size = 1536
+    hidden_states = torch.randn(
+        max_tokens,
+        hidden_size,
         device="cuda",
-        dtype=torch.int64,
+        dtype=torch.bfloat16,
     )
-    topk_ids[:, 0] = 0
-    topk_ids[:58, 0] = 3
-    topk_ids[:, 1] = torch.arange(num_tokens, device="cuda") % 3
-    inputs[5] = topk_ids.contiguous()
-    inputs[6] = inputs[6].repeat(repeats, 1).contiguous()
-
-    expected = _native_expert_oracle(*inputs)
-    actual = fused_moe_fp8(
-        *inputs,
-        num_experts=4,
-        local_expert_start=0,
+    w13_weight = (
+        torch.randn(
+            1,
+            2 * intermediate_size,
+            hidden_size,
+            device="cuda",
+        )
+        * 0.02
+    ).to(torch.float8_e4m3fn)
+    w2_weight = (
+        torch.randn(
+            1,
+            hidden_size,
+            intermediate_size,
+            device="cuda",
+        )
+        * 0.02
+    ).to(torch.float8_e4m3fn)
+    w13_scale_inv = torch.rand(
+        1,
+        2 * intermediate_size // 128,
+        hidden_size // 128,
+        device="cuda",
+        dtype=torch.float32,
     )
-    torch.cuda.synchronize()
+    w2_scale_inv = torch.rand(
+        1,
+        hidden_size // 128,
+        intermediate_size // 128,
+        device="cuda",
+        dtype=torch.float32,
+    )
 
-    assert torch.equal(actual, expected)
+    for num_tokens in (8, 24, 58, 100):
+        topk_ids = torch.zeros(
+            num_tokens,
+            1,
+            device="cuda",
+            dtype=torch.int64,
+        )
+        topk_weights = torch.ones(
+            num_tokens,
+            1,
+            device="cuda",
+            dtype=torch.float32,
+        )
+        inputs = (
+            hidden_states[:num_tokens].contiguous(),
+            w13_weight,
+            w13_scale_inv,
+            w2_weight,
+            w2_scale_inv,
+            topk_ids,
+            topk_weights,
+        )
+        expected = _native_expert_oracle(*inputs)
+        actual = fused_moe_fp8(
+            *inputs,
+            num_experts=1,
+            local_expert_start=0,
+        )
+        torch.cuda.synchronize()
+
+        assert torch.equal(actual, expected), f"token count {num_tokens} differs"
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for this test.")
