@@ -647,18 +647,40 @@ def load_model(
                 if source_weight_name.endswith(".weight_scale_inv"):
                     continue
                 scale_key = None
-                loaded_scale = None
                 if source_weight_name.endswith(".weight"):
                     scale_key = _scale_key_for_weight_key(source_weight_name)
-                    loaded_scale = tensors.get(scale_key)
                 param_name = _target_weight_name_for_model(model, source_weight_name)
                 if param_name is None:
                     skipped_weight_hook = getattr(model, "record_skipped_weight", None)
                     if callable(skipped_weight_hook):
-                        skipped_weight_hook(source_weight_name, loaded_scale)
-                    if scale_key is not None and loaded_scale is not None:
+                        scale_tensor = tensors.get(scale_key)
+                        skipped_weight_hook(
+                            source_weight_name,
+                            (
+                                tuple(int(dim) for dim in scale_tensor.shape)
+                                if scale_tensor is not None
+                                else None
+                            ),
+                            (
+                                "F32"
+                                if scale_tensor is not None
+                                and scale_tensor.dtype == torch.float32
+                                else None
+                            ),
+                        )
+                    if scale_key is not None and scale_key in scale_keys:
                         consumed_scale_keys.add(scale_key)
                     continue
+                loaded_scale = (
+                    tensors.get(scale_key)
+                    if scale_key is not None and scale_key in scale_keys
+                    else None
+                )
+                loaded_scale = (
+                    f.get_tensor(scale_key)
+                    if scale_key is not None and scale_key in scale_keys
+                    else None
+                )
                 special_loader = getattr(model, "load_special_weight", None)
                 special_suffixes = tuple(getattr(model, "special_weight_loaders", ()))
                 if callable(special_loader) and param_name.endswith(special_suffixes):
@@ -683,11 +705,6 @@ def load_model(
                         v, shard_id = packed_modules_mapping[k]
                         packed_param_name = param_name.replace(k, v)
                         module = _module_for_parameter(model, packed_param_name)
-                        scale_key = None
-                        loaded_scale = None
-                        if source_weight_name.endswith(".weight"):
-                            scale_key = _scale_key_for_weight_key(source_weight_name)
-                            loaded_scale = tensors.get(scale_key)
                         if _load_grouped_quantized_weight(
                             model=model,
                             module=module,
