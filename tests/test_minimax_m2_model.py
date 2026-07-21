@@ -92,6 +92,19 @@ def _random_fp8(shape):
     return torch.randn(shape).clamp(-4.0, 4.0).to(torch.float8_e4m3fn)
 
 
+def test_minimax_rmsnorm_disables_shape_dependent_compile():
+    model = _instantiate_model(_config(), _ep_context(0, 1))
+    norms = [
+        model.model.norm,
+        model.model.layers[0].input_layernorm,
+        model.model.layers[0].post_attention_layernorm,
+        model.model.layers[0].self_attn.q_norm,
+        model.model.layers[0].self_attn.k_norm,
+    ]
+
+    assert all(not norm.use_torch_compile for norm in norms)
+
+
 def test_router_matches_official_biased_sigmoid_math():
     torch.manual_seed(0)
     config = _config()

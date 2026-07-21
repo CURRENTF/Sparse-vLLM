@@ -417,8 +417,16 @@ class MiniMaxM2Attention(nn.Module):
             bias=False,
             quantization=quantization,
         )
-        self.q_norm = RMSNorm(self.q_size, eps=float(config.rms_norm_eps))
-        self.k_norm = RMSNorm(self.kv_size, eps=float(config.rms_norm_eps))
+        self.q_norm = RMSNorm(
+            self.q_size,
+            eps=float(config.rms_norm_eps),
+            use_torch_compile=False,
+        )
+        self.k_norm = RMSNorm(
+            self.kv_size,
+            eps=float(config.rms_norm_eps),
+            use_torch_compile=False,
+        )
         self.rotary_emb = get_rope(
             self.rotary_dim,
             rotary_dim=self.rotary_dim,
@@ -466,10 +474,15 @@ class MiniMaxM2DecoderLayer(nn.Module):
         self.parallel_context = get_parallel_context()
         self.self_attn = MiniMaxM2Attention(config)
         self.block_sparse_moe = MiniMaxM2SparseMoeBlock(config)
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = RMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            use_torch_compile=False,
+        )
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
+            use_torch_compile=False,
         )
 
     def forward(
@@ -496,6 +509,11 @@ class MiniMaxM2DecoderLayer(nn.Module):
 class MiniMaxM2Model(Qwen3ModelBase):
     def __init__(self, config) -> None:
         super().__init__(config, MiniMaxM2DecoderLayer)
+        self.norm = RMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            use_torch_compile=False,
+        )
 
 
 class MiniMaxM2ForCausalLM(nn.Module):
