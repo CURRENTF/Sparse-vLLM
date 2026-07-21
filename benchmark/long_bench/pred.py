@@ -19,6 +19,8 @@ from deltakv.get_chat_api import get_generate_api
 from datetime import datetime
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 BASE_PATH = os.getenv("DELTAKV_OUTPUT_DIR", str(REPO_ROOT / "outputs"))
 DATA_PREFIX_PATH = os.getenv("DELTAKV_LONGBENCH_DATA_DIR") or os.getenv("DELTAKV_DATA_DIR")
 NO_CHAT_TEMPLATE_DATASETS = {"trec", "triviaqa", "samsum", "lsht", "lcc", "repobench-p"}
