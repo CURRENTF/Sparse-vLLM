@@ -366,6 +366,7 @@ def _run_requests(
     *,
     max_tokens: int,
     max_steps: int,
+    capture_debug_steps: bool = False,
 ) -> dict[str, Any]:
     sampling_params = SamplingParams(
         temperature=0.0,
@@ -378,6 +379,7 @@ def _run_requests(
     outputs: dict[int, list[int]] = {}
     prefix_hits = {seq_id: 0 for seq_id in seq_ids}
     graph_keys = []
+    debug_steps = []
     steps = 0
     while not llm.is_finished():
         steps += 1
@@ -386,6 +388,27 @@ def _run_requests(
                 f"Generation exceeded max_steps={max_steps} for seq_ids={seq_ids}."
             )
         finished, num_tokens = llm.step()
+        if capture_debug_steps:
+            rank_summaries = llm.debug_sparse_state_summaries()
+            debug_steps.append(
+                {
+                    "step": steps,
+                    "num_tokens": int(num_tokens),
+                    "logits": llm.debug_last_logits(),
+                    "hidden_states": llm.debug_hidden_states(),
+                    "attention_states": llm.debug_attention_states(),
+                    "moe_states": llm.debug_moe_states(),
+                    "rank_moe_summaries": [
+                        {
+                            "world_rank": int(summary["world_rank"]),
+                            "ep_rank": int(summary["ep_rank"]),
+                            "moe_local": summary["moe_local"],
+                            "moe_synced": summary["moe_synced"],
+                        }
+                        for summary in rank_summaries
+                    ],
+                }
+            )
         for queue_name in ("waiting", "decoding"):
             for sequence in getattr(llm.scheduler, queue_name, ()):
                 seq_id = int(sequence.seq_id)
@@ -412,6 +435,7 @@ def _run_requests(
         "cache_stats_after": stats_after,
         "cache_stats_delta": _stats_delta(stats_before, stats_after),
         "graph_states": graph_keys,
+        "debug_steps": debug_steps,
     }
 
 
@@ -447,6 +471,8 @@ def _collect_raw_case(llm, request_result: dict[str, Any], *, use_graph: bool):
                 "moe_states": llm.debug_moe_states(),
             }
         )
+    if request_result["debug_steps"]:
+        raw_case["debug_steps"] = request_result["debug_steps"]
     return raw_case
 
 
@@ -647,6 +673,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-sizes", default="1,2,4,8,16")
     parser.add_argument("--max-tokens", type=int, default=4)
     parser.add_argument("--max-steps-per-case", type=int, default=10_000)
+    parser.add_argument("--capture-debug-steps", action="store_true")
     parser.add_argument("--seed", type=int, default=27)
     parser.add_argument("--oracle-artifact", type=Path, default=None)
     parser.add_argument("--max-relative-l2", type=float, default=0.10)
@@ -888,6 +915,7 @@ def main() -> int:
                     prompts,
                     max_tokens=args.max_tokens,
                     max_steps=args.max_steps_per_case,
+                    capture_debug_steps=args.capture_debug_steps,
                 )
                 raw_case = _collect_raw_case(
                     llm,

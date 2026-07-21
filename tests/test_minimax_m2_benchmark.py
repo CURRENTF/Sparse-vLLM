@@ -7,12 +7,15 @@ from scripts.validation import benchmark_minimax_m2_fp8 as benchmark
 
 def test_minimax_benchmark_parses_and_validates_csv_values():
     assert benchmark._parse_int_csv("1, 8,32") == [1, 8, 32]
+    assert benchmark._parse_nonnegative_int_csv("0, 1,3") == [0, 1, 3]
     assert benchmark._parse_str_csv("Reference, routed") == [
         "reference",
         "routed",
     ]
     with pytest.raises(ValueError, match="positive"):
         benchmark._parse_int_csv("1,0")
+    with pytest.raises(ValueError, match="non-negative"):
+        benchmark._parse_nonnegative_int_csv("0,-1")
     with pytest.raises(ValueError, match="non-empty"):
         benchmark._parse_str_csv(" , ")
 
