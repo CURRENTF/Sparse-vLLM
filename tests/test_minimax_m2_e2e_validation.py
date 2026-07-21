@@ -69,37 +69,48 @@ def test_e2e_validator_checks_prefix_hits_and_graph_key_reuse():
             "context_capacity": 1024,
             "is_long_text": False,
             "capture_sampling": False,
-        }
+        },
+        "captured": True,
+        "num_graph_states": 1,
     }
+    graph_replays = [graph_state, graph_state]
     results = {
         "prefix_warm": {
             "prefix_cache_hit_lengths": [0],
-            "graph_states": [graph_state],
+            "graph_states": graph_replays,
         },
         "prefix_exact": {
             "prefix_cache_hit_lengths": [112],
-            "graph_states": [graph_state],
+            "graph_states": graph_replays,
         },
         "prefix_partial": {
             "prefix_cache_hit_lengths": [64],
-            "graph_states": [graph_state],
+            "graph_states": graph_replays,
         },
         "prefix_no_hit": {
             "prefix_cache_hit_lengths": [0],
-            "graph_states": [graph_state],
+            "graph_states": graph_replays,
         },
         "prefix_shared": {
             "prefix_cache_hit_lengths": [64, 64],
-            "graph_states": [graph_state],
+            "graph_states": graph_replays,
         },
     }
     summary = validation._validate_prefix_patterns(results, use_graph=True)
     assert summary["exact_hit_tokens"] == [112]
 
-    results["prefix_partial"]["graph_states"][0] = {
-        "key": {**graph_state["key"], "context_capacity": 2048}
-    }
+    results["prefix_partial"]["graph_states"] = [
+        {
+            **graph_state,
+            "key": {**graph_state["key"], "context_capacity": 2048},
+        },
+        graph_state,
+    ]
     with pytest.raises(validation.MetricFailure, match="graph key"):
+        validation._validate_prefix_patterns(results, use_graph=True)
+
+    results["prefix_partial"]["graph_states"] = [graph_state]
+    with pytest.raises(validation.MetricFailure, match="fewer than two"):
         validation._validate_prefix_patterns(results, use_graph=True)
 
 

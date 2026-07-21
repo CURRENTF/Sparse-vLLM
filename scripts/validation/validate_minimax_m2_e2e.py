@@ -515,7 +515,11 @@ def _graph_key_tuple(request_result: dict[str, Any]):
     states = request_result["graph_states"]
     if not states:
         return None
-    key = states[-1]["key"]
+    return _graph_state_key_tuple(states[-1])
+
+
+def _graph_state_key_tuple(state: dict[str, Any]):
+    key = state["key"]
     return tuple((name, key[name]) for name in sorted(key))
 
 
@@ -539,19 +543,46 @@ def _validate_prefix_patterns(results: dict[str, dict[str, Any]], *, use_graph: 
     if len(shared_hits) != 2 or any(hit <= 0 for hit in shared_hits):
         raise MetricFailure(f"Concurrent shared-prefix reuse failed: {shared_hits}.")
     if use_graph:
+        replay_phases = (
+            "prefix_warm",
+            "prefix_exact",
+            "prefix_partial",
+            "prefix_no_hit",
+        )
+        for phase in replay_phases:
+            states = results[phase]["graph_states"]
+            if len(states) < 2:
+                raise MetricFailure(
+                    f"Prefix phase {phase!r} replayed the decode graph fewer than "
+                    f"two times: graph_states={len(states)}."
+                )
+            if any(not state.get("captured", False) for state in states):
+                raise MetricFailure(
+                    f"Prefix phase {phase!r} used an uncaptured decode state: {states}."
+                )
         keys = {
-            phase: _graph_key_tuple(results[phase])
-            for phase in (
-                "prefix_warm",
-                "prefix_exact",
-                "prefix_partial",
-                "prefix_no_hit",
-            )
+            phase: {
+                _graph_state_key_tuple(state)
+                for state in results[phase]["graph_states"]
+            }
+            for phase in replay_phases
         }
-        if None in keys.values() or len(set(keys.values())) != 1:
+        unique_keys = set().union(*keys.values())
+        if any(len(phase_keys) != 1 for phase_keys in keys.values()) or len(
+            unique_keys
+        ) != 1:
             raise MetricFailure(
                 "Prefix hit mode changed the decode graph key for one bucket: "
                 f"{keys}."
+            )
+        graph_counts = {
+            phase: results[phase]["graph_states"][-1].get("num_graph_states")
+            for phase in replay_phases
+        }
+        if None in graph_counts.values() or len(set(graph_counts.values())) != 1:
+            raise MetricFailure(
+                "Prefix hit mode changed the cached decode graph count: "
+                f"{graph_counts}."
             )
     return {
         "warm_hit_tokens": warm_hits,
@@ -559,6 +590,7 @@ def _validate_prefix_patterns(results: dict[str, dict[str, Any]], *, use_graph: 
         "partial_hit_tokens": partial_hits,
         "no_hit_tokens": no_hit,
         "shared_hit_tokens": shared_hits,
+        "minimum_graph_replays": 2 if use_graph else 0,
     }
 
 
