@@ -460,7 +460,7 @@ def test_remote_expert_without_scale_fails_immediately():
 
     assert model.map_weight_name(source_name) is None
     with pytest.raises(ValueError, match="missing weight_scale_inv"):
-        model.record_skipped_weight(source_name, None)
+        model.record_skipped_weight(source_name, None, None)
 
 
 def test_local_expert_loader_rejects_missing_duplicate_and_bad_tensors():

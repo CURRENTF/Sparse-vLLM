@@ -574,7 +574,8 @@ class MiniMaxM2ForCausalLM(nn.Module):
     def record_skipped_weight(
         self,
         source_weight_name: str,
-        loaded_scale: torch.Tensor | None,
+        loaded_scale_shape: tuple[int, ...] | None,
+        loaded_scale_dtype: str | None,
     ) -> None:
         match = _EXPERT_SOURCE_RE.match(source_weight_name)
         if match is None:
@@ -587,25 +588,26 @@ class MiniMaxM2ForCausalLM(nn.Module):
             raise ValueError(
                 f"MiniMax loader skipped local expert weight {source_weight_name!r}."
             )
-        if loaded_scale is None:
+        if loaded_scale_shape is None or loaded_scale_dtype is None:
             raise ValueError(
                 f"Skipped remote MiniMax expert is missing weight_scale_inv: "
                 f"{source_weight_name!r}."
             )
-        if loaded_scale.dtype != torch.float32:
+        if loaded_scale_dtype != "F32":
             raise TypeError(
-                f"Remote MiniMax expert scale must be FP32, got {loaded_scale.dtype}."
+                "Remote MiniMax expert scale must be FP32, got safetensors dtype "
+                f"{loaded_scale_dtype}."
             )
         expected_shape = (
             (experts.hidden_size // 128, experts.intermediate_size // 128)
             if projection == "w2"
             else (experts.intermediate_size // 128, experts.hidden_size // 128)
         )
-        if tuple(loaded_scale.shape) != expected_shape:
+        if loaded_scale_shape != expected_shape:
             raise ValueError(
                 "Remote MiniMax expert scale shape mismatch for "
                 f"{source_weight_name!r}: expected={expected_shape}, "
-                f"got={tuple(loaded_scale.shape)}."
+                f"got={loaded_scale_shape}."
             )
         self._intentionally_skipped_expert_weights.add(source_weight_name)
         self._intentionally_skipped_expert_scales.add(
