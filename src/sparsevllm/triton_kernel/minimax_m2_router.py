@@ -14,10 +14,8 @@ _TOP_K = 8
 def _topk_biased_sigmoid_kernel(
     routing_weights_ptr,
     correction_bias_ptr,
-    weights_ptr,
     ids_ptr,
     stride_routing_weights_m,
-    stride_weights_m,
     stride_ids_m,
 ):
     row = tl.program_id(0)
@@ -39,11 +37,8 @@ def _topk_biased_sigmoid_kernel(
     selected_equal = equal_mask & (equal_rank < 8 - num_greater)
     selected = greater_mask | selected_equal
     output_slot = tl.where(greater_mask, greater_rank, num_greater + equal_rank)
-    denominator = tl.sum(tl.where(selected, routing_weights, 0.0), axis=0)
 
-    weights_base = weights_ptr + row * stride_weights_m
     ids_base = ids_ptr + row * stride_ids_m
-    tl.store(weights_base + output_slot, routing_weights / denominator, mask=selected)
     tl.store(ids_base + output_slot, offsets, mask=selected)
 
 
@@ -92,22 +87,19 @@ def topk_biased_sigmoid(
     _validate_router_inputs(router_logits, correction_bias, top_k)
     num_tokens = int(router_logits.shape[0])
     routing_weights = torch.sigmoid(router_logits)
-    weights = torch.empty(
-        (num_tokens, _TOP_K), dtype=torch.float32, device=router_logits.device
-    )
     ids = torch.empty(
         (num_tokens, _TOP_K), dtype=torch.int64, device=router_logits.device
     )
     _topk_biased_sigmoid_kernel[(num_tokens,)](
         routing_weights,
         correction_bias,
-        weights,
         ids,
         routing_weights.stride(0),
-        weights.stride(0),
         ids.stride(0),
         num_warps=2 if num_tokens <= 256 else 1,
     )
+    weights = routing_weights.gather(1, ids)
+    weights = weights / weights.sum(dim=-1, keepdim=True)
     return weights, ids
 
 

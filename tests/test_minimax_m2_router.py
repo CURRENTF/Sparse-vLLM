@@ -33,7 +33,7 @@ def test_topk_biased_sigmoid_matches_minimax_reference():
     torch.cuda.synchronize()
 
     assert torch.equal(ids, expected_ids)
-    assert torch.allclose(weights, expected_weights, atol=2e-7, rtol=2e-6)
+    assert torch.equal(weights, expected_weights)
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for this test.")
@@ -53,11 +53,8 @@ def test_topk_biased_sigmoid_matches_nonfinite_reference():
 
     assert torch.equal(ids, expected_ids)
     assert torch.equal(torch.isnan(weights), torch.isnan(expected_weights))
-    assert torch.allclose(
-        torch.nan_to_num(weights),
-        torch.nan_to_num(expected_weights),
-        atol=2e-7,
-        rtol=2e-6,
+    assert torch.equal(
+        torch.nan_to_num(weights), torch.nan_to_num(expected_weights)
     )
 
 
@@ -74,7 +71,7 @@ def test_topk_biased_sigmoid_matches_unsorted_tie_order():
     torch.cuda.synchronize()
 
     assert torch.equal(ids, expected_ids)
-    assert torch.allclose(weights, expected_weights, atol=2e-7, rtol=2e-6)
+    assert torch.equal(weights, expected_weights)
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for this test.")
@@ -88,7 +85,7 @@ def test_correction_bias_selects_experts_but_does_not_change_weights():
 
     assert torch.equal(ids, expected_ids)
     assert set(ids[0].tolist()) == set(range(8))
-    assert torch.allclose(weights, expected_weights, atol=2e-7, rtol=2e-6)
+    assert torch.equal(weights, expected_weights)
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for this test.")
