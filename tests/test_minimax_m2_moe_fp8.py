@@ -398,7 +398,12 @@ def test_routed_fp8_ep_partition_and_cuda_graph_replay():
             local_expert_start=0,
         )
 
+    replay_ids = torch.zeros_like(ids)
+    replay_ids[:, 1] = 3
+    replay_weights = torch.flip(weights, dims=(1,)).contiguous()
     static_hidden.copy_(hidden_states * 0.5)
+    static_ids.copy_(replay_ids)
+    static_weights.copy_(replay_weights)
     graph.replay()
     torch.cuda.synchronize()
     expected_replay = fused_moe_fp8(
@@ -414,3 +419,21 @@ def test_routed_fp8_ep_partition_and_cuda_graph_replay():
     )
     torch.cuda.synchronize()
     assert torch.equal(graph_output, expected_replay)
+
+    static_ids.copy_((ids + 1) % 4)
+    static_weights.copy_(weights.flip(-1))
+    graph.replay()
+    torch.cuda.synchronize()
+    expected_reroute = fused_moe_fp8(
+        static_hidden,
+        w13_weight,
+        w13_scale_inv,
+        w2_weight,
+        w2_scale_inv,
+        static_ids,
+        static_weights,
+        num_experts=4,
+        local_expert_start=0,
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(graph_output, expected_reroute)
