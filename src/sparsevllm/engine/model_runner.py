@@ -646,11 +646,15 @@ class ModelRunner:
                 "output": _debug_tensor_summary(output),
             }
             experts = block.experts
+            local_output_cpu = block.debug_last_local_output.detach().cpu()
             moe_local[str(layer_idx)] = {
                 "local_expert_start": int(experts.local_expert_start),
                 "local_expert_end": int(experts.local_expert_end),
                 "local_hit_count": int(block.debug_last_local_hit_count),
-                "local_output": _debug_tensor_summary(block.debug_last_local_output),
+                "local_output": _debug_tensor_summary(local_output_cpu),
+                "local_output_row_sha256": [
+                    _debug_tensor_summary(row)["sha256"] for row in local_output_cpu
+                ],
             }
         state = self.sparse_controller.debug_state_summary()
         if self.prefix_cache_coordinator is not None:
