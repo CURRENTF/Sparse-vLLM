@@ -379,7 +379,8 @@ class MiniMaxM2SparseMoeBlock(nn.Module):
             local_hit_count = local_mask.sum()
             self.debug_last_local_hit_count = (
                 local_hit_count
-                if platforms.current_platform.is_stream_capturing()
+                if hidden_states.is_cuda
+                and platforms.current_platform.is_stream_capturing()
                 else int(local_hit_count.item())
             )
         output = self.parallel_context.ep_all_reduce(local_output)
