@@ -7,6 +7,7 @@ from sparsevllm.quantization.fp8 import (
     Fp8BlockScaledLinearBackend,
     fp8_blockwise_dequantize,
     fp8_blockwise_linear_reference,
+    load_finegrained_fp8_kernel,
 )
 from sparsevllm.triton_kernel.minimax_m2_moe_fp8 import (
     _expert_order_moe_sum,
@@ -119,6 +120,46 @@ def _explicit_oracle(
     return output
 
 
+def _native_expert_oracle(
+    hidden_states,
+    w13_weight,
+    w13_scale_inv,
+    w2_weight,
+    w2_scale_inv,
+    topk_ids,
+    topk_weights,
+):
+    kernel = load_finegrained_fp8_kernel()
+    output = torch.zeros_like(hidden_states)
+    for expert_id in range(w13_weight.shape[0]):
+        token_ids, topk_slots = torch.where(topk_ids == expert_id)
+        if token_ids.numel() == 0:
+            continue
+        expert_input = hidden_states[token_ids].contiguous()
+        gate_up = kernel.matmul(
+            expert_input,
+            w13_weight[expert_id],
+            w13_scale_inv[expert_id],
+            [128, 128],
+            hidden_states.dtype,
+        )
+        gate, up = gate_up.chunk(2, dim=-1)
+        activated = (F.silu(gate) * up).contiguous()
+        down = kernel.matmul(
+            activated,
+            w2_weight[expert_id],
+            w2_scale_inv[expert_id],
+            [128, 128],
+            hidden_states.dtype,
+        )
+        output.index_add_(
+            0,
+            token_ids,
+            down * topk_weights[token_ids, topk_slots, None].to(down.dtype),
+        )
+    return output
+
+
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for this test.")
 def test_generic_native_fp8_linear_matches_reference_intermediate():
     hidden_states, w13_weight, w13_scale_inv, *_ = _inputs()
@@ -170,6 +211,36 @@ def test_routed_fp8_matches_explicit_dequant_oracle():
     )
     relative_l2 = torch.linalg.vector_norm(error) / torch.linalg.vector_norm(expected)
     assert float(relative_l2) < 0.06
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for this test.")
+def test_routed_fp8_matches_native_with_hot_expert():
+    inputs = list(_inputs())
+    hidden_states = inputs[0]
+    repeats = 6
+    inputs[0] = hidden_states.repeat(repeats, 1).contiguous()
+    num_tokens = inputs[0].shape[0]
+    topk_ids = torch.empty(
+        num_tokens,
+        2,
+        device="cuda",
+        dtype=torch.int64,
+    )
+    topk_ids[:, 0] = 0
+    topk_ids[:58, 0] = 3
+    topk_ids[:, 1] = torch.arange(num_tokens, device="cuda") % 3
+    inputs[5] = topk_ids.contiguous()
+    inputs[6] = inputs[6].repeat(repeats, 1).contiguous()
+
+    expected = _native_expert_oracle(*inputs)
+    actual = fused_moe_fp8(
+        *inputs,
+        num_experts=4,
+        local_expert_start=0,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(actual, expected)
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for this test.")

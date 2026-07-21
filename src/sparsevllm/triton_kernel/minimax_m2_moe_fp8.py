@@ -5,10 +5,151 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from sparsevllm.quantization.fp8 import load_finegrained_fp8_kernel
-
-
 _SUPPORTED_ACTIVATION_DTYPES = (torch.bfloat16, torch.float16)
+_FP8_MATMUL_CONFIGS = [
+    triton.Config({}, num_warps=num_warps, num_stages=num_stages)
+    for num_stages in (2, 3, 4)
+    for num_warps in (2, 4, 8, 16)
+]
+_EXPERT_M_BLOCK_SIZES = (16, 32, 64, 128)
+
+
+@triton.jit
+def _count_local_experts_kernel(
+    expert_ids_ptr,
+    expert_counts_ptr,
+    num_slots,
+    NUM_EXPERTS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    expert_ids = tl.load(
+        expert_ids_ptr + offsets,
+        mask=offsets < num_slots,
+        other=NUM_EXPERTS,
+    ).to(tl.int32)
+    is_local = expert_ids < NUM_EXPERTS
+    tl.atomic_add(
+        expert_counts_ptr + expert_ids,
+        1,
+        mask=is_local,
+    )
+
+
+@triton.autotune(
+    configs=_FP8_MATMUL_CONFIGS,
+    key=["N", "K", "BLOCK_SIZE_M"],
+)
+@triton.jit
+def _expert_bucket_fp8_matmul_kernel(
+    A,
+    B,
+    C,
+    Bs,
+    ExpertIds,
+    ExpertCounts,
+    S,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_be,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    stride_bs_e,
+    stride_bs_k,
+    stride_bs_n,
+    stride_eid,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    NUM_EXPERTS: tl.constexpr,
+):
+    slot_id = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    expert_id = tl.load(ExpertIds + slot_id * stride_eid).to(tl.int64)
+    if expert_id >= NUM_EXPERTS:
+        return
+
+    expert_count = tl.load(ExpertCounts + expert_id).to(tl.int32)
+    lower_bound = BLOCK_SIZE_M // 2 if BLOCK_SIZE_M > 16 else 0
+    if expert_count <= lower_bound:
+        return
+    if BLOCK_SIZE_M < 128 and expert_count > BLOCK_SIZE_M:
+        return
+
+    A = A + slot_id * stride_am
+    B = B + expert_id * stride_be
+    C = C + slot_id * stride_cm
+    Bs = Bs + expert_id * stride_bs_e
+
+    offsets_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offsets_k = tl.arange(0, BLOCK_SIZE_K)
+    offsets_m = tl.arange(0, BLOCK_SIZE_M)
+    a_ptrs = A + offsets_m[:, None] * 0 + offsets_k[None, :] * stride_ak
+    b_ptrs = B + offsets_k[:, None] * stride_bk + offsets_n[None, :] * stride_bn
+    bs_ptrs = Bs + pid_n * stride_bs_n
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for _ in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        a_raw = tl.load(a_ptrs).to(tl.float32)
+        a_scale = tl.max(tl.abs(a_raw), axis=1) / 448.0
+        a = (a_raw / tl.maximum(a_scale[:, None], 1.0e-12)).to(
+            tl.float8e4nv
+        )
+        b = tl.load(b_ptrs)
+        b_scale = tl.load(bs_ptrs)
+        accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_ptrs += BLOCK_SIZE_K * stride_bk
+        bs_ptrs += stride_bs_k
+
+    output = accumulator.to(C.dtype.element_ty)
+    c_ptrs = C + offsets_m[:, None] * 0 + offsets_n[None, :] * stride_cn
+    tl.store(c_ptrs, output, mask=(offsets_m == 0)[:, None])
+
+
+def _expert_bucket_fp8_matmul(
+    inputs: torch.Tensor,
+    weight: torch.Tensor,
+    scale_inv: torch.Tensor,
+    expert_ids: torch.Tensor,
+    expert_counts: torch.Tensor,
+) -> torch.Tensor:
+    num_slots, input_size = (int(dim) for dim in inputs.shape)
+    num_experts, output_size, _ = (int(dim) for dim in weight.shape)
+    output = inputs.new_empty((num_slots, output_size))
+    grid = (num_slots, triton.cdiv(output_size, 128))
+    for block_m in _EXPERT_M_BLOCK_SIZES:
+        _expert_bucket_fp8_matmul_kernel[grid](
+            inputs,
+            weight,
+            output,
+            scale_inv,
+            expert_ids,
+            expert_counts,
+            num_slots,
+            output_size,
+            input_size,
+            inputs.stride(0),
+            inputs.stride(1),
+            weight.stride(0),
+            weight.stride(2),
+            weight.stride(1),
+            output.stride(0),
+            output.stride(1),
+            scale_inv.stride(0),
+            scale_inv.stride(2),
+            scale_inv.stride(1),
+            expert_ids.stride(0),
+            BLOCK_SIZE_M=block_m,
+            BLOCK_SIZE_N=128,
+            BLOCK_SIZE_K=128,
+            NUM_EXPERTS=num_experts,
+        )
+    return output
 
 
 @triton.jit(
@@ -292,23 +433,36 @@ def fused_moe_fp8(
         torch.full_like(local_ids, num_local_experts),
     ).contiguous()
     selected_hidden_states = hidden_states.repeat_interleave(top_k, dim=0)
+    expert_counts = torch.zeros(
+        num_local_experts,
+        device=hidden_states.device,
+        dtype=torch.int32,
+    )
+    count_block_size = 256
+    _count_local_experts_kernel[(triton.cdiv(expert_ids.numel(), count_block_size),)](
+        expert_ids,
+        expert_counts,
+        expert_ids.numel(),
+        NUM_EXPERTS=num_local_experts,
+        BLOCK_SIZE=count_block_size,
+        num_warps=4,
+    )
 
-    kernel = load_finegrained_fp8_kernel()
-    gate_up = kernel.matmul_batched(
+    gate_up = _expert_bucket_fp8_matmul(
         selected_hidden_states,
         w13_weight,
         w13_scale_inv,
         expert_ids,
-        [128, 128],
+        expert_counts,
     )
     gate, up = gate_up.chunk(2, dim=-1)
     activated = F.silu(gate) * up
-    down = kernel.matmul_batched(
+    down = _expert_bucket_fp8_matmul(
         activated,
         w2_weight,
         w2_scale_inv,
         expert_ids,
-        [128, 128],
+        expert_counts,
     )
     weighted = down * topk_weights.reshape(-1, 1).to(down.dtype)
     return _expert_order_moe_sum(
