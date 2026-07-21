@@ -471,7 +471,7 @@ def _collect_raw_case(llm, request_result: dict[str, Any], *, use_graph: bool):
                 "moe_states": llm.debug_moe_states(),
             }
         )
-    if request_result["debug_steps"]:
+    if request_result.get("debug_steps"):
         raw_case["debug_steps"] = request_result["debug_steps"]
     return raw_case
 
@@ -799,6 +799,7 @@ def main() -> int:
                 "batch_sizes": batch_sizes,
                 "max_tokens": args.max_tokens,
                 "max_steps_per_case": args.max_steps_per_case,
+                "capture_debug_steps": bool(args.capture_debug_steps),
                 "checkpoint_manifest": _checkpoint_manifest(args.model_path),
                 "thresholds": {
                     "max_relative_l2": args.max_relative_l2,
