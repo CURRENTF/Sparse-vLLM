@@ -3,6 +3,7 @@ import os
 import time
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from glob import glob
 
 import torch
@@ -15,6 +16,18 @@ from sparsevllm.utils.log import logger
 
 def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
     param.data.copy_(loaded_weight)
+
+
+@dataclass(frozen=True)
+class TensorMetadata:
+    shape: tuple[int, ...]
+    dtype: str
+
+
+@dataclass
+class SafetensorsShard:
+    metadata: dict[str, TensorMetadata]
+    tensors: dict[str, torch.Tensor]
 
 
 def _rank_local_slice_for_tensor(
@@ -63,25 +76,40 @@ def _rank_local_slice_for_tensor(
 def _read_safetensors_shard(
     path: str,
     model: nn.Module | None = None,
-) -> dict[str, torch.Tensor]:
+) -> SafetensorsShard:
     with safe_open(path, "pt", "cpu") as handle:
+        metadata: dict[str, TensorMetadata] = {}
         tensors: dict[str, torch.Tensor] = {}
         for key in handle.keys():
+            tensor_slice = handle.get_slice(key)
+            source_shape = tuple(int(dim) for dim in tensor_slice.get_shape())
+            metadata[key] = TensorMetadata(
+                shape=source_shape,
+                dtype=str(tensor_slice.get_dtype()),
+            )
             if model is None:
                 tensors[key] = handle.get_tensor(key)
                 continue
-            tensor_slice = handle.get_slice(key)
+
+            is_scale = key.endswith(".weight_scale_inv")
+            source_parameter_name = (
+                key[: -len(".weight_scale_inv")] + ".weight"
+                if is_scale
+                else key
+            )
+            if _target_weight_name_for_model(model, source_parameter_name) is None:
+                continue
             rank_slice = _rank_local_slice_for_tensor(
                 model,
                 key,
-                tuple(tensor_slice.get_shape()),
+                source_shape,
             )
             tensors[key] = (
                 tensor_slice[rank_slice]
                 if rank_slice is not None
                 else handle.get_tensor(key)
             )
-        return tensors
+        return SafetensorsShard(metadata=metadata, tensors=tensors)
 
 
 def _iter_safetensors_shards(
@@ -97,7 +125,7 @@ def _iter_safetensors_shards(
         return
 
     file_iter = iter(files)
-    pending: deque[tuple[str, Future[dict[str, torch.Tensor]]]] = deque()
+    pending: deque[tuple[str, Future[SafetensorsShard]]] = deque()
     with ThreadPoolExecutor(max_workers=min(num_threads, len(files))) as executor:
         for _ in range(min(num_threads, len(files))):
             file = next(file_iter)
@@ -624,16 +652,17 @@ def load_model(
         dynamic_ncols=True,
         disable=not show_progress,
     ) as progress:
-        for _, tensors in _iter_safetensors_shards(
+        for _, shard in _iter_safetensors_shards(
             files,
             num_threads=num_threads,
             model=None if checkpoint_is_rank_local else model,
         ):
+            tensors = shard.tensors
             loaded_tensor_bytes += sum(
                 tensor.numel() * tensor.element_size()
                 for tensor in tensors.values()
             )
-            keys = list(tensors)
+            keys = list(shard.metadata)
             duplicate_source_keys = sorted(seen_source_keys.intersection(keys))
             if duplicate_source_keys:
                 raise ValueError(
@@ -653,25 +682,20 @@ def load_model(
                 if param_name is None:
                     skipped_weight_hook = getattr(model, "record_skipped_weight", None)
                     if callable(skipped_weight_hook):
-                        weight_tensor = tensors[source_weight_name]
-                        scale_tensor = tensors.get(scale_key)
+                        weight_metadata = shard.metadata[source_weight_name]
+                        scale_metadata = shard.metadata.get(scale_key)
                         skipped_weight_hook(
                             source_weight_name,
-                            tuple(int(dim) for dim in weight_tensor.shape),
+                            weight_metadata.shape,
+                            weight_metadata.dtype,
                             (
-                                "F8_E4M3"
-                                if weight_tensor.dtype == torch.float8_e4m3fn
-                                else str(weight_tensor.dtype)
-                            ),
-                            (
-                                tuple(int(dim) for dim in scale_tensor.shape)
-                                if scale_tensor is not None
+                                scale_metadata.shape
+                                if scale_metadata is not None
                                 else None
                             ),
                             (
-                                "F32"
-                                if scale_tensor is not None
-                                and scale_tensor.dtype == torch.float32
+                                scale_metadata.dtype
+                                if scale_metadata is not None
                                 else None
                             ),
                         )
