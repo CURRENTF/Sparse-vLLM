@@ -25,11 +25,28 @@ class VocabParallelEmbedding(nn.Module):
         self.weight = nn.Parameter(torch.empty(self.num_embeddings_per_partition, embedding_dim))
         self.weight.weight_loader = self.weight_loader
 
+    def rank_local_weight_slice(
+        self,
+        source_shape: tuple[int, ...],
+        *,
+        loaded_shard_id=None,
+        is_scale: bool = False,
+    ) -> tuple[slice, ...] | None:
+        del loaded_shard_id, is_scale
+        if self.tp_size == 1:
+            return None
+        shard_size = int(source_shape[0]) // self.tp_size
+        start = self.tp_rank * shard_size
+        return (slice(start, start + shard_size),) + (slice(None),) * (
+            len(source_shape) - 1
+        )
+
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param_data = param.data
         shard_size = param_data.size(0)
-        start_idx = self.tp_rank * shard_size
-        loaded_weight = loaded_weight.narrow(0, start_idx, shard_size)
+        if loaded_weight.size(0) != shard_size:
+            start_idx = self.tp_rank * shard_size
+            loaded_weight = loaded_weight.narrow(0, start_idx, shard_size)
         param_data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor):

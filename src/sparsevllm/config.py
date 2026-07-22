@@ -597,6 +597,7 @@ class Config:
     tensor_parallel_size: int = 1
     expert_parallel_size: int = 1
     data_parallel_size: int = 1
+    weight_loading_workers: int = 8
     moe_backend: str = "triton"
     enforce_eager: bool = True
     hf_config: Union[Qwen3Config, AutoConfig] | None = None
@@ -1048,6 +1049,7 @@ class Config:
         self.tensor_parallel_size = int(self.tensor_parallel_size)
         self.expert_parallel_size = int(self.expert_parallel_size)
         self.data_parallel_size = int(self.data_parallel_size)
+        self.weight_loading_workers = int(self.weight_loading_workers)
         self.moe_backend = str(self.moe_backend or "").strip().lower()
         if not 1 <= self.tensor_parallel_size <= 8:
             raise ValueError(f"tensor_parallel_size must be in [1, 8], got {self.tensor_parallel_size}.")
@@ -1058,6 +1060,11 @@ class Config:
         if self.data_parallel_size <= 0:
             raise ValueError(
                 f"data_parallel_size must be positive, got {self.data_parallel_size}."
+            )
+        if self.weight_loading_workers <= 0:
+            raise ValueError(
+                "weight_loading_workers must be positive, "
+                f"got {self.weight_loading_workers}."
             )
         if self.moe_backend not in {"pytorch", "triton"}:
             raise ValueError(
