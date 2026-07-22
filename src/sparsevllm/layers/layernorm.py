@@ -23,9 +23,9 @@ class RMSNorm(nn.Module):
         x_float = x.float()
         var = x_float.pow(2).mean(dim=-1, keepdim=True)
         x_norm = x_float * torch.rsqrt(var + self.eps)
-        return x_norm.to(orig_dtype) * self.weight.to(orig_dtype)
+        return (x_norm * self.weight.float()).to(orig_dtype)
 
-    @torch.compile
+    @torch.compile(dynamic=True)
     def rms_forward(
         self,
         x: torch.Tensor,
@@ -42,9 +42,9 @@ class RMSNorm(nn.Module):
         residual = x_float.to(orig_dtype)
         var = x_float.pow(2).mean(dim=-1, keepdim=True)
         x_norm = x_float * torch.rsqrt(var + self.eps)
-        return x_norm.to(orig_dtype) * self.weight.to(orig_dtype), residual
+        return (x_norm * self.weight.float()).to(orig_dtype), residual
 
-    @torch.compile
+    @torch.compile(dynamic=True)
     def add_rms_forward(
         self,
         x: torch.Tensor,

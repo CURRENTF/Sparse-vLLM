@@ -421,12 +421,10 @@ class MiniMaxM2Attention(nn.Module):
         self.q_norm = RMSNorm(
             self.q_size,
             eps=float(config.rms_norm_eps),
-            use_torch_compile=False,
         )
         self.k_norm = RMSNorm(
             self.kv_size,
             eps=float(config.rms_norm_eps),
-            use_torch_compile=False,
         )
         self.rotary_emb = get_rope(
             self.rotary_dim,
@@ -478,12 +476,10 @@ class MiniMaxM2DecoderLayer(nn.Module):
         self.input_layernorm = RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
-            use_torch_compile=False,
         )
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
-            use_torch_compile=False,
         )
 
     def forward(
@@ -513,7 +509,6 @@ class MiniMaxM2Model(Qwen3ModelBase):
         self.norm = RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
-            use_torch_compile=False,
         )
 
 

@@ -77,6 +77,31 @@ def test_qwen3_rmsnorm_does_not_modify_input(dtype):
     assert torch.equal(x, original)
 
 
+@pytest.mark.parametrize("with_residual", [False, True])
+def test_rmsnorm_multiplies_weight_in_fp32_before_final_cast(with_residual):
+    torch.manual_seed(27)
+    norm = RMSNorm(16, use_torch_compile=False)
+    norm.weight.data.normal_(mean=1.0, std=0.2)
+    x = torch.randn(3, 16, dtype=torch.bfloat16)
+    residual = torch.randn_like(x) if with_residual else None
+
+    if residual is None:
+        actual = norm(x)
+        x_float = x.float()
+    else:
+        actual, actual_residual = norm(x, residual)
+        x_float = x.float() + residual.float()
+        assert torch.equal(actual_residual, x_float.to(x.dtype))
+
+    variance = x_float.pow(2).mean(dim=-1, keepdim=True)
+    normalized = x_float * torch.rsqrt(variance + norm.eps)
+    expected = (normalized * norm.weight.float()).to(x.dtype)
+    old_cast_order = normalized.to(x.dtype) * norm.weight.to(x.dtype)
+
+    assert torch.equal(actual, expected)
+    assert not torch.equal(actual, old_cast_order)
+
+
 def test_qwen3_attention_passes_raw_key_without_clone():
     class FixedProjection(torch.nn.Module):
         def __init__(self, output):
