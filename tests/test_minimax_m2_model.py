@@ -360,8 +360,9 @@ def test_attention_uses_flat_qk_norm_and_partial_rope():
             "sparsevllm.layers.linear.get_parallel_context",
             return_value=context,
         ),
-    ):
-        attention = MiniMaxM2Attention(config)
+        ):
+            attention = MiniMaxM2Attention(config)
+    attention.rotary_emb.backend = "torch"
     attention.q_norm = _ReferenceRMSNorm(attention.q_norm)
     attention.k_norm = _ReferenceRMSNorm(attention.k_norm)
     qkv = torch.randn(3, 3 * config.hidden_size)
@@ -645,6 +646,7 @@ def test_tiny_dynamic_w8a8_model_stays_close_to_w8a16_transformers():
     config = _config()
     context = _ep_context(0, 1)
     model = _instantiate_model(config, context).eval()
+    model.model.layers[0].self_attn.rotary_emb.backend = "torch"
     _initialize_tiny_reference_weights(model)
     _replace_rmsnorm_with_reference(model)
     model.model.layers[0].self_attn.attn = _TinyCausalAttention(64**-0.5)

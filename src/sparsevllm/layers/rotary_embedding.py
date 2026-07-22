@@ -1,5 +1,6 @@
 import math
 from functools import lru_cache
+
 import torch
 from torch import nn
 
@@ -37,12 +38,16 @@ def apply_partial_rotary_emb(
     if rotary_dim == query_dim == key_dim:
         return rotary_emb(positions, query, key)
 
-    cos_sin = rotary_emb.cos_sin_cache[positions]
-    if int(cos_sin.shape[-1]) != rotary_dim:
+    cache_rotary_dim = int(rotary_emb.cos_sin_cache.shape[-1])
+    if cache_rotary_dim != rotary_dim:
         raise RuntimeError(
             "Rotary cache dimension does not match partial rotary_dim: "
-            f"cache={cos_sin.shape[-1]}, rotary_dim={rotary_dim}."
+            f"cache={cache_rotary_dim}, rotary_dim={rotary_dim}."
         )
+    if rotary_emb.backend == "flashinfer":
+        return rotary_emb.flashinfer_forward(positions, query, key)
+
+    cos_sin = rotary_emb.cos_sin_cache[positions]
     cos, sin = cos_sin.chunk(2, dim=-1)
     query_rotated = apply_rotary_emb(query[..., :rotary_dim], cos, sin)
     key_rotated = apply_rotary_emb(key[..., :rotary_dim], cos, sin)
@@ -77,8 +82,14 @@ class RotaryEmbedding(nn.Module):
         max_position_embeddings: int,
         base: float,
         rope_scaling: tuple[tuple[str, object], ...] | None = None,
+        backend: str = "flashinfer",
     ) -> None:
         super().__init__()
+        if backend not in {"flashinfer", "torch"}:
+            raise ValueError(
+                f"Unsupported RoPE backend={backend!r}; expected 'flashinfer' or 'torch'."
+            )
+        self.backend = backend
         self.head_size = head_size
         assert rotary_dim == head_size
         inv_freq = 1.0 / (base**(torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))
@@ -109,6 +120,18 @@ class RotaryEmbedding(nn.Module):
         cache = torch.cat((cos, sin), dim=-1).unsqueeze_(1)
         self.register_buffer("cos_sin_cache", cache, persistent=False)
 
+    @staticmethod
+    @lru_cache(1)
+    def _load_flashinfer_op():
+        try:
+            from flashinfer import apply_rope_with_cos_sin_cache
+        except ImportError as exc:
+            raise ImportError(
+                "FlashInfer RoPE requires flashinfer-python and the JIT cache "
+                "matching torch.version.cuda."
+            ) from exc
+        return apply_rope_with_cos_sin_cache
+
     @torch.compile(fullgraph=True, dynamic=True)
     def compiled_forward(
         self,
@@ -122,12 +145,35 @@ class RotaryEmbedding(nn.Module):
         key = apply_rotary_emb(key, cos, sin)
         return query, key
 
+    def flashinfer_forward(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        cos_sin_cache = self.cos_sin_cache.squeeze(1)
+        head_size = int(query.shape[-1])
+        query_flat = query.view(query.shape[0], -1)
+        key_flat = key.view(key.shape[0], -1)
+        apply_rope_with_cos_sin_cache = self._load_flashinfer_op()
+        query_out, key_out = apply_rope_with_cos_sin_cache(
+            positions=positions,
+            query=query_flat,
+            key=key_flat,
+            head_size=head_size,
+            cos_sin_cache=cos_sin_cache,
+            is_neox=True,
+        )
+        return query_out.view_as(query), key_out.view_as(key)
+
     def forward(
         self,
         positions: torch.Tensor,
         query: torch.Tensor,
         key: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.backend == "flashinfer":
+            return self.flashinfer_forward(positions, query, key)
         return self.compiled_forward(positions, query, key)
 
 
@@ -138,6 +184,14 @@ def get_rope(
     max_position: int,
     base: float,
     rope_scaling: tuple[tuple[str, object], ...] | None = None,
+    backend: str = "flashinfer",
 ):
-    rotary_emb = RotaryEmbedding(head_size, rotary_dim, max_position, base, rope_scaling=rope_scaling)
+    rotary_emb = RotaryEmbedding(
+        head_size,
+        rotary_dim,
+        max_position,
+        base,
+        rope_scaling=rope_scaling,
+        backend=backend,
+    )
     return rotary_emb
