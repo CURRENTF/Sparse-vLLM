@@ -76,8 +76,18 @@ QWEN3_MOE_EP_COMPATIBILITY = ModelRuntimeCompatibility(
 
 MINIMAX_M2_EP_COMPATIBILITY = ModelRuntimeCompatibility(
     parallel_mode="ep_replicated_kv",
-    sparse_methods=frozenset({""}),
-    prefix_cache_methods=frozenset({""}),
+    sparse_methods=frozenset(
+        {
+            "",
+            "streamingllm",
+            "snapkv",
+            "pyramidkv",
+            "omnikv",
+            "quest",
+            "rkv",
+        }
+    ),
+    prefix_cache_methods=frozenset({"", "omnikv", "quest"}),
     requires_eager=False,
     decode_cuda_graph_methods=frozenset({""}),
 )
