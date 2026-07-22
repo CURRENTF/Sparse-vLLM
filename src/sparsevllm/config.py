@@ -685,6 +685,7 @@ class Config:
     tensor_parallel_size: int = 1
     expert_parallel_size: int = 1
     data_parallel_size: int = 1
+    # Total host-side I/O worker budget shared by all distributed ranks.
     weight_loading_workers: int = 8
     moe_backend: str = "triton"
     enforce_eager: bool = True
@@ -851,6 +852,10 @@ class Config:
             * int(self.expert_parallel_size)
             * int(self.data_parallel_size)
         )
+
+    @property
+    def weight_loading_workers_per_rank(self) -> int:
+        return max(1, self.weight_loading_workers // self.world_size)
 
     def _normalize_platform_aliases(self):
         if self.device_memory_utilization is not None:
