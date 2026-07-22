@@ -181,6 +181,7 @@ class ModelRunner:
             tp_size=self.parallel_context.tp_size,
             num_threads=config.weight_loading_workers_per_rank,
             show_progress=self.parallel_context.world_rank == 0,
+            progress_rank=0 if self.parallel_context.world_rank == 0 else None,
         )
         if (
             hf_config.model_type in {"qwen3_moe", "minimax_m2"}

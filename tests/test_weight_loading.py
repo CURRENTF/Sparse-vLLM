@@ -119,6 +119,19 @@ def test_load_model_can_disable_progress(tmp_path, capsys):
     assert "loading shards" not in capsys.readouterr().err.lower()
 
 
+def test_load_model_labels_progress_rank(tmp_path, capsys):
+    _write_two_shards(tmp_path)
+
+    loader.load_model(
+        _TwoShardModel(),
+        str(tmp_path),
+        num_threads=2,
+        progress_rank=0,
+    )
+
+    assert "Multi-thread loading shards (rank 0)" in capsys.readouterr().err
+
+
 def test_load_model_reads_only_rank_local_tensor_slice(tmp_path):
     full_weight = torch.arange(8, dtype=torch.float32).reshape(4, 2)
     save_file({"proj.weight": full_weight}, tmp_path / "model.safetensors")

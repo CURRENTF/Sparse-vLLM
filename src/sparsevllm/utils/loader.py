@@ -600,6 +600,7 @@ def load_model(
     tp_size: int | None = None,
     num_threads: int = 8,
     show_progress: bool | None = None,
+    progress_rank: int | None = None,
 ):
     num_threads = int(num_threads)
     if num_threads <= 0:
@@ -647,6 +648,8 @@ def load_model(
         if num_threads > 1 and len(files) > 1
         else "Loading weight shards"
     )
+    if progress_rank is not None:
+        description = f"{description} (rank {int(progress_rank)})"
     with tqdm(
         total=len(files),
         desc=description,
