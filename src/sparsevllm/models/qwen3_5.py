@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from sparsevllm.distributed import get_parallel_context
 from sparsevllm.layers.activation import SiluAndMul
 from sparsevllm.layers.attention import Attention
-from sparsevllm.layers.layernorm import RMSNorm
+from sparsevllm.layers.layernorm import GemmaRMSNorm
 from sparsevllm.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -309,46 +309,8 @@ class Qwen35GatedRMSNorm(nn.Module):
         )
 
 
-class Qwen35RMSNorm(nn.Module):
-    def __init__(self, hidden_size: int, eps: float = 1.0e-6) -> None:
-        super().__init__()
-        self.eps = float(eps)
-        self.weight = nn.Parameter(torch.zeros(hidden_size))
-
-    def _norm_with_weight(self, x_float: torch.Tensor, orig_dtype: torch.dtype) -> torch.Tensor:
-        variance = x_float.pow(2).mean(dim=-1, keepdim=True)
-        x_norm = x_float * torch.rsqrt(variance + self.eps)
-        return (x_norm * (1.0 + self.weight.float())).to(orig_dtype)
-
-    def _rms_forward_impl(self, x: torch.Tensor) -> torch.Tensor:
-        return self._norm_with_weight(x.float(), x.dtype)
-
-    @torch.compile
-    def rms_forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self._rms_forward_impl(x)
-
-    def _add_rms_forward_impl(
-        self,
-        x: torch.Tensor,
-        residual: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        orig_dtype = x.dtype
-        x_float = x.float() + residual.float()
-        residual = x_float.to(orig_dtype)
-        return self._norm_with_weight(x_float, orig_dtype), residual
-
-    @torch.compile
-    def add_rms_forward(self, x: torch.Tensor, residual: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        return self._add_rms_forward_impl(x, residual)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        residual: torch.Tensor | None = None,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if residual is None:
-            return self.rms_forward(x)
-        return self.add_rms_forward(x, residual)
+class Qwen35RMSNorm(GemmaRMSNorm):
+    """Qwen3.5 RMSNorm using its Hugging Face offset-weight semantics."""
 
 
 class Qwen35LinearConv1D(nn.Module):

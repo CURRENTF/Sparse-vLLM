@@ -66,40 +66,68 @@ def _instantiate_model(config, context):
         return Qwen3MoeForCausalLM(config)
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def _rmsnorm_reference(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    x_float = x.float()
+    normalized = x_float * torch.rsqrt(
+        x_float.square().mean(dim=-1, keepdim=True) + eps
+    )
+    return (normalized * weight.float()).to(x.dtype)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_qwen3_rmsnorm_does_not_modify_input(dtype):
-    norm = RMSNorm(4)
-    x = torch.randn(3, 4, dtype=dtype)
+    pytest.importorskip("flashinfer")
+    norm = RMSNorm(128).cuda().to(dtype)
+    x = torch.randn(3, 128, device="cuda", dtype=dtype)
     original = x.clone()
 
-    norm(x)
+    actual = norm(x)
 
     assert torch.equal(x, original)
+    torch.testing.assert_close(
+        actual,
+        _rmsnorm_reference(x, norm.weight, norm.eps),
+        rtol=1.0e-2,
+        atol=3.0e-2,
+    )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("with_residual", [False, True])
-def test_rmsnorm_multiplies_weight_in_fp32_before_final_cast(with_residual):
+def test_rmsnorm_matches_fp32_reference(dtype, with_residual):
+    pytest.importorskip("flashinfer")
     torch.manual_seed(27)
-    norm = RMSNorm(16)
+    norm = RMSNorm(128).cuda().to(dtype)
     norm.weight.data.normal_(mean=1.0, std=0.2)
-    x = torch.randn(3, 16, dtype=torch.bfloat16)
+    x = torch.randn(7, 128, device="cuda", dtype=dtype)
     residual = torch.randn_like(x) if with_residual else None
 
     if residual is None:
-        actual = norm._rms_forward_impl(x)
-        x_float = x.float()
+        expected = _rmsnorm_reference(x, norm.weight, norm.eps)
+        actual = norm(x)
     else:
-        actual, actual_residual = norm._add_rms_forward_impl(x, residual)
-        x_float = x.float() + residual.float()
-        assert torch.equal(actual_residual, x_float.to(x.dtype))
+        merged = x.float() + residual.float()
+        expected_residual = merged.to(dtype)
+        expected = _rmsnorm_reference(
+            merged,
+            norm.weight,
+            norm.eps,
+        ).to(dtype)
+        actual, actual_residual = norm(x, residual)
+        assert torch.equal(actual_residual, expected_residual)
 
-    variance = x_float.pow(2).mean(dim=-1, keepdim=True)
-    normalized = x_float * torch.rsqrt(variance + norm.eps)
-    expected = (normalized * norm.weight.float()).to(x.dtype)
-    old_cast_order = normalized.to(x.dtype) * norm.weight.to(x.dtype)
-
-    assert torch.equal(actual, expected)
-    assert not torch.equal(actual, old_cast_order)
+    torch.testing.assert_close(
+        actual,
+        expected,
+        rtol=1.0e-2,
+        atol=3.0e-2,
+    )
 
 
 def test_qwen3_attention_passes_raw_key_without_clone():

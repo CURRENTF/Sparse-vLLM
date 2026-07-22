@@ -12,7 +12,7 @@ from transformers import (
 
 from sparsevllm.config import QuantizationConfig
 from sparsevllm.distributed import ParallelContext, ParallelGroup
-from sparsevllm.layers.layernorm import FlashInferRMSNorm
+from sparsevllm.layers.layernorm import RMSNorm
 from sparsevllm.models.minimax_m2 import (
     MiniMaxM2Attention,
     MiniMaxM2ForCausalLM,
@@ -26,30 +26,58 @@ from sparsevllm.quantization.fp8 import (
 from sparsevllm.utils.loader import load_model
 
 
-@pytest.mark.parametrize("hidden_size", [1024, 3072, 6144])
-def test_flashinfer_rmsnorm_cpu_reference(hidden_size):
-    torch.manual_seed(31)
-    norm = FlashInferRMSNorm(hidden_size)
-    norm.weight.data.normal_(mean=1.0, std=0.2)
-    x = torch.randn(3, hidden_size)
+def _rmsnorm_reference(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    *,
+    weight_offset: float = 0.0,
+) -> torch.Tensor:
+    x_float = x.float()
+    normalized = x_float * torch.rsqrt(
+        x_float.square().mean(dim=-1, keepdim=True) + eps
+    )
+    return (normalized * (weight.float() + weight_offset)).to(x.dtype)
 
-    actual = norm(x)
-    expected = norm._rms_forward_impl(x)
 
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+class _ReferenceRMSNorm(torch.nn.Module):
+    def __init__(self, norm: RMSNorm) -> None:
+        super().__init__()
+        self.eps = norm.eps
+        self.weight = torch.nn.Parameter(norm.weight.detach().clone())
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if residual is None:
+            return _rmsnorm_reference(x, self.weight, self.eps)
+        merged = x.float() + residual.float()
+        merged_output = merged.to(x.dtype)
+        return _rmsnorm_reference(merged, self.weight, self.eps).to(x.dtype), merged_output
+
+
+def _replace_rmsnorm_with_reference(module: torch.nn.Module) -> None:
+    for name, child in tuple(module.named_children()):
+        if isinstance(child, RMSNorm):
+            setattr(module, name, _ReferenceRMSNorm(child))
+        else:
+            _replace_rmsnorm_with_reference(child)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("hidden_size", [1024, 3072, 6144])
-def test_flashinfer_rmsnorm_matches_reference_for_minimax_shapes(hidden_size):
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_flashinfer_rmsnorm_matches_reference_for_minimax_shapes(hidden_size, dtype):
     pytest.importorskip("flashinfer")
     torch.manual_seed(37)
-    norm = FlashInferRMSNorm(hidden_size).cuda().to(torch.bfloat16)
+    norm = RMSNorm(hidden_size).cuda().to(dtype)
     norm.weight.data.normal_(mean=1.0, std=0.2)
-    storage = torch.randn(7, 8192, device="cuda", dtype=torch.bfloat16)
+    storage = torch.randn(7, 8192, device="cuda", dtype=dtype)
     x = storage[:, :hidden_size]
     original = x.clone()
-    expected = norm._rms_forward_impl(x)
+    expected = _rmsnorm_reference(x, norm.weight, norm.eps)
 
     actual = norm(x)
 
@@ -61,11 +89,13 @@ def test_flashinfer_rmsnorm_matches_reference_for_minimax_shapes(hidden_size):
 def test_flashinfer_fused_add_rmsnorm_matches_reference():
     pytest.importorskip("flashinfer")
     torch.manual_seed(41)
-    norm = FlashInferRMSNorm(3072).cuda().to(torch.bfloat16)
+    norm = RMSNorm(3072).cuda().to(torch.bfloat16)
     norm.weight.data.normal_(mean=1.0, std=0.2)
     x = torch.randn(7, 3072, device="cuda", dtype=torch.bfloat16)
     residual = torch.randn_like(x)
-    expected, expected_residual = norm._add_rms_forward_impl(x, residual)
+    merged = x.float() + residual.float()
+    expected_residual = merged.to(x.dtype)
+    expected = _rmsnorm_reference(merged, norm.weight, norm.eps).to(x.dtype)
 
     actual, actual_residual = norm(x, residual)
 
@@ -332,6 +362,8 @@ def test_attention_uses_flat_qk_norm_and_partial_rope():
         ),
     ):
         attention = MiniMaxM2Attention(config)
+    attention.q_norm = _ReferenceRMSNorm(attention.q_norm)
+    attention.k_norm = _ReferenceRMSNorm(attention.k_norm)
     qkv = torch.randn(3, 3 * config.hidden_size)
     qkv[:, :64] *= 0.1
     qkv[:, 64:128] *= 10.0
@@ -350,8 +382,8 @@ def test_attention_uses_flat_qk_norm_and_partial_rope():
         attention(positions, torch.empty(3, config.hidden_size))
 
     raw_q, raw_k, raw_v = qkv.split([128, 128, 128], dim=-1)
-    expected_flat_q = attention.q_norm._rms_forward_impl(raw_q).view(3, 2, 64)
-    expected_flat_k = attention.k_norm._rms_forward_impl(raw_k).view(3, 2, 64)
+    expected_flat_q = attention.q_norm(raw_q).view(3, 2, 64)
+    expected_flat_k = attention.k_norm(raw_k).view(3, 2, 64)
     per_head_q = raw_q.view(3, 2, 64)
     per_head_q = per_head_q * torch.rsqrt(
         per_head_q.pow(2).mean(dim=-1, keepdim=True) + attention.q_norm.eps
@@ -614,6 +646,7 @@ def test_tiny_dynamic_w8a8_model_stays_close_to_w8a16_transformers():
     context = _ep_context(0, 1)
     model = _instantiate_model(config, context).eval()
     _initialize_tiny_reference_weights(model)
+    _replace_rmsnorm_with_reference(model)
     model.model.layers[0].self_attn.attn = _TinyCausalAttention(64**-0.5)
 
     transformers_config = TransformersMiniMaxM2Config(
