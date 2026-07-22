@@ -50,14 +50,35 @@ def test_block_fp8_dequant_handles_non_square_boundary_tiles():
     assert torch.equal(actual, expected)
 
 
-def test_block_fp8_linear_reference_matches_explicit_dequantization():
+def test_block_fp8_linear_reference_matches_dynamic_w8a8_oracle():
     torch.manual_seed(0)
     weight = torch.randn(130, 129).clamp(-4, 4).to(torch.float8_e4m3fn)
     scale = torch.rand(2, 2, dtype=torch.float32) + 0.25
     inputs = torch.randn(3, 129)
 
     actual = fp8_blockwise_linear_reference(inputs, weight, scale)
-    expected = F.linear(inputs, fp8_blockwise_dequantize(weight, scale))
+    expected = torch.zeros(3, 130, dtype=torch.float32)
+    for column_block, column_start in enumerate(range(0, 129, 128)):
+        column_end = min(column_start + 128, 129)
+        input_block = inputs[:, column_start:column_end]
+        input_scale = (
+            input_block.abs().amax(dim=-1) / torch.finfo(torch.float8_e4m3fn).max
+        ).clamp_min(1.0e-12)
+        input_quantized = (input_block / input_scale[:, None]).to(
+            torch.float8_e4m3fn
+        )
+        for row_block, row_start in enumerate(range(0, 130, 128)):
+            row_end = min(row_start + 128, 130)
+            partial = F.linear(
+                input_quantized.float(),
+                weight[
+                    row_start:row_end,
+                    column_start:column_end,
+                ].float(),
+            )
+            expected[:, row_start:row_end].add_(
+                partial * input_scale[:, None] * scale[row_block, column_block]
+            )
 
     torch.testing.assert_close(actual, expected, atol=0.0, rtol=0.0)
 

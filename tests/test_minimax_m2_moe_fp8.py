@@ -5,7 +5,6 @@ import torch.nn.functional as F
 
 from sparsevllm.quantization.fp8 import (
     Fp8BlockScaledLinearBackend,
-    fp8_blockwise_dequantize,
     fp8_blockwise_linear_reference,
     load_finegrained_fp8_kernel,
 )
@@ -96,23 +95,20 @@ def _explicit_oracle(
     for token_id in range(hidden_states.shape[0]):
         for topk_slot in range(topk_ids.shape[1]):
             expert_id = int(topk_ids[token_id, topk_slot])
-            w1 = fp8_blockwise_dequantize(
+            gate = fp8_blockwise_linear_reference(
+                hidden_states[token_id],
                 w13_weight[expert_id, :intermediate_size],
                 w13_scale_inv[expert_id, :1],
             )
-            w3 = fp8_blockwise_dequantize(
+            up = fp8_blockwise_linear_reference(
+                hidden_states[token_id],
                 w13_weight[expert_id, intermediate_size:],
                 w13_scale_inv[expert_id, 1:],
             )
-            w2 = fp8_blockwise_dequantize(
+            expert_output = fp8_blockwise_linear_reference(
+                F.silu(gate) * up,
                 w2_weight[expert_id],
                 w2_scale_inv[expert_id],
-            )
-            expert_input = hidden_states[token_id].float()
-            expert_output = F.linear(
-                F.silu(F.linear(expert_input, w1))
-                * F.linear(expert_input, w3),
-                w2,
             )
             output[token_id] += expert_output * topk_weights[
                 token_id, topk_slot
@@ -183,16 +179,13 @@ def test_generic_native_fp8_linear_matches_reference_intermediate():
     relative_l2 /= torch.linalg.vector_norm(expected.float())
 
     torch.testing.assert_close(
-        actual.float(),
-        expected.float(),
-        atol=1.0e-2,
-        rtol=1.2e-1,
+        actual.float(), expected.float(), atol=1.0e-5, rtol=1.0e-3
     )
-    assert float(relative_l2) < 0.06
+    assert float(relative_l2) < 1.0e-3
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for this test.")
-def test_routed_fp8_matches_explicit_dequant_oracle():
+def test_routed_fp8_matches_dynamic_w8a8_oracle():
     inputs = _inputs()
     actual = fused_moe_fp8(
         *inputs,
@@ -203,14 +196,9 @@ def test_routed_fp8_matches_explicit_dequant_oracle():
     expected = _explicit_oracle(*inputs)
     error = actual.float() - expected
 
-    torch.testing.assert_close(
-        actual.float(),
-        expected,
-        atol=1.0e-3,
-        rtol=1.2e-1,
-    )
+    torch.testing.assert_close(actual.float(), expected, atol=5.0e-5, rtol=5.0e-3)
     relative_l2 = torch.linalg.vector_norm(error) / torch.linalg.vector_norm(expected)
-    assert float(relative_l2) < 0.06
+    assert float(relative_l2) < 5.0e-3
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for this test.")

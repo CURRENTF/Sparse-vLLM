@@ -19,7 +19,10 @@ from sparsevllm.models.minimax_m2 import (
     MiniMaxM2PackedExperts,
     MiniMaxM2Router,
 )
-from sparsevllm.quantization.fp8 import fp8_blockwise_dequantize
+from sparsevllm.quantization.fp8 import (
+    fp8_blockwise_dequantize,
+    fp8_blockwise_linear_reference,
+)
 from sparsevllm.utils.loader import load_model
 
 
@@ -92,7 +95,7 @@ def _random_fp8(shape):
     return torch.randn(shape).clamp(-4.0, 4.0).to(torch.float8_e4m3fn)
 
 
-def test_minimax_rmsnorm_disables_shape_dependent_compile():
+def test_minimax_rmsnorm_uses_dynamic_compile_path():
     model = _instantiate_model(_config(), _ep_context(0, 1))
     norms = [
         model.model.norm,
@@ -102,7 +105,7 @@ def test_minimax_rmsnorm_disables_shape_dependent_compile():
         model.model.layers[0].self_attn.k_norm,
     ]
 
-    assert all(not norm.use_torch_compile for norm in norms)
+    assert all(norm.use_torch_compile for norm in norms)
 
 
 def test_router_matches_official_biased_sigmoid_math():
@@ -169,13 +172,15 @@ def test_reference_packed_experts_match_explicit_oracle():
     for token_id in range(hidden_states.shape[0]):
         for topk_slot in range(topk_ids.shape[1]):
             expert_id = int(topk_ids[token_id, topk_slot])
-            w1 = fp8_blockwise_dequantize(*source[(expert_id, "w1")])
-            w2 = fp8_blockwise_dequantize(*source[(expert_id, "w2")])
-            w3 = fp8_blockwise_dequantize(*source[(expert_id, "w3")])
-            expert_output = F.linear(
-                F.silu(F.linear(hidden_states[token_id], w1))
-                * F.linear(hidden_states[token_id], w3),
-                w2,
+            gate = fp8_blockwise_linear_reference(
+                hidden_states[token_id], *source[(expert_id, "w1")]
+            )
+            up = fp8_blockwise_linear_reference(
+                hidden_states[token_id], *source[(expert_id, "w3")]
+            )
+            expert_output = fp8_blockwise_linear_reference(
+                F.silu(gate) * up,
+                *source[(expert_id, "w2")],
             )
             expected[token_id] += (
                 expert_output * topk_weights[token_id, topk_slot]
@@ -628,7 +633,7 @@ def _copy_to_transformers_reference(source, target):
         target.lm_head.weight.copy_(source.lm_head.weight)
 
 
-def test_tiny_model_matches_transformers_hidden_logits_and_greedy_tokens():
+def test_tiny_dynamic_w8a8_model_stays_close_to_w8a16_transformers():
     torch.manual_seed(5)
     config = _config()
     context = _ep_context(0, 1)
@@ -693,20 +698,18 @@ def test_tiny_model_matches_transformers_hidden_logits_and_greedy_tokens():
         reference_hidden = reference_output.last_hidden_state
         reference_logits = reference.lm_head(reference_hidden)
 
-        torch.testing.assert_close(
-            hidden_states,
-            reference_hidden.squeeze(0),
-            atol=2.0e-5,
-            rtol=2.0e-5,
-        )
-        torch.testing.assert_close(
-            logits,
-            reference_logits.squeeze(0),
-            atol=2.0e-5,
-            rtol=2.0e-5,
-        )
+        reference_hidden = reference_hidden.squeeze(0)
+        reference_logits = reference_logits.squeeze(0)
+        hidden_relative_l2 = torch.linalg.vector_norm(
+            hidden_states - reference_hidden
+        ) / torch.linalg.vector_norm(reference_hidden)
+        logits_relative_l2 = torch.linalg.vector_norm(
+            logits - reference_logits
+        ) / torch.linalg.vector_norm(reference_logits)
+        assert 1.0e-3 < float(hidden_relative_l2.detach()) < 5.0e-2
+        assert 1.0e-3 < float(logits_relative_l2.detach()) < 5.0e-2
         next_token = logits[-1].argmax()
-        reference_next_token = reference_logits[0, -1].argmax()
+        reference_next_token = reference_logits[-1].argmax()
         assert torch.equal(next_token, reference_next_token)
         greedy_tokens.append(int(next_token))
         token_ids = torch.cat((token_ids, next_token.view(1)))
