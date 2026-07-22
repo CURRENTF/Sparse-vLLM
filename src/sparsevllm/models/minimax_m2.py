@@ -10,7 +10,7 @@ from torch import nn
 from sparsevllm.distributed import get_parallel_context
 from sparsevllm.layers.attention import Attention
 from sparsevllm.layers.embed_head import ParallelLMHead
-from sparsevllm.layers.layernorm import RMSNorm
+from sparsevllm.layers.layernorm import FlashInferRMSNorm
 from sparsevllm.layers.linear import QKVParallelLinear, RowParallelLinear
 from sparsevllm.layers.rotary_embedding import (
     apply_partial_rotary_emb,
@@ -395,11 +395,11 @@ class MiniMaxM2Attention(nn.Module):
             bias=False,
             quantization=quantization,
         )
-        self.q_norm = RMSNorm(
+        self.q_norm = FlashInferRMSNorm(
             self.q_size,
             eps=float(config.rms_norm_eps),
         )
-        self.k_norm = RMSNorm(
+        self.k_norm = FlashInferRMSNorm(
             self.kv_size,
             eps=float(config.rms_norm_eps),
         )
@@ -445,11 +445,11 @@ class MiniMaxM2DecoderLayer(nn.Module):
         self.parallel_context = get_parallel_context()
         self.self_attn = MiniMaxM2Attention(config)
         self.block_sparse_moe = MiniMaxM2SparseMoeBlock(config)
-        self.input_layernorm = RMSNorm(
+        self.input_layernorm = FlashInferRMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
         )
-        self.post_attention_layernorm = RMSNorm(
+        self.post_attention_layernorm = FlashInferRMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
         )
@@ -478,7 +478,7 @@ class MiniMaxM2DecoderLayer(nn.Module):
 class MiniMaxM2Model(Qwen3ModelBase):
     def __init__(self, config) -> None:
         super().__init__(config, MiniMaxM2DecoderLayer)
-        self.norm = RMSNorm(
+        self.norm = FlashInferRMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
         )

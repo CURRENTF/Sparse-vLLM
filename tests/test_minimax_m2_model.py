@@ -12,6 +12,7 @@ from transformers import (
 
 from sparsevllm.config import QuantizationConfig
 from sparsevllm.distributed import ParallelContext, ParallelGroup
+from sparsevllm.layers.layernorm import FlashInferRMSNorm
 from sparsevllm.models.minimax_m2 import (
     MiniMaxM2Attention,
     MiniMaxM2ForCausalLM,
@@ -23,6 +24,55 @@ from sparsevllm.quantization.fp8 import (
     fp8_blockwise_linear_reference,
 )
 from sparsevllm.utils.loader import load_model
+
+
+@pytest.mark.parametrize("hidden_size", [1024, 3072, 6144])
+def test_flashinfer_rmsnorm_cpu_reference(hidden_size):
+    torch.manual_seed(31)
+    norm = FlashInferRMSNorm(hidden_size)
+    norm.weight.data.normal_(mean=1.0, std=0.2)
+    x = torch.randn(3, hidden_size)
+
+    actual = norm(x)
+    expected = norm._rms_forward_impl(x)
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("hidden_size", [1024, 3072, 6144])
+def test_flashinfer_rmsnorm_matches_reference_for_minimax_shapes(hidden_size):
+    pytest.importorskip("flashinfer")
+    torch.manual_seed(37)
+    norm = FlashInferRMSNorm(hidden_size).cuda().to(torch.bfloat16)
+    norm.weight.data.normal_(mean=1.0, std=0.2)
+    storage = torch.randn(7, 8192, device="cuda", dtype=torch.bfloat16)
+    x = storage[:, :hidden_size]
+    original = x.clone()
+    expected = norm._rms_forward_impl(x)
+
+    actual = norm(x)
+
+    torch.testing.assert_close(actual, expected, rtol=1.0e-2, atol=2.0e-2)
+    assert torch.equal(x, original)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_flashinfer_fused_add_rmsnorm_matches_reference():
+    pytest.importorskip("flashinfer")
+    torch.manual_seed(41)
+    norm = FlashInferRMSNorm(3072).cuda().to(torch.bfloat16)
+    norm.weight.data.normal_(mean=1.0, std=0.2)
+    x = torch.randn(7, 3072, device="cuda", dtype=torch.bfloat16)
+    residual = torch.randn_like(x)
+    expected, expected_residual = norm._add_rms_forward_impl(x, residual)
+
+    actual, actual_residual = norm(x, residual)
+
+    torch.testing.assert_close(actual, expected, rtol=1.0e-2, atol=2.0e-2)
+    assert torch.equal(actual_residual, expected_residual)
+    assert actual is x
+    assert actual_residual is residual
 
 
 def _config(**overrides):

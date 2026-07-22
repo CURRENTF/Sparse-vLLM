@@ -46,6 +46,7 @@ qwen35 = [
 ]
 minimax_m2 = [
     "kernels==0.15.2",
+    "flashinfer-python==0.6.15.post1",
 ]
 
 [project.scripts]
