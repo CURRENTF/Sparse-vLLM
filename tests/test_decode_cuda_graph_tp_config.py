@@ -7,7 +7,6 @@ from unittest.mock import patch
 import torch
 
 from sparsevllm.config import Config
-from sparsevllm.engine.decode_cuda_graph import DecodeCudaGraphKey, DecodeCudaGraphRunner, DecodeCudaGraphState
 
 
 class DecodeCudaGraphTPConfigTest(unittest.TestCase):
@@ -62,52 +61,6 @@ class DecodeCudaGraphTPConfigTest(unittest.TestCase):
     def test_tp_decode_cuda_graph_rejects_capture_sampling(self):
         with self.assertRaisesRegex(ValueError, "capture_sampling is disabled"):
             self._config("snapkv", decode_cuda_graph_capture_sampling=True)
-
-
-class DecodeCudaGraphDebugRefsTest(unittest.TestCase):
-    def test_replay_restores_graph_captured_model_debug_refs(self):
-        class DebugModule(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.debug_last_tensor = torch.tensor([1.0])
-                self.debug_last_nested = {"items": [torch.tensor([2.0])]}
-                self.not_debug = torch.tensor([3.0])
-
-        class Engine:
-            def __init__(self):
-                self.model = DebugModule()
-
-            def run_model(self, *_args):
-                raise AssertionError("not called")
-
-        engine = Engine()
-        runner = object.__new__(DecodeCudaGraphRunner)
-        runner.run_model = engine.run_model
-        captured_tensor = engine.model.debug_last_tensor
-        captured_nested = engine.model.debug_last_nested
-
-        refs = runner._snapshot_model_debug_refs()
-        engine.model.debug_last_tensor = torch.tensor([4.0])
-        engine.model.debug_last_nested = {"items": [torch.tensor([5.0])]}
-        state = DecodeCudaGraphState(
-            key=DecodeCudaGraphKey(
-                method="",
-                batch_size=1,
-                context_capacity=1024,
-                is_long_text=False,
-                capture_sampling=False,
-            ),
-            model_debug_refs=refs,
-        )
-
-        runner._restore_model_debug_refs(state)
-
-        self.assertIs(engine.model.debug_last_tensor, captured_tensor)
-        self.assertIs(engine.model.debug_last_nested, captured_nested)
-        tensor_refs = list(runner._debug_tensor_refs(captured_nested))
-        self.assertEqual(len(tensor_refs), 1)
-        self.assertIs(tensor_refs[0], captured_nested["items"][0])
-        self.assertTrue(all(name != "not_debug" for _, name, _ in refs))
 
 
 if __name__ == "__main__":

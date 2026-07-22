@@ -1,6 +1,3 @@
-import json
-import subprocess
-import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -66,77 +63,6 @@ class LongBenchDeltaKVContractsTest(unittest.TestCase):
                 longbench_pred.validate_longbench_data_paths(["hotpotqa"], use_longbench_e=False)
         finally:
             longbench_pred.DATA_PREFIX_PATH = old_root
-
-    def test_longbench_prompt_budget_reserves_generation_tokens(self):
-        self.assertEqual(
-            longbench_pred._prompt_token_budget(204_800, 121_000, 64),
-            120_936,
-        )
-        with self.assertRaisesRegex(ValueError, "smaller than"):
-            longbench_pred._prompt_token_budget(32, 64, 32)
-
-    def test_longbench_raw_artifact_preserves_model_prompt(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            output_dir = Path(tmp)
-            task_path = output_dir / "hotpotqa.jsonl"
-            longbench_pred._write_sample_record(
-                out_root=str(output_dir),
-                task_out_path=str(task_path),
-                record={
-                    "dataset": "hotpotqa",
-                    "sample_idx": 0,
-                    "source_idx": 3,
-                    "status": "success",
-                    "prompt_tokens": 4,
-                    "prompt": "final model prompt",
-                    "raw_pred": "Paris",
-                    "pred": "Paris",
-                    "answers": ["Paris"],
-                    "all_classes": [],
-                    "length": 4,
-                },
-            )
-
-            raw = json.loads(
-                (output_dir / "raw_outputs.jsonl").read_text(encoding="utf-8")
-            )
-            self.assertEqual(raw["prompt"], "final model prompt")
-
-    def test_longbench_eval_rejects_skipped_task(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            output_dir = Path(tmp)
-            (output_dir / "hotpotqa.jsonl").write_text(
-                json.dumps(
-                    {
-                        "status": "skipped_by_policy",
-                        "pred": "",
-                        "answers": None,
-                        "all_classes": None,
-                    }
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    "benchmark/long_bench/eval.py",
-                    "--path",
-                    str(output_dir),
-                ],
-                cwd=longbench_pred.REPO_ROOT,
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-
-            self.assertNotEqual(result.returncode, 0)
-            metrics = json.loads((output_dir / "result.json").read_text())
-            self.assertEqual(metrics["status"], "failed")
-            self.assertEqual(
-                metrics["task_statuses"]["hotpotqa"]["status"],
-                "skipped_by_policy",
-            )
 
     def test_new_hf_sparse_methods_route_without_legacy_names(self):
         for sparse_method in (

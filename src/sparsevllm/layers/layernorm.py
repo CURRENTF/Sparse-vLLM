@@ -8,11 +8,9 @@ class RMSNorm(nn.Module):
         self,
         hidden_size: int,
         eps: float = 1e-6,
-        use_torch_compile: bool = True,
     ) -> None:
         super().__init__()
         self.eps = eps
-        self.use_torch_compile = bool(use_torch_compile)
         self.weight = nn.Parameter(torch.ones(hidden_size))
 
     def _rms_forward_impl(
@@ -58,9 +56,5 @@ class RMSNorm(nn.Module):
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
-            if self.use_torch_compile:
-                return self.rms_forward(x)
-            return self._rms_forward_impl(x)
-        if self.use_torch_compile:
-            return self.add_rms_forward(x, residual)
-        return self._add_rms_forward_impl(x, residual)
+            return self.rms_forward(x)
+        return self.add_rms_forward(x, residual)

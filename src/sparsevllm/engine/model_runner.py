@@ -69,7 +69,6 @@ PREFIX_CACHE_CONTROL_RPC_METHODS = {
     "prefix_cache_set_eviction_priority",
 }
 TP_RPC_STATUS_SYNC_METHODS = PREFIX_CACHE_CONTROL_RPC_METHODS | {
-    "debug_attention_states_cpu",
     "debug_hidden_states_cpu",
     "debug_moe_states_cpu",
     "refresh_prefix_cache_hit",
@@ -80,13 +79,6 @@ TP_RPC_STATUS_SYNC_METHODS = PREFIX_CACHE_CONTROL_RPC_METHODS | {
 
 def make_tp_shm_name() -> str:
     return f"{TP_SHM_NAME_PREFIX}{os.getpid()}_{uuid.uuid4().hex}"
-
-
-def _debug_moe_block(layer):
-    block = getattr(layer, "mlp", None)
-    if block is None:
-        block = getattr(layer, "block_sparse_moe", None)
-    return block
 
 
 class ModelRunner:
@@ -615,7 +607,7 @@ class ModelRunner:
         for layer_idx, layer in enumerate(layers):
             if layer_idx not in selected_layers:
                 continue
-            block = _debug_moe_block(layer)
+            block = getattr(layer, "mlp", None)
             topk_ids = getattr(block, "debug_last_topk_ids", None)
             topk_weights = getattr(block, "debug_last_topk_weights", None)
             output = getattr(block, "debug_last_output", None)
@@ -627,15 +619,11 @@ class ModelRunner:
                 "output": _debug_tensor_summary(output),
             }
             experts = block.experts
-            local_output_cpu = block.debug_last_local_output.detach().cpu()
             moe_local[str(layer_idx)] = {
                 "local_expert_start": int(experts.local_expert_start),
                 "local_expert_end": int(experts.local_expert_end),
                 "local_hit_count": int(block.debug_last_local_hit_count),
-                "local_output": _debug_tensor_summary(local_output_cpu),
-                "local_output_row_sha256": [
-                    _debug_tensor_summary(row)["sha256"] for row in local_output_cpu
-                ],
+                "local_output": _debug_tensor_summary(block.debug_last_local_output),
             }
         return {
             "world_rank": self.parallel_context.world_rank,
@@ -673,39 +661,14 @@ class ModelRunner:
             for layer_idx, tensor in snapshots.items()
         }
 
-    def debug_attention_states_cpu(self) -> dict[int, dict[str, torch.Tensor]] | None:
-        model = getattr(getattr(self, "model", None), "model", None)
-        layers = getattr(model, "layers", ())
-        snapshots = {}
-        for layer_idx, layer in enumerate(layers):
-            attention = getattr(layer, "self_attn", None)
-            required = {
-                "q_norm_rope": getattr(attention, "debug_last_q_norm", None),
-                "k_raw": getattr(attention, "debug_last_k_raw", None),
-                "k_norm_rope": getattr(attention, "debug_last_k_norm_rope", None),
-                "value": getattr(attention, "debug_last_v", None),
-            }
-            missing = [name for name, tensor in required.items() if tensor is None]
-            if missing:
-                raise RuntimeError(
-                    f"Layer {layer_idx} is missing attention debug tensors {missing}. "
-                    "Set SPARSEVLLM_DEBUG_MINIMAX_M2=1 before model execution."
-                )
-            snapshots[layer_idx] = {
-                name: tensor.detach().cpu()
-                for name, tensor in required.items()
-            }
-        return snapshots if self.rank == 0 else None
-
     def debug_moe_states_cpu(self) -> dict[int, dict[str, torch.Tensor]] | None:
         model = getattr(getattr(self, "model", None), "model", None)
         layers = getattr(model, "layers", ())
         snapshots = {}
         for layer_idx, layer in enumerate(layers):
-            block = _debug_moe_block(layer)
+            block = getattr(layer, "mlp", None)
             required = {
                 "input": getattr(block, "debug_last_input", None),
-                "router_logits": getattr(block, "debug_last_router_logits", None),
                 "topk_ids": getattr(block, "debug_last_topk_ids", None),
                 "topk_weights": getattr(block, "debug_last_topk_weights", None),
                 "output": getattr(block, "debug_last_output", None),
@@ -780,7 +743,7 @@ class ModelRunner:
         model = getattr(getattr(self, "model", None), "model", None)
         layers = getattr(model, "layers", ())
         for layer_idx in sorted({0, len(layers) - 1} if layers else set()):
-            block = _debug_moe_block(layers[layer_idx])
+            block = getattr(layers[layer_idx], "mlp", None)
             if not hasattr(block, "debug_last_topk_ids"):
                 continue
             topk_weights_max_abs, topk_weights_tolerance_ratio = (

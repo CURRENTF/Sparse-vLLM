@@ -65,7 +65,6 @@ class DecodeCudaGraphState:
     token_ids: torch.Tensor | None = None
     keepalive: list[object] = field(default_factory=list)
     sparse_state_refs: dict[int, dict[str, object]] = field(default_factory=dict)
-    model_debug_refs: list[tuple[object, str, object]] = field(default_factory=list)
 
 
 class DecodeCudaGraphRunner:
@@ -147,7 +146,6 @@ class DecodeCudaGraphRunner:
         state.token_ids = None
         state.keepalive.clear()
         state.sparse_state_refs.clear()
-        state.model_debug_refs.clear()
 
     def _touch_graph_state(self, key: DecodeCudaGraphKey):
         move_to_end = getattr(self._graphs, "move_to_end", None)
@@ -382,42 +380,6 @@ class DecodeCudaGraphRunner:
             for name, value in refs.items():
                 setattr(sparse_state, name, value)
 
-    def _snapshot_model_debug_refs(self) -> list[tuple[object, str, object]]:
-        """Keep graph-captured debug outputs visible after a real prefill.
-
-        Debug hooks assign newly allocated tensors to ``debug_last_*`` Python
-        attributes while the graph is captured. A subsequent real prefill
-        replaces those attributes, even though replay still writes to the
-        captured tensors. Retain and later restore the captured references so
-        validation reads replay output instead of stale prefill output.
-        """
-        owner = getattr(self.run_model, "__self__", None)
-        model = getattr(owner, "model", None)
-        if model is None:
-            return []
-        refs: list[tuple[object, str, object]] = []
-        for module in model.modules():
-            for name, value in vars(module).items():
-                if name.startswith("debug_last_"):
-                    refs.append((module, name, value))
-        return refs
-
-    @staticmethod
-    def _restore_model_debug_refs(state: DecodeCudaGraphState):
-        for module, name, value in state.model_debug_refs:
-            setattr(module, name, value)
-
-    @staticmethod
-    def _debug_tensor_refs(value: object):
-        if isinstance(value, torch.Tensor):
-            yield value
-        elif isinstance(value, dict):
-            for item in value.values():
-                yield from DecodeCudaGraphRunner._debug_tensor_refs(item)
-        elif isinstance(value, (list, tuple)):
-            for item in value:
-                yield from DecodeCudaGraphRunner._debug_tensor_refs(item)
-
     def _reset_graph_input_attn_scores(self, refs: dict[int, dict[str, object]]):
         """Reset graph-input score buffers inside capture/replay.
 
@@ -477,7 +439,6 @@ class DecodeCudaGraphRunner:
         state.logits = logits
         state.token_ids = token_ids
         state.sparse_state_refs = self._snapshot_sparse_state_refs()
-        state.model_debug_refs = self._snapshot_model_debug_refs()
 
         keepalive: list[object] = [
             ctx,
@@ -501,8 +462,6 @@ class DecodeCudaGraphRunner:
         sparse_keepalive = getattr(self.sparse_controller, "decode_cuda_graph_keepalive_tensors", None)
         if sparse_keepalive is not None:
             keepalive.extend(sparse_keepalive())
-        for _, _, value in state.model_debug_refs:
-            keepalive.extend(self._debug_tensor_refs(value))
         state.keepalive = keepalive
         return state
 
@@ -542,7 +501,6 @@ class DecodeCudaGraphRunner:
             self._restore_sparse_state_refs(state)
             with profiler.record("decode_cuda_graph_replay_after_capture"):
                 state.graph.replay()
-            self._restore_model_debug_refs(state)
             logits = state.logits[:real_batch_size] if state.logits is not None else None
             token_ids = state.token_ids[:real_batch_size] if state.token_ids is not None else None
             return logits, token_ids
@@ -550,7 +508,6 @@ class DecodeCudaGraphRunner:
         self._restore_sparse_state_refs(state)
         with profiler.record("decode_cuda_graph_replay"):
             state.graph.replay()
-        self._restore_model_debug_refs(state)
         logits = state.logits[:real_batch_size] if state.logits is not None else None
         token_ids = state.token_ids[:real_batch_size] if state.token_ids is not None else None
         return logits, token_ids

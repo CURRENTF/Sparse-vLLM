@@ -12,7 +12,6 @@ from transformers import (
 
 from sparsevllm.config import QuantizationConfig
 from sparsevllm.distributed import ParallelContext, ParallelGroup
-from sparsevllm.engine.model_runner import ModelRunner
 from sparsevllm.models.minimax_m2 import (
     MiniMaxM2Attention,
     MiniMaxM2ForCausalLM,
@@ -93,19 +92,6 @@ def _instantiate_model(config, context):
 
 def _random_fp8(shape):
     return torch.randn(shape).clamp(-4.0, 4.0).to(torch.float8_e4m3fn)
-
-
-def test_minimax_rmsnorm_uses_dynamic_compile_path():
-    model = _instantiate_model(_config(), _ep_context(0, 1))
-    norms = [
-        model.model.norm,
-        model.model.layers[0].input_layernorm,
-        model.model.layers[0].post_attention_layernorm,
-        model.model.layers[0].self_attn.q_norm,
-        model.model.layers[0].self_attn.k_norm,
-    ]
-
-    assert all(norm.use_torch_compile for norm in norms)
 
 
 def test_router_matches_official_biased_sigmoid_math():
@@ -227,67 +213,6 @@ def test_ep2_reference_local_outputs_sum_to_ep1_oracle():
     actual = rank0.forward_reference(hidden_states, topk_ids, topk_weights)
     actual += rank1.forward_reference(hidden_states, topk_ids, topk_weights)
     torch.testing.assert_close(actual, expected, atol=1.0e-6, rtol=1.0e-6)
-
-
-def test_minimax_moe_debug_state_is_available_through_model_runner(monkeypatch):
-    torch.manual_seed(7)
-    config = _config()
-    model = _instantiate_model(config, _ep_context(0, 1))
-    block = model.model.layers[0].block_sparse_moe
-
-    class _DebugGate(torch.nn.Module):
-        def forward(self, hidden_states):
-            token_count = hidden_states.shape[0]
-            logits = hidden_states.new_zeros((token_count, config.num_local_experts))
-            weights = hidden_states.new_full(
-                (token_count, config.num_experts_per_tok),
-                1.0 / config.num_experts_per_tok,
-                dtype=torch.float32,
-            )
-            ids = torch.tensor([[0, 1]], dtype=torch.int64).expand(token_count, -1)
-            return logits, weights, ids
-
-    class _DebugExperts(torch.nn.Module):
-        local_expert_start = 0
-        local_expert_end = config.num_local_experts
-
-        def forward(self, hidden_states, _topk_ids, _topk_weights):
-            return hidden_states * 2
-
-    block.gate = _DebugGate()
-    block.experts = _DebugExperts()
-    monkeypatch.setenv("SPARSEVLLM_DEBUG_MOE", "1")
-    hidden_states = torch.randn(3, config.hidden_size)
-
-    block(hidden_states)
-    runner = object.__new__(ModelRunner)
-    runner.rank = 0
-    runner.model = model
-    snapshots = runner.debug_moe_states_cpu()
-
-    assert set(snapshots) == {0}
-    assert torch.equal(snapshots[0]["input"], hidden_states)
-    assert snapshots[0]["router_logits"].shape == (
-        3,
-        config.num_local_experts,
-    )
-    assert snapshots[0]["topk_ids"].shape == (3, config.num_experts_per_tok)
-    assert snapshots[0]["topk_weights"].shape == (3, config.num_experts_per_tok)
-    assert snapshots[0]["output"].shape == hidden_states.shape
-    assert block.debug_last_local_hit_count == 3 * config.num_experts_per_tok
-
-    attention = model.model.layers[0].self_attn
-    attention.debug_last_q_norm = torch.randn(3, 2, 64)
-    attention.debug_last_k_raw = torch.randn(3, 2, 64)
-    attention.debug_last_k_norm_rope = torch.randn(3, 2, 64)
-    attention.debug_last_v = torch.randn(3, 2, 64)
-    attention_snapshots = runner.debug_attention_states_cpu()
-    assert set(attention_snapshots[0]) == {
-        "q_norm_rope",
-        "k_raw",
-        "k_norm_rope",
-        "value",
-    }
 
 
 class _FixedProjection(torch.nn.Module):
