@@ -202,7 +202,7 @@ def fp8_blockwise_linear_reference(
     *,
     block_size: tuple[int, int] = (128, 128),
 ) -> torch.Tensor:
-    """Slow explicit-dequant FP8 Linear used only by the reference backend."""
+    """Explicit dynamic W8A8 Linear used only by the reference backend."""
 
     if x.device != weight.device:
         raise RuntimeError(
@@ -219,13 +219,40 @@ def fp8_blockwise_linear_reference(
         if x.dtype in {torch.float32, torch.bfloat16, torch.float16}
         else torch.bfloat16
     )
-    dequantized = fp8_blockwise_dequantize(
-        weight,
-        weight_scale_inv,
-        block_size=block_size,
-        output_dtype=output_dtype,
+    block_size = tuple(int(value) for value in block_size)
+    _validate_fp8_weight_and_scale(weight, weight_scale_inv, block_size)
+    block_rows, block_cols = block_size
+    original_shape = x.shape[:-1]
+    x_2d = x.reshape(-1, x.shape[-1]).contiguous()
+    output = torch.zeros(
+        x_2d.shape[0],
+        weight.shape[0],
+        device=x.device,
+        dtype=torch.float32,
     )
-    return F.linear(x.to(output_dtype), dequantized, bias)
+    weight_scales = weight_scale_inv.repeat_interleave(block_rows, dim=0)
+    weight_scales = weight_scales[: weight.shape[0]]
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+
+    for block_index, column_start in enumerate(
+        range(0, weight.shape[1], block_cols)
+    ):
+        column_end = min(column_start + block_cols, weight.shape[1])
+        x_block = x_2d[:, column_start:column_end].float()
+        x_scale = (x_block.abs().amax(dim=-1) / fp8_max).clamp_min(1.0e-12)
+        x_quantized = (x_block / x_scale[:, None]).to(torch.float8_e4m3fn)
+        block_product = F.linear(
+            x_quantized.float(),
+            weight[:, column_start:column_end].float(),
+        )
+        block_product.mul_(x_scale[:, None])
+        block_product.mul_(weight_scales[:, block_index][None, :])
+        output.add_(block_product)
+
+    output = output.to(output_dtype)
+    if bias is not None:
+        output.add_(bias)
+    return output.reshape(*original_shape, weight.shape[0])
 
 
 @dataclass(frozen=True)
