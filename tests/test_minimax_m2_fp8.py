@@ -115,6 +115,7 @@ def test_partial_rope_preserves_pass_through_features_bitwise():
         rotary_dim=4,
         max_position_embeddings=16,
         base=10_000.0,
+        backend="torch",
     )
     positions = torch.tensor([1, 3, 7])
     query = torch.randn(3, 2, 8, dtype=torch.bfloat16)
