@@ -168,16 +168,82 @@ def _validate(method="", **overrides):
     return validate_model_runtime_compatibility(**values)
 
 
-def test_minimax_compatibility_declares_only_vanilla_runtime():
+def test_minimax_compatibility_matches_qwen3_moe_sparse_runtime():
     assert MODEL_RUNTIME_COMPATIBILITY["minimax_m2"] is MINIMAX_M2_EP_COMPATIBILITY
     assert MINIMAX_M2_EP_COMPATIBILITY.parallel_mode == "ep_replicated_kv"
-    assert MINIMAX_M2_EP_COMPATIBILITY.sparse_methods == {""}
-    assert MINIMAX_M2_EP_COMPATIBILITY.prefix_cache_methods == {""}
+    assert MINIMAX_M2_EP_COMPATIBILITY.sparse_methods == {
+        "",
+        "streamingllm",
+        "snapkv",
+        "pyramidkv",
+        "omnikv",
+        "quest",
+        "rkv",
+    }
+    assert MINIMAX_M2_EP_COMPATIBILITY.prefix_cache_methods == {
+        "",
+        "omnikv",
+        "quest",
+    }
     assert MINIMAX_M2_EP_COMPATIBILITY.decode_cuda_graph_methods == {""}
     assert _validate() is MINIMAX_M2_EP_COMPATIBILITY
 
 
-@pytest.mark.parametrize("method", ["snapkv", "quest", "deltakv", "skipkv"])
-def test_minimax_compatibility_rejects_sparse_kv_methods(method):
+@pytest.mark.parametrize("method", sorted(MINIMAX_M2_EP_COMPATIBILITY.sparse_methods))
+def test_minimax_compatibility_accepts_non_deltakv_sparse_methods(method):
+    assert (
+        _validate(method, decode_cuda_graph=False, enable_prefix_caching=False)
+        is MINIMAX_M2_EP_COMPATIBILITY
+    )
+
+
+@pytest.mark.parametrize("method", ["", "omnikv", "quest"])
+def test_minimax_compatibility_accepts_prefix_cache_methods(method):
+    assert (
+        _validate(method, decode_cuda_graph=False, enable_prefix_caching=True)
+        is MINIMAX_M2_EP_COMPATIBILITY
+    )
+
+
+@pytest.mark.parametrize("method", ["streamingllm", "snapkv", "pyramidkv", "rkv"])
+def test_minimax_compatibility_rejects_unvalidated_prefix_cache_methods(method):
+    with pytest.raises(ValueError, match="prefix caching is validated only"):
+        _validate(method, decode_cuda_graph=False, enable_prefix_caching=True)
+
+
+@pytest.mark.parametrize("method", ["deltakv", "skipkv"])
+def test_minimax_compatibility_rejects_out_of_scope_sparse_methods(method):
     with pytest.raises(ValueError, match="validated methods"):
         _validate(method, decode_cuda_graph=False, enable_prefix_caching=False)
+
+
+@pytest.mark.parametrize(
+    "method",
+    ["streamingllm", "snapkv", "pyramidkv", "omnikv", "quest", "rkv"],
+)
+def test_minimax_config_accepts_non_deltakv_sparse_methods(tmp_path, method):
+    config = _make_config(
+        tmp_path,
+        vllm_sparse_method=method,
+        enforce_eager=True,
+        decode_cuda_graph=False,
+        enable_prefix_caching=False,
+    )
+
+    assert config.vllm_sparse_method == method
+
+
+@pytest.mark.parametrize(
+    "method",
+    ["streamingllm", "snapkv", "pyramidkv", "omnikv", "quest", "rkv"],
+)
+def test_minimax_sparse_methods_require_eager_decode(tmp_path, method):
+    with pytest.raises(ValueError, match="decode_cuda_graph is validated only"):
+        _make_config(
+            tmp_path,
+            vllm_sparse_method=method,
+            moe_backend="triton",
+            enforce_eager=False,
+            decode_cuda_graph=True,
+            enable_prefix_caching=False,
+        )
