@@ -91,6 +91,7 @@ def _apply_partial_rope(rotary_emb, positions: torch.Tensor, q: torch.Tensor, k:
 
 
 class Qwen35QKVGatedParallelLinear(ColumnParallelLinear):
+    rank_local_weight_slice = None
     def __init__(
         self,
         hidden_size: int,
