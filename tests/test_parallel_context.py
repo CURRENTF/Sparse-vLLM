@@ -244,6 +244,7 @@ def test_cache_kv_heads_depend_on_tp_not_ep():
         ),
         runtime_layout=None,
         max_model_len=128,
+        max_num_seqs_in_gpu=2,
         max_num_seqs_in_batch=2,
     )
     with patch.object(platforms, "_current_platform", CpuPlatform()):

@@ -63,6 +63,7 @@ class FakeCacheManager(CacheManager):
         config = types.SimpleNamespace(
             hf_config=hf_config,
             max_model_len=10,
+            max_num_seqs_in_gpu=2,
             max_num_seqs_in_batch=2,
             num_kvcache_slots=16,
         )

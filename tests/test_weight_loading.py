@@ -37,6 +37,37 @@ class _RankLocalModel(nn.Module):
         self.proj = _RankLocalWeight()
 
 
+class _ExpertOwnershipModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.local = nn.Linear(2, 2, bias=False)
+        self.skipped = []
+
+    @staticmethod
+    def map_weight_name(source_weight_name):
+        if source_weight_name.startswith("remote."):
+            return None
+        return source_weight_name
+
+    def record_skipped_weight(
+        self,
+        source_weight_name,
+        loaded_weight_shape,
+        loaded_weight_dtype,
+        loaded_scale_shape,
+        loaded_scale_dtype,
+    ):
+        self.skipped.append(
+            (
+                source_weight_name,
+                loaded_weight_shape,
+                loaded_weight_dtype,
+                loaded_scale_shape,
+                loaded_scale_dtype,
+            )
+        )
+
+
 def _write_two_shards(path):
     left = torch.arange(4, dtype=torch.float32).reshape(2, 2)
     right = torch.arange(4, 8, dtype=torch.float32).reshape(2, 2)
@@ -83,6 +114,37 @@ def test_load_model_reads_only_rank_local_tensor_slice(tmp_path):
     loader.load_model(model, str(tmp_path), tp_rank=1, tp_size=2)
 
     torch.testing.assert_close(model.proj.weight, full_weight[2:4])
+
+
+def test_load_model_keeps_remote_expert_tensors_as_metadata(tmp_path):
+    local_weight = torch.arange(4, dtype=torch.float32).reshape(2, 2)
+    save_file(
+        {
+            "local.weight": local_weight,
+            "remote.weight": torch.ones(4, 2),
+            "remote.weight_scale_inv": torch.ones(1, 1),
+        },
+        tmp_path / "model.safetensors",
+    )
+    model = _ExpertOwnershipModel()
+
+    shard = loader._read_safetensors_shard(
+        str(tmp_path / "model.safetensors"),
+        model,
+    )
+    assert set(shard.metadata) == {
+        "local.weight",
+        "remote.weight",
+        "remote.weight_scale_inv",
+    }
+    assert set(shard.tensors) == {"local.weight"}
+
+    loader.load_model(model, str(tmp_path), num_threads=2)
+
+    torch.testing.assert_close(model.local.weight, local_weight)
+    assert model.skipped == [
+        ("remote.weight", (4, 2), "F32", (1, 1), "F32")
+    ]
 
 
 def test_load_model_selects_all_files_for_local_checkpoint_rank(tmp_path):
