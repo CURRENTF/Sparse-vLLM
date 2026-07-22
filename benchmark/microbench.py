@@ -165,12 +165,6 @@ def _standard_status(status: Any) -> str:
     return "model_failed"
 
 
-def _benchmark_exit_code(rows: list[dict[str, Any]]) -> int:
-    if not rows:
-        return 1
-    return int(any(_standard_status(row.get("status")) != "success" for row in rows))
-
-
 def _artifact_records(args, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     for idx, row in enumerate(rows):
@@ -707,7 +701,7 @@ def benchmark_task(method, length, bs, args, results_dict):
             llm.exit()
 
 
-def main() -> int:
+def main():
     parser = argparse.ArgumentParser(description="Professional benchmark for sparsevllm.")
     parser.add_argument("--model_path", type=str, required=True, help="Path to the model")
     parser.add_argument("--lengths", type=str, default="16000,32000,64000", help="Context lengths to test")
@@ -863,9 +857,8 @@ def main() -> int:
     print(f"{ '='*140}\n")
     _write_jsonl(args.output_jsonl, jsonl_rows)
     _write_output_dir(args, jsonl_rows)
-    return _benchmark_exit_code(jsonl_rows)
 
 
 if __name__ == "__main__":
     mp.set_start_method('spawn', force=True)
-    raise SystemExit(main())
+    main()

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import re
 from dataclasses import replace
 
@@ -8,7 +7,6 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-import sparsevllm.platforms as platforms
 from sparsevllm.distributed import get_parallel_context
 from sparsevllm.layers.attention import Attention
 from sparsevllm.layers.embed_head import ParallelLMHead
@@ -363,30 +361,9 @@ class MiniMaxM2SparseMoeBlock(nn.Module):
             raise ValueError(
                 f"MiniMax M2 MoE expects [tokens, hidden], got {tuple(hidden_states.shape)}."
             )
-        debug_enabled = os.getenv("SPARSEVLLM_DEBUG_MOE", "0") == "1"
-        if debug_enabled:
-            self.debug_last_input = hidden_states.detach().clone()
-        router_logits, topk_weights, topk_ids = self.gate(hidden_states)
+        _, topk_weights, topk_ids = self.gate(hidden_states)
         local_output = self.experts(hidden_states, topk_ids, topk_weights)
-        if debug_enabled:
-            self.debug_last_router_logits = router_logits.detach().clone()
-            self.debug_last_topk_ids = topk_ids.detach().clone()
-            self.debug_last_topk_weights = topk_weights.detach().clone()
-            self.debug_last_local_output = local_output.detach().clone()
-            local_mask = (topk_ids >= self.experts.local_expert_start) & (
-                topk_ids < self.experts.local_expert_end
-            )
-            local_hit_count = local_mask.sum()
-            self.debug_last_local_hit_count = (
-                local_hit_count
-                if hidden_states.is_cuda
-                and platforms.current_platform.is_stream_capturing()
-                else int(local_hit_count.item())
-            )
-        output = self.parallel_context.ep_all_reduce(local_output)
-        if debug_enabled:
-            self.debug_last_output = output.detach().clone()
-        return output
+        return self.parallel_context.ep_all_reduce(local_output)
 
 
 class MiniMaxM2Attention(nn.Module):
@@ -458,11 +435,6 @@ class MiniMaxM2Attention(nn.Module):
             self.rotary_dim,
         )
         context.cache_manager.save_rope_kv_if_needed(layer_idx, k, v)
-        if os.getenv("SPARSEVLLM_DEBUG_MINIMAX_M2", "0") == "1":
-            self.debug_last_q_norm = q.detach().clone()
-            self.debug_last_k_raw = raw_k.detach().clone()
-            self.debug_last_k_norm_rope = k.detach().clone()
-            self.debug_last_v = v.detach().clone()
         output = self.attn(q, k, v).flatten(1, -1)
         return self.o_proj(output)
 

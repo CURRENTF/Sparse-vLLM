@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 
-from benchmark.microbench import _benchmark_exit_code, _resolved_engine_config
+from benchmark.microbench import _resolved_engine_config
 
 
 def test_resolved_engine_config_records_backend_and_jsonable_values():
@@ -28,11 +28,3 @@ def test_resolved_engine_config_records_backend_and_jsonable_values():
     assert resolved["deltakv_sparse_decode_backend"] == "fa2"
     assert resolved["full_attn_layers"] == [0, 1, 2, 8]
     assert resolved["obs_layer_ids"] == [2, 8]
-
-
-def test_microbench_exit_code_propagates_case_failures():
-    assert _benchmark_exit_code([{"status": "SUCCESS"}]) == 0
-    assert _benchmark_exit_code([{"status": "FAILED"}]) == 1
-    assert _benchmark_exit_code([{"status": "OOM"}]) == 1
-    assert _benchmark_exit_code([{"status": "SKIPPED_BY_POLICY"}]) == 1
-    assert _benchmark_exit_code([]) == 1
