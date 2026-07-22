@@ -185,7 +185,10 @@ def test_minimax_compatibility_matches_qwen3_moe_sparse_runtime():
         "omnikv",
         "quest",
     }
-    assert MINIMAX_M2_EP_COMPATIBILITY.decode_cuda_graph_methods == {""}
+    assert (
+        MINIMAX_M2_EP_COMPATIBILITY.decode_cuda_graph_methods
+        == MINIMAX_M2_EP_COMPATIBILITY.sparse_methods
+    )
     assert _validate() is MINIMAX_M2_EP_COMPATIBILITY
 
 
@@ -237,13 +240,15 @@ def test_minimax_config_accepts_non_deltakv_sparse_methods(tmp_path, method):
     "method",
     ["streamingllm", "snapkv", "pyramidkv", "omnikv", "quest", "rkv"],
 )
-def test_minimax_sparse_methods_require_eager_decode(tmp_path, method):
-    with pytest.raises(ValueError, match="decode_cuda_graph is validated only"):
-        _make_config(
-            tmp_path,
-            vllm_sparse_method=method,
-            moe_backend="triton",
-            enforce_eager=False,
-            decode_cuda_graph=True,
-            enable_prefix_caching=False,
-        )
+def test_minimax_sparse_methods_accept_decode_cuda_graph(tmp_path, method):
+    config = _make_config(
+        tmp_path,
+        vllm_sparse_method=method,
+        moe_backend="triton",
+        enforce_eager=False,
+        decode_cuda_graph=True,
+        enable_prefix_caching=False,
+    )
+
+    assert config.decode_cuda_graph is True
+    assert config.vllm_sparse_method == method

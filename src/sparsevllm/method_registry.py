@@ -89,7 +89,17 @@ MINIMAX_M2_EP_COMPATIBILITY = ModelRuntimeCompatibility(
     ),
     prefix_cache_methods=frozenset({"", "omnikv", "quest"}),
     requires_eager=False,
-    decode_cuda_graph_methods=frozenset({""}),
+    decode_cuda_graph_methods=frozenset(
+        {
+            "",
+            "streamingllm",
+            "snapkv",
+            "pyramidkv",
+            "omnikv",
+            "quest",
+            "rkv",
+        }
+    ),
 )
 
 MODEL_RUNTIME_COMPATIBILITY = {
