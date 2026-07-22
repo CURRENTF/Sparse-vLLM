@@ -599,6 +599,7 @@ def load_model(
     tp_rank: int | None = None,
     tp_size: int | None = None,
     num_threads: int = 8,
+    show_progress: bool | None = None,
 ):
     num_threads = int(num_threads)
     if num_threads <= 0:
@@ -639,7 +640,8 @@ def load_model(
     loaded_tensor_bytes = 0
     loaded_parameter_names: set[str] = set()
     seen_source_keys: set[str] = set()
-    show_progress = tp_rank is None or tp_rank == 0
+    if show_progress is None:
+        show_progress = tp_rank is None or tp_rank == 0
     description = (
         "Multi-thread loading shards"
         if num_threads > 1 and len(files) > 1
