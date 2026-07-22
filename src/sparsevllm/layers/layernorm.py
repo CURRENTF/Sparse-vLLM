@@ -25,38 +25,11 @@ class RMSNorm(nn.Module):
             ) from exc
         return rmsnorm, fused_add_rmsnorm
 
-    def _validate_input(
-        self,
-        x: torch.Tensor,
-        residual: torch.Tensor | None,
-    ) -> None:
-        if not x.is_cuda:
-            raise RuntimeError("FlashInfer RMSNorm requires a CUDA input tensor.")
-        if x.dtype not in {torch.float16, torch.bfloat16}:
-            raise TypeError(
-                "FlashInfer RMSNorm requires FP16 or BF16 input, "
-                f"got {x.dtype}."
-            )
-        if x.shape[-1] != self.weight.numel():
-            raise ValueError(
-                "RMSNorm input and weight hidden sizes differ: "
-                f"{x.shape[-1]} and {self.weight.numel()}."
-            )
-        if residual is not None and (
-            residual.shape != x.shape or residual.dtype != x.dtype
-        ):
-            raise ValueError(
-                "Fused add-RMSNorm requires input and residual with matching "
-                f"shape and dtype, got {tuple(x.shape)}/{x.dtype} and "
-                f"{tuple(residual.shape)}/{residual.dtype}."
-            )
-
     def forward(
         self,
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        self._validate_input(x, residual)
         rmsnorm, fused_add_rmsnorm = self._load_flashinfer_ops()
         if residual is None:
             return rmsnorm(x, self.weight, eps=self.eps)
