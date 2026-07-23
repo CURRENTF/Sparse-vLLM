@@ -1581,6 +1581,43 @@ class SimulatedDeepResearchTest(unittest.TestCase):
             run.hashlib.sha256(patch_text.encode("utf-8")).hexdigest(),
         )
 
+    def test_benchmark_fails_when_client_git_status_cannot_be_inspected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "run"
+            config = self._config(output_dir)
+
+            with (
+                patch.object(run, "_git_command", return_value=None),
+                self.assertRaisesRegex(
+                    run.BenchmarkFailed,
+                    "Cannot inspect the client source-tree Git status",
+                ),
+            ):
+                asyncio.run(
+                    run.run_benchmark(
+                        config,
+                        get_fn=FakeService().get,
+                        post_fn=FakeService().post,
+                    )
+                )
+
+            aggregate = json.loads(
+                (output_dir / "aggregate_metrics.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            run_info = json.loads(
+                (output_dir / "run_info.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(aggregate["status"], "invalid_input")
+            self.assertIn(
+                "Cannot inspect the client source-tree Git status",
+                aggregate["error"],
+            )
+            self.assertIsNone(run_info["git_dirty"])
+
     def test_preflight_rejects_synthetic_ids_outside_vocab(self):
         service = FakeService()
 

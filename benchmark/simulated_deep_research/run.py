@@ -1383,14 +1383,14 @@ def _capture_client_code_state() -> tuple[dict[str, Any], str | None]:
     git_branch = _git_value("branch", "--show-current")
     status = _git_command("status", "--porcelain", "--untracked-files=all")
     if status is None:
-        return (
-            {
-                "git_commit": git_commit,
-                "git_branch": git_branch,
-                "git_dirty": None,
-                "worktree_patch": None,
-            },
-            None,
+        raise ValueError(
+            "Cannot inspect the client source-tree Git status; benchmark "
+            "provenance requires a readable Git worktree."
+        )
+    if not git_commit:
+        raise ValueError(
+            "Cannot resolve the client source-tree Git commit; benchmark "
+            "provenance requires an exact source revision."
         )
     status_lines = [
         line

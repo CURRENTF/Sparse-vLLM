@@ -96,6 +96,11 @@ match larger than this run's block-aligned expectation, including any hit on
 the first main-agent request, is `metric_failed`. Clear or restart the
 prefix-cache worker before rerunning a fixed seed.
 
+The runner is executed from the source tree and requires successful Git
+inspection before preflight. If the client commit or worktree status cannot be
+inspected, the run fails with `invalid_input` and writes failure artifacts
+instead of producing a result with unknown client provenance.
+
 The weighted distributions are configurable:
 
 ```bash
