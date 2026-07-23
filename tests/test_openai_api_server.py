@@ -1524,6 +1524,86 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(match_payload["snapshot"])
         self.assertFalse(match_payload["enabled"])
 
+    async def test_routing_snapshots_refresh_after_final_engine_step(self):
+        from sparsevllm.entrypoints.openai.api_server import AsyncEngineDispatcher
+
+        tokenizer = _byte_level_tokenizer()
+        completion_token_id = tokenizer.encode("a")[0]
+
+        class Snapshot:
+            def __init__(self, generation):
+                self.generation = generation
+
+            def match(self, _token_ids):
+                return {
+                    "supported": True,
+                    "enabled": True,
+                    "matched_tokens": 0,
+                    "generation": self.generation,
+                    "snapshot": True,
+                }
+
+        class Engine:
+            last_step_token_outputs = []
+            last_step_logprob_outputs = []
+
+            def __init__(self):
+                self.tokenizer = tokenizer
+                self.active_requests = 0
+                self.generation = 0
+
+            def worker_load(self):
+                return {"active_requests": self.active_requests}
+
+            def prefix_cache_routing_snapshot(self):
+                return Snapshot(self.generation)
+
+            def add_request(self, _prompt, _sampling_params):
+                self.active_requests = 1
+                return 17
+
+            def step(self):
+                self.active_requests = 0
+                self.generation = 1
+                return [(17, [completion_token_id], [None], [None])], 0
+
+            def abort_request(self, _seq_id):
+                pass
+
+            def exit(self):
+                pass
+
+        dispatcher = AsyncEngineDispatcher(Engine())
+        try:
+            handle = await dispatcher.submit(
+                "prompt",
+                type("Sampling", (), {"max_tokens": 1})(),
+                0,
+            )
+            item = await asyncio.wait_for(handle.output_queue.get(), timeout=1)
+            if item["type"] == "token":
+                item = await asyncio.wait_for(
+                    handle.output_queue.get(),
+                    timeout=1,
+                )
+            self.assertEqual(item["type"], "final")
+
+            deadline = time.monotonic() + 1
+            while time.monotonic() < deadline:
+                load = dispatcher.worker_load_snapshot()
+                match = dispatcher.prefix_cache_routing_match([1, 2])
+                if (
+                    load["active_requests"] == 0
+                    and match["generation"] == 1
+                ):
+                    break
+                await asyncio.sleep(0.01)
+        finally:
+            dispatcher.close()
+
+        self.assertEqual(load["active_requests"], 0)
+        self.assertEqual(match["generation"], 1)
+
     async def test_prefix_cache_text_selector_tokenizes_server_side(self):
         from sparsevllm.entrypoints.openai import api_server
 
