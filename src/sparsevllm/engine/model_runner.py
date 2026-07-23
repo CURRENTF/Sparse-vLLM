@@ -73,6 +73,14 @@ TP_RPC_STATUS_SYNC_METHODS = PREFIX_CACHE_CONTROL_RPC_METHODS | {
 def make_tp_shm_name() -> str:
     return f"{TP_SHM_NAME_PREFIX}{os.getpid()}_{uuid.uuid4().hex}"
 
+
+def _prepare_allocator_for_kv_sizing(platform, device: torch.device) -> None:
+    """Discard model-load temporaries before measuring the KV cache budget."""
+    platform.synchronize()
+    platform.empty_cache()
+    platform.reset_peak_memory_stats(device)
+
+
 class ModelRunner:
     """
     负责模型执行的类。每个 GPU Rank 进程都拥有一个 ModelRunner 实例。
@@ -198,6 +206,10 @@ class ModelRunner:
                 platform=self.platform,
                 state_spec=state_spec,
             )
+        # Model loading and backend warmup can leave released temporary tensors in
+        # the allocator cache. Flush them before KV sizing so device-used memory
+        # and allocator peak history do not reserve the same temporary memory.
+        _prepare_allocator_for_kv_sizing(self.platform, self.device)
         # Recurrent rows are persistent runtime state. Allocate them before the
         # cache manager sizes KV so gpu_memory_utilization accounts for both.
         self.cache_manager = CacheManager.create(config, self.parallel_context)

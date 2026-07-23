@@ -17,7 +17,7 @@ from sparsevllm.engine.cache_manager.base import (
 from sparsevllm.engine.cache_manager.quest import QuestCacheManager, QuestPrefixBlockPayload
 from sparsevllm.engine.cache_manager.snapkv import SnapKVCacheManager
 from sparsevllm.engine.cache_manager.standard import StandardCacheManager
-from sparsevllm.engine.model_runner import ModelRunner
+from sparsevllm.engine.model_runner import ModelRunner, _prepare_allocator_for_kv_sizing
 from sparsevllm.engine.prefix_cache import PrefixCacheBlock, RadixPrefixIndex
 from sparsevllm.engine.prefix_cache_coordinator import MixedPrefixBlockPayload, PrefixCacheCoordinator
 from sparsevllm.engine.recurrent_state_manager import (
@@ -714,6 +714,26 @@ def test_model_runner_resets_inherited_allocator_peak_before_model_construction(
 
     assert events == [("reset_peak", torch.device("cpu"))]
     assert observed_peak_at_construction == [0]
+
+
+def test_model_runner_flushes_allocator_before_kv_sizing():
+    events = []
+    device = torch.device("cpu")
+    platform = SimpleNamespace(
+        synchronize=lambda: events.append("synchronize"),
+        empty_cache=lambda: events.append("empty_cache"),
+        reset_peak_memory_stats=lambda observed_device: events.append(
+            ("reset_peak", observed_device)
+        ),
+    )
+
+    _prepare_allocator_for_kv_sizing(platform, device)
+
+    assert events == [
+        "synchronize",
+        "empty_cache",
+        ("reset_peak", device),
+    ]
 
 
 def test_cache_budget_resolves_joint_prefix_capacity_before_kv_allocation():
