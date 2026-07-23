@@ -100,7 +100,7 @@ def create_app(
     if engine is None:
         engine_kwargs.setdefault("throughput_log_interval_s", 0.0)
     _validate_serving_method(engine_kwargs, engine)
-    if reasoning_parser not in (None, "qwen3"):
+    if reasoning_parser not in (None, "qwen3", "minimax_m2"):
         raise ValueError(f"Unsupported reasoning parser {reasoning_parser!r}.")
     engine = engine or LLM(model, **engine_kwargs)
     dispatcher = AsyncEngineDispatcher(engine)
@@ -201,7 +201,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--engine-kwargs", default=None, help="JSON object or JSON file with Sparse-vLLM engine kwargs.")
     parser.add_argument("--request-log-dir", default=None, help="Optional directory for per-request JSON logs.")
-    parser.add_argument("--reasoning-parser", choices=["qwen3"], default=None)
+    parser.add_argument("--reasoning-parser", choices=["qwen3", "minimax_m2"], default=None)
     return parser
 
 

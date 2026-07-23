@@ -29,10 +29,15 @@ class _FastTokenizerAdapter:
 class _TransformersResponseTokenizer:
     response_template = None
 
-    def __init__(self, *, xml_tools=False):
+    def __init__(self, *, xml_tools=False, minimax_tools=False):
         self.chat_template = "<think><tool_call>"
         if xml_tools:
             self.chat_template += "<function=name><parameter=key>"
+        if minimax_tools:
+            self.chat_template = (
+                '<think><minimax:tool_call><invoke name="tool">'
+                '<parameter name="key">'
+            )
 
     def parse_response(self, response, schema, *, prefix=None):
         from transformers.utils.chat_parsing import parse_response
@@ -45,11 +50,14 @@ class _TransformersResponseTokenizer:
         return ResponseParser(response_template, prefix=prefix)
 
 
-def _transformers_response_parser(*, xml_tools=False):
+def _transformers_response_parser(*, xml_tools=False, minimax_tools=False):
     from sparsevllm.entrypoints.openai.serving.response_parsing import TransformersResponseParser
 
     parser = TransformersResponseParser.from_tokenizer(
-        _TransformersResponseTokenizer(xml_tools=xml_tools)
+        _TransformersResponseTokenizer(
+            xml_tools=xml_tools,
+            minimax_tools=minimax_tools,
+        )
     )
     assert parser is not None
     return parser
@@ -1000,6 +1008,53 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tokenizer.chat[1]["tool_calls"][0]["function"]["arguments"], {"city": "Paris"})
         self.assertEqual(tokenizer.chat[2]["tool_call_id"], "call_1")
         self.assertEqual(tokenizer.tools[0]["name"], "get_weather")
+
+    def test_chat_prompt_adapts_tools_for_minimax_template(self):
+        from sparsevllm.entrypoints.openai.api_server import (
+            ChatCompletionRequest,
+            _chat_request_prompt,
+        )
+
+        class Tokenizer:
+            chat_template = "<minimax:tool_call>{{ tool.function }}"
+
+            def __init__(self):
+                self.tools = None
+
+            def apply_chat_template(self, _chat, tools=None, **_kwargs):
+                self.tools = tools
+                return "rendered"
+
+        tokenizer = Tokenizer()
+        request = ChatCompletionRequest(
+            model="m",
+            messages=[{"role": "user", "content": "weather"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "description": "Get weather",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+        )
+
+        self.assertEqual(_chat_request_prompt(tokenizer, request), "rendered")
+        self.assertEqual(
+            tokenizer.tools,
+            [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "description": "Get weather",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+        )
 
     def test_chat_prompt_rejects_invalid_tool_history_arguments(self):
         from sparsevllm.entrypoints.openai.api_server import ChatMessage, _chat_prompt
@@ -3147,6 +3202,55 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tokenizer.chat, [{"role": "tool", "content": '{"ok":true}', "tool_call_id": "call_1"}])
         self.assertEqual(tokenizer.tools[0]["name"], "get_weather")
 
+    def test_response_prompt_adapts_minimax_tool_history(self):
+        from sparsevllm.entrypoints.openai.api_server import ResponseRequest, _response_prompt
+
+        class Tokenizer:
+            chat_template = "<minimax:tool_call>{{ tool.function }}"
+
+            def __init__(self):
+                self.chat = None
+                self.tools = None
+
+            def apply_chat_template(self, chat, tools=None, **_kwargs):
+                self.chat = chat
+                self.tools = tools
+                return "rendered"
+
+        tokenizer = Tokenizer()
+        request = ResponseRequest(
+            model="model",
+            input=[
+                {"type": "message", "role": "user", "content": "weather"},
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "get_weather",
+                    "arguments": '{"city":"Paris"}',
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "sunny",
+                },
+            ],
+            tools=[
+                {
+                    "type": "function",
+                    "name": "get_weather",
+                    "parameters": {"type": "object"},
+                }
+            ],
+        )
+
+        self.assertEqual(_response_prompt(tokenizer, request), "rendered")
+        self.assertEqual(
+            tokenizer.chat[1]["tool_calls"][0]["function"]["arguments"],
+            {"city": "Paris"},
+        )
+        self.assertEqual(tokenizer.chat[2]["tool_call_id"], "call_1")
+        self.assertEqual(tokenizer.tools[0]["function"]["name"], "get_weather")
+
     def test_response_prompt_rejects_tools_without_template_support(self):
         from sparsevllm.entrypoints.openai.api_server import ResponseRequest, _response_prompt
 
@@ -3790,6 +3894,69 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
             "name": "bash",
             "arguments": '{"command":"pwd"}',
         })
+
+    def test_minimax_tool_calls_parse_reasoning_and_parallel_invokes(self):
+        from sparsevllm.entrypoints.openai.api_server import _response_output_items
+
+        parsed = _transformers_response_parser(minimax_tools=True).parse(
+            "reason</think>\n"
+            "<minimax:tool_call>"
+            '<invoke name="get_weather">'
+            '<parameter name="city">北京</parameter>'
+            "</invoke>"
+            '<invoke name="get_forecast">'
+            '<parameter name="days">2</parameter>'
+            "</invoke>"
+            "</minimax:tool_call>[e~[",
+            prefix="]~b]ai\n<think>\n",
+            parse_tools=True,
+        )
+        output = _response_output_items(parsed)
+
+        self.assertEqual(parsed.reasoning_content, "reason")
+        self.assertEqual(parsed.content, "")
+        self.assertEqual(
+            [item["name"] for item in output[1:]],
+            ["get_weather", "get_forecast"],
+        )
+        self.assertEqual(output[1]["arguments"], '{"city":"北京"}')
+        self.assertEqual(output[2]["arguments"], '{"days":"2"}')
+
+    def test_minimax_response_stream_parser_handles_split_invokes(self):
+        parser = _transformers_response_parser(minimax_tools=True).stream(
+            prefix="]~b]ai\n<think>\n",
+            parse_tools=True,
+        )
+        deltas = []
+        for chunk in [
+            "rea",
+            "son</think>\n<minimax:tool_",
+            'call><invoke name="get_weather"><parameter name="city">北',
+            "京</parameter></invoke>",
+            '<invoke name="get_forecast"><parameter name="days">2</parameter>',
+            "</invoke>",
+            "</minimax:tool_call>",
+        ]:
+            deltas.extend(parser.feed(chunk))
+        deltas.extend(parser.finish())
+
+        reasoning = "".join(
+            delta.get("reasoning_content", "")
+            for delta in deltas
+        )
+        calls = [
+            delta["tool_calls"][0]
+            for delta in deltas
+            if "tool_calls" in delta
+        ]
+        self.assertEqual(reasoning, "reason")
+        self.assertEqual(
+            [call["function"]["name"] for call in calls],
+            ["get_weather", "get_forecast"],
+        )
+        self.assertEqual(calls[0]["function"]["arguments"], '{"city":"北京"}')
+        self.assertEqual(calls[1]["function"]["arguments"], '{"days":"2"}')
+        self.assertFalse(any(delta.get("content") for delta in deltas))
 
     def test_malformed_tool_call_json_fails_fast(self):
         from sparsevllm.entrypoints.openai.serving.response_parsing import ResponseParseError
