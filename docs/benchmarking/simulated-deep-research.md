@@ -71,6 +71,9 @@ The client timeout must exceed the router's upstream timeout by at least
 30-second margin, and `SPARSEVLLM_ROUTER_REQUEST_TIMEOUT_S=900` for the
 systemd router. Keep the separate router control-plane timeout short; its
 default is 5 seconds.
+The worker serves load and prefix-match routing probes from immutable
+dispatcher snapshots, so a long synchronous prefill step does not turn that
+short control timeout into a false worker failure.
 The router must have workers whose advertised methods satisfy
 `--subagent-methods snapkv` and `--main-agent-methods omnikv,vanilla`.
 For the default profile, every eligible subagent worker needs

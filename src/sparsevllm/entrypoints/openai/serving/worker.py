@@ -13,7 +13,7 @@ def serve_worker_info(engine: Any, served_model_name: str):
 
 async def serve_worker_load(dispatcher: AsyncEngineDispatcher):
     try:
-        result = await dispatcher.control("worker_load")
+        result = dispatcher.worker_load_snapshot()
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     if not isinstance(result, dict):

@@ -124,6 +124,55 @@ class OpenAISmartRouterTest(unittest.TestCase):
         self.assertIs(worker, cache_worker)
         self.assertEqual(reason, "best_prefix_match")
 
+    def test_probe_uses_nonblocking_prefix_routing_snapshot(self):
+        from sparsevllm.entrypoints.openai import smart_router
+
+        router = smart_router.SmartRouter(
+            worker_urls=["http://worker-a"],
+            request_timeout_s=900.0,
+            control_timeout_s=5.0,
+            overload_load_factor=1.5,
+            load_abs_threshold=1,
+            profiles={},
+            route_log_dir=None,
+        )
+        worker = router.workers[0]
+        with (
+            patch.object(
+                smart_router,
+                "_get_json",
+                return_value={"active_requests": 1, "snapshot": True},
+            ) as get_json,
+            patch.object(
+                smart_router,
+                "_post_json",
+                return_value={
+                    "supported": True,
+                    "enabled": True,
+                    "matched_tokens": 16,
+                    "match_ratio": 1.0,
+                    "snapshot": True,
+                },
+            ) as post_json,
+        ):
+            probe = asyncio.run(
+                router._probe_worker(
+                    worker,
+                    {"token_ids": [1, 2, 3]},
+                )
+            )
+
+        get_json.assert_called_once_with(
+            "http://worker-a/v1/worker/load",
+            5.0,
+        )
+        post_json.assert_called_once_with(
+            "http://worker-a/v1/prefix_cache/routing_match",
+            {"token_ids": [1, 2, 3]},
+            5.0,
+        )
+        self.assertEqual(probe.matched_tokens, 16)
+
     def test_choose_worker_falls_back_to_lowest_load_when_match_worker_is_overloaded(self):
         from sparsevllm.entrypoints.openai.smart_router import WorkerProbe, WorkerState, choose_worker
 

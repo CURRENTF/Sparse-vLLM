@@ -19,6 +19,7 @@ from sparsevllm.sampling_params import SamplingParams
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.engine.scheduler import Scheduler
 from sparsevllm.engine.model_runner import ModelRunner, make_tp_shm_name
+from sparsevllm.engine.prefix_cache import PrefixCacheRoutingSnapshot
 from sparsevllm.method_registry import normalize_sparse_method
 from sparsevllm.utils.profiler import profiler
 
@@ -660,6 +661,30 @@ class LLMEngine:
             "max_num_seqs_in_gpu": int(getattr(scheduler.config, "max_num_seqs_in_gpu", 0)),
             "cache": {str(key): int(value) for key, value in cache_stats.items() if isinstance(value, int)},
         }
+
+    def prefix_cache_routing_snapshot(self) -> PrefixCacheRoutingSnapshot:
+        runtime_state = self.model_runner.runtime_state
+        owner = (
+            runtime_state.prefix_cache_coordinator
+            if runtime_state.prefix_cache_coordinator is not None
+            else runtime_state.cache_manager
+        )
+        method = str(self.config.vllm_sparse_method or "")
+        prefix_cache = getattr(owner, "prefix_cache", None)
+        if prefix_cache is not None:
+            return prefix_cache.routing_snapshot(method)
+
+        supported = hasattr(owner, "prefix_cache")
+        return PrefixCacheRoutingSnapshot(
+            supported=supported,
+            enabled=False,
+            method=method,
+            reason=(
+                "prefix cache is not enabled for this runtime."
+                if supported
+                else "prefix cache is not supported by this cache manager."
+            ),
+        )
 
     def step(self):
         """

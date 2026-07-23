@@ -87,6 +87,91 @@ def _pack_token_ids(token_ids: list[int] | tuple[int, ...]) -> bytes:
     return b"".join(struct.pack("<q", int(token_id)) for token_id in token_ids)
 
 
+def _stable_prefix_block_id(
+    fingerprint: bytes,
+    token_ids: list[int] | tuple[int, ...],
+    parent_block_id: bytes | None,
+) -> bytes:
+    hasher = hashlib.sha256()
+    hasher.update(fingerprint)
+    if parent_block_id is None:
+        hasher.update(b"\x00")
+    else:
+        hasher.update(b"\x01")
+        hasher.update(parent_block_id)
+    hasher.update(_pack_token_ids(token_ids))
+    return hasher.digest()
+
+
+@dataclass(frozen=True)
+class PrefixCacheRoutingSnapshot:
+    supported: bool
+    enabled: bool
+    method: str
+    block_size: int | None = None
+    fingerprint: bytes = b""
+    block_ids: frozenset[bytes] = frozenset()
+    reason: str | None = None
+
+    def match(self, token_ids: list[int]) -> dict[str, object]:
+        token_ids = [int(token_id) for token_id in token_ids]
+        if not self.supported or not self.enabled:
+            return {
+                "supported": bool(self.supported),
+                "enabled": bool(self.enabled),
+                "method": self.method,
+                "matched_tokens": 0,
+                "matched_blocks": 0,
+                "match_ratio": 0.0,
+                "reason": self.reason,
+                "snapshot": True,
+            }
+        if self.block_size is None or self.block_size <= 0:
+            raise RuntimeError(
+                "Enabled prefix-cache routing snapshot has no valid block size."
+            )
+
+        usable_tokens = usable_prefix_cache_tokens(
+            len(token_ids),
+            self.block_size,
+        )
+        hit_blocks = 0
+        last_block_id: bytes | None = None
+        parent_block_id: bytes | None = None
+        for start in range(0, usable_tokens, self.block_size):
+            block_id = _stable_prefix_block_id(
+                self.fingerprint,
+                token_ids[start : start + self.block_size],
+                parent_block_id,
+            )
+            if block_id not in self.block_ids:
+                break
+            hit_blocks += 1
+            last_block_id = block_id
+            parent_block_id = block_id
+        hit_len = hit_blocks * self.block_size
+        return {
+            "supported": True,
+            "enabled": True,
+            "method": self.method,
+            "block_size": int(self.block_size),
+            "prompt_tokens": int(len(token_ids)),
+            "usable_tokens": int(usable_tokens),
+            "matched_tokens": int(hit_len),
+            "matched_blocks": int(hit_blocks),
+            "match_ratio": (
+                0.0
+                if usable_tokens <= 0
+                else float(hit_len) / float(usable_tokens)
+            ),
+            "last_block_id": (
+                None if last_block_id is None else last_block_id.hex()
+            ),
+            "live_blocks": int(len(self.block_ids)),
+            "snapshot": True,
+        }
+
+
 class PrefixBlockPayload(Protocol):
     """Marker protocol for method-owned prefix block payloads."""
 
@@ -405,6 +490,7 @@ class RadixPrefixIndex:
         self.control_inspect_requests = 0
         self.control_delete_requests = 0
         self.control_priority_updates = 0
+        self._routing_snapshot: PrefixCacheRoutingSnapshot | None = None
 
     def __len__(self) -> int:
         return len(self.blocks)
@@ -428,15 +514,26 @@ class RadixPrefixIndex:
             raise ValueError(
                 f"prefix cache blocks must be full: got {len(token_ids)} tokens, block_size={self.block_size}."
             )
-        hasher = hashlib.sha256()
-        hasher.update(self.fingerprint)
-        if parent_block_id is None:
-            hasher.update(b"\x00")
-        else:
-            hasher.update(b"\x01")
-            hasher.update(parent_block_id)
-        hasher.update(_pack_token_ids(token_ids))
-        return hasher.digest()
+        return _stable_prefix_block_id(
+            self.fingerprint,
+            token_ids,
+            parent_block_id,
+        )
+
+    def routing_snapshot(self, method: str) -> PrefixCacheRoutingSnapshot:
+        method = str(method or "")
+        snapshot = self._routing_snapshot
+        if snapshot is None or snapshot.method != method:
+            snapshot = PrefixCacheRoutingSnapshot(
+                supported=True,
+                enabled=True,
+                method=method,
+                block_size=self.block_size,
+                fingerprint=self.fingerprint,
+                block_ids=frozenset(self.blocks),
+            )
+            self._routing_snapshot = snapshot
+        return snapshot
 
     def block_ids_for_tokens(
         self,
@@ -547,6 +644,7 @@ class RadixPrefixIndex:
         self.blocks[block.stable_block_id] = block
         self.backend.insert_child(block.parent_block_id, block.stable_block_id)
         self.committed_blocks += 1
+        self._routing_snapshot = None
         return block
 
     def touch_chain(self, blocks: list[PrefixCacheBlock]) -> None:
@@ -624,6 +722,7 @@ class RadixPrefixIndex:
             raise RuntimeError("Cannot remove a prefix cache block with live children.")
         self.backend.remove_block(stable_block_id)
         del self.blocks[stable_block_id]
+        self._routing_snapshot = None
         return block
 
     def rollback_inserted_leaf(self, block: PrefixCacheBlock) -> None:

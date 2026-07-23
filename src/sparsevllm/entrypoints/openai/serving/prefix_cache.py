@@ -45,6 +45,19 @@ async def serve_prefix_cache_match(
     return JSONResponse(result)
 
 
+async def serve_prefix_cache_routing_match(
+    request: PrefixCacheMatchRequest,
+    dispatcher: AsyncEngineDispatcher,
+    tokenizer: Any,
+):
+    token_ids = _prefix_cache_match_token_ids_from_request(request, tokenizer)
+    try:
+        result = dispatcher.prefix_cache_routing_match(token_ids)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return JSONResponse(result)
+
+
 async def serve_prefix_cache_delete_subtree(
     request: PrefixCacheDeleteSubtreeRequest,
     dispatcher: AsyncEngineDispatcher,

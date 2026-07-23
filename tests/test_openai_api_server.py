@@ -308,6 +308,16 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
                 self.tokenizer = tokenizer
                 self.aborted = []
 
+            def worker_load(self):
+                return {"active_requests": 1}
+
+            def prefix_cache_routing_snapshot(self):
+                return type(
+                    "Snapshot",
+                    (),
+                    {"match": lambda _self, _token_ids: {"matched_tokens": 0}},
+                )()
+
             def add_request(self, _prompt, _sampling_params):
                 return 17
 
@@ -335,6 +345,10 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("fatal engine step", item["message"])
         self.assertFalse(dispatcher.is_ready)
         self.assertIn("fatal engine step", dispatcher.failure_message)
+        with self.assertRaisesRegex(RuntimeError, "fatal engine step"):
+            dispatcher.worker_load_snapshot()
+        with self.assertRaisesRegex(RuntimeError, "fatal engine step"):
+            dispatcher.prefix_cache_routing_match([1, 2, 3])
 
     async def test_dispatcher_fatal_failure_releases_concurrent_control(self):
         from sparsevllm.entrypoints.openai.api_server import AsyncEngineDispatcher
@@ -1430,9 +1444,85 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
             app.state.dispatcher.close()
 
         self.assertEqual(json.loads(info_response.body), {"served_model_name": "model", "tags": ["dialog", "omnikv"]})
-        self.assertEqual(json.loads(load_response.body), {"active_requests": 3, "thread": "sparsevllm-openai-dispatcher"})
+        load_payload = json.loads(load_response.body)
+        self.assertEqual(load_payload["active_requests"], 3)
+        self.assertTrue(load_payload["snapshot"])
         self.assertEqual(unavailable_info_response.status_code, 503)
         self.assertEqual(json.loads(unavailable_info_response.body)["reason"], "OutOfMemoryError")
+
+    async def test_routing_probe_snapshots_do_not_wait_for_engine_step(self):
+        from sparsevllm.engine.prefix_cache import PrefixCacheRoutingSnapshot
+        from sparsevllm.entrypoints.openai import api_server
+
+        tokenizer = _byte_level_tokenizer()
+        step_started = threading.Event()
+        release_step = threading.Event()
+
+        class Engine:
+            config = type("Config", (), {"vllm_sparse_method": ""})()
+
+            def __init__(self):
+                self.tokenizer = tokenizer
+
+            def worker_load(self):
+                return {"active_requests": 1}
+
+            def prefix_cache_routing_snapshot(self):
+                return PrefixCacheRoutingSnapshot(
+                    supported=True,
+                    enabled=False,
+                    method="",
+                    reason="prefix cache is not enabled for this runtime.",
+                )
+
+            def add_request(self, _prompt, _sampling_params):
+                return 17
+
+            def step(self):
+                step_started.set()
+                release_step.wait(1)
+                return [], 0
+
+            def abort_request(self, _seq_id):
+                pass
+
+            def exit(self):
+                pass
+
+        app = api_server.create_app(
+            "/tmp/model",
+            served_model_name="model",
+            engine=Engine(),
+        )
+        load_endpoint = _route_endpoint(app, "/v1/worker/load")
+        match_endpoint = _route_endpoint(
+            app,
+            "/v1/prefix_cache/routing_match",
+        )
+        try:
+            sampling = type("Sampling", (), {"max_tokens": 1})()
+            await app.state.dispatcher.submit("prompt", sampling, 0)
+            self.assertTrue(await asyncio.to_thread(step_started.wait, 1))
+
+            load_response = await asyncio.wait_for(
+                load_endpoint(_TestRequest(app)),
+                timeout=0.2,
+            )
+            match_response = await asyncio.wait_for(
+                match_endpoint(
+                    api_server.PrefixCacheMatchRequest(token_ids=[1, 2]),
+                    _TestRequest(app),
+                ),
+                timeout=0.2,
+            )
+        finally:
+            release_step.set()
+            app.state.dispatcher.close()
+
+        self.assertTrue(json.loads(load_response.body)["snapshot"])
+        match_payload = json.loads(match_response.body)
+        self.assertTrue(match_payload["snapshot"])
+        self.assertFalse(match_payload["enabled"])
 
     async def test_prefix_cache_text_selector_tokenizes_server_side(self):
         from sparsevllm.entrypoints.openai import api_server

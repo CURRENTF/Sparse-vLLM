@@ -8,6 +8,7 @@ from sparsevllm.entrypoints.openai.protocol.prefix_cache import PrefixCacheSetEv
 from sparsevllm.entrypoints.openai.serving.prefix_cache import serve_prefix_cache_delete_subtree
 from sparsevllm.entrypoints.openai.serving.prefix_cache import serve_prefix_cache_inspect
 from sparsevllm.entrypoints.openai.serving.prefix_cache import serve_prefix_cache_match
+from sparsevllm.entrypoints.openai.serving.prefix_cache import serve_prefix_cache_routing_match
 from sparsevllm.entrypoints.openai.serving.prefix_cache import serve_prefix_cache_set_eviction_priority
 
 
@@ -26,6 +27,15 @@ async def prefix_cache_inspect(body: PrefixCacheInspectRequest, request: Request
 @router.post("/v1/prefix_cache/match")
 async def prefix_cache_match(body: PrefixCacheMatchRequest, request: Request):
     return await serve_prefix_cache_match(
+        body,
+        request.app.state.dispatcher,
+        request.app.state.engine.tokenizer,
+    )
+
+
+@router.post("/v1/prefix_cache/routing_match")
+async def prefix_cache_routing_match(body: PrefixCacheMatchRequest, request: Request):
+    return await serve_prefix_cache_routing_match(
         body,
         request.app.state.dispatcher,
         request.app.state.engine.tokenizer,

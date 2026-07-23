@@ -73,6 +73,10 @@ class AsyncEngineDispatcher:
         self._failed_message: str | None = None
         self._fatal_callback: Callable[[str], None] | None = None
         self._state_lock = threading.Lock()
+        self._routing_snapshot_lock = threading.Lock()
+        self._worker_load_snapshot: dict[str, Any] | None = None
+        self._prefix_cache_routing_snapshot: Any | None = None
+        self._refresh_routing_snapshots()
         self._thread = threading.Thread(target=self._run, name="sparsevllm-openai-dispatcher", daemon=True)
         self._thread.start()
 
@@ -157,6 +161,69 @@ class AsyncEngineDispatcher:
             raise RuntimeError(result["message"])
         return result["value"]
 
+    def worker_load_snapshot(self) -> dict[str, Any]:
+        self._raise_if_unavailable()
+        with self._routing_snapshot_lock:
+            snapshot = self._worker_load_snapshot
+        if snapshot is None:
+            raise RuntimeError(
+                "Engine does not expose worker_load for routing snapshots."
+            )
+        return {**snapshot, "snapshot": True}
+
+    def prefix_cache_routing_match(
+        self,
+        token_ids: list[int],
+    ) -> dict[str, Any]:
+        self._raise_if_unavailable()
+        with self._routing_snapshot_lock:
+            snapshot = self._prefix_cache_routing_snapshot
+        if snapshot is None:
+            raise RuntimeError(
+                "Engine does not expose a prefix-cache routing snapshot."
+            )
+        result = snapshot.match([int(token_id) for token_id in token_ids])
+        if not isinstance(result, dict):
+            raise RuntimeError(
+                "Prefix-cache routing snapshot returned a non-object result: "
+                f"{type(result).__name__}."
+            )
+        return result
+
+    def _raise_if_unavailable(self) -> None:
+        with self._state_lock:
+            terminal_message = self._terminal_message_locked()
+        if terminal_message is not None:
+            raise RuntimeError(terminal_message)
+
+    def _refresh_routing_snapshots(self) -> None:
+        worker_load_fn = getattr(self.engine, "worker_load", None)
+        prefix_snapshot_fn = getattr(
+            self.engine,
+            "prefix_cache_routing_snapshot",
+            None,
+        )
+        worker_load = (
+            worker_load_fn()
+            if callable(worker_load_fn)
+            else None
+        )
+        prefix_snapshot = (
+            prefix_snapshot_fn()
+            if callable(prefix_snapshot_fn)
+            else None
+        )
+        if worker_load is not None and not isinstance(worker_load, dict):
+            raise RuntimeError(
+                "worker_load must return an object for routing snapshots, "
+                f"got {type(worker_load).__name__}."
+            )
+        with self._routing_snapshot_lock:
+            if worker_load is not None:
+                self._worker_load_snapshot = dict(worker_load)
+            if prefix_snapshot is not None:
+                self._prefix_cache_routing_snapshot = prefix_snapshot
+
     def cancel(self, handle: RequestHandle):
         handle.cancelled.set()
         if handle.seq_id is not None:
@@ -188,8 +255,10 @@ class AsyncEngineDispatcher:
         fatal_callback: Callable[[str], None] | None = None
         try:
             while not stopping:
-                self._drain_controls()
+                controls_changed = self._drain_controls()
                 self._drain_aborts(active)
+                if controls_changed:
+                    self._refresh_routing_snapshots()
                 if not active:
                     item = self._pending.get()
                     if item is None:
@@ -213,8 +282,10 @@ class AsyncEngineDispatcher:
                 self._drain_controls()
                 self._drain_aborts(active)
                 if not active:
+                    self._refresh_routing_snapshots()
                     continue
 
+                self._refresh_routing_snapshots()
                 finished_outputs, _num_tokens = self.engine.step()
                 self._publish_token_deltas(active)
                 self._publish_finished(active, finished_outputs)
@@ -234,12 +305,13 @@ class AsyncEngineDispatcher:
                     except Exception:
                         logger.exception("OpenAI dispatcher fatal callback failed")
 
-    def _drain_controls(self):
+    def _drain_controls(self) -> bool:
+        changed = False
         while True:
             try:
                 item = self._controls.get_nowait()
             except queue.Empty:
-                return
+                return changed
             if self._closing.is_set():
                 self._put_control(item, {"type": "error", "message": "Sparse-vLLM server is shutting down."})
                 continue
@@ -249,6 +321,7 @@ class AsyncEngineDispatcher:
             try:
                 method = getattr(self.engine, item.operation)
                 value = method(**item.kwargs)
+                changed = True
             except Exception as exc:
                 self._put_control(item, {"type": "error", "message": f"{type(exc).__name__}: {exc}"})
                 continue

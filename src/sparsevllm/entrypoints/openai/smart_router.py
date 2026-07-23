@@ -399,7 +399,7 @@ class SmartRouter:
                 load_task,
                 asyncio.to_thread(
                     _post_json,
-                    f"{worker.url}/v1/prefix_cache/match",
+                    f"{worker.url}/v1/prefix_cache/routing_match",
                     match_payload,
                     self.control_timeout_s,
                 ),

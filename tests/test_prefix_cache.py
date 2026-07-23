@@ -264,6 +264,24 @@ def test_lookup_returns_longest_full_block_prefix():
     assert [block.logical_block_idx for block in chain] == [0, 1]
 
 
+def test_routing_snapshot_is_immutable_and_refreshes_after_insert():
+    fp = build_prefix_cache_fingerprint(_cfg(method="omnikv"), 4)
+    index = RadixPrefixIndex(block_size=4, fingerprint=fp)
+    _insert_tokens(index, list(range(8)))
+
+    first_snapshot = index.routing_snapshot("omnikv")
+    assert first_snapshot is index.routing_snapshot("omnikv")
+    assert first_snapshot.match(list(range(13)))["matched_tokens"] == 8
+
+    _insert_tokens(index, list(range(12)))
+    second_snapshot = index.routing_snapshot("omnikv")
+
+    assert second_snapshot is not first_snapshot
+    assert first_snapshot.match(list(range(13)))["matched_tokens"] == 8
+    assert second_snapshot.match(list(range(13)))["matched_tokens"] == 12
+    assert second_snapshot.match(list(range(13)))["snapshot"] is True
+
+
 def test_lookup_never_returns_half_block_match():
     fp = build_prefix_cache_fingerprint(_cfg(), 4)
     index = RadixPrefixIndex(block_size=4, fingerprint=fp)
