@@ -53,8 +53,9 @@ SPARSEVLLM_ROUTE_LOG_DIR=/path/to/logs/router
 ```
 
 Set `SPARSEVLLM_ROUTER_REQUEST_TIMEOUT_S` at least as high as the client
-request timeout for long-context workloads. For example, the simulated Deep
-Research benchmark uses 900 seconds.
+workload needs, while keeping the client timeout higher so routing and response
+overhead cannot expire first. The simulated Deep Research benchmark uses a
+900-second router timeout and a 930-second client timeout.
 
 Then load and start the services:
 

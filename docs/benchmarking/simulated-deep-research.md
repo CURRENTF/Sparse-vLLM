@@ -37,8 +37,8 @@ The runner calls the smart router's `/v1/completions` endpoint.
 - Subagents send `svllm_method_preference=snapkv`.
 - Main-agent requests send
   `svllm_method_preference=omnikv,vanilla`.
-- The preflight requires at least two entries in `/health`'s
-  `healthy_workers`.
+- The preflight requires at least two healthy workers for the selected model
+  and verifies that the advertised methods cover both agent roles.
 - Every response must include `X-SparseVLLM-Worker`,
   `X-SparseVLLM-Route-Reason`, and `X-SparseVLLM-Sparse-Method`.
 - A request routed to the wrong method is recorded as `metric_failed`, and the
@@ -62,9 +62,10 @@ python -m benchmark.simulated_deep_research.run \
   --output-dir outputs/simulated_deep_research/<RUN_NAME>
 ```
 
-Configure the router's upstream timeout to at least the benchmark's
-`--request-timeout-s` value. With the systemd runbook, set
-`SPARSEVLLM_ROUTER_REQUEST_TIMEOUT_S=900` for the default benchmark.
+The client timeout must exceed the router's upstream timeout by at least
+`--router-timeout-margin-s`. The defaults use a 930-second client timeout, a
+30-second margin, and `SPARSEVLLM_ROUTER_REQUEST_TIMEOUT_S=900` for the
+systemd router.
 The router must have workers whose advertised methods satisfy
 `--subagent-methods snapkv` and `--main-agent-methods omnikv,vanilla`.
 For the default profile, configure every routed worker with

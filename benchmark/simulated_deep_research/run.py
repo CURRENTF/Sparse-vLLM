@@ -78,7 +78,8 @@ class BenchmarkConfig:
     main_agent_methods: tuple[str, ...] = ("omnikv", "vanilla")
     synthetic_token_id_low: int = 100
     synthetic_token_id_high: int = 255
-    request_timeout_s: float = 900.0
+    request_timeout_s: float = 930.0
+    router_timeout_margin_s: float = 30.0
     seed: int = 20260723
     require_router: bool = True
     min_healthy_workers: int = 2
@@ -271,6 +272,8 @@ def validate_config(config: BenchmarkConfig) -> None:
         )
     if config.request_timeout_s <= 0:
         raise ValueError("request_timeout_s must be positive.")
+    if config.router_timeout_margin_s <= 0:
+        raise ValueError("router_timeout_margin_s must be positive.")
     subagent_methods = {_canonical_method(item) for item in config.subagent_methods}
     main_agent_methods = {_canonical_method(item) for item in config.main_agent_methods}
     overlap = sorted(subagent_methods & main_agent_methods)
@@ -505,10 +508,14 @@ async def preflight(
             raise PreflightParseError(
                 "Router policy request_timeout_s must be positive."
             )
-        if router_timeout < config.request_timeout_s:
+        if (
+            config.request_timeout_s
+            < router_timeout + config.router_timeout_margin_s
+        ):
             raise ValueError(
-                "Router upstream timeout is shorter than the benchmark "
-                f"request timeout: router={router_timeout}s "
+                "Benchmark request timeout must exceed the router upstream "
+                f"timeout by at least {config.router_timeout_margin_s}s: "
+                f"router={router_timeout}s "
                 f"benchmark={config.request_timeout_s}s."
             )
         overload_load_factor = router_policy["overload_load_factor"]
@@ -584,6 +591,11 @@ async def preflight(
         ]
     for worker in workers:
         info = worker["info"]
+        if not isinstance(info.get("sparse_method"), str):
+            raise PreflightParseError(
+                "Worker info response is missing a string sparse_method: "
+                f"worker={worker['url']}."
+            )
         if not isinstance(info.get("benchmark_config"), dict):
             raise PreflightParseError(
                 "Worker info response is missing benchmark_config: "
@@ -596,6 +608,24 @@ async def preflight(
                 f"served_model_name={info.get('served_model_name')!r} "
                 f"expected={config.model!r}."
             )
+    if config.require_router:
+        advertised_methods = {
+            _canonical_method(worker["info"]["sparse_method"])
+            for worker in workers
+        }
+        for role, preferences in (
+            ("subagent", config.subagent_methods),
+            ("main agent", config.main_agent_methods),
+        ):
+            if not any(
+                _canonical_method(method) in advertised_methods
+                for method in preferences
+            ):
+                raise ValueError(
+                    f"No healthy worker for model {config.model!r} matches "
+                    f"the configured {role} methods {list(preferences)}; "
+                    f"advertised methods={sorted(advertised_methods)}."
+                )
     return {
         "health": health,
         "model_card": model_card,
@@ -1497,7 +1527,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--synthetic-token-id-low", type=int, default=100)
     parser.add_argument("--synthetic-token-id-high", type=int, default=255)
-    parser.add_argument("--request-timeout-s", type=float, default=900.0)
+    parser.add_argument("--request-timeout-s", type=float, default=930.0)
+    parser.add_argument(
+        "--router-timeout-margin-s",
+        type=float,
+        default=30.0,
+        help=(
+            "Required margin between the client timeout and the router's "
+            "advertised upstream timeout."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=20260723)
     parser.add_argument("--min-healthy-workers", type=int, default=2)
     parser.add_argument(
@@ -1544,6 +1583,7 @@ def config_from_args(args: argparse.Namespace) -> BenchmarkConfig:
         synthetic_token_id_low=args.synthetic_token_id_low,
         synthetic_token_id_high=args.synthetic_token_id_high,
         request_timeout_s=args.request_timeout_s,
+        router_timeout_margin_s=args.router_timeout_margin_s,
         seed=args.seed,
         require_router=not args.allow_direct_server,
         min_healthy_workers=args.min_healthy_workers,

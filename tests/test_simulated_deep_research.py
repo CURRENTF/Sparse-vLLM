@@ -183,7 +183,21 @@ class SimulatedDeepResearchTest(unittest.TestCase):
                 config.subagent_output_token_buckets,
                 ((90, 100, 600), (10, 800, 1_500)),
             )
+            self.assertEqual(config.request_timeout_s, 930.0)
+            self.assertEqual(config.router_timeout_margin_s, 30.0)
             self.assertEqual(run.required_model_len(config), 65_564)
+            cli_config = run.config_from_args(
+                run.build_arg_parser().parse_args(
+                    [
+                        "--model",
+                        "sim-model",
+                        "--output-dir",
+                        str(Path(tmp) / "cli-run"),
+                    ]
+                )
+            )
+            self.assertEqual(cli_config.request_timeout_s, 930.0)
+            self.assertEqual(cli_config.router_timeout_margin_s, 30.0)
 
     def test_rejects_invalid_token_bucket(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -773,14 +787,14 @@ class SimulatedDeepResearchTest(unittest.TestCase):
             ["http://snap-worker", "http://main-worker"],
         )
 
-    def test_preflight_rejects_shorter_router_timeout(self):
+    def test_preflight_rejects_insufficient_client_timeout_margin(self):
         service = FakeService()
 
-        async def short_timeout_get(url, timeout_s):
+        async def insufficient_margin_get(url, timeout_s):
             response = await service.get(url, timeout_s)
             if url.endswith("/health"):
                 payload = json.loads(response.body)
-                payload["router_policy"]["request_timeout_s"] = 30.0
+                payload["router_policy"]["request_timeout_s"] = 920.0
                 return _json_response(payload)
             return response
 
@@ -788,10 +802,31 @@ class SimulatedDeepResearchTest(unittest.TestCase):
             config = self._config(Path(tmp) / "run")
             with self.assertRaisesRegex(
                 ValueError,
-                "Router upstream timeout is shorter",
+                "must exceed the router upstream timeout",
             ):
                 asyncio.run(
-                    run.preflight(config, get_fn=short_timeout_get)
+                    run.preflight(config, get_fn=insufficient_margin_get)
+                )
+
+    def test_preflight_rejects_missing_main_agent_method(self):
+        service = FakeService()
+
+        async def snapkv_only_get(url, timeout_s):
+            response = await service.get(url, timeout_s)
+            if url.endswith("/v1/worker/info"):
+                payload = json.loads(response.body)
+                payload["sparse_method"] = "snapkv"
+                return _json_response(payload)
+            return response
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config(Path(tmp) / "run")
+            with self.assertRaisesRegex(
+                ValueError,
+                "configured main agent methods",
+            ):
+                asyncio.run(
+                    run.preflight(config, get_fn=snapkv_only_get)
                 )
 
     def test_git_dirty_is_unknown_when_probe_fails(self):
