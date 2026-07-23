@@ -46,6 +46,56 @@ _QWEN_XML_TOOL_FIELD = {
     "optional": True,
 }
 
+_MINIMAX_RESPONSE_TEMPLATE_BASE = {
+    "version": 1,
+    "defaults": {"role": "assistant"},
+    "start_anchor": "]~b]ai\n",
+    "fields": {
+        "thinking": {
+            "open_pattern": r"<think>\s*",
+            "close": "</think>",
+            "content": "text",
+            "optional": True,
+        },
+        "content": {
+            "close_pattern": r"\[e~\[|\Z",
+            "content": "text",
+            "optional": True,
+        },
+    },
+}
+
+_MINIMAX_XML_TOOL_FIELD = {
+    # MiniMax wraps one or more sibling <invoke> elements in a single
+    # <minimax:tool_call> region. Keeping the outer tags optional on each
+    # repeated field lets the shared parser emit every invocation separately.
+    "open_pattern": (
+        r"\s*(?:<minimax:tool_call>\s*)?"
+        r"<invoke\s+name=[\"'](?P<name>[^\"']+)[\"']>\s*"
+    ),
+    "close_pattern": r"\s*</invoke>",
+    "content": "xml-inline",
+    "content_args": {
+        "tag_pattern": (
+            r"<parameter\s+name=[\"'](?P<key>[^\"']+)[\"']>\s*"
+            r"(?P<value>.*?)\s*</parameter>"
+        ),
+    },
+    "transform": {
+        "type": "function",
+        "function": {"name": "{name}", "arguments": "{content}"},
+    },
+    "repeats": True,
+    "optional": True,
+}
+
+_MINIMAX_TOOL_END_FIELD = {
+    "open_pattern": r"\s*</minimax:tool_call>\s*",
+    "close_pattern": r"\[e~\[|\Z",
+    "content": "text",
+    "optional": True,
+}
+
 
 class ResponseParseError(ValueError):
     pass
@@ -84,6 +134,18 @@ class TransformersResponseParser:
             chat_template = "\n".join(str(value) for value in chat_template.values())
         if not isinstance(chat_template, str) or "<think>" not in chat_template:
             return None
+
+        if "<minimax:tool_call>" in chat_template and "<invoke name=" in chat_template:
+            fields = dict(_MINIMAX_RESPONSE_TEMPLATE_BASE["fields"])
+            content_field = fields.pop("content")
+            fields["tool_calls"] = _MINIMAX_XML_TOOL_FIELD
+            fields["tool_call_end"] = _MINIMAX_TOOL_END_FIELD
+            fields["content"] = content_field
+            response_template = {
+                **_MINIMAX_RESPONSE_TEMPLATE_BASE,
+                "fields": fields,
+            }
+            return cls(tokenizer, response_template)
 
         response_template = {
             **_QWEN_RESPONSE_TEMPLATE_BASE,

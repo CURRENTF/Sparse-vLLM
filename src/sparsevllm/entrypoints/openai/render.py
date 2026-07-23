@@ -56,6 +56,39 @@ def normalize_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]] 
     return normalized
 
 
+def _chat_template_source(tokenizer: Any) -> str:
+    chat_template = getattr(tokenizer, "chat_template", None)
+    if isinstance(chat_template, dict):
+        return "\n".join(str(value) for value in chat_template.values())
+    return chat_template if isinstance(chat_template, str) else ""
+
+
+def _uses_minimax_tool_format(tokenizer: Any) -> bool:
+    chat_template = _chat_template_source(tokenizer)
+    return "<minimax:tool_call>" in chat_template and "tool.function" in chat_template
+
+
+def _tools_for_chat_template(
+    tokenizer: Any,
+    tools: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if not _uses_minimax_tool_format(tokenizer):
+        return tools
+
+    nested = []
+    for tool in tools:
+        function = {
+            "name": tool["name"],
+            "parameters": tool["parameters"],
+        }
+        if "description" in tool:
+            function["description"] = tool["description"]
+        if tool.get("strict"):
+            function["strict"] = True
+        nested.append({"type": "function", "function": function})
+    return nested
+
+
 def _chat_template_role(role: str) -> str:
     return "system" if role == "developer" else role
 
@@ -159,7 +192,7 @@ def _chat_prompt(
         if tools:
             if not _supports_chat_template_kwarg(tokenizer, "tools"):
                 raise ValueError("Tokenizer chat template does not support tools.")
-            kwargs["tools"] = tools
+            kwargs["tools"] = _tools_for_chat_template(tokenizer, tools)
         return tokenizer.apply_chat_template(chat, **kwargs)
     if any("reasoning_content" in message for message in chat):
         raise ValueError("reasoning_content requires a tokenizer chat_template.")
@@ -205,6 +238,8 @@ def _response_prompt(tokenizer: Any, request: ResponseRequest) -> str:
 
     has_template = bool(getattr(tokenizer, "chat_template", None)) and hasattr(tokenizer, "apply_chat_template")
     if has_template:
+        if _uses_minimax_tool_format(tokenizer):
+            messages = _minimax_response_messages(messages)
         kwargs: dict[str, Any] = {
             "tokenize": False,
             "add_generation_prompt": True,
@@ -214,7 +249,7 @@ def _response_prompt(tokenizer: Any, request: ResponseRequest) -> str:
         if tools:
             if not _supports_chat_template_kwarg(tokenizer, "tools"):
                 raise ValueError("Tokenizer chat template does not support tools.")
-            kwargs["tools"] = tools
+            kwargs["tools"] = _tools_for_chat_template(tokenizer, tools)
         return tokenizer.apply_chat_template(messages, **kwargs)
 
     if chat_template_kwargs:
@@ -298,6 +333,16 @@ def _response_function_call_item(item: dict[str, Any]) -> dict[str, Any]:
             }
         ],
     }
+
+
+def _minimax_response_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    adapted = []
+    for message in messages:
+        message = dict(message)
+        if message.get("tool_calls"):
+            message["tool_calls"] = _chat_template_tool_calls(message["tool_calls"])
+        adapted.append(message)
+    return adapted
 
 
 def _response_content_text(content: Any) -> str:
