@@ -74,7 +74,7 @@ class AsyncEngineDispatcher:
         self._fatal_callback: Callable[[str], None] | None = None
         self._state_lock = threading.Lock()
         self._routing_snapshot_lock = threading.Lock()
-        self._worker_load_snapshot: dict[str, Any] | None = None
+        self._worker_routing_load_snapshot: dict[str, Any] | None = None
         self._prefix_cache_routing_snapshot: Any | None = None
         self._refresh_routing_snapshots()
         self._thread = threading.Thread(target=self._run, name="sparsevllm-openai-dispatcher", daemon=True)
@@ -161,13 +161,13 @@ class AsyncEngineDispatcher:
             raise RuntimeError(result["message"])
         return result["value"]
 
-    def worker_load_snapshot(self) -> dict[str, Any]:
+    def worker_routing_load_snapshot(self) -> dict[str, Any]:
         self._raise_if_unavailable()
         with self._routing_snapshot_lock:
-            snapshot = self._worker_load_snapshot
+            snapshot = self._worker_routing_load_snapshot
         if snapshot is None:
             raise RuntimeError(
-                "Engine does not expose worker_load for routing snapshots."
+                "Engine does not expose worker_routing_load for routing snapshots."
             )
         return {**snapshot, "snapshot": True}
 
@@ -197,15 +197,21 @@ class AsyncEngineDispatcher:
             raise RuntimeError(terminal_message)
 
     def _refresh_routing_snapshots(self) -> None:
-        worker_load_fn = getattr(self.engine, "worker_load", None)
+        worker_routing_load_fn = getattr(
+            self.engine,
+            "worker_routing_load",
+            None,
+        )
+        if not callable(worker_routing_load_fn):
+            worker_routing_load_fn = getattr(self.engine, "worker_load", None)
         prefix_snapshot_fn = getattr(
             self.engine,
             "prefix_cache_routing_snapshot",
             None,
         )
-        worker_load = (
-            worker_load_fn()
-            if callable(worker_load_fn)
+        worker_routing_load = (
+            worker_routing_load_fn()
+            if callable(worker_routing_load_fn)
             else None
         )
         prefix_snapshot = (
@@ -213,14 +219,19 @@ class AsyncEngineDispatcher:
             if callable(prefix_snapshot_fn)
             else None
         )
-        if worker_load is not None and not isinstance(worker_load, dict):
+        if (
+            worker_routing_load is not None
+            and not isinstance(worker_routing_load, dict)
+        ):
             raise RuntimeError(
-                "worker_load must return an object for routing snapshots, "
-                f"got {type(worker_load).__name__}."
+                "worker_routing_load must return an object for routing "
+                f"snapshots, got {type(worker_routing_load).__name__}."
             )
         with self._routing_snapshot_lock:
-            if worker_load is not None:
-                self._worker_load_snapshot = dict(worker_load)
+            if worker_routing_load is not None:
+                self._worker_routing_load_snapshot = dict(
+                    worker_routing_load
+                )
             if prefix_snapshot is not None:
                 self._prefix_cache_routing_snapshot = prefix_snapshot
 

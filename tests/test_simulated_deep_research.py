@@ -449,6 +449,34 @@ class SimulatedDeepResearchTest(unittest.TestCase):
                 sum(row["status"] == "model_failed" for row in rows),
                 1,
             )
+            round_rows = [
+                json.loads(line)
+                for line in (output_dir / "round_metrics.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            self.assertEqual(len(round_rows), 1)
+            round_row = round_rows[0]
+            self.assertEqual(round_row["status"], "model_failed")
+            self.assertEqual(
+                round_row["subagent_prompt_tokens"],
+                sum(int(row["actual_prompt_tokens"] or 0) for row in rows),
+            )
+            self.assertEqual(
+                round_row["subagent_completion_tokens"],
+                sum(
+                    int(row["actual_completion_tokens"] or 0)
+                    for row in rows
+                ),
+            )
+            self.assertGreater(round_row["subagent_latency_p50_s"], 0.0)
+            self.assertGreaterEqual(
+                round_row["subagent_latency_max_s"],
+                round_row["subagent_latency_p95_s"],
+            )
+            self.assertGreaterEqual(round_row["straggler_gap_s"], 0.0)
+            self.assertIsNone(round_row["main_agent_latency_s"])
+            self.assertIsNone(round_row["main_agent_prompt_tokens"])
 
     def test_main_failure_keeps_attempted_subagent_barrier_metrics(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -486,6 +514,38 @@ class SimulatedDeepResearchTest(unittest.TestCase):
             self.assertEqual(len(round_rows), 1)
             self.assertEqual(round_rows[0]["status"], "model_failed")
             self.assertGreater(round_rows[0]["subagent_barrier_s"], 0.0)
+            self.assertGreater(
+                round_rows[0]["subagent_prompt_tokens"],
+                0,
+            )
+            self.assertGreater(
+                round_rows[0]["subagent_completion_tokens"],
+                0,
+            )
+            self.assertGreater(
+                round_rows[0]["subagent_latency_p50_s"],
+                0.0,
+            )
+            self.assertGreaterEqual(
+                round_rows[0]["subagent_latency_max_s"],
+                round_rows[0]["subagent_latency_p95_s"],
+            )
+            self.assertIsNone(
+                round_rows[0]["main_agent_prompt_tokens"]
+            )
+            self.assertIsNone(
+                round_rows[0]["main_agent_completion_tokens"]
+            )
+            self.assertEqual(
+                round_rows[0][
+                    "main_agent_expected_reusable_prefix_tokens"
+                ],
+                0,
+            )
+            self.assertGreater(
+                round_rows[0]["main_agent_latency_s"],
+                0.0,
+            )
 
     def test_non_json_http_error_is_model_failure(self):
         async def fail_post(_url, _payload, _timeout_s):

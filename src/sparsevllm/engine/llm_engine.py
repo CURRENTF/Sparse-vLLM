@@ -646,11 +646,10 @@ class LLMEngine:
             "tags": sorted(str(tag) for tag in (tags or []) if str(tag)),
         }
 
-    def worker_load(self) -> dict[str, object]:
+    def worker_routing_load(self) -> dict[str, object]:
         scheduler = self.scheduler
         waiting = len(scheduler.waiting)
         decoding = len(scheduler.decoding)
-        cache_stats = self.model_runner.runtime_state.free_slot_stats()
         return {
             "waiting_requests": int(waiting),
             "decoding_requests": int(decoding),
@@ -659,8 +658,17 @@ class LLMEngine:
             "max_num_seqs_in_batch": int(getattr(scheduler, "max_num_seqs_in_batch", 0)),
             "max_decoding_seqs": int(getattr(scheduler, "max_decoding_seqs", 0)),
             "max_num_seqs_in_gpu": int(getattr(scheduler.config, "max_num_seqs_in_gpu", 0)),
-            "cache": {str(key): int(value) for key, value in cache_stats.items() if isinstance(value, int)},
         }
+
+    def worker_load(self) -> dict[str, object]:
+        result = self.worker_routing_load()
+        cache_stats = self.model_runner.runtime_state.free_slot_stats()
+        result["cache"] = {
+            str(key): int(value)
+            for key, value in cache_stats.items()
+            if isinstance(value, int)
+        }
+        return result
 
     def prefix_cache_routing_snapshot(self) -> PrefixCacheRoutingSnapshot:
         runtime_state = self.model_runner.runtime_state

@@ -308,7 +308,7 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
                 self.tokenizer = tokenizer
                 self.aborted = []
 
-            def worker_load(self):
+            def worker_routing_load(self):
                 return {"active_requests": 1}
 
             def prefix_cache_routing_snapshot(self):
@@ -346,7 +346,7 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(dispatcher.is_ready)
         self.assertIn("fatal engine step", dispatcher.failure_message)
         with self.assertRaisesRegex(RuntimeError, "fatal engine step"):
-            dispatcher.worker_load_snapshot()
+            dispatcher.worker_routing_load_snapshot()
         with self.assertRaisesRegex(RuntimeError, "fatal engine step"):
             dispatcher.prefix_cache_routing_match([1, 2, 3])
 
@@ -1446,9 +1446,58 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(json.loads(info_response.body), {"served_model_name": "model", "tags": ["dialog", "omnikv"]})
         load_payload = json.loads(load_response.body)
         self.assertEqual(load_payload["active_requests"], 3)
-        self.assertTrue(load_payload["snapshot"])
+        self.assertEqual(
+            load_payload["thread"],
+            "sparsevllm-openai-dispatcher",
+        )
         self.assertEqual(unavailable_info_response.status_code, 503)
         self.assertEqual(json.loads(unavailable_info_response.body)["reason"], "OutOfMemoryError")
+
+    def test_worker_routing_load_does_not_collect_cache_stats(self):
+        from sparsevllm.engine.llm_engine import LLMEngine
+
+        class RuntimeState:
+            def __init__(self):
+                self.calls = 0
+
+            def free_slot_stats(self):
+                self.calls += 1
+                return {"free_slots": 123}
+
+        runtime_state = RuntimeState()
+        scheduler = type(
+            "Scheduler",
+            (),
+            {
+                "waiting": [1, 2],
+                "decoding": [3],
+                "total_preemptions": 4,
+                "max_num_seqs_in_batch": 5,
+                "max_decoding_seqs": 6,
+                "config": type(
+                    "Config",
+                    (),
+                    {"max_num_seqs_in_gpu": 7},
+                )(),
+            },
+        )()
+        engine = object.__new__(LLMEngine)
+        engine.scheduler = scheduler
+        engine.model_runner = type(
+            "ModelRunner",
+            (),
+            {"runtime_state": runtime_state},
+        )()
+
+        routing_load = engine.worker_routing_load()
+
+        self.assertEqual(routing_load["active_requests"], 3)
+        self.assertNotIn("cache", routing_load)
+        self.assertEqual(runtime_state.calls, 0)
+
+        full_load = engine.worker_load()
+        self.assertEqual(full_load["cache"]["free_slots"], 123)
+        self.assertEqual(runtime_state.calls, 1)
 
     async def test_routing_probe_snapshots_do_not_wait_for_engine_step(self):
         from sparsevllm.engine.prefix_cache import PrefixCacheRoutingSnapshot
@@ -1464,7 +1513,7 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
             def __init__(self):
                 self.tokenizer = tokenizer
 
-            def worker_load(self):
+            def worker_routing_load(self):
                 return {"active_requests": 1}
 
             def prefix_cache_routing_snapshot(self):
@@ -1494,7 +1543,10 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
             served_model_name="model",
             engine=Engine(),
         )
-        load_endpoint = _route_endpoint(app, "/v1/worker/load")
+        load_endpoint = _route_endpoint(
+            app,
+            "/v1/worker/routing_load",
+        )
         match_endpoint = _route_endpoint(
             app,
             "/v1/prefix_cache/routing_match",
@@ -1552,7 +1604,7 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
                 self.active_requests = 0
                 self.generation = 0
 
-            def worker_load(self):
+            def worker_routing_load(self):
                 return {"active_requests": self.active_requests}
 
             def prefix_cache_routing_snapshot(self):
@@ -1590,7 +1642,7 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
 
             deadline = time.monotonic() + 1
             while time.monotonic() < deadline:
-                load = dispatcher.worker_load_snapshot()
+                load = dispatcher.worker_routing_load_snapshot()
                 match = dispatcher.prefix_cache_routing_match([1, 2])
                 if (
                     load["active_requests"] == 0

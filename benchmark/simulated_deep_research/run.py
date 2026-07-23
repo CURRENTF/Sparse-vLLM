@@ -1395,6 +1395,18 @@ async def _run_benchmark_impl(
                 barrier_s = time.perf_counter() - barrier_started
                 records.extend(subagent_results)
                 subagent_failure = _failure_status(subagent_results)
+                subagent_latencies = [
+                    float(record["latency_s"])
+                    for record in subagent_results
+                ]
+                subagent_prompt_tokens = sum(
+                    int(record.get("actual_prompt_tokens") or 0)
+                    for record in subagent_results
+                )
+                subagent_completion_tokens = sum(
+                    int(record.get("actual_completion_tokens") or 0)
+                    for record in subagent_results
+                )
                 round_rows.append(
                     {
                         "round_index": round_index,
@@ -1404,7 +1416,30 @@ async def _run_benchmark_impl(
                             record["status"] == "success"
                             for record in subagent_results
                         ),
+                        "subagent_prompt_tokens": subagent_prompt_tokens,
+                        "subagent_completion_tokens": (
+                            subagent_completion_tokens
+                        ),
                         "subagent_barrier_s": barrier_s,
+                        "subagent_latency_p50_s": _percentile(
+                            subagent_latencies,
+                            0.50,
+                        ),
+                        "subagent_latency_p95_s": _percentile(
+                            subagent_latencies,
+                            0.95,
+                        ),
+                        "subagent_latency_max_s": max(
+                            subagent_latencies
+                        ),
+                        "straggler_gap_s": (
+                            max(subagent_latencies)
+                            - statistics.median(subagent_latencies)
+                        ),
+                        "main_agent_prompt_tokens": None,
+                        "main_agent_completion_tokens": None,
+                        "main_agent_expected_reusable_prefix_tokens": None,
+                        "main_agent_latency_s": None,
                         "round_elapsed_s": time.perf_counter() - round_started,
                     }
                 )
@@ -1413,10 +1448,6 @@ async def _run_benchmark_impl(
                     f"Round {round_index} subagents",
                 )
 
-                subagent_completion_tokens = sum(
-                    int(record["actual_completion_tokens"])
-                    for record in subagent_results
-                )
                 accumulated_summaries = tuple(
                     token_id
                     for segment in round_summary_segments
@@ -1469,6 +1500,17 @@ async def _run_benchmark_impl(
                 round_rows[-1].update(
                     {
                         "status": main_result["status"],
+                        "main_agent_prompt_tokens": main_result[
+                            "actual_prompt_tokens"
+                        ],
+                        "main_agent_completion_tokens": main_result[
+                            "actual_completion_tokens"
+                        ],
+                        "main_agent_expected_reusable_prefix_tokens": (
+                            main_result[
+                                "expected_reusable_prefix_tokens"
+                            ]
+                        ),
                         "main_agent_latency_s": main_result["latency_s"],
                         "round_elapsed_s": (
                             time.perf_counter() - round_started
@@ -1488,49 +1530,10 @@ async def _run_benchmark_impl(
                     )
                 )
 
-                subagent_latencies = [
-                    float(record["latency_s"])
-                    for record in subagent_results
-                ]
-                round_row = {
-                    "round_index": round_index,
-                    "status": "success",
-                    "subagent_requests": len(subagent_results),
-                    "subagent_successful_requests": len(
-                        subagent_results
-                    ),
-                    "subagent_prompt_tokens": sum(
-                        int(record["actual_prompt_tokens"])
-                        for record in subagent_results
-                    ),
-                    "subagent_completion_tokens": subagent_completion_tokens,
-                    "subagent_barrier_s": barrier_s,
-                    "subagent_latency_p50_s": _percentile(
-                        subagent_latencies,
-                        0.50,
-                    ),
-                    "subagent_latency_p95_s": _percentile(
-                        subagent_latencies,
-                        0.95,
-                    ),
-                    "subagent_latency_max_s": max(subagent_latencies),
-                    "straggler_gap_s": (
-                        max(subagent_latencies)
-                        - statistics.median(subagent_latencies)
-                    ),
-                    "main_agent_prompt_tokens": main_result[
-                        "actual_prompt_tokens"
-                    ],
-                    "main_agent_completion_tokens": main_result[
-                        "actual_completion_tokens"
-                    ],
-                    "main_agent_expected_reusable_prefix_tokens": (
-                        main_result["expected_reusable_prefix_tokens"]
-                    ),
-                    "main_agent_latency_s": main_result["latency_s"],
-                    "round_elapsed_s": time.perf_counter() - round_started,
-                }
-                round_rows[-1] = round_row
+                round_rows[-1]["status"] = "success"
+                round_rows[-1]["round_elapsed_s"] = (
+                    time.perf_counter() - round_started
+                )
 
             final_overhead_segment = tuple(
                 synthetic_token_ids(

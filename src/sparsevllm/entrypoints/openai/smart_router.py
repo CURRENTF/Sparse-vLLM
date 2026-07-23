@@ -388,7 +388,7 @@ class SmartRouter:
     ) -> WorkerProbe:
         load_task = asyncio.to_thread(
             _get_json,
-            f"{worker.url}/v1/worker/load",
+            f"{worker.url}/v1/worker/routing_load",
             self.control_timeout_s,
         )
         if match_payload is None:

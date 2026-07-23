@@ -163,7 +163,7 @@ class OpenAISmartRouterTest(unittest.TestCase):
             )
 
         get_json.assert_called_once_with(
-            "http://worker-a/v1/worker/load",
+            "http://worker-a/v1/worker/routing_load",
             5.0,
         )
         post_json.assert_called_once_with(
