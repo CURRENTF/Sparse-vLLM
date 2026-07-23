@@ -48,8 +48,13 @@ SPARSEVLLM_PYTHON=/path/to/python
 SPARSEVLLM_WORKER_URLS=http://127.0.0.1:18004,http://127.0.0.1:18005
 SPARSEVLLM_ROUTER_HOST=0.0.0.0
 SPARSEVLLM_ROUTER_PORT=18000
+SPARSEVLLM_ROUTER_REQUEST_TIMEOUT_S=30
 SPARSEVLLM_ROUTE_LOG_DIR=/path/to/logs/router
 ```
+
+Set `SPARSEVLLM_ROUTER_REQUEST_TIMEOUT_S` at least as high as the client
+request timeout for long-context workloads. For example, the simulated Deep
+Research benchmark uses 900 seconds.
 
 Then load and start the services:
 

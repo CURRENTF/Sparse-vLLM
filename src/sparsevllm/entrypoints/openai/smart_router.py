@@ -110,7 +110,11 @@ def create_app(
         await router.refresh_worker_info()
         healthy = [worker.url for worker in router.workers if worker.healthy]
         return JSONResponse(
-            {"status": "ok" if healthy else "unavailable", "healthy_workers": healthy},
+            {
+                "status": "ok" if healthy else "unavailable",
+                "healthy_workers": healthy,
+                "router_policy": router.policy_info(),
+            },
             status_code=200 if healthy else 503,
         )
 
@@ -226,6 +230,14 @@ class SmartRouter:
         self.route_log_dir = route_log_dir
         if self.route_log_dir is not None:
             self.route_log_dir.mkdir(parents=True, exist_ok=True)
+
+    def policy_info(self) -> dict[str, Any]:
+        return {
+            "request_timeout_s": self.request_timeout_s,
+            "overload_load_factor": self.overload_load_factor,
+            "load_abs_threshold": self.load_abs_threshold,
+            "profiles": self.profiles,
+        }
 
     async def refresh_worker_info(self):
         results = await asyncio.gather(

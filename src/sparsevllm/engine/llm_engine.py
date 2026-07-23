@@ -576,6 +576,8 @@ class LLMEngine:
             "obs_layer_ids",
             "snapkv_window_size",
             "snapkv_num_full_layers",
+            "pool_kernel_size",
+            "sparse_attn_score_dtype",
             "pyramid_layer_ratios",
             "pyramidkv_start_layer",
             "pyramidkv_start_ratio",

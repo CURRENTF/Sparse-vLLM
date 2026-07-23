@@ -477,10 +477,62 @@ async def preflight(
             raise PreflightParseError(
                 "Router healthy_workers must contain non-empty worker URLs."
             )
-        if len(healthy_workers) < config.min_healthy_workers:
+        router_policy = health.get("router_policy")
+        if not isinstance(router_policy, dict):
+            raise PreflightParseError(
+                "Router health response is missing router_policy."
+            )
+        required_policy_fields = {
+            "request_timeout_s",
+            "overload_load_factor",
+            "load_abs_threshold",
+            "profiles",
+        }
+        missing_policy_fields = sorted(
+            required_policy_fields - router_policy.keys()
+        )
+        if missing_policy_fields:
+            raise PreflightParseError(
+                "Router policy is missing fields: "
+                f"{missing_policy_fields}."
+            )
+        router_timeout = router_policy["request_timeout_s"]
+        if (
+            isinstance(router_timeout, bool)
+            or not isinstance(router_timeout, (int, float))
+            or router_timeout <= 0
+        ):
+            raise PreflightParseError(
+                "Router policy request_timeout_s must be positive."
+            )
+        if router_timeout < config.request_timeout_s:
             raise ValueError(
-                f"Need at least {config.min_healthy_workers} healthy workers, "
-                f"but the router reports {len(healthy_workers)}."
+                "Router upstream timeout is shorter than the benchmark "
+                f"request timeout: router={router_timeout}s "
+                f"benchmark={config.request_timeout_s}s."
+            )
+        overload_load_factor = router_policy["overload_load_factor"]
+        if (
+            isinstance(overload_load_factor, bool)
+            or not isinstance(overload_load_factor, (int, float))
+            or overload_load_factor <= 0
+        ):
+            raise PreflightParseError(
+                "Router policy overload_load_factor must be positive."
+            )
+        load_abs_threshold = router_policy["load_abs_threshold"]
+        if (
+            isinstance(load_abs_threshold, bool)
+            or not isinstance(load_abs_threshold, int)
+            or load_abs_threshold < 0
+        ):
+            raise PreflightParseError(
+                "Router policy load_abs_threshold must be a non-negative "
+                "integer."
+            )
+        if not isinstance(router_policy["profiles"], dict):
+            raise PreflightParseError(
+                "Router policy profiles must be an object."
             )
         worker_responses = await asyncio.gather(
             *[
@@ -491,7 +543,7 @@ async def preflight(
                 for worker_url in healthy_workers
             ]
         )
-        workers = [
+        healthy_worker_info = [
             {
                 "url": worker_url,
                 "info": _decode_json(
@@ -504,6 +556,17 @@ async def preflight(
                 worker_responses,
             )
         ]
+        workers = [
+            worker
+            for worker in healthy_worker_info
+            if str(worker["info"].get("served_model_name")) == config.model
+        ]
+        if len(workers) < config.min_healthy_workers:
+            raise ValueError(
+                f"Need at least {config.min_healthy_workers} healthy workers "
+                f"for model {config.model!r}, but the router reports "
+                f"{len(workers)}."
+            )
     else:
         worker_url = config.base_url
         worker_response = await get_fn(
@@ -826,9 +889,9 @@ def _require_success(records: list[dict[str, Any]], label: str) -> None:
         )
 
 
-def _git_value(*args: str) -> str | None:
+def _git_command(*args: str) -> subprocess.CompletedProcess[str] | None:
     try:
-        result = subprocess.run(
+        return subprocess.run(
             ["git", *args],
             cwd=Path(__file__).resolve().parents[2],
             check=True,
@@ -837,8 +900,21 @@ def _git_value(*args: str) -> str | None:
         )
     except (OSError, subprocess.SubprocessError):
         return None
+
+
+def _git_value(*args: str) -> str | None:
+    result = _git_command(*args)
+    if result is None:
+        return None
     value = result.stdout.strip()
     return value or None
+
+
+def _git_dirty() -> bool | None:
+    result = _git_command("status", "--porcelain")
+    if result is None:
+        return None
+    return bool(result.stdout.strip())
 
 
 def _run_info(
@@ -862,7 +938,7 @@ def _run_info(
         "preflight": preflight_info,
         "git_commit": _git_value("rev-parse", "HEAD"),
         "git_branch": _git_value("branch", "--show-current"),
-        "git_dirty": bool(_git_value("status", "--porcelain")),
+        "git_dirty": _git_dirty(),
         "environment": {
             key: os.environ[key]
             for key in ("CUDA_VISIBLE_DEVICES", "PYTHONPATH")

@@ -4,9 +4,30 @@ import unittest
 import torch
 
 from sparsevllm.engine.decode_cuda_graph import DecodeCudaGraphRunner
+from sparsevllm.engine.llm_engine import LLMEngine
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.engine.sparse_controller import SparseController
 from sparsevllm.utils.context import reset_context, set_context
+
+
+class WorkerInfoTest(unittest.TestCase):
+    def test_snapkv_selection_config_is_reported(self):
+        engine = object.__new__(LLMEngine)
+        engine.config = SimpleNamespace(
+            model="model",
+            hf_config=SimpleNamespace(model_type="test"),
+            vllm_sparse_method="snapkv",
+            pool_kernel_size=7,
+            sparse_attn_score_dtype="float16",
+        )
+
+        benchmark_config = engine.worker_info()["benchmark_config"]
+
+        self.assertEqual(benchmark_config["pool_kernel_size"], 7)
+        self.assertEqual(
+            benchmark_config["sparse_attn_score_dtype"],
+            "float16",
+        )
 
 
 def make_controller(

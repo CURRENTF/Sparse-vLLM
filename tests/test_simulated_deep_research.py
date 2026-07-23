@@ -58,6 +58,12 @@ class FakeService:
                         "http://snap-worker",
                         "http://main-worker",
                     ],
+                    "router_policy": {
+                        "request_timeout_s": 900.0,
+                        "overload_load_factor": 1.0,
+                        "load_abs_threshold": 0,
+                        "profiles": {},
+                    },
                 }
             )
         if url.endswith("/v1/worker/info"):
@@ -359,6 +365,12 @@ class SimulatedDeepResearchTest(unittest.TestCase):
                 worker_configs[1]["info"]["benchmark_config"][
                     "enable_prefix_caching"
                 ]
+            )
+            self.assertEqual(
+                run_info["preflight"]["health"]["router_policy"][
+                    "request_timeout_s"
+                ],
+                900.0,
             )
 
     def test_http_failure_is_recorded_before_run_fails(self):
@@ -694,10 +706,23 @@ class SimulatedDeepResearchTest(unittest.TestCase):
                         ]
                     }
                 )
+            if url.endswith("/v1/worker/info"):
+                return _json_response(
+                    {
+                        "served_model_name": "sim-model",
+                        "benchmark_config": {},
+                    }
+                )
             return _json_response(
                 {
                     "status": "ok",
                     "healthy_workers": ["http://only-worker"],
+                    "router_policy": {
+                        "request_timeout_s": 900.0,
+                        "overload_load_factor": 1.0,
+                        "load_abs_threshold": 0,
+                        "profiles": {},
+                    },
                 }
             )
 
@@ -718,6 +743,68 @@ class SimulatedDeepResearchTest(unittest.TestCase):
                 )
             )
             self.assertEqual(aggregate["status"], "invalid_input")
+
+    def test_preflight_ignores_healthy_workers_for_other_models(self):
+        service = FakeService()
+
+        async def multi_model_get(url, timeout_s):
+            if url.endswith("/health"):
+                response = await service.get(url, timeout_s)
+                payload = json.loads(response.body)
+                payload["healthy_workers"].append("http://other-worker")
+                return _json_response(payload)
+            if url == "http://other-worker/v1/worker/info":
+                return _json_response(
+                    {
+                        "served_model_name": "other-model",
+                        "benchmark_config": {},
+                    }
+                )
+            return await service.get(url, timeout_s)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config(Path(tmp) / "run")
+            preflight_info = asyncio.run(
+                run.preflight(config, get_fn=multi_model_get)
+            )
+
+        self.assertEqual(
+            [worker["url"] for worker in preflight_info["workers"]],
+            ["http://snap-worker", "http://main-worker"],
+        )
+
+    def test_preflight_rejects_shorter_router_timeout(self):
+        service = FakeService()
+
+        async def short_timeout_get(url, timeout_s):
+            response = await service.get(url, timeout_s)
+            if url.endswith("/health"):
+                payload = json.loads(response.body)
+                payload["router_policy"]["request_timeout_s"] = 30.0
+                return _json_response(payload)
+            return response
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config(Path(tmp) / "run")
+            with self.assertRaisesRegex(
+                ValueError,
+                "Router upstream timeout is shorter",
+            ):
+                asyncio.run(
+                    run.preflight(config, get_fn=short_timeout_get)
+                )
+
+    def test_git_dirty_is_unknown_when_probe_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config(Path(tmp) / "run")
+            with patch.object(run, "_git_command", return_value=None):
+                run_info = run._run_info(
+                    config,
+                    None,
+                    status="running",
+                )
+
+        self.assertIsNone(run_info["git_dirty"])
 
     def test_direct_server_payload_omits_router_only_fields(self):
         with tempfile.TemporaryDirectory() as tmp:

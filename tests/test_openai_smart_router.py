@@ -1,5 +1,6 @@
 import asyncio
 import importlib.util
+import json
 import unittest
 from unittest.mock import AsyncMock
 from unittest.mock import Mock
@@ -52,6 +53,15 @@ class OpenAISmartRouterTest(unittest.TestCase):
         response = asyncio.run(endpoint())
 
         self.assertEqual(response.status_code, 503)
+        self.assertEqual(
+            json.loads(response.body)["router_policy"],
+            {
+                "request_timeout_s": 30.0,
+                "overload_load_factor": 1.5,
+                "load_abs_threshold": 1,
+                "profiles": {},
+            },
+        )
 
     def test_router_livez_stays_available_without_ready_workers(self):
         from sparsevllm.entrypoints.openai import smart_router

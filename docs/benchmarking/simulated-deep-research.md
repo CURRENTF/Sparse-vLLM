@@ -62,6 +62,9 @@ python -m benchmark.simulated_deep_research.run \
   --output-dir outputs/simulated_deep_research/<RUN_NAME>
 ```
 
+Configure the router's upstream timeout to at least the benchmark's
+`--request-timeout-s` value. With the systemd runbook, set
+`SPARSEVLLM_ROUTER_REQUEST_TIMEOUT_S=900` for the default benchmark.
 The router must have workers whose advertised methods satisfy
 `--subagent-methods snapkv` and `--main-agent-methods omnikv,vanilla`.
 For the default profile, configure every routed worker with
