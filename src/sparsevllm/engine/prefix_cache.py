@@ -5,6 +5,7 @@ import heapq
 import json
 import struct
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Protocol
 
 
@@ -418,6 +419,39 @@ class PrefixBlockPayload(Protocol):
     """Marker protocol for method-owned prefix block payloads."""
 
 
+class PrefixTransferKind(str, Enum):
+    D2H = "d2h"
+    H2D = "h2d"
+
+
+@dataclass
+class PrefixBlockResidency:
+    """Physical residency for one immutable logical prefix block.
+
+    ``device_present`` and ``host_present`` describe allocated payloads.  An
+    H2D transfer may therefore have both set while later layers are still
+    unavailable; the transfer ticket owns that readiness boundary.
+    """
+
+    device_present: bool = True
+    host_present: bool = False
+    transfer: PrefixTransferKind | None = None
+
+    def validate(self) -> None:
+        if not self.device_present and not self.host_present:
+            raise RuntimeError("Prefix cache block has no resident payload.")
+        if self.transfer == PrefixTransferKind.D2H:
+            if not self.device_present or self.host_present:
+                raise RuntimeError(
+                    "D2H prefix transfer requires a device payload and no published host payload."
+                )
+        elif self.transfer == PrefixTransferKind.H2D:
+            if not self.device_present or not self.host_present:
+                raise RuntimeError(
+                    "H2D prefix transfer requires allocated device and host payloads."
+                )
+
+
 @dataclass
 class PrefixCacheBlock:
     stable_block_id: bytes
@@ -429,6 +463,53 @@ class PrefixCacheBlock:
     ref_count: int = 0
     last_access: int = 0
     eviction_priority: int = 0
+    residency: PrefixBlockResidency = field(default_factory=PrefixBlockResidency)
+
+
+def select_write_through_candidates(
+    prefix_cache: RadixPrefixIndex,
+    pending: dict[bytes, PrefixCacheBlock],
+    newly_unreferenced: list[PrefixCacheBlock] | None = None,
+) -> list[PrefixCacheBlock]:
+    """Select root-contiguous device blocks without scanning the full radix."""
+    if newly_unreferenced is None:
+        newly_unreferenced = list(prefix_cache.blocks.values())
+    for block in newly_unreferenced:
+        if int(block.ref_count) == 0:
+            pending[block.stable_block_id] = block
+
+    candidates: list[PrefixCacheBlock] = []
+    for block_id, block in list(pending.items()):
+        residency = block.residency
+        if (
+            prefix_cache.get_block(block_id) is not block
+            or int(block.ref_count) != 0
+            or not residency.device_present
+            or residency.host_present
+            or residency.transfer is not None
+        ):
+            pending.pop(block_id, None)
+            continue
+        candidates.append(block)
+
+    selected: list[PrefixCacheBlock] = []
+    selected_ids: set[bytes] = set()
+    for block in sorted(
+        candidates,
+        key=lambda item: (int(item.logical_block_idx), int(item.last_access)),
+    ):
+        parent_ready = block.parent_block_id is None
+        if block.parent_block_id is not None:
+            parent = prefix_cache.get_block(block.parent_block_id)
+            parent_ready = parent is not None and (
+                parent.residency.host_present
+                or parent.residency.transfer == PrefixTransferKind.D2H
+                or parent.stable_block_id in selected_ids
+            )
+        if parent_ready:
+            selected.append(block)
+            selected_ids.add(block.stable_block_id)
+    return selected
 
 
 @dataclass(frozen=True)
@@ -644,6 +725,15 @@ class RadixTreeBackend:
             return 1
         return len(node.children)
 
+    def child_block_ids(self, block_id: bytes) -> tuple[bytes, ...]:
+        location = self._locations.get(block_id)
+        if location is None:
+            raise KeyError("Prefix cache block id is not present in radix tree.")
+        node, index = location
+        if index < len(node.segment) - 1:
+            return (node.segment[index + 1],)
+        return tuple(child.segment[0] for child in node.children.values())
+
     def leaf_block_ids(self) -> tuple[bytes, ...]:
         return tuple(self._leaf_block_ids)
 
@@ -727,6 +817,8 @@ class RadixPrefixIndex:
         self.hit_blocks = 0
         self.committed_blocks = 0
         self.evicted_blocks = 0
+        self.device_demoted_blocks = 0
+        self.host_evicted_blocks = 0
         self.deleted_blocks = 0
         self.duplicate_commits = 0
         self.control_inspect_requests = 0
@@ -887,6 +979,7 @@ class RadixPrefixIndex:
         return evicted
 
     def insert_block(self, block: PrefixCacheBlock) -> PrefixCacheBlock:
+        block.residency.validate()
         existing = self.blocks.get(block.stable_block_id)
         if existing is not None:
             self.duplicate_commits += 1
@@ -899,8 +992,17 @@ class RadixPrefixIndex:
                 f"evictable_blocks={self.evictable_blocks()}."
             )
         if block.parent_block_id is not None:
-            if block.parent_block_id not in self.blocks:
+            parent = self.blocks.get(block.parent_block_id)
+            if parent is None:
                 raise KeyError("Cannot insert prefix cache block because parent is missing.")
+            if block.residency.device_present and not parent.residency.device_present:
+                raise RuntimeError(
+                    "Cannot insert a device-resident prefix block below a host-only parent."
+                )
+            if block.residency.host_present and not parent.residency.host_present:
+                raise RuntimeError(
+                    "Cannot insert a host-resident prefix block below a device-only parent."
+                )
         block.last_access = self._tick()
         self.blocks[block.stable_block_id] = block
         self.backend.insert_child(block.parent_block_id, block.stable_block_id)
@@ -916,10 +1018,264 @@ class RadixPrefixIndex:
     def child_count(self, stable_block_id: bytes) -> int:
         return self.backend.child_count(stable_block_id)
 
+    def device_child_count(self, stable_block_id: bytes) -> int:
+        return sum(
+            1
+            for child_id in self.backend.child_block_ids(stable_block_id)
+            if (child := self.blocks.get(child_id)) is not None
+            and child.residency.device_present
+        )
+
+    def begin_d2h(self, block: PrefixCacheBlock) -> None:
+        if self.blocks.get(block.stable_block_id) is not block:
+            raise RuntimeError("Cannot back up a prefix block that is not indexed.")
+        block.residency.validate()
+        if int(block.ref_count) != 0:
+            raise RuntimeError("Cannot back up a referenced prefix cache block.")
+        if block.residency.host_present:
+            raise RuntimeError("Cannot back up a prefix cache block that already has a host payload.")
+        if block.residency.transfer is not None:
+            raise RuntimeError("Cannot start D2H while another prefix transfer is active.")
+        if block.parent_block_id is not None:
+            parent = self.blocks.get(block.parent_block_id)
+            if parent is None or not (
+                parent.residency.host_present
+                or parent.residency.transfer == PrefixTransferKind.D2H
+            ):
+                raise RuntimeError(
+                    "Prefix D2H backup must preserve a host-resident path from the radix root."
+                )
+        block.residency.transfer = PrefixTransferKind.D2H
+        block.residency.validate()
+
+    def finish_d2h(self, block: PrefixCacheBlock) -> None:
+        if block.residency.transfer != PrefixTransferKind.D2H:
+            raise RuntimeError("Cannot finish D2H without an active D2H prefix transfer.")
+        if block.parent_block_id is not None:
+            parent = self.blocks.get(block.parent_block_id)
+            if parent is None or not parent.residency.host_present:
+                raise RuntimeError(
+                    "Cannot publish a host prefix payload before its parent is host-resident."
+                )
+        block.residency.host_present = True
+        block.residency.transfer = None
+        block.residency.validate()
+
+    def abort_d2h(self, block: PrefixCacheBlock) -> None:
+        if block.residency.transfer != PrefixTransferKind.D2H:
+            raise RuntimeError("Cannot abort D2H without an active D2H prefix transfer.")
+        block.residency.transfer = None
+        block.residency.validate()
+
+    def begin_h2d(self, block: PrefixCacheBlock) -> None:
+        if self.blocks.get(block.stable_block_id) is not block:
+            raise RuntimeError("Cannot promote a prefix block that is not indexed.")
+        block.residency.validate()
+        if block.residency.device_present:
+            raise RuntimeError("Cannot promote a prefix cache block that already has a device payload.")
+        if not block.residency.host_present:
+            raise RuntimeError("Cannot promote a prefix cache block without a host payload.")
+        if block.residency.transfer is not None:
+            raise RuntimeError("Cannot start H2D while another prefix transfer is active.")
+        if block.parent_block_id is not None:
+            parent = self.blocks.get(block.parent_block_id)
+            if parent is None or not parent.residency.device_present:
+                raise RuntimeError(
+                    "Prefix H2D promotion must preserve a device-resident path from the radix root."
+                )
+        block.residency.device_present = True
+        block.residency.transfer = PrefixTransferKind.H2D
+        block.residency.validate()
+
+    def finish_h2d(self, block: PrefixCacheBlock) -> None:
+        if block.residency.transfer != PrefixTransferKind.H2D:
+            raise RuntimeError("Cannot finish H2D without an active H2D prefix transfer.")
+        block.residency.transfer = None
+        block.residency.validate()
+
+    def abort_h2d(self, block: PrefixCacheBlock) -> None:
+        if block.residency.transfer != PrefixTransferKind.H2D:
+            raise RuntimeError("Cannot abort H2D without an active H2D prefix transfer.")
+        if self.device_child_count(block.stable_block_id) != 0:
+            raise RuntimeError("Cannot abort H2D while a device-resident child depends on the block.")
+        block.residency.device_present = False
+        block.residency.transfer = None
+        block.residency.validate()
+
     def can_evict(self, block: PrefixCacheBlock) -> bool:
-        if int(block.ref_count) != 0 or int(block.eviction_priority) < 0:
+        if (
+            int(block.ref_count) != 0
+            or int(block.eviction_priority) < 0
+            or block.residency.transfer is not None
+        ):
             return False
         return self.child_count(block.stable_block_id) == 0
+
+    def can_demote_device(self, block: PrefixCacheBlock) -> bool:
+        residency = block.residency
+        if (
+            int(block.ref_count) != 0
+            or int(block.eviction_priority) < 0
+            or not residency.device_present
+            or not residency.host_present
+            or residency.transfer is not None
+        ):
+            return False
+        return self.device_child_count(block.stable_block_id) == 0
+
+    def device_evictable_blocks(self) -> int:
+        return sum(1 for block in self.blocks.values() if self.can_demote_device(block))
+
+    def device_freeable_blocks(self) -> int:
+        """Count device blocks reclaimable by repeated residency-leaf demotion."""
+        return len(self.device_freeable_block_ids())
+
+    def device_freeable_block_ids(self) -> set[bytes]:
+        """Return blocks reclaimable by repeated device-residency demotion."""
+        return self._device_reclaimable_block_ids(include_inflight_d2h=False)
+
+    def device_reclaimable_blocks(self) -> int:
+        """Count blocks admission may reclaim after pending D2H completes."""
+        return len(self.device_reclaimable_block_ids())
+
+    def device_reclaimable_block_ids(self) -> set[bytes]:
+        """Return device blocks backed by host now or by an in-flight D2H.
+
+        This is scheduler-facing capacity. Actual demotion must continue to use
+        ``device_freeable_block_ids`` and wait for D2H completion first.
+        """
+        return self._device_reclaimable_block_ids(include_inflight_d2h=True)
+
+    def _device_reclaimable_block_ids(
+        self,
+        *,
+        include_inflight_d2h: bool,
+    ) -> set[bytes]:
+        freeable: set[bytes] = set()
+        device_children = {
+            block_id: self.device_child_count(block_id)
+            for block_id, block in self.blocks.items()
+            if block.residency.device_present
+        }
+        stack = [
+            block_id
+            for block_id, child_count in device_children.items()
+            if child_count == 0
+        ]
+        while stack:
+            block_id = stack.pop()
+            block = self.blocks.get(block_id)
+            if block is None or block_id in freeable:
+                continue
+            residency = block.residency
+            host_ready = residency.host_present and residency.transfer is None
+            host_pending = (
+                include_inflight_d2h
+                and residency.transfer == PrefixTransferKind.D2H
+            )
+            locally_freeable = (
+                int(block.ref_count) == 0
+                and int(block.eviction_priority) >= 0
+                and residency.device_present
+                and (host_ready or host_pending)
+            )
+            if not locally_freeable:
+                continue
+            freeable.add(block_id)
+            parent_id = block.parent_block_id
+            if parent_id is not None and parent_id in device_children:
+                device_children[parent_id] -= 1
+                if device_children[parent_id] == 0:
+                    stack.append(parent_id)
+        return freeable
+
+    def demote_device_until_freeable(self, needed_blocks: int) -> list[PrefixCacheBlock]:
+        demoted: list[PrefixCacheBlock] = []
+        needed_blocks = int(needed_blocks)
+        if needed_blocks <= 0:
+            return demoted
+        candidate_heap: list[tuple[int, int, bytes]] = []
+        queued: set[bytes] = set()
+
+        def queue_if_demotable(block_id: bytes | None) -> None:
+            if block_id is None or block_id in queued:
+                return
+            block = self.blocks.get(block_id)
+            if block is None or not self.can_demote_device(block):
+                return
+            heapq.heappush(
+                candidate_heap,
+                (-int(block.eviction_priority), int(block.last_access), block_id),
+            )
+            queued.add(block_id)
+
+        for block_id, block in self.blocks.items():
+            if block.residency.device_present and self.device_child_count(block_id) == 0:
+                queue_if_demotable(block_id)
+
+        while len(demoted) < needed_blocks:
+            while candidate_heap:
+                _, _, block_id = heapq.heappop(candidate_heap)
+                queued.discard(block_id)
+                block = self.blocks.get(block_id)
+                if block is not None and self.can_demote_device(block):
+                    break
+            else:
+                break
+            block.residency.device_present = False
+            block.residency.validate()
+            demoted.append(block)
+            self.device_demoted_blocks += 1
+            queue_if_demotable(block.parent_block_id)
+        return demoted
+
+    def can_evict_host(self, block: PrefixCacheBlock) -> bool:
+        residency = block.residency
+        if (
+            int(block.ref_count) != 0
+            or int(block.eviction_priority) < 0
+            or residency.device_present
+            or not residency.host_present
+            or residency.transfer is not None
+        ):
+            return False
+        return self.child_count(block.stable_block_id) == 0
+
+    def evict_host_until_freeable(self, needed_blocks: int) -> list[PrefixCacheBlock]:
+        evicted: list[PrefixCacheBlock] = []
+        needed_blocks = int(needed_blocks)
+        candidate_heap: list[tuple[int, int, bytes]] = []
+        queued: set[bytes] = set()
+
+        def queue_if_evictable(block_id: bytes | None) -> None:
+            if block_id is None or block_id in queued:
+                return
+            block = self.blocks.get(block_id)
+            if block is None or not self.can_evict_host(block):
+                return
+            heapq.heappush(
+                candidate_heap,
+                (-int(block.eviction_priority), int(block.last_access), block_id),
+            )
+            queued.add(block_id)
+
+        for block_id in self.backend.leaf_block_ids():
+            queue_if_evictable(block_id)
+
+        while len(evicted) < needed_blocks:
+            while candidate_heap:
+                _, _, block_id = heapq.heappop(candidate_heap)
+                queued.discard(block_id)
+                block = self.blocks.get(block_id)
+                if block is not None and self.can_evict_host(block):
+                    break
+            else:
+                break
+            parent_id = block.parent_block_id
+            evicted.append(self._remove_block_from_index(block.stable_block_id))
+            self.host_evicted_blocks += 1
+            queue_if_evictable(parent_id)
+        return evicted
 
     def evictable_blocks(self) -> int:
         return sum(
@@ -928,6 +1284,7 @@ class RadixPrefixIndex:
             if (block := self.blocks.get(block_id)) is not None
             and int(block.ref_count) == 0
             and int(block.eviction_priority) >= 0
+            and block.residency.transfer is None
         )
 
     def freeable_block_ids(self) -> set[bytes]:
@@ -957,6 +1314,7 @@ class RadixPrefixIndex:
                     block is not None
                     and int(block.ref_count) == 0
                     and int(block.eviction_priority) >= 0
+                    and block.residency.transfer is None
                 )
                 if locally_freeable and suffix_freeable:
                     freeable.add(block_id)
@@ -979,6 +1337,8 @@ class RadixPrefixIndex:
             raise RuntimeError("Cannot remove a referenced prefix cache block.")
         if int(block.eviction_priority) < 0:
             raise RuntimeError("Cannot remove a negative-priority prefix cache block.")
+        if block.residency.transfer is not None:
+            raise RuntimeError("Cannot remove a prefix cache block with an in-flight transfer.")
         if self.child_count(stable_block_id) != 0:
             raise RuntimeError("Cannot remove a prefix cache block with live children.")
         self.backend.remove_block(stable_block_id)
@@ -1079,6 +1439,14 @@ class RadixPrefixIndex:
             "ref_count": int(block.ref_count),
             "eviction_priority": int(block.eviction_priority),
             "child_count": int(self.child_count(block_id)),
+            "device_child_count": int(self.device_child_count(block_id)),
+            "device_present": bool(block.residency.device_present),
+            "host_present": bool(block.residency.host_present),
+            "transfer": (
+                None
+                if block.residency.transfer is None
+                else block.residency.transfer.value
+            ),
             "last_access": int(block.last_access),
         }
 
@@ -1100,8 +1468,7 @@ class RadixPrefixIndex:
             return None
         return self.backend.subtree_block_ids(result.last_block_id)
 
-    def safe_delete_subtree(self, token_ids: list[int]) -> PrefixCacheDeleteResult:
-        self.control_delete_requests += 1
+    def preview_delete_subtree(self, token_ids: list[int]) -> PrefixCacheDeleteResult:
         subtree_ids = self._exact_subtree_ids_for_tokens(token_ids)
         if subtree_ids is None:
             return PrefixCacheDeleteResult(
@@ -1115,6 +1482,7 @@ class RadixPrefixIndex:
         )
         deleted: list[PrefixCacheBlock] = []
         blocked: list[PrefixCacheBlockedBlock] = []
+        planned_deleted_ids: set[bytes] = set()
         for block_id in sorted_ids:
             block = self.blocks.get(block_id)
             if block is None:
@@ -1124,14 +1492,36 @@ class RadixPrefixIndex:
                 reason = "referenced"
             elif int(block.eviction_priority) < 0:
                 reason = "negative_priority"
-            elif self.child_count(block_id) > 0:
+            elif block.residency.transfer is not None:
+                reason = "transfer_inflight"
+            elif any(
+                child_id not in planned_deleted_ids
+                for child_id in self.backend.child_block_ids(block_id)
+            ):
                 reason = "has_children"
             if reason is not None:
                 blocked.append(PrefixCacheBlockedBlock(block_id=block_id, reason=reason))
                 continue
-            deleted.append(self._remove_block_from_index(block_id))
-            self.deleted_blocks += 1
+            deleted.append(block)
+            planned_deleted_ids.add(block_id)
         return PrefixCacheDeleteResult(deleted_blocks=deleted, blocked_blocks=blocked)
+
+    def safe_delete_subtree(self, token_ids: list[int]) -> PrefixCacheDeleteResult:
+        self.control_delete_requests += 1
+        plan = self.preview_delete_subtree(token_ids)
+        deleted: list[PrefixCacheBlock] = []
+        for planned in plan.deleted_blocks:
+            current = self.blocks.get(planned.stable_block_id)
+            if current is not planned:
+                raise RuntimeError(
+                    "Prefix subtree deletion plan became stale before it was applied."
+                )
+            deleted.append(self._remove_block_from_index(planned.stable_block_id))
+            self.deleted_blocks += 1
+        return PrefixCacheDeleteResult(
+            deleted_blocks=deleted,
+            blocked_blocks=plan.blocked_blocks,
+        )
 
     def set_subtree_eviction_priority(self, token_ids: list[int], priority: int) -> dict[str, Any]:
         self.control_priority_updates += 1
@@ -1176,7 +1566,19 @@ class RadixPrefixIndex:
             "prefix_cache_duplicate_commits": int(self.duplicate_commits),
             "prefix_cache_deleted_blocks": int(self.deleted_blocks),
             "prefix_cache_evicted_blocks": int(self.evicted_blocks),
+            "prefix_cache_device_demoted_blocks": int(self.device_demoted_blocks),
+            "prefix_cache_host_evicted_blocks": int(self.host_evicted_blocks),
             "prefix_cache_live_blocks": int(len(self.blocks)),
+            "prefix_cache_device_blocks": int(
+                sum(1 for block in self.blocks.values() if block.residency.device_present)
+            ),
+            "prefix_cache_host_blocks": int(
+                sum(1 for block in self.blocks.values() if block.residency.host_present)
+            ),
+            "prefix_cache_inflight_transfers": int(
+                sum(1 for block in self.blocks.values() if block.residency.transfer is not None)
+            ),
+            "prefix_cache_device_freeable_blocks": int(self.device_freeable_blocks()),
             "prefix_cache_referenced_blocks": int(sum(1 for block in self.blocks.values() if int(block.ref_count) > 0)),
             "prefix_cache_negative_priority_blocks": int(
                 sum(1 for block in self.blocks.values() if int(block.eviction_priority) < 0)

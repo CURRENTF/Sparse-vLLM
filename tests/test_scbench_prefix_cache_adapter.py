@@ -98,6 +98,26 @@ def test_sparsevllm_multiturn_accumulates_history_prefix():
     assert search.calls[2]["reusable_prefix_tokens"] == 3
 
 
+def test_sparsevllm_adapter_accepts_hit_beyond_planned_session_prefix():
+    accounting = run_scbench._cache_reuse_accounting(
+        cached_tokens=16,
+        planned_session_eligible_tokens=0,
+    )
+    assert accounting["cached_tokens_beyond_planned_session_prefix"] == 16
+    assert run_scbench.SparseVLLMSCBenchSearch._trace_metric_error(
+        cached_tokens=16,
+        cached_blocks=1,
+        max_usable_cache_tokens=16,
+        block_size=16,
+    ) == ""
+    assert run_scbench.SparseVLLMSCBenchSearch._trace_metric_error(
+        cached_tokens=32,
+        cached_blocks=2,
+        max_usable_cache_tokens=16,
+        block_size=16,
+    ) == "cached_tokens=32 exceeds max_usable_cache_tokens=16."
+
+
 def test_sparsevllm_prefix_summary_reports_reuse(tmp_path):
     trace_path = tmp_path / "prefix_cache_trace_scbench_kv_scdq.jsonl"
     summary_path = tmp_path / "prefix_cache_summary_scbench_kv_scdq.json"
@@ -106,23 +126,25 @@ def test_sparsevllm_prefix_summary_reports_reuse(tmp_path):
             "status": "success",
             "prompt_tokens": 128,
             "generated_tokens": 8,
-            "eligible_cache_tokens": 0,
-            "cached_tokens": 0,
-            "cached_blocks": 0,
+            "planned_session_eligible_cache_tokens": 0,
+            "cached_tokens": 16,
+            "cached_blocks": 1,
+            "planned_session_prefix_covered_tokens": 999,
+            "cached_tokens_beyond_planned_session_prefix": 0,
             "latency_s": 2.0,
             "prefix_cache_stats_before": {"prefix_cache_hit_tokens": 0},
-            "prefix_cache_stats_after": {"prefix_cache_hit_tokens": 0},
+            "prefix_cache_stats_after": {"prefix_cache_hit_tokens": 16},
         },
         {
             "status": "success",
             "prompt_tokens": 128,
             "generated_tokens": 8,
-            "eligible_cache_tokens": 112,
+            "planned_session_eligible_cache_tokens": 112,
             "cached_tokens": 112,
             "cached_blocks": 7,
             "latency_s": 1.0,
-            "prefix_cache_stats_before": {"prefix_cache_hit_tokens": 0},
-            "prefix_cache_stats_after": {"prefix_cache_hit_tokens": 112},
+            "prefix_cache_stats_before": {"prefix_cache_hit_tokens": 16},
+            "prefix_cache_stats_after": {"prefix_cache_hit_tokens": 128},
         },
     ]
     trace_path.write_text(
@@ -134,11 +156,16 @@ def test_sparsevllm_prefix_summary_reports_reuse(tmp_path):
 
     assert summary["status"] == "success"
     assert summary["request_count"] == 2
-    assert summary["hit_requests"] == 1
-    assert summary["total_cached_tokens"] == 112
-    assert summary["total_cached_blocks"] == 7
+    assert summary["hit_requests"] == 2
+    assert summary["total_cached_tokens"] == 128
+    assert summary["total_cached_blocks"] == 8
+    assert summary["total_planned_session_eligible_cache_tokens"] == 112
+    assert summary["total_planned_session_prefix_covered_tokens"] == 112
+    assert summary["total_cached_tokens_beyond_planned_session_prefix"] == 16
+    assert summary["beyond_planned_session_prefix_hit_requests"] == 1
     assert summary["eligible_cache_hit_rate"] == 1.0
-    assert summary["prefix_cache_stats_delta"] == {"prefix_cache_hit_tokens": 112}
+    assert summary["planned_session_prefix_coverage_rate"] == 1.0
+    assert summary["prefix_cache_stats_delta"] == {"prefix_cache_hit_tokens": 128}
     assert json.loads(summary_path.read_text(encoding="utf-8")) == summary
 
 

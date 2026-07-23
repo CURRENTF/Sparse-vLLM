@@ -234,7 +234,6 @@ class SparseVLLMRegressionSuiteTest(unittest.TestCase):
                 "prefix_cache_salt": "unit",
                 "prefix_cache_max_blocks": None,
                 "quest_chunk_size": 16,
-                "quest_token_budget": 64,
                 "num_sink_tokens": 0,
                 "num_recent_tokens": 16,
                 "num_top_tokens": 64,

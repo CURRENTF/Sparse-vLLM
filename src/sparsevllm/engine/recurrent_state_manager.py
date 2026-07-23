@@ -8,6 +8,7 @@ import torch
 from sparsevllm.config import Config
 from sparsevllm.distributed import ParallelContext
 from sparsevllm.engine.sequence import Sequence
+from sparsevllm.platforms import device_runtime
 
 
 @dataclass
@@ -148,6 +149,9 @@ class RecurrentStateManager:
                 platform.get_allocator_stats(self.device).peak_allocated_bytes
             )
         self.decode_state_indices: dict[int, torch.Tensor] = {}
+        self.pending_prefix_payloads: dict[
+            int, tuple[RecurrentPrefixPayload, dict[int, object]]
+        ] = {}
         config.recurrent_state_pool_bytes = int(self.pool_bytes)
         config.recurrent_state_bytes_per_row = int(self.bytes_per_row)
         config.recurrent_state_row_capacity = int(self.row_capacity)
@@ -274,6 +278,7 @@ class RecurrentStateManager:
 
     def free_seq(self, seq_id: int) -> None:
         seq_id = int(seq_id)
+        self.pending_prefix_payloads.pop(seq_id, None)
         row = self.seq_id_to_row.pop(seq_id, None)
         if row is None:
             return
@@ -286,6 +291,7 @@ class RecurrentStateManager:
         self.free_rows.append(int(row))
 
     def reset_after_warmup(self) -> None:
+        self.pending_prefix_payloads.clear()
         self.seq_id_to_row.clear()
         self.row_to_seq_id = [None] * self.row_capacity
         self.free_rows = deque(range(self.row_capacity))
@@ -294,6 +300,7 @@ class RecurrentStateManager:
                 buffer.zero_()
 
     def get_layer_state(self, seq_id: int, layer_idx: int) -> dict[str, torch.Tensor] | None:
+        self._materialize_pending_prefix_layer(int(seq_id), int(layer_idx))
         row = self.seq_id_to_row.get(int(seq_id))
         buffers = self.layer_buffers.get(int(layer_idx))
         if row is None or not buffers:
@@ -338,6 +345,8 @@ class RecurrentStateManager:
         layer_idx = int(layer_idx)
         token_batch = int(token_batch)
         real_batch = len(seqs)
+        for seq in seqs:
+            self._materialize_pending_prefix_layer(int(seq.seq_id), layer_idx)
         if token_batch < real_batch:
             raise RuntimeError(
                 f"{self.state_spec.name} decode has fewer token rows than real sequences: "
@@ -406,7 +415,13 @@ class RecurrentStateManager:
             }
         return RecurrentPrefixPayload(token_count=token_count, layer_states=payload_states)
 
-    def attach_prefix_recurrent_payload(self, seq: Sequence, payload: RecurrentPrefixPayload | None) -> None:
+    def attach_prefix_recurrent_payload(
+        self,
+        seq: Sequence,
+        payload: RecurrentPrefixPayload | None,
+        *,
+        readiness_events: dict[int, object] | None = None,
+    ) -> None:
         if payload is None:
             return
         if int(payload.token_count) <= 0:
@@ -417,8 +432,43 @@ class RecurrentStateManager:
                 "Cannot attach recurrent prefix payload from a non-boundary snapshot: "
                 f"seq_id={seq.seq_id} token_count={payload.token_count} block_size={block_size}."
             )
+        if readiness_events is not None:
+            expected_layers = set(int(layer_idx) for layer_idx in payload.layer_states)
+            if set(int(layer_idx) for layer_idx in readiness_events) != expected_layers:
+                raise RuntimeError(
+                    "Recurrent prefix readiness events do not match payload layers: "
+                    f"expected={sorted(expected_layers)} got={sorted(readiness_events)}."
+                )
+            self._allocate_row(int(seq.seq_id))
+            self.pending_prefix_payloads[int(seq.seq_id)] = (
+                payload,
+                {int(layer_idx): event for layer_idx, event in readiness_events.items()},
+            )
+            return
         for layer_idx, state in payload.layer_states.items():
             self.set_layer_state(int(seq.seq_id), int(layer_idx), state)
+
+    def _materialize_pending_prefix_layer(self, seq_id: int, layer_idx: int) -> None:
+        pending = self.pending_prefix_payloads.get(int(seq_id))
+        if pending is None:
+            return
+        payload, readiness_events = pending
+        state = payload.layer_states.get(int(layer_idx))
+        if state is None:
+            return
+        event = readiness_events.pop(int(layer_idx), None)
+        if event is None:
+            raise RuntimeError(
+                f"Recurrent prefix layer={layer_idx} is missing its H2D readiness event."
+            )
+        if device_runtime.is_stream_capturing():
+            raise RuntimeError(
+                "Recurrent prefix H2D readiness waits are forbidden during graph capture."
+            )
+        device_runtime.wait_event(event, device=self.device)
+        self.set_layer_state(int(seq_id), int(layer_idx), state)
+        if not readiness_events:
+            self.pending_prefix_payloads.pop(int(seq_id), None)
 
     def free_prefix_recurrent_payload(self, payload: RecurrentPrefixPayload | None) -> None:
         del payload

@@ -15,6 +15,8 @@ The README contains the current install command. The expected baseline is:
 - Editable install from the repository root with `pip install -e .`.
 - Qwen3.5/Qwen3.6 FP8 runs install the CUDA-specific extra with
   `pip install -e ".[qwen35]"`.
+- Vanilla, OmniKV, and QuEST prefix-cache offload runs install
+  `pip install -e ".[prefix-offload]"` when the Qwen3.5 extra is not needed.
 - Qwen3.5/Qwen3.6 FP8 warmup may query the Hugging Face kernel registry to
   resolve `kernels-community/finegrained-fp8`, even for a local model path.
   Record `HF_ENDPOINT` and proxy overrides. A SOCKS `ALL_PROXY` requires the

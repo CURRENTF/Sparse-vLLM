@@ -48,6 +48,11 @@ def supports_streams(device: torch.device | str | int | None = None) -> bool:
     return torch.device(device).type == "cuda"
 
 
+def is_stream_capturing() -> bool:
+    platform = _optional_platform()
+    return bool(platform is not None and platform.is_stream_capturing())
+
+
 def optional_device_name(device_id: int = 0) -> str:
     platform = _optional_platform()
     if platform is None or not platform.is_cuda_alike() or not torch.cuda.is_available():
@@ -84,6 +89,17 @@ def synchronize_event(event: Any) -> None:
         event.synchronize()
 
 
+def is_event_complete(event: Any) -> bool:
+    if event is None:
+        return True
+    query = getattr(event, "query", None)
+    if not callable(query):
+        raise RuntimeError(
+            f"Device event {type(event).__name__} does not support non-blocking completion queries."
+        )
+    return bool(query())
+
+
 def new_stream(device: torch.device | str | int | None = None) -> Any | None:
     if not supports_streams(device):
         return None
@@ -101,3 +117,10 @@ def stream_wait_event(stream: Any, event: Any) -> None:
         wait_event(event)
         return
     stream.wait_event(event)
+
+
+def synchronize_stream(stream: Any) -> None:
+    if stream is None:
+        synchronize()
+        return
+    stream.synchronize()

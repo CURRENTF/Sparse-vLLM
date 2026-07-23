@@ -93,6 +93,30 @@ def test_free_slots_batch_releases_each_seq_id():
     assert freed == [3, 5, 8]
 
 
+def test_prefix_offload_release_rpcs_use_failure_synchronized_world_path():
+    assert "free_slots" in TP_RPC_STATUS_SYNC_METHODS
+    assert "free_slots_batch" in TP_RPC_STATUS_SYNC_METHODS
+
+
+def test_prefix_offload_release_rpc_surfaces_local_failure_after_status_sync():
+    for method_name, args in (("free_slots", (7,)), ("free_slots_batch", ([7, 9],))):
+        runner = object.__new__(ModelRunner)
+        runner.world_size = 1
+        runner.rank = 0
+        expected = RuntimeError(f"{method_name} failed")
+        setattr(runner, method_name, lambda *unused, error=expected: (_ for _ in ()).throw(error))
+        calls = []
+        runner._sync_tp_rpc_status = lambda method, error: calls.append((method, error))
+
+        try:
+            ModelRunner.call(runner, method_name, *args)
+        except RuntimeError as exc:
+            assert exc is expected
+        else:
+            raise AssertionError(f"expected {method_name} failure")
+        assert calls == [(method_name, expected)]
+
+
 def test_prefix_cache_control_rpc_reports_any_tp_worker_failure():
     runner = object.__new__(ModelRunner)
     runner.world_size = 2

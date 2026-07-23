@@ -115,6 +115,55 @@ def _eligible_cache_tokens(reusable_prefix_tokens: int, current_prompt_len: int,
     return min(reusable, _usable_prefix_cache_tokens(current_prompt_len, block_size))
 
 
+def _cache_reuse_accounting(
+    *,
+    cached_tokens: int,
+    planned_session_eligible_tokens: int,
+) -> dict[str, int | str]:
+    cached_tokens = int(cached_tokens)
+    planned_session_eligible_tokens = int(planned_session_eligible_tokens)
+    covered_tokens = min(cached_tokens, planned_session_eligible_tokens)
+    beyond_tokens = max(0, cached_tokens - planned_session_eligible_tokens)
+    if cached_tokens == 0:
+        scope = "none"
+    elif beyond_tokens > 0:
+        scope = "beyond_planned_session_prefix"
+    else:
+        scope = "within_planned_session_prefix"
+    return {
+        "planned_session_prefix_covered_tokens": covered_tokens,
+        "cached_tokens_beyond_planned_session_prefix": beyond_tokens,
+        "cache_hit_scope": scope,
+    }
+
+
+def _cache_reuse_totals(records: Sequence[dict[str, Any]]) -> tuple[int, int, int, int]:
+    total_planned = 0
+    total_covered = 0
+    total_beyond = 0
+    beyond_requests = 0
+    for record in records:
+        planned = int(
+            record.get(
+                "planned_session_eligible_cache_tokens",
+                record.get("eligible_cache_tokens", 0),
+            )
+            or 0
+        )
+        cached = int(record.get("cached_tokens", 0) or 0)
+        accounting = _cache_reuse_accounting(
+            cached_tokens=cached,
+            planned_session_eligible_tokens=planned,
+        )
+        covered = int(accounting["planned_session_prefix_covered_tokens"])
+        beyond = int(accounting["cached_tokens_beyond_planned_session_prefix"])
+        total_planned += planned
+        total_covered += covered
+        total_beyond += beyond
+        beyond_requests += int(beyond > 0)
+    return total_planned, total_covered, total_beyond, beyond_requests
+
+
 def _prefix_trace_path(
     result_dir: Path,
     data_name: str,
@@ -183,7 +232,12 @@ def _write_sparsevllm_prefix_summary(trace_path: Path, summary_path: Path) -> di
     total_generated_tokens = sum(int(record.get("generated_tokens", 0) or 0) for record in success)
     total_cached_tokens = sum(int(record.get("cached_tokens", 0) or 0) for record in success)
     total_cached_blocks = sum(int(record.get("cached_blocks", 0) or 0) for record in success)
-    total_eligible_tokens = sum(int(record.get("eligible_cache_tokens", 0) or 0) for record in success)
+    (
+        total_planned_session_eligible_tokens,
+        total_planned_session_covered_tokens,
+        total_beyond_planned_session_tokens,
+        beyond_planned_session_requests,
+    ) = _cache_reuse_totals(success)
     request_elapsed_s = sum(float(record.get("latency_s", 0.0) or 0.0) for record in success)
 
     status_counts: dict[str, int] = {}
@@ -208,11 +262,22 @@ def _write_sparsevllm_prefix_summary(trace_path: Path, summary_path: Path) -> di
         "total_generated_tokens": total_generated_tokens,
         "total_cached_tokens": total_cached_tokens,
         "total_cached_blocks": total_cached_blocks,
-        "total_eligible_cache_tokens": total_eligible_tokens,
+        "total_eligible_cache_tokens": total_planned_session_eligible_tokens,
+        "total_planned_session_eligible_cache_tokens": total_planned_session_eligible_tokens,
+        "total_planned_session_prefix_covered_tokens": total_planned_session_covered_tokens,
+        "total_cached_tokens_beyond_planned_session_prefix": total_beyond_planned_session_tokens,
         "hit_requests": sum(1 for record in success if int(record.get("cached_tokens", 0) or 0) > 0),
+        "beyond_planned_session_prefix_hit_requests": beyond_planned_session_requests,
         "cache_hit_rate": total_cached_tokens / total_prompt_tokens if total_prompt_tokens else 0.0,
         "eligible_cache_hit_rate": (
-            total_cached_tokens / total_eligible_tokens if total_eligible_tokens else 0.0
+            total_planned_session_covered_tokens / total_planned_session_eligible_tokens
+            if total_planned_session_eligible_tokens
+            else 0.0
+        ),
+        "planned_session_prefix_coverage_rate": (
+            total_planned_session_covered_tokens / total_planned_session_eligible_tokens
+            if total_planned_session_eligible_tokens
+            else 0.0
         ),
         "request_elapsed_s": request_elapsed_s,
         "request_throughput": len(success) / request_elapsed_s if request_elapsed_s > 0 else 0.0,
@@ -271,12 +336,12 @@ class SparseVLLMSCBenchSearch:
                     return seq
         return None
 
+    @staticmethod
     def _trace_metric_error(
-        self,
         *,
         cached_tokens: int,
         cached_blocks: int,
-        eligible_cache_tokens: int,
+        max_usable_cache_tokens: int,
         block_size: int,
     ) -> str:
         if cached_tokens < 0:
@@ -291,10 +356,10 @@ class SparseVLLMSCBenchSearch:
             return f"cached_tokens={cached_tokens} is not block-aligned to {block_size}."
         if cached_blocks * block_size != cached_tokens:
             return f"cached_blocks={cached_blocks} does not match cached_tokens={cached_tokens}."
-        if cached_tokens > eligible_cache_tokens:
+        if cached_tokens > max_usable_cache_tokens:
             return (
-                f"cached_tokens={cached_tokens} exceeds eligible_cache_tokens="
-                f"{eligible_cache_tokens}."
+                f"cached_tokens={cached_tokens} exceeds max_usable_cache_tokens="
+                f"{max_usable_cache_tokens}."
             )
         return ""
 
@@ -317,6 +382,7 @@ class SparseVLLMSCBenchSearch:
             len(prompt_token_ids),
             block_size,
         )
+        max_usable_tokens = _usable_prefix_cache_tokens(len(prompt_token_ids), block_size)
         stats_before = self._cache_stats()
         start_s = time.perf_counter()
         seq_id = self.llm.add_request(
@@ -382,8 +448,12 @@ class SparseVLLMSCBenchSearch:
             metric_error = self._trace_metric_error(
                 cached_tokens=cached_tokens,
                 cached_blocks=cached_blocks,
-                eligible_cache_tokens=eligible_tokens,
+                max_usable_cache_tokens=max_usable_tokens,
                 block_size=block_size,
+            )
+            reuse_accounting = _cache_reuse_accounting(
+                cached_tokens=cached_tokens,
+                planned_session_eligible_tokens=eligible_tokens,
             )
             if metric_error:
                 status = "metric_failed"
@@ -400,9 +470,13 @@ class SparseVLLMSCBenchSearch:
                 "generated_tokens": len(generated_token_ids),
                 "generated_token_ids": generated_token_ids,
                 "planned_reusable_prefix_tokens": int(reusable_prefix_tokens),
+                "planned_session_reusable_prefix_tokens": int(reusable_prefix_tokens),
                 "eligible_cache_tokens": int(eligible_tokens),
+                "planned_session_eligible_cache_tokens": int(eligible_tokens),
+                "max_usable_cache_tokens": int(max_usable_tokens),
                 "cached_tokens": int(cached_tokens),
                 "cached_blocks": int(cached_blocks),
+                **reuse_accounting,
                 "ttft_s": float(first_token_s - start_s),
                 "latency_s": float(end_s - start_s),
                 "error_message": error_message,

@@ -7,6 +7,7 @@ import pytest
 import torch
 
 import sparsevllm.platforms as platforms
+from sparsevllm.platforms import device_runtime
 from sparsevllm.config import Config, RuntimeLayout
 from sparsevllm.distributed import ParallelContext, ParallelGroup
 from sparsevllm.engine.cache_manager.base import (
@@ -16,11 +17,19 @@ from sparsevllm.engine.cache_manager.base import (
 )
 from sparsevllm.engine.cache_manager.quest import QuestCacheManager, QuestPrefixBlockPayload
 from sparsevllm.engine.cache_manager.snapkv import SnapKVCacheManager
-from sparsevllm.engine.cache_manager.standard import StandardCacheManager
+from sparsevllm.engine.cache_manager.standard import (
+    StandardCacheManager,
+    StandardPrefixBlockPayload,
+)
 from sparsevllm.engine.model_runner import ModelRunner
-from sparsevllm.engine.prefix_cache import PrefixCacheBlock, RadixPrefixIndex
+from sparsevllm.engine.prefix_cache import (
+    PrefixCacheBlock,
+    PrefixTransferKind,
+    RadixPrefixIndex,
+)
 from sparsevllm.engine.prefix_cache_coordinator import MixedPrefixBlockPayload, PrefixCacheCoordinator
 from sparsevllm.engine.recurrent_state_manager import (
+    RecurrentPrefixPayload,
     RecurrentStateManager,
     RecurrentStateSpec,
     RecurrentTensorSpec,
@@ -938,6 +947,20 @@ def test_qwen35_quest_prefix_block_may_span_multiple_pages(tmp_path):
     assert cfg.prefix_cache_block_size == 4096
 
 
+def test_qwen35_mixed_prefix_offload_allows_decode_graph(tmp_path):
+    cfg = _make_config(
+        tmp_path,
+        enable_prefix_caching=True,
+        enable_prefix_cache_offload=True,
+        prefix_cache_host_size_gb=1,
+        decode_cuda_graph=True,
+    )
+
+    assert cfg.enable_prefix_cache_offload is True
+    assert cfg.decode_cuda_graph is True
+    assert cfg.runtime_layout.linear_attention_layer_indices
+
+
 def test_qwen35_deltakv_requires_compatible_checkpoint_even_when_missing_allowed(tmp_path):
     with pytest.raises(ValueError, match="DeltaKV for qwen3_5 requires"):
         _make_config(
@@ -1196,6 +1219,71 @@ def test_standard_mixed_prefix_payload_preserves_block_range():
     assert payload.token_slots[0].item() == 4096
 
 
+def test_standard_mixed_prefix_promotion_bulk_allocates_one_slot_tensor():
+    manager = object.__new__(StandardCacheManager)
+    allocations = []
+    manager._take_prefix_device_slots = lambda count: (
+        allocations.append(count) or torch.arange(count, dtype=torch.int32)
+    )
+    payloads = [
+        StandardPrefixBlockPayload(token_slots=None, block_start=0, block_end=4),
+        StandardPrefixBlockPayload(token_slots=None, block_start=4, block_end=8),
+    ]
+
+    manager.allocate_prefix_kv_payloads_device(payloads)
+
+    assert allocations == [8]
+    assert payloads[0].token_slots.tolist() == [0, 1, 2, 3]
+    assert payloads[1].token_slots.tolist() == [4, 5, 6, 7]
+    assert (
+        payloads[0].token_slots.untyped_storage().data_ptr()
+        == payloads[1].token_slots.untyped_storage().data_ptr()
+    )
+
+
+def test_quest_mixed_prefix_promotion_bulk_allocates_one_page_tensor():
+    manager = object.__new__(QuestCacheManager)
+    manager.page_size = 2
+    manager.page_offsets_i32 = torch.arange(2, dtype=torch.int32)
+    allocations = []
+    manager._take_prefix_device_pages = lambda count: (
+        allocations.append(count) or torch.tensor([3, 5, 7, 9], dtype=torch.int32)
+    )
+    payloads = [
+        QuestPrefixBlockPayload(
+            block_slot=None,
+            token_slots=None,
+            block_start=0,
+            block_end=4,
+        ),
+        QuestPrefixBlockPayload(
+            block_slot=None,
+            token_slots=None,
+            block_start=4,
+            block_end=8,
+        ),
+    ]
+
+    manager.allocate_prefix_kv_payloads_device(payloads)
+
+    assert allocations == [4]
+    assert payloads[0].block_slots.tolist() == [3, 5]
+    assert payloads[0].token_slots.tolist() == [6, 7, 10, 11]
+    assert payloads[1].block_slots.tolist() == [7, 9]
+    assert payloads[1].token_slots.tolist() == [14, 15, 18, 19]
+
+
+@pytest.mark.parametrize("manager_type", [StandardCacheManager, QuestCacheManager])
+def test_mixed_prefix_attach_preflight_rejects_missing_row_capacity(manager_type):
+    manager = object.__new__(manager_type)
+    manager.seq_id_to_row = {}
+    manager.row_seq_lens = []
+    manager.free_rows = deque()
+
+    with pytest.raises(RuntimeError, match="No free rows"):
+        manager.validate_prefix_kv_attach(SimpleNamespace(seq_id=7))
+
+
 class _BoundaryCacheManager:
     def prefill_step_free_slots_for(self, seq):
         del seq
@@ -1205,7 +1293,7 @@ class _BoundaryCacheManager:
 class _BoundaryCoordinator:
     block_size = 4096
 
-    def evictable_slots(self):
+    def step_reclaimable_slots(self):
         return 0
 
 
@@ -1223,6 +1311,294 @@ def test_mixed_runtime_caps_prefill_chunks_at_recurrent_snapshot_boundary():
     assert runtime_state.prefill_step_free_slots_for(seq) == 904
 
 
+def test_mixed_admission_counts_inflight_d2h_before_pressure_prompt():
+    prefix_cache = RadixPrefixIndex(block_size=4, fingerprint=b"mixed-reclaimable")
+    block_id = prefix_cache.stable_block_id([1, 2, 3, 4], None)
+    block = PrefixCacheBlock(
+        stable_block_id=block_id,
+        parent_block_id=None,
+        block_size=4,
+        logical_block_idx=0,
+        payload=MixedPrefixBlockPayload(
+            kv_payload="kv",
+            recurrent_payload="recurrent",
+            token_count=4,
+            accounting_bytes=8,
+            recurrent_bytes=4,
+        ),
+        token_ids=(1, 2, 3, 4),
+    )
+    prefix_cache.insert_block(block)
+    prefix_cache.begin_d2h(block)
+    coordinator = object.__new__(PrefixCacheCoordinator)
+    coordinator.prefix_cache = prefix_cache
+    coordinator.block_size = 4
+    coordinator.offload_controller = object()
+    cache_manager = _ResidentAdmissionCache()
+    cache_manager.num_free_slots = 4
+    runtime_state = RuntimeState(
+        config=SimpleNamespace(max_num_seqs_in_gpu=4),
+        cache_manager=cache_manager,
+        prefix_cache_coordinator=coordinator,
+    )
+
+    assert coordinator.evictable_slots() == 0
+    assert coordinator.step_reclaimable_slots() == 4
+    assert coordinator.admission_reclaimable_slots() == 4
+    assert runtime_state.prefill_step_free_slots() == 8
+    assert runtime_state.decode_step_free_slots() == 8
+    assert runtime_state.prompt_admission_free_slots() == 8
+    assert runtime_state.prompt_admission_budgets(deque(), 4)["slots"] == 8
+    hit_seq = SimpleNamespace(
+        seq_id=7,
+        num_prompt_tokens=5,
+        prefix_cache_hit_len=4,
+        prefix_cache_hit_block_count=1,
+        prefix_cache_hit_last_block_id=block_id,
+    )
+    assert runtime_state.prompt_admission_costs(hit_seq)["slots"] == 5
+
+    block.ref_count = 1
+    assert runtime_state.prompt_admission_free_slots() == 4
+
+
+def test_mixed_cpu_only_hit_reclaims_other_device_block_before_promotion():
+    prefix_cache = RadixPrefixIndex(block_size=4, fingerprint=b"mixed-promotion-pressure")
+    pressure_kv = SimpleNamespace(token_slots=torch.arange(4, dtype=torch.int32))
+    pressure_recurrent = RecurrentPrefixPayload(
+        token_count=4,
+        layer_states={1: {"state": torch.ones(2)}},
+    )
+    pressure_id = prefix_cache.stable_block_id([9, 9, 9, 9], None)
+    pressure_block = PrefixCacheBlock(
+        stable_block_id=pressure_id,
+        parent_block_id=None,
+        block_size=4,
+        logical_block_idx=0,
+        payload=MixedPrefixBlockPayload(
+            kv_payload=pressure_kv,
+            recurrent_payload=pressure_recurrent,
+            token_count=4,
+            accounting_bytes=24,
+            recurrent_bytes=8,
+            host_block_index=1,
+        ),
+        token_ids=(9, 9, 9, 9),
+    )
+    pressure_block.residency.host_present = True
+    prefix_cache.insert_block(pressure_block)
+
+    target_kv = SimpleNamespace(token_slots=None)
+    target_recurrent = RecurrentPrefixPayload(token_count=4, layer_states={})
+    target_id = prefix_cache.stable_block_id([1, 2, 3, 4], None)
+    target_block = PrefixCacheBlock(
+        stable_block_id=target_id,
+        parent_block_id=None,
+        block_size=4,
+        logical_block_idx=0,
+        payload=MixedPrefixBlockPayload(
+            kv_payload=target_kv,
+            recurrent_payload=target_recurrent,
+            token_count=4,
+            accounting_bytes=24,
+            recurrent_bytes=8,
+            host_block_index=0,
+        ),
+        token_ids=(1, 2, 3, 4),
+    )
+    target_block.residency.device_present = False
+    target_block.residency.host_present = True
+    prefix_cache.insert_block(target_block)
+
+    class FakeCacheManager:
+        def __init__(self):
+            self.num_free_slots = 0
+            self.allocations = []
+            self.attachments = []
+
+        def free_prefix_kv_payload_device(self, payload):
+            assert isinstance(payload.token_slots, torch.Tensor)
+            payload.token_slots = None
+            self.num_free_slots += 4
+
+        def allocate_prefix_kv_payload_device(self, payload):
+            assert self.num_free_slots >= 4
+            payload.token_slots = torch.arange(4, 8, dtype=torch.int32)
+            self.num_free_slots -= 4
+            self.allocations.append(payload)
+
+        def allocate_prefix_kv_payloads_device(self, payloads):
+            for payload in payloads:
+                self.allocate_prefix_kv_payload_device(payload)
+
+        def attach_prefix_kv_payload(self, seq, payload):
+            self.attachments.append((seq.seq_id, payload))
+
+        def validate_prefix_kv_attach(self, seq):
+            assert seq.seq_id not in {attached_seq for attached_seq, _ in self.attachments}
+
+    class FakeController:
+        def __init__(self):
+            self.operations = {}
+
+        def poll(self):
+            return (0, 0)
+
+        def free_device_recurrent(self, block):
+            block.payload.recurrent_payload.layer_states = {}
+
+        def allocate_device_recurrent(self, blocks):
+            for block in blocks:
+                block.payload.recurrent_payload.layer_states = {
+                    1: {"state": torch.empty(2)}
+                }
+
+        def submit_h2d(self, blocks):
+            operation = SimpleNamespace(auxiliary_layer_events={1: object()})
+            for block in blocks:
+                prefix_cache.begin_h2d(block)
+                self.operations[block.stable_block_id] = operation
+            return operation
+
+        def h2d_operation_for_block(self, block):
+            return self.operations.get(block.stable_block_id)
+
+    recurrent_attachments = []
+    coordinator = object.__new__(PrefixCacheCoordinator)
+    coordinator.enabled = True
+    coordinator.block_size = 4
+    coordinator.prefix_cache = prefix_cache
+    coordinator.cache_manager = FakeCacheManager()
+    coordinator.recurrent_state_manager = SimpleNamespace(
+        attach_prefix_recurrent_payload=lambda seq, payload, readiness_events: (
+            recurrent_attachments.append((seq.seq_id, payload, readiness_events))
+        )
+    )
+    coordinator.offload_controller = FakeController()
+    coordinator.seq_id_to_prefix_blocks = {}
+    coordinator._step_h2d_operations = []
+    seq = SimpleNamespace(
+        seq_id=7,
+        prefix_cache_hit_len=4,
+        prefix_cache_hit_block_count=1,
+        prefix_cache_hit_last_block_id=target_id,
+    )
+
+    coordinator.attach_prefix_cache_hits([seq])
+
+    assert pressure_block.residency.device_present is False
+    assert pressure_block.residency.host_present is True
+    assert pressure_kv.token_slots is None
+    assert target_block.residency.transfer == PrefixTransferKind.H2D
+    assert target_block.ref_count == 1
+    assert coordinator.cache_manager.num_free_slots == 0
+    assert coordinator.cache_manager.allocations == [target_kv]
+    assert coordinator.cache_manager.attachments == [(seq.seq_id, target_kv)]
+    assert recurrent_attachments[0][:2] == (seq.seq_id, target_recurrent)
+
+
+@pytest.mark.parametrize("manager_type", [StandardCacheManager, QuestCacheManager])
+@pytest.mark.parametrize("row_preexisted", [False, True])
+def test_mixed_recurrent_attach_failure_rolls_back_kv_row_and_prefix_ref(
+    manager_type,
+    row_preexisted,
+):
+    manager = object.__new__(manager_type)
+    manager.device = torch.device("cpu")
+    manager.max_model_len = 8
+    manager.seq_id_to_row = {7: 0} if row_preexisted else {}
+    manager.free_rows = deque([1] if row_preexisted else [0, 1])
+    manager.row_seq_lens = [0, 0]
+    manager.buffer_req_to_token_slots = torch.zeros((2, 8), dtype=torch.int32)
+
+    if manager_type is StandardCacheManager:
+        manager.config = SimpleNamespace(prefix_cache_block_size=4)
+        manager.seq_id_to_cached_ranges = {}
+        manager._num_free_slots = 4
+        payload = StandardPrefixBlockPayload(
+            token_slots=torch.tensor([4, 5, 6, 7], dtype=torch.int32),
+            block_start=0,
+            block_end=4,
+        )
+        free_capacity_before = manager._num_free_slots
+    else:
+        manager.page_size = 2
+        manager.page_offsets_i32 = torch.arange(2, dtype=torch.int32)
+        manager.num_pages = 8
+        manager.seq_id_to_cached_pages = {}
+        manager.buffer_req_to_page_slots = torch.full((2, 4), -1, dtype=torch.int32)
+        manager._num_free_pages = 2
+        payload = QuestPrefixBlockPayload(
+            block_slot=None,
+            block_slots=torch.tensor([2, 3], dtype=torch.int32),
+            token_slots=torch.tensor([4, 5, 6, 7], dtype=torch.int32),
+            block_start=0,
+            block_end=4,
+        )
+        free_capacity_before = manager._num_free_pages
+
+    prefix_cache = RadixPrefixIndex(block_size=4, fingerprint=b"mixed-attach-rollback")
+    block_id = prefix_cache.stable_block_id([1, 2, 3, 4], None)
+    block = PrefixCacheBlock(
+        stable_block_id=block_id,
+        parent_block_id=None,
+        block_size=4,
+        logical_block_idx=0,
+        payload=MixedPrefixBlockPayload(
+            kv_payload=payload,
+            recurrent_payload=RecurrentPrefixPayload(
+                token_count=4,
+                layer_states={1: {"state": torch.ones(2)}},
+            ),
+            token_count=4,
+            accounting_bytes=24,
+            recurrent_bytes=8,
+        ),
+        token_ids=(1, 2, 3, 4),
+    )
+    prefix_cache.insert_block(block)
+
+    def fail_recurrent_attach(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError("injected recurrent attach failure")
+
+    coordinator = object.__new__(PrefixCacheCoordinator)
+    coordinator.block_size = 4
+    coordinator.prefix_cache = prefix_cache
+    coordinator.cache_manager = manager
+    coordinator.recurrent_state_manager = SimpleNamespace(
+        attach_prefix_recurrent_payload=fail_recurrent_attach,
+    )
+    coordinator.offload_controller = None
+    coordinator.seq_id_to_prefix_blocks = {}
+    coordinator._step_h2d_operations = []
+    seq = SimpleNamespace(
+        seq_id=7,
+        prefix_cache_hit_len=4,
+        prefix_cache_hit_block_count=1,
+        prefix_cache_hit_last_block_id=block_id,
+    )
+
+    with pytest.raises(RuntimeError, match="injected recurrent attach failure"):
+        coordinator.attach_prefix_cache_hits([seq])
+
+    assert block.ref_count == 0
+    assert coordinator.seq_id_to_prefix_blocks == {}
+    assert coordinator._step_h2d_operations == []
+    assert manager.seq_id_to_row == ({7: 0} if row_preexisted else {})
+    assert list(manager.free_rows) == ([1] if row_preexisted else [0, 1])
+    assert manager.row_seq_lens == [0, 0]
+    assert torch.count_nonzero(manager.buffer_req_to_token_slots).item() == 0
+    assert torch.equal(payload.token_slots, torch.tensor([4, 5, 6, 7], dtype=torch.int32))
+    if manager_type is StandardCacheManager:
+        assert manager.seq_id_to_cached_ranges == {}
+        assert manager._num_free_slots == free_capacity_before
+    else:
+        assert manager.seq_id_to_cached_pages == {}
+        assert manager._num_free_pages == free_capacity_before
+        assert torch.all(manager.buffer_req_to_page_slots == -1).item()
+
+
 def test_mixed_runtime_uses_prefix_hit_as_virtual_prefill_boundary():
     runtime_state = RuntimeState(
         config=None,
@@ -1232,6 +1608,24 @@ def test_mixed_runtime_uses_prefix_hit_as_virtual_prefill_boundary():
     seq = SimpleNamespace(num_prompt_tokens=5000, num_prefilled_tokens=0, prefix_cache_hit_len=4096)
 
     assert runtime_state.prefill_step_free_slots_for(seq) == 904
+
+
+def test_mixed_runtime_drops_step_h2d_references_after_forward():
+    coordinator = object.__new__(PrefixCacheCoordinator)
+    operation = SimpleNamespace(auxiliary_tensors=(torch.ones(2),))
+    coordinator._step_h2d_operations = [operation]
+    coordinator.record_step_tokens = lambda seqs, is_prefill: None
+    coordinator.commit_pending_blocks = lambda seqs: None
+    cache_manager = SimpleNamespace(on_forward_end=lambda seqs, is_prefill: None)
+    runtime_state = RuntimeState(
+        config=None,
+        cache_manager=cache_manager,
+        prefix_cache_coordinator=coordinator,
+    )
+
+    runtime_state.on_forward_end([], is_prefill=True)
+
+    assert coordinator._step_h2d_operations == []
 
 
 def test_mixed_prefix_rejects_prefill_chunk_crossing_recurrent_snapshot_boundary():
@@ -1304,6 +1698,25 @@ def test_mixed_prefix_warmup_reset_clears_dummy_blocks_and_accounting():
     coordinator.capacity_limited_seq_ids.add(99)
     coordinator.skipped_capacity_blocks = 1
 
+    summary = coordinator.debug_state_summary()
+    assert summary is not None
+    assert summary["fingerprint"] == coordinator.prefix_cache.fingerprint.hex()
+    assert summary["stats"]["prefix_cache_live_blocks"] == 1
+    assert summary["blocks"] == [
+        {
+            "stable_block_id": block_id.hex(),
+            "parent_block_id": None,
+            "logical_block_idx": 0,
+            "token_ids": [1, 2, 3, 4],
+            "ref_count": 0,
+            "last_access": 1,
+            "eviction_priority": 0,
+            "device_present": True,
+            "host_present": False,
+            "transfer": None,
+        }
+    ]
+
     coordinator.reset_after_warmup()
 
     assert len(coordinator.prefix_cache) == 0
@@ -1312,6 +1725,47 @@ def test_mixed_prefix_warmup_reset_clears_dummy_blocks_and_accounting():
     assert coordinator.capacity_limited_seq_ids == set()
     assert coordinator.skipped_capacity_blocks == 0
     assert freed == [("kv", "kv-warmup"), ("recurrent", "state-warmup")]
+
+
+def test_mixed_offload_reset_drains_and_rebinds_controller():
+    config = SimpleNamespace(
+        prefix_cache_block_size=4,
+        prefix_cache_max_blocks=2,
+        model="test",
+        hf_config=SimpleNamespace(model_type="test", torch_dtype=torch.float16),
+        tensor_parallel_size=1,
+        vllm_sparse_method="",
+        prefix_cache_salt="",
+    )
+    old_prefix_cache = RadixPrefixIndex(block_size=4, fingerprint=b"old", max_blocks=2)
+    calls = []
+    controller = SimpleNamespace(
+        prefix_cache=old_prefix_cache,
+        synchronize_all=lambda: calls.append("synchronize"),
+        reset=lambda: calls.append("reset"),
+    )
+    coordinator = object.__new__(PrefixCacheCoordinator)
+    coordinator.config = config
+    coordinator.block_size = 4
+    coordinator.prefix_cache = old_prefix_cache
+    coordinator.offload_controller = controller
+    coordinator.cache_manager = SimpleNamespace()
+    coordinator.recurrent_state_manager = SimpleNamespace()
+    coordinator.seq_id_to_prefix_blocks = {}
+    coordinator.seq_id_to_materialized_blocks = {}
+    coordinator.runtime_states = {}
+    coordinator.pending_blocks = {}
+    coordinator.pending_duplicate_refs = {}
+    coordinator.pending_block_ids = set()
+    coordinator.pending_recurrent_bytes = 0
+    coordinator.capacity_limited_seq_ids = set()
+    coordinator.skipped_capacity_blocks = 0
+
+    coordinator.reset_after_warmup()
+
+    assert calls == ["synchronize", "reset"]
+    assert coordinator.prefix_cache is not old_prefix_cache
+    assert controller.prefix_cache is coordinator.prefix_cache
 
 
 def test_runtime_state_does_not_proxy_undeclared_cache_manager_api():
@@ -1371,6 +1825,107 @@ def test_mixed_prefix_recurrent_byte_budget_evicts_freeable_block():
 
     assert len(coordinator.prefix_cache) == 0
     assert freed == [("kv", "kv-0"), ("recurrent", "state-0")]
+
+
+def test_mixed_offload_release_demotes_both_payloads_then_host_evicts():
+    freed_device_kv = []
+    freed_host = []
+    prefix_cache = RadixPrefixIndex(
+        block_size=4,
+        fingerprint=b"mixed-offload-manager",
+        max_blocks=1,
+    )
+
+    class FakeController:
+        def __init__(self):
+            self.prefix_cache = prefix_cache
+            self.host_pool = SimpleNamespace(free_blocks=4, capacity_blocks=4)
+            self.submitted = []
+
+        def poll(self):
+            return (0, 0)
+
+        def wait_oldest_d2h(self):
+            return False
+
+        def submit_d2h(self, blocks):
+            for block in blocks:
+                self.prefix_cache.begin_d2h(block)
+            self.submitted.append(list(blocks))
+
+        def free_device_recurrent(self, block):
+            block.payload.recurrent_payload.layer_states = {}
+
+        def free_host_payloads(self, blocks):
+            for block in blocks:
+                freed_host.append(block.stable_block_id)
+                block.payload.host_block_index = None
+
+    kv_payload = SimpleNamespace(token_slots=torch.arange(4, dtype=torch.int32))
+    recurrent_payload = RecurrentPrefixPayload(
+        token_count=4,
+        layer_states={1: {"state": torch.ones(2)}},
+    )
+    block_id = prefix_cache.stable_block_id([1, 2, 3, 4], None)
+    block = PrefixCacheBlock(
+        stable_block_id=block_id,
+        parent_block_id=None,
+        block_size=4,
+        logical_block_idx=0,
+        payload=MixedPrefixBlockPayload(
+            kv_payload=kv_payload,
+            recurrent_payload=recurrent_payload,
+            token_count=4,
+            accounting_bytes=24,
+            recurrent_bytes=8,
+        ),
+        token_ids=(1, 2, 3, 4),
+        ref_count=1,
+    )
+    prefix_cache.insert_block(block)
+    controller = FakeController()
+    coordinator = object.__new__(PrefixCacheCoordinator)
+    coordinator.block_size = 4
+    coordinator.max_recurrent_bytes = 8
+    coordinator.prefix_cache = prefix_cache
+    coordinator.offload_controller = controller
+    coordinator.cache_manager = SimpleNamespace(
+        free_prefix_kv_payload_device=lambda payload: (
+            freed_device_kv.append(payload.token_slots.clone()),
+            setattr(payload, "token_slots", None),
+        ),
+    )
+    coordinator.recurrent_state_manager = SimpleNamespace(
+        free_prefix_recurrent_payload=lambda payload: None
+    )
+    coordinator.seq_id_to_prefix_blocks = {}
+    coordinator.seq_id_to_materialized_blocks = {7: [block]}
+    coordinator.runtime_states = {}
+    coordinator.pending_blocks = {}
+    coordinator.pending_duplicate_refs = {}
+    coordinator.pending_block_ids = set()
+    coordinator.pending_recurrent_bytes = 0
+    coordinator.capacity_limited_seq_ids = set()
+
+    coordinator.release_seq(7)
+
+    assert controller.submitted == [[block]]
+    assert block.residency.transfer == PrefixTransferKind.D2H
+    block.payload.host_block_index = 0
+    prefix_cache.finish_d2h(block)
+
+    coordinator.evict_for_slots(4)
+
+    assert prefix_cache.get_block(block_id) is block
+    assert block.residency.device_present is False
+    assert block.residency.host_present is True
+    assert block.payload.kv_payload.token_slots is None
+    assert block.payload.recurrent_payload.layer_states == {}
+    assert len(freed_device_kv) == 1
+
+    assert coordinator._evict_for_insert(1, incoming_recurrent_bytes=8)
+    assert len(prefix_cache) == 0
+    assert freed_host == [block_id]
 
 
 def test_mixed_prefix_capacity_skips_insert_when_live_chain_is_referenced():
@@ -1686,6 +2241,62 @@ def test_recurrent_state_manager_reuses_preallocated_rows_for_decode():
     manager.reset_after_warmup()
 
     assert manager.decode_state_indices[4].data_ptr() == state_indices.data_ptr()
+
+
+def test_recurrent_prefix_h2d_waits_and_attaches_one_layer_at_first_access(monkeypatch):
+    config = SimpleNamespace(
+        runtime_layout=SimpleNamespace(
+            linear_attention_layer_indices=(1, 3),
+            is_linear_attention=lambda layer_idx: int(layer_idx) in {1, 3},
+        ),
+        enable_prefix_caching=True,
+        max_num_seqs_in_batch=1,
+        max_decoding_seqs=1,
+        max_num_seqs_in_gpu=2,
+        recurrent_state_max_bytes=None,
+        prefix_cache_block_size=4,
+    )
+    manager = RecurrentStateManager(
+        config,
+        _single_process_parallel_context(),
+        device=torch.device("cpu"),
+        state_spec=RecurrentStateSpec(
+            name="layer-ready-test",
+            tensor_specs=(RecurrentTensorSpec("state", (2,), torch.float16),),
+        ),
+    )
+    payload = RecurrentPrefixPayload(
+        token_count=4,
+        layer_states={
+            1: {"state": torch.tensor([1.0, 2.0], dtype=torch.float16)},
+            3: {"state": torch.tensor([3.0, 4.0], dtype=torch.float16)},
+        },
+    )
+    waits = []
+    monkeypatch.setattr(
+        device_runtime,
+        "wait_event",
+        lambda event, device=None: waits.append((event, device)),
+    )
+    seq = SimpleNamespace(seq_id=9)
+    manager.attach_prefix_recurrent_payload(
+        seq,
+        payload,
+        readiness_events={1: "layer-1-ready", 3: "layer-3-ready"},
+    )
+
+    first = manager.get_layer_state(seq.seq_id, 1)
+
+    assert waits == [("layer-1-ready", torch.device("cpu"))]
+    assert torch.equal(first["state"], payload.layer_states[1]["state"])
+    assert seq.seq_id in manager.pending_prefix_payloads
+    assert torch.count_nonzero(manager.layer_buffers[3]["state"][0]).item() == 0
+
+    later = manager.get_layer_state(seq.seq_id, 3)
+
+    assert waits[-1] == ("layer-3-ready", torch.device("cpu"))
+    assert torch.equal(later["state"], payload.layer_states[3]["state"])
+    assert seq.seq_id not in manager.pending_prefix_payloads
 
 
 def test_recurrent_state_manager_uses_model_declared_state_schema():

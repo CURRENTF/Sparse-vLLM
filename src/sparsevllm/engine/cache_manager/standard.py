@@ -12,22 +12,31 @@ from sparsevllm.distributed import ParallelContext
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.engine.prefix_cache import (
     PrefixCacheBlock,
+    PrefixTransferKind,
     RadixPrefixIndex,
     build_prefix_cache_fingerprint,
+    select_write_through_candidates,
     usable_prefix_cache_tokens,
 )
 from sparsevllm.utils.log import logger, log_level
 from sparsevllm.utils.profiler import profiler
+from sparsevllm.platforms import device_runtime
 
 from .base import CacheManager, LayerBatchStates, SparseSelection
 from .prefix_cache_mixin import PrefixCacheMixin
+from .prefix_offload import (
+    PinnedPrefixKVPool,
+    PrefixH2DOperation,
+    StandardPrefixOffloadController,
+)
 
 
 @dataclass
 class StandardPrefixBlockPayload:
-    token_slots: torch.Tensor
+    token_slots: torch.Tensor | None
     block_start: int = 0
     block_end: int = 0
+    host_block_index: int | None = None
 
 
 def _merge_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
@@ -89,6 +98,72 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
         self.seq_id_to_prefix_blocks: dict[int, list[PrefixCacheBlock]] = {}
         self.seq_id_to_cached_ranges: dict[int, list[tuple[int, int]]] = {}
         self._init_prefix_cache_runtime()
+        self.prefix_offload_controller: StandardPrefixOffloadController | None = None
+        self._prefix_offload_step_h2d_operations: list[PrefixH2DOperation] = []
+        self._prefix_write_through_candidates: dict[bytes, PrefixCacheBlock] = {}
+        has_linear_layers = bool(
+            getattr(getattr(config, "runtime_layout", None), "linear_attention_layer_indices", ())
+        )
+        if bool(getattr(config, "enable_prefix_cache_offload", False)) and not has_linear_layers:
+            self._init_prefix_offload()
+
+    def _init_prefix_offload(self) -> None:
+        if not self.enable_prefix_caching or self.prefix_cache is None:
+            raise RuntimeError("Prefix cache offload requires the Standard prefix cache.")
+        if self.tp_size not in (1, 2):
+            raise RuntimeError("Prefix cache offload currently supports only TP=1 or TP=2.")
+        if not bool(getattr(self.config, "enforce_eager", False)):
+            raise RuntimeError("Prefix cache offload currently requires eager execution.")
+        if not device_runtime.supports_pin_memory():
+            raise RuntimeError("Prefix cache offload requires pinned host memory support.")
+        if not device_runtime.supports_streams(self.device):
+            raise RuntimeError("Prefix cache offload requires asynchronous device streams.")
+        host_size_gb = getattr(self.config, "prefix_cache_host_size_gb", None)
+        if host_size_gb is None:
+            raise RuntimeError("Prefix cache offload requires prefix_cache_host_size_gb.")
+        bytes_per_block = int(
+            self.prefix_cache_block_size
+            * self.num_kv_layers
+            * 2
+            * self.num_kv_heads
+            * self.head_dim
+            * self.kv_cache.element_size()
+        )
+        host_bytes = int(float(host_size_gb) * (1024**3))
+        host_capacity_blocks = host_bytes // bytes_per_block
+        gpu_capacity_blocks = int(self.config.num_kvcache_slots) // self.prefix_cache_block_size
+        required_blocks = gpu_capacity_blocks
+        if self.prefix_cache.max_blocks is not None:
+            required_blocks = min(required_blocks, int(self.prefix_cache.max_blocks))
+        if host_capacity_blocks < required_blocks:
+            raise RuntimeError(
+                "Prefix host tier is too small for write-through safety: "
+                f"host_blocks={host_capacity_blocks} required_blocks={required_blocks} "
+                f"bytes_per_block={bytes_per_block} host_size_gb={host_size_gb}."
+            )
+        host_pool = PinnedPrefixKVPool(
+            capacity_blocks=host_capacity_blocks,
+            num_layers=self.num_kv_layers,
+            block_size=self.prefix_cache_block_size,
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_dim,
+            dtype=self.kv_cache.dtype,
+        )
+        self.prefix_offload_controller = StandardPrefixOffloadController(
+            prefix_cache=self.prefix_cache,
+            kv_cache=self.kv_cache,
+            host_pool=host_pool,
+            block_size=self.prefix_cache_block_size,
+            device=self.device,
+        )
+
+    def _prefix_offload_enabled(self) -> bool:
+        return getattr(self, "prefix_offload_controller", None) is not None
+
+    def _poll_prefix_offload(self) -> None:
+        controller = getattr(self, "prefix_offload_controller", None)
+        if controller is not None:
+            controller.poll()
 
     def allocate_kv_cache(self):
         available_memory, slot_bytes_per_layer = self._get_available_slots_info()
@@ -153,11 +228,15 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
         return costs
 
     def free_slot_stats(self) -> dict[str, int]:
+        self._poll_prefix_offload()
         stats = super().free_slot_stats()
         stats["free_rows"] = int(self.num_free_rows)
         if getattr(self, "prefix_cache", None) is not None:
             stats.update(self.prefix_cache.stats())
             stats["prefix_cache_evictable_slots"] = int(self._prefix_evictable_slots())
+        controller = getattr(self, "prefix_offload_controller", None)
+        if controller is not None:
+            stats.update(controller.stats())
         return stats
 
     def _require_prefix_cache(self) -> RadixPrefixIndex:
@@ -171,12 +250,14 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
         *,
         include_subtree: bool = False,
     ) -> dict[str, object]:
+        self._poll_prefix_offload()
         return self._require_prefix_cache().inspect_prefix(
             [int(token_id) for token_id in token_ids],
             include_subtree=include_subtree,
         )
 
     def prefix_cache_match(self, token_ids: list[int]) -> dict[str, object]:
+        self._poll_prefix_offload()
         if getattr(self, "prefix_cache", None) is None:
             return {
                 "supported": True,
@@ -208,9 +289,14 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
         }
 
     def prefix_cache_delete_subtree(self, token_ids: list[int]) -> dict[str, object]:
-        result = self._require_prefix_cache().safe_delete_subtree(
-            [int(token_id) for token_id in token_ids],
-        )
+        controller = getattr(self, "prefix_offload_controller", None)
+        if controller is not None:
+            controller.synchronize_all()
+        normalized = [int(token_id) for token_id in token_ids]
+        prefix_cache = self._require_prefix_cache()
+        plan = prefix_cache.preview_delete_subtree(normalized)
+        self.synchronize_prefix_cache_delete_plan(plan.to_dict())
+        result = prefix_cache.safe_delete_subtree(normalized)
         self._free_prefix_cache_blocks(result.deleted_blocks)
         return result.to_dict()
 
@@ -228,16 +314,39 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
     def _prefix_evictable_slots(self) -> int:
         if getattr(self, "prefix_cache", None) is None:
             return 0
-        return int(self.prefix_cache.freeable_blocks() * self.prefix_cache_block_size)
+        freeable_blocks = (
+            self.prefix_cache.device_freeable_blocks()
+            if self._prefix_offload_enabled()
+            else self.prefix_cache.freeable_blocks()
+        )
+        return int(freeable_blocks * self.prefix_cache_block_size)
+
+    def _prefix_step_reclaimable_slots(self) -> int:
+        if getattr(self, "prefix_cache", None) is None:
+            return 0
+        reclaimable_blocks = (
+            self.prefix_cache.device_reclaimable_blocks()
+            if self._prefix_offload_enabled()
+            else self.prefix_cache.freeable_blocks()
+        )
+        return int(reclaimable_blocks * self.prefix_cache_block_size)
 
     def prefill_step_free_slots(self) -> int:
-        return int(self.num_free_slots + self._prefix_evictable_slots())
+        return int(self.num_free_slots + self._prefix_step_reclaimable_slots())
 
     def decode_step_free_slots(self) -> int:
-        return int(self.num_free_slots + self._prefix_evictable_slots())
+        return int(self.num_free_slots + self._prefix_step_reclaimable_slots())
 
     def prompt_admission_free_slots(self) -> int:
-        return int(self.num_free_slots + self._prefix_evictable_slots())
+        reclaimable_slots = 0
+        if getattr(self, "prefix_cache", None) is not None:
+            reclaimable_blocks = (
+                self.prefix_cache.device_reclaimable_blocks()
+                if self._prefix_offload_enabled()
+                else self.prefix_cache.freeable_blocks()
+            )
+            reclaimable_slots = reclaimable_blocks * self.prefix_cache_block_size
+        return int(self.num_free_slots + reclaimable_slots)
 
     def _prefix_hit_evictable_slots(self, seq: Sequence) -> int:
         if getattr(self, "prefix_cache", None) is None or int(getattr(seq, "prefix_cache_hit_len", 0) or 0) <= 0:
@@ -248,7 +357,11 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
             seq.prefix_cache_hit_last_block_id,
             int(seq.prefix_cache_hit_block_count),
         )
-        freeable_block_ids = self.prefix_cache.freeable_block_ids()
+        freeable_block_ids = (
+            self.prefix_cache.device_reclaimable_block_ids()
+            if self._prefix_offload_enabled()
+            else self.prefix_cache.freeable_block_ids()
+        )
         return sum(
             self.prefix_cache_block_size
             for block in chain
@@ -258,12 +371,32 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
     def prompt_admission_cost(self, seq: Sequence) -> int:
         hit_len = int(getattr(seq, "prefix_cache_hit_len", 0) or 0)
         suffix_len = int(seq.num_prompt_tokens - hit_len)
-        return suffix_len + self._prefix_hit_evictable_slots(seq)
+        promotion_slots = 0
+        if self._prefix_offload_enabled() and hit_len > 0:
+            if seq.prefix_cache_hit_last_block_id is None:
+                raise RuntimeError(
+                    f"seq_id={seq.seq_id} has prefix hit length but no last block id."
+                )
+            chain = self._require_prefix_cache().get_chain(
+                seq.prefix_cache_hit_last_block_id,
+                int(seq.prefix_cache_hit_block_count),
+            )
+            promotion_slots = sum(
+                self.prefix_cache_block_size
+                for block in chain
+                if not block.residency.device_present
+            )
+        return (
+            suffix_len
+            + promotion_slots
+            + self._prefix_hit_evictable_slots(seq)
+        )
 
     def prompt_logical_reservation_cost(self, seq: Sequence) -> int:
         return int(self.prompt_admission_cost(seq))
 
     def refresh_prefix_cache_hit(self, seq: Sequence) -> None:
+        self._poll_prefix_offload()
         self.clear_prefix_cache_hit(seq)
         if not self.enable_prefix_caching or self.prefix_cache is None:
             return
@@ -295,15 +428,42 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
         seq.prefix_cache_method = str(self.config.vllm_sparse_method or "")
 
     def _free_prefix_cache_blocks(self, blocks: list[PrefixCacheBlock]) -> None:
+        pending = getattr(self, "_prefix_write_through_candidates", None)
+        host_blocks: list[PrefixCacheBlock] = []
         for block in blocks:
+            if pending is not None:
+                pending.pop(block.stable_block_id, None)
             payload = block.payload
             if not isinstance(payload, StandardPrefixBlockPayload):
                 raise RuntimeError("Standard prefix cache block is missing token slots.")
-            slots = payload.token_slots.to(dtype=torch.int32)
-            count = int(slots.numel())
-            ptr = self._num_free_slots
-            self.free_slots_stack[ptr: ptr + count] = slots
-            self._num_free_slots += count
+            if block.residency.device_present:
+                self._free_device_prefix_block(block)
+            if block.residency.host_present:
+                host_blocks.append(block)
+        controller = getattr(self, "prefix_offload_controller", None)
+        if host_blocks:
+            if controller is None:
+                raise RuntimeError(
+                    "Prefix blocks have host payloads but no offload controller is active."
+                )
+            controller.free_host_payloads(host_blocks)
+
+    def _free_device_prefix_block(self, block: PrefixCacheBlock) -> None:
+        payload = block.payload
+        if not isinstance(payload, StandardPrefixBlockPayload):
+            raise RuntimeError("Standard prefix cache block is missing its device payload.")
+        slots = payload.token_slots
+        if not isinstance(slots, torch.Tensor) or int(slots.numel()) != self.prefix_cache_block_size:
+            raise RuntimeError(
+                "Standard prefix cache block has invalid device slots: "
+                f"block={block.stable_block_id.hex()[:16]}."
+            )
+        slots = slots.to(device=self.device, dtype=torch.int32)
+        count = int(slots.numel())
+        ptr = self._num_free_slots
+        self.free_slots_stack[ptr: ptr + count] = slots
+        self._num_free_slots += count
+        payload.token_slots = None
 
     def _make_prefix_block_payload(self, slots: torch.Tensor) -> StandardPrefixBlockPayload:
         return StandardPrefixBlockPayload(
@@ -343,6 +503,8 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
     def attach_prefix_kv_payload(self, seq: Sequence, payload: object) -> None:
         if not isinstance(payload, StandardPrefixBlockPayload):
             raise RuntimeError("Standard mixed prefix KV payload is missing token slots.")
+        if not isinstance(payload.token_slots, torch.Tensor):
+            raise RuntimeError("Standard mixed prefix KV payload has no device slots.")
         slots = payload.token_slots.to(device=self.device, dtype=torch.int32).reshape(-1)
         count = int(slots.numel())
         if count <= 0:
@@ -375,18 +537,121 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
         cached_ranges = self.seq_id_to_cached_ranges.setdefault(int(seq.seq_id), [])
         cached_ranges.append((start, end))
 
+    def validate_prefix_kv_attach(self, seq: Sequence) -> bool:
+        row_idx = self.seq_id_to_row.get(int(seq.seq_id))
+        if row_idx is not None and int(self.row_seq_lens[row_idx]) != 0:
+            raise RuntimeError(
+                "Cannot attach mixed prefix KV to a non-empty row: "
+                f"seq_id={seq.seq_id} row_idx={row_idx} "
+                f"row_len={int(self.row_seq_lens[row_idx])}."
+            )
+        if row_idx is None and not self.free_rows:
+            raise RuntimeError("No free rows in cache manager buffer!")
+        return row_idx is not None
+
+    def rollback_prefix_kv_attach(
+        self,
+        seq: Sequence,
+        payloads: list[object],
+        *,
+        row_preexisted: bool,
+    ) -> None:
+        normalized: list[StandardPrefixBlockPayload] = []
+        expected_start = 0
+        for payload in payloads:
+            if not isinstance(payload, StandardPrefixBlockPayload):
+                raise RuntimeError("Standard mixed prefix rollback received an invalid payload.")
+            if int(payload.block_start) != expected_start or int(payload.block_end) <= expected_start:
+                raise RuntimeError(
+                    "Standard mixed prefix rollback payloads are not contiguous: "
+                    f"expected_start={expected_start} "
+                    f"range={int(payload.block_start)}:{int(payload.block_end)}."
+                )
+            normalized.append(payload)
+            expected_start = int(payload.block_end)
+        if not normalized:
+            return
+
+        seq_id = int(seq.seq_id)
+        row_idx = self.seq_id_to_row.get(seq_id)
+        if row_idx is None or int(self.row_seq_lens[row_idx]) != expected_start:
+            raise RuntimeError(
+                "Standard mixed prefix rollback row state is inconsistent: "
+                f"seq_id={seq_id} row_idx={row_idx} "
+                f"row_len={None if row_idx is None else int(self.row_seq_lens[row_idx])} "
+                f"expected={expected_start}."
+            )
+        expected_ranges = [
+            (int(payload.block_start), int(payload.block_end))
+            for payload in normalized
+        ]
+        if self.seq_id_to_cached_ranges.get(seq_id) != expected_ranges:
+            raise RuntimeError(
+                "Standard mixed prefix rollback cached ranges are inconsistent: "
+                f"seq_id={seq_id} expected={expected_ranges} "
+                f"got={self.seq_id_to_cached_ranges.get(seq_id)}."
+            )
+
+        self.buffer_req_to_token_slots[row_idx, :expected_start] = 0
+        self.row_seq_lens[row_idx] = 0
+        self.seq_id_to_cached_ranges.pop(seq_id, None)
+        if not row_preexisted:
+            owner = self.seq_id_to_row.pop(seq_id, None)
+            if owner != row_idx:
+                raise RuntimeError(
+                    "Standard mixed prefix rollback row ownership changed unexpectedly: "
+                    f"seq_id={seq_id} expected_row={row_idx} owner={owner}."
+                )
+            self.free_rows.appendleft(row_idx)
+
     def free_prefix_kv_payload(self, payload: object) -> None:
         if not isinstance(payload, StandardPrefixBlockPayload):
             raise RuntimeError("Standard mixed prefix KV payload is missing token slots.")
+        if not isinstance(payload.token_slots, torch.Tensor):
+            raise RuntimeError("Standard mixed prefix KV payload has no device slots.")
         slots = payload.token_slots.to(device=self.device, dtype=torch.int32).reshape(-1)
         count = int(slots.numel())
         ptr = self._num_free_slots
         self.free_slots_stack[ptr: ptr + count] = slots
         self._num_free_slots += count
 
+    def allocate_prefix_kv_payload_device(self, payload: object) -> None:
+        self.allocate_prefix_kv_payloads_device([payload])
+
+    def allocate_prefix_kv_payloads_device(self, payloads: list[object]) -> None:
+        normalized: list[StandardPrefixBlockPayload] = []
+        counts: list[int] = []
+        for payload in payloads:
+            if not isinstance(payload, StandardPrefixBlockPayload):
+                raise RuntimeError("Standard mixed prefix KV payload is missing token slots.")
+            if isinstance(payload.token_slots, torch.Tensor):
+                raise RuntimeError("Mixed prefix KV payload is already device-resident.")
+            count = int(payload.block_end) - int(payload.block_start)
+            if count <= 0:
+                raise RuntimeError("Mixed prefix KV payload has an invalid token range.")
+            normalized.append(payload)
+            counts.append(count)
+        if not normalized:
+            return
+        slots = self._take_prefix_device_slots(sum(counts))
+        offset = 0
+        for payload, count in zip(normalized, counts):
+            payload.token_slots = slots[offset : offset + count]
+            offset += count
+
+    def free_prefix_kv_payload_device(self, payload: object) -> None:
+        if not isinstance(payload, StandardPrefixBlockPayload):
+            raise RuntimeError("Standard mixed prefix KV payload is missing token slots.")
+        if not isinstance(payload.token_slots, torch.Tensor):
+            raise RuntimeError("Mixed prefix KV payload has no device slots to demote.")
+        self._return_prefix_device_slots(payload.token_slots)
+        payload.token_slots = None
+
     def prefix_kv_payload_nbytes(self, payload: object) -> int:
         if not isinstance(payload, StandardPrefixBlockPayload):
             raise RuntimeError("Standard mixed prefix KV payload is missing token slots.")
+        if not isinstance(payload.token_slots, torch.Tensor):
+            raise RuntimeError("Standard mixed prefix KV payload has no device slots.")
         dtype_size = self._cache_slot_dtype_size()
         return int(
             payload.token_slots.numel()
@@ -435,10 +700,19 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
     def _reset_prefix_cache_allocator_after_clear(self) -> None:
         if self.seq_id_to_row:
             raise RuntimeError("Cannot reset prefix cache while Standard sequences are active.")
+        controller = getattr(self, "prefix_offload_controller", None)
+        if controller is not None:
+            controller.reset()
         num_slots = int(self.config.num_kvcache_slots)
         self.free_slots_stack[:num_slots] = torch.arange(num_slots, dtype=torch.int32, device=self.device)
         self._num_free_slots = num_slots
         self.seq_id_to_cached_ranges.clear()
+        getattr(self, "_prefix_write_through_candidates", {}).clear()
+
+    def _on_prefix_cache_reset(self) -> None:
+        controller = getattr(self, "prefix_offload_controller", None)
+        if controller is not None:
+            controller.prefix_cache = self._require_prefix_cache()
 
     def reset_after_warmup(self) -> None:
         if self.enable_prefix_caching and self.prefix_cache is not None:
@@ -452,6 +726,25 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
         needed_slots = int(needed_slots)
         if self._num_free_slots >= needed_slots:
             return
+        if self._prefix_offload_enabled():
+            controller = self.prefix_offload_controller
+            assert controller is not None
+            while self._num_free_slots < needed_slots:
+                self._poll_prefix_offload()
+                missing_slots = needed_slots - int(self._num_free_slots)
+                needed_blocks = (
+                    missing_slots + self.prefix_cache_block_size - 1
+                ) // self.prefix_cache_block_size
+                with profiler.record("prefix_cache_device_demote"):
+                    demoted = self.prefix_cache.demote_device_until_freeable(needed_blocks)
+                for block in demoted:
+                    self._free_device_prefix_block(block)
+                if self._num_free_slots >= needed_slots:
+                    return
+                if not controller.wait_oldest_d2h():
+                    break
+            return
+
         missing_slots = needed_slots - int(self._num_free_slots)
         needed_blocks = (missing_slots + self.prefix_cache_block_size - 1) // self.prefix_cache_block_size
         with profiler.record("prefix_cache_evict"):
@@ -461,9 +754,115 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
     def _evict_prefix_cache_for_insert(self, needed_blocks: int = 1) -> None:
         if not self.enable_prefix_caching or self.prefix_cache is None:
             return
+        if self._prefix_offload_enabled():
+            max_blocks = self.prefix_cache.max_blocks
+            if max_blocks is None:
+                return
+            over_capacity = len(self.prefix_cache) + int(needed_blocks) - int(max_blocks)
+            if over_capacity <= 0:
+                return
+            controller = self.prefix_offload_controller
+            assert controller is not None
+            evicted: list[PrefixCacheBlock] = []
+            while len(evicted) < over_capacity:
+                self._poll_prefix_offload()
+                remaining = over_capacity - len(evicted)
+                with profiler.record("prefix_cache_host_evict"):
+                    host_evicted = self.prefix_cache.evict_host_until_freeable(remaining)
+                self._free_prefix_cache_blocks(host_evicted)
+                evicted.extend(host_evicted)
+                if len(evicted) >= over_capacity:
+                    break
+
+                remaining = over_capacity - len(evicted)
+                with profiler.record("prefix_cache_device_demote"):
+                    demoted = self.prefix_cache.demote_device_until_freeable(remaining)
+                for block in demoted:
+                    self._free_device_prefix_block(block)
+                with profiler.record("prefix_cache_host_evict"):
+                    newly_evicted = self.prefix_cache.evict_host_until_freeable(remaining)
+                self._free_prefix_cache_blocks(newly_evicted)
+                evicted.extend(newly_evicted)
+                if len(evicted) >= over_capacity:
+                    break
+
+                inflight_before = sum(
+                    1
+                    for block in self.prefix_cache.blocks.values()
+                    if block.residency.transfer == PrefixTransferKind.D2H
+                )
+                if inflight_before <= 0 or not controller.wait_oldest_d2h():
+                    break
+                self._poll_prefix_offload()
+                inflight_after = sum(
+                    1
+                    for block in self.prefix_cache.blocks.values()
+                    if block.residency.transfer == PrefixTransferKind.D2H
+                )
+                if inflight_after >= inflight_before:
+                    break
+            if len(evicted) != over_capacity:
+                raise RuntimeError(
+                    "Prefix cache logical capacity exceeded and not enough CPU-only leaves "
+                    "are evictable: "
+                    f"live_blocks={len(self.prefix_cache)} max_blocks={max_blocks} "
+                    f"needed_blocks={needed_blocks} evicted_blocks={len(evicted)}."
+                )
+            return
         with profiler.record("prefix_cache_evict"):
             evicted = self.prefix_cache.ensure_insert_capacity(needed_blocks)
         self._free_prefix_cache_blocks(evicted)
+
+    def _ensure_prefix_host_capacity(self, needed_blocks: int) -> None:
+        controller = self.prefix_offload_controller
+        if controller is None:
+            raise RuntimeError("Prefix host capacity requested without an offload controller.")
+        needed_blocks = int(needed_blocks)
+        if controller.host_pool.free_blocks >= needed_blocks:
+            return
+        missing = needed_blocks - controller.host_pool.free_blocks
+        with profiler.record("prefix_cache_host_evict"):
+            evicted = self._require_prefix_cache().evict_host_until_freeable(missing)
+        self._free_prefix_cache_blocks(evicted)
+        if controller.host_pool.free_blocks < needed_blocks:
+            raise RuntimeError(
+                "Prefix host pool cannot preserve write-through residency: "
+                f"need={needed_blocks} free={controller.host_pool.free_blocks} "
+                f"evicted={len(evicted)} capacity={controller.host_pool.capacity_blocks}."
+            )
+
+    def _schedule_write_through_prefix_blocks(
+        self,
+        newly_unreferenced: list[PrefixCacheBlock] | None = None,
+    ) -> None:
+        if not self._prefix_offload_enabled():
+            return
+        if device_runtime.is_stream_capturing():
+            raise RuntimeError("Prefix D2H scheduling is forbidden during graph capture.")
+        self._poll_prefix_offload()
+        prefix_cache = self._require_prefix_cache()
+        pending = getattr(self, "_prefix_write_through_candidates", None)
+        if pending is None:
+            pending = {}
+            self._prefix_write_through_candidates = pending
+        selected = select_write_through_candidates(
+            prefix_cache,
+            pending,
+            newly_unreferenced,
+        )
+        if not selected:
+            return
+        self._ensure_prefix_host_capacity(len(selected))
+        controller = self.prefix_offload_controller
+        assert controller is not None
+        with profiler.record("prefix_cache_d2h_submit"):
+            controller.submit_d2h(selected)
+        for block in selected:
+            pending.pop(block.stable_block_id, None)
+
+    def on_forward_end(self, seqs: list[Sequence], is_prefill: bool):
+        self._poll_prefix_offload()
+        return super().on_forward_end(seqs, is_prefill)
 
     def _attach_prefix_cache_if_needed(self, seq: Sequence) -> None:
         if not self.enable_prefix_caching or self.prefix_cache is None:
@@ -473,6 +872,7 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
             return
         if seq.seq_id in self.seq_id_to_prefix_blocks:
             return
+        self._poll_prefix_offload()
         with profiler.record("prefix_cache_attach"):
             if seq.prefix_cache_hit_last_block_id is None:
                 raise RuntimeError(f"seq_id={seq.seq_id} has prefix hit length but no last block id.")
@@ -491,33 +891,158 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
                     f"seq_id={seq.seq_id} hit_len={hit_len} blocks={len(chain)} "
                     f"block_size={self.prefix_cache_block_size}."
                 )
-            row_idx = self._get_free_row(seq.seq_id)
-            if int(self.row_seq_lens[row_idx]) != 0:
-                raise RuntimeError(
-                    f"Cannot attach prefix cache to non-empty row: seq_id={seq.seq_id} "
-                    f"row_idx={row_idx} row_len={int(self.row_seq_lens[row_idx])}."
-                )
-
-            cached_ranges = self.seq_id_to_cached_ranges.setdefault(seq.seq_id, [])
+            cpu_only_blocks: list[PrefixCacheBlock] = []
+            existing_h2d_operations: list[PrefixH2DOperation] = []
+            saw_cpu_only = False
             for block in chain:
                 payload = block.payload
+                if not isinstance(payload, StandardPrefixBlockPayload):
+                    raise RuntimeError(
+                        f"Invalid Standard prefix cache payload for seq_id={seq.seq_id}: "
+                        f"logical_block_idx={block.logical_block_idx}."
+                    )
+                residency = block.residency
+                residency.validate()
+                if not residency.device_present:
+                    saw_cpu_only = True
+                    if not self._prefix_offload_enabled() or not residency.host_present:
+                        raise RuntimeError(
+                            "Prefix lookup returned a non-device block that cannot be promoted: "
+                            f"seq_id={seq.seq_id} block={block.stable_block_id.hex()[:16]}."
+                        )
+                    if residency.transfer is not None:
+                        raise RuntimeError(
+                            "CPU-only prefix block has an unexpected in-flight transfer: "
+                            f"seq_id={seq.seq_id} transfer={residency.transfer.value}."
+                        )
+                    if payload.host_block_index is None:
+                        raise RuntimeError(
+                            "CPU-only prefix block is missing its host allocation: "
+                            f"seq_id={seq.seq_id} block={block.stable_block_id.hex()[:16]}."
+                        )
+                    cpu_only_blocks.append(block)
+                    continue
+                if saw_cpu_only:
+                    raise RuntimeError(
+                        "Prefix device residency is not root-contiguous: "
+                        f"seq_id={seq.seq_id} block={block.stable_block_id.hex()[:16]}."
+                    )
                 if (
-                    not isinstance(payload, StandardPrefixBlockPayload)
+                    not isinstance(payload.token_slots, torch.Tensor)
                     or int(payload.token_slots.numel()) != self.prefix_cache_block_size
                 ):
                     raise RuntimeError(
                         f"Invalid Standard prefix cache block slots for seq_id={seq.seq_id}: "
                         f"logical_block_idx={block.logical_block_idx}."
                     )
+                if residency.transfer == PrefixTransferKind.H2D:
+                    controller = self.prefix_offload_controller
+                    assert controller is not None
+                    operation = controller.h2d_operation_for_block(block)
+                    if operation is None:
+                        raise RuntimeError(
+                            "Prefix block is promoting without a tracked H2D operation: "
+                            f"block={block.stable_block_id.hex()[:16]}."
+                        )
+                    if all(existing is not operation for existing in existing_h2d_operations):
+                        existing_h2d_operations.append(operation)
+
+            existing_row_idx = self.seq_id_to_row.get(seq.seq_id)
+            if existing_row_idx is not None and int(self.row_seq_lens[existing_row_idx]) != 0:
+                raise RuntimeError(
+                    f"Cannot attach prefix cache to non-empty row: seq_id={seq.seq_id} "
+                    f"row_idx={existing_row_idx} "
+                    f"row_len={int(self.row_seq_lens[existing_row_idx])}."
+                )
+            if existing_row_idx is None and not self.free_rows:
+                raise RuntimeError("No free rows in cache manager buffer!")
+
+            for block in chain:
+                block.ref_count += 1
+            allocated_promotion_slots: torch.Tensor | None = None
+            submitted_operation: PrefixH2DOperation | None = None
+            try:
+                if cpu_only_blocks:
+                    if not self._prefix_offload_enabled():
+                        raise RuntimeError(
+                            "CPU prefix hit requires prefix cache offload to be enabled."
+                        )
+                    if device_runtime.is_stream_capturing():
+                        raise RuntimeError("Prefix H2D promotion is forbidden during graph capture.")
+                    promotion_slot_count = len(cpu_only_blocks) * self.prefix_cache_block_size
+                    allocated_promotion_slots = self._take_prefix_device_slots(
+                        promotion_slot_count
+                    )
+                    for offset, block in enumerate(cpu_only_blocks):
+                        payload = block.payload
+                        assert isinstance(payload, StandardPrefixBlockPayload)
+                        start = offset * self.prefix_cache_block_size
+                        end = start + self.prefix_cache_block_size
+                        payload.token_slots = allocated_promotion_slots[start:end]
+                    controller = self.prefix_offload_controller
+                    assert controller is not None
+                    with profiler.record("prefix_cache_h2d_submit"):
+                        submitted_operation = controller.submit_h2d(cpu_only_blocks)
+            except Exception:
+                for block in chain:
+                    block.ref_count -= 1
+                if allocated_promotion_slots is not None:
+                    self._return_prefix_device_slots(allocated_promotion_slots)
+                    for block in cpu_only_blocks:
+                        payload = block.payload
+                        assert isinstance(payload, StandardPrefixBlockPayload)
+                        payload.token_slots = None
+                raise
+
+            row_idx = self._get_free_row(seq.seq_id)
+
+            active_operations = list(existing_h2d_operations)
+            if submitted_operation is not None:
+                active_operations.append(submitted_operation)
+            for operation in active_operations:
+                if all(
+                    existing is not operation
+                    for existing in self._prefix_offload_step_h2d_operations
+                ):
+                    self._prefix_offload_step_h2d_operations.append(operation)
+
+            cached_ranges = self.seq_id_to_cached_ranges.setdefault(seq.seq_id, [])
+            for block in chain:
+                payload = block.payload
+                assert isinstance(payload, StandardPrefixBlockPayload)
+                if not isinstance(payload.token_slots, torch.Tensor):
+                    raise RuntimeError(
+                        "Prefix attach reached a block without device slots after promotion: "
+                        f"block={block.stable_block_id.hex()[:16]}."
+                    )
                 start = int(block.logical_block_idx) * self.prefix_cache_block_size
                 end = start + self.prefix_cache_block_size
                 self.buffer_req_to_token_slots[row_idx, start:end] = payload.token_slots
-                block.ref_count += 1
                 cached_ranges.append((start, end))
 
             self.row_seq_lens[row_idx] = hit_len
             self.seq_id_to_prefix_blocks[seq.seq_id] = chain
             self.prefix_cache.touch_chain(chain)
+
+    def _take_prefix_device_slots(self, count: int) -> torch.Tensor:
+        count = int(count)
+        self._evict_prefix_cache_until_free(count)
+        if self._num_free_slots < count:
+            raise RuntimeError(
+                "Out of KV cache slots while promoting a CPU prefix: "
+                f"need={count} free={self._num_free_slots}."
+            )
+        ptr = self._num_free_slots
+        slots = self.free_slots_stack[ptr - count:ptr].clone()
+        self._num_free_slots -= count
+        return slots
+
+    def _return_prefix_device_slots(self, slots: torch.Tensor) -> None:
+        slots = slots.to(device=self.device, dtype=torch.int32).reshape(-1)
+        count = int(slots.numel())
+        ptr = self._num_free_slots
+        self.free_slots_stack[ptr:ptr + count] = slots
+        self._num_free_slots += count
 
     def _get_free_row(self, seq_id: int) -> int:
         if seq_id in self.seq_id_to_row:
@@ -617,6 +1142,7 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
 
     def free_seq(self, seq_id: int):
         with profiler.record("cache_free_seq"):
+            self._poll_prefix_offload()
             debug_slots = os.getenv("SPARSEVLLM_DEBUG_SLOTS", "0") == "1"
             row_idx = self.seq_id_to_row.pop(seq_id, None)
             if row_idx is None:
@@ -635,8 +1161,12 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
                 self.free_slots_stack[ptr: ptr + count] = slots
                 self._num_free_slots += count
                 freed_tokens += count
-            self._release_prefix_blocks(self.seq_id_to_prefix_blocks.pop(seq_id, []))
-            self._release_prefix_blocks(self.seq_id_to_materialized_blocks.pop(seq_id, []))
+            released_prefix_blocks = self.seq_id_to_prefix_blocks.pop(seq_id, [])
+            released_prefix_blocks.extend(
+                self.seq_id_to_materialized_blocks.pop(seq_id, [])
+            )
+            self._release_prefix_blocks(released_prefix_blocks)
+            self._schedule_write_through_prefix_blocks(released_prefix_blocks)
             self.prefix_runtime_states.pop(seq_id, None)
             self.pending_prefix_blocks.pop(seq_id, None)
             after_free = self._num_free_slots
@@ -668,6 +1198,8 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
 
     def _prepare_prefill(self, seqs: list[Sequence]):
         with profiler.record("cache_prepare_prefill"):
+            self._poll_prefix_offload()
+            self._prefix_offload_step_h2d_operations = []
             for seq in seqs:
                 self._attach_prefix_cache_if_needed(seq)
 
@@ -732,6 +1264,8 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
 
     def _prepare_decode(self, seqs: list[Sequence]):
         with profiler.record("cache_prepare_decode"):
+            self._poll_prefix_offload()
+            self._prefix_offload_step_h2d_operations = []
             batch_size = len(seqs)
             input_ids_list = [seq.last_token for seq in seqs]
             positions_list = [seq.num_tokens - 1 for seq in seqs]
@@ -763,6 +1297,21 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
             positions = torch.tensor(positions_list, dtype=torch.int64, device=self.device)
             return input_ids, positions, None
 
+    def before_prefill_layer_attention(
+        self,
+        layer_idx: int,
+        selection: SparseSelection,
+    ):
+        controller = getattr(self, "prefix_offload_controller", None)
+        if controller is not None and self._prefix_offload_step_h2d_operations:
+            if device_runtime.is_stream_capturing():
+                raise RuntimeError("Prefix H2D waits are forbidden during graph capture.")
+            kv_layer_index = self.kv_layer_index(layer_idx)
+            with profiler.record("prefix_cache_h2d_layer_wait"):
+                for operation in self._prefix_offload_step_h2d_operations:
+                    controller.wait_for_layer(operation, kv_layer_index)
+        return super().before_prefill_layer_attention(layer_idx, selection)
+
     def prepare_decode_static(
         self,
         seqs: list[Sequence],
@@ -778,6 +1327,8 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
         this avoids the ordinary per-step metadata tensor allocation path.
         """
         with profiler.record("cache_prepare_decode"):
+            self._poll_prefix_offload()
+            self._prefix_offload_step_h2d_operations = []
             real_batch_size = len(seqs)
             graph_batch_size = int(input_ids.numel())
             if real_batch_size <= 0:

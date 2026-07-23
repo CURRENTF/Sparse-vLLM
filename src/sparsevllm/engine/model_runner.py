@@ -64,6 +64,8 @@ PREFIX_CACHE_CONTROL_RPC_METHODS = {
 TP_RPC_STATUS_SYNC_METHODS = PREFIX_CACHE_CONTROL_RPC_METHODS | {
     "debug_hidden_states_cpu",
     "debug_moe_states_cpu",
+    "free_slots",
+    "free_slots_batch",
     "refresh_prefix_cache_hit",
     "reset_after_warmup",
     "run",
@@ -206,6 +208,8 @@ class ModelRunner:
             if has_linear_layers and bool(config.enable_prefix_caching)
             else None
         )
+        if self.prefix_cache_coordinator is not None:
+            self.cache_manager.prefix_cache_coordinator = self.prefix_cache_coordinator
         self.runtime_state = RuntimeState(
             config,
             self.cache_manager,
@@ -605,10 +609,15 @@ class ModelRunner:
                 "local_hit_count": int(block.debug_last_local_hit_count),
                 "local_output": _debug_tensor_summary(block.debug_last_local_output),
             }
+        state = self.sparse_controller.debug_state_summary()
+        if self.prefix_cache_coordinator is not None:
+            state["mixed_prefix_cache"] = (
+                self.prefix_cache_coordinator.debug_state_summary()
+            )
         return {
             "world_rank": self.parallel_context.world_rank,
             "ep_rank": self.parallel_context.ep_rank,
-            "state": self.sparse_controller.debug_state_summary(),
+            "state": state,
             "last_logits": (
                 _debug_tensor_summary(self.debug_last_logits)
                 if hasattr(self, "debug_last_logits")

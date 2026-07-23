@@ -18,6 +18,44 @@ class FakeTokenizer:
         return "".join(chr(int(token_id)) for token_id in token_ids)
 
 
+def test_scbench_quality_defaults_to_standard_context_length():
+    manifest = load_manifest()
+
+    assert manifest["scbench"]["max_seq_length"] == 131_072
+    assert runner.DEFAULT_MAX_SEQ_LENGTH == 131_072
+
+
+def test_cache_trace_accepts_hit_beyond_planned_session_prefix():
+    accounting = runner.cache_reuse_accounting(
+        cached_tokens=16,
+        planned_session_eligible_tokens=0,
+    )
+
+    assert accounting == {
+        "planned_session_prefix_covered_tokens": 0,
+        "cached_tokens_beyond_planned_session_prefix": 16,
+        "cache_hit_scope": "beyond_planned_session_prefix",
+    }
+    assert (
+        runner.BatchedSparseVLLMGenerator.trace_metric_error(
+            cached_tokens=16,
+            cached_blocks=1,
+            max_usable_tokens=16,
+            block_size=16,
+        )
+        == ""
+    )
+
+
+def test_cache_trace_rejects_hit_beyond_prompt_usable_prefix():
+    assert runner.BatchedSparseVLLMGenerator.trace_metric_error(
+        cached_tokens=32,
+        cached_blocks=2,
+        max_usable_tokens=16,
+        block_size=16,
+    ) == "cached_tokens=32 exceeds max_usable_cache_tokens=16."
+
+
 def test_method_runtime_config_enables_prefix_cache_and_aligns_quest_blocks():
     manifest = load_manifest()
 
@@ -216,11 +254,13 @@ def test_prefix_summary_reports_cache_reuse(tmp_path):
             "prompt_tokens": 64,
             "generated_tokens": 4,
             "eligible_cache_tokens": 0,
-            "cached_tokens": 0,
-            "cached_blocks": 0,
+            "cached_tokens": 16,
+            "cached_blocks": 1,
+            "planned_session_prefix_covered_tokens": 999,
+            "cached_tokens_beyond_planned_session_prefix": 0,
             "latency_s": 2.0,
             "prefix_cache_stats_before": {"prefix_cache_hit_tokens": 0},
-            "prefix_cache_stats_after": {"prefix_cache_hit_tokens": 0},
+            "prefix_cache_stats_after": {"prefix_cache_hit_tokens": 16},
         },
         {
             "status": "success",
@@ -230,8 +270,8 @@ def test_prefix_summary_reports_cache_reuse(tmp_path):
             "cached_tokens": 64,
             "cached_blocks": 4,
             "latency_s": 1.0,
-            "prefix_cache_stats_before": {"prefix_cache_hit_tokens": 0},
-            "prefix_cache_stats_after": {"prefix_cache_hit_tokens": 64},
+            "prefix_cache_stats_before": {"prefix_cache_hit_tokens": 16},
+            "prefix_cache_stats_after": {"prefix_cache_hit_tokens": 80},
         },
     ]
     trace_path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
@@ -240,8 +280,13 @@ def test_prefix_summary_reports_cache_reuse(tmp_path):
 
     assert summary["status"] == "success"
     assert summary["request_count"] == 2
-    assert summary["hit_requests"] == 1
-    assert summary["total_cached_tokens"] == 64
-    assert summary["total_cached_blocks"] == 4
+    assert summary["hit_requests"] == 2
+    assert summary["total_cached_tokens"] == 80
+    assert summary["total_cached_blocks"] == 5
+    assert summary["total_planned_session_eligible_cache_tokens"] == 64
+    assert summary["total_planned_session_prefix_covered_tokens"] == 64
+    assert summary["total_cached_tokens_beyond_planned_session_prefix"] == 16
+    assert summary["beyond_planned_session_prefix_hit_requests"] == 1
     assert summary["eligible_cache_hit_rate"] == 1.0
+    assert summary["planned_session_prefix_coverage_rate"] == 1.0
     assert json.loads(summary_path.read_text(encoding="utf-8")) == summary

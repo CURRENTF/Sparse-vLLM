@@ -1764,7 +1764,11 @@ def _hf_infer_config(args: argparse.Namespace, method: str, prompt_len: int) -> 
     if method == "quest":
         return {
             "sparse_method": "quest",
-            "decode_keep_tokens": int(args.quest_token_budget),
+            "decode_keep_tokens": (
+                int(args.sink_keep_tokens)
+                + int(args.decode_keep_tokens)
+                + int(args.recent_keep_tokens)
+            ),
             "chunk_size": int(args.quest_chunk_size),
         }
 
@@ -1853,7 +1857,6 @@ def _sparse_infer_config(args: argparse.Namespace, method: str) -> dict[str, Any
                 "sink_keep_tokens": int(args.sink_keep_tokens),
                 "recent_keep_tokens": int(args.recent_keep_tokens),
                 "quest_chunk_size": int(args.quest_chunk_size),
-                "quest_token_budget": int(args.quest_token_budget),
                 "quest_skip_layers": int(args.quest_skip_layers),
             }
         )
@@ -3320,7 +3323,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pyramidkv_least_layer", type=int, default=None)
     parser.add_argument("--pyramidkv_least_ratio", type=float, default=0.01)
     parser.add_argument("--quest_chunk_size", type=int, default=16)
-    parser.add_argument("--quest_token_budget", type=int, default=1024)
     parser.add_argument("--quest_skip_layers", type=int, default=2)
     parser.add_argument("--full_attention_layers", default="0,1,2,4,7,14")
     parser.add_argument("--deltakv_center_ratio", type=float, default=0.1)

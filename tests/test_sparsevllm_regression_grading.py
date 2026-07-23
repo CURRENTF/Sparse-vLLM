@@ -64,6 +64,7 @@ class FakeCacheManager(CacheManager):
             hf_config=hf_config,
             max_model_len=10,
             max_num_seqs_in_batch=2,
+            max_num_seqs_in_gpu=2,
             num_kvcache_slots=16,
         )
         super().__init__(config, _single_process_parallel_context())
@@ -185,6 +186,59 @@ class SparseVLLMRegressionGradingTest(unittest.TestCase):
             "3,11,23,31,35,47,59",
         )
 
+    def test_manifest_decode_keep_tokens_follow_eviction_policy(self):
+        manifest = load_manifest()
+        static_eviction_methods = {
+            "streamingllm",
+            "snapkv",
+            "pyramidkv",
+            "rkv",
+            "skipkv",
+        }
+        dynamic_sparse_view_methods = {
+            "omnikv",
+            "quest",
+            "deltakv",
+            "deltakv-less-memory",
+            "deltakv-less-memory-cudagraph",
+        }
+        expected_decode_keep = {
+            **dict.fromkeys(static_eviction_methods, 4096),
+            **dict.fromkeys(dynamic_sparse_view_methods, 2048),
+        }
+        configured_methods = {
+            method_id
+            for method_id, method in manifest["methods"].items()
+            if "decode_keep_tokens" in method["config"]
+        }
+        self.assertEqual(configured_methods, set(expected_decode_keep))
+
+        for method_id, expected in expected_decode_keep.items():
+            method = manifest["methods"][method_id]
+            configs = [("config", method["config"])]
+            configs.extend(
+                (f"model_configs.{model_id}", override)
+                for model_id, override in (method.get("model_configs") or {}).items()
+            )
+            for config_name, config in configs:
+                if "decode_keep_tokens" not in config:
+                    continue
+                self.assertEqual(
+                    config["decode_keep_tokens"],
+                    expected,
+                    f"{method_id}.{config_name} does not match its eviction policy.",
+                )
+
+        quest = manifest["methods"]["quest"]["config"]
+        self.assertNotIn("quest_token_budget", quest)
+        self.assertGreater(
+            quest["decode_keep_tokens"]
+            + quest["sink_keep_tokens"]
+            + quest["recent_keep_tokens"],
+            0,
+        )
+        self.assertNotIn("quest_token_budget", manifest["stress_v2"])
+
     def test_omnikv_and_deltakv_full_layers_are_model_specific(self):
         manifest = load_manifest()
         model = {"model_path": "/tmp/model", "tokenizer_path": "/tmp/model"}
@@ -299,21 +353,18 @@ class SparseVLLMRegressionGradingTest(unittest.TestCase):
         self.assertEqual(grade.status, "failed")
         self.assertIn("below minimum", grade.reason)
 
-    def test_thinking_off_applies_chat_template_to_legacy_raw_prompt_tasks(self):
+    def test_legacy_raw_prompt_tasks_skip_chat_template(self):
         class QwenTokenizer:
             chat_template = "template"
 
             def apply_chat_template(self, messages, **kwargs):
-                self.messages = messages
-                self.kwargs = kwargs
-                return "templated<think>\n"
+                raise AssertionError("legacy raw-prompt tasks must not apply a chat template")
 
         tokenizer = QwenTokenizer()
 
         prompt = build_chat(tokenizer, "classify this", "trec", thinking_mode="off")
 
-        self.assertEqual(prompt, "templated<think>\n</think>\n")
-        self.assertFalse(tokenizer.kwargs["enable_thinking"])
+        self.assertEqual(prompt, "classify this")
         self.assertEqual(
             build_chat(tokenizer, "classify this", "trec", no_chat_template=True, thinking_mode="off"),
             "classify this",
