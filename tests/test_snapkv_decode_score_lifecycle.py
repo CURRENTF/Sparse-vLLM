@@ -9,7 +9,15 @@ from sparsevllm.engine.sparse_controller import SparseController
 from sparsevllm.utils.context import reset_context, set_context
 
 
-def make_controller(method="snapkv", *, layers=2, kv_len=6, graph=False, keep=2):
+def make_controller(
+    method="snapkv",
+    *,
+    layers=2,
+    kv_len=6,
+    graph=False,
+    graph_capacity=None,
+    keep=2,
+):
     layout = SimpleNamespace(
         kv_layer_index=lambda layer: int(layer),
         is_full_attention=lambda layer: 0 <= int(layer) < layers,
@@ -41,6 +49,10 @@ def make_controller(method="snapkv", *, layers=2, kv_len=6, graph=False, keep=2)
 
         def __init__(self):
             self.compactions = []
+            if graph:
+                self._decode_static_max_context_len = int(
+                    graph_capacity if graph_capacity is not None else kv_len
+                )
 
         def get_layer_batch_states(self, layer):
             del layer
@@ -100,19 +112,38 @@ class SnapKVDecodeScoreLifecycleTest(unittest.TestCase):
         torch.testing.assert_close(state.attn_score, torch.tensor([[6, 7, 8, 4, 5, 9]]).float())
 
     def test_graph_refs_are_2d_keepalive_has_one_raw_and_scores_before_trigger(self):
-        controller, _manager, seqs = make_controller(layers=1, kv_len=7, graph=True, keep=4)
+        controller, _manager, seqs = make_controller(
+            layers=1,
+            kv_len=7,
+            graph=True,
+            graph_capacity=16,
+            keep=4,
+        )
         self.assertEqual(controller._snapkv_decode_trigger_len(6), 8)
         self.assertTrue(controller._needs_attn_score(0, False, seqs))
         raw = controller.get_decode_selection(0, torch.empty((1, 2, 4))).attn_score
-        raw.fill_(3)
+        self.assertEqual(tuple(raw.shape), (1, 2, 16))
+        raw[:, :, :7].fill_(3)
         controller.on_layer_attention_end(0)
 
         runner = object.__new__(DecodeCudaGraphRunner)
         runner.sparse_controller = controller
         refs = runner._snapshot_sparse_state_refs()
         self.assertEqual(refs[0]["attn_score"].dim(), 2)
+        self.assertEqual(tuple(refs[0]["attn_score"].shape), (1, 16))
+        self.assertTrue(
+            torch.equal(
+                refs[0]["attn_score"][:, 7:],
+                torch.full((1, 9), -1e20),
+            )
+        )
         runner._reset_graph_input_attn_scores(refs)
-        self.assertTrue(torch.equal(refs[0]["attn_score"], torch.full((1, 7), -1e20)))
+        self.assertTrue(
+            torch.equal(
+                refs[0]["attn_score"],
+                torch.full((1, 16), -1e20),
+            )
+        )
         keepalive = controller.decode_cuda_graph_keepalive_tensors()
         self.assertEqual(sum(tensor.dim() == 3 for tensor in keepalive), 1)
         self.assertEqual(sum(tensor.dim() == 2 for tensor in keepalive), 1)

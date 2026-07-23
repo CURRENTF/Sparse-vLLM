@@ -13,9 +13,12 @@ import subprocess
 import sys
 import time
 from collections import Counter
+from concurrent.futures import Executor
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from dataclasses import dataclass
 from datetime import datetime
+from functools import partial
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError
@@ -267,7 +270,7 @@ def validate_config(config: BenchmarkConfig) -> None:
     subagent_methods = {_canonical_method(item) for item in config.subagent_methods}
     main_agent_methods = {_canonical_method(item) for item in config.main_agent_methods}
     overlap = sorted(subagent_methods & main_agent_methods)
-    if overlap:
+    if config.require_router and overlap:
         raise ValueError(
             "Subagent and main-agent methods must be disjoint for this non-uniform "
             f"benchmark; overlap={overlap}."
@@ -360,13 +363,18 @@ async def post_json(
     url: str,
     payload: dict[str, Any],
     timeout_s: float,
+    *,
+    executor: Executor | None = None,
 ) -> HttpResponse:
-    return await asyncio.to_thread(
+    request = partial(
         _request_bytes,
         url,
         payload=payload,
         timeout_s=timeout_s,
     )
+    if executor is None:
+        return await asyncio.to_thread(request)
+    return await asyncio.get_running_loop().run_in_executor(executor, request)
 
 
 def _decode_json(response: HttpResponse, label: str) -> dict[str, Any]:
@@ -536,15 +544,21 @@ async def run_request(
         )
         http_status = response.status
         response_headers = response.headers
-        try:
-            response_body = json.loads(response.body.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            status = "parse_failed"
-            error = f"Invalid JSON response: {exc}"
-            response_body = response.body.decode("utf-8", errors="replace")
-        if status == "success" and response.status >= 400:
+        response_text = response.body.decode("utf-8", errors="replace")
+        if response.status >= 400:
+            try:
+                response_body = json.loads(response_text)
+            except json.JSONDecodeError:
+                response_body = response_text
             status = "model_failed"
             error = f"HTTP {response.status}: {response_body}"
+        else:
+            try:
+                response_body = json.loads(response.body.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                status = "parse_failed"
+                error = f"Invalid JSON response: {exc}"
+                response_body = response_text
         if status == "success":
             if not isinstance(response_body, dict):
                 status = "parse_failed"
@@ -561,9 +575,19 @@ async def run_request(
                     status = "parse_failed"
                     error = "Completion response is missing one choice or usage."
                 else:
-                    parsed_text = choices[0].get("text")
-                    finish_reason = choices[0].get("finish_reason")
-                    usage = dict(usage_value)
+                    choice = choices[0]
+                    text_value = choice.get("text")
+                    finish_reason_value = choice.get("finish_reason")
+                    if not isinstance(text_value, str):
+                        status = "parse_failed"
+                        error = "Completion choice text must be a string."
+                    elif not isinstance(finish_reason_value, str):
+                        status = "parse_failed"
+                        error = "Completion choice finish_reason must be a string."
+                    else:
+                        parsed_text = text_value
+                        finish_reason = finish_reason_value
+                        usage = dict(usage_value)
         route = _route_values(response_headers)
         if status == "success" and config.require_router:
             missing_headers = [
@@ -902,13 +926,12 @@ def _aggregate_metrics(
     }
 
 
-async def run_benchmark(
+async def _run_benchmark_impl(
     config: BenchmarkConfig,
     *,
     get_fn=get_json,
     post_fn=post_json,
 ) -> dict[str, Any]:
-    validate_config(config)
     records: list[dict[str, Any]] = []
     round_rows: list[dict[str, Any]] = []
     preflight_info: dict[str, Any] | None = None
@@ -1212,6 +1235,32 @@ async def run_benchmark(
             f"status={aggregate_status}: {run_error}"
         )
     return aggregate
+
+
+async def run_benchmark(
+    config: BenchmarkConfig,
+    *,
+    get_fn=get_json,
+    post_fn=post_json,
+) -> dict[str, Any]:
+    validate_config(config)
+    if post_fn is not post_json:
+        return await _run_benchmark_impl(
+            config,
+            get_fn=get_fn,
+            post_fn=post_fn,
+        )
+
+    with ThreadPoolExecutor(
+        max_workers=config.articles_per_round,
+        thread_name_prefix="simulated-deep-research",
+    ) as executor:
+        sized_post_fn = partial(post_json, executor=executor)
+        return await _run_benchmark_impl(
+            config,
+            get_fn=get_fn,
+            post_fn=sized_post_fn,
+        )
 
 
 def build_arg_parser() -> argparse.ArgumentParser:

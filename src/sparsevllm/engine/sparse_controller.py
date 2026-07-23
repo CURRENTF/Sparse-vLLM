@@ -296,6 +296,7 @@ class SparseController:
                             device=self.device,
                         )
                     elif self.sparse_method in ("snapkv", "pyramidkv"):
+                        max_len = self._snapkv_decode_score_width(state)
                         state.attn_score = self._prepare_snapkv_decode_score_buffers(
                             i,
                             batch_size,
@@ -425,6 +426,22 @@ class SparseController:
         view.fill_(fill_value)
         return view
 
+    def _snapkv_decode_score_width(self, state: LayerBatchSparseState) -> int:
+        max_len = self._state_max_context_len(state)
+        if not bool(getattr(self.config, "decode_cuda_graph", False)):
+            return max_len
+        graph_capacity = getattr(
+            self.cache_manager,
+            "_decode_static_max_context_len",
+            None,
+        )
+        if graph_capacity is None or int(graph_capacity) < max_len:
+            raise RuntimeError(
+                "SnapKV decode CUDA graph requires a score capacity covering the "
+                f"current context: graph_capacity={graph_capacity} current={max_len}."
+            )
+        return int(graph_capacity)
+
     def _prepare_snapkv_decode_layer_score(self, layer_idx: int) -> torch.Tensor:
         """Reset and expose the shared raw workspace immediately before one scored layer."""
         state = self.layer_batch_sparse_states[int(layer_idx)]
@@ -437,7 +454,7 @@ class SparseController:
             raise RuntimeError(f"SnapKV decode score requires context_lens: layer={layer_idx}.")
 
         batch_size = int(state.context_lens.numel())
-        max_len = self._state_max_context_len(state)
+        max_len = self._snapkv_decode_score_width(state)
         num_heads = self.config.hf_config.num_attention_heads // self.config.tensor_parallel_size
         self._validate_snapkv_score_tensor(
             reduced,

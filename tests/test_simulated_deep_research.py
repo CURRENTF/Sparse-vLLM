@@ -1,8 +1,10 @@
 import asyncio
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from benchmark.simulated_deep_research import run
 
@@ -207,6 +209,19 @@ class SimulatedDeepResearchTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "must be disjoint"):
                 run.validate_config(config)
 
+    def test_direct_server_allows_the_same_method_for_both_roles(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config(Path(tmp) / "run")
+            config = run.BenchmarkConfig(
+                **{
+                    **config.__dict__,
+                    "subagent_methods": ("vanilla",),
+                    "main_agent_methods": ("vanilla",),
+                    "require_router": False,
+                }
+            )
+            run.validate_config(config)
+
     def test_runs_parallel_subagents_and_writes_auditable_artifacts(self):
         with tempfile.TemporaryDirectory() as tmp:
             output_dir = Path(tmp) / "run"
@@ -351,6 +366,146 @@ class SimulatedDeepResearchTest(unittest.TestCase):
                 sum(row["status"] == "model_failed" for row in rows),
                 1,
             )
+
+    def test_non_json_http_error_is_model_failure(self):
+        async def fail_post(_url, _payload, _timeout_s):
+            return run.HttpResponse(
+                status=502,
+                headers={},
+                body=b"<html>bad gateway</html>",
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "run"
+            config = self._config(output_dir)
+            with self.assertRaisesRegex(run.BenchmarkFailed, "model_failed"):
+                asyncio.run(
+                    run.run_benchmark(
+                        config,
+                        get_fn=FakeService().get,
+                        post_fn=fail_post,
+                    )
+                )
+            aggregate = json.loads(
+                (output_dir / "aggregate_metrics.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(aggregate["status"], "model_failed")
+            self.assertEqual(aggregate["status_counts"]["model_failed"], 3)
+
+    def test_malformed_choice_text_is_parse_failure(self):
+        async def malformed_post(_url, payload, _timeout_s):
+            prompt_tokens = len(payload["prompt"])
+            completion_tokens = payload["max_tokens"]
+            return _json_response(
+                {
+                    "choices": [
+                        {
+                            "index": 0,
+                            "text": None,
+                            "finish_reason": "length",
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": completion_tokens,
+                        "total_tokens": prompt_tokens + completion_tokens,
+                    },
+                },
+                headers={
+                    "x-sparsevllm-worker": "http://snap-worker",
+                    "x-sparsevllm-route-reason": "test",
+                    "x-sparsevllm-sparse-method": "snapkv",
+                },
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "run"
+            config = self._config(output_dir)
+            with self.assertRaisesRegex(run.BenchmarkFailed, "parse_failed"):
+                asyncio.run(
+                    run.run_benchmark(
+                        config,
+                        get_fn=FakeService().get,
+                        post_fn=malformed_post,
+                    )
+                )
+            aggregate = json.loads(
+                (output_dir / "aggregate_metrics.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(aggregate["status"], "parse_failed")
+            self.assertEqual(aggregate["status_counts"]["parse_failed"], 3)
+
+    def test_default_http_executor_reaches_configured_concurrency(self):
+        concurrency = 40
+        barrier = threading.Barrier(concurrency)
+        lock = threading.Lock()
+        active = 0
+        max_active = 0
+
+        def fake_request(_url, *, payload, timeout_s):
+            nonlocal active, max_active
+            self.assertGreater(timeout_s, 0)
+            methods = payload["svllm_method_preference"].split(",")
+            if methods == ["snapkv"]:
+                with lock:
+                    active += 1
+                    max_active = max(max_active, active)
+                try:
+                    barrier.wait(timeout=5)
+                finally:
+                    with lock:
+                        active -= 1
+                worker = "http://snap-worker"
+                method = "snapkv"
+            else:
+                worker = "http://main-worker"
+                method = "omnikv"
+            prompt_tokens = len(payload["prompt"])
+            completion_tokens = payload["max_tokens"]
+            return _json_response(
+                {
+                    "choices": [
+                        {
+                            "index": 0,
+                            "text": "synthetic output",
+                            "finish_reason": "length",
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": completion_tokens,
+                        "total_tokens": prompt_tokens + completion_tokens,
+                    },
+                },
+                headers={
+                    "x-sparsevllm-worker": worker,
+                    "x-sparsevllm-route-reason": "test",
+                    "x-sparsevllm-sparse-method": method,
+                },
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config(Path(tmp) / "run")
+            config = run.BenchmarkConfig(
+                **{
+                    **config.__dict__,
+                    "rounds": 1,
+                    "articles_per_round": concurrency,
+                }
+            )
+            with patch.object(run, "_request_bytes", side_effect=fake_request):
+                aggregate = asyncio.run(
+                    run.run_benchmark(
+                        config,
+                        get_fn=FakeService().get,
+                    )
+                )
+            self.assertEqual(aggregate["status"], "success")
+            self.assertEqual(max_active, concurrency)
 
     def test_wrong_subagent_method_is_metric_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
