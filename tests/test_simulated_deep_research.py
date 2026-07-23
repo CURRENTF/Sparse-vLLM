@@ -60,6 +60,7 @@ class FakeService:
                     ],
                     "router_policy": {
                         "request_timeout_s": 900.0,
+                        "control_timeout_s": 5.0,
                         "overload_load_factor": 1.0,
                         "load_abs_threshold": 0,
                         "profiles": {},
@@ -71,6 +72,7 @@ class FakeService:
             return _json_response(
                 {
                     "served_model_name": "sim-model",
+                    "vocab_size": 32_000,
                     "sparse_method": method,
                     "benchmark_config": {
                         "gpu_memory_utilization": 0.9,
@@ -724,6 +726,7 @@ class SimulatedDeepResearchTest(unittest.TestCase):
                 return _json_response(
                     {
                         "served_model_name": "sim-model",
+                        "vocab_size": 32_000,
                         "benchmark_config": {},
                     }
                 )
@@ -733,6 +736,7 @@ class SimulatedDeepResearchTest(unittest.TestCase):
                     "healthy_workers": ["http://only-worker"],
                     "router_policy": {
                         "request_timeout_s": 900.0,
+                        "control_timeout_s": 5.0,
                         "overload_load_factor": 1.0,
                         "load_abs_threshold": 0,
                         "profiles": {},
@@ -771,6 +775,7 @@ class SimulatedDeepResearchTest(unittest.TestCase):
                 return _json_response(
                     {
                         "served_model_name": "other-model",
+                        "vocab_size": 32_000,
                         "benchmark_config": {},
                     }
                 )
@@ -827,6 +832,25 @@ class SimulatedDeepResearchTest(unittest.TestCase):
             ):
                 asyncio.run(
                     run.preflight(config, get_fn=snapkv_only_get)
+                )
+
+    def test_preflight_rejects_synthetic_ids_outside_vocab(self):
+        service = FakeService()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config(Path(tmp) / "run")
+            config = run.BenchmarkConfig(
+                **{
+                    **config.__dict__,
+                    "synthetic_token_id_high": 32_000,
+                }
+            )
+            with self.assertRaisesRegex(
+                ValueError,
+                "Synthetic token range exceeds",
+            ):
+                asyncio.run(
+                    run.preflight(config, get_fn=service.get)
                 )
 
     def test_git_dirty_is_unknown_when_probe_fails(self):

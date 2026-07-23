@@ -15,7 +15,10 @@ class WorkerInfoTest(unittest.TestCase):
         engine = object.__new__(LLMEngine)
         engine.config = SimpleNamespace(
             model="model",
-            hf_config=SimpleNamespace(model_type="test"),
+            hf_config=SimpleNamespace(
+                model_type="test",
+                vocab_size=32_000,
+            ),
             vllm_sparse_method="snapkv",
             pool_kernel_size=7,
             sparse_attn_score_dtype="float16",
@@ -28,6 +31,7 @@ class WorkerInfoTest(unittest.TestCase):
             benchmark_config["sparse_attn_score_dtype"],
             "float16",
         )
+        self.assertEqual(engine.worker_info()["vocab_size"], 32_000)
 
 
 def make_controller(

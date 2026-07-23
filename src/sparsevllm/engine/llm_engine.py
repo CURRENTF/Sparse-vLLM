@@ -621,6 +621,9 @@ class LLMEngine:
             "served_model_name": served_model_name or str(config.model),
             "model": str(config.model),
             "model_type": str(getattr(config.hf_config, "model_type", "")),
+            "vocab_size": int(
+                getattr(config.hf_config, "vocab_size", 0) or 0
+            ),
             "sparse_method": str(getattr(config, "vllm_sparse_method", "") or ""),
             "world_size": int(getattr(config, "world_size", 1)),
             "tensor_parallel_size": int(getattr(config, "tensor_parallel_size", 1)),

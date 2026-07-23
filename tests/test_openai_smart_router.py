@@ -25,9 +25,11 @@ class OpenAISmartRouterTest(unittest.TestCase):
         )
         ready = False
         urls = []
+        timeouts = []
 
-        def get_json(url, _timeout):
+        def get_json(url, timeout):
             urls.append(url)
+            timeouts.append(timeout)
             if not ready:
                 raise RuntimeError("worker not ready")
             return {"served_model_name": "model", "max_model_len": 262144}
@@ -41,6 +43,7 @@ class OpenAISmartRouterTest(unittest.TestCase):
         self.assertTrue(router.workers[0].healthy)
         self.assertEqual(router.workers[0].info["served_model_name"], "model")
         self.assertEqual(urls, ["http://worker-a/v1/worker/info"] * 2)
+        self.assertEqual(timeouts, [5.0, 5.0])
 
     def test_router_health_returns_503_without_ready_workers(self):
         from sparsevllm.entrypoints.openai import smart_router
@@ -57,6 +60,7 @@ class OpenAISmartRouterTest(unittest.TestCase):
             json.loads(response.body)["router_policy"],
             {
                 "request_timeout_s": 30.0,
+                "control_timeout_s": 5.0,
                 "overload_load_factor": 1.5,
                 "load_abs_threshold": 1,
                 "profiles": {},

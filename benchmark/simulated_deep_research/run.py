@@ -487,6 +487,7 @@ async def preflight(
             )
         required_policy_fields = {
             "request_timeout_s",
+            "control_timeout_s",
             "overload_load_factor",
             "load_abs_threshold",
             "profiles",
@@ -517,6 +518,15 @@ async def preflight(
                 f"timeout by at least {config.router_timeout_margin_s}s: "
                 f"router={router_timeout}s "
                 f"benchmark={config.request_timeout_s}s."
+            )
+        control_timeout = router_policy["control_timeout_s"]
+        if (
+            isinstance(control_timeout, bool)
+            or not isinstance(control_timeout, (int, float))
+            or control_timeout <= 0
+        ):
+            raise PreflightParseError(
+                "Router policy control_timeout_s must be positive."
             )
         overload_load_factor = router_policy["overload_load_factor"]
         if (
@@ -600,6 +610,22 @@ async def preflight(
             raise PreflightParseError(
                 "Worker info response is missing benchmark_config: "
                 f"worker={worker['url']}."
+            )
+        vocab_size = info.get("vocab_size")
+        if (
+            isinstance(vocab_size, bool)
+            or not isinstance(vocab_size, int)
+            or vocab_size <= 0
+        ):
+            raise PreflightParseError(
+                "Worker info response is missing a positive integer "
+                f"vocab_size: worker={worker['url']}."
+            )
+        if config.synthetic_token_id_high >= vocab_size:
+            raise ValueError(
+                "Synthetic token range exceeds a worker vocabulary: "
+                f"worker={worker['url']} high={config.synthetic_token_id_high} "
+                f"vocab_size={vocab_size}."
             )
         if str(info.get("served_model_name")) != config.model:
             raise ValueError(

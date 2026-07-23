@@ -86,6 +86,7 @@ def create_app(
     worker_urls: list[str],
     *,
     request_timeout_s: float = 30.0,
+    control_timeout_s: float = 5.0,
     overload_load_factor: float = 1.5,
     load_abs_threshold: int = 1,
     profiles: dict[str, Any] | None = None,
@@ -94,6 +95,7 @@ def create_app(
     router = SmartRouter(
         worker_urls=worker_urls,
         request_timeout_s=request_timeout_s,
+        control_timeout_s=control_timeout_s,
         overload_load_factor=overload_load_factor,
         load_abs_threshold=load_abs_threshold,
         profiles=profiles or {},
@@ -212,6 +214,7 @@ class SmartRouter:
         *,
         worker_urls: list[str],
         request_timeout_s: float,
+        control_timeout_s: float = 5.0,
         overload_load_factor: float,
         load_abs_threshold: int,
         profiles: dict[str, Any],
@@ -224,6 +227,9 @@ class SmartRouter:
             for url in worker_urls
         ]
         self.request_timeout_s = float(request_timeout_s)
+        self.control_timeout_s = float(control_timeout_s)
+        if self.request_timeout_s <= 0 or self.control_timeout_s <= 0:
+            raise ValueError("Router request and control timeouts must be positive.")
         self.overload_load_factor = float(overload_load_factor)
         self.load_abs_threshold = int(load_abs_threshold)
         self.profiles = profiles
@@ -234,6 +240,7 @@ class SmartRouter:
     def policy_info(self) -> dict[str, Any]:
         return {
             "request_timeout_s": self.request_timeout_s,
+            "control_timeout_s": self.control_timeout_s,
             "overload_load_factor": self.overload_load_factor,
             "load_abs_threshold": self.load_abs_threshold,
             "profiles": self.profiles,
@@ -245,7 +252,7 @@ class SmartRouter:
                 asyncio.to_thread(
                     _get_json,
                     f"{worker.url}/v1/worker/info",
-                    self.request_timeout_s,
+                    self.control_timeout_s,
                 )
                 for worker in self.workers
             ],
@@ -377,14 +384,23 @@ class SmartRouter:
         worker: WorkerState,
         match_payload: dict[str, Any] | None,
     ) -> WorkerProbe:
-        load_task = asyncio.to_thread(_get_json, f"{worker.url}/v1/worker/load", self.request_timeout_s)
+        load_task = asyncio.to_thread(
+            _get_json,
+            f"{worker.url}/v1/worker/load",
+            self.control_timeout_s,
+        )
         if match_payload is None:
             load = await load_task
             match = {"supported": False, "enabled": False, "matched_tokens": 0, "match_ratio": 0.0}
         else:
             load, match = await asyncio.gather(
                 load_task,
-                asyncio.to_thread(_post_json, f"{worker.url}/v1/prefix_cache/match", match_payload, self.request_timeout_s),
+                asyncio.to_thread(
+                    _post_json,
+                    f"{worker.url}/v1/prefix_cache/match",
+                    match_payload,
+                    self.control_timeout_s,
+                ),
             )
         return WorkerProbe(worker=worker, load=dict(load), match=dict(match))
 
@@ -811,6 +827,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--request-timeout-s", type=float, default=30.0)
+    parser.add_argument("--control-timeout-s", type=float, default=5.0)
     parser.add_argument("--overload-load-factor", type=float, default=1.5)
     parser.add_argument("--load-abs-threshold", type=int, default=1)
     parser.add_argument("--profiles-json", default=None, help="Inline JSON or a JSON file path for route profiles.")
@@ -826,6 +843,7 @@ def main(argv: list[str] | None = None):
     app = create_app(
         worker_urls,
         request_timeout_s=args.request_timeout_s,
+        control_timeout_s=args.control_timeout_s,
         overload_load_factor=args.overload_load_factor,
         load_abs_threshold=args.load_abs_threshold,
         profiles=_load_profiles(args.profiles_json),

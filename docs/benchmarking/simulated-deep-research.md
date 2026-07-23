@@ -65,7 +65,8 @@ python -m benchmark.simulated_deep_research.run \
 The client timeout must exceed the router's upstream timeout by at least
 `--router-timeout-margin-s`. The defaults use a 930-second client timeout, a
 30-second margin, and `SPARSEVLLM_ROUTER_REQUEST_TIMEOUT_S=900` for the
-systemd router.
+systemd router. Keep the separate router control-plane timeout short; its
+default is 5 seconds.
 The router must have workers whose advertised methods satisfy
 `--subagent-methods snapkv` and `--main-agent-methods omnikv,vanilla`.
 For the default profile, configure every routed worker with
