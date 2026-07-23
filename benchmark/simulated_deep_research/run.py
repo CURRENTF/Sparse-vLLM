@@ -286,7 +286,7 @@ def validate_config(config: BenchmarkConfig) -> None:
         raise ValueError("Router runs must require at least two healthy workers.")
 
 
-def required_model_len(config: BenchmarkConfig) -> int:
+def required_model_len_by_role(config: BenchmarkConfig) -> dict[str, int]:
     max_article_tokens = _max_bucket_tokens(config.article_token_buckets)
     max_subagent_output_tokens = _max_bucket_tokens(
         config.subagent_output_token_buckets
@@ -308,7 +308,49 @@ def required_model_len(config: BenchmarkConfig) -> int:
         + config.final_overhead_tokens
         + config.max_final_output_tokens
     )
-    return max(max_subagent, max_round_summary, max_final_summary)
+    return {
+        "subagent": max_subagent,
+        "main agent": max(max_round_summary, max_final_summary),
+    }
+
+
+def required_model_len(config: BenchmarkConfig) -> int:
+    return max(required_model_len_by_role(config).values())
+
+
+def _validate_code_revision(value: Any, label: str) -> None:
+    if not isinstance(value, dict):
+        raise PreflightParseError(f"{label} is missing code_revision metadata.")
+    required_fields = {
+        "git_commit",
+        "git_branch",
+        "git_dirty",
+        "package_version",
+    }
+    missing = sorted(required_fields - value.keys())
+    if missing:
+        raise PreflightParseError(
+            f"{label} code_revision is missing fields: {missing}."
+        )
+    git_commit = value["git_commit"]
+    package_version = value["package_version"]
+    if git_commit is not None and not isinstance(git_commit, str):
+        raise PreflightParseError(
+            f"{label} code_revision.git_commit must be a string or null."
+        )
+    if package_version is not None and not isinstance(package_version, str):
+        raise PreflightParseError(
+            f"{label} code_revision.package_version must be a string or null."
+        )
+    if not git_commit and not package_version:
+        raise PreflightParseError(
+            f"{label} code revision has neither a Git commit nor package version."
+        )
+    git_dirty = value["git_dirty"]
+    if git_dirty is not None and not isinstance(git_dirty, bool):
+        raise PreflightParseError(
+            f"{label} code_revision.git_dirty must be boolean or null."
+        )
 
 
 def _health_url(base_url: str) -> str:
@@ -443,25 +485,26 @@ async def preflight(
             f"Model {config.model!r} is not served; available models={available}."
         )
     max_model_len_value = model_card.get("max_model_len")
-    if (
-        isinstance(max_model_len_value, bool)
-        or not isinstance(max_model_len_value, int)
-    ):
-        raise PreflightParseError(
-            "The selected model card max_model_len must be an integer."
-        )
-    max_model_len = max_model_len_value
     required_len = required_model_len(config)
-    if max_model_len <= 0:
-        raise ValueError(
-            "The selected model does not advertise max_model_len; the synthetic "
-            "workload cannot be validated safely."
-        )
-    if required_len > max_model_len:
-        raise ValueError(
-            f"Workload requires max_model_len>={required_len}, but the router "
-            f"advertises {max_model_len}."
-        )
+    required_lens_by_role = required_model_len_by_role(config)
+    if not config.require_router:
+        if (
+            isinstance(max_model_len_value, bool)
+            or not isinstance(max_model_len_value, int)
+        ):
+            raise PreflightParseError(
+                "The selected model card max_model_len must be an integer."
+            )
+        if max_model_len_value <= 0:
+            raise ValueError(
+                "The selected model does not advertise max_model_len; the "
+                "synthetic workload cannot be validated safely."
+            )
+        if required_len > max_model_len_value:
+            raise ValueError(
+                f"Workload requires max_model_len>={required_len}, but the "
+                f"server advertises {max_model_len_value}."
+            )
     healthy_workers = health.get("healthy_workers")
     if config.require_router:
         if model_card.get("owned_by") != "sparsevllm-router":
@@ -491,6 +534,7 @@ async def preflight(
             "overload_load_factor",
             "load_abs_threshold",
             "profiles",
+            "code_revision",
         }
         missing_policy_fields = sorted(
             required_policy_fields - router_policy.keys()
@@ -551,6 +595,10 @@ async def preflight(
             raise PreflightParseError(
                 "Router policy profiles must be an object."
             )
+        _validate_code_revision(
+            router_policy["code_revision"],
+            "Router policy",
+        )
         worker_responses = await asyncio.gather(
             *[
                 get_fn(
@@ -611,6 +659,16 @@ async def preflight(
                 "Worker info response is missing benchmark_config: "
                 f"worker={worker['url']}."
             )
+        max_worker_len = info.get("max_model_len")
+        if (
+            isinstance(max_worker_len, bool)
+            or not isinstance(max_worker_len, int)
+            or max_worker_len <= 0
+        ):
+            raise PreflightParseError(
+                "Worker info response is missing a positive integer "
+                f"max_model_len: worker={worker['url']}."
+            )
         vocab_size = info.get("vocab_size")
         if (
             isinstance(vocab_size, bool)
@@ -621,12 +679,10 @@ async def preflight(
                 "Worker info response is missing a positive integer "
                 f"vocab_size: worker={worker['url']}."
             )
-        if config.synthetic_token_id_high >= vocab_size:
-            raise ValueError(
-                "Synthetic token range exceeds a worker vocabulary: "
-                f"worker={worker['url']} high={config.synthetic_token_id_high} "
-                f"vocab_size={vocab_size}."
-            )
+        _validate_code_revision(
+            info.get("code_revision"),
+            f"Worker {worker['url']}",
+        )
         if str(info.get("served_model_name")) != config.model:
             raise ValueError(
                 "Worker serves a different model: "
@@ -635,27 +691,91 @@ async def preflight(
                 f"expected={config.model!r}."
             )
     if config.require_router:
-        advertised_methods = {
-            _canonical_method(worker["info"]["sparse_method"])
-            for worker in workers
-        }
+        advertised_methods = sorted(
+            {
+                _canonical_method(worker["info"]["sparse_method"])
+                for worker in workers
+            }
+        )
         for role, preferences in (
             ("subagent", config.subagent_methods),
             ("main agent", config.main_agent_methods),
         ):
-            if not any(
-                _canonical_method(method) in advertised_methods
+            preferred_methods = {
+                _canonical_method(method)
                 for method in preferences
-            ):
+            }
+            eligible_workers = [
+                worker
+                for worker in workers
+                if _canonical_method(worker["info"]["sparse_method"])
+                in preferred_methods
+            ]
+            if not eligible_workers:
                 raise ValueError(
                     f"No healthy worker for model {config.model!r} matches "
                     f"the configured {role} methods {list(preferences)}; "
-                    f"advertised methods={sorted(advertised_methods)}."
+                    f"advertised methods={advertised_methods}."
                 )
+            required_role_len = required_lens_by_role[role]
+            too_short = [
+                {
+                    "url": worker["url"],
+                    "method": _canonical_method(
+                        worker["info"]["sparse_method"]
+                    ),
+                    "max_model_len": worker["info"]["max_model_len"],
+                }
+                for worker in eligible_workers
+                if worker["info"]["max_model_len"] < required_role_len
+            ]
+            if too_short:
+                raise ValueError(
+                    f"{role} workers cannot serve the required model length "
+                    f"{required_role_len}: {too_short}."
+                )
+            too_small_vocab = [
+                {
+                    "url": worker["url"],
+                    "method": _canonical_method(
+                        worker["info"]["sparse_method"]
+                    ),
+                    "vocab_size": worker["info"]["vocab_size"],
+                }
+                for worker in eligible_workers
+                if config.synthetic_token_id_high
+                >= worker["info"]["vocab_size"]
+            ]
+            if too_small_vocab:
+                raise ValueError(
+                    "Synthetic token range exceeds an eligible worker "
+                    f"vocabulary: high={config.synthetic_token_id_high} "
+                    f"workers={too_small_vocab}."
+                )
+            if role == "main agent":
+                without_prefix_cache = [
+                    worker["url"]
+                    for worker in eligible_workers
+                    if worker["info"].get("prefix_cache_enabled") is not True
+                ]
+                if without_prefix_cache:
+                    raise ValueError(
+                        "All eligible main-agent workers must enable prefix "
+                        f"caching: workers={without_prefix_cache}."
+                    )
+    else:
+        worker = workers[0]
+        if config.synthetic_token_id_high >= worker["info"]["vocab_size"]:
+            raise ValueError(
+                "Synthetic token range exceeds the direct worker vocabulary: "
+                f"high={config.synthetic_token_id_high} "
+                f"vocab_size={worker['info']['vocab_size']}."
+            )
     return {
         "health": health,
         "model_card": model_card,
         "required_model_len": required_len,
+        "required_model_len_by_role": required_lens_by_role,
         "workers": workers,
     }
 
@@ -917,6 +1037,23 @@ async def run_request(
     return result
 
 
+def _failure_status(records: list[dict[str, Any]]) -> str | None:
+    return next(
+        (
+            status
+            for status in (
+                "model_failed",
+                "parse_failed",
+                "metric_failed",
+                "invalid_input",
+                "skipped_by_policy",
+            )
+            if any(record["status"] == status for record in records)
+        ),
+        None,
+    )
+
+
 def _require_success(records: list[dict[str, Any]], label: str) -> None:
     failed = [record for record in records if record["status"] != "success"]
     if failed:
@@ -928,17 +1065,9 @@ def _require_success(records: list[dict[str, Any]], label: str) -> None:
             }
             for record in failed
         ]
-        failure_status = next(
-            status
-            for status in (
-                "model_failed",
-                "parse_failed",
-                "metric_failed",
-                "invalid_input",
-                "skipped_by_policy",
-            )
-            if any(record["status"] == status for record in failed)
-        )
+        failure_status = _failure_status(failed)
+        if failure_status is None:
+            raise AssertionError(f"Unknown failure statuses: {failures}")
         raise BenchmarkFailed(
             failure_status,
             f"{label} failed: {failures}",
@@ -1261,6 +1390,20 @@ async def _run_benchmark_impl(
                 )
                 barrier_s = time.perf_counter() - barrier_started
                 records.extend(subagent_results)
+                subagent_failure = _failure_status(subagent_results)
+                round_rows.append(
+                    {
+                        "round_index": round_index,
+                        "status": subagent_failure or "model_failed",
+                        "subagent_requests": len(subagent_results),
+                        "subagent_successful_requests": sum(
+                            record["status"] == "success"
+                            for record in subagent_results
+                        ),
+                        "subagent_barrier_s": barrier_s,
+                        "round_elapsed_s": time.perf_counter() - round_started,
+                    }
+                )
                 _require_success(
                     subagent_results,
                     f"Round {round_index} subagents",
@@ -1319,6 +1462,15 @@ async def _run_benchmark_impl(
                     post_fn=post_fn,
                 )
                 records.append(main_result)
+                round_rows[-1].update(
+                    {
+                        "status": main_result["status"],
+                        "main_agent_latency_s": main_result["latency_s"],
+                        "round_elapsed_s": (
+                            time.perf_counter() - round_started
+                        ),
+                    }
+                )
                 _require_success([main_result], f"Round {round_index} main agent")
                 previous_main_prompt = main_prompt
                 round_summary_segments.append(
@@ -1340,6 +1492,9 @@ async def _run_benchmark_impl(
                     "round_index": round_index,
                     "status": "success",
                     "subagent_requests": len(subagent_results),
+                    "subagent_successful_requests": len(
+                        subagent_results
+                    ),
                     "subagent_prompt_tokens": sum(
                         int(record["actual_prompt_tokens"])
                         for record in subagent_results
@@ -1371,8 +1526,7 @@ async def _run_benchmark_impl(
                     "main_agent_latency_s": main_result["latency_s"],
                     "round_elapsed_s": time.perf_counter() - round_started,
                 }
-                round_rows.append(round_row)
-                writer.write_jsonl("round_metrics", round_row)
+                round_rows[-1] = round_row
 
             final_overhead_segment = tuple(
                 synthetic_token_ids(
@@ -1445,6 +1599,8 @@ async def _run_benchmark_impl(
             else:
                 aggregate_status = "model_failed"
 
+        for round_row in round_rows:
+            writer.write_jsonl("round_metrics", round_row)
         finished = time.perf_counter()
         run_elapsed_s = finished - run_started
         elapsed_s = (

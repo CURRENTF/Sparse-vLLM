@@ -56,8 +56,10 @@ class OpenAISmartRouterTest(unittest.TestCase):
         response = asyncio.run(endpoint())
 
         self.assertEqual(response.status_code, 503)
+        policy = json.loads(response.body)["router_policy"]
+        revision = policy.pop("code_revision")
         self.assertEqual(
-            json.loads(response.body)["router_policy"],
+            policy,
             {
                 "request_timeout_s": 30.0,
                 "control_timeout_s": 5.0,
@@ -66,6 +68,7 @@ class OpenAISmartRouterTest(unittest.TestCase):
                 "profiles": {},
             },
         )
+        self.assertTrue(revision["git_commit"] or revision["package_version"])
 
     def test_router_livez_stays_available_without_ready_workers(self):
         from sparsevllm.entrypoints.openai import smart_router

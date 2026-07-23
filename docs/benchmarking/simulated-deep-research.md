@@ -38,7 +38,11 @@ The runner calls the smart router's `/v1/completions` endpoint.
 - Main-agent requests send
   `svllm_method_preference=omnikv,vanilla`.
 - The preflight requires at least two healthy workers for the selected model
-  and verifies that the advertised methods cover both agent roles.
+  and verifies that the advertised methods and context capacities cover both
+  agent roles. Same-model workers with unrelated methods do not constrain the
+  benchmark.
+- Every worker eligible for main-agent routing must have prefix caching
+  enabled.
 - Every response must include `X-SparseVLLM-Worker`,
   `X-SparseVLLM-Route-Reason`, and `X-SparseVLLM-Sparse-Method`.
 - A request routed to the wrong method is recorded as `metric_failed`, and the
@@ -47,9 +51,9 @@ The runner calls the smart router's `/v1/completions` endpoint.
 This contract requires separate workers because one worker advertises one
 sparse method. A typical deployment uses one GPU for the main-agent
 OmniKV/vanilla worker and another GPU for the SnapKV subagent worker. The
-main-agent worker should enable prefix caching because the workload
-deliberately reuses its growing prefix. The benchmark does not start or
-reconfigure those services.
+main-agent worker must enable prefix caching because the workload deliberately
+reuses its growing prefix; preflight rejects any eligible main-agent worker
+without it. The benchmark does not start or reconfigure those services.
 
 ## Run
 
@@ -69,8 +73,11 @@ systemd router. Keep the separate router control-plane timeout short; its
 default is 5 seconds.
 The router must have workers whose advertised methods satisfy
 `--subagent-methods snapkv` and `--main-agent-methods omnikv,vanilla`.
-For the default profile, configure every routed worker with
-`max_model_len >= 65564`; 69,632 leaves a small explicit margin.
+For the default profile, every eligible subagent worker needs
+`max_model_len >= 65564`, while every eligible main-agent worker needs
+`max_model_len >= 40368`. A larger shared limit such as 69,632 is also valid.
+The preflight reads these limits from each eligible worker instead of applying
+the router model card's cross-method minimum.
 
 The weighted distributions are configurable:
 
@@ -103,9 +110,10 @@ claimed as a non-uniform router run.
 Each output directory is created as a new directory; an existing directory is
 rejected. The run writes:
 
-- `run_info.json`: command, resolved workload, Git state, environment, router
-  health, model context limit, and benchmark-critical resolved configuration
-  reported by every worker.
+- `run_info.json`: command, resolved workload, client Git state, environment,
+  router health and code revision, role-specific context requirements, and
+  benchmark-critical configuration and code revision reported by every
+  worker.
 - `raw_outputs.jsonl`: raw HTTP responses and response headers.
 - `parsed_outputs.jsonl`: extracted text, finish reason, usage, and parse
   status.
@@ -113,7 +121,8 @@ rejected. The run writes:
   method preference, actual worker, actual method, expected reusable
   main-agent prefix tokens, and explicit status.
 - `round_metrics.jsonl`: barrier time, p50/p95/max subagent latency, straggler
-  gap, and main-agent latency for every completed round.
+  gap, main-agent latency, and explicit status for every attempted round,
+  including a round whose main-agent request fails.
 - `aggregate_metrics.json`: end-to-end research-job throughput, token
   throughput, latency percentiles, status counts, and route distributions.
 

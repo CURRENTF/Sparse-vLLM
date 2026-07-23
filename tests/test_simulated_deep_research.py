@@ -9,6 +9,14 @@ from unittest.mock import patch
 from benchmark.simulated_deep_research import run
 
 
+CODE_REVISION = {
+    "git_commit": "0123456789abcdef",
+    "git_branch": "test",
+    "git_dirty": False,
+    "package_version": None,
+}
+
+
 def _json_response(
     payload,
     *,
@@ -64,6 +72,7 @@ class FakeService:
                         "overload_load_factor": 1.0,
                         "load_abs_threshold": 0,
                         "profiles": {},
+                        "code_revision": CODE_REVISION,
                     },
                 }
             )
@@ -72,8 +81,11 @@ class FakeService:
             return _json_response(
                 {
                     "served_model_name": "sim-model",
+                    "max_model_len": 65_536,
                     "vocab_size": 32_000,
                     "sparse_method": method,
+                    "prefix_cache_enabled": method == "omnikv",
+                    "code_revision": CODE_REVISION,
                     "benchmark_config": {
                         "gpu_memory_utilization": 0.9,
                         "prefill_schedule_policy": "all_chunked",
@@ -388,6 +400,19 @@ class SimulatedDeepResearchTest(unittest.TestCase):
                 ],
                 900.0,
             )
+            self.assertEqual(
+                run_info["preflight"]["health"]["router_policy"][
+                    "code_revision"
+                ]["git_commit"],
+                CODE_REVISION["git_commit"],
+            )
+            self.assertTrue(
+                all(
+                    worker["info"]["code_revision"]["git_commit"]
+                    == CODE_REVISION["git_commit"]
+                    for worker in worker_configs
+                )
+            )
 
     def test_http_failure_is_recorded_before_run_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -422,6 +447,41 @@ class SimulatedDeepResearchTest(unittest.TestCase):
                 sum(row["status"] == "model_failed" for row in rows),
                 1,
             )
+
+    def test_main_failure_keeps_attempted_subagent_barrier_metrics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "run"
+            config = self._config(output_dir)
+            service = FakeService(fail_sample_number=4)
+
+            with self.assertRaisesRegex(run.BenchmarkFailed, "model_failed"):
+                asyncio.run(
+                    run.run_benchmark(
+                        config,
+                        get_fn=service.get,
+                        post_fn=service.post,
+                    )
+                )
+
+            aggregate = json.loads(
+                (output_dir / "aggregate_metrics.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(aggregate["successful_requests"], 3)
+            self.assertGreater(
+                aggregate["phase_metrics"]["subagent"]["elapsed_s"],
+                0.0,
+            )
+            round_rows = [
+                json.loads(line)
+                for line in (output_dir / "round_metrics.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            self.assertEqual(len(round_rows), 1)
+            self.assertEqual(round_rows[0]["status"], "model_failed")
+            self.assertGreater(round_rows[0]["subagent_barrier_s"], 0.0)
 
     def test_non_json_http_error_is_model_failure(self):
         async def fail_post(_url, _payload, _timeout_s):
@@ -726,7 +786,11 @@ class SimulatedDeepResearchTest(unittest.TestCase):
                 return _json_response(
                     {
                         "served_model_name": "sim-model",
+                        "max_model_len": 65_536,
                         "vocab_size": 32_000,
+                        "sparse_method": "snapkv",
+                        "prefix_cache_enabled": False,
+                        "code_revision": CODE_REVISION,
                         "benchmark_config": {},
                     }
                 )
@@ -740,6 +804,7 @@ class SimulatedDeepResearchTest(unittest.TestCase):
                         "overload_load_factor": 1.0,
                         "load_abs_threshold": 0,
                         "profiles": {},
+                        "code_revision": CODE_REVISION,
                     },
                 }
             )
@@ -792,6 +857,50 @@ class SimulatedDeepResearchTest(unittest.TestCase):
             ["http://snap-worker", "http://main-worker"],
         )
 
+    def test_preflight_ignores_unrelated_method_capacity_and_vocab(self):
+        service = FakeService()
+
+        async def heterogeneous_get(url, timeout_s):
+            if url.endswith("/models"):
+                response = await service.get(url, timeout_s)
+                payload = json.loads(response.body)
+                payload["data"][0]["max_model_len"] = 8
+                return _json_response(payload)
+            if url.endswith("/health"):
+                response = await service.get(url, timeout_s)
+                payload = json.loads(response.body)
+                payload["healthy_workers"].append("http://quest-worker")
+                return _json_response(payload)
+            if url == "http://quest-worker/v1/worker/info":
+                return _json_response(
+                    {
+                        "served_model_name": "sim-model",
+                        "max_model_len": 8,
+                        "vocab_size": 64,
+                        "sparse_method": "quest",
+                        "prefix_cache_enabled": False,
+                        "code_revision": CODE_REVISION,
+                        "benchmark_config": {},
+                    }
+                )
+            return await service.get(url, timeout_s)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config(Path(tmp) / "run")
+            preflight_info = asyncio.run(
+                run.preflight(config, get_fn=heterogeneous_get)
+            )
+
+        self.assertEqual(preflight_info["required_model_len"], 29)
+        self.assertEqual(
+            [worker["url"] for worker in preflight_info["workers"]],
+            [
+                "http://snap-worker",
+                "http://main-worker",
+                "http://quest-worker",
+            ],
+        )
+
     def test_preflight_rejects_insufficient_client_timeout_margin(self):
         service = FakeService()
 
@@ -832,6 +941,28 @@ class SimulatedDeepResearchTest(unittest.TestCase):
             ):
                 asyncio.run(
                     run.preflight(config, get_fn=snapkv_only_get)
+                )
+
+    def test_preflight_requires_prefix_cache_on_main_candidates(self):
+        service = FakeService()
+
+        async def no_prefix_cache_get(url, timeout_s):
+            response = await service.get(url, timeout_s)
+            if url == "http://main-worker/v1/worker/info":
+                payload = json.loads(response.body)
+                payload["prefix_cache_enabled"] = False
+                payload["benchmark_config"]["enable_prefix_caching"] = False
+                return _json_response(payload)
+            return response
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config(Path(tmp) / "run")
+            with self.assertRaisesRegex(
+                ValueError,
+                "must enable prefix caching",
+            ):
+                asyncio.run(
+                    run.preflight(config, get_fn=no_prefix_cache_get)
                 )
 
     def test_preflight_rejects_synthetic_ids_outside_vocab(self):

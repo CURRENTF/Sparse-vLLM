@@ -100,7 +100,6 @@ class SparseController:
         for i in range(self.num_layers):
             self.layer_batch_sparse_states[i] = LayerBatchSparseState()
         self._decode_attn_score_buffers: dict[int, torch.Tensor] = {}
-        self._snapkv_decode_raw_attn_score_buffer: torch.Tensor | None = None
         self._snapkv_decode_reduced_attn_score_buffers: dict[int, torch.Tensor] = {}
 
         # 静态配置
@@ -141,13 +140,10 @@ class SparseController:
 
     def clear_decode_attn_score_buffers(self):
         self._decode_attn_score_buffers.clear()
-        self._snapkv_decode_raw_attn_score_buffer = None
         self._snapkv_decode_reduced_attn_score_buffers.clear()
 
     def decode_cuda_graph_keepalive_tensors(self) -> list[torch.Tensor]:
         tensors = self.activation_controller.decode_cuda_graph_keepalive_tensors()
-        if self._snapkv_decode_raw_attn_score_buffer is not None:
-            tensors.append(self._snapkv_decode_raw_attn_score_buffer)
         tensors.extend(self._snapkv_decode_reduced_attn_score_buffers.values())
         return tensors
 
@@ -297,10 +293,9 @@ class SparseController:
                         )
                     elif self.sparse_method in ("snapkv", "pyramidkv"):
                         max_len = self._snapkv_decode_score_width(state)
-                        state.attn_score = self._prepare_snapkv_decode_score_buffers(
+                        state.attn_score = self._get_snapkv_decode_score_buffer(
                             i,
                             batch_size,
-                            num_heads,
                             max_len,
                             fill_value=_val,
                         )
@@ -365,52 +360,19 @@ class SparseController:
         view.fill_(fill_value)
         return view
 
-    def _validate_snapkv_score_tensor(
-        self,
-        tensor: torch.Tensor,
-        *,
-        name: str,
-        layer_idx: int,
-        shape: tuple[int, ...],
-    ):
-        if tuple(tensor.shape) != tuple(shape):
-            raise RuntimeError(
-                f"SnapKV decode {name} shape mismatch: layer={layer_idx} "
-                f"got={tuple(tensor.shape)} expected={tuple(shape)}."
-            )
-        if tensor.dtype != self.attn_score_dtype or tensor.device != self.device:
-            raise RuntimeError(
-                f"SnapKV decode {name} dtype/device mismatch: layer={layer_idx} "
-                f"got={tensor.dtype}/{tensor.device} "
-                f"expected={self.attn_score_dtype}/{self.device}."
-            )
-
-    def _prepare_snapkv_decode_score_buffers(
+    def _get_snapkv_decode_score_buffer(
         self,
         layer_idx: int,
         batch_size: int,
-        num_heads: int,
         max_len: int,
         *,
         fill_value: float,
     ) -> torch.Tensor:
-        """Allocate one shared raw workspace and one stable reduced buffer per layer."""
-        if min(batch_size, num_heads, max_len) <= 0:
+        """Return a stable fused head-reduced score buffer for one layer."""
+        if min(batch_size, max_len) <= 0:
             raise RuntimeError(
-                "SnapKV decode score buffers require positive dimensions: "
-                f"layer={layer_idx} shape={(batch_size, num_heads, max_len)}."
-            )
-        raw = self._snapkv_decode_raw_attn_score_buffer
-        if (
-            raw is None
-            or raw.dtype != self.attn_score_dtype
-            or raw.device != self.device
-            or any(int(raw.shape[dim]) < size for dim, size in enumerate((batch_size, num_heads, max_len)))
-        ):
-            self._snapkv_decode_raw_attn_score_buffer = torch.empty(
-                (batch_size, num_heads, max_len),
-                dtype=self.attn_score_dtype,
-                device=self.device,
+                "SnapKV decode score buffer requires positive dimensions: "
+                f"layer={layer_idx} shape={(batch_size, max_len)}."
             )
         reduced = self._snapkv_decode_reduced_attn_score_buffers.get(int(layer_idx))
         if (
@@ -442,80 +404,6 @@ class SparseController:
             )
         return int(graph_capacity)
 
-    def _prepare_snapkv_decode_layer_score(self, layer_idx: int) -> torch.Tensor:
-        """Reset and expose the shared raw workspace immediately before one scored layer."""
-        state = self.layer_batch_sparse_states[int(layer_idx)]
-        reduced = state.attn_score
-        if reduced is None:
-            raise RuntimeError(
-                f"SnapKV decode layer score was requested without a reduced buffer: layer={layer_idx}."
-            )
-        if state.context_lens is None:
-            raise RuntimeError(f"SnapKV decode score requires context_lens: layer={layer_idx}.")
-
-        batch_size = int(state.context_lens.numel())
-        max_len = self._snapkv_decode_score_width(state)
-        num_heads = self.config.hf_config.num_attention_heads // self.config.tensor_parallel_size
-        self._validate_snapkv_score_tensor(
-            reduced,
-            name="reduced score",
-            layer_idx=layer_idx,
-            shape=(batch_size, max_len),
-        )
-        raw_buf = self._snapkv_decode_raw_attn_score_buffer
-        if raw_buf is None:
-            raise RuntimeError(f"SnapKV decode layer={layer_idx} has no raw score workspace.")
-        raw = raw_buf[:batch_size, :num_heads, :max_len]
-        self._validate_snapkv_score_tensor(
-            raw,
-            name="raw score workspace",
-            layer_idx=layer_idx,
-            shape=(batch_size, num_heads, max_len),
-        )
-        # This reset executes immediately before the scored attention kernel, so
-        # reset -> score write -> head reduction is ordered in the captured graph.
-        raw.fill_(-1e20)
-        state.attn_score = raw
-        return raw
-
-    def _reduce_snapkv_decode_layer_score(self, layer_idx: int):
-        """Head-reduce the shared raw workspace into this layer's stable [B, L] buffer."""
-        state = self.layer_batch_sparse_states[int(layer_idx)]
-        raw = state.attn_score
-        if raw is None:
-            return
-        if raw.dim() != 3:
-            raise RuntimeError(
-                f"SnapKV decode attention end expected raw [B, H, L]: "
-                f"layer={layer_idx} shape={tuple(raw.shape)}."
-            )
-        shared = self._snapkv_decode_raw_attn_score_buffer
-        if shared is None or raw.untyped_storage().data_ptr() != shared.untyped_storage().data_ptr():
-            raise RuntimeError(
-                f"SnapKV decode layer={layer_idx} raw scores are not backed by the shared workspace."
-            )
-        self._validate_snapkv_score_tensor(
-            raw,
-            name="raw score at reduction",
-            layer_idx=layer_idx,
-            shape=tuple(raw.shape),
-        )
-
-        reduced_buf = self._snapkv_decode_reduced_attn_score_buffers.get(int(layer_idx))
-        if reduced_buf is None:
-            raise RuntimeError(f"SnapKV decode layer={layer_idx} has no reduced score buffer.")
-        reduced = reduced_buf[: raw.shape[0], : raw.shape[2]]
-        self._validate_snapkv_score_tensor(
-            reduced,
-            name="reduced score at reduction",
-            layer_idx=layer_idx,
-            shape=(int(raw.shape[0]), int(raw.shape[2])),
-        )
-
-        with profiler.record("snapkv_decode_score_reduce"):
-            torch.amax(raw, dim=1, out=reduced)
-        state.attn_score = reduced
-
     def _state_max_context_len(self, state: LayerBatchSparseState) -> int:
         if state.max_context_len is not None:
             return int(state.max_context_len)
@@ -531,8 +419,13 @@ class SparseController:
             return
         ctx = get_context()
         if not ctx.is_prefill and self.sparse_method in ("snapkv", "pyramidkv"):
-            if self.layer_batch_sparse_states[layer_idx].attn_score is not None:
-                self._reduce_snapkv_decode_layer_score(layer_idx)
+            attn_score = self.layer_batch_sparse_states[layer_idx].attn_score
+            if attn_score is not None and attn_score.dim() != 2:
+                raise RuntimeError(
+                    "SnapKV decode attention must write a fused head-reduced "
+                    f"[B, L] score tensor: layer={layer_idx} "
+                    f"shape={tuple(attn_score.shape)}."
+                )
             return
         if not ctx.is_prefill or self.sparse_method != "pyramidkv":
             return
@@ -709,11 +602,6 @@ class SparseController:
         context_lens: torch.Tensor | None = None,
     ) -> SparseSelection:
         del active_slots, req_indices, context_lens
-        if (
-            self.sparse_method in ("snapkv", "pyramidkv")
-            and self.layer_batch_sparse_states[layer_idx].attn_score is not None
-        ):
-            self._prepare_snapkv_decode_layer_score(layer_idx)
         return self._build_selection(layer_idx, is_prefill=False, q=q)
 
     def on_layer_end(self, layer_idx: int, context):
@@ -1598,7 +1486,9 @@ class SparseController:
             if bool(getattr(self.config, "decode_cuda_graph", False)):
                 # A long-text graph can be captured before this layer reaches its
                 # eviction trigger, then replayed after crossing it. Capture the
-                # score path for the whole long-text graph family.
+                # fused 2D score path for the whole long-text graph family; the
+                # attention kernel reduces heads directly without a [B, H, L]
+                # workspace or a separate per-token reduction.
                 return bool(get_context().is_long_text)
 
             # Eager decode only collects scores when we're about to evict.

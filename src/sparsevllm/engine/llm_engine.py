@@ -8,6 +8,7 @@ from tqdm.auto import tqdm
 from transformers import AutoTokenizer, GenerationConfig, Qwen2Tokenizer
 import torch
 import torch.multiprocessing as mp
+from sparsevllm.utils.code_revision import code_revision_info
 from sparsevllm.utils.log import logger
 import sys
 
@@ -635,6 +636,7 @@ class LLMEngine:
             "max_num_seqs_in_gpu": int(getattr(config, "max_num_seqs_in_gpu", 0) or 0),
             "prefix_cache_enabled": bool(getattr(config, "enable_prefix_caching", False)),
             "prefix_cache_block_size": getattr(config, "prefix_cache_block_size", None),
+            "code_revision": code_revision_info(),
             "benchmark_config": {
                 key: jsonable(getattr(config, key))
                 for key in benchmark_config_keys

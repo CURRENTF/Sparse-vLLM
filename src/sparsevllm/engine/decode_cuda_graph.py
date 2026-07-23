@@ -418,7 +418,7 @@ class DecodeCudaGraphRunner:
             self.sparse_controller.prepare_forward(seqs, is_prefill=False)
             # Dynamic score paths can replace Python state fields during the
             # captured forward. Keep both input and post-forward refs alive;
-            # SnapKV-family shared raw workspaces are retained by the controller.
+            # SnapKV-family fused 2D score buffers are retained by the controller.
             graph_input_sparse_state_refs = self._snapshot_sparse_state_refs()
             graph = torch.cuda.CUDAGraph()
             try:

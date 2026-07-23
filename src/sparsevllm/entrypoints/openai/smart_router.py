@@ -25,6 +25,7 @@ from fastapi.responses import StreamingResponse
 
 from sparsevllm.entrypoints.openai.serving.base import DisconnectChecker
 from sparsevllm.entrypoints.openai.serving.base import _wait_for_any_or_disconnect
+from sparsevllm.utils.code_revision import code_revision_info
 from sparsevllm.utils.log import logger
 
 
@@ -244,6 +245,7 @@ class SmartRouter:
             "overload_load_factor": self.overload_load_factor,
             "load_abs_threshold": self.load_abs_threshold,
             "profiles": self.profiles,
+            "code_revision": code_revision_info(),
         }
 
     async def refresh_worker_info(self):

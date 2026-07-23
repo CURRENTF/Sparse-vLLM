@@ -32,6 +32,8 @@ class WorkerInfoTest(unittest.TestCase):
             "float16",
         )
         self.assertEqual(engine.worker_info()["vocab_size"], 32_000)
+        revision = engine.worker_info()["code_revision"]
+        self.assertTrue(revision["git_commit"] or revision["package_version"])
 
 
 def make_controller(
@@ -106,37 +108,50 @@ class SnapKVDecodeScoreLifecycleTest(unittest.TestCase):
     def tearDown(self):
         reset_context()
 
-    def test_shared_workspace_reduces_immediately_into_independent_layer_scores(self):
+    def test_decode_uses_independent_fused_2d_layer_scores(self):
         controller, _manager, _seqs = make_controller()
         states = controller.layer_batch_sparse_states
         stable_ptrs = [states[layer].attn_score.data_ptr() for layer in range(2)]
         self.assertNotEqual(*stable_ptrs)
         q = torch.empty((1, 2, 4))
 
-        raw0 = controller.get_decode_selection(0, q).attn_score
-        raw0.copy_(torch.tensor([[[1, 9, 3, 4, 5, 6], [7, 2, 8, 0, 6, 1]]]))
+        score0 = controller.get_decode_selection(0, q).attn_score
+        self.assertEqual(tuple(score0.shape), (1, 6))
+        score0.copy_(torch.tensor([[7, 9, 8, 4, 6, 6]]))
         controller.on_layer_attention_end(0)
-        torch.testing.assert_close(states[0].attn_score, torch.tensor([[7, 9, 8, 4, 6, 6]]).float())
+        torch.testing.assert_close(
+            states[0].attn_score,
+            torch.tensor([[7, 9, 8, 4, 6, 6]]).float(),
+        )
         layer0 = states[0].attn_score.clone()
 
-        raw1 = controller.get_decode_selection(1, q).attn_score
-        self.assertEqual(raw0.data_ptr(), raw1.data_ptr())
-        self.assertTrue(torch.equal(raw1, torch.full_like(raw1, -1e20)))
-        raw1.copy_(torch.tensor([[[4, 3, 2, 1, 0, -1], [0, 5, 1, 8, 2, 9]]]))
+        score1 = controller.get_decode_selection(1, q).attn_score
+        self.assertNotEqual(score0.data_ptr(), score1.data_ptr())
+        self.assertTrue(torch.equal(score1, torch.full_like(score1, -1e20)))
+        score1.copy_(torch.tensor([[4, 5, 2, 8, 2, 9]]))
         controller.on_layer_attention_end(1)
         torch.testing.assert_close(states[0].attn_score, layer0)
-        torch.testing.assert_close(states[1].attn_score, torch.tensor([[4, 5, 2, 8, 2, 9]]).float())
+        torch.testing.assert_close(
+            states[1].attn_score,
+            torch.tensor([[4, 5, 2, 8, 2, 9]]).float(),
+        )
         self.assertEqual([states[layer].attn_score.dim() for layer in range(2)], [2, 2])
 
-    def test_pyramidkv_uses_the_same_shared_raw_lifecycle(self):
+    def test_pyramidkv_uses_the_same_fused_2d_lifecycle(self):
         controller, _manager, _seqs = make_controller("pyramidkv", layers=1)
         state = controller.layer_batch_sparse_states[0]
-        raw = controller.get_decode_selection(0, torch.empty((1, 2, 4))).attn_score
-        raw.copy_(torch.tensor([[[1, 7, 3, 4, 5, 2], [6, 2, 8, 3, 1, 9]]]))
+        score = controller.get_decode_selection(
+            0,
+            torch.empty((1, 2, 4)),
+        ).attn_score
+        score.copy_(torch.tensor([[6, 7, 8, 4, 5, 9]]))
         controller.on_layer_attention_end(0)
-        torch.testing.assert_close(state.attn_score, torch.tensor([[6, 7, 8, 4, 5, 9]]).float())
+        torch.testing.assert_close(
+            state.attn_score,
+            torch.tensor([[6, 7, 8, 4, 5, 9]]).float(),
+        )
 
-    def test_graph_refs_are_2d_keepalive_has_one_raw_and_scores_before_trigger(self):
+    def test_graph_refs_are_2d_keepalive_and_score_before_trigger(self):
         controller, _manager, seqs = make_controller(
             layers=1,
             kv_len=7,
@@ -146,9 +161,12 @@ class SnapKVDecodeScoreLifecycleTest(unittest.TestCase):
         )
         self.assertEqual(controller._snapkv_decode_trigger_len(6), 8)
         self.assertTrue(controller._needs_attn_score(0, False, seqs))
-        raw = controller.get_decode_selection(0, torch.empty((1, 2, 4))).attn_score
-        self.assertEqual(tuple(raw.shape), (1, 2, 16))
-        raw[:, :, :7].fill_(3)
+        score = controller.get_decode_selection(
+            0,
+            torch.empty((1, 2, 4)),
+        ).attn_score
+        self.assertEqual(tuple(score.shape), (1, 16))
+        score[:, :7].fill_(3)
         controller.on_layer_attention_end(0)
 
         runner = object.__new__(DecodeCudaGraphRunner)
@@ -170,7 +188,7 @@ class SnapKVDecodeScoreLifecycleTest(unittest.TestCase):
             )
         )
         keepalive = controller.decode_cuda_graph_keepalive_tensors()
-        self.assertEqual(sum(tensor.dim() == 3 for tensor in keepalive), 1)
+        self.assertEqual(sum(tensor.dim() == 3 for tensor in keepalive), 0)
         self.assertEqual(sum(tensor.dim() == 2 for tensor in keepalive), 1)
         controller.layer_batch_sparse_states[0].attn_score = None
         runner._restore_sparse_state_refs(SimpleNamespace(sparse_state_refs=refs))
@@ -179,10 +197,13 @@ class SnapKVDecodeScoreLifecycleTest(unittest.TestCase):
         controller.config.decode_cuda_graph = False
         self.assertFalse(controller._needs_attn_score(0, False, seqs))
 
-    def test_post_forward_consumes_2d_and_rejects_unreduced_scores(self):
+    def test_post_forward_consumes_2d_and_rejects_3d_scores(self):
         controller, manager, seqs = make_controller(layers=1)
-        raw = controller.get_decode_selection(0, torch.empty((1, 2, 4))).attn_score
-        raw.copy_(torch.arange(12, dtype=torch.float32).reshape(1, 2, 6))
+        score = controller.get_decode_selection(
+            0,
+            torch.empty((1, 2, 4)),
+        ).attn_score
+        score.copy_(torch.arange(6, dtype=torch.float32).reshape(1, 6))
         controller.on_layer_attention_end(0)
         shapes = []
 
@@ -197,9 +218,11 @@ class SnapKVDecodeScoreLifecycleTest(unittest.TestCase):
         self.assertEqual(manager.compactions[0][2].tolist(), [0, 2, 3, 5])
 
         controller.prepare_forward(seqs, is_prefill=False)
-        controller.get_decode_selection(0, torch.empty((1, 2, 4)))
+        controller.layer_batch_sparse_states[0].attn_score = torch.zeros(
+            (1, 2, 6)
+        )
         with self.assertRaisesRegex(RuntimeError, r"head-reduced \[B, L\]"):
-            controller.post_forward(seqs, is_prefill=False)
+            controller.on_layer_attention_end(0)
 
 
 if __name__ == "__main__":
