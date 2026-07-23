@@ -4,6 +4,8 @@ import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
+from flashinfer.fused_moe import cutlass_fused_moe
+from flashinfer.tllm_enums import ActivationType
 
 _SUPPORTED_ACTIVATION_DTYPES = (torch.bfloat16, torch.float16)
 _EXPERT_M_BLOCK_SIZES = (16, 32, 64, 128)
@@ -452,7 +454,7 @@ def _validate_fused_moe_fp8_inputs(
         )
 
 
-def fused_moe_fp8(
+def _fused_moe_fp8_triton(
     hidden_states: torch.Tensor,
     w13_weight: torch.Tensor,
     w13_scale_inv: torch.Tensor,
@@ -464,22 +466,6 @@ def fused_moe_fp8(
     num_experts: int,
     local_expert_start: int,
 ) -> torch.Tensor:
-    """Graph-stable routed W8A8 expert pipeline for MiniMax M2.7."""
-
-    num_experts = int(num_experts)
-    local_expert_start = int(local_expert_start)
-    _validate_fused_moe_fp8_inputs(
-        hidden_states,
-        w13_weight,
-        w13_scale_inv,
-        w2_weight,
-        w2_scale_inv,
-        topk_ids,
-        topk_weights,
-        num_experts=num_experts,
-        local_expert_start=local_expert_start,
-    )
-
     num_tokens = int(hidden_states.shape[0])
     top_k = int(topk_ids.shape[1])
     num_local_experts = int(w13_weight.shape[0])
@@ -540,4 +526,114 @@ def fused_moe_fp8(
         num_experts=num_experts,
         local_expert_start=local_expert_start,
         local_expert_end=local_expert_end,
+    )
+
+
+def fused_moe_fp8_flashinfer(
+    hidden_states: torch.Tensor,
+    w13_weight: torch.Tensor,
+    w13_scale_inv: torch.Tensor,
+    w2_weight: torch.Tensor,
+    w2_scale_inv: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    *,
+    ep_size: int,
+    ep_rank: int,
+) -> torch.Tensor:
+    output = torch.empty_like(hidden_states)
+    cutlass_fused_moe(
+        hidden_states,
+        topk_ids.to(dtype=torch.int32),
+        topk_weights,
+        w13_weight,
+        w2_weight,
+        hidden_states.dtype,
+        quant_scales=[w13_scale_inv, w2_scale_inv],
+        ep_size=ep_size,
+        ep_rank=ep_rank,
+        output=output,
+        use_deepseek_fp8_block_scale=True,
+        use_fused_finalize=False,
+        enable_pdl=False,
+        activation_type=ActivationType.Swiglu,
+    )
+    return output
+
+
+def fused_moe_fp8(
+    hidden_states: torch.Tensor,
+    w13_weight: torch.Tensor,
+    w13_scale_inv: torch.Tensor,
+    w2_weight: torch.Tensor,
+    w2_scale_inv: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    *,
+    num_experts: int,
+    local_expert_start: int,
+    implementation: str = "triton",
+) -> torch.Tensor:
+    """Run MiniMax M2.7's pre-routed W8A8 MoE.
+
+    The MiniMax runtime selects FlashInfer by default. It uses physical
+    ``[up (w3), gate (w1)]`` W13 order; the optional Triton fallback uses
+    ``[gate (w1), up (w3)]``. Direct callers retain Triton as the compatibility
+    default because their packed weights use the legacy order.
+    """
+
+    implementation = str(implementation).strip().lower()
+    if implementation not in {"flashinfer", "triton"}:
+        raise ValueError(
+            "MiniMax routed FP8 implementation must be 'flashinfer' or "
+            f"'triton', got {implementation!r}."
+        )
+    num_experts = int(num_experts)
+    local_expert_start = int(local_expert_start)
+    _validate_fused_moe_fp8_inputs(
+        hidden_states,
+        w13_weight,
+        w13_scale_inv,
+        w2_weight,
+        w2_scale_inv,
+        topk_ids,
+        topk_weights,
+        num_experts=num_experts,
+        local_expert_start=local_expert_start,
+    )
+
+    if implementation == "triton":
+        return _fused_moe_fp8_triton(
+            hidden_states,
+            w13_weight,
+            w13_scale_inv,
+            w2_weight,
+            w2_scale_inv,
+            topk_ids,
+            topk_weights,
+            num_experts=num_experts,
+            local_expert_start=local_expert_start,
+        )
+
+    num_local_experts = int(w13_weight.shape[0])
+    if num_experts % num_local_experts:
+        raise ValueError(
+            f"Global experts={num_experts} must be divisible by local "
+            f"experts={num_local_experts}."
+        )
+    if local_expert_start % num_local_experts:
+        raise ValueError(
+            f"local_expert_start={local_expert_start} is not aligned to "
+            f"local experts={num_local_experts}."
+        )
+    return fused_moe_fp8_flashinfer(
+        hidden_states,
+        w13_weight,
+        w13_scale_inv,
+        w2_weight,
+        w2_scale_inv,
+        topk_ids,
+        topk_weights,
+        ep_size=num_experts // num_local_experts,
+        ep_rank=local_expert_start // num_local_experts,
     )

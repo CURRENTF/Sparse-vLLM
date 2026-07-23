@@ -218,9 +218,22 @@ class MiniMaxM2PackedExperts(nn.Module):
             weight_target = self.w2_weight.data[local_expert_id]
             scale_target = self.w2_scale_inv[local_expert_id]
         else:
-            weight_offset = 0 if projection == "w1" else self.intermediate_size
+            # FlashInfer CUTLASS consumes [up (w3), gate (w1)].  Write that
+            # physical layout during checkpoint loading instead of copying the
+            # packed expert tensor in every forward call.
+            if self.backend == "triton":
+                weight_offset = (
+                    self.intermediate_size if projection == "w1" else 0
+                )
+            else:
+                weight_offset = (
+                    0 if projection == "w1" else self.intermediate_size
+                )
             scale_rows = self.intermediate_size // 128
-            scale_offset = 0 if projection == "w1" else scale_rows
+            if self.backend == "triton":
+                scale_offset = scale_rows if projection == "w1" else 0
+            else:
+                scale_offset = 0 if projection == "w1" else scale_rows
             weight_target = self.w13_weight.data[
                 local_expert_id,
                 weight_offset : weight_offset + self.intermediate_size,
@@ -322,9 +335,11 @@ class MiniMaxM2PackedExperts(nn.Module):
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
     ) -> torch.Tensor:
-        from sparsevllm.triton_kernel.minimax_m2_moe_fp8 import fused_moe_fp8
+        from sparsevllm.triton_kernel.minimax_m2_moe_fp8 import (
+            fused_moe_fp8_flashinfer,
+        )
 
-        return fused_moe_fp8(
+        return fused_moe_fp8_flashinfer(
             hidden_states,
             self.w13_weight,
             self.w13_scale_inv,
@@ -332,8 +347,8 @@ class MiniMaxM2PackedExperts(nn.Module):
             self.w2_scale_inv,
             topk_ids,
             topk_weights,
-            num_experts=self.num_experts,
-            local_expert_start=self.local_expert_start,
+            ep_size=self.ep_size,
+            ep_rank=self.ep_rank,
         )
 
     def forward(
