@@ -266,9 +266,8 @@ class AsyncEngineDispatcher:
         fatal_callback: Callable[[str], None] | None = None
         try:
             while not stopping:
-                controls_changed = self._drain_controls()
-                self._drain_aborts(active)
-                if controls_changed:
+                self._drain_controls()
+                if self._drain_aborts(active):
                     self._refresh_routing_snapshots()
                 if not active:
                     item = self._pending.get()
@@ -291,7 +290,8 @@ class AsyncEngineDispatcher:
                     self._admit(item, active)
 
                 self._drain_controls()
-                self._drain_aborts(active)
+                if self._drain_aborts(active):
+                    self._refresh_routing_snapshots()
                 if not active:
                     self._refresh_routing_snapshots()
                     continue
@@ -317,13 +317,12 @@ class AsyncEngineDispatcher:
                     except Exception:
                         logger.exception("OpenAI dispatcher fatal callback failed")
 
-    def _drain_controls(self) -> bool:
-        changed = False
+    def _drain_controls(self):
         while True:
             try:
                 item = self._controls.get_nowait()
             except queue.Empty:
-                return changed
+                return
             if self._closing.is_set():
                 self._put_control(item, {"type": "error", "message": "Sparse-vLLM server is shutting down."})
                 continue
@@ -333,10 +332,14 @@ class AsyncEngineDispatcher:
             try:
                 method = getattr(self.engine, item.operation)
                 value = method(**item.kwargs)
-                changed = True
             except Exception as exc:
                 self._put_control(item, {"type": "error", "message": f"{type(exc).__name__}: {exc}"})
                 continue
+            try:
+                self._refresh_routing_snapshots()
+            except Exception as exc:
+                self._put_control(item, {"type": "error", "message": f"{type(exc).__name__}: {exc}"})
+                raise
             self._put_control(item, {"type": "result", "value": value})
 
     def _admit(self, item: _QueuedRequest, active: dict[int, _ActiveRequest]):
@@ -410,12 +413,13 @@ class AsyncEngineDispatcher:
             )
             text = visible_text[request.emitted_text_len:emit_len]
             request.emitted_text_len = emit_len
-            if text or (stop_index is None and raw_text_delta):
-                self._publish_pending_token_event(request, text, raw_text_delta)
             if stop_index is not None:
                 final = request.detokenizer.finish(request.completion_token_ids)
                 self.engine.abort_request(seq_id)
-                active.pop(seq_id, None)
+                self._refresh_routing_snapshots()
+            if text or (stop_index is None and raw_text_delta):
+                self._publish_pending_token_event(request, text, raw_text_delta)
+            if stop_index is not None:
                 self._put(
                     request,
                     {
@@ -432,6 +436,7 @@ class AsyncEngineDispatcher:
                         "top_logprobs": request.completion_top_logprobs,
                     },
                 )
+                active.pop(seq_id, None)
 
     def _publish_pending_token_event(
         self,
@@ -455,15 +460,17 @@ class AsyncEngineDispatcher:
         request.pending_token_logprobs.clear()
         request.pending_top_logprobs.clear()
 
-    def _drain_aborts(self, active: dict[int, _ActiveRequest]):
+    def _drain_aborts(self, active: dict[int, _ActiveRequest]) -> bool:
+        changed = False
         while True:
             try:
                 seq_id = self._aborts.get_nowait()
             except queue.Empty:
-                return
+                return changed
             if seq_id in active:
                 self.engine.abort_request(seq_id)
                 active.pop(seq_id)
+                changed = True
 
     def _fail_active_requests(self, active: dict[int, _ActiveRequest], message: str):
         for seq_id, request in list(active.items()):

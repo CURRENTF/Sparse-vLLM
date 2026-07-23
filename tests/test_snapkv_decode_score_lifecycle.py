@@ -93,6 +93,10 @@ def make_controller(
     graph_capacity=None,
     keep=2,
     score_dtype="float32",
+    sink=1,
+    recent=1,
+    pyramid_ratios=None,
+    is_long_text=True,
 ):
     layout = SimpleNamespace(
         kv_layer_index=lambda layer: int(layer),
@@ -109,13 +113,17 @@ def make_controller(
             torch_dtype=torch.float32,
         ),
         runtime_layout=layout,
-        num_sink_tokens=1,
-        num_recent_tokens=1,
+        num_sink_tokens=sink,
+        num_recent_tokens=recent,
         decode_keep_tokens=keep,
         sparse_attn_score_dtype=score_dtype,
         tensor_parallel_size=1,
         snapkv_num_full_layers=0,
-        pyramid_layer_ratios=[1.0] * layers if method == "pyramidkv" else None,
+        pyramid_layer_ratios=(
+            pyramid_ratios
+            if pyramid_ratios is not None
+            else ([1.0] * layers if method == "pyramidkv" else None)
+        ),
         decode_cuda_graph=graph,
         pool_kernel_size=1,
     )
@@ -148,7 +156,12 @@ def make_controller(
     manager = Manager()
     controller = SparseController(config, manager)
     seqs = [Sequence([1])]
-    set_context(False, cache_manager=manager, is_long_text=True, seqs=seqs)
+    set_context(
+        False,
+        cache_manager=manager,
+        is_long_text=is_long_text,
+        seqs=seqs,
+    )
     controller.prepare_forward(seqs, is_prefill=False)
     return controller, manager, seqs
 
@@ -273,6 +286,70 @@ class SnapKVDecodeScoreLifecycleTest(unittest.TestCase):
 
         controller.config.decode_cuda_graph = False
         self.assertFalse(controller._needs_attn_score(0, False, seqs))
+
+    def test_pyramid_short_graph_uses_layer_trigger_and_graph_capacity(self):
+        common = {
+            "method": "pyramidkv",
+            "layers": 2,
+            "graph": True,
+            "keep": 4_096,
+            "sink": 64,
+            "recent": 512,
+            "pyramid_ratios": [0.6, 0.01],
+            "is_long_text": False,
+        }
+        controller, _manager, _seqs = make_controller(
+            **common,
+            kv_len=700,
+            graph_capacity=1_024,
+        )
+        low_budget = controller._get_layer_budget(1, is_prefill=False)
+        self.assertEqual(low_budget, 644)
+        self.assertEqual(controller._snapkv_decode_trigger_len(low_budget), 712)
+        self.assertIsNone(controller.layer_batch_sparse_states[0].attn_score)
+        self.assertEqual(
+            tuple(controller.layer_batch_sparse_states[1].attn_score.shape),
+            (1, 1_024),
+        )
+
+        below, _manager, _seqs = make_controller(
+            **common,
+            kv_len=700,
+            graph_capacity=700,
+        )
+        self.assertIsNone(below.layer_batch_sparse_states[1].attn_score)
+
+        snap_short, _manager, _seqs = make_controller(
+            "snapkv",
+            layers=1,
+            kv_len=5,
+            graph=True,
+            graph_capacity=16,
+            keep=4,
+            sink=1,
+            recent=1,
+            is_long_text=False,
+        )
+        self.assertEqual(
+            snap_short._snapkv_decode_trigger_len(
+                snap_short._get_layer_budget(0, is_prefill=False)
+            ),
+            8,
+        )
+        self.assertIsNone(snap_short.layer_batch_sparse_states[0].attn_score)
+
+        triggered, manager, seqs = make_controller(
+            **common,
+            kv_len=712,
+            graph_capacity=1_024,
+        )
+        score = triggered.layer_batch_sparse_states[1].attn_score
+        score.copy_(torch.arange(1_024, dtype=torch.float32).reshape(1, -1))
+        triggered.on_layer_attention_end(1)
+        triggered.post_forward(seqs, is_prefill=False)
+        self.assertEqual(len(manager.compactions), 1)
+        self.assertEqual(manager.compactions[0][0], 1)
+        self.assertEqual(manager.compactions[0][2].numel(), low_budget)
 
     def test_post_forward_consumes_2d_and_rejects_3d_scores(self):
         controller, manager, seqs = make_controller(layers=1)

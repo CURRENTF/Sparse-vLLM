@@ -42,22 +42,30 @@ The runner calls the smart router's `/v1/completions` endpoint.
   agent roles. Same-model workers with unrelated methods do not constrain the
   benchmark.
 - Every worker eligible for main-agent routing must have prefix caching
-  enabled and report a positive integer `prefix_cache_block_size`.
+  enabled and report a positive integer `prefix_cache_block_size` no larger
+  than the workload's guaranteed reusable main-agent prefix:
+  `main_overhead_tokens + max(0, rounds - 1) * min_round_summary_tokens`.
 - Every response must include `X-SparseVLLM-Worker`,
   `X-SparseVLLM-Route-Reason`, `X-SparseVLLM-Sparse-Method`, and
   `X-SparseVLLM-Prefix-Matched-Tokens`.
 - A request routed to the wrong method is recorded as `metric_failed`, and the
   run stops after the active round has been recorded.
 - Preflight rejects a router or benchmark-eligible worker that reports
-  `git_dirty=true`. An installed package may report `git_dirty=null` only when
-  it provides a package version.
+  `git_dirty=true`. A source revision with a `git_commit` must report
+  `git_dirty=false`, even when it also provides a package version. An installed
+  package may report `git_dirty=null` only when `git_commit=null` and it
+  provides a package version.
 
 This contract requires separate workers because one worker advertises one
 sparse method. A typical deployment uses one GPU for the main-agent
 OmniKV/vanilla worker and another GPU for the SnapKV subagent worker. The
 main-agent worker must enable prefix caching because the workload deliberately
 reuses its growing prefix; preflight rejects any eligible main-agent worker
-without it. The benchmark does not start or reconfigure those services.
+without it. It also rejects a block size above the guaranteed reusable-prefix
+bound and directs the operator to increase rounds/minimum summary length or
+decrease the block size. The default bound is 4,736 tokens, so an 8,192-token
+prefix-cache block is invalid for the default workload. The benchmark does not
+start or reconfigure those services.
 
 ## Run
 
@@ -178,3 +186,9 @@ actual zero hit. A nonzero partial hit is recorded without failing because
 cache capacity can reduce reuse. Zero actual reuse when the block-aligned
 expectation is nonzero, or actual reuse above that expectation, is
 `metric_failed`.
+
+Before a router run can report success, at least one successful main-agent
+record must have both a positive block-aligned expected reusable prefix and a
+positive actual matched-prefix count. This run-level check prevents routing
+each main-agent prompt to a different worker from turning a zero-hit benchmark
+into a success. It does not apply to `--allow-direct-server`.

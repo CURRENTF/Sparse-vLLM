@@ -479,7 +479,19 @@ class SparseController:
         """持久化压缩 (如 SnapKV / DeltaKV)"""
         self.activation_controller.post_forward(seqs, is_prefill)
 
-        if get_context().is_long_text is False and not self.is_deltakv_family:
+        short_snapkv_decode_has_scores = (
+            not is_prefill
+            and self.sparse_method in ("snapkv", "pyramidkv")
+            and any(
+                state.attn_score is not None
+                for state in self.layer_batch_sparse_states.values()
+            )
+        )
+        if (
+            get_context().is_long_text is False
+            and not self.is_deltakv_family
+            and not short_snapkv_decode_has_scores
+        ):
             return
 
         if is_prefill:
@@ -1493,16 +1505,26 @@ class SparseController:
             budget = self._get_layer_budget(layer_idx, is_prefill=False)
             if budget is None:
                 return False
+            trigger_len = self._snapkv_decode_trigger_len(budget)
             if bool(getattr(self.config, "decode_cuda_graph", False)):
-                # A long-text graph can be captured before this layer reaches its
-                # eviction trigger, then replayed after crossing it. Capture the
-                # fused 2D score path for the whole long-text graph family; the
-                # attention kernel reduces heads directly without a [B, H, L]
-                # workspace or a separate per-token reduction.
-                return bool(get_context().is_long_text)
+                state = self.layer_batch_sparse_states[layer_idx]
+                graph_capacity = self._snapkv_decode_score_width(state)
+                if not bool(get_context().is_long_text):
+                    short_family_max_len = (
+                        int(self.num_sink)
+                        + int(self.num_recent)
+                        + int(self.decode_keep_tokens)
+                    )
+                    graph_capacity = min(
+                        int(graph_capacity),
+                        short_family_max_len,
+                    )
+                # Capture exactly the graph families that can cross this layer's
+                # eviction boundary during replay. PyramidKV budgets vary by
+                # layer, so a short-text graph can still require fused 2D scores.
+                return int(graph_capacity) >= int(trigger_len) and int(graph_capacity) > int(budget)
 
             # Eager decode only collects scores when we're about to evict.
-            trigger_len = self._snapkv_decode_trigger_len(budget)
             kv_lens_fn = getattr(self.cache_manager, "decode_kv_lens_for_layer", None)
             if kv_lens_fn is not None:
                 kv_lens = kv_lens_fn(layer_idx, seqs)

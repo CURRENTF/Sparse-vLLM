@@ -55,6 +55,7 @@ class FakeService:
         )
         self.previous_main_prompt = None
         self.prefix_cache_block_size = 2
+        self.max_model_len = 65_536
 
     async def get(self, url, _timeout_s):
         if url.endswith("/models"):
@@ -65,7 +66,7 @@ class FakeService:
                         {
                             "id": "sim-model",
                             "owned_by": "sparsevllm-router",
-                            "max_model_len": 65536,
+                            "max_model_len": self.max_model_len,
                         }
                     ],
                 }
@@ -93,7 +94,7 @@ class FakeService:
             return _json_response(
                 {
                     "served_model_name": "sim-model",
-                    "max_model_len": 65_536,
+                    "max_model_len": self.max_model_len,
                     "vocab_size": 32_000,
                     "sparse_method": method,
                     "prefix_cache_enabled": method == "omnikv",
@@ -1053,6 +1054,76 @@ class SimulatedDeepResearchTest(unittest.TestCase):
                 0,
             )
 
+    def test_router_run_requires_a_verified_main_prefix_hit(self):
+        class SpreadMainRequestsService(FakeService):
+            def __init__(self):
+                super().__init__()
+                self.main_workers = [
+                    "http://main-worker-0",
+                    "http://main-worker-1",
+                    "http://main-worker-2",
+                ]
+                self.main_request_index = 0
+
+            async def get(self, url, timeout_s):
+                response = await super().get(url, timeout_s)
+                if url.endswith("/health"):
+                    payload = json.loads(response.body)
+                    payload["healthy_workers"] = [
+                        "http://snap-worker",
+                        *self.main_workers,
+                    ]
+                    return _json_response(payload)
+                return response
+
+            async def post(self, url, payload, timeout_s):
+                response = await super().post(url, payload, timeout_s)
+                if payload["svllm_method_preference"] == "snapkv":
+                    return response
+                headers = dict(response.headers)
+                headers["x-sparsevllm-worker"] = self.main_workers[
+                    self.main_request_index
+                ]
+                headers["x-sparsevllm-prefix-matched-tokens"] = "0"
+                self.main_request_index += 1
+                return run.HttpResponse(
+                    status=response.status,
+                    headers=headers,
+                    body=response.body,
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "run"
+            config = self._config(output_dir)
+            service = SpreadMainRequestsService()
+
+            with self.assertRaisesRegex(
+                run.BenchmarkFailed,
+                "verified main-agent prefix-cache hit",
+            ):
+                asyncio.run(
+                    run.run_benchmark(
+                        config,
+                        get_fn=service.get,
+                        post_fn=service.post,
+                    )
+                )
+
+            aggregate = json.loads(
+                (output_dir / "aggregate_metrics.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(aggregate["status"], "metric_failed")
+            self.assertEqual(
+                aggregate["prefix_cache"]["expected_hit_requests"],
+                0,
+            )
+            self.assertEqual(
+                aggregate["prefix_cache"]["actual_hit_requests"],
+                0,
+            )
+
     def test_block_multiple_prefix_retains_full_block_expectation(self):
         with tempfile.TemporaryDirectory() as tmp:
             output_dir = Path(tmp) / "run"
@@ -1487,6 +1558,48 @@ class SimulatedDeepResearchTest(unittest.TestCase):
                     )
                 )
 
+    def test_preflight_rejects_default_workload_with_8192_prefix_blocks(self):
+        service = FakeService()
+        service.prefix_cache_block_size = 8_192
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = run.BenchmarkConfig(
+                base_url="http://router.test/v1",
+                model="sim-model",
+                output_dir=Path(tmp) / "run",
+            )
+            service.max_model_len = run.required_model_len(config)
+            with self.assertRaisesRegex(
+                ValueError,
+                "block_size=8192.*guaranteed_reusable_prefix_tokens=4736",
+            ):
+                asyncio.run(
+                    run.preflight(config, get_fn=service.get)
+                )
+
+    def test_preflight_accepts_guaranteed_reusable_prefix_block_size(self):
+        service = FakeService()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = run.BenchmarkConfig(
+                base_url="http://router.test/v1",
+                model="sim-model",
+                output_dir=Path(tmp) / "run",
+            )
+            service.prefix_cache_block_size = 4_736
+            service.max_model_len = run.required_model_len(config)
+
+            info = asyncio.run(
+                run.preflight(config, get_fn=service.get)
+            )
+
+        self.assertEqual(
+            info["worker_prefix_cache_block_sizes"][
+                "http://main-worker"
+            ],
+            4_736,
+        )
+
     def test_preflight_rejects_dirty_router_revision(self):
         service = FakeService()
 
@@ -1545,6 +1658,21 @@ class SimulatedDeepResearchTest(unittest.TestCase):
             },
             "installed package",
         )
+
+    def test_source_revision_requires_explicit_clean_git_state(self):
+        with self.assertRaisesRegex(
+            run.PreflightParseError,
+            "git_dirty must be false when git_commit is present",
+        ):
+            run._validate_code_revision(
+                {
+                    "git_commit": "abc123",
+                    "git_branch": "main",
+                    "git_dirty": None,
+                    "package_version": "0.1.0",
+                },
+                "source revision",
+            )
 
     def test_client_dirty_patch_is_archived_with_hash(self):
         patch_text = "diff --git a/a.py b/a.py\n"

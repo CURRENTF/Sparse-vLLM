@@ -398,6 +398,96 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item["type"], "error")
         self.assertEqual(dispatcher._controls.qsize(), 0)
 
+    async def test_dispatcher_refreshes_snapshots_before_control_result(self):
+        from sparsevllm.entrypoints.openai.api_server import AsyncEngineDispatcher
+
+        class Snapshot:
+            def __init__(self, generation):
+                self.generation = generation
+
+            def match(self, _token_ids):
+                return {"generation": self.generation}
+
+        class Engine:
+            tokenizer = object()
+
+            def __init__(self):
+                self.generation = 0
+
+            def mutate(self):
+                self.generation = 1
+                return "mutated"
+
+            def worker_routing_load(self):
+                return {"generation": self.generation}
+
+            def prefix_cache_routing_snapshot(self):
+                return Snapshot(self.generation)
+
+            def exit(self):
+                pass
+
+        dispatcher = AsyncEngineDispatcher(Engine())
+        published_snapshot_states = []
+        original_put_control = dispatcher._put_control
+
+        def put_after_observing_snapshots(request, item):
+            if item["type"] == "result":
+                load = dispatcher.worker_routing_load_snapshot()
+                match = dispatcher.prefix_cache_routing_match([1])
+                published_snapshot_states.append(
+                    (load["generation"], match["generation"])
+                )
+            original_put_control(request, item)
+
+        dispatcher._put_control = put_after_observing_snapshots
+        try:
+            result = await asyncio.wait_for(
+                dispatcher.control("mutate"),
+                timeout=1,
+            )
+        finally:
+            dispatcher.close()
+
+        self.assertEqual(result, "mutated")
+        self.assertEqual(published_snapshot_states, [(1, 1)])
+
+    async def test_dispatcher_snapshot_refresh_failure_is_fatal(self):
+        from sparsevllm.entrypoints.openai.api_server import AsyncEngineDispatcher
+
+        class Engine:
+            tokenizer = object()
+
+            def __init__(self):
+                self.fail_snapshot = False
+
+            def mutate(self):
+                self.fail_snapshot = True
+
+            def worker_routing_load(self):
+                if self.fail_snapshot:
+                    raise RuntimeError("snapshot refresh failed")
+                return {"active_requests": 0}
+
+            def exit(self):
+                pass
+
+        failed = threading.Event()
+        dispatcher = AsyncEngineDispatcher(Engine())
+        dispatcher.set_fatal_callback(lambda _message: failed.set())
+        try:
+            with self.assertRaisesRegex(RuntimeError, "snapshot refresh failed"):
+                await asyncio.wait_for(
+                    dispatcher.control("mutate"),
+                    timeout=1,
+                )
+            self.assertTrue(await asyncio.to_thread(failed.wait, 1))
+        finally:
+            dispatcher.close()
+
+        self.assertFalse(dispatcher.is_ready)
+        self.assertIn("snapshot refresh failed", dispatcher.failure_message)
+
     async def test_dispatcher_abort_failure_notifies_supervisor_and_rejects_new_work(self):
         from sparsevllm.entrypoints.openai.api_server import AsyncEngineDispatcher
 
@@ -449,6 +539,211 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("abort failed", item["message"])
         self.assertEqual(rejected_item["type"], "error")
         self.assertIn("abort failed", rejected_item["message"])
+        self.assertFalse(dispatcher.is_ready)
+
+    async def test_dispatcher_refreshes_snapshot_after_last_active_abort(self):
+        from sparsevllm.entrypoints.openai.api_server import AsyncEngineDispatcher
+
+        tokenizer = _byte_level_tokenizer()
+        step_started = threading.Event()
+        release_step = threading.Event()
+        abort_called = threading.Event()
+        refreshed_after_abort = threading.Event()
+
+        class Engine:
+            last_step_token_outputs = []
+            last_step_logprob_outputs = []
+
+            def __init__(self):
+                self.tokenizer = tokenizer
+                self.active_requests = 0
+
+            def worker_routing_load(self):
+                if abort_called.is_set() and self.active_requests == 0:
+                    refreshed_after_abort.set()
+                return {"active_requests": self.active_requests}
+
+            def add_request(self, _prompt, _sampling_params):
+                self.active_requests = 1
+                return 17
+
+            def step(self):
+                step_started.set()
+                release_step.wait(1)
+                return [], 0
+
+            def abort_request(self, _seq_id):
+                self.active_requests = 0
+                abort_called.set()
+
+            def exit(self):
+                pass
+
+        dispatcher = AsyncEngineDispatcher(Engine())
+        try:
+            sampling = type("Sampling", (), {"max_tokens": 1})()
+            handle = await dispatcher.submit("prompt", sampling, 0)
+            self.assertTrue(await asyncio.to_thread(step_started.wait, 1))
+            dispatcher.cancel(handle)
+            release_step.set()
+            self.assertTrue(await asyncio.to_thread(abort_called.wait, 1))
+            self.assertTrue(
+                await asyncio.to_thread(refreshed_after_abort.wait, 1)
+            )
+            self.assertEqual(
+                dispatcher.worker_routing_load_snapshot()["active_requests"],
+                0,
+            )
+        finally:
+            release_step.set()
+            dispatcher.close()
+
+    async def test_dispatcher_stop_abort_refreshes_snapshots_before_events(self):
+        from sparsevllm.entrypoints.openai.api_server import AsyncEngineDispatcher
+
+        tokenizer = _byte_level_tokenizer()
+        output_token_ids = tokenizer.encode("visibleSTOP")
+
+        class Snapshot:
+            def __init__(self, active_requests):
+                self.active_requests = active_requests
+
+            def match(self, _token_ids):
+                return {"active_requests": self.active_requests}
+
+        class Engine:
+            last_step_logprob_outputs = []
+
+            def __init__(self):
+                self.tokenizer = tokenizer
+                self.active_requests = 0
+                self.last_step_token_outputs = []
+
+            def worker_routing_load(self):
+                return {"active_requests": self.active_requests}
+
+            def prefix_cache_routing_snapshot(self):
+                return Snapshot(self.active_requests)
+
+            def add_request(self, _prompt, _sampling_params):
+                self.active_requests = 1
+                return 17
+
+            def step(self):
+                self.last_step_token_outputs = [(17, output_token_ids)]
+                return [], 0
+
+            def abort_request(self, _seq_id):
+                self.active_requests = 0
+
+            def exit(self):
+                pass
+
+        dispatcher = AsyncEngineDispatcher(Engine())
+        published_snapshot_states = []
+        original_put = dispatcher._put
+
+        def put_after_observing_snapshots(request, item):
+            if item["type"] in {"token", "final"}:
+                load = dispatcher.worker_routing_load_snapshot()
+                match = dispatcher.prefix_cache_routing_match([1])
+                published_snapshot_states.append(
+                    (
+                        item["type"],
+                        load["active_requests"],
+                        match["active_requests"],
+                    )
+                )
+            original_put(request, item)
+
+        dispatcher._put = put_after_observing_snapshots
+        try:
+            sampling = type(
+                "Sampling",
+                (),
+                {"max_tokens": len(output_token_ids)},
+            )()
+            handle = await dispatcher.submit(
+                "prompt",
+                sampling,
+                0,
+                stop=["STOP"],
+            )
+            items = []
+            while not items or items[-1]["type"] != "final":
+                items.append(
+                    await asyncio.wait_for(handle.output_queue.get(), timeout=1)
+                )
+        finally:
+            dispatcher.close()
+
+        self.assertEqual([item["type"] for item in items], ["token", "final"])
+        self.assertEqual(
+            published_snapshot_states,
+            [("token", 0, 0), ("final", 0, 0)],
+        )
+        self.assertEqual(
+            dispatcher._worker_routing_load_snapshot["active_requests"],
+            0,
+        )
+
+    async def test_dispatcher_stop_abort_refresh_failure_releases_request(self):
+        from sparsevllm.entrypoints.openai.api_server import AsyncEngineDispatcher
+
+        tokenizer = _byte_level_tokenizer()
+        output_token_ids = tokenizer.encode("visibleSTOP")
+
+        class Engine:
+            last_step_logprob_outputs = []
+
+            def __init__(self):
+                self.tokenizer = tokenizer
+                self.active_requests = 0
+                self.fail_snapshot = False
+                self.last_step_token_outputs = []
+
+            def worker_routing_load(self):
+                if self.fail_snapshot:
+                    raise RuntimeError("stop snapshot refresh failed")
+                return {"active_requests": self.active_requests}
+
+            def add_request(self, _prompt, _sampling_params):
+                self.active_requests = 1
+                return 17
+
+            def step(self):
+                self.last_step_token_outputs = [(17, output_token_ids)]
+                return [], 0
+
+            def abort_request(self, _seq_id):
+                self.active_requests = 0
+                self.fail_snapshot = True
+
+            def exit(self):
+                pass
+
+        failed = threading.Event()
+        dispatcher = AsyncEngineDispatcher(Engine())
+        dispatcher.set_fatal_callback(lambda _message: failed.set())
+        try:
+            sampling = type(
+                "Sampling",
+                (),
+                {"max_tokens": len(output_token_ids)},
+            )()
+            handle = await dispatcher.submit(
+                "prompt",
+                sampling,
+                0,
+                stop=["STOP"],
+            )
+            item = await asyncio.wait_for(handle.output_queue.get(), timeout=1)
+            self.assertTrue(await asyncio.to_thread(failed.wait, 1))
+        finally:
+            dispatcher.close()
+
+        self.assertEqual(item["type"], "error")
+        self.assertIn("stop snapshot refresh failed", item["message"])
         self.assertFalse(dispatcher.is_ready)
 
     def test_health_is_readiness_aware_but_livez_stays_available(self):

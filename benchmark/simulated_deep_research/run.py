@@ -322,6 +322,15 @@ def required_model_len(config: BenchmarkConfig) -> int:
     return max(required_model_len_by_role(config).values())
 
 
+def _guaranteed_main_agent_reusable_prefix_tokens(
+    config: BenchmarkConfig,
+) -> int:
+    return (
+        config.main_overhead_tokens
+        + max(0, config.rounds - 1) * config.min_round_summary_tokens
+    )
+
+
 def _validate_code_revision(value: Any, label: str) -> None:
     if not isinstance(value, dict):
         raise PreflightParseError(f"{label} is missing code_revision metadata.")
@@ -360,11 +369,17 @@ def _validate_code_revision(value: Any, label: str) -> None:
             f"{label} reports a dirty Git worktree; benchmark provenance "
             "requires committed router and worker code."
         )
-    if git_dirty is None and not package_version:
-        raise PreflightParseError(
-            f"{label} code_revision.git_dirty may be null only for an "
-            "installed package with package_version metadata."
-        )
+    if git_dirty is None:
+        if git_commit is not None:
+            raise PreflightParseError(
+                f"{label} code_revision.git_dirty must be false when "
+                "git_commit is present."
+            )
+        if not package_version:
+            raise PreflightParseError(
+                f"{label} code_revision.git_dirty may be null only for an "
+                "installed package with package_version metadata."
+            )
 
 
 def _health_url(base_url: str) -> str:
@@ -817,6 +832,34 @@ async def preflight(
                         "All eligible main-agent workers must report a "
                         "positive integer prefix_cache_block_size: "
                         f"workers={invalid_block_sizes}."
+                    )
+                guaranteed_reusable_prefix = (
+                    _guaranteed_main_agent_reusable_prefix_tokens(config)
+                )
+                oversized_block_sizes = [
+                    {
+                        "url": worker["url"],
+                        "block_size": worker["info"][
+                            "prefix_cache_block_size"
+                        ],
+                    }
+                    for worker in eligible_workers
+                    if worker["info"]["prefix_cache_block_size"]
+                    > guaranteed_reusable_prefix
+                ]
+                if oversized_block_sizes:
+                    details = ", ".join(
+                        f"worker={worker['url']} "
+                        f"block_size={worker['block_size']}"
+                        for worker in oversized_block_sizes
+                    )
+                    raise ValueError(
+                        "Eligible main-agent prefix-cache blocks cannot be "
+                        "reused by the configured workload: "
+                        f"{details}; guaranteed_reusable_prefix_tokens="
+                        f"{guaranteed_reusable_prefix}. Increase --rounds or "
+                        "--min-round-summary-tokens, or decrease the worker "
+                        "prefix_cache_block_size."
                     )
     else:
         worker = workers[0]
@@ -2083,6 +2126,28 @@ async def _run_benchmark_impl(
             )
             records.append(final_result)
             _require_success([final_result], "Final main agent")
+
+            if config.require_router and not any(
+                record["status"] == "success"
+                and record["phase"] != "subagent"
+                and int(
+                    record.get(
+                        "block_aligned_expected_reusable_prefix_tokens"
+                    )
+                    or 0
+                )
+                > 0
+                and int(record.get("actual_prefix_matched_tokens") or 0) > 0
+                for record in records
+            ):
+                raise BenchmarkFailed(
+                    "metric_failed",
+                    "Router run completed without a verified main-agent "
+                    "prefix-cache hit; no main-agent record had both positive "
+                    "block-aligned expected reuse and positive actual matched "
+                    "tokens. Keep reusable main prompts on a prefix-cache "
+                    "worker or inspect routing and cache state."
+                )
 
             distinct_workers = {
                 str(record["route_worker"])
