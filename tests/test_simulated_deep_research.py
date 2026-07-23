@@ -36,6 +36,9 @@ class FakeService:
         *,
         fail_sample_number=None,
         wrong_subagent_method=False,
+        zero_main_prefix_match=False,
+        partial_main_prefix_match=False,
+        invalid_prefix_match_header=False,
     ):
         self.active = 0
         self.max_active = 0
@@ -43,6 +46,10 @@ class FakeService:
         self.payloads = []
         self.fail_sample_number = fail_sample_number
         self.wrong_subagent_method = wrong_subagent_method
+        self.zero_main_prefix_match = zero_main_prefix_match
+        self.partial_main_prefix_match = partial_main_prefix_match
+        self.invalid_prefix_match_header = invalid_prefix_match_header
+        self.previous_main_prompt = None
 
     async def get(self, url, _timeout_s):
         if url.endswith("/models"):
@@ -116,10 +123,30 @@ class FakeService:
             else:
                 worker = "http://main-worker"
                 method = "omnikv"
+            matched_tokens = 0
+            if methods != ["snapkv"]:
+                prompt = tuple(payload["prompt"])
+                matched_tokens = run._common_prefix_tokens(
+                    self.previous_main_prompt,
+                    prompt,
+                )
+                self.previous_main_prompt = prompt
+                if self.zero_main_prefix_match:
+                    matched_tokens = 0
+                elif self.partial_main_prefix_match and matched_tokens > 0:
+                    matched_tokens -= 1
+            matched_tokens_header = (
+                "invalid"
+                if self.invalid_prefix_match_header
+                else str(matched_tokens)
+            )
             headers = {
                 "x-sparsevllm-worker": worker,
                 "x-sparsevllm-route-reason": "lowest_load_no_prefix_match",
                 "x-sparsevllm-sparse-method": method,
+                "x-sparsevllm-prefix-matched-tokens": (
+                    matched_tokens_header
+                ),
             }
             if call_number == self.fail_sample_number:
                 return _json_response(
@@ -383,6 +410,34 @@ class SimulatedDeepResearchTest(unittest.TestCase):
                 ],
                 [0, config.main_overhead_tokens, reusable_before_final],
             )
+            self.assertEqual(
+                [
+                    row["actual_prefix_matched_tokens"]
+                    for row in main_rows
+                ],
+                [0, config.main_overhead_tokens, reusable_before_final],
+            )
+            expected_reuse = (
+                config.main_overhead_tokens + reusable_before_final
+            )
+            self.assertEqual(
+                aggregate["prefix_cache"],
+                {
+                    "expected_reusable_prefix_tokens": expected_reuse,
+                    "actual_prefix_matched_tokens": expected_reuse,
+                    "observed_requests": 9,
+                    "expected_hit_requests": 2,
+                    "actual_hit_requests": 2,
+                    "unexpected_zero_hit_requests": 0,
+                    "partial_hit_requests": 0,
+                },
+            )
+            self.assertEqual(
+                aggregate["phase_metrics"]["round_summary"]["prefix_cache"][
+                    "actual_hit_requests"
+                ],
+                1,
+            )
             raw_rows = [
                 json.loads(line)
                 for line in (output_dir / "raw_outputs.jsonl")
@@ -405,6 +460,16 @@ class SimulatedDeepResearchTest(unittest.TestCase):
                     == config.request_timeout_s
                     for row in raw_rows
                 )
+            )
+            self.assertEqual(
+                [
+                    row["route_observation"][
+                        "actual_prefix_matched_tokens"
+                    ]
+                    for row in raw_rows
+                    if row["route_observation"]["method"] == "omnikv"
+                ],
+                [0, config.main_overhead_tokens, reusable_before_final],
             )
             run_info = json.loads(
                 (output_dir / "run_info.json").read_text(encoding="utf-8")
@@ -764,15 +829,110 @@ class SimulatedDeepResearchTest(unittest.TestCase):
                 expected,
             )
 
+    def test_zero_actual_hit_for_expected_prefix_is_metric_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "run"
+            config = self._config(output_dir)
+            service = FakeService(zero_main_prefix_match=True)
+
+            with self.assertRaisesRegex(
+                run.BenchmarkFailed,
+                "prefix reuse was expected",
+            ):
+                asyncio.run(
+                    run.run_benchmark(
+                        config,
+                        get_fn=service.get,
+                        post_fn=service.post,
+                    )
+                )
+
+            rows = [
+                json.loads(line)
+                for line in (output_dir / "per_sample_results.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            failed = [row for row in rows if row["status"] == "metric_failed"]
+            self.assertEqual(len(failed), 1)
+            self.assertGreater(
+                failed[0]["expected_reusable_prefix_tokens"],
+                0,
+            )
+            self.assertEqual(failed[0]["actual_prefix_matched_tokens"], 0)
+            aggregate = json.loads(
+                (output_dir / "aggregate_metrics.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(
+                aggregate["prefix_cache"]["unexpected_zero_hit_requests"],
+                1,
+            )
+
+    def test_partial_actual_prefix_hit_is_recorded_without_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "run"
+            config = self._config(output_dir)
+            service = FakeService(partial_main_prefix_match=True)
+
+            aggregate = asyncio.run(
+                run.run_benchmark(
+                    config,
+                    get_fn=service.get,
+                    post_fn=service.post,
+                )
+            )
+
+            self.assertEqual(aggregate["status"], "success")
+            self.assertEqual(
+                aggregate["prefix_cache"]["partial_hit_requests"],
+                2,
+            )
+            self.assertEqual(
+                aggregate["prefix_cache"]["unexpected_zero_hit_requests"],
+                0,
+            )
+
+    def test_invalid_prefix_match_header_is_metric_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "run"
+            config = self._config(output_dir)
+            service = FakeService(invalid_prefix_match_header=True)
+
+            with self.assertRaisesRegex(
+                run.BenchmarkFailed,
+                "invalid x-sparsevllm-prefix-matched-tokens",
+            ):
+                asyncio.run(
+                    run.run_benchmark(
+                        config,
+                        get_fn=service.get,
+                        post_fn=service.post,
+                    )
+                )
+
+            aggregate = json.loads(
+                (output_dir / "aggregate_metrics.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(aggregate["status_counts"]["metric_failed"], 3)
+            self.assertEqual(
+                aggregate["prefix_cache"]["observed_requests"],
+                0,
+            )
+
     def test_default_http_executor_reaches_configured_concurrency(self):
         concurrency = 40
         barrier = threading.Barrier(concurrency)
         lock = threading.Lock()
         active = 0
         max_active = 0
+        previous_main_prompt = None
 
         def fake_request(_url, *, payload, timeout_s):
-            nonlocal active, max_active
+            nonlocal active, max_active, previous_main_prompt
             self.assertGreater(timeout_s, 0)
             methods = payload["svllm_method_preference"].split(",")
             if methods == ["snapkv"]:
@@ -789,6 +949,14 @@ class SimulatedDeepResearchTest(unittest.TestCase):
             else:
                 worker = "http://main-worker"
                 method = "omnikv"
+            matched_tokens = 0
+            if methods != ["snapkv"]:
+                prompt = tuple(payload["prompt"])
+                matched_tokens = run._common_prefix_tokens(
+                    previous_main_prompt,
+                    prompt,
+                )
+                previous_main_prompt = prompt
             prompt_tokens = len(payload["prompt"])
             completion_tokens = payload["max_tokens"]
             return _json_response(
@@ -810,6 +978,9 @@ class SimulatedDeepResearchTest(unittest.TestCase):
                     "x-sparsevllm-worker": worker,
                     "x-sparsevllm-route-reason": "test",
                     "x-sparsevllm-sparse-method": method,
+                    "x-sparsevllm-prefix-matched-tokens": str(
+                        matched_tokens
+                    ),
                 },
             )
 

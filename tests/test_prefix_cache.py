@@ -1,3 +1,4 @@
+import math
 import tempfile
 from collections import deque
 from pathlib import Path
@@ -280,6 +281,91 @@ def test_routing_snapshot_is_immutable_and_refreshes_after_insert():
     assert first_snapshot.match(list(range(13)))["matched_tokens"] == 8
     assert second_snapshot.match(list(range(13)))["matched_tokens"] == 12
     assert second_snapshot.match(list(range(13)))["snapshot"] is True
+
+
+def test_routing_snapshot_removal_does_not_leave_false_hit():
+    fp = build_prefix_cache_fingerprint(_cfg(method="omnikv"), 4)
+    index = RadixPrefixIndex(block_size=4, fingerprint=fp)
+    last_block_id = _insert_tokens(index, list(range(8)))
+
+    first_snapshot = index.routing_snapshot("omnikv")
+    removed = index._remove_block_from_index(last_block_id)
+    second_snapshot = index.routing_snapshot("omnikv")
+
+    assert removed.stable_block_id == last_block_id
+    assert first_snapshot.match(list(range(9)))["matched_tokens"] == 8
+    assert second_snapshot.match(list(range(9)))["matched_tokens"] == 4
+    assert second_snapshot.match(list(range(9)))["live_blocks"] == 1
+
+
+def test_routing_snapshot_membership_structurally_shares_avl_nodes():
+    fp = build_prefix_cache_fingerprint(_cfg(method="omnikv"), 4)
+    index = RadixPrefixIndex(block_size=4, fingerprint=fp)
+
+    def insert_root_block(value: int) -> bytes:
+        token_ids = tuple(range(value * 4, value * 4 + 4))
+        stable_block_id = index.stable_block_id(token_ids, None)
+        index.insert_block(
+            PrefixCacheBlock(
+                stable_block_id=stable_block_id,
+                parent_block_id=None,
+                block_size=4,
+                logical_block_idx=0,
+                payload=SimpleNamespace(name="dummy"),
+                token_ids=token_ids,
+            )
+        )
+        return stable_block_id
+
+    def validate_tree(root) -> tuple[int, set[int]]:
+        if root is None:
+            return 0, set()
+        left_height, left_ids = validate_tree(root.left)
+        right_height, right_ids = validate_tree(root.right)
+        assert abs(left_height - right_height) <= 1
+        assert root.height == 1 + max(left_height, right_height)
+        return root.height, left_ids | right_ids | {id(root)}
+
+    for value in range(256):
+        insert_root_block(value)
+    first_snapshot = index.routing_snapshot("omnikv")
+    assert first_snapshot.routing_membership is not None
+    first_height, first_nodes = validate_tree(
+        first_snapshot.routing_membership.root
+    )
+
+    inserted_block_id = insert_root_block(256)
+    second_snapshot = index.routing_snapshot("omnikv")
+    assert second_snapshot.routing_membership is not None
+    second_height, second_nodes = validate_tree(
+        second_snapshot.routing_membership.root
+    )
+
+    assert len(first_nodes) == 256
+    assert len(second_nodes) == 257
+    assert len(first_nodes & second_nodes) >= 240
+    assert first_snapshot.routing_membership.contains(inserted_block_id) is False
+    assert second_snapshot.routing_membership.contains(inserted_block_id) is True
+    assert first_height == first_snapshot.routing_membership.height
+    assert second_height == second_snapshot.routing_membership.height
+    assert second_height <= 2 * math.ceil(
+        math.log2(second_snapshot.routing_membership.live_blocks + 1)
+    )
+
+    index._remove_block_from_index(inserted_block_id)
+    third_snapshot = index.routing_snapshot("omnikv")
+    assert third_snapshot.routing_membership is not None
+    third_height, third_nodes = validate_tree(
+        third_snapshot.routing_membership.root
+    )
+
+    assert len(third_nodes) == 256
+    assert len(second_nodes & third_nodes) >= 235
+    assert second_snapshot.routing_membership.contains(inserted_block_id) is True
+    assert third_snapshot.routing_membership.contains(inserted_block_id) is False
+    assert third_height <= 2 * math.ceil(
+        math.log2(third_snapshot.routing_membership.live_blocks + 1)
+    )
 
 
 def test_lookup_never_returns_half_block_match():

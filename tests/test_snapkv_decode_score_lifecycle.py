@@ -44,6 +44,7 @@ def make_controller(
     graph=False,
     graph_capacity=None,
     keep=2,
+    score_dtype="float32",
 ):
     layout = SimpleNamespace(
         kv_layer_index=lambda layer: int(layer),
@@ -63,7 +64,7 @@ def make_controller(
         num_sink_tokens=1,
         num_recent_tokens=1,
         decode_keep_tokens=keep,
-        sparse_attn_score_dtype="float32",
+        sparse_attn_score_dtype=score_dtype,
         tensor_parallel_size=1,
         snapkv_num_full_layers=0,
         pyramid_layer_ratios=[1.0] * layers if method == "pyramidkv" else None,
@@ -150,6 +151,34 @@ class SnapKVDecodeScoreLifecycleTest(unittest.TestCase):
             state.attn_score,
             torch.tensor([[6, 7, 8, 4, 5, 9]]).float(),
         )
+
+    def test_fused_decode_score_stays_float32_for_low_precision_score_configs(self):
+        configured_dtypes = {
+            "float16": torch.float16,
+            "bfloat16": torch.bfloat16,
+        }
+        for method in ("snapkv", "pyramidkv"):
+            for score_name, configured_dtype in configured_dtypes.items():
+                with self.subTest(method=method, score_dtype=score_name):
+                    controller, manager, seqs = make_controller(
+                        method,
+                        layers=1,
+                        score_dtype=score_name,
+                    )
+                    score = controller.get_decode_selection(
+                        0,
+                        torch.empty((1, 2, 4)),
+                    ).attn_score
+                    self.assertEqual(controller.attn_score_dtype, configured_dtype)
+                    self.assertEqual(score.dtype, torch.float32)
+                    self.assertEqual(
+                        controller._snapkv_decode_reduced_attn_score_buffers[0].dtype,
+                        torch.float32,
+                    )
+                    score.copy_(torch.arange(6, dtype=torch.float32).reshape(1, 6))
+                    controller.on_layer_attention_end(0)
+                    controller.post_forward(seqs, is_prefill=False)
+                    self.assertEqual(len(manager.compactions), 1)
 
     def test_graph_refs_are_2d_keepalive_and_score_before_trigger(self):
         controller, _manager, seqs = make_controller(

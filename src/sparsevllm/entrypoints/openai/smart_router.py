@@ -544,11 +544,24 @@ class SmartRouter:
         probes: list[WorkerProbe],
         route_hints: dict[str, Any],
     ) -> dict[str, Any]:
+        selected_probe = next(
+            (
+                probe
+                for probe in probes
+                if probe.worker is worker
+            ),
+            None,
+        )
         return {
             "id": f"route-{uuid.uuid4().hex}",
             "endpoint": endpoint,
             "selected_worker_url": worker.url,
             "selected_sparse_method": worker.info.get("sparse_method", ""),
+            "selected_prefix_matched_tokens": (
+                selected_probe.matched_tokens
+                if selected_probe is not None
+                else None
+            ),
             "reason": reason,
             "hints": route_hints,
             "probes": [
@@ -643,11 +656,15 @@ def match_payload_for_request(endpoint: str, payload: dict[str, Any]) -> dict[st
 
 
 def route_headers(route: dict[str, Any]) -> dict[str, str]:
-    return {
+    headers = {
         "X-SparseVLLM-Worker": str(route["selected_worker_url"]),
         "X-SparseVLLM-Route-Reason": str(route["reason"]),
         "X-SparseVLLM-Sparse-Method": str(route.get("selected_sparse_method", "")),
     }
+    matched_tokens = route.get("selected_prefix_matched_tokens")
+    if matched_tokens is not None:
+        headers["X-SparseVLLM-Prefix-Matched-Tokens"] = str(matched_tokens)
+    return headers
 
 
 def _with_route_headers(response: Response, route: dict[str, Any]) -> Response:

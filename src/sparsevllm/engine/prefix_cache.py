@@ -103,6 +103,235 @@ def _stable_prefix_block_id(
     return hasher.digest()
 
 
+@dataclass(frozen=True, slots=True)
+class _PrefixCacheRoutingMembershipNode:
+    block_id: bytes
+    left: _PrefixCacheRoutingMembershipNode | None = None
+    right: _PrefixCacheRoutingMembershipNode | None = None
+    height: int = 1
+
+
+def _routing_membership_height(
+    node: _PrefixCacheRoutingMembershipNode | None,
+) -> int:
+    return 0 if node is None else node.height
+
+
+def _make_routing_membership_node(
+    block_id: bytes,
+    left: _PrefixCacheRoutingMembershipNode | None,
+    right: _PrefixCacheRoutingMembershipNode | None,
+) -> _PrefixCacheRoutingMembershipNode:
+    return _PrefixCacheRoutingMembershipNode(
+        block_id=block_id,
+        left=left,
+        right=right,
+        height=1 + max(
+            _routing_membership_height(left),
+            _routing_membership_height(right),
+        ),
+    )
+
+
+def _rotate_routing_membership_left(
+    node: _PrefixCacheRoutingMembershipNode,
+) -> _PrefixCacheRoutingMembershipNode:
+    pivot = node.right
+    if pivot is None:
+        raise RuntimeError("Cannot rotate prefix-cache routing membership left.")
+    moved = _make_routing_membership_node(
+        node.block_id,
+        node.left,
+        pivot.left,
+    )
+    return _make_routing_membership_node(
+        pivot.block_id,
+        moved,
+        pivot.right,
+    )
+
+
+def _rotate_routing_membership_right(
+    node: _PrefixCacheRoutingMembershipNode,
+) -> _PrefixCacheRoutingMembershipNode:
+    pivot = node.left
+    if pivot is None:
+        raise RuntimeError("Cannot rotate prefix-cache routing membership right.")
+    moved = _make_routing_membership_node(
+        node.block_id,
+        pivot.right,
+        node.right,
+    )
+    return _make_routing_membership_node(
+        pivot.block_id,
+        pivot.left,
+        moved,
+    )
+
+
+def _balance_routing_membership(
+    node: _PrefixCacheRoutingMembershipNode,
+) -> _PrefixCacheRoutingMembershipNode:
+    balance = (
+        _routing_membership_height(node.left)
+        - _routing_membership_height(node.right)
+    )
+    if balance > 1:
+        left = node.left
+        if left is None:
+            raise RuntimeError("Invalid left-heavy prefix-cache routing membership.")
+        if _routing_membership_height(left.left) < _routing_membership_height(
+            left.right
+        ):
+            left = _rotate_routing_membership_left(left)
+            node = _make_routing_membership_node(
+                node.block_id,
+                left,
+                node.right,
+            )
+        return _rotate_routing_membership_right(node)
+    if balance < -1:
+        right = node.right
+        if right is None:
+            raise RuntimeError("Invalid right-heavy prefix-cache routing membership.")
+        if _routing_membership_height(right.right) < _routing_membership_height(
+            right.left
+        ):
+            right = _rotate_routing_membership_right(right)
+            node = _make_routing_membership_node(
+                node.block_id,
+                node.left,
+                right,
+            )
+        return _rotate_routing_membership_left(node)
+    return node
+
+
+def _insert_routing_membership(
+    node: _PrefixCacheRoutingMembershipNode | None,
+    block_id: bytes,
+) -> tuple[_PrefixCacheRoutingMembershipNode, bool]:
+    if node is None:
+        return _PrefixCacheRoutingMembershipNode(block_id=block_id), True
+    if block_id == node.block_id:
+        return node, False
+    if block_id < node.block_id:
+        left, inserted = _insert_routing_membership(node.left, block_id)
+        if not inserted:
+            return node, False
+        updated = _make_routing_membership_node(
+            node.block_id,
+            left,
+            node.right,
+        )
+    else:
+        right, inserted = _insert_routing_membership(node.right, block_id)
+        if not inserted:
+            return node, False
+        updated = _make_routing_membership_node(
+            node.block_id,
+            node.left,
+            right,
+        )
+    return _balance_routing_membership(updated), True
+
+
+def _minimum_routing_membership_node(
+    node: _PrefixCacheRoutingMembershipNode,
+) -> _PrefixCacheRoutingMembershipNode:
+    while node.left is not None:
+        node = node.left
+    return node
+
+
+def _remove_routing_membership(
+    node: _PrefixCacheRoutingMembershipNode | None,
+    block_id: bytes,
+) -> tuple[_PrefixCacheRoutingMembershipNode | None, bool]:
+    if node is None:
+        return None, False
+    if block_id < node.block_id:
+        left, removed = _remove_routing_membership(node.left, block_id)
+        if not removed:
+            return node, False
+        updated = _make_routing_membership_node(
+            node.block_id,
+            left,
+            node.right,
+        )
+    elif block_id > node.block_id:
+        right, removed = _remove_routing_membership(node.right, block_id)
+        if not removed:
+            return node, False
+        updated = _make_routing_membership_node(
+            node.block_id,
+            node.left,
+            right,
+        )
+    else:
+        if node.left is None:
+            return node.right, True
+        if node.right is None:
+            return node.left, True
+        successor = _minimum_routing_membership_node(node.right)
+        right, removed = _remove_routing_membership(
+            node.right,
+            successor.block_id,
+        )
+        if not removed:
+            raise RuntimeError(
+                "Failed to remove prefix-cache routing membership successor."
+            )
+        updated = _make_routing_membership_node(
+            successor.block_id,
+            node.left,
+            right,
+        )
+    return _balance_routing_membership(updated), True
+
+
+@dataclass(frozen=True, slots=True)
+class _PrefixCacheRoutingMembership:
+    """Immutable AVL set shared by old and new routing snapshots."""
+
+    root: _PrefixCacheRoutingMembershipNode | None = None
+    live_blocks: int = 0
+
+    @property
+    def height(self) -> int:
+        return _routing_membership_height(self.root)
+
+    def contains(self, block_id: bytes) -> bool:
+        node = self.root
+        while node is not None:
+            if block_id == node.block_id:
+                return True
+            node = node.left if block_id < node.block_id else node.right
+        return False
+
+    def insert(self, block_id: bytes) -> _PrefixCacheRoutingMembership:
+        root, inserted = _insert_routing_membership(self.root, block_id)
+        if not inserted:
+            raise RuntimeError(
+                "Prefix-cache routing membership already contains inserted block."
+            )
+        return _PrefixCacheRoutingMembership(
+            root=root,
+            live_blocks=self.live_blocks + 1,
+        )
+
+    def remove(self, block_id: bytes) -> _PrefixCacheRoutingMembership:
+        root, removed = _remove_routing_membership(self.root, block_id)
+        if not removed:
+            raise RuntimeError(
+                "Prefix-cache routing membership is missing removed block."
+            )
+        return _PrefixCacheRoutingMembership(
+            root=root,
+            live_blocks=self.live_blocks - 1,
+        )
+
+
 @dataclass(frozen=True)
 class PrefixCacheRoutingSnapshot:
     supported: bool
@@ -111,6 +340,11 @@ class PrefixCacheRoutingSnapshot:
     block_size: int | None = None
     fingerprint: bytes = b""
     block_ids: frozenset[bytes] = frozenset()
+    routing_membership: _PrefixCacheRoutingMembership | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
     reason: str | None = None
 
     def match(self, token_ids: list[int]) -> dict[str, object]:
@@ -144,7 +378,11 @@ class PrefixCacheRoutingSnapshot:
                 token_ids[start : start + self.block_size],
                 parent_block_id,
             )
-            if block_id not in self.block_ids:
+            if self.routing_membership is None:
+                contains_block = block_id in self.block_ids
+            else:
+                contains_block = self.routing_membership.contains(block_id)
+            if not contains_block:
                 break
             hit_blocks += 1
             last_block_id = block_id
@@ -167,7 +405,11 @@ class PrefixCacheRoutingSnapshot:
             "last_block_id": (
                 None if last_block_id is None else last_block_id.hex()
             ),
-            "live_blocks": int(len(self.block_ids)),
+            "live_blocks": int(
+                len(self.block_ids)
+                if self.routing_membership is None
+                else self.routing_membership.live_blocks
+            ),
             "snapshot": True,
         }
 
@@ -491,6 +733,7 @@ class RadixPrefixIndex:
         self.control_delete_requests = 0
         self.control_priority_updates = 0
         self._routing_snapshot: PrefixCacheRoutingSnapshot | None = None
+        self._routing_membership = _PrefixCacheRoutingMembership()
 
     def __len__(self) -> int:
         return len(self.blocks)
@@ -524,16 +767,34 @@ class RadixPrefixIndex:
         method = str(method or "")
         snapshot = self._routing_snapshot
         if snapshot is None or snapshot.method != method:
+            if self._routing_membership.live_blocks != len(self.blocks):
+                raise RuntimeError(
+                    "Prefix-cache routing membership is inconsistent with the live index: "
+                    f"routing_blocks={self._routing_membership.live_blocks} "
+                    f"live_blocks={len(self.blocks)}."
+                )
             snapshot = PrefixCacheRoutingSnapshot(
                 supported=True,
                 enabled=True,
                 method=method,
                 block_size=self.block_size,
                 fingerprint=self.fingerprint,
-                block_ids=frozenset(self.blocks),
+                routing_membership=self._routing_membership,
             )
             self._routing_snapshot = snapshot
         return snapshot
+
+    def _record_routing_insert(self, stable_block_id: bytes) -> None:
+        self._routing_membership = self._routing_membership.insert(
+            stable_block_id
+        )
+        self._routing_snapshot = None
+
+    def _record_routing_remove(self, stable_block_id: bytes) -> None:
+        self._routing_membership = self._routing_membership.remove(
+            stable_block_id
+        )
+        self._routing_snapshot = None
 
     def block_ids_for_tokens(
         self,
@@ -644,7 +905,7 @@ class RadixPrefixIndex:
         self.blocks[block.stable_block_id] = block
         self.backend.insert_child(block.parent_block_id, block.stable_block_id)
         self.committed_blocks += 1
-        self._routing_snapshot = None
+        self._record_routing_insert(block.stable_block_id)
         return block
 
     def touch_chain(self, blocks: list[PrefixCacheBlock]) -> None:
@@ -722,7 +983,7 @@ class RadixPrefixIndex:
             raise RuntimeError("Cannot remove a prefix cache block with live children.")
         self.backend.remove_block(stable_block_id)
         del self.blocks[stable_block_id]
-        self._routing_snapshot = None
+        self._record_routing_remove(stable_block_id)
         return block
 
     def rollback_inserted_leaf(self, block: PrefixCacheBlock) -> None:

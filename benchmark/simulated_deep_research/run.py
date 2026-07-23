@@ -41,6 +41,7 @@ ROUTE_HEADERS = {
     "worker": "x-sparsevllm-worker",
     "reason": "x-sparsevllm-route-reason",
     "method": "x-sparsevllm-sparse-method",
+    "prefix_matched_tokens": "x-sparsevllm-prefix-matched-tokens",
 }
 DEFAULT_ARTICLE_TOKEN_BUCKETS = (
     (60, 1_000, 8_000),
@@ -889,6 +890,8 @@ async def run_request(
     parsed_text: str | None = None
     finish_reason: str | None = None
     usage: dict[str, Any] = {}
+    route = _route_values(response_headers)
+    actual_prefix_matched_tokens: int | None = None
     try:
         response = await post_fn(
             _completion_url(config.base_url),
@@ -971,6 +974,22 @@ async def run_request(
             if missing_headers:
                 status = "metric_failed"
                 error = f"Router response is missing route headers: {missing_headers}."
+        if config.require_router and route.get("prefix_matched_tokens") is not None:
+            try:
+                actual_prefix_matched_tokens = int(
+                    str(route["prefix_matched_tokens"])
+                )
+                if actual_prefix_matched_tokens < 0:
+                    raise ValueError("value must be non-negative")
+            except ValueError as exc:
+                actual_prefix_matched_tokens = None
+                if status == "success":
+                    status = "metric_failed"
+                    error = (
+                        "Router response has invalid "
+                        f"{ROUTE_HEADERS['prefix_matched_tokens']} header "
+                        f"{route['prefix_matched_tokens']!r}: {exc}."
+                    )
         if status == "success":
             expected_methods = {
                 _canonical_method(item) for item in spec.method_preferences
@@ -981,6 +1000,28 @@ async def run_request(
                 error = (
                     f"{spec.phase} request routed to method {actual_method!r}; "
                     f"expected one of {sorted(expected_methods)}."
+                )
+        if (
+            status == "success"
+            and config.require_router
+            and actual_prefix_matched_tokens is not None
+        ):
+            if actual_prefix_matched_tokens > spec.prompt_tokens:
+                status = "metric_failed"
+                error = (
+                    "Router reported more matched prefix tokens than the "
+                    f"request prompt: matched={actual_prefix_matched_tokens}, "
+                    f"prompt={spec.prompt_tokens}."
+                )
+            elif (
+                spec.expected_reusable_prefix_tokens > 0
+                and actual_prefix_matched_tokens == 0
+            ):
+                status = "metric_failed"
+                error = (
+                    "Main-agent prefix reuse was expected but the selected "
+                    "worker reported zero matched tokens: "
+                    f"expected={spec.expected_reusable_prefix_tokens}."
                 )
         if status == "success":
             actual_prompt = usage["prompt_tokens"]
@@ -1017,6 +1058,12 @@ async def run_request(
         },
         "http_status": http_status,
         "response_headers": response_headers,
+        "route_observation": {
+            "worker": route.get("worker"),
+            "reason": route.get("reason"),
+            "method": route.get("method"),
+            "actual_prefix_matched_tokens": actual_prefix_matched_tokens,
+        },
         "response": response_body,
     }
     parsed_record = {
@@ -1051,6 +1098,7 @@ async def run_request(
         "expected_reusable_prefix_tokens": (
             spec.expected_reusable_prefix_tokens
         ),
+        "actual_prefix_matched_tokens": actual_prefix_matched_tokens,
     }
     writer.write_jsonl("raw_outputs", raw_record)
     writer.write_jsonl("parsed_outputs", parsed_record)
@@ -1153,6 +1201,48 @@ def _run_info(
     }
 
 
+def _prefix_cache_metrics(
+    records: list[dict[str, Any]],
+) -> dict[str, int]:
+    observed_records = [
+        record
+        for record in records
+        if record.get("actual_prefix_matched_tokens") is not None
+    ]
+    expected_hit_records = [
+        record
+        for record in records
+        if int(record.get("expected_reusable_prefix_tokens") or 0) > 0
+    ]
+    return {
+        "expected_reusable_prefix_tokens": sum(
+            int(record.get("expected_reusable_prefix_tokens") or 0)
+            for record in records
+        ),
+        "actual_prefix_matched_tokens": sum(
+            int(record["actual_prefix_matched_tokens"])
+            for record in observed_records
+        ),
+        "observed_requests": len(observed_records),
+        "expected_hit_requests": len(expected_hit_records),
+        "actual_hit_requests": sum(
+            int(record["actual_prefix_matched_tokens"]) > 0
+            for record in observed_records
+        ),
+        "unexpected_zero_hit_requests": sum(
+            int(record.get("expected_reusable_prefix_tokens") or 0) > 0
+            and record.get("actual_prefix_matched_tokens") == 0
+            for record in records
+        ),
+        "partial_hit_requests": sum(
+            0
+            < int(record.get("actual_prefix_matched_tokens") or 0)
+            < int(record.get("expected_reusable_prefix_tokens") or 0)
+            for record in records
+        ),
+    }
+
+
 def _aggregate_metrics(
     config: BenchmarkConfig,
     records: list[dict[str, Any]],
@@ -1204,6 +1294,11 @@ def _aggregate_metrics(
     all_success = status == "success" and len(success_records) == expected_requests
     phase_metrics = {}
     for phase in sorted(phase_counts):
+        phase_all_records = [
+            record
+            for record in records
+            if record["phase"] == phase
+        ]
         phase_records = [
             record
             for record in success_records
@@ -1255,6 +1350,7 @@ def _aggregate_metrics(
             "expected_reusable_prefix_tokens": (
                 phase_expected_reusable_prefix_tokens
             ),
+            "prefix_cache": _prefix_cache_metrics(phase_all_records),
             "total_tokens_per_s": (
                 (phase_prompt_tokens + phase_completion_tokens)
                 / phase_elapsed_s
@@ -1309,6 +1405,7 @@ def _aggregate_metrics(
         "route_worker_counts": dict(sorted(route_worker_counts.items())),
         "route_method_counts": dict(sorted(route_method_counts.items())),
         "route_reason_counts": dict(sorted(route_reason_counts.items())),
+        "prefix_cache": _prefix_cache_metrics(records),
         "distinct_route_workers": len(route_worker_counts),
         "rounds_attempted": len(rounds),
         "rounds_completed": sum(

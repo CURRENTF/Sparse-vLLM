@@ -120,23 +120,29 @@ rejected. The run writes:
   benchmark-critical configuration and code revision reported by every
   worker.
 - `raw_outputs.jsonl`: exact request URL, timeout, prompt seed and payload,
-  plus raw HTTP responses and response headers.
+  plus raw HTTP responses, response headers, and the parsed router observation.
 - `parsed_outputs.jsonl`: extracted text, finish reason, usage, and parse
   status.
 - `per_sample_results.jsonl`: phase, requested/actual token counts, latency,
   method preference, actual worker, actual method, expected reusable
-  main-agent prefix tokens, and explicit status.
+  main-agent prefix tokens, the selected worker's actual matched prefix tokens,
+  and explicit status.
 - `round_metrics.jsonl`: barrier time, p50/p95/max subagent latency, straggler
   gap, main-agent latency, and explicit status for every attempted round,
   including a round whose main-agent request fails.
 - `aggregate_metrics.json`: end-to-end research-job throughput, token
   throughput, latency percentiles, status counts, route distributions, and
-  separate attempted/completed round counts.
+  separate attempted/completed round counts. Its top-level and per-phase
+  `prefix_cache` objects include expected and actual token totals, expected and
+  actual hit counts, partial hits, and unexpected zero hits.
 
 Any failed HTTP request, malformed response, token-count mismatch, wrong method
-route, or missing route header remains visible in the artifacts and makes the
-run fail.
+route, missing route header, invalid matched-token header, or expected nonzero
+reuse with zero actual matched tokens remains visible in the artifacts and
+makes the run fail.
 
 `expected_reusable_prefix_tokens` is the raw common-prefix length. A block-based
 prefix cache can reuse the largest whole-block prefix, so observed hit tokens
-may be lower by fewer than one cache block per hit.
+may be lower. A nonzero partial hit is recorded without failing the metric
+because block alignment and cache capacity can reduce reuse; an observed zero
+when the workload expects a reusable main-agent prefix is `metric_failed`.

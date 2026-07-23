@@ -94,6 +94,9 @@ class SparseController:
             "bfloat16": torch.bfloat16,
             "float16": torch.float16,
         }[score_dtype_name]
+        # Fused SnapKV-family decode uses tl.atomic_max on its 2D score buffer;
+        # Triton only supports floating-point atomic_max for fp32/fp64.
+        self.snapkv_decode_score_dtype = torch.float32
         
         # 稀疏层私有状态: dict[layer_idx, LayerSparseState]
         self.layer_batch_sparse_states: dict[int, LayerBatchSparseState] = {}
@@ -377,12 +380,16 @@ class SparseController:
         reduced = self._snapkv_decode_reduced_attn_score_buffers.get(int(layer_idx))
         if (
             reduced is None
-            or reduced.dtype != self.attn_score_dtype
+            or reduced.dtype != self.snapkv_decode_score_dtype
             or reduced.device != self.device
             or int(reduced.shape[0]) < batch_size
             or int(reduced.shape[1]) < max_len
         ):
-            reduced = torch.empty((batch_size, max_len), dtype=self.attn_score_dtype, device=self.device)
+            reduced = torch.empty(
+                (batch_size, max_len),
+                dtype=self.snapkv_decode_score_dtype,
+                device=self.device,
+            )
             self._snapkv_decode_reduced_attn_score_buffers[int(layer_idx)] = reduced
         view = reduced[:batch_size, :max_len]
         view.fill_(fill_value)
@@ -776,11 +783,14 @@ class SparseController:
                         "SnapKV/PyramidKV post-forward eviction requires head-reduced [B, L] scores: "
                         f"layer={layer_idx} shape={tuple(attn_scores.shape)}."
                     )
-                if attn_scores.dtype != self.attn_score_dtype or attn_scores.device != self.device:
+                if (
+                    attn_scores.dtype != self.snapkv_decode_score_dtype
+                    or attn_scores.device != self.device
+                ):
                     raise RuntimeError(
                         "SnapKV/PyramidKV post-forward score dtype/device mismatch: "
                         f"layer={layer_idx} got={attn_scores.dtype}/{attn_scores.device} "
-                        f"expected={self.attn_score_dtype}/{self.device}."
+                        f"expected={self.snapkv_decode_score_dtype}/{self.device}."
                     )
 
                 by_kv_len: dict[int, list[tuple[int, Sequence]]] = {}

@@ -124,6 +124,83 @@ class OpenAISmartRouterTest(unittest.TestCase):
         self.assertIs(worker, cache_worker)
         self.assertEqual(reason, "best_prefix_match")
 
+    def test_route_headers_report_selected_probe_matched_tokens(self):
+        from sparsevllm.entrypoints.openai import smart_router
+
+        router = smart_router.SmartRouter(
+            worker_urls=["http://worker-a", "http://worker-b"],
+            request_timeout_s=1.0,
+            overload_load_factor=1.5,
+            load_abs_threshold=1,
+            profiles={},
+            route_log_dir=None,
+        )
+        selected = router.workers[0]
+        selected.info = {"sparse_method": "omnikv"}
+        other = router.workers[1]
+        other.info = {"sparse_method": "omnikv"}
+        route = router._route_record(
+            "/v1/completions",
+            selected,
+            "best_prefix_match",
+            [
+                smart_router.WorkerProbe(
+                    worker=selected,
+                    load={"active_requests": 1},
+                    match={
+                        "supported": True,
+                        "enabled": True,
+                        "matched_tokens": 128,
+                        "match_ratio": 0.5,
+                    },
+                ),
+                smart_router.WorkerProbe(
+                    worker=other,
+                    load={"active_requests": 0},
+                    match={
+                        "supported": True,
+                        "enabled": True,
+                        "matched_tokens": 0,
+                        "match_ratio": 0.0,
+                    },
+                ),
+            ],
+            {},
+        )
+
+        self.assertEqual(route["selected_prefix_matched_tokens"], 128)
+        self.assertEqual(
+            smart_router.route_headers(route)[
+                "X-SparseVLLM-Prefix-Matched-Tokens"
+            ],
+            "128",
+        )
+
+    def test_target_worker_route_does_not_claim_unprobed_prefix_match(self):
+        from sparsevllm.entrypoints.openai import smart_router
+
+        router = smart_router.SmartRouter(
+            worker_urls=["http://worker-a"],
+            request_timeout_s=1.0,
+            overload_load_factor=1.5,
+            load_abs_threshold=1,
+            profiles={},
+            route_log_dir=None,
+        )
+        route = router._route_record(
+            "/v1/completions",
+            router.workers[0],
+            "target_worker",
+            [],
+            {"target_worker": "0"},
+        )
+
+        self.assertIsNone(route["selected_prefix_matched_tokens"])
+        self.assertNotIn(
+            "X-SparseVLLM-Prefix-Matched-Tokens",
+            smart_router.route_headers(route),
+        )
+
     def test_probe_uses_nonblocking_prefix_routing_snapshot(self):
         from sparsevllm.entrypoints.openai import smart_router
 
