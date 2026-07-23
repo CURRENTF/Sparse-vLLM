@@ -1,0 +1,150 @@
+from types import SimpleNamespace
+import unittest
+
+import torch
+
+from sparsevllm.engine.decode_cuda_graph import DecodeCudaGraphRunner
+from sparsevllm.engine.sequence import Sequence
+from sparsevllm.engine.sparse_controller import SparseController
+from sparsevllm.utils.context import reset_context, set_context
+
+
+def make_controller(method="snapkv", *, layers=2, kv_len=6, graph=False, keep=2):
+    layout = SimpleNamespace(
+        kv_layer_index=lambda layer: int(layer),
+        is_full_attention=lambda layer: 0 <= int(layer) < layers,
+    )
+    config = SimpleNamespace(
+        vllm_sparse_method=method,
+        obs_layer_ids=[],
+        full_attn_layers=[],
+        hf_config=SimpleNamespace(
+            num_hidden_layers=layers,
+            hidden_size=8,
+            num_attention_heads=2,
+            torch_dtype=torch.float32,
+        ),
+        runtime_layout=layout,
+        num_sink_tokens=1,
+        num_recent_tokens=1,
+        decode_keep_tokens=keep,
+        sparse_attn_score_dtype="float32",
+        tensor_parallel_size=1,
+        snapkv_num_full_layers=0,
+        pyramid_layer_ratios=[1.0] * layers if method == "pyramidkv" else None,
+        decode_cuda_graph=graph,
+        pool_kernel_size=1,
+    )
+
+    class Manager:
+        device = torch.device("cpu")
+
+        def __init__(self):
+            self.compactions = []
+
+        def get_layer_batch_states(self, layer):
+            del layer
+            return SimpleNamespace(
+                context_lens=torch.tensor([kv_len], dtype=torch.int32),
+                max_context_len=kv_len,
+                req_indices=torch.tensor([0], dtype=torch.int32),
+            )
+
+        def decode_kv_lens_for_layer(self, layer, seqs):
+            del layer
+            return [kv_len for _seq in seqs]
+
+        def free_part_slots(self, layer, seq, keep_indices):
+            self.compactions.append((layer, seq.seq_id, keep_indices.clone()))
+
+    manager = Manager()
+    controller = SparseController(config, manager)
+    seqs = [Sequence([1])]
+    set_context(False, cache_manager=manager, is_long_text=True, seqs=seqs)
+    controller.prepare_forward(seqs, is_prefill=False)
+    return controller, manager, seqs
+
+
+class SnapKVDecodeScoreLifecycleTest(unittest.TestCase):
+    def tearDown(self):
+        reset_context()
+
+    def test_shared_workspace_reduces_immediately_into_independent_layer_scores(self):
+        controller, _manager, _seqs = make_controller()
+        states = controller.layer_batch_sparse_states
+        stable_ptrs = [states[layer].attn_score.data_ptr() for layer in range(2)]
+        self.assertNotEqual(*stable_ptrs)
+        q = torch.empty((1, 2, 4))
+
+        raw0 = controller.get_decode_selection(0, q).attn_score
+        raw0.copy_(torch.tensor([[[1, 9, 3, 4, 5, 6], [7, 2, 8, 0, 6, 1]]]))
+        controller.on_layer_attention_end(0)
+        torch.testing.assert_close(states[0].attn_score, torch.tensor([[7, 9, 8, 4, 6, 6]]).float())
+        layer0 = states[0].attn_score.clone()
+
+        raw1 = controller.get_decode_selection(1, q).attn_score
+        self.assertEqual(raw0.data_ptr(), raw1.data_ptr())
+        self.assertTrue(torch.equal(raw1, torch.full_like(raw1, -1e20)))
+        raw1.copy_(torch.tensor([[[4, 3, 2, 1, 0, -1], [0, 5, 1, 8, 2, 9]]]))
+        controller.on_layer_attention_end(1)
+        torch.testing.assert_close(states[0].attn_score, layer0)
+        torch.testing.assert_close(states[1].attn_score, torch.tensor([[4, 5, 2, 8, 2, 9]]).float())
+        self.assertEqual([states[layer].attn_score.dim() for layer in range(2)], [2, 2])
+
+    def test_pyramidkv_uses_the_same_shared_raw_lifecycle(self):
+        controller, _manager, _seqs = make_controller("pyramidkv", layers=1)
+        state = controller.layer_batch_sparse_states[0]
+        raw = controller.get_decode_selection(0, torch.empty((1, 2, 4))).attn_score
+        raw.copy_(torch.tensor([[[1, 7, 3, 4, 5, 2], [6, 2, 8, 3, 1, 9]]]))
+        controller.on_layer_attention_end(0)
+        torch.testing.assert_close(state.attn_score, torch.tensor([[6, 7, 8, 4, 5, 9]]).float())
+
+    def test_graph_refs_are_2d_keepalive_has_one_raw_and_scores_before_trigger(self):
+        controller, _manager, seqs = make_controller(layers=1, kv_len=7, graph=True, keep=4)
+        self.assertEqual(controller._snapkv_decode_trigger_len(6), 8)
+        self.assertTrue(controller._needs_attn_score(0, False, seqs))
+        raw = controller.get_decode_selection(0, torch.empty((1, 2, 4))).attn_score
+        raw.fill_(3)
+        controller.on_layer_attention_end(0)
+
+        runner = object.__new__(DecodeCudaGraphRunner)
+        runner.sparse_controller = controller
+        refs = runner._snapshot_sparse_state_refs()
+        self.assertEqual(refs[0]["attn_score"].dim(), 2)
+        runner._reset_graph_input_attn_scores(refs)
+        self.assertTrue(torch.equal(refs[0]["attn_score"], torch.full((1, 7), -1e20)))
+        keepalive = controller.decode_cuda_graph_keepalive_tensors()
+        self.assertEqual(sum(tensor.dim() == 3 for tensor in keepalive), 1)
+        self.assertEqual(sum(tensor.dim() == 2 for tensor in keepalive), 1)
+        controller.layer_batch_sparse_states[0].attn_score = None
+        runner._restore_sparse_state_refs(SimpleNamespace(sparse_state_refs=refs))
+        self.assertIs(controller.layer_batch_sparse_states[0].attn_score, refs[0]["attn_score"])
+
+        controller.config.decode_cuda_graph = False
+        self.assertFalse(controller._needs_attn_score(0, False, seqs))
+
+    def test_post_forward_consumes_2d_and_rejects_unreduced_scores(self):
+        controller, manager, seqs = make_controller(layers=1)
+        raw = controller.get_decode_selection(0, torch.empty((1, 2, 4))).attn_score
+        raw.copy_(torch.arange(12, dtype=torch.float32).reshape(1, 2, 6))
+        controller.on_layer_attention_end(0)
+        shapes = []
+
+        def select(scores, kv_len, budget, **_kwargs):
+            shapes.append(tuple(scores.shape))
+            self.assertEqual((kv_len, budget), (6, 4))
+            return torch.tensor([0, 2, 3, 5])
+
+        controller._snapkv_select_indices = select
+        controller.post_forward(seqs, is_prefill=False)
+        self.assertEqual(shapes, [(6,)])
+        self.assertEqual(manager.compactions[0][2].tolist(), [0, 2, 3, 5])
+
+        controller.prepare_forward(seqs, is_prefill=False)
+        controller.get_decode_selection(0, torch.empty((1, 2, 4)))
+        with self.assertRaisesRegex(RuntimeError, r"head-reduced \[B, L\]"):
+            controller.post_forward(seqs, is_prefill=False)
+
+
+if __name__ == "__main__":
+    unittest.main()
