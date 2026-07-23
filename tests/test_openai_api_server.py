@@ -184,6 +184,20 @@ def _response_sse_events(chunks):
     "OpenAI API server dependencies are not installed",
 )
 class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
+    def test_response_parser_cli_replaces_reasoning_parser(self):
+        from sparsevllm.entrypoints.openai import api_server
+
+        parser = api_server.build_arg_parser()
+        args = parser.parse_args(
+            ["--model", "/tmp/model", "--response-parser", "minimax_m2"]
+        )
+
+        self.assertEqual(args.response_parser, "minimax_m2")
+        with self.assertRaises(SystemExit):
+            parser.parse_args(
+                ["--model", "/tmp/model", "--reasoning-parser", "minimax_m2"]
+            )
+
     def test_incremental_detokenizer_waits_for_complete_unicode(self):
         from sparsevllm.entrypoints.openai.detokenizer import IncrementalDetokenizer
 

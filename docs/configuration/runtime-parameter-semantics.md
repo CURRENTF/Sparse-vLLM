@@ -870,7 +870,7 @@ The serving entrypoint has dedicated server flags:
 | `--port` | `8000` | Uvicorn bind port. |
 | `--engine-kwargs` | unset | JSON object or path to a JSON object with Sparse-vLLM engine kwargs. |
 | `--request-log-dir` | unset | Optional directory for per-request JSON logs. |
-| `--reasoning-parser` | unset | Optional Chat Completions and Responses parser. `qwen3` and `minimax_m2` parse `<think>...</think>` output into endpoint-specific Sparse-vLLM reasoning fields; the loaded tokenizer selects the matching response template. |
+| `--response-parser` | unset | Optional Chat Completions and Responses output parser. `qwen3` and `minimax_m2` split model output into reasoning, content, and tool calls; the loaded tokenizer selects the matching response template. |
 
 The `/v1/models` entry also advertises the engine's effective
 `max_model_len`. vLLM-compatible clients use this extension to discover the
@@ -1044,11 +1044,11 @@ omits tools from the generation prompt. Named/required choices and
 constraints are not implemented. The server parses Qwen-style
 `<tool_call>`/`<tool_calls>` and MiniMax M2
 `<minimax:tool_call><invoke ...>` output only when tools are effective and
-never executes tools itself. Enable the matching `--reasoning-parser` when
+never executes tools itself. Enable the matching `--response-parser` when
 thinking and tool calling are both active; without it, reasoning-only output
 remains raw `content`.
 
-With `--reasoning-parser qwen3` or `--reasoning-parser minimax_m2`,
+With `--response-parser qwen3` or `--response-parser minimax_m2`,
 non-streaming Chat responses split local raw
 reasoning into the Sparse-vLLM `message.reasoning_content` extension and place
 the visible answer in `message.content`. Function calls use OpenAI
@@ -1083,7 +1083,7 @@ so `store=true` fails explicitly. `prompt_cache_key` is retained in request
 logs as a cache-grouping hint but does not alter the rendered model prompt or
 replace Sparse-vLLM's exact-prefix cache matching.
 
-When `--reasoning-parser qwen3` or `--reasoning-parser minimax_m2` is enabled,
+When `--response-parser qwen3` or `--response-parser minimax_m2` is enabled,
 `/v1/responses` parses model output that starts with `<think>` into a
 Sparse-vLLM extension reasoning item followed by the assistant message or
 function call item. This extension exposes local model reasoning text for
