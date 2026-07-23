@@ -99,7 +99,8 @@ Each output directory is created as a new directory; an existing directory is
 rejected. The run writes:
 
 - `run_info.json`: command, resolved workload, Git state, environment, router
-  health, and model context limit.
+  health, model context limit, and benchmark-critical resolved configuration
+  reported by every worker.
 - `raw_outputs.jsonl`: raw HTTP responses and response headers.
 - `parsed_outputs.jsonl`: extracted text, finish reason, usage, and parse
   status.

@@ -116,6 +116,10 @@ class BenchmarkFailed(RuntimeError):
         self.status = status
 
 
+class PreflightParseError(ValueError):
+    """Raised when a service preflight response violates its JSON contract."""
+
+
 class ArtifactWriter:
     def __init__(self, output_dir: Path):
         self.output_dir = output_dir
@@ -312,6 +316,16 @@ def _health_url(base_url: str) -> str:
     return urlunsplit((parsed.scheme, parsed.netloc, f"{path}/health", "", ""))
 
 
+def _worker_info_url(worker_url: str) -> str:
+    parsed = urlsplit(worker_url.rstrip("/"))
+    path = parsed.path.rstrip("/")
+    if not path.endswith("/v1"):
+        path = f"{path}/v1"
+    return urlunsplit(
+        (parsed.scheme, parsed.netloc, f"{path}/worker/info", "", "")
+    )
+
+
 def _models_url(base_url: str) -> str:
     return f"{base_url.rstrip('/')}/models"
 
@@ -384,9 +398,11 @@ def _decode_json(response: HttpResponse, label: str) -> dict[str, Any]:
     try:
         decoded = json.loads(response.body.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError(f"{label} returned invalid JSON: {exc}") from exc
+        raise PreflightParseError(
+            f"{label} returned invalid JSON: {exc}"
+        ) from exc
     if not isinstance(decoded, dict):
-        raise ValueError(f"{label} must return a JSON object.")
+        raise PreflightParseError(f"{label} must return a JSON object.")
     return decoded
 
 
@@ -403,7 +419,9 @@ async def preflight(
     health = _decode_json(health_response, "health preflight")
     cards = models.get("data")
     if not isinstance(cards, list):
-        raise ValueError("/v1/models response is missing a data list.")
+        raise PreflightParseError(
+            "/v1/models response is missing a data list."
+        )
     model_card = next(
         (
             card
@@ -421,7 +439,15 @@ async def preflight(
         raise ValueError(
             f"Model {config.model!r} is not served; available models={available}."
         )
-    max_model_len = int(model_card.get("max_model_len", 0) or 0)
+    max_model_len_value = model_card.get("max_model_len")
+    if (
+        isinstance(max_model_len_value, bool)
+        or not isinstance(max_model_len_value, int)
+    ):
+        raise PreflightParseError(
+            "The selected model card max_model_len must be an integer."
+        )
+    max_model_len = max_model_len_value
     required_len = required_model_len(config)
     if max_model_len <= 0:
         raise ValueError(
@@ -441,18 +467,77 @@ async def preflight(
                 "Sparse-vLLM smart router."
             )
         if not isinstance(healthy_workers, list):
-            raise ValueError(
+            raise PreflightParseError(
                 "Router health response is missing healthy_workers."
+            )
+        if not all(
+            isinstance(worker_url, str) and worker_url
+            for worker_url in healthy_workers
+        ):
+            raise PreflightParseError(
+                "Router healthy_workers must contain non-empty worker URLs."
             )
         if len(healthy_workers) < config.min_healthy_workers:
             raise ValueError(
                 f"Need at least {config.min_healthy_workers} healthy workers, "
                 f"but the router reports {len(healthy_workers)}."
             )
+        worker_responses = await asyncio.gather(
+            *[
+                get_fn(
+                    _worker_info_url(worker_url),
+                    config.request_timeout_s,
+                )
+                for worker_url in healthy_workers
+            ]
+        )
+        workers = [
+            {
+                "url": worker_url,
+                "info": _decode_json(
+                    response,
+                    f"worker info preflight for {worker_url}",
+                ),
+            }
+            for worker_url, response in zip(
+                healthy_workers,
+                worker_responses,
+            )
+        ]
+    else:
+        worker_url = config.base_url
+        worker_response = await get_fn(
+            _worker_info_url(worker_url),
+            config.request_timeout_s,
+        )
+        workers = [
+            {
+                "url": worker_url,
+                "info": _decode_json(
+                    worker_response,
+                    f"worker info preflight for {worker_url}",
+                ),
+            }
+        ]
+    for worker in workers:
+        info = worker["info"]
+        if not isinstance(info.get("benchmark_config"), dict):
+            raise PreflightParseError(
+                "Worker info response is missing benchmark_config: "
+                f"worker={worker['url']}."
+            )
+        if str(info.get("served_model_name")) != config.model:
+            raise ValueError(
+                "Worker serves a different model: "
+                f"worker={worker['url']} "
+                f"served_model_name={info.get('served_model_name')!r} "
+                f"expected={config.model!r}."
+            )
     return {
         "health": health,
         "model_card": model_card,
         "required_model_len": required_len,
+        "workers": workers,
     }
 
 
@@ -519,6 +604,20 @@ def _percentile(values: list[float], quantile: float) -> float | None:
     return ordered[lower] * (1.0 - fraction) + ordered[upper] * fraction
 
 
+def _common_prefix_tokens(
+    previous: tuple[int, ...] | None,
+    current: tuple[int, ...],
+) -> int:
+    if previous is None:
+        return 0
+    common = 0
+    for previous_token, current_token in zip(previous, current):
+        if previous_token != current_token:
+            break
+        common += 1
+    return common
+
+
 async def run_request(
     spec: RequestSpec,
     config: BenchmarkConfig,
@@ -578,12 +677,32 @@ async def run_request(
                     choice = choices[0]
                     text_value = choice.get("text")
                     finish_reason_value = choice.get("finish_reason")
+                    prompt_tokens_value = usage_value.get("prompt_tokens")
+                    completion_tokens_value = usage_value.get(
+                        "completion_tokens"
+                    )
                     if not isinstance(text_value, str):
                         status = "parse_failed"
                         error = "Completion choice text must be a string."
                     elif not isinstance(finish_reason_value, str):
                         status = "parse_failed"
                         error = "Completion choice finish_reason must be a string."
+                    elif (
+                        isinstance(prompt_tokens_value, bool)
+                        or not isinstance(prompt_tokens_value, int)
+                        or prompt_tokens_value < 0
+                    ):
+                        status = "parse_failed"
+                        error = "usage.prompt_tokens must be a non-negative integer."
+                    elif (
+                        isinstance(completion_tokens_value, bool)
+                        or not isinstance(completion_tokens_value, int)
+                        or completion_tokens_value < 0
+                    ):
+                        status = "parse_failed"
+                        error = (
+                            "usage.completion_tokens must be a non-negative integer."
+                        )
                     else:
                         parsed_text = text_value
                         finish_reason = finish_reason_value
@@ -610,8 +729,8 @@ async def run_request(
                     f"expected one of {sorted(expected_methods)}."
                 )
         if status == "success":
-            actual_prompt = int(usage.get("prompt_tokens", -1))
-            actual_completion = int(usage.get("completion_tokens", -1))
+            actual_prompt = usage["prompt_tokens"]
+            actual_completion = usage["completion_tokens"]
             if actual_prompt != spec.prompt_tokens:
                 status = "metric_failed"
                 error = (
@@ -965,6 +1084,7 @@ async def _run_benchmark_impl(
                 )
             )
             round_summary_segments: list[tuple[int, ...]] = []
+            previous_main_prompt: tuple[int, ...] | None = None
 
             for round_index in range(config.rounds):
                 round_started = time.perf_counter()
@@ -1038,16 +1158,9 @@ async def _run_benchmark_impl(
                     + accumulated_summaries
                     + current_answer_segment
                 )
-                expected_reusable_prefix_tokens = (
-                    0
-                    if round_index == 0
-                    else (
-                        config.main_overhead_tokens
-                        + sum(
-                            len(segment)
-                            for segment in round_summary_segments[:-1]
-                        )
-                    )
+                expected_reusable_prefix_tokens = _common_prefix_tokens(
+                    previous_main_prompt,
+                    main_prompt,
                 )
                 round_summary_tokens = rng.randint(
                     config.min_round_summary_tokens,
@@ -1075,6 +1188,7 @@ async def _run_benchmark_impl(
                 )
                 records.append(main_result)
                 _require_success([main_result], f"Round {round_index} main agent")
+                previous_main_prompt = main_prompt
                 round_summary_segments.append(
                     tuple(
                         synthetic_token_ids(
@@ -1158,12 +1272,9 @@ async def _run_benchmark_impl(
                 prompt_seed=rng.getrandbits(63),
                 method_preferences=config.main_agent_methods,
                 prompt_token_ids=final_prompt,
-                expected_reusable_prefix_tokens=(
-                    config.main_overhead_tokens
-                    + sum(
-                        len(segment)
-                        for segment in round_summary_segments[:-1]
-                    )
+                expected_reusable_prefix_tokens=_common_prefix_tokens(
+                    previous_main_prompt,
+                    final_prompt,
                 ),
             )
             final_result = await run_request(
@@ -1193,7 +1304,9 @@ async def _run_benchmark_impl(
             aggregate_status = "success"
         except Exception as exc:
             run_error = f"{type(exc).__name__}: {exc}"
-            if isinstance(exc, ValueError):
+            if isinstance(exc, PreflightParseError):
+                aggregate_status = "parse_failed"
+            elif isinstance(exc, ValueError):
                 aggregate_status = "invalid_input"
             elif isinstance(exc, BenchmarkFailed):
                 aggregate_status = exc.status

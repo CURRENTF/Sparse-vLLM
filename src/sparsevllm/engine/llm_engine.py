@@ -562,6 +562,59 @@ class LLMEngine:
         tags: list[str] | None = None,
     ) -> dict[str, object]:
         config = self.config
+        benchmark_config_keys = (
+            "gpu_memory_utilization",
+            "num_kvcache_slots",
+            "max_num_batched_tokens",
+            "prefill_schedule_policy",
+            "chunk_prefill_size",
+            "long_prefill_offload_threshold",
+            "num_sink_tokens",
+            "num_recent_tokens",
+            "decode_keep_tokens",
+            "full_attn_layers",
+            "obs_layer_ids",
+            "snapkv_window_size",
+            "snapkv_num_full_layers",
+            "pyramid_layer_ratios",
+            "pyramidkv_start_layer",
+            "pyramidkv_start_ratio",
+            "pyramidkv_least_layer",
+            "pyramidkv_least_ratio",
+            "quest_chunk_size",
+            "quest_token_budget",
+            "quest_skip_layers",
+            "deltakv_path",
+            "cluster_ratio",
+            "kv_compressed_size",
+            "kv_quant_bits",
+            "kv_quant_group_size",
+            "decode_cuda_graph",
+            "decode_cuda_graph_capture_sampling",
+            "decode_cuda_graph_capture_sizes",
+            "decode_cuda_graph_context_sizes",
+            "decode_cuda_graph_context_policy",
+            "decode_cuda_graph_max_cached_graphs",
+            "enable_prefix_caching",
+            "prefix_cache_block_size",
+            "prefix_cache_max_blocks",
+        )
+
+        def jsonable(value):
+            if value is None or isinstance(value, (str, int, float, bool)):
+                return value
+            if isinstance(value, (list, tuple)):
+                return [jsonable(item) for item in value]
+            if isinstance(value, dict):
+                return {
+                    str(key): jsonable(item)
+                    for key, item in value.items()
+                }
+            raise TypeError(
+                "Worker benchmark metadata is not JSON serializable: "
+                f"type={type(value).__name__} value={value!r}."
+            )
+
         return {
             "served_model_name": served_model_name or str(config.model),
             "model": str(config.model),
@@ -577,6 +630,11 @@ class LLMEngine:
             "max_num_seqs_in_gpu": int(getattr(config, "max_num_seqs_in_gpu", 0) or 0),
             "prefix_cache_enabled": bool(getattr(config, "enable_prefix_caching", False)),
             "prefix_cache_block_size": getattr(config, "prefix_cache_block_size", None),
+            "benchmark_config": {
+                key: jsonable(getattr(config, key))
+                for key in benchmark_config_keys
+                if hasattr(config, key)
+            },
             "tags": sorted(str(tag) for tag in (tags or []) if str(tag)),
         }
 

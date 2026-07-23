@@ -60,6 +60,21 @@ class FakeService:
                     ],
                 }
             )
+        if url.endswith("/v1/worker/info"):
+            method = "snapkv" if "snap-worker" in url else "omnikv"
+            return _json_response(
+                {
+                    "served_model_name": "sim-model",
+                    "sparse_method": method,
+                    "benchmark_config": {
+                        "gpu_memory_utilization": 0.9,
+                        "prefill_schedule_policy": "all_chunked",
+                        "chunk_prefill_size": 8192,
+                        "decode_cuda_graph": True,
+                        "enable_prefix_caching": method == "omnikv",
+                    },
+                }
+            )
         raise AssertionError(f"Unexpected GET URL: {url}")
 
     async def post(self, url, payload, _timeout_s):
@@ -332,6 +347,19 @@ class SimulatedDeepResearchTest(unittest.TestCase):
                 ],
                 [0, config.main_overhead_tokens, reusable_before_final],
             )
+            run_info = json.loads(
+                (output_dir / "run_info.json").read_text(encoding="utf-8")
+            )
+            worker_configs = run_info["preflight"]["workers"]
+            self.assertEqual(
+                [worker["info"]["sparse_method"] for worker in worker_configs],
+                ["snapkv", "omnikv"],
+            )
+            self.assertTrue(
+                worker_configs[1]["info"]["benchmark_config"][
+                    "enable_prefix_caching"
+                ]
+            )
 
     def test_http_failure_is_recorded_before_run_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -438,6 +466,128 @@ class SimulatedDeepResearchTest(unittest.TestCase):
             )
             self.assertEqual(aggregate["status"], "parse_failed")
             self.assertEqual(aggregate["status_counts"]["parse_failed"], 3)
+
+    def test_malformed_usage_is_parse_failure(self):
+        async def malformed_post(_url, payload, _timeout_s):
+            return _json_response(
+                {
+                    "choices": [
+                        {
+                            "index": 0,
+                            "text": "synthetic output",
+                            "finish_reason": "length",
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": None,
+                        "completion_tokens": payload["max_tokens"],
+                    },
+                },
+                headers={
+                    "x-sparsevllm-worker": "http://snap-worker",
+                    "x-sparsevllm-route-reason": "test",
+                    "x-sparsevllm-sparse-method": "snapkv",
+                },
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "run"
+            config = self._config(output_dir)
+            with self.assertRaisesRegex(run.BenchmarkFailed, "parse_failed"):
+                asyncio.run(
+                    run.run_benchmark(
+                        config,
+                        get_fn=FakeService().get,
+                        post_fn=malformed_post,
+                    )
+                )
+            aggregate = json.loads(
+                (output_dir / "aggregate_metrics.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(aggregate["status"], "parse_failed")
+            self.assertEqual(aggregate["status_counts"]["parse_failed"], 3)
+
+    def test_preflight_malformed_json_is_parse_failure(self):
+        async def malformed_get(url, timeout_s):
+            if url.endswith("/models"):
+                return run.HttpResponse(
+                    status=200,
+                    headers={},
+                    body=b"not-json",
+                )
+            return await FakeService().get(url, timeout_s)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "run"
+            config = self._config(output_dir)
+            with self.assertRaisesRegex(run.BenchmarkFailed, "parse_failed"):
+                asyncio.run(
+                    run.run_benchmark(
+                        config,
+                        get_fn=malformed_get,
+                        post_fn=FakeService().post,
+                    )
+                )
+            aggregate = json.loads(
+                (output_dir / "aggregate_metrics.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(aggregate["status"], "parse_failed")
+
+    def test_reusable_prefix_uses_actual_prompt_tokens(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "run"
+            config = self._config(output_dir)
+            config = run.BenchmarkConfig(
+                **{
+                    **config.__dict__,
+                    "synthetic_token_id_low": 7,
+                    "synthetic_token_id_high": 7,
+                }
+            )
+            service = FakeService()
+            asyncio.run(
+                run.run_benchmark(
+                    config,
+                    get_fn=service.get,
+                    post_fn=service.post,
+                )
+            )
+            main_payloads = [
+                payload
+                for payload in service.payloads
+                if payload["svllm_method_preference"] == "omnikv,vanilla"
+            ]
+            rows = [
+                json.loads(line)
+                for line in (output_dir / "per_sample_results.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            main_rows = [
+                row for row in rows if row["phase"] != "subagent"
+            ]
+            expected = [
+                0,
+                min(
+                    len(main_payloads[0]["prompt"]),
+                    len(main_payloads[1]["prompt"]),
+                ),
+                min(
+                    len(main_payloads[1]["prompt"]),
+                    len(main_payloads[2]["prompt"]),
+                ),
+            ]
+            self.assertEqual(
+                [
+                    row["expected_reusable_prefix_tokens"]
+                    for row in main_rows
+                ],
+                expected,
+            )
 
     def test_default_http_executor_reaches_configured_concurrency(self):
         concurrency = 40
