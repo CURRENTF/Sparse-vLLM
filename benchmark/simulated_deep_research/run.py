@@ -99,8 +99,6 @@ class RequestSpec:
     method_preferences: tuple[str, ...]
     article_tokens: int | None = None
     prompt_token_ids: tuple[int, ...] | None = None
-    expected_reusable_prefix_tokens: int = 0
-    previous_prompt_tokens: int | None = None
 
 
 @dataclass(frozen=True)
@@ -932,12 +930,70 @@ def _common_prefix_tokens(
     return common
 
 
+def _same_worker_prefix_expectation(
+    current_prompt: tuple[int, ...],
+    selected_worker: str,
+    main_prompt_history_by_worker: dict[
+        str,
+        list[tuple[int, ...]],
+    ],
+    block_size: int,
+) -> tuple[int, int, int]:
+    if not current_prompt:
+        raise ValueError("Current main-agent prompt must not be empty.")
+    if block_size <= 0:
+        raise ValueError("Prefix-cache block size must be positive.")
+    prior_prompts = main_prompt_history_by_worker.get(
+        selected_worker,
+        [],
+    )
+    current_cacheable_tokens = (
+        (len(current_prompt) - 1)
+        // block_size
+        * block_size
+    )
+    max_raw_common_prefix = 0
+    max_block_aligned_prefix = 0
+    for prior_prompt in prior_prompts:
+        raw_common_prefix = _common_prefix_tokens(
+            prior_prompt,
+            current_prompt,
+        )
+        prior_materialized_tokens = (
+            len(prior_prompt)
+            // block_size
+            * block_size
+        )
+        block_aligned_prefix = min(
+            raw_common_prefix // block_size * block_size,
+            current_cacheable_tokens,
+            prior_materialized_tokens,
+        )
+        max_raw_common_prefix = max(
+            max_raw_common_prefix,
+            raw_common_prefix,
+        )
+        max_block_aligned_prefix = max(
+            max_block_aligned_prefix,
+            block_aligned_prefix,
+        )
+    return (
+        max_raw_common_prefix,
+        max_block_aligned_prefix,
+        len(prior_prompts),
+    )
+
+
 async def run_request(
     spec: RequestSpec,
     config: BenchmarkConfig,
     writer: ArtifactWriter,
     *,
     worker_prefix_cache_block_sizes: dict[str, int | None],
+    main_prompt_history_by_worker: dict[
+        str,
+        list[tuple[int, ...]],
+    ],
     post_fn=post_json,
 ) -> dict[str, Any]:
     payload = build_payload(spec, config)
@@ -954,6 +1010,9 @@ async def run_request(
     actual_prefix_matched_tokens: int | None = None
     prefix_cache_block_size: int | None = None
     block_aligned_expected_reusable_prefix_tokens: int | None = None
+    expected_reusable_prefix_tokens = 0
+    same_worker_prior_prompt_count = 0
+    selected_worker: str | None = None
     try:
         response = await post_fn(
             _completion_url(config.base_url),
@@ -1075,16 +1134,13 @@ async def run_request(
                 prefix_cache_block_size = (
                     worker_prefix_cache_block_sizes[selected_worker]
                 )
-                if spec.expected_reusable_prefix_tokens == 0:
+                if spec.phase == "subagent":
                     block_aligned_expected_reusable_prefix_tokens = 0
-                elif (
-                    spec.previous_prompt_tokens is None
-                    or spec.previous_prompt_tokens <= 0
-                ):
+                elif spec.prompt_token_ids is None:
                     status = "metric_failed"
                     error = (
-                        "Expected prefix reuse is missing the previous main "
-                        "prompt length required for block alignment."
+                        "Main-agent prefix auditing requires explicit prompt "
+                        "token ids."
                     )
                 elif prefix_cache_block_size is None:
                     status = "metric_failed"
@@ -1094,24 +1150,15 @@ async def run_request(
                         f"worker={selected_worker!r}."
                     )
                 else:
-                    block_aligned_expected_reusable_prefix_tokens = (
-                        min(
-                            (
-                                spec.expected_reusable_prefix_tokens
-                                // prefix_cache_block_size
-                                * prefix_cache_block_size
-                            ),
-                            (
-                                (spec.prompt_tokens - 1)
-                                // prefix_cache_block_size
-                                * prefix_cache_block_size
-                            ),
-                            (
-                                (spec.previous_prompt_tokens - 1)
-                                // prefix_cache_block_size
-                                * prefix_cache_block_size
-                            ),
-                        )
+                    (
+                        expected_reusable_prefix_tokens,
+                        block_aligned_expected_reusable_prefix_tokens,
+                        same_worker_prior_prompt_count,
+                    ) = _same_worker_prefix_expectation(
+                        spec.prompt_token_ids,
+                        selected_worker,
+                        main_prompt_history_by_worker,
+                        prefix_cache_block_size,
                     )
         if (
             status == "success"
@@ -1135,7 +1182,7 @@ async def run_request(
                     "Selected worker reported prefix reuse beyond this run's "
                     "cacheable expectation, indicating stale-cache "
                     "contamination: "
-                    f"raw_expected={spec.expected_reusable_prefix_tokens}, "
+                    f"raw_expected={expected_reusable_prefix_tokens}, "
                     "block_aligned_expected="
                     f"{block_aligned_expected_reusable_prefix_tokens}, "
                     f"actual={actual_prefix_matched_tokens}, "
@@ -1149,7 +1196,7 @@ async def run_request(
                 error = (
                     "Main-agent prefix reuse was expected but the selected "
                     "worker reported zero matched tokens: "
-                    f"raw_expected={spec.expected_reusable_prefix_tokens}, "
+                    f"raw_expected={expected_reusable_prefix_tokens}, "
                     "block_aligned_expected="
                     f"{block_aligned_expected_reusable_prefix_tokens}, "
                     f"block_size={prefix_cache_block_size}."
@@ -1177,6 +1224,20 @@ async def run_request(
     elapsed_s = time.perf_counter() - started
     if status not in VALID_STATUSES:
         raise AssertionError(f"Unexpected request status: {status}")
+    if (
+        status == "success"
+        and config.require_router
+        and spec.phase != "subagent"
+    ):
+        if selected_worker is None or spec.prompt_token_ids is None:
+            raise AssertionError(
+                "Successful main-agent request is missing audited routing "
+                "or prompt metadata."
+            )
+        main_prompt_history_by_worker.setdefault(
+            selected_worker,
+            [],
+        ).append(spec.prompt_token_ids)
     raw_record = {
         "sample_id": spec.sample_id,
         "status": status,
@@ -1195,9 +1256,11 @@ async def run_request(
             "method": route.get("method"),
             "prefix_cache_block_size": prefix_cache_block_size,
             "raw_expected_reusable_prefix_tokens": (
-                spec.expected_reusable_prefix_tokens
+                expected_reusable_prefix_tokens
             ),
-            "previous_prompt_tokens": spec.previous_prompt_tokens,
+            "same_worker_prior_prompt_count": (
+                same_worker_prior_prompt_count
+            ),
             "block_aligned_expected_reusable_prefix_tokens": (
                 block_aligned_expected_reusable_prefix_tokens
             ),
@@ -1235,9 +1298,9 @@ async def run_request(
         ),
         "method_preferences": list(spec.method_preferences),
         "expected_reusable_prefix_tokens": (
-            spec.expected_reusable_prefix_tokens
+            expected_reusable_prefix_tokens
         ),
-        "previous_prompt_tokens": spec.previous_prompt_tokens,
+        "same_worker_prior_prompt_count": same_worker_prior_prompt_count,
         "prefix_cache_block_size": prefix_cache_block_size,
         "block_aligned_expected_reusable_prefix_tokens": (
             block_aligned_expected_reusable_prefix_tokens
@@ -1770,7 +1833,10 @@ async def _run_benchmark_impl(
                 )
             )
             round_summary_segments: list[tuple[int, ...]] = []
-            previous_main_prompt: tuple[int, ...] | None = None
+            main_prompt_history_by_worker: dict[
+                str,
+                list[tuple[int, ...]],
+            ] = {}
 
             for round_index in range(config.rounds):
                 round_started = time.perf_counter()
@@ -1810,6 +1876,9 @@ async def _run_benchmark_impl(
                             writer,
                             worker_prefix_cache_block_sizes=(
                                 worker_prefix_cache_block_sizes
+                            ),
+                            main_prompt_history_by_worker=(
+                                main_prompt_history_by_worker
                             ),
                             post_fn=post_fn,
                         )
@@ -1896,10 +1965,6 @@ async def _run_benchmark_impl(
                     + accumulated_summaries
                     + current_answer_segment
                 )
-                expected_reusable_prefix_tokens = _common_prefix_tokens(
-                    previous_main_prompt,
-                    main_prompt,
-                )
                 round_summary_tokens = rng.randint(
                     config.min_round_summary_tokens,
                     config.max_round_summary_tokens,
@@ -1914,14 +1979,6 @@ async def _run_benchmark_impl(
                     prompt_seed=rng.getrandbits(63),
                     method_preferences=config.main_agent_methods,
                     prompt_token_ids=main_prompt,
-                    expected_reusable_prefix_tokens=(
-                        expected_reusable_prefix_tokens
-                    ),
-                    previous_prompt_tokens=(
-                        len(previous_main_prompt)
-                        if previous_main_prompt is not None
-                        else None
-                    ),
                 )
                 main_result = await run_request(
                     main_spec,
@@ -1929,6 +1986,9 @@ async def _run_benchmark_impl(
                     writer,
                     worker_prefix_cache_block_sizes=(
                         worker_prefix_cache_block_sizes
+                    ),
+                    main_prompt_history_by_worker=(
+                        main_prompt_history_by_worker
                     ),
                     post_fn=post_fn,
                 )
@@ -1962,7 +2022,6 @@ async def _run_benchmark_impl(
                     }
                 )
                 _require_success([main_result], f"Round {round_index} main agent")
-                previous_main_prompt = main_prompt
                 round_summary_segments.append(
                     tuple(
                         synthetic_token_ids(
@@ -2009,15 +2068,6 @@ async def _run_benchmark_impl(
                 prompt_seed=rng.getrandbits(63),
                 method_preferences=config.main_agent_methods,
                 prompt_token_ids=final_prompt,
-                expected_reusable_prefix_tokens=_common_prefix_tokens(
-                    previous_main_prompt,
-                    final_prompt,
-                ),
-                previous_prompt_tokens=(
-                    len(previous_main_prompt)
-                    if previous_main_prompt is not None
-                    else None
-                ),
             )
             final_result = await run_request(
                 final_spec,
@@ -2025,6 +2075,9 @@ async def _run_benchmark_impl(
                 writer,
                 worker_prefix_cache_block_sizes=(
                     worker_prefix_cache_block_sizes
+                ),
+                main_prompt_history_by_worker=(
+                    main_prompt_history_by_worker
                 ),
                 post_fn=post_fn,
             )

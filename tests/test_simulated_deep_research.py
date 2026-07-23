@@ -450,6 +450,13 @@ class SimulatedDeepResearchTest(unittest.TestCase):
                 ],
                 [0, 2, 6],
             )
+            self.assertEqual(
+                [
+                    row["same_worker_prior_prompt_count"]
+                    for row in main_rows
+                ],
+                [0, 1, 2],
+            )
             expected_reuse = (
                 config.main_overhead_tokens + reusable_before_final
             )
@@ -872,6 +879,67 @@ class SimulatedDeepResearchTest(unittest.TestCase):
                 ],
                 expected,
             )
+
+    def test_older_same_worker_prompt_can_define_larger_expected_hit(self):
+        current = (1, 2, 3, 4, 9, 9)
+        history = {
+            "worker-a": [
+                (1, 2, 3, 4, 8, 8),
+                (1, 2, 7, 7),
+            ]
+        }
+
+        raw, aligned, prior_count = (
+            run._same_worker_prefix_expectation(
+                current,
+                "worker-a",
+                history,
+                2,
+            )
+        )
+
+        self.assertEqual(raw, 4)
+        self.assertEqual(aligned, 4)
+        self.assertEqual(prior_count, 2)
+
+    def test_different_worker_prompt_does_not_raise_expected_hit(self):
+        current = (1, 2, 3, 4, 9, 9)
+        history = {
+            "worker-a": [(1, 2, 3, 4, 8, 8)],
+            "worker-b": [(1, 2, 7, 7)],
+        }
+
+        raw, aligned, prior_count = (
+            run._same_worker_prefix_expectation(
+                current,
+                "worker-b",
+                history,
+                2,
+            )
+        )
+
+        self.assertEqual(raw, 2)
+        self.assertEqual(aligned, 2)
+        self.assertEqual(prior_count, 1)
+
+    def test_exact_block_prior_final_block_is_reusable(self):
+        current = (1, 2, 3, 4, 9)
+        history = {
+            "worker-a": [(1, 2, 3, 4)],
+        }
+
+        raw, aligned, prior_count = (
+            run._same_worker_prefix_expectation(
+                current,
+                "worker-a",
+                history,
+                2,
+            )
+        )
+
+        self.assertEqual(raw, 4)
+        self.assertEqual(aligned, 4)
+        self.assertEqual(prior_count, 1)
 
     def test_zero_actual_hit_for_expected_prefix_is_metric_failure(self):
         with tempfile.TemporaryDirectory() as tmp:

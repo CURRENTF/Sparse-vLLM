@@ -141,8 +141,8 @@ rejected. The run writes:
 - `per_sample_results.jsonl`: phase, requested/actual token counts, latency,
   method preference, actual worker, actual method, expected reusable
   main-agent prefix tokens, selected-worker block size, block-aligned expected
-  tokens, the selected worker's actual matched prefix tokens, and explicit
-  status.
+  tokens, the number of successful prior prompts on that worker, the selected
+  worker's actual matched prefix tokens, and explicit status.
 - `round_metrics.jsonl`: barrier time, p50/p95/max subagent latency, straggler
   gap, main-agent latency, and explicit status for every attempted round,
   including a round whose main-agent request fails.
@@ -158,12 +158,18 @@ route, missing route header, invalid matched-token header, expected cacheable
 reuse with zero actual matched tokens, or actual reuse beyond this run's
 expectation remains visible in the artifacts and makes the run fail.
 
-`expected_reusable_prefix_tokens` is the raw common-prefix length. A block-based
-prefix cache can reuse only whole blocks. For the selected worker's block size
-`b`, `block_aligned_expected_reusable_prefix_tokens` is the minimum of the
-whole-block raw common prefix and the cacheable portions of the current and
-previous prompts; the latter two retain their final token for logits. A raw
-prefix shorter than one block therefore allows an actual zero hit. A nonzero
-partial hit is recorded without failing because cache capacity can reduce
-reuse. Zero actual reuse when the block-aligned expectation is nonzero, or
-actual reuse above that expectation, is `metric_failed`.
+`expected_reusable_prefix_tokens` is the largest raw common-prefix length
+between the current main-agent prompt and every successful prior main-agent
+prompt handled by the selected worker in this run. Prompts handled by another
+worker never raise this expectation. For block size `b`, each prior prompt
+contributes the minimum of its whole-block common prefix, the current prompt's
+cacheable portion `floor((current_length - 1) / b) * b`, and the prior prompt's
+materialized portion `floor(prior_length / b) * b`.
+`block_aligned_expected_reusable_prefix_tokens` is the largest contribution.
+Only the current prompt retains a final token for logits; if a prior prompt
+ends exactly on a block boundary, that final complete block was materialized
+and remains reusable. A raw prefix shorter than one block therefore allows an
+actual zero hit. A nonzero partial hit is recorded without failing because
+cache capacity can reduce reuse. Zero actual reuse when the block-aligned
+expectation is nonzero, or actual reuse above that expectation, is
+`metric_failed`.
