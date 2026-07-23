@@ -119,7 +119,8 @@ rejected. The run writes:
   router health and code revision, role-specific context requirements, and
   benchmark-critical configuration and code revision reported by every
   worker.
-- `raw_outputs.jsonl`: raw HTTP responses and response headers.
+- `raw_outputs.jsonl`: exact request URL, timeout, prompt seed and payload,
+  plus raw HTTP responses and response headers.
 - `parsed_outputs.jsonl`: extracted text, finish reason, usage, and parse
   status.
 - `per_sample_results.jsonl`: phase, requested/actual token counts, latency,

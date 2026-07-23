@@ -626,12 +626,6 @@ async def preflight(
             for worker in healthy_worker_info
             if str(worker["info"].get("served_model_name")) == config.model
         ]
-        if len(workers) < config.min_healthy_workers:
-            raise ValueError(
-                f"Need at least {config.min_healthy_workers} healthy workers "
-                f"for model {config.model!r}, but the router reports "
-                f"{len(workers)}."
-            )
     else:
         worker_url = config.base_url
         worker_response = await get_fn(
@@ -647,6 +641,14 @@ async def preflight(
                 ),
             }
         ]
+    required_worker_methods = {
+        _canonical_method(method)
+        for method in (
+            config.subagent_methods
+            + config.main_agent_methods
+        )
+    }
+    benchmark_workers = []
     for worker in workers:
         info = worker["info"]
         if not isinstance(info.get("sparse_method"), str):
@@ -654,6 +656,13 @@ async def preflight(
                 "Worker info response is missing a string sparse_method: "
                 f"worker={worker['url']}."
             )
+        if (
+            config.require_router
+            and _canonical_method(info["sparse_method"])
+            not in required_worker_methods
+        ):
+            continue
+        benchmark_workers.append(worker)
         if not isinstance(info.get("benchmark_config"), dict):
             raise PreflightParseError(
                 "Worker info response is missing benchmark_config: "
@@ -691,6 +700,12 @@ async def preflight(
                 f"expected={config.model!r}."
             )
     if config.require_router:
+        if len(benchmark_workers) < config.min_healthy_workers:
+            raise ValueError(
+                f"Need at least {config.min_healthy_workers} healthy "
+                f"benchmark-eligible workers for model {config.model!r}, "
+                f"but the router reports {len(benchmark_workers)}."
+            )
         advertised_methods = sorted(
             {
                 _canonical_method(worker["info"]["sparse_method"])
@@ -707,7 +722,7 @@ async def preflight(
             }
             eligible_workers = [
                 worker
-                for worker in workers
+                for worker in benchmark_workers
                 if _canonical_method(worker["info"]["sparse_method"])
                 in preferred_methods
             ]
@@ -994,6 +1009,12 @@ async def run_request(
         "sample_id": spec.sample_id,
         "status": status,
         "error": error,
+        "request": {
+            "url": _completion_url(config.base_url),
+            "timeout_s": config.request_timeout_s,
+            "prompt_seed": spec.prompt_seed,
+            "payload": payload,
+        },
         "http_status": http_status,
         "response_headers": response_headers,
         "response": response_body,

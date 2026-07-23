@@ -383,6 +383,29 @@ class SimulatedDeepResearchTest(unittest.TestCase):
                 ],
                 [0, config.main_overhead_tokens, reusable_before_final],
             )
+            raw_rows = [
+                json.loads(line)
+                for line in (output_dir / "raw_outputs.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            self.assertEqual(
+                [row["request"]["payload"] for row in raw_rows],
+                service.payloads,
+            )
+            self.assertTrue(
+                all(
+                    isinstance(row["request"]["prompt_seed"], int)
+                    for row in raw_rows
+                )
+            )
+            self.assertTrue(
+                all(
+                    row["request"]["timeout_s"]
+                    == config.request_timeout_s
+                    for row in raw_rows
+                )
+            )
             run_info = json.loads(
                 (output_dir / "run_info.json").read_text(encoding="utf-8")
             )
@@ -939,12 +962,8 @@ class SimulatedDeepResearchTest(unittest.TestCase):
                 return _json_response(
                     {
                         "served_model_name": "sim-model",
-                        "max_model_len": 8,
-                        "vocab_size": 64,
                         "sparse_method": "quest",
                         "prefix_cache_enabled": False,
-                        "code_revision": CODE_REVISION,
-                        "benchmark_config": {},
                     }
                 )
             return await service.get(url, timeout_s)

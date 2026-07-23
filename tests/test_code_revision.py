@@ -1,6 +1,9 @@
+from pathlib import Path
+from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
+from sparsevllm.utils.code_revision import _verified_source_repo_root
 from sparsevllm.utils.code_revision import code_revision_info
 
 
@@ -18,6 +21,48 @@ class CodeRevisionTest(unittest.TestCase):
         mock_version.assert_called_once_with("deltakv")
         self.assertEqual(revision["package_version"], "0.1.0")
         self.assertIsNone(revision["git_commit"])
+
+    def test_rejects_an_enclosing_unrelated_git_root(self):
+        with TemporaryDirectory() as tmp:
+            source_root = Path(tmp) / "source"
+            module_path = (
+                source_root
+                / "src"
+                / "sparsevllm"
+                / "utils"
+                / "code_revision.py"
+            )
+            module_path.parent.mkdir(parents=True)
+            module_path.touch()
+
+            with patch(
+                "sparsevllm.utils.code_revision._git_value",
+                return_value=str(Path(tmp)),
+            ):
+                repo_root = _verified_source_repo_root(module_path)
+
+        self.assertIsNone(repo_root)
+
+    def test_accepts_the_matching_source_git_root(self):
+        with TemporaryDirectory() as tmp:
+            source_root = Path(tmp) / "source"
+            module_path = (
+                source_root
+                / "src"
+                / "sparsevllm"
+                / "utils"
+                / "code_revision.py"
+            )
+            module_path.parent.mkdir(parents=True)
+            module_path.touch()
+
+            with patch(
+                "sparsevllm.utils.code_revision._git_value",
+                return_value=str(source_root),
+            ):
+                repo_root = _verified_source_repo_root(module_path)
+
+        self.assertEqual(repo_root, source_root)
 
 
 if __name__ == "__main__":
