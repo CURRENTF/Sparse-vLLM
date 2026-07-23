@@ -601,7 +601,20 @@ class LLMEngine:
             "decode_cuda_graph_max_cached_graphs",
             "enable_prefix_caching",
             "prefix_cache_block_size",
+            "prefix_cache_requested_max_blocks",
             "prefix_cache_max_blocks",
+            "enable_prefix_cache_offload",
+            "prefix_cache_host_size_gb",
+            "recurrent_state_max_bytes",
+            "prefix_cache_max_recurrent_bytes",
+            "recurrent_state_pool_bytes",
+            "recurrent_state_bytes_per_row",
+            "recurrent_state_row_capacity",
+            "prefix_recurrent_bytes_per_block",
+            "prefix_recurrent_capacity_bytes",
+            "prefix_kv_bytes_per_block",
+            "prefix_kv_block_capacity",
+            "kv_allocatable_bytes",
         )
 
         def jsonable(value):

@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 import unittest
 
@@ -34,6 +35,53 @@ class WorkerInfoTest(unittest.TestCase):
         self.assertEqual(engine.worker_info()["vocab_size"], 32_000)
         revision = engine.worker_info()["code_revision"]
         self.assertTrue(revision["git_commit"] or revision["package_version"])
+
+    def test_prefix_offload_capacity_config_is_reported_json_safely(self):
+        engine = object.__new__(LLMEngine)
+        engine.config = SimpleNamespace(
+            model="model",
+            hf_config=SimpleNamespace(model_type="test", vocab_size=32_000),
+            vllm_sparse_method="",
+            enable_prefix_caching=True,
+            prefix_cache_block_size=16,
+            prefix_cache_max_blocks=4_096,
+            prefix_cache_requested_max_blocks=8_192,
+            enable_prefix_cache_offload=True,
+            prefix_cache_host_size_gb=6.5,
+            recurrent_state_max_bytes=1 << 30,
+            prefix_cache_max_recurrent_bytes=None,
+            recurrent_state_pool_bytes=768 << 20,
+            recurrent_state_bytes_per_row=16_384,
+            recurrent_state_row_capacity=49_152,
+            prefix_recurrent_bytes_per_block=16_384,
+            prefix_recurrent_capacity_bytes=256 << 20,
+            prefix_kv_bytes_per_block=65_536,
+            prefix_kv_block_capacity=4_096,
+            kv_allocatable_bytes=512 << 20,
+            num_kvcache_slots=262_144,
+            max_num_seqs_in_gpu=64,
+        )
+
+        worker_info = engine.worker_info()
+        benchmark_config = worker_info["benchmark_config"]
+
+        self.assertIs(benchmark_config["enable_prefix_cache_offload"], True)
+        self.assertEqual(benchmark_config["prefix_cache_host_size_gb"], 6.5)
+        self.assertEqual(benchmark_config["recurrent_state_max_bytes"], 1 << 30)
+        self.assertIsNone(benchmark_config["prefix_cache_max_recurrent_bytes"])
+        self.assertEqual(benchmark_config["prefix_cache_requested_max_blocks"], 8_192)
+        self.assertEqual(benchmark_config["prefix_cache_max_blocks"], 4_096)
+        self.assertEqual(benchmark_config["recurrent_state_pool_bytes"], 768 << 20)
+        self.assertEqual(benchmark_config["recurrent_state_bytes_per_row"], 16_384)
+        self.assertEqual(benchmark_config["recurrent_state_row_capacity"], 49_152)
+        self.assertEqual(benchmark_config["prefix_recurrent_bytes_per_block"], 16_384)
+        self.assertEqual(benchmark_config["prefix_recurrent_capacity_bytes"], 256 << 20)
+        self.assertEqual(benchmark_config["prefix_kv_bytes_per_block"], 65_536)
+        self.assertEqual(benchmark_config["prefix_kv_block_capacity"], 4_096)
+        self.assertEqual(benchmark_config["kv_allocatable_bytes"], 512 << 20)
+        self.assertEqual(benchmark_config["num_kvcache_slots"], 262_144)
+        self.assertEqual(worker_info["max_num_seqs_in_gpu"], 64)
+        json.dumps(worker_info)
 
 
 def make_controller(

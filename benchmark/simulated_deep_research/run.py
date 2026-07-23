@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import random
@@ -99,6 +100,7 @@ class RequestSpec:
     article_tokens: int | None = None
     prompt_token_ids: tuple[int, ...] | None = None
     expected_reusable_prefix_tokens: int = 0
+    previous_prompt_tokens: int | None = None
 
 
 @dataclass(frozen=True)
@@ -152,6 +154,9 @@ class ArtifactWriter:
             json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
+
+    def write_text(self, filename: str, content: str) -> None:
+        (self.output_dir / filename).write_text(content, encoding="utf-8")
 
 
 def _canonical_method(method: str | None) -> str:
@@ -351,6 +356,16 @@ def _validate_code_revision(value: Any, label: str) -> None:
     if git_dirty is not None and not isinstance(git_dirty, bool):
         raise PreflightParseError(
             f"{label} code_revision.git_dirty must be boolean or null."
+        )
+    if git_dirty is True:
+        raise ValueError(
+            f"{label} reports a dirty Git worktree; benchmark provenance "
+            "requires committed router and worker code."
+        )
+    if git_dirty is None and not package_version:
+        raise PreflightParseError(
+            f"{label} code_revision.git_dirty may be null only for an "
+            "installed package with package_version metadata."
         )
 
 
@@ -779,6 +794,32 @@ async def preflight(
                         "All eligible main-agent workers must enable prefix "
                         f"caching: workers={without_prefix_cache}."
                     )
+                invalid_block_sizes = [
+                    {
+                        "url": worker["url"],
+                        "prefix_cache_block_size": worker["info"].get(
+                            "prefix_cache_block_size"
+                        ),
+                    }
+                    for worker in eligible_workers
+                    if (
+                        isinstance(
+                            worker["info"].get("prefix_cache_block_size"),
+                            bool,
+                        )
+                        or not isinstance(
+                            worker["info"].get("prefix_cache_block_size"),
+                            int,
+                        )
+                        or worker["info"]["prefix_cache_block_size"] <= 0
+                    )
+                ]
+                if invalid_block_sizes:
+                    raise PreflightParseError(
+                        "All eligible main-agent workers must report a "
+                        "positive integer prefix_cache_block_size: "
+                        f"workers={invalid_block_sizes}."
+                    )
     else:
         worker = workers[0]
         if config.synthetic_token_id_high >= worker["info"]["vocab_size"]:
@@ -793,6 +834,24 @@ async def preflight(
         "required_model_len": required_len,
         "required_model_len_by_role": required_lens_by_role,
         "workers": workers,
+        "worker_prefix_cache_block_sizes": {
+            str(worker["url"]): (
+                int(worker["info"]["prefix_cache_block_size"])
+                if (
+                    not isinstance(
+                        worker["info"].get("prefix_cache_block_size"),
+                        bool,
+                    )
+                    and isinstance(
+                        worker["info"].get("prefix_cache_block_size"),
+                        int,
+                    )
+                    and worker["info"]["prefix_cache_block_size"] > 0
+                )
+                else None
+            )
+            for worker in workers
+        },
     }
 
 
@@ -878,6 +937,7 @@ async def run_request(
     config: BenchmarkConfig,
     writer: ArtifactWriter,
     *,
+    worker_prefix_cache_block_sizes: dict[str, int | None],
     post_fn=post_json,
 ) -> dict[str, Any]:
     payload = build_payload(spec, config)
@@ -892,6 +952,8 @@ async def run_request(
     usage: dict[str, Any] = {}
     route = _route_values(response_headers)
     actual_prefix_matched_tokens: int | None = None
+    prefix_cache_block_size: int | None = None
+    block_aligned_expected_reusable_prefix_tokens: int | None = None
     try:
         response = await post_fn(
             _completion_url(config.base_url),
@@ -1001,10 +1063,61 @@ async def run_request(
                     f"{spec.phase} request routed to method {actual_method!r}; "
                     f"expected one of {sorted(expected_methods)}."
                 )
+        if status == "success" and config.require_router:
+            selected_worker = route.get("worker")
+            if selected_worker not in worker_prefix_cache_block_sizes:
+                status = "metric_failed"
+                error = (
+                    "Router selected a worker absent from preflight metadata: "
+                    f"worker={selected_worker!r}."
+                )
+            else:
+                prefix_cache_block_size = (
+                    worker_prefix_cache_block_sizes[selected_worker]
+                )
+                if spec.expected_reusable_prefix_tokens == 0:
+                    block_aligned_expected_reusable_prefix_tokens = 0
+                elif (
+                    spec.previous_prompt_tokens is None
+                    or spec.previous_prompt_tokens <= 0
+                ):
+                    status = "metric_failed"
+                    error = (
+                        "Expected prefix reuse is missing the previous main "
+                        "prompt length required for block alignment."
+                    )
+                elif prefix_cache_block_size is None:
+                    status = "metric_failed"
+                    error = (
+                        "Selected worker did not report a usable "
+                        "prefix_cache_block_size for expected prefix reuse: "
+                        f"worker={selected_worker!r}."
+                    )
+                else:
+                    block_aligned_expected_reusable_prefix_tokens = (
+                        min(
+                            (
+                                spec.expected_reusable_prefix_tokens
+                                // prefix_cache_block_size
+                                * prefix_cache_block_size
+                            ),
+                            (
+                                (spec.prompt_tokens - 1)
+                                // prefix_cache_block_size
+                                * prefix_cache_block_size
+                            ),
+                            (
+                                (spec.previous_prompt_tokens - 1)
+                                // prefix_cache_block_size
+                                * prefix_cache_block_size
+                            ),
+                        )
+                    )
         if (
             status == "success"
             and config.require_router
             and actual_prefix_matched_tokens is not None
+            and block_aligned_expected_reusable_prefix_tokens is not None
         ):
             if actual_prefix_matched_tokens > spec.prompt_tokens:
                 status = "metric_failed"
@@ -1014,14 +1127,32 @@ async def run_request(
                     f"prompt={spec.prompt_tokens}."
                 )
             elif (
-                spec.expected_reusable_prefix_tokens > 0
+                actual_prefix_matched_tokens
+                > block_aligned_expected_reusable_prefix_tokens
+            ):
+                status = "metric_failed"
+                error = (
+                    "Selected worker reported prefix reuse beyond this run's "
+                    "cacheable expectation, indicating stale-cache "
+                    "contamination: "
+                    f"raw_expected={spec.expected_reusable_prefix_tokens}, "
+                    "block_aligned_expected="
+                    f"{block_aligned_expected_reusable_prefix_tokens}, "
+                    f"actual={actual_prefix_matched_tokens}, "
+                    f"block_size={prefix_cache_block_size}."
+                )
+            elif (
+                block_aligned_expected_reusable_prefix_tokens > 0
                 and actual_prefix_matched_tokens == 0
             ):
                 status = "metric_failed"
                 error = (
                     "Main-agent prefix reuse was expected but the selected "
                     "worker reported zero matched tokens: "
-                    f"expected={spec.expected_reusable_prefix_tokens}."
+                    f"raw_expected={spec.expected_reusable_prefix_tokens}, "
+                    "block_aligned_expected="
+                    f"{block_aligned_expected_reusable_prefix_tokens}, "
+                    f"block_size={prefix_cache_block_size}."
                 )
         if status == "success":
             actual_prompt = usage["prompt_tokens"]
@@ -1062,6 +1193,14 @@ async def run_request(
             "worker": route.get("worker"),
             "reason": route.get("reason"),
             "method": route.get("method"),
+            "prefix_cache_block_size": prefix_cache_block_size,
+            "raw_expected_reusable_prefix_tokens": (
+                spec.expected_reusable_prefix_tokens
+            ),
+            "previous_prompt_tokens": spec.previous_prompt_tokens,
+            "block_aligned_expected_reusable_prefix_tokens": (
+                block_aligned_expected_reusable_prefix_tokens
+            ),
             "actual_prefix_matched_tokens": actual_prefix_matched_tokens,
         },
         "response": response_body,
@@ -1097,6 +1236,11 @@ async def run_request(
         "method_preferences": list(spec.method_preferences),
         "expected_reusable_prefix_tokens": (
             spec.expected_reusable_prefix_tokens
+        ),
+        "previous_prompt_tokens": spec.previous_prompt_tokens,
+        "prefix_cache_block_size": prefix_cache_block_size,
+        "block_aligned_expected_reusable_prefix_tokens": (
+            block_aligned_expected_reusable_prefix_tokens
         ),
         "actual_prefix_matched_tokens": actual_prefix_matched_tokens,
     }
@@ -1171,17 +1315,86 @@ def _git_dirty() -> bool | None:
     return bool(result.stdout.strip())
 
 
+def _capture_client_code_state() -> tuple[dict[str, Any], str | None]:
+    git_commit = _git_value("rev-parse", "HEAD")
+    git_branch = _git_value("branch", "--show-current")
+    status = _git_command("status", "--porcelain", "--untracked-files=all")
+    if status is None:
+        return (
+            {
+                "git_commit": git_commit,
+                "git_branch": git_branch,
+                "git_dirty": None,
+                "worktree_patch": None,
+            },
+            None,
+        )
+    status_lines = [
+        line
+        for line in status.stdout.splitlines()
+        if line
+    ]
+    if not status_lines:
+        return (
+            {
+                "git_commit": git_commit,
+                "git_branch": git_branch,
+                "git_dirty": False,
+                "worktree_patch": None,
+            },
+            None,
+        )
+    untracked = [
+        line[3:]
+        for line in status_lines
+        if line.startswith("?? ")
+    ]
+    if untracked:
+        raise ValueError(
+            "Client worktree has untracked files that cannot be reproduced "
+            f"by a Git patch; commit or remove them first: {untracked}."
+        )
+    diff = _git_command("diff", "--binary", "HEAD", "--")
+    if diff is None or not diff.stdout:
+        raise ValueError(
+            "Client worktree is dirty but a reproducible Git patch could not "
+            "be captured."
+        )
+    patch_sha256 = hashlib.sha256(diff.stdout.encode("utf-8")).hexdigest()
+    return (
+        {
+            "git_commit": git_commit,
+            "git_branch": git_branch,
+            "git_dirty": True,
+            "worktree_patch": {
+                "path": "client_worktree.patch",
+                "sha256": patch_sha256,
+                "format": "git diff --binary HEAD",
+            },
+        },
+        diff.stdout,
+    )
+
+
 def _run_info(
     config: BenchmarkConfig,
     preflight_info: dict[str, Any] | None,
     *,
     status: str,
     error: str | None = None,
+    client_code_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     resolved = asdict(config)
     resolved["output_dir"] = str(config.output_dir)
     resolved["subagent_methods"] = list(config.subagent_methods)
     resolved["main_agent_methods"] = list(config.main_agent_methods)
+    if client_code_state is None:
+        client_code_state = {
+            "git_commit": _git_value("rev-parse", "HEAD"),
+            "git_branch": _git_value("branch", "--show-current"),
+            "git_dirty": _git_dirty(),
+            "worktree_patch": None,
+        }
     return {
         "benchmark": "simulated_deep_research",
         "status": status,
@@ -1190,9 +1403,10 @@ def _run_info(
         "command": sys.argv,
         "config": resolved,
         "preflight": preflight_info,
-        "git_commit": _git_value("rev-parse", "HEAD"),
-        "git_branch": _git_value("branch", "--show-current"),
-        "git_dirty": _git_dirty(),
+        "git_commit": client_code_state["git_commit"],
+        "git_branch": client_code_state["git_branch"],
+        "git_dirty": client_code_state["git_dirty"],
+        "client_worktree_patch": client_code_state["worktree_patch"],
         "environment": {
             key: os.environ[key]
             for key in ("CUDA_VISIBLE_DEVICES", "PYTHONPATH")
@@ -1212,11 +1426,26 @@ def _prefix_cache_metrics(
     expected_hit_records = [
         record
         for record in records
-        if int(record.get("expected_reusable_prefix_tokens") or 0) > 0
+        if int(
+            record.get(
+                "block_aligned_expected_reusable_prefix_tokens"
+            )
+            or 0
+        )
+        > 0
     ]
     return {
         "expected_reusable_prefix_tokens": sum(
             int(record.get("expected_reusable_prefix_tokens") or 0)
+            for record in records
+        ),
+        "block_aligned_expected_reusable_prefix_tokens": sum(
+            int(
+                record.get(
+                    "block_aligned_expected_reusable_prefix_tokens"
+                )
+                or 0
+            )
             for record in records
         ),
         "actual_prefix_matched_tokens": sum(
@@ -1230,14 +1459,42 @@ def _prefix_cache_metrics(
             for record in observed_records
         ),
         "unexpected_zero_hit_requests": sum(
-            int(record.get("expected_reusable_prefix_tokens") or 0) > 0
+            int(
+                record.get(
+                    "block_aligned_expected_reusable_prefix_tokens"
+                )
+                or 0
+            )
+            > 0
             and record.get("actual_prefix_matched_tokens") == 0
             for record in records
         ),
         "partial_hit_requests": sum(
             0
             < int(record.get("actual_prefix_matched_tokens") or 0)
-            < int(record.get("expected_reusable_prefix_tokens") or 0)
+            < int(
+                record.get(
+                    "block_aligned_expected_reusable_prefix_tokens"
+                )
+                or 0
+            )
+            for record in records
+        ),
+        "unexpected_excess_hit_requests": sum(
+            record.get("actual_prefix_matched_tokens") is not None
+            and record.get(
+                "block_aligned_expected_reusable_prefix_tokens"
+            )
+            is not None
+            and (
+                int(record["actual_prefix_matched_tokens"])
+                > int(
+                    record.get(
+                        "block_aligned_expected_reusable_prefix_tokens"
+                    )
+                    or 0
+                )
+            )
             for record in records
         ),
     }
@@ -1316,6 +1573,15 @@ def _aggregate_metrics(
             int(record.get("expected_reusable_prefix_tokens") or 0)
             for record in phase_records
         )
+        phase_block_aligned_expected_reusable_prefix_tokens = sum(
+            int(
+                record.get(
+                    "block_aligned_expected_reusable_prefix_tokens"
+                )
+                or 0
+            )
+            for record in phase_records
+        )
         phase_latencies = [
             float(record["latency_s"])
             for record in phase_records
@@ -1349,6 +1615,9 @@ def _aggregate_metrics(
             "completion_tokens": phase_completion_tokens,
             "expected_reusable_prefix_tokens": (
                 phase_expected_reusable_prefix_tokens
+            ),
+            "block_aligned_expected_reusable_prefix_tokens": (
+                phase_block_aligned_expected_reusable_prefix_tokens
             ),
             "prefix_cache": _prefix_cache_metrics(phase_all_records),
             "total_tokens_per_s": (
@@ -1442,19 +1711,53 @@ async def _run_benchmark_impl(
     run_started = time.perf_counter()
     workload_started: float | None = None
     preflight_elapsed_s = 0.0
+    client_code_state_error: Exception | None = None
+    try:
+        client_code_state, client_worktree_patch = (
+            _capture_client_code_state()
+        )
+    except Exception as exc:
+        client_code_state_error = exc
+        client_worktree_patch = None
+        client_code_state = {
+            "git_commit": _git_value("rev-parse", "HEAD"),
+            "git_branch": _git_value("branch", "--show-current"),
+            "git_dirty": _git_dirty(),
+            "worktree_patch": None,
+        }
 
     with ArtifactWriter(config.output_dir) as writer:
+        if client_worktree_patch is not None:
+            writer.write_text(
+                "client_worktree.patch",
+                client_worktree_patch,
+            )
         writer.write_json(
             "run_info.json",
-            _run_info(config, None, status="running"),
+            _run_info(
+                config,
+                None,
+                status="running",
+                client_code_state=client_code_state,
+            ),
         )
         try:
+            if client_code_state_error is not None:
+                raise client_code_state_error
             preflight_started = time.perf_counter()
             preflight_info = await preflight(config, get_fn=get_fn)
             preflight_elapsed_s = time.perf_counter() - preflight_started
             writer.write_json(
                 "run_info.json",
-                _run_info(config, preflight_info, status="running"),
+                _run_info(
+                    config,
+                    preflight_info,
+                    status="running",
+                    client_code_state=client_code_state,
+                ),
+            )
+            worker_prefix_cache_block_sizes = dict(
+                preflight_info["worker_prefix_cache_block_sizes"]
             )
             workload_started = time.perf_counter()
             rng = random.Random(config.seed)
@@ -1505,6 +1808,9 @@ async def _run_benchmark_impl(
                             spec,
                             config,
                             writer,
+                            worker_prefix_cache_block_sizes=(
+                                worker_prefix_cache_block_sizes
+                            ),
                             post_fn=post_fn,
                         )
                         for spec in specs
@@ -1557,6 +1863,10 @@ async def _run_benchmark_impl(
                         "main_agent_prompt_tokens": None,
                         "main_agent_completion_tokens": None,
                         "main_agent_expected_reusable_prefix_tokens": None,
+                        "main_agent_block_aligned_expected_reusable_prefix_tokens": (
+                            None
+                        ),
+                        "main_agent_actual_prefix_matched_tokens": None,
                         "main_agent_latency_s": None,
                         "round_elapsed_s": time.perf_counter() - round_started,
                     }
@@ -1607,11 +1917,19 @@ async def _run_benchmark_impl(
                     expected_reusable_prefix_tokens=(
                         expected_reusable_prefix_tokens
                     ),
+                    previous_prompt_tokens=(
+                        len(previous_main_prompt)
+                        if previous_main_prompt is not None
+                        else None
+                    ),
                 )
                 main_result = await run_request(
                     main_spec,
                     config,
                     writer,
+                    worker_prefix_cache_block_sizes=(
+                        worker_prefix_cache_block_sizes
+                    ),
                     post_fn=post_fn,
                 )
                 records.append(main_result)
@@ -1628,6 +1946,14 @@ async def _run_benchmark_impl(
                             main_result[
                                 "expected_reusable_prefix_tokens"
                             ]
+                        ),
+                        "main_agent_block_aligned_expected_reusable_prefix_tokens": (
+                            main_result[
+                                "block_aligned_expected_reusable_prefix_tokens"
+                            ]
+                        ),
+                        "main_agent_actual_prefix_matched_tokens": (
+                            main_result["actual_prefix_matched_tokens"]
                         ),
                         "main_agent_latency_s": main_result["latency_s"],
                         "round_elapsed_s": (
@@ -1687,11 +2013,19 @@ async def _run_benchmark_impl(
                     previous_main_prompt,
                     final_prompt,
                 ),
+                previous_prompt_tokens=(
+                    len(previous_main_prompt)
+                    if previous_main_prompt is not None
+                    else None
+                ),
             )
             final_result = await run_request(
                 final_spec,
                 config,
                 writer,
+                worker_prefix_cache_block_sizes=(
+                    worker_prefix_cache_block_sizes
+                ),
                 post_fn=post_fn,
             )
             records.append(final_result)
@@ -1751,6 +2085,7 @@ async def _run_benchmark_impl(
                 preflight_info,
                 status=aggregate_status,
                 error=run_error,
+                client_code_state=client_code_state,
             ),
         )
 

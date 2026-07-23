@@ -1576,7 +1576,7 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(match_payload["snapshot"])
         self.assertFalse(match_payload["enabled"])
 
-    async def test_routing_snapshots_refresh_after_final_engine_step(self):
+    async def test_routing_snapshots_refresh_before_completion_events(self):
         from sparsevllm.entrypoints.openai.api_server import AsyncEngineDispatcher
 
         tokenizer = _byte_level_tokenizer()
@@ -1625,7 +1625,25 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
             def exit(self):
                 pass
 
-        dispatcher = AsyncEngineDispatcher(Engine())
+        engine = Engine()
+        dispatcher = AsyncEngineDispatcher(engine)
+        published_snapshot_states = []
+        original_put = dispatcher._put
+
+        def put_after_observing_snapshots(request, item):
+            if item["type"] in {"token", "final"}:
+                load = dispatcher.worker_routing_load_snapshot()
+                match = dispatcher.prefix_cache_routing_match([1, 2])
+                published_snapshot_states.append(
+                    (
+                        item["type"],
+                        load["active_requests"],
+                        match["generation"],
+                    )
+                )
+            original_put(request, item)
+
+        dispatcher._put = put_after_observing_snapshots
         try:
             handle = await dispatcher.submit(
                 "prompt",
@@ -1639,22 +1657,13 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
                     timeout=1,
                 )
             self.assertEqual(item["type"], "final")
-
-            deadline = time.monotonic() + 1
-            while time.monotonic() < deadline:
-                load = dispatcher.worker_routing_load_snapshot()
-                match = dispatcher.prefix_cache_routing_match([1, 2])
-                if (
-                    load["active_requests"] == 0
-                    and match["generation"] == 1
-                ):
-                    break
-                await asyncio.sleep(0.01)
         finally:
             dispatcher.close()
 
-        self.assertEqual(load["active_requests"], 0)
-        self.assertEqual(match["generation"], 1)
+        self.assertGreaterEqual(len(published_snapshot_states), 1)
+        for _event_type, active_requests, generation in published_snapshot_states:
+            self.assertEqual(active_requests, 0)
+            self.assertEqual(generation, 1)
 
     async def test_prefix_cache_text_selector_tokenizes_server_side(self):
         from sparsevllm.entrypoints.openai import api_server

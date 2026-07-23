@@ -298,9 +298,9 @@ class AsyncEngineDispatcher:
 
                 self._refresh_routing_snapshots()
                 finished_outputs, _num_tokens = self.engine.step()
+                self._refresh_routing_snapshots()
                 self._publish_token_deltas(active)
                 self._publish_finished(active, finished_outputs)
-                self._refresh_routing_snapshots()
         except Exception as exc:
             failed_message = f"{type(exc).__name__}: {exc}"
             fatal_callback = self._mark_failed(failed_message)

@@ -39,6 +39,7 @@ class FakeService:
         zero_main_prefix_match=False,
         partial_main_prefix_match=False,
         invalid_prefix_match_header=False,
+        contaminate_first_main_prefix_match=False,
     ):
         self.active = 0
         self.max_active = 0
@@ -49,7 +50,11 @@ class FakeService:
         self.zero_main_prefix_match = zero_main_prefix_match
         self.partial_main_prefix_match = partial_main_prefix_match
         self.invalid_prefix_match_header = invalid_prefix_match_header
+        self.contaminate_first_main_prefix_match = (
+            contaminate_first_main_prefix_match
+        )
         self.previous_main_prompt = None
+        self.prefix_cache_block_size = 2
 
     async def get(self, url, _timeout_s):
         if url.endswith("/models"):
@@ -92,6 +97,9 @@ class FakeService:
                     "vocab_size": 32_000,
                     "sparse_method": method,
                     "prefix_cache_enabled": method == "omnikv",
+                    "prefix_cache_block_size": (
+                        self.prefix_cache_block_size
+                    ),
                     "code_revision": CODE_REVISION,
                     "benchmark_config": {
                         "gpu_memory_utilization": 0.9,
@@ -99,6 +107,9 @@ class FakeService:
                         "chunk_prefill_size": 8192,
                         "decode_cuda_graph": True,
                         "enable_prefix_caching": method == "omnikv",
+                        "prefix_cache_block_size": (
+                            self.prefix_cache_block_size
+                        ),
                     },
                 }
             )
@@ -126,15 +137,28 @@ class FakeService:
             matched_tokens = 0
             if methods != ["snapkv"]:
                 prompt = tuple(payload["prompt"])
-                matched_tokens = run._common_prefix_tokens(
+                raw_matched_tokens = run._common_prefix_tokens(
                     self.previous_main_prompt,
                     prompt,
                 )
+                matched_tokens = (
+                    raw_matched_tokens
+                    // self.prefix_cache_block_size
+                    * self.prefix_cache_block_size
+                )
+                if (
+                    self.previous_main_prompt is None
+                    and self.contaminate_first_main_prefix_match
+                ):
+                    matched_tokens = self.prefix_cache_block_size
                 self.previous_main_prompt = prompt
                 if self.zero_main_prefix_match:
                     matched_tokens = 0
-                elif self.partial_main_prefix_match and matched_tokens > 0:
-                    matched_tokens -= 1
+                elif (
+                    self.partial_main_prefix_match
+                    and matched_tokens > self.prefix_cache_block_size
+                ):
+                    matched_tokens -= self.prefix_cache_block_size
             matched_tokens_header = (
                 "invalid"
                 if self.invalid_prefix_match_header
@@ -415,7 +439,16 @@ class SimulatedDeepResearchTest(unittest.TestCase):
                     row["actual_prefix_matched_tokens"]
                     for row in main_rows
                 ],
-                [0, config.main_overhead_tokens, reusable_before_final],
+                [0, 2, 6],
+            )
+            self.assertEqual(
+                [
+                    row[
+                        "block_aligned_expected_reusable_prefix_tokens"
+                    ]
+                    for row in main_rows
+                ],
+                [0, 2, 6],
             )
             expected_reuse = (
                 config.main_overhead_tokens + reusable_before_final
@@ -424,12 +457,14 @@ class SimulatedDeepResearchTest(unittest.TestCase):
                 aggregate["prefix_cache"],
                 {
                     "expected_reusable_prefix_tokens": expected_reuse,
-                    "actual_prefix_matched_tokens": expected_reuse,
+                    "block_aligned_expected_reusable_prefix_tokens": 8,
+                    "actual_prefix_matched_tokens": 8,
                     "observed_requests": 9,
                     "expected_hit_requests": 2,
                     "actual_hit_requests": 2,
                     "unexpected_zero_hit_requests": 0,
                     "partial_hit_requests": 0,
+                    "unexpected_excess_hit_requests": 0,
                 },
             )
             self.assertEqual(
@@ -469,7 +504,7 @@ class SimulatedDeepResearchTest(unittest.TestCase):
                     for row in raw_rows
                     if row["route_observation"]["method"] == "omnikv"
                 ],
-                [0, config.main_overhead_tokens, reusable_before_final],
+                [0, 2, 6],
             )
             run_info = json.loads(
                 (output_dir / "run_info.json").read_text(encoding="utf-8")
@@ -483,6 +518,15 @@ class SimulatedDeepResearchTest(unittest.TestCase):
                 worker_configs[1]["info"]["benchmark_config"][
                     "enable_prefix_caching"
                 ]
+            )
+            self.assertEqual(
+                run_info["preflight"][
+                    "worker_prefix_cache_block_sizes"
+                ],
+                {
+                    "http://main-worker": 2,
+                    "http://snap-worker": 2,
+                },
             )
             self.assertEqual(
                 run_info["preflight"]["health"]["router_policy"][
@@ -887,11 +931,137 @@ class SimulatedDeepResearchTest(unittest.TestCase):
             self.assertEqual(aggregate["status"], "success")
             self.assertEqual(
                 aggregate["prefix_cache"]["partial_hit_requests"],
-                2,
+                1,
             )
             self.assertEqual(
                 aggregate["prefix_cache"]["unexpected_zero_hit_requests"],
                 0,
+            )
+
+    def test_sub_block_prefix_allows_zero_actual_hit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "run"
+            config = self._config(output_dir)
+            config = run.BenchmarkConfig(
+                **{
+                    **config.__dict__,
+                    "main_overhead_tokens": 1,
+                }
+            )
+            service = FakeService()
+
+            aggregate = asyncio.run(
+                run.run_benchmark(
+                    config,
+                    get_fn=service.get,
+                    post_fn=service.post,
+                )
+            )
+
+            self.assertEqual(aggregate["status"], "success")
+            rows = [
+                json.loads(line)
+                for line in (output_dir / "per_sample_results.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            second_round = next(
+                row
+                for row in rows
+                if row["sample_id"] == "round-01-main-agent"
+            )
+            self.assertEqual(
+                second_round["expected_reusable_prefix_tokens"],
+                1,
+            )
+            self.assertEqual(
+                second_round[
+                    "block_aligned_expected_reusable_prefix_tokens"
+                ],
+                0,
+            )
+            self.assertEqual(
+                second_round["actual_prefix_matched_tokens"],
+                0,
+            )
+
+    def test_block_multiple_prefix_retains_full_block_expectation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "run"
+            config = self._config(output_dir)
+            config = run.BenchmarkConfig(
+                **{
+                    **config.__dict__,
+                    "main_overhead_tokens": 2,
+                }
+            )
+            service = FakeService()
+
+            aggregate = asyncio.run(
+                run.run_benchmark(
+                    config,
+                    get_fn=service.get,
+                    post_fn=service.post,
+                )
+            )
+
+            self.assertEqual(aggregate["status"], "success")
+            rows = [
+                json.loads(line)
+                for line in (output_dir / "per_sample_results.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            second_round = next(
+                row
+                for row in rows
+                if row["sample_id"] == "round-01-main-agent"
+            )
+            self.assertEqual(
+                second_round["expected_reusable_prefix_tokens"],
+                2,
+            )
+            self.assertEqual(
+                second_round[
+                    "block_aligned_expected_reusable_prefix_tokens"
+                ],
+                2,
+            )
+            self.assertEqual(
+                second_round["actual_prefix_matched_tokens"],
+                2,
+            )
+
+    def test_first_main_hit_is_rejected_as_stale_cache_contamination(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "run"
+            config = self._config(output_dir)
+            service = FakeService(
+                contaminate_first_main_prefix_match=True
+            )
+
+            with self.assertRaisesRegex(
+                run.BenchmarkFailed,
+                "stale-cache contamination",
+            ):
+                asyncio.run(
+                    run.run_benchmark(
+                        config,
+                        get_fn=service.get,
+                        post_fn=service.post,
+                    )
+                )
+
+            aggregate = json.loads(
+                (output_dir / "aggregate_metrics.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(
+                aggregate["prefix_cache"][
+                    "unexpected_excess_hit_requests"
+                ],
+                1,
             )
 
     def test_invalid_prefix_match_header_is_metric_failure(self):
@@ -930,6 +1100,7 @@ class SimulatedDeepResearchTest(unittest.TestCase):
         active = 0
         max_active = 0
         previous_main_prompt = None
+        prefix_cache_block_size = 2
 
         def fake_request(_url, *, payload, timeout_s):
             nonlocal active, max_active, previous_main_prompt
@@ -955,6 +1126,11 @@ class SimulatedDeepResearchTest(unittest.TestCase):
                 matched_tokens = run._common_prefix_tokens(
                     previous_main_prompt,
                     prompt,
+                )
+                matched_tokens = (
+                    matched_tokens
+                    // prefix_cache_block_size
+                    * prefix_cache_block_size
                 )
                 previous_main_prompt = prompt
             prompt_tokens = len(payload["prompt"])
@@ -1218,6 +1394,124 @@ class SimulatedDeepResearchTest(unittest.TestCase):
                 asyncio.run(
                     run.preflight(config, get_fn=no_prefix_cache_get)
                 )
+
+    def test_preflight_requires_main_worker_prefix_cache_block_size(self):
+        service = FakeService()
+
+        async def missing_block_size_get(url, timeout_s):
+            response = await service.get(url, timeout_s)
+            if url == "http://main-worker/v1/worker/info":
+                payload = json.loads(response.body)
+                payload.pop("prefix_cache_block_size")
+                return _json_response(payload)
+            return response
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config(Path(tmp) / "run")
+            with self.assertRaisesRegex(
+                run.PreflightParseError,
+                "positive integer prefix_cache_block_size",
+            ):
+                asyncio.run(
+                    run.preflight(
+                        config,
+                        get_fn=missing_block_size_get,
+                    )
+                )
+
+    def test_preflight_rejects_dirty_router_revision(self):
+        service = FakeService()
+
+        async def dirty_router_get(url, timeout_s):
+            response = await service.get(url, timeout_s)
+            if url.endswith("/health"):
+                payload = json.loads(response.body)
+                payload["router_policy"]["code_revision"] = {
+                    **CODE_REVISION,
+                    "git_dirty": True,
+                }
+                return _json_response(payload)
+            return response
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config(Path(tmp) / "run")
+            with self.assertRaisesRegex(
+                ValueError,
+                "dirty Git worktree",
+            ):
+                asyncio.run(
+                    run.preflight(config, get_fn=dirty_router_get)
+                )
+
+    def test_preflight_rejects_dirty_worker_revision(self):
+        service = FakeService()
+
+        async def dirty_worker_get(url, timeout_s):
+            response = await service.get(url, timeout_s)
+            if url == "http://main-worker/v1/worker/info":
+                payload = json.loads(response.body)
+                payload["code_revision"] = {
+                    **CODE_REVISION,
+                    "git_dirty": True,
+                }
+                return _json_response(payload)
+            return response
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config(Path(tmp) / "run")
+            with self.assertRaisesRegex(
+                ValueError,
+                "dirty Git worktree",
+            ):
+                asyncio.run(
+                    run.preflight(config, get_fn=dirty_worker_get)
+                )
+
+    def test_installed_package_revision_may_have_unknown_git_dirty(self):
+        run._validate_code_revision(
+            {
+                "git_commit": None,
+                "git_branch": None,
+                "git_dirty": None,
+                "package_version": "1.2.3",
+            },
+            "installed package",
+        )
+
+    def test_client_dirty_patch_is_archived_with_hash(self):
+        patch_text = "diff --git a/a.py b/a.py\n"
+
+        def git_command(*args):
+            outputs = {
+                ("rev-parse", "HEAD"): "abc123\n",
+                ("branch", "--show-current"): "feature\n",
+                (
+                    "status",
+                    "--porcelain",
+                    "--untracked-files=all",
+                ): " M a.py\n",
+                ("diff", "--binary", "HEAD", "--"): patch_text,
+            }
+            return run.subprocess.CompletedProcess(
+                ["git", *args],
+                0,
+                outputs[args],
+                "",
+            )
+
+        with patch.object(run, "_git_command", side_effect=git_command):
+            state, captured_patch = run._capture_client_code_state()
+
+        self.assertEqual(captured_patch, patch_text)
+        self.assertTrue(state["git_dirty"])
+        self.assertEqual(
+            state["worktree_patch"]["path"],
+            "client_worktree.patch",
+        )
+        self.assertEqual(
+            state["worktree_patch"]["sha256"],
+            run.hashlib.sha256(patch_text.encode("utf-8")).hexdigest(),
+        )
 
     def test_preflight_rejects_synthetic_ids_outside_vocab(self):
         service = FakeService()

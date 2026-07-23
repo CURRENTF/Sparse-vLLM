@@ -42,11 +42,15 @@ The runner calls the smart router's `/v1/completions` endpoint.
   agent roles. Same-model workers with unrelated methods do not constrain the
   benchmark.
 - Every worker eligible for main-agent routing must have prefix caching
-  enabled.
+  enabled and report a positive integer `prefix_cache_block_size`.
 - Every response must include `X-SparseVLLM-Worker`,
-  `X-SparseVLLM-Route-Reason`, and `X-SparseVLLM-Sparse-Method`.
+  `X-SparseVLLM-Route-Reason`, `X-SparseVLLM-Sparse-Method`, and
+  `X-SparseVLLM-Prefix-Matched-Tokens`.
 - A request routed to the wrong method is recorded as `metric_failed`, and the
   run stops after the active round has been recorded.
+- Preflight rejects a router or benchmark-eligible worker that reports
+  `git_dirty=true`. An installed package may report `git_dirty=null` only when
+  it provides a package version.
 
 This contract requires separate workers because one worker advertises one
 sparse method. A typical deployment uses one GPU for the main-agent
@@ -84,6 +88,14 @@ For the default profile, every eligible subagent worker needs
 The preflight reads these limits from each eligible worker instead of applying
 the router model card's cross-method minimum.
 
+The synthetic workload remains exactly reproducible from `seed`; the runner
+does not inject a per-run nonce. Consequently, rerunning the same seed against
+an uncleared worker could encounter cache entries from an earlier run. The
+runner detects this instead of silently measuring the warm cache: an actual
+match larger than this run's block-aligned expectation, including any hit on
+the first main-agent request, is `metric_failed`. Clear or restart the
+prefix-cache worker before rerunning a fixed seed.
+
 The weighted distributions are configurable:
 
 ```bash
@@ -119,30 +131,39 @@ rejected. The run writes:
   router health and code revision, role-specific context requirements, and
   benchmark-critical configuration and code revision reported by every
   worker.
+- `client_worktree.patch`: emitted when tracked client files are dirty. Its
+  path and SHA-256 are recorded in `run_info.json`; untracked client files are
+  rejected because a tracked Git patch cannot reproduce them.
 - `raw_outputs.jsonl`: exact request URL, timeout, prompt seed and payload,
   plus raw HTTP responses, response headers, and the parsed router observation.
 - `parsed_outputs.jsonl`: extracted text, finish reason, usage, and parse
   status.
 - `per_sample_results.jsonl`: phase, requested/actual token counts, latency,
   method preference, actual worker, actual method, expected reusable
-  main-agent prefix tokens, the selected worker's actual matched prefix tokens,
-  and explicit status.
+  main-agent prefix tokens, selected-worker block size, block-aligned expected
+  tokens, the selected worker's actual matched prefix tokens, and explicit
+  status.
 - `round_metrics.jsonl`: barrier time, p50/p95/max subagent latency, straggler
   gap, main-agent latency, and explicit status for every attempted round,
   including a round whose main-agent request fails.
 - `aggregate_metrics.json`: end-to-end research-job throughput, token
   throughput, latency percentiles, status counts, route distributions, and
   separate attempted/completed round counts. Its top-level and per-phase
-  `prefix_cache` objects include expected and actual token totals, expected and
-  actual hit counts, partial hits, and unexpected zero hits.
+  `prefix_cache` objects include raw expected, block-aligned expected, and
+  actual token totals, expected and actual hit counts, partial hits, unexpected
+  zero hits, and unexpected excess hits.
 
 Any failed HTTP request, malformed response, token-count mismatch, wrong method
-route, missing route header, invalid matched-token header, or expected nonzero
-reuse with zero actual matched tokens remains visible in the artifacts and
-makes the run fail.
+route, missing route header, invalid matched-token header, expected cacheable
+reuse with zero actual matched tokens, or actual reuse beyond this run's
+expectation remains visible in the artifacts and makes the run fail.
 
 `expected_reusable_prefix_tokens` is the raw common-prefix length. A block-based
-prefix cache can reuse the largest whole-block prefix, so observed hit tokens
-may be lower. A nonzero partial hit is recorded without failing the metric
-because block alignment and cache capacity can reduce reuse; an observed zero
-when the workload expects a reusable main-agent prefix is `metric_failed`.
+prefix cache can reuse only whole blocks. For the selected worker's block size
+`b`, `block_aligned_expected_reusable_prefix_tokens` is the minimum of the
+whole-block raw common prefix and the cacheable portions of the current and
+previous prompts; the latter two retain their final token for logits. A raw
+prefix shorter than one block therefore allows an actual zero hit. A nonzero
+partial hit is recorded without failing because cache capacity can reduce
+reuse. Zero actual reuse when the block-aligned expectation is nonzero, or
+actual reuse above that expectation, is `metric_failed`.
