@@ -291,6 +291,8 @@ class SimulatedDeepResearchTest(unittest.TestCase):
             self.assertEqual(aggregate["phase_counts"]["subagent"], 6)
             self.assertEqual(aggregate["phase_counts"]["round_summary"], 2)
             self.assertEqual(aggregate["phase_counts"]["final_summary"], 1)
+            self.assertEqual(aggregate["rounds_attempted"], 2)
+            self.assertEqual(aggregate["rounds_completed"], 2)
             self.assertEqual(
                 aggregate["route_method_counts"],
                 {"omnikv": 3, "snapkv": 6},
@@ -469,6 +471,8 @@ class SimulatedDeepResearchTest(unittest.TestCase):
                 )
             )
             self.assertEqual(aggregate["successful_requests"], 3)
+            self.assertEqual(aggregate["rounds_attempted"], 1)
+            self.assertEqual(aggregate["rounds_completed"], 0)
             self.assertGreater(
                 aggregate["phase_metrics"]["subagent"]["elapsed_s"],
                 0.0,

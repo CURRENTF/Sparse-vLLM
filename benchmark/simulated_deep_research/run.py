@@ -1289,7 +1289,11 @@ def _aggregate_metrics(
         "route_method_counts": dict(sorted(route_method_counts.items())),
         "route_reason_counts": dict(sorted(route_reason_counts.items())),
         "distinct_route_workers": len(route_worker_counts),
-        "rounds_completed": len(rounds),
+        "rounds_attempted": len(rounds),
+        "rounds_completed": sum(
+            str(round_row.get("status")) == "success"
+            for round_row in rounds
+        ),
         "round_metrics": rounds,
         "artifact_paths": {
             "run_info": str(config.output_dir / "run_info.json"),

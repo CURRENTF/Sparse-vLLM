@@ -124,7 +124,8 @@ rejected. The run writes:
   gap, main-agent latency, and explicit status for every attempted round,
   including a round whose main-agent request fails.
 - `aggregate_metrics.json`: end-to-end research-job throughput, token
-  throughput, latency percentiles, status counts, and route distributions.
+  throughput, latency percentiles, status counts, route distributions, and
+  separate attempted/completed round counts.
 
 Any failed HTTP request, malformed response, token-count mismatch, wrong method
 route, or missing route header remains visible in the artifacts and makes the

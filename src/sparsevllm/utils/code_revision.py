@@ -31,7 +31,7 @@ def code_revision_info() -> dict[str, str | bool | None]:
     repo_root = Path(__file__).resolve().parents[3]
     dirty_result = _git_command(repo_root, "status", "--porcelain")
     try:
-        package_version = version("sparsevllm")
+        package_version = version("deltakv")
     except PackageNotFoundError:
         package_version = None
     return {
