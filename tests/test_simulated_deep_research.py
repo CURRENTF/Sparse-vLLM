@@ -1,0 +1,441 @@
+import asyncio
+import json
+import tempfile
+import unittest
+from pathlib import Path
+
+from benchmark.simulated_deep_research import run
+
+
+def _json_response(
+    payload,
+    *,
+    status=200,
+    headers=None,
+):
+    return run.HttpResponse(
+        status=status,
+        headers=headers or {},
+        body=json.dumps(payload).encode("utf-8"),
+    )
+
+
+class FakeService:
+    def __init__(
+        self,
+        *,
+        fail_sample_number=None,
+        wrong_subagent_method=False,
+    ):
+        self.active = 0
+        self.max_active = 0
+        self.completion_calls = 0
+        self.payloads = []
+        self.fail_sample_number = fail_sample_number
+        self.wrong_subagent_method = wrong_subagent_method
+
+    async def get(self, url, _timeout_s):
+        if url.endswith("/models"):
+            return _json_response(
+                {
+                    "object": "list",
+                    "data": [
+                        {
+                            "id": "sim-model",
+                            "owned_by": "sparsevllm-router",
+                            "max_model_len": 65536,
+                        }
+                    ],
+                }
+            )
+        if url.endswith("/health"):
+            return _json_response(
+                {
+                    "status": "ok",
+                    "healthy_workers": [
+                        "http://snap-worker",
+                        "http://main-worker",
+                    ],
+                }
+            )
+        raise AssertionError(f"Unexpected GET URL: {url}")
+
+    async def post(self, url, payload, _timeout_s):
+        self.completion_calls += 1
+        self.payloads.append(payload)
+        call_number = self.completion_calls
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        try:
+            await asyncio.sleep(0.001)
+            methods = payload["svllm_method_preference"].split(",")
+            if methods == ["snapkv"]:
+                worker = "http://snap-worker"
+                method = (
+                    "omnikv"
+                    if self.wrong_subagent_method
+                    else "snapkv"
+                )
+            else:
+                worker = "http://main-worker"
+                method = "omnikv"
+            headers = {
+                "x-sparsevllm-worker": worker,
+                "x-sparsevllm-route-reason": "lowest_load_no_prefix_match",
+                "x-sparsevllm-sparse-method": method,
+            }
+            if call_number == self.fail_sample_number:
+                return _json_response(
+                    {"error": "synthetic failure"},
+                    status=500,
+                    headers=headers,
+                )
+            prompt_tokens = len(payload["prompt"])
+            completion_tokens = payload["max_tokens"]
+            return _json_response(
+                {
+                    "id": f"cmpl-{call_number}",
+                    "object": "text_completion",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "text": "synthetic output",
+                            "finish_reason": "length",
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": completion_tokens,
+                        "total_tokens": prompt_tokens + completion_tokens,
+                    },
+                },
+                headers=headers,
+            )
+        finally:
+            self.active -= 1
+
+
+class SimulatedDeepResearchTest(unittest.TestCase):
+    def _config(self, output_dir):
+        return run.BenchmarkConfig(
+            base_url="http://router.test/v1",
+            model="sim-model",
+            output_dir=output_dir,
+            rounds=2,
+            articles_per_round=3,
+            article_token_buckets=((1, 10, 20),),
+            query_tokens=4,
+            subagent_output_token_buckets=((1, 2, 5),),
+            main_overhead_tokens=3,
+            min_round_summary_tokens=4,
+            max_round_summary_tokens=4,
+            final_overhead_tokens=2,
+            min_final_output_tokens=6,
+            max_final_output_tokens=6,
+            seed=7,
+        )
+
+    def test_required_model_len_covers_each_request_class(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config(Path(tmp) / "run")
+            self.assertEqual(run.required_model_len(config), 29)
+
+    def test_default_profile_is_long_tailed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = run.BenchmarkConfig(
+                base_url="http://router.test/v1",
+                model="sim-model",
+                output_dir=Path(tmp) / "run",
+            )
+            self.assertEqual(
+                config.article_token_buckets,
+                (
+                    (60, 1_000, 8_000),
+                    (25, 8_001, 16_000),
+                    (10, 16_001, 32_000),
+                    (5, 32_001, 64_000),
+                ),
+            )
+            self.assertEqual(
+                config.subagent_output_token_buckets,
+                ((90, 100, 600), (10, 800, 1_500)),
+            )
+            self.assertEqual(run.required_model_len(config), 65_564)
+
+    def test_rejects_invalid_token_bucket(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config(Path(tmp) / "run")
+            config = run.BenchmarkConfig(
+                **{
+                    **config.__dict__,
+                    "article_token_buckets": ((0, 10, 20),),
+                }
+            )
+            with self.assertRaisesRegex(ValueError, "weight must be positive"):
+                run.validate_config(config)
+
+    def test_required_model_len_includes_accumulated_main_summaries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config(Path(tmp) / "run")
+            config = run.BenchmarkConfig(
+                **{
+                    **config.__dict__,
+                    "rounds": 4,
+                    "articles_per_round": 2,
+                    "article_token_buckets": ((1, 1, 1),),
+                    "query_tokens": 1,
+                    "subagent_output_token_buckets": ((1, 1, 1),),
+                    "main_overhead_tokens": 3,
+                    "min_round_summary_tokens": 5,
+                    "max_round_summary_tokens": 5,
+                    "final_overhead_tokens": 2,
+                    "min_final_output_tokens": 1,
+                    "max_final_output_tokens": 1,
+                }
+            )
+            self.assertEqual(run.required_model_len(config), 26)
+
+    def test_rejects_overlapping_main_and_subagent_methods(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config(Path(tmp) / "run")
+            config = run.BenchmarkConfig(
+                **{
+                    **config.__dict__,
+                    "main_agent_methods": ("snapkv",),
+                }
+            )
+            with self.assertRaisesRegex(ValueError, "must be disjoint"):
+                run.validate_config(config)
+
+    def test_runs_parallel_subagents_and_writes_auditable_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "run"
+            config = self._config(output_dir)
+            service = FakeService()
+
+            aggregate = asyncio.run(
+                run.run_benchmark(
+                    config,
+                    get_fn=service.get,
+                    post_fn=service.post,
+                )
+            )
+
+            self.assertEqual(aggregate["status"], "success")
+            self.assertEqual(aggregate["expected_requests"], 9)
+            self.assertEqual(aggregate["successful_requests"], 9)
+            self.assertEqual(aggregate["phase_counts"]["subagent"], 6)
+            self.assertEqual(aggregate["phase_counts"]["round_summary"], 2)
+            self.assertEqual(aggregate["phase_counts"]["final_summary"], 1)
+            self.assertEqual(
+                aggregate["route_method_counts"],
+                {"omnikv": 3, "snapkv": 6},
+            )
+            self.assertEqual(
+                aggregate["phase_metrics"]["subagent"][
+                    "route_method_counts"
+                ],
+                {"snapkv": 6},
+            )
+            self.assertEqual(
+                aggregate["phase_metrics"]["round_summary"][
+                    "route_method_counts"
+                ],
+                {"omnikv": 2},
+            )
+            self.assertEqual(aggregate["distinct_route_workers"], 2)
+            self.assertGreaterEqual(service.max_active, 3)
+            main_payloads = [
+                payload
+                for payload in service.payloads
+                if payload["svllm_method_preference"] == "omnikv,vanilla"
+            ]
+            self.assertEqual(len(main_payloads), 3)
+            first_round_prompt = main_payloads[0]["prompt"]
+            second_round_prompt = main_payloads[1]["prompt"]
+            final_prompt = main_payloads[2]["prompt"]
+            self.assertEqual(
+                second_round_prompt[: config.main_overhead_tokens],
+                first_round_prompt[: config.main_overhead_tokens],
+            )
+            reusable_before_final = (
+                config.main_overhead_tokens
+                + config.max_round_summary_tokens
+            )
+            self.assertEqual(
+                final_prompt[:reusable_before_final],
+                second_round_prompt[:reusable_before_final],
+            )
+
+            for name in (
+                "run_info.json",
+                "raw_outputs.jsonl",
+                "parsed_outputs.jsonl",
+                "per_sample_results.jsonl",
+                "round_metrics.jsonl",
+                "aggregate_metrics.json",
+            ):
+                self.assertTrue((output_dir / name).is_file(), name)
+            sample_rows = [
+                json.loads(line)
+                for line in (output_dir / "per_sample_results.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            self.assertEqual(len(sample_rows), 9)
+            self.assertTrue(all(row["status"] == "success" for row in sample_rows))
+            self.assertTrue(
+                all(
+                    row["article_tokens"] is not None
+                    for row in sample_rows
+                    if row["phase"] == "subagent"
+                )
+            )
+            self.assertEqual(
+                {
+                    row["route_method"]
+                    for row in sample_rows
+                    if row["phase"] == "subagent"
+                },
+                {"snapkv"},
+            )
+            self.assertEqual(
+                {
+                    row["route_method"]
+                    for row in sample_rows
+                    if row["phase"] != "subagent"
+                },
+                {"omnikv"},
+            )
+            main_rows = [
+                row for row in sample_rows if row["phase"] != "subagent"
+            ]
+            self.assertEqual(
+                [
+                    row["expected_reusable_prefix_tokens"]
+                    for row in main_rows
+                ],
+                [0, config.main_overhead_tokens, reusable_before_final],
+            )
+
+    def test_http_failure_is_recorded_before_run_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "run"
+            config = self._config(output_dir)
+            service = FakeService(fail_sample_number=2)
+
+            with self.assertRaisesRegex(run.BenchmarkFailed, "model_failed"):
+                asyncio.run(
+                    run.run_benchmark(
+                        config,
+                        get_fn=service.get,
+                        post_fn=service.post,
+                    )
+                )
+
+            aggregate = json.loads(
+                (output_dir / "aggregate_metrics.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(aggregate["status"], "model_failed")
+            self.assertEqual(aggregate["status_counts"]["model_failed"], 1)
+            rows = [
+                json.loads(line)
+                for line in (output_dir / "per_sample_results.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            self.assertEqual(len(rows), 3)
+            self.assertEqual(
+                sum(row["status"] == "model_failed" for row in rows),
+                1,
+            )
+
+    def test_wrong_subagent_method_is_metric_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "run"
+            config = self._config(output_dir)
+            service = FakeService(wrong_subagent_method=True)
+
+            with self.assertRaisesRegex(run.BenchmarkFailed, "metric_failed"):
+                asyncio.run(
+                    run.run_benchmark(
+                        config,
+                        get_fn=service.get,
+                        post_fn=service.post,
+                    )
+                )
+
+            aggregate = json.loads(
+                (output_dir / "aggregate_metrics.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(aggregate["status"], "metric_failed")
+            self.assertEqual(aggregate["status_counts"]["metric_failed"], 3)
+
+    def test_fails_when_router_has_only_one_worker(self):
+        async def one_worker_get(url, _timeout_s):
+            if url.endswith("/models"):
+                return _json_response(
+                    {
+                        "data": [
+                            {
+                                "id": "sim-model",
+                                "owned_by": "sparsevllm-router",
+                                "max_model_len": 65536,
+                            }
+                        ]
+                    }
+                )
+            return _json_response(
+                {
+                    "status": "ok",
+                    "healthy_workers": ["http://only-worker"],
+                }
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "run"
+            config = self._config(output_dir)
+            with self.assertRaisesRegex(run.BenchmarkFailed, "invalid_input"):
+                asyncio.run(
+                    run.run_benchmark(
+                        config,
+                        get_fn=one_worker_get,
+                        post_fn=FakeService().post,
+                    )
+                )
+            aggregate = json.loads(
+                (output_dir / "aggregate_metrics.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(aggregate["status"], "invalid_input")
+
+    def test_direct_server_payload_omits_router_only_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config(Path(tmp) / "run")
+            config = run.BenchmarkConfig(
+                **{
+                    **config.__dict__,
+                    "require_router": False,
+                }
+            )
+            spec = run.RequestSpec(
+                sample_id="direct",
+                phase="subagent",
+                round_index=0,
+                request_index=0,
+                prompt_tokens=8,
+                completion_tokens=2,
+                prompt_seed=1,
+                method_preferences=("snapkv",),
+            )
+            payload = run.build_payload(spec, config)
+            self.assertNotIn("svllm_method_preference", payload)
+
+
+if __name__ == "__main__":
+    unittest.main()

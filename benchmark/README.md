@@ -12,6 +12,7 @@ as a lightweight source-tree map.
 | `claw_eval/` | `run_sparsevllm_claw_eval.sh` | Claw-Eval through the shared Sparse-vLLM OpenAI-compatible server. |
 | `swe_bench_lite/` | `run.py` | Thin mini-SWE-agent generator and official SWE-bench Lite evaluator. |
 | `microbench.py` | `microbench.py` | Synthetic prompt-length throughput benchmark for TTFT, prefill/decode tok/s, ITL, and peak memory. |
+| `simulated_deep_research/` | `run.py` | Synthetic multi-round main-agent/subagent workload through the non-uniform OpenAI smart router. |
 | `multimodal/` | `video_qa/`, `image_qa/`, `visual_cache/` | Video QA, image QA, and visual-cache benchmark runners. |
 | `ruler_vt/` | `pred.py` | Self-contained RULER variable-tracking runner. |
 | `niah/` | `test_niah.py`, `gen_niah.py` | Needle-in-a-haystack generation and evaluation utility. |
