@@ -67,10 +67,15 @@ class RuntimeState:
             return int(sum(int(seq.current_chunk_size or 0) for seq in seqs))
         return int(len(seqs))
 
-    def _mixed_prefix_evictable_slots(self) -> int:
+    def _mixed_prefix_step_reclaimable_slots(self) -> int:
         if self.prefix_cache_coordinator is None:
             return 0
-        return int(self.prefix_cache_coordinator.evictable_slots())
+        return int(self.prefix_cache_coordinator.step_reclaimable_slots())
+
+    def _mixed_prefix_admission_reclaimable_slots(self) -> int:
+        if self.prefix_cache_coordinator is None:
+            return 0
+        return int(self.prefix_cache_coordinator.admission_reclaimable_slots())
 
     def _mixed_prefix_boundary_limit(self, seq: Sequence) -> int:
         if self.prefix_cache_coordinator is None:
@@ -127,8 +132,11 @@ class RuntimeState:
         if self.recurrent_state_manager is not None:
             self.recurrent_state_manager.on_forward_end(seqs, is_prefill)
         if self.prefix_cache_coordinator is not None:
-            self.prefix_cache_coordinator.record_step_tokens(seqs, is_prefill)
-            self.prefix_cache_coordinator.commit_pending_blocks(seqs)
+            try:
+                self.prefix_cache_coordinator.record_step_tokens(seqs, is_prefill)
+                self.prefix_cache_coordinator.commit_pending_blocks(seqs)
+            finally:
+                self.prefix_cache_coordinator.finish_step()
 
     def free_seq(self, seq_id: int) -> None:
         self.cache_manager.free_seq(seq_id)
@@ -163,7 +171,10 @@ class RuntimeState:
         self.cache_manager.clear_prefix_cache_hit(seq)
 
     def prefill_step_free_slots(self) -> int:
-        return int(self.cache_manager.prefill_step_free_slots() + self._mixed_prefix_evictable_slots())
+        return int(
+            self.cache_manager.prefill_step_free_slots()
+            + self._mixed_prefix_step_reclaimable_slots()
+        )
 
     def prefill_batched_tokens_margin(self) -> int:
         return int(self.cache_manager.prefill_batched_tokens_margin())
@@ -184,7 +195,10 @@ class RuntimeState:
         return bool(self.cache_manager.requires_long_prefill_offload(seq))
 
     def prefill_step_free_slots_for(self, seq: Sequence) -> int:
-        free_slots = int(self.cache_manager.prefill_step_free_slots_for(seq) + self._mixed_prefix_evictable_slots())
+        free_slots = int(
+            self.cache_manager.prefill_step_free_slots_for(seq)
+            + self._mixed_prefix_step_reclaimable_slots()
+        )
         if self.prefix_cache_coordinator is None:
             return free_slots
         return int(min(free_slots, self._mixed_prefix_boundary_limit(seq)))
@@ -193,10 +207,16 @@ class RuntimeState:
         return int(self.cache_manager.min_final_prefill_chunk_size(seq))
 
     def decode_step_free_slots(self) -> int:
-        return int(self.cache_manager.decode_step_free_slots() + self._mixed_prefix_evictable_slots())
+        return int(
+            self.cache_manager.decode_step_free_slots()
+            + self._mixed_prefix_step_reclaimable_slots()
+        )
 
     def decode_step_free_slots_for(self, seq: Sequence) -> int:
-        return int(self.cache_manager.decode_step_free_slots_for(seq) + self._mixed_prefix_evictable_slots())
+        return int(
+            self.cache_manager.decode_step_free_slots_for(seq)
+            + self._mixed_prefix_step_reclaimable_slots()
+        )
 
     def prefill_step_reservation_cost(self, seq: Sequence, scheduled_tokens: int) -> int:
         return int(self.cache_manager.prefill_step_reservation_cost(seq, scheduled_tokens))
@@ -205,7 +225,10 @@ class RuntimeState:
         return int(self.cache_manager.decode_step_reservation_cost(seq))
 
     def prompt_admission_free_slots(self) -> int:
-        return int(self.cache_manager.prompt_admission_free_slots() + self._mixed_prefix_evictable_slots())
+        return int(
+            self.cache_manager.prompt_admission_free_slots()
+            + self._mixed_prefix_admission_reclaimable_slots()
+        )
 
     def prompt_admission_budgets(self, waiting_seqs, chunk_prefill_size: int) -> dict[str, int]:
         budgets = dict(self.cache_manager.prompt_admission_budgets(waiting_seqs, chunk_prefill_size))
@@ -213,7 +236,7 @@ class RuntimeState:
             0,
             int(self.config.max_num_seqs_in_gpu) - len(self._resident_seq_ids),
         )
-        extra = self._mixed_prefix_evictable_slots()
+        extra = self._mixed_prefix_admission_reclaimable_slots()
         if extra <= 0:
             return budgets
         if "slots" in budgets:

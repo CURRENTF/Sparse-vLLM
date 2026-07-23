@@ -38,6 +38,8 @@ from eval_utils import (  # noqa: E402
     create_multiturn_prompt,
 )
 
+DEFAULT_MAX_SEQ_LENGTH = 131_072
+
 
 def parse_csv(value: str) -> list[str]:
     return [item.strip() for item in str(value).split(",") if item.strip()]
@@ -110,6 +112,55 @@ def encode_prompt_fragment(fragment: Any, tokenizer: Any) -> list[int]:
 def eligible_cache_tokens(reusable_prefix_tokens: int, current_prompt_len: int, block_size: int) -> int:
     reusable = (int(reusable_prefix_tokens) // int(block_size)) * int(block_size)
     return min(reusable, usable_prefix_cache_tokens(current_prompt_len, block_size))
+
+
+def cache_reuse_accounting(
+    *,
+    cached_tokens: int,
+    planned_session_eligible_tokens: int,
+) -> dict[str, int | str]:
+    cached_tokens = int(cached_tokens)
+    planned_session_eligible_tokens = int(planned_session_eligible_tokens)
+    covered_tokens = min(cached_tokens, planned_session_eligible_tokens)
+    beyond_tokens = max(0, cached_tokens - planned_session_eligible_tokens)
+    if cached_tokens == 0:
+        scope = "none"
+    elif beyond_tokens > 0:
+        scope = "beyond_planned_session_prefix"
+    else:
+        scope = "within_planned_session_prefix"
+    return {
+        "planned_session_prefix_covered_tokens": covered_tokens,
+        "cached_tokens_beyond_planned_session_prefix": beyond_tokens,
+        "cache_hit_scope": scope,
+    }
+
+
+def cache_reuse_totals(records: Sequence[dict[str, Any]]) -> tuple[int, int, int, int]:
+    total_planned = 0
+    total_covered = 0
+    total_beyond = 0
+    beyond_requests = 0
+    for record in records:
+        planned = int(
+            record.get(
+                "planned_session_eligible_cache_tokens",
+                record.get("eligible_cache_tokens", 0),
+            )
+            or 0
+        )
+        cached = int(record.get("cached_tokens", 0) or 0)
+        accounting = cache_reuse_accounting(
+            cached_tokens=cached,
+            planned_session_eligible_tokens=planned,
+        )
+        covered = int(accounting["planned_session_prefix_covered_tokens"])
+        beyond = int(accounting["cached_tokens_beyond_planned_session_prefix"])
+        total_planned += planned
+        total_covered += covered
+        total_beyond += beyond
+        beyond_requests += int(beyond > 0)
+    return total_planned, total_covered, total_beyond, beyond_requests
 
 
 def truncate_token_ids(token_ids: list[int], max_length: int, manner: str = "middle") -> list[int]:
@@ -304,7 +355,7 @@ class BatchedSparseVLLMGenerator:
         *,
         cached_tokens: int,
         cached_blocks: int,
-        eligible_tokens: int,
+        max_usable_tokens: int,
         block_size: int,
     ) -> str:
         if cached_tokens < 0:
@@ -319,8 +370,11 @@ class BatchedSparseVLLMGenerator:
             return f"cached_tokens={cached_tokens} is not block-aligned to {block_size}."
         if cached_blocks * block_size != cached_tokens:
             return f"cached_blocks={cached_blocks} does not match cached_tokens={cached_tokens}."
-        if cached_tokens > eligible_tokens:
-            return f"cached_tokens={cached_tokens} exceeds eligible_cache_tokens={eligible_tokens}."
+        if cached_tokens > max_usable_tokens:
+            return (
+                f"cached_tokens={cached_tokens} exceeds max_usable_cache_tokens="
+                f"{max_usable_tokens}."
+            )
         return ""
 
     def run_batch(self, specs: list[RequestSpec]) -> tuple[dict[int, str], list[dict[str, Any]]]:
@@ -355,8 +409,12 @@ class BatchedSparseVLLMGenerator:
                 "cached_blocks": 0,
                 "status": "success",
                 "error_message": "",
-                "eligible_tokens": eligible_cache_tokens(
+                "planned_session_eligible_tokens": eligible_cache_tokens(
                     spec.reusable_prefix_tokens,
+                    len(spec.prompt_token_ids),
+                    block_size,
+                ),
+                "max_usable_tokens": usable_prefix_cache_tokens(
                     len(spec.prompt_token_ids),
                     block_size,
                 ),
@@ -413,8 +471,12 @@ class BatchedSparseVLLMGenerator:
             metric_error = self.trace_metric_error(
                 cached_tokens=cached_tokens,
                 cached_blocks=cached_blocks,
-                eligible_tokens=int(runtime["eligible_tokens"]),
+                max_usable_tokens=int(runtime["max_usable_tokens"]),
                 block_size=block_size,
+            )
+            reuse_accounting = cache_reuse_accounting(
+                cached_tokens=cached_tokens,
+                planned_session_eligible_tokens=int(runtime["planned_session_eligible_tokens"]),
             )
             status = str(runtime["status"])
             error_message = str(runtime["error_message"])
@@ -437,9 +499,15 @@ class BatchedSparseVLLMGenerator:
                     "generated_tokens": len(generated_token_ids),
                     "generated_token_ids": generated_token_ids,
                     "planned_reusable_prefix_tokens": int(spec.reusable_prefix_tokens),
-                    "eligible_cache_tokens": int(runtime["eligible_tokens"]),
+                    "planned_session_reusable_prefix_tokens": int(spec.reusable_prefix_tokens),
+                    "eligible_cache_tokens": int(runtime["planned_session_eligible_tokens"]),
+                    "planned_session_eligible_cache_tokens": int(
+                        runtime["planned_session_eligible_tokens"]
+                    ),
+                    "max_usable_cache_tokens": int(runtime["max_usable_tokens"]),
                     "cached_tokens": cached_tokens,
                     "cached_blocks": cached_blocks,
+                    **reuse_accounting,
                     "ttft_s": float(first_token_s - start_s),
                     "latency_s": float(finish_s - start_s),
                     "error_message": error_message,
@@ -459,7 +527,12 @@ def prefix_summary(trace_path: Path, summary_path: Path) -> dict[str, Any]:
     total_generated_tokens = sum(int(record.get("generated_tokens", 0) or 0) for record in success)
     total_cached_tokens = sum(int(record.get("cached_tokens", 0) or 0) for record in success)
     total_cached_blocks = sum(int(record.get("cached_blocks", 0) or 0) for record in success)
-    total_eligible_tokens = sum(int(record.get("eligible_cache_tokens", 0) or 0) for record in success)
+    (
+        total_planned_session_eligible_tokens,
+        total_planned_session_covered_tokens,
+        total_beyond_planned_session_tokens,
+        beyond_planned_session_requests,
+    ) = cache_reuse_totals(success)
     request_elapsed_s = sum(float(record.get("latency_s", 0.0) or 0.0) for record in success)
     status_counts: dict[str, int] = {}
     for record in records:
@@ -479,11 +552,22 @@ def prefix_summary(trace_path: Path, summary_path: Path) -> dict[str, Any]:
         "total_generated_tokens": total_generated_tokens,
         "total_cached_tokens": total_cached_tokens,
         "total_cached_blocks": total_cached_blocks,
-        "total_eligible_cache_tokens": total_eligible_tokens,
+        "total_eligible_cache_tokens": total_planned_session_eligible_tokens,
+        "total_planned_session_eligible_cache_tokens": total_planned_session_eligible_tokens,
+        "total_planned_session_prefix_covered_tokens": total_planned_session_covered_tokens,
+        "total_cached_tokens_beyond_planned_session_prefix": total_beyond_planned_session_tokens,
         "hit_requests": sum(1 for record in success if int(record.get("cached_tokens", 0) or 0) > 0),
+        "beyond_planned_session_prefix_hit_requests": beyond_planned_session_requests,
         "cache_hit_rate": total_cached_tokens / total_prompt_tokens if total_prompt_tokens else 0.0,
         "eligible_cache_hit_rate": (
-            total_cached_tokens / total_eligible_tokens if total_eligible_tokens else 0.0
+            total_planned_session_covered_tokens / total_planned_session_eligible_tokens
+            if total_planned_session_eligible_tokens
+            else 0.0
+        ),
+        "planned_session_prefix_coverage_rate": (
+            total_planned_session_covered_tokens / total_planned_session_eligible_tokens
+            if total_planned_session_eligible_tokens
+            else 0.0
         ),
         "request_elapsed_s": request_elapsed_s,
         "request_throughput": len(success) / request_elapsed_s if request_elapsed_s > 0 else 0.0,
@@ -1031,7 +1115,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_eval_examples", type=int, default=4)
     parser.add_argument("--start_example_id", type=int, default=0)
     parser.add_argument("--max_turns", type=int, default=2)
-    parser.add_argument("--max_seq_length", type=int, default=4096)
+    parser.add_argument("--max_seq_length", type=int, default=DEFAULT_MAX_SEQ_LENGTH)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--tensor_parallel_size", type=int, default=1)
     parser.add_argument("--prefix_cache_block_size", type=int, default=16)

@@ -16,7 +16,7 @@ Set `sparse_method` to one of the following method names.
 | `snapkv` | Physical eviction | SnapKV-style token selection keeps a compact set of important historical tokens after prefill. It reduces cache footprint by physically retaining only selected KV positions. | `decode_keep_tokens`, `prefill_keep_tokens`, `sink_keep_tokens`, `recent_keep_tokens` |
 | `pyramidkv` | Physical eviction | PyramidKV-style layer-dependent KV retention. It allocates sparse budgets across layers and physically stores the selected context tokens. | `decode_keep_tokens`, `prefill_keep_tokens`, `sink_keep_tokens`, `recent_keep_tokens` |
 | `omnikv` | Logical masking | OmniKV keeps the physical cache available but constructs sparse attention views for selected layers. This is useful when the method should avoid rewriting cache storage while still reducing attention work. | `full_attention_layers`, `decode_keep_tokens`, `prefill_keep_tokens`, `sink_keep_tokens`, `recent_keep_tokens`, `chunk_prefill_accel_omnikv` |
-| `quest` | Query-aware page selection | QuEST selects token pages based on the decode query. Prefill stays dense, and sparse selection happens in decode through page/chunk budgets. | `quest_chunk_size`, `quest_token_budget`, `quest_skip_layers` |
+| `quest` | Query-aware page selection | QuEST selects token pages based on the decode query. Prefill stays dense, and sparse selection happens in decode through page/chunk budgets. | `quest_chunk_size`, `quest_skip_layers`, `sink_keep_tokens`, `decode_keep_tokens`, `recent_keep_tokens` |
 | `deltakv` | Hybrid compression | Slim compressor-backed DeltaKV runtime. Legacy `deltakv-less-memory*` names normalize here for older configs, but real benchmark runs still require a matching compressor checkpoint. | `deltakv_checkpoint_path`, `deltakv_latent_dim`, `deltakv_center_ratio`, `deltakv_neighbor_count`, `deltakv_latent_quant_bits`, `full_layer_kv_quant_bits` |
 
 Sparse-vLLM internally stores this as `vllm_sparse_method`, but public commands
@@ -65,5 +65,10 @@ explicit ablation and document it with the benchmark result.
 `quest` runtime knobs:
 
 - `quest_chunk_size`: QuEST page/chunk size in tokens
-- `quest_token_budget`: decode-time token budget before page rounding
+- `sink_keep_tokens`, `decode_keep_tokens`, `recent_keep_tokens`: QuEST derives
+  its decode-time token budget once during config construction by summing these
+  three values
 - `quest_skip_layers`: keep the first N layers dense during decode
+
+`quest_token_budget` is no longer a runtime input. Passing it fails fast; remove
+it and configure the three common keep-token fields instead.

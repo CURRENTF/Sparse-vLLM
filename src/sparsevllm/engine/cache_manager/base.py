@@ -8,6 +8,7 @@ from abc import ABC, abstractmethod
 from typing import Any
 
 import torch
+import torch.distributed as dist
 
 from sparsevllm.config import Config
 from sparsevllm.distributed import ParallelContext
@@ -222,6 +223,24 @@ class CacheManager(ABC):
 
         self.kv_cache = None
         self._decode_static_max_context_len: int | None = None
+
+    def synchronize_prefix_cache_delete_plan(
+        self,
+        local_plan: dict[str, object],
+    ) -> None:
+        if int(getattr(self, "world_size", 1)) <= 1:
+            return
+        plans: list[dict[str, object] | None] = [None] * self.world_size
+        dist.all_gather_object(
+            plans,
+            local_plan,
+            group=self.parallel_context.world.process_group,
+        )
+        if any(plan != plans[0] for plan in plans[1:]):
+            raise RuntimeError(
+                "Prefix-cache subtree deletion plan diverged across world ranks: "
+                f"plans={plans!r}."
+            )
 
     def is_full_attention_layer(self, layer_idx: int) -> bool:
         return bool(self.runtime_layout.is_full_attention(int(layer_idx)))
@@ -678,7 +697,10 @@ class CacheManager(ABC):
 
     def before_prefill_layer_attention(self, layer_idx: int, selection: SparseSelection):
         """Optional hook immediately before building a prefill layer compute view."""
-        del layer_idx, selection
+        del selection
+        coordinator = getattr(self, "prefix_cache_coordinator", None)
+        if coordinator is not None:
+            coordinator.before_prefill_layer_attention(int(layer_idx))
         return None
 
     def defer_prefill_eviction(self) -> bool:
@@ -1052,9 +1074,35 @@ class CacheManager(ABC):
         del seq, payload
         raise RuntimeError("This cache manager does not support mixed prefix KV payload attach.")
 
+    def validate_prefix_kv_attach(self, seq: Sequence) -> bool:
+        del seq
+        raise RuntimeError("This cache manager does not support mixed prefix KV payload attach.")
+
+    def rollback_prefix_kv_attach(
+        self,
+        seq: Sequence,
+        payloads: list[object],
+        *,
+        row_preexisted: bool,
+    ) -> None:
+        del seq, payloads, row_preexisted
+        raise RuntimeError("This cache manager does not support mixed prefix KV attach rollback.")
+
     def free_prefix_kv_payload(self, payload: object) -> None:
         del payload
         raise RuntimeError("This cache manager does not support mixed prefix KV payload free.")
+
+    def allocate_prefix_kv_payload_device(self, payload: object) -> None:
+        del payload
+        raise RuntimeError("This cache manager does not support mixed prefix KV promotion.")
+
+    def allocate_prefix_kv_payloads_device(self, payloads: list[object]) -> None:
+        for payload in payloads:
+            self.allocate_prefix_kv_payload_device(payload)
+
+    def free_prefix_kv_payload_device(self, payload: object) -> None:
+        del payload
+        raise RuntimeError("This cache manager does not support mixed prefix KV demotion.")
 
     def prefix_kv_payload_nbytes(self, payload: object) -> int:
         del payload
@@ -1124,6 +1172,13 @@ class CacheManager(ABC):
                         "ref_count": int(block.ref_count),
                         "last_access": int(block.last_access),
                         "eviction_priority": int(block.eviction_priority),
+                        "device_present": bool(block.residency.device_present),
+                        "host_present": bool(block.residency.host_present),
+                        "transfer": (
+                            None
+                            if block.residency.transfer is None
+                            else block.residency.transfer.value
+                        ),
                         "payload": _debug_value_summary(block.payload),
                     }
                 )

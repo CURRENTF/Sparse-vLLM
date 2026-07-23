@@ -237,7 +237,7 @@ class SweBenchLiteRunnerTest(unittest.TestCase):
 
     def test_secret_validation_allows_token_budget_config(self):
         _reject_secrets(
-            {"engine_kwargs": {"quest_token_budget": 2048}},
+            {"engine_kwargs": {"decode_keep_tokens": 2048}},
             source=Path("server_manifest.json"),
         )
 

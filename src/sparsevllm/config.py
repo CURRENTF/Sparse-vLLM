@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import math
 import os
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -614,6 +615,8 @@ class Config:
     enable_prefix_caching: bool = False
     prefix_cache_block_size: int | None = None
     prefix_cache_max_blocks: int | None = None
+    enable_prefix_cache_offload: bool = False
+    prefix_cache_host_size_gb: float | None = None
     recurrent_state_max_bytes: int | None = None
     prefix_cache_max_recurrent_bytes: int | None = None
     prefix_cache_salt: str = ""
@@ -647,7 +650,7 @@ class Config:
 
     # QuEST Config
     quest_chunk_size: int = 16
-    quest_token_budget: int = 1024
+    quest_token_budget: int = field(init=False)
     quest_skip_layers: int = 2
 
     # SnapKV Config
@@ -847,6 +850,43 @@ class Config:
             "prefix_cache_max_blocks",
             self.prefix_cache_max_blocks,
         )
+        self.enable_prefix_cache_offload = _coerce_bool_config(
+            "enable_prefix_cache_offload",
+            self.enable_prefix_cache_offload,
+        )
+        if self.prefix_cache_host_size_gb is not None:
+            self.prefix_cache_host_size_gb = float(self.prefix_cache_host_size_gb)
+            if (
+                not math.isfinite(self.prefix_cache_host_size_gb)
+                or self.prefix_cache_host_size_gb <= 0
+            ):
+                raise ValueError(
+                    "prefix_cache_host_size_gb must be positive when set, "
+                    f"got {self.prefix_cache_host_size_gb}."
+                )
+        if self.enable_prefix_cache_offload:
+            if not self.enable_prefix_caching:
+                raise ValueError(
+                    "enable_prefix_cache_offload requires enable_prefix_caching=True."
+                )
+            if self.vllm_sparse_method not in ("", "omnikv", "quest"):
+                raise ValueError(
+                    "prefix cache offload currently supports only vanilla, OmniKV, and QuEST; "
+                    f"got vllm_sparse_method={self.vllm_sparse_method!r}."
+                )
+            if int(self.tensor_parallel_size) not in (1, 2):
+                raise ValueError(
+                    "prefix cache offload currently supports tensor_parallel_size=1 or 2."
+                )
+            if not self.enforce_eager:
+                raise ValueError(
+                    "prefix cache offload currently requires enforce_eager=True."
+                )
+            if self.prefix_cache_host_size_gb is None:
+                raise ValueError(
+                    "enable_prefix_cache_offload requires an explicit "
+                    "prefix_cache_host_size_gb."
+                )
         recurrent_state_max_bytes = _coerce_optional_positive_int(
             "recurrent_state_max_bytes",
             self.recurrent_state_max_bytes,
@@ -1250,8 +1290,25 @@ class Config:
 
         if self.quest_chunk_size <= 0:
             raise ValueError("quest_chunk_size 必须 > 0")
-        if self.quest_token_budget <= 0:
-            raise ValueError("quest_token_budget 必须 > 0")
+        self.quest_token_budget = 0
+        if self.vllm_sparse_method == "quest":
+            for name in ("num_sink_tokens", "decode_keep_tokens", "num_recent_tokens"):
+                value = getattr(self, name)
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                    raise ValueError(
+                        f"QuEST {name} must be a non-negative integer, got {value!r}."
+                    )
+            self.quest_token_budget = (
+                self.num_sink_tokens
+                + self.decode_keep_tokens
+                + self.num_recent_tokens
+            )
+            if self.quest_token_budget <= 0:
+                raise ValueError(
+                    "QuEST derived token budget must be > 0: "
+                    "num_sink_tokens + decode_keep_tokens + num_recent_tokens "
+                    f"= {self.quest_token_budget}."
+                )
         if self.quest_skip_layers < 0:
             raise ValueError("quest_skip_layers 不能 < 0")
         self.rkv_compression_interval = int(self.rkv_compression_interval or 0)

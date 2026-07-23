@@ -58,6 +58,9 @@ class PrefixCacheMixin:
     def _reset_prefix_cache_allocator_after_clear(self) -> None:
         raise NotImplementedError
 
+    def _on_prefix_cache_reset(self) -> None:
+        return None
+
     def _release_prefix_blocks(self, blocks: list[PrefixCacheBlock]) -> None:
         for block in blocks:
             block.ref_count -= 1
@@ -84,6 +87,7 @@ class PrefixCacheMixin:
             fingerprint=build_prefix_cache_fingerprint(self.config, int(self.prefix_cache_block_size)),
             max_blocks=getattr(self.config, "prefix_cache_max_blocks", None),
         )
+        self._on_prefix_cache_reset()
         self.seq_id_to_prefix_blocks.clear()
         self._init_prefix_cache_runtime()
 

@@ -21,6 +21,12 @@ optional dependencies as well:
 pip install -e ".[qwen35]"
 ```
 
+For prefix-cache offload with vanilla, OmniKV, or QuEST only:
+
+```bash
+pip install -e ".[prefix-offload]"
+```
+
 The Qwen3.5/Qwen3.6 FP8 backend resolves the
 `kernels-community/finegrained-fp8` Hub kernel on the first FP8 forward in each
 fresh process. This version lookup may contact the Hugging Face kernel registry

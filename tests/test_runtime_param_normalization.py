@@ -124,6 +124,16 @@ class RuntimeParamNormalizationTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "explicit token count"):
             normalize_runtime_params({"decode_keep_tokens": 0.17}, backend="sparsevllm")
 
+    def test_quest_token_budget_is_rejected_as_derived(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            "Sparse-vLLM QuEST derives it from sink_keep_tokens",
+        ):
+            normalize_runtime_params(
+                {"quest_token_budget": 2048},
+                backend="sparsevllm",
+            )
+
     def test_sparsevllm_observation_layer_keys_are_unknown(self):
         from sparsevllm import LLM
 

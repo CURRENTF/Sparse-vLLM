@@ -393,7 +393,6 @@ def _case_engine_kwargs(args: argparse.Namespace, case_name: str, max_prompt_len
         "decode_keep_tokens": int(args.num_top_tokens),
         "full_attention_layers": args.full_attention_layers,
         "quest_chunk_size": int(args.quest_chunk_size),
-        "quest_token_budget": int(args.quest_token_budget),
         "prefix_cache_block_size": _case_block_size(args, case_name),
         "prefix_cache_max_blocks": args.prefix_cache_max_blocks,
         "prefix_cache_salt": args.prefix_cache_salt,
@@ -407,7 +406,6 @@ def _case_engine_kwargs(args: argparse.Namespace, case_name: str, max_prompt_len
     hyper_params["enable_prefix_caching"] = bool(preset["enable_prefix_caching"])
     hyper_params["sparse_method"] = preset["method"]
     hyper_params["quest_chunk_size"] = int(args.quest_chunk_size)
-    hyper_params["quest_token_budget"] = int(args.quest_token_budget)
     hyper_params["full_attention_layers"] = args.full_attention_layers
     hyper_params["prefix_cache_block_size"] = _case_block_size(args, case_name)
     hyper_params["max_model_len"] = int(max_prompt_len + args.output_len + args.max_model_len_margin)
@@ -482,22 +480,46 @@ def _token_count_plan(args: argparse.Namespace) -> dict[str, int]:
     }
 
 
-def _long_text_threshold(args: argparse.Namespace, *, is_prefill: bool) -> int:
-    base = int(args.num_sink_tokens) + int(args.num_top_tokens) + int(args.num_recent_tokens)
-    return base + (int(args.chunk_prefill_size) if is_prefill else 0)
+def _long_text_threshold(
+    args: argparse.Namespace,
+    *,
+    is_prefill: bool,
+    engine_kwargs: dict[str, Any] | None = None,
+) -> int:
+    resolved = engine_kwargs or {}
+    base = (
+        int(resolved.get("sink_keep_tokens", args.num_sink_tokens))
+        + int(resolved.get("decode_keep_tokens", args.num_top_tokens))
+        + int(resolved.get("recent_keep_tokens", args.num_recent_tokens))
+    )
+    chunk_size = int(
+        resolved.get("engine_prefill_chunk_size", args.chunk_prefill_size)
+    )
+    return base + (chunk_size if is_prefill else 0)
 
 
-def _trace_sparse_path_summary(args: argparse.Namespace) -> dict[str, int | bool | str]:
+def _trace_sparse_path_summary(
+    args: argparse.Namespace,
+    engine_kwargs: dict[str, Any] | None = None,
+) -> dict[str, int | bool | str]:
     plan = _token_count_plan(args)
-    prefill_threshold = _long_text_threshold(args, is_prefill=True)
-    decode_threshold = _long_text_threshold(args, is_prefill=False)
+    prefill_threshold = _long_text_threshold(
+        args,
+        is_prefill=True,
+        engine_kwargs=engine_kwargs,
+    )
+    decode_threshold = _long_text_threshold(
+        args,
+        is_prefill=False,
+        engine_kwargs=engine_kwargs,
+    )
     multiturn_base_prefix = int(args.system_prompt_len) + int(args.session_prefix_len)
     return {
         "history_update": str(args.history_update),
         "chunk_prefill_accel_omnikv": bool(args.chunk_prefill_accel_omnikv),
         "omnikv_prefill_long_text_threshold": prefill_threshold,
         "omnikv_decode_long_text_threshold": decode_threshold,
-        "quest_sparse_decode_threshold": int(args.quest_token_budget),
+        "quest_sparse_decode_threshold": decode_threshold,
         "min_performance_prompt_len": int(args.min_performance_prompt_len),
         "min_cacheable_prefix_len": int(args.min_cacheable_prefix_len),
         "multiturn_base_prefix": int(multiturn_base_prefix),
@@ -514,7 +536,13 @@ def _validate_sparse_path_requirements(args: argparse.Namespace, cases: list[str
         return
 
     errors: list[str] = []
-    summary = _trace_sparse_path_summary(args)
+    token_plan = _token_count_plan(args)
+    resolved_kwargs = _case_engine_kwargs(
+        args,
+        cases[0],
+        token_plan["max_prompt_len"],
+    )
+    summary = _trace_sparse_path_summary(args, resolved_kwargs)
     prefill_threshold = int(summary["omnikv_prefill_long_text_threshold"])
     quest_threshold = int(summary["quest_sparse_decode_threshold"])
     shared_prompt = int(summary["shared_prefix_max_prompt"])
@@ -575,12 +603,13 @@ def _validate_sparse_path_requirements(args: argparse.Namespace, cases: list[str
             errors.append(
                 "shared_prefix prompt is too short for QuEST decode sparse path: "
                 f"shared_prefix_len + shared_suffix_len = {shared_prompt}, "
-                f"quest_token_budget = {quest_threshold}."
+                f"derived QuEST token budget = {quest_threshold}."
             )
         if "multiturn" in workloads and multiturn_max <= quest_threshold:
             errors.append(
                 "multiturn trace is too short for QuEST decode sparse path: "
-                f"max multiturn prompt = {multiturn_max}, quest_token_budget = {quest_threshold}."
+                f"max multiturn prompt = {multiturn_max}, "
+                f"derived QuEST token budget = {quest_threshold}."
             )
 
     if errors:
@@ -860,6 +889,7 @@ def _summarize_records(
     case_config: dict[str, Any],
     records: list[dict[str, Any]],
     args: argparse.Namespace,
+    engine_kwargs: dict[str, Any],
     cache_stats_before: dict[str, int],
     cache_stats_after: dict[str, int],
     peak_memory_gb: float,
@@ -878,7 +908,7 @@ def _summarize_records(
     total_generated_tokens = sum(generated_tokens)
     total_cached_tokens = sum(cached_tokens)
     total_eligible_tokens = sum(eligible_tokens)
-    trace_summary = _trace_sparse_path_summary(args)
+    trace_summary = _trace_sparse_path_summary(args, engine_kwargs)
     prefill_threshold = int(trace_summary["omnikv_prefill_long_text_threshold"])
     decode_threshold = int(trace_summary["omnikv_decode_long_text_threshold"])
     quest_threshold = int(trace_summary["quest_sparse_decode_threshold"])
@@ -1035,6 +1065,7 @@ def _run_case_worker(case_name: str, args_dict: dict[str, Any], case_dir: str) -
             case_config=CASE_PRESETS[case_name],
             records=records,
             args=args,
+            engine_kwargs=engine_kwargs,
             cache_stats_before=cache_stats_before,
             cache_stats_after=cache_stats_after,
             peak_memory_gb=peak_memory_gb,
@@ -1075,6 +1106,10 @@ def _read_case_summary(case_dir: Path, case_name: str) -> dict[str, Any]:
 
 
 def _write_report(output_dir: Path, summaries: list[dict[str, Any]], args: argparse.Namespace) -> None:
+    sparse_path_thresholds = {
+        str(summary.get("case", "")): summary.get("trace_sparse_path_summary", {})
+        for summary in summaries
+    }
     lines = [
         "# Prefix Cache Benchmark",
         "",
@@ -1083,7 +1118,7 @@ def _write_report(output_dir: Path, summaries: list[dict[str, Any]], args: argpa
         f"- Sessions/turns: `{args.sessions}/{args.turns}`",
         f"- Shared prefix prompts: `{args.shared_prompts}`",
         f"- History update: `{args.history_update}`",
-        f"- Sparse-path thresholds: `{_trace_sparse_path_summary(args)}`",
+        f"- Sparse-path thresholds: `{sparse_path_thresholds}`",
         "",
         "| Case | Status | Method | Prefix cache | Requests | Long prefill reqs | QuEST sparse-decode reqs | Mean TTFT ms | P90 TTFT ms | Cache hit rate | Eligible hit rate | Recomputed prompt tokens | Peak GB |",
         "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
@@ -1212,8 +1247,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prefix_cache_max_blocks", type=int, default=None)
     parser.add_argument("--prefix_cache_salt", default="prefix-cache-bench-v1")
     parser.add_argument("--quest_chunk_size", type=int, default=16)
-    parser.add_argument("--quest_token_budget", type=int, default=4096)
-
     parser.add_argument("--num_sink_tokens", type=int, default=8)
     parser.add_argument("--num_recent_tokens", type=int, default=256)
     parser.add_argument("--num_top_tokens", type=int, default=2048)
@@ -1250,17 +1283,22 @@ def main() -> None:
     )
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    token_plan = _token_count_plan(args)
+    case_engine_kwargs = {
+        case: _case_engine_kwargs(args, case, token_plan["max_prompt_len"])
+        for case in cases
+    }
     plan = {
         "command": _shell_command(),
         "output_dir": str(output_dir),
         "cases": cases,
         "workloads": sorted(workloads),
-        "token_count_plan": _token_count_plan(args),
-        "trace_sparse_path_summary": _trace_sparse_path_summary(args),
-        "case_engine_kwargs": {
-            case: _case_engine_kwargs(args, case, _token_count_plan(args)["max_prompt_len"])
-            for case in cases
-        },
+        "token_count_plan": token_plan,
+        "trace_sparse_path_summary": _trace_sparse_path_summary(
+            args,
+            case_engine_kwargs[cases[0]],
+        ),
+        "case_engine_kwargs": case_engine_kwargs,
         "git": git_metadata(REPO_ROOT_FOR_IMPORT),
         "env": selected_env_snapshot(),
     }

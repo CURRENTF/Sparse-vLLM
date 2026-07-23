@@ -1,5 +1,6 @@
 import tempfile
 from collections import deque
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -11,9 +12,15 @@ import torch
 from sparsevllm.config import Config
 from sparsevllm.engine.cache_manager.quest import QuestCacheManager, QuestPrefixBlockPayload
 from sparsevllm.engine.cache_manager.standard import StandardCacheManager, StandardPrefixBlockPayload
+from sparsevllm.engine.cache_manager.prefix_offload import (
+    QuestPrefixOffloadController,
+    StandardPrefixOffloadController,
+)
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.engine.prefix_cache import (
+    PrefixBlockResidency,
     PrefixCacheBlock,
+    PrefixTransferKind,
     RadixPrefixIndex,
     RadixTreeBackend,
     build_prefix_cache_fingerprint,
@@ -21,6 +28,7 @@ from sparsevllm.engine.prefix_cache import (
     usable_prefix_cache_tokens,
 )
 from sparsevllm.method_registry import PREFIX_CACHE_SUPPORTED_METHODS
+from sparsevllm.platforms import device_runtime
 
 
 def _cfg(method="", salt="", block_size=4):
@@ -105,8 +113,90 @@ def _make_standard_manager_for_prefix(block_size=2):
     manager.row_seq_lens = np.zeros((2,), dtype=np.int32)
     manager.seq_id_to_prefix_blocks = {}
     manager.seq_id_to_cached_ranges = {}
+    manager.prefix_offload_controller = None
+    manager._prefix_offload_step_h2d_operations = []
     manager._init_prefix_cache_runtime()
     return manager
+
+
+class _FakeHostPool:
+    def __init__(self, free_blocks=100):
+        self.free_blocks = int(free_blocks)
+        self.capacity_blocks = int(free_blocks)
+
+
+class _FakePrefixOffloadController:
+    def __init__(self, prefix_cache, free_blocks=100):
+        self.prefix_cache = prefix_cache
+        self.host_pool = _FakeHostPool(free_blocks)
+        self.d2h_operations = []
+        self.submitted_d2h = []
+        self.submitted_h2d = []
+        self._h2d_by_block_id = {}
+        self.waited_layers = []
+        self.reset_count = 0
+        self.synchronize_count = 0
+
+    def poll(self):
+        return (0, 0)
+
+    def wait_oldest_d2h(self):
+        return False
+
+    def submit_d2h(self, blocks):
+        for block in blocks:
+            self.prefix_cache.begin_d2h(block)
+        self.submitted_d2h.append(list(blocks))
+        self.host_pool.free_blocks -= len(blocks)
+
+    def submit_h2d(self, blocks):
+        for block in blocks:
+            self.prefix_cache.begin_h2d(block)
+        operation = SimpleNamespace(blocks=list(blocks), layer_events=[object(), object()])
+        self.submitted_h2d.append(operation)
+        for block in blocks:
+            self._h2d_by_block_id[block.stable_block_id] = operation
+        return operation
+
+    def h2d_operation_for_block(self, block):
+        return self._h2d_by_block_id.get(block.stable_block_id)
+
+    def wait_for_layer(self, operation, layer_index):
+        self.waited_layers.append((operation, int(layer_index)))
+
+    def free_host_payloads(self, blocks):
+        for block in blocks:
+            block.payload.host_block_index = None
+        self.host_pool.free_blocks += len(blocks)
+
+    def synchronize_all(self):
+        self.synchronize_count += 1
+
+    def reset(self):
+        self.reset_count += 1
+
+    def stats(self):
+        return {}
+
+
+class _CompletingD2HPrefixOffloadController(_FakePrefixOffloadController):
+    def wait_oldest_d2h(self):
+        blocks = [
+            block
+            for block in self.prefix_cache.blocks.values()
+            if block.residency.transfer == PrefixTransferKind.D2H
+        ]
+        if not blocks:
+            return False
+        for host_index, block in enumerate(blocks):
+            block.payload.host_block_index = host_index
+            self.prefix_cache.finish_d2h(block)
+        return True
+
+    def synchronize_all(self):
+        super().synchronize_all()
+        while self.wait_oldest_d2h():
+            pass
 
 
 def _make_quest_manager_for_prefix(page_size=2):
@@ -114,6 +204,7 @@ def _make_quest_manager_for_prefix(page_size=2):
     fingerprint = build_prefix_cache_fingerprint(cfg, page_size)
     manager = object.__new__(QuestCacheManager)
     manager.config = cfg
+    manager.runtime_layout = SimpleNamespace(kv_layer_index=lambda layer_idx: int(layer_idx))
     manager.device = torch.device("cpu")
     manager.enable_prefix_caching = True
     manager.page_size = page_size
@@ -131,6 +222,8 @@ def _make_quest_manager_for_prefix(page_size=2):
     manager.row_seq_lens = np.zeros((2,), dtype=np.int32)
     manager.seq_id_to_prefix_blocks = {}
     manager.seq_id_to_cached_pages = {}
+    manager.prefix_offload_controller = None
+    manager._prefix_offload_step_h2d_operations = []
     manager._init_prefix_cache_runtime()
     return manager
 
@@ -220,8 +313,14 @@ def test_prefix_cache_debug_summary_includes_refs_slots_and_stable_ids():
             token_ids=(1, 2),
             ref_count=2,
             eviction_priority=7,
+            residency=PrefixBlockResidency(
+                device_present=True,
+                host_present=False,
+                transfer=PrefixTransferKind.D2H,
+            ),
         )
     )
+    manager.prefix_cache.blocks[block_id].last_access = 11
 
     summary = manager.debug_state_summary()
 
@@ -229,7 +328,11 @@ def test_prefix_cache_debug_summary_includes_refs_slots_and_stable_ids():
     block = summary["prefix_cache"]["blocks"][0]
     assert block["stable_block_id"] == block_id.hex()
     assert block["ref_count"] == 2
+    assert block["last_access"] == 11
     assert block["eviction_priority"] == 7
+    assert block["device_present"] is True
+    assert block["host_present"] is False
+    assert block["transfer"] == "d2h"
     assert block["payload"]["token_slots"]["shape"] == [2]
 
 
@@ -411,6 +514,157 @@ def test_leaf_only_eviction_preserves_parent_until_child_is_removed():
     evicted = index.evict_until_freeable(1)
     assert [block.logical_block_idx for block in evicted] == [0]
     assert len(index) == 0
+
+
+def test_prefix_residency_rejects_missing_payload_and_invalid_transfers():
+    with pytest.raises(RuntimeError, match="no resident payload"):
+        PrefixBlockResidency(device_present=False, host_present=False).validate()
+    with pytest.raises(RuntimeError, match="D2H"):
+        PrefixBlockResidency(
+            device_present=True,
+            host_present=True,
+            transfer=PrefixTransferKind.D2H,
+        ).validate()
+    with pytest.raises(RuntimeError, match="H2D"):
+        PrefixBlockResidency(
+            device_present=False,
+            host_present=True,
+            transfer=PrefixTransferKind.H2D,
+        ).validate()
+
+
+def test_prefix_insert_rejects_device_child_below_host_only_parent():
+    index = RadixPrefixIndex(block_size=2, fingerprint=b"device-root-contiguous")
+    parent_id = _insert_tokens(index, [1, 2])
+    parent = index.get_block(parent_id)
+    assert parent is not None
+    index.begin_d2h(parent)
+    index.finish_d2h(parent)
+    assert index.demote_device_until_freeable(1) == [parent]
+
+    child_tokens = [3, 4]
+    child = PrefixCacheBlock(
+        stable_block_id=index.stable_block_id(child_tokens, parent_id),
+        parent_block_id=parent_id,
+        block_size=2,
+        logical_block_idx=1,
+        payload=SimpleNamespace(name="device-child"),
+        token_ids=tuple(child_tokens),
+    )
+    with pytest.raises(RuntimeError, match="host-only parent"):
+        index.insert_block(child)
+
+
+def test_write_through_residency_demotes_device_without_deleting_radix_blocks():
+    fp = build_prefix_cache_fingerprint(_cfg(), 4)
+    index = RadixPrefixIndex(block_size=4, fingerprint=fp)
+    last_block_id = _insert_tokens(index, list(range(12)))
+    chain = index.get_chain(last_block_id, 3)
+
+    for block in chain:
+        index.begin_d2h(block)
+    for block in chain:
+        index.finish_d2h(block)
+
+    assert index.device_evictable_blocks() == 1
+    assert index.device_freeable_blocks() == 3
+    demoted = index.demote_device_until_freeable(2)
+
+    assert [block.logical_block_idx for block in demoted] == [2, 1]
+    assert len(index) == 3
+    assert [block.residency.device_present for block in chain] == [True, False, False]
+    assert all(block.residency.host_present for block in chain)
+    hit_len, hit_last_block_id, hit_blocks = index.lookup_longest_prefix(
+        list(range(13)),
+        max_usable_tokens=12,
+    )
+    assert (hit_len, hit_last_block_id, hit_blocks) == (12, last_block_id, 3)
+
+
+def test_device_reclaimable_blocks_include_only_demotable_or_inflight_d2h_chains():
+    index = RadixPrefixIndex(block_size=2, fingerprint=b"reclaimable")
+    last_block_id = _insert_tokens(index, list(range(6)))
+    chain = index.get_chain(last_block_id, 3)
+    for block in chain:
+        index.begin_d2h(block)
+
+    assert index.device_freeable_blocks() == 0
+    assert index.device_reclaimable_block_ids() == {
+        block.stable_block_id for block in chain
+    }
+
+    chain[-1].ref_count = 1
+    assert index.device_reclaimable_blocks() == 0
+    chain[-1].ref_count = 0
+    chain[-1].eviction_priority = -1
+    assert index.device_reclaimable_blocks() == 0
+
+    h2d_index = RadixPrefixIndex(block_size=2, fingerprint=b"h2d-not-reclaimable")
+    h2d_id = _insert_tokens(h2d_index, [1, 2])
+    h2d_block = h2d_index.get_block(h2d_id)
+    assert h2d_block is not None
+    h2d_index.begin_d2h(h2d_block)
+    h2d_index.finish_d2h(h2d_block)
+    h2d_index.demote_device_until_freeable(1)
+    h2d_index.begin_h2d(h2d_block)
+    assert h2d_index.device_reclaimable_blocks() == 0
+
+
+def test_host_eviction_only_deletes_cpu_only_logical_leaves():
+    fp = build_prefix_cache_fingerprint(_cfg(), 4)
+    index = RadixPrefixIndex(block_size=4, fingerprint=fp)
+    last_block_id = _insert_tokens(index, list(range(12)))
+    chain = index.get_chain(last_block_id, 3)
+    for block in chain:
+        index.begin_d2h(block)
+    for block in chain:
+        index.finish_d2h(block)
+    index.demote_device_until_freeable(2)
+
+    assert index.evict_host_until_freeable(2) == [chain[2], chain[1]]
+    assert len(index) == 1
+    assert index.get_block(chain[0].stable_block_id) is chain[0]
+    assert index.stats()["prefix_cache_device_demoted_blocks"] == 2
+    assert index.stats()["prefix_cache_host_evicted_blocks"] == 2
+
+
+def test_transfering_prefix_block_is_not_deleted_or_demoted():
+    fp = build_prefix_cache_fingerprint(_cfg(), 4)
+    index = RadixPrefixIndex(block_size=4, fingerprint=fp)
+    block_id = _insert_tokens(index, [1, 2, 3, 4])
+    block = index.get_block(block_id)
+    assert block is not None
+
+    index.begin_d2h(block)
+
+    assert index.evict_until_freeable(1) == []
+    assert index.demote_device_until_freeable(1) == []
+    result = index.safe_delete_subtree([1, 2, 3, 4])
+    assert result.deleted_blocks == []
+    assert [item.reason for item in result.blocked_blocks] == ["transfer_inflight"]
+
+
+def test_h2d_promotion_requires_root_to_leaf_order():
+    fp = build_prefix_cache_fingerprint(_cfg(), 4)
+    index = RadixPrefixIndex(block_size=4, fingerprint=fp)
+    last_block_id = _insert_tokens(index, list(range(8)))
+    parent, child = index.get_chain(last_block_id, 2)
+    for block in (parent, child):
+        index.begin_d2h(block)
+    for block in (parent, child):
+        index.finish_d2h(block)
+    index.demote_device_until_freeable(2)
+
+    with pytest.raises(RuntimeError, match="radix root"):
+        index.begin_h2d(child)
+    index.begin_h2d(parent)
+    index.begin_h2d(child)
+    index.finish_h2d(parent)
+    index.finish_h2d(child)
+
+    assert parent.residency.device_present
+    assert child.residency.device_present
+    assert index.device_freeable_blocks() == 2
 
 
 def test_freeable_blocks_counts_cascade_evictable_chain_without_mutation():
@@ -603,6 +857,50 @@ def test_subtree_delete_deletes_safe_child_and_blocks_protected_branch():
     assert free_child_id not in index.blocks
 
 
+def test_subtree_delete_preview_does_not_mutate_index():
+    index = RadixPrefixIndex(block_size=2, fingerprint=b"delete-preview")
+    last_id = _insert_tokens(index, [1, 2, 3, 4])
+    plan = index.preview_delete_subtree([1, 2])
+
+    assert [block.logical_block_idx for block in plan.deleted_blocks] == [1, 0]
+    assert len(index) == 2
+    assert last_id in index.blocks
+
+    result = index.safe_delete_subtree([1, 2])
+    assert result.to_dict() == plan.to_dict()
+    assert len(index) == 0
+
+
+def test_prefix_delete_plan_rejects_tp_divergence_before_mutation():
+    manager = _make_standard_manager_for_prefix(block_size=2)
+    manager.world_size = 2
+    manager.parallel_context = SimpleNamespace(
+        world=SimpleNamespace(process_group=None),
+    )
+    block_id = _insert_tokens(manager.prefix_cache, [1, 2])
+    local_plan = manager.prefix_cache.preview_delete_subtree([1, 2]).to_dict()
+
+    def gather(plans, plan, group=None):
+        del group
+        plans[:] = [
+            plan,
+            {
+                "deleted_block_ids": [],
+                "deleted_block_count": 0,
+                "blocked_blocks": [{"block_id": block_id.hex(), "reason": "transfer_inflight"}],
+            },
+        ]
+
+    with patch(
+        "sparsevllm.engine.cache_manager.base.dist.all_gather_object",
+        side_effect=gather,
+    ):
+        with pytest.raises(RuntimeError, match="deletion plan diverged"):
+            manager.prefix_cache_delete_subtree([1, 2])
+
+    assert block_id in manager.prefix_cache.blocks
+
+
 def test_max_blocks_requires_explicit_capacity_before_insert():
     fp = build_prefix_cache_fingerprint(_cfg(), 4)
     index = RadixPrefixIndex(block_size=4, fingerprint=fp, max_blocks=1)
@@ -693,6 +991,64 @@ def test_config_rejects_unvalidated_prefix_cache_options():
         _make_config(prefix_cache_max_blocks="16.9")
 
 
+def test_config_restricts_prefix_cache_offload_to_explicit_eager_tp1_tp2_modes():
+    with pytest.raises(ValueError, match="enable_prefix_caching"):
+        _make_config(
+            enable_prefix_cache_offload=True,
+            prefix_cache_host_size_gb=1,
+        )
+    with pytest.raises(ValueError, match="explicit prefix_cache_host_size_gb"):
+        _make_config(
+            enable_prefix_caching=True,
+            enable_prefix_cache_offload=True,
+        )
+    quest = _make_config(
+        vllm_sparse_method="quest",
+        enable_prefix_caching=True,
+        enable_prefix_cache_offload=True,
+        prefix_cache_host_size_gb=1,
+        decode_cuda_graph=True,
+    )
+    assert quest.enable_prefix_cache_offload is True
+    assert quest.decode_cuda_graph is True
+    tp2 = _make_config(
+        enable_prefix_caching=True,
+        enable_prefix_cache_offload=True,
+        prefix_cache_host_size_gb=1,
+        tensor_parallel_size=2,
+    )
+    assert tp2.tensor_parallel_size == 2
+    with pytest.raises(ValueError, match="tensor_parallel_size=1 or 2"):
+        _make_config(
+            enable_prefix_caching=True,
+            enable_prefix_cache_offload=True,
+            prefix_cache_host_size_gb=1,
+            tensor_parallel_size=3,
+        )
+    with pytest.raises(ValueError, match="enforce_eager=True"):
+        _make_config(
+            enable_prefix_caching=True,
+            enable_prefix_cache_offload=True,
+            prefix_cache_host_size_gb=1,
+            enforce_eager=False,
+        )
+    graph = _make_config(
+        enable_prefix_caching=True,
+        enable_prefix_cache_offload=True,
+        prefix_cache_host_size_gb=1,
+        decode_cuda_graph=True,
+    )
+    assert graph.decode_cuda_graph is True
+
+    cfg = _make_config(
+        vllm_sparse_method="omnikv",
+        enable_prefix_caching=True,
+        enable_prefix_cache_offload=True,
+        prefix_cache_host_size_gb=1,
+    )
+    assert cfg.enable_prefix_cache_offload is True
+    assert cfg.prefix_cache_host_size_gb == 1
+
 def test_config_allows_prefix_cache_decode_cuda_graph_tp_methods():
     vanilla = _make_config(
         enable_prefix_caching=True,
@@ -759,6 +1115,326 @@ def test_standard_attach_pins_prefix_slots_and_free_seq_keeps_cached_slots():
     assert manager._num_free_slots == 88
     assert block.ref_count == 0
     assert manager.seq_id_to_row == {}
+
+
+def test_standard_offload_gpu_pressure_only_demotes_dual_resident_blocks():
+    manager = _make_standard_manager_for_prefix(block_size=2)
+    controller = _FakePrefixOffloadController(manager.prefix_cache)
+    manager.prefix_offload_controller = controller
+    last_block_id = None
+    parent_id = None
+    blocks = []
+    for logical_idx, (tokens, slots) in enumerate(
+        [([1, 2], [10, 11]), ([3, 4], [12, 13])]
+    ):
+        block_id = manager.prefix_cache.stable_block_id(tokens, parent_id)
+        block = PrefixCacheBlock(
+            stable_block_id=block_id,
+            parent_block_id=parent_id,
+            block_size=2,
+            logical_block_idx=logical_idx,
+            payload=StandardPrefixBlockPayload(
+                token_slots=torch.tensor(slots, dtype=torch.int32),
+                host_block_index=logical_idx,
+            ),
+            token_ids=tuple(tokens),
+        )
+        manager.prefix_cache.insert_block(block)
+        manager.prefix_cache.begin_d2h(block)
+        manager.prefix_cache.finish_d2h(block)
+        _remove_free_slots(manager, slots)
+        blocks.append(block)
+        parent_id = block_id
+        last_block_id = block_id
+
+    live_blocks = len(manager.prefix_cache)
+    manager._evict_prefix_cache_until_free(manager._num_free_slots + 2)
+
+    assert len(manager.prefix_cache) == live_blocks
+    assert last_block_id in manager.prefix_cache.blocks
+    assert blocks[0].residency.device_present is True
+    assert blocks[1].residency.device_present is False
+    assert blocks[1].residency.host_present is True
+    assert blocks[1].payload.token_slots is None
+    assert manager._num_free_slots == 88
+
+
+def test_standard_write_through_batches_only_unreferenced_root_contiguous_blocks():
+    manager = _make_standard_manager_for_prefix(block_size=2)
+    controller = _FakePrefixOffloadController(manager.prefix_cache)
+    manager.prefix_offload_controller = controller
+    last_block_id = _insert_tokens(manager.prefix_cache, [1, 2, 3, 4, 5, 6])
+    chain = manager.prefix_cache.get_chain(last_block_id, 3)
+    for idx, block in enumerate(chain):
+        block.payload = StandardPrefixBlockPayload(
+            token_slots=torch.tensor([10 + idx * 2, 11 + idx * 2], dtype=torch.int32)
+        )
+    chain[0].ref_count = 1
+
+    manager._schedule_write_through_prefix_blocks(chain[1:])
+
+    assert controller.submitted_d2h == []
+    assert set(manager._prefix_write_through_candidates) == {
+        chain[1].stable_block_id,
+        chain[2].stable_block_id,
+    }
+    chain[0].ref_count = 0
+    manager._schedule_write_through_prefix_blocks([chain[0]])
+    assert controller.submitted_d2h == [chain]
+    assert all(block.residency.transfer == PrefixTransferKind.D2H for block in chain)
+    assert manager._prefix_write_through_candidates == {}
+
+
+def test_standard_free_seq_starts_write_through_after_last_reference_release():
+    manager = _make_standard_manager_for_prefix(block_size=2)
+    controller = _FakePrefixOffloadController(manager.prefix_cache)
+    manager.prefix_offload_controller = controller
+    seq = Sequence([1, 2])
+    slots = manager._allocate(seq.seq_id, 2)
+    manager._record_prefix_materialization(seq, [1, 2], slots)
+    manager.on_forward_end([seq], is_prefill=True)
+    block = next(iter(manager.prefix_cache.blocks.values()))
+    assert block.ref_count == 1
+
+    manager.free_seq(seq.seq_id)
+
+    assert block.ref_count == 0
+    assert block.residency.transfer == PrefixTransferKind.D2H
+    assert controller.submitted_d2h == [[block]]
+    assert manager._num_free_slots == 88
+
+
+def test_standard_offload_logical_pressure_demotes_then_deletes_cpu_leaf():
+    manager = _make_standard_manager_for_prefix(block_size=2)
+    manager.prefix_cache.max_blocks = 1
+    controller = _FakePrefixOffloadController(manager.prefix_cache)
+    manager.prefix_offload_controller = controller
+    block_id = manager.prefix_cache.stable_block_id([1, 2], None)
+    block = PrefixCacheBlock(
+        stable_block_id=block_id,
+        parent_block_id=None,
+        block_size=2,
+        logical_block_idx=0,
+        payload=StandardPrefixBlockPayload(
+            token_slots=torch.tensor([10, 11], dtype=torch.int32),
+            host_block_index=0,
+        ),
+        token_ids=(1, 2),
+    )
+    _remove_free_slots(manager, [10, 11])
+    manager.prefix_cache.insert_block(block)
+    manager.prefix_cache.begin_d2h(block)
+    manager.prefix_cache.finish_d2h(block)
+
+    manager._evict_prefix_cache_for_insert(1)
+
+    assert len(manager.prefix_cache) == 0
+    assert manager._num_free_slots == 90
+    assert manager.prefix_cache.device_demoted_blocks == 1
+    assert manager.prefix_cache.host_evicted_blocks == 1
+    assert manager.prefix_cache.evicted_blocks == 0
+
+
+def test_standard_offload_logical_pressure_waits_for_inflight_d2h_leaf():
+    manager = _make_standard_manager_for_prefix(block_size=2)
+    manager.prefix_cache.max_blocks = 1
+    controller = _CompletingD2HPrefixOffloadController(manager.prefix_cache)
+    manager.prefix_offload_controller = controller
+    block_id = manager.prefix_cache.stable_block_id([1, 2], None)
+    block = PrefixCacheBlock(
+        stable_block_id=block_id,
+        parent_block_id=None,
+        block_size=2,
+        logical_block_idx=0,
+        payload=StandardPrefixBlockPayload(
+            token_slots=torch.tensor([10, 11], dtype=torch.int32),
+        ),
+        token_ids=(1, 2),
+    )
+    _remove_free_slots(manager, [10, 11])
+    manager.prefix_cache.insert_block(block)
+    manager.prefix_cache.begin_d2h(block)
+
+    manager._evict_prefix_cache_for_insert(1)
+
+    assert len(manager.prefix_cache) == 0
+    assert manager._num_free_slots == 90
+    assert manager.prefix_cache.device_demoted_blocks == 1
+    assert manager.prefix_cache.host_evicted_blocks == 1
+    assert manager.prefix_cache.evicted_blocks == 0
+
+
+def test_standard_cpu_prefix_hit_allocates_slots_and_tracks_layer_wait_operation():
+    manager = _make_standard_manager_for_prefix(block_size=2)
+    controller = _FakePrefixOffloadController(manager.prefix_cache)
+    manager.prefix_offload_controller = controller
+    seq = Sequence([1, 2, 3])
+    block_id = manager.prefix_cache.stable_block_id([1, 2], None)
+    block = PrefixCacheBlock(
+        stable_block_id=block_id,
+        parent_block_id=None,
+        block_size=2,
+        logical_block_idx=0,
+        payload=StandardPrefixBlockPayload(
+            token_slots=torch.tensor([10, 11], dtype=torch.int32),
+            host_block_index=0,
+        ),
+        token_ids=(1, 2),
+    )
+    _remove_free_slots(manager, [10, 11])
+    manager.prefix_cache.insert_block(block)
+    manager.prefix_cache.begin_d2h(block)
+    manager.prefix_cache.finish_d2h(block)
+    manager.prefix_cache.demote_device_until_freeable(1)
+    manager._free_device_prefix_block(block)
+    seq.prefix_cache_enabled = True
+    seq.prefix_cache_hit_len = 2
+    seq.prefix_cache_hit_block_count = 1
+    seq.prefix_cache_hit_last_block_id = block_id
+    seq.prefix_cache_block_size = 2
+
+    assert manager.prompt_admission_cost(seq) == 3
+    manager._attach_prefix_cache_if_needed(seq)
+
+    assert block.ref_count == 1
+    assert block.residency.transfer == PrefixTransferKind.H2D
+    assert isinstance(block.payload.token_slots, torch.Tensor)
+    assert manager.buffer_req_to_token_slots[0, :2].tolist() == block.payload.token_slots.tolist()
+    assert len(manager._prefix_offload_step_h2d_operations) == 1
+    assert len(controller.submitted_h2d) == 1
+
+
+def test_h2d_transfer_stream_waits_for_index_producer_event(monkeypatch):
+    prefix_cache = RadixPrefixIndex(block_size=2, fingerprint=b"h2d-order")
+    block_id = prefix_cache.stable_block_id([1, 2], None)
+    block = PrefixCacheBlock(
+        stable_block_id=block_id,
+        parent_block_id=None,
+        block_size=2,
+        logical_block_idx=0,
+        payload=StandardPrefixBlockPayload(
+            token_slots=torch.tensor([2, 3], dtype=torch.int32),
+            host_block_index=0,
+        ),
+        token_ids=(1, 2),
+    )
+    prefix_cache.insert_block(block)
+    prefix_cache.begin_d2h(block)
+    prefix_cache.finish_d2h(block)
+    prefix_cache.demote_device_until_freeable(1)
+
+    trace = []
+    controller = object.__new__(StandardPrefixOffloadController)
+    controller.prefix_cache = prefix_cache
+    controller.block_size = 2
+    controller.device = torch.device("cpu")
+    controller.kv_cache = torch.zeros((2, 2, 8, 1, 4), dtype=torch.float16)
+    controller.host_pool = SimpleNamespace(
+        cache=torch.zeros((2, 2, 1, 2, 1, 4), dtype=torch.float16),
+        num_layers=2,
+        token_indices=lambda block_indices, device: torch.tensor(
+            [0, 1], dtype=torch.long, device=device
+        ),
+    )
+    controller.h2d_stream = object()
+    controller.item_size = 8
+    controller._new_event = lambda device, purpose: purpose
+    controller._transfer_per_layer = lambda **kwargs: trace.append(
+        ("transfer", int(kwargs["dst_k"].data_ptr()))
+    )
+    controller.h2d_operations = []
+    controller._h2d_by_block_id = {}
+    controller.h2d_bytes = 0
+    controller.h2d_submitted_operations = 0
+    controller.h2d_merged_blocks = 0
+
+    monkeypatch.setattr(
+        device_runtime,
+        "record_event",
+        lambda event, device=None: trace.append(("record", event)),
+    )
+    monkeypatch.setattr(
+        device_runtime,
+        "stream_context",
+        lambda stream: nullcontext(),
+    )
+    monkeypatch.setattr(
+        device_runtime,
+        "stream_wait_event",
+        lambda stream, event: trace.append(("wait", event)),
+    )
+
+    operation = controller.submit_h2d([block])
+
+    assert trace[0] == ("record", "H2D producer")
+    assert trace[1] == ("wait", "H2D producer")
+    assert trace[2][0] == "transfer"
+    assert operation.producer_event == "H2D producer"
+
+
+def test_offload_controller_reset_clears_transfer_stats():
+    class FakeHostPool:
+        capacity_blocks = 8
+        used_blocks = 3
+        free_blocks = 5
+
+        def reset(self):
+            self.used_blocks = 0
+            self.free_blocks = self.capacity_blocks
+
+    controller = object.__new__(StandardPrefixOffloadController)
+    controller.synchronize_all = lambda: None
+    controller.host_pool = FakeHostPool()
+    controller.d2h_operations = [object()]
+    controller.h2d_operations = [object()]
+    controller._h2d_by_block_id = {b"block": object()}
+    controller.d2h_bytes = 10
+    controller.h2d_bytes = 20
+    controller.d2h_submitted_operations = 2
+    controller.d2h_completed_operations = 1
+    controller.h2d_submitted_operations = 3
+    controller.h2d_completed_operations = 2
+    controller.d2h_merged_blocks = 4
+    controller.h2d_merged_blocks = 5
+    controller.layer_waits = 6
+
+    controller.reset()
+
+    stats = controller.stats()
+    assert stats["prefix_cache_host_used_blocks"] == 0
+    assert stats["prefix_cache_host_free_blocks"] == 8
+    assert stats["prefix_cache_d2h_inflight_operations"] == 0
+    assert stats["prefix_cache_h2d_inflight_operations"] == 0
+    for name in (
+        "prefix_cache_d2h_bytes",
+        "prefix_cache_h2d_bytes",
+        "prefix_cache_d2h_submitted_operations",
+        "prefix_cache_d2h_completed_operations",
+        "prefix_cache_h2d_submitted_operations",
+        "prefix_cache_h2d_completed_operations",
+        "prefix_cache_d2h_merged_blocks",
+        "prefix_cache_h2d_merged_blocks",
+        "prefix_cache_h2d_layer_waits",
+    ):
+        assert stats[name] == 0
+
+
+@pytest.mark.parametrize(
+    "controller_type",
+    [StandardPrefixOffloadController, QuestPrefixOffloadController],
+)
+def test_prefix_offload_rejects_transfer_submission_during_capture(
+    monkeypatch,
+    controller_type,
+):
+    controller = object.__new__(controller_type)
+    block = SimpleNamespace()
+    monkeypatch.setattr(device_runtime, "is_stream_capturing", lambda: True)
+
+    with pytest.raises(RuntimeError, match="forbidden during graph capture"):
+        controller.submit_d2h([block])
+    with pytest.raises(RuntimeError, match="forbidden during graph capture"):
+        controller.submit_h2d([block])
 
 
 def test_standard_materializes_blocks_only_after_forward_end():
@@ -882,6 +1558,41 @@ def test_standard_admission_reserves_evictable_hit_blocks():
 
     block.ref_count = 1
     assert manager.prompt_admission_cost(seq) == 1
+
+
+def test_standard_admission_counts_inflight_d2h_before_pressure_prompt():
+    manager = _make_standard_manager_for_prefix(block_size=2)
+    manager._num_free_slots = 1
+    manager.prefix_offload_controller = _FakePrefixOffloadController(manager.prefix_cache)
+    block_id = manager.prefix_cache.stable_block_id([1, 2], None)
+    block = PrefixCacheBlock(
+        stable_block_id=block_id,
+        parent_block_id=None,
+        block_size=2,
+        logical_block_idx=0,
+        payload=StandardPrefixBlockPayload(
+            token_slots=torch.tensor([10, 11], dtype=torch.int32)
+        ),
+        token_ids=(1, 2),
+    )
+    manager.prefix_cache.insert_block(block)
+    manager.prefix_cache.begin_d2h(block)
+    pressure_seq = Sequence([7, 8, 9])
+
+    assert manager._prefix_evictable_slots() == 0
+    assert manager.prefill_step_free_slots() == 3
+    assert manager.decode_step_free_slots() == 3
+    assert manager.prompt_admission_cost(pressure_seq) == 3
+    assert manager.prompt_admission_free_slots() == 3
+    assert manager.prompt_admission_budgets(deque(), 2)["slots"] == 3
+    hit_seq = Sequence([1, 2, 3])
+    hit_seq.prefix_cache_hit_len = 2
+    hit_seq.prefix_cache_hit_block_count = 1
+    hit_seq.prefix_cache_hit_last_block_id = block_id
+    assert manager.prompt_admission_cost(hit_seq) == 3
+
+    block.ref_count = 1
+    assert manager.prompt_admission_free_slots() == 1
 
 
 def test_standard_materializes_child_after_prefix_hit_with_parent_sensitive_id():
@@ -1081,6 +1792,141 @@ def test_quest_attach_pins_pages_and_free_seq_keeps_cached_page():
     assert manager._num_free_pages == 10
     reused = manager._allocate(Sequence([4]).seq_id, 1)
     assert reused.tolist() == [10]
+
+
+def test_quest_free_seq_starts_atomic_write_through_after_last_release():
+    manager = _make_quest_manager_for_prefix(page_size=2)
+    controller = _FakePrefixOffloadController(manager.prefix_cache)
+    manager.prefix_offload_controller = controller
+    seq = Sequence([1, 2])
+    slots = manager._allocate(seq.seq_id, 2)
+    manager._record_prefix_materialization(seq, [1, 2], slots)
+    manager.on_forward_end([seq], is_prefill=True)
+    block = next(iter(manager.prefix_cache.blocks.values()))
+
+    manager.free_seq(seq.seq_id)
+
+    assert block.ref_count == 0
+    assert block.residency.transfer == PrefixTransferKind.D2H
+    assert controller.submitted_d2h == [[block]]
+    assert manager._num_free_pages == 9
+
+
+def test_quest_gpu_pressure_demotes_dual_resident_page_without_tree_delete():
+    manager = _make_quest_manager_for_prefix(page_size=2)
+    controller = _FakePrefixOffloadController(manager.prefix_cache)
+    manager.prefix_offload_controller = controller
+    block_id = manager.prefix_cache.stable_block_id([1, 2], None)
+    block = PrefixCacheBlock(
+        stable_block_id=block_id,
+        parent_block_id=None,
+        block_size=2,
+        logical_block_idx=0,
+        payload=QuestPrefixBlockPayload(
+            block_slot=5,
+            token_slots=torch.tensor([10, 11], dtype=torch.int32),
+            host_block_index=0,
+        ),
+        token_ids=(1, 2),
+    )
+    _remove_free_page(manager, 5)
+    manager.prefix_cache.insert_block(block)
+    manager.prefix_cache.begin_d2h(block)
+    manager.prefix_cache.finish_d2h(block)
+
+    manager._evict_prefix_cache_until_free(manager.num_free_slots + 2)
+
+    assert block_id in manager.prefix_cache.blocks
+    assert block.residency.device_present is False
+    assert block.residency.host_present is True
+    assert block.payload.block_slot is None
+    assert block.payload.token_slots is None
+    assert manager._num_free_pages == 10
+
+
+def test_quest_logical_pressure_waits_for_inflight_d2h_then_deletes_host_leaf():
+    manager = _make_quest_manager_for_prefix(page_size=2)
+    manager.prefix_cache.max_blocks = 1
+    controller = _CompletingD2HPrefixOffloadController(manager.prefix_cache)
+    manager.prefix_offload_controller = controller
+    block_id = manager.prefix_cache.stable_block_id([1, 2], None)
+    block = PrefixCacheBlock(
+        stable_block_id=block_id,
+        parent_block_id=None,
+        block_size=2,
+        logical_block_idx=0,
+        payload=QuestPrefixBlockPayload(
+            block_slot=5,
+            token_slots=torch.tensor([10, 11], dtype=torch.int32),
+        ),
+        token_ids=(1, 2),
+    )
+    _remove_free_page(manager, 5)
+    manager.prefix_cache.insert_block(block)
+    manager.prefix_cache.begin_d2h(block)
+
+    manager._evict_prefix_cache_for_insert(1)
+
+    assert len(manager.prefix_cache) == 0
+    assert manager._num_free_pages == 10
+    assert manager.prefix_cache.device_demoted_blocks == 1
+    assert manager.prefix_cache.host_evicted_blocks == 1
+    assert manager.prefix_cache.evicted_blocks == 0
+
+
+def test_quest_reset_rebinds_offload_controller_to_new_radix_index():
+    manager = _make_quest_manager_for_prefix(page_size=2)
+    controller = _FakePrefixOffloadController(manager.prefix_cache)
+    manager.prefix_offload_controller = controller
+    old_prefix_cache = manager.prefix_cache
+
+    manager.reset_prefix_cache()
+
+    assert manager.prefix_cache is not old_prefix_cache
+    assert controller.prefix_cache is manager.prefix_cache
+    assert controller.reset_count == 1
+
+
+def test_quest_cpu_prefix_hit_promotes_page_and_tracks_layer_wait():
+    manager = _make_quest_manager_for_prefix(page_size=2)
+    controller = _FakePrefixOffloadController(manager.prefix_cache)
+    manager.prefix_offload_controller = controller
+    seq = Sequence([1, 2, 3])
+    block_id = manager.prefix_cache.stable_block_id([1, 2], None)
+    block = PrefixCacheBlock(
+        stable_block_id=block_id,
+        parent_block_id=None,
+        block_size=2,
+        logical_block_idx=0,
+        payload=QuestPrefixBlockPayload(
+            block_slot=5,
+            token_slots=torch.tensor([10, 11], dtype=torch.int32),
+            host_block_index=0,
+        ),
+        token_ids=(1, 2),
+    )
+    _remove_free_page(manager, 5)
+    manager.prefix_cache.insert_block(block)
+    manager.prefix_cache.begin_d2h(block)
+    manager.prefix_cache.finish_d2h(block)
+    manager.prefix_cache.demote_device_until_freeable(1)
+    manager._free_device_prefix_block(block)
+    seq.prefix_cache_hit_len = 2
+    seq.prefix_cache_hit_block_count = 1
+    seq.prefix_cache_hit_last_block_id = block_id
+
+    assert manager.prompt_admission_cost(seq) == 4
+    manager._attach_prefix_cache_if_needed(seq)
+
+    assert block.ref_count == 1
+    assert block.residency.transfer == PrefixTransferKind.H2D
+    assert block.payload.block_slot is not None
+    assert isinstance(block.payload.token_slots, torch.Tensor)
+    assert manager.buffer_req_to_page_slots[0, 0].item() == block.payload.block_slot
+    assert manager.buffer_req_to_token_slots[0, :2].tolist() == block.payload.token_slots.tolist()
+    assert len(manager._prefix_offload_step_h2d_operations) == 1
+    manager.before_prefill_layer_attention(0, SimpleNamespace())
+    assert controller.waited_layers == [(controller.submitted_h2d[0], 0)]
 
 
 def test_quest_allocate_can_fill_partial_page_without_free_pages():
@@ -1325,6 +2171,42 @@ def test_quest_admission_is_page_aligned_and_reserves_hit_pages():
 
     block.ref_count = 1
     assert manager.prompt_admission_cost(seq) == 2
+
+
+def test_quest_admission_counts_inflight_d2h_before_pressure_prompt():
+    manager = _make_quest_manager_for_prefix(page_size=2)
+    manager._num_free_pages = 1
+    manager.prefix_offload_controller = _FakePrefixOffloadController(manager.prefix_cache)
+    block_id = manager.prefix_cache.stable_block_id([1, 2], None)
+    block = PrefixCacheBlock(
+        stable_block_id=block_id,
+        parent_block_id=None,
+        block_size=2,
+        logical_block_idx=0,
+        payload=QuestPrefixBlockPayload(
+            block_slot=5,
+            token_slots=torch.tensor([10, 11], dtype=torch.int32),
+        ),
+        token_ids=(1, 2),
+    )
+    manager.prefix_cache.insert_block(block)
+    manager.prefix_cache.begin_d2h(block)
+    pressure_seq = Sequence([7, 8, 9])
+
+    assert manager._prefix_evictable_slots() == 0
+    assert manager.prefill_step_free_slots() == 4
+    assert manager.decode_step_free_slots() == 4
+    assert manager.prompt_admission_cost(pressure_seq) == 4
+    assert manager.prompt_admission_free_slots() == 4
+    assert manager.prompt_admission_budgets(deque(), 2)["slots"] == 4
+    hit_seq = Sequence([1, 2, 3])
+    hit_seq.prefix_cache_hit_len = 2
+    hit_seq.prefix_cache_hit_block_count = 1
+    hit_seq.prefix_cache_hit_last_block_id = block_id
+    assert manager.prompt_admission_cost(hit_seq) == 4
+
+    block.ref_count = 1
+    assert manager.prompt_admission_free_slots() == 2
 
 
 def test_quest_admission_counts_cascade_freeable_prefix_pages():

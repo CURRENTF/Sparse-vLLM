@@ -2,11 +2,12 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
 from sparsevllm.config import Config
+from sparsevllm.engine.cache_manager.quest import QuestCacheManager
 
 
 class DecodeCudaGraphTPConfigTest(unittest.TestCase):
@@ -61,6 +62,60 @@ class DecodeCudaGraphTPConfigTest(unittest.TestCase):
     def test_tp_decode_cuda_graph_rejects_capture_sampling(self):
         with self.assertRaisesRegex(ValueError, "capture_sampling is disabled"):
             self._config("snapkv", decode_cuda_graph_capture_sampling=True)
+
+    def test_quest_derives_token_budget_from_common_keep_tokens(self):
+        cfg = self._config(
+            "quest",
+            num_sink_tokens=3,
+            decode_keep_tokens=40,
+            num_recent_tokens=5,
+        )
+        self.assertEqual(cfg.quest_token_budget, 48)
+
+        manager = object.__new__(QuestCacheManager)
+        manager.config = cfg
+        manager._build_decode_view_static = Mock(
+            return_value=(
+                torch.tensor([0]),
+                torch.tensor([0]),
+                torch.tensor([1]),
+            )
+        )
+        manager.build_decode_view(
+            layer_idx=cfg.quest_skip_layers,
+            q=torch.empty((1, 1, 1)),
+            active_slots=torch.tensor([0]),
+            req_indices=torch.tensor([0]),
+            context_lens=torch.tensor([1]),
+            num_heads=1,
+            num_kv_heads=1,
+        )
+        self.assertEqual(
+            manager._build_decode_view_static.call_args.kwargs["token_budget"],
+            48,
+        )
+
+    def test_quest_config_constructor_rejects_explicit_token_budget(self):
+        with self.assertRaisesRegex(TypeError, "quest_token_budget"):
+            self._config("quest", quest_token_budget=48)
+
+    def test_quest_rejects_invalid_derived_token_budget_inputs(self):
+        invalid_configs = (
+            {"num_sink_tokens": -1},
+            {"decode_keep_tokens": 1.5},
+            {
+                "num_sink_tokens": 0,
+                "decode_keep_tokens": 0,
+                "num_recent_tokens": 0,
+            },
+        )
+        for kwargs in invalid_configs:
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "QuEST .* must be a non-negative integer|derived token budget must be > 0",
+                ):
+                    self._config("quest", **kwargs)
 
 
 if __name__ == "__main__":

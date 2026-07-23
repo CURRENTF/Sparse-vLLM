@@ -93,7 +93,6 @@ def test_prefix_cache_bench_engine_kwargs_are_sparsevllm_config_fields():
         chunk_prefill_accel_omnikv=True,
         full_attention_layers="0,1,2,4,7,14",
         quest_chunk_size=16,
-        quest_token_budget=4096,
         prefix_cache_block_size=16,
         prefix_cache_max_blocks=None,
         prefix_cache_salt="prefix-cache-bench-test",
@@ -108,6 +107,40 @@ def test_prefix_cache_bench_engine_kwargs_are_sparsevllm_config_fields():
     config_fields = set(Config.__dataclass_fields__)
     unknown = sorted(set(normalized.infer_config) - config_fields)
     assert unknown == []
+
+
+def test_prefix_cache_bench_trace_uses_resolved_sparse_budgets():
+    args = types.SimpleNamespace(
+        system_prompt_len=100,
+        session_prefix_min_len=10,
+        session_prefix_len=20,
+        user_min_len=3,
+        user_len=7,
+        output_len=5,
+        turns=3,
+        shared_prefix_len=50,
+        shared_suffix_min_len=4,
+        shared_suffix_len=9,
+        history_update="generated",
+        chunk_prefill_accel_omnikv=True,
+        num_sink_tokens=8,
+        num_top_tokens=2048,
+        num_recent_tokens=256,
+        chunk_prefill_size=16384,
+        min_performance_prompt_len=0,
+        min_cacheable_prefix_len=0,
+    )
+    engine_kwargs = {
+        "sink_keep_tokens": 4,
+        "decode_keep_tokens": 512,
+        "recent_keep_tokens": 128,
+        "engine_prefill_chunk_size": 4096,
+    }
+
+    summary = bench._trace_sparse_path_summary(args, engine_kwargs)
+
+    assert summary["quest_sparse_decode_threshold"] == 4 + 512 + 128
+    assert summary["omnikv_prefill_long_text_threshold"] == 4 + 512 + 128 + 4096
 
 
 def test_prefix_cache_bench_sample_length_validates_bounds():

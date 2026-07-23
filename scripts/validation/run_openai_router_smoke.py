@@ -45,7 +45,6 @@ def method_kwargs(method: str, *, max_model_len: int, prefix_cache: bool) -> dic
         cfg.update(
             {
                 "quest_chunk_size": 16,
-                "quest_token_budget": 2048,
                 "quest_skip_layers": 0,
                 "decode_keep_tokens": 2048,
                 "sink_keep_tokens": 0,

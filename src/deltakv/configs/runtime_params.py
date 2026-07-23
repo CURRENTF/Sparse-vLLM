@@ -51,6 +51,10 @@ _LEGACY_RUNTIME_KEYS: dict[str, str] = {
     "num_sink_tokens": "sink_keep_tokens",
     "num_recent_tokens": "recent_keep_tokens",
     "tail_token_size": "recent_keep_tokens",
+    "quest_token_budget": (
+        "removed; Sparse-vLLM QuEST derives it from sink_keep_tokens + "
+        "decode_keep_tokens + recent_keep_tokens; HF QuEST uses decode_keep_tokens"
+    ),
     # Layer routing.
     "full_attn_layers": "full_attention_layers",
     # DeltaKV naming.

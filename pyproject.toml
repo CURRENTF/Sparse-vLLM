@@ -39,10 +39,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+prefix-offload = [
+    "sgl-kernel @ https://github.com/sgl-project/whl/releases/download/v0.3.14.post1/sgl_kernel-0.3.14.post1%2Bcu128-cp310-abi3-manylinux2014_x86_64.whl",
+]
 qwen35 = [
     "kernels==0.15.2",
     "einops",
-    "sglang-kernel @ https://github.com/sgl-project/whl/releases/download/v0.3.14.post1/sgl_kernel-0.3.14.post1%2Bcu128-cp310-abi3-manylinux2014_x86_64.whl",
+    "sgl-kernel @ https://github.com/sgl-project/whl/releases/download/v0.3.14.post1/sgl_kernel-0.3.14.post1%2Bcu128-cp310-abi3-manylinux2014_x86_64.whl",
 ]
 
 [project.scripts]

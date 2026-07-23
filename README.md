@@ -93,6 +93,13 @@ CUDA-specific optional dependencies:
 pip install -e ".[qwen35]"
 ```
 
+Vanilla, OmniKV, or QuEST prefix-cache offload without Qwen3.5/Qwen3.6 uses
+the smaller CUDA-specific extra:
+
+```bash
+pip install -e ".[prefix-offload]"
+```
+
 For the full dependency list and a minimal `LLM(...)` example, see
 [Getting Started](docs/getting_started/README.md).
 

@@ -373,21 +373,25 @@ observation layers from it. `observation_layers` is not a supported runtime key.
 | `pyramid_layer_ratios` | Sparse-vLLM PyramidKV | Explicit per-KV/full-attention-layer keep ratios. A legacy full Transformer-layer list is projected onto KV layers for mixed-attention models. |
 | `pyramidkv_start_layer`, `pyramidkv_start_ratio`, `pyramidkv_least_layer`, `pyramidkv_least_ratio` | HF and Sparse-vLLM PyramidKV-style paths | Auto-generate the budget schedule; layer positions count KV/full-attention layers. |
 | `quest_chunk_size` | Sparse-vLLM Quest | Quest page size. |
-| `quest_token_budget` | Sparse-vLLM Quest | Quest token budget. |
+| `sink_keep_tokens` + `decode_keep_tokens` + `recent_keep_tokens` | Sparse-vLLM Quest | Quest token budget, derived once during config construction. |
 | `chunk_size` | HF Quest adapter | Quest chunk/page size on HF. |
 | `decode_keep_tokens` | HF Quest adapter | Quest token budget on HF. |
 
-Quest is a good example of "same research idea, different surface":
+Quest is a good example of "same research idea, different surface". The HF
+configuration:
 
 ```json
 {"backend": "hf", "sparse_method": "quest", "decode_keep_tokens": 1024, "chunk_size": 16}
 ```
 
-is not equivalent to:
+uses a single total budget, while Sparse-vLLM expresses the same total as:
 
 ```json
-{"backend": "sparsevllm", "sparse_method": "quest", "quest_token_budget": 1024, "quest_chunk_size": 16}
+{"backend": "sparsevllm", "sparse_method": "quest", "sink_keep_tokens": 0, "decode_keep_tokens": 992, "recent_keep_tokens": 32, "quest_chunk_size": 16}
 ```
+
+Sparse-vLLM rejects the removed `quest_token_budget` input instead of silently
+ignoring it. The example above derives the same total budget of 1024 tokens.
 
 ### 6.4 R-KV
 
