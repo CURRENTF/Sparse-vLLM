@@ -416,10 +416,9 @@ class DecodeCudaGraphRunner:
 
         with profiler.record("decode_cuda_graph_capture"):
             self.sparse_controller.prepare_forward(seqs, is_prefill=False)
-            # OmniKV observation layers pass a 3D attn_score tensor into the
-            # captured decode kernel, then replace the Python field with a 2D
-            # head-reduced tensor in on_layer_end(). Keep the original refs so
-            # graph replay cannot point at allocator-reused storage.
+            # Dynamic score paths can replace Python state fields during the
+            # captured forward. Keep both input and post-forward refs alive;
+            # SnapKV-family shared raw workspaces are retained by the controller.
             graph_input_sparse_state_refs = self._snapshot_sparse_state_refs()
             graph = torch.cuda.CUDAGraph()
             try:
