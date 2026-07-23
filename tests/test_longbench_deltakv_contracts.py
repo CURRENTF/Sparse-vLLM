@@ -1,6 +1,8 @@
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from benchmark.long_bench import pred as longbench_pred
 from benchmark.long_bench.metrics import classification_score, qa_f1_score
@@ -63,6 +65,40 @@ class LongBenchDeltaKVContractsTest(unittest.TestCase):
                 longbench_pred.validate_longbench_data_paths(["hotpotqa"], use_longbench_e=False)
         finally:
             longbench_pred.DATA_PREFIX_PATH = old_root
+
+    def test_sparsevllm_data_workers_receive_distinct_master_ports(self):
+        launched = []
+
+        class Process:
+            def wait(self):
+                return 0
+
+        def fake_popen(command, *, env, cwd):
+            launched.append((command, env, cwd))
+            return Process()
+
+        worker_args = SimpleNamespace(ws=4)
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+                    "SPARSEVLLM_MASTER_PORT": "24300",
+                },
+                clear=False,
+            ),
+            patch.object(longbench_pred.subprocess, "Popen", side_effect=fake_popen),
+        ):
+            longbench_pred.launch_single_gpu_workers(worker_args, "/tmp/longbench-output")
+
+        self.assertEqual(
+            [env["CUDA_VISIBLE_DEVICES"] for _command, env, _cwd in launched],
+            ["0", "1", "2", "3"],
+        )
+        self.assertEqual(
+            [env["SPARSEVLLM_MASTER_PORT"] for _command, env, _cwd in launched],
+            ["24300", "24301", "24302", "24303"],
+        )
 
     def test_new_hf_sparse_methods_route_without_legacy_names(self):
         for sparse_method in (

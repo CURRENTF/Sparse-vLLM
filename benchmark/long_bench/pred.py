@@ -599,12 +599,20 @@ def launch_single_gpu_workers(args, out_root):
             f"Requested ws={args.ws}, but only {len(gpu_ids)} visible GPUs are available: {gpu_ids}"
         )
 
+    base_master_port = int(os.environ.get("SPARSEVLLM_MASTER_PORT", "2333"))
+    if base_master_port <= 0 or base_master_port + args.ws - 1 > 65535:
+        raise ValueError(
+            "LongBench worker master-port range is invalid: "
+            f"base={base_master_port} ws={args.ws}."
+        )
+
     script_path = Path(__file__).resolve()
     child_argv = sys.argv[1:]
     procs = []
     for rank in range(args.ws):
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = gpu_ids[rank]
+        env["SPARSEVLLM_MASTER_PORT"] = str(base_master_port + rank)
         cmd = [
             sys.executable,
             "-u",
