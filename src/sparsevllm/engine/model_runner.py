@@ -643,9 +643,14 @@ class ModelRunner:
                 "local_output": _debug_tensor_summary(block.debug_last_local_output),
             }
         state = self.sparse_controller.debug_state_summary()
-        if self.prefix_cache_coordinator is not None:
+        prefix_cache_coordinator = getattr(
+            self,
+            "prefix_cache_coordinator",
+            None,
+        )
+        if prefix_cache_coordinator is not None:
             state["mixed_prefix_cache"] = (
-                self.prefix_cache_coordinator.debug_state_summary()
+                prefix_cache_coordinator.debug_state_summary()
             )
         return {
             "world_rank": self.parallel_context.world_rank,
