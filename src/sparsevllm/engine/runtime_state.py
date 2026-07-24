@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from collections import deque
+from contextlib import nullcontext
+from typing import ContextManager
 from typing import Protocol
 
 import torch
@@ -38,6 +40,7 @@ class MemoryOracle(Protocol):
     def on_prompt_admitted(self, seq: Sequence, costs: dict[str, int]) -> None: ...
     def refresh_prefix_cache_hit(self, seq: Sequence) -> None: ...
     def clear_prefix_cache_hit(self, seq: Sequence) -> None: ...
+    def scheduler_capacity_snapshot(self) -> ContextManager[None]: ...
     def free_slot_stats(self) -> dict[str, int]: ...
     def debug_live_seq_slots(self) -> dict[int, int]: ...
 
@@ -169,6 +172,14 @@ class RuntimeState:
 
     def clear_prefix_cache_hit(self, seq: Sequence) -> None:
         self.cache_manager.clear_prefix_cache_hit(seq)
+
+    def scheduler_capacity_snapshot(self) -> ContextManager[None]:
+        snapshot = getattr(
+            self.cache_manager,
+            "scheduler_capacity_snapshot",
+            None,
+        )
+        return snapshot() if callable(snapshot) else nullcontext()
 
     def prefill_step_free_slots(self) -> int:
         return int(

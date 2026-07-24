@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 import numpy as np
@@ -97,6 +98,8 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
             )
         self.seq_id_to_prefix_blocks: dict[int, list[PrefixCacheBlock]] = {}
         self.seq_id_to_cached_ranges: dict[int, list[tuple[int, int]]] = {}
+        self._scheduler_capacity_snapshot_depth = 0
+        self._scheduler_freeable_block_ids: set[bytes] | None = None
         self._init_prefix_cache_runtime()
         self.prefix_offload_controller: StandardPrefixOffloadController | None = None
         self._prefix_offload_step_h2d_operations: list[PrefixH2DOperation] = []
@@ -317,9 +320,33 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
         freeable_blocks = (
             self.prefix_cache.device_freeable_blocks()
             if self._prefix_offload_enabled()
-            else self.prefix_cache.freeable_blocks()
+            else len(self._prefix_freeable_block_ids_for_capacity())
         )
         return int(freeable_blocks * self.prefix_cache_block_size)
+
+    def _prefix_freeable_block_ids_for_capacity(self) -> set[bytes]:
+        if self.prefix_cache is None:
+            return set()
+        if self._scheduler_capacity_snapshot_depth <= 0:
+            return self.prefix_cache.freeable_block_ids()
+        if self._scheduler_freeable_block_ids is None:
+            self._scheduler_freeable_block_ids = (
+                self.prefix_cache.freeable_block_ids()
+            )
+        return self._scheduler_freeable_block_ids
+
+    @contextmanager
+    def scheduler_capacity_snapshot(self):
+        """Reuse one immutable prefix-capacity view within a scheduler pass."""
+        self._scheduler_capacity_snapshot_depth += 1
+        if self._scheduler_capacity_snapshot_depth == 1:
+            self._scheduler_freeable_block_ids = None
+        try:
+            yield
+        finally:
+            self._scheduler_capacity_snapshot_depth -= 1
+            if self._scheduler_capacity_snapshot_depth == 0:
+                self._scheduler_freeable_block_ids = None
 
     def _prefix_step_reclaimable_slots(self) -> int:
         if getattr(self, "prefix_cache", None) is None:
@@ -327,14 +354,26 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
         reclaimable_blocks = (
             self.prefix_cache.device_reclaimable_blocks()
             if self._prefix_offload_enabled()
-            else self.prefix_cache.freeable_blocks()
+            else len(self._prefix_freeable_block_ids_for_capacity())
         )
         return int(reclaimable_blocks * self.prefix_cache_block_size)
 
     def prefill_step_free_slots(self) -> int:
+        physical_free = int(self.num_free_slots)
+        max_step_tokens = int(
+            getattr(self.config, "max_num_batched_tokens", 0) or 0
+        )
+        if max_step_tokens > 0 and physical_free >= max_step_tokens:
+            return physical_free
         return int(self.num_free_slots + self._prefix_step_reclaimable_slots())
 
     def decode_step_free_slots(self) -> int:
+        physical_free = int(self.num_free_slots)
+        max_step_seqs = int(
+            getattr(self.config, "max_num_seqs_in_batch", 0) or 0
+        )
+        if max_step_seqs > 0 and physical_free >= max_step_seqs:
+            return physical_free
         return int(self.num_free_slots + self._prefix_step_reclaimable_slots())
 
     def prompt_admission_free_slots(self) -> int:
@@ -343,7 +382,7 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
             reclaimable_blocks = (
                 self.prefix_cache.device_reclaimable_blocks()
                 if self._prefix_offload_enabled()
-                else self.prefix_cache.freeable_blocks()
+                else len(self._prefix_freeable_block_ids_for_capacity())
             )
             reclaimable_slots = reclaimable_blocks * self.prefix_cache_block_size
         return int(self.num_free_slots + reclaimable_slots)
@@ -360,7 +399,7 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
         freeable_block_ids = (
             self.prefix_cache.device_reclaimable_block_ids()
             if self._prefix_offload_enabled()
-            else self.prefix_cache.freeable_block_ids()
+            else self._prefix_freeable_block_ids_for_capacity()
         )
         return sum(
             self.prefix_cache_block_size

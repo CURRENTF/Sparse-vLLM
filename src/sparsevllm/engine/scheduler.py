@@ -305,6 +305,17 @@ class Scheduler:
         return [], False, preempted_seqs
 
     def schedule(self) -> tuple[list[Sequence], bool, list[Sequence]]:
+        snapshot = getattr(
+            self.memory_oracle,
+            "scheduler_capacity_snapshot",
+            None,
+        )
+        if not callable(snapshot):
+            return self._schedule_impl()
+        with snapshot():
+            return self._schedule_impl()
+
+    def _schedule_impl(self) -> tuple[list[Sequence], bool, list[Sequence]]:
         """
         核心调度逻辑。
         返回：(本次要运行的序列列表, 是否是 Prefill 阶段, 本次被抢占的序列列表)
@@ -318,17 +329,32 @@ class Scheduler:
         
         # 逻辑可用空间计数器，用于在本轮调度中预估显存占用
         physical_free_count = self.memory_oracle.num_free_slots
-        reserved_prefill = self._reserved_prefill_tokens()
-        prompt_logical_free_count = max(
-            0,
-            int(self.memory_oracle.prompt_admission_free_slots()) - reserved_prefill,
-        )
+        if self.waiting:
+            reserved_prefill = self._reserved_prefill_tokens()
+            prompt_logical_free_count = max(
+                0,
+                int(self.memory_oracle.prompt_admission_free_slots())
+                - reserved_prefill,
+            )
+            step_free_count = int(
+                self.memory_oracle.prefill_step_free_slots()
+            )
+            admission_budgets = dict(
+                self.memory_oracle.prompt_admission_budgets(
+                    self.waiting,
+                    self.chunk_prefill_size,
+                )
+            )
+            margin_batched_tokens = (
+                self.memory_oracle.prefill_batched_tokens_margin()
+            )
+        else:
+            reserved_prefill = 0
+            prompt_logical_free_count = 0
+            step_free_count = int(physical_free_count)
+            admission_budgets = {}
+            margin_batched_tokens = 0
         decode_logical_free_count = max(0, int(self.memory_oracle.decode_step_free_slots()))
-        step_free_count = int(self.memory_oracle.prefill_step_free_slots())
-        admission_budgets = dict(
-            self.memory_oracle.prompt_admission_budgets(self.waiting, self.chunk_prefill_size)
-        )
-        margin_batched_tokens = self.memory_oracle.prefill_batched_tokens_margin()
         deferred_prompt_failure: tuple[Sequence, str, int, int] | None = None
         blocked_prefill_step_failure: tuple[Sequence, int, int] | None = None
         blocked_prefill_capacity_failure: tuple[Sequence, int, int, int] | None = None

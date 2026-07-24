@@ -114,6 +114,8 @@ def _make_standard_manager_for_prefix(block_size=2):
     manager.row_seq_lens = np.zeros((2,), dtype=np.int32)
     manager.seq_id_to_prefix_blocks = {}
     manager.seq_id_to_cached_ranges = {}
+    manager._scheduler_capacity_snapshot_depth = 0
+    manager._scheduler_freeable_block_ids = None
     manager.prefix_offload_controller = None
     manager._prefix_offload_step_h2d_operations = []
     manager._init_prefix_cache_runtime()
@@ -1662,6 +1664,53 @@ def test_standard_admission_reserves_evictable_hit_blocks():
 
     block.ref_count = 1
     assert manager.prompt_admission_cost(seq) == 1
+
+
+def test_standard_scheduler_capacity_snapshot_reuses_freeable_tree_scan():
+    manager = _make_standard_manager_for_prefix(block_size=2)
+    stable_block_id = manager.prefix_cache.stable_block_id([1, 2], None)
+    manager.prefix_cache.insert_block(
+        PrefixCacheBlock(
+            stable_block_id=stable_block_id,
+            parent_block_id=None,
+            block_size=2,
+            logical_block_idx=0,
+            payload=StandardPrefixBlockPayload(
+                token_slots=torch.tensor([10, 11], dtype=torch.int32)
+            ),
+            token_ids=(1, 2),
+        )
+    )
+
+    with patch.object(
+        manager.prefix_cache,
+        "freeable_block_ids",
+        wraps=manager.prefix_cache.freeable_block_ids,
+    ) as freeable_block_ids:
+        with manager.scheduler_capacity_snapshot():
+            assert manager.prompt_admission_free_slots() == 92
+            assert manager.prefill_step_free_slots() == 92
+            assert manager.decode_step_free_slots() == 92
+            assert manager.prompt_admission_budgets(deque(), 2)["slots"] == 92
+        assert freeable_block_ids.call_count == 1
+
+        assert manager.decode_step_free_slots() == 92
+        assert freeable_block_ids.call_count == 2
+
+
+def test_standard_capacity_skips_prefix_scan_with_physical_step_headroom():
+    manager = _make_standard_manager_for_prefix(block_size=2)
+    manager.config.max_num_batched_tokens = 16
+    manager.config.max_num_seqs_in_batch = 4
+
+    with patch.object(
+        manager.prefix_cache,
+        "freeable_block_ids",
+        wraps=manager.prefix_cache.freeable_block_ids,
+    ) as freeable_block_ids:
+        assert manager.prefill_step_free_slots() == 90
+        assert manager.decode_step_free_slots() == 90
+        assert freeable_block_ids.call_count == 0
 
 
 def test_standard_admission_counts_inflight_d2h_before_pressure_prompt():

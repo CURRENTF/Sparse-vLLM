@@ -1532,6 +1532,48 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
         self.assertEqual(short_seq.current_chunk_size, None)
         self.assertEqual(list(scheduler.waiting), [short_seq])
 
+    def test_decode_only_schedule_skips_prompt_and_prefill_capacity_queries(self):
+        class CountingOracle(FakeMemoryOracle):
+            def __init__(self):
+                super().__init__()
+                self.prompt_calls = 0
+                self.prefill_calls = 0
+
+            def prompt_admission_free_slots(self):
+                self.prompt_calls += 1
+                return super().prompt_admission_free_slots()
+
+            def prompt_admission_budgets(
+                self,
+                waiting,
+                chunk_prefill_size,
+            ):
+                self.prompt_calls += 1
+                return super().prompt_admission_budgets(
+                    waiting,
+                    chunk_prefill_size,
+                )
+
+            def prefill_step_free_slots(self):
+                self.prefill_calls += 1
+                return super().prefill_step_free_slots()
+
+        oracle = CountingOracle()
+        scheduler = make_scheduler(
+            PREFILL_POLICY_ALL_CHUNKED,
+            oracle=oracle,
+        )
+        decode_seq = seq_with_len(8)
+        decode_seq.num_prefilled_tokens = decode_seq.num_prompt_tokens
+        scheduler.decoding.append(decode_seq)
+
+        scheduled, is_prefill, _ = scheduler.schedule()
+
+        self.assertFalse(is_prefill)
+        self.assertEqual(scheduled, [decode_seq])
+        self.assertEqual(oracle.prompt_calls, 0)
+        self.assertEqual(oracle.prefill_calls, 0)
+
     def test_snapkv_remaining_prefill_no_longer_reserves_score_window_chunk(self):
         manager = object.__new__(SnapKVCacheManager)
         manager.config = SimpleNamespace(chunk_prefill_size=5, snapkv_window_size=2, vllm_sparse_method="snapkv")
