@@ -75,6 +75,7 @@ TP_RPC_STATUS_SYNC_METHODS = PREFIX_CACHE_CONTROL_RPC_METHODS | {
 def make_tp_shm_name() -> str:
     return f"{TP_SHM_NAME_PREFIX}{os.getpid()}_{uuid.uuid4().hex}"
 
+
 class ModelRunner:
     """
     负责模型执行的类。每个 GPU Rank 进程都拥有一个 ModelRunner 实例。
@@ -160,12 +161,21 @@ class ModelRunner:
             self.model = LlamaForCausalLM(hf_config)
         else:
             raise NotImplementedError(f"Unsupported Sparse-vLLM model_type={hf_config.model_type!r}.")
-        load_model(
-            self.model,
-            config.model,
-            tp_rank=self.parallel_context.tp_rank,
-            tp_size=self.parallel_context.tp_size,
-        )
+        if config.tiny_random:
+            from sparsevllm.debug.tiny_random import initialize_sparse_model
+
+            initialize_sparse_model(
+                self.model,
+                hf_config,
+                seed=config.tiny_random_seed,
+            )
+        else:
+            load_model(
+                self.model,
+                config.model,
+                tp_rank=self.parallel_context.tp_rank,
+                tp_size=self.parallel_context.tp_size,
+            )
         if hf_config.model_type == "qwen3_moe" and config.moe_backend == "triton":
             self.model.warmup_moe_backend()
         
@@ -200,6 +210,12 @@ class ModelRunner:
                 platform=self.platform,
                 state_spec=state_spec,
             )
+        # Model loading and backend warmup can leave released temporary tensors in
+        # the allocator cache. Flush them before KV sizing so device-used memory
+        # and allocator peak history do not reserve the same temporary memory.
+        self.platform.synchronize()
+        self.platform.empty_cache()
+        self.platform.reset_peak_memory_stats(self.device)
         # Recurrent rows are persistent runtime state. Allocate them before the
         # cache manager sizes KV so gpu_memory_utilization accounts for both.
         self.cache_manager = CacheManager.create(config, self.parallel_context)
