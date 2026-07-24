@@ -14,14 +14,14 @@ from typing import Any
 
 import torch
 import torch.multiprocessing as mp
-from transformers import AutoTokenizer
+from transformers import AutoConfig, AutoTokenizer
 
 from deltakv.configs.runtime_params import normalize_runtime_params
 from deltakv.configs.default_paths import compressor_path, model_path, output_path
 from deltakv.get_chat_api import get_generate_api
 from benchmark.long_bench.pred import build_chat
 from sparsevllm.config import Config
-from sparsevllm.engine.model_runner import ModelRunner
+from sparsevllm.engine.model_runner import ModelRunner, make_tp_shm_name
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.method_registry import (
     PREFILL_POLICY_ALL_CHUNKED,
@@ -29,6 +29,13 @@ from sparsevllm.method_registry import (
     is_deltakv_method,
 )
 from sparsevllm.sampling_params import SamplingParams
+from sparsevllm.debug.tiny_random import (
+    TINY_RANDOM_CONFIG_ENV,
+    TINY_RANDOM_ENV,
+    TINY_RANDOM_SEED_ENV,
+    apply_tiny_random_overrides,
+    build_tiny_random_hf_model,
+)
 from sparsevllm.utils.context import get_context, reset_context
 
 
@@ -1900,6 +1907,26 @@ def _sparse_infer_config(args: argparse.Namespace, method: str) -> dict[str, Any
 
 def _load_hf_model(args: argparse.Namespace, method: str, prompt_len: int):
     infer_config = _hf_infer_config(args, method, prompt_len)
+    if args.tiny_random_config:
+        if method != "vanilla":
+            raise NotImplementedError(
+                "Tiny random HF comparison currently supports --methods vanilla only."
+            )
+        config = AutoConfig.from_pretrained(args.model_path, trust_remote_code=True)
+        overrides = apply_tiny_random_overrides(config, args.tiny_random_config)
+        config._attn_implementation = "eager"
+        model = build_tiny_random_hf_model(
+            config,
+            seed=int(args.tiny_random_seed),
+        )
+        model.to(torch.device("cuda", 0))
+        model.eval()
+        return model, {
+            "weight_mode": "tiny_random",
+            "seed": int(args.tiny_random_seed),
+            "config_path": os.path.abspath(args.tiny_random_config),
+            "overrides": overrides,
+        }
     _, model = get_generate_api(
         model_path=args.model_path,
         infer_config=infer_config,
@@ -2023,14 +2050,18 @@ def _make_sparse_runner(args: argparse.Namespace, method: str) -> tuple[ModelRun
     processes = []
     events = []
     ctx = mp.get_context("spawn")
+    tp_shm_name = make_tp_shm_name() if config.world_size > 1 else None
     try:
         for rank in range(1, int(config.tensor_parallel_size)):
-            event = ctx.Event()
-            process = ctx.Process(target=ModelRunner, args=(config, rank, event))
+            event = (ctx.Event(), ctx.Event())
+            process = ctx.Process(
+                target=ModelRunner,
+                args=(config, rank, event, tp_shm_name),
+            )
             process.start()
             processes.append(process)
             events.append(event)
-        runner = ModelRunner(config, 0, events)
+        runner = ModelRunner(config, 0, events, tp_shm_name)
     except Exception:
         for process in processes:
             if process.is_alive():
@@ -3350,6 +3381,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_decoding_seqs", type=int, default=1)
     parser.add_argument("--max_num_batched_tokens", type=int, default=None)
     parser.add_argument("--tensor_parallel_size", type=int, default=1)
+    parser.add_argument(
+        "--tiny_random_config",
+        default=None,
+        help="JSON architecture overrides for deterministic random-weight comparison.",
+    )
+    parser.add_argument("--tiny_random_seed", type=int, default=0)
     return parser.parse_args()
 
 
@@ -3364,7 +3401,18 @@ def main() -> int:
 
     os.environ.setdefault("SPARSEVLLM_MASTER_PORT", str(args.master_port))
     _require_path(args.model_path, "model_path")
+    if args.tiny_random_config:
+        _require_path(args.tiny_random_config, "tiny_random_config")
+        if int(args.tiny_random_seed) < 0:
+            raise ValueError("--tiny_random_seed must be >= 0.")
+        os.environ[TINY_RANDOM_ENV] = "1"
+        os.environ[TINY_RANDOM_CONFIG_ENV] = os.path.abspath(args.tiny_random_config)
+        os.environ[TINY_RANDOM_SEED_ENV] = str(int(args.tiny_random_seed))
     methods = [part.strip() for part in args.methods.split(",") if part.strip()]
+    if args.tiny_random_config and set(methods) != {"vanilla"}:
+        raise NotImplementedError(
+            "Tiny random HF comparison currently requires --methods vanilla."
+        )
     uses_deltakv_compare = any(method in DELTAKV_COMPARE_METHODS for method in methods)
     if bool(args.use_compression) and uses_deltakv_compare:
         _require_path(args.compressor_path, "compressor_path")
