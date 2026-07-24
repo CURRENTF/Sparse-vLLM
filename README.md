@@ -90,8 +90,11 @@ pip install torch==2.11.0 torchvision==0.26.0 triton==3.6.0 \
 pip install "flashinfer-jit-cache>=0.6.14" \
   --index-url https://flashinfer.ai/whl/cu130
 
-MAX_JOBS=8 pip install flash-attn --no-build-isolation
 pip install -e .
+
+# Optional
+MAX_JOBS=8 pip install flash-attn --no-build-isolation
+pip install flashinfer-cubin --index-url https://flashinfer.ai/whl
 ```
 
 PyTorch wheels include their CUDA runtime, while compiled extensions such as
@@ -102,12 +105,17 @@ PyTorch wheels include their CUDA runtime, while compiled extensions such as
 ```bash
 uv venv --python 3.10
 source .venv/bin/activate
+
 uv pip install torch==2.11.0 torchvision==0.26.0 triton==3.6.0 \
   --index-url https://download.pytorch.org/whl/cu130
 uv pip install "flashinfer-jit-cache>=0.6.14" \
   --index-url https://flashinfer.ai/whl/cu130
-MAX_JOBS=8 uv pip install flash-attn --no-build-isolation
+
 uv pip install -e .
+
+# Optional
+MAX_JOBS=8 uv pip install flash-attn --no-build-isolation
+uv pip install flashinfer-cubin --index-url https://flashinfer.ai/whl
 ```
 
 The explicit indexes select the CUDA 13.0 builds of PyTorch and the FlashInfer
