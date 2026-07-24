@@ -311,7 +311,7 @@ class SimulatedDeepResearchTest(unittest.TestCase):
             )
             self.assertEqual(run.required_model_len(config), 26)
 
-    def test_rejects_overlapping_main_and_subagent_methods(self):
+    def test_allows_overlapping_methods_without_role_tags(self):
         with tempfile.TemporaryDirectory() as tmp:
             config = self._config(Path(tmp) / "run")
             config = run.BenchmarkConfig(
@@ -320,7 +320,19 @@ class SimulatedDeepResearchTest(unittest.TestCase):
                     "main_agent_methods": ("snapkv",),
                 }
             )
-            with self.assertRaisesRegex(ValueError, "disjoint role tags"):
+            run.validate_config(config)
+
+    def test_rejects_partial_role_tags_for_overlapping_methods(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config(Path(tmp) / "run")
+            config = run.BenchmarkConfig(
+                **{
+                    **config.__dict__,
+                    "main_agent_methods": ("snapkv",),
+                    "subagent_required_tags": ("subagent",),
+                }
+            )
+            with self.assertRaisesRegex(ValueError, "disjoint tags"):
                 run.validate_config(config)
 
     def test_allows_overlapping_methods_with_disjoint_role_tags(self):
@@ -432,6 +444,77 @@ class SimulatedDeepResearchTest(unittest.TestCase):
                 {
                     "http://vanilla-main": 2,
                     "http://vanilla-subagent": None,
+                },
+            )
+
+    def test_preflight_accepts_balanced_untagged_vanilla_workers(self):
+        async def vanilla_get(url, _timeout_s):
+            if url.endswith("/models"):
+                return _json_response(
+                    {
+                        "data": [
+                            {
+                                "id": "sim-model",
+                                "owned_by": "sparsevllm-router",
+                                "max_model_len": 65_536,
+                            }
+                        ]
+                    }
+                )
+            if url.endswith("/health"):
+                return _json_response(
+                    {
+                        "healthy_workers": [
+                            "http://vanilla-0",
+                            "http://vanilla-1",
+                        ],
+                        "router_policy": {
+                            "request_timeout_s": 900.0,
+                            "control_timeout_s": 5.0,
+                            "overload_load_factor": 1.0,
+                            "load_abs_threshold": 0,
+                            "profiles": {},
+                            "code_revision": CODE_REVISION,
+                        },
+                    }
+                )
+            if url.endswith("/v1/worker/info"):
+                return _json_response(
+                    {
+                        "served_model_name": "sim-model",
+                        "max_model_len": 65_536,
+                        "vocab_size": 32_000,
+                        "sparse_method": "",
+                        "tags": [],
+                        "prefix_cache_enabled": True,
+                        "prefix_cache_block_size": 2,
+                        "code_revision": CODE_REVISION,
+                        "benchmark_config": {
+                            "decode_cuda_graph": True,
+                            "enable_prefix_caching": True,
+                        },
+                    }
+                )
+            raise AssertionError(f"Unexpected GET URL: {url}")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config(Path(tmp) / "run")
+            config = run.BenchmarkConfig(
+                **{
+                    **config.__dict__,
+                    "subagent_methods": ("vanilla",),
+                    "main_agent_methods": ("vanilla",),
+                }
+            )
+            result = asyncio.run(
+                run.preflight(config, get_fn=vanilla_get)
+            )
+            self.assertEqual(len(result["workers"]), 2)
+            self.assertEqual(
+                result["worker_prefix_cache_block_sizes"],
+                {
+                    "http://vanilla-0": 2,
+                    "http://vanilla-1": 2,
                 },
             )
 

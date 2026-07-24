@@ -318,14 +318,15 @@ def validate_config(config: BenchmarkConfig) -> None:
     if config.require_router and overlap:
         subagent_tags = set(config.subagent_required_tags)
         main_agent_tags = set(config.main_agent_required_tags)
-        if (
+        uses_role_tags = bool(subagent_tags or main_agent_tags)
+        if uses_role_tags and (
             not subagent_tags
             or not main_agent_tags
             or subagent_tags & main_agent_tags
         ):
             raise ValueError(
-                "Overlapping subagent and main-agent methods require non-empty, "
-                "disjoint role tags so the router uses separate workers; "
+                "When overlapping subagent and main-agent methods use role "
+                "tags, both roles require non-empty, disjoint tags; "
                 f"overlap={overlap}."
             )
     if config.require_router and config.min_healthy_workers < 2:
@@ -942,7 +943,15 @@ async def preflight(
             eligible_worker_urls_by_role["subagent"]
             & eligible_worker_urls_by_role["main agent"]
         )
-        if overlapping_methods and overlapping_role_workers:
+        uses_role_tags = bool(
+            config.subagent_required_tags
+            or config.main_agent_required_tags
+        )
+        if (
+            overlapping_methods
+            and uses_role_tags
+            and overlapping_role_workers
+        ):
             raise ValueError(
                 "Role tags did not isolate overlapping subagent and main-agent "
                 "methods onto separate workers: "
