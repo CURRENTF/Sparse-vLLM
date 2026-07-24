@@ -207,6 +207,43 @@ def test_qwen3_moe_parallel_config_validation(tmp_path):
             Config(model=str(tmp_path))
 
 
+def test_qwen3_moe_fp8_config_validation(tmp_path):
+    hf_config = _hf_config()
+    hf_config.architectures = ["Qwen3MoeForCausalLM"]
+    hf_config.hidden_size = 128
+    hf_config.moe_intermediate_size = 128
+    raw_quantization_config = {
+        "quant_method": "fp8",
+        "fmt": "e4m3",
+        "activation_scheme": "dynamic",
+        "weight_block_size": [128, 128],
+        "modules_to_not_convert": [
+            "lm_head",
+            "model.layers.0.mlp.gate",
+            "model.layers.1.mlp.gate",
+        ],
+    }
+    hf_config.quantization_config = raw_quantization_config
+    with patch(
+        "sparsevllm.config.AutoConfig.from_pretrained",
+        return_value=hf_config,
+    ):
+        config = Config(model=str(tmp_path), expert_parallel_size=2)
+    assert config.quantization_config.enabled
+    assert config.quantization_config.model_name == "Qwen3MoE"
+
+    hf_config.quantization_config = {
+        **raw_quantization_config,
+        "modules_to_not_convert": ["lm_head"],
+    }
+    with patch(
+        "sparsevllm.config.AutoConfig.from_pretrained",
+        return_value=hf_config,
+    ):
+        with pytest.raises(ValueError, match="router gate"):
+            Config(model=str(tmp_path), expert_parallel_size=2)
+
+
 def test_dense_config_rejects_expert_or_data_parallelism(tmp_path):
     with patch("sparsevllm.config.AutoConfig.from_pretrained", return_value=_hf_config("qwen3")):
         with pytest.raises(ValueError, match="requires EP=1 and DP=1"):

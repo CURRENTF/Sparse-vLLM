@@ -52,6 +52,7 @@ class Qwen3Attention(nn.Module):
         rope_theta: float = 10000,
         rope_scaling: tuple | None = None,
         proj_chunk_size: int = 16384,
+        quantization=None,
     ) -> None:
         super().__init__()
         tp_size = get_parallel_context().tp_size
@@ -76,11 +77,13 @@ class Qwen3Attention(nn.Module):
             self.total_num_heads,
             self.total_num_kv_heads,
             bias=qkv_bias,
+            quantization=quantization,
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=False,
+            quantization=quantization,
         )
         self.rotary_emb = get_rope(
             self.head_dim,
@@ -165,17 +168,20 @@ class Qwen3MLP(nn.Module):
         intermediate_size: int,
         hidden_act: str,
         mlp_chunk_size: int = 16384,
+        quantization=None,
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
             bias=False,
+            quantization=quantization,
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
             bias=False,
+            quantization=quantization,
         )
         assert hidden_act == "silu"
         self.act_fn = SiluAndMul()
@@ -219,6 +225,7 @@ class Qwen3DecoderLayerBase(nn.Module):
             rope_theta=_get_rope_theta(config),
             rope_scaling=_get_rope_scaling(config),
             proj_chunk_size=getattr(config, "mlp_chunk_size", 16384),
+            quantization=getattr(config, "quantization_config", None),
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -247,6 +254,7 @@ class Qwen3DecoderLayer(Qwen3DecoderLayerBase):
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
             mlp_chunk_size=getattr(config, "mlp_chunk_size", 16384),
+            quantization=getattr(config, "quantization_config", None),
         )
 
 
