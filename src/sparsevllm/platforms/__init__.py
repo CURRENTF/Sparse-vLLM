@@ -7,7 +7,12 @@ from typing import Any
 
 from sparsevllm.platforms.cpu import CpuPlatform
 from sparsevllm.platforms.cuda import CudaPlatform
-from sparsevllm.platforms.interface import AllocatorStats, Platform, PlatformEnum
+from sparsevllm.platforms.interface import (
+    AllocatorStats,
+    DeviceCaps,
+    Platform,
+    PlatformEnum,
+)
 from sparsevllm.platforms.rocm import RocmPlatform
 
 PLATFORM_ENTRYPOINT_GROUP = "sparsevllm.platforms"
@@ -111,6 +116,7 @@ __all__ = [
     "AllocatorStats",
     "CpuPlatform",
     "CudaPlatform",
+    "DeviceCaps",
     "Platform",
     "PlatformEnum",
     "RocmPlatform",

@@ -16,6 +16,11 @@ from sparsevllm.layers.rotary_embedding import (
     get_rope,
 )
 from sparsevllm.models.qwen3 import Qwen3ModelBase
+from sparsevllm.operators.moe import (
+    MoeOpSpec,
+    model_activation_dtype,
+    resolve_moe_provider,
+)
 from sparsevllm.platforms import device_runtime
 from sparsevllm.utils.context import get_context
 from sparsevllm.utils.log import logger
@@ -83,6 +88,19 @@ class MiniMaxM2PackedExperts(nn.Module):
         self.num_local_experts = self.num_experts // self.ep_size
         self.local_expert_start = self.ep_rank * self.num_local_experts
         self.local_expert_end = self.local_expert_start + self.num_local_experts
+        self.op_spec = MoeOpSpec(
+            num_experts=self.num_experts,
+            num_local_experts=self.num_local_experts,
+            hidden_size=self.hidden_size,
+            intermediate_size=self.intermediate_size,
+            top_k=int(config.num_experts_per_tok),
+            activation_dtype=model_activation_dtype(config),
+            weight_dtype=torch.float8_e4m3fn,
+            block_shape=tuple(config.quantization_config.weight_block_size),
+            ep_size=self.ep_size,
+            cuda_graph=bool(getattr(config, "decode_cuda_graph", False)),
+        )
+        self.provider = resolve_moe_provider(self.op_spec)
         self.w13_weight = nn.Parameter(
             torch.empty(
                 self.num_local_experts,
@@ -161,38 +179,18 @@ class MiniMaxM2PackedExperts(nn.Module):
             )
 
         local_expert_id = global_expert_id - self.local_expert_start
-        if projection == "w2":
-            weight_target = self.w2_weight.data[local_expert_id]
-            scale_target = self.w2_scale_inv[local_expert_id]
-        else:
-            # FlashInfer CUTLASS consumes [up (w3), gate (w1)].  Write that
-            # physical layout during checkpoint loading instead of copying the
-            # packed expert tensor in every forward call.
-            weight_offset = self.intermediate_size if projection == "w1" else 0
-            scale_rows = self.intermediate_size // 128
-            scale_offset = scale_rows if projection == "w1" else 0
-            weight_target = self.w13_weight.data[
-                local_expert_id,
-                weight_offset : weight_offset + self.intermediate_size,
-            ]
-            scale_target = self.w13_scale_inv[
-                local_expert_id,
-                scale_offset : scale_offset + scale_rows,
-            ]
-        if tuple(loaded_weight.shape) != tuple(weight_target.shape):
-            raise ValueError(
-                f"MiniMax expert weight shape mismatch for expert={global_expert_id}, "
-                f"projection={projection}: expected={tuple(weight_target.shape)}, "
-                f"got={tuple(loaded_weight.shape)}."
-            )
-        if tuple(loaded_scale.shape) != tuple(scale_target.shape):
-            raise ValueError(
-                f"MiniMax expert scale shape mismatch for expert={global_expert_id}, "
-                f"projection={projection}: expected={tuple(scale_target.shape)}, "
-                f"got={tuple(loaded_scale.shape)}."
-            )
-        weight_target.copy_(loaded_weight)
-        scale_target.copy_(loaded_scale)
+        logical_projection = {"w1": "gate", "w2": "down", "w3": "up"}[projection]
+        self.provider.load_expert_projection(
+            self.op_spec,
+            local_expert_id=local_expert_id,
+            projection=logical_projection,
+            loaded_weight=loaded_weight,
+            loaded_scale=loaded_scale,
+            w13_weight=self.w13_weight.data,
+            w2_weight=self.w2_weight.data,
+            w13_scale_inv=self.w13_scale_inv,
+            w2_scale_inv=self.w2_scale_inv,
+        )
         self._loaded_expert_shards.add(load_key)
 
     def validate_loaded_weights(self) -> None:
@@ -215,27 +213,18 @@ class MiniMaxM2PackedExperts(nn.Module):
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
     ) -> torch.Tensor:
-        from flashinfer.fused_moe import cutlass_fused_moe
-        from flashinfer.tllm_enums import ActivationType
-
-        output = torch.empty_like(hidden_states)
-        cutlass_fused_moe(
+        return self.provider.run(
+            self.op_spec,
             hidden_states,
-            topk_ids.to(dtype=torch.int32),
+            topk_ids,
             topk_weights,
             self.w13_weight,
             self.w2_weight,
-            hidden_states.dtype,
-            quant_scales=[self.w13_scale_inv, self.w2_scale_inv],
-            ep_size=self.ep_size,
+            self.w13_scale_inv,
+            self.w2_scale_inv,
+            local_expert_start=self.local_expert_start,
             ep_rank=self.ep_rank,
-            output=output,
-            use_deepseek_fp8_block_scale=True,
-            use_fused_finalize=False,
-            enable_pdl=False,
-            activation_type=ActivationType.Swiglu,
         )
-        return output
 
 
 class MiniMaxM2SparseMoeBlock(nn.Module):

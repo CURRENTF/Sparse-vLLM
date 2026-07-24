@@ -1,6 +1,6 @@
 ---
 name: code-review
-description: Review Sparse-vLLM diffs for correctness, sparse-runtime architecture, scheduling semantics, reproducibility, public documentation hygiene, performance, and tests. Use when reviewing PRs, git diffs, sparse method integrations, cache-manager or scheduler changes, benchmark/evaluation scripts, docs changes, or when the user asks for a code review; if no range is specified, diff the current branch against main.
+description: Review Sparse-vLLM diffs for correctness, sparse-runtime and operator architecture, scheduling semantics, reproducibility, public documentation hygiene, performance, and tests. Use when reviewing PRs, git diffs, sparse method integrations, operator/provider or kernel changes, platform capability handling, cache-manager or scheduler changes, benchmark/evaluation scripts, docs changes, or when the user asks for a code review; if no range is specified, diff the current branch against main.
 ---
 
 # Code Review
@@ -27,6 +27,11 @@ Read [svllm-review-standards.md](references/svllm-review-standards.md).
 
 For sparse-method additions or refactors, also read [`$add-sparse-method`](../add-sparse-method/SKILL.md). For policy changes, inspect `src/sparsevllm/method_registry.py`, `src/sparsevllm/engine/scheduler.py`, and `tests/test_prefill_schedule_policy.py`.
 
+For changes to operators, providers, platforms, kernels, quantized weight
+layouts, external kernel dependencies, or model-to-operator call sites, read
+and apply
+[`$review-operator-organization`](../review-operator-organization/SKILL.md).
+
 ### Step 3: Review
 
 Prioritize:
@@ -34,6 +39,7 @@ Prioritize:
 - inference correctness and tensor/cache invariants
 - Sparse-vLLM architecture boundaries
 - platform abstraction boundaries
+- operator/provider selection and kernel ownership
 - prefill policy, long/short split, and `long_bs1full_short_batch`
 - OpenAI-compatible request lifecycle, streaming, cancellation, and sampling contracts
 - research reproducibility and fail-fast behavior

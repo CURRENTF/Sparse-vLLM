@@ -1,0 +1,4 @@
+interface:
+  display_name: "Operator Organization Review"
+  short_description: "Review operator selection and kernel boundaries"
+  default_prompt: "Use $review-operator-organization to review operator providers, platform capabilities, kernel selection, dependency compatibility, and validation coverage."

@@ -36,7 +36,11 @@ class LinearBase(nn.Module):
                     "Linear FP8 quantization requires weight_block_size=(128, 128), "
                     f"got {getattr(quantization, 'weight_block_size', None)}."
                 )
-            self.quant_backend = QuantizationRegistry.create_linear_backend(quantization)
+            self.quant_provider = QuantizationRegistry.resolve_linear_provider(
+                quantization,
+                input_features=input_size,
+                output_features=output_size,
+            )
             self.weight = nn.Parameter(
                 torch.empty(output_size, input_size, dtype=torch.float8_e4m3fn),
                 requires_grad=False,
@@ -46,7 +50,7 @@ class LinearBase(nn.Module):
                 torch.empty(self._scale_shape_for_weight_shape((output_size, input_size)), dtype=torch.float32),
             )
         else:
-            self.quant_backend = None
+            self.quant_provider = None
             self.weight = nn.Parameter(torch.empty(output_size, input_size))
             self.register_buffer("weight_scale_inv", None)
         self.weight.weight_loader = self.weight_loader
@@ -180,7 +184,7 @@ class ReplicatedLinear(LinearBase):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.quantized:
-            return self.quant_backend(x, self.weight, self.weight_scale_inv, self.bias)
+            return self.quant_provider(x, self.weight, self.weight_scale_inv, self.bias)
         return F.linear(x, self.weight, self.bias)
 
 
@@ -237,7 +241,7 @@ class ColumnParallelLinear(LinearBase):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.quantized:
-            return self.quant_backend(x, self.weight, self.weight_scale_inv, self.bias)
+            return self.quant_provider(x, self.weight, self.weight_scale_inv, self.bias)
         return F.linear(x, self.weight, self.bias)
 
 
@@ -445,7 +449,7 @@ class RowParallelLinear(LinearBase):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         bias = self.bias if self.tp_rank == 0 else None
         if self.quantized:
-            y = self.quant_backend(x, self.weight, self.weight_scale_inv, bias)
+            y = self.quant_provider(x, self.weight, self.weight_scale_inv, bias)
         else:
             y = F.linear(x, self.weight, bias)
         return self.parallel_context.tp_all_reduce(y)

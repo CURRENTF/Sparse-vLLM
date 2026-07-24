@@ -14,7 +14,7 @@ pip install torch==2.11.0 torchvision==0.26.0 triton==3.6.0 \
   --index-url https://download.pytorch.org/whl/cu130
 
 # FlashInfer publishes the CUDA-specific JIT cache on a separate index.
-pip install "flashinfer-jit-cache>=0.6.14" \
+pip install "flashinfer-jit-cache>=0.6.15" \
   --index-url https://flashinfer.ai/whl/cu130
 
 pip install -e .
@@ -33,7 +33,7 @@ source .venv/bin/activate
 
 uv pip install torch==2.11.0 torchvision==0.26.0 triton==3.6.0 \
   --index-url https://download.pytorch.org/whl/cu130
-uv pip install "flashinfer-jit-cache>=0.6.14" \
+uv pip install "flashinfer-jit-cache>=0.6.15" \
   --index-url https://flashinfer.ai/whl/cu130
 
 uv pip install -e .
@@ -43,8 +43,8 @@ MAX_JOBS=8 uv pip install flash-attn --no-build-isolation
 ```
 
 
-For Qwen3.5/Qwen3.6 FP8 mixed-attention inference, install the CUDA-specific
-optional dependencies as well:
+For Qwen3.5/Qwen3.6 FP8 mixed-attention inference, install the optional Python
+dependencies as well:
 
 ```bash
 # uv
@@ -60,14 +60,30 @@ For prefix-cache offload with vanilla, OmniKV, or QuEST only:
 pip install -e ".[prefix-offload]"
 ```
 
-The Qwen3.5/Qwen3.6 FP8 backend resolves the
-`kernels-community/finegrained-fp8` Hub kernel on the first FP8 forward in each
-fresh process. This version lookup may contact the Hugging Face kernel registry
-even when the model checkpoint is local. Make sure the configured Hugging Face
-endpoint is reachable. If `ALL_PROXY` uses a SOCKS URL, either install the
-`httpx` SOCKS extra (which provides `socksio`) or remove that override for the
-run; an unusable inherited SOCKS proxy fails during engine warmup before any
-sparse method executes.
+Sparse-vLLM currently supports Qwen3.5/Qwen3.6 checkpoints only in the
+block-scaled FP8 format.
+
+Its prefill causal Conv1D and decode Conv1D/GDN packing paths use local Triton
+kernels. They do not require `sglang-kernel` or a repository CUDA-extension
+build.
+
+The required `flashinfer-jit-cache` package provides modules built for a
+specific CUDA toolkit version. Select the index matching the CUDA version used
+by PyTorch. `flashinfer-cubin` is an optional acceleration package containing
+architecture-specific device binaries:
+
+```bash
+pip install "flashinfer-jit-cache>=0.6.15" \
+  --index-url https://flashinfer.ai/whl/cu130
+
+# Optional
+pip install flashinfer-cubin --index-url https://flashinfer.ai/whl
+```
+
+Block-scaled FP8 Linear selects an implementation from the local operator
+registry using the active CUDA device capabilities. SM90 uses the optimized
+FlashInfer implementation; other supported native-FP8 CUDA devices use the
+generic Triton implementation. No Hub kernel is downloaded during warmup.
 
 ## DeltaKV Checkpoints
 

@@ -75,11 +75,14 @@ pip install torch==2.11.0 torchvision==0.26.0 triton==3.6.0 \
   --index-url https://download.pytorch.org/whl/cu130
 
 # FlashInfer 在单独的索引中发布 CUDA 专用 JIT 缓存。
-pip install "flashinfer-jit-cache>=0.6.14" \
+pip install "flashinfer-jit-cache>=0.6.15" \
   --index-url https://flashinfer.ai/whl/cu130
 
-MAX_JOBS=8 pip install flash-attn --no-build-isolation
 pip install -e .
+
+# 可选安装
+MAX_JOBS=8 pip install flash-attn --no-build-isolation
+pip install flashinfer-cubin --index-url https://flashinfer.ai/whl
 ```
 
 PyTorch wheel 自带 CUDA 运行时，而 `flash-attn` 等编译扩展使用当前环境中
@@ -92,10 +95,14 @@ uv venv --python 3.10
 source .venv/bin/activate
 uv pip install torch==2.11.0 torchvision==0.26.0 triton==3.6.0 \
   --index-url https://download.pytorch.org/whl/cu130
-uv pip install "flashinfer-jit-cache>=0.6.14" \
+uv pip install "flashinfer-jit-cache>=0.6.15" \
   --index-url https://flashinfer.ai/whl/cu130
-MAX_JOBS=8 uv pip install flash-attn --no-build-isolation
+
 uv pip install -e .
+
+# 可选安装
+MAX_JOBS=8 uv pip install flash-attn --no-build-isolation
+uv pip install flashinfer-cubin --index-url https://flashinfer.ai/whl
 ```
 
 以上显式索引分别用于安装 CUDA 13.0 版本的 PyTorch 和 FlashInfer JIT

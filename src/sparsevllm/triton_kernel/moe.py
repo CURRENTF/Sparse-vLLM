@@ -468,6 +468,170 @@ def _routed_gemm(
     )
 
 
+@triton.jit(do_not_specialize=["EM", "num_assignments"])
+def _routed_fp8_gemm_kernel(
+    a_ptr,
+    b_ptr,
+    b_scale_ptr,
+    c_ptr,
+    routing_weights_ptr,
+    sorted_token_ids_ptr,
+    expert_ids_ptr,
+    num_tokens_post_padded_ptr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    EM,
+    num_assignments,
+    stride_am,
+    stride_ak,
+    stride_be,
+    stride_bn,
+    stride_bk,
+    stride_bse,
+    stride_bsn,
+    stride_bsk,
+    stride_cm,
+    stride_cn,
+    INPUT_TOP_K: tl.constexpr,
+    MUL_ROUTING_WEIGHT: tl.constexpr,
+    NAIVE_ASSIGNMENT: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    row_offsets = tl.arange(0, BLOCK_SIZE_M)
+    if NAIVE_ASSIGNMENT:
+        assignment_ids = tl.where(
+            row_offsets == 0,
+            pid_m,
+            num_assignments,
+        )
+    else:
+        num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+        if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
+            return
+        assignment_ids = tl.load(
+            sorted_token_ids_ptr + pid_m * BLOCK_SIZE_M + row_offsets
+        )
+    assignment_ids = assignment_ids.to(tl.int64)
+    assignment_mask = assignment_ids < num_assignments
+    expert_id = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
+    if expert_id < 0:
+        return
+
+    offsets_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offsets_k = tl.arange(0, BLOCK_SIZE_K)
+    input_rows = assignment_ids // INPUT_TOP_K
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+    for k_block in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        remaining_k = K - k_block * BLOCK_SIZE_K
+        a_raw = tl.load(
+            a_ptr
+            + input_rows[:, None] * stride_am
+            + (k_block * BLOCK_SIZE_K + offsets_k[None, :]) * stride_ak,
+            mask=assignment_mask[:, None]
+            & (offsets_k[None, :] < remaining_k),
+            other=0.0,
+        ).to(tl.float32)
+        a_scale = tl.max(tl.abs(a_raw), axis=1) / 448.0
+        a_quant = (a_raw / tl.maximum(a_scale[:, None], 1.0e-12)).to(
+            tl.float8e4nv
+        )
+        b = tl.load(
+            b_ptr
+            + expert_id * stride_be
+            + offsets_n[None, :] * stride_bn
+            + (k_block * BLOCK_SIZE_K + offsets_k[:, None]) * stride_bk,
+            mask=(offsets_n[None, :] < N)
+            & (offsets_k[:, None] < remaining_k),
+            other=0.0,
+        )
+        b_scale = tl.load(
+            b_scale_ptr
+            + expert_id * stride_bse
+            + pid_n * stride_bsn
+            + k_block * stride_bsk
+        ).to(tl.float32)
+        accumulator += tl.dot(a_quant, b) * a_scale[:, None] * b_scale
+
+    if MUL_ROUTING_WEIGHT:
+        routing_weights = tl.load(
+            routing_weights_ptr + assignment_ids,
+            mask=assignment_mask,
+            other=0.0,
+        ).to(tl.float32)
+        accumulator *= routing_weights[:, None]
+
+    tl.store(
+        c_ptr
+        + assignment_ids[:, None] * stride_cm
+        + offsets_n[None, :] * stride_cn,
+        accumulator,
+        mask=assignment_mask[:, None] & (offsets_n[None, :] < N),
+    )
+
+
+def _routed_fp8_gemm(
+    inputs: torch.Tensor,
+    weights: torch.Tensor,
+    scales: torch.Tensor,
+    output: torch.Tensor,
+    topk_weights: torch.Tensor,
+    alignment: MoeAlignment,
+    *,
+    input_top_k: int,
+    multiply_routing_weight: bool,
+) -> None:
+    num_assignments = int(topk_weights.numel())
+    if alignment.naive:
+        em = num_assignments * alignment.block_size
+        sorted_token_ids = topk_weights
+    else:
+        if alignment.sorted_token_ids is None:
+            raise RuntimeError("Aligned FP8 routed GEMM is missing sorted_token_ids.")
+        em = int(alignment.sorted_token_ids.numel())
+        sorted_token_ids = alignment.sorted_token_ids
+    grid = (
+        triton.cdiv(em, alignment.block_size),
+        triton.cdiv(int(weights.shape[1]), 128),
+    )
+    _routed_fp8_gemm_kernel[grid](
+        inputs,
+        weights,
+        scales,
+        output,
+        topk_weights,
+        sorted_token_ids,
+        alignment.expert_ids,
+        alignment.num_tokens_post_padded,
+        N=int(weights.shape[1]),
+        K=int(weights.shape[2]),
+        EM=em,
+        num_assignments=num_assignments,
+        stride_am=inputs.stride(0),
+        stride_ak=inputs.stride(1),
+        stride_be=weights.stride(0),
+        stride_bn=weights.stride(1),
+        stride_bk=weights.stride(2),
+        stride_bse=scales.stride(0),
+        stride_bsn=scales.stride(1),
+        stride_bsk=scales.stride(2),
+        stride_cm=output.stride(0),
+        stride_cn=output.stride(1),
+        INPUT_TOP_K=int(input_top_k),
+        MUL_ROUTING_WEIGHT=bool(multiply_routing_weight),
+        NAIVE_ASSIGNMENT=alignment.naive,
+        BLOCK_SIZE_M=alignment.block_size,
+        BLOCK_SIZE_N=128,
+        BLOCK_SIZE_K=128,
+        num_warps=4,
+        num_stages=3,
+    )
+
+
 @triton.jit(
     do_not_specialize=[
         "num_tokens",
@@ -792,4 +956,162 @@ def fused_moe(
         local_expert_start=local_expert_start,
         local_expert_end=local_expert_end,
         output_dtype=output_dtype,
+    )
+
+
+def fused_moe_fp8(
+    hidden_states: torch.Tensor,
+    w13_weight: torch.Tensor,
+    w2_weight: torch.Tensor,
+    w13_scale_inv: torch.Tensor,
+    w2_scale_inv: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    *,
+    num_experts: int,
+    local_expert_start: int,
+    gate_up_order: str,
+) -> torch.Tensor:
+    """Run block-scaled W8A8 routed experts with a generic Triton pipeline."""
+
+    tensors = {
+        "hidden_states": hidden_states,
+        "w13_weight": w13_weight,
+        "w2_weight": w2_weight,
+        "w13_scale_inv": w13_scale_inv,
+        "w2_scale_inv": w2_scale_inv,
+        "topk_ids": topk_ids,
+        "topk_weights": topk_weights,
+    }
+    for name, tensor in tensors.items():
+        if not tensor.is_cuda:
+            raise ValueError(f"Triton FP8 MoE requires CUDA {name}.")
+        if tensor.device != hidden_states.device:
+            raise ValueError(f"Triton FP8 MoE {name} is on the wrong device.")
+        if not tensor.is_contiguous():
+            raise ValueError(f"Triton FP8 MoE requires contiguous {name}.")
+    if hidden_states.ndim != 2 or int(hidden_states.shape[0]) <= 0:
+        raise ValueError(
+            f"hidden_states must be non-empty [tokens, hidden], got {hidden_states.shape}."
+        )
+    if hidden_states.dtype not in _SUPPORTED_DTYPES:
+        raise TypeError(
+            f"Triton FP8 MoE activations must be BF16 or FP16, got {hidden_states.dtype}."
+        )
+    if w13_weight.dtype != torch.float8_e4m3fn or w2_weight.dtype != torch.float8_e4m3fn:
+        raise TypeError("Triton FP8 MoE weights must use FP8 E4M3.")
+    if w13_scale_inv.dtype not in (torch.float32, torch.bfloat16) or w2_scale_inv.dtype not in (
+        torch.float32,
+        torch.bfloat16,
+    ):
+        raise TypeError("Triton FP8 MoE scales must use FP32 or BF16.")
+    if topk_ids.ndim != 2 or topk_weights.shape != topk_ids.shape:
+        raise ValueError("topk_ids and topk_weights must share [tokens, top_k] shape.")
+    if int(topk_ids.shape[0]) != int(hidden_states.shape[0]):
+        raise ValueError("Router token count does not match hidden_states.")
+    if topk_ids.dtype not in (torch.int32, torch.int64):
+        raise TypeError("topk_ids must use int32 or int64.")
+    if topk_weights.dtype not in (*_SUPPORTED_DTYPES, torch.float32):
+        raise TypeError("topk_weights must use BF16, FP16, or FP32.")
+    if gate_up_order not in {"gate_up", "up_gate"}:
+        raise ValueError(
+            f"gate_up_order must be 'gate_up' or 'up_gate', got {gate_up_order!r}."
+        )
+
+    num_experts = int(num_experts)
+    local_expert_start = int(local_expert_start)
+    num_local_experts = int(w13_weight.shape[0])
+    local_expert_end = local_expert_start + num_local_experts
+    hidden_size = int(hidden_states.shape[1])
+    if w13_weight.ndim != 3 or w2_weight.ndim != 3 or int(w13_weight.shape[1]) % 2:
+        raise ValueError("Triton FP8 MoE expects rank-3 packed expert weights.")
+    intermediate_size = int(w13_weight.shape[1]) // 2
+    if tuple(w13_weight.shape) != (
+        num_local_experts,
+        2 * intermediate_size,
+        hidden_size,
+    ) or tuple(w2_weight.shape) != (
+        num_local_experts,
+        hidden_size,
+        intermediate_size,
+    ):
+        raise ValueError("Triton FP8 MoE expert weight shapes are inconsistent.")
+    if hidden_size % 128 or intermediate_size % 128:
+        raise ValueError(
+            "Triton FP8 MoE requires hidden/intermediate dimensions aligned to 128, "
+            f"got {hidden_size}/{intermediate_size}."
+        )
+    expected_w13_scale = (
+        num_local_experts,
+        2 * intermediate_size // 128,
+        hidden_size // 128,
+    )
+    expected_w2_scale = (
+        num_local_experts,
+        hidden_size // 128,
+        intermediate_size // 128,
+    )
+    if tuple(w13_scale_inv.shape) != expected_w13_scale:
+        raise ValueError(
+            f"w13 scale shape mismatch: expected={expected_w13_scale}, "
+            f"got={tuple(w13_scale_inv.shape)}."
+        )
+    if tuple(w2_scale_inv.shape) != expected_w2_scale:
+        raise ValueError(
+            f"w2 scale shape mismatch: expected={expected_w2_scale}, "
+            f"got={tuple(w2_scale_inv.shape)}."
+        )
+    if not 0 <= local_expert_start < local_expert_end <= num_experts:
+        raise ValueError(
+            f"Invalid local expert range [{local_expert_start}, {local_expert_end}) "
+            f"for num_experts={num_experts}."
+        )
+
+    num_tokens = int(hidden_states.shape[0])
+    top_k = int(topk_ids.shape[1])
+    num_assignments = num_tokens * top_k
+    alignment = _prepare_expert_assignment(
+        topk_ids,
+        block_size=16,
+        num_experts=num_experts,
+        local_expert_start=local_expert_start,
+        local_expert_end=local_expert_end,
+    )
+    w13_output = torch.empty(
+        (num_assignments, 2 * intermediate_size),
+        dtype=hidden_states.dtype,
+        device=hidden_states.device,
+    )
+    _routed_fp8_gemm(
+        hidden_states,
+        w13_weight,
+        w13_scale_inv,
+        w13_output,
+        topk_weights,
+        alignment,
+        input_top_k=top_k,
+        multiply_routing_weight=False,
+    )
+    activated = silu_and_mul_fwd(w13_output, gate_up_order=gate_up_order)
+    w2_output = torch.empty(
+        (num_assignments, hidden_size),
+        dtype=hidden_states.dtype,
+        device=hidden_states.device,
+    )
+    _routed_fp8_gemm(
+        activated,
+        w2_weight,
+        w2_scale_inv,
+        w2_output,
+        topk_weights,
+        alignment,
+        input_top_k=1,
+        multiply_routing_weight=True,
+    )
+    return moe_sum(
+        w2_output.view(num_tokens, top_k, hidden_size),
+        topk_ids,
+        num_experts=num_experts,
+        local_expert_start=local_expert_start,
+        local_expert_end=local_expert_end,
     )
