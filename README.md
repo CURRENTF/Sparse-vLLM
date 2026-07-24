@@ -170,6 +170,7 @@ New sparse methods should keep method-specific runtime state in
 This project is inspired by and/or references ideas and implementation techniques from:
 
 - `LightLLM` (`ModelTC/LightLLM`)
+- `SGLang` (`sgl-project/sglang`)
 - `ShadowKV` (`ByteDance-Seed/ShadowKV`)
 - `nano-vllm` (`GeeeekExplorer/nano-vllm`)
 
