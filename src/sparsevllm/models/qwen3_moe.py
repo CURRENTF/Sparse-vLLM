@@ -122,22 +122,22 @@ class Qwen3MoePackedExperts(nn.Module):
             )
 
         local_expert_id = global_expert_id - self.local_expert_start
-        if projection == "down_proj":
-            target = self.w2_weight.data[local_expert_id]
-        else:
-            logical_projection = "gate" if projection == "gate_proj" else "up"
-            offset = self.provider.packed_projection_offset(
-                logical_projection,
-                self.intermediate_size,
-            )
-            target = self.w13_weight.data[local_expert_id, offset : offset + self.intermediate_size]
-        if tuple(target.shape) != tuple(loaded_weight.shape):
-            raise ValueError(
-                f"Qwen3MoE expert weight shape mismatch for expert={global_expert_id}, "
-                f"projection={projection}: expected={tuple(target.shape)}, "
-                f"got={tuple(loaded_weight.shape)}."
-            )
-        target.copy_(loaded_weight)
+        logical_projection = {
+            "gate_proj": "gate",
+            "up_proj": "up",
+            "down_proj": "down",
+        }[projection]
+        self.provider.load_expert_projection(
+            self.op_spec,
+            local_expert_id=local_expert_id,
+            projection=logical_projection,
+            loaded_weight=loaded_weight,
+            loaded_scale=None,
+            w13_weight=self.w13_weight.data,
+            w2_weight=self.w2_weight.data,
+            w13_scale_inv=None,
+            w2_scale_inv=None,
+        )
         self._loaded_expert_shards.add(load_key)
 
     def validate_loaded_weights(self) -> None:

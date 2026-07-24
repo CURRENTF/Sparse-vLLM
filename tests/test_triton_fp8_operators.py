@@ -63,13 +63,37 @@ def test_resolved_fp8_linear_provider_matches_reference():
     inputs = torch.randn(3, 128, device=device, dtype=torch.bfloat16)
     weight = _fp8_weight((128, 128), device)
     scales = torch.rand(1, 1, device=device) + 0.25
-    provider = resolve_fp8_linear_provider((128, 128))
+    provider = resolve_fp8_linear_provider(
+        (128, 128),
+        input_features=weight.shape[1],
+        output_features=weight.shape[0],
+    )
 
     actual = provider(inputs, weight, scales)
     expected = fp8_blockwise_linear_reference(inputs, weight, scales).to(
         torch.bfloat16
     )
 
+    torch.testing.assert_close(actual, expected, rtol=2.0e-2, atol=2.0e-1)
+
+
+def test_resolver_uses_triton_for_non_sm90_aligned_shape():
+    torch.manual_seed(31)
+    device = torch.device("cuda")
+    inputs = torch.randn(3, 257, device=device, dtype=torch.bfloat16)
+    weight = _fp8_weight((129, 257), device)
+    scales = torch.rand(2, 3, device=device) + 0.25
+    provider = resolve_fp8_linear_provider(
+        (128, 128),
+        input_features=weight.shape[1],
+        output_features=weight.shape[0],
+    )
+
+    assert provider.name == "triton"
+    actual = provider(inputs, weight, scales)
+    expected = fp8_blockwise_linear_reference(inputs, weight, scales).to(
+        torch.bfloat16
+    )
     torch.testing.assert_close(actual, expected, rtol=2.0e-2, atol=2.0e-1)
 
 

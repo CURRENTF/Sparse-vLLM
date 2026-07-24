@@ -10,6 +10,22 @@ SpecT = TypeVar("SpecT")
 ProviderT = TypeVar("ProviderT", bound="OperatorProvider")
 
 
+def runtime_version_at_least(
+    version: str | None,
+    minimum: tuple[int, int],
+) -> bool:
+    if version is None:
+        return False
+    parts = str(version).split(".")
+    if len(parts) < 2:
+        return False
+    try:
+        current = (int(parts[0]), int(parts[1]))
+    except ValueError:
+        return False
+    return current >= minimum
+
+
 @dataclass(frozen=True)
 class SupportResult:
     supported: bool

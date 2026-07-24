@@ -37,7 +37,9 @@ class LinearBase(nn.Module):
                     f"got {getattr(quantization, 'weight_block_size', None)}."
                 )
             self.quant_provider = QuantizationRegistry.resolve_linear_provider(
-                quantization
+                quantization,
+                input_features=input_size,
+                output_features=output_size,
             )
             self.weight = nn.Parameter(
                 torch.empty(output_size, input_size, dtype=torch.float8_e4m3fn),

@@ -9,7 +9,12 @@ class QuantizationRegistry:
     """Resolve quantized Linear providers from validated config objects."""
 
     @staticmethod
-    def resolve_linear_provider(quantization: Any):
+    def resolve_linear_provider(
+        quantization: Any,
+        *,
+        input_features: int,
+        output_features: int,
+    ):
         if not bool(getattr(quantization, "enabled", False)):
             return None
         quant_method = str(getattr(quantization, "quant_method", "") or "").strip().lower()
@@ -17,4 +22,6 @@ class QuantizationRegistry:
             raise ValueError(f"Unsupported quantized Linear method={quant_method!r}.")
         return resolve_fp8_linear_provider(
             tuple(quantization.weight_block_size),
+            input_features=input_features,
+            output_features=output_features,
         )

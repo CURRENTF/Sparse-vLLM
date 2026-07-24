@@ -7,7 +7,12 @@ from shutil import which
 import torch
 
 import sparsevllm.platforms as platforms
-from sparsevllm.operators.registry import OpRegistry, OpResolver, SupportResult
+from sparsevllm.operators.registry import (
+    OpRegistry,
+    OpResolver,
+    SupportResult,
+    runtime_version_at_least,
+)
 from sparsevllm.platforms.interface import DeviceCaps, PlatformEnum
 from sparsevllm.utils.log import logger
 
@@ -15,7 +20,13 @@ from sparsevllm.utils.log import logger
 @dataclass(frozen=True)
 class Fp8LinearSpec:
     block_shape: tuple[int, int]
+    input_features: int
+    output_features: int
     activation_dtype: torch.dtype = torch.bfloat16
+
+    def __post_init__(self) -> None:
+        if self.input_features <= 0 or self.output_features <= 0:
+            raise ValueError("FP8 Linear feature sizes must be positive.")
 
 
 class Fp8LinearProvider:
@@ -58,6 +69,19 @@ class FlashInferSm90Fp8LinearProvider(Fp8LinearProvider):
         if caps.platform != PlatformEnum.CUDA or caps.compute_capability != (9, 0):
             return SupportResult.no(
                 f"requires CUDA SM90, got {caps.platform.name} {caps.compute_capability}"
+            )
+        if not runtime_version_at_least(caps.runtime_version, (12, 8)):
+            return SupportResult.no(
+                "requires CUDA runtime >= 12.8, "
+                f"got {caps.runtime_version or 'unknown'}"
+            )
+        if spec.input_features % 128:
+            return SupportResult.no(
+                f"requires input_features divisible by 128, got {spec.input_features}"
+            )
+        if spec.output_features % 64:
+            return SupportResult.no(
+                f"requires output_features divisible by 64, got {spec.output_features}"
             )
         if find_spec("flashinfer") is None:
             return SupportResult.no("flashinfer is not installed")
@@ -145,6 +169,8 @@ class TritonFp8LinearProvider(Fp8LinearProvider):
 def resolve_fp8_linear_provider(
     block_shape: tuple[int, int],
     *,
+    input_features: int,
+    output_features: int,
     activation_dtype: torch.dtype = torch.bfloat16,
     device_index: int | None = None,
 ) -> Fp8LinearProvider:
@@ -155,6 +181,8 @@ def resolve_fp8_linear_provider(
     return OpResolver(FP8_LINEAR_REGISTRY).resolve(
         Fp8LinearSpec(
             tuple(int(value) for value in block_shape),
+            input_features=int(input_features),
+            output_features=int(output_features),
             activation_dtype=activation_dtype,
         ),
         caps,

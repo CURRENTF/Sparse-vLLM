@@ -179,42 +179,18 @@ class MiniMaxM2PackedExperts(nn.Module):
             )
 
         local_expert_id = global_expert_id - self.local_expert_start
-        if projection == "w2":
-            weight_target = self.w2_weight.data[local_expert_id]
-            scale_target = self.w2_scale_inv[local_expert_id]
-        else:
-            logical_projection = "gate" if projection == "w1" else "up"
-            weight_offset = self.provider.packed_projection_offset(
-                logical_projection,
-                self.intermediate_size,
-            )
-            scale_rows = self.intermediate_size // 128
-            scale_offset = self.provider.packed_projection_offset(
-                logical_projection,
-                scale_rows,
-            )
-            weight_target = self.w13_weight.data[
-                local_expert_id,
-                weight_offset : weight_offset + self.intermediate_size,
-            ]
-            scale_target = self.w13_scale_inv[
-                local_expert_id,
-                scale_offset : scale_offset + scale_rows,
-            ]
-        if tuple(loaded_weight.shape) != tuple(weight_target.shape):
-            raise ValueError(
-                f"MiniMax expert weight shape mismatch for expert={global_expert_id}, "
-                f"projection={projection}: expected={tuple(weight_target.shape)}, "
-                f"got={tuple(loaded_weight.shape)}."
-            )
-        if tuple(loaded_scale.shape) != tuple(scale_target.shape):
-            raise ValueError(
-                f"MiniMax expert scale shape mismatch for expert={global_expert_id}, "
-                f"projection={projection}: expected={tuple(scale_target.shape)}, "
-                f"got={tuple(loaded_scale.shape)}."
-            )
-        weight_target.copy_(loaded_weight)
-        scale_target.copy_(loaded_scale)
+        logical_projection = {"w1": "gate", "w2": "down", "w3": "up"}[projection]
+        self.provider.load_expert_projection(
+            self.op_spec,
+            local_expert_id=local_expert_id,
+            projection=logical_projection,
+            loaded_weight=loaded_weight,
+            loaded_scale=loaded_scale,
+            w13_weight=self.w13_weight.data,
+            w2_weight=self.w2_weight.data,
+            w13_scale_inv=self.w13_scale_inv,
+            w2_scale_inv=self.w2_scale_inv,
+        )
         self._loaded_expert_shards.add(load_key)
 
     def validate_loaded_weights(self) -> None:

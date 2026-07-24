@@ -21,6 +21,7 @@ def _cuda_caps(
     capability: tuple[int, int],
     *,
     native_fp8: bool = True,
+    runtime_version: str | None = "13.0",
 ) -> DeviceCaps:
     return DeviceCaps(
         platform=PlatformEnum.CUDA,
@@ -28,6 +29,7 @@ def _cuda_caps(
         device_index=0,
         device_name=f"SM{capability[0]}{capability[1]}",
         compute_capability=capability,
+        runtime_version=runtime_version,
         supports_graph_capture=True,
         supports_triton=True,
         supports_bfloat16=True,
@@ -66,6 +68,21 @@ def _moe_spec(
         block_shape=block_shape,
         ep_size=2,
         cuda_graph=True,
+    )
+
+
+def _linear_spec(
+    *,
+    input_features=256,
+    output_features=128,
+    activation_dtype=torch.bfloat16,
+    block_shape=(128, 128),
+) -> Fp8LinearSpec:
+    return Fp8LinearSpec(
+        block_shape=block_shape,
+        input_features=input_features,
+        output_features=output_features,
+        activation_dtype=activation_dtype,
     )
 
 
@@ -116,7 +133,7 @@ def test_fp8_linear_uses_generic_triton_when_specialization_does_not_match(
 ):
     with patch("sparsevllm.operators.fp8_linear.find_spec", return_value=object()):
         resolved = OpResolver(FP8_LINEAR_REGISTRY).resolve(
-            Fp8LinearSpec((128, 128), activation_dtype),
+            _linear_spec(activation_dtype=activation_dtype),
             _cuda_caps(capability),
         )
 
@@ -129,7 +146,7 @@ def test_fp8_linear_prefers_flashinfer_on_sm90():
         patch("sparsevllm.operators.fp8_linear.which", return_value="/cuda/bin/nvcc"),
     ):
         resolved = OpResolver(FP8_LINEAR_REGISTRY).resolve(
-            Fp8LinearSpec((128, 128)),
+            _linear_spec(),
             _cuda_caps((9, 0)),
         )
 
@@ -139,7 +156,7 @@ def test_fp8_linear_prefers_flashinfer_on_sm90():
 def test_fp8_linear_uses_triton_when_flashinfer_is_missing_on_sm90():
     with patch("sparsevllm.operators.fp8_linear.find_spec", return_value=None):
         resolved = OpResolver(FP8_LINEAR_REGISTRY).resolve(
-            Fp8LinearSpec((128, 128)),
+            _linear_spec(),
             _cuda_caps((9, 0)),
         )
 
@@ -153,7 +170,7 @@ def test_fp8_linear_resolution_does_not_require_nvcc():
         patch("sparsevllm.operators.fp8_linear.which", return_value=None),
     ):
         resolved = OpResolver(FP8_LINEAR_REGISTRY).resolve(
-            Fp8LinearSpec((128, 128)),
+            _linear_spec(),
             _cuda_caps((9, 0)),
         )
 
@@ -224,7 +241,7 @@ def test_flashinfer_linear_does_not_mask_other_runtime_failures():
 def test_fp8_linear_reports_unsupported_pre_fp8_device():
     with pytest.raises(RuntimeError, match="native FP8 tensor cores"):
         OpResolver(FP8_LINEAR_REGISTRY).resolve(
-            Fp8LinearSpec((128, 128)),
+            _linear_spec(),
             _cuda_caps((8, 0), native_fp8=False),
         )
 
@@ -232,8 +249,8 @@ def test_fp8_linear_reports_unsupported_pre_fp8_device():
 @pytest.mark.parametrize(
     "spec",
     [
-        Fp8LinearSpec((64, 128)),
-        Fp8LinearSpec((128, 128), torch.float32),
+        _linear_spec(block_shape=(64, 128)),
+        _linear_spec(activation_dtype=torch.float32),
     ],
 )
 def test_fp8_linear_rejects_unsupported_operation_specs(spec):
@@ -245,7 +262,7 @@ def test_fp8_linear_rejects_unsupported_operation_specs(spec):
 def test_fp8_linear_rejects_non_cuda_platforms(platform):
     with pytest.raises(RuntimeError, match="requires CUDA"):
         OpResolver(FP8_LINEAR_REGISTRY).resolve(
-            Fp8LinearSpec((128, 128)),
+            _linear_spec(),
             _non_cuda_caps(platform),
         )
 
@@ -258,9 +275,44 @@ def test_fp8_linear_rejects_cuda_without_triton_or_flashinfer():
         pytest.raises(RuntimeError, match="does not support Triton"),
     ):
         OpResolver(FP8_LINEAR_REGISTRY).resolve(
-            Fp8LinearSpec((128, 128)),
+            _linear_spec(),
             caps,
         )
+
+
+@pytest.mark.parametrize(
+    ("spec", "reason"),
+    [
+        (_linear_spec(input_features=255), "input_features divisible by 128"),
+        (_linear_spec(output_features=127), "output_features divisible by 64"),
+    ],
+)
+def test_fp8_linear_uses_triton_for_unsupported_flashinfer_shapes(spec, reason):
+    with patch("sparsevllm.operators.fp8_linear.find_spec", return_value=object()):
+        resolved = OpResolver(FP8_LINEAR_REGISTRY).resolve(
+            spec,
+            _cuda_caps((9, 0)),
+        )
+
+    assert resolved.provider.name == "triton"
+    assert resolved.rejected[0][0] == "flashinfer_sm90"
+    assert reason in resolved.rejected[0][1]
+
+
+@pytest.mark.parametrize("runtime_version", [None, "12.7", "invalid"])
+def test_flashinfer_providers_require_cuda_12_8(runtime_version):
+    caps = _cuda_caps((9, 0), runtime_version=runtime_version)
+    with (
+        patch("sparsevllm.operators.fp8_linear.find_spec", return_value=object()),
+        patch("sparsevllm.operators.moe.find_spec", return_value=object()),
+    ):
+        linear = OpResolver(FP8_LINEAR_REGISTRY).resolve(_linear_spec(), caps)
+        moe = OpResolver(MOE_REGISTRY).resolve(_moe_spec(), caps)
+
+    assert linear.provider.name == "triton"
+    assert moe.provider.name == "triton"
+    assert "requires CUDA runtime >= 12.8" in linear.rejected[0][1]
+    assert "requires CUDA runtime >= 12.8" in moe.rejected[0][1]
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
@@ -341,26 +393,68 @@ def test_moe_rejects_non_cuda_platforms(platform):
 
 
 def test_provider_owns_packed_gate_up_layout():
+    triton_spec = _moe_spec(
+        activation_dtype=torch.bfloat16,
+        weight_dtype=torch.bfloat16,
+        block_shape=None,
+    )
     triton = OpResolver(MOE_REGISTRY).resolve(
-        _moe_spec(
-            activation_dtype=torch.bfloat16,
-            weight_dtype=torch.bfloat16,
-            block_shape=None,
-        ),
+        triton_spec,
         _cuda_caps((9, 0)),
     ).provider
+    flashinfer_spec = _moe_spec()
     with patch("sparsevllm.operators.moe.find_spec", return_value=object()):
         flashinfer = OpResolver(MOE_REGISTRY).resolve(
-            _moe_spec(),
+            flashinfer_spec,
             _cuda_caps((9, 0)),
         ).provider
 
-    assert triton.packed_projection_offset("gate", 128) == 0
-    assert triton.packed_projection_offset("up", 128) == 128
-    assert flashinfer.packed_projection_offset("up", 128) == 0
-    assert flashinfer.packed_projection_offset("gate", 128) == 128
-    with pytest.raises(ValueError, match="Unknown packed MoE projection"):
-        triton.packed_projection_offset("down", 128)
+    triton_w13 = torch.zeros(4, 256, 256, dtype=torch.bfloat16)
+    triton_w2 = torch.zeros(4, 256, 128, dtype=torch.bfloat16)
+    gate = torch.full((128, 256), 1, dtype=torch.bfloat16)
+    up = torch.full((128, 256), 2, dtype=torch.bfloat16)
+    for projection, weight in (("gate", gate), ("up", up)):
+        triton.load_expert_projection(
+            triton_spec,
+            local_expert_id=0,
+            projection=projection,
+            loaded_weight=weight,
+            loaded_scale=None,
+            w13_weight=triton_w13,
+            w2_weight=triton_w2,
+            w13_scale_inv=None,
+            w2_scale_inv=None,
+        )
+    assert torch.equal(triton_w13[0, :128], gate)
+    assert torch.equal(triton_w13[0, 128:], up)
+
+    flashinfer_w13 = torch.zeros(4, 256, 256, dtype=torch.float8_e4m3fn)
+    flashinfer_w2 = torch.zeros(4, 256, 128, dtype=torch.float8_e4m3fn)
+    flashinfer_s13 = torch.zeros(4, 2, 2)
+    flashinfer_s2 = torch.zeros(4, 2, 1)
+    gate_fp8 = torch.full((128, 256), 1).to(torch.float8_e4m3fn)
+    up_fp8 = torch.full((128, 256), 2).to(torch.float8_e4m3fn)
+    gate_scale = torch.full((1, 2), 3.0)
+    up_scale = torch.full((1, 2), 4.0)
+    for projection, weight, scale in (
+        ("gate", gate_fp8, gate_scale),
+        ("up", up_fp8, up_scale),
+    ):
+        flashinfer.load_expert_projection(
+            flashinfer_spec,
+            local_expert_id=0,
+            projection=projection,
+            loaded_weight=weight,
+            loaded_scale=scale,
+            w13_weight=flashinfer_w13,
+            w2_weight=flashinfer_w2,
+            w13_scale_inv=flashinfer_s13,
+            w2_scale_inv=flashinfer_s2,
+        )
+    assert torch.equal(flashinfer_w13[0, :128], up_fp8)
+    assert torch.equal(flashinfer_w13[0, 128:], gate_fp8)
+    assert torch.equal(flashinfer_s13[0, :1], up_scale)
+    assert torch.equal(flashinfer_s13[0, 1:], gate_scale)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -368,7 +462,11 @@ def test_public_resolvers_match_live_device_capabilities():
     from sparsevllm.platforms import current_platform
 
     caps = current_platform.get_device_caps(torch.cuda.current_device())
-    linear = resolve_fp8_linear_provider((128, 128))
+    linear = resolve_fp8_linear_provider(
+        (128, 128),
+        input_features=256,
+        output_features=128,
+    )
     unquantized_moe = resolve_moe_provider(
         _moe_spec(
             activation_dtype=torch.bfloat16,

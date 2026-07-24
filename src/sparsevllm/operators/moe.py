@@ -6,7 +6,12 @@ from importlib.util import find_spec
 import torch
 
 import sparsevllm.platforms as platforms
-from sparsevllm.operators.registry import OpRegistry, OpResolver, SupportResult
+from sparsevllm.operators.registry import (
+    OpRegistry,
+    OpResolver,
+    SupportResult,
+    runtime_version_at_least,
+)
 from sparsevllm.platforms.interface import DeviceCaps, PlatformEnum
 
 
@@ -64,7 +69,7 @@ class MoeProvider:
     priority = 0
     gate_up_order = "gate_up"
 
-    def packed_projection_offset(
+    def _packed_projection_offset(
         self,
         projection: str,
         intermediate_size: int,
@@ -73,6 +78,73 @@ class MoeProvider:
             raise ValueError(f"Unknown packed MoE projection {projection!r}.")
         first = "gate" if self.gate_up_order == "gate_up" else "up"
         return 0 if projection == first else int(intermediate_size)
+
+    def load_expert_projection(
+        self,
+        spec: MoeOpSpec,
+        *,
+        local_expert_id: int,
+        projection: str,
+        loaded_weight: torch.Tensor,
+        loaded_scale: torch.Tensor | None,
+        w13_weight: torch.Tensor,
+        w2_weight: torch.Tensor,
+        w13_scale_inv: torch.Tensor | None,
+        w2_scale_inv: torch.Tensor | None,
+    ) -> None:
+        if not 0 <= local_expert_id < spec.num_local_experts:
+            raise ValueError(
+                f"Local expert id {local_expert_id} is outside "
+                f"[0, {spec.num_local_experts})."
+            )
+        if projection == "down":
+            weight_target = w2_weight[local_expert_id]
+            scale_target = (
+                None if w2_scale_inv is None else w2_scale_inv[local_expert_id]
+            )
+        elif projection in {"gate", "up"}:
+            weight_offset = self._packed_projection_offset(
+                projection,
+                spec.intermediate_size,
+            )
+            weight_target = w13_weight[
+                local_expert_id,
+                weight_offset : weight_offset + spec.intermediate_size,
+            ]
+            if w13_scale_inv is None:
+                scale_target = None
+            else:
+                scale_rows = w13_scale_inv.shape[1] // 2
+                scale_offset = self._packed_projection_offset(
+                    projection,
+                    scale_rows,
+                )
+                scale_target = w13_scale_inv[
+                    local_expert_id,
+                    scale_offset : scale_offset + scale_rows,
+                ]
+        else:
+            raise ValueError(f"Unknown logical MoE projection {projection!r}.")
+
+        if tuple(loaded_weight.shape) != tuple(weight_target.shape):
+            raise ValueError(
+                "MoE expert weight shape mismatch: "
+                f"expected={tuple(weight_target.shape)}, "
+                f"got={tuple(loaded_weight.shape)}."
+            )
+        if (loaded_scale is None) != (scale_target is None):
+            raise ValueError(
+                "MoE expert scale presence does not match provider storage."
+            )
+        if loaded_scale is not None and scale_target is not None:
+            if tuple(loaded_scale.shape) != tuple(scale_target.shape):
+                raise ValueError(
+                    "MoE expert scale shape mismatch: "
+                    f"expected={tuple(scale_target.shape)}, "
+                    f"got={tuple(loaded_scale.shape)}."
+                )
+            scale_target.copy_(loaded_scale)
+        weight_target.copy_(loaded_weight)
 
     def run(
         self,
@@ -115,6 +187,11 @@ class FlashInferCutlassFp8MoeProvider(MoeProvider):
         if caps.platform != PlatformEnum.CUDA or caps.compute_capability != (9, 0):
             return SupportResult.no(
                 f"requires CUDA SM90, got {caps.platform.name} {caps.compute_capability}"
+            )
+        if not runtime_version_at_least(caps.runtime_version, (12, 8)):
+            return SupportResult.no(
+                "requires CUDA runtime >= 12.8, "
+                f"got {caps.runtime_version or 'unknown'}"
             )
         if find_spec("flashinfer") is None:
             return SupportResult.no("flashinfer is not installed")
