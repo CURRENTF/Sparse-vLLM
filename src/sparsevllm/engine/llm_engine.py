@@ -344,12 +344,21 @@ class LLMEngine:
             f"(num_seqs={num_seqs}, max_tokens={sampling_params.max_tokens}, "
             f"ignore_eos={sampling_params.ignore_eos})."
         )
-        
-        for _ in range(num_seqs):
-            self.add_request(dummy_prompt, sampling_params)
 
-        while not self.is_finished():
-            self.step()
+        def run_warmup(params: SamplingParams) -> None:
+            for _ in range(num_seqs):
+                self.add_request(dummy_prompt, params)
+            while not self.is_finished():
+                self.step()
+
+        run_warmup(sampling_params)
+
+        if warmup_profile == "graph":
+            # CUDA Graph capture establishes its private allocator pool. Warm
+            # prefill once more against the final allocator layout.
+            logger.info(f"Post-capture prefill warmup (num_seqs={num_seqs}).")
+            run_warmup(SamplingParams(max_tokens=1, temperature=0.0))
+
         self._after_warmup_debug_cleanup()
         logger.info("Warmup finished.")
 

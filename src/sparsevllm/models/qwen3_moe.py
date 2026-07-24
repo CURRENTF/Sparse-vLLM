@@ -32,32 +32,10 @@ class Qwen3MoeRouter(nn.Module):
         self.num_experts = int(config.num_experts)
         self.top_k = int(config.num_experts_per_tok)
         self.norm_topk_prob = bool(config.norm_topk_prob)
-        self.backend = str(getattr(config, "moe_backend", "pytorch")).strip().lower()
-        if self.backend not in {"pytorch", "triton"}:
-            raise ValueError(
-                "Qwen3MoE backend must be 'pytorch' or 'triton', "
-                f"got {self.backend!r}."
-            )
-        if self.backend == "triton":
-            from sparsevllm.triton_kernel.moe_topk import topk_softmax
+        from sparsevllm.triton_kernel.moe_topk import topk_softmax
 
-            self.topk_impl = topk_softmax
-        else:
-            self.topk_impl = self._topk_pytorch
+        self.topk_impl = topk_softmax
         self.weight = nn.Parameter(torch.empty(self.num_experts, self.hidden_size))
-
-    @staticmethod
-    def _topk_pytorch(
-        router_logits: torch.Tensor,
-        *,
-        top_k: int,
-        norm_topk_prob: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        router_probs = F.softmax(router_logits, dtype=torch.float32, dim=-1)
-        topk_weights, topk_ids = torch.topk(router_probs, top_k, dim=-1)
-        if norm_topk_prob:
-            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-        return topk_weights.to(router_logits.dtype), topk_ids
 
     def forward(
         self,
@@ -153,30 +131,7 @@ class Qwen3MoePackedExperts(nn.Module):
                 f"missing={missing[:8]}."
             )
 
-    def forward_pytorch(
-        self,
-        hidden_states: torch.Tensor,
-        topk_ids: torch.Tensor,
-        topk_weights: torch.Tensor,
-    ) -> torch.Tensor:
-        local_output = torch.zeros_like(hidden_states)
-        for local_expert_id in range(self.num_local_experts):
-            global_expert_id = self.local_expert_start + local_expert_id
-            token_ids, topk_slots = torch.where(topk_ids == global_expert_id)
-            if token_ids.numel() == 0:
-                continue
-            expert_input = hidden_states[token_ids]
-            gate_up = F.linear(expert_input, self.w13_weight[local_expert_id])
-            gate, up = gate_up.chunk(2, dim=-1)
-            expert_output = F.linear(
-                F.silu(gate) * up,
-                self.w2_weight[local_expert_id],
-            )
-            expert_output = expert_output * topk_weights[token_ids, topk_slots, None]
-            local_output.index_add_(0, token_ids, expert_output)
-        return local_output
-
-    def forward_triton(
+    def forward(
         self,
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
@@ -201,17 +156,6 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self.parallel_context = get_parallel_context()
         self.gate = Qwen3MoeRouter(config)
         self.experts = Qwen3MoePackedExperts(config)
-        self.moe_backend = str(getattr(config, "moe_backend", "pytorch")).strip().lower()
-        if self.moe_backend not in {"pytorch", "triton"}:
-            raise ValueError(
-                "Qwen3MoeSparseMoeBlock moe_backend must be 'pytorch' or 'triton', "
-                f"got {self.moe_backend!r}."
-            )
-        self.expert_forward = (
-            self.experts.forward_pytorch
-            if self.moe_backend == "pytorch"
-            else self.experts.forward_triton
-        )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if hidden_states.dim() != 2:
@@ -222,7 +166,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         if debug_enabled:
             self.debug_last_input = hidden_states.detach().clone()
         router_logits, topk_weights, topk_ids = self.gate(hidden_states)
-        local_output = self.expert_forward(
+        local_output = self.experts(
             hidden_states,
             topk_ids,
             topk_weights,
@@ -302,10 +246,8 @@ class Qwen3MoeForCausalLM(nn.Module):
         self._intentionally_skipped_expert_weights: set[str] = set()
 
     @torch.inference_mode()
-    def warmup_moe_backend(self) -> None:
+    def warmup_moe(self) -> None:
         block = self.model.layers[0].mlp
-        if block.moe_backend != "triton":
-            return
         experts = block.experts
         top_k = int(self.config.num_experts_per_tok)
         device = experts.w13_weight.device
@@ -327,7 +269,7 @@ class Qwen3MoeForCausalLM(nn.Module):
             dtype=dtype,
             device=device,
         )
-        experts.forward_triton(hidden_states, topk_ids, topk_weights)
+        experts(hidden_states, topk_ids, topk_weights)
         device_runtime.synchronize()
 
     def map_weight_name(self, source_weight_name: str) -> str | None:

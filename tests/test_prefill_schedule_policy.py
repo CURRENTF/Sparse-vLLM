@@ -2648,6 +2648,7 @@ class DeltaKVLessMemoryStorageContractTest(unittest.TestCase):
             rotary_dim=4,
             max_position_embeddings=2,
             base=10000.0,
+            backend="torch",
         )
         with patch("sparsevllm.engine.cache_manager.deltakv_base.apply_rotary_emb", fake_apply_rotary_emb):
             out = DeltaKVLessMemoryCacheManager._apply_sparse_rope_to_key(manager, positions, key)
@@ -2659,7 +2660,13 @@ class DeltaKVLessMemoryStorageContractTest(unittest.TestCase):
     def test_rotary_embedding_forward_uses_compiled_path(self):
         from sparsevllm.layers.rotary_embedding import RotaryEmbedding
 
-        rotary_emb = RotaryEmbedding(head_size=4, rotary_dim=4, max_position_embeddings=2, base=10000.0)
+        rotary_emb = RotaryEmbedding(
+            head_size=4,
+            rotary_dim=4,
+            max_position_embeddings=2,
+            base=10000.0,
+            backend="torch",
+        )
         positions = torch.tensor([0, 1], dtype=torch.long)
         query = torch.zeros((2, 1, 4), dtype=torch.float32)
         key = torch.ones((2, 1, 4), dtype=torch.float32)

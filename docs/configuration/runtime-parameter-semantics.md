@@ -866,7 +866,7 @@ The serving entrypoint has dedicated server flags:
 | `--port` | `8000` | Uvicorn bind port. |
 | `--engine-kwargs` | unset | JSON object or path to a JSON object with Sparse-vLLM engine kwargs. |
 | `--request-log-dir` | unset | Optional directory for per-request JSON logs. |
-| `--reasoning-parser` | unset | Optional Chat Completions and Responses parser. The first supported value is `qwen3`, which parses `<think>...</think>` output into endpoint-specific Sparse-vLLM reasoning fields. |
+| `--response-parser` | unset | Optional Chat Completions and Responses output parser. `qwen3` and `minimax_m2` split model output into reasoning, content, and tool calls; the loaded tokenizer selects the matching response template. |
 
 The `/v1/models` entry also advertises the engine's effective
 `max_model_len`. vLLM-compatible clients use this extension to discover the
@@ -1038,12 +1038,14 @@ flat Responses form. Effective tools are passed through the tokenizer's
 omits tools from the generation prompt. Named/required choices and
 `parallel_tool_calls=false` fail explicitly because their generation
 constraints are not implemented. The server parses Qwen-style
-`<tool_call>`/`<tool_calls>` output only when tools are effective and never
-executes tools itself. Enable `--reasoning-parser qwen3` when Qwen3 thinking
-and tool calling are both active; without it, combined reasoning plus tool-call
-text remains raw `content` instead of being guessed into a structured call.
+`<tool_call>`/`<tool_calls>` and MiniMax M2
+`<minimax:tool_call><invoke ...>` output only when tools are effective and
+never executes tools itself. Enable the matching `--response-parser` when
+thinking and tool calling are both active; without it, reasoning-only output
+remains raw `content`.
 
-With `--reasoning-parser qwen3`, non-streaming Chat responses split local raw
+With `--response-parser qwen3` or `--response-parser minimax_m2`,
+non-streaming Chat responses split local raw
 reasoning into the Sparse-vLLM `message.reasoning_content` extension and place
 the visible answer in `message.content`. Function calls use OpenAI
 `message.tool_calls` and `finish_reason="tool_calls"`. Streaming uses
@@ -1077,12 +1079,13 @@ so `store=true` fails explicitly. `prompt_cache_key` is retained in request
 logs as a cache-grouping hint but does not alter the rendered model prompt or
 replace Sparse-vLLM's exact-prefix cache matching.
 
-When `--reasoning-parser qwen3` is enabled, `/v1/responses` parses model output
-that starts with `<think>` into a Sparse-vLLM extension reasoning item followed
-by the assistant message or function call item. This extension exposes local
-model reasoning text for reproducibility; it is not claiming equivalence with
-OpenAI-hosted reasoning tokens, which are not exposed as raw text. If the
-parser is not enabled, generated text is returned unchanged as `output_text`.
+When `--response-parser qwen3` or `--response-parser minimax_m2` is enabled,
+`/v1/responses` parses model output that starts with `<think>` into a
+Sparse-vLLM extension reasoning item followed by the assistant message or
+function call item. This extension exposes local model reasoning text for
+reproducibility; it is not claiming equivalence with OpenAI-hosted reasoning
+tokens, which are not exposed as raw text. If the parser is not enabled,
+generated text is returned unchanged as `output_text`.
 `reasoning.effort="none"` maps to `enable_thinking=false`; other effort values
 map to `enable_thinking=true`. Conflicts with explicit
 `chat_template_kwargs.enable_thinking` fail fast. In streaming mode,
@@ -1090,11 +1093,12 @@ map to `enable_thinking=true`. Conflicts with explicit
 reasoning text, not an OpenAI-hosted raw reasoning token field.
 
 Function tools are passed to tokenizer chat templates through the `tools`
-kwarg when supported. The server normalizes OpenAI function tool schemas and
-parses explicit `<tool_call>...</tool_call>` or `<tool_calls>...</tool_calls>`
-model output into Responses `function_call` items. It does not execute tools;
-applications must execute tools and send results back as
-`function_call_output` input items. Streaming tool calls emit a
+kwarg when supported. The server normalizes OpenAI function tool schemas,
+adapts them to the loaded tokenizer's Qwen or MiniMax template shape, and
+parses explicit Qwen `<tool_call>...</tool_call>` or MiniMax
+`<minimax:tool_call><invoke ...>` output into Responses `function_call` items.
+It does not execute tools; applications must execute tools and send results
+back as `function_call_output` input items. Streaming tool calls emit a
 `function_call` output item plus `response.function_call_arguments.delta` and
 `response.function_call_arguments.done` events.
 

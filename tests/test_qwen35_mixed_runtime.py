@@ -697,7 +697,6 @@ def test_model_runner_resets_inherited_allocator_peak_before_model_construction(
         expert_parallel_size=1,
         data_parallel_size=1,
         mlp_chunk_size=16384,
-        moe_backend="triton",
         hf_config=SimpleNamespace(model_type="qwen2", torch_dtype=torch.float32),
     )
     with (
@@ -988,67 +987,81 @@ def test_qwen35_rotary_dim_uses_partial_rotary_factor():
     assert _get_rotary_dim(SimpleNamespace(qk_rope_head_dim=96), 256) == 96
 
 
-def test_qwen35_rmsnorm_uses_hf_offset_weight_semantics():
-    norm = Qwen35RMSNorm(4, eps=1.0e-6)
-    norm.weight.data.copy_(torch.tensor([0.5, -0.25, 0.0, 1.0]))
-    x = torch.tensor([[1.0, -2.0, 3.0, -4.0]], dtype=torch.float32)
+def _qwen35_rmsnorm_reference(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    x_float = x.float()
+    normalized = x_float * torch.rsqrt(
+        x_float.square().mean(dim=-1, keepdim=True) + eps
+    )
+    return (normalized * (1.0 + weight.float())).to(x.dtype)
 
-    out = norm(x)
 
-    expected = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + 1.0e-6)
-    expected = expected * (1.0 + norm.weight)
-    assert torch.allclose(out, expected)
-
-
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_qwen35_rmsnorm_does_not_modify_input(dtype):
-    norm = Qwen35RMSNorm(4, eps=1.0e-6)
-    x = torch.randn(3, 4, dtype=dtype)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_qwen35_rmsnorm_uses_hf_offset_weight_semantics(dtype):
+    pytest.importorskip("flashinfer")
+    torch.manual_seed(43)
+    norm = Qwen35RMSNorm(128, eps=1.0e-6).cuda().to(dtype)
+    norm.weight.data.normal_(mean=0.0, std=0.2)
+    x = torch.randn(7, 128, device="cuda", dtype=dtype)
     original = x.clone()
 
-    norm(x)
+    actual = norm(x)
 
+    torch.testing.assert_close(
+        actual,
+        _qwen35_rmsnorm_reference(x, norm.weight, norm.eps),
+        rtol=1.0e-2,
+        atol=3.0e-2,
+    )
     assert torch.equal(x, original)
 
 
-def test_qwen35_rmsnorm_residual_path_uses_hf_offset_weight_semantics():
-    norm = Qwen35RMSNorm(4, eps=1.0e-6)
-    norm.weight.data.copy_(torch.tensor([0.5, -0.25, 0.0, 1.0]))
-    x = torch.tensor([[1.0, -2.0, 3.0, -4.0]], dtype=torch.float32)
-    residual_in = torch.tensor([[0.5, 0.5, -1.0, 2.0]], dtype=torch.float32)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_qwen35_fused_rmsnorm_uses_hf_offset_weight_semantics(dtype):
+    pytest.importorskip("flashinfer")
+    torch.manual_seed(47)
+    norm = Qwen35RMSNorm(128, eps=1.0e-6).cuda().to(dtype)
+    norm.weight.data.normal_(mean=0.0, std=0.2)
+    x = torch.randn(7, 128, device="cuda", dtype=dtype)
+    residual = torch.randn_like(x)
+    merged = x.float() + residual.float()
+    expected_residual = merged.to(dtype)
+    expected = _qwen35_rmsnorm_reference(
+        merged,
+        norm.weight,
+        norm.eps,
+    ).to(dtype)
 
-    out, residual = norm(x, residual_in)
+    actual, actual_residual = norm(x, residual)
 
-    merged = x + residual_in
-    expected = merged * torch.rsqrt(merged.pow(2).mean(dim=-1, keepdim=True) + 1.0e-6)
-    expected = expected * (1.0 + norm.weight)
-    assert torch.allclose(out, expected)
-    assert torch.allclose(residual, merged)
+    torch.testing.assert_close(actual, expected, rtol=1.0e-2, atol=3.0e-2)
+    assert torch.equal(actual_residual, expected_residual)
+    assert actual is x
+    assert actual_residual is residual
 
 
-@pytest.mark.parametrize("with_residual", [False, True])
-def test_qwen35_rmsnorm_capture_uses_compiled_path(with_residual):
-    norm = Qwen35RMSNorm(4, eps=1.0e-6)
-    x = torch.ones((1, 4), dtype=torch.float32)
-    residual = torch.full_like(x, 2.0) if with_residual else None
-    expected = (torch.full_like(x, 3.0), residual) if with_residual else torch.full_like(x, 4.0)
-    compiled_name = "add_rms_forward" if with_residual else "rms_forward"
-    raw_name = "_add_rms_forward_impl" if with_residual else "_rms_forward_impl"
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_qwen35_rmsnorm_supports_strided_qkv_views(dtype):
+    pytest.importorskip("flashinfer")
+    torch.manual_seed(53)
+    norm = Qwen35RMSNorm(128, eps=1.0e-6).cuda().to(dtype)
+    projection = torch.randn(7, 14336, device="cuda", dtype=dtype)
+    query = projection[:, : 48 * 128].view(7, 48, 128)
 
-    with (
-        patch("torch.cuda.is_available", return_value=True),
-        patch("torch.cuda.is_current_stream_capturing", return_value=True),
-        patch.object(norm, compiled_name, return_value=expected) as compiled,
-        patch.object(norm, raw_name, side_effect=AssertionError("capture bypassed the compiled RMSNorm path")),
-    ):
-        actual = norm(x, residual) if with_residual else norm(x)
+    actual = norm(query)
 
-    compiled.assert_called_once()
-    if with_residual:
-        assert actual[0] is expected[0]
-        assert actual[1] is expected[1]
-    else:
-        assert actual is expected
+    torch.testing.assert_close(
+        actual,
+        _qwen35_rmsnorm_reference(query, norm.weight, norm.eps),
+        rtol=1.0e-2,
+        atol=3.0e-2,
+    )
 
 
 def test_qwen35_linear_attention_repeats_qk_to_value_heads():

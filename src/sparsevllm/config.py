@@ -304,6 +304,7 @@ class QuantizationConfig:
     activation_scheme: str = ""
     weight_block_size: tuple[int, int] | None = None
     backend: str = "auto"
+    model_name: str = "qwen3_5"
 
     @classmethod
     def disabled(cls) -> "QuantizationConfig":
@@ -323,10 +324,19 @@ class QuantizationConfig:
         return payload
 
     @classmethod
-    def from_hf_config(cls, value: Any, *, required_fp8: bool = False) -> "QuantizationConfig":
+    def from_hf_config(
+        cls,
+        value: Any,
+        *,
+        required_fp8: bool = False,
+        model_name: str = "qwen3_5",
+    ) -> "QuantizationConfig":
         if value is None:
             if required_fp8:
-                raise ValueError("qwen3_5 requires FP8 quantization_config; BF16/FP16 fallback is not supported.")
+                raise ValueError(
+                    f"{model_name} requires FP8 quantization_config; "
+                    "BF16/FP16 fallback is not supported."
+                )
             return cls.disabled()
 
         quant_method = str(
@@ -336,7 +346,7 @@ class QuantizationConfig:
         if quant_method not in {"fp8", "fbgemm_fp8"}:
             if required_fp8:
                 raise ValueError(
-                    "qwen3_5 requires quantization_config.quant_method='fp8', "
+                    f"{model_name} requires quantization_config.quant_method='fp8', "
                     f"got {quant_method!r}."
                 )
             return cls.disabled()
@@ -351,7 +361,7 @@ class QuantizationConfig:
         ).strip().lower()
         if "e4m3" not in weight_dtype:
             raise ValueError(
-                "Sparse-vLLM qwen3_5 FP8 supports e4m3 weights only, "
+                f"Sparse-vLLM {model_name} FP8 supports e4m3 weights only, "
                 f"got weight_dtype={weight_dtype!r}."
             )
 
@@ -361,7 +371,7 @@ class QuantizationConfig:
         ).strip().lower()
         if activation_scheme != "dynamic":
             raise ValueError(
-                "Sparse-vLLM qwen3_5 FP8 supports dynamic activation only, "
+                f"Sparse-vLLM {model_name} FP8 supports dynamic activation only, "
                 f"got activation_scheme={activation_scheme!r}."
             )
 
@@ -378,7 +388,8 @@ class QuantizationConfig:
             raise ValueError(f"weight_block_size must be a pair, got {block_size!r}.")
         if block_tuple != (128, 128):
             raise ValueError(
-                "Sparse-vLLM qwen3_5 FP8 supports weight_block_size=(128, 128) only, "
+                f"Sparse-vLLM {model_name} FP8 supports "
+                "weight_block_size=(128, 128) only, "
                 f"got {block_tuple}."
             )
 
@@ -390,6 +401,83 @@ class QuantizationConfig:
             activation_scheme="dynamic",
             weight_block_size=block_tuple,
             backend=backend,
+            model_name=model_name,
+        )
+
+
+_MINIMAX_M2_FIXED_FIELDS = {
+    "vocab_size": 200064,
+    "hidden_size": 3072,
+    "intermediate_size": 1536,
+    "num_hidden_layers": 62,
+    "num_attention_heads": 48,
+    "num_key_value_heads": 8,
+    "head_dim": 128,
+    "rotary_dim": 64,
+    "num_local_experts": 256,
+    "num_experts_per_tok": 8,
+    "max_position_embeddings": 204800,
+    "shared_intermediate_size": 0,
+    "mtp_transformer_layers": 1,
+    "num_mtp_modules": 3,
+}
+
+
+def _validate_minimax_m2_checkpoint_config(
+    hf_config: Any,
+    raw_quantization_config: Any,
+) -> None:
+    architectures = tuple(_config_get(hf_config, "architectures", ()) or ())
+    if architectures != ("MiniMaxM2ForCausalLM",):
+        raise ValueError(
+            "MiniMax M2.7 requires architectures=['MiniMaxM2ForCausalLM'], "
+            f"got {list(architectures)}."
+        )
+    for field_name, expected in _MINIMAX_M2_FIXED_FIELDS.items():
+        actual = _config_get(hf_config, field_name, None)
+        if actual != expected:
+            raise ValueError(
+                f"MiniMax M2.7 requires {field_name}={expected!r}, got {actual!r}."
+            )
+
+    expected_values = {
+        "hidden_act": "silu",
+        "qk_norm_type": "per_layer",
+        "scoring_func": "sigmoid",
+        "use_qk_norm": True,
+        "use_routing_bias": True,
+        "use_mtp": True,
+        "tie_word_embeddings": False,
+    }
+    for field_name, expected in expected_values.items():
+        actual = _config_get(hf_config, field_name, None)
+        if actual != expected:
+            raise ValueError(
+                f"MiniMax M2.7 requires {field_name}={expected!r}, got {actual!r}."
+            )
+
+    configured_dtype = _config_get(hf_config, "torch_dtype", None)
+    if configured_dtype is None:
+        configured_dtype = _config_get(hf_config, "dtype", None)
+    if configured_dtype not in {torch.bfloat16, "bfloat16"}:
+        raise ValueError(
+            "MiniMax M2.7 requires BF16 non-quantized parameters, "
+            f"got dtype={configured_dtype!r}."
+        )
+
+    excluded_modules = {
+        str(name)
+        for name in (
+            _config_get(raw_quantization_config, "modules_to_not_convert", ()) or ()
+        )
+    }
+    required_exclusions = {"gate", "e_score_correction_bias", "lm_head"}
+    missing_exclusions = sorted(required_exclusions - excluded_modules)
+    if missing_exclusions:
+        raise ValueError(
+            "MiniMax M2.7 quantization_config must exclude gate, "
+            "e_score_correction_bias, and lm_head; missing "
+            f"{missing_exclusions}."
         )
 
 
@@ -597,7 +685,8 @@ class Config:
     tensor_parallel_size: int = 1
     expert_parallel_size: int = 1
     data_parallel_size: int = 1
-    moe_backend: str = "triton"
+    # Total host-side I/O worker budget shared by all distributed ranks.
+    weight_loading_workers: int = 8
     enforce_eager: bool = True
     hf_config: Union[Qwen3Config, AutoConfig] | None = None
     outer_hf_config: Any | None = None
@@ -762,6 +851,10 @@ class Config:
             * int(self.expert_parallel_size)
             * int(self.data_parallel_size)
         )
+
+    @property
+    def weight_loading_workers_per_rank(self) -> int:
+        return max(1, self.weight_loading_workers // self.world_size)
 
     def _normalize_platform_aliases(self):
         if self.device_memory_utilization is not None:
@@ -1048,7 +1141,7 @@ class Config:
         self.tensor_parallel_size = int(self.tensor_parallel_size)
         self.expert_parallel_size = int(self.expert_parallel_size)
         self.data_parallel_size = int(self.data_parallel_size)
-        self.moe_backend = str(self.moe_backend or "").strip().lower()
+        self.weight_loading_workers = int(self.weight_loading_workers)
         if not 1 <= self.tensor_parallel_size <= 8:
             raise ValueError(f"tensor_parallel_size must be in [1, 8], got {self.tensor_parallel_size}.")
         if self.expert_parallel_size <= 0:
@@ -1059,10 +1152,10 @@ class Config:
             raise ValueError(
                 f"data_parallel_size must be positive, got {self.data_parallel_size}."
             )
-        if self.moe_backend not in {"pytorch", "triton"}:
+        if self.weight_loading_workers <= 0:
             raise ValueError(
-                "moe_backend must be 'pytorch' or 'triton', "
-                f"got {self.moe_backend!r}."
+                "weight_loading_workers must be positive, "
+                f"got {self.weight_loading_workers}."
             )
         self._normalize_platform_aliases()
         if legacy_deltakv_graph_method:
@@ -1137,6 +1230,8 @@ class Config:
         self.hf_config = _extract_text_config(self.outer_hf_config)
         if is_qwen35:
             setattr(self.hf_config, "model_type", "qwen3_5")
+        model_type = str(getattr(self.hf_config, "model_type", "") or "")
+        is_minimax_m2 = model_type == "minimax_m2"
         raw_quantization_config = _config_get(
             self.hf_config,
             "quantization_config",
@@ -1144,15 +1239,20 @@ class Config:
         )
         self.quantization_config = QuantizationConfig.from_hf_config(
             raw_quantization_config,
-            required_fp8=is_qwen35,
+            required_fp8=is_qwen35 or is_minimax_m2,
+            model_name="MiniMax M2.7" if is_minimax_m2 else "qwen3_5",
         )
         setattr(self.hf_config, "quantization_config", self.quantization_config)
+        if is_minimax_m2:
+            _validate_minimax_m2_checkpoint_config(
+                self.hf_config,
+                raw_quantization_config,
+            )
         if getattr(self.hf_config, "model_type", "") in {"deepseek_v2", "deepseek_v32"}:
             raise NotImplementedError(
                 f"Unsupported Sparse-vLLM model_type={self.hf_config.model_type!r}. "
                 "Supported model types: qwen2, qwen3, qwen3_5, llama."
             )
-        model_type = str(getattr(self.hf_config, "model_type", "") or "")
         if model_type == "qwen3_moe":
             if self.tensor_parallel_size != 1 or self.data_parallel_size != 1:
                 raise ValueError(
@@ -1209,6 +1309,35 @@ class Config:
                 raise NotImplementedError(
                     "Qwen3MoE v1 supports BF16/FP16 checkpoints only, "
                     f"got torch_dtype={model_dtype}."
+                )
+            validate_model_runtime_compatibility(
+                model_type=model_type,
+                sparse_method=self.vllm_sparse_method,
+                tensor_parallel_size=self.tensor_parallel_size,
+                expert_parallel_size=self.expert_parallel_size,
+                data_parallel_size=self.data_parallel_size,
+                enforce_eager=self.enforce_eager,
+                decode_cuda_graph=self.decode_cuda_graph,
+                enable_prefix_caching=self.enable_prefix_caching,
+            )
+        elif model_type == "minimax_m2":
+            if self.tensor_parallel_size != 1 or self.data_parallel_size != 1:
+                raise ValueError(
+                    "MiniMax M2.7 v1 requires TP=1 and DP=1, got "
+                    f"TP={self.tensor_parallel_size}, EP={self.expert_parallel_size}, "
+                    f"DP={self.data_parallel_size}."
+                )
+            num_experts = int(getattr(self.hf_config, "num_local_experts"))
+            if self.expert_parallel_size > num_experts:
+                raise ValueError(
+                    "MiniMax M2.7 expert_parallel_size must not exceed "
+                    f"num_local_experts={num_experts}, got {self.expert_parallel_size}."
+                )
+            if num_experts % self.expert_parallel_size != 0:
+                raise ValueError(
+                    "MiniMax M2.7 requires num_local_experts divisible by "
+                    f"expert_parallel_size, got {num_experts} and "
+                    f"{self.expert_parallel_size}."
                 )
             validate_model_runtime_compatibility(
                 model_type=model_type,

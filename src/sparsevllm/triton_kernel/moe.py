@@ -530,7 +530,7 @@ def _moe_sum_kernel(
     )
 
 
-def _moe_sum(
+def moe_sum(
     inputs: torch.Tensor,
     topk_ids: torch.Tensor,
     *,
@@ -581,6 +581,11 @@ def _moe_sum(
         num_stages=2,
     )
     return output
+
+
+# Retain the private name for out-of-tree callers while new routed kernels use
+# the dtype-independent public helper.
+_moe_sum = moe_sum
 
 
 def _validate_fused_moe_inputs(
@@ -780,7 +785,7 @@ def fused_moe(
         multiply_routing_weight=True,
         launch_config=w2_config,
     )
-    return _moe_sum(
+    return moe_sum(
         w2_output.view(num_tokens, top_k, hidden_size),
         topk_ids,
         num_experts=num_experts,

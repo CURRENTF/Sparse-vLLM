@@ -73,6 +73,7 @@ from sparsevllm.utils.log import logger
 
 
 UNSUPPORTED_SERVING_METHOD_PREFIXES = ("deltakv",)
+SUPPORTED_RESPONSE_PARSERS = ("qwen3", "minimax_m2")
 SEMANTIC_ENGINE_ARGS = {
     "sparse_method",
     "deltakv_checkpoint_path",
@@ -93,18 +94,18 @@ def create_app(
     served_model_name: str | None = None,
     engine: LLM | None = None,
     request_log_dir: str | None = None,
-    reasoning_parser: str | None = None,
+    response_parser: str | None = None,
 ) -> FastAPI:
     served_model_name = served_model_name or model
     engine_kwargs = dict(engine_kwargs or {})
     if engine is None:
         engine_kwargs.setdefault("throughput_log_interval_s", 0.0)
     _validate_serving_method(engine_kwargs, engine)
-    if reasoning_parser not in (None, "qwen3"):
-        raise ValueError(f"Unsupported reasoning parser {reasoning_parser!r}.")
+    if response_parser not in (None, *SUPPORTED_RESPONSE_PARSERS):
+        raise ValueError(f"Unsupported response parser {response_parser!r}.")
     engine = engine or LLM(model, **engine_kwargs)
     dispatcher = AsyncEngineDispatcher(engine)
-    response_parser = TransformersResponseParser.from_tokenizer(
+    response_parser_impl = TransformersResponseParser.from_tokenizer(
         getattr(engine, "tokenizer", None)
     )
     request_log_path = Path(request_log_dir) if request_log_dir else None
@@ -123,8 +124,8 @@ def create_app(
     app.state.dispatcher = dispatcher
     app.state.served_model_name = served_model_name
     app.state.request_log_dir = request_log_path
-    app.state.reasoning_parser = reasoning_parser
-    app.state.response_parser = response_parser
+    app.state.response_parser_name = response_parser
+    app.state.response_parser = response_parser_impl
     app.include_router(models_router)
     app.include_router(worker_router)
     app.include_router(prefix_cache_router)
@@ -201,7 +202,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--engine-kwargs", default=None, help="JSON object or JSON file with Sparse-vLLM engine kwargs.")
     parser.add_argument("--request-log-dir", default=None, help="Optional directory for per-request JSON logs.")
-    parser.add_argument("--reasoning-parser", choices=["qwen3"], default=None)
+    parser.add_argument(
+        "--response-parser",
+        choices=SUPPORTED_RESPONSE_PARSERS,
+        default=None,
+        help="Parse model output into reasoning, content, and tool calls.",
+    )
     return parser
 
 
@@ -235,7 +241,7 @@ def main():
         engine_kwargs,
         served_model_name=args.served_model_name,
         request_log_dir=args.request_log_dir,
-        reasoning_parser=args.reasoning_parser,
+        response_parser=args.response_parser,
     )
 
     exit_code = _run_server(app, host=args.host, port=args.port)
