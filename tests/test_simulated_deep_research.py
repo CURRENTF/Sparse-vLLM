@@ -321,6 +321,9 @@ class SimulatedDeepResearchTest(unittest.TestCase):
                 }
             )
             run.validate_config(config)
+            self.assertFalse(
+                run._roles_require_distinct_workers(config)
+            )
 
     def test_rejects_partial_role_tags_for_overlapping_methods(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -348,6 +351,9 @@ class SimulatedDeepResearchTest(unittest.TestCase):
                 }
             )
             run.validate_config(config)
+            self.assertTrue(
+                run._roles_require_distinct_workers(config)
+            )
             spec = run.RequestSpec(
                 sample_id="job-0000-subagent",
                 job_index=0,

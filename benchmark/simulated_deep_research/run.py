@@ -361,6 +361,22 @@ def required_model_len_by_role(config: BenchmarkConfig) -> dict[str, int]:
     }
 
 
+def _roles_require_distinct_workers(config: BenchmarkConfig) -> bool:
+    subagent_methods = {
+        _canonical_method(method)
+        for method in config.subagent_methods
+    }
+    main_agent_methods = {
+        _canonical_method(method)
+        for method in config.main_agent_methods
+    }
+    return bool(
+        subagent_methods.isdisjoint(main_agent_methods)
+        or config.subagent_required_tags
+        or config.main_agent_required_tags
+    )
+
+
 def required_model_len(config: BenchmarkConfig) -> int:
     return max(required_model_len_by_role(config).values())
 
@@ -2363,6 +2379,7 @@ async def _run_one_job(
         }
         if (
             config.require_router
+            and _roles_require_distinct_workers(config)
             and len(distinct_workers) < config.min_healthy_workers
         ):
             raise BenchmarkFailed(
@@ -2493,6 +2510,25 @@ async def _run_benchmark_impl(
                     for job in failed_jobs
                 )
             else:
+                if (
+                    config.require_router
+                    and not _roles_require_distinct_workers(config)
+                ):
+                    distinct_workers = {
+                        str(record["route_worker"])
+                        for record in records
+                        if (
+                            record["status"] == "success"
+                            and record.get("route_worker")
+                        )
+                    }
+                    if len(distinct_workers) < config.min_healthy_workers:
+                        raise BenchmarkFailed(
+                            "metric_failed",
+                            "Load-balanced run exercised only "
+                            f"{len(distinct_workers)} distinct workers; "
+                            f"expected at least {config.min_healthy_workers}.",
+                        )
                 aggregate_status = "success"
         except Exception as exc:
             run_error = f"{type(exc).__name__}: {exc}"
