@@ -478,6 +478,55 @@ def _validate_minimax_m2_checkpoint_config(
         )
 
 
+def _validate_qwen3_moe_fp8_checkpoint_config(
+    hf_config: Any,
+    raw_quantization_config: Any,
+) -> None:
+    architectures = tuple(_config_get(hf_config, "architectures", ()) or ())
+    if architectures != ("Qwen3MoeForCausalLM",):
+        raise ValueError(
+            "Qwen3MoE FP8 requires architectures=['Qwen3MoeForCausalLM'], "
+            f"got {list(architectures)}."
+        )
+    configured_dtype = _config_get(hf_config, "torch_dtype", None)
+    if configured_dtype is None:
+        configured_dtype = _config_get(hf_config, "dtype", None)
+    if configured_dtype not in {torch.bfloat16, "bfloat16"}:
+        raise ValueError(
+            "Qwen3MoE FP8 requires BF16 non-quantized parameters, "
+            f"got dtype={configured_dtype!r}."
+        )
+
+    hidden_size = int(_config_get(hf_config, "hidden_size", 0) or 0)
+    intermediate_size = int(
+        _config_get(hf_config, "moe_intermediate_size", 0) or 0
+    )
+    if hidden_size % 128 or intermediate_size % 128:
+        raise ValueError(
+            "Qwen3MoE FP8 requires hidden_size and moe_intermediate_size "
+            f"aligned to 128, got {hidden_size}/{intermediate_size}."
+        )
+
+    excluded_modules = {
+        str(name)
+        for name in (
+            _config_get(raw_quantization_config, "modules_to_not_convert", ()) or ()
+        )
+    }
+    num_layers = int(_config_get(hf_config, "num_hidden_layers", 0) or 0)
+    required_exclusions = {"lm_head"}
+    required_exclusions.update(
+        f"model.layers.{layer_idx}.mlp.gate"
+        for layer_idx in range(num_layers)
+    )
+    missing_exclusions = sorted(required_exclusions - excluded_modules)
+    if missing_exclusions:
+        raise ValueError(
+            "Qwen3MoE FP8 quantization_config must exclude lm_head and every "
+            f"router gate; missing {missing_exclusions[:8]}."
+        )
+
+
 @dataclass(frozen=True)
 class RuntimeLayout:
     num_layers: int
@@ -682,8 +731,9 @@ class Config:
     tensor_parallel_size: int = 1
     expert_parallel_size: int = 1
     data_parallel_size: int = 1
-    # Total host-side I/O worker budget shared by all distributed ranks.
-    weight_loading_workers: int = 8
+    # Soft host-side I/O budget shared across ranks; every rank retains at
+    # least one synchronous loading path when the budget is smaller.
+    weight_loading_workers: int = 1
     enforce_eager: bool = True
     hf_config: Union[Qwen3Config, AutoConfig] | None = None
     outer_hf_config: Any | None = None
@@ -1288,6 +1338,7 @@ class Config:
             setattr(self.hf_config, "model_type", "qwen3_5")
         model_type = str(getattr(self.hf_config, "model_type", "") or "")
         is_minimax_m2 = model_type == "minimax_m2"
+        is_qwen3_moe = model_type == "qwen3_moe"
         if self.tiny_random:
             from sparsevllm.debug.tiny_random import apply_tiny_random_overrides
 
@@ -1308,16 +1359,26 @@ class Config:
             "quantization_config",
             _config_get(self.outer_hf_config, "quantization_config", None),
         )
+        quantized_model_name = "qwen3_5"
+        if is_minimax_m2:
+            quantized_model_name = "MiniMax M2.7"
+        elif is_qwen3_moe:
+            quantized_model_name = "Qwen3MoE"
         self.quantization_config = QuantizationConfig.from_hf_config(
             raw_quantization_config,
             required_fp8=is_qwen35 or is_minimax_m2,
-            model_name="MiniMax M2.7" if is_minimax_m2 else "qwen3_5",
+            model_name=quantized_model_name,
         )
         if self.tiny_random and self.quantization_config.enabled:
             raise NotImplementedError("Tiny random mode does not support quantized model weights.")
         setattr(self.hf_config, "quantization_config", self.quantization_config)
         if is_minimax_m2:
             _validate_minimax_m2_checkpoint_config(
+                self.hf_config,
+                raw_quantization_config,
+            )
+        if is_qwen3_moe and self.quantization_config.enabled:
+            _validate_qwen3_moe_fp8_checkpoint_config(
                 self.hf_config,
                 raw_quantization_config,
             )
@@ -1372,10 +1433,6 @@ class Config:
                 raise NotImplementedError(
                     "Qwen3MoE v1 does not support shared experts, got "
                     f"shared_expert_intermediate_size={shared_intermediate_size}."
-                )
-            if self.quantization_config.enabled:
-                raise NotImplementedError(
-                    "Qwen3MoE v1 supports BF16/FP16 expert weights only; quantized MoE is unsupported."
                 )
             model_dtype = getattr(self.hf_config, "torch_dtype", None)
             if model_dtype not in {torch.bfloat16, torch.float16}:
