@@ -9,14 +9,14 @@ import torch.nn.functional as F
 from sparsevllm.distributed import get_parallel_context
 from sparsevllm.layers.activation import SiluAndMul
 from sparsevllm.layers.attention import Attention
-from sparsevllm.layers.layernorm import RMSNorm
+from sparsevllm.layers.layernorm import GemmaRMSNorm
 from sparsevllm.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
     RowParallelLinear,
     divide,
 )
-from sparsevllm.layers.rotary_embedding import get_rope, apply_rotary_emb
+from sparsevllm.layers.rotary_embedding import apply_partial_rotary_emb, get_rope
 from sparsevllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 from sparsevllm.utils.context import get_context
 from sparsevllm.engine.recurrent_state_manager import RecurrentStateSpec, RecurrentTensorSpec
@@ -75,22 +75,8 @@ def _get_rotary_dim(config, head_dim: int) -> int:
     return rotary_dim
 
 
-def _apply_partial_rope(rotary_emb, positions: torch.Tensor, q: torch.Tensor, k: torch.Tensor, rotary_dim: int):
-    rotary_dim = int(rotary_dim)
-    if rotary_dim == int(q.shape[-1]):
-        return rotary_emb(positions, q, k)
-    if rotary_dim <= 0 or rotary_dim > int(q.shape[-1]) or rotary_dim > int(k.shape[-1]):
-        raise ValueError(
-            f"Invalid qwen3_5 rotary_dim={rotary_dim} for q={tuple(q.shape)} k={tuple(k.shape)}."
-        )
-    cos_sin = rotary_emb.cos_sin_cache[positions]
-    cos, sin = cos_sin.chunk(2, dim=-1)
-    q_rot = apply_rotary_emb(q[..., :rotary_dim], cos, sin)
-    k_rot = apply_rotary_emb(k[..., :rotary_dim], cos, sin)
-    return torch.cat((q_rot, q[..., rotary_dim:]), dim=-1), torch.cat((k_rot, k[..., rotary_dim:]), dim=-1)
-
-
 class Qwen35QKVGatedParallelLinear(ColumnParallelLinear):
+    rank_local_weight_slice = None
     def __init__(
         self,
         hidden_size: int,
@@ -290,7 +276,13 @@ class Qwen35FullAttention(nn.Module):
         cache_manager.save_raw_kv_if_needed(layer_idx, pre_rope_k, v)
         q = self.q_norm(q)
         k = self.k_norm(k)
-        q, k = _apply_partial_rope(self.rotary_emb, positions, q, k, self.rotary_dim)
+        q, k = apply_partial_rotary_emb(
+            self.rotary_emb,
+            positions,
+            q,
+            k,
+            self.rotary_dim,
+        )
         cache_manager.save_rope_kv_if_needed(layer_idx, k, v)
         o = self.attn(q, k, v)
         o = o.flatten(1, -1) * torch.sigmoid(gate)
@@ -317,46 +309,8 @@ class Qwen35GatedRMSNorm(nn.Module):
         )
 
 
-class Qwen35RMSNorm(nn.Module):
-    def __init__(self, hidden_size: int, eps: float = 1.0e-6) -> None:
-        super().__init__()
-        self.eps = float(eps)
-        self.weight = nn.Parameter(torch.zeros(hidden_size))
-
-    def _norm_with_weight(self, x_float: torch.Tensor, orig_dtype: torch.dtype) -> torch.Tensor:
-        variance = x_float.pow(2).mean(dim=-1, keepdim=True)
-        x_norm = x_float * torch.rsqrt(variance + self.eps)
-        return (x_norm * (1.0 + self.weight.float())).to(orig_dtype)
-
-    def _rms_forward_impl(self, x: torch.Tensor) -> torch.Tensor:
-        return self._norm_with_weight(x.float(), x.dtype)
-
-    @torch.compile
-    def rms_forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self._rms_forward_impl(x)
-
-    def _add_rms_forward_impl(
-        self,
-        x: torch.Tensor,
-        residual: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        orig_dtype = x.dtype
-        x_float = x.float() + residual.float()
-        residual = x_float.to(orig_dtype)
-        return self._norm_with_weight(x_float, orig_dtype), residual
-
-    @torch.compile
-    def add_rms_forward(self, x: torch.Tensor, residual: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        return self._add_rms_forward_impl(x, residual)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        residual: torch.Tensor | None = None,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if residual is None:
-            return self.rms_forward(x)
-        return self.add_rms_forward(x, residual)
+class Qwen35RMSNorm(GemmaRMSNorm):
+    """Qwen3.5 RMSNorm using its Hugging Face offset-weight semantics."""
 
 
 class Qwen35LinearConv1D(nn.Module):

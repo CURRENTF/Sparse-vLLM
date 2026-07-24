@@ -19,7 +19,11 @@ from sparsevllm.engine.cache_manager.deltakv_less_memory_cuda_graph import (
 )
 from sparsevllm.engine.cache_manager.snapkv import SnapKVCacheManager
 from sparsevllm.engine.decode_cuda_graph import DecodeCudaGraphKey, DecodeCudaGraphRunner, DecodeCudaGraphState
-from sparsevllm.engine.llm_engine import _deltakv_graph_warmup_profile, _use_graph_scaled_warmup
+from sparsevllm.engine.llm_engine import (
+    LLMEngine,
+    _deltakv_graph_warmup_profile,
+    _use_graph_scaled_warmup,
+)
 from sparsevllm.engine.model_runner import ModelRunner
 from sparsevllm.engine.runtime_state import RuntimeState
 from sparsevllm.engine.scheduler import Scheduler
@@ -1209,6 +1213,43 @@ class DecodeCudaGraphWarmupPolicyTest(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(_deltakv_graph_warmup_profile(self.make_config(method="omnikv")), "graph")
             self.assertTrue(_use_graph_scaled_warmup(self.make_config(method="omnikv")))
+
+    def test_graph_warmup_uses_distinct_prompts_across_requests_and_rounds(self):
+        engine = object.__new__(LLMEngine)
+        engine.config = SimpleNamespace(
+            vllm_sparse_method="omnikv",
+            decode_cuda_graph=True,
+            num_sink_tokens=1,
+            decode_keep_tokens=1,
+            num_recent_tokens=1,
+            chunk_prefill_size=1,
+            max_decoding_seqs=3,
+            max_model_len=2048,
+            hf_config=SimpleNamespace(vocab_size=32),
+        )
+        prompts = []
+        pending = 0
+
+        def add_request(prompt, sampling_params):
+            nonlocal pending
+            prompts.append((list(prompt), sampling_params.max_tokens))
+            pending += 1
+
+        def step():
+            nonlocal pending
+            pending = 0
+
+        engine.add_request = add_request
+        engine.is_finished = lambda: pending == 0
+        engine.step = step
+        engine._after_warmup_debug_cleanup = lambda: None
+
+        engine._warmup()
+
+        self.assertEqual(len(prompts), 6)
+        self.assertEqual([prompt[0] for prompt, _ in prompts], list(range(6)))
+        self.assertEqual({len(prompt) for prompt, _ in prompts}, {1028})
+        self.assertEqual([max_tokens for _, max_tokens in prompts], [2, 2, 2, 1, 1, 1])
 
 
 class DeltaKVLessMemoryCudaGraphReserveTest(unittest.TestCase):
@@ -2690,6 +2731,7 @@ class DeltaKVLessMemoryStorageContractTest(unittest.TestCase):
             rotary_dim=4,
             max_position_embeddings=2,
             base=10000.0,
+            backend="torch",
         )
         with patch("sparsevllm.engine.cache_manager.deltakv_base.apply_rotary_emb", fake_apply_rotary_emb):
             out = DeltaKVLessMemoryCacheManager._apply_sparse_rope_to_key(manager, positions, key)
@@ -2701,7 +2743,13 @@ class DeltaKVLessMemoryStorageContractTest(unittest.TestCase):
     def test_rotary_embedding_forward_uses_compiled_path(self):
         from sparsevllm.layers.rotary_embedding import RotaryEmbedding
 
-        rotary_emb = RotaryEmbedding(head_size=4, rotary_dim=4, max_position_embeddings=2, base=10000.0)
+        rotary_emb = RotaryEmbedding(
+            head_size=4,
+            rotary_dim=4,
+            max_position_embeddings=2,
+            base=10000.0,
+            backend="torch",
+        )
         positions = torch.tensor([0, 1], dtype=torch.long)
         query = torch.zeros((2, 1, 4), dtype=torch.float32)
         key = torch.ones((2, 1, 4), dtype=torch.float32)

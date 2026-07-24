@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum, auto
+from functools import lru_cache
 from typing import Any
 
 import torch
@@ -20,6 +21,22 @@ class PlatformEnum(Enum):
 class AllocatorStats:
     peak_allocated_bytes: int = 0
     current_allocated_bytes: int = 0
+
+
+@dataclass(frozen=True)
+class DeviceCaps:
+    platform: PlatformEnum
+    device_type: str
+    device_index: int
+    device_name: str
+    compute_capability: tuple[int, int] | None = None
+    runtime_version: str | None = None
+    supports_graph_capture: bool = False
+    supports_torch_compile: bool = False
+    supports_triton: bool = False
+    supports_pin_memory: bool = False
+    supports_bfloat16: bool = False
+    supports_native_fp8: bool = False
 
 
 class Platform:
@@ -83,23 +100,38 @@ class Platform:
     def get_communicator_cls(self) -> type | None:
         return None
 
+    @lru_cache(maxsize=None)
+    def get_device_caps(self, device_index: int = 0) -> DeviceCaps:
+        return DeviceCaps(
+            platform=self.enum,
+            device_type=self.device_type,
+            device_index=int(device_index),
+            device_name=self.name,
+            supports_graph_capture=False,
+            supports_torch_compile=False,
+            supports_triton=False,
+            supports_pin_memory=False,
+            supports_bfloat16=False,
+            supports_native_fp8=False,
+        )
+
     def supports_graph_capture(self) -> bool:
-        return False
+        return self.get_device_caps().supports_graph_capture
 
     def supports_torch_compile(self) -> bool:
-        return False
+        return self.get_device_caps().supports_torch_compile
 
     def supports_triton(self) -> bool:
-        return False
+        return self.get_device_caps().supports_triton
 
     def supports_pin_memory(self) -> bool:
-        return False
+        return self.get_device_caps().supports_pin_memory
 
     def supports_fp8(self) -> bool:
-        return False
+        return self.get_device_caps().supports_native_fp8
 
     def supports_bfloat16(self) -> bool:
-        return False
+        return self.get_device_caps().supports_bfloat16
 
     def get_default_attention_backend(self) -> str:
         return "native"

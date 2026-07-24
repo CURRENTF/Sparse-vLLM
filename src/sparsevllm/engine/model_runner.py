@@ -43,6 +43,13 @@ except ImportError:
     Qwen3MoeForCausalLM = None
 
 try:
+    from sparsevllm.models.minimax_m2 import MiniMaxM2ForCausalLM
+    _MINIMAX_M2_IMPORT_ERROR = None
+except ImportError as exc:
+    MiniMaxM2ForCausalLM = None
+    _MINIMAX_M2_IMPORT_ERROR = exc
+
+try:
     from sparsevllm.models.qwen3_5 import Qwen35ForCausalLM
     _QWEN35_IMPORT_ERROR = None
 except ImportError as exc:
@@ -131,7 +138,6 @@ class ModelRunner:
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device(self.device)
         setattr(hf_config, "mlp_chunk_size", config.mlp_chunk_size)
-        setattr(hf_config, "moe_backend", config.moe_backend)
         
         # 加载对应的模型分片 (Shards)
         if hf_config.model_type == "qwen2":
@@ -150,6 +156,14 @@ class ModelRunner:
                     "Use a Transformers version with Qwen3MoE config support."
                 )
             self.model = Qwen3MoeForCausalLM(hf_config)
+        elif hf_config.model_type == "minimax_m2":
+            if MiniMaxM2ForCausalLM is None:
+                raise ImportError(
+                    "MiniMaxM2ForCausalLM is unavailable; verify the MiniMax FP8 "
+                    "runtime dependencies in the active uv environment: "
+                    f"{_MINIMAX_M2_IMPORT_ERROR}"
+                ) from _MINIMAX_M2_IMPORT_ERROR
+            self.model = MiniMaxM2ForCausalLM(hf_config)
         elif hf_config.model_type == "qwen3_5":
             if Qwen35ForCausalLM is None:
                 raise ImportError(
@@ -175,9 +189,12 @@ class ModelRunner:
                 config.model,
                 tp_rank=self.parallel_context.tp_rank,
                 tp_size=self.parallel_context.tp_size,
+                num_threads=config.weight_loading_workers_per_rank,
+                show_progress=self.parallel_context.world_rank == 0,
+                progress_rank=0 if self.parallel_context.world_rank == 0 else None,
             )
-        if hf_config.model_type == "qwen3_moe" and config.moe_backend == "triton":
-            self.model.warmup_moe_backend()
+        if hf_config.model_type in {"qwen3_moe", "minimax_m2"}:
+            self.model.warmup_moe()
         
         self.sampler = Sampler()
 
@@ -626,9 +643,14 @@ class ModelRunner:
                 "local_output": _debug_tensor_summary(block.debug_last_local_output),
             }
         state = self.sparse_controller.debug_state_summary()
-        if self.prefix_cache_coordinator is not None:
+        prefix_cache_coordinator = getattr(
+            self,
+            "prefix_cache_coordinator",
+            None,
+        )
+        if prefix_cache_coordinator is not None:
             state["mixed_prefix_cache"] = (
-                self.prefix_cache_coordinator.debug_state_summary()
+                prefix_cache_coordinator.debug_state_summary()
             )
         return {
             "world_rank": self.parallel_context.world_rank,

@@ -6,6 +6,8 @@ from sparsevllm.platforms.interface import Platform, PlatformEnum
 
 
 class RocmPlatform(Platform):
+    # TODO: populate DeviceCaps and register ROCm operator providers when
+    # Sparse-vLLM gains a supported ROCm inference backend.
     name = "rocm"
     device_type = "cuda"
     enum = PlatformEnum.ROCM

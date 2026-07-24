@@ -15,11 +15,33 @@ def test_explicit_cpu_platform_is_lazy_and_available(monkeypatch):
     assert platform.get_device(3) == torch.device("cpu")
     assert platform.get_distributed_backend() == "gloo"
     assert not platform.supports_graph_capture()
+    caps = platform.get_device_caps()
+    assert caps.platform.name == "CPU"
+    assert caps.device_type == "cpu"
+    assert caps.supports_bfloat16
+    assert not caps.supports_native_fp8
     assert not platform.supports_inference()
     with pytest.raises(RuntimeError, match="inference is not supported"):
         platform.validate_inference()
 
     platforms._set_current_platform_for_tests(None)
+
+
+def test_cuda_device_caps_are_the_capability_source(monkeypatch):
+    from sparsevllm.platforms.cuda import CudaPlatform
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: (9, 0))
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda _: "Test H100")
+    monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: True)
+    platform = CudaPlatform()
+
+    caps = platform.get_device_caps(7)
+
+    assert caps.device_index == 7
+    assert caps.device_name == "Test H100"
+    assert caps.compute_capability == (9, 0)
+    assert caps.supports_native_fp8
+    assert platform.supports_fp8()
 
 
 def test_unknown_explicit_platform_fails_fast(monkeypatch):

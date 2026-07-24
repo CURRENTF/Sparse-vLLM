@@ -1,129 +1,133 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from types import ModuleType
-
 import torch
+import torch.nn.functional as F
 
 
-def _load_transformers_fp8_kernel() -> None:
-    """Load the exact Transformers fine-grained FP8 kernel with explicit trust."""
-    try:
-        from kernels import get_kernel
-        from transformers.integrations import hub_kernels
-    except ImportError as exc:
+def _validate_fp8_weight_and_scale(
+    weight: torch.Tensor,
+    weight_scale_inv: torch.Tensor | None,
+    block_size: tuple[int, int],
+) -> None:
+    if tuple(block_size) != (128, 128):
+        raise ValueError(
+            f"FP8 backend supports block_size=(128, 128), got {block_size}."
+        )
+    if weight.ndim != 2:
         raise RuntimeError(
-            "qwen3_5 FP8 requires the optional Qwen3.5 dependencies; "
-            "install them with `pip install -e '.[qwen35]'`."
-        ) from exc
-
-    kernel_name = "finegrained-fp8"
-    if isinstance(hub_kernels._KERNEL_MODULE_MAPPING.get(kernel_name), ModuleType):
-        return
-    kernel_config = hub_kernels._HUB_KERNEL_MAPPING.get(kernel_name)
-    if not isinstance(kernel_config, dict):
-        raise RuntimeError("Installed Transformers does not define the finegrained-fp8 Hub Kernel.")
-    hub_kernels._KERNEL_MODULE_MAPPING[kernel_name] = get_kernel(
-        kernel_config["repo_id"],
-        revision=kernel_config.get("revision"),
-        version=kernel_config.get("version"),
-        trust_remote_code=True,
+            f"FP8 Linear weight must be rank-2, got shape={tuple(weight.shape)}."
+        )
+    if weight.dtype != torch.float8_e4m3fn:
+        raise RuntimeError(
+            f"FP8 Linear weight must be torch.float8_e4m3fn, got {weight.dtype}."
+        )
+    if weight_scale_inv is None:
+        raise RuntimeError("FP8 Linear requires weight_scale_inv.")
+    if weight_scale_inv.dtype != torch.float32:
+        raise RuntimeError(
+            f"weight_scale_inv must be FP32, got dtype={weight_scale_inv.dtype}."
+        )
+    if weight_scale_inv.dim() != 2:
+        raise RuntimeError(
+            "weight_scale_inv must be rank-2, "
+            f"got shape={tuple(weight_scale_inv.shape)}."
+        )
+    if weight_scale_inv.device != weight.device:
+        raise RuntimeError(
+            "FP8 weight and weight_scale_inv must be on the same device, got "
+            f"weight={weight.device}, scale={weight_scale_inv.device}."
+        )
+    expected = (
+        (int(weight.shape[0]) + block_size[0] - 1) // block_size[0],
+        (int(weight.shape[1]) + block_size[1] - 1) // block_size[1],
     )
-
-
-def _has_native_fp8_dtype() -> bool:
-    return hasattr(torch, "float8_e4m3fn")
-
-
-def require_fp8_backend(backend: str = "auto") -> None:
-    backend = str(backend or "auto").strip().lower()
-    if backend not in {"auto", "transformers"}:
-        raise ValueError(f"Unsupported FP8 backend={backend!r}. Supported backends: 'auto', 'transformers'.")
-    if not _has_native_fp8_dtype():
+    if tuple(weight_scale_inv.shape) != expected:
         raise RuntimeError(
-            "qwen3_5 FP8 requires torch.float8_e4m3fn. "
-            "Install a PyTorch build with native FP8 support."
+            "weight_scale_inv shape mismatch: "
+            f"expected={expected}, got={tuple(weight_scale_inv.shape)} "
+            f"for weight={tuple(weight.shape)}."
         )
-    if not torch.cuda.is_available():
-        raise RuntimeError("qwen3_5 FP8 requires a CUDA device with native FP8 matmul support.")
-    major, minor = torch.cuda.get_device_capability()
-    if (int(major), int(minor)) < (8, 9):
+
+
+def fp8_blockwise_dequantize(
+    weight: torch.Tensor,
+    weight_scale_inv: torch.Tensor,
+    *,
+    block_size: tuple[int, int] = (128, 128),
+    output_dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Explicit block-wise FP8 dequantization for correctness oracles."""
+
+    block_size = tuple(int(value) for value in block_size)
+    _validate_fp8_weight_and_scale(weight, weight_scale_inv, block_size)
+    if output_dtype not in {torch.float32, torch.bfloat16, torch.float16}:
+        raise TypeError(
+            "FP8 reference dequantization output must be FP32, BF16, or FP16, "
+            f"got {output_dtype}."
+        )
+    block_rows, block_cols = block_size
+    scales = weight_scale_inv.repeat_interleave(block_rows, dim=0)
+    scales = scales.repeat_interleave(block_cols, dim=1)
+    scales = scales[: weight.shape[0], : weight.shape[1]]
+    return weight.to(output_dtype) * scales.to(output_dtype)
+
+
+def fp8_blockwise_linear_reference(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale_inv: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    *,
+    block_size: tuple[int, int] = (128, 128),
+) -> torch.Tensor:
+    """Explicit dynamic W8A8 Linear used only by the reference backend."""
+
+    if x.device != weight.device:
         raise RuntimeError(
-            "qwen3_5 FP8 requires a native FP8 CUDA backend on Hopper/Ada-or-newer GPUs; "
-            f"detected compute capability {major}.{minor}."
+            f"FP8 reference input and weight must share a device, got {x.device} and "
+            f"{weight.device}."
         )
-
-
-@dataclass(frozen=True)
-class Fp8BlockScaledLinearBackend:
-    """Local rank FP8 matmul backend.
-
-    Parallel Linear subclasses still own sharding and communication. This object
-    only validates and executes the local dense projection.
-    """
-
-    block_size: tuple[int, int] = (128, 128)
-    backend: str = "auto"
-
-    def __post_init__(self) -> None:
-        if tuple(self.block_size) != (128, 128):
-            raise ValueError(f"FP8 backend supports block_size=(128, 128), got {self.block_size}.")
-        require_fp8_backend(self.backend)
-
-    def validate_weight_and_scale(
-        self,
-        weight: torch.Tensor,
-        weight_scale_inv: torch.Tensor | None,
-    ) -> None:
-        if weight.dtype != torch.float8_e4m3fn:
-            raise RuntimeError(f"FP8 Linear weight must be torch.float8_e4m3fn, got {weight.dtype}.")
-        if weight_scale_inv is None:
-            raise RuntimeError("FP8 Linear requires weight_scale_inv.")
-        if weight_scale_inv.dim() != 2:
-            raise RuntimeError(f"weight_scale_inv must be rank-2, got shape={tuple(weight_scale_inv.shape)}.")
-        expected = (
-            (int(weight.shape[0]) + self.block_size[0] - 1) // self.block_size[0],
-            (int(weight.shape[1]) + self.block_size[1] - 1) // self.block_size[1],
+    if x.shape[-1] != weight.shape[-1]:
+        raise RuntimeError(
+            f"FP8 Linear input feature mismatch: input={tuple(x.shape)} "
+            f"weight={tuple(weight.shape)}."
         )
-        if tuple(weight_scale_inv.shape) != expected:
-            raise RuntimeError(
-                "weight_scale_inv shape mismatch: "
-                f"expected={expected}, got={tuple(weight_scale_inv.shape)} for weight={tuple(weight.shape)}."
-            )
+    output_dtype = (
+        x.dtype
+        if x.dtype in {torch.float32, torch.bfloat16, torch.float16}
+        else torch.bfloat16
+    )
+    block_size = tuple(int(value) for value in block_size)
+    _validate_fp8_weight_and_scale(weight, weight_scale_inv, block_size)
+    block_rows, block_cols = block_size
+    original_shape = x.shape[:-1]
+    x_2d = x.reshape(-1, x.shape[-1]).contiguous()
+    output = torch.zeros(
+        x_2d.shape[0],
+        weight.shape[0],
+        device=x.device,
+        dtype=torch.float32,
+    )
+    weight_scales = weight_scale_inv.repeat_interleave(block_rows, dim=0)
+    weight_scales = weight_scales[: weight.shape[0]]
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
 
-    def __call__(
-        self,
-        x: torch.Tensor,
-        weight: torch.Tensor,
-        weight_scale_inv: torch.Tensor,
-        bias: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        self.validate_weight_and_scale(weight, weight_scale_inv)
-        if x.device.type != "cuda" or weight.device.type != "cuda":
-            raise RuntimeError("FP8 Linear requires CUDA tensors; CPU fallback is not supported.")
-
-        original_shape = x.shape[:-1]
-        x_2d = x.reshape(-1, x.shape[-1]).contiguous()
-        if x_2d.shape[-1] != weight.shape[-1]:
-            raise RuntimeError(
-                f"FP8 Linear input feature mismatch: input={tuple(x.shape)} weight={tuple(weight.shape)}."
-            )
-
-        out_dtype = x.dtype if x.dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
-        try:
-            from transformers.integrations.finegrained_fp8 import finegrained_fp8_linear
-        except ImportError as exc:
-            raise RuntimeError(
-                "qwen3_5 FP8 requires the optional Qwen3.5 dependencies; "
-                "install them with `pip install -e '.[qwen35]'`."
-            ) from exc
-        _load_transformers_fp8_kernel()
-        output = finegrained_fp8_linear(
-            x_2d,
-            weight,
-            weight_scale_inv,
-            block_size=self.block_size,
-            bias=bias,
-            output_dtype=out_dtype,
+    for block_index, column_start in enumerate(
+        range(0, weight.shape[1], block_cols)
+    ):
+        column_end = min(column_start + block_cols, weight.shape[1])
+        x_block = x_2d[:, column_start:column_end].float()
+        x_scale = (x_block.abs().amax(dim=-1) / fp8_max).clamp_min(1.0e-12)
+        x_quantized = (x_block / x_scale[:, None]).to(torch.float8_e4m3fn)
+        block_product = F.linear(
+            x_quantized.float(),
+            weight[:, column_start:column_end].float(),
         )
-        return output.reshape(*original_shape, weight.shape[0])
+        block_product.mul_(x_scale[:, None])
+        block_product.mul_(weight_scales[:, block_index][None, :])
+        output.add_(block_product)
+
+    output = output.to(output_dtype)
+    if bias is not None:
+        output.add_(bias)
+    return output.reshape(*original_shape, weight.shape[0])

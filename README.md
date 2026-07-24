@@ -75,21 +75,61 @@ The full documentation index is maintained in [docs/README.md](docs/README.md).
 ## Quick Start
 
 Sparse-vLLM requires Python 3.10 or newer. Install the package from the
-repository root using the runtime versions pinned in `pyproject.toml`:
+repository root using the runtime versions pinned in `pyproject.toml`.
+
+### Conda
 
 ```bash
 conda create -n svllm python=3.10 -y
 conda activate svllm
-pip install torch==2.8.0 transformers[torch]==5.13.1 triton==3.4.0 torchvision==0.23.0 accelerate deepspeed==0.15.4 datasets==4.1.0 bitsandbytes
-pip install fire matplotlib seaborn wandb loguru ansible
-MAX_JOBS=8 pip install flash-attn --no-build-isolation
+
+pip install torch==2.11.0 torchvision==0.26.0 triton==3.6.0 \
+  --index-url https://download.pytorch.org/whl/cu130
+
+# FlashInfer publishes the CUDA-specific JIT cache on a separate index.
+pip install "flashinfer-jit-cache>=0.6.15" \
+  --index-url https://flashinfer.ai/whl/cu130
+
 pip install -e .
+
+# Optional
+MAX_JOBS=8 pip install flash-attn --no-build-isolation
+pip install flashinfer-cubin --index-url https://flashinfer.ai/whl
 ```
 
-Qwen3.5/Qwen3.6 FP8 mixed-attention inference additionally requires the
-CUDA-specific optional dependencies:
+PyTorch wheels include their CUDA runtime, while compiled extensions such as
+`flash-attn` use the CUDA toolchain active in the environment.
+
+### uv
 
 ```bash
+uv venv --python 3.10
+source .venv/bin/activate
+
+uv pip install torch==2.11.0 torchvision==0.26.0 triton==3.6.0 \
+  --index-url https://download.pytorch.org/whl/cu130
+uv pip install "flashinfer-jit-cache>=0.6.15" \
+  --index-url https://flashinfer.ai/whl/cu130
+
+uv pip install -e .
+
+# Optional
+MAX_JOBS=8 uv pip install flash-attn --no-build-isolation
+uv pip install flashinfer-cubin --index-url https://flashinfer.ai/whl
+```
+
+The explicit indexes select the CUDA 13.0 builds of PyTorch and the FlashInfer
+JIT cache.
+
+
+Qwen3.5/Qwen3.6 FP8 mixed-attention inference additionally requires the
+optional Python dependencies:
+
+```bash
+# uv
+uv pip install -e ".[qwen35]"
+
+# Conda/pip
 pip install -e ".[qwen35]"
 ```
 
@@ -99,6 +139,13 @@ the smaller CUDA-specific extra:
 ```bash
 pip install -e ".[prefix-offload]"
 ```
+
+Sparse-vLLM currently supports Qwen3.5/Qwen3.6 checkpoints only in the
+block-scaled FP8 format.
+
+The Qwen3.5/Qwen3.6 prefill causal Conv1D and decode Conv1D/GDN packing paths
+use repository-local Triton kernels; `sglang-kernel` and a local CUDA extension
+build are not required.
 
 For the full dependency list and a minimal `LLM(...)` example, see
 [Getting Started](docs/getting_started/README.md).

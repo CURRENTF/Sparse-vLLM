@@ -1,8 +1,15 @@
 from __future__ import annotations
 
+from functools import lru_cache
+
 import torch
 
-from sparsevllm.platforms.interface import AllocatorStats, Platform, PlatformEnum
+from sparsevllm.platforms.interface import (
+    AllocatorStats,
+    DeviceCaps,
+    Platform,
+    PlatformEnum,
+)
 
 
 class CudaPlatform(Platform):
@@ -54,20 +61,25 @@ class CudaPlatform(Platform):
     def barrier_device_ids(self, rank: int) -> list[int] | None:
         return [int(rank)]
 
-    def supports_graph_capture(self) -> bool:
-        return True
-
-    def supports_torch_compile(self) -> bool:
-        return True
-
-    def supports_triton(self) -> bool:
-        return True
-
-    def supports_pin_memory(self) -> bool:
-        return True
-
-    def supports_bfloat16(self) -> bool:
-        return True
+    @lru_cache(maxsize=None)
+    def get_device_caps(self, device_index: int = 0) -> DeviceCaps:
+        device_index = int(device_index)
+        major, minor = torch.cuda.get_device_capability(device_index)
+        return DeviceCaps(
+            platform=self.enum,
+            device_type=self.device_type,
+            device_index=device_index,
+            device_name=str(torch.cuda.get_device_name(device_index)),
+            compute_capability=(int(major), int(minor)),
+            runtime_version=torch.version.cuda,
+            supports_graph_capture=True,
+            supports_torch_compile=True,
+            supports_triton=True,
+            supports_pin_memory=True,
+            supports_bfloat16=(int(major), int(minor)) >= (8, 0),
+            # Ada (SM89), Hopper and Blackwell provide native FP8 tensor cores.
+            supports_native_fp8=(int(major), int(minor)) >= (8, 9),
+        )
 
     def get_default_attention_backend(self) -> str:
         return "cuda_triton"
