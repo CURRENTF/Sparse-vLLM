@@ -9,8 +9,11 @@ evidence, cite the original run artifact path.
 The README contains the current install command. The expected baseline is:
 
 - Python 3.10.
-- PyTorch 2.8.0.
-- `transformers[torch]==4.53.3`.
+- PyTorch 2.11.0 with the CUDA 13.0 wheel.
+- Triton 3.6.0 and torchvision 0.26.0.
+- `flashinfer-jit-cache>=0.6.14` installed from the matching FlashInfer CUDA
+  wheel index.
+- `transformers[torch]==5.13.1`.
 - `flash-attn` installed with `MAX_JOBS=8 pip install flash-attn --no-build-isolation`.
 - Editable install from the repository root with `pip install -e .`.
 - Qwen3.5/Qwen3.6 FP8 runs install the CUDA-specific extra with

@@ -3,21 +3,54 @@
 This page covers environment setup, checkpoint download, and a minimal
 Sparse-vLLM usage example.
 
-## Install
+
+## Install with Conda
 
 ```bash
 conda create -n svllm python=3.10 -y
 conda activate svllm
-pip install torch==2.8.0 transformers[torch]==4.53.3 accelerate deepspeed==0.15.4 torchvision datasets==4.1.0 bitsandbytes
-pip install fire matplotlib seaborn wandb loguru ansible
-MAX_JOBS=8 pip install flash-attn --no-build-isolation
+
+pip install torch==2.11.0 torchvision==0.26.0 triton==3.6.0 \
+  --index-url https://download.pytorch.org/whl/cu130
+
+# FlashInfer publishes the CUDA-specific JIT cache on a separate index.
+pip install "flashinfer-jit-cache>=0.6.14" \
+  --index-url https://flashinfer.ai/whl/cu130
+
 pip install -e .
+
+# Optional
+MAX_JOBS=8 pip install flash-attn --no-build-isolation
 ```
+
+## Install with uv
+
+The project uses the CUDA 13.0 build:
+
+```bash
+uv venv --python 3.12
+source .venv/bin/activate
+
+uv pip install torch==2.11.0 torchvision==0.26.0 triton==3.6.0 \
+  --index-url https://download.pytorch.org/whl/cu130
+uv pip install "flashinfer-jit-cache>=0.6.14" \
+  --index-url https://flashinfer.ai/whl/cu130
+
+uv pip install -e .
+
+# Optional
+MAX_JOBS=8 uv pip install flash-attn --no-build-isolation
+```
+
 
 For Qwen3.5/Qwen3.6 FP8 mixed-attention inference, install the CUDA-specific
 optional dependencies as well:
 
 ```bash
+# uv
+uv pip install -e ".[qwen35]"
+
+# Conda/pip
 pip install -e ".[qwen35]"
 ```
 
