@@ -1347,19 +1347,6 @@ async def run_request(
                     f"actual={actual_prefix_matched_tokens}, "
                     f"block_size={prefix_cache_block_size}."
                 )
-            elif (
-                block_aligned_expected_reusable_prefix_tokens > 0
-                and actual_prefix_matched_tokens == 0
-            ):
-                status = "metric_failed"
-                error = (
-                    "Main-agent prefix reuse was expected but the selected "
-                    "worker reported zero matched tokens: "
-                    f"raw_expected={expected_reusable_prefix_tokens}, "
-                    "block_aligned_expected="
-                    f"{block_aligned_expected_reusable_prefix_tokens}, "
-                    f"block_size={prefix_cache_block_size}."
-                )
         if status == "success":
             actual_prompt = usage["prompt_tokens"]
             actual_completion = usage["completion_tokens"]
@@ -2350,28 +2337,6 @@ async def _run_one_job(
         records.append(final_result)
         _require_success([final_result], f"Job {job_index} final main agent")
 
-        if config.require_router and not any(
-            record["status"] == "success"
-            and record["phase"] != "subagent"
-            and int(
-                record.get(
-                    "block_aligned_expected_reusable_prefix_tokens"
-                )
-                or 0
-            )
-            > 0
-            and int(record.get("actual_prefix_matched_tokens") or 0) > 0
-            for record in records
-        ):
-            raise BenchmarkFailed(
-                "metric_failed",
-                f"Job {job_index} completed without a verified main-agent "
-                "prefix-cache hit; no main-agent record had both positive "
-                "block-aligned expected reuse and positive actual matched "
-                "tokens. Keep reusable main prompts on a prefix-cache "
-                "worker or inspect routing and cache state."
-            )
-
         distinct_workers = {
             str(record["route_worker"])
             for record in records
@@ -2511,6 +2476,34 @@ async def _run_benchmark_impl(
                 )
             else:
                 if config.require_router:
+                    if not any(
+                        record["status"] == "success"
+                        and record["phase"] != "subagent"
+                        and int(
+                            record.get(
+                                "block_aligned_expected_reusable_prefix_tokens"
+                            )
+                            or 0
+                        )
+                        > 0
+                        and int(
+                            record.get(
+                                "actual_prefix_matched_tokens"
+                            )
+                            or 0
+                        )
+                        > 0
+                        for record in records
+                    ):
+                        raise BenchmarkFailed(
+                            "metric_failed",
+                            "Run completed without a verified main-agent "
+                            "prefix-cache hit; no main-agent record had "
+                            "both positive block-aligned expected reuse "
+                            "and positive actual matched tokens. Keep "
+                            "reusable main prompts on a prefix-cache "
+                            "worker or inspect routing and cache state.",
+                        )
                     distinct_workers = {
                         str(record["route_worker"])
                         for record in records

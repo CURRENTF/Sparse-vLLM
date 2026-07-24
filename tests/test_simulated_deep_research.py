@@ -38,6 +38,7 @@ class FakeService:
         fail_sample_number=None,
         wrong_subagent_method=False,
         zero_main_prefix_match=False,
+        miss_first_reusable_main_prefix=False,
         partial_main_prefix_match=False,
         invalid_prefix_match_header=False,
         contaminate_first_main_prefix_match=False,
@@ -49,6 +50,9 @@ class FakeService:
         self.fail_sample_number = fail_sample_number
         self.wrong_subagent_method = wrong_subagent_method
         self.zero_main_prefix_match = zero_main_prefix_match
+        self.miss_first_reusable_main_prefix = (
+            miss_first_reusable_main_prefix
+        )
         self.partial_main_prefix_match = partial_main_prefix_match
         self.invalid_prefix_match_header = invalid_prefix_match_header
         self.contaminate_first_main_prefix_match = (
@@ -164,6 +168,12 @@ class FakeService:
                 self.previous_main_prompts.append(prompt)
                 if self.zero_main_prefix_match:
                     matched_tokens = 0
+                elif (
+                    self.miss_first_reusable_main_prefix
+                    and matched_tokens > 0
+                ):
+                    matched_tokens = 0
+                    self.miss_first_reusable_main_prefix = False
                 elif (
                     self.partial_main_prefix_match
                     and matched_tokens > self.prefix_cache_block_size
@@ -1250,7 +1260,33 @@ class SimulatedDeepResearchTest(unittest.TestCase):
         self.assertEqual(aligned, 4)
         self.assertEqual(prior_count, 1)
 
-    def test_zero_actual_hit_for_expected_prefix_is_metric_failure(self):
+    def test_single_evicted_expected_prefix_is_recorded_without_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "run"
+            config = self._config(output_dir)
+            service = FakeService(
+                miss_first_reusable_main_prefix=True,
+            )
+
+            aggregate = asyncio.run(
+                run.run_benchmark(
+                    config,
+                    get_fn=service.get,
+                    post_fn=service.post,
+                )
+            )
+
+            self.assertEqual(aggregate["status"], "success")
+            self.assertEqual(
+                aggregate["prefix_cache"]["unexpected_zero_hit_requests"],
+                1,
+            )
+            self.assertGreater(
+                aggregate["prefix_cache"]["actual_hit_requests"],
+                0,
+            )
+
+    def test_no_actual_hit_for_any_expected_prefix_is_metric_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
             output_dir = Path(tmp) / "run"
             config = self._config(output_dir)
@@ -1258,7 +1294,7 @@ class SimulatedDeepResearchTest(unittest.TestCase):
 
             with self.assertRaisesRegex(
                 run.BenchmarkFailed,
-                "prefix reuse was expected",
+                "without a verified main-agent prefix-cache hit",
             ):
                 asyncio.run(
                     run.run_benchmark(
@@ -1274,21 +1310,16 @@ class SimulatedDeepResearchTest(unittest.TestCase):
                 .read_text(encoding="utf-8")
                 .splitlines()
             ]
-            failed = [row for row in rows if row["status"] == "metric_failed"]
-            self.assertEqual(len(failed), 1)
-            self.assertGreater(
-                failed[0]["expected_reusable_prefix_tokens"],
-                0,
-            )
-            self.assertEqual(failed[0]["actual_prefix_matched_tokens"], 0)
+            self.assertTrue(all(row["status"] == "success" for row in rows))
             aggregate = json.loads(
                 (output_dir / "aggregate_metrics.json").read_text(
                     encoding="utf-8"
                 )
             )
-            self.assertEqual(
+            self.assertEqual(aggregate["status"], "metric_failed")
+            self.assertGreater(
                 aggregate["prefix_cache"]["unexpected_zero_hit_requests"],
-                1,
+                0,
             )
 
     def test_partial_actual_prefix_hit_is_recorded_without_failure(self):

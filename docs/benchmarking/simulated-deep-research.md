@@ -215,9 +215,9 @@ rejected. The run writes:
   zero hits, and unexpected excess hits.
 
 Any failed HTTP request, malformed response, token-count mismatch, wrong method
-route, missing route header, invalid matched-token header, expected cacheable
-reuse with zero actual matched tokens, or actual reuse beyond this run's
-expectation remains visible in the artifacts and makes the run fail.
+route, missing route header, invalid matched-token header, or actual reuse
+beyond this run's expectation remains visible in the artifacts and makes the
+run fail.
 
 `expected_reusable_prefix_tokens` is the largest raw common-prefix length
 between the current main-agent prompt and every successful prior main-agent
@@ -230,9 +230,9 @@ materialized portion `floor(prior_length / b) * b`.
 Only the current prompt retains a final token for logits; if a prior prompt
 ends exactly on a block boundary, that final complete block was materialized
 and remains reusable. A raw prefix shorter than one block therefore allows an
-actual zero hit. A nonzero partial hit is recorded without failing because
-cache capacity can reduce reuse. Zero actual reuse when the block-aligned
-expectation is nonzero, or actual reuse above that expectation, is
+actual zero hit. Partial and zero hits are recorded without individually
+failing because cache capacity can reduce or eliminate reuse after the prior
+request. Actual reuse above this run's cacheable expectation is
 `metric_failed`.
 
 Before a router run can report success, at least one successful main-agent
