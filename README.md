@@ -87,7 +87,7 @@ pip install torch==2.11.0 torchvision==0.26.0 triton==3.6.0 \
   --index-url https://download.pytorch.org/whl/cu130
 
 # FlashInfer publishes the CUDA-specific JIT cache on a separate index.
-pip install "flashinfer-jit-cache>=0.6.14" \
+pip install "flashinfer-jit-cache>=0.6.15" \
   --index-url https://flashinfer.ai/whl/cu130
 
 pip install -e .
@@ -108,7 +108,7 @@ source .venv/bin/activate
 
 uv pip install torch==2.11.0 torchvision==0.26.0 triton==3.6.0 \
   --index-url https://download.pytorch.org/whl/cu130
-uv pip install "flashinfer-jit-cache>=0.6.14" \
+uv pip install "flashinfer-jit-cache>=0.6.15" \
   --index-url https://flashinfer.ai/whl/cu130
 
 uv pip install -e .

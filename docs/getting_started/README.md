@@ -14,7 +14,7 @@ pip install torch==2.11.0 torchvision==0.26.0 triton==3.6.0 \
   --index-url https://download.pytorch.org/whl/cu130
 
 # FlashInfer publishes the CUDA-specific JIT cache on a separate index.
-pip install "flashinfer-jit-cache>=0.6.14" \
+pip install "flashinfer-jit-cache>=0.6.15" \
   --index-url https://flashinfer.ai/whl/cu130
 
 pip install -e .
@@ -33,7 +33,7 @@ source .venv/bin/activate
 
 uv pip install torch==2.11.0 torchvision==0.26.0 triton==3.6.0 \
   --index-url https://download.pytorch.org/whl/cu130
-uv pip install "flashinfer-jit-cache>=0.6.14" \
+uv pip install "flashinfer-jit-cache>=0.6.15" \
   --index-url https://flashinfer.ai/whl/cu130
 
 uv pip install -e .
@@ -67,14 +67,17 @@ Its prefill causal Conv1D and decode Conv1D/GDN packing paths use local Triton
 kernels. They do not require `sglang-kernel` or a repository CUDA-extension
 build.
 
-Install both FlashInfer precompiled artifact packages. They are complementary:
-`flashinfer-cubin` provides architecture-specific device binaries, while
-`flashinfer-jit-cache` provides modules built for a specific CUDA toolkit
-version. Select the JIT-cache index matching the CUDA version used by PyTorch:
+The required `flashinfer-jit-cache` package provides modules built for a
+specific CUDA toolkit version. Select the index matching the CUDA version used
+by PyTorch. `flashinfer-cubin` is an optional acceleration package containing
+architecture-specific device binaries:
 
 ```bash
+pip install "flashinfer-jit-cache>=0.6.15" \
+  --index-url https://flashinfer.ai/whl/cu130
+
+# Optional
 pip install flashinfer-cubin --index-url https://flashinfer.ai/whl
-pip install flashinfer-jit-cache --index-url https://flashinfer.ai/whl/cu130
 ```
 
 Block-scaled FP8 Linear selects an implementation from the local operator

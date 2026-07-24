@@ -75,7 +75,7 @@ pip install torch==2.11.0 torchvision==0.26.0 triton==3.6.0 \
   --index-url https://download.pytorch.org/whl/cu130
 
 # FlashInfer 在单独的索引中发布 CUDA 专用 JIT 缓存。
-pip install "flashinfer-jit-cache>=0.6.14" \
+pip install "flashinfer-jit-cache>=0.6.15" \
   --index-url https://flashinfer.ai/whl/cu130
 
 pip install -e .
@@ -95,7 +95,7 @@ uv venv --python 3.10
 source .venv/bin/activate
 uv pip install torch==2.11.0 torchvision==0.26.0 triton==3.6.0 \
   --index-url https://download.pytorch.org/whl/cu130
-uv pip install "flashinfer-jit-cache>=0.6.14" \
+uv pip install "flashinfer-jit-cache>=0.6.15" \
   --index-url https://flashinfer.ai/whl/cu130
 
 uv pip install -e .

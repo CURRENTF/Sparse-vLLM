@@ -11,9 +11,10 @@ The README contains the current install command. The expected baseline is:
 - Python 3.10.
 - PyTorch 2.11.0 with the CUDA 13.0 wheel.
 - Triton 3.6.0 and torchvision 0.26.0.
-- `flashinfer-cubin>=0.6.14` installed from the generic FlashInfer wheel index.
-- `flashinfer-jit-cache>=0.6.14` installed from the FlashInfer wheel index that
+- `flashinfer-jit-cache>=0.6.15` installed from the FlashInfer wheel index that
   matches `torch.version.cuda`.
+- Optional matching `flashinfer-cubin` installed from the generic FlashInfer
+  wheel index when precompiled device binaries are desired.
 - `transformers[torch]==5.13.1`.
 - `flash-attn` installed with `MAX_JOBS=8 pip install flash-attn --no-build-isolation`.
 - Editable install from the repository root with `pip install -e .`.
