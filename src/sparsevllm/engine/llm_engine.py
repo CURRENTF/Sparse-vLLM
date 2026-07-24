@@ -566,6 +566,7 @@ class LLMEngine:
         config = self.config
         benchmark_config_keys = (
             "gpu_memory_utilization",
+            "enforce_eager",
             "num_kvcache_slots",
             "max_num_batched_tokens",
             "prefill_schedule_policy",
