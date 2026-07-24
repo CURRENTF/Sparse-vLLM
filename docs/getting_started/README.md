@@ -43,8 +43,8 @@ MAX_JOBS=8 uv pip install flash-attn --no-build-isolation
 ```
 
 
-For Qwen3.5/Qwen3.6 FP8 mixed-attention inference, install the CUDA-specific
-optional dependencies as well:
+For Qwen3.5/Qwen3.6 FP8 mixed-attention inference, install the optional Python
+dependencies as well:
 
 ```bash
 # uv
@@ -59,6 +59,13 @@ For prefix-cache offload with vanilla, OmniKV, or QuEST only:
 ```bash
 pip install -e ".[prefix-offload]"
 ```
+
+Sparse-vLLM currently supports Qwen3.5/Qwen3.6 checkpoints only in the
+block-scaled FP8 format.
+
+Its prefill causal Conv1D and decode Conv1D/GDN packing paths use local Triton
+kernels. They do not require `sglang-kernel` or a repository CUDA-extension
+build.
 
 Install both FlashInfer precompiled artifact packages. They are complementary:
 `flashinfer-cubin` provides architecture-specific device binaries, while

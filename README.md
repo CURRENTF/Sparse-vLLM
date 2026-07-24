@@ -123,7 +123,7 @@ JIT cache.
 
 
 Qwen3.5/Qwen3.6 FP8 mixed-attention inference additionally requires the
-CUDA-specific optional dependencies:
+optional Python dependencies:
 
 ```bash
 # uv
@@ -139,6 +139,13 @@ the smaller CUDA-specific extra:
 ```bash
 pip install -e ".[prefix-offload]"
 ```
+
+Sparse-vLLM currently supports Qwen3.5/Qwen3.6 checkpoints only in the
+block-scaled FP8 format.
+
+The Qwen3.5/Qwen3.6 prefill causal Conv1D and decode Conv1D/GDN packing paths
+use repository-local Triton kernels; `sglang-kernel` and a local CUDA extension
+build are not required.
 
 For the full dependency list and a minimal `LLM(...)` example, see
 [Getting Started](docs/getting_started/README.md).

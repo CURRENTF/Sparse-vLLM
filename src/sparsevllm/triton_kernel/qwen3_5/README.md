@@ -12,6 +12,9 @@ kernel code.
 
 Sparse-vLLM vendors these files so the Qwen3.5/Qwen3.6 mixed runtime can be
 customized locally without depending on a matching LightLLM package install.
+The varlen prefill causal Conv1D is a scoped local Triton implementation adapted
+from SGLang; decode continues to use the local fused Conv1D/GDN packing kernel.
+Neither path requires `sglang-kernel` or a CUDA-extension build.
 
-Install their CUDA-specific runtime dependencies with
+Install the remaining optional runtime dependencies with
 `pip install -e ".[qwen35]"`.
