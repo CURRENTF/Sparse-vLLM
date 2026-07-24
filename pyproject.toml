@@ -14,10 +14,10 @@ authors = [
 ]
 dependencies = [
     "fire",
-    "torch==2.8.0",
+    "torch==2.11.0",
     "transformers==5.13.1",
-    "triton==3.4.0",
-    "torchvision==0.23.0",
+    "triton==3.6.0",
+    "torchvision==0.26.0",
     "pillow",
     "accelerate",
     "deepspeed",
