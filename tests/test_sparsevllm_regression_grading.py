@@ -65,7 +65,6 @@ class FakeCacheManager(CacheManager):
             max_model_len=10,
             max_num_seqs_in_gpu=2,
             max_num_seqs_in_batch=2,
-            max_num_seqs_in_gpu=2,
             num_kvcache_slots=16,
         )
         super().__init__(config, _single_process_parallel_context())
