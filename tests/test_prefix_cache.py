@@ -1713,6 +1713,39 @@ def test_standard_capacity_skips_prefix_scan_with_physical_step_headroom():
         assert freeable_block_ids.call_count == 0
 
 
+def test_standard_decode_uses_evictable_leaf_headroom_without_tree_scan():
+    manager = _make_standard_manager_for_prefix(block_size=2)
+    manager.config.max_num_seqs_in_batch = 4
+    manager._num_free_slots = 0
+    for token_ids in ([1, 2], [3, 4]):
+        stable_block_id = manager.prefix_cache.stable_block_id(
+            token_ids,
+            None,
+        )
+        manager.prefix_cache.insert_block(
+            PrefixCacheBlock(
+                stable_block_id=stable_block_id,
+                parent_block_id=None,
+                block_size=2,
+                logical_block_idx=0,
+                payload=StandardPrefixBlockPayload(
+                    token_slots=torch.tensor(
+                        token_ids,
+                        dtype=torch.int32,
+                    )
+                ),
+                token_ids=tuple(token_ids),
+            )
+        )
+
+    with patch.object(
+        manager.prefix_cache,
+        "freeable_block_ids",
+        side_effect=AssertionError("full radix scan should be skipped"),
+    ):
+        assert manager.decode_step_free_slots() == 4
+
+
 def test_standard_admission_counts_inflight_d2h_before_pressure_prompt():
     manager = _make_standard_manager_for_prefix(block_size=2)
     manager._num_free_slots = 1

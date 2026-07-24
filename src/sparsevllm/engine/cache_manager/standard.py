@@ -358,6 +358,17 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
         )
         return int(reclaimable_blocks * self.prefix_cache_block_size)
 
+    def _prefix_immediately_evictable_slots(self) -> int:
+        if (
+            getattr(self, "prefix_cache", None) is None
+            or self._prefix_offload_enabled()
+        ):
+            return 0
+        return int(
+            self.prefix_cache.evictable_blocks()
+            * self.prefix_cache_block_size
+        )
+
     def prefill_step_free_slots(self) -> int:
         physical_free = int(self.num_free_slots)
         max_step_tokens = int(
@@ -374,6 +385,12 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
         )
         if max_step_seqs > 0 and physical_free >= max_step_seqs:
             return physical_free
+        immediately_evictable = self._prefix_immediately_evictable_slots()
+        if (
+            max_step_seqs > 0
+            and physical_free + immediately_evictable >= max_step_seqs
+        ):
+            return int(physical_free + immediately_evictable)
         return int(self.num_free_slots + self._prefix_step_reclaimable_slots())
 
     def prompt_admission_free_slots(self) -> int:
