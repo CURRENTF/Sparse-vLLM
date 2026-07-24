@@ -25,6 +25,9 @@ The README contains the current install command. The expected baseline is:
 - Record the selected operator provider and CUDA compute capability. FP8
   providers are selected locally from device capabilities and do not download
   Hub kernels during warmup.
+- RMSNorm defaults to `SPARSEVLLM_RMSNORM_PROVIDER=auto`, which prefers
+  FlashInfer when installed. Set the variable to `triton` to force the local
+  Triton kernel, or to `flashinfer` to require FlashInfer explicitly.
 
 Record CUDA version, GPU type/count, visible GPU ids, branch, commit, and any
 relevant uncommitted changes with every reported benchmark.

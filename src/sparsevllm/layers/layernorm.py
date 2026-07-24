@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from functools import lru_cache
 from importlib import import_module
@@ -94,9 +95,20 @@ def _load_triton_ops(*, zero_centered_weight: bool) -> _RMSNormOps:
     )
 
 
-@lru_cache(maxsize=2)
-def _resolve_rmsnorm_ops(*, zero_centered_weight: bool) -> _RMSNormOps:
-    if find_spec("flashinfer") is not None:
+@lru_cache(maxsize=6)
+def _resolve_rmsnorm_ops(
+    *,
+    zero_centered_weight: bool,
+    provider: str = "auto",
+) -> _RMSNormOps:
+    if provider not in {"auto", "flashinfer", "triton"}:
+        raise ValueError(
+            "SPARSEVLLM_RMSNORM_PROVIDER must be one of "
+            f"'auto', 'flashinfer', or 'triton', got {provider!r}."
+        )
+    if provider == "triton":
+        return _load_triton_ops(zero_centered_weight=zero_centered_weight)
+    if provider == "flashinfer" or find_spec("flashinfer") is not None:
         return _load_flashinfer_ops(
             zero_centered_weight=zero_centered_weight,
         )
@@ -116,8 +128,13 @@ class RMSNorm(nn.Module):
         super().__init__()
         self.eps = float(eps)
         self.weight = nn.Parameter(torch.ones(hidden_size))
+        provider = os.environ.get(
+            "SPARSEVLLM_RMSNORM_PROVIDER",
+            "auto",
+        ).strip().lower()
         self._ops = _resolve_rmsnorm_ops(
             zero_centered_weight=self.zero_centered_weight,
+            provider=provider,
         )
 
     @property
