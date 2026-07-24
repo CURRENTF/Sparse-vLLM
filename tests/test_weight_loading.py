@@ -1,3 +1,4 @@
+import os
 import threading
 
 import pytest
@@ -74,6 +75,32 @@ def _write_two_shards(path):
     save_file({"left.weight": left}, path / "model-00001-of-00002.safetensors")
     save_file({"right.weight": right}, path / "model-00002-of-00002.safetensors")
     return left, right
+
+
+@pytest.mark.parametrize(
+    ("checkpoint_bytes", "expected_workers"),
+    (
+        (0, 1),
+        ((8 << 30) - 1, 1),
+        (8 << 30, 4),
+        ((32 << 30) - 1, 4),
+        (32 << 30, 8),
+        ((128 << 30) - 1, 8),
+        (128 << 30, 16),
+    ),
+)
+def test_auto_weight_loading_worker_budget_tiers(
+    tmp_path, checkpoint_bytes, expected_workers
+):
+    checkpoint = tmp_path / "model.safetensors"
+    checkpoint.touch()
+    os.truncate(checkpoint, checkpoint_bytes)
+
+    resolved = loader.resolve_weight_loading_workers(
+        "auto", model_path=str(tmp_path), world_size=1
+    )
+
+    assert resolved == (expected_workers, checkpoint_bytes)
 
 
 def test_load_model_prefetches_shards_in_parallel(tmp_path, monkeypatch, capsys):

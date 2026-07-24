@@ -182,7 +182,11 @@ def test_ep_broadcast_rejects_invalid_source_rank():
 
 def test_qwen3_moe_parallel_config_validation(tmp_path):
     with patch("sparsevllm.config.AutoConfig.from_pretrained", return_value=_hf_config()):
-        config = Config(model=str(tmp_path), expert_parallel_size=4)
+        config = Config(
+            model=str(tmp_path),
+            expert_parallel_size=4,
+            weight_loading_workers=8,
+        )
     assert config.world_size == 4
     assert config.weight_loading_workers_per_rank == 2
 
@@ -205,6 +209,39 @@ def test_qwen3_moe_parallel_config_validation(tmp_path):
     with patch("sparsevllm.config.AutoConfig.from_pretrained", return_value=invalid_dtype):
         with pytest.raises(NotImplementedError, match="BF16/FP16 checkpoints"):
             Config(model=str(tmp_path))
+
+
+def test_weight_loading_workers_auto_uses_checkpoint_size_and_world_floor(tmp_path):
+    checkpoint = tmp_path / "model.safetensors"
+    checkpoint.write_bytes(b"test")
+    with patch("sparsevllm.config.AutoConfig.from_pretrained", return_value=_hf_config()):
+        config = Config(model=str(tmp_path), expert_parallel_size=4)
+
+    assert config.weight_loading_workers == 4
+    assert config.weight_loading_workers_per_rank == 1
+    assert config.weight_loading_workers_auto is True
+    assert config.weight_loading_checkpoint_bytes == 4
+
+
+def test_weight_loading_workers_explicit_override_skips_auto(tmp_path):
+    with patch("sparsevllm.config.AutoConfig.from_pretrained", return_value=_hf_config()):
+        config = Config(
+            model=str(tmp_path),
+            expert_parallel_size=4,
+            weight_loading_workers="12",
+        )
+
+    assert config.weight_loading_workers == 12
+    assert config.weight_loading_workers_per_rank == 3
+    assert config.weight_loading_workers_auto is False
+    assert config.weight_loading_checkpoint_bytes is None
+
+
+@pytest.mark.parametrize("configured", (0, -1, False, "fast"))
+def test_weight_loading_workers_rejects_invalid_values(tmp_path, configured):
+    with patch("sparsevllm.config.AutoConfig.from_pretrained", return_value=_hf_config()):
+        with pytest.raises(ValueError, match="'auto' or a positive integer"):
+            Config(model=str(tmp_path), weight_loading_workers=configured)
 
 
 def test_qwen3_moe_fp8_config_validation(tmp_path):

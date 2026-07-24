@@ -23,6 +23,7 @@ from sparsevllm.method_registry import (
     validate_model_runtime_compatibility,
 )
 from sparsevllm.engine.prefix_cache import resolve_prefix_cache_block_size
+from sparsevllm.utils.loader import resolve_weight_loading_workers
 from sparsevllm.utils.log import logger, log_once
 
 try:
@@ -731,8 +732,10 @@ class Config:
     tensor_parallel_size: int = 1
     expert_parallel_size: int = 1
     data_parallel_size: int = 1
-    # Total host-side I/O worker budget shared by all distributed ranks.
-    weight_loading_workers: int = 8
+    # Soft host-side I/O concurrency budget shared across ranks. "auto"
+    # selects by checkpoint size; every rank retains one synchronous loader.
+    weight_loading_workers: int | str | None = "auto"
+    weight_loading_checkpoint_bytes: int | None = field(default=None, init=False)
     enforce_eager: bool = True
     hf_config: Union[Qwen3Config, AutoConfig] | None = None
     outer_hf_config: Any | None = None
@@ -907,6 +910,10 @@ class Config:
     @property
     def weight_loading_workers_per_rank(self) -> int:
         return max(1, self.weight_loading_workers // self.world_size)
+
+    @property
+    def weight_loading_workers_auto(self) -> bool:
+        return self.weight_loading_checkpoint_bytes is not None
 
     def _normalize_platform_aliases(self):
         if self.device_memory_utilization is not None:
@@ -1242,7 +1249,6 @@ class Config:
         self.tensor_parallel_size = int(self.tensor_parallel_size)
         self.expert_parallel_size = int(self.expert_parallel_size)
         self.data_parallel_size = int(self.data_parallel_size)
-        self.weight_loading_workers = int(self.weight_loading_workers)
         if not 1 <= self.tensor_parallel_size <= 8:
             raise ValueError(f"tensor_parallel_size must be in [1, 8], got {self.tensor_parallel_size}.")
         if self.expert_parallel_size <= 0:
@@ -1253,11 +1259,11 @@ class Config:
             raise ValueError(
                 f"data_parallel_size must be positive, got {self.data_parallel_size}."
             )
-        if self.weight_loading_workers <= 0:
-            raise ValueError(
-                "weight_loading_workers must be positive, "
-                f"got {self.weight_loading_workers}."
-            )
+        self.weight_loading_workers, self.weight_loading_checkpoint_bytes = resolve_weight_loading_workers(
+            self.weight_loading_workers,
+            model_path=self.model,
+            world_size=self.world_size,
+        )
         self._normalize_platform_aliases()
         if legacy_deltakv_graph_method:
             self.decode_cuda_graph = True

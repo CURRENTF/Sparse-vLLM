@@ -9,6 +9,9 @@ def test_resolved_engine_config_records_backend_and_jsonable_values():
             vllm_sparse_method="deltakv",
             prefill_schedule_policy="long_bs1full_short_batch",
             chunk_prefill_size=4096,
+            weight_loading_workers=8,
+            weight_loading_workers_auto=True,
+            weight_loading_checkpoint_bytes=64 << 30,
             decode_cuda_graph=True,
             decode_cuda_graph_capture_sampling=False,
             deltakv_sparse_decode_backend="fa2",
@@ -26,5 +29,8 @@ def test_resolved_engine_config_records_backend_and_jsonable_values():
     resolved = _resolved_engine_config(llm)
 
     assert resolved["deltakv_sparse_decode_backend"] == "fa2"
+    assert resolved["weight_loading_workers"] == 8
+    assert resolved["weight_loading_workers_auto"] is True
+    assert resolved["weight_loading_checkpoint_bytes"] == 64 << 30
     assert resolved["full_attn_layers"] == [0, 1, 2, 8]
     assert resolved["obs_layer_ids"] == [2, 8]
