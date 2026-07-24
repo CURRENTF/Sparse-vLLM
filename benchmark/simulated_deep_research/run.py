@@ -61,6 +61,8 @@ class BenchmarkConfig:
     base_url: str
     model: str
     output_dir: Path
+    num_jobs: int = 1
+    job_concurrency: int = 1
     rounds: int = 10
     articles_per_round: int = 20
     article_token_buckets: tuple[tuple[int, int, int], ...] = (
@@ -78,6 +80,8 @@ class BenchmarkConfig:
     max_final_output_tokens: int = 2_000
     subagent_methods: tuple[str, ...] = ("snapkv",)
     main_agent_methods: tuple[str, ...] = ("omnikv", "vanilla")
+    subagent_required_tags: tuple[str, ...] = ()
+    main_agent_required_tags: tuple[str, ...] = ()
     synthetic_token_id_low: int = 100
     synthetic_token_id_high: int = 255
     request_timeout_s: float = 930.0
@@ -90,6 +94,7 @@ class BenchmarkConfig:
 @dataclass(frozen=True)
 class RequestSpec:
     sample_id: str
+    job_index: int
     phase: str
     round_index: int | None
     request_index: int | None
@@ -97,6 +102,7 @@ class RequestSpec:
     completion_tokens: int
     prompt_seed: int
     method_preferences: tuple[str, ...]
+    required_tags: tuple[str, ...] = ()
     article_tokens: int | None = None
     prompt_token_ids: tuple[int, ...] | None = None
 
@@ -129,7 +135,13 @@ class ArtifactWriter:
 
     def __enter__(self) -> ArtifactWriter:
         self.output_dir.mkdir(parents=True, exist_ok=False)
-        for name in ("raw_outputs", "parsed_outputs", "per_sample_results", "round_metrics"):
+        for name in (
+            "raw_outputs",
+            "parsed_outputs",
+            "per_sample_results",
+            "round_metrics",
+            "job_metrics",
+        ):
             self._handles[name] = (self.output_dir / f"{name}.jsonl").open(
                 "w",
                 encoding="utf-8",
@@ -167,6 +179,13 @@ def _parse_methods(value: str, flag: str) -> tuple[str, ...]:
     if not methods:
         raise ValueError(f"{flag} must contain at least one method.")
     return methods
+
+
+def _parse_tags(value: str, flag: str) -> tuple[str, ...]:
+    tags = tuple(item.strip() for item in value.split(",") if item.strip())
+    if len(tags) != len(set(tags)):
+        raise ValueError(f"{flag} must not contain duplicate tags.")
+    return tags
 
 
 def _parse_token_buckets(
@@ -238,6 +257,8 @@ def validate_config(config: BenchmarkConfig) -> None:
     if not config.model:
         raise ValueError("--model must not be empty.")
     for name in (
+        "num_jobs",
+        "job_concurrency",
         "rounds",
         "articles_per_round",
         "query_tokens",
@@ -251,6 +272,11 @@ def validate_config(config: BenchmarkConfig) -> None:
     ):
         if int(getattr(config, name)) <= 0:
             raise ValueError(f"{name} must be positive.")
+    if config.job_concurrency > config.num_jobs:
+        raise ValueError(
+            "job_concurrency must not exceed num_jobs: "
+            f"{config.job_concurrency} > {config.num_jobs}."
+        )
     _validate_token_buckets(
         "article_token_buckets",
         config.article_token_buckets,
@@ -280,12 +306,28 @@ def validate_config(config: BenchmarkConfig) -> None:
         raise ValueError("router_timeout_margin_s must be positive.")
     subagent_methods = {_canonical_method(item) for item in config.subagent_methods}
     main_agent_methods = {_canonical_method(item) for item in config.main_agent_methods}
+    for name, tags in (
+        ("subagent_required_tags", config.subagent_required_tags),
+        ("main_agent_required_tags", config.main_agent_required_tags),
+    ):
+        if any(not isinstance(tag, str) or not tag.strip() for tag in tags):
+            raise ValueError(f"{name} must contain non-empty strings.")
+        if len(tags) != len(set(tags)):
+            raise ValueError(f"{name} must not contain duplicate tags.")
     overlap = sorted(subagent_methods & main_agent_methods)
     if config.require_router and overlap:
-        raise ValueError(
-            "Subagent and main-agent methods must be disjoint for this non-uniform "
-            f"benchmark; overlap={overlap}."
-        )
+        subagent_tags = set(config.subagent_required_tags)
+        main_agent_tags = set(config.main_agent_required_tags)
+        if (
+            not subagent_tags
+            or not main_agent_tags
+            or subagent_tags & main_agent_tags
+        ):
+            raise ValueError(
+                "Overlapping subagent and main-agent methods require non-empty, "
+                "disjoint role tags so the router uses separate workers; "
+                f"overlap={overlap}."
+            )
     if config.require_router and config.min_healthy_workers < 2:
         raise ValueError("Router runs must require at least two healthy workers.")
 
@@ -697,6 +739,16 @@ async def preflight(
                 "Worker info response is missing benchmark_config: "
                 f"worker={worker['url']}."
             )
+        tags = info.get("tags", [])
+        if (
+            not isinstance(tags, list)
+            or not all(isinstance(tag, str) and tag for tag in tags)
+        ):
+            raise PreflightParseError(
+                "Worker info response must contain a list of non-empty string "
+                f"tags: worker={worker['url']}."
+            )
+        info["tags"] = tags
         max_worker_len = info.get("max_model_len")
         if (
             isinstance(max_worker_len, bool)
@@ -741,26 +793,44 @@ async def preflight(
                 for worker in workers
             }
         )
-        for role, preferences in (
-            ("subagent", config.subagent_methods),
-            ("main agent", config.main_agent_methods),
+        eligible_worker_urls_by_role: dict[str, set[str]] = {}
+        for role, preferences, required_tags in (
+            (
+                "subagent",
+                config.subagent_methods,
+                config.subagent_required_tags,
+            ),
+            (
+                "main agent",
+                config.main_agent_methods,
+                config.main_agent_required_tags,
+            ),
         ):
             preferred_methods = {
                 _canonical_method(method)
                 for method in preferences
             }
+            required_tag_set = set(required_tags)
             eligible_workers = [
                 worker
                 for worker in benchmark_workers
                 if _canonical_method(worker["info"]["sparse_method"])
                 in preferred_methods
+                and required_tag_set.issubset(
+                    set(worker["info"]["tags"])
+                )
             ]
             if not eligible_workers:
                 raise ValueError(
                     f"No healthy worker for model {config.model!r} matches "
-                    f"the configured {role} methods {list(preferences)}; "
+                    f"the configured {role} methods {list(preferences)} and "
+                    f"required tags {list(required_tags)}; "
                     f"advertised methods={advertised_methods}."
                 )
+            eligible_worker_urls_by_role[role] = {
+                str(worker["url"])
+                for worker in eligible_workers
+            }
             required_role_len = required_lens_by_role[role]
             too_short = [
                 {
@@ -861,6 +931,23 @@ async def preflight(
                         "--min-round-summary-tokens, or decrease the worker "
                         "prefix_cache_block_size."
                     )
+        overlapping_methods = {
+            _canonical_method(method)
+            for method in config.subagent_methods
+        } & {
+            _canonical_method(method)
+            for method in config.main_agent_methods
+        }
+        overlapping_role_workers = sorted(
+            eligible_worker_urls_by_role["subagent"]
+            & eligible_worker_urls_by_role["main agent"]
+        )
+        if overlapping_methods and overlapping_role_workers:
+            raise ValueError(
+                "Role tags did not isolate overlapping subagent and main-agent "
+                "methods onto separate workers: "
+                f"workers={overlapping_role_workers}."
+            )
     else:
         worker = workers[0]
         if config.synthetic_token_id_high >= worker["info"]["vocab_size"]:
@@ -936,6 +1023,8 @@ def build_payload(spec: RequestSpec, config: BenchmarkConfig) -> dict[str, Any]:
     }
     if config.require_router:
         payload["svllm_method_preference"] = ",".join(spec.method_preferences)
+        if spec.required_tags:
+            payload["svllm_required_tags"] = list(spec.required_tags)
     return payload
 
 
@@ -1037,10 +1126,12 @@ async def run_request(
         str,
         list[tuple[int, ...]],
     ],
+    timeline_origin: float,
     post_fn=post_json,
 ) -> dict[str, Any]:
     payload = build_payload(spec, config)
     started = time.perf_counter()
+    started_offset_s = started - timeline_origin
     http_status: int | None = None
     response_headers: dict[str, str] = {}
     response_body: Any = None
@@ -1264,7 +1355,9 @@ async def run_request(
         error = f"{type(exc).__name__}: {exc}"
         route = _route_values(response_headers)
 
-    elapsed_s = time.perf_counter() - started
+    finished = time.perf_counter()
+    elapsed_s = finished - started
+    finished_offset_s = finished - timeline_origin
     if status not in VALID_STATUSES:
         raise AssertionError(f"Unexpected request status: {status}")
     if (
@@ -1283,6 +1376,7 @@ async def run_request(
         ).append(spec.prompt_token_ids)
     raw_record = {
         "sample_id": spec.sample_id,
+        "job_index": spec.job_index,
         "status": status,
         "error": error,
         "request": {
@@ -1310,9 +1404,12 @@ async def run_request(
             "actual_prefix_matched_tokens": actual_prefix_matched_tokens,
         },
         "response": response_body,
+        "started_offset_s": started_offset_s,
+        "finished_offset_s": finished_offset_s,
     }
     parsed_record = {
         "sample_id": spec.sample_id,
+        "job_index": spec.job_index,
         "status": status,
         "error": error,
         "text": parsed_text,
@@ -1321,6 +1418,7 @@ async def run_request(
     }
     result = {
         "sample_id": spec.sample_id,
+        "job_index": spec.job_index,
         "phase": spec.phase,
         "round_index": spec.round_index,
         "request_index": spec.request_index,
@@ -1332,6 +1430,8 @@ async def run_request(
         "target_completion_tokens": spec.completion_tokens,
         "actual_completion_tokens": usage.get("completion_tokens"),
         "latency_s": elapsed_s,
+        "started_offset_s": started_offset_s,
+        "finished_offset_s": finished_offset_s,
         "route_worker": route.get("worker"),
         "route_reason": route.get("reason"),
         "route_method": (
@@ -1340,6 +1440,7 @@ async def run_request(
             else None
         ),
         "method_preferences": list(spec.method_preferences),
+        "required_tags": list(spec.required_tags),
         "expected_reusable_prefix_tokens": (
             expected_reusable_prefix_tokens
         ),
@@ -1494,6 +1595,12 @@ def _run_info(
     resolved["output_dir"] = str(config.output_dir)
     resolved["subagent_methods"] = list(config.subagent_methods)
     resolved["main_agent_methods"] = list(config.main_agent_methods)
+    resolved["subagent_required_tags"] = list(
+        config.subagent_required_tags
+    )
+    resolved["main_agent_required_tags"] = list(
+        config.main_agent_required_tags
+    )
     if client_code_state is None:
         client_code_state = {
             "git_commit": _git_value("rev-parse", "HEAD"),
@@ -1606,10 +1713,34 @@ def _prefix_cache_metrics(
     }
 
 
+def _interval_union_duration(
+    records: list[dict[str, Any]],
+) -> float:
+    intervals = sorted(
+        (
+            float(record["started_offset_s"]),
+            float(record["finished_offset_s"]),
+        )
+        for record in records
+    )
+    if not intervals:
+        return 0.0
+    total = 0.0
+    current_start, current_end = intervals[0]
+    for start, end in intervals[1:]:
+        if start <= current_end:
+            current_end = max(current_end, end)
+            continue
+        total += current_end - current_start
+        current_start, current_end = start, end
+    return total + current_end - current_start
+
+
 def _aggregate_metrics(
     config: BenchmarkConfig,
     records: list[dict[str, Any]],
     rounds: list[dict[str, Any]],
+    jobs: list[dict[str, Any]],
     *,
     elapsed_s: float,
     run_elapsed_s: float,
@@ -1649,12 +1780,21 @@ def _aggregate_metrics(
         int(record.get("actual_completion_tokens") or 0)
         for record in success_records
     )
-    expected_requests = (
+    expected_requests_per_job = (
         config.rounds * config.articles_per_round
         + config.rounds
         + 1
     )
-    all_success = status == "success" and len(success_records) == expected_requests
+    expected_requests = config.num_jobs * expected_requests_per_job
+    successful_jobs = [
+        job for job in jobs if job["status"] == "success"
+    ]
+    job_status_counts = Counter(job["status"] for job in jobs)
+    all_success = (
+        status == "success"
+        and len(success_records) == expected_requests
+        and len(successful_jobs) == config.num_jobs
+    )
     phase_metrics = {}
     for phase in sorted(phase_counts):
         phase_all_records = [
@@ -1692,13 +1832,7 @@ def _aggregate_metrics(
             float(record["latency_s"])
             for record in phase_records
         ]
-        if phase == "subagent":
-            phase_elapsed_s = sum(
-                float(row["subagent_barrier_s"])
-                for row in rounds
-            )
-        else:
-            phase_elapsed_s = sum(phase_latencies)
+        phase_elapsed_s = _interval_union_duration(phase_records)
         phase_workers = Counter(
             str(record["route_worker"])
             for record in phase_records
@@ -1747,15 +1881,36 @@ def _aggregate_metrics(
         "elapsed_s": elapsed_s,
         "run_elapsed_s": run_elapsed_s,
         "preflight_elapsed_s": preflight_elapsed_s,
-        "completed_research_jobs": 1 if all_success else 0,
+        "requested_research_jobs": config.num_jobs,
+        "job_concurrency": config.job_concurrency,
+        "completed_research_jobs": len(successful_jobs),
         "research_jobs_per_hour": (
-            3600.0 / elapsed_s if all_success and elapsed_s > 0 else 0.0
+            len(successful_jobs) * 3600.0 / elapsed_s
+            if all_success and elapsed_s > 0
+            else 0.0
         ),
+        "expected_requests_per_job": expected_requests_per_job,
         "expected_requests": expected_requests,
         "completed_requests": len(records),
         "successful_requests": len(success_records),
         "status_counts": dict(sorted(status_counts.items())),
         "phase_counts": dict(sorted(phase_counts.items())),
+        "job_status_counts": dict(sorted(job_status_counts.items())),
+        "job_latency_s": {
+            "p50": _percentile(
+                [float(job["elapsed_s"]) for job in successful_jobs],
+                0.50,
+            ),
+            "p95": _percentile(
+                [float(job["elapsed_s"]) for job in successful_jobs],
+                0.95,
+            ),
+            "max": (
+                max(float(job["elapsed_s"]) for job in successful_jobs)
+                if successful_jobs
+                else None
+            ),
+        },
         "phase_metrics": phase_metrics,
         "request_latency_s": {
             "p50": _percentile(latencies, 0.50),
@@ -1788,6 +1943,7 @@ def _aggregate_metrics(
             for round_row in rounds
         ),
         "round_metrics": rounds,
+        "job_metrics": jobs,
         "artifact_paths": {
             "run_info": str(config.output_dir / "run_info.json"),
             "raw_outputs": str(config.output_dir / "raw_outputs.jsonl"),
@@ -1796,11 +1952,433 @@ def _aggregate_metrics(
                 config.output_dir / "per_sample_results.jsonl"
             ),
             "round_metrics": str(config.output_dir / "round_metrics.jsonl"),
+            "job_metrics": str(config.output_dir / "job_metrics.jsonl"),
             "aggregate_metrics": str(
                 config.output_dir / "aggregate_metrics.json"
             ),
         },
     }
+
+
+def _exception_status(exc: Exception) -> str:
+    if isinstance(exc, PreflightParseError):
+        return "parse_failed"
+    if isinstance(exc, ValueError):
+        return "invalid_input"
+    if isinstance(exc, BenchmarkFailed):
+        return exc.status
+    return "model_failed"
+
+
+def _job_metrics_row(
+    config: BenchmarkConfig,
+    *,
+    job_index: int,
+    status: str,
+    error: str | None,
+    records: list[dict[str, Any]],
+    rounds: list[dict[str, Any]],
+    started_offset_s: float,
+    finished_offset_s: float,
+) -> dict[str, Any]:
+    successful_records = [
+        record for record in records if record["status"] == "success"
+    ]
+    elapsed_s = finished_offset_s - started_offset_s
+    prompt_tokens = sum(
+        int(record.get("actual_prompt_tokens") or 0)
+        for record in successful_records
+    )
+    completion_tokens = sum(
+        int(record.get("actual_completion_tokens") or 0)
+        for record in successful_records
+    )
+    expected_requests = (
+        config.rounds * config.articles_per_round
+        + config.rounds
+        + 1
+    )
+    route_worker_counts = Counter(
+        str(record["route_worker"])
+        for record in successful_records
+        if record.get("route_worker")
+    )
+    return {
+        "job_index": job_index,
+        "status": status,
+        "error": error,
+        "started_offset_s": started_offset_s,
+        "finished_offset_s": finished_offset_s,
+        "elapsed_s": elapsed_s,
+        "expected_requests": expected_requests,
+        "completed_requests": len(records),
+        "successful_requests": len(successful_records),
+        "status_counts": dict(
+            sorted(Counter(record["status"] for record in records).items())
+        ),
+        "rounds_attempted": len(rounds),
+        "rounds_completed": sum(
+            str(round_row.get("status")) == "success"
+            for round_row in rounds
+        ),
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+        "requests_per_s": (
+            len(successful_records) / elapsed_s
+            if elapsed_s > 0
+            else 0.0
+        ),
+        "total_tokens_per_s": (
+            (prompt_tokens + completion_tokens) / elapsed_s
+            if elapsed_s > 0
+            else 0.0
+        ),
+        "route_worker_counts": dict(sorted(route_worker_counts.items())),
+        "prefix_cache": _prefix_cache_metrics(records),
+    }
+
+
+async def _run_one_job(
+    config: BenchmarkConfig,
+    *,
+    job_index: int,
+    writer: ArtifactWriter,
+    worker_prefix_cache_block_sizes: dict[str, int | None],
+    workload_started: float,
+    post_fn=post_json,
+) -> tuple[
+    dict[str, Any],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+]:
+    records: list[dict[str, Any]] = []
+    round_rows: list[dict[str, Any]] = []
+    job_started = time.perf_counter()
+    job_status = "model_failed"
+    job_error: str | None = None
+    try:
+        rng = random.Random(config.seed + job_index)
+        main_shared_prefix = tuple(
+            synthetic_token_ids(
+                config.main_overhead_tokens,
+                seed=rng.getrandbits(63),
+                low=config.synthetic_token_id_low,
+                high=config.synthetic_token_id_high,
+            )
+        )
+        round_summary_segments: list[tuple[int, ...]] = []
+        main_prompt_history_by_worker: dict[
+            str,
+            list[tuple[int, ...]],
+        ] = {}
+
+        for round_index in range(config.rounds):
+            round_started = time.perf_counter()
+            specs = []
+            for request_index in range(config.articles_per_round):
+                article_tokens = sample_bucketed_tokens(
+                    rng,
+                    config.article_token_buckets,
+                )
+                completion_tokens = sample_bucketed_tokens(
+                    rng,
+                    config.subagent_output_token_buckets,
+                )
+                specs.append(
+                    RequestSpec(
+                        sample_id=(
+                            f"job-{job_index:04d}-round-{round_index:02d}-"
+                            f"subagent-{request_index:03d}"
+                        ),
+                        job_index=job_index,
+                        phase="subagent",
+                        round_index=round_index,
+                        request_index=request_index,
+                        prompt_tokens=config.query_tokens + article_tokens,
+                        completion_tokens=completion_tokens,
+                        prompt_seed=rng.getrandbits(63),
+                        method_preferences=config.subagent_methods,
+                        required_tags=config.subagent_required_tags,
+                        article_tokens=article_tokens,
+                    )
+                )
+
+            barrier_started = time.perf_counter()
+            subagent_results = await asyncio.gather(
+                *[
+                    run_request(
+                        spec,
+                        config,
+                        writer,
+                        worker_prefix_cache_block_sizes=(
+                            worker_prefix_cache_block_sizes
+                        ),
+                        main_prompt_history_by_worker=(
+                            main_prompt_history_by_worker
+                        ),
+                        timeline_origin=workload_started,
+                        post_fn=post_fn,
+                    )
+                    for spec in specs
+                ]
+            )
+            barrier_s = time.perf_counter() - barrier_started
+            records.extend(subagent_results)
+            subagent_failure = _failure_status(subagent_results)
+            subagent_latencies = [
+                float(record["latency_s"])
+                for record in subagent_results
+            ]
+            subagent_prompt_tokens = sum(
+                int(record.get("actual_prompt_tokens") or 0)
+                for record in subagent_results
+            )
+            subagent_completion_tokens = sum(
+                int(record.get("actual_completion_tokens") or 0)
+                for record in subagent_results
+            )
+            round_rows.append(
+                {
+                    "job_index": job_index,
+                    "round_index": round_index,
+                    "status": subagent_failure or "model_failed",
+                    "subagent_requests": len(subagent_results),
+                    "subagent_successful_requests": sum(
+                        record["status"] == "success"
+                        for record in subagent_results
+                    ),
+                    "subagent_prompt_tokens": subagent_prompt_tokens,
+                    "subagent_completion_tokens": subagent_completion_tokens,
+                    "subagent_barrier_s": barrier_s,
+                    "subagent_latency_p50_s": _percentile(
+                        subagent_latencies,
+                        0.50,
+                    ),
+                    "subagent_latency_p95_s": _percentile(
+                        subagent_latencies,
+                        0.95,
+                    ),
+                    "subagent_latency_max_s": max(subagent_latencies),
+                    "straggler_gap_s": (
+                        max(subagent_latencies)
+                        - statistics.median(subagent_latencies)
+                    ),
+                    "main_agent_prompt_tokens": None,
+                    "main_agent_completion_tokens": None,
+                    "main_agent_expected_reusable_prefix_tokens": None,
+                    "main_agent_block_aligned_expected_reusable_prefix_tokens": (
+                        None
+                    ),
+                    "main_agent_actual_prefix_matched_tokens": None,
+                    "main_agent_latency_s": None,
+                    "round_elapsed_s": time.perf_counter() - round_started,
+                }
+            )
+            _require_success(
+                subagent_results,
+                f"Job {job_index} round {round_index} subagents",
+            )
+
+            accumulated_summaries = tuple(
+                token_id
+                for segment in round_summary_segments
+                for token_id in segment
+            )
+            current_answer_segment = tuple(
+                token_id
+                for record in subagent_results
+                for token_id in synthetic_token_ids(
+                    int(record["actual_completion_tokens"]),
+                    seed=rng.getrandbits(63),
+                    low=config.synthetic_token_id_low,
+                    high=config.synthetic_token_id_high,
+                )
+            )
+            main_prompt = (
+                main_shared_prefix
+                + accumulated_summaries
+                + current_answer_segment
+            )
+            round_summary_tokens = rng.randint(
+                config.min_round_summary_tokens,
+                config.max_round_summary_tokens,
+            )
+            main_spec = RequestSpec(
+                sample_id=(
+                    f"job-{job_index:04d}-round-{round_index:02d}-main-agent"
+                ),
+                job_index=job_index,
+                phase="round_summary",
+                round_index=round_index,
+                request_index=None,
+                prompt_tokens=len(main_prompt),
+                completion_tokens=round_summary_tokens,
+                prompt_seed=rng.getrandbits(63),
+                method_preferences=config.main_agent_methods,
+                required_tags=config.main_agent_required_tags,
+                prompt_token_ids=main_prompt,
+            )
+            main_result = await run_request(
+                main_spec,
+                config,
+                writer,
+                worker_prefix_cache_block_sizes=(
+                    worker_prefix_cache_block_sizes
+                ),
+                main_prompt_history_by_worker=(
+                    main_prompt_history_by_worker
+                ),
+                timeline_origin=workload_started,
+                post_fn=post_fn,
+            )
+            records.append(main_result)
+            round_rows[-1].update(
+                {
+                    "status": main_result["status"],
+                    "main_agent_prompt_tokens": main_result[
+                        "actual_prompt_tokens"
+                    ],
+                    "main_agent_completion_tokens": main_result[
+                        "actual_completion_tokens"
+                    ],
+                    "main_agent_expected_reusable_prefix_tokens": (
+                        main_result["expected_reusable_prefix_tokens"]
+                    ),
+                    "main_agent_block_aligned_expected_reusable_prefix_tokens": (
+                        main_result[
+                            "block_aligned_expected_reusable_prefix_tokens"
+                        ]
+                    ),
+                    "main_agent_actual_prefix_matched_tokens": (
+                        main_result["actual_prefix_matched_tokens"]
+                    ),
+                    "main_agent_latency_s": main_result["latency_s"],
+                    "round_elapsed_s": time.perf_counter() - round_started,
+                }
+            )
+            _require_success(
+                [main_result],
+                f"Job {job_index} round {round_index} main agent",
+            )
+            round_summary_segments.append(
+                tuple(
+                    synthetic_token_ids(
+                        int(main_result["actual_completion_tokens"]),
+                        seed=rng.getrandbits(63),
+                        low=config.synthetic_token_id_low,
+                        high=config.synthetic_token_id_high,
+                    )
+                )
+            )
+            round_rows[-1]["status"] = "success"
+            round_rows[-1]["round_elapsed_s"] = (
+                time.perf_counter() - round_started
+            )
+
+        final_overhead_segment = tuple(
+            synthetic_token_ids(
+                config.final_overhead_tokens,
+                seed=rng.getrandbits(63),
+                low=config.synthetic_token_id_low,
+                high=config.synthetic_token_id_high,
+            )
+        )
+        final_prompt = (
+            main_shared_prefix
+            + tuple(
+                token_id
+                for segment in round_summary_segments
+                for token_id in segment
+            )
+            + final_overhead_segment
+        )
+        final_spec = RequestSpec(
+            sample_id=f"job-{job_index:04d}-final-main-agent",
+            job_index=job_index,
+            phase="final_summary",
+            round_index=None,
+            request_index=None,
+            prompt_tokens=len(final_prompt),
+            completion_tokens=rng.randint(
+                config.min_final_output_tokens,
+                config.max_final_output_tokens,
+            ),
+            prompt_seed=rng.getrandbits(63),
+            method_preferences=config.main_agent_methods,
+            required_tags=config.main_agent_required_tags,
+            prompt_token_ids=final_prompt,
+        )
+        final_result = await run_request(
+            final_spec,
+            config,
+            writer,
+            worker_prefix_cache_block_sizes=(
+                worker_prefix_cache_block_sizes
+            ),
+            main_prompt_history_by_worker=(
+                main_prompt_history_by_worker
+            ),
+            timeline_origin=workload_started,
+            post_fn=post_fn,
+        )
+        records.append(final_result)
+        _require_success([final_result], f"Job {job_index} final main agent")
+
+        if config.require_router and not any(
+            record["status"] == "success"
+            and record["phase"] != "subagent"
+            and int(
+                record.get(
+                    "block_aligned_expected_reusable_prefix_tokens"
+                )
+                or 0
+            )
+            > 0
+            and int(record.get("actual_prefix_matched_tokens") or 0) > 0
+            for record in records
+        ):
+            raise BenchmarkFailed(
+                "metric_failed",
+                f"Job {job_index} completed without a verified main-agent "
+                "prefix-cache hit; no main-agent record had both positive "
+                "block-aligned expected reuse and positive actual matched "
+                "tokens. Keep reusable main prompts on a prefix-cache "
+                "worker or inspect routing and cache state."
+            )
+
+        distinct_workers = {
+            str(record["route_worker"])
+            for record in records
+            if record["status"] == "success" and record.get("route_worker")
+        }
+        if (
+            config.require_router
+            and len(distinct_workers) < config.min_healthy_workers
+        ):
+            raise BenchmarkFailed(
+                "metric_failed",
+                f"Job {job_index} successful requests exercised only "
+                f"{len(distinct_workers)} distinct workers; expected at least "
+                f"{config.min_healthy_workers}."
+            )
+        job_status = "success"
+    except Exception as exc:
+        job_status = _exception_status(exc)
+        job_error = f"{type(exc).__name__}: {exc}"
+
+    job_finished = time.perf_counter()
+    job_row = _job_metrics_row(
+        config,
+        job_index=job_index,
+        status=job_status,
+        error=job_error,
+        records=records,
+        rounds=round_rows,
+        started_offset_s=job_started - workload_started,
+        finished_offset_s=job_finished - workload_started,
+    )
+    return job_row, records, round_rows
 
 
 async def _run_benchmark_impl(
@@ -1811,6 +2389,7 @@ async def _run_benchmark_impl(
 ) -> dict[str, Any]:
     records: list[dict[str, Any]] = []
     round_rows: list[dict[str, Any]] = []
+    job_rows: list[dict[str, Any]] = []
     preflight_info: dict[str, Any] | None = None
     run_error: str | None = None
     aggregate_status = "model_failed"
@@ -1866,318 +2445,54 @@ async def _run_benchmark_impl(
                 preflight_info["worker_prefix_cache_block_sizes"]
             )
             workload_started = time.perf_counter()
-            rng = random.Random(config.seed)
-            main_shared_prefix = tuple(
-                synthetic_token_ids(
-                    config.main_overhead_tokens,
-                    seed=rng.getrandbits(63),
-                    low=config.synthetic_token_id_low,
-                    high=config.synthetic_token_id_high,
-                )
-            )
-            round_summary_segments: list[tuple[int, ...]] = []
-            main_prompt_history_by_worker: dict[
-                str,
-                list[tuple[int, ...]],
-            ] = {}
+            semaphore = asyncio.Semaphore(config.job_concurrency)
 
-            for round_index in range(config.rounds):
-                round_started = time.perf_counter()
-                specs = []
-                for request_index in range(config.articles_per_round):
-                    article_tokens = sample_bucketed_tokens(
-                        rng,
-                        config.article_token_buckets,
-                    )
-                    completion_tokens = sample_bucketed_tokens(
-                        rng,
-                        config.subagent_output_token_buckets,
-                    )
-                    specs.append(
-                        RequestSpec(
-                            sample_id=(
-                                f"round-{round_index:02d}-"
-                                f"subagent-{request_index:03d}"
-                            ),
-                            phase="subagent",
-                            round_index=round_index,
-                            request_index=request_index,
-                            prompt_tokens=config.query_tokens + article_tokens,
-                            completion_tokens=completion_tokens,
-                            prompt_seed=rng.getrandbits(63),
-                            method_preferences=config.subagent_methods,
-                            article_tokens=article_tokens,
-                        )
+            async def run_scheduled_job(job_index: int):
+                async with semaphore:
+                    return await _run_one_job(
+                        config,
+                        job_index=job_index,
+                        writer=writer,
+                        worker_prefix_cache_block_sizes=(
+                            worker_prefix_cache_block_sizes
+                        ),
+                        workload_started=workload_started,
+                        post_fn=post_fn,
                     )
 
-                barrier_started = time.perf_counter()
-                subagent_results = await asyncio.gather(
-                    *[
-                        run_request(
-                            spec,
-                            config,
-                            writer,
-                            worker_prefix_cache_block_sizes=(
-                                worker_prefix_cache_block_sizes
-                            ),
-                            main_prompt_history_by_worker=(
-                                main_prompt_history_by_worker
-                            ),
-                            post_fn=post_fn,
-                        )
-                        for spec in specs
-                    ]
-                )
-                barrier_s = time.perf_counter() - barrier_started
-                records.extend(subagent_results)
-                subagent_failure = _failure_status(subagent_results)
-                subagent_latencies = [
-                    float(record["latency_s"])
-                    for record in subagent_results
+            outcomes = await asyncio.gather(
+                *[
+                    run_scheduled_job(job_index)
+                    for job_index in range(config.num_jobs)
                 ]
-                subagent_prompt_tokens = sum(
-                    int(record.get("actual_prompt_tokens") or 0)
-                    for record in subagent_results
-                )
-                subagent_completion_tokens = sum(
-                    int(record.get("actual_completion_tokens") or 0)
-                    for record in subagent_results
-                )
-                round_rows.append(
-                    {
-                        "round_index": round_index,
-                        "status": subagent_failure or "model_failed",
-                        "subagent_requests": len(subagent_results),
-                        "subagent_successful_requests": sum(
-                            record["status"] == "success"
-                            for record in subagent_results
-                        ),
-                        "subagent_prompt_tokens": subagent_prompt_tokens,
-                        "subagent_completion_tokens": (
-                            subagent_completion_tokens
-                        ),
-                        "subagent_barrier_s": barrier_s,
-                        "subagent_latency_p50_s": _percentile(
-                            subagent_latencies,
-                            0.50,
-                        ),
-                        "subagent_latency_p95_s": _percentile(
-                            subagent_latencies,
-                            0.95,
-                        ),
-                        "subagent_latency_max_s": max(
-                            subagent_latencies
-                        ),
-                        "straggler_gap_s": (
-                            max(subagent_latencies)
-                            - statistics.median(subagent_latencies)
-                        ),
-                        "main_agent_prompt_tokens": None,
-                        "main_agent_completion_tokens": None,
-                        "main_agent_expected_reusable_prefix_tokens": None,
-                        "main_agent_block_aligned_expected_reusable_prefix_tokens": (
-                            None
-                        ),
-                        "main_agent_actual_prefix_matched_tokens": None,
-                        "main_agent_latency_s": None,
-                        "round_elapsed_s": time.perf_counter() - round_started,
-                    }
-                )
-                _require_success(
-                    subagent_results,
-                    f"Round {round_index} subagents",
-                )
-
-                accumulated_summaries = tuple(
-                    token_id
-                    for segment in round_summary_segments
-                    for token_id in segment
-                )
-                current_answer_segment = tuple(
-                    token_id
-                    for record in subagent_results
-                    for token_id in synthetic_token_ids(
-                        int(record["actual_completion_tokens"]),
-                        seed=rng.getrandbits(63),
-                        low=config.synthetic_token_id_low,
-                        high=config.synthetic_token_id_high,
-                    )
-                )
-                main_prompt = (
-                    main_shared_prefix
-                    + accumulated_summaries
-                    + current_answer_segment
-                )
-                round_summary_tokens = rng.randint(
-                    config.min_round_summary_tokens,
-                    config.max_round_summary_tokens,
-                )
-                main_spec = RequestSpec(
-                    sample_id=f"round-{round_index:02d}-main-agent",
-                    phase="round_summary",
-                    round_index=round_index,
-                    request_index=None,
-                    prompt_tokens=len(main_prompt),
-                    completion_tokens=round_summary_tokens,
-                    prompt_seed=rng.getrandbits(63),
-                    method_preferences=config.main_agent_methods,
-                    prompt_token_ids=main_prompt,
-                )
-                main_result = await run_request(
-                    main_spec,
-                    config,
-                    writer,
-                    worker_prefix_cache_block_sizes=(
-                        worker_prefix_cache_block_sizes
-                    ),
-                    main_prompt_history_by_worker=(
-                        main_prompt_history_by_worker
-                    ),
-                    post_fn=post_fn,
-                )
-                records.append(main_result)
-                round_rows[-1].update(
-                    {
-                        "status": main_result["status"],
-                        "main_agent_prompt_tokens": main_result[
-                            "actual_prompt_tokens"
-                        ],
-                        "main_agent_completion_tokens": main_result[
-                            "actual_completion_tokens"
-                        ],
-                        "main_agent_expected_reusable_prefix_tokens": (
-                            main_result[
-                                "expected_reusable_prefix_tokens"
-                            ]
-                        ),
-                        "main_agent_block_aligned_expected_reusable_prefix_tokens": (
-                            main_result[
-                                "block_aligned_expected_reusable_prefix_tokens"
-                            ]
-                        ),
-                        "main_agent_actual_prefix_matched_tokens": (
-                            main_result["actual_prefix_matched_tokens"]
-                        ),
-                        "main_agent_latency_s": main_result["latency_s"],
-                        "round_elapsed_s": (
-                            time.perf_counter() - round_started
-                        ),
-                    }
-                )
-                _require_success([main_result], f"Round {round_index} main agent")
-                round_summary_segments.append(
-                    tuple(
-                        synthetic_token_ids(
-                            int(main_result["actual_completion_tokens"]),
-                            seed=rng.getrandbits(63),
-                            low=config.synthetic_token_id_low,
-                            high=config.synthetic_token_id_high,
-                        )
-                    )
-                )
-
-                round_rows[-1]["status"] = "success"
-                round_rows[-1]["round_elapsed_s"] = (
-                    time.perf_counter() - round_started
-                )
-
-            final_overhead_segment = tuple(
-                synthetic_token_ids(
-                    config.final_overhead_tokens,
-                    seed=rng.getrandbits(63),
-                    low=config.synthetic_token_id_low,
-                    high=config.synthetic_token_id_high,
-                )
             )
-            final_prompt = (
-                main_shared_prefix
-                + tuple(
-                    token_id
-                    for segment in round_summary_segments
-                    for token_id in segment
-                )
-                + final_overhead_segment
-            )
-            final_spec = RequestSpec(
-                sample_id="final-main-agent",
-                phase="final_summary",
-                round_index=None,
-                request_index=None,
-                prompt_tokens=len(final_prompt),
-                completion_tokens=rng.randint(
-                    config.min_final_output_tokens,
-                    config.max_final_output_tokens,
-                ),
-                prompt_seed=rng.getrandbits(63),
-                method_preferences=config.main_agent_methods,
-                prompt_token_ids=final_prompt,
-            )
-            final_result = await run_request(
-                final_spec,
-                config,
-                writer,
-                worker_prefix_cache_block_sizes=(
-                    worker_prefix_cache_block_sizes
-                ),
-                main_prompt_history_by_worker=(
-                    main_prompt_history_by_worker
-                ),
-                post_fn=post_fn,
-            )
-            records.append(final_result)
-            _require_success([final_result], "Final main agent")
+            for job_row, job_records, job_round_rows in outcomes:
+                job_rows.append(job_row)
+                records.extend(job_records)
+                round_rows.extend(job_round_rows)
 
-            if config.require_router and not any(
-                record["status"] == "success"
-                and record["phase"] != "subagent"
-                and int(
-                    record.get(
-                        "block_aligned_expected_reusable_prefix_tokens"
-                    )
-                    or 0
+            failed_jobs = [
+                job for job in job_rows if job["status"] != "success"
+            ]
+            if failed_jobs:
+                aggregate_status = (
+                    _failure_status(failed_jobs) or "model_failed"
                 )
-                > 0
-                and int(record.get("actual_prefix_matched_tokens") or 0) > 0
-                for record in records
-            ):
-                raise BenchmarkFailed(
-                    "metric_failed",
-                    "Router run completed without a verified main-agent "
-                    "prefix-cache hit; no main-agent record had both positive "
-                    "block-aligned expected reuse and positive actual matched "
-                    "tokens. Keep reusable main prompts on a prefix-cache "
-                    "worker or inspect routing and cache state."
+                run_error = "; ".join(
+                    f"job={job['job_index']} status={job['status']} "
+                    f"error={job['error']}"
+                    for job in failed_jobs
                 )
-
-            distinct_workers = {
-                str(record["route_worker"])
-                for record in records
-                if record["status"] == "success" and record.get("route_worker")
-            }
-            if (
-                config.require_router
-                and len(distinct_workers) < config.min_healthy_workers
-            ):
-                raise BenchmarkFailed(
-                    "metric_failed",
-                    "Successful requests exercised only "
-                    f"{len(distinct_workers)} distinct workers; expected at least "
-                    f"{config.min_healthy_workers}."
-                )
-            aggregate_status = "success"
+            else:
+                aggregate_status = "success"
         except Exception as exc:
             run_error = f"{type(exc).__name__}: {exc}"
-            if isinstance(exc, PreflightParseError):
-                aggregate_status = "parse_failed"
-            elif isinstance(exc, ValueError):
-                aggregate_status = "invalid_input"
-            elif isinstance(exc, BenchmarkFailed):
-                aggregate_status = exc.status
-            else:
-                aggregate_status = "model_failed"
+            aggregate_status = _exception_status(exc)
 
         for round_row in round_rows:
             writer.write_jsonl("round_metrics", round_row)
+        for job_row in job_rows:
+            writer.write_jsonl("job_metrics", job_row)
         finished = time.perf_counter()
         run_elapsed_s = finished - run_started
         elapsed_s = (
@@ -2189,6 +2504,7 @@ async def _run_benchmark_impl(
             config,
             records,
             round_rows,
+            job_rows,
             elapsed_s=elapsed_s,
             run_elapsed_s=run_elapsed_s,
             preflight_elapsed_s=preflight_elapsed_s,
@@ -2231,7 +2547,9 @@ async def run_benchmark(
         )
 
     with ThreadPoolExecutor(
-        max_workers=config.articles_per_round,
+        max_workers=(
+            config.job_concurrency * config.articles_per_round
+        ),
         thread_name_prefix="simulated-deep-research",
     ) as executor:
         sized_post_fn = partial(post_json, executor=executor)
@@ -2245,8 +2563,8 @@ async def run_benchmark(
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Run a 10-round, 20-subagent-per-round synthetic Deep Research "
-            "workload through the Sparse-vLLM smart router."
+            "Run one or more 10-round, 20-subagent-per-round synthetic Deep "
+            "Research jobs through the Sparse-vLLM smart router."
         )
     )
     parser.add_argument(
@@ -2256,6 +2574,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--model", required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--num-jobs", type=int, default=1)
+    parser.add_argument("--job-concurrency", type=int, default=1)
     parser.add_argument("--rounds", type=int, default=10)
     parser.add_argument("--articles-per-round", type=int, default=20)
     parser.add_argument(
@@ -2284,6 +2604,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--main-agent-methods",
         default="omnikv,vanilla",
         help="Comma-separated smart-router method preference for the main agent.",
+    )
+    parser.add_argument(
+        "--subagent-required-tags",
+        default="",
+        help="Comma-separated worker tags required for subagent requests.",
+    )
+    parser.add_argument(
+        "--main-agent-required-tags",
+        default="",
+        help="Comma-separated worker tags required for main-agent requests.",
     )
     parser.add_argument("--synthetic-token-id-low", type=int, default=100)
     parser.add_argument("--synthetic-token-id-high", type=int, default=255)
@@ -2315,6 +2645,8 @@ def config_from_args(args: argparse.Namespace) -> BenchmarkConfig:
         base_url=args.base_url.rstrip("/"),
         model=args.model,
         output_dir=args.output_dir.expanduser().resolve(),
+        num_jobs=args.num_jobs,
+        job_concurrency=args.job_concurrency,
         rounds=args.rounds,
         articles_per_round=args.articles_per_round,
         article_token_buckets=_parse_token_buckets(
@@ -2339,6 +2671,14 @@ def config_from_args(args: argparse.Namespace) -> BenchmarkConfig:
         main_agent_methods=_parse_methods(
             args.main_agent_methods,
             "--main-agent-methods",
+        ),
+        subagent_required_tags=_parse_tags(
+            args.subagent_required_tags,
+            "--subagent-required-tags",
+        ),
+        main_agent_required_tags=_parse_tags(
+            args.main_agent_required_tags,
+            "--main-agent-required-tags",
         ),
         synthetic_token_id_low=args.synthetic_token_id_low,
         synthetic_token_id_high=args.synthetic_token_id_high,

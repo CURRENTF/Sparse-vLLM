@@ -3,6 +3,7 @@ import json
 import tempfile
 import threading
 import unittest
+from collections import Counter
 from pathlib import Path
 from unittest.mock import patch
 
@@ -53,7 +54,7 @@ class FakeService:
         self.contaminate_first_main_prefix_match = (
             contaminate_first_main_prefix_match
         )
-        self.previous_main_prompt = None
+        self.previous_main_prompts = []
         self.prefix_cache_block_size = 2
         self.max_model_len = 65_536
 
@@ -97,6 +98,11 @@ class FakeService:
                     "max_model_len": self.max_model_len,
                     "vocab_size": 32_000,
                     "sparse_method": method,
+                    "tags": (
+                        ["subagent"]
+                        if method == "snapkv"
+                        else ["main-agent"]
+                    ),
                     "prefix_cache_enabled": method == "omnikv",
                     "prefix_cache_block_size": (
                         self.prefix_cache_block_size
@@ -138,9 +144,12 @@ class FakeService:
             matched_tokens = 0
             if methods != ["snapkv"]:
                 prompt = tuple(payload["prompt"])
-                raw_matched_tokens = run._common_prefix_tokens(
-                    self.previous_main_prompt,
-                    prompt,
+                raw_matched_tokens = max(
+                    (
+                        run._common_prefix_tokens(previous, prompt)
+                        for previous in self.previous_main_prompts
+                    ),
+                    default=0,
                 )
                 matched_tokens = (
                     raw_matched_tokens
@@ -148,11 +157,11 @@ class FakeService:
                     * self.prefix_cache_block_size
                 )
                 if (
-                    self.previous_main_prompt is None
+                    not self.previous_main_prompts
                     and self.contaminate_first_main_prefix_match
                 ):
                     matched_tokens = self.prefix_cache_block_size
-                self.previous_main_prompt = prompt
+                self.previous_main_prompts.append(prompt)
                 if self.zero_main_prefix_match:
                     matched_tokens = 0
                 elif (
@@ -251,6 +260,8 @@ class SimulatedDeepResearchTest(unittest.TestCase):
             )
             self.assertEqual(config.request_timeout_s, 930.0)
             self.assertEqual(config.router_timeout_margin_s, 30.0)
+            self.assertEqual(config.num_jobs, 1)
+            self.assertEqual(config.job_concurrency, 1)
             self.assertEqual(run.required_model_len(config), 65_564)
             cli_config = run.config_from_args(
                 run.build_arg_parser().parse_args(
@@ -264,6 +275,8 @@ class SimulatedDeepResearchTest(unittest.TestCase):
             )
             self.assertEqual(cli_config.request_timeout_s, 930.0)
             self.assertEqual(cli_config.router_timeout_margin_s, 30.0)
+            self.assertEqual(cli_config.num_jobs, 1)
+            self.assertEqual(cli_config.job_concurrency, 1)
 
     def test_rejects_invalid_token_bucket(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -307,7 +320,135 @@ class SimulatedDeepResearchTest(unittest.TestCase):
                     "main_agent_methods": ("snapkv",),
                 }
             )
-            with self.assertRaisesRegex(ValueError, "must be disjoint"):
+            with self.assertRaisesRegex(ValueError, "disjoint role tags"):
+                run.validate_config(config)
+
+    def test_allows_overlapping_methods_with_disjoint_role_tags(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config(Path(tmp) / "run")
+            config = run.BenchmarkConfig(
+                **{
+                    **config.__dict__,
+                    "subagent_methods": ("vanilla",),
+                    "main_agent_methods": ("vanilla",),
+                    "subagent_required_tags": ("subagent",),
+                    "main_agent_required_tags": ("main-agent",),
+                }
+            )
+            run.validate_config(config)
+            spec = run.RequestSpec(
+                sample_id="job-0000-subagent",
+                job_index=0,
+                phase="subagent",
+                round_index=0,
+                request_index=0,
+                prompt_tokens=2,
+                completion_tokens=1,
+                prompt_seed=1,
+                method_preferences=config.subagent_methods,
+                required_tags=config.subagent_required_tags,
+            )
+            payload = run.build_payload(spec, config)
+            self.assertEqual(payload["svllm_method_preference"], "vanilla")
+            self.assertEqual(
+                payload["svllm_required_tags"],
+                ["subagent"],
+            )
+
+    def test_preflight_accepts_two_tag_isolated_vanilla_workers(self):
+        async def vanilla_get(url, _timeout_s):
+            if url.endswith("/models"):
+                return _json_response(
+                    {
+                        "data": [
+                            {
+                                "id": "sim-model",
+                                "owned_by": "sparsevllm-router",
+                                "max_model_len": 65_536,
+                            }
+                        ]
+                    }
+                )
+            if url.endswith("/health"):
+                return _json_response(
+                    {
+                        "healthy_workers": [
+                            "http://vanilla-subagent",
+                            "http://vanilla-main",
+                        ],
+                        "router_policy": {
+                            "request_timeout_s": 900.0,
+                            "control_timeout_s": 5.0,
+                            "overload_load_factor": 1.0,
+                            "load_abs_threshold": 0,
+                            "profiles": {},
+                            "code_revision": CODE_REVISION,
+                        },
+                    }
+                )
+            if url.endswith("/v1/worker/info"):
+                main_worker = "vanilla-main" in url
+                return _json_response(
+                    {
+                        "served_model_name": "sim-model",
+                        "max_model_len": 65_536,
+                        "vocab_size": 32_000,
+                        "sparse_method": "",
+                        "tags": (
+                            ["main-agent"]
+                            if main_worker
+                            else ["subagent"]
+                        ),
+                        "prefix_cache_enabled": main_worker,
+                        "prefix_cache_block_size": (
+                            2 if main_worker else None
+                        ),
+                        "code_revision": CODE_REVISION,
+                        "benchmark_config": {
+                            "decode_cuda_graph": True,
+                            "enable_prefix_caching": main_worker,
+                        },
+                    }
+                )
+            raise AssertionError(f"Unexpected GET URL: {url}")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config(Path(tmp) / "run")
+            config = run.BenchmarkConfig(
+                **{
+                    **config.__dict__,
+                    "subagent_methods": ("vanilla",),
+                    "main_agent_methods": ("vanilla",),
+                    "subagent_required_tags": ("subagent",),
+                    "main_agent_required_tags": ("main-agent",),
+                }
+            )
+            result = asyncio.run(
+                run.preflight(config, get_fn=vanilla_get)
+            )
+            self.assertEqual(len(result["workers"]), 2)
+            self.assertEqual(
+                result["worker_prefix_cache_block_sizes"],
+                {
+                    "http://vanilla-main": 2,
+                    "http://vanilla-subagent": None,
+                },
+            )
+
+    def test_rejects_job_concurrency_above_job_count(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config(Path(tmp) / "run")
+            config = run.BenchmarkConfig(
+                **{
+                    **config.__dict__,
+                    "num_jobs": 2,
+                    "job_concurrency": 3,
+                }
+            )
+            with self.assertRaisesRegex(
+                ValueError,
+                "must not exceed num_jobs",
+            ):
                 run.validate_config(config)
 
     def test_direct_server_allows_the_same_method_for_both_roles(self):
@@ -345,6 +486,11 @@ class SimulatedDeepResearchTest(unittest.TestCase):
             self.assertEqual(aggregate["phase_counts"]["final_summary"], 1)
             self.assertEqual(aggregate["rounds_attempted"], 2)
             self.assertEqual(aggregate["rounds_completed"], 2)
+            self.assertEqual(aggregate["requested_research_jobs"], 1)
+            self.assertEqual(aggregate["completed_research_jobs"], 1)
+            self.assertEqual(aggregate["job_concurrency"], 1)
+            self.assertEqual(aggregate["job_status_counts"], {"success": 1})
+            self.assertGreater(aggregate["research_jobs_per_hour"], 0.0)
             self.assertEqual(
                 aggregate["route_method_counts"],
                 {"omnikv": 3, "snapkv": 6},
@@ -391,6 +537,7 @@ class SimulatedDeepResearchTest(unittest.TestCase):
                 "parsed_outputs.jsonl",
                 "per_sample_results.jsonl",
                 "round_metrics.jsonl",
+                "job_metrics.jsonl",
                 "aggregate_metrics.json",
             ):
                 self.assertTrue((output_dir / name).is_file(), name)
@@ -554,6 +701,78 @@ class SimulatedDeepResearchTest(unittest.TestCase):
                     == CODE_REVISION["git_commit"]
                     for worker in worker_configs
                 )
+            )
+
+    def test_runs_multiple_jobs_with_bounded_job_concurrency(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "run"
+            config = self._config(output_dir)
+            config = run.BenchmarkConfig(
+                **{
+                    **config.__dict__,
+                    "num_jobs": 3,
+                    "job_concurrency": 2,
+                }
+            )
+            service = FakeService()
+
+            aggregate = asyncio.run(
+                run.run_benchmark(
+                    config,
+                    get_fn=service.get,
+                    post_fn=service.post,
+                )
+            )
+
+            self.assertEqual(aggregate["status"], "success")
+            self.assertEqual(aggregate["requested_research_jobs"], 3)
+            self.assertEqual(aggregate["completed_research_jobs"], 3)
+            self.assertEqual(aggregate["job_concurrency"], 2)
+            self.assertEqual(aggregate["expected_requests_per_job"], 9)
+            self.assertEqual(aggregate["expected_requests"], 27)
+            self.assertEqual(aggregate["successful_requests"], 27)
+            self.assertEqual(aggregate["job_status_counts"], {"success": 3})
+            self.assertEqual(aggregate["rounds_completed"], 6)
+            self.assertEqual(service.max_active, 6)
+            job_rows = [
+                json.loads(line)
+                for line in (output_dir / "job_metrics.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            self.assertEqual(
+                [row["job_index"] for row in job_rows],
+                [0, 1, 2],
+            )
+            self.assertTrue(
+                all(row["status"] == "success" for row in job_rows)
+            )
+            self.assertTrue(
+                all(
+                    row["prefix_cache"]["actual_hit_requests"] >= 2
+                    for row in job_rows
+                )
+            )
+            self.assertLess(
+                job_rows[1]["started_offset_s"],
+                job_rows[0]["finished_offset_s"],
+            )
+            self.assertGreaterEqual(
+                job_rows[2]["started_offset_s"],
+                min(
+                    job_rows[0]["finished_offset_s"],
+                    job_rows[1]["finished_offset_s"],
+                ),
+            )
+            sample_rows = [
+                json.loads(line)
+                for line in (output_dir / "per_sample_results.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            self.assertEqual(
+                Counter(row["job_index"] for row in sample_rows),
+                Counter({0: 9, 1: 9, 2: 9}),
             )
 
     def test_http_failure_is_recorded_before_run_fails(self):
@@ -1037,7 +1256,7 @@ class SimulatedDeepResearchTest(unittest.TestCase):
             second_round = next(
                 row
                 for row in rows
-                if row["sample_id"] == "round-01-main-agent"
+                if row["sample_id"] == "job-0000-round-01-main-agent"
             )
             self.assertEqual(
                 second_round["expected_reusable_prefix_tokens"],
@@ -1154,7 +1373,7 @@ class SimulatedDeepResearchTest(unittest.TestCase):
             second_round = next(
                 row
                 for row in rows
-                if row["sample_id"] == "round-01-main-agent"
+                if row["sample_id"] == "job-0000-round-01-main-agent"
             )
             self.assertEqual(
                 second_round["expected_reusable_prefix_tokens"],
@@ -1788,6 +2007,7 @@ class SimulatedDeepResearchTest(unittest.TestCase):
             )
             spec = run.RequestSpec(
                 sample_id="direct",
+                job_index=0,
                 phase="subagent",
                 round_index=0,
                 request_index=0,

@@ -5,7 +5,9 @@ evaluation. BrowseComp-Plus remains the separate end-to-end quality benchmark.
 
 ## Workload
 
-The default run models one research job:
+The default run models one research job. `--num-jobs` controls the total
+number of complete jobs and `--job-concurrency` bounds how many complete jobs
+may execute at once. Each job independently follows this workload:
 
 - 10 sequential research rounds.
 - 20 parallel subagent requests per round.
@@ -22,8 +24,9 @@ The default run models one research job:
 - One final main-agent request consumes all round summaries and generates a
   uniformly sampled 1,000-2,000 tokens.
 
-The defaults therefore issue 211 model requests: 200 SnapKV subagent requests,
-10 OmniKV/vanilla round-summary requests, and one OmniKV/vanilla final request.
+The defaults therefore issue 211 model requests per job: 200 SnapKV subagent
+requests, 10 OmniKV/vanilla round-summary requests, and one OmniKV/vanilla
+final request.
 Synthetic token ids make requested prompt lengths exact and avoid turning this
 serving benchmark into a tokenizer-content benchmark. The default expected
 article and subagent-output lengths are approximately 10,500 and 430 tokens,
@@ -37,6 +40,10 @@ The runner calls the smart router's `/v1/completions` endpoint.
 - Subagents send `svllm_method_preference=snapkv`.
 - Main-agent requests send
   `svllm_method_preference=omnikv,vanilla`.
+- Optional `--subagent-required-tags` and `--main-agent-required-tags` values
+  are forwarded as `svllm_required_tags`. They allow two workers using the same
+  method, such as a two-worker vanilla baseline, to remain assigned to separate
+  roles.
 - The preflight requires at least two healthy workers for the selected model
   and verifies that the advertised methods and context capacities cover both
   agent roles. Same-model workers with unrelated methods do not constrain the
@@ -97,12 +104,48 @@ The preflight reads these limits from each eligible worker instead of applying
 the router model card's cross-method minimum.
 
 The synthetic workload remains exactly reproducible from `seed`; the runner
-does not inject a per-run nonce. Consequently, rerunning the same seed against
-an uncleared worker could encounter cache entries from an earlier run. The
-runner detects this instead of silently measuring the warm cache: an actual
-match larger than this run's block-aligned expectation, including any hit on
-the first main-agent request, is `metric_failed`. Clear or restart the
-prefix-cache worker before rerunning a fixed seed.
+uses `seed + job_index` for each job and does not inject a per-run nonce.
+Consequently, rerunning the same seed against an uncleared worker could
+encounter cache entries from an earlier run. The runner detects this instead
+of silently measuring the warm cache: an actual match larger than the current
+job's block-aligned expectation, including any hit on a job's first main-agent
+request, is `metric_failed`. Clear or restart the prefix-cache worker before
+rerunning a fixed seed.
+
+To measure complete-job throughput at several simultaneous job counts, keep
+the per-job workload fixed and run separate clean-cache invocations such as:
+
+```bash
+python -m benchmark.simulated_deep_research.run \
+  --base-url http://127.0.0.1:18180/v1 \
+  --model <SERVED_MODEL_NAME> \
+  --output-dir outputs/simulated_deep_research/jobs_4 \
+  --num-jobs 4 \
+  --job-concurrency 4
+```
+
+The client request pool is sized for
+`job_concurrency * articles_per_round`. Raising `--articles-per-round` changes
+the per-job workload and main-agent context length; use `--job-concurrency`
+when the experiment variable is simultaneous complete jobs.
+
+For a fair two-worker vanilla baseline, tag the workers through
+`SPARSEVLLM_WORKER_TAGS=subagent` and
+`SPARSEVLLM_WORKER_TAGS=main-agent`, enable prefix caching on the main-agent
+worker, and run:
+
+```bash
+python -m benchmark.simulated_deep_research.run \
+  --base-url http://127.0.0.1:18180/v1 \
+  --model <SERVED_MODEL_NAME> \
+  --output-dir outputs/simulated_deep_research/vanilla_2_jobs_4 \
+  --num-jobs 4 \
+  --job-concurrency 4 \
+  --subagent-methods vanilla \
+  --main-agent-methods vanilla \
+  --subagent-required-tags subagent \
+  --main-agent-required-tags main-agent
+```
 
 The runner is executed from the source tree and requires successful Git
 inspection before preflight. If the client commit or worktree status cannot be
@@ -159,9 +202,14 @@ rejected. The run writes:
 - `round_metrics.jsonl`: barrier time, p50/p95/max subagent latency, straggler
   gap, main-agent latency, and explicit status for every attempted round,
   including a round whose main-agent request fails.
+- `job_metrics.jsonl`: explicit job status, elapsed time, request and token
+  counts, route distribution, prefix-cache observations, and completed-round
+  counts for every requested job.
 - `aggregate_metrics.json`: end-to-end research-job throughput, token
-  throughput, latency percentiles, status counts, route distributions, and
-  separate attempted/completed round counts. Its top-level and per-phase
+  throughput, job and request latency percentiles, job/request status counts,
+  route distributions, and separate attempted/completed job and round counts.
+  Phase elapsed times are unions of request intervals, so overlapping jobs are
+  not double-counted. Its top-level and per-phase
   `prefix_cache` objects include raw expected, block-aligned expected, and
   actual token totals, expected and actual hit counts, partial hits, unexpected
   zero hits, and unexpected excess hits.
