@@ -185,11 +185,6 @@ def test_qwen3_moe_parallel_config_validation(tmp_path):
         config = Config(model=str(tmp_path), expert_parallel_size=4)
     assert config.world_size == 4
     assert config.weight_loading_workers_per_rank == 2
-    assert config.moe_backend == "triton"
-
-    with patch("sparsevllm.config.AutoConfig.from_pretrained", return_value=_hf_config()):
-        with pytest.raises(ValueError, match="moe_backend must be"):
-            Config(model=str(tmp_path), moe_backend="automatic")
 
     with patch("sparsevllm.config.AutoConfig.from_pretrained", return_value=_hf_config()):
         with pytest.raises(ValueError, match="only supports TP=1 and DP=1"):

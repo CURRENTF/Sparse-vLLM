@@ -71,39 +71,21 @@ def _make_config(tmp_path, hf_config=None, **kwargs):
 
 
 @pytest.mark.parametrize("expert_parallel_size", [1, 2, 4, 8])
-@pytest.mark.parametrize("moe_backend", ["pytorch", "native", "triton"])
 def test_minimax_config_accepts_first_milestone_runtime(
     tmp_path,
     expert_parallel_size,
-    moe_backend,
 ):
     config = _make_config(
         tmp_path,
         expert_parallel_size=expert_parallel_size,
-        moe_backend=moe_backend,
         enable_prefix_caching=True,
-        decode_cuda_graph=moe_backend == "triton",
-        enforce_eager=moe_backend != "triton",
+        decode_cuda_graph=True,
+        enforce_eager=False,
     )
 
     assert config.hf_config.model_type == "minimax_m2"
     assert config.quantization_config.model_name == "MiniMax M2.7"
     assert config.quantization_config.weight_block_size == (128, 128)
-    assert config.moe_backend == moe_backend
-
-
-@pytest.mark.parametrize("moe_backend", ["pytorch", "native"])
-def test_minimax_config_rejects_graph_for_eager_expert_backends(
-    tmp_path,
-    moe_backend,
-):
-    with pytest.raises(ValueError, match="moe_backend='triton'"):
-        _make_config(
-            tmp_path,
-            moe_backend=moe_backend,
-            decode_cuda_graph=True,
-            enforce_eager=False,
-        )
 
 
 @pytest.mark.parametrize(
@@ -244,7 +226,6 @@ def test_minimax_sparse_methods_accept_decode_cuda_graph(tmp_path, method):
     config = _make_config(
         tmp_path,
         vllm_sparse_method=method,
-        moe_backend="triton",
         enforce_eager=False,
         decode_cuda_graph=True,
         enable_prefix_caching=False,

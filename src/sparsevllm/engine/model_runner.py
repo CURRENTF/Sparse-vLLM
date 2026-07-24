@@ -138,7 +138,6 @@ class ModelRunner:
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device(self.device)
         setattr(hf_config, "mlp_chunk_size", config.mlp_chunk_size)
-        setattr(hf_config, "moe_backend", config.moe_backend)
         
         # 加载对应的模型分片 (Shards)
         if hf_config.model_type == "qwen2":
@@ -194,11 +193,8 @@ class ModelRunner:
                 show_progress=self.parallel_context.world_rank == 0,
                 progress_rank=0 if self.parallel_context.world_rank == 0 else None,
             )
-        if (
-            hf_config.model_type in {"qwen3_moe", "minimax_m2"}
-            and config.moe_backend == "triton"
-        ):
-            self.model.warmup_moe_backend()
+        if hf_config.model_type in {"qwen3_moe", "minimax_m2"}:
+            self.model.warmup_moe()
         
         self.sampler = Sampler()
 

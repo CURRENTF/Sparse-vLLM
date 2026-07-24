@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import re
-from dataclasses import replace
 
 import torch
 import torch.nn.functional as F
@@ -18,10 +17,6 @@ from sparsevllm.layers.rotary_embedding import (
 )
 from sparsevllm.models.qwen3 import Qwen3ModelBase
 from sparsevllm.platforms import device_runtime
-from sparsevllm.quantization.fp8 import (
-    Fp8BlockScaledLinearBackend,
-    fp8_blockwise_linear_reference,
-)
 from sparsevllm.utils.context import get_context
 from sparsevllm.utils.log import logger
 
@@ -36,58 +31,23 @@ _EXPERT_TARGET_RE = re.compile(
 )
 
 
-def _execution_backend(config) -> str:
-    backend = str(getattr(config, "moe_backend", "pytorch")).strip().lower()
-    if backend not in {"pytorch", "native", "triton"}:
-        raise ValueError(
-            "MiniMax M2 execution backend must be 'pytorch', 'native', or "
-            f"'triton', got {backend!r}."
-        )
-    return backend
-
-
-def _dense_quantization_config(config):
-    quantization = config.quantization_config
-    if _execution_backend(config) == "pytorch":
-        return replace(quantization, backend="reference")
-    return quantization
-
-
-def _torch_biased_sigmoid_topk(
-    router_logits: torch.Tensor,
-    correction_bias: torch.Tensor,
-    *,
-    top_k: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    routing_weights = torch.sigmoid(router_logits.float())
-    scores = routing_weights + correction_bias
-    _, topk_ids = torch.topk(scores, top_k, dim=-1, sorted=False)
-    topk_weights = routing_weights.gather(1, topk_ids)
-    topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-    return topk_weights, topk_ids
-
-
 class MiniMaxM2Router(nn.Module):
     def __init__(self, config) -> None:
         super().__init__()
         self.hidden_size = int(config.hidden_size)
         self.num_experts = int(config.num_local_experts)
         self.top_k = int(config.num_experts_per_tok)
-        self.backend = _execution_backend(config)
         self.weight = nn.Parameter(
             torch.empty(self.num_experts, self.hidden_size, dtype=torch.float32)
         )
         self.e_score_correction_bias = nn.Parameter(
             torch.empty(self.num_experts, dtype=torch.float32)
         )
-        if self.backend == "triton":
-            from sparsevllm.triton_kernel.minimax_m2_router import (
-                topk_biased_sigmoid,
-            )
+        from sparsevllm.triton_kernel.minimax_m2_router import (
+            topk_biased_sigmoid,
+        )
 
-            self.topk_impl = topk_biased_sigmoid
-        else:
-            self.topk_impl = _torch_biased_sigmoid_topk
+        self.topk_impl = topk_biased_sigmoid
 
     def forward(
         self,
@@ -160,19 +120,6 @@ class MiniMaxM2PackedExperts(nn.Module):
             ),
         )
         self._loaded_expert_shards: set[tuple[int, str]] = set()
-        self.backend = _execution_backend(config)
-        if self.backend == "pytorch":
-            self.forward_impl = self.forward_reference
-        elif self.backend == "native":
-            quantization = config.quantization_config
-            self.native_linear = Fp8BlockScaledLinearBackend(
-                block_size=tuple(quantization.weight_block_size),
-                backend=str(quantization.backend),
-                model_name="MiniMax M2.7",
-            )
-            self.forward_impl = self.forward_native
-        else:
-            self.forward_impl = self.forward_triton
 
     def is_local_expert(self, global_expert_id: int) -> bool:
         return self.local_expert_start <= int(global_expert_id) < self.local_expert_end
@@ -221,19 +168,9 @@ class MiniMaxM2PackedExperts(nn.Module):
             # FlashInfer CUTLASS consumes [up (w3), gate (w1)].  Write that
             # physical layout during checkpoint loading instead of copying the
             # packed expert tensor in every forward call.
-            if self.backend == "triton":
-                weight_offset = (
-                    self.intermediate_size if projection == "w1" else 0
-                )
-            else:
-                weight_offset = (
-                    0 if projection == "w1" else self.intermediate_size
-                )
+            weight_offset = self.intermediate_size if projection == "w1" else 0
             scale_rows = self.intermediate_size // 128
-            if self.backend == "triton":
-                scale_offset = scale_rows if projection == "w1" else 0
-            else:
-                scale_offset = 0 if projection == "w1" else scale_rows
+            scale_offset = scale_rows if projection == "w1" else 0
             weight_target = self.w13_weight.data[
                 local_expert_id,
                 weight_offset : weight_offset + self.intermediate_size,
@@ -272,92 +209,33 @@ class MiniMaxM2PackedExperts(nn.Module):
                 f"missing={missing[:8]}."
             )
 
-    def _dispatch_loop(
-        self,
-        hidden_states: torch.Tensor,
-        topk_ids: torch.Tensor,
-        topk_weights: torch.Tensor,
-        linear,
-    ) -> torch.Tensor:
-        local_output = torch.zeros_like(hidden_states)
-        for local_expert_id in range(self.num_local_experts):
-            global_expert_id = self.local_expert_start + local_expert_id
-            token_ids, topk_slots = torch.where(topk_ids == global_expert_id)
-            if token_ids.numel() == 0:
-                continue
-            expert_input = hidden_states[token_ids]
-            gate_up = linear(
-                expert_input,
-                self.w13_weight[local_expert_id],
-                self.w13_scale_inv[local_expert_id],
-            )
-            gate, up = gate_up.chunk(2, dim=-1)
-            expert_output = linear(
-                F.silu(gate) * up,
-                self.w2_weight[local_expert_id],
-                self.w2_scale_inv[local_expert_id],
-            )
-            expert_output.mul_(
-                topk_weights[token_ids, topk_slots, None].to(expert_output.dtype)
-            )
-            local_output.index_add_(0, token_ids, expert_output.to(local_output.dtype))
-        return local_output
-
-    def forward_reference(
-        self,
-        hidden_states: torch.Tensor,
-        topk_ids: torch.Tensor,
-        topk_weights: torch.Tensor,
-    ) -> torch.Tensor:
-        return self._dispatch_loop(
-            hidden_states,
-            topk_ids,
-            topk_weights,
-            fp8_blockwise_linear_reference,
-        )
-
-    def forward_native(
-        self,
-        hidden_states: torch.Tensor,
-        topk_ids: torch.Tensor,
-        topk_weights: torch.Tensor,
-    ) -> torch.Tensor:
-        return self._dispatch_loop(
-            hidden_states,
-            topk_ids,
-            topk_weights,
-            self.native_linear,
-        )
-
-    def forward_triton(
-        self,
-        hidden_states: torch.Tensor,
-        topk_ids: torch.Tensor,
-        topk_weights: torch.Tensor,
-    ) -> torch.Tensor:
-        from sparsevllm.triton_kernel.minimax_m2_moe_fp8 import (
-            fused_moe_fp8_flashinfer,
-        )
-
-        return fused_moe_fp8_flashinfer(
-            hidden_states,
-            self.w13_weight,
-            self.w13_scale_inv,
-            self.w2_weight,
-            self.w2_scale_inv,
-            topk_ids,
-            topk_weights,
-            ep_size=self.ep_size,
-            ep_rank=self.ep_rank,
-        )
-
     def forward(
         self,
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
     ) -> torch.Tensor:
-        return self.forward_impl(hidden_states, topk_ids, topk_weights)
+        from flashinfer.fused_moe import cutlass_fused_moe
+        from flashinfer.tllm_enums import ActivationType
+
+        output = torch.empty_like(hidden_states)
+        cutlass_fused_moe(
+            hidden_states,
+            topk_ids.to(dtype=torch.int32),
+            topk_weights,
+            self.w13_weight,
+            self.w2_weight,
+            hidden_states.dtype,
+            quant_scales=[self.w13_scale_inv, self.w2_scale_inv],
+            ep_size=self.ep_size,
+            ep_rank=self.ep_rank,
+            output=output,
+            use_deepseek_fp8_block_scale=True,
+            use_fused_finalize=False,
+            enable_pdl=False,
+            activation_type=ActivationType.Swiglu,
+        )
+        return output
 
 
 class MiniMaxM2SparseMoeBlock(nn.Module):
@@ -395,20 +273,19 @@ class MiniMaxM2Attention(nn.Module):
         self.rotary_dim = int(config.rotary_dim)
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
-        quantization = _dense_quantization_config(config)
         self.qkv_proj = QKVParallelLinear(
             int(config.hidden_size),
             self.head_dim,
             self.total_num_heads,
             self.total_num_kv_heads,
             bias=False,
-            quantization=quantization,
+            quantization=config.quantization_config,
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             int(config.hidden_size),
             bias=False,
-            quantization=quantization,
+            quantization=config.quantization_config,
         )
         self.q_norm = RMSNorm(
             self.q_size,
@@ -517,9 +394,7 @@ class MiniMaxM2ForCausalLM(nn.Module):
         self._intentionally_skipped_expert_scales: set[str] = set()
 
     @torch.inference_mode()
-    def warmup_moe_backend(self) -> None:
-        if _execution_backend(self.config) != "triton":
-            return
+    def warmup_moe(self) -> None:
         layer = self.model.layers[0]
         experts = layer.block_sparse_moe.experts
         device = experts.w13_weight.device
@@ -550,7 +425,7 @@ class MiniMaxM2ForCausalLM(nn.Module):
             dtype=torch.float32,
             device=device,
         )
-        experts.forward_triton(hidden_states, topk_ids, topk_weights)
+        experts(hidden_states, topk_ids, topk_weights)
         device_runtime.synchronize()
 
     def map_weight_name(self, source_weight_name: str) -> str | None:

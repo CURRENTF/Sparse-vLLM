@@ -688,7 +688,6 @@ class Config:
     data_parallel_size: int = 1
     # Total host-side I/O worker budget shared by all distributed ranks.
     weight_loading_workers: int = 8
-    moe_backend: str = "triton"
     enforce_eager: bool = True
     hf_config: Union[Qwen3Config, AutoConfig] | None = None
     outer_hf_config: Any | None = None
@@ -1199,7 +1198,6 @@ class Config:
         self.expert_parallel_size = int(self.expert_parallel_size)
         self.data_parallel_size = int(self.data_parallel_size)
         self.weight_loading_workers = int(self.weight_loading_workers)
-        self.moe_backend = str(self.moe_backend or "").strip().lower()
         if not 1 <= self.tensor_parallel_size <= 8:
             raise ValueError(f"tensor_parallel_size must be in [1, 8], got {self.tensor_parallel_size}.")
         if self.expert_parallel_size <= 0:
@@ -1214,11 +1212,6 @@ class Config:
             raise ValueError(
                 "weight_loading_workers must be positive, "
                 f"got {self.weight_loading_workers}."
-            )
-        if self.moe_backend not in {"pytorch", "native", "triton"}:
-            raise ValueError(
-                "moe_backend must be 'pytorch', 'native', or 'triton', "
-                f"got {self.moe_backend!r}."
             )
         self._normalize_platform_aliases()
         if legacy_deltakv_graph_method:
@@ -1299,11 +1292,6 @@ class Config:
             setattr(self.hf_config, "model_type", "qwen3_5")
         model_type = str(getattr(self.hf_config, "model_type", "") or "")
         is_minimax_m2 = model_type == "minimax_m2"
-        if self.moe_backend == "native" and not is_minimax_m2:
-            raise ValueError(
-                "moe_backend='native' is supported only for MiniMax M2.7, "
-                f"got model_type={model_type!r}."
-            )
         if self.tiny_random:
             from sparsevllm.debug.tiny_random import apply_tiny_random_overrides
 
@@ -1427,12 +1415,6 @@ class Config:
                     "MiniMax M2.7 requires num_local_experts divisible by "
                     f"expert_parallel_size, got {num_experts} and "
                     f"{self.expert_parallel_size}."
-                )
-            if self.decode_cuda_graph and self.moe_backend != "triton":
-                raise ValueError(
-                    "MiniMax M2.7 decode CUDA Graph requires "
-                    "moe_backend='triton'; the pytorch and native backends use "
-                    "data-dependent eager expert dispatch."
                 )
             validate_model_runtime_compatibility(
                 model_type=model_type,
