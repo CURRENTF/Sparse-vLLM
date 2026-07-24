@@ -13,6 +13,7 @@ def _silu_and_mul_kernel(
     stride_output_n,
     size_m,
     size_n,
+    GATE_FIRST: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
@@ -27,8 +28,13 @@ def _silu_and_mul_kernel(
     input_n_offsets = pid * BLOCK_N + tl.arange(0, BLOCK_N)
     output_n_offsets = pid * BLOCK_N + tl.arange(0, BLOCK_N)
 
-    up_offsets = input_m_offsets[:, None] * stride_input_m + (input_n_offsets[None, :] + size_n) * stride_input_n
-    gate_offsets = input_m_offsets[:, None] * stride_input_m + input_n_offsets[None, :] * stride_input_n
+    first_offsets = (
+        input_m_offsets[:, None] * stride_input_m
+        + input_n_offsets[None, :] * stride_input_n
+    )
+    second_offsets = first_offsets + size_n * stride_input_n
+    gate_offsets = first_offsets if GATE_FIRST else second_offsets
+    up_offsets = second_offsets if GATE_FIRST else first_offsets
     res_offsets = output_m_offsets[:, None] * stride_output_m + output_n_offsets[None, :] * stride_output_n
 
     up = tl.load(
@@ -52,7 +58,12 @@ def _silu_and_mul_kernel(
     )
 
 
-def silu_and_mul_fwd(input):
+def silu_and_mul_fwd(input, *, gate_up_order: str = "gate_up"):
+    if gate_up_order not in {"gate_up", "up_gate"}:
+        raise ValueError(
+            "gate_up_order must be 'gate_up' or 'up_gate', "
+            f"got {gate_up_order!r}."
+        )
     stride_input_m = input.stride(0)
     stride_input_n = input.stride(1)
     stride_output_m = input.stride(0)
@@ -73,8 +84,9 @@ def silu_and_mul_fwd(input):
         stride_output_n,
         size_m,
         size_n,
-        BLOCK_M,
-        BLOCK_N,
+        GATE_FIRST=gate_up_order == "gate_up",
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
     )
     return input[:, 0 : (input.shape[-1] // 2)]
 

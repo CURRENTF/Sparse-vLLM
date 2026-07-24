@@ -37,6 +37,7 @@ dependencies = [
     "pytest",
     "math-verify==0.9.0",
     "flashinfer-python>=0.6.14",
+    "flashinfer-cubin>=0.6.14",
     "flashinfer-jit-cache>=0.6.14",
 ]
 
@@ -45,12 +46,8 @@ prefix-offload = [
     "sgl-kernel @ https://github.com/sgl-project/whl/releases/download/v0.3.14.post1/sgl_kernel-0.3.14.post1%2Bcu128-cp310-abi3-manylinux2014_x86_64.whl",
 ]
 qwen35 = [
-    "kernels==0.15.2",
     "einops",
     "sgl-kernel @ https://github.com/sgl-project/whl/releases/download/v0.3.14.post1/sgl_kernel-0.3.14.post1%2Bcu128-cp310-abi3-manylinux2014_x86_64.whl",
-]
-minimax_m2 = [
-    "kernels==0.15.2",
 ]
 
 [project.scripts]

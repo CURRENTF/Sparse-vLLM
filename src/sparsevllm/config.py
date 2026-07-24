@@ -304,7 +304,6 @@ class QuantizationConfig:
     weight_dtype: str = ""
     activation_scheme: str = ""
     weight_block_size: tuple[int, int] | None = None
-    backend: str = "auto"
     model_name: str = "qwen3_5"
 
     @classmethod
@@ -318,7 +317,6 @@ class QuantizationConfig:
             "quant_method": self.quant_method,
             "fmt": self.weight_dtype,
             "activation_scheme": self.activation_scheme,
-            "backend": self.backend,
         }
         if self.weight_block_size is not None:
             payload["weight_block_size"] = list(self.weight_block_size)
@@ -394,14 +392,12 @@ class QuantizationConfig:
                 f"got {block_tuple}."
             )
 
-        backend = str(_config_get(value, "backend", "auto") or "auto").strip().lower()
         return cls(
             enabled=True,
             quant_method="fp8",
             weight_dtype="e4m3",
             activation_scheme="dynamic",
             weight_block_size=block_tuple,
-            backend=backend,
             model_name=model_name,
         )
 

@@ -104,14 +104,13 @@ def _config(**overrides):
         "rms_norm_eps": 1.0e-6,
         "hidden_act": "silu",
         "tie_word_embeddings": False,
-        "torch_dtype": torch.float32,
+        "torch_dtype": torch.bfloat16,
         "quantization_config": QuantizationConfig(
             enabled=True,
             quant_method="fp8",
             weight_dtype="e4m3",
             activation_scheme="dynamic",
             weight_block_size=(128, 128),
-            backend="auto",
             model_name="MiniMax M2.7",
         ),
     }

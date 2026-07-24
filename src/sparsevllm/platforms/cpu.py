@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import os
+from functools import lru_cache
 
 import torch
 
-from sparsevllm.platforms.interface import Platform, PlatformEnum
+from sparsevllm.platforms.interface import DeviceCaps, Platform, PlatformEnum
 
 
 class CpuPlatform(Platform):
@@ -32,5 +33,12 @@ class CpuPlatform(Platform):
             return available_pages * page_size, total_pages * page_size
         raise NotImplementedError("CPU memory probing requires os.sysconf support.")
 
-    def supports_bfloat16(self) -> bool:
-        return True
+    @lru_cache(maxsize=None)
+    def get_device_caps(self, device_index: int = 0) -> DeviceCaps:
+        return DeviceCaps(
+            platform=self.enum,
+            device_type=self.device_type,
+            device_index=int(device_index),
+            device_name="cpu",
+            supports_bfloat16=True,
+        )

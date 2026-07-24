@@ -11,8 +11,9 @@ The README contains the current install command. The expected baseline is:
 - Python 3.10.
 - PyTorch 2.11.0 with the CUDA 13.0 wheel.
 - Triton 3.6.0 and torchvision 0.26.0.
-- `flashinfer-jit-cache>=0.6.14` installed from the matching FlashInfer CUDA
-  wheel index.
+- `flashinfer-cubin>=0.6.14` installed from the generic FlashInfer wheel index.
+- `flashinfer-jit-cache>=0.6.14` installed from the FlashInfer wheel index that
+  matches `torch.version.cuda`.
 - `transformers[torch]==5.13.1`.
 - `flash-attn` installed with `MAX_JOBS=8 pip install flash-attn --no-build-isolation`.
 - Editable install from the repository root with `pip install -e .`.
@@ -20,11 +21,9 @@ The README contains the current install command. The expected baseline is:
   `pip install -e ".[qwen35]"`.
 - Vanilla, OmniKV, and QuEST prefix-cache offload runs install
   `pip install -e ".[prefix-offload]"` when the Qwen3.5 extra is not needed.
-- Qwen3.5/Qwen3.6 FP8 warmup may query the Hugging Face kernel registry to
-  resolve `kernels-community/finegrained-fp8`, even for a local model path.
-  Record `HF_ENDPOINT` and proxy overrides. A SOCKS `ALL_PROXY` requires the
-  `httpx` SOCKS extra/`socksio`; otherwise clear the unusable override before
-  launching the benchmark.
+- Record the selected operator provider and CUDA compute capability. FP8
+  providers are selected locally from device capabilities and do not download
+  Hub kernels during warmup.
 
 Record CUDA version, GPU type/count, visible GPU ids, branch, commit, and any
 relevant uncommitted changes with every reported benchmark.

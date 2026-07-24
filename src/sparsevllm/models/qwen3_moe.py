@@ -11,6 +11,11 @@ from transformers import Qwen3MoeConfig
 from sparsevllm.distributed import get_parallel_context
 from sparsevllm.layers.embed_head import ParallelLMHead
 from sparsevllm.models.qwen3 import Qwen3DecoderLayerBase, Qwen3ModelBase
+from sparsevllm.operators.moe import (
+    MoeOpSpec,
+    model_activation_dtype,
+    resolve_moe_provider,
+)
 from sparsevllm.platforms import device_runtime
 from sparsevllm.utils.log import logger
 
@@ -62,6 +67,20 @@ class Qwen3MoePackedExperts(nn.Module):
         self.num_local_experts = self.num_experts // self.ep_size
         self.local_expert_start = self.ep_rank * self.num_local_experts
         self.local_expert_end = self.local_expert_start + self.num_local_experts
+        activation_dtype = model_activation_dtype(config)
+        self.op_spec = MoeOpSpec(
+            num_experts=self.num_experts,
+            num_local_experts=self.num_local_experts,
+            hidden_size=self.hidden_size,
+            intermediate_size=self.intermediate_size,
+            top_k=int(config.num_experts_per_tok),
+            activation_dtype=activation_dtype,
+            weight_dtype=activation_dtype,
+            block_shape=None,
+            ep_size=int(self.ep_size),
+            cuda_graph=bool(getattr(config, "decode_cuda_graph", False)),
+        )
+        self.provider = resolve_moe_provider(self.op_spec)
         self.w13_weight = nn.Parameter(
             torch.empty(
                 self.num_local_experts,
@@ -106,7 +125,11 @@ class Qwen3MoePackedExperts(nn.Module):
         if projection == "down_proj":
             target = self.w2_weight.data[local_expert_id]
         else:
-            offset = 0 if projection == "gate_proj" else self.intermediate_size
+            logical_projection = "gate" if projection == "gate_proj" else "up"
+            offset = self.provider.packed_projection_offset(
+                logical_projection,
+                self.intermediate_size,
+            )
             target = self.w13_weight.data[local_expert_id, offset : offset + self.intermediate_size]
         if tuple(target.shape) != tuple(loaded_weight.shape):
             raise ValueError(
@@ -137,16 +160,17 @@ class Qwen3MoePackedExperts(nn.Module):
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
     ) -> torch.Tensor:
-        from sparsevllm.triton_kernel.moe import fused_moe
-
-        return fused_moe(
+        return self.provider.run(
+            self.op_spec,
             hidden_states,
-            self.w13_weight,
-            self.w2_weight,
             topk_ids,
             topk_weights,
-            num_experts=self.num_experts,
+            self.w13_weight,
+            self.w2_weight,
+            None,
+            None,
             local_expert_start=self.local_expert_start,
+            ep_rank=int(self.ep_rank),
         )
 
 

@@ -60,14 +60,20 @@ For prefix-cache offload with vanilla, OmniKV, or QuEST only:
 pip install -e ".[prefix-offload]"
 ```
 
-The Qwen3.5/Qwen3.6 FP8 backend resolves the
-`kernels-community/finegrained-fp8` Hub kernel on the first FP8 forward in each
-fresh process. This version lookup may contact the Hugging Face kernel registry
-even when the model checkpoint is local. Make sure the configured Hugging Face
-endpoint is reachable. If `ALL_PROXY` uses a SOCKS URL, either install the
-`httpx` SOCKS extra (which provides `socksio`) or remove that override for the
-run; an unusable inherited SOCKS proxy fails during engine warmup before any
-sparse method executes.
+Install both FlashInfer precompiled artifact packages. They are complementary:
+`flashinfer-cubin` provides architecture-specific device binaries, while
+`flashinfer-jit-cache` provides modules built for a specific CUDA toolkit
+version. Select the JIT-cache index matching the CUDA version used by PyTorch:
+
+```bash
+pip install flashinfer-cubin --index-url https://flashinfer.ai/whl
+pip install flashinfer-jit-cache --index-url https://flashinfer.ai/whl/cu130
+```
+
+Block-scaled FP8 Linear selects an implementation from the local operator
+registry using the active CUDA device capabilities. SM90 uses the optimized
+FlashInfer implementation; other supported native-FP8 CUDA devices use the
+generic Triton implementation. No Hub kernel is downloaded during warmup.
 
 ## DeltaKV Checkpoints
 
