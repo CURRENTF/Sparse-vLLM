@@ -2380,13 +2380,13 @@ async def _run_one_job(
         if (
             config.require_router
             and _roles_require_distinct_workers(config)
-            and len(distinct_workers) < config.min_healthy_workers
+            and len(distinct_workers) < 2
         ):
             raise BenchmarkFailed(
                 "metric_failed",
                 f"Job {job_index} successful requests exercised only "
                 f"{len(distinct_workers)} distinct workers; expected at least "
-                f"{config.min_healthy_workers}."
+                "2 role workers."
             )
         job_status = "success"
     except Exception as exc:
@@ -2510,10 +2510,7 @@ async def _run_benchmark_impl(
                     for job in failed_jobs
                 )
             else:
-                if (
-                    config.require_router
-                    and not _roles_require_distinct_workers(config)
-                ):
+                if config.require_router:
                     distinct_workers = {
                         str(record["route_worker"])
                         for record in records
@@ -2525,7 +2522,7 @@ async def _run_benchmark_impl(
                     if len(distinct_workers) < config.min_healthy_workers:
                         raise BenchmarkFailed(
                             "metric_failed",
-                            "Load-balanced run exercised only "
+                            "Run exercised only "
                             f"{len(distinct_workers)} distinct workers; "
                             f"expected at least {config.min_healthy_workers}.",
                         )
