@@ -340,26 +340,39 @@ class LLMEngine:
                 f"({max_prompt_len}). Clamping warmup_len to {max_prompt_len}."
             )
             warmup_len = max_prompt_len
-        dummy_prompt = [0] * warmup_len
+        num_warmup_rounds = 2 if warmup_profile == "graph" else 1
+        vocab_size = int(self.config.hf_config.vocab_size)
+        num_dummy_prompts = num_seqs * num_warmup_rounds
+        if num_dummy_prompts > vocab_size:
+            raise ValueError(
+                "Warmup requires one distinct leading token per dummy prompt: "
+                f"need={num_dummy_prompts} vocab_size={vocab_size}."
+            )
         logger.info(
             f"Warmup profile: {warmup_profile} "
             f"(num_seqs={num_seqs}, max_tokens={sampling_params.max_tokens}, "
             f"ignore_eos={sampling_params.ignore_eos})."
         )
 
-        def run_warmup(params: SamplingParams) -> None:
-            for _ in range(num_seqs):
+        def run_warmup(params: SamplingParams, prompt_offset: int) -> None:
+            for request_idx in range(num_seqs):
+                # Keep shapes identical while preventing prefix-cache reuse
+                # within or across warmup rounds.
+                dummy_prompt = [prompt_offset + request_idx] + [0] * (warmup_len - 1)
                 self.add_request(dummy_prompt, params)
             while not self.is_finished():
                 self.step()
 
-        run_warmup(sampling_params)
+        run_warmup(sampling_params, prompt_offset=0)
 
         if warmup_profile == "graph":
             # CUDA Graph capture establishes its private allocator pool. Warm
             # prefill once more against the final allocator layout.
             logger.info(f"Post-capture prefill warmup (num_seqs={num_seqs}).")
-            run_warmup(SamplingParams(max_tokens=1, temperature=0.0))
+            run_warmup(
+                SamplingParams(max_tokens=1, temperature=0.0),
+                prompt_offset=num_seqs,
+            )
 
         self._after_warmup_debug_cleanup()
         logger.info("Warmup finished.")
