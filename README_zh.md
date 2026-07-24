@@ -135,6 +135,7 @@ pip install -e ".[qwen35]"
 本项目受到以下项目的启发，并参考了其中的理念和实现技术：
 
 - `LightLLM` (`ModelTC/LightLLM`)
+- `SGLang` (`sgl-project/sglang`)
 - `ShadowKV` (`ByteDance-Seed/ShadowKV`)
 - `nano-vllm` (`GeeeekExplorer/nano-vllm`)
 
