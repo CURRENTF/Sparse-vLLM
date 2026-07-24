@@ -5,9 +5,6 @@ import pytest
 import torch
 from safetensors.torch import save_file
 from transformers import Qwen3MoeConfig
-from transformers.models.qwen3_moe.modeling_qwen3_moe import (
-    Qwen3MoeSparseMoeBlock as HFQwen3MoeSparseMoeBlock,
-)
 
 from sparsevllm.distributed import ParallelContext, ParallelGroup
 from sparsevllm.layers.layernorm import RMSNorm
@@ -15,7 +12,6 @@ from sparsevllm.models.qwen3 import Qwen3Attention
 from sparsevllm.models.qwen3_moe import (
     Qwen3MoeForCausalLM,
     Qwen3MoePackedExperts,
-    Qwen3MoeRouter,
     Qwen3MoeSparseMoeBlock,
 )
 from sparsevllm.utils.loader import load_model
@@ -66,15 +62,68 @@ def _instantiate_model(config, context):
         return Qwen3MoeForCausalLM(config)
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def _rmsnorm_reference(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    x_float = x.float()
+    normalized = x_float * torch.rsqrt(
+        x_float.square().mean(dim=-1, keepdim=True) + eps
+    )
+    return (normalized * weight.float()).to(x.dtype)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_qwen3_rmsnorm_does_not_modify_input(dtype):
-    norm = RMSNorm(4)
-    x = torch.randn(3, 4, dtype=dtype)
+    pytest.importorskip("flashinfer")
+    norm = RMSNorm(128).cuda().to(dtype)
+    x = torch.randn(3, 128, device="cuda", dtype=dtype)
     original = x.clone()
 
-    norm(x)
+    actual = norm(x)
 
     assert torch.equal(x, original)
+    torch.testing.assert_close(
+        actual,
+        _rmsnorm_reference(x, norm.weight, norm.eps),
+        rtol=1.0e-2,
+        atol=3.0e-2,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("with_residual", [False, True])
+def test_rmsnorm_matches_fp32_reference(dtype, with_residual):
+    pytest.importorskip("flashinfer")
+    torch.manual_seed(27)
+    norm = RMSNorm(128).cuda().to(dtype)
+    norm.weight.data.normal_(mean=1.0, std=0.2)
+    x = torch.randn(7, 128, device="cuda", dtype=dtype)
+    residual = torch.randn_like(x) if with_residual else None
+
+    if residual is None:
+        expected = _rmsnorm_reference(x, norm.weight, norm.eps)
+        actual = norm(x)
+    else:
+        merged = x.float() + residual.float()
+        expected_residual = merged.to(dtype)
+        expected = _rmsnorm_reference(
+            merged,
+            norm.weight,
+            norm.eps,
+        ).to(dtype)
+        actual, actual_residual = norm(x, residual)
+        assert torch.equal(actual_residual, expected_residual)
+
+    torch.testing.assert_close(
+        actual,
+        expected,
+        rtol=1.0e-2,
+        atol=3.0e-2,
+    )
 
 
 def test_qwen3_attention_passes_raw_key_without_clone():
@@ -129,59 +178,14 @@ def test_qwen3_attention_passes_raw_key_without_clone():
     assert torch.equal(cache.saved_raw_key, expected_raw_key)
 
 
-def test_router_matches_qwen3_moe_reference_math():
-    torch.manual_seed(0)
-    config = _config()
-    router = Qwen3MoeRouter(config)
-    router.weight.data.normal_(mean=0.0, std=0.2)
-    hidden_states = torch.randn(7, config.hidden_size)
-
-    logits, topk_weights, topk_ids = router(hidden_states)
-
-    expected_logits = torch.nn.functional.linear(hidden_states, router.weight)
-    expected_probs = torch.softmax(expected_logits, dtype=torch.float32, dim=-1)
-    expected_weights, expected_ids = torch.topk(
-        expected_probs,
-        config.num_experts_per_tok,
-        dim=-1,
-    )
-    expected_weights /= expected_weights.sum(dim=-1, keepdim=True)
-    assert torch.equal(logits, expected_logits)
-    assert torch.equal(topk_ids, expected_ids)
-    assert torch.allclose(topk_weights, expected_weights.to(logits.dtype))
-
-
-def test_pytorch_moe_block_matches_transformers_reference():
-    torch.manual_seed(4)
-    config = _config()
-    reference = HFQwen3MoeSparseMoeBlock(config)
-    reference.gate.weight.data.normal_(mean=0.0, std=0.2)
-    reference.experts.gate_up_proj.data.normal_(mean=0.0, std=0.2)
-    reference.experts.down_proj.data.normal_(mean=0.0, std=0.2)
-    context = _ep_context(0, 1)
-    with patch("sparsevllm.models.qwen3_moe.get_parallel_context", return_value=context):
-        actual = Qwen3MoeSparseMoeBlock(config)
-    actual.gate.weight.data.copy_(reference.gate.weight)
-    actual.experts.w13_weight.data.copy_(reference.experts.gate_up_proj)
-    actual.experts.w2_weight.data.copy_(reference.experts.down_proj)
-    hidden_states = torch.randn(9, config.hidden_size)
-
-    expected = reference(hidden_states.unsqueeze(0)).squeeze(0)
-    output = actual(hidden_states)
-
-    assert torch.allclose(output, expected, atol=1e-6, rtol=1e-6)
-
-
-def test_moe_block_dispatches_only_the_selected_backend():
+def test_moe_block_uses_triton_kernels():
     from sparsevllm.triton_kernel.moe_topk import topk_softmax
 
     config = _config()
-    config.moe_backend = "triton"
     context = _ep_context(0, 1)
     with patch("sparsevllm.models.qwen3_moe.get_parallel_context", return_value=context):
         block = Qwen3MoeSparseMoeBlock(config)
     assert block.gate.topk_impl is topk_softmax
-    assert block.expert_forward.__func__ is Qwen3MoePackedExperts.forward_triton
     hidden_states = torch.randn(3, config.hidden_size)
     expected = torch.randn_like(hidden_states)
 
@@ -191,7 +195,7 @@ def test_moe_block_dispatches_only_the_selected_backend():
             torch.empty(3, config.num_experts_per_tok),
             torch.empty(3, config.num_experts_per_tok, dtype=torch.int64),
         )),
-        patch.object(block, "expert_forward", return_value=expected) as triton_forward,
+        patch.object(block.experts, "forward", return_value=expected) as triton_forward,
     ):
         actual = block(hidden_states)
 
@@ -201,7 +205,6 @@ def test_moe_block_dispatches_only_the_selected_backend():
 
 def test_moe_block_reduces_in_activation_dtype():
     config = _config()
-    config.moe_backend = "triton"
     context = _ep_context(0, 1)
     with patch("sparsevllm.models.qwen3_moe.get_parallel_context", return_value=context):
         block = Qwen3MoeSparseMoeBlock(config)
@@ -218,7 +221,7 @@ def test_moe_block_reduces_in_activation_dtype():
                 torch.empty(3, config.num_experts_per_tok, dtype=torch.int64),
             ),
         ),
-        patch.object(block, "expert_forward", return_value=local_output),
+        patch.object(block.experts, "forward", return_value=local_output),
     ):
         output = block(hidden_states)
 
@@ -264,35 +267,20 @@ def test_decoder_layer_broadcasts_attention_output_before_post_norm():
     ]
 
 
-def test_pytorch_moe_returns_activation_dtype_for_low_precision_input():
-    config = _config()
-    context = _ep_context(0, 1)
-    with patch("sparsevllm.models.qwen3_moe.get_parallel_context", return_value=context):
-        experts = Qwen3MoePackedExperts(config).to(torch.bfloat16)
-    hidden_states = torch.randn(3, config.hidden_size, dtype=torch.bfloat16)
-    topk_ids = torch.tensor([[0, 1], [2, 3], [1, 2]])
-    topk_weights = torch.rand(3, 2, dtype=torch.bfloat16)
-
-    output = experts.forward_pytorch(hidden_states, topk_ids, topk_weights)
-
-    assert output.dtype == hidden_states.dtype
-
-
-def test_moe_backend_warmup_uses_one_local_decode_assignment():
+def test_moe_warmup_uses_one_local_decode_assignment():
     config = _config(num_experts_per_tok=3)
-    config.moe_backend = "triton"
     context = _ep_context(1, 2)
     model = _instantiate_model(config, context)
     experts = model.model.layers[0].mlp.experts
     expected = torch.zeros(1, config.hidden_size)
 
     with (
-        patch.object(experts, "forward_triton", return_value=expected) as forward,
+        patch.object(experts, "forward", return_value=expected) as forward,
         patch(
             "sparsevllm.models.qwen3_moe.device_runtime.synchronize"
         ) as synchronize,
     ):
-        model.warmup_moe_backend()
+        model.warmup_moe()
 
     hidden_states, topk_ids, topk_weights = forward.call_args.args
     assert hidden_states.shape == (1, config.hidden_size)
@@ -301,7 +289,7 @@ def test_moe_backend_warmup_uses_one_local_decode_assignment():
     synchronize.assert_called_once()
 
 
-def test_packed_expert_weight_mapping_and_oracle():
+def test_packed_expert_weight_mapping():
     torch.manual_seed(1)
     config = _config()
     context = _ep_context(0, 1)
@@ -320,64 +308,19 @@ def test_packed_expert_weight_mapping_and_oracle():
             experts.load_expert_weight(expert_id, projection, weight)
     experts.validate_loaded_weights()
 
-    hidden_states = torch.randn(5, config.hidden_size)
-    topk_ids = torch.tensor([[0, 1], [1, 1], [2, 3], [3, 0], [2, 0]])
-    topk_weights = torch.rand(5, 2)
-    actual = experts.forward_pytorch(hidden_states, topk_ids, topk_weights)
-
-    expected = torch.zeros_like(hidden_states)
-    for token_id in range(hidden_states.shape[0]):
-        for topk_slot in range(topk_ids.shape[1]):
-            expert_id = int(topk_ids[token_id, topk_slot])
-            gate = torch.nn.functional.linear(
-                hidden_states[token_id],
-                source_weights[(expert_id, "gate_proj")],
-            )
-            up = torch.nn.functional.linear(
-                hidden_states[token_id],
-                source_weights[(expert_id, "up_proj")],
-            )
-            output = torch.nn.functional.linear(
-                torch.nn.functional.silu(gate) * up,
-                source_weights[(expert_id, "down_proj")],
-            )
-            expected[token_id] += output * topk_weights[token_id, topk_slot]
-    assert torch.allclose(actual, expected, atol=1e-5, rtol=1e-5)
-
-
-def test_ep_local_contributions_sum_to_full_expert_output():
-    torch.manual_seed(2)
-    config = _config()
-    with patch(
-        "sparsevllm.models.qwen3_moe.get_parallel_context",
-        return_value=_ep_context(0, 1),
-    ):
-        full = Qwen3MoePackedExperts(config)
-    with patch(
-        "sparsevllm.models.qwen3_moe.get_parallel_context",
-        return_value=_ep_context(0, 2),
-    ):
-        rank0 = Qwen3MoePackedExperts(config)
-    with patch(
-        "sparsevllm.models.qwen3_moe.get_parallel_context",
-        return_value=_ep_context(1, 2),
-    ):
-        rank1 = Qwen3MoePackedExperts(config)
-
-    full.w13_weight.data.normal_(mean=0.0, std=0.2)
-    full.w2_weight.data.normal_(mean=0.0, std=0.2)
-    rank0.w13_weight.data.copy_(full.w13_weight[:2])
-    rank0.w2_weight.data.copy_(full.w2_weight[:2])
-    rank1.w13_weight.data.copy_(full.w13_weight[2:])
-    rank1.w2_weight.data.copy_(full.w2_weight[2:])
-    hidden_states = torch.randn(6, config.hidden_size)
-    topk_ids = torch.tensor([[0, 1], [2, 3], [0, 0], [3, 3], [1, 2], [0, 1]])
-    topk_weights = torch.rand(6, 2)
-
-    expected = full.forward_pytorch(hidden_states, topk_ids, topk_weights)
-    actual = rank0.forward_pytorch(hidden_states, topk_ids, topk_weights)
-    actual += rank1.forward_pytorch(hidden_states, topk_ids, topk_weights)
-    assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+    for expert_id in range(config.num_experts):
+        assert torch.equal(
+            experts.w13_weight[expert_id, : config.moe_intermediate_size],
+            source_weights[(expert_id, "gate_proj")],
+        )
+        assert torch.equal(
+            experts.w13_weight[expert_id, config.moe_intermediate_size :],
+            source_weights[(expert_id, "up_proj")],
+        )
+        assert torch.equal(
+            experts.w2_weight[expert_id],
+            source_weights[(expert_id, "down_proj")],
+        )
 
 
 def test_model_maps_only_local_experts_and_validates_all_weights():

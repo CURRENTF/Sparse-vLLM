@@ -63,8 +63,8 @@ class FakeCacheManager(CacheManager):
         config = types.SimpleNamespace(
             hf_config=hf_config,
             max_model_len=10,
-            max_num_seqs_in_batch=2,
             max_num_seqs_in_gpu=2,
+            max_num_seqs_in_batch=2,
             num_kvcache_slots=16,
         )
         super().__init__(config, _single_process_parallel_context())
@@ -365,6 +365,7 @@ class SparseVLLMRegressionGradingTest(unittest.TestCase):
         prompt = build_chat(tokenizer, "classify this", "trec", thinking_mode="off")
 
         self.assertEqual(prompt, "classify this")
+        self.assertFalse(hasattr(tokenizer, "kwargs"))
         self.assertEqual(
             build_chat(tokenizer, "classify this", "trec", no_chat_template=True, thinking_mode="off"),
             "classify this",

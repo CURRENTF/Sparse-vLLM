@@ -1,14 +1,150 @@
 import json
 import os
+import time
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from glob import glob
+
 import torch
-from torch import nn
 from safetensors import safe_open
+from torch import nn
+from tqdm.auto import tqdm
+
 from sparsevllm.utils.log import logger
 
 
 def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
     param.data.copy_(loaded_weight)
+
+
+@dataclass(frozen=True)
+class TensorMetadata:
+    shape: tuple[int, ...]
+    dtype: str
+
+
+@dataclass
+class SafetensorsShard:
+    metadata: dict[str, TensorMetadata]
+    tensors: dict[str, torch.Tensor]
+
+
+def _rank_local_slice_for_tensor(
+    model: nn.Module,
+    source_weight_name: str,
+    source_shape: tuple[int, ...],
+) -> tuple[slice, ...] | None:
+    is_scale = source_weight_name.endswith(".weight_scale_inv")
+    source_parameter_name = (
+        source_weight_name[: -len(".weight_scale_inv")] + ".weight"
+        if is_scale
+        else source_weight_name
+    )
+    target_parameter_name = _target_weight_name_for_model(
+        model, source_parameter_name
+    )
+    if target_parameter_name is None:
+        return None
+
+    special_loader = getattr(model, "load_special_weight", None)
+    special_suffixes = tuple(getattr(model, "special_weight_loaders", ()))
+    if callable(special_loader) and target_parameter_name.endswith(special_suffixes):
+        return None
+
+    loaded_shard_id = None
+    packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
+    for source_fragment, (target_fragment, shard_id) in packed_modules_mapping.items():
+        if source_fragment in target_parameter_name:
+            target_parameter_name = target_parameter_name.replace(
+                source_fragment, target_fragment
+            )
+            loaded_shard_id = shard_id
+            break
+
+    module = _module_for_parameter(model, target_parameter_name)
+    slicer = getattr(module, "rank_local_weight_slice", None)
+    if not callable(slicer):
+        return None
+    return slicer(
+        source_shape,
+        loaded_shard_id=loaded_shard_id,
+        is_scale=is_scale,
+    )
+
+
+def _read_safetensors_shard(
+    path: str,
+    model: nn.Module | None = None,
+) -> SafetensorsShard:
+    with safe_open(path, "pt", "cpu") as handle:
+        metadata: dict[str, TensorMetadata] = {}
+        tensors: dict[str, torch.Tensor] = {}
+        for key in handle.keys():
+            tensor_slice = handle.get_slice(key)
+            source_shape = tuple(int(dim) for dim in tensor_slice.get_shape())
+            metadata[key] = TensorMetadata(
+                shape=source_shape,
+                dtype=str(tensor_slice.get_dtype()),
+            )
+            if model is None:
+                tensors[key] = handle.get_tensor(key)
+                continue
+
+            is_scale = key.endswith(".weight_scale_inv")
+            source_parameter_name = (
+                key[: -len(".weight_scale_inv")] + ".weight"
+                if is_scale
+                else key
+            )
+            if _target_weight_name_for_model(model, source_parameter_name) is None:
+                continue
+            rank_slice = _rank_local_slice_for_tensor(
+                model,
+                key,
+                source_shape,
+            )
+            tensors[key] = (
+                tensor_slice[rank_slice]
+                if rank_slice is not None
+                else handle.get_tensor(key)
+            )
+        return SafetensorsShard(metadata=metadata, tensors=tensors)
+
+
+def _iter_safetensors_shards(
+    files: list[str],
+    *,
+    num_threads: int,
+    model: nn.Module | None = None,
+):
+    """Prefetch a bounded number of shards while preserving checkpoint order."""
+    if num_threads == 1 or len(files) == 1:
+        for file in files:
+            yield file, _read_safetensors_shard(file, model)
+        return
+
+    file_iter = iter(files)
+    pending: deque[tuple[str, Future[SafetensorsShard]]] = deque()
+    with ThreadPoolExecutor(max_workers=min(num_threads, len(files))) as executor:
+        for _ in range(min(num_threads, len(files))):
+            file = next(file_iter)
+            pending.append(
+                (file, executor.submit(_read_safetensors_shard, file, model))
+            )
+
+        while pending:
+            file, future = pending.popleft()
+            tensors = future.result()
+            next_file = next(file_iter, None)
+            if next_file is not None:
+                pending.append(
+                    (
+                        next_file,
+                        executor.submit(_read_safetensors_shard, next_file, model),
+                    )
+                )
+            yield file, tensors
 
 
 def _module_for_parameter(model: nn.Module, param_name: str) -> nn.Module:
@@ -462,53 +598,127 @@ def load_model(
     *,
     tp_rank: int | None = None,
     tp_size: int | None = None,
+    num_threads: int = 8,
+    show_progress: bool | None = None,
+    progress_rank: int | None = None,
 ):
+    num_threads = int(num_threads)
+    if num_threads <= 0:
+        raise ValueError(f"num_threads must be positive, got {num_threads}.")
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
     files = sorted(glob(os.path.join(path, "*.safetensors")))
     assert len(files) > 0, f"No safetensors found in {path}"
+    checkpoint_is_rank_local = False
 
     # Some tensor-parallel converters emit one file per rank:
     #   model{tp_rank}-mp{tp_size}.safetensors
-    # In that case load only the local rank shard.
+    # They may also split each rank across multiple files with the same prefix.
+    # In either case load only the local rank files and do not slice them again.
     if tp_rank is not None and tp_size is not None:
-        shard = os.path.join(path, f"model{tp_rank}-mp{tp_size}.safetensors")
-        if os.path.isfile(shard):
-            files = [shard]
+        rank_prefix = os.path.join(path, f"model{tp_rank}-mp{tp_size}")
+        rank_files = sorted(glob(f"{rank_prefix}*.safetensors"))
+        if rank_files:
+            files = rank_files
+            checkpoint_is_rank_local = True
         else:
-            mp_files = sorted(glob(os.path.join(path, f"model*-mp{tp_size}.safetensors")))
+            mp_files = sorted(
+                glob(os.path.join(path, f"model*-mp{tp_size}*.safetensors"))
+            )
             if mp_files:
                 raise FileNotFoundError(
                     "Detected per-rank weight shards but missing expected shard for this rank. "
-                    f"expected={shard} available={mp_files}"
+                    f"expected_prefix={rank_prefix} available={mp_files}"
                 )
-    
+
+    load_start = time.perf_counter()
+    rank_local_tensor_slicing = (
+        not checkpoint_is_rank_local
+        and tp_rank is not None
+        and tp_size is not None
+        and tp_size > 1
+    )
     loaded_count = 0
+    loaded_tensor_bytes = 0
     loaded_parameter_names: set[str] = set()
-    for file in files:
-        with safe_open(file, "pt", "cpu") as f:
-            keys = list(f.keys())
+    seen_source_keys: set[str] = set()
+    if show_progress is None:
+        show_progress = tp_rank is None or tp_rank == 0
+    description = (
+        "Multi-thread loading shards"
+        if num_threads > 1 and len(files) > 1
+        else "Loading weight shards"
+    )
+    if progress_rank is not None:
+        description = f"{description} (rank {int(progress_rank)})"
+    with tqdm(
+        total=len(files),
+        desc=description,
+        unit="shard",
+        dynamic_ncols=True,
+        disable=not show_progress,
+    ) as progress:
+        for _, shard in _iter_safetensors_shards(
+            files,
+            num_threads=num_threads,
+            model=None if checkpoint_is_rank_local else model,
+        ):
+            tensors = shard.tensors
+            loaded_tensor_bytes += sum(
+                tensor.numel() * tensor.element_size()
+                for tensor in tensors.values()
+            )
+            keys = list(shard.metadata)
+            duplicate_source_keys = sorted(seen_source_keys.intersection(keys))
+            if duplicate_source_keys:
+                raise ValueError(
+                    "Checkpoint contains duplicate tensor keys across safetensor shards: "
+                    f"{duplicate_source_keys[:5]}."
+                )
+            seen_source_keys.update(keys)
             scale_keys = {key for key in keys if key.endswith(".weight_scale_inv")}
             consumed_scale_keys: set[str] = set()
             for source_weight_name in keys:
                 if source_weight_name.endswith(".weight_scale_inv"):
                     continue
                 scale_key = None
-                loaded_scale = None
                 if source_weight_name.endswith(".weight"):
                     scale_key = _scale_key_for_weight_key(source_weight_name)
-                    loaded_scale = f.get_tensor(scale_key) if scale_key in scale_keys else None
                 param_name = _target_weight_name_for_model(model, source_weight_name)
                 if param_name is None:
-                    if scale_key is not None and loaded_scale is not None:
+                    skipped_weight_hook = getattr(model, "record_skipped_weight", None)
+                    if callable(skipped_weight_hook):
+                        weight_metadata = shard.metadata[source_weight_name]
+                        scale_metadata = shard.metadata.get(scale_key)
+                        skipped_weight_hook(
+                            source_weight_name,
+                            weight_metadata.shape,
+                            weight_metadata.dtype,
+                            (
+                                scale_metadata.shape
+                                if scale_metadata is not None
+                                else None
+                            ),
+                            (
+                                scale_metadata.dtype
+                                if scale_metadata is not None
+                                else None
+                            ),
+                        )
+                    if scale_key is not None and scale_key in scale_keys:
                         consumed_scale_keys.add(scale_key)
                     continue
+                loaded_scale = (
+                    tensors.get(scale_key)
+                    if scale_key is not None and scale_key in scale_keys
+                    else None
+                )
                 special_loader = getattr(model, "load_special_weight", None)
                 special_suffixes = tuple(getattr(model, "special_weight_loaders", ()))
                 if callable(special_loader) and param_name.endswith(special_suffixes):
                     special_count = int(
                         special_loader(
                             param_name,
-                            f.get_tensor(source_weight_name),
+                            tensors[source_weight_name],
                             loaded_scale,
                         )
                     )
@@ -526,17 +736,12 @@ def load_model(
                         v, shard_id = packed_modules_mapping[k]
                         packed_param_name = param_name.replace(k, v)
                         module = _module_for_parameter(model, packed_param_name)
-                        scale_key = None
-                        loaded_scale = None
-                        if source_weight_name.endswith(".weight"):
-                            scale_key = _scale_key_for_weight_key(source_weight_name)
-                            loaded_scale = f.get_tensor(scale_key) if scale_key in scale_keys else None
                         if _load_grouped_quantized_weight(
                             model=model,
                             module=module,
                             source_weight_name=source_weight_name,
                             target_weight_name=packed_param_name,
-                            loaded_weight=f.get_tensor(source_weight_name),
+                            loaded_weight=tensors[source_weight_name],
                             loaded_scale=loaded_scale,
                             loaded_shard_id=shard_id,
                         ):
@@ -544,7 +749,7 @@ def load_model(
                         else:
                             param = model.get_parameter(packed_param_name)
                             weight_loader = getattr(param, "weight_loader")
-                            weight_loader(param, f.get_tensor(source_weight_name), shard_id)
+                            weight_loader(param, tensors[source_weight_name], shard_id)
                         loaded_parameter_names.add(packed_param_name)
                         loaded_count += 1
                         break
@@ -553,7 +758,7 @@ def load_model(
                     loaded_scale = None
                     if source_weight_name.endswith(".weight"):
                         scale_key = _scale_key_for_weight_key(source_weight_name)
-                        loaded_scale = f.get_tensor(scale_key) if scale_key in scale_keys else None
+                        loaded_scale = tensors.get(scale_key)
                     if loaded_scale is not None:
                         consumed_scale_keys.add(scale_key)
                     if _load_grouped_quantized_weight(
@@ -561,14 +766,15 @@ def load_model(
                         module=module,
                         source_weight_name=source_weight_name,
                         target_weight_name=param_name,
-                        loaded_weight=f.get_tensor(source_weight_name),
+                        loaded_weight=tensors[source_weight_name],
                         loaded_scale=loaded_scale,
                     ):
+                        loaded_parameter_names.add(param_name)
                         loaded_count += 1
                         continue
                     param = model.get_parameter(param_name)
                     weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                    weight_loader(param, f.get_tensor(source_weight_name))
+                    weight_loader(param, tensors[source_weight_name])
                     loaded_parameter_names.add(param_name)
                     loaded_count += 1
             unused_scale_keys = sorted(scale_keys - consumed_scale_keys)
@@ -577,10 +783,21 @@ def load_model(
                     "Found weight_scale_inv tensors without a grouped FP8 weight load: "
                     f"{unused_scale_keys[:5]}."
                 )
-    
+            progress.update(1)
+            progress.set_postfix(
+                loaded=f"{loaded_tensor_bytes / 2**30:.1f} GiB"
+            )
+
     assert loaded_count > 0, f"No weights were loaded from {path}"
     _validate_all_quantized_weights_loaded(model)
     strict_validator = getattr(model, "validate_loaded_weights", None)
     if callable(strict_validator):
         strict_validator(loaded_parameter_names)
-    print(f"Successfully loaded {loaded_count} weights from {path}")
+    logger.info(
+        f"Load weight end. elapsed={time.perf_counter() - load_start:.2f} s, "
+        f"type={type(model).__name__}, shards={len(files)}, "
+        f"workers={min(num_threads, len(files))}, weights={loaded_count}, "
+        f"tensor_bytes={loaded_tensor_bytes / 2**30:.2f} GiB, "
+        f"rank_local_checkpoint={checkpoint_is_rank_local}, "
+        f"rank_local_tensor_slicing={rank_local_tensor_slicing}."
+    )

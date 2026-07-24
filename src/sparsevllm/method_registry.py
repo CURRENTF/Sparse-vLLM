@@ -74,8 +74,37 @@ QWEN3_MOE_EP_COMPATIBILITY = ModelRuntimeCompatibility(
     decode_cuda_graph_methods=frozenset({""}),
 )
 
+MINIMAX_M2_EP_COMPATIBILITY = ModelRuntimeCompatibility(
+    parallel_mode="ep_replicated_kv",
+    sparse_methods=frozenset(
+        {
+            "",
+            "streamingllm",
+            "snapkv",
+            "pyramidkv",
+            "omnikv",
+            "quest",
+            "rkv",
+        }
+    ),
+    prefix_cache_methods=frozenset({"", "omnikv", "quest"}),
+    requires_eager=False,
+    decode_cuda_graph_methods=frozenset(
+        {
+            "",
+            "streamingllm",
+            "snapkv",
+            "pyramidkv",
+            "omnikv",
+            "quest",
+            "rkv",
+        }
+    ),
+)
+
 MODEL_RUNTIME_COMPATIBILITY = {
     "qwen3_moe": QWEN3_MOE_EP_COMPATIBILITY,
+    "minimax_m2": MINIMAX_M2_EP_COMPATIBILITY,
 }
 
 # All shipped cache managers now expose a graph-stable decode preparation path.
@@ -175,12 +204,12 @@ def validate_model_runtime_compatibility(
             f"{model_type} v1 decode_cuda_graph is validated only for {supported}; "
             f"got method={method!r}."
         )
-    if method == "skipkv":
+    if model_type == "qwen3_moe" and method == "skipkv":
         raise NotImplementedError(
             "Qwen3MoE + SkipKV requires a Qwen3MoE-matched steering asset and validation; "
             "no compatible asset is currently registered."
         )
-    if method == "deltakv":
+    if model_type == "qwen3_moe" and method == "deltakv":
         raise NotImplementedError(
             "Qwen3MoE + DeltaKV is not part of the validated v1 compatibility matrix."
         )
