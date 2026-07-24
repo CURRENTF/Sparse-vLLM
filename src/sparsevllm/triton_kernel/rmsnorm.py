@@ -1,98 +1,233 @@
-import torch
+"""Inference-only Triton RMSNorm kernels.
 
+Adapted from SGLang's Apache-2.0 licensed Triton normalization kernel:
+reference/sglang/python/sglang/jit_kernel/diffusion/triton/norm.py
+"""
+
+from __future__ import annotations
+
+import torch
 import triton
 import triton.language as tl
 
 
+_SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
+
+
 @triton.jit
-def _rms_norm_fwd_fused(
-    X,  # pointer to the input
-    Y,  # pointer to the output
-    W,  # pointer to the weights
-    x_stride0,  # how much to increase the pointer when moving by 1 row
-    x_stride1,
-    y_stride0,
-    y_stride1,
-    N,  # number of columns in X
-    eps,  # epsilon to avoid division by zero
+def _rms_norm_fwd_kernel(
+    x_ptr,
+    residual_ptr,
+    weight_ptr,
+    output_ptr,
+    residual_out_ptr,
+    stride_x_row,
+    stride_residual_row,
+    stride_output_row,
+    stride_residual_out_row,
+    hidden_size,
+    eps,
+    HAS_RESIDUAL: tl.constexpr,
+    ZERO_CENTERED_WEIGHT: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    # Map the program id to the row of X and Y it should compute.
     row = tl.program_id(0)
-    Y += row * y_stride0
-    X += row * x_stride0
-    # Compute variance
-    _var = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
-    for off in range(0, N, BLOCK_SIZE):
-        cols = off + tl.arange(0, BLOCK_SIZE)
-        x = tl.load(X + cols * x_stride1, mask=cols < N, other=0.0).to(tl.float32)
-        _var += x * x
-    var = tl.sum(_var, axis=0) / N
-    rstd = 1 / tl.sqrt(var + eps)
-    # Normalize and apply linear transformation
-    for off in range(0, N, BLOCK_SIZE):
-        cols = off + tl.arange(0, BLOCK_SIZE)
-        mask = cols < N
-        w = tl.load(W + cols, mask=mask).to(tl.float32)
-        x = tl.load(X + cols, mask=mask, other=0.0).to(tl.float32)
-        x_hat = x * rstd
-        y = x_hat * w
-        # Write output
-        tl.store(Y + cols * y_stride1, y.to(Y.dtype.element_ty), mask=mask)
+    cols = tl.arange(0, BLOCK_SIZE)
+    mask = cols < hidden_size
 
+    x = tl.load(
+        x_ptr + row * stride_x_row + cols,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    if HAS_RESIDUAL:
+        residual = tl.load(
+            residual_ptr + row * stride_residual_row + cols,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        x += residual
+        tl.store(
+            residual_out_ptr + row * stride_residual_out_row + cols,
+            x,
+            mask=mask,
+        )
 
-def rmsnorm_forward(x: torch.Tensor, weight, eps, out=None):
-    # allocate output
-    y = torch.empty_like(x) if out is None else out
-    # reshape input data into 2D tensor
-    x_arg = x.view(-1, x.shape[-1])
-    y_arg = y.view(-1, x.shape[-1])
-    assert y.data_ptr() == y_arg.data_ptr()
-    M, N = x_arg.shape
-    # Less than 64KB per feature: enqueue fused kernel
-    MAX_FUSED_SIZE = 65536 // x.element_size()
-    BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(N))
-    # print("BLOCK_SIZE:", BLOCK_SIZE)
-    if N > BLOCK_SIZE:
-        raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
-    # heuristics for number of warps
-    num_warps = min(max(BLOCK_SIZE // 256, 1), 8)
-    # print(BLOCK_SIZE, num_warps, "block_size, numwarps")
-    BLOCK_SIZE = 128 * 2 * 2 * 2 * 2 * 2 * 2 * 2
-    num_warps = 8
-    # enqueue kernel
-    _rms_norm_fwd_fused[(M,)](
-        x_arg,
-        y_arg,
-        weight,
-        x_arg.stride(0),
-        x_arg.stride(1),
-        y_arg.stride(0),
-        y_arg.stride(1),
-        N,
-        eps,
-        BLOCK_SIZE=BLOCK_SIZE,
-        num_warps=num_warps,
+    variance = tl.sum(tl.where(mask, x * x, 0.0), axis=0) / hidden_size
+    normalized = x * tl.rsqrt(variance + eps)
+    weight = tl.load(weight_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    if ZERO_CENTERED_WEIGHT:
+        weight += 1.0
+    output = normalized * weight
+    tl.store(
+        output_ptr + row * stride_output_row + cols,
+        output,
+        mask=mask,
     )
-    return y
 
 
-def torch_rms_norm(x, weight, eps):
-    return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps) * weight
+def _validate_inputs(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    residual: torch.Tensor | None,
+) -> None:
+    if not x.is_cuda:
+        raise RuntimeError("Triton RMSNorm requires a CUDA input tensor.")
+    if x.dtype not in _SUPPORTED_DTYPES:
+        raise TypeError(
+            "Triton RMSNorm supports FP16 and BF16 inputs, "
+            f"got {x.dtype}."
+        )
+    if x.ndim == 0:
+        raise ValueError("Triton RMSNorm requires at least one input dimension.")
+    if x.shape[-1] <= 0:
+        raise ValueError("Triton RMSNorm requires a non-empty feature dimension.")
+    if x.stride(-1) != 1:
+        raise ValueError(
+            "Triton RMSNorm requires the input's last dimension to be contiguous."
+        )
+    if weight.shape != (x.shape[-1],):
+        raise ValueError(
+            f"RMSNorm weight must have shape ({x.shape[-1]},), "
+            f"got {tuple(weight.shape)}."
+        )
+    if weight.device != x.device or weight.dtype != x.dtype:
+        raise ValueError(
+            "RMSNorm input and weight must have the same device and dtype, "
+            f"got x=({x.device}, {x.dtype}) and "
+            f"weight=({weight.device}, {weight.dtype})."
+        )
+    if not weight.is_contiguous():
+        raise ValueError("Triton RMSNorm requires a contiguous weight tensor.")
+    if residual is None:
+        return
+    if residual.shape != x.shape:
+        raise ValueError(
+            "RMSNorm residual must match the input shape, "
+            f"got x={tuple(x.shape)} and residual={tuple(residual.shape)}."
+        )
+    if residual.device != x.device or residual.dtype != x.dtype:
+        raise ValueError(
+            "RMSNorm input and residual must have the same device and dtype, "
+            f"got x=({x.device}, {x.dtype}) and "
+            f"residual=({residual.device}, {residual.dtype})."
+        )
+    if residual.stride(-1) != 1:
+        raise ValueError(
+            "Triton fused add RMSNorm requires the residual's last dimension "
+            "to be contiguous."
+        )
+    if residual.data_ptr() == x.data_ptr():
+        raise ValueError(
+            "Triton fused add RMSNorm requires distinct input and residual tensors."
+        )
 
 
-def test_rms_norm(M, N, dtype, eps=1e-5, device="cuda"):
-    # create data
-    x_shape = (M, N)
-    w_shape = (x_shape[-1],)
-    weight = torch.rand(w_shape, dtype=dtype, device="cuda")
-    x = -2.3 + 0.5 * torch.randn(x_shape, dtype=dtype, device="cuda")
-    # forward pass
-    y_tri = rmsnorm_forward(x, weight, eps)
-    y_ref = torch_rms_norm(x.to(torch.float32), weight.to(torch.float32), eps).to(dtype)
+def _block_size(hidden_size: int, element_size: int) -> int:
+    max_fused_size = 65536 // element_size
+    block_size = min(max_fused_size, triton.next_power_of_2(hidden_size))
+    if hidden_size > block_size:
+        raise RuntimeError(
+            "Triton RMSNorm does not support feature dimensions occupying "
+            "more than 64 KiB per row."
+        )
+    return block_size
 
-    # compare
-    print("type:", y_tri.dtype, y_ref.dtype)
-    print("max delta:", torch.max(torch.abs(y_tri - y_ref)))
-    assert torch.allclose(y_tri, y_ref, atol=1e-2, rtol=0)
-    return
+
+def _view_rows_without_copy(x: torch.Tensor, name: str) -> torch.Tensor:
+    try:
+        rows = x.view(-1, x.shape[-1])
+    except RuntimeError as exc:
+        raise ValueError(
+            f"Triton fused add RMSNorm requires {name} to flatten into rows "
+            "without copying."
+        ) from exc
+    if rows.data_ptr() != x.data_ptr():
+        raise ValueError(
+            f"Triton fused add RMSNorm requires {name} to flatten into rows "
+            "without copying."
+        )
+    return rows
+
+
+def _launch(
+    x_rows: torch.Tensor,
+    weight: torch.Tensor,
+    output_rows: torch.Tensor,
+    eps: float,
+    *,
+    zero_centered_weight: bool,
+    residual_rows: torch.Tensor | None = None,
+    residual_out_rows: torch.Tensor | None = None,
+) -> None:
+    row_count, hidden_size = x_rows.shape
+    block_size = _block_size(hidden_size, x_rows.element_size())
+    num_warps = min(max(block_size // 256, 1), 8)
+    has_residual = residual_rows is not None
+
+    with torch.cuda.device(x_rows.device):
+        _rms_norm_fwd_kernel[(row_count,)](
+            x_rows,
+            residual_rows,
+            weight,
+            output_rows,
+            residual_out_rows,
+            x_rows.stride(0),
+            residual_rows.stride(0) if residual_rows is not None else 0,
+            output_rows.stride(0),
+            residual_out_rows.stride(0) if residual_out_rows is not None else 0,
+            hidden_size,
+            float(eps),
+            HAS_RESIDUAL=has_residual,
+            ZERO_CENTERED_WEIGHT=bool(zero_centered_weight),
+            BLOCK_SIZE=block_size,
+            num_warps=num_warps,
+        )
+
+
+def rmsnorm_forward(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    *,
+    zero_centered_weight: bool = False,
+) -> torch.Tensor:
+    """Return RMSNorm without modifying ``x``."""
+
+    _validate_inputs(x, weight, residual=None)
+    hidden_size = x.shape[-1]
+    x_rows = x.reshape(-1, hidden_size)
+    output = torch.empty(x.shape, device=x.device, dtype=x.dtype)
+    output_rows = output.view(-1, hidden_size)
+    _launch(
+        x_rows,
+        weight,
+        output_rows,
+        eps,
+        zero_centered_weight=zero_centered_weight,
+    )
+    return output
+
+
+def fused_add_rmsnorm_forward(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    *,
+    zero_centered_weight: bool = False,
+) -> None:
+    """Normalize ``x + residual`` into ``x`` and store the sum in ``residual``."""
+
+    _validate_inputs(x, weight, residual)
+    x_rows = _view_rows_without_copy(x, "input")
+    residual_rows = _view_rows_without_copy(residual, "residual")
+    _launch(
+        x_rows,
+        weight,
+        x_rows,
+        eps,
+        zero_centered_weight=zero_centered_weight,
+        residual_rows=residual_rows,
+        residual_out_rows=residual_rows,
+    )
