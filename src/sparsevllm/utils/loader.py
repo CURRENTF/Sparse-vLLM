@@ -14,41 +14,6 @@ from tqdm.auto import tqdm
 from sparsevllm.utils.log import logger
 
 
-def resolve_weight_loading_workers(
-    configured, *, model_path: str, world_size: int
-) -> tuple[int, int | None]:
-    if configured is None or (
-        isinstance(configured, str) and configured.strip().lower() == "auto"
-    ):
-        checkpoint_bytes = sum(
-            os.path.getsize(path) for path in glob(os.path.join(model_path, "*.safetensors"))
-        )
-        size_budget = next(
-            (
-                workers
-                for max_gib, workers in ((8, 1), (32, 4), (128, 8))
-                if checkpoint_bytes < max_gib << 30
-            ),
-            16,
-        )
-        # Soft global budget: every rank retains one synchronous loading path.
-        workers = max(int(world_size), size_budget)
-        logger.info(
-            "Weight loading worker budget auto-selected: "
-            f"checkpoint_bytes={checkpoint_bytes} world_size={world_size} "
-            f"global_soft_budget={workers} workers_per_rank={max(1, workers // world_size)}."
-        )
-        return workers, checkpoint_bytes
-
-    raw = str(configured).strip()
-    if isinstance(configured, bool) or not raw.isdecimal() or int(raw) <= 0:
-        raise ValueError(
-            "weight_loading_workers must be 'auto' or a positive integer, "
-            f"got {configured!r}."
-        )
-    return int(raw), None
-
-
 def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
     param.data.copy_(loaded_weight)
 
