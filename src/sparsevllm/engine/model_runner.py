@@ -158,12 +158,21 @@ class ModelRunner:
             self.model = LlamaForCausalLM(hf_config)
         else:
             raise NotImplementedError(f"Unsupported Sparse-vLLM model_type={hf_config.model_type!r}.")
-        load_model(
-            self.model,
-            config.model,
-            tp_rank=self.parallel_context.tp_rank,
-            tp_size=self.parallel_context.tp_size,
-        )
+        if config.tiny_random:
+            from sparsevllm.debug.tiny_random import initialize_sparse_model
+
+            initialize_sparse_model(
+                self.model,
+                hf_config,
+                seed=config.tiny_random_seed,
+            )
+        else:
+            load_model(
+                self.model,
+                config.model,
+                tp_rank=self.parallel_context.tp_rank,
+                tp_size=self.parallel_context.tp_size,
+            )
         if hf_config.model_type == "qwen3_moe" and config.moe_backend == "triton":
             self.model.warmup_moe_backend()
         

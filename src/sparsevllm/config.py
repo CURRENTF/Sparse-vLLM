@@ -603,6 +603,10 @@ class Config:
     outer_hf_config: Any | None = None
     runtime_layout: RuntimeLayout | None = None
     quantization_config: QuantizationConfig = field(default_factory=QuantizationConfig.disabled)
+    tiny_random: bool = False
+    tiny_random_config: str | None = None
+    tiny_random_seed: int = 0
+    tiny_random_overrides: dict[str, int] = field(default_factory=dict, init=False)
     eos: int = -1
     eos_token_ids: tuple[int, ...] = field(default_factory=tuple)
     num_kvcache_slots: int | list = -1
@@ -792,6 +796,18 @@ class Config:
     def __post_init__(self):
         if os.getenv("PROFILER_SVLLM"):
             self.enable_profiler = True
+        if self.tiny_random or os.getenv("SPARSEVLLM_TINY_RANDOM") is not None:
+            from sparsevllm.debug.tiny_random import resolve_tiny_random_settings
+
+            (
+                self.tiny_random,
+                self.tiny_random_config,
+                self.tiny_random_seed,
+            ) = resolve_tiny_random_settings(
+                enabled=self.tiny_random,
+                config_path=self.tiny_random_config,
+                seed=self.tiny_random_seed,
+            )
 
         raw_sparse_method = self.vllm_sparse_method
         raw_sparse_method_normalized = "" if raw_sparse_method is None else str(raw_sparse_method).strip().lower()
@@ -1129,6 +1145,10 @@ class Config:
         if isinstance(self.deltakv_path, str):
             deltakv_path = self.deltakv_path.strip()
             self.deltakv_path = None if deltakv_path.lower() in {"", "none", "null"} else deltakv_path
+        if self.tiny_random and self.vllm_sparse_method == "deltakv":
+            raise NotImplementedError(
+                "Tiny random mode does not support DeltaKV compressor weights yet."
+            )
         try:
             self.outer_hf_config = AutoConfig.from_pretrained(self.model, trust_remote_code=True)
         except Exception as e:
@@ -1137,6 +1157,21 @@ class Config:
         self.hf_config = _extract_text_config(self.outer_hf_config)
         if is_qwen35:
             setattr(self.hf_config, "model_type", "qwen3_5")
+        if self.tiny_random:
+            from sparsevllm.debug.tiny_random import apply_tiny_random_overrides
+
+            if is_qwen35:
+                raise NotImplementedError("Tiny random mode does not support qwen3_5 yet.")
+            self.tiny_random_overrides = apply_tiny_random_overrides(
+                self.hf_config,
+                self.tiny_random_config,
+            )
+            log_once(
+                "TINY RANDOM MODE is enabled: checkpoint weights will not be read and "
+                f"model-quality results are invalid. config={self.tiny_random_config} "
+                f"seed={self.tiny_random_seed} overrides={self.tiny_random_overrides}",
+                level="WARNING",
+            )
         raw_quantization_config = _config_get(
             self.hf_config,
             "quantization_config",
@@ -1146,6 +1181,8 @@ class Config:
             raw_quantization_config,
             required_fp8=is_qwen35,
         )
+        if self.tiny_random and self.quantization_config.enabled:
+            raise NotImplementedError("Tiny random mode does not support quantized model weights.")
         setattr(self.hf_config, "quantization_config", self.quantization_config)
         if getattr(self.hf_config, "model_type", "") in {"deepseek_v2", "deepseek_v32"}:
             raise NotImplementedError(
@@ -1237,6 +1274,19 @@ class Config:
                 "Set allow_missing_deltakv_path=True only for construction-only tests."
             )
         self.runtime_layout = RuntimeLayout.from_config(self.hf_config, require_mixed=is_qwen35)
+        if self.tiny_random:
+            if self.hf_config.num_attention_heads % self.tensor_parallel_size != 0:
+                raise ValueError(
+                    "Tiny random num_attention_heads must be divisible by tensor_parallel_size."
+                )
+            if self.hf_config.num_key_value_heads % self.tensor_parallel_size != 0:
+                raise ValueError(
+                    "Tiny random num_key_value_heads must be divisible by tensor_parallel_size."
+                )
+            if self.hf_config.vocab_size % self.tensor_parallel_size != 0:
+                raise ValueError(
+                    "Tiny random vocab_size must be divisible by tensor_parallel_size."
+                )
         if self.max_model_len > self.hf_config.max_position_embeddings:
             logger.warning('max_model_len > model.max_position_embeddings 输出可能不正常')
             self.hf_config.max_position_embeddings = self.max_model_len
