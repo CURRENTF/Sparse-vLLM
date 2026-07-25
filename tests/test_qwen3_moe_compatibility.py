@@ -34,7 +34,14 @@ def test_qwen3_moe_registry_lists_only_v1_validated_combinations():
         "quest",
         "rkv",
     }
-    assert QWEN3_MOE_EP_COMPATIBILITY.prefix_cache_methods == {"", "omnikv", "quest"}
+    assert QWEN3_MOE_EP_COMPATIBILITY.prefix_cache_methods == {
+        "",
+        "omnikv",
+        "quest",
+        "snapkv",
+        "pyramidkv",
+        "rkv",
+    }
     assert QWEN3_MOE_EP_COMPATIBILITY.requires_eager is False
     assert QWEN3_MOE_EP_COMPATIBILITY.decode_cuda_graph_methods == {""}
 
@@ -44,12 +51,15 @@ def test_qwen3_moe_registry_accepts_first_batch_sparse_methods(method):
     assert _validate(method) is QWEN3_MOE_EP_COMPATIBILITY
 
 
-@pytest.mark.parametrize("method", ["", "omnikv", "quest"])
+@pytest.mark.parametrize(
+    "method",
+    ["", "omnikv", "quest", "snapkv", "pyramidkv", "rkv"],
+)
 def test_qwen3_moe_registry_accepts_explicit_prefix_cache_methods(method):
     assert _validate(method, enable_prefix_caching=True) is QWEN3_MOE_EP_COMPATIBILITY
 
 
-@pytest.mark.parametrize("method", ["streamingllm", "snapkv", "pyramidkv", "rkv"])
+@pytest.mark.parametrize("method", ["streamingllm"])
 def test_qwen3_moe_registry_rejects_unvalidated_prefix_cache_methods(method):
     with pytest.raises(ValueError, match="prefix caching is validated only"):
         _validate(method, enable_prefix_caching=True)

@@ -301,7 +301,60 @@ class SmartRouter:
     ) -> tuple[WorkerState, dict[str, Any], dict[str, Any]]:
         await self.refresh_worker_info()
         forward_payload, route_hints = strip_route_hints(payload)
-        candidates = self._candidate_workers(endpoint, forward_payload, route_hints)
+        chain_requested = "chain_id" in forward_payload
+        chain_id = str(forward_payload.get("chain_id") or "").strip()
+        if chain_id:
+            requested_model = forward_payload.get("model")
+            candidates = [
+                worker
+                for worker in self.workers
+                if worker.healthy
+                and (
+                    requested_model is None
+                    or worker.info.get("served_model_name") is None
+                    or str(worker.info.get("served_model_name"))
+                    == str(requested_model)
+                )
+            ]
+            if not candidates:
+                raise HTTPException(
+                    status_code=503,
+                    detail="No healthy Sparse-vLLM worker matches this chain request.",
+                )
+            worker, chain_matches = await self._select_chain_owner(
+                candidates, chain_id
+            )
+            route = self._route_record(
+                endpoint,
+                worker,
+                "chain_affinity",
+                [],
+                route_hints,
+            )
+            route["chain_id"] = chain_id
+            route["chain_affinity"] = True
+            route["chain_probes"] = chain_matches
+            self._write_route_log(route)
+            return worker, forward_payload, route
+        candidates = self._candidate_workers(
+            endpoint, forward_payload, route_hints
+        )
+        if chain_requested:
+            candidates = [
+                worker
+                for worker in candidates
+                if bool(worker.info.get("prefix_cache_enabled"))
+                and str(worker.info.get("prefix_cache_mode") or "")
+                == "chain"
+            ]
+            if not candidates:
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "No healthy chain-capable Sparse-vLLM worker matches "
+                        "this new-chain request."
+                    ),
+                )
         if not candidates:
             raise HTTPException(status_code=503, detail="No healthy Sparse-vLLM worker matches this request.")
         if route_hints.get("target_worker"):
@@ -320,9 +373,104 @@ class SmartRouter:
             overload_load_factor=self.overload_load_factor,
             load_abs_threshold=self.load_abs_threshold,
         )
-        route = self._route_record(endpoint, worker, reason, probes, route_hints)
+        route = self._route_record(
+            endpoint,
+            worker,
+            "chain_create" if chain_requested else reason,
+            probes,
+            route_hints,
+        )
+        if chain_requested:
+            route["chain_create"] = True
+            route["chain_selection_reason"] = reason
         self._write_route_log(route)
         return worker, forward_payload, route
+
+    async def _select_chain_owner(
+        self,
+        candidates: list[WorkerState],
+        chain_id: str,
+    ) -> tuple[WorkerState, list[dict[str, Any]]]:
+        results = await asyncio.gather(
+            *[
+                asyncio.to_thread(
+                    _post_json,
+                    f"{worker.url}/v1/chain_cache/routing_match",
+                    {"chain_id": chain_id},
+                    self.control_timeout_s,
+                )
+                for worker in candidates
+            ],
+            return_exceptions=True,
+        )
+        matches: list[dict[str, Any]] = []
+        owners: list[tuple[WorkerState, dict[str, Any]]] = []
+        tombstoned = False
+        probe_errors: list[str] = []
+        enabled_workers = 0
+        for worker, result in zip(candidates, results):
+            if isinstance(result, Exception):
+                worker.healthy = False
+                worker.last_error = f"{type(result).__name__}: {result}"
+                probe_errors.append(f"{worker.url}: {worker.last_error}")
+                matches.append(
+                    {
+                        "worker_url": worker.url,
+                        "error": worker.last_error,
+                    }
+                )
+                continue
+            match = dict(result)
+            matches.append({"worker_url": worker.url, **match})
+            enabled_workers += int(bool(match.get("enabled", True)))
+            tombstoned = tombstoned or bool(match.get("tombstone"))
+            if bool(match.get("present")):
+                owners.append((worker, match))
+        if probe_errors:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Cannot determine a unique chain owner because worker "
+                    f"probes failed: {probe_errors}."
+                ),
+            )
+        if enabled_workers == 0:
+            raise HTTPException(
+                status_code=400,
+                detail="Chain prefix cache is not enabled on any matching worker.",
+            )
+        if len(owners) > 1:
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    f"chain_id {chain_id!r} has duplicate owners: "
+                    f"{[worker.url for worker, _ in owners]}."
+                ),
+            )
+        if not owners:
+            raise HTTPException(
+                status_code=410 if tombstoned else 404,
+                detail=(
+                    f"chain_id {chain_id!r} was evicted."
+                    if tombstoned
+                    else f"Unknown chain_id {chain_id!r}."
+                ),
+            )
+        worker, match = owners[0]
+        if str(match.get("state") or "") == "active":
+            raise HTTPException(
+                status_code=409,
+                detail=f"chain_id {chain_id!r} already has an active writer.",
+            )
+        if str(match.get("state") or "") != "idle":
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    f"chain_id {chain_id!r} owner {worker.url} returned "
+                    f"invalid state {match.get('state')!r}."
+                ),
+            )
+        return worker, matches
 
     def _candidate_workers(
         self,
@@ -664,6 +812,9 @@ def route_headers(route: dict[str, Any]) -> dict[str, str]:
     matched_tokens = route.get("selected_prefix_matched_tokens")
     if matched_tokens is not None:
         headers["X-SparseVLLM-Prefix-Matched-Tokens"] = str(matched_tokens)
+    if route.get("chain_id"):
+        headers["X-SparseVLLM-Chain-ID"] = str(route["chain_id"])
+        headers["X-SparseVLLM-Chain-Affinity"] = "true"
     return headers
 
 
@@ -827,7 +978,14 @@ async def _stream_response_chunks(response: Any):
 
 def _content_headers(headers: dict[str, str]) -> dict[str, str]:
     content_type = headers.get("Content-Type") or headers.get("content-type")
-    return {"Content-Type": content_type} if content_type else {}
+    result = {"Content-Type": content_type} if content_type else {}
+    chain_id = (
+        headers.get("X-SparseVLLM-Chain-ID")
+        or headers.get("x-sparsevllm-chain-id")
+    )
+    if chain_id:
+        result["X-SparseVLLM-Chain-ID"] = chain_id
+    return result
 
 
 def _load_profiles(value: str | None) -> dict[str, Any]:

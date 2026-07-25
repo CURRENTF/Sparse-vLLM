@@ -20,6 +20,14 @@ from sparsevllm.engine.sequence import Sequence
 from sparsevllm.engine.scheduler import Scheduler
 from sparsevllm.engine.model_runner import ModelRunner, make_tp_shm_name
 from sparsevllm.engine.prefix_cache import PrefixCacheRoutingSnapshot
+from sparsevllm.engine.chain_cache import (
+    ChainCacheIndex,
+    ChainRoutingSnapshot,
+    ChainModeError,
+    ChainPrefixMismatchError,
+    RequestAdmission,
+    stable_token_digest,
+)
 from sparsevllm.method_registry import normalize_sparse_method
 from sparsevllm.utils.profiler import profiler
 
@@ -246,6 +254,7 @@ class LLMEngine:
         self.last_step_logprob_outputs: list[
             tuple[int, list[float | None], list[dict[int, float] | None]]
         ] = []
+        self._active_chain_sequences: dict[int, Sequence] = {}
         # 注册退出钩子，确保程序崩溃或结束时能正确释放多进程资源
         self._atexit_callback = self.exit
         atexit.register(self._atexit_callback)
@@ -483,15 +492,90 @@ class LLMEngine:
             self.events.clear()
         return runner_exit_completed, runner_platform
 
-    def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
-        """将一个新的推理请求加入系统"""
+    def _tokenize_prompt(self, prompt: str | list[int]) -> list[int]:
         if isinstance(prompt, str):
             # Match HF manual_generate: add BOS for raw prompts, but do not
             # duplicate it when a chat template already starts with BOS.
             add_special_tokens = True
             if self.tokenizer.bos_token is None or prompt.startswith(self.tokenizer.bos_token):
                 add_special_tokens = False
-            prompt = self.tokenizer.encode(prompt, add_special_tokens=add_special_tokens)
+            return self.tokenizer.encode(
+                prompt, add_special_tokens=add_special_tokens
+            )
+        return [int(token_id) for token_id in prompt]
+
+    def _tokenize_chain_continuation(
+        self,
+        prompt: str | list[int],
+        record,
+    ) -> list[int]:
+        token_ids = self._tokenize_prompt(prompt)
+        if not isinstance(prompt, str):
+            return token_ids
+        processed_token_count = int(record.processed_token_count)
+        processed_token_ids = [
+            int(token_id) for token_id in record.processed_token_ids
+        ]
+        if not processed_token_ids:
+            return token_ids
+        if len(processed_token_ids) != processed_token_count:
+            raise RuntimeError(
+                "Chain logical token history is incomplete: "
+                f"chain_id={record.chain_id!r} "
+                f"stored_tokens={len(processed_token_ids)} "
+                f"processed_tokens={processed_token_count}."
+            )
+        if token_ids[:processed_token_count] == processed_token_ids:
+            return token_ids
+        prefix_text = self.tokenizer.decode(
+            processed_token_ids,
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
+        if not prompt.startswith(prefix_text):
+            return token_ids
+        suffix_text = prompt[len(prefix_text):]
+        suffix_token_ids = self.tokenizer.encode(
+            suffix_text,
+            add_special_tokens=False,
+        )
+        return processed_token_ids + [
+            int(token_id) for token_id in suffix_token_ids
+        ]
+
+    def admit_request(
+        self,
+        prompt: str | list[int],
+        sampling_params: SamplingParams,
+        chain_id: str | None = None,
+    ) -> RequestAdmission:
+        """Validate and synchronously admit one request.
+
+        In chain mode the returned seq_id is the resident sequence identity and
+        remains stable across turns. The caller's request identity is separate.
+        """
+        mode = str(
+            getattr(self.config, "resolved_prefix_cache_mode", "disabled")
+        )
+        normalized_chain_id = str(chain_id or "").strip()
+        existing = None
+        if mode == "chain" and normalized_chain_id:
+            coordinator = (
+                self.model_runner.runtime_state.chain_cache_coordinator
+            )
+            if coordinator is None:
+                raise RuntimeError(
+                    "Config resolved chain prefix caching but the runtime has no "
+                    "ChainCacheCoordinator."
+                )
+            existing = coordinator.index.records.get(normalized_chain_id)
+            if existing is None:
+                coordinator.index.lookup(normalized_chain_id)
+        prompt = (
+            self._tokenize_chain_continuation(prompt, existing)
+            if existing is not None
+            else self._tokenize_prompt(prompt)
+        )
         prompt_len = len(prompt)
         max_tokens = sampling_params.max_tokens
         if prompt_len + max_tokens > self.config.max_model_len:
@@ -502,17 +586,150 @@ class LLMEngine:
             )
         logger.debug(f'add prompt with {len(prompt)} tokens.')
         seq = Sequence(prompt, sampling_params)
-        self.scheduler.add(seq)
-        return seq.seq_id
+        if mode != "chain":
+            if normalized_chain_id:
+                raise ChainModeError(
+                    "chain_id requires enable_prefix_caching=True with "
+                    "prefix_cache_mode='chain'.",
+                    chain_id=normalized_chain_id,
+                )
+            self.scheduler.add(seq)
+            return RequestAdmission(
+                seq_id=int(seq.seq_id),
+                chain_id=None,
+                chain_status="disabled",
+                reused_tokens=0,
+                prefilled_tokens=prompt_len,
+            )
+
+        coordinator = self.model_runner.runtime_state.chain_cache_coordinator
+        if coordinator is None:
+            raise RuntimeError(
+                "Config resolved chain prefix caching but the runtime has no "
+                "ChainCacheCoordinator."
+            )
+        created = not normalized_chain_id
+        if created:
+            normalized_chain_id = ChainCacheIndex.new_chain_id()
+        if existing is not None:
+            seq.seq_id = int(existing.seq_id)
+        plan = self.model_runner.runtime_state.chain_admission_plan(
+            normalized_chain_id,
+            int(seq.seq_id),
+            prompt,
+            int(sampling_params.max_tokens),
+        )
+        if plan.status == "resumed" and prompt_len <= int(plan.reused_tokens):
+            raise ChainPrefixMismatchError(
+                "A resumed chain request must include at least one suffix token "
+                "beyond the processed boundary.",
+                chain_id=normalized_chain_id,
+            )
+        self.model_runner.call(
+            "chain_validate_admission_plan",
+            plan,
+            prompt_len,
+            stable_token_digest(prompt, count=int(plan.reused_tokens)),
+            int(sampling_params.max_tokens),
+        )
+        self.model_runner.call("chain_apply_admission", plan)
+        seq.chain_id = normalized_chain_id
+        seq.chain_status = str(plan.status)
+        seq.chain_reused_tokens = int(plan.reused_tokens)
+        seq.num_prefilled_tokens = int(plan.reused_tokens)
+        seq.prefix_cache_enabled = True
+        seq.prefix_cache_hit_len = int(plan.reused_tokens)
+        seq.prefix_cache_method = str(self.config.vllm_sparse_method or "")
+        try:
+            self.scheduler.add(seq)
+        except Exception:
+            self.model_runner.call(
+                "chain_invalidate",
+                normalized_chain_id,
+                int(seq.seq_id),
+            )
+            raise
+        self._active_chain_sequences[int(seq.seq_id)] = seq
+        return RequestAdmission(
+            seq_id=int(seq.seq_id),
+            chain_id=normalized_chain_id,
+            chain_status=str(plan.status),
+            reused_tokens=int(plan.reused_tokens),
+            prefilled_tokens=prompt_len - int(plan.reused_tokens),
+        )
+
+    def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
+        """Backward-compatible request API returning only seq_id."""
+        return self.admit_request(prompt, sampling_params).seq_id
 
     def _refresh_prefix_cache_hit(self, seq: Sequence) -> None:
         self.model_runner.call("refresh_prefix_cache_hit", seq)
 
-    def abort_request(self, seq_id: int):
+    def abort_request(self, seq_id: int, disposition: str = "invalidate"):
         """Abort a queued or running request and release any owned KV slots."""
+        disposition = str(disposition)
+        if disposition != "invalidate":
+            raise ValueError(
+                "abort_request only supports 'invalidate'; interrupted chain "
+                "state cannot be retained safely, got "
+                f"{disposition!r}."
+            )
+        chain_seq = self._active_chain_sequences.get(int(seq_id))
         should_free = self.scheduler.abort(seq_id)
+        if chain_seq is not None:
+            self._active_chain_sequences.pop(int(seq_id), None)
+            self.model_runner.call(
+                "chain_invalidate",
+                str(chain_seq.chain_id),
+                int(chain_seq.seq_id),
+            )
+            return
+        coordinator = (
+            self.model_runner.runtime_state.chain_cache_coordinator
+        )
+        if coordinator is not None:
+            chain_id = coordinator.index.seq_id_to_chain_id.get(
+                int(seq_id)
+            )
+            if chain_id is not None:
+                self.model_runner.call(
+                    "chain_invalidate",
+                    str(chain_id),
+                    int(seq_id),
+                )
+                return
         if should_free:
             self.model_runner.call("free_slots", seq_id)
+
+    def chain_cache_routing_match(self, chain_id: str) -> dict[str, object]:
+        return self.model_runner.runtime_state.chain_routing_match(
+            str(chain_id)
+        )
+
+    def invalidate_chain(self, chain_id: str) -> None:
+        coordinator = (
+            self.model_runner.runtime_state.chain_cache_coordinator
+        )
+        if coordinator is None:
+            raise ChainModeError(
+                "Chain prefix cache is not enabled.",
+                chain_id=str(chain_id),
+            )
+        record = coordinator.index.lookup(str(chain_id))
+        self._active_chain_sequences.pop(int(record.seq_id), None)
+        self.model_runner.call(
+            "chain_invalidate",
+            str(chain_id),
+            int(record.seq_id),
+        )
+
+    def chain_cache_routing_snapshot(self) -> ChainRoutingSnapshot:
+        coordinator = (
+            self.model_runner.runtime_state.chain_cache_coordinator
+        )
+        if coordinator is None:
+            return ChainRoutingSnapshot(enabled=False)
+        return coordinator.index.routing_snapshot()
 
     def prefix_cache_inspect(
         self,
@@ -627,6 +844,9 @@ class LLMEngine:
             "decode_cuda_graph_context_policy",
             "decode_cuda_graph_max_cached_graphs",
             "enable_prefix_caching",
+            "prefix_cache_mode",
+            "resolved_prefix_cache_mode",
+            "chain_cache_max_tombstones",
             "prefix_cache_block_size",
             "prefix_cache_requested_max_blocks",
             "prefix_cache_max_blocks",
@@ -676,6 +896,9 @@ class LLMEngine:
             "max_decoding_seqs": int(getattr(config, "max_decoding_seqs", 0) or 0),
             "max_num_seqs_in_gpu": int(getattr(config, "max_num_seqs_in_gpu", 0) or 0),
             "prefix_cache_enabled": bool(getattr(config, "enable_prefix_caching", False)),
+            "prefix_cache_mode": str(
+                getattr(config, "resolved_prefix_cache_mode", "disabled")
+            ),
             "prefix_cache_block_size": getattr(config, "prefix_cache_block_size", None),
             "code_revision": code_revision_info(),
             "benchmark_config": {
@@ -750,8 +973,23 @@ class LLMEngine:
             # 如果有序列被调度器踢出，立即广播指令让所有 Rank 释放其占用的物理槽位
             with profiler.record("preempt_free"):
                 preempted_seq_ids = [int(seq.seq_id) for seq in preempted_seqs]
-                if preempted_seq_ids:
-                    self.model_runner.call("free_slots_batch", preempted_seq_ids)
+                ordinary_preempted_seq_ids = []
+                for seq in preempted_seqs:
+                    chain_seq = self._active_chain_sequences.pop(
+                        int(seq.seq_id), None
+                    )
+                    if chain_seq is None:
+                        ordinary_preempted_seq_ids.append(int(seq.seq_id))
+                        continue
+                    self.model_runner.call(
+                        "chain_invalidate",
+                        str(chain_seq.chain_id),
+                        int(chain_seq.seq_id),
+                    )
+                if ordinary_preempted_seq_ids:
+                    self.model_runner.call(
+                        "free_slots_batch", ordinary_preempted_seq_ids
+                    )
                 
             if not seqs:
                 # No progress can be made; avoid infinite busy-looping in callers.
@@ -789,7 +1027,33 @@ class LLMEngine:
             # 3. 跨进程广播并执行推理：
             # Rank 0 会驱动所有 Rank 进程同步运行本地的 ModelRunner.run
             with profiler.record("model_run_call"):
-                token_ids, logprob_outputs = self.model_runner.call("run", seqs, is_prefill)
+                try:
+                    token_ids, logprob_outputs = self.model_runner.call(
+                        "run", seqs, is_prefill
+                    )
+                except Exception:
+                    for seq in seqs:
+                        chain_seq = self._active_chain_sequences.pop(
+                            int(seq.seq_id), None
+                        )
+                        if chain_seq is None:
+                            continue
+                        try:
+                            self.model_runner.call(
+                                "chain_invalidate",
+                                str(chain_seq.chain_id),
+                                int(chain_seq.seq_id),
+                            )
+                            # Remove scheduler ownership after RuntimeState has
+                            # reclaimed the resident payload. A later serving
+                            # cleanup must not free the same sparse rows twice.
+                            self.scheduler.abort(int(chain_seq.seq_id))
+                        except Exception:
+                            logger.exception(
+                                "Failed to invalidate chain {} after model failure.",
+                                chain_seq.chain_id,
+                            )
+                    raise
             token_logprobs, top_logprobs = (
                 logprob_outputs if logprob_outputs is not None else (None, None)
             )
@@ -829,7 +1093,40 @@ class LLMEngine:
                 finished_seq_ids = []
                 for seq in seqs:
                     if seq.is_finished:
-                        finished_seq_ids.append(int(seq.seq_id))
+                        chain_seq = self._active_chain_sequences.pop(
+                            int(seq.seq_id), None
+                        )
+                        if chain_seq is None:
+                            finished_seq_ids.append(int(seq.seq_id))
+                        else:
+                            processed_token_count = max(
+                                0, int(chain_seq.num_tokens) - 1
+                            )
+                            self.model_runner.call(
+                                "chain_finish",
+                                str(chain_seq.chain_id),
+                                int(chain_seq.seq_id),
+                                stable_token_digest(
+                                    chain_seq.token_ids,
+                                    count=processed_token_count,
+                                ),
+                                processed_token_count,
+                            )
+                            coordinator = (
+                                self.model_runner.runtime_state
+                                .chain_cache_coordinator
+                            )
+                            if coordinator is None:
+                                raise RuntimeError(
+                                    "Finished a chain request without a chain "
+                                    "cache coordinator."
+                                )
+                            coordinator.remember_processed_tokens(
+                                chain_id=str(chain_seq.chain_id),
+                                seq_id=int(chain_seq.seq_id),
+                                token_ids=list(chain_seq.token_ids),
+                                processed_token_count=processed_token_count,
+                            )
                         finished_outputs.append(
                             (
                                 seq.seq_id,

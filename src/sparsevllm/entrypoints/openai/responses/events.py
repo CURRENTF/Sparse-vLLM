@@ -13,9 +13,11 @@ def response_object(
     model: str,
     status: str,
     output: list[dict[str, Any]],
-    usage: dict[str, int] | None = None,
+    usage: dict[str, Any] | None = None,
     incomplete_reason: str | None = None,
     error: dict[str, Any] | None = None,
+    chain_id: str | None = None,
+    chain_status: str | None = None,
 ) -> dict[str, Any]:
     response: dict[str, Any] = {
         "id": request_id,
@@ -25,6 +27,9 @@ def response_object(
         "model": model,
         "output": output,
     }
+    if chain_id is not None:
+        response["chain_id"] = chain_id
+        response["chain_status"] = chain_status
     if usage is not None:
         response["usage"] = usage
     if incomplete_reason is not None:

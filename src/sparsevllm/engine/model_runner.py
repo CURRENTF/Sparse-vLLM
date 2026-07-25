@@ -25,6 +25,7 @@ from sparsevllm.engine.cache_manager import CacheManager
 from sparsevllm.engine.cache_manager.base import _debug_tensor_summary
 from sparsevllm.engine.decode_cuda_graph import DecodeCudaGraphRunner
 from sparsevllm.engine.prefix_cache_coordinator import PrefixCacheCoordinator
+from sparsevllm.engine.chain_cache import ChainAdmissionPlan, ChainCacheCoordinator
 from sparsevllm.engine.recurrent_state_manager import RecurrentStateManager, RecurrentStateSpec
 from sparsevllm.engine.runtime_state import RuntimeState
 from sparsevllm.engine.sparse_controller import SparseController
@@ -69,6 +70,11 @@ PREFIX_CACHE_CONTROL_RPC_METHODS = {
     "prefix_cache_set_eviction_priority",
 }
 TP_RPC_STATUS_SYNC_METHODS = PREFIX_CACHE_CONTROL_RPC_METHODS | {
+    "chain_admission_plan",
+    "chain_apply_admission",
+    "chain_finish",
+    "chain_invalidate",
+    "chain_validate_admission_plan",
     "debug_hidden_states_cpu",
     "debug_moe_states_cpu",
     "free_slots",
@@ -236,9 +242,17 @@ class ModelRunner:
         # Recurrent rows are persistent runtime state. Allocate them before the
         # cache manager sizes KV so gpu_memory_utilization accounts for both.
         self.cache_manager = CacheManager.create(config, self.parallel_context)
+        prefix_cache_mode = str(
+            getattr(config, "resolved_prefix_cache_mode", "disabled")
+        )
         self.prefix_cache_coordinator = (
             PrefixCacheCoordinator(config, self.cache_manager, self.recurrent_state_manager)
-            if has_linear_layers and bool(config.enable_prefix_caching)
+            if has_linear_layers and prefix_cache_mode == "radix"
+            else None
+        )
+        self.chain_cache_coordinator = (
+            ChainCacheCoordinator(config, self.cache_manager)
+            if prefix_cache_mode == "chain"
             else None
         )
         if self.prefix_cache_coordinator is not None:
@@ -248,6 +262,7 @@ class ModelRunner:
             self.cache_manager,
             self.recurrent_state_manager,
             self.prefix_cache_coordinator,
+            self.chain_cache_coordinator,
         )
 
         # 初始化稀疏控制器
@@ -399,6 +414,8 @@ class ModelRunner:
                 raise local_error
             if method_name == "refresh_prefix_cache_hit":
                 self._sync_prefix_cache_lookup_result(result)
+            elif method_name.startswith("chain_"):
+                self._sync_chain_cache_result(method_name, result)
             return result
         with torch.inference_mode():
             return method(*args)
@@ -503,6 +520,21 @@ class ModelRunner:
                 f"results={results!r}."
             )
 
+    def _sync_chain_cache_result(self, method_name: str, local_result) -> None:
+        if self.world_size <= 1:
+            return
+        results = [None] * self.world_size
+        dist.all_gather_object(
+            results,
+            local_result,
+            group=self.parallel_context.world.process_group,
+        )
+        if any(result != results[0] for result in results[1:]):
+            raise RuntimeError(
+                f"Chain-cache {method_name} diverged across world ranks: "
+                f"results={results!r}."
+            )
+
     def load_deltakv_compressors(self):
         """加载 DeltaKV 压缩器权重"""
         method = str(self.config.vllm_sparse_method or "")
@@ -557,6 +589,64 @@ class ModelRunner:
             if os.getenv("SPARSEVLLM_DEBUG_SLOTS", "0") == "1":
                 after = self.cache_manager.free_slot_stats()
                 logger.info("model_runner.free_slots_batch seq_ids={} after={}", seq_ids, after)
+
+    def chain_admission_plan(
+        self,
+        chain_id: str,
+        seq_id: int,
+        token_ids: list[int],
+        generation_tokens: int = 0,
+    ) -> ChainAdmissionPlan:
+        return self.runtime_state.chain_admission_plan(
+            chain_id,
+            seq_id,
+            token_ids,
+            generation_tokens,
+        )
+
+    def chain_apply_admission(
+        self,
+        plan: ChainAdmissionPlan,
+    ) -> dict[str, object]:
+        return self.runtime_state.chain_apply_admission(plan)
+
+    def chain_validate_admission_plan(
+        self,
+        plan: ChainAdmissionPlan,
+        input_token_count: int,
+        input_prefix_digest: bytes,
+        generation_tokens: int = 0,
+    ) -> ChainAdmissionPlan:
+        return self.runtime_state.chain_validate_admission_plan(
+            plan,
+            input_token_count,
+            input_prefix_digest,
+            generation_tokens,
+        )
+
+    def chain_finish(
+        self,
+        chain_id: str,
+        seq_id: int,
+        processed_token_digest: bytes,
+        processed_token_count: int,
+    ) -> dict[str, object]:
+        return self.runtime_state.chain_finish(
+            chain_id,
+            seq_id,
+            processed_token_digest,
+            processed_token_count,
+        )
+
+    def chain_invalidate(
+        self,
+        chain_id: str,
+        expected_seq_id: int | None = None,
+    ) -> dict[str, object]:
+        return self.runtime_state.chain_invalidate(
+            chain_id,
+            expected_seq_id=expected_seq_id,
+        )
 
     def set_tokenizer_metadata(
         self,

@@ -45,6 +45,19 @@ an experiment needs a different boundary. `Config` raises
 `max_num_batched_tokens` to fit one boundary-sized short prefill when necessary.
 `all_chunked` still uses `engine_prefill_chunk_size` independently.
 
+## Prefix cache modes
+
+`enable_prefix_caching=true` supports two deliberately separate layouts.
+`prefix_cache_mode=auto` chooses radix for vanilla/OmniKV/QuEST and a linear
+chain for SnapKV/PyramidKV/R-KV/SkipKV. `radix` and `chain` can be requested
+explicitly, but incompatible method/mode pairs fail fast.
+
+The chain layout keeps one resident `seq_id` across turns and never branches.
+Callers send the complete logical context plus the returned `chain_id`; only
+the suffix after the verified processed boundary is forwarded. Method KV and
+metadata remain in the cache manager. Idle chains are reclaimed by strict
+LRU, while active writers are pinned.
+
 `Config` resolves `None`, empty string, and `auto` to the registry default. An
 explicit policy that does not match the method default fails fast so experiments
 do not silently change scheduler semantics. Treat any policy override as an

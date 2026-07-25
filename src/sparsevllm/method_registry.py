@@ -45,7 +45,15 @@ CANONICAL_SPARSE_METHODS = {
 SUPPORTED_SPARSE_METHODS = set(CANONICAL_SPARSE_METHODS)
 SUPPORTED_SPARSE_METHOD_ALIASES = {str(k) for k in METHOD_ALIASES if k is not None and str(k)}
 
-PREFIX_CACHE_SUPPORTED_METHODS = {"", "omnikv", "quest"}
+PREFIX_CACHE_SUPPORTED_METHODS = {
+    "",
+    "omnikv",
+    "quest",
+    "snapkv",
+    "pyramidkv",
+    "rkv",
+    "skipkv",
+}
 
 
 @dataclass(frozen=True)
@@ -70,7 +78,9 @@ QWEN3_MOE_EP_COMPATIBILITY = ModelRuntimeCompatibility(
             "rkv",
         }
     ),
-    prefix_cache_methods=frozenset({"", "omnikv", "quest"}),
+    prefix_cache_methods=frozenset(
+        {"", "omnikv", "quest", "snapkv", "pyramidkv", "rkv"}
+    ),
     requires_eager=False,
     decode_cuda_graph_methods=frozenset({""}),
 )

@@ -581,6 +581,7 @@ def _budget_test_manager(
     peak_bytes,
     current_bytes,
     prefix_on=False,
+    prefix_mode="radix",
     recurrent_pool_bytes=1_000,
     recurrent_peak_before_bytes=None,
     recurrent_peak_after_bytes=None,
@@ -598,6 +599,7 @@ def _budget_test_manager(
         long_prefill_offload_threshold=1,
         prefill_schedule_policy="long_bs1full_short_batch",
         enable_prefix_caching=prefix_on,
+        resolved_prefix_cache_mode=prefix_mode if prefix_on else "disabled",
         prefix_cache_block_size=4,
         prefix_cache_max_blocks=None,
         recurrent_state_pool_bytes=recurrent_pool_bytes,
@@ -740,6 +742,28 @@ def test_cache_budget_resolves_joint_prefix_capacity_before_kv_allocation():
     assert manager.config.prefix_cache_max_blocks == 9_720
     assert manager.config.prefix_recurrent_capacity_bytes == 3_888_000
     assert kv_allocatable_bytes == 3_110_400
+
+
+def test_chain_cache_budget_does_not_reserve_radix_prefix_blocks():
+    chain = _budget_test_manager(
+        free_bytes=8_000_000,
+        peak_bytes=1_000_000,
+        current_bytes=1_000_000,
+        prefix_on=True,
+        prefix_mode="chain",
+    )
+    without_prefix = _budget_test_manager(
+        free_bytes=8_000_000,
+        peak_bytes=1_000_000,
+        current_bytes=1_000_000,
+        prefix_on=False,
+    )
+
+    chain_available, _ = chain._get_available_slots_info()
+    without_prefix_available, _ = without_prefix._get_available_slots_info()
+
+    assert chain_available == without_prefix_available
+    assert not hasattr(chain.config, "prefix_kv_block_capacity")
 
 
 def test_quest_joint_prefix_kv_bytes_include_page_metadata():
@@ -933,6 +957,20 @@ def test_qwen35_prefix_block_defaults_to_4096_and_rejects_unaligned(tmp_path):
         _make_config(tmp_path, enable_prefix_caching=True, prefix_cache_block_size=2048)
     with pytest.raises(ValueError, match="4096\\*N"):
         _make_config(tmp_path, enable_prefix_caching=True, prefix_cache_block_size=4097)
+
+
+def test_qwen35_chain_prefix_cache_does_not_require_radix_block_alignment(
+    tmp_path,
+):
+    cfg = _make_config(
+        tmp_path,
+        vllm_sparse_method="snapkv",
+        enable_prefix_caching=True,
+        prefix_cache_block_size=16,
+    )
+
+    assert cfg.resolved_prefix_cache_mode == "chain"
+    assert cfg.prefix_cache_block_size == 16
 
 
 def test_qwen35_quest_prefix_block_may_span_multiple_pages(tmp_path):
@@ -1172,6 +1210,46 @@ def test_snapkv_prefill_context_lens_stays_dense_for_mixed_layout():
     assert manager.layer_batch_states[3].context_lens.tolist() == [5, 5]
     assert manager.layer_batch_states[7].context_lens.tolist() == [5, 5]
     assert manager.layer_batch_states[0].context_lens is None
+
+
+def test_pyramidkv_full_prefill_staging_populates_context_lens():
+    manager = object.__new__(SnapKVCacheManager)
+    manager.device = torch.device("cpu")
+    manager.num_layers = 1
+    manager.layer_batch_states = [LayerBatchStates()]
+    manager.seq_id_to_row = [{}]
+    manager.row_seq_lens = [[0]]
+    manager.pyramidkv_prefill_staging_num_slots = 4
+    manager._pyramidkv_prefill_staging_seq_offsets = {}
+    manager._pyramidkv_prefill_staging_materialized_layers = set()
+    manager.kv_transformer_layer_indices = lambda: [0]
+    manager._clear_prefill_attention_scores = lambda seq_id: None
+    manager._should_use_pyramidkv_long_prefill_offload_staging = lambda seqs: False
+    manager._should_use_pyramidkv_full_prefill_staging = lambda seqs: True
+
+    def fake_get_free_row(layer_idx, seq_id):
+        manager.seq_id_to_row[layer_idx][seq_id] = 0
+        return 0
+
+    manager._get_free_row = fake_get_free_row
+    seq = SimpleNamespace(
+        seq_id=10,
+        current_chunk_size=2,
+        num_prefilled_tokens=0,
+        token_ids=[1, 2],
+    )
+
+    input_ids, positions, cu_seqlens_q = SnapKVCacheManager._prepare_prefill(
+        manager,
+        [seq],
+    )
+
+    assert input_ids.tolist() == [1, 2]
+    assert positions.tolist() == [0, 1]
+    assert cu_seqlens_q.tolist() == [0, 2]
+    assert manager.layer_batch_states[0].context_lens.tolist() == [2]
+    assert manager.layer_batch_states[0].max_context_len == 2
+    assert manager._pyramidkv_prefill_staging_context_lens.tolist() == [2]
 
 
 def test_omnikv_uses_first_target_kv_layer_for_slot_table_in_mixed_layout():

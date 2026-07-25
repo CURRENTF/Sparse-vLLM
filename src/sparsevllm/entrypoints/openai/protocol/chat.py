@@ -48,6 +48,7 @@ class ChatCompletionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     model: str
+    chain_id: str | None = None
     messages: list[ChatMessage]
     max_tokens: int = Field(default=256, ge=1)
     max_completion_tokens: int | None = Field(default=None, ge=1)

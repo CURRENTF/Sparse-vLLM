@@ -25,6 +25,8 @@ from sparsevllm.entrypoints.openai.serving.base import DisconnectChecker
 from sparsevllm.entrypoints.openai.serving.base import _queue_get_or_disconnect
 from sparsevllm.entrypoints.openai.serving.base import _wait_final
 from sparsevllm.entrypoints.openai.serving.base import _write_request_log
+from sparsevllm.entrypoints.openai.serving.base import _chain_http_exception
+from sparsevllm.engine.chain_cache import ChainCacheError
 from sparsevllm.entrypoints.openai.serving.response_parsing import ParsedModelResponse
 from sparsevllm.entrypoints.openai.serving.response_parsing import ResponseParseError
 from sparsevllm.entrypoints.openai.serving.response_parsing import TransformersResponseParser
@@ -80,8 +82,31 @@ async def serve_chat_completion(
                 "request": _model_dump_json(request),
             },
         )
-    handle = await dispatcher.submit(prompt, sampling_params, 0, stop)
+    try:
+        submit = (
+            getattr(dispatcher, "submit_admitted", dispatcher.submit)
+            if bool(getattr(dispatcher, "admission_ack_enabled", False))
+            else dispatcher.submit
+        )
+        handle = (
+            await submit(prompt, sampling_params, 0, stop)
+            if request.chain_id is None
+            else await submit(
+                prompt,
+                sampling_params,
+                0,
+                stop,
+                chain_id=request.chain_id,
+            )
+        )
+    except ChainCacheError as exc:
+        raise _chain_http_exception(exc) from exc
     handles = [handle]
+    headers = (
+        {"X-SparseVLLM-Chain-ID": getattr(handle, "chain_id", None)}
+        if getattr(handle, "chain_id", None) is not None
+        else None
+    )
 
     if request.stream:
         return StreamingResponse(
@@ -101,6 +126,7 @@ async def serve_chat_completion(
                 is_disconnected=is_disconnected,
             ),
             media_type="text/event-stream",
+            headers=headers,
         )
 
     try:
@@ -152,7 +178,7 @@ async def serve_chat_completion(
             "response": response,
         },
     )
-    return JSONResponse(response)
+    return JSONResponse(response, headers=headers)
 
 
 def _validate_chat_request(
@@ -245,7 +271,15 @@ async def _chat_completion_response(
     else:
         parsed = ParsedModelResponse(None, final["text"], [])
     message = _chat_message(parsed)
-    return {
+    usage = {
+        "prompt_tokens": final["prompt_tokens"],
+        "completion_tokens": final["completion_tokens"],
+        "total_tokens": final["prompt_tokens"] + final["completion_tokens"],
+    }
+    if final.get("chain_id"):
+        usage["cached_tokens"] = int(final.get("reused_tokens", 0))
+        usage["reused_tokens"] = int(final.get("reused_tokens", 0))
+    response = {
         "id": request_id,
         "object": "chat.completion",
         "created": created,
@@ -269,12 +303,12 @@ async def _chat_completion_response(
                 ),
             }
         ],
-        "usage": {
-            "prompt_tokens": final["prompt_tokens"],
-            "completion_tokens": final["completion_tokens"],
-            "total_tokens": final["prompt_tokens"] + final["completion_tokens"],
-        },
+        "usage": usage,
     }
+    if final.get("chain_id") is not None:
+        response["chain_id"] = final["chain_id"]
+        response["chain_status"] = final.get("chain_status")
+    return response
 
 
 def _chat_message(parsed: ParsedModelResponse) -> dict[str, Any]:
@@ -326,6 +360,8 @@ async def _chat_completion_stream(
     completion_tokens = 0
     raw_text_len = 0
     visible_text_len = 0
+    chain_id = getattr(handles[0], "chain_id", None)
+    chain_status = getattr(handles[0], "chain_status", None)
     try:
         yield _chat_stream_chunk(
             request_id,
@@ -333,6 +369,8 @@ async def _chat_completion_stream(
             model,
             0,
             {"role": "assistant"},
+            chain_id=chain_id,
+            chain_status=chain_status,
         )
         while pending:
             handle = next(iter(pending.values()))
@@ -371,9 +409,12 @@ async def _chat_completion_stream(
                         item["index"],
                         delta,
                         logprobs=logprobs if delta_index == 0 else None,
+                        chain_id=chain_id,
+                        chain_status=item.get("chain_status", chain_status),
                     )
                 continue
             if item["type"] == "final":
+                chain_status = item.get("chain_status", chain_status)
                 prompt_tokens += item["prompt_tokens"]
                 completion_tokens = max(completion_tokens, item["completion_tokens"])
                 if parser is not None:
@@ -391,6 +432,8 @@ async def _chat_completion_stream(
                         model,
                         item["index"],
                         delta,
+                        chain_id=chain_id,
+                        chain_status=item.get("chain_status", chain_status),
                     )
                 finish_reason = item["finish_reason"]
                 if parser is not None and parser.tools_called and finish_reason == "stop":
@@ -402,23 +445,34 @@ async def _chat_completion_stream(
                     item["index"],
                     {},
                     finish_reason=finish_reason,
+                    chain_id=chain_id,
+                    chain_status=item.get("chain_status", chain_status),
                 )
                 pending.clear()
         if include_usage:
-            yield _sse(
-                {
-                    "id": request_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model,
-                    "choices": [],
-                    "usage": {
-                        "prompt_tokens": prompt_tokens,
-                        "completion_tokens": completion_tokens,
-                        "total_tokens": prompt_tokens + completion_tokens,
-                    },
-                }
-            )
+            usage = {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+            }
+            if chain_id:
+                reused_tokens = int(
+                    getattr(handles[0], "reused_tokens", 0)
+                )
+                usage["cached_tokens"] = reused_tokens
+                usage["reused_tokens"] = reused_tokens
+            usage_chunk = {
+                "id": request_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [],
+                "usage": usage,
+            }
+            if chain_id is not None:
+                usage_chunk["chain_id"] = chain_id
+                usage_chunk["chain_status"] = chain_status
+            yield _sse(usage_chunk)
         yield "data: [DONE]\n\n"
         if started is not None:
             elapsed_s = time.perf_counter() - started
@@ -469,20 +523,24 @@ def _chat_stream_chunk(
     *,
     logprobs: dict[str, Any] | None = None,
     finish_reason: str | None = None,
+    chain_id: str | None = None,
+    chain_status: str | None = None,
 ) -> str:
-    return _sse(
-        {
-            "id": request_id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model,
-            "choices": [
-                {
-                    "index": index,
-                    "delta": delta,
-                    "logprobs": logprobs,
-                    "finish_reason": finish_reason,
-                }
-            ],
-        }
-    )
+    chunk = {
+        "id": request_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [
+            {
+                "index": index,
+                "delta": delta,
+                "logprobs": logprobs,
+                "finish_reason": finish_reason,
+            }
+        ],
+    }
+    if chain_id is not None:
+        chunk["chain_id"] = chain_id
+        chunk["chain_status"] = chain_status
+    return _sse(chunk)

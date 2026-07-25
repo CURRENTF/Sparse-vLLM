@@ -31,6 +31,9 @@ class Sequence:
         self.prefix_cache_hit_last_block_id: bytes | None = None
         self.prefix_cache_block_size = 0
         self.prefix_cache_method = ""
+        self.chain_id: str | None = None
+        self.chain_status = "disabled"
+        self.chain_reused_tokens = 0
 
         self.temperature = sampling_params.temperature
         self.top_p = sampling_params.top_p
@@ -129,6 +132,9 @@ class Sequence:
             self.prefix_cache_hit_last_block_id,
             self.prefix_cache_block_size,
             self.prefix_cache_method,
+            self.chain_id,
+            self.chain_status,
+            self.chain_reused_tokens,
         )
 
     def __setstate__(self, state):
@@ -137,7 +143,8 @@ class Sequence:
          self.top_p, self.top_k, self.max_tokens, self.ignore_eos, self.eos_token_ids,
          self.logprobs, data,
          self.prefix_cache_enabled, self.prefix_cache_hit_len, self.prefix_cache_hit_block_count,
-         self.prefix_cache_hit_last_block_id, self.prefix_cache_block_size, self.prefix_cache_method) = state
+         self.prefix_cache_hit_last_block_id, self.prefix_cache_block_size, self.prefix_cache_method,
+         self.chain_id, self.chain_status, self.chain_reused_tokens) = state
         self.completion_token_logprobs = []
         self.completion_top_logprobs = []
 

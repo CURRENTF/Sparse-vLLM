@@ -140,6 +140,15 @@ manifests normalize to the same runtime.
 Use the HF backend when you want to compare against the DeltaKV / SnapKV /
 PyramidKV wrapper models implemented under `src/deltakv/`.
 
+For linear chain prefix-cache traces, select `chain_snapkv`,
+`chain_pyramidkv`, `chain_rkv`, or `chain_skipkv` in
+`scripts/benchmarks/bench_prefix_cache.py`. Chain cases require
+`--workloads multiturn --history_update generated`: turn 0 records the
+server-created `chain_id`, later turns reuse it, and each record includes chain
+status, reused logical tokens, prefilled delta tokens, and per-layer physical
+residency. A tombstone or digest mismatch is a failed sample; the harness does
+not fall back to recomputation.
+
 ```bash
 python benchmark/long_bench/pred.py \
   --model qwen7b-deltakv \

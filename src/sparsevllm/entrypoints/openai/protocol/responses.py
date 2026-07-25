@@ -17,6 +17,7 @@ class ResponseRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     model: str
+    chain_id: str | None = None
     input: str | list[dict[str, Any]]
     instructions: str | None = None
     max_output_tokens: int | None = Field(default=None, ge=1)

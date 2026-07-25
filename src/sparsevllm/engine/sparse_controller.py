@@ -634,7 +634,16 @@ class SparseController:
                 raise RuntimeError("PyramidKV full-prefill staging should only run on the final prefill chunk.")
             seq_keep_indices = []
             for seq in seqs:
-                kv_len = int(seq.num_prefilled_tokens) + int(seq.current_chunk_size)
+                physical_len = getattr(
+                    self.cache_manager, "chain_physical_kv_len", None
+                )
+                kv_len = (
+                    int(physical_len(layer_idx, seq.seq_id))
+                    if getattr(seq, "chain_status", "") == "resumed"
+                    and callable(physical_len)
+                    else int(seq.num_prefilled_tokens)
+                    + int(seq.current_chunk_size)
+                )
                 if budget is None or kv_len <= budget:
                     keep_indices = torch.arange(kv_len, device=self.device, dtype=torch.long)
                 else:
@@ -915,7 +924,16 @@ class SparseController:
             for seq in seqs:
                 if not seq.is_last_chunk_prefill:
                     continue
-                kv_len = int(seq.num_prefilled_tokens) + int(seq.current_chunk_size)
+                physical_len = getattr(
+                    self.cache_manager, "chain_physical_kv_len", None
+                )
+                kv_len = (
+                    int(physical_len(layer_idx, seq.seq_id))
+                    if getattr(seq, "chain_status", "") == "resumed"
+                    and callable(physical_len)
+                    else int(seq.num_prefilled_tokens)
+                    + int(seq.current_chunk_size)
+                )
                 if kv_len <= budget:
                     continue
                 seq_scores = self.cache_manager.pop_prefill_attention_score(layer_idx, seq)

@@ -9,6 +9,7 @@ from typing import Any
 
 from fastapi import HTTPException
 from pydantic import BaseModel
+from sparsevllm.engine.chain_cache import ChainCacheError
 
 
 DisconnectChecker = Callable[[], Awaitable[bool]]
@@ -16,6 +17,17 @@ DisconnectChecker = Callable[[], Awaitable[bool]]
 
 class ClientDisconnected(asyncio.CancelledError):
     """Raised when the ASGI client disappears while generation is active."""
+
+
+def _chain_http_exception(exc: ChainCacheError) -> HTTPException:
+    return HTTPException(
+        status_code=int(exc.status_code),
+        detail={
+            "code": exc.error_code,
+            "message": str(exc),
+            "chain_id": exc.chain_id,
+        },
+    )
 
 
 def _model_dump_json(model: BaseModel) -> dict[str, Any]:

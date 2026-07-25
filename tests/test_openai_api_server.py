@@ -906,12 +906,25 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
 
     def test_sse_serializes_openai_data_frame(self):
         from sparsevllm.entrypoints.openai.api_server import _sse
+        from sparsevllm.entrypoints.openai.serving.chat import (
+            _chat_stream_chunk,
+        )
 
         frame = _sse({"text": "hello"})
 
         self.assertTrue(frame.startswith("data: "))
         self.assertTrue(frame.endswith("\n\n"))
         self.assertEqual(json.loads(frame.removeprefix("data: ")), {"text": "hello"})
+        non_chain = json.loads(
+            _chat_stream_chunk(
+                "chatcmpl-test",
+                123,
+                "model",
+                0,
+                {"content": "x"},
+            ).removeprefix("data: ")
+        )
+        self.assertNotIn("chain_id", non_chain)
 
     def test_deltakv_serving_method_fails_fast(self):
         from sparsevllm.entrypoints.openai.api_server import _validate_serving_method
@@ -3021,6 +3034,533 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response["object"], "chat.completion")
         self.assertEqual(response["choices"][0]["message"], {"role": "assistant", "content": "hello"})
         self.assertEqual(response["usage"], {"prompt_tokens": 4, "completion_tokens": 1, "total_tokens": 5})
+
+    async def test_chain_metadata_is_exposed_by_all_response_shapes(self):
+        from sparsevllm.entrypoints.openai.api_server import (
+            RequestHandle,
+            _chat_completion_response,
+            _completion_response,
+        )
+        from sparsevllm.entrypoints.openai.serving.responses import _usage_from_final
+
+        final = {
+            "type": "final",
+            "index": 0,
+            "text": "hello",
+            "finish_reason": "stop",
+            "prompt_tokens": 6,
+            "completion_tokens": 1,
+            "token_ids": [1],
+            "token_logprobs": [None],
+            "top_logprobs": [None],
+            "chain_id": "chain-1",
+            "chain_status": "resumed",
+            "reused_tokens": 4,
+            "prefilled_tokens": 2,
+        }
+
+        def handle():
+            queue = asyncio.Queue()
+            queue.put_nowait(dict(final))
+            return RequestHandle(
+                output_queue=queue,
+                cancelled=threading.Event(),
+                chain_id="chain-1",
+                chain_status="resumed",
+                reused_tokens=4,
+                prefilled_tokens=2,
+            )
+
+        chat = await _chat_completion_response(
+            "chatcmpl-test", 123, "model", [handle()]
+        )
+        completion = await _completion_response(
+            "cmpl-test", 123, "model", [handle()]
+        )
+        responses_usage = _usage_from_final(final)
+
+        self.assertEqual(chat["chain_id"], "chain-1")
+        self.assertEqual(chat["chain_status"], "resumed")
+        self.assertEqual(chat["usage"]["reused_tokens"], 4)
+        self.assertEqual(completion["chain_id"], "chain-1")
+        self.assertEqual(completion["chain_status"], "resumed")
+        self.assertEqual(completion["usage"]["reused_tokens"], 4)
+        self.assertEqual(responses_usage["reused_tokens"], 4)
+        self.assertEqual(
+            responses_usage["input_tokens_details"]["cached_tokens"], 4
+        )
+
+    async def test_chain_worker_keeps_implicit_completion_batch_compatible(self):
+        from sparsevllm.entrypoints.openai.dispatcher import RequestHandle
+        from sparsevllm.entrypoints.openai.protocol.completion import (
+            CompletionRequest,
+        )
+        from sparsevllm.entrypoints.openai.serving.completion import (
+            serve_completion,
+        )
+
+        class Dispatcher:
+            admission_ack_enabled = True
+            chain_cache_enabled = True
+
+            def __init__(self):
+                self.submitted = []
+
+            async def submit(self, *_args, **_kwargs):
+                raise AssertionError("submit_admitted must be used")
+
+            async def submit_admitted(
+                self,
+                prompt,
+                _sampling_params,
+                index,
+                _stop,
+            ):
+                self.submitted.append((prompt, index))
+                output_queue = asyncio.Queue()
+                chain_id = f"chain-{index}"
+                output_queue.put_nowait(
+                    {
+                        "type": "final",
+                        "index": index,
+                        "text": f"answer-{index}",
+                        "finish_reason": "length",
+                        "prompt_tokens": 1,
+                        "completion_tokens": 1,
+                        "token_ids": [index],
+                        "token_logprobs": [None],
+                        "top_logprobs": [None],
+                        "chain_id": chain_id,
+                        "chain_status": "created",
+                        "reused_tokens": 0,
+                        "prefilled_tokens": 1,
+                    }
+                )
+                return RequestHandle(
+                    output_queue=output_queue,
+                    cancelled=threading.Event(),
+                    seq_id=index,
+                    chain_id=chain_id,
+                    chain_status="created",
+                    prefilled_tokens=1,
+                )
+
+        dispatcher = Dispatcher()
+        response = await serve_completion(
+            CompletionRequest(
+                model="model",
+                prompt=["first", "second"],
+                max_tokens=1,
+                temperature=0,
+            ),
+            dispatcher,
+            tokenizer=None,
+            served_model_name="model",
+            request_log_path=None,
+        )
+        payload = json.loads(response.body)
+
+        self.assertEqual(
+            dispatcher.submitted,
+            [("first", 0), ("second", 1)],
+        )
+        self.assertNotIn("chain_id", payload)
+        self.assertEqual(
+            [choice["chain_id"] for choice in payload["choices"]],
+            ["chain-0", "chain-1"],
+        )
+
+    async def test_chain_admission_error_precedes_streaming_http_200(self):
+        from fastapi import HTTPException
+
+        from sparsevllm.engine.chain_cache import ChainBusyError
+        from sparsevllm.entrypoints.openai.api_server import ChatCompletionRequest
+        from sparsevllm.entrypoints.openai.serving.chat import (
+            serve_chat_completion,
+        )
+
+        class Dispatcher:
+            admission_ack_enabled = True
+
+            async def submit(self, *_args, **_kwargs):
+                raise AssertionError("submit_admitted must be used")
+
+            async def submit_admitted(self, *_args, **_kwargs):
+                raise ChainBusyError(
+                    "already active",
+                    chain_id="chain-1",
+                )
+
+        class Tokenizer:
+            chat_template = None
+
+        request = ChatCompletionRequest(
+            model="model",
+            messages=[{"role": "user", "content": "hello"}],
+            stream=True,
+            chain_id="chain-1",
+        )
+        with self.assertRaises(HTTPException) as ctx:
+            await serve_chat_completion(
+                request,
+                Dispatcher(),
+                Tokenizer(),
+                "model",
+                None,
+            )
+        self.assertEqual(ctx.exception.status_code, 409)
+
+    async def test_dispatcher_shutdown_resolves_pending_admission(self):
+        from sparsevllm.entrypoints.openai.dispatcher import (
+            AsyncEngineDispatcher,
+            RequestHandle,
+            _QueuedRequest,
+        )
+
+        loop = asyncio.get_running_loop()
+        output_queue = asyncio.Queue()
+        cancelled = threading.Event()
+        future = loop.create_future()
+        handle = RequestHandle(
+            output_queue=output_queue,
+            cancelled=cancelled,
+            admission_future=future,
+        )
+        item = _QueuedRequest(
+            prompt=[1],
+            sampling_params=object(),
+            index=0,
+            stop=[],
+            loop=loop,
+            output_queue=output_queue,
+            cancelled=cancelled,
+            handle=handle,
+            admission_future=future,
+        )
+        dispatcher = object.__new__(AsyncEngineDispatcher)
+        dispatcher._closing = threading.Event()
+        dispatcher._closing.set()
+        dispatcher._failed_message = None
+
+        dispatcher._admit(item, {})
+        admitted = await asyncio.wait_for(future, timeout=1)
+
+        self.assertIs(admitted, handle)
+        self.assertIsInstance(handle.admission_error, RuntimeError)
+        self.assertIn("shutting down", str(handle.admission_error))
+
+    async def test_dispatcher_invalidates_chain_when_stop_is_found_at_finish(self):
+        from sparsevllm.entrypoints.openai.api_server import (
+            AsyncEngineDispatcher,
+            _ActiveRequest,
+        )
+        from sparsevllm.entrypoints.openai.detokenizer import (
+            IncrementalDetokenizer,
+        )
+
+        tokenizer = _byte_level_tokenizer()
+        token_ids = tokenizer.encode("answerSTOP")
+
+        class Engine:
+            def __init__(self):
+                self.tokenizer = tokenizer
+                self.last_step_token_outputs = []
+                self.last_step_logprob_outputs = []
+                self.aborted = []
+
+            def abort_request(self, seq_id, disposition="invalidate"):
+                self.aborted.append((int(seq_id), str(disposition)))
+
+            def exit(self):
+                pass
+
+        engine = Engine()
+        dispatcher = AsyncEngineDispatcher(engine)
+        output_queue = asyncio.Queue()
+        active = {
+            7: _ActiveRequest(
+                index=0,
+                loop=asyncio.get_running_loop(),
+                output_queue=output_queue,
+                prompt_token_ids=[1],
+                max_tokens=len(token_ids) + 1,
+                stop=["STOP"],
+                completion_token_ids=[],
+                completion_token_logprobs=[],
+                completion_top_logprobs=[],
+                detokenizer=IncrementalDetokenizer(tokenizer),
+                chain_id="chain-1",
+                chain_status="resumed",
+            )
+        }
+        try:
+            dispatcher._publish_finished(
+                active,
+                [
+                    (
+                        7,
+                        token_ids,
+                        [None] * len(token_ids),
+                        [None] * len(token_ids),
+                    )
+                ],
+            )
+            items = []
+            await asyncio.sleep(0)
+            while not output_queue.empty():
+                items.append(output_queue.get_nowait())
+        finally:
+            dispatcher.close()
+
+        final = next(item for item in items if item["type"] == "final")
+        self.assertEqual(final["text"], "answer")
+        self.assertEqual(final["chain_status"], "invalidated")
+        self.assertEqual(engine.aborted, [(7, "invalidate")])
+
+    async def test_dispatcher_cleans_up_chain_when_post_admission_setup_fails(self):
+        from sparsevllm.entrypoints.openai.dispatcher import (
+            AsyncEngineDispatcher,
+            RequestHandle,
+            _QueuedRequest,
+        )
+
+        base_tokenizer = _byte_level_tokenizer()
+
+        class FailingTokenizer:
+            is_fast = True
+            backend_tokenizer = base_tokenizer.backend_tokenizer
+
+            def encode(self, _text):
+                raise RuntimeError("token accounting failed")
+
+            def decode(self, token_ids, skip_special_tokens=True):
+                return base_tokenizer.decode(
+                    token_ids,
+                    skip_special_tokens=skip_special_tokens,
+                )
+
+        class Admission:
+            seq_id = 7
+            chain_id = "chain-1"
+            chain_status = "created"
+            reused_tokens = 0
+            prefilled_tokens = 1
+
+        class Engine:
+            tokenizer = FailingTokenizer()
+
+            def __init__(self):
+                self.aborted = []
+
+            def admit_request(self, *_args, **_kwargs):
+                return Admission()
+
+            def abort_request(self, seq_id, disposition="invalidate"):
+                self.aborted.append((int(seq_id), str(disposition)))
+
+        loop = asyncio.get_running_loop()
+        output_queue = asyncio.Queue()
+        cancelled = threading.Event()
+        future = loop.create_future()
+        handle = RequestHandle(
+            output_queue=output_queue,
+            cancelled=cancelled,
+            admission_future=future,
+        )
+        item = _QueuedRequest(
+            prompt="hello",
+            sampling_params=type("Params", (), {"max_tokens": 1})(),
+            index=0,
+            stop=[],
+            loop=loop,
+            output_queue=output_queue,
+            cancelled=cancelled,
+            handle=handle,
+            admission_future=future,
+        )
+        dispatcher = object.__new__(AsyncEngineDispatcher)
+        dispatcher.engine = Engine()
+        dispatcher._closing = threading.Event()
+        dispatcher._failed_message = None
+
+        dispatcher._admit(item, {})
+        await asyncio.wait_for(future, timeout=1)
+
+        self.assertIsInstance(handle.admission_error, RuntimeError)
+        self.assertEqual(
+            dispatcher.engine.aborted,
+            [(7, "invalidate")],
+        )
+
+    async def test_dispatcher_uses_admitted_prompt_count_for_usage(self):
+        from sparsevllm.entrypoints.openai.dispatcher import (
+            AsyncEngineDispatcher,
+            RequestHandle,
+            _QueuedRequest,
+        )
+
+        tokenizer = _byte_level_tokenizer()
+
+        class Admission:
+            seq_id = 7
+            chain_id = "chain-1"
+            chain_status = "resumed"
+            reused_tokens = 2
+            prefilled_tokens = 1
+
+        class Engine:
+            def __init__(self):
+                self.tokenizer = tokenizer
+
+            def admit_request(self, *_args, **_kwargs):
+                return Admission()
+
+        loop = asyncio.get_running_loop()
+        output_queue = asyncio.Queue()
+        future = loop.create_future()
+        handle = RequestHandle(
+            output_queue=output_queue,
+            cancelled=threading.Event(),
+            admission_future=future,
+        )
+        item = _QueuedRequest(
+            prompt="hello",
+            sampling_params=type("Params", (), {"max_tokens": 1})(),
+            index=0,
+            stop=[],
+            loop=loop,
+            output_queue=output_queue,
+            cancelled=handle.cancelled,
+            handle=handle,
+            admission_future=future,
+            chain_id="chain-1",
+        )
+        dispatcher = object.__new__(AsyncEngineDispatcher)
+        dispatcher.engine = Engine()
+        dispatcher._closing = threading.Event()
+        dispatcher._failed_message = None
+        active = {}
+
+        dispatcher._admit(item, active)
+        await asyncio.wait_for(future, timeout=1)
+        dispatcher._publish_finished(active, [(7, [], [], [])])
+        final = await asyncio.wait_for(output_queue.get(), timeout=1)
+
+        self.assertIsNone(handle.admission_error)
+        self.assertEqual(final["type"], "final")
+        self.assertEqual(final["prompt_tokens"], 3)
+
+    async def test_dispatcher_wakes_to_invalidate_finished_chain_on_cancel(self):
+        from sparsevllm.entrypoints.openai.dispatcher import (
+            AsyncEngineDispatcher,
+            RequestHandle,
+        )
+
+        invalidated = threading.Event()
+
+        class Engine:
+            tokenizer = _byte_level_tokenizer()
+            last_step_token_outputs = []
+            last_step_logprob_outputs = []
+
+            def invalidate_chain(self, chain_id):
+                if chain_id != "chain-1":
+                    raise AssertionError(chain_id)
+                invalidated.set()
+
+            def exit(self):
+                pass
+
+        dispatcher = AsyncEngineDispatcher(Engine())
+        handle = RequestHandle(
+            output_queue=asyncio.Queue(),
+            cancelled=threading.Event(),
+            seq_id=7,
+            chain_id="chain-1",
+        )
+        try:
+            dispatcher.cancel(handle)
+            completed = await asyncio.to_thread(invalidated.wait, 1.0)
+        finally:
+            dispatcher.close()
+
+        self.assertTrue(completed)
+
+    async def test_dispatcher_ignores_stale_cancel_after_chain_seq_id_reuse(self):
+        import queue
+
+        from sparsevllm.entrypoints.openai.dispatcher import (
+            AsyncEngineDispatcher,
+            RequestHandle,
+            _ActiveRequest,
+        )
+        from sparsevllm.entrypoints.openai.detokenizer import (
+            IncrementalDetokenizer,
+        )
+
+        tokenizer = _byte_level_tokenizer()
+
+        class Engine:
+            def __init__(self):
+                self.aborted = []
+
+            def abort_request(self, seq_id, disposition="invalidate"):
+                self.aborted.append((int(seq_id), str(disposition)))
+
+        dispatcher = object.__new__(AsyncEngineDispatcher)
+        dispatcher.engine = Engine()
+        dispatcher._aborts = queue.Queue()
+        dispatcher._pending = queue.Queue()
+        dispatcher._latest_request_tokens = {7: "new-turn"}
+        old_handle = RequestHandle(
+            output_queue=asyncio.Queue(),
+            cancelled=threading.Event(),
+            seq_id=7,
+            chain_id="chain-1",
+            request_token="old-turn",
+        )
+        active = {
+            7: _ActiveRequest(
+                index=0,
+                loop=asyncio.get_running_loop(),
+                output_queue=asyncio.Queue(),
+                prompt_token_ids=[1, 2],
+                max_tokens=1,
+                stop=[],
+                completion_token_ids=[],
+                completion_token_logprobs=[],
+                completion_top_logprobs=[],
+                detokenizer=IncrementalDetokenizer(tokenizer),
+                chain_id="chain-1",
+                chain_status="resumed",
+                request_token="new-turn",
+            )
+        }
+
+        dispatcher.cancel(old_handle)
+        changed = dispatcher._drain_aborts(active)
+
+        self.assertFalse(changed)
+        self.assertEqual(dispatcher.engine.aborted, [])
+        self.assertIn(7, active)
+
+        active.clear()
+        dispatcher.cancel(old_handle)
+        changed = dispatcher._drain_aborts(active)
+        self.assertFalse(changed)
+        self.assertEqual(dispatcher.engine.aborted, [])
+
+        current_handle = RequestHandle(
+            output_queue=asyncio.Queue(),
+            cancelled=threading.Event(),
+            seq_id=7,
+            chain_id="chain-1",
+            request_token="new-turn",
+        )
+        dispatcher.cancel(current_handle)
+        changed = dispatcher._drain_aborts(active)
+        self.assertTrue(changed)
+        self.assertEqual(dispatcher.engine.aborted, [(7, "invalidate")])
 
     async def test_chat_completion_parses_qwen3_reasoning(self):
         from sparsevllm.entrypoints.openai.api_server import RequestHandle, _chat_completion_response

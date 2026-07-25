@@ -23,6 +23,7 @@ from sparsevllm.method_registry import (
     validate_model_runtime_compatibility,
 )
 from sparsevllm.engine.prefix_cache import resolve_prefix_cache_block_size
+from sparsevllm.engine.chain_cache import normalize_prefix_cache_mode
 from sparsevllm.utils.log import logger, log_once
 
 try:
@@ -752,8 +753,11 @@ class Config:
 
     # Prefix Cache Config
     enable_prefix_caching: bool = False
+    prefix_cache_mode: str = "auto"
+    resolved_prefix_cache_mode: str = field(default="disabled", init=False)
     prefix_cache_block_size: int | None = None
     prefix_cache_max_blocks: int | None = None
+    chain_cache_max_tombstones: int = 1024
     enable_prefix_cache_offload: bool = False
     prefix_cache_host_size_gb: float | None = None
     recurrent_state_max_bytes: int | None = None
@@ -972,6 +976,12 @@ class Config:
                 f"Supported methods: '', {supported}."
             )
         self.enable_prefix_caching = _coerce_bool_config("enable_prefix_caching", self.enable_prefix_caching)
+        self.prefix_cache_mode = str(self.prefix_cache_mode or "auto").strip().lower()
+        self.resolved_prefix_cache_mode = normalize_prefix_cache_mode(
+            self.prefix_cache_mode,
+            enabled=self.enable_prefix_caching,
+            method=self.vllm_sparse_method,
+        )
         self.max_num_seqs_in_batch = int(self.max_num_seqs_in_batch)
         if self.max_num_seqs_in_batch <= 0:
             raise ValueError(
@@ -1011,6 +1021,12 @@ class Config:
             "prefix_cache_max_blocks",
             self.prefix_cache_max_blocks,
         )
+        self.chain_cache_max_tombstones = int(self.chain_cache_max_tombstones)
+        if self.chain_cache_max_tombstones <= 0:
+            raise ValueError(
+                "chain_cache_max_tombstones must be > 0, got "
+                f"{self.chain_cache_max_tombstones}."
+            )
         self.enable_prefix_cache_offload = _coerce_bool_config(
             "enable_prefix_cache_offload",
             self.enable_prefix_cache_offload,
@@ -1076,7 +1092,10 @@ class Config:
             recurrent_state_max_bytes = self.prefix_cache_max_recurrent_bytes
         self.recurrent_state_max_bytes = recurrent_state_max_bytes
         if self.enable_prefix_caching and self.vllm_sparse_method not in PREFIX_CACHE_SUPPORTED_METHODS:
-            raise ValueError("prefix caching only supports vanilla, omnikv, quest.")
+            raise ValueError(
+                "prefix caching only supports vanilla, omnikv, quest, snapkv, "
+                "pyramidkv, rkv, and skipkv."
+            )
         self.prefix_cache_salt = str(self.prefix_cache_salt or "")
         self.prefill_schedule_policy = resolve_prefill_schedule_policy(
             self.vllm_sparse_method,
@@ -1714,10 +1733,14 @@ class Config:
                 "Official SkipKV support is limited to the released steering vectors for "
                 f"{', '.join(sorted(SUPPORTED_SKIPKV_MODEL_NAMES))}."
             )
-        if is_qwen35 and self.enable_prefix_caching and self.prefix_cache_block_size is None:
+        if (
+            is_qwen35
+            and self.resolved_prefix_cache_mode == "radix"
+            and self.prefix_cache_block_size is None
+        ):
             self.prefix_cache_block_size = 4096
         self.prefix_cache_block_size = resolve_prefix_cache_block_size(self)
-        if is_qwen35 and self.enable_prefix_caching:
+        if is_qwen35 and self.resolved_prefix_cache_mode == "radix":
             if self.prefix_cache_block_size < 4096 or self.prefix_cache_block_size % 4096 != 0:
                 raise ValueError(
                     "qwen3_5 mixed prefix cache requires prefix_cache_block_size to be "

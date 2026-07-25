@@ -22,6 +22,13 @@ runs, `ModelRunner` executes it, `Attention` calls generic hooks, and
 `CacheManager` implementations own method-specific cache state, allocation,
 views, reconstruction, and graph-stable metadata.
 
+For SnapKV, PyramidKV, R-KV, and SkipKV chain prefix caching,
+`ChainCacheIndex` owns logical lifecycle only. `ChainCacheCoordinator` plans
+transitions, cache managers retain all payload/metadata, and `RuntimeState`
+performs reclamation. The OpenAI dispatcher acknowledges admission before
+constructing a stream. Smart-router affinity comes from parallel read-only
+worker probes, not a router-owned chain map.
+
 ## Runtime Flow
 
 ```mermaid

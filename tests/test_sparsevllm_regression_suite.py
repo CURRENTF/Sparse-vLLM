@@ -82,9 +82,12 @@ class SparseVLLMRegressionSuiteTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "enable_prefix_caching"):
             run_suite._quality_command(
                 model_id="qwen25_7b",
-                method_id="snapkv",
+                method_id="streamingllm",
                 model={"model_path": "/models/qwen", "tokenizer_path": "/models/qwen"},
-                method={"sparse_method": "snapkv", "config": {"sparse_method": "snapkv"}},
+                method={
+                    "sparse_method": "streamingllm",
+                    "config": {"sparse_method": "streamingllm"},
+                },
                 quality={**self._quality_cfg(), "enable_prefix_caching": True},
                 performance={
                     "decode_cuda_graph": True,

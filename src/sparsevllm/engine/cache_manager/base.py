@@ -417,7 +417,11 @@ class CacheManager(ABC):
         prefix_block_capacity = 0
         prefix_recurrent_capacity_bytes = 0
         kv_bytes_per_block = 0
-        if bool(getattr(config, "enable_prefix_caching", False)) and recurrent_bytes_per_block > 0:
+        if (
+            str(getattr(config, "resolved_prefix_cache_mode", "disabled"))
+            == "radix"
+            and recurrent_bytes_per_block > 0
+        ):
             kv_bytes_per_block = self._kv_allocation_bytes_per_prefix_block(
                 slot_bytes_per_layer
             )
@@ -1377,6 +1381,55 @@ class CacheManager(ABC):
     def debug_live_seq_slots(self) -> dict[int, int]:
         """Return live seq_id -> occupied slot count for debugging."""
         return {}
+
+    def chain_capacity_deficits(
+        self,
+        *,
+        suffix_tokens: int,
+        generation_tokens: int = 0,
+        existing_slots_by_layer: tuple[int, ...] = (),
+        outstanding_reserved_slots_by_layer: tuple[int, ...] = (),
+        outstanding_reserved_rows: int = 0,
+        needs_resident_row: bool,
+    ) -> tuple[tuple[int, ...], int, tuple[int, ...], int]:
+        """Return requirements and deficits for chain admission.
+
+        Chain-capable cache managers override this with their physical layout.
+        """
+        del (
+            suffix_tokens,
+            generation_tokens,
+            existing_slots_by_layer,
+            outstanding_reserved_slots_by_layer,
+            outstanding_reserved_rows,
+            needs_resident_row,
+        )
+        raise RuntimeError(
+            f"{type(self).__name__} does not implement chain cache capacity accounting."
+        )
+
+    def chain_physical_residency(self, seq_id: int) -> tuple[int, ...]:
+        del seq_id
+        raise RuntimeError(
+            f"{type(self).__name__} does not implement chain cache residency accounting."
+        )
+
+    def chain_has_residency(self, seq_id: int) -> bool:
+        del seq_id
+        return False
+
+    def chain_physical_kv_len(self, layer_idx: int, seq_id: int) -> int:
+        del layer_idx, seq_id
+        raise RuntimeError(
+            f"{type(self).__name__} does not expose chain physical KV length."
+        )
+
+    def on_chain_turn_finished(
+        self,
+        seq_id: int,
+        processed_token_count: int,
+    ) -> None:
+        del seq_id, processed_token_count
 
     @abstractmethod
     def free_seq(self, seq_id: int):

@@ -22,6 +22,8 @@ from sparsevllm.entrypoints.openai.serving.base import DisconnectChecker
 from sparsevllm.entrypoints.openai.serving.base import _wait_for_any_or_disconnect
 from sparsevllm.entrypoints.openai.serving.base import _wait_final
 from sparsevllm.entrypoints.openai.serving.base import _write_request_log
+from sparsevllm.entrypoints.openai.serving.base import _chain_http_exception
+from sparsevllm.engine.chain_cache import ChainCacheError
 from sparsevllm.utils.log import logger
 
 
@@ -63,10 +65,32 @@ async def serve_completion(
             },
         )
 
-    handles = [
-        await dispatcher.submit(prompt, sampling_params, index, stop)
-        for index, prompt in enumerate(prompts)
-    ]
+    try:
+        submit = (
+            getattr(dispatcher, "submit_admitted", dispatcher.submit)
+            if bool(getattr(dispatcher, "admission_ack_enabled", False))
+            else dispatcher.submit
+        )
+        handles = [
+            await submit(prompt, sampling_params, index, stop)
+            if request.chain_id is None
+            else await submit(
+                prompt, sampling_params, index, stop, chain_id=request.chain_id
+            )
+            for index, prompt in enumerate(prompts)
+        ]
+    except ChainCacheError as exc:
+        raise _chain_http_exception(exc) from exc
+    chain_id = (
+        getattr(handles[0], "chain_id", None)
+        if len(handles) == 1
+        else None
+    )
+    headers = (
+        {"X-SparseVLLM-Chain-ID": chain_id}
+        if chain_id is not None
+        else None
+    )
 
     if request.stream:
         return StreamingResponse(
@@ -81,6 +105,7 @@ async def serve_completion(
                 is_disconnected=is_disconnected,
             ),
             media_type="text/event-stream",
+            headers=headers,
         )
 
     try:
@@ -130,7 +155,7 @@ async def serve_completion(
             "response": response,
         },
     )
-    return JSONResponse(response)
+    return JSONResponse(response, headers=headers)
 
 
 def _validate_request(request: CompletionRequest, served_model_name: str):
@@ -143,6 +168,11 @@ def _validate_request(request: CompletionRequest, served_model_name: str):
         raise HTTPException(status_code=400, detail="Sparse-vLLM completions currently supports n=1 only.")
     if request.stop and request.logprobs is not None:
         raise HTTPException(status_code=400, detail="stop with logprobs is not supported yet.")
+    if request.chain_id and len(_normalize_prompts(request.prompt)) != 1:
+        raise HTTPException(
+            status_code=400,
+            detail="chain mode completions requires exactly one prompt.",
+        )
 
 
 async def _completion_response(
@@ -157,39 +187,60 @@ async def _completion_response(
     choices = []
     prompt_tokens = 0
     completion_tokens = 0
+    chain_status = None
     for handle in handles:
         final = await _wait_final(handle.output_queue, is_disconnected)
-        choices.append(
-            {
-                "text": final["text"],
-                "index": final["index"],
-                "logprobs": _completion_logprobs(
-                    tokenizer,
-                    final.get("token_ids", []),
-                    final.get("token_logprobs", []),
-                    final.get("top_logprobs", []),
-                )
-                if tokenizer is not None
-                else None,
-                "finish_reason": final["finish_reason"],
-            }
-        )
+        chain_status = final.get("chain_status", chain_status)
+        choice = {
+            "text": final["text"],
+            "index": final["index"],
+            "logprobs": _completion_logprobs(
+                tokenizer,
+                final.get("token_ids", []),
+                final.get("token_logprobs", []),
+                final.get("top_logprobs", []),
+            )
+            if tokenizer is not None
+            else None,
+            "finish_reason": final["finish_reason"],
+        }
+        if final.get("chain_id") is not None:
+            choice["chain_id"] = final["chain_id"]
+            choice["chain_status"] = final.get("chain_status")
+        choices.append(choice)
         prompt_tokens += final["prompt_tokens"]
         completion_tokens += final["completion_tokens"]
 
     choices.sort(key=lambda choice: choice["index"])
-    return {
+    usage = {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+    }
+    if any(getattr(handle, "chain_id", None) for handle in handles):
+        reused_tokens = sum(
+            int(getattr(handle, "reused_tokens", 0))
+            for handle in handles
+        )
+        usage["cached_tokens"] = reused_tokens
+        usage["reused_tokens"] = reused_tokens
+    response = {
         "id": request_id,
         "object": "text_completion",
         "created": created,
         "model": model,
         "choices": choices,
-        "usage": {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": prompt_tokens + completion_tokens,
-        },
+        "usage": usage,
     }
+    chain_id = (
+        getattr(handles[0], "chain_id", None)
+        if len(handles) == 1
+        else None
+    )
+    if chain_id is not None:
+        response["chain_id"] = chain_id
+        response["chain_status"] = chain_status
+    return response
 
 
 async def _completion_stream(
@@ -241,41 +292,47 @@ async def _completion_stream(
                     )
                     if not item["text"] and logprobs is None:
                         continue
+                    chunk = {
+                        "id": request_id,
+                        "object": "text_completion",
+                        "created": created,
+                        "model": model,
+                        "choices": [
+                            {
+                                "text": item["text"],
+                                "index": item["index"],
+                                "logprobs": logprobs,
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                    if item.get("chain_id") is not None:
+                        chunk["chain_id"] = item["chain_id"]
+                        chunk["chain_status"] = item.get("chain_status")
                     yield _sse(
-                        {
-                            "id": request_id,
-                            "object": "text_completion",
-                            "created": created,
-                            "model": model,
-                            "choices": [
-                                {
-                                    "text": item["text"],
-                                    "index": item["index"],
-                                    "logprobs": logprobs,
-                                    "finish_reason": None,
-                                }
-                            ],
-                        }
+                        chunk
                     )
                 elif item["type"] == "final":
                     prompt_tokens += item["prompt_tokens"]
                     completion_tokens = max(completion_tokens, item["completion_tokens"])
-                    yield _sse(
-                        {
-                            "id": request_id,
-                            "object": "text_completion",
-                            "created": created,
-                            "model": model,
-                            "choices": [
-                                {
-                                    "text": item.get("text_delta", ""),
-                                    "index": item["index"],
-                                    "logprobs": None,
-                                    "finish_reason": item["finish_reason"],
-                                }
-                            ],
-                        }
-                    )
+                    chunk = {
+                        "id": request_id,
+                        "object": "text_completion",
+                        "created": created,
+                        "model": model,
+                        "choices": [
+                            {
+                                "text": item.get("text_delta", ""),
+                                "index": item["index"],
+                                "logprobs": None,
+                                "finish_reason": item["finish_reason"],
+                            }
+                        ],
+                    }
+                    if item.get("chain_id") is not None:
+                        chunk["chain_id"] = item["chain_id"]
+                        chunk["chain_status"] = item.get("chain_status")
+                    yield _sse(chunk)
                     pending.pop(tasks[task], None)
         yield "data: [DONE]\n\n"
         if started is not None:

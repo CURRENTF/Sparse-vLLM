@@ -158,9 +158,23 @@ class SkipKVCacheManager(RKVCacheManager):
             hit_delimiter = token_id in self._skipkv_delimiter_token_ids
             hit_max_len = sentence_len >= int(self.config.skipkv_sentence_max_tokens)
             if hit_delimiter or hit_max_len:
-                self._finalize_sentence(seq, state, token_pos + 1)
+                self._finalize_sentence(state, token_pos + 1)
 
-    def _finalize_sentence(self, seq: Sequence, state: SkipKVSequenceState, end_gen: int):
+    def on_chain_turn_finished(
+        self,
+        seq_id: int,
+        processed_token_count: int,
+    ) -> None:
+        state = self._skipkv_seq_states.get(int(seq_id))
+        if state is None or state.open_start_gen is None:
+            return
+        self._finalize_sentence(state, int(processed_token_count))
+
+    def _finalize_sentence(
+        self,
+        state: SkipKVSequenceState,
+        end_gen: int,
+    ):
         start_gen = int(state.open_start_gen) if state.open_start_gen is not None else int(end_gen)
         count = int(state.open_embedding_count)
         if count < int(self.config.skipkv_sentence_min_tokens) or state.open_embedding_sum is None:

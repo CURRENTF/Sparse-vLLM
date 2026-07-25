@@ -12,6 +12,218 @@ from unittest.mock import patch
     "OpenAI smart router dependencies are not installed",
 )
 class OpenAISmartRouterTest(unittest.TestCase):
+    def test_empty_chain_id_creates_on_chain_capable_worker(self):
+        from sparsevllm.entrypoints.openai import smart_router
+
+        router = smart_router.SmartRouter(
+            worker_urls=["http://chain-worker", "http://radix-worker"],
+            request_timeout_s=1.0,
+            overload_load_factor=1.5,
+            load_abs_threshold=1,
+            profiles={},
+            route_log_dir=None,
+        )
+        chain_worker, radix_worker = router.workers
+        chain_worker.info = {
+            "served_model_name": "model",
+            "sparse_method": "snapkv",
+            "prefix_cache_enabled": True,
+            "prefix_cache_mode": "chain",
+        }
+        radix_worker.info = {
+            "served_model_name": "model",
+            "sparse_method": "omnikv",
+            "prefix_cache_enabled": True,
+            "prefix_cache_mode": "radix",
+        }
+        router.refresh_worker_info = AsyncMock(return_value=None)
+
+        async def probe_workers(candidates, match_payload):
+            self.assertEqual(candidates, [chain_worker])
+            self.assertEqual(match_payload, {"text": "hello"})
+            return [
+                smart_router.WorkerProbe(
+                    worker=chain_worker,
+                    load={"active_requests": 0},
+                    match={
+                        "supported": False,
+                        "enabled": False,
+                        "matched_tokens": 0,
+                        "match_ratio": 0.0,
+                    },
+                )
+            ]
+
+        router._probe_workers = probe_workers
+
+        worker, payload, route = asyncio.run(
+            router.select_worker(
+                "/v1/completions",
+                {
+                    "model": "model",
+                    "prompt": "hello",
+                    "chain_id": "",
+                },
+            )
+        )
+
+        self.assertIs(worker, chain_worker)
+        self.assertEqual(payload["chain_id"], "")
+        self.assertEqual(route["reason"], "chain_create")
+        self.assertTrue(route["chain_create"])
+        self.assertEqual(
+            route["chain_selection_reason"],
+            "lowest_load_no_prefix_match",
+        )
+
+    def test_chain_affinity_requires_one_idle_owner(self):
+        from fastapi import HTTPException
+
+        from sparsevllm.entrypoints.openai import smart_router
+
+        router = smart_router.SmartRouter(
+            worker_urls=["http://worker-a", "http://worker-b"],
+            request_timeout_s=1.0,
+            overload_load_factor=1.5,
+            load_abs_threshold=1,
+            profiles={},
+            route_log_dir=None,
+        )
+
+        def post_json(url, _payload, _timeout):
+            if "worker-a" in url:
+                return {
+                    "present": True,
+                    "state": "idle",
+                    "chain_id": "chain-1",
+                }
+            return {"present": False, "tombstone": False}
+
+        with patch.object(smart_router, "_post_json", side_effect=post_json):
+            owner, matches = asyncio.run(
+                router._select_chain_owner(router.workers, "chain-1")
+            )
+        self.assertEqual(owner.url, "http://worker-a")
+        self.assertEqual(len(matches), 2)
+
+        with patch.object(
+            smart_router,
+            "_post_json",
+            return_value={
+                "present": True,
+                "state": "idle",
+                "chain_id": "chain-1",
+            },
+        ):
+            with self.assertRaises(HTTPException) as duplicate:
+                asyncio.run(router._select_chain_owner(router.workers, "chain-1"))
+        self.assertEqual(duplicate.exception.status_code, 500)
+
+        with patch.object(
+            smart_router,
+            "_post_json",
+            return_value={
+                "present": True,
+                "state": "active",
+                "chain_id": "chain-1",
+            },
+        ):
+            with self.assertRaises(HTTPException) as busy:
+                asyncio.run(router._select_chain_owner(router.workers[:1], "chain-1"))
+        self.assertEqual(busy.exception.status_code, 409)
+
+    def test_chain_affinity_distinguishes_unknown_and_gone(self):
+        from fastapi import HTTPException
+
+        from sparsevllm.entrypoints.openai import smart_router
+
+        router = smart_router.SmartRouter(
+            worker_urls=["http://worker-a"],
+            request_timeout_s=1.0,
+            overload_load_factor=1.5,
+            load_abs_threshold=1,
+            profiles={},
+            route_log_dir=None,
+        )
+        with patch.object(
+            smart_router,
+            "_post_json",
+            return_value={"present": False, "tombstone": False},
+        ):
+            with self.assertRaises(HTTPException) as unknown:
+                asyncio.run(router._select_chain_owner(router.workers, "chain-1"))
+        self.assertEqual(unknown.exception.status_code, 404)
+
+        with patch.object(
+            smart_router,
+            "_post_json",
+            return_value={"present": False, "tombstone": True},
+        ):
+            with self.assertRaises(HTTPException) as gone:
+                asyncio.run(router._select_chain_owner(router.workers, "chain-1"))
+        self.assertEqual(gone.exception.status_code, 410)
+
+    def test_chain_affinity_fails_closed_on_probe_error_or_disabled_workers(self):
+        from fastapi import HTTPException
+
+        from sparsevllm.entrypoints.openai import smart_router
+
+        router = smart_router.SmartRouter(
+            worker_urls=["http://worker-a", "http://worker-b"],
+            request_timeout_s=1.0,
+            overload_load_factor=1.5,
+            load_abs_threshold=1,
+            profiles={},
+            route_log_dir=None,
+        )
+
+        def partial_failure(url, _payload, _timeout):
+            if "worker-a" in url:
+                return {"enabled": True, "present": True, "state": "idle"}
+            raise RuntimeError("probe failed")
+
+        with patch.object(
+            smart_router,
+            "_post_json",
+            side_effect=partial_failure,
+        ):
+            with self.assertRaises(HTTPException) as failed:
+                asyncio.run(
+                    router._select_chain_owner(router.workers, "chain-1")
+                )
+        self.assertEqual(failed.exception.status_code, 503)
+
+        with patch.object(
+            smart_router,
+            "_post_json",
+            return_value={
+                "enabled": False,
+                "present": False,
+                "tombstone": False,
+            },
+        ):
+            with self.assertRaises(HTTPException) as disabled:
+                asyncio.run(
+                    router._select_chain_owner(router.workers, "chain-1")
+                )
+        self.assertEqual(disabled.exception.status_code, 400)
+
+    def test_router_preserves_upstream_chain_header(self):
+        from sparsevllm.entrypoints.openai.smart_router import _content_headers
+
+        self.assertEqual(
+            _content_headers(
+                {
+                    "content-type": "text/event-stream",
+                    "x-sparsevllm-chain-id": "chain-1",
+                }
+            ),
+            {
+                "Content-Type": "text/event-stream",
+                "X-SparseVLLM-Chain-ID": "chain-1",
+            },
+        )
+
     def test_worker_readiness_failure_is_removed_and_recovery_is_detected(self):
         from sparsevllm.entrypoints.openai import smart_router
 

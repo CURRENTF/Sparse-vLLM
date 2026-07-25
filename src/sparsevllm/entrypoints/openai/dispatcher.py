@@ -2,6 +2,7 @@ import asyncio
 import os
 import queue
 import threading
+import uuid
 from dataclasses import dataclass
 from dataclasses import field
 from typing import Any
@@ -19,7 +20,14 @@ from sparsevllm.utils.log import logger
 class RequestHandle:
     output_queue: asyncio.Queue
     cancelled: threading.Event
+    request_token: str = field(default_factory=lambda: uuid.uuid4().hex)
     seq_id: int | None = None
+    chain_id: str | None = None
+    chain_status: str = "disabled"
+    reused_tokens: int = 0
+    prefilled_tokens: int = 0
+    admission_future: asyncio.Future | None = None
+    admission_error: BaseException | None = None
 
 
 @dataclass
@@ -32,6 +40,8 @@ class _QueuedRequest:
     output_queue: asyncio.Queue
     cancelled: threading.Event
     handle: RequestHandle
+    admission_future: asyncio.Future
+    chain_id: str | None = None
 
 
 @dataclass
@@ -50,6 +60,12 @@ class _ActiveRequest:
     pending_token_ids: list[int] = field(default_factory=list)
     pending_token_logprobs: list[float | None] = field(default_factory=list)
     pending_top_logprobs: list[dict[int, float] | None] = field(default_factory=list)
+    chain_id: str | None = None
+    chain_status: str = "disabled"
+    reused_tokens: int = 0
+    prefilled_tokens: int = 0
+    request_token: str | None = None
+    prompt_token_count: int | None = None
 
 
 @dataclass
@@ -60,6 +76,14 @@ class _ControlRequest:
     output_queue: asyncio.Queue
 
 
+@dataclass(frozen=True)
+class _AbortRequest:
+    seq_id: int
+    disposition: str
+    chain_id: str | None
+    request_token: str
+
+
 _WAKEUP = object()
 
 
@@ -67,7 +91,10 @@ class AsyncEngineDispatcher:
     def __init__(self, engine: LLM):
         self.engine = engine
         self._pending: queue.Queue[_QueuedRequest | object | None] = queue.Queue()
-        self._aborts: queue.Queue[int] = queue.Queue()
+        self._aborts: queue.Queue[
+            _AbortRequest | tuple[int, str, str | None] | tuple[int, str] | int
+        ] = queue.Queue()
+        self._latest_request_tokens: dict[int, str] = {}
         self._controls: queue.Queue[_ControlRequest] = queue.Queue()
         self._closing = threading.Event()
         self._failed_message: str | None = None
@@ -76,6 +103,7 @@ class AsyncEngineDispatcher:
         self._routing_snapshot_lock = threading.Lock()
         self._worker_routing_load_snapshot: dict[str, Any] | None = None
         self._prefix_cache_routing_snapshot: Any | None = None
+        self._chain_cache_routing_snapshot: Any | None = None
         self._refresh_routing_snapshots()
         self._thread = threading.Thread(target=self._run, name="sparsevllm-openai-dispatcher", daemon=True)
         self._thread.start()
@@ -89,6 +117,25 @@ class AsyncEngineDispatcher:
     def is_ready(self) -> bool:
         with self._state_lock:
             return self._terminal_message_locked() is None
+
+    @property
+    def chain_cache_enabled(self) -> bool:
+        config = getattr(self.engine, "config", None)
+        return (
+            str(
+                getattr(
+                    config, "resolved_prefix_cache_mode", "disabled"
+                )
+            )
+            == "chain"
+        )
+
+    @property
+    def admission_ack_enabled(self) -> bool:
+        return hasattr(
+            getattr(self.engine, "config", None),
+            "resolved_prefix_cache_mode",
+        )
 
     def set_fatal_callback(self, callback: Callable[[str], None]) -> None:
         with self._state_lock:
@@ -117,28 +164,61 @@ class AsyncEngineDispatcher:
         sampling_params: SamplingParams,
         index: int,
         stop: list[str] | None = None,
+        chain_id: str | None = None,
     ) -> RequestHandle:
         output_queue: asyncio.Queue = asyncio.Queue()
         cancelled = threading.Event()
         handle = RequestHandle(output_queue=output_queue, cancelled=cancelled)
+        loop = asyncio.get_running_loop()
+        admission_future = loop.create_future()
+        handle.admission_future = admission_future
         queued = _QueuedRequest(
             prompt=prompt,
             sampling_params=sampling_params,
             index=index,
             stop=list(stop or []),
-            loop=asyncio.get_running_loop(),
+            loop=loop,
             output_queue=output_queue,
             cancelled=cancelled,
             handle=handle,
+            admission_future=admission_future,
+            chain_id=chain_id,
         )
         with self._state_lock:
             terminal_message = self._terminal_message_locked()
             if terminal_message is None:
                 self._pending.put(queued)
         if terminal_message is not None:
+            handle.admission_error = RuntimeError(terminal_message)
+            admission_future.set_result(handle)
             output_queue.put_nowait(
                 {"type": "error", "message": terminal_message}
             )
+        return handle
+
+    async def submit_admitted(
+        self,
+        prompt: str | list[int],
+        sampling_params: SamplingParams,
+        index: int,
+        stop: list[str] | None = None,
+        chain_id: str | None = None,
+    ) -> RequestHandle:
+        handle = await self.submit(
+            prompt,
+            sampling_params,
+            index,
+            stop,
+            chain_id=chain_id,
+        )
+        if handle.admission_future is not None:
+            try:
+                await asyncio.shield(handle.admission_future)
+            except asyncio.CancelledError:
+                self.cancel(handle)
+                raise
+        if handle.admission_error is not None:
+            raise handle.admission_error
         return handle
 
     async def control(self, operation: str, **kwargs: Any) -> Any:
@@ -190,6 +270,25 @@ class AsyncEngineDispatcher:
             )
         return result
 
+    def chain_cache_routing_match(self, chain_id: str) -> dict[str, Any]:
+        self._raise_if_unavailable()
+        with self._routing_snapshot_lock:
+            snapshot = self._chain_cache_routing_snapshot
+        if snapshot is None:
+            return {
+                "enabled": False,
+                "present": False,
+                "state": None,
+                "tombstone": False,
+            }
+        result = snapshot.match(str(chain_id))
+        if not isinstance(result, dict):
+            raise RuntimeError(
+                "Chain-cache routing snapshot returned a non-object result: "
+                f"{type(result).__name__}."
+            )
+        return result
+
     def _raise_if_unavailable(self) -> None:
         with self._state_lock:
             terminal_message = self._terminal_message_locked()
@@ -209,6 +308,11 @@ class AsyncEngineDispatcher:
             "prefix_cache_routing_snapshot",
             None,
         )
+        chain_snapshot_fn = getattr(
+            self.engine,
+            "chain_cache_routing_snapshot",
+            None,
+        )
         worker_routing_load = (
             worker_routing_load_fn()
             if callable(worker_routing_load_fn)
@@ -217,6 +321,11 @@ class AsyncEngineDispatcher:
         prefix_snapshot = (
             prefix_snapshot_fn()
             if callable(prefix_snapshot_fn)
+            else None
+        )
+        chain_snapshot = (
+            chain_snapshot_fn()
+            if callable(chain_snapshot_fn)
             else None
         )
         if (
@@ -234,11 +343,25 @@ class AsyncEngineDispatcher:
                 )
             if prefix_snapshot is not None:
                 self._prefix_cache_routing_snapshot = prefix_snapshot
+            if chain_snapshot is not None:
+                self._chain_cache_routing_snapshot = chain_snapshot
 
-    def cancel(self, handle: RequestHandle):
+    def cancel(
+        self,
+        handle: RequestHandle,
+        disposition: str = "invalidate",
+    ):
         handle.cancelled.set()
         if handle.seq_id is not None:
-            self._aborts.put(handle.seq_id)
+            self._aborts.put(
+                _AbortRequest(
+                    seq_id=int(handle.seq_id),
+                    disposition=str(disposition),
+                    chain_id=handle.chain_id,
+                    request_token=handle.request_token,
+                )
+            )
+            self._pending.put(_WAKEUP)
 
     def close(self):
         with self._state_lock:
@@ -259,6 +382,19 @@ class AsyncEngineDispatcher:
 
     def _put_control(self, request: _ControlRequest, item: dict[str, Any]):
         request.loop.call_soon_threadsafe(request.output_queue.put_nowait, item)
+
+    def _resolve_admission(
+        self,
+        item: _QueuedRequest,
+        error: BaseException | None = None,
+    ) -> None:
+        item.handle.admission_error = error
+
+        def resolve() -> None:
+            if not item.admission_future.done():
+                item.admission_future.set_result(item.handle)
+
+        item.loop.call_soon_threadsafe(resolve)
 
     def _run(self):
         active: dict[int, _ActiveRequest] = {}
@@ -344,19 +480,42 @@ class AsyncEngineDispatcher:
 
     def _admit(self, item: _QueuedRequest, active: dict[int, _ActiveRequest]):
         if item.cancelled.is_set():
+            self._resolve_admission(item, asyncio.CancelledError())
             return
         if self._closing.is_set():
-            self._put(item, {"type": "error", "message": "Sparse-vLLM server is shutting down."})
+            message = "Sparse-vLLM server is shutting down."
+            self._put(item, {"type": "error", "message": message})
+            self._resolve_admission(item, RuntimeError(message))
             return
         if self._failed_message is not None:
             self._put(item, {"type": "error", "message": self._failed_message})
+            self._resolve_admission(
+                item,
+                RuntimeError(self._failed_message),
+            )
             return
         try:
             detokenizer = IncrementalDetokenizer(self.engine.tokenizer)
-            seq_id = self.engine.add_request(item.prompt, item.sampling_params)
+            admit = getattr(self.engine, "admit_request", None)
+            if callable(admit):
+                admission = admit(
+                    item.prompt,
+                    item.sampling_params,
+                    chain_id=item.chain_id,
+                )
+                seq_id = int(admission.seq_id)
+                item.handle.chain_id = admission.chain_id
+                item.handle.chain_status = str(admission.chain_status)
+                item.handle.reused_tokens = int(admission.reused_tokens)
+                item.handle.prefilled_tokens = int(admission.prefilled_tokens)
+            else:
+                seq_id = self.engine.add_request(
+                    item.prompt, item.sampling_params
+                )
             item.handle.seq_id = seq_id
             if item.cancelled.is_set():
                 self.engine.abort_request(seq_id)
+                self._resolve_admission(item, asyncio.CancelledError())
                 return
             prompt_token_ids = (
                 list(item.prompt)
@@ -374,9 +533,48 @@ class AsyncEngineDispatcher:
                 completion_token_logprobs=[],
                 completion_top_logprobs=[],
                 detokenizer=detokenizer,
+                chain_id=item.handle.chain_id,
+                chain_status=item.handle.chain_status,
+                reused_tokens=item.handle.reused_tokens,
+                prefilled_tokens=item.handle.prefilled_tokens,
+                request_token=item.handle.request_token,
+                prompt_token_count=(
+                    int(admission.reused_tokens)
+                    + int(admission.prefilled_tokens)
+                    if callable(admit)
+                    else len(prompt_token_ids)
+                ),
             )
+            latest_request_tokens = getattr(
+                self, "_latest_request_tokens", None
+            )
+            if latest_request_tokens is None:
+                latest_request_tokens = {}
+                self._latest_request_tokens = latest_request_tokens
+            latest_request_tokens[seq_id] = item.handle.request_token
+            self._resolve_admission(item)
         except Exception as exc:
-            self._put(item, {"type": "error", "message": f"{type(exc).__name__}: {exc}"})
+            if item.handle.seq_id is not None:
+                try:
+                    self.engine.abort_request(
+                        item.handle.seq_id,
+                        disposition="invalidate",
+                    )
+                except TypeError:
+                    self.engine.abort_request(item.handle.seq_id)
+                except Exception:
+                    logger.exception(
+                        "Failed to abort request {} after admission setup failed.",
+                        item.handle.seq_id,
+                    )
+            self._put(
+                item,
+                {
+                    "type": "error",
+                    "message": f"{type(exc).__name__}: {exc}",
+                },
+            )
+            self._resolve_admission(item, exc)
 
     def _publish_token_deltas(self, active: dict[int, _ActiveRequest]):
         logprob_outputs = {
@@ -415,7 +613,14 @@ class AsyncEngineDispatcher:
             request.emitted_text_len = emit_len
             if stop_index is not None:
                 final = request.detokenizer.finish(request.completion_token_ids)
-                self.engine.abort_request(seq_id)
+                try:
+                    self.engine.abort_request(
+                        seq_id, disposition="invalidate"
+                    )
+                except TypeError:
+                    self.engine.abort_request(seq_id)
+                if request.chain_id is not None:
+                    request.chain_status = "invalidated"
                 self._refresh_routing_snapshots()
             if text or (stop_index is None and raw_text_delta):
                 self._publish_pending_token_event(request, text, raw_text_delta)
@@ -429,11 +634,19 @@ class AsyncEngineDispatcher:
                         "raw_text": final.raw_text,
                         "text_delta": visible_text[request.emitted_text_len:],
                         "finish_reason": "stop",
-                        "prompt_tokens": len(request.prompt_token_ids),
+                        "prompt_tokens": (
+                            request.prompt_token_count
+                            if request.prompt_token_count is not None
+                            else len(request.prompt_token_ids)
+                        ),
                         "completion_tokens": len(request.completion_token_ids),
                         "token_ids": request.completion_token_ids,
                         "token_logprobs": request.completion_token_logprobs,
                         "top_logprobs": request.completion_top_logprobs,
+                        "chain_id": request.chain_id,
+                        "chain_status": request.chain_status,
+                        "reused_tokens": request.reused_tokens,
+                        "prefilled_tokens": request.prefilled_tokens,
                     },
                 )
                 active.pop(seq_id, None)
@@ -454,6 +667,10 @@ class AsyncEngineDispatcher:
                 "token_ids": list(request.pending_token_ids),
                 "token_logprobs": list(request.pending_token_logprobs),
                 "top_logprobs": list(request.pending_top_logprobs),
+                "chain_id": request.chain_id,
+                "chain_status": request.chain_status,
+                "reused_tokens": request.reused_tokens,
+                "prefilled_tokens": request.prefilled_tokens,
             },
         )
         request.pending_token_ids.clear()
@@ -464,13 +681,73 @@ class AsyncEngineDispatcher:
         changed = False
         while True:
             try:
-                seq_id = self._aborts.get_nowait()
+                abort = self._aborts.get_nowait()
             except queue.Empty:
                 return changed
+            chain_id = None
+            request_token = None
+            if isinstance(abort, _AbortRequest):
+                seq_id = int(abort.seq_id)
+                disposition = str(abort.disposition)
+                chain_id = abort.chain_id
+                request_token = abort.request_token
+            elif isinstance(abort, tuple) and len(abort) == 3:
+                seq_id, disposition, chain_id = abort
+            elif isinstance(abort, tuple):
+                seq_id, disposition = abort
+            else:
+                seq_id, disposition = abort, "invalidate"
+            latest_request_tokens = getattr(
+                self, "_latest_request_tokens", {}
+            )
+            latest_request_token = latest_request_tokens.get(int(seq_id))
+            if (
+                request_token is not None
+                and latest_request_token is not None
+                and request_token != latest_request_token
+            ):
+                continue
             if seq_id in active:
-                self.engine.abort_request(seq_id)
+                active_request = active[seq_id]
+                if (
+                    request_token is not None
+                    and active_request.request_token is not None
+                    and request_token != active_request.request_token
+                ):
+                    continue
+                try:
+                    self.engine.abort_request(
+                        seq_id, disposition=disposition
+                    )
+                except TypeError:
+                    self.engine.abort_request(seq_id)
                 active.pop(seq_id)
+                if latest_request_token == request_token:
+                    latest_request_tokens.pop(int(seq_id), None)
                 changed = True
+            else:
+                abort_request = getattr(
+                    self.engine, "abort_request", None
+                )
+                if callable(abort_request):
+                    try:
+                        abort_request(
+                            seq_id, disposition=disposition
+                        )
+                    except TypeError:
+                        abort_request(seq_id)
+                    if latest_request_token == request_token:
+                        latest_request_tokens.pop(int(seq_id), None)
+                    changed = True
+                elif disposition == "invalidate" and chain_id:
+                    invalidate_chain = getattr(
+                        self.engine, "invalidate_chain", None
+                    )
+                    if callable(invalidate_chain):
+                        invalidate_chain(chain_id)
+                        if latest_request_token == request_token:
+                            latest_request_tokens.pop(int(seq_id), None)
+                        changed = True
 
     def _fail_active_requests(self, active: dict[int, _ActiveRequest], message: str):
         for seq_id, request in list(active.items()):
@@ -492,7 +769,11 @@ class AsyncEngineDispatcher:
                 break
             if item is not None and item is not _WAKEUP:
                 try:
-                    self._put(item, {"type": "error", "message": message})
+                    error = RuntimeError(message)
+                    self._resolve_admission(item, error)
+                    self._put(
+                        item, {"type": "error", "message": message}
+                    )
                 except Exception:
                     logger.exception("Failed to notify queued OpenAI request during dispatcher shutdown")
         while True:
@@ -536,6 +817,15 @@ class AsyncEngineDispatcher:
             if stop_index is not None:
                 text = text[:stop_index]
                 finish_reason = "stop"
+                if request.chain_id is not None:
+                    try:
+                        self.engine.abort_request(
+                            seq_id, disposition="invalidate"
+                        )
+                    except TypeError:
+                        self.engine.abort_request(seq_id)
+                    request.chain_status = "invalidated"
+                    self._refresh_routing_snapshots()
             text_delta = text[request.emitted_text_len:]
             has_pending_logprobs = any(
                 value is not None for value in request.pending_token_logprobs
@@ -554,10 +844,18 @@ class AsyncEngineDispatcher:
                     "raw_text": final.raw_text,
                     "text_delta": text[request.emitted_text_len:],
                     "finish_reason": finish_reason,
-                    "prompt_tokens": len(request.prompt_token_ids),
+                    "prompt_tokens": (
+                        request.prompt_token_count
+                        if request.prompt_token_count is not None
+                        else len(request.prompt_token_ids)
+                    ),
                     "completion_tokens": len(completion_token_ids),
                     "token_ids": completion_token_ids,
                     "token_logprobs": token_logprobs,
                     "top_logprobs": top_logprobs,
+                    "chain_id": request.chain_id,
+                    "chain_status": request.chain_status,
+                    "reused_tokens": request.reused_tokens,
+                    "prefilled_tokens": request.prefilled_tokens,
                 },
             )

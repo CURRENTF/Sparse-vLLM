@@ -42,6 +42,26 @@ CASE_PRESETS: dict[str, dict[str, Any]] = {
         "enable_prefix_caching": True,
         "label": "QuEST, prefix cache on",
     },
+    "chain_snapkv": {
+        "method": "snapkv",
+        "enable_prefix_caching": True,
+        "label": "SnapKV, linear chain prefix cache",
+    },
+    "chain_pyramidkv": {
+        "method": "pyramidkv",
+        "enable_prefix_caching": True,
+        "label": "PyramidKV, linear chain prefix cache",
+    },
+    "chain_rkv": {
+        "method": "rkv",
+        "enable_prefix_caching": True,
+        "label": "R-KV, linear chain prefix cache",
+    },
+    "chain_skipkv": {
+        "method": "skipkv",
+        "enable_prefix_caching": True,
+        "label": "SkipKV, linear chain prefix cache",
+    },
 }
 
 CASE_ALIASES = {
@@ -52,6 +72,10 @@ CASE_ALIASES = {
     "prefix_vanilla": "prefix_full",
     "omnikv": "prefix_omnikv",
     "quest": "prefix_quest",
+    "snapkv": "chain_snapkv",
+    "pyramidkv": "chain_pyramidkv",
+    "rkv": "chain_rkv",
+    "skipkv": "chain_skipkv",
 }
 
 
@@ -80,6 +104,12 @@ class RequestState:
     prefix_cache_hit_blocks: int = 0
     status: str = "success"
     error_message: str = ""
+    chain_expected: bool = False
+    chain_id: str | None = None
+    chain_status: str = "disabled"
+    reused_tokens: int = 0
+    prefilled_tokens: int = 0
+    physical_residency: list[int] = field(default_factory=list)
 
 
 def _cache_hit_metric_error(
@@ -119,6 +149,39 @@ def _cache_hit_metric_error(
     return ""
 
 
+def _chain_cache_metric_error(
+    spec: RequestSpec,
+    state: RequestState,
+) -> str:
+    if not state.chain_id:
+        return "chain request completed without a chain_id."
+    expected_reuse = int(spec.expected_reuse_tokens)
+    if expected_reuse == 0 and state.chain_status != "created":
+        return (
+            "first chain turn must report chain_status='created', got "
+            f"{state.chain_status!r}."
+        )
+    if expected_reuse > 0 and state.chain_status != "resumed":
+        return (
+            "continuing chain turn must report chain_status='resumed', got "
+            f"{state.chain_status!r}."
+        )
+    if int(state.reused_tokens) != expected_reuse:
+        return (
+            f"reused_logical_tokens={int(state.reused_tokens)} does not match "
+            f"expected_reuse_tokens={expected_reuse}."
+        )
+    expected_prefill = len(spec.prompt_token_ids) - expected_reuse
+    if int(state.prefilled_tokens) != expected_prefill:
+        return (
+            f"prefilled_delta_tokens={int(state.prefilled_tokens)} does not "
+            f"match expected suffix={expected_prefill}."
+        )
+    if not state.physical_residency:
+        return "chain request finished without per-layer physical residency."
+    return ""
+
+
 def _write_request_records(
     *,
     states: dict[int, RequestState],
@@ -141,11 +204,15 @@ def _write_request_records(
             planned_eligible_tokens = int(spec.eligible_cache_tokens)
             status = state.status
             error_message = state.error_message
-            metric_error = _cache_hit_metric_error(
-                spec,
-                cached_tokens=cached_tokens,
-                cached_blocks=cached_blocks,
-                block_size=block_size,
+            metric_error = (
+                _chain_cache_metric_error(spec, state)
+                if state.chain_expected
+                else _cache_hit_metric_error(
+                    spec,
+                    cached_tokens=cached_tokens,
+                    cached_blocks=cached_blocks,
+                    block_size=block_size,
+                )
             )
             if metric_error:
                 status = "metric_failed"
@@ -170,6 +237,11 @@ def _write_request_records(
                 "latency_s": float(finish_s - state.add_s),
                 "batch_elapsed_s": float(finish_s - batch_start_s),
                 "error_message": error_message,
+                "chain_id": state.chain_id,
+                "chain_status": state.chain_status,
+                "reused_logical_tokens": state.reused_tokens,
+                "prefilled_delta_tokens": state.prefilled_tokens,
+                "physical_residency_by_layer": state.physical_residency,
             }
             raw = {
                 **record,
@@ -397,6 +469,9 @@ def _case_engine_kwargs(args: argparse.Namespace, case_name: str, max_prompt_len
         "prefix_cache_max_blocks": args.prefix_cache_max_blocks,
         "prefix_cache_salt": args.prefix_cache_salt,
         "enable_prefix_caching": bool(preset["enable_prefix_caching"]),
+        "prefix_cache_mode": (
+            "chain" if case_name.startswith("chain_") else "auto"
+        ),
         "sparse_method": preset["method"],
         "max_model_len": int(max_prompt_len + args.output_len + args.max_model_len_margin),
     }
@@ -532,6 +607,20 @@ def _trace_sparse_path_summary(
 
 
 def _validate_sparse_path_requirements(args: argparse.Namespace, cases: list[str], workloads: set[str]) -> None:
+    chain_cases = [case for case in cases if case.startswith("chain_")]
+    chain_errors: list[str] = []
+    if chain_cases and args.history_update != "generated":
+        chain_errors.append(
+            "linear chain cases require --history_update generated so the next "
+            "turn contains the exact prior model tokens."
+        )
+    if chain_cases and "shared_prefix" in workloads:
+        chain_errors.append(
+            "linear chain cases do not support the branching shared_prefix "
+            "workload; use --workloads multiturn."
+        )
+    if chain_errors:
+        raise ValueError("Invalid linear chain benchmark:\n- " + "\n- ".join(chain_errors))
     if args.allow_short_trace:
         return
 
@@ -629,7 +718,7 @@ def _find_live_seq(llm: Any, seq_id: int) -> Any | None:
 
 
 def _cache_stats(llm: Any) -> dict[str, int]:
-    stats = llm.model_runner.cache_manager.free_slot_stats()
+    stats = llm.model_runner.runtime_state.free_slot_stats()
     return {str(key): int(value) for key, value in stats.items() if isinstance(value, (int, float))}
 
 
@@ -642,6 +731,7 @@ def _run_request_batch(
     raw_output_path: Path,
     block_size: int,
     max_steps: int,
+    session_chain_ids: dict[int, str] | None = None,
 ) -> list[dict[str, Any]]:
     from sparsevllm import SamplingParams
     import torch
@@ -660,8 +750,43 @@ def _run_request_batch(
                 ignore_eos=True,
                 max_tokens=int(spec.output_len),
             )
-            seq_id = llm.add_request(spec.prompt_token_ids, sampling_params)
-            states[int(seq_id)] = RequestState(spec=spec, seq_id=int(seq_id), add_s=time.perf_counter())
+            requested_chain_id = (
+                None
+                if session_chain_ids is None
+                else session_chain_ids.get(int(spec.session_id))
+            )
+            if hasattr(llm, "admit_request"):
+                admission = llm.admit_request(
+                    spec.prompt_token_ids,
+                    sampling_params,
+                    chain_id=requested_chain_id,
+                )
+                seq_id = int(admission.seq_id)
+                if session_chain_ids is not None and admission.chain_id:
+                    session_chain_ids[int(spec.session_id)] = str(
+                        admission.chain_id
+                    )
+                state = RequestState(
+                    spec=spec,
+                    seq_id=seq_id,
+                    add_s=time.perf_counter(),
+                    chain_expected=session_chain_ids is not None,
+                    chain_id=admission.chain_id,
+                    chain_status=str(admission.chain_status),
+                    reused_tokens=int(admission.reused_tokens),
+                    prefilled_tokens=int(admission.prefilled_tokens),
+                    prefix_cache_hit_len=int(admission.reused_tokens),
+                )
+            else:
+                seq_id = llm.add_request(
+                    spec.prompt_token_ids, sampling_params
+                )
+                state = RequestState(
+                    spec=spec,
+                    seq_id=int(seq_id),
+                    add_s=time.perf_counter(),
+                )
+            states[int(seq_id)] = state
             active.add(int(seq_id))
 
         while active:
@@ -697,6 +822,20 @@ def _run_request_batch(
                 state = states[seq_id]
                 if len(state.generated_token_ids) >= int(state.spec.output_len):
                     state.finish_s = now_s
+                    if state.chain_id:
+                        coordinator = getattr(
+                            llm.model_runner.runtime_state,
+                            "chain_cache_coordinator",
+                            None,
+                        )
+                        if coordinator is None:
+                            raise RuntimeError(
+                                "Chain admission succeeded without a chain coordinator."
+                            )
+                        record = coordinator.index.lookup(state.chain_id)
+                        state.physical_residency = list(
+                            record.physical_slots_by_layer
+                        )
                     active.discard(seq_id)
     except Exception as exc:
         failure = exc
@@ -752,6 +891,14 @@ def _run_multiturn_workload(
         histories[session_id] = shared_system + _sample_tokens(vocab_ids, rng, session_prefix_len)
 
     records: list[dict[str, Any]] = []
+    session_chain_ids: dict[int, str] | None = (
+        {}
+        if str(
+            getattr(llm.config, "resolved_prefix_cache_mode", "disabled")
+        )
+        == "chain"
+        else None
+    )
     for turn in range(int(args.turns)):
         specs: list[RequestSpec] = []
         prompt_by_session: dict[int, list[int]] = {}
@@ -766,6 +913,18 @@ def _run_multiturn_workload(
             user_tokens = _sample_tokens(vocab_ids, rng, user_len)
             prompt = histories[session_id] + user_tokens
             prompt_by_session[session_id] = prompt
+            if session_chain_ids is None:
+                eligible_cache_tokens = _eligible_cache_tokens(
+                    reusable_prefix_len, len(prompt), block_size
+                )
+                expected_reuse_tokens = reusable_prefix_len
+            else:
+                # The final sampled token has not run a forward pass and is
+                # deliberately part of the next turn's prefill suffix.
+                expected_reuse_tokens = (
+                    max(0, reusable_prefix_len - 1) if turn > 0 else 0
+                )
+                eligible_cache_tokens = expected_reuse_tokens
             specs.append(
                 RequestSpec(
                     request_key=f"mt_s{session_id:04d}_t{turn:03d}",
@@ -775,8 +934,8 @@ def _run_multiturn_workload(
                     turn=turn,
                     prompt_token_ids=prompt,
                     output_len=int(args.output_len),
-                    eligible_cache_tokens=_eligible_cache_tokens(reusable_prefix_len, len(prompt), block_size),
-                    expected_reuse_tokens=reusable_prefix_len,
+                    eligible_cache_tokens=eligible_cache_tokens,
+                    expected_reuse_tokens=expected_reuse_tokens,
                 )
             )
         round_records = _run_request_batch(
@@ -787,6 +946,7 @@ def _run_multiturn_workload(
             raw_output_path=raw_output_path,
             block_size=block_size,
             max_steps=int(args.max_steps_per_round),
+            session_chain_ids=session_chain_ids,
         )
         records.extend(round_records)
         by_key = {record["request_key"]: record for record in round_records}
@@ -897,6 +1057,16 @@ def _summarize_records(
 ) -> dict[str, Any]:
     success = [record for record in records if record.get("status") == "success"]
     failures = [record for record in records if record.get("status") != "success"]
+    failure_status_counts: dict[str, int] = {}
+    for record in failures:
+        status = str(record.get("status") or "metric_failed")
+        failure_status_counts[status] = failure_status_counts.get(status, 0) + 1
+    if not failure_status_counts:
+        summary_status = "success"
+    elif len(failure_status_counts) == 1:
+        summary_status = next(iter(failure_status_counts))
+    else:
+        summary_status = "mixed_failed"
     bench_success = [record for record in success if record.get("phase") != "warmup"]
     ttfts = [float(record["ttft_s"]) for record in bench_success]
     latencies = [float(record["latency_s"]) for record in bench_success]
@@ -948,7 +1118,8 @@ def _summarize_records(
         "case_label": case_config["label"],
         "method": case_config["method"],
         "enable_prefix_caching": bool(case_config["enable_prefix_caching"]),
-        "status": "success" if not failures else "model_failed",
+        "status": summary_status,
+        "failure_status_counts": failure_status_counts,
         "requests": len(records),
         "bench_requests": len(bench_success),
         "success_requests": len(success),
@@ -966,7 +1137,7 @@ def _summarize_records(
         "unique_prompt_lengths": len(set(prompt_tokens)),
         "cache_hit_rate": total_cached_tokens / total_prompt_tokens if total_prompt_tokens else 0.0,
         "eligible_cache_hit_rate": total_cached_tokens / total_eligible_tokens if total_eligible_tokens else 0.0,
-        "physical_kv_reuse_rate": total_cached_tokens / total_prompt_tokens if total_prompt_tokens else 0.0,
+        "logical_token_reuse_rate": total_cached_tokens / total_prompt_tokens if total_prompt_tokens else 0.0,
         "recomputed_prompt_tokens": total_prompt_tokens - total_cached_tokens,
         "hit_requests": sum(1 for value in cached_tokens if value > 0),
         "long_prefill_requests": sum(1 for record in bench_success if int(record["prompt_tokens"]) > prefill_threshold),
@@ -1149,7 +1320,7 @@ def _append_ledger(output_dir: Path, summaries: list[dict[str, Any]], args: argp
     git = git_metadata(REPO_ROOT_FOR_IMPORT)
     for idx, summary in enumerate(summaries, start=1):
         status = summary.get("status", "model_failed")
-        if status not in {"success", "invalid_run", "invalid_input", "model_failed", "parse_failed", "metric_failed", "skipped_by_policy", "oom", "timeout"}:
+        if status not in {"success", "invalid_run", "invalid_input", "model_failed", "parse_failed", "metric_failed", "mixed_failed", "skipped_by_policy", "oom", "timeout"}:
             status = "metric_failed"
         case_name = str(summary.get("case", f"case_{idx}"))
         record = {
@@ -1354,9 +1525,24 @@ def main() -> None:
             break
         summaries.append(_read_case_summary(case_dir, case_name))
 
+    case_failure_status_counts: dict[str, int] = {}
+    for summary in summaries:
+        status = str(summary.get("status") or "metric_failed")
+        if status == "success":
+            continue
+        case_failure_status_counts[status] = (
+            case_failure_status_counts.get(status, 0) + 1
+        )
+    if not case_failure_status_counts:
+        aggregate_status = "success"
+    elif len(case_failure_status_counts) == 1:
+        aggregate_status = next(iter(case_failure_status_counts))
+    else:
+        aggregate_status = "mixed_failed"
     aggregate = {
         "benchmark": "prefix_cache_trace",
-        "status": "success" if all(summary.get("status") == "success" for summary in summaries) else "model_failed",
+        "status": aggregate_status,
+        "failure_status_counts": case_failure_status_counts,
         "output_dir": str(output_dir),
         "cases": summaries,
     }

@@ -7,6 +7,7 @@ class CompletionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     model: str
+    chain_id: str | None = None
     prompt: str | list[int] | list[str] | list[list[int]]
     max_tokens: int = Field(default=256, ge=1)
     temperature: float = Field(default=1.0, ge=0.0)

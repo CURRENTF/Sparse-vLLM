@@ -22,6 +22,8 @@ from sparsevllm.entrypoints.openai.serving.base import DisconnectChecker
 from sparsevllm.entrypoints.openai.serving.base import _queue_get_or_disconnect
 from sparsevllm.entrypoints.openai.serving.base import _wait_final
 from sparsevllm.entrypoints.openai.serving.base import _write_request_log
+from sparsevllm.entrypoints.openai.serving.base import _chain_http_exception
+from sparsevllm.engine.chain_cache import ChainCacheError
 from sparsevllm.entrypoints.openai.serving.response_parsing import ParsedModelResponse
 from sparsevllm.entrypoints.openai.serving.response_parsing import ResponseParseError
 from sparsevllm.entrypoints.openai.serving.response_parsing import TransformersResponseParser
@@ -64,7 +66,31 @@ async def serve_response(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    handle = await dispatcher.submit(prompt, _sampling_params_from_response_request(request), 0, [])
+    try:
+        sampling_params = _sampling_params_from_response_request(request)
+        submit = (
+            getattr(dispatcher, "submit_admitted", dispatcher.submit)
+            if bool(getattr(dispatcher, "admission_ack_enabled", False))
+            else dispatcher.submit
+        )
+        handle = (
+            await submit(prompt, sampling_params, 0, [])
+            if request.chain_id is None
+            else await submit(
+                prompt,
+                sampling_params,
+                0,
+                [],
+                chain_id=request.chain_id,
+            )
+        )
+    except ChainCacheError as exc:
+        raise _chain_http_exception(exc) from exc
+    headers = (
+        {"X-SparseVLLM-Chain-ID": getattr(handle, "chain_id", None)}
+        if getattr(handle, "chain_id", None) is not None
+        else None
+    )
     if request.stream:
         _write_request_log(
             request_log_path,
@@ -91,6 +117,7 @@ async def serve_response(
                 is_disconnected=is_disconnected,
             ),
             media_type="text/event-stream",
+            headers=headers,
         )
 
     try:
@@ -145,7 +172,7 @@ async def serve_response(
             "response": response,
         },
     )
-    return JSONResponse(response)
+    return JSONResponse(response, headers=headers)
 
 
 def _validate_response_request(
@@ -220,6 +247,8 @@ async def _response_response(
         output,
         usage=_usage_from_final(final),
         incomplete_reason="max_output_tokens" if incomplete else None,
+        chain_id=final.get("chain_id"),
+        chain_status=final.get("chain_status"),
     )
 
 
@@ -238,7 +267,13 @@ async def _response_stream(
     response_parser: TransformersResponseParser | None = None,
     is_disconnected: DisconnectChecker | None = None,
 ):
-    state = _ResponseStreamState(request_id, created_at, model)
+    state = _ResponseStreamState(
+        request_id,
+        created_at,
+        model,
+        chain_id=getattr(handle, "chain_id", None),
+        chain_status=getattr(handle, "chain_status", None),
+    )
     should_parse = reasoning_parser_name is not None or bool(request.tools)
     if should_parse and response_parser is None:
         raise HTTPException(status_code=500, detail="Responses parser is not configured.")
@@ -284,6 +319,9 @@ async def _response_stream(
                 continue
 
             if item["type"] == "final":
+                state.chain_status = item.get(
+                    "chain_status", state.chain_status
+                )
                 if parser is not None:
                     parser_text = item.get("raw_text", item["text"])
                     parsed_deltas = parser.feed(parser_text[raw_text_len:])
@@ -423,12 +461,18 @@ def _log_response_stream_failure(
     )
 
 
-def _usage_from_final(final: dict[str, Any]) -> dict[str, int]:
-    return {
+def _usage_from_final(final: dict[str, Any]) -> dict[str, Any]:
+    usage = {
         "input_tokens": final["prompt_tokens"],
         "output_tokens": final["completion_tokens"],
         "total_tokens": final["prompt_tokens"] + final["completion_tokens"],
     }
+    if final.get("chain_id"):
+        usage["input_tokens_details"] = {
+            "cached_tokens": int(final.get("reused_tokens", 0))
+        }
+        usage["reused_tokens"] = int(final.get("reused_tokens", 0))
+    return usage
 
 
 def _response_output_items(parsed: ParsedModelResponse) -> list[dict[str, Any]]:
@@ -478,10 +522,19 @@ def _message_output_item(text: str) -> dict[str, Any]:
 
 
 class _ResponseStreamState:
-    def __init__(self, request_id: str, created_at: int, model: str):
+    def __init__(
+        self,
+        request_id: str,
+        created_at: int,
+        model: str,
+        chain_id: str | None = None,
+        chain_status: str | None = None,
+    ):
         self.request_id = request_id
         self.created_at = created_at
         self.model = model
+        self.chain_id = chain_id
+        self.chain_status = chain_status
         self.output: list[dict[str, Any]] = []
         self._message_item: dict[str, Any] | None = None
         self._message_index: int | None = None
@@ -511,6 +564,8 @@ class _ResponseStreamState:
             usage=usage,
             incomplete_reason=incomplete_reason,
             error=error,
+            chain_id=self.chain_id,
+            chain_status=self.chain_status,
         )
 
     def message_delta(self, text: str) -> list[str]:

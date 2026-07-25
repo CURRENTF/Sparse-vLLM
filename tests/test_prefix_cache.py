@@ -1049,13 +1049,22 @@ def test_resolve_prefix_cache_block_size_uses_quest_page_size():
 
 
 def test_prefix_cache_supported_method_allowlist():
-    assert PREFIX_CACHE_SUPPORTED_METHODS == {"", "omnikv", "quest"}
+    assert PREFIX_CACHE_SUPPORTED_METHODS == {
+        "",
+        "omnikv",
+        "quest",
+        "snapkv",
+        "pyramidkv",
+        "rkv",
+        "skipkv",
+    }
 
 
 def test_config_resolves_prefix_cache_defaults():
     cfg = _make_config(enable_prefix_caching=True)
     assert cfg.vllm_sparse_method == ""
     assert cfg.prefix_cache_block_size == 16
+    assert cfg.resolved_prefix_cache_mode == "radix"
 
     cfg = _make_config(
         vllm_sparse_method="quest",
@@ -1064,15 +1073,26 @@ def test_config_resolves_prefix_cache_defaults():
         prefix_cache_block_size=None,
     )
     assert cfg.prefix_cache_block_size == 8
+    assert cfg.resolved_prefix_cache_mode == "radix"
+
+    cfg = _make_config(
+        vllm_sparse_method="snapkv",
+        enable_prefix_caching=True,
+    )
+    assert cfg.resolved_prefix_cache_mode == "chain"
 
     cfg = _make_config(enable_prefix_caching="false", prefix_cache_block_size="32")
     assert cfg.enable_prefix_caching is False
     assert cfg.prefix_cache_block_size == 32
+    assert cfg.resolved_prefix_cache_mode == "disabled"
 
 
 def test_config_rejects_unsupported_prefix_cache_methods():
-    with pytest.raises(ValueError, match="only supports vanilla"):
-        _make_config(vllm_sparse_method="snapkv", enable_prefix_caching=True)
+    with pytest.raises(ValueError, match="not supported"):
+        _make_config(
+            vllm_sparse_method="streamingllm",
+            enable_prefix_caching=True,
+        )
 
 
 def test_config_rejects_unvalidated_prefix_cache_options():

@@ -9,6 +9,11 @@ import torch
 
 from sparsevllm.config import Config
 from sparsevllm.engine.prefix_cache_coordinator import PrefixCacheCoordinator
+from sparsevllm.engine.chain_cache import (
+    ChainAdmissionPlan,
+    ChainCacheCoordinator,
+    ChainOwnerMismatchError,
+)
 from sparsevllm.engine.recurrent_state_manager import RecurrentStateManager
 from sparsevllm.engine.sequence import Sequence
 
@@ -54,11 +59,13 @@ class RuntimeState:
         cache_manager,
         recurrent_state_manager: RecurrentStateManager | None = None,
         prefix_cache_coordinator: PrefixCacheCoordinator | None = None,
+        chain_cache_coordinator: ChainCacheCoordinator | None = None,
     ):
         self.config = config
         self.cache_manager = cache_manager
         self.recurrent_state_manager = recurrent_state_manager
         self.prefix_cache_coordinator = prefix_cache_coordinator
+        self.chain_cache_coordinator = chain_cache_coordinator
         self._resident_seq_ids: set[int] = set()
 
     @property
@@ -142,6 +149,9 @@ class RuntimeState:
                 self.prefix_cache_coordinator.finish_step()
 
     def free_seq(self, seq_id: int) -> None:
+        self._free_seq_payload(seq_id)
+
+    def _free_seq_payload(self, seq_id: int) -> None:
         self.cache_manager.free_seq(seq_id)
         if self.prefix_cache_coordinator is not None:
             self.prefix_cache_coordinator.release_seq(seq_id)
@@ -149,10 +159,130 @@ class RuntimeState:
             self.recurrent_state_manager.free_seq(seq_id)
         self._resident_seq_ids.discard(int(seq_id))
 
+    def chain_admission_plan(
+        self,
+        chain_id: str,
+        seq_id: int,
+        token_ids: list[int],
+        generation_tokens: int = 0,
+    ) -> ChainAdmissionPlan:
+        if self.chain_cache_coordinator is None:
+            raise RuntimeError("Chain prefix cache is not enabled for this runtime.")
+        return self.chain_cache_coordinator.plan_admission(
+            chain_id=str(chain_id),
+            seq_id=int(seq_id),
+            token_ids=[int(token_id) for token_id in token_ids],
+            generation_tokens=int(generation_tokens),
+        )
+
+    def chain_validate_admission_plan(
+        self,
+        expected: ChainAdmissionPlan,
+        input_token_count: int,
+        input_prefix_digest: bytes,
+        generation_tokens: int = 0,
+    ) -> ChainAdmissionPlan:
+        if self.chain_cache_coordinator is None:
+            raise RuntimeError("Chain prefix cache is not enabled for this runtime.")
+        return self.chain_cache_coordinator.validate_admission_plan(
+            expected,
+            input_token_count=int(input_token_count),
+            input_prefix_digest=bytes(input_prefix_digest),
+            generation_tokens=int(generation_tokens),
+        )
+
+    def chain_apply_admission(self, plan: ChainAdmissionPlan) -> dict[str, object]:
+        if self.chain_cache_coordinator is None:
+            raise RuntimeError("Chain prefix cache is not enabled for this runtime.")
+        local_victims: list[tuple[str, int]] = []
+        for chain_id in plan.victim_chain_ids:
+            record = self.chain_cache_coordinator.index.lookup(chain_id)
+            local_victims.append((str(chain_id), int(record.seq_id)))
+        record = self.chain_cache_coordinator.apply_admission(plan)
+        for _chain_id, victim_seq_id in local_victims:
+            self._free_seq_payload(victim_seq_id)
+        return {
+            "chain_id": record.chain_id,
+            "seq_id": int(record.seq_id),
+            "state": record.state.value,
+            "victim_chain_ids": list(plan.victim_chain_ids),
+        }
+
+    def chain_finish(
+        self,
+        chain_id: str,
+        seq_id: int,
+        processed_token_digest: bytes,
+        processed_token_count: int,
+    ) -> dict[str, object]:
+        if self.chain_cache_coordinator is None:
+            raise RuntimeError("Chain prefix cache is not enabled for this runtime.")
+        self.cache_manager.on_chain_turn_finished(
+            int(seq_id),
+            int(processed_token_count),
+        )
+        record = self.chain_cache_coordinator.finish_values(
+            chain_id=str(chain_id),
+            seq_id=int(seq_id),
+            processed_token_digest=bytes(processed_token_digest),
+            processed_token_count=int(processed_token_count),
+        )
+        return {
+            "chain_id": record.chain_id,
+            "seq_id": int(record.seq_id),
+            "state": record.state.value,
+            "processed_token_count": int(record.processed_token_count),
+            "physical_slots_by_layer": list(record.physical_slots_by_layer),
+        }
+
+    def chain_invalidate(
+        self,
+        chain_id: str,
+        *,
+        expected_seq_id: int | None = None,
+    ) -> dict[str, object]:
+        if self.chain_cache_coordinator is None:
+            raise RuntimeError("Chain prefix cache is not enabled for this runtime.")
+        record = self.chain_cache_coordinator.index.lookup(str(chain_id))
+        if expected_seq_id is not None and int(record.seq_id) != int(expected_seq_id):
+            raise ChainOwnerMismatchError(
+                f"Chain owner mismatch for {chain_id!r}: "
+                f"resident_seq_id={record.seq_id}, expected_seq_id={expected_seq_id}.",
+                chain_id=str(chain_id),
+            )
+        record = self.chain_cache_coordinator.invalidate(str(chain_id))
+        has_residency = getattr(
+            self.cache_manager, "chain_has_residency", None
+        )
+        if callable(has_residency) and has_residency(int(record.seq_id)):
+            self._free_seq_payload(int(record.seq_id))
+        else:
+            self._resident_seq_ids.discard(int(record.seq_id))
+        return {
+            "chain_id": record.chain_id,
+            "seq_id": int(record.seq_id),
+            "state": "tombstoned",
+        }
+
+    def chain_routing_match(self, chain_id: str) -> dict[str, object]:
+        if self.chain_cache_coordinator is None:
+            return {
+                "present": False,
+                "state": None,
+                "tombstone": False,
+                "enabled": False,
+            }
+        return {
+            **self.chain_cache_coordinator.routing_match(str(chain_id)),
+            "enabled": True,
+        }
+
     @torch.inference_mode()
     def reset_after_warmup(self) -> None:
         if self.prefix_cache_coordinator is not None:
             self.prefix_cache_coordinator.reset_after_warmup()
+        if self.chain_cache_coordinator is not None:
+            self.chain_cache_coordinator.reset()
         reset_cache = getattr(self.cache_manager, "reset_after_warmup", None)
         if callable(reset_cache):
             reset_cache()
@@ -334,6 +464,8 @@ class RuntimeState:
         )
         if self.prefix_cache_coordinator is not None:
             stats.update(self.prefix_cache_coordinator.stats())
+        if self.chain_cache_coordinator is not None:
+            stats.update(self.chain_cache_coordinator.stats())
         return stats
 
     def debug_live_seq_slots(self) -> dict[int, int]:

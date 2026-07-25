@@ -15,6 +15,29 @@ class FakeTokenizer:
         return " ".join(str(token_id) for token_id in token_ids)
 
 
+def _summary_args():
+    return types.SimpleNamespace(
+        system_prompt_len=1,
+        session_prefix_min_len=1,
+        session_prefix_len=1,
+        user_min_len=1,
+        user_len=1,
+        output_len=2,
+        turns=2,
+        shared_prefix_len=1,
+        shared_suffix_min_len=1,
+        shared_suffix_len=1,
+        history_update="generated",
+        chunk_prefill_accel_omnikv=False,
+        num_sink_tokens=0,
+        num_top_tokens=4,
+        num_recent_tokens=0,
+        chunk_prefill_size=4,
+        min_performance_prompt_len=0,
+        min_cacheable_prefix_len=0,
+    )
+
+
 def test_prefix_cache_bench_flags_impossible_cache_hit(tmp_path):
     spec = bench.RequestSpec(
         request_key="req",
@@ -50,6 +73,138 @@ def test_prefix_cache_bench_flags_impossible_cache_hit(tmp_path):
     assert records[0]["status"] == "metric_failed"
     assert records[0]["eligible_cache_tokens"] == 4
     assert "exceeds planned_eligible_cache_tokens" in records[0]["error_message"]
+
+
+def test_prefix_cache_bench_flags_incorrect_chain_reuse(tmp_path):
+    spec = bench.RequestSpec(
+        request_key="chain",
+        workload="multiturn",
+        phase="turn",
+        session_id=0,
+        turn=1,
+        prompt_token_ids=[1, 2, 3, 4, 5],
+        output_len=2,
+        eligible_cache_tokens=3,
+        expected_reuse_tokens=3,
+    )
+    state = bench.RequestState(
+        spec=spec,
+        seq_id=7,
+        add_s=1.0,
+        first_token_s=1.5,
+        finish_s=2.0,
+        generated_token_ids=[9, 10],
+        chain_expected=True,
+        chain_id="chain-1",
+        chain_status="resumed",
+        reused_tokens=2,
+        prefilled_tokens=3,
+        physical_residency=[4, 4],
+    )
+
+    records = bench._write_request_records(
+        states={7: state},
+        tokenizer=FakeTokenizer(),
+        per_turn_path=tmp_path / "per_turn_results.jsonl",
+        raw_output_path=tmp_path / "raw_outputs.jsonl",
+        batch_start_s=1.0,
+        block_size=4,
+    )
+
+    assert records[0]["status"] == "metric_failed"
+    assert "does not match expected_reuse_tokens=3" in records[0]["error_message"]
+
+
+def test_prefix_cache_bench_does_not_silently_skip_missing_chain_metrics(
+    tmp_path,
+):
+    spec = bench.RequestSpec(
+        request_key="chain",
+        workload="multiturn",
+        phase="turn",
+        session_id=0,
+        turn=0,
+        prompt_token_ids=[1, 2],
+        output_len=1,
+        eligible_cache_tokens=0,
+        expected_reuse_tokens=0,
+    )
+    state = bench.RequestState(
+        spec=spec,
+        seq_id=7,
+        add_s=1.0,
+        first_token_s=1.5,
+        finish_s=2.0,
+        generated_token_ids=[9],
+        chain_expected=True,
+        chain_status="disabled",
+    )
+
+    records = bench._write_request_records(
+        states={7: state},
+        tokenizer=FakeTokenizer(),
+        per_turn_path=tmp_path / "per_turn_results.jsonl",
+        raw_output_path=tmp_path / "raw_outputs.jsonl",
+        batch_start_s=1.0,
+        block_size=4,
+    )
+
+    assert records[0]["status"] == "metric_failed"
+    assert "without a chain_id" in records[0]["error_message"]
+
+
+def test_prefix_cache_bench_summary_preserves_metric_failure_status():
+    summary = bench._summarize_records(
+        case_name="chain_snapkv",
+        case_config=bench.CASE_PRESETS["chain_snapkv"],
+        records=[
+            {
+                "status": "metric_failed",
+                "phase": "turn",
+                "error_message": "wrong chain boundary",
+            }
+        ],
+        args=_summary_args(),
+        engine_kwargs={},
+        cache_stats_before={},
+        cache_stats_after={},
+        peak_memory_gb=0.0,
+        elapsed_s=1.0,
+    )
+
+    assert summary["status"] == "metric_failed"
+    assert summary["failure_status_counts"] == {"metric_failed": 1}
+
+
+def test_prefix_cache_bench_labels_chain_reuse_as_logical_tokens():
+    summary = bench._summarize_records(
+        case_name="chain_snapkv",
+        case_config=bench.CASE_PRESETS["chain_snapkv"],
+        records=[
+            {
+                "status": "success",
+                "phase": "turn",
+                "workload": "multiturn",
+                "turn": 1,
+                "ttft_s": 0.1,
+                "latency_s": 0.2,
+                "prompt_tokens": 100,
+                "generated_tokens": 2,
+                "cached_tokens": 80,
+                "eligible_cache_tokens": 80,
+                "physical_residency_by_layer": [12, 14],
+            }
+        ],
+        args=_summary_args(),
+        engine_kwargs={},
+        cache_stats_before={},
+        cache_stats_after={},
+        peak_memory_gb=0.0,
+        elapsed_s=1.0,
+    )
+
+    assert summary["logical_token_reuse_rate"] == 0.8
+    assert "physical_kv_reuse_rate" not in summary
 
 
 def test_prefix_cache_bench_token_plan_uses_max_bounds():

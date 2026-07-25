@@ -171,6 +171,45 @@ class RKVSkipKVMethodTest(unittest.TestCase):
         self.assertEqual(len(state.sentences), 1)
         self.assertEqual(state.non_execution_count, 1)
 
+    def test_skipkv_chain_turn_boundary_finalizes_open_sentence(self):
+        manager = object.__new__(SkipKVCacheManager)
+        manager.config = SimpleNamespace(
+            skipkv_enable_sentence_scoring=True,
+            skipkv_similarity_threshold=0.95,
+            skipkv_sentence_min_tokens=1,
+            skipkv_sentence_max_tokens=16,
+            skipkv_max_tracked_sentences=16,
+        )
+        manager._skipkv_delimiter_token_ids = {99}
+        manager._skipkv_non_execution_token_ids = set()
+        manager._skipkv_seq_states = {}
+
+        seq = Sequence([1])
+        seq.num_prompt_tokens = 0
+        seq.num_tokens = 1
+        seq.last_token = 11
+        manager.record_skipkv_decode_hidden_states(
+            [seq],
+            torch.tensor([[1.0, 0.0]]),
+        )
+
+        manager.on_chain_turn_finished(seq.seq_id, processed_token_count=1)
+
+        seq.num_prompt_tokens = 2
+        seq.num_tokens = 3
+        seq.last_token = 99
+        manager.record_skipkv_decode_hidden_states(
+            [seq],
+            torch.tensor([[0.0, 1.0]]),
+        )
+
+        state = manager._skipkv_seq_states[seq.seq_id]
+        self.assertIsNone(state.open_start_gen)
+        self.assertEqual(
+            [(sentence.start_gen, sentence.end_gen) for sentence in state.sentences],
+            [(0, 1), (2, 3)],
+        )
+
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for activation controller buffers")
     def test_skipkv_activation_steering_uses_signed_non_execution_count(self):
         class FakeCacheManager:
