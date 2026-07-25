@@ -65,6 +65,8 @@ class BenchmarkConfig:
     job_concurrency: int = 1
     rounds: int = 10
     articles_per_round: int = 20
+    min_subagents_per_round: int | None = None
+    max_subagents_per_round: int | None = None
     article_token_buckets: tuple[tuple[int, int, int], ...] = (
         DEFAULT_ARTICLE_TOKEN_BUCKETS
     )
@@ -251,6 +253,42 @@ def _max_bucket_tokens(
     return max(maximum for _, _, maximum in buckets)
 
 
+def _subagent_count_bounds(config: BenchmarkConfig) -> tuple[int, int]:
+    if (
+        config.min_subagents_per_round is None
+        and config.max_subagents_per_round is None
+    ):
+        return config.articles_per_round, config.articles_per_round
+    if (
+        config.min_subagents_per_round is None
+        or config.max_subagents_per_round is None
+    ):
+        raise ValueError(
+            "min_subagents_per_round and max_subagents_per_round must "
+            "be set together."
+        )
+    return (
+        config.min_subagents_per_round,
+        config.max_subagents_per_round,
+    )
+
+
+def _subagent_counts_for_job(
+    config: BenchmarkConfig,
+    job_index: int,
+) -> tuple[int, ...]:
+    minimum, maximum = _subagent_count_bounds(config)
+    if minimum == maximum:
+        return (minimum,) * config.rounds
+    count_rng = random.Random(
+        f"simulated-deep-research:{config.seed}:{job_index}:subagent-counts"
+    )
+    return tuple(
+        count_rng.randint(minimum, maximum)
+        for _ in range(config.rounds)
+    )
+
+
 def validate_config(config: BenchmarkConfig) -> None:
     if not config.base_url.startswith(("http://", "https://")):
         raise ValueError("--base-url must start with http:// or https://.")
@@ -276,6 +314,14 @@ def validate_config(config: BenchmarkConfig) -> None:
         raise ValueError(
             "job_concurrency must not exceed num_jobs: "
             f"{config.job_concurrency} > {config.num_jobs}."
+        )
+    min_subagents, max_subagents = _subagent_count_bounds(config)
+    if min_subagents <= 0:
+        raise ValueError("min_subagents_per_round must be positive.")
+    if min_subagents > max_subagents:
+        raise ValueError(
+            "min_subagents_per_round must not exceed "
+            "max_subagents_per_round."
         )
     _validate_token_buckets(
         "article_token_buckets",
@@ -338,6 +384,7 @@ def required_model_len_by_role(config: BenchmarkConfig) -> dict[str, int]:
     max_subagent_output_tokens = _max_bucket_tokens(
         config.subagent_output_token_buckets
     )
+    _, max_subagents_per_round = _subagent_count_bounds(config)
     max_subagent = (
         config.query_tokens
         + max_article_tokens
@@ -346,7 +393,7 @@ def required_model_len_by_role(config: BenchmarkConfig) -> dict[str, int]:
     max_round_summary = (
         config.main_overhead_tokens
         + (config.rounds - 1) * config.max_round_summary_tokens
-        + config.articles_per_round * max_subagent_output_tokens
+        + max_subagents_per_round * max_subagent_output_tokens
         + config.max_round_summary_tokens
     )
     max_final_summary = (
@@ -1792,12 +1839,18 @@ def _aggregate_metrics(
         int(record.get("actual_completion_tokens") or 0)
         for record in success_records
     )
+    expected_requests_by_job = {
+        str(job["job_index"]): int(job["expected_requests"])
+        for job in jobs
+    }
+    per_job_expected_values = list(expected_requests_by_job.values())
     expected_requests_per_job = (
-        config.rounds * config.articles_per_round
-        + config.rounds
-        + 1
+        per_job_expected_values[0]
+        if per_job_expected_values
+        and len(set(per_job_expected_values)) == 1
+        else None
     )
-    expected_requests = config.num_jobs * expected_requests_per_job
+    expected_requests = sum(per_job_expected_values)
     successful_jobs = [
         job for job in jobs if job["status"] == "success"
     ]
@@ -1902,6 +1955,7 @@ def _aggregate_metrics(
             else 0.0
         ),
         "expected_requests_per_job": expected_requests_per_job,
+        "expected_requests_by_job": expected_requests_by_job,
         "expected_requests": expected_requests,
         "completed_requests": len(records),
         "successful_requests": len(success_records),
@@ -1986,6 +2040,7 @@ def _job_metrics_row(
     config: BenchmarkConfig,
     *,
     job_index: int,
+    planned_subagent_counts: tuple[int, ...],
     status: str,
     error: str | None,
     records: list[dict[str, Any]],
@@ -2006,9 +2061,7 @@ def _job_metrics_row(
         for record in successful_records
     )
     expected_requests = (
-        config.rounds * config.articles_per_round
-        + config.rounds
-        + 1
+        sum(planned_subagent_counts) + config.rounds + 1
     )
     route_worker_counts = Counter(
         str(record["route_worker"])
@@ -2022,6 +2075,9 @@ def _job_metrics_row(
         "started_offset_s": started_offset_s,
         "finished_offset_s": finished_offset_s,
         "elapsed_s": elapsed_s,
+        "planned_subagent_requests_per_round": list(
+            planned_subagent_counts
+        ),
         "expected_requests": expected_requests,
         "completed_requests": len(records),
         "successful_requests": len(successful_records),
@@ -2066,6 +2122,7 @@ async def _run_one_job(
 ]:
     records: list[dict[str, Any]] = []
     round_rows: list[dict[str, Any]] = []
+    planned_subagent_counts = _subagent_counts_for_job(config, job_index)
     job_started = time.perf_counter()
     job_status = "model_failed"
     job_error: str | None = None
@@ -2088,7 +2145,8 @@ async def _run_one_job(
         for round_index in range(config.rounds):
             round_started = time.perf_counter()
             specs = []
-            for request_index in range(config.articles_per_round):
+            sampled_subagent_requests = planned_subagent_counts[round_index]
+            for request_index in range(sampled_subagent_requests):
                 article_tokens = sample_bucketed_tokens(
                     rng,
                     config.article_token_buckets,
@@ -2155,6 +2213,9 @@ async def _run_one_job(
                     "job_index": job_index,
                     "round_index": round_index,
                     "status": subagent_failure or "model_failed",
+                    "sampled_subagent_requests": (
+                        sampled_subagent_requests
+                    ),
                     "subagent_requests": len(subagent_results),
                     "subagent_successful_requests": sum(
                         record["status"] == "success"
@@ -2362,6 +2423,7 @@ async def _run_one_job(
     job_row = _job_metrics_row(
         config,
         job_index=job_index,
+        planned_subagent_counts=planned_subagent_counts,
         status=job_status,
         error=job_error,
         records=records,
@@ -2583,7 +2645,7 @@ async def run_benchmark(
 
     with ThreadPoolExecutor(
         max_workers=(
-            config.job_concurrency * config.articles_per_round
+            config.job_concurrency * _subagent_count_bounds(config)[1]
         ),
         thread_name_prefix="simulated-deep-research",
     ) as executor:
@@ -2598,8 +2660,8 @@ async def run_benchmark(
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Run one or more 10-round, 20-subagent-per-round synthetic Deep "
-            "Research jobs through the Sparse-vLLM smart router."
+            "Run one or more synthetic Deep Research jobs through the "
+            "Sparse-vLLM smart router."
         )
     )
     parser.add_argument(
@@ -2613,6 +2675,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--job-concurrency", type=int, default=1)
     parser.add_argument("--rounds", type=int, default=10)
     parser.add_argument("--articles-per-round", type=int, default=20)
+    parser.add_argument(
+        "--min-subagents-per-round",
+        type=int,
+        default=None,
+        help=(
+            "Inclusive minimum subagent count sampled independently for each "
+            "job round. Must be used with --max-subagents-per-round; when "
+            "unset, --articles-per-round remains fixed."
+        ),
+    )
+    parser.add_argument(
+        "--max-subagents-per-round",
+        type=int,
+        default=None,
+        help=(
+            "Inclusive maximum subagent count sampled independently for each "
+            "job round. Must be used with --min-subagents-per-round."
+        ),
+    )
     parser.add_argument(
         "--article-token-buckets",
         default="60:1000:8000,25:8001:16000,10:16001:32000,5:32001:64000",
@@ -2684,6 +2765,8 @@ def config_from_args(args: argparse.Namespace) -> BenchmarkConfig:
         job_concurrency=args.job_concurrency,
         rounds=args.rounds,
         articles_per_round=args.articles_per_round,
+        min_subagents_per_round=args.min_subagents_per_round,
+        max_subagents_per_round=args.max_subagents_per_round,
         article_token_buckets=_parse_token_buckets(
             args.article_token_buckets,
             "--article-token-buckets",

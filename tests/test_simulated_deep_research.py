@@ -272,6 +272,8 @@ class SimulatedDeepResearchTest(unittest.TestCase):
             self.assertEqual(config.router_timeout_margin_s, 30.0)
             self.assertEqual(config.num_jobs, 1)
             self.assertEqual(config.job_concurrency, 1)
+            self.assertIsNone(config.min_subagents_per_round)
+            self.assertIsNone(config.max_subagents_per_round)
             self.assertEqual(run.required_model_len(config), 65_564)
             cli_config = run.config_from_args(
                 run.build_arg_parser().parse_args(
@@ -287,6 +289,66 @@ class SimulatedDeepResearchTest(unittest.TestCase):
             self.assertEqual(cli_config.router_timeout_margin_s, 30.0)
             self.assertEqual(cli_config.num_jobs, 1)
             self.assertEqual(cli_config.job_concurrency, 1)
+            self.assertIsNone(cli_config.min_subagents_per_round)
+            self.assertIsNone(cli_config.max_subagents_per_round)
+
+    def test_parses_random_subagent_count_range(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = run.config_from_args(
+                run.build_arg_parser().parse_args(
+                    [
+                        "--model",
+                        "sim-model",
+                        "--output-dir",
+                        str(Path(tmp) / "run"),
+                        "--min-subagents-per-round",
+                        "10",
+                        "--max-subagents-per-round",
+                        "40",
+                    ]
+                )
+            )
+            run.validate_config(config)
+            self.assertEqual(config.min_subagents_per_round, 10)
+            self.assertEqual(config.max_subagents_per_round, 40)
+            self.assertEqual(run._subagent_count_bounds(config), (10, 40))
+
+    def test_rejects_invalid_random_subagent_count_range(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = self._config(Path(tmp) / "run")
+            invalid_cases = (
+                (
+                    {
+                        "min_subagents_per_round": 2,
+                        "max_subagents_per_round": None,
+                    },
+                    "must be set together",
+                ),
+                (
+                    {
+                        "min_subagents_per_round": 0,
+                        "max_subagents_per_round": 2,
+                    },
+                    "must be positive",
+                ),
+                (
+                    {
+                        "min_subagents_per_round": 4,
+                        "max_subagents_per_round": 3,
+                    },
+                    "must not exceed",
+                ),
+            )
+            for overrides, message in invalid_cases:
+                with self.subTest(overrides=overrides):
+                    config = run.BenchmarkConfig(
+                        **{
+                            **base.__dict__,
+                            **overrides,
+                        }
+                    )
+                    with self.assertRaisesRegex(ValueError, message):
+                        run.validate_config(config)
 
     def test_rejects_invalid_token_bucket(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -320,6 +382,18 @@ class SimulatedDeepResearchTest(unittest.TestCase):
                 }
             )
             self.assertEqual(run.required_model_len(config), 26)
+
+    def test_required_model_len_uses_random_subagent_upper_bound(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config(Path(tmp) / "run")
+            config = run.BenchmarkConfig(
+                **{
+                    **config.__dict__,
+                    "min_subagents_per_round": 2,
+                    "max_subagents_per_round": 5,
+                }
+            )
+            self.assertEqual(run.required_model_len(config), 36)
 
     def test_allows_overlapping_methods_without_role_tags(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -872,6 +946,96 @@ class SimulatedDeepResearchTest(unittest.TestCase):
             self.assertEqual(
                 Counter(row["job_index"] for row in sample_rows),
                 Counter({0: 9, 1: 9, 2: 9}),
+            )
+
+    def test_samples_reproducible_subagent_counts_per_job_and_round(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "run"
+            config = self._config(output_dir)
+            config = run.BenchmarkConfig(
+                **{
+                    **config.__dict__,
+                    "num_jobs": 2,
+                    "job_concurrency": 2,
+                    "rounds": 3,
+                    "min_subagents_per_round": 2,
+                    "max_subagents_per_round": 4,
+                }
+            )
+            planned = {
+                str(job_index): run._subagent_counts_for_job(
+                    config,
+                    job_index,
+                )
+                for job_index in range(config.num_jobs)
+            }
+            self.assertEqual(
+                planned,
+                {
+                    str(job_index): run._subagent_counts_for_job(
+                        config,
+                        job_index,
+                    )
+                    for job_index in range(config.num_jobs)
+                },
+            )
+            self.assertTrue(
+                all(
+                    2 <= count <= 4
+                    for counts in planned.values()
+                    for count in counts
+                )
+            )
+            self.assertNotEqual(planned["0"], planned["1"])
+
+            service = FakeService()
+            aggregate = asyncio.run(
+                run.run_benchmark(
+                    config,
+                    get_fn=service.get,
+                    post_fn=service.post,
+                )
+            )
+
+            expected_requests_by_job = {
+                job_index: sum(counts) + config.rounds + 1
+                for job_index, counts in planned.items()
+            }
+            self.assertEqual(
+                aggregate["expected_requests_by_job"],
+                expected_requests_by_job,
+            )
+            self.assertEqual(
+                aggregate["expected_requests"],
+                sum(expected_requests_by_job.values()),
+            )
+            self.assertEqual(
+                aggregate["successful_requests"],
+                aggregate["expected_requests"],
+            )
+            round_counts = {
+                str(job_index): [
+                    row["sampled_subagent_requests"]
+                    for row in aggregate["round_metrics"]
+                    if row["job_index"] == int(job_index)
+                ]
+                for job_index in planned
+            }
+            self.assertEqual(
+                round_counts,
+                {
+                    job_index: list(counts)
+                    for job_index, counts in planned.items()
+                },
+            )
+            self.assertEqual(
+                {
+                    str(row["job_index"]): tuple(
+                        row["planned_subagent_requests_per_round"]
+                    )
+                    for row in aggregate["job_metrics"]
+                },
+                planned,
             )
 
     def test_http_failure_is_recorded_before_run_fails(self):

@@ -11,13 +11,16 @@ may execute at once. Each job independently follows this workload:
 
 - 10 sequential research rounds.
 - 20 parallel subagent requests per round.
+- Optionally, `--min-subagents-per-round` and
+  `--max-subagents-per-round` replace the fixed count with an inclusive,
+  independently sampled count for every job and round.
 - Each subagent receives 64 query tokens plus a heavy-tailed article length:
   60% sample 1,000-8,000 tokens, 25% sample 8,001-16,000, 10% sample
   16,001-32,000, and 5% sample 32,001-64,000.
 - Subagent outputs use a second heavy-tailed distribution: 90% sample
   100-600 tokens and 10% sample 800-1,500, with `ignore_eos=true`.
-- After every subagent barrier, one main-agent request compresses the 20
-  answers into a uniformly sampled 512-1,024 token round summary.
+- After every subagent barrier, one main-agent request compresses the current
+  round's answers into a uniformly sampled 512-1,024 token round summary.
 - Main-agent prompts use a stable synthetic system/query prefix, accumulated
   prior round summaries, and the current round's answers. This creates
   deterministic cross-round prefix reuse without retaining every raw answer.
@@ -105,6 +108,12 @@ the router model card's cross-method minimum.
 
 The synthetic workload remains exactly reproducible from `seed`; the runner
 uses `seed + job_index` for each job and does not inject a per-run nonce.
+When a random subagent-count range is configured, a separate deterministic
+random stream samples one count for each `(job_index, round_index)`. This keeps
+the sampled fanout identical across variants with the same seed without
+changing the existing token-length stream used by fixed-count runs. The
+sampled counts are saved in `round_metrics.jsonl`, and the complete planned
+count list for each job is saved in `job_metrics.jsonl`.
 Consequently, rerunning the same seed against an uncleared worker could
 encounter cache entries from an earlier run. The runner detects this instead
 of silently measuring the warm cache: an actual match larger than the current
@@ -125,9 +134,30 @@ python -m benchmark.simulated_deep_research.run \
 ```
 
 The client request pool is sized for
-`job_concurrency * articles_per_round`. Raising `--articles-per-round` changes
-the per-job workload and main-agent context length; use `--job-concurrency`
-when the experiment variable is simultaneous complete jobs.
+`job_concurrency * max_subagents_per_round`, or
+`job_concurrency * articles_per_round` in fixed-count mode. Raising the
+subagent count changes the per-job workload and main-agent context length; use
+`--job-concurrency` when the experiment variable is simultaneous complete
+jobs.
+
+To avoid synchronized barriers across concurrent research jobs, sample
+between 10 and 40 subagents independently for every job and round:
+
+```bash
+python -m benchmark.simulated_deep_research.run \
+  --base-url http://127.0.0.1:18180/v1 \
+  --model <SERVED_MODEL_NAME> \
+  --output-dir outputs/simulated_deep_research/random_10_40_jobs_16 \
+  --num-jobs 16 \
+  --job-concurrency 16 \
+  --min-subagents-per-round 10 \
+  --max-subagents-per-round 40
+```
+
+Both range arguments must be provided together. Their values are inclusive,
+positive, and ordered. When they are absent, `--articles-per-round` retains
+the original fixed-count behavior. Preflight sizes the main-agent context
+requirement from the configured maximum so every sampled round is valid.
 
 For a fair two-worker vanilla baseline, tag the workers through
 `SPARSEVLLM_WORKER_TAGS=subagent` and
@@ -199,12 +229,13 @@ rejected. The run writes:
   main-agent prefix tokens, selected-worker block size, block-aligned expected
   tokens, the number of successful prior prompts on that worker, the selected
   worker's actual matched prefix tokens, and explicit status.
-- `round_metrics.jsonl`: barrier time, p50/p95/max subagent latency, straggler
-  gap, main-agent latency, and explicit status for every attempted round,
-  including a round whose main-agent request fails.
+- `round_metrics.jsonl`: sampled subagent count, barrier time, p50/p95/max
+  subagent latency, straggler gap, main-agent latency, and explicit status for
+  every attempted round, including a round whose main-agent request fails.
 - `job_metrics.jsonl`: explicit job status, elapsed time, request and token
-  counts, route distribution, prefix-cache observations, and completed-round
-  counts for every requested job.
+  counts, the complete planned subagent-count sequence, route distribution,
+  prefix-cache observations, and completed-round counts for every requested
+  job.
 - `aggregate_metrics.json`: end-to-end research-job throughput, token
   throughput, job and request latency percentiles, job/request status counts,
   route distributions, and separate attempted/completed job and round counts.
