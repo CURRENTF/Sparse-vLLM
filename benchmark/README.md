@@ -1,7 +1,7 @@
 # Benchmark Entrypoints
 
 This directory contains runnable benchmark code. The stable runbook lives in
-[`docs/benchmarking/README.md`](../docs/benchmarking/README.md); keep this file
+[`docs/en/benchmarking/README.md`](../docs/en/benchmarking/README.md); keep this file
 as a lightweight source-tree map.
 
 | Directory | Main entrypoints | Notes |
@@ -20,4 +20,4 @@ as a lightweight source-tree map.
 
 Do not store local experiment ledgers in this directory. Put reproducible
 commands, stable runbook notes, and result-interpretation rules in
-`docs/benchmarking/`.
+`docs/en/benchmarking/`.

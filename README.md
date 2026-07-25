@@ -56,7 +56,7 @@ and hybrid KV compression. The main method families are `streamingllm`,
 | `deltakv` / `deltakv-*` | Hybrid compression | Keeps a small full-precision pool and stores older context through DeltaKV compression or related ablations. |
 
 Read the method overview and integration rules in
-[Core Sparse Methods](docs/features/sparse-methods.md).
+[Core Sparse Methods](docs/en/features/sparse-methods.md).
 
 ## Supported Models
 
@@ -69,23 +69,23 @@ Read the method overview and integration rules in
 | Llama 3 / 3.1 | ✅ |
 | MiniMax M2.7 | ✅ |
 
-See [Supported Models](docs/features/supported-models.md) for the precision,
+See [Supported Models](docs/en/features/supported-models.md) for the precision,
 parallelism, and sparse-method compatibility matrices.
 
 ## Documentation
 
 | Topic | Link |
 | --- | --- |
-| Quick setup and minimal usage | [Getting Started](docs/getting_started/README.md) |
-| Model, precision, and parallelism support | [Supported Models](docs/features/supported-models.md) |
-| Sparse method taxonomy and extension rules | [Core Sparse Methods](docs/features/README.md) |
-| Runtime architecture | [Architecture](docs/design/README.md) |
-| Runtime parameter semantics | [Runtime Parameter Semantics](docs/configuration/runtime-parameter-semantics.md) |
-| Benchmark commands | [Benchmarks](docs/benchmarking/README.md) |
-| DeltaKV inference and training | [DeltaKV](docs/features/deltakv.md) |
-| Reproducibility checklist | [Reproducibility](docs/getting_started/reproducibility.md) |
+| Quick setup and minimal usage | [Getting Started](docs/en/getting_started/README.md) |
+| Model, precision, and parallelism support | [Supported Models](docs/en/features/supported-models.md) |
+| Sparse method taxonomy and extension rules | [Core Sparse Methods](docs/en/features/README.md) |
+| Runtime architecture | [Architecture](docs/en/design/README.md) |
+| Runtime parameter semantics | [Runtime Parameter Semantics](docs/en/configuration/runtime-parameter-semantics.md) |
+| Benchmark commands | [Benchmarks](docs/en/benchmarking/README.md) |
+| DeltaKV inference and training | [DeltaKV](docs/en/features/deltakv.md) |
+| Reproducibility checklist | [Reproducibility](docs/en/getting_started/reproducibility.md) |
 
-The full documentation index is maintained in [docs/README.md](docs/README.md).
+The full documentation index is maintained in [docs/en/README.md](docs/en/README.md).
 
 ## Quick Start
 
@@ -163,7 +163,7 @@ use repository-local Triton kernels; `sglang-kernel` and a local CUDA extension
 build are not required.
 
 For the full dependency list and a minimal `LLM(...)` example, see
-[Getting Started](docs/getting_started/README.md).
+[Getting Started](docs/en/getting_started/README.md).
 
 ## Benchmarks
 
@@ -171,7 +171,7 @@ Use `scripts/benchmarks/bench_sparse_vllm.py` for throughput measurements and
 the `benchmark/` entrypoints for LongBench, MathBench, SCBench, NIAH, and
 multimodal evaluations.
 
-See [Benchmarks](docs/benchmarking/README.md) for command examples and backend notes.
+See [Benchmarks](docs/en/benchmarking/README.md) for command examples and backend notes.
 
 ## Contributing Sparse Methods
 

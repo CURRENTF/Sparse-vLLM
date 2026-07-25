@@ -7,11 +7,12 @@ before reporting results.
 
 ## Documentation Map
 
-- Start from `docs/README.md` when choosing where documentation belongs.
-- Stable runbooks and contracts live under the topical `docs/` directories.
+- Start from `docs/en/README.md` when choosing where documentation belongs.
+- Stable English runbooks and contracts live under the topical `docs/en/`
+  directories.
 - Keep local run ledgers out of repo docs. Use the run artifacts themselves
   when a repo-facing claim needs evidence.
-- `docs/configuration/runtime-parameter-semantics.md` is the canonical parameter contract.
+- `docs/en/configuration/runtime-parameter-semantics.md` is the canonical parameter contract.
   Keep it synchronized before adding new public run configs.
 
 ## One Sentence Model
@@ -48,7 +49,7 @@ flowchart TD
 
 | Path | Role | Ownership rule |
 | --- | --- | --- |
-| `src/sparsevllm/config.py` | Runtime dataclass, validation, graph constraints, method-normalized defaults. | Public knob behavior must be mirrored in `docs/configuration/runtime-parameter-semantics.md`. |
+| `src/sparsevllm/config.py` | Runtime dataclass, validation, graph constraints, method-normalized defaults. | Public knob behavior must be mirrored in `docs/en/configuration/runtime-parameter-semantics.md`. |
 | `src/sparsevllm/method_registry.py` | Sparse method aliases and default prefill policy. | New method strings and policy defaults start here. |
 | `src/sparsevllm/engine/llm_engine.py` | Public engine lifecycle, tokenizer, scheduler loop, warmup, throughput logging. | Should not grow method-specific runtime logic. |
 | `src/sparsevllm/engine/scheduler.py` | Prefill/decode batching, long/short separation, prompt admission, preemption. | Uses cache-manager budget hooks instead of knowing method internals. |
@@ -197,5 +198,5 @@ These are control-restoring tasks, not urgent correctness fixes:
 4. Avoid splitting the giant DeltaKV cache managers until a functional change
    touches the exact region. When splitting, preserve tests around allocation,
    staging, graph metadata, and reconstruction separately.
-5. Keep `docs/configuration/runtime-parameter-semantics.md` synchronized whenever method
+5. Keep `docs/en/configuration/runtime-parameter-semantics.md` synchronized whenever method
    aliases, graph support, or public knobs change.

@@ -1,0 +1,50 @@
+# 核心稀疏方法
+
+Sparse-vLLM 围绕 cache-manager-first sparse runtime 构建。engine 支持 physical eviction、logical masking 和 hybrid compression，而不强迫 `attention.py` 持有方法特定状态。
+
+## 支持的方法
+
+将 `sparse_method` 设置为下列方法名之一。
+
+| 方法 | 类别 | 说明 | 主要 Runtime 参数 |
+| --- | --- | --- | --- |
+| `vanilla` | Dense baseline | Full attention baseline，用于验证正确性并测量非稀疏 engine path。 | 仅使用通用 engine 参数。 |
+| `streamingllm` | Physical eviction | StreamingLLM 风格的固定 sink 加 recent-window cache。保留 prefix/tail 策略之外的 token 会从 active KV cache 中被物理淘汰。 | `sink_keep_tokens`, `recent_keep_tokens` |
+| `attention-sink` | Physical eviction | attention-sink alias policy，使用相同的 sink-token 和 recent-window 保留模型。适合将 sink-window 行为与其他 physical eviction 方法对比。 | `sink_keep_tokens`, `recent_keep_tokens` |
+| `snapkv` | Physical eviction | SnapKV 风格的 token selection 在 prefill 后保留紧凑的重要历史 token 集合，只物理保留选中的 KV position，以减小 cache footprint。 | `decode_keep_tokens`, `prefill_keep_tokens`, `sink_keep_tokens`, `recent_keep_tokens` |
+| `pyramidkv` | Physical eviction | PyramidKV 风格、依赖 layer 的 KV 保留方式。它在 layer 之间分配 sparse budget，并物理存储选中的 context token。 | `decode_keep_tokens`, `prefill_keep_tokens`, `sink_keep_tokens`, `recent_keep_tokens` |
+| `omnikv` | Logical masking | OmniKV 保留 physical cache，但为选定 layer 构建 sparse attention view。适用于不改写 cache storage、同时降低 attention 计算量的场景。 | `full_attention_layers`, `decode_keep_tokens`, `prefill_keep_tokens`, `sink_keep_tokens`, `recent_keep_tokens`, `chunk_prefill_accel_omnikv` |
+| `quest` | Query-aware page selection | QuEST 根据 decode query 选择 token page。prefill 保持 dense，decode 通过 page/chunk budget 执行 sparse selection。 | `quest_chunk_size`, `quest_skip_layers`, `sink_keep_tokens`, `decode_keep_tokens`, `recent_keep_tokens` |
+| `deltakv` | Hybrid compression | 依赖 compressor 的精简 DeltaKV runtime。旧配置中的 `deltakv-less-memory*` 名称会规范到此方法，但实际 benchmark run 仍需要匹配的 compressor checkpoint。 | `deltakv_checkpoint_path`, `deltakv_latent_dim`, `deltakv_center_ratio`, `deltakv_neighbor_count`, `deltakv_latent_quant_bits`, `full_layer_kv_quant_bits` |
+
+Sparse-vLLM 在内部将该值存为 `vllm_sparse_method`，但 public command 和 `LLM(...)` kwarg 应使用 `sparse_method`。
+
+## Prefill Scheduling Policy
+
+Prefill scheduling 是方法 contract 的一部分，由 registry 管理。唯一事实来源是 `src/sparsevllm/method_registry.py`；benchmark script 和用户配置不应重新定义方法语义。
+
+| Policy | Runtime 语义 | 当前默认方法 |
+| --- | --- | --- |
+| `all_chunked` | 每个 prefill request 都受 `chunk_prefill_size` 和 scheduler 常规 batch 限制约束。 | `vanilla`, `streamingllm`, `attention-sink`, `snapkv`, `quest`, `omnikv` |
+| `long_bs1full_short_batch` | 长度不超过 `chunk_prefill_size` 的 prompt 使用完整 batched prefill；超过该值的 prompt 以 batch size 1 隔离运行，并使用 chunked RawKV offload。 | `pyramidkv` 和 DeltaKV family 方法 |
+
+DeltaKV family 方法和 PyramidKV 只对外提供 `long_bs1full_short_batch` policy。它们的 cache manager 对每个长于 `chunk_prefill_size` 的 prompt 使用 `requires_long_prefill_offload()`。这一精确边界避免产生一段使用 isolated full prefill、可能导致 activation OOM 的中间区间。在该 policy 下，`Config` 根据 `long_prefill_offload_threshold` 同时设置 `chunk_prefill_size` 和 offload boundary；该阈值默认是 `98304` token（96K）。不要单独设置 `engine_prefill_chunk_size`；实验需要不同边界时应设置该 threshold。必要时，`Config` 会提高 `max_num_batched_tokens`，使一个边界大小的 short prefill 能够容纳。`all_chunked` 仍独立使用 `engine_prefill_chunk_size`。
+
+`Config` 会把 `None`、空字符串和 `auto` 解析为 registry default。与方法默认值不一致的显式 policy 会快速失败，避免实验静默改变 scheduler 语义。任何 policy override 都应视为显式 ablation，并随 benchmark result 一起记录。
+
+## Runtime 所有权
+
+- 方法特定的 runtime state 属于 `src/sparsevllm/engine/cache_manager/`。
+- 跨 layer observation 或 scheduling coordination 属于 `src/sparsevllm/engine/sparse_controller.py`。
+- `src/sparsevllm/layers/attention.py` 应保持通用，只调用 shared hook。
+- 新的一等方法必须在 `src/sparsevllm/method_registry.py` 中注册默认 prefill policy，并在 `tests/test_prefill_schedule_policy.py` 中覆盖。
+
+## Query-Aware 参数
+
+`quest` runtime 参数：
+
+- `quest_chunk_size`：QuEST page/chunk 的 token 数量；
+- `sink_keep_tokens`、`decode_keep_tokens`、`recent_keep_tokens`：QuEST 在 config 构造期间将三者相加，一次性得到 decode token budget；
+- `quest_skip_layers`：在 decode 中保持前 N 个 layer 为 dense。
+
+`quest_token_budget` 已不再是 runtime input。传入该参数会快速失败；请删除它，改为配置上述三个通用 keep-token 字段。

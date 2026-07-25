@@ -44,7 +44,7 @@ Sparse-vLLM 支持物理淘汰、逻辑掩码、查询感知选择和混合 KV �
 | `quest` | 查询感知选择 | 保持预填充阶段为稠密计算，在解码阶段使用查询感知的分页选择。 |
 | `deltakv` / `deltakv-*` | 混合压缩 | 保留一个小型全精度池，并通过 DeltaKV 压缩或相关消融方法存储较早的上下文。 |
 
-方法概览和集成规则请参阅[核心稀疏方法](docs/features/sparse-methods.md)。
+方法概览和集成规则请参阅[核心稀疏方法](docs/zh/features/sparse-methods.md)。
 
 ## 支持的模型
 
@@ -58,22 +58,22 @@ Sparse-vLLM 支持物理淘汰、逻辑掩码、查询感知选择和混合 KV �
 | MiniMax M2.7 | ✅ |
 
 各模型支持的精度、并行方式和稀疏方法请参阅
-[支持的模型](docs/features/supported-models.md)。
+[支持的模型](docs/zh/features/supported-models.md)。
 
 ## 文档
 
 | 主题 | 链接 |
 | --- | --- |
-| 快速配置与最小用法 | [快速开始](docs/getting_started/README.md) |
-| 模型、精度与并行支持 | [支持的模型](docs/features/supported-models.md) |
-| 稀疏方法分类与扩展规则 | [核心稀疏方法](docs/features/README.md) |
-| 运行时架构 | [架构](docs/design/README.md) |
-| 运行时参数语义 | [运行时参数语义](docs/configuration/runtime-parameter-semantics.md) |
-| 基准测试命令 | [基准测试](docs/benchmarking/README.md) |
-| DeltaKV 推理与训练 | [DeltaKV](docs/features/deltakv.md) |
-| 可复现性检查清单 | [可复现性](docs/getting_started/reproducibility.md) |
+| 快速配置与最小用法 | [快速开始](docs/zh/getting_started/README.md) |
+| 模型、精度与并行支持 | [支持的模型](docs/zh/features/supported-models.md) |
+| 稀疏方法分类与扩展规则 | [核心稀疏方法](docs/zh/features/README.md) |
+| 运行时架构 | [架构](docs/zh/design/README.md) |
+| 运行时参数语义 | [运行时参数语义](docs/zh/configuration/runtime-parameter-semantics.md) |
+| 基准测试命令 | [基准测试](docs/zh/benchmarking/README.md) |
+| DeltaKV 推理与训练 | [DeltaKV](docs/zh/features/deltakv.md) |
+| 可复现性检查清单 | [可复现性](docs/zh/getting_started/reproducibility.md) |
 
-完整文档索引维护在 [docs/README.md](docs/README.md) 中。
+完整文档索引维护在 [docs/zh/README.md](docs/zh/README.md) 中。
 
 ## 快速开始
 
@@ -133,13 +133,13 @@ uv pip install -e ".[qwen35]"
 pip install -e ".[qwen35]"
 ```
 
-完整依赖列表和最小 `LLM(...)` 示例请参阅[快速开始](docs/getting_started/README.md)。
+完整依赖列表和最小 `LLM(...)` 示例请参阅[快速开始](docs/zh/getting_started/README.md)。
 
 ## 基准测试
 
 使用 `scripts/benchmarks/bench_sparse_vllm.py` 测量吞吐量，并通过 `benchmark/` 下的入口进行 LongBench、MathBench、SCBench、NIAH 和多模态评测。
 
-命令示例和后端说明请参阅[基准测试](docs/benchmarking/README.md)。
+命令示例和后端说明请参阅[基准测试](docs/zh/benchmarking/README.md)。
 
 ## 贡献稀疏方法
 

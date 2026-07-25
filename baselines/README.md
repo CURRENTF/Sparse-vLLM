@@ -5,7 +5,7 @@ adapters. Standalone benchmark, evaluation, profiling, visualization, and
 bundled benchmark-data implementations from vendored baselines are omitted.
 
 Use the repository-owned entrypoints under `benchmark/` and the runbooks under
-`docs/benchmarking/` for reproducible comparisons. The upstream README files
+`docs/en/benchmarking/` for reproducible comparisons. The upstream README files
 are retained for provenance and may still describe benchmark files that are not
 part of this trimmed copy.
 

@@ -799,7 +799,7 @@ Main files:
 
 - `benchmark/multimodal/visual_cache/run_visual_cache.py`
 - `src/deltakv/modeling/llava_onevision_deltakv.py`
-- `docs/benchmarking/multimodal/README.md`
+- `docs/en/benchmarking/multimodal/README.md`
 
 Current implemented benchmark methods:
 

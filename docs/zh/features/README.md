@@ -1,0 +1,8 @@
+# 功能
+
+本目录收录定义 Sparse-vLLM 行为的稀疏方法文档。
+
+- [支持的模型](supported-models.md)
+- [核心稀疏方法](sparse-methods.md)
+- [DeltaKV](deltakv.md)
+- [Tiny Random 调试模式](tiny-random-debug.md)

@@ -2,7 +2,7 @@
 
 This page collects the supported benchmark entrypoints and the canonical ways
 to run them. For a source-tree map of benchmark code, see
-[`benchmark/README.md`](../../benchmark/README.md).
+[`benchmark/README.md`](../../../benchmark/README.md).
 
 ## Benchmark Inventory
 
@@ -58,7 +58,7 @@ compatibility wrapper for existing runbooks and regression harnesses.
 These examples are convenient for GSM8K, AIME 2024, MATH-500, and HMMT-style
 comparisons while exercising the Sparse-vLLM engine directly. For dataset
 details, see
-[`benchmark/math_bench/README.md`](../../benchmark/math_bench/README.md).
+[`benchmark/math_bench/README.md`](../../../benchmark/math_bench/README.md).
 
 Full-attention baseline:
 
@@ -305,7 +305,7 @@ Notes:
 ## Multimodal
 
 Current multimodal benchmark entrypoints and method support are documented in
-[`docs/benchmarking/multimodal/`](multimodal/).
+[`docs/en/benchmarking/multimodal/`](multimodal/).
 
 ## RULER-VT And NIAH
 
