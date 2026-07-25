@@ -56,9 +56,13 @@ layer 物理峰值与 resident row，避免并发排队的 chain 重复承诺同
 
 Chat Completions、Completions 和 Responses 都接受 `chain_id`。Admission
 在构造 streaming response 前完成，因此 chain error 会保留 404/409/410/503
-status，而不是在 HTTP 200 后才出现。成功响应通过
+status，而不是在 HTTP 200 后才出现。成功的单 chain 响应通过
 `X-SparseVLLM-Chain-ID` 暴露 ID；JSON/SSE object 暴露 `chain_id` 和复用
-token usage。
+token usage。未显式传入 `chain_id` 的多 prompt Completions 请求会为每个
+prompt 创建独立 chain；各 choice 与 streaming chunk 携带自己的
+`chain_id`，响应不会设置只能表达单值的 header 或顶层 ID。因此显式传入
+`chain_id` 的 continuation 必须恰好包含一个 prompt。若 batch 中任一
+admission 失败，服务端会先取消已完成的部分 admission，再返回错误。
 
 Worker 提供只读 `/v1/chain_cache/routing_match`。对于非空 ID，smart router
 并行探测 worker；唯一 IDLE owner 无论负载如何都会胜出。ACTIVE、missing、

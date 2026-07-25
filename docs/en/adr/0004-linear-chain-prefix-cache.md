@@ -63,8 +63,13 @@ queued chains from overcommitting the same free slots.
 Chat Completions, Completions, and Responses accept `chain_id`. Admission
 finishes before a streaming response is constructed, so chain errors retain
 their 404/409/410/503 status instead of appearing after HTTP 200. Successful
-responses expose `X-SparseVLLM-Chain-ID`; JSON/SSE objects expose `chain_id`
-and reused-token usage.
+single-chain responses expose `X-SparseVLLM-Chain-ID`; JSON/SSE objects expose
+`chain_id` and reused-token usage. An implicit multi-prompt Completions request
+creates one independent chain per prompt. Its choices and streaming chunks
+carry their own `chain_id`, while the response intentionally omits the
+single-value header and top-level ID. Explicit continuation with `chain_id`
+therefore requires exactly one prompt. If any batch admission fails, earlier
+partial admissions are cancelled before the error is returned.
 
 Workers expose read-only `/v1/chain_cache/routing_match`. The smart router
 probes workers in parallel for a non-empty ID. A unique IDLE owner wins

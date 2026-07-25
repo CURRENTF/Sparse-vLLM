@@ -3170,6 +3170,106 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
             ["chain-0", "chain-1"],
         )
 
+    async def test_implicit_chain_batch_cancels_partial_admissions(self):
+        from fastapi import HTTPException
+
+        from sparsevllm.engine.chain_cache import ChainCapacityError
+        from sparsevllm.entrypoints.openai.dispatcher import RequestHandle
+        from sparsevllm.entrypoints.openai.protocol.completion import (
+            CompletionRequest,
+        )
+        from sparsevllm.entrypoints.openai.serving.completion import (
+            serve_completion,
+        )
+
+        class Dispatcher:
+            admission_ack_enabled = True
+            chain_cache_enabled = True
+
+            def __init__(self):
+                self.discarded = []
+
+            async def submit(self, *_args, **_kwargs):
+                raise AssertionError("submit_admitted must be used")
+
+            async def submit_admitted(
+                self,
+                _prompt,
+                _sampling_params,
+                index,
+                _stop,
+            ):
+                if index == 1:
+                    raise ChainCapacityError(
+                        "no chain capacity",
+                        chain_id="chain-1",
+                    )
+                return RequestHandle(
+                    output_queue=asyncio.Queue(),
+                    cancelled=threading.Event(),
+                    seq_id=7,
+                    chain_id="chain-0",
+                    chain_status="created",
+                )
+
+            async def discard(self, handle):
+                self.discarded.append(handle.chain_id)
+
+        dispatcher = Dispatcher()
+        with self.assertRaises(HTTPException) as ctx:
+            await serve_completion(
+                CompletionRequest(
+                    model="model",
+                    prompt=["first", "second"],
+                    max_tokens=1,
+                    temperature=0,
+                ),
+                dispatcher,
+                tokenizer=None,
+                served_model_name="model",
+                request_log_path=None,
+            )
+
+        self.assertEqual(ctx.exception.status_code, 503)
+        self.assertEqual(dispatcher.discarded, ["chain-0"])
+
+    async def test_partial_admission_cleanup_attempts_every_handle(self):
+        from sparsevllm.entrypoints.openai.dispatcher import RequestHandle
+        from sparsevllm.entrypoints.openai.serving.completion import (
+            _discard_partial_admissions,
+        )
+
+        class Dispatcher:
+            def __init__(self):
+                self.discarded = []
+
+            async def discard(self, handle):
+                self.discarded.append(handle.chain_id)
+                if handle.chain_id == "chain-0":
+                    raise RuntimeError("first cleanup failed")
+
+        handles = [
+            RequestHandle(
+                output_queue=asyncio.Queue(),
+                cancelled=threading.Event(),
+                seq_id=index,
+                chain_id=f"chain-{index}",
+            )
+            for index in range(2)
+        ]
+        dispatcher = Dispatcher()
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "2 partially admitted|1 cleanup error",
+        ):
+            await _discard_partial_admissions(dispatcher, handles)
+
+        self.assertEqual(
+            dispatcher.discarded,
+            ["chain-0", "chain-1"],
+        )
+
     async def test_chain_admission_error_precedes_streaming_http_200(self):
         from fastapi import HTTPException
 
@@ -3564,6 +3664,168 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         changed = dispatcher._drain_aborts(active)
         self.assertTrue(changed)
         self.assertEqual(dispatcher.engine.aborted, [(7, "invalidate")])
+
+    async def test_dispatcher_discard_invalidates_after_terminal_race(self):
+        import queue
+        from types import SimpleNamespace
+
+        from sparsevllm.entrypoints.openai.dispatcher import (
+            AsyncEngineDispatcher,
+            RequestHandle,
+        )
+
+        class Engine:
+            def __init__(self):
+                self.discarded = []
+
+            def discard_chain(self, chain_id, *, expected_seq_id):
+                self.discarded.append(
+                    (str(chain_id), int(expected_seq_id))
+                )
+                return True
+
+        dispatcher = object.__new__(AsyncEngineDispatcher)
+        dispatcher.engine = Engine()
+        dispatcher._aborts = queue.Queue()
+        dispatcher._pending = queue.Queue()
+        dispatcher._latest_request_tokens = {}
+        dispatcher._state_lock = threading.Lock()
+        dispatcher._closing = threading.Event()
+        dispatcher._failed_message = None
+        dispatcher._thread = SimpleNamespace(is_alive=lambda: True)
+        handle = RequestHandle(
+            output_queue=asyncio.Queue(),
+            cancelled=threading.Event(),
+            seq_id=7,
+            chain_id="chain-1",
+            request_token="finished-turn",
+        )
+
+        discard_task = asyncio.create_task(dispatcher.discard(handle))
+        await asyncio.sleep(0)
+        handle.terminal.set()
+        changed = dispatcher._drain_aborts({})
+        await asyncio.wait_for(discard_task, timeout=1)
+
+        self.assertTrue(changed)
+        self.assertEqual(
+            dispatcher.engine.discarded,
+            [("chain-1", 7)],
+        )
+
+    async def test_dispatcher_rejects_discard_after_shutdown(self):
+        import queue
+        from types import SimpleNamespace
+
+        from sparsevllm.entrypoints.openai.dispatcher import (
+            AsyncEngineDispatcher,
+            RequestHandle,
+        )
+
+        dispatcher = object.__new__(AsyncEngineDispatcher)
+        dispatcher._aborts = queue.Queue()
+        dispatcher._pending = queue.Queue()
+        dispatcher._state_lock = threading.Lock()
+        dispatcher._closing = threading.Event()
+        dispatcher._closing.set()
+        dispatcher._failed_message = None
+        dispatcher._thread = SimpleNamespace(is_alive=lambda: False)
+        handle = RequestHandle(
+            output_queue=asyncio.Queue(),
+            cancelled=threading.Event(),
+            seq_id=7,
+            chain_id="chain-1",
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "shutting down"):
+            await asyncio.wait_for(dispatcher.discard(handle), timeout=1)
+        self.assertTrue(dispatcher._aborts.empty())
+
+    async def test_dispatcher_shutdown_resolves_queued_discard(self):
+        import queue
+
+        from sparsevllm.entrypoints.openai.dispatcher import (
+            AsyncEngineDispatcher,
+            _AbortRequest,
+        )
+
+        output_queue = asyncio.Queue()
+        abort = _AbortRequest(
+            seq_id=7,
+            disposition="invalidate",
+            chain_id="chain-1",
+            request_token="turn",
+            force=True,
+            loop=asyncio.get_running_loop(),
+            output_queue=output_queue,
+        )
+        dispatcher = object.__new__(AsyncEngineDispatcher)
+        dispatcher._aborts = queue.Queue()
+        dispatcher._aborts.put(abort)
+
+        dispatcher._fail_pending_aborts("dispatcher failed")
+        result = await asyncio.wait_for(output_queue.get(), timeout=1)
+
+        self.assertEqual(result["type"], "error")
+        self.assertIn("dispatcher failed", result["message"])
+        self.assertTrue(dispatcher._aborts.empty())
+
+    async def test_dispatcher_abort_failure_resolves_discard_waiter(self):
+        import queue
+
+        from sparsevllm.entrypoints.openai.detokenizer import (
+            IncrementalDetokenizer,
+        )
+        from sparsevllm.entrypoints.openai.dispatcher import (
+            AsyncEngineDispatcher,
+            _AbortRequest,
+            _ActiveRequest,
+        )
+
+        class Engine:
+            def abort_request(self, _seq_id, disposition="invalidate"):
+                del disposition
+                raise RuntimeError("abort failed")
+
+        output_queue = asyncio.Queue()
+        abort = _AbortRequest(
+            seq_id=7,
+            disposition="invalidate",
+            chain_id="chain-1",
+            request_token="turn",
+            force=True,
+            loop=asyncio.get_running_loop(),
+            output_queue=output_queue,
+        )
+        dispatcher = object.__new__(AsyncEngineDispatcher)
+        dispatcher.engine = Engine()
+        dispatcher._aborts = queue.Queue()
+        dispatcher._aborts.put(abort)
+        dispatcher._latest_request_tokens = {7: "turn"}
+        tokenizer = _byte_level_tokenizer()
+        active = {
+            7: _ActiveRequest(
+                index=0,
+                loop=asyncio.get_running_loop(),
+                output_queue=asyncio.Queue(),
+                prompt_token_ids=[1],
+                max_tokens=1,
+                stop=[],
+                completion_token_ids=[],
+                completion_token_logprobs=[],
+                completion_top_logprobs=[],
+                detokenizer=IncrementalDetokenizer(tokenizer),
+                chain_id="chain-1",
+                request_token="turn",
+            )
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "abort failed"):
+            dispatcher._drain_aborts(active)
+        result = await asyncio.wait_for(output_queue.get(), timeout=1)
+
+        self.assertEqual(result["type"], "error")
+        self.assertIn("abort failed", result["message"])
 
     async def test_chat_completion_parses_qwen3_reasoning(self):
         from sparsevllm.entrypoints.openai.api_server import RequestHandle, _chat_completion_response

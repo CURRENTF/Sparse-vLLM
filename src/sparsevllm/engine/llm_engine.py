@@ -24,6 +24,7 @@ from sparsevllm.engine.chain_cache import (
     ChainCacheIndex,
     ChainRoutingSnapshot,
     ChainModeError,
+    ChainOwnerMismatchError,
     ChainPrefixMismatchError,
     RequestAdmission,
     stable_token_digest,
@@ -527,8 +528,33 @@ class LLMEngine:
             )
         if token_ids[:processed_token_count] == processed_token_ids:
             return token_ids
+        raw_token_ids = [
+            int(token_id)
+            for token_id in self.tokenizer.encode(
+                prompt,
+                add_special_tokens=False,
+            )
+        ]
+        automatic_prefix_count = 0
+        if (
+            len(token_ids) >= len(raw_token_ids)
+            and (
+                not raw_token_ids
+                or token_ids[-len(raw_token_ids):] == raw_token_ids
+            )
+        ):
+            automatic_prefix_count = len(token_ids) - len(raw_token_ids)
+        text_prefix_token_ids = processed_token_ids
+        if (
+            automatic_prefix_count
+            and processed_token_ids[:automatic_prefix_count]
+            == token_ids[:automatic_prefix_count]
+        ):
+            text_prefix_token_ids = processed_token_ids[
+                automatic_prefix_count:
+            ]
         prefix_text = self.tokenizer.decode(
-            processed_token_ids,
+            text_prefix_token_ids,
             skip_special_tokens=False,
             clean_up_tokenization_spaces=False,
         )
@@ -722,6 +748,40 @@ class LLMEngine:
             str(chain_id),
             int(record.seq_id),
         )
+
+    def discard_chain(
+        self,
+        chain_id: str,
+        *,
+        expected_seq_id: int,
+    ) -> bool:
+        coordinator = (
+            self.model_runner.runtime_state.chain_cache_coordinator
+        )
+        if coordinator is None:
+            raise ChainModeError(
+                "Chain prefix cache is not enabled.",
+                chain_id=str(chain_id),
+            )
+        record = coordinator.index.records.get(str(chain_id))
+        if record is None:
+            return False
+        if int(record.seq_id) != int(expected_seq_id):
+            raise ChainOwnerMismatchError(
+                f"Chain owner mismatch for {chain_id!r}: "
+                f"resident_seq_id={record.seq_id}, "
+                f"expected_seq_id={int(expected_seq_id)}.",
+                chain_id=str(chain_id),
+            )
+        seq_id = int(record.seq_id)
+        self.scheduler.abort(seq_id)
+        self._active_chain_sequences.pop(seq_id, None)
+        self.model_runner.call(
+            "chain_invalidate",
+            str(chain_id),
+            seq_id,
+        )
+        return True
 
     def chain_cache_routing_snapshot(self) -> ChainRoutingSnapshot:
         coordinator = (

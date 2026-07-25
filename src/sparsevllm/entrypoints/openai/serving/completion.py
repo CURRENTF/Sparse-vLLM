@@ -27,6 +27,27 @@ from sparsevllm.engine.chain_cache import ChainCacheError
 from sparsevllm.utils.log import logger
 
 
+async def _discard_partial_admissions(
+    dispatcher: AsyncEngineDispatcher,
+    handles: list[RequestHandle],
+) -> None:
+    discard = getattr(dispatcher, "discard", None)
+    errors: list[BaseException] = []
+    for handle in handles:
+        try:
+            if callable(discard):
+                await discard(handle)
+            else:
+                dispatcher.cancel(handle)
+        except BaseException as exc:
+            errors.append(exc)
+    if errors:
+        raise RuntimeError(
+            "Failed to discard one or more partially admitted requests: "
+            f"{len(errors)} cleanup error(s)."
+        ) from errors[0]
+
+
 async def serve_completion(
     request: CompletionRequest,
     dispatcher: AsyncEngineDispatcher,
@@ -65,22 +86,32 @@ async def serve_completion(
             },
         )
 
+    handles: list[RequestHandle] = []
     try:
         submit = (
             getattr(dispatcher, "submit_admitted", dispatcher.submit)
             if bool(getattr(dispatcher, "admission_ack_enabled", False))
             else dispatcher.submit
         )
-        handles = [
-            await submit(prompt, sampling_params, index, stop)
-            if request.chain_id is None
-            else await submit(
-                prompt, sampling_params, index, stop, chain_id=request.chain_id
+        for index, prompt in enumerate(prompts):
+            handle = (
+                await submit(prompt, sampling_params, index, stop)
+                if request.chain_id is None
+                else await submit(
+                    prompt,
+                    sampling_params,
+                    index,
+                    stop,
+                    chain_id=request.chain_id,
+                )
             )
-            for index, prompt in enumerate(prompts)
-        ]
+            handles.append(handle)
     except ChainCacheError as exc:
+        await _discard_partial_admissions(dispatcher, handles)
         raise _chain_http_exception(exc) from exc
+    except BaseException:
+        await _discard_partial_admissions(dispatcher, handles)
+        raise
     chain_id = (
         getattr(handles[0], "chain_id", None)
         if len(handles) == 1

@@ -85,6 +85,9 @@ class _AbortRequest:
     chain_id: str | None
     request_token: str
     terminal: threading.Event | None = None
+    force: bool = False
+    loop: asyncio.AbstractEventLoop | None = None
+    output_queue: asyncio.Queue | None = None
 
 
 _WAKEUP = object()
@@ -370,6 +373,43 @@ class AsyncEngineDispatcher:
             )
             self._pending.put(_WAKEUP)
 
+    async def discard(self, handle: RequestHandle) -> None:
+        handle.cancelled.set()
+        if handle.seq_id is None:
+            return
+        output_queue: asyncio.Queue = asyncio.Queue()
+        abort = _AbortRequest(
+            seq_id=int(handle.seq_id),
+            disposition="invalidate",
+            chain_id=handle.chain_id,
+            request_token=handle.request_token,
+            terminal=handle.terminal,
+            force=True,
+            loop=asyncio.get_running_loop(),
+            output_queue=output_queue,
+        )
+        with self._state_lock:
+            terminal_message = self._terminal_message_locked()
+            if terminal_message is None:
+                self._aborts.put(abort)
+                self._pending.put(_WAKEUP)
+        if terminal_message is not None:
+            raise RuntimeError(terminal_message)
+        timeout_s = float(
+            os.getenv("SPARSEVLLM_OPENAI_DISCARD_TIMEOUT_S", "30")
+        )
+        try:
+            result = await asyncio.wait_for(
+                output_queue.get(),
+                timeout=max(0.1, timeout_s),
+            )
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError(
+                "Timed out while discarding a partially admitted request."
+            ) from exc
+        if result["type"] == "error":
+            raise RuntimeError(result["message"])
+
     def close(self):
         with self._state_lock:
             if not self._closing.is_set():
@@ -453,6 +493,7 @@ class AsyncEngineDispatcher:
             try:
                 self._fail_active_requests(active, terminal_message)
                 self._drain_queued_requests(terminal_message)
+                self._fail_pending_aborts(terminal_message)
             finally:
                 if fatal_callback is not None:
                     try:
@@ -712,6 +753,24 @@ class AsyncEngineDispatcher:
         if latest_request_tokens.get(int(seq_id)) == request.request_token:
             latest_request_tokens.pop(int(seq_id), None)
 
+    @staticmethod
+    def _resolve_abort(
+        abort: _AbortRequest,
+        *,
+        error: BaseException | None = None,
+    ) -> None:
+        if abort.loop is None or abort.output_queue is None:
+            return
+        result = (
+            {"type": "error", "message": f"{type(error).__name__}: {error}"}
+            if error is not None
+            else {"type": "result", "value": None}
+        )
+        abort.loop.call_soon_threadsafe(
+            abort.output_queue.put_nowait,
+            result,
+        )
+
     def _drain_aborts(self, active: dict[int, _ActiveRequest]) -> bool:
         changed = False
         while True:
@@ -729,6 +788,7 @@ class AsyncEngineDispatcher:
                 if (
                     abort.terminal is not None
                     and abort.terminal.is_set()
+                    and not abort.force
                 ):
                     continue
             elif isinstance(abort, tuple) and len(abort) == 3:
@@ -749,6 +809,7 @@ class AsyncEngineDispatcher:
                 if isinstance(abort, _AbortRequest):
                     if abort.terminal is not None:
                         abort.terminal.set()
+                    self._resolve_abort(abort)
                 continue
             if seq_id in active:
                 active_request = active[seq_id]
@@ -760,17 +821,47 @@ class AsyncEngineDispatcher:
                     if isinstance(abort, _AbortRequest):
                         if abort.terminal is not None:
                             abort.terminal.set()
+                        self._resolve_abort(abort)
                     continue
                 try:
-                    self.engine.abort_request(
-                        seq_id, disposition=disposition
-                    )
-                except TypeError:
-                    self.engine.abort_request(seq_id)
+                    try:
+                        self.engine.abort_request(
+                            seq_id, disposition=disposition
+                        )
+                    except TypeError:
+                        self.engine.abort_request(seq_id)
+                except Exception as exc:
+                    if isinstance(abort, _AbortRequest):
+                        self._resolve_abort(abort, error=exc)
+                    raise
                 active.pop(seq_id)
                 self._mark_request_terminal(seq_id, active_request)
+                if isinstance(abort, _AbortRequest):
+                    self._resolve_abort(abort)
                 changed = True
             else:
+                if isinstance(abort, _AbortRequest) and abort.force:
+                    try:
+                        if chain_id:
+                            discard_chain = getattr(
+                                self.engine,
+                                "discard_chain",
+                                None,
+                            )
+                            if not callable(discard_chain):
+                                raise RuntimeError(
+                                    "Engine does not expose discard_chain."
+                                )
+                            discarded = discard_chain(
+                                chain_id,
+                                expected_seq_id=seq_id,
+                            )
+                            changed = bool(discarded) or changed
+                    except Exception as exc:
+                        self._resolve_abort(abort, error=exc)
+                    else:
+                        self._resolve_abort(abort)
+                    continue
                 abort_request = getattr(
                     self.engine, "abort_request", None
                 )
@@ -786,6 +877,7 @@ class AsyncEngineDispatcher:
                     if isinstance(abort, _AbortRequest):
                         if abort.terminal is not None:
                             abort.terminal.set()
+                        self._resolve_abort(abort)
                     changed = True
                 elif disposition == "invalidate" and chain_id:
                     invalidate_chain = getattr(
@@ -798,7 +890,20 @@ class AsyncEngineDispatcher:
                         if isinstance(abort, _AbortRequest):
                             if abort.terminal is not None:
                                 abort.terminal.set()
+                            self._resolve_abort(abort)
                         changed = True
+
+    def _fail_pending_aborts(self, message: str) -> None:
+        while True:
+            try:
+                abort = self._aborts.get_nowait()
+            except queue.Empty:
+                return
+            if not isinstance(abort, _AbortRequest):
+                continue
+            if abort.terminal is not None:
+                abort.terminal.set()
+            self._resolve_abort(abort, error=RuntimeError(message))
 
     def _fail_active_requests(self, active: dict[int, _ActiveRequest], message: str):
         for seq_id, request in list(active.items()):

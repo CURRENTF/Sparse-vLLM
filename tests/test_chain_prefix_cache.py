@@ -14,6 +14,7 @@ from sparsevllm.engine.chain_cache import (
     ChainFingerprintMismatchError,
     ChainGoneError,
     ChainNotFoundError,
+    ChainOwnerMismatchError,
     ChainPrefixMismatchError,
     ChainState,
     normalize_prefix_cache_mode,
@@ -122,6 +123,77 @@ def test_chain_text_continuation_preserves_resident_token_identity():
 
     assert engine._tokenize_prompt("ab!") == [3, 4]
     assert engine._tokenize_chain_continuation("ab!", record) == [1, 2, 4]
+
+
+def test_chain_text_continuation_preserves_identity_after_automatic_bos():
+    class MergeTokenizer:
+        bos_token = "<bos>"
+
+        def encode(self, text, add_special_tokens=False):
+            values = {
+                "ab!": [3, 4],
+                "!": [4],
+            }
+            token_ids = values[text]
+            return [0, *token_ids] if add_special_tokens else token_ids
+
+        def decode(
+            self,
+            token_ids,
+            *,
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        ):
+            del skip_special_tokens, clean_up_tokenization_spaces
+            if list(token_ids) != [1, 2]:
+                raise AssertionError(token_ids)
+            return "ab"
+
+    index = ChainCacheIndex()
+    record = _create_and_finish(index, "chain-a", 1, [0, 1, 2])
+    engine = object.__new__(LLMEngine)
+    engine.tokenizer = MergeTokenizer()
+
+    assert engine._tokenize_prompt("ab!") == [0, 3, 4]
+    assert engine._tokenize_chain_continuation("ab!", record) == [0, 1, 2, 4]
+
+
+def test_discard_chain_targets_expected_resident_sequence():
+    class Scheduler:
+        def __init__(self):
+            self.aborted = []
+
+        def abort(self, seq_id):
+            self.aborted.append(int(seq_id))
+
+    class ModelRunner:
+        def __init__(self, coordinator):
+            self.runtime_state = SimpleNamespace(
+                chain_cache_coordinator=coordinator,
+            )
+            self.calls = []
+
+        def call(self, method, *args):
+            self.calls.append((method, args))
+
+    record = SimpleNamespace(seq_id=7)
+    coordinator = SimpleNamespace(
+        index=SimpleNamespace(records={"chain-a": record}),
+    )
+    engine = object.__new__(LLMEngine)
+    engine.scheduler = Scheduler()
+    engine.model_runner = ModelRunner(coordinator)
+    engine._active_chain_sequences = {7: SimpleNamespace()}
+
+    assert engine.discard_chain("missing", expected_seq_id=8) is False
+    with pytest.raises(ChainOwnerMismatchError):
+        engine.discard_chain("chain-a", expected_seq_id=8)
+    assert engine.discard_chain("chain-a", expected_seq_id=7) is True
+    assert engine.scheduler.aborted == [7]
+    assert engine._active_chain_sequences == {}
+    assert engine.model_runner.calls == [
+        ("chain_invalidate", ("chain-a", 7)),
+    ]
 
 
 def test_chain_resume_rejects_digest_and_fingerprint_mismatch():
