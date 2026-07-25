@@ -263,6 +263,50 @@ def test_chain_tombstones_are_bounded():
         index.lookup("b")
 
 
+def test_chain_token_history_is_compact_bounded_and_reclaimed():
+    index = ChainCacheIndex(max_token_history_tokens=4)
+    first = _create_and_finish(index, "first", 1, [1, 2, 3])
+
+    assert first.processed_token_ids.typecode == "I"
+    assert list(first.processed_token_ids) == [1, 2, 3]
+    assert index.stats()["chain_cache_token_history_tokens"] == 3
+    assert index.stats()["chain_cache_token_history_capacity"] == 4
+    assert (
+        index.stats()["chain_cache_token_history_bytes"]
+        == 3 * first.processed_token_ids.itemsize
+    )
+    assert (
+        index.stats()["chain_cache_token_history_byte_capacity"]
+        == 4 * first.processed_token_ids.itemsize
+    )
+
+    second_plan = index.plan_admission(
+        chain_id="second",
+        seq_id=2,
+        token_ids=[4, 5],
+        fingerprint=FINGERPRINT,
+    )
+    index.apply_admission(second_plan, fingerprint=FINGERPRINT)
+    with pytest.raises(ChainCapacityError, match="token history"):
+        index.finish(
+            "second",
+            token_ids=[4, 5],
+            processed_token_count=2,
+            physical_slots_by_layer=(2,),
+        )
+    assert index.lookup("second").state is ChainState.ACTIVE
+
+    evicted = index.evict("first")
+    assert list(evicted.processed_token_ids) == []
+    index.finish(
+        "second",
+        token_ids=[4, 5],
+        processed_token_count=2,
+        physical_slots_by_layer=(2,),
+    )
+    assert index.stats()["chain_cache_token_history_tokens"] == 2
+
+
 def test_chain_apply_plan_rejects_duplicate_resident_seq_owner():
     index = ChainCacheIndex()
     _create_and_finish(index, "chain-a", 1, [1])

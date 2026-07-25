@@ -20,6 +20,7 @@ from sparsevllm.utils.log import logger
 class RequestHandle:
     output_queue: asyncio.Queue
     cancelled: threading.Event
+    terminal: threading.Event = field(default_factory=threading.Event)
     request_token: str = field(default_factory=lambda: uuid.uuid4().hex)
     seq_id: int | None = None
     chain_id: str | None = None
@@ -56,6 +57,7 @@ class _ActiveRequest:
     completion_token_logprobs: list[float | None]
     completion_top_logprobs: list[dict[int, float] | None]
     detokenizer: IncrementalDetokenizer
+    terminal: threading.Event = field(default_factory=threading.Event)
     emitted_text_len: int = 0
     pending_token_ids: list[int] = field(default_factory=list)
     pending_token_logprobs: list[float | None] = field(default_factory=list)
@@ -82,6 +84,7 @@ class _AbortRequest:
     disposition: str
     chain_id: str | None
     request_token: str
+    terminal: threading.Event | None = None
 
 
 _WAKEUP = object()
@@ -190,6 +193,7 @@ class AsyncEngineDispatcher:
                 self._pending.put(queued)
         if terminal_message is not None:
             handle.admission_error = RuntimeError(terminal_message)
+            handle.terminal.set()
             admission_future.set_result(handle)
             output_queue.put_nowait(
                 {"type": "error", "message": terminal_message}
@@ -351,6 +355,8 @@ class AsyncEngineDispatcher:
         handle: RequestHandle,
         disposition: str = "invalidate",
     ):
+        if handle.terminal.is_set():
+            return
         handle.cancelled.set()
         if handle.seq_id is not None:
             self._aborts.put(
@@ -359,6 +365,7 @@ class AsyncEngineDispatcher:
                     disposition=str(disposition),
                     chain_id=handle.chain_id,
                     request_token=handle.request_token,
+                    terminal=handle.terminal,
                 )
             )
             self._pending.put(_WAKEUP)
@@ -480,14 +487,17 @@ class AsyncEngineDispatcher:
 
     def _admit(self, item: _QueuedRequest, active: dict[int, _ActiveRequest]):
         if item.cancelled.is_set():
+            item.handle.terminal.set()
             self._resolve_admission(item, asyncio.CancelledError())
             return
         if self._closing.is_set():
             message = "Sparse-vLLM server is shutting down."
+            item.handle.terminal.set()
             self._put(item, {"type": "error", "message": message})
             self._resolve_admission(item, RuntimeError(message))
             return
         if self._failed_message is not None:
+            item.handle.terminal.set()
             self._put(item, {"type": "error", "message": self._failed_message})
             self._resolve_admission(
                 item,
@@ -515,6 +525,7 @@ class AsyncEngineDispatcher:
             item.handle.seq_id = seq_id
             if item.cancelled.is_set():
                 self.engine.abort_request(seq_id)
+                item.handle.terminal.set()
                 self._resolve_admission(item, asyncio.CancelledError())
                 return
             prompt_token_ids = (
@@ -533,6 +544,7 @@ class AsyncEngineDispatcher:
                 completion_token_logprobs=[],
                 completion_top_logprobs=[],
                 detokenizer=detokenizer,
+                terminal=item.handle.terminal,
                 chain_id=item.handle.chain_id,
                 chain_status=item.handle.chain_status,
                 reused_tokens=item.handle.reused_tokens,
@@ -567,6 +579,16 @@ class AsyncEngineDispatcher:
                         "Failed to abort request {} after admission setup failed.",
                         item.handle.seq_id,
                     )
+            item.handle.terminal.set()
+            latest_request_tokens = getattr(
+                self, "_latest_request_tokens", {}
+            )
+            if (
+                item.handle.seq_id is not None
+                and latest_request_tokens.get(int(item.handle.seq_id))
+                == item.handle.request_token
+            ):
+                latest_request_tokens.pop(int(item.handle.seq_id), None)
             self._put(
                 item,
                 {
@@ -625,6 +647,8 @@ class AsyncEngineDispatcher:
             if text or (stop_index is None and raw_text_delta):
                 self._publish_pending_token_event(request, text, raw_text_delta)
             if stop_index is not None:
+                active.pop(seq_id, None)
+                self._mark_request_terminal(seq_id, request)
                 self._put(
                     request,
                     {
@@ -649,7 +673,6 @@ class AsyncEngineDispatcher:
                         "prefilled_tokens": request.prefilled_tokens,
                     },
                 )
-                active.pop(seq_id, None)
 
     def _publish_pending_token_event(
         self,
@@ -677,6 +700,18 @@ class AsyncEngineDispatcher:
         request.pending_token_logprobs.clear()
         request.pending_top_logprobs.clear()
 
+    def _mark_request_terminal(
+        self,
+        seq_id: int,
+        request: _ActiveRequest,
+    ) -> None:
+        request.terminal.set()
+        latest_request_tokens = getattr(
+            self, "_latest_request_tokens", {}
+        )
+        if latest_request_tokens.get(int(seq_id)) == request.request_token:
+            latest_request_tokens.pop(int(seq_id), None)
+
     def _drain_aborts(self, active: dict[int, _ActiveRequest]) -> bool:
         changed = False
         while True:
@@ -691,6 +726,11 @@ class AsyncEngineDispatcher:
                 disposition = str(abort.disposition)
                 chain_id = abort.chain_id
                 request_token = abort.request_token
+                if (
+                    abort.terminal is not None
+                    and abort.terminal.is_set()
+                ):
+                    continue
             elif isinstance(abort, tuple) and len(abort) == 3:
                 seq_id, disposition, chain_id = abort
             elif isinstance(abort, tuple):
@@ -706,6 +746,9 @@ class AsyncEngineDispatcher:
                 and latest_request_token is not None
                 and request_token != latest_request_token
             ):
+                if isinstance(abort, _AbortRequest):
+                    if abort.terminal is not None:
+                        abort.terminal.set()
                 continue
             if seq_id in active:
                 active_request = active[seq_id]
@@ -714,6 +757,9 @@ class AsyncEngineDispatcher:
                     and active_request.request_token is not None
                     and request_token != active_request.request_token
                 ):
+                    if isinstance(abort, _AbortRequest):
+                        if abort.terminal is not None:
+                            abort.terminal.set()
                     continue
                 try:
                     self.engine.abort_request(
@@ -722,8 +768,7 @@ class AsyncEngineDispatcher:
                 except TypeError:
                     self.engine.abort_request(seq_id)
                 active.pop(seq_id)
-                if latest_request_token == request_token:
-                    latest_request_tokens.pop(int(seq_id), None)
+                self._mark_request_terminal(seq_id, active_request)
                 changed = True
             else:
                 abort_request = getattr(
@@ -738,6 +783,9 @@ class AsyncEngineDispatcher:
                         abort_request(seq_id)
                     if latest_request_token == request_token:
                         latest_request_tokens.pop(int(seq_id), None)
+                    if isinstance(abort, _AbortRequest):
+                        if abort.terminal is not None:
+                            abort.terminal.set()
                     changed = True
                 elif disposition == "invalidate" and chain_id:
                     invalidate_chain = getattr(
@@ -747,11 +795,15 @@ class AsyncEngineDispatcher:
                         invalidate_chain(chain_id)
                         if latest_request_token == request_token:
                             latest_request_tokens.pop(int(seq_id), None)
+                        if isinstance(abort, _AbortRequest):
+                            if abort.terminal is not None:
+                                abort.terminal.set()
                         changed = True
 
     def _fail_active_requests(self, active: dict[int, _ActiveRequest], message: str):
         for seq_id, request in list(active.items()):
             active.pop(seq_id, None)
+            self._mark_request_terminal(seq_id, request)
             try:
                 self._put(request, {"type": "error", "message": message})
             except Exception:
@@ -771,6 +823,7 @@ class AsyncEngineDispatcher:
                 try:
                     error = RuntimeError(message)
                     self._resolve_admission(item, error)
+                    item.handle.terminal.set()
                     self._put(
                         item, {"type": "error", "message": message}
                     )
@@ -835,6 +888,7 @@ class AsyncEngineDispatcher:
             ):
                 self._publish_pending_token_event(request, text_delta, final.raw_text_delta)
                 request.emitted_text_len = len(text)
+            self._mark_request_terminal(seq_id, request)
             self._put(
                 request,
                 {

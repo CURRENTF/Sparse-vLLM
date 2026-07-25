@@ -4,8 +4,10 @@ import hashlib
 import json
 import secrets
 import struct
+from array import array
 from collections import OrderedDict
 from dataclasses import dataclass
+from dataclasses import field
 from enum import Enum
 from typing import Any, Iterable
 
@@ -86,7 +88,9 @@ class ChainRecord:
     state: ChainState
     processed_token_count: int = 0
     processed_token_digest: bytes = b""
-    processed_token_ids: tuple[int, ...] = ()
+    processed_token_ids: array = field(
+        default_factory=lambda: array("I")
+    )
     last_access: int = 0
     physical_slots_by_layer: tuple[int, ...] = ()
     resident_rows: int = 1
@@ -289,13 +293,27 @@ def stable_token_digest(
 class ChainCacheIndex:
     """Logical lifecycle for non-branching, resident sparse-KV chains."""
 
-    def __init__(self, *, max_tombstones: int = 1024):
+    def __init__(
+        self,
+        *,
+        max_tombstones: int = 1024,
+        max_token_history_tokens: int | None = None,
+    ):
         max_tombstones = int(max_tombstones)
         if max_tombstones <= 0:
             raise ValueError(
                 f"chain_cache_max_tombstones must be > 0, got {max_tombstones}."
             )
+        if max_token_history_tokens is not None:
+            max_token_history_tokens = int(max_token_history_tokens)
+            if max_token_history_tokens <= 0:
+                raise ValueError(
+                    "max_token_history_tokens must be > 0 when set, got "
+                    f"{max_token_history_tokens}."
+                )
         self.max_tombstones = max_tombstones
+        self.max_token_history_tokens = max_token_history_tokens
+        self._token_history_tokens = 0
         self.records: dict[str, ChainRecord] = {}
         self.seq_id_to_chain_id: dict[int, str] = {}
         self.tombstones: OrderedDict[str, int] = OrderedDict()
@@ -323,6 +341,69 @@ class ChainCacheIndex:
         self.tombstones[chain_id] = self._tick()
         while len(self.tombstones) > self.max_tombstones:
             self.tombstones.popitem(last=False)
+
+    def _prepare_token_history(
+        self,
+        record: ChainRecord,
+        token_ids: Iterable[int],
+        *,
+        processed_token_count: int,
+    ) -> array:
+        processed_token_count = int(processed_token_count)
+        if processed_token_count < 0:
+            raise ValueError(
+                "processed_token_count must be >= 0, got "
+                f"{processed_token_count}."
+            )
+        logical_tokens = array("I")
+        for index, raw_token_id in enumerate(token_ids):
+            if index >= processed_token_count:
+                break
+            token_id = int(raw_token_id)
+            if token_id < 0 or token_id > 0xFFFFFFFF:
+                raise ChainOwnerMismatchError(
+                    "Chain token IDs must fit unsigned 32-bit storage: "
+                    f"index={index}, token_id={token_id}.",
+                    chain_id=record.chain_id,
+                )
+            logical_tokens.append(token_id)
+        if len(logical_tokens) != processed_token_count:
+            raise ChainOwnerMismatchError(
+                "Finished token sequence is shorter than the processed boundary: "
+                f"tokens={len(logical_tokens)}, "
+                f"processed={processed_token_count}.",
+                chain_id=record.chain_id,
+            )
+        next_total = (
+            self._token_history_tokens
+            - len(record.processed_token_ids)
+            + len(logical_tokens)
+        )
+        if (
+            self.max_token_history_tokens is not None
+            and next_total > self.max_token_history_tokens
+        ):
+            raise ChainCapacityError(
+                "Chain logical token history exceeds its configured resident "
+                "capacity: "
+                f"needed_tokens={next_total}, "
+                f"capacity_tokens={self.max_token_history_tokens}.",
+                chain_id=record.chain_id,
+            )
+        return logical_tokens
+
+    def _store_token_history(
+        self,
+        record: ChainRecord,
+        logical_tokens: array,
+    ) -> None:
+        self._token_history_tokens -= len(record.processed_token_ids)
+        record.processed_token_ids = logical_tokens
+        self._token_history_tokens += len(logical_tokens)
+
+    def _drop_token_history(self, record: ChainRecord) -> None:
+        self._token_history_tokens -= len(record.processed_token_ids)
+        record.processed_token_ids = array("I")
 
     def lookup(self, chain_id: str) -> ChainRecord:
         chain_id = str(chain_id)
@@ -566,6 +647,12 @@ class ChainCacheIndex:
         resident_rows: int = 1,
     ) -> ChainRecord:
         processed_token_count = int(processed_token_count)
+        existing = self.lookup(chain_id)
+        logical_tokens = self._prepare_token_history(
+            existing,
+            token_ids,
+            processed_token_count=processed_token_count,
+        )
         record = self.finish_digest(
             chain_id,
             processed_token_digest=stable_token_digest(
@@ -576,10 +663,7 @@ class ChainCacheIndex:
             physical_slots_by_layer=physical_slots_by_layer,
             resident_rows=resident_rows,
         )
-        record.processed_token_ids = tuple(
-            int(token_id)
-            for token_id in token_ids[:processed_token_count]
-        )
+        self._store_token_history(record, logical_tokens)
         return record
 
     def finish_digest(
@@ -625,6 +709,7 @@ class ChainCacheIndex:
 
     def invalidate(self, chain_id: str) -> ChainRecord:
         record = self.lookup(chain_id)
+        self._drop_token_history(record)
         self.records.pop(chain_id, None)
         self.seq_id_to_chain_id.pop(int(record.seq_id), None)
         self._add_tombstone(chain_id)
@@ -638,6 +723,7 @@ class ChainCacheIndex:
                 f"Cannot evict ACTIVE chain {chain_id!r}.",
                 chain_id=chain_id,
             )
+        self._drop_token_history(record)
         self.records.pop(chain_id, None)
         self.seq_id_to_chain_id.pop(int(record.seq_id), None)
         self._add_tombstone(chain_id)
@@ -688,6 +774,20 @@ class ChainCacheIndex:
             ),
             "chain_cache_tombstones": len(self.tombstones),
             "chain_cache_tombstone_capacity": self.max_tombstones,
+            "chain_cache_token_history_tokens": self._token_history_tokens,
+            "chain_cache_token_history_capacity": (
+                -1
+                if self.max_token_history_tokens is None
+                else self.max_token_history_tokens
+            ),
+            "chain_cache_token_history_bytes": (
+                self._token_history_tokens * array("I").itemsize
+            ),
+            "chain_cache_token_history_byte_capacity": (
+                -1
+                if self.max_token_history_tokens is None
+                else self.max_token_history_tokens * array("I").itemsize
+            ),
         }
 
     def reset(self) -> None:
@@ -695,6 +795,7 @@ class ChainCacheIndex:
         self.seq_id_to_chain_id.clear()
         self.tombstones.clear()
         self._clock = 0
+        self._token_history_tokens = 0
         for name in self._stats:
             self._stats[name] = 0
 
@@ -709,7 +810,18 @@ class ChainCacheCoordinator:
         self.index = ChainCacheIndex(
             max_tombstones=int(
                 getattr(config, "chain_cache_max_tombstones", 1024)
-            )
+            ),
+            max_token_history_tokens=(
+                int(getattr(config, "max_model_len"))
+                * int(
+                    getattr(
+                        config,
+                        "max_num_seqs_in_gpu",
+                        getattr(config, "max_num_seqs_in_batch", 1),
+                    )
+                    or 1
+                )
+            ),
         )
 
     def owner_seq_id(self, chain_id: str) -> int:
@@ -941,16 +1053,11 @@ class ChainCacheCoordinator:
                 f"Cannot remember tokens for non-IDLE chain {chain_id!r}.",
                 chain_id=str(chain_id),
             )
-        logical_tokens = tuple(
-            int(token_id)
-            for token_id in token_ids[:processed_token_count]
+        logical_tokens = self.index._prepare_token_history(
+            record,
+            token_ids,
+            processed_token_count=processed_token_count,
         )
-        if len(logical_tokens) != processed_token_count:
-            raise ChainOwnerMismatchError(
-                "Finished token sequence is shorter than the processed boundary: "
-                f"tokens={len(logical_tokens)}, processed={processed_token_count}.",
-                chain_id=str(chain_id),
-            )
         digest = stable_token_digest(logical_tokens)
         if (
             processed_token_count != int(record.processed_token_count)
@@ -960,7 +1067,7 @@ class ChainCacheCoordinator:
                 "Finished logical tokens do not match the recorded chain boundary.",
                 chain_id=str(chain_id),
             )
-        record.processed_token_ids = logical_tokens
+        self.index._store_token_history(record, logical_tokens)
         return record
 
     def invalidate(self, chain_id: str) -> ChainRecord:

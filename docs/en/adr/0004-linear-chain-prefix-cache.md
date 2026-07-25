@@ -22,7 +22,8 @@ explicit combinations fail during config construction.
 The chain implementation is independent of `RadixPrefixIndex`:
 
 - `ChainCacheIndex` owns opaque IDs, ACTIVE/IDLE lifecycle, processed-token
-  digest, strict IDLE-only LRU metadata, and bounded tombstones.
+  digest, compact driver-side logical token history, strict IDLE-only LRU
+  metadata, and bounded tombstones.
 - `ChainCacheCoordinator` owns logical coordination only.
 - Cache managers own KV rows, physical slots, R-KV queries, SkipKV sentence
   state, and all other method metadata.
@@ -31,10 +32,15 @@ The chain implementation is independent of `RadixPrefixIndex`:
 An omitted, null, or empty `chain_id` creates an opaque server ID. Reusing an
 ID requires an IDLE record, the same method/config fingerprint, and an exact
 SHA-256 match for the logical input prefix through the persisted processed
-boundary. The index stores only count plus digest, never long-lived token
-arrays. Rank 0 computes the digest from the request `Sequence`; TP admission
-validation and completion RPCs carry only token count plus the 32-byte digest,
-so long prompts do not consume the fixed-size shared-memory command buffer.
+boundary. Rank 0 also retains that exact logical prefix in a compact unsigned
+32-bit array. Text APIs need the original token identity because decoding and
+re-encoding a BPE prefix is not generally token-stable; the stored prefix lets
+the server tokenize only the appended text. This history is bounded by
+`max_model_len * max_num_seqs_in_gpu` tokens, reclaimed with the chain, and
+reported in chain-cache token/byte statistics. TP admission validation and
+completion RPCs still carry only token count plus the 32-byte digest, so long
+prompts do not consume the fixed-size shared-memory command buffer and worker
+ranks do not duplicate the driver token history.
 
 One chain has one ACTIVE writer. Normal EOS and length completion retain the
 resident row and transition to IDLE. The final sampled token has not run a

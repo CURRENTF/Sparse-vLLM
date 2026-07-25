@@ -27,7 +27,9 @@ For SnapKV, PyramidKV, R-KV, and SkipKV chain prefix caching,
 transitions, cache managers retain all payload/metadata, and `RuntimeState`
 performs reclamation. The OpenAI dispatcher acknowledges admission before
 constructing a stream. Smart-router affinity comes from parallel read-only
-worker probes, not a router-owned chain map.
+worker probes, not a router-owned chain map. Rank 0 retains compact logical
+token IDs only to preserve exact BPE identity for text continuations; the
+history is capacity-bounded and is not part of the physical KV payload.
 
 ## Runtime Flow
 

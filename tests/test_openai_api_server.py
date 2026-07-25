@@ -3449,6 +3449,9 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(handle.admission_error)
         self.assertEqual(final["type"], "final")
         self.assertEqual(final["prompt_tokens"], 3)
+        self.assertTrue(handle.terminal.is_set())
+        self.assertEqual(dispatcher._latest_request_tokens, {})
+        dispatcher.cancel(handle)
 
     async def test_dispatcher_wakes_to_invalidate_finished_chain_on_cancel(self):
         from sparsevllm.entrypoints.openai.dispatcher import (

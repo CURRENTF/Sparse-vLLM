@@ -237,6 +237,13 @@ Parameter semantics:
 | `prefix_cache_salt` | String folded into the cache fingerprint. Use it to intentionally isolate runs that should not share cache entries. |
 | `chain_cache_max_tombstones` | Positive integer. Bounds 410 Gone history for evicted or invalidated chain IDs. |
 
+Chain mode retains exact processed token IDs on rank 0 in compact unsigned
+32-bit storage. This is required because decode-then-encode is not token-stable
+for BPE tokenizers. The total logical-history budget is derived as
+`max_model_len * max_num_seqs_in_gpu`; eviction or invalidation releases both
+the physical KV payload and this CPU history. `free_slot_stats()` reports the
+current and maximum token and byte counts.
+
 Correctness constraints:
 
 - Cache keys include model path, model type, dtype, tensor-parallel size, sparse
