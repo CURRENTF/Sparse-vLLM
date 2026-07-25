@@ -120,6 +120,14 @@ python benchmark/long_bench/pred.py \
 
 需要与 `src/deltakv/` 下实现的 DeltaKV / SnapKV / PyramidKV wrapper model 对比时，使用 HF backend。
 
+对于线性 chain prefix-cache trace，在
+`scripts/benchmarks/bench_prefix_cache.py` 中选择 `chain_snapkv`、
+`chain_pyramidkv`、`chain_rkv` 或 `chain_skipkv`。Chain case 要求使用
+`--workloads multiturn --history_update generated`：turn 0 记录服务端创建的
+`chain_id`，后续 turn 复用该 ID；每条记录包含 chain 状态、复用的逻辑 token
+数、新 prefill 的增量 token 数以及逐 layer 物理驻留量。Tombstone 或 digest
+不匹配会被记为失败样本，harness 不会 fallback 到重新计算。
+
 ```bash
 python benchmark/long_bench/pred.py \
   --model qwen7b-deltakv \

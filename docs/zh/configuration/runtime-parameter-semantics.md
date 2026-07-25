@@ -52,7 +52,7 @@ HF DeltaKV 使用显式 HF 参数名：
 - `decode_keep_tokens=0.17` 在部分 HF path 中表示 ratio，但对 Sparse-vLLM 无效。运行 Sparse-vLLM 前应把 ratio 转换为显式 token count。
 - HF 和 Sparse-vLLM 都使用 `sparse_method` 作为 public method selector。
 - HF 和 Sparse-vLLM 都使用 `deltakv_checkpoint_path` 作为 public DeltaKV checkpoint path。
-- Sparse-vLLM prefix-cache control 是直接的 engine config field：`enable_prefix_caching`、`prefix_cache_block_size`、`prefix_cache_max_blocks` 和 `prefix_cache_salt`。它们不是 HF 参数。
+- Sparse-vLLM prefix-cache control 是直接的 engine config field：`enable_prefix_caching`、`prefix_cache_mode`、`prefix_cache_block_size`、`prefix_cache_max_blocks`、`prefix_cache_salt` 和 `chain_cache_max_tombstones`。它们不是 HF 参数。
 - `compressor_token_group_size` 用于 compressor token grouping；`deltakv_neighbor_count` 用于 selected reference/prototype count。
 - LLaVA 的 `--deltakv_checkpoint_path none` 加 `visual_uniform_keep` 不是 learned DeltaKV，而是 visual-token uniform-pruning baseline。
 
@@ -102,9 +102,11 @@ normalizer 只接受规范 public runtime name。它把这些名称映射到 bac
 | `visual_token_prune_only` | 相同 | 无 | LLaVA visual-token-only cache dropping/pruning。 |
 | `visual_token_keep_ratio` | 相同 | 无 | LLaVA 保留 eligible visual token 的 ratio。 |
 | `enable_prefix_caching` | 无 | 相同 | 为支持的方法启用 Sparse-vLLM prefix KV reuse。 |
-| `prefix_cache_block_size` | 无 | 相同 | Prefix-cache hash/materialization block size；QuEST 之外默认为 16。 |
+| `prefix_cache_mode` | 无 | 相同 | `auto`、`radix` 或 `chain`；`auto` 选择与方法兼容的实现。 |
+| `prefix_cache_block_size` | 无 | 相同 | Radix prefix-cache hash/materialization block size；QuEST 之外默认为 16，chain mode 不使用 block identity。 |
 | `prefix_cache_max_blocks` | 无 | 相同 | Live prefix-cache block 的可选上限；只淘汰 unreferenced leaf block。 |
 | `prefix_cache_salt` | 无 | 相同 | 额外 fingerprint salt，用于隔离本应不共享的 cache entry。 |
+| `chain_cache_max_tombstones` | 无 | 相同 | 记忆已淘汰或已失效 chain ID 的数量上限。 |
 
 被拒绝的 legacy runtime name：
 
@@ -180,17 +182,27 @@ Prefix cache 是 Sparse-vLLM engine feature，不是通用 HF runtime feature。
 | `vanilla` / `""` | token block | 使用 `StandardCacheManager`。 |
 | `omnikv` | token block | 复用 `StandardCacheManager`；fingerprint 仍包括 `omnikv` 设置。 |
 | `quest` | QuEST page | 要求 `prefix_cache_block_size == quest_chunk_size`。 |
+| `snapkv` / `pyramidkv` / `rkv` / `skipkv` | 线性 chain | 每个 opaque chain ID 保留一个驻留 sparse sequence；不支持分支。 |
 
-当 `enable_prefix_caching=true` 时，不支持的方法会快速失败：StreamingLLM、attention-sink alias、SnapKV、PyramidKV 和所有 DeltaKV-family 方法。这些方法会以无法等价复用完整 request-context KV prefix 的方式物理剪枝、压缩、重建或重映射 KV。
+当 `enable_prefix_caching=true` 时，不支持的方法会快速失败：
+StreamingLLM、attention-sink alias 和所有 DeltaKV-family 方法。
 
 参数语义：
 
 | 参数 | 含义 |
 | --- | --- |
 | `enable_prefix_caching` | Boolean 或显式 true/false 字符串。启用 scheduler lookup 及 cache-manager attach/materialize/free/evict hook。 |
-| `prefix_cache_block_size` | 正整数或 `null`。vanilla/OmniKV 默认为 16。QuEST 解析为 `quest_chunk_size`；任何不同的显式值都会被拒绝。 |
+| `prefix_cache_mode` | `auto`、`radix` 或 `chain`。Auto 为 vanilla/OmniKV/QuEST 选择 radix，为 SnapKV/PyramidKV/R-KV/SkipKV 选择 chain；显式的不兼容组合会快速失败。 |
+| `prefix_cache_block_size` | 正整数或 `null`。仅用于 radix：vanilla/OmniKV 默认为 16；QuEST 解析为 `quest_chunk_size`，并拒绝不同的显式值。Chain mode 不用它定义 identity、capacity 或 reuse boundary。 |
 | `prefix_cache_max_blocks` | 可选正整数上限。设置后，插入时只淘汰 unreferenced leaf block；不淘汰 referenced block。 |
 | `prefix_cache_salt` | 折叠进 cache fingerprint 的字符串。用于有意隔离不应共享 cache entry 的 run。 |
+| `chain_cache_max_tombstones` | 正整数。限制已淘汰或失效 chain ID 的 410 Gone 历史。 |
+
+Chain mode 在 rank 0 使用紧凑的 unsigned 32-bit storage 保留准确的
+processed token ID。之所以需要它，是因为 BPE tokenizer 的
+decode-then-encode 通常不保持 token identity。逻辑历史总预算由
+`max_model_len * max_num_seqs_in_gpu` 派生；淘汰或失效会同时释放物理 KV
+payload 和这份 CPU 历史。`free_slot_stats()` 会报告当前值与 token/byte 上限。
 
 正确性约束：
 
@@ -570,10 +582,12 @@ python scripts/benchmarks/bench_sparse_vllm.py \
 | `gpu_memory_utilization` | Sparse-vLLM | Cache planning 使用的 GPU 总显存比例。 |
 | `tensor_parallel_size` | Sparse-vLLM | TP rank/process 数。 |
 | `num_kvcache_slots` | Sparse-vLLM | 可选显式 KV slot override。 |
-| `enable_prefix_caching` | Sparse-vLLM | 仅为 vanilla、OmniKV 和 QuEST 启用 prefix KV reuse。 |
-| `prefix_cache_block_size` | Sparse-vLLM | Prefix-cache block size；QuEST 必须等于 `quest_chunk_size`。 |
+| `enable_prefix_caching` | Sparse-vLLM | 为 vanilla/OmniKV/QuEST 启用 radix reuse，或为 SnapKV/PyramidKV/R-KV/SkipKV 启用线性 chain reuse。 |
+| `prefix_cache_mode` | Sparse-vLLM | 选择 `auto`、`radix` 或线性 `chain` prefix reuse。 |
+| `prefix_cache_block_size` | Sparse-vLLM | Radix prefix-cache block size；QuEST 必须等于 `quest_chunk_size`，chain mode 不使用。 |
 | `prefix_cache_max_blocks` | Sparse-vLLM | Prefix cache 的可选 live-block 上限。 |
 | `prefix_cache_salt` | Sparse-vLLM | Cache isolation 使用的附加 fingerprint salt。 |
+| `chain_cache_max_tombstones` | Sparse-vLLM | 记忆已淘汰或失效 chain ID 的最大数量。 |
 | `admission_wave_size` | `scripts/benchmarks/bench_sparse_vllm.py` | 仅 benchmark 使用的 staged admission。 |
 | `wave_decode_gap_steps` | `scripts/benchmarks/bench_sparse_vllm.py` | 加入下一 wave 前，仅 benchmark 使用的 delay。 |
 | `max_decode_steps_after_full` | `scripts/benchmarks/bench_sparse_vllm.py` | Full admission 后，仅 benchmark 使用的 decode window 上限。 |
@@ -786,9 +800,11 @@ sparsevllm-openai-server \
 | `engine_prefill_chunk_size` / `chunk_prefill_size` | `8192` | 仅用于 `all_chunked`。CLI 使用语义明确的 `--engine-prefill-chunk-size`。 |
 | `long_prefill_offload_threshold` | `98304` | 仅用于 `long_bs1full_short_batch`，同时决定该 policy 的 chunk size。 |
 | `enable_prefix_caching` | `false` | 传入 `--enable-prefix-caching true` 启用 prefix KV reuse。 |
-| `prefix_cache_block_size` | vanilla/OmniKV 为 `16`，QuEST 为 `quest_chunk_size` | 使用 `--prefix-cache-block-size`；QuEST 拒绝与 `quest_chunk_size` 不同的值。 |
+| `prefix_cache_mode` | `"auto"` | 为 vanilla/OmniKV/QuEST 解析为 radix，为 SnapKV/PyramidKV/R-KV/SkipKV 解析为 chain。 |
+| `prefix_cache_block_size` | vanilla/OmniKV 为 `16`，QuEST 为 `quest_chunk_size` | 仅用于 radix。使用 `--prefix-cache-block-size`；QuEST 拒绝与 `quest_chunk_size` 不同的值，chain mode 忽略它。 |
 | `prefix_cache_max_blocks` | 未设置 | 可选 cache capacity 上限。 |
 | `prefix_cache_salt` | `""` | 可选 cache fingerprint isolation salt。 |
+| `chain_cache_max_tombstones` | `1024` | 限制 chain tombstone 内存及 410 Gone 历史。 |
 | `throughput_log_interval_s` | serving 中为 `0.0` | server 默认关闭周期性 `Avg TP` log，改为 per-request logging。传入 `--throughput-log-interval-s 10` 可重新启用周期性 throughput log。 |
 
 OpenAI server 当前有意不暴露 DeltaKV-family sparse method。规范化 method 以 `deltakv` 开头时，server startup 会快速失败。在 serving correctness 和 memory 行为得到验证前，使用离线实验入口运行这些方法。
@@ -1087,7 +1103,11 @@ python benchmark/long_bench/pred.py \
 - 使用 `hf_prefill_chunk_size` 或 `engine_prefill_chunk_size`；新 shared config 不要使用裸 `chunk_prefill_size`。
 - `use_cluster=True` 时显式设置 `deltakv_neighbor_count`。
 - 使用 Sparse-vLLM 时，把所有 ratio budget 转换为 token count。
-- 使用 prefix cache 时，`sparse_method` 必须是 `vanilla`、`omnikv` 或 `quest`；generated decode input token 在形成完整 prefix-cache block 后默认进入 cache；使用 `decode_cuda_graph` 时保持 `decode_cuda_graph_capture_sampling=false`。
+- 使用 radix prefix cache 时，`sparse_method` 应为 `vanilla`、`omnikv` 或
+  `quest`；generated decode input token 形成完整 block 后进入 cache。对于
+  SnapKV、PyramidKV、R-KV 或 SkipKV，使用线性 chain ID，不要为同一个
+  chain 创建分支。使用 `decode_cuda_graph` 时保持
+  `decode_cuda_graph_capture_sampling=false`。
 - QuEST prefix cache 应让 `prefix_cache_block_size` 等于 `quest_chunk_size`，或省略前者。
 - 使用 LLaVA 无 checkpoint path 时，将其标为 visual uniform pruning，不要标为 DeltaKV compressor inference。
 - 记录 `deltakv_latent_quant_bits=2` 或 `4` 量化的是 latent state、raw KV 还是 residual。

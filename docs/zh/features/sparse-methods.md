@@ -31,6 +31,20 @@ Prefill scheduling 是方法 contract 的一部分，由 registry 管理。唯�
 
 DeltaKV family 方法和 PyramidKV 只对外提供 `long_bs1full_short_batch` policy。它们的 cache manager 对每个长于 `chunk_prefill_size` 的 prompt 使用 `requires_long_prefill_offload()`。这一精确边界避免产生一段使用 isolated full prefill、可能导致 activation OOM 的中间区间。在该 policy 下，`Config` 根据 `long_prefill_offload_threshold` 同时设置 `chunk_prefill_size` 和 offload boundary；该阈值默认是 `98304` token（96K）。不要单独设置 `engine_prefill_chunk_size`；实验需要不同边界时应设置该 threshold。必要时，`Config` 会提高 `max_num_batched_tokens`，使一个边界大小的 short prefill 能够容纳。`all_chunked` 仍独立使用 `engine_prefill_chunk_size`。
 
+## Prefix Cache 模式
+
+`enable_prefix_caching=true` 支持两种有意分离的布局。
+`prefix_cache_mode=auto` 为 vanilla/OmniKV/QuEST 选择 radix，为
+SnapKV/PyramidKV/R-KV/SkipKV 选择线性 chain。也可以显式请求 `radix`
+或 `chain`，但不兼容的方法/模式组合会快速失败。
+
+Chain 布局跨 turn 保留同一个驻留 `seq_id`，且永不分支。调用方发送完整逻辑
+上下文和服务端返回的 `chain_id`；服务端验证 processed boundary 后只转发新增
+suffix。方法 KV 与 metadata 仍由 cache manager 持有。Idle chain 采用严格
+LRU 回收，active writer 保持 pinned。Rank 0 使用紧凑 32-bit storage 保存
+processed logical token ID，以便文本 continuation 保持驻留的 BPE tokenization。
+该 CPU 历史受 `max_model_len * max_num_seqs_in_gpu` 限制，并随 chain 一起回收。
+
 `Config` 会把 `None`、空字符串和 `auto` 解析为 registry default。与方法默认值不一致的显式 policy 会快速失败，避免实验静默改变 scheduler 语义。任何 policy override 都应视为显式 ablation，并随 benchmark result 一起记录。
 
 ## Runtime 所有权

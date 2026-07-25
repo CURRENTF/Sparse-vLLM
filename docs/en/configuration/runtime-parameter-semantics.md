@@ -66,9 +66,9 @@ Important rules:
 - `deltakv_checkpoint_path` is the public DeltaKV checkpoint path for both HF
   and Sparse-vLLM.
 - Sparse-vLLM prefix-cache controls are direct engine config fields:
-  `enable_prefix_caching`, `prefix_cache_block_size`,
-  `prefix_cache_max_blocks`, and `prefix_cache_salt`. They are not HF
-  parameters.
+  `enable_prefix_caching`, `prefix_cache_mode`, `prefix_cache_block_size`,
+  `prefix_cache_max_blocks`, `prefix_cache_salt`, and
+  `chain_cache_max_tombstones`. They are not HF parameters.
 - `compressor_token_group_size` is for compressor token grouping.
   `deltakv_neighbor_count` is for selected reference/prototype count.
 - LLaVA `--deltakv_checkpoint_path none` plus `visual_uniform_keep` is not
