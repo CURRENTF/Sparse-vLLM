@@ -46,11 +46,26 @@ Sparse-vLLM 支持物理淘汰、逻辑掩码、查询感知选择和混合 KV �
 
 方法概览和集成规则请参阅[核心稀疏方法](docs/features/sparse-methods.md)。
 
+## 支持的模型
+
+| 模型 | 是否支持 |
+| --- | :---: |
+| Qwen2.5 | ✅ |
+| Qwen3 | ✅ |
+| Qwen3MoE | ✅ |
+| Qwen3.5 / Qwen3.6 | ✅ |
+| Llama 3 / 3.1 | ✅ |
+| MiniMax M2.7 | ✅ |
+
+各模型支持的精度、并行方式和稀疏方法请参阅
+[支持的模型](docs/features/supported-models.md)。
+
 ## 文档
 
 | 主题 | 链接 |
 | --- | --- |
 | 快速配置与最小用法 | [快速开始](docs/getting_started/README.md) |
+| 模型、精度与并行支持 | [支持的模型](docs/features/supported-models.md) |
 | 稀疏方法分类与扩展规则 | [核心稀疏方法](docs/features/README.md) |
 | 运行时架构 | [架构](docs/design/README.md) |
 | 运行时参数语义 | [运行时参数语义](docs/configuration/runtime-parameter-semantics.md) |

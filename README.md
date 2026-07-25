@@ -58,11 +58,26 @@ and hybrid KV compression. The main method families are `streamingllm`,
 Read the method overview and integration rules in
 [Core Sparse Methods](docs/features/sparse-methods.md).
 
+## Supported Models
+
+| Model | Supported |
+| --- | :---: |
+| Qwen2.5 | ✅ |
+| Qwen3 | ✅ |
+| Qwen3MoE | ✅ |
+| Qwen3.5 / Qwen3.6 | ✅ |
+| Llama 3 / 3.1 | ✅ |
+| MiniMax M2.7 | ✅ |
+
+See [Supported Models](docs/features/supported-models.md) for the precision,
+parallelism, and sparse-method compatibility matrices.
+
 ## Documentation
 
 | Topic | Link |
 | --- | --- |
 | Quick setup and minimal usage | [Getting Started](docs/getting_started/README.md) |
+| Model, precision, and parallelism support | [Supported Models](docs/features/supported-models.md) |
 | Sparse method taxonomy and extension rules | [Core Sparse Methods](docs/features/README.md) |
 | Runtime architecture | [Architecture](docs/design/README.md) |
 | Runtime parameter semantics | [Runtime Parameter Semantics](docs/configuration/runtime-parameter-semantics.md) |

@@ -25,6 +25,7 @@ repo-facing result claim needs evidence.
 
 ## Reference Docs
 
+- [Supported models](features/supported-models.md)
 - [Research code guidelines](governance/research-code-guidelines.md)
 - [HF vs Sparse-vLLM backend parameter guide](configuration/hf-vs-sparsevllm-parameter-guide.md)
 - [Runtime parameter semantics](configuration/runtime-parameter-semantics.md)
