@@ -31,7 +31,7 @@ class SkipKVConfigTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             model_dir = Path(tmp) / "DeepSeek-R1-Distill-Qwen-7B"
             model_dir.mkdir()
-            with patch("sparsevllm.config.AutoConfig.from_pretrained", return_value=self.hf_config()):
+            with patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", return_value=self.hf_config()):
                 cfg = Config(model=str(model_dir), vllm_sparse_method="skipkv")
             self.assertEqual(cfg.vllm_sparse_method, "skipkv")
 
@@ -39,7 +39,7 @@ class SkipKVConfigTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             model_dir = Path(tmp) / "DeepSeek-R1-Distill-Qwen-7B"
             model_dir.mkdir()
-            with patch("sparsevllm.config.AutoConfig.from_pretrained", return_value=self.hf_config()):
+            with patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", return_value=self.hf_config()):
                 with self.assertRaisesRegex(ValueError, "requires skipkv_steering_vector_path"):
                     Config(
                         model=str(model_dir),

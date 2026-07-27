@@ -92,7 +92,7 @@ def _qwen35_outer_config(*, num_layers: int = 64, full_layers: tuple[int, ...] |
 
 
 def _make_config(tmp_path, **kwargs):
-    with patch("sparsevllm.config.AutoConfig.from_pretrained", return_value=_qwen35_outer_config()):
+    with patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", return_value=_qwen35_outer_config()):
         return Config(model=str(tmp_path), **kwargs)
 
 
@@ -429,7 +429,7 @@ def _deprecation_messages(mock_log_once):
 
 
 def test_recurrent_budget_accepts_deprecated_prefix_cache_alias(tmp_path):
-    with patch("sparsevllm.config.log_once") as mock_log_once:
+    with patch("sparsevllm.configs.prefix_cache.log_once") as mock_log_once:
         config = _make_config(tmp_path, prefix_cache_max_recurrent_bytes=2 << 30)
 
     assert config.recurrent_state_max_bytes == 2 << 30
@@ -438,7 +438,7 @@ def test_recurrent_budget_accepts_deprecated_prefix_cache_alias(tmp_path):
 
 
 def test_recurrent_budget_accepts_new_name_without_deprecation(tmp_path):
-    with patch("sparsevllm.config.log_once") as mock_log_once:
+    with patch("sparsevllm.configs.prefix_cache.log_once") as mock_log_once:
         config = _make_config(tmp_path, recurrent_state_max_bytes=3 << 30)
 
     assert config.recurrent_state_max_bytes == 3 << 30
@@ -447,7 +447,7 @@ def test_recurrent_budget_accepts_new_name_without_deprecation(tmp_path):
 
 
 def test_recurrent_budget_accepts_equal_new_and_deprecated_names(tmp_path):
-    with patch("sparsevllm.config.log_once") as mock_log_once:
+    with patch("sparsevllm.configs.prefix_cache.log_once") as mock_log_once:
         config = _make_config(
             tmp_path,
             recurrent_state_max_bytes=2 << 30,
@@ -803,7 +803,7 @@ def test_runtime_layout_maps_qwen35_full_layers_to_compact_kv_indices():
 
 def test_omnikv_observation_layers_follow_compact_qwen_kv_order(tmp_path):
     outer_config = _qwen35_outer_config(full_layers=tuple(range(3, 64, 4)))
-    with patch("sparsevllm.config.AutoConfig.from_pretrained", return_value=outer_config):
+    with patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", return_value=outer_config):
         cfg = Config(
             model=str(tmp_path),
             vllm_sparse_method="omnikv",
@@ -815,7 +815,7 @@ def test_omnikv_observation_layers_follow_compact_qwen_kv_order(tmp_path):
 
 def test_qwen35_pyramidkv_ratios_follow_compact_kv_order(tmp_path):
     outer_config = _qwen35_outer_config(full_layers=tuple(range(3, 64, 4)))
-    with patch("sparsevllm.config.AutoConfig.from_pretrained", return_value=outer_config):
+    with patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", return_value=outer_config):
         cfg = Config(
             model=str(tmp_path),
             vllm_sparse_method="pyramidkv",
@@ -836,7 +836,7 @@ def test_qwen35_pyramidkv_ratios_follow_compact_kv_order(tmp_path):
 
 def test_qwen35_pyramidkv_allocates_slots_only_for_kv_layers(tmp_path):
     outer_config = _qwen35_outer_config(num_layers=8, full_layers=(3, 7))
-    with patch("sparsevllm.config.AutoConfig.from_pretrained", return_value=outer_config):
+    with patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", return_value=outer_config):
         cfg = Config(
             model=str(tmp_path),
             vllm_sparse_method="pyramidkv",
@@ -869,7 +869,7 @@ def test_qwen35_pyramidkv_allocates_slots_only_for_kv_layers(tmp_path):
 
 def test_qwen35_snapkv_initializes_compact_kv_metadata(tmp_path):
     outer_config = _qwen35_outer_config(num_layers=8, full_layers=(3, 7))
-    with patch("sparsevllm.config.AutoConfig.from_pretrained", return_value=outer_config):
+    with patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", return_value=outer_config):
         cfg = Config(
             model=str(tmp_path),
             vllm_sparse_method="snapkv",
@@ -941,7 +941,7 @@ def test_qwen35_snapkv_initializes_compact_kv_metadata(tmp_path):
 def test_qwen35_pyramidkv_projects_legacy_transformer_layer_ratios(tmp_path):
     outer_config = _qwen35_outer_config(num_layers=8, full_layers=(3, 7))
     legacy_ratios = [1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3]
-    with patch("sparsevllm.config.AutoConfig.from_pretrained", return_value=outer_config):
+    with patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", return_value=outer_config):
         cfg = Config(
             model=str(tmp_path),
             vllm_sparse_method="pyramidkv",
@@ -1023,7 +1023,7 @@ def test_qwen35_raw_config_fallback_when_transformers_autoconfig_is_unknown(tmp_
             f,
         )
 
-    with patch("sparsevllm.config.AutoConfig.from_pretrained", side_effect=ValueError("unknown model")):
+    with patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", side_effect=ValueError("unknown model")):
         cfg = Config(model=str(tmp_path))
 
     assert cfg.outer_hf_config.model_type == "qwen3_5"

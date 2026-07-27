@@ -561,7 +561,7 @@ class PrefillPolicyConfigTest(unittest.TestCase):
     def make_config(self, **kwargs):
         with tempfile.TemporaryDirectory() as tmp:
             model_dir = Path(tmp)
-            with patch("sparsevllm.config.AutoConfig.from_pretrained", return_value=self.hf_config()):
+            with patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", return_value=self.hf_config()):
                 return Config(model=str(model_dir), **kwargs)
 
     def test_obs_layers_are_derived_from_full_attention_layers(self):
@@ -627,7 +627,7 @@ class PrefillPolicyConfigTest(unittest.TestCase):
         llama_config.model_type = "llama"
         with tempfile.TemporaryDirectory() as tmp:
             with patch(
-                "sparsevllm.config.AutoConfig.from_pretrained",
+                "sparsevllm.configs.runtime.AutoConfig.from_pretrained",
                 return_value=llama_config,
             ):
                 cfg = Config(model=str(Path(tmp)), vllm_sparse_method="h2o")
@@ -637,7 +637,7 @@ class PrefillPolicyConfigTest(unittest.TestCase):
         unknown_config.model_type = "unknown_model"
         with tempfile.TemporaryDirectory() as tmp:
             with patch(
-                "sparsevllm.config.AutoConfig.from_pretrained",
+                "sparsevllm.configs.runtime.AutoConfig.from_pretrained",
                 return_value=unknown_config,
             ):
                 with self.assertRaisesRegex(
@@ -777,7 +777,7 @@ class PrefillPolicyConfigTest(unittest.TestCase):
         self.assertEqual(cfg.kv_quant_bits, 4)
 
     def test_deltakv_sparse_decode_backend_auto_uses_custom_without_flash_attn(self):
-        with patch("sparsevllm.config._flash_attn_available", return_value=False):
+        with patch("sparsevllm.configs.delta._flash_attn_available", return_value=False):
             cfg = self.make_config(
                 vllm_sparse_method="deltakv-less-memory",
                 allow_missing_deltakv_path=True,
@@ -787,7 +787,7 @@ class PrefillPolicyConfigTest(unittest.TestCase):
         self.assertEqual(cfg.deltakv_sparse_decode_backend, "custom")
 
     def test_deltakv_sparse_decode_backend_auto_uses_fa2_when_available(self):
-        with patch("sparsevllm.config._flash_attn_available", return_value=True):
+        with patch("sparsevllm.configs.delta._flash_attn_available", return_value=True):
             cfg = self.make_config(
                 vllm_sparse_method="deltakv-less-memory",
                 allow_missing_deltakv_path=True,
@@ -797,7 +797,7 @@ class PrefillPolicyConfigTest(unittest.TestCase):
         self.assertEqual(cfg.deltakv_sparse_decode_backend, "fa2")
 
     def test_deltakv_sparse_decode_backend_explicit_custom_does_not_require_flash_attn(self):
-        with patch("sparsevllm.config._flash_attn_available", return_value=False):
+        with patch("sparsevllm.configs.delta._flash_attn_available", return_value=False):
             cfg = self.make_config(
                 vllm_sparse_method="deltakv-less-memory",
                 allow_missing_deltakv_path=True,
@@ -808,7 +808,7 @@ class PrefillPolicyConfigTest(unittest.TestCase):
         self.assertEqual(cfg.deltakv_sparse_decode_backend, "custom")
 
     def test_deltakv_sparse_decode_backend_explicit_fa2_requires_flash_attn(self):
-        with patch("sparsevllm.config._flash_attn_available", return_value=False):
+        with patch("sparsevllm.configs.delta._flash_attn_available", return_value=False):
             with self.assertRaisesRegex(ValueError, "requires the flash_attn package"):
                 self.make_config(
                     vllm_sparse_method="deltakv-less-memory",

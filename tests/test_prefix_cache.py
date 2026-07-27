@@ -91,7 +91,7 @@ def _hf_config():
 def _make_config(**kwargs):
     with tempfile.TemporaryDirectory() as tmp:
         model_dir = Path(tmp)
-        with patch("sparsevllm.config.AutoConfig.from_pretrained", return_value=_hf_config()):
+        with patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", return_value=_hf_config()):
             return Config(model=str(model_dir), **kwargs)
 
 
