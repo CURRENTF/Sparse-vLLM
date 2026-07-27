@@ -16,6 +16,12 @@ from sparsevllm.models.minimax_m2 import (
 from sparsevllm.utils.loader import load_model
 
 
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="CUDA is required for MiniMax M2 model tests.",
+)
+
+
 def _rmsnorm_reference(
     x: torch.Tensor,
     weight: torch.Tensor,

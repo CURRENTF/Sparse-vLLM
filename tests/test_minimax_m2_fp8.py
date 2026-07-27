@@ -136,6 +136,7 @@ class _StrictQuantizedModel(torch.nn.Module):
         self.validated_names = set(loaded_parameter_names)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_loader_reports_grouped_quantized_dense_parameter_as_loaded(tmp_path):
     weight = torch.randn(128, 128).clamp(-4, 4).to(torch.float8_e4m3fn)
     scale = torch.rand(1, 1, dtype=torch.float32)
