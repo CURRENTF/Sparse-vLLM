@@ -45,8 +45,8 @@ class RKVSkipKVMethodTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             model_dir = Path(tmp)
             with (
-                patch("sparsevllm.config.AutoConfig.from_pretrained", return_value=self._hf_config()),
-                patch("sparsevllm.config.log_once") as log_once,
+                patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", return_value=self._hf_config()),
+                patch("sparsevllm.configs.runtime.log_once") as log_once,
             ):
                 Config(
                     model=str(model_dir),

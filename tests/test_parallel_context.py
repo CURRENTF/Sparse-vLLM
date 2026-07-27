@@ -181,28 +181,28 @@ def test_ep_broadcast_rejects_invalid_source_rank():
 
 
 def test_qwen3_moe_parallel_config_validation(tmp_path):
-    with patch("sparsevllm.config.AutoConfig.from_pretrained", return_value=_hf_config()):
+    with patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", return_value=_hf_config()):
         config = Config(model=str(tmp_path), expert_parallel_size=4)
     assert config.world_size == 4
     assert config.weight_loading_workers_per_rank == 1
 
-    with patch("sparsevllm.config.AutoConfig.from_pretrained", return_value=_hf_config()):
+    with patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", return_value=_hf_config()):
         with pytest.raises(ValueError, match="only supports TP=1 and DP=1"):
             Config(model=str(tmp_path), tensor_parallel_size=2, expert_parallel_size=2)
 
-    with patch("sparsevllm.config.AutoConfig.from_pretrained", return_value=_hf_config(num_experts=6)):
+    with patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", return_value=_hf_config(num_experts=6)):
         with pytest.raises(ValueError, match="divisible"):
             Config(model=str(tmp_path), expert_parallel_size=4)
 
     invalid_layout = _hf_config()
     invalid_layout.decoder_sparse_step = 0
-    with patch("sparsevllm.config.AutoConfig.from_pretrained", return_value=invalid_layout):
+    with patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", return_value=invalid_layout):
         with pytest.raises(NotImplementedError, match="every decoder layer"):
             Config(model=str(tmp_path))
 
     invalid_dtype = _hf_config()
     invalid_dtype.torch_dtype = torch.float32
-    with patch("sparsevllm.config.AutoConfig.from_pretrained", return_value=invalid_dtype):
+    with patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", return_value=invalid_dtype):
         with pytest.raises(NotImplementedError, match="BF16/FP16 checkpoints"):
             Config(model=str(tmp_path))
 
@@ -225,7 +225,7 @@ def test_qwen3_moe_fp8_config_validation(tmp_path):
     }
     hf_config.quantization_config = raw_quantization_config
     with patch(
-        "sparsevllm.config.AutoConfig.from_pretrained",
+        "sparsevllm.configs.runtime.AutoConfig.from_pretrained",
         return_value=hf_config,
     ):
         config = Config(model=str(tmp_path), expert_parallel_size=2)
@@ -237,7 +237,7 @@ def test_qwen3_moe_fp8_config_validation(tmp_path):
         "modules_to_not_convert": ["lm_head"],
     }
     with patch(
-        "sparsevllm.config.AutoConfig.from_pretrained",
+        "sparsevllm.configs.runtime.AutoConfig.from_pretrained",
         return_value=hf_config,
     ):
         with pytest.raises(ValueError, match="router gate"):
@@ -259,7 +259,7 @@ def test_qwen3_dense_fp8_config_validation(tmp_path):
         "weight_block_size": [128, 128],
     }
     with patch(
-        "sparsevllm.config.AutoConfig.from_pretrained",
+        "sparsevllm.configs.runtime.AutoConfig.from_pretrained",
         return_value=hf_config,
     ):
         config = Config(model=str(tmp_path), tensor_parallel_size=8)
@@ -268,7 +268,7 @@ def test_qwen3_dense_fp8_config_validation(tmp_path):
 
     hf_config.intermediate_size = 12160
     with patch(
-        "sparsevllm.config.AutoConfig.from_pretrained",
+        "sparsevllm.configs.runtime.AutoConfig.from_pretrained",
         return_value=hf_config,
     ):
         with pytest.raises(ValueError, match="TP-local dense projection"):
@@ -285,7 +285,7 @@ def test_qwen3_dense_fp8_rejects_wrong_architecture(tmp_path):
         "weight_block_size": [128, 128],
     }
     with patch(
-        "sparsevllm.config.AutoConfig.from_pretrained",
+        "sparsevllm.configs.runtime.AutoConfig.from_pretrained",
         return_value=hf_config,
     ):
         with pytest.raises(ValueError, match="Qwen3ForCausalLM"):
@@ -293,7 +293,7 @@ def test_qwen3_dense_fp8_rejects_wrong_architecture(tmp_path):
 
 
 def test_dense_config_rejects_expert_or_data_parallelism(tmp_path):
-    with patch("sparsevllm.config.AutoConfig.from_pretrained", return_value=_hf_config("qwen3")):
+    with patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", return_value=_hf_config("qwen3")):
         with pytest.raises(ValueError, match="requires EP=1 and DP=1"):
             Config(model=str(tmp_path), expert_parallel_size=2)
 

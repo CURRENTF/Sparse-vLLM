@@ -64,7 +64,7 @@ def _make_config(tmp_path, hf_config=None, **kwargs):
     if hf_config is None:
         hf_config = _official_config()
     with patch(
-        "sparsevllm.config.AutoConfig.from_pretrained",
+        "sparsevllm.configs.runtime.AutoConfig.from_pretrained",
         return_value=hf_config,
     ):
         return Config(model=str(tmp_path), **kwargs)
