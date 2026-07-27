@@ -852,6 +852,8 @@ def test_qwen35_pyramidkv_allocates_slots_only_for_kv_layers(tmp_path):
     manager.num_kv_layers = cfg.runtime_layout.num_kv_layers
     manager.num_kv_heads = 1
     manager.head_dim = 1
+    manager.max_buffer_rows = 1
+    manager.max_model_len = 8
     manager.device = torch.device("cpu")
     manager.pyramidkv_prefill_staging_num_slots = 0
     manager.pyramidkv_prefill_staging_kv_cache = None

@@ -19,6 +19,66 @@ from .base import CacheManager, LayerBatchStates, PrefillComputeView, SparseSele
 from .raw_kv_offload import RawKVOffloadBuffer
 
 
+_INT32_BYTES = 4
+
+
+def resolve_snapkv_cache_capacity(
+    *,
+    available_bytes: int,
+    slot_bytes_per_layer: int,
+    num_kv_layers: int,
+    max_buffer_rows: int,
+    max_model_len: int,
+    layer_ratios: list[float] | None = None,
+) -> tuple[int, tuple[int, ...], int]:
+    """Size KV storage together with its persistent slot metadata."""
+    available_bytes = int(available_bytes)
+    slot_bytes_per_layer = int(slot_bytes_per_layer)
+    num_kv_layers = int(num_kv_layers)
+    row_slot_map_bytes = (
+        num_kv_layers
+        * int(max_buffer_rows)
+        * int(max_model_len)
+        * _INT32_BYTES
+    )
+    slot_pool_bytes = available_bytes - row_slot_map_bytes
+    if slot_pool_bytes <= 0:
+        raise RuntimeError(
+            "Not enough GPU memory for SnapKV row-slot metadata. "
+            f"row_slot_map_bytes={row_slot_map_bytes} "
+            f"available_bytes={available_bytes}."
+        )
+
+    persistent_bytes_per_slot = slot_bytes_per_layer + _INT32_BYTES
+    if layer_ratios is None:
+        slots_per_layer = slot_pool_bytes // (
+            num_kv_layers * persistent_bytes_per_slot
+        )
+        layer_slots = (int(slots_per_layer),) * num_kv_layers
+        base_slots = int(slots_per_layer)
+    else:
+        ratios = tuple(float(ratio) for ratio in layer_ratios)
+        if len(ratios) != num_kv_layers or any(ratio <= 0 for ratio in ratios):
+            raise ValueError(
+                "PyramidKV layer ratios must contain one positive value per KV layer: "
+                f"ratios={ratios}, num_kv_layers={num_kv_layers}."
+            )
+        base_slots = int(
+            slot_pool_bytes
+            // (persistent_bytes_per_slot * sum(ratios))
+        )
+        layer_slots = tuple(int(base_slots * ratio) for ratio in ratios)
+
+    if base_slots <= 0 or any(num_slots <= 0 for num_slots in layer_slots):
+        raise RuntimeError(
+            "Not enough GPU memory for SnapKV KV slots and free-slot metadata. "
+            f"slot_pool_bytes={slot_pool_bytes} "
+            f"persistent_bytes_per_slot={persistent_bytes_per_slot} "
+            f"num_kv_layers={num_kv_layers}."
+        )
+    return base_slots, layer_slots, row_slot_map_bytes
+
+
 class SnapKVCacheManager(CacheManager):
     def __init__(self, config: Config, parallel_context: ParallelContext):
         super().__init__(config, parallel_context)
@@ -45,7 +105,6 @@ class SnapKVCacheManager(CacheManager):
 
         self.layer_num_slots = []
         self.free_slots_stack_tensor = None
-        self._free_slots_layer_indices = None
         self.free_slots_stack = []
         self._num_free_slots = []
         self.buffer_req_to_token_slots = []
@@ -71,11 +130,6 @@ class SnapKVCacheManager(CacheManager):
                 dtype=torch.int32,
                 device=self.device,
             ).expand(self.num_kv_layers, -1).clone()
-            self._free_slots_layer_indices = torch.arange(
-                self.num_kv_layers,
-                dtype=torch.long,
-                device=self.device,
-            )
 
         for layer_id in range(self.num_layers):
             if not self.is_full_attention_layer(layer_id):
@@ -204,6 +258,7 @@ class SnapKVCacheManager(CacheManager):
         num_layers = self.num_kv_layers
 
         if config.pyramid_layer_ratios is not None:
+            staging_bytes = 0
             if self._pyramidkv_can_use_full_prefill_staging():
                 self.pyramidkv_prefill_staging_num_slots = max(
                     int(config.max_model_len),
@@ -217,6 +272,26 @@ class SnapKVCacheManager(CacheManager):
                         f"staging_slots={self.pyramidkv_prefill_staging_num_slots} "
                         f"required={staging_bytes / 1024**3:.2f}GiB."
                     )
+            # PyramidKV: 根据比例分配每层不同大小的 cache
+            kv_layer_ids = list(self.runtime_layout.kv_idx_to_layer_idx)
+            base_slots, resolved_layer_slots, row_slot_map_bytes = (
+                resolve_snapkv_cache_capacity(
+                    available_bytes=available_memory,
+                    slot_bytes_per_layer=slot_bytes_per_layer,
+                    num_kv_layers=num_layers,
+                    max_buffer_rows=self.max_buffer_rows,
+                    max_model_len=self.max_model_len,
+                    layer_ratios=config.pyramid_layer_ratios,
+                )
+            )
+            kv_layer_slots = list(resolved_layer_slots)
+            assert kv_layer_slots[0] == max(kv_layer_slots), (
+                "The first KV layer must have the largest PyramidKV allocation, but "
+                f"first={kv_layer_slots[0]}, max={max(kv_layer_slots)}."
+            )
+            layer_slots = [0] * self.num_layers
+
+            if staging_bytes:
                 self.pyramidkv_prefill_staging_kv_cache = torch.empty(
                     2,
                     self.pyramidkv_prefill_staging_num_slots,
@@ -225,19 +300,6 @@ class SnapKVCacheManager(CacheManager):
                     dtype=self.hf_config.torch_dtype,
                     device=self.device,
                 )
-
-            # PyramidKV: 根据比例分配每层不同大小的 cache
-            kv_layer_ids = list(self.runtime_layout.kv_idx_to_layer_idx)
-            total_ratio = sum(float(ratio) for ratio in config.pyramid_layer_ratios)
-            base_slots = int(available_memory // (slot_bytes_per_layer * total_ratio))
-            assert base_slots > 0, "可用显存不足以分配 KV Cache"
-
-            kv_layer_slots = [int(base_slots * ratio) for ratio in config.pyramid_layer_ratios]
-            assert kv_layer_slots[0] == max(kv_layer_slots), (
-                "The first KV layer must have the largest PyramidKV allocation, but "
-                f"first={kv_layer_slots[0]}, max={max(kv_layer_slots)}."
-            )
-            layer_slots = [0] * self.num_layers
 
             self.kv_cache = []
             for kv_idx, layer_idx in enumerate(kv_layer_ids):
@@ -257,16 +319,24 @@ class SnapKVCacheManager(CacheManager):
             logger.info(
                 f"PyramidKV: KV layer slots = {list(zip(kv_layer_ids, kv_layer_slots))}, "
                 f"base_slots = {base_slots}, "
-                f"prefill_staging_slots={self.pyramidkv_prefill_staging_num_slots}"
+                f"prefill_staging_slots={self.pyramidkv_prefill_staging_num_slots}, "
+                f"row_slot_map_bytes={row_slot_map_bytes}"
             )
         else:
             # 标准模式：所有层使用相同大小
-            slot_bytes = num_layers * slot_bytes_per_layer
-            config.num_kvcache_slots = available_memory // slot_bytes
-            assert config.num_kvcache_slots > 0, "可用显存不足以分配 KV Cache"
+            num_slots, _, row_slot_map_bytes = resolve_snapkv_cache_capacity(
+                available_bytes=available_memory,
+                slot_bytes_per_layer=slot_bytes_per_layer,
+                num_kv_layers=num_layers,
+                max_buffer_rows=self.max_buffer_rows,
+                max_model_len=self.max_model_len,
+            )
+            config.num_kvcache_slots = num_slots
 
             logger.info(
-                f"Standard Mode (SnapKV): Each layer can accommodate {config.num_kvcache_slots} tokens."
+                "Standard Mode (SnapKV): Each layer can accommodate "
+                f"{config.num_kvcache_slots} tokens, "
+                f"row_slot_map_bytes={row_slot_map_bytes}."
             )
             self.kv_cache = torch.empty(
                 2,

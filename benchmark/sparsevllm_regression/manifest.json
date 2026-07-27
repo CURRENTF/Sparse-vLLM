@@ -79,8 +79,8 @@
       "sparse_method": "h2o",
       "requires_compressor": false,
       "hf_logits_reference": false,
-      "supported_model_families": ["qwen2"],
-      "supported_tensor_parallel_sizes": [1],
+      "supported_model_families": ["qwen2", "qwen3", "qwen3_moe", "qwen3_5", "llama", "minimax_m2"],
+      "supported_tensor_parallel_sizes": [1, 2],
       "config": {
         "sparse_method": "h2o",
         "engine_prefill_chunk_size": 4096,

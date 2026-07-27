@@ -9,7 +9,10 @@ from typing import Any
 import torch
 from transformers import AutoConfig
 
-from sparsevllm.method_registry import validate_model_runtime_compatibility
+from sparsevllm.method_registry import (
+    H2O_SUPPORTED_MODEL_TYPES,
+    validate_model_runtime_compatibility,
+)
 from sparsevllm.utils.log import logger, log_once
 
 try:
@@ -700,16 +703,13 @@ def load_and_validate_model(config) -> bool:
     is_qwen3_moe = model_type == "qwen3_moe"
 
     if config.vllm_sparse_method == "h2o":
-        if model_type != "qwen2":
-            raise NotImplementedError(
-                "H2O v1 is validated for Qwen2-family models only, "
-                f"got model_type={model_type!r}."
+        if model_type not in H2O_SUPPORTED_MODEL_TYPES:
+            supported = ", ".join(
+                repr(value) for value in sorted(H2O_SUPPORTED_MODEL_TYPES)
             )
-        if config.tensor_parallel_size != 1:
             raise NotImplementedError(
-                "H2O v1 requires TP=1 because token scores and eviction "
-                "indices are not aggregated across tensor-parallel ranks, "
-                f"got TP={config.tensor_parallel_size}."
+                "H2O v1 supports the model types already implemented by Sparse-vLLM: "
+                f"{supported}; got model_type={model_type!r}."
             )
 
     if config.tiny_random:
