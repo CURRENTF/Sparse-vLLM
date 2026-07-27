@@ -3,7 +3,12 @@
 import importlib.util
 from typing import Any
 
-from sparsevllm.configs.common import _normalize_float_attr, _normalize_int_attr
+from sparsevllm.configs.common import (
+    _normalize_float_attr,
+    _normalize_int_attr,
+    _normalize_positive_int,
+    _normalize_positive_multiple,
+)
 from sparsevllm.configs.model import (
     _is_qwen35_deltakv_checkpoint,
     _qwen35_deltakv_message,
@@ -80,12 +85,7 @@ def _normalize_deltakv_quantization(config) -> None:
 
 
 def _normalize_full_layer_kivi(config) -> None:
-    _normalize_int_attr(config, "full_layer_kivi_group_size", fallback=32)
-    if config.full_layer_kivi_group_size <= 0:
-        raise ValueError(
-            "full_layer_kivi_group_size must be > 0, "
-            f"got {config.full_layer_kivi_group_size}."
-        )
+    _normalize_positive_int(config, "full_layer_kivi_group_size", fallback=32)
     config.full_layer_kivi_residual_length = int(
         config.full_layer_kivi_residual_length or config.full_layer_kivi_group_size
     )
@@ -94,30 +94,19 @@ def _normalize_full_layer_kivi(config) -> None:
             "full_layer_kivi_residual_length must be > 0, "
             f"got {config.full_layer_kivi_residual_length}."
         )
-    _normalize_int_attr(config, "full_layer_kivi_decode_block_seq", fallback=256)
-    if config.full_layer_kivi_decode_block_seq <= 0 or config.full_layer_kivi_decode_block_seq % 16 != 0:
-        raise ValueError(
-            "full_layer_kivi_decode_block_seq must be a positive multiple of 16, "
-            f"got {config.full_layer_kivi_decode_block_seq}."
-        )
-    _normalize_int_attr(config, "full_layer_kivi_decode_block_n", fallback=16)
-    if config.full_layer_kivi_decode_block_n <= 0 or config.full_layer_kivi_decode_block_n % 16 != 0:
-        raise ValueError(
-            "full_layer_kivi_decode_block_n must be a positive multiple of 16, "
-            f"got {config.full_layer_kivi_decode_block_n}."
-        )
+    _normalize_positive_multiple(
+        config, "full_layer_kivi_decode_block_seq", multiple=16, fallback=256
+    )
+    _normalize_positive_multiple(
+        config, "full_layer_kivi_decode_block_n", multiple=16, fallback=16
+    )
     _normalize_int_attr(config, "full_layer_kivi_decode_num_warps", fallback=2)
     if config.full_layer_kivi_decode_num_warps not in {1, 2, 4, 8}:
         raise ValueError(
             "full_layer_kivi_decode_num_warps must be one of 1, 2, 4, or 8, "
             f"got {config.full_layer_kivi_decode_num_warps}."
         )
-    _normalize_int_attr(config, "full_layer_kivi_decode_num_stages", fallback=3)
-    if config.full_layer_kivi_decode_num_stages <= 0:
-        raise ValueError(
-            "full_layer_kivi_decode_num_stages must be > 0, "
-            f"got {config.full_layer_kivi_decode_num_stages}."
-        )
+    _normalize_positive_int(config, "full_layer_kivi_decode_num_stages", fallback=3)
     config.enable_full_layer_kivi_fused_decode = bool(config.enable_full_layer_kivi_fused_decode)
     config.enable_full_layer_kivi_grouped_decode = bool(config.enable_full_layer_kivi_grouped_decode)
     config.enable_full_layer_kivi_dense_decode = bool(config.enable_full_layer_kivi_dense_decode)
@@ -199,17 +188,12 @@ def validate_deltakv_runtime(config, *, is_qwen35: bool) -> None:
             )
         if config.kv_quant_bits == 4 and config.kv_quant_group_size == 0:
             config.kv_quant_group_size = 32
-        config.deltakv_triton_materialize_block_tokens = int(
-            config.deltakv_triton_materialize_block_tokens or 16
+        _normalize_positive_multiple(
+            config,
+            "deltakv_triton_materialize_block_tokens",
+            multiple=8,
+            fallback=16,
         )
-        if (
-            config.deltakv_triton_materialize_block_tokens <= 0
-            or config.deltakv_triton_materialize_block_tokens % 8 != 0
-        ):
-            raise ValueError(
-                "deltakv_triton_materialize_block_tokens must be a positive multiple of 8, "
-                f"got {config.deltakv_triton_materialize_block_tokens}."
-            )
         config.deltakv_sparse_decode_backend = _resolve_deltakv_sparse_decode_backend(
             config.deltakv_sparse_decode_backend
         )

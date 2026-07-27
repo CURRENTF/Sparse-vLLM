@@ -1,6 +1,10 @@
 """Sparse-method normalization and layout-dependent validation."""
 
-from sparsevllm.configs.common import _normalize_float_attr, _normalize_int_attr
+from sparsevllm.configs.common import (
+    _normalize_float_attr,
+    _normalize_int_attr,
+    _normalize_positive_int,
+)
 from sparsevllm.configs.delta import SUPPORTED_SKIPKV_MODEL_NAMES
 from sparsevllm.method_registry import SUPPORTED_SPARSE_METHODS, normalize_sparse_method
 from sparsevllm.utils.log import logger, log_once
@@ -52,11 +56,7 @@ def _normalize_quest(config) -> None:
         raise ValueError("quest_skip_layers 不能 < 0")
 
 def _normalize_h2o(config) -> None:
-    _normalize_int_attr(config, "h2o_decode_budget", fallback=0)
-    if config.h2o_decode_budget <= 0:
-        raise ValueError(
-            f"h2o_decode_budget must be > 0, got {config.h2o_decode_budget}."
-        )
+    _normalize_positive_int(config, "h2o_decode_budget", fallback=0)
     _normalize_int_attr(config, "h2o_prefill_budget", fallback=0)
     if config.h2o_prefill_budget < config.h2o_decode_budget:
         raise ValueError(
@@ -76,16 +76,8 @@ def _normalize_h2o(config) -> None:
         )
 
 def _normalize_rkv(config) -> None:
-    _normalize_int_attr(config, "rkv_compression_interval", fallback=0)
-    if config.rkv_compression_interval <= 0:
-        raise ValueError(
-            f"rkv_compression_interval must be > 0, got {config.rkv_compression_interval}."
-        )
-    _normalize_int_attr(config, "rkv_observation_tokens", fallback=0)
-    if config.rkv_observation_tokens <= 0:
-        raise ValueError(
-            f"rkv_observation_tokens must be > 0, got {config.rkv_observation_tokens}."
-        )
+    _normalize_positive_int(config, "rkv_compression_interval", fallback=0)
+    _normalize_positive_int(config, "rkv_observation_tokens", fallback=0)
     if config.rkv_observation_tokens > 128:
         raise ValueError(
             "rkv_observation_tokens must be <= 128 because the prefill score kernel "
@@ -111,11 +103,7 @@ def _normalize_rkv(config) -> None:
         raise ValueError(
             f"rkv_recent_similar_keep must be >= 0, got {config.rkv_recent_similar_keep}."
         )
-    _normalize_int_attr(config, "rkv_max_redundancy_tokens", fallback=0)
-    if config.rkv_max_redundancy_tokens <= 0:
-        raise ValueError(
-            f"rkv_max_redundancy_tokens must be > 0, got {config.rkv_max_redundancy_tokens}."
-        )
+    _normalize_positive_int(config, "rkv_max_redundancy_tokens", fallback=0)
     _normalize_int_attr(config, "rkv_redundancy_window", fallback=0)
     if config.rkv_redundancy_window < 0:
         raise ValueError(
@@ -137,12 +125,7 @@ def _normalize_rkv(config) -> None:
         )
 
 def _normalize_skipkv(config) -> None:
-    _normalize_int_attr(config, "skipkv_compression_interval", fallback=0)
-    if config.skipkv_compression_interval <= 0:
-        raise ValueError(
-            "skipkv_compression_interval must be > 0, "
-            f"got {config.skipkv_compression_interval}."
-        )
+    _normalize_positive_int(config, "skipkv_compression_interval", fallback=0)
     _normalize_float_attr(config, "skipkv_alpha")
     if config.skipkv_alpha < 0.0:
         raise ValueError(f"skipkv_alpha must be >= 0, got {config.skipkv_alpha}.")
@@ -152,21 +135,9 @@ def _normalize_skipkv(config) -> None:
             "skipkv_similarity_threshold must be in [0, 1], "
             f"got {config.skipkv_similarity_threshold}."
         )
-    _normalize_int_attr(config, "skipkv_segment_size", fallback=0)
-    if config.skipkv_segment_size <= 0:
-        raise ValueError(f"skipkv_segment_size must be > 0, got {config.skipkv_segment_size}.")
-    _normalize_int_attr(config, "skipkv_max_redundancy_tokens", fallback=0)
-    if config.skipkv_max_redundancy_tokens <= 0:
-        raise ValueError(
-            "skipkv_max_redundancy_tokens must be > 0, "
-            f"got {config.skipkv_max_redundancy_tokens}."
-        )
-    _normalize_int_attr(config, "skipkv_redundancy_window", fallback=0)
-    if config.skipkv_redundancy_window <= 0:
-        raise ValueError(
-            "skipkv_redundancy_window must be > 0, "
-            f"got {config.skipkv_redundancy_window}."
-        )
+    _normalize_positive_int(config, "skipkv_segment_size", fallback=0)
+    _normalize_positive_int(config, "skipkv_max_redundancy_tokens", fallback=0)
+    _normalize_positive_int(config, "skipkv_redundancy_window", fallback=0)
     if config.skipkv_redundancy_window > config.skipkv_max_redundancy_tokens:
         raise ValueError(
             "skipkv_redundancy_window must be <= skipkv_max_redundancy_tokens, "
@@ -179,12 +150,7 @@ def _normalize_skipkv(config) -> None:
             "skipkv_sentence_score_weight must be >= 0, "
             f"got {config.skipkv_sentence_score_weight}."
         )
-    _normalize_int_attr(config, "skipkv_sentence_min_tokens", fallback=0)
-    if config.skipkv_sentence_min_tokens <= 0:
-        raise ValueError(
-            "skipkv_sentence_min_tokens must be > 0, "
-            f"got {config.skipkv_sentence_min_tokens}."
-        )
+    _normalize_positive_int(config, "skipkv_sentence_min_tokens", fallback=0)
     _normalize_int_attr(config, "skipkv_sentence_max_tokens", fallback=0)
     if config.skipkv_sentence_max_tokens < config.skipkv_sentence_min_tokens:
         raise ValueError(
@@ -192,12 +158,7 @@ def _normalize_skipkv(config) -> None:
             f"got max={config.skipkv_sentence_max_tokens} min={config.skipkv_sentence_min_tokens}."
         )
     _normalize_int_attr(config, "skipkv_sentence_embedding_layer")
-    _normalize_int_attr(config, "skipkv_max_tracked_sentences", fallback=0)
-    if config.skipkv_max_tracked_sentences <= 0:
-        raise ValueError(
-            "skipkv_max_tracked_sentences must be > 0, "
-            f"got {config.skipkv_max_tracked_sentences}."
-        )
+    _normalize_positive_int(config, "skipkv_max_tracked_sentences", fallback=0)
     config.skipkv_enable_activation_steering = bool(config.skipkv_enable_activation_steering)
     _normalize_int_attr(config, "skipkv_steering_layer")
     _normalize_float_attr(config, "skipkv_steering_alpha")

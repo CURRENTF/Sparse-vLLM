@@ -544,114 +544,6 @@ def _is_qwen35_deltakv_checkpoint(path: str | None) -> bool:
 
 
 
-def _load_model_metadata(config) -> tuple[bool, str, bool, bool, bool]:
-    if isinstance(config.deltakv_path, str):
-        deltakv_path = config.deltakv_path.strip()
-        config.deltakv_path = None if deltakv_path.lower() in {"", "none", "null"} else deltakv_path
-    if config.tiny_random and config.vllm_sparse_method == "deltakv":
-        raise NotImplementedError(
-            "Tiny random mode does not support DeltaKV compressor weights yet."
-        )
-    try:
-        config.outer_hf_config = AutoConfig.from_pretrained(config.model, trust_remote_code=True)
-    except Exception as e:
-        config.outer_hf_config = _load_raw_qwen35_config(config.model, e)
-    is_qwen35 = _is_qwen35_outer_config(config.outer_hf_config)
-    config.hf_config = _extract_text_config(config.outer_hf_config)
-    if is_qwen35:
-        setattr(config.hf_config, "model_type", "qwen3_5")
-    model_type = str(getattr(config.hf_config, "model_type", "") or "")
-    is_minimax_m2 = model_type == "minimax_m2"
-    is_qwen3 = model_type == "qwen3"
-    is_qwen3_moe = model_type == "qwen3_moe"
-    return is_qwen35, model_type, is_minimax_m2, is_qwen3, is_qwen3_moe
-
-
-def _validate_h2o_model(config, *, model_type: str) -> None:
-    if config.vllm_sparse_method == "h2o":
-        if model_type != "qwen2":
-            raise NotImplementedError(
-                "H2O v1 is validated for Qwen2-family models only, "
-                f"got model_type={model_type!r}."
-            )
-        if config.tensor_parallel_size != 1:
-            raise NotImplementedError(
-                "H2O v1 requires TP=1 because token scores and eviction "
-                "indices are not aggregated across tensor-parallel ranks, "
-                f"got TP={config.tensor_parallel_size}."
-            )
-
-
-def _apply_tiny_random_overrides(config, *, is_qwen35: bool) -> None:
-    if config.tiny_random:
-        from sparsevllm.debug.tiny_random import apply_tiny_random_overrides
-
-        if is_qwen35:
-            raise NotImplementedError("Tiny random mode does not support qwen3_5 yet.")
-        config.tiny_random_overrides = apply_tiny_random_overrides(
-            config.hf_config,
-            config.tiny_random_config,
-        )
-        log_once(
-            "TINY RANDOM MODE is enabled: checkpoint weights will not be read and "
-            f"model-quality results are invalid. config={config.tiny_random_config} "
-            f"seed={config.tiny_random_seed} overrides={config.tiny_random_overrides}",
-            level="WARNING",
-        )
-
-
-def _normalize_model_quantization(
-    config,
-    *,
-    is_qwen35: bool,
-    is_minimax_m2: bool,
-    is_qwen3: bool,
-    is_qwen3_moe: bool,
-) -> None:
-    raw_quantization_config = _config_get(
-        config.hf_config,
-        "quantization_config",
-        _config_get(config.outer_hf_config, "quantization_config", None),
-    )
-    quantized_model_name = "qwen3_5"
-    if is_minimax_m2:
-        quantized_model_name = "MiniMax M2.7"
-    elif is_qwen3:
-        quantized_model_name = "Qwen3"
-    elif is_qwen3_moe:
-        quantized_model_name = "Qwen3MoE"
-    config.quantization_config = QuantizationConfig.from_hf_config(
-        raw_quantization_config,
-        required_fp8=is_qwen35 or is_minimax_m2,
-        model_name=quantized_model_name,
-    )
-    if config.tiny_random and config.quantization_config.enabled:
-        raise NotImplementedError("Tiny random mode does not support quantized model weights.")
-    setattr(config.hf_config, "quantization_config", config.quantization_config)
-    if is_minimax_m2:
-        _validate_minimax_m2_checkpoint_config(
-            config.hf_config,
-            raw_quantization_config,
-        )
-    if is_qwen3 and config.quantization_config.enabled:
-        _validate_qwen3_fp8_checkpoint_config(
-            config.hf_config,
-            tensor_parallel_size=config.tensor_parallel_size,
-        )
-    if is_qwen3_moe and config.quantization_config.enabled:
-        _validate_qwen3_moe_fp8_checkpoint_config(
-            config.hf_config,
-            raw_quantization_config,
-        )
-
-
-def _validate_supported_model_type(config) -> None:
-    if getattr(config.hf_config, "model_type", "") in {"deepseek_v2", "deepseek_v32"}:
-        raise NotImplementedError(
-            f"Unsupported Sparse-vLLM model_type={config.hf_config.model_type!r}. "
-            "Supported model types: qwen2, qwen3, qwen3_5, llama."
-        )
-
 
 def _validate_runtime_compatibility(config, *, model_type: str) -> None:
     validate_model_runtime_compatibility(
@@ -787,23 +679,97 @@ def _finalize_model_config(config, *, is_qwen35: bool) -> None:
 
 
 def load_and_validate_model(config) -> bool:
-    (
-        is_qwen35,
-        model_type,
-        is_minimax_m2,
-        is_qwen3,
-        is_qwen3_moe,
-    ) = _load_model_metadata(config)
-    _validate_h2o_model(config, model_type=model_type)
-    _apply_tiny_random_overrides(config, is_qwen35=is_qwen35)
-    _normalize_model_quantization(
-        config,
-        is_qwen35=is_qwen35,
-        is_minimax_m2=is_minimax_m2,
-        is_qwen3=is_qwen3,
-        is_qwen3_moe=is_qwen3_moe,
+    if isinstance(config.deltakv_path, str):
+        deltakv_path = config.deltakv_path.strip()
+        config.deltakv_path = None if deltakv_path.lower() in {"", "none", "null"} else deltakv_path
+    if config.tiny_random and config.vllm_sparse_method == "deltakv":
+        raise NotImplementedError(
+            "Tiny random mode does not support DeltaKV compressor weights yet."
+        )
+    try:
+        config.outer_hf_config = AutoConfig.from_pretrained(config.model, trust_remote_code=True)
+    except Exception as e:
+        config.outer_hf_config = _load_raw_qwen35_config(config.model, e)
+    is_qwen35 = _is_qwen35_outer_config(config.outer_hf_config)
+    config.hf_config = _extract_text_config(config.outer_hf_config)
+    if is_qwen35:
+        setattr(config.hf_config, "model_type", "qwen3_5")
+    model_type = str(getattr(config.hf_config, "model_type", "") or "")
+    is_minimax_m2 = model_type == "minimax_m2"
+    is_qwen3 = model_type == "qwen3"
+    is_qwen3_moe = model_type == "qwen3_moe"
+
+    if config.vllm_sparse_method == "h2o":
+        if model_type != "qwen2":
+            raise NotImplementedError(
+                "H2O v1 is validated for Qwen2-family models only, "
+                f"got model_type={model_type!r}."
+            )
+        if config.tensor_parallel_size != 1:
+            raise NotImplementedError(
+                "H2O v1 requires TP=1 because token scores and eviction "
+                "indices are not aggregated across tensor-parallel ranks, "
+                f"got TP={config.tensor_parallel_size}."
+            )
+
+    if config.tiny_random:
+        from sparsevllm.debug.tiny_random import apply_tiny_random_overrides
+
+        if is_qwen35:
+            raise NotImplementedError("Tiny random mode does not support qwen3_5 yet.")
+        config.tiny_random_overrides = apply_tiny_random_overrides(
+            config.hf_config,
+            config.tiny_random_config,
+        )
+        log_once(
+            "TINY RANDOM MODE is enabled: checkpoint weights will not be read and "
+            f"model-quality results are invalid. config={config.tiny_random_config} "
+            f"seed={config.tiny_random_seed} overrides={config.tiny_random_overrides}",
+            level="WARNING",
+        )
+
+    raw_quantization_config = _config_get(
+        config.hf_config,
+        "quantization_config",
+        _config_get(config.outer_hf_config, "quantization_config", None),
     )
-    _validate_supported_model_type(config)
+    quantized_model_name = "qwen3_5"
+    if is_minimax_m2:
+        quantized_model_name = "MiniMax M2.7"
+    elif is_qwen3:
+        quantized_model_name = "Qwen3"
+    elif is_qwen3_moe:
+        quantized_model_name = "Qwen3MoE"
+    config.quantization_config = QuantizationConfig.from_hf_config(
+        raw_quantization_config,
+        required_fp8=is_qwen35 or is_minimax_m2,
+        model_name=quantized_model_name,
+    )
+    if config.tiny_random and config.quantization_config.enabled:
+        raise NotImplementedError("Tiny random mode does not support quantized model weights.")
+    setattr(config.hf_config, "quantization_config", config.quantization_config)
+    if is_minimax_m2:
+        _validate_minimax_m2_checkpoint_config(
+            config.hf_config,
+            raw_quantization_config,
+        )
+    if is_qwen3 and config.quantization_config.enabled:
+        _validate_qwen3_fp8_checkpoint_config(
+            config.hf_config,
+            tensor_parallel_size=config.tensor_parallel_size,
+        )
+    if is_qwen3_moe and config.quantization_config.enabled:
+        _validate_qwen3_moe_fp8_checkpoint_config(
+            config.hf_config,
+            raw_quantization_config,
+        )
+
+    if getattr(config.hf_config, "model_type", "") in {"deepseek_v2", "deepseek_v32"}:
+        raise NotImplementedError(
+            f"Unsupported Sparse-vLLM model_type={config.hf_config.model_type!r}. "
+            "Supported model types: qwen2, qwen3, qwen3_5, llama."
+        )
+
     if model_type == "qwen3_moe":
         _validate_qwen3_moe_runtime(config, model_type=model_type)
     elif model_type == "minimax_m2":

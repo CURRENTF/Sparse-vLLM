@@ -30,6 +30,33 @@ def _normalize_float_attr(
     return normalized
 
 
+def _normalize_positive_int(
+    config: Any,
+    name: str,
+    *,
+    fallback: Any = _MISSING,
+) -> int:
+    value = _normalize_int_attr(config, name, fallback=fallback)
+    if value <= 0:
+        raise ValueError(f"{name} must be > 0, got {value}.")
+    return value
+
+
+def _normalize_positive_multiple(
+    config: Any,
+    name: str,
+    *,
+    multiple: int,
+    fallback: Any = _MISSING,
+) -> int:
+    value = _normalize_int_attr(config, name, fallback=fallback)
+    if value <= 0 or value % multiple != 0:
+        raise ValueError(
+            f"{name} must be a positive multiple of {multiple}, got {value}."
+        )
+    return value
+
+
 def _coerce_bool_config(name: str, value: Any) -> bool:
     if isinstance(value, bool):
         return value
