@@ -3,6 +3,33 @@
 import os
 from typing import Any
 
+
+_MISSING = object()
+
+
+def _normalize_int_attr(config: Any, name: str, *, fallback: Any = _MISSING) -> int:
+    value = getattr(config, name)
+    if fallback is not _MISSING:
+        value = value or fallback
+    normalized = int(value)
+    setattr(config, name, normalized)
+    return normalized
+
+
+def _normalize_float_attr(
+    config: Any,
+    name: str,
+    *,
+    fallback: Any = _MISSING,
+) -> float:
+    value = getattr(config, name)
+    if fallback is not _MISSING:
+        value = value or fallback
+    normalized = float(value)
+    setattr(config, name, normalized)
+    return normalized
+
+
 def _coerce_bool_config(name: str, value: Any) -> bool:
     if isinstance(value, bool):
         return value
@@ -50,7 +77,6 @@ def _resolve_long_prefill_offload_threshold(configured: Any) -> int:
     if resolved is None:
         raise ValueError("long_prefill_offload_threshold must be a positive integer.")
     return int(resolved)
-
 
 
 def _model_path_basename(model_path: str) -> str:

@@ -543,7 +543,8 @@ def _is_qwen35_deltakv_checkpoint(path: str | None) -> bool:
     return any(str(value).strip().lower() in {"qwen3_5", "qwen3_6"} for value in candidates if value)
 
 
-def load_and_validate_model(config) -> bool:
+
+def _load_model_metadata(config) -> tuple[bool, str, bool, bool, bool]:
     if isinstance(config.deltakv_path, str):
         deltakv_path = config.deltakv_path.strip()
         config.deltakv_path = None if deltakv_path.lower() in {"", "none", "null"} else deltakv_path
@@ -563,6 +564,10 @@ def load_and_validate_model(config) -> bool:
     is_minimax_m2 = model_type == "minimax_m2"
     is_qwen3 = model_type == "qwen3"
     is_qwen3_moe = model_type == "qwen3_moe"
+    return is_qwen35, model_type, is_minimax_m2, is_qwen3, is_qwen3_moe
+
+
+def _validate_h2o_model(config, *, model_type: str) -> None:
     if config.vllm_sparse_method == "h2o":
         if model_type != "qwen2":
             raise NotImplementedError(
@@ -575,6 +580,9 @@ def load_and_validate_model(config) -> bool:
                 "indices are not aggregated across tensor-parallel ranks, "
                 f"got TP={config.tensor_parallel_size}."
             )
+
+
+def _apply_tiny_random_overrides(config, *, is_qwen35: bool) -> None:
     if config.tiny_random:
         from sparsevllm.debug.tiny_random import apply_tiny_random_overrides
 
@@ -590,6 +598,16 @@ def load_and_validate_model(config) -> bool:
             f"seed={config.tiny_random_seed} overrides={config.tiny_random_overrides}",
             level="WARNING",
         )
+
+
+def _normalize_model_quantization(
+    config,
+    *,
+    is_qwen35: bool,
+    is_minimax_m2: bool,
+    is_qwen3: bool,
+    is_qwen3_moe: bool,
+) -> None:
     raw_quantization_config = _config_get(
         config.hf_config,
         "quantization_config",
@@ -625,109 +643,117 @@ def load_and_validate_model(config) -> bool:
             config.hf_config,
             raw_quantization_config,
         )
+
+
+def _validate_supported_model_type(config) -> None:
     if getattr(config.hf_config, "model_type", "") in {"deepseek_v2", "deepseek_v32"}:
         raise NotImplementedError(
             f"Unsupported Sparse-vLLM model_type={config.hf_config.model_type!r}. "
             "Supported model types: qwen2, qwen3, qwen3_5, llama."
         )
-    if model_type == "qwen3_moe":
-        if config.tensor_parallel_size != 1 or config.data_parallel_size != 1:
-            raise ValueError(
-                "Qwen3MoE v1 only supports TP=1 and DP=1, got "
-                f"TP={config.tensor_parallel_size}, EP={config.expert_parallel_size}, "
-                f"DP={config.data_parallel_size}."
-            )
-        num_experts = int(getattr(config.hf_config, "num_experts", 0) or 0)
-        if num_experts <= 0:
-            raise ValueError(f"Qwen3MoE requires a positive num_experts, got {num_experts}.")
-        if config.expert_parallel_size > num_experts:
-            raise ValueError(
-                "expert_parallel_size must not exceed num_experts, "
-                f"got EP={config.expert_parallel_size}, num_experts={num_experts}."
-            )
-        if num_experts % config.expert_parallel_size != 0:
-            raise ValueError(
-                "Qwen3MoE requires num_experts divisible by expert_parallel_size, "
-                f"got num_experts={num_experts}, EP={config.expert_parallel_size}."
-            )
-        top_k = int(getattr(config.hf_config, "num_experts_per_tok", 0) or 0)
-        if not 1 <= top_k <= num_experts:
-            raise ValueError(
-                "Qwen3MoE num_experts_per_tok must be in [1, num_experts], "
-                f"got top_k={top_k}, num_experts={num_experts}."
-            )
-        decoder_sparse_step = int(
-            getattr(config.hf_config, "decoder_sparse_step", 1)
+
+
+def _validate_runtime_compatibility(config, *, model_type: str) -> None:
+    validate_model_runtime_compatibility(
+        model_type=model_type,
+        sparse_method=config.vllm_sparse_method,
+        tensor_parallel_size=config.tensor_parallel_size,
+        expert_parallel_size=config.expert_parallel_size,
+        data_parallel_size=config.data_parallel_size,
+        enforce_eager=config.enforce_eager,
+        decode_cuda_graph=config.decode_cuda_graph,
+        enable_prefix_caching=config.enable_prefix_caching,
+    )
+
+
+def _validate_qwen3_moe_runtime(config, *, model_type: str) -> None:
+    if config.tensor_parallel_size != 1 or config.data_parallel_size != 1:
+        raise ValueError(
+            "Qwen3MoE v1 only supports TP=1 and DP=1, got "
+            f"TP={config.tensor_parallel_size}, EP={config.expert_parallel_size}, "
+            f"DP={config.data_parallel_size}."
         )
-        mlp_only_layers = tuple(
-            int(layer_idx)
-            for layer_idx in (getattr(config.hf_config, "mlp_only_layers", ()) or ())
+    num_experts = int(getattr(config.hf_config, "num_experts", 0) or 0)
+    if num_experts <= 0:
+        raise ValueError(f"Qwen3MoE requires a positive num_experts, got {num_experts}.")
+    if config.expert_parallel_size > num_experts:
+        raise ValueError(
+            "expert_parallel_size must not exceed num_experts, "
+            f"got EP={config.expert_parallel_size}, num_experts={num_experts}."
         )
-        if decoder_sparse_step != 1 or mlp_only_layers:
-            raise NotImplementedError(
-                "Qwen3MoE v1 requires every decoder layer to be MoE, got "
-                f"decoder_sparse_step={decoder_sparse_step}, "
-                f"mlp_only_layers={list(mlp_only_layers)}."
-            )
-        shared_intermediate_size = int(
-            getattr(config.hf_config, "shared_expert_intermediate_size", 0) or 0
+    if num_experts % config.expert_parallel_size != 0:
+        raise ValueError(
+            "Qwen3MoE requires num_experts divisible by expert_parallel_size, "
+            f"got num_experts={num_experts}, EP={config.expert_parallel_size}."
         )
-        if shared_intermediate_size != 0:
-            raise NotImplementedError(
-                "Qwen3MoE v1 does not support shared experts, got "
-                f"shared_expert_intermediate_size={shared_intermediate_size}."
-            )
-        model_dtype = getattr(config.hf_config, "torch_dtype", None)
-        if model_dtype not in {torch.bfloat16, torch.float16}:
-            raise NotImplementedError(
-                "Qwen3MoE v1 supports BF16/FP16 checkpoints only, "
-                f"got torch_dtype={model_dtype}."
-            )
-        validate_model_runtime_compatibility(
-            model_type=model_type,
-            sparse_method=config.vllm_sparse_method,
-            tensor_parallel_size=config.tensor_parallel_size,
-            expert_parallel_size=config.expert_parallel_size,
-            data_parallel_size=config.data_parallel_size,
-            enforce_eager=config.enforce_eager,
-            decode_cuda_graph=config.decode_cuda_graph,
-            enable_prefix_caching=config.enable_prefix_caching,
+    top_k = int(getattr(config.hf_config, "num_experts_per_tok", 0) or 0)
+    if not 1 <= top_k <= num_experts:
+        raise ValueError(
+            "Qwen3MoE num_experts_per_tok must be in [1, num_experts], "
+            f"got top_k={top_k}, num_experts={num_experts}."
         )
-    elif model_type == "minimax_m2":
-        if config.tensor_parallel_size != 1 or config.data_parallel_size != 1:
-            raise ValueError(
-                "MiniMax M2.7 v1 requires TP=1 and DP=1, got "
-                f"TP={config.tensor_parallel_size}, EP={config.expert_parallel_size}, "
-                f"DP={config.data_parallel_size}."
-            )
-        num_experts = int(getattr(config.hf_config, "num_local_experts"))
-        if config.expert_parallel_size > num_experts:
-            raise ValueError(
-                "MiniMax M2.7 expert_parallel_size must not exceed "
-                f"num_local_experts={num_experts}, got {config.expert_parallel_size}."
-            )
-        if num_experts % config.expert_parallel_size != 0:
-            raise ValueError(
-                "MiniMax M2.7 requires num_local_experts divisible by "
-                f"expert_parallel_size, got {num_experts} and "
-                f"{config.expert_parallel_size}."
-            )
-        validate_model_runtime_compatibility(
-            model_type=model_type,
-            sparse_method=config.vllm_sparse_method,
-            tensor_parallel_size=config.tensor_parallel_size,
-            expert_parallel_size=config.expert_parallel_size,
-            data_parallel_size=config.data_parallel_size,
-            enforce_eager=config.enforce_eager,
-            decode_cuda_graph=config.decode_cuda_graph,
-            enable_prefix_caching=config.enable_prefix_caching,
+    decoder_sparse_step = int(
+        getattr(config.hf_config, "decoder_sparse_step", 1)
+    )
+    mlp_only_layers = tuple(
+        int(layer_idx)
+        for layer_idx in (getattr(config.hf_config, "mlp_only_layers", ()) or ())
+    )
+    if decoder_sparse_step != 1 or mlp_only_layers:
+        raise NotImplementedError(
+            "Qwen3MoE v1 requires every decoder layer to be MoE, got "
+            f"decoder_sparse_step={decoder_sparse_step}, "
+            f"mlp_only_layers={list(mlp_only_layers)}."
         )
-    elif config.expert_parallel_size != 1 or config.data_parallel_size != 1:
+    shared_intermediate_size = int(
+        getattr(config.hf_config, "shared_expert_intermediate_size", 0) or 0
+    )
+    if shared_intermediate_size != 0:
+        raise NotImplementedError(
+            "Qwen3MoE v1 does not support shared experts, got "
+            f"shared_expert_intermediate_size={shared_intermediate_size}."
+        )
+    model_dtype = getattr(config.hf_config, "torch_dtype", None)
+    if model_dtype not in {torch.bfloat16, torch.float16}:
+        raise NotImplementedError(
+            "Qwen3MoE v1 supports BF16/FP16 checkpoints only, "
+            f"got torch_dtype={model_dtype}."
+        )
+    _validate_runtime_compatibility(config, model_type=model_type)
+
+
+def _validate_minimax_runtime(config, *, model_type: str) -> None:
+    if config.tensor_parallel_size != 1 or config.data_parallel_size != 1:
+        raise ValueError(
+            "MiniMax M2.7 v1 requires TP=1 and DP=1, got "
+            f"TP={config.tensor_parallel_size}, EP={config.expert_parallel_size}, "
+            f"DP={config.data_parallel_size}."
+        )
+    num_experts = int(getattr(config.hf_config, "num_local_experts"))
+    if config.expert_parallel_size > num_experts:
+        raise ValueError(
+            "MiniMax M2.7 expert_parallel_size must not exceed "
+            f"num_local_experts={num_experts}, got {config.expert_parallel_size}."
+        )
+    if num_experts % config.expert_parallel_size != 0:
+        raise ValueError(
+            "MiniMax M2.7 requires num_local_experts divisible by "
+            f"expert_parallel_size, got {num_experts} and "
+            f"{config.expert_parallel_size}."
+        )
+    _validate_runtime_compatibility(config, model_type=model_type)
+
+
+def _validate_dense_parallelism(config, *, model_type: str) -> None:
+    if config.expert_parallel_size != 1 or config.data_parallel_size != 1:
         raise ValueError(
             f"Dense model_type={model_type!r} requires EP=1 and DP=1, got "
             f"TP={config.tensor_parallel_size}, EP={config.expert_parallel_size}, "
             f"DP={config.data_parallel_size}."
         )
+
+
+def _finalize_model_config(config, *, is_qwen35: bool) -> None:
     if (
         config.vllm_sparse_method == "deltakv"
         and not is_qwen35
@@ -758,4 +784,31 @@ def load_and_validate_model(config) -> bool:
 
     if config.max_num_seqs_in_batch > 32:
         logger.warning('max_num_seqs_in_batch 过大或许会占用太多显存')
+
+
+def load_and_validate_model(config) -> bool:
+    (
+        is_qwen35,
+        model_type,
+        is_minimax_m2,
+        is_qwen3,
+        is_qwen3_moe,
+    ) = _load_model_metadata(config)
+    _validate_h2o_model(config, model_type=model_type)
+    _apply_tiny_random_overrides(config, is_qwen35=is_qwen35)
+    _normalize_model_quantization(
+        config,
+        is_qwen35=is_qwen35,
+        is_minimax_m2=is_minimax_m2,
+        is_qwen3=is_qwen3,
+        is_qwen3_moe=is_qwen3_moe,
+    )
+    _validate_supported_model_type(config)
+    if model_type == "qwen3_moe":
+        _validate_qwen3_moe_runtime(config, model_type=model_type)
+    elif model_type == "minimax_m2":
+        _validate_minimax_runtime(config, model_type=model_type)
+    else:
+        _validate_dense_parallelism(config, model_type=model_type)
+    _finalize_model_config(config, is_qwen35=is_qwen35)
     return is_qwen35

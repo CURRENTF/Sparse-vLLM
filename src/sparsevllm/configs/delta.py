@@ -3,6 +3,7 @@
 import importlib.util
 from typing import Any
 
+from sparsevllm.configs.common import _normalize_float_attr, _normalize_int_attr
 from sparsevllm.configs.model import (
     _is_qwen35_deltakv_checkpoint,
     _qwen35_deltakv_message,
@@ -45,35 +46,41 @@ SUPPORTED_SKIPKV_MODEL_NAMES = frozenset(
 )
 
 
-def normalize_deltakv_storage(config) -> None:
+def _normalize_deltakv_kernel_options(config) -> None:
     if int(config.deltakv_cluster_gather_chunk_size) <= 0:
         raise ValueError(
             "deltakv_cluster_gather_chunk_size must be > 0, "
             f"got {config.deltakv_cluster_gather_chunk_size}."
         )
-    config.deltakv_cluster_gather_chunk_size = int(config.deltakv_cluster_gather_chunk_size)
+    _normalize_int_attr(config, "deltakv_cluster_gather_chunk_size")
     config.sparse_attn_score_dtype = str(config.sparse_attn_score_dtype or "float32").strip().lower()
     if config.sparse_attn_score_dtype not in {"float32", "bfloat16", "float16"}:
         raise ValueError(
             "sparse_attn_score_dtype must be 'float32', 'bfloat16', or 'float16', "
             f"got {config.sparse_attn_score_dtype!r}."
         )
-    config.full_layer_kv_quant_bits = int(config.full_layer_kv_quant_bits or 0)
+
+
+def _normalize_deltakv_quantization(config) -> None:
+    _normalize_int_attr(config, "full_layer_kv_quant_bits", fallback=0)
     if config.full_layer_kv_quant_bits not in (0, 2, 4):
         raise ValueError(
             "full_layer_kv_quant_bits must be 0, 2, or 4, "
             f"got {config.full_layer_kv_quant_bits}."
         )
-    config.full_layer_cluster_ratio = float(config.full_layer_cluster_ratio or 0.0)
+    _normalize_float_attr(config, "full_layer_cluster_ratio", fallback=0.0)
     if config.full_layer_cluster_ratio < 0.0:
         raise ValueError(f"full_layer_cluster_ratio must be >= 0, got {config.full_layer_cluster_ratio}.")
-    config.kv_quant_bits = int(config.kv_quant_bits or 0)
+    _normalize_int_attr(config, "kv_quant_bits", fallback=0)
     if config.kv_quant_bits not in (0, 2, 4):
         raise ValueError(f"kv_quant_bits must be 0, 2, or 4, got {config.kv_quant_bits}.")
-    config.kv_quant_group_size = int(config.kv_quant_group_size or 0)
+    _normalize_int_attr(config, "kv_quant_group_size", fallback=0)
     if config.kv_quant_group_size < 0:
         raise ValueError(f"kv_quant_group_size must be >= 0, got {config.kv_quant_group_size}.")
-    config.full_layer_kivi_group_size = int(config.full_layer_kivi_group_size or 32)
+
+
+def _normalize_full_layer_kivi(config) -> None:
+    _normalize_int_attr(config, "full_layer_kivi_group_size", fallback=32)
     if config.full_layer_kivi_group_size <= 0:
         raise ValueError(
             "full_layer_kivi_group_size must be > 0, "
@@ -87,25 +94,25 @@ def normalize_deltakv_storage(config) -> None:
             "full_layer_kivi_residual_length must be > 0, "
             f"got {config.full_layer_kivi_residual_length}."
         )
-    config.full_layer_kivi_decode_block_seq = int(config.full_layer_kivi_decode_block_seq or 256)
+    _normalize_int_attr(config, "full_layer_kivi_decode_block_seq", fallback=256)
     if config.full_layer_kivi_decode_block_seq <= 0 or config.full_layer_kivi_decode_block_seq % 16 != 0:
         raise ValueError(
             "full_layer_kivi_decode_block_seq must be a positive multiple of 16, "
             f"got {config.full_layer_kivi_decode_block_seq}."
         )
-    config.full_layer_kivi_decode_block_n = int(config.full_layer_kivi_decode_block_n or 16)
+    _normalize_int_attr(config, "full_layer_kivi_decode_block_n", fallback=16)
     if config.full_layer_kivi_decode_block_n <= 0 or config.full_layer_kivi_decode_block_n % 16 != 0:
         raise ValueError(
             "full_layer_kivi_decode_block_n must be a positive multiple of 16, "
             f"got {config.full_layer_kivi_decode_block_n}."
         )
-    config.full_layer_kivi_decode_num_warps = int(config.full_layer_kivi_decode_num_warps or 2)
+    _normalize_int_attr(config, "full_layer_kivi_decode_num_warps", fallback=2)
     if config.full_layer_kivi_decode_num_warps not in {1, 2, 4, 8}:
         raise ValueError(
             "full_layer_kivi_decode_num_warps must be one of 1, 2, 4, or 8, "
             f"got {config.full_layer_kivi_decode_num_warps}."
         )
-    config.full_layer_kivi_decode_num_stages = int(config.full_layer_kivi_decode_num_stages or 3)
+    _normalize_int_attr(config, "full_layer_kivi_decode_num_stages", fallback=3)
     if config.full_layer_kivi_decode_num_stages <= 0:
         raise ValueError(
             "full_layer_kivi_decode_num_stages must be > 0, "
@@ -124,24 +131,34 @@ def normalize_deltakv_storage(config) -> None:
             "enable_full_layer_kivi_grouped_decode was removed; full-layer KIVI decode now "
             "uses the direct packed backend."
         )
-    config.deltakv_full_pool_reserve_ratio = float(config.deltakv_full_pool_reserve_ratio or 0.0)
+
+
+def _normalize_deltakv_capacity(config) -> None:
+    _normalize_float_attr(config, "deltakv_full_pool_reserve_ratio", fallback=0.0)
     if config.deltakv_full_pool_reserve_ratio < 0.0 or config.deltakv_full_pool_reserve_ratio >= 1.0:
         raise ValueError(
             "deltakv_full_pool_reserve_ratio must be in [0, 1), "
             f"got {config.deltakv_full_pool_reserve_ratio}."
         )
-    config.deltakv_cache_capacity_margin = float(config.deltakv_cache_capacity_margin or 1.0)
+    _normalize_float_attr(config, "deltakv_cache_capacity_margin", fallback=1.0)
     if config.deltakv_cache_capacity_margin < 1.0:
         raise ValueError(
             "deltakv_cache_capacity_margin must be >= 1.0, "
             f"got {config.deltakv_cache_capacity_margin}."
         )
-    config.deltakv_center_capacity_margin = float(config.deltakv_center_capacity_margin or 1.0)
+    _normalize_float_attr(config, "deltakv_center_capacity_margin", fallback=1.0)
     if config.deltakv_center_capacity_margin < 1.0:
         raise ValueError(
             "deltakv_center_capacity_margin must be >= 1.0, "
             f"got {config.deltakv_center_capacity_margin}."
         )
+
+
+def normalize_deltakv_storage(config) -> None:
+    _normalize_deltakv_kernel_options(config)
+    _normalize_deltakv_quantization(config)
+    _normalize_full_layer_kivi(config)
+    _normalize_deltakv_capacity(config)
 
 
 def validate_deltakv_runtime(config, *, is_qwen35: bool) -> None:

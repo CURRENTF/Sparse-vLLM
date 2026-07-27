@@ -1,5 +1,6 @@
 """Decode CUDA Graph normalization and validation."""
 
+from collections.abc import Callable
 from typing import Any
 
 from sparsevllm.configs.common import _coerce_bool_config
@@ -24,22 +25,24 @@ def _default_decode_cuda_graph_capture_sizes(max_decoding_seqs: int) -> list[int
     return sizes
 
 
-def _resolve_decode_cuda_graph_capture_sizes(
+def _resolve_positive_sizes(
     value: str | int | list[int] | tuple[int, ...] | None,
-    max_decoding_seqs: int,
+    *,
+    name: str,
+    default_factory: Callable[[], list[int]],
 ) -> list[int]:
     if value is None:
-        sizes = _default_decode_cuda_graph_capture_sizes(max_decoding_seqs)
+        sizes = default_factory()
     elif isinstance(value, str):
         raw = value.strip().lower()
         if raw in {"", "auto"}:
-            sizes = _default_decode_cuda_graph_capture_sizes(max_decoding_seqs)
+            sizes = default_factory()
         else:
             try:
                 sizes = [int(part.strip()) for part in value.split(",") if part.strip()]
             except ValueError as exc:
                 raise ValueError(
-                    "decode_cuda_graph_capture_sizes must be 'auto' or a comma-separated "
+                    f"{name} must be 'auto' or a comma-separated "
                     f"integer list, got {value!r}."
                 ) from exc
     elif isinstance(value, int):
@@ -48,13 +51,27 @@ def _resolve_decode_cuda_graph_capture_sizes(
         sizes = [int(item) for item in value]
     else:
         raise ValueError(
-            "decode_cuda_graph_capture_sizes must be 'auto', an int, a list/tuple of ints, "
+            f"{name} must be 'auto', an int, a list/tuple of ints, "
             f"or None, got {type(value).__name__}."
         )
 
     sizes = sorted(set(sizes))
     if not sizes or any(size <= 0 for size in sizes):
-        raise ValueError(f"decode_cuda_graph_capture_sizes must contain positive integers, got {sizes}.")
+        raise ValueError(f"{name} must contain positive integers, got {sizes}.")
+    return sizes
+
+
+def _resolve_decode_cuda_graph_capture_sizes(
+    value: str | int | list[int] | tuple[int, ...] | None,
+    max_decoding_seqs: int,
+) -> list[int]:
+    sizes = _resolve_positive_sizes(
+        value,
+        name="decode_cuda_graph_capture_sizes",
+        default_factory=lambda: _default_decode_cuda_graph_capture_sizes(
+            max_decoding_seqs
+        ),
+    )
     if sizes[-1] < int(max_decoding_seqs):
         raise ValueError(
             "decode_cuda_graph_capture_sizes must cover max_decoding_seqs: "
@@ -82,34 +99,11 @@ def _resolve_decode_cuda_graph_context_sizes(
     value: str | int | list[int] | tuple[int, ...] | None,
     max_model_len: int,
 ) -> list[int]:
-    if value is None:
-        sizes = _default_decode_cuda_graph_context_sizes(max_model_len)
-    elif isinstance(value, str):
-        raw = value.strip().lower()
-        if raw in {"", "auto"}:
-            sizes = _default_decode_cuda_graph_context_sizes(max_model_len)
-        else:
-            try:
-                sizes = [int(part.strip()) for part in value.split(",") if part.strip()]
-            except ValueError as exc:
-                raise ValueError(
-                    "decode_cuda_graph_context_sizes must be 'auto' or a comma-separated "
-                    f"integer list, got {value!r}."
-                ) from exc
-    elif isinstance(value, int):
-        sizes = [int(value)]
-    elif isinstance(value, (list, tuple)):
-        sizes = [int(item) for item in value]
-    else:
-        raise ValueError(
-            "decode_cuda_graph_context_sizes must be 'auto', an int, a list/tuple of ints, "
-            f"or None, got {type(value).__name__}."
-        )
-
-    sizes = sorted(set(sizes))
-    if not sizes or any(size <= 0 for size in sizes):
-        raise ValueError(f"decode_cuda_graph_context_sizes must contain positive integers, got {sizes}.")
-    return sizes
+    return _resolve_positive_sizes(
+        value,
+        name="decode_cuda_graph_context_sizes",
+        default_factory=lambda: _default_decode_cuda_graph_context_sizes(max_model_len),
+    )
 
 
 def _normalize_decode_cuda_graph_context_policy(value: str | None) -> str:
