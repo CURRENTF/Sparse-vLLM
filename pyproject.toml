@@ -48,6 +48,13 @@ qwen35 = [
     "einops",
 ]
 
+test = [
+    "fuzzywuzzy",
+    "jieba",
+    "pytest",
+    "rouge",
+]
+
 [project.scripts]
 deltakv-train = "deltakv.train_compressor:main"
 sparsevllm-openai-server = "sparsevllm.entrypoints.openai.api_server:main"
@@ -57,3 +64,6 @@ sparsevllm-openai-client = "sparsevllm.entrypoints.openai.client:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["deltakv*", "sparsevllm*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
