@@ -46,7 +46,7 @@ class RKVSkipKVMethodTest(unittest.TestCase):
             model_dir = Path(tmp)
             with (
                 patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", return_value=self._hf_config()),
-                patch("sparsevllm.configs.runtime.log_once") as log_once,
+                patch("sparsevllm.configs.sparse.log_once") as log_once,
             ):
                 Config(
                     model=str(model_dir),

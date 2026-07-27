@@ -429,7 +429,7 @@ def _deprecation_messages(mock_log_once):
 
 
 def test_recurrent_budget_accepts_deprecated_prefix_cache_alias(tmp_path):
-    with patch("sparsevllm.configs.runtime.log_once") as mock_log_once:
+    with patch("sparsevllm.configs.prefix_cache.log_once") as mock_log_once:
         config = _make_config(tmp_path, prefix_cache_max_recurrent_bytes=2 << 30)
 
     assert config.recurrent_state_max_bytes == 2 << 30
@@ -438,7 +438,7 @@ def test_recurrent_budget_accepts_deprecated_prefix_cache_alias(tmp_path):
 
 
 def test_recurrent_budget_accepts_new_name_without_deprecation(tmp_path):
-    with patch("sparsevllm.configs.runtime.log_once") as mock_log_once:
+    with patch("sparsevllm.configs.prefix_cache.log_once") as mock_log_once:
         config = _make_config(tmp_path, recurrent_state_max_bytes=3 << 30)
 
     assert config.recurrent_state_max_bytes == 3 << 30
@@ -447,7 +447,7 @@ def test_recurrent_budget_accepts_new_name_without_deprecation(tmp_path):
 
 
 def test_recurrent_budget_accepts_equal_new_and_deprecated_names(tmp_path):
-    with patch("sparsevllm.configs.runtime.log_once") as mock_log_once:
+    with patch("sparsevllm.configs.prefix_cache.log_once") as mock_log_once:
         config = _make_config(
             tmp_path,
             recurrent_state_max_bytes=2 << 30,

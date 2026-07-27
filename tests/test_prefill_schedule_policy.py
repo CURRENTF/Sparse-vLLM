@@ -766,7 +766,7 @@ class PrefillPolicyConfigTest(unittest.TestCase):
         self.assertEqual(cfg.kv_quant_bits, 4)
 
     def test_deltakv_sparse_decode_backend_auto_uses_custom_without_flash_attn(self):
-        with patch("sparsevllm.configs.runtime._flash_attn_available", return_value=False):
+        with patch("sparsevllm.configs.delta._flash_attn_available", return_value=False):
             cfg = self.make_config(
                 vllm_sparse_method="deltakv-less-memory",
                 allow_missing_deltakv_path=True,
@@ -776,7 +776,7 @@ class PrefillPolicyConfigTest(unittest.TestCase):
         self.assertEqual(cfg.deltakv_sparse_decode_backend, "custom")
 
     def test_deltakv_sparse_decode_backend_auto_uses_fa2_when_available(self):
-        with patch("sparsevllm.configs.runtime._flash_attn_available", return_value=True):
+        with patch("sparsevllm.configs.delta._flash_attn_available", return_value=True):
             cfg = self.make_config(
                 vllm_sparse_method="deltakv-less-memory",
                 allow_missing_deltakv_path=True,
@@ -786,7 +786,7 @@ class PrefillPolicyConfigTest(unittest.TestCase):
         self.assertEqual(cfg.deltakv_sparse_decode_backend, "fa2")
 
     def test_deltakv_sparse_decode_backend_explicit_custom_does_not_require_flash_attn(self):
-        with patch("sparsevllm.configs.runtime._flash_attn_available", return_value=False):
+        with patch("sparsevllm.configs.delta._flash_attn_available", return_value=False):
             cfg = self.make_config(
                 vllm_sparse_method="deltakv-less-memory",
                 allow_missing_deltakv_path=True,
@@ -797,7 +797,7 @@ class PrefillPolicyConfigTest(unittest.TestCase):
         self.assertEqual(cfg.deltakv_sparse_decode_backend, "custom")
 
     def test_deltakv_sparse_decode_backend_explicit_fa2_requires_flash_attn(self):
-        with patch("sparsevllm.configs.runtime._flash_attn_available", return_value=False):
+        with patch("sparsevllm.configs.delta._flash_attn_available", return_value=False):
             with self.assertRaisesRegex(ValueError, "requires the flash_attn package"):
                 self.make_config(
                     vllm_sparse_method="deltakv-less-memory",

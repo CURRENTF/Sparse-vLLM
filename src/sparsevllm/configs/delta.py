@@ -1,0 +1,220 @@
+"""DeltaKV configuration normalization and runtime validation."""
+
+import importlib.util
+from typing import Any
+
+from sparsevllm.configs.model import (
+    _is_qwen35_deltakv_checkpoint,
+    _qwen35_deltakv_message,
+)
+from sparsevllm.utils.log import log_once
+
+def _flash_attn_available() -> bool:
+    return importlib.util.find_spec("flash_attn") is not None
+
+
+def _resolve_deltakv_sparse_decode_backend(value: Any) -> str:
+    backend = str(value or "auto").strip().lower()
+    if backend not in {"auto", "custom", "fa2"}:
+        raise ValueError(
+            "deltakv_sparse_decode_backend must be one of 'auto', 'custom', or 'fa2', "
+            f"got {value!r}."
+        )
+    if backend == "auto":
+        resolved = "fa2" if _flash_attn_available() else "custom"
+        reason = "flash_attn available" if resolved == "fa2" else "flash_attn not available"
+        log_once(
+            f"DeltaKV sparse decode backend auto-selected {resolved!r} ({reason}).",
+            level="INFO",
+        )
+        return resolved
+    if backend == "fa2" and not _flash_attn_available():
+        raise ValueError(
+            "deltakv_sparse_decode_backend='fa2' requires the flash_attn package; "
+            "use 'custom' or leave it as 'auto' when flash_attn is not installed."
+        )
+    return backend
+
+
+SUPPORTED_SKIPKV_MODEL_NAMES = frozenset(
+    {
+        "DeepSeek-R1-Distill-Llama-8B",
+        "DeepSeek-R1-Distill-Qwen-7B",
+        "DeepSeek-R1-Distill-Qwen-14B",
+    }
+)
+
+
+def normalize_deltakv_storage(config) -> None:
+    if int(config.deltakv_cluster_gather_chunk_size) <= 0:
+        raise ValueError(
+            "deltakv_cluster_gather_chunk_size must be > 0, "
+            f"got {config.deltakv_cluster_gather_chunk_size}."
+        )
+    config.deltakv_cluster_gather_chunk_size = int(config.deltakv_cluster_gather_chunk_size)
+    config.sparse_attn_score_dtype = str(config.sparse_attn_score_dtype or "float32").strip().lower()
+    if config.sparse_attn_score_dtype not in {"float32", "bfloat16", "float16"}:
+        raise ValueError(
+            "sparse_attn_score_dtype must be 'float32', 'bfloat16', or 'float16', "
+            f"got {config.sparse_attn_score_dtype!r}."
+        )
+    config.full_layer_kv_quant_bits = int(config.full_layer_kv_quant_bits or 0)
+    if config.full_layer_kv_quant_bits not in (0, 2, 4):
+        raise ValueError(
+            "full_layer_kv_quant_bits must be 0, 2, or 4, "
+            f"got {config.full_layer_kv_quant_bits}."
+        )
+    config.full_layer_cluster_ratio = float(config.full_layer_cluster_ratio or 0.0)
+    if config.full_layer_cluster_ratio < 0.0:
+        raise ValueError(f"full_layer_cluster_ratio must be >= 0, got {config.full_layer_cluster_ratio}.")
+    config.kv_quant_bits = int(config.kv_quant_bits or 0)
+    if config.kv_quant_bits not in (0, 2, 4):
+        raise ValueError(f"kv_quant_bits must be 0, 2, or 4, got {config.kv_quant_bits}.")
+    config.kv_quant_group_size = int(config.kv_quant_group_size or 0)
+    if config.kv_quant_group_size < 0:
+        raise ValueError(f"kv_quant_group_size must be >= 0, got {config.kv_quant_group_size}.")
+    config.full_layer_kivi_group_size = int(config.full_layer_kivi_group_size or 32)
+    if config.full_layer_kivi_group_size <= 0:
+        raise ValueError(
+            "full_layer_kivi_group_size must be > 0, "
+            f"got {config.full_layer_kivi_group_size}."
+        )
+    config.full_layer_kivi_residual_length = int(
+        config.full_layer_kivi_residual_length or config.full_layer_kivi_group_size
+    )
+    if config.full_layer_kivi_residual_length <= 0:
+        raise ValueError(
+            "full_layer_kivi_residual_length must be > 0, "
+            f"got {config.full_layer_kivi_residual_length}."
+        )
+    config.full_layer_kivi_decode_block_seq = int(config.full_layer_kivi_decode_block_seq or 256)
+    if config.full_layer_kivi_decode_block_seq <= 0 or config.full_layer_kivi_decode_block_seq % 16 != 0:
+        raise ValueError(
+            "full_layer_kivi_decode_block_seq must be a positive multiple of 16, "
+            f"got {config.full_layer_kivi_decode_block_seq}."
+        )
+    config.full_layer_kivi_decode_block_n = int(config.full_layer_kivi_decode_block_n or 16)
+    if config.full_layer_kivi_decode_block_n <= 0 or config.full_layer_kivi_decode_block_n % 16 != 0:
+        raise ValueError(
+            "full_layer_kivi_decode_block_n must be a positive multiple of 16, "
+            f"got {config.full_layer_kivi_decode_block_n}."
+        )
+    config.full_layer_kivi_decode_num_warps = int(config.full_layer_kivi_decode_num_warps or 2)
+    if config.full_layer_kivi_decode_num_warps not in {1, 2, 4, 8}:
+        raise ValueError(
+            "full_layer_kivi_decode_num_warps must be one of 1, 2, 4, or 8, "
+            f"got {config.full_layer_kivi_decode_num_warps}."
+        )
+    config.full_layer_kivi_decode_num_stages = int(config.full_layer_kivi_decode_num_stages or 3)
+    if config.full_layer_kivi_decode_num_stages <= 0:
+        raise ValueError(
+            "full_layer_kivi_decode_num_stages must be > 0, "
+            f"got {config.full_layer_kivi_decode_num_stages}."
+        )
+    config.enable_full_layer_kivi_fused_decode = bool(config.enable_full_layer_kivi_fused_decode)
+    config.enable_full_layer_kivi_grouped_decode = bool(config.enable_full_layer_kivi_grouped_decode)
+    config.enable_full_layer_kivi_dense_decode = bool(config.enable_full_layer_kivi_dense_decode)
+    if config.enable_full_layer_kivi_fused_decode:
+        raise ValueError(
+            "enable_full_layer_kivi_fused_decode was removed; full-layer KIVI decode now "
+            "uses the direct packed backend."
+        )
+    if config.enable_full_layer_kivi_grouped_decode:
+        raise ValueError(
+            "enable_full_layer_kivi_grouped_decode was removed; full-layer KIVI decode now "
+            "uses the direct packed backend."
+        )
+    config.deltakv_full_pool_reserve_ratio = float(config.deltakv_full_pool_reserve_ratio or 0.0)
+    if config.deltakv_full_pool_reserve_ratio < 0.0 or config.deltakv_full_pool_reserve_ratio >= 1.0:
+        raise ValueError(
+            "deltakv_full_pool_reserve_ratio must be in [0, 1), "
+            f"got {config.deltakv_full_pool_reserve_ratio}."
+        )
+    config.deltakv_cache_capacity_margin = float(config.deltakv_cache_capacity_margin or 1.0)
+    if config.deltakv_cache_capacity_margin < 1.0:
+        raise ValueError(
+            "deltakv_cache_capacity_margin must be >= 1.0, "
+            f"got {config.deltakv_cache_capacity_margin}."
+        )
+    config.deltakv_center_capacity_margin = float(config.deltakv_center_capacity_margin or 1.0)
+    if config.deltakv_center_capacity_margin < 1.0:
+        raise ValueError(
+            "deltakv_center_capacity_margin must be >= 1.0, "
+            f"got {config.deltakv_center_capacity_margin}."
+        )
+
+
+def validate_deltakv_runtime(config, *, is_qwen35: bool) -> None:
+    # Normalize compressor type strings.
+    for attr in ("compressor_down_type", "compressor_up_type"):
+        v = getattr(config, attr, "auto")
+        if v is None:
+            v = "auto"
+        v = str(v).strip().lower()
+        setattr(config, attr, v if v else "auto")
+
+    if config.vllm_sparse_method == "deltakv":
+        log_once(
+            "DeltaKV support in Sparse-vLLM is still experimental and not fully mature; "
+            "verify results carefully before treating them as final.",
+            level="WARNING",
+        )
+        if is_qwen35 and not _is_qwen35_deltakv_checkpoint(config.deltakv_path):
+            raise ValueError(_qwen35_deltakv_message())
+        if not bool(getattr(config, "use_compression", True)):
+            raise ValueError("DeltaKV runtime is compressor-only; set use_compression=True.")
+        if bool(getattr(config, "enable_sparse_ref_fp8", False)):
+            raise ValueError("enable_sparse_ref_fp8 was removed from the slim DeltaKV runtime.")
+        if config.deltakv_path is None and not config.allow_missing_deltakv_path:
+            raise ValueError(
+                "DeltaKV requires deltakv_path for compressor sparse layers. "
+                "Set allow_missing_deltakv_path=True only for construction-only tests."
+            )
+        if config.kv_quant_bits not in (0, 4):
+            raise ValueError(
+                "DeltaKV slim runtime supports sparse compressor residual bits 0 or 4 only, "
+                f"got kv_quant_bits={config.kv_quant_bits}."
+            )
+        if config.full_layer_kv_quant_bits not in (0, 4):
+            raise ValueError(
+                "DeltaKV slim runtime supports full-layer storage bits 0 or 4 only, "
+                f"got full_layer_kv_quant_bits={config.full_layer_kv_quant_bits}."
+            )
+        if config.kv_quant_bits == 4 and config.kv_quant_group_size == 0:
+            config.kv_quant_group_size = 32
+        config.deltakv_triton_materialize_block_tokens = int(
+            config.deltakv_triton_materialize_block_tokens or 16
+        )
+        if (
+            config.deltakv_triton_materialize_block_tokens <= 0
+            or config.deltakv_triton_materialize_block_tokens % 8 != 0
+        ):
+            raise ValueError(
+                "deltakv_triton_materialize_block_tokens must be a positive multiple of 8, "
+                f"got {config.deltakv_triton_materialize_block_tokens}."
+            )
+        config.deltakv_sparse_decode_backend = _resolve_deltakv_sparse_decode_backend(
+            config.deltakv_sparse_decode_backend
+        )
+        is_bf16_full_compressor_sparse = (
+            config.full_layer_kv_quant_bits == 0 and config.kv_quant_bits == 0
+        )
+        is_bf16_full_int4_compressor_sparse = (
+            config.full_layer_kv_quant_bits == 0 and config.kv_quant_bits == 4
+        )
+        is_kivi4_full_int4_compressor_sparse = (
+            config.full_layer_kv_quant_bits == 4
+            and config.kv_quant_bits == 4
+            and bool(getattr(config, "enable_full_layer_kivi_quant", True))
+        )
+        if not (
+            is_bf16_full_compressor_sparse
+            or is_bf16_full_int4_compressor_sparse
+            or is_kivi4_full_int4_compressor_sparse
+        ):
+            raise ValueError(
+                "DeltaKV slim runtime supports exactly three paths: "
+                "(full_layer_kv_quant_bits=0, kv_quant_bits=0) and "
+                "(full_layer_kv_quant_bits=0, kv_quant_bits=4) and "
+                "(full_layer_kv_quant_bits=4, kv_quant_bits=4, enable_full_layer_kivi_quant=True)."
+            )
