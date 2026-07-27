@@ -15,9 +15,9 @@ class RKVCacheManager(SnapKVCacheManager):
     """SnapKV-style physical cache with R-KV decode-time joint eviction scoring."""
 
     def __init__(self, config: Config, parallel_context: ParallelContext):
+        self._rkv_query_cache_enabled = self._query_cache_needed_for_config(config)
         super().__init__(config, parallel_context)
         self._rkv_observation_tokens = int(config.rkv_observation_tokens)
-        self._rkv_query_cache_enabled = self._query_cache_needed_for_config(config)
         self._rkv_vectorized_prefill_query_cache = True
         self._rkv_batch_clear_query_cache_rows = True
         self._rkv_query_cache = []
