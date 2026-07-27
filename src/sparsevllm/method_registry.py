@@ -95,7 +95,17 @@ QWEN3_MOE_EP_COMPATIBILITY = ModelRuntimeCompatibility(
         {"", "omnikv", "quest", "snapkv", "h2o", "pyramidkv", "rkv"}
     ),
     requires_eager=False,
-    decode_cuda_graph_methods=frozenset({""}),
+    decode_cuda_graph_methods=frozenset(
+        {
+            "",
+            "streamingllm",
+            "snapkv",
+            "pyramidkv",
+            "omnikv",
+            "quest",
+            "rkv",
+        }
+    ),
 )
 
 MINIMAX_M2_EP_COMPATIBILITY = ModelRuntimeCompatibility(

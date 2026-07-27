@@ -142,6 +142,52 @@ def _artifact_paths(out_root: str) -> dict[str, str]:
     }
 
 
+def _write_decode_cuda_graph_status(
+    *,
+    generate_fn,
+    out_root: str,
+    rank: int,
+) -> dict[str, Any]:
+    llm = getattr(generate_fn, "_sparsevllm_llm", None)
+    if llm is None:
+        raise RuntimeError(
+            "SparseVLLM LongBench generation did not expose _sparsevllm_llm; "
+            "cannot verify decode CUDA graph execution."
+        )
+
+    runner = getattr(llm, "model_runner", None)
+    graph_runner = getattr(runner, "decode_cuda_graph_runner", None)
+    graph_states = (
+        getattr(graph_runner, "_graphs", {})
+        if graph_runner is not None
+        else {}
+    )
+    graph_count = sum(
+        getattr(state, "graph", None) is not None
+        for state in graph_states.values()
+    )
+    graph_status = {
+        "rank": int(rank),
+        "configured": bool(
+            getattr(getattr(llm, "config", None), "decode_cuda_graph", False)
+        ),
+        "runner_initialized": graph_runner is not None,
+        "state_count": int(len(graph_states)),
+        "graph_count": int(graph_count),
+        "active": bool(graph_count > 0),
+        "last_state_key": str(getattr(graph_runner, "last_state_key", None)),
+        "state_keys": [str(key) for key in graph_states],
+    }
+    status_path = os.path.join(
+        out_root,
+        f"decode_cuda_graph_status_rank{rank}.json",
+    )
+    with open(status_path, "w", encoding="utf-8") as handle:
+        json.dump(graph_status, handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+    return graph_status
+
+
 def _sample_base_record(
     *,
     dataset: str,
@@ -585,6 +631,13 @@ def worker(rank, world_size, datasets, dataset2prompt, dataset2maxlen, args, out
             eos_token_ids,
         )
         torch.cuda.empty_cache()
+
+    if args.backend == "sparsevllm":
+        _write_decode_cuda_graph_status(
+            generate_fn=model,
+            out_root=out_root,
+            rank=rank,
+        )
 
 
 def launch_single_gpu_workers(args, out_root):
