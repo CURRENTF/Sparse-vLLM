@@ -13,7 +13,7 @@ parallel size must use that value.
 | Model | `model_type` | Precision | TP | DP | EP |
 | --- | --- | --- | :---: | :---: | :---: |
 | Qwen2.5 | `qwen2` | BF16 / FP16 | ✅ | 1 only | 1 only |
-| Qwen3 | `qwen3` | BF16 / FP16 / block FP8 | ✅ | 1 only | 1 only |
+| Qwen3 Dense | `qwen3` | BF16 / FP16 / block FP8 | ✅ (FP8: 1/2/4/8) | 1 only | 1 only |
 | Qwen3MoE | `qwen3_moe` | BF16 / FP16 / block FP8 | 1 only | 1 only | ✅ |
 | Qwen3.5 / Qwen3.6 | `qwen3_5` | block FP8 | ✅ | 1 only | 1 only |
 | Llama 3 / 3.1 | `llama` | BF16 / FP16 | ✅ | 1 only | 1 only |

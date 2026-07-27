@@ -528,6 +528,55 @@ def _validate_qwen3_moe_fp8_checkpoint_config(
         )
 
 
+def _validate_qwen3_fp8_checkpoint_config(
+    hf_config: Any,
+    *,
+    tensor_parallel_size: int,
+) -> None:
+    architectures = tuple(_config_get(hf_config, "architectures", ()) or ())
+    if architectures != ("Qwen3ForCausalLM",):
+        raise ValueError(
+            "Qwen3 FP8 requires architectures=['Qwen3ForCausalLM'], "
+            f"got {list(architectures)}."
+        )
+    configured_dtype = _config_get(hf_config, "torch_dtype", None)
+    if configured_dtype is None:
+        configured_dtype = _config_get(hf_config, "dtype", None)
+    if configured_dtype not in {torch.bfloat16, "bfloat16"}:
+        raise ValueError(
+            "Qwen3 FP8 requires BF16 non-quantized parameters, "
+            f"got dtype={configured_dtype!r}."
+        )
+
+    tp_size = int(tensor_parallel_size)
+    head_dim = int(_config_get(hf_config, "head_dim", 0) or 0)
+    dimensions = {
+        "hidden_size": int(_config_get(hf_config, "hidden_size", 0) or 0),
+        "intermediate_size": int(
+            _config_get(hf_config, "intermediate_size", 0) or 0
+        ),
+        "query_size": int(
+            _config_get(hf_config, "num_attention_heads", 0) or 0
+        )
+        * head_dim,
+        "key_value_size": int(
+            _config_get(hf_config, "num_key_value_heads", 0) or 0
+        )
+        * head_dim,
+    }
+    invalid_dimensions = {
+        name: size
+        for name, size in dimensions.items()
+        if size <= 0 or size % (128 * tp_size)
+    }
+    if invalid_dimensions:
+        raise ValueError(
+            "Qwen3 FP8 requires every TP-local dense projection dimension to be "
+            "128-aligned; "
+            f"TP={tp_size}, invalid={invalid_dimensions}."
+        )
+
+
 @dataclass(frozen=True)
 class RuntimeLayout:
     num_layers: int
@@ -1363,6 +1412,7 @@ class Config:
             setattr(self.hf_config, "model_type", "qwen3_5")
         model_type = str(getattr(self.hf_config, "model_type", "") or "")
         is_minimax_m2 = model_type == "minimax_m2"
+        is_qwen3 = model_type == "qwen3"
         is_qwen3_moe = model_type == "qwen3_moe"
         if self.vllm_sparse_method == "h2o":
             if model_type != "qwen2":
@@ -1399,6 +1449,8 @@ class Config:
         quantized_model_name = "qwen3_5"
         if is_minimax_m2:
             quantized_model_name = "MiniMax M2.7"
+        elif is_qwen3:
+            quantized_model_name = "Qwen3"
         elif is_qwen3_moe:
             quantized_model_name = "Qwen3MoE"
         self.quantization_config = QuantizationConfig.from_hf_config(
@@ -1413,6 +1465,11 @@ class Config:
             _validate_minimax_m2_checkpoint_config(
                 self.hf_config,
                 raw_quantization_config,
+            )
+        if is_qwen3 and self.quantization_config.enabled:
+            _validate_qwen3_fp8_checkpoint_config(
+                self.hf_config,
+                tensor_parallel_size=self.tensor_parallel_size,
             )
         if is_qwen3_moe and self.quantization_config.enabled:
             _validate_qwen3_moe_fp8_checkpoint_config(

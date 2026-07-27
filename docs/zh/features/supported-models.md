@@ -9,7 +9,7 @@
 | 模型 | `model_type` | 精度 | TP | DP | EP |
 | --- | --- | --- | :---: | :---: | :---: |
 | Qwen2.5 | `qwen2` | BF16 / FP16 | ✅ | 仅支持 1 | 仅支持 1 |
-| Qwen3 | `qwen3` | BF16 / FP16 / 块级 FP8 | ✅ | 仅支持 1 | 仅支持 1 |
+| Qwen3 Dense | `qwen3` | BF16 / FP16 / 块级 FP8 | ✅（FP8：1/2/4/8） | 仅支持 1 | 仅支持 1 |
 | Qwen3MoE | `qwen3_moe` | BF16 / FP16 / 块级 FP8 | 仅支持 1 | 仅支持 1 | ✅ |
 | Qwen3.5 / Qwen3.6 | `qwen3_5` | 块级 FP8 | ✅ | 仅支持 1 | 仅支持 1 |
 | Llama 3 / 3.1 | `llama` | BF16 / FP16 | ✅ | 仅支持 1 | 仅支持 1 |

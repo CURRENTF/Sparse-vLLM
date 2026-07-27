@@ -244,6 +244,54 @@ def test_qwen3_moe_fp8_config_validation(tmp_path):
             Config(model=str(tmp_path), expert_parallel_size=2)
 
 
+def test_qwen3_dense_fp8_config_validation(tmp_path):
+    hf_config = _hf_config("qwen3")
+    hf_config.architectures = ["Qwen3ForCausalLM"]
+    hf_config.hidden_size = 4096
+    hf_config.intermediate_size = 12288
+    hf_config.head_dim = 128
+    hf_config.num_attention_heads = 32
+    hf_config.num_key_value_heads = 8
+    hf_config.quantization_config = {
+        "quant_method": "fp8",
+        "fmt": "e4m3",
+        "activation_scheme": "dynamic",
+        "weight_block_size": [128, 128],
+    }
+    with patch(
+        "sparsevllm.config.AutoConfig.from_pretrained",
+        return_value=hf_config,
+    ):
+        config = Config(model=str(tmp_path), tensor_parallel_size=8)
+    assert config.quantization_config.enabled
+    assert config.quantization_config.model_name == "Qwen3"
+
+    hf_config.intermediate_size = 12160
+    with patch(
+        "sparsevllm.config.AutoConfig.from_pretrained",
+        return_value=hf_config,
+    ):
+        with pytest.raises(ValueError, match="TP-local dense projection"):
+            Config(model=str(tmp_path), tensor_parallel_size=8)
+
+
+def test_qwen3_dense_fp8_rejects_wrong_architecture(tmp_path):
+    hf_config = _hf_config("qwen3")
+    hf_config.architectures = ["Qwen3MoeForCausalLM"]
+    hf_config.quantization_config = {
+        "quant_method": "fp8",
+        "fmt": "e4m3",
+        "activation_scheme": "dynamic",
+        "weight_block_size": [128, 128],
+    }
+    with patch(
+        "sparsevllm.config.AutoConfig.from_pretrained",
+        return_value=hf_config,
+    ):
+        with pytest.raises(ValueError, match="Qwen3ForCausalLM"):
+            Config(model=str(tmp_path))
+
+
 def test_dense_config_rejects_expert_or_data_parallelism(tmp_path):
     with patch("sparsevllm.config.AutoConfig.from_pretrained", return_value=_hf_config("qwen3")):
         with pytest.raises(ValueError, match="requires EP=1 and DP=1"):
