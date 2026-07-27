@@ -113,6 +113,63 @@ def _require_synchronized_step_timing(
         )
 
 
+def _require_successful_perf_matrix(
+    rows: list[dict[str, Any]],
+    *,
+    methods: tuple[str, ...] | list[str],
+    lengths: tuple[int, ...] | list[int],
+    batch_sizes: tuple[int, ...] | list[int],
+    artifact: Path,
+) -> None:
+    expected = {
+        (str(method), int(length), int(batch_size))
+        for method in methods
+        for length in lengths
+        for batch_size in batch_sizes
+    }
+    observed: dict[tuple[str, int, int], dict[str, Any]] = {}
+    duplicates: list[tuple[str, int, int]] = []
+    malformed: list[str] = []
+    for index, row in enumerate(rows):
+        try:
+            key = (
+                str(row["method"]),
+                int(row["length"]),
+                int(row["batch_size"]),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            malformed.append(f"row={index}: {exc}")
+            continue
+        if key in observed:
+            duplicates.append(key)
+            continue
+        observed[key] = row
+
+    missing = sorted(expected - set(observed))
+    unexpected = sorted(set(observed) - expected)
+    non_success = sorted(
+        (key, str(observed[key].get("status", "UNKNOWN")))
+        for key in expected & set(observed)
+        if observed[key].get("status") != "SUCCESS"
+    )
+    problems: list[str] = []
+    if malformed:
+        problems.append(f"malformed={malformed}")
+    if duplicates:
+        problems.append(f"duplicate={sorted(set(duplicates))}")
+    if missing:
+        problems.append(f"missing={missing}")
+    if unexpected:
+        problems.append(f"unexpected={unexpected}")
+    if non_success:
+        problems.append(f"non-success={non_success}")
+    if problems:
+        raise RuntimeError(
+            f"Performance artifact {artifact} does not contain the exact successful "
+            f"benchmark matrix: {'; '.join(problems)}"
+        )
+
+
 def _read_json(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
@@ -1352,10 +1409,32 @@ def main() -> int:
                         log_path=output_root / "perf" / model_id / f"{method_id}.log",
                         timeout_s=args.command_timeout_s,
                     )
+                    if args.dry_run:
+                        grade = GateGrade("performance", "N/A", "skipped_by_policy", {}, "dry run")
+                        summary["grades"].append(
+                            {
+                                **grade.to_dict(),
+                                "model": model_id,
+                                "method": method_id,
+                            }
+                        )
+                        continue
                     rows = _read_jsonl(out_path)
-                    _require_synchronized_step_timing(rows, artifact=out_path)
                     for row in rows:
                         _append_jsonl(output_root / "perf.jsonl", {"model": model_id, **row})
+                    expected_methods = (
+                        ("vanilla",)
+                        if method_id == "vanilla"
+                        else ("vanilla", method_id)
+                    )
+                    _require_successful_perf_matrix(
+                        rows,
+                        methods=expected_methods,
+                        lengths=resolved["performance"]["lengths"],
+                        batch_sizes=resolved["performance"]["batch_sizes"],
+                        artifact=out_path,
+                    )
+                    _require_synchronized_step_timing(rows, artifact=out_path)
                     vanilla_by_shape = {
                         (row["length"], row["batch_size"]): row
                         for row in rows
@@ -1367,13 +1446,29 @@ def main() -> int:
                         vanilla = vanilla_by_shape.get((row["length"], row["batch_size"]))
                         if not vanilla:
                             continue
-                        speedup = float(row["decode_tp"]) / max(float(vanilla["decode_tp"]), 1e-9)
+                        vanilla_decode_tp = float(vanilla["decode_tp"])
+                        vanilla_prefill_tp = float(vanilla["prefill_tp"])
+                        if vanilla_decode_tp <= 0.0 or vanilla_prefill_tp <= 0.0:
+                            raise RuntimeError(
+                                "Vanilla performance baseline must report positive throughput "
+                                f"for length={row['length']} batch_size={row['batch_size']}; "
+                                f"decode_tp={vanilla_decode_tp} prefill_tp={vanilla_prefill_tp}."
+                            )
+                        decode_speedup = float(row["decode_tp"]) / vanilla_decode_tp
+                        prefill_speedup = float(row["prefill_tp"]) / vanilla_prefill_tp
                         tensor_parallel_size = _tensor_parallel_size_from_config(resolved.get("performance"))
+                        method_performance = (
+                            resolved["methods"].get(row["method"], {}).get("performance") or {}
+                        )
                         grade = grade_perf(
-                            speedup,
+                            decode_speedup,
                             graph_expected=bool(row.get("decode_cuda_graph_expected")),
                             graph_active=bool(row.get("decode_cuda_graph_active")),
                             require_speedup=tensor_parallel_size <= 1,
+                            prefill_speedup=prefill_speedup,
+                            minimum_prefill_speedup=method_performance.get(
+                                "minimum_prefill_speedup"
+                            ),
                         )
                         summary["grades"].append(
                             {
@@ -1591,6 +1686,20 @@ def main() -> int:
             for item in summary["grades"]
         ]
         summary["worst_required_grade"] = worst_required_grade(grade_objs)
+        if summary["worst_required_grade"] == "D":
+            failed_gates = [
+                "/".join(
+                    str(item[key])
+                    for key in ("name", "model", "method", "length", "batch_size")
+                    if item.get(key) is not None
+                )
+                for item in summary["grades"]
+                if item.get("grade") == "D"
+            ]
+            raise RuntimeError(
+                "Required regression gates failed: "
+                + ", ".join(failed_gates)
+            )
         summary["status"] = "completed"
         _write_json(output_root / "metrics.json", {"records": metrics_records})
         _write_json(output_root / "logits_alignment.json", {"records": logits_records})

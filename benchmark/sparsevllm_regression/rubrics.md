@@ -11,7 +11,8 @@ summary of those rules.
 ## Common Semantics
 
 - `A`, `B`, and `C` are passing grades with decreasing confidence.
-- `D` is a required-gate failure.
+- `D` is a required-gate failure; the harness writes the failure artifacts,
+  marks the run failed, and exits nonzero.
 - `N/A` means the gate was skipped by policy, such as a method without an HF
   logits reference.
 - Dated run results and blockers belong in run artifacts, issue notes, or a
@@ -46,7 +47,8 @@ the method declares an HF logits reference.
 ## Performance
 
 Performance grades decode speedup and, when required, decode CUDA graph
-activation.
+activation. A method may also declare `performance.minimum_prefill_speedup`;
+falling below that method-specific prefill floor is a `D`.
 
 | Grade | Rule |
 | --- | --- |

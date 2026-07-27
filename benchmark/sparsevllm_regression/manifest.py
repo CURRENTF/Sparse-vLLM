@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from pathlib import Path
 from typing import Any
@@ -139,6 +140,32 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
         compressor_env = method.get("compressor_path_env")
         if compressor_env is not None and not isinstance(compressor_env, str):
             raise ManifestError(f"method {method_id!r} compressor_path_env must be a string.")
+        performance_policy = method.get("performance")
+        if performance_policy is not None:
+            if not isinstance(performance_policy, dict):
+                raise ManifestError(f"method {method_id!r} performance must be a JSON object.")
+            unknown_performance_keys = sorted(
+                set(performance_policy) - {"minimum_prefill_speedup"}
+            )
+            if unknown_performance_keys:
+                raise ManifestError(
+                    f"method {method_id!r} performance has unknown keys: "
+                    f"{unknown_performance_keys}"
+                )
+            minimum_prefill_speedup = performance_policy.get("minimum_prefill_speedup")
+            if (
+                minimum_prefill_speedup is not None
+                and (
+                    not isinstance(minimum_prefill_speedup, (int, float))
+                    or isinstance(minimum_prefill_speedup, bool)
+                    or not math.isfinite(float(minimum_prefill_speedup))
+                    or minimum_prefill_speedup <= 0
+                )
+            ):
+                raise ManifestError(
+                    f"method {method_id!r} performance minimum_prefill_speedup "
+                    "must be a positive number."
+                )
         if method["requires_compressor"] and "compressor_path_env" not in method:
             model_specific = [model_id for model_id, model in models.items() if model.get("compressor_path_env")]
             if not model_specific:

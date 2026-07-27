@@ -90,6 +90,7 @@
         "h2o_prefill_score_window": 128,
         "gpu_memory_utilization": 0.9
       },
+      "performance": {"minimum_prefill_speedup": 1.0},
       "memory": {"expected_savings": 0.3}
     },
     "pyramidkv": {

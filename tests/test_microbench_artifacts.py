@@ -6,6 +6,7 @@ import pytest
 from benchmark.microbench import (
     _artifact_records,
     _benchmark_sparse_method,
+    _record_child_exit_failure,
     _resolved_engine_config,
     _write_output_dir,
 )
@@ -28,6 +29,44 @@ def test_benchmark_sparse_method_preserves_runtime_method(method, expected):
 def test_benchmark_sparse_method_rejects_unknown_method():
     with pytest.raises(ValueError, match="Unsupported benchmark sparse method"):
         _benchmark_sparse_method("typo")
+
+
+def test_nonzero_child_exit_overrides_partial_success_row():
+    results = {
+        ("h2o", 16, 1): {
+            "method": "h2o",
+            "length": 16,
+            "batch_size": 1,
+            "status": "SUCCESS",
+            "prefill_tp": 123.0,
+        }
+    }
+
+    _record_child_exit_failure(
+        results,
+        method="h2o",
+        length=16,
+        batch_size=1,
+        exitcode=7,
+        synchronize_step_timing=True,
+    )
+
+    row = results[("h2o", 16, 1)]
+    assert row["status"] == "FAILED"
+    assert row["child_exitcode"] == 7
+    assert row["child_partial_status"] == "SUCCESS"
+    assert row["prefill_tp"] == 123.0
+
+
+@pytest.mark.parametrize(
+    "method",
+    [
+        "deltakv-less-memory-cudagraph",
+        "deltakv_less_memory_cudagraph",
+    ],
+)
+def test_benchmark_sparse_method_preserves_graph_enabling_legacy_alias(method):
+    assert _benchmark_sparse_method(method) == method
 
 
 @pytest.mark.parametrize("enabled", [False, True])
@@ -94,6 +133,10 @@ def test_resolved_engine_config_records_backend_and_jsonable_values():
             kv_quant_group_size=64,
             full_attn_layers=(0, 1, 2, 8),
             obs_layer_ids=[2, 8],
+            h2o_decode_budget=4096,
+            h2o_prefill_budget=8192,
+            h2o_recent_ratio=0.5,
+            h2o_prefill_score_window=128,
         )
     )
 
@@ -102,3 +145,7 @@ def test_resolved_engine_config_records_backend_and_jsonable_values():
     assert resolved["deltakv_sparse_decode_backend"] == "fa2"
     assert resolved["full_attn_layers"] == [0, 1, 2, 8]
     assert resolved["obs_layer_ids"] == [2, 8]
+    assert resolved["h2o_decode_budget"] == 4096
+    assert resolved["h2o_prefill_budget"] == 8192
+    assert resolved["h2o_recent_ratio"] == 0.5
+    assert resolved["h2o_prefill_score_window"] == 128

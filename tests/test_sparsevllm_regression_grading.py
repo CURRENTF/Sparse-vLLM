@@ -34,6 +34,7 @@ from benchmark.sparsevllm_regression.manifest import (
 )
 from benchmark.sparsevllm_regression.run_suite import (
     _perf_command,
+    _require_successful_perf_matrix,
     _require_synchronized_step_timing,
     _scbench_command,
     _stress_command,
@@ -142,6 +143,7 @@ class SparseVLLMRegressionGradingTest(unittest.TestCase):
         method = manifest["methods"]["h2o"]
         self.assertEqual(method["supported_model_families"], ["qwen2"])
         self.assertEqual(method["supported_tensor_parallel_sizes"], [1])
+        self.assertEqual(method["performance"]["minimum_prefill_speedup"], 1.0)
         self.assertIsNone(
             runtime_support_reason(
                 manifest,
@@ -168,6 +170,23 @@ class SparseVLLMRegressionGradingTest(unittest.TestCase):
                 tensor_parallel_sizes=(2,),
             ),
         )
+
+    def test_manifest_rejects_invalid_method_prefill_performance_floor(self):
+        for invalid_value in (0.0, float("nan"), True):
+            manifest = copy.deepcopy(load_manifest())
+            manifest["methods"]["h2o"]["performance"]["minimum_prefill_speedup"] = (
+                invalid_value
+            )
+
+            with self.subTest(invalid_value=invalid_value), self.assertRaisesRegex(
+                ManifestError, "minimum_prefill_speedup"
+            ):
+                validate_manifest(manifest)
+
+        manifest = copy.deepcopy(load_manifest())
+        manifest["methods"]["h2o"]["performance"]["minimum_prefill_speedups"] = 1.0
+        with self.assertRaisesRegex(ManifestError, "unknown keys"):
+            validate_manifest(manifest)
 
     def test_h2o_unsupported_model_dry_run_is_skipped_by_policy(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -395,6 +414,167 @@ class SparseVLLMRegressionGradingTest(unittest.TestCase):
                 artifact=Path("/tmp/perf.jsonl"),
             )
 
+    def test_regression_requires_complete_successful_perf_matrix(self):
+        rows = [
+            {
+                "status": "SUCCESS",
+                "method": method,
+                "length": length,
+                "batch_size": batch_size,
+            }
+            for method in ("vanilla", "h2o")
+            for length in (32000, 64000)
+            for batch_size in (4, 8)
+        ]
+
+        _require_successful_perf_matrix(
+            rows,
+            methods=("vanilla", "h2o"),
+            lengths=(32000, 64000),
+            batch_sizes=(4, 8),
+            artifact=Path("/tmp/perf.jsonl"),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "missing"):
+            _require_successful_perf_matrix(
+                rows[:-1],
+                methods=("vanilla", "h2o"),
+                lengths=(32000, 64000),
+                batch_sizes=(4, 8),
+                artifact=Path("/tmp/perf.jsonl"),
+            )
+
+        failed_rows = copy.deepcopy(rows)
+        failed_rows[-1]["status"] = "FAILED"
+        with self.assertRaisesRegex(RuntimeError, "non-success"):
+            _require_successful_perf_matrix(
+                failed_rows,
+                methods=("vanilla", "h2o"),
+                lengths=(32000, 64000),
+                batch_sizes=(4, 8),
+                artifact=Path("/tmp/perf.jsonl"),
+            )
+
+    def test_regression_rejects_duplicate_or_unexpected_perf_cases(self):
+        row = {
+            "status": "SUCCESS",
+            "method": "vanilla",
+            "length": 32000,
+            "batch_size": 4,
+        }
+        with self.assertRaisesRegex(RuntimeError, "duplicate"):
+            _require_successful_perf_matrix(
+                [row, dict(row)],
+                methods=("vanilla",),
+                lengths=(32000,),
+                batch_sizes=(4,),
+                artifact=Path("/tmp/perf.jsonl"),
+            )
+
+        with self.assertRaisesRegex(RuntimeError, "unexpected"):
+            _require_successful_perf_matrix(
+                [row, {**row, "method": "h2o"}],
+                methods=("vanilla",),
+                lengths=(32000,),
+                batch_sizes=(4,),
+                artifact=Path("/tmp/perf.jsonl"),
+            )
+
+    def test_perf_layer_applies_h2o_prefill_non_regression_gate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            model_path = root / "qwen25-model"
+            model_path.mkdir()
+
+            def fake_run_and_record(summary, cmd, **kwargs):
+                del kwargs
+                output_path = Path(cmd[cmd.index("--output_jsonl") + 1])
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                rows = [
+                    {
+                        "status": "SUCCESS",
+                        "method": "vanilla",
+                        "length": length,
+                        "batch_size": batch_size,
+                        "prefill_tp": 100.0,
+                        "decode_tp": 100.0,
+                        "decode_cuda_graph_expected": True,
+                        "decode_cuda_graph_active": True,
+                        "synchronize_step_timing": True,
+                    }
+                    for length in (32000, 64000)
+                    for batch_size in (4, 8)
+                ]
+                rows.extend(
+                    {
+                        "status": "SUCCESS",
+                        "method": "h2o",
+                        "length": length,
+                        "batch_size": batch_size,
+                        "prefill_tp": 99.0,
+                        "decode_tp": 110.0,
+                        "decode_cuda_graph_expected": True,
+                        "decode_cuda_graph_active": True,
+                        "synchronize_step_timing": True,
+                        "memory_accounting": {"observed_savings": 0.3},
+                    }
+                    for length in (32000, 64000)
+                    for batch_size in (4, 8)
+                )
+                output_path.write_text(
+                    "".join(json.dumps(row) + "\n" for row in rows),
+                    encoding="utf-8",
+                )
+                summary["commands"].append({"status": "success", "cmd": cmd})
+
+            argv = [
+                "run_suite.py",
+                "--layer",
+                "perf",
+                "--models",
+                "qwen25_7b",
+                "--methods",
+                "h2o",
+                "--run_id",
+                "h2o-prefill-gate",
+                "--output_root",
+                str(root),
+            ]
+            with patch.object(sys, "argv", argv), patch.dict(
+                os.environ,
+                {
+                    "DELTAKV_MODEL_QWEN25_7B": str(model_path),
+                    "DELTAKV_TOKENIZER_QWEN25_7B": str(model_path),
+                },
+                clear=False,
+            ), patch(
+                "benchmark.sparsevllm_regression.run_suite._run_and_record",
+                side_effect=fake_run_and_record,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "Required regression gates failed"):
+                    run_suite_main()
+
+            summary = json.loads(
+                (
+                    root
+                    / "sparsevllm_regression"
+                    / "h2o-prefill-gate"
+                    / "grade_summary.json"
+                ).read_text(encoding="utf-8")
+            )
+            perf_grades = [
+                grade
+                for grade in summary["grades"]
+                if grade["name"] == "performance" and grade["method"] == "h2o"
+            ]
+            self.assertEqual(summary["status"], "failed")
+            self.assertEqual(summary["worst_required_grade"], "D")
+            self.assertEqual(len(perf_grades), 4)
+            self.assertTrue(all(grade["grade"] == "D" for grade in perf_grades))
+            self.assertTrue(
+                all(grade["metrics"]["prefill_speedup"] == 0.99 for grade in perf_grades)
+            )
+
     def test_scbench_regression_command_uses_batched_multiturn_subset(self):
         manifest = load_manifest()
         cmd = _scbench_command(
@@ -488,6 +668,31 @@ class SparseVLLMRegressionGradingTest(unittest.TestCase):
         self.assertEqual(grade_perf(1.1, graph_expected=True, graph_active=True).grade, "C")
         self.assertEqual(grade_perf(0.8, graph_expected=True, graph_active=True, require_speedup=False).grade, "A")
         self.assertEqual(grade_perf(2.1, graph_expected=True, graph_active=False).grade, "D")
+        self.assertEqual(
+            grade_perf(
+                1.1,
+                graph_expected=True,
+                graph_active=True,
+                prefill_speedup=1.0,
+                minimum_prefill_speedup=1.0,
+            ).grade,
+            "C",
+        )
+        prefill_regression = grade_perf(
+            1.1,
+            graph_expected=True,
+            graph_active=True,
+            prefill_speedup=0.99,
+            minimum_prefill_speedup=1.0,
+        )
+        self.assertEqual(prefill_regression.grade, "D")
+        self.assertIn("prefill", prefill_regression.reason)
+        with self.assertRaisesRegex(ValueError, "must be positive"):
+            grade_perf(
+                1.1,
+                prefill_speedup=1.0,
+                minimum_prefill_speedup=0.0,
+            )
         self.assertEqual(grade_memory(expected_savings=0.3, observed_savings=0.21).grade, "B")
         self.assertEqual(grade_memory(expected_savings=0.3, observed_savings=0.05).grade, "D")
         self.assertEqual(

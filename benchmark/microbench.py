@@ -168,10 +168,43 @@ def _standard_status(status: Any) -> str:
 
 def _benchmark_sparse_method(method: str) -> str:
     """Resolve a benchmark label to the runtime sparse method without fallback."""
-    normalized = normalize_sparse_method(method)
+    runtime_method = str(method).strip().lower()
+    normalized = normalize_sparse_method(runtime_method)
     if normalized not in CANONICAL_SPARSE_METHODS:
         raise ValueError(f"Unsupported benchmark sparse method: {method!r}.")
+    if runtime_method in {
+        "deltakv-less-memory-cudagraph",
+        "deltakv_less_memory_cudagraph",
+    }:
+        return runtime_method
     return "vanilla" if normalized == "" else normalized
+
+
+def _record_child_exit_failure(
+    results_dict,
+    *,
+    method: str,
+    length: int,
+    batch_size: int,
+    exitcode: int | None,
+    synchronize_step_timing: bool,
+) -> None:
+    if exitcode in (None, 0):
+        return
+    case_key = (method, length, batch_size)
+    row = dict(results_dict.get(case_key) or {})
+    partial_status = row.get("status")
+    row.setdefault("method", method)
+    row.setdefault("sparse_method", normalize_sparse_method(method))
+    row.setdefault("length", int(length))
+    row.setdefault("batch_size", int(batch_size))
+    row.setdefault("synchronize_step_timing", bool(synchronize_step_timing))
+    row.setdefault("error", f"benchmark child exited with code {exitcode}")
+    row["status"] = "FAILED"
+    row["child_exitcode"] = int(exitcode)
+    if partial_status is not None:
+        row["child_partial_status"] = str(partial_status)
+    results_dict[case_key] = row
 
 
 def _artifact_records(args, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -334,6 +367,10 @@ def _resolved_engine_config(llm) -> dict[str, Any]:
         "kv_quant_group_size",
         "full_attn_layers",
         "obs_layer_ids",
+        "h2o_decode_budget",
+        "h2o_prefill_budget",
+        "h2o_recent_ratio",
+        "h2o_prefill_score_window",
     )
     return {
         key: _jsonable_config_value(getattr(config, key))
@@ -820,6 +857,14 @@ def main():
                 p = mp.Process(target=benchmark_task, args=(method, length, bs, args, results_dict))
                 p.start()
                 p.join()
+                _record_child_exit_failure(
+                    results_dict,
+                    method=method,
+                    length=length,
+                    batch_size=bs,
+                    exitcode=p.exitcode,
+                    synchronize_step_timing=bool(args.synchronize_step_timing),
+                )
 
     # 打印最终报表
     print(f"\n\n{'='*140}")
@@ -877,8 +922,17 @@ def main():
     print(f"{ '='*140}\n")
     _write_jsonl(args.output_jsonl, jsonl_rows)
     _write_output_dir(args, jsonl_rows)
+    failed_rows = [
+        row
+        for row in jsonl_rows
+        if str(row.get("status", "")).upper() in {"FAILED", "OOM", "UNKNOWN"}
+    ]
+    if failed_rows:
+        print(f"[microbench] {len(failed_rows)} benchmark case(s) failed.", file=sys.stderr)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
     mp.set_start_method('spawn', force=True)
-    main()
+    raise SystemExit(main())

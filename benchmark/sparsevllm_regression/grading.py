@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -26,9 +27,12 @@ class GateGrade:
 
 
 def _require_number(value: Any, name: str) -> float:
-    if not isinstance(value, (int, float)):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise TypeError(f"{name} must be numeric, got {type(value).__name__}.")
-    return float(value)
+    resolved = float(value)
+    if not math.isfinite(resolved):
+        raise ValueError(f"{name} must be finite, got {value!r}.")
+    return resolved
 
 
 def grade_quality(
@@ -129,32 +133,68 @@ def grade_perf(
     graph_expected: bool = True,
     graph_active: bool = True,
     require_speedup: bool = True,
+    prefill_speedup: float | None = None,
+    minimum_prefill_speedup: float | None = None,
 ) -> GateGrade:
     speedup = _require_number(speedup, "speedup")
+    resolved_prefill_speedup = (
+        None
+        if prefill_speedup is None
+        else _require_number(prefill_speedup, "prefill_speedup")
+    )
+    resolved_minimum_prefill_speedup = (
+        None
+        if minimum_prefill_speedup is None
+        else _require_number(minimum_prefill_speedup, "minimum_prefill_speedup")
+    )
+    if (
+        resolved_minimum_prefill_speedup is not None
+        and resolved_minimum_prefill_speedup <= 0.0
+    ):
+        raise ValueError(
+            "minimum_prefill_speedup must be positive, "
+            f"got {resolved_minimum_prefill_speedup}."
+        )
+    metrics = {
+        "speedup": speedup,
+        "decode_speedup": speedup,
+        "prefill_speedup": resolved_prefill_speedup,
+        "minimum_prefill_speedup": resolved_minimum_prefill_speedup,
+        "graph_expected": graph_expected,
+        "graph_active": graph_active,
+        "require_speedup": require_speedup,
+    }
     if graph_expected and not graph_active:
         return GateGrade(
             "performance",
             "D",
             "failed",
-            {
-                "speedup": speedup,
-                "graph_expected": graph_expected,
-                "graph_active": graph_active,
-                "require_speedup": require_speedup,
-            },
+            metrics,
             "decode CUDA graph was expected but not active.",
         )
+    if resolved_minimum_prefill_speedup is not None:
+        if resolved_prefill_speedup is None:
+            return GateGrade(
+                "performance",
+                "D",
+                "failed",
+                metrics,
+                "prefill speedup is required by the method performance policy.",
+            )
+        if resolved_prefill_speedup < resolved_minimum_prefill_speedup:
+            return GateGrade(
+                "performance",
+                "D",
+                "failed",
+                metrics,
+                "prefill speedup is below the required minimum.",
+            )
     if not require_speedup:
         return GateGrade(
             "performance",
             "A",
             "success",
-            {
-                "speedup": speedup,
-                "graph_expected": graph_expected,
-                "graph_active": graph_active,
-                "require_speedup": require_speedup,
-            },
+            metrics,
             "Speedup is recorded but not required by this performance gate.",
         )
     if speedup >= 2.0:
@@ -169,12 +209,7 @@ def grade_perf(
         "performance",
         grade,
         "success" if grade != "D" else "failed",
-        {
-            "speedup": speedup,
-            "graph_expected": graph_expected,
-            "graph_active": graph_active,
-            "require_speedup": require_speedup,
-        },
+        metrics,
     )
 
 
