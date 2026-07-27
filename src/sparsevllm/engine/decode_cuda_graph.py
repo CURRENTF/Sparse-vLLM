@@ -388,6 +388,13 @@ class DecodeCudaGraphRunner:
         buffers used by captured observation-layer kernels must be reset by a
         captured fill before each replay.
         """
+        reset_contiguous = getattr(
+            self.sparse_controller,
+            "reset_decode_attn_scores_for_graph",
+            None,
+        )
+        if callable(reset_contiguous) and reset_contiguous(refs):
+            return
         for layer_refs in refs.values():
             attn_score = layer_refs.get("attn_score")
             if isinstance(attn_score, torch.Tensor):

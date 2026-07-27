@@ -14,6 +14,7 @@ Set `sparse_method` to one of the following method names.
 | `streamingllm` | Physical eviction | StreamingLLM-style fixed sink plus recent-window cache. Tokens outside the retained prefix/tail policy are physically evicted from the active KV cache. | `sink_keep_tokens`, `recent_keep_tokens` |
 | `attention-sink` | Physical eviction | Alias-style attention-sink policy with the same sink-token and recent-window retention model. It is useful for comparing sink-window behavior against other physical eviction methods. | `sink_keep_tokens`, `recent_keep_tokens` |
 | `snapkv` | Physical eviction | SnapKV-style token selection keeps a compact set of important historical tokens after prefill. It reduces cache footprint by physically retaining only selected KV positions. | `decode_keep_tokens`, `prefill_keep_tokens`, `sink_keep_tokens`, `recent_keep_tokens` |
+| `h2o` | Physical eviction | H2O accumulates a normalized token-importance vector aligned with each physical row. Prefill uses normalized attention mass; decode follows the SnapKV-style fused path by max-reducing raw QK logits across query heads before token-wise normalization. Every chunk and decode step retains heavy hitters plus a recent suffix; the final prefill chunk contracts to the decode budget. Sparse-vLLM v1 shares one selected token set across KV heads. | `h2o_decode_budget`, `h2o_prefill_budget`, `h2o_recent_ratio`, `h2o_prefill_score_window` |
 | `pyramidkv` | Physical eviction | PyramidKV-style layer-dependent KV retention. It allocates sparse budgets across layers and physically stores the selected context tokens. | `decode_keep_tokens`, `prefill_keep_tokens`, `sink_keep_tokens`, `recent_keep_tokens` |
 | `omnikv` | Logical masking | OmniKV keeps the physical cache available but constructs sparse attention views for selected layers. This is useful when the method should avoid rewriting cache storage while still reducing attention work. | `full_attention_layers`, `decode_keep_tokens`, `prefill_keep_tokens`, `sink_keep_tokens`, `recent_keep_tokens`, `chunk_prefill_accel_omnikv` |
 | `quest` | Query-aware page selection | QuEST selects token pages based on the decode query. Prefill stays dense, and sparse selection happens in decode through page/chunk budgets. | `quest_chunk_size`, `quest_skip_layers`, `sink_keep_tokens`, `decode_keep_tokens`, `recent_keep_tokens` |
@@ -30,7 +31,7 @@ should not redefine method semantics.
 
 | Policy | Runtime Semantics | Current Default Methods |
 | --- | --- | --- |
-| `all_chunked` | Every prefill request is capped by `chunk_prefill_size` and normal scheduler batch limits. | `vanilla`, `streamingllm`, `attention-sink`, `snapkv`, `quest`, `omnikv` |
+| `all_chunked` | Every prefill request is capped by `chunk_prefill_size` and normal scheduler batch limits. | `vanilla`, `streamingllm`, `attention-sink`, `snapkv`, `h2o`, `quest`, `omnikv` |
 | `long_bs1full_short_batch` | Prompts at or below `chunk_prefill_size` use complete batched prefill. Prompts above it are isolated at batch size 1 and use chunked RawKV offload. | `pyramidkv` and DeltaKV-family methods |
 
 DeltaKV-family methods and PyramidKV keep `long_bs1full_short_batch` as the only

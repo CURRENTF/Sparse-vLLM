@@ -10,6 +10,7 @@ REQUIRED_METHODS = {
     "vanilla",
     "streamingllm",
     "snapkv",
+    "h2o",
     "pyramidkv",
     "omnikv",
     "quest",
@@ -112,6 +113,26 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
                     raise ManifestError(
                         f"method {method_id!r} model_configs[{model_id!r}] must be a JSON object."
                     )
+        supported_families = method.get("supported_model_families")
+        if supported_families is not None:
+            if (
+                not isinstance(supported_families, list)
+                or not supported_families
+                or any(not isinstance(family, str) or not family for family in supported_families)
+            ):
+                raise ManifestError(
+                    f"method {method_id!r} supported_model_families must be a non-empty string list."
+                )
+        supported_tp_sizes = method.get("supported_tensor_parallel_sizes")
+        if supported_tp_sizes is not None:
+            if (
+                not isinstance(supported_tp_sizes, list)
+                or not supported_tp_sizes
+                or any(not isinstance(size, int) or size <= 0 for size in supported_tp_sizes)
+            ):
+                raise ManifestError(
+                    f"method {method_id!r} supported_tensor_parallel_sizes must be a non-empty positive integer list."
+                )
         for bool_key in ("requires_compressor", "hf_logits_reference"):
             if bool_key not in method or not isinstance(method[bool_key], bool):
                 raise ManifestError(f"method {method_id!r} must define boolean {bool_key}.")
@@ -160,6 +181,39 @@ def select_entries(manifest: dict[str, Any], models: list[str] | None, methods: 
     if unknown_methods:
         raise ManifestError(f"Unknown method ids: {unknown_methods}")
     return model_ids, method_ids
+
+
+def runtime_support_reason(
+    manifest: dict[str, Any],
+    model_id: str,
+    method_id: str,
+    *,
+    tensor_parallel_sizes: list[int] | tuple[int, ...],
+) -> str | None:
+    """Return why a model/method pair is outside the declared runtime matrix."""
+    model = manifest["models"][model_id]
+    method = manifest["methods"][method_id]
+    supported_families = method.get("supported_model_families")
+    model_family = str(model.get("family") or "")
+    if supported_families is not None and model_family not in supported_families:
+        return (
+            f"method supports model families {supported_families}, "
+            f"got model={model_id!r} family={model_family!r}"
+        )
+    supported_tp_sizes = method.get("supported_tensor_parallel_sizes")
+    unsupported_tp_sizes = sorted(
+        {
+            int(size)
+            for size in tensor_parallel_sizes
+            if supported_tp_sizes is not None and int(size) not in supported_tp_sizes
+        }
+    )
+    if unsupported_tp_sizes:
+        return (
+            f"method supports tensor_parallel_size values {supported_tp_sizes}, "
+            f"got {unsupported_tp_sizes}"
+        )
+    return None
 
 
 def resolve_manifest_paths(manifest: dict[str, Any]) -> dict[str, Any]:

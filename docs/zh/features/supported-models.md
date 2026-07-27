@@ -21,14 +21,14 @@ TP 规模限制为 1 到 8，并且 checkpoint 维度（包括 attention head �
 
 ## 稀疏方法支持
 
-| 模型 | Vanilla | StreamingLLM | SnapKV | PyramidKV | OmniKV | QuEST | R-KV | SkipKV | DeltaKV |
-| --- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| Qwen2.5 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | 指定 checkpoint¹ | 需要 compressor² |
-| Qwen3 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — | 需要压缩器² |
-| Qwen3MoE | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — | — |
-| Qwen3.5 / Qwen3.6 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — | 匹配的 checkpoint³ |
-| Llama 3 / 3.1 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | 指定 checkpoint¹ | 需要 compressor² |
-| MiniMax M2.7 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — | — |
+| 模型 | Vanilla | StreamingLLM | SnapKV | H2O | PyramidKV | OmniKV | QuEST | R-KV | SkipKV | DeltaKV |
+| --- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| Qwen2.5 | ✅ | ✅ | ✅ | 实验性 TP=1⁴ | ✅ | ✅ | ✅ | ✅ | 指定 checkpoint¹ | 需要 compressor² |
+| Qwen3 | ✅ | ✅ | ✅ | — | ✅ | ✅ | ✅ | ✅ | — | 需要压缩器² |
+| Qwen3MoE | ✅ | ✅ | ✅ | — | ✅ | ✅ | ✅ | ✅ | — | — |
+| Qwen3.5 / Qwen3.6 | ✅ | ✅ | ✅ | — | ✅ | ✅ | ✅ | ✅ | — | 匹配的 checkpoint³ |
+| Llama 3 / 3.1 | ✅ | ✅ | ✅ | — | ✅ | ✅ | ✅ | ✅ | 指定 checkpoint¹ | 需要 compressor² |
+| MiniMax M2.7 | ✅ | ✅ | ✅ | — | ✅ | ✅ | ✅ | ✅ | — | — |
 
 ¹ SkipKV 仅支持已发布 steering vector 的模型：
 `DeepSeek-R1-Distill-Qwen-7B`、`DeepSeek-R1-Distill-Qwen-14B` 和
@@ -37,5 +37,7 @@ TP 规模限制为 1 到 8，并且 checkpoint 维度（包括 attention head �
 ² DeltaKV 需要针对 base model 训练的 compressor checkpoint。
 
 ³ Qwen3.5 和 Qwen3.6 需要 mixed-attention runtime 可接受的匹配 DeltaKV checkpoint。
+
+⁴ H2O 当前仅面向 Qwen2.5 单 GPU 验证路径。其他模型、TP 和 expert-parallel 组合尚未验证；存在显式兼容性 gate 时会快速失败。
 
 `—` 表示当前不支持该组合。

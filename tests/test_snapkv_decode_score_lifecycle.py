@@ -12,6 +12,25 @@ from sparsevllm.utils.context import reset_context, set_context
 
 
 class WorkerInfoTest(unittest.TestCase):
+    def test_h2o_selection_config_is_reported(self):
+        engine = object.__new__(LLMEngine)
+        engine.config = SimpleNamespace(
+            model="model",
+            hf_config=SimpleNamespace(model_type="qwen2", vocab_size=32_000),
+            vllm_sparse_method="h2o",
+            h2o_decode_budget=4096,
+            h2o_prefill_budget=8192,
+            h2o_recent_ratio=0.5,
+            h2o_prefill_score_window=128,
+        )
+
+        benchmark_config = engine.worker_info()["benchmark_config"]
+
+        self.assertEqual(benchmark_config["h2o_decode_budget"], 4096)
+        self.assertEqual(benchmark_config["h2o_prefill_budget"], 8192)
+        self.assertEqual(benchmark_config["h2o_recent_ratio"], 0.5)
+        self.assertEqual(benchmark_config["h2o_prefill_score_window"], 128)
+
     def test_snapkv_selection_config_is_reported(self):
         engine = object.__new__(LLMEngine)
         engine.config = SimpleNamespace(

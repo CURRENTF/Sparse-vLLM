@@ -272,6 +272,7 @@ class PrefillPolicyRegistryTest(unittest.TestCase):
             "streamingllm",
             "attention-sink",
             "snapkv",
+            "h2o",
             "quest",
             "rkv",
             "r-kv",
@@ -597,6 +598,50 @@ class PrefillPolicyConfigTest(unittest.TestCase):
             prefill_schedule_policy=PREFILL_POLICY_ALL_CHUNKED,
         )
         self.assertEqual(cfg.prefill_schedule_policy, PREFILL_POLICY_ALL_CHUNKED)
+
+        h2o_cfg = self.make_config(
+            vllm_sparse_method="h2o",
+            prefill_schedule_policy=PREFILL_POLICY_ALL_CHUNKED,
+        )
+        self.assertEqual(h2o_cfg.prefill_schedule_policy, PREFILL_POLICY_ALL_CHUNKED)
+
+    def test_h2o_config_validation_fails_fast(self):
+        invalid = (
+            ({"h2o_decode_budget": 0}, "h2o_decode_budget"),
+            (
+                {"h2o_decode_budget": 8, "h2o_prefill_budget": 7},
+                "h2o_prefill_budget",
+            ),
+            ({"h2o_recent_ratio": 0.0}, "h2o_recent_ratio"),
+            ({"h2o_recent_ratio": 1.0}, "h2o_recent_ratio"),
+            ({"h2o_prefill_score_window": 0}, "h2o_prefill_score_window"),
+            ({"h2o_prefill_score_window": 129}, "h2o_prefill_score_window"),
+        )
+        for values, message in invalid:
+            with self.subTest(values=values):
+                with self.assertRaisesRegex(ValueError, message):
+                    self.make_config(vllm_sparse_method="h2o", **values)
+
+    def test_h2o_rejects_unvalidated_model_and_tp_combinations(self):
+        llama_config = self.hf_config()
+        llama_config.model_type = "llama"
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch(
+                "sparsevllm.config.AutoConfig.from_pretrained",
+                return_value=llama_config,
+            ):
+                with self.assertRaisesRegex(
+                    NotImplementedError,
+                    "Qwen2-family models only",
+                ):
+                    Config(model=str(Path(tmp)), vllm_sparse_method="h2o")
+
+        with self.assertRaisesRegex(NotImplementedError, "requires TP=1"):
+            self.make_config(
+                vllm_sparse_method="h2o",
+                tensor_parallel_size=2,
+                decode_cuda_graph=False,
+            )
 
     def test_all_chunked_keeps_configured_batch_cap_below_chunk_size(self):
         cfg = self.make_config(

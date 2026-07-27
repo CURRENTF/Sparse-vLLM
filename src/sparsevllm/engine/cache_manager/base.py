@@ -281,6 +281,10 @@ class CacheManager(ABC):
             from .snapkv import SnapKVCacheManager
 
             return SnapKVCacheManager(config, parallel_context)
+        if sparse_method == "h2o":
+            from .h2o import H2OCacheManager
+
+            return H2OCacheManager(config, parallel_context)
         if sparse_method == "rkv":
             from .rkv import RKVCacheManager
 

@@ -156,6 +156,7 @@ normalizer 只接受规范 public runtime name。它把这些名称映射到 bac
 | `""` 或规范 `vanilla` | Standard dense cache manager。 |
 | `streamingllm`, `attention-sink`, `attention_sink` | StreamingLLM cache manager；alias 规范为 `streamingllm`。 |
 | `snapkv` | SnapKV cache manager。 |
+| `h2o` | 使用累计归一化 token-importance 评分及 heavy-hitter + recent 物理淘汰的 H2O cache manager。Prefill 使用 attention mass；优化后的 decode 使用 max-reduced raw QK logit，再按 token 归一化。 |
 | `pyramidkv` | 带 PyramidKV layer budget 的 SnapKV cache manager。 |
 | `omnikv` | OmniKV cache manager。 |
 | `quest` | Quest cache manager。 |
@@ -304,12 +305,16 @@ selector 写入 `<OUTPUT_DIR>/selected_full_layers.json`；在 OmniKV Sparse-vLL
 
 这是 offline calibration step，不是自动 `LLM(...)` runtime mode。设置 `full_attention_layers` 后，Sparse-vLLM 从中派生 internal observation layer。`observation_layers` 不是受支持的 runtime key。
 
-### 6.3 SnapKV、PyramidKV、OmniKV、Quest
+### 6.3 SnapKV、H2O、PyramidKV、OmniKV、Quest
 
 | 参数 | 主要使用者 | 含义 |
 | --- | --- | --- |
 | `snapkv_window_size` | HF SnapKV/PyramidKV 和 Sparse-vLLM SnapKV/DeltaKV-SnapKV | Local observation/recent window。 |
 | `pool_kernel_size` | HF token selection 和部分 Sparse-vLLM 方法 | Score smoothing kernel；使用者因方法而异。 |
+| `h2o_decode_budget` | Sparse-vLLM H2O | 最后一个 prefill chunk 结束后、以及 decode 超预算时保留的 token 总数。该总数同时包含 heavy hitter 和 recent token；H2O 不额外强制 sink budget。默认值：`4096`。 |
+| `h2o_prefill_budget` | Sparse-vLLM H2O | 非最后 prefill chunk 结束后保留的较高 token 总预算，必须不小于 `h2o_decode_budget`。默认值：`8192`。 |
+| `h2o_recent_ratio` | Sparse-vLLM H2O | 两种总预算中为最近物理 token 保留的比例；剩余预算按累计 attention mass 选择。必须严格位于 0 和 1 之间。默认值：`0.5`。 |
+| `h2o_prefill_score_window` | Sparse-vLLM H2O | 归一化 prefill score kernel 使用的当前 chunk 尾部 query token 数，范围为 1 到 128。默认值：`128`。 |
 | `pyramid_layer_ratios` | Sparse-vLLM PyramidKV | 显式 per-KV/full-attention-layer keep ratio。对于 mixed-attention model，legacy full Transformer-layer list 会投影到 KV layer。 |
 | `pyramidkv_start_layer`, `pyramidkv_start_ratio`, `pyramidkv_least_layer`, `pyramidkv_least_ratio` | HF 和 Sparse-vLLM PyramidKV-style path | 自动生成 budget schedule；layer position 按 KV/full-attention layer 计数。 |
 | `quest_chunk_size` | Sparse-vLLM Quest | Quest page size。 |

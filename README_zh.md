@@ -33,13 +33,14 @@ Sparse-vLLM 是一个从设计之初就以稀疏性为核心原则的推理框�
 
 ## 核心稀疏方法
 
-Sparse-vLLM 支持物理淘汰、逻辑掩码、查询感知选择和混合 KV 压缩。主要方法系列包括 `streamingllm`、`snapkv`、`pyramidkv`、`omnikv`、`quest` 和 `deltakv`。
+Sparse-vLLM 支持物理淘汰、逻辑掩码、查询感知选择和混合 KV 压缩。主要方法系列包括 `streamingllm`、`snapkv`、`h2o`、`pyramidkv`、`omnikv`、`quest` 和 `deltakv`。
 
 | 方法 | 类型 | 简介 |
 | --- | --- | --- |
 | `vanilla` | 稠密基线 | 执行完整注意力计算并保留标准 KV 缓存行为，作为正确性和性能基线。 |
 | `streamingllm` / `attention-sink` | 物理淘汰 | 保留固定的注意力汇聚 token 和最近窗口，并物理淘汰策略范围之外的旧 token。 |
 | `snapkv`、`pyramidkv` | 物理淘汰 | 在预填充或收尾阶段选择重要的历史 token，仅存储保留下来的 KV token。 |
+| `h2o` | 物理淘汰 | 每层、每序列用一个 score vector 累积归一化 token importance，并在每个 prefill chunk 和 decode step 后保留 heavy hitter 与 recent 后缀。Prefill 使用归一化 attention mass；优化后的 decode 路径先在 query head 间对 raw QK logit 做 max reduction，再按 token 归一化。中间/最终总预算分别由 `h2o_prefill_budget` 和 `h2o_decode_budget` 控制，`h2o_recent_ratio` 切分预算，`h2o_prefill_score_window` 控制 chunk 评分窗口。 |
 | `omnikv` | 逻辑掩码 | 保留存储中的 token，但对注意力读取视图进行掩码，使稀疏层仅关注选定的上下文。 |
 | `quest` | 查询感知选择 | 保持预填充阶段为稠密计算，在解码阶段使用查询感知的分页选择。 |
 | `deltakv` / `deltakv-*` | 混合压缩 | 保留一个小型全精度池，并通过 DeltaKV 压缩或相关消融方法存储较早的上下文。 |

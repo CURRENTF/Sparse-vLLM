@@ -1,6 +1,7 @@
 import copy
 import json
 import os
+import sys
 import tempfile
 import types
 import unittest
@@ -28,9 +29,17 @@ from benchmark.sparsevllm_regression.manifest import (
     load_manifest,
     missing_runtime_inputs,
     resolve_manifest_paths,
+    runtime_support_reason,
     validate_manifest,
 )
-from benchmark.sparsevllm_regression.run_suite import _perf_command, _scbench_command, _stress_command, _stress_v2_command
+from benchmark.sparsevllm_regression.run_suite import (
+    _perf_command,
+    _require_synchronized_step_timing,
+    _scbench_command,
+    _stress_command,
+    _stress_v2_command,
+    main as run_suite_main,
+)
 from benchmark.sparsevllm_regression.run_suite import _quality_command
 from sparsevllm.engine.cache_manager.base import CacheManager
 from sparsevllm.distributed import ParallelContext, ParallelGroup
@@ -127,6 +136,77 @@ class SparseVLLMRegressionGradingTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ManifestError, "minimum_vanilla_score"):
             validate_manifest(manifest)
+
+    def test_h2o_manifest_declares_qwen2_tp1_runtime_matrix(self):
+        manifest = load_manifest()
+        method = manifest["methods"]["h2o"]
+        self.assertEqual(method["supported_model_families"], ["qwen2"])
+        self.assertEqual(method["supported_tensor_parallel_sizes"], [1])
+        self.assertIsNone(
+            runtime_support_reason(
+                manifest,
+                "qwen25_7b",
+                "h2o",
+                tensor_parallel_sizes=(1,),
+            )
+        )
+        self.assertIn(
+            "model families",
+            runtime_support_reason(
+                manifest,
+                "qwen3_4b",
+                "h2o",
+                tensor_parallel_sizes=(1,),
+            ),
+        )
+        self.assertIn(
+            "tensor_parallel_size",
+            runtime_support_reason(
+                manifest,
+                "qwen25_7b",
+                "h2o",
+                tensor_parallel_sizes=(2,),
+            ),
+        )
+
+    def test_h2o_unsupported_model_dry_run_is_skipped_by_policy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            model_path = root / "qwen3-model"
+            model_path.mkdir()
+            argv = [
+                "run_suite.py",
+                "--layer",
+                "quality",
+                "--models",
+                "qwen3_4b",
+                "--methods",
+                "h2o",
+                "--dry_run",
+                "--run_id",
+                "h2o-unsupported-dry-run",
+                "--output_root",
+                str(root),
+            ]
+            with patch.object(sys, "argv", argv), patch.dict(
+                os.environ,
+                {"DELTAKV_MODEL_QWEN3_4B": str(model_path)},
+                clear=False,
+            ):
+                self.assertEqual(run_suite_main(), 0)
+
+            summary = json.loads(
+                (
+                    root
+                    / "sparsevllm_regression"
+                    / "h2o-unsupported-dry-run"
+                    / "grade_summary.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(summary["commands"], [])
+            self.assertEqual(summary["skipped"][0]["model"], "qwen3_4b")
+            self.assertEqual(summary["skipped"][0]["method"], "h2o")
+            self.assertEqual(summary["skipped"][0]["status"], "skipped_by_policy")
 
     def test_model_specific_compressor_path_resolution(self):
         manifest = copy.deepcopy(load_manifest())
@@ -300,6 +380,20 @@ class SparseVLLMRegressionGradingTest(unittest.TestCase):
                     cmd = command_builder(**kwargs)
                     hyper_params = json.loads(cmd[cmd.index("--hyper_params") + 1])
                     self.assertIs(hyper_params["decode_cuda_graph"], expected)
+                    self.assertIn("--synchronize_step_timing", cmd)
+
+    def test_regression_rejects_unsynchronized_success_throughput(self):
+        with self.assertRaisesRegex(RuntimeError, "requires synchronized"):
+            _require_synchronized_step_timing(
+                [
+                    {
+                        "status": "SUCCESS",
+                        "method": "h2o",
+                        "synchronize_step_timing": False,
+                    }
+                ],
+                artifact=Path("/tmp/perf.jsonl"),
+            )
 
     def test_scbench_regression_command_uses_batched_multiturn_subset(self):
         manifest = load_manifest()

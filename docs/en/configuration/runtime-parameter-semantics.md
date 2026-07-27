@@ -187,6 +187,7 @@ Known Sparse-vLLM method strings:
 | `""` or canonical `vanilla` | Standard dense cache manager. |
 | `streamingllm`, `attention-sink`, `attention_sink` | StreamingLLM cache manager. Aliases normalize to `streamingllm`. |
 | `snapkv` | SnapKV cache manager. |
+| `h2o` | H2O cache manager with cumulative normalized token-importance scoring and heavy-hitter plus recent physical eviction. Prefill uses attention mass; optimized decode uses max-reduced raw QK logits followed by token-wise normalization. |
 | `pyramidkv` | SnapKV cache manager with PyramidKV layer budgets. |
 | `omnikv` | OmniKV cache manager. |
 | `quest` | Quest cache manager. |
@@ -364,12 +365,16 @@ This is an offline calibration step, not an automatic `LLM(...)` runtime mode.
 After setting `full_attention_layers`, Sparse-vLLM derives its internal
 observation layers from it. `observation_layers` is not a supported runtime key.
 
-### 6.3 SnapKV, PyramidKV, OmniKV, Quest
+### 6.3 SnapKV, H2O, PyramidKV, OmniKV, Quest
 
 | Parameter | Main consumer | Meaning |
 | --- | --- | --- |
 | `snapkv_window_size` | HF SnapKV/PyramidKV and Sparse-vLLM SnapKV/DeltaKV-SnapKV | Local observation/recent window. |
 | `pool_kernel_size` | HF token selection and some Sparse-vLLM methods | Score smoothing kernel. The consumer differs by method. |
+| `h2o_decode_budget` | Sparse-vLLM H2O | Total tokens retained after the final prefill chunk and after each over-budget decode step. This total includes both heavy hitters and recent tokens; H2O does not add a separate forced sink budget. Default: `4096`. |
+| `h2o_prefill_budget` | Sparse-vLLM H2O | Higher total budget retained after a non-final prefill chunk. It must be at least `h2o_decode_budget`. Default: `8192`. |
+| `h2o_recent_ratio` | Sparse-vLLM H2O | Fraction of either total budget reserved for the most recent physical tokens; the remainder is selected by cumulative attention mass. Must be strictly between 0 and 1. Default: `0.5`. |
+| `h2o_prefill_score_window` | Sparse-vLLM H2O | Number of query tokens from the current chunk tail used by the normalized prefill score kernel. Range: 1 through 128. Default: `128`. |
 | `pyramid_layer_ratios` | Sparse-vLLM PyramidKV | Explicit per-KV/full-attention-layer keep ratios. A legacy full Transformer-layer list is projected onto KV layers for mixed-attention models. |
 | `pyramidkv_start_layer`, `pyramidkv_start_ratio`, `pyramidkv_least_layer`, `pyramidkv_least_ratio` | HF and Sparse-vLLM PyramidKV-style paths | Auto-generate the budget schedule; layer positions count KV/full-attention layers. |
 | `quest_chunk_size` | Sparse-vLLM Quest | Quest page size. |

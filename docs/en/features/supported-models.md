@@ -30,14 +30,14 @@ normalized internally to `model_type=qwen3_5`.
 
 ## Sparse Method Support
 
-| Model | Vanilla | StreamingLLM | SnapKV | PyramidKV | OmniKV | QuEST | R-KV | SkipKV | DeltaKV |
-| --- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| Qwen2.5 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | Selected checkpoints¹ | Compressor required² |
-| Qwen3 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — | Compressor required² |
-| Qwen3MoE | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — | — |
-| Qwen3.5 / Qwen3.6 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — | Matched checkpoint³ |
-| Llama 3 / 3.1 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | Selected checkpoint¹ | Compressor required² |
-| MiniMax M2.7 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — | — |
+| Model | Vanilla | StreamingLLM | SnapKV | H2O | PyramidKV | OmniKV | QuEST | R-KV | SkipKV | DeltaKV |
+| --- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| Qwen2.5 | ✅ | ✅ | ✅ | Experimental TP=1⁴ | ✅ | ✅ | ✅ | ✅ | Selected checkpoints¹ | Compressor required² |
+| Qwen3 | ✅ | ✅ | ✅ | — | ✅ | ✅ | ✅ | ✅ | — | Compressor required² |
+| Qwen3MoE | ✅ | ✅ | ✅ | — | ✅ | ✅ | ✅ | ✅ | — | — |
+| Qwen3.5 / Qwen3.6 | ✅ | ✅ | ✅ | — | ✅ | ✅ | ✅ | ✅ | — | Matched checkpoint³ |
+| Llama 3 / 3.1 | ✅ | ✅ | ✅ | — | ✅ | ✅ | ✅ | ✅ | Selected checkpoint¹ | Compressor required² |
+| MiniMax M2.7 | ✅ | ✅ | ✅ | — | ✅ | ✅ | ✅ | ✅ | — | — |
 
 ¹ SkipKV is limited to the released steering-vector models:
 `DeepSeek-R1-Distill-Qwen-7B`, `DeepSeek-R1-Distill-Qwen-14B`, and
@@ -47,5 +47,9 @@ normalized internally to `model_type=qwen3_5`.
 
 ³ Qwen3.5 and Qwen3.6 require a matching DeltaKV checkpoint accepted by the
 mixed-attention runtime.
+
+⁴ H2O is currently scoped to the Qwen2.5 single-GPU validation path. Other
+model, TP, and expert-parallel combinations remain unvalidated and fail fast
+where an explicit compatibility gate exists.
 
 `—` means that the combination is not currently supported.

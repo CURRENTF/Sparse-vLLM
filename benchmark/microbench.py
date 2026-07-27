@@ -20,6 +20,7 @@ if src_path not in sys.path:
 
 from deltakv.configs.runtime_params import normalize_runtime_params
 from sparsevllm.method_registry import (
+    CANONICAL_SPARSE_METHODS,
     is_decode_cuda_graph_supported,
     is_tp_decode_cuda_graph_supported,
     normalize_sparse_method,
@@ -165,6 +166,14 @@ def _standard_status(status: Any) -> str:
     return "model_failed"
 
 
+def _benchmark_sparse_method(method: str) -> str:
+    """Resolve a benchmark label to the runtime sparse method without fallback."""
+    normalized = normalize_sparse_method(method)
+    if normalized not in CANONICAL_SPARSE_METHODS:
+        raise ValueError(f"Unsupported benchmark sparse method: {method!r}.")
+    return "vanilla" if normalized == "" else normalized
+
+
 def _artifact_records(args, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     for idx, row in enumerate(rows):
@@ -177,6 +186,10 @@ def _artifact_records(args, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         record.setdefault("max_new_tokens", int(args.output_len))
         record.setdefault("sampling_temperature", float(args.temperature))
         record.setdefault("sampling_top_p", float(args.top_p))
+        record.setdefault(
+            "synchronize_step_timing",
+            bool(getattr(args, "synchronize_step_timing", False)),
+        )
         if "prefill_tp" in row:
             record.setdefault("prefill_tok_s", row["prefill_tp"])
         if "decode_tp" in row:
@@ -212,6 +225,9 @@ def _write_output_dir(args, rows: list[dict[str, Any]]) -> None:
         "output_len": int(args.output_len),
         "temperature": float(args.temperature),
         "top_p": float(args.top_p),
+        "synchronize_step_timing": bool(
+            getattr(args, "synchronize_step_timing", False)
+        ),
         "hyper_params": args.hyper_params_dict,
         "env": _selected_env_snapshot(),
     }
@@ -228,6 +244,9 @@ def _write_output_dir(args, rows: list[dict[str, Any]]) -> None:
         "success_cases": len(success_records),
         "skipped_cases": len(skipped_records),
         "failed_cases": len(failed_records),
+        "synchronize_step_timing": bool(
+            getattr(args, "synchronize_step_timing", False)
+        ),
         "records": records,
     }
 
@@ -369,28 +388,12 @@ def benchmark_task(method, length, bs, args, results_dict):
     print(f"\n>>> Starting: {method.upper()} | Context: {length} | Batch: {bs}...")
     
     base_hyper_params = args.hyper_params_dict
-    sparse_kwargs: dict[str, Any] = {"sparse_method": "vanilla"}
-    if method == "vanilla":
-        sparse_kwargs["sparse_method"] = "vanilla"
-    elif method in (
-        "streamingllm",
-        "attention-sink",
-        "attention_sink",
-        "snapkv",
-        "pyramidkv",
-        "omnikv",
-        "quest",
-        "rkv",
-        "r-kv",
-        "r_kv",
-        "skipkv",
-        "skip-kv",
-        "skip_kv",
-        "deltakv",
-    ):
-        sparse_kwargs["sparse_method"] = method
-    elif "deltakv" in method:
-        sparse_kwargs["sparse_method"] = method
+    synchronize_step_timing = bool(
+        getattr(args, "synchronize_step_timing", False)
+    )
+    sparse_kwargs: dict[str, Any] = {
+        "sparse_method": _benchmark_sparse_method(method),
+    }
 
     normalized_method = normalize_sparse_method(sparse_kwargs["sparse_method"])
     tensor_parallel_size = int(base_hyper_params.get("tensor_parallel_size", 1) or 1)
@@ -412,6 +415,7 @@ def benchmark_task(method, length, bs, args, results_dict):
             ),
             "decode_cuda_graph_expected": True,
             "decode_cuda_graph_active": False,
+            "synchronize_step_timing": synchronize_step_timing,
         }
         print(
             f"[{method.upper()}] SKIPPED_BY_POLICY: decode_cuda_graph is not supported "
@@ -528,6 +532,8 @@ def benchmark_task(method, length, bs, args, results_dict):
 
             step_start = perf_counter()
             finished_outputs, num_tokens = llm.step()
+            if synchronize_step_timing:
+                torch.cuda.synchronize()
             step_dt = perf_counter() - step_start
             _observe_prefix_cache_hits(llm, prefix_hits_by_seq_id)
             
@@ -662,6 +668,7 @@ def benchmark_task(method, length, bs, args, results_dict):
             "decode_warmup_steps_after_full": decode_warmup_steps_after_full,
             "decode_steps_after_full": int(decode_steps_after_full),
             "measured_decode_steps_after_full": len(decode_times_after_full),
+            "synchronize_step_timing": synchronize_step_timing,
             "scheduler_preemptions": preemptions,
             "decode_cuda_graph_expected": bool(base_hyper_params.get("decode_cuda_graph")),
             **graph_status,
@@ -694,6 +701,7 @@ def benchmark_task(method, length, bs, args, results_dict):
             "status": "FAILED",
             "error": repr(e),
             "traceback": traceback.format_exc(),
+            "synchronize_step_timing": synchronize_step_timing,
             "resolved_engine_config": _resolved_engine_config(llm) if llm is not None else resolved_engine_config,
         }
     finally:
@@ -711,7 +719,7 @@ def main():
         type=str,
         default="vanilla,snapkv,omnikv",
         help=(
-            "Methods to test (vanilla, streamingllm, attention-sink, snapkv, pyramidkv, "
+            "Methods to test (vanilla, streamingllm, attention-sink, snapkv, h2o, pyramidkv, "
             "omnikv, quest, rkv, skipkv, deltakv; deltakv-less-memory* are legacy aliases)"
         ),
     )
@@ -751,6 +759,14 @@ def main():
         type=int,
         default=0,
         help="Discard this many initial full-admission decode steps from throughput and ITL metrics.",
+    )
+    parser.add_argument(
+        "--synchronize_step_timing",
+        action="store_true",
+        help=(
+            "Synchronize CUDA after each llm.step() before measuring its duration, "
+            "so post-sparse work is attributed to the step that launched it."
+        ),
     )
     parser.add_argument(
         "--wave_decode_gap_steps",
@@ -831,6 +847,10 @@ def main():
                     row.setdefault("length", int(length))
                     row.setdefault("batch_size", int(bs))
                     row.setdefault("status", status_str)
+                    row.setdefault(
+                        "synchronize_step_timing",
+                        bool(getattr(args, "synchronize_step_timing", False)),
+                    )
                     jsonl_rows.append(row)
                     continue
                 

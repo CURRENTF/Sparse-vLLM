@@ -748,7 +748,7 @@ class Config:
     num_kvcache_slots: int | list = -1
 
     # Sparse Attention Config
-    vllm_sparse_method: str = ""  # "", "streamingllm", "snapkv", "pyramidkv", "omnikv", "quest", "rkv", "skipkv", "deltakv"; legacy deltakv-less-memory aliases normalize to deltakv.
+    vllm_sparse_method: str = ""  # "", "streamingllm", "snapkv", "h2o", "pyramidkv", "omnikv", "quest", "rkv", "skipkv", "deltakv"; legacy deltakv-less-memory aliases normalize to deltakv.
 
     # Prefix Cache Config
     enable_prefix_caching: bool = False
@@ -795,6 +795,12 @@ class Config:
     # SnapKV Config
     snapkv_window_size: int = 32
     snapkv_num_full_layers: int = 0  # 前多少层不进行驱逐
+
+    # H2O Config. Budgets are total retained physical tokens (heavy + recent).
+    h2o_decode_budget: int = 4096
+    h2o_prefill_budget: int = 8192
+    h2o_recent_ratio: float = 0.5
+    h2o_prefill_score_window: int = 128
 
     # R-KV Config
     rkv_compression_interval: int = 128
@@ -1339,6 +1345,18 @@ class Config:
         model_type = str(getattr(self.hf_config, "model_type", "") or "")
         is_minimax_m2 = model_type == "minimax_m2"
         is_qwen3_moe = model_type == "qwen3_moe"
+        if self.vllm_sparse_method == "h2o":
+            if model_type != "qwen2":
+                raise NotImplementedError(
+                    "H2O v1 is validated for Qwen2-family models only, "
+                    f"got model_type={model_type!r}."
+                )
+            if self.tensor_parallel_size != 1:
+                raise NotImplementedError(
+                    "H2O v1 requires TP=1 because token scores and eviction "
+                    "indices are not aggregated across tensor-parallel ranks, "
+                    f"got TP={self.tensor_parallel_size}."
+                )
         if self.tiny_random:
             from sparsevllm.debug.tiny_random import apply_tiny_random_overrides
 
@@ -1543,6 +1561,28 @@ class Config:
                 )
         if self.quest_skip_layers < 0:
             raise ValueError("quest_skip_layers 不能 < 0")
+        self.h2o_decode_budget = int(self.h2o_decode_budget or 0)
+        if self.h2o_decode_budget <= 0:
+            raise ValueError(
+                f"h2o_decode_budget must be > 0, got {self.h2o_decode_budget}."
+            )
+        self.h2o_prefill_budget = int(self.h2o_prefill_budget or 0)
+        if self.h2o_prefill_budget < self.h2o_decode_budget:
+            raise ValueError(
+                "h2o_prefill_budget must be >= h2o_decode_budget, "
+                f"got prefill={self.h2o_prefill_budget} decode={self.h2o_decode_budget}."
+            )
+        self.h2o_recent_ratio = float(self.h2o_recent_ratio)
+        if not 0.0 < self.h2o_recent_ratio < 1.0:
+            raise ValueError(
+                f"h2o_recent_ratio must be in (0, 1), got {self.h2o_recent_ratio}."
+            )
+        self.h2o_prefill_score_window = int(self.h2o_prefill_score_window or 0)
+        if not 1 <= self.h2o_prefill_score_window <= 128:
+            raise ValueError(
+                "h2o_prefill_score_window must be in [1, 128] because the prefill "
+                f"score kernel supports at most 128 query tokens, got {self.h2o_prefill_score_window}."
+            )
         self.rkv_compression_interval = int(self.rkv_compression_interval or 0)
         if self.rkv_compression_interval <= 0:
             raise ValueError(

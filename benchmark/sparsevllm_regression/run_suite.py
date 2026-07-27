@@ -27,6 +27,7 @@ from benchmark.sparsevllm_regression.manifest import (
     load_manifest,
     missing_runtime_inputs,
     resolve_manifest_paths,
+    runtime_support_reason,
     select_entries,
 )
 from sparsevllm.method_registry import (
@@ -92,6 +93,24 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
         if line.strip():
             rows.append(json.loads(line))
     return rows
+
+
+def _require_synchronized_step_timing(
+    rows: list[dict[str, Any]],
+    *,
+    artifact: Path,
+) -> None:
+    unsynchronized = [
+        row
+        for row in rows
+        if row.get("status") == "SUCCESS"
+        and row.get("synchronize_step_timing") is not True
+    ]
+    if unsynchronized:
+        raise RuntimeError(
+            "Regression throughput requires synchronized llm.step timing; "
+            f"found {len(unsynchronized)} invalid SUCCESS rows in {artifact}."
+        )
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -242,6 +261,32 @@ def _tensor_parallel_size_from_config(*configs: dict[str, Any] | None) -> int:
                 raise ValueError(f"tensor_parallel_size must be > 0, got {value}.")
             return value
     return 1
+
+
+def _runtime_tensor_parallel_sizes(
+    layer: str,
+    resolved: dict[str, Any],
+) -> tuple[int, ...]:
+    """TP sizes exercised by a regression layer for pair compatibility gates."""
+    quality_tp = _tensor_parallel_size_from_config(
+        resolved.get("quality"), resolved.get("performance")
+    )
+    perf_tp = _tensor_parallel_size_from_config(resolved.get("performance"))
+    stress_tp = _tensor_parallel_size_from_config(
+        resolved.get("stress"), resolved.get("performance")
+    )
+    sizes_by_layer = {
+        "validate": (),
+        "quality": (quality_tp,),
+        "logits": (1,),
+        "perf": (perf_tp,),
+        "stress": (stress_tp,),
+        "stress_v2": (_tensor_parallel_size_from_config(resolved.get("stress_v2")),),
+        "scbench": (_tensor_parallel_size_from_config(resolved.get("scbench")),),
+        "nightly": (quality_tp, 1, perf_tp),
+        "pre-refactor": (quality_tp, 1, perf_tp, stress_tp),
+    }
+    return tuple(sorted(set(sizes_by_layer[layer])))
 
 
 def _apply_prefix_cache_config(
@@ -503,6 +548,7 @@ def _perf_command(
         json.dumps(hyper_params, sort_keys=True),
         "--output_jsonl",
         str(output_jsonl),
+        "--synchronize_step_timing",
     ]
 
 
@@ -575,6 +621,7 @@ def _stress_command(
         str(int(stress["max_decode_steps_after_full"])),
         "--output_jsonl",
         str(output_jsonl),
+        "--synchronize_step_timing",
     ]
     if admission_wave_size > 0:
         cmd.extend(["--admission_wave_size", str(admission_wave_size)])
@@ -1143,8 +1190,28 @@ def main() -> int:
             return 0
 
         selected_pairs: list[tuple[str, str]] = []
+        runtime_tp_sizes = _runtime_tensor_parallel_sizes(args.layer, resolved)
         for model_id in model_ids:
             for method_id in method_ids:
+                unsupported_reason = runtime_support_reason(
+                    resolved,
+                    model_id,
+                    method_id,
+                    tensor_parallel_sizes=runtime_tp_sizes,
+                )
+                if unsupported_reason is not None:
+                    record = {
+                        "model": model_id,
+                        "method": method_id,
+                        "status": "skipped_by_policy",
+                        "reason": unsupported_reason,
+                    }
+                    summary["skipped"].append(record)
+                    if not args.allow_skipped_policy:
+                        raise RuntimeError(
+                            f"Unsupported runtime pair {model_id}/{method_id}: {unsupported_reason}"
+                        )
+                    continue
                 missing = missing_runtime_inputs(resolved, model_id, method_id)
                 if missing:
                     record = {
@@ -1286,6 +1353,7 @@ def main() -> int:
                         timeout_s=args.command_timeout_s,
                     )
                     rows = _read_jsonl(out_path)
+                    _require_synchronized_step_timing(rows, artifact=out_path)
                     for row in rows:
                         _append_jsonl(output_root / "perf.jsonl", {"model": model_id, **row})
                     vanilla_by_shape = {
@@ -1360,6 +1428,7 @@ def main() -> int:
                     timeout_s=args.command_timeout_s,
                 )
                 rows = _read_jsonl(out_path)
+                _require_synchronized_step_timing(rows, artifact=out_path)
                 if args.dry_run:
                     grade = GateGrade("stress", "N/A", "skipped_by_policy", {}, "dry run")
                     summary["grades"].append({**grade.to_dict(), "model": model_id, "method": method_id})

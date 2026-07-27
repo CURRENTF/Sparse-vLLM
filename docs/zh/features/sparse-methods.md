@@ -12,6 +12,7 @@ Sparse-vLLM 围绕 cache-manager-first sparse runtime 构建。engine 支持 phy
 | `streamingllm` | Physical eviction | StreamingLLM 风格的固定 sink 加 recent-window cache。保留 prefix/tail 策略之外的 token 会从 active KV cache 中被物理淘汰。 | `sink_keep_tokens`, `recent_keep_tokens` |
 | `attention-sink` | Physical eviction | attention-sink alias policy，使用相同的 sink-token 和 recent-window 保留模型。适合将 sink-window 行为与其他 physical eviction 方法对比。 | `sink_keep_tokens`, `recent_keep_tokens` |
 | `snapkv` | Physical eviction | SnapKV 风格的 token selection 在 prefill 后保留紧凑的重要历史 token 集合，只物理保留选中的 KV position，以减小 cache footprint。 | `decode_keep_tokens`, `prefill_keep_tokens`, `sink_keep_tokens`, `recent_keep_tokens` |
+| `h2o` | Physical eviction | H2O 在与物理 row 对齐的 token vector 中累积归一化 token importance。Prefill 使用归一化 attention mass；decode 复用 SnapKV 风格融合路径，先在 query head 间对 raw QK logit 做 max reduction，再按 token 归一化。每个 chunk 和 decode step 都保留 heavy hitter 与 recent 后缀，最后一个 prefill chunk 收缩到 decode budget。Sparse-vLLM v1 在 KV head 之间共享一套 token 选择。 | `h2o_decode_budget`, `h2o_prefill_budget`, `h2o_recent_ratio`, `h2o_prefill_score_window` |
 | `pyramidkv` | Physical eviction | PyramidKV 风格、依赖 layer 的 KV 保留方式。它在 layer 之间分配 sparse budget，并物理存储选中的 context token。 | `decode_keep_tokens`, `prefill_keep_tokens`, `sink_keep_tokens`, `recent_keep_tokens` |
 | `omnikv` | Logical masking | OmniKV 保留 physical cache，但为选定 layer 构建 sparse attention view。适用于不改写 cache storage、同时降低 attention 计算量的场景。 | `full_attention_layers`, `decode_keep_tokens`, `prefill_keep_tokens`, `sink_keep_tokens`, `recent_keep_tokens`, `chunk_prefill_accel_omnikv` |
 | `quest` | Query-aware page selection | QuEST 根据 decode query 选择 token page。prefill 保持 dense，decode 通过 page/chunk budget 执行 sparse selection。 | `quest_chunk_size`, `quest_skip_layers`, `sink_keep_tokens`, `decode_keep_tokens`, `recent_keep_tokens` |
@@ -25,7 +26,7 @@ Prefill scheduling 是方法 contract 的一部分，由 registry 管理。唯�
 
 | Policy | Runtime 语义 | 当前默认方法 |
 | --- | --- | --- |
-| `all_chunked` | 每个 prefill request 都受 `chunk_prefill_size` 和 scheduler 常规 batch 限制约束。 | `vanilla`, `streamingllm`, `attention-sink`, `snapkv`, `quest`, `omnikv` |
+| `all_chunked` | 每个 prefill request 都受 `chunk_prefill_size` 和 scheduler 常规 batch 限制约束。 | `vanilla`, `streamingllm`, `attention-sink`, `snapkv`, `h2o`, `quest`, `omnikv` |
 | `long_bs1full_short_batch` | 长度不超过 `chunk_prefill_size` 的 prompt 使用完整 batched prefill；超过该值的 prompt 以 batch size 1 隔离运行，并使用 chunked RawKV offload。 | `pyramidkv` 和 DeltaKV family 方法 |
 
 DeltaKV family 方法和 PyramidKV 只对外提供 `long_bs1full_short_batch` policy。它们的 cache manager 对每个长于 `chunk_prefill_size` 的 prompt 使用 `requires_long_prefill_offload()`。这一精确边界避免产生一段使用 isolated full prefill、可能导致 activation OOM 的中间区间。在该 policy 下，`Config` 根据 `long_prefill_offload_threshold` 同时设置 `chunk_prefill_size` 和 offload boundary；该阈值默认是 `98304` token（96K）。不要单独设置 `engine_prefill_chunk_size`；实验需要不同边界时应设置该 threshold。必要时，`Config` 会提高 `max_num_batched_tokens`，使一个边界大小的 short prefill 能够容纳。`all_chunked` 仍独立使用 `engine_prefill_chunk_size`。
