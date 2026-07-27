@@ -221,7 +221,7 @@ Supported methods:
 | `vanilla` / `""` | token block | Uses `StandardCacheManager`. |
 | `omnikv` | token block | Reuses `StandardCacheManager`; fingerprint still includes `omnikv` settings. |
 | `quest` | QuEST page | Requires `prefix_cache_block_size == quest_chunk_size`. |
-| `snapkv` / `pyramidkv` / `rkv` / `skipkv` | linear chain | Stores one resident sparse sequence per opaque chain ID; branching is not supported. |
+| `snapkv` / `h2o` / `pyramidkv` / `rkv` / `skipkv` | linear chain | Stores one resident sparse sequence per opaque chain ID; branching is not supported. |
 
 Unsupported methods fail fast when `enable_prefix_caching=true`: StreamingLLM,
 attention-sink aliases and all DeltaKV-family methods.
@@ -231,7 +231,7 @@ Parameter semantics:
 | Parameter | Meaning |
 | --- | --- |
 | `enable_prefix_caching` | Boolean or explicit true/false string. Enables scheduler lookup plus cache-manager attach/materialize/free/evict hooks. |
-| `prefix_cache_mode` | `auto`, `radix`, or `chain`. Auto selects radix for vanilla/OmniKV/QuEST and chain for SnapKV/PyramidKV/R-KV/SkipKV. Explicit incompatible combinations fail fast. |
+| `prefix_cache_mode` | `auto`, `radix`, or `chain`. Auto selects radix for vanilla/OmniKV/QuEST and chain for SnapKV/H2O/PyramidKV/R-KV/SkipKV. Explicit incompatible combinations fail fast. |
 | `prefix_cache_block_size` | Positive integer or `null`. Radix-only: defaults to 16 for vanilla/OmniKV; for QuEST it resolves to `quest_chunk_size` and rejects any different explicit value. Chain mode does not use this value for identity, capacity, or reuse boundaries. |
 | `prefix_cache_max_blocks` | Optional positive integer cap. When set, insertions evict unreferenced leaf blocks only; referenced blocks are never evicted. |
 | `prefix_cache_salt` | String folded into the cache fingerprint. Use it to intentionally isolate runs that should not share cache entries. |
@@ -688,7 +688,7 @@ queueing, and whether a benchmark measures the intended batch.
 | `gpu_memory_utilization` | Sparse-vLLM | Fraction of total GPU memory used for cache planning. |
 | `tensor_parallel_size` | Sparse-vLLM | Number of TP ranks/processes. |
 | `num_kvcache_slots` | Sparse-vLLM | Optional explicit KV slot override. |
-| `enable_prefix_caching` | Sparse-vLLM | Enables radix reuse for vanilla/OmniKV/QuEST or linear chain reuse for SnapKV/PyramidKV/R-KV/SkipKV. |
+| `enable_prefix_caching` | Sparse-vLLM | Enables radix reuse for vanilla/OmniKV/QuEST or linear chain reuse for SnapKV/H2O/PyramidKV/R-KV/SkipKV. |
 | `prefix_cache_mode` | Sparse-vLLM | Chooses `auto`, `radix`, or linear `chain` prefix reuse. |
 | `prefix_cache_block_size` | Sparse-vLLM | Radix prefix-cache block size; must equal `quest_chunk_size` for QuEST and is not used by chain mode. |
 | `prefix_cache_max_blocks` | Sparse-vLLM | Optional live-block cap for prefix cache. |
@@ -941,7 +941,7 @@ Important serving defaults:
 | `engine_prefill_chunk_size` / `chunk_prefill_size` | `8192` | `all_chunked` only. Use the semantic `--engine-prefill-chunk-size` on the CLI. |
 | `long_prefill_offload_threshold` | `98304` | `long_bs1full_short_batch` only. Also determines that policy's chunk size. |
 | `enable_prefix_caching` | `false` | Pass `--enable-prefix-caching true` to enable prefix KV reuse. |
-| `prefix_cache_mode` | `"auto"` | Resolves to radix for vanilla/OmniKV/QuEST and chain for SnapKV/PyramidKV/R-KV/SkipKV. |
+| `prefix_cache_mode` | `"auto"` | Resolves to radix for vanilla/OmniKV/QuEST and chain for SnapKV/H2O/PyramidKV/R-KV/SkipKV. |
 | `prefix_cache_block_size` | `16` for vanilla/OmniKV, `quest_chunk_size` for QuEST | Radix-only. Use `--prefix-cache-block-size`; QuEST rejects values different from `quest_chunk_size`. Chain mode ignores it. |
 | `prefix_cache_max_blocks` | unset | Optional cache capacity cap. |
 | `prefix_cache_salt` | `""` | Optional cache fingerprint isolation salt. |
@@ -1357,7 +1357,7 @@ Before launching a run:
 - If using Sparse-vLLM, convert all ratio budgets to token counts.
 - If using radix prefix cache, keep `sparse_method` in `vanilla`, `omnikv`, or
   `quest`; generated decode input tokens are cached once they complete full
-  blocks. For SnapKV, PyramidKV, R-KV, or SkipKV use linear chain IDs and do
+  blocks. For SnapKV, H2O, PyramidKV, R-KV, or SkipKV use linear chain IDs and do
   not branch a chain. Keep `decode_cuda_graph_capture_sampling=false` when
   using `decode_cuda_graph`.
 - For QuEST prefix cache, set `prefix_cache_block_size` equal to

@@ -6,8 +6,8 @@ Accepted.
 
 ## Context
 
-SnapKV, PyramidKV, R-KV, and SkipKV physically delete KV positions. A radix
-prefix node cannot describe their resident payload because logical token
+SnapKV, H2O, PyramidKV, R-KV, and SkipKV physically delete KV positions. A
+radix prefix node cannot describe their resident payload because logical token
 positions and physical per-layer row lengths diverge after compression. These
 methods still benefit from the common multi-turn case where one conversation
 has exactly one continuation writer.
@@ -16,7 +16,7 @@ has exactly one continuation writer.
 
 `enable_prefix_caching` remains the feature switch. `prefix_cache_mode` selects
 `auto`, `radix`, or `chain`. Auto resolves to radix for vanilla, OmniKV, and
-QuEST, and to chain for SnapKV, PyramidKV, R-KV, and SkipKV. Incompatible
+QuEST, and to chain for SnapKV, H2O, PyramidKV, R-KV, and SkipKV. Incompatible
 explicit combinations fail during config construction.
 
 The chain implementation is independent of `RadixPrefixIndex`:
@@ -25,8 +25,8 @@ The chain implementation is independent of `RadixPrefixIndex`:
   digest, compact driver-side logical token history, strict IDLE-only LRU
   metadata, and bounded tombstones.
 - `ChainCacheCoordinator` owns logical coordination only.
-- Cache managers own KV rows, physical slots, R-KV queries, SkipKV sentence
-  state, and all other method metadata.
+- Cache managers own KV rows, physical slots, H2O score/cursor state, R-KV
+  queries, SkipKV sentence state, and all other method metadata.
 - `RuntimeState` is the payload reclamation entrypoint.
 
 An omitted, null, or empty `chain_id` creates an opaque server ID. Reusing an

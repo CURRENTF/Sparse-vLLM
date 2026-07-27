@@ -122,7 +122,7 @@ python benchmark/long_bench/pred.py \
 
 对于线性 chain prefix-cache trace，在
 `scripts/benchmarks/bench_prefix_cache.py` 中选择 `chain_snapkv`、
-`chain_pyramidkv`、`chain_rkv` 或 `chain_skipkv`。Chain case 要求使用
+`chain_h2o`、`chain_pyramidkv`、`chain_rkv` 或 `chain_skipkv`。Chain case 要求使用
 `--workloads multiturn --history_update generated`：turn 0 记录服务端创建的
 `chain_id`，后续 turn 复用该 ID；每条记录包含 chain 状态、复用的逻辑 token
 数、新 prefill 的增量 token 数以及逐 layer 物理驻留量。Tombstone 或 digest

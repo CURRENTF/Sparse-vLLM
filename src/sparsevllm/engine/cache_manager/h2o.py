@@ -115,6 +115,82 @@ class H2OCacheManager(SnapKVCacheManager):
         del seq
         return 1
 
+    def chain_capacity_deficits(
+        self,
+        *,
+        suffix_tokens: int,
+        generation_tokens: int = 0,
+        existing_slots_by_layer: tuple[int, ...] = (),
+        outstanding_reserved_slots_by_layer: tuple[int, ...] = (),
+        outstanding_reserved_rows: int = 0,
+        needs_resident_row: bool,
+    ) -> tuple[tuple[int, ...], int, tuple[int, ...], int]:
+        """Reserve H2O's physical prefill/decode peak for a chain turn."""
+        suffix_tokens = max(0, int(suffix_tokens))
+        generated_kv_tokens = max(0, int(generation_tokens) - 1)
+        chunk_size = max(1, int(self.config.chunk_prefill_size))
+        layer_ids = self.kv_transformer_layer_indices()
+        required_by_layer = []
+        for local_layer, _layer_idx in enumerate(layer_ids):
+            existing = (
+                int(existing_slots_by_layer[local_layer])
+                if local_layer < len(existing_slots_by_layer)
+                else 0
+            )
+            prefill_peak = min(
+                existing + suffix_tokens,
+                self.h2o_prefill_budget + chunk_size,
+            )
+            resident_after_prefill = min(
+                existing + suffix_tokens,
+                self.h2o_decode_budget,
+            )
+            decode_peak = resident_after_prefill + min(
+                generated_kv_tokens,
+                max(0, self.h2o_decode_budget + 1 - resident_after_prefill),
+            )
+            required_by_layer.append(
+                max(0, max(prefill_peak, decode_peak) - existing)
+            )
+
+        slot_deficits = tuple(
+            max(
+                0,
+                int(required)
+                - max(
+                    0,
+                    int(self._num_free_slots[layer_idx])
+                    - (
+                        int(
+                            outstanding_reserved_slots_by_layer[local_layer]
+                        )
+                        if local_layer
+                        < len(outstanding_reserved_slots_by_layer)
+                        else 0
+                    ),
+                ),
+            )
+            for local_layer, (layer_idx, required) in enumerate(
+                zip(layer_ids, required_by_layer)
+            )
+        )
+        required_rows = 1 if needs_resident_row else 0
+        available_rows = max(
+            0,
+            min(
+                (len(self.free_rows[layer_idx]) for layer_idx in layer_ids),
+                default=0,
+            )
+            - max(0, int(outstanding_reserved_rows)),
+        )
+        row_deficit = max(0, required_rows - available_rows)
+        return (
+            tuple(int(value) for value in required_by_layer),
+            required_rows,
+            slot_deficits,
+            row_deficit,
+        )
+
     def decode_cuda_graph_context_capacity(
         self,
         seqs: list[Sequence],

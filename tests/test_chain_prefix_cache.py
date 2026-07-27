@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from sparsevllm.engine.cache_manager.h2o import H2OCacheManager
 from sparsevllm.engine.cache_manager.snapkv import SnapKVCacheManager
 from sparsevllm.engine.chain_cache import (
     ChainAdmissionPlan,
@@ -17,6 +18,7 @@ from sparsevllm.engine.chain_cache import (
     ChainOwnerMismatchError,
     ChainPrefixMismatchError,
     ChainState,
+    build_chain_cache_fingerprint,
     normalize_prefix_cache_mode,
     stable_token_digest,
 )
@@ -399,6 +401,7 @@ def test_chain_apply_plan_rejects_duplicate_resident_seq_owner():
         ("omnikv", "auto", "radix"),
         ("quest", "radix", "radix"),
         ("snapkv", "auto", "chain"),
+        ("h2o", "auto", "chain"),
         ("pyramidkv", "chain", "chain"),
         ("rkv", "auto", "chain"),
         ("skipkv", "chain", "chain"),
@@ -416,6 +419,8 @@ def test_prefix_cache_mode_resolution(method, requested, expected):
 def test_prefix_cache_mode_rejects_incompatible_mode():
     with pytest.raises(ValueError, match="incompatible"):
         normalize_prefix_cache_mode("radix", enabled=True, method="snapkv")
+    with pytest.raises(ValueError, match="incompatible"):
+        normalize_prefix_cache_mode("radix", enabled=True, method="h2o")
     with pytest.raises(ValueError, match="incompatible"):
         normalize_prefix_cache_mode("chain", enabled=True, method="quest")
     assert (
@@ -661,6 +666,134 @@ def test_resumed_snapkv_capacity_uses_physical_peak_not_token_sum():
     assert required_rows == 0
     assert deficits == (3,)
     assert row_deficit == 0
+
+
+def test_resumed_h2o_capacity_uses_chunked_physical_peak():
+    manager = object.__new__(H2OCacheManager)
+    manager.config = SimpleNamespace(
+        vllm_sparse_method="h2o",
+        h2o_decode_budget=4,
+        h2o_prefill_budget=8,
+        chunk_prefill_size=4,
+    )
+    manager.kv_transformer_layer_indices = lambda: [0]
+    manager._num_free_slots = [3]
+    manager.free_rows = [[]]
+
+    required, required_rows, deficits, row_deficit = (
+        manager.chain_capacity_deficits(
+            suffix_tokens=100,
+            generation_tokens=10,
+            existing_slots_by_layer=(4,),
+            needs_resident_row=False,
+        )
+    )
+
+    # Intermediate prefill peaks at prefill_budget + one chunk (12), so an
+    # already resident four-slot row needs eight more slots, not the 109
+    # logical suffix/decode tokens.
+    assert required == (8,)
+    assert required_rows == 0
+    assert deficits == (5,)
+    assert row_deficit == 0
+
+
+def test_new_h2o_chain_capacity_reserves_row_and_outstanding_slots():
+    manager = object.__new__(H2OCacheManager)
+    manager.config = SimpleNamespace(
+        vllm_sparse_method="h2o",
+        h2o_decode_budget=4,
+        h2o_prefill_budget=8,
+        chunk_prefill_size=4,
+    )
+    manager.kv_transformer_layer_indices = lambda: [0]
+    manager._num_free_slots = [16]
+    manager.free_rows = [[0, 1]]
+
+    required, required_rows, deficits, row_deficit = (
+        manager.chain_capacity_deficits(
+            suffix_tokens=100,
+            generation_tokens=10,
+            outstanding_reserved_slots_by_layer=(8,),
+            outstanding_reserved_rows=1,
+            needs_resident_row=True,
+        )
+    )
+
+    assert required == (12,)
+    assert required_rows == 1
+    assert deficits == (4,)
+    assert row_deficit == 0
+
+
+def test_h2o_chain_capacity_reserves_one_decode_ring_slot():
+    manager = object.__new__(H2OCacheManager)
+    manager.config = SimpleNamespace(
+        vllm_sparse_method="h2o",
+        h2o_decode_budget=4,
+        h2o_prefill_budget=8,
+        chunk_prefill_size=4,
+    )
+    manager.kv_transformer_layer_indices = lambda: [0]
+    manager._num_free_slots = [1]
+    manager.free_rows = [[]]
+
+    required, required_rows, deficits, row_deficit = (
+        manager.chain_capacity_deficits(
+            suffix_tokens=0,
+            generation_tokens=10,
+            existing_slots_by_layer=(4,),
+            needs_resident_row=False,
+        )
+    )
+
+    assert required == (1,)
+    assert required_rows == 0
+    assert deficits == (0,)
+    assert row_deficit == 0
+
+
+def _h2o_fingerprint_config(**overrides):
+    values = {
+        "vllm_sparse_method": "h2o",
+        "model": "/models/test",
+        "hf_config": SimpleNamespace(
+            model_type="qwen2",
+            torch_dtype="float16",
+        ),
+        "tensor_parallel_size": 1,
+        "max_model_len": 128,
+        "full_attn_layers": [],
+        "prefix_cache_salt": "",
+        "h2o_decode_budget": 4,
+        "h2o_prefill_budget": 8,
+        "h2o_recent_ratio": 0.5,
+        "h2o_prefill_score_window": 4,
+        "sparse_attn_score_dtype": "float32",
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "changed_value"),
+    [
+        ("h2o_decode_budget", 5),
+        ("h2o_prefill_budget", 9),
+        ("h2o_recent_ratio", 0.25),
+        ("h2o_prefill_score_window", 8),
+        ("sparse_attn_score_dtype", "float16"),
+    ],
+)
+def test_h2o_chain_fingerprint_covers_physical_state_config(
+    field_name,
+    changed_value,
+):
+    baseline = build_chain_cache_fingerprint(_h2o_fingerprint_config())
+    changed = build_chain_cache_fingerprint(
+        _h2o_fingerprint_config(**{field_name: changed_value})
+    )
+    assert changed != baseline
 
 
 def test_chain_admission_reserves_capacity_before_prefill_allocation():

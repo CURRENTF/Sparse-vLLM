@@ -50,6 +50,7 @@ PREFIX_CACHE_SUPPORTED_METHODS = {
     "omnikv",
     "quest",
     "snapkv",
+    "h2o",
     "pyramidkv",
     "rkv",
     "skipkv",

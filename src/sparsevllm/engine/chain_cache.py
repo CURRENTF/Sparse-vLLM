@@ -12,7 +12,9 @@ from enum import Enum
 from typing import Any, Iterable
 
 
-CHAIN_PREFIX_METHODS = frozenset({"snapkv", "pyramidkv", "rkv", "skipkv"})
+CHAIN_PREFIX_METHODS = frozenset(
+    {"snapkv", "h2o", "pyramidkv", "rkv", "skipkv"}
+)
 RADIX_PREFIX_METHODS = frozenset({"", "omnikv", "quest"})
 PREFIX_CACHE_MODES = frozenset({"auto", "radix", "chain"})
 
@@ -199,6 +201,13 @@ def build_chain_cache_fingerprint(config: Any) -> bytes:
             "snapkv_num_full_layers",
             "sparse_attn_score_dtype",
             "pool_kernel_size",
+        ),
+        "h2o": (
+            "h2o_decode_budget",
+            "h2o_prefill_budget",
+            "h2o_recent_ratio",
+            "h2o_prefill_score_window",
+            "sparse_attn_score_dtype",
         ),
         "pyramidkv": (
             "num_sink_tokens",

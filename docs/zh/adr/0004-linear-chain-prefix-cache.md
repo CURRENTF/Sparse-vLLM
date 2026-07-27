@@ -6,17 +6,17 @@
 
 ## 背景
 
-SnapKV、PyramidKV、R-KV 和 SkipKV 会物理删除 KV position。压缩后，逻辑
-token position 与各 layer 的物理 row length 会发生分离，因此 radix prefix
-node 无法描述这些方法的驻留 payload。不过，这些方法仍可受益于常见的多轮
-场景：一个会话始终只有一个 continuation writer。
+SnapKV、H2O、PyramidKV、R-KV 和 SkipKV 会物理删除 KV position。压缩后，
+逻辑 token position 与各 layer 的物理 row length 会发生分离，因此 radix
+prefix node 无法描述这些方法的驻留 payload。不过，这些方法仍可受益于常见
+的多轮场景：一个会话始终只有一个 continuation writer。
 
 ## 决策
 
 `enable_prefix_caching` 仍作为 feature switch；`prefix_cache_mode` 可选
 `auto`、`radix` 或 `chain`。Auto 为 vanilla、OmniKV 和 QuEST 解析为
-radix，为 SnapKV、PyramidKV、R-KV 和 SkipKV 解析为 chain。显式的不兼容
-组合会在构造 config 时快速失败。
+radix，为 SnapKV、H2O、PyramidKV、R-KV 和 SkipKV 解析为 chain。显式的
+不兼容组合会在构造 config 时快速失败。
 
 Chain 实现与 `RadixPrefixIndex` 完全独立：
 
@@ -24,8 +24,8 @@ Chain 实现与 `RadixPrefixIndex` 完全独立：
   digest、紧凑的 driver-side 逻辑 token 历史、严格的 IDLE-only LRU metadata
   以及有界 tombstone。
 - `ChainCacheCoordinator` 只负责逻辑协调。
-- Cache manager 负责 KV row、物理 slot、R-KV query、SkipKV sentence state
-  以及其他所有方法 metadata。
+- Cache manager 负责 KV row、物理 slot、H2O score/cursor state、R-KV
+  query、SkipKV sentence state 以及其他所有方法 metadata。
 - `RuntimeState` 是 payload 回收入口。
 
 省略、设为 null 或传入空 `chain_id` 时，服务端创建 opaque ID。复用 ID 时，

@@ -13,7 +13,7 @@
 
 Sparse-vLLM 是 sparse-first inference engine：`Scheduler` 决定运行什么，`ModelRunner` 执行，`Attention` 调用 generic hook，`CacheManager` 实现负责方法特定的 cache state、allocation、view、reconstruction 和 graph-stable metadata。
 
-对于 SnapKV、PyramidKV、R-KV 和 SkipKV 的 chain prefix cache，
+对于 SnapKV、H2O、PyramidKV、R-KV 和 SkipKV 的 chain prefix cache，
 `ChainCacheIndex` 只负责逻辑生命周期，`ChainCacheCoordinator` 规划状态转换，
 cache manager 保留全部 payload/metadata，`RuntimeState` 执行回收。OpenAI
 dispatcher 在构造 stream 前确认 admission；smart-router affinity 来自并行的

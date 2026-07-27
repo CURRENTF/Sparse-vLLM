@@ -35,7 +35,7 @@ DeltaKV family 方法和 PyramidKV 只对外提供 `long_bs1full_short_batch` po
 
 `enable_prefix_caching=true` 支持两种有意分离的布局。
 `prefix_cache_mode=auto` 为 vanilla/OmniKV/QuEST 选择 radix，为
-SnapKV/PyramidKV/R-KV/SkipKV 选择线性 chain。也可以显式请求 `radix`
+SnapKV/H2O/PyramidKV/R-KV/SkipKV 选择线性 chain。也可以显式请求 `radix`
 或 `chain`，但不兼容的方法/模式组合会快速失败。
 
 Chain 布局跨 turn 保留同一个驻留 `seq_id`，且永不分支。调用方发送完整逻辑

@@ -176,6 +176,15 @@ def test_prefix_cache_bench_summary_preserves_metric_failure_status():
     assert summary["failure_status_counts"] == {"metric_failed": 1}
 
 
+def test_prefix_cache_bench_exposes_h2o_chain_case():
+    assert bench.CASE_PRESETS["chain_h2o"] == {
+        "method": "h2o",
+        "enable_prefix_caching": True,
+        "label": "H2O, linear chain prefix cache",
+    }
+    assert bench.CASE_ALIASES["h2o"] == "chain_h2o"
+
+
 def test_prefix_cache_bench_labels_chain_reuse_as_logical_tokens():
     summary = bench._summarize_records(
         case_name="chain_snapkv",

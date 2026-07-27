@@ -1054,6 +1054,7 @@ def test_prefix_cache_supported_method_allowlist():
         "omnikv",
         "quest",
         "snapkv",
+        "h2o",
         "pyramidkv",
         "rkv",
         "skipkv",
@@ -1077,6 +1078,12 @@ def test_config_resolves_prefix_cache_defaults():
 
     cfg = _make_config(
         vllm_sparse_method="snapkv",
+        enable_prefix_caching=True,
+    )
+    assert cfg.resolved_prefix_cache_mode == "chain"
+
+    cfg = _make_config(
+        vllm_sparse_method="h2o",
         enable_prefix_caching=True,
     )
     assert cfg.resolved_prefix_cache_mode == "chain"

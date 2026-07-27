@@ -182,7 +182,7 @@ Prefix cache 是 Sparse-vLLM engine feature，不是通用 HF runtime feature。
 | `vanilla` / `""` | token block | 使用 `StandardCacheManager`。 |
 | `omnikv` | token block | 复用 `StandardCacheManager`；fingerprint 仍包括 `omnikv` 设置。 |
 | `quest` | QuEST page | 要求 `prefix_cache_block_size == quest_chunk_size`。 |
-| `snapkv` / `pyramidkv` / `rkv` / `skipkv` | 线性 chain | 每个 opaque chain ID 保留一个驻留 sparse sequence；不支持分支。 |
+| `snapkv` / `h2o` / `pyramidkv` / `rkv` / `skipkv` | 线性 chain | 每个 opaque chain ID 保留一个驻留 sparse sequence；不支持分支。 |
 
 当 `enable_prefix_caching=true` 时，不支持的方法会快速失败：
 StreamingLLM、attention-sink alias 和所有 DeltaKV-family 方法。
@@ -192,7 +192,7 @@ StreamingLLM、attention-sink alias 和所有 DeltaKV-family 方法。
 | 参数 | 含义 |
 | --- | --- |
 | `enable_prefix_caching` | Boolean 或显式 true/false 字符串。启用 scheduler lookup 及 cache-manager attach/materialize/free/evict hook。 |
-| `prefix_cache_mode` | `auto`、`radix` 或 `chain`。Auto 为 vanilla/OmniKV/QuEST 选择 radix，为 SnapKV/PyramidKV/R-KV/SkipKV 选择 chain；显式的不兼容组合会快速失败。 |
+| `prefix_cache_mode` | `auto`、`radix` 或 `chain`。Auto 为 vanilla/OmniKV/QuEST 选择 radix，为 SnapKV/H2O/PyramidKV/R-KV/SkipKV 选择 chain；显式的不兼容组合会快速失败。 |
 | `prefix_cache_block_size` | 正整数或 `null`。仅用于 radix：vanilla/OmniKV 默认为 16；QuEST 解析为 `quest_chunk_size`，并拒绝不同的显式值。Chain mode 不用它定义 identity、capacity 或 reuse boundary。 |
 | `prefix_cache_max_blocks` | 可选正整数上限。设置后，插入时只淘汰 unreferenced leaf block；不淘汰 referenced block。 |
 | `prefix_cache_salt` | 折叠进 cache fingerprint 的字符串。用于有意隔离不应共享 cache entry 的 run。 |
@@ -582,7 +582,7 @@ python scripts/benchmarks/bench_sparse_vllm.py \
 | `gpu_memory_utilization` | Sparse-vLLM | Cache planning 使用的 GPU 总显存比例。 |
 | `tensor_parallel_size` | Sparse-vLLM | TP rank/process 数。 |
 | `num_kvcache_slots` | Sparse-vLLM | 可选显式 KV slot override。 |
-| `enable_prefix_caching` | Sparse-vLLM | 为 vanilla/OmniKV/QuEST 启用 radix reuse，或为 SnapKV/PyramidKV/R-KV/SkipKV 启用线性 chain reuse。 |
+| `enable_prefix_caching` | Sparse-vLLM | 为 vanilla/OmniKV/QuEST 启用 radix reuse，或为 SnapKV/H2O/PyramidKV/R-KV/SkipKV 启用线性 chain reuse。 |
 | `prefix_cache_mode` | Sparse-vLLM | 选择 `auto`、`radix` 或线性 `chain` prefix reuse。 |
 | `prefix_cache_block_size` | Sparse-vLLM | Radix prefix-cache block size；QuEST 必须等于 `quest_chunk_size`，chain mode 不使用。 |
 | `prefix_cache_max_blocks` | Sparse-vLLM | Prefix cache 的可选 live-block 上限。 |
@@ -800,7 +800,7 @@ sparsevllm-openai-server \
 | `engine_prefill_chunk_size` / `chunk_prefill_size` | `8192` | 仅用于 `all_chunked`。CLI 使用语义明确的 `--engine-prefill-chunk-size`。 |
 | `long_prefill_offload_threshold` | `98304` | 仅用于 `long_bs1full_short_batch`，同时决定该 policy 的 chunk size。 |
 | `enable_prefix_caching` | `false` | 传入 `--enable-prefix-caching true` 启用 prefix KV reuse。 |
-| `prefix_cache_mode` | `"auto"` | 为 vanilla/OmniKV/QuEST 解析为 radix，为 SnapKV/PyramidKV/R-KV/SkipKV 解析为 chain。 |
+| `prefix_cache_mode` | `"auto"` | 为 vanilla/OmniKV/QuEST 解析为 radix，为 SnapKV/H2O/PyramidKV/R-KV/SkipKV 解析为 chain。 |
 | `prefix_cache_block_size` | vanilla/OmniKV 为 `16`，QuEST 为 `quest_chunk_size` | 仅用于 radix。使用 `--prefix-cache-block-size`；QuEST 拒绝与 `quest_chunk_size` 不同的值，chain mode 忽略它。 |
 | `prefix_cache_max_blocks` | 未设置 | 可选 cache capacity 上限。 |
 | `prefix_cache_salt` | `""` | 可选 cache fingerprint isolation salt。 |
@@ -1105,7 +1105,7 @@ python benchmark/long_bench/pred.py \
 - 使用 Sparse-vLLM 时，把所有 ratio budget 转换为 token count。
 - 使用 radix prefix cache 时，`sparse_method` 应为 `vanilla`、`omnikv` 或
   `quest`；generated decode input token 形成完整 block 后进入 cache。对于
-  SnapKV、PyramidKV、R-KV 或 SkipKV，使用线性 chain ID，不要为同一个
+  SnapKV、H2O、PyramidKV、R-KV 或 SkipKV，使用线性 chain ID，不要为同一个
   chain 创建分支。使用 `decode_cuda_graph` 时保持
   `decode_cuda_graph_capture_sampling=false`。
 - QuEST prefix cache 应让 `prefix_cache_block_size` 等于 `quest_chunk_size`，或省略前者。

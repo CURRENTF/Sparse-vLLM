@@ -1094,7 +1094,7 @@ class Config:
         if self.enable_prefix_caching and self.vllm_sparse_method not in PREFIX_CACHE_SUPPORTED_METHODS:
             raise ValueError(
                 "prefix caching only supports vanilla, omnikv, quest, snapkv, "
-                "pyramidkv, rkv, and skipkv."
+                "h2o, pyramidkv, rkv, and skipkv."
             )
         self.prefix_cache_salt = str(self.prefix_cache_salt or "")
         self.prefill_schedule_policy = resolve_prefill_schedule_policy(

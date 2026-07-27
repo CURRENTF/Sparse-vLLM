@@ -49,8 +49,8 @@ an experiment needs a different boundary. `Config` raises
 
 `enable_prefix_caching=true` supports two deliberately separate layouts.
 `prefix_cache_mode=auto` chooses radix for vanilla/OmniKV/QuEST and a linear
-chain for SnapKV/PyramidKV/R-KV/SkipKV. `radix` and `chain` can be requested
-explicitly, but incompatible method/mode pairs fail fast.
+chain for SnapKV/H2O/PyramidKV/R-KV/SkipKV. `radix` and `chain` can be
+requested explicitly, but incompatible method/mode pairs fail fast.
 
 The chain layout keeps one resident `seq_id` across turns and never branches.
 Callers send the complete logical context plus the returned `chain_id`; only

@@ -140,7 +140,7 @@ manifests normalize to the same runtime.
 Use the HF backend when you want to compare against the DeltaKV / SnapKV /
 PyramidKV wrapper models implemented under `src/deltakv/`.
 
-For linear chain prefix-cache traces, select `chain_snapkv`,
+For linear chain prefix-cache traces, select `chain_snapkv`, `chain_h2o`,
 `chain_pyramidkv`, `chain_rkv`, or `chain_skipkv` in
 `scripts/benchmarks/bench_prefix_cache.py`. Chain cases require
 `--workloads multiturn --history_update generated`: turn 0 records the

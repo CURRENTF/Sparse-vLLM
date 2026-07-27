@@ -1443,6 +1443,18 @@ def test_h2o_free_seq_cleans_score_vectors():
     parent_free.assert_called_once_with(manager, 0)
 
 
+def test_h2o_chain_turn_retains_score_and_cursor_until_reclaimed():
+    manager = _manager_with_rows([4])
+    manager._h2o_scores[(0, 0)] = torch.arange(4, dtype=torch.float32)
+    manager._h2o_recent_cursors[(0, 0)] = 2
+
+    manager.on_chain_turn_finished(0, processed_token_count=100)
+
+    assert manager._h2o_scores[(0, 0)].tolist() == [0.0, 1.0, 2.0, 3.0]
+    assert manager._h2o_recent_cursors == {(0, 0): 2}
+    assert manager.chain_physical_residency(0) == (4,)
+
+
 def test_h2o_reset_after_warmup_clears_scores_and_counters():
     manager = _manager_with_rows([2])
     manager._h2o_scores[(0, 0)] = torch.ones(2)

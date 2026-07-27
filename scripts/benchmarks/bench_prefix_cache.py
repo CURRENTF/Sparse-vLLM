@@ -47,6 +47,11 @@ CASE_PRESETS: dict[str, dict[str, Any]] = {
         "enable_prefix_caching": True,
         "label": "SnapKV, linear chain prefix cache",
     },
+    "chain_h2o": {
+        "method": "h2o",
+        "enable_prefix_caching": True,
+        "label": "H2O, linear chain prefix cache",
+    },
     "chain_pyramidkv": {
         "method": "pyramidkv",
         "enable_prefix_caching": True,
@@ -73,6 +78,7 @@ CASE_ALIASES = {
     "omnikv": "prefix_omnikv",
     "quest": "prefix_quest",
     "snapkv": "chain_snapkv",
+    "h2o": "chain_h2o",
     "pyramidkv": "chain_pyramidkv",
     "rkv": "chain_rkv",
     "skipkv": "chain_skipkv",
