@@ -38,7 +38,16 @@ class DecodeCudaGraphTPConfigTest(unittest.TestCase):
                 )
 
     def test_tp_decode_cuda_graph_accepts_v1_methods(self):
-        for method in ["vanilla", "streamingllm", "snapkv", "pyramidkv", "omnikv", "quest", "rkv"]:
+        for method in [
+            "vanilla",
+            "streamingllm",
+            "snapkv",
+            "h2o",
+            "pyramidkv",
+            "omnikv",
+            "quest",
+            "rkv",
+        ]:
             with self.subTest(method=method):
                 cfg = self._config(method)
                 self.assertTrue(cfg.decode_cuda_graph)

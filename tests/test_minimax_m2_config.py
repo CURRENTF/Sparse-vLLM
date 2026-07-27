@@ -157,6 +157,7 @@ def test_minimax_compatibility_matches_qwen3_moe_sparse_runtime():
         "",
         "streamingllm",
         "snapkv",
+        "h2o",
         "pyramidkv",
         "omnikv",
         "quest",
@@ -190,7 +191,10 @@ def test_minimax_compatibility_accepts_prefix_cache_methods(method):
     )
 
 
-@pytest.mark.parametrize("method", ["streamingllm", "snapkv", "pyramidkv", "rkv"])
+@pytest.mark.parametrize(
+    "method",
+    ["streamingllm", "snapkv", "h2o", "pyramidkv", "rkv"],
+)
 def test_minimax_compatibility_rejects_unvalidated_prefix_cache_methods(method):
     with pytest.raises(ValueError, match="prefix caching is validated only"):
         _validate(method, decode_cuda_graph=False, enable_prefix_caching=True)
@@ -204,7 +208,15 @@ def test_minimax_compatibility_rejects_out_of_scope_sparse_methods(method):
 
 @pytest.mark.parametrize(
     "method",
-    ["streamingllm", "snapkv", "pyramidkv", "omnikv", "quest", "rkv"],
+    [
+        "streamingllm",
+        "snapkv",
+        "h2o",
+        "pyramidkv",
+        "omnikv",
+        "quest",
+        "rkv",
+    ],
 )
 def test_minimax_config_accepts_non_deltakv_sparse_methods(tmp_path, method):
     config = _make_config(
@@ -220,7 +232,15 @@ def test_minimax_config_accepts_non_deltakv_sparse_methods(tmp_path, method):
 
 @pytest.mark.parametrize(
     "method",
-    ["streamingllm", "snapkv", "pyramidkv", "omnikv", "quest", "rkv"],
+    [
+        "streamingllm",
+        "snapkv",
+        "h2o",
+        "pyramidkv",
+        "omnikv",
+        "quest",
+        "rkv",
+    ],
 )
 def test_minimax_sparse_methods_accept_decode_cuda_graph(tmp_path, method):
     config = _make_config(

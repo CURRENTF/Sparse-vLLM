@@ -12,6 +12,7 @@ from transformers import AutoConfig
 from sparsevllm.constant import REDUNDANCY_BATCH_SIZE_FACTOR
 from sparsevllm.method_registry import (
     DECODE_CUDA_GRAPH_SUPPORTED_METHODS,
+    H2O_SUPPORTED_MODEL_TYPES,
     PREFILL_POLICY_AUTO,
     PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
     PREFIX_CACHE_SUPPORTED_METHODS,
@@ -1415,16 +1416,13 @@ class Config:
         is_qwen3 = model_type == "qwen3"
         is_qwen3_moe = model_type == "qwen3_moe"
         if self.vllm_sparse_method == "h2o":
-            if model_type != "qwen2":
-                raise NotImplementedError(
-                    "H2O v1 is validated for Qwen2-family models only, "
-                    f"got model_type={model_type!r}."
+            if model_type not in H2O_SUPPORTED_MODEL_TYPES:
+                supported = ", ".join(
+                    repr(value) for value in sorted(H2O_SUPPORTED_MODEL_TYPES)
                 )
-            if self.tensor_parallel_size != 1:
                 raise NotImplementedError(
-                    "H2O v1 requires TP=1 because token scores and eviction "
-                    "indices are not aggregated across tensor-parallel ranks, "
-                    f"got TP={self.tensor_parallel_size}."
+                    "H2O v1 supports the model types already implemented by Sparse-vLLM: "
+                    f"{supported}; got model_type={model_type!r}."
                 )
         if self.tiny_random:
             from sparsevllm.debug.tiny_random import apply_tiny_random_overrides

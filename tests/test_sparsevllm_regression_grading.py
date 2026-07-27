@@ -44,6 +44,7 @@ from benchmark.sparsevllm_regression.run_suite import (
 from benchmark.sparsevllm_regression.run_suite import _quality_command
 from sparsevllm.engine.cache_manager.base import CacheManager
 from sparsevllm.distributed import ParallelContext, ParallelGroup
+from sparsevllm.method_registry import H2O_SUPPORTED_MODEL_TYPES
 
 
 def _single_process_parallel_context() -> ParallelContext:
@@ -138,11 +139,18 @@ class SparseVLLMRegressionGradingTest(unittest.TestCase):
         with self.assertRaisesRegex(ManifestError, "minimum_vanilla_score"):
             validate_manifest(manifest)
 
-    def test_h2o_manifest_declares_qwen2_tp1_runtime_matrix(self):
+    def test_h2o_manifest_declares_supported_models_tp_runtime_matrix(self):
         manifest = load_manifest()
         method = manifest["methods"]["h2o"]
-        self.assertEqual(method["supported_model_families"], ["qwen2"])
-        self.assertEqual(method["supported_tensor_parallel_sizes"], [1])
+        self.assertEqual(
+            method["supported_model_families"],
+            ["qwen2", "qwen3", "qwen3_moe", "qwen3_5", "llama", "minimax_m2"],
+        )
+        self.assertEqual(
+            set(method["supported_model_families"]),
+            set(H2O_SUPPORTED_MODEL_TYPES),
+        )
+        self.assertEqual(method["supported_tensor_parallel_sizes"], [1, 2])
         self.assertEqual(method["performance"]["minimum_prefill_speedup"], 1.0)
         self.assertIsNone(
             runtime_support_reason(
@@ -152,13 +160,17 @@ class SparseVLLMRegressionGradingTest(unittest.TestCase):
                 tensor_parallel_sizes=(1,),
             )
         )
-        self.assertIn(
-            "model families",
+        self.assertIsNone(
+            runtime_support_reason(
+                manifest, "qwen3_4b", "h2o", tensor_parallel_sizes=(1,)
+            )
+        )
+        self.assertIsNone(
             runtime_support_reason(
                 manifest,
-                "qwen3_4b",
+                "qwen25_7b",
                 "h2o",
-                tensor_parallel_sizes=(1,),
+                tensor_parallel_sizes=(2,),
             ),
         )
         self.assertIn(
@@ -167,7 +179,7 @@ class SparseVLLMRegressionGradingTest(unittest.TestCase):
                 manifest,
                 "qwen25_7b",
                 "h2o",
-                tensor_parallel_sizes=(2,),
+                tensor_parallel_sizes=(4,),
             ),
         )
 
@@ -188,7 +200,7 @@ class SparseVLLMRegressionGradingTest(unittest.TestCase):
         with self.assertRaisesRegex(ManifestError, "unknown keys"):
             validate_manifest(manifest)
 
-    def test_h2o_unsupported_model_dry_run_is_skipped_by_policy(self):
+    def test_h2o_supported_qwen3_dry_run_emits_command(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             model_path = root / "qwen3-model"
@@ -222,10 +234,9 @@ class SparseVLLMRegressionGradingTest(unittest.TestCase):
                     / "grade_summary.json"
                 ).read_text(encoding="utf-8")
             )
-            self.assertEqual(summary["commands"], [])
-            self.assertEqual(summary["skipped"][0]["model"], "qwen3_4b")
-            self.assertEqual(summary["skipped"][0]["method"], "h2o")
-            self.assertEqual(summary["skipped"][0]["status"], "skipped_by_policy")
+            self.assertEqual(len(summary["commands"]), 1)
+            self.assertEqual(summary["commands"][0]["status"], "skipped_by_policy")
+            self.assertEqual(summary["skipped"], [])
 
     def test_model_specific_compressor_path_resolution(self):
         manifest = copy.deepcopy(load_manifest())

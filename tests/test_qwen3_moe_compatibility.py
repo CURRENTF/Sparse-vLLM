@@ -29,6 +29,7 @@ def test_qwen3_moe_registry_lists_only_v1_validated_combinations():
         "",
         "streamingllm",
         "snapkv",
+        "h2o",
         "pyramidkv",
         "omnikv",
         "quest",
@@ -39,6 +40,7 @@ def test_qwen3_moe_registry_lists_only_v1_validated_combinations():
         "omnikv",
         "quest",
         "snapkv",
+        "h2o",
         "pyramidkv",
         "rkv",
     }
@@ -53,7 +55,7 @@ def test_qwen3_moe_registry_accepts_first_batch_sparse_methods(method):
 
 @pytest.mark.parametrize(
     "method",
-    ["", "omnikv", "quest", "snapkv", "pyramidkv", "rkv"],
+    ["", "omnikv", "quest", "snapkv", "h2o", "pyramidkv", "rkv"],
 )
 def test_qwen3_moe_registry_accepts_explicit_prefix_cache_methods(method):
     assert _validate(method, enable_prefix_caching=True) is QWEN3_MOE_EP_COMPATIBILITY

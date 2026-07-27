@@ -622,7 +622,7 @@ class PrefillPolicyConfigTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, message):
                     self.make_config(vllm_sparse_method="h2o", **values)
 
-    def test_h2o_rejects_unvalidated_model_and_tp_combinations(self):
+    def test_h2o_accepts_supported_dense_model_tp_and_rejects_unknown_model(self):
         llama_config = self.hf_config()
         llama_config.model_type = "llama"
         with tempfile.TemporaryDirectory() as tmp:
@@ -630,18 +630,29 @@ class PrefillPolicyConfigTest(unittest.TestCase):
                 "sparsevllm.config.AutoConfig.from_pretrained",
                 return_value=llama_config,
             ):
+                cfg = Config(model=str(Path(tmp)), vllm_sparse_method="h2o")
+                self.assertEqual(cfg.vllm_sparse_method, "h2o")
+
+        unknown_config = self.hf_config()
+        unknown_config.model_type = "unknown_model"
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch(
+                "sparsevllm.config.AutoConfig.from_pretrained",
+                return_value=unknown_config,
+            ):
                 with self.assertRaisesRegex(
                     NotImplementedError,
-                    "Qwen2-family models only",
+                    "model types already implemented",
                 ):
                     Config(model=str(Path(tmp)), vllm_sparse_method="h2o")
 
-        with self.assertRaisesRegex(NotImplementedError, "requires TP=1"):
-            self.make_config(
-                vllm_sparse_method="h2o",
-                tensor_parallel_size=2,
-                decode_cuda_graph=False,
-            )
+        cfg = self.make_config(
+            vllm_sparse_method="h2o",
+            tensor_parallel_size=2,
+            decode_cuda_graph=False,
+        )
+        self.assertEqual(cfg.vllm_sparse_method, "h2o")
+        self.assertEqual(cfg.tensor_parallel_size, 2)
 
     def test_all_chunked_keeps_configured_batch_cap_below_chunk_size(self):
         cfg = self.make_config(

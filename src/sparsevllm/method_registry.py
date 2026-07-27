@@ -56,6 +56,17 @@ PREFIX_CACHE_SUPPORTED_METHODS = {
     "skipkv",
 }
 
+H2O_SUPPORTED_MODEL_TYPES = frozenset(
+    {
+        "qwen2",
+        "qwen3",
+        "qwen3_moe",
+        "qwen3_5",
+        "llama",
+        "minimax_m2",
+    }
+)
+
 
 @dataclass(frozen=True)
 class ModelRuntimeCompatibility:
@@ -73,6 +84,7 @@ QWEN3_MOE_EP_COMPATIBILITY = ModelRuntimeCompatibility(
             "",
             "streamingllm",
             "snapkv",
+            "h2o",
             "pyramidkv",
             "omnikv",
             "quest",
@@ -80,7 +92,7 @@ QWEN3_MOE_EP_COMPATIBILITY = ModelRuntimeCompatibility(
         }
     ),
     prefix_cache_methods=frozenset(
-        {"", "omnikv", "quest", "snapkv", "pyramidkv", "rkv"}
+        {"", "omnikv", "quest", "snapkv", "h2o", "pyramidkv", "rkv"}
     ),
     requires_eager=False,
     decode_cuda_graph_methods=frozenset({""}),
@@ -93,6 +105,7 @@ MINIMAX_M2_EP_COMPATIBILITY = ModelRuntimeCompatibility(
             "",
             "streamingllm",
             "snapkv",
+            "h2o",
             "pyramidkv",
             "omnikv",
             "quest",
@@ -106,6 +119,7 @@ MINIMAX_M2_EP_COMPATIBILITY = ModelRuntimeCompatibility(
             "",
             "streamingllm",
             "snapkv",
+            "h2o",
             "pyramidkv",
             "omnikv",
             "quest",
@@ -125,6 +139,7 @@ TP_DECODE_CUDA_GRAPH_SUPPORTED_METHODS = {
     "",
     "streamingllm",
     "snapkv",
+    "h2o",
     "pyramidkv",
     "omnikv",
     "quest",

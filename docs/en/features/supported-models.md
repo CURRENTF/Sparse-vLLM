@@ -32,12 +32,12 @@ normalized internally to `model_type=qwen3_5`.
 
 | Model | Vanilla | StreamingLLM | SnapKV | H2O | PyramidKV | OmniKV | QuEST | R-KV | SkipKV | DeltaKV |
 | --- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| Qwen2.5 | ✅ | ✅ | ✅ | Experimental TP=1⁴ | ✅ | ✅ | ✅ | ✅ | Selected checkpoints¹ | Compressor required² |
-| Qwen3 | ✅ | ✅ | ✅ | — | ✅ | ✅ | ✅ | ✅ | — | Compressor required² |
-| Qwen3MoE | ✅ | ✅ | ✅ | — | ✅ | ✅ | ✅ | ✅ | — | — |
-| Qwen3.5 / Qwen3.6 | ✅ | ✅ | ✅ | — | ✅ | ✅ | ✅ | ✅ | — | Matched checkpoint³ |
-| Llama 3 / 3.1 | ✅ | ✅ | ✅ | — | ✅ | ✅ | ✅ | ✅ | Selected checkpoint¹ | Compressor required² |
-| MiniMax M2.7 | ✅ | ✅ | ✅ | — | ✅ | ✅ | ✅ | ✅ | — | — |
+| Qwen2.5 | ✅ | ✅ | ✅ | Experimental⁴ | ✅ | ✅ | ✅ | ✅ | Selected checkpoints¹ | Compressor required² |
+| Qwen3 | ✅ | ✅ | ✅ | Experimental⁴ | ✅ | ✅ | ✅ | ✅ | — | Compressor required² |
+| Qwen3MoE | ✅ | ✅ | ✅ | Experimental⁴ | ✅ | ✅ | ✅ | ✅ | — | — |
+| Qwen3.5 / Qwen3.6 | ✅ | ✅ | ✅ | Experimental⁴ | ✅ | ✅ | ✅ | ✅ | — | Matched checkpoint³ |
+| Llama 3 / 3.1 | ✅ | ✅ | ✅ | Experimental⁴ | ✅ | ✅ | ✅ | ✅ | Selected checkpoint¹ | Compressor required² |
+| MiniMax M2.7 | ✅ | ✅ | ✅ | Experimental⁴ | ✅ | ✅ | ✅ | ✅ | — | — |
 
 ¹ SkipKV is limited to the released steering-vector models:
 `DeepSeek-R1-Distill-Qwen-7B`, `DeepSeek-R1-Distill-Qwen-14B`, and
@@ -48,8 +48,9 @@ normalized internally to `model_type=qwen3_5`.
 ³ Qwen3.5 and Qwen3.6 require a matching DeltaKV checkpoint accepted by the
 mixed-attention runtime.
 
-⁴ H2O is currently scoped to the Qwen2.5 single-GPU validation path. Other
-model, TP, and expert-parallel combinations remain unvalidated and fail fast
-where an explicit compatibility gate exists.
+⁴ H2O supports tensor parallelism with TP-local sparse selection: each rank
+scores and retains tokens using its local heads or KV heads, without cross-rank
+sparse-index aggregation. This is not guaranteed to be equivalent to TP=1 or
+global-head selection. Model-specific TP, EP, and DP restrictions still apply.
 
 `—` means that the combination is not currently supported.

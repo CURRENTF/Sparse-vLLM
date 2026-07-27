@@ -2,7 +2,7 @@
 
 Sparse-vLLM will support tensor-parallel decode CUDA graphs by having every TP rank capture and replay its own full decode forward, including existing collective operations. This keeps model-layer boundaries intact and matches the direction used by vLLM and SGLang; if the active distributed backend cannot be captured safely, the runtime should fail explicitly rather than silently falling back to static eager execution.
 
-v1 is single-node TP only and supports `vanilla`, `streamingllm`, `snapkv`, `pyramidkv`, `omnikv`, `quest`, `rkv`, and `skipkv`. DeltaKV is excluded from v1. QuEST support means graph-on equivalence to the same tensor-parallel QuEST static/eager path under TP-local sparse selection, not equivalence to TP=1 or global-head sparse selection.
+v1 is single-node TP only and supports `vanilla`, `streamingllm`, `snapkv`, `h2o`, `pyramidkv`, `omnikv`, `quest`, `rkv`, and `skipkv`. DeltaKV is excluded from v1. Sparse-method support means graph-on equivalence to the same tensor-parallel static/eager path under TP-local sparse selection, not equivalence to TP=1 or global-head sparse selection.
 
 Sparse methods use TP-local sparse selection: every rank selects important tokens from its own local heads or KV heads, without cross-rank sparse-index aggregation. The runtime warns when `decode_cuda_graph=True` and `tensor_parallel_size > 1` because this is not guaranteed algorithmically equivalent to TP=1 or global-head sparse selection.
 
