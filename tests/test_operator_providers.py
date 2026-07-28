@@ -56,18 +56,20 @@ def _moe_spec(
     block_shape=(128, 128),
     hidden_size=256,
     intermediate_size=128,
+    num_local_experts=4,
+    ep_size=2,
     tp_size=1,
 ) -> MoeOpSpec:
     return MoeOpSpec(
         num_experts=8,
-        num_local_experts=4,
+        num_local_experts=num_local_experts,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
         top_k=2,
         activation_dtype=activation_dtype,
         weight_dtype=weight_dtype,
         block_shape=block_shape,
-        ep_size=2,
+        ep_size=ep_size,
         cuda_graph=True,
         tp_size=tp_size,
     )
@@ -381,6 +383,14 @@ def test_fp8_moe_rejects_pre_fp8_cuda():
         OpResolver(MOE_REGISTRY).resolve(
             _moe_spec(),
             _cuda_caps((8, 0), native_fp8=False),
+        )
+
+
+def test_fp8_moe_rejects_tensor_parallel_expert_shards():
+    with pytest.raises(RuntimeError, match="tensor-parallel expert shards"):
+        OpResolver(MOE_REGISTRY).resolve(
+            _moe_spec(tp_size=2, ep_size=1, num_local_experts=8),
+            _cuda_caps((9, 0)),
         )
 
 

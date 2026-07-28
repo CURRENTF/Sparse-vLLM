@@ -263,6 +263,10 @@ class TritonMoeProvider(MoeProvider):
                 f"requires BF16 or FP16 activations, got {spec.activation_dtype}"
             )
         if spec.weight_dtype == torch.float8_e4m3fn:
+            if spec.tp_size != 1:
+                return SupportResult.no(
+                    "FP8 tensor-parallel expert shards are not validated"
+                )
             if spec.block_shape != (128, 128):
                 return SupportResult.no(
                     f"FP8 requires block_shape=(128, 128), got {spec.block_shape}"

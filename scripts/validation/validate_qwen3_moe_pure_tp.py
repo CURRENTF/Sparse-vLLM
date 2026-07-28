@@ -155,6 +155,38 @@ def _prompts(tokenizer) -> list[tuple[str, str]]:
     return prompts
 
 
+def _generate_sample(
+    llm: LLM,
+    *,
+    sample_id: str,
+    prompt: str,
+    max_tokens: int,
+) -> dict[str, Any]:
+    try:
+        output = llm.generate(
+            [prompt],
+            SamplingParams(temperature=0.0, max_tokens=max_tokens),
+            use_tqdm=False,
+        )[0]
+    except Exception as exc:
+        return {
+            "sample_id": sample_id,
+            "status": "model_failed",
+            "prompt": prompt,
+            "text": "",
+            "token_ids": [],
+            "error": repr(exc),
+            "traceback": traceback.format_exc(),
+        }
+    return {
+        "sample_id": sample_id,
+        "status": "success",
+        "prompt": prompt,
+        "text": output["text"],
+        "token_ids": list(output["token_ids"]),
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
@@ -237,18 +269,17 @@ def main() -> None:
         )
         cache_before = _cache_stats(llm)
         for sample_id, prompt in prompts:
-            output = llm.generate(
-                [prompt],
-                SamplingParams(temperature=0.0, max_tokens=args.max_tokens),
-                use_tqdm=False,
-            )[0]
-            row = {
-                "sample_id": sample_id,
-                "status": "success",
-                "prompt": prompt,
-                "text": output["text"],
-                "token_ids": list(output["token_ids"]),
-            }
+            row = _generate_sample(
+                llm,
+                sample_id=sample_id,
+                prompt=prompt,
+                max_tokens=args.max_tokens,
+            )
+            rows.append(row)
+            if row["status"] != "success":
+                raise RuntimeError(
+                    f"Generation failed for sample {sample_id!r}: {row['error']}"
+                )
             expected = reference.get(sample_id)
             if args.reference is not None and expected is None:
                 row["status"] = "metric_failed"
@@ -256,7 +287,6 @@ def main() -> None:
             elif expected is not None and row["token_ids"] != expected:
                 row["status"] = "metric_failed"
                 row["error"] = "Generated token IDs differ from the reference."
-            rows.append(row)
 
         cache_after = _cache_stats(llm)
         cache_delta = {
