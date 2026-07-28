@@ -96,7 +96,8 @@ def _validate_replica_consistency(llm: LLM) -> list[dict[str, Any]]:
     failures = []
     for summary in summaries:
         consistency = summary.get("replica_consistency") or {}
-        if float(consistency.get("last_logits_tolerance_ratio", 0.0)) > 1.0:
+        logits_ratio = consistency.get("last_logits_tolerance_ratio")
+        if logits_ratio is not None and float(logits_ratio) > 1.0:
             failures.append(
                 {
                     "world_rank": summary.get("world_rank"),
@@ -249,7 +250,10 @@ def main() -> None:
                 "token_ids": list(output["token_ids"]),
             }
             expected = reference.get(sample_id)
-            if expected is not None and row["token_ids"] != expected:
+            if args.reference is not None and expected is None:
+                row["status"] = "metric_failed"
+                row["error"] = "Reference output is missing this sample ID."
+            elif expected is not None and row["token_ids"] != expected:
                 row["status"] = "metric_failed"
                 row["error"] = "Generated token IDs differ from the reference."
             rows.append(row)
@@ -312,8 +316,20 @@ def main() -> None:
         }
         raise
     finally:
+        active_error = sys.exception()
+        exit_error = None
         if llm is not None:
-            llm.exit()
+            try:
+                llm.exit()
+            except Exception as exc:
+                exit_error = exc
+        if exit_error is not None:
+            aggregate["shutdown_error"] = repr(exit_error)
+            if active_error is None:
+                aggregate["status"] = "model_failed"
+                aggregate["error"] = f"Engine shutdown failed: {exit_error!r}"
+            else:
+                active_error.add_note(f"Engine shutdown also failed: {exit_error!r}")
         raw_rows = [
             {
                 "sample_id": row["sample_id"],
@@ -338,6 +354,8 @@ def main() -> None:
         _write_json(output_dir / "parsed_outputs.json", parsed_rows)
         _write_jsonl(output_dir / "per_sample_results.jsonl", rows)
         _write_json(output_dir / "aggregate_metrics.json", aggregate)
+        if exit_error is not None and active_error is None:
+            raise RuntimeError(f"Engine shutdown failed: {exit_error!r}") from exit_error
 
 
 if __name__ == "__main__":

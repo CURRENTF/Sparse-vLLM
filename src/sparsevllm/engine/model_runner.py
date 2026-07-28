@@ -845,18 +845,24 @@ class ModelRunner:
 
     def debug_replica_consistency(self) -> dict[str, object] | None:
         logits = getattr(self, "debug_last_logits", None)
-        if logits is None:
+        tp_size = int(getattr(self.parallel_context, "tp_size", 1))
+        if logits is None and tp_size == 1:
             return None
-        logits_max_abs, logits_tolerance_ratio = self._debug_float_error_from_world_rank_zero(
-            logits,
-            atol=0.05,
-            rtol=0.05,
-        )
         result: dict[str, object] = {
-            "last_logits_max_abs": logits_max_abs,
-            "last_logits_tolerance_ratio": logits_tolerance_ratio,
+            "last_logits_max_abs": None,
+            "last_logits_tolerance_ratio": None,
             "moe_layers": {},
         }
+        if tp_size == 1:
+            logits_max_abs, logits_tolerance_ratio = (
+                self._debug_float_error_from_world_rank_zero(
+                    logits,
+                    atol=0.05,
+                    rtol=0.05,
+                )
+            )
+            result["last_logits_max_abs"] = logits_max_abs
+            result["last_logits_tolerance_ratio"] = logits_tolerance_ratio
         model = getattr(getattr(self, "model", None), "model", None)
         layers = getattr(model, "layers", ())
         for layer_idx in sorted({0, len(layers) - 1} if layers else set()):
@@ -1001,7 +1007,10 @@ class ModelRunner:
         _stage = 'prefill' if is_prefill else 'decode'
         with profiler.record(f"model_run_model_{_stage}"):
             logits = self.model.compute_logits(self.model(input_ids, positions))
-        if os.getenv("SPARSEVLLM_DEBUG_RUNTIME", "0") == "1":
+        if (
+            os.getenv("SPARSEVLLM_DEBUG_RUNTIME", "0") == "1"
+            and logits is not None
+        ):
             self.debug_last_logits = logits.detach().clone()
         return logits
 
