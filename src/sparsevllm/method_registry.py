@@ -108,6 +108,14 @@ QWEN3_MOE_EP_COMPATIBILITY = ModelRuntimeCompatibility(
     ),
 )
 
+QWEN3_MOE_TP_COMPATIBILITY = ModelRuntimeCompatibility(
+    parallel_mode="pure_tp",
+    sparse_methods=frozenset({""}),
+    prefix_cache_methods=frozenset({""}),
+    requires_eager=False,
+    decode_cuda_graph_methods=frozenset({""}),
+)
+
 MINIMAX_M2_EP_COMPATIBILITY = ModelRuntimeCompatibility(
     parallel_mode="ep_replicated_kv",
     sparse_methods=frozenset(
@@ -222,12 +230,22 @@ def validate_model_runtime_compatibility(
         return None
 
     method = normalize_sparse_method(sparse_method)
-    if int(tensor_parallel_size) != 1 or int(data_parallel_size) != 1:
+    tp_size = int(tensor_parallel_size)
+    ep_size = int(expert_parallel_size)
+    dp_size = int(data_parallel_size)
+    if model_type == "qwen3_moe" and tp_size > 1:
+        compatibility = QWEN3_MOE_TP_COMPATIBILITY
+        if ep_size != 1 or dp_size != 1:
+            raise ValueError(
+                "qwen3_moe pure_tp requires EP=1 and DP=1, got "
+                f"TP={tp_size}, EP={ep_size}, DP={dp_size}."
+            )
+    elif tp_size != 1 or dp_size != 1:
         raise ValueError(
             f"{model_type} {compatibility.parallel_mode} requires TP=1 and DP=1, got "
             f"TP={tensor_parallel_size}, EP={expert_parallel_size}, DP={data_parallel_size}."
         )
-    if int(expert_parallel_size) <= 0:
+    if ep_size <= 0:
         raise ValueError(
             f"{model_type} requires a positive expert_parallel_size, got {expert_parallel_size}."
         )

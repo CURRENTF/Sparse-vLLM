@@ -8,6 +8,7 @@ from benchmark.microbench import (
     _benchmark_sparse_method,
     _record_child_exit_failure,
     _resolved_engine_config,
+    _selected_moe_providers,
     _write_output_dir,
 )
 
@@ -149,3 +150,24 @@ def test_resolved_engine_config_records_backend_and_jsonable_values():
     assert resolved["h2o_prefill_budget"] == 8192
     assert resolved["h2o_recent_ratio"] == 0.5
     assert resolved["h2o_prefill_score_window"] == 128
+
+
+def test_selected_moe_providers_records_bound_provider_names():
+    def layer(provider_name):
+        return SimpleNamespace(
+            mlp=SimpleNamespace(
+                experts=SimpleNamespace(
+                    provider=SimpleNamespace(name=provider_name),
+                )
+            )
+        )
+
+    llm = SimpleNamespace(
+        model_runner=SimpleNamespace(
+            model=SimpleNamespace(
+                model=SimpleNamespace(layers=[layer("triton"), layer("triton")])
+            )
+        )
+    )
+
+    assert _selected_moe_providers(llm) == ["triton"]

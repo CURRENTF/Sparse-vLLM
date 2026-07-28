@@ -78,6 +78,7 @@ def _hf_config(model_type: str = "qwen3_moe", *, num_experts: int = 8):
         num_hidden_layers=2,
         num_attention_heads=4,
         num_key_value_heads=2,
+        vocab_size=32,
         num_experts=num_experts,
         num_experts_per_tok=2,
         decoder_sparse_step=1,
@@ -187,8 +188,23 @@ def test_qwen3_moe_parallel_config_validation(tmp_path):
     assert config.weight_loading_workers_per_rank == 1
 
     with patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", return_value=_hf_config()):
-        with pytest.raises(ValueError, match="only supports TP=1 and DP=1"):
+        with pytest.raises(ValueError, match="not combined TP and EP"):
             Config(model=str(tmp_path), tensor_parallel_size=2, expert_parallel_size=2)
+
+    with patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", return_value=_hf_config()):
+        config = Config(model=str(tmp_path), tensor_parallel_size=2)
+    assert config.tensor_parallel_size == 2
+    assert config.expert_parallel_size == 1
+
+    with patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", return_value=_hf_config()):
+        with pytest.raises(ValueError, match="num_key_value_heads must be divisible"):
+            Config(model=str(tmp_path), tensor_parallel_size=4)
+
+    fp16 = _hf_config()
+    fp16.torch_dtype = torch.float16
+    with patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", return_value=fp16):
+        with pytest.raises(NotImplementedError, match="pure TP supports BF16"):
+            Config(model=str(tmp_path), tensor_parallel_size=2)
 
     with patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", return_value=_hf_config(num_experts=6)):
         with pytest.raises(ValueError, match="divisible"):

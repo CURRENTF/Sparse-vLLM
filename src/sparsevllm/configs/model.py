@@ -562,25 +562,49 @@ def _validate_runtime_compatibility(config, *, model_type: str) -> None:
 
 
 def _validate_qwen3_moe_runtime(config, *, model_type: str) -> None:
-    if config.tensor_parallel_size != 1 or config.data_parallel_size != 1:
+    tp_size = int(config.tensor_parallel_size)
+    ep_size = int(config.expert_parallel_size)
+    if config.data_parallel_size != 1:
         raise ValueError(
-            "Qwen3MoE v1 only supports TP=1 and DP=1, got "
+            "Qwen3MoE requires DP=1, got "
             f"TP={config.tensor_parallel_size}, EP={config.expert_parallel_size}, "
             f"DP={config.data_parallel_size}."
+        )
+    if tp_size > 1 and ep_size > 1:
+        raise ValueError(
+            "Qwen3MoE supports pure TP or pure EP, not combined TP and EP; got "
+            f"TP={tp_size}, EP={ep_size}."
         )
     num_experts = int(getattr(config.hf_config, "num_experts", 0) or 0)
     if num_experts <= 0:
         raise ValueError(f"Qwen3MoE requires a positive num_experts, got {num_experts}.")
-    if config.expert_parallel_size > num_experts:
+    if ep_size > num_experts:
         raise ValueError(
             "expert_parallel_size must not exceed num_experts, "
             f"got EP={config.expert_parallel_size}, num_experts={num_experts}."
         )
-    if num_experts % config.expert_parallel_size != 0:
+    if num_experts % ep_size != 0:
         raise ValueError(
             "Qwen3MoE requires num_experts divisible by expert_parallel_size, "
             f"got num_experts={num_experts}, EP={config.expert_parallel_size}."
         )
+    if tp_size > 1:
+        divisible_fields = {
+            "num_attention_heads": int(config.hf_config.num_attention_heads),
+            "num_key_value_heads": int(config.hf_config.num_key_value_heads),
+            "vocab_size": int(config.hf_config.vocab_size),
+            "moe_intermediate_size": int(config.hf_config.moe_intermediate_size),
+        }
+        for field, value in divisible_fields.items():
+            if value % tp_size:
+                raise ValueError(
+                    f"Qwen3MoE {field} must be divisible by tensor_parallel_size, "
+                    f"got {value} and {tp_size}."
+                )
+        if config.quantization_config.enabled:
+            raise NotImplementedError(
+                "Qwen3MoE pure TP supports unquantized BF16 checkpoints only."
+            )
     top_k = int(getattr(config.hf_config, "num_experts_per_tok", 0) or 0)
     if not 1 <= top_k <= num_experts:
         raise ValueError(
@@ -612,6 +636,11 @@ def _validate_qwen3_moe_runtime(config, *, model_type: str) -> None:
     if model_dtype not in {torch.bfloat16, torch.float16}:
         raise NotImplementedError(
             "Qwen3MoE v1 supports BF16/FP16 checkpoints only, "
+            f"got torch_dtype={model_dtype}."
+        )
+    if tp_size > 1 and model_dtype != torch.bfloat16:
+        raise NotImplementedError(
+            "Qwen3MoE pure TP supports BF16 checkpoints only, "
             f"got torch_dtype={model_dtype}."
         )
     _validate_runtime_compatibility(config, model_type=model_type)

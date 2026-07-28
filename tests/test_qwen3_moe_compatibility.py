@@ -3,6 +3,7 @@ import pytest
 from sparsevllm.method_registry import (
     MODEL_RUNTIME_COMPATIBILITY,
     QWEN3_MOE_EP_COMPATIBILITY,
+    QWEN3_MOE_TP_COMPATIBILITY,
     validate_model_runtime_compatibility,
 )
 
@@ -83,8 +84,28 @@ def test_qwen3_moe_registry_rejects_conditional_and_out_of_scope_methods():
 
 
 def test_qwen3_moe_registry_rejects_unvalidated_parallel_modes():
-    with pytest.raises(ValueError, match="requires TP=1 and DP=1"):
+    with pytest.raises(ValueError, match="pure_tp requires EP=1 and DP=1"):
         _validate(tensor_parallel_size=2)
+
+
+def test_qwen3_moe_registry_accepts_vanilla_pure_tp_modes():
+    for tp_size in (2, 4):
+        assert _validate(
+            tensor_parallel_size=tp_size,
+            expert_parallel_size=1,
+        ) is QWEN3_MOE_TP_COMPATIBILITY
+        assert _validate(
+            tensor_parallel_size=tp_size,
+            expert_parallel_size=1,
+            enforce_eager=False,
+            decode_cuda_graph=True,
+            enable_prefix_caching=True,
+        ) is QWEN3_MOE_TP_COMPATIBILITY
+
+
+def test_qwen3_moe_registry_rejects_unvalidated_sparse_pure_tp():
+    with pytest.raises(ValueError, match="validated methods: 'vanilla'"):
+        _validate("omnikv", tensor_parallel_size=2, expert_parallel_size=1)
 
 
 @pytest.mark.parametrize(

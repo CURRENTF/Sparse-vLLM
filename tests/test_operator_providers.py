@@ -56,6 +56,7 @@ def _moe_spec(
     block_shape=(128, 128),
     hidden_size=256,
     intermediate_size=128,
+    tp_size=1,
 ) -> MoeOpSpec:
     return MoeOpSpec(
         num_experts=8,
@@ -68,6 +69,7 @@ def _moe_spec(
         block_shape=block_shape,
         ep_size=2,
         cuda_graph=True,
+        tp_size=tp_size,
     )
 
 
@@ -92,6 +94,8 @@ def _linear_spec(
         {"num_experts": 0},
         {"num_local_experts": 3},
         {"ep_size": 0},
+        {"tp_size": 0},
+        {"tp_size": 2},
         {"hidden_size": 0},
         {"intermediate_size": -1},
         {"top_k": 0},
@@ -111,6 +115,7 @@ def test_moe_spec_rejects_inconsistent_semantics(overrides):
         "block_shape": (128, 128),
         "ep_size": 2,
         "cuda_graph": True,
+        "tp_size": 1,
     }
     values.update(overrides)
 

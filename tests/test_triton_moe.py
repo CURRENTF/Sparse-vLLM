@@ -357,6 +357,73 @@ def test_triton_moe_ep_local_output_matches_oracle_and_ignores_remote_experts():
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for Triton MoE tests.")
+def test_triton_moe_tp_partial_sum_matches_unsharded_oracle():
+    torch.manual_seed(37)
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    num_tokens = 11
+    num_experts = 8
+    top_k = 3
+    hidden_size = 64
+    intermediate_size = 32
+    tp_size = 2
+    hidden_states = torch.randn(num_tokens, hidden_size, device=device, dtype=dtype)
+    gate = torch.randn(
+        num_experts,
+        intermediate_size,
+        hidden_size,
+        device=device,
+        dtype=dtype,
+    ) * 0.1
+    up = torch.randn_like(gate) * 0.1
+    down = torch.randn(
+        num_experts,
+        hidden_size,
+        intermediate_size,
+        device=device,
+        dtype=dtype,
+    ) * 0.1
+    topk_ids = torch.randint(
+        0,
+        num_experts,
+        (num_tokens, top_k),
+        dtype=torch.int64,
+        device=device,
+    )
+    topk_weights = torch.rand(num_tokens, top_k, device=device, dtype=dtype)
+    topk_weights /= topk_weights.sum(dim=-1, keepdim=True)
+
+    expected = _oracle_local_moe(
+        hidden_states,
+        torch.cat((gate, up), dim=1),
+        down,
+        topk_ids,
+        topk_weights,
+        0,
+    )
+    partial_outputs = []
+    for tp_rank in range(tp_size):
+        gate_shard = gate.chunk(tp_size, dim=1)[tp_rank]
+        up_shard = up.chunk(tp_size, dim=1)[tp_rank]
+        down_shard = down.chunk(tp_size, dim=2)[tp_rank].contiguous()
+        partial_outputs.append(
+            fused_moe(
+                hidden_states,
+                torch.cat((gate_shard, up_shard), dim=1),
+                down_shard,
+                topk_ids,
+                topk_weights,
+                num_experts=num_experts,
+                local_expert_start=0,
+            )
+        )
+    actual = torch.stack(partial_outputs).sum(dim=0)
+    torch.cuda.synchronize()
+
+    assert torch.allclose(actual, expected, atol=4e-2, rtol=4e-2)
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for Triton MoE tests.")
 def test_triton_moe_can_preserve_fp32_topk_sum():
     torch.manual_seed(15)
     device = torch.device("cuda")

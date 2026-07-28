@@ -50,7 +50,10 @@ def _rank_local_slice_for_tensor(
     special_loader = getattr(model, "load_special_weight", None)
     special_suffixes = tuple(getattr(model, "special_weight_loaders", ()))
     if callable(special_loader) and target_parameter_name.endswith(special_suffixes):
-        return None
+        special_slicer = getattr(model, "rank_local_special_weight_slice", None)
+        if not callable(special_slicer):
+            return None
+        return special_slicer(source_parameter_name, source_shape)
 
     loaded_shard_id = None
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})

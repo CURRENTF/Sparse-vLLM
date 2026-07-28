@@ -27,12 +27,19 @@ class MoeOpSpec:
     block_shape: tuple[int, int] | None
     ep_size: int
     cuda_graph: bool
+    tp_size: int = 1
 
     def __post_init__(self) -> None:
         if self.num_experts <= 0 or self.num_local_experts <= 0:
             raise ValueError("MoE expert counts must be positive.")
         if self.ep_size <= 0:
             raise ValueError("MoE ep_size must be positive.")
+        if self.tp_size <= 0:
+            raise ValueError("MoE tp_size must be positive.")
+        if self.ep_size > 1 and self.tp_size > 1:
+            raise ValueError(
+                "MoE TP and EP cannot both exceed one in the supported topology."
+            )
         if self.num_local_experts * self.ep_size != self.num_experts:
             raise ValueError(
                 "MoE local expert topology is inconsistent: "
@@ -174,6 +181,8 @@ class FlashInferCutlassFp8MoeProvider(MoeProvider):
 
     @classmethod
     def supports(cls, spec: MoeOpSpec, caps: DeviceCaps) -> SupportResult:
+        if spec.tp_size != 1:
+            return SupportResult.no("does not support tensor-parallel expert shards")
         if spec.weight_dtype != torch.float8_e4m3fn:
             return SupportResult.no(f"requires FP8 E4M3 weights, got {spec.weight_dtype}")
         if spec.block_shape != (128, 128):
