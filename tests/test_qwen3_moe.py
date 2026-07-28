@@ -91,6 +91,23 @@ def _tp_context(tp_rank: int, tp_size: int) -> ParallelContext:
     )
 
 
+def _hybrid_context(world_rank: int) -> ParallelContext:
+    ranks = (0, 1, 2, 3)
+    moe_tp_ranks = (0, 1) if world_rank < 2 else (2, 3)
+    moe_ep_ranks = (0, 2) if world_rank % 2 == 0 else (1, 3)
+    return ParallelContext(
+        world=ParallelGroup(None, ranks, world_rank, 4),
+        tensor=ParallelGroup(None, ranks, world_rank, 4),
+        expert=ParallelGroup(
+            None, moe_ep_ranks, moe_ep_ranks.index(world_rank), 2
+        ),
+        data=ParallelGroup(None, (world_rank,), 0, 1),
+        moe_tensor=ParallelGroup(
+            None, moe_tp_ranks, moe_tp_ranks.index(world_rank), 2
+        ),
+    )
+
+
 def _instantiate_model(config, context):
     with ExitStack() as stack:
         stack.enter_context(
@@ -494,7 +511,7 @@ def test_model_exposes_rank_local_expert_checkpoint_slices():
     ) == (slice(None), slice(4, 8))
 
 
-def test_moe_block_reduces_tp_partial_output():
+def test_moe_block_reduces_hybrid_partial_output_over_outer_world():
     config = _config(moe_intermediate_size=8)
     context = _tp_context(0, 2)
     with (
@@ -521,7 +538,7 @@ def test_moe_block_reduces_tp_partial_output():
         patch.object(block.experts, "forward", return_value=local_output),
         patch.object(
             ParallelContext,
-            "tp_all_reduce",
+            "world_all_reduce",
             return_value=local_output,
         ) as reduce,
     ):
@@ -529,6 +546,37 @@ def test_moe_block_reduces_tp_partial_output():
 
     assert output is local_output
     reduce.assert_called_once_with(local_output)
+
+
+def test_hybrid_expert_shards_cover_ep_and_moe_tp_dimensions():
+    config = _config(moe_intermediate_size=8)
+    source = torch.arange(64, dtype=torch.float32).reshape(8, 8)
+    shards = []
+    for world_rank in range(4):
+        with (
+            patch(
+                "sparsevllm.models.qwen3_moe.get_parallel_context",
+                return_value=_hybrid_context(world_rank),
+            ),
+            patch(
+                "sparsevllm.models.qwen3_moe.resolve_moe_provider",
+                return_value=TritonMoeProvider(),
+            ),
+        ):
+            experts = Qwen3MoePackedExperts(config)
+        experts.load_expert_weight(experts.local_expert_start, "gate_proj", source)
+        shards.append(experts)
+
+    assert [(item.local_expert_start, item.local_expert_end) for item in shards] == [
+        (0, 2),
+        (0, 2),
+        (2, 4),
+        (2, 4),
+    ]
+    assert torch.equal(shards[0].w13_weight[0, :4], source[:4])
+    assert torch.equal(shards[1].w13_weight[0, :4], source[4:])
+    assert torch.equal(shards[2].w13_weight[0, :4], source[:4])
+    assert torch.equal(shards[3].w13_weight[0, :4], source[4:])
 
 
 def test_packed_fp8_expert_weight_and_scale_mapping():

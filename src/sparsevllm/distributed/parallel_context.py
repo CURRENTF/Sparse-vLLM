@@ -113,6 +113,42 @@ def parallel_group_ranks(
     }
 
 
+def hybrid_moe_group_ranks(
+    *,
+    outer_tp_size: int,
+    moe_ep_size: int,
+) -> dict[str, tuple[tuple[int, ...], ...]]:
+    outer_tp_size = int(outer_tp_size)
+    moe_ep_size = int(moe_ep_size)
+    if outer_tp_size <= 0 or moe_ep_size <= 0:
+        raise ValueError(
+            "Hybrid MoE parallel sizes must be positive, "
+            f"got outer TP={outer_tp_size}, MoE EP={moe_ep_size}."
+        )
+    if outer_tp_size % moe_ep_size:
+        raise ValueError(
+            "Hybrid MoE outer TP must be divisible by MoE EP, "
+            f"got outer TP={outer_tp_size}, MoE EP={moe_ep_size}."
+        )
+    moe_tp_size = outer_tp_size // moe_ep_size
+    attention_groups = (tuple(range(outer_tp_size)),)
+    moe_tensor_groups = tuple(
+        tuple(range(ep_rank * moe_tp_size, (ep_rank + 1) * moe_tp_size))
+        for ep_rank in range(moe_ep_size)
+    )
+    moe_expert_groups = tuple(
+        tuple(ep_rank * moe_tp_size + moe_tp_rank for ep_rank in range(moe_ep_size))
+        for moe_tp_rank in range(moe_tp_size)
+    )
+    singleton_groups = tuple((rank,) for rank in range(outer_tp_size))
+    return {
+        "attention": attention_groups,
+        "moe_tensor": moe_tensor_groups,
+        "moe_expert": moe_expert_groups,
+        "data": singleton_groups,
+    }
+
+
 @dataclass(frozen=True)
 class ParallelGroup:
     process_group: dist.ProcessGroup | None
@@ -137,6 +173,7 @@ class ParallelContext:
     tensor: ParallelGroup
     expert: ParallelGroup
     data: ParallelGroup
+    moe_tensor: ParallelGroup | None = None
 
     @property
     def world_rank(self) -> int:
@@ -155,6 +192,18 @@ class ParallelContext:
         return self.tensor.size
 
     @property
+    def attention(self) -> ParallelGroup:
+        return self.tensor
+
+    @property
+    def attention_tp_rank(self) -> int:
+        return self.attention.rank
+
+    @property
+    def attention_tp_size(self) -> int:
+        return self.attention.size
+
+    @property
     def ep_rank(self) -> int:
         return self.expert.rank
 
@@ -163,12 +212,39 @@ class ParallelContext:
         return self.expert.size
 
     @property
+    def moe_tp_rank(self) -> int:
+        return (self.moe_tensor or self.tensor).rank
+
+    @property
+    def moe_tp_size(self) -> int:
+        return (self.moe_tensor or self.tensor).size
+
+    @property
     def dp_rank(self) -> int:
         return self.data.rank
 
     @property
     def dp_size(self) -> int:
         return self.data.size
+
+    def topology_summary(self) -> dict[str, object]:
+        moe_tensor = self.moe_tensor or self.tensor
+        return {
+            "world_rank": self.world_rank,
+            "world_size": self.world_size,
+            "attention_tp_rank": self.attention_tp_rank,
+            "attention_tp_size": self.attention_tp_size,
+            "attention_tp_ranks": self.attention.ranks,
+            "moe_tp_rank": moe_tensor.rank,
+            "moe_tp_size": moe_tensor.size,
+            "moe_tp_ranks": moe_tensor.ranks,
+            "moe_ep_rank": self.ep_rank,
+            "moe_ep_size": self.ep_size,
+            "moe_ep_ranks": self.expert.ranks,
+            "dp_rank": self.dp_rank,
+            "dp_size": self.dp_size,
+            "dp_ranks": self.data.ranks,
+        }
 
     @staticmethod
     def _all_reduce(
@@ -187,12 +263,19 @@ class ParallelContext:
     ) -> torch.Tensor:
         return self._all_reduce(tensor, self.world, op)
 
+    def attention_tp_all_reduce(
+        self,
+        tensor: torch.Tensor,
+        op: dist.ReduceOp = dist.ReduceOp.SUM,
+    ) -> torch.Tensor:
+        return self._all_reduce(tensor, self.attention, op)
+
     def tp_all_reduce(
         self,
         tensor: torch.Tensor,
         op: dist.ReduceOp = dist.ReduceOp.SUM,
     ) -> torch.Tensor:
-        return self._all_reduce(tensor, self.tensor, op)
+        return self.attention_tp_all_reduce(tensor, op)
 
     def ep_all_reduce(
         self,
@@ -200,6 +283,13 @@ class ParallelContext:
         op: dist.ReduceOp = dist.ReduceOp.SUM,
     ) -> torch.Tensor:
         return self._all_reduce(tensor, self.expert, op)
+
+    def moe_tp_all_reduce(
+        self,
+        tensor: torch.Tensor,
+        op: dist.ReduceOp = dist.ReduceOp.SUM,
+    ) -> torch.Tensor:
+        return self._all_reduce(tensor, self.moe_tensor or self.tensor, op)
 
     def ep_broadcast(
         self,
@@ -271,6 +361,7 @@ def init_parallel_context(
     tp_size: int,
     ep_size: int,
     dp_size: int,
+    hybrid_moe: bool = False,
 ) -> ParallelContext:
     global _PARALLEL_CONTEXT
     if _PARALLEL_CONTEXT is not None:
@@ -279,7 +370,9 @@ def init_parallel_context(
         raise RuntimeError("torch.distributed must be initialized before ParallelContext.")
 
     tp_size, ep_size, dp_size = _validate_sizes(tp_size, ep_size, dp_size)
-    expected_world_size = tp_size * ep_size * dp_size
+    if hybrid_moe and dp_size != 1:
+        raise ValueError(f"Hybrid MoE parallelism requires DP=1, got DP={dp_size}.")
+    expected_world_size = tp_size if hybrid_moe else tp_size * ep_size * dp_size
     world_size = dist.get_world_size()
     world_rank = dist.get_rank()
     if world_size != expected_world_size:
@@ -288,16 +381,29 @@ def init_parallel_context(
             f"world_size={world_size}, TP={tp_size}, EP={ep_size}, DP={dp_size}."
         )
 
-    ranks_by_dimension = parallel_group_ranks(
-        tp_size=tp_size,
-        ep_size=ep_size,
-        dp_size=dp_size,
-    )
+    if hybrid_moe:
+        hybrid_groups = hybrid_moe_group_ranks(
+            outer_tp_size=tp_size,
+            moe_ep_size=ep_size,
+        )
+        ranks_by_dimension = {
+            "tensor": hybrid_groups["attention"],
+            "expert": hybrid_groups["moe_expert"],
+            "data": hybrid_groups["data"],
+            "moe_tensor": hybrid_groups["moe_tensor"],
+        }
+    else:
+        ranks_by_dimension = parallel_group_ranks(
+            tp_size=tp_size,
+            ep_size=ep_size,
+            dp_size=dp_size,
+        )
+        ranks_by_dimension["moe_tensor"] = ranks_by_dimension["tensor"]
     world_ranks = tuple(range(world_size))
     process_groups: dict[tuple[int, ...], dist.ProcessGroup | None] = {
         world_ranks: dist.group.WORLD,
     }
-    for dimension in ("tensor", "expert", "data"):
+    for dimension in ("tensor", "expert", "data", "moe_tensor"):
         for ranks in ranks_by_dimension[dimension]:
             if ranks in process_groups:
                 continue
@@ -313,6 +419,9 @@ def init_parallel_context(
         tensor=_local_group(ranks_by_dimension["tensor"], process_groups, world_rank),
         expert=_local_group(ranks_by_dimension["expert"], process_groups, world_rank),
         data=_local_group(ranks_by_dimension["data"], process_groups, world_rank),
+        moe_tensor=_local_group(
+            ranks_by_dimension["moe_tensor"], process_groups, world_rank
+        ),
     )
     return _PARALLEL_CONTEXT
 

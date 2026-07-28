@@ -356,6 +356,9 @@ def _resolved_engine_config(llm) -> dict[str, Any]:
         "vllm_sparse_method",
         "prefill_schedule_policy",
         "chunk_prefill_size",
+        "tensor_parallel_size",
+        "expert_parallel_size",
+        "data_parallel_size",
         "decode_cuda_graph",
         "decode_cuda_graph_capture_sampling",
         "deltakv_sparse_decode_backend",
@@ -376,6 +379,32 @@ def _resolved_engine_config(llm) -> dict[str, Any]:
         key: _jsonable_config_value(getattr(config, key))
         for key in keys
         if hasattr(config, key)
+    }
+
+
+def _parallel_topology(llm) -> dict[str, Any]:
+    config = getattr(llm, "config", None)
+    if config is None:
+        return {}
+    hf_config = getattr(config, "hf_config", None)
+    model_type = str(getattr(hf_config, "model_type", "") or "")
+    num_experts = int(getattr(hf_config, "num_experts", 0) or 0)
+    moe_ep_size = int(config.moe_expert_parallel_size)
+    return {
+        "parallel_mode": (
+            "outer_tp_moe_tp_ep"
+            if config.uses_outer_tp_moe_layout
+            else "legacy_tp_ep"
+        ),
+        "world_size": int(config.world_size),
+        "outer_tp_size": int(config.tensor_parallel_size),
+        "attention_tp_size": int(config.attention_tensor_parallel_size),
+        "moe_ep_size": moe_ep_size,
+        "moe_tp_size": int(config.moe_tensor_parallel_size),
+        "num_local_experts": num_experts // moe_ep_size if num_experts else None,
+        "moe_collective": (
+            "outer_world_all_reduce" if model_type == "qwen3_moe" else None
+        ),
     }
 
 
@@ -743,6 +772,7 @@ def benchmark_task(method, length, bs, args, results_dict):
             "engine_hyper_params": engine_kwargs,
             "resolved_engine_config": resolved_engine_config,
             "moe_providers": _selected_moe_providers(llm),
+            "parallel_topology": _parallel_topology(llm),
             "status": "SUCCESS"
         }
 

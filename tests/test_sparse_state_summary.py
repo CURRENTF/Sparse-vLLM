@@ -65,7 +65,9 @@ def test_model_runner_gathers_one_debug_summary_per_world_rank():
         world_rank=0,
         ep_rank=0,
         world=SimpleNamespace(process_group=object()),
+        topology_summary=lambda: {"world_rank": 0, "world_size": 2},
     )
+    runner.config = SimpleNamespace(decode_cuda_graph=False)
     runner.sparse_controller = SimpleNamespace(
         debug_state_summary=lambda: {"sparse_method": "", "layers": {}}
     )

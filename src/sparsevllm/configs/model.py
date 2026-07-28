@@ -570,10 +570,10 @@ def _validate_qwen3_moe_runtime(config, *, model_type: str) -> None:
             f"TP={config.tensor_parallel_size}, EP={config.expert_parallel_size}, "
             f"DP={config.data_parallel_size}."
         )
-    if tp_size > 1 and ep_size > 1:
+    if tp_size > 1 and tp_size % ep_size:
         raise ValueError(
-            "Qwen3MoE supports pure TP or pure EP, not combined TP and EP; got "
-            f"TP={tp_size}, EP={ep_size}."
+            "Qwen3MoE outer tensor_parallel_size must be divisible by "
+            f"expert_parallel_size, got outer TP={tp_size}, MoE EP={ep_size}."
         )
     num_experts = int(getattr(config.hf_config, "num_experts", 0) or 0)
     if num_experts <= 0:
@@ -593,7 +593,6 @@ def _validate_qwen3_moe_runtime(config, *, model_type: str) -> None:
             "num_attention_heads": int(config.hf_config.num_attention_heads),
             "num_key_value_heads": int(config.hf_config.num_key_value_heads),
             "vocab_size": int(config.hf_config.vocab_size),
-            "moe_intermediate_size": int(config.hf_config.moe_intermediate_size),
         }
         for field, value in divisible_fields.items():
             if value % tp_size:
@@ -601,9 +600,16 @@ def _validate_qwen3_moe_runtime(config, *, model_type: str) -> None:
                     f"Qwen3MoE {field} must be divisible by tensor_parallel_size, "
                     f"got {value} and {tp_size}."
                 )
+        moe_tp_size = tp_size // ep_size
+        moe_intermediate_size = int(config.hf_config.moe_intermediate_size)
+        if moe_intermediate_size % moe_tp_size:
+            raise ValueError(
+                "Qwen3MoE moe_intermediate_size must be divisible by MoE TP size, "
+                f"got {moe_intermediate_size} and {moe_tp_size}."
+            )
         if config.quantization_config.enabled:
             raise NotImplementedError(
-                "Qwen3MoE pure TP supports unquantized BF16 checkpoints only."
+                "Qwen3MoE outer TP supports unquantized BF16 checkpoints only."
             )
     top_k = int(getattr(config.hf_config, "num_experts_per_tok", 0) or 0)
     if not 1 <= top_k <= num_experts:
@@ -640,7 +646,7 @@ def _validate_qwen3_moe_runtime(config, *, model_type: str) -> None:
         )
     if tp_size > 1 and model_dtype != torch.bfloat16:
         raise NotImplementedError(
-            "Qwen3MoE pure TP supports BF16 checkpoints only, "
+            "Qwen3MoE outer TP supports BF16 checkpoints only, "
             f"got torch_dtype={model_dtype}."
         )
     _validate_runtime_compatibility(config, model_type=model_type)

@@ -10,6 +10,7 @@ from sparsevllm.config import Config
 from sparsevllm.distributed import ParallelContext, ParallelGroup
 from sparsevllm.distributed.parallel_context import (
     get_parallel_context,
+    hybrid_moe_group_ranks,
     init_parallel_context,
     parallel_group_ranks,
     parallel_ranks_from_world_rank,
@@ -110,6 +111,38 @@ def test_parallel_group_members_follow_dp_ep_tp_layout():
     }
 
 
+def test_hybrid_moe_groups_split_outer_attention_world():
+    assert hybrid_moe_group_ranks(outer_tp_size=4, moe_ep_size=2) == {
+        "attention": ((0, 1, 2, 3),),
+        "moe_tensor": ((0, 1), (2, 3)),
+        "moe_expert": ((0, 2), (1, 3)),
+        "data": ((0,), (1,), (2,), (3,)),
+    }
+
+
+def test_hybrid_moe_parallel_context_uses_explicit_groups():
+    reset_parallel_context()
+    with (
+        patch.object(dist, "is_initialized", return_value=True),
+        patch.object(dist, "get_world_size", return_value=4),
+        patch.object(dist, "get_rank", return_value=2),
+        patch.object(dist, "new_group", side_effect=lambda _ranks: object()),
+    ):
+        context = init_parallel_context(
+            tp_size=4,
+            ep_size=2,
+            dp_size=1,
+            hybrid_moe=True,
+        )
+    assert context.attention.ranks == (0, 1, 2, 3)
+    assert context.attention_tp_rank == 2
+    assert context.moe_tensor.ranks == (2, 3)
+    assert context.moe_tp_rank == 0
+    assert context.expert.ranks == (0, 2)
+    assert context.ep_rank == 1
+    reset_parallel_context()
+
+
 def test_parallel_context_lifecycle_and_local_groups():
     reset_parallel_context()
     fake_groups = []
@@ -188,8 +221,13 @@ def test_qwen3_moe_parallel_config_validation(tmp_path):
     assert config.weight_loading_workers_per_rank == 1
 
     with patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", return_value=_hf_config()):
-        with pytest.raises(ValueError, match="not combined TP and EP"):
-            Config(model=str(tmp_path), tensor_parallel_size=2, expert_parallel_size=2)
+        hybrid = Config(
+            model=str(tmp_path), tensor_parallel_size=2, expert_parallel_size=2
+        )
+    assert hybrid.world_size == 2
+    assert hybrid.attention_tensor_parallel_size == 2
+    assert hybrid.moe_expert_parallel_size == 2
+    assert hybrid.moe_tensor_parallel_size == 1
 
     with patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", return_value=_hf_config()):
         config = Config(model=str(tmp_path), tensor_parallel_size=2)
@@ -203,8 +241,12 @@ def test_qwen3_moe_parallel_config_validation(tmp_path):
     fp16 = _hf_config()
     fp16.torch_dtype = torch.float16
     with patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", return_value=fp16):
-        with pytest.raises(NotImplementedError, match="pure TP supports BF16"):
+        with pytest.raises(NotImplementedError, match="outer TP supports BF16"):
             Config(model=str(tmp_path), tensor_parallel_size=2)
+
+    with patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", return_value=_hf_config()):
+        with pytest.raises(ValueError, match="outer tensor_parallel_size"):
+            Config(model=str(tmp_path), tensor_parallel_size=3, expert_parallel_size=2)
 
     with patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", return_value=_hf_config(num_experts=6)):
         with pytest.raises(ValueError, match="divisible"):

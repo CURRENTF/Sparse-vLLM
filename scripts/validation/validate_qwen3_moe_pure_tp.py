@@ -128,6 +128,16 @@ def _validate_replica_consistency(llm: LLM) -> list[dict[str, Any]]:
     return summaries
 
 
+def _worker_runtime_summaries(llm: LLM) -> list[dict[str, Any]]:
+    summaries = llm.debug_sparse_state_summaries()
+    if len(summaries) != llm.config.world_size:
+        raise RuntimeError(
+            "Runtime summary did not cover every worker: "
+            f"expected={llm.config.world_size}, got={len(summaries)}."
+        )
+    return summaries
+
+
 def _load_reference(path: Path | None) -> dict[str, list[int]]:
     if path is None:
         return {}
@@ -206,8 +216,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    if args.tensor_parallel_size > 1 and args.expert_parallel_size > 1:
-        raise ValueError("TP and EP cannot both exceed one.")
+    if args.tensor_parallel_size > 1 and (
+        args.tensor_parallel_size % args.expert_parallel_size
+    ):
+        raise ValueError("Outer TP must be divisible by MoE EP.")
     if args.require_prefix_hit and not args.enable_prefix_caching:
         raise ValueError("--require-prefix-hit requires --enable-prefix-caching.")
     if args.check_replica_consistency and args.decode_cuda_graph:
@@ -232,6 +244,11 @@ def main() -> None:
         "model": args.model,
         "tensor_parallel_size": args.tensor_parallel_size,
         "expert_parallel_size": args.expert_parallel_size,
+        "moe_tensor_parallel_size": (
+            args.tensor_parallel_size // args.expert_parallel_size
+            if args.tensor_parallel_size > 1
+            else args.tensor_parallel_size
+        ),
         "decode_cuda_graph": args.decode_cuda_graph,
         "enable_prefix_caching": args.enable_prefix_caching,
         "max_model_len": args.max_model_len,
@@ -294,8 +311,18 @@ def main() -> None:
             for key in sorted(set(cache_before) | set(cache_after))
         }
         graph_status = _graph_status(llm)
-        if args.decode_cuda_graph and not graph_status["active"]:
-            raise RuntimeError(f"Decode CUDA Graph was not active: {graph_status}")
+        worker_summaries = _worker_runtime_summaries(llm)
+        if args.decode_cuda_graph:
+            inactive_workers = [
+                summary["world_rank"]
+                for summary in worker_summaries
+                if not summary["decode_cuda_graph"]["active"]
+            ]
+            if inactive_workers:
+                raise RuntimeError(
+                    "Decode CUDA Graph was not active on every worker: "
+                    f"inactive_world_ranks={inactive_workers}."
+                )
         hit_tokens = int(cache_delta.get("prefix_cache_hit_tokens", 0))
         if args.require_prefix_hit and hit_tokens <= 0:
             raise RuntimeError(f"No real prefix-cache hit was observed: {cache_delta}")
@@ -312,6 +339,7 @@ def main() -> None:
             "failed_count": failed,
             "moe_providers": _provider_names(llm),
             "decode_cuda_graph": graph_status,
+            "worker_runtime_summaries": worker_summaries,
             "prefix_cache_stats_before": cache_before,
             "prefix_cache_stats_after": cache_after,
             "prefix_cache_stats_delta": cache_delta,

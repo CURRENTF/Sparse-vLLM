@@ -108,13 +108,15 @@ QWEN3_MOE_EP_COMPATIBILITY = ModelRuntimeCompatibility(
     ),
 )
 
-QWEN3_MOE_TP_COMPATIBILITY = ModelRuntimeCompatibility(
-    parallel_mode="pure_tp",
+QWEN3_MOE_TP_EP_COMPATIBILITY = ModelRuntimeCompatibility(
+    parallel_mode="outer_tp_moe_tp_ep",
     sparse_methods=frozenset({""}),
     prefix_cache_methods=frozenset({""}),
     requires_eager=False,
     decode_cuda_graph_methods=frozenset({""}),
 )
+
+QWEN3_MOE_TP_COMPATIBILITY = QWEN3_MOE_TP_EP_COMPATIBILITY
 
 MINIMAX_M2_EP_COMPATIBILITY = ModelRuntimeCompatibility(
     parallel_mode="ep_replicated_kv",
@@ -234,10 +236,10 @@ def validate_model_runtime_compatibility(
     ep_size = int(expert_parallel_size)
     dp_size = int(data_parallel_size)
     if model_type == "qwen3_moe" and tp_size > 1:
-        compatibility = QWEN3_MOE_TP_COMPATIBILITY
-        if ep_size != 1 or dp_size != 1:
+        compatibility = QWEN3_MOE_TP_EP_COMPATIBILITY
+        if dp_size != 1:
             raise ValueError(
-                "qwen3_moe pure_tp requires EP=1 and DP=1, got "
+                "qwen3_moe outer_tp_moe_tp_ep requires DP=1, got "
                 f"TP={tp_size}, EP={ep_size}, DP={dp_size}."
             )
     elif tp_size != 1 or dp_size != 1:

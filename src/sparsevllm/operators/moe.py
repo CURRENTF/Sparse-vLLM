@@ -36,10 +36,6 @@ class MoeOpSpec:
             raise ValueError("MoE ep_size must be positive.")
         if self.tp_size <= 0:
             raise ValueError("MoE tp_size must be positive.")
-        if self.ep_size > 1 and self.tp_size > 1:
-            raise ValueError(
-                "MoE TP and EP cannot both exceed one in the supported topology."
-            )
         if self.num_local_experts * self.ep_size != self.num_experts:
             raise ValueError(
                 "MoE local expert topology is inconsistent: "

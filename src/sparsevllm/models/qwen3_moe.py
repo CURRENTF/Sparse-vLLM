@@ -59,12 +59,10 @@ class Qwen3MoePackedExperts(nn.Module):
     def __init__(self, config: Qwen3MoeConfig) -> None:
         super().__init__()
         parallel_context = get_parallel_context()
-        self.tp_rank = parallel_context.tp_rank
-        self.tp_size = parallel_context.tp_size
+        self.tp_rank = parallel_context.moe_tp_rank
+        self.tp_size = parallel_context.moe_tp_size
         self.ep_rank = parallel_context.ep_rank
         self.ep_size = parallel_context.ep_size
-        if self.tp_size > 1 and self.ep_size > 1:
-            raise ValueError("Qwen3MoE does not support combined TP and EP.")
         self.num_experts = int(config.num_experts)
         self.hidden_size = int(config.hidden_size)
         self.global_intermediate_size = int(config.moe_intermediate_size)
@@ -312,8 +310,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 else int(local_hit_count.item())
             )
 
-        output = self.parallel_context.ep_all_reduce(local_output)
-        output = self.parallel_context.tp_all_reduce(output)
+        output = self.parallel_context.world_all_reduce(local_output)
         if debug_enabled:
             self.debug_last_output = output.detach().clone()
         return output
@@ -337,7 +334,7 @@ class Qwen3MoeDecoderLayer(Qwen3DecoderLayerBase):
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
         hidden_states = self.self_attn(positions, hidden_states)
 
-        if self.parallel_context.ep_size > 1:
+        if self.parallel_context.tp_size == 1 and self.parallel_context.ep_size > 1:
             # The incoming residual is already replicated, so syncing attention
             # output before RMSNorm preserves the old post-norm state with half
             # the broadcast payload.
@@ -431,10 +428,12 @@ class Qwen3MoeForCausalLM(nn.Module):
         source_shape: tuple[int, ...],
     ) -> tuple[slice, ...] | None:
         match = _EXPERT_SOURCE_RE.match(source_weight_name)
-        if match is None or self.parallel_context.tp_size == 1:
+        if match is None:
             return None
         _, _, projection = match.groups()
         experts = self.model.layers[0].mlp.experts
+        if experts.tp_size == 1:
+            return None
         global_shape = (
             (experts.hidden_size, experts.global_intermediate_size)
             if projection == "down_proj"
@@ -601,12 +600,15 @@ class Qwen3MoeForCausalLM(nn.Module):
                 f"scales={unexpected_scale_skips[:4]}."
             )
         logger.info(
-            "Loaded Qwen3MoE rank {} provider={} TP shard {}/{} and local experts "
+            "Loaded Qwen3MoE rank {} provider={} attention TP {}/{} MoE TP {}/{} "
+            "and local experts "
             "[{}, {}) across {} layers; intentionally skipped {} remote expert tensors.",
             self.parallel_context.world_rank,
             self.model.layers[0].mlp.experts.provider.name,
             self.parallel_context.tp_rank,
             self.parallel_context.tp_size,
+            self.parallel_context.moe_tp_rank,
+            self.parallel_context.moe_tp_size,
             self.model.layers[0].mlp.experts.local_expert_start,
             self.model.layers[0].mlp.experts.local_expert_end,
             len(self.model.layers),

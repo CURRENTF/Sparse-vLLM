@@ -133,6 +133,7 @@ class ModelRunner:
             tp_size=config.tensor_parallel_size,
             ep_size=config.expert_parallel_size,
             dp_size=config.data_parallel_size,
+            hybrid_moe=config.uses_outer_tp_moe_layout,
         )
 
         # CUDA allocator peaks are process-global and survive LLMEngine.exit().
@@ -742,9 +743,22 @@ class ModelRunner:
             state["mixed_prefix_cache"] = (
                 prefix_cache_coordinator.debug_state_summary()
             )
+        graph_runner = getattr(self, "decode_cuda_graph_runner", None)
+        graph_states = getattr(graph_runner, "_graphs", {}) if graph_runner is not None else {}
+        graph_count = sum(
+            getattr(graph_state, "graph", None) is not None
+            for graph_state in graph_states.values()
+        )
         return {
             "world_rank": self.parallel_context.world_rank,
             "ep_rank": self.parallel_context.ep_rank,
+            "parallel_topology": self.parallel_context.topology_summary(),
+            "decode_cuda_graph": {
+                "configured": bool(self.config.decode_cuda_graph),
+                "state_count": len(graph_states),
+                "graph_count": int(graph_count),
+                "active": bool(self.config.decode_cuda_graph and graph_count),
+            },
             "state": state,
             "last_logits": (
                 _debug_tensor_summary(self.debug_last_logits)

@@ -97,7 +97,6 @@ def _linear_spec(
         {"num_local_experts": 3},
         {"ep_size": 0},
         {"tp_size": 0},
-        {"tp_size": 2},
         {"hidden_size": 0},
         {"intermediate_size": -1},
         {"top_k": 0},

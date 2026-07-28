@@ -83,9 +83,9 @@ def test_qwen3_moe_registry_rejects_conditional_and_out_of_scope_methods():
         _validate("deltakv")
 
 
-def test_qwen3_moe_registry_rejects_unvalidated_parallel_modes():
-    with pytest.raises(ValueError, match="pure_tp requires EP=1 and DP=1"):
-        _validate(tensor_parallel_size=2)
+def test_qwen3_moe_registry_rejects_outer_tp_with_dp():
+    with pytest.raises(ValueError, match="requires DP=1"):
+        _validate(tensor_parallel_size=2, data_parallel_size=2)
 
 
 def test_qwen3_moe_registry_accepts_vanilla_pure_tp_modes():
@@ -101,6 +101,16 @@ def test_qwen3_moe_registry_accepts_vanilla_pure_tp_modes():
             decode_cuda_graph=True,
             enable_prefix_caching=True,
         ) is QWEN3_MOE_TP_COMPATIBILITY
+
+
+def test_qwen3_moe_registry_accepts_vanilla_hybrid_mode():
+    assert _validate(
+        tensor_parallel_size=4,
+        expert_parallel_size=2,
+        enforce_eager=False,
+        decode_cuda_graph=True,
+        enable_prefix_caching=True,
+    ) is QWEN3_MOE_TP_COMPATIBILITY
 
 
 def test_qwen3_moe_registry_rejects_unvalidated_sparse_pure_tp():
