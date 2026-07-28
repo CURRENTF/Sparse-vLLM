@@ -414,7 +414,8 @@ def test_packed_expert_weight_mapping():
         )
 
 
-def test_packed_expert_tp_shards_cover_each_projection_exactly():
+@pytest.mark.parametrize("tp_size", [2, 4])
+def test_packed_expert_tp_shards_cover_each_projection_exactly(tp_size):
     torch.manual_seed(31)
     config = _config(moe_intermediate_size=8)
     source_weights = {
@@ -426,8 +427,8 @@ def test_packed_expert_tp_shards_cover_each_projection_exactly():
         }.items()
     }
     shards = []
-    for tp_rank in range(2):
-        context = _tp_context(tp_rank, 2)
+    for tp_rank in range(tp_size):
+        context = _tp_context(tp_rank, tp_size)
         with (
             patch(
                 "sparsevllm.models.qwen3_moe.get_parallel_context",
@@ -444,13 +445,26 @@ def test_packed_expert_tp_shards_cover_each_projection_exactly():
         shards.append(experts)
 
     assert all(experts.num_local_experts == config.num_experts for experts in shards)
-    assert all(experts.intermediate_size == 4 for experts in shards)
+    local_intermediate_size = config.moe_intermediate_size // tp_size
+    assert all(
+        experts.intermediate_size == local_intermediate_size for experts in shards
+    )
     assert torch.equal(
-        torch.cat([experts.w13_weight[0, :4] for experts in shards]),
+        torch.cat(
+            [
+                experts.w13_weight[0, :local_intermediate_size]
+                for experts in shards
+            ]
+        ),
         source_weights["gate_proj"],
     )
     assert torch.equal(
-        torch.cat([experts.w13_weight[0, 4:] for experts in shards]),
+        torch.cat(
+            [
+                experts.w13_weight[0, local_intermediate_size:]
+                for experts in shards
+            ]
+        ),
         source_weights["up_proj"],
     )
     assert torch.equal(
