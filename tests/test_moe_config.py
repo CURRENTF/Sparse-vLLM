@@ -46,6 +46,42 @@ def test_moe_config_rejects_unknown_stage():
         resolve_moe_gemm_config(**arguments, stage="w3")
 
 
+def test_h100_tp_ep_fused_gate_up_uses_dedicated_profile():
+    common = dict(
+        dtype=torch.bfloat16,
+        top_k=8,
+        num_local_experts=64,
+        hidden_size=2048,
+        intermediate_size=384,
+        stage="gate_up_swiglu",
+        device_name="NVIDIA H100 80GB HBM3",
+        device_capability=(9, 0),
+    )
+    small = resolve_moe_gemm_config(**common, num_tokens=4)
+    large = resolve_moe_gemm_config(**common, num_tokens=1024)
+
+    assert (small.block_n, small.block_k, small.num_stages) == (32, 64, 4)
+    assert (large.block_n, large.block_k, large.num_stages) == (128, 64, 3)
+
+
+def test_fused_gate_up_fallback_is_stage_specific():
+    common = dict(
+        dtype=torch.bfloat16,
+        num_tokens=4,
+        top_k=8,
+        num_local_experts=16,
+        hidden_size=256,
+        intermediate_size=64,
+        device_name="NVIDIA H100 80GB HBM3",
+        device_capability=(9, 0),
+    )
+    w13 = resolve_moe_gemm_config(**common, stage="w13")
+    fused = resolve_moe_gemm_config(**common, stage="gate_up_swiglu")
+
+    assert w13.block_n == 128
+    assert fused.block_n == 32
+
+
 def test_h20_qwen3_moe_config_is_shape_and_stage_aware():
     common = dict(
         dtype=torch.bfloat16,

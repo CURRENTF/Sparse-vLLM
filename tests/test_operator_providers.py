@@ -22,12 +22,13 @@ def _cuda_caps(
     *,
     native_fp8: bool = True,
     runtime_version: str | None = "13.0",
+    device_name: str | None = None,
 ) -> DeviceCaps:
     return DeviceCaps(
         platform=PlatformEnum.CUDA,
         device_type="cuda",
         device_index=0,
-        device_name=f"SM{capability[0]}{capability[1]}",
+        device_name=device_name or f"SM{capability[0]}{capability[1]}",
         compute_capability=capability,
         runtime_version=runtime_version,
         supports_graph_capture=True,
@@ -57,15 +58,17 @@ def _moe_spec(
     hidden_size=256,
     intermediate_size=128,
     num_local_experts=4,
+    num_experts=8,
+    top_k=2,
     ep_size=2,
     tp_size=1,
 ) -> MoeOpSpec:
     return MoeOpSpec(
-        num_experts=8,
+        num_experts=num_experts,
         num_local_experts=num_local_experts,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
-        top_k=2,
+        top_k=top_k,
         activation_dtype=activation_dtype,
         weight_dtype=weight_dtype,
         block_shape=block_shape,
@@ -338,6 +341,61 @@ def test_unquantized_moe_uses_triton_on_supported_cuda(dtype, capability):
     assert resolved.provider.name == "triton"
 
 
+def test_hopper_fused_moe_uses_profiled_tp_ep_shape():
+    spec = _moe_spec(
+        activation_dtype=torch.bfloat16,
+        weight_dtype=torch.bfloat16,
+        block_shape=None,
+        hidden_size=2048,
+        intermediate_size=384,
+        num_local_experts=64,
+        num_experts=128,
+        top_k=8,
+        ep_size=2,
+        tp_size=2,
+    )
+
+    resolved = OpResolver(MOE_REGISTRY).resolve(
+        spec,
+        _cuda_caps(
+            (9, 0),
+            native_fp8=False,
+            device_name="NVIDIA H100 80GB HBM3",
+        ),
+    )
+
+    assert resolved.provider.name == "triton_hopper_fused"
+
+
+def test_hopper_fused_moe_falls_back_for_missing_graph_support():
+    spec = _moe_spec(
+        activation_dtype=torch.bfloat16,
+        weight_dtype=torch.bfloat16,
+        block_shape=None,
+        hidden_size=2048,
+        intermediate_size=384,
+        num_local_experts=64,
+        num_experts=128,
+        top_k=8,
+        ep_size=2,
+        tp_size=2,
+    )
+    caps = _cuda_caps(
+        (9, 0),
+        native_fp8=False,
+        device_name="NVIDIA H100 80GB HBM3",
+    )
+    caps = DeviceCaps(**{**caps.__dict__, "supports_graph_capture": False})
+
+    resolved = OpResolver(MOE_REGISTRY).resolve(spec, caps)
+
+    assert resolved.provider.name == "triton"
+    assert (
+        "triton_hopper_fused",
+        "device does not support CUDA Graph capture",
+    ) in resolved.rejected
+
+
 def test_fp8_moe_prefers_flashinfer_only_on_sm90():
     spec = _moe_spec()
     with patch("sparsevllm.operators.moe.find_spec", return_value=object()):
@@ -358,6 +416,7 @@ def test_fp8_moe_uses_triton_when_flashinfer_is_missing_on_sm90():
     assert resolved.provider.name == "triton"
     assert resolved.rejected == (
         ("flashinfer_cutlass_fp8_sm90", "flashinfer is not installed"),
+        ("triton_hopper_fused", "requires unquantized BF16 expert weights"),
     )
 
 

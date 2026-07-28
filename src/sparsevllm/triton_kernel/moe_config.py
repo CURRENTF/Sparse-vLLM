@@ -90,6 +90,8 @@ _B = MoeGemmConfig(16, 128, 64, 8, 4, 3)
 _C = MoeGemmConfig(16, 128, 64, 8, 8, 3)
 _D = MoeGemmConfig(16, 128, 32, 8, 4, 4)
 _F = MoeGemmConfig(64, 64, 64, 8, 8, 3)
+_G = MoeGemmConfig(16, 32, 64, 8, 4, 4)
+_H = MoeGemmConfig(16, 32, 64, 8, 4, 3)
 
 
 def _stage_table(
@@ -134,6 +136,26 @@ _TUNED_CONFIGS = {
 }
 
 
+# BF16 TP2 expert shards profiled on H100. The fused stage has two FP32
+# accumulators, so reusing the unfused W13 tile creates register pressure.
+_TUNED_GATE_UP_SWIGLU_CONFIGS = {
+    MoeGemmShape(
+        "NVIDIA H100 80GB HBM3",
+        (9, 0),
+        torch.bfloat16,
+        8,
+        64,
+        2048,
+        384,
+    ): dict(
+        zip(
+            TUNED_TOKEN_COUNTS,
+            (_G, _G, _G, _G, _H, _H, _A, _B, _H, _G, _B, _B),
+        )
+    ),
+}
+
+
 @lru_cache(maxsize=None)
 def _resolve_moe_gemm_config(
     dtype: torch.dtype,
@@ -156,6 +178,19 @@ def _resolve_moe_gemm_config(
         intermediate_size=intermediate_size,
     )
     table = _TUNED_CONFIGS.get(shape)
+    if stage == "gate_up_swiglu":
+        fused_table = _TUNED_GATE_UP_SWIGLU_CONFIGS.get(shape)
+        if fused_table is not None:
+            return fused_table[token_bucket(num_tokens)]
+        assignments = num_tokens * top_k
+        return MoeGemmConfig(
+            block_m=16,
+            block_n=32 if assignments <= 256 else 64,
+            block_k=64,
+            group_m=8,
+            num_warps=4,
+            num_stages=4 if assignments <= 64 else 3,
+        )
     if table is not None:
         return table[stage][token_bucket(num_tokens)]
 
@@ -179,8 +214,11 @@ def resolve_moe_gemm_config(
     device_name: str | None = None,
     device_capability: tuple[int, int] | None = None,
 ) -> MoeGemmConfig:
-    if stage not in {"w13", "w2"}:
-        raise ValueError(f"MoE GEMM stage must be 'w13' or 'w2', got {stage!r}.")
+    if stage not in {"w13", "gate_up_swiglu", "w2"}:
+        raise ValueError(
+            "MoE GEMM stage must be 'w13', 'gate_up_swiglu', or 'w2', "
+            f"got {stage!r}."
+        )
     if device_name is None:
         device_name = torch.cuda.get_device_name()
     if device_capability is None:

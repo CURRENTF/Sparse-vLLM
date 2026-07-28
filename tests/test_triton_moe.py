@@ -4,7 +4,11 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from sparsevllm.triton_kernel.moe import fused_moe, moe_align_block_size
+from sparsevllm.triton_kernel.moe import (
+    fused_moe,
+    fused_moe_gate_up_swiglu,
+    moe_align_block_size,
+)
 from sparsevllm.triton_kernel.moe_topk import topk_softmax
 
 
@@ -290,6 +294,107 @@ def test_triton_moe_aligned_prefill_matches_oracle_with_padding():
     torch.cuda.synchronize()
 
     assert torch.allclose(actual, expected, atol=4e-2, rtol=4e-2)
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "num_experts", "top_k"),
+    [(1, 16, 2), (4, 8, 3), (19, 7, 3)],
+)
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for Triton MoE tests.")
+def test_fused_gate_up_swiglu_matches_generic_pipeline(
+    num_tokens,
+    num_experts,
+    top_k,
+):
+    torch.manual_seed(43 + num_tokens)
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    hidden_size = 64
+    intermediate_size = 32
+    hidden_states = torch.randn(num_tokens, hidden_size, device=device, dtype=dtype)
+    w13_weight = torch.randn(
+        num_experts,
+        2 * intermediate_size,
+        hidden_size,
+        device=device,
+        dtype=dtype,
+    )
+    w2_weight = torch.randn(
+        num_experts,
+        hidden_size,
+        intermediate_size,
+        device=device,
+        dtype=dtype,
+    )
+    topk_ids = torch.randint(
+        0,
+        num_experts,
+        (num_tokens, top_k),
+        dtype=torch.int64,
+        device=device,
+    )
+    topk_weights = torch.rand(num_tokens, top_k, device=device, dtype=dtype)
+    topk_weights /= topk_weights.sum(dim=-1, keepdim=True)
+
+    expected = fused_moe(
+        hidden_states,
+        w13_weight,
+        w2_weight,
+        topk_ids,
+        topk_weights,
+        num_experts=num_experts,
+        local_expert_start=0,
+    )
+    actual = fused_moe_gate_up_swiglu(
+        hidden_states,
+        w13_weight,
+        w2_weight,
+        topk_ids,
+        topk_weights,
+        num_experts=num_experts,
+        local_expert_start=0,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(actual, expected)
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for Triton MoE tests.")
+def test_fused_gate_up_swiglu_matches_qwen3_tp_ep_shape():
+    torch.manual_seed(59)
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    hidden_states = torch.randn(4, 2048, device=device, dtype=dtype)
+    w13_weight = torch.randn(1, 768, 2048, device=device, dtype=dtype) * 0.02
+    w2_weight = torch.randn(1, 2048, 384, device=device, dtype=dtype) * 0.02
+    topk_ids = torch.tensor(
+        [[0, 1], [1, 0], [0, 2], [3, 0]],
+        dtype=torch.int64,
+        device=device,
+    )
+    topk_weights = torch.rand(4, 2, device=device, dtype=dtype)
+    topk_weights /= topk_weights.sum(dim=-1, keepdim=True)
+    kwargs = {"num_experts": 128, "local_expert_start": 0}
+
+    expected = fused_moe(
+        hidden_states,
+        w13_weight,
+        w2_weight,
+        topk_ids,
+        topk_weights,
+        **kwargs,
+    )
+    actual = fused_moe_gate_up_swiglu(
+        hidden_states,
+        w13_weight,
+        w2_weight,
+        topk_ids,
+        topk_weights,
+        **kwargs,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(actual, expected)
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for Triton MoE tests.")

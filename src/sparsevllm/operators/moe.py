@@ -243,6 +243,82 @@ class FlashInferCutlassFp8MoeProvider(MoeProvider):
 
 
 @MOE_REGISTRY.register
+class TritonHopperFusedMoeProvider(MoeProvider):
+    name = "triton_hopper_fused"
+    priority = 20
+    gate_up_order = "gate_up"
+
+    @classmethod
+    def supports(cls, spec: MoeOpSpec, caps: DeviceCaps) -> SupportResult:
+        if caps.platform != PlatformEnum.CUDA or caps.compute_capability != (9, 0):
+            return SupportResult.no(
+                f"requires CUDA SM90, got {caps.platform.name} {caps.compute_capability}"
+            )
+        if not caps.supports_triton:
+            return SupportResult.no("platform does not support Triton")
+        if spec.cuda_graph and not caps.supports_graph_capture:
+            return SupportResult.no("device does not support CUDA Graph capture")
+        if spec.activation_dtype != torch.bfloat16:
+            return SupportResult.no(
+                f"requires BF16 activations, got {spec.activation_dtype}"
+            )
+        if spec.weight_dtype != torch.bfloat16 or spec.block_shape is not None:
+            return SupportResult.no("requires unquantized BF16 expert weights")
+        if caps.device_name != "NVIDIA H100 80GB HBM3":
+            return SupportResult.no(
+                "requires profiled NVIDIA H100 80GB HBM3 hardware, "
+                f"got {caps.device_name}"
+            )
+        if not caps.supports_bfloat16:
+            return SupportResult.no("device does not support BF16")
+        profiled_shape = (128, 64, 2048, 384, 8, 2, 2)
+        actual_shape = (
+            spec.num_experts,
+            spec.num_local_experts,
+            spec.hidden_size,
+            spec.intermediate_size,
+            spec.top_k,
+            spec.tp_size,
+            spec.ep_size,
+        )
+        if actual_shape != profiled_shape:
+            return SupportResult.no(
+                "requires profiled TP2xEP2 MoE shape "
+                f"{profiled_shape}, got {actual_shape}"
+            )
+        return SupportResult.yes()
+
+    def run(
+        self,
+        spec,
+        hidden_states,
+        topk_ids,
+        topk_weights,
+        w13_weight,
+        w2_weight,
+        w13_scale_inv,
+        w2_scale_inv,
+        *,
+        local_expert_start,
+        ep_rank,
+    ):
+        del ep_rank
+        if w13_scale_inv is not None or w2_scale_inv is not None:
+            raise RuntimeError("Fused Hopper BF16 MoE does not accept expert scales.")
+        from sparsevllm.triton_kernel.moe import fused_moe_gate_up_swiglu
+
+        return fused_moe_gate_up_swiglu(
+            hidden_states,
+            w13_weight,
+            w2_weight,
+            topk_ids,
+            topk_weights,
+            num_experts=spec.num_experts,
+            local_expert_start=local_expert_start,
+        )
+
+
+@MOE_REGISTRY.register
 class TritonMoeProvider(MoeProvider):
     name = "triton"
     priority = 10
