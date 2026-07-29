@@ -607,10 +607,6 @@ def _validate_qwen3_moe_runtime(config, *, model_type: str) -> None:
                 "Qwen3MoE moe_intermediate_size must be divisible by MoE TP size, "
                 f"got {moe_intermediate_size} and {moe_tp_size}."
             )
-        if config.quantization_config.enabled:
-            raise NotImplementedError(
-                "Qwen3MoE outer TP supports unquantized BF16 checkpoints only."
-            )
     top_k = int(getattr(config.hf_config, "num_experts_per_tok", 0) or 0)
     if not 1 <= top_k <= num_experts:
         raise ValueError(
@@ -653,24 +649,50 @@ def _validate_qwen3_moe_runtime(config, *, model_type: str) -> None:
 
 
 def _validate_minimax_runtime(config, *, model_type: str) -> None:
-    if config.tensor_parallel_size != 1 or config.data_parallel_size != 1:
+    tp_size = int(config.tensor_parallel_size)
+    ep_size = int(config.expert_parallel_size)
+    if config.data_parallel_size != 1:
         raise ValueError(
-            "MiniMax M2.7 v1 requires TP=1 and DP=1, got "
+            "MiniMax M2.7 requires DP=1, got "
             f"TP={config.tensor_parallel_size}, EP={config.expert_parallel_size}, "
             f"DP={config.data_parallel_size}."
         )
+    if tp_size > 1 and tp_size % ep_size:
+        raise ValueError(
+            "MiniMax M2.7 outer tensor_parallel_size must be divisible by "
+            f"expert_parallel_size, got outer TP={tp_size}, MoE EP={ep_size}."
+        )
     num_experts = int(getattr(config.hf_config, "num_local_experts"))
-    if config.expert_parallel_size > num_experts:
+    if ep_size > num_experts:
         raise ValueError(
             "MiniMax M2.7 expert_parallel_size must not exceed "
             f"num_local_experts={num_experts}, got {config.expert_parallel_size}."
         )
-    if num_experts % config.expert_parallel_size != 0:
+    if num_experts % ep_size != 0:
         raise ValueError(
             "MiniMax M2.7 requires num_local_experts divisible by "
             f"expert_parallel_size, got {num_experts} and "
             f"{config.expert_parallel_size}."
         )
+    if tp_size > 1:
+        divisible_fields = {
+            "num_attention_heads": int(config.hf_config.num_attention_heads),
+            "num_key_value_heads": int(config.hf_config.num_key_value_heads),
+            "vocab_size": int(config.hf_config.vocab_size),
+        }
+        for field, value in divisible_fields.items():
+            if value % tp_size:
+                raise ValueError(
+                    f"MiniMax M2.7 {field} must be divisible by "
+                    f"tensor_parallel_size, got {value} and {tp_size}."
+                )
+        moe_tp_size = tp_size // ep_size
+        intermediate_size = int(config.hf_config.intermediate_size)
+        if intermediate_size % moe_tp_size:
+            raise ValueError(
+                "MiniMax M2.7 intermediate_size must be divisible by MoE TP size, "
+                f"got {intermediate_size} and {moe_tp_size}."
+            )
     _validate_runtime_compatibility(config, model_type=model_type)
 
 

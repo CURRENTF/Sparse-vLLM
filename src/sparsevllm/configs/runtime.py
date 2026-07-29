@@ -85,7 +85,9 @@ class Config(
     @property
     def uses_outer_tp_moe_layout(self) -> bool:
         model_type = str(getattr(self.hf_config, "model_type", "") or "")
-        return model_type == "qwen3_moe" and int(self.tensor_parallel_size) > 1
+        return model_type in {"qwen3_moe", "minimax_m2"} and int(
+            self.tensor_parallel_size
+        ) > 1
 
     @property
     def attention_tensor_parallel_size(self) -> int:

@@ -83,12 +83,18 @@ def _cache_stats(llm: LLM) -> dict[str, int]:
 
 
 def _provider_names(llm: LLM) -> list[str]:
-    return sorted(
-        {
-            str(layer.mlp.experts.provider.name)
-            for layer in llm.model_runner.model.model.layers
-        }
-    )
+    names = set()
+    for layer in llm.model_runner.model.model.layers:
+        moe = getattr(layer, "mlp", None)
+        if moe is None:
+            moe = getattr(layer, "block_sparse_moe", None)
+        experts = getattr(moe, "experts", None)
+        if experts is None:
+            raise RuntimeError(
+                f"Layer {type(layer).__name__} does not expose packed MoE experts."
+            )
+        names.add(str(experts.provider.name))
+    return sorted(names)
 
 
 def _validate_replica_consistency(llm: LLM) -> list[dict[str, Any]]:

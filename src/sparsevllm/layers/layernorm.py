@@ -128,10 +128,14 @@ class RMSNorm(nn.Module):
         super().__init__()
         self.eps = float(eps)
         self.weight = nn.Parameter(torch.ones(hidden_size))
-        provider = os.environ.get(
-            "SPARSEVLLM_RMSNORM_PROVIDER",
-            "auto",
-        ).strip().lower()
+        provider = (
+            os.environ.get(
+                "SPARSEVLLM_RMSNORM_PROVIDER",
+                "auto",
+            )
+            .strip()
+            .lower()
+        )
         self._ops = _resolve_rmsnorm_ops(
             zero_centered_weight=self.zero_centered_weight,
             provider=provider,
@@ -150,6 +154,83 @@ class RMSNorm(nn.Module):
             return self._ops.rmsnorm(x, self.weight, self.eps)
         self._ops.fused_add_rmsnorm(x, residual, self.weight, self.eps)
         return x, residual
+
+
+class ColumnParallelRMSNorm(RMSNorm):
+    """RMSNorm over a feature dimension sharded across attention TP ranks."""
+
+    def __init__(
+        self,
+        global_hidden_size: int,
+        eps: float = 1e-6,
+        *,
+        parallel_context=None,
+    ) -> None:
+        if parallel_context is None:
+            from sparsevllm.distributed import get_parallel_context
+
+            parallel_context = get_parallel_context()
+        self.parallel_context = parallel_context
+        self.global_hidden_size = int(global_hidden_size)
+        self.tp_rank = int(self.parallel_context.attention_tp_rank)
+        self.tp_size = int(self.parallel_context.attention_tp_size)
+        if self.global_hidden_size % self.tp_size:
+            raise ValueError(
+                "Column-parallel RMSNorm size must be divisible by attention TP, "
+                f"got {self.global_hidden_size} and {self.tp_size}."
+            )
+        super().__init__(self.global_hidden_size // self.tp_size, eps=eps)
+
+    def rank_local_weight_slice(
+        self,
+        source_shape: tuple[int, ...],
+        **_: object,
+    ) -> tuple[slice, ...] | None:
+        expected = (self.global_hidden_size,)
+        if tuple(source_shape) != expected:
+            raise ValueError(
+                "Column-parallel RMSNorm checkpoint shape mismatch: "
+                f"expected={expected}, got={source_shape}."
+            )
+        if self.tp_size == 1:
+            return None
+        local_size = self.global_hidden_size // self.tp_size
+        start = self.tp_rank * local_size
+        return (slice(start, start + local_size),)
+
+    def _apply_global_rms(
+        self,
+        x: torch.Tensor,
+        global_square_sum: torch.Tensor,
+    ) -> torch.Tensor:
+        inv_rms = torch.rsqrt(global_square_sum / self.global_hidden_size + self.eps)
+        return (x.float() * inv_rms.unsqueeze(-1)).to(x.dtype) * self.weight.to(x.dtype)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        square_sum = x.float().square().sum(dim=-1)
+        self.parallel_context.attention_tp_all_reduce(square_sum)
+        return self._apply_global_rms(x, square_sum)
+
+    def forward_pair(
+        self,
+        x: torch.Tensor,
+        other: torch.Tensor,
+        other_norm: "ColumnParallelRMSNorm",
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.parallel_context is not other_norm.parallel_context:
+            raise ValueError("Paired column-parallel RMSNorms must share a context.")
+        square_sums = torch.stack(
+            (
+                x.float().square().sum(dim=-1),
+                other.float().square().sum(dim=-1),
+            ),
+            dim=-1,
+        )
+        self.parallel_context.attention_tp_all_reduce(square_sums)
+        return (
+            self._apply_global_rms(x, square_sums[..., 0]),
+            other_norm._apply_global_rms(other, square_sums[..., 1]),
+        )
 
 
 class GemmaRMSNorm(RMSNorm):

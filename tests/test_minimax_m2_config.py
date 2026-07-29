@@ -7,6 +7,7 @@ import torch
 from sparsevllm.config import Config
 from sparsevllm.method_registry import (
     MINIMAX_M2_EP_COMPATIBILITY,
+    MINIMAX_M2_TP_EP_COMPATIBILITY,
     MODEL_RUNTIME_COMPATIBILITY,
     validate_model_runtime_compatibility,
 )
@@ -122,9 +123,9 @@ def test_minimax_config_requires_all_fp8_exclusions(tmp_path):
 @pytest.mark.parametrize(
     "parallel_kwargs",
     [
-        {"tensor_parallel_size": 2},
         {"data_parallel_size": 2},
         {"expert_parallel_size": 3},
+        {"tensor_parallel_size": 4, "expert_parallel_size": 3},
     ],
 )
 def test_minimax_config_rejects_unvalidated_parallel_layout(
@@ -133,6 +134,29 @@ def test_minimax_config_rejects_unvalidated_parallel_layout(
 ):
     with pytest.raises(ValueError, match="MiniMax M2.7"):
         _make_config(tmp_path, **parallel_kwargs)
+
+
+@pytest.mark.parametrize(
+    ("tensor_parallel_size", "expert_parallel_size", "moe_tensor_parallel_size"),
+    [(2, 1, 2), (4, 1, 4), (4, 2, 2)],
+)
+def test_minimax_config_accepts_outer_tp_layout(
+    tmp_path,
+    tensor_parallel_size,
+    expert_parallel_size,
+    moe_tensor_parallel_size,
+):
+    config = _make_config(
+        tmp_path,
+        tensor_parallel_size=tensor_parallel_size,
+        expert_parallel_size=expert_parallel_size,
+        decode_cuda_graph=True,
+        enforce_eager=False,
+    )
+
+    assert config.uses_outer_tp_moe_layout
+    assert config.world_size == tensor_parallel_size
+    assert config.moe_tensor_parallel_size == moe_tensor_parallel_size
 
 
 def _validate(method="", **overrides):
@@ -173,6 +197,22 @@ def test_minimax_compatibility_matches_qwen3_moe_sparse_runtime():
         == MINIMAX_M2_EP_COMPATIBILITY.sparse_methods
     )
     assert _validate() is MINIMAX_M2_EP_COMPATIBILITY
+
+
+def test_minimax_outer_tp_compatibility_preserves_sparse_matrix():
+    assert MINIMAX_M2_TP_EP_COMPATIBILITY.parallel_mode == "outer_tp_moe_tp_ep"
+    assert (
+        MINIMAX_M2_TP_EP_COMPATIBILITY.sparse_methods
+        == MINIMAX_M2_EP_COMPATIBILITY.sparse_methods
+    )
+    assert (
+        _validate(
+            tensor_parallel_size=4,
+            expert_parallel_size=2,
+            decode_cuda_graph=True,
+        )
+        is MINIMAX_M2_TP_EP_COMPATIBILITY
+    )
 
 
 @pytest.mark.parametrize("method", sorted(MINIMAX_M2_EP_COMPATIBILITY.sparse_methods))

@@ -17,6 +17,7 @@ from sparsevllm.operators.moe import (
     resolve_moe_provider,
 )
 from sparsevllm.platforms import device_runtime
+from sparsevllm.quantization.fp8_tp import Fp8ExpertTpShard
 from sparsevllm.utils.log import logger
 
 
@@ -72,7 +73,7 @@ class Qwen3MoePackedExperts(nn.Module):
                 f"tensor_parallel_size, got {self.global_intermediate_size} and "
                 f"{self.tp_size}."
             )
-        self.intermediate_size = self.global_intermediate_size // self.tp_size
+        self.logical_intermediate_size = self.global_intermediate_size // self.tp_size
         self.fp8_enabled = bool(
             getattr(getattr(config, "quantization_config", None), "enabled", False)
         )
@@ -83,6 +84,20 @@ class Qwen3MoePackedExperts(nn.Module):
                 "Qwen3MoE FP8 requires hidden_size and moe_intermediate_size "
                 f"aligned to 128, got {self.hidden_size}/{self.global_intermediate_size}."
             )
+        self.fp8_tp_shard = (
+            Fp8ExpertTpShard(
+                self.global_intermediate_size,
+                self.tp_rank,
+                self.tp_size,
+            )
+            if self.fp8_enabled
+            else None
+        )
+        self.intermediate_size = (
+            self.fp8_tp_shard.physical_size
+            if self.fp8_tp_shard is not None
+            else self.logical_intermediate_size
+        )
         self.num_local_experts = self.num_experts // self.ep_size
         self.local_expert_start = self.ep_rank * self.num_local_experts
         self.local_expert_end = self.local_expert_start + self.num_local_experts
@@ -192,7 +207,15 @@ class Qwen3MoePackedExperts(nn.Module):
                 f"expert={global_expert_id}, projection={projection}."
             )
 
-        loaded_weight = self._local_projection_shard(projection, loaded_weight)
+        if self.fp8_tp_shard is not None:
+            loaded_weight, loaded_scale = self.fp8_tp_shard.prepare_projection(
+                loaded_weight,
+                loaded_scale,
+                hidden_size=self.hidden_size,
+                down_projection=projection == "down_proj",
+            )
+        else:
+            loaded_weight = self._local_projection_shard(projection, loaded_weight)
         local_expert_id = global_expert_id - self.local_expert_start
         logical_projection = {
             "gate_proj": "gate",
@@ -242,7 +265,9 @@ class Qwen3MoePackedExperts(nn.Module):
     def validate_loaded_weights(self) -> None:
         expected = {
             (global_expert_id, projection)
-            for global_expert_id in range(self.local_expert_start, self.local_expert_end)
+            for global_expert_id in range(
+                self.local_expert_start, self.local_expert_end
+            )
             for projection in ("gate_proj", "up_proj", "down_proj")
         }
         missing = sorted(expected - self._loaded_expert_shards)
@@ -306,7 +331,8 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             local_hit_count = local_mask.sum()
             self.debug_last_local_hit_count = (
                 local_hit_count
-                if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+                if torch.cuda.is_available()
+                and torch.cuda.is_current_stream_capturing()
                 else int(local_hit_count.item())
             )
 
@@ -426,6 +452,8 @@ class Qwen3MoeForCausalLM(nn.Module):
         self,
         source_weight_name: str,
         source_shape: tuple[int, ...],
+        *,
+        is_scale: bool = False,
     ) -> tuple[slice, ...] | None:
         match = _EXPERT_SOURCE_RE.match(source_weight_name)
         if match is None:
@@ -434,6 +462,15 @@ class Qwen3MoeForCausalLM(nn.Module):
         experts = self.model.layers[0].mlp.experts
         if experts.tp_size == 1:
             return None
+        if experts.fp8_tp_shard is not None:
+            return experts.fp8_tp_shard.checkpoint_slice(
+                source_shape,
+                hidden_size=experts.hidden_size,
+                down_projection=projection == "down_proj",
+                is_scale=is_scale,
+            )
+        if is_scale:
+            raise ValueError("Unquantized Qwen3MoE checkpoint has an expert scale.")
         global_shape = (
             (experts.hidden_size, experts.global_intermediate_size)
             if projection == "down_proj"
@@ -444,8 +481,8 @@ class Qwen3MoeForCausalLM(nn.Module):
                 "Qwen3MoE checkpoint expert shape mismatch: "
                 f"projection={projection}, expected={global_shape}, got={source_shape}."
             )
-        start = experts.tp_rank * experts.intermediate_size
-        stop = start + experts.intermediate_size
+        start = experts.tp_rank * experts.logical_intermediate_size
+        stop = start + experts.logical_intermediate_size
         return (
             (slice(None), slice(start, stop))
             if projection == "down_proj"
@@ -489,9 +526,12 @@ class Qwen3MoeForCausalLM(nn.Module):
                     f"safetensors dtype {loaded_weight_dtype}."
                 )
             expected_scale_shape = (
-                (experts.hidden_size // 128, experts.intermediate_size // 128)
+                (experts.hidden_size // 128, experts.global_intermediate_size // 128)
                 if projection == "down_proj"
-                else (experts.intermediate_size // 128, experts.hidden_size // 128)
+                else (
+                    experts.global_intermediate_size // 128,
+                    experts.hidden_size // 128,
+                )
             )
             if loaded_scale_shape != expected_scale_shape:
                 raise ValueError(
@@ -564,10 +604,7 @@ class Qwen3MoeForCausalLM(nn.Module):
             for projection in ("gate_proj", "up_proj", "down_proj")
         }
         expected_skipped_scales = (
-            {
-                name[: -len(".weight")] + ".weight_scale_inv"
-                for name in expected_skipped
-            }
+            {name[: -len(".weight")] + ".weight_scale_inv" for name in expected_skipped}
             if self.model.layers[0].mlp.experts.fp8_enabled
             else set()
         )

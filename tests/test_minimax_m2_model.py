@@ -53,6 +53,9 @@ class _ReferenceRMSNorm(torch.nn.Module):
         merged_output = merged.to(x.dtype)
         return _rmsnorm_reference(merged, self.weight, self.eps).to(x.dtype), merged_output
 
+    def forward_pair(self, x, other, other_norm):
+        return self(x), other_norm(other)
+
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("hidden_size", [1024, 3072, 6144])
