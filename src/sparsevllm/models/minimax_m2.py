@@ -110,6 +110,8 @@ class MiniMaxM2PackedExperts(nn.Module):
             ep_size=self.ep_size,
             cuda_graph=bool(getattr(config, "decode_cuda_graph", False)),
             tp_size=self.tp_size,
+            routing_method="biased_sigmoid",
+            scale_dtype=torch.float32,
         )
         self.provider = resolve_moe_provider(self.op_spec)
         self.w13_weight = nn.Parameter(
@@ -617,9 +619,15 @@ class MiniMaxM2ForCausalLM(nn.Module):
                 f"weights={unexpected_skips[:4]}, scales={unexpected_scale_skips[:4]}."
             )
         logger.info(
-            "Loaded MiniMax M2 rank {} local experts [{}, {}) across {} layers; "
-            "intentionally skipped {} remote expert weight/scale pairs.",
+            "Loaded MiniMax M2 rank {} provider={} attention TP {}/{} MoE TP "
+            "{}/{} local experts [{}, {}) across {} layers; intentionally skipped "
+            "{} remote expert weight/scale pairs.",
             self.parallel_context.world_rank,
+            self.model.layers[0].block_sparse_moe.experts.provider.name,
+            self.parallel_context.tp_rank,
+            self.parallel_context.tp_size,
+            self.parallel_context.moe_tp_rank,
+            self.parallel_context.moe_tp_size,
             self.model.layers[0].block_sparse_moe.experts.local_expert_start,
             self.model.layers[0].block_sparse_moe.experts.local_expert_end,
             len(self.model.layers),

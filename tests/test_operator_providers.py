@@ -62,6 +62,8 @@ def _moe_spec(
     top_k=2,
     ep_size=2,
     tp_size=1,
+    routing_method="softmax",
+    scale_dtype=None,
 ) -> MoeOpSpec:
     return MoeOpSpec(
         num_experts=num_experts,
@@ -75,6 +77,8 @@ def _moe_spec(
         ep_size=ep_size,
         cuda_graph=True,
         tp_size=tp_size,
+        routing_method=routing_method,
+        scale_dtype=scale_dtype,
     )
 
 
@@ -105,6 +109,7 @@ def _linear_spec(
         {"top_k": 0},
         {"top_k": 9},
         {"block_shape": (128, 0)},
+        {"routing_method": "unknown"},
     ],
 )
 def test_moe_spec_rejects_inconsistent_semantics(overrides):
@@ -321,7 +326,7 @@ def test_flashinfer_providers_require_cuda_12_8(runtime_version):
     assert linear.provider.name == "triton"
     assert moe.provider.name == "triton"
     assert "requires CUDA runtime >= 12.8" in linear.rejected[0][1]
-    assert "requires CUDA runtime >= 12.8" in moe.rejected[0][1]
+    assert any("requires CUDA runtime >= 12.8" in reason for _, reason in moe.rejected)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
@@ -365,6 +370,115 @@ def test_hopper_fused_moe_uses_profiled_tp_ep_shape():
     )
 
     assert resolved.provider.name == "triton_hopper_fused"
+
+
+@pytest.mark.parametrize(
+    ("tp_size", "ep_size", "intermediate_size", "num_local_experts"),
+    [(4, 1, 384, 256), (2, 2, 768, 128), (1, 4, 1536, 64)],
+)
+def test_minimax_m2_fused_moe_uses_dedicated_provider(
+    tp_size,
+    ep_size,
+    intermediate_size,
+    num_local_experts,
+):
+    spec = _moe_spec(
+        hidden_size=3072,
+        intermediate_size=intermediate_size,
+        num_local_experts=num_local_experts,
+        num_experts=256,
+        top_k=8,
+        ep_size=ep_size,
+        tp_size=tp_size,
+        routing_method="biased_sigmoid",
+        scale_dtype=torch.float32,
+    )
+
+    resolved = OpResolver(MOE_REGISTRY).resolve(
+        spec,
+        _cuda_caps((9, 0), device_name="NVIDIA H100 80GB HBM3"),
+    )
+
+    assert resolved.provider.name == "triton_minimax_m2_fused"
+
+
+def test_minimax_m2_fused_moe_rejects_graph_on_unsupported_device():
+    spec = _moe_spec(
+        hidden_size=3072,
+        intermediate_size=384,
+        num_local_experts=256,
+        num_experts=256,
+        top_k=8,
+        ep_size=1,
+        tp_size=4,
+        routing_method="biased_sigmoid",
+        scale_dtype=torch.float32,
+    )
+    caps = _cuda_caps((9, 0), device_name="NVIDIA H100 80GB HBM3")
+    caps = DeviceCaps(**{**caps.__dict__, "supports_graph_capture": False})
+
+    resolved = OpResolver(MOE_REGISTRY).resolve(spec, caps)
+
+    assert resolved.provider.name == "triton"
+    assert (
+        "triton_minimax_m2_fused",
+        "device does not support CUDA Graph capture",
+    ) in resolved.rejected
+
+
+def test_minimax_m2_fused_moe_requires_native_fp8():
+    spec = _moe_spec(
+        hidden_size=3072,
+        intermediate_size=384,
+        num_local_experts=256,
+        num_experts=256,
+        top_k=8,
+        ep_size=1,
+        tp_size=4,
+        routing_method="biased_sigmoid",
+        scale_dtype=torch.float32,
+    )
+
+    with pytest.raises(RuntimeError, match="native FP8 tensor cores"):
+        OpResolver(MOE_REGISTRY).resolve(
+            spec,
+            _cuda_caps(
+                (9, 0),
+                native_fp8=False,
+                device_name="NVIDIA H100 80GB HBM3",
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "reason"),
+    [
+        ({"routing_method": "softmax"}, "biased-sigmoid routing"),
+        ({"scale_dtype": torch.bfloat16}, "FP32 expert scales"),
+        ({"hidden_size": 2048}, "MiniMax M2.7 expert shape"),
+    ],
+)
+def test_minimax_m2_fused_moe_falls_back_locally(overrides, reason):
+    values = dict(
+        hidden_size=3072,
+        intermediate_size=384,
+        num_local_experts=256,
+        num_experts=256,
+        top_k=8,
+        ep_size=1,
+        tp_size=4,
+        routing_method="biased_sigmoid",
+        scale_dtype=torch.float32,
+    )
+    values.update(overrides)
+    resolved = OpResolver(MOE_REGISTRY).resolve(
+        _moe_spec(**values),
+        _cuda_caps((9, 0), device_name="NVIDIA H100 80GB HBM3"),
+    )
+
+    assert resolved.provider.name == "triton"
+    rejection = dict(resolved.rejected)["triton_minimax_m2_fused"]
+    assert reason in rejection
 
 
 def test_hopper_fused_moe_falls_back_for_missing_graph_support():
@@ -414,10 +528,14 @@ def test_fp8_moe_uses_triton_when_flashinfer_is_missing_on_sm90():
         )
 
     assert resolved.provider.name == "triton"
-    assert resolved.rejected == (
-        ("flashinfer_cutlass_fp8_sm90", "flashinfer is not installed"),
-        ("triton_hopper_fused", "requires unquantized BF16 expert weights"),
-    )
+    assert (
+        "flashinfer_cutlass_fp8_sm90",
+        "flashinfer is not installed",
+    ) in resolved.rejected
+    assert (
+        "triton_hopper_fused",
+        "requires unquantized BF16 expert weights",
+    ) in resolved.rejected
 
 
 @pytest.mark.parametrize(
@@ -452,13 +570,14 @@ def test_fp8_moe_uses_triton_for_tensor_parallel_expert_shards():
         )
 
     assert resolved.provider.name == "triton"
-    assert resolved.rejected == (
-        (
-            "flashinfer_cutlass_fp8_sm90",
-            "does not support tensor-parallel expert shards",
-        ),
-        ("triton_hopper_fused", "requires unquantized BF16 expert weights"),
-    )
+    assert (
+        "flashinfer_cutlass_fp8_sm90",
+        "does not support tensor-parallel expert shards",
+    ) in resolved.rejected
+    assert (
+        "triton_hopper_fused",
+        "requires unquantized BF16 expert weights",
+    ) in resolved.rejected
 
 
 @pytest.mark.parametrize("platform", [PlatformEnum.CPU, PlatformEnum.ROCM])

@@ -28,6 +28,8 @@ class MoeOpSpec:
     ep_size: int
     cuda_graph: bool
     tp_size: int = 1
+    routing_method: str = "softmax"
+    scale_dtype: torch.dtype | None = None
 
     def __post_init__(self) -> None:
         if self.num_experts <= 0 or self.num_local_experts <= 0:
@@ -52,6 +54,11 @@ class MoeOpSpec:
         ):
             raise ValueError(
                 f"MoE block_shape must contain two positive values, got {self.block_shape}."
+            )
+        if self.routing_method not in {"softmax", "biased_sigmoid"}:
+            raise ValueError(
+                "MoE routing_method must be 'softmax' or 'biased_sigmoid', "
+                f"got {self.routing_method!r}."
             )
 
 
@@ -167,6 +174,108 @@ class MoeProvider:
 
 
 MOE_REGISTRY: OpRegistry[MoeOpSpec, MoeProvider] = OpRegistry("routed MoE")
+
+
+@MOE_REGISTRY.register
+class TritonMinimaxM2FusedMoeProvider(MoeProvider):
+    name = "triton_minimax_m2_fused"
+    priority = 110
+    gate_up_order = "gate_up"
+
+    @classmethod
+    def supports(cls, spec: MoeOpSpec, caps: DeviceCaps) -> SupportResult:
+        if spec.routing_method != "biased_sigmoid":
+            return SupportResult.no("requires biased-sigmoid routing")
+        if caps.platform != PlatformEnum.CUDA or caps.compute_capability != (9, 0):
+            return SupportResult.no(
+                f"requires CUDA SM90, got {caps.platform.name} {caps.compute_capability}"
+            )
+        if caps.device_name != "NVIDIA H100 80GB HBM3":
+            return SupportResult.no(
+                "requires profiled NVIDIA H100 80GB HBM3 hardware, "
+                f"got {caps.device_name}"
+            )
+        if not caps.supports_triton:
+            return SupportResult.no("platform does not support Triton")
+        if not caps.supports_bfloat16:
+            return SupportResult.no("device does not support BF16")
+        if not caps.supports_native_fp8:
+            return SupportResult.no("device does not provide native FP8 tensor cores")
+        if spec.cuda_graph and not caps.supports_graph_capture:
+            return SupportResult.no("device does not support CUDA Graph capture")
+        if spec.activation_dtype != torch.bfloat16:
+            return SupportResult.no(
+                f"requires BF16 activations, got {spec.activation_dtype}"
+            )
+        if spec.weight_dtype != torch.float8_e4m3fn:
+            return SupportResult.no(
+                f"requires FP8 E4M3 weights, got {spec.weight_dtype}"
+            )
+        if spec.block_shape != (128, 128):
+            return SupportResult.no(
+                f"requires block_shape=(128, 128), got {spec.block_shape}"
+            )
+        if spec.scale_dtype != torch.float32:
+            return SupportResult.no(
+                f"requires FP32 expert scales, got {spec.scale_dtype}"
+            )
+        if spec.tp_size not in {1, 2, 4}:
+            return SupportResult.no(
+                f"requires MoE TP size 1, 2, or 4, got {spec.tp_size}"
+            )
+        expected_shape = (
+            256,
+            256 // spec.ep_size,
+            3072,
+            1536 // spec.tp_size,
+            8,
+        )
+        actual_shape = (
+            spec.num_experts,
+            spec.num_local_experts,
+            spec.hidden_size,
+            spec.intermediate_size,
+            spec.top_k,
+        )
+        if actual_shape != expected_shape:
+            return SupportResult.no(
+                "requires MiniMax M2.7 expert shape "
+                f"{expected_shape}, got {actual_shape}"
+            )
+        return SupportResult.yes()
+
+    def run(
+        self,
+        spec,
+        hidden_states,
+        topk_ids,
+        topk_weights,
+        w13_weight,
+        w2_weight,
+        w13_scale_inv,
+        w2_scale_inv,
+        *,
+        local_expert_start,
+        ep_rank,
+    ):
+        del ep_rank
+        if w13_scale_inv is None or w2_scale_inv is None:
+            raise RuntimeError("MiniMax M2.7 fused MoE requires expert scales.")
+        from sparsevllm.triton_kernel.minimax_m2_moe import (
+            fused_minimax_m2_moe_fp8,
+        )
+
+        return fused_minimax_m2_moe_fp8(
+            hidden_states,
+            w13_weight,
+            w2_weight,
+            w13_scale_inv,
+            w2_scale_inv,
+            topk_ids,
+            topk_weights,
+            num_experts=spec.num_experts,
+            local_expert_start=local_expert_start,
+        )
 
 
 @MOE_REGISTRY.register
