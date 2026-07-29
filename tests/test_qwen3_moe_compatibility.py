@@ -4,6 +4,7 @@ from sparsevllm.method_registry import (
     MODEL_RUNTIME_COMPATIBILITY,
     QWEN3_MOE_EP_COMPATIBILITY,
     QWEN3_MOE_TP_COMPATIBILITY,
+    QWEN3_MOE_TP_EP_COMPATIBILITY,
     validate_model_runtime_compatibility,
 )
 
@@ -103,19 +104,30 @@ def test_qwen3_moe_registry_accepts_vanilla_pure_tp_modes():
         ) is QWEN3_MOE_TP_COMPATIBILITY
 
 
-def test_qwen3_moe_registry_accepts_vanilla_hybrid_mode():
+@pytest.mark.parametrize(
+    "method",
+    sorted(QWEN3_MOE_TP_EP_COMPATIBILITY.decode_cuda_graph_methods),
+)
+@pytest.mark.parametrize("expert_parallel_size", [1, 2])
+def test_qwen3_moe_registry_accepts_tp_sparse_graph_modes(
+    method,
+    expert_parallel_size,
+):
     assert _validate(
+        method,
         tensor_parallel_size=4,
-        expert_parallel_size=2,
+        expert_parallel_size=expert_parallel_size,
         enforce_eager=False,
         decode_cuda_graph=True,
-        enable_prefix_caching=True,
     ) is QWEN3_MOE_TP_COMPATIBILITY
 
 
-def test_qwen3_moe_registry_rejects_unvalidated_sparse_pure_tp():
-    with pytest.raises(ValueError, match="validated methods: 'vanilla'"):
-        _validate("omnikv", tensor_parallel_size=2, expert_parallel_size=1)
+def test_qwen3_moe_tp_sparse_methods_exclude_deltakv_and_skipkv():
+    assert "deltakv" not in QWEN3_MOE_TP_EP_COMPATIBILITY.sparse_methods
+    assert "skipkv" not in QWEN3_MOE_TP_EP_COMPATIBILITY.sparse_methods
+    for method in ("deltakv", "skipkv"):
+        with pytest.raises((ValueError, NotImplementedError)):
+            _validate(method, tensor_parallel_size=4, expert_parallel_size=2)
 
 
 @pytest.mark.parametrize(

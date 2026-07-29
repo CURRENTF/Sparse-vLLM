@@ -110,10 +110,32 @@ QWEN3_MOE_EP_COMPATIBILITY = ModelRuntimeCompatibility(
 
 QWEN3_MOE_TP_EP_COMPATIBILITY = ModelRuntimeCompatibility(
     parallel_mode="outer_tp_moe_tp_ep",
-    sparse_methods=frozenset({""}),
+    sparse_methods=frozenset(
+        {
+            "",
+            "streamingllm",
+            "snapkv",
+            "h2o",
+            "pyramidkv",
+            "omnikv",
+            "quest",
+            "rkv",
+        }
+    ),
     prefix_cache_methods=frozenset({""}),
     requires_eager=False,
-    decode_cuda_graph_methods=frozenset({""}),
+    decode_cuda_graph_methods=frozenset(
+        {
+            "",
+            "streamingllm",
+            "snapkv",
+            "h2o",
+            "pyramidkv",
+            "omnikv",
+            "quest",
+            "rkv",
+        }
+    ),
 )
 
 QWEN3_MOE_TP_COMPATIBILITY = QWEN3_MOE_TP_EP_COMPATIBILITY
