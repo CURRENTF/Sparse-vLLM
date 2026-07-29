@@ -10,6 +10,10 @@ from transformers import Qwen3MoeConfig
 
 from sparsevllm.distributed import get_parallel_context
 from sparsevllm.layers.embed_head import ParallelLMHead
+from sparsevllm.layers.expert_weights import (
+    PackedExpertWeightLoader,
+    UnquantizedExpertTpShard,
+)
 from sparsevllm.models.qwen3 import Qwen3DecoderLayerBase, Qwen3ModelBase
 from sparsevllm.operators.moe import (
     MoeOpSpec,
@@ -19,6 +23,7 @@ from sparsevllm.operators.moe import (
 from sparsevllm.platforms import device_runtime
 from sparsevllm.quantization.fp8_tp import Fp8ExpertTpShard
 from sparsevllm.utils.log import logger
+from sparsevllm.utils.weight_target import WeightTarget
 
 
 _EXPERT_SOURCE_RE = re.compile(
@@ -56,7 +61,13 @@ class Qwen3MoeRouter(nn.Module):
         return router_logits, topk_weights, topk_ids
 
 
-class Qwen3MoePackedExperts(nn.Module):
+class Qwen3MoePackedExperts(PackedExpertWeightLoader, nn.Module):
+    checkpoint_projection_map = {
+        "gate_proj": "gate",
+        "up_proj": "up",
+        "down_proj": "down",
+    }
+
     def __init__(self, config: Qwen3MoeConfig) -> None:
         super().__init__()
         parallel_context = get_parallel_context()
@@ -92,6 +103,15 @@ class Qwen3MoePackedExperts(nn.Module):
             )
             if self.fp8_enabled
             else None
+        )
+        self.checkpoint_tp_shard = (
+            self.fp8_tp_shard
+            if self.fp8_tp_shard is not None
+            else UnquantizedExpertTpShard(
+                self.global_intermediate_size,
+                self.tp_rank,
+                self.tp_size,
+            )
         )
         self.intermediate_size = (
             self.fp8_tp_shard.physical_size
@@ -448,46 +468,16 @@ class Qwen3MoeForCausalLM(nn.Module):
             f"{projection}.expert_weight"
         )
 
-    def rank_local_special_weight_slice(
+    def resolve_special_weight(
         self,
-        source_weight_name: str,
-        source_shape: tuple[int, ...],
-        *,
-        is_scale: bool = False,
-    ) -> tuple[slice, ...] | None:
-        match = _EXPERT_SOURCE_RE.match(source_weight_name)
+        target_weight_name: str,
+    ) -> WeightTarget | None:
+        match = _EXPERT_TARGET_RE.match(target_weight_name)
         if match is None:
             return None
-        _, _, projection = match.groups()
-        experts = self.model.layers[0].mlp.experts
-        if experts.tp_size == 1:
-            return None
-        if experts.fp8_tp_shard is not None:
-            return experts.fp8_tp_shard.checkpoint_slice(
-                source_shape,
-                hidden_size=experts.hidden_size,
-                down_projection=projection == "down_proj",
-                is_scale=is_scale,
-            )
-        if is_scale:
-            raise ValueError("Unquantized Qwen3MoE checkpoint has an expert scale.")
-        global_shape = (
-            (experts.hidden_size, experts.global_intermediate_size)
-            if projection == "down_proj"
-            else (experts.global_intermediate_size, experts.hidden_size)
-        )
-        if tuple(source_shape) != global_shape:
-            raise ValueError(
-                "Qwen3MoE checkpoint expert shape mismatch: "
-                f"projection={projection}, expected={global_shape}, got={source_shape}."
-            )
-        start = experts.tp_rank * experts.logical_intermediate_size
-        stop = start + experts.logical_intermediate_size
-        return (
-            (slice(None), slice(start, stop))
-            if projection == "down_proj"
-            else (slice(start, stop), slice(None))
-        )
+        layer_idx, global_expert_id, projection = match.groups()
+        experts = self.model.layers[int(layer_idx)].mlp.experts
+        return WeightTarget(experts, (int(global_expert_id), projection))
 
     def record_skipped_weight(
         self,
@@ -565,12 +555,12 @@ class Qwen3MoeForCausalLM(nn.Module):
         loaded_weight: torch.Tensor,
         loaded_scale: torch.Tensor | None,
     ) -> int:
-        match = _EXPERT_TARGET_RE.match(target_weight_name)
-        if match is None:
+        target = self.resolve_special_weight(target_weight_name)
+        if target is None:
             return 0
-        layer_idx, global_expert_id, projection = match.groups()
-        self.model.layers[int(layer_idx)].mlp.experts.load_expert_weight(
-            int(global_expert_id),
+        global_expert_id, projection = target.shard_id
+        target.module.load_expert_weight(
+            global_expert_id,
             projection,
             loaded_weight,
             loaded_scale,

@@ -490,7 +490,7 @@ def test_packed_expert_tp_shards_cover_each_projection_exactly(tp_size):
     )
 
 
-def test_model_exposes_rank_local_expert_checkpoint_slices():
+def test_packed_experts_own_rank_local_checkpoint_slices():
     config = _config(
         moe_intermediate_size=8,
         num_attention_heads=4,
@@ -500,15 +500,20 @@ def test_model_exposes_rank_local_expert_checkpoint_slices():
     model = _instantiate_model(config, _tp_context(1, 2))
     prefix = "model.layers.0.mlp.experts.0."
 
-    assert model.rank_local_special_weight_slice(
-        prefix + "gate_proj.weight", (8, 8)
+    gate_target = model.resolve_special_weight(prefix + "gate_proj.expert_weight")
+    up_target = model.resolve_special_weight(prefix + "up_proj.expert_weight")
+    down_target = model.resolve_special_weight(prefix + "down_proj.expert_weight")
+
+    assert gate_target.module.rank_local_weight_slice(
+        (8, 8), loaded_shard_id=gate_target.shard_id
     ) == (slice(4, 8), slice(None))
-    assert model.rank_local_special_weight_slice(
-        prefix + "up_proj.weight", (8, 8)
+    assert up_target.module.rank_local_weight_slice(
+        (8, 8), loaded_shard_id=up_target.shard_id
     ) == (slice(4, 8), slice(None))
-    assert model.rank_local_special_weight_slice(
-        prefix + "down_proj.weight", (8, 8)
+    assert down_target.module.rank_local_weight_slice(
+        (8, 8), loaded_shard_id=down_target.shard_id
     ) == (slice(None), slice(4, 8))
+    assert not hasattr(model, "rank_local_special_weight_slice")
 
 
 def test_moe_block_reduces_hybrid_partial_output_over_outer_world():

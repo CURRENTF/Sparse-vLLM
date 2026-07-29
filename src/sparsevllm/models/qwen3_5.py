@@ -19,6 +19,7 @@ from sparsevllm.layers.linear import (
 from sparsevllm.layers.rotary_embedding import apply_partial_rotary_emb, get_rope
 from sparsevllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 from sparsevllm.utils.context import get_context
+from sparsevllm.utils.weight_target import WeightTarget
 from sparsevllm.engine.recurrent_state_manager import RecurrentStateSpec, RecurrentTensorSpec
 from sparsevllm.triton_kernel.qwen3_5.causal_conv1d import causal_conv1d_fn
 from sparsevllm.triton_kernel.qwen3_5.fused_gdn_gating import fused_gdn_gating
@@ -976,25 +977,34 @@ class Qwen35ForCausalLM(nn.Module):
             return "model." + source_weight_name[len(prefix) :]
         return source_weight_name
 
+    def resolve_special_weight(
+        self,
+        target_weight_name: str,
+    ) -> WeightTarget | None:
+        for suffix, loader_name in self.special_weight_loaders.items():
+            if not target_weight_name.endswith(suffix):
+                continue
+            module_name = target_weight_name[: -len(".weight")].rpartition(".")[0]
+            return WeightTarget(self.get_submodule(module_name), loader_name)
+        return None
+
     def load_special_weight(
         self,
         target_weight_name: str,
         loaded_weight: torch.Tensor,
         loaded_scale: torch.Tensor | None,
     ) -> int:
-        for suffix, loader_name in self.special_weight_loaders.items():
-            if not target_weight_name.endswith(suffix):
-                continue
-            module_name = target_weight_name[: -len(".weight")].rpartition(".")[0]
-            module = self.get_submodule(module_name)
-            loader = getattr(module, loader_name, None)
-            if loader is None:
-                raise ValueError(
-                    f"Found qwen3_5 packed linear attention weight {target_weight_name!r}, "
-                    f"but target module {module_name!r} has no {loader_name}()."
-                )
-            return int(loader(loaded_weight, loaded_scale))
-        return 0
+        target = self.resolve_special_weight(target_weight_name)
+        if target is None:
+            return 0
+        loader = getattr(target.module, target.shard_id, None)
+        if loader is None:
+            raise ValueError(
+                f"Found qwen3_5 packed linear attention weight {target_weight_name!r}, "
+                f"but target module {type(target.module).__name__!r} has no "
+                f"{target.shard_id}()."
+            )
+        return int(loader(loaded_weight, loaded_scale))
 
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         return self.model(input_ids, positions)
