@@ -743,22 +743,9 @@ class ModelRunner:
             state["mixed_prefix_cache"] = (
                 prefix_cache_coordinator.debug_state_summary()
             )
-        graph_runner = getattr(self, "decode_cuda_graph_runner", None)
-        graph_states = getattr(graph_runner, "_graphs", {}) if graph_runner is not None else {}
-        graph_count = sum(
-            getattr(graph_state, "graph", None) is not None
-            for graph_state in graph_states.values()
-        )
         return {
             "world_rank": self.parallel_context.world_rank,
             "ep_rank": self.parallel_context.ep_rank,
-            "parallel_topology": self.parallel_context.topology_summary(),
-            "decode_cuda_graph": {
-                "configured": bool(self.config.decode_cuda_graph),
-                "state_count": len(graph_states),
-                "graph_count": int(graph_count),
-                "active": bool(self.config.decode_cuda_graph and graph_count),
-            },
             "state": state,
             "last_logits": (
                 _debug_tensor_summary(self.debug_last_logits)
@@ -859,24 +846,18 @@ class ModelRunner:
 
     def debug_replica_consistency(self) -> dict[str, object] | None:
         logits = getattr(self, "debug_last_logits", None)
-        tp_size = int(getattr(self.parallel_context, "tp_size", 1))
-        if logits is None and tp_size == 1:
+        if logits is None:
             return None
+        logits_max_abs, logits_tolerance_ratio = self._debug_float_error_from_world_rank_zero(
+            logits,
+            atol=0.05,
+            rtol=0.05,
+        )
         result: dict[str, object] = {
-            "last_logits_max_abs": None,
-            "last_logits_tolerance_ratio": None,
+            "last_logits_max_abs": logits_max_abs,
+            "last_logits_tolerance_ratio": logits_tolerance_ratio,
             "moe_layers": {},
         }
-        if tp_size == 1:
-            logits_max_abs, logits_tolerance_ratio = (
-                self._debug_float_error_from_world_rank_zero(
-                    logits,
-                    atol=0.05,
-                    rtol=0.05,
-                )
-            )
-            result["last_logits_max_abs"] = logits_max_abs
-            result["last_logits_tolerance_ratio"] = logits_tolerance_ratio
         model = getattr(getattr(self, "model", None), "model", None)
         layers = getattr(model, "layers", ())
         for layer_idx in sorted({0, len(layers) - 1} if layers else set()):
@@ -1021,10 +1002,7 @@ class ModelRunner:
         _stage = 'prefill' if is_prefill else 'decode'
         with profiler.record(f"model_run_model_{_stage}"):
             logits = self.model.compute_logits(self.model(input_ids, positions))
-        if (
-            os.getenv("SPARSEVLLM_DEBUG_RUNTIME", "0") == "1"
-            and logits is not None
-        ):
+        if os.getenv("SPARSEVLLM_DEBUG_RUNTIME", "0") == "1":
             self.debug_last_logits = logits.detach().clone()
         return logits
 

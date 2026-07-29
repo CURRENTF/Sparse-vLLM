@@ -444,12 +444,21 @@ def test_fp8_moe_rejects_pre_fp8_cuda():
         )
 
 
-def test_fp8_moe_rejects_tensor_parallel_expert_shards():
-    with pytest.raises(RuntimeError, match="tensor-parallel expert shards"):
-        OpResolver(MOE_REGISTRY).resolve(
+def test_fp8_moe_uses_triton_for_tensor_parallel_expert_shards():
+    with patch("sparsevllm.operators.moe.find_spec", return_value=object()):
+        resolved = OpResolver(MOE_REGISTRY).resolve(
             _moe_spec(tp_size=2, ep_size=1, num_local_experts=8),
             _cuda_caps((9, 0)),
         )
+
+    assert resolved.provider.name == "triton"
+    assert resolved.rejected == (
+        (
+            "flashinfer_cutlass_fp8_sm90",
+            "does not support tensor-parallel expert shards",
+        ),
+        ("triton_hopper_fused", "requires unquantized BF16 expert weights"),
+    )
 
 
 @pytest.mark.parametrize("platform", [PlatformEnum.CPU, PlatformEnum.ROCM])

@@ -65,9 +65,7 @@ def test_model_runner_gathers_one_debug_summary_per_world_rank():
         world_rank=0,
         ep_rank=0,
         world=SimpleNamespace(process_group=object()),
-        topology_summary=lambda: {"world_rank": 0, "world_size": 2},
     )
-    runner.config = SimpleNamespace(decode_cuda_graph=False)
     runner.sparse_controller = SimpleNamespace(
         debug_state_summary=lambda: {"sparse_method": "", "layers": {}}
     )
@@ -85,17 +83,3 @@ def test_model_runner_gathers_one_debug_summary_per_world_rank():
     assert [summary["world_rank"] for summary in summaries] == [0, 1]
     assert summaries[0]["state"] == summaries[1]["state"]
     sync_status.assert_called_once_with("debug_sparse_state_summaries", None)
-
-
-def test_tp_replica_consistency_skips_rank_zero_only_logits():
-    runner = object.__new__(ModelRunner)
-    runner.parallel_context = SimpleNamespace(tp_size=2)
-    runner.model = SimpleNamespace(model=SimpleNamespace(layers=[]))
-
-    consistency = runner.debug_replica_consistency()
-
-    assert consistency == {
-        "last_logits_max_abs": None,
-        "last_logits_tolerance_ratio": None,
-        "moe_layers": {},
-    }

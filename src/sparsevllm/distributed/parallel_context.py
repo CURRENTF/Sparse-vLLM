@@ -227,25 +227,6 @@ class ParallelContext:
     def dp_size(self) -> int:
         return self.data.size
 
-    def topology_summary(self) -> dict[str, object]:
-        moe_tensor = self.moe_tensor or self.tensor
-        return {
-            "world_rank": self.world_rank,
-            "world_size": self.world_size,
-            "attention_tp_rank": self.attention_tp_rank,
-            "attention_tp_size": self.attention_tp_size,
-            "attention_tp_ranks": self.attention.ranks,
-            "moe_tp_rank": moe_tensor.rank,
-            "moe_tp_size": moe_tensor.size,
-            "moe_tp_ranks": moe_tensor.ranks,
-            "moe_ep_rank": self.ep_rank,
-            "moe_ep_size": self.ep_size,
-            "moe_ep_ranks": self.expert.ranks,
-            "dp_rank": self.dp_rank,
-            "dp_size": self.dp_size,
-            "dp_ranks": self.data.ranks,
-        }
-
     @staticmethod
     def _all_reduce(
         tensor: torch.Tensor,

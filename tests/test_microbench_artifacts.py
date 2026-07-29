@@ -7,9 +7,7 @@ from benchmark.microbench import (
     _artifact_records,
     _benchmark_sparse_method,
     _record_child_exit_failure,
-    _parallel_topology,
     _resolved_engine_config,
-    _selected_moe_providers,
     _write_output_dir,
 )
 
@@ -151,48 +149,3 @@ def test_resolved_engine_config_records_backend_and_jsonable_values():
     assert resolved["h2o_prefill_budget"] == 8192
     assert resolved["h2o_recent_ratio"] == 0.5
     assert resolved["h2o_prefill_score_window"] == 128
-
-
-def test_selected_moe_providers_records_bound_provider_names():
-    def layer(provider_name):
-        return SimpleNamespace(
-            mlp=SimpleNamespace(
-                experts=SimpleNamespace(
-                    provider=SimpleNamespace(name=provider_name),
-                )
-            )
-        )
-
-    llm = SimpleNamespace(
-        model_runner=SimpleNamespace(
-            model=SimpleNamespace(
-                model=SimpleNamespace(layers=[layer("triton"), layer("triton")])
-            )
-        )
-    )
-
-    assert _selected_moe_providers(llm) == ["triton"]
-
-
-def test_parallel_topology_records_hybrid_moe_dimensions():
-    config = SimpleNamespace(
-        hf_config=SimpleNamespace(model_type="qwen3_moe", num_experts=128),
-        uses_outer_tp_moe_layout=True,
-        world_size=4,
-        tensor_parallel_size=4,
-        expert_parallel_size=2,
-        attention_tensor_parallel_size=4,
-        moe_expert_parallel_size=2,
-        moe_tensor_parallel_size=2,
-    )
-
-    assert _parallel_topology(SimpleNamespace(config=config)) == {
-        "parallel_mode": "outer_tp_moe_tp_ep",
-        "world_size": 4,
-        "outer_tp_size": 4,
-        "attention_tp_size": 4,
-        "moe_ep_size": 2,
-        "moe_tp_size": 2,
-        "num_local_experts": 64,
-        "moe_collective": "outer_world_all_reduce",
-    }

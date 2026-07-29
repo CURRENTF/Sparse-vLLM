@@ -356,9 +356,6 @@ def _resolved_engine_config(llm) -> dict[str, Any]:
         "vllm_sparse_method",
         "prefill_schedule_policy",
         "chunk_prefill_size",
-        "tensor_parallel_size",
-        "expert_parallel_size",
-        "data_parallel_size",
         "decode_cuda_graph",
         "decode_cuda_graph_capture_sampling",
         "deltakv_sparse_decode_backend",
@@ -380,45 +377,6 @@ def _resolved_engine_config(llm) -> dict[str, Any]:
         for key in keys
         if hasattr(config, key)
     }
-
-
-def _parallel_topology(llm) -> dict[str, Any]:
-    config = getattr(llm, "config", None)
-    if config is None:
-        return {}
-    hf_config = getattr(config, "hf_config", None)
-    model_type = str(getattr(hf_config, "model_type", "") or "")
-    num_experts = int(getattr(hf_config, "num_experts", 0) or 0)
-    moe_ep_size = int(config.moe_expert_parallel_size)
-    return {
-        "parallel_mode": (
-            "outer_tp_moe_tp_ep"
-            if config.uses_outer_tp_moe_layout
-            else "legacy_tp_ep"
-        ),
-        "world_size": int(config.world_size),
-        "outer_tp_size": int(config.tensor_parallel_size),
-        "attention_tp_size": int(config.attention_tensor_parallel_size),
-        "moe_ep_size": moe_ep_size,
-        "moe_tp_size": int(config.moe_tensor_parallel_size),
-        "num_local_experts": num_experts // moe_ep_size if num_experts else None,
-        "moe_collective": (
-            "outer_world_all_reduce" if model_type == "qwen3_moe" else None
-        ),
-    }
-
-
-def _selected_moe_providers(llm) -> list[str]:
-    model = getattr(getattr(llm, "model_runner", None), "model", None)
-    layers = getattr(getattr(model, "model", None), "layers", ())
-    providers = {
-        str(experts.provider.name)
-        for layer in layers
-        if (experts := getattr(getattr(layer, "mlp", None), "experts", None))
-        is not None
-        and getattr(experts, "provider", None) is not None
-    }
-    return sorted(providers)
 
 
 def _cache_stats(llm) -> dict[str, int]:
@@ -673,9 +631,6 @@ def benchmark_task(method, length, bs, args, results_dict):
         t_end = perf_counter()
         
         duration = t_end - t_start
-        end_to_end_tp = (
-            (prefill_tokens + decode_tokens) / duration if duration > 0 else 0.0
-        )
         peak_mem = get_peak_memory()
         graph_status = _decode_cuda_graph_status(llm)
         prefix_cache_stats_after = _cache_stats(llm)
@@ -735,8 +690,6 @@ def benchmark_task(method, length, bs, args, results_dict):
             "batch_size": int(bs),
             "prefill_tp": prefill_tp,
             "decode_tp": decode_tp,
-            "end_to_end_tp": end_to_end_tp,
-            "duration_s": duration,
             "ttft": ttft,
             "itl": avg_itl,
             "avg_bs": avg_active_bs,
@@ -771,8 +724,6 @@ def benchmark_task(method, length, bs, args, results_dict):
             "memory_accounting": memory_accounting,
             "engine_hyper_params": engine_kwargs,
             "resolved_engine_config": resolved_engine_config,
-            "moe_providers": _selected_moe_providers(llm),
-            "parallel_topology": _parallel_topology(llm),
             "status": "SUCCESS"
         }
 
