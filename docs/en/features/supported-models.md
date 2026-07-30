@@ -14,15 +14,22 @@ parallel size must use that value.
 | --- | --- | --- | :---: | :---: | :---: |
 | Qwen2.5 | `qwen2` | BF16 / FP16 | ✅ | 1 only | 1 only |
 | Qwen3 Dense | `qwen3` | BF16 / FP16 / block FP8 | ✅ (FP8: 1/2/4/8) | 1 only | 1 only |
-| Qwen3MoE | `qwen3_moe` | BF16 / FP16 / block FP8 | 1 only | 1 only | ✅ |
+| Qwen3MoE | `qwen3_moe` | BF16 / FP16 / block FP8 | ✅ (TP > 1: BF16 model dtype only) | 1 only | ✅ |
 | Qwen3.5 / Qwen3.6 | `qwen3_5` | block FP8 | ✅ | 1 only | 1 only |
 | Llama 3 / 3.1 | `llama` | BF16 / FP16 | ✅ | 1 only | 1 only |
-| MiniMax M2.7 | `minimax_m2` | block FP8 with BF16 non-quantized weights | 1 only | 1 only | ✅ |
+| MiniMax M2.7 | `minimax_m2` | block FP8 with BF16 non-quantized weights | ✅ | 1 only | ✅ |
 
 TP is limited to sizes 1 through 8 and requires the checkpoint dimensions,
 including the attention heads and vocabulary size, to be divisible by the
-selected TP size. Qwen3MoE EP must divide `num_experts`; MiniMax M2.7 EP must
-divide `num_local_experts`.
+selected TP size.
+
+Qwen3MoE and MiniMax M2.7 use a hybrid layout when the outer TP size `T` is
+greater than 1: attention TP is `T`, MoE EP is `E`, MoE TP is `T / E`, and
+the distributed world size is `T`. This layout requires `DP=1` and `T % E ==
+0`. The expert count must be divisible by `E`, and the MoE intermediate
+dimension must be divisible by `T / E`. Qwen3MoE outer TP requires a BF16
+model dtype; FP16 Qwen3MoE checkpoints are limited to `TP=1`. When `TP=1`,
+the existing EP layout uses world size `E`.
 
 Block FP8 support requires E4M3 weights, dynamic activation quantization, and
 a `128 x 128` weight block size. Qwen3.5 and Qwen3.6 configurations are

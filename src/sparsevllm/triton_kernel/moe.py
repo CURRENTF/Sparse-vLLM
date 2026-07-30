@@ -469,6 +469,168 @@ def _routed_gemm(
 
 
 @triton.jit(do_not_specialize=["EM", "num_assignments"])
+def _routed_gate_up_swiglu_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    sorted_token_ids_ptr,
+    expert_ids_ptr,
+    num_tokens_post_padded_ptr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    EM,
+    num_assignments,
+    stride_am,
+    stride_ak,
+    stride_be,
+    stride_bn,
+    stride_bk,
+    stride_cm,
+    stride_cn,
+    INPUT_TOP_K: tl.constexpr,
+    NAIVE_ASSIGNMENT: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + (pid % num_pid_in_group) % group_size_m
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    row_offsets = tl.arange(0, BLOCK_SIZE_M)
+    if NAIVE_ASSIGNMENT:
+        assignment_ids = tl.where(
+            row_offsets == 0,
+            pid_m,
+            num_assignments,
+        )
+    else:
+        num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+        if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
+            return
+        assignment_offsets = pid_m * BLOCK_SIZE_M + row_offsets
+        assignment_ids = tl.load(sorted_token_ids_ptr + assignment_offsets)
+    assignment_ids = assignment_ids.to(tl.int64)
+    assignment_mask = assignment_ids < num_assignments
+
+    expert_id = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
+    if expert_id < 0:
+        return
+
+    n_offsets = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    k_offsets = tl.arange(0, BLOCK_SIZE_K)
+    input_rows = assignment_ids // INPUT_TOP_K
+    a_ptrs = (
+        a_ptr
+        + input_rows[:, None] * stride_am
+        + k_offsets[None, :] * stride_ak
+    )
+    gate_ptrs = (
+        b_ptr
+        + expert_id * stride_be
+        + n_offsets[None, :] * stride_bn
+        + k_offsets[:, None] * stride_bk
+    )
+    up_ptrs = gate_ptrs + N * stride_bn
+
+    gate_accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    up_accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for k_start in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        remaining_k = K - k_start * BLOCK_SIZE_K
+        a = tl.load(
+            a_ptrs,
+            mask=assignment_mask[:, None] & (k_offsets[None, :] < remaining_k),
+            other=0.0,
+        )
+        weight_mask = (k_offsets[:, None] < remaining_k) & (
+            n_offsets[None, :] < N
+        )
+        gate = tl.load(gate_ptrs, mask=weight_mask, other=0.0)
+        up = tl.load(up_ptrs, mask=weight_mask, other=0.0)
+        gate_accumulator += tl.dot(a, gate)
+        up_accumulator += tl.dot(a, up)
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        gate_ptrs += BLOCK_SIZE_K * stride_bk
+        up_ptrs += BLOCK_SIZE_K * stride_bk
+
+    # Preserve the generic pipeline's BF16/FP16 rounding boundary before
+    # SwiGLU so the fused provider remains numerically equivalent.
+    element_dtype = b_ptr.dtype.element_ty
+    gate = gate_accumulator.to(element_dtype).to(tl.float32)
+    up = up_accumulator.to(element_dtype)
+    gate = (gate / (1.0 + tl.exp(-gate))).to(element_dtype)
+    output = gate * up
+    tl.store(
+        c_ptr
+        + assignment_ids[:, None] * stride_cm
+        + n_offsets[None, :] * stride_cn,
+        output,
+        mask=assignment_mask[:, None] & (n_offsets[None, :] < N),
+    )
+
+
+def _routed_gate_up_swiglu(
+    inputs: torch.Tensor,
+    weights: torch.Tensor,
+    output: torch.Tensor,
+    alignment: MoeAlignment,
+    *,
+    input_top_k: int,
+    launch_config: dict[str, int],
+) -> None:
+    num_assignments = int(output.shape[0])
+    if alignment.naive:
+        em = num_assignments * alignment.block_size
+        sorted_token_ids = output
+    else:
+        if alignment.sorted_token_ids is None:
+            raise RuntimeError("Aligned routed GEMM is missing sorted_token_ids.")
+        em = int(alignment.sorted_token_ids.numel())
+        sorted_token_ids = alignment.sorted_token_ids
+
+    intermediate_size = int(weights.shape[1]) // 2
+    block_m = launch_config["BLOCK_SIZE_M"]
+    block_n = launch_config["BLOCK_SIZE_N"]
+    grid = (
+        triton.cdiv(em, block_m) * triton.cdiv(intermediate_size, block_n),
+    )
+    _routed_gate_up_swiglu_kernel[grid](
+        inputs,
+        weights,
+        output,
+        sorted_token_ids,
+        alignment.expert_ids,
+        alignment.num_tokens_post_padded,
+        N=intermediate_size,
+        K=int(weights.shape[2]),
+        EM=em,
+        num_assignments=num_assignments,
+        stride_am=inputs.stride(0),
+        stride_ak=inputs.stride(1),
+        stride_be=weights.stride(0),
+        stride_bn=weights.stride(1),
+        stride_bk=weights.stride(2),
+        stride_cm=output.stride(0),
+        stride_cn=output.stride(1),
+        INPUT_TOP_K=int(input_top_k),
+        NAIVE_ASSIGNMENT=alignment.naive,
+        BLOCK_SIZE_M=block_m,
+        BLOCK_SIZE_N=block_n,
+        BLOCK_SIZE_K=launch_config["BLOCK_SIZE_K"],
+        GROUP_SIZE_M=launch_config["GROUP_SIZE_M"],
+        num_warps=launch_config["num_warps"],
+        num_stages=launch_config["num_stages"],
+    )
+
+
+@triton.jit(do_not_specialize=["EM", "num_assignments"])
 def _routed_fp8_gemm_kernel(
     a_ptr,
     b_ptr,
@@ -855,6 +1017,7 @@ def fused_moe(
     num_experts: int,
     local_expert_start: int,
     output_dtype: torch.dtype | None = None,
+    _fuse_gate_up_swiglu: bool = False,
 ) -> torch.Tensor:
     """Run unquantized routed experts with a generic Triton MoE pipeline.
 
@@ -893,7 +1056,7 @@ def fused_moe(
         num_local_experts=num_local_experts,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
-        stage="w13",
+        stage="gate_up_swiglu" if _fuse_gate_up_swiglu else "w13",
         device_name=device_name,
         device_capability=capability,
     ).as_triton_kwargs()
@@ -905,22 +1068,37 @@ def fused_moe(
         local_expert_end=local_expert_end,
     )
 
-    w13_output = torch.empty(
-        (num_assignments, 2 * intermediate_size),
-        dtype=hidden_states.dtype,
-        device=hidden_states.device,
-    )
-    _routed_gemm(
-        hidden_states,
-        w13_weight,
-        w13_output,
-        topk_weights,
-        alignment,
-        input_top_k=top_k,
-        multiply_routing_weight=False,
-        launch_config=w13_config,
-    )
-    activated = silu_and_mul_fwd(w13_output)
+    if _fuse_gate_up_swiglu:
+        activated = torch.empty(
+            (num_assignments, intermediate_size),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        _routed_gate_up_swiglu(
+            hidden_states,
+            w13_weight,
+            activated,
+            alignment,
+            input_top_k=top_k,
+            launch_config=w13_config,
+        )
+    else:
+        w13_output = torch.empty(
+            (num_assignments, 2 * intermediate_size),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        _routed_gemm(
+            hidden_states,
+            w13_weight,
+            w13_output,
+            topk_weights,
+            alignment,
+            input_top_k=top_k,
+            multiply_routing_weight=False,
+            launch_config=w13_config,
+        )
+        activated = silu_and_mul_fwd(w13_output)
 
     w2_config = resolve_moe_gemm_config(
         dtype=hidden_states.dtype,
@@ -956,6 +1134,32 @@ def fused_moe(
         local_expert_start=local_expert_start,
         local_expert_end=local_expert_end,
         output_dtype=output_dtype,
+    )
+
+
+def fused_moe_gate_up_swiglu(
+    hidden_states: torch.Tensor,
+    w13_weight: torch.Tensor,
+    w2_weight: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    *,
+    num_experts: int,
+    local_expert_start: int,
+    output_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """Run the Triton MoE pipeline with fused W13 GEMM and SwiGLU."""
+
+    return fused_moe(
+        hidden_states,
+        w13_weight,
+        w2_weight,
+        topk_ids,
+        topk_weights,
+        num_experts=num_experts,
+        local_expert_start=local_expert_start,
+        output_dtype=output_dtype,
+        _fuse_gate_up_swiglu=True,
     )
 
 

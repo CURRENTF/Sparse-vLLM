@@ -6,6 +6,7 @@ from safetensors.torch import save_file
 from torch import nn
 
 from sparsevllm.utils import loader
+from sparsevllm.utils.weight_target import WeightTarget
 
 
 class _TwoShardModel(nn.Module):
@@ -35,6 +36,33 @@ class _RankLocalModel(nn.Module):
     def __init__(self):
         super().__init__()
         self.proj = _RankLocalWeight()
+
+
+class _SpecialRankLocalModel(nn.Module):
+    special_weight_loaders = (".expert_weight",)
+
+    def __init__(self):
+        super().__init__()
+        self.experts = _RankLocalWeight()
+
+    @staticmethod
+    def map_weight_name(source_weight_name):
+        if source_weight_name == "expert.weight":
+            return "experts.gate.expert_weight"
+        return source_weight_name
+
+    def resolve_special_weight(self, target_weight_name):
+        if target_weight_name != "experts.gate.expert_weight":
+            return None
+        return WeightTarget(self.experts, (0, "gate"))
+
+    def load_special_weight(self, target_weight_name, loaded_weight, loaded_scale):
+        target = self.resolve_special_weight(target_weight_name)
+        if target is None:
+            return 0
+        assert loaded_scale is None
+        target.module.weight_loader(target.module.weight, loaded_weight)
+        return 1
 
 
 class _ExpertOwnershipModel(nn.Module):
@@ -140,6 +168,16 @@ def test_load_model_reads_only_rank_local_tensor_slice(tmp_path):
     loader.load_model(model, str(tmp_path), tp_rank=1, tp_size=2)
 
     torch.testing.assert_close(model.proj.weight, full_weight[2:4])
+
+
+def test_special_weight_resolves_rank_local_slice_from_target_module(tmp_path):
+    full_weight = torch.arange(8, dtype=torch.float32).reshape(4, 2)
+    save_file({"expert.weight": full_weight}, tmp_path / "model.safetensors")
+    model = _SpecialRankLocalModel()
+
+    loader.load_model(model, str(tmp_path), tp_rank=1, tp_size=2)
+
+    torch.testing.assert_close(model.experts.weight, full_weight[2:4])
 
 
 def test_load_model_keeps_remote_expert_tensors_as_metadata(tmp_path):

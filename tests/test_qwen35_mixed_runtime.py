@@ -707,6 +707,7 @@ def test_model_runner_resets_inherited_allocator_peak_before_model_construction(
         tensor_parallel_size=1,
         expert_parallel_size=1,
         data_parallel_size=1,
+        uses_outer_tp_moe_layout=False,
         mlp_chunk_size=16384,
         hf_config=SimpleNamespace(model_type="qwen2", torch_dtype=torch.float32),
     )

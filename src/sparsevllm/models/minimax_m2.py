@@ -9,7 +9,8 @@ from torch import nn
 from sparsevllm.distributed import get_parallel_context
 from sparsevllm.layers.attention import Attention
 from sparsevllm.layers.embed_head import ParallelLMHead
-from sparsevllm.layers.layernorm import RMSNorm
+from sparsevllm.layers.expert_weights import PackedExpertWeightLoader
+from sparsevllm.layers.layernorm import ColumnParallelRMSNorm, RMSNorm
 from sparsevllm.layers.linear import QKVParallelLinear, RowParallelLinear
 from sparsevllm.layers.rotary_embedding import (
     apply_partial_rotary_emb,
@@ -22,8 +23,10 @@ from sparsevllm.operators.moe import (
     resolve_moe_provider,
 )
 from sparsevllm.platforms import device_runtime
+from sparsevllm.quantization.fp8_tp import Fp8ExpertTpShard
 from sparsevllm.utils.context import get_context
 from sparsevllm.utils.log import logger
+from sparsevllm.utils.weight_target import WeightTarget
 
 
 _EXPERT_SOURCE_RE = re.compile(
@@ -67,23 +70,35 @@ class MiniMaxM2Router(nn.Module):
         return router_logits, topk_weights, topk_ids
 
 
-class MiniMaxM2PackedExperts(nn.Module):
+class MiniMaxM2PackedExperts(PackedExpertWeightLoader, nn.Module):
+    checkpoint_projection_map = {"w1": "gate", "w2": "down", "w3": "up"}
+
     def __init__(self, config) -> None:
         super().__init__()
         parallel_context = get_parallel_context()
+        self.tp_rank = int(parallel_context.moe_tp_rank)
+        self.tp_size = int(parallel_context.moe_tp_size)
         self.ep_rank = int(parallel_context.ep_rank)
         self.ep_size = int(parallel_context.ep_size)
         self.num_experts = int(config.num_local_experts)
         self.hidden_size = int(config.hidden_size)
-        self.intermediate_size = int(config.intermediate_size)
+        self.global_intermediate_size = int(config.intermediate_size)
+        self.fp8_tp_shard = Fp8ExpertTpShard(
+            self.global_intermediate_size,
+            self.tp_rank,
+            self.tp_size,
+        )
+        self.checkpoint_tp_shard = self.fp8_tp_shard
+        self.logical_intermediate_size = self.fp8_tp_shard.logical_size
+        self.intermediate_size = self.fp8_tp_shard.physical_size
         if self.num_experts % self.ep_size:
             raise ValueError(
                 f"MiniMax experts={self.num_experts} must be divisible by EP={self.ep_size}."
             )
-        if self.hidden_size % 128 or self.intermediate_size % 128:
+        if self.hidden_size % 128 or self.global_intermediate_size % 128:
             raise ValueError(
                 "MiniMax packed FP8 experts require hidden/intermediate dimensions "
-                f"aligned to 128, got {self.hidden_size}/{self.intermediate_size}."
+                f"aligned to 128, got {self.hidden_size}/{self.global_intermediate_size}."
             )
         self.num_local_experts = self.num_experts // self.ep_size
         self.local_expert_start = self.ep_rank * self.num_local_experts
@@ -99,6 +114,9 @@ class MiniMaxM2PackedExperts(nn.Module):
             block_shape=tuple(config.quantization_config.weight_block_size),
             ep_size=self.ep_size,
             cuda_graph=bool(getattr(config, "decode_cuda_graph", False)),
+            tp_size=self.tp_size,
+            routing_method="biased_sigmoid",
+            scale_dtype=torch.float32,
         )
         self.provider = resolve_moe_provider(self.op_spec)
         self.w13_weight = nn.Parameter(
@@ -178,6 +196,12 @@ class MiniMaxM2PackedExperts(nn.Module):
                 f"got {loaded_scale.dtype}."
             )
 
+        loaded_weight, loaded_scale = self.fp8_tp_shard.prepare_projection(
+            loaded_weight,
+            loaded_scale,
+            hidden_size=self.hidden_size,
+            down_projection=projection == "w2",
+        )
         local_expert_id = global_expert_id - self.local_expert_start
         logical_projection = {"w1": "gate", "w2": "down", "w3": "up"}[projection]
         self.provider.load_expert_projection(
@@ -245,13 +269,14 @@ class MiniMaxM2SparseMoeBlock(nn.Module):
             )
         _, topk_weights, topk_ids = self.gate(hidden_states)
         local_output = self.experts(hidden_states, topk_ids, topk_weights)
-        return self.parallel_context.ep_all_reduce(local_output)
+        return self.parallel_context.world_all_reduce(local_output)
 
 
 class MiniMaxM2Attention(nn.Module):
     def __init__(self, config) -> None:
         super().__init__()
-        tp_size = int(get_parallel_context().tp_size)
+        self.parallel_context = get_parallel_context()
+        tp_size = int(self.parallel_context.tp_size)
         self.total_num_heads = int(config.num_attention_heads)
         self.total_num_kv_heads = int(config.num_key_value_heads)
         if self.total_num_heads % tp_size or self.total_num_kv_heads % tp_size:
@@ -276,13 +301,15 @@ class MiniMaxM2Attention(nn.Module):
             bias=False,
             quantization=config.quantization_config,
         )
-        self.q_norm = RMSNorm(
-            self.q_size,
+        self.q_norm = ColumnParallelRMSNorm(
+            self.total_num_heads * self.head_dim,
             eps=float(config.rms_norm_eps),
+            parallel_context=self.parallel_context,
         )
-        self.k_norm = RMSNorm(
-            self.kv_size,
+        self.k_norm = ColumnParallelRMSNorm(
+            self.total_num_kv_heads * self.head_dim,
             eps=float(config.rms_norm_eps),
+            parallel_context=self.parallel_context,
         )
         self.rotary_emb = get_rope(
             self.rotary_dim,
@@ -298,7 +325,9 @@ class MiniMaxM2Attention(nn.Module):
             self.num_kv_heads,
         )
 
-    def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, positions: torch.Tensor, hidden_states: torch.Tensor
+    ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         context = get_context()
@@ -306,8 +335,9 @@ class MiniMaxM2Attention(nn.Module):
         raw_k = k.view(-1, self.num_kv_heads, self.head_dim)
         v = v.view(-1, self.num_kv_heads, self.head_dim)
         context.cache_manager.save_raw_kv_if_needed(layer_idx, raw_k, v)
-        q = self.q_norm(q).view(-1, self.num_heads, self.head_dim)
-        k = self.k_norm(k).view(-1, self.num_kv_heads, self.head_dim)
+        q, k = self.q_norm.forward_pair(q, k, self.k_norm)
+        q = q.view(-1, self.num_heads, self.head_dim)
+        k = k.view(-1, self.num_kv_heads, self.head_dim)
         q, k = apply_partial_rotary_emb(
             self.rotary_emb,
             positions,
@@ -346,7 +376,7 @@ class MiniMaxM2DecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
         hidden_states = self.self_attn(positions, hidden_states)
-        if self.parallel_context.ep_size > 1:
+        if self.parallel_context.tp_size == 1 and self.parallel_context.ep_size > 1:
             self.parallel_context.ep_broadcast(hidden_states, src_ep_rank=0)
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states,
@@ -436,6 +466,17 @@ class MiniMaxM2ForCausalLM(nn.Module):
             f"{global_expert_id}.{projection}.expert_weight"
         )
 
+    def resolve_special_weight(
+        self,
+        target_weight_name: str,
+    ) -> WeightTarget | None:
+        match = _EXPERT_TARGET_RE.match(target_weight_name)
+        if match is None:
+            return None
+        layer_idx, global_expert_id, projection = match.groups()
+        experts = self.model.layers[int(layer_idx)].block_sparse_moe.experts
+        return WeightTarget(experts, (int(global_expert_id), projection))
+
     def record_skipped_weight(
         self,
         source_weight_name: str,
@@ -476,14 +517,14 @@ class MiniMaxM2ForCausalLM(nn.Module):
                 f"{loaded_scale_dtype}."
             )
         expected_shape = (
-            (experts.hidden_size // 128, experts.intermediate_size // 128)
+            (experts.hidden_size // 128, experts.global_intermediate_size // 128)
             if projection == "w2"
-            else (experts.intermediate_size // 128, experts.hidden_size // 128)
+            else (experts.global_intermediate_size // 128, experts.hidden_size // 128)
         )
         expected_weight_shape = (
-            (experts.hidden_size, experts.intermediate_size)
+            (experts.hidden_size, experts.global_intermediate_size)
             if projection == "w2"
-            else (experts.intermediate_size, experts.hidden_size)
+            else (experts.global_intermediate_size, experts.hidden_size)
         )
         if loaded_weight_shape != expected_weight_shape:
             raise ValueError(
@@ -508,12 +549,12 @@ class MiniMaxM2ForCausalLM(nn.Module):
         loaded_weight: torch.Tensor,
         loaded_scale: torch.Tensor | None,
     ) -> int:
-        match = _EXPERT_TARGET_RE.match(target_weight_name)
-        if match is None:
+        target = self.resolve_special_weight(target_weight_name)
+        if target is None:
             return 0
-        layer_idx, global_expert_id, projection = match.groups()
-        self.model.layers[int(layer_idx)].block_sparse_moe.experts.load_expert_weight(
-            int(global_expert_id),
+        global_expert_id, projection = target.shard_id
+        target.module.load_expert_weight(
+            global_expert_id,
             projection,
             loaded_weight,
             loaded_scale,
@@ -575,9 +616,15 @@ class MiniMaxM2ForCausalLM(nn.Module):
                 f"weights={unexpected_skips[:4]}, scales={unexpected_scale_skips[:4]}."
             )
         logger.info(
-            "Loaded MiniMax M2 rank {} local experts [{}, {}) across {} layers; "
-            "intentionally skipped {} remote expert weight/scale pairs.",
+            "Loaded MiniMax M2 rank {} provider={} attention TP {}/{} MoE TP "
+            "{}/{} local experts [{}, {}) across {} layers; intentionally skipped "
+            "{} remote expert weight/scale pairs.",
             self.parallel_context.world_rank,
+            self.model.layers[0].block_sparse_moe.experts.provider.name,
+            self.parallel_context.tp_rank,
+            self.parallel_context.tp_size,
+            self.parallel_context.moe_tp_rank,
+            self.parallel_context.moe_tp_size,
             self.model.layers[0].block_sparse_moe.experts.local_expert_start,
             self.model.layers[0].block_sparse_moe.experts.local_expert_end,
             len(self.model.layers),

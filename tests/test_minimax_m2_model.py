@@ -53,6 +53,9 @@ class _ReferenceRMSNorm(torch.nn.Module):
         merged_output = merged.to(x.dtype)
         return _rmsnorm_reference(merged, self.weight, self.eps).to(x.dtype), merged_output
 
+    def forward_pair(self, x, other, other_norm):
+        return self(x), other_norm(other)
+
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("hidden_size", [1024, 3072, 6144])
@@ -134,6 +137,16 @@ def _ep_context(ep_rank: int, ep_size: int) -> ParallelContext:
     )
 
 
+def _tp_context(tp_rank: int, tp_size: int) -> ParallelContext:
+    ranks = tuple(range(tp_size))
+    return ParallelContext(
+        world=ParallelGroup(None, ranks, tp_rank, tp_size),
+        tensor=ParallelGroup(None, ranks, tp_rank, tp_size),
+        expert=ParallelGroup(None, (tp_rank,), 0, 1),
+        data=ParallelGroup(None, (tp_rank,), 0, 1),
+    )
+
+
 def _instantiate_model(config, context):
     with (
         patch(
@@ -158,6 +171,21 @@ def _instantiate_model(config, context):
 
 def _random_fp8(shape):
     return torch.randn(shape).clamp(-4.0, 4.0).to(torch.float8_e4m3fn)
+
+
+def test_packed_experts_own_rank_local_checkpoint_slices():
+    model = _instantiate_model(_config(), _tp_context(1, 2))
+    prefix = "model.layers.0.block_sparse_moe.experts.0."
+    gate_target = model.resolve_special_weight(prefix + "w1.expert_weight")
+    down_target = model.resolve_special_weight(prefix + "w2.expert_weight")
+
+    assert gate_target.module.rank_local_weight_slice(
+        (128, 128), loaded_shard_id=gate_target.shard_id
+    ) == (slice(0, 128), slice(None))
+    assert down_target.module.rank_local_weight_slice(
+        (128, 128), loaded_shard_id=down_target.shard_id
+    ) == (slice(None), slice(0, 128))
+    assert not hasattr(model, "rank_local_special_weight_slice")
 
 
 class _FixedProjection(torch.nn.Module):

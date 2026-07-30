@@ -3,6 +3,8 @@ import pytest
 from sparsevllm.method_registry import (
     MODEL_RUNTIME_COMPATIBILITY,
     QWEN3_MOE_EP_COMPATIBILITY,
+    QWEN3_MOE_TP_COMPATIBILITY,
+    QWEN3_MOE_TP_EP_COMPATIBILITY,
     validate_model_runtime_compatibility,
 )
 
@@ -82,9 +84,50 @@ def test_qwen3_moe_registry_rejects_conditional_and_out_of_scope_methods():
         _validate("deltakv")
 
 
-def test_qwen3_moe_registry_rejects_unvalidated_parallel_modes():
-    with pytest.raises(ValueError, match="requires TP=1 and DP=1"):
-        _validate(tensor_parallel_size=2)
+def test_qwen3_moe_registry_rejects_outer_tp_with_dp():
+    with pytest.raises(ValueError, match="requires DP=1"):
+        _validate(tensor_parallel_size=2, data_parallel_size=2)
+
+
+def test_qwen3_moe_registry_accepts_vanilla_pure_tp_modes():
+    for tp_size in (2, 4):
+        assert _validate(
+            tensor_parallel_size=tp_size,
+            expert_parallel_size=1,
+        ) is QWEN3_MOE_TP_COMPATIBILITY
+        assert _validate(
+            tensor_parallel_size=tp_size,
+            expert_parallel_size=1,
+            enforce_eager=False,
+            decode_cuda_graph=True,
+            enable_prefix_caching=True,
+        ) is QWEN3_MOE_TP_COMPATIBILITY
+
+
+@pytest.mark.parametrize(
+    "method",
+    sorted(QWEN3_MOE_TP_EP_COMPATIBILITY.decode_cuda_graph_methods),
+)
+@pytest.mark.parametrize("expert_parallel_size", [1, 2])
+def test_qwen3_moe_registry_accepts_tp_sparse_graph_modes(
+    method,
+    expert_parallel_size,
+):
+    assert _validate(
+        method,
+        tensor_parallel_size=4,
+        expert_parallel_size=expert_parallel_size,
+        enforce_eager=False,
+        decode_cuda_graph=True,
+    ) is QWEN3_MOE_TP_COMPATIBILITY
+
+
+def test_qwen3_moe_tp_sparse_methods_exclude_deltakv_and_skipkv():
+    assert "deltakv" not in QWEN3_MOE_TP_EP_COMPATIBILITY.sparse_methods
+    assert "skipkv" not in QWEN3_MOE_TP_EP_COMPATIBILITY.sparse_methods
+    for method in ("deltakv", "skipkv"):
+        with pytest.raises((ValueError, NotImplementedError)):
+            _validate(method, tensor_parallel_size=4, expert_parallel_size=2)
 
 
 @pytest.mark.parametrize(

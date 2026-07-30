@@ -81,6 +81,33 @@ def _ep_context(ep_rank: int, ep_size: int) -> ParallelContext:
     )
 
 
+def _tp_context(tp_rank: int, tp_size: int) -> ParallelContext:
+    ranks = tuple(range(tp_size))
+    return ParallelContext(
+        world=ParallelGroup(None, ranks, tp_rank, tp_size),
+        tensor=ParallelGroup(None, ranks, tp_rank, tp_size),
+        expert=ParallelGroup(None, (tp_rank,), 0, 1),
+        data=ParallelGroup(None, (tp_rank,), 0, 1),
+    )
+
+
+def _hybrid_context(world_rank: int) -> ParallelContext:
+    ranks = (0, 1, 2, 3)
+    moe_tp_ranks = (0, 1) if world_rank < 2 else (2, 3)
+    moe_ep_ranks = (0, 2) if world_rank % 2 == 0 else (1, 3)
+    return ParallelContext(
+        world=ParallelGroup(None, ranks, world_rank, 4),
+        tensor=ParallelGroup(None, ranks, world_rank, 4),
+        expert=ParallelGroup(
+            None, moe_ep_ranks, moe_ep_ranks.index(world_rank), 2
+        ),
+        data=ParallelGroup(None, (world_rank,), 0, 1),
+        moe_tensor=ParallelGroup(
+            None, moe_tp_ranks, moe_tp_ranks.index(world_rank), 2
+        ),
+    )
+
+
 def _instantiate_model(config, context):
     with ExitStack() as stack:
         stack.enter_context(
@@ -404,6 +431,159 @@ def test_packed_expert_weight_mapping():
         )
 
 
+@pytest.mark.parametrize("tp_size", [2, 4])
+def test_packed_expert_tp_shards_cover_each_projection_exactly(tp_size):
+    torch.manual_seed(31)
+    config = _config(moe_intermediate_size=8)
+    source_weights = {
+        projection: torch.randn(shape)
+        for projection, shape in {
+            "gate_proj": (8, config.hidden_size),
+            "up_proj": (8, config.hidden_size),
+            "down_proj": (config.hidden_size, 8),
+        }.items()
+    }
+    shards = []
+    for tp_rank in range(tp_size):
+        context = _tp_context(tp_rank, tp_size)
+        with (
+            patch(
+                "sparsevllm.models.qwen3_moe.get_parallel_context",
+                return_value=context,
+            ),
+            patch(
+                "sparsevllm.models.qwen3_moe.resolve_moe_provider",
+                return_value=TritonMoeProvider(),
+            ),
+        ):
+            experts = Qwen3MoePackedExperts(config)
+        for projection, weight in source_weights.items():
+            experts.load_expert_weight(0, projection, weight)
+        shards.append(experts)
+
+    assert all(experts.num_local_experts == config.num_experts for experts in shards)
+    local_intermediate_size = config.moe_intermediate_size // tp_size
+    assert all(
+        experts.intermediate_size == local_intermediate_size for experts in shards
+    )
+    assert torch.equal(
+        torch.cat(
+            [
+                experts.w13_weight[0, :local_intermediate_size]
+                for experts in shards
+            ]
+        ),
+        source_weights["gate_proj"],
+    )
+    assert torch.equal(
+        torch.cat(
+            [
+                experts.w13_weight[0, local_intermediate_size:]
+                for experts in shards
+            ]
+        ),
+        source_weights["up_proj"],
+    )
+    assert torch.equal(
+        torch.cat([experts.w2_weight[0] for experts in shards], dim=1),
+        source_weights["down_proj"],
+    )
+
+
+def test_packed_experts_own_rank_local_checkpoint_slices():
+    config = _config(
+        moe_intermediate_size=8,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=2,
+    )
+    model = _instantiate_model(config, _tp_context(1, 2))
+    prefix = "model.layers.0.mlp.experts.0."
+
+    gate_target = model.resolve_special_weight(prefix + "gate_proj.expert_weight")
+    up_target = model.resolve_special_weight(prefix + "up_proj.expert_weight")
+    down_target = model.resolve_special_weight(prefix + "down_proj.expert_weight")
+
+    assert gate_target.module.rank_local_weight_slice(
+        (8, 8), loaded_shard_id=gate_target.shard_id
+    ) == (slice(4, 8), slice(None))
+    assert up_target.module.rank_local_weight_slice(
+        (8, 8), loaded_shard_id=up_target.shard_id
+    ) == (slice(4, 8), slice(None))
+    assert down_target.module.rank_local_weight_slice(
+        (8, 8), loaded_shard_id=down_target.shard_id
+    ) == (slice(None), slice(4, 8))
+    assert not hasattr(model, "rank_local_special_weight_slice")
+
+
+def test_moe_block_reduces_hybrid_partial_output_over_outer_world():
+    config = _config(moe_intermediate_size=8)
+    context = _tp_context(0, 2)
+    with (
+        patch("sparsevllm.models.qwen3_moe.get_parallel_context", return_value=context),
+        patch(
+            "sparsevllm.models.qwen3_moe.resolve_moe_provider",
+            return_value=TritonMoeProvider(),
+        ),
+    ):
+        block = Qwen3MoeSparseMoeBlock(config)
+    hidden_states = torch.randn(3, config.hidden_size, dtype=torch.bfloat16)
+    local_output = torch.randn_like(hidden_states)
+
+    with (
+        patch.object(
+            block.gate,
+            "forward",
+            return_value=(
+                torch.empty(3, config.num_experts, dtype=torch.bfloat16),
+                torch.empty(3, config.num_experts_per_tok, dtype=torch.bfloat16),
+                torch.empty(3, config.num_experts_per_tok, dtype=torch.int64),
+            ),
+        ),
+        patch.object(block.experts, "forward", return_value=local_output),
+        patch.object(
+            ParallelContext,
+            "world_all_reduce",
+            return_value=local_output,
+        ) as reduce,
+    ):
+        output = block(hidden_states)
+
+    assert output is local_output
+    reduce.assert_called_once_with(local_output)
+
+
+def test_hybrid_expert_shards_cover_ep_and_moe_tp_dimensions():
+    config = _config(moe_intermediate_size=8)
+    source = torch.arange(64, dtype=torch.float32).reshape(8, 8)
+    shards = []
+    for world_rank in range(4):
+        with (
+            patch(
+                "sparsevllm.models.qwen3_moe.get_parallel_context",
+                return_value=_hybrid_context(world_rank),
+            ),
+            patch(
+                "sparsevllm.models.qwen3_moe.resolve_moe_provider",
+                return_value=TritonMoeProvider(),
+            ),
+        ):
+            experts = Qwen3MoePackedExperts(config)
+        experts.load_expert_weight(experts.local_expert_start, "gate_proj", source)
+        shards.append(experts)
+
+    assert [(item.local_expert_start, item.local_expert_end) for item in shards] == [
+        (0, 2),
+        (0, 2),
+        (2, 4),
+        (2, 4),
+    ]
+    assert torch.equal(shards[0].w13_weight[0, :4], source[:4])
+    assert torch.equal(shards[1].w13_weight[0, :4], source[4:])
+    assert torch.equal(shards[2].w13_weight[0, :4], source[:4])
+    assert torch.equal(shards[3].w13_weight[0, :4], source[4:])
+
+
 def test_packed_fp8_expert_weight_and_scale_mapping():
     torch.manual_seed(2)
     config = _fp8_config()
@@ -667,6 +847,65 @@ def test_checkpoint_loader_loads_local_experts_and_skips_remote(tmp_path):
     assert torch.equal(experts.w13_weight[0, config.moe_intermediate_size :], local_sources[(2, "up_proj")])
     assert torch.equal(experts.w2_weight[1], local_sources[(3, "down_proj")])
     assert len(target._intentionally_skipped_expert_weights) == 6
+
+
+def test_checkpoint_loader_reads_tp_local_expert_projection_shards(tmp_path):
+    torch.manual_seed(41)
+    config = _config(
+        moe_intermediate_size=8,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=2,
+    )
+    source_model = _instantiate_model(config, _ep_context(0, 1))
+    checkpoint = {}
+    for name, parameter in source_model.named_parameters():
+        if name.endswith(".mlp.experts.w13_weight") or name.endswith(
+            ".mlp.experts.w2_weight"
+        ):
+            continue
+        value = torch.randn(parameter.shape, dtype=parameter.dtype)
+        if name.endswith(".self_attn.qkv_proj.weight"):
+            prefix = name[: -len("qkv_proj.weight")]
+            q_size = config.num_attention_heads * config.head_dim
+            kv_size = config.num_key_value_heads * config.head_dim
+            checkpoint[prefix + "q_proj.weight"] = value[:q_size].clone()
+            checkpoint[prefix + "k_proj.weight"] = value[
+                q_size : q_size + kv_size
+            ].clone()
+            checkpoint[prefix + "v_proj.weight"] = value[q_size + kv_size :].clone()
+        else:
+            checkpoint[name] = value
+
+    source_experts = {}
+    for expert_id in range(config.num_experts):
+        for projection, shape in {
+            "gate_proj": (8, config.hidden_size),
+            "up_proj": (8, config.hidden_size),
+            "down_proj": (config.hidden_size, 8),
+        }.items():
+            name = f"model.layers.0.mlp.experts.{expert_id}.{projection}.weight"
+            checkpoint[name] = torch.randn(shape)
+            source_experts[(expert_id, projection)] = checkpoint[name]
+    save_file(checkpoint, tmp_path / "model.safetensors")
+
+    target = _instantiate_model(config, _tp_context(1, 2))
+    load_model(target, str(tmp_path), tp_rank=1, tp_size=2)
+
+    experts = target.model.layers[0].mlp.experts
+    for expert_id in range(config.num_experts):
+        assert torch.equal(
+            experts.w13_weight[expert_id, :4],
+            source_experts[(expert_id, "gate_proj")][4:8],
+        )
+        assert torch.equal(
+            experts.w13_weight[expert_id, 4:],
+            source_experts[(expert_id, "up_proj")][4:8],
+        )
+        assert torch.equal(
+            experts.w2_weight[expert_id],
+            source_experts[(expert_id, "down_proj")][:, 4:8],
+        )
 
 
 def test_checkpoint_loader_loads_local_fp8_experts_and_scales(tmp_path):

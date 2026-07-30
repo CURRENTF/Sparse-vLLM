@@ -133,6 +133,7 @@ class ModelRunner:
             tp_size=config.tensor_parallel_size,
             ep_size=config.expert_parallel_size,
             dp_size=config.data_parallel_size,
+            hybrid_moe=config.uses_outer_tp_moe_layout,
         )
 
         # CUDA allocator peaks are process-global and survive LLMEngine.exit().

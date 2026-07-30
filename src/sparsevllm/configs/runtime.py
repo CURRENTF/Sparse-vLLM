@@ -83,7 +83,30 @@ class Config(
     num_kvcache_slots: int | list = -1
 
     @property
+    def uses_outer_tp_moe_layout(self) -> bool:
+        model_type = str(getattr(self.hf_config, "model_type", "") or "")
+        return model_type in {"qwen3_moe", "minimax_m2"} and int(
+            self.tensor_parallel_size
+        ) > 1
+
+    @property
+    def attention_tensor_parallel_size(self) -> int:
+        return int(self.tensor_parallel_size)
+
+    @property
+    def moe_expert_parallel_size(self) -> int:
+        return int(self.expert_parallel_size)
+
+    @property
+    def moe_tensor_parallel_size(self) -> int:
+        if self.uses_outer_tp_moe_layout:
+            return int(self.tensor_parallel_size) // int(self.expert_parallel_size)
+        return int(self.tensor_parallel_size)
+
+    @property
     def world_size(self) -> int:
+        if self.uses_outer_tp_moe_layout:
+            return int(self.tensor_parallel_size) * int(self.data_parallel_size)
         return (
             int(self.tensor_parallel_size)
             * int(self.expert_parallel_size)

@@ -6,6 +6,7 @@ from sparsevllm.operators.fp8_linear import resolve_fp8_linear_provider
 from sparsevllm.quantization.fp8 import fp8_blockwise_linear_reference
 from sparsevllm.triton_kernel.fp8_blockwise import fp8_blockwise_matmul
 from sparsevllm.triton_kernel.moe import fused_moe_fp8
+from sparsevllm.triton_kernel.minimax_m2_moe import fused_minimax_m2_moe_fp8
 
 
 pytestmark = pytest.mark.skipif(
@@ -149,8 +150,18 @@ def test_fp8_moe_matches_reference(gate_up_order):
     )
     w13_weight = _fp8_weight((experts, 2 * intermediate, hidden), device)
     w2_weight = _fp8_weight((experts, hidden, intermediate), device)
-    w13_scale = torch.rand(experts, 2, 1, device=device) + 0.25
-    w2_scale = torch.rand(experts, 1, 1, device=device) + 0.25
+    w13_scale = torch.rand(
+        experts,
+        2 * intermediate // 128,
+        hidden // 128,
+        device=device,
+    ) + 0.25
+    w2_scale = torch.rand(
+        experts,
+        hidden // 128,
+        intermediate // 128,
+        device=device,
+    ) + 0.25
     topk_ids = torch.stack(
         [torch.randperm(experts, device=device)[:top_k] for _ in range(tokens)]
     ).to(torch.int32)
@@ -186,3 +197,49 @@ def test_fp8_moe_matches_reference(gate_up_order):
     )
 
     torch.testing.assert_close(actual, expected, rtol=4.0e-2, atol=5.0)
+
+
+@pytest.mark.parametrize(
+    ("hidden", "intermediate"),
+    [(128, 128), (3072, 384)],
+)
+def test_minimax_fused_gate_up_matches_generic_fp8_pipeline(hidden, intermediate):
+    torch.manual_seed(71)
+    device = torch.device("cuda")
+    tokens, experts, top_k = 4, 4, 2
+    hidden_states = torch.randn(tokens, hidden, device=device, dtype=torch.bfloat16)
+    w13_weight = _fp8_weight((experts, 2 * intermediate, hidden), device)
+    w2_weight = _fp8_weight((experts, hidden, intermediate), device)
+    w13_scale = torch.rand(
+        experts,
+        2 * intermediate // 128,
+        hidden // 128,
+        device=device,
+    ) + 0.25
+    w2_scale = torch.rand(
+        experts,
+        hidden // 128,
+        intermediate // 128,
+        device=device,
+    ) + 0.25
+    topk_ids = torch.stack(
+        [torch.randperm(experts, device=device)[:top_k] for _ in range(tokens)]
+    ).to(torch.int32)
+    topk_weights = torch.rand(tokens, top_k, device=device, dtype=torch.float32)
+    topk_weights /= topk_weights.sum(dim=-1, keepdim=True)
+    arguments = (
+        hidden_states,
+        w13_weight,
+        w2_weight,
+        w13_scale,
+        w2_scale,
+        topk_ids,
+        topk_weights,
+    )
+    kwargs = {"num_experts": experts, "local_expert_start": 0}
+
+    expected = fused_moe_fp8(*arguments, **kwargs, gate_up_order="gate_up")
+    actual = fused_minimax_m2_moe_fp8(*arguments, **kwargs)
+    torch.cuda.synchronize()
+
+    assert torch.equal(actual, expected)

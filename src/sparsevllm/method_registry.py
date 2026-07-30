@@ -108,6 +108,38 @@ QWEN3_MOE_EP_COMPATIBILITY = ModelRuntimeCompatibility(
     ),
 )
 
+QWEN3_MOE_TP_EP_COMPATIBILITY = ModelRuntimeCompatibility(
+    parallel_mode="outer_tp_moe_tp_ep",
+    sparse_methods=frozenset(
+        {
+            "",
+            "streamingllm",
+            "snapkv",
+            "h2o",
+            "pyramidkv",
+            "omnikv",
+            "quest",
+            "rkv",
+        }
+    ),
+    prefix_cache_methods=frozenset({""}),
+    requires_eager=False,
+    decode_cuda_graph_methods=frozenset(
+        {
+            "",
+            "streamingllm",
+            "snapkv",
+            "h2o",
+            "pyramidkv",
+            "omnikv",
+            "quest",
+            "rkv",
+        }
+    ),
+)
+
+QWEN3_MOE_TP_COMPATIBILITY = QWEN3_MOE_TP_EP_COMPATIBILITY
+
 MINIMAX_M2_EP_COMPATIBILITY = ModelRuntimeCompatibility(
     parallel_mode="ep_replicated_kv",
     sparse_methods=frozenset(
@@ -136,6 +168,14 @@ MINIMAX_M2_EP_COMPATIBILITY = ModelRuntimeCompatibility(
             "rkv",
         }
     ),
+)
+
+MINIMAX_M2_TP_EP_COMPATIBILITY = ModelRuntimeCompatibility(
+    parallel_mode="outer_tp_moe_tp_ep",
+    sparse_methods=MINIMAX_M2_EP_COMPATIBILITY.sparse_methods,
+    prefix_cache_methods=MINIMAX_M2_EP_COMPATIBILITY.prefix_cache_methods,
+    requires_eager=False,
+    decode_cuda_graph_methods=MINIMAX_M2_EP_COMPATIBILITY.decode_cuda_graph_methods,
 )
 
 MODEL_RUNTIME_COMPATIBILITY = {
@@ -222,12 +262,26 @@ def validate_model_runtime_compatibility(
         return None
 
     method = normalize_sparse_method(sparse_method)
-    if int(tensor_parallel_size) != 1 or int(data_parallel_size) != 1:
+    tp_size = int(tensor_parallel_size)
+    ep_size = int(expert_parallel_size)
+    dp_size = int(data_parallel_size)
+    if model_type in {"qwen3_moe", "minimax_m2"} and tp_size > 1:
+        compatibility = (
+            QWEN3_MOE_TP_EP_COMPATIBILITY
+            if model_type == "qwen3_moe"
+            else MINIMAX_M2_TP_EP_COMPATIBILITY
+        )
+        if dp_size != 1:
+            raise ValueError(
+                f"{model_type} outer_tp_moe_tp_ep requires DP=1, got "
+                f"TP={tp_size}, EP={ep_size}, DP={dp_size}."
+            )
+    elif tp_size != 1 or dp_size != 1:
         raise ValueError(
             f"{model_type} {compatibility.parallel_mode} requires TP=1 and DP=1, got "
             f"TP={tensor_parallel_size}, EP={expert_parallel_size}, DP={data_parallel_size}."
         )
-    if int(expert_parallel_size) <= 0:
+    if ep_size <= 0:
         raise ValueError(
             f"{model_type} requires a positive expert_parallel_size, got {expert_parallel_size}."
         )

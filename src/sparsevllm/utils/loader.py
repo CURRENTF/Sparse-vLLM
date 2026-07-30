@@ -12,6 +12,7 @@ from torch import nn
 from tqdm.auto import tqdm
 
 from sparsevllm.utils.log import logger
+from sparsevllm.utils.weight_target import WeightTarget
 
 
 def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
@@ -30,6 +31,40 @@ class SafetensorsShard:
     tensors: dict[str, torch.Tensor]
 
 
+def _resolve_weight_target(
+    model: nn.Module,
+    target_parameter_name: str,
+) -> WeightTarget | None:
+    special_loader = getattr(model, "load_special_weight", None)
+    special_suffixes = tuple(getattr(model, "special_weight_loaders", ()))
+    if callable(special_loader) and target_parameter_name.endswith(special_suffixes):
+        resolver = getattr(model, "resolve_special_weight", None)
+        if not callable(resolver):
+            return None
+        target = resolver(target_parameter_name)
+        if target is None:
+            return None
+        if not isinstance(target, WeightTarget):
+            raise TypeError(
+                "resolve_special_weight() must return WeightTarget or None, "
+                f"got {type(target).__name__}."
+            )
+        return target
+
+    loaded_shard_id = None
+    packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
+    for source_fragment, (target_fragment, shard_id) in packed_modules_mapping.items():
+        if source_fragment in target_parameter_name:
+            target_parameter_name = target_parameter_name.replace(
+                source_fragment, target_fragment
+            )
+            loaded_shard_id = shard_id
+            break
+
+    module = _module_for_parameter(model, target_parameter_name)
+    return WeightTarget(module, loaded_shard_id)
+
+
 def _rank_local_slice_for_tensor(
     model: nn.Module,
     source_weight_name: str,
@@ -46,29 +81,15 @@ def _rank_local_slice_for_tensor(
     )
     if target_parameter_name is None:
         return None
-
-    special_loader = getattr(model, "load_special_weight", None)
-    special_suffixes = tuple(getattr(model, "special_weight_loaders", ()))
-    if callable(special_loader) and target_parameter_name.endswith(special_suffixes):
+    target = _resolve_weight_target(model, target_parameter_name)
+    if target is None:
         return None
-
-    loaded_shard_id = None
-    packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
-    for source_fragment, (target_fragment, shard_id) in packed_modules_mapping.items():
-        if source_fragment in target_parameter_name:
-            target_parameter_name = target_parameter_name.replace(
-                source_fragment, target_fragment
-            )
-            loaded_shard_id = shard_id
-            break
-
-    module = _module_for_parameter(model, target_parameter_name)
-    slicer = getattr(module, "rank_local_weight_slice", None)
+    slicer = getattr(target.module, "rank_local_weight_slice", None)
     if not callable(slicer):
         return None
     return slicer(
         source_shape,
-        loaded_shard_id=loaded_shard_id,
+        loaded_shard_id=target.shard_id,
         is_scale=is_scale,
     )
 
