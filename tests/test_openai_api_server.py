@@ -1064,6 +1064,57 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(prompt, "user: hello\nassistant:")
 
+    def test_chat_append_prompt_renders_only_new_suffix(self):
+        from sparsevllm.entrypoints.openai.render import (
+            _chat_request_append_prompt,
+        )
+        from sparsevllm.entrypoints.openai.protocol.chat import (
+            ChatCompletionRequest,
+        )
+
+        class Tokenizer:
+            chat_template = "template"
+
+            def apply_chat_template(
+                self,
+                chat,
+                *,
+                tokenize,
+                add_generation_prompt,
+                **_kwargs,
+            ):
+                self.assertFalse(tokenize)
+                rendered = "".join(
+                    f"<{message['role']}>{message.get('content') or ''}</{message['role']}>"
+                    for message in chat
+                )
+                if add_generation_prompt:
+                    rendered += "<assistant>"
+                return rendered
+
+            def assertFalse(self, value):
+                if value:
+                    raise AssertionError(value)
+
+        request = ChatCompletionRequest(
+            model="m",
+            chain_id="chain-a",
+            chain_append_start=2,
+            messages=[
+                {"role": "user", "content": "question"},
+                {"role": "assistant", "content": "answer"},
+                {
+                    "role": "tool",
+                    "tool_call_id": "call-a",
+                    "content": "result",
+                },
+            ],
+        )
+
+        assert _chat_request_append_prompt(Tokenizer(), request) == (
+            "<tool>result</tool><assistant>"
+        )
+
     def test_chat_prompt_maps_developer_and_text_parts_for_templates(self):
         from sparsevllm.entrypoints.openai.api_server import ChatMessage, _chat_prompt
 
@@ -3049,10 +3100,10 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
             "text": "hello",
             "finish_reason": "stop",
             "prompt_tokens": 6,
-            "completion_tokens": 1,
-            "token_ids": [1],
-            "token_logprobs": [None],
-            "top_logprobs": [None],
+            "completion_tokens": 3,
+            "token_ids": [1, 2, 3],
+            "token_logprobs": [None, None, None],
+            "top_logprobs": [None, None, None],
             "chain_id": "chain-1",
             "chain_status": "resumed",
             "reused_tokens": 4,
@@ -3903,6 +3954,46 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(message["tool_calls"][0]["function"]["arguments"], '{"city":"Paris"}')
         self.assertEqual(choice["finish_reason"], "tool_calls")
 
+    async def test_chat_completion_preserves_content_before_tool_calls(self):
+        from sparsevllm.entrypoints.openai.api_server import RequestHandle, _chat_completion_response
+
+        raw_text = (
+            "THOUGHT: I should inspect the repository first.\n"
+            '<tool_call>{"name":"bash","arguments":{"command":"ls -la"}}</tool_call>'
+        )
+        queue = asyncio.Queue()
+        await queue.put(
+            {
+                "type": "final",
+                "index": 0,
+                "text": raw_text,
+                "raw_text": raw_text,
+                "finish_reason": "stop",
+                "prompt_tokens": 4,
+                "completion_tokens": 5,
+                "token_ids": [1, 2, 3, 4, 5],
+                "token_logprobs": [None] * 5,
+                "top_logprobs": [None] * 5,
+            }
+        )
+
+        response = await _chat_completion_response(
+            "chatcmpl-test",
+            123,
+            "model",
+            [RequestHandle(output_queue=queue, cancelled=threading.Event())],
+            parse_tools=True,
+            response_parser=_transformers_response_parser(),
+        )
+
+        choice = response["choices"][0]
+        self.assertEqual(
+            choice["message"]["content"],
+            "THOUGHT: I should inspect the repository first.",
+        )
+        self.assertEqual(choice["message"]["tool_calls"][0]["function"]["name"], "bash")
+        self.assertEqual(choice["finish_reason"], "tool_calls")
+
     async def test_chat_completion_parses_multiple_tool_calls(self):
         from sparsevllm.entrypoints.openai.api_server import RequestHandle, _chat_completion_response
 
@@ -4014,8 +4105,6 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(choice["finish_reason"], "length")
 
     async def test_chat_completion_transformers_controls_parse_outcomes(self):
-        from fastapi import HTTPException
-
         from sparsevllm.entrypoints.openai.api_server import RequestHandle, _chat_completion_response
 
         async def parse(text, *, reasoning_parser_name=None, parse_tools=False):
@@ -4048,8 +4137,61 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response["choices"][0]["message"]["reasoning_content"], "partial")
         self.assertEqual(response["choices"][0]["finish_reason"], "stop")
 
-        with self.assertRaisesRegex(HTTPException, "could not parse region as JSON"):
-            await parse('<tool_call>{"name":</tool_call>', parse_tools=True)
+        malformed = '<tool_call>{"name":</tool_call>'
+        response = await parse(malformed, parse_tools=True)
+        choice = response["choices"][0]
+        self.assertEqual(choice["message"]["content"], malformed)
+        self.assertNotIn("tool_calls", choice["message"])
+        self.assertEqual(choice["finish_reason"], "stop")
+
+    async def test_chat_completion_does_not_mask_parser_contract_errors(self):
+        from fastapi import HTTPException
+
+        from sparsevllm.entrypoints.openai.api_server import (
+            RequestHandle,
+            _chat_completion_response,
+        )
+        from sparsevllm.entrypoints.openai.serving.response_parsing import (
+            ResponseParseError,
+        )
+
+        class BrokenParser:
+            def parse(self, *_args, **_kwargs):
+                raise ResponseParseError("unexpected parsed response schema")
+
+        queue = asyncio.Queue()
+        await queue.put(
+            {
+                "type": "final",
+                "index": 0,
+                "text": "output",
+                "raw_text": "output",
+                "finish_reason": "stop",
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+                "token_ids": [1],
+                "token_logprobs": [None],
+                "top_logprobs": [None],
+            }
+        )
+
+        with self.assertRaises(HTTPException) as raised:
+            await _chat_completion_response(
+                "chatcmpl-test",
+                123,
+                "model",
+                [
+                    RequestHandle(
+                        output_queue=queue,
+                        cancelled=threading.Event(),
+                    )
+                ],
+                parse_tools=True,
+                response_parser=BrokenParser(),
+            )
+
+        self.assertEqual(raised.exception.status_code, 500)
+        self.assertIn("unexpected parsed response schema", raised.exception.detail)
 
     def test_chat_logprobs_reject_parsed_outputs(self):
         from fastapi import HTTPException
@@ -5223,6 +5365,28 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(output[0]["name"], "get_weather")
         self.assertEqual(output[0]["arguments"], '{"city":"Paris"}')
 
+    def test_qwen_nonthinking_tool_call_parser_is_available(self):
+        from sparsevllm.entrypoints.openai.serving.response_parsing import (
+            TransformersResponseParser,
+        )
+
+        tokenizer = _TransformersResponseTokenizer()
+        tokenizer.chat_template = "<tool_call>"
+        parser = TransformersResponseParser.from_tokenizer(tokenizer)
+
+        self.assertIsNotNone(parser)
+        parsed = parser.parse(
+            '<tool_call>{"name":"get_weather","arguments":{"city":"Paris"}}</tool_call>',
+            prefix="",
+            parse_tools=True,
+        )
+        self.assertEqual(parsed.reasoning_content, None)
+        self.assertEqual(parsed.content, "")
+        self.assertEqual(parsed.tool_calls[0]["function"], {
+            "name": "get_weather",
+            "arguments": '{"city":"Paris"}',
+        })
+
     def test_transformers_decides_xml_tool_delimiter_handling(self):
         parsed = _transformers_response_parser(xml_tools=True).parse(
             "reason</think>\n\n"
@@ -5304,9 +5468,9 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any(delta.get("content") for delta in deltas))
 
     def test_malformed_tool_call_json_fails_fast(self):
-        from sparsevllm.entrypoints.openai.serving.response_parsing import ResponseParseError
+        from sparsevllm.entrypoints.openai.serving.response_parsing import ModelOutputParseError
 
-        with self.assertRaises(ResponseParseError):
+        with self.assertRaises(ModelOutputParseError):
             _transformers_response_parser().parse(
                 '<tool_call>{"name":</tool_call>',
                 prefix="",

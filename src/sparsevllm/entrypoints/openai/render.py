@@ -151,6 +151,52 @@ def _chat_request_prompt(tokenizer: Any, request: ChatCompletionRequest) -> str:
     )
 
 
+def _chat_request_append_prompt(
+    tokenizer: Any,
+    request: ChatCompletionRequest,
+) -> str:
+    append_start = request.chain_append_start
+    if append_start is None:
+        raise ValueError("chain_append_start is required for append rendering.")
+    if append_start >= len(request.messages):
+        raise ValueError(
+            "chain_append_start must point to at least one new message."
+        )
+    previous_response = request.messages[append_start - 1]
+    if previous_response.role != "assistant":
+        raise ValueError(
+            "The message before chain_append_start must be an assistant "
+            "response."
+        )
+    context = [
+        ChatMessage(role="user", content="chain append context"),
+        previous_response,
+    ]
+    kwargs = resolve_chat_template_kwargs(request)
+    prefix = _chat_prompt(
+        tokenizer,
+        context,
+        kwargs,
+        tools=None,
+        add_generation_prompt=False,
+    )
+    combined = _chat_prompt(
+        tokenizer,
+        [*context, *request.messages[append_start:]],
+        kwargs,
+        tools=None,
+        add_generation_prompt=True,
+    )
+    if not combined.startswith(prefix):
+        raise ValueError(
+            "Chat template cannot render a stable chain append suffix."
+        )
+    suffix = combined[len(prefix):]
+    if not suffix:
+        raise ValueError("Chat template rendered an empty chain append suffix.")
+    return suffix
+
+
 def resolve_response_chat_template_kwargs(request: ResponseRequest) -> dict[str, Any] | None:
     kwargs = validate_chat_template_kwargs(request.chat_template_kwargs) or {}
     effort = request.reasoning.effort if request.reasoning is not None else None
@@ -169,6 +215,8 @@ def _chat_prompt(
     messages: list[ChatMessage],
     chat_template_kwargs: dict[str, Any] | None = None,
     tools: list[dict[str, Any]] | None = None,
+    *,
+    add_generation_prompt: bool = True,
 ) -> str:
     chat = []
     for message in messages:
@@ -186,7 +234,7 @@ def _chat_prompt(
     if getattr(tokenizer, "chat_template", None) and hasattr(tokenizer, "apply_chat_template"):
         kwargs = {
             "tokenize": False,
-            "add_generation_prompt": True,
+            "add_generation_prompt": bool(add_generation_prompt),
         }
         kwargs.update(chat_template_kwargs or {})
         if tools:
@@ -206,7 +254,8 @@ def _chat_prompt(
     rendered = []
     for message in chat:
         rendered.append(f"{message['role']}: {message['content'] or ''}")
-    rendered.append("assistant:")
+    if add_generation_prompt:
+        rendered.append("assistant:")
     return "\n".join(rendered)
 
 

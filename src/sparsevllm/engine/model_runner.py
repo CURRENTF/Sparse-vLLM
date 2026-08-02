@@ -82,6 +82,8 @@ TP_RPC_STATUS_SYNC_METHODS = PREFIX_CACHE_CONTROL_RPC_METHODS | {
     "refresh_prefix_cache_hit",
     "reset_after_warmup",
     "run",
+    "set_warmup_fake_prefill_attention",
+    "warmup_moe_workspace",
 }
 
 
@@ -565,6 +567,70 @@ class ModelRunner:
         if os.getenv("SPARSEVLLM_DELTAKV_CLEAR_ATTN_SCORE_BUFFERS_AFTER_WARMUP", "0") == "1":
             self.sparse_controller.clear_decode_attn_score_buffers()
 
+    def warmup_moe_workspace(self, num_tokens: int) -> None:
+        warmup_moe = getattr(self.model, "warmup_moe", None)
+        if not callable(warmup_moe):
+            raise RuntimeError(
+                f"Model {type(self.model).__name__} does not provide warmup_moe()."
+            )
+        warmup_moe(num_tokens=int(num_tokens))
+
+    def set_warmup_fake_prefill_attention(
+        self,
+        enabled: bool,
+        real_probe_min_context_tokens: int | None = None,
+    ) -> None:
+        env_keys = (
+            "SPARSEVLLM_ALLOW_FAKE_ATTENTION",
+            "SPARSEVLLM_FAKE_PREFILL_ATTENTION",
+            "SPARSEVLLM_FAKE_ATTENTION_MODE",
+            "SPARSEVLLM_WARMUP_REAL_PREFILL_MIN_CONTEXT_TOKENS",
+        )
+        saved = getattr(self, "_warmup_fake_prefill_saved_env", None)
+        if enabled:
+            if saved is not None:
+                raise RuntimeError("Warmup fake prefill attention is already enabled.")
+            if real_probe_min_context_tokens is not None:
+                real_probe_min_context_tokens = int(real_probe_min_context_tokens)
+                if real_probe_min_context_tokens <= 0:
+                    raise ValueError(
+                        "real_probe_min_context_tokens must be positive, got "
+                        f"{real_probe_min_context_tokens}."
+                    )
+            self._warmup_fake_prefill_saved_env = {
+                key: os.environ.get(key) for key in env_keys
+            }
+            os.environ["SPARSEVLLM_ALLOW_FAKE_ATTENTION"] = "1"
+            os.environ["SPARSEVLLM_FAKE_PREFILL_ATTENTION"] = "1"
+            os.environ["SPARSEVLLM_FAKE_ATTENTION_MODE"] = "copy"
+            if real_probe_min_context_tokens is None:
+                os.environ.pop(
+                    "SPARSEVLLM_WARMUP_REAL_PREFILL_MIN_CONTEXT_TOKENS",
+                    None,
+                )
+            else:
+                os.environ[
+                    "SPARSEVLLM_WARMUP_REAL_PREFILL_MIN_CONTEXT_TOKENS"
+                ] = str(real_probe_min_context_tokens)
+            logger.info("Warmup fake prefill attention enabled (mode=copy).")
+            if real_probe_min_context_tokens is not None:
+                logger.info(
+                    "Warmup will run real prefill attention when context reaches "
+                    "{} tokens.",
+                    real_probe_min_context_tokens,
+                )
+            return
+
+        if saved is None:
+            raise RuntimeError("Warmup fake prefill attention is not enabled.")
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        self._warmup_fake_prefill_saved_env = None
+        logger.info("Warmup fake prefill attention disabled; environment restored.")
+
     def free_slots(self, seq_id: int):
         """通知 CacheManager 释放该序列占用的物理显存位子"""
         with profiler.record("model_free_slots"):
@@ -981,14 +1047,79 @@ class ModelRunner:
 
     def _auto_capture_greedy_sampling(self, seqs: list[Sequence]) -> bool:
         if self.config.decode_cuda_graph_capture_sampling:
-            return True
+            return all(bool(getattr(seq, "should_publish_sample", True)) for seq in seqs)
         if self.config.tensor_parallel_size != 1:
             return False
         if self.config.enable_prefix_caching:
             return False
         if str(self.config.vllm_sparse_method or "") not in {"", "omnikv"}:
             return False
-        return all(seq.temperature <= 1e-10 for seq in seqs)
+        return all(
+            bool(getattr(seq, "should_publish_sample", True))
+            and seq.temperature <= 1e-10
+            for seq in seqs
+        )
+
+    def _sample_model_outputs(
+        self,
+        logits: torch.Tensor,
+        seqs: list[Sequence],
+        graph_token_ids: torch.Tensor | None = None,
+    ) -> list[int]:
+        """Sample only outputs that belong to live generation.
+
+        Recompute replay forwards rebuild KV for already accepted tokens. Their
+        logits must neither advance the sampling RNG nor escape to serving.
+        """
+        publish_indices = [
+            idx
+            for idx, seq in enumerate(seqs)
+            if bool(getattr(seq, "should_publish_sample", True))
+        ]
+        token_ids = [0] * len(seqs)
+        if not publish_indices:
+            return token_ids
+        if graph_token_ids is not None:
+            if len(publish_indices) != len(seqs):
+                raise RuntimeError(
+                    "CUDA graph sampling cannot mix recompute replay and live outputs."
+                )
+            return [int(token_id) for token_id in graph_token_ids.tolist()]
+
+        publish_seqs = [seqs[idx] for idx in publish_indices]
+        publish_logits = logits[publish_indices]
+        all_greedy = all(seq.temperature <= 1e-10 for seq in publish_seqs)
+        temperatures = None
+        top_ps = None
+        top_ks = None
+        if not all_greedy:
+            temperatures, top_ps, top_ks = self.prepare_sample(publish_seqs)
+        sampled = self.sampler(
+            publish_logits,
+            temperatures,
+            top_ps,
+            top_ks,
+            all_greedy=all_greedy,
+        ).tolist()
+        for idx, token_id in zip(publish_indices, sampled):
+            token_ids[idx] = int(token_id)
+        return token_ids
+
+    @staticmethod
+    def _mask_recompute_logprobs(
+        seqs: list[Sequence],
+        outputs: tuple[list[float | None], list[dict[int, float] | None]] | None,
+    ):
+        if outputs is None:
+            return None
+        token_logprobs, top_logprobs = outputs
+        if token_logprobs is None or top_logprobs is None:
+            return outputs
+        for idx, seq in enumerate(seqs):
+            if not bool(getattr(seq, "should_publish_sample", True)):
+                token_logprobs[idx] = None
+                top_logprobs[idx] = None
+        return token_logprobs, top_logprobs
 
     def set_decode_cuda_graph_max_context_len_override(self, max_context_len: int | None):
         self.decode_cuda_graph_runner.set_max_context_len_override(max_context_len)
@@ -1089,23 +1220,15 @@ class ModelRunner:
                         return None, None
                     self._post_sparse_forward(seqs, is_prefill)
                     with profiler.record("model_sampler"):
-                        if graph_token_ids is not None:
-                            token_ids = graph_token_ids.tolist()
-                        else:
-                            all_greedy = all(seq.temperature <= 1e-10 for seq in seqs)
-                            temperatures = None
-                            top_ps = None
-                            top_ks = None
-                            if not all_greedy:
-                                temperatures, top_ps, top_ks = self.prepare_sample(seqs)
-                            token_ids = self.sampler(
-                                logits,
-                                temperatures,
-                                top_ps,
-                                top_ks,
-                                all_greedy=all_greedy,
-                            ).tolist()
-                    logprob_outputs = self._collect_logprobs(logits, token_ids, seqs)
+                        token_ids = self._sample_model_outputs(
+                            logits,
+                            seqs,
+                            graph_token_ids=graph_token_ids,
+                        )
+                    logprob_outputs = self._mask_recompute_logprobs(
+                        seqs,
+                        self._collect_logprobs(logits, token_ids, seqs),
+                    )
                     return token_ids, logprob_outputs
                 finally:
                     reset_context()
@@ -1119,20 +1242,24 @@ class ModelRunner:
                 ctx.sparse_controller = self.sparse_controller
                 self.sparse_controller.prepare_forward(seqs, is_prefill)
             
-            all_greedy = all(seq.temperature <= 1e-10 for seq in seqs) if self.rank == 0 else False
-            temperatures = None
-            top_ps = None
-            top_ks = None
-            if self.rank == 0 and not all_greedy:
-                temperatures, top_ps, top_ks = self.prepare_sample(seqs)
-            
             # 3. 前向计算
             logits = self.run_model(input_ids, positions, is_prefill)
             
             # 4. Token 采样 (仅 Rank 0)
             with profiler.record("model_sampler"):
-                token_ids = self.sampler(logits, temperatures, top_ps, top_ks, all_greedy=all_greedy).tolist() if self.rank == 0 else None
-            logprob_outputs = self._collect_logprobs(logits, token_ids, seqs) if self.rank == 0 else None
+                token_ids = (
+                    self._sample_model_outputs(logits, seqs)
+                    if self.rank == 0
+                    else None
+                )
+            logprob_outputs = (
+                self._mask_recompute_logprobs(
+                    seqs,
+                    self._collect_logprobs(logits, token_ids, seqs),
+                )
+                if self.rank == 0
+                else None
+            )
 
             # 5. 后置稀疏处理 (如 SnapKV 驱逐)
             self._post_sparse_forward(seqs, is_prefill)

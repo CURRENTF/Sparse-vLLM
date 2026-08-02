@@ -166,8 +166,8 @@ class SkipKVActivationController(ActivationController):
         alpha_limit = float(getattr(self.config, "skipkv_steering_alpha_max", 0.0) or 0.0)
         values: list[float] = []
         for seq in seqs:
-            token_id = int(seq.last_token) if seq.last_token is not None else -1
-            if int(seq.num_tokens) <= int(seq.num_prompt_tokens) or token_id not in self._delimiter_token_ids:
+            token_id = seq.decode_input_token
+            if seq.decode_input_position < int(seq.num_prompt_tokens) or token_id not in self._delimiter_token_ids:
                 values.append(0.0)
                 continue
             getter = getattr(self.cache_manager, "skipkv_non_execution_count", None)

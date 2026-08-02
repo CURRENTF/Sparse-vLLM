@@ -1944,8 +1944,8 @@ class DeltaKVCacheManager(CacheManager):
     def _prepare_decode(self, seqs: list[Sequence]):
         with profiler.record("cache_prepare_decode"):
             batch_size = len(seqs)
-            input_ids_list = [seq.last_token for seq in seqs]
-            positions_list = [seq.num_tokens - 1 for seq in seqs]
+            input_ids_list = [seq.decode_input_token for seq in seqs]
+            positions_list = [seq.decode_input_position for seq in seqs]
             seq_ids = [seq.seq_id for seq in seqs]
 
             full_slot_mapping = torch.empty((batch_size,), dtype=torch.int32, device=self.device)
@@ -2012,8 +2012,8 @@ class DeltaKVCacheManager(CacheManager):
                     f"graph={graph_batch_size}, real={real_batch_size}."
                 )
 
-            input_ids_list = [seq.last_token for seq in seqs]
-            positions_list = [seq.num_tokens - 1 for seq in seqs]
+            input_ids_list = [seq.decode_input_token for seq in seqs]
+            positions_list = [seq.decode_input_position for seq in seqs]
             seq_ids = [seq.seq_id for seq in seqs]
 
             full_slots = self._allocate_batch_full(seq_ids, 1)

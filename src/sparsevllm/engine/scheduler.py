@@ -58,6 +58,7 @@ class Scheduler:
         self.decoding: deque[Sequence] = deque()
         self._admission_defer_warned_seq_ids: set[int] = set()
         self.total_preemptions = 0
+        self.total_recompute_replays = 0
 
     def _long_text_threshold(self, is_prefill: bool) -> int:
         """Long-text boundary for batch partitioning.
@@ -94,7 +95,14 @@ class Scheduler:
     def _pop_next_prefill_seq(self, target_is_long: bool) -> Sequence | None:
         if not self.waiting:
             return None
+        replay_pending = any(seq.is_recompute_replay for seq in self.waiting)
         for idx, seq in enumerate(self.waiting):
+            # Once decode recovery starts, rebuild preempted requests before
+            # admitting fresh prompts. Replays are intentionally serialized:
+            # rebuilding several victims together can consume the capacity that
+            # one request needs to run to completion and free its full row.
+            if replay_pending and not seq.is_recompute_replay:
+                continue
             if self._is_long_text(seq, is_prefill=True) == target_is_long:
                 return self._pop_waiting_at(idx)
         return None
@@ -153,6 +161,11 @@ class Scheduler:
         margin_batched_tokens: int,
     ) -> bool:
         if not self.waiting:
+            return False
+        if any(seq.is_recompute_replay for seq in scheduled_seqs):
+            # A replay rebuilds cache for an already accepted request. Keep the
+            # whole prefill step isolated so a fresh or partial prompt cannot
+            # inflate its compute workspace or consume the slots it needs.
             return False
         if len(self.decoding) >= self.max_decoding_seqs:
             return False
@@ -266,13 +279,28 @@ class Scheduler:
         physical_free_count: int,
         reserved_prefill: int,
     ) -> tuple[list[Sequence], bool, list[Sequence]]:
-        if victim.num_completion_tokens > 0:
+        has_waiting_replay = any(
+            seq.is_recompute_replay for seq in self.waiting
+        )
+        made_progress_since_handoff = (
+            int(victim.num_completion_tokens)
+            > int(victim.decode_progress_checkpoint)
+        )
+        if (
+            victim.num_completion_tokens > 0
+            and not self.decoding
+            and not (
+                has_waiting_replay and made_progress_since_handoff
+            )
+        ):
             raise RuntimeError(
-                "Decode preemption replay after generation is not supported yet. "
+                "KV cache is too small for the sole remaining decode request "
+                "to make forward progress. Recompute replay would rebuild the "
+                "same cache state and loop forever. "
                 f"seq_id={victim.seq_id} prompt_len={victim.num_prompt_tokens} "
                 f"num_tokens={victim.num_tokens} completion_tokens={victim.num_completion_tokens} "
-                f"free_slots={physical_free_count} reserved_prefill={reserved_prefill}. "
-                "Reduce batch size or KV pressure instead of silently replaying an incomplete context."
+                f"decode_progress_checkpoint={victim.decode_progress_checkpoint} "
+                f"free_slots={physical_free_count} reserved_prefill={reserved_prefill}."
             )
         debug_slots = os.getenv("SPARSEVLLM_DEBUG_SLOTS", "0") == "1"
         if debug_slots:
@@ -287,11 +315,26 @@ class Scheduler:
                 len(self.decoding),
             )
         victim.status = SequenceStatus.WAITING
-        victim.num_prefilled_tokens = 0  # 重置进度，下次回来重新跑 Prefill
+        if victim.num_completion_tokens > 0:
+            victim.start_recompute_replay()
+            self.total_recompute_replays += 1
+            logger.warning(
+                "recompute_replay_start seq_id={} prompt_tokens={} completion_tokens={} active_decodes={}",
+                victim.seq_id,
+                victim.num_prompt_tokens,
+                victim.num_completion_tokens,
+                len(self.decoding),
+            )
+        else:
+            victim.num_prefilled_tokens = 0  # 重置进度，下次回来重新跑 Prefill
+        for survivor in self.decoding:
+            survivor.decode_progress_checkpoint = int(
+                survivor.num_completion_tokens
+            )
         self.memory_oracle.clear_prefix_cache_hit(victim)
-        # Requeue to the tail instead of the head. Otherwise a long sequence can
-        # be immediately re-admitted after preemption and thrash in a tight
-        # prefill->decode->preempt loop while other waiting prompts never drain.
+        # Requeue to the tail. While a replay is pending, prefill scheduling is
+        # suspended until active decodes drain; the victim therefore cannot
+        # immediately consume the slots it just released.
         self.waiting.append(victim)
         # Any decode sequences already popped into `scheduled_seqs` in this round
         # have not been executed yet. Put them back before returning, otherwise
@@ -362,8 +405,14 @@ class Scheduler:
         # --- 阶段 1: Prefill 调度 ---
         # 只要 waiting 队列有活，就优先处理 Prefill，因为它是计算密集型的。
         prefill_bucket_order: list[bool] = []
-        if self.waiting:
-            first_bucket = self._is_long_text(self.waiting[0], is_prefill=True)
+        replay_waiting = [seq for seq in self.waiting if seq.is_recompute_replay]
+        if self.waiting and not (replay_waiting and self.decoding):
+            # A preempted request may only rebuild after the surviving decode
+            # set drains. Rebuilding immediately would consume the KV capacity
+            # that preemption just released and can make the scheduler alternate
+            # between replay victims without producing another token.
+            first_prefill = replay_waiting[0] if replay_waiting else self.waiting[0]
+            first_bucket = self._is_long_text(first_prefill, is_prefill=True)
             prefill_bucket_order.append(first_bucket)
             prefill_bucket_order.append(not first_bucket)
 
@@ -581,6 +630,16 @@ class Scheduler:
                         blocked_decode_victim = seq
                     self.decoding.append(seq)
                     continue
+                if scheduled_seqs:
+                    # The current step still has useful work. Keep this request
+                    # queued and run the partial decode batch before considering
+                    # preemption; otherwise a fourth request can fail the whole
+                    # step after three requests have already reserved its last
+                    # three writable KV slots.
+                    if blocked_decode_victim is None:
+                        blocked_decode_victim = seq
+                    self.decoding.append(seq)
+                    break
                 # 显存耗尽，触发驱逐/抢占逻辑
                 # 策略：牺牲当前 seq，并立刻返回，让上层先释放槽位再进入下一轮调度。
                 # 这样可以避免在一次 schedule() 调用中反复驱逐多个请求造成抖动。
@@ -686,6 +745,16 @@ class Scheduler:
             
         # 将被选中的 Decode 序列放回 running 队列以保持顺序
         self.decoding.extendleft(reversed(scheduled_seqs))
+        if blocked_decode_victim is not None:
+            # Retry the sequence that could not join this partial batch first.
+            # If no slot was freed by the completed step, it is the appropriate
+            # preemption victim; evicting a sequence that just made progress
+            # would create avoidable completion replay work.
+            try:
+                self.decoding.remove(blocked_decode_victim)
+            except ValueError:
+                pass
+            self.decoding.appendleft(blocked_decode_victim)
         return scheduled_seqs, False, preempted_seqs
 
     def postprocess(
@@ -716,6 +785,17 @@ class Scheduler:
                     # Prefill 彻底结束，进入正常生成流程
                     seq.status = SequenceStatus.RUNNING
                     self.decoding.append(seq)
+                    if seq.is_recompute_replay:
+                        # Prefill rebuilt the original prompt KV. Its sampled
+                        # token is discarded because the accepted completion
+                        # history is authoritative.
+                        if seq.replay_decode_token_count == 0:
+                            seq.finish_recompute_replay()
+                            logger.info(
+                                "recompute_replay_complete seq_id={} replay_decode_tokens=0",
+                                seq.seq_id,
+                            )
+                        continue
                     # 记录模型生成的第一个 Token
                     seq.append_token(token_id, token_logprob, top_logprob)
                     # 检查是否命中结束条件
@@ -727,6 +807,18 @@ class Scheduler:
 
         # 处理 Decode 步骤
         for seq, token_id, token_logprob, top_logprob in zip(seqs, token_ids, token_logprobs, top_logprobs):
+            if seq.is_recompute_decode:
+                # This forward rebuilt KV for an already accepted completion
+                # token. Ignore the sampled output and advance through history.
+                replay_token_count = seq.replay_decode_token_count
+                seq.advance_recompute_replay()
+                if not seq.is_recompute_replay:
+                    logger.info(
+                        "recompute_replay_complete seq_id={} replay_decode_tokens={}",
+                        seq.seq_id,
+                        replay_token_count,
+                    )
+                continue
             seq.append_token(token_id, token_logprob, top_logprob)
             request_eos = frozenset(seq.eos_token_ids) or self.eos_token_ids
             if (not seq.ignore_eos and token_id in request_eos) or seq.num_completion_tokens == seq.max_tokens:

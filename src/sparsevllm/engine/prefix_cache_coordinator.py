@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from weakref import WeakKeyDictionary
 
 import torch
 
@@ -23,6 +24,12 @@ from sparsevllm.engine.mixed_prefix_offload import (
 from sparsevllm.engine.recurrent_state_manager import RecurrentPrefixPayload
 from sparsevllm.platforms import device_runtime
 from sparsevllm.engine.sequence import Sequence
+from sparsevllm.engine.cache_manager.prefix_cache_mixin import (
+    PrefixHitCapacityCacheEntry,
+    PrefixLookupCacheEntry,
+    lookup_prefix_cache_hit,
+    prefix_hit_capacity_counts,
+)
 from sparsevllm.utils.profiler import profiler
 
 
@@ -76,6 +83,12 @@ class PrefixCacheCoordinator:
         self.pending_duplicate_refs: dict[int, list[bytes]] = {}
         self.pending_block_ids: set[bytes] = set()
         self.pending_recurrent_bytes = 0
+        self.prefix_lookup_cache: WeakKeyDictionary[
+            Sequence, PrefixLookupCacheEntry
+        ] = WeakKeyDictionary()
+        self.prefix_hit_capacity_cache: WeakKeyDictionary[
+            Sequence, PrefixHitCapacityCacheEntry
+        ] = WeakKeyDictionary()
         self.capacity_limited_seq_ids: set[int] = set()
         self.skipped_capacity_blocks = 0
         self.offload_controller: MixedPrefixOffloadController | None = None
@@ -326,27 +339,17 @@ class PrefixCacheCoordinator:
     def prefix_hit_evictable_slots(self, seq: Sequence) -> int:
         if self.prefix_cache is None or int(getattr(seq, "prefix_cache_hit_len", 0) or 0) <= 0:
             return 0
-        if seq.prefix_cache_hit_last_block_id is None:
-            raise RuntimeError(f"seq_id={seq.seq_id} has mixed prefix hit length but no last block id.")
-        chain = self.prefix_cache.get_chain(
-            seq.prefix_cache_hit_last_block_id,
-            int(seq.prefix_cache_hit_block_count),
+        cache = getattr(self, "prefix_hit_capacity_cache", None)
+        if cache is None:
+            cache = WeakKeyDictionary()
+            self.prefix_hit_capacity_cache = cache
+        reclaimable_blocks, promotion_blocks = prefix_hit_capacity_counts(
+            self.prefix_cache,
+            cache,
+            seq,
+            offload_enabled=self._offload_enabled(),
         )
-        freeable_block_ids = (
-            self.prefix_cache.device_reclaimable_block_ids()
-            if self._offload_enabled()
-            else self.prefix_cache.freeable_block_ids()
-        )
-        cost = sum(
-            self.block_size
-            for block in chain
-            if block.stable_block_id in freeable_block_ids
-        )
-        if self._offload_enabled():
-            cost += sum(
-                self.block_size for block in chain if not block.residency.device_present
-            )
-        return int(cost)
+        return int((reclaimable_blocks + promotion_blocks) * self.block_size)
 
     def refresh_prefix_cache_hit(self, seq: Sequence) -> None:
         self._poll_offload()
@@ -359,9 +362,11 @@ class PrefixCacheCoordinator:
         if usable_tokens <= 0:
             return
         with profiler.record("mixed_prefix_cache_lookup"):
-            hit_len, last_block_id, hit_blocks = self.prefix_cache.lookup_longest_prefix(
-                seq.prompt_token_ids,
-                max_usable_tokens=usable_tokens,
+            hit_len, last_block_id, hit_blocks = lookup_prefix_cache_hit(
+                self.prefix_cache,
+                self.prefix_lookup_cache,
+                seq,
+                usable_tokens,
             )
         if hit_len <= 0:
             return
@@ -451,7 +456,7 @@ class PrefixCacheCoordinator:
 
             row_preexisted = bool(self.cache_manager.validate_prefix_kv_attach(seq))
             for block in chain:
-                block.ref_count += 1
+                self.prefix_cache.acquire_block_ref(block)
             submitted_operation = None
             attached_kv_payloads: list[object] = []
             try:
@@ -508,7 +513,7 @@ class PrefixCacheCoordinator:
                     except BaseException as exc:
                         rollback_error = exc
                 for block in chain:
-                    block.ref_count -= 1
+                    self.prefix_cache.release_block_ref(block)
                 if cpu_only_blocks and submitted_operation is None:
                     controller = self.offload_controller
                     assert controller is not None
@@ -563,8 +568,7 @@ class PrefixCacheCoordinator:
                     token_ids = token_ids[start:end]
                 self._record_tokens(seq, [int(token_id) for token_id in token_ids])
             else:
-                if seq.last_token is not None:
-                    self._record_tokens(seq, [int(seq.last_token)])
+                self._record_tokens(seq, [seq.decode_input_token])
 
     def finish_step(self) -> None:
         self._step_h2d_operations.clear()
@@ -701,6 +705,7 @@ class PrefixCacheCoordinator:
                             logical_block_idx=pending.logical_block_idx,
                             payload=pending.payload,
                             token_ids=tuple(pending.token_ids),
+                            ref_count=1,
                         )
                         inserted = self.prefix_cache.insert_block(block)
                         if inserted is not block:
@@ -708,7 +713,6 @@ class PrefixCacheCoordinator:
                                 "Mixed prefix insertion returned an unexpected duplicate block."
                             )
                         inserted_new = True
-                        inserted.ref_count = 1
                         materialized.append(inserted)
                         try:
                             self.cache_manager.mark_materialized_prefix_kv_payload(
@@ -721,7 +725,7 @@ class PrefixCacheCoordinator:
                                 pending.payload.kv_payload,
                             )
                             materialized.remove(inserted)
-                            inserted.ref_count = 0
+                            self.prefix_cache.set_block_ref_count(inserted, 0)
                             self.prefix_cache.rollback_inserted_leaf(inserted)
                             self.recurrent_state_manager.free_prefix_recurrent_payload(
                                 pending.payload.recurrent_payload
@@ -777,7 +781,7 @@ class PrefixCacheCoordinator:
         ]
         if any(existing.stable_block_id == block.stable_block_id for existing in held):
             return
-        block.ref_count += 1
+        self._require_prefix_cache().acquire_block_ref(block)
         self.seq_id_to_materialized_blocks.setdefault(seq_id, []).append(block)
 
     def _live_recurrent_bytes(self) -> int:
@@ -1023,10 +1027,12 @@ class PrefixCacheCoordinator:
         seq_id = int(seq_id)
         released_blocks = self.seq_id_to_prefix_blocks.pop(seq_id, [])
         released_blocks.extend(self.seq_id_to_materialized_blocks.pop(seq_id, []))
+        prefix_cache = self._require_prefix_cache()
         for block in released_blocks:
-            block.ref_count -= 1
-            if block.ref_count < 0:
-                raise RuntimeError("Mixed prefix cache block ref_count became negative.")
+            prefix_cache.release_block_ref(
+                block,
+                negative_error="Mixed prefix cache block ref_count became negative.",
+            )
         self.runtime_states.pop(seq_id, None)
         for pending in self.pending_blocks.pop(seq_id, []):
             self.recurrent_state_manager.free_prefix_recurrent_payload(
@@ -1079,6 +1085,8 @@ class PrefixCacheCoordinator:
         self.pending_duplicate_refs.clear()
         self.pending_block_ids.clear()
         self.pending_recurrent_bytes = 0
+        self.prefix_lookup_cache = WeakKeyDictionary()
+        self.prefix_hit_capacity_cache = WeakKeyDictionary()
         self.capacity_limited_seq_ids.clear()
         self.skipped_capacity_blocks = 0
         getattr(self, "_step_h2d_operations", []).clear()

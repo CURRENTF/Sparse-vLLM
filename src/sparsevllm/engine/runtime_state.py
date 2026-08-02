@@ -282,6 +282,15 @@ class RuntimeState:
         if self.prefix_cache_coordinator is not None:
             self.prefix_cache_coordinator.reset_after_warmup()
         if self.chain_cache_coordinator is not None:
+            resident_chain_seq_ids = sorted(
+                {
+                    int(record.seq_id)
+                    for record in self.chain_cache_coordinator.index.records.values()
+                    if int(record.seq_id) in self._resident_seq_ids
+                }
+            )
+            for seq_id in resident_chain_seq_ids:
+                self._free_seq_payload(seq_id)
             self.chain_cache_coordinator.reset()
         reset_cache = getattr(self.cache_manager, "reset_after_warmup", None)
         if callable(reset_cache):

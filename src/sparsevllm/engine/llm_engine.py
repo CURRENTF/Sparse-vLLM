@@ -24,6 +24,7 @@ from sparsevllm.engine.chain_cache import (
     ChainCacheIndex,
     ChainRoutingSnapshot,
     ChainModeError,
+    ChainNotFoundError,
     ChainOwnerMismatchError,
     ChainPrefixMismatchError,
     RequestAdmission,
@@ -57,6 +58,27 @@ def _deltakv_graph_warmup_profile(config: Config) -> str:
 
 def _use_graph_scaled_warmup(config: Config) -> bool:
     return _deltakv_graph_warmup_profile(config) == "graph"
+
+
+def _moe_workspace_warmup_token_counts(config: Config) -> tuple[int, ...]:
+    model_type = str(getattr(config.hf_config, "model_type", "") or "")
+    if model_type not in {"qwen3_moe", "minimax_m2"}:
+        return ()
+
+    max_batched_tokens = int(config.max_num_batched_tokens)
+    mlp_chunk_size = int(config.mlp_chunk_size)
+    if max_batched_tokens <= 0 or mlp_chunk_size <= 0:
+        raise ValueError(
+            "MoE workspace warmup requires positive max_num_batched_tokens and "
+            f"mlp_chunk_size, got {max_batched_tokens} and {mlp_chunk_size}."
+        )
+
+    max_moe_tokens = min(max_batched_tokens, mlp_chunk_size)
+    decode_tokens = min(
+        max_moe_tokens,
+        max(1, int(config.max_decoding_seqs)),
+    )
+    return tuple(dict.fromkeys((decode_tokens, max_moe_tokens)))
 
 
 class _ThroughputIntervalLogger:
@@ -364,16 +386,55 @@ class LLMEngine:
             f"ignore_eos={sampling_params.ignore_eos})."
         )
 
-        def run_warmup(params: SamplingParams, prompt_offset: int) -> None:
+        def run_warmup(
+            params: SamplingParams,
+            prompt_offset: int,
+            *,
+            stress_max_context: bool = False,
+        ) -> None:
             for request_idx in range(num_seqs):
-                # Keep shapes identical while preventing prefix-cache reuse
-                # within or across warmup rounds.
-                dummy_prompt = [prompt_offset + request_idx] + [0] * (warmup_len - 1)
+                # Distinct leading tokens prevent prefix-cache reuse within or
+                # across warmup rounds.
+                prompt_len = warmup_len
+                if stress_max_context:
+                    prompt_len = max_prompt_len if request_idx == 0 else 1
+                dummy_prompt = [prompt_offset + request_idx] + [0] * (prompt_len - 1)
                 self.add_request(dummy_prompt, params)
             while not self.is_finished():
                 self.step()
 
-        run_warmup(sampling_params, prompt_offset=0)
+        stress_max_context = warmup_profile == "graph" and not warmup_len_override
+        if stress_max_context:
+            logger.info(
+                "CUDA Graph maximum-context warmup: one prompt with {} tokens "
+                "and {} one-token prompts; prefill attention uses the scoped "
+                "fake kernel until the final maximum-context chunk, which uses "
+                "real attention; decode remains real.",
+                max_prompt_len,
+                num_seqs - 1,
+            )
+            self.model_runner.call(
+                "set_warmup_fake_prefill_attention",
+                True,
+                max_prompt_len,
+            )
+            try:
+                run_warmup(
+                    sampling_params,
+                    prompt_offset=0,
+                    stress_max_context=True,
+                )
+            finally:
+                self.model_runner.call(
+                    "set_warmup_fake_prefill_attention",
+                    False,
+                )
+        else:
+            run_warmup(
+                sampling_params,
+                prompt_offset=0,
+                stress_max_context=False,
+            )
 
         if warmup_profile == "graph":
             # CUDA Graph capture establishes its private allocator pool. Warm
@@ -384,8 +445,21 @@ class LLMEngine:
                 prompt_offset=num_seqs,
             )
 
+        self._warmup_moe_workspaces()
         self._after_warmup_debug_cleanup()
         logger.info("Warmup finished.")
+
+    def _warmup_moe_workspaces(self) -> None:
+        token_counts = _moe_workspace_warmup_token_counts(self.config)
+        if not token_counts:
+            return
+        logger.info(
+            "Post-allocation MoE workspace warmup token counts: {}. "
+            "An OOM here is fatal so gpu_memory_utilization can be tuned before serving.",
+            token_counts,
+        )
+        for num_tokens in token_counts:
+            self.model_runner.call("warmup_moe_workspace", num_tokens)
 
     def _after_warmup_debug_cleanup(self):
         self.model_runner.call("reset_after_warmup")
@@ -505,75 +579,12 @@ class LLMEngine:
             )
         return [int(token_id) for token_id in prompt]
 
-    def _tokenize_chain_continuation(
-        self,
-        prompt: str | list[int],
-        record,
-    ) -> list[int]:
-        token_ids = self._tokenize_prompt(prompt)
-        if not isinstance(prompt, str):
-            return token_ids
-        processed_token_count = int(record.processed_token_count)
-        processed_token_ids = [
-            int(token_id) for token_id in record.processed_token_ids
-        ]
-        if not processed_token_ids:
-            return token_ids
-        if len(processed_token_ids) != processed_token_count:
-            raise RuntimeError(
-                "Chain logical token history is incomplete: "
-                f"chain_id={record.chain_id!r} "
-                f"stored_tokens={len(processed_token_ids)} "
-                f"processed_tokens={processed_token_count}."
-            )
-        if token_ids[:processed_token_count] == processed_token_ids:
-            return token_ids
-        raw_token_ids = [
-            int(token_id)
-            for token_id in self.tokenizer.encode(
-                prompt,
-                add_special_tokens=False,
-            )
-        ]
-        automatic_prefix_count = 0
-        if (
-            len(token_ids) >= len(raw_token_ids)
-            and (
-                not raw_token_ids
-                or token_ids[-len(raw_token_ids):] == raw_token_ids
-            )
-        ):
-            automatic_prefix_count = len(token_ids) - len(raw_token_ids)
-        text_prefix_token_ids = processed_token_ids
-        if (
-            automatic_prefix_count
-            and processed_token_ids[:automatic_prefix_count]
-            == token_ids[:automatic_prefix_count]
-        ):
-            text_prefix_token_ids = processed_token_ids[
-                automatic_prefix_count:
-            ]
-        prefix_text = self.tokenizer.decode(
-            text_prefix_token_ids,
-            skip_special_tokens=False,
-            clean_up_tokenization_spaces=False,
-        )
-        if not prompt.startswith(prefix_text):
-            return token_ids
-        suffix_text = prompt[len(prefix_text):]
-        suffix_token_ids = self.tokenizer.encode(
-            suffix_text,
-            add_special_tokens=False,
-        )
-        return processed_token_ids + [
-            int(token_id) for token_id in suffix_token_ids
-        ]
-
     def admit_request(
         self,
         prompt: str | list[int],
         sampling_params: SamplingParams,
         chain_id: str | None = None,
+        chain_append_only: bool = False,
     ) -> RequestAdmission:
         """Validate and synchronously admit one request.
 
@@ -597,11 +608,33 @@ class LLMEngine:
             existing = coordinator.index.records.get(normalized_chain_id)
             if existing is None:
                 coordinator.index.lookup(normalized_chain_id)
-        prompt = (
-            self._tokenize_chain_continuation(prompt, existing)
-            if existing is not None
-            else self._tokenize_prompt(prompt)
-        )
+        if chain_append_only:
+            if existing is None:
+                raise ChainNotFoundError(
+                    "chain_append_only requires an existing chain.",
+                    chain_id=normalized_chain_id or None,
+                )
+            suffix_token_ids = (
+                [
+                    int(token_id)
+                    for token_id in self.tokenizer.encode(
+                        prompt,
+                        add_special_tokens=False,
+                    )
+                ]
+                if isinstance(prompt, str)
+                else [int(token_id) for token_id in prompt]
+            )
+            if not suffix_token_ids:
+                raise ChainPrefixMismatchError(
+                    "A chain append must contain at least one suffix token.",
+                    chain_id=normalized_chain_id,
+                )
+            prompt = [
+                int(token_id) for token_id in existing.token_ids
+            ] + suffix_token_ids
+        else:
+            prompt = self._tokenize_prompt(prompt)
         prompt_len = len(prompt)
         max_tokens = sampling_params.max_tokens
         if prompt_len + max_tokens > self.config.max_model_len:
@@ -639,12 +672,40 @@ class LLMEngine:
             normalized_chain_id = ChainCacheIndex.new_chain_id()
         if existing is not None:
             seq.seq_id = int(existing.seq_id)
-        plan = self.model_runner.runtime_state.chain_admission_plan(
-            normalized_chain_id,
-            int(seq.seq_id),
-            prompt,
-            int(sampling_params.max_tokens),
-        )
+        recreated = False
+        try:
+            plan = self.model_runner.runtime_state.chain_admission_plan(
+                normalized_chain_id,
+                int(seq.seq_id),
+                prompt,
+                int(sampling_params.max_tokens),
+            )
+        except ChainPrefixMismatchError as exc:
+            if existing is None or chain_append_only:
+                raise
+            replaced_chain_id = normalized_chain_id
+            replaced_seq_id = int(existing.seq_id)
+            self.model_runner.call(
+                "chain_invalidate",
+                replaced_chain_id,
+                replaced_seq_id,
+            )
+            normalized_chain_id = ChainCacheIndex.new_chain_id()
+            logger.warning(
+                "Recreating chain after strict token-prefix mismatch: "
+                "old_chain_id={} new_chain_id={} input_tokens={} reason={}",
+                replaced_chain_id,
+                normalized_chain_id,
+                prompt_len,
+                str(exc),
+            )
+            plan = self.model_runner.runtime_state.chain_admission_plan(
+                normalized_chain_id,
+                int(seq.seq_id),
+                prompt,
+                int(sampling_params.max_tokens),
+            )
+            recreated = True
         if plan.status == "resumed" and prompt_len <= int(plan.reused_tokens):
             raise ChainPrefixMismatchError(
                 "A resumed chain request must include at least one suffix token "
@@ -659,8 +720,9 @@ class LLMEngine:
             int(sampling_params.max_tokens),
         )
         self.model_runner.call("chain_apply_admission", plan)
+        chain_status = "recreated" if recreated else str(plan.status)
         seq.chain_id = normalized_chain_id
-        seq.chain_status = str(plan.status)
+        seq.chain_status = chain_status
         seq.chain_reused_tokens = int(plan.reused_tokens)
         seq.num_prefilled_tokens = int(plan.reused_tokens)
         seq.prefix_cache_enabled = True
@@ -679,7 +741,7 @@ class LLMEngine:
         return RequestAdmission(
             seq_id=int(seq.seq_id),
             chain_id=normalized_chain_id,
-            chain_status=str(plan.status),
+            chain_status=chain_status,
             reused_tokens=int(plan.reused_tokens),
             prefilled_tokens=prompt_len - int(plan.reused_tokens),
         )
@@ -978,6 +1040,9 @@ class LLMEngine:
             "decoding_requests": int(decoding),
             "active_requests": int(waiting + decoding),
             "total_preemptions": int(getattr(scheduler, "total_preemptions", 0)),
+            "total_recompute_replays": int(
+                getattr(scheduler, "total_recompute_replays", 0)
+            ),
             "max_num_seqs_in_batch": int(getattr(scheduler, "max_num_seqs_in_batch", 0)),
             "max_decoding_seqs": int(getattr(scheduler, "max_decoding_seqs", 0)),
             "max_num_seqs_in_gpu": int(getattr(scheduler.config, "max_num_seqs_in_gpu", 0)),
@@ -1017,6 +1082,15 @@ class LLMEngine:
             ),
         )
 
+    def _release_preempted_sequences(self, preempted_seqs: list[Sequence]) -> None:
+        preempted_seq_ids = [int(seq.seq_id) for seq in preempted_seqs]
+        if not preempted_seq_ids:
+            return
+        # Preemption is transient: retain the logical request and chain
+        # identity, release only runtime KV/recurrent state, and let
+        # scheduler-driven recompute rebuild it later.
+        self.model_runner.call("free_slots_batch", preempted_seq_ids)
+
     def step(self):
         """
         执行单个推理步进（一个 Batch）。
@@ -1032,24 +1106,7 @@ class LLMEngine:
             # 2. 显式处理抢占 (Eviction)：
             # 如果有序列被调度器踢出，立即广播指令让所有 Rank 释放其占用的物理槽位
             with profiler.record("preempt_free"):
-                preempted_seq_ids = [int(seq.seq_id) for seq in preempted_seqs]
-                ordinary_preempted_seq_ids = []
-                for seq in preempted_seqs:
-                    chain_seq = self._active_chain_sequences.pop(
-                        int(seq.seq_id), None
-                    )
-                    if chain_seq is None:
-                        ordinary_preempted_seq_ids.append(int(seq.seq_id))
-                        continue
-                    self.model_runner.call(
-                        "chain_invalidate",
-                        str(chain_seq.chain_id),
-                        int(chain_seq.seq_id),
-                    )
-                if ordinary_preempted_seq_ids:
-                    self.model_runner.call(
-                        "free_slots_batch", ordinary_preempted_seq_ids
-                    )
+                self._release_preempted_sequences(preempted_seqs)
                 
             if not seqs:
                 # No progress can be made; avoid infinite busy-looping in callers.
@@ -1130,7 +1187,10 @@ class LLMEngine:
                 step_token_logprobs,
                 step_top_logprobs,
             ):
-                if not is_prefill or seq.is_last_chunk_prefill:
+                if (
+                    seq.should_publish_sample
+                    and (not is_prefill or seq.is_last_chunk_prefill)
+                ):
                     token_outputs.append((seq.seq_id, [int(token_id)]))
                     logprob_step_outputs.append((seq.seq_id, [token_logprob], [top_logprob]))
             

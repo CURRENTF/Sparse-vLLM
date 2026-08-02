@@ -101,6 +101,21 @@ class ResponseParseError(ValueError):
     pass
 
 
+class ModelOutputParseError(ResponseParseError):
+    """The generated text is malformed, while the parser contract is valid."""
+
+
+def _caused_by_json_decode_error(exc: BaseException) -> bool:
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        if isinstance(current, json.JSONDecodeError):
+            return True
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    return False
+
+
 @dataclass(frozen=True)
 class ParsedModelResponse:
     reasoning_content: str | None
@@ -132,7 +147,9 @@ class TransformersResponseParser:
         chat_template = getattr(tokenizer, "chat_template", None)
         if isinstance(chat_template, dict):
             chat_template = "\n".join(str(value) for value in chat_template.values())
-        if not isinstance(chat_template, str) or "<think>" not in chat_template:
+        if not isinstance(chat_template, str):
+            return None
+        if "<think>" not in chat_template and "<tool_call>" not in chat_template:
             return None
 
         if "<minimax:tool_call>" in chat_template and "<invoke name=" in chat_template:
@@ -171,7 +188,13 @@ class TransformersResponseParser:
                 prefix=prefix,
             )
             return _normalize_parsed_message(parsed, parse_tools=parse_tools)
-        except (AttributeError, KeyError, TypeError, ValueError) as exc:
+        except ResponseParseError:
+            raise
+        except ValueError as exc:
+            if _caused_by_json_decode_error(exc):
+                raise ModelOutputParseError(str(exc)) from exc
+            raise ResponseParseError(str(exc)) from exc
+        except (AttributeError, KeyError, TypeError) as exc:
             raise ResponseParseError(str(exc)) from exc
 
     def stream(self, *, prefix: str, parse_tools: bool) -> "TransformersResponseStreamParser":

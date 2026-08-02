@@ -22,6 +22,7 @@ from sparsevllm.engine.decode_cuda_graph import DecodeCudaGraphKey, DecodeCudaGr
 from sparsevllm.engine.llm_engine import (
     LLMEngine,
     _deltakv_graph_warmup_profile,
+    _moe_workspace_warmup_token_counts,
     _use_graph_scaled_warmup,
 )
 from sparsevllm.engine.model_runner import ModelRunner
@@ -963,6 +964,28 @@ class PrefillPolicyConfigTest(unittest.TestCase):
         runner.config.decode_cuda_graph_capture_sampling = True
         self.assertTrue(runner._auto_capture_greedy_sampling(seqs))
 
+        seqs[0].should_publish_sample = False
+        self.assertFalse(runner._auto_capture_greedy_sampling(seqs))
+
+    def test_recompute_rows_are_excluded_from_sampling(self):
+        runner = object.__new__(ModelRunner)
+        sampled_shapes = []
+
+        def sampler(logits, temperatures, top_ps, top_ks, *, all_greedy):
+            sampled_shapes.append(tuple(logits.shape))
+            self.assertTrue(all_greedy)
+            return logits.argmax(dim=-1)
+
+        runner.sampler = sampler
+        replay = SimpleNamespace(should_publish_sample=False, temperature=0.0)
+        live = SimpleNamespace(should_publish_sample=True, temperature=0.0)
+        logits = torch.tensor([[9.0, 1.0], [2.0, 8.0]])
+
+        token_ids = runner._sample_model_outputs(logits, [replay, live])
+
+        self.assertEqual(token_ids, [0, 1])
+        self.assertEqual(sampled_shapes, [(1, 2)])
+
     def test_decode_cuda_graph_explicit_capture_sizes_are_validated(self):
         cfg = self.make_config(
             vllm_sparse_method="omnikv",
@@ -1285,6 +1308,15 @@ class DecodeCudaGraphWarmupPolicyTest(unittest.TestCase):
         )
         prompts = []
         pending = 0
+        fake_prefill_enabled = False
+        fake_prefill_step_states = []
+        runner_calls = []
+
+        def runner_call(method, *args):
+            nonlocal fake_prefill_enabled
+            runner_calls.append((method, *args))
+            if method == "set_warmup_fake_prefill_attention":
+                fake_prefill_enabled = bool(args[0])
 
         def add_request(prompt, sampling_params):
             nonlocal pending
@@ -1293,8 +1325,10 @@ class DecodeCudaGraphWarmupPolicyTest(unittest.TestCase):
 
         def step():
             nonlocal pending
+            fake_prefill_step_states.append(fake_prefill_enabled)
             pending = 0
 
+        engine.model_runner = SimpleNamespace(call=runner_call)
         engine.add_request = add_request
         engine.is_finished = lambda: pending == 0
         engine.step = step
@@ -1304,8 +1338,115 @@ class DecodeCudaGraphWarmupPolicyTest(unittest.TestCase):
 
         self.assertEqual(len(prompts), 6)
         self.assertEqual([prompt[0] for prompt, _ in prompts], list(range(6)))
-        self.assertEqual({len(prompt) for prompt, _ in prompts}, {1028})
+        self.assertEqual(
+            [len(prompt) for prompt, _ in prompts],
+            [2046, 1, 1, 1028, 1028, 1028],
+        )
         self.assertEqual([max_tokens for _, max_tokens in prompts], [2, 2, 2, 1, 1, 1])
+        self.assertEqual(fake_prefill_step_states, [True, False])
+        self.assertEqual(
+            runner_calls,
+            [
+                ("set_warmup_fake_prefill_attention", True, 2046),
+                ("set_warmup_fake_prefill_attention", False),
+            ],
+        )
+
+    def test_graph_warmup_restores_real_prefill_after_failure(self):
+        engine = object.__new__(LLMEngine)
+        engine.config = SimpleNamespace(
+            vllm_sparse_method="omnikv",
+            decode_cuda_graph=True,
+            num_sink_tokens=1,
+            decode_keep_tokens=1,
+            num_recent_tokens=1,
+            chunk_prefill_size=1,
+            max_decoding_seqs=2,
+            max_model_len=2048,
+            hf_config=SimpleNamespace(vocab_size=32),
+        )
+        calls = []
+        pending = 0
+
+        def add_request(_prompt, _sampling_params):
+            nonlocal pending
+            pending += 1
+
+        engine.model_runner = SimpleNamespace(
+            call=lambda method, *args: calls.append((method, *args))
+        )
+        engine.add_request = add_request
+        engine.is_finished = lambda: pending == 0
+        engine.step = lambda: (_ for _ in ()).throw(RuntimeError("warmup failed"))
+
+        with self.assertRaisesRegex(RuntimeError, "warmup failed"):
+            engine._warmup()
+
+        self.assertEqual(
+            calls,
+            [
+                ("set_warmup_fake_prefill_attention", True, 2046),
+                ("set_warmup_fake_prefill_attention", False),
+            ],
+        )
+
+    def test_moe_workspace_warmup_profiles_decode_and_maximum_mlp_shapes(self):
+        config = self.make_config(method="omnikv")
+        config.max_decoding_seqs = 24
+        config.max_num_batched_tokens = 56_214
+        config.mlp_chunk_size = 16_384
+        config.hf_config = SimpleNamespace(model_type="qwen3_moe")
+
+        self.assertEqual(
+            _moe_workspace_warmup_token_counts(config),
+            (24, 16_384),
+        )
+
+    def test_dense_model_skips_moe_workspace_warmup(self):
+        config = self.make_config(method="vanilla")
+        config.hf_config = SimpleNamespace(model_type="qwen2")
+
+        self.assertEqual(_moe_workspace_warmup_token_counts(config), ())
+
+    def test_engine_runs_each_moe_workspace_shape_after_regular_warmup(self):
+        engine = object.__new__(LLMEngine)
+        engine.config = SimpleNamespace(
+            max_decoding_seqs=24,
+            max_num_batched_tokens=56_214,
+            mlp_chunk_size=16_384,
+            hf_config=SimpleNamespace(model_type="qwen3_moe"),
+        )
+        calls = []
+        engine.model_runner = SimpleNamespace(
+            call=lambda method, *args: calls.append((method, *args))
+        )
+
+        engine._warmup_moe_workspaces()
+
+        self.assertEqual(
+            calls,
+            [
+                ("warmup_moe_workspace", 24),
+                ("warmup_moe_workspace", 16_384),
+            ],
+        )
+
+    def test_moe_workspace_oom_fails_startup(self):
+        engine = object.__new__(LLMEngine)
+        engine.config = SimpleNamespace(
+            max_decoding_seqs=24,
+            max_num_batched_tokens=56_214,
+            mlp_chunk_size=16_384,
+            hf_config=SimpleNamespace(model_type="qwen3_moe"),
+        )
+
+        def fail_on_workspace(_method, _num_tokens):
+            raise torch.OutOfMemoryError("warmup workspace OOM")
+
+        engine.model_runner = SimpleNamespace(call=fail_on_workspace)
+
+        with self.assertRaisesRegex(torch.OutOfMemoryError, "warmup workspace OOM"):
+            engine._warmup_moe_workspaces()
 
 
 class DeltaKVLessMemoryCudaGraphReserveTest(unittest.TestCase):
@@ -2258,7 +2399,7 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
         self.assertEqual(oracle.refresh_calls, 0)
         self.assertEqual(seq.num_prefilled_tokens, 4)
 
-    def test_prefix_cache_lookup_skips_preempted_completion_replay(self):
+    def test_prefix_cache_lookup_skips_recompute_replay(self):
         oracle = FakeMemoryOracle(prefix_hit_len=8, prefix_hit_blocks=2)
         scheduler = make_scheduler_with_oracle(
             PREFILL_POLICY_ALL_CHUNKED,
@@ -2269,7 +2410,7 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
         )
         seq = seq_with_len(20)
         seq.append_token(99)
-        seq.num_prefilled_tokens = 0
+        seq.start_recompute_replay()
         scheduler.add(seq)
 
         scheduled, is_prefill, _ = scheduler.schedule()
@@ -2280,7 +2421,36 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
         self.assertFalse(seq.prefix_cache_enabled)
         self.assertEqual(seq.num_prefilled_tokens, 0)
 
-    def test_decode_preemption_after_generation_fails_fast(self):
+    def test_decode_preemption_after_generation_starts_recompute_replay(self):
+        oracle = FakeMemoryOracle(free_slots=0)
+        scheduler = make_scheduler_with_oracle(
+            PREFILL_POLICY_ALL_CHUNKED,
+            oracle,
+            method="",
+            chunk=5,
+            max_tokens=20,
+        )
+        seq = seq_with_len(8)
+        seq.num_prefilled_tokens = seq.num_prompt_tokens
+        seq.append_token(99)
+        survivor = seq_with_len(8)
+        survivor.num_prefilled_tokens = survivor.num_prompt_tokens
+        survivor.append_token(89)
+        scheduler.decoding.append(seq)
+        scheduler.decoding.append(survivor)
+
+        scheduled, is_prefill, preempted = scheduler.schedule()
+
+        self.assertEqual(scheduled, [])
+        self.assertFalse(is_prefill)
+        self.assertEqual(preempted, [seq])
+        self.assertTrue(seq.is_recompute_replay)
+        self.assertEqual(seq.num_prefilled_tokens, 0)
+        self.assertEqual(list(scheduler.waiting), [seq])
+        self.assertEqual(list(scheduler.decoding), [survivor])
+        self.assertEqual(scheduler.total_recompute_replays, 1)
+
+    def test_decode_recompute_rejects_sole_request_that_cannot_make_progress(self):
         oracle = FakeMemoryOracle(free_slots=0)
         scheduler = make_scheduler_with_oracle(
             PREFILL_POLICY_ALL_CHUNKED,
@@ -2294,8 +2464,264 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
         seq.append_token(99)
         scheduler.decoding.append(seq)
 
-        with self.assertRaisesRegex(RuntimeError, "Decode preemption replay"):
+        with self.assertRaisesRegex(RuntimeError, "sole remaining decode"):
             scheduler.schedule()
+
+    def test_sole_decode_without_new_progress_cannot_yield_to_replay(self):
+        oracle = FakeMemoryOracle(free_slots=0)
+        scheduler = make_scheduler_with_oracle(
+            PREFILL_POLICY_ALL_CHUNKED,
+            oracle,
+            method="",
+            chunk=5,
+            max_tokens=20,
+        )
+        waiting = seq_with_len(8)
+        waiting.append_token(90)
+        waiting.start_recompute_replay()
+        active = seq_with_len(8)
+        active.num_prefilled_tokens = active.num_prompt_tokens
+        active.append_token(91)
+        active.decode_progress_checkpoint = active.num_completion_tokens
+        scheduler.waiting.append(waiting)
+        scheduler.decoding.append(active)
+
+        with self.assertRaisesRegex(RuntimeError, "forward progress"):
+            scheduler.schedule()
+
+    def test_sole_decode_with_new_progress_can_yield_to_replay(self):
+        oracle = FakeMemoryOracle(free_slots=0)
+        scheduler = make_scheduler_with_oracle(
+            PREFILL_POLICY_ALL_CHUNKED,
+            oracle,
+            method="",
+            chunk=5,
+            max_tokens=20,
+        )
+        waiting = seq_with_len(8)
+        waiting.append_token(90)
+        waiting.start_recompute_replay()
+        active = seq_with_len(8)
+        active.num_prefilled_tokens = active.num_prompt_tokens
+        active.append_token(91)
+        active.decode_progress_checkpoint = active.num_completion_tokens
+        active.append_token(92)
+        scheduler.waiting.append(waiting)
+        scheduler.decoding.append(active)
+
+        scheduled, is_prefill, preempted = scheduler.schedule()
+
+        self.assertEqual(scheduled, [])
+        self.assertFalse(is_prefill)
+        self.assertEqual(preempted, [active])
+        self.assertEqual(list(scheduler.decoding), [])
+        self.assertEqual(list(scheduler.waiting), [waiting, active])
+        self.assertTrue(active.is_recompute_replay)
+
+    def test_recompute_replay_waits_while_other_decode_is_active(self):
+        oracle = FakeMemoryOracle(free_slots=8)
+        scheduler = make_scheduler_with_oracle(
+            PREFILL_POLICY_ALL_CHUNKED,
+            oracle,
+            method="",
+            chunk=8,
+            max_tokens=32,
+        )
+        replay = seq_with_len(8)
+        replay.append_token(90)
+        replay.append_token(91)
+        replay.start_recompute_replay()
+        active = seq_with_len(8)
+        active.num_prefilled_tokens = active.num_prompt_tokens
+        active.append_token(80)
+        scheduler.waiting.append(replay)
+        scheduler.decoding.append(active)
+
+        scheduled, is_prefill, preempted = scheduler.schedule()
+
+        self.assertFalse(is_prefill)
+        self.assertEqual(scheduled, [active])
+        self.assertEqual(preempted, [])
+        self.assertEqual(list(scheduler.waiting), [replay])
+        self.assertEqual(list(scheduler.decoding), [active])
+
+    def test_recompute_replay_prefill_isolated_from_fresh_prompt(self):
+        oracle = FakeMemoryOracle(free_slots=64)
+        scheduler = make_scheduler_with_oracle(
+            PREFILL_POLICY_ALL_CHUNKED,
+            oracle,
+            method="",
+            chunk=8,
+            max_tokens=32,
+        )
+        replay = seq_with_len(8)
+        replay.append_token(90)
+        replay.start_recompute_replay()
+        fresh = seq_with_len(4)
+        scheduler.waiting.extend([replay, fresh])
+
+        scheduled, is_prefill, preempted = scheduler.schedule()
+
+        self.assertTrue(is_prefill)
+        self.assertEqual(scheduled, [replay])
+        self.assertEqual(preempted, [])
+        self.assertEqual(list(scheduler.waiting), [fresh])
+        self.assertEqual(replay.current_chunk_size, 8)
+
+    def test_multiple_replay_prefills_are_serialized(self):
+        oracle = FakeMemoryOracle(free_slots=64)
+        scheduler = make_scheduler_with_oracle(
+            PREFILL_POLICY_ALL_CHUNKED,
+            oracle,
+            method="",
+            chunk=8,
+            max_tokens=32,
+        )
+        first = seq_with_len(15)
+        first.max_tokens = 2
+        second = seq_with_len(23)
+        for seq, token_id in ((first, 90), (second, 91)):
+            seq.append_token(token_id)
+            seq.start_recompute_replay()
+        scheduler.waiting.extend([first, second])
+
+        scheduled, is_prefill, _ = scheduler.schedule()
+        self.assertTrue(is_prefill)
+        self.assertEqual(scheduled, [first])
+        scheduler.postprocess([first], [999], is_prefill=True)
+        self.assertEqual(first.num_prefilled_tokens, 8)
+        self.assertEqual(second.num_prefilled_tokens, 0)
+
+        scheduled, is_prefill, _ = scheduler.schedule()
+        self.assertTrue(is_prefill)
+        self.assertEqual(scheduled, [first])
+        scheduler.postprocess([first], [999], is_prefill=True)
+        self.assertEqual(first.num_prefilled_tokens, 15)
+        self.assertEqual(second.num_prefilled_tokens, 0)
+
+        scheduled, is_prefill, _ = scheduler.schedule()
+        self.assertFalse(is_prefill)
+        self.assertEqual(scheduled, [first])
+        scheduler.postprocess([first], [999], is_prefill=False)
+        self.assertTrue(first.is_finished)
+
+        scheduled, is_prefill, _ = scheduler.schedule()
+        self.assertTrue(is_prefill)
+        self.assertEqual(scheduled, [second])
+        self.assertEqual(second.num_prefilled_tokens, 0)
+
+    def test_recompute_replay_rebuilds_prompt_and_completion_without_appending(self):
+        oracle = FakeMemoryOracle(free_slots=64)
+        scheduler = make_scheduler_with_oracle(
+            PREFILL_POLICY_ALL_CHUNKED,
+            oracle,
+            method="",
+            chunk=8,
+            max_tokens=32,
+        )
+        seq = seq_with_len(8)
+        for token_id in (90, 91, 92):
+            seq.append_token(token_id)
+        original_tokens = list(seq.token_ids)
+        seq.start_recompute_replay()
+        scheduler.add(seq)
+
+        scheduled, is_prefill, _ = scheduler.schedule()
+        self.assertTrue(is_prefill)
+        self.assertEqual(scheduled, [seq])
+        self.assertEqual(seq.replay_input_token_ids, list(range(8)))
+        scheduler.postprocess([seq], [999], is_prefill=True)
+        self.assertEqual(seq.token_ids, original_tokens)
+        self.assertTrue(seq.is_recompute_replay)
+
+        for expected_token, expected_position in ((90, 8), (91, 9)):
+            scheduled, is_prefill, _ = scheduler.schedule()
+            self.assertFalse(is_prefill)
+            self.assertEqual(scheduled, [seq])
+            self.assertEqual(seq.decode_input_token, expected_token)
+            self.assertEqual(seq.decode_input_position, expected_position)
+            self.assertFalse(seq.should_publish_sample)
+            scheduler.postprocess([seq], [998], is_prefill=False)
+            self.assertEqual(seq.token_ids, original_tokens)
+
+        self.assertFalse(seq.is_recompute_replay)
+        self.assertTrue(seq.should_publish_sample)
+        scheduled, is_prefill, _ = scheduler.schedule()
+        self.assertFalse(is_prefill)
+        self.assertEqual(seq.decode_input_token, 92)
+        self.assertEqual(seq.decode_input_position, 10)
+        scheduler.postprocess([seq], [93], is_prefill=False)
+        self.assertEqual(seq.token_ids, original_tokens + [93])
+
+    def test_preemption_releases_chain_runtime_without_invalidating_identity(self):
+        engine = object.__new__(LLMEngine)
+        calls = []
+        engine.model_runner = SimpleNamespace(
+            call=lambda method, *args: calls.append((method, args))
+        )
+        seq = seq_with_len(8)
+        seq.chain_id = "chain-a"
+        engine._active_chain_sequences = {seq.seq_id: seq}
+
+        engine._release_preempted_sequences([seq])
+
+        self.assertEqual(calls, [("free_slots_batch", ([seq.seq_id],))])
+        self.assertIs(engine._active_chain_sequences[seq.seq_id], seq)
+
+    def test_decode_runs_partial_batch_before_considering_preemption(self):
+        oracle = FakeMemoryOracle(free_slots=3)
+        scheduler = make_scheduler_with_oracle(
+            PREFILL_POLICY_ALL_CHUNKED,
+            oracle,
+            method="",
+            chunk=8,
+            max_tokens=32,
+        )
+        seqs = [seq_with_len(8) for _ in range(4)]
+        for seq in seqs:
+            seq.current_chunk_size = seq.num_prompt_tokens
+
+        # Follow the real state transition: final prefill emits the first
+        # completion token before the request enters the decoding queue.
+        scheduler.postprocess(seqs, [99, 99, 99, 99], is_prefill=True)
+        self.assertTrue(all(seq.num_completion_tokens == 1 for seq in seqs))
+
+        scheduled, is_prefill, preempted = scheduler.schedule()
+
+        self.assertFalse(is_prefill)
+        self.assertEqual(scheduled, seqs[:3])
+        self.assertEqual(preempted, [])
+        self.assertEqual(list(scheduler.decoding), [seqs[3], *seqs[:3]])
+        self.assertEqual(scheduler.total_preemptions, 0)
+
+    def test_partial_decode_retries_blocked_sequence_before_preempting_progressed_one(self):
+        oracle = FakeMemoryOracle(free_slots=3)
+        scheduler = make_scheduler_with_oracle(
+            PREFILL_POLICY_ALL_CHUNKED,
+            oracle,
+            method="",
+            chunk=8,
+            max_tokens=32,
+        )
+        seqs = [seq_with_len(8) for _ in range(4)]
+        for seq in seqs:
+            seq.current_chunk_size = seq.num_prompt_tokens
+        scheduler.postprocess(seqs, [99, 99, 99, 99], is_prefill=True)
+
+        scheduled, is_prefill, preempted = scheduler.schedule()
+
+        self.assertFalse(is_prefill)
+        self.assertEqual(scheduled, seqs[:3])
+        self.assertEqual(preempted, [])
+
+        oracle._free_slots = 0
+        scheduled, is_prefill, preempted = scheduler.schedule()
+
+        self.assertFalse(is_prefill)
+        self.assertEqual(scheduled, [])
+        self.assertEqual(preempted, [seqs[3]])
+        self.assertEqual(list(scheduler.waiting), [seqs[3]])
+        self.assertEqual(list(scheduler.decoding), seqs[:3])
 
     def test_decode_preempts_when_no_candidate_can_use_partial_capacity(self):
         class PartialPageOracle(FakeMemoryOracle):
@@ -2401,6 +2827,25 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
         self.assertEqual(restored.prefix_cache_hit_len, 8)
         self.assertEqual(restored.prefix_cache_hit_block_count, 2)
         self.assertEqual(restored.prefix_cache_hit_last_block_id, b"block")
+
+    def test_sequence_ipc_carries_recompute_prefill_and_decode_inputs(self):
+        seq = seq_with_len(4)
+        seq.append_token(90)
+        seq.append_token(91)
+        seq.start_recompute_replay()
+        seq.current_chunk_size = 2
+
+        restored_prefill = object.__new__(Sequence)
+        restored_prefill.__setstate__(seq.__getstate__())
+        self.assertTrue(restored_prefill.is_recompute_prefill)
+        self.assertEqual(restored_prefill.replay_input_token_ids, [0, 1])
+
+        seq.num_prefilled_tokens = seq.num_prompt_tokens
+        restored_decode = object.__new__(Sequence)
+        restored_decode.__setstate__(seq.__getstate__())
+        self.assertTrue(restored_decode.is_recompute_decode)
+        self.assertEqual(restored_decode.decode_input_token, 90)
+        self.assertEqual(restored_decode.decode_input_position, 4)
 
 
 class DeltaKVFullPrefillStagingTest(unittest.TestCase):

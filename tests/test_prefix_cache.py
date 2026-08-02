@@ -699,10 +699,10 @@ def test_device_reclaimable_blocks_include_only_demotable_or_inflight_d2h_chains
         block.stable_block_id for block in chain
     }
 
-    chain[-1].ref_count = 1
+    index.acquire_block_ref(chain[-1])
     assert index.device_reclaimable_blocks() == 0
-    chain[-1].ref_count = 0
-    chain[-1].eviction_priority = -1
+    index.release_block_ref(chain[-1])
+    index.set_subtree_eviction_priority(list(range(6)), -1)
     assert index.device_reclaimable_blocks() == 0
 
     h2d_index = RadixPrefixIndex(block_size=2, fingerprint=b"h2d-not-reclaimable")
@@ -802,6 +802,265 @@ def test_freeable_blocks_excludes_ancestors_of_referenced_descendant():
     assert root_id in index.blocks
 
 
+def test_freeable_block_ids_reuses_scan_until_index_mutates():
+    fp = build_prefix_cache_fingerprint(_cfg(), 2)
+    index = RadixPrefixIndex(block_size=2, fingerprint=fp)
+    root_id = _insert_tokens(index, [1, 2])
+    child_id = _insert_tokens(index, [1, 2, 3, 4])
+    child = index.get_block(child_id)
+    assert child is not None
+
+    expected = frozenset({root_id, child_id})
+    assert index.freeable_block_ids() == expected
+    assert index.freeable_block_ids() is index.freeable_block_ids()
+    assert index.freeable_scans == 1
+    assert index.freeable_cache_hits == 2
+
+    index.acquire_block_ref(child)
+    assert index.freeable_block_ids() == frozenset()
+    assert index.freeable_scans == 2
+
+    index.release_block_ref(child)
+    assert index.freeable_block_ids() == expected
+    assert index.freeable_scans == 3
+
+
+def test_freeable_block_ids_invalidates_for_priority_transfer_and_removal():
+    fp = build_prefix_cache_fingerprint(_cfg(), 2)
+    index = RadixPrefixIndex(block_size=2, fingerprint=fp)
+    block_id = _insert_tokens(index, [1, 2])
+    block = index.get_block(block_id)
+    assert block is not None
+
+    assert index.freeable_block_ids() == frozenset({block_id})
+    index.set_subtree_eviction_priority([1, 2], -1)
+    assert index.freeable_block_ids() == frozenset()
+
+    index.set_subtree_eviction_priority([1, 2], 0)
+    assert index.freeable_block_ids() == frozenset({block_id})
+
+    index.begin_d2h(block)
+    assert index.freeable_block_ids() == frozenset()
+    index.abort_d2h(block)
+    assert index.freeable_block_ids() == frozenset({block_id})
+
+    assert index.evict_until_freeable(1) == [block]
+    assert index.freeable_block_ids() == frozenset()
+    assert index.freeable_scans == 6
+
+
+def test_waiting_prefix_lookup_reuses_hash_chain_and_cached_result():
+    manager = _make_standard_manager_for_prefix(block_size=2)
+    assert manager.prefix_cache is not None
+    _insert_tokens(manager.prefix_cache, [1, 2])
+    seq = Sequence([1, 2, 3, 4, 5])
+
+    manager.refresh_prefix_cache_hit(seq)
+    assert seq.prefix_cache_hit_len == 2
+    assert manager.prefix_cache.block_id_generation_requests == 1
+    assert manager.prefix_cache.lookup_requests == 1
+
+    manager.refresh_prefix_cache_hit(seq)
+    assert seq.prefix_cache_hit_len == 2
+    assert manager.prefix_cache.block_id_generation_requests == 1
+    assert manager.prefix_cache.lookup_requests == 1
+
+    _insert_tokens(manager.prefix_cache, [11, 12])
+    manager.refresh_prefix_cache_hit(seq)
+    assert seq.prefix_cache_hit_len == 2
+    assert manager.prefix_cache.block_id_generation_requests == 1
+    assert manager.prefix_cache.lookup_requests == 1
+
+    root = manager.prefix_cache.get_chain(seq.prefix_cache_hit_last_block_id, 1)[0]
+    manager.prefix_cache.acquire_block_ref(root)
+    manager.refresh_prefix_cache_hit(seq)
+    manager.prefix_cache.release_block_ref(root)
+    assert manager.prefix_cache.block_id_generation_requests == 1
+    assert manager.prefix_cache.lookup_requests == 1
+
+    _insert_tokens(manager.prefix_cache, [1, 2, 3, 4])
+    manager.refresh_prefix_cache_hit(seq)
+    assert seq.prefix_cache_hit_len == 4
+    assert manager.prefix_cache.block_id_generation_requests == 1
+    assert manager.prefix_cache.lookup_requests == 2
+
+    _insert_tokens(manager.prefix_cache, [7, 8])
+    manager.refresh_prefix_cache_hit(seq)
+    assert seq.prefix_cache_hit_len == 4
+    assert manager.prefix_cache.block_id_generation_requests == 1
+    assert manager.prefix_cache.lookup_requests == 2
+
+    changed_seq = Sequence([1, 2, 9, 4, 5])
+    manager.refresh_prefix_cache_hit(changed_seq)
+    assert changed_seq.prefix_cache_hit_len == 2
+    assert manager.prefix_cache.block_id_generation_requests == 2
+    assert manager.prefix_cache.lookup_requests == 3
+
+
+def test_prefix_hit_admission_cost_reuses_chain_until_capacity_mutates():
+    manager = _make_standard_manager_for_prefix(block_size=2)
+    assert manager.prefix_cache is not None
+    last_block_id = _insert_tokens(manager.prefix_cache, [1, 2, 3, 4])
+    seq = Sequence([1, 2, 3, 4, 5])
+    seq.prefix_cache_hit_len = 4
+    seq.prefix_cache_hit_block_count = 2
+    seq.prefix_cache_hit_last_block_id = last_block_id
+
+    get_chain_calls = 0
+    original_get_chain = manager.prefix_cache.get_chain
+
+    def counted_get_chain(block_id, block_count):
+        nonlocal get_chain_calls
+        get_chain_calls += 1
+        return original_get_chain(block_id, block_count)
+
+    manager.prefix_cache.get_chain = counted_get_chain
+    assert manager.prompt_admission_cost(seq) == 5
+    assert manager.prompt_admission_cost(seq) == 5
+    assert get_chain_calls == 1
+    assert manager.prefix_cache.freeable_scans == 1
+
+    _insert_tokens(manager.prefix_cache, [7, 8])
+    assert manager.prompt_admission_cost(seq) == 5
+    assert get_chain_calls == 1
+    assert manager.prefix_cache.freeable_scans == 2
+
+    referenced = original_get_chain(last_block_id, 2)[-1]
+    manager.prefix_cache.acquire_block_ref(referenced)
+    assert manager.prompt_admission_cost(seq) == 1
+    assert get_chain_calls == 1
+    assert manager.prefix_cache.freeable_scans == 3
+
+
+def test_evictable_and_device_reclaimable_counts_reuse_epoch_cache():
+    index = RadixPrefixIndex(block_size=2, fingerprint=b"capacity-count-cache")
+    block_id = _insert_tokens(index, [1, 2])
+    block = index.get_block(block_id)
+    assert block is not None
+
+    assert index.evictable_blocks() == 1
+    assert index.evictable_blocks() == 1
+    assert index.evictable_scans == 1
+    assert index.evictable_cache_hits == 1
+
+    index.begin_d2h(block)
+    assert index.device_reclaimable_blocks() == 1
+    assert index.device_reclaimable_blocks() == 1
+    assert index.device_reclaimable_scans == 1
+    assert index.device_reclaimable_cache_hits == 1
+
+    index.acquire_block_ref(block)
+    assert index.evictable_blocks() == 0
+    assert index.device_reclaimable_blocks() == 0
+    assert index.evictable_scans == 2
+    assert index.device_reclaimable_scans == 2
+
+
+def test_referenced_chain_growth_does_not_invalidate_capacity_cache():
+    index = RadixPrefixIndex(block_size=2, fingerprint=b"referenced-growth")
+    root_id = index.stable_block_id([1, 2], None)
+    root = PrefixCacheBlock(
+        stable_block_id=root_id,
+        parent_block_id=None,
+        block_size=2,
+        logical_block_idx=0,
+        payload=SimpleNamespace(name="root"),
+        token_ids=(1, 2),
+        ref_count=1,
+    )
+    index.insert_block(root)
+    assert index.freeable_block_ids() == frozenset()
+    capacity_epoch = index.capacity_epoch
+
+    index.acquire_block_ref(root)
+    index.release_block_ref(root)
+    child_id = index.stable_block_id([3, 4], root_id)
+    child = PrefixCacheBlock(
+        stable_block_id=child_id,
+        parent_block_id=root_id,
+        block_size=2,
+        logical_block_idx=1,
+        payload=SimpleNamespace(name="child"),
+        token_ids=(3, 4),
+        ref_count=1,
+    )
+    index.insert_block(child)
+
+    assert index.capacity_epoch == capacity_epoch
+    assert index.freeable_block_ids() == frozenset()
+    assert index.freeable_scans == 1
+    assert index.freeable_cache_hits == 1
+
+
+def test_unrelated_insert_churn_does_not_refresh_waiting_prefix_lookups():
+    manager = _make_standard_manager_for_prefix(block_size=2)
+    assert manager.prefix_cache is not None
+    _insert_tokens(manager.prefix_cache, [1, 2])
+    waiting = [Sequence([1, 2, 100 + idx, 200 + idx, 9]) for idx in range(24)]
+
+    for seq in waiting:
+        manager.refresh_prefix_cache_hit(seq)
+        assert seq.prefix_cache_hit_len == 2
+    assert manager.prefix_cache.lookup_requests == 24
+    assert manager.prefix_cache.block_id_generation_requests == 24
+
+    for step in range(12):
+        _insert_tokens(manager.prefix_cache, [1000 + step, 2000 + step])
+        for seq in waiting:
+            manager.refresh_prefix_cache_hit(seq)
+
+    assert manager.prefix_cache.lookup_requests == 24
+    assert manager.prefix_cache.block_id_generation_requests == 24
+
+
+def test_referenced_insert_churn_keeps_waiting_hit_capacity_cached():
+    manager = _make_standard_manager_for_prefix(block_size=2)
+    assert manager.prefix_cache is not None
+    last_block_id = _insert_tokens(manager.prefix_cache, [1, 2, 3, 4])
+    chain = manager.prefix_cache.get_chain(last_block_id, 2)
+    for block in chain:
+        manager.prefix_cache.acquire_block_ref(block)
+    waiting = [Sequence([1, 2, 3, 4, 100 + idx]) for idx in range(24)]
+    for seq in waiting:
+        seq.prefix_cache_hit_len = 4
+        seq.prefix_cache_hit_block_count = 2
+        seq.prefix_cache_hit_last_block_id = last_block_id
+
+    get_chain_calls = 0
+    original_get_chain = manager.prefix_cache.get_chain
+
+    def counted_get_chain(block_id, block_count):
+        nonlocal get_chain_calls
+        get_chain_calls += 1
+        return original_get_chain(block_id, block_count)
+
+    manager.prefix_cache.get_chain = counted_get_chain
+    assert all(manager.prompt_admission_cost(seq) == 1 for seq in waiting)
+    assert get_chain_calls == 24
+    assert manager.prefix_cache.freeable_scans == 1
+    capacity_epoch = manager.prefix_cache.capacity_epoch
+
+    for step in range(12):
+        block_tokens = [3000 + step, 4000 + step]
+        block_id = manager.prefix_cache.stable_block_id(block_tokens, None)
+        manager.prefix_cache.insert_block(
+            PrefixCacheBlock(
+                stable_block_id=block_id,
+                parent_block_id=None,
+                block_size=2,
+                logical_block_idx=0,
+                payload=SimpleNamespace(name="referenced"),
+                token_ids=tuple(block_tokens),
+                ref_count=1,
+            )
+        )
+        assert all(manager.prompt_admission_cost(seq) == 1 for seq in waiting)
+
+    assert manager.prefix_cache.capacity_epoch == capacity_epoch
+    assert get_chain_calls == 24
+    assert manager.prefix_cache.freeable_scans == 1
+
+
 def test_bulk_eviction_scans_initial_leaves_once(monkeypatch):
     fp = build_prefix_cache_fingerprint(_cfg(), 4)
     index = RadixPrefixIndex(block_size=4, fingerprint=fp)
@@ -867,10 +1126,10 @@ def test_referenced_blocks_are_not_evictable():
     index = RadixPrefixIndex(block_size=4, fingerprint=fp)
     last_block_id = _insert_tokens(index, [1, 2, 3, 4])
     block = index.get_chain(last_block_id, 1)[0]
-    block.ref_count = 1
+    index.acquire_block_ref(block)
 
     assert index.evict_until_freeable(1) == []
-    block.ref_count = 0
+    index.release_block_ref(block)
     assert index.evict_until_freeable(1) == [block]
 
 
@@ -1689,7 +1948,7 @@ def test_standard_admission_reserves_evictable_hit_blocks():
     assert manager.prompt_admission_free_slots() == 3
     assert manager.prompt_admission_cost(seq) == 3
 
-    block.ref_count = 1
+    manager.prefix_cache.acquire_block_ref(block)
     assert manager.prompt_admission_cost(seq) == 1
 
 
@@ -1804,7 +2063,7 @@ def test_standard_admission_counts_inflight_d2h_before_pressure_prompt():
     hit_seq.prefix_cache_hit_last_block_id = block_id
     assert manager.prompt_admission_cost(hit_seq) == 3
 
-    block.ref_count = 1
+    manager.prefix_cache.acquire_block_ref(block)
     assert manager.prompt_admission_free_slots() == 1
 
 
@@ -1839,6 +2098,39 @@ def test_standard_materializes_child_after_prefix_hit_with_parent_sensitive_id()
     assert isinstance(child.payload, StandardPrefixBlockPayload)
     assert child.payload.token_slots.tolist() == [20, 21]
     assert [block.stable_block_id for block in manager.prefix_cache.get_chain(child_id, 2)] == [root_id, child_id]
+
+
+def test_standard_duplicate_materialization_holds_parent_until_sequence_free():
+    manager = _make_standard_manager_for_prefix(block_size=2)
+    owner = Sequence([1, 2])
+    owner_slots = manager._allocate(owner.seq_id, 2)
+    manager._record_prefix_materialization(owner, [1, 2], owner_slots)
+    manager.on_forward_end([owner], is_prefill=True)
+
+    block_id = manager.prefix_cache.stable_block_id([1, 2], None)
+    block = manager.prefix_cache.get_block(block_id)
+    assert block is not None
+    manager.free_seq(owner.seq_id)
+    assert block.ref_count == 0
+
+    replay = Sequence([1, 2, 3, 4])
+    replay_slots = manager._allocate(replay.seq_id, 4)
+    manager._record_prefix_materialization(replay, [1, 2], replay_slots[:2])
+    manager.on_forward_end([replay], is_prefill=True)
+
+    assert block.ref_count == 1
+    assert not manager.prefix_cache.can_evict(block)
+    assert manager.prefix_cache.evict_until_freeable(1) == []
+    assert manager.seq_id_to_materialized_blocks[replay.seq_id] == [block]
+    assert manager.seq_id_to_cached_ranges.get(replay.seq_id, []) == []
+
+    manager._record_prefix_materialization(replay, [3, 4], replay_slots[2:])
+    manager.on_forward_end([replay], is_prefill=True)
+    child_id = manager.prefix_cache.stable_block_id([3, 4], block_id)
+    assert manager.prefix_cache.get_block(child_id) is not None
+
+    manager.free_seq(replay.seq_id)
+    assert block.ref_count == 0
 
 
 def test_standard_decode_token_completes_pending_prefix_block_by_default():
@@ -2382,7 +2674,7 @@ def test_quest_admission_is_page_aligned_and_reserves_hit_pages():
     assert manager.prompt_admission_free_slots() == 4
     assert manager.prompt_admission_cost(seq) == 4
 
-    block.ref_count = 1
+    manager.prefix_cache.acquire_block_ref(block)
     assert manager.prompt_admission_cost(seq) == 2
 
 
@@ -2418,7 +2710,7 @@ def test_quest_admission_counts_inflight_d2h_before_pressure_prompt():
     hit_seq.prefix_cache_hit_last_block_id = block_id
     assert manager.prompt_admission_cost(hit_seq) == 4
 
-    block.ref_count = 1
+    manager.prefix_cache.acquire_block_ref(block)
     assert manager.prompt_admission_free_slots() == 2
 
 

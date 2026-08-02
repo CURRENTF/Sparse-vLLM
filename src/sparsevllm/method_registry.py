@@ -100,6 +100,7 @@ QWEN3_MOE_EP_COMPATIBILITY = ModelRuntimeCompatibility(
             "",
             "streamingllm",
             "snapkv",
+            "h2o",
             "pyramidkv",
             "omnikv",
             "quest",

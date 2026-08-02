@@ -55,6 +55,15 @@ INLINE_SECRET_PATTERN = re.compile(
 )
 
 
+def _env_truthy(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 class RunnerError(RuntimeError):
     """Raised when an evaluation boundary cannot be validated."""
 
@@ -749,6 +758,12 @@ def normalize_results(
 
 class SweBenchLiteRunner:
     def __init__(self, args: argparse.Namespace):
+        if not hasattr(args, "offline_dataset"):
+            args.offline_dataset = not bool(
+                getattr(args, "allow_dataset_download", False)
+            )
+        if getattr(args, "chain_cache", None) is None:
+            args.chain_cache = _env_truthy("SPARSEVLLM_CHAIN_CACHE")
         self.args = args
         self.repo_root = Path(__file__).resolve().parents[2]
         self.swe_bench_dir = (
@@ -888,6 +903,10 @@ class SweBenchLiteRunner:
             env.pop("HF_HUB_OFFLINE", None)
         env.pop("MSWEA_GLOBAL_CALL_LIMIT", None)
         env.pop("MSWEA_GLOBAL_COST_LIMIT", None)
+        if bool(getattr(self.args, "chain_cache", False)):
+            env["SPARSEVLLM_CHAIN_CACHE"] = "1"
+        else:
+            env.pop("SPARSEVLLM_CHAIN_CACHE", None)
         return env
 
     def _load_selection(self) -> None:
@@ -963,6 +982,7 @@ class SweBenchLiteRunner:
             "max_tokens": self.args.max_tokens,
             "temperature": self.args.temperature,
             "top_p": self.args.top_p,
+            "chain_cache": bool(self.args.chain_cache),
             "seed": None,
             "seed_control": "not exposed by this adapter",
             "eval_timeout": self.args.eval_timeout,
@@ -1599,6 +1619,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-tokens", type=int, default=4096)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=1.0)
+    parser.add_argument(
+        "--chain-cache",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Enable Sparse-vLLM chain reuse in the mini-SWE-agent model adapter. "
+            "When omitted, SPARSEVLLM_CHAIN_CACHE is read once for compatibility; "
+            "the resolved value is persisted in run_config.json."
+        ),
+    )
     parser.add_argument(
         "--allow-image-pulls",
         action="store_true",

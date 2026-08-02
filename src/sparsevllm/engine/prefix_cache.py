@@ -810,8 +810,22 @@ class RadixPrefixIndex:
         self.backend = backend or RadixTreeBackend()
         self.blocks: dict[bytes, PrefixCacheBlock] = {}
         self._clock = 0
+        self._mutation_epoch = 0
+        self._capacity_epoch = 0
+        self._lookup_epoch = 0
+        self._insert_epoch = 0
+        self._remove_epoch = 0
+        self._freeable_cache_epoch = -1
+        self._freeable_block_ids_cache: frozenset[bytes] = frozenset()
+        self._evictable_cache_epoch = -1
+        self._evictable_blocks_cache = 0
+        self._device_freeable_cache_epoch = -1
+        self._device_freeable_block_ids_cache: frozenset[bytes] = frozenset()
+        self._device_reclaimable_cache_epoch = -1
+        self._device_reclaimable_block_ids_cache: frozenset[bytes] = frozenset()
 
         self.lookup_requests = 0
+        self.block_id_generation_requests = 0
         self.hit_requests = 0
         self.hit_tokens = 0
         self.hit_blocks = 0
@@ -824,6 +838,12 @@ class RadixPrefixIndex:
         self.control_inspect_requests = 0
         self.control_delete_requests = 0
         self.control_priority_updates = 0
+        self.freeable_scans = 0
+        self.freeable_cache_hits = 0
+        self.evictable_scans = 0
+        self.evictable_cache_hits = 0
+        self.device_reclaimable_scans = 0
+        self.device_reclaimable_cache_hits = 0
         self._routing_snapshot: PrefixCacheRoutingSnapshot | None = None
         self._routing_membership = _PrefixCacheRoutingMembership()
 
@@ -839,6 +859,85 @@ class RadixPrefixIndex:
     def _tick(self) -> int:
         self._clock += 1
         return self._clock
+
+    @property
+    def mutation_epoch(self) -> int:
+        return self._mutation_epoch
+
+    @property
+    def lookup_epoch(self) -> int:
+        return self._lookup_epoch
+
+    @property
+    def capacity_epoch(self) -> int:
+        return self._capacity_epoch
+
+    @property
+    def insert_epoch(self) -> int:
+        return self._insert_epoch
+
+    @property
+    def remove_epoch(self) -> int:
+        return self._remove_epoch
+
+    def _mark_mutated(self) -> None:
+        self._mutation_epoch += 1
+
+    def _mark_capacity_mutated(self) -> None:
+        self._capacity_epoch += 1
+        self._mark_mutated()
+
+    def _mark_inserted(self, *, capacity_changed: bool) -> None:
+        self._insert_epoch += 1
+        self._lookup_epoch += 1
+        if capacity_changed:
+            self._mark_capacity_mutated()
+        else:
+            self._mark_mutated()
+
+    def _mark_removed(self) -> None:
+        self._remove_epoch += 1
+        self._lookup_epoch += 1
+        self._mark_capacity_mutated()
+
+    def _validate_indexed_block(self, block: PrefixCacheBlock) -> None:
+        if self.blocks.get(block.stable_block_id) is not block:
+            raise RuntimeError("Cannot update a prefix block that is not indexed.")
+
+    def set_block_ref_count(
+        self,
+        block: PrefixCacheBlock,
+        ref_count: int,
+        *,
+        negative_error: str = "Prefix cache block ref_count became negative.",
+    ) -> None:
+        self._validate_indexed_block(block)
+        ref_count = int(ref_count)
+        if ref_count < 0:
+            raise RuntimeError(negative_error)
+        old_ref_count = int(block.ref_count)
+        if old_ref_count == ref_count:
+            return
+        block.ref_count = ref_count
+        if (old_ref_count == 0) != (ref_count == 0):
+            self._mark_capacity_mutated()
+        else:
+            self._mark_mutated()
+
+    def acquire_block_ref(self, block: PrefixCacheBlock) -> None:
+        self.set_block_ref_count(block, int(block.ref_count) + 1)
+
+    def release_block_ref(
+        self,
+        block: PrefixCacheBlock,
+        *,
+        negative_error: str = "Prefix cache block ref_count became negative.",
+    ) -> None:
+        self.set_block_ref_count(
+            block,
+            int(block.ref_count) - 1,
+            negative_error=negative_error,
+        )
 
     def stable_block_id(
         self,
@@ -890,10 +989,11 @@ class RadixPrefixIndex:
 
     def block_ids_for_tokens(
         self,
-        token_ids: list[int],
+        token_ids: list[int] | tuple[int, ...],
         *,
         max_tokens: int | None = None,
     ) -> list[bytes]:
+        self.block_id_generation_requests += 1
         token_limit = len(token_ids) if max_tokens is None else min(int(max_tokens), len(token_ids))
         token_limit = (token_limit // self.block_size) * self.block_size
         parent_block_id: bytes | None = None
@@ -912,6 +1012,12 @@ class RadixPrefixIndex:
         max_usable_tokens: int,
     ) -> tuple[int, bytes | None, int]:
         block_ids = self.block_ids_for_tokens(token_ids, max_tokens=max_usable_tokens)
+        return self.match_longest_block_ids(block_ids)
+
+    def match_longest_block_ids(
+        self,
+        block_ids: list[bytes] | tuple[bytes, ...],
+    ) -> tuple[int, bytes | None, int]:
         result = self.backend.lookup(block_ids, len(block_ids))
         if result.hit_block_count <= 0:
             return 0, None, 0
@@ -924,11 +1030,15 @@ class RadixPrefixIndex:
         *,
         max_usable_tokens: int,
     ) -> tuple[int, bytes | None, int]:
+        block_ids = self.block_ids_for_tokens(token_ids, max_tokens=max_usable_tokens)
+        return self.lookup_longest_block_ids(block_ids)
+
+    def lookup_longest_block_ids(
+        self,
+        block_ids: list[bytes] | tuple[bytes, ...],
+    ) -> tuple[int, bytes | None, int]:
         self.lookup_requests += 1
-        hit_len, last_block_id, hit_blocks = self.match_longest_prefix(
-            token_ids,
-            max_usable_tokens=max_usable_tokens,
-        )
+        hit_len, last_block_id, hit_blocks = self.match_longest_block_ids(block_ids)
         if hit_blocks <= 0:
             return 0, None, 0
         self.hit_requests += 1
@@ -1008,6 +1118,29 @@ class RadixPrefixIndex:
         self.backend.insert_child(block.parent_block_id, block.stable_block_id)
         self.committed_blocks += 1
         self._record_routing_insert(block.stable_block_id)
+        parent = (
+            None
+            if block.parent_block_id is None
+            else self.blocks.get(block.parent_block_id)
+        )
+        block_is_locally_blocked = (
+            int(block.ref_count) != 0
+            or int(block.eviction_priority) < 0
+            or block.residency.transfer is not None
+        )
+        parent_is_locally_blocked = (
+            parent is not None
+            and (
+                int(parent.ref_count) != 0
+                or int(parent.eviction_priority) < 0
+                or parent.residency.transfer is not None
+            )
+        )
+        capacity_changed = not (
+            block_is_locally_blocked
+            and (parent is None or parent_is_locally_blocked)
+        )
+        self._mark_inserted(capacity_changed=capacity_changed)
         return block
 
     def touch_chain(self, blocks: list[PrefixCacheBlock]) -> None:
@@ -1047,6 +1180,7 @@ class RadixPrefixIndex:
                 )
         block.residency.transfer = PrefixTransferKind.D2H
         block.residency.validate()
+        self._mark_capacity_mutated()
 
     def finish_d2h(self, block: PrefixCacheBlock) -> None:
         if block.residency.transfer != PrefixTransferKind.D2H:
@@ -1060,12 +1194,14 @@ class RadixPrefixIndex:
         block.residency.host_present = True
         block.residency.transfer = None
         block.residency.validate()
+        self._mark_capacity_mutated()
 
     def abort_d2h(self, block: PrefixCacheBlock) -> None:
         if block.residency.transfer != PrefixTransferKind.D2H:
             raise RuntimeError("Cannot abort D2H without an active D2H prefix transfer.")
         block.residency.transfer = None
         block.residency.validate()
+        self._mark_capacity_mutated()
 
     def begin_h2d(self, block: PrefixCacheBlock) -> None:
         if self.blocks.get(block.stable_block_id) is not block:
@@ -1086,12 +1222,14 @@ class RadixPrefixIndex:
         block.residency.device_present = True
         block.residency.transfer = PrefixTransferKind.H2D
         block.residency.validate()
+        self._mark_capacity_mutated()
 
     def finish_h2d(self, block: PrefixCacheBlock) -> None:
         if block.residency.transfer != PrefixTransferKind.H2D:
             raise RuntimeError("Cannot finish H2D without an active H2D prefix transfer.")
         block.residency.transfer = None
         block.residency.validate()
+        self._mark_capacity_mutated()
 
     def abort_h2d(self, block: PrefixCacheBlock) -> None:
         if block.residency.transfer != PrefixTransferKind.H2D:
@@ -1101,6 +1239,7 @@ class RadixPrefixIndex:
         block.residency.device_present = False
         block.residency.transfer = None
         block.residency.validate()
+        self._mark_capacity_mutated()
 
     def can_evict(self, block: PrefixCacheBlock) -> bool:
         if (
@@ -1130,7 +1269,7 @@ class RadixPrefixIndex:
         """Count device blocks reclaimable by repeated residency-leaf demotion."""
         return len(self.device_freeable_block_ids())
 
-    def device_freeable_block_ids(self) -> set[bytes]:
+    def device_freeable_block_ids(self) -> frozenset[bytes]:
         """Return blocks reclaimable by repeated device-residency demotion."""
         return self._device_reclaimable_block_ids(include_inflight_d2h=False)
 
@@ -1138,7 +1277,7 @@ class RadixPrefixIndex:
         """Count blocks admission may reclaim after pending D2H completes."""
         return len(self.device_reclaimable_block_ids())
 
-    def device_reclaimable_block_ids(self) -> set[bytes]:
+    def device_reclaimable_block_ids(self) -> frozenset[bytes]:
         """Return device blocks backed by host now or by an in-flight D2H.
 
         This is scheduler-facing capacity. Actual demotion must continue to use
@@ -1150,7 +1289,16 @@ class RadixPrefixIndex:
         self,
         *,
         include_inflight_d2h: bool,
-    ) -> set[bytes]:
+    ) -> frozenset[bytes]:
+        if include_inflight_d2h:
+            if self._device_reclaimable_cache_epoch == self._capacity_epoch:
+                self.device_reclaimable_cache_hits += 1
+                return self._device_reclaimable_block_ids_cache
+        elif self._device_freeable_cache_epoch == self._capacity_epoch:
+            self.device_reclaimable_cache_hits += 1
+            return self._device_freeable_block_ids_cache
+
+        self.device_reclaimable_scans += 1
         freeable: set[bytes] = set()
         device_children = {
             block_id: self.device_child_count(block_id)
@@ -1187,7 +1335,14 @@ class RadixPrefixIndex:
                 device_children[parent_id] -= 1
                 if device_children[parent_id] == 0:
                     stack.append(parent_id)
-        return freeable
+        result = frozenset(freeable)
+        if include_inflight_d2h:
+            self._device_reclaimable_cache_epoch = self._capacity_epoch
+            self._device_reclaimable_block_ids_cache = result
+        else:
+            self._device_freeable_cache_epoch = self._capacity_epoch
+            self._device_freeable_block_ids_cache = result
+        return result
 
     def demote_device_until_freeable(self, needed_blocks: int) -> list[PrefixCacheBlock]:
         demoted: list[PrefixCacheBlock] = []
@@ -1226,6 +1381,7 @@ class RadixPrefixIndex:
             block.residency.validate()
             demoted.append(block)
             self.device_demoted_blocks += 1
+            self._mark_capacity_mutated()
             queue_if_demotable(block.parent_block_id)
         return demoted
 
@@ -1278,7 +1434,11 @@ class RadixPrefixIndex:
         return evicted
 
     def evictable_blocks(self) -> int:
-        return sum(
+        if self._evictable_cache_epoch == self._capacity_epoch:
+            self.evictable_cache_hits += 1
+            return self._evictable_blocks_cache
+        self.evictable_scans += 1
+        self._evictable_blocks_cache = sum(
             1
             for block_id in self.backend.leaf_block_ids()
             if (block := self.blocks.get(block_id)) is not None
@@ -1286,9 +1446,16 @@ class RadixPrefixIndex:
             and int(block.eviction_priority) >= 0
             and block.residency.transfer is None
         )
+        self._evictable_cache_epoch = self._capacity_epoch
+        return self._evictable_blocks_cache
 
-    def freeable_block_ids(self) -> set[bytes]:
+    def freeable_block_ids(self) -> frozenset[bytes]:
         """Return blocks removable by repeated leaf eviction without mutating the tree."""
+        if self._freeable_cache_epoch == self._capacity_epoch:
+            self.freeable_cache_hits += 1
+            return self._freeable_block_ids_cache
+
+        self.freeable_scans += 1
         freeable: set[bytes] = set()
         subtree_freeable: dict[int, bool] = {}
         stack: list[tuple[RadixTreeNode, bool]] = [(self.backend.root, False)]
@@ -1324,7 +1491,9 @@ class RadixPrefixIndex:
 
             subtree_freeable[node_key] = suffix_freeable
 
-        return freeable
+        self._freeable_block_ids_cache = frozenset(freeable)
+        self._freeable_cache_epoch = self._capacity_epoch
+        return self._freeable_block_ids_cache
 
     def freeable_blocks(self) -> int:
         return len(self.freeable_block_ids())
@@ -1344,6 +1513,7 @@ class RadixPrefixIndex:
         self.backend.remove_block(stable_block_id)
         del self.blocks[stable_block_id]
         self._record_routing_remove(stable_block_id)
+        self._mark_removed()
         return block
 
     def rollback_inserted_leaf(self, block: PrefixCacheBlock) -> None:
@@ -1544,14 +1714,28 @@ class RadixPrefixIndex:
                 "eviction_priority": int(priority),
             }
         subtree_ids = self.backend.subtree_block_ids(result.last_block_id)
+        updated_block_count = 0
+        changed = False
+        capacity_changed = False
         for block_id in subtree_ids:
             block = self.blocks.get(block_id)
             if block is not None:
-                block.eviction_priority = int(priority)
+                updated_block_count += 1
+                if int(block.eviction_priority) != int(priority):
+                    old_priority = int(block.eviction_priority)
+                    block.eviction_priority = int(priority)
+                    changed = True
+                    capacity_changed = capacity_changed or (
+                        (old_priority < 0) != (int(priority) < 0)
+                    )
+        if capacity_changed:
+            self._mark_capacity_mutated()
+        elif changed:
+            self._mark_mutated()
         return {
             "matched": True,
             "root_block_id": result.last_block_id.hex(),
-            "updated_block_count": int(sum(1 for block_id in subtree_ids if block_id in self.blocks)),
+            "updated_block_count": int(updated_block_count),
             "eviction_priority": int(priority),
         }
 
@@ -1559,6 +1743,9 @@ class RadixPrefixIndex:
         tree_stats = self.backend.stats()
         stats = {
             "prefix_cache_lookup_requests": int(self.lookup_requests),
+            "prefix_cache_block_id_generation_requests": int(
+                self.block_id_generation_requests
+            ),
             "prefix_cache_hit_requests": int(self.hit_requests),
             "prefix_cache_hit_tokens": int(self.hit_tokens),
             "prefix_cache_hit_blocks": int(self.hit_blocks),
@@ -1588,6 +1775,21 @@ class RadixPrefixIndex:
             "prefix_cache_control_inspect_requests": int(self.control_inspect_requests),
             "prefix_cache_control_delete_requests": int(self.control_delete_requests),
             "prefix_cache_control_priority_updates": int(self.control_priority_updates),
+            "prefix_cache_mutation_epoch": int(self.mutation_epoch),
+            "prefix_cache_capacity_epoch": int(self.capacity_epoch),
+            "prefix_cache_lookup_epoch": int(self.lookup_epoch),
+            "prefix_cache_insert_epoch": int(self.insert_epoch),
+            "prefix_cache_remove_epoch": int(self.remove_epoch),
+            "prefix_cache_freeable_scans": int(self.freeable_scans),
+            "prefix_cache_freeable_cache_hits": int(self.freeable_cache_hits),
+            "prefix_cache_evictable_scans": int(self.evictable_scans),
+            "prefix_cache_evictable_cache_hits": int(self.evictable_cache_hits),
+            "prefix_cache_device_reclaimable_scans": int(
+                self.device_reclaimable_scans
+            ),
+            "prefix_cache_device_reclaimable_cache_hits": int(
+                self.device_reclaimable_cache_hits
+            ),
         }
         stats.update(tree_stats)
         return stats

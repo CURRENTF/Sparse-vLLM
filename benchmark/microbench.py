@@ -650,6 +650,14 @@ def benchmark_task(method, length, bs, args, results_dict):
                 f"request_seq_ids={request_seq_ids[:8]}."
             )
         preemptions = int(getattr(getattr(llm, "scheduler", None), "total_preemptions", 0) or 0)
+        recompute_replays = int(
+            getattr(
+                getattr(llm, "scheduler", None),
+                "total_recompute_replays",
+                0,
+            )
+            or 0
+        )
         cache_manager = getattr(getattr(llm, "model_runner", None), "cache_manager", None)
         if cache_manager is None or not hasattr(cache_manager, "memory_accounting"):
             raise RuntimeError("Sparse-VLLM cache manager does not expose memory_accounting().")
@@ -707,6 +715,7 @@ def benchmark_task(method, length, bs, args, results_dict):
             "measured_decode_steps_after_full": len(decode_times_after_full),
             "synchronize_step_timing": synchronize_step_timing,
             "scheduler_preemptions": preemptions,
+            "scheduler_recompute_replays": recompute_replays,
             "decode_cuda_graph_expected": bool(base_hyper_params.get("decode_cuda_graph")),
             **graph_status,
             "prefix_cache_required": bool(getattr(args, "require_prefix_cache_hit", False)),

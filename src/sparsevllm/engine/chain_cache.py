@@ -90,9 +90,10 @@ class ChainRecord:
     state: ChainState
     processed_token_count: int = 0
     processed_token_digest: bytes = b""
-    processed_token_ids: array = field(
+    token_ids: array = field(
         default_factory=lambda: array("I")
     )
+    last_input_token_count: int = 0
     last_access: int = 0
     physical_slots_by_layer: tuple[int, ...] = ()
     resident_rows: int = 1
@@ -106,6 +107,7 @@ class ChainAdmissionPlan:
     seq_id: int
     status: str
     reused_tokens: int
+    input_token_count: int = 0
     victim_chain_ids: tuple[str, ...] = ()
     reserved_slots_by_layer: tuple[int, ...] = ()
     reserved_rows: int = 0
@@ -366,8 +368,6 @@ class ChainCacheIndex:
             )
         logical_tokens = array("I")
         for index, raw_token_id in enumerate(token_ids):
-            if index >= processed_token_count:
-                break
             token_id = int(raw_token_id)
             if token_id < 0 or token_id > 0xFFFFFFFF:
                 raise ChainOwnerMismatchError(
@@ -376,7 +376,7 @@ class ChainCacheIndex:
                     chain_id=record.chain_id,
                 )
             logical_tokens.append(token_id)
-        if len(logical_tokens) != processed_token_count:
+        if len(logical_tokens) < processed_token_count:
             raise ChainOwnerMismatchError(
                 "Finished token sequence is shorter than the processed boundary: "
                 f"tokens={len(logical_tokens)}, "
@@ -385,7 +385,7 @@ class ChainCacheIndex:
             )
         next_total = (
             self._token_history_tokens
-            - len(record.processed_token_ids)
+            - len(record.token_ids)
             + len(logical_tokens)
         )
         if (
@@ -406,13 +406,13 @@ class ChainCacheIndex:
         record: ChainRecord,
         logical_tokens: array,
     ) -> None:
-        self._token_history_tokens -= len(record.processed_token_ids)
-        record.processed_token_ids = logical_tokens
+        self._token_history_tokens -= len(record.token_ids)
+        record.token_ids = logical_tokens
         self._token_history_tokens += len(logical_tokens)
 
     def _drop_token_history(self, record: ChainRecord) -> None:
-        self._token_history_tokens -= len(record.processed_token_ids)
-        record.processed_token_ids = array("I")
+        self._token_history_tokens -= len(record.token_ids)
+        record.token_ids = array("I")
 
     def lookup(self, chain_id: str) -> ChainRecord:
         chain_id = str(chain_id)
@@ -542,9 +542,60 @@ class ChainCacheIndex:
                 raise
             if digest != record.processed_token_digest:
                 self._stats["chain_cache_prefix_mismatch"] += 1
+                mismatch_details = ""
+                if token_ids is not None:
+                    expected = list(
+                        record.token_ids[
+                            : record.processed_token_count
+                        ]
+                    )
+                    actual = [
+                        int(token_id)
+                        for token_id in token_ids[
+                            : record.processed_token_count
+                        ]
+                    ]
+                    first_mismatch = next(
+                        (
+                            index
+                            for index, (expected_id, actual_id) in enumerate(
+                                zip(expected, actual)
+                            )
+                            if expected_id != actual_id
+                        ),
+                        min(len(expected), len(actual)),
+                    )
+                    stable_boundary = min(
+                        int(record.last_input_token_count),
+                        len(expected),
+                        len(actual),
+                    )
+                    stable_prefix_matches = (
+                        expected[:stable_boundary]
+                        == actual[:stable_boundary]
+                    )
+                    expected_id = (
+                        expected[first_mismatch]
+                        if first_mismatch < len(expected)
+                        else None
+                    )
+                    actual_id = (
+                        actual[first_mismatch]
+                        if first_mismatch < len(actual)
+                        else None
+                    )
+                    mismatch_details = (
+                        f" input_tokens={len(token_ids)},"
+                        f" last_input_token_count={record.last_input_token_count},"
+                        f" stable_prefix_matches={stable_prefix_matches},"
+                        f" first_mismatch={first_mismatch},"
+                        f" expected_token_id={expected_id},"
+                        f" actual_token_id={actual_id}."
+                    )
                 raise ChainPrefixMismatchError(
                     f"Input prefix does not match chain {chain_id!r} at "
-                    f"processed_token_count={record.processed_token_count}.",
+                    f"processed_token_count={record.processed_token_count}."
+                    f"{mismatch_details}",
                     chain_id=chain_id,
                 )
             status = "resumed"
@@ -589,6 +640,7 @@ class ChainCacheIndex:
             seq_id=int(seq_id),
             status=status,
             reused_tokens=reused_tokens,
+            input_token_count=int(input_token_count),
             victim_chain_ids=tuple(victims),
             reserved_slots_by_layer=tuple(
                 max(0, int(value)) for value in reserved_slots_by_layer
@@ -621,6 +673,7 @@ class ChainCacheIndex:
                 seq_id=int(plan.seq_id),
                 fingerprint=bytes(fingerprint),
                 state=ChainState.ACTIVE,
+                last_input_token_count=int(plan.input_token_count),
                 last_access=self._tick(),
             )
             self.records[plan.chain_id] = record
@@ -638,6 +691,7 @@ class ChainCacheIndex:
                 chain_id=plan.chain_id,
             )
         record.state = ChainState.ACTIVE
+        record.last_input_token_count = int(plan.input_token_count)
         record.last_access = self._tick()
         record.reserved_slots_by_layer = tuple(
             int(value) for value in plan.reserved_slots_by_layer
@@ -1067,7 +1121,10 @@ class ChainCacheCoordinator:
             token_ids,
             processed_token_count=processed_token_count,
         )
-        digest = stable_token_digest(logical_tokens)
+        digest = stable_token_digest(
+            logical_tokens,
+            count=processed_token_count,
+        )
         if (
             processed_token_count != int(record.processed_token_count)
             or digest != record.processed_token_digest

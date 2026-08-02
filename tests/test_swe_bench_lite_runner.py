@@ -155,12 +155,53 @@ class SweBenchLiteRunnerTest(unittest.TestCase):
     def test_model_environment_makes_benchmark_adapter_importable(self):
         runner = object.__new__(SweBenchLiteRunner)
         runner.repo_root = Path("/adapter").resolve()
-        runner.args = Namespace(api_proxy_from_environment=False, offline_dataset=False)
+        runner.args = Namespace(
+            api_proxy_from_environment=False,
+            offline_dataset=False,
+            chain_cache=True,
+        )
 
         with mock.patch.dict("os.environ", {"PYTHONPATH": "/existing"}, clear=True):
             env = runner._model_env()
 
         self.assertEqual(env["PYTHONPATH"], f"{runner.repo_root}:/existing")
+        self.assertEqual(env["SPARSEVLLM_CHAIN_CACHE"], "1")
+
+    def test_chain_cache_setting_is_resolved_once_from_environment(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            "os.environ",
+            {"SPARSEVLLM_CHAIN_CACHE": "true"},
+            clear=True,
+        ):
+            args = build_parser().parse_args(
+                ["--stage", "summarize", "--run-dir", tmp]
+            )
+            runner = SweBenchLiteRunner(args)
+            env = runner._model_env()
+
+        self.assertTrue(runner.args.chain_cache)
+        self.assertEqual(env["SPARSEVLLM_CHAIN_CACHE"], "1")
+
+    def test_chain_cache_cli_override_clears_ambient_setting(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            "os.environ",
+            {"SPARSEVLLM_CHAIN_CACHE": "1"},
+            clear=True,
+        ):
+            args = build_parser().parse_args(
+                [
+                    "--stage",
+                    "summarize",
+                    "--run-dir",
+                    tmp,
+                    "--no-chain-cache",
+                ]
+            )
+            runner = SweBenchLiteRunner(args)
+            env = runner._model_env()
+
+        self.assertFalse(runner.args.chain_cache)
+        self.assertNotIn("SPARSEVLLM_CHAIN_CACHE", env)
 
     def test_validate_predictions_rejects_missing_and_extra_ids(self):
         with self.assertRaisesRegex(RunnerError, "missing=.*b.*extra=.*c"):

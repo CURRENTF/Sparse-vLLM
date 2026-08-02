@@ -188,6 +188,39 @@ def test_packed_experts_own_rank_local_checkpoint_slices():
     assert not hasattr(model, "rank_local_special_weight_slice")
 
 
+def test_moe_block_honors_mlp_chunk_size():
+    config = _config(mlp_chunk_size=2)
+    model = _instantiate_model(config, _ep_context(0, 1))
+    block = model.model.layers[0].block_sparse_moe
+    hidden_states = torch.randn(5, config.hidden_size)
+    chunk_sizes = []
+
+    def gate_forward(chunk):
+        chunk_sizes.append(int(chunk.shape[0]))
+        return (
+            torch.empty(chunk.shape[0], config.num_local_experts),
+            torch.empty(chunk.shape[0], config.num_experts_per_tok),
+            torch.empty(
+                chunk.shape[0],
+                config.num_experts_per_tok,
+                dtype=torch.int64,
+            ),
+        )
+
+    with (
+        patch.object(block.gate, "forward", side_effect=gate_forward),
+        patch.object(
+            block.experts,
+            "forward",
+            side_effect=lambda chunk, _ids, _weights: chunk,
+        ),
+    ):
+        output = block(hidden_states)
+
+    assert chunk_sizes == [2, 2, 1]
+    assert torch.equal(output, hidden_states)
+
+
 class _FixedProjection(torch.nn.Module):
     def __init__(self, output):
         super().__init__()

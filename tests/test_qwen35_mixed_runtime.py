@@ -1452,7 +1452,7 @@ def test_mixed_admission_counts_inflight_d2h_before_pressure_prompt():
     )
     assert runtime_state.prompt_admission_costs(hit_seq)["slots"] == 5
 
-    block.ref_count = 1
+    prefix_cache.acquire_block_ref(block)
     assert runtime_state.prompt_admission_free_slots() == 4
 
 

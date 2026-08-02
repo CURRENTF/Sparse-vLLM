@@ -322,6 +322,11 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
     def __init__(self, config: Qwen3MoeConfig) -> None:
         super().__init__()
         self.parallel_context = get_parallel_context()
+        self.mlp_chunk_size = int(getattr(config, "mlp_chunk_size", 16384))
+        if self.mlp_chunk_size <= 0:
+            raise ValueError(
+                f"mlp_chunk_size must be > 0, got {self.mlp_chunk_size}."
+            )
         self.gate = Qwen3MoeRouter(config)
         self.experts = Qwen3MoePackedExperts(config)
 
@@ -333,12 +338,37 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         debug_enabled = os.getenv("SPARSEVLLM_DEBUG_MOE", "0") == "1"
         if debug_enabled:
             self.debug_last_input = hidden_states.detach().clone()
-        router_logits, topk_weights, topk_ids = self.gate(hidden_states)
-        local_output = self.experts(
-            hidden_states,
-            topk_ids,
-            topk_weights,
-        )
+
+        if int(hidden_states.shape[0]) <= self.mlp_chunk_size:
+            router_logits, topk_weights, topk_ids = self.gate(hidden_states)
+            local_output = self.experts(
+                hidden_states,
+                topk_ids,
+                topk_weights,
+            )
+        else:
+            router_logits_chunks = [] if debug_enabled else None
+            topk_weights_chunks = [] if debug_enabled else None
+            topk_ids_chunks = [] if debug_enabled else None
+            local_output_chunks = []
+            for chunk in hidden_states.split(self.mlp_chunk_size, dim=0):
+                router_logits, topk_weights, topk_ids = self.gate(chunk)
+                local_output = self.experts(
+                    chunk,
+                    topk_ids,
+                    topk_weights,
+                )
+                if debug_enabled:
+                    router_logits_chunks.append(router_logits)
+                    topk_weights_chunks.append(topk_weights)
+                    topk_ids_chunks.append(topk_ids)
+                local_output_chunks.append(local_output)
+
+            local_output = torch.cat(local_output_chunks, dim=0)
+            if debug_enabled:
+                router_logits = torch.cat(router_logits_chunks, dim=0)
+                topk_weights = torch.cat(topk_weights_chunks, dim=0)
+                topk_ids = torch.cat(topk_ids_chunks, dim=0)
 
         if debug_enabled:
             self.debug_last_router_logits = router_logits.detach().clone()
@@ -416,14 +446,17 @@ class Qwen3MoeForCausalLM(nn.Module):
         self._intentionally_skipped_expert_scales: set[str] = set()
 
     @torch.inference_mode()
-    def warmup_moe(self) -> None:
+    def warmup_moe(self, num_tokens: int = 1) -> None:
+        num_tokens = int(num_tokens)
+        if num_tokens <= 0:
+            raise ValueError(f"num_tokens must be > 0, got {num_tokens}.")
         block = self.model.layers[0].mlp
         experts = block.experts
         top_k = int(self.config.num_experts_per_tok)
         device = experts.w13_weight.device
         dtype = block.gate.weight.dtype
         hidden_states = torch.zeros(
-            (1, experts.hidden_size),
+            (num_tokens, experts.hidden_size),
             dtype=dtype,
             device=device,
         )
@@ -432,20 +465,24 @@ class Qwen3MoeForCausalLM(nn.Module):
             layer.self_attn.qkv_proj(hidden_states)
             layer.self_attn.o_proj(
                 torch.zeros(
-                    (1, layer.self_attn.q_size),
+                    (num_tokens, layer.self_attn.q_size),
                     dtype=dtype,
                     device=device,
                 )
             )
             block.gate(hidden_states)
         topk_ids = (
-            torch.arange(top_k, dtype=torch.int64, device=device)
+            torch.arange(
+                num_tokens * top_k,
+                dtype=torch.int64,
+                device=device,
+            )
             .remainder(experts.num_local_experts)
             .add(experts.local_expert_start)
-            .view(1, top_k)
+            .view(num_tokens, top_k)
         )
         topk_weights = torch.full(
-            (1, top_k),
+            (num_tokens, top_k),
             1.0 / top_k,
             dtype=dtype,
             device=device,

@@ -43,6 +43,7 @@ class _QueuedRequest:
     handle: RequestHandle
     admission_future: asyncio.Future
     chain_id: str | None = None
+    chain_append_only: bool = False
 
 
 @dataclass
@@ -171,6 +172,7 @@ class AsyncEngineDispatcher:
         index: int,
         stop: list[str] | None = None,
         chain_id: str | None = None,
+        chain_append_only: bool = False,
     ) -> RequestHandle:
         output_queue: asyncio.Queue = asyncio.Queue()
         cancelled = threading.Event()
@@ -189,6 +191,7 @@ class AsyncEngineDispatcher:
             handle=handle,
             admission_future=admission_future,
             chain_id=chain_id,
+            chain_append_only=bool(chain_append_only),
         )
         with self._state_lock:
             terminal_message = self._terminal_message_locked()
@@ -210,6 +213,7 @@ class AsyncEngineDispatcher:
         index: int,
         stop: list[str] | None = None,
         chain_id: str | None = None,
+        chain_append_only: bool = False,
     ) -> RequestHandle:
         handle = await self.submit(
             prompt,
@@ -217,6 +221,7 @@ class AsyncEngineDispatcher:
             index,
             stop,
             chain_id=chain_id,
+            chain_append_only=chain_append_only,
         )
         if handle.admission_future is not None:
             try:
@@ -549,10 +554,13 @@ class AsyncEngineDispatcher:
             detokenizer = IncrementalDetokenizer(self.engine.tokenizer)
             admit = getattr(self.engine, "admit_request", None)
             if callable(admit):
+                admission_kwargs = {"chain_id": item.chain_id}
+                if item.chain_append_only:
+                    admission_kwargs["chain_append_only"] = True
                 admission = admit(
                     item.prompt,
                     item.sampling_params,
-                    chain_id=item.chain_id,
+                    **admission_kwargs,
                 )
                 seq_id = int(admission.seq_id)
                 item.handle.chain_id = admission.chain_id

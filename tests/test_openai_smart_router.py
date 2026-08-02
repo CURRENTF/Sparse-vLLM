@@ -224,6 +224,42 @@ class OpenAISmartRouterTest(unittest.TestCase):
             },
         )
 
+    def test_route_headers_preserve_recreated_upstream_chain_id(self):
+        from starlette.responses import Response
+
+        from sparsevllm.entrypoints.openai.smart_router import (
+            _route_response_headers,
+            _with_route_headers,
+        )
+
+        route = {
+            "selected_worker_url": "http://worker-a",
+            "reason": "chain_affinity",
+            "selected_sparse_method": "snapkv",
+            "chain_id": "old-chain",
+        }
+        upstream = {
+            "content-type": "application/json",
+            "x-sparsevllm-chain-id": "new-chain",
+        }
+
+        self.assertEqual(
+            _route_response_headers(upstream, route)[
+                "X-SparseVLLM-Chain-ID"
+            ],
+            "new-chain",
+        )
+        response = Response(
+            content=b"{}",
+            headers={"X-SparseVLLM-Chain-ID": "new-chain"},
+        )
+        self.assertEqual(
+            _with_route_headers(response, route).headers[
+                "X-SparseVLLM-Chain-ID"
+            ],
+            "new-chain",
+        )
+
     def test_worker_readiness_failure_is_removed_and_recovery_is_detected(self):
         from sparsevllm.entrypoints.openai import smart_router
 

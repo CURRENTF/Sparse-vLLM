@@ -103,6 +103,7 @@ class SparseController:
         for i in range(self.num_layers):
             self.layer_batch_sparse_states[i] = LayerBatchSparseState()
         self._decode_attn_score_buffers: dict[int, torch.Tensor] = {}
+        self._omnikv_decode_attn_score_buffer: torch.Tensor | None = None
         self._snapkv_decode_reduced_attn_score_buffers: dict[int, torch.Tensor] = {}
         self._h2o_decode_attn_score_buffers: dict[tuple[int, ...], torch.Tensor] = {}
 
@@ -144,11 +145,14 @@ class SparseController:
 
     def clear_decode_attn_score_buffers(self):
         self._decode_attn_score_buffers.clear()
+        self._omnikv_decode_attn_score_buffer = None
         self._snapkv_decode_reduced_attn_score_buffers.clear()
         self._h2o_decode_attn_score_buffers.clear()
 
     def decode_cuda_graph_keepalive_tensors(self) -> list[torch.Tensor]:
         tensors = self.activation_controller.decode_cuda_graph_keepalive_tensors()
+        if self._omnikv_decode_attn_score_buffer is not None:
+            tensors.append(self._omnikv_decode_attn_score_buffer)
         tensors.extend(self._snapkv_decode_reduced_attn_score_buffers.values())
         tensors.extend(self._h2o_decode_attn_score_buffers.values())
         return tensors
@@ -244,6 +248,7 @@ class SparseController:
         ctx = get_context()
         ctx.sparse_config = self.sparse_config if self.sparse_method else None
         self.activation_controller.prepare_forward(seqs, is_prefill)
+        omnikv_decode_score_specs: list[tuple[int, int, int, int]] = []
 
         for i in range(self.num_layers):
             state = self.layer_batch_sparse_states[i]
@@ -309,6 +314,10 @@ class SparseController:
                             max_len,
                             fill_value=_val,
                         )
+                    elif self.sparse_method == "omnikv":
+                        omnikv_decode_score_specs.append(
+                            (i, batch_size, num_heads, max_len)
+                        )
                     else:
                         state.attn_score = self._get_decode_attn_score_buffer(
                             i,
@@ -317,6 +326,11 @@ class SparseController:
                             max_len,
                             fill_value=_val,
                         )
+        if omnikv_decode_score_specs:
+            self._prepare_omnikv_decode_attn_score_buffer(
+                omnikv_decode_score_specs,
+                fill_value=-1e20,
+            )
         if not is_prefill and self.sparse_method == "h2o":
             self._prepare_h2o_decode_attn_score_buffer(seqs)
 
@@ -471,6 +485,39 @@ class SparseController:
         self,
         refs: dict[int, dict[str, object]],
     ) -> bool:
+        if self.sparse_method == "omnikv":
+            score_views = []
+            for layer_idx in self.obs_layer_ids:
+                score = refs.get(int(layer_idx), {}).get("attn_score")
+                if score is None:
+                    continue
+                if not isinstance(score, torch.Tensor) or score.dim() != 3:
+                    raise RuntimeError(
+                        "OmniKV decode CUDA graph requires raw [B, H, L] score "
+                        f"views at graph input: layer={layer_idx} score={score!r}."
+                    )
+                score_views.append(score)
+            if not score_views:
+                return False
+            storage_ptr = score_views[0].untyped_storage().data_ptr()
+            if any(
+                score.untyped_storage().data_ptr() != storage_ptr
+                for score in score_views[1:]
+            ):
+                raise RuntimeError(
+                    "OmniKV observation layers do not share one decode score workspace."
+                )
+            reset_views = {}
+            for score in score_views:
+                key = (
+                    score.data_ptr(),
+                    tuple(score.shape),
+                    tuple(score.stride()),
+                )
+                reset_views.setdefault(key, score)
+            for score in reset_views.values():
+                score.fill_(-1e20)
+            return True
         if self.sparse_method != "h2o":
             return False
         layer_tensors = {
@@ -501,6 +548,49 @@ class SparseController:
             residual,
             context,
         )
+
+    def _prepare_omnikv_decode_attn_score_buffer(
+        self,
+        score_specs: list[tuple[int, int, int, int]],
+        *,
+        fill_value: float,
+    ):
+        """Assign every OmniKV observation layer a view of one raw workspace."""
+        if not score_specs:
+            return
+        if any(
+            min(batch_size, num_heads, max_len) <= 0
+            for _, batch_size, num_heads, max_len in score_specs
+        ):
+            raise RuntimeError(
+                "OmniKV decode score workspace requires positive layer shapes: "
+                f"specs={score_specs}."
+            )
+        max_batch_size = max(batch_size for _, batch_size, _, _ in score_specs)
+        max_num_heads = max(num_heads for _, _, num_heads, _ in score_specs)
+        max_len = max(length for _, _, _, length in score_specs)
+        buf = self._omnikv_decode_attn_score_buffer
+        if (
+            buf is None
+            or buf.dtype != self.attn_score_dtype
+            or buf.device != self.device
+            or int(buf.shape[0]) < int(max_batch_size)
+            or int(buf.shape[1]) < int(max_num_heads)
+            or int(buf.shape[2]) < int(max_len)
+        ):
+            buf = torch.empty(
+                (int(max_batch_size), int(max_num_heads), int(max_len)),
+                dtype=self.attn_score_dtype,
+                device=self.device,
+            )
+            self._omnikv_decode_attn_score_buffer = buf
+        buf[:max_batch_size, :max_num_heads, :max_len].fill_(fill_value)
+        for layer_idx, batch_size, num_heads, layer_max_len in score_specs:
+            self.layer_batch_sparse_states[int(layer_idx)].attn_score = buf[
+                :batch_size,
+                :num_heads,
+                :layer_max_len,
+            ]
 
     def _get_decode_attn_score_buffer(
         self,
@@ -640,6 +730,7 @@ class SparseController:
                 kv_len = (
                     int(physical_len(layer_idx, seq.seq_id))
                     if getattr(seq, "chain_status", "") == "resumed"
+                    and not bool(getattr(seq, "is_recompute_replay", False))
                     and callable(physical_len)
                     else int(seq.num_prefilled_tokens)
                     + int(seq.current_chunk_size)
@@ -930,6 +1021,7 @@ class SparseController:
                 kv_len = (
                     int(physical_len(layer_idx, seq.seq_id))
                     if getattr(seq, "chain_status", "") == "resumed"
+                    and not bool(getattr(seq, "is_recompute_replay", False))
                     and callable(physical_len)
                     else int(seq.num_prefilled_tokens)
                     + int(seq.current_chunk_size)

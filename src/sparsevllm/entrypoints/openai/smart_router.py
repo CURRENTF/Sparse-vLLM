@@ -606,10 +606,10 @@ class SmartRouter:
                 return Response(
                     content=upstream.body,
                     status_code=upstream.status,
-                    headers={**_content_headers(upstream.headers), **route_headers(route)},
+                    headers=_route_response_headers(upstream.headers, route),
                 )
             opened_response = upstream.response
-            response_headers = {**_content_headers(upstream.headers), **route_headers(route)}
+            response_headers = _route_response_headers(upstream.headers, route)
 
             async def _stream():
                 try:
@@ -818,9 +818,27 @@ def route_headers(route: dict[str, Any]) -> dict[str, str]:
     return headers
 
 
+def _route_response_headers(
+    upstream_headers: dict[str, str],
+    route: dict[str, Any],
+) -> dict[str, str]:
+    content_headers = _content_headers(upstream_headers)
+    headers = {**content_headers, **route_headers(route)}
+    # The worker may replace a mismatched chain with a new identity. Its
+    # response header is authoritative; route metadata only describes the
+    # identity used to select the worker.
+    returned_chain_id = content_headers.get("X-SparseVLLM-Chain-ID")
+    if returned_chain_id:
+        headers["X-SparseVLLM-Chain-ID"] = returned_chain_id
+    return headers
+
+
 def _with_route_headers(response: Response, route: dict[str, Any]) -> Response:
+    returned_chain_id = response.headers.get("X-SparseVLLM-Chain-ID")
     for key, value in route_headers(route).items():
         response.headers[key] = value
+    if returned_chain_id:
+        response.headers["X-SparseVLLM-Chain-ID"] = returned_chain_id
     return response
 
 

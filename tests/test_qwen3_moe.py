@@ -331,6 +331,96 @@ def test_moe_block_reduces_in_activation_dtype():
     assert torch.equal(output, local_output)
 
 
+def test_moe_block_honors_mlp_chunk_size():
+    config = _config()
+    config.mlp_chunk_size = 2
+    context = _ep_context(0, 1)
+    with (
+        patch("sparsevllm.models.qwen3_moe.get_parallel_context", return_value=context),
+        patch(
+            "sparsevllm.models.qwen3_moe.resolve_moe_provider",
+            return_value=TritonMoeProvider(),
+        ),
+    ):
+        block = Qwen3MoeSparseMoeBlock(config)
+
+    hidden_states = torch.randn(5, config.hidden_size)
+    chunk_sizes = []
+
+    def gate_forward(chunk):
+        chunk_sizes.append(int(chunk.shape[0]))
+        return (
+            torch.empty(chunk.shape[0], config.num_experts),
+            torch.empty(chunk.shape[0], config.num_experts_per_tok),
+            torch.empty(
+                chunk.shape[0],
+                config.num_experts_per_tok,
+                dtype=torch.int64,
+            ),
+        )
+
+    with (
+        patch.object(block.gate, "forward", side_effect=gate_forward),
+        patch.object(
+            block.experts,
+            "forward",
+            side_effect=lambda chunk, _ids, _weights: chunk,
+        ),
+    ):
+        output = block(hidden_states)
+
+    assert chunk_sizes == [2, 2, 1]
+    assert torch.equal(output, hidden_states)
+
+
+def test_moe_chunking_does_not_concatenate_debug_metadata_when_disabled():
+    config = _config()
+    config.mlp_chunk_size = 2
+    context = _ep_context(0, 1)
+    with (
+        patch(
+            "sparsevllm.models.qwen3_moe.get_parallel_context",
+            return_value=context,
+        ),
+        patch(
+            "sparsevllm.models.qwen3_moe.resolve_moe_provider",
+            return_value=TritonMoeProvider(),
+        ),
+    ):
+        block = Qwen3MoeSparseMoeBlock(config)
+    hidden_states = torch.randn(5, config.hidden_size)
+    real_cat = torch.cat
+
+    with (
+        patch.object(
+            block.gate,
+            "forward",
+            side_effect=lambda chunk: (
+                torch.empty(chunk.shape[0], config.num_experts),
+                torch.empty(chunk.shape[0], config.num_experts_per_tok),
+                torch.empty(
+                    chunk.shape[0],
+                    config.num_experts_per_tok,
+                    dtype=torch.int64,
+                ),
+            ),
+        ),
+        patch.object(
+            block.experts,
+            "forward",
+            side_effect=lambda chunk, _ids, _weights: chunk,
+        ),
+        patch(
+            "sparsevllm.models.qwen3_moe.torch.cat",
+            wraps=real_cat,
+        ) as cat,
+    ):
+        output = block(hidden_states)
+
+    assert torch.equal(output, hidden_states)
+    assert cat.call_count == 1
+
+
 def test_decoder_layer_broadcasts_attention_output_before_post_norm():
     config = _config()
     context = _ep_context(0, 2)
@@ -369,12 +459,12 @@ def test_decoder_layer_broadcasts_attention_output_before_post_norm():
     ]
 
 
-def test_moe_warmup_uses_one_local_decode_assignment():
+def test_moe_warmup_uses_requested_tokens_and_balanced_local_assignments():
     config = _config(num_experts_per_tok=3)
     context = _ep_context(1, 2)
     model = _instantiate_model(config, context)
     experts = model.model.layers[0].mlp.experts
-    expected = torch.zeros(1, config.hidden_size)
+    expected = torch.zeros(5, config.hidden_size)
 
     with (
         patch.object(experts, "forward", return_value=expected) as forward,
@@ -382,13 +472,28 @@ def test_moe_warmup_uses_one_local_decode_assignment():
             "sparsevllm.models.qwen3_moe.device_runtime.synchronize"
         ) as synchronize,
     ):
-        model.warmup_moe()
+        model.warmup_moe(num_tokens=5)
 
     hidden_states, topk_ids, topk_weights = forward.call_args.args
-    assert hidden_states.shape == (1, config.hidden_size)
-    assert topk_ids.tolist() == [[2, 3, 2]]
-    assert torch.allclose(topk_weights, torch.full((1, 3), 1 / 3))
+    assert hidden_states.shape == (5, config.hidden_size)
+    assert topk_ids.tolist() == [
+        [2, 3, 2],
+        [3, 2, 3],
+        [2, 3, 2],
+        [3, 2, 3],
+        [2, 3, 2],
+    ]
+    assert torch.allclose(topk_weights, torch.full((5, 3), 1 / 3))
     synchronize.assert_called_once()
+
+
+def test_moe_warmup_rejects_non_positive_token_count():
+    config = _config()
+    context = _ep_context(0, 1)
+    model = _instantiate_model(config, context)
+
+    with pytest.raises(ValueError, match="num_tokens must be > 0"):
+        model.warmup_moe(num_tokens=0)
 
 
 def test_packed_expert_weight_mapping():

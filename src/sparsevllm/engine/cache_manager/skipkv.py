@@ -122,7 +122,7 @@ class SkipKVCacheManager(RKVCacheManager):
                 if row_idx is None:
                     continue
                 self._skipkv_row_gen_indices[layer_idx].setdefault(int(row_idx), []).append(
-                    int(seq.num_tokens) - 1
+                    seq.decode_input_position
                 )
 
     def _get_seq_state(self, seq: Sequence) -> SkipKVSequenceState:
@@ -138,10 +138,10 @@ class SkipKVCacheManager(RKVCacheManager):
         if not self._skipkv_delimiter_token_ids:
             return
         for b_idx, seq in enumerate(seqs):
-            token_pos = int(seq.num_tokens) - 1
+            token_pos = seq.decode_input_position
             if token_pos < int(seq.num_prompt_tokens):
                 continue
-            token_id = int(seq.last_token) if seq.last_token is not None else -1
+            token_id = seq.decode_input_token
             state = self._get_seq_state(seq)
             if state.open_start_gen is None:
                 state.open_start_gen = token_pos

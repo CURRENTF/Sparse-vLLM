@@ -385,8 +385,8 @@ class H2OCacheManager(SnapKVCacheManager):
                 batch_cols_gpu[None, :],
             ] = rows_i32_gpu[None, :]
 
-            input_ids_list = [int(seq.last_token) for seq in seqs]
-            positions_list = [int(seq.num_tokens - 1) for seq in seqs]
+            input_ids_list = [seq.decode_input_token for seq in seqs]
+            positions_list = [seq.decode_input_position for seq in seqs]
             input_ids[:real_batch_size].copy_(
                 torch.tensor(input_ids_list, dtype=torch.int64, device=self.device)
             )

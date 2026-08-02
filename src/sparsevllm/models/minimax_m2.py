@@ -255,6 +255,11 @@ class MiniMaxM2SparseMoeBlock(nn.Module):
     def __init__(self, config) -> None:
         super().__init__()
         self.parallel_context = get_parallel_context()
+        self.mlp_chunk_size = int(getattr(config, "mlp_chunk_size", 16384))
+        if self.mlp_chunk_size <= 0:
+            raise ValueError(
+                f"mlp_chunk_size must be > 0, got {self.mlp_chunk_size}."
+            )
         self.gate = MiniMaxM2Router(config)
         self.experts = MiniMaxM2PackedExperts(config)
 
@@ -267,8 +272,21 @@ class MiniMaxM2SparseMoeBlock(nn.Module):
             raise ValueError(
                 f"MiniMax M2 MoE expects [tokens, hidden], got {tuple(hidden_states.shape)}."
             )
-        _, topk_weights, topk_ids = self.gate(hidden_states)
-        local_output = self.experts(hidden_states, topk_ids, topk_weights)
+        if int(hidden_states.shape[0]) <= self.mlp_chunk_size:
+            _, topk_weights, topk_ids = self.gate(hidden_states)
+            local_output = self.experts(
+                hidden_states,
+                topk_ids,
+                topk_weights,
+            )
+        else:
+            local_output_chunks = []
+            for chunk in hidden_states.split(self.mlp_chunk_size, dim=0):
+                _, topk_weights, topk_ids = self.gate(chunk)
+                local_output_chunks.append(
+                    self.experts(chunk, topk_ids, topk_weights)
+                )
+            local_output = torch.cat(local_output_chunks, dim=0)
         return self.parallel_context.world_all_reduce(local_output)
 
 
@@ -413,19 +431,22 @@ class MiniMaxM2ForCausalLM(nn.Module):
         self._intentionally_skipped_expert_scales: set[str] = set()
 
     @torch.inference_mode()
-    def warmup_moe(self) -> None:
+    def warmup_moe(self, num_tokens: int = 1) -> None:
+        num_tokens = int(num_tokens)
+        if num_tokens <= 0:
+            raise ValueError(f"num_tokens must be > 0, got {num_tokens}.")
         layer = self.model.layers[0]
         experts = layer.block_sparse_moe.experts
         device = experts.w13_weight.device
         hidden_states = torch.zeros(
-            (1, experts.hidden_size),
+            (num_tokens, experts.hidden_size),
             dtype=torch.bfloat16,
             device=device,
         )
         layer.self_attn.qkv_proj(hidden_states)
         layer.self_attn.o_proj(
             torch.zeros(
-                (1, layer.self_attn.q_size),
+                (num_tokens, layer.self_attn.q_size),
                 dtype=hidden_states.dtype,
                 device=device,
             )
@@ -433,13 +454,17 @@ class MiniMaxM2ForCausalLM(nn.Module):
         layer.block_sparse_moe.gate(hidden_states)
         top_k = int(self.config.num_experts_per_tok)
         topk_ids = (
-            torch.arange(top_k, dtype=torch.int64, device=device)
+            torch.arange(
+                num_tokens * top_k,
+                dtype=torch.int64,
+                device=device,
+            )
             .remainder(experts.num_local_experts)
             .add(experts.local_expert_start)
-            .view(1, top_k)
+            .view(num_tokens, top_k)
         )
         topk_weights = torch.full(
-            (1, top_k),
+            (num_tokens, top_k),
             1.0 / top_k,
             dtype=torch.float32,
             device=device,

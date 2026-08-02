@@ -93,71 +93,34 @@ def test_chain_create_finish_resume_and_processed_digest():
     assert resumed.seq_id == 7
 
 
-def test_chain_text_continuation_preserves_resident_token_identity():
-    class MergeTokenizer:
-        bos_token = None
-
-        def encode(self, text, add_special_tokens=False):
-            del add_special_tokens
-            values = {
-                "ab": [3],
-                "ab!": [3, 4],
-                "!": [4],
-            }
-            return values[text]
-
-        def decode(
-            self,
-            token_ids,
-            *,
-            skip_special_tokens=False,
-            clean_up_tokenization_spaces=False,
-        ):
-            del skip_special_tokens, clean_up_tokenization_spaces
-            if list(token_ids) != [1, 2]:
-                raise AssertionError(token_ids)
-            return "ab"
-
+def test_chain_keeps_full_tokens_independent_of_sparse_physical_slots():
     index = ChainCacheIndex()
-    record = _create_and_finish(index, "chain-a", 1, [1, 2])
-    engine = object.__new__(LLMEngine)
-    engine.tokenizer = MergeTokenizer()
+    plan = index.plan_admission(
+        chain_id="chain-a",
+        seq_id=7,
+        token_ids=[10, 11],
+        fingerprint=FINGERPRINT,
+    )
+    index.apply_admission(plan, fingerprint=FINGERPRINT)
+    record = index.finish(
+        "chain-a",
+        token_ids=[10, 11, 20, 21, 99],
+        processed_token_count=4,
+        physical_slots_by_layer=(2, 3),
+    )
 
-    assert engine._tokenize_prompt("ab!") == [3, 4]
-    assert engine._tokenize_chain_continuation("ab!", record) == [1, 2, 4]
+    assert list(record.token_ids) == [10, 11, 20, 21, 99]
+    assert record.processed_token_count == 4
+    assert record.physical_slots_by_layer == (2, 3)
 
-
-def test_chain_text_continuation_preserves_identity_after_automatic_bos():
-    class MergeTokenizer:
-        bos_token = "<bos>"
-
-        def encode(self, text, add_special_tokens=False):
-            values = {
-                "ab!": [3, 4],
-                "!": [4],
-            }
-            token_ids = values[text]
-            return [0, *token_ids] if add_special_tokens else token_ids
-
-        def decode(
-            self,
-            token_ids,
-            *,
-            skip_special_tokens=False,
-            clean_up_tokenization_spaces=False,
-        ):
-            del skip_special_tokens, clean_up_tokenization_spaces
-            if list(token_ids) != [1, 2]:
-                raise AssertionError(token_ids)
-            return "ab"
-
-    index = ChainCacheIndex()
-    record = _create_and_finish(index, "chain-a", 1, [0, 1, 2])
-    engine = object.__new__(LLMEngine)
-    engine.tokenizer = MergeTokenizer()
-
-    assert engine._tokenize_prompt("ab!") == [0, 3, 4]
-    assert engine._tokenize_chain_continuation("ab!", record) == [0, 1, 2, 4]
+    resumed = index.plan_admission(
+        chain_id="chain-a",
+        seq_id=7,
+        token_ids=[10, 11, 20, 21, 99, 30],
+        fingerprint=FINGERPRINT,
+    )
+    assert resumed.status == "resumed"
+    assert resumed.reused_tokens == 4
 
 
 def test_discard_chain_targets_expected_resident_sequence():
@@ -341,17 +304,17 @@ def test_chain_token_history_is_compact_bounded_and_reclaimed():
     index = ChainCacheIndex(max_token_history_tokens=4)
     first = _create_and_finish(index, "first", 1, [1, 2, 3])
 
-    assert first.processed_token_ids.typecode == "I"
-    assert list(first.processed_token_ids) == [1, 2, 3]
+    assert first.token_ids.typecode == "I"
+    assert list(first.token_ids) == [1, 2, 3]
     assert index.stats()["chain_cache_token_history_tokens"] == 3
     assert index.stats()["chain_cache_token_history_capacity"] == 4
     assert (
         index.stats()["chain_cache_token_history_bytes"]
-        == 3 * first.processed_token_ids.itemsize
+        == 3 * first.token_ids.itemsize
     )
     assert (
         index.stats()["chain_cache_token_history_byte_capacity"]
-        == 4 * first.processed_token_ids.itemsize
+        == 4 * first.token_ids.itemsize
     )
 
     second_plan = index.plan_admission(
@@ -371,7 +334,7 @@ def test_chain_token_history_is_compact_bounded_and_reclaimed():
     assert index.lookup("second").state is ChainState.ACTIVE
 
     evicted = index.evict("first")
-    assert list(evicted.processed_token_ids) == []
+    assert list(evicted.token_ids) == []
     index.finish(
         "second",
         token_ids=[4, 5],
@@ -535,6 +498,64 @@ def test_runtime_chain_lru_reclaims_payload_before_reusing_capacity():
     assert coordinator.index.lookup("newer").state is ChainState.IDLE
 
 
+def test_runtime_warmup_reset_reclaims_chain_payload_before_metadata():
+    class CacheManager:
+        def __init__(self):
+            self.freed = []
+
+        def free_seq(self, seq_id):
+            self.freed.append(int(seq_id))
+
+    config = SimpleNamespace(
+        vllm_sparse_method="snapkv",
+        model="/models/test",
+        hf_config=SimpleNamespace(model_type="test", torch_dtype="float16"),
+        tensor_parallel_size=1,
+        max_model_len=128,
+        prefix_cache_salt="",
+        chain_cache_max_tombstones=8,
+        full_attn_layers=[],
+        num_sink_tokens=1,
+        num_recent_tokens=1,
+        decode_keep_tokens=4,
+        snapkv_window_size=2,
+        snapkv_num_full_layers=0,
+        sparse_attn_score_dtype="float32",
+        pool_kernel_size=1,
+    )
+    cache_manager = CacheManager()
+    coordinator = ChainCacheCoordinator(config, cache_manager)
+    runtime_state = RuntimeState(
+        config,
+        cache_manager,
+        chain_cache_coordinator=coordinator,
+    )
+    for seq_id, chain_id in ((11, "warmup-a"), (12, "warmup-b")):
+        plan = coordinator.index.plan_admission(
+            chain_id=chain_id,
+            seq_id=seq_id,
+            token_ids=[seq_id],
+            fingerprint=coordinator.fingerprint,
+        )
+        coordinator.index.apply_admission(
+            plan,
+            fingerprint=coordinator.fingerprint,
+        )
+        coordinator.index.finish(
+            chain_id,
+            token_ids=[seq_id],
+            processed_token_count=1,
+            physical_slots_by_layer=(1,),
+        )
+        runtime_state._resident_seq_ids.add(seq_id)
+
+    runtime_state.reset_after_warmup()
+
+    assert cache_manager.freed == [11, 12]
+    assert coordinator.index.records == {}
+    assert runtime_state._resident_seq_ids == set()
+
+
 def test_snapkv_resumed_prefill_score_uses_physical_coordinates():
     manager = object.__new__(SnapKVCacheManager)
     manager.config = SimpleNamespace(
@@ -584,6 +605,33 @@ def test_snapkv_resumed_prefill_skips_score_below_physical_budget():
     seq.current_chunk_size = 10
 
     assert manager._prefill_score_rows(0, [seq]) == []
+
+
+def test_snapkv_recompute_replay_scores_the_full_prompt_window():
+    manager = object.__new__(SnapKVCacheManager)
+    manager.config = SimpleNamespace(
+        vllm_sparse_method="snapkv",
+        snapkv_num_full_layers=0,
+        snapkv_window_size=8,
+        num_sink_tokens=2,
+        decode_keep_tokens=16,
+        num_recent_tokens=4,
+    )
+    manager.kv_layer_index = lambda layer_idx: int(layer_idx)
+    seq = Sequence(
+        list(range(100)),
+        SamplingParams(max_tokens=2, temperature=0.0),
+    )
+    seq.chain_status = "resumed"
+    seq.chain_reused_tokens = 96
+    seq.append_token(100)
+    seq.start_recompute_replay()
+    seq.num_prefilled_tokens = 92
+    seq.current_chunk_size = 8
+
+    rows = manager._prefill_score_rows(0, [seq])
+
+    assert rows == [(0, seq, 92, 100)]
 
 
 def test_pyramid_chain_resume_disables_long_prefill_staging():
@@ -933,12 +981,19 @@ def test_engine_chain_admission_reuses_resident_seq_and_logical_boundary():
         stable_token_digest([1, 2, 3, 9], count=3),
         3,
     )
+    coordinator.remember_processed_tokens(
+        chain_id=first.chain_id,
+        seq_id=first.seq_id,
+        token_ids=[1, 2, 3, 9],
+        processed_token_count=3,
+    )
     assert cache_manager.finished_turns == [(first.seq_id, 3)]
     engine._active_chain_sequences.clear()
     resumed = engine.admit_request(
-        [1, 2, 3, 9, 5],
+        [5],
         params,
         chain_id=first.chain_id,
+        chain_append_only=True,
     )
 
     assert resumed.seq_id == first.seq_id
@@ -963,10 +1018,28 @@ def test_engine_chain_admission_reuses_resident_seq_and_logical_boundary():
         (resumed.seq_id, 4),
     ]
     engine._active_chain_sequences.clear()
-    engine.abort_request(resumed.seq_id)
-    engine.abort_request(resumed.seq_id)
+
+    recreated = engine.admit_request(
+        [1, 2, 99],
+        params,
+        chain_id=resumed.chain_id,
+    )
+
+    assert recreated.chain_id != resumed.chain_id
+    assert recreated.seq_id == resumed.seq_id
+    assert recreated.chain_status == "recreated"
+    assert recreated.reused_tokens == 0
+    assert recreated.prefilled_tokens == 3
+    recreated_seq = engine.scheduler.added[-1]
+    assert recreated_seq.token_ids == [1, 2, 99]
+    assert recreated_seq.num_prefilled_tokens == 0
     with pytest.raises(ChainGoneError):
         coordinator.index.lookup(resumed.chain_id)
+
+    engine.abort_request(recreated.seq_id)
+    engine.abort_request(recreated.seq_id)
+    with pytest.raises(ChainGoneError):
+        coordinator.index.lookup(recreated.chain_id)
 
 
 def test_engine_abort_rejects_unsafe_chain_retain_disposition():

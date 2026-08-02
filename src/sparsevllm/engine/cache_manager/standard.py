@@ -99,7 +99,7 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
         self.seq_id_to_prefix_blocks: dict[int, list[PrefixCacheBlock]] = {}
         self.seq_id_to_cached_ranges: dict[int, list[tuple[int, int]]] = {}
         self._scheduler_capacity_snapshot_depth = 0
-        self._scheduler_freeable_block_ids: set[bytes] | None = None
+        self._scheduler_freeable_block_ids: frozenset[bytes] | None = None
         self._init_prefix_cache_runtime()
         self.prefix_offload_controller: StandardPrefixOffloadController | None = None
         self._prefix_offload_step_h2d_operations: list[PrefixH2DOperation] = []
@@ -324,9 +324,9 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
         )
         return int(freeable_blocks * self.prefix_cache_block_size)
 
-    def _prefix_freeable_block_ids_for_capacity(self) -> set[bytes]:
+    def _prefix_freeable_block_ids_for_capacity(self) -> frozenset[bytes]:
         if self.prefix_cache is None:
-            return set()
+            return frozenset()
         if self._scheduler_capacity_snapshot_depth <= 0:
             return self.prefix_cache.freeable_block_ids()
         if self._scheduler_freeable_block_ids is None:
@@ -407,45 +407,19 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
     def _prefix_hit_evictable_slots(self, seq: Sequence) -> int:
         if getattr(self, "prefix_cache", None) is None or int(getattr(seq, "prefix_cache_hit_len", 0) or 0) <= 0:
             return 0
-        if seq.prefix_cache_hit_last_block_id is None:
-            raise RuntimeError(f"seq_id={seq.seq_id} has prefix hit length but no last block id.")
-        chain = self.prefix_cache.get_chain(
-            seq.prefix_cache_hit_last_block_id,
-            int(seq.prefix_cache_hit_block_count),
-        )
-        freeable_block_ids = (
-            self.prefix_cache.device_reclaimable_block_ids()
-            if self._prefix_offload_enabled()
-            else self._prefix_freeable_block_ids_for_capacity()
-        )
-        return sum(
-            self.prefix_cache_block_size
-            for block in chain
-            if block.stable_block_id in freeable_block_ids
-        )
+        reclaimable_blocks, _ = self._prefix_hit_capacity_counts(seq)
+        return int(reclaimable_blocks * self.prefix_cache_block_size)
 
     def prompt_admission_cost(self, seq: Sequence) -> int:
         hit_len = int(getattr(seq, "prefix_cache_hit_len", 0) or 0)
         suffix_len = int(seq.num_prompt_tokens - hit_len)
-        promotion_slots = 0
-        if self._prefix_offload_enabled() and hit_len > 0:
-            if seq.prefix_cache_hit_last_block_id is None:
-                raise RuntimeError(
-                    f"seq_id={seq.seq_id} has prefix hit length but no last block id."
-                )
-            chain = self._require_prefix_cache().get_chain(
-                seq.prefix_cache_hit_last_block_id,
-                int(seq.prefix_cache_hit_block_count),
-            )
-            promotion_slots = sum(
-                self.prefix_cache_block_size
-                for block in chain
-                if not block.residency.device_present
-            )
+        if hit_len <= 0:
+            return suffix_len
+        reclaimable_blocks, promotion_blocks = self._prefix_hit_capacity_counts(seq)
         return (
             suffix_len
-            + promotion_slots
-            + self._prefix_hit_evictable_slots(seq)
+            + (promotion_blocks + reclaimable_blocks)
+            * self.prefix_cache_block_size
         )
 
     def prompt_logical_reservation_cost(self, seq: Sequence) -> int:
@@ -462,9 +436,9 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
         if usable_tokens <= 0:
             return
         with profiler.record("prefix_cache_lookup"):
-            hit_len, last_block_id, hit_blocks = self.prefix_cache.lookup_longest_prefix(
-                seq.prompt_token_ids,
-                max_usable_tokens=usable_tokens,
+            hit_len, last_block_id, hit_blocks = self._lookup_prefix_cache_hit(
+                seq,
+                usable_tokens,
             )
         if hit_len <= 0:
             return
@@ -1014,7 +988,7 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
                 raise RuntimeError("No free rows in cache manager buffer!")
 
             for block in chain:
-                block.ref_count += 1
+                self.prefix_cache.acquire_block_ref(block)
             allocated_promotion_slots: torch.Tensor | None = None
             submitted_operation: PrefixH2DOperation | None = None
             try:
@@ -1041,7 +1015,7 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
                         submitted_operation = controller.submit_h2d(cpu_only_blocks)
             except Exception:
                 for block in chain:
-                    block.ref_count -= 1
+                    self.prefix_cache.release_block_ref(block)
                 if allocated_promotion_slots is not None:
                     self._return_prefix_device_slots(allocated_promotion_slots)
                     for block in cpu_only_blocks:
@@ -1323,14 +1297,14 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
             self._poll_prefix_offload()
             self._prefix_offload_step_h2d_operations = []
             batch_size = len(seqs)
-            input_ids_list = [seq.last_token for seq in seqs]
-            positions_list = [seq.num_tokens - 1 for seq in seqs]
+            input_ids_list = [seq.decode_input_token for seq in seqs]
+            positions_list = [seq.decode_input_position for seq in seqs]
             seq_ids = [seq.seq_id for seq in seqs]
 
             new_slots_batch = self._allocate_batch(seq_ids, 1)
             row_indices = [self.seq_id_to_row[sid] for sid in seq_ids]
             for seq, slot in zip(seqs, new_slots_batch):
-                self._record_prefix_materialization(seq, [int(seq.last_token)], slot.reshape(1))
+                self._record_prefix_materialization(seq, [seq.decode_input_token], slot.reshape(1))
             context_lens = torch.tensor(
                 self.row_seq_lens[row_indices],
                 dtype=torch.int32,
@@ -1403,8 +1377,8 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
                     f"graph={graph_batch_size}, real={real_batch_size}."
                 )
 
-            input_ids_list = [seq.last_token for seq in seqs]
-            positions_list = [seq.num_tokens - 1 for seq in seqs]
+            input_ids_list = [seq.decode_input_token for seq in seqs]
+            positions_list = [seq.decode_input_position for seq in seqs]
             seq_ids = [seq.seq_id for seq in seqs]
 
             new_slots_batch, real_context_lens, row_indices = self._allocate_decode_batch_static(
@@ -1412,7 +1386,7 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
                 graph_batch_size,
             )
             for seq, slot in zip(seqs, new_slots_batch):
-                self._record_prefix_materialization(seq, [int(seq.last_token)], slot.reshape(1))
+                self._record_prefix_materialization(seq, [seq.decode_input_token], slot.reshape(1))
 
             input_ids[:real_batch_size].copy_(torch.tensor(input_ids_list, dtype=torch.int64))
             positions[:real_batch_size].copy_(torch.tensor(positions_list, dtype=torch.int64))

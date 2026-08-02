@@ -12,6 +12,7 @@ from sparsevllm.entrypoints.openai.dispatcher import AsyncEngineDispatcher
 from sparsevllm.entrypoints.openai.dispatcher import RequestHandle
 from sparsevllm.entrypoints.openai.protocol.chat import ChatCompletionRequest
 from sparsevllm.entrypoints.openai.render import _chat_request_prompt
+from sparsevllm.entrypoints.openai.render import _chat_request_append_prompt
 from sparsevllm.entrypoints.openai.render import resolve_chat_template_kwargs
 from sparsevllm.entrypoints.openai.render import resolve_chat_tools
 from sparsevllm.entrypoints.openai.sampling import _field_was_set
@@ -28,6 +29,7 @@ from sparsevllm.entrypoints.openai.serving.base import _write_request_log
 from sparsevllm.entrypoints.openai.serving.base import _chain_http_exception
 from sparsevllm.engine.chain_cache import ChainCacheError
 from sparsevllm.entrypoints.openai.serving.response_parsing import ParsedModelResponse
+from sparsevllm.entrypoints.openai.serving.response_parsing import ModelOutputParseError
 from sparsevllm.entrypoints.openai.serving.response_parsing import ResponseParseError
 from sparsevllm.entrypoints.openai.serving.response_parsing import TransformersResponseParser
 from sparsevllm.utils.log import logger
@@ -68,7 +70,11 @@ async def serve_chat_completion(
     )
     stop = _normalize_stop(request.stop)
     try:
-        prompt = _chat_request_prompt(tokenizer, request)
+        prompt = (
+            _chat_request_append_prompt(tokenizer, request)
+            if request.chain_append_start is not None
+            else _chat_request_prompt(tokenizer, request)
+        )
         chat_tools = resolve_chat_tools(request)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -88,17 +94,19 @@ async def serve_chat_completion(
             if bool(getattr(dispatcher, "admission_ack_enabled", False))
             else dispatcher.submit
         )
-        handle = (
-            await submit(prompt, sampling_params, 0, stop)
-            if request.chain_id is None
-            else await submit(
+        if request.chain_id is None:
+            handle = await submit(prompt, sampling_params, 0, stop)
+        else:
+            submit_kwargs = {"chain_id": request.chain_id}
+            if request.chain_append_start is not None:
+                submit_kwargs["chain_append_only"] = True
+            handle = await submit(
                 prompt,
                 sampling_params,
                 0,
                 stop,
-                chain_id=request.chain_id,
+                **submit_kwargs,
             )
-        )
     except ChainCacheError as exc:
         raise _chain_http_exception(exc) from exc
     handles = [handle]
@@ -196,6 +204,13 @@ def _validate_chat_request(
         )
     if not request.messages:
         raise HTTPException(status_code=400, detail="messages must not be empty.")
+    if request.chain_append_start is not None and not str(
+        request.chain_id or ""
+    ).strip():
+        raise HTTPException(
+            status_code=400,
+            detail="chain_append_start requires a non-empty chain_id.",
+        )
     if request.n != 1:
         raise HTTPException(status_code=400, detail="Sparse-vLLM chat completions currently supports n=1 only.")
     if (
@@ -266,8 +281,23 @@ async def _chat_completion_response(
                 prefix=prompt,
                 parse_tools=parse_tools,
             )
+        except ModelOutputParseError as exc:
+            # Malformed tool JSON is a model-format failure, not an inference
+            # service failure. Return the generated text as plain assistant
+            # content so tool-aware clients can record a FormatError without
+            # retrying the identical request as an HTTP 500.
+            logger.warning(
+                "request_format_error id={} model={} stream=false error={}",
+                request_id,
+                model,
+                exc,
+            )
+            parsed = ParsedModelResponse(None, final["text"], [])
         except ResponseParseError as exc:
-            raise HTTPException(status_code=500, detail=f"Chat Completions parse failed: {exc}") from exc
+            raise HTTPException(
+                status_code=500,
+                detail=f"Chat Completions parse failed: {exc}",
+            ) from exc
     else:
         parsed = ParsedModelResponse(None, final["text"], [])
     message = _chat_message(parsed)
@@ -314,7 +344,7 @@ async def _chat_completion_response(
 def _chat_message(parsed: ParsedModelResponse) -> dict[str, Any]:
     message: dict[str, Any] = {
         "role": "assistant",
-        "content": None if parsed.tool_calls else parsed.content,
+        "content": parsed.content if parsed.content or not parsed.tool_calls else None,
     }
     if parsed.reasoning_content is not None:
         message["reasoning_content"] = parsed.reasoning_content

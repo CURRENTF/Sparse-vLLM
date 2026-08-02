@@ -201,7 +201,10 @@ class SnapKVCacheManager(CacheManager):
     def requires_long_prefill_offload(self, seq: Sequence) -> bool:
         if not self._pyramidkv_can_use_full_prefill_staging():
             return False
-        if getattr(seq, "chain_status", "") == "resumed":
+        if (
+            getattr(seq, "chain_status", "") == "resumed"
+            and not bool(getattr(seq, "is_recompute_replay", False))
+        ):
             return False
         if self.pyramidkv_prefill_staging_kv_cache is None:
             return False
@@ -737,6 +740,7 @@ class SnapKVCacheManager(CacheManager):
             prompt_len = int(seq.num_prompt_tokens)
             is_chain_resume = (
                 getattr(seq, "chain_status", "") == "resumed"
+                and not bool(getattr(seq, "is_recompute_replay", False))
             )
             physical_context_len = (
                 self.chain_physical_kv_len(layer_idx, int(seq.seq_id))
@@ -745,10 +749,12 @@ class SnapKVCacheManager(CacheManager):
             )
             if physical_context_len <= int(budget):
                 continue
-            appended_delta_len = max(
-                0,
-                prompt_len - int(getattr(seq, "chain_reused_tokens", 0) or 0),
+            reused_tokens = (
+                0
+                if bool(getattr(seq, "is_recompute_replay", False))
+                else int(getattr(seq, "chain_reused_tokens", 0) or 0)
             )
+            appended_delta_len = max(0, prompt_len - reused_tokens)
             score_window = min(window, appended_delta_len) if appended_delta_len else window
             logical_score_end = prompt_len
             logical_score_start = max(0, logical_score_end - score_window)
@@ -1027,6 +1033,7 @@ class SnapKVCacheManager(CacheManager):
                     row_len = int(self.row_seq_lens[layer_id][row_idx])
                     is_chain_resume = bool(
                         getattr(seq, "chain_status", "") == "resumed"
+                        and not bool(getattr(seq, "is_recompute_replay", False))
                     )
                     expected_start = int(seq.num_prefilled_tokens)
                     if not is_chain_resume and row_len != expected_start:
@@ -1847,6 +1854,7 @@ class SnapKVCacheManager(CacheManager):
             for seq in seqs:
                 starts_resumed_turn = (
                     getattr(seq, "chain_status", "") == "resumed"
+                    and not bool(getattr(seq, "is_recompute_replay", False))
                     and int(seq.num_prefilled_tokens)
                     == int(getattr(seq, "chain_reused_tokens", 0) or 0)
                 )
@@ -1896,8 +1904,8 @@ class SnapKVCacheManager(CacheManager):
                                     int(seq.seq_id)
                                 ]
                             ]
-                            if getattr(seq, "chain_status", "")
-                            == "resumed"
+                            if getattr(seq, "chain_status", "") == "resumed"
+                            and not bool(getattr(seq, "is_recompute_replay", False))
                             else int(seq.num_prefilled_tokens)
                             + int(seq.current_chunk_size)
                         )
@@ -1917,6 +1925,7 @@ class SnapKVCacheManager(CacheManager):
                             expected_row_len = 0 if use_long_prefill_offload_staging else start_idx
                             is_chain_resume = bool(
                                 getattr(seq, "chain_status", "") == "resumed"
+                                and not bool(getattr(seq, "is_recompute_replay", False))
                             )
                             if (
                                 not is_chain_resume
@@ -2029,8 +2038,8 @@ class SnapKVCacheManager(CacheManager):
             self._decode_static_state_binding_key = None
             layer_ids = self.kv_transformer_layer_indices()
             batch_size = len(seqs)
-            input_ids_list = [seq.last_token for seq in seqs]
-            positions_list = [seq.num_tokens - 1 for seq in seqs]
+            input_ids_list = [seq.decode_input_token for seq in seqs]
+            positions_list = [seq.decode_input_position for seq in seqs]
             seq_ids = [seq.seq_id for seq in seqs]
 
             layers_slot_mapping_cuda = torch.empty(
@@ -2136,8 +2145,8 @@ class SnapKVCacheManager(CacheManager):
     ):
         real_batch_size = len(seqs)
         graph_batch_size = int(input_ids.numel())
-        input_ids_list = [seq.last_token for seq in seqs]
-        positions_list = [seq.num_tokens - 1 for seq in seqs]
+        input_ids_list = [seq.decode_input_token for seq in seqs]
+        positions_list = [seq.decode_input_position for seq in seqs]
         seq_ids = [seq.seq_id for seq in seqs]
         layer_ids = self.kv_transformer_layer_indices()
         first_layer = int(layer_ids[0])
@@ -2333,8 +2342,8 @@ class SnapKVCacheManager(CacheManager):
                     f"graph={graph_batch_size}, real={real_batch_size}."
                 )
 
-            input_ids_list = [seq.last_token for seq in seqs]
-            positions_list = [seq.num_tokens - 1 for seq in seqs]
+            input_ids_list = [seq.decode_input_token for seq in seqs]
+            positions_list = [seq.decode_input_position for seq in seqs]
             seq_ids = [seq.seq_id for seq in seqs]
 
             if self._uniform_decode_metadata:

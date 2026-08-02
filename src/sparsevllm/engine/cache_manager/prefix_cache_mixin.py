@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from weakref import WeakKeyDictionary
 
 import torch
 
@@ -32,6 +33,140 @@ class PendingPrefixBlock:
     token_ids: list[int]
 
 
+@dataclass(frozen=True)
+class PrefixLookupCacheEntry:
+    token_ids: tuple[int, ...]
+    usable_tokens: int
+    block_ids: tuple[bytes, ...]
+    remove_epoch: int
+    result: tuple[int, bytes | None, int]
+
+
+@dataclass(frozen=True)
+class PrefixHitCapacityCacheEntry:
+    last_block_id: bytes
+    hit_blocks: int
+    remove_epoch: int
+    capacity_epoch: int
+    offload_enabled: bool
+    chain: tuple[PrefixCacheBlock, ...]
+    reclaimable_blocks: int
+    promotion_blocks: int
+
+
+def lookup_prefix_cache_hit(
+    prefix_cache: RadixPrefixIndex,
+    cache: WeakKeyDictionary[Sequence, PrefixLookupCacheEntry],
+    seq: Sequence,
+    usable_tokens: int,
+) -> tuple[int, bytes | None, int]:
+    prompt_token_ids = seq.prompt_token_ids
+    entry = cache.get(seq)
+    if (
+        entry is not None
+        and entry.token_ids is prompt_token_ids
+        and entry.usable_tokens == int(usable_tokens)
+    ):
+        hit_blocks = int(entry.result[2])
+        lookup_is_current = (
+            entry.remove_epoch == prefix_cache.remove_epoch
+            and (
+                hit_blocks == len(entry.block_ids)
+                or not prefix_cache.has_block(entry.block_ids[hit_blocks])
+            )
+        )
+        if lookup_is_current:
+            return entry.result
+        block_ids = entry.block_ids
+    else:
+        if not isinstance(prompt_token_ids, tuple):
+            prompt_token_ids = tuple(int(token_id) for token_id in prompt_token_ids)
+        block_ids = tuple(
+            prefix_cache.block_ids_for_tokens(
+                prompt_token_ids,
+                max_tokens=int(usable_tokens),
+            )
+        )
+
+    result = prefix_cache.lookup_longest_block_ids(block_ids)
+    cache[seq] = PrefixLookupCacheEntry(
+        token_ids=prompt_token_ids,
+        usable_tokens=int(usable_tokens),
+        block_ids=block_ids,
+        remove_epoch=prefix_cache.remove_epoch,
+        result=result,
+    )
+    return result
+
+
+def prefix_hit_capacity_counts(
+    prefix_cache: RadixPrefixIndex,
+    cache: WeakKeyDictionary[Sequence, PrefixHitCapacityCacheEntry],
+    seq: Sequence,
+    *,
+    offload_enabled: bool,
+) -> tuple[int, int]:
+    hit_blocks = int(getattr(seq, "prefix_cache_hit_block_count", 0) or 0)
+    last_block_id = getattr(seq, "prefix_cache_hit_last_block_id", None)
+    if hit_blocks <= 0:
+        return 0, 0
+    if last_block_id is None:
+        raise RuntimeError(
+            f"seq_id={seq.seq_id} has prefix hit blocks but no last block id."
+        )
+
+    try:
+        entry = cache.get(seq)
+        cacheable = True
+    except TypeError:
+        entry = None
+        cacheable = False
+    same_chain = (
+        entry is not None
+        and entry.last_block_id == last_block_id
+        and entry.hit_blocks == hit_blocks
+        and entry.remove_epoch == prefix_cache.remove_epoch
+    )
+    if (
+        same_chain
+        and entry is not None
+        and entry.capacity_epoch == prefix_cache.capacity_epoch
+        and entry.offload_enabled == bool(offload_enabled)
+    ):
+        return entry.reclaimable_blocks, entry.promotion_blocks
+
+    chain = (
+        entry.chain
+        if same_chain and entry is not None
+        else tuple(prefix_cache.get_chain(last_block_id, hit_blocks))
+    )
+    freeable_block_ids = (
+        prefix_cache.device_reclaimable_block_ids()
+        if offload_enabled
+        else prefix_cache.freeable_block_ids()
+    )
+    reclaimable_blocks = sum(
+        1 for block in chain if block.stable_block_id in freeable_block_ids
+    )
+    promotion_blocks = (
+        sum(1 for block in chain if not block.residency.device_present)
+        if offload_enabled
+        else 0
+    )
+    if cacheable:
+        cache[seq] = PrefixHitCapacityCacheEntry(
+            last_block_id=last_block_id,
+            hit_blocks=hit_blocks,
+            remove_epoch=prefix_cache.remove_epoch,
+            capacity_epoch=prefix_cache.capacity_epoch,
+            offload_enabled=bool(offload_enabled),
+            chain=chain,
+            reclaimable_blocks=reclaimable_blocks,
+            promotion_blocks=promotion_blocks,
+        )
+    return reclaimable_blocks, promotion_blocks
+
+
 class PrefixCacheMixin:
     """Shared prefix-cache block materialization for cache managers."""
 
@@ -39,6 +174,12 @@ class PrefixCacheMixin:
         self.seq_id_to_materialized_blocks: dict[int, list[PrefixCacheBlock]] = {}
         self.prefix_runtime_states: dict[int, PrefixRuntimeState] = {}
         self.pending_prefix_blocks: dict[int, list[PendingPrefixBlock]] = {}
+        self.prefix_lookup_cache: WeakKeyDictionary[
+            Sequence, PrefixLookupCacheEntry
+        ] = WeakKeyDictionary()
+        self.prefix_hit_capacity_cache: WeakKeyDictionary[
+            Sequence, PrefixHitCapacityCacheEntry
+        ] = WeakKeyDictionary()
 
     def _prefix_cache_materialization_subject(self) -> str:
         return "Prefix materialization"
@@ -62,10 +203,68 @@ class PrefixCacheMixin:
         return None
 
     def _release_prefix_blocks(self, blocks: list[PrefixCacheBlock]) -> None:
+        prefix_cache = self.prefix_cache
+        if prefix_cache is None and blocks:
+            raise RuntimeError("Cannot release prefix blocks without a prefix cache.")
         for block in blocks:
-            block.ref_count -= 1
-            if block.ref_count < 0:
-                raise RuntimeError(self._prefix_cache_negative_refcount_message())
+            assert prefix_cache is not None
+            prefix_cache.release_block_ref(
+                block,
+                negative_error=self._prefix_cache_negative_refcount_message(),
+            )
+
+    def _hold_materialized_prefix_block_ref(
+        self,
+        seq: Sequence,
+        block: PrefixCacheBlock,
+    ) -> None:
+        held = [
+            *self.seq_id_to_prefix_blocks.get(seq.seq_id, []),
+            *self.seq_id_to_materialized_blocks.get(seq.seq_id, []),
+        ]
+        if any(
+            existing.stable_block_id == block.stable_block_id
+            for existing in held
+        ):
+            return
+        prefix_cache = self.prefix_cache
+        if prefix_cache is None:
+            raise RuntimeError("Cannot hold a prefix block without a prefix cache.")
+        prefix_cache.acquire_block_ref(block)
+        self.seq_id_to_materialized_blocks.setdefault(seq.seq_id, []).append(block)
+
+    def _lookup_prefix_cache_hit(
+        self,
+        seq: Sequence,
+        usable_tokens: int,
+    ) -> tuple[int, bytes | None, int]:
+        prefix_cache = self.prefix_cache
+        if prefix_cache is None:
+            return 0, None, 0
+        return lookup_prefix_cache_hit(
+            prefix_cache,
+            self.prefix_lookup_cache,
+            seq,
+            usable_tokens,
+        )
+
+    def _prefix_hit_capacity_counts(
+        self,
+        seq: Sequence,
+    ) -> tuple[int, int]:
+        prefix_cache = getattr(self, "prefix_cache", None)
+        if prefix_cache is None:
+            return 0, 0
+        cache = getattr(self, "prefix_hit_capacity_cache", None)
+        if cache is None:
+            cache = WeakKeyDictionary()
+            self.prefix_hit_capacity_cache = cache
+        return prefix_hit_capacity_counts(
+            prefix_cache,
+            cache,
+            seq,
+            offload_enabled=self._prefix_offload_enabled(),
+        )
 
     def reset_prefix_cache(self) -> None:
         if not self.enable_prefix_caching or self.prefix_cache is None:
@@ -192,7 +391,7 @@ class PrefixCacheMixin:
                     block = self.prefix_cache.get_block(block_id)
                     if block is None:
                         continue
-                    block.ref_count += 1
+                    self.prefix_cache.acquire_block_ref(block)
                     protected.append(block)
                 try:
                     for pending in pending_blocks:
@@ -205,11 +404,19 @@ class PrefixCacheMixin:
                             logical_block_idx=pending.logical_block_idx,
                             payload=pending.payload,
                             token_ids=tuple(pending.token_ids),
+                            ref_count=1,
                         )
                         inserted = self.prefix_cache.insert_block(block)
                         if inserted is not block:
+                            # Recompute replay deliberately rebuilds the exact
+                            # token stream instead of attaching a prefix hit.
+                            # Its blocks can therefore duplicate blocks left by
+                            # the first pass. Keep those parents referenced for
+                            # the replay lifetime, but do not mark the replay's
+                            # newly allocated slots as prefix-owned: the
+                            # existing block payload owns different slots.
+                            self._hold_materialized_prefix_block_ref(seq, inserted)
                             continue
-                        inserted.ref_count = 1
                         materialized.append(inserted)
                         self._mark_materialized_prefix_block(seq, inserted)
                 finally:

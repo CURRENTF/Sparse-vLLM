@@ -43,6 +43,28 @@ def _fake_prefill_attention_enabled() -> bool:
     return enabled
 
 
+def _warmup_real_prefill_probe_min_context() -> int | None:
+    raw_value = os.environ.get(
+        "SPARSEVLLM_WARMUP_REAL_PREFILL_MIN_CONTEXT_TOKENS",
+        "",
+    ).strip()
+    if not raw_value:
+        return None
+    try:
+        min_context_tokens = int(raw_value)
+    except ValueError as exc:
+        raise ValueError(
+            "SPARSEVLLM_WARMUP_REAL_PREFILL_MIN_CONTEXT_TOKENS must be a "
+            f"positive integer, got {raw_value!r}."
+        ) from exc
+    if min_context_tokens <= 0:
+        raise ValueError(
+            "SPARSEVLLM_WARMUP_REAL_PREFILL_MIN_CONTEXT_TOKENS must be "
+            f"positive, got {min_context_tokens}."
+        )
+    return min_context_tokens
+
+
 def _fake_decode_attention_enabled() -> bool:
     enabled = _env_truthy("SPARSEVLLM_FAKE_DECODE_ATTENTION") or _fake_attention_enabled()
     if enabled:
@@ -94,8 +116,25 @@ class TritonAttentionBackend:
         b_prompt_cache_len = b_seq_len - chunk_lens
         self._debug_check_prefill_bounds(q, view, chunk_lens=chunk_lens)
         if _fake_prefill_attention_enabled():
-            _fill_fake_attention_score(view.attn_score)
-            return _fake_attention_output(q)
+            real_probe_min_context = _warmup_real_prefill_probe_min_context()
+            probe_context_tokens = (
+                int(view.max_context_len)
+                if view.max_context_len is not None
+                else int(max_input_len)
+            )
+            if (
+                real_probe_min_context is None
+                or probe_context_tokens < real_probe_min_context
+            ):
+                _fill_fake_attention_score(view.attn_score)
+                return _fake_attention_output(q)
+            log_once(
+                "Warmup real prefill attention probe executing at "
+                f"context_tokens={probe_context_tokens} "
+                f"query_tokens={int(q.shape[0])} "
+                f"batch_seqs={int(chunk_lens.shape[0])}.",
+                level="INFO",
+            )
         o = torch.empty_like(q)
         context_attention_fwd(
             q,
