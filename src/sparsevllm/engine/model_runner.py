@@ -65,12 +65,12 @@ except ImportError:
     Qwen35MoeForCausalLM = None
 
 
-def _create_model(hf_config, model_spec: ModelSpec):
+def _create_model(hf_config, model_spec: ModelSpec, **kwargs):
     class_name = model_spec.runtime_class_name
     model_class = globals().get(class_name)
     if model_class is None:
         raise ImportError(f"{class_name} is unavailable for {model_spec.name}.")
-    return model_class(hf_config)
+    return model_class(hf_config, **kwargs)
 
 
 TP_SHM_NAME_PREFIX = "sparsevllm_"
@@ -165,21 +165,29 @@ class ModelRunner:
             "decode_cuda_graph",
             bool(getattr(config, "decode_cuda_graph", False)),
         )
+        model_kwargs = {}
         if config.model_spec.runtime_class_name == "Glm4MoeLiteForCausalLM":
-            setattr(hf_config, "sparsevllm_device", self.device)
-            setattr(
-                hf_config,
-                "sparsevllm_max_batch_size",
-                max(config.max_num_seqs_in_batch, config.max_decoding_seqs),
+            from sparsevllm.models.glm4_moe_lite import (
+                build_glm4_moe_lite_mla_attention,
             )
-            setattr(
-                hf_config,
-                "sparsevllm_mla_prefill_workspace_bytes",
-                config.mla_prefill_workspace_bytes,
-            )
-            setattr(hf_config, "sparsevllm_expect_mtp_weights", not config.tiny_random)
+
+            model_kwargs = {
+                "mla_attention": build_glm4_moe_lite_mla_attention(
+                    hf_config,
+                    device=self.device,
+                    max_batch_size=max(
+                        config.max_num_seqs_in_batch,
+                        config.max_decoding_seqs,
+                    ),
+                    prefill_workspace_bytes=config.mla_prefill_workspace_bytes,
+                    decode_cuda_graph=config.decode_cuda_graph,
+                ),
+                "mlp_chunk_size": config.mlp_chunk_size,
+                "decode_cuda_graph": config.decode_cuda_graph,
+                "expect_mtp_weights": not config.tiny_random,
+            }
         
-        self.model = _create_model(hf_config, config.model_spec)
+        self.model = _create_model(hf_config, config.model_spec, **model_kwargs)
         if config.tiny_random:
             from sparsevllm.debug.tiny_random import initialize_sparse_model
 

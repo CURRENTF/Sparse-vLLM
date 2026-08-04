@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .base import AttentionCacheStorage, CacheLayout
 from .explicit_kv import ExplicitKVStorage
-from .mla_latent import MlaLatentStorage
+
+if TYPE_CHECKING:
+    from .mla_latent import MlaLatentStorage
 
 
 def create_attention_cache_storage(
@@ -34,12 +36,22 @@ def create_attention_cache_storage(
             dtype=dtype,
         )
     if layout is CacheLayout.MLA_LATENT:
+        from .mla_latent import MlaLatentStorage
+
         return MlaLatentStorage(
             kv_lora_rank=int(config.hf_config.kv_lora_rank),
             rope_dim=int(config.hf_config.qk_rope_head_dim),
             dtype=dtype,
         )
     raise AssertionError(f"Unhandled attention cache layout: {layout!r}")
+
+
+def __getattr__(name: str):
+    if name == "MlaLatentStorage":
+        from .mla_latent import MlaLatentStorage
+
+        return MlaLatentStorage
+    raise AttributeError(name)
 
 
 __all__ = [

@@ -41,18 +41,16 @@ _MTP_LAYER_INDEX = 47
 _MTP_PREFIX = f"model.layers.{_MTP_LAYER_INDEX}."
 
 
-def _build_mla_attention(config: Glm4MoeLiteConfig) -> MLAAttention:
-    device = getattr(config, "sparsevllm_device", None)
-    max_batch_size = int(getattr(config, "sparsevllm_max_batch_size", 0) or 0)
-    prefill_workspace_bytes = int(
-        getattr(config, "sparsevllm_mla_prefill_workspace_bytes", 0) or 0
-    )
-    if device is None or max_batch_size <= 0 or prefill_workspace_bytes <= 0:
-        raise ValueError(
-            "GLM MLA construction requires ModelRunner runtime hints: "
-            "sparsevllm_device, sparsevllm_max_batch_size, and "
-            "sparsevllm_mla_prefill_workspace_bytes."
-        )
+def build_glm4_moe_lite_mla_attention(
+    config: Glm4MoeLiteConfig,
+    *,
+    device: torch.device | str,
+    max_batch_size: int,
+    prefill_workspace_bytes: int,
+    decode_cuda_graph: bool,
+) -> MLAAttention:
+    """Bind the one process-local MLA operator from explicit runtime inputs."""
+
     parallel_context = get_parallel_context()
     activation_dtype = model_activation_dtype(config)
     spec = MlaAttentionOpSpec(
@@ -64,7 +62,7 @@ def _build_mla_attention(config: Glm4MoeLiteConfig) -> MLAAttention:
         activation_dtype=activation_dtype,
         cache_dtype=activation_dtype,
         tp_size=int(parallel_context.attention_tp_size),
-        cuda_graph=bool(getattr(config, "decode_cuda_graph", False)),
+        cuda_graph=bool(decode_cuda_graph),
     )
     return MLAAttention.bind(
         spec=spec,
@@ -81,6 +79,8 @@ class Glm4MoeLiteAttention(nn.Module):
         self,
         config: Glm4MoeLiteConfig,
         mla_attention: MLAAttention,
+        *,
+        projection_chunk_size: int,
     ) -> None:
         super().__init__()
         self.mla_attention = mla_attention
@@ -93,7 +93,7 @@ class Glm4MoeLiteAttention(nn.Module):
         self.qk_rope_head_dim = int(config.qk_rope_head_dim)
         self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         self.v_head_dim = int(config.v_head_dim)
-        self.proj_chunk_size = int(getattr(config, "mlp_chunk_size", 16384))
+        self.proj_chunk_size = int(projection_chunk_size)
         if self.proj_chunk_size <= 0:
             raise ValueError(
                 f"mlp_chunk_size must be positive, got {self.proj_chunk_size}."
@@ -356,7 +356,12 @@ class Glm4MoeLiteRouter(nn.Module):
 
 
 class Glm4MoeLitePackedExperts(PackedMoeExperts):
-    def __init__(self, config: Glm4MoeLiteConfig) -> None:
+    def __init__(
+        self,
+        config: Glm4MoeLiteConfig,
+        *,
+        decode_cuda_graph: bool,
+    ) -> None:
         super().__init__(
             num_experts=int(config.n_routed_experts),
             hidden_size=int(config.hidden_size),
@@ -364,7 +369,7 @@ class Glm4MoeLitePackedExperts(PackedMoeExperts):
             top_k=int(config.num_experts_per_tok),
             activation_dtype=model_activation_dtype(config),
             fp8_enabled=False,
-            cuda_graph=bool(getattr(config, "decode_cuda_graph", False)),
+            cuda_graph=bool(decode_cuda_graph),
             routing_method="biased_sigmoid",
             model_label="GLM-4.7-Flash",
             provider_resolver=resolve_moe_provider,
@@ -373,16 +378,25 @@ class Glm4MoeLitePackedExperts(PackedMoeExperts):
 
 
 class Glm4MoeLiteSparseMoeBlock(nn.Module):
-    def __init__(self, config: Glm4MoeLiteConfig) -> None:
+    def __init__(
+        self,
+        config: Glm4MoeLiteConfig,
+        *,
+        mlp_chunk_size: int,
+        decode_cuda_graph: bool,
+    ) -> None:
         super().__init__()
         self.parallel_context = get_parallel_context()
-        self.mlp_chunk_size = int(getattr(config, "mlp_chunk_size", 16384))
+        self.mlp_chunk_size = int(mlp_chunk_size)
         if self.mlp_chunk_size <= 0:
             raise ValueError(
                 f"mlp_chunk_size must be positive, got {self.mlp_chunk_size}."
             )
         self.gate = Glm4MoeLiteRouter(config)
-        self.experts = Glm4MoeLitePackedExperts(config)
+        self.experts = Glm4MoeLitePackedExperts(
+            config,
+            decode_cuda_graph=decode_cuda_graph,
+        )
         self.shared_experts = Qwen3MLP(
             hidden_size=int(config.hidden_size),
             intermediate_size=(
@@ -423,9 +437,16 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
         config: Glm4MoeLiteConfig,
         layer_idx: int,
         mla_attention: MLAAttention,
+        *,
+        mlp_chunk_size: int,
+        decode_cuda_graph: bool,
     ) -> None:
         super().__init__()
-        self.self_attn = Glm4MoeLiteAttention(config, mla_attention)
+        self.self_attn = Glm4MoeLiteAttention(
+            config,
+            mla_attention,
+            projection_chunk_size=mlp_chunk_size,
+        )
         layer_types = list(config.mlp_layer_types)
         if len(layer_types) != int(config.num_hidden_layers):
             raise ValueError(
@@ -438,11 +459,15 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
                 hidden_size=int(config.hidden_size),
                 intermediate_size=int(config.intermediate_size),
                 hidden_act=str(config.hidden_act),
-                mlp_chunk_size=int(getattr(config, "mlp_chunk_size", 16384)),
+                mlp_chunk_size=int(mlp_chunk_size),
                 quantization=None,
             )
         elif layer_type == "sparse":
-            self.mlp = Glm4MoeLiteSparseMoeBlock(config)
+            self.mlp = Glm4MoeLiteSparseMoeBlock(
+                config,
+                mlp_chunk_size=mlp_chunk_size,
+                decode_cuda_graph=decode_cuda_graph,
+            )
         else:
             raise ValueError(
                 f"Unsupported GLM MLP layer type at layer {layer_idx}: {layer_type!r}."
@@ -478,6 +503,9 @@ class Glm4MoeLiteModel(nn.Module):
         self,
         config: Glm4MoeLiteConfig,
         mla_attention: MLAAttention,
+        *,
+        mlp_chunk_size: int,
+        decode_cuda_graph: bool,
     ) -> None:
         super().__init__()
         self.config = config
@@ -498,7 +526,13 @@ class Glm4MoeLiteModel(nn.Module):
         )
         self.layers = nn.ModuleList(
             [
-                Glm4MoeLiteDecoderLayer(config, layer_idx, mla_attention)
+                Glm4MoeLiteDecoderLayer(
+                    config,
+                    layer_idx,
+                    mla_attention,
+                    mlp_chunk_size=mlp_chunk_size,
+                    decode_cuda_graph=decode_cuda_graph,
+                )
                 for layer_idx in range(int(config.num_hidden_layers))
             ]
         )
@@ -602,20 +636,24 @@ class Glm4MoeLiteForCausalLM(nn.Module):
         self,
         config: Glm4MoeLiteConfig,
         *,
-        mla_attention: MLAAttention | None = None,
+        mla_attention: MLAAttention,
+        mlp_chunk_size: int,
+        decode_cuda_graph: bool,
+        expect_mtp_weights: bool,
     ) -> None:
         super().__init__()
         self.config = config
         self.parallel_context = get_parallel_context()
-        if mla_attention is None:
-            mla_attention = _build_mla_attention(config)
-        self.model = Glm4MoeLiteModel(config, mla_attention)
+        self.model = Glm4MoeLiteModel(
+            config,
+            mla_attention,
+            mlp_chunk_size=mlp_chunk_size,
+            decode_cuda_graph=decode_cuda_graph,
+        )
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if config.tie_word_embeddings:
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
-        self.expect_mtp_weights = bool(
-            getattr(config, "sparsevllm_expect_mtp_weights", False)
-        )
+        self.expect_mtp_weights = bool(expect_mtp_weights)
         self._intentionally_skipped_expert_weights: set[str] = set()
         self._intentionally_skipped_mtp_weights: set[str] = set()
 
@@ -913,4 +951,5 @@ __all__ = [
     "Glm4MoeLitePackedExperts",
     "Glm4MoeLiteRouter",
     "Glm4MoeLiteSparseMoeBlock",
+    "build_glm4_moe_lite_mla_attention",
 ]

@@ -64,7 +64,6 @@ def _config(**overrides) -> Glm4MoeLiteConfig:
     config.mlp_chunk_size = 8
     config.quantization_config = QuantizationConfig.disabled()
     config.decode_cuda_graph = False
-    config.sparsevllm_expect_mtp_weights = False
     return config
 
 
@@ -136,6 +135,9 @@ def _model(config=None, *, tp_rank: int = 0, tp_size: int = 1):
         return Glm4MoeLiteForCausalLM(
             config,
             mla_attention=_fake_mla(tp_size),
+            mlp_chunk_size=config.mlp_chunk_size,
+            decode_cuda_graph=config.decode_cuda_graph,
+            expect_mtp_weights=False,
         )
 
 
@@ -181,7 +183,11 @@ def test_glm_tp_projection_slices_follow_local_heads() -> None:
     config = _config()
     context = _tp_context(tp_rank=2, tp_size=4)
     with _construction_context(context):
-        attention = Glm4MoeLiteAttention(config, _fake_mla(tp_size=4))
+        attention = Glm4MoeLiteAttention(
+            config,
+            _fake_mla(tp_size=4),
+            projection_chunk_size=config.mlp_chunk_size,
+        )
 
     q_source = (
         torch.arange(20 * 256 * 768).remainder(127).to(torch.bfloat16)
@@ -206,7 +212,11 @@ def test_glm_decode_absorption_and_value_reconstruction_match_linear_algebra() -
     config = _config()
     context = _tp_context()
     with _construction_context(context):
-        attention = Glm4MoeLiteAttention(config, _fake_mla())
+        attention = Glm4MoeLiteAttention(
+            config,
+            _fake_mla(),
+            projection_chunk_size=config.mlp_chunk_size,
+        )
     torch.manual_seed(19)
     attention.kv_b_proj.weight.data.normal_(mean=0.0, std=0.02)
     q_nope = torch.randn(3, 20, 192, dtype=torch.bfloat16)
@@ -264,7 +274,13 @@ def test_tiny_transformers_weights_load_through_strict_glm_mapping() -> None:
     config = _config()
     context = _tp_context()
     with _construction_context(context):
-        model = Glm4MoeLiteForCausalLM(config, mla_attention=_fake_mla())
+        model = Glm4MoeLiteForCausalLM(
+            config,
+            mla_attention=_fake_mla(),
+            mlp_chunk_size=config.mlp_chunk_size,
+            decode_cuda_graph=config.decode_cuda_graph,
+            expect_mtp_weights=False,
+        )
         initialize_sparse_model(model, config, seed=29)
     reference = build_tiny_random_hf_model(config, seed=29)
     reference_experts = reference.model.layers[1].mlp.experts
@@ -292,8 +308,15 @@ def test_tiny_transformers_weights_load_through_strict_glm_mapping() -> None:
 
 def test_glm_mtp_skip_set_is_exact() -> None:
     config = _config()
-    config.sparsevllm_expect_mtp_weights = True
-    model = _model(config)
+    context = _tp_context()
+    with _construction_context(context):
+        model = Glm4MoeLiteForCausalLM(
+            config,
+            mla_attention=_fake_mla(),
+            mlp_chunk_size=config.mlp_chunk_size,
+            decode_cuda_graph=config.decode_cuda_graph,
+            expect_mtp_weights=True,
+        )
     dense_names = {
         name
         for name, _ in model.named_parameters()
