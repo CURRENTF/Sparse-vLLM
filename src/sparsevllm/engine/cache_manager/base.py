@@ -175,6 +175,25 @@ AttentionPayload = ExplicitKVPayload | MlaLatentPayload
 
 
 @dataclass(frozen=True)
+class ExplicitKVWrite:
+    """Current-token key/value tensors to persist."""
+
+    key: torch.Tensor
+    value: torch.Tensor
+
+
+@dataclass(frozen=True)
+class MlaLatentWrite:
+    """Current-token latent and RoPE tensors to persist."""
+
+    latent: torch.Tensor
+    rope: torch.Tensor
+
+
+AttentionCacheWrite = ExplicitKVWrite | MlaLatentWrite
+
+
+@dataclass(frozen=True)
 class DecodeComputeView:
     """Decode metadata paired with exactly one physical payload layout."""
 
@@ -436,7 +455,7 @@ class CacheManager(ABC):
             + current
             - recurrent_explicit_deduction
         )
-        slot_bytes_per_layer = 2 * self.num_kv_heads * self.head_dim * dtype_size
+        slot_bytes_per_layer = self.attention_cache_bytes_per_slot_per_layer()
 
         recurrent_bytes_per_block = int(
             getattr(config, "prefix_recurrent_bytes_per_block", 0) or 0
@@ -527,6 +546,11 @@ class CacheManager(ABC):
 
         return available_memory, slot_bytes_per_layer
 
+    def attention_cache_bytes_per_slot_per_layer(self) -> int:
+        """Persistent attention-cache bytes for one token in one KV layer."""
+        dtype_size = self._cache_slot_dtype_size()
+        return int(2 * self.num_kv_heads * self.head_dim * dtype_size)
+
     def _kv_allocation_bytes_per_prefix_block(
         self,
         slot_bytes_per_layer: int,
@@ -595,6 +619,23 @@ class CacheManager(ABC):
         store_kvcache(k, v, k_cache, v_cache, slot_mapping)
         return slot_mapping
 
+    def store_attention_payload(
+        self,
+        layer_idx: int,
+        payload: AttentionCacheWrite,
+    ) -> torch.Tensor:
+        """Store one layer's current-token payload using the configured layout."""
+        if not isinstance(payload, ExplicitKVWrite):
+            raise TypeError(
+                f"{type(self).__name__} supports only ExplicitKVWrite stores, got "
+                f"{type(payload).__name__}."
+            )
+        return self._store_layer_kv(
+            layer_idx,
+            payload.key,
+            payload.value,
+        )
+
     def save_raw_kv_if_needed(
         self,
         layer_idx: int,
@@ -617,7 +658,10 @@ class CacheManager(ABC):
             k_post_rope=k_post_rope,
             v=v,
         )
-        slot_mapping = self._store_layer_kv(layer_idx, store_k, store_v)
+        slot_mapping = self.store_attention_payload(
+            layer_idx,
+            ExplicitKVWrite(key=store_k, value=store_v),
+        )
         self.on_kv_stored(
             layer_idx,
             store_k,
@@ -639,6 +683,31 @@ class CacheManager(ABC):
             k_cache, v_cache = self.get_layer_kv_cache(layer_idx)
         return k_cache, v_cache, active_slots, req_indices, context_lens
 
+    def get_layer_compute_payload(
+        self,
+        layer_idx: int,
+        active_slots: torch.Tensor,
+        req_indices: torch.Tensor,
+        context_lens: torch.Tensor,
+        selection: SparseSelection | None = None,
+    ) -> tuple[AttentionPayload, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return the physical payload and logical coordinates for decode."""
+        k_cache, v_cache, active_slots, req_indices, context_lens = (
+            self.get_layer_compute_view(
+                layer_idx,
+                active_slots,
+                req_indices,
+                context_lens,
+                selection,
+            )
+        )
+        return (
+            ExplicitKVPayload(k_cache=k_cache, v_cache=v_cache),
+            active_slots,
+            req_indices,
+            context_lens,
+        )
+
     def get_prefill_compute_view(
         self,
         layer_idx: int,
@@ -657,6 +726,35 @@ class CacheManager(ABC):
             req_indices,
             context_lens,
             selection,
+        )
+
+    def get_prefill_compute_payload(
+        self,
+        layer_idx: int,
+        k_current: torch.Tensor,
+        v_current: torch.Tensor,
+        selection: SparseSelection,
+        active_slots: torch.Tensor,
+        req_indices: torch.Tensor,
+        context_lens: torch.Tensor,
+    ) -> tuple[AttentionPayload, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return the physical payload and logical coordinates for prefill."""
+        k_cache, v_cache, active_slots, req_indices, context_lens = (
+            self.get_prefill_compute_view(
+                layer_idx,
+                k_current,
+                v_current,
+                selection,
+                active_slots,
+                req_indices,
+                context_lens,
+            )
+        )
+        return (
+            ExplicitKVPayload(k_cache=k_cache, v_cache=v_cache),
+            active_slots,
+            req_indices,
+            context_lens,
         )
 
     def _default_active_slots_for_selection(self, layer_idx: int, selection: SparseSelection) -> torch.Tensor:
@@ -684,7 +782,7 @@ class CacheManager(ABC):
             active_slots = self._default_active_slots_for_selection(layer_idx, selection)
             req_indices = selection.req_indices
             context_lens = selection.context_lens
-        k_cache, v_cache, active_slots, req_indices, context_lens = self.get_prefill_compute_view(
+        payload, active_slots, req_indices, context_lens = self.get_prefill_compute_payload(
             layer_idx,
             k_current,
             v_current,
@@ -702,7 +800,7 @@ class CacheManager(ABC):
                 max_context_len=selection.max_context_len,
                 temp_slots=temp_slots,
             ),
-            payload=ExplicitKVPayload(k_cache=k_cache, v_cache=v_cache),
+            payload=payload,
         )
 
     def collect_prefill_attention_score(
@@ -933,12 +1031,14 @@ class CacheManager(ABC):
                 num_heads=num_heads,
                 num_kv_heads=num_kv_heads,
             )
-        k_cache, v_cache, active_slots, req_indices, context_lens = self.get_layer_compute_view(
-            layer_idx,
-            active_slots,
-            req_indices,
-            context_lens,
-            selection,
+        payload, active_slots, req_indices, context_lens = (
+            self.get_layer_compute_payload(
+                layer_idx,
+                active_slots,
+                req_indices,
+                context_lens,
+                selection,
+            )
         )
         return DecodeComputeView(
             meta=AttentionViewMeta(
@@ -948,7 +1048,7 @@ class CacheManager(ABC):
                 attn_score=selection.attn_score,
                 max_context_len=selection.max_context_len,
             ),
-            payload=ExplicitKVPayload(k_cache=k_cache, v_cache=v_cache),
+            payload=payload,
         )
 
     def get_decode_block_seq(self, layer_idx: int, default: int) -> int:
@@ -1285,7 +1385,8 @@ class CacheManager(ABC):
         }
 
     def _cache_slot_dtype_size(self) -> int:
-        dtype = getattr(self.hf_config, "torch_dtype", torch.float16)
+        hf_config = getattr(self, "hf_config", getattr(self.config, "hf_config", None))
+        dtype = getattr(hf_config, "torch_dtype", torch.float16)
         if not isinstance(dtype, torch.dtype):
             dtype = torch.float16
         return int(torch.tensor([], dtype=dtype).element_size())
@@ -1350,8 +1451,14 @@ class CacheManager(ABC):
                 for field_name, item in value.__dict__.items():
                     yield from visit(f"{path}.{field_name}", item)
 
+        storage = getattr(self, "attention_cache_storage", None)
+        if storage is not None:
+            layout = getattr(getattr(storage, "layout", None), "value", "unknown")
+            for index, tensor in enumerate(storage.accounting_tensors()):
+                yield f"attention_cache_storage.{layout}.{index}_cache", tensor
+
         for name, value in self.__dict__.items():
-            if name in {"config", "hf_config"}:
+            if name in {"config", "hf_config", "attention_cache_storage"}:
                 continue
             yield from visit(name, value)
 
@@ -1376,8 +1483,11 @@ class CacheManager(ABC):
             live_tokens = int(row_seq_lens.sum())
         except Exception:
             return 0
-        dtype_size = self._cache_slot_dtype_size()
-        return int(live_tokens * self.num_kv_layers * 2 * self.num_kv_heads * self.head_dim * dtype_size)
+        return int(
+            live_tokens
+            * self.num_kv_layers
+            * self.attention_cache_bytes_per_slot_per_layer()
+        )
 
     def memory_accounting(self) -> dict[str, Any]:
         """Return read-only tensor memory accounting for regression gates.

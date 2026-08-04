@@ -5,9 +5,11 @@ import os
 from types import SimpleNamespace
 from typing import Any
 
+import torch
 from transformers import AutoConfig
 
 from sparsevllm.method_registry import (
+    normalize_sparse_method,
     validate_model_runtime_compatibility,
     validate_sparse_method_assets,
 )
@@ -60,6 +62,42 @@ def _extract_text_config(config: Any) -> Any:
     if isinstance(text_config, dict):
         return _config_to_namespace(text_config)
     return text_config
+
+
+def _resolve_attention_cache_layout(config, model_type: str) -> None:
+    config.attention_cache_layout = (
+        "mla_latent" if model_type == "glm4_moe_lite" else "explicit_kv"
+    )
+    if config.attention_cache_layout == "explicit_kv":
+        return
+    if normalize_sparse_method(config.vllm_sparse_method):
+        raise NotImplementedError(
+            "GLM-4.7-Flash latent MLA supports only vanilla attention."
+        )
+    if config.enable_prefix_caching or config.enable_prefix_cache_offload:
+        raise NotImplementedError(
+            "GLM-4.7-Flash latent MLA does not support prefix caching or offload."
+        )
+    if config.decode_cuda_graph or not config.enforce_eager:
+        raise NotImplementedError(
+            "GLM-4.7-Flash latent MLA requires eager execution."
+        )
+    if config.quantization_config.enabled:
+        raise NotImplementedError(
+            "GLM-4.7-Flash latent MLA does not support quantized checkpoints."
+        )
+    if config.hf_config.torch_dtype != torch.bfloat16:
+        raise NotImplementedError(
+            "GLM-4.7-Flash latent MLA requires BF16 checkpoints."
+        )
+    if (
+        int(config_get(config.hf_config, "kv_lora_rank", 0)) != 512
+        or int(config_get(config.hf_config, "qk_rope_head_dim", 0)) != 64
+    ):
+        raise NotImplementedError(
+            "GLM-4.7-Flash latent MLA requires kv_lora_rank=512 and "
+            "qk_rope_head_dim=64."
+        )
 
 
 def _finalize_model_config(config, model_spec: ModelSpec) -> None:
@@ -132,6 +170,7 @@ def load_and_validate_model(config) -> None:
             "Tiny random mode does not support quantized model weights."
         )
     setattr(config.hf_config, "quantization_config", config.quantization_config)
+    _resolve_attention_cache_layout(config, model_type)
     validate_checkpoint(
         model_type,
         outer_config=config.outer_hf_config,

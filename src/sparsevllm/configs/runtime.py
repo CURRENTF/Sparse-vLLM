@@ -74,6 +74,7 @@ class Config(
     hf_config: AutoConfig | None = None
     outer_hf_config: Any | None = None
     runtime_layout: RuntimeLayout | None = None
+    attention_cache_layout: str = field(default="explicit_kv", init=False)
     quantization_config: QuantizationConfig = field(default_factory=QuantizationConfig.disabled)
     model_spec: ModelSpec = field(init=False, repr=False)
     parallel_topology: ParallelTopology = field(init=False, repr=False)
