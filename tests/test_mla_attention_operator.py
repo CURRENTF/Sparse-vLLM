@@ -206,6 +206,7 @@ def test_mla_provider_run_does_not_resolve_or_allocate() -> None:
     q_nope_absorbed = torch.empty(2, 5, 512, dtype=torch.bfloat16)
     q_rope = torch.empty(2, 5, 64, dtype=torch.bfloat16)
     output = torch.empty_like(q_nope_absorbed)
+    validation_scope = object()
 
     with (
         patch.object(OpResolver, "resolve") as resolve,
@@ -216,13 +217,44 @@ def test_mla_provider_run_does_not_resolve_or_allocate() -> None:
             "sparsevllm.operators.mla_attention.run_mla_decode",
             return_value=output,
         ) as kernel,
+        patch(
+            "sparsevllm.operators.mla_attention.validate_mla_decode_metadata"
+        ) as validate,
     ):
-        actual = provider.run(q_nope_absorbed, q_rope, view, output)
+        actual = provider.run(
+            q_nope_absorbed,
+            q_rope,
+            view,
+            output,
+            validation_scope=validation_scope,
+        )
+        provider.run(
+            q_nope_absorbed,
+            q_rope,
+            view,
+            output,
+            validation_scope=validation_scope,
+        )
+        provider.run(
+            q_nope_absorbed,
+            q_rope,
+            view,
+            output,
+            validation_scope=object(),
+        )
 
     assert actual is output
     resolve.assert_not_called()
     allocate.assert_not_called()
-    kernel.assert_called_once_with(
+    assert validate.call_count == 2
+    validate.assert_called_with(
+        view.meta.active_slots,
+        view.meta.req_indices,
+        view.meta.context_lens,
+        cache_slot_count=4,
+    )
+    assert kernel.call_count == 3
+    kernel.assert_called_with(
         q_nope_absorbed,
         q_rope,
         payload.latent_cache,
@@ -234,6 +266,7 @@ def test_mla_provider_run_does_not_resolve_or_allocate() -> None:
         workspace,
         softmax_scale=spec.softmax_scale,
         config=provider.launch_config,
+        validate_metadata=False,
     )
 
 

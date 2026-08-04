@@ -65,6 +65,12 @@ def test_glm_config_selects_mla_latent_layout():
     config = _glm_config()
 
     assert config.attention_cache_layout == CacheLayout.MLA_LATENT.value
+    assert config.mla_prefill_workspace_bytes == 2 * 1024**3
+
+
+def test_mla_prefill_workspace_budget_must_be_positive():
+    with pytest.raises(ValueError, match="mla_prefill_workspace_bytes"):
+        _glm_config(mla_prefill_workspace_bytes=0)
 
 
 @pytest.mark.parametrize(

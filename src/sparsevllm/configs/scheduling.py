@@ -111,3 +111,9 @@ def normalize_scheduling(config) -> None:
     if int(config.mlp_chunk_size) <= 0:
         raise ValueError(f"mlp_chunk_size must be > 0, got {config.mlp_chunk_size}.")
     config.mlp_chunk_size = int(config.mlp_chunk_size)
+    config.mla_prefill_workspace_bytes = int(config.mla_prefill_workspace_bytes)
+    if config.mla_prefill_workspace_bytes <= 0:
+        raise ValueError(
+            "mla_prefill_workspace_bytes must be > 0, got "
+            f"{config.mla_prefill_workspace_bytes}."
+        )

@@ -20,6 +20,7 @@ from sparsevllm.triton_kernel.mla import (
     MlaDecodeLaunchConfig,
     allocate_mla_decode_workspace,
     run_mla_decode,
+    validate_mla_decode_metadata,
 )
 
 
@@ -82,6 +83,8 @@ class MlaAttentionProvider:
         q_rope: torch.Tensor,
         view: DecodeComputeView,
         output: torch.Tensor,
+        *,
+        validation_scope: object | None = None,
     ) -> torch.Tensor:
         raise NotImplementedError
 
@@ -123,6 +126,13 @@ class MlaTritonProvider(MlaAttentionProvider):
             config=self.launch_config,
         )
         self.device = self.workspace.block_size.device
+        self._validated_decode_metadata: tuple[
+            object,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            int,
+        ] | None = None
 
     @classmethod
     def supports(
@@ -261,6 +271,8 @@ class MlaTritonProvider(MlaAttentionProvider):
         q_rope: torch.Tensor,
         view: DecodeComputeView,
         output: torch.Tensor,
+        *,
+        validation_scope: object | None = None,
     ) -> torch.Tensor:
         payload = self._validate_run_inputs(
             q_nope_absorbed,
@@ -268,6 +280,34 @@ class MlaTritonProvider(MlaAttentionProvider):
             view,
             output,
         )
+        cache_slot_count = int(payload.latent_cache.shape[0])
+        metadata_key = (
+            validation_scope,
+            view.meta.active_slots,
+            view.meta.req_indices,
+            view.meta.context_lens,
+            cache_slot_count,
+        )
+        cached_key = self._validated_decode_metadata
+        metadata_is_validated = (
+            validation_scope is not None
+            and cached_key is not None
+            and cached_key[0] is validation_scope
+            and cached_key[1] is metadata_key[1]
+            and cached_key[2] is metadata_key[2]
+            and cached_key[3] is metadata_key[3]
+            and cached_key[4] == metadata_key[4]
+        )
+        if not metadata_is_validated:
+            validate_mla_decode_metadata(
+                view.meta.active_slots,
+                view.meta.req_indices,
+                view.meta.context_lens,
+                cache_slot_count=cache_slot_count,
+            )
+            self._validated_decode_metadata = (
+                metadata_key if validation_scope is not None else None
+            )
         return run_mla_decode(
             q_nope_absorbed,
             q_rope,
@@ -280,6 +320,7 @@ class MlaTritonProvider(MlaAttentionProvider):
             self.workspace,
             softmax_scale=self.spec.softmax_scale,
             config=self.launch_config,
+            validate_metadata=False,
         )
 
 

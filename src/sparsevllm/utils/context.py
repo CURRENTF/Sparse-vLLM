@@ -1,5 +1,6 @@
 class Context:
     def __init__(self):
+        self.attention_validation_scope = object()
         self.is_prefill = False
         self.is_long_text = False
         self.cu_seqlens_q = None
