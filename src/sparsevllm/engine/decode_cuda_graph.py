@@ -481,6 +481,14 @@ class DecodeCudaGraphRunner:
             raise ValueError("decode_cuda_graph requires a non-empty decode batch.")
         if capture_sampling and any(seq.temperature > 1e-10 for seq in seqs):
             raise ValueError("decode_cuda_graph capture_sampling currently supports greedy decode only.")
+        if capture_sampling and any(
+            float(getattr(seq, "presence_penalty", 0.0)) != 0.0
+            or float(getattr(seq, "repetition_penalty", 1.0)) != 1.0
+            for seq in seqs
+        ):
+            raise ValueError(
+                "decode_cuda_graph capture_sampling cannot apply sampling penalties."
+            )
 
         real_batch_size = len(seqs)
         force_eager = getattr(self.cache_manager, "decode_cuda_graph_force_eager", None)

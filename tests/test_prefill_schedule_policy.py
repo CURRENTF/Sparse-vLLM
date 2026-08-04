@@ -29,6 +29,7 @@ from sparsevllm.engine.model_runner import ModelRunner
 from sparsevllm.engine.runtime_state import RuntimeState
 from sparsevllm.engine.scheduler import Scheduler
 from sparsevllm.engine.sequence import Sequence
+from sparsevllm.layers.sampler import Sampler
 from sparsevllm.sampling_params import SamplingParams
 from sparsevllm.engine.sparse_controller import SparseController
 from sparsevllm.method_registry import (
@@ -964,8 +965,35 @@ class PrefillPolicyConfigTest(unittest.TestCase):
         runner.config.decode_cuda_graph_capture_sampling = True
         self.assertTrue(runner._auto_capture_greedy_sampling(seqs))
 
+        seqs[0].presence_penalty = 0.1
+        self.assertFalse(runner._auto_capture_greedy_sampling(seqs))
+        seqs[0].presence_penalty = 0.0
+        seqs[0].repetition_penalty = 0.9
+        self.assertFalse(runner._auto_capture_greedy_sampling(seqs))
+        seqs[0].repetition_penalty = 1.0
+        self.assertTrue(runner._auto_capture_greedy_sampling(seqs))
+
         seqs[0].should_publish_sample = False
         self.assertFalse(runner._auto_capture_greedy_sampling(seqs))
+
+    def test_decode_cuda_graph_capture_sampling_rejects_penalties(self):
+        runner = object.__new__(DecodeCudaGraphRunner)
+
+        for seq in (
+            SimpleNamespace(
+                temperature=0.0,
+                presence_penalty=0.1,
+                repetition_penalty=1.0,
+            ),
+            SimpleNamespace(
+                temperature=0.0,
+                presence_penalty=0.0,
+                repetition_penalty=1.1,
+            ),
+        ):
+            with self.subTest(seq=seq):
+                with self.assertRaisesRegex(ValueError, "sampling penalties"):
+                    runner.run([seq], capture_sampling=True)
 
     def test_recompute_rows_are_excluded_from_sampling(self):
         runner = object.__new__(ModelRunner)
@@ -985,6 +1013,39 @@ class PrefillPolicyConfigTest(unittest.TestCase):
 
         self.assertEqual(token_ids, [0, 1])
         self.assertEqual(sampled_shapes, [(1, 2)])
+
+    def test_penalized_logits_drive_greedy_sampling_and_logprobs(self):
+        runner = object.__new__(ModelRunner)
+        runner.sampler = Sampler()
+        seq = Sequence(
+            [0],
+            SamplingParams(
+                temperature=0.0,
+                max_tokens=3,
+                presence_penalty=0.5,
+                repetition_penalty=2.0,
+                logprobs=1,
+            ),
+        )
+        seq.append_token(2)
+        raw_logits = torch.tensor([[4.0, 3.0, 3.5]])
+
+        sampling_logits = runner._apply_sampling_penalties(raw_logits, [seq])
+        token_ids = runner._sample_model_outputs(sampling_logits, [seq])
+        token_logprobs, top_logprobs = runner._collect_logprobs(
+            sampling_logits,
+            token_ids,
+            [seq],
+        )
+
+        torch.testing.assert_close(
+            sampling_logits,
+            torch.tensor([[2.0, 3.0, 1.25]]),
+        )
+        self.assertEqual(token_ids, [1])
+        expected_logprob = torch.log_softmax(sampling_logits, dim=-1)[0, 1].item()
+        self.assertAlmostEqual(token_logprobs[0], expected_logprob)
+        self.assertEqual(list(top_logprobs[0]), [1])
 
     def test_decode_cuda_graph_explicit_capture_sizes_are_validated(self):
         cfg = self.make_config(

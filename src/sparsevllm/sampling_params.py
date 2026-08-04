@@ -6,6 +6,8 @@ class SamplingParams:
     temperature: float = 1.0
     top_p: float = 1.0
     top_k: int = 0
+    presence_penalty: float = 0.0
+    repetition_penalty: float = 1.0
     max_tokens: int = 64
     ignore_eos: bool = False
     eos_token_ids: int | list[int] | tuple[int, ...] | None = None
@@ -18,6 +20,10 @@ class SamplingParams:
             raise ValueError("top_p must be in (0, 1]")
         if self.top_k < 0:
             raise ValueError("top_k must be non-negative")
+        if not -2.0 <= self.presence_penalty <= 2.0:
+            raise ValueError("presence_penalty must be in [-2, 2]")
+        if not self.repetition_penalty > 0.0:
+            raise ValueError("repetition_penalty must be positive")
         if self.max_tokens <= 0:
             raise ValueError("max_tokens must be positive")
         if self.eos_token_ids is None:

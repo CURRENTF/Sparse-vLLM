@@ -1025,6 +1025,72 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
                 top_logprobs=21,
             )
 
+    def test_sampling_penalty_request_bounds_and_mapping(self):
+        from pydantic import ValidationError
+
+        from sparsevllm.entrypoints.openai.api_server import (
+            ChatCompletionRequest,
+            CompletionRequest,
+            ResponseRequest,
+            _sampling_params_from_request,
+            _sampling_params_from_response_request,
+        )
+
+        completion_params = _sampling_params_from_request(
+            CompletionRequest(
+                model="m",
+                prompt="p",
+                presence_penalty=-0.5,
+                repetition_penalty=0.8,
+            )
+        )
+        chat_params = _sampling_params_from_request(
+            ChatCompletionRequest(
+                model="m",
+                messages=[{"role": "user", "content": "p"}],
+                presence_penalty=0.75,
+                repetition_penalty=1.2,
+            )
+        )
+        response_params = _sampling_params_from_response_request(
+            ResponseRequest(
+                model="m",
+                input="p",
+                presence_penalty=2.0,
+                repetition_penalty=1.5,
+            )
+        )
+
+        self.assertEqual(completion_params.presence_penalty, -0.5)
+        self.assertEqual(completion_params.repetition_penalty, 0.8)
+        self.assertEqual(chat_params.presence_penalty, 0.75)
+        self.assertEqual(chat_params.repetition_penalty, 1.2)
+        self.assertEqual(response_params.presence_penalty, 2.0)
+        self.assertEqual(response_params.repetition_penalty, 1.5)
+
+        for request_type, request_fields in (
+            (CompletionRequest, {"prompt": "p"}),
+            (
+                ChatCompletionRequest,
+                {"messages": [{"role": "user", "content": "p"}]},
+            ),
+            (ResponseRequest, {"input": "p"}),
+        ):
+            with self.subTest(request_type=request_type.__name__, field="presence"):
+                with self.assertRaises(ValidationError):
+                    request_type(
+                        model="m",
+                        presence_penalty=2.01,
+                        **request_fields,
+                    )
+            with self.subTest(request_type=request_type.__name__, field="repetition"):
+                with self.assertRaises(ValidationError):
+                    request_type(
+                        model="m",
+                        repetition_penalty=0.0,
+                        **request_fields,
+                    )
+
     def test_stop_with_logprobs_fails_fast(self):
         from fastapi import HTTPException
 

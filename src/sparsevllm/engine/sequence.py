@@ -6,6 +6,77 @@ from itertools import count
 from sparsevllm.sampling_params import SamplingParams
 
 
+class _UniqueTokenIds:
+    """Rank-0 unique-token state with an incrementally synced device buffer."""
+
+    def __init__(self, token_ids=()):
+        self.values: list[int] = []
+        self.seen: set[int] = set()
+        for token_id in token_ids:
+            self.add(token_id)
+        self.device_tensor: torch.Tensor | None = None
+        self.device: torch.device | None = None
+        self.vocab_size: int | None = None
+        self.synced_count = 0
+
+    def add(self, token_id: int) -> None:
+        token_id = int(token_id)
+        if token_id in self.seen:
+            return
+        self.seen.add(token_id)
+        self.values.append(token_id)
+
+    def to_tensor(
+        self,
+        *,
+        device: torch.device,
+        vocab_size: int,
+        max_new_tokens: int,
+    ) -> torch.Tensor | None:
+        if not self.values:
+            return None
+        device = torch.device(device)
+        vocab_size = int(vocab_size)
+        if vocab_size <= 0:
+            raise ValueError(f"vocab_size must be positive, got {vocab_size}.")
+
+        token_count = len(self.values)
+        if (
+            self.device_tensor is None
+            or self.device != device
+            or self.vocab_size != vocab_size
+            or token_count > int(self.device_tensor.numel())
+        ):
+            capacity = max(
+                token_count,
+                min(vocab_size, token_count + max(0, int(max_new_tokens))),
+            )
+            self.device_tensor = torch.empty(
+                (capacity,),
+                dtype=torch.long,
+                device=device,
+            )
+            self.device = device
+            self.vocab_size = vocab_size
+            self.synced_count = 0
+
+        if self.synced_count < token_count:
+            new_values = self.values[self.synced_count:token_count]
+            target = self.device_tensor[self.synced_count:token_count]
+            if len(new_values) == 1:
+                target.fill_(new_values[0])
+            else:
+                target.copy_(
+                    torch.tensor(
+                        new_values,
+                        dtype=torch.long,
+                        device=device,
+                    )
+                )
+            self.synced_count = token_count
+        return self.device_tensor[:token_count]
+
+
 class SequenceStatus(Enum):
     WAITING = auto()
     RUNNING = auto()
@@ -51,12 +122,90 @@ class Sequence:
         self.temperature = sampling_params.temperature
         self.top_p = sampling_params.top_p
         self.top_k = sampling_params.top_k
+        self.presence_penalty = sampling_params.presence_penalty
+        self.repetition_penalty = sampling_params.repetition_penalty
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
         self.eos_token_ids = tuple(sampling_params.eos_token_ids)
         self.logprobs = sampling_params.logprobs
         self.completion_token_logprobs: list[float | None] = []
         self.completion_top_logprobs: list[dict[int, float] | None] = []
+        self._init_sampling_penalty_state(token_ids)
+
+    def _init_sampling_penalty_state(self, prompt_token_ids: list[int]) -> None:
+        self._presence_penalty_tokens = (
+            _UniqueTokenIds() if self.presence_penalty != 0.0 else None
+        )
+        self._repetition_penalty_tokens = (
+            _UniqueTokenIds(prompt_token_ids)
+            if self.repetition_penalty != 1.0
+            else None
+        )
+
+    @property
+    def has_sampling_penalty(self) -> bool:
+        return self.presence_penalty != 0.0 or self.repetition_penalty != 1.0
+
+    def _track_sampling_penalty_token(self, token_id: int) -> None:
+        if self._presence_penalty_tokens is not None:
+            self._presence_penalty_tokens.add(token_id)
+        if self._repetition_penalty_tokens is not None:
+            self._repetition_penalty_tokens.add(token_id)
+
+    def _sampling_penalty_token_tensor(
+        self,
+        kind: str,
+        *,
+        device: torch.device,
+        vocab_size: int,
+    ) -> torch.Tensor | None:
+        if kind == "presence":
+            token_state = self._presence_penalty_tokens
+            active = self.presence_penalty != 0.0
+        elif kind == "repetition":
+            token_state = self._repetition_penalty_tokens
+            active = self.repetition_penalty != 1.0
+        else:
+            raise ValueError(f"Unknown sampling penalty token kind: {kind!r}.")
+        if not active:
+            return None
+        if token_state is None:
+            raise RuntimeError(
+                "Sampling penalty token history is unavailable on this TP worker. "
+                "Only rank 0 may apply sampling penalties."
+            )
+        return token_state.to_tensor(
+            device=device,
+            vocab_size=vocab_size,
+            max_new_tokens=max(
+                0,
+                int(self.max_tokens) - int(self.num_completion_tokens),
+            ),
+        )
+
+    def presence_penalty_token_ids_tensor(
+        self,
+        *,
+        device: torch.device,
+        vocab_size: int,
+    ) -> torch.Tensor | None:
+        return self._sampling_penalty_token_tensor(
+            "presence",
+            device=device,
+            vocab_size=vocab_size,
+        )
+
+    def repetition_penalty_token_ids_tensor(
+        self,
+        *,
+        device: torch.device,
+        vocab_size: int,
+    ) -> torch.Tensor | None:
+        return self._sampling_penalty_token_tensor(
+            "repetition",
+            device=device,
+            vocab_size=vocab_size,
+        )
 
     def __len__(self):
         return self.num_tokens
@@ -196,6 +345,8 @@ class Sequence:
         logprob: float | None = None,
         top_logprobs: dict[int, float] | None = None,
     ):
+        if self.has_sampling_penalty:
+            self._track_sampling_penalty_token(token_id)
         self.token_ids.append(token_id)
         if self.num_completion_tokens >= 0:
             self.completion_token_logprobs.append(logprob)
@@ -223,6 +374,8 @@ class Sequence:
             self.temperature,
             self.top_p,
             self.top_k,
+            self.presence_penalty,
+            self.repetition_penalty,
             self.max_tokens,
             self.ignore_eos,
             self.eos_token_ids,
@@ -244,7 +397,8 @@ class Sequence:
     def __setstate__(self, state):
         (self.seq_id, self.status, self.num_tokens, self.num_prompt_tokens,
          self.num_prefilled_tokens, self.current_chunk_size, self.temperature,
-         self.top_p, self.top_k, self.max_tokens, self.ignore_eos, self.eos_token_ids,
+         self.top_p, self.top_k, self.presence_penalty, self.repetition_penalty,
+         self.max_tokens, self.ignore_eos, self.eos_token_ids,
          self.logprobs, data,
          self.prefix_cache_enabled, self.prefix_cache_hit_len, self.prefix_cache_hit_block_count,
          self.prefix_cache_hit_last_block_id, self.prefix_cache_block_size, self.prefix_cache_method,
@@ -252,6 +406,12 @@ class Sequence:
          self.recompute_replay_cursor, self.decode_progress_checkpoint) = state
         self.completion_token_logprobs = []
         self.completion_top_logprobs = []
+        # TP workers intentionally receive only the active prompt chunk or one
+        # decode token, so they cannot reconstruct full penalty history. They do
+        # receive both scalar penalties to make CUDA-graph control flow agree
+        # with rank 0; rank 0 alone owns and applies the token-history state.
+        self._presence_penalty_tokens = None
+        self._repetition_penalty_tokens = None
 
         if self.num_completion_tokens == 0 or self.is_recompute_prefill:
             self.token_ids = data

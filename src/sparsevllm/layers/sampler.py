@@ -7,6 +7,62 @@ class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
 
+    def apply_penalties(
+        self,
+        logits: torch.Tensor,
+        *,
+        presence_penalties: list[float],
+        repetition_penalties: list[float],
+        presence_token_ids: list[torch.Tensor | None],
+        repetition_token_ids: list[torch.Tensor | None],
+    ) -> torch.Tensor:
+        batch_size = int(logits.shape[0])
+        inputs = (
+            presence_penalties,
+            repetition_penalties,
+            presence_token_ids,
+            repetition_token_ids,
+        )
+        if any(len(values) != batch_size for values in inputs):
+            raise ValueError(
+                "Sampling penalties must provide one value/token set per logits row."
+            )
+        if not any(
+            presence_penalty != 0.0 or repetition_penalty != 1.0
+            for presence_penalty, repetition_penalty in zip(
+                presence_penalties,
+                repetition_penalties,
+            )
+        ):
+            return logits
+
+        penalized_logits = logits.to(dtype=torch.float32, copy=True)
+        for row, (
+            presence_penalty,
+            repetition_penalty,
+            completion_ids,
+            prompt_and_completion_ids,
+        ) in enumerate(
+            zip(
+                presence_penalties,
+                repetition_penalties,
+                presence_token_ids,
+                repetition_token_ids,
+            )
+        ):
+            row_logits = penalized_logits[row]
+            if repetition_penalty != 1.0 and prompt_and_completion_ids is not None:
+                repeated_logits = row_logits[prompt_and_completion_ids]
+                repeated_logits = torch.where(
+                    repeated_logits > 0,
+                    repeated_logits / repetition_penalty,
+                    repeated_logits * repetition_penalty,
+                )
+                row_logits[prompt_and_completion_ids] = repeated_logits
+            if presence_penalty != 0.0 and completion_ids is not None:
+                row_logits[completion_ids] -= presence_penalty
+        return penalized_logits
+
     def _sample(
         self,
         logits: torch.Tensor,

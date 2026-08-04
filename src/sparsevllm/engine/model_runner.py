@@ -1046,6 +1046,8 @@ class ModelRunner:
         )
 
     def _auto_capture_greedy_sampling(self, seqs: list[Sequence]) -> bool:
+        if any(self._has_sampling_penalty(seq) for seq in seqs):
+            return False
         if self.config.decode_cuda_graph_capture_sampling:
             return all(bool(getattr(seq, "should_publish_sample", True)) for seq in seqs)
         if self.config.tensor_parallel_size != 1:
@@ -1058,6 +1060,54 @@ class ModelRunner:
             bool(getattr(seq, "should_publish_sample", True))
             and seq.temperature <= 1e-10
             for seq in seqs
+        )
+
+    @staticmethod
+    def _has_sampling_penalty(seq: Sequence) -> bool:
+        return (
+            float(getattr(seq, "presence_penalty", 0.0)) != 0.0
+            or float(getattr(seq, "repetition_penalty", 1.0)) != 1.0
+        )
+
+    def _apply_sampling_penalties(
+        self,
+        logits: torch.Tensor,
+        seqs: list[Sequence],
+    ) -> torch.Tensor:
+        if not any(self._has_sampling_penalty(seq) for seq in seqs):
+            return logits
+
+        vocab_size = int(logits.shape[-1])
+        presence_penalties = [
+            float(getattr(seq, "presence_penalty", 0.0)) for seq in seqs
+        ]
+        repetition_penalties = [
+            float(getattr(seq, "repetition_penalty", 1.0)) for seq in seqs
+        ]
+        presence_token_ids = [
+            seq.presence_penalty_token_ids_tensor(
+                device=logits.device,
+                vocab_size=vocab_size,
+            )
+            if presence_penalty != 0.0
+            else None
+            for seq, presence_penalty in zip(seqs, presence_penalties)
+        ]
+        repetition_token_ids = [
+            seq.repetition_penalty_token_ids_tensor(
+                device=logits.device,
+                vocab_size=vocab_size,
+            )
+            if repetition_penalty != 1.0
+            else None
+            for seq, repetition_penalty in zip(seqs, repetition_penalties)
+        ]
+        return self.sampler.apply_penalties(
+            logits,
+            presence_penalties=presence_penalties,
+            repetition_penalties=repetition_penalties,
+            presence_token_ids=presence_token_ids,
+            repetition_token_ids=repetition_token_ids,
         )
 
     def _sample_model_outputs(
@@ -1220,14 +1270,15 @@ class ModelRunner:
                         return None, None
                     self._post_sparse_forward(seqs, is_prefill)
                     with profiler.record("model_sampler"):
+                        sampling_logits = self._apply_sampling_penalties(logits, seqs)
                         token_ids = self._sample_model_outputs(
-                            logits,
+                            sampling_logits,
                             seqs,
                             graph_token_ids=graph_token_ids,
                         )
                     logprob_outputs = self._mask_recompute_logprobs(
                         seqs,
-                        self._collect_logprobs(logits, token_ids, seqs),
+                        self._collect_logprobs(sampling_logits, token_ids, seqs),
                     )
                     return token_ids, logprob_outputs
                 finally:
@@ -1247,15 +1298,16 @@ class ModelRunner:
             
             # 4. Token 采样 (仅 Rank 0)
             with profiler.record("model_sampler"):
-                token_ids = (
-                    self._sample_model_outputs(logits, seqs)
-                    if self.rank == 0
-                    else None
-                )
+                if self.rank == 0:
+                    sampling_logits = self._apply_sampling_penalties(logits, seqs)
+                    token_ids = self._sample_model_outputs(sampling_logits, seqs)
+                else:
+                    sampling_logits = None
+                    token_ids = None
             logprob_outputs = (
                 self._mask_recompute_logprobs(
                     seqs,
-                    self._collect_logprobs(logits, token_ids, seqs),
+                    self._collect_logprobs(sampling_logits, token_ids, seqs),
                 )
                 if self.rank == 0
                 else None

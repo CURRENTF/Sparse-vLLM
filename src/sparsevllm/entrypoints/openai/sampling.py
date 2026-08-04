@@ -28,6 +28,8 @@ def _sampling_params_from_request(request: CompletionRequest | ChatCompletionReq
         temperature=request.temperature,
         top_p=request.top_p,
         top_k=request.top_k,
+        presence_penalty=request.presence_penalty,
+        repetition_penalty=request.repetition_penalty,
         max_tokens=max_tokens,
         ignore_eos=request.ignore_eos,
         logprobs=logprobs,
@@ -39,6 +41,8 @@ def _sampling_params_from_response_request(request: ResponseRequest) -> Sampling
         temperature=request.temperature,
         top_p=request.top_p,
         top_k=request.top_k,
+        presence_penalty=request.presence_penalty,
+        repetition_penalty=request.repetition_penalty,
         max_tokens=request.max_output_tokens or 16,
     )
 
