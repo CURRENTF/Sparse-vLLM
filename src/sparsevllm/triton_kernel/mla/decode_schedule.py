@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import torch
@@ -326,6 +327,7 @@ def run_mla_decode(
     output: torch.Tensor,
     workspace: MlaDecodeWorkspace,
     *,
+    softmax_scale: float,
     config: MlaDecodeLaunchConfig = DEFAULT_GLM_MLA_DECODE_CONFIG,
     validate_metadata: bool = True,
 ) -> torch.Tensor:
@@ -358,6 +360,11 @@ def run_mla_decode(
             "MLA decode workspace is too small: "
             f"heads={workspace.mid_output.shape[0]}, required={head_count}"
         )
+    softmax_scale = float(softmax_scale)
+    if not math.isfinite(softmax_scale) or softmax_scale <= 0:
+        raise ValueError(
+            f"softmax_scale must be finite and positive, got {softmax_scale}."
+        )
     if validate_metadata:
         validate_mla_decode_metadata(
             active_slots,
@@ -378,7 +385,7 @@ def run_mla_decode(
         workspace.block_size,
         workspace.mid_output,
         workspace.mid_logsumexp,
-        softmax_scale=GLM_MLA_SOFTMAX_SCALE,
+        softmax_scale=softmax_scale,
         program_count=config.program_count,
         block_q_heads=config.block_q_heads,
         block_n=config.block_n,

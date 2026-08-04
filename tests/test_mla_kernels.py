@@ -326,6 +326,7 @@ def test_mla_decode_matches_torch_matrix(
             context_lens,
             output,
             workspace,
+            softmax_scale=GLM_MLA_SOFTMAX_SCALE,
         )
         torch.cuda.synchronize()
         expected = _torch_mla_decode(*case)
@@ -380,6 +381,7 @@ def test_mla_decode_zeroes_padded_rows() -> None:
         context_lens,
         output,
         workspace,
+        softmax_scale=GLM_MLA_SOFTMAX_SCALE,
     )
     torch.cuda.synchronize()
 
@@ -423,6 +425,7 @@ def test_mla_decode_rejects_duplicate_active_slots() -> None:
             context_lens,
             output,
             workspace,
+            softmax_scale=GLM_MLA_SOFTMAX_SCALE,
         )
 
 
@@ -565,6 +568,7 @@ def test_decode_rejects_small_workspace_and_non_bf16_input() -> None:
             context_lens,
             output,
             small_workspace,
+            softmax_scale=GLM_MLA_SOFTMAX_SCALE,
         )
     with pytest.raises(TypeError, match="q_latent"):
         run_mla_decode(
@@ -577,4 +581,5 @@ def test_decode_rejects_small_workspace_and_non_bf16_input() -> None:
             context_lens,
             output,
             workspace,
+            softmax_scale=GLM_MLA_SOFTMAX_SCALE,
         )
