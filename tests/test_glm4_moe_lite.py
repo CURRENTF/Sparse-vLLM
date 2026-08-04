@@ -92,6 +92,8 @@ def _fake_mla(tp_size: int = 1):
     return SimpleNamespace(
         spec=spec,
         provider=SimpleNamespace(name="test"),
+        hidden_size=64,
+        projection_chunk_size=8,
     )
 
 

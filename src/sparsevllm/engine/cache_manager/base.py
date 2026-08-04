@@ -1407,7 +1407,38 @@ class CacheManager(ABC):
     def _dense_baseline_bytes(self) -> int:
         dtype_size = self._cache_slot_dtype_size()
         slots = self._dense_baseline_slots()
-        return int(slots * self.num_kv_layers * 2 * self.num_kv_heads * self.head_dim * dtype_size)
+        storage = getattr(self, "attention_cache_storage", None)
+        layout = getattr(storage, "layout", None)
+        layout_name = str(getattr(layout, "value", layout) or "")
+        if layout_name == "mla_latent":
+            hf_config = self.hf_config
+            global_heads = int(hf_config.num_attention_heads)
+            attention_tp_size = int(
+                getattr(
+                    getattr(self, "parallel_context", None),
+                    "attention_tp_size",
+                    getattr(self, "tp_size", 1),
+                )
+            )
+            if global_heads % attention_tp_size != 0:
+                raise ValueError(
+                    "MLA dense baseline requires attention heads divisible by TP: "
+                    f"heads={global_heads} tp={attention_tp_size}."
+                )
+            local_heads = global_heads // attention_tp_size
+            qk_head_dim = int(hf_config.qk_nope_head_dim) + int(
+                hf_config.qk_rope_head_dim
+            )
+            value_head_dim = int(hf_config.v_head_dim)
+            values_per_token = local_heads * (qk_head_dim + value_head_dim)
+        else:
+            values_per_token = 2 * self.num_kv_heads * self.head_dim
+        return int(
+            slots
+            * self.num_kv_layers
+            * values_per_token
+            * dtype_size
+        )
 
     @staticmethod
     def _tensor_storage_key(tensor: torch.Tensor) -> tuple[Any, ...]:

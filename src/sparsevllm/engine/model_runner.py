@@ -181,6 +181,7 @@ class ModelRunner:
                     ),
                     prefill_workspace_bytes=config.mla_prefill_workspace_bytes,
                     decode_cuda_graph=config.decode_cuda_graph,
+                    projection_chunk_size=config.mlp_chunk_size,
                 ),
                 "mlp_chunk_size": config.mlp_chunk_size,
                 "decode_cuda_graph": config.decode_cuda_graph,

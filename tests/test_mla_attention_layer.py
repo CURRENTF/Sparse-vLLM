@@ -70,6 +70,8 @@ def _attention(
             max_batch_size=max_batch_size,
         ),
         prefill_workspace_bytes=budget,
+        hidden_size=64,
+        projection_chunk_size=8,
     )
 
 
@@ -145,17 +147,32 @@ def _torch_prefill(
 def test_mla_prefill_workspace_estimate_accounts_for_full_history() -> None:
     actual = estimate_mla_prefill_workspace_bytes(
         total_visible_tokens=11,
+        query_tokens=5,
         batch_size=2,
         max_context_len=7,
         local_q_heads=5,
+        kv_lora_rank=512,
+        rope_dim=64,
+        qk_head_dim=256,
+        value_head_dim=256,
+        hidden_size=64,
+        projection_chunk_size=4,
         activation_dtype=torch.bfloat16,
         cache_dtype=torch.bfloat16,
     )
 
     gathered = 11 * (512 + 64) * 2
-    expanded = 11 * 5 * ((192 + 256) + 256) * 2
+    projected = 11 * 5 * (192 + 256) * 2
+    projection_scratch = 4 * 5 * (192 + 256) * 2
+    expanded_k = 11 * 5 * 256 * 2
+    attention_output = 5 * 5 * 256 * 2
+    output_projection_scratch = 4 * 64 * 2
     metadata = (2 * 7 + 2 * 2 + 7) * 4
-    assert actual == gathered + expanded + metadata
+    assert actual == max(
+        gathered + projected + projection_scratch,
+        gathered + projected + expanded_k + attention_output,
+        attention_output + output_projection_scratch,
+    ) + metadata
 
 
 def test_mla_prefill_rejects_wrong_payload_before_gather() -> None:
@@ -176,7 +193,7 @@ def test_mla_prefill_rejects_wrong_payload_before_gather() -> None:
         patch("sparsevllm.layers.mla_attention.gather_latent_history") as gather,
         pytest.raises(TypeError, match="MlaLatentPayload"),
     ):
-        attention.prepare_prefill_history(view)
+        attention.prepare_prefill_history(view, query_tokens=1)
     gather.assert_not_called()
 
 
@@ -194,7 +211,7 @@ def test_mla_prefill_budget_fails_before_allocation_or_gather() -> None:
         patch("sparsevllm.layers.mla_attention.gather_latent_history") as gather,
         pytest.raises(MemoryError, match="exceeds its configured budget"),
     ):
-        attention.prepare_prefill_history(view)
+        attention.prepare_prefill_history(view, query_tokens=2)
     gather.assert_not_called()
 
 
@@ -211,6 +228,8 @@ def test_mla_attention_bind_resolves_provider_once() -> None:
             device="cpu",
             max_batch_size=8,
             prefill_workspace_bytes=1024,
+            hidden_size=64,
+            projection_chunk_size=8,
         )
 
     assert attention.provider is provider
@@ -249,10 +268,10 @@ def test_mla_prefill_reuses_validated_packing_across_layers() -> None:
             "sparsevllm.layers.mla_attention.gather_latent_history"
         ) as gather,
     ):
-        first = attention.prepare_prefill_history(first_view)
-        second = attention.prepare_prefill_history(second_view)
+        first = attention.prepare_prefill_history(first_view, query_tokens=2)
+        second = attention.prepare_prefill_history(second_view, query_tokens=2)
         reset_context()
-        attention.prepare_prefill_history(second_view)
+        attention.prepare_prefill_history(second_view, query_tokens=2)
 
     assert validate.call_count == 2
     assert gather.call_count == 3
@@ -270,7 +289,7 @@ def test_mla_prefill_reuses_query_validation_across_layers() -> None:
         torch.tensor([2], dtype=torch.int32),
     )
     with patch("sparsevllm.layers.mla_attention.gather_latent_history"):
-        history = attention.prepare_prefill_history(view)
+        history = attention.prepare_prefill_history(view, query_tokens=2)
     workset = _expand_history(attention, history)
     q = torch.empty(2, 5, 256, dtype=torch.bfloat16)
     starts = torch.tensor([0], dtype=torch.int32)
@@ -337,7 +356,7 @@ def test_mla_prefill_matches_ragged_full_history_oracle() -> None:
         torch.tensor([2, 0], dtype=torch.int32, device="cuda"),
         context_lens,
     )
-    history = attention.prepare_prefill_history(view)
+    history = attention.prepare_prefill_history(view, query_tokens=5)
     workset = _expand_history(attention, history)
     chunk_lens = torch.tensor([2, 3], dtype=torch.int32, device="cuda")
     b_start_loc = torch.tensor([0, 2], dtype=torch.int32, device="cuda")
@@ -382,7 +401,8 @@ def test_mla_prefill_is_invariant_to_chunk_boundary() -> None:
             active_slots,
             request_indices,
             torch.tensor([6], dtype=torch.int32, device="cuda"),
-        )
+        ),
+        query_tokens=6,
     )
     full_workset = _expand_history(attention, full_history)
     full_output = attention.run_prefill(
@@ -399,7 +419,8 @@ def test_mla_prefill_is_invariant_to_chunk_boundary() -> None:
             active_slots,
             request_indices,
             torch.tensor([4], dtype=torch.int32, device="cuda"),
-        )
+        ),
+        query_tokens=4,
     )
     first_output = attention.run_prefill(
         q[:4],

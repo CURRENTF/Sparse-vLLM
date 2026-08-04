@@ -61,6 +61,7 @@ class _MlaPrefillPlan:
     source_req_indices: torch.Tensor
     source_context_lens: torch.Tensor
     source_max_context_len: int | None
+    source_query_tokens: int
     cache_slot_count: int
     packed_offsets: torch.Tensor
     packed_slots: torch.Tensor
@@ -75,6 +76,7 @@ class _MlaPrefillPlan:
         validation_scope: object,
         meta: AttentionViewMeta,
         cache_slot_count: int,
+        query_tokens: int,
     ) -> bool:
         return (
             self.validation_scope is validation_scope
@@ -82,6 +84,7 @@ class _MlaPrefillPlan:
             and self.source_req_indices is meta.req_indices
             and self.source_context_lens is meta.context_lens
             and self.source_max_context_len == meta.max_context_len
+            and self.source_query_tokens == int(query_tokens)
             and self.cache_slot_count == int(cache_slot_count)
         )
 
@@ -116,49 +119,133 @@ def _host_int_values(tensor: torch.Tensor) -> tuple[int, ...]:
 def estimate_mla_prefill_workspace_bytes(
     *,
     total_visible_tokens: int,
+    query_tokens: int,
     batch_size: int,
     max_context_len: int,
     local_q_heads: int,
+    kv_lora_rank: int,
+    rope_dim: int,
+    qk_head_dim: int,
+    value_head_dim: int,
+    hidden_size: int,
+    projection_chunk_size: int,
     activation_dtype: torch.dtype,
     cache_dtype: torch.dtype,
 ) -> int:
-    """Conservatively bound full-history gather and K/V expansion storage."""
+    """Bound the peak modeled transient storage for MLA full-history prefill."""
 
     values = {
         "total_visible_tokens": total_visible_tokens,
+        "query_tokens": query_tokens,
         "batch_size": batch_size,
         "max_context_len": max_context_len,
         "local_q_heads": local_q_heads,
+        "kv_lora_rank": kv_lora_rank,
+        "rope_dim": rope_dim,
+        "qk_head_dim": qk_head_dim,
+        "value_head_dim": value_head_dim,
+        "hidden_size": hidden_size,
+        "projection_chunk_size": projection_chunk_size,
     }
     for name, value in values.items():
         if int(value) < 0:
             raise ValueError(f"{name} must be non-negative, got {value}.")
-    if batch_size == 0 or local_q_heads == 0:
-        raise ValueError("batch_size and local_q_heads must be positive.")
+    positive_values = (
+        "total_visible_tokens",
+        "query_tokens",
+        "batch_size",
+        "local_q_heads",
+        "kv_lora_rank",
+        "rope_dim",
+        "qk_head_dim",
+        "value_head_dim",
+        "hidden_size",
+        "projection_chunk_size",
+    )
+    for name in positive_values:
+        if int(values[name]) == 0:
+            raise ValueError(f"{name} must be positive, got 0.")
+    if int(query_tokens) > int(total_visible_tokens):
+        raise ValueError(
+            "query_tokens cannot exceed total_visible_tokens, got "
+            f"{query_tokens} > {total_visible_tokens}."
+        )
+    qk_nope_head_dim = int(qk_head_dim) - int(rope_dim)
+    if qk_nope_head_dim <= 0:
+        raise ValueError(
+            "qk_head_dim must be larger than rope_dim, got "
+            f"{qk_head_dim} and {rope_dim}."
+        )
 
     cache_element_size = torch.empty((), dtype=cache_dtype).element_size()
     activation_element_size = torch.empty(
         (),
         dtype=activation_dtype,
     ).element_size()
-    gathered_values = int(total_visible_tokens) * (512 + 64)
-    # kv_b projection materializes 192 K-noPE + 256 V values per head. The
-    # final K concatenation additionally materializes 192+64 values per head;
-    # expanded_v may remain a view of the projection output.
-    expanded_values = (
-        int(total_visible_tokens)
-        * int(local_q_heads)
-        * ((192 + 256) + 256)
+    visible_tokens = int(total_visible_tokens)
+    current_tokens = int(query_tokens)
+    heads = int(local_q_heads)
+    projected_width = qk_nope_head_dim + int(value_head_dim)
+    gathered_bytes = (
+        visible_tokens
+        * (int(kv_lora_rank) + int(rope_dim))
+        * cache_element_size
+    )
+    projected_bytes = (
+        visible_tokens * heads * projected_width * activation_element_size
+    )
+    projection_scratch_bytes = 0
+    if visible_tokens > int(projection_chunk_size):
+        projection_scratch_bytes = (
+            min(visible_tokens, int(projection_chunk_size))
+            * heads
+            * projected_width
+            * activation_element_size
+        )
+    expanded_k_bytes = (
+        visible_tokens
+        * heads
+        * int(qk_head_dim)
+        * activation_element_size
+    )
+    attention_output_bytes = (
+        current_tokens
+        * heads
+        * int(value_head_dim)
+        * activation_element_size
+    )
+    output_projection_scratch_bytes = (
+        min(current_tokens, int(projection_chunk_size))
+        * int(hidden_size)
+        * activation_element_size
+    )
+    kv_projection_phase_bytes = (
+        gathered_bytes + projected_bytes + projection_scratch_bytes
+    )
+    attention_phase_bytes = (
+        gathered_bytes
+        + projected_bytes
+        + expanded_k_bytes
+        + attention_output_bytes
+    )
+    output_projection_phase_bytes = (
+        attention_output_bytes + output_projection_scratch_bytes
     )
     metadata_values = (
         int(batch_size) * int(max_context_len)
         + 2 * int(batch_size)
         + int(max_context_len)
     )
+    metadata_bytes = (
+        metadata_values * torch.empty((), dtype=torch.int32).element_size()
+    )
     return int(
-        gathered_values * cache_element_size
-        + expanded_values * activation_element_size
-        + metadata_values * torch.empty((), dtype=torch.int32).element_size()
+        max(
+            kv_projection_phase_bytes,
+            attention_phase_bytes,
+            output_projection_phase_bytes,
+        )
+        + metadata_bytes
     )
 
 
@@ -176,6 +263,8 @@ class MLAAttention:
         spec: MlaAttentionOpSpec,
         provider: MlaAttentionProvider,
         prefill_workspace_bytes: int,
+        hidden_size: int,
+        projection_chunk_size: int,
     ) -> None:
         self.spec = spec
         self.provider = provider
@@ -194,6 +283,13 @@ class MLAAttention:
                 "MLA prefill_workspace_bytes must be positive, got "
                 f"{self.prefill_workspace_bytes}."
             )
+        self.hidden_size = int(hidden_size)
+        self.projection_chunk_size = int(projection_chunk_size)
+        if self.hidden_size <= 0 or self.projection_chunk_size <= 0:
+            raise ValueError(
+                "MLA hidden_size and projection_chunk_size must be positive, "
+                f"got {self.hidden_size} and {self.projection_chunk_size}."
+            )
         if self.spec.qk_head_dim != self.spec.value_head_dim:
             raise ValueError(
                 "The existing prefill backend requires equal QK/value widths, "
@@ -211,6 +307,8 @@ class MLAAttention:
         device: torch.device | str,
         max_batch_size: int,
         prefill_workspace_bytes: int,
+        hidden_size: int,
+        projection_chunk_size: int,
     ) -> "MLAAttention":
         provider = resolve_mla_attention_provider(
             spec,
@@ -221,6 +319,8 @@ class MLAAttention:
             spec=spec,
             provider=provider,
             prefill_workspace_bytes=prefill_workspace_bytes,
+            hidden_size=hidden_size,
+            projection_chunk_size=projection_chunk_size,
         )
 
     @property
@@ -265,6 +365,7 @@ class MLAAttention:
         meta: AttentionViewMeta,
         *,
         cache_slot_count: int,
+        query_tokens: int,
     ) -> _MlaPrefillPlan:
         cached = self._prefill_plan
         validation_scope = get_context().attention_validation_scope
@@ -272,6 +373,7 @@ class MLAAttention:
             validation_scope,
             meta,
             cache_slot_count,
+            query_tokens,
         ):
             return cached
 
@@ -329,9 +431,16 @@ class MLAAttention:
             )
         required_bytes = estimate_mla_prefill_workspace_bytes(
             total_visible_tokens=total_visible_tokens,
+            query_tokens=query_tokens,
             batch_size=batch_size,
             max_context_len=max_context_len,
             local_q_heads=self.spec.local_q_heads,
+            kv_lora_rank=self.spec.kv_lora_rank,
+            rope_dim=self.spec.rope_dim,
+            qk_head_dim=self.spec.qk_head_dim,
+            value_head_dim=self.spec.value_head_dim,
+            hidden_size=self.hidden_size,
+            projection_chunk_size=self.projection_chunk_size,
             activation_dtype=self.spec.activation_dtype,
             cache_dtype=self.spec.cache_dtype,
         )
@@ -379,6 +488,7 @@ class MLAAttention:
             source_req_indices=meta.req_indices,
             source_context_lens=meta.context_lens,
             source_max_context_len=meta.max_context_len,
+            source_query_tokens=int(query_tokens),
             cache_slot_count=int(cache_slot_count),
             packed_offsets=packed_offsets,
             packed_slots=packed_slots,
@@ -394,6 +504,8 @@ class MLAAttention:
     def prepare_prefill_history(
         self,
         view: PrefillComputeView,
+        *,
+        query_tokens: int,
     ) -> MlaPrefillHistory:
         if not isinstance(view, PrefillComputeView):
             raise TypeError(
@@ -405,6 +517,7 @@ class MLAAttention:
         plan = self._get_prefill_plan(
             meta,
             cache_slot_count=int(payload.latent_cache.shape[0]),
+            query_tokens=query_tokens,
         )
         gathered_latent = torch.empty(
             plan.total_visible_tokens,

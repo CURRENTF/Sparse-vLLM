@@ -366,7 +366,14 @@ def test_standard_manager_delegates_payload_store_and_compute_view():
     assert actual_lens is context_lens
 
 
-def test_standard_manager_accounts_storage_tensors_explicitly():
+@pytest.mark.parametrize(
+    ("attention_tp_size", "local_heads"),
+    [(1, 20), (4, 5)],
+)
+def test_standard_manager_accounts_storage_tensors_explicitly(
+    attention_tp_size,
+    local_heads,
+):
     storage = MlaLatentStorage(
         kv_lora_rank=512,
         rope_dim=64,
@@ -381,7 +388,16 @@ def test_standard_manager_accounts_storage_tensors_explicitly():
         max_num_seqs_in_gpu=1,
         memory_expected_savings=None,
     )
-    manager.hf_config = SimpleNamespace(torch_dtype=torch.bfloat16)
+    manager.hf_config = SimpleNamespace(
+        torch_dtype=torch.bfloat16,
+        num_attention_heads=20,
+        qk_nope_head_dim=192,
+        qk_rope_head_dim=64,
+        v_head_dim=256,
+    )
+    manager.parallel_context = SimpleNamespace(
+        attention_tp_size=attention_tp_size,
+    )
     manager.num_layers = 2
     manager.num_kv_layers = 2
     manager.num_kv_heads = 4
@@ -392,6 +408,9 @@ def test_standard_manager_accounts_storage_tensors_explicitly():
 
     assert accounting["kv_or_latent_tensor_bytes"] == 2 * 3 * 576 * 2
     assert accounting["logical_live_kv_bytes"] == 2 * 2 * 576 * 2
+    assert accounting["dense_baseline_bytes"] == (
+        3 * 2 * local_heads * (256 + 256) * 2
+    )
     assert accounting["tensor_count"] == 2
     assert {item["path"] for item in accounting["tensors"]} == {
         "attention_cache_storage.mla_latent.0_cache",

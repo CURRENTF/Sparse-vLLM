@@ -48,6 +48,7 @@ def build_glm4_moe_lite_mla_attention(
     max_batch_size: int,
     prefill_workspace_bytes: int,
     decode_cuda_graph: bool,
+    projection_chunk_size: int,
 ) -> MLAAttention:
     """Bind the one process-local MLA operator from explicit runtime inputs."""
 
@@ -69,6 +70,8 @@ def build_glm4_moe_lite_mla_attention(
         device=device,
         max_batch_size=max_batch_size,
         prefill_workspace_bytes=prefill_workspace_bytes,
+        hidden_size=int(config.hidden_size),
+        projection_chunk_size=projection_chunk_size,
     )
 
 
@@ -97,6 +100,17 @@ class Glm4MoeLiteAttention(nn.Module):
         if self.proj_chunk_size <= 0:
             raise ValueError(
                 f"mlp_chunk_size must be positive, got {self.proj_chunk_size}."
+            )
+        if self.proj_chunk_size != int(mla_attention.projection_chunk_size):
+            raise ValueError(
+                "GLM projection chunk size must match the MLA workspace bound: "
+                f"model={self.proj_chunk_size} "
+                f"mla={mla_attention.projection_chunk_size}."
+            )
+        if int(config.hidden_size) != int(mla_attention.hidden_size):
+            raise ValueError(
+                "GLM hidden size must match the MLA workspace bound: "
+                f"model={config.hidden_size} mla={mla_attention.hidden_size}."
             )
         quantization = getattr(config, "quantization_config", None)
         if bool(getattr(quantization, "enabled", False)):
@@ -216,7 +230,10 @@ class Glm4MoeLiteAttention(nn.Module):
                 temp_slots = view.meta.temp_slots
                 if context.cu_seqlens_q is None or context.cu_seqlens_q.numel() <= 1:
                     return torch.empty_like(q)
-                history = self.mla_attention.prepare_prefill_history(view)
+                history = self.mla_attention.prepare_prefill_history(
+                    view,
+                    query_tokens=int(q.shape[0]),
+                )
                 expanded = self._project_kv_history(history.gathered_latent).view(
                     history.visible_tokens,
                     self.local_heads,
