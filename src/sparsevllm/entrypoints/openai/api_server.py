@@ -73,7 +73,7 @@ from sparsevllm.utils.log import logger
 
 
 UNSUPPORTED_SERVING_METHOD_PREFIXES = ("deltakv",)
-SUPPORTED_RESPONSE_PARSERS = ("qwen3", "minimax_m2")
+SUPPORTED_RESPONSE_PARSERS = ("auto", "qwen3", "minimax_m2", "glm47")
 SEMANTIC_ENGINE_ARGS = {
     "sparse_method",
     "deltakv_checkpoint_path",

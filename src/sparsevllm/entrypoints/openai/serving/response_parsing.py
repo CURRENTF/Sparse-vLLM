@@ -46,6 +46,52 @@ _QWEN_XML_TOOL_FIELD = {
     "optional": True,
 }
 
+_GLM_RESPONSE_TEMPLATE = {
+    "version": 1,
+    "defaults": {"role": "assistant"},
+    "start_anchor": "<|assistant|>",
+    "fields": {
+        "thinking": {
+            # GLM writes <think> for thinking mode and a leading </think>
+            # when thinking is disabled. The zero-width alternative consumes
+            # that template-provided close without exposing it as content.
+            "open_pattern": r"<think>\s*|(?=</think>)",
+            "close": "</think>",
+            "content": "text",
+            "optional": True,
+        },
+        "tool_calls": {
+            "open_pattern": (
+                r"<tool_call>\s*(?P<name>[^<]*?)\s*"
+                r"(?=<arg_key>|</tool_call>)"
+            ),
+            "close": "</tool_call>",
+            "content": "xml-inline",
+            "content_args": {
+                "tag_pattern": (
+                    r"<arg_key>\s*(?P<key>.*?)\s*</arg_key>\s*"
+                    r"<arg_value>\s*(?P<value>.*?)\s*</arg_value>"
+                ),
+                "value_parser": {
+                    "name": "json",
+                    "args": {"allow_non_json": True},
+                },
+            },
+            "transform": {
+                "type": "function",
+                "function": {"name": "{name}", "arguments": "{content}"},
+            },
+            "repeats": True,
+            "optional": True,
+        },
+        "content": {
+            "close_pattern": r"<\|endoftext\|>|<eop>|\Z",
+            "content": "text",
+            "optional": True,
+        },
+    },
+}
+
 _MINIMAX_RESPONSE_TEMPLATE_BASE = {
     "version": 1,
     "defaults": {"role": "assistant"},
@@ -151,6 +197,12 @@ class TransformersResponseParser:
             return None
         if "<think>" not in chat_template and "<tool_call>" not in chat_template:
             return None
+
+        if all(
+            marker in chat_template
+            for marker in ("<|assistant|>", "<arg_key>", "<arg_value>")
+        ):
+            return cls(tokenizer, _GLM_RESPONSE_TEMPLATE)
 
         if "<minimax:tool_call>" in chat_template and "<invoke name=" in chat_template:
             fields = dict(_MINIMAX_RESPONSE_TEMPLATE_BASE["fields"])

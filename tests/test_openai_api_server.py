@@ -29,7 +29,7 @@ class _FastTokenizerAdapter:
 class _TransformersResponseTokenizer:
     response_template = None
 
-    def __init__(self, *, xml_tools=False, minimax_tools=False):
+    def __init__(self, *, xml_tools=False, minimax_tools=False, glm_tools=False):
         self.chat_template = "<think><tool_call>"
         if xml_tools:
             self.chat_template += "<function=name><parameter=key>"
@@ -37,6 +37,10 @@ class _TransformersResponseTokenizer:
             self.chat_template = (
                 '<think><minimax:tool_call><invoke name="tool">'
                 '<parameter name="key">'
+            )
+        if glm_tools:
+            self.chat_template = (
+                "<|assistant|><think><tool_call><arg_key><arg_value>"
             )
 
     def parse_response(self, response, schema, *, prefix=None):
@@ -50,13 +54,16 @@ class _TransformersResponseTokenizer:
         return ResponseParser(response_template, prefix=prefix)
 
 
-def _transformers_response_parser(*, xml_tools=False, minimax_tools=False):
+def _transformers_response_parser(
+    *, xml_tools=False, minimax_tools=False, glm_tools=False
+):
     from sparsevllm.entrypoints.openai.serving.response_parsing import TransformersResponseParser
 
     parser = TransformersResponseParser.from_tokenizer(
         _TransformersResponseTokenizer(
             xml_tools=xml_tools,
             minimax_tools=minimax_tools,
+            glm_tools=glm_tools,
         )
     )
     assert parser is not None
@@ -197,6 +204,12 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
             parser.parse_args(
                 ["--model", "/tmp/model", "--reasoning-parser", "minimax_m2"]
             )
+
+        for alias in ("auto", "glm47"):
+            args = parser.parse_args(
+                ["--model", "/tmp/model", "--response-parser", alias]
+            )
+            self.assertEqual(args.response_parser, alias)
 
     def test_incremental_detokenizer_waits_for_complete_unicode(self):
         from sparsevllm.entrypoints.openai.detokenizer import IncrementalDetokenizer
@@ -5469,6 +5482,94 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
             "name": "bash",
             "arguments": '{"command":"pwd"}',
         })
+
+    def test_glm_response_parser_handles_thinking_and_plain_content(self):
+        parser = _transformers_response_parser(glm_tools=True)
+
+        parsed = parser.parse(
+            "先分析🙂</think>最终答案<|endoftext|>",
+            prefix="[gMASK]<sop><|assistant|><think>",
+            parse_tools=False,
+        )
+        nonthinking = parser.parse(
+            "直接回答<|endoftext|>",
+            prefix="[gMASK]<sop><|assistant|></think>",
+            parse_tools=False,
+        )
+
+        self.assertEqual(parsed.reasoning_content, "先分析🙂")
+        self.assertEqual(parsed.content, "最终答案")
+        self.assertEqual(nonthinking.reasoning_content, None)
+        self.assertEqual(nonthinking.content, "直接回答")
+
+    def test_glm_response_parser_handles_parallel_tool_calls(self):
+        parsed = _transformers_response_parser(glm_tools=True).parse(
+            "分析</think>"
+            "<tool_call>天气查询"
+            "<arg_key>城市</arg_key><arg_value>北京</arg_value>"
+            "<arg_key>天数</arg_key><arg_value>2</arg_value>"
+            "</tool_call>"
+            "<tool_call>echo"
+            "<arg_key>text</arg_key><arg_value>你好🙂</arg_value>"
+            "</tool_call><|endoftext|>",
+            prefix="[gMASK]<sop><|assistant|><think>",
+            parse_tools=True,
+        )
+
+        self.assertEqual(parsed.reasoning_content, "分析")
+        self.assertEqual(parsed.content, "")
+        self.assertEqual(
+            [call["function"]["name"] for call in parsed.tool_calls],
+            ["天气查询", "echo"],
+        )
+        self.assertEqual(
+            parsed.tool_calls[0]["function"]["arguments"],
+            '{"城市":"北京","天数":2}',
+        )
+        self.assertEqual(
+            parsed.tool_calls[1]["function"]["arguments"],
+            '{"text":"你好🙂"}',
+        )
+
+    def test_glm_response_stream_parser_handles_split_tags(self):
+        parser = _transformers_response_parser(glm_tools=True).stream(
+            prefix="[gMASK]<sop><|assistant|><think>",
+            parse_tools=True,
+        )
+        deltas = []
+        for chunk in [
+            "推",
+            "理</thi",
+            "nk>答",
+            "案<tool_",
+            "call>天气<arg_key>城市</arg_key><arg_value>北",
+            "京</arg_value></tool_",
+            "call><|endoftext|>",
+        ]:
+            deltas.extend(parser.feed(chunk))
+        deltas.extend(parser.finish())
+
+        reasoning = "".join(
+            delta.get("reasoning_content", "") for delta in deltas
+        )
+        content = "".join(delta.get("content", "") for delta in deltas)
+        calls = [delta["tool_calls"][0] for delta in deltas if "tool_calls" in delta]
+        self.assertEqual(reasoning, "推理")
+        self.assertEqual(content, "答案")
+        self.assertEqual(calls[0]["function"]["name"], "天气")
+        self.assertEqual(calls[0]["function"]["arguments"], '{"城市":"北京"}')
+
+    def test_glm_response_parser_rejects_empty_tool_name(self):
+        from sparsevllm.entrypoints.openai.serving.response_parsing import (
+            ResponseParseError,
+        )
+
+        with self.assertRaisesRegex(ResponseParseError, "non-empty function name"):
+            _transformers_response_parser(glm_tools=True).parse(
+                "</think><tool_call></tool_call>",
+                prefix="[gMASK]<sop><|assistant|><think>",
+                parse_tools=True,
+            )
 
     def test_minimax_tool_calls_parse_reasoning_and_parallel_invokes(self):
         from sparsevllm.entrypoints.openai.api_server import _response_output_items
