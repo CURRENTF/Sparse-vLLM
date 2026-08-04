@@ -1,7 +1,7 @@
 # GLM-4.7-Flash 支持实施计划
 
-- 状态：Implemented（TP1 已验证；TP4/EP1 待验证）
-- 更新时间：2026-08-04
+- 状态：Implemented（H100 TP1/TP2/TP4、EP1 已验证）
+- 更新时间：2026-08-05
 - 目标分支：codex/glm-4.7-flash
 - 目标模型：zai-org/GLM-4.7-Flash / glm4_moe_lite
 
@@ -527,7 +527,8 @@ TP 布局建议：
 - 每 rank 持有本 rank 的 K_b/V_b head slices。
 - persistent latent/rope cache 在各 TP rank 上语义一致。
 
-首版验证 TP1 和 TP4；TP2 可以保留配置能力，但未经实测不列为已验证。
+首版门禁以 TP1 和 TP4 为目标；本轮同时补测 TP2。支持声明只列入真实
+checkpoint 已实测的 `TP=1/2/4`，不从配置可构造性外推其他 TP 规模。
 
 ## 13. MoE 复用边界
 
@@ -626,10 +627,12 @@ CLI 建议新增通用 auto；现有 qwen3、minimax_m2 保留兼容，glm47 仅
 | 能力 | 首版状态 | 门禁 |
 | --- | --- | --- |
 | BF16 | 已实现并验证 | tiny + 真实权重验证 |
+| NVIDIA H100 80GB HBM3 | 已实现并验证 | `triton_h100` provider 实机门禁 |
 | eager | 已实现并验证 | 必须显式启用 |
 | vanilla latent MLA | 已实现并验证 | kernel/storage/model 全链路 |
 | TP1 | 已实现并验证 | 真实模型 |
-| TP4/EP1 | 已实现路径，尚未验证 | 验证前不写入支持声明 |
+| TP2/EP1 | 已实现并验证 | 真实模型 32 步 greedy 对齐 |
+| TP4/EP1 | 已实现并验证 | 真实模型、multi-chunk、ragged batch 与 API 并发 |
 | EP > 1 | 暂不支持 | 后续独立验证 |
 | CUDA Graph | 暂不支持 | 配置阶段拒绝 |
 | Prefix Cache/offload | 暂不支持 | 配置阶段拒绝 |
@@ -977,7 +980,7 @@ ComputeView 迁移与 MLA 引入分开；Qwen MoE 抽取与 GLM model 引入分�
 - Provider 初始化时绑定，运行时无静默 fallback。
 - Tiny model 的 attention、MoE、logits 和多步 decode 与 Transformers 对齐。
 - 真实 checkpoint 除精确 MTP/远端 EP allowlist 外无 missing/unexpected weights。
-- TP1 真实短序列验证通过；TP4/EP1 在写入支持声明前必须另行验证。
+- TP1/TP2/TP4、EP1 真实短序列验证通过；其他 TP/EP 规模不得外推。
 - OpenAI 非流式/流式 reasoning 和 tool-call parsing 通过 Transformers parser。
 - Artifact 能证明实际执行了目标 MLA provider、latent cache 和 GLM MoE 路径。
 - 文档支持矩阵准确区分已实现、已验证和暂不支持。
@@ -999,8 +1002,9 @@ ComputeView 迁移与 MLA 引入分开；Qwen MoE 抽取与 GLM model 引入分�
 
 ## 25. 当前支持状态与验证摘要
 
-当前里程碑已经完成 TP1、BF16、eager、vanilla latent MLA 基础支持。TP4/EP1
-未按当前范围执行，因此只能称为“代码路径已实现、尚未验证”，不能称为已支持。
+当前里程碑已经完成 BF16、eager、vanilla latent MLA，以及
+`TP=1/2/4`、`DP=1`、`EP=1` 的基础支持，硬件限定为 NVIDIA H100 80GB
+HBM3。支持声明只覆盖这些实测组合。
 
 ### 25.1 已落地的架构边界
 
@@ -1027,21 +1031,27 @@ ComputeView 迁移与 MLA 引入分开；Qwen MoE 抽取与 GLM model 引入分�
 | CUDA kernel/operator/model regression | `57 passed` | H100 kernel、operator、attention layer 与模型测试 |
 | Tiny multi-chunk TP1 | 17-token prompt、chunk size 8，实际 3 chunks；prefill 与两步 decode argmax 全匹配，max abs diff 分别为 `0.00390625`、`0.00390625`、`0.0048828125` | run manifest、raw comparison 与 stdout |
 | 真实 checkpoint TP1 | 48/48 shards、9491 tensors、55.77 GiB、8832 local expert shards、精确跳过 212 个 MTP tensors；prefill + 32 decode steps argmax 全匹配 | run manifest、raw comparison 与 stdout |
-| OpenAI serving | 完整 thinking、thinking SSE 和真实 function tool call 通过；另以真实 checkpoint 复验 terminal EOS、单 token 内 stop boundary 及 Responses API | command/env manifest、raw token/text、parser-facing raw text、parsed responses 与 request logs |
+| 真实 checkpoint TP2 | 每 rank 28.01 GiB，两个 rank 均加载 48/48 shards、9491 tensors；prefill + 32 decode steps 共 33/33 argmax 全匹配，greedy token 序列与 TP1 相同 | run manifest、raw comparison 与 stdout |
+| 真实 checkpoint TP4/EP1 | 每 rank 14.13 GiB，四个 rank 均绑定 `triton_h100` MLA 与 Triton MoE；短序列 33/33、257-token 五段 prefill + decode 9/9 argmax 全匹配 | run manifest、raw comparison 与 stdout |
+| TP4 synthetic API ragged + natural LCC | 64/256/768/1536-token synthetic API batch 连续三轮共 12/12 成功且跨轮逐字稳定；另以 1004/1023/1024/1025-token natural LCC 样本对 HF teacher-forced prefill 7/7、decode 27/28，唯一 teacher-forced argmax mismatch 为两个 HF 候选 logit 完全相等的 BF16 tie | raw/parsed responses、per-row comparison 与 request logs |
+| TP4 OpenAI client gates | Chat 普通/思考、Chat SSE、Responses、Responses SSE、function tool call、streaming tool call 和 4-way concurrency 共 8/8 client gates 通过；parser 实际委托 Transformers。服务在验证后由 operator 主动停止，teardown 不作为 client gate | command/env manifest、raw parser events、parsed responses、validation status 与 request logs |
 
 完整命令、依赖与设备版本、dirty status、raw/parsed output 和本机 artifact
 路径保存在私有实验记录中，不写入公开仓库文档；上表只保留稳定的支持边界和
 可复现门禁摘要。
 
-真实 checkpoint 的 32 步 greedy token 序列全部一致，足以证明该短序列的独立
-greedy rollout 一致。它不等价于严格逐元素 logits parity：后续步骤的 BF16 raw
-logit max abs diff 可到 `6.0`，并带近似全局平移；当前证据只支持“argmax/greedy
-sequence 一致”，不支持“所有 logits 数值严格等价”。
+TP1、TP2 和 TP4 的真实 checkpoint 32 步 greedy token 序列全部一致，足以证明
+该短序列的独立 greedy rollout 一致。它不等价于严格逐元素 logits parity：
+后续步骤及 multi-chunk case 的 BF16 raw logit max abs diff 可到 `9.0`，并带
+近似全局平移；自然文本 teacher-forced 测试还观测到一次零 margin tie。当前证据
+只支持“非 tie 的 argmax 与短序列 greedy 行为一致”，不支持“所有 logits 数值
+严格等价”。
 
 ### 25.3 尚未完成的门禁
 
-- TP4/EP1 真实 checkpoint smoke 与 TP1 对齐。
 - CUDA Graph、Prefix Cache/offload、量化、MTP 和所有 sparse method。
 - 128K/202K 长上下文容量与吞吐验证。
+- `TP=5` 等其他可整除配置，以及 `EP > 1`。
+- H100 以外的 GPU 架构。
 
 这些组合在完成独立验证前必须继续 fail fast 或维持未支持声明。

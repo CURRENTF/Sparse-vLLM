@@ -17,7 +17,7 @@ parallel size must use that value.
 | Qwen3MoE | `qwen3_moe` | BF16 / FP16 / block FP8 | ✅ (TP > 1: BF16 model dtype only) | 1 only | ✅ |
 | Qwen3.5 / Qwen3.6 | `qwen3_5` | BF16 / block FP8 | ✅ | 1 only | 1 only |
 | Qwen3.6 MoE | `qwen3_5_moe` | BF16 / block FP8 | ✅ | 1 only | ✅ |
-| GLM-4.7-Flash | `glm4_moe_lite` | BF16 | 1 only | 1 only | 1 only |
+| GLM-4.7-Flash | `glm4_moe_lite` | BF16 | 1 / 2 / 4 (H100 only) | 1 only | 1 only |
 | Llama 3 / 3.1 | `llama` | BF16 / FP16 | ✅ | 1 only | 1 only |
 | MiniMax M2.7 | `minimax_m2` | block FP8 with BF16 non-quantized weights | ✅ | 1 only | ✅ |
 
@@ -39,8 +39,9 @@ normalized internally to `model_type=qwen3_5`; Qwen3.6 MoE uses
 `model_type=qwen3_5_moe`.
 
 GLM-4.7-Flash support is currently limited to BF16, eager execution, vanilla
-latent MLA, and `TP=DP=EP=1`. The loader intentionally skips the checkpoint's
-MTP layer. TP greater than 1, expert parallelism, CUDA Graph, prefix caching,
+latent MLA, `TP=1/2/4`, `DP=1`, and `EP=1` on NVIDIA H100 80GB HBM3. The
+loader intentionally skips the checkpoint's MTP layer. Other GPU
+architectures, TP sizes, expert parallelism, CUDA Graph, prefix caching,
 quantization, and sparse methods remain unsupported until separately validated.
 
 ## Sparse Method Support
