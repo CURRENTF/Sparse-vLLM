@@ -5,6 +5,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
+import sparsevllm.layers.mla_attention as mla_attention_module
 from sparsevllm.engine.cache_manager import (
     AttentionViewMeta,
     ExplicitKVPayload,
@@ -257,6 +258,57 @@ def test_mla_prefill_reuses_validated_packing_across_layers() -> None:
     assert gather.call_count == 3
     assert first.packed_offsets is second.packed_offsets
     assert first.packed_slots is second.packed_slots
+
+
+def test_mla_prefill_reuses_query_validation_across_layers() -> None:
+    attention = _attention()
+    view = _view(
+        torch.empty(2, 1, 512, dtype=torch.bfloat16),
+        torch.empty(2, 1, 64, dtype=torch.bfloat16),
+        torch.tensor([[0, 1]], dtype=torch.int32),
+        torch.tensor([0], dtype=torch.int32),
+        torch.tensor([2], dtype=torch.int32),
+    )
+    with patch("sparsevllm.layers.mla_attention.gather_latent_history"):
+        history = attention.prepare_prefill_history(view)
+    workset = _expand_history(attention, history)
+    q = torch.empty(2, 5, 256, dtype=torch.bfloat16)
+    starts = torch.tensor([0], dtype=torch.int32)
+    chunks = torch.tensor([2], dtype=torch.int32)
+
+    with (
+        patch(
+            "sparsevllm.layers.mla_attention._host_int_values",
+            wraps=mla_attention_module._host_int_values,
+        ) as host_values,
+        patch.object(
+            attention.prefill_backend,
+            "run_prefill",
+            return_value=torch.empty_like(q),
+        ),
+    ):
+        attention.run_prefill(
+            q,
+            workset,
+            b_start_loc=starts,
+            chunk_lens=chunks,
+        )
+        attention.run_prefill(
+            q,
+            workset,
+            b_start_loc=starts,
+            chunk_lens=chunks,
+        )
+        assert host_values.call_count == 2
+
+        reset_context()
+        attention.run_prefill(
+            q,
+            workset,
+            b_start_loc=starts,
+            chunk_lens=chunks,
+        )
+        assert host_values.call_count == 4
 
 
 CUDA_REQUIRED = pytest.mark.skipif(

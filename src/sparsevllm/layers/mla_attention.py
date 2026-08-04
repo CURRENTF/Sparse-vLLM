@@ -34,6 +34,7 @@ class MlaPrefillHistory:
     packed_slots: torch.Tensor
     local_req_indices: torch.Tensor
     context_lens: torch.Tensor
+    context_lengths: tuple[int, ...]
     max_context_len: int
     required_workspace_bytes: int
 
@@ -64,6 +65,7 @@ class _MlaPrefillPlan:
     packed_offsets: torch.Tensor
     packed_slots: torch.Tensor
     local_req_indices: torch.Tensor
+    context_lengths: tuple[int, ...]
     total_visible_tokens: int
     max_context_len: int
     required_workspace_bytes: int
@@ -82,6 +84,33 @@ class _MlaPrefillPlan:
             and self.source_max_context_len == meta.max_context_len
             and self.cache_slot_count == int(cache_slot_count)
         )
+
+
+@dataclass(frozen=True, slots=True)
+class _MlaPrefillQueryPlan:
+    """Step-local query-packing validation shared by every MLA layer."""
+
+    validation_scope: object
+    source_context_lens: torch.Tensor
+    query_tokens: int
+
+    def matches(
+        self,
+        validation_scope: object,
+        context_lens: torch.Tensor,
+        query_tokens: int,
+    ) -> bool:
+        return (
+            self.validation_scope is validation_scope
+            and self.source_context_lens is context_lens
+            and self.query_tokens == int(query_tokens)
+        )
+
+
+def _host_int_values(tensor: torch.Tensor) -> tuple[int, ...]:
+    """Synchronize an integer tensor once inside a validation scope."""
+
+    return tuple(int(value) for value in tensor.tolist())
 
 
 def estimate_mla_prefill_workspace_bytes(
@@ -172,6 +201,7 @@ class MLAAttention:
             )
         self.prefill_backend = TritonAttentionBackend()
         self._prefill_plan: _MlaPrefillPlan | None = None
+        self._prefill_query_plan: _MlaPrefillQueryPlan | None = None
 
     @classmethod
     def bind(
@@ -280,7 +310,7 @@ class MLAAttention:
                 f"batch={batch_size} max_batch_size={self.max_batch_size}."
             )
 
-        lengths = [int(value) for value in meta.context_lens.tolist()]
+        lengths = _host_int_values(meta.context_lens)
         if any(length < 0 for length in lengths):
             raise ValueError(
                 f"MLA prefill context lengths must be non-negative: {lengths}."
@@ -353,6 +383,7 @@ class MLAAttention:
             packed_offsets=packed_offsets,
             packed_slots=packed_slots,
             local_req_indices=local_req_indices,
+            context_lengths=lengths,
             total_visible_tokens=total_visible_tokens,
             max_context_len=max_context_len,
             required_workspace_bytes=required_bytes,
@@ -406,6 +437,7 @@ class MLAAttention:
             packed_slots=plan.packed_slots,
             local_req_indices=plan.local_req_indices,
             context_lens=meta.context_lens,
+            context_lengths=plan.context_lengths,
             max_context_len=plan.max_context_len,
             required_workspace_bytes=plan.required_workspace_bytes,
         )
@@ -513,24 +545,40 @@ class MLAAttention:
                     f"{name} must be int32 on {self.device}, got "
                     f"{tensor.device}/{tensor.dtype}."
                 )
-        chunks = [int(value) for value in chunk_lens.tolist()]
-        starts = [int(value) for value in b_start_loc.tolist()]
-        expected_starts: list[int] = []
-        cursor = 0
-        for chunk in chunks:
-            expected_starts.append(cursor)
-            cursor += chunk
-        if starts != expected_starts or cursor != int(q.shape[0]):
-            raise ValueError(
-                "MLA prefill query packing is inconsistent: "
-                f"starts={starts} expected_starts={expected_starts} "
-                f"chunk_tokens={cursor} q_tokens={int(q.shape[0])}."
-            )
-        contexts = [int(value) for value in history.context_lens.tolist()]
-        if any(chunk <= 0 or chunk > context for chunk, context in zip(chunks, contexts)):
-            raise ValueError(
-                "MLA prefill chunk lengths must be positive and no larger than "
-                f"their contexts: chunks={chunks} contexts={contexts}."
+        validation_scope = get_context().attention_validation_scope
+        query_tokens = int(q.shape[0])
+        cached_query_plan = self._prefill_query_plan
+        if cached_query_plan is None or not cached_query_plan.matches(
+            validation_scope,
+            history.context_lens,
+            query_tokens,
+        ):
+            chunks = _host_int_values(chunk_lens)
+            starts = _host_int_values(b_start_loc)
+            expected_starts: list[int] = []
+            cursor = 0
+            for chunk in chunks:
+                expected_starts.append(cursor)
+                cursor += chunk
+            if starts != tuple(expected_starts) or cursor != query_tokens:
+                raise ValueError(
+                    "MLA prefill query packing is inconsistent: "
+                    f"starts={starts} expected_starts={expected_starts} "
+                    f"chunk_tokens={cursor} q_tokens={query_tokens}."
+                )
+            contexts = history.context_lengths
+            if any(
+                chunk <= 0 or chunk > context
+                for chunk, context in zip(chunks, contexts)
+            ):
+                raise ValueError(
+                    "MLA prefill chunk lengths must be positive and no larger "
+                    f"than their contexts: chunks={chunks} contexts={contexts}."
+                )
+            self._prefill_query_plan = _MlaPrefillQueryPlan(
+                validation_scope=validation_scope,
+                source_context_lens=history.context_lens,
+                query_tokens=query_tokens,
             )
 
         explicit_view = PrefillComputeView(
