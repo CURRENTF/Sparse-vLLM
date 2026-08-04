@@ -58,6 +58,8 @@ class _ActiveRequest:
     completion_token_logprobs: list[float | None]
     completion_top_logprobs: list[dict[int, float] | None]
     detokenizer: IncrementalDetokenizer
+    eos_token_ids: frozenset[int] = field(default_factory=frozenset)
+    ignore_eos: bool = False
     terminal: threading.Event = field(default_factory=threading.Event)
     emitted_text_len: int = 0
     pending_token_ids: list[int] = field(default_factory=list)
@@ -582,6 +584,23 @@ class AsyncEngineDispatcher:
                 if isinstance(item.prompt, list)
                 else self.engine.tokenizer.encode(item.prompt)
             )
+            requested_eos = getattr(
+                item.sampling_params, "eos_token_ids", ()
+            ) or ()
+            if isinstance(requested_eos, int):
+                requested_eos = (requested_eos,)
+            eos_token_ids = frozenset(
+                int(token_id) for token_id in requested_eos
+            )
+            if not eos_token_ids:
+                configured_eos = getattr(
+                    getattr(self.engine, "config", None),
+                    "eos_token_ids",
+                    (),
+                ) or ()
+                eos_token_ids = frozenset(
+                    int(token_id) for token_id in configured_eos
+                )
             active[seq_id] = _ActiveRequest(
                 index=item.index,
                 loop=item.loop,
@@ -593,6 +612,10 @@ class AsyncEngineDispatcher:
                 completion_token_logprobs=[],
                 completion_top_logprobs=[],
                 detokenizer=detokenizer,
+                eos_token_ids=eos_token_ids,
+                ignore_eos=bool(
+                    getattr(item.sampling_params, "ignore_eos", False)
+                ),
                 terminal=item.handle.terminal,
                 chain_id=item.handle.chain_id,
                 chain_status=item.handle.chain_status,
@@ -647,6 +670,40 @@ class AsyncEngineDispatcher:
             )
             self._resolve_admission(item, exc)
 
+    @staticmethod
+    def _response_parser_raw_text(
+        request: _ActiveRequest,
+        token_ids: list[int],
+        raw_text: str,
+    ) -> str:
+        if (
+            request.ignore_eos
+            or not request.eos_token_ids
+            or not token_ids
+            or int(token_ids[-1]) not in request.eos_token_ids
+        ):
+            return raw_text
+
+        content_end = len(token_ids)
+        while (
+            content_end > 0
+            and int(token_ids[content_end - 1]) in request.eos_token_ids
+        ):
+            content_end -= 1
+        return request.detokenizer.tokenizer.decode(
+            token_ids[:content_end],
+            skip_special_tokens=False,
+        )
+
+    @staticmethod
+    def _response_parser_delta(previous: str, current: str) -> str:
+        if not current.startswith(previous):
+            raise RuntimeError(
+                "Response-parser text is not append-only: "
+                f"previous={previous!r} current={current!r}."
+            )
+        return current[len(previous):]
+
     def _publish_token_deltas(self, active: dict[int, _ActiveRequest]):
         logprob_outputs = {
             seq_id: (token_logprobs, top_logprobs)
@@ -664,14 +721,27 @@ class AsyncEngineDispatcher:
                 seq_id,
                 ([None] * len(token_ids), [None] * len(token_ids)),
             )
+            previous_parser_raw_text = self._response_parser_raw_text(
+                request,
+                request.completion_token_ids,
+                request.detokenizer.raw_text,
+            )
             request.completion_token_ids.extend(token_ids)
             request.completion_token_logprobs.extend(token_logprobs)
             request.completion_top_logprobs.extend(top_logprobs)
             request.pending_token_ids.extend(token_ids)
             request.pending_token_logprobs.extend(token_logprobs)
             request.pending_top_logprobs.extend(top_logprobs)
-            decoded = request.detokenizer.push(token_ids)
-            raw_text_delta = decoded.raw_text
+            request.detokenizer.push(token_ids)
+            parser_raw_text = self._response_parser_raw_text(
+                request,
+                request.completion_token_ids,
+                request.detokenizer.raw_text,
+            )
+            raw_text_delta = self._response_parser_delta(
+                previous_parser_raw_text,
+                parser_raw_text,
+            )
             full_text = request.detokenizer.text
             stop_index = _find_stop_index(full_text, request.stop)
             visible_text = full_text if stop_index is None else full_text[:stop_index]
@@ -704,7 +774,11 @@ class AsyncEngineDispatcher:
                         "type": "final",
                         "index": request.index,
                         "text": visible_text,
-                        "raw_text": final.raw_text,
+                        "raw_text": self._response_parser_raw_text(
+                            request,
+                            request.completion_token_ids,
+                            final.raw_text,
+                        ),
                         "text_delta": visible_text[request.emitted_text_len:],
                         "finish_reason": "stop",
                         "prompt_tokens": (
@@ -969,7 +1043,21 @@ class AsyncEngineDispatcher:
             if request is None:
                 continue
             observed = len(request.completion_token_ids)
+            previous_parser_raw_text = self._response_parser_raw_text(
+                request,
+                request.completion_token_ids,
+                request.detokenizer.raw_text,
+            )
             final = request.detokenizer.finish(completion_token_ids)
+            parser_raw_text = self._response_parser_raw_text(
+                request,
+                completion_token_ids,
+                final.raw_text,
+            )
+            parser_raw_text_delta = self._response_parser_delta(
+                previous_parser_raw_text,
+                parser_raw_text,
+            )
             request.pending_token_ids.extend(completion_token_ids[observed:])
             request.pending_token_logprobs.extend(token_logprobs[observed:])
             request.pending_top_logprobs.extend(top_logprobs[observed:])
@@ -997,9 +1085,13 @@ class AsyncEngineDispatcher:
                 value is not None for value in request.pending_token_logprobs
             ) or any(value is not None for value in request.pending_top_logprobs)
             if request.pending_token_ids and (
-                text_delta or final.raw_text_delta or has_pending_logprobs
+                text_delta or parser_raw_text_delta or has_pending_logprobs
             ):
-                self._publish_pending_token_event(request, text_delta, final.raw_text_delta)
+                self._publish_pending_token_event(
+                    request,
+                    text_delta,
+                    parser_raw_text_delta,
+                )
                 request.emitted_text_len = len(text)
             self._mark_request_terminal(seq_id, request)
             self._put(
@@ -1008,7 +1100,7 @@ class AsyncEngineDispatcher:
                     "type": "final",
                     "index": request.index,
                     "text": text,
-                    "raw_text": final.raw_text,
+                    "raw_text": parser_raw_text,
                     "text_delta": text[request.emitted_text_len:],
                     "finish_reason": finish_reason,
                     "prompt_tokens": (

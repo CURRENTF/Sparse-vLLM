@@ -2618,6 +2618,148 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item["raw_text_delta"], "b")
         self.assertEqual(active[7].completion_token_ids, token_ids)
 
+    async def test_dispatcher_strips_terminal_eos_from_parser_text(self):
+        from sparsevllm.entrypoints.openai.api_server import AsyncEngineDispatcher, _ActiveRequest
+        from sparsevllm.entrypoints.openai.detokenizer import IncrementalDetokenizer
+
+        tokenizer = _byte_level_tokenizer(special_tokens=["<eos>"])
+        content_token_ids = tokenizer.encode("Paris")
+        eos_token_id = tokenizer._tokenizer.token_to_id("<eos>")
+        completion_token_ids = content_token_ids + [eos_token_id]
+
+        class Engine:
+            def __init__(self):
+                self.tokenizer = tokenizer
+                self.last_step_token_outputs = []
+                self.last_step_logprob_outputs = []
+
+            def exit(self):
+                pass
+
+        engine = Engine()
+        dispatcher = AsyncEngineDispatcher(engine)
+        output_queue = asyncio.Queue()
+        active = {
+            7: _ActiveRequest(
+                index=0,
+                loop=asyncio.get_running_loop(),
+                output_queue=output_queue,
+                prompt_token_ids=[10],
+                max_tokens=len(completion_token_ids) + 1,
+                stop=[],
+                completion_token_ids=[],
+                completion_token_logprobs=[],
+                completion_top_logprobs=[],
+                detokenizer=IncrementalDetokenizer(tokenizer),
+                eos_token_ids=frozenset({eos_token_id}),
+            )
+        }
+        try:
+            engine.last_step_token_outputs = [(7, content_token_ids)]
+            engine.last_step_logprob_outputs = [
+                (
+                    7,
+                    [None] * len(content_token_ids),
+                    [None] * len(content_token_ids),
+                )
+            ]
+            dispatcher._publish_token_deltas(active)
+            token_item = await asyncio.wait_for(output_queue.get(), timeout=1)
+
+            engine.last_step_token_outputs = [(7, [eos_token_id])]
+            engine.last_step_logprob_outputs = [(7, [None], [None])]
+            dispatcher._publish_token_deltas(active)
+            self.assertTrue(output_queue.empty())
+
+            dispatcher._publish_finished(
+                active,
+                [
+                    (
+                        7,
+                        completion_token_ids,
+                        [None] * len(completion_token_ids),
+                        [None] * len(completion_token_ids),
+                    )
+                ],
+            )
+            final_item = await asyncio.wait_for(output_queue.get(), timeout=1)
+        finally:
+            dispatcher.close()
+
+        self.assertEqual(token_item["raw_text_delta"], "Paris")
+        self.assertEqual(final_item["raw_text"], "Paris")
+        self.assertEqual(final_item["token_ids"], completion_token_ids)
+        self.assertEqual(
+            final_item["completion_tokens"],
+            len(completion_token_ids),
+        )
+
+    async def test_dispatcher_preserves_eos_when_ignored(self):
+        from sparsevllm.entrypoints.openai.api_server import AsyncEngineDispatcher, _ActiveRequest
+        from sparsevllm.entrypoints.openai.detokenizer import IncrementalDetokenizer
+
+        tokenizer = _byte_level_tokenizer(special_tokens=["<eos>"])
+        content_token_ids = tokenizer.encode("Paris")
+        eos_token_id = tokenizer._tokenizer.token_to_id("<eos>")
+        completion_token_ids = content_token_ids + [eos_token_id]
+
+        class Engine:
+            def __init__(self):
+                self.tokenizer = tokenizer
+                self.last_step_token_outputs = [
+                    (7, completion_token_ids)
+                ]
+                self.last_step_logprob_outputs = [
+                    (
+                        7,
+                        [None] * len(completion_token_ids),
+                        [None] * len(completion_token_ids),
+                    )
+                ]
+
+            def exit(self):
+                pass
+
+        engine = Engine()
+        dispatcher = AsyncEngineDispatcher(engine)
+        output_queue = asyncio.Queue()
+        active = {
+            7: _ActiveRequest(
+                index=0,
+                loop=asyncio.get_running_loop(),
+                output_queue=output_queue,
+                prompt_token_ids=[10],
+                max_tokens=len(completion_token_ids),
+                stop=[],
+                completion_token_ids=[],
+                completion_token_logprobs=[],
+                completion_top_logprobs=[],
+                detokenizer=IncrementalDetokenizer(tokenizer),
+                eos_token_ids=frozenset({eos_token_id}),
+                ignore_eos=True,
+            )
+        }
+        try:
+            dispatcher._publish_token_deltas(active)
+            token_item = await asyncio.wait_for(output_queue.get(), timeout=1)
+            dispatcher._publish_finished(
+                active,
+                [
+                    (
+                        7,
+                        completion_token_ids,
+                        [None] * len(completion_token_ids),
+                        [None] * len(completion_token_ids),
+                    )
+                ],
+            )
+            final_item = await asyncio.wait_for(output_queue.get(), timeout=1)
+        finally:
+            dispatcher.close()
+
+        self.assertEqual(token_item["raw_text_delta"], "Paris<eos>")
+        self.assertEqual(final_item["raw_text"], "Paris<eos>")
+
     async def test_dispatcher_streams_complete_unicode_with_pending_logprobs(self):
         from sparsevllm.entrypoints.openai.api_server import AsyncEngineDispatcher, _ActiveRequest
         from sparsevllm.entrypoints.openai.detokenizer import IncrementalDetokenizer
