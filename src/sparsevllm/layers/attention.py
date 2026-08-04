@@ -3,6 +3,7 @@ import os
 import torch
 from torch import nn
 
+from sparsevllm.engine.cache_manager import ExplicitKVPayload
 from sparsevllm.layers.attention_backend import TritonAttentionBackend
 from sparsevllm.utils.context import get_context
 
@@ -86,20 +87,26 @@ class Attention(nn.Module):
                     v,
                     selection,
                 )
-                temp_slots = prefill_view.temp_slots
+                if not isinstance(prefill_view.payload, ExplicitKVPayload):
+                    raise TypeError(
+                        "Attention prefill requires ExplicitKVPayload, got "
+                        f"{type(prefill_view.payload).__name__}."
+                    )
+                prefill_meta = prefill_view.meta
+                temp_slots = prefill_meta.temp_slots
 
                 if context.cu_seqlens_q is None or context.cu_seqlens_q.numel() <= 1:
                     return torch.empty_like(q)
 
                 b_start_loc = context.cu_seqlens_q[:-1]
                 chunk_lens = context.cu_seqlens_q[1:] - context.cu_seqlens_q[:-1]
-                max_context_len = prefill_view.max_context_len
+                max_context_len = prefill_meta.max_context_len
                 if max_context_len is not None:
                     max_input_len = int(max_context_len)
                 elif torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
-                    max_input_len = int(prefill_view.active_slots.shape[1])
+                    max_input_len = int(prefill_meta.active_slots.shape[1])
                 else:
-                    max_input_len = prefill_view.context_lens.max().item()
+                    max_input_len = prefill_meta.context_lens.max().item()
 
                 o = self.attention_backend.run_prefill(
                     q,
@@ -135,9 +142,15 @@ class Attention(nn.Module):
                     num_heads=self.num_heads,
                     num_kv_heads=self.num_kv_heads,
                 )
-                temp_slots = decode_view.temp_slots
+                if not isinstance(decode_view.payload, ExplicitKVPayload):
+                    raise TypeError(
+                        "Attention decode requires ExplicitKVPayload, got "
+                        f"{type(decode_view.payload).__name__}."
+                    )
+                decode_meta = decode_view.meta
+                temp_slots = decode_meta.temp_slots
 
-                max_context_len = decode_view.max_context_len
+                max_context_len = decode_meta.max_context_len
                 static_cap = getattr(cache_manager, "_decode_static_max_context_len", None)
                 if static_cap is not None:
                     max_context_len = max(
@@ -147,13 +160,17 @@ class Attention(nn.Module):
                 if max_context_len is None:
                     raise RuntimeError(f"static decode requires max_context_len, got None at layer={layer_idx}")
                 max_len_in_batch = int(max_context_len)
-                if decode_view.active_slots.dim() == 2:
-                    slot_table_len = int(decode_view.active_slots.shape[1])
+                if decode_meta.active_slots.dim() == 2:
+                    slot_table_len = int(decode_meta.active_slots.shape[1])
                     if (
                         os.environ.get("SVLLM_DEBUG_DECODE_BOUNDS", "0") == "1"
                         and not (torch.cuda.is_available() and torch.cuda.is_current_stream_capturing())
                     ):
-                        actual_max_len = int(decode_view.context_lens.max().item()) if decode_view.context_lens.numel() > 0 else 0
+                        actual_max_len = (
+                            int(decode_meta.context_lens.max().item())
+                            if decode_meta.context_lens.numel() > 0
+                            else 0
+                        )
                         if actual_max_len > slot_table_len:
                             raise RuntimeError(
                                 "decode context length exceeds active slot table width: "

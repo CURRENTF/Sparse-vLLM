@@ -11,7 +11,7 @@ from sparsevllm.triton_kernel.prefill_score import prefill_score_fwd
 from sparsevllm.utils.context import get_context
 from sparsevllm.utils.profiler import profiler
 
-from .base import PrefillComputeView
+from .base import ExplicitKVPayload, PrefillComputeView
 from .snapkv import SnapKVCacheManager
 
 
@@ -754,6 +754,13 @@ class H2OCacheManager(SnapKVCacheManager):
         ranges = self.prefill_score_ranges(layer_idx, seqs)
         if not ranges:
             return None
+        if not isinstance(view.payload, ExplicitKVPayload):
+            raise TypeError(
+                "H2O prefill scoring requires ExplicitKVPayload, got "
+                f"{type(view.payload).__name__}."
+            )
+        meta = view.meta
+        payload = view.payload
 
         score_starts = torch.tensor(
             [item[3] for item in ranges], dtype=torch.int32, device=q.device
@@ -765,31 +772,31 @@ class H2OCacheManager(SnapKVCacheManager):
             [item[4] for item in ranges], dtype=torch.int32, device=q.device
         )
         physical_coordinates_match = (
-            view.context_lens[: len(seqs)] == physical_context_lens
+            meta.context_lens[: len(seqs)] == physical_context_lens
         ).all()
         if physical_coordinates_match.is_cuda:
             torch._assert_async(physical_coordinates_match)
         elif not bool(physical_coordinates_match.item()):
             raise RuntimeError(
                 "H2O prefill score view is not in compressed physical coordinates: "
-                f"layer={layer_idx} view={view.context_lens.tolist()} "
+                f"layer={layer_idx} view={meta.context_lens.tolist()} "
                 f"physical={physical_context_lens.tolist()}."
             )
         max_context_len = max(item[4] for item in ranges)
         step_score = torch.zeros(
             (len(seqs), max_context_len), dtype=torch.float32, device=q.device
         )
-        prompt_cache_lens = view.context_lens - chunk_lens
+        prompt_cache_lens = meta.context_lens - chunk_lens
         prefill_score_fwd(
             q,
-            view.k_cache,
+            payload.k_cache,
             step_score,
-            view.req_indices,
+            meta.req_indices,
             b_start_loc,
-            view.context_lens,
+            meta.context_lens,
             prompt_cache_lens,
             max(int(seq.current_chunk_size) for seq in seqs),
-            view.active_slots,
+            meta.active_slots,
             score_starts,
             score_ends,
             candidate_start=0,

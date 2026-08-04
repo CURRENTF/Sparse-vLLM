@@ -24,7 +24,15 @@ from sparsevllm.utils.profiler import profiler
 from sparsevllm.layers.rotary_embedding import get_rope, apply_rotary_emb
 from sparsevllm.platforms import device_runtime
 
-from .base import CacheManager, DecodeComputeView, LayerBatchStates, PrefillComputeView, SparseSelection
+from .base import (
+    AttentionViewMeta,
+    CacheManager,
+    DecodeComputeView,
+    ExplicitKVPayload,
+    LayerBatchStates,
+    PrefillComputeView,
+    SparseSelection,
+)
 from .raw_kv_offload import RawKVOffloadBuffer
 
 
@@ -953,14 +961,15 @@ class DeltaKVCacheManager(CacheManager):
             context_lens,
         )
         return PrefillComputeView(
-            k_cache=k_cache,
-            v_cache=v_cache,
-            active_slots=active_slots,
-            req_indices=req_indices,
-            context_lens=context_lens,
-            attn_score=selection.attn_score,
-            max_context_len=selection.max_context_len,
-            temp_slots=temp_slots,
+            meta=AttentionViewMeta(
+                active_slots=active_slots,
+                req_indices=req_indices,
+                context_lens=context_lens,
+                attn_score=selection.attn_score,
+                max_context_len=selection.max_context_len,
+                temp_slots=temp_slots,
+            ),
+            payload=ExplicitKVPayload(k_cache=k_cache, v_cache=v_cache),
         )
 
     def build_decode_compute_view(
@@ -997,14 +1006,15 @@ class DeltaKVCacheManager(CacheManager):
             selection,
         )
         return DecodeComputeView(
-            k_cache=k_cache,
-            v_cache=v_cache,
-            active_slots=active_slots,
-            req_indices=req_indices,
-            context_lens=context_lens,
-            attn_score=selection.attn_score,
-            max_context_len=selection.max_context_len,
-            temp_slots=temp_slots,
+            meta=AttentionViewMeta(
+                active_slots=active_slots,
+                req_indices=req_indices,
+                context_lens=context_lens,
+                attn_score=selection.attn_score,
+                max_context_len=selection.max_context_len,
+                temp_slots=temp_slots,
+            ),
+            payload=ExplicitKVPayload(k_cache=k_cache, v_cache=v_cache),
         )
 
     def has_prefill_staging_view(self, layer_idx: int) -> bool:

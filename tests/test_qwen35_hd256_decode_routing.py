@@ -3,7 +3,11 @@ from unittest.mock import patch
 
 import torch
 
-from sparsevllm.engine.cache_manager import DecodeComputeView
+from sparsevllm.engine.cache_manager import (
+    AttentionViewMeta,
+    DecodeComputeView,
+    ExplicitKVPayload,
+)
 from sparsevllm.layers.attention_backend import TritonAttentionBackend
 from sparsevllm.triton_kernel.flash_decoding_stage2 import flash_decode_stage2
 from sparsevllm.triton_kernel.gqa_flash_decoding_stage1 import (
@@ -20,13 +24,14 @@ class Qwen35Hd256DecodeRoutingTest(unittest.TestCase):
         k_cache = torch.zeros(4, 4, head_dim, dtype=torch.float32)
         v_cache = torch.zeros_like(k_cache)
         return DecodeComputeView(
-            k_cache=k_cache,
-            v_cache=v_cache,
-            active_slots=active_slots,
-            req_indices=req_indices,
-            context_lens=context_lens,
-            attn_score=attn_score,
-            max_context_len=3,
+            meta=AttentionViewMeta(
+                active_slots=active_slots,
+                req_indices=req_indices,
+                context_lens=context_lens,
+                attn_score=attn_score,
+                max_context_len=3,
+            ),
+            payload=ExplicitKVPayload(k_cache=k_cache, v_cache=v_cache),
         )
 
     def test_head_dim_256_uses_grouped_gqa_stage1_and_unified_stage2(self):

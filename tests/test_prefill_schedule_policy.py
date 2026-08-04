@@ -3745,7 +3745,11 @@ class DeltaKVFullPrefillStagingTest(unittest.TestCase):
         self.assertEqual(int(manager.row_seq_lens[row_idx]), 8)
 
     def test_deltakv_sparse_decode_backend_controls_fa2_view(self):
-        from sparsevllm.engine.cache_manager import DecodeComputeView
+        from sparsevllm.engine.cache_manager import (
+            AttentionViewMeta,
+            DecodeComputeView,
+            ExplicitKVPayload,
+        )
         from sparsevllm.engine.cache_manager.deltakv_base import DeltaKVCacheTritonManagerV4
         from sparsevllm.engine.cache_manager.deltakv_less_memory import DeltaKVLessMemoryCacheManager
 
@@ -3771,12 +3775,16 @@ class DeltaKVFullPrefillStagingTest(unittest.TestCase):
                 manager.deltakv_layer_to_idx = {1: 0}
                 manager.has_prefill_staging_view = lambda layer_idx, active=staging_active: active
                 view = DecodeComputeView(
-                    k_cache=torch.empty((2, 1, 4), dtype=torch.float32),
-                    v_cache=torch.empty((2, 1, 4), dtype=torch.float32),
-                    active_slots=torch.tensor([[0, 1]], dtype=torch.int32),
-                    req_indices=selection.req_indices,
-                    context_lens=selection.context_lens,
-                    backend="dense",
+                    meta=AttentionViewMeta(
+                        active_slots=torch.tensor([[0, 1]], dtype=torch.int32),
+                        req_indices=selection.req_indices,
+                        context_lens=selection.context_lens,
+                    ),
+                    payload=ExplicitKVPayload(
+                        k_cache=torch.empty((2, 1, 4), dtype=torch.float32),
+                        v_cache=torch.empty((2, 1, 4), dtype=torch.float32),
+                        backend="dense",
+                    ),
                 )
 
                 with patch.object(DeltaKVCacheTritonManagerV4, "build_decode_compute_view", return_value=view):
@@ -3789,7 +3797,8 @@ class DeltaKVFullPrefillStagingTest(unittest.TestCase):
                         num_kv_heads=1,
                     )
 
-                self.assertEqual(out.backend, expected)
+                self.assertIsInstance(out.payload, ExplicitKVPayload)
+                self.assertEqual(out.payload.backend, expected)
 
     def test_static_decode_resets_deltakv_view_cache_before_validation(self):
         manager = object.__new__(DeltaKVCacheManager)

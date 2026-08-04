@@ -7,7 +7,12 @@ from unittest.mock import patch
 import torch
 
 from sparsevllm.config import Config, RuntimeLayout
-from sparsevllm.engine.cache_manager.base import LayerBatchStates
+from sparsevllm.engine.cache_manager.base import (
+    AttentionViewMeta,
+    ExplicitKVPayload,
+    LayerBatchStates,
+    PrefillComputeView,
+)
 from sparsevllm.engine.cache_manager.rkv import RKVCacheManager
 from sparsevllm.engine.cache_manager.skipkv import (
     SkipKVCacheManager,
@@ -502,9 +507,16 @@ class RKVSkipKVMethodTest(unittest.TestCase):
         manager._rkv_query_positions = [torch.full((1, 3), -1, dtype=torch.int32)]
 
         q_prefill = torch.arange(10, dtype=torch.float32).view(5, 1, 2)
-        view = SimpleNamespace(
-            req_indices=torch.tensor([0], dtype=torch.int32),
-            context_lens=torch.tensor([5], dtype=torch.int32),
+        view = PrefillComputeView(
+            meta=AttentionViewMeta(
+                active_slots=torch.empty((1, 0), dtype=torch.int32),
+                req_indices=torch.tensor([0], dtype=torch.int32),
+                context_lens=torch.tensor([5], dtype=torch.int32),
+            ),
+            payload=ExplicitKVPayload(
+                k_cache=torch.empty((0, 1, 2)),
+                v_cache=torch.empty((0, 1, 2)),
+            ),
         )
         manager.record_prefill_query(
             0,

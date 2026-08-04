@@ -1,11 +1,25 @@
 from __future__ import annotations
 
-from .base import CacheManager, DecodeComputeView, LayerBatchStates, PrefillComputeView, SparseSelection
+from .base import (
+    AttentionPayload,
+    AttentionViewMeta,
+    CacheManager,
+    DecodeComputeView,
+    ExplicitKVPayload,
+    LayerBatchStates,
+    MlaLatentPayload,
+    PrefillComputeView,
+    SparseSelection,
+)
 
 __all__ = [
+    "AttentionPayload",
+    "AttentionViewMeta",
     "CacheManager",
     "DecodeComputeView",
+    "ExplicitKVPayload",
     "LayerBatchStates",
+    "MlaLatentPayload",
     "PrefillComputeView",
     "SparseSelection",
     "StandardCacheManager",

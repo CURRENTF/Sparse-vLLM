@@ -9,7 +9,9 @@ import pytest
 import torch
 
 from sparsevllm.engine.cache_manager.base import (
+    AttentionViewMeta,
     CacheManager,
+    ExplicitKVPayload,
     LayerBatchStates,
     PrefillComputeView,
 )
@@ -360,12 +362,16 @@ def test_h2o_prefill_score_collection_accumulates_in_physical_coordinates():
     seq = _seq(0, 20, prefilled=8, chunk=2)
     manager._h2o_scores[(0, 0)] = torch.tensor([1.0, 2.0, 3.0, 4.0])
     view = PrefillComputeView(
-        k_cache=torch.empty((16, 1, 1)),
-        v_cache=torch.empty((16, 1, 1)),
-        active_slots=manager.buffer_req_to_token_slots[0],
-        req_indices=torch.tensor([0], dtype=torch.int32),
-        context_lens=torch.tensor([6], dtype=torch.int32),
-        max_context_len=6,
+        meta=AttentionViewMeta(
+            active_slots=manager.buffer_req_to_token_slots[0],
+            req_indices=torch.tensor([0], dtype=torch.int32),
+            context_lens=torch.tensor([6], dtype=torch.int32),
+            max_context_len=6,
+        ),
+        payload=ExplicitKVPayload(
+            k_cache=torch.empty((16, 1, 1)),
+            v_cache=torch.empty((16, 1, 1)),
+        ),
     )
     set_context(is_prefill=True, cache_manager=manager, seqs=[seq])
 
@@ -402,12 +408,16 @@ def test_h2o_prefill_score_collection_rejects_misaligned_physical_view():
     seq = _seq(0, 20, prefilled=8, chunk=2)
     manager._h2o_scores[(0, 0)] = torch.ones(4)
     view = PrefillComputeView(
-        k_cache=torch.empty((16, 1, 1)),
-        v_cache=torch.empty((16, 1, 1)),
-        active_slots=manager.buffer_req_to_token_slots[0],
-        req_indices=torch.tensor([0], dtype=torch.int32),
-        context_lens=torch.tensor([7], dtype=torch.int32),
-        max_context_len=7,
+        meta=AttentionViewMeta(
+            active_slots=manager.buffer_req_to_token_slots[0],
+            req_indices=torch.tensor([0], dtype=torch.int32),
+            context_lens=torch.tensor([7], dtype=torch.int32),
+            max_context_len=7,
+        ),
+        payload=ExplicitKVPayload(
+            k_cache=torch.empty((16, 1, 1)),
+            v_cache=torch.empty((16, 1, 1)),
+        ),
     )
     set_context(is_prefill=True, cache_manager=manager, seqs=[seq])
 

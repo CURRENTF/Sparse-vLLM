@@ -20,7 +20,13 @@ from sparsevllm.utils.context import get_context
 from sparsevllm.utils.log import logger, log_level
 from sparsevllm.utils.profiler import profiler
 
-from .base import CacheManager, LayerBatchStates, PrefillComputeView, SparseSelection
+from .base import (
+    CacheManager,
+    ExplicitKVPayload,
+    LayerBatchStates,
+    PrefillComputeView,
+    SparseSelection,
+)
 from .raw_kv_offload import RawKVOffloadBuffer
 
 
@@ -969,8 +975,15 @@ class SnapKVCacheManager(CacheManager):
         rows = self._prefill_score_rows(layer_idx, seqs)
         if not rows:
             return None
+        if not isinstance(view.payload, ExplicitKVPayload):
+            raise TypeError(
+                "SnapKV prefill scoring requires ExplicitKVPayload, got "
+                f"{type(view.payload).__name__}."
+            )
+        meta = view.meta
+        payload = view.payload
 
-        b_prompt_cache_len = view.context_lens - chunk_lens
+        b_prompt_cache_len = meta.context_lens - chunk_lens
         max_query_len = max(int(seq.current_chunk_size) for seq in seqs)
         if len(rows) == 1:
             b_idx, seq, score_start, score_end = rows[0]
@@ -978,19 +991,19 @@ class SnapKVCacheManager(CacheManager):
             acc = self._get_prefill_attention_score_accumulator(
                 layer_idx,
                 seq,
-                prompt_len=int(view.context_lens[b_idx].item()),
+                prompt_len=int(meta.context_lens[b_idx].item()),
                 device=q.device,
             )
             prefill_score_fwd(
                 q,
-                view.k_cache,
+                payload.k_cache,
                 acc.unsqueeze(0),
-                view.req_indices[b_idx : b_idx + 1],
+                meta.req_indices[b_idx : b_idx + 1],
                 b_start_loc[b_idx : b_idx + 1],
-                view.context_lens[b_idx : b_idx + 1],
+                meta.context_lens[b_idx : b_idx + 1],
                 b_prompt_cache_len[b_idx : b_idx + 1],
                 query_len,
-                view.active_slots,
+                meta.active_slots,
                 *self._prefill_score_bound_tensors(
                     score_start=score_start,
                     score_end=score_end,
@@ -1008,8 +1021,8 @@ class SnapKVCacheManager(CacheManager):
             score_ends[b_idx] = int(score_end)
 
         max_context_len = (
-            int(view.max_context_len)
-            if view.max_context_len is not None
+            int(meta.max_context_len)
+            if meta.max_context_len is not None
             else max(int(seq.num_prefilled_tokens + seq.current_chunk_size) for seq in seqs)
         )
         step_score = torch.zeros(
@@ -1019,14 +1032,14 @@ class SnapKVCacheManager(CacheManager):
         )
         prefill_score_fwd(
             q,
-            view.k_cache,
+            payload.k_cache,
             step_score,
-            view.req_indices,
+            meta.req_indices,
             b_start_loc,
-            view.context_lens,
+            meta.context_lens,
             b_prompt_cache_len,
             max_query_len,
-            view.active_slots,
+            meta.active_slots,
             score_starts,
             score_ends,
             candidate_start=int(self.config.num_sink_tokens),
@@ -1036,10 +1049,10 @@ class SnapKVCacheManager(CacheManager):
             acc = self._get_prefill_attention_score_accumulator(
                 layer_idx,
                 seq,
-                prompt_len=int(view.context_lens[b_idx].item()),
+                prompt_len=int(meta.context_lens[b_idx].item()),
                 device=q.device,
             )
-            context_len = int(view.context_lens[b_idx].item())
+            context_len = int(meta.context_lens[b_idx].item())
             acc[:context_len] = torch.maximum(acc[:context_len], step_score[b_idx, :context_len])
         return None
 

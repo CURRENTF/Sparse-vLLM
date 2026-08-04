@@ -264,10 +264,11 @@ class RKVCacheManager(SnapKVCacheManager):
 
         layer_idx = int(layer_idx)
         cache, positions_cache = self._rkv_layer_query_cache(layer_idx)
+        meta = view.meta
         if not bool(getattr(self, "_rkv_vectorized_prefill_query_cache", True)):
-            batch = int(view.context_lens.numel())
+            batch = int(meta.context_lens.numel())
             for b_idx in range(batch):
-                context_len = int(view.context_lens[b_idx].item())
+                context_len = int(meta.context_lens[b_idx].item())
                 chunk_len = int(chunk_lens[b_idx].item())
                 if context_len <= 0 or chunk_len <= 0:
                     continue
@@ -277,7 +278,7 @@ class RKVCacheManager(SnapKVCacheManager):
                 if record_len <= 0:
                     continue
 
-                row_idx = int(view.req_indices[b_idx].item())
+                row_idx = int(meta.req_indices[b_idx].item())
                 q_start = int(b_start_loc[b_idx].item()) + (record_start - chunk_start)
                 token_positions = torch.arange(
                     record_start,
@@ -290,9 +291,9 @@ class RKVCacheManager(SnapKVCacheManager):
                 positions_cache[row_idx, cols] = token_positions.to(torch.int32)
             return None
 
-        context_lens = view.context_lens.to(device=q.device, dtype=torch.long)
+        context_lens = meta.context_lens.to(device=q.device, dtype=torch.long)
         chunk_lens = chunk_lens.to(device=q.device, dtype=torch.long)
-        req_indices = view.req_indices.to(device=q.device, dtype=torch.long)
+        req_indices = meta.req_indices.to(device=q.device, dtype=torch.long)
         b_start_loc = b_start_loc.to(device=q.device, dtype=torch.long)
 
         offsets = torch.arange(obs, dtype=torch.long, device=q.device)

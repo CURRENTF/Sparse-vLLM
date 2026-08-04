@@ -141,34 +141,53 @@ class SparseSelection:
     release_temp_slots: bool = False
 
 
-@dataclass
-class DecodeComputeView:
-    """Physical KV/view tensors consumed by decode attention kernels."""
+@dataclass(frozen=True)
+class AttentionViewMeta:
+    """Logical request/slot coordinates shared by attention payloads."""
 
-    k_cache: torch.Tensor
-    v_cache: torch.Tensor
     active_slots: torch.Tensor
     req_indices: torch.Tensor
     context_lens: torch.Tensor
-    attn_score: torch.Tensor | None = None
     max_context_len: int | None = None
+    attn_score: torch.Tensor | None = None
     temp_slots: torch.Tensor | None = None
+
+
+@dataclass(frozen=True)
+class ExplicitKVPayload:
+    """Materialized key/value tensors consumed by ordinary attention."""
+
+    k_cache: torch.Tensor
+    v_cache: torch.Tensor
     backend: str = "dense"
     metadata: dict[str, Any] | None = None
 
 
-@dataclass
-class PrefillComputeView:
-    """Physical KV/view tensors consumed by prefill attention kernels."""
+@dataclass(frozen=True)
+class MlaLatentPayload:
+    """Latent and RoPE caches consumed by MLA attention providers."""
 
-    k_cache: torch.Tensor
-    v_cache: torch.Tensor
-    active_slots: torch.Tensor
-    req_indices: torch.Tensor
-    context_lens: torch.Tensor
-    attn_score: torch.Tensor | None = None
-    max_context_len: int | None = None
-    temp_slots: torch.Tensor | None = None
+    latent_cache: torch.Tensor
+    rope_cache: torch.Tensor
+
+
+AttentionPayload = ExplicitKVPayload | MlaLatentPayload
+
+
+@dataclass(frozen=True)
+class DecodeComputeView:
+    """Decode metadata paired with exactly one physical payload layout."""
+
+    meta: AttentionViewMeta
+    payload: AttentionPayload
+
+
+@dataclass(frozen=True)
+class PrefillComputeView:
+    """Prefill metadata paired with exactly one physical payload layout."""
+
+    meta: AttentionViewMeta
+    payload: AttentionPayload
 
 
 class CacheManager(ABC):
@@ -675,14 +694,15 @@ class CacheManager(ABC):
             context_lens,
         )
         return PrefillComputeView(
-            k_cache=k_cache,
-            v_cache=v_cache,
-            active_slots=active_slots,
-            req_indices=req_indices,
-            context_lens=context_lens,
-            attn_score=selection.attn_score,
-            max_context_len=selection.max_context_len,
-            temp_slots=temp_slots,
+            meta=AttentionViewMeta(
+                active_slots=active_slots,
+                req_indices=req_indices,
+                context_lens=context_lens,
+                attn_score=selection.attn_score,
+                max_context_len=selection.max_context_len,
+                temp_slots=temp_slots,
+            ),
+            payload=ExplicitKVPayload(k_cache=k_cache, v_cache=v_cache),
         )
 
     def collect_prefill_attention_score(
@@ -921,13 +941,14 @@ class CacheManager(ABC):
             selection,
         )
         return DecodeComputeView(
-            k_cache=k_cache,
-            v_cache=v_cache,
-            active_slots=active_slots,
-            req_indices=req_indices,
-            context_lens=context_lens,
-            attn_score=selection.attn_score,
-            max_context_len=selection.max_context_len,
+            meta=AttentionViewMeta(
+                active_slots=active_slots,
+                req_indices=req_indices,
+                context_lens=context_lens,
+                attn_score=selection.attn_score,
+                max_context_len=selection.max_context_len,
+            ),
+            payload=ExplicitKVPayload(k_cache=k_cache, v_cache=v_cache),
         )
 
     def get_decode_block_seq(self, layer_idx: int, default: int) -> int:
