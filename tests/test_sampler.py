@@ -8,6 +8,7 @@ from torch.utils._python_dispatch import TorchDispatchMode
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.layers.sampler import Sampler
 from sparsevllm.sampling_params import SamplingParams
+from sparsevllm.sampling_params import resolve_eos_token_ids
 
 
 class SamplerTest(unittest.TestCase):
@@ -84,6 +85,20 @@ class SamplerTest(unittest.TestCase):
             repetition_token_ids=[None],
         )
         self.assertIs(output, logits)
+
+    def test_resolve_eos_token_ids_uses_request_precedence(self):
+        self.assertEqual(
+            resolve_eos_token_ids((7, 8), (9,), fallback_eos_token_id=10),
+            frozenset({7, 8}),
+        )
+        self.assertEqual(
+            resolve_eos_token_ids((), (9,), fallback_eos_token_id=10),
+            frozenset({9}),
+        )
+        self.assertEqual(
+            resolve_eos_token_ids((), (), fallback_eos_token_id=10),
+            frozenset({10}),
+        )
 
     def test_presence_and_repetition_penalty_formulas(self):
         sampler = Sampler()

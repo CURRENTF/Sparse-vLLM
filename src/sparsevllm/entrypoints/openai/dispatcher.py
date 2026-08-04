@@ -13,6 +13,7 @@ from sparsevllm.entrypoints.openai.sampling import _find_stop_index
 from sparsevllm.entrypoints.openai.sampling import _safe_stream_text_len
 from sparsevllm.llm import LLM
 from sparsevllm.sampling_params import SamplingParams
+from sparsevllm.sampling_params import resolve_eos_token_ids
 from sparsevllm.utils.log import logger
 
 
@@ -62,6 +63,7 @@ class _ActiveRequest:
     ignore_eos: bool = False
     terminal: threading.Event = field(default_factory=threading.Event)
     emitted_text_len: int = 0
+    emitted_raw_text_len: int = 0
     pending_token_ids: list[int] = field(default_factory=list)
     pending_token_logprobs: list[float | None] = field(default_factory=list)
     pending_top_logprobs: list[dict[int, float] | None] = field(default_factory=list)
@@ -584,23 +586,14 @@ class AsyncEngineDispatcher:
                 if isinstance(item.prompt, list)
                 else self.engine.tokenizer.encode(item.prompt)
             )
-            requested_eos = getattr(
-                item.sampling_params, "eos_token_ids", ()
-            ) or ()
-            if isinstance(requested_eos, int):
-                requested_eos = (requested_eos,)
-            eos_token_ids = frozenset(
-                int(token_id) for token_id in requested_eos
+            engine_config = getattr(self.engine, "config", None)
+            eos_token_ids = resolve_eos_token_ids(
+                getattr(item.sampling_params, "eos_token_ids", ()),
+                getattr(engine_config, "eos_token_ids", ()),
+                fallback_eos_token_id=getattr(
+                    engine_config, "eos", -1
+                ),
             )
-            if not eos_token_ids:
-                configured_eos = getattr(
-                    getattr(self.engine, "config", None),
-                    "eos_token_ids",
-                    (),
-                ) or ()
-                eos_token_ids = frozenset(
-                    int(token_id) for token_id in configured_eos
-                )
             active[seq_id] = _ActiveRequest(
                 index=item.index,
                 loop=item.loop,
@@ -675,6 +668,7 @@ class AsyncEngineDispatcher:
         request: _ActiveRequest,
         token_ids: list[int],
         raw_text: str,
+        visible_text_len: int,
     ) -> str:
         if (
             request.ignore_eos
@@ -682,27 +676,32 @@ class AsyncEngineDispatcher:
             or not token_ids
             or int(token_ids[-1]) not in request.eos_token_ids
         ):
-            return raw_text
-
-        content_end = len(token_ids)
-        while (
-            content_end > 0
-            and int(token_ids[content_end - 1]) in request.eos_token_ids
-        ):
-            content_end -= 1
-        return request.detokenizer.tokenizer.decode(
-            token_ids[:content_end],
-            skip_special_tokens=False,
-        )
-
-    @staticmethod
-    def _response_parser_delta(previous: str, current: str) -> str:
-        if not current.startswith(previous):
-            raise RuntimeError(
-                "Response-parser text is not append-only: "
-                f"previous={previous!r} current={current!r}."
+            parser_raw_text = raw_text
+        else:
+            content_end = len(token_ids)
+            while (
+                content_end > 0
+                and int(token_ids[content_end - 1])
+                in request.eos_token_ids
+            ):
+                content_end -= 1
+            parser_raw_text = request.detokenizer.tokenizer.decode(
+                token_ids[:content_end],
+                skip_special_tokens=False,
             )
-        return current[len(previous):]
+
+        if not raw_text.startswith(parser_raw_text):
+            raise RuntimeError(
+                "Response-parser raw text is not a prefix of detokenized "
+                f"raw text: parser={parser_raw_text!r} raw={raw_text!r}."
+            )
+        if not request.stop:
+            return parser_raw_text
+        raw_text_len = request.detokenizer.raw_offset_for_visible_prefix(
+            visible_text_len,
+            raw_text_limit=len(parser_raw_text),
+        )
+        return parser_raw_text[:raw_text_len]
 
     def _publish_token_deltas(self, active: dict[int, _ActiveRequest]):
         logprob_outputs = {
@@ -721,11 +720,6 @@ class AsyncEngineDispatcher:
                 seq_id,
                 ([None] * len(token_ids), [None] * len(token_ids)),
             )
-            previous_parser_raw_text = self._response_parser_raw_text(
-                request,
-                request.completion_token_ids,
-                request.detokenizer.raw_text,
-            )
             request.completion_token_ids.extend(token_ids)
             request.completion_token_logprobs.extend(token_logprobs)
             request.completion_top_logprobs.extend(top_logprobs)
@@ -733,15 +727,6 @@ class AsyncEngineDispatcher:
             request.pending_token_logprobs.extend(token_logprobs)
             request.pending_top_logprobs.extend(top_logprobs)
             request.detokenizer.push(token_ids)
-            parser_raw_text = self._response_parser_raw_text(
-                request,
-                request.completion_token_ids,
-                request.detokenizer.raw_text,
-            )
-            raw_text_delta = self._response_parser_delta(
-                previous_parser_raw_text,
-                parser_raw_text,
-            )
             full_text = request.detokenizer.text
             stop_index = _find_stop_index(full_text, request.stop)
             visible_text = full_text if stop_index is None else full_text[:stop_index]
@@ -750,10 +735,40 @@ class AsyncEngineDispatcher:
                 if stop_index is not None
                 else _safe_stream_text_len(visible_text, request.stop)
             )
+            parser_raw_text = self._response_parser_raw_text(
+                request,
+                request.completion_token_ids,
+                request.detokenizer.raw_text,
+                emit_len,
+            )
+            if len(parser_raw_text) < request.emitted_raw_text_len:
+                raise RuntimeError(
+                    "Response-parser boundary precedes emitted text: "
+                    f"emitted={request.emitted_raw_text_len} "
+                    f"boundary={len(parser_raw_text)}."
+                )
+            raw_text_delta = parser_raw_text[
+                request.emitted_raw_text_len:
+            ]
             text = visible_text[request.emitted_text_len:emit_len]
             request.emitted_text_len = emit_len
             if stop_index is not None:
                 final = request.detokenizer.finish(request.completion_token_ids)
+                final_stop_index = _find_stop_index(
+                    final.text,
+                    request.stop,
+                )
+                if final_stop_index is None:
+                    raise RuntimeError(
+                        "Incremental stop match disappeared during final "
+                        "detokenization."
+                    )
+                final_parser_raw_text = self._response_parser_raw_text(
+                    request,
+                    request.completion_token_ids,
+                    final.raw_text,
+                    final_stop_index,
+                )
                 try:
                     self.engine.abort_request(
                         seq_id, disposition="invalidate"
@@ -763,9 +778,18 @@ class AsyncEngineDispatcher:
                 if request.chain_id is not None:
                     request.chain_status = "invalidated"
                 self._refresh_routing_snapshots()
-            if text or (stop_index is None and raw_text_delta):
+            if text or raw_text_delta:
                 self._publish_pending_token_event(request, text, raw_text_delta)
             if stop_index is not None:
+                if (
+                    len(final_parser_raw_text)
+                    < request.emitted_raw_text_len
+                ):
+                    raise RuntimeError(
+                        "Final response-parser text is shorter than its "
+                        f"stream: emitted={request.emitted_raw_text_len} "
+                        f"final={len(final_parser_raw_text)}."
+                    )
                 active.pop(seq_id, None)
                 self._mark_request_terminal(seq_id, request)
                 self._put(
@@ -774,11 +798,7 @@ class AsyncEngineDispatcher:
                         "type": "final",
                         "index": request.index,
                         "text": visible_text,
-                        "raw_text": self._response_parser_raw_text(
-                            request,
-                            request.completion_token_ids,
-                            final.raw_text,
-                        ),
+                        "raw_text": final_parser_raw_text,
                         "text_delta": visible_text[request.emitted_text_len:],
                         "finish_reason": "stop",
                         "prompt_tokens": (
@@ -822,6 +842,7 @@ class AsyncEngineDispatcher:
         request.pending_token_ids.clear()
         request.pending_token_logprobs.clear()
         request.pending_top_logprobs.clear()
+        request.emitted_raw_text_len += len(raw_text_delta)
 
     def _mark_request_terminal(
         self,
@@ -1043,21 +1064,7 @@ class AsyncEngineDispatcher:
             if request is None:
                 continue
             observed = len(request.completion_token_ids)
-            previous_parser_raw_text = self._response_parser_raw_text(
-                request,
-                request.completion_token_ids,
-                request.detokenizer.raw_text,
-            )
             final = request.detokenizer.finish(completion_token_ids)
-            parser_raw_text = self._response_parser_raw_text(
-                request,
-                completion_token_ids,
-                final.raw_text,
-            )
-            parser_raw_text_delta = self._response_parser_delta(
-                previous_parser_raw_text,
-                parser_raw_text,
-            )
             request.pending_token_ids.extend(completion_token_ids[observed:])
             request.pending_token_logprobs.extend(token_logprobs[observed:])
             request.pending_top_logprobs.extend(top_logprobs[observed:])
@@ -1065,9 +1072,35 @@ class AsyncEngineDispatcher:
             request.completion_token_ids = list(completion_token_ids)
             request.completion_token_logprobs = list(token_logprobs)
             request.completion_top_logprobs = list(top_logprobs)
-            finish_reason = "length" if len(completion_token_ids) >= request.max_tokens else "stop"
             text = final.text
             stop_index = _find_stop_index(text, request.stop)
+            parser_raw_text = self._response_parser_raw_text(
+                request,
+                completion_token_ids,
+                final.raw_text,
+                stop_index if stop_index is not None else len(text),
+            )
+            if len(parser_raw_text) < request.emitted_raw_text_len:
+                raise RuntimeError(
+                    "Final response-parser text is shorter than its stream: "
+                    f"emitted={request.emitted_raw_text_len} "
+                    f"final={len(parser_raw_text)}."
+                )
+            parser_raw_text_delta = parser_raw_text[
+                request.emitted_raw_text_len:
+            ]
+            ended_by_eos = (
+                not request.ignore_eos
+                and bool(completion_token_ids)
+                and int(completion_token_ids[-1])
+                in request.eos_token_ids
+            )
+            finish_reason = (
+                "stop"
+                if ended_by_eos
+                or len(completion_token_ids) < request.max_tokens
+                else "length"
+            )
             if stop_index is not None:
                 text = text[:stop_index]
                 finish_reason = "stop"

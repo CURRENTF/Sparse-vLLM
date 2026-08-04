@@ -1,4 +1,35 @@
+from collections.abc import Iterable
 from dataclasses import dataclass
+
+
+def _as_eos_token_id_set(
+    value: int | Iterable[int] | None,
+) -> frozenset[int]:
+    if value is None:
+        return frozenset()
+    if isinstance(value, int):
+        return frozenset({int(value)})
+    return frozenset(int(token_id) for token_id in value)
+
+
+def resolve_eos_token_ids(
+    request_eos_token_ids: int | Iterable[int] | None = (),
+    configured_eos_token_ids: int | Iterable[int] | None = (),
+    *,
+    fallback_eos_token_id: int | None = -1,
+) -> frozenset[int]:
+    requested = _as_eos_token_id_set(request_eos_token_ids)
+    if requested:
+        return requested
+    configured = _as_eos_token_id_set(configured_eos_token_ids)
+    if configured:
+        return configured
+    if (
+        fallback_eos_token_id is not None
+        and int(fallback_eos_token_id) >= 0
+    ):
+        return frozenset({int(fallback_eos_token_id)})
+    return frozenset()
 
 
 @dataclass
