@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import importlib.metadata
 import json
+import math
 import os
 import re
 import shlex
@@ -811,6 +812,20 @@ class SweBenchLiteRunner:
             raise RunnerError("--temperature must be non-negative")
         if not 0.0 < args.top_p <= 1.0:
             raise RunnerError("--top-p must be in (0, 1]")
+        if (
+            not math.isfinite(args.docker_writable_layer_limit_gib)
+            or args.docker_writable_layer_limit_gib < 0
+        ):
+            raise RunnerError(
+                "--docker-writable-layer-limit-gib must be finite and non-negative"
+            )
+        if (
+            not math.isfinite(args.docker_writable_layer_poll_seconds)
+            or args.docker_writable_layer_poll_seconds <= 0
+        ):
+            raise RunnerError(
+                "--docker-writable-layer-poll-seconds must be finite and positive"
+            )
         if args.cost_tracking == "ignore_errors" and args.cost_limit > 0:
             raise RunnerError(
                 "A positive --cost-limit is not reliable with --cost-tracking=ignore_errors; "
@@ -879,7 +894,20 @@ class SweBenchLiteRunner:
 
     def _model_env(self) -> dict[str, str]:
         env = os.environ.copy()
-        python_path = [str(self.repo_root)]
+        python_path = []
+        writable_limit_gib = getattr(
+            self.args, "docker_writable_layer_limit_gib", 0.0
+        )
+        if writable_limit_gib > 0:
+            python_path.append(
+                str(
+                    self.repo_root
+                    / "benchmark"
+                    / "swe_bench_lite"
+                    / "docker_guard_bootstrap"
+                )
+            )
+        python_path.append(str(self.repo_root))
         if env.get("PYTHONPATH"):
             python_path.append(env["PYTHONPATH"])
         env["PYTHONPATH"] = os.pathsep.join(python_path)
@@ -907,6 +935,26 @@ class SweBenchLiteRunner:
             env["SPARSEVLLM_CHAIN_CACHE"] = "1"
         else:
             env.pop("SPARSEVLLM_CHAIN_CACHE", None)
+        guard_env_vars = (
+            "SPARSEVLLM_DOCKER_WRITABLE_LAYER_LIMIT_BYTES",
+            "SPARSEVLLM_DOCKER_WRITABLE_LAYER_POLL_SECONDS",
+            "SPARSEVLLM_DOCKER_WRITABLE_LAYER_EVENTS",
+            "SPARSEVLLM_SWE_RUN_ID",
+        )
+        if writable_limit_gib > 0:
+            env["SPARSEVLLM_DOCKER_WRITABLE_LAYER_LIMIT_BYTES"] = str(
+                int(writable_limit_gib * 1024**3)
+            )
+            env["SPARSEVLLM_DOCKER_WRITABLE_LAYER_POLL_SECONDS"] = str(
+                getattr(self.args, "docker_writable_layer_poll_seconds", 1.0)
+            )
+            env["SPARSEVLLM_DOCKER_WRITABLE_LAYER_EVENTS"] = str(
+                self.run_dir / "docker_writable_layer_guard.jsonl"
+            )
+            env["SPARSEVLLM_SWE_RUN_ID"] = self.run_id
+        else:
+            for key in guard_env_vars:
+                env.pop(key, None)
         return env
 
     def _load_selection(self) -> None:
@@ -983,6 +1031,8 @@ class SweBenchLiteRunner:
             "temperature": self.args.temperature,
             "top_p": self.args.top_p,
             "chain_cache": bool(self.args.chain_cache),
+            "docker_writable_layer_limit_gib": self.args.docker_writable_layer_limit_gib,
+            "docker_writable_layer_poll_seconds": self.args.docker_writable_layer_poll_seconds,
             "seed": None,
             "seed_control": "not exposed by this adapter",
             "eval_timeout": self.args.eval_timeout,
@@ -1628,6 +1678,21 @@ def build_parser() -> argparse.ArgumentParser:
             "When omitted, SPARSEVLLM_CHAIN_CACHE is read once for compatibility; "
             "the resolved value is persisted in run_config.json."
         ),
+    )
+    parser.add_argument(
+        "--docker-writable-layer-limit-gib",
+        type=float,
+        default=4.0,
+        help=(
+            "Kill a sample container and fail that sample when its Docker writable "
+            "layer exceeds this many GiB (default: 4); 0 disables the guard."
+        ),
+    )
+    parser.add_argument(
+        "--docker-writable-layer-poll-seconds",
+        type=float,
+        default=1.0,
+        help="Polling interval for the Docker writable-layer guard.",
     )
     parser.add_argument(
         "--allow-image-pulls",

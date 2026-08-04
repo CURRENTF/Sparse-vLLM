@@ -203,6 +203,66 @@ class SweBenchLiteRunnerTest(unittest.TestCase):
         self.assertFalse(runner.args.chain_cache)
         self.assertNotIn("SPARSEVLLM_CHAIN_CACHE", env)
 
+    def test_docker_writable_layer_guard_environment_is_explicit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runner = object.__new__(SweBenchLiteRunner)
+            runner.repo_root = Path("/adapter").resolve()
+            runner.run_dir = root / "run"
+            runner.run_id = "guarded-run"
+            runner.args = Namespace(
+                api_proxy_from_environment=False,
+                offline_dataset=False,
+                chain_cache=False,
+                docker_writable_layer_limit_gib=4.0,
+                docker_writable_layer_poll_seconds=1.0,
+            )
+
+            with mock.patch.dict("os.environ", {}, clear=True):
+                env = runner._model_env()
+
+        self.assertEqual(
+            env["SPARSEVLLM_DOCKER_WRITABLE_LAYER_LIMIT_BYTES"],
+            str(4 * 1024**3),
+        )
+        self.assertEqual(env["SPARSEVLLM_DOCKER_WRITABLE_LAYER_POLL_SECONDS"], "1.0")
+        self.assertEqual(env["SPARSEVLLM_SWE_RUN_ID"], "guarded-run")
+        self.assertEqual(
+            env["SPARSEVLLM_DOCKER_WRITABLE_LAYER_EVENTS"],
+            str(runner.run_dir / "docker_writable_layer_guard.jsonl"),
+        )
+        self.assertTrue(
+            env["PYTHONPATH"].startswith(
+                str(
+                    runner.repo_root
+                    / "benchmark"
+                    / "swe_bench_lite"
+                    / "docker_guard_bootstrap"
+                )
+            )
+        )
+
+    def test_invalid_docker_writable_layer_guard_limits_are_rejected(self):
+        for flag, value in (
+            ("--docker-writable-layer-limit-gib", "-1"),
+            ("--docker-writable-layer-limit-gib", "nan"),
+            ("--docker-writable-layer-poll-seconds", "0"),
+        ):
+            with self.subTest(flag=flag, value=value), tempfile.TemporaryDirectory() as tmp:
+                args = build_parser().parse_args(
+                    ["--stage", "summarize", "--run-dir", tmp, flag, value]
+                )
+                with self.assertRaisesRegex(RunnerError, "docker-writable-layer"):
+                    SweBenchLiteRunner(args)
+
+    def test_docker_writable_layer_guard_defaults_to_four_gib(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = build_parser().parse_args(
+                ["--stage", "summarize", "--run-dir", tmp]
+            )
+
+        self.assertEqual(args.docker_writable_layer_limit_gib, 4.0)
+
     def test_validate_predictions_rejects_missing_and_extra_ids(self):
         with self.assertRaisesRegex(RunnerError, "missing=.*b.*extra=.*c"):
             validate_predictions(
