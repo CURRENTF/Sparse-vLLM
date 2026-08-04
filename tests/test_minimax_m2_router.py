@@ -8,6 +8,9 @@ from sparsevllm.triton_kernel.minimax_m2_router import (
     minimax_m2_router,
     topk_biased_sigmoid,
 )
+from sparsevllm.triton_kernel.moe_biased_sigmoid import (
+    topk_biased_sigmoid as generic_topk_biased_sigmoid,
+)
 
 
 def _reference(
@@ -30,6 +33,32 @@ def test_topk_biased_sigmoid_matches_minimax_reference():
     expected_weights, expected_ids = _reference(logits, correction_bias)
 
     weights, ids = topk_biased_sigmoid(logits, correction_bias)
+    torch.cuda.synchronize()
+
+    assert torch.equal(ids, expected_ids)
+    assert torch.equal(weights, expected_weights)
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for this test.")
+def test_topk_biased_sigmoid_matches_glm_64_expert_reference():
+    torch.manual_seed(29)
+    logits = torch.randn(1024, 64, dtype=torch.float32, device="cuda") * 3
+    correction_bias = torch.randn(64, dtype=torch.float32, device="cuda") * 0.1
+    routing_weights = torch.sigmoid(logits)
+    expected_ids = torch.topk(
+        routing_weights + correction_bias,
+        4,
+        dim=-1,
+        sorted=False,
+    ).indices
+    expected_weights = routing_weights.gather(1, expected_ids)
+    expected_weights /= expected_weights.sum(dim=-1, keepdim=True) + 1e-20
+
+    weights, ids = generic_topk_biased_sigmoid(
+        logits,
+        correction_bias,
+        top_k=4,
+    )
     torch.cuda.synchronize()
 
     assert torch.equal(ids, expected_ids)

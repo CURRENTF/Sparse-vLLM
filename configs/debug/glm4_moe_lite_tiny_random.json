@@ -1,0 +1,6 @@
+{
+  "hidden_size": 64,
+  "intermediate_size": 128,
+  "max_position_embeddings": 512,
+  "num_hidden_layers": 2
+}

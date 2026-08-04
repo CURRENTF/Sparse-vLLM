@@ -159,6 +159,14 @@ MODEL_SPECS.update(
             moe_tp_fields=("intermediate_size",),
             top_k_field="num_experts_per_tok",
         ),
+        "glm4_moe_lite": ModelSpec(
+            "GLM-4.7-Flash",
+            runtime_class_name="Glm4MoeLiteForCausalLM",
+            attention_tp_fields=("num_attention_heads", "vocab_size"),
+            num_experts_field="n_routed_experts",
+            moe_tp_fields=("intermediate_size", "moe_intermediate_size"),
+            top_k_field="num_experts_per_tok",
+        ),
     }
 )
 

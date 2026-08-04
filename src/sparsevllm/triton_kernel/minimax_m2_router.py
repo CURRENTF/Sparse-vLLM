@@ -2,44 +2,14 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
-import triton
-import triton.language as tl
+
+from sparsevllm.triton_kernel.moe_biased_sigmoid import (
+    topk_biased_sigmoid as _topk_biased_sigmoid,
+)
 
 
 _NUM_EXPERTS = 256
 _TOP_K = 8
-
-
-@triton.jit
-def _topk_biased_sigmoid_kernel(
-    routing_weights_ptr,
-    correction_bias_ptr,
-    ids_ptr,
-    stride_routing_weights_m,
-    stride_ids_m,
-):
-    row = tl.program_id(0)
-    offsets = tl.arange(0, 256)
-    routing_weights = tl.load(
-        routing_weights_ptr + row * stride_routing_weights_m + offsets
-    )
-    scores = routing_weights + tl.load(correction_bias_ptr + offsets)
-
-    # CUDA topk(sorted=False) writes values strictly above the kth threshold
-    # first, then fills the remaining slots with first-seen threshold ties.
-    selection_values = tl.where(scores == scores, scores, float("inf"))
-    threshold = tl.min(tl.topk(selection_values, 8), axis=0)
-    greater_mask = selection_values > threshold
-    equal_mask = selection_values == threshold
-    greater_rank = tl.cumsum(greater_mask.to(tl.int32), axis=0) - 1
-    equal_rank = tl.cumsum(equal_mask.to(tl.int32), axis=0) - 1
-    num_greater = tl.sum(greater_mask.to(tl.int32), axis=0)
-    selected_equal = equal_mask & (equal_rank < 8 - num_greater)
-    selected = greater_mask | selected_equal
-    output_slot = tl.where(greater_mask, greater_rank, num_greater + equal_rank)
-
-    ids_base = ids_ptr + row * stride_ids_m
-    tl.store(ids_base + output_slot, offsets, mask=selected)
 
 
 def _validate_router_inputs(
@@ -85,22 +55,12 @@ def topk_biased_sigmoid(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Route MiniMax M2.7 logits with its biased-sigmoid top-k rule."""
     _validate_router_inputs(router_logits, correction_bias, top_k)
-    num_tokens = int(router_logits.shape[0])
-    routing_weights = torch.sigmoid(router_logits)
-    ids = torch.empty(
-        (num_tokens, _TOP_K), dtype=torch.int64, device=router_logits.device
-    )
-    _topk_biased_sigmoid_kernel[(num_tokens,)](
-        routing_weights,
+    return _topk_biased_sigmoid(
+        router_logits,
         correction_bias,
-        ids,
-        routing_weights.stride(0),
-        ids.stride(0),
-        num_warps=2 if num_tokens <= 256 else 1,
+        top_k=top_k,
+        normalization_epsilon=0.0,
     )
-    weights = routing_weights.gather(1, ids)
-    weights = weights / weights.sum(dim=-1, keepdim=True)
-    return weights, ids
 
 
 def minimax_m2_router(

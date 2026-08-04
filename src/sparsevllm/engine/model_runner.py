@@ -45,6 +45,11 @@ except ImportError:
     Qwen3MoeForCausalLM = None
 
 try:
+    from sparsevllm.models.glm4_moe_lite import Glm4MoeLiteForCausalLM
+except ImportError:
+    Glm4MoeLiteForCausalLM = None
+
+try:
     from sparsevllm.models.minimax_m2 import MiniMaxM2ForCausalLM
 except ImportError:
     MiniMaxM2ForCausalLM = None
@@ -160,6 +165,19 @@ class ModelRunner:
             "decode_cuda_graph",
             bool(getattr(config, "decode_cuda_graph", False)),
         )
+        if config.model_spec.runtime_class_name == "Glm4MoeLiteForCausalLM":
+            setattr(hf_config, "sparsevllm_device", self.device)
+            setattr(
+                hf_config,
+                "sparsevllm_max_batch_size",
+                max(config.max_num_seqs_in_batch, config.max_decoding_seqs),
+            )
+            setattr(
+                hf_config,
+                "sparsevllm_mla_prefill_workspace_bytes",
+                config.mla_prefill_workspace_bytes,
+            )
+            setattr(hf_config, "sparsevllm_expect_mtp_weights", not config.tiny_random)
         
         self.model = _create_model(hf_config, config.model_spec)
         if config.tiny_random:
