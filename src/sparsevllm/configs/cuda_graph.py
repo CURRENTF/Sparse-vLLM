@@ -21,7 +21,8 @@ def _default_decode_cuda_graph_capture_sizes(max_decoding_seqs: int) -> list[int
     while size < max_decoding_seqs:
         sizes.append(size)
         size *= 2
-    sizes.append(size)
+    if not sizes or sizes[-1] != max_decoding_seqs:
+        sizes.append(max_decoding_seqs)
     return sizes
 
 

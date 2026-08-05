@@ -901,15 +901,22 @@ class PrefillPolicyConfigTest(unittest.TestCase):
                 decode_cuda_graph_capture_sampling=True,
             )
 
-    def test_decode_cuda_graph_auto_capture_sizes_pad_to_power_of_two(self):
-        cfg = self.make_config(
-            vllm_sparse_method="omnikv",
-            decode_cuda_graph=True,
-            max_decoding_seqs=6,
-        )
-        self.assertEqual(cfg.decode_cuda_graph_capture_sizes, [1, 2, 4, 8])
-        self.assertTrue(cfg.decode_graph)
-        self.assertEqual(cfg.decode_graph_capture_sizes, [1, 2, 4, 8])
+    def test_decode_cuda_graph_auto_capture_sizes_end_at_decode_limit(self):
+        for max_decoding_seqs, expected_sizes in (
+            (1, [1]),
+            (6, [1, 2, 4, 6]),
+            (8, [1, 2, 4, 8]),
+            (24, [1, 2, 4, 8, 16, 24]),
+        ):
+            with self.subTest(max_decoding_seqs=max_decoding_seqs):
+                cfg = self.make_config(
+                    vllm_sparse_method="omnikv",
+                    decode_cuda_graph=True,
+                    max_decoding_seqs=max_decoding_seqs,
+                )
+                self.assertEqual(cfg.decode_cuda_graph_capture_sizes, expected_sizes)
+                self.assertTrue(cfg.decode_graph)
+                self.assertEqual(cfg.decode_graph_capture_sizes, expected_sizes)
 
     def test_decode_graph_aliases_normalize_to_canonical_fields(self):
         cfg = self.make_config(
