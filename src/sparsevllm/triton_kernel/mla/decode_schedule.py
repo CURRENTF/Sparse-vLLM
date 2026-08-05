@@ -243,6 +243,7 @@ def validate_mla_decode_metadata(
     context_lens: torch.Tensor,
     *,
     cache_slot_count: int,
+    max_context_len: int | None = None,
 ) -> None:
     """Synchronously validate one decode view before per-layer reuse."""
 
@@ -274,6 +275,17 @@ def validate_mla_decode_metadata(
         )
     if cache_slot_count <= 0:
         raise ValueError("cache_slot_count must be positive")
+    context_capacity = (
+        int(active_slots.shape[1])
+        if max_context_len is None
+        else int(max_context_len)
+    )
+    if not 0 < context_capacity <= int(active_slots.shape[1]):
+        raise ValueError(
+            "MLA decode max_context_len must be within the active-slot width: "
+            f"max_context_len={context_capacity} "
+            f"active_slot_width={int(active_slots.shape[1])}."
+        )
 
     request_rows = request_indices.tolist()
     lengths = context_lens.tolist()
@@ -281,10 +293,10 @@ def validate_mla_decode_metadata(
     for batch_index, (request_row, length) in enumerate(
         zip(request_rows, lengths)
     ):
-        if length < 0 or length > active_slots.shape[1]:
+        if length < 0 or length > context_capacity:
             raise ValueError(
                 f"context_lens[{batch_index}]={length} is outside "
-                f"[0, {active_slots.shape[1]}]"
+                f"[0, {context_capacity}]"
             )
         if request_row < 0:
             if length != 0:
@@ -328,6 +340,8 @@ def run_mla_decode(
     workspace: MlaDecodeWorkspace,
     *,
     softmax_scale: float,
+    attn_score: torch.Tensor | None = None,
+    max_context_len: int | None = None,
     config: MlaDecodeLaunchConfig = DEFAULT_GLM_MLA_DECODE_CONFIG,
     validate_metadata: bool = True,
 ) -> torch.Tensor:
@@ -371,7 +385,14 @@ def run_mla_decode(
             request_indices,
             context_lens,
             cache_slot_count=latent_cache.shape[0],
+            max_context_len=max_context_len,
         )
+
+    # The 2D score path uses atomic_max across query-head tiles. Reset inside
+    # the captured execution so replay can never inherit a previous step's max.
+    # The same reset also keeps padded/tail positions explicit for 3D scores.
+    if attn_score is not None:
+        attn_score.fill_(-1.0e20)
 
     prepare_mla_decode_schedule(context_lens, workspace, config=config)
     decode_stage1(
@@ -385,6 +406,8 @@ def run_mla_decode(
         workspace.block_size,
         workspace.mid_output,
         workspace.mid_logsumexp,
+        attn_score=attn_score,
+        max_context_len=max_context_len,
         softmax_scale=softmax_scale,
         program_count=config.program_count,
         block_q_heads=config.block_q_heads,

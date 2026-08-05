@@ -21,6 +21,7 @@ from sparsevllm.utils.log import logger, log_level
 from sparsevllm.utils.profiler import profiler
 
 from .base import (
+    AttentionCacheWrite,
     CacheManager,
     ExplicitKVPayload,
     LayerBatchStates,
@@ -28,6 +29,7 @@ from .base import (
     SparseSelection,
 )
 from .raw_kv_offload import RawKVOffloadBuffer
+from .storage import ExplicitKVStorage, create_attention_cache_storage
 
 
 _INT32_BYTES = 4
@@ -93,6 +95,15 @@ def resolve_snapkv_cache_capacity(
 class SnapKVCacheManager(CacheManager):
     def __init__(self, config: Config, parallel_context: ParallelContext):
         super().__init__(config, parallel_context)
+        self.attention_cache_storage = (
+            create_attention_cache_storage(
+                config,
+                num_kv_heads=self.num_kv_heads,
+                head_dim=self.head_dim,
+            )
+            if config.pyramid_layer_ratios is None
+            else None
+        )
         self.pyramidkv_prefill_staging_num_slots = 0
         self.pyramidkv_prefill_staging_kv_cache = None
         self._pyramidkv_prefill_staging_active = False
@@ -381,15 +392,27 @@ class SnapKVCacheManager(CacheManager):
                 f"{config.num_kvcache_slots} tokens, "
                 f"row_slot_map_bytes={row_slot_map_bytes}."
             )
-            self.kv_cache = torch.empty(
-                2,
-                num_layers,
-                config.num_kvcache_slots,
-                self.num_kv_heads,
-                self.head_dim,
-                dtype=self.hf_config.torch_dtype,
+            storage = self.attention_cache_storage
+            if storage is None:
+                raise RuntimeError(
+                    "Uniform SnapKV requires an attention cache storage."
+                )
+            storage.allocate(
+                num_layers=num_layers,
+                num_slots=config.num_kvcache_slots,
                 device=self.device,
             )
+            self.kv_cache = (
+                storage.cache
+                if isinstance(storage, ExplicitKVStorage)
+                else None
+            )
+
+    def attention_cache_bytes_per_slot_per_layer(self) -> int:
+        storage = getattr(self, "attention_cache_storage", None)
+        if storage is None:
+            return super().attention_cache_bytes_per_slot_per_layer()
+        return int(storage.bytes_per_slot_per_layer())
 
     def get_layer_batch_states(self, layer_idx: int) -> LayerBatchStates:
         self.kv_layer_index(layer_idx)
@@ -403,6 +426,79 @@ class SnapKVCacheManager(CacheManager):
             return self.kv_cache[0, kv_idx], self.kv_cache[1, kv_idx]
         else:
             raise ValueError
+
+    def store_attention_payload(
+        self,
+        layer_idx: int,
+        payload: AttentionCacheWrite,
+    ) -> torch.Tensor:
+        storage = getattr(self, "attention_cache_storage", None)
+        if storage is None or isinstance(storage, ExplicitKVStorage):
+            return super().store_attention_payload(layer_idx, payload)
+        slot_mapping = self.layer_batch_states[layer_idx].slot_mapping
+        if slot_mapping is None:
+            raise RuntimeError(
+                f"Attention cache store requires slot_mapping at layer={layer_idx}."
+            )
+        storage.store(
+            self.kv_layer_index(layer_idx),
+            slot_mapping,
+            payload,
+        )
+        return slot_mapping
+
+    def get_layer_compute_payload(
+        self,
+        layer_idx: int,
+        active_slots: torch.Tensor,
+        req_indices: torch.Tensor,
+        context_lens: torch.Tensor,
+        selection: SparseSelection | None = None,
+    ):
+        storage = getattr(self, "attention_cache_storage", None)
+        if storage is None or isinstance(storage, ExplicitKVStorage):
+            return super().get_layer_compute_payload(
+                layer_idx,
+                active_slots,
+                req_indices,
+                context_lens,
+                selection,
+            )
+        return (
+            storage.layer_payload(self.kv_layer_index(layer_idx)),
+            active_slots,
+            req_indices,
+            context_lens,
+        )
+
+    def get_prefill_compute_payload(
+        self,
+        layer_idx: int,
+        k_current: torch.Tensor,
+        v_current: torch.Tensor,
+        selection: SparseSelection,
+        active_slots: torch.Tensor,
+        req_indices: torch.Tensor,
+        context_lens: torch.Tensor,
+    ):
+        storage = getattr(self, "attention_cache_storage", None)
+        if storage is None or isinstance(storage, ExplicitKVStorage):
+            return super().get_prefill_compute_payload(
+                layer_idx,
+                k_current,
+                v_current,
+                selection,
+                active_slots,
+                req_indices,
+                context_lens,
+            )
+        return self.get_layer_compute_payload(
+            layer_idx,
+            active_slots,
+            req_indices,
+            context_lens,
+            selection,
+        )
 
     def get_layer_store_view(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if self.has_prefill_staging_view(layer_idx):
@@ -2519,6 +2615,7 @@ class SnapKVCacheManager(CacheManager):
             state.max_context_len = real_max_context_len
             state.req_indices = req_indices
         self._decode_static_state_binding_key = None
+        self.validate_decode_cuda_graph_slot_mappings()
         return input_ids, positions, None
 
     def _allocate_decode_batch_all_layers(
@@ -2707,6 +2804,7 @@ class SnapKVCacheManager(CacheManager):
                 layers_req_indices,
                 max_context_lens,
             )
+            self.validate_decode_cuda_graph_slot_mappings()
 
             first_layer = int(self.kv_transformer_layer_indices()[0])
             slot_mapping.copy_(layers_slot_mapping[first_layer])

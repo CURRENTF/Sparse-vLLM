@@ -1505,6 +1505,6 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
             self.layer_batch_state.context_lens = context_lens
             self.layer_batch_state.max_context_len = int(real_context_lens.max()) if real_batch_size > 0 else 0
             self.layer_batch_state.req_indices = req_indices
-            self._validate_attention_slot_mapping(slot_mapping)
+            self.validate_decode_cuda_graph_slot_mappings()
 
             return input_ids, positions, None

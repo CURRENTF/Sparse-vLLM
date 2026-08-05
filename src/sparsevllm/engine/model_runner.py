@@ -783,6 +783,17 @@ class ModelRunner:
         )
 
     def debug_sparse_state_summary(self) -> dict[str, object]:
+        def parallel_group_summary(group) -> dict[str, object] | None:
+            if group is None:
+                return None
+            return {
+                "rank": int(group.rank),
+                "size": int(group.size),
+                "ranks": [int(rank) for rank in group.ranks],
+            }
+
+        parallel_context = self.parallel_context
+        config = getattr(self, "config", None)
         moe_synced = {}
         moe_local = {}
         model = getattr(getattr(self, "model", None), "model", None)
@@ -819,10 +830,73 @@ class ModelRunner:
             state["mixed_prefix_cache"] = (
                 prefix_cache_coordinator.debug_state_summary()
             )
+        graph_runner = getattr(self, "decode_cuda_graph_runner", None)
+        graph_key = getattr(graph_runner, "last_state_key", None)
+        graph_summary = {
+            "enabled": bool(
+                getattr(config, "decode_cuda_graph", False)
+            ),
+            "capture_count": int(
+                getattr(graph_runner, "capture_count", 0)
+            ),
+            "replay_count": int(
+                getattr(graph_runner, "replay_count", 0)
+            ),
+            "eager_static_count": int(
+                getattr(graph_runner, "eager_static_count", 0)
+            ),
+            "force_eager_count": int(
+                getattr(graph_runner, "force_eager_count", 0)
+            ),
+            "cached_graph_count": len(
+                getattr(graph_runner, "_graphs", {})
+            ),
+            "last_state_key": (
+                {
+                    "method": str(graph_key.method or ""),
+                    "batch_size": int(graph_key.batch_size),
+                    "context_capacity": int(graph_key.context_capacity),
+                    "is_long_text": bool(graph_key.is_long_text),
+                    "capture_sampling": bool(graph_key.capture_sampling),
+                }
+                if graph_key is not None
+                else None
+            ),
+        }
         return {
             "world_rank": self.parallel_context.world_rank,
             "ep_rank": self.parallel_context.ep_rank,
+            "parallel": {
+                "configured": {
+                    "tensor_parallel_size": int(
+                        getattr(config, "tensor_parallel_size", parallel_context.tp_size)
+                    ),
+                    "expert_parallel_size": int(
+                        getattr(config, "expert_parallel_size", parallel_context.ep_size)
+                    ),
+                    "data_parallel_size": int(
+                        getattr(config, "data_parallel_size", parallel_context.dp_size)
+                    ),
+                    "world_size": int(
+                        getattr(config, "world_size", parallel_context.world_size)
+                    ),
+                },
+                "effective": {
+                    "world": parallel_group_summary(parallel_context.world),
+                    "attention": parallel_group_summary(parallel_context.attention),
+                    "expert": parallel_group_summary(parallel_context.expert),
+                    "moe_tensor": parallel_group_summary(
+                        parallel_context.moe_tensor or parallel_context.tensor
+                    ),
+                    "data": parallel_group_summary(parallel_context.data),
+                },
+                "attention_replicated_for_ep": bool(
+                    parallel_context.ep_size > 1
+                    and parallel_context.attention_tp_size == 1
+                ),
+            },
             "state": state,
+            "decode_cuda_graph": graph_summary,
             "last_logits": (
                 _debug_tensor_summary(self.debug_last_logits)
                 if hasattr(self, "debug_last_logits")
@@ -833,12 +907,14 @@ class ModelRunner:
         }
 
     def debug_last_logits_cpu(self) -> torch.Tensor | None:
+        if self.rank != 0:
+            return None
         logits = getattr(self, "debug_last_logits", None)
         if logits is None:
             raise RuntimeError(
                 "No debug logits are available. Set SPARSEVLLM_DEBUG_RUNTIME=1 before engine startup."
             )
-        return logits.detach().cpu() if self.rank == 0 else None
+        return logits.detach().cpu()
 
     def debug_hidden_states_cpu(self) -> dict[int, torch.Tensor] | None:
         model = getattr(getattr(self, "model", None), "model", None)
@@ -861,6 +937,8 @@ class ModelRunner:
         snapshots = {}
         for layer_idx, layer in enumerate(layers):
             block = getattr(layer, "mlp", None)
+            if block is None or not hasattr(block, "experts"):
+                continue
             required = {
                 "input": getattr(block, "debug_last_input", None),
                 "topk_ids": getattr(block, "debug_last_topk_ids", None),
@@ -922,18 +1000,29 @@ class ModelRunner:
 
     def debug_replica_consistency(self) -> dict[str, object] | None:
         logits = getattr(self, "debug_last_logits", None)
-        if logits is None:
-            return None
-        logits_max_abs, logits_tolerance_ratio = self._debug_float_error_from_world_rank_zero(
-            logits,
-            atol=0.05,
-            rtol=0.05,
-        )
-        result: dict[str, object] = {
-            "last_logits_max_abs": logits_max_abs,
-            "last_logits_tolerance_ratio": logits_tolerance_ratio,
-            "moe_layers": {},
-        }
+        if self.parallel_context.attention_tp_size > 1:
+            result: dict[str, object] = {
+                "last_logits_max_abs": None,
+                "last_logits_tolerance_ratio": None,
+                "last_logits_comparison": "not_applicable_tp_vocab_sharded",
+                "moe_layers": {},
+            }
+        else:
+            if logits is None:
+                return None
+            logits_max_abs, logits_tolerance_ratio = (
+                self._debug_float_error_from_world_rank_zero(
+                    logits,
+                    atol=0.05,
+                    rtol=0.05,
+                )
+            )
+            result = {
+                "last_logits_max_abs": logits_max_abs,
+                "last_logits_tolerance_ratio": logits_tolerance_ratio,
+                "last_logits_comparison": "compared",
+                "moe_layers": {},
+            }
         model = getattr(getattr(self, "model", None), "model", None)
         layers = getattr(model, "layers", ())
         for layer_idx in sorted({0, len(layers) - 1} if layers else set()):
@@ -1186,9 +1275,18 @@ class ModelRunner:
         _stage = 'prefill' if is_prefill else 'decode'
         with profiler.record(f"model_run_model_{_stage}"):
             logits = self.model.compute_logits(self.model(input_ids, positions))
-        if os.getenv("SPARSEVLLM_DEBUG_RUNTIME", "0") == "1":
-            self.debug_last_logits = logits.detach().clone()
+        self._record_debug_logits(logits)
         return logits
+
+    def _record_debug_logits(self, logits: torch.Tensor | None) -> None:
+        if (
+            os.getenv("SPARSEVLLM_DEBUG_RUNTIME", "0") == "1"
+            and isinstance(logits, torch.Tensor)
+        ):
+            # A clone captured inside run_model keeps the capture-time value on
+            # CUDA Graph replay.  Refresh outside replay so debug/validation
+            # observes the business step that actually completed.
+            self.debug_last_logits = logits.detach().clone()
 
     def run_logits_for_compare(self, seqs: list[Sequence], is_prefill: bool) -> torch.Tensor | None:
         """Debug logits-alignment path: execute one step and return rank-0 logits without sampling."""
@@ -1268,6 +1366,7 @@ class ModelRunner:
                     else:
                         logits = self.decode_cuda_graph_runner.run_eager_static(seqs)
                         graph_token_ids = None
+                    self._record_debug_logits(logits)
                     if self.rank != 0:
                         self._post_sparse_forward(seqs, is_prefill)
                         return None, None

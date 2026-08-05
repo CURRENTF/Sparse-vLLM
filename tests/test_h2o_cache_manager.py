@@ -17,6 +17,7 @@ from sparsevllm.engine.cache_manager.base import (
 )
 from sparsevllm.engine.cache_manager.h2o import H2OCacheManager
 from sparsevllm.engine.cache_manager.snapkv import SnapKVCacheManager
+from sparsevllm.engine.cache_manager.storage import MlaLatentStorage
 from sparsevllm.engine.scheduler import Scheduler
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.engine.sparse_controller import SparseController
@@ -800,6 +801,45 @@ def test_h2o_final_prefill_dense_batch_preserves_logical_kv_alignment(
     ]
     assert len(workspace_entries) == 1
     assert workspace_entries[0]["nbytes"] == workspace.untyped_storage().nbytes()
+
+
+def test_h2o_final_prefill_compacts_mla_latent_and_rope_slots():
+    manager = _manager_with_rows([6], decode_budget=4, prefill_budget=8)
+    _set_layer_row_slots(manager, 0, [[9, 2, 7, 1, 6, 4]])
+    manager._h2o_scores[(0, 0)] = torch.tensor(
+        [1.0, 9.0, 2.0, 8.0, 0.0, 0.0]
+    )
+    storage = MlaLatentStorage(
+        kv_lora_rank=512,
+        rope_dim=64,
+        dtype=torch.bfloat16,
+    )
+    storage.allocate(num_layers=1, num_slots=64, device=torch.device("cpu"))
+    manager.attention_cache_storage = storage
+    manager.kv_cache = None
+    assert storage.latent_cache is not None
+    assert storage.rope_cache is not None
+    for slot in [9, 2, 7, 1, 6, 4]:
+        storage.latent_cache[0, slot].fill_(slot)
+        storage.rope_cache[0, slot].fill_(slot + 100)
+    seq = _seq(0, 6, prefilled=0, chunk=6)
+
+    manager.evict_after_prefill([seq])
+
+    destination_slots = manager.buffer_req_to_token_slots[0][0, :4].long()
+    assert destination_slots.tolist() == [1, 2, 4, 6]
+    payload = storage.layer_payload(0)
+    expected_sources = torch.tensor([2, 1, 6, 4], dtype=torch.bfloat16)
+    torch.testing.assert_close(
+        payload.latent_cache[destination_slots, 0, 0],
+        expected_sources,
+    )
+    torch.testing.assert_close(
+        payload.rope_cache[destination_slots, 0, 0],
+        expected_sources + 100,
+    )
+    assert manager._h2o_scores[(0, 0)].tolist() == [9.0, 8.0, 0.0, 0.0]
+    assert manager._h2o_final_prefill_workspace is None
 
 
 def test_h2o_intermediate_prefill_does_not_move_kv_payloads():

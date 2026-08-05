@@ -342,6 +342,212 @@ def test_mla_decode_matches_torch_matrix(
         )
 
 
+@pytest.mark.parametrize("reduce_heads", [False, True])
+@CUDA_REQUIRED
+def test_mla_decode_writes_raw_attention_scores(reduce_heads: bool) -> None:
+    torch.manual_seed(211)
+    case = _make_decode_case(batch_size=2, head_count=20, max_context_len=33)
+    q_latent, q_rope, latent_cache, rope_cache = case[:4]
+    active_slots, request_indices, context_lens = case[4:]
+    output = torch.empty_like(q_latent)
+    score_shape = (
+        (2, active_slots.shape[1])
+        if reduce_heads
+        else (2, 20, active_slots.shape[1])
+    )
+    scores = torch.full(
+        score_shape,
+        -1.0e20,
+        dtype=torch.float32,
+        device="cuda",
+    )
+    workspace = allocate_mla_decode_workspace(
+        batch_size=2,
+        head_count=20,
+        device="cuda",
+    )
+
+    run_mla_decode(
+        q_latent,
+        q_rope,
+        latent_cache,
+        rope_cache,
+        active_slots,
+        request_indices,
+        context_lens,
+        output,
+        workspace,
+        softmax_scale=GLM_MLA_SOFTMAX_SCALE,
+        attn_score=scores,
+    )
+    torch.cuda.synchronize()
+
+    for batch_idx in range(2):
+        length = int(context_lens[batch_idx].item())
+        request_row = int(request_indices[batch_idx].item())
+        slots = active_slots[request_row, :length].long()
+        expected = torch.matmul(
+            q_latent[batch_idx].float(), latent_cache[slots, 0].float().T
+        ) + torch.matmul(
+            q_rope[batch_idx].float(), rope_cache[slots, 0].float().T
+        )
+        actual = scores[batch_idx, :length] if reduce_heads else scores[batch_idx, :, :length]
+        if reduce_heads:
+            expected = expected.max(dim=0).values
+        torch.testing.assert_close(actual, expected, rtol=3e-2, atol=3e-2)
+        assert torch.all(scores[batch_idx, ..., length:] == -1.0e20)
+
+
+@CUDA_REQUIRED
+def test_mla_decode_score_capacity_can_be_smaller_than_slot_table() -> None:
+    torch.manual_seed(219)
+    case = _make_decode_case(batch_size=1, head_count=20, max_context_len=33)
+    q_latent, q_rope, latent_cache, rope_cache = case[:4]
+    active_slots, request_indices, _context_lens = case[4:]
+    context_lens = torch.tensor([17], dtype=torch.int32, device="cuda")
+    output = torch.empty_like(q_latent)
+    scores = torch.empty((1, 17), dtype=torch.float32, device="cuda")
+    workspace = allocate_mla_decode_workspace(
+        batch_size=1,
+        head_count=20,
+        device="cuda",
+    )
+
+    run_mla_decode(
+        q_latent,
+        q_rope,
+        latent_cache,
+        rope_cache,
+        active_slots,
+        request_indices,
+        context_lens,
+        output,
+        workspace,
+        softmax_scale=GLM_MLA_SOFTMAX_SCALE,
+        attn_score=scores,
+        max_context_len=17,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.isfinite(output).all()
+    assert torch.isfinite(scores).all()
+
+
+@CUDA_REQUIRED
+def test_mla_reduced_scores_reset_before_each_decode_step() -> None:
+    torch.manual_seed(223)
+    case = _make_decode_case(batch_size=1, head_count=20, max_context_len=33)
+    q_latent, q_rope, latent_cache, rope_cache = case[:4]
+    active_slots, request_indices, context_lens = case[4:]
+    output = torch.empty_like(q_latent)
+    scores = torch.empty(
+        (1, active_slots.shape[1]),
+        dtype=torch.float32,
+        device="cuda",
+    )
+    workspace = allocate_mla_decode_workspace(
+        batch_size=1,
+        head_count=20,
+        device="cuda",
+    )
+
+    run_mla_decode(
+        q_latent,
+        q_rope,
+        latent_cache,
+        rope_cache,
+        active_slots,
+        request_indices,
+        context_lens,
+        output,
+        workspace,
+        softmax_scale=GLM_MLA_SOFTMAX_SCALE,
+        attn_score=scores,
+    )
+    first_scores = scores.clone()
+    run_mla_decode(
+        torch.zeros_like(q_latent),
+        torch.zeros_like(q_rope),
+        latent_cache,
+        rope_cache,
+        active_slots,
+        request_indices,
+        context_lens,
+        output,
+        workspace,
+        softmax_scale=GLM_MLA_SOFTMAX_SCALE,
+        attn_score=scores,
+    )
+    torch.cuda.synchronize()
+
+    length = int(context_lens[0].item())
+    assert torch.any(first_scores[0, :length] != 0)
+    torch.testing.assert_close(
+        scores[0, :length],
+        torch.zeros_like(scores[0, :length]),
+    )
+    assert torch.all(scores[0, length:] == -1.0e20)
+
+
+@CUDA_REQUIRED
+def test_mla_decode_cuda_graph_replay_resets_reduced_scores() -> None:
+    torch.manual_seed(227)
+    case = _make_decode_case(batch_size=2, head_count=20, max_context_len=33)
+    q_latent, q_rope, latent_cache, rope_cache = case[:4]
+    active_slots, request_indices, context_lens = case[4:]
+    output = torch.empty_like(q_latent)
+    scores = torch.empty(
+        (2, active_slots.shape[1]),
+        dtype=torch.float32,
+        device="cuda",
+    )
+    workspace = allocate_mla_decode_workspace(
+        batch_size=2,
+        head_count=20,
+        device="cuda",
+    )
+
+    def run_decode() -> None:
+        run_mla_decode(
+            q_latent,
+            q_rope,
+            latent_cache,
+            rope_cache,
+            active_slots,
+            request_indices,
+            context_lens,
+            output,
+            workspace,
+            softmax_scale=GLM_MLA_SOFTMAX_SCALE,
+            attn_score=scores,
+            validate_metadata=False,
+        )
+
+    run_decode()
+    run_decode()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run_decode()
+
+    q_latent.zero_()
+    q_rope.zero_()
+    scores.fill_(12345.0)
+    graph.replay()
+    graph_output = output.clone()
+    graph_scores = scores.clone()
+    run_decode()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(graph_output, output, rtol=0, atol=0)
+    torch.testing.assert_close(graph_scores, scores, rtol=0, atol=0)
+    for batch_idx, length in enumerate(context_lens.tolist()):
+        torch.testing.assert_close(
+            graph_scores[batch_idx, :length],
+            torch.zeros_like(graph_scores[batch_idx, :length]),
+        )
+        assert torch.all(graph_scores[batch_idx, length:] == -1.0e20)
+
 @CUDA_REQUIRED
 def test_mla_decode_zeroes_padded_rows() -> None:
     torch.manual_seed(19)

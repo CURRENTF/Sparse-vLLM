@@ -31,12 +31,26 @@ class AttentionCacheStorage(Protocol):
 
     def validate_slot_mapping(self, slot_mapping: torch.Tensor) -> None: ...
 
+    def validate_slot_mappings(
+        self,
+        slot_mappings: tuple[torch.Tensor, ...],
+    ) -> None: ...
+
     def store(
         self,
         layer_idx: int,
         slot_mapping: torch.Tensor,
         payload: AttentionCacheWrite,
     ) -> None: ...
+
+    def copy_slots(
+        self,
+        layer_idx: int,
+        source_slots: torch.Tensor,
+        destination_slots: torch.Tensor,
+    ) -> None: ...
+
+    def slot_capacity(self) -> int: ...
 
     def bytes_per_slot_per_layer(self) -> int: ...
 

@@ -39,8 +39,9 @@ class MlaLatentStorage:
             )
         self.latent_cache: torch.Tensor | None = None
         self.rope_cache: torch.Tensor | None = None
-        self._validated_slot_mapping_key: tuple[str, int, int] | None = None
-        self._validated_store_calls_remaining = 0
+        self._validated_store_calls_remaining: dict[
+            tuple[str, int, int], int
+        ] = {}
 
     def allocate(
         self,
@@ -72,8 +73,7 @@ class MlaLatentStorage:
             dtype=self.dtype,
             device=device,
         )
-        self._validated_slot_mapping_key = None
-        self._validated_store_calls_remaining = 0
+        self._validated_store_calls_remaining.clear()
 
     def _require_caches(self) -> tuple[torch.Tensor, torch.Tensor]:
         if self.latent_cache is None or self.rope_cache is None:
@@ -100,7 +100,7 @@ class MlaLatentStorage:
             int(slot_mapping.numel()),
         )
 
-    def validate_slot_mapping(self, slot_mapping: torch.Tensor) -> None:
+    def _validate_slot_mapping(self, slot_mapping: torch.Tensor) -> None:
         latent_cache, _ = self._require_caches()
         if slot_mapping.ndim != 1:
             raise ValueError(
@@ -119,8 +119,28 @@ class MlaLatentStorage:
             slot_mapping,
             cache_slot_count=int(latent_cache.shape[1]),
         )
-        self._validated_slot_mapping_key = self._slot_mapping_key(slot_mapping)
-        self._validated_store_calls_remaining = int(latent_cache.shape[0])
+
+    def validate_slot_mappings(
+        self,
+        slot_mappings: tuple[torch.Tensor, ...],
+    ) -> None:
+        if not slot_mappings:
+            raise ValueError("MLA slot mapping validation requires at least one layer.")
+        remaining: dict[tuple[str, int, int], int] = {}
+        validated: set[tuple[str, int, int]] = set()
+        for slot_mapping in slot_mappings:
+            key = self._slot_mapping_key(slot_mapping)
+            if key not in validated:
+                self._validate_slot_mapping(slot_mapping)
+                validated.add(key)
+            remaining[key] = remaining.get(key, 0) + 1
+        self._validated_store_calls_remaining = remaining
+
+    def validate_slot_mapping(self, slot_mapping: torch.Tensor) -> None:
+        latent_cache, _ = self._require_caches()
+        self.validate_slot_mappings(
+            (slot_mapping,) * int(latent_cache.shape[0])
+        )
 
     def store(
         self,
@@ -135,10 +155,11 @@ class MlaLatentStorage:
             )
         destination = self.layer_payload(layer_idx)
         slot_mapping_key = self._slot_mapping_key(slot_mapping)
-        use_prevalidated_mapping = (
-            slot_mapping_key == self._validated_slot_mapping_key
-            and self._validated_store_calls_remaining > 0
+        remaining = self._validated_store_calls_remaining.get(
+            slot_mapping_key,
+            0,
         )
+        use_prevalidated_mapping = remaining > 0
         copy_latent_to_cache(
             payload.latent,
             payload.rope,
@@ -148,13 +169,70 @@ class MlaLatentStorage:
             validate_slots=not use_prevalidated_mapping,
         )
         if use_prevalidated_mapping:
-            self._validated_store_calls_remaining -= 1
-            if self._validated_store_calls_remaining == 0:
-                self._validated_slot_mapping_key = None
+            if remaining == 1:
+                del self._validated_store_calls_remaining[slot_mapping_key]
+            else:
+                self._validated_store_calls_remaining[slot_mapping_key] = (
+                    remaining - 1
+                )
 
     def bytes_per_slot_per_layer(self) -> int:
         element_size = torch.tensor([], dtype=self.dtype).element_size()
         return int((self.kv_lora_rank + self.rope_dim) * element_size)
+
+    def slot_capacity(self) -> int:
+        latent_cache, _ = self._require_caches()
+        return int(latent_cache.shape[1])
+
+    @torch.no_grad()
+    def copy_slots(
+        self,
+        layer_idx: int,
+        source_slots: torch.Tensor,
+        destination_slots: torch.Tensor,
+    ) -> None:
+        payload = self.layer_payload(layer_idx)
+        source_slots = source_slots.to(
+            device=payload.latent_cache.device,
+            dtype=torch.long,
+        ).reshape(-1)
+        destination_slots = destination_slots.to(
+            device=payload.latent_cache.device,
+            dtype=torch.long,
+        ).reshape(-1)
+        if source_slots.shape != destination_slots.shape:
+            raise ValueError(
+                "MLA latent slot copy requires equal source/destination shapes, "
+                f"got {tuple(source_slots.shape)} and "
+                f"{tuple(destination_slots.shape)}."
+            )
+        if source_slots.numel() == 0:
+            return
+        slot_count = int(payload.latent_cache.shape[0])
+        in_bounds = (
+            (source_slots >= 0)
+            & (source_slots < slot_count)
+            & (destination_slots >= 0)
+            & (destination_slots < slot_count)
+        ).all()
+        if in_bounds.is_cuda:
+            torch._assert_async(in_bounds)
+        elif not bool(in_bounds.item()):
+            raise ValueError(
+                f"MLA latent slot copy indices must be in [0, {slot_count})."
+            )
+        latent_selected = payload.latent_cache.index_select(0, source_slots)
+        rope_selected = payload.rope_cache.index_select(0, source_slots)
+        payload.latent_cache.index_copy_(
+            0,
+            destination_slots,
+            latent_selected,
+        )
+        payload.rope_cache.index_copy_(
+            0,
+            destination_slots,
+            rope_selected,
+        )
 
     def accounting_tensors(self) -> tuple[torch.Tensor, ...]:
         return self._require_caches()

@@ -5,7 +5,7 @@ import hashlib
 from collections import deque
 from dataclasses import dataclass, fields, is_dataclass
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import Any, Callable
 
 import torch
 import torch.distributed as dist
@@ -20,6 +20,7 @@ from sparsevllm.engine.prefill import (
 from sparsevllm.method_registry import SUPPORTED_SPARSE_METHODS, normalize_sparse_method
 from sparsevllm.triton_kernel.store_kvcache import store_kvcache
 import sparsevllm.platforms as platforms
+from sparsevllm.configs.model import resolve_attention_qk_head_dim
 from sparsevllm.utils.log import logger, log_level
 
 
@@ -209,6 +210,17 @@ class PrefillComputeView:
     payload: AttentionPayload
 
 
+@dataclass(frozen=True)
+class AttentionKeyComputeView:
+    """Physical payload plus the slots whose actual attention keys are needed."""
+
+    active_slots: torch.Tensor
+    payload: AttentionPayload
+
+
+AttentionKeyMaterializer = Callable[[AttentionKeyComputeView], torch.Tensor]
+
+
 class CacheManager(ABC):
     """每个 Rank 只有一个 CacheManager，内部管理所有层的物理槽位和 KV Cache。"""
 
@@ -233,11 +245,7 @@ class CacheManager(ABC):
         self.num_kv_layers = int(self.runtime_layout.num_kv_layers)
 
         self.num_kv_heads = self.hf_config.num_key_value_heads // self.tp_size
-        self.head_dim = getattr(
-            self.hf_config,
-            "head_dim",
-            self.hf_config.hidden_size // self.hf_config.num_attention_heads,
-        )
+        self.head_dim = resolve_attention_qk_head_dim(self.hf_config)
 
         self.max_model_len = config.max_model_len
         resident_buffer_rows = int(config.max_num_seqs_in_gpu)
@@ -264,6 +272,7 @@ class CacheManager(ABC):
         self.kv_cache = None
         self._decode_static_max_context_len: int | None = None
         self._raw_offload_prefill_phases: dict[int, bool] = {}
+        self._attention_key_materializers: dict[int, AttentionKeyMaterializer] = {}
 
     def synchronize_prefix_cache_delete_plan(
         self,
@@ -708,6 +717,108 @@ class CacheManager(ABC):
             context_lens,
         )
 
+    def register_attention_key_materializer(
+        self,
+        layer_idx: int,
+        materializer: AttentionKeyMaterializer,
+    ) -> None:
+        """Bind a model/operator hook that reconstructs actual keys from a layout."""
+
+        layer_idx = int(layer_idx)
+        self.kv_layer_index(layer_idx)
+        if not callable(materializer):
+            raise TypeError(
+                "Attention key materializer must be callable, got "
+                f"{type(materializer).__name__}."
+            )
+        registry = getattr(self, "_attention_key_materializers", None)
+        if registry is None:
+            registry = {}
+            self._attention_key_materializers = registry
+        existing = registry.get(layer_idx)
+        if existing is not None and existing != materializer:
+            raise RuntimeError(
+                "Attention key materializer is already bound for "
+                f"layer={layer_idx}."
+            )
+        registry[layer_idx] = materializer
+
+    def has_attention_key_materializer(self, layer_idx: int) -> bool:
+        registry = getattr(self, "_attention_key_materializers", {})
+        return int(layer_idx) in registry
+
+    def build_attention_key_compute_view(
+        self,
+        layer_idx: int,
+        active_slots: torch.Tensor,
+    ) -> AttentionKeyComputeView:
+        """Build a tagged view without assuming an explicit or latent layout."""
+
+        layer_idx = int(layer_idx)
+        kv_idx = self.kv_layer_index(layer_idx)
+        storage = getattr(self, "attention_cache_storage", None)
+        if storage is None:
+            k_cache, v_cache = self.get_layer_kv_cache(layer_idx)
+            payload: AttentionPayload = ExplicitKVPayload(
+                k_cache=k_cache,
+                v_cache=v_cache,
+            )
+        else:
+            payload = storage.layer_payload(kv_idx)
+        return AttentionKeyComputeView(
+            active_slots=active_slots,
+            payload=payload,
+        )
+
+    @torch.no_grad()
+    def materialize_attention_keys(
+        self,
+        layer_idx: int,
+        active_slots: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return the actual post-RoPE per-head keys for arbitrary cache slots."""
+
+        view = self.build_attention_key_compute_view(layer_idx, active_slots)
+        slots = view.active_slots
+        if slots.ndim == 0:
+            raise ValueError("Attention key slots must have at least one dimension.")
+        if slots.dtype not in (torch.int32, torch.int64):
+            raise TypeError(
+                "Attention key slots must use int32 or int64, got "
+                f"{slots.dtype}."
+            )
+
+        if isinstance(view.payload, ExplicitKVPayload):
+            k_cache = view.payload.k_cache
+            flat_slots = slots.to(device=k_cache.device, dtype=torch.long).reshape(-1)
+            keys = k_cache.index_select(0, flat_slots).view(
+                *slots.shape,
+                *k_cache.shape[1:],
+            )
+        else:
+            registry = getattr(self, "_attention_key_materializers", {})
+            materializer = registry.get(int(layer_idx))
+            if materializer is None:
+                raise RuntimeError(
+                    "The attention cache layout requires an actual-key "
+                    f"materializer at layer={int(layer_idx)}."
+                )
+            keys = materializer(view)
+
+        expected_ndim = int(slots.ndim) + 2
+        if keys.ndim != expected_ndim or tuple(keys.shape[: slots.ndim]) != tuple(slots.shape):
+            raise RuntimeError(
+                "Attention key materializer returned an invalid shape: "
+                f"slots={tuple(slots.shape)} keys={tuple(keys.shape)}; expected "
+                "the slot shape followed by [heads, head_dim]."
+            )
+        if keys.device != slots.device:
+            raise RuntimeError(
+                "Materialized attention keys must share the slot device: "
+                f"slots={slots.device} keys={keys.device}."
+            )
+        return keys
+
     def get_prefill_compute_view(
         self,
         layer_idx: int,
@@ -886,6 +997,31 @@ class CacheManager(ABC):
     def decode_cuda_graph_keepalive_tensors(self) -> list[torch.Tensor]:
         """Cache-manager-owned tensors captured by decode CUDA graphs."""
         return []
+
+    def validate_decode_cuda_graph_slot_mappings(self) -> None:
+        """Validate every layer's static decode mapping as one store scope.
+
+        Static preparation calls this for every decode step. Graph capture then
+        calls it again after its eager warmup because a storage backend may
+        consume the one-forward prevalidation during that warmup. Sparse
+        methods may bind a different stable mapping tensor per layer, so the
+        storage is given the exact layer-ordered set instead of only the
+        runner's common metadata buffer.
+        """
+        storage = getattr(self, "attention_cache_storage", None)
+        if storage is None:
+            return
+        slot_mappings: list[torch.Tensor] = []
+        for layer_idx in self.kv_transformer_layer_indices():
+            state = self.get_layer_batch_states(layer_idx)
+            slot_mapping = state.slot_mapping
+            if slot_mapping is None:
+                raise RuntimeError(
+                    "Decode CUDA graph capture requires a slot mapping for "
+                    f"layer={layer_idx}."
+                )
+            slot_mappings.append(slot_mapping)
+        storage.validate_slot_mappings(tuple(slot_mappings))
 
     def decode_cuda_graph_max_cached_graphs(self) -> int | None:
         """Optional bound for captured decode graph states.
@@ -1426,9 +1562,7 @@ class CacheManager(ABC):
                     f"heads={global_heads} tp={attention_tp_size}."
                 )
             local_heads = global_heads // attention_tp_size
-            qk_head_dim = int(hf_config.qk_nope_head_dim) + int(
-                hf_config.qk_rope_head_dim
-            )
+            qk_head_dim = resolve_attention_qk_head_dim(hf_config)
             value_head_dim = int(hf_config.v_head_dim)
             values_per_token = local_heads * (qk_head_dim + value_head_dim)
         else:

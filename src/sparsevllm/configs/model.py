@@ -9,7 +9,6 @@ import torch
 from transformers import AutoConfig
 
 from sparsevllm.method_registry import (
-    normalize_sparse_method,
     validate_model_runtime_compatibility,
     validate_sparse_method_assets,
 )
@@ -23,6 +22,30 @@ from sparsevllm.utils.log import logger, log_once
 
 def _config_to_namespace(config: dict[str, Any]) -> SimpleNamespace:
     return SimpleNamespace(**config)
+
+
+def resolve_attention_qk_head_dim(hf_config: Any) -> int:
+    qk_nope_head_dim = config_get(hf_config, "qk_nope_head_dim", None)
+    qk_rope_head_dim = config_get(hf_config, "qk_rope_head_dim", None)
+    if qk_nope_head_dim is not None and qk_rope_head_dim is not None:
+        head_dim = int(qk_nope_head_dim) + int(qk_rope_head_dim)
+        if head_dim <= 0:
+            raise ValueError(f"Attention QK head dimension must be positive, got {head_dim}.")
+        return head_dim
+    head_dim = config_get(hf_config, "head_dim", None)
+    if head_dim is not None:
+        head_dim = int(head_dim)
+        if head_dim <= 0:
+            raise ValueError(f"Attention QK head dimension must be positive, got {head_dim}.")
+        return head_dim
+    hidden_size = int(config_get(hf_config, "hidden_size", 0) or 0)
+    num_heads = int(config_get(hf_config, "num_attention_heads", 0) or 0)
+    if hidden_size <= 0 or num_heads <= 0 or hidden_size % num_heads:
+        raise ValueError(
+            "Attention QK head dimension requires valid head_dim or divisible "
+            "hidden_size/num_attention_heads."
+        )
+    return hidden_size // num_heads
 
 
 def _load_model_config(model_path: str) -> Any:
@@ -70,17 +93,9 @@ def _resolve_attention_cache_layout(config, model_type: str) -> None:
     )
     if config.attention_cache_layout == "explicit_kv":
         return
-    if normalize_sparse_method(config.vllm_sparse_method):
+    if config.enable_prefix_cache_offload:
         raise NotImplementedError(
-            "GLM-4.7-Flash latent MLA supports only vanilla attention."
-        )
-    if config.enable_prefix_caching or config.enable_prefix_cache_offload:
-        raise NotImplementedError(
-            "GLM-4.7-Flash latent MLA does not support prefix caching or offload."
-        )
-    if config.decode_cuda_graph or not config.enforce_eager:
-        raise NotImplementedError(
-            "GLM-4.7-Flash latent MLA requires eager execution."
+            "GLM-4.7-Flash latent MLA does not support prefix cache offload."
         )
     if config.quantization_config.enabled:
         raise NotImplementedError(
@@ -90,13 +105,23 @@ def _resolve_attention_cache_layout(config, model_type: str) -> None:
         raise NotImplementedError(
             "GLM-4.7-Flash latent MLA requires BF16 checkpoints."
         )
-    if (
-        int(config_get(config.hf_config, "kv_lora_rank", 0)) != 512
-        or int(config_get(config.hf_config, "qk_rope_head_dim", 0)) != 64
-    ):
+    expected = {
+        "num_attention_heads": 20,
+        "q_lora_rank": 768,
+        "kv_lora_rank": 512,
+        "qk_nope_head_dim": 192,
+        "qk_rope_head_dim": 64,
+        "v_head_dim": 256,
+    }
+    invalid = {
+        field: config_get(config.hf_config, field, None)
+        for field, value in expected.items()
+        if config_get(config.hf_config, field, None) != value
+    }
+    if invalid:
+        field, actual = next(iter(invalid.items()))
         raise NotImplementedError(
-            "GLM-4.7-Flash latent MLA requires kv_lora_rank=512 and "
-            "qk_rope_head_dim=64."
+            f"GLM-4.7-Flash latent MLA requires {field}={expected[field]}, got {actual}."
         )
 
 

@@ -30,6 +30,7 @@ def _decode_stage1_kernel(
     context_lens,
     mid_output,
     mid_logsumexp,
+    attn_score,
     stride_slots_row,
     stride_slots_token,
     stride_q_latent_batch,
@@ -49,6 +50,9 @@ def _decode_stage1_kernel(
     stride_mid_dim,
     stride_lse_head,
     stride_lse_block,
+    stride_score_batch,
+    stride_score_head,
+    stride_score_token,
     block_size_ptr,
     cache_slot_count,
     program_count,
@@ -61,6 +65,8 @@ def _decode_stage1_kernel(
     BLOCK_N: tl.constexpr,
     PIPELINE_STAGES: tl.constexpr,
     MASK_HEADS: tl.constexpr,
+    STORE_SCORE: tl.constexpr,
+    REDUCE_SCORE_HEADS: tl.constexpr,
 ):
     program_id = tl.program_id(0).to(tl.int64)
     output_batch_start = tl.cast(0, tl.int64)
@@ -161,7 +167,7 @@ def _decode_stage1_kernel(
                     mask=valid_cache_slot[None, :],
                     other=0.0,
                 )
-                logits = tl.dot(query_latent, cached_latent)
+                raw_logits = tl.dot(query_latent, cached_latent)
 
                 rope_cache_offsets = (
                     safe_cache_slots[None, :] * stride_rope_slot
@@ -172,8 +178,37 @@ def _decode_stage1_kernel(
                     mask=valid_cache_slot[None, :],
                     other=0.0,
                 )
-                logits += tl.dot(query_rope, cached_rope)
-                logits *= softmax_scale
+                raw_logits += tl.dot(query_rope, cached_rope)
+                if STORE_SCORE:
+                    score_mask = valid_cache_slot[None, :]
+                    if MASK_HEADS:
+                        score_mask &= head_mask[:, None]
+                    if REDUCE_SCORE_HEADS:
+                        reduced_score = tl.max(
+                            tl.where(score_mask, raw_logits, -float("inf")),
+                            axis=0,
+                        )
+                        score_offsets = (
+                            batch_index * stride_score_batch
+                            + token_indices * stride_score_token
+                        )
+                        tl.atomic_max(
+                            attn_score + score_offsets,
+                            reduced_score,
+                            mask=valid_cache_slot,
+                        )
+                    else:
+                        score_offsets = (
+                            batch_index * stride_score_batch
+                            + query_heads[:, None] * stride_score_head
+                            + token_indices[None, :] * stride_score_token
+                        )
+                        tl.store(
+                            attn_score + score_offsets,
+                            raw_logits,
+                            mask=score_mask,
+                        )
+                logits = raw_logits * softmax_scale
                 logits = tl.where(
                     valid_cache_slot[None, :],
                     logits,
@@ -251,6 +286,8 @@ def decode_stage1(
     mid_output: torch.Tensor,
     mid_logsumexp: torch.Tensor,
     *,
+    attn_score: torch.Tensor | None = None,
+    max_context_len: int | None = None,
     softmax_scale: float,
     program_count: int,
     block_q_heads: int,
@@ -276,6 +313,8 @@ def decode_stage1(
         "mid_output": mid_output,
         "mid_logsumexp": mid_logsumexp,
     }
+    if attn_score is not None:
+        tensors["attn_score"] = attn_score
     for name, tensor in tensors.items():
         _require_cuda_tensor(name, tensor)
         if tensor.device != q_latent.device:
@@ -343,6 +382,58 @@ def decode_stage1(
             f"mid_output has capacity for {mid_output.shape[0]} heads, "
             f"but {head_count} are required"
         )
+    if attn_score is not None:
+        min_width = (
+            int(active_slots.shape[1])
+            if max_context_len is None
+            else int(max_context_len)
+        )
+        if not 0 < min_width <= int(active_slots.shape[1]):
+            raise ValueError(
+                "MLA attention-score context capacity must be within the "
+                f"active-slot width: capacity={min_width} "
+                f"active_slot_width={int(active_slots.shape[1])}."
+            )
+        if attn_score.dim() == 2:
+            if attn_score.dtype != torch.float32:
+                raise TypeError(
+                    "Head-reduced MLA attention scores must use torch.float32, "
+                    f"got {attn_score.dtype}."
+                )
+            if (
+                int(attn_score.shape[0]) < batch_size
+                or int(attn_score.shape[1]) < min_width
+            ):
+                raise ValueError(
+                    "Head-reduced MLA attention scores must cover "
+                    f"[batch, context]=[{batch_size}, {min_width}], got "
+                    f"{tuple(attn_score.shape)}."
+                )
+        elif attn_score.dim() == 3:
+            if attn_score.dtype not in {
+                torch.float32,
+                torch.bfloat16,
+                torch.float16,
+            }:
+                raise TypeError(
+                    "Per-head MLA attention scores must use a floating dtype, "
+                    f"got {attn_score.dtype}."
+                )
+            if (
+                int(attn_score.shape[0]) < batch_size
+                or int(attn_score.shape[1]) < head_count
+                or int(attn_score.shape[2]) < min_width
+            ):
+                raise ValueError(
+                    "Per-head MLA attention scores must cover "
+                    f"[batch, heads, context]=[{batch_size}, {head_count}, "
+                    f"{min_width}], got {tuple(attn_score.shape)}."
+                )
+        else:
+            raise ValueError(
+                "MLA attention score must be [batch, context] or "
+                f"[batch, heads, context], got {tuple(attn_score.shape)}."
+            )
     if program_count <= 0:
         raise ValueError("program_count must be positive")
     if block_q_heads <= 0 or block_q_heads & (block_q_heads - 1):
@@ -356,6 +447,17 @@ def decode_stage1(
 
     head_group_count = triton.cdiv(head_count, block_q_heads)
     mask_heads = head_count % block_q_heads != 0
+    score_arg = attn_score if attn_score is not None else mid_logsumexp
+    if attn_score is None:
+        score_strides = (0, 0, 0)
+    elif attn_score.dim() == 2:
+        score_strides = (
+            attn_score.stride(0),
+            0,
+            attn_score.stride(1),
+        )
+    else:
+        score_strides = attn_score.stride()
     _decode_stage1_kernel[(program_count,)](
         q_latent,
         q_rope,
@@ -367,6 +469,7 @@ def decode_stage1(
         context_lens,
         mid_output,
         mid_logsumexp,
+        score_arg,
         *active_slots.stride(),
         *q_latent.stride(),
         *q_rope.stride(),
@@ -374,6 +477,7 @@ def decode_stage1(
         *rope_cache.stride(),
         *mid_output.stride(),
         *mid_logsumexp.stride(),
+        *score_strides,
         block_size,
         cache_slot_count=latent_cache.shape[0],
         program_count=program_count,
@@ -386,6 +490,10 @@ def decode_stage1(
         BLOCK_N=block_n,
         PIPELINE_STAGES=pipeline_stages,
         MASK_HEADS=mask_heads,
+        STORE_SCORE=attn_score is not None,
+        REDUCE_SCORE_HEADS=(
+            attn_score is not None and attn_score.dim() == 2
+        ),
         num_warps=num_warps,
         num_stages=1,
     )

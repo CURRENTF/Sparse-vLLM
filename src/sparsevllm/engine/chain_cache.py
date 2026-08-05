@@ -13,7 +13,7 @@ from typing import Any, Iterable
 
 
 CHAIN_PREFIX_METHODS = frozenset(
-    {"snapkv", "h2o", "pyramidkv", "rkv", "skipkv"}
+    {"streamingllm", "snapkv", "h2o", "pyramidkv", "rkv", "skipkv"}
 )
 RADIX_PREFIX_METHODS = frozenset({"", "omnikv", "quest"})
 PREFIX_CACHE_MODES = frozenset({"auto", "radix", "chain"})
@@ -195,6 +195,10 @@ def build_chain_cache_fingerprint(config: Any) -> bytes:
     hf_config = getattr(config, "hf_config", None)
     method = str(getattr(config, "vllm_sparse_method", "") or "")
     method_fields = {
+        "streamingllm": (
+            "num_sink_tokens",
+            "num_recent_tokens",
+        ),
         "snapkv": (
             "num_sink_tokens",
             "num_recent_tokens",

@@ -128,10 +128,15 @@ class MlaTritonProvider(MlaAttentionProvider):
         self.device = self.workspace.block_size.device
         self._validated_decode_metadata: tuple[
             object,
-            torch.Tensor,
-            torch.Tensor,
-            torch.Tensor,
-            int,
+            list[
+                tuple[
+                    torch.Tensor,
+                    torch.Tensor,
+                    torch.Tensor,
+                    int,
+                    int | None,
+                ]
+            ],
         ] | None = None
 
     @classmethod
@@ -154,6 +159,10 @@ class MlaTritonProvider(MlaAttentionProvider):
             return SupportResult.no("platform does not support Triton")
         if not caps.supports_bfloat16:
             return SupportResult.no("device does not support BF16")
+        if spec.cuda_graph and not caps.supports_graph_capture:
+            return SupportResult.no(
+                "decode CUDA Graph requires platform graph capture support"
+            )
         if spec.activation_dtype != torch.bfloat16:
             return SupportResult.no(
                 f"requires BF16 activations, got {spec.activation_dtype}"
@@ -184,8 +193,6 @@ class MlaTritonProvider(MlaAttentionProvider):
             return SupportResult.no(
                 f"requires tensor parallel size 1, 2, or 4, got {spec.tp_size}"
             )
-        if spec.cuda_graph:
-            return SupportResult.no("CUDA Graph execution is not validated")
         return SupportResult.yes()
 
     def _validate_run_inputs(
@@ -282,21 +289,27 @@ class MlaTritonProvider(MlaAttentionProvider):
         )
         cache_slot_count = int(payload.latent_cache.shape[0])
         metadata_key = (
-            validation_scope,
             view.meta.active_slots,
             view.meta.req_indices,
             view.meta.context_lens,
             cache_slot_count,
+            view.meta.max_context_len,
         )
-        cached_key = self._validated_decode_metadata
-        metadata_is_validated = (
-            validation_scope is not None
-            and cached_key is not None
-            and cached_key[0] is validation_scope
-            and cached_key[1] is metadata_key[1]
-            and cached_key[2] is metadata_key[2]
-            and cached_key[3] is metadata_key[3]
-            and cached_key[4] == metadata_key[4]
+        cached = self._validated_decode_metadata
+        cached_entries = (
+            cached[1]
+            if validation_scope is not None
+            and cached is not None
+            and cached[0] is validation_scope
+            else []
+        )
+        metadata_is_validated = any(
+            entry[0] is metadata_key[0]
+            and entry[1] is metadata_key[1]
+            and entry[2] is metadata_key[2]
+            and entry[3] == metadata_key[3]
+            and entry[4] == metadata_key[4]
+            for entry in cached_entries
         )
         if not metadata_is_validated:
             validate_mla_decode_metadata(
@@ -304,10 +317,16 @@ class MlaTritonProvider(MlaAttentionProvider):
                 view.meta.req_indices,
                 view.meta.context_lens,
                 cache_slot_count=cache_slot_count,
+                max_context_len=view.meta.max_context_len,
             )
-            self._validated_decode_metadata = (
-                metadata_key if validation_scope is not None else None
-            )
+            if validation_scope is None:
+                self._validated_decode_metadata = None
+            else:
+                cached_entries.append(metadata_key)
+                self._validated_decode_metadata = (
+                    validation_scope,
+                    cached_entries,
+                )
         return run_mla_decode(
             q_nope_absorbed,
             q_rope,
@@ -319,6 +338,8 @@ class MlaTritonProvider(MlaAttentionProvider):
             output,
             self.workspace,
             softmax_scale=self.spec.softmax_scale,
+            attn_score=view.meta.attn_score,
+            max_context_len=view.meta.max_context_len,
             config=self.launch_config,
             validate_metadata=False,
         )

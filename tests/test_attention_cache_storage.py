@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -8,7 +7,7 @@ import numpy as np
 import pytest
 import torch
 
-from sparsevllm.config import Config, RuntimeLayout
+from sparsevllm.config import RuntimeLayout
 from sparsevllm.engine.cache_manager import (
     ExplicitKVPayload,
     ExplicitKVWrite,
@@ -17,106 +16,13 @@ from sparsevllm.engine.cache_manager import (
     MlaLatentWrite,
 )
 from sparsevllm.engine.cache_manager.standard import StandardCacheManager
+from sparsevllm.engine.cache_manager.snapkv import SnapKVCacheManager
 from sparsevllm.engine.cache_manager.storage import (
     CacheLayout,
     ExplicitKVStorage,
     MlaLatentStorage,
     create_attention_cache_storage,
 )
-
-
-def _glm_hf_config(**overrides):
-    values = {
-        "model_type": "glm4_moe_lite",
-        "architectures": ["Glm4MoeLiteForCausalLM"],
-        "torch_dtype": torch.bfloat16,
-        "max_position_embeddings": 4096,
-        "hidden_size": 64,
-        "intermediate_size": 128,
-        "num_hidden_layers": 47,
-        "num_attention_heads": 20,
-        "num_key_value_heads": 20,
-        "vocab_size": 128,
-        "q_lora_rank": 768,
-        "kv_lora_rank": 512,
-        "qk_nope_head_dim": 192,
-        "qk_rope_head_dim": 64,
-        "v_head_dim": 256,
-        "moe_intermediate_size": 64,
-        "n_routed_experts": 64,
-        "n_shared_experts": 1,
-        "num_experts_per_tok": 4,
-        "n_group": 1,
-        "topk_group": 1,
-        "topk_method": "noaux_tc",
-        "norm_topk_prob": True,
-        "routed_scaling_factor": 1.8,
-        "mlp_layer_types": ["dense"] + ["sparse"] * 46,
-        "num_nextn_predict_layers": 1,
-        "rope_interleave": True,
-        "rope_scaling": None,
-        "attention_bias": False,
-        "quantization_config": None,
-    }
-    values.update(overrides)
-    return SimpleNamespace(**values)
-
-
-def _glm_config(*, hf_overrides=None, **overrides) -> Config:
-    kwargs = {
-        "model": str(Path(__file__).resolve().parents[1]),
-        "max_model_len": 128,
-        "max_num_batched_tokens": 64,
-        "chunk_prefill_size": 64,
-        "enforce_eager": True,
-    }
-    kwargs.update(overrides)
-    with patch(
-        "sparsevllm.configs.runtime.AutoConfig.from_pretrained",
-        return_value=_glm_hf_config(**(hf_overrides or {})),
-    ):
-        return Config(**kwargs)
-
-
-def test_glm_config_selects_mla_latent_layout():
-    config = _glm_config()
-
-    assert config.attention_cache_layout == CacheLayout.MLA_LATENT.value
-    assert config.mla_prefill_workspace_bytes == 2 * 1024**3
-
-
-def test_mla_prefill_workspace_budget_must_be_positive():
-    with pytest.raises(ValueError, match="mla_prefill_workspace_bytes"):
-        _glm_config(mla_prefill_workspace_bytes=0)
-
-
-@pytest.mark.parametrize(
-    ("override", "message"),
-    [
-        ({"vllm_sparse_method": "snapkv"}, "only vanilla attention"),
-        ({"enable_prefix_caching": True}, "does not support prefix caching"),
-        ({"decode_cuda_graph": True}, "does not support decode CUDA Graph"),
-        ({"enforce_eager": False}, "requires enforce_eager=True"),
-    ],
-)
-def test_glm_config_rejects_unsupported_storage_combinations(override, message):
-    with pytest.raises(NotImplementedError, match=message):
-        _glm_config(**override)
-
-
-@pytest.mark.parametrize(
-    ("hf_override", "message"),
-    [
-        ({"torch_dtype": torch.float16}, "requires torch.bfloat16"),
-        ({"kv_lora_rank": 256}, "requires kv_lora_rank=512"),
-        ({"qk_rope_head_dim": 32}, "qk_rope_head_dim=64"),
-    ],
-)
-def test_glm_config_rejects_unsupported_mla_storage_contract(hf_override, message):
-    with pytest.raises(NotImplementedError, match=message):
-        _glm_config(hf_overrides=hf_override)
-
-
 def test_explicit_storage_preserves_legacy_tensor_layout_and_size():
     storage = ExplicitKVStorage(
         num_kv_heads=2,
@@ -300,6 +206,42 @@ def test_storage_store_payload_types_are_not_interchangeable():
         )
 
 
+@pytest.mark.parametrize("layout", ["explicit_kv", "mla_latent"])
+def test_attention_storage_copy_slots_is_overlap_safe(layout):
+    if layout == "explicit_kv":
+        storage = ExplicitKVStorage(
+            num_kv_heads=1,
+            head_dim=4,
+            dtype=torch.float32,
+        )
+    else:
+        storage = MlaLatentStorage(
+            kv_lora_rank=512,
+            rope_dim=64,
+            dtype=torch.bfloat16,
+        )
+    storage.allocate(num_layers=1, num_slots=4, device=torch.device("cpu"))
+    payload = storage.layer_payload(0)
+    tensors = (
+        (payload.k_cache, payload.v_cache)
+        if isinstance(payload, ExplicitKVPayload)
+        else (payload.latent_cache, payload.rope_cache)
+    )
+    for tensor_idx, tensor in enumerate(tensors):
+        for slot in range(4):
+            tensor[slot].fill_(tensor_idx * 10 + slot)
+
+    storage.copy_slots(
+        0,
+        torch.tensor([3, 1], dtype=torch.long),
+        torch.tensor([1, 2], dtype=torch.long),
+    )
+
+    for tensor_idx, tensor in enumerate(tensors):
+        assert torch.all(tensor[1] == tensor_idx * 10 + 3)
+        assert torch.all(tensor[2] == tensor_idx * 10 + 1)
+
+
 def test_mla_storage_reuses_one_manager_validation_across_layers():
     storage = MlaLatentStorage(
         kv_lora_rank=512,
@@ -320,6 +262,68 @@ def test_mla_storage_reuses_one_manager_validation_across_layers():
         storage.store(0, slots, write)
         storage.store(1, slots, write)
         storage.store(0, slots, write)
+
+    assert [call.kwargs["validate_slots"] for call in copy.call_args_list] == [
+        False,
+        False,
+        True,
+    ]
+
+
+def test_mla_storage_can_revalidate_between_graph_warmup_and_capture():
+    storage = MlaLatentStorage(
+        kv_lora_rank=512,
+        rope_dim=64,
+        dtype=torch.bfloat16,
+    )
+    storage.allocate(num_layers=2, num_slots=2, device=torch.device("cpu"))
+    slots = torch.tensor([0], dtype=torch.int32)
+    write = MlaLatentWrite(
+        latent=torch.empty(1, 1, 512, dtype=torch.bfloat16),
+        rope=torch.empty(1, 1, 64, dtype=torch.bfloat16),
+    )
+
+    with patch(
+        "sparsevllm.engine.cache_manager.storage.mla_latent.copy_latent_to_cache"
+    ) as copy:
+        storage.validate_slot_mapping(slots)
+        storage.store(0, slots, write)
+        storage.store(1, slots, write)
+        storage.validate_slot_mapping(slots)
+        storage.store(0, slots, write)
+        storage.store(1, slots, write)
+
+    assert [call.kwargs["validate_slots"] for call in copy.call_args_list] == [
+        False,
+        False,
+        False,
+        False,
+    ]
+
+
+def test_mla_storage_prevalidates_nonuniform_layer_mappings():
+    storage = MlaLatentStorage(
+        kv_lora_rank=512,
+        rope_dim=64,
+        dtype=torch.bfloat16,
+    )
+    storage.allocate(num_layers=2, num_slots=2, device=torch.device("cpu"))
+    layer_slots = (
+        torch.tensor([0], dtype=torch.int32),
+        torch.tensor([1], dtype=torch.int32),
+    )
+    write = MlaLatentWrite(
+        latent=torch.empty(1, 1, 512, dtype=torch.bfloat16),
+        rope=torch.empty(1, 1, 64, dtype=torch.bfloat16),
+    )
+    storage.validate_slot_mappings(layer_slots)
+
+    with patch(
+        "sparsevllm.engine.cache_manager.storage.mla_latent.copy_latent_to_cache"
+    ) as copy:
+        storage.store(0, layer_slots[0], write)
+        storage.store(1, layer_slots[1], write)
+        storage.store(0, layer_slots[0], write)
 
     assert [call.kwargs["validate_slots"] for call in copy.call_args_list] == [
         False,
@@ -361,6 +365,118 @@ def test_standard_manager_delegates_payload_store_and_compute_view():
         context_lens,
     )
     assert isinstance(payload, MlaLatentPayload)
+    assert actual_slots is active_slots
+    assert actual_rows is req_indices
+    assert actual_lens is context_lens
+
+
+def test_snapkv_manager_delegates_latent_store_and_compute_view():
+    storage = MlaLatentStorage(
+        kv_lora_rank=512,
+        rope_dim=64,
+        dtype=torch.bfloat16,
+    )
+    storage.allocate(num_layers=2, num_slots=4, device=torch.device("cpu"))
+    manager = object.__new__(SnapKVCacheManager)
+    manager.attention_cache_storage = storage
+    manager.runtime_layout = RuntimeLayout.dense(2)
+    manager.layer_batch_states = [LayerBatchStates(), LayerBatchStates()]
+    manager._pyramidkv_prefill_staging_active = False
+    manager.layer_batch_states[1].slot_mapping = torch.tensor(
+        [1], dtype=torch.int32
+    )
+    write = MlaLatentWrite(
+        latent=torch.empty(1, 1, 512, dtype=torch.bfloat16),
+        rope=torch.empty(1, 1, 64, dtype=torch.bfloat16),
+    )
+
+    with patch.object(storage, "store") as store:
+        returned_slots = manager.store_attention_payload(1, write)
+    store.assert_called_once_with(
+        1,
+        manager.layer_batch_states[1].slot_mapping,
+        write,
+    )
+    assert returned_slots is manager.layer_batch_states[1].slot_mapping
+
+    active_slots = torch.tensor([[0, 1]], dtype=torch.int32)
+    req_indices = torch.tensor([0], dtype=torch.int32)
+    context_lens = torch.tensor([2], dtype=torch.int32)
+    payload, actual_slots, actual_rows, actual_lens = (
+        manager.get_layer_compute_payload(
+            1,
+            active_slots,
+            req_indices,
+            context_lens,
+        )
+    )
+    assert isinstance(payload, MlaLatentPayload)
+    assert actual_slots is active_slots
+    assert actual_rows is req_indices
+    assert actual_lens is context_lens
+
+
+def test_graph_capture_prevalidates_nonuniform_latent_layer_mappings():
+    storage = MlaLatentStorage(
+        kv_lora_rank=512,
+        rope_dim=64,
+        dtype=torch.bfloat16,
+    )
+    storage.allocate(num_layers=2, num_slots=4, device=torch.device("cpu"))
+    manager = object.__new__(SnapKVCacheManager)
+    manager.attention_cache_storage = storage
+    manager.runtime_layout = RuntimeLayout.dense(2)
+    manager.layer_batch_states = [
+        LayerBatchStates(slot_mapping=torch.tensor([0], dtype=torch.int32)),
+        LayerBatchStates(slot_mapping=torch.tensor([1], dtype=torch.int32)),
+    ]
+    write = MlaLatentWrite(
+        latent=torch.empty(1, 1, 512, dtype=torch.bfloat16),
+        rope=torch.empty(1, 1, 64, dtype=torch.bfloat16),
+    )
+
+    manager.validate_decode_cuda_graph_slot_mappings()
+    with patch(
+        "sparsevllm.engine.cache_manager.storage.mla_latent.copy_latent_to_cache"
+    ) as copy:
+        manager.store_attention_payload(0, write)
+        manager.store_attention_payload(1, write)
+
+    assert [call.kwargs["validate_slots"] for call in copy.call_args_list] == [
+        False,
+        False,
+    ]
+
+
+def test_snapkv_explicit_compute_view_preserves_legacy_payload():
+    storage = ExplicitKVStorage(
+        num_kv_heads=2,
+        head_dim=8,
+        dtype=torch.float16,
+    )
+    storage.allocate(num_layers=2, num_slots=4, device=torch.device("cpu"))
+    manager = object.__new__(SnapKVCacheManager)
+    manager.attention_cache_storage = storage
+    manager.runtime_layout = RuntimeLayout.dense(2)
+    manager.kv_cache = storage.cache
+    manager.layer_batch_states = [LayerBatchStates(), LayerBatchStates()]
+    manager._pyramidkv_prefill_staging_active = False
+    active_slots = torch.tensor([[0, 1]], dtype=torch.int32)
+    req_indices = torch.tensor([0], dtype=torch.int32)
+    context_lens = torch.tensor([2], dtype=torch.int32)
+
+    payload, actual_slots, actual_rows, actual_lens = (
+        manager.get_layer_compute_payload(
+            1,
+            active_slots,
+            req_indices,
+            context_lens,
+        )
+    )
+
+    assert isinstance(payload, ExplicitKVPayload)
+    assert payload.k_cache.data_ptr() == storage.cache[0, 1].data_ptr()
+    assert payload.v_cache.data_ptr() == storage.cache[1, 1].data_ptr()
     assert actual_slots is active_slots
     assert actual_rows is req_indices
     assert actual_lens is context_lens

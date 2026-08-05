@@ -9,7 +9,11 @@ from torch import nn
 from transformers import Glm4MoeLiteConfig
 
 from sparsevllm.distributed import get_parallel_context
-from sparsevllm.engine.cache_manager import MlaLatentWrite
+from sparsevllm.configs.model import resolve_attention_qk_head_dim
+from sparsevllm.engine.cache_manager import (
+    AttentionKeyComputeView,
+    MlaLatentWrite,
+)
 from sparsevllm.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
 from sparsevllm.layers.layernorm import RMSNorm
 from sparsevllm.layers.linear import (
@@ -58,7 +62,7 @@ def build_glm4_moe_lite_mla_attention(
         num_q_heads=int(config.num_attention_heads),
         kv_lora_rank=int(config.kv_lora_rank),
         rope_dim=int(config.qk_rope_head_dim),
-        qk_head_dim=int(config.qk_nope_head_dim + config.qk_rope_head_dim),
+        qk_head_dim=resolve_attention_qk_head_dim(config),
         value_head_dim=int(config.v_head_dim),
         activation_dtype=activation_dtype,
         cache_dtype=activation_dtype,
@@ -94,7 +98,7 @@ class Glm4MoeLiteAttention(nn.Module):
         self.kv_lora_rank = int(config.kv_lora_rank)
         self.qk_nope_head_dim = int(config.qk_nope_head_dim)
         self.qk_rope_head_dim = int(config.qk_rope_head_dim)
-        self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        self.qk_head_dim = resolve_attention_qk_head_dim(config)
         self.v_head_dim = int(config.v_head_dim)
         self.proj_chunk_size = int(projection_chunk_size)
         if self.proj_chunk_size <= 0:
@@ -146,6 +150,7 @@ class Glm4MoeLiteAttention(nn.Module):
             int(config.hidden_size),
             bias=bool(config.attention_bias),
         )
+        self._attention_key_materializer_binding: tuple[int, int] | None = None
 
     def _project_kv_history(self, latent: torch.Tensor) -> torch.Tensor:
         if int(latent.shape[0]) <= self.proj_chunk_size:
@@ -195,6 +200,25 @@ class Glm4MoeLiteAttention(nn.Module):
             v_weight.transpose(1, 2),
         ).transpose(0, 1)
 
+    def _materialize_attention_keys(
+        self,
+        view: AttentionKeyComputeView,
+    ) -> torch.Tensor:
+        return self.mla_attention.materialize_expanded_keys(
+            view,
+            project_latent=self._project_kv_history,
+        )
+
+    def _ensure_attention_key_materializer(self, cache_manager, layer_idx: int) -> None:
+        binding = (id(cache_manager), int(layer_idx))
+        if self._attention_key_materializer_binding == binding:
+            return
+        cache_manager.register_attention_key_materializer(
+            int(layer_idx),
+            self._materialize_attention_keys,
+        )
+        self._attention_key_materializer_binding = binding
+
     def _run_attention(
         self,
         q: torch.Tensor,
@@ -207,6 +231,7 @@ class Glm4MoeLiteAttention(nn.Module):
         cache_manager = context.cache_manager
         sparse_controller = context.sparse_controller
         layer_idx = int(context.now_layer_idx)
+        self._ensure_attention_key_materializer(cache_manager, layer_idx)
         slot_mapping = cache_manager.store_attention_payload(
             layer_idx,
             MlaLatentWrite(
@@ -264,7 +289,7 @@ class Glm4MoeLiteAttention(nn.Module):
                 cache_manager.collect_prefill_attention_score(
                     layer_idx,
                     q,
-                    view,
+                    self.mla_attention.build_prefill_explicit_view(workset),
                     b_start_loc=b_start_loc,
                     chunk_lens=chunk_lens,
                 )
@@ -434,18 +459,71 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
                 "Glm4MoeLiteSparseMoeBlock expects [tokens, hidden], got "
                 f"{tuple(hidden_states.shape)}."
             )
-        if int(hidden_states.shape[0]) <= self.mlp_chunk_size:
-            routed = self._routed_chunk(hidden_states)
+        debug_enabled = os.getenv("SPARSEVLLM_DEBUG_MOE", "0") == "1"
+        if debug_enabled:
+            self.debug_last_input = hidden_states.detach().clone()
+        if not debug_enabled:
+            if int(hidden_states.shape[0]) <= self.mlp_chunk_size:
+                routed = self._routed_chunk(hidden_states)
+            else:
+                routed = torch.cat(
+                    [
+                        self._routed_chunk(chunk)
+                        for chunk in hidden_states.split(
+                            self.mlp_chunk_size,
+                            dim=0,
+                        )
+                    ],
+                    dim=0,
+                )
+        elif int(hidden_states.shape[0]) <= self.mlp_chunk_size:
+            router_logits, topk_weights, topk_ids = self.gate(hidden_states)
+            routed = self.experts(hidden_states, topk_ids, topk_weights)
         else:
-            routed = torch.cat(
-                [
-                    self._routed_chunk(chunk)
-                    for chunk in hidden_states.split(self.mlp_chunk_size, dim=0)
-                ],
-                dim=0,
+            router_logits_chunks = []
+            topk_weights_chunks = []
+            topk_ids_chunks = []
+            routed_chunks = []
+            for chunk in hidden_states.split(self.mlp_chunk_size, dim=0):
+                router_logits, topk_weights, topk_ids = self.gate(chunk)
+                routed_chunks.append(
+                    self.experts(chunk, topk_ids, topk_weights)
+                )
+                router_logits_chunks.append(router_logits)
+                topk_weights_chunks.append(topk_weights)
+                topk_ids_chunks.append(topk_ids)
+            routed = torch.cat(routed_chunks, dim=0)
+            router_logits = torch.cat(router_logits_chunks, dim=0)
+            topk_weights = torch.cat(topk_weights_chunks, dim=0)
+            topk_ids = torch.cat(topk_ids_chunks, dim=0)
+        if debug_enabled:
+            self.debug_last_router_logits = router_logits.detach().clone()
+            self.debug_last_topk_ids = topk_ids.detach().clone()
+            self.debug_last_topk_weights = topk_weights.detach().clone()
+            self.debug_last_local_output = routed.detach().clone()
+            local_mask = (topk_ids >= self.experts.local_expert_start) & (
+                topk_ids < self.experts.local_expert_end
             )
+            local_hit_count = local_mask.sum()
+            self.debug_last_local_hit_count = (
+                local_hit_count
+                if torch.cuda.is_available()
+                and torch.cuda.is_current_stream_capturing()
+                else int(local_hit_count.item())
+            )
+        # Each rank owns one (expert, intermediate) shard.  Summing across the
+        # world composes pure TP, pure EP, and outer-TP x MoE-EP identically to
+        # the shared PackedMoeExperts contract used by Qwen3-MoE.
         self.parallel_context.world_all_reduce(routed)
-        return routed + self.shared_experts(hidden_states)
+        if debug_enabled:
+            self.debug_last_routed_output = routed.detach().clone()
+        output = routed + self.shared_experts(hidden_states)
+        if debug_enabled:
+            # ModelRunner's cross-rank evidence contract consumes the final
+            # MoE block output, including both the synced routed experts and
+            # the replicated shared experts.
+            self.debug_last_output = output.detach().clone()
+        return output
 
 
 class Glm4MoeLiteDecoderLayer(nn.Module):
@@ -459,6 +537,7 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
         decode_cuda_graph: bool,
     ) -> None:
         super().__init__()
+        self.parallel_context = get_parallel_context()
         self.self_attn = Glm4MoeLiteAttention(
             config,
             mla_attention,
@@ -507,6 +586,10 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
         hidden_states = self.self_attn(positions, hidden_states, rotary_emb)
+        if self.parallel_context.tp_size == 1 and self.parallel_context.ep_size > 1:
+            # Replicated MLA must enter the post-attention norm identically on
+            # every expert rank before routed experts make their next decision.
+            self.parallel_context.ep_broadcast(hidden_states, src_ep_rank=0)
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states,
             residual,

@@ -115,6 +115,26 @@ def test_mla_resolver_selects_h100_triton_provider() -> None:
     )
 
 
+def test_mla_resolver_accepts_cuda_graph_after_capture_gate() -> None:
+    spec = _spec(cuda_graph=True)
+    workspace = _cpu_workspace(batch_size=8, head_count=spec.local_q_heads)
+
+    with patch(
+        "sparsevllm.operators.mla_attention.allocate_mla_decode_workspace",
+        return_value=workspace,
+    ):
+        resolved = OpResolver(MLA_ATTENTION_REGISTRY).resolve(
+            spec,
+            _h100_caps(),
+            op_spec=spec,
+            device="cpu",
+            max_batch_size=8,
+        )
+
+    assert isinstance(resolved.provider, MlaTritonProvider)
+    assert resolved.rejected == ()
+
+
 @pytest.mark.parametrize(
     ("spec_overrides", "caps_overrides", "reason"),
     [
@@ -123,11 +143,15 @@ def test_mla_resolver_selects_h100_triton_provider() -> None:
         ({}, {"device_name": "NVIDIA H100 PCIe"}, "validated"),
         ({}, {"supports_triton": False}, "does not support Triton"),
         ({}, {"supports_bfloat16": False}, "does not support BF16"),
+        (
+            {"cuda_graph": True},
+            {"supports_graph_capture": False},
+            "graph capture support",
+        ),
         ({"activation_dtype": torch.float16}, {}, "BF16 activations"),
         ({"cache_dtype": torch.float16}, {}, "BF16 cache"),
         ({"kv_lora_rank": 256}, {}, "GLM MLA shape"),
         ({"tp_size": 5}, {}, "tensor parallel size"),
-        ({"cuda_graph": True}, {}, "CUDA Graph"),
     ],
 )
 def test_mla_resolver_rejects_unvalidated_contracts(
@@ -252,6 +276,7 @@ def test_mla_provider_run_does_not_resolve_or_allocate() -> None:
         view.meta.req_indices,
         view.meta.context_lens,
         cache_slot_count=4,
+        max_context_len=None,
     )
     assert kernel.call_count == 3
     kernel.assert_called_with(
@@ -265,9 +290,67 @@ def test_mla_provider_run_does_not_resolve_or_allocate() -> None:
         output,
         workspace,
         softmax_scale=spec.softmax_scale,
+        attn_score=None,
+        max_context_len=None,
         config=provider.launch_config,
         validate_metadata=False,
     )
+
+
+def test_mla_provider_validates_each_metadata_identity_once_per_scope() -> None:
+    spec = _spec(tp_size=4)
+    workspace = _cpu_workspace(batch_size=1, head_count=5)
+    with patch(
+        "sparsevllm.operators.mla_attention.allocate_mla_decode_workspace",
+        return_value=workspace,
+    ):
+        provider = MlaTritonProvider(
+            op_spec=spec,
+            device="cpu",
+            max_batch_size=1,
+        )
+
+    payload = MlaLatentPayload(
+        latent_cache=torch.empty(4, 1, 512, dtype=torch.bfloat16),
+        rope_cache=torch.empty(4, 1, 64, dtype=torch.bfloat16),
+    )
+
+    def view(slots: list[int]) -> DecodeComputeView:
+        return DecodeComputeView(
+            meta=AttentionViewMeta(
+                active_slots=torch.tensor([slots], dtype=torch.int32),
+                req_indices=torch.tensor([0], dtype=torch.int32),
+                context_lens=torch.tensor([len(slots)], dtype=torch.int32),
+            ),
+            payload=payload,
+        )
+
+    view_a = view([0, 1])
+    view_b = view([2, 3])
+    q_nope_absorbed = torch.empty(1, 5, 512, dtype=torch.bfloat16)
+    q_rope = torch.empty(1, 5, 64, dtype=torch.bfloat16)
+    output = torch.empty_like(q_nope_absorbed)
+    validation_scope = object()
+
+    with (
+        patch(
+            "sparsevllm.operators.mla_attention.run_mla_decode",
+            return_value=output,
+        ),
+        patch(
+            "sparsevllm.operators.mla_attention.validate_mla_decode_metadata"
+        ) as validate,
+    ):
+        for decode_view in (view_a, view_b, view_a, view_b):
+            provider.run(
+                q_nope_absorbed,
+                q_rope,
+                decode_view,
+                output,
+                validation_scope=validation_scope,
+            )
+
+    assert validate.call_count == 2
 
 
 def test_mla_provider_rejects_batch_larger_than_workspace() -> None:

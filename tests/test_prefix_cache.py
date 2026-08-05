@@ -12,7 +12,11 @@ import torch
 
 from sparsevllm.config import Config
 from sparsevllm.engine.cache_manager.quest import QuestCacheManager, QuestPrefixBlockPayload
+from sparsevllm.configs.model import RuntimeLayout
+from sparsevllm.engine.cache_manager import MlaLatentPayload
+from sparsevllm.engine.cache_manager.omnikv import OmniKVCacheManager
 from sparsevllm.engine.cache_manager.standard import StandardCacheManager, StandardPrefixBlockPayload
+from sparsevllm.engine.cache_manager.storage import MlaLatentStorage
 from sparsevllm.engine.cache_manager.prefix_offload import (
     QuestPrefixOffloadController,
     StandardPrefixOffloadController,
@@ -93,11 +97,12 @@ def _make_config(**kwargs):
             return Config(model=str(model_dir), **kwargs)
 
 
-def _make_standard_manager_for_prefix(block_size=2):
-    cfg = _cfg(block_size=block_size)
+def _make_standard_manager_for_prefix(block_size=2, method=""):
+    cfg = _cfg(method=method, block_size=block_size)
     cfg.num_kvcache_slots = 90
     fingerprint = build_prefix_cache_fingerprint(cfg, block_size)
-    manager = object.__new__(StandardCacheManager)
+    manager_type = OmniKVCacheManager if method == "omnikv" else StandardCacheManager
+    manager = object.__new__(manager_type)
     manager.config = cfg
     manager.device = torch.device("cpu")
     manager.enable_prefix_caching = True
@@ -1308,6 +1313,7 @@ def test_resolve_prefix_cache_block_size_uses_quest_page_size():
 def test_prefix_cache_supported_method_allowlist():
     assert PREFIX_CACHE_SUPPORTED_METHODS == {
         "",
+        "streamingllm",
         "omnikv",
         "quest",
         "snapkv",
@@ -1351,12 +1357,13 @@ def test_config_resolves_prefix_cache_defaults():
     assert cfg.resolved_prefix_cache_mode == "disabled"
 
 
-def test_config_rejects_unsupported_prefix_cache_methods():
-    with pytest.raises(ValueError, match="not supported"):
-        _make_config(
-            vllm_sparse_method="streamingllm",
-            enable_prefix_caching=True,
-        )
+def test_config_accepts_streamingllm_chain_prefix_cache():
+    cfg = _make_config(
+        vllm_sparse_method="streamingllm",
+        enable_prefix_caching=True,
+    )
+
+    assert cfg.resolved_prefix_cache_mode == "chain"
 
 
 def test_config_rejects_unvalidated_prefix_cache_options():
@@ -1505,6 +1512,170 @@ def test_standard_attach_pins_prefix_slots_and_free_seq_keeps_cached_slots():
     assert manager._num_free_slots == 88
     assert block.ref_count == 0
     assert manager.seq_id_to_row == {}
+
+
+def test_standard_latent_prefix_restores_mla_payload_and_cleans_request_state():
+    manager = _make_standard_manager_for_prefix(block_size=2)
+    storage = MlaLatentStorage(
+        kv_lora_rank=512,
+        rope_dim=64,
+        dtype=torch.bfloat16,
+    )
+    storage.allocate(num_layers=1, num_slots=100, device=torch.device("cpu"))
+    manager.attention_cache_storage = storage
+
+    owner = Sequence([1, 2])
+    owner_slots = manager._allocate(owner.seq_id, 2).clone()
+    assert storage.latent_cache is not None
+    assert storage.rope_cache is not None
+    storage.latent_cache[0, owner_slots[0]].fill_(11)
+    storage.latent_cache[0, owner_slots[1]].fill_(22)
+    storage.rope_cache[0, owner_slots[0]].fill_(33)
+    storage.rope_cache[0, owner_slots[1]].fill_(44)
+    manager._record_prefix_materialization(owner, [1, 2], owner_slots)
+    manager.on_forward_end([owner], is_prefill=True)
+    manager.free_seq(owner.seq_id)
+
+    replay = Sequence([1, 2, 9])
+    manager.refresh_prefix_cache_hit(replay)
+    assert replay.prefix_cache_hit_len == 2
+    manager._attach_prefix_cache_if_needed(replay)
+    replay_row = manager.seq_id_to_row[replay.seq_id]
+    replay_slots = manager.buffer_req_to_token_slots[replay_row, :2].clone()
+    assert replay_slots.tolist() == owner_slots.tolist()
+    payload = storage.layer_payload(0)
+    assert isinstance(payload, MlaLatentPayload)
+    torch.testing.assert_close(
+        payload.latent_cache[replay_slots, 0, 0],
+        torch.tensor([11, 22], dtype=torch.bfloat16),
+    )
+    torch.testing.assert_close(
+        payload.rope_cache[replay_slots, 0, 0],
+        torch.tensor([33, 44], dtype=torch.bfloat16),
+    )
+
+    manager.free_seq(replay.seq_id)
+    assert replay.seq_id not in manager.seq_id_to_row
+    assert replay.seq_id not in manager.seq_id_to_prefix_blocks
+    assert replay.seq_id not in manager.seq_id_to_cached_ranges
+    assert replay.seq_id not in manager.prefix_runtime_states
+    manager.reset_prefix_cache()
+    assert len(manager.prefix_cache) == 0
+    assert manager._num_free_slots == 90
+
+    unrelated = Sequence([7, 8, 9])
+    manager.refresh_prefix_cache_hit(unrelated)
+    assert unrelated.prefix_cache_hit_len == 0
+    assert unrelated.seq_id not in manager.seq_id_to_row
+
+
+def _assert_standard_latent_prefix_full_lifecycle(method: str):
+    manager = _make_standard_manager_for_prefix(block_size=2, method=method)
+    manager.max_model_len = 16
+    manager.num_layers = 1
+    manager.num_kv_layers = 1
+    manager.runtime_layout = RuntimeLayout.dense(1)
+    storage = MlaLatentStorage(
+        kv_lora_rank=512,
+        rope_dim=64,
+        dtype=torch.bfloat16,
+    )
+    storage.allocate(num_layers=1, num_slots=100, device=torch.device("cpu"))
+    manager.attention_cache_storage = storage
+
+    owner = Sequence([1, 2, 9])
+    owner.current_chunk_size = 3
+    input_ids, positions, cu_seqlens_q = manager.prepare_step([owner], is_prefill=True)
+    assert input_ids.tolist() == [1, 2, 9]
+    assert positions.tolist() == [0, 1, 2]
+    assert cu_seqlens_q.tolist() == [0, 3]
+    owner_slots = manager.layer_batch_state.slot_mapping.clone()
+    payload = storage.layer_payload(0)
+    payload.latent_cache[owner_slots] = (
+        torch.tensor([11, 22, 99], dtype=torch.bfloat16)
+        .view(3, 1, 1)
+        .expand(3, 1, 512)
+    )
+    payload.rope_cache[owner_slots] = (
+        torch.tensor([33, 44, 88], dtype=torch.bfloat16)
+        .view(3, 1, 1)
+        .expand(3, 1, 64)
+    )
+    manager.on_forward_end([owner], is_prefill=True)
+    manager.free_seq(owner.seq_id)
+    assert len(manager.prefix_cache) == 1
+    assert manager._num_free_slots == 88
+
+    replay = Sequence([1, 2, 8])
+    manager.refresh_prefix_cache_hit(replay)
+    assert replay.prefix_cache_hit_len == 2
+    replay.num_prefilled_tokens = replay.prefix_cache_hit_len
+    replay.current_chunk_size = 1
+    input_ids, positions, cu_seqlens_q = manager.prepare_step([replay], is_prefill=True)
+    assert input_ids.tolist() == [8]
+    assert positions.tolist() == [2]
+    assert cu_seqlens_q.tolist() == [0, 1]
+    replay_row = manager.seq_id_to_row[replay.seq_id]
+    replay_slots = manager.buffer_req_to_token_slots[replay_row, :3].clone()
+    assert replay_slots[:2].tolist() == owner_slots[:2].tolist()
+    torch.testing.assert_close(
+        payload.latent_cache[replay_slots[:2], 0, 0],
+        torch.tensor([11, 22], dtype=torch.bfloat16),
+    )
+    torch.testing.assert_close(
+        payload.rope_cache[replay_slots[:2], 0, 0],
+        torch.tensor([33, 44], dtype=torch.bfloat16),
+    )
+    payload.latent_cache[replay_slots[2:]] = 77
+    payload.rope_cache[replay_slots[2:]] = 66
+    manager.on_forward_end([replay], is_prefill=True)
+    manager.free_seq(replay.seq_id)
+    assert replay.seq_id not in manager.seq_id_to_row
+    assert replay.seq_id not in manager.seq_id_to_prefix_blocks
+    assert replay.seq_id not in manager.seq_id_to_cached_ranges
+    assert replay.seq_id not in manager.seq_id_to_materialized_blocks
+    assert replay.seq_id not in manager.pending_prefix_blocks
+    assert replay.seq_id not in manager.prefix_runtime_states
+    assert manager._num_free_slots == 88
+
+    deleted = manager.prefix_cache_delete_subtree([1, 2])
+    assert deleted["deleted_block_count"] == 1
+    assert len(manager.prefix_cache) == 0
+    assert manager._num_free_slots == 90
+
+    replacement = Sequence([7, 8])
+    replacement.current_chunk_size = 2
+    manager.prepare_step([replacement], is_prefill=True)
+    replacement_slots = manager.layer_batch_state.slot_mapping.clone()
+    assert replacement_slots.tolist() == owner_slots[:2].tolist()
+    payload.latent_cache[replacement_slots] = 55
+    payload.rope_cache[replacement_slots] = 44
+    torch.testing.assert_close(
+        payload.latent_cache[replacement_slots, 0, 0],
+        torch.tensor([55, 55], dtype=torch.bfloat16),
+    )
+    torch.testing.assert_close(
+        payload.rope_cache[replacement_slots, 0, 0],
+        torch.tensor([44, 44], dtype=torch.bfloat16),
+    )
+    manager.on_forward_end([replacement], is_prefill=True)
+    manager.free_seq(replacement.seq_id)
+    manager.prefix_cache_delete_subtree([7, 8])
+    assert manager._num_free_slots == 90
+    assert manager.seq_id_to_row == {}
+    assert manager.seq_id_to_prefix_blocks == {}
+    assert manager.seq_id_to_cached_ranges == {}
+    assert manager.seq_id_to_materialized_blocks == {}
+    assert manager.pending_prefix_blocks == {}
+    assert manager.prefix_runtime_states == {}
+
+
+def test_standard_latent_prefix_full_lifecycle_restores_and_reuses_slots():
+    _assert_standard_latent_prefix_full_lifecycle("")
+
+
+def test_omnikv_latent_prefix_full_lifecycle_restores_and_reuses_slots():
+    _assert_standard_latent_prefix_full_lifecycle("omnikv")
 
 
 def test_standard_offload_gpu_pressure_only_demotes_dual_resident_blocks():

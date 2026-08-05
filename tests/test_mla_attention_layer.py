@@ -7,6 +7,7 @@ import torch
 
 import sparsevllm.layers.mla_attention as mla_attention_module
 from sparsevllm.engine.cache_manager import (
+    AttentionKeyComputeView,
     AttentionViewMeta,
     ExplicitKVPayload,
     MlaLatentPayload,
@@ -20,7 +21,7 @@ from sparsevllm.operators.mla_attention import (
     MlaAttentionOpSpec,
     MlaAttentionProvider,
 )
-from sparsevllm.utils.context import reset_context
+from sparsevllm.utils.context import get_context, reset_context, set_context
 
 
 class _TestProvider(MlaAttentionProvider):
@@ -240,6 +241,18 @@ def test_mla_attention_bind_resolves_provider_once() -> None:
     )
 
 
+def test_set_context_starts_a_new_attention_validation_scope() -> None:
+    reset_context()
+    initial_scope = get_context().attention_validation_scope
+    set_context(False)
+    first_step_scope = get_context().attention_validation_scope
+    set_context(False)
+    second_step_scope = get_context().attention_validation_scope
+
+    assert first_step_scope is not initial_scope
+    assert second_step_scope is not first_step_scope
+
+
 def test_mla_prefill_reuses_validated_packing_across_layers() -> None:
     attention = _attention()
     active_slots = torch.tensor([[3, 1]], dtype=torch.int32)
@@ -328,6 +341,84 @@ def test_mla_prefill_reuses_query_validation_across_layers() -> None:
             chunk_lens=chunks,
         )
         assert host_values.call_count == 4
+
+
+def test_mla_prefill_exposes_expanded_explicit_score_view() -> None:
+    attention = _attention()
+    view = _view(
+        torch.empty(2, 1, 512, dtype=torch.bfloat16),
+        torch.empty(2, 1, 64, dtype=torch.bfloat16),
+        torch.tensor([[0, 1]], dtype=torch.int32),
+        torch.tensor([0], dtype=torch.int32),
+        torch.tensor([2], dtype=torch.int32),
+    )
+    with patch("sparsevllm.layers.mla_attention.gather_latent_history"):
+        history = attention.prepare_prefill_history(view, query_tokens=2)
+    workset = _expand_history(attention, history)
+
+    score_view = attention.build_prefill_explicit_view(workset)
+
+    assert isinstance(score_view.payload, ExplicitKVPayload)
+    assert score_view.payload.k_cache is workset.expanded_k
+    assert score_view.payload.v_cache is workset.expanded_v
+    assert score_view.meta.active_slots is history.packed_slots
+    assert score_view.meta.req_indices is history.local_req_indices
+    assert score_view.meta.context_lens is history.context_lens
+    assert score_view.meta.max_context_len == history.max_context_len
+
+
+def test_mla_materializes_actual_keys_for_permuted_slots() -> None:
+    torch.manual_seed(47)
+    attention = _attention(tp_size=4)
+    latent_cache = torch.randn(7, 1, 512, dtype=torch.bfloat16)
+    rope_cache = torch.randn(7, 1, 64, dtype=torch.bfloat16)
+    slots = torch.tensor([[5, 1], [6, 2]], dtype=torch.int32)
+    view = AttentionKeyComputeView(
+        active_slots=slots,
+        payload=MlaLatentPayload(
+            latent_cache=latent_cache,
+            rope_cache=rope_cache,
+        ),
+    )
+    weights = torch.randn(
+        attention.spec.local_q_heads,
+        448,
+        512,
+        dtype=torch.bfloat16,
+    )
+
+    def project_latent(latent: torch.Tensor) -> torch.Tensor:
+        return torch.einsum(
+            "tr,hor->tho",
+            latent.float(),
+            weights.float(),
+        ).to(torch.bfloat16).flatten(1)
+
+    actual = attention.materialize_expanded_keys(
+        view,
+        project_latent=project_latent,
+    )
+
+    flat_slots = slots.long().flatten()
+    latent = latent_cache[flat_slots, 0]
+    projected = torch.einsum(
+        "tr,hor->tho",
+        latent.float(),
+        weights.float(),
+    ).to(torch.bfloat16)
+    expected = torch.cat(
+        (
+            projected[..., :192],
+            rope_cache[flat_slots, 0][:, None, :].expand(
+                -1,
+                attention.spec.local_q_heads,
+                -1,
+            ),
+        ),
+        dim=-1,
+    ).view(2, 2, attention.spec.local_q_heads, 256)
+
+    torch.testing.assert_close(actual, expected)
 
 
 CUDA_REQUIRED = pytest.mark.skipif(

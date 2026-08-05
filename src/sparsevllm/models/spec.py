@@ -161,6 +161,8 @@ MODEL_SPECS.update(
         ),
         "glm4_moe_lite": ModelSpec(
             "GLM-4.7-Flash",
+            supports_expert_parallel=True,
+            supports_outer_tp_moe=True,
             runtime_class_name="Glm4MoeLiteForCausalLM",
             attention_tp_fields=("num_attention_heads", "vocab_size"),
             num_experts_field="n_routed_experts",

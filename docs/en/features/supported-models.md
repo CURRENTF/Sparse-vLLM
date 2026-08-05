@@ -17,7 +17,7 @@ parallel size must use that value.
 | Qwen3MoE | `qwen3_moe` | BF16 / FP16 / block FP8 | ✅ (TP > 1: BF16 model dtype only) | 1 only | ✅ |
 | Qwen3.5 / Qwen3.6 | `qwen3_5` | BF16 / block FP8 | ✅ | 1 only | 1 only |
 | Qwen3.6 MoE | `qwen3_5_moe` | BF16 / block FP8 | ✅ | 1 only | ✅ |
-| GLM-4.7-Flash | `glm4_moe_lite` | BF16 | 1 / 2 / 4 (H100 only) | 1 only | 1 only |
+| GLM-4.7-Flash | `glm4_moe_lite` | BF16 | 1 / 2 / 4 (H100 only)⁵ | 1 only | 1 / 2 / 4⁵ |
 | Llama 3 / 3.1 | `llama` | BF16 / FP16 | ✅ | 1 only | 1 only |
 | MiniMax M2.7 | `minimax_m2` | block FP8 with BF16 non-quantized weights | ✅ | 1 only | ✅ |
 
@@ -26,23 +26,28 @@ including the attention heads and vocabulary size, to be divisible by the
 selected TP size.
 
 Qwen3MoE and MiniMax M2.7 use a hybrid layout when the outer TP size `T` is
-greater than 1: attention TP is `T`, MoE EP is `E`, MoE TP is `T / E`, and
-the distributed world size is `T`. This layout requires `DP=1` and `T % E ==
-0`. The expert count must be divisible by `E`, and the MoE intermediate
-dimension must be divisible by `T / E`. Qwen3MoE outer TP requires a BF16
-model dtype; FP16 Qwen3MoE checkpoints are limited to `TP=1`. When `TP=1`,
-the existing EP layout uses world size `E`.
+greater than 1. GLM-4.7-Flash uses the same layout when both `T > 1` and
+`E > 1`: attention TP is `T`, MoE EP is `E`, MoE TP is `T / E`, and the
+distributed world size is `T`. This layout requires `DP=1` and `T % E == 0`.
+The expert count must be divisible by `E`, and the MoE intermediate dimension
+must be divisible by `T / E`. Qwen3MoE outer TP requires a BF16 model dtype;
+FP16 Qwen3MoE checkpoints are limited to `TP=1`. When `TP=1`, the existing EP
+layout uses world size `E`.
 
 Block FP8 support requires E4M3 weights, dynamic activation quantization, and
 a `128 x 128` weight block size. Qwen3.5/Qwen3.6 dense configurations are
 normalized internally to `model_type=qwen3_5`; Qwen3.6 MoE uses
 `model_type=qwen3_5_moe`.
 
-GLM-4.7-Flash support is currently limited to BF16, eager execution, vanilla
-latent MLA, `TP=1/2/4`, `DP=1`, and `EP=1` on NVIDIA H100 80GB HBM3. The
-loader intentionally skips the checkpoint's MTP layer. Other GPU
-architectures, TP sizes, expert parallelism, CUDA Graph, prefix caching,
-quantization, and sparse methods remain unsupported until separately validated.
+GLM-4.7-Flash uses BF16 latent MLA on NVIDIA H100 80GB HBM3 and requires
+`DP=1` plus `enforce_eager=True`. The validated `(TP, EP)` layouts are
+`(1,1)`, `(2,1)`, `(4,1)`, `(1,2)`, `(1,4)`, `(2,2)`, `(4,2)`, and `(4,4)`.
+Across all eight layouts, vanilla, StreamingLLM, SnapKV, H2O, OmniKV, and R-KV
+support decode CUDA Graph and prefix caching together. Prefix caching uses
+radix mode for vanilla and OmniKV, and chain mode for StreamingLLM, SnapKV,
+H2O, and R-KV. Prefix offload, quantization, and the other sparse methods
+remain unsupported. The loader intentionally skips the checkpoint's MTP
+layer.
 
 ## Sparse Method Support
 
@@ -53,7 +58,7 @@ quantization, and sparse methods remain unsupported until separately validated.
 | Qwen3MoE | ✅ | ✅ | ✅ | Experimental⁴ | ✅ | ✅ | ✅ | ✅ | — | — |
 | Qwen3.5 / Qwen3.6 | ✅ | ✅ | ✅ | Experimental⁴ | ✅ | ✅ | ✅ | ✅ | — | Matched checkpoint³ |
 | Qwen3.6 MoE | ✅ | ✅ | ✅ | Experimental⁴ | ✅ | ✅ | ✅ | ✅ | — | — |
-| GLM-4.7-Flash | ✅ | — | — | — | — | — | — | — | — | — |
+| GLM-4.7-Flash | ✅⁵ | ✅⁵ | ✅⁵ | Experimental⁴⁵ | — | ✅⁵ | — | ✅⁵ | — | — |
 | Llama 3 / 3.1 | ✅ | ✅ | ✅ | Experimental⁴ | ✅ | ✅ | ✅ | ✅ | Selected checkpoint¹ | Compressor required² |
 | MiniMax M2.7 | ✅ | ✅ | ✅ | Experimental⁴ | ✅ | ✅ | ✅ | ✅ | — | — |
 
@@ -70,5 +75,10 @@ mixed-attention runtime.
 scores and retains tokens using its local heads or KV heads, without cross-rank
 sparse-index aggregation. This is not guaranteed to be equivalent to TP=1 or
 global-head selection. Model-specific TP, EP, and DP restrictions still apply.
+
+⁵ GLM support is limited to the eight `(TP, EP)` layouts listed above with
+`DP=1`. At `TP>1`, head-scored sparse methods use TP-local selection without
+cross-rank sparse-index aggregation, so their selection semantics are not
+guaranteed to match `TP=1`.
 
 `—` means that the combination is not currently supported.

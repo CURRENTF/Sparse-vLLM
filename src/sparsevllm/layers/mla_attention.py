@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Callable
 
 import torch
 
 from sparsevllm.engine.cache_manager.base import (
+    AttentionKeyComputeView,
     AttentionViewMeta,
     DecodeComputeView,
     ExplicitKVPayload,
@@ -329,7 +331,7 @@ class MLAAttention:
 
     def _require_mla_payload(
         self,
-        view: PrefillComputeView | DecodeComputeView,
+        view: PrefillComputeView | DecodeComputeView | AttentionKeyComputeView,
         *,
         operation: str,
     ) -> MlaLatentPayload:
@@ -613,6 +615,82 @@ class MLAAttention:
             expanded_v=expanded_v,
         )
 
+    @torch.no_grad()
+    def materialize_expanded_keys(
+        self,
+        view: AttentionKeyComputeView,
+        *,
+        project_latent: Callable[[torch.Tensor], torch.Tensor],
+    ) -> torch.Tensor:
+        """Reconstruct the exact post-RoPE per-head keys for selected slots."""
+
+        if not isinstance(view, AttentionKeyComputeView):
+            raise TypeError(
+                "MLA key materialization requires AttentionKeyComputeView, got "
+                f"{type(view).__name__}."
+            )
+        payload = self._require_mla_payload(
+            view,
+            operation="MLA key materialization",
+        )
+        slots = view.active_slots
+        if slots.ndim == 0:
+            raise ValueError("MLA key materialization slots must not be scalar.")
+        if slots.dtype not in (torch.int32, torch.int64):
+            raise TypeError(
+                "MLA key materialization slots must use int32 or int64, got "
+                f"{slots.dtype}."
+            )
+        if slots.device != self.device:
+            raise ValueError(
+                "MLA key materialization slots are on the wrong device: "
+                f"slots={slots.device} expected={self.device}."
+            )
+
+        flat_slots = slots.to(torch.long).reshape(-1)
+        latent = payload.latent_cache.index_select(0, flat_slots).squeeze(1)
+        rope = payload.rope_cache.index_select(0, flat_slots).squeeze(1)
+        projected = project_latent(latent)
+        qk_nope_head_dim = int(self.spec.qk_head_dim) - int(self.spec.rope_dim)
+        projected_width = qk_nope_head_dim + int(self.spec.value_head_dim)
+        expected_shape = (
+            int(flat_slots.numel()),
+            int(self.spec.local_q_heads) * projected_width,
+        )
+        if tuple(projected.shape) != expected_shape:
+            raise RuntimeError(
+                "MLA key projection returned an invalid shape: "
+                f"got={tuple(projected.shape)} expected={expected_shape}."
+            )
+        if projected.device != self.device:
+            raise RuntimeError(
+                "MLA key projection returned the wrong device: "
+                f"got={projected.device} expected={self.device}."
+            )
+        if projected.dtype != self.spec.activation_dtype:
+            raise TypeError(
+                "MLA key projection returned the wrong dtype: "
+                f"got={projected.dtype} expected={self.spec.activation_dtype}."
+            )
+
+        expanded = projected.view(
+            int(flat_slots.numel()),
+            self.spec.local_q_heads,
+            projected_width,
+        )
+        expanded_k_nope = expanded[..., :qk_nope_head_dim]
+        expanded_rope = rope[:, None, :].expand(
+            -1,
+            self.spec.local_q_heads,
+            -1,
+        )
+        keys = torch.cat((expanded_k_nope, expanded_rope), dim=-1)
+        return keys.view(
+            *slots.shape,
+            self.spec.local_q_heads,
+            self.spec.qk_head_dim,
+        )
+
     def run_prefill(
         self,
         q: torch.Tensor,
@@ -694,7 +772,28 @@ class MLAAttention:
                 query_tokens=query_tokens,
             )
 
-        explicit_view = PrefillComputeView(
+        explicit_view = self.build_prefill_explicit_view(workset)
+        return self.prefill_backend.run_prefill(
+            q,
+            explicit_view,
+            b_start_loc=b_start_loc,
+            chunk_lens=chunk_lens,
+            max_input_len=history.max_context_len,
+        )
+
+    def build_prefill_explicit_view(
+        self,
+        workset: MlaPrefillWorkset,
+    ) -> PrefillComputeView:
+        """Expose the exact expanded KV view used by prefill score kernels."""
+
+        if not isinstance(workset, MlaPrefillWorkset):
+            raise TypeError(
+                "build_prefill_explicit_view requires MlaPrefillWorkset, got "
+                f"{type(workset).__name__}."
+            )
+        history = workset.history
+        return PrefillComputeView(
             meta=AttentionViewMeta(
                 active_slots=history.packed_slots,
                 req_indices=history.local_req_indices,
@@ -705,13 +804,6 @@ class MLAAttention:
                 k_cache=workset.expanded_k,
                 v_cache=workset.expanded_v,
             ),
-        )
-        return self.prefill_backend.run_prefill(
-            q,
-            explicit_view,
-            b_start_loc=b_start_loc,
-            chunk_lens=chunk_lens,
-            max_input_len=history.max_context_len,
         )
 
     def run_decode(

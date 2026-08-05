@@ -87,6 +87,10 @@ def build_omnikv_keep_and_slots(
     req_indices: torch.Tensor,
     num_sink: int,
     max_s: int | None = None,
+    *,
+    keep_indices_out: torch.Tensor | None = None,
+    active_slots_out: torch.Tensor | None = None,
+    new_context_lens_out: torch.Tensor | None = None,
 ):
     if topk_indices.dtype != torch.int32:
         topk_indices = topk_indices.to(torch.int32)
@@ -105,19 +109,54 @@ def build_omnikv_keep_and_slots(
         assert int(topk_lens.min().item()) >= 0
         assert int(topk_lens.max().item()) <= k_max
     if max_s is None:
-        new_context_lens = num_sink + topk_lens + recent_chunk_lens
-        max_s = int(new_context_lens.max().item())
+        computed_context_lens = num_sink + topk_lens + recent_chunk_lens
+        max_s = int(computed_context_lens.max().item())
     else:
         max_s = int(max_s)
         if max_s < 0:
             raise ValueError(f"max_s must be >= 0, got {max_s}.")
-        if max_s == 0:
-            new_context_lens = num_sink + topk_lens + recent_chunk_lens
-        else:
-            new_context_lens = torch.empty_like(topk_lens)
 
-    keep_indices = torch.empty((batch_size, max_s), dtype=torch.int32, device=topk_indices.device)
-    active_slots = torch.empty((batch_size, max_s), dtype=torch.int32, device=topk_indices.device)
+    def _resolve_output(
+        name: str,
+        output: torch.Tensor | None,
+        shape: tuple[int, ...],
+    ) -> torch.Tensor:
+        if output is None:
+            return torch.empty(
+                shape,
+                dtype=torch.int32,
+                device=topk_indices.device,
+            )
+        if output.shape != shape:
+            raise ValueError(
+                f"{name} must have shape {shape}, got {tuple(output.shape)}."
+            )
+        if output.dtype != torch.int32 or output.device != topk_indices.device:
+            raise TypeError(
+                f"{name} must be int32 on {topk_indices.device}, got "
+                f"{output.dtype}/{output.device}."
+            )
+        return output
+
+    keep_indices = _resolve_output(
+        "keep_indices_out",
+        keep_indices_out,
+        (batch_size, max_s),
+    )
+    active_slots = _resolve_output(
+        "active_slots_out",
+        active_slots_out,
+        (batch_size, max_s),
+    )
+    new_context_lens = _resolve_output(
+        "new_context_lens_out",
+        new_context_lens_out,
+        (batch_size,),
+    )
+
+    if max_s == 0:
+        new_context_lens.copy_(num_sink + topk_lens + recent_chunk_lens)
+        return keep_indices, active_slots, new_context_lens
 
     block = 256
     grid = (batch_size, triton.cdiv(max_s, block))

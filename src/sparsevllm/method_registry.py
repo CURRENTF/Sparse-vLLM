@@ -50,6 +50,7 @@ SUPPORTED_SPARSE_METHOD_ALIASES = {str(k) for k in METHOD_ALIASES if k is not No
 
 PREFIX_CACHE_SUPPORTED_METHODS = {
     "",
+    "streamingllm",
     "omnikv",
     "quest",
     "snapkv",
@@ -88,13 +89,6 @@ DENSE_MODEL_COMPATIBILITY = ModelRuntimeCompatibility(
     requires_eager=False,
     decode_cuda_graph_methods=frozenset(CANONICAL_SPARSE_METHODS),
 )
-
-GLM4_MOE_LITE_COMPATIBILITY = ModelRuntimeCompatibility(
-    sparse_methods=frozenset({""}),
-    prefix_cache_methods=frozenset(),
-    requires_eager=True,
-)
-
 
 QWEN3_MOE_EP_COMPATIBILITY = ModelRuntimeCompatibility(
     sparse_methods=_MOE_SPARSE_METHODS,
@@ -137,6 +131,19 @@ MINIMAX_M2_TP_EP_COMPATIBILITY = ModelRuntimeCompatibility(
     decode_cuda_graph_methods=MINIMAX_M2_EP_COMPATIBILITY.decode_cuda_graph_methods,
 )
 
+GLM4_MOE_LITE_EP_COMPATIBILITY = ModelRuntimeCompatibility(
+    sparse_methods=frozenset(
+        {"", "streamingllm", "snapkv", "h2o", "omnikv", "rkv"}
+    ),
+    prefix_cache_methods=frozenset(
+        {"", "streamingllm", "snapkv", "h2o", "omnikv", "rkv"}
+    ),
+    requires_eager=True,
+    decode_cuda_graph_methods=frozenset(
+        {"", "streamingllm", "snapkv", "h2o", "omnikv", "rkv"}
+    ),
+)
+
 MODEL_RUNTIME_COMPATIBILITY = {
     **{
         (model_type, ParallelMode.STANDARD): DENSE_MODEL_COMPATIBILITY
@@ -148,7 +155,8 @@ MODEL_RUNTIME_COMPATIBILITY = {
     ("qwen3_5_moe", ParallelMode.OUTER_TP_MOE): QWEN35_MOE_COMPATIBILITY,
     ("minimax_m2", ParallelMode.STANDARD): MINIMAX_M2_EP_COMPATIBILITY,
     ("minimax_m2", ParallelMode.OUTER_TP_MOE): MINIMAX_M2_TP_EP_COMPATIBILITY,
-    ("glm4_moe_lite", ParallelMode.STANDARD): GLM4_MOE_LITE_COMPATIBILITY,
+    ("glm4_moe_lite", ParallelMode.STANDARD): GLM4_MOE_LITE_EP_COMPATIBILITY,
+    ("glm4_moe_lite", ParallelMode.OUTER_TP_MOE): GLM4_MOE_LITE_EP_COMPATIBILITY,
 }
 
 # All shipped cache managers now expose a graph-stable decode preparation path.

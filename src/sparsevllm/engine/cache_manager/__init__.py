@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from .base import (
     AttentionCacheWrite,
+    AttentionKeyComputeView,
     AttentionPayload,
     AttentionViewMeta,
     CacheManager,
@@ -17,6 +18,7 @@ from .base import (
 
 __all__ = [
     "AttentionCacheWrite",
+    "AttentionKeyComputeView",
     "AttentionPayload",
     "AttentionViewMeta",
     "CacheManager",

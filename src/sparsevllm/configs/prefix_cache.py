@@ -100,8 +100,8 @@ def normalize_prefix_cache(config) -> None:
     config.recurrent_state_max_bytes = recurrent_state_max_bytes
     if config.enable_prefix_caching and config.vllm_sparse_method not in PREFIX_CACHE_SUPPORTED_METHODS:
         raise ValueError(
-            "prefix caching only supports vanilla, omnikv, quest, snapkv, "
-            "h2o, pyramidkv, rkv, and skipkv."
+            "prefix caching only supports vanilla, streamingllm, omnikv, quest, "
+            "snapkv, h2o, pyramidkv, rkv, and skipkv."
         )
     config.prefix_cache_salt = str(config.prefix_cache_salt or "")
 

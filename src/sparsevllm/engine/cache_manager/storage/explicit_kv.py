@@ -91,6 +91,13 @@ class ExplicitKVStorage:
                 f"slots={slot_mapping.device} cache={cache.device}."
             )
 
+    def validate_slot_mappings(
+        self,
+        slot_mappings: tuple[torch.Tensor, ...],
+    ) -> None:
+        for slot_mapping in slot_mappings:
+            self.validate_slot_mapping(slot_mapping)
+
     def store(
         self,
         layer_idx: int,
@@ -148,6 +155,51 @@ class ExplicitKVStorage:
     def bytes_per_slot_per_layer(self) -> int:
         element_size = torch.tensor([], dtype=self.dtype).element_size()
         return int(2 * self.num_kv_heads * self.head_dim * element_size)
+
+    def slot_capacity(self) -> int:
+        return int(self._require_cache().shape[2])
+
+    @torch.no_grad()
+    def copy_slots(
+        self,
+        layer_idx: int,
+        source_slots: torch.Tensor,
+        destination_slots: torch.Tensor,
+    ) -> None:
+        payload = self.layer_payload(layer_idx)
+        source_slots = source_slots.to(
+            device=payload.k_cache.device,
+            dtype=torch.long,
+        ).reshape(-1)
+        destination_slots = destination_slots.to(
+            device=payload.k_cache.device,
+            dtype=torch.long,
+        ).reshape(-1)
+        if source_slots.shape != destination_slots.shape:
+            raise ValueError(
+                "Explicit KV slot copy requires equal source/destination shapes, "
+                f"got {tuple(source_slots.shape)} and "
+                f"{tuple(destination_slots.shape)}."
+            )
+        if source_slots.numel() == 0:
+            return
+        slot_count = int(payload.k_cache.shape[0])
+        in_bounds = (
+            (source_slots >= 0)
+            & (source_slots < slot_count)
+            & (destination_slots >= 0)
+            & (destination_slots < slot_count)
+        ).all()
+        if in_bounds.is_cuda:
+            torch._assert_async(in_bounds)
+        elif not bool(in_bounds.item()):
+            raise ValueError(
+                f"Explicit KV slot copy indices must be in [0, {slot_count})."
+            )
+        k_selected = payload.k_cache.index_select(0, source_slots)
+        v_selected = payload.v_cache.index_select(0, source_slots)
+        payload.k_cache.index_copy_(0, destination_slots, k_selected)
+        payload.v_cache.index_copy_(0, destination_slots, v_selected)
 
     def accounting_tensors(self) -> tuple[torch.Tensor, ...]:
         return (self._require_cache(),)

@@ -1,6 +1,6 @@
 # GLM-4.7-Flash 支持实施计划
 
-- 状态：Implemented（H100 TP1/TP2/TP4、EP1 已验证）
+- 状态：Implemented（H100 BF16；8 种 TP/EP 布局 × 6 种方法的 Graph + Prefix 组合已验证）
 - 更新时间：2026-08-05
 - 目标分支：codex/glm-4.7-flash
 - 目标模型：zai-org/GLM-4.7-Flash / glm4_moe_lite
@@ -19,7 +19,12 @@
 6. MoE 只抽取 Qwen3-MoE 中真正通用的 packed-expert 物理执行部分，不构建万能 MoE 模型框架。
 7. GLM response parsing 继续委托 Transformers；本地只提供缺失的声明式 response template。
 
-首版目标是 BF16、eager、vanilla latent MLA、TP1 和 TP4/EP1 的短上下文正确性。CUDA Graph、Prefix Cache、稀疏方法、MTP、量化和实用长上下文能力均需后续单独验证。
+本计划最初以 BF16、eager、vanilla latent MLA、TP1 和 TP4/EP1 的短上下文
+正确性为首版目标。后续扩展已在相同 H100/BF16 边界内验证 8 种合法
+`(TP, EP)` 布局，以及 vanilla、StreamingLLM、SnapKV、H2O、OmniKV、
+R-KV 与 decode CUDA Graph、Prefix Cache 的完整交叉组合。当前精确支持边界
+以第 16 节和第 25 节为准；MTP、量化、prefix offload 与实用长上下文仍需
+独立验证。
 
 ## 2. 目标与非目标
 
@@ -47,6 +52,9 @@
 - 128K/202K 长上下文吞吐或显存能力声明。
 - LightLLM Python package 或 runtime 依赖。
 - 在 kernel 失败后切换到 Torch/其他 backend 的运行时 fallback。
+
+以上列表记录首版冻结范围，不代表后续扩展仍全部未支持。已完成的后续能力和
+仍然保留的拒绝边界见第 16 节兼容矩阵。
 
 ## 3. 已知模型契约
 
@@ -622,21 +630,25 @@ tokenizer.get_response_parser()   # 流式
 
 CLI 建议新增通用 auto；现有 qwen3、minimax_m2 保留兼容，glm47 仅作为 alias，不选择另一套 parser 实现。
 
-## 16. 首版兼容矩阵
+## 16. 当前兼容矩阵
 
-| 能力 | 首版状态 | 门禁 |
+| 能力 | 当前状态 | 门禁 |
 | --- | --- | --- |
 | BF16 | 已实现并验证 | tiny + 真实权重验证 |
 | NVIDIA H100 80GB HBM3 | 已实现并验证 | `triton_h100` provider 实机门禁 |
-| eager | 已实现并验证 | 必须显式启用 |
+| eager | 已实现并验证 | `enforce_eager=True` |
 | vanilla latent MLA | 已实现并验证 | kernel/storage/model 全链路 |
-| TP1 | 已实现并验证 | 真实模型 |
+| TP1/EP1 | 已实现并验证 | 真实模型 |
 | TP2/EP1 | 已实现并验证 | 真实模型 32 步 greedy 对齐 |
 | TP4/EP1 | 已实现并验证 | 真实模型、multi-chunk、ragged batch 与 API 并发 |
-| EP > 1 | 暂不支持 | 后续独立验证 |
-| CUDA Graph | 暂不支持 | 配置阶段拒绝 |
-| Prefix Cache/offload | 暂不支持 | 配置阶段拒绝 |
-| sparse methods | 暂不支持 | method registry 显式拒绝 |
+| TP1/EP2、TP1/EP4 | 已实现并验证 | replicated attention + EP，跨 rank router/MoE/logits 一致性与 expert 覆盖 |
+| TP2/EP2、TP4/EP2、TP4/EP4 | 已实现并验证 | outer TP：attention TP=`T`、MoE EP=`E`、MoE TP=`T/E`、world=`T` |
+| decode CUDA Graph | 8 种布局均支持 6 种方法 | 每个 world rank 的 capture/replay、零 eager/force-eager fallback |
+| Prefix Cache | 8 种布局均支持 6 种方法 | vanilla/OmniKV radix；StreamingLLM/SnapKV/H2O/R-KV chain |
+| CUDA Graph + Prefix Cache | 8 种布局 × 6 种方法已联合验证 | 48/48 真实 checkpoint 组合门禁 |
+| sparse methods | 8 种布局均支持 StreamingLLM、SnapKV、H2O、OmniKV、R-KV | H2O 维持实验性标记；TP>1 使用 TP-local selection |
+| Prefix offload | 暂不支持 | 配置阶段拒绝 |
+| PyramidKV、QuEST、SkipKV、DeltaKV | 暂不支持 | method registry 显式拒绝 |
 | MTP | 暂不支持 | loader 精确跳过 |
 | quantization | 暂不支持 | checkpoint config 拒绝 |
 | 128K/202K | 未验证 | 不写入支持声明 |
@@ -882,6 +894,15 @@ vllm_sparse_method: ""
 - 真实模型首 token logits/top-k margin。
 - 真实模型短序列 greedy token。
 - TP1 与 TP4 对齐。
+- TP1/EP2 与 TP1/EP4 的跨 rank router、MoE 输出和 logits 一致性。
+- 8 种合法 `(TP, EP)` 布局的 group topology、expert 分片与执行覆盖。
+- vanilla/OmniKV radix 与 StreamingLLM/SnapKV/H2O/R-KV chain prefix cache
+  的真实 hit 和 token reuse。
+- vanilla、StreamingLLM、SnapKV、H2O、OmniKV、R-KV 的真实模型
+  static/eager 与 decode CUDA Graph 全词表 logits 对比；同时要求 Graph capture、
+  business-request replay、零 eager/force-eager fallback 和方法特定触发证据。
+- 以上 6 种方法与 8 种并行布局、decode CUDA Graph、Prefix Cache 的完整
+  交叉组合；不能用单特性分别通过替代联合生命周期门禁。
 
 非空输出不构成正确性证明。
 
@@ -1002,9 +1023,12 @@ ComputeView 迁移与 MLA 引入分开；Qwen MoE 抽取与 GLM model 引入分�
 
 ## 25. 当前支持状态与验证摘要
 
-当前里程碑已经完成 BF16、eager、vanilla latent MLA，以及
-`TP=1/2/4`、`DP=1`、`EP=1` 的基础支持，硬件限定为 NVIDIA H100 80GB
-HBM3。支持声明只覆盖这些实测组合。
+当前里程碑已经完成 BF16 latent MLA，以及 `(TP, EP)` 为 `(1,1)`、`(2,1)`、
+`(4,1)`、`(1,2)`、`(1,4)`、`(2,2)`、`(4,2)`、`(4,4)` 时，vanilla、
+StreamingLLM、SnapKV、H2O、OmniKV、R-KV 与 decode CUDA Graph、Prefix
+Cache 的完整交叉组合，硬件限定为 NVIDIA H100 80GB HBM3、`DP=1`。
+支持声明只覆盖这些实测组合，不向其他并行规模、其他 sparse 方法、prefix
+offload 或多稀疏算法叠加外推。
 
 ### 25.1 已落地的架构边界
 
@@ -1019,22 +1043,37 @@ HBM3。支持声明只覆盖这些实测组合。
   `triton_h100`，执行失败不会静默切换实现。
 - GLM MoE 复用 Qwen3-MoE 的 packed expert 物理执行，只保留 GLM 自己的
   biased-sigmoid router、Dense/MoE topology 和 checkpoint 语义。
+- 联合 TP/EP 复用 Qwen3-MoE 的 outer-TP group topology：attention TP 为
+  `T`、MoE EP 为 `E`、MoE TP 为 `T/E`、world size 为 `T`；纯 EP 保留
+  replicated-attention world size `E`，纯 TP 保留普通 tensor parallel。
 - Chat Completions 与 Responses API 均继续调用 Transformers response parser；
   本地只提供 GLM 声明式 template。Terminal EOS 和 stop boundary 在 dispatcher /
   detokenizer 通用边界处理，不在 GLM parser 中写模型特判。
+- 稀疏方法继续复用 cache-manager-first 路径；MLA storage 提供 latent cache 的
+  eviction、query-key materialization 和 graph-stable selection metadata，不在
+  `attention.py` 增加 GLM 方法分支。
+- Decode CUDA Graph 保留 warmup graph 及其 private-pool ownership；业务请求用
+  capture/replay counter 增量验证实际 replay，不通过销毁 warmup graph 后重捕获来
+  重置测量。
 
 ### 25.2 验证结果
 
 | 门禁 | 结果 | 证据 |
 | --- | --- | --- |
-| CPU regression | `402 passed, 33 skipped, 87 subtests passed` | 完整 GLM/MLA/MoE/OpenAI/scheduler test selection |
-| CUDA kernel/operator/model regression | `57 passed` | H100 kernel、operator、attention layer 与模型测试 |
+| CPU regression | `1523 passed, 172 skipped, 239 subtests passed` | CPU-only 完整回归 |
+| CUDA kernel/operator/model targeted regression | `83 passed` | H100 kernel、operator、attention layer、模型与稀疏 score lifecycle targeted selection |
 | Tiny multi-chunk TP1 | 17-token prompt、chunk size 8，实际 3 chunks；prefill 与两步 decode argmax 全匹配，max abs diff 分别为 `0.00390625`、`0.00390625`、`0.0048828125` | run manifest、raw comparison 与 stdout |
 | 真实 checkpoint TP1 | 48/48 shards、9491 tensors、55.77 GiB、8832 local expert shards、精确跳过 212 个 MTP tensors；prefill + 32 decode steps argmax 全匹配 | run manifest、raw comparison 与 stdout |
 | 真实 checkpoint TP2 | 每 rank 28.01 GiB，两个 rank 均加载 48/48 shards、9491 tensors；prefill + 32 decode steps 共 33/33 argmax 全匹配，greedy token 序列与 TP1 相同 | run manifest、raw comparison 与 stdout |
 | 真实 checkpoint TP4/EP1 | 每 rank 14.13 GiB，四个 rank 均绑定 `triton_h100` MLA 与 Triton MoE；短序列 33/33、257-token 五段 prefill + decode 9/9 argmax 全匹配 | run manifest、raw comparison 与 stdout |
 | TP4 synthetic API ragged + natural LCC | 64/256/768/1536-token synthetic API batch 连续三轮共 12/12 成功且跨轮逐字稳定；另以 1004/1023/1024/1025-token natural LCC 样本对 HF teacher-forced prefill 7/7、decode 27/28，唯一 teacher-forced argmax mismatch 为两个 HF 候选 logit 完全相等的 BF16 tie | raw/parsed responses、per-row comparison 与 request logs |
 | TP4 OpenAI client gates | Chat 普通/思考、Chat SSE、Responses、Responses SSE、function tool call、streaming tool call 和 4-way concurrency 共 8/8 client gates 通过；parser 实际委托 Transformers。服务在验证后由 operator 主动停止，teardown 不作为 client gate | command/env manifest、raw parser events、parsed responses、validation status 与 request logs |
+| 真实 checkpoint EP2/EP4 | `TP=1, DP=1` 下 EP2 与 EP4 均成功；各 rank 的 router top-k、MoE 输出和最终 logits 精确一致，prefill 覆盖全部 expert shard | summary、完整 logits 与跨 rank comparison |
+| 真实 checkpoint 联合 TP/EP topology | TP2/EP2、TP4/EP2、TP4/EP4 均成功；attention、expert、MoE-TP、data group 与 outer-TP 契约逐 rank 一致，所有 expert partition 在 prefill 实际命中，router top-k 与 MoE 输出跨 rank 精确一致 | per-rank group summary、expert hit count、router/MoE comparison 与 status |
+| TP2/EP1 与 TP2/EP2 数值门禁 | 同 prompt/config 的 prefill logits max/mean/p99 abs diff 为 `1.5/0.174635/0.5`，final decode 为 `2.0/0.417368/1.0`；首 token 差异来自 reference 中两个候选的零 margin BF16 tie，后续 token 完全一致 | 两侧 float32 全词表 logits、token 序列、SHA256 与独立 comparison status |
+| 真实 checkpoint Prefix Cache | vanilla/OmniKV radix 与 StreamingLLM/SnapKV/H2O/R-KV chain 共 6 种模式成功；每种均完成 2/2 请求，第二请求命中，eligible hit rate 为 1.0，chain 模式无 invalidation/prefix mismatch | aggregate metrics、resolved config 与 request logs |
+| 真实 checkpoint decode CUDA Graph | vanilla、StreamingLLM、SnapKV、H2O、OmniKV、R-KV 共 6 种方法均通过 10/10 gates；两段 prompt 产生的 6 行全词表 logits shape 为 `[6, 154880]`，eager/Graph max abs diff 均为 `0.0`；每项 lifetime capture 为 1、业务 replay 增量为 6，且无 eager/force-eager fallback，方法特定 trigger 均有证据 | 完整 logits、runtime counter before/after/delta、selection/cache trace 与 status |
+| Graph + Prefix 完整组合矩阵 | 8 种 `(TP, EP)` 布局 × 6 种方法共 48/48 case 成功；每项完成 2/2 请求且 eligible hit rate 为 1.0，每个 world rank 均 lifetime capture=1、业务 replay 增量=4、eager/force-eager 增量=0 | per-case metrics、per-rank Graph before/after/delta、prefix/chain lifecycle 与 aggregate status |
 
 完整命令、依赖与设备版本、dirty status、raw/parsed output 和本机 artifact
 路径保存在私有实验记录中，不写入公开仓库文档；上表只保留稳定的支持边界和
@@ -1049,9 +1088,13 @@ TP1、TP2 和 TP4 的真实 checkpoint 32 步 greedy token 序列全部一致，
 
 ### 25.3 尚未完成的门禁
 
-- CUDA Graph、Prefix Cache/offload、量化、MTP 和所有 sparse method。
+- Prefix Cache offload。
+- PyramidKV、QuEST、SkipKV、DeltaKV 等未列入当前 GLM 矩阵的方法。
+- 量化 checkpoint 与 MTP/speculative decoding。
 - 128K/202K 长上下文容量与吞吐验证。
-- `TP=5` 等其他可整除配置，以及 `EP > 1`。
+- `TP=5` 等其他可整除配置与 `DP>1`。
+- SnapKV + H2O 等多稀疏算法叠加；当前“组合支持”指一个稀疏方法与
+  TP/EP、CUDA Graph、Prefix Cache 的能力交叉，不定义新的混合稀疏算法。
 - H100 以外的 GPU 架构。
 
 这些组合在完成独立验证前必须继续 fail fast 或维持未支持声明。

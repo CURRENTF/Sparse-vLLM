@@ -48,7 +48,9 @@ from sparsevllm.method_registry import (
     H2O_SUPPORTED_MODEL_TYPES,
     PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
     get_default_prefill_schedule_policy,
+    validate_model_runtime_compatibility,
 )
+from sparsevllm.distributed import ParallelMode, ParallelTopology
 
 
 def _single_process_parallel_context() -> ParallelContext:
@@ -196,9 +198,28 @@ class SparseVLLMRegressionGradingTest(unittest.TestCase):
             ["qwen2", "qwen3", "qwen3_moe", "qwen3_5", "qwen3_5_moe", "llama", "minimax_m2"],
         )
         self.assertEqual(
-            set(method["supported_model_families"]),
-            set(H2O_SUPPORTED_MODEL_TYPES),
+            set(H2O_SUPPORTED_MODEL_TYPES) - set(method["supported_model_families"]),
+            {"glm4_moe_lite"},
         )
+        for tp_size, ep_size in (
+            (1, 1),
+            (1, 2),
+            (1, 4),
+            (2, 1),
+            (2, 2),
+            (4, 1),
+            (4, 2),
+            (4, 4),
+        ):
+            mode = ParallelMode.OUTER_TP_MOE if tp_size > 1 else ParallelMode.STANDARD
+            validate_model_runtime_compatibility(
+                model_type="glm4_moe_lite",
+                sparse_method="h2o",
+                topology=ParallelTopology(tp_size, ep_size, 1, mode),
+                enforce_eager=True,
+                decode_cuda_graph=True,
+                enable_prefix_caching=True,
+            )
         self.assertEqual(method["supported_tensor_parallel_sizes"], [1, 2])
         self.assertEqual(method["performance"]["minimum_prefill_speedup"], 1.0)
         self.assertIsNone(

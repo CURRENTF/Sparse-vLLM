@@ -79,24 +79,34 @@ class SparseVLLMRegressionSuiteTest(unittest.TestCase):
         self.assertEqual(hyper_params["prefix_cache_block_size"], 16)
         self.assertFalse(hyper_params["decode_cuda_graph_capture_sampling"])
 
-    def test_quality_command_rejects_prefix_cache_for_unsupported_methods(self):
-        with self.assertRaisesRegex(ValueError, "enable_prefix_caching"):
-            run_suite._quality_command(
-                model_id="qwen25_7b",
-                method_id="streamingllm",
-                model={"model_path": "/models/qwen", "tokenizer_path": "/models/qwen"},
-                method={
-                    "sparse_method": "streamingllm",
-                    "config": {"sparse_method": "streamingllm"},
-                },
-                quality={**self._quality_cfg(), "enable_prefix_caching": True},
-                performance={
-                    "decode_cuda_graph": True,
-                    "enforce_eager": False,
-                    "tensor_parallel_size": 2,
-                },
-                output_root=Path("/tmp/sparsevllm-quality"),
-            )
+    def test_quality_command_enables_streamingllm_prefix_graph(self):
+        cmd = run_suite._quality_command(
+            model_id="qwen25_7b",
+            method_id="streamingllm",
+            model={"model_path": "/models/qwen", "tokenizer_path": "/models/qwen"},
+            method={
+                "sparse_method": "streamingllm",
+                "config": {"sparse_method": "streamingllm"},
+            },
+            quality={
+                **self._quality_cfg(),
+                "enable_prefix_caching": True,
+                "prefix_cache_block_size": 16,
+            },
+            performance={
+                "decode_cuda_graph": True,
+                "enforce_eager": False,
+                "tensor_parallel_size": 2,
+            },
+            output_root=Path("/tmp/sparsevllm-quality"),
+        )
+
+        hyper_params = json.loads(cmd[cmd.index("--hyper_param") + 1])
+        self.assertEqual(hyper_params["tensor_parallel_size"], 2)
+        self.assertTrue(hyper_params["decode_cuda_graph"])
+        self.assertTrue(hyper_params["enable_prefix_caching"])
+        self.assertEqual(hyper_params["prefix_cache_block_size"], 16)
+        self.assertFalse(hyper_params["decode_cuda_graph_capture_sampling"])
 
     def test_perf_command_uses_tp_decode_graph_hyper_params(self):
         cmd = run_suite._perf_command(

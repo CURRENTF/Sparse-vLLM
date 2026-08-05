@@ -154,6 +154,69 @@ class RKVCacheManager(SnapKVCacheManager):
         rows_tensor = torch.tensor(rows, dtype=torch.long, device=self.device)
         positions[rows_tensor].fill_(-1)
 
+    @staticmethod
+    def attention_scores_from_materialized_keys(
+        q_window: torch.Tensor,
+        keys: torch.Tensor,
+        query_positions: torch.Tensor,
+        candidate_positions: torch.Tensor,
+    ) -> torch.Tensor:
+        """Match the R-KV prefill-score contract using actual post-RoPE keys."""
+
+        if q_window.ndim != 3 or keys.ndim != 3:
+            raise ValueError(
+                "R-KV materialized scoring requires q=[queries, heads, dim] "
+                f"and keys=[tokens, kv_heads, dim], got {tuple(q_window.shape)} "
+                f"and {tuple(keys.shape)}."
+            )
+        if int(q_window.shape[-1]) != int(keys.shape[-1]):
+            raise ValueError(
+                "R-KV query/key head dimensions differ: "
+                f"q={int(q_window.shape[-1])} k={int(keys.shape[-1])}."
+            )
+        num_query_heads = int(q_window.shape[1])
+        num_key_heads = int(keys.shape[1])
+        if num_key_heads <= 0 or num_query_heads % num_key_heads:
+            raise ValueError(
+                "R-KV query heads must be divisible by materialized key heads: "
+                f"q_heads={num_query_heads} key_heads={num_key_heads}."
+            )
+        if query_positions.shape != (int(q_window.shape[0]),):
+            raise ValueError(
+                "R-KV query positions do not match the query window: "
+                f"positions={tuple(query_positions.shape)} "
+                f"queries={int(q_window.shape[0])}."
+            )
+        if candidate_positions.shape != (int(keys.shape[0]),):
+            raise ValueError(
+                "R-KV candidate positions do not match materialized keys: "
+                f"positions={tuple(candidate_positions.shape)} "
+                f"keys={int(keys.shape[0])}."
+            )
+        if int(keys.shape[0]) == 0:
+            return torch.empty((0,), dtype=torch.float32, device=keys.device)
+
+        heads_per_key = num_query_heads // num_key_heads
+        expanded_keys = keys.repeat_interleave(heads_per_key, dim=1)
+        logits = torch.einsum(
+            "qhd,chd->qhc",
+            q_window.float(),
+            expanded_keys.float(),
+        )
+        logits.mul_(float(q_window.shape[-1]) ** -0.5)
+        valid = query_positions[:, None] >= candidate_positions[None, :]
+        valid_rows = valid.any(dim=1)
+        logits = logits.masked_fill(~valid[:, None, :], float("-inf"))
+        logits = torch.where(
+            valid_rows[:, None, None],
+            logits,
+            torch.zeros_like(logits),
+        )
+        probabilities = torch.softmax(logits, dim=-1)
+        probabilities.masked_fill_(~valid[:, None, :], 0.0)
+        probabilities.masked_fill_(~valid_rows[:, None, None], 0.0)
+        return probabilities.mean(dim=0).amax(dim=0)
+
     def free_seq(self, seq_id: int):
         row_by_layer = [
             self.seq_id_to_row[layer_idx].get(int(seq_id))
@@ -372,6 +435,44 @@ class RKVCacheManager(SnapKVCacheManager):
             )
 
         q_window = cache[row_idx, cols].contiguous()
+        if self.has_attention_key_materializer(layer_idx):
+            candidate_start = max(0, int(candidate_start))
+            candidate_end = max(
+                candidate_start,
+                kv_len - int(num_recent_tokens),
+            )
+            scores = torch.zeros(
+                (kv_len,),
+                dtype=self._prefill_score_dtype(),
+                device=self.device,
+            )
+            if candidate_end <= candidate_start:
+                return scores
+            candidate_positions = torch.arange(
+                candidate_start,
+                candidate_end,
+                dtype=torch.long,
+                device=self.device,
+            )
+            candidate_slots = self.buffer_req_to_token_slots[layer_idx][
+                row_idx,
+                candidate_start:candidate_end,
+            ]
+            keys = self.materialize_attention_keys(
+                layer_idx,
+                candidate_slots,
+            )
+            candidate_scores = self.attention_scores_from_materialized_keys(
+                q_window,
+                keys,
+                positions,
+                candidate_positions,
+            )
+            scores[candidate_start:candidate_end] = candidate_scores.to(
+                scores.dtype
+            )
+            return scores
+
         k_cache, _ = self.get_layer_kv_cache(layer_idx)
         attn_score = torch.zeros(
             (1, kv_len),
@@ -426,6 +527,23 @@ class RKVCacheManager(SnapKVCacheManager):
                 "rkv_query_attention_scores_batch expected one kv_len per sequence: "
                 f"seqs={len(seqs)} kv_lens={len(kv_lens)}"
             )
+        if self.has_attention_key_materializer(layer_idx):
+            max_kv_len = max(int(kv_len) for kv_len in kv_lens)
+            scores = torch.zeros(
+                (len(seqs), max_kv_len),
+                dtype=self._prefill_score_dtype(),
+                device=self.device,
+            )
+            for batch_idx, (seq, kv_len) in enumerate(zip(seqs, kv_lens)):
+                single = self.rkv_query_attention_scores(
+                    layer_idx,
+                    seq,
+                    int(kv_len),
+                    candidate_start=candidate_start,
+                    num_recent_tokens=num_recent_tokens,
+                )
+                scores[batch_idx, : int(kv_len)] = single
+            return scores
 
         obs = int(self._rkv_observation_tokens)
         if obs <= 0:
@@ -624,9 +742,11 @@ class RKVCacheManager(SnapKVCacheManager):
         configured_window = int(self.config.rkv_redundancy_window)
         window = int(slots.numel()) if configured_window == 0 else min(configured_window, int(slots.numel()))
         if window > 0:
-            k_cache, _ = self.get_layer_kv_cache(layer_idx)
             window_slots = slots[-window:]
-            window_keys = k_cache.index_select(0, window_slots)
+            window_keys = self.materialize_attention_keys(
+                layer_idx,
+                window_slots,
+            )
             redundancy = self.redundancy_scores_from_keys(
                 window_keys,
                 similarity_threshold=float(self.config.rkv_similarity_threshold),
@@ -697,13 +817,10 @@ class RKVCacheManager(SnapKVCacheManager):
         configured_window = int(self.config.rkv_redundancy_window)
         window = int(slots.shape[1]) if configured_window == 0 else min(configured_window, int(slots.shape[1]))
         if window > 0:
-            k_cache, _ = self.get_layer_kv_cache(layer_idx)
             window_slots = slots[:, -window:]
-            window_keys = k_cache.index_select(0, window_slots.reshape(-1)).view(
-                len(seqs),
-                window,
-                k_cache.shape[1],
-                k_cache.shape[2],
+            window_keys = self.materialize_attention_keys(
+                layer_idx,
+                window_slots,
             )
             redundancy = self.redundancy_scores_from_keys_batch(
                 window_keys,

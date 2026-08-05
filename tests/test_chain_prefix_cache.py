@@ -363,6 +363,7 @@ def test_chain_apply_plan_rejects_duplicate_resident_seq_owner():
         ("", "auto", "radix"),
         ("omnikv", "auto", "radix"),
         ("quest", "radix", "radix"),
+        ("streamingllm", "auto", "chain"),
         ("snapkv", "auto", "chain"),
         ("h2o", "auto", "chain"),
         ("pyramidkv", "chain", "chain"),

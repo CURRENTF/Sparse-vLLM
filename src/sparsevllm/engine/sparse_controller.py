@@ -3,6 +3,7 @@ import os
 import torch
 import torch.nn.functional as F
 from sparsevllm.config import Config
+from sparsevllm.configs.model import resolve_attention_qk_head_dim
 from sparsevllm.engine.activation_controller import ActivationController
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.engine.cache_manager import CacheManager, SparseSelection
@@ -83,10 +84,7 @@ class SparseController:
         self.num_sink = self.config.num_sink_tokens
         self.num_recent = self.config.num_recent_tokens
         self.decode_keep_tokens = self.config.decode_keep_tokens
-        head_dim = int(
-            getattr(self.config.hf_config, "head_dim", None)
-            or (self.config.hf_config.hidden_size // self.config.hf_config.num_attention_heads)
-        )
+        head_dim = resolve_attention_qk_head_dim(self.config.hf_config)
         self.attn_softmax_scale = float(head_dim) ** -0.5
         score_dtype_name = str(getattr(self.config, "sparse_attn_score_dtype", "float32") or "float32").lower()
         self.attn_score_dtype = {
@@ -104,6 +102,15 @@ class SparseController:
             self.layer_batch_sparse_states[i] = LayerBatchSparseState()
         self._decode_attn_score_buffers: dict[int, torch.Tensor] = {}
         self._omnikv_decode_attn_score_buffer: torch.Tensor | None = None
+        self._omnikv_decode_selection_buffers: dict[
+            tuple[int, tuple[int, ...], int, int, str],
+            tuple[
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+            ],
+        ] = {}
         self._snapkv_decode_reduced_attn_score_buffers: dict[int, torch.Tensor] = {}
         self._h2o_decode_attn_score_buffers: dict[tuple[int, ...], torch.Tensor] = {}
 
@@ -153,9 +160,49 @@ class SparseController:
         tensors = self.activation_controller.decode_cuda_graph_keepalive_tensors()
         if self._omnikv_decode_attn_score_buffer is not None:
             tensors.append(self._omnikv_decode_attn_score_buffer)
+        for buffers in self._omnikv_decode_selection_buffers.values():
+            tensors.extend(buffers)
         tensors.extend(self._snapkv_decode_reduced_attn_score_buffers.values())
         tensors.extend(self._h2o_decode_attn_score_buffers.values())
         return tensors
+
+    def _get_omnikv_decode_selection_buffers(
+        self,
+        *,
+        obs_layer_idx: int,
+        target_layers: list[int],
+        batch_size: int,
+        max_context_len: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        cache = getattr(self, "_omnikv_decode_selection_buffers", None)
+        if cache is None:
+            cache = {}
+            self._omnikv_decode_selection_buffers = cache
+        key = (
+            int(obs_layer_idx),
+            tuple(int(layer_idx) for layer_idx in target_layers),
+            int(batch_size),
+            int(max_context_len),
+            str(device),
+        )
+        buffers = cache.get(key)
+        if buffers is not None:
+            return buffers
+        if device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "OmniKV decode CUDA graph capture requires selection buffers "
+                "to be allocated by the eager capture warmup."
+            )
+        selection_shape = (int(batch_size), int(max_context_len))
+        buffers = (
+            torch.empty(selection_shape, dtype=torch.int32, device=device),
+            torch.empty(selection_shape, dtype=torch.int32, device=device),
+            torch.empty((int(batch_size),), dtype=torch.int32, device=device),
+            torch.arange(int(batch_size), dtype=torch.int32, device=device),
+        )
+        cache[key] = buffers
+        return buffers
 
     def _debug_record_dynamic_selection(self, bucket: str, layer_idx: int, **fields):
         entry = self.debug_dynamic_selection.setdefault(bucket, {}).setdefault(str(int(layer_idx)), {"calls": 0})
@@ -1444,6 +1491,13 @@ class SparseController:
                     by_kv_len.setdefault(int(kv_len), []).append((b_idx, seq))
 
                 for kv_len, group in by_kv_len.items():
+                    if log_level == 'DEBUG':
+                        for _b_idx, seq in group:
+                            logger.debug(
+                                "[StreamingLLM] prefill eviction: "
+                                f"layer={layer_idx} seq_id={seq.seq_id} "
+                                f"kv_len={kv_len} budget={budget}"
+                            )
                     group_seqs = [seq for _b_idx, seq in group]
                     if free_prefix_recent is not None:
                         key = (tuple(int(seq.seq_id) for seq in group_seqs), int(kv_len))
@@ -1793,7 +1847,6 @@ class SparseController:
 
             # 4. 根据方法更新目标层状态
             if self.sparse_method == 'omnikv':
-                local_req_indices = torch.arange(batch_size, dtype=torch.int32, device=self.device)
                 decode_keep = int(decode_keep)
                 k_max = min(decode_keep, int(search_scores.size(1)))
                 if k_max > 0:
@@ -1810,6 +1863,46 @@ class SparseController:
                     max_recent_or_chunk = int(self.num_recent)
                 max_sparse_context_len = int(self.num_sink) + int(k_max) + max_recent_or_chunk
                 slot_source_layer = int(target_layers[0])
+                graph_outputs = None
+                if (
+                    not ctx.is_prefill
+                    and bool(
+                        getattr(
+                            getattr(self, "config", None),
+                            "decode_cuda_graph",
+                            False,
+                        )
+                    )
+                ):
+                    graph_outputs = self._get_omnikv_decode_selection_buffers(
+                        obs_layer_idx=obs_layer_idx,
+                        target_layers=target_layers,
+                        batch_size=batch_size,
+                        max_context_len=max_sparse_context_len,
+                        device=token_scores.device,
+                    )
+                    (
+                        keep_indices_out,
+                        active_slots_out,
+                        new_context_lens_out,
+                        local_req_indices,
+                    ) = graph_outputs
+                else:
+                    keep_indices_out = None
+                    active_slots_out = None
+                    new_context_lens_out = None
+                    local_req_indices = torch.arange(
+                        batch_size,
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                output_kwargs = {}
+                if graph_outputs is not None:
+                    output_kwargs = {
+                        "keep_indices_out": keep_indices_out,
+                        "active_slots_out": active_slots_out,
+                        "new_context_lens_out": new_context_lens_out,
+                    }
                 keep_indices, active_slots, new_context_lens = build_omnikv_keep_and_slots(
                     topk_indices,
                     topk_lens,
@@ -1819,7 +1912,17 @@ class SparseController:
                     obs_sparse_state.req_indices,
                     self.num_sink,
                     max_s=max_sparse_context_len,
+                    **output_kwargs,
                 )
+                if graph_outputs is not None and (
+                    keep_indices is not keep_indices_out
+                    or active_slots is not active_slots_out
+                    or new_context_lens is not new_context_lens_out
+                ):
+                    raise RuntimeError(
+                        "OmniKV decode CUDA graph selection builder did not "
+                        "preserve caller-owned output buffers."
+                    )
 
                 for l_idx in target_layers:
                     target_sparse_state = self.layer_batch_sparse_states[l_idx]
