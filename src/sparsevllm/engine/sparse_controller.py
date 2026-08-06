@@ -722,19 +722,18 @@ class SparseController:
                 ):
                     return
                 raise RuntimeError("PyramidKV full-prefill staging should only run on the final prefill chunk.")
+            staging_context_lens = (
+                self.cache_manager.prefill_staging_context_lens_cpu(layer_idx)
+            )
+            if staging_context_lens is None or len(staging_context_lens) != len(seqs):
+                raise RuntimeError(
+                    "PyramidKV staging CPU context lengths do not match the current batch: "
+                    f"layer={layer_idx} lengths={staging_context_lens} "
+                    f"batch_size={len(seqs)}."
+                )
             seq_keep_indices = []
-            for seq in seqs:
-                physical_len = getattr(
-                    self.cache_manager, "chain_physical_kv_len", None
-                )
-                kv_len = (
-                    int(physical_len(layer_idx, seq.seq_id))
-                    if getattr(seq, "chain_status", "") == "resumed"
-                    and not bool(getattr(seq, "is_recompute_replay", False))
-                    and callable(physical_len)
-                    else int(seq.num_prefilled_tokens)
-                    + int(seq.current_chunk_size)
-                )
+            for b_idx, seq in enumerate(seqs):
+                kv_len = int(staging_context_lens[b_idx])
                 if budget is None or kv_len <= budget:
                     keep_indices = torch.arange(kv_len, device=self.device, dtype=torch.long)
                 else:
@@ -760,9 +759,12 @@ class SparseController:
         """持久化压缩 (如 SnapKV / DeltaKV)"""
         self.activation_controller.post_forward(seqs, is_prefill)
 
+        if is_prefill:
+            self.on_every_chunk_prefill_end(seqs)
+            return
+
         short_snapkv_decode_has_scores = (
-            not is_prefill
-            and self.sparse_method in ("snapkv", "pyramidkv")
+            self.sparse_method in ("snapkv", "pyramidkv")
             and any(
                 state.attn_score is not None
                 for state in self.layer_batch_sparse_states.values()
@@ -775,9 +777,6 @@ class SparseController:
             and self.sparse_method != "h2o"
         ):
             return
-
-        if is_prefill:
-            self.on_every_chunk_prefill_end(seqs)
 
         # Decode 阶段如果 Recent Buffer 溢出也需要压缩 (对于 DeltaKV)
         if not is_prefill and self.is_deltakv_family:
@@ -795,13 +794,6 @@ class SparseController:
 
     @torch.no_grad()
     def on_every_chunk_prefill_end(self, seqs: list[Sequence]):
-        if (
-            get_context().is_long_text is False
-            and not self.is_deltakv_family
-            and self.sparse_method != "h2o"
-        ):
-            return
-
         if self.sparse_method == "h2o":
             self.cache_manager.evict_after_prefill(seqs)
             return
@@ -814,8 +806,7 @@ class SparseController:
             return
 
         # SnapKV / PyramidKV: Only evict at the end of prefill
-        is_last_chunk = any(seq.is_last_chunk_prefill for seq in seqs)
-        if not is_last_chunk:
+        if not any(seq.is_last_chunk_prefill for seq in seqs):
             return
 
         if self.sparse_method == "pyramidkv" and getattr(self.cache_manager, "prefill_staging_was_active", lambda: False)():

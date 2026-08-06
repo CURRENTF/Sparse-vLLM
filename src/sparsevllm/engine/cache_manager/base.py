@@ -13,6 +13,10 @@ import torch.distributed as dist
 from sparsevllm.config import Config
 from sparsevllm.distributed import ParallelContext
 from sparsevllm.engine.sequence import Sequence
+from sparsevllm.engine.prefill import (
+    PREFILL_EXECUTION_CHUNKED,
+    PREFILL_EXECUTION_RAW_OFFLOAD,
+)
 from sparsevllm.method_registry import SUPPORTED_SPARSE_METHODS, normalize_sparse_method
 from sparsevllm.triton_kernel.store_kvcache import store_kvcache
 import sparsevllm.platforms as platforms
@@ -223,6 +227,7 @@ class CacheManager(ABC):
 
         self.kv_cache = None
         self._decode_static_max_context_len: int | None = None
+        self._raw_offload_prefill_phases: dict[int, bool] = {}
 
     def synchronize_prefix_cache_delete_plan(
         self,
@@ -331,20 +336,26 @@ class CacheManager(ABC):
                 f"estimated_max_tokens={estimated_max_tokens}."
             )
         chunk_prefill_size = int(config.chunk_prefill_size)
-        if prefill_policy == "long_bs1full_short_batch":
-            long_prefill_offload_threshold = int(config.long_prefill_offload_threshold)
-            assert long_prefill_offload_threshold == chunk_prefill_size, (
-                "long_bs1full_short_batch requires long_prefill_offload_threshold "
-                "to equal chunk_prefill_size: "
-                f"long_prefill_offload_threshold={long_prefill_offload_threshold}, "
-                f"chunk_prefill_size={chunk_prefill_size}."
+        long_prefill_offload_threshold = int(
+            getattr(config, "long_prefill_offload_threshold", chunk_prefill_size)
+        )
+        if (
+            prefill_policy == "long_bs1full_short_batch"
+            and not 0 < chunk_prefill_size <= long_prefill_offload_threshold
+        ):
+            raise ValueError(
+                "long_bs1full_short_batch requires 0 < chunk_prefill_size <= "
+                "long_prefill_offload_threshold after normalization: "
+                f"chunk_prefill_size={chunk_prefill_size}, "
+                f"long_prefill_offload_threshold={long_prefill_offload_threshold}."
             )
         if (
             prefill_policy == "long_bs1full_short_batch"
-            and chunk_prefill_size > estimated_max_tokens
+            and long_prefill_offload_threshold > estimated_max_tokens
         ):
             msg = (
-                f"chunk_prefill_size={chunk_prefill_size} > "
+                "long_prefill_offload_threshold="
+                f"{long_prefill_offload_threshold} > "
                 f"estimated_max_tokens={estimated_max_tokens} "
                 f"(prefill_schedule_policy={prefill_policy!r})"
             )
@@ -356,13 +367,16 @@ class CacheManager(ABC):
                 )
             else:
                 logger.warning(
-                    "{}; capping long_prefill_offload_threshold and "
-                    "chunk_prefill_size to {} to avoid OOM.",
+                    "{}; capping long_prefill_offload_threshold to {} and "
+                    "chunk_prefill_size to at most that value to avoid OOM.",
                     msg,
                     estimated_max_tokens,
                 )
                 config.long_prefill_offload_threshold = estimated_max_tokens
-                config.chunk_prefill_size = estimated_max_tokens
+                config.chunk_prefill_size = min(
+                    int(config.chunk_prefill_size),
+                    estimated_max_tokens,
+                )
 
         if estimated_max_tokens < config.max_num_batched_tokens and not allow_large_prefill_chunk:
             logger.warning(
@@ -802,6 +816,10 @@ class CacheManager(ABC):
 
     def on_forward_end(self, seqs: list[Sequence], is_prefill: bool):
         """Optional hook after all layers have stored KV for a forward step."""
+        if is_prefill:
+            for seq in seqs:
+                if seq.is_last_chunk_prefill:
+                    self.complete_prefill_execution(seq)
         return None
 
     def prefix_cache_inspect(
@@ -965,6 +983,41 @@ class CacheManager(ABC):
         )
         return int(seq.num_prompt_tokens - virtual_prefilled)
 
+    def prefill_execution_mode(self, seq: Sequence) -> str:
+        """Return the method-owned execution contract for the remaining prompt."""
+        del seq
+        return PREFILL_EXECUTION_CHUNKED
+
+    def _apply_sticky_raw_offload_mode(self, seq: Sequence, mode: str) -> str:
+        """Keep RawKV staging active for one logical prefill lifecycle."""
+        phases = getattr(self, "_raw_offload_prefill_phases", None)
+        if phases is None:
+            phases = {}
+            self._raw_offload_prefill_phases = phases
+        seq_id = int(seq.seq_id)
+        replay_phase = bool(getattr(seq, "is_recompute_replay", False))
+        previous_phase = phases.get(seq_id)
+        if previous_phase is not None and previous_phase != replay_phase:
+            phases.pop(seq_id, None)
+        if seq_id in phases:
+            return PREFILL_EXECUTION_RAW_OFFLOAD
+        if mode == PREFILL_EXECUTION_RAW_OFFLOAD:
+            phases[seq_id] = replay_phase
+        return mode
+
+    def reset_prefill_execution_state(self, seq_id: int) -> None:
+        phases = getattr(self, "_raw_offload_prefill_phases", None)
+        if phases is not None:
+            phases.pop(int(seq_id), None)
+
+    def complete_prefill_execution(self, seq: Sequence) -> None:
+        self.reset_prefill_execution_state(int(seq.seq_id))
+
+    def prefill_batch_compatibility_key(self, seq: Sequence) -> object:
+        """Return a method-owned key for prefill requests that may share a batch."""
+        del seq
+        return None
+
     def reserved_prefill_slots(self, waiting_seqs: deque[Sequence], chunk_prefill_size: int) -> int:
         """Persistent slots reserved by waiting/running prefills.
 
@@ -1004,6 +1057,14 @@ class CacheManager(ABC):
         """Minimum final chunk size required by method-specific prefill logic."""
         del seq
         return 0
+
+    def prefill_staging_context_lens_cpu(
+        self,
+        layer_idx: int,
+    ) -> tuple[int, ...] | None:
+        """CPU mirror of staging lengths for synchronization-free finalization."""
+        del layer_idx
+        return None
 
     def requires_long_prefill_offload(self, seq: Sequence) -> bool:
         """Whether this long prefill should be internally chunked through offload staging."""

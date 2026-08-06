@@ -7,10 +7,9 @@ from sparsevllm.configs.common import (
 from sparsevllm.constant import REDUNDANCY_BATCH_SIZE_FACTOR
 from sparsevllm.method_registry import (
     PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
+    normalize_sparse_method,
     resolve_prefill_schedule_policy,
 )
-from sparsevllm.utils.log import log_once
-
 def normalize_scheduling(config) -> None:
     config.max_num_seqs_in_batch = int(config.max_num_seqs_in_batch)
     if config.max_num_seqs_in_batch <= 0:
@@ -61,26 +60,19 @@ def normalize_scheduling(config) -> None:
         config.long_prefill_offload_threshold = _resolve_long_prefill_offload_threshold(
             config.long_prefill_offload_threshold
         )
-        if (
-            configured_chunk_prefill_size is not None
-            and configured_chunk_prefill_size != config.long_prefill_offload_threshold
-        ):
-            log_once(
-                "long_bs1full_short_batch derives chunk_prefill_size from "
-                "long_prefill_offload_threshold; ignoring "
-                f"chunk_prefill_size={configured_chunk_prefill_size} and using "
-                f"{config.long_prefill_offload_threshold}.",
-                level="WARNING",
-            )
-        config.chunk_prefill_size = config.long_prefill_offload_threshold
-    else:
-        resolved_offload_threshold = _coerce_optional_positive_int(
-            "long_prefill_offload_threshold",
-            config.long_prefill_offload_threshold,
+        config.chunk_prefill_size = (
+            int(config.long_prefill_offload_threshold)
+            if configured_chunk_prefill_size is None
+            else configured_chunk_prefill_size
         )
-        if resolved_offload_threshold is None:
-            raise ValueError("long_prefill_offload_threshold must be a positive integer.")
-        config.long_prefill_offload_threshold = int(resolved_offload_threshold)
+        if config.chunk_prefill_size > config.long_prefill_offload_threshold:
+            raise ValueError(
+                "long_bs1full_short_batch requires 0 < chunk_prefill_size <= "
+                "long_prefill_offload_threshold: "
+                f"chunk_prefill_size={config.chunk_prefill_size}, "
+                f"long_prefill_offload_threshold={config.long_prefill_offload_threshold}."
+            )
+    else:
         config.chunk_prefill_size = (
             8192
             if configured_chunk_prefill_size is None
@@ -90,17 +82,31 @@ def normalize_scheduling(config) -> None:
         raise ValueError(
             f"chunk_prefill_size must be > 0, got {config.chunk_prefill_size}."
         )
+    score_window_method = normalize_sparse_method(config.vllm_sparse_method)
+    if score_window_method in {"snapkv", "pyramidkv"}:
+        snapkv_window_size = int(config.snapkv_window_size)
+        if config.chunk_prefill_size < snapkv_window_size:
+            raise ValueError(
+                f"{score_window_method} requires chunk_prefill_size >= "
+                "snapkv_window_size so the "
+                "final score window fits in one prefill step: "
+                f"chunk_prefill_size={config.chunk_prefill_size}, "
+                f"snapkv_window_size={snapkv_window_size}."
+            )
     if (
         config.prefill_schedule_policy == PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH
-        and config.max_num_batched_tokens < config.chunk_prefill_size
+        and config.max_num_batched_tokens < config.long_prefill_offload_threshold
     ):
+        from sparsevllm.utils.log import log_once
+
         log_once(
-            "long_bs1full_short_batch requires one short-boundary prefill to fit; "
-            f"raising max_num_batched_tokens from {config.max_num_batched_tokens} "
-            f"to {config.chunk_prefill_size}.",
+            "long_bs1full_short_batch requires one full residual at the offload "
+            "boundary to fit; raising max_num_batched_tokens from "
+            f"{config.max_num_batched_tokens} to "
+            f"{config.long_prefill_offload_threshold}.",
             level="WARNING",
         )
-        config.max_num_batched_tokens = config.chunk_prefill_size
+        config.max_num_batched_tokens = config.long_prefill_offload_threshold
 
     if int(config.mlp_chunk_size) <= 0:
         raise ValueError(f"mlp_chunk_size must be > 0, got {config.mlp_chunk_size}.")

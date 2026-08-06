@@ -26,6 +26,11 @@ from sparsevllm.engine.llm_engine import (
     _use_graph_scaled_warmup,
 )
 from sparsevllm.engine.model_runner import ModelRunner
+from sparsevllm.engine.prefill import (
+    PREFILL_EXECUTION_CHUNKED,
+    PREFILL_EXECUTION_FULL,
+    PREFILL_EXECUTION_RAW_OFFLOAD,
+)
 from sparsevllm.engine.runtime_state import RuntimeState
 from sparsevllm.engine.scheduler import Scheduler
 from sparsevllm.engine.sequence import Sequence
@@ -54,6 +59,7 @@ class FakeMemoryOracle:
         prefix_hit_blocks=0,
         long_prefill_offload=False,
         min_final_prefill_chunk_size=0,
+        execution_mode=None,
     ):
         self._free_slots = int(free_slots)
         self._step_free_slots = int(step_free_slots) if step_free_slots is not None else int(free_slots)
@@ -63,6 +69,7 @@ class FakeMemoryOracle:
         self.prefix_hit_blocks = int(prefix_hit_blocks)
         self._long_prefill_offload = bool(long_prefill_offload)
         self._min_final_prefill_chunk_size = int(min_final_prefill_chunk_size)
+        self._execution_mode = execution_mode
         self.refresh_calls = 0
         self.clear_calls = 0
 
@@ -110,6 +117,26 @@ class FakeMemoryOracle:
         virtual_prefilled = max(seq.num_prefilled_tokens, seq.prefix_cache_hit_len)
         return int(seq.num_prompt_tokens - virtual_prefilled)
 
+    def prefill_execution_mode(self, seq):
+        del seq
+        if self._execution_mode is not None:
+            return self._execution_mode
+        if self._long_prefill_offload:
+            return PREFILL_EXECUTION_RAW_OFFLOAD
+        if self._force_full_prefill or self._force_whole_prefill:
+            return PREFILL_EXECUTION_FULL
+        return PREFILL_EXECUTION_CHUNKED
+
+    def prefill_batch_compatibility_key(self, seq):
+        del seq
+        return None
+
+    def reset_prefill_execution_state(self, seq_id):
+        del seq_id
+
+    def complete_prefill_execution(self, seq):
+        del seq
+
     def prefill_batched_tokens_margin(self):
         return 0
 
@@ -151,6 +178,27 @@ class FakeMemoryOracle:
         return {"free_slots": int(self._free_slots), "step_free_slots": int(self._step_free_slots)}
 
 
+class CacheManagerPolicyOracle(FakeMemoryOracle):
+    def __init__(self, cache_manager, **kwargs):
+        super().__init__(**kwargs)
+        self.cache_manager = cache_manager
+
+    def prefill_execution_mode(self, seq):
+        return self.cache_manager.prefill_execution_mode(seq)
+
+    def prefill_batch_compatibility_key(self, seq):
+        return self.cache_manager.prefill_batch_compatibility_key(seq)
+
+    def min_final_prefill_chunk_size(self, seq):
+        return self.cache_manager.min_final_prefill_chunk_size(seq)
+
+    def reset_prefill_execution_state(self, seq_id):
+        self.cache_manager.reset_prefill_execution_state(seq_id)
+
+    def complete_prefill_execution(self, seq):
+        self.cache_manager.complete_prefill_execution(seq)
+
+
 def make_scheduler(policy, *, method="", chunk=5, max_tokens=10, oracle=None):
     cfg = SimpleNamespace(
         max_num_seqs_in_batch=4,
@@ -165,7 +213,15 @@ def make_scheduler(policy, *, method="", chunk=5, max_tokens=10, oracle=None):
         snapkv_window_size=2,
         vllm_sparse_method=method,
     )
-    return Scheduler(cfg, oracle or FakeMemoryOracle())
+    if oracle is None:
+        oracle = FakeMemoryOracle(
+            execution_mode=(
+                PREFILL_EXECUTION_FULL
+                if policy == PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH
+                else PREFILL_EXECUTION_CHUNKED
+            )
+        )
+    return Scheduler(cfg, oracle)
 
 
 def make_sparse_controller_config():
@@ -406,6 +462,136 @@ class PrefillPolicyRegistryTest(unittest.TestCase):
         self.assertEqual(tuple(keep_indices.shape), (2, 2, 5))
         self.assertEqual(keep_indices[0, 0].tolist(), [0, 1, 9, 10, 11])
 
+    def test_streamingllm_prefill_eviction_finalizes_only_final_sequences(self):
+        class FakeStreamingManager:
+            device = torch.device("cpu")
+
+            def __init__(self):
+                self.calls = []
+
+            def free_part_slots_batch_layers(self, layer_indices, seqs, keep_indices):
+                self.calls.append((list(layer_indices), list(seqs), keep_indices.clone()))
+
+            def free_part_slots(self, layer_idx, seq, keep_indices):
+                self.calls.append(([layer_idx], [seq], keep_indices[None, :].clone()))
+
+        cfg = make_sparse_controller_config()
+        cfg.vllm_sparse_method = "streamingllm"
+        cfg.hf_config.num_hidden_layers = 1
+        cfg.num_sink_tokens = 2
+        cfg.num_recent_tokens = 3
+        manager = FakeStreamingManager()
+        controller = SparseController(cfg, manager)
+        final_seq = seq_with_len(12)
+        partial_seq = seq_with_len(16)
+        final_seq.current_chunk_size = 4
+        final_seq.num_prefilled_tokens = 8
+        partial_seq.current_chunk_size = 4
+        partial_seq.num_prefilled_tokens = 8
+        controller.layer_batch_sparse_states[0].context_lens = torch.tensor(
+            [12, 12], dtype=torch.int32
+        )
+
+        controller._streamingllm_prefill_eviction([final_seq, partial_seq])
+
+        self.assertEqual(len(manager.calls), 1)
+        self.assertEqual(manager.calls[0][1], [final_seq])
+
+    def test_snapkv_prefill_eviction_finalizes_only_final_sequences(self):
+        class FakeSnapManager:
+            device = torch.device("cpu")
+
+            def __init__(self):
+                self.popped = []
+                self.freed = []
+
+            def pop_prefill_attention_score(self, layer_idx, seq):
+                self.popped.append((layer_idx, seq.seq_id))
+                return torch.arange(8, dtype=torch.float32)
+
+            def free_part_slots(self, layer_idx, seq, keep_indices):
+                self.freed.append((layer_idx, seq.seq_id, keep_indices.clone()))
+
+        cfg = make_sparse_controller_config()
+        cfg.vllm_sparse_method = "snapkv"
+        cfg.num_sink_tokens = 1
+        cfg.num_recent_tokens = 1
+        cfg.decode_keep_tokens = 3
+        cfg.pool_kernel_size = 1
+        cfg.snapkv_num_full_layers = 0
+        cfg.pyramid_layer_ratios = None
+        manager = FakeSnapManager()
+        controller = SparseController(cfg, manager)
+        final_seq = seq_with_len(8)
+        partial_seq = seq_with_len(12)
+        final_seq.current_chunk_size = 4
+        final_seq.num_prefilled_tokens = 4
+        partial_seq.current_chunk_size = 4
+        partial_seq.num_prefilled_tokens = 4
+
+        controller._snapkv_prefill_eviction([final_seq, partial_seq])
+
+        self.assertEqual(manager.popped, [(0, final_seq.seq_id)])
+        self.assertEqual(len(manager.freed), 1)
+        self.assertEqual(manager.freed[0][1], final_seq.seq_id)
+
+    def test_pyramid_materialization_uses_cpu_context_lengths_once_per_layer(self):
+        from sparsevllm.utils.context import reset_context, set_context
+
+        class FakePyramidManager:
+            def __init__(self):
+                self.cpu_len_calls = 0
+                self.materialized = []
+
+            def has_prefill_staging_view(self, layer_idx):
+                return layer_idx == 0
+
+            def requires_long_prefill_offload(self, seq):
+                del seq
+                return True
+
+            def prefill_staging_context_lens_cpu(self, layer_idx):
+                self.cpu_len_calls += 1
+                self.asserted_layer = layer_idx
+                return (7, 5)
+
+            def get_prefill_staging_view(self, layer_idx):
+                raise AssertionError(
+                    f"unexpected CUDA staging-length read for layer={layer_idx}"
+                )
+
+            def materialize_prefill_staging_layer_batch(self, layer_idx, values):
+                self.materialized.append((layer_idx, values))
+
+        manager = FakePyramidManager()
+        controller = object.__new__(SparseController)
+        controller.sparse_method = "pyramidkv"
+        controller.cache_manager = manager
+        controller.device = torch.device("cpu")
+        controller.config = SimpleNamespace()
+        controller._is_kv_layer = lambda layer_idx: layer_idx == 0
+        controller._get_layer_budget = lambda layer_idx, is_prefill: None
+        seq_a = seq_with_len(7)
+        seq_b = seq_with_len(5)
+        seq_a.current_chunk_size = 2
+        seq_a.num_prefilled_tokens = 5
+        seq_b.current_chunk_size = 2
+        seq_b.num_prefilled_tokens = 3
+
+        reset_context()
+        set_context(is_prefill=True, cache_manager=manager, seqs=[seq_a, seq_b])
+        try:
+            controller.on_layer_attention_end(0)
+        finally:
+            reset_context()
+
+        self.assertEqual(manager.cpu_len_calls, 1)
+        self.assertEqual(len(manager.materialized), 1)
+        self.assertEqual(
+            [int(indices.numel()) for _, indices in manager.materialized[0][1]],
+            [7, 5],
+        )
+
 
 class StandardCacheManagerAdmissionTest(unittest.TestCase):
     def make_manager_for_prefill_estimate(
@@ -486,19 +672,20 @@ class StandardCacheManagerAdmissionTest(unittest.TestCase):
         self.assertEqual(manager.config.chunk_prefill_size, 98304)
         self.assertEqual(manager.config.long_prefill_offload_threshold, 98304)
 
-    def test_long_policy_requires_matching_chunk_and_threshold(self):
+    def test_long_policy_keeps_explicit_chunk_below_threshold(self):
         manager = self.make_manager_for_prefill_estimate(
             estimated_max_tokens=93828,
             policy=PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
-            chunk_prefill_size=98304,
+            chunk_prefill_size=4096,
             long_prefill_offload_threshold=8192,
         )
 
-        with self.assertRaisesRegex(
-            AssertionError,
-            "long_prefill_offload_threshold to equal chunk_prefill_size",
-        ):
+        with patch.dict(os.environ, {"SPARSEVLLM_ALLOW_LARGE_PREFILL_CHUNK": "0"}):
             manager._get_available_slots_info()
+
+        self.assertEqual(manager.config.chunk_prefill_size, 4096)
+        self.assertEqual(manager.config.long_prefill_offload_threshold, 8192)
+
 
     def test_prefill_token_estimate_keeps_sixteen_x_activation_headroom(self):
         total_memory = 80 * 1024**3
@@ -684,7 +871,7 @@ class PrefillPolicyConfigTest(unittest.TestCase):
 
         self.assertEqual(cfg.chunk_prefill_size, 4096)
 
-    def test_long_policy_derives_chunk_and_batch_cap_from_offload_threshold(self):
+    def test_long_policy_keeps_explicit_chunk_and_uses_threshold_for_batch_cap(self):
         with patch.dict(os.environ, {}, clear=True):
             cfg = self.make_config(
                 vllm_sparse_method="pyramidkv",
@@ -694,16 +881,51 @@ class PrefillPolicyConfigTest(unittest.TestCase):
             )
 
         self.assertEqual(cfg.long_prefill_offload_threshold, 8192)
-        self.assertEqual(cfg.chunk_prefill_size, 8192)
+        self.assertEqual(cfg.chunk_prefill_size, 4096)
         self.assertEqual(cfg.max_num_batched_tokens, 8192)
 
-    def test_long_policy_offload_threshold_defaults_to_96k(self):
+    def test_long_policy_offload_threshold_defaults_to_64k(self):
         with patch.dict(os.environ, {}, clear=True):
             cfg = self.make_config(vllm_sparse_method="pyramidkv")
 
-        self.assertEqual(cfg.long_prefill_offload_threshold, 96 * 1024)
-        self.assertEqual(cfg.chunk_prefill_size, 96 * 1024)
-        self.assertEqual(cfg.max_num_batched_tokens, 96 * 1024)
+        self.assertEqual(cfg.long_prefill_offload_threshold, 64 * 1024)
+        self.assertEqual(cfg.chunk_prefill_size, 64 * 1024)
+        self.assertEqual(cfg.max_num_batched_tokens, 64 * 1024)
+
+    def test_long_policy_accepts_chunk_equal_to_threshold(self):
+        cfg = self.make_config(
+            vllm_sparse_method="pyramidkv",
+            chunk_prefill_size=8192,
+            long_prefill_offload_threshold=8192,
+        )
+
+        self.assertEqual(cfg.chunk_prefill_size, 8192)
+        self.assertEqual(cfg.long_prefill_offload_threshold, 8192)
+
+    def test_long_policy_rejects_chunk_above_threshold(self):
+        with self.assertRaisesRegex(ValueError, "chunk_prefill_size <="):
+            self.make_config(
+                vllm_sparse_method="pyramidkv",
+                chunk_prefill_size=8193,
+                long_prefill_offload_threshold=8192,
+            )
+
+    def test_snapkv_rejects_chunk_smaller_than_score_window(self):
+        with self.assertRaisesRegex(ValueError, "snapkv_window_size"):
+            self.make_config(
+                vllm_sparse_method="snapkv",
+                chunk_prefill_size=31,
+                snapkv_window_size=32,
+            )
+
+    def test_pyramidkv_rejects_chunk_smaller_than_score_window(self):
+        with self.assertRaisesRegex(ValueError, "snapkv_window_size"):
+            self.make_config(
+                vllm_sparse_method="pyramidkv",
+                chunk_prefill_size=31,
+                long_prefill_offload_threshold=64,
+                snapkv_window_size=32,
+            )
 
     def test_long_policy_offload_threshold_env_overrides_config(self):
         with patch.dict(
@@ -1559,7 +1781,224 @@ class DeltaKVLessMemoryCudaGraphReserveTest(unittest.TestCase):
 
 
 class SchedulerPrefillPolicyTest(unittest.TestCase):
-    def test_model_runner_uses_policy_chunk_as_long_prefill_boundary(self):
+    def test_pyramid_modes_use_attached_residual_at_boundary(self):
+        pyramid = object.__new__(SnapKVCacheManager)
+        pyramid.config = SimpleNamespace(
+            vllm_sparse_method="pyramidkv",
+            pyramid_layer_ratios=[1.0],
+            prefill_schedule_policy=PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
+            chunk_prefill_size=2,
+            long_prefill_offload_threshold=5,
+        )
+        pyramid.pyramidkv_prefill_staging_kv_cache = torch.empty(
+            (2, 32, 1, 1), dtype=torch.float32
+        )
+
+        for residual, expected in (
+            (4, PREFILL_EXECUTION_FULL),
+            (5, PREFILL_EXECUTION_FULL),
+            (6, PREFILL_EXECUTION_RAW_OFFLOAD),
+        ):
+            with self.subTest(residual=residual):
+                fresh = seq_with_len(residual)
+                self.assertEqual(pyramid.prefill_execution_mode(fresh), expected)
+
+                resumed = seq_with_len(10 + residual)
+                resumed.num_prefilled_tokens = 10
+                resumed.chain_status = "resumed"
+                resumed.chain_reused_tokens = 10
+                self.assertEqual(pyramid.prefill_execution_mode(resumed), expected)
+
+    def test_deltakv_fresh_modes_use_residual_boundary(self):
+        manager = object.__new__(DeltaKVLessMemoryCacheManager)
+        manager.config = SimpleNamespace(
+            prefill_schedule_policy=PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
+            chunk_prefill_size=2,
+            long_prefill_offload_threshold=5,
+        )
+
+        for residual, expected in (
+            (4, PREFILL_EXECUTION_FULL),
+            (5, PREFILL_EXECUTION_FULL),
+            (6, PREFILL_EXECUTION_RAW_OFFLOAD),
+        ):
+            with self.subTest(residual=residual):
+                self.assertEqual(
+                    manager.prefill_execution_mode(seq_with_len(residual)),
+                    expected,
+                )
+
+    def test_long_raw_offload_mode_stays_sticky_across_scheduler_steps(self):
+        managers = []
+        pyramid = object.__new__(SnapKVCacheManager)
+        pyramid.config = SimpleNamespace(
+            vllm_sparse_method="pyramidkv",
+            pyramid_layer_ratios=[1.0],
+            prefill_schedule_policy=PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
+            chunk_prefill_size=2,
+            long_prefill_offload_threshold=5,
+            snapkv_window_size=0,
+        )
+        pyramid.pyramidkv_prefill_staging_kv_cache = torch.empty(
+            (2, 8, 1, 1), dtype=torch.float32
+        )
+        managers.append(("pyramidkv", pyramid))
+
+        deltakv = object.__new__(DeltaKVLessMemoryCacheManager)
+        deltakv.config = SimpleNamespace(
+            prefill_schedule_policy=PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
+            chunk_prefill_size=2,
+            long_prefill_offload_threshold=5,
+        )
+        managers.append(("deltakv", deltakv))
+
+        for method, manager in managers:
+            with self.subTest(method=method):
+                scheduler = make_scheduler(
+                    PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
+                    method=method,
+                    chunk=2,
+                    max_tokens=8,
+                    oracle=CacheManagerPolicyOracle(manager),
+                )
+                seq = seq_with_len(8)
+                scheduler.add(seq)
+                modes = []
+                chunks = []
+                while scheduler.waiting:
+                    scheduled, is_prefill, _ = scheduler.schedule()
+                    self.assertTrue(is_prefill)
+                    modes.append(scheduler.prefill_execution_mode_for_batch(scheduled))
+                    chunks.append(int(seq.current_chunk_size))
+                    scheduler.postprocess(scheduled, [99], is_prefill=True)
+
+                self.assertEqual(modes, [PREFILL_EXECUTION_RAW_OFFLOAD] * 4)
+                self.assertEqual(chunks, [2, 2, 2, 2])
+                self.assertEqual(
+                    getattr(manager, "_raw_offload_prefill_phases", {}),
+                    {},
+                )
+
+    def test_deltakv_resumed_raw_offload_fails_before_row_mutation(self):
+        manager = object.__new__(DeltaKVLessMemoryCacheManager)
+        manager.config = SimpleNamespace(
+            prefill_schedule_policy=PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
+            chunk_prefill_size=2,
+            long_prefill_offload_threshold=5,
+        )
+        manager.row_seq_lens = np.array([10], dtype=np.int32)
+        manager.seq_id_to_row = {0: 0}
+        seq = seq_with_len(16)
+        seq.num_prefilled_tokens = 10
+        seq.chain_status = "resumed"
+        seq.chain_reused_tokens = 10
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "DeltaKV does not support attached-prefix prefill",
+        ):
+            manager.prefill_execution_mode(seq)
+
+        self.assertEqual(int(manager.row_seq_lens[0]), 10)
+        self.assertEqual(seq.num_prefilled_tokens, 10)
+
+    def test_scheduler_refreshes_prefix_hit_before_execution_mode_classification(self):
+        events = []
+
+        class AttachAwareOracle(FakeMemoryOracle):
+            def refresh_prefix_cache_hit(self, seq):
+                events.append("refresh")
+                super().refresh_prefix_cache_hit(seq)
+
+            def prefill_execution_mode(self, seq):
+                events.append(
+                    ("mode", self.remaining_prefill_tokens(seq))
+                )
+                return (
+                    PREFILL_EXECUTION_FULL
+                    if self.remaining_prefill_tokens(seq) <= 5
+                    else PREFILL_EXECUTION_RAW_OFFLOAD
+                )
+
+        oracle = AttachAwareOracle(prefix_hit_len=8)
+        scheduler = make_scheduler_with_oracle(
+            PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
+            oracle,
+            method="pyramidkv",
+            chunk=2,
+            max_tokens=12,
+        )
+        seq = seq_with_len(12)
+        scheduler.add(seq)
+
+        scheduled, is_prefill, _ = scheduler.schedule()
+
+        self.assertTrue(is_prefill)
+        self.assertEqual(scheduled, [seq])
+        self.assertEqual(seq.num_prefilled_tokens, 8)
+        self.assertEqual(seq.current_chunk_size, 4)
+        self.assertEqual(events[0], "refresh")
+        self.assertTrue(all(event == "refresh" or event == ("mode", 4) for event in events))
+
+    def test_full_mode_batches_complete_residuals_without_chunking(self):
+        scheduler = make_scheduler(
+            PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
+            method="pyramidkv",
+            chunk=2,
+            max_tokens=10,
+            oracle=FakeMemoryOracle(execution_mode=PREFILL_EXECUTION_FULL),
+        )
+        seq_a = seq_with_len(5)
+        seq_b = seq_with_len(4)
+        scheduler.add(seq_a)
+        scheduler.add(seq_b)
+
+        scheduled, is_prefill, _ = scheduler.schedule()
+
+        self.assertTrue(is_prefill)
+        self.assertEqual(scheduled, [seq_a, seq_b])
+        self.assertEqual([seq.current_chunk_size for seq in scheduled], [5, 4])
+
+    def test_pyramidkv_separates_fresh_staged_and_resumed_resident_full_batches(self):
+        manager = object.__new__(SnapKVCacheManager)
+        manager.config = SimpleNamespace(
+            vllm_sparse_method="pyramidkv",
+            pyramid_layer_ratios=[1.0],
+            prefill_schedule_policy=PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
+            chunk_prefill_size=2,
+            long_prefill_offload_threshold=5,
+            snapkv_window_size=0,
+        )
+        manager.pyramidkv_prefill_staging_num_slots = 16
+        manager.pyramidkv_prefill_staging_kv_cache = torch.empty(
+            (2, 16, 1, 1), dtype=torch.float32
+        )
+        scheduler = make_scheduler(
+            PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
+            method="pyramidkv",
+            chunk=2,
+            max_tokens=10,
+            oracle=CacheManagerPolicyOracle(manager),
+        )
+        fresh = seq_with_len(4)
+        resumed = seq_with_len(14)
+        resumed.num_prefilled_tokens = 10
+        resumed.chain_status = "resumed"
+        resumed.chain_reused_tokens = 10
+        scheduler.add(fresh)
+        scheduler.add(resumed)
+
+        scheduled, is_prefill, _ = scheduler.schedule()
+
+        self.assertTrue(is_prefill)
+        self.assertEqual(scheduled, [fresh])
+        self.assertEqual(fresh.current_chunk_size, 4)
+        self.assertIsNone(resumed.current_chunk_size)
+        self.assertTrue(
+            manager._should_use_pyramidkv_full_prefill_staging(scheduled)
+        )
+
+    def test_model_runner_keeps_long_text_boundary_decode_only(self):
         runner = object.__new__(ModelRunner)
         runner.config = SimpleNamespace(
             prefill_schedule_policy=PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
@@ -1570,7 +2009,10 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
             decode_keep_tokens=4096,
         )
 
-        self.assertEqual(ModelRunner._long_text_threshold(runner, is_prefill=True), 8192)
+        self.assertEqual(
+            ModelRunner._long_text_threshold(runner, is_prefill=True),
+            64 + 128 + 4096,
+        )
         self.assertEqual(
             ModelRunner._long_text_threshold(runner, is_prefill=False),
             64 + 128 + 4096,
@@ -1587,7 +2029,7 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
             ModelRunner._is_long_text_batch(runner, seqs, is_prefill=False)
         )
 
-    def test_all_chunked_keeps_sparse_long_and_short_separate(self):
+    def test_all_chunked_batches_sparse_mixed_lengths(self):
         scheduler = make_scheduler(
             PREFILL_POLICY_ALL_CHUNKED,
             method="quest",
@@ -1600,9 +2042,9 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
         scheduled, is_prefill, _ = scheduler.schedule()
 
         self.assertTrue(is_prefill)
-        self.assertEqual(scheduled, [long_seq])
+        self.assertEqual(scheduled, [long_seq, short_seq])
         self.assertEqual(long_seq.current_chunk_size, 5)
-        self.assertEqual(short_seq.current_chunk_size, None)
+        self.assertEqual(short_seq.current_chunk_size, 4)
 
     def test_vanilla_decode_batches_across_sparse_long_text_boundary(self):
         scheduler = make_scheduler(
@@ -1716,7 +2158,7 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
         self.assertEqual(scheduled, [final_window])
         self.assertEqual(final_window.current_chunk_size, 2)
 
-    def test_snapkv_final_prefill_window_only_applies_to_scored_long_prompts(self):
+    def test_snapkv_final_prefill_window_applies_when_final_physical_context_exceeds_budget(self):
         manager = object.__new__(SnapKVCacheManager)
         manager.num_kv_layers = 2
         manager.config = SimpleNamespace(
@@ -1730,14 +2172,107 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
         )
 
         self.assertEqual(manager.min_final_prefill_chunk_size(seq_with_len(12)), 2)
-        self.assertEqual(manager.min_final_prefill_chunk_size(seq_with_len(11)), 0)
+        self.assertEqual(manager.min_final_prefill_chunk_size(seq_with_len(11)), 2)
+        self.assertEqual(manager.min_final_prefill_chunk_size(seq_with_len(6)), 0)
 
         manager.config.snapkv_num_full_layers = 2
         self.assertEqual(manager.min_final_prefill_chunk_size(seq_with_len(12)), 0)
 
         manager.config.vllm_sparse_method = "pyramidkv"
         manager.config.snapkv_num_full_layers = 0
-        self.assertEqual(manager.min_final_prefill_chunk_size(seq_with_len(12)), 0)
+        manager.config.pyramid_layer_ratios = [1.0, 0.5]
+        manager.runtime_layout = identity_runtime_layout(2)
+        self.assertEqual(manager.min_final_prefill_chunk_size(seq_with_len(12)), 2)
+
+    def test_pyramidkv_scheduler_preserves_final_score_window(self):
+        manager = object.__new__(SnapKVCacheManager)
+        manager.num_kv_layers = 1
+        manager.runtime_layout = identity_runtime_layout(1)
+        manager.config = SimpleNamespace(
+            vllm_sparse_method="pyramidkv",
+            pyramid_layer_ratios=[1.0],
+            prefill_schedule_policy=PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
+            long_prefill_offload_threshold=5,
+            chunk_prefill_size=4,
+            snapkv_window_size=3,
+            snapkv_num_full_layers=0,
+            num_sink_tokens=1,
+            decode_keep_tokens=4,
+            num_recent_tokens=1,
+        )
+        manager.pyramidkv_prefill_staging_kv_cache = torch.empty(
+            (2, 10, 1, 1), dtype=torch.float32
+        )
+        scheduler = make_scheduler(
+            PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
+            method="pyramidkv",
+            chunk=4,
+            max_tokens=10,
+            oracle=CacheManagerPolicyOracle(manager),
+        )
+        seq = seq_with_len(10)
+        scheduler.add(seq)
+        chunks = []
+
+        while scheduler.waiting:
+            scheduled, is_prefill, _ = scheduler.schedule()
+            self.assertTrue(is_prefill)
+            self.assertEqual(scheduled, [seq])
+            chunks.append(int(seq.current_chunk_size))
+            scheduler.postprocess(scheduled, [99], is_prefill=True)
+
+        self.assertEqual(chunks, [4, 3, 3])
+
+    def test_pyramidkv_resumed_raw_offload_preserves_final_score_window(self):
+        manager = object.__new__(SnapKVCacheManager)
+        manager.num_kv_layers = 1
+        manager.runtime_layout = identity_runtime_layout(1)
+        manager.config = SimpleNamespace(
+            vllm_sparse_method="pyramidkv",
+            pyramid_layer_ratios=[1.0],
+            prefill_schedule_policy=PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
+            long_prefill_offload_threshold=64,
+            chunk_prefill_size=32,
+            snapkv_window_size=8,
+            snapkv_num_full_layers=0,
+            num_sink_tokens=0,
+            decode_keep_tokens=100,
+            num_recent_tokens=0,
+        )
+        manager.pyramidkv_prefill_staging_kv_cache = torch.empty(
+            (2, 256, 1, 1), dtype=torch.float32
+        )
+        manager.chain_physical_kv_len = lambda layer_idx, seq_id: 30
+        scheduler = make_scheduler(
+            PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
+            method="pyramidkv",
+            chunk=32,
+            max_tokens=256,
+            oracle=CacheManagerPolicyOracle(manager),
+        )
+        seq = seq_with_len(190)
+        seq.chain_status = "resumed"
+        seq.chain_reused_tokens = 90
+        seq.num_prefilled_tokens = 90
+        scheduler.add(seq)
+        chunks = []
+
+        while scheduler.waiting:
+            scheduled, is_prefill, _ = scheduler.schedule()
+            self.assertTrue(is_prefill)
+            self.assertEqual(scheduled, [seq])
+            chunks.append(int(seq.current_chunk_size))
+            if seq.is_last_chunk_prefill:
+                manager._pyramidkv_prefill_staging_context_lens_cpu_by_layer = {
+                    0: (130,)
+                }
+                self.assertEqual(
+                    manager._prefill_score_rows(0, [seq]),
+                    [(0, seq, 122, 130)],
+                )
+            scheduler.postprocess(scheduled, [99], is_prefill=True)
+
+        self.assertEqual(chunks, [32, 32, 28, 8])
 
     def test_snapkv_scoring_accepts_preserved_reported_final_windows(self):
         manager = object.__new__(SnapKVCacheManager)
@@ -2148,6 +2683,47 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
         self.assertEqual(manager.buffer_req_to_token_slots_tensor[1, 0, :2].tolist(), [118, 119])
         self.assertEqual(manager.buffer_req_to_token_slots_tensor[1, 1, :2].tolist(), [116, 117])
 
+    def test_pyramidkv_resumed_full_prefill_appends_to_physical_row(self):
+        manager = object.__new__(SnapKVCacheManager)
+        manager.runtime_layout = identity_runtime_layout(1)
+        manager.config = SimpleNamespace(vllm_sparse_method="pyramidkv")
+        manager.device = torch.device("cpu")
+        manager.num_layers = 1
+        manager.max_model_len = 16
+        manager.seq_id_to_row = [{10: 0}]
+        manager.free_rows = [deque()]
+        manager.row_seq_lens = [np.array([3], dtype=np.int32)]
+        manager.buffer_req_to_token_slots_tensor = None
+        manager.buffer_req_to_token_slots = [
+            torch.tensor([[1, 2, 3] + [0] * 13], dtype=torch.int32)
+        ]
+        manager.free_slots_stack_tensor = None
+        manager.free_slots_stack = [torch.arange(20, 40, dtype=torch.int32)]
+        manager._num_free_slots = [20]
+        manager.layer_batch_states = [SimpleNamespace()]
+        manager._prefill_attn_score_accumulators = {}
+        manager._pyramidkv_prefill_staging_active = False
+        manager._pyramidkv_can_use_full_prefill_staging = lambda: True
+        manager._should_use_pyramidkv_long_prefill_offload_staging = lambda seqs: False
+        manager._should_use_pyramidkv_full_prefill_staging = lambda seqs: False
+
+        seq = Sequence(list(range(10)), SamplingParams(max_tokens=1))
+        seq.seq_id = 10
+        seq.chain_status = "resumed"
+        seq.chain_reused_tokens = 8
+        seq.num_prefilled_tokens = 8
+        seq.current_chunk_size = 2
+
+        input_ids, positions, _ = SnapKVCacheManager._prepare_prefill(
+            manager,
+            [seq],
+        )
+
+        self.assertEqual(manager.row_seq_lens[0].tolist(), [5])
+        self.assertEqual(manager.layer_batch_states[0].context_lens.tolist(), [5])
+        self.assertEqual(input_ids.tolist(), [8, 9])
+        self.assertEqual(positions.tolist(), [8, 9])
+
     def test_pyramidkv_batch_materialize_updates_rows_and_kv(self):
         manager = object.__new__(SnapKVCacheManager)
         manager.runtime_layout = identity_runtime_layout(1)
@@ -2199,6 +2775,7 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
             pyramid_layer_ratios=[1.0],
             prefill_schedule_policy=PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
             chunk_prefill_size=1024,
+            long_prefill_offload_threshold=1024,
             max_num_batched_tokens=2048,
         )
         manager.pyramidkv_prefill_staging_num_slots = 4096
@@ -2211,13 +2788,14 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
         self.assertFalse(SnapKVCacheManager._should_use_pyramidkv_full_prefill_staging(manager, [seq]))
         self.assertTrue(SnapKVCacheManager._should_use_pyramidkv_long_prefill_offload_staging(manager, [seq]))
 
-    def test_long_prefill_offload_threshold_equals_chunk_size(self):
+    def test_long_prefill_offload_threshold_is_independent_from_chunk_size(self):
         pyramid = object.__new__(SnapKVCacheManager)
         pyramid.config = SimpleNamespace(
             vllm_sparse_method="pyramidkv",
             pyramid_layer_ratios=[1.0],
             prefill_schedule_policy=PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
             chunk_prefill_size=4096,
+            long_prefill_offload_threshold=8192,
             max_num_batched_tokens=128000,
         )
         pyramid.pyramidkv_prefill_staging_num_slots = 128356
@@ -2227,11 +2805,12 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
         deltakv.config = SimpleNamespace(
             prefill_schedule_policy=PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
             chunk_prefill_size=4096,
+            long_prefill_offload_threshold=8192,
             max_num_batched_tokens=128000,
         )
 
-        boundary_seq = seq_with_len(4096)
-        long_seq = seq_with_len(4097)
+        boundary_seq = seq_with_len(8192)
+        long_seq = seq_with_len(8193)
         self.assertFalse(SnapKVCacheManager.requires_long_prefill_offload(pyramid, boundary_seq))
         self.assertFalse(DeltaKVCacheManager.requires_long_prefill_offload(deltakv, boundary_seq))
         self.assertTrue(SnapKVCacheManager.requires_long_prefill_offload(pyramid, long_seq))
@@ -2268,6 +2847,68 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
 
         self.assertEqual(manager.pyramidkv_prefill_staging_kv_cache[0, :2, 0, 0].tolist(), [1.0, 2.0])
         self.assertEqual(manager.pyramidkv_prefill_staging_kv_cache[1, :2, 0, 0].tolist(), [11.0, 12.0])
+
+    def test_pyramidkv_resumed_offload_keeps_resident_prefix_and_offloads_only_residual(self):
+        from sparsevllm.engine.cache_manager.raw_kv_offload import RawKVOffloadBuffer
+
+        manager = object.__new__(SnapKVCacheManager)
+        manager.runtime_layout = identity_runtime_layout(1)
+        manager.config = SimpleNamespace(vllm_sparse_method="pyramidkv")
+        manager.device = torch.device("cpu")
+        manager.num_layers = 1
+        manager.seq_id_to_row = [{10: 0}]
+        manager.row_seq_lens = [np.array([2], dtype=np.int32)]
+        manager.buffer_req_to_token_slots = [
+            torch.tensor([[4, 5, 0, 0, 0, 0]], dtype=torch.int32)
+        ]
+        k_cache = torch.zeros((8, 1, 1), dtype=torch.float32)
+        v_cache = torch.zeros((8, 1, 1), dtype=torch.float32)
+        k_cache[4:6, 0, 0] = torch.tensor([101.0, 102.0])
+        v_cache[4:6, 0, 0] = torch.tensor([201.0, 202.0])
+        manager.kv_cache = [(k_cache, v_cache)]
+        manager.raw_kv_offload_buffer = RawKVOffloadBuffer(
+            pin_memory=False,
+            mode="chunked",
+        )
+        manager.pyramidkv_prefill_staging_kv_cache = torch.zeros(
+            (2, 8, 1, 1), dtype=torch.float32
+        )
+        manager._pyramidkv_prefill_staging_active = True
+        manager._pyramidkv_long_prefill_offload_step_active = True
+        manager._pyramidkv_long_prefill_offload_seq_id = 10
+        manager._pyramidkv_long_prefill_offload_residual_start = 10
+        manager._pyramidkv_long_prefill_offload_resident_prefix_lens = {0: 2}
+        manager._pyramidkv_long_prefill_offload_start = 10
+        manager._pyramidkv_long_prefill_offload_end = 12
+        manager._pyramidkv_long_prefill_offload_total_len = 16
+        manager._pyramidkv_long_prefill_offload_is_last_chunk = False
+        manager.pyramidkv_prefill_staging_kv_cache[0, 2:4, 0, 0] = torch.tensor(
+            [1.0, 2.0]
+        )
+        manager.pyramidkv_prefill_staging_kv_cache[1, 2:4, 0, 0] = torch.tensor(
+            [11.0, 12.0]
+        )
+
+        SnapKVCacheManager._offload_pyramidkv_long_prefill_layer(manager, 0)
+        entry = manager.raw_kv_offload_buffer._entries[
+            (0, 0, "pyramidkv_post_rope")
+        ]
+        self.assertEqual(entry.capacity, 6)
+        self.assertEqual(entry.filled_until, 2)
+
+        manager.pyramidkv_prefill_staging_kv_cache.zero_()
+        manager._pyramidkv_long_prefill_offload_start = 12
+        manager._pyramidkv_long_prefill_offload_end = 14
+        SnapKVCacheManager.before_prefill_layer_attention(manager, 0, None)
+
+        self.assertEqual(
+            manager.pyramidkv_prefill_staging_kv_cache[0, :4, 0, 0].tolist(),
+            [101.0, 102.0, 1.0, 2.0],
+        )
+        self.assertEqual(
+            manager.pyramidkv_prefill_staging_kv_cache[1, :4, 0, 0].tolist(),
+            [201.0, 202.0, 11.0, 12.0],
+        )
 
     def test_pyramidkv_long_prefill_offload_uses_staged_prefetch(self):
         manager = object.__new__(SnapKVCacheManager)
@@ -2948,12 +3589,15 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
 
 class DeltaKVFullPrefillStagingTest(unittest.TestCase):
     def _make_raw_deltakv_prefill_manager(self):
+        from sparsevllm.engine.cache_manager.raw_kv_offload import RawKVOffloadBuffer
+
         max_model_len = 16
-        manager = object.__new__(DeltaKVCacheManager)
+        manager = object.__new__(DeltaKVLessMemoryCacheManager)
         manager.device = torch.device("cpu")
         manager.config = SimpleNamespace(
             prefill_schedule_policy=PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
             chunk_prefill_size=2,
+            long_prefill_offload_threshold=5,
             max_num_batched_tokens=16,
             num_sink_tokens=1,
             num_recent_tokens=1,
@@ -2985,6 +3629,16 @@ class DeltaKVFullPrefillStagingTest(unittest.TestCase):
         manager.full_layer_batch_states = SimpleNamespace()
         manager.deltakv_layer_batch_states = SimpleNamespace()
         manager._deltakv_prefill_staging_active = False
+        manager.deltakv_prefill_staging_kv_cache = torch.zeros(
+            (2, max_model_len, 1, 1), dtype=torch.float32
+        )
+        manager.deltakv_prefill_staging_pre_rope_k_cache = torch.zeros(
+            (max_model_len, 1, 1), dtype=torch.float32
+        )
+        manager.raw_kv_offload_buffer = RawKVOffloadBuffer(
+            pin_memory=False,
+            mode="chunked",
+        )
         manager._deltakv_full_prefill_plans = {}
         manager._deltakv_full_prefill_compressed_layers = set()
         manager._deltakv_long_prefill_offload_row_idx = None
@@ -3031,6 +3685,62 @@ class DeltaKVFullPrefillStagingTest(unittest.TestCase):
             manager.deltakv_layer_batch_states.slot_mapping,
             torch.arange(2, dtype=torch.int32),
         )
+
+    def test_fresh_raw_offload_tracks_chunk_rows_and_finalizes_once(self):
+        manager = self._make_raw_deltakv_prefill_manager()
+        manager._full_layer_kivi_enabled = lambda: False
+        manager._deltakv_restore_sparse_prefix_to_staging = (
+            lambda layer_idx, start: None
+        )
+        manager._debug_track_deltakv_full_slots = lambda *args, **kwargs: None
+        calls = []
+
+        def compress(layer_idx):
+            calls.append(("compress", int(layer_idx)))
+            manager._deltakv_full_prefill_compressed_layers.add(int(layer_idx))
+
+        manager._deltakv_compress_full_prefill_layer = compress
+        scheduler = make_scheduler(
+            PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
+            method="deltakv",
+            chunk=2,
+            max_tokens=8,
+            oracle=CacheManagerPolicyOracle(manager),
+        )
+        seq = seq_with_len(8)
+        scheduler.add(seq)
+        observed_row_lens = []
+        observed_modes = []
+        while scheduler.waiting:
+            scheduled, is_prefill, _ = scheduler.schedule()
+            self.assertTrue(is_prefill)
+            observed_modes.append(
+                scheduler.prefill_execution_mode_for_batch(scheduled)
+            )
+            manager.prepare_step(scheduled, is_prefill=True)
+            row_idx = manager.seq_id_to_row[seq.seq_id]
+            observed_row_lens.append(int(manager.row_seq_lens[row_idx]))
+            self.assertEqual(
+                int(manager.deltakv_layer_batch_states.context_lens[0]),
+                int(seq.num_prefilled_tokens + seq.current_chunk_size),
+            )
+            if seq.num_prefilled_tokens > 0:
+                manager.before_prefill_layer_attention(1, None)
+            start = int(seq.num_prefilled_tokens)
+            end = start + int(seq.current_chunk_size)
+            manager.deltakv_prefill_staging_pre_rope_k_cache[start:end] = 1
+            manager.deltakv_prefill_staging_kv_cache[1, start:end] = 2
+            manager.on_layer_attention_end(1)
+            manager.on_forward_end(scheduled, is_prefill=True)
+            scheduler.postprocess(scheduled, [99], is_prefill=True)
+
+        self.assertEqual(observed_modes, [PREFILL_EXECUTION_RAW_OFFLOAD] * 4)
+        self.assertEqual(observed_row_lens, [2, 4, 6, 8])
+        self.assertEqual(calls, [("compress", 1)])
+        self.assertFalse(manager._deltakv_prefill_staging_active)
+        self.assertEqual(manager._deltakv_full_prefill_plans, {})
+        self.assertEqual(manager.raw_kv_offload_buffer._entries, {})
+        self.assertEqual(int(manager.row_seq_lens[row_idx]), 8)
 
     def test_deltakv_sparse_decode_backend_controls_fa2_view(self):
         from sparsevllm.engine.cache_manager import DecodeComputeView
@@ -3112,6 +3822,7 @@ class DeltaKVFullPrefillStagingTest(unittest.TestCase):
         manager.config = SimpleNamespace(
             prefill_schedule_policy=PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
             chunk_prefill_size=5,
+            long_prefill_offload_threshold=5,
             max_num_batched_tokens=64,
         )
         manager.deltakv_layer_ids = [0]
@@ -3126,6 +3837,7 @@ class DeltaKVFullPrefillStagingTest(unittest.TestCase):
         manager.config = SimpleNamespace(
             prefill_schedule_policy=PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
             chunk_prefill_size=8192,
+            long_prefill_offload_threshold=8192,
             max_num_batched_tokens=16384,
         )
         manager.deltakv_layer_ids = [0]
@@ -3562,6 +4274,7 @@ class DeltaKVLessMemoryStorageContractTest(unittest.TestCase):
         manager.config = SimpleNamespace(
             prefill_schedule_policy=PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
             chunk_prefill_size=32768,
+            long_prefill_offload_threshold=32768,
             enable_full_layer_kivi_quant=True,
             full_layer_kv_quant_bits=4,
         )
@@ -3571,10 +4284,24 @@ class DeltaKVLessMemoryStorageContractTest(unittest.TestCase):
         seq.current_chunk_size = 11766
 
         self.assertTrue(DeltaKVLessMemoryCacheManager._should_use_full_prefill_staging(manager, [seq]))
+        peer = seq_with_len(4096)
+        peer.current_chunk_size = 4096
+        self.assertTrue(
+            DeltaKVLessMemoryCacheManager._should_use_full_prefill_staging(
+                manager,
+                [seq, peer],
+            )
+        )
 
         partial = seq_with_len(11766)
         partial.current_chunk_size = 4096
         self.assertFalse(DeltaKVLessMemoryCacheManager._should_use_full_prefill_staging(manager, [partial]))
+        self.assertFalse(
+            DeltaKVLessMemoryCacheManager._should_use_full_prefill_staging(
+                manager,
+                [seq, partial],
+            )
+        )
 
     def test_delta_quant_full_kivi_requests_full_prefill_when_step_slots_are_too_small(self):
         from sparsevllm.engine.cache_manager.deltakv_less_memory import DeltaKVLessMemoryCacheManager
@@ -3583,6 +4310,7 @@ class DeltaKVLessMemoryStorageContractTest(unittest.TestCase):
         manager.config = SimpleNamespace(
             prefill_schedule_policy=PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
             chunk_prefill_size=32768,
+            long_prefill_offload_threshold=32768,
             enable_full_layer_kivi_quant=True,
             full_layer_kv_quant_bits=4,
         )
@@ -3602,7 +4330,7 @@ class DeltaKVLessMemoryStorageContractTest(unittest.TestCase):
         )
 
         tiny = seq_with_len(16)
-        self.assertFalse(DeltaKVLessMemoryCacheManager.should_schedule_full_prefill(manager, tiny))
+        self.assertTrue(DeltaKVLessMemoryCacheManager.should_schedule_full_prefill(manager, tiny))
 
     def test_delta_quant_full_kivi_does_not_force_full_prefill_for_offload_candidate(self):
         from sparsevllm.engine.cache_manager.deltakv_less_memory import DeltaKVLessMemoryCacheManager
@@ -3611,6 +4339,7 @@ class DeltaKVLessMemoryStorageContractTest(unittest.TestCase):
         manager.config = SimpleNamespace(
             prefill_schedule_policy=PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
             chunk_prefill_size=1024,
+            long_prefill_offload_threshold=1024,
             max_num_batched_tokens=2048,
             enable_full_layer_kivi_quant=True,
             full_layer_kv_quant_bits=4,
@@ -4053,6 +4782,7 @@ class DeltaKVStaticDecodeRobustnessTest(unittest.TestCase):
         manager.config = SimpleNamespace(
             prefill_schedule_policy=PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
             chunk_prefill_size=8192,
+            long_prefill_offload_threshold=8192,
         )
         manager.deltakv_layer_ids = [1]
         manager._full_layer_kivi_enabled = lambda: True
@@ -4064,6 +4794,74 @@ class DeltaKVStaticDecodeRobustnessTest(unittest.TestCase):
 
         manager._deltakv_less_memory_prepare_full_prefill_staging = True
         self.assertTrue(manager._should_stage_full_layer_kivi_prefill(seq, 1024))
+
+    def test_kivi_short_batch_prefill_uses_disjoint_staging_ranges(self):
+        manager = object.__new__(DeltaKVLessMemoryCacheManager)
+        manager.device = torch.device("cpu")
+        manager.deltakv_prefill_staging_num_slots = 8
+        manager.seq_id_to_row = {}
+        manager.free_rows = deque([0, 1])
+        manager.row_seq_lens = np.zeros((2,), dtype=np.int32)
+        manager.full_layer_slots_map = torch.full((2, 8), -1, dtype=torch.int32)
+        first = seq_with_len(3)
+        second = seq_with_len(2)
+        first.current_chunk_size = 3
+        second.current_chunk_size = 2
+        manager._deltakv_less_memory_prepare_seqs = [first, second]
+        manager._deltakv_less_memory_full_prefill_staging_offset = 0
+        manager._should_stage_full_layer_kivi_prefill = lambda seq, size: True
+        manager._should_use_long_prefill_offload_staging = lambda seqs: False
+
+        first_slots = manager._allocate_full(first.seq_id, 3)
+        second_slots = manager._allocate_full(second.seq_id, 2)
+
+        self.assertTrue(torch.equal(first_slots, torch.tensor([0, 1, 2], dtype=torch.int32)))
+        self.assertTrue(torch.equal(second_slots, torch.tensor([3, 4], dtype=torch.int32)))
+        self.assertEqual(manager._deltakv_less_memory_full_prefill_staging_offset, 5)
+
+    def test_kivi_short_batch_finalize_reads_each_plan_staging_range(self):
+        manager = object.__new__(DeltaKVLessMemoryCacheManager)
+        manager.device = torch.device("cpu")
+        manager.head_dim = 8
+        manager.config = SimpleNamespace(
+            mlp_chunk_size=8,
+            full_layer_kivi_group_size=8,
+        )
+        manager.full_layer_ids = [0]
+        manager.full_layer_to_idx = {0: 0}
+        manager.deltakv_prefill_staging_kv_cache = torch.stack(
+            [
+                torch.arange(6, dtype=torch.float32).view(6, 1, 1),
+                (100 + torch.arange(6, dtype=torch.float32)).view(6, 1, 1),
+            ]
+        )
+        manager.full_kv_cache = torch.zeros((2, 1, 4, 1, 1), dtype=torch.float32)
+        manager._full_layer_kivi_full_prefill_materialized_layers = set()
+        manager._full_layer_kivi_full_prefill_plans = {
+            0: {
+                "staging_start": 0,
+                "keep_pos": torch.tensor([0, 1], dtype=torch.int32),
+                "keep_slots": torch.tensor([0, 1], dtype=torch.int32),
+                "block_slots": torch.empty((0,), dtype=torch.int32),
+            },
+            1: {
+                "staging_start": 3,
+                "keep_pos": torch.tensor([0, 1], dtype=torch.int32),
+                "keep_slots": torch.tensor([2, 3], dtype=torch.int32),
+                "block_slots": torch.empty((0,), dtype=torch.int32),
+            },
+        }
+
+        manager._full_layer_kivi_materialize_full_prefill_layer(0)
+
+        torch.testing.assert_close(
+            manager.full_kv_cache[0, 0, :, 0, 0],
+            torch.tensor([0.0, 1.0, 3.0, 4.0]),
+        )
+        torch.testing.assert_close(
+            manager.full_kv_cache[1, 0, :, 0, 0],
+            torch.tensor([100.0, 101.0, 103.0, 104.0]),
+        )
 
 
 if __name__ == "__main__":

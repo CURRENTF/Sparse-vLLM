@@ -678,10 +678,10 @@ queueing, and whether a benchmark measures the intended batch.
 
 | Parameter | Backend | Meaning |
 | --- | --- | --- |
-| `engine_prefill_chunk_size` | Sparse-vLLM | Max prefill chunk scheduled per sequence per step for `all_chunked`. Do not set it for `long_bs1full_short_batch`; that policy derives the chunk size from `long_prefill_offload_threshold`. |
+| `engine_prefill_chunk_size` | Sparse-vLLM | Max prefill chunk scheduled per sequence per step for `all_chunked`, and max RawKV offload chunk for `long_bs1full_short_batch`. Under the long policy it defaults to `long_prefill_offload_threshold`; an explicit value must satisfy `0 < engine_prefill_chunk_size <= long_prefill_offload_threshold`. |
 | `hf_prefill_chunk_size` | HF | Wrapper/model chunk size for long input forwarding. Often a large value means "do not chunk". |
 | `max_model_len` | Sparse-vLLM | Hard engine capacity for prompt plus generated tokens. Affects allocation and request validation. |
-| `long_prefill_offload_threshold` | Sparse-vLLM | Exact boundary between complete batched short prefill and isolated chunked RawKV offload under `long_bs1full_short_batch`. Defaults to `98304` tokens (96K) and also becomes that policy's `chunk_prefill_size`. |
+| `long_prefill_offload_threshold` | Sparse-vLLM | Residual-token boundary between atomic batched full prefill and isolated chunked RawKV offload under `long_bs1full_short_batch`. Defaults to `65536` tokens (64K). |
 | `max_num_batched_tokens` | Sparse-vLLM | Aggregate scheduler cap for tokens in one step; memory heuristics may reduce it. `all_chunked` permits this cap to be smaller than `engine_prefill_chunk_size`. `long_bs1full_short_batch` normalizes it to at least `long_prefill_offload_threshold` so the boundary prompt fits atomically. |
 | `max_num_seqs_in_batch` | Sparse-vLLM | Max active sequences in a prefill/decode step. |
 | `max_decoding_seqs` | Sparse-vLLM | Max sequences in decode queue. |
@@ -938,8 +938,8 @@ Important serving defaults:
 | `max_num_batched_tokens` | `65536` | Inherited from `Config`. |
 | `max_num_seqs_in_batch` | `32` | Inherited from `Config`. |
 | `max_decoding_seqs` | `64` | Inherited from `Config`. |
-| `engine_prefill_chunk_size` / `chunk_prefill_size` | `8192` | `all_chunked` only. Use the semantic `--engine-prefill-chunk-size` on the CLI. |
-| `long_prefill_offload_threshold` | `98304` | `long_bs1full_short_batch` only. Also determines that policy's chunk size. |
+| `engine_prefill_chunk_size` / `chunk_prefill_size` | `8192` | Max chunk for `all_chunked`. Under `long_bs1full_short_batch`, an omitted value defaults to the offload threshold and an explicit value may be smaller. Use the semantic `--engine-prefill-chunk-size` on the CLI. |
+| `long_prefill_offload_threshold` | `65536` | Residual boundary for `long_bs1full_short_batch`; requests above it use isolated RawKV offload. |
 | `enable_prefix_caching` | `false` | Pass `--enable-prefix-caching true` to enable prefix KV reuse. |
 | `prefix_cache_mode` | `"auto"` | Resolves to radix for vanilla/OmniKV/QuEST and chain for SnapKV/H2O/PyramidKV/R-KV/SkipKV. |
 | `prefix_cache_block_size` | `16` for vanilla/OmniKV, `quest_chunk_size` for QuEST | Radix-only. Use `--prefix-cache-block-size`; QuEST rejects values different from `quest_chunk_size`. Chain mode ignores it. |

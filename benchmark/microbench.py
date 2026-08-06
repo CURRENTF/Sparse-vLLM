@@ -30,7 +30,7 @@ from sparsevllm.method_registry import (
 
 
 DEFAULT_ALL_CHUNKED_PREFILL_SIZE = 96 * 1024
-DEFAULT_LONG_PREFILL_OFFLOAD_THRESHOLD = 96 * 1024
+DEFAULT_LONG_PREFILL_OFFLOAD_THRESHOLD = 64 * 1024
 
 
 def get_peak_memory():
@@ -192,35 +192,45 @@ def _apply_prefill_policy_defaults(
     runtime_method = _benchmark_sparse_method(method)
     policy = get_default_prefill_schedule_policy(runtime_method)
     if policy == PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH:
-        if (
-            "engine_prefill_chunk_size" in hyper_params
-            and "long_prefill_offload_threshold" not in hyper_params
-        ):
-            raise ValueError(
-                f"sparse_method={runtime_method!r} uses {policy}; declare "
-                "long_prefill_offload_threshold instead of "
-                "engine_prefill_chunk_size."
-            )
         hyper_params.setdefault(
             "long_prefill_offload_threshold",
             DEFAULT_LONG_PREFILL_OFFLOAD_THRESHOLD,
         )
-        hyper_params.pop("engine_prefill_chunk_size", None)
-    else:
+        boundary = hyper_params["long_prefill_offload_threshold"]
+        chunk_size = hyper_params.get("engine_prefill_chunk_size", boundary)
         if (
-            "long_prefill_offload_threshold" in hyper_params
-            and "engine_prefill_chunk_size" not in hyper_params
+            not isinstance(boundary, int)
+            or isinstance(boundary, bool)
+            or boundary <= 0
         ):
             raise ValueError(
-                f"sparse_method={runtime_method!r} uses {policy}; declare "
-                "engine_prefill_chunk_size instead of "
-                "long_prefill_offload_threshold."
+                "long_prefill_offload_threshold must be a positive integer."
             )
+        if (
+            not isinstance(chunk_size, int)
+            or isinstance(chunk_size, bool)
+            or chunk_size <= 0
+        ):
+            raise ValueError("engine_prefill_chunk_size must be a positive integer.")
+        if chunk_size > boundary:
+            raise ValueError(
+                f"sparse_method={runtime_method!r} uses {policy}; require "
+                "engine_prefill_chunk_size <= long_prefill_offload_threshold, "
+                f"got {chunk_size} > {boundary}."
+            )
+    else:
         hyper_params.setdefault(
             "engine_prefill_chunk_size",
             DEFAULT_ALL_CHUNKED_PREFILL_SIZE,
         )
         hyper_params.pop("long_prefill_offload_threshold", None)
+        chunk_size = hyper_params["engine_prefill_chunk_size"]
+        if (
+            not isinstance(chunk_size, int)
+            or isinstance(chunk_size, bool)
+            or chunk_size <= 0
+        ):
+            raise ValueError("engine_prefill_chunk_size must be a positive integer.")
 
 
 def _record_child_exit_failure(
@@ -876,8 +886,9 @@ def main():
         default="{}",
         help=(
             "LLMEngine/Config hyper-params as JSON (string or @file.json). "
-            "Use engine_prefill_chunk_size for all_chunked methods and "
-            "long_prefill_offload_threshold for long_bs1full_short_batch methods."
+            "engine_prefill_chunk_size controls all_chunked steps and RawKV "
+            "offload chunks; long_prefill_offload_threshold selects the full "
+            "versus RawKV mode for long_bs1full_short_batch methods."
         ),
     )
     parser.add_argument(

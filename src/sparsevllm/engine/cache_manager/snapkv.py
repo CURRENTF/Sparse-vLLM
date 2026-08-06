@@ -8,6 +8,11 @@ import torch
 from sparsevllm.config import Config
 from sparsevllm.distributed import ParallelContext
 from sparsevllm.engine.sequence import Sequence
+from sparsevllm.engine.prefill import (
+    PREFILL_EXECUTION_CHUNKED,
+    PREFILL_EXECUTION_FULL,
+    PREFILL_EXECUTION_RAW_OFFLOAD,
+)
 from sparsevllm.method_registry import PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH
 from sparsevllm.platforms import device_runtime
 from sparsevllm.triton_kernel.prefill_score import prefill_score_fwd
@@ -87,9 +92,13 @@ class SnapKVCacheManager(CacheManager):
         self._pyramidkv_prefill_staging_active = False
         self._pyramidkv_prefill_staging_was_active = False
         self._pyramidkv_prefill_staging_slot_mapping = None
+        self._pyramidkv_prefill_staging_slot_mapping_by_layer = {}
         self._pyramidkv_prefill_staging_active_slots = None
+        self._pyramidkv_prefill_staging_active_slots_by_layer = {}
         self._pyramidkv_prefill_staging_req_indices = None
         self._pyramidkv_prefill_staging_context_lens = None
+        self._pyramidkv_prefill_staging_context_lens_by_layer = {}
+        self._pyramidkv_prefill_staging_context_lens_cpu_by_layer = {}
         self._pyramidkv_prefill_staging_seq_offsets: dict[int, int] = {}
         self._pyramidkv_prefill_staging_materialized_layers: set[tuple[int, int]] = set()
         self.raw_kv_offload_buffer = RawKVOffloadBuffer(pin_memory=device_runtime.supports_pin_memory())
@@ -98,6 +107,8 @@ class SnapKVCacheManager(CacheManager):
         self._pyramidkv_long_prefill_offload_start = 0
         self._pyramidkv_long_prefill_offload_end = 0
         self._pyramidkv_long_prefill_offload_total_len = 0
+        self._pyramidkv_long_prefill_offload_residual_start = 0
+        self._pyramidkv_long_prefill_offload_resident_prefix_lens: dict[int, int] = {}
         self._pyramidkv_long_prefill_offload_is_last_chunk = False
         self._pyramidkv_long_prefill_offload_prefetch_stream = None
         self._pyramidkv_long_prefill_offload_prefetch_states: dict[tuple[int, int, str, int], dict] = {}
@@ -184,38 +195,70 @@ class SnapKVCacheManager(CacheManager):
         self._pyramidkv_prefill_staging_active = False
         self._pyramidkv_prefill_staging_was_active = False
         self._pyramidkv_prefill_staging_slot_mapping = None
+        self._pyramidkv_prefill_staging_slot_mapping_by_layer = {}
         self._pyramidkv_prefill_staging_active_slots = None
+        self._pyramidkv_prefill_staging_active_slots_by_layer = {}
         self._pyramidkv_prefill_staging_req_indices = None
         self._pyramidkv_prefill_staging_context_lens = None
+        self._pyramidkv_prefill_staging_context_lens_by_layer = {}
+        self._pyramidkv_prefill_staging_context_lens_cpu_by_layer = {}
         self._pyramidkv_prefill_staging_seq_offsets = {}
         self._pyramidkv_prefill_staging_materialized_layers = set()
         self._pyramidkv_long_prefill_offload_seq_id = None
         self._pyramidkv_long_prefill_offload_start = 0
         self._pyramidkv_long_prefill_offload_end = 0
         self._pyramidkv_long_prefill_offload_total_len = 0
+        self._pyramidkv_long_prefill_offload_residual_start = 0
+        self._pyramidkv_long_prefill_offload_resident_prefix_lens = {}
         self._pyramidkv_long_prefill_offload_is_last_chunk = False
 
     def _long_prefill_offload_threshold(self) -> int:
-        return int(self.config.chunk_prefill_size)
+        return int(self.config.long_prefill_offload_threshold)
+
+    def prefill_execution_mode(self, seq: Sequence) -> str:
+        if not self._pyramidkv_can_use_full_prefill_staging():
+            return PREFILL_EXECUTION_CHUNKED
+        residual = int(self.remaining_prefill_tokens(seq))
+        if residual <= 0:
+            raise ValueError(
+                "PyramidKV prefill execution mode requires a positive residual: "
+                f"seq_id={seq.seq_id} residual={residual}."
+            )
+        initial_mode = (
+            PREFILL_EXECUTION_FULL
+            if residual <= self._long_prefill_offload_threshold()
+            else PREFILL_EXECUTION_RAW_OFFLOAD
+        )
+        mode = self._apply_sticky_raw_offload_mode(seq, initial_mode)
+        if (
+            mode == PREFILL_EXECUTION_RAW_OFFLOAD
+            and self.pyramidkv_prefill_staging_kv_cache is None
+        ):
+            raise RuntimeError(
+                "PyramidKV raw_offload mode requires prefill staging KV. "
+                f"seq_id={seq.seq_id} residual={residual}."
+            )
+        return mode
+
+    def prefill_batch_compatibility_key(self, seq: Sequence) -> object:
+        if (
+            self._pyramidkv_can_use_full_prefill_staging()
+            and self.prefill_execution_mode(seq) == PREFILL_EXECUTION_FULL
+        ):
+            resumed_resident = (
+                getattr(seq, "chain_status", "") == "resumed"
+                and not bool(getattr(seq, "is_recompute_replay", False))
+                and int(seq.num_prefilled_tokens) > 0
+            )
+            return (
+                "pyramidkv_resumed_resident_full"
+                if resumed_resident
+                else "pyramidkv_fresh_staged_full"
+            )
+        return None
 
     def requires_long_prefill_offload(self, seq: Sequence) -> bool:
-        if not self._pyramidkv_can_use_full_prefill_staging():
-            return False
-        if (
-            getattr(seq, "chain_status", "") == "resumed"
-            and not bool(getattr(seq, "is_recompute_replay", False))
-        ):
-            return False
-        if self.pyramidkv_prefill_staging_kv_cache is None:
-            return False
-        prompt_len = int(seq.num_prompt_tokens)
-        remaining = prompt_len - int(seq.num_prefilled_tokens)
-        return (
-            prompt_len > int(self.config.chunk_prefill_size)
-            and prompt_len >= self._long_prefill_offload_threshold()
-            and prompt_len <= int(self.pyramidkv_prefill_staging_num_slots)
-            and remaining > 0
-        )
+        return self.prefill_execution_mode(seq) == PREFILL_EXECUTION_RAW_OFFLOAD
 
     def _should_use_pyramidkv_long_prefill_offload_staging(self, seqs: list[Sequence]) -> bool:
         if not self._pyramidkv_can_use_full_prefill_staging():
@@ -241,16 +284,7 @@ class SnapKVCacheManager(CacheManager):
         return total_chunk_tokens <= int(self.pyramidkv_prefill_staging_num_slots)
 
     def requires_full_prefill_step(self, seq: Sequence) -> bool:
-        if not self._pyramidkv_can_use_full_prefill_staging():
-            return False
-        if self.pyramidkv_prefill_staging_kv_cache is None:
-            return False
-        if self.requires_long_prefill_offload(seq):
-            return False
-        if int(seq.num_prefilled_tokens) != 0:
-            return False
-        remaining = int(seq.num_prompt_tokens - seq.num_prefilled_tokens)
-        return 0 < remaining <= int(self.pyramidkv_prefill_staging_num_slots)
+        return self.prefill_execution_mode(seq) == PREFILL_EXECUTION_FULL
 
     def is_full_prefill_step(self, seqs: list[Sequence]) -> bool:
         return self._should_use_pyramidkv_full_prefill_staging(seqs)
@@ -369,7 +403,10 @@ class SnapKVCacheManager(CacheManager):
             return (
                 self.pyramidkv_prefill_staging_kv_cache[0],
                 self.pyramidkv_prefill_staging_kv_cache[1],
-                self._pyramidkv_prefill_staging_slot_mapping,
+                self._pyramidkv_prefill_staging_slot_mapping_by_layer.get(
+                    int(layer_idx),
+                    self._pyramidkv_prefill_staging_slot_mapping,
+                ),
             )
         k_cache, v_cache = self.get_layer_kv_cache(layer_idx)
         return k_cache, v_cache, self.layer_batch_states[layer_idx].slot_mapping
@@ -395,9 +432,15 @@ class SnapKVCacheManager(CacheManager):
         if not self.has_prefill_staging_view(layer_idx):
             raise NotImplementedError("PyramidKV prefill staging view is not active for this layer.")
         return (
-            self._pyramidkv_prefill_staging_active_slots,
+            self._pyramidkv_prefill_staging_active_slots_by_layer.get(
+                int(layer_idx),
+                self._pyramidkv_prefill_staging_active_slots,
+            ),
             self._pyramidkv_prefill_staging_req_indices,
-            self._pyramidkv_prefill_staging_context_lens,
+            self._pyramidkv_prefill_staging_context_lens_by_layer.get(
+                int(layer_idx),
+                self._pyramidkv_prefill_staging_context_lens,
+            ),
             None,
         )
 
@@ -644,11 +687,12 @@ class SnapKVCacheManager(CacheManager):
 
     def prefill_step_free_slots_for(self, seq: Sequence) -> int:
         if self.requires_long_prefill_offload(seq):
-            return max(0, int(self.pyramidkv_prefill_staging_num_slots) - int(seq.num_prefilled_tokens))
+            return int(self.pyramidkv_prefill_staging_num_slots)
         return super().prefill_step_free_slots_for(seq)
 
     def min_final_prefill_chunk_size(self, seq: Sequence) -> int:
-        if self.config.vllm_sparse_method != "snapkv":
+        method = self.config.vllm_sparse_method
+        if method not in {"snapkv", "pyramidkv"}:
             return 0
         window = int(getattr(self.config, "snapkv_window_size", 0) or 0)
         if window <= 0:
@@ -658,16 +702,73 @@ class SnapKVCacheManager(CacheManager):
             >= int(self.num_kv_layers)
         ):
             return 0
-        budget = (
-            int(self.config.num_sink_tokens)
-            + int(self.config.decode_keep_tokens)
-            + int(self.config.num_recent_tokens)
+        is_chain_resume = (
+            getattr(seq, "chain_status", "") == "resumed"
+            and not bool(getattr(seq, "is_recompute_replay", False))
         )
-        # Match the ModelRunner long-prefill gate used by score collection.
-        long_prefill_threshold = budget + int(self.config.chunk_prefill_size)
-        if int(seq.num_prompt_tokens) <= long_prefill_threshold:
+        residual = int(seq.num_prompt_tokens) - int(seq.num_prefilled_tokens)
+        raw_offload_turn_tokens = None
+        if (
+            method == "pyramidkv"
+            and is_chain_resume
+            and self.requires_long_prefill_offload(seq)
+        ):
+            reused_tokens = max(
+                int(getattr(seq, "chain_reused_tokens", 0) or 0),
+                int(getattr(seq, "prefix_cache_hit_len", 0) or 0),
+            )
+            raw_offload_turn_tokens = max(
+                0,
+                int(seq.num_prompt_tokens) - reused_tokens,
+            )
+        if method == "snapkv":
+            budget = (
+                int(self.config.num_sink_tokens)
+                + int(self.config.decode_keep_tokens)
+                + int(self.config.num_recent_tokens)
+            )
+            if is_chain_resume:
+                first_layer = int(self.kv_transformer_layer_indices()[0])
+                final_physical_len = (
+                    self.chain_physical_kv_len(first_layer, int(seq.seq_id))
+                    + residual
+                )
+            else:
+                final_physical_len = int(seq.num_prompt_tokens)
+            needs_score = final_physical_len > budget
+        else:
+            needs_score = False
+            for layer_idx in self.kv_transformer_layer_indices():
+                if self.kv_layer_index(layer_idx) < int(
+                    getattr(self.config, "snapkv_num_full_layers", 0) or 0
+                ):
+                    continue
+                final_physical_len = (
+                    self.chain_physical_kv_len(layer_idx, int(seq.seq_id))
+                    + (
+                        raw_offload_turn_tokens
+                        if raw_offload_turn_tokens is not None
+                        else residual
+                    )
+                    if is_chain_resume
+                    else int(seq.num_prompt_tokens)
+                )
+                if final_physical_len > self._pyramidkv_layer_budget(layer_idx):
+                    needs_score = True
+                    break
+        if not needs_score:
             return 0
-        return min(window, int(seq.num_prompt_tokens))
+        return min(window, int(self.remaining_prefill_tokens(seq)))
+
+    def prefill_staging_context_lens_cpu(
+        self,
+        layer_idx: int,
+    ) -> tuple[int, ...] | None:
+        return getattr(
+            self,
+            "_pyramidkv_prefill_staging_context_lens_cpu_by_layer",
+            {},
+        ).get(int(layer_idx))
 
     def prefill_step_reservation_cost(self, seq: Sequence, scheduled_tokens: int) -> int:
         if self.requires_long_prefill_offload(seq):
@@ -742,19 +843,28 @@ class SnapKVCacheManager(CacheManager):
                 getattr(seq, "chain_status", "") == "resumed"
                 and not bool(getattr(seq, "is_recompute_replay", False))
             )
-            physical_context_len = (
-                self.chain_physical_kv_len(layer_idx, int(seq.seq_id))
-                if is_chain_resume
-                else prompt_len
-            )
-            if physical_context_len <= int(budget):
-                continue
             reused_tokens = (
                 0
                 if bool(getattr(seq, "is_recompute_replay", False))
                 else int(getattr(seq, "chain_reused_tokens", 0) or 0)
             )
             appended_delta_len = max(0, prompt_len - reused_tokens)
+            if is_chain_resume:
+                staging_context_lens = self.prefill_staging_context_lens_cpu(
+                    layer_idx
+                )
+                physical_context_len = (
+                    int(staging_context_lens[b_idx])
+                    if staging_context_lens is not None
+                    else self.chain_physical_kv_len(
+                        layer_idx,
+                        int(seq.seq_id),
+                    )
+                )
+            else:
+                physical_context_len = prompt_len
+            if physical_context_len <= int(budget):
+                continue
             score_window = min(window, appended_delta_len) if appended_delta_len else window
             logical_score_end = prompt_len
             logical_score_start = max(0, logical_score_end - score_window)
@@ -849,8 +959,6 @@ class SnapKVCacheManager(CacheManager):
     ):
         ctx = get_context()
         if not ctx.is_prefill:
-            return None
-        if not ctx.is_long_text and not self.has_prefill_staging_view(layer_idx):
             return None
         if self.config.vllm_sparse_method not in ("snapkv", "pyramidkv"):
             return None
@@ -1099,6 +1207,7 @@ class SnapKVCacheManager(CacheManager):
 
     def free_seq(self, seq_id: int):
         with profiler.record("cache_free_seq"):
+            self.reset_prefill_execution_state(seq_id)
             self._clear_prefill_attention_scores(seq_id)
             self._pyramidkv_clear_long_prefill_offload_prefetch()
             for layer_idx in self.kv_transformer_layer_indices():
@@ -1519,6 +1628,31 @@ class SnapKVCacheManager(CacheManager):
         row_idx = self.seq_id_to_row[layer_idx].get(seq.seq_id)
         if row_idx is None:
             raise RuntimeError(f"PyramidKV staging row is missing: layer={layer_idx} seq_id={seq.seq_id}.")
+        resident_prefix_len = int(
+            getattr(
+                self,
+                "_pyramidkv_long_prefill_offload_resident_prefix_lens",
+                {},
+            ).get(int(layer_idx), 0)
+        )
+        if resident_prefix_len > 0:
+            if int(self.row_seq_lens[layer_idx][row_idx]) != resident_prefix_len:
+                raise RuntimeError(
+                    "PyramidKV raw_offload resident prefix changed before final "
+                    "materialization: "
+                    f"layer={layer_idx} seq_id={seq.seq_id} "
+                    f"expected={resident_prefix_len} "
+                    f"observed={int(self.row_seq_lens[layer_idx][row_idx])}."
+                )
+            old_slots = self.buffer_req_to_token_slots[layer_idx][
+                row_idx,
+                :resident_prefix_len,
+            ].clone()
+            ptr = int(self._num_free_slots[layer_idx])
+            self.free_slots_stack[layer_idx][ptr : ptr + resident_prefix_len] = old_slots
+            self._num_free_slots[layer_idx] += resident_prefix_len
+            self.buffer_req_to_token_slots[layer_idx][row_idx, :resident_prefix_len] = 0
+            self.row_seq_lens[layer_idx][row_idx] = 0
         if int(self.row_seq_lens[layer_idx][row_idx]) != 0:
             raise RuntimeError(
                 "PyramidKV full-prefill staging expects an empty persistent row before materialization. "
@@ -1632,6 +1766,7 @@ class SnapKVCacheManager(CacheManager):
                 continue
             self.raw_kv_offload_buffer.release_row(row_idx)
             seen_rows.add(row_idx)
+        self._pyramidkv_long_prefill_offload_seq_id = None
 
     def _pyramidkv_long_prefill_offload_row(self, layer_idx: int) -> int:
         seq_id = self._pyramidkv_long_prefill_offload_seq_id
@@ -1696,6 +1831,13 @@ class SnapKVCacheManager(CacheManager):
             return
         next_layer = int(next_layers[0])
         row_idx = self._pyramidkv_long_prefill_offload_row(next_layer)
+        resident_prefix_len = int(
+            getattr(
+                self,
+                "_pyramidkv_long_prefill_offload_resident_prefix_lens",
+                {},
+            ).get(next_layer, 0)
+        )
         kind = self._pyramidkv_long_prefill_offload_kind()
         key = (next_layer, int(row_idx), kind, int(end))
         states = getattr(self, "_pyramidkv_long_prefill_offload_prefetch_states", None) or {}
@@ -1732,8 +1874,14 @@ class SnapKVCacheManager(CacheManager):
                     row_idx=row_idx,
                     kind=kind,
                     end=end,
-                    k_out=self.pyramidkv_prefill_staging_kv_cache[0, :end],
-                    v_out=self.pyramidkv_prefill_staging_kv_cache[1, :end],
+                    k_out=self.pyramidkv_prefill_staging_kv_cache[
+                        0,
+                        resident_prefix_len : resident_prefix_len + end,
+                    ],
+                    v_out=self.pyramidkv_prefill_staging_kv_cache[
+                        1,
+                        resident_prefix_len : resident_prefix_len + end,
+                    ],
                 )
                 event = device_runtime.new_event(device=self.device)
                 if event is None:
@@ -1756,12 +1904,16 @@ class SnapKVCacheManager(CacheManager):
         if not bool(getattr(self, "_pyramidkv_long_prefill_offload_step_active", False)):
             return
         start = int(getattr(self, "_pyramidkv_long_prefill_offload_start", 0) or 0)
-        if start <= 0:
+        residual_start = int(
+            getattr(self, "_pyramidkv_long_prefill_offload_residual_start", 0) or 0
+        )
+        restored_residual = start - residual_start
+        if restored_residual <= 0:
             return
         with profiler.record("pyramidkv_long_prefill_offload_after_attention_prefetch"):
             self._pyramidkv_schedule_next_long_prefill_offload_prefetch(
                 layer_idx=layer_idx,
-                end=start,
+                end=restored_residual,
             )
 
     @torch.no_grad()
@@ -1772,14 +1924,39 @@ class SnapKVCacheManager(CacheManager):
         if not self.has_prefill_staging_view(layer_idx):
             return None
         start = int(getattr(self, "_pyramidkv_long_prefill_offload_start", 0) or 0)
-        if start <= 0:
-            return None
+        residual_start = int(
+            getattr(self, "_pyramidkv_long_prefill_offload_residual_start", 0) or 0
+        )
+        restored_residual = start - residual_start
         row_idx = self._pyramidkv_long_prefill_offload_row(layer_idx)
+        resident_prefix_len = int(
+            getattr(
+                self,
+                "_pyramidkv_long_prefill_offload_resident_prefix_lens",
+                {},
+            ).get(int(layer_idx), 0)
+        )
+        if resident_prefix_len > 0:
+            slots = self.buffer_req_to_token_slots[int(layer_idx)][
+                row_idx,
+                :resident_prefix_len,
+            ].to(torch.long)
+            k_cache, v_cache = self.get_layer_kv_cache(layer_idx)
+            self.pyramidkv_prefill_staging_kv_cache[
+                0,
+                :resident_prefix_len,
+            ].copy_(k_cache[slots])
+            self.pyramidkv_prefill_staging_kv_cache[
+                1,
+                :resident_prefix_len,
+            ].copy_(v_cache[slots])
+        if restored_residual <= 0:
+            return None
         with profiler.record("pyramidkv_long_prefill_offload_wait_or_restore"):
             staged = self._pyramidkv_consume_long_prefill_offload_staged_prefetch(
                 layer_idx=layer_idx,
                 row_idx=row_idx,
-                end=start,
+                end=restored_residual,
             )
             if staged:
                 return None
@@ -1788,9 +1965,15 @@ class SnapKVCacheManager(CacheManager):
                 layer_idx=layer_idx,
                 row_idx=row_idx,
                 kind=self._pyramidkv_long_prefill_offload_kind(),
-                end=start,
-                k_out=self.pyramidkv_prefill_staging_kv_cache[0, :start],
-                v_out=self.pyramidkv_prefill_staging_kv_cache[1, :start],
+                end=restored_residual,
+                k_out=self.pyramidkv_prefill_staging_kv_cache[
+                    0,
+                    resident_prefix_len : resident_prefix_len + restored_residual,
+                ],
+                v_out=self.pyramidkv_prefill_staging_kv_cache[
+                    1,
+                    resident_prefix_len : resident_prefix_len + restored_residual,
+                ],
             )
         return None
 
@@ -1799,21 +1982,35 @@ class SnapKVCacheManager(CacheManager):
         start = int(getattr(self, "_pyramidkv_long_prefill_offload_start", 0) or 0)
         end = int(getattr(self, "_pyramidkv_long_prefill_offload_end", 0) or 0)
         total_len = int(getattr(self, "_pyramidkv_long_prefill_offload_total_len", 0) or 0)
+        residual_start = int(
+            getattr(self, "_pyramidkv_long_prefill_offload_residual_start", 0) or 0
+        )
         if end <= start:
             raise RuntimeError(
                 "PyramidKV long-prefill offload has invalid range: "
                 f"layer={layer_idx} start={start} end={end}."
             )
         row_idx = self._pyramidkv_long_prefill_offload_row(layer_idx)
-        k = self.pyramidkv_prefill_staging_kv_cache[0, start:end]
-        v = self.pyramidkv_prefill_staging_kv_cache[1, start:end]
+        resident_prefix_len = int(
+            getattr(
+                self,
+                "_pyramidkv_long_prefill_offload_resident_prefix_lens",
+                {},
+            ).get(int(layer_idx), 0)
+        )
+        offload_start = start - residual_start
+        offload_end = end - residual_start
+        staging_start = resident_prefix_len + offload_start
+        staging_end = resident_prefix_len + offload_end
+        k = self.pyramidkv_prefill_staging_kv_cache[0, staging_start:staging_end]
+        v = self.pyramidkv_prefill_staging_kv_cache[1, staging_start:staging_end]
         kind = self._pyramidkv_long_prefill_offload_kind()
         with profiler.record("pyramidkv_long_prefill_offload_ensure_entry"):
             self.raw_kv_offload_buffer.ensure_entry(
                 layer_idx=layer_idx,
                 row_idx=row_idx,
                 kind=kind,
-                total_len=total_len,
+                total_len=total_len - residual_start,
                 k_shape_tail=tuple(k.shape[1:]),
                 v_shape_tail=tuple(v.shape[1:]),
                 dtype=k.dtype,
@@ -1823,7 +2020,7 @@ class SnapKVCacheManager(CacheManager):
                 layer_idx=layer_idx,
                 row_idx=row_idx,
                 kind=kind,
-                start=start,
+                start=offload_start,
                 k=k,
                 v=v,
             )
@@ -1851,6 +2048,11 @@ class SnapKVCacheManager(CacheManager):
         with profiler.record("cache_prepare_prefill"):
             self._decode_static_state_binding_key = None
             layer_ids = self.kv_transformer_layer_indices()
+            self._pyramidkv_prefill_staging_slot_mapping_by_layer = {}
+            self._pyramidkv_prefill_staging_active_slots_by_layer = {}
+            self._pyramidkv_prefill_staging_context_lens_by_layer = {}
+            self._pyramidkv_prefill_staging_context_lens_cpu_by_layer = {}
+            self._pyramidkv_long_prefill_offload_resident_prefix_lens = {}
             for seq in seqs:
                 starts_resumed_turn = (
                     getattr(seq, "chain_status", "") == "resumed"
@@ -1878,13 +2080,11 @@ class SnapKVCacheManager(CacheManager):
             cu_seqlens_q = [0]
 
             if use_full_prefill_staging:
-                staging_start = int(seqs[0].num_prefilled_tokens) if use_long_prefill_offload_staging else 0
-                layers_slot_mapping_cuda = torch.arange(
-                    staging_start,
-                    staging_start + total_chunk_tokens,
+                layers_slot_mapping_cuda = torch.empty(
+                    (self.num_layers, total_chunk_tokens),
                     dtype=torch.int32,
                     device=self.device,
-                ).expand(self.num_layers, -1)
+                )
             else:
                 layers_slot_mapping_cuda = torch.empty(
                     (self.num_layers, total_chunk_tokens), dtype=torch.int32, device=self.device
@@ -1917,15 +2117,47 @@ class SnapKVCacheManager(CacheManager):
                 chunk_size = seq.current_chunk_size
                 start_idx = seq.num_prefilled_tokens
                 end_idx = start_idx + chunk_size
+                residual_start = 0
+                if use_long_prefill_offload_staging and not bool(
+                    getattr(seq, "is_recompute_replay", False)
+                ):
+                    residual_start = max(
+                        int(getattr(seq, "chain_reused_tokens", 0) or 0),
+                        int(getattr(seq, "prefix_cache_hit_len", 0) or 0),
+                    )
+                residual_progress = int(start_idx) - int(residual_start)
+                if residual_progress < 0:
+                    raise RuntimeError(
+                        "PyramidKV raw_offload residual progress is negative: "
+                        f"seq_id={seq.seq_id} start={start_idx} "
+                        f"residual_start={residual_start}."
+                    )
 
                 if not use_batched_prefill_alloc:
                     for layer_id in layer_ids:
+                        resident_prefix_len = 0
+                        if use_long_prefill_offload_staging and residual_start > 0:
+                            row_idx = self.seq_id_to_row[layer_id].get(seq.seq_id)
+                            if row_idx is None:
+                                raise RuntimeError(
+                                    "PyramidKV raw_offload resumed prefix row is missing: "
+                                    f"layer={layer_id} seq_id={seq.seq_id}."
+                                )
+                            resident_prefix_len = int(
+                                self.row_seq_lens[layer_id][int(row_idx)]
+                            )
                         if seq.seq_id in self.seq_id_to_row[layer_id]:
                             row_idx = self.seq_id_to_row[layer_id][seq.seq_id]
-                            expected_row_len = 0 if use_long_prefill_offload_staging else start_idx
-                            is_chain_resume = bool(
+                            is_chain_resume = (
                                 getattr(seq, "chain_status", "") == "resumed"
-                                and not bool(getattr(seq, "is_recompute_replay", False))
+                                and not bool(
+                                    getattr(seq, "is_recompute_replay", False)
+                                )
+                            )
+                            expected_row_len = (
+                                resident_prefix_len
+                                if use_long_prefill_offload_staging
+                                else start_idx
                             )
                             if (
                                 not is_chain_resume
@@ -1946,7 +2178,38 @@ class SnapKVCacheManager(CacheManager):
                             self._allocate(layer_id, seq.seq_id, chunk_size)
                         row_idx = self.seq_id_to_row[layer_id][seq.seq_id]
                         if use_full_prefill_staging:
-                            context_len = end_idx
+                            staging_start = (
+                                resident_prefix_len + residual_progress
+                                if use_long_prefill_offload_staging
+                                else token_offset
+                            )
+                            staging_end = staging_start + int(chunk_size)
+                            if staging_end > int(self.pyramidkv_prefill_staging_num_slots):
+                                raise RuntimeError(
+                                    "PyramidKV raw_offload staging capacity is too small "
+                                    "for the attached prefix and residual chunk: "
+                                    f"layer={layer_id} seq_id={seq.seq_id} "
+                                    f"required={staging_end} "
+                                    f"staging_slots={self.pyramidkv_prefill_staging_num_slots}."
+                                )
+                            layers_slot_mapping_cuda[
+                                layer_id,
+                                token_offset : token_offset + chunk_size,
+                            ] = torch.arange(
+                                staging_start,
+                                staging_end,
+                                dtype=torch.int32,
+                                device=self.device,
+                            )
+                            context_len = (
+                                resident_prefix_len + residual_progress + chunk_size
+                                if use_long_prefill_offload_staging
+                                else chunk_size
+                            )
+                            if use_long_prefill_offload_staging:
+                                self._pyramidkv_long_prefill_offload_resident_prefix_lens[
+                                    int(layer_id)
+                                ] = resident_prefix_len
                         else:
                             physical_end = int(
                                 self.row_seq_lens[layer_id][row_idx]
@@ -1989,36 +2252,59 @@ class SnapKVCacheManager(CacheManager):
                 self._pyramidkv_prefill_staging_active = True
                 self._pyramidkv_prefill_staging_was_active = True
                 self._pyramidkv_prefill_staging_slot_mapping = layers_slot_mapping_cuda[0]
-                max_context_len = int(max(max(lens) for lens in context_lens_list if lens))
-                active_slots = torch.full(
-                    (len(seqs), max_context_len),
-                    -1,
-                    dtype=torch.int32,
-                    device=self.device,
-                )
-                offset = 0
-                for b_idx, seq in enumerate(seqs):
-                    chunk_size = int(seq.current_chunk_size)
-                    visible_len = int(seq.num_prefilled_tokens) + chunk_size if use_long_prefill_offload_staging else chunk_size
-                    slot_start = 0 if use_long_prefill_offload_staging else offset
-                    self._pyramidkv_prefill_staging_seq_offsets[int(seq.seq_id)] = int(slot_start)
-                    active_slots[b_idx, :visible_len] = torch.arange(
-                        slot_start,
-                        slot_start + visible_len,
-                        dtype=torch.int32,
-                        device=self.device,
-                    )
-                    offset += chunk_size
-                self._pyramidkv_prefill_staging_active_slots = active_slots
+                self._pyramidkv_prefill_staging_slot_mapping_by_layer = {
+                    int(layer_id): layers_slot_mapping_cuda[int(layer_id)]
+                    for layer_id in layer_ids
+                }
                 self._pyramidkv_prefill_staging_req_indices = torch.arange(
                     len(seqs),
                     dtype=torch.int32,
                     device=self.device,
                 )
-                self._pyramidkv_prefill_staging_context_lens = torch.tensor(
-                    [int(seq.num_prefilled_tokens + seq.current_chunk_size) for seq in seqs],
-                    dtype=torch.int32,
-                    device=self.device,
+                for layer_id in layer_ids:
+                    layer_context_lens = [int(value) for value in context_lens_list[layer_id]]
+                    max_context_len = max(layer_context_lens)
+                    active_slots = torch.full(
+                        (len(seqs), max_context_len),
+                        -1,
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                    offset = 0
+                    for b_idx, (seq, visible_len) in enumerate(
+                        zip(seqs, layer_context_lens)
+                    ):
+                        slot_start = 0 if use_long_prefill_offload_staging else offset
+                        self._pyramidkv_prefill_staging_seq_offsets[
+                            int(seq.seq_id)
+                        ] = int(slot_start)
+                        active_slots[b_idx, :visible_len] = torch.arange(
+                            slot_start,
+                            slot_start + visible_len,
+                            dtype=torch.int32,
+                            device=self.device,
+                        )
+                        offset += int(seq.current_chunk_size)
+                    context_lens = torch.tensor(
+                        layer_context_lens,
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                    self._pyramidkv_prefill_staging_active_slots_by_layer[
+                        int(layer_id)
+                    ] = active_slots
+                    self._pyramidkv_prefill_staging_context_lens_by_layer[
+                        int(layer_id)
+                    ] = context_lens
+                    self._pyramidkv_prefill_staging_context_lens_cpu_by_layer[
+                        int(layer_id)
+                    ] = tuple(layer_context_lens)
+                first_layer = int(layer_ids[0])
+                self._pyramidkv_prefill_staging_active_slots = (
+                    self._pyramidkv_prefill_staging_active_slots_by_layer[first_layer]
+                )
+                self._pyramidkv_prefill_staging_context_lens = (
+                    self._pyramidkv_prefill_staging_context_lens_by_layer[first_layer]
                 )
                 if use_long_prefill_offload_staging:
                     seq = seqs[0]
@@ -2026,6 +2312,14 @@ class SnapKVCacheManager(CacheManager):
                     self._pyramidkv_long_prefill_offload_start = int(seq.num_prefilled_tokens)
                     self._pyramidkv_long_prefill_offload_end = int(seq.num_prefilled_tokens + seq.current_chunk_size)
                     self._pyramidkv_long_prefill_offload_total_len = int(seq.num_prompt_tokens)
+                    self._pyramidkv_long_prefill_offload_residual_start = max(
+                        0
+                        if bool(getattr(seq, "is_recompute_replay", False))
+                        else int(getattr(seq, "chain_reused_tokens", 0) or 0),
+                        0
+                        if bool(getattr(seq, "is_recompute_replay", False))
+                        else int(getattr(seq, "prefix_cache_hit_len", 0) or 0),
+                    )
                     self._pyramidkv_long_prefill_offload_is_last_chunk = bool(seq.is_last_chunk_prefill)
 
             input_ids = torch.from_numpy(input_ids_np).to(self.device)

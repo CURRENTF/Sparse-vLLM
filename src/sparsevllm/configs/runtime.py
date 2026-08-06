@@ -58,7 +58,7 @@ class Config(
     max_num_seqs_in_gpu: int | None = None
 
     chunk_prefill_size: int | None = None
-    long_prefill_offload_threshold: int = 96 * 1024
+    long_prefill_offload_threshold: int = 64 * 1024
     mlp_chunk_size: int = 16384
     prefill_schedule_policy: str = PREFILL_POLICY_AUTO
     gpu_memory_utilization: float = 0.8

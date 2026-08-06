@@ -634,9 +634,12 @@ def test_snapkv_recompute_replay_scores_the_full_prompt_window():
     assert rows == [(0, seq, 92, 100)]
 
 
-def test_pyramid_chain_resume_disables_long_prefill_staging():
+def test_pyramid_chain_resume_uses_residual_for_raw_offload():
     manager = object.__new__(SnapKVCacheManager)
-    manager.config = SimpleNamespace(vllm_sparse_method="pyramidkv")
+    manager.config = SimpleNamespace(
+        vllm_sparse_method="pyramidkv",
+        long_prefill_offload_threshold=5,
+    )
     manager._pyramidkv_can_use_full_prefill_staging = lambda: True
     manager.pyramidkv_prefill_staging_kv_cache = object()
     seq = Sequence(
@@ -647,7 +650,7 @@ def test_pyramid_chain_resume_disables_long_prefill_staging():
     seq.num_prefilled_tokens = 90
     seq.current_chunk_size = 10
 
-    assert manager.requires_long_prefill_offload(seq) is False
+    assert manager.requires_long_prefill_offload(seq) is True
 
 
 def test_new_pyramid_chain_capacity_uses_materialized_layer_budgets():

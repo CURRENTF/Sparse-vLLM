@@ -99,7 +99,7 @@
       "hf_logits_reference": true,
       "config": {
         "sparse_method": "pyramidkv",
-        "long_prefill_offload_threshold": 98304,
+        "long_prefill_offload_threshold": 65536,
         "sink_keep_tokens": 0,
         "recent_keep_tokens": 32,
         "decode_keep_tokens": 4096,
@@ -207,7 +207,7 @@
       "hf_logits_reference": true,
       "config": {
         "sparse_method": "deltakv",
-        "long_prefill_offload_threshold": 98304,
+        "long_prefill_offload_threshold": 65536,
         "full_attention_layers": "0,3,9,13,16,21,28",
         "sink_keep_tokens": 8,
         "recent_keep_tokens": 128,
@@ -250,7 +250,7 @@
       "config": {
         "sparse_method": "deltakv-less-memory",
         "hf_sparse_method": "delta_compressed_quant_kivi_full_fp8_ref",
-        "long_prefill_offload_threshold": 98304,
+        "long_prefill_offload_threshold": 65536,
         "full_attention_layers": "0,3,9,13,16,21,28",
         "sink_keep_tokens": 8,
         "recent_keep_tokens": 128,
@@ -293,7 +293,7 @@
       "config": {
         "sparse_method": "deltakv-less-memory-cudagraph",
         "hf_sparse_method": "delta_compressed_quant_kivi_full_fp8_ref",
-        "long_prefill_offload_threshold": 98304,
+        "long_prefill_offload_threshold": 65536,
         "full_attention_layers": "0,3,9,13,16,21,28",
         "sink_keep_tokens": 8,
         "recent_keep_tokens": 128,

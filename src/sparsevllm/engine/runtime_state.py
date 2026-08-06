@@ -26,6 +26,10 @@ class MemoryOracle(Protocol):
 
     def prefill_batched_tokens_margin(self) -> int: ...
     def remaining_prefill_tokens(self, seq: Sequence) -> int: ...
+    def prefill_execution_mode(self, seq: Sequence) -> str: ...
+    def prefill_batch_compatibility_key(self, seq: Sequence) -> object: ...
+    def reset_prefill_execution_state(self, seq_id: int) -> None: ...
+    def complete_prefill_execution(self, seq: Sequence) -> None: ...
     def reserved_prefill_slots(self, waiting_seqs: deque[Sequence], chunk_prefill_size: int) -> int: ...
     def should_schedule_full_prefill(self, seq: Sequence) -> bool: ...
     def requires_full_prefill_step(self, seq: Sequence) -> bool: ...
@@ -331,6 +335,18 @@ class RuntimeState:
 
     def remaining_prefill_tokens(self, seq: Sequence) -> int:
         return int(self.cache_manager.remaining_prefill_tokens(seq))
+
+    def prefill_execution_mode(self, seq: Sequence) -> str:
+        return str(self.cache_manager.prefill_execution_mode(seq))
+
+    def prefill_batch_compatibility_key(self, seq: Sequence) -> object:
+        return self.cache_manager.prefill_batch_compatibility_key(seq)
+
+    def reset_prefill_execution_state(self, seq_id: int) -> None:
+        self.cache_manager.reset_prefill_execution_state(int(seq_id))
+
+    def complete_prefill_execution(self, seq: Sequence) -> None:
+        self.cache_manager.complete_prefill_execution(seq)
 
     def reserved_prefill_slots(self, waiting_seqs: deque[Sequence], chunk_prefill_size: int) -> int:
         return int(self.cache_manager.reserved_prefill_slots(waiting_seqs, chunk_prefill_size))

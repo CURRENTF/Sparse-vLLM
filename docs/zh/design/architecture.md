@@ -47,10 +47,10 @@ Prefill scheduling 是方法 contract 的一部分。默认 policy 位于 `src/s
 
 engine 当前支持：
 
-- `all_chunked`：所有 prefill request 都通过常规 scheduler limit 进行 chunking 和 batching。
-- `long_bs1full_short_batch`：长度不超过 `chunk_prefill_size` 的 prompt 使用完整 batched prefill，超过该值的 prompt 单独运行 chunked RawKV offload prefill。
+- `all_chunked`：所有 prefill request 都通过常规 scheduler limit 进行 chunking 和 batching，每个 sequence 每步最多调度 `chunk_prefill_size` 个 token。
+- `long_bs1full_short_batch`：在附加受支持的 prefix 后，residual token 数不超过 `long_prefill_offload_threshold` 的 request 使用 atomic full prefill，并且可以互相 batch；更大的 residual 单独运行 chunked RawKV offload prefill，每个 chunk 不超过 `chunk_prefill_size`。
 
-DeltaKV 和 PyramidKV 通过 `requires_long_prefill_offload()` 实现 long branch。offload threshold 与 `chunk_prefill_size` 完全相同，因此 short branch 与 offload branch 之间不存在隐藏的 isolated full-prefill prompt 区间。`Config` 根据 `long_prefill_offload_threshold` 同时派生两者；默认值为 `98304` token（96K），必要时还会把 `max_num_batched_tokens` 提高到可容纳该边界大小的单个 chunk。该 policy 下不要单独设置 `chunk_prefill_size`。`all_chunked` 继续使用独立配置的 chunk size。
+DeltaKV 和 PyramidKV 通过 `prefill_execution_mode()` 实现 long branch。threshold 默认是 `65536` token（64K）。未设置 `chunk_prefill_size` 时，`Config` 默认令其等于 threshold；显式设置时必须满足 `0 < chunk_prefill_size <= long_prefill_offload_threshold`。必要时，`Config` 会把 `max_num_batched_tokens` 提高到 threshold，使边界大小的 full prefill 保持 atomic。PyramidKV 根据 chain prefix attach 后的 residual 应用该边界。DeltaKV 不提供 prefix caching；如果 attached-prefix prefill 到达其 cache manager，会快速失败，因为其 compressed row state 没有 prefix residency contract。
 
 不要在 benchmark script 或一次性 config default 中编码某个方法的 prefill policy。应把 method-to-policy mapping 添加到 registry，并更新 `tests/test_prefill_schedule_policy.py`。
 

@@ -31,19 +31,21 @@ should not redefine method semantics.
 
 | Policy | Runtime Semantics | Current Default Methods |
 | --- | --- | --- |
-| `all_chunked` | Every prefill request is capped by `chunk_prefill_size` and normal scheduler batch limits. | `vanilla`, `streamingllm`, `attention-sink`, `snapkv`, `h2o`, `quest`, `omnikv` |
-| `long_bs1full_short_batch` | Prompts at or below `chunk_prefill_size` use complete batched prefill. Prompts above it are isolated at batch size 1 and use chunked RawKV offload. | `pyramidkv` and DeltaKV-family methods |
+| `all_chunked` | Every prefill request is capped by `chunk_prefill_size` and normal scheduler batch limits; `long_prefill_offload_threshold` is ignored. | `vanilla`, `streamingllm`, `attention-sink`, `snapkv`, `h2o`, `quest`, `omnikv` |
+| `long_bs1full_short_batch` | After supported prefix attachment, residuals at or below `long_prefill_offload_threshold` use atomic full prefill and may batch. Larger residuals are isolated and use RawKV offload chunks capped by `chunk_prefill_size`. | `pyramidkv` and DeltaKV-family methods |
 
 DeltaKV-family methods and PyramidKV keep `long_bs1full_short_batch` as the only
-public policy. Their cache managers use `requires_long_prefill_offload()` for
-every prompt longer than `chunk_prefill_size`. This exact boundary avoids a
-middle range of isolated full-prefill requests that can cause an activation OOM.
-Under this policy, `Config` sets both `chunk_prefill_size` and the offload
-boundary from `long_prefill_offload_threshold`, which defaults to `98304` tokens
-(96K). Do not set `engine_prefill_chunk_size` separately; set the threshold if
-an experiment needs a different boundary. `Config` raises
-`max_num_batched_tokens` to fit one boundary-sized short prefill when necessary.
-`all_chunked` still uses `engine_prefill_chunk_size` independently.
+public policy. The threshold defaults to `65536` tokens (64K). If
+`engine_prefill_chunk_size` is omitted, it defaults to that threshold; explicit
+values must be positive and no larger than the threshold. `Config` raises
+`max_num_batched_tokens` to fit one threshold-sized full prefill when necessary.
+With full-layer KIVI enabled, DeltaKV keeps a small resident raw tail pool for
+decode and a separate `max_model_len`-sized prefill staging buffer. Batched
+short prefills share that staging buffer through disjoint per-request ranges;
+the resident raw-tail slot count is not a prefill batch limit.
+PyramidKV classifies the residual after chain-prefix attachment. DeltaKV does
+not support prefix caching and rejects attached-prefix prefill before mutating
+compressed or quantized row metadata.
 
 ## Prefix cache modes
 

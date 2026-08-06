@@ -63,19 +63,22 @@ and `src/sparsevllm/engine/scheduler.py` implements the scheduling behavior.
 The engine currently supports:
 
 - `all_chunked`: all prefill requests are chunked and batched through the normal
-  scheduler limits.
-- `long_bs1full_short_batch`: prompts at or below `chunk_prefill_size` use
-  complete batched prefill, while prompts above it run alone as chunked RawKV
-  offload prefill.
+  scheduler limits, with at most `chunk_prefill_size` tokens per sequence.
+- `long_bs1full_short_batch`: after any supported prefix is attached, requests
+  with at most `long_prefill_offload_threshold` residual tokens use atomic full
+  prefill and may batch together. Larger residuals run alone as chunked RawKV
+  offload prefill, with chunks capped by `chunk_prefill_size`.
 
 DeltaKV and PyramidKV implement the long branch through
-`requires_long_prefill_offload()`. The offload threshold is exactly
-`chunk_prefill_size`, so there is no hidden range of isolated full-prefill
-prompts between the short and offload branches. `Config` derives both from
-`long_prefill_offload_threshold`, whose default is `98304` tokens (96K), and
-raises `max_num_batched_tokens` to that one-chunk boundary when necessary. Do
-not set `chunk_prefill_size` separately for this policy. `all_chunked` continues
-to use its independently configured chunk size.
+`prefill_execution_mode()`. The threshold defaults to `65536` tokens (64K).
+When `chunk_prefill_size` is omitted, `Config` defaults it to the threshold; an
+explicit chunk size must satisfy `0 < chunk_prefill_size <=
+long_prefill_offload_threshold`. `Config` raises `max_num_batched_tokens` to the
+threshold when necessary so a boundary-sized full prefill remains atomic.
+PyramidKV applies the boundary to the residual after chain-prefix attachment.
+DeltaKV does not expose prefix caching and fails fast if an attached-prefix
+prefill reaches its cache manager because its compressed row state has no
+prefix-residency contract.
 
 Do not encode a method's prefill policy in benchmark scripts or one-off config
 defaults. Add the method-to-policy mapping to the registry and update

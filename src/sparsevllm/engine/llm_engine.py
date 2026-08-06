@@ -92,11 +92,12 @@ class _ThroughputIntervalLogger:
         self._running_seqs = 0
         self._prefill_seqs = 0
         self._decode_seqs = 0
-        self._prefill_long_seqs = 0
-        self._prefill_short_seqs = 0
+        self._prefill_chunked_seqs = 0
+        self._prefill_full_seqs = 0
+        self._prefill_raw_offload_seqs = 0
         self._decode_long_seqs = 0
         self._decode_short_seqs = 0
-        self._last_batch = "idle"  # "pf-L", "pf-S", "dc-L", "dc-S", "idle"
+        self._last_batch = "idle"
         self._last_report_t = perf_counter()
 
     def start(self):
@@ -129,8 +130,9 @@ class _ThroughputIntervalLogger:
         running_seqs: int,
         prefill_seqs: int,
         decode_seqs: int,
-        prefill_long_seqs: int,
-        prefill_short_seqs: int,
+        prefill_chunked_seqs: int,
+        prefill_full_seqs: int,
+        prefill_raw_offload_seqs: int,
         decode_long_seqs: int,
         decode_short_seqs: int,
         last_batch: str,
@@ -139,8 +141,9 @@ class _ThroughputIntervalLogger:
             self._running_seqs = int(running_seqs)
             self._prefill_seqs = int(prefill_seqs)
             self._decode_seqs = int(decode_seqs)
-            self._prefill_long_seqs = int(prefill_long_seqs)
-            self._prefill_short_seqs = int(prefill_short_seqs)
+            self._prefill_chunked_seqs = int(prefill_chunked_seqs)
+            self._prefill_full_seqs = int(prefill_full_seqs)
+            self._prefill_raw_offload_seqs = int(prefill_raw_offload_seqs)
             self._decode_long_seqs = int(decode_long_seqs)
             self._decode_short_seqs = int(decode_short_seqs)
             self._last_batch = str(last_batch)
@@ -154,8 +157,9 @@ class _ThroughputIntervalLogger:
                 running_seqs = self._running_seqs
                 prefill_seqs = self._prefill_seqs
                 decode_seqs = self._decode_seqs
-                prefill_long_seqs = self._prefill_long_seqs
-                prefill_short_seqs = self._prefill_short_seqs
+                prefill_chunked_seqs = self._prefill_chunked_seqs
+                prefill_full_seqs = self._prefill_full_seqs
+                prefill_raw_offload_seqs = self._prefill_raw_offload_seqs
                 decode_long_seqs = self._decode_long_seqs
                 decode_short_seqs = self._decode_short_seqs
                 last_batch = self._last_batch
@@ -170,7 +174,8 @@ class _ThroughputIntervalLogger:
             logger.info(
                 "Avg TP (last {dt:.1f}s): prefill_tp={prefill_tp:.0f} tok/s, decode_tp={decode_tp:.0f} tok/s "
                 "| seq(run/prf/dc)={running_seqs}/{prefill_seqs}/{decode_seqs} "
-                "| prf(L/S)={prefill_long_seqs}/{prefill_short_seqs} dc(L/S)={decode_long_seqs}/{decode_short_seqs} "
+                "| prf(chunked/full/raw_offload)={prefill_chunked_seqs}/{prefill_full_seqs}/{prefill_raw_offload_seqs} "
+                "dc(L/S)={decode_long_seqs}/{decode_short_seqs} "
                 "| last_batch={last_batch} "
                 "(prefill_tokens={prefill_tokens}, decode_tokens={decode_tokens})",
                 dt=dt,
@@ -181,8 +186,9 @@ class _ThroughputIntervalLogger:
                 running_seqs=running_seqs,
                 prefill_seqs=prefill_seqs,
                 decode_seqs=decode_seqs,
-                prefill_long_seqs=prefill_long_seqs,
-                prefill_short_seqs=prefill_short_seqs,
+                prefill_chunked_seqs=prefill_chunked_seqs,
+                prefill_full_seqs=prefill_full_seqs,
+                prefill_raw_offload_seqs=prefill_raw_offload_seqs,
                 decode_long_seqs=decode_long_seqs,
                 decode_short_seqs=decode_short_seqs,
                 last_batch=last_batch,
@@ -1102,6 +1108,11 @@ class LLMEngine:
             # 1. 调度：决定哪些序列进入本次 Batch
             with profiler.record("schedule"):
                 seqs, is_prefill, preempted_seqs = self.scheduler.schedule()
+            prefill_batch_mode = (
+                self.scheduler.prefill_execution_mode_for_batch(seqs)
+                if seqs and is_prefill
+                else None
+            )
             
             # 2. 显式处理抢占 (Eviction)：
             # 如果有序列被调度器踢出，立即广播指令让所有 Rank 释放其占用的物理槽位
@@ -1113,11 +1124,8 @@ class LLMEngine:
                 if preempted_seqs or self.is_finished():
                     prefill_seqs = len(self.scheduler.waiting)
                     decode_seqs = len(self.scheduler.decoding)
-                    prefill_threshold = self.scheduler._long_text_threshold(is_prefill=True)
+                    prefill_modes = self.scheduler.prefill_execution_mode_counts()
                     decode_threshold = self.scheduler._long_text_threshold(is_prefill=False)
-                    prefill_long = sum(
-                        1 for s in self.scheduler.waiting if int(s.num_prompt_tokens) > int(prefill_threshold)
-                    )
                     decode_long = sum(
                         1 for s in self.scheduler.decoding if int(s.num_tokens) > int(decode_threshold)
                     )
@@ -1125,8 +1133,9 @@ class LLMEngine:
                         prefill_seqs + decode_seqs,
                         prefill_seqs,
                         decode_seqs,
-                        prefill_long,
-                        prefill_seqs - prefill_long,
+                        prefill_modes["chunked"],
+                        prefill_modes["full"],
+                        prefill_modes["raw_offload"],
                         decode_long,
                         decode_seqs - decode_long,
                         "idle",
@@ -1263,23 +1272,23 @@ class LLMEngine:
         self._throughput_logger.record_step(num_tokens)
         prefill_seqs = len(self.scheduler.waiting)
         decode_seqs = len(self.scheduler.decoding)
-        prefill_threshold = self.scheduler._long_text_threshold(is_prefill=True)
+        prefill_modes = self.scheduler.prefill_execution_mode_counts()
         decode_threshold = self.scheduler._long_text_threshold(is_prefill=False)
-        prefill_long = sum(1 for s in self.scheduler.waiting if int(s.num_prompt_tokens) > int(prefill_threshold))
         decode_long = sum(1 for s in self.scheduler.decoding if int(s.num_tokens) > int(decode_threshold))
         if is_prefill:
-            batch_is_long = bool(int(seqs[0].num_prompt_tokens) > int(prefill_threshold))
-            stage = "pf"
+            if prefill_batch_mode is None:
+                raise RuntimeError("Missing execution mode for a scheduled prefill batch.")
+            last_batch = f"pf-{prefill_batch_mode}"
         else:
             batch_is_long = bool(int(seqs[0].num_tokens) > int(decode_threshold))
-            stage = "dc"
-        last_batch = f"{stage}-{'L' if batch_is_long else 'S'}"
+            last_batch = f"dc-{'L' if batch_is_long else 'S'}"
         self._throughput_logger.record_state(
             prefill_seqs + decode_seqs,
             prefill_seqs,
             decode_seqs,
-            prefill_long,
-            prefill_seqs - prefill_long,
+            prefill_modes["chunked"],
+            prefill_modes["full"],
+            prefill_modes["raw_offload"],
             decode_long,
             decode_seqs - decode_long,
             last_batch,

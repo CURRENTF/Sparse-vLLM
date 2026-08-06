@@ -3,12 +3,14 @@ from collections import deque
 from collections.abc import Callable
 
 from sparsevllm.config import Config
+from sparsevllm.engine.prefill import (
+    PREFILL_EXECUTION_CHUNKED,
+    PREFILL_EXECUTION_FULL,
+    PREFILL_EXECUTION_RAW_OFFLOAD,
+    validate_prefill_execution_mode,
+)
 from sparsevllm.engine.sequence import Sequence, SequenceStatus
 from sparsevllm.engine.runtime_state import MemoryOracle
-from sparsevllm.method_registry import (
-    PREFILL_POLICY_ALL_CHUNKED,
-    PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
-)
 from sparsevllm.utils.log import logger
 
 
@@ -61,30 +63,22 @@ class Scheduler:
         self.total_recompute_replays = 0
 
     def _long_text_threshold(self, is_prefill: bool) -> int:
-        """Long-text boundary for batch partitioning.
-
-        Prefill: based on prompt length + chunk prefill size.
-        Decode: based on current total tokens (prompt + generated), without chunk size.
-        """
-        if (
-            is_prefill
-            and self.prefill_schedule_policy == PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH
-        ):
-            return int(self.chunk_prefill_size)
+        """Long-text boundary retained only for decode batch partitioning."""
         if self.config.vllm_sparse_method in ("streamingllm", "attention-sink", "attention_sink"):
             base = self.num_sink_tokens + self.num_recent_tokens
         else:
             base = self.num_sink_tokens + self.decode_keep_tokens + self.num_recent_tokens
-        return base + (self.chunk_prefill_size if is_prefill else 0)
+        return base
 
     def _is_long_text(self, seq: Sequence, is_prefill: bool) -> bool:
         if not self.config.vllm_sparse_method:
             return False
-        if is_prefill and self.memory_oracle.should_schedule_full_prefill(seq):
-            return True
+        if is_prefill:
+            raise ValueError(
+                "Prefill must use prefill_execution_mode(), not decode long-text partitioning."
+            )
         threshold = self._long_text_threshold(is_prefill)
-        seq_len = seq.num_prompt_tokens if is_prefill else seq.num_tokens
-        return int(seq_len) > int(threshold)
+        return int(seq.num_tokens) > int(threshold)
 
     def _pop_waiting_at(self, idx: int) -> Sequence:
         if idx == 0:
@@ -94,7 +88,67 @@ class Scheduler:
         self.waiting.rotate(idx)
         return seq
 
-    def _pop_next_prefill_seq(self, target_is_long: bool) -> Sequence | None:
+    def _prefill_execution_mode(self, seq: Sequence) -> str:
+        return validate_prefill_execution_mode(
+            self.memory_oracle.prefill_execution_mode(seq)
+        )
+
+    def _prefill_batch_key(self, seq: Sequence) -> tuple[str, object]:
+        mode = self._prefill_execution_mode(seq)
+        compatibility = self.memory_oracle.prefill_batch_compatibility_key(seq)
+        try:
+            hash(compatibility)
+        except TypeError as exc:
+            raise TypeError(
+                "prefill_batch_compatibility_key must be hashable: "
+                f"seq_id={seq.seq_id} key={compatibility!r}."
+            ) from exc
+        return mode, compatibility
+
+    def prefill_execution_mode_counts(self) -> dict[str, int]:
+        """Count queued prompts by their method-owned execution contract."""
+        counts = {
+            PREFILL_EXECUTION_CHUNKED: 0,
+            PREFILL_EXECUTION_FULL: 0,
+            PREFILL_EXECUTION_RAW_OFFLOAD: 0,
+        }
+        for seq in self.waiting:
+            self._refresh_prefill_metadata(seq)
+            counts[self._prefill_execution_mode(seq)] += 1
+        return counts
+
+    def prefill_execution_mode_for_batch(self, seqs: list[Sequence]) -> str:
+        """Return the single execution mode guaranteed by prefill bucketing."""
+        batch_keys = {self._prefill_batch_key(seq) for seq in seqs}
+        if len(batch_keys) != 1:
+            raise RuntimeError(
+                "Scheduler produced an incompatible prefill batch: "
+                f"keys={batch_keys!r} seq_ids={[seq.seq_id for seq in seqs]}."
+            )
+        mode, _compatibility = batch_keys.pop()
+        return mode
+
+    def _refresh_prefill_metadata(self, seq: Sequence) -> None:
+        if seq.num_prefilled_tokens == 0 and seq.num_completion_tokens == 0:
+            self.prefix_cache_hit_refresher(seq)
+
+    def _prefill_mode_order(self) -> list[tuple[str, object]]:
+        replay_pending = any(seq.is_recompute_replay for seq in self.waiting)
+        modes: list[tuple[str, object]] = []
+        for seq in self.waiting:
+            if replay_pending and not seq.is_recompute_replay:
+                continue
+            self._refresh_prefill_metadata(seq)
+            batch_key = self._prefill_batch_key(seq)
+            if batch_key not in modes:
+                modes.append(batch_key)
+        return modes
+
+    def _pop_next_prefill_seq(
+        self,
+        target_mode: str,
+        target_compatibility: object,
+    ) -> Sequence | None:
         if not self.waiting:
             return None
         replay_pending = any(seq.is_recompute_replay for seq in self.waiting)
@@ -105,7 +159,10 @@ class Scheduler:
             # one request needs to run to completion and free its full row.
             if replay_pending and not seq.is_recompute_replay:
                 continue
-            if self._is_long_text(seq, is_prefill=True) == target_is_long:
+            if self._prefill_batch_key(seq) == (
+                target_mode,
+                target_compatibility,
+            ):
                 return self._pop_waiting_at(idx)
         return None
 
@@ -146,6 +203,7 @@ class Scheduler:
                 queue.remove(seq)
                 seq.status = SequenceStatus.FINISHED
                 self._admission_defer_warned_seq_ids.discard(seq_id)
+                self.memory_oracle.reset_prefill_execution_state(seq_id)
                 return seq.num_prefilled_tokens > 0 or queue is self.decoding
         return False
 
@@ -155,7 +213,7 @@ class Scheduler:
     def _can_continue_prefill_batch(
         self,
         *,
-        target_is_long: bool,
+        target_mode: str,
         scheduled_seqs: list[Sequence],
         step_free_count: int,
         num_batched_tokens: int,
@@ -171,11 +229,7 @@ class Scheduler:
             return False
         if len(self.decoding) >= self.max_decoding_seqs:
             return False
-        if (
-            self.prefill_schedule_policy == PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH and target_is_long
-        ):
-            # Long full-prefill methods are isolated as bs=1. Methods that need
-            # long-prefill offload still cap the step in _prefill_step_tokens().
+        if target_mode == PREFILL_EXECUTION_RAW_OFFLOAD:
             return not scheduled_seqs and step_free_count > 0
         return (
             step_free_count > 0
@@ -183,26 +237,16 @@ class Scheduler:
             and num_batched_seqs < self.max_num_seqs_in_batch
         )
 
-    def _requires_long_prefill_offload(self, seq: Sequence) -> bool:
-        if self.prefill_schedule_policy != PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH:
-            return False
-        requires_offload = getattr(
-            self.memory_oracle,
-            "requires_long_prefill_offload",
-            None,
-        )
-        return bool(callable(requires_offload) and requires_offload(seq))
-
     def _prefill_step_tokens(
         self,
         *,
         seq: Sequence,
-        target_is_long: bool,
+        mode: str,
         remaining_prefill_tokens: int,
         num_batched_tokens: int,
         step_free_count: int,
     ) -> int:
-        if self.memory_oracle.requires_full_prefill_step(seq):
+        if mode == PREFILL_EXECUTION_FULL:
             available = min(
                 self.max_num_batched_tokens - num_batched_tokens,
                 step_free_count,
@@ -210,30 +254,17 @@ class Scheduler:
             if remaining_prefill_tokens <= available:
                 return int(remaining_prefill_tokens)
             return 0
-        if self.prefill_schedule_policy == PREFILL_POLICY_ALL_CHUNKED:
+        if mode in {
+            PREFILL_EXECUTION_CHUNKED,
+            PREFILL_EXECUTION_RAW_OFFLOAD,
+        }:
             return min(
                 remaining_prefill_tokens,
                 self.chunk_prefill_size,
                 self.max_num_batched_tokens - num_batched_tokens,
                 step_free_count,
             )
-        if self.prefill_schedule_policy == PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH:
-            if target_is_long:
-                if self._requires_long_prefill_offload(seq):
-                    return min(
-                        remaining_prefill_tokens,
-                        self.chunk_prefill_size,
-                        self.max_num_batched_tokens - num_batched_tokens,
-                        step_free_count,
-                    )
-                return int(remaining_prefill_tokens)
-            return min(
-                remaining_prefill_tokens,
-                self.chunk_prefill_size,
-                self.max_num_batched_tokens - num_batched_tokens,
-                step_free_count,
-            )
-        raise ValueError(f"Unknown prefill_schedule_policy={self.prefill_schedule_policy!r}")
+        raise ValueError(f"Unknown prefill execution mode={mode!r}")
 
     def _respect_min_final_prefill_chunk(
         self,
@@ -334,6 +365,7 @@ class Scheduler:
                 survivor.num_completion_tokens
             )
         self.memory_oracle.clear_prefix_cache_hit(victim)
+        self.memory_oracle.reset_prefill_execution_state(victim.seq_id)
         # Requeue to the tail. While a replay is pending, prefill scheduling is
         # suspended until active decodes drain; the victim therefore cannot
         # immediately consume the slots it just released.
@@ -406,26 +438,23 @@ class Scheduler:
 
         # --- 阶段 1: Prefill 调度 ---
         # 只要 waiting 队列有活，就优先处理 Prefill，因为它是计算密集型的。
-        prefill_bucket_order: list[bool] = []
+        prefill_mode_order: list[tuple[str, object]] = []
         replay_waiting = [seq for seq in self.waiting if seq.is_recompute_replay]
         if self.waiting and not (replay_waiting and self.decoding):
             # A preempted request may only rebuild after the surviving decode
             # set drains. Rebuilding immediately would consume the KV capacity
             # that preemption just released and can make the scheduler alternate
             # between replay victims without producing another token.
-            first_prefill = replay_waiting[0] if replay_waiting else self.waiting[0]
-            first_bucket = self._is_long_text(first_prefill, is_prefill=True)
-            prefill_bucket_order.append(first_bucket)
-            prefill_bucket_order.append(not first_bucket)
+            prefill_mode_order = self._prefill_mode_order()
 
-        for target_is_long in prefill_bucket_order:
+        for target_mode, target_compatibility in prefill_mode_order:
             if scheduled_seqs:
                 break
             bucket_scan_budget = len(self.waiting)
             while (
                 bucket_scan_budget > 0
                 and self._can_continue_prefill_batch(
-                    target_is_long=target_is_long,
+                    target_mode=target_mode,
                     scheduled_seqs=scheduled_seqs,
                     step_free_count=step_free_count,
                     num_batched_tokens=num_batched_tokens,
@@ -433,19 +462,20 @@ class Scheduler:
                     margin_batched_tokens=margin_batched_tokens,
                 )
             ):
-                seq = self._pop_next_prefill_seq(target_is_long)
+                seq = self._pop_next_prefill_seq(
+                    target_mode,
+                    target_compatibility,
+                )
                 if seq is None:
                     break
                 bucket_scan_budget -= 1
-                if seq.num_prefilled_tokens == 0 and seq.num_completion_tokens == 0:
-                    self.prefix_cache_hit_refresher(seq)
                 remaining_prefill_tokens = self.memory_oracle.remaining_prefill_tokens(seq)
                 candidate_step_free_count = int(self.memory_oracle.prefill_step_free_slots_for(seq))
                 uses_full_prefill_staging = bool(
                     self.memory_oracle.should_schedule_full_prefill(seq)
                 )
                 if (
-                    not self._requires_long_prefill_offload(seq)
+                    target_mode != PREFILL_EXECUTION_RAW_OFFLOAD
                     and not uses_full_prefill_staging
                 ):
                     candidate_step_free_count = min(int(step_free_count), int(candidate_step_free_count))
@@ -457,7 +487,7 @@ class Scheduler:
                 # 确定本次 Chunk 的大小
                 can_prefill_tokens = self._prefill_step_tokens(
                     seq=seq,
-                    target_is_long=target_is_long,
+                    mode=target_mode,
                     remaining_prefill_tokens=remaining_prefill_tokens,
                     num_batched_tokens=num_batched_tokens,
                     step_free_count=candidate_step_free_count,
@@ -477,7 +507,7 @@ class Scheduler:
                                 int(candidate_step_free_count),
                                 int(step_free_count),
                             )
-                    if self.memory_oracle.requires_full_prefill_step(seq):
+                    if target_mode == PREFILL_EXECUTION_FULL:
                         available = min(
                             self.max_num_batched_tokens - num_batched_tokens,
                             candidate_step_free_count,
@@ -592,10 +622,7 @@ class Scheduler:
                 step_free_count = max(0, step_free_count - int(prefill_reservation_cost))
                 seq.status = SequenceStatus.RUNNING
                 scheduled_seqs.append(seq)
-                if (
-                    self.prefill_schedule_policy == PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH
-                    and target_is_long
-                ):
+                if target_mode == PREFILL_EXECUTION_RAW_OFFLOAD:
                     break
 
         # 如果有 Prefill 请求被选中，直接返回，本次 step 只跑 Prefill。
@@ -786,6 +813,7 @@ class Scheduler:
                     seq.status = SequenceStatus.WAITING
                     self.waiting.appendleft(seq)
                 else:
+                    self.memory_oracle.complete_prefill_execution(seq)
                     # Prefill 彻底结束，进入正常生成流程
                     seq.status = SequenceStatus.RUNNING
                     self.decoding.append(seq)

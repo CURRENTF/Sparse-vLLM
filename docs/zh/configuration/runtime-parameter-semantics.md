@@ -572,10 +572,10 @@ python scripts/benchmarks/bench_sparse_vllm.py \
 
 | 参数 | Backend | 含义 |
 | --- | --- | --- |
-| `engine_prefill_chunk_size` | Sparse-vLLM | `all_chunked` 下每个 step、每个 sequence 调度的最大 prefill chunk。不要为 `long_bs1full_short_batch` 设置；该 policy 从 `long_prefill_offload_threshold` 派生 chunk size。 |
+| `engine_prefill_chunk_size` | Sparse-vLLM | `all_chunked` 下每个 step、每个 sequence 调度的最大 prefill chunk，也是 `long_bs1full_short_batch` 下 RawKV offload 的最大 chunk。long policy 下未设置时默认等于 `long_prefill_offload_threshold`；显式值必须满足 `0 < engine_prefill_chunk_size <= long_prefill_offload_threshold`。 |
 | `hf_prefill_chunk_size` | HF | Long input forward 的 wrapper/model chunk size；较大值通常表示“不 chunk”。 |
 | `max_model_len` | Sparse-vLLM | Prompt 加 generated token 的 engine hard capacity，影响 allocation 和 request validation。 |
-| `long_prefill_offload_threshold` | Sparse-vLLM | `long_bs1full_short_batch` 下 complete batched short prefill 与 isolated chunked RawKV offload 的精确边界。默认 `98304` token（96K），同时成为该 policy 的 `chunk_prefill_size`。 |
+| `long_prefill_offload_threshold` | Sparse-vLLM | `long_bs1full_short_batch` 下 atomic batched full prefill 与 isolated chunked RawKV offload 的 residual-token 边界。默认 `65536` token（64K）。 |
 | `max_num_batched_tokens` | Sparse-vLLM | 一个 step 的 aggregate scheduler token 上限；memory heuristic 可能降低。`all_chunked` 允许小于 `engine_prefill_chunk_size`；`long_bs1full_short_batch` 至少规范到 `long_prefill_offload_threshold`，使边界 prompt 能原子容纳。 |
 | `max_num_seqs_in_batch` | Sparse-vLLM | Prefill/decode step 中最大 active sequence 数。 |
 | `max_decoding_seqs` | Sparse-vLLM | Decode queue 中最大 sequence 数。 |
@@ -797,8 +797,8 @@ sparsevllm-openai-server \
 | `max_num_batched_tokens` | `65536` | 继承自 `Config`。 |
 | `max_num_seqs_in_batch` | `32` | 继承自 `Config`。 |
 | `max_decoding_seqs` | `64` | 继承自 `Config`。 |
-| `engine_prefill_chunk_size` / `chunk_prefill_size` | `8192` | 仅用于 `all_chunked`。CLI 使用语义明确的 `--engine-prefill-chunk-size`。 |
-| `long_prefill_offload_threshold` | `98304` | 仅用于 `long_bs1full_short_batch`，同时决定该 policy 的 chunk size。 |
+| `engine_prefill_chunk_size` / `chunk_prefill_size` | `8192` | `all_chunked` 的最大 chunk。`long_bs1full_short_batch` 下未设置时默认等于 offload threshold，也可显式设置更小的值。CLI 使用语义明确的 `--engine-prefill-chunk-size`。 |
+| `long_prefill_offload_threshold` | `65536` | `long_bs1full_short_batch` 的 residual 边界；超过时使用 isolated RawKV offload。 |
 | `enable_prefix_caching` | `false` | 传入 `--enable-prefix-caching true` 启用 prefix KV reuse。 |
 | `prefix_cache_mode` | `"auto"` | 为 vanilla/OmniKV/QuEST 解析为 radix，为 SnapKV/H2O/PyramidKV/R-KV/SkipKV 解析为 chain。 |
 | `prefix_cache_block_size` | vanilla/OmniKV 为 `16`，QuEST 为 `quest_chunk_size` | 仅用于 radix。使用 `--prefix-cache-block-size`；QuEST 拒绝与 `quest_chunk_size` 不同的值，chain mode 忽略它。 |

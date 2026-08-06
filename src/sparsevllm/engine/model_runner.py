@@ -29,7 +29,6 @@ from sparsevllm.engine.chain_cache import ChainAdmissionPlan, ChainCacheCoordina
 from sparsevllm.engine.recurrent_state_manager import RecurrentStateManager, RecurrentStateSpec
 from sparsevllm.engine.runtime_state import RuntimeState
 from sparsevllm.engine.sparse_controller import SparseController
-from sparsevllm.method_registry import PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH
 import sparsevllm.platforms as platforms
 from sparsevllm.utils.profiler import profiler
 
@@ -977,12 +976,7 @@ class ModelRunner:
         return summaries if self.rank == 0 else None
 
     def _long_text_threshold(self, is_prefill: bool) -> int:
-        if (
-            is_prefill
-            and self.config.prefill_schedule_policy
-            == PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH
-        ):
-            return int(self.config.chunk_prefill_size)
+        del is_prefill
         if self.config.vllm_sparse_method in ("streamingllm", "attention-sink", "attention_sink"):
             base = self.config.num_sink_tokens + self.config.num_recent_tokens
         else:
@@ -991,23 +985,19 @@ class ModelRunner:
                 + self.config.num_recent_tokens
                 + self.config.decode_keep_tokens
             )
-        return base + (self.config.chunk_prefill_size if is_prefill else 0)
+        return base
 
     def _is_long_text_batch(self, seqs: list[Sequence], is_prefill: bool) -> bool:
-        # `is_long_text` is a batch-level flag used to gate sparse logic. We compute it
-        # dynamically from the *current* sequence lengths so short prompts can become
-        # long during decode.
+        # Prefill execution is per-sequence and cache-manager owned.  This
+        # batch-level flag remains only for decode graph families.
         if not seqs:
             return False
         if not self.config.vllm_sparse_method:
             return False
-        if is_prefill and self.cache_manager.is_full_prefill_step(seqs):
-            return True
-        threshold = self._long_text_threshold(is_prefill)
         if is_prefill:
-            flags = [int(seq.num_prompt_tokens) > int(threshold) for seq in seqs]
-        else:
-            flags = [int(seq.num_tokens) > int(threshold) for seq in seqs]
+            return False
+        threshold = self._long_text_threshold(is_prefill)
+        flags = [int(seq.num_tokens) > int(threshold) for seq in seqs]
         is_long = bool(flags[0])
         if any(bool(flag) != is_long for flag in flags):
             raise ValueError("Mixed long/short batch detected; scheduler should enforce separation.")

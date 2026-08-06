@@ -254,17 +254,19 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
             return False
         if getattr(self.config, "prefill_schedule_policy", None) != "long_bs1full_short_batch":
             return False
-        if not self.deltakv_layer_ids or len(seqs) != 1:
+        if not self.deltakv_layer_ids or not seqs:
             return False
-        seq = seqs[0]
-        if self.requires_long_prefill_offload(seq):
-            return False
-        remaining = int(seq.num_prompt_tokens - seq.num_prefilled_tokens)
-        return (
-            remaining > 0
-            and int(seq.num_prefilled_tokens) == 0
-            and int(seq.current_chunk_size) == remaining
-        )
+        for seq in seqs:
+            if self.requires_long_prefill_offload(seq):
+                return False
+            remaining = int(seq.num_prompt_tokens - seq.num_prefilled_tokens)
+            if not (
+                remaining > 0
+                and int(seq.num_prefilled_tokens) == 0
+                and int(seq.current_chunk_size) == remaining
+            ):
+                return False
+        return True
 
     def should_schedule_full_prefill(self, seq: Sequence) -> bool:
         if not self._full_layer_kivi_enabled():
@@ -283,7 +285,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         staging_slots = int(getattr(self, "deltakv_prefill_staging_num_slots", 0) or 0)
         if staging_slots > 0 and remaining > staging_slots:
             return False
-        return remaining > int(self.prefill_step_free_slots())
+        return True
 
     def has_prefill_staging_view(self, layer_idx: int) -> bool:
         if super().has_prefill_staging_view(layer_idx):
@@ -307,6 +309,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
 
     def prepare_step(self, seqs: list[Sequence], is_prefill: bool):
         self._deltakv_less_memory_prepare_seqs = seqs
+        self._deltakv_less_memory_full_prefill_staging_offset = 0
         self._deltakv_less_memory_prepare_full_prefill_staging = bool(
             is_prefill
             and (
@@ -318,6 +321,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
             return super().prepare_step(seqs, is_prefill)
         finally:
             self._deltakv_less_memory_prepare_seqs = None
+            self._deltakv_less_memory_full_prefill_staging_offset = 0
             self._deltakv_less_memory_prepare_full_prefill_staging = False
 
     @staticmethod
@@ -892,7 +896,8 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         if closed_loop_plan is not None:
             logger.info(
                 "DeltaKV less-memory closed-loop allocation: "
-                f"full_raw_slots={self.full_num_slots}; "
+                f"full_layer_resident_raw_slots={self.full_num_slots}; "
+                f"prefill_staging_slots={self.deltakv_prefill_staging_num_slots}; "
                 f"sparse_raw_slots={self.deltakv_full_num_slots}; "
                 f"sparse_raw_overhead={deltakv_overhead_slots}; "
                 f"sparse_raw_persistent_overhead={deltakv_persistent_overhead_slots}; "
@@ -1516,19 +1521,14 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
     def _should_stage_full_layer_kivi_prefill(self, seq: Sequence, size: int) -> bool:
         if not self._full_layer_kivi_enabled():
             return False
-        # This helper is called from _allocate_full() while prepare_prefill() is
-        # still building the step.  A singleton [seq] would satisfy
-        # _should_use_full_prefill_staging() even when the actual scheduled step is
-        # a batched short-prefill step.  In that case staging slots are not active
-        # for the step, and returning torch.arange(size) would alias multiple rows
-        # onto the same physical full-layer slots.  Only stage when prepare_step()
-        # has already determined that the whole scheduled batch is a full-prefill
-        # staging step.
+        # Only stage when prepare_step() has classified the entire homogeneous
+        # prefill batch as a staging step. The per-step cursor in _allocate_full()
+        # gives each short prompt a disjoint range in the shared staging buffer.
         if not bool(getattr(self, "_deltakv_less_memory_prepare_full_prefill_staging", False)):
             return False
         if int(size) != int(seq.current_chunk_size):
             return False
-        return self._should_use_full_prefill_staging([seq]) or self._should_use_long_prefill_offload_staging([seq])
+        return True
 
     @torch.no_grad()
     def _allocate_full(self, seq_id: int, size: int) -> torch.Tensor:
@@ -1543,23 +1543,56 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
             uses_offload_staging = self._should_use_long_prefill_offload_staging([seq])
             if cur_len != 0 and not uses_offload_staging:
                 raise RuntimeError("Full-layer KIVI full-prefill staging only supports first-prefill prompts.")
-            if cur_len + int(size) > int(self.deltakv_prefill_staging_num_slots):
+            if uses_offload_staging:
+                staging_start = cur_len
+            else:
+                staging_start = int(
+                    getattr(self, "_deltakv_less_memory_full_prefill_staging_offset", 0)
+                    or 0
+                )
+            staging_end = staging_start + int(size)
+            if staging_end > int(self.deltakv_prefill_staging_num_slots):
                 raise RuntimeError(
                     "Full-layer KIVI full-prefill staging capacity is too small: "
-                    f"context_len={cur_len + int(size)}, staging_slots={self.deltakv_prefill_staging_num_slots}."
+                    f"staging_end={staging_end} staging_slots={self.deltakv_prefill_staging_num_slots}."
                 )
-            staging_slots = torch.arange(cur_len, cur_len + int(size), dtype=torch.int32, device=self.device)
+            staging_slots = torch.arange(staging_start, staging_end, dtype=torch.int32, device=self.device)
             if not uses_offload_staging:
+                self._deltakv_less_memory_full_prefill_staging_offset = staging_end
                 self.full_layer_slots_map[row_idx, cur_len: cur_len + int(size)] = staging_slots
             return staging_slots
         return super()._allocate_full(seq_id, size)
 
-    def _prepare_full_prefill_staging_plan(self, seq: Sequence, row_idx: int, total_len: int):
-        super()._prepare_full_prefill_staging_plan(seq, row_idx, total_len)
+    def _prepare_full_prefill_staging_plan(
+        self,
+        seq: Sequence,
+        row_idx: int,
+        total_len: int,
+        *,
+        staging_start: int = 0,
+    ):
+        super()._prepare_full_prefill_staging_plan(
+            seq,
+            row_idx,
+            total_len,
+            staging_start=staging_start,
+        )
         if self._full_layer_kivi_enabled():
-            self._prepare_full_layer_kivi_full_prefill_plan(seq, row_idx, total_len)
+            self._prepare_full_layer_kivi_full_prefill_plan(
+                seq,
+                row_idx,
+                total_len,
+                staging_start=staging_start,
+            )
 
-    def _prepare_full_layer_kivi_full_prefill_plan(self, seq: Sequence, row_idx: int, total_len: int):
+    def _prepare_full_layer_kivi_full_prefill_plan(
+        self,
+        seq: Sequence,
+        row_idx: int,
+        total_len: int,
+        *,
+        staging_start: int = 0,
+    ):
         total_len = int(total_len)
         group_size = self._full_layer_kivi_group_size()
         sink = min(int(self.config.num_sink_tokens), total_len)
@@ -1597,6 +1630,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         self._full_layer_kivi_full_prefill_plans[int(row_idx)] = {
             "row_idx": int(row_idx),
             "total_len": int(total_len),
+            "staging_start": int(staging_start),
             "keep_pos": keep_pos,
             "keep_slots": keep_slots,
             "block_slots": block_slots,
@@ -1616,12 +1650,14 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
             block_chunk_size = self._full_layer_kivi_store_block_chunk_size()
 
             for plan in self._full_layer_kivi_full_prefill_plans.values():
+                staging_start = int(plan.get("staging_start", 0) or 0)
                 keep_pos = plan["keep_pos"].to(torch.long)
                 keep_slots = plan["keep_slots"].to(torch.long)
                 if keep_slots.numel() > 0:
                     with profiler.record("deltakv_full_prefill_kivi_copy_keep"):
-                        self.full_kv_cache[0, l_idx, keep_slots] = k_stage[keep_pos]
-                        self.full_kv_cache[1, l_idx, keep_slots] = v_stage[keep_pos]
+                        stage_keep_pos = keep_pos + staging_start
+                        self.full_kv_cache[0, l_idx, keep_slots] = k_stage[stage_keep_pos]
+                        self.full_kv_cache[1, l_idx, keep_slots] = v_stage[stage_keep_pos]
 
                 block_slots = plan["block_slots"].to(torch.long)
                 if block_slots.numel() > 0:
@@ -1637,7 +1673,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
                     with profiler.record("deltakv_full_prefill_kivi_store_blocks"):
                         for start in range(0, int(block_slots.numel()), block_chunk_size):
                             end = min(int(block_slots.numel()), start + block_chunk_size)
-                            block_pos = block_pos_all[start:end]
+                            block_pos = block_pos_all[start:end] + staging_start
                             self._store_full_layer_kivi_blocks(
                                 l_idx=l_idx,
                                 block_slots=block_slots[start:end],
@@ -2493,14 +2529,18 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
 
         with profiler.record("deltakv_full_prefill_build_centers"):
             kv_dim = 2 * self.num_kv_heads * self.head_dim
+            staging_start = int(plan.get("staging_start", 0) or 0)
             sink_pos = plan["keep_pos"][: int(sink_slots.numel())].to(torch.int32)
             existing_centers = (
-                self._stage_pre_rope_kv_by_pos(sink_pos, validate=False).unsqueeze(0)
+                self._stage_pre_rope_kv_by_pos(sink_pos + staging_start, validate=False).unsqueeze(0)
                 if sink_slots.numel() > 0
                 else evict_pos.new_zeros((1, 0, kv_dim), dtype=self.hf_config.torch_dtype)
             )
             new_centers = (
-                self._stage_pre_rope_kv_by_pos(center_pos.to(torch.int32), validate=False).unsqueeze(0)
+                self._stage_pre_rope_kv_by_pos(
+                    center_pos.to(torch.int32) + staging_start,
+                    validate=False,
+                ).unsqueeze(0)
                 if center_pos.numel() > 0
                 else existing_centers.new_zeros((1, 0, kv_dim))
             )
@@ -2517,7 +2557,10 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
             end = min(int(evict_pos.numel()), start + store_chunk_size)
             evict_chunk = evict_pos[start:end]
             with profiler.record("deltakv_full_prefill_gather_raw_chunk"):
-                kv_chunk = self._stage_pre_rope_kv_by_pos(evict_chunk, validate=False).unsqueeze(0)
+                kv_chunk = self._stage_pre_rope_kv_by_pos(
+                    evict_chunk + staging_start,
+                    validate=False,
+                ).unsqueeze(0)
             with profiler.record("deltakv_full_prefill_cluster_chunk"):
                 topk_center_indices, base_kv = self._cluster_compress_against_centers(
                     kv_states=kv_chunk,
@@ -2586,10 +2629,11 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
             v_persist = self.deltakv_full_kv_cache[1, l_idx]
 
             for plan in self._deltakv_full_prefill_plans.values():
+                staging_start = int(plan.get("staging_start", 0) or 0)
                 keep_pos = plan["keep_pos"]
                 keep_slots = plan["keep_slots"]
                 if keep_slots.numel() > 0:
-                    keep_pos_i64 = keep_pos.to(torch.long)
+                    keep_pos_i64 = keep_pos.to(torch.long) + staging_start
                     keep_slots_i64 = keep_slots.to(torch.long)
                     with profiler.record("deltakv_full_prefill_copy_keep"):
                         k_persist[keep_slots_i64] = self.deltakv_prefill_staging_pre_rope_k_cache[keep_pos_i64].to(

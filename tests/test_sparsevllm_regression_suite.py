@@ -144,7 +144,7 @@ class SparseVLLMRegressionSuiteTest(unittest.TestCase):
 
         self.assertEqual(cmd[cmd.index("--methods") + 1], "vanilla,pyramidkv")
         hyper_params = json.loads(cmd[cmd.index("--hyper_params") + 1])
-        self.assertEqual(hyper_params["engine_prefill_chunk_size"], 96 * 1024)
+        self.assertNotIn("engine_prefill_chunk_size", hyper_params)
         self.assertEqual(
             hyper_params["long_prefill_offload_threshold"],
             96 * 1024,

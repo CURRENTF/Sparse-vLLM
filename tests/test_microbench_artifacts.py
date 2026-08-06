@@ -45,54 +45,71 @@ def test_microbench_defaults_all_chunked_methods_to_96k(method):
     "method",
     ["pyramidkv", "deltakv", "deltakv-less-memory-cudagraph"],
 )
-def test_microbench_defaults_long_prefill_methods_to_96k_boundary(method):
+def test_microbench_defaults_long_prefill_methods_to_64k_boundary(method):
     hyper_params = {}
 
     _apply_prefill_policy_defaults(hyper_params, method)
 
-    assert hyper_params == {"long_prefill_offload_threshold": 96 * 1024}
+    assert hyper_params == {"long_prefill_offload_threshold": 64 * 1024}
 
 
 def test_microbench_preserves_explicit_policy_specific_prefill_controls():
     all_chunked = {"engine_prefill_chunk_size": 8192}
-    long_prefill = {"long_prefill_offload_threshold": 65536}
+    long_prefill = {
+        "engine_prefill_chunk_size": 8192,
+        "long_prefill_offload_threshold": 65536,
+    }
 
     _apply_prefill_policy_defaults(all_chunked, "vanilla")
     _apply_prefill_policy_defaults(long_prefill, "pyramidkv")
 
     assert all_chunked == {"engine_prefill_chunk_size": 8192}
-    assert long_prefill == {"long_prefill_offload_threshold": 65536}
+    assert long_prefill == {
+        "engine_prefill_chunk_size": 8192,
+        "long_prefill_offload_threshold": 65536,
+    }
 
 
-@pytest.mark.parametrize(
-    ("method", "hyper_params", "expected_key"),
-    [
-        (
-            "vanilla",
-            {"long_prefill_offload_threshold": 65536},
-            "engine_prefill_chunk_size",
-        ),
-        (
-            "pyramidkv",
-            {"engine_prefill_chunk_size": 8192},
-            "long_prefill_offload_threshold",
-        ),
-    ],
-)
-def test_microbench_rejects_only_incompatible_prefill_control(
-    method,
-    hyper_params,
-    expected_key,
-):
-    with pytest.raises(ValueError, match=expected_key):
-        _apply_prefill_policy_defaults(hyper_params, method)
+def test_microbench_all_chunked_ignores_long_prefill_boundary():
+    hyper_params = {"long_prefill_offload_threshold": 65536}
+
+    _apply_prefill_policy_defaults(hyper_params, "vanilla")
+
+    assert hyper_params == {"engine_prefill_chunk_size": 96 * 1024}
+
+
+def test_microbench_long_prefill_accepts_chunk_without_explicit_boundary():
+    hyper_params = {"engine_prefill_chunk_size": 8192}
+
+    _apply_prefill_policy_defaults(hyper_params, "pyramidkv")
+
+    assert hyper_params == {
+        "engine_prefill_chunk_size": 8192,
+        "long_prefill_offload_threshold": 64 * 1024,
+    }
+
+
+def test_microbench_rejects_chunk_larger_than_long_prefill_boundary():
+    hyper_params = {
+        "engine_prefill_chunk_size": 65537,
+        "long_prefill_offload_threshold": 65536,
+    }
+
+    with pytest.raises(ValueError, match="engine_prefill_chunk_size <="):
+        _apply_prefill_policy_defaults(hyper_params, "pyramidkv")
 
 
 @pytest.mark.parametrize(
     ("method", "expected"),
     [
         ("vanilla", {"engine_prefill_chunk_size": 8192}),
-        ("pyramidkv", {"long_prefill_offload_threshold": 65536}),
+        (
+            "pyramidkv",
+            {
+                "engine_prefill_chunk_size": 8192,
+                "long_prefill_offload_threshold": 65536,
+            },
+        ),
     ],
 )
 def test_microbench_selects_policy_control_when_both_are_declared(

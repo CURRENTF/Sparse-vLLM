@@ -69,23 +69,41 @@ def _validate_prefill_controls(
         ) from exc
 
     if policy == PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH:
-        if "engine_prefill_chunk_size" in config:
+        boundary = config.get("long_prefill_offload_threshold")
+        if (
+            not isinstance(boundary, int)
+            or isinstance(boundary, bool)
+            or boundary <= 0
+        ):
             raise ManifestError(
-                f"{config_label} uses {policy}; declare long_prefill_offload_threshold "
-                "and remove engine_prefill_chunk_size."
+                f"{config_label} long_prefill_offload_threshold must be a positive integer."
             )
-        key = "long_prefill_offload_threshold"
+        chunk_size = config.get("engine_prefill_chunk_size", boundary)
+        if (
+            not isinstance(chunk_size, int)
+            or isinstance(chunk_size, bool)
+            or chunk_size <= 0
+        ):
+            raise ManifestError(
+                f"{config_label} engine_prefill_chunk_size must be a positive integer."
+            )
+        if chunk_size > boundary:
+            raise ManifestError(
+                f"{config_label} engine_prefill_chunk_size must be <= "
+                "long_prefill_offload_threshold."
+            )
+        return
     else:
         if "long_prefill_offload_threshold" in config:
             raise ManifestError(
                 f"{config_label} uses {policy}; declare engine_prefill_chunk_size "
                 "and remove long_prefill_offload_threshold."
             )
-        key = "engine_prefill_chunk_size"
-
-    value = config.get(key)
+    value = config.get("engine_prefill_chunk_size")
     if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
-        raise ManifestError(f"{config_label} {key} must be a positive integer.")
+        raise ManifestError(
+            f"{config_label} engine_prefill_chunk_size must be a positive integer."
+        )
 
 
 def load_manifest(path: str | Path | None = None) -> dict[str, Any]:

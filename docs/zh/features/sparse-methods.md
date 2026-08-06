@@ -26,10 +26,12 @@ Prefill scheduling 是方法 contract 的一部分，由 registry 管理。唯�
 
 | Policy | Runtime 语义 | 当前默认方法 |
 | --- | --- | --- |
-| `all_chunked` | 每个 prefill request 都受 `chunk_prefill_size` 和 scheduler 常规 batch 限制约束。 | `vanilla`, `streamingllm`, `attention-sink`, `snapkv`, `h2o`, `quest`, `omnikv` |
-| `long_bs1full_short_batch` | 长度不超过 `chunk_prefill_size` 的 prompt 使用完整 batched prefill；超过该值的 prompt 以 batch size 1 隔离运行，并使用 chunked RawKV offload。 | `pyramidkv` 和 DeltaKV family 方法 |
+| `all_chunked` | 每个 prefill request 都受 `chunk_prefill_size` 和 scheduler 常规 batch 限制约束；忽略 `long_prefill_offload_threshold`。 | `vanilla`, `streamingllm`, `attention-sink`, `snapkv`, `h2o`, `quest`, `omnikv` |
+| `long_bs1full_short_batch` | 在附加受支持的 prefix 后，residual 不超过 `long_prefill_offload_threshold` 时使用 atomic full prefill，并且可以互相 batch；更大的 residual 被隔离，并使用不超过 `chunk_prefill_size` 的 RawKV offload chunk。 | `pyramidkv` 和 DeltaKV family 方法 |
 
-DeltaKV family 方法和 PyramidKV 只对外提供 `long_bs1full_short_batch` policy。它们的 cache manager 对每个长于 `chunk_prefill_size` 的 prompt 使用 `requires_long_prefill_offload()`。这一精确边界避免产生一段使用 isolated full prefill、可能导致 activation OOM 的中间区间。在该 policy 下，`Config` 根据 `long_prefill_offload_threshold` 同时设置 `chunk_prefill_size` 和 offload boundary；该阈值默认是 `98304` token（96K）。不要单独设置 `engine_prefill_chunk_size`；实验需要不同边界时应设置该 threshold。必要时，`Config` 会提高 `max_num_batched_tokens`，使一个边界大小的 short prefill 能够容纳。`all_chunked` 仍独立使用 `engine_prefill_chunk_size`。
+DeltaKV family 方法和 PyramidKV 只对外提供 `long_bs1full_short_batch` policy。threshold 默认是 `65536` token（64K）。未设置 `engine_prefill_chunk_size` 时，它默认等于 threshold；显式值必须为正数且不大于 threshold。必要时，`Config` 会提高 `max_num_batched_tokens`，使一个 threshold 大小的 full prefill 能够原子容纳。PyramidKV 根据 chain prefix attach 后的 residual 进行分类。DeltaKV 不支持 prefix caching，并会在修改 compressed 或 quantized row metadata 前拒绝 attached-prefix prefill。
+
+启用 full-layer KIVI 时，DeltaKV 的 decode 常驻 raw 尾部池与 `max_model_len` 大小的 prefill staging buffer 是两块独立容量。多个 short prefill 通过互不重叠的 request range 共享 staging buffer；常驻 raw 尾部的 slot 数不是 prefill batch 上限。
 
 ## Prefix Cache 模式
 

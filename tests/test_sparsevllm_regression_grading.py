@@ -155,22 +155,35 @@ class SparseVLLMRegressionGradingTest(unittest.TestCase):
             policy = get_default_prefill_schedule_policy(method["sparse_method"])
             with self.subTest(method=method_id, policy=policy):
                 if policy == PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH:
-                    self.assertNotIn("engine_prefill_chunk_size", config)
                     self.assertEqual(
                         config["long_prefill_offload_threshold"],
-                        96 * 1024,
+                        64 * 1024,
                     )
+                    if "engine_prefill_chunk_size" in config:
+                        self.assertLessEqual(
+                            config["engine_prefill_chunk_size"],
+                            config["long_prefill_offload_threshold"],
+                        )
                 else:
                     self.assertGreater(config["engine_prefill_chunk_size"], 0)
 
-    def test_manifest_rejects_chunk_size_for_long_prefill_policy(self):
+    def test_manifest_accepts_chunk_size_below_long_prefill_boundary(self):
         manifest = copy.deepcopy(load_manifest())
         pyramid_config = manifest["methods"]["pyramidkv"]["config"]
         pyramid_config["engine_prefill_chunk_size"] = 4096
 
+        validate_manifest(manifest)
+
+    def test_manifest_rejects_chunk_size_above_long_prefill_boundary(self):
+        manifest = copy.deepcopy(load_manifest())
+        pyramid_config = manifest["methods"]["pyramidkv"]["config"]
+        pyramid_config["engine_prefill_chunk_size"] = (
+            pyramid_config["long_prefill_offload_threshold"] + 1
+        )
+
         with self.assertRaisesRegex(
             ManifestError,
-            "long_prefill_offload_threshold.*engine_prefill_chunk_size",
+            "engine_prefill_chunk_size must be <= long_prefill_offload_threshold",
         ):
             validate_manifest(manifest)
 

@@ -31,9 +31,7 @@ from benchmark.sparsevllm_regression.manifest import (
     select_entries,
 )
 from sparsevllm.method_registry import (
-    PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
     PREFIX_CACHE_SUPPORTED_METHODS,
-    get_default_prefill_schedule_policy,
     is_decode_cuda_graph_supported,
     is_tp_decode_cuda_graph_supported,
     normalize_sparse_method,
@@ -581,14 +579,6 @@ def _perf_command(
     # not forward it into SparseVLLM perf runs, where unknown keys fail fast.
     method_cfg.pop("hf_sparse_method", None)
     hyper_params.update(method_cfg)
-    if (
-        method_id != "vanilla"
-        and get_default_prefill_schedule_policy(method["sparse_method"])
-        == PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH
-    ):
-        hyper_params["engine_prefill_chunk_size"] = int(
-            hyper_params["long_prefill_offload_threshold"]
-        )
     _apply_prefix_cache_config(
         hyper_params,
         method,

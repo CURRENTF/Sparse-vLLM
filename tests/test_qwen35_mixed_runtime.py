@@ -108,6 +108,20 @@ class _ResidentAdmissionCache:
     def remaining_prefill_tokens(self, seq):
         return int(seq.num_prompt_tokens - max(seq.num_prefilled_tokens, seq.prefix_cache_hit_len))
 
+    def prefill_execution_mode(self, seq):
+        del seq
+        return "chunked"
+
+    def prefill_batch_compatibility_key(self, seq):
+        del seq
+        return None
+
+    def reset_prefill_execution_state(self, seq_id):
+        del seq_id
+
+    def complete_prefill_execution(self, seq):
+        del seq
+
     def reserved_prefill_slots(self, waiting, chunk_prefill_size):
         return 0
 
