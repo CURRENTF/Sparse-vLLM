@@ -26,6 +26,7 @@ from sparsevllm.engine.sequence import Sequence
 from sparsevllm.method_registry import (
     PREFILL_POLICY_ALL_CHUNKED,
     PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
+    get_default_prefill_schedule_policy,
     is_deltakv_method,
 )
 from sparsevllm.sampling_params import SamplingParams
@@ -1816,6 +1817,10 @@ def _hf_infer_config(args: argparse.Namespace, method: str, prompt_len: int) -> 
 
 
 def _sparse_infer_config(args: argparse.Namespace, method: str) -> dict[str, Any]:
+    long_prefill_policy = (
+        get_default_prefill_schedule_policy(method)
+        == PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH
+    )
     config = {
         "max_model_len": args.max_model_len,
         "max_num_seqs_in_batch": int(args.max_num_seqs_in_batch),
@@ -1823,7 +1828,12 @@ def _sparse_infer_config(args: argparse.Namespace, method: str) -> dict[str, Any
         "max_num_batched_tokens": int(
             args.max_num_batched_tokens
             if args.max_num_batched_tokens is not None
-            else max(args.long_tokens + 8, args.engine_prefill_chunk_size * 2 + 8)
+            else max(
+                args.long_tokens + 8,
+                args.long_prefill_offload_threshold
+                if long_prefill_policy
+                else args.engine_prefill_chunk_size * 2 + 8,
+            )
         ),
         "gpu_memory_utilization": args.gpu_memory_utilization,
         "tensor_parallel_size": int(args.tensor_parallel_size),
@@ -1832,9 +1842,14 @@ def _sparse_infer_config(args: argparse.Namespace, method: str) -> dict[str, Any
         "decode_cuda_graph_capture_sizes": args.decode_cuda_graph_capture_sizes,
         "throughput_log_interval_s": 0.0,
         "sparse_method": method,
-        "engine_prefill_chunk_size": int(args.engine_prefill_chunk_size),
         "mlp_chunk_size": int(args.mlp_chunk_size),
     }
+    if long_prefill_policy:
+        config["long_prefill_offload_threshold"] = int(
+            args.long_prefill_offload_threshold
+        )
+    else:
+        config["engine_prefill_chunk_size"] = int(args.engine_prefill_chunk_size)
     if method in {"streamingllm", "attention-sink", "attention_sink"}:
         config.update(
             {
@@ -2318,6 +2333,7 @@ def _sparse_resolved_config_summary(
         "num_sink_tokens": config.num_sink_tokens,
         "num_recent_tokens": config.num_recent_tokens,
         "chunk_prefill_size": config.chunk_prefill_size,
+        "long_prefill_offload_threshold": config.long_prefill_offload_threshold,
         "cluster_ratio": config.cluster_ratio,
         "kv_compressed_size": config.kv_compressed_size,
         "kv_quant_bits": config.kv_quant_bits,
@@ -3371,6 +3387,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--enable_full_layer_kivi_dense_decode", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--enable_sparse_ref_fp8", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--engine_prefill_chunk_size", type=int, default=4096)
+    parser.add_argument(
+        "--long_prefill_offload_threshold",
+        type=int,
+        default=96 * 1024,
+    )
     parser.add_argument("--hf_prefill_chunk_size", type=int, default=None)
     parser.add_argument("--gpu_memory_utilization", type=float, default=0.9)
     parser.add_argument("--deltakv_full_pool_reserve_ratio", type=float, default=0.2)

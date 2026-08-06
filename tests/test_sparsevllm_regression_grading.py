@@ -44,7 +44,11 @@ from benchmark.sparsevllm_regression.run_suite import (
 from benchmark.sparsevllm_regression.run_suite import _quality_command
 from sparsevllm.engine.cache_manager.base import CacheManager
 from sparsevllm.distributed import ParallelContext, ParallelGroup
-from sparsevllm.method_registry import H2O_SUPPORTED_MODEL_TYPES
+from sparsevllm.method_registry import (
+    H2O_SUPPORTED_MODEL_TYPES,
+    PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
+    get_default_prefill_schedule_policy,
+)
 
 
 def _single_process_parallel_context() -> ParallelContext:
@@ -137,6 +141,37 @@ class SparseVLLMRegressionGradingTest(unittest.TestCase):
         manifest["quality"].pop("minimum_vanilla_score")
 
         with self.assertRaisesRegex(ManifestError, "minimum_vanilla_score"):
+            validate_manifest(manifest)
+
+    def test_manifest_uses_policy_specific_prefill_controls(self):
+        manifest = load_manifest()
+        self.assertEqual(
+            manifest["methods"]["vanilla"]["config"]["engine_prefill_chunk_size"],
+            96 * 1024,
+        )
+
+        for method_id, method in manifest["methods"].items():
+            config = method["config"]
+            policy = get_default_prefill_schedule_policy(method["sparse_method"])
+            with self.subTest(method=method_id, policy=policy):
+                if policy == PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH:
+                    self.assertNotIn("engine_prefill_chunk_size", config)
+                    self.assertEqual(
+                        config["long_prefill_offload_threshold"],
+                        96 * 1024,
+                    )
+                else:
+                    self.assertGreater(config["engine_prefill_chunk_size"], 0)
+
+    def test_manifest_rejects_chunk_size_for_long_prefill_policy(self):
+        manifest = copy.deepcopy(load_manifest())
+        pyramid_config = manifest["methods"]["pyramidkv"]["config"]
+        pyramid_config["engine_prefill_chunk_size"] = 4096
+
+        with self.assertRaisesRegex(
+            ManifestError,
+            "long_prefill_offload_threshold.*engine_prefill_chunk_size",
+        ):
             validate_manifest(manifest)
 
     def test_h2o_manifest_declares_supported_models_tp_runtime_matrix(self):

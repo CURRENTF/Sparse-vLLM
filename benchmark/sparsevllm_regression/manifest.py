@@ -6,6 +6,11 @@ import os
 from pathlib import Path
 from typing import Any
 
+from sparsevllm.method_registry import (
+    PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
+    get_default_prefill_schedule_policy,
+)
+
 
 REQUIRED_METHODS = {
     "vanilla",
@@ -47,6 +52,40 @@ REQUIRED_ARTIFACTS = [
 
 class ManifestError(ValueError):
     pass
+
+
+def _validate_prefill_controls(
+    *,
+    method_id: str,
+    sparse_method: str,
+    config: dict[str, Any],
+    config_label: str,
+) -> None:
+    try:
+        policy = get_default_prefill_schedule_policy(sparse_method)
+    except ValueError as exc:
+        raise ManifestError(
+            f"method {method_id!r} has unsupported sparse_method={sparse_method!r}."
+        ) from exc
+
+    if policy == PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH:
+        if "engine_prefill_chunk_size" in config:
+            raise ManifestError(
+                f"{config_label} uses {policy}; declare long_prefill_offload_threshold "
+                "and remove engine_prefill_chunk_size."
+            )
+        key = "long_prefill_offload_threshold"
+    else:
+        if "long_prefill_offload_threshold" in config:
+            raise ManifestError(
+                f"{config_label} uses {policy}; declare engine_prefill_chunk_size "
+                "and remove long_prefill_offload_threshold."
+            )
+        key = "engine_prefill_chunk_size"
+
+    value = config.get(key)
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise ManifestError(f"{config_label} {key} must be a positive integer.")
 
 
 def load_manifest(path: str | Path | None = None) -> dict[str, Any]:
@@ -100,6 +139,12 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
             raise ManifestError(f"method {method_id!r} is missing sparse_method.")
         if "config" not in method or not isinstance(method["config"], dict):
             raise ManifestError(f"method {method_id!r} must define config object.")
+        _validate_prefill_controls(
+            method_id=method_id,
+            sparse_method=method["sparse_method"],
+            config=method["config"],
+            config_label=f"method {method_id!r} config",
+        )
         model_configs = method.get("model_configs")
         if model_configs is not None:
             if not isinstance(model_configs, dict):
@@ -114,6 +159,13 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
                     raise ManifestError(
                         f"method {method_id!r} model_configs[{model_id!r}] must be a JSON object."
                     )
+                merged_config = {**method["config"], **override}
+                _validate_prefill_controls(
+                    method_id=method_id,
+                    sparse_method=method["sparse_method"],
+                    config=merged_config,
+                    config_label=f"method {method_id!r} model_configs[{model_id!r}]",
+                )
         supported_families = method.get("supported_model_families")
         if supported_families is not None:
             if (

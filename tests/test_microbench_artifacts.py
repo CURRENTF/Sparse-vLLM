@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 from benchmark.microbench import (
+    _apply_prefill_policy_defaults,
     _artifact_records,
     _benchmark_sparse_method,
     _record_child_exit_failure,
@@ -29,6 +30,83 @@ def test_benchmark_sparse_method_preserves_runtime_method(method, expected):
 def test_benchmark_sparse_method_rejects_unknown_method():
     with pytest.raises(ValueError, match="Unsupported benchmark sparse method"):
         _benchmark_sparse_method("typo")
+
+
+@pytest.mark.parametrize("method", ["vanilla", "snapkv", "quest"])
+def test_microbench_defaults_all_chunked_methods_to_96k(method):
+    hyper_params = {}
+
+    _apply_prefill_policy_defaults(hyper_params, method)
+
+    assert hyper_params == {"engine_prefill_chunk_size": 96 * 1024}
+
+
+@pytest.mark.parametrize(
+    "method",
+    ["pyramidkv", "deltakv", "deltakv-less-memory-cudagraph"],
+)
+def test_microbench_defaults_long_prefill_methods_to_96k_boundary(method):
+    hyper_params = {}
+
+    _apply_prefill_policy_defaults(hyper_params, method)
+
+    assert hyper_params == {"long_prefill_offload_threshold": 96 * 1024}
+
+
+def test_microbench_preserves_explicit_policy_specific_prefill_controls():
+    all_chunked = {"engine_prefill_chunk_size": 8192}
+    long_prefill = {"long_prefill_offload_threshold": 65536}
+
+    _apply_prefill_policy_defaults(all_chunked, "vanilla")
+    _apply_prefill_policy_defaults(long_prefill, "pyramidkv")
+
+    assert all_chunked == {"engine_prefill_chunk_size": 8192}
+    assert long_prefill == {"long_prefill_offload_threshold": 65536}
+
+
+@pytest.mark.parametrize(
+    ("method", "hyper_params", "expected_key"),
+    [
+        (
+            "vanilla",
+            {"long_prefill_offload_threshold": 65536},
+            "engine_prefill_chunk_size",
+        ),
+        (
+            "pyramidkv",
+            {"engine_prefill_chunk_size": 8192},
+            "long_prefill_offload_threshold",
+        ),
+    ],
+)
+def test_microbench_rejects_only_incompatible_prefill_control(
+    method,
+    hyper_params,
+    expected_key,
+):
+    with pytest.raises(ValueError, match=expected_key):
+        _apply_prefill_policy_defaults(hyper_params, method)
+
+
+@pytest.mark.parametrize(
+    ("method", "expected"),
+    [
+        ("vanilla", {"engine_prefill_chunk_size": 8192}),
+        ("pyramidkv", {"long_prefill_offload_threshold": 65536}),
+    ],
+)
+def test_microbench_selects_policy_control_when_both_are_declared(
+    method,
+    expected,
+):
+    hyper_params = {
+        "engine_prefill_chunk_size": 8192,
+        "long_prefill_offload_threshold": 65536,
+    }
+
+    _apply_prefill_policy_defaults(hyper_params, method)
+
+    assert hyper_params == expected
 
 
 def test_nonzero_child_exit_overrides_partial_success_row():
@@ -122,6 +200,7 @@ def test_resolved_engine_config_records_backend_and_jsonable_values():
             vllm_sparse_method="deltakv",
             prefill_schedule_policy="long_bs1full_short_batch",
             chunk_prefill_size=4096,
+            long_prefill_offload_threshold=4096,
             decode_cuda_graph=True,
             decode_cuda_graph_capture_sampling=False,
             deltakv_sparse_decode_backend="fa2",
@@ -143,6 +222,7 @@ def test_resolved_engine_config_records_backend_and_jsonable_values():
     resolved = _resolved_engine_config(llm)
 
     assert resolved["deltakv_sparse_decode_backend"] == "fa2"
+    assert resolved["long_prefill_offload_threshold"] == 4096
     assert resolved["full_attn_layers"] == [0, 1, 2, 8]
     assert resolved["obs_layer_ids"] == [2, 8]
     assert resolved["h2o_decode_budget"] == 4096

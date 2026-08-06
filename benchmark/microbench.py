@@ -21,10 +21,16 @@ if src_path not in sys.path:
 from deltakv.configs.runtime_params import normalize_runtime_params
 from sparsevllm.method_registry import (
     CANONICAL_SPARSE_METHODS,
+    PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
+    get_default_prefill_schedule_policy,
     is_decode_cuda_graph_supported,
     is_tp_decode_cuda_graph_supported,
     normalize_sparse_method,
 )
+
+
+DEFAULT_ALL_CHUNKED_PREFILL_SIZE = 96 * 1024
+DEFAULT_LONG_PREFILL_OFFLOAD_THRESHOLD = 96 * 1024
 
 
 def get_peak_memory():
@@ -61,7 +67,6 @@ def _build_engine_hyper_params(args) -> dict[str, Any]:
         "enforce_eager": False,
         "decode_cuda_graph": True,
         "gpu_memory_utilization": 0.8,
-        "engine_prefill_chunk_size": 4096,
         "tensor_parallel_size": 1,
     }
 
@@ -178,6 +183,44 @@ def _benchmark_sparse_method(method: str) -> str:
     }:
         return runtime_method
     return "vanilla" if normalized == "" else normalized
+
+
+def _apply_prefill_policy_defaults(
+    hyper_params: dict[str, Any],
+    method: str,
+) -> None:
+    runtime_method = _benchmark_sparse_method(method)
+    policy = get_default_prefill_schedule_policy(runtime_method)
+    if policy == PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH:
+        if (
+            "engine_prefill_chunk_size" in hyper_params
+            and "long_prefill_offload_threshold" not in hyper_params
+        ):
+            raise ValueError(
+                f"sparse_method={runtime_method!r} uses {policy}; declare "
+                "long_prefill_offload_threshold instead of "
+                "engine_prefill_chunk_size."
+            )
+        hyper_params.setdefault(
+            "long_prefill_offload_threshold",
+            DEFAULT_LONG_PREFILL_OFFLOAD_THRESHOLD,
+        )
+        hyper_params.pop("engine_prefill_chunk_size", None)
+    else:
+        if (
+            "long_prefill_offload_threshold" in hyper_params
+            and "engine_prefill_chunk_size" not in hyper_params
+        ):
+            raise ValueError(
+                f"sparse_method={runtime_method!r} uses {policy}; declare "
+                "engine_prefill_chunk_size instead of "
+                "long_prefill_offload_threshold."
+            )
+        hyper_params.setdefault(
+            "engine_prefill_chunk_size",
+            DEFAULT_ALL_CHUNKED_PREFILL_SIZE,
+        )
+        hyper_params.pop("long_prefill_offload_threshold", None)
 
 
 def _record_child_exit_failure(
@@ -356,6 +399,7 @@ def _resolved_engine_config(llm) -> dict[str, Any]:
         "vllm_sparse_method",
         "prefill_schedule_policy",
         "chunk_prefill_size",
+        "long_prefill_offload_threshold",
         "decode_cuda_graph",
         "decode_cuda_graph_capture_sampling",
         "deltakv_sparse_decode_backend",
@@ -471,9 +515,10 @@ def benchmark_task(method, length, bs, args, results_dict):
                     f"got {args.max_model_len_override} < {length + args.output_len}."
                 )
             m_len = int(args.max_model_len_override)
-        # Note: max_model_len is derived from (length, bs, output_len, engine_prefill_chunk_size).
+        # max_model_len is derived from the workload geometry.
         # They can be passed in --hyper_params, but will be overwritten here to keep the benchmark consistent.
         hyper_params = dict(base_hyper_params)
+        _apply_prefill_policy_defaults(hyper_params, method)
         hyper_params.pop("max_model_len", None)
         hyper_params.setdefault("max_num_seqs_in_batch", int(bs))
         hyper_params.setdefault("max_decoding_seqs", int(bs))
@@ -831,7 +876,8 @@ def main():
         default="{}",
         help=(
             "LLMEngine/Config hyper-params as JSON (string or @file.json). "
-            'Example: \'{"gpu_memory_utilization":0.9,"engine_prefill_chunk_size":4096,"tensor_parallel_size":1,"decode_keep_tokens":2048}\''
+            "Use engine_prefill_chunk_size for all_chunked methods and "
+            "long_prefill_offload_threshold for long_bs1full_short_batch methods."
         ),
     )
     parser.add_argument(

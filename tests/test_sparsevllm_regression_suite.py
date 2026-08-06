@@ -7,6 +7,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
+from benchmark.microbench import _apply_prefill_policy_defaults
 from benchmark.sparsevllm_regression import run_suite
 from benchmark.sparsevllm_regression.manifest import REQUIRED_ARTIFACTS
 
@@ -118,6 +119,72 @@ class SparseVLLMRegressionSuiteTest(unittest.TestCase):
         self.assertEqual(hyper_params["tensor_parallel_size"], 2)
         self.assertTrue(hyper_params["decode_cuda_graph"])
         self.assertFalse(hyper_params["decode_cuda_graph_capture_sampling"])
+
+    def test_perf_command_pairs_policy_specific_prefill_controls(self):
+        cmd = run_suite._perf_command(
+            model_id="qwen25_7b",
+            model={"model_path": "/models/qwen", "tokenizer_path": "/models/qwen"},
+            method_id="pyramidkv",
+            method={
+                "sparse_method": "pyramidkv",
+                "config": {
+                    "sparse_method": "pyramidkv",
+                    "long_prefill_offload_threshold": 96 * 1024,
+                },
+            },
+            performance={
+                "lengths": [1024],
+                "batch_sizes": [2],
+                "output_len": 8,
+                "decode_cuda_graph": True,
+                "enforce_eager": False,
+            },
+            output_jsonl=Path("/tmp/perf.jsonl"),
+        )
+
+        self.assertEqual(cmd[cmd.index("--methods") + 1], "vanilla,pyramidkv")
+        hyper_params = json.loads(cmd[cmd.index("--hyper_params") + 1])
+        self.assertEqual(hyper_params["engine_prefill_chunk_size"], 96 * 1024)
+        self.assertEqual(
+            hyper_params["long_prefill_offload_threshold"],
+            96 * 1024,
+        )
+
+        vanilla_params = dict(hyper_params)
+        _apply_prefill_policy_defaults(vanilla_params, "vanilla")
+        self.assertIn("engine_prefill_chunk_size", vanilla_params)
+        self.assertNotIn("long_prefill_offload_threshold", vanilla_params)
+
+        pyramid_params = dict(hyper_params)
+        _apply_prefill_policy_defaults(pyramid_params, "pyramidkv")
+        self.assertIn("long_prefill_offload_threshold", pyramid_params)
+        self.assertNotIn("engine_prefill_chunk_size", pyramid_params)
+
+    def test_logits_command_passes_long_prefill_boundary(self):
+        cmd = run_suite._logits_command(
+            model_id="qwen25_7b",
+            model={"model_path": "/models/qwen", "tokenizer_path": "/models/qwen"},
+            method={
+                "sparse_method": "pyramidkv",
+                "config": {
+                    "sparse_method": "pyramidkv",
+                    "long_prefill_offload_threshold": 96 * 1024,
+                },
+            },
+            logits={
+                "cases": "short,long",
+                "longbench_task": "hotpotqa",
+                "longbench_sample_idx": 0,
+                "teacher_forced_decode_steps": 1,
+            },
+            output_dir=Path("/tmp/logits"),
+        )
+
+        self.assertEqual(
+            cmd[cmd.index("--long_prefill_offload_threshold") + 1],
+            str(96 * 1024),
+        )
+        self.assertNotIn("--engine_prefill_chunk_size", cmd)
 
     def test_tp_decode_graph_command_accepts_quest_v11(self):
         cmd = run_suite._quality_command(
