@@ -107,6 +107,11 @@ class DockerWritableLayerGuard:
         with self._lock:
             self._states.pop(container_id, None)
 
+    def _retire(self, state: GuardState) -> None:
+        with self._lock:
+            if self._states.get(state.container_id) is state:
+                self._states.pop(state.container_id)
+
     def _snapshot(self) -> dict[str, GuardState]:
         with self._lock:
             return dict(self._states)
@@ -134,7 +139,9 @@ class DockerWritableLayerGuard:
         writable_bytes: int | None = None,
         detail: str | None = None,
     ) -> None:
-        if not state.fail(error, writable_bytes=writable_bytes):
+        newly_failed = state.fail(error, writable_bytes=writable_bytes)
+        self._retire(state)
+        if not newly_failed:
             return
         event = {
             "time": _now(),
@@ -197,20 +204,47 @@ class DockerWritableLayerGuard:
                     )
                 records.append(record)
             if result.returncode != 0 or len(records) != len(states):
-                detail = result.stderr.strip() or (
-                    f"docker inspect returned {len(records)} of {len(states)} containers"
+                returned_ids = {
+                    str(record.get("Id") or "") for record in records
+                }
+                missing_ids = set(states) - returned_ids
+                current_ids = set(self._snapshot())
+                stale_ids = missing_ids - current_ids
+                error_prefix = "error: no such object: "
+                error_lines = [
+                    line.strip()
+                    for line in result.stderr.splitlines()
+                    if line.strip()
+                ]
+                missing_object_ids = {
+                    line[len(error_prefix) :].strip()
+                    for line in error_lines
+                    if line.lower().startswith(error_prefix)
+                }
+                cleanup_race = (
+                    result.returncode != 0
+                    and bool(missing_ids)
+                    and stale_ids == missing_ids
+                    and len(missing_object_ids) == len(error_lines)
+                    and missing_object_ids == missing_ids
                 )
-                raise RuntimeError(detail)
+                if not cleanup_race:
+                    detail = result.stderr.strip() or (
+                        f"docker inspect returned {len(records)} of {len(states)} "
+                        "containers"
+                    )
+                    raise RuntimeError(detail)
         except (OSError, subprocess.SubprocessError, json.JSONDecodeError, RuntimeError) as exc:
             self._monitor_failures += 1
             if self._monitor_failures >= self.max_monitor_failures:
-                self._fail_closed(states, str(exc))
+                self._fail_closed(self._snapshot(), str(exc))
             return
 
         self._monitor_failures = 0
+        current_states = self._snapshot()
         for record in records:
             container_id = str(record.get("Id") or "")
-            state = states.get(container_id)
+            state = current_states.get(container_id)
             if state is None:
                 continue
             writable_bytes = record.get("SizeRw")
