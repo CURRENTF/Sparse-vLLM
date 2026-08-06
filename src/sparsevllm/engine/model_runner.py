@@ -999,6 +999,8 @@ class ModelRunner:
         # long during decode.
         if not seqs:
             return False
+        if not self.config.vllm_sparse_method:
+            return False
         if is_prefill and self.cache_manager.is_full_prefill_step(seqs):
             return True
         threshold = self._long_text_threshold(is_prefill)

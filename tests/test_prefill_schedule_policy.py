@@ -1576,8 +1576,22 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
             64 + 128 + 4096,
         )
 
-    def test_all_chunked_keeps_long_and_short_separate(self):
-        scheduler = make_scheduler(PREFILL_POLICY_ALL_CHUNKED, method="")
+    def test_vanilla_model_runner_does_not_partition_long_and_short(self):
+        runner = object.__new__(ModelRunner)
+        runner.config = SimpleNamespace(
+            vllm_sparse_method="",
+        )
+        seqs = [seq_with_len(8), seq_with_len(20_000)]
+
+        self.assertFalse(
+            ModelRunner._is_long_text_batch(runner, seqs, is_prefill=False)
+        )
+
+    def test_all_chunked_keeps_sparse_long_and_short_separate(self):
+        scheduler = make_scheduler(
+            PREFILL_POLICY_ALL_CHUNKED,
+            method="quest",
+        )
         long_seq = seq_with_len(20)
         short_seq = seq_with_len(4)
         scheduler.add(long_seq)
@@ -1589,6 +1603,22 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
         self.assertEqual(scheduled, [long_seq])
         self.assertEqual(long_seq.current_chunk_size, 5)
         self.assertEqual(short_seq.current_chunk_size, None)
+
+    def test_vanilla_decode_batches_across_sparse_long_text_boundary(self):
+        scheduler = make_scheduler(
+            PREFILL_POLICY_ALL_CHUNKED,
+            method="",
+        )
+        short_seq = seq_with_len(4)
+        long_seq = seq_with_len(20)
+        short_seq.num_prefilled_tokens = short_seq.num_prompt_tokens
+        long_seq.num_prefilled_tokens = long_seq.num_prompt_tokens
+        scheduler.decoding.extend((short_seq, long_seq))
+
+        scheduled, is_prefill, _ = scheduler.schedule()
+
+        self.assertFalse(is_prefill)
+        self.assertEqual(scheduled, [short_seq, long_seq])
 
     def test_all_chunked_caps_each_prefill_by_chunk_size(self):
         scheduler = make_scheduler(PREFILL_POLICY_ALL_CHUNKED, method="", chunk=5, max_tokens=20)

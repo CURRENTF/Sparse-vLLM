@@ -78,6 +78,8 @@ class Scheduler:
         return base + (self.chunk_prefill_size if is_prefill else 0)
 
     def _is_long_text(self, seq: Sequence, is_prefill: bool) -> bool:
+        if not self.config.vllm_sparse_method:
+            return False
         if is_prefill and self.memory_oracle.should_schedule_full_prefill(seq):
             return True
         threshold = self._long_text_threshold(is_prefill)
@@ -605,8 +607,10 @@ class Scheduler:
         # Decode 优先短序列：如果当前 decoding 队列里存在 short，则本轮只调度 short；
         # 仅当全部都是 long 时，才调度 long。（避免 short 被 long 淹没）
         if self.decoding:
-            decode_threshold = self._long_text_threshold(is_prefill=False)
-            has_short_decode = any(int(seq.num_tokens) <= int(decode_threshold) for seq in self.decoding)
+            has_short_decode = any(
+                not self._is_long_text(seq, is_prefill=False)
+                for seq in self.decoding
+            )
             target_is_long_decode = not has_short_decode
         else:
             target_is_long_decode = False
