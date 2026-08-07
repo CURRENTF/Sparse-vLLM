@@ -12,7 +12,7 @@ from sparsevllm.utils.code_revision import code_revision_info
 from sparsevllm.utils.log import logger
 import sys
 
-from deltakv.configs.runtime_params import normalize_runtime_params
+from sparsevllm.configs.runtime_params import normalize_runtime_params
 
 from sparsevllm.config import Config
 from sparsevllm.sampling_params import SamplingParams
