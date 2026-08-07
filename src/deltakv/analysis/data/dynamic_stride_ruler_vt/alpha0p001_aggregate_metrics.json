@@ -1,0 +1,50 @@
+{
+  "task": "ruler_vt",
+  "metric": "string_match_all",
+  "score_by_context_length": {
+    "4096": {
+      "score": 100.0,
+      "exact_match": 100.0,
+      "num_samples": 20,
+      "num_success": 20,
+      "mean_input_tokens": 3883.3
+    },
+    "8192": {
+      "score": 98.0,
+      "exact_match": 95.0,
+      "num_samples": 20,
+      "num_success": 20,
+      "mean_input_tokens": 8179.8
+    },
+    "16384": {
+      "score": 100.0,
+      "exact_match": 100.0,
+      "num_samples": 20,
+      "num_success": 20,
+      "mean_input_tokens": 16193.7
+    },
+    "32768": {
+      "score": 97.0,
+      "exact_match": 85.0,
+      "num_samples": 20,
+      "num_success": 20,
+      "mean_input_tokens": 32754.3
+    },
+    "65536": {
+      "score": 87.0,
+      "exact_match": 65.0,
+      "num_samples": 20,
+      "num_success": 20,
+      "mean_input_tokens": 65516.6
+    },
+    "98304": {
+      "score": 94.0,
+      "exact_match": 75.0,
+      "num_samples": 20,
+      "num_success": 20,
+      "mean_input_tokens": 98274.2
+    }
+  },
+  "overall_score": 96.0,
+  "elapsed_seconds": 225.197
+}

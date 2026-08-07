@@ -1,6 +1,7 @@
 import unittest
 
-from sparsevllm.configs.runtime_params import normalize_runtime_params
+from deltakv.configs.model_config_cls import KVQwen2Config
+from deltakv.configs.runtime_params import normalize_runtime_params
 
 
 class RuntimeParamNormalizationTest(unittest.TestCase):
@@ -148,6 +149,48 @@ class RuntimeParamNormalizationTest(unittest.TestCase):
             with self.subTest(key=key):
                 with self.assertRaisesRegex(ValueError, "Unknown Sparse-vLLM config keys"):
                     LLM("/tmp/unused-model", **{key: True})
+
+    def test_hf_config_accepts_canonical_aliases(self):
+        cfg = KVQwen2Config()
+        cfg.set_infer_args(
+            decode_keep_tokens=0.25,
+            prefill_keep_tokens=4096,
+            recent_keep_tokens=128,
+            sink_keep_tokens=8,
+            full_attention_layers="0,1,2",
+            deltakv_neighbor_count=3,
+            hf_prefill_chunk_size=32768,
+            deltakv_latent_quant_bits=2,
+            full_layer_kv_quant_bits=4,
+            full_layer_cluster_ratio=0.1,
+            full_layer_stride_alpha=0.0,
+            visual_token_prune_only=True,
+            visual_token_keep_ratio=0.1,
+        )
+
+        self.assertEqual(cfg.num_top_tokens, 0.25)
+        self.assertEqual(cfg.num_top_tokens_in_prefill, 4096)
+        self.assertEqual(cfg.num_recent_tokens, 128)
+        self.assertEqual(cfg.tail_token_size, 128)
+        self.assertEqual(cfg.num_sink_tokens, 8)
+        self.assertEqual(cfg.full_attn_layers, [0, 1, 2])
+        self.assertEqual(cfg.deltakv_neighbor_count, 3)
+        self.assertEqual(cfg.chunk_prefill_size, 32768)
+        self.assertEqual(cfg.kv_quant_bits, 2)
+        self.assertEqual(cfg.full_layer_kv_quant_bits, 4)
+        self.assertEqual(cfg.full_layer_cluster_ratio, 0.1)
+        self.assertEqual(cfg.full_layer_stride_alpha, 0.0)
+        self.assertTrue(cfg.visual_token_prune_only)
+        self.assertEqual(cfg.visual_token_keep_ratio, 0.1)
+
+    def test_hf_config_rejects_legacy_visual_prune_aliases(self):
+        cfg = KVQwen2Config()
+        with self.assertRaisesRegex(ValueError, "Legacy runtime parameter"):
+            cfg.set_infer_args(
+                deltakv_visual_compress_only=True,
+                deltakv_visual_keep_ratio=0.25,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

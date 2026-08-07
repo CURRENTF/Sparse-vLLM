@@ -1,0 +1,1046 @@
+import os
+import sys
+import json
+import torch
+from typing import Union, List
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
+from deltakv.configs.model_config_cls import KVQwen2Config, KVQwen3Config, KVLlamaConfig, parse_full_attn_layers
+from deltakv.configs.runtime_params import normalize_runtime_params
+from deltakv.baseline_adapters import load_omnikv_model, load_kivi_model
+from deltakv.modeling.cache_factory import (
+    DELTA_COMPRESSED_LATENT_W_FULL,
+    DELTA_COMPRESSED_LATENT_WO_FULL,
+    DELTA_COMPRESSED_QUANT_KIVI_FULL_FP8_REF,
+    DELTA_ORIGIN_W_FULL,
+    DELTA_ORIGIN_WO_FULL,
+)
+from deltakv.quantization import build_model_load_kwargs, restore_modules_to_dtype
+from deltakv.utils.log import logger
+from safetensors.torch import load_file
+
+
+def load_compressor(compressor_path, device='cuda:0'):
+    state_dict = load_file(os.path.join(compressor_path, 'model.safetensors'), device)
+    return state_dict
+
+
+def _load_deltakv_checkpoint_config(config_cls, compressor_path):
+    config_path = os.path.join(compressor_path, "config.json")
+    with open(config_path, "r", encoding="utf-8") as f:
+        config_dict = json.load(f)
+    removed = [key for key in ("compressor_token_group_size", "seq_chunk_size", "ref_mode") if key in config_dict]
+    if removed:
+        logger.info(
+            "Ignoring removed DeltaKV checkpoint-only config fields while loading compressor: {}",
+            ", ".join(removed),
+        )
+        for key in removed:
+            config_dict.pop(key, None)
+    return config_cls.from_dict(config_dict)
+
+
+def _as_bool(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
+
+
+def top_k_top_p_filtering(logits, top_k=0, top_p=1.0, filter_value=-float("Inf"), min_tokens_to_keep=1):
+    """ Filter a distribution of logits using top-k and/or nucleus (top-p) filtering
+        Args:
+            logits: logits distribution shape (batch, vocabulary size)
+            if top_k > 0: keep only top k tokens with the highest probability (top-k filtering).
+            if top_p < 1.0: keep the top tokens with cumulative probability >= top_p (nucleus filtering).
+                Nucleus filtering is described in Holtzman et al. (http://arxiv.org/abs/1904.09751)
+            Make sure we keep at least min_tokens_to_keep per batch example in the end
+        From: https://gist.github.com/thomwolf/1a5a29f69620886c271b93575f97Self
+    """
+    if top_k > 0:
+        top_k = min(max(top_k, min_tokens_to_keep), logits.size(-1))  # Safety check
+        # Remove all tokens with a probability less than the last token of the top-k
+        indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
+        logits[indices_to_remove] = filter_value
+
+    if top_p < 1.0:
+        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+        cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+
+        # Remove tokens with cumulative probability above the threshold (token with 0 are kept)
+        sorted_indices_to_remove = cumulative_probs > top_p
+        if min_tokens_to_keep > 1:
+            # Keep at least min_tokens_to_keep (set to min_tokens_to_keep - 1 because we add the first one below)
+            sorted_indices_to_remove[..., :min_tokens_to_keep] = 0
+        # Shift the indices to the right to keep also the first token above the threshold
+        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+        sorted_indices_to_remove[..., 0] = 0
+
+        # scatter sorted tensors to original indexing
+        indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+        logits[indices_to_remove] = filter_value
+    return logits
+
+
+@torch.inference_mode()
+def manual_generate(model, tokenizer, prompt: Union[str, List[str]], past_key_values=None, return_kv_cache=False, **kwargs):
+    """
+    手动实现的生成函数，支持KV Cache复用及采样。
+    """
+    if isinstance(prompt, str):
+        prompts = [prompt]
+        is_single = True
+    else:
+        prompts = prompt
+        is_single = False
+
+    max_new_tokens = kwargs.get('max_new_tokens', 128)
+    do_sample = kwargs.get('do_sample', False)
+    temperature = kwargs.get('temperature', 1.0)
+    top_k = kwargs.get('top_k', 50)
+    top_p = kwargs.get('top_p', 1.0)
+    add_special_tokens = True
+    if tokenizer.bos_token is None or prompts[0].startswith(tokenizer.bos_token):
+        add_special_tokens = False
+    inputs = tokenizer(prompts, return_tensors='pt', padding=True, add_special_tokens=add_special_tokens).to(model.device)
+    input_ids = inputs.input_ids
+    attention_mask = inputs.attention_mask
+
+    batch_size = input_ids.shape[0]
+    unfinished_sequences = input_ids.new_ones(batch_size, device=model.device)
+
+    # 保存每一轮生成的 token
+    generated_tokens = []
+
+    cur_input_ids = input_ids
+    logits_to_keep = kwargs.get('logits_to_keep', 1)
+    # 支持分块 Prefill 以降低激活显存占用
+    chunk_prefill_size = int(os.environ.get('MANUAL_GEN_CHUNK_PREFILL_SIZE', 0))
+    if chunk_prefill_size > 0 and input_ids.shape[1] > chunk_prefill_size:
+        seq_len = input_ids.shape[1]
+        for j in range(0, seq_len - 1, chunk_prefill_size):
+            end_idx = min(j + chunk_prefill_size, seq_len - 1)
+            chunk = input_ids[:, j:end_idx]
+            outputs = model(
+                input_ids=chunk,
+                attention_mask=attention_mask[:, :end_idx],
+                past_key_values=past_key_values,
+                use_cache=True,
+                logits_to_keep=logits_to_keep,
+            )
+            past_key_values = outputs.past_key_values
+        cur_input_ids = input_ids[:, -1:]
+
+    eos_token_ids = kwargs.get('eos_token_id', [tokenizer.eos_token_id])
+    if isinstance(eos_token_ids, int):
+        eos_token_ids = [eos_token_ids]
+    eos_token_ids_tensor = torch.tensor(eos_token_ids, device=model.device)
+
+    for i in range(max_new_tokens):
+        outputs = model(
+            input_ids=cur_input_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            use_cache=True,
+            logits_to_keep=logits_to_keep,
+        )
+        logits = outputs.logits[:, -1, :]
+        past_key_values = outputs.past_key_values
+
+        if os.environ.get('BAN_EOS') and tokenizer.eos_token_id is not None:
+            logits[:, tokenizer.eos_token_id] = -float('inf')
+
+        if do_sample:
+            if temperature != 1.0:
+                logits = logits / temperature
+            logits = top_k_top_p_filtering(logits, top_k=top_k, top_p=top_p)
+            probs = torch.softmax(logits, dim=-1)
+            next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+        else:
+            next_tokens = torch.argmax(logits, dim=-1)
+
+        # 考虑 EOS (支持多个 EOS ID)
+        is_eos = torch.isin(next_tokens, eos_token_ids_tensor)
+        next_tokens = next_tokens * unfinished_sequences + tokenizer.pad_token_id * (1 - unfinished_sequences)
+        generated_tokens.append(next_tokens)
+
+        # 更新状态
+        unfinished_sequences = unfinished_sequences.mul((~is_eos).long())
+        if unfinished_sequences.max() == 0:
+            break
+
+        cur_input_ids = next_tokens.unsqueeze(-1)
+        attention_mask = torch.cat([attention_mask, unfinished_sequences[:, None]], dim=1)
+
+    skip_special_tokens = True
+    if os.environ.get('NOT_SKIP_SPECIAL_TOKENS', False):
+        skip_special_tokens = False
+
+    # 拼接并解码
+    if not generated_tokens:
+        results = ["" for _ in range(batch_size)]
+    else:
+        all_generated_ids = torch.stack(generated_tokens, dim=1)
+        results = []
+        for i in range(batch_size):
+            text = tokenizer.decode(all_generated_ids[i], skip_special_tokens=skip_special_tokens)
+            results.append(text)
+
+    if return_kv_cache:
+        return (results[0], past_key_values) if is_single else (results, past_key_values)
+    return results[0] if is_single else results
+
+
+def hf_gen(model, tokenizer, prompt: Union[str, List[str]], return_kv_cache, past_key_values=None, **kwargs):
+    assert past_key_values is None
+    if isinstance(prompt, str):
+        prompts = [prompt]
+        is_single = True
+    else:
+        prompts = prompt
+        is_single = False
+
+    inputs = tokenizer(prompts, return_tensors='pt', padding=True, add_special_tokens=False).to(model.device)
+
+    gen_config = {
+        "max_new_tokens": kwargs.get('max_new_tokens', 128),
+        "do_sample": kwargs.get('do_sample', False),
+        "temperature": kwargs.get('temperature', 1.0),
+        "top_k": kwargs.get('top_k', 50),
+        "top_p": kwargs.get('top_p', 1.0),
+        "eos_token_id": kwargs.get('eos_token_id', tokenizer.eos_token_id),
+        "pad_token_id": tokenizer.pad_token_id,
+        "use_cache": True,
+    }
+
+    # 如果不采样，移除相关参数以避免警告
+    if not gen_config["do_sample"]:
+        gen_config.pop("temperature", None)
+        gen_config.pop("top_k", None)
+        gen_config.pop("top_p", None)
+
+    output_ids = model.generate(**inputs, **gen_config)
+
+    input_len = inputs.input_ids.shape[1]
+    generated_ids = output_ids[:, input_len:]
+
+    results = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+
+    if return_kv_cache:
+        return (results[0], None) if is_single else (results, None)
+    return results[0] if is_single else results
+
+
+def get_generate_api(model_path: str, infer_config: dict, deltakv_checkpoint_path: str = None,
+                     tokenizer_path: str = None, sparse_method: str = None,  use_cache: bool = True,
+                     cuda_device: Union[int, str] = 0, backend: str = 'hf', return_kv_cache: bool = False,
+                     return_model: bool = False):
+    """
+    Returns:
+        function: 一个生成函数，输入prompt和生成参数，返回生成内容。
+    """
+
+    infer_config = dict(infer_config or {})
+    if sparse_method is None and backend == "hf" and "sparse_method" not in infer_config:
+        sparse_method = "deltakv"
+    if sparse_method is not None:
+        if "sparse_method" in infer_config and infer_config["sparse_method"] != sparse_method:
+            raise ValueError(
+                f"Conflicting sparse_method values: argument={sparse_method!r}, "
+                f"infer_config={infer_config['sparse_method']!r}."
+            )
+        infer_config["sparse_method"] = sparse_method
+    if deltakv_checkpoint_path is not None:
+        if (
+            "deltakv_checkpoint_path" in infer_config
+            and infer_config["deltakv_checkpoint_path"] != deltakv_checkpoint_path
+        ):
+            raise ValueError(
+                "Conflicting deltakv_checkpoint_path values: "
+                f"argument={deltakv_checkpoint_path!r}, "
+                f"infer_config={infer_config['deltakv_checkpoint_path']!r}."
+            )
+        infer_config["deltakv_checkpoint_path"] = deltakv_checkpoint_path
+
+    public_infer_config = dict(infer_config)
+    normalized_params = normalize_runtime_params(
+        public_infer_config,
+        backend=backend,
+    )
+    for warning in normalized_params.warnings:
+        logger.info(f"Runtime parameter normalization: {warning}")
+    model_cls = normalized_params.hf_model_cls or ("deltakv" if backend == "hf" else "auto")
+    compressor_path = normalized_params.hf_deltakv_checkpoint_path
+
+    if backend == 'sparsevllm':
+        from sparsevllm import LLM, SamplingParams
+        # Sparse-vLLM's public LLM entrypoint owns the final normalization. Pass
+        # semantic names here so legacy internal field names are not exposed as
+        # user-facing kwargs.
+        
+        llm = LLM(
+            model_path, 
+            **public_infer_config,
+        )
+
+        def generate(prompt: Union[str, List[str]], past_key_values=None, **kwargs):
+            if isinstance(prompt, str):
+                prompts = [prompt]
+                is_single = True
+            else:
+                prompts = prompt
+                is_single = False
+
+            # 将 HF 风格参数映射到 SamplingParams
+            max_tokens = kwargs.get('max_new_tokens', kwargs.get('max_tokens', 128))
+            temperature = kwargs.get('temperature', 1.0)
+            top_p = kwargs.get('top_p', 1.0)
+            top_k = kwargs.get('top_k', 0)
+            if top_k < 0:
+                top_k = 0
+            eos_token_ids = kwargs.get('eos_token_id')
+            
+            # greedy decoding should be exact argmax, not low-temperature sampling.
+            if not kwargs.get('do_sample', True):
+                temperature = 0.0
+            elif temperature < 1e-5:
+                temperature = 1e-5
+            
+            sampling_params = SamplingParams(
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                max_tokens=max_tokens,
+                eos_token_ids=eos_token_ids,
+            )
+            outputs = llm.generate(prompts, sampling_params, use_tqdm=False)
+            
+            results = [out['text'] for out in outputs]
+            if return_kv_cache:
+                return (results[0], None) if is_single else (results, None)
+            return results[0] if is_single else results
+
+        generate._sparsevllm_llm = llm
+        generate._sparsevllm_infer_config = dict(public_infer_config)
+        
+        if return_model:
+            raise ValueError('sparse vllm 不支持 return_model=True')
+        return generate
+
+    infer_config = normalized_params.infer_config
+
+    def _prepare_model_load(default_torch_dtype: torch.dtype):
+        runtime_infer_config, model_load_kwargs, target_torch_dtype = build_model_load_kwargs(
+            infer_config,
+            default_torch_dtype=default_torch_dtype,
+        )
+        quantization_config = model_load_kwargs.get("quantization_config")
+        if quantization_config is not None:
+            quant_bits = "4-bit" if quantization_config.load_in_4bit else "8-bit"
+            print(
+                f"[Quantization] Using {quant_bits} base-model quantization "
+                f"with torch_dtype={target_torch_dtype} "
+                f"and skip_modules={quantization_config.llm_int8_skip_modules}"
+            )
+        return runtime_infer_config, model_load_kwargs, target_torch_dtype
+    def _hf_attn_implementation() -> str:
+        return os.getenv("DELTAKV_HF_ATTN_IMPLEMENTATION", "flash_attention_2")
+
+
+    def _drop_stale_checkpoint_quantization_config(config, model_load_kwargs):
+        if "quantization_config" in model_load_kwargs:
+            return
+        if "quantization_config" in getattr(config, "__dict__", {}):
+            print(
+                "[Quantization] Dropping checkpoint-side quantization_config before "
+                "base-model loading. To load the base model in 4-bit or 8-bit, set "
+                "`load_in_4bit` or `load_in_8bit` explicitly in --hyper_param."
+            )
+            del config.__dict__["quantization_config"]
+
+    assert use_cache, '还要做padding才能用训练代码推理'
+    if model_cls in {
+        'deltakv',
+        'hf_kivi',
+        DELTA_COMPRESSED_LATENT_WO_FULL,
+        DELTA_COMPRESSED_LATENT_W_FULL,
+        DELTA_COMPRESSED_QUANT_KIVI_FULL_FP8_REF,
+        DELTA_ORIGIN_WO_FULL,
+        DELTA_ORIGIN_W_FULL,
+    }:
+        cache_impl_by_model_cls = {
+            'deltakv': DELTA_COMPRESSED_LATENT_WO_FULL,
+            DELTA_COMPRESSED_LATENT_WO_FULL: DELTA_COMPRESSED_LATENT_WO_FULL,
+            DELTA_COMPRESSED_LATENT_W_FULL: DELTA_COMPRESSED_LATENT_W_FULL,
+            DELTA_COMPRESSED_QUANT_KIVI_FULL_FP8_REF: DELTA_COMPRESSED_QUANT_KIVI_FULL_FP8_REF,
+            DELTA_ORIGIN_WO_FULL: DELTA_ORIGIN_WO_FULL,
+            DELTA_ORIGIN_W_FULL: DELTA_ORIGIN_W_FULL,
+        }
+        runtime_infer_config, model_load_kwargs, target_torch_dtype = _prepare_model_load(torch.bfloat16)
+        if model_cls == "hf_kivi":
+            runtime_infer_config["hf_sparse_cache_impl"] = "kivi"
+            runtime_infer_config["use_cluster"] = False
+            runtime_infer_config["use_compression"] = False
+        else:
+            runtime_infer_config["deltakv_cache_impl"] = cache_impl_by_model_cls[model_cls]
+        base_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        if base_config.model_type == 'qwen2':
+            from deltakv.modeling.qwen2_inference import Qwen2KVCompress as KVModel
+            config_cls = KVQwen2Config
+        elif base_config.model_type == 'qwen3':
+            from deltakv.modeling.qwen3_inference import Qwen3KVCompress as KVModel
+            config_cls = KVQwen3Config
+        elif base_config.model_type == 'llama':
+            from deltakv.modeling.llama_inference import LlamaKVCompress as KVModel
+            config_cls = KVLlamaConfig
+        else:
+            raise ValueError(f"Unsupported model type: {base_config.model_type}")
+
+        if compressor_path is not None:
+            config = _load_deltakv_checkpoint_config(config_cls, compressor_path)
+        else:
+            config = config_cls.from_pretrained(model_path)
+        _drop_stale_checkpoint_quantization_config(config, model_load_kwargs)
+        config.set_native_args(**runtime_infer_config)
+        config.finalize_cluster_args()
+        model = KVModel.from_pretrained(
+            model_path,
+            config=config,
+            torch_dtype=target_torch_dtype,
+            device_map=cuda_device,
+            attn_implementation=_hf_attn_implementation(),
+            **model_load_kwargs,
+        )
+        if compressor_path is not None:
+            load_device = f'cuda:{cuda_device}' if isinstance(cuda_device, int) else 'cpu'
+            comp_state_dict = load_compressor(compressor_path, device=load_device)
+            _, unexpected = model.load_state_dict(comp_state_dict, strict=False)
+            assert len(unexpected) == 0, f'compressor 加载有问题: {unexpected}'
+            del comp_state_dict
+        if model_load_kwargs:
+            restore_modules_to_dtype(model, target_torch_dtype)
+
+    elif model_cls == 'snapkv':
+        runtime_infer_config, model_load_kwargs, target_torch_dtype = _prepare_model_load(torch.bfloat16)
+        base_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        if base_config.model_type == 'qwen2':
+            from deltakv.modeling.qwen2.qwen2_snapkv import Qwen2SnapKVForCausalLM as KVModel
+            config_cls = KVQwen2Config
+        elif base_config.model_type == 'qwen3':
+            from deltakv.modeling.qwen3.qwen3_snapkv import Qwen3SnapKVForCausalLM as KVModel
+            config_cls = KVQwen3Config
+        elif base_config.model_type == 'llama':
+            from deltakv.modeling.llama.llama_snapkv import LlamaSnapKVForCausalLM as KVModel
+            config_cls = KVLlamaConfig
+        else:
+            raise ValueError(f"Unsupported model type: {base_config.model_type}")
+
+        print('💡💡💡 SnapKV')
+        config = config_cls.from_pretrained(model_path)
+        config.set_native_args(**runtime_infer_config)
+        config.finalize_cluster_args()
+        print(f'[Config] {config}')
+        model = KVModel.from_pretrained(
+            model_path,
+            config=config,
+            torch_dtype=target_torch_dtype,
+            device_map=cuda_device,
+            attn_implementation=_hf_attn_implementation(),
+            **model_load_kwargs,
+        )
+        if model_load_kwargs:
+            restore_modules_to_dtype(model, target_torch_dtype)
+
+    elif model_cls == 'pyramidkv':
+        runtime_infer_config, model_load_kwargs, target_torch_dtype = _prepare_model_load(torch.bfloat16)
+        base_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        if base_config.model_type == 'qwen2':
+            from deltakv.modeling.qwen2.qwen2_pyramidkv import Qwen2PyramidKVForCausalLM as KVModel
+            config_cls = KVQwen2Config
+        elif base_config.model_type == 'llama':
+            from deltakv.modeling.llama.llama_pyramidkv import LlamaPyramidKVForCausalLM as KVModel
+            config_cls = KVLlamaConfig
+        else:
+            raise ValueError(f"Unsupported model type: {base_config.model_type}")
+
+        print('💡💡💡 PyramidKV')
+        config = config_cls.from_pretrained(model_path)
+        config.set_native_args(**runtime_infer_config)
+        config.finalize_cluster_args()
+        print(f'[Config] {config}')
+        model = KVModel.from_pretrained(
+            model_path,
+            config=config,
+            torch_dtype=target_torch_dtype,
+            device_map=cuda_device,
+            attn_implementation=_hf_attn_implementation(),
+            **model_load_kwargs,
+        )
+        if model_load_kwargs:
+            restore_modules_to_dtype(model, target_torch_dtype)
+
+    elif model_cls == 'omnikv':
+        print('💡💡💡 OmniKV')
+        model = load_omnikv_model(model_path, infer_config, cuda_device)
+
+    elif model_cls == 'auto':
+        runtime_infer_config, model_load_kwargs, target_torch_dtype = _prepare_model_load(torch.bfloat16)
+        print('💡💡💡 Auto')
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=target_torch_dtype,
+            device_map=cuda_device,
+            trust_remote_code=True,
+            attn_implementation=_hf_attn_implementation(),
+            **model_load_kwargs,
+        )
+        if model_load_kwargs:
+            restore_modules_to_dtype(model, target_torch_dtype)
+        auto_chunk_prefill_size = runtime_infer_config.get('chunk_prefill_size', None)
+        if auto_chunk_prefill_size is not None:
+            from types import MethodType
+
+            def chunked_forward(self, input_ids=None, past_key_values=None, **kwargs):
+                if input_ids is not None and input_ids.shape[1] > auto_chunk_prefill_size:
+                    seq_len = input_ids.shape[1]
+                    outputs = None
+                    for i in range(0, seq_len, auto_chunk_prefill_size):   # noqa
+                        chunk = input_ids[:, i:i + auto_chunk_prefill_size]   # noqa
+                        outputs = self.original_forward(input_ids=chunk, past_key_values=past_key_values, **kwargs)
+                        past_key_values = outputs.past_key_values
+                    return outputs
+                return self.original_forward(input_ids=input_ids, past_key_values=past_key_values, **kwargs)
+
+            print('monkey patch raw full attn')
+            model.original_forward = model.forward
+            model.forward = MethodType(chunked_forward, model)
+
+    elif model_cls == 'quest':
+        runtime_infer_config, model_load_kwargs, target_torch_dtype = _prepare_model_load(torch.bfloat16)
+        print('💡💡💡 Quest')
+        # 加入 quest 的路径
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        quest_base_dir = os.path.abspath(os.path.join(current_dir, "../../baselines/quest"))
+        if quest_base_dir not in sys.path:
+            sys.path.insert(0, quest_base_dir)
+
+        from baselines.quest.evaluation.llama import enable_tuple_kv_cache_for_llama
+        from baselines.quest.evaluation.quest_attention import enable_quest_attention_eval
+
+        # 启用 Quest 所需的补丁，改变 KV Cache 处理方式
+        enable_tuple_kv_cache_for_llama()
+
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=target_torch_dtype,
+            device_map=cuda_device,
+            trust_remote_code=True,
+            attn_implementation=_hf_attn_implementation(),
+            **model_load_kwargs,
+        )
+        if model_load_kwargs:
+            restore_modules_to_dtype(model, target_torch_dtype)
+
+        class QuestArgs:
+            def __init__(self, token_budget, chunk_size):
+                self.token_budget = token_budget
+                self.chunk_size = chunk_size
+
+        # 从 infer_config 中获取参数
+        quest_args = QuestArgs(
+            token_budget=runtime_infer_config['num_top_tokens'],
+            chunk_size=runtime_infer_config.get('chunk_size', 16)
+        )
+        enable_quest_attention_eval(model, quest_args)
+
+    elif model_cls == 'palu':
+        runtime_infer_config, model_load_kwargs, target_torch_dtype = _prepare_model_load(torch.float16)
+        print('💡💡💡 Palu')
+        import transformers
+        assert transformers.__version__ == '4.37.2'
+
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        palu_base_dir = os.path.abspath(os.path.join(current_dir, "../../baselines/palu"))
+        if palu_base_dir not in sys.path:
+            sys.path.insert(0, palu_base_dir)
+
+        # 必须先导入 palu.model 以触发 AutoConfig/AutoModel 注册
+        import palu.model  # noqa: F401
+        from palu.quant_utils import configure_latent_quantizer
+
+        # Palu 模型通常使用 float16，且依赖其自定义的 Triton kernel
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=target_torch_dtype,
+            device_map=cuda_device,
+            trust_remote_code=True,
+            attn_implementation=_hf_attn_implementation(),
+            **model_load_kwargs,
+        )
+        if model_load_kwargs:
+            restore_modules_to_dtype(model, target_torch_dtype)
+
+        # 如果配置了低比特量化（lt_bits < 16），则进行配置
+        lt_bits = runtime_infer_config.get('lt_bits', 16)
+        if lt_bits < 16:
+            configure_latent_quantizer(
+                model,
+                n_bits=lt_bits,
+                group_size=runtime_infer_config.get('lt_group_size', 0),
+                sym=runtime_infer_config.get('lt_sym', True),
+                clip_ratio=runtime_infer_config.get('lt_clip_ratio', 1.0),
+                hadamard=runtime_infer_config.get('lt_hadamard', False)
+            )
+
+    elif model_cls == 'kivi':
+        print('💡💡💡 KIVI')
+        model = load_kivi_model(model_path, infer_config, cuda_device)
+    elif model_cls == 'adakv':
+        runtime_infer_config, model_load_kwargs, target_torch_dtype = _prepare_model_load(torch.bfloat16)
+        print('💡💡💡 AdaKV')
+        os.environ['ENABLE_HF_GEN'] = '1'  # 生成hack流程依赖于generate函数
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        adakv_base_dir = os.path.abspath(os.path.join(current_dir, "../../baselines/adakv"))
+        if adakv_base_dir not in sys.path:
+            sys.path.insert(0, adakv_base_dir)
+
+        from adaptive_snapkv.monkeypatch.monkeypatch import (
+            replace_mistral_adaptive, replace_llama_adaptive,
+            replace_mistral_fixed, replace_llama_fixed,
+            config_compress
+        )
+
+        base_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        use_adaptive = runtime_infer_config.get('use_adaptive', True)
+
+        if base_config.model_type == 'llama':
+            if use_adaptive:
+                replace_llama_adaptive()
+            else:
+                replace_llama_fixed()
+        elif base_config.model_type == 'mistral':
+            if use_adaptive:
+                replace_mistral_adaptive()
+            else:
+                replace_mistral_fixed()
+        else:
+            raise ValueError(f"AdaKV does not support model type: {base_config.model_type}")
+
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=target_torch_dtype,
+            device_map=cuda_device,
+            attn_implementation=_hf_attn_implementation(),
+            trust_remote_code=True,
+            **model_load_kwargs,
+        )
+        if model_load_kwargs:
+            restore_modules_to_dtype(model, target_torch_dtype)
+
+        # config hyperparameters
+        model = config_compress(
+            model,
+            window_size=runtime_infer_config.get('snapkv_window_size', 32),
+            base_capacity=runtime_infer_config.get('num_top_tokens', 512),
+            kernel_size=runtime_infer_config.get('kernel_size', 7),
+            pooling=runtime_infer_config.get('pooling', 'maxpool'),
+            floor_alpha=runtime_infer_config.get('floor_alpha', 0.2),
+            pyram_mode=runtime_infer_config.get('pyram_mode', False),
+            beta=runtime_infer_config.get('pyram_beta', 20),
+            gqa_support=runtime_infer_config.get('gqa_support', False),
+            gqa_func=runtime_infer_config.get('gqa_func', 'mean')
+        )
+    elif model_cls == 'kvzip':
+        print('💡💡💡 KVzip')
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        kvzip_base_dir = os.path.abspath(os.path.join(current_dir, "../../baselines/kvzip"))
+        if kvzip_base_dir not in sys.path:
+            sys.path.insert(0, kvzip_base_dir)
+
+        from model import ModelKVzip
+
+        kvzip_model = ModelKVzip(
+            model_path,
+            kv_type=infer_config.get('kv_type', 'evict'),
+        )
+        base_gen_kwargs = kvzip_model.gen_kwargs.copy()
+        default_prefill_chunk_size = int(
+            infer_config.get('prefill_chunk_size', infer_config.get('chunk_prefill_size', 16000))
+        )
+        default_ratio = float(infer_config.get('ratio', 0.3))
+        default_level = infer_config.get('level', 'pair')
+        default_load_score = _as_bool(infer_config.get('load_score', False))
+        default_do_score = _as_bool(infer_config.get('do_score', True))
+        default_update_cache = _as_bool(infer_config.get('update_cache', False))
+        default_iterative_chunk_size = int(infer_config.get('iterative_expand_chunk_size', 0) or 0)
+        default_iterative_keep_tokens = int(infer_config.get('iterative_keep_tokens', 0) or 0)
+        # Keep prefill-side and decode-side iterative pruning independent.
+        # Falling back decode settings to prefill settings makes it impossible
+        # to enable only one side from `infer_config`.
+        default_iterative_decode_chunk_size = int(
+            infer_config.get('iterative_decode_chunk_size', 0) or 0
+        )
+        default_iterative_decode_keep_tokens = int(
+            infer_config.get('iterative_decode_keep_tokens', 0) or 0
+        )
+        model = kvzip_model.model
+        tokenizer = kvzip_model.tokenizer
+
+        def _kvzip_debug_enabled():
+            return os.getenv("KVZIP_DEBUG", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+        def _kvzip_debug_decode(prefix, kv, step_idx=None, token_id=None):
+            if not _kvzip_debug_enabled():
+                return
+            alloc = torch.cuda.memory_allocated(model.device) / 1e9
+            reserved = torch.cuda.memory_reserved(model.device) / 1e9
+            max_alloc = torch.cuda.max_memory_allocated(model.device) / 1e9
+            print(
+                f"[KVzipDebug] {prefix} step={step_idx} token_id={token_id} "
+                f"ctx_len={getattr(kv, 'ctx_len', None)} seen={getattr(kv, '_seen_tokens', None)} "
+                f"prefill_len={None if getattr(kv, 'prefill_ids', None) is None else kv.prefill_ids.shape[1]} "
+                f"cache_mem_gb={kv._mem() if hasattr(kv, '_mem') else 'na'} "
+                f"cuda_alloc_gb={alloc:.3f} cuda_reserved_gb={reserved:.3f} cuda_max_alloc_gb={max_alloc:.3f}"
+            )
+
+        def _evict_dense_context_tokens(kv, keep_tokens):
+            if keep_tokens <= 0 or kv.ctx_len <= keep_tokens:
+                return 1.0
+
+            if kv.score is None:
+                raise ValueError("KVzip iterative evict requires KV scores, but kv.score is empty.")
+
+            score = torch.stack(kv.score, dim=0) if isinstance(kv.score, list) else kv.score
+            token_score = score.amax(dim=(0, 1, 2))
+            keep_tokens = min(int(keep_tokens), int(token_score.numel()))
+            topk_indices = torch.topk(token_score, keep_tokens, dim=-1).indices
+            keep_mask = torch.zeros_like(token_score, dtype=torch.bool)
+            keep_mask.scatter_(0, topk_indices, True)
+
+            full_keep_mask = torch.cat([
+                torch.ones(kv.sink, dtype=torch.bool, device=keep_mask.device),
+                keep_mask,
+            ], dim=0)
+            for layer_idx in range(len(kv.key_cache)):
+                kv.key_cache[layer_idx] = kv.key_cache[layer_idx][:, :, full_keep_mask, :].contiguous()
+                kv.value_cache[layer_idx] = kv.value_cache[layer_idx][:, :, full_keep_mask, :].contiguous()
+
+            kv.ctx_ids = kv.ctx_ids[:, keep_mask]
+            kv.prefill_ids = torch.cat([kv.prefill_ids[:, :kv.sink], kv.ctx_ids], dim=1)
+            kv.score = [layer_score[..., keep_mask] for layer_score in kv.score]
+            kv.start_idx = kv.sink
+            kv.ctx_len = kv.ctx_ids.shape[1]
+            kv.end_idx = kv.start_idx + kv.ctx_len
+            kv._seen_tokens = kv.prefill_ids.shape[1]
+            kv.pruned = False
+            return keep_tokens / max(int(token_score.numel()), 1)
+
+        def _refresh_dense_kv_metadata(kv):
+            kv.ctx_ids = kv.prefill_ids[:, kv.sink:]
+            kv.start_idx = kv.sink
+            kv.ctx_len = kv.ctx_ids.shape[1]
+            kv.end_idx = kv.start_idx + kv.ctx_len
+            kv._seen_tokens = kv.prefill_ids.shape[1]
+            kv.pruned = False
+
+        def _append_dense_tokens(kv, new_ids):
+            if new_ids is None or new_ids.numel() == 0:
+                return
+            kv.prefill_ids = torch.cat([kv.prefill_ids, new_ids], dim=1)
+            _refresh_dense_kv_metadata(kv)
+
+        def _maybe_iterative_decode_evict(kv, decode_chunk_size, decode_keep_tokens):
+            if decode_chunk_size <= 0 or decode_keep_tokens <= 0:
+                return False
+            # Decode-side iterative eviction should behave like chunked growth:
+            # wait until the dense context grows by one decode chunk beyond the
+            # retained budget, then score once and evict back to `decode_keep_tokens`.
+            if (kv.ctx_len + 1) <= (decode_keep_tokens + decode_chunk_size):
+                return False
+
+            kvzip_model.scoring(kv, kv.ctx_ids, load_score=False)
+            keep_ratio = _evict_dense_context_tokens(kv, decode_keep_tokens)
+            print(f"[KVzip] iterative decode evict keep_ratio={keep_ratio:.4f}")
+            return True
+
+        def _iterative_prefill_kv(
+            prefill_ids,
+            prefill_chunk_size,
+            load_score,
+            do_score,
+            level,
+            iterative_chunk_size,
+            iterative_keep_tokens,
+        ):
+            if (iterative_chunk_size <= 0 or iterative_keep_tokens <= 0 or
+                    prefill_ids.shape[1] <= iterative_chunk_size):
+                return kvzip_model.prefill(
+                    prefill_ids,
+                    prefill_chunk_size=prefill_chunk_size,
+                    load_score=load_score,
+                    do_score=do_score,
+                )
+
+            if not do_score and not load_score:
+                raise ValueError(
+                    "KVzip iterative evict requires scoring. Set do_score=true or load_score=true."
+                )
+
+            cursor = min(iterative_chunk_size, prefill_ids.shape[1])
+            kv = kvzip_model.prefill(
+                    prefill_ids[:, :cursor],
+                    prefill_chunk_size=prefill_chunk_size,
+                    load_score=load_score,
+                    do_score=do_score,
+                )
+            if kv.ctx_len > iterative_keep_tokens:
+                keep_ratio = _evict_dense_context_tokens(kv, iterative_keep_tokens)
+                print(f"[KVzip] iterative dense evict keep_ratio={keep_ratio:.4f} ({level})")
+
+            while cursor < prefill_ids.shape[1]:
+                next_cursor = min(cursor + iterative_chunk_size, prefill_ids.shape[1])
+                next_ids = prefill_ids[:, cursor:next_cursor]
+                for input_ids in torch.split(next_ids, prefill_chunk_size, dim=1):
+                    kvzip_model.__call__(input_ids, kv, update_cache=True)
+
+                kv.ctx_ids = torch.cat([kv.ctx_ids, next_ids], dim=1)
+                kv.prefill_ids = torch.cat([kv.prefill_ids, next_ids], dim=1)
+                kv.start_idx = kv.sink
+                kv.ctx_len = kv.ctx_ids.shape[1]
+                kv.end_idx = kv.start_idx + kv.ctx_len
+                kv._seen_tokens = kv.prefill_ids.shape[1]
+
+                kvzip_model.scoring(kv, kv.ctx_ids, load_score=load_score)
+                if kv.ctx_len > iterative_keep_tokens:
+                    keep_ratio = _evict_dense_context_tokens(kv, iterative_keep_tokens)
+                    print(f"[KVzip] iterative dense evict keep_ratio={keep_ratio:.4f} ({level})")
+
+                cursor = next_cursor
+
+            return kv
+
+        def _manual_decode_with_iterative_evict(
+            query_ids,
+            kv,
+            decode_chunk_size,
+            decode_keep_tokens,
+            gen_kwargs,
+        ):
+            if query_ids.shape[0] != 1:
+                raise ValueError("KVzip iterative decode only supports batch_size=1.")
+            if query_ids.shape[1] == 0:
+                raise ValueError("KVzip iterative decode requires at least one query token.")
+            if hasattr(kv, "info") and isinstance(kv.info, dict) and kv.info.get("flatten", False):
+                raise ValueError("KVzip iterative decode evict requires a dense KV cache, but got flattened cache.")
+
+            logits = None
+            for token_idx in range(query_ids.shape[1]):
+                _kvzip_debug_decode("before-query-token", kv, step_idx=token_idx)
+                current_ids = query_ids[:, token_idx:token_idx + 1]
+                outputs = kvzip_model.__call__(current_ids, kv, update_cache=True, return_logits=True)
+                _append_dense_tokens(kv, current_ids)
+                _kvzip_debug_decode("after-query-token", kv, step_idx=token_idx, token_id=int(current_ids[0, 0]))
+                logits = outputs.logits[:, -1, :]
+
+            eos_token_id = gen_kwargs.get('eos_token_id', None)
+            stop_token_ids = set()
+            if eos_token_id is not None:
+                if isinstance(eos_token_id, int):
+                    stop_token_ids.add(int(eos_token_id))
+                else:
+                    stop_token_ids.update(int(token_id) for token_id in eos_token_id)
+            for token_id in [tokenizer.eos_token_id, tokenizer.pad_token_id]:
+                if token_id is not None:
+                    stop_token_ids.add(int(token_id))
+            if hasattr(tokenizer, "eot_token_id") and tokenizer.eot_token_id is not None:
+                stop_token_ids.add(int(tokenizer.eot_token_id))
+
+            max_new_tokens = int(gen_kwargs.get('max_new_tokens', 512))
+            do_sample = bool(gen_kwargs.get('do_sample', False))
+            temperature = float(gen_kwargs.get('temperature', 1.0))
+            top_p = float(gen_kwargs.get('top_p', 1.0))
+            top_k_value = gen_kwargs.get('top_k', 0)
+            top_k = 0 if top_k_value in (None, 0) else int(top_k_value)
+
+            generated_ids = []
+            for decode_step in range(max_new_tokens):
+                step_logits = logits.clone()
+                if os.environ.get('BAN_EOS') and tokenizer.eos_token_id is not None:
+                    step_logits[:, tokenizer.eos_token_id] = -float('inf')
+
+                if do_sample:
+                    if temperature != 1.0:
+                        step_logits = step_logits / temperature
+                    step_logits = top_k_top_p_filtering(step_logits, top_k=top_k, top_p=top_p)
+                    probs = torch.softmax(step_logits, dim=-1)
+                    next_token = torch.multinomial(probs, num_samples=1)
+                else:
+                    next_token = torch.argmax(step_logits, dim=-1, keepdim=True)
+
+                token_id = int(next_token[0, 0])
+                if token_id in stop_token_ids:
+                    _kvzip_debug_decode("stop-token", kv, step_idx=decode_step, token_id=token_id)
+                    break
+
+                _kvzip_debug_decode("before-decode-token", kv, step_idx=decode_step, token_id=token_id)
+                _maybe_iterative_decode_evict(kv, decode_chunk_size, decode_keep_tokens)
+                outputs = kvzip_model.__call__(next_token, kv, update_cache=True, return_logits=True)
+                _append_dense_tokens(kv, next_token)
+                generated_ids.append(token_id)
+                _kvzip_debug_decode("after-decode-token", kv, step_idx=decode_step, token_id=token_id)
+                logits = outputs.logits[:, -1, :]
+
+            if not generated_ids:
+                return ""
+
+            return kvzip_model.decode(
+                torch.tensor([generated_ids], device=query_ids.device, dtype=query_ids.dtype)
+            )
+
+        def generate(prompt: Union[str, dict, List[Union[str, dict]]], past_key_values=None, **kwargs):
+            if past_key_values is not None:
+                raise ValueError('KVzip adapter does not support external past_key_values.')
+
+            if isinstance(prompt, (str, dict)):
+                prompts = [prompt]
+                is_single = True
+            else:
+                prompts = prompt
+                is_single = False
+
+            prefill_chunk_size = int(kwargs.pop('prefill_chunk_size', default_prefill_chunk_size))
+            ratio = float(kwargs.pop('ratio', default_ratio))
+            level = kwargs.pop('level', default_level)
+            load_score = _as_bool(kwargs.pop('load_score', default_load_score))
+            do_score = _as_bool(kwargs.pop('do_score', default_do_score))
+            update_cache = _as_bool(kwargs.pop('update_cache', default_update_cache))
+            iterative_chunk_size = int(kwargs.pop('iterative_expand_chunk_size', default_iterative_chunk_size) or 0)
+            iterative_keep_tokens = int(kwargs.pop('iterative_keep_tokens', default_iterative_keep_tokens) or 0)
+            iterative_decode_chunk_size = int(
+                kwargs.pop('iterative_decode_chunk_size', default_iterative_decode_chunk_size) or 0
+            )
+            iterative_decode_keep_tokens = int(
+                kwargs.pop('iterative_decode_keep_tokens', default_iterative_decode_keep_tokens) or 0
+            )
+
+            gen_kwargs = base_gen_kwargs.copy()
+            gen_kwargs.update({
+                'max_new_tokens': kwargs.pop('max_new_tokens', base_gen_kwargs.get('max_new_tokens', 512)),
+                'do_sample': kwargs.pop('do_sample', base_gen_kwargs.get('do_sample', False)),
+                'temperature': kwargs.pop('temperature', base_gen_kwargs.get('temperature', 1.0)),
+                'top_p': kwargs.pop('top_p', base_gen_kwargs.get('top_p', 1)),
+                'top_k': kwargs.pop('top_k', base_gen_kwargs.get('top_k', None)),
+            })
+            num_beams = int(kwargs.pop('num_beams', 1))
+            if num_beams != 1:
+                raise ValueError(f'KVzip adapter only supports num_beams=1, got {num_beams}')
+
+            eos_token_id = kwargs.pop('eos_token_id', None)
+            if eos_token_id is not None:
+                gen_kwargs['eos_token_id'] = eos_token_id
+
+            if kwargs:
+                raise ValueError(f'Unsupported KVzip generation kwargs: {sorted(kwargs.keys())}')
+
+            results = []
+            old_gen_kwargs = kvzip_model.gen_kwargs
+            kvzip_model.gen_kwargs = gen_kwargs
+            try:
+                with torch.inference_mode():
+                    for single_prompt in prompts:
+                        old_sys_prompt_ids = kvzip_model.sys_prompt_ids
+                        old_postfix_ids = kvzip_model.postfix_ids
+                        if isinstance(single_prompt, dict):
+                            prefill_text = single_prompt.get('prefill_text')
+                            query_text = single_prompt.get('query_text')
+                            use_kvzip_template = bool(single_prompt.get('use_kvzip_template', True))
+                            if prefill_text is None or query_text is None:
+                                raise ValueError(
+                                    "Structured KVzip prompt must contain 'prefill_text' and 'query_text'."
+                                )
+                            if not use_kvzip_template:
+                                kvzip_model.sys_prompt_ids = old_sys_prompt_ids[:, :0]
+                                kvzip_model.postfix_ids = old_postfix_ids[:, :0]
+                                prefill_ids = kvzip_model.encode(prefill_text)
+                                query_ids = kvzip_model.encode(query_text)
+                            else:
+                                prefill_ids = kvzip_model.encode(prefill_text)
+                                query_ids = kvzip_model.apply_template(query_text)
+                        else:
+                            # Fallback for legacy callers that pass a single prompt string.
+                            prompt_ids = kvzip_model.encode(single_prompt)
+                            prefill_ids = prompt_ids[:, :-1]
+                            query_ids = prompt_ids[:, -1:]
+                        try:
+                            kv = _iterative_prefill_kv(
+                                prefill_ids=prefill_ids,
+                                prefill_chunk_size=prefill_chunk_size,
+                                load_score=load_score,
+                                do_score=do_score,
+                                level=level,
+                                iterative_chunk_size=iterative_chunk_size,
+                                iterative_keep_tokens=iterative_keep_tokens,
+                            )
+                            if ((iterative_chunk_size > 0 and iterative_keep_tokens > 0) or
+                                    (iterative_decode_chunk_size > 0 and iterative_decode_keep_tokens > 0)):
+                                if ratio < 1.0:
+                                    print(
+                                        "[KVzip] skip final pair-level prune because iterative dense evict "
+                                        "is enabled."
+                                    )
+                            else:
+                                kv.prune(ratio=ratio, level=level)
+                            if iterative_decode_chunk_size > 0 and iterative_decode_keep_tokens > 0:
+                                results.append(
+                                    _manual_decode_with_iterative_evict(
+                                        query_ids=query_ids,
+                                        kv=kv,
+                                        decode_chunk_size=iterative_decode_chunk_size,
+                                        decode_keep_tokens=iterative_decode_keep_tokens,
+                                        gen_kwargs=gen_kwargs,
+                                    )
+                                )
+                            else:
+                                results.append(kvzip_model.generate(query_ids, kv=kv, update_cache=update_cache))
+                        finally:
+                            kvzip_model.sys_prompt_ids = old_sys_prompt_ids
+                            kvzip_model.postfix_ids = old_postfix_ids
+            finally:
+                kvzip_model.gen_kwargs = old_gen_kwargs
+
+            if return_kv_cache:
+                return (results[0], None) if is_single else (results, None)
+            return results[0] if is_single else results
+
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = 'left'
+
+        if return_model:
+            return generate, model
+        return generate
+    else:
+        raise ValueError(f"Unknown sparse_method/model backend class: {model_cls}")
+
+    manual_chunk_prefill_size = int(os.environ.get('MANUAL_GEN_CHUNK_PREFILL_SIZE', 0))
+    if manual_chunk_prefill_size > 0:
+        assert model_cls == 'kivi' or model_cls == 'palu' or model_cls == 'quest' or model_cls == 'kvzip', '其他方法在代码内部实现了chunk prefill'
+
+    model.eval()
+    if tokenizer_path is None:
+        tokenizer_path = model_path
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = 'left'
+
+    def generate(prompt: Union[str, List[str]], past_key_values=None, **kwargs):
+        if os.getenv('ENABLE_HF_GEN'):
+            return hf_gen(model, tokenizer, prompt, return_kv_cache, past_key_values, **kwargs)
+        else:
+            return manual_generate(model, tokenizer, prompt, past_key_values, return_kv_cache, **kwargs)
+
+    if return_model:
+        return generate, model
+
+    return generate

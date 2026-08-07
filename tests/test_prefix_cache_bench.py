@@ -4,7 +4,7 @@ import types
 
 import pytest
 
-from sparsevllm.configs.runtime_params import normalize_runtime_params
+from deltakv.configs.runtime_params import normalize_runtime_params
 from sparsevllm.config import Config
 from scripts.benchmarks import bench_prefix_cache as bench
 

@@ -10,7 +10,7 @@
 
 <p align="center">English | <a href="README_zh.md">简体中文</a></p>
 
-A sparse-first inference engine for long-context LLM serving.
+A sparse-first inference engine for long-context LLM serving, which also includes DeltaKV compressor training and evaluation tooling.
 
 <div align="center">
   <img src="docs/assets/sparse_vllm_throughput.png" alt="Sparse-vLLM throughput" style="width:86%; height:auto;">
@@ -20,9 +20,8 @@ A sparse-first inference engine for long-context LLM serving.
 
 Sparse-vLLM is an inference framework built with sparsity as the first design principle. Instead of layering sparse methods on top of a conventional KV cache, it rethinks cache layout, controller flow, and kernels so that multiple sparse mechanisms can plug in cleanly.
 
-> **Note:** DeltaKV compressor training code will be maintained separately in
-> [CURRENTF/DeltaKV](https://github.com/CURRENTF/DeltaKV) and is no longer
-> included in this repository.
+DeltaKV-related compressor training, HF wrapper comparisons, and benchmark
+adapters live under `src/deltakv/` and `benchmark/`.
 
 ## Key Runtime Principles
 
@@ -84,6 +83,7 @@ parallelism, and sparse-method compatibility matrices.
 | Runtime architecture | [Architecture](docs/en/design/README.md) |
 | Runtime parameter semantics | [Runtime Parameter Semantics](docs/en/configuration/runtime-parameter-semantics.md) |
 | Benchmark commands | [Benchmarks](docs/en/benchmarking/README.md) |
+| DeltaKV inference and training | [DeltaKV](docs/en/features/deltakv.md) |
 | Reproducibility checklist | [Reproducibility](docs/en/getting_started/reproducibility.md) |
 
 The full documentation index is maintained in [docs/en/README.md](docs/en/README.md).
