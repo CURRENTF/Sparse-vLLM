@@ -149,8 +149,20 @@ class ModelRunner:
             )
         self.parallel_context = init_parallel_context(
             topology=config.parallel_topology,
+            enable_flashinfer_custom_all_reduce=(
+                hf_config.model_type == "glm4_moe_lite"
+                and bool(config.decode_cuda_graph)
+                and config.tensor_parallel_size == 2
+                and config.expert_parallel_size == 1
+                and config.data_parallel_size == 1
+                and self.platform.is_cuda()
+                and self.platform.get_device_caps(rank).compute_capability == (9, 0)
+            ),
         )
-
+        if self.parallel_context.all_reduce_provider is not None:
+            logger.info(
+                "Enabled FlashInfer custom TP all-reduce for tensors up to 8 MiB."
+            )
         # CUDA allocator peaks are process-global and survive LLMEngine.exit().
         # Start a new lifecycle before model construction so KV sizing observes
         # only this engine's model load and persistent allocations.
@@ -306,6 +318,7 @@ class ModelRunner:
             is_long_text_batch=self._is_long_text_batch,
             method=self.config.vllm_sparse_method,
             rank=self.rank,
+            parallel_context=self.parallel_context,
             capture_sizes=decode_static_capture_sizes,
             context_sizes=decode_static_context_sizes,
             graph_pool=self.cuda_graph_pool,
@@ -346,6 +359,7 @@ class ModelRunner:
             )
             if self.rank == 0:
                 self.shm.unlink()
+        self.parallel_context.close_all_reduce_provider()
         reset_parallel_context()
         dist.destroy_process_group()
 

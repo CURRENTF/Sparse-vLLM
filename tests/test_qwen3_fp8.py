@@ -16,6 +16,7 @@ def _parallel_context():
         tp_rank=0,
         tp_size=1,
         tp_all_reduce=lambda tensor: tensor,
+        tp_all_reduce_out_of_place=lambda tensor: tensor,
     )
 
 

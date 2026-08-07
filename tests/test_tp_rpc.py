@@ -450,7 +450,8 @@ def test_model_runner_exit_drains_graphs_before_barrier():
         unlink=lambda: calls.append("unlink_shm"),
     )
     runner.parallel_context = SimpleNamespace(
-        world_barrier=lambda **_: calls.append("barrier")
+        world_barrier=lambda **_: calls.append("barrier"),
+        close_all_reduce_provider=lambda: calls.append("close_all_reduce"),
     )
 
     with (
@@ -472,6 +473,7 @@ def test_model_runner_exit_drains_graphs_before_barrier():
         "close_shm",
         "barrier",
         "unlink_shm",
+        "close_all_reduce",
         "reset",
         "destroy",
     ]

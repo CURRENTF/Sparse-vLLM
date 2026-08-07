@@ -7,19 +7,24 @@ import torch
 import sparsevllm.platforms as platforms
 from sparsevllm.engine.cache_manager.base import (
     DecodeComputeView,
+    ExplicitKVPayload,
     MlaLatentPayload,
+    PrefillComputeView,
 )
 from sparsevllm.operators.registry import (
     OpRegistry,
     OpResolver,
     SupportResult,
 )
+from sparsevllm.operators.sgl_fa3 import SglFa3DecodeKernel, sgl_fa3_support
 from sparsevllm.platforms.interface import DeviceCaps, PlatformEnum
 from sparsevllm.triton_kernel.mla import (
     DEFAULT_GLM_MLA_DECODE_CONFIG,
+    GLM_MLA_MAX_WORKSPACE_CONFIG,
     MlaDecodeLaunchConfig,
     allocate_mla_decode_workspace,
     run_mla_decode,
+    select_glm_mla_decode_config,
     validate_mla_decode_metadata,
 )
 
@@ -76,6 +81,7 @@ class MlaAttentionOpSpec:
 class MlaAttentionProvider:
     name = ""
     priority = 0
+    supports_explicit_prefill = False
 
     def run(
         self,
@@ -108,7 +114,7 @@ class MlaTritonProvider(MlaAttentionProvider):
         op_spec: MlaAttentionOpSpec,
         device: torch.device | str,
         max_batch_size: int,
-        launch_config: MlaDecodeLaunchConfig = DEFAULT_GLM_MLA_DECODE_CONFIG,
+        launch_config: MlaDecodeLaunchConfig | None = None,
     ) -> None:
         self.spec = op_spec
         requested_device = torch.device(device)
@@ -118,12 +124,14 @@ class MlaTritonProvider(MlaAttentionProvider):
                 "MLA max_batch_size must be positive, got "
                 f"{self.max_batch_size}."
             )
-        self.launch_config = launch_config
+        self._fixed_launch_config = launch_config
+        self.launch_config = launch_config or DEFAULT_GLM_MLA_DECODE_CONFIG
+        workspace_config = launch_config or GLM_MLA_MAX_WORKSPACE_CONFIG
         self.workspace = allocate_mla_decode_workspace(
             batch_size=self.max_batch_size,
             head_count=self.spec.local_q_heads,
             device=requested_device,
-            config=self.launch_config,
+            config=workspace_config,
         )
         self.device = self.workspace.block_size.device
         self._validated_decode_metadata: tuple[
@@ -271,22 +279,13 @@ class MlaTritonProvider(MlaAttentionProvider):
                 )
         return view.payload
 
-    @torch.no_grad()
-    def run(
+    def _validate_metadata(
         self,
-        q_nope_absorbed: torch.Tensor,
-        q_rope: torch.Tensor,
-        view: DecodeComputeView,
-        output: torch.Tensor,
+        view: DecodeComputeView | PrefillComputeView,
+        payload: MlaLatentPayload,
         *,
-        validation_scope: object | None = None,
-    ) -> torch.Tensor:
-        payload = self._validate_run_inputs(
-            q_nope_absorbed,
-            q_rope,
-            view,
-            output,
-        )
+        validation_scope: object | None,
+    ) -> None:
         cache_slot_count = int(payload.latent_cache.shape[0])
         metadata_key = (
             view.meta.active_slots,
@@ -311,22 +310,67 @@ class MlaTritonProvider(MlaAttentionProvider):
             and entry[4] == metadata_key[4]
             for entry in cached_entries
         )
-        if not metadata_is_validated:
-            validate_mla_decode_metadata(
-                view.meta.active_slots,
-                view.meta.req_indices,
-                view.meta.context_lens,
-                cache_slot_count=cache_slot_count,
-                max_context_len=view.meta.max_context_len,
-            )
-            if validation_scope is None:
-                self._validated_decode_metadata = None
-            else:
-                cached_entries.append(metadata_key)
-                self._validated_decode_metadata = (
-                    validation_scope,
-                    cached_entries,
-                )
+        if metadata_is_validated:
+            return
+        validate_mla_decode_metadata(
+            view.meta.active_slots,
+            view.meta.req_indices,
+            view.meta.context_lens,
+            cache_slot_count=cache_slot_count,
+            max_context_len=view.meta.max_context_len,
+        )
+        if validation_scope is None:
+            self._validated_decode_metadata = None
+        else:
+            cached_entries.append(metadata_key)
+            self._validated_decode_metadata = (validation_scope, cached_entries)
+
+    def _launch_config_for(
+        self,
+        *,
+        batch_size: int,
+        max_context_len: int | None,
+        active_slot_width: int,
+    ) -> MlaDecodeLaunchConfig:
+        if self._fixed_launch_config is not None:
+            return self._fixed_launch_config
+        context_capacity = (
+            active_slot_width
+            if max_context_len is None
+            else int(max_context_len)
+        )
+        return select_glm_mla_decode_config(
+            batch_size=batch_size,
+            max_context_len=context_capacity,
+            local_q_heads=self.spec.local_q_heads,
+        )
+
+    @torch.no_grad()
+    def run(
+        self,
+        q_nope_absorbed: torch.Tensor,
+        q_rope: torch.Tensor,
+        view: DecodeComputeView,
+        output: torch.Tensor,
+        *,
+        validation_scope: object | None = None,
+    ) -> torch.Tensor:
+        payload = self._validate_run_inputs(
+            q_nope_absorbed,
+            q_rope,
+            view,
+            output,
+        )
+        self._validate_metadata(
+            view,
+            payload,
+            validation_scope=validation_scope,
+        )
+        launch_config = self._launch_config_for(
+            batch_size=int(q_nope_absorbed.shape[0]),
+            max_context_len=view.meta.max_context_len,
+            active_slot_width=int(view.meta.active_slots.shape[1]),
+        )
         return run_mla_decode(
             q_nope_absorbed,
             q_rope,
@@ -340,17 +384,194 @@ class MlaTritonProvider(MlaAttentionProvider):
             softmax_scale=self.spec.softmax_scale,
             attn_score=view.meta.attn_score,
             max_context_len=view.meta.max_context_len,
-            config=self.launch_config,
+            config=launch_config,
             validate_metadata=False,
         )
 
+
+@MLA_ATTENTION_REGISTRY.register
+class MlaSglFa3Provider(MlaTritonProvider):
+    """SGL FA3 decode with the score-producing Triton path kept explicit."""
+
+    name = "sgl_fa3_h100"
+    priority = 200
+    supports_explicit_prefill = True
+
+    def __init__(
+        self,
+        *,
+        op_spec: MlaAttentionOpSpec,
+        device: torch.device | str,
+        max_batch_size: int,
+        launch_config: MlaDecodeLaunchConfig | None = None,
+    ) -> None:
+        super().__init__(
+            op_spec=op_spec,
+            device=device,
+            max_batch_size=max_batch_size,
+            launch_config=launch_config,
+        )
+        self.fa3 = SglFa3DecodeKernel(
+            device=self.device,
+            max_batch_size=self.max_batch_size,
+            softmax_scale=self.spec.softmax_scale,
+        )
+
+    @classmethod
+    def supports(
+        cls,
+        spec: MlaAttentionOpSpec,
+        caps: DeviceCaps,
+    ) -> SupportResult:
+        base = MlaTritonProvider.supports(spec, caps)
+        if not base.supported:
+            return base
+        supported, reason = sgl_fa3_support()
+        return SupportResult.yes(reason) if supported else SupportResult.no(reason)
+
+    @torch.no_grad()
+    def run(
+        self,
+        q_nope_absorbed: torch.Tensor,
+        q_rope: torch.Tensor,
+        view: DecodeComputeView,
+        output: torch.Tensor,
+        *,
+        validation_scope: object | None = None,
+    ) -> torch.Tensor:
+        if view.meta.attn_score is not None:
+            return super().run(
+                q_nope_absorbed,
+                q_rope,
+                view,
+                output,
+                validation_scope=validation_scope,
+            )
+        payload = self._validate_run_inputs(
+            q_nope_absorbed,
+            q_rope,
+            view,
+            output,
+        )
+        self._validate_metadata(
+            view,
+            payload,
+            validation_scope=validation_scope,
+        )
+        return self.fa3(
+            q_rope,
+            q_nope_absorbed,
+            payload.rope_cache,
+            payload.latent_cache,
+            view.meta.active_slots,
+            view.meta.req_indices,
+            view.meta.context_lens,
+            output,
+            num_splits=5,
+            validation_scope=validation_scope,
+        )
+
+    @torch.no_grad()
+    def run_explicit_prefill(
+        self,
+        q: torch.Tensor,
+        view: PrefillComputeView,
+        output: torch.Tensor,
+        *,
+        cu_seqlens_q: torch.Tensor,
+        max_seqlen_q: int,
+        validation_scope: object | None = None,
+    ) -> torch.Tensor:
+        if not isinstance(view, PrefillComputeView):
+            raise TypeError(
+                "MlaSglFa3Provider.run_explicit_prefill requires "
+                "PrefillComputeView, got "
+                f"{type(view).__name__}."
+            )
+        if not isinstance(view.payload, ExplicitKVPayload):
+            raise TypeError(
+                "MLA explicit prefill requires ExplicitKVPayload, got "
+                f"{type(view.payload).__name__}."
+            )
+        query_tokens = int(q.shape[0])
+        expected_q_shape = (
+            query_tokens,
+            self.spec.local_q_heads,
+            self.spec.qk_head_dim,
+        )
+        if tuple(q.shape) != expected_q_shape:
+            raise ValueError(
+                f"q must have shape {expected_q_shape}, got {tuple(q.shape)}."
+            )
+        expected_output_shape = (
+            query_tokens,
+            self.spec.local_q_heads,
+            self.spec.value_head_dim,
+        )
+        if tuple(output.shape) != expected_output_shape:
+            raise ValueError(
+                f"output must have shape {expected_output_shape}, got "
+                f"{tuple(output.shape)}."
+            )
+        batch_size = int(view.meta.context_lens.numel())
+        if batch_size > self.max_batch_size:
+            raise ValueError(
+                "MLA prefill batch exceeds provider capacity: "
+                f"batch={batch_size} max_batch_size={self.max_batch_size}."
+            )
+        if cu_seqlens_q.shape != (batch_size + 1,):
+            raise ValueError(
+                f"cu_seqlens_q must have shape ({batch_size + 1},), got "
+                f"{tuple(cu_seqlens_q.shape)}."
+            )
+        if cu_seqlens_q.device != self.device or cu_seqlens_q.dtype != torch.int32:
+            raise TypeError(
+                "cu_seqlens_q must be int32 on the provider device, got "
+                f"{cu_seqlens_q.device}/{cu_seqlens_q.dtype}."
+            )
+        if not 0 < int(max_seqlen_q) <= query_tokens:
+            raise ValueError(
+                "max_seqlen_q must be in [1, query_tokens], got "
+                f"{max_seqlen_q} for {query_tokens}."
+            )
+        payload = view.payload
+        tensors = {
+            "q": q,
+            "output": output,
+            "k_cache": payload.k_cache,
+            "v_cache": payload.v_cache,
+        }
+        for name, tensor in tensors.items():
+            if tensor.device != self.device:
+                raise ValueError(
+                    f"{name} is on {tensor.device}, expected {self.device}."
+                )
+            expected_dtype = (
+                self.spec.activation_dtype
+            )
+            if tensor.dtype != expected_dtype:
+                raise TypeError(
+                    f"{name} must use {expected_dtype}, got {tensor.dtype}."
+                )
+        return self.fa3.run_explicit_varlen(
+            q,
+            payload.k_cache,
+            payload.v_cache,
+            view.meta.active_slots,
+            view.meta.req_indices,
+            view.meta.context_lens,
+            output,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=int(max_seqlen_q),
+            validation_scope=validation_scope,
+        )
 
 def resolve_mla_attention_provider(
     spec: MlaAttentionOpSpec,
     *,
     device: torch.device | str,
     max_batch_size: int,
-    launch_config: MlaDecodeLaunchConfig = DEFAULT_GLM_MLA_DECODE_CONFIG,
+    launch_config: MlaDecodeLaunchConfig | None = None,
 ) -> MlaAttentionProvider:
     """Resolve and bind an MLA provider during model construction."""
 
@@ -371,6 +592,7 @@ __all__ = [
     "MLA_ATTENTION_REGISTRY",
     "MlaAttentionOpSpec",
     "MlaAttentionProvider",
+    "MlaSglFa3Provider",
     "MlaTritonProvider",
     "resolve_mla_attention_provider",
 ]

@@ -3,6 +3,7 @@
 from .copy_latent import copy_latent_to_cache, validate_copy_slot_mapping
 from .decode_schedule import (
     DEFAULT_GLM_MLA_DECODE_CONFIG,
+    GLM_MLA_MAX_WORKSPACE_CONFIG,
     GLM_MLA_SOFTMAX_SCALE,
     MlaDecodeLaunchConfig,
     MlaDecodeWorkspace,
@@ -10,6 +11,7 @@ from .decode_schedule import (
     prepare_mla_decode_schedule,
     required_workspace_blocks,
     run_mla_decode,
+    select_glm_mla_decode_config,
     validate_mla_decode_metadata,
 )
 from .decode_stage1 import MLA_LATENT_DIM, MLA_ROPE_DIM, decode_stage1
@@ -21,6 +23,7 @@ from .gather_latent import (
 
 __all__ = [
     "DEFAULT_GLM_MLA_DECODE_CONFIG",
+    "GLM_MLA_MAX_WORKSPACE_CONFIG",
     "GLM_MLA_SOFTMAX_SCALE",
     "MLA_LATENT_DIM",
     "MLA_ROPE_DIM",
@@ -34,6 +37,7 @@ __all__ = [
     "prepare_mla_decode_schedule",
     "required_workspace_blocks",
     "run_mla_decode",
+    "select_glm_mla_decode_config",
     "validate_copy_slot_mapping",
     "validate_gather_metadata",
     "validate_mla_decode_metadata",

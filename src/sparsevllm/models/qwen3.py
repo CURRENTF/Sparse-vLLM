@@ -169,6 +169,7 @@ class Qwen3MLP(nn.Module):
         hidden_act: str,
         mlp_chunk_size: int = 16384,
         quantization=None,
+        reduce_results: bool = True,
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
@@ -182,6 +183,7 @@ class Qwen3MLP(nn.Module):
             hidden_size,
             bias=False,
             quantization=quantization,
+            reduce_results=reduce_results,
         )
         assert hidden_act == "silu"
         self.act_fn = SiluAndMul()

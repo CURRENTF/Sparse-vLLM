@@ -34,6 +34,7 @@ from sparsevllm.models.glm4_moe_lite import (
 from sparsevllm.models.qwen3 import Qwen3MLP
 from sparsevllm.operators.mla_attention import MlaAttentionOpSpec
 from sparsevllm.operators.moe import TritonMoeProvider
+from sparsevllm.platforms import device_runtime
 
 
 def _config(**overrides) -> Glm4MoeLiteConfig:
@@ -225,6 +226,45 @@ def test_glm_tp_projection_slices_follow_local_heads() -> None:
     assert torch.equal(attention.o_proj.weight, o_source[:, 2560:3840])
 
 
+def test_glm_qkv_a_projection_loads_and_executes_as_one_gemm() -> None:
+    config = _config()
+    context = _tp_context()
+    with _construction_context(context):
+        attention = Glm4MoeLiteAttention(
+            config,
+            _fake_mla(),
+            projection_chunk_size=config.mlp_chunk_size,
+        )
+
+    torch.manual_seed(23)
+    q_weight = torch.randn(config.q_lora_rank, config.hidden_size)
+    kv_output_size = config.kv_lora_rank + config.qk_rope_head_dim
+    kv_weight = torch.randn(kv_output_size, config.hidden_size)
+    projection = attention.fused_qkv_a_proj
+    projection.weight_loader(projection.weight, q_weight, 0)
+    projection.weight_loader(projection.weight, kv_weight, 1)
+
+    q_weight = q_weight.to(dtype=projection.weight.dtype)
+    kv_weight = kv_weight.to(dtype=projection.weight.dtype)
+    hidden_states = torch.randn(
+        5,
+        config.hidden_size,
+        dtype=projection.weight.dtype,
+    )
+    actual_q, actual_kv = projection(hidden_states).split(
+        [config.q_lora_rank, kv_output_size],
+        dim=-1,
+    )
+    torch.testing.assert_close(actual_q, F.linear(hidden_states, q_weight))
+    torch.testing.assert_close(actual_kv, F.linear(hidden_states, kv_weight))
+    assert Glm4MoeLiteForCausalLM.packed_modules_mapping[
+        "self_attn.q_a_proj"
+    ] == ("self_attn.fused_qkv_a_proj", 0)
+    assert Glm4MoeLiteForCausalLM.packed_modules_mapping[
+        "self_attn.kv_a_proj_with_mqa"
+    ] == ("self_attn.fused_qkv_a_proj", 1)
+
+
 def test_glm_decode_absorption_and_value_reconstruction_match_linear_algebra() -> None:
     config = _config()
     context = _tp_context()
@@ -395,7 +435,11 @@ def test_glm_sparse_moe_reduces_pure_ep_over_world(ep_size: int) -> None:
         assert all_reduce.call_args.kwargs["group"] is context.world.process_group
 
 
-def test_glm_sparse_moe_reduces_pure_tp_over_world() -> None:
+@pytest.mark.parametrize(("is_prefill", "expected_reductions"), [(False, 1), (True, 1)])
+def test_glm_sparse_moe_reduces_pure_tp_over_world(
+    is_prefill: bool,
+    expected_reductions: int,
+) -> None:
     moe_tp_process_group = object()
     context = ParallelContext(
         world=ParallelGroup(moe_tp_process_group, (0, 1), 0, 2),
@@ -412,12 +456,21 @@ def test_glm_sparse_moe_reduces_pure_tp_over_world() -> None:
     block._routed_chunk = lambda hidden_states: hidden_states.clone()
     hidden_states = torch.arange(8, dtype=torch.float32).reshape(2, 4)
 
-    with patch.object(dist, "all_reduce") as all_reduce:
+    with (
+        patch.object(dist, "all_reduce") as all_reduce,
+        patch(
+            "sparsevllm.models.glm4_moe_lite.get_context",
+            return_value=SimpleNamespace(is_prefill=is_prefill),
+        ),
+    ):
         output = block(hidden_states)
 
     torch.testing.assert_close(output, hidden_states * 2)
-    all_reduce.assert_called_once()
-    assert all_reduce.call_args.kwargs["group"] is context.world.process_group
+    assert all_reduce.call_count == expected_reductions
+    assert all(
+        call.kwargs["group"] is context.world.process_group
+        for call in all_reduce.call_args_list
+    )
 
 
 def test_glm_sparse_moe_reduces_hybrid_tp_ep_shards_over_outer_world() -> None:
@@ -475,10 +528,18 @@ def test_glm_moe_debug_contract_populates_model_runner_summaries() -> None:
     block.shared_experts = nn.Identity()
     hidden_states = torch.arange(8, dtype=torch.float32).reshape(2, 4)
 
-    with patch.dict(os.environ, {"SPARSEVLLM_DEBUG_MOE": "1"}):
+    with (
+        patch.dict(os.environ, {"SPARSEVLLM_DEBUG_MOE": "1"}),
+        patch.object(
+            device_runtime,
+            "is_stream_capturing",
+            return_value=True,
+        ),
+    ):
         output = block(hidden_states)
 
     torch.testing.assert_close(output, hidden_states * 3)
+    assert isinstance(block.debug_last_local_hit_count, torch.Tensor)
     torch.testing.assert_close(block.debug_last_local_output, hidden_states * 2)
     torch.testing.assert_close(block.debug_last_routed_output, hidden_states * 2)
     torch.testing.assert_close(block.debug_last_output, output)

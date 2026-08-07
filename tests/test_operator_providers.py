@@ -453,6 +453,68 @@ def test_hopper_fused_moe_uses_profiled_tp_ep_shape():
     assert resolved.provider.name == "triton_hopper_fused"
 
 
+def test_glm_tp2_moe_uses_sgl_aligned_provider():
+    spec = _moe_spec(
+        activation_dtype=torch.bfloat16,
+        weight_dtype=torch.bfloat16,
+        block_shape=None,
+        hidden_size=2048,
+        intermediate_size=768,
+        num_local_experts=64,
+        num_experts=64,
+        top_k=4,
+        ep_size=1,
+        tp_size=2,
+        routing_method="biased_sigmoid",
+    )
+
+    with patch(
+        "sparsevllm.operators.sgl_moe.sgl_moe_alignment_support",
+        return_value=(True, "available"),
+    ):
+        resolved = OpResolver(MOE_REGISTRY).resolve(
+            spec,
+            _cuda_caps(
+                (9, 0),
+                native_fp8=False,
+                device_name="NVIDIA H100 80GB HBM3",
+            ),
+        )
+
+    assert resolved.provider.name == "sgl_aligned_triton_glm"
+
+
+def test_glm_tp2_fused_shared_decode_uses_sgl_aligned_provider():
+    spec = _moe_spec(
+        activation_dtype=torch.bfloat16,
+        weight_dtype=torch.bfloat16,
+        block_shape=None,
+        hidden_size=2048,
+        intermediate_size=768,
+        num_local_experts=65,
+        num_experts=65,
+        top_k=5,
+        ep_size=1,
+        tp_size=2,
+        routing_method="biased_sigmoid",
+    )
+
+    with patch(
+        "sparsevllm.operators.sgl_moe.sgl_moe_alignment_support",
+        return_value=(True, "available"),
+    ):
+        resolved = OpResolver(MOE_REGISTRY).resolve(
+            spec,
+            _cuda_caps(
+                (9, 0),
+                native_fp8=False,
+                device_name="NVIDIA H100 80GB HBM3",
+            ),
+        )
+
+    assert resolved.provider.name == "sgl_aligned_triton_glm"
+
+
 @pytest.mark.parametrize(
     ("tp_size", "ep_size", "intermediate_size", "num_local_experts"),
     [(1, 1, 512, 256), (2, 1, 256, 256), (1, 2, 512, 128)],

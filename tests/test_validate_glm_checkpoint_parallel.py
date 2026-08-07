@@ -1,10 +1,44 @@
 from __future__ import annotations
 
+import subprocess
+from pathlib import Path
+
 import pytest
 
 from scripts.validation.validate_glm_checkpoint_parallel import (
+    REPO_ROOT,
+    _git_output,
     _validate_parallel_evidence,
 )
+
+
+def test_git_provenance_is_resolved_from_repository_root(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    assert _git_output("rev-parse", "--show-toplevel") == str(REPO_ROOT)
+
+
+def test_git_provenance_failure_is_explicit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail(*args, **kwargs):
+        del args, kwargs
+        raise subprocess.CalledProcessError(
+            returncode=128,
+            cmd=["git", "rev-parse", "HEAD"],
+            stderr="fatal: unavailable repository",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fail)
+
+    with pytest.raises(
+        RuntimeError,
+        match="Git provenance command failed.*fatal: unavailable repository",
+    ):
+        _git_output("rev-parse", "HEAD")
 
 
 def _graph_summary(enabled: bool = False) -> dict:

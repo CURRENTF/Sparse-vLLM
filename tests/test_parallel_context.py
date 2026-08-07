@@ -231,6 +231,81 @@ def test_ep_broadcast_rejects_invalid_source_rank():
         context.ep_broadcast(torch.tensor([1.0]), src_ep_rank=4)
 
 
+def test_small_out_of_place_all_reduce_uses_bound_provider():
+    ranks = (0, 1)
+    group = ParallelGroup(object(), ranks, 0, 2)
+    reduced = torch.tensor([3.0])
+    provider = SimpleNamespace(
+        group=group,
+        all_reduce=Mock(return_value=reduced),
+    )
+    context = ParallelContext(
+        world=group,
+        tensor=group,
+        expert=ParallelGroup(None, (0,), 0, 1),
+        data=ParallelGroup(None, (0,), 0, 1),
+        all_reduce_provider=provider,
+    )
+    tensor = torch.tensor([1.0])
+
+    with patch.object(dist, "all_reduce") as nccl_all_reduce:
+        output = context.tp_all_reduce_out_of_place(tensor)
+
+    assert output is reduced
+    provider.all_reduce.assert_called_once_with(tensor)
+    nccl_all_reduce.assert_not_called()
+
+
+def test_small_out_of_place_all_reduce_falls_back_to_nccl():
+    ranks = (0, 1)
+    group = ParallelGroup(object(), ranks, 0, 2)
+    provider = SimpleNamespace(group=group, all_reduce=Mock(return_value=None))
+    context = ParallelContext(
+        world=group,
+        tensor=group,
+        expert=ParallelGroup(None, (0,), 0, 1),
+        data=ParallelGroup(None, (0,), 0, 1),
+        all_reduce_provider=provider,
+    )
+    tensor = torch.tensor([1.0])
+
+    with patch.object(dist, "all_reduce") as nccl_all_reduce:
+        output = context.world_all_reduce_out_of_place(tensor)
+
+    assert output is tensor
+    nccl_all_reduce.assert_called_once_with(
+        tensor,
+        op=dist.ReduceOp.SUM,
+        group=group.process_group,
+    )
+
+
+def test_all_reduce_capture_and_close_delegate_to_provider():
+    group = ParallelGroup(None, (0,), 0, 1)
+    capture = Mock()
+    capture.return_value.__enter__ = Mock(return_value=None)
+    capture.return_value.__exit__ = Mock(return_value=False)
+    provider = SimpleNamespace(
+        group=group,
+        capture=capture,
+        close=Mock(),
+    )
+    context = ParallelContext(
+        world=group,
+        tensor=group,
+        expert=group,
+        data=group,
+        all_reduce_provider=provider,
+    )
+
+    with context.all_reduce_capture():
+        pass
+    context.close_all_reduce_provider()
+
+    capture.assert_called_once_with()
+    provider.close.assert_called_once_with()
+
+
 def test_qwen3_moe_parallel_config_validation(tmp_path):
     with patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", return_value=_hf_config()):
         config = Config(model=str(tmp_path), expert_parallel_size=4)
@@ -404,6 +479,25 @@ def test_parallel_group_uses_bound_all_reduce_provider():
 
     assert actual is output_tensor
     provider.run.assert_called_once_with(input_tensor)
+
+
+def test_vocab_parallel_embedding_uses_out_of_place_reduction():
+    reduced = torch.randn(2, 4)
+    context = SimpleNamespace(
+        tp_rank=0,
+        tp_size=2,
+        tp_all_reduce_out_of_place=Mock(return_value=reduced),
+    )
+    with patch(
+        "sparsevllm.layers.embed_head.get_parallel_context",
+        return_value=context,
+    ):
+        embedding = VocabParallelEmbedding(8, 4)
+
+    output = embedding(torch.tensor([0, 5]))
+
+    assert output is reduced
+    context.tp_all_reduce_out_of_place.assert_called_once()
 
 
 def test_cache_kv_heads_depend_on_tp_not_ep():

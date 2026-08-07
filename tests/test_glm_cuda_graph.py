@@ -249,6 +249,7 @@ def _make_glm_graph_lane(
         is_long_text_batch=lambda seqs, is_prefill: False,
         method="",
         rank=0,
+        parallel_context=parallel_context,
         capture_sizes=[1],
         context_sizes=[128],
     )
@@ -558,6 +559,7 @@ def _make_glm_full_graph_lane(
         is_long_text_batch=lambda seqs, is_prefill: False,
         method="",
         rank=0,
+        parallel_context=parallel_context,
         capture_sizes=[1],
         context_sizes=[128],
     )
@@ -1117,6 +1119,7 @@ def _make_glm_method_graph_lane(
         is_long_text_batch=lambda seqs, is_prefill: True,
         method=method,
         rank=0,
+        parallel_context=parallel_context,
         capture_sizes=[1],
         context_sizes=[16],
     )

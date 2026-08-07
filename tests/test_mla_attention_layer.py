@@ -40,6 +40,30 @@ class _TestProvider(MlaAttentionProvider):
         self.max_batch_size = int(max_batch_size)
 
 
+class _ExplicitPrefillProvider(_TestProvider):
+    supports_explicit_prefill = True
+
+    def run_explicit_prefill(
+        self,
+        q,
+        view,
+        output,
+        *,
+        cu_seqlens_q,
+        max_seqlen_q,
+        validation_scope=None,
+    ):
+        self.prefill_call = {
+            "q": q,
+            "view": view,
+            "cu_seqlens_q": cu_seqlens_q,
+            "max_seqlen_q": max_seqlen_q,
+            "validation_scope": validation_scope,
+        }
+        output.copy_(q)
+        return output
+
+
 def _spec(tp_size: int = 4) -> MlaAttentionOpSpec:
     return MlaAttentionOpSpec(
         num_q_heads=20,
@@ -365,6 +389,45 @@ def test_mla_prefill_exposes_expanded_explicit_score_view() -> None:
     assert score_view.meta.req_indices is history.local_req_indices
     assert score_view.meta.context_lens is history.context_lens
     assert score_view.meta.max_context_len == history.max_context_len
+
+
+def test_mla_prefill_dispatches_explicit_provider_with_shared_cu_seqlens() -> None:
+    spec = _spec()
+    provider = _ExplicitPrefillProvider(spec, device="cpu", max_batch_size=4)
+    attention = MLAAttention(
+        spec=spec,
+        provider=provider,
+        prefill_workspace_bytes=64 * 1024 * 1024,
+        hidden_size=64,
+        projection_chunk_size=8,
+    )
+    view = _view(
+        torch.empty(2, 1, 512, dtype=torch.bfloat16),
+        torch.empty(2, 1, 64, dtype=torch.bfloat16),
+        torch.tensor([[0, 1]], dtype=torch.int32),
+        torch.tensor([0], dtype=torch.int32),
+        torch.tensor([2], dtype=torch.int32),
+    )
+    with patch("sparsevllm.layers.mla_attention.gather_latent_history"):
+        history = attention.prepare_prefill_history(view, query_tokens=2)
+    workset = _expand_history(attention, history)
+    q = torch.randn(2, 5, 256, dtype=torch.bfloat16)
+    cu_seqlens_q = torch.tensor([0, 2], dtype=torch.int32)
+    set_context(True, cu_seqlens_q=cu_seqlens_q)
+    try:
+        output = attention.run_prefill(
+            q,
+            workset,
+            b_start_loc=cu_seqlens_q[:-1],
+            chunk_lens=cu_seqlens_q[1:] - cu_seqlens_q[:-1],
+        )
+    finally:
+        reset_context()
+
+    torch.testing.assert_close(output, q)
+    assert provider.prefill_call["view"].payload.k_cache is workset.expanded_k
+    assert provider.prefill_call["cu_seqlens_q"] is cu_seqlens_q
+    assert provider.prefill_call["max_seqlen_q"] == 2
 
 
 def test_mla_materializes_actual_keys_for_permuted_slots() -> None:

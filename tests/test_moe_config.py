@@ -47,6 +47,27 @@ def test_moe_config_rejects_unknown_stage():
         resolve_moe_gemm_config(**arguments, stage="w3")
 
 
+def test_glm_fused_shared_decode_reuses_profiled_tile():
+    config = resolve_moe_gemm_config(
+        dtype=torch.bfloat16,
+        num_tokens=32,
+        top_k=5,
+        num_local_experts=65,
+        hidden_size=2048,
+        intermediate_size=768,
+        stage="w2",
+        device_name="NVIDIA H100 80GB HBM3",
+        device_capability=(9, 0),
+    )
+
+    assert (
+        config.block_m,
+        config.block_n,
+        config.block_k,
+        config.group_m,
+    ) == (16, 64, 128, 16)
+
+
 def test_h100_tp_ep_fused_gate_up_uses_dedicated_profile():
     common = dict(
         dtype=torch.bfloat16,
@@ -349,3 +370,37 @@ def test_fp8_routed_unknown_shape_uses_explicit_default():
     )
 
     assert (config.block_n, config.block_k, config.swap_ab) == (128, 128, False)
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "expected"),
+    [
+        (32, (16, 64, 128, 16)),
+        (64, (64, 128, 64, 8)),
+        (512, (64, 128, 64, 1)),
+        (1024, (128, 128, 64, 1)),
+        (65536, (128, 128, 64, 1)),
+    ],
+)
+def test_glm_h100_tp2_profile_covers_decode_and_large_prefill(
+    num_tokens,
+    expected,
+):
+    common = dict(
+        dtype=torch.bfloat16,
+        num_tokens=num_tokens,
+        top_k=4,
+        num_local_experts=64,
+        hidden_size=2048,
+        intermediate_size=768,
+        device_name="NVIDIA H100 80GB HBM3",
+        device_capability=(9, 0),
+    )
+    for stage in ("w13", "w2"):
+        config = resolve_moe_gemm_config(**common, stage=stage)
+        assert (
+            config.block_m,
+            config.block_n,
+            config.block_k,
+            config.group_m,
+        ) == expected

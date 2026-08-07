@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
@@ -25,6 +26,89 @@ class MoeAlignment:
     num_tokens_post_padded: torch.Tensor
     block_size: int
     naive: bool
+
+
+@triton.jit
+def _append_shared_expert_route_kernel(
+    input_ids_ptr,
+    input_weights_ptr,
+    output_ids_ptr,
+    output_weights_ptr,
+    shared_expert_id: tl.constexpr,
+    INPUT_TOP_K: tl.constexpr,
+    OUTPUT_TOP_K: tl.constexpr,
+    BLOCK_TOP_K: tl.constexpr,
+):
+    token_id = tl.program_id(0)
+    route_offsets = tl.arange(0, BLOCK_TOP_K)
+    input_offsets = token_id * INPUT_TOP_K + route_offsets
+    output_offsets = token_id * OUTPUT_TOP_K + route_offsets
+    routed = route_offsets < INPUT_TOP_K
+    route_ids = tl.load(input_ids_ptr + input_offsets, mask=routed, other=0)
+    route_weights = tl.load(
+        input_weights_ptr + input_offsets,
+        mask=routed,
+        other=0.0,
+    )
+    route_ids = tl.where(routed, route_ids, shared_expert_id)
+    route_weights = tl.where(routed, route_weights, 1.0)
+    output_mask = route_offsets < OUTPUT_TOP_K
+    tl.store(output_ids_ptr + output_offsets, route_ids, mask=output_mask)
+    tl.store(output_weights_ptr + output_offsets, route_weights, mask=output_mask)
+
+
+def append_shared_expert_route(
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    *,
+    shared_expert_id: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Append one always-active shared expert in one graph-safe kernel."""
+
+    if not topk_ids.is_cuda or not topk_weights.is_cuda:
+        raise ValueError("Shared-expert route packing requires CUDA tensors.")
+    if topk_ids.device != topk_weights.device:
+        raise ValueError("Shared-expert route tensors must share one device.")
+    if topk_ids.ndim != 2 or topk_weights.shape != topk_ids.shape:
+        raise ValueError(
+            "Shared-expert route tensors must share [tokens, top_k] shape."
+        )
+    if topk_ids.dtype not in (torch.int32, torch.int64):
+        raise TypeError("Shared-expert route IDs must use int32 or int64.")
+    if topk_weights.dtype not in (*_SUPPORTED_DTYPES, torch.float32):
+        raise TypeError("Shared-expert route weights must use BF16, FP16, or FP32.")
+    if not topk_ids.is_contiguous() or not topk_weights.is_contiguous():
+        raise ValueError("Shared-expert route tensors must be contiguous.")
+    if topk_ids.shape[0] <= 0 or topk_ids.shape[1] <= 0:
+        raise ValueError("Shared-expert route tensors must be non-empty.")
+    shared_expert_id = int(shared_expert_id)
+    if shared_expert_id < 0:
+        raise ValueError("shared_expert_id must be non-negative.")
+
+    tokens, input_top_k = map(int, topk_ids.shape)
+    output_top_k = input_top_k + 1
+    output_ids = torch.empty(
+        (tokens, output_top_k),
+        dtype=topk_ids.dtype,
+        device=topk_ids.device,
+    )
+    output_weights = torch.empty(
+        (tokens, output_top_k),
+        dtype=topk_weights.dtype,
+        device=topk_weights.device,
+    )
+    _append_shared_expert_route_kernel[(tokens,)](
+        topk_ids,
+        topk_weights,
+        output_ids,
+        output_weights,
+        shared_expert_id=shared_expert_id,
+        INPUT_TOP_K=input_top_k,
+        OUTPUT_TOP_K=output_top_k,
+        BLOCK_TOP_K=triton.next_power_of_2(output_top_k),
+        num_warps=1,
+    )
+    return output_ids, output_weights
 
 
 @triton.jit(
@@ -1084,6 +1168,7 @@ def fused_moe(
     local_expert_start: int,
     output_dtype: torch.dtype | None = None,
     _fuse_gate_up_swiglu: bool = False,
+    alignment_impl: Callable[..., MoeAlignment] | None = None,
 ) -> torch.Tensor:
     """Run unquantized routed experts with a generic Triton MoE pipeline.
 
@@ -1126,7 +1211,9 @@ def fused_moe(
         device_name=device_name,
         device_capability=capability,
     ).as_triton_kwargs()
-    alignment = _prepare_expert_assignment(
+    if alignment_impl is None:
+        alignment_impl = _prepare_expert_assignment
+    alignment = alignment_impl(
         topk_ids,
         block_size=w13_config["BLOCK_SIZE_M"],
         num_experts=num_experts,

@@ -98,6 +98,7 @@ class _MlaPrefillQueryPlan:
     validation_scope: object
     source_context_lens: torch.Tensor
     query_tokens: int
+    max_query_len: int
 
     def matches(
         self,
@@ -328,6 +329,10 @@ class MLAAttention:
     @property
     def device(self) -> torch.device:
         return torch.device(getattr(self.provider, "device"))
+
+    @property
+    def supports_explicit_prefill(self) -> bool:
+        return bool(getattr(self.provider, "supports_explicit_prefill", False))
 
     def _require_mla_payload(
         self,
@@ -721,6 +726,8 @@ class MLAAttention:
                 f"q={q.device}/{q.dtype} expected="
                 f"{self.device}/{self.spec.activation_dtype}."
             )
+        query_tokens = int(q.shape[0])
+        validation_scope = get_context().attention_validation_scope
         batch_size = int(history.context_lens.numel())
         for name, tensor in (
             ("b_start_loc", b_start_loc),
@@ -736,8 +743,6 @@ class MLAAttention:
                     f"{name} must be int32 on {self.device}, got "
                     f"{tensor.device}/{tensor.dtype}."
                 )
-        validation_scope = get_context().attention_validation_scope
-        query_tokens = int(q.shape[0])
         cached_query_plan = self._prefill_query_plan
         if cached_query_plan is None or not cached_query_plan.matches(
             validation_scope,
@@ -770,9 +775,33 @@ class MLAAttention:
                 validation_scope=validation_scope,
                 source_context_lens=history.context_lens,
                 query_tokens=query_tokens,
+                max_query_len=max(chunks),
             )
 
         explicit_view = self.build_prefill_explicit_view(workset)
+        if self.supports_explicit_prefill:
+            run_prefill = getattr(self.provider, "run_explicit_prefill", None)
+            if not callable(run_prefill):
+                raise RuntimeError(
+                    f"MLA provider {self.provider.name!r} advertises explicit "
+                    "prefill without a run_explicit_prefill implementation."
+                )
+            cu_seqlens_q = get_context().cu_seqlens_q
+            if cu_seqlens_q is None:
+                raise RuntimeError("MLA explicit prefill requires cu_seqlens_q.")
+            output = torch.empty(
+                (query_tokens, self.spec.local_q_heads, self.spec.value_head_dim),
+                dtype=q.dtype,
+                device=q.device,
+            )
+            return run_prefill(
+                q,
+                explicit_view,
+                output,
+                cu_seqlens_q=cu_seqlens_q,
+                max_seqlen_q=self._prefill_query_plan.max_query_len,
+                validation_scope=validation_scope,
+            )
         return self.prefill_backend.run_prefill(
             q,
             explicit_view,
@@ -826,7 +855,6 @@ class MLAAttention:
             output,
             validation_scope=get_context().attention_validation_scope,
         )
-
 
 __all__ = [
     "MLAAttention",

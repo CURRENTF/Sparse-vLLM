@@ -14,11 +14,15 @@ from sparsevllm.engine.cache_manager import (
 from sparsevllm.operators.mla_attention import (
     MLA_ATTENTION_REGISTRY,
     MlaAttentionOpSpec,
+    MlaSglFa3Provider,
     MlaTritonProvider,
 )
 from sparsevllm.operators.registry import OpResolver
 from sparsevllm.platforms import DeviceCaps, PlatformEnum
-from sparsevllm.triton_kernel.mla import MlaDecodeWorkspace
+from sparsevllm.triton_kernel.mla import (
+    GLM_MLA_MAX_WORKSPACE_CONFIG,
+    MlaDecodeWorkspace,
+)
 
 
 def _spec(**overrides) -> MlaAttentionOpSpec:
@@ -93,10 +97,16 @@ def test_mla_resolver_selects_h100_triton_provider() -> None:
     spec = _spec()
     workspace = _cpu_workspace(batch_size=8, head_count=spec.local_q_heads)
 
-    with patch(
-        "sparsevllm.operators.mla_attention.allocate_mla_decode_workspace",
-        return_value=workspace,
-    ) as allocate:
+    with (
+        patch(
+            "sparsevllm.operators.mla_attention.sgl_fa3_support",
+            return_value=(False, "sgl-kernel is not installed"),
+        ),
+        patch(
+            "sparsevllm.operators.mla_attention.allocate_mla_decode_workspace",
+            return_value=workspace,
+        ) as allocate,
+    ):
         resolved = OpResolver(MLA_ATTENTION_REGISTRY).resolve(
             spec,
             _h100_caps(),
@@ -106,13 +116,42 @@ def test_mla_resolver_selects_h100_triton_provider() -> None:
         )
 
     assert isinstance(resolved.provider, MlaTritonProvider)
-    assert resolved.rejected == ()
+    assert resolved.rejected == (
+        ("sgl_fa3_h100", "sgl-kernel is not installed"),
+    )
     allocate.assert_called_once_with(
         batch_size=8,
         head_count=5,
         device=torch.device("cpu"),
-        config=resolved.provider.launch_config,
+        config=GLM_MLA_MAX_WORKSPACE_CONFIG,
     )
+
+
+def test_mla_resolver_prefers_sgl_fa3_when_available() -> None:
+    spec = _spec()
+    workspace = _cpu_workspace(batch_size=8, head_count=spec.local_q_heads)
+
+    with (
+        patch(
+            "sparsevllm.operators.mla_attention.sgl_fa3_support",
+            return_value=(True, "validated test API"),
+        ),
+        patch(
+            "sparsevllm.operators.mla_attention.allocate_mla_decode_workspace",
+            return_value=workspace,
+        ),
+        patch("sparsevllm.operators.mla_attention.SglFa3DecodeKernel"),
+    ):
+        resolved = OpResolver(MLA_ATTENTION_REGISTRY).resolve(
+            spec,
+            _h100_caps(),
+            op_spec=spec,
+            device="cpu",
+            max_batch_size=8,
+        )
+
+    assert type(resolved.provider) is MlaSglFa3Provider
+    assert resolved.rejected == ()
 
 
 def test_mla_resolver_accepts_cuda_graph_after_capture_gate() -> None:

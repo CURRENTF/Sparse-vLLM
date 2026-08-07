@@ -88,6 +88,7 @@ class DecodeCudaGraphRunner:
         is_long_text_batch: Callable[[list[Sequence], bool], bool],
         method: str,
         rank: int,
+        parallel_context,
         capture_sizes: list[int],
         context_sizes: list[int] | tuple[int, ...] | str | int | None = None,
         graph_pool=None,
@@ -100,6 +101,7 @@ class DecodeCudaGraphRunner:
         self.is_long_text_batch = is_long_text_batch
         self.method = str(method or "")
         self.rank = int(rank)
+        self.parallel_context = parallel_context
         self.platform = platforms.current_platform
         self.capture_sizes = sorted(set(int(size) for size in capture_sizes))
         if not self.capture_sizes or any(size <= 0 for size in self.capture_sizes):
@@ -438,15 +440,16 @@ class DecodeCudaGraphRunner:
             graph_input_sparse_state_refs = self._snapshot_sparse_state_refs()
             graph = torch.cuda.CUDAGraph()
             try:
-                with torch.cuda.graph(graph, pool=self.graph_pool):
-                    self._reset_graph_input_attn_scores(graph_input_sparse_state_refs)
-                    logits = self.run_model(input_ids, positions, is_prefill=False)
-                    if state.key.capture_sampling:
-                        if logits is None:
-                            raise RuntimeError("decode_cuda_graph capture_sampling requires rank-0 logits.")
-                        token_ids = logits.argmax(dim=-1)
-                    else:
-                        token_ids = None
+                with self.parallel_context.all_reduce_capture():
+                    with torch.cuda.graph(graph, pool=self.graph_pool):
+                        self._reset_graph_input_attn_scores(graph_input_sparse_state_refs)
+                        logits = self.run_model(input_ids, positions, is_prefill=False)
+                        if state.key.capture_sampling:
+                            if logits is None:
+                                raise RuntimeError("decode_cuda_graph capture_sampling requires rank-0 logits.")
+                            token_ids = logits.argmax(dim=-1)
+                        else:
+                            token_ids = None
             except Exception as exc:
                 raise RuntimeError(f"decode_cuda_graph capture failed: {exc!r}") from exc
 

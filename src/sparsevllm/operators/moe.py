@@ -177,6 +177,77 @@ MOE_REGISTRY: OpRegistry[MoeOpSpec, MoeProvider] = OpRegistry("routed MoE")
 
 
 @MOE_REGISTRY.register
+class SglAlignedTritonGlmMoeProvider(MoeProvider):
+    name = "sgl_aligned_triton_glm"
+    priority = 30
+    gate_up_order = "gate_up"
+
+    @classmethod
+    def supports(cls, spec: MoeOpSpec, caps: DeviceCaps) -> SupportResult:
+        if caps.platform != PlatformEnum.CUDA or caps.compute_capability != (9, 0):
+            return SupportResult.no("requires CUDA SM90")
+        if caps.device_name != "NVIDIA H100 80GB HBM3":
+            return SupportResult.no("requires profiled NVIDIA H100 80GB HBM3")
+        expected = {
+            (64, 64, 2048, 768, 4, 2, 1, "biased_sigmoid"),
+            (65, 65, 2048, 768, 5, 2, 1, "biased_sigmoid"),
+        }
+        actual = (
+            spec.num_experts,
+            spec.num_local_experts,
+            spec.hidden_size,
+            spec.intermediate_size,
+            spec.top_k,
+            spec.tp_size,
+            spec.ep_size,
+            spec.routing_method,
+        )
+        if actual not in expected:
+            return SupportResult.no(
+                f"requires a profiled GLM TP2 MoE shape {expected}, got {actual}"
+            )
+        if spec.activation_dtype != torch.bfloat16:
+            return SupportResult.no("requires BF16 activations")
+        if spec.weight_dtype != torch.bfloat16 or spec.block_shape is not None:
+            return SupportResult.no("requires unquantized BF16 expert weights")
+        from sparsevllm.operators.sgl_moe import sgl_moe_alignment_support
+
+        supported, reason = sgl_moe_alignment_support()
+        return SupportResult.yes() if supported else SupportResult.no(reason)
+
+    def run(
+        self,
+        spec,
+        hidden_states,
+        topk_ids,
+        topk_weights,
+        w13_weight,
+        w2_weight,
+        w13_scale_inv,
+        w2_scale_inv,
+        *,
+        local_expert_start,
+        ep_rank,
+    ):
+        del ep_rank
+        if w13_scale_inv is not None or w2_scale_inv is not None:
+            raise RuntimeError("SGL-aligned BF16 MoE does not accept expert scales.")
+        from sparsevllm.operators.sgl_moe import sgl_moe_align_block_size
+        from sparsevllm.triton_kernel.moe import fused_moe
+
+        return fused_moe(
+            hidden_states,
+            w13_weight,
+            w2_weight,
+            topk_ids,
+            topk_weights,
+            num_experts=spec.num_experts,
+            local_expert_start=local_expert_start,
+            alignment_impl=sgl_moe_align_block_size,
+        )
+
+
+@MOE_REGISTRY.register
 class TritonMinimaxM2FusedMoeProvider(MoeProvider):
     name = "triton_minimax_m2_fused"
     priority = 110

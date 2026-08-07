@@ -14,11 +14,15 @@ from sparsevllm.engine.cache_manager import (
     AttentionKeyComputeView,
     MlaLatentWrite,
 )
-from sparsevllm.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
+from sparsevllm.layers.embed_head import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
+from sparsevllm.layers.activation import SiluAndMul
 from sparsevllm.layers.layernorm import RMSNorm
 from sparsevllm.layers.linear import (
     ColumnParallelLinear,
-    ReplicatedLinear,
+    MergedReplicatedLinear,
     RowParallelLinear,
 )
 from sparsevllm.layers.mla_attention import MLAAttention
@@ -26,7 +30,11 @@ from sparsevllm.layers.packed_moe import PackedMoeExperts
 from sparsevllm.layers.rotary_embedding import RotaryEmbedding, get_rope
 from sparsevllm.models.qwen3 import Qwen3MLP
 from sparsevllm.operators.mla_attention import MlaAttentionOpSpec
-from sparsevllm.operators.moe import model_activation_dtype, resolve_moe_provider
+from sparsevllm.operators.moe import (
+    MoeOpSpec,
+    model_activation_dtype,
+    resolve_moe_provider,
+)
 from sparsevllm.platforms import device_runtime
 from sparsevllm.utils.context import get_context
 from sparsevllm.utils.log import logger
@@ -40,6 +48,10 @@ _EXPERT_SOURCE_RE = re.compile(
 _EXPERT_TARGET_RE = re.compile(
     r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\."
     r"(gate_proj|up_proj|down_proj)\.expert_weight$"
+)
+_SHARED_EXPERT_SOURCE_RE = re.compile(
+    r"^model\.layers\.(\d+)\.mlp\.shared_experts\."
+    r"(gate_proj|up_proj|down_proj)\.weight$"
 )
 _MTP_LAYER_INDEX = 47
 _MTP_PREFIX = f"model.layers.{_MTP_LAYER_INDEX}."
@@ -120,9 +132,12 @@ class Glm4MoeLiteAttention(nn.Module):
         if bool(getattr(quantization, "enabled", False)):
             raise NotImplementedError("GLM MLA projections do not support quantization.")
 
-        self.q_a_proj = ReplicatedLinear(
+        self.fused_qkv_a_proj = MergedReplicatedLinear(
             int(config.hidden_size),
-            self.q_lora_rank,
+            [
+                self.q_lora_rank,
+                self.kv_lora_rank + self.qk_rope_head_dim,
+            ],
             bias=bool(config.attention_bias),
         )
         self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
@@ -130,11 +145,6 @@ class Glm4MoeLiteAttention(nn.Module):
             self.q_lora_rank,
             self.num_heads * self.qk_head_dim,
             bias=False,
-        )
-        self.kv_a_proj_with_mqa = ReplicatedLinear(
-            int(config.hidden_size),
-            self.kv_lora_rank + self.qk_rope_head_dim,
-            bias=bool(config.attention_bias),
         )
         self.kv_a_layernorm = RMSNorm(
             self.kv_lora_rank,
@@ -268,14 +278,22 @@ class Glm4MoeLiteAttention(nn.Module):
                     [self.qk_nope_head_dim, self.v_head_dim],
                     dim=-1,
                 )
-                expanded_rope = history.gathered_rope[:, None, :].expand(
-                    -1,
-                    self.local_heads,
-                    -1,
+                expanded_k = torch.empty(
+                    (
+                        history.visible_tokens,
+                        self.local_heads,
+                        self.qk_head_dim,
+                    ),
+                    dtype=expanded_k_nope.dtype,
+                    device=expanded_k_nope.device,
+                )
+                expanded_k[..., : self.qk_nope_head_dim].copy_(expanded_k_nope)
+                expanded_k[..., self.qk_nope_head_dim :].copy_(
+                    history.gathered_rope[:, None, :]
                 )
                 workset = self.mla_attention.bind_prefill_kv(
                     history,
-                    expanded_k=torch.cat((expanded_k_nope, expanded_rope), dim=-1),
+                    expanded_k=expanded_k,
                     expanded_v=expanded_v,
                 )
                 b_start_loc = context.cu_seqlens_q[:-1]
@@ -330,14 +348,18 @@ class Glm4MoeLiteAttention(nn.Module):
         hidden_states: torch.Tensor,
         rotary_emb: RotaryEmbedding,
     ) -> torch.Tensor:
-        q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
+        compressed_qkv = self.fused_qkv_a_proj(hidden_states)
+        compressed_q, compressed_kv = compressed_qkv.split(
+            [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
+            dim=-1,
+        )
+        q = self.q_b_proj(self.q_a_layernorm(compressed_q))
         q = q.view(-1, self.local_heads, self.qk_head_dim)
         q_nope, q_rope = q.split(
             [self.qk_nope_head_dim, self.qk_rope_head_dim],
             dim=-1,
         )
 
-        compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
         latent, k_rope = compressed_kv.split(
             [self.kv_lora_rank, self.qk_rope_head_dim],
             dim=-1,
@@ -377,23 +399,33 @@ class Glm4MoeLiteRouter(nn.Module):
         self.e_score_correction_bias = nn.Parameter(
             torch.empty(self.num_experts, dtype=torch.float32)
         )
-        from sparsevllm.triton_kernel.moe_biased_sigmoid import (
-            topk_biased_sigmoid,
-        )
+        from sparsevllm.operators.sgl_moe import SglGlmFusedMoeGate
 
-        self.topk_impl = topk_biased_sigmoid
+        self.topk_impl = SglGlmFusedMoeGate(
+            num_experts=self.num_experts,
+            top_k=self.top_k,
+        )
+        self._fused_topk_impl = self.topk_impl
 
     def forward(
         self,
         hidden_states: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         router_logits = F.linear(hidden_states.float(), self.weight)
-        topk_weights, topk_ids = self.topk_impl(
-            router_logits,
-            self.e_score_correction_bias,
-            top_k=self.top_k,
-        )
-        topk_weights = topk_weights * self.routed_scaling_factor
+        if self.topk_impl is self._fused_topk_impl:
+            topk_weights, topk_ids = self.topk_impl(
+                router_logits,
+                self.e_score_correction_bias,
+                top_k=self.top_k,
+                routed_scaling_factor=self.routed_scaling_factor,
+            )
+        else:
+            topk_weights, topk_ids = self.topk_impl(
+                router_logits,
+                self.e_score_correction_bias,
+                top_k=self.top_k,
+            )
+            topk_weights = topk_weights * self.routed_scaling_factor
         return router_logits, topk_weights, topk_ids
 
 
@@ -404,19 +436,113 @@ class Glm4MoeLitePackedExperts(PackedMoeExperts):
         *,
         decode_cuda_graph: bool,
     ) -> None:
+        parallel_context = get_parallel_context()
+        self.routed_num_experts = int(config.n_routed_experts)
+        self.routed_top_k = int(config.num_experts_per_tok)
+        self.fuses_shared_decode = bool(
+            decode_cuda_graph
+            and (
+                self.routed_num_experts,
+                int(config.n_shared_experts),
+                self.routed_top_k,
+                int(config.hidden_size),
+                int(config.moe_intermediate_size),
+                int(parallel_context.moe_tp_size),
+                int(parallel_context.ep_size),
+            )
+            == (64, 1, 4, 2048, 1536, 2, 1)
+        )
+        packed_num_experts = self.routed_num_experts + int(
+            self.fuses_shared_decode
+        )
+        packed_top_k = self.routed_top_k + int(self.fuses_shared_decode)
         super().__init__(
-            num_experts=int(config.n_routed_experts),
+            num_experts=packed_num_experts,
             hidden_size=int(config.hidden_size),
             intermediate_size=int(config.moe_intermediate_size),
-            top_k=int(config.num_experts_per_tok),
+            top_k=packed_top_k,
             activation_dtype=model_activation_dtype(config),
             fp8_enabled=False,
             cuda_graph=bool(decode_cuda_graph),
             routing_method="biased_sigmoid",
             model_label="GLM-4.7-Flash",
             provider_resolver=resolve_moe_provider,
-            parallel_context=get_parallel_context(),
+            parallel_context=parallel_context,
         )
+        self.shared_expert_id = (
+            self.routed_num_experts if self.fuses_shared_decode else None
+        )
+        self.shared_act = SiluAndMul()
+        if self.fuses_shared_decode:
+            self.routed_op_spec = MoeOpSpec(
+                num_experts=self.routed_num_experts,
+                num_local_experts=self.routed_num_experts,
+                hidden_size=self.hidden_size,
+                intermediate_size=self.intermediate_size,
+                top_k=self.routed_top_k,
+                activation_dtype=self.op_spec.activation_dtype,
+                weight_dtype=self.op_spec.weight_dtype,
+                block_shape=self.op_spec.block_shape,
+                ep_size=1,
+                cuda_graph=self.op_spec.cuda_graph,
+                tp_size=self.op_spec.tp_size,
+                routing_method=self.op_spec.routing_method,
+                scale_dtype=self.op_spec.scale_dtype,
+            )
+            self.routed_provider = resolve_moe_provider(self.routed_op_spec)
+        else:
+            self.routed_op_spec = self.op_spec
+            self.routed_provider = self.provider
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        if not self.fuses_shared_decode:
+            return super().forward(hidden_states, topk_ids, topk_weights)
+        return self.routed_provider.run(
+            self.routed_op_spec,
+            hidden_states,
+            topk_ids,
+            topk_weights,
+            self.w13_weight[: self.routed_num_experts],
+            self.w2_weight[: self.routed_num_experts],
+            self.w13_scale_inv,
+            self.w2_scale_inv,
+            local_expert_start=0,
+            ep_rank=int(self.ep_rank),
+        )
+
+    def forward_shared(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.shared_expert_id is None:
+            raise RuntimeError("Packed shared expert is not enabled.")
+        gate_up = F.linear(
+            hidden_states,
+            self.w13_weight[self.shared_expert_id],
+        )
+        return F.linear(
+            self.shared_act(gate_up),
+            self.w2_weight[self.shared_expert_id],
+        )
+
+    def forward_routed_and_shared(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.shared_expert_id is None:
+            raise RuntimeError("Packed shared expert is not enabled.")
+        from sparsevllm.triton_kernel.moe import append_shared_expert_route
+
+        fused_ids, fused_weights = append_shared_expert_route(
+            topk_ids,
+            topk_weights,
+            shared_expert_id=self.shared_expert_id,
+        )
+        return super().forward(hidden_states, fused_ids, fused_weights)
 
 
 class Glm4MoeLiteSparseMoeBlock(nn.Module):
@@ -439,19 +565,41 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
             config,
             decode_cuda_graph=decode_cuda_graph,
         )
-        self.shared_experts = Qwen3MLP(
-            hidden_size=int(config.hidden_size),
-            intermediate_size=(
-                int(config.moe_intermediate_size) * int(config.n_shared_experts)
-            ),
-            hidden_act=str(config.hidden_act),
-            mlp_chunk_size=self.mlp_chunk_size,
-            quantization=None,
+        self.shared_experts = (
+            None
+            if self.experts.fuses_shared_decode
+            else Qwen3MLP(
+                hidden_size=int(config.hidden_size),
+                intermediate_size=(
+                    int(config.moe_intermediate_size)
+                    * int(config.n_shared_experts)
+                ),
+                hidden_act=str(config.hidden_act),
+                mlp_chunk_size=self.mlp_chunk_size,
+                quantization=None,
+                reduce_results=self.parallel_context.ep_size > 1,
+            )
         )
 
     def _routed_chunk(self, hidden_states: torch.Tensor) -> torch.Tensor:
         _, topk_weights, topk_ids = self.gate(hidden_states)
         return self.experts(hidden_states, topk_ids, topk_weights)
+
+    def _shared_chunk(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.shared_experts is not None:
+            return self.shared_experts(hidden_states)
+        return self.experts.forward_shared(hidden_states)
+
+    def _routed_and_shared_chunk(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        _, topk_weights, topk_ids = self.gate(hidden_states)
+        return self.experts.forward_routed_and_shared(
+            hidden_states,
+            topk_ids,
+            topk_weights,
+        )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if hidden_states.ndim != 2:
@@ -462,6 +610,32 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
         debug_enabled = os.getenv("SPARSEVLLM_DEBUG_MOE", "0") == "1"
         if debug_enabled:
             self.debug_last_input = hidden_states.detach().clone()
+        context = get_context()
+        if (
+            not debug_enabled
+            and getattr(
+                getattr(self, "experts", None),
+                "fuses_shared_decode",
+                False,
+            )
+            and not context.is_prefill
+        ):
+            if int(hidden_states.shape[0]) <= self.mlp_chunk_size:
+                local_output = self._routed_and_shared_chunk(hidden_states)
+            else:
+                local_output = torch.cat(
+                    [
+                        self._routed_and_shared_chunk(chunk)
+                        for chunk in hidden_states.split(
+                            self.mlp_chunk_size,
+                            dim=0,
+                        )
+                    ],
+                    dim=0,
+                )
+            return self.parallel_context.world_all_reduce_out_of_place(
+                local_output
+            )
         if not debug_enabled:
             if int(hidden_states.shape[0]) <= self.mlp_chunk_size:
                 routed = self._routed_chunk(hidden_states)
@@ -507,21 +681,42 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
             local_hit_count = local_mask.sum()
             self.debug_last_local_hit_count = (
                 local_hit_count
-                if torch.cuda.is_available()
-                and torch.cuda.is_current_stream_capturing()
+                if device_runtime.is_stream_capturing()
                 else int(local_hit_count.item())
             )
-        # Each rank owns one (expert, intermediate) shard.  Summing across the
-        # world composes pure TP, pure EP, and outer-TP x MoE-EP identically to
-        # the shared PackedMoeExperts contract used by Qwen3-MoE.
-        self.parallel_context.world_all_reduce(routed)
         if debug_enabled:
+            # Preserve the general EP composition and routed-only debug
+            # evidence. The single-reduction specialization below is TP-only.
+            self.parallel_context.world_all_reduce(routed)
             self.debug_last_routed_output = routed.detach().clone()
-        output = routed + self.shared_experts(hidden_states)
+            shared = self._shared_chunk(hidden_states)
+            if self.parallel_context.ep_size == 1:
+                shared = self.parallel_context.tp_all_reduce(shared)
+            output = routed + shared
+        elif self.parallel_context.ep_size > 1:
+            self.parallel_context.world_all_reduce(routed)
+            output = routed + self._shared_chunk(hidden_states)
+        else:
+            shared_local = self._shared_chunk(hidden_states)
+            if context.is_prefill:
+                # Both branches are TP partials. Compose them locally so the
+                # full MoE block needs one collective, matching the fused-MoE
+                # communication contract used by the reference runtime.
+                output = self.parallel_context.world_all_reduce_out_of_place(
+                    routed + shared_local
+                )
+            else:
+                # Decode tensors are small. Pack both partials into one
+                # collective, then add the independently reduced rows. This
+                # preserves the original BF16 reduction/addition order.
+                partials = self.parallel_context.world_all_reduce_out_of_place(
+                    torch.stack((routed, shared_local), dim=0)
+                )
+                output = partials[0] + partials[1]
         if debug_enabled:
             # ModelRunner's cross-rank evidence contract consumes the final
             # MoE block output, including both the synced routed experts and
-            # the replicated shared experts.
+            # the synchronized shared-expert branch.
             self.debug_last_output = output.detach().clone()
         return output
 
@@ -728,6 +923,8 @@ def _expected_mtp_weight_names(num_experts: int) -> set[str]:
 class Glm4MoeLiteForCausalLM(nn.Module):
     special_weight_loaders = (".expert_weight",)
     packed_modules_mapping = {
+        "self_attn.q_a_proj": ("self_attn.fused_qkv_a_proj", 0),
+        "self_attn.kv_a_proj_with_mqa": ("self_attn.fused_qkv_a_proj", 1),
         "gate_proj": ("gate_up_proj", 0),
         "up_proj": ("gate_up_proj", 1),
     }
@@ -830,7 +1027,7 @@ class Glm4MoeLiteForCausalLM(nn.Module):
                 dtype=torch.int64,
                 device=hidden_states.device,
             )
-            .remainder(experts.num_local_experts)
+            .remainder(experts.routed_num_experts)
             .add(experts.local_expert_start)
             .view(num_tokens, top_k)
         )
@@ -846,6 +1043,15 @@ class Glm4MoeLiteForCausalLM(nn.Module):
     def map_weight_name(self, source_weight_name: str) -> str | None:
         if source_weight_name.startswith(_MTP_PREFIX):
             return None
+        shared_match = _SHARED_EXPERT_SOURCE_RE.match(source_weight_name)
+        if shared_match is not None:
+            layer_idx, projection = shared_match.groups()
+            experts = self._sparse_block(int(layer_idx)).experts
+            if experts.shared_expert_id is not None:
+                return (
+                    f"model.layers.{layer_idx}.mlp.experts."
+                    f"{experts.shared_expert_id}.{projection}.expert_weight"
+                )
         match = _EXPERT_SOURCE_RE.match(source_weight_name)
         if match is None:
             return source_weight_name

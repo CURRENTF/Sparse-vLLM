@@ -96,6 +96,49 @@ _H = MoeGemmConfig(16, 32, 64, 8, 4, 3)
 _I = MoeGemmConfig(16, 64, 64, 8, 4, 4)
 _J = MoeGemmConfig(16, 64, 64, 8, 4, 2)
 _K = MoeGemmConfig(16, 128, 64, 8, 4, 2)
+_GLM_DECODE_32 = MoeGemmConfig(16, 64, 128, 16, 4, 3)
+_GLM_DECODE_64 = MoeGemmConfig(64, 128, 64, 8, 8, 3)
+_GLM_MID_BATCH = MoeGemmConfig(64, 128, 64, 1, 8, 3)
+_GLM_LARGE_BATCH = MoeGemmConfig(128, 128, 64, 1, 8, 3)
+
+
+def _glm_h100_tp2_config(
+    shape: MoeGemmShape,
+    *,
+    num_tokens: int,
+    stage: str,
+) -> MoeGemmConfig | None:
+    """Return measured BF16 configs for the GLM TP2 expert shape."""
+
+    profiled_shapes = {
+        MoeGemmShape(
+            "NVIDIA H100 80GB HBM3",
+            (9, 0),
+            torch.bfloat16,
+            4,
+            64,
+            2048,
+            768,
+        ),
+        MoeGemmShape(
+            "NVIDIA H100 80GB HBM3",
+            (9, 0),
+            torch.bfloat16,
+            5,
+            65,
+            2048,
+            768,
+        ),
+    }
+    if stage not in {"w13", "w2"} or shape not in profiled_shapes:
+        return None
+    if num_tokens <= 32:
+        return _GLM_DECODE_32
+    if num_tokens <= 64:
+        return _GLM_DECODE_64
+    if num_tokens <= 512:
+        return _GLM_MID_BATCH
+    return _GLM_LARGE_BATCH
 
 
 def _stage_table(
@@ -391,6 +434,13 @@ def _resolve_moe_gemm_config(
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
     )
+    glm_config = _glm_h100_tp2_config(
+        shape,
+        num_tokens=num_tokens,
+        stage=stage,
+    )
+    if glm_config is not None:
+        return glm_config
     table = _TUNED_CONFIGS.get(shape)
     if stage == "gate_up_swiglu":
         fused_table = _TUNED_GATE_UP_SWIGLU_CONFIGS.get(shape)

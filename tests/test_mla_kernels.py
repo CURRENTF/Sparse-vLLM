@@ -18,6 +18,7 @@ from sparsevllm.triton_kernel.mla import (
     gather_latent_history,
     prepare_mla_decode_schedule,
     run_mla_decode,
+    select_glm_mla_decode_config,
 )
 
 
@@ -26,6 +27,35 @@ CUDA_REQUIRED = pytest.mark.skipif(
     reason="CUDA is required for MLA Triton tests",
 )
 DECODE_CONTEXTS = (1, 31, 32, 33, 127, 128, 129, 255, 256, 257, 1024, 4096)
+
+
+def test_select_glm_mla_decode_config_uses_measured_tp2_shapes() -> None:
+    small = select_glm_mla_decode_config(
+        batch_size=1, max_context_len=4096, local_q_heads=10
+    )
+    medium = select_glm_mla_decode_config(
+        batch_size=8, max_context_len=4096, local_q_heads=10
+    )
+    short = select_glm_mla_decode_config(
+        batch_size=32, max_context_len=1024, local_q_heads=10
+    )
+    large = select_glm_mla_decode_config(
+        batch_size=32, max_context_len=4096, local_q_heads=10
+    )
+
+    assert (small.program_count, small.blocks_per_program) == (256, 4)
+    assert (medium.program_count, medium.blocks_per_program) == (264, 2)
+    assert (short.program_count, short.blocks_per_program) == (128, 8)
+    assert (large.program_count, large.blocks_per_program) == (256, 8)
+    assert large.block_q_heads == 8
+
+
+def test_select_glm_mla_decode_config_keeps_unmeasured_tp_default() -> None:
+    actual = select_glm_mla_decode_config(
+        batch_size=32, max_context_len=4096, local_q_heads=5
+    )
+
+    assert actual == DEFAULT_GLM_MLA_DECODE_CONFIG
 
 
 def _torch_mla_decode(

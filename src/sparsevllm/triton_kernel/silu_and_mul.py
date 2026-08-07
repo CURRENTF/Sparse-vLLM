@@ -58,6 +58,12 @@ def _silu_and_mul_kernel(
     )
 
 
+def _resolve_silu_launch_config(size_m: int) -> tuple[int, int, int | None]:
+    if int(size_m) <= 256:
+        return 32, 128, 4
+    return 128, 128, None
+
+
 def silu_and_mul_fwd(input, *, gate_up_order: str = "gate_up"):
     if gate_up_order not in {"gate_up", "up_gate"}:
         raise ValueError(
@@ -70,12 +76,12 @@ def silu_and_mul_fwd(input, *, gate_up_order: str = "gate_up"):
     stride_output_n = input.stride(1)
     size_m = input.shape[0]
     size_n = input.shape[-1] // 2
-    BLOCK_M = 128
-    BLOCK_N = 128
+    BLOCK_M, BLOCK_N, num_warps = _resolve_silu_launch_config(size_m)
     grid = (
         triton.cdiv(size_m, BLOCK_M),
         triton.cdiv(size_n, BLOCK_N),
     )
+    launch_kwargs = {} if num_warps is None else {"num_warps": num_warps}
     _silu_and_mul_kernel[grid](
         input,
         stride_input_m,
@@ -87,6 +93,7 @@ def silu_and_mul_fwd(input, *, gate_up_order: str = "gate_up"):
         GATE_FIRST=gate_up_order == "gate_up",
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
+        **launch_kwargs,
     )
     return input[:, 0 : (input.shape[-1] // 2)]
 

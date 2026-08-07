@@ -23,6 +23,9 @@ from typing import Any
 import torch
 
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Validate one real GLM checkpoint TP/EP variant."
@@ -66,13 +69,22 @@ def _write_json(path: Path, payload: Any) -> None:
 
 
 def _git_output(*args: str) -> str:
-    result = subprocess.run(
-        ["git", *args],
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
+    command = ["git", *args]
+    try:
+        result = subprocess.run(
+            command,
+            cwd=REPO_ROOT,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError) as exc:
+        detail = getattr(exc, "stderr", None) or str(exc)
+        raise RuntimeError(
+            f"Git provenance command failed in {REPO_ROOT}: "
+            f"{' '.join(command)}: {str(detail).strip()}"
+        ) from exc
     return result.stdout.strip()
 
 
