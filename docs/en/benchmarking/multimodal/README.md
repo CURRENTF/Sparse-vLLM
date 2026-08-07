@@ -10,9 +10,8 @@ the actual run artifacts when reporting a result.
 | --- | --- | --- |
 | Video QA | `benchmark/multimodal/video_qa/evaluate.py` | Unified evaluator for `mvbench`, `longvideobench`, `mlvu`, and `videomme`. Prefer this for new video runs. |
 | Image QA suite | `benchmark/multimodal/image_qa/small_image_bench.py` | ScienceQA-IMG, POPE, MMBench_EN, MME, and MMMU. |
-| AI2D | `benchmark/multimodal/image_qa/ai2d.py` | LLaVA-OneVision `vanilla`/`deltakv` only. |
-| VQAv2 | `benchmark/multimodal/image_qa/vqav2.py` | LLaVA-OneVision `vanilla`/`deltakv` only. |
-| Visual-cache ablation | `benchmark/multimodal/visual_cache/run_visual_cache.py` | LLaVA-OneVision visual-token uniform-pruning baseline and DeltaKV comparison. |
+| AI2D | `benchmark/multimodal/image_qa/ai2d.py` | LLaVA-OneVision and supported visual-token pruning methods. |
+| VQAv2 | `benchmark/multimodal/image_qa/vqav2.py` | LLaVA-OneVision and supported visual-token pruning methods. |
 
 Dataset-specific scripts such as `streamingbench.py`, `videomme.py`, and
 `qaego4d.py` still exist for compatibility with older workflows, but do not
@@ -23,23 +22,16 @@ Video-MME runs, use the unified video evaluator.
 
 | Entry point | Model family | Supported methods |
 | --- | --- | --- |
-| `video_qa/evaluate.py` | `llava_onevision` | `vanilla`, `deltakv`, `snapkv`, `omnikv`, `divprune`, `divprune_official`, `fastv`, `visionzip`, `fastvid_official_repo`, `pact_official_repo` |
-| `video_qa/evaluate.py` | `qwen3_vl` | `vanilla`, `deltakv`, `divprune`, `divprune_official`, `fastv`, `fastvid` |
+| `video_qa/evaluate.py` | `llava_onevision` | `vanilla`, `divprune`, `divprune_official`, `fastv`, `visionzip`, `fastvid_official_repo`, `pact_official_repo` |
+| `video_qa/evaluate.py` | `qwen3_vl` | `vanilla`, `divprune`, `divprune_official`, `fastv`, `fastvid` |
 | `image_qa/small_image_bench.py` | `llava_onevision` | Same LLaVA adapter as above, except `fastvid_official_repo` is video-only. |
 | `image_qa/small_image_bench.py` | `qwen3_vl` | Same Qwen3-VL adapter as above. |
-| `image_qa/ai2d.py`, `image_qa/vqav2.py` | LLaVA-OneVision | `vanilla`, `deltakv` |
-| `visual_cache/run_visual_cache.py` | LLaVA-OneVision | `vanilla`, `deltakv`, `visual_uniform_keep` |
+| `image_qa/ai2d.py`, `image_qa/vqav2.py` | LLaVA-OneVision | Same adapter as the image suite. |
 
 Method constraints:
 
-- `deltakv` requires a real `--deltakv_checkpoint_path` trained for the same
-  base model.
-- `visual_uniform_keep` requires `--deltakv_checkpoint_path none`; it is a
-  uniform visual-token pruning baseline, not DeltaKV compressor inference.
-- `snapkv`, `omnikv`, and `visual_uniform_keep` do not use learned compressor
-  checkpoints.
 - `pact_official_repo` must run alone in a fresh evaluator process; do not mix
-  it with HF methods in one command.
+  it with other methods in one command.
 - Qwen3-VL evaluation requires a Transformers build that provides
   `Qwen3VLForConditionalGeneration`; the adapter runs with batch size 1.
 
@@ -73,21 +65,6 @@ python benchmark/multimodal/image_qa/small_image_bench.py \
   --dataset_dir <DATA_ROOT>/ScienceQA \
   --output_dir <OUTPUT_ROOT>/scienceqa_llava_vanilla_smoke \
   --methods vanilla \
-  --num_samples 16 \
-  --batch_size 1
-```
-
-Visual uniform baseline:
-
-```bash
-CUDA_VISIBLE_DEVICES=<GPU_ID> PYTHONPATH=$PWD:$PWD/src \
-python benchmark/multimodal/visual_cache/run_visual_cache.py \
-  --model_path <MODEL_ROOT>/llava-onevision-qwen2-7b-ov-hf \
-  --deltakv_checkpoint_path none \
-  --source_vqa_dir <DATA_ROOT>/VQAv2 \
-  --output_dir <OUTPUT_ROOT>/vqav2_visual_uniform_keep_smoke \
-  --methods vanilla,visual_uniform_keep \
-  --visual_keep_ratio 0.1 \
   --num_samples 16 \
   --batch_size 1
 ```

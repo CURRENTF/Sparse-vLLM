@@ -2283,10 +2283,10 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
             return
         if k is None:
             raise RuntimeError(
-                "DeltaKV pre-RoPE key storage requires pre-RoPE key states for HF alignment."
+                "DeltaKV pre-RoPE key storage requires pre-RoPE key states."
             )
         if v is None:
-            raise RuntimeError("DeltaKV sparse reference storage requires value states for HF alignment.")
+            raise RuntimeError("DeltaKV sparse reference storage requires value states.")
         if slot_mapping is None or int(slot_mapping.numel()) == 0:
             return
         if int(slot_mapping.numel()) != int(k.shape[0]):

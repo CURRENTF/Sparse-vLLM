@@ -28,9 +28,9 @@ SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-DEFAULT_MODEL_ROOT = Path(os.getenv("DELTAKV_MODEL_ROOT", PROJECT_ROOT / "models"))
-DEFAULT_DATA_ROOT = Path(os.getenv("DELTAKV_DATA_DIR", PROJECT_ROOT / "data"))
-DEFAULT_OUTPUT_ROOT = Path(os.getenv("DELTAKV_OUTPUT_DIR", PROJECT_ROOT / "outputs"))
+DEFAULT_MODEL_ROOT = Path(os.getenv("SPARSEVLLM_MODEL_ROOT", PROJECT_ROOT / "models"))
+DEFAULT_DATA_ROOT = Path(os.getenv("SPARSEVLLM_DATA_DIR", PROJECT_ROOT / "data"))
+DEFAULT_OUTPUT_ROOT = Path(os.getenv("SPARSEVLLM_OUTPUT_DIR", PROJECT_ROOT / "outputs"))
 
 BENCHMARKS = {
     "scienceqa_img": {
@@ -107,11 +107,10 @@ def parse_args() -> argparse.Namespace:
         choices=["llava_onevision", "qwen3_vl"],
         help="Model adapter family. qwen3_vl currently supports vanilla only and runs batch_size=1.",
     )
-    parser.add_argument("--deltakv_checkpoint_path", default="none")
     parser.add_argument("--dataset_dir", default="")
     parser.add_argument("--split", default="")
     parser.add_argument("--output_dir", default="")
-    parser.add_argument("--methods", default="vanilla", help="Comma-separated: vanilla,deltakv.")
+    parser.add_argument("--methods", default="vanilla", help="Comma-separated model-adapter methods.")
     parser.add_argument("--num_samples", type=int, default=32, help="Use -1 for the full split.")
     parser.add_argument("--sample_start", type=int, default=0)
     parser.add_argument("--batch_size", type=int, default=4)
@@ -120,24 +119,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--torch_dtype", default="bfloat16", choices=["bfloat16", "float16"])
     parser.add_argument("--attn_implementation", default="flash_attention_2")
     parser.add_argument("--image_processor_use_fast", action="store_true")
-    parser.add_argument("--recent_keep_tokens", type=int, default=128)
-    parser.add_argument("--sink_keep_tokens", type=int, default=8)
-    parser.add_argument("--decode_keep_tokens", type=int, default=1024)
-    parser.add_argument("--prefill_keep_tokens", type=int, default=4096)
-    parser.add_argument("--hf_prefill_chunk_size", type=int, default=100000000)
-    parser.add_argument("--chunk_prefill_accel_omnikv", action="store_true")
-    parser.add_argument("--snapkv_window_size", type=int, default=32)
-    parser.add_argument("--full_attention_layers", default="0,1,2,3,8,16,22")
     parser.add_argument("--visual_keep_ratio", type=float, default=1.0)
-    parser.add_argument("--deltakv_latent_quant_bits", type=int, default=-1, choices=[-1, 0, 2, 4])
-    parser.add_argument("--deltakv_latent_quant_group_size", type=int, default=0)
-    parser.add_argument("--deltakv_cache_impl", default="")
-    parser.add_argument("--full_layer_kv_quant_bits", type=int, default=-1, choices=[-1, 0, 2, 4])
-    parser.add_argument("--full_layer_kivi_group_size", type=int, default=32)
-    parser.add_argument("--full_layer_kivi_residual_length", type=int, default=32)
-    parser.add_argument("--enable_sparse_ref_fp8", action="store_true", default=None)
-    parser.add_argument("--deltakv_center_ratio", type=float, default=0.1)
-    parser.add_argument("--deltakv_neighbor_count", type=int, default=1)
     parser.add_argument(
         "--pope_categories",
         default="all",
@@ -157,7 +139,7 @@ def validate_args(args: argparse.Namespace) -> None:
     if not args.dataset_dir:
         args.dataset_dir = spec["default_dir"]
     if not args.output_dir:
-        args.output_dir = str(DEFAULT_OUTPUT_ROOT / "deltakv_multimodal" / args.benchmark)
+        args.output_dir = str(DEFAULT_OUTPUT_ROOT / "multimodal" / args.benchmark)
     if args.split not in spec["splits"]:
         raise ValueError(f"{args.benchmark} split must be one of {sorted(spec['splits'])}, got {args.split!r}.")
     if args.num_samples < -1:
@@ -172,18 +154,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--max_new_tokens must be >= 1.")
     if args.log_every < 1:
         raise ValueError("--log_every must be >= 1.")
-    if args.hf_prefill_chunk_size < 1:
-        raise ValueError("--hf_prefill_chunk_size must be >= 1.")
     if args.visual_keep_ratio <= 0.0 or args.visual_keep_ratio > 1.0:
         raise ValueError("--visual_keep_ratio must be in (0, 1].")
-    if args.deltakv_center_ratio <= 0.0 or args.deltakv_center_ratio > 1.0:
-        raise ValueError("--deltakv_center_ratio must be in (0, 1].")
-    if args.deltakv_latent_quant_group_size < 0:
-        raise ValueError("--deltakv_latent_quant_group_size must be >= 0.")
-    if args.full_layer_kivi_group_size <= 0:
-        raise ValueError("--full_layer_kivi_group_size must be > 0.")
-    if args.full_layer_kivi_residual_length <= 0:
-        raise ValueError("--full_layer_kivi_residual_length must be > 0.")
 
 
 def init_seed(seed: int) -> None:
@@ -616,7 +588,6 @@ def build_run_info(args: argparse.Namespace, output_dir: Path, row_count: int) -
             "pruning_tokeep_percentage_value": args.pact_official_pruning_tokeep_percentage_value,
         },
         "model_family": args.model_family,
-        "deltakv_checkpoint_path": args.deltakv_checkpoint_path,
         "dataset_dir": args.dataset_dir,
         "split": args.split,
         "output_dir": str(output_dir),
@@ -634,24 +605,7 @@ def build_run_info(args: argparse.Namespace, output_dir: Path, row_count: int) -
             "attn_implementation": args.attn_implementation,
         },
         "runtime_params": {
-            "recent_keep_tokens": args.recent_keep_tokens,
-            "sink_keep_tokens": args.sink_keep_tokens,
-            "decode_keep_tokens": args.decode_keep_tokens,
-            "prefill_keep_tokens": args.prefill_keep_tokens,
-            "hf_prefill_chunk_size": args.hf_prefill_chunk_size,
-            "snapkv_window_size": args.snapkv_window_size,
-            "full_attention_layers": args.full_attention_layers,
             "visual_keep_ratio": args.visual_keep_ratio,
-            "deltakv_latent_quant_bits": args.deltakv_latent_quant_bits,
-            "deltakv_latent_quant_group_size": args.deltakv_latent_quant_group_size,
-            "deltakv_cache_impl": args.deltakv_cache_impl,
-            "full_layer_kv_quant_bits": args.full_layer_kv_quant_bits,
-            "full_layer_kivi_group_size": args.full_layer_kivi_group_size,
-            "full_layer_kivi_residual_length": args.full_layer_kivi_residual_length,
-            "enable_sparse_ref_fp8": args.enable_sparse_ref_fp8,
-            "deltakv_center_ratio": args.deltakv_center_ratio,
-            "deltakv_neighbor_count": args.deltakv_neighbor_count,
-            "chunk_prefill_accel_omnikv": bool(args.chunk_prefill_accel_omnikv),
         },
     }
 

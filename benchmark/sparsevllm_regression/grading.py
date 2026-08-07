@@ -81,52 +81,6 @@ def grade_quality(
     )
 
 
-def grade_logits(metrics: dict[str, Any] | None, *, p99_threshold: float | None = None) -> GateGrade:
-    if metrics is None:
-        return GateGrade("logits", "N/A", "skipped_by_policy", {}, "HF logits reference is not available.")
-
-    steps = metrics.get("decode_steps") or []
-    if not steps:
-        return GateGrade("logits", "D", "failed", metrics, "No decode step metrics.")
-    top1_ok = all(bool(step.get("argmax_match")) for step in steps)
-    top5 = [
-        float((step.get("topk_overlap") or {}).get("5", {}).get("ratio", 0.0))
-        for step in steps
-    ]
-    top10 = [
-        float((step.get("topk_overlap") or {}).get("10", {}).get("ratio", 0.0))
-        for step in steps
-    ]
-    top5_mean = sum(top5) / len(top5)
-    top10_mean = sum(top10) / len(top10)
-    p99_values = [float(step.get("p99_abs_diff", float("inf"))) for step in steps]
-    p99_max = max(p99_values) if p99_values else float("inf")
-
-    if top1_ok and top5_mean >= 0.8 and top10_mean >= 0.9 and (
-        p99_threshold is None or p99_max <= float(p99_threshold)
-    ):
-        grade = "A"
-    elif top1_ok and top5_mean >= 0.8:
-        grade = "B"
-    elif top1_ok:
-        grade = "C"
-    else:
-        grade = "D"
-
-    return GateGrade(
-        name="logits",
-        grade=grade,
-        status="success" if grade != "D" else "failed",
-        metrics={
-            "top1_all_match": top1_ok,
-            "top5_overlap_mean": top5_mean,
-            "top10_overlap_mean": top10_mean,
-            "p99_abs_diff_max": p99_max,
-            "p99_threshold": p99_threshold,
-        },
-    )
-
-
 def grade_perf(
     speedup: float,
     *,

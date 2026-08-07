@@ -4,7 +4,7 @@ import types
 
 import pytest
 
-from deltakv.configs.runtime_params import normalize_runtime_params
+from sparsevllm.configs.runtime_params import normalize_runtime_params
 from sparsevllm.config import Config
 from scripts.benchmarks import bench_prefix_cache as bench
 
@@ -28,7 +28,7 @@ def _summary_args():
         shared_suffix_min_len=1,
         shared_suffix_len=1,
         history_update="generated",
-        chunk_prefill_accel_omnikv=False,
+        require_omnikv_prefill_path=False,
         num_sink_tokens=0,
         num_top_tokens=4,
         num_recent_tokens=0,
@@ -253,8 +253,7 @@ def test_prefix_cache_bench_engine_kwargs_are_sparsevllm_config_fields():
         num_sink_tokens=8,
         num_recent_tokens=256,
         num_top_tokens=2048,
-        num_top_tokens_in_prefill=2048,
-        chunk_prefill_accel_omnikv=True,
+        require_omnikv_prefill_path=True,
         full_attention_layers="0,1,2,4,7,14",
         quest_chunk_size=16,
         prefix_cache_block_size=16,
@@ -286,7 +285,7 @@ def test_prefix_cache_bench_trace_uses_resolved_sparse_budgets():
         shared_suffix_min_len=4,
         shared_suffix_len=9,
         history_update="generated",
-        chunk_prefill_accel_omnikv=True,
+        require_omnikv_prefill_path=True,
         num_sink_tokens=8,
         num_top_tokens=2048,
         num_recent_tokens=256,

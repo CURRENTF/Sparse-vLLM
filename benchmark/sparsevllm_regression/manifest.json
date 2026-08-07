@@ -37,7 +37,6 @@
     "vanilla": {
       "sparse_method": "vanilla",
       "requires_compressor": false,
-      "hf_logits_reference": true,
       "config": {
         "sparse_method": "vanilla",
         "engine_prefill_chunk_size": 98304,
@@ -48,7 +47,6 @@
     "streamingllm": {
       "sparse_method": "streamingllm",
       "requires_compressor": false,
-      "hf_logits_reference": false,
       "config": {
         "sparse_method": "streamingllm",
         "engine_prefill_chunk_size": 4096,
@@ -62,7 +60,6 @@
     "snapkv": {
       "sparse_method": "snapkv",
       "requires_compressor": false,
-      "hf_logits_reference": true,
       "config": {
         "sparse_method": "snapkv",
         "engine_prefill_chunk_size": 4096,
@@ -78,7 +75,6 @@
     "h2o": {
       "sparse_method": "h2o",
       "requires_compressor": false,
-      "hf_logits_reference": false,
       "supported_model_families": ["qwen2", "qwen3", "qwen3_moe", "qwen3_5", "llama", "minimax_m2"],
       "supported_tensor_parallel_sizes": [1, 2],
       "config": {
@@ -96,7 +92,6 @@
     "pyramidkv": {
       "sparse_method": "pyramidkv",
       "requires_compressor": false,
-      "hf_logits_reference": true,
       "config": {
         "sparse_method": "pyramidkv",
         "long_prefill_offload_threshold": 65536,
@@ -115,7 +110,6 @@
     "omnikv": {
       "sparse_method": "omnikv",
       "requires_compressor": false,
-      "hf_logits_reference": true,
       "config": {
         "sparse_method": "omnikv",
         "engine_prefill_chunk_size": 16384,
@@ -145,7 +139,6 @@
     "quest": {
       "sparse_method": "quest",
       "requires_compressor": false,
-      "hf_logits_reference": false,
       "config": {
         "sparse_method": "quest",
         "engine_prefill_chunk_size": 4096,
@@ -161,7 +154,6 @@
     "rkv": {
       "sparse_method": "rkv",
       "requires_compressor": false,
-      "hf_logits_reference": false,
       "config": {
         "sparse_method": "rkv",
         "engine_prefill_chunk_size": 4096,
@@ -181,7 +173,6 @@
     "skipkv": {
       "sparse_method": "skipkv",
       "requires_compressor": false,
-      "hf_logits_reference": false,
       "config": {
         "sparse_method": "skipkv",
         "engine_prefill_chunk_size": 4096,
@@ -204,7 +195,6 @@
       "sparse_method": "deltakv",
       "requires_compressor": true,
       "compressor_path_env": "DELTAKV_COMPRESSOR_PATH",
-      "hf_logits_reference": true,
       "config": {
         "sparse_method": "deltakv",
         "long_prefill_offload_threshold": 65536,
@@ -246,10 +236,8 @@
       "sparse_method": "deltakv-less-memory",
       "requires_compressor": true,
       "compressor_path_env": "DELTAKV_COMPRESSOR_PATH",
-      "hf_logits_reference": true,
       "config": {
         "sparse_method": "deltakv-less-memory",
-        "hf_sparse_method": "delta_compressed_quant_kivi_full_fp8_ref",
         "long_prefill_offload_threshold": 65536,
         "full_attention_layers": "0,3,9,13,16,21,28",
         "sink_keep_tokens": 8,
@@ -289,10 +277,8 @@
       "sparse_method": "deltakv-less-memory-cudagraph",
       "requires_compressor": true,
       "compressor_path_env": "DELTAKV_COMPRESSOR_PATH",
-      "hf_logits_reference": true,
       "config": {
         "sparse_method": "deltakv-less-memory-cudagraph",
-        "hf_sparse_method": "delta_compressed_quant_kivi_full_fp8_ref",
         "long_prefill_offload_threshold": 65536,
         "full_attention_layers": "0,3,9,13,16,21,28",
         "sink_keep_tokens": 8,
@@ -342,13 +328,6 @@
     "top_p": 1.0,
     "top_k": 1
   },
-  "logits": {
-    "cases": "longbench",
-    "longbench_task": "hotpotqa",
-    "longbench_sample_idx": 0,
-    "teacher_forced_decode_steps": 3,
-    "p99_abs_diff_threshold": 0.1
-  },
   "performance": {
     "lengths": [32000, 64000],
     "batch_sizes": [4, 8],
@@ -393,8 +372,7 @@
     "num_sink_tokens": 8,
     "num_recent_tokens": 256,
     "num_top_tokens": 2048,
-    "num_top_tokens_in_prefill": 2048,
-    "chunk_prefill_accel_omnikv": true,
+    "require_omnikv_prefill_path": true,
     "min_performance_prompt_len": 8192,
     "min_cacheable_prefix_len": 8192,
     "case_timeout_s": 0,
@@ -419,7 +397,6 @@
     "parsed_outputs.jsonl",
     "sample_results.jsonl",
     "metrics.json",
-    "logits_alignment.json",
     "perf.jsonl",
     "memory.json",
     "stress.json",

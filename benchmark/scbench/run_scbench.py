@@ -13,18 +13,21 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, List, Sequence, Tuple
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+SRC_ROOT = REPO_ROOT / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
+
 # Where to append scbench_eval.log. Default to repo-local outputs unless overridden.
 BASE_PATH = os.environ.get(
-    "DELTAKV_OUTPUT_DIR",
-    str(Path(__file__).resolve().parents[2] / "outputs"),
+    "SPARSEVLLM_OUTPUT_DIR",
+    str(REPO_ROOT / "outputs"),
 )
 
-# Add src to sys.path
-sys.path.append(str(Path(__file__).parent.parent.parent / "src"))
-
 import torch
-from deltakv.get_chat_api import get_generate_api
-from deltakv.quantization import build_model_load_kwargs, restore_modules_to_dtype
+from benchmark.model_adapters.quantization import build_model_load_kwargs, restore_modules_to_dtype
 from args import parse_args
 from compute_scores import compute_scores
 from datasets import load_dataset
@@ -36,7 +39,6 @@ from eval_utils import (
     GreedySearch_RetrAttn,
     GreedySearch_RetrAttn_Legacy,
     GreedySearch_vLLM,
-    DeltaKVGreedySearch,
     check_benchmark_availability,
     create_multiturn_prompt,
     create_scdq_prompt,
@@ -1042,37 +1044,6 @@ def load_model(
         llm = SparseLLM(model_name, **sparse_hyper_param)
         llm = SparseVLLMSCBenchSearch(llm, tok, max_steps=scbench_max_steps)
         print("Sparse-vLLM model and tokenizer loaded.")
-        return llm, tok
-
-    if attn_type in [
-        "deltakv",
-        "delta_compressed_latent_wo_full",
-        "delta_compressed_latent_w_full",
-        "delta_origin_wo_full",
-        "delta_origin_w_full",
-        "snapkv",
-        "pyramidkv",
-        "palu",
-        "quest",
-    ]:
-        deltakv_checkpoint_path = hyper_param.pop("deltakv_checkpoint_path", None)
-        
-        infer_config = hyper_param.copy()
-        sparse_method = infer_config.pop("sparse_method", attn_type)
-        cuda_device = infer_config.pop("cuda_device", "auto")
-        
-        from deltakv.get_chat_api import get_generate_api
-
-        _, model = get_generate_api(
-            model_path=model_name,
-            infer_config=infer_config,
-            deltakv_checkpoint_path=deltakv_checkpoint_path,
-            sparse_method=sparse_method,
-            cuda_device=cuda_device,
-            return_model=True
-        )
-        
-        llm = DeltaKVGreedySearch(model, tok, copy_on_gpu=copy_on_gpu)
         return llm, tok
 
     if attn_type == "vllm_blend":

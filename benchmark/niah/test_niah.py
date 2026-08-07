@@ -1,8 +1,17 @@
 import json
 import os
+import sys
 import time
 from collections import defaultdict
 from datetime import datetime
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+SRC_ROOT = REPO_ROOT / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
 
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -12,10 +21,10 @@ import jsonlines
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
-from deltakv.get_chat_api import get_generate_api
+from benchmark.model_adapters.sparsevllm import get_sparsevllm_generate_api
 from benchmark.niah.gen_niah import generate_text
 
-BASE_PATH = os.environ.get("DELTAKV_OUTPUT_BASE", os.path.join(os.getcwd(), "outputs", "niah"))
+BASE_PATH = os.environ.get("SPARSEVLLM_OUTPUT_DIR", os.path.join(os.getcwd(), "outputs"))
 
 
 def _load_or_generate_data(
@@ -79,22 +88,18 @@ def test(
     deltakv_checkpoint_path: str = None,
     use_cache: bool = True,
     cuda_device: int = 0,
-    backend: str = 'hf',
 
     # kv compress infer config
     sink_keep_tokens: int = 64,
     recent_keep_tokens: int = 512,
     full_attention_layers: str = '0,1,2,3,8,16,22',
     decode_keep_tokens: int = 512,
-    prefill_keep_tokens: int = 4096,
     use_compression: bool = True,
     use_cluster: bool = False,
     deltakv_center_ratio: float = 0.1,
     stride_alpha: float = 0.0,
     deltakv_use_omnikv_selection: bool = False,
-    chunk_prefill_accel_omnikv: bool = False,
     omnikv_score_method: str = 'last',
-    hf_prefill_chunk_size: int = 32768,
     engine_prefill_chunk_size: int = 32768,
     gpu_memory_utilization: float = 0.8,
     max_model_len: int = 128000,
@@ -127,9 +132,6 @@ def test(
     if isinstance(full_attention_layers, (list, tuple)):
         full_attention_layers = ",".join(str(int(layer)) for layer in full_attention_layers)
 
-    prefill_chunk_key = "engine_prefill_chunk_size" if backend == "sparsevllm" else "hf_prefill_chunk_size"
-    prefill_chunk_value = engine_prefill_chunk_size if backend == "sparsevllm" else hf_prefill_chunk_size
-
     infer_config = {
         'sink_keep_tokens': sink_keep_tokens,
         'recent_keep_tokens': recent_keep_tokens,
@@ -141,7 +143,7 @@ def test(
         'deltakv_use_omnikv_selection': deltakv_use_omnikv_selection,
         'omnikv_score_method': omnikv_score_method,
         'sparse_method': sparse_method,
-        prefill_chunk_key: prefill_chunk_value,
+        'engine_prefill_chunk_size': engine_prefill_chunk_size,
         'gpu_memory_utilization': gpu_memory_utilization,
         'max_model_len': max_model_len,
         'pyramid_last_layer_ratio': pyramid_last_layer_ratio,
@@ -152,47 +154,40 @@ def test(
         'lt_clip_ratio': lt_clip_ratio,
         'lt_hadamard': lt_hadamard,
     }
-    if backend != "sparsevllm":
-        infer_config['stride_alpha'] = stride_alpha
-        infer_config['prefill_keep_tokens'] = prefill_keep_tokens
-        infer_config['chunk_prefill_accel_omnikv'] = chunk_prefill_accel_omnikv
-    else:
-        # Keep SparseVLLM strict-config checks meaningful: do not forward
-        # compatibility knobs that only HF wrappers or other benchmark methods use.
-        for key in (
-            "deltakv_use_omnikv_selection",
-            "omnikv_score_method",
-            "pyramid_last_layer_ratio",
-            "use_cluster",
-            "lt_bits",
-            "lt_group_size",
-            "lt_sym",
-            "lt_clip_ratio",
-            "lt_hadamard",
-        ):
-            infer_config.pop(key, None)
-        infer_config.update(
-            {
-                "max_num_seqs_in_batch": max_num_seqs_in_batch,
-                "max_decoding_seqs": max_decoding_seqs,
-                "deltakv_latent_dim": deltakv_latent_dim,
-                "deltakv_latent_quant_bits": deltakv_latent_quant_bits,
-                "deltakv_latent_quant_group_size": deltakv_latent_quant_group_size,
-                "full_layer_kv_quant_bits": full_layer_kv_quant_bits,
-                "enable_full_layer_kivi_quant": enable_full_layer_kivi_quant,
-            }
-        )
-        if max_num_batched_tokens > 0:
-            infer_config["max_num_batched_tokens"] = max_num_batched_tokens
-    chat = get_generate_api(
+    # Keep SparseVLLM strict-config checks meaningful: do not forward
+    # compatibility knobs used only by unrelated benchmark methods.
+    for key in (
+        "deltakv_use_omnikv_selection",
+        "omnikv_score_method",
+        "pyramid_last_layer_ratio",
+        "use_cluster",
+        "lt_bits",
+        "lt_group_size",
+        "lt_sym",
+        "lt_clip_ratio",
+        "lt_hadamard",
+    ):
+        infer_config.pop(key, None)
+    infer_config.update(
+        {
+            "max_num_seqs_in_batch": max_num_seqs_in_batch,
+            "max_decoding_seqs": max_decoding_seqs,
+            "deltakv_latent_dim": deltakv_latent_dim,
+            "deltakv_latent_quant_bits": deltakv_latent_quant_bits,
+            "deltakv_latent_quant_group_size": deltakv_latent_quant_group_size,
+            "full_layer_kv_quant_bits": full_layer_kv_quant_bits,
+            "enable_full_layer_kivi_quant": enable_full_layer_kivi_quant,
+        }
+    )
+    if max_num_batched_tokens > 0:
+        infer_config["max_num_batched_tokens"] = max_num_batched_tokens
+
+    chat = get_sparsevllm_generate_api(
         model_path,
         infer_config,
         deltakv_checkpoint_path=deltakv_checkpoint_path,
-        tokenizer_path=tokenizer_path,
         sparse_method=sparse_method,
         use_cache=use_cache,
-        cuda_device=cuda_device,
-        backend=backend
     )
 
     if deltakv_checkpoint_path is not None:

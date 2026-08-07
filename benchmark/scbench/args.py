@@ -11,20 +11,10 @@ try:
     ATTN_TYPES = MInferenceConfig.get_available_attn_types()
     KV_TYPES = MInferenceConfig.get_available_kv_types()
 except ImportError:
-    ATTN_TYPES = ["hf", "deltakv", "vllm", "vllm_blend", "vllm_kv", "inf_llm"]
+    ATTN_TYPES = ["hf", "vllm", "vllm_blend", "vllm_kv", "inf_llm"]
     KV_TYPES = ["dense", "retr_attn", "kivi"]
 
-for attn_type in (
-    "sparsevllm",
-    "snapkv",
-    "pyramidkv",
-    "palu",
-    "quest",
-    "delta_compressed_latent_wo_full",
-    "delta_compressed_latent_w_full",
-    "delta_origin_wo_full",
-    "delta_origin_w_full",
-):
+for attn_type in ("sparsevllm",):
     if attn_type not in ATTN_TYPES:
         ATTN_TYPES.append(attn_type)
 

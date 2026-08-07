@@ -1,1 +1,0 @@
-"""Visual-cache benchmark entrypoints."""

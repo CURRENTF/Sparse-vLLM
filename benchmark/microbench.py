@@ -18,7 +18,7 @@ src_path = str(REPO_ROOT / "src")
 if src_path not in sys.path:
     sys.path.insert(0, src_path)
 
-from deltakv.configs.runtime_params import normalize_runtime_params
+from sparsevllm.configs.runtime_params import normalize_runtime_params
 from sparsevllm.method_registry import (
     CANONICAL_SPARSE_METHODS,
     PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
@@ -146,8 +146,8 @@ def _selected_env_snapshot() -> dict[str, str]:
         "PYTHONPATH",
         "SVLLM_BENCHMARK_OUTPUT_DIR",
         "SVLLM_BENCHMARK_DATA_DIR",
-        "DELTAKV_OUTPUT_DIR",
-        "DELTAKV_DATA_DIR",
+        "SPARSEVLLM_OUTPUT_DIR",
+        "SPARSEVLLM_DATA_DIR",
         "SPARSEVLLM_FAKE_ATTENTION",
         "SPARSEVLLM_FAKE_PREFILL_ATTENTION",
         "SPARSEVLLM_FAKE_DECODE_ATTENTION",

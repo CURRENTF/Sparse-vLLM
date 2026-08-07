@@ -4,12 +4,12 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from sparsevllm.analysis.select_omnikv_full_layers import (
+from sparsevllm.utils.select_omnikv_full_layers import (
     CalibrationPoint,
     add_topk_to_pair_scores,
     attention_layer_indices_from_config,
     compute_segment_scores,
-    prepare_fp8_hf_config,
+    prepare_fp8_transformers_config,
     sample_decode_points,
     select_full_layers_dp,
     selected_segment_breakdown,
@@ -123,7 +123,7 @@ class OmniKVFullLayerSelectorTest(unittest.TestCase):
             }
         )
 
-        removed = prepare_fp8_hf_config(config)
+        removed = prepare_fp8_transformers_config(config)
 
         self.assertEqual(
             removed,

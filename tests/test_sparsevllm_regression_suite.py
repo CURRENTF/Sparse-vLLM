@@ -160,32 +160,6 @@ class SparseVLLMRegressionSuiteTest(unittest.TestCase):
         self.assertIn("long_prefill_offload_threshold", pyramid_params)
         self.assertNotIn("engine_prefill_chunk_size", pyramid_params)
 
-    def test_logits_command_passes_long_prefill_boundary(self):
-        cmd = run_suite._logits_command(
-            model_id="qwen25_7b",
-            model={"model_path": "/models/qwen", "tokenizer_path": "/models/qwen"},
-            method={
-                "sparse_method": "pyramidkv",
-                "config": {
-                    "sparse_method": "pyramidkv",
-                    "long_prefill_offload_threshold": 96 * 1024,
-                },
-            },
-            logits={
-                "cases": "short,long",
-                "longbench_task": "hotpotqa",
-                "longbench_sample_idx": 0,
-                "teacher_forced_decode_steps": 1,
-            },
-            output_dir=Path("/tmp/logits"),
-        )
-
-        self.assertEqual(
-            cmd[cmd.index("--long_prefill_offload_threshold") + 1],
-            str(96 * 1024),
-        )
-        self.assertNotIn("--engine_prefill_chunk_size", cmd)
-
     def test_tp_decode_graph_command_accepts_quest_v11(self):
         cmd = run_suite._quality_command(
             model_id="qwen25_7b",
@@ -307,8 +281,7 @@ class SparseVLLMRegressionSuiteTest(unittest.TestCase):
                 "num_sink_tokens": 0,
                 "num_recent_tokens": 16,
                 "num_top_tokens": 64,
-                "num_top_tokens_in_prefill": 64,
-                "chunk_prefill_accel_omnikv": True,
+                "require_omnikv_prefill_path": True,
                 "min_performance_prompt_len": 0,
                 "min_cacheable_prefix_len": 0,
                 "case_timeout_s": 0,
@@ -323,7 +296,7 @@ class SparseVLLMRegressionSuiteTest(unittest.TestCase):
 
     def test_validate_layer_runs_as_a_standard_test_and_writes_required_artifacts(self):
         # Keep the default tests on the cheap validate layer only. Full
-        # quality/logits/perf/stress regression runs require model paths,
+        # quality/performance/stress regression runs require model paths,
         # checkpoints, datasets, and GPUs, so they must be launched explicitly
         # through benchmark/sparsevllm_regression/run_suite.py.
         with tempfile.TemporaryDirectory() as tmp:

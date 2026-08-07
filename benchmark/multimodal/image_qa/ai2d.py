@@ -26,9 +26,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-DEFAULT_MODEL_ROOT = Path(os.getenv("DELTAKV_MODEL_ROOT", PROJECT_ROOT / "models"))
-DEFAULT_DATA_ROOT = Path(os.getenv("DELTAKV_DATA_DIR", PROJECT_ROOT / "data"))
-DEFAULT_OUTPUT_ROOT = Path(os.getenv("DELTAKV_OUTPUT_DIR", PROJECT_ROOT / "outputs"))
+DEFAULT_MODEL_ROOT = Path(os.getenv("SPARSEVLLM_MODEL_ROOT", PROJECT_ROOT / "models"))
+DEFAULT_DATA_ROOT = Path(os.getenv("SPARSEVLLM_DATA_DIR", PROJECT_ROOT / "data"))
+DEFAULT_OUTPUT_ROOT = Path(os.getenv("SPARSEVLLM_OUTPUT_DIR", PROJECT_ROOT / "outputs"))
 DEFAULT_HF_CACHE = Path(os.getenv("HF_HOME", PROJECT_ROOT / ".hf_cache"))
 
 
@@ -46,12 +46,11 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument("--model_path", default=str(DEFAULT_MODEL_ROOT / "llava-onevision-qwen2-0.5b-ov-hf"))
-    parser.add_argument("--deltakv_checkpoint_path", default="none")
     parser.add_argument("--dataset_path", default="lmms-lab/ai2d")
     parser.add_argument("--dataset_dir", default=str(DEFAULT_DATA_ROOT / "lmms-lab_ai2d"))
     parser.add_argument("--dataset_cache_dir", default=str(DEFAULT_HF_CACHE / "datasets"))
-    parser.add_argument("--output_dir", default=str(DEFAULT_OUTPUT_ROOT / "deltakv_multimodal" / "ai2d"))
-    parser.add_argument("--methods", default="vanilla", help="Comma-separated: vanilla,deltakv.")
+    parser.add_argument("--output_dir", default=str(DEFAULT_OUTPUT_ROOT / "multimodal" / "ai2d"))
+    parser.add_argument("--methods", default="vanilla", help="Comma-separated model-adapter methods.")
     parser.add_argument("--num_samples", type=int, default=32, help="Use -1 for the full AI2D test split.")
     parser.add_argument("--sample_start", type=int, default=0)
     parser.add_argument("--batch_size", type=int, default=4)
@@ -60,16 +59,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--torch_dtype", default="bfloat16", choices=["bfloat16", "float16"])
     parser.add_argument("--attn_implementation", default="flash_attention_2")
     parser.add_argument("--image_processor_use_fast", action="store_true")
-    parser.add_argument("--recent_keep_tokens", type=int, default=128)
-    parser.add_argument("--sink_keep_tokens", type=int, default=8)
-    parser.add_argument("--decode_keep_tokens", type=int, default=1024)
-    parser.add_argument("--prefill_keep_tokens", type=int, default=4096)
-    parser.add_argument("--hf_prefill_chunk_size", type=int, default=100000000)
-    parser.add_argument("--chunk_prefill_accel_omnikv", action="store_true")
-    parser.add_argument("--full_attention_layers", default="0,1,2,3,8,16,22")
     parser.add_argument("--visual_keep_ratio", type=float, default=1.0)
-    parser.add_argument("--deltakv_center_ratio", type=float, default=0.1)
-    parser.add_argument("--deltakv_neighbor_count", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--log_every", type=int, default=20)
     parser.add_argument("--print_records", action="store_true")
@@ -89,12 +79,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--max_new_tokens must be >= 1.")
     if args.log_every < 1:
         raise ValueError("--log_every must be >= 1.")
-    if args.hf_prefill_chunk_size < 1:
-        raise ValueError("--hf_prefill_chunk_size must be >= 1.")
     if args.visual_keep_ratio <= 0.0 or args.visual_keep_ratio > 1.0:
         raise ValueError("--visual_keep_ratio must be in (0, 1].")
-    if args.deltakv_center_ratio <= 0.0 or args.deltakv_center_ratio > 1.0:
-        raise ValueError("--deltakv_center_ratio must be in (0, 1].")
 
 
 def init_seed(seed: int) -> None:
@@ -238,25 +224,15 @@ def iter_batches(rows: list[dict[str, Any]], batch_size: int) -> Iterable[tuple[
 
 
 def iter_requested_methods(methods: str) -> Iterable[tuple[str, str]]:
-    for raw_method in [part.strip() for part in methods.split(",") if part.strip()]:
-        method = raw_method.lower()
-        if method == "vanilla":
-            yield raw_method, "vanilla"
-        elif method in {"deltakv", "llava_deltakv"}:
-            yield raw_method, "deltakv"
-        else:
-            raise ValueError("AI2D supports methods: vanilla, deltakv.")
+    from benchmark.multimodal.model_adapters.llava_onevision import iter_requested_methods as iter_methods
+
+    yield from iter_methods(methods, allow_fastvid=False)
 
 
 def load_method_model(method_kind: str, args: argparse.Namespace, dtype: torch.dtype, device: torch.device):
-    from benchmark.multimodal.model_adapters.llava_onevision import load_llava_deltakv_model, load_vanilla_model
+    from benchmark.multimodal.model_adapters.llava_onevision import load_model_for_method
 
-    if method_kind == "vanilla":
-        return load_vanilla_model(args, dtype, device), None, "vanilla"
-    if method_kind == "deltakv":
-        model, policy = load_llava_deltakv_model(args, dtype, device)
-        return model, policy, policy["method"]
-    raise ValueError(f"Unsupported method kind: {method_kind}")
+    return load_model_for_method(method_kind, args, dtype, device)
 
 
 def infer_paper_target(model_path: str) -> float | None:
@@ -272,7 +248,6 @@ def build_run_info(args: argparse.Namespace, output_dir: Path, row_count: int) -
         "git_commit": get_git_commit(),
         "benchmark": "ai2d",
         "model_path": args.model_path,
-        "deltakv_checkpoint_path": args.deltakv_checkpoint_path,
         "dataset_path": args.dataset_path,
         "dataset_dir": args.dataset_dir,
         "dataset_cache_dir": args.dataset_cache_dir,
@@ -289,18 +264,7 @@ def build_run_info(args: argparse.Namespace, output_dir: Path, row_count: int) -
             "torch_dtype": args.torch_dtype,
             "attn_implementation": args.attn_implementation,
         },
-        "runtime_params": {
-            "recent_keep_tokens": args.recent_keep_tokens,
-            "sink_keep_tokens": args.sink_keep_tokens,
-            "decode_keep_tokens": args.decode_keep_tokens,
-            "prefill_keep_tokens": args.prefill_keep_tokens,
-            "hf_prefill_chunk_size": args.hf_prefill_chunk_size,
-            "full_attention_layers": args.full_attention_layers,
-            "visual_keep_ratio": args.visual_keep_ratio,
-            "deltakv_center_ratio": args.deltakv_center_ratio,
-            "deltakv_neighbor_count": args.deltakv_neighbor_count,
-            "chunk_prefill_accel_omnikv": bool(args.chunk_prefill_accel_omnikv),
-        },
+        "runtime_params": {"visual_keep_ratio": args.visual_keep_ratio},
     }
 
 

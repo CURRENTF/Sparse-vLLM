@@ -31,9 +31,9 @@ Base model 与 DeltaKV compressor checkpoint 必须匹配。公开 compressor ch
 
 LongBench 和 MathBench 从环境变量读取数据根目录：
 
-- `DELTAKV_OUTPUT_DIR`：benchmark prediction 和 log 的 output root。
-- `DELTAKV_DATA_DIR`：通用 benchmark dataset root。
-- `DELTAKV_LONGBENCH_DATA_DIR`：包含 `data/*.jsonl` 的 LongBench root。
+- `SPARSEVLLM_OUTPUT_DIR`：benchmark prediction 和 log 的 output root。
+- `SPARSEVLLM_DATA_DIR`：通用 benchmark dataset root。
+- `SPARSEVLLM_LONGBENCH_DATA_DIR`：包含 `data/*.jsonl` 的 LongBench root。
 - `SCBENCH_LOCAL_DATA_DIR`：standard SCBench 文件的可选 local root。
 - `SCBENCH_PREPROCESSED_ROOT`：包含 SCBench 预处理 `<task>.parquet` 文件的 root。
 
@@ -48,16 +48,14 @@ Benchmark 入口不假设 host-specific dataset path。缺少必需 data root �
 - `sparse_method`
 - `deltakv_checkpoint_path`
 - `decode_keep_tokens`
-- `prefill_keep_tokens`
 - `sink_keep_tokens`
 - `recent_keep_tokens`
 - `full_attention_layers`
-- HF wrapper 使用 `hf_prefill_chunk_size`
-- Sparse-vLLM 使用 `engine_prefill_chunk_size`
+- `engine_prefill_chunk_size`
 
-新命令不要使用 `chunk_prefill_size`、`vllm_sparse_method`、`model_cls`、`compressor_path`、`deltakv_path`、`num_top_tokens` 或 `seq_chunk_size` 等 legacy public key。完整 alias map 和 backend-specific 行为参见[运行时参数语义](../configuration/runtime-parameter-semantics.md)。
+新命令不要使用 `chunk_prefill_size`、`vllm_sparse_method`、`model_cls`、`compressor_path`、`deltakv_path`、`num_top_tokens` 或 `seq_chunk_size` 等 legacy public key。完整 alias map 和原生行为参见[运行时参数语义](../configuration/runtime-parameter-semantics.md)。
 
-Sparse-vLLM 要求显式 integer keep budget。HF path 可能接受 `decode_keep_tokens=0.17` 等 ratio；将同一 policy 移到 Sparse-vLLM 前，应把 ratio 换算为 token count。
+Sparse-vLLM 要求显式 integer keep budget；ratio 必须在启动前换算为 token count。
 
 ## Smoke Check
 
@@ -82,7 +80,7 @@ PYTHONPATH=$PWD/src python scripts/benchmarks/bench_sparse_vllm.py \
   --batch_sizes 2 \
   --methods deltakv \
   --output_len 4 \
-  --hyper_params '{"gpu_memory_utilization":0.9,"engine_prefill_chunk_size":512,"max_num_seqs_in_batch":2,"max_decoding_seqs":2,"max_num_batched_tokens":2048,"full_attention_layers":"0,1","sink_keep_tokens":4,"recent_keep_tokens":32,"decode_keep_tokens":64,"prefill_keep_tokens":64,"deltakv_checkpoint_path":"<LOCAL_COMPRESSOR_CHECKPOINT>","deltakv_center_ratio":0.1,"deltakv_neighbor_count":1,"deltakv_latent_dim":256,"deltakv_latent_quant_bits":4,"full_layer_kv_quant_bits":4,"enable_full_layer_kivi_quant":true,"deltakv_full_pool_reserve_ratio":0.2}'
+  --hyper_params '{"gpu_memory_utilization":0.9,"engine_prefill_chunk_size":512,"max_num_seqs_in_batch":2,"max_decoding_seqs":2,"max_num_batched_tokens":2048,"full_attention_layers":"0,1","sink_keep_tokens":4,"recent_keep_tokens":32,"decode_keep_tokens":64,"deltakv_checkpoint_path":"<LOCAL_COMPRESSOR_CHECKPOINT>","deltakv_center_ratio":0.1,"deltakv_neighbor_count":1,"deltakv_latent_dim":256,"deltakv_latent_quant_bits":4,"full_layer_kv_quant_bits":4,"enable_full_layer_kivi_quant":true,"deltakv_full_pool_reserve_ratio":0.2}'
 ```
 
 确认 loader log 显示 compressor 权重已加载。只有明确设置 `allow_missing_deltakv_path` 的构造测试才能省略 checkpoint。

@@ -402,7 +402,7 @@ class DeltaKVCacheManager(CacheManager):
             end=evict_end,
             base_step=cluster_step,
         )
-        # HF DeltaKV stores compressed payloads for the entire finalized
+        # DeltaKV stores compressed payloads for the entire finalized
         # history block, including center tokens. Centers also keep raw slots as
         # future references, but attention should reconstruct them from latent
         # payloads when they are selected from compressed history.

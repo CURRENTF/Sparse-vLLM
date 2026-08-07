@@ -12,9 +12,15 @@ import time
 from pathlib import Path
 from typing import Any
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+SRC_ROOT = REPO_ROOT / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
+
 from benchmark.sparsevllm_regression.grading import (
     GateGrade,
-    grade_logits,
     grade_memory,
     grade_perf,
     grade_quality,
@@ -36,10 +42,7 @@ from sparsevllm.method_registry import (
     is_tp_decode_cuda_graph_supported,
     normalize_sparse_method,
 )
-from deltakv.configs.default_paths import output_path
-
-
-DEFAULT_OUTPUT_ROOT = os.getenv("DELTAKV_OUTPUT_DIR", output_path())
+DEFAULT_OUTPUT_ROOT = os.getenv("SPARSEVLLM_OUTPUT_DIR", str(REPO_ROOT / "outputs"))
 
 
 class CommandExecutionError(RuntimeError):
@@ -335,7 +338,6 @@ def _runtime_tensor_parallel_sizes(
     sizes_by_layer = {
         "validate": (),
         "quality": (quality_tp,),
-        "logits": (1,),
         "perf": (perf_tp,),
         "stress": (stress_tp,),
         "stress_v2": (_tensor_parallel_size_from_config(resolved.get("stress_v2")),),
@@ -421,9 +423,6 @@ def _quality_command(
     output_root: Path,
 ) -> list[str]:
     cfg = _method_config(method, model=model, model_id=model_id)
-    # Quality runs only the SparseVLLM backend.  HF reference keys are consumed
-    # by the logits comparator and should not be forwarded to SparseVLLM config.
-    cfg.pop("hf_sparse_method", None)
     tensor_parallel_size = _tensor_parallel_size_from_config(quality, performance)
     cfg["tensor_parallel_size"] = int(tensor_parallel_size)
     cfg["decode_cuda_graph"] = _decode_cuda_graph_for_method(
@@ -459,8 +458,6 @@ def _quality_command(
         str(int(quality.get("worker_world_size", quality.get("ws", 1)))),
         "--batch_size",
         str(int(quality.get("batch_size", 1))),
-        "--backend",
-        "sparsevllm",
         "--sparse_method",
         method["sparse_method"],
         "--task",
@@ -482,74 +479,6 @@ def _quality_command(
         "--output_root",
         str(output_root),
     ]
-
-
-def _logits_command(
-    *,
-    model_id: str | None = None,
-    model: dict[str, Any],
-    method: dict[str, Any],
-    logits: dict[str, Any],
-    performance: dict[str, Any] | None = None,
-    output_dir: Path,
-) -> list[str]:
-    cfg = _method_config(method, model=model, model_id=model_id)
-    cmd = [
-        sys.executable,
-        "scripts/debug/compare_logits_hf_sparsevllm.py",
-        "--model_path",
-        model["model_path"],
-        "--output_dir",
-        str(output_dir),
-        "--cases",
-        str(logits["cases"]),
-        "--methods",
-        method["sparse_method"],
-        "--sparse_method",
-        method["sparse_method"],
-        "--hf_sparse_method",
-        cfg.get("hf_sparse_method", cfg.get("sparse_method", method["sparse_method"])),
-        "--longbench_task",
-        str(logits["longbench_task"]),
-        "--longbench_sample_idx",
-        str(int(logits["longbench_sample_idx"])),
-        "--teacher_forced_decode_steps",
-        str(int(logits["teacher_forced_decode_steps"])),
-    ]
-    visible = os.getenv("CUDA_VISIBLE_DEVICES")
-    if visible:
-        cmd.extend(["--cuda_visible_devices", visible])
-    compressor_path = compressor_path_for(model, method)
-    if compressor_path:
-        cmd.extend(["--compressor_path", compressor_path])
-    if _decode_cuda_graph_for_method(method, bool((performance or {}).get("decode_cuda_graph", False))):
-        cmd.append("--decode_cuda_graph")
-
-    arg_map = {
-        "decode_keep_tokens": "--decode_keep_tokens",
-        "sink_keep_tokens": "--sink_keep_tokens",
-        "recent_keep_tokens": "--recent_keep_tokens",
-        "snapkv_window_size": "--snapkv_window_size",
-        "full_attention_layers": "--full_attention_layers",
-        "deltakv_center_ratio": "--deltakv_center_ratio",
-        "deltakv_neighbor_count": "--deltakv_neighbor_count",
-        "deltakv_latent_dim": "--deltakv_latent_dim",
-        "deltakv_latent_quant_bits": "--deltakv_latent_quant_bits",
-        "deltakv_latent_quant_group_size": "--deltakv_latent_quant_group_size",
-        "full_layer_kv_quant_bits": "--full_layer_kv_quant_bits",
-        "full_layer_kivi_group_size": "--full_layer_kivi_group_size",
-        "full_layer_kivi_residual_length": "--full_layer_kivi_residual_length",
-        "engine_prefill_chunk_size": "--engine_prefill_chunk_size",
-        "long_prefill_offload_threshold": "--long_prefill_offload_threshold",
-        "gpu_memory_utilization": "--gpu_memory_utilization",
-        "deltakv_full_pool_reserve_ratio": "--deltakv_full_pool_reserve_ratio",
-    }
-    for key, flag in arg_map.items():
-        if key in cfg:
-            cmd.extend([flag, str(cfg[key])])
-    if cfg.get("use_compression") is False:
-        cmd.append("--no-use_compression")
-    return cmd
 
 
 def _perf_command(
@@ -575,9 +504,6 @@ def _perf_command(
     if tensor_parallel_size > 1:
         hyper_params["decode_cuda_graph_capture_sampling"] = False
     method_cfg = _method_config(method, model=model, model_id=model_id, include_method=False)
-    # HF reference routing is only meaningful for the logits comparator.  Do
-    # not forward it into SparseVLLM perf runs, where unknown keys fail fast.
-    method_cfg.pop("hf_sparse_method", None)
     hyper_params.update(method_cfg)
     _apply_prefix_cache_config(
         hyper_params,
@@ -637,9 +563,6 @@ def _stress_command(
     if tensor_parallel_size > 1:
         hyper_params["decode_cuda_graph_capture_sampling"] = False
     method_cfg = _method_config(method, model=model, model_id=model_id, include_method=False)
-    # HF reference routing is only meaningful for the logits comparator.  Do
-    # not forward it into SparseVLLM stress runs, where unknown keys fail fast.
-    method_cfg.pop("hf_sparse_method", None)
     hyper_params.update(method_cfg)
     _apply_prefix_cache_config(
         hyper_params,
@@ -717,7 +640,6 @@ def _stress_v2_command(
         raise ValueError(f"stress_v2 does not support method {method_id!r}.")
 
     method_cfg = _method_config(method, model=model, model_id=model_id, include_method=False)
-    method_cfg.pop("hf_sparse_method", None)
     full_attention_layers = method_cfg.get("full_attention_layers", stress_v2.get("full_attention_layers", "0,1,2,4,7,14"))
     bench_hyper_params = dict(method_cfg)
     for managed_key in (
@@ -726,8 +648,6 @@ def _stress_v2_command(
         "sink_keep_tokens",
         "recent_keep_tokens",
         "decode_keep_tokens",
-        "prefill_keep_tokens",
-        "chunk_prefill_accel_omnikv",
         "full_attention_layers",
         "quest_chunk_size",
         "prefix_cache_block_size",
@@ -803,8 +723,6 @@ def _stress_v2_command(
         str(int(method_cfg.get("recent_keep_tokens", stress_v2["num_recent_tokens"]))),
         "--num_top_tokens",
         str(int(method_cfg.get("decode_keep_tokens", stress_v2["num_top_tokens"]))),
-        "--num_top_tokens_in_prefill",
-        str(int(method_cfg.get("prefill_keep_tokens", stress_v2["num_top_tokens_in_prefill"]))),
         "--full_attention_layers",
         str(full_attention_layers),
         "--min_performance_prompt_len",
@@ -828,8 +746,8 @@ def _stress_v2_command(
         cmd.append("--allow_short_trace")
     if bool(stress_v2.get("continue_on_failure", False)):
         cmd.append("--continue_on_failure")
-    if not bool(stress_v2.get("chunk_prefill_accel_omnikv", True)):
-        cmd.append("--no-chunk_prefill_accel_omnikv")
+    if not bool(stress_v2.get("require_omnikv_prefill_path", True)):
+        cmd.append("--no-require_omnikv_prefill_path")
     return cmd
 
 
@@ -929,7 +847,7 @@ def _grade_quality_pair(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run fixed Sparse-VLLM regression gates.")
     parser.add_argument("--manifest", default=None)
-    parser.add_argument("--layer", default="validate", choices=["validate", "quality", "logits", "perf", "stress", "stress_v2", "scbench", "nightly", "pre-refactor"])
+    parser.add_argument("--layer", default="validate", choices=["validate", "quality", "perf", "stress", "stress_v2", "scbench", "nightly", "pre-refactor"])
     parser.add_argument("--models", default=None, help="Comma-separated model ids from the manifest.")
     parser.add_argument("--methods", default=None, help="Comma-separated method ids from the manifest.")
     parser.add_argument("--run_id", default=None)
@@ -1226,7 +1144,6 @@ def main() -> int:
         "skipped": [],
     }
     metrics_records: list[dict[str, Any]] = []
-    logits_records: list[dict[str, Any]] = []
     memory_records: list[dict[str, Any]] = []
     stress_records: list[dict[str, Any]] = []
     stress_v2_records: list[dict[str, Any]] = []
@@ -1237,7 +1154,6 @@ def main() -> int:
         if args.layer == "validate":
             summary["status"] = "completed"
             _write_json(output_root / "metrics.json", {"records": metrics_records})
-            _write_json(output_root / "logits_alignment.json", {"records": logits_records})
             _write_json(output_root / "memory.json", {"records": memory_records})
             _write_json(output_root / "stress.json", {"records": stress_records})
             _write_json(output_root / "stress_v2.json", {"records": stress_v2_records})
@@ -1285,7 +1201,6 @@ def main() -> int:
                 selected_pairs.append((model_id, method_id))
 
         run_quality = args.layer in {"quality", "nightly", "pre-refactor"}
-        run_logits = args.layer in {"logits", "nightly", "pre-refactor"}
         run_perf = args.layer in {"perf", "nightly", "pre-refactor"}
         run_stress = args.layer in {"stress", "pre-refactor"}
         run_stress_v2 = args.layer == "stress_v2"
@@ -1347,41 +1262,6 @@ def main() -> int:
                         minimum_vanilla_score=float(resolved["quality"]["minimum_vanilla_score"]),
                     )
                     summary["grades"].append({**grade.to_dict(), "model": model_id, "method": method_id})
-
-        if run_logits:
-            for model_id, method_id in selected_pairs:
-                method = resolved["methods"][method_id]
-                if not method.get("hf_logits_reference"):
-                    grade = grade_logits(None)
-                    summary["grades"].append({**grade.to_dict(), "model": model_id, "method": method_id})
-                    continue
-                out_dir = output_root / "logits" / model_id / method_id
-                cmd = _logits_command(
-                    model_id=model_id,
-                    model=resolved["models"][model_id],
-                    method=method,
-                    logits=resolved["logits"],
-                    performance=resolved["performance"],
-                    output_dir=out_dir,
-                )
-                _run_and_record(
-                    summary,
-                    cmd,
-                    cwd=cwd,
-                    dry_run=args.dry_run,
-                    log_path=out_dir / "run.log",
-                    timeout_s=args.command_timeout_s,
-                )
-                summary_path = out_dir / "summary.json"
-                metrics = None
-                if summary_path.exists():
-                    with summary_path.open("r", encoding="utf-8") as handle:
-                        payload = json.load(handle)
-                    logits_records.append({"model": model_id, "method": method_id, "summary": payload})
-                    if payload.get("results"):
-                        metrics = payload["results"][0].get("comparisons")
-                grade = grade_logits(metrics, p99_threshold=resolved["logits"].get("p99_abs_diff_threshold"))
-                summary["grades"].append({**grade.to_dict(), "model": model_id, "method": method_id})
 
         if run_perf:
             for model_id in model_ids:
@@ -1703,7 +1583,6 @@ def main() -> int:
             )
         summary["status"] = "completed"
         _write_json(output_root / "metrics.json", {"records": metrics_records})
-        _write_json(output_root / "logits_alignment.json", {"records": logits_records})
         _write_json(output_root / "memory.json", {"records": memory_records})
         _write_json(output_root / "stress.json", {"records": stress_records})
         _write_json(output_root / "stress_v2.json", {"records": stress_v2_records})
@@ -1716,7 +1595,6 @@ def main() -> int:
         summary["status"] = "failed"
         summary["error"] = repr(exc)
         _write_json(output_root / "metrics.json", {"records": metrics_records})
-        _write_json(output_root / "logits_alignment.json", {"records": logits_records})
         _write_json(output_root / "memory.json", {"records": memory_records})
         _write_json(output_root / "stress.json", {"records": stress_records})
         _write_json(output_root / "stress_v2.json", {"records": stress_v2_records})

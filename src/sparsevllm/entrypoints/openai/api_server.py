@@ -78,7 +78,6 @@ SEMANTIC_ENGINE_ARGS = {
     "sparse_method",
     "deltakv_checkpoint_path",
     "decode_keep_tokens",
-    "prefill_keep_tokens",
     "sink_keep_tokens",
     "recent_keep_tokens",
     "full_attention_layers",

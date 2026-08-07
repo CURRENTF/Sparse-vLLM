@@ -11,7 +11,6 @@ benchmark/multimodal/
   model_adapters/  model-specific loading and generation adapters
   video_qa/        video QA benchmarks and utilities
   image_qa/        image QA benchmarks
-  visual_cache/    visual-cache ablation benchmark
 ```
 
 ## Current Entry Points
@@ -26,17 +25,14 @@ benchmark/multimodal/
 | AI2D | `benchmark/multimodal/image_qa/ai2d.py` |
 | VQAv2 | `benchmark/multimodal/image_qa/vqav2.py` |
 | ScienceQA-IMG / POPE / MMBench_EN / MME / MMMU | `benchmark/multimodal/image_qa/small_image_bench.py` |
-| Visual-cache ablation | `benchmark/multimodal/visual_cache/run_visual_cache.py` |
 
 ## Adapter Boundary
 
-Dataset/task code should stay under `video_qa/`, `image_qa/`, or
-`visual_cache/`. Model-specific loading and generation glue belongs under
-`model_adapters/`.
+Dataset/task code should stay under `video_qa/` or `image_qa/`. Model-specific
+loading and generation glue belongs under `model_adapters/`.
 
 Current model families:
 
-- `llava_onevision`: `vanilla`, compressor-backed `deltakv`, SnapKV/OmniKV,
-  and several visual-token pruning baselines.
-- `qwen3_vl`: `vanilla`, compressor-backed `deltakv`, and visual-token pruning
-  baselines. Requires a Transformers build with Qwen3-VL support.
+- `llava_onevision`: `vanilla` and visual-token pruning baselines.
+- `qwen3_vl`: `vanilla` and visual-token pruning baselines. Requires a
+  Transformers build with Qwen3-VL support.

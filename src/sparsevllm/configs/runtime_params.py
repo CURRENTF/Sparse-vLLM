@@ -6,11 +6,9 @@ from typing import Any
 
 @dataclass(frozen=True)
 class NormalizedRuntimeParams:
-    """Normalized runtime parameters plus optional top-level routing fields."""
+    """Runtime parameters normalized for the native Sparse-vLLM engine."""
 
     infer_config: dict[str, Any]
-    hf_model_cls: str | None = None
-    hf_deltakv_checkpoint_path: str | None = None
     warnings: tuple[str, ...] = ()
 
 
@@ -28,11 +26,6 @@ _COMMON_ALIASES: dict[str, str] = {
 }
 
 _BACKEND_ALIASES: dict[str, dict[str, str]] = {
-    "hf": {
-        "decode_keep_tokens": "num_top_tokens",
-        "prefill_keep_tokens": "num_top_tokens_in_prefill",
-        "hf_prefill_chunk_size": "chunk_prefill_size",
-    },
     "sparsevllm": {
         "engine_prefill_chunk_size": "chunk_prefill_size",
         "deltakv_neighbor_count": "deltakv_k_neighbors",
@@ -47,13 +40,14 @@ _LEGACY_RUNTIME_KEYS: dict[str, str] = {
     "deltakv_path": "deltakv_checkpoint_path",
     # Token budgets.
     "num_top_tokens": "decode_keep_tokens",
-    "num_top_tokens_in_prefill": "prefill_keep_tokens",
+    "num_top_tokens_in_prefill": "removed; use decode_keep_tokens",
+    "prefill_keep_tokens": "removed; use decode_keep_tokens",
     "num_sink_tokens": "sink_keep_tokens",
     "num_recent_tokens": "recent_keep_tokens",
     "tail_token_size": "recent_keep_tokens",
     "quest_token_budget": (
         "removed; Sparse-vLLM QuEST derives it from sink_keep_tokens + "
-        "decode_keep_tokens + recent_keep_tokens; HF QuEST uses decode_keep_tokens"
+        "decode_keep_tokens + recent_keep_tokens"
     ),
     # Layer routing.
     "full_attn_layers": "full_attention_layers",
@@ -68,36 +62,13 @@ _LEGACY_RUNTIME_KEYS: dict[str, str] = {
     "kv_quant_bits": "deltakv_latent_quant_bits",
     "kv_quant_group_size": "deltakv_latent_quant_group_size",
     # Prefill chunking must be backend-specific.
-    "chunk_prefill_size": "hf_prefill_chunk_size or engine_prefill_chunk_size",
-    "model_prefill_chunk_size": "hf_prefill_chunk_size",
+    "chunk_prefill_size": "engine_prefill_chunk_size",
+    "model_prefill_chunk_size": "engine_prefill_chunk_size",
     "sparsevllm_prefill_chunk_size": "engine_prefill_chunk_size",
+    "chunk_prefill_accel_omnikv": "removed; OmniKV prefill routing is runtime-owned",
     # LLaVA visual path.
     "deltakv_visual_compress_only": "visual_token_prune_only",
     "deltakv_visual_keep_ratio": "visual_token_keep_ratio",
-}
-
-_SPARSE_METHOD_TO_HF_MODEL_CLS: dict[str, str] = {
-    "": "auto",
-    "vanilla": "auto",
-    "deltakv": "deltakv",
-    "deltakv-less-memory": "deltakv",
-    "deltakv-less-memory-cudagraph": "deltakv",
-    "delta_compressed_quant_kivi_full_fp8_ref": "delta_compressed_quant_kivi_full_fp8_ref",
-    "hf_kivi": "hf_kivi",
-    "kivi_hf": "hf_kivi",
-    "snapkv": "snapkv",
-    "pyramidkv": "pyramidkv",
-    "omnikv": "omnikv",
-    "quest": "quest",
-    "rkv": "rkv",
-    "r-kv": "rkv",
-    "r_kv": "rkv",
-    "skipkv": "skipkv",
-    "skip-kv": "skipkv",
-    "skip_kv": "skipkv",
-    "streamingllm": "streamingllm",
-    "attention-sink": "streamingllm",
-    "attention_sink": "streamingllm",
 }
 
 _SPARSEVLLM_METHOD_ALIASES: dict[str, str] = {
@@ -114,7 +85,7 @@ def _canonical_backend(backend: str | None) -> str | None:
     backend = str(backend).strip().lower()
     if backend in ("sparse-vllm", "sparse_vllm"):
         return "sparsevllm"
-    if backend in ("hf", "sparsevllm"):
+    if backend == "sparsevllm":
         return backend
     raise ValueError(f"Unknown runtime parameter backend: {backend!r}")
 
@@ -172,7 +143,7 @@ def _validate_sparsevllm_token_budgets(params: dict[str, Any]):
             raise ValueError(
                 f"Sparse-vLLM `{key}` must be an explicit token count, got ratio-style "
                 f"value {value!r}. Convert the ratio using the target context length before "
-                "running Sparse-vLLM, or use backend='hf' for ratio semantics."
+                "running Sparse-vLLM."
             )
 
 
@@ -181,14 +152,13 @@ def normalize_runtime_params(
     *,
     backend: str | None = None,
 ) -> NormalizedRuntimeParams:
-    """Normalize user-facing runtime params to backend-native legacy fields.
+    """Normalize user-facing runtime params to native engine fields.
 
     The canonical aliases are intentionally explicit:
 
-    - `decode_keep_tokens` stays native for Sparse-vLLM and maps to HF `num_top_tokens`
+    - `decode_keep_tokens` stays native for Sparse-vLLM
     - `engine_prefill_chunk_size` -> Sparse-vLLM `chunk_prefill_size`
-    - `hf_prefill_chunk_size` -> HF DeltaKV `chunk_prefill_size`
-    - `deltakv_checkpoint_path` -> Sparse-vLLM `deltakv_path` or HF compressor path
+    - `deltakv_checkpoint_path` -> Sparse-vLLM `deltakv_path`
 
     Legacy runtime keys are rejected at the API boundary. This function still
     maps the new semantic names to backend-native internal fields where needed.
@@ -200,9 +170,6 @@ def normalize_runtime_params(
 
     _reject_legacy_runtime_keys(normalized)
 
-    hf_model_cls: str | None = None
-    hf_deltakv_checkpoint_path: str | None = None
-
     sparse_method = normalized.pop("sparse_method", None)
     if sparse_method is not None:
         sparse_method = str(sparse_method)
@@ -210,15 +177,6 @@ def normalize_runtime_params(
             sparsevllm_method = _SPARSEVLLM_METHOD_ALIASES.get(sparse_method, sparse_method)
             normalized["vllm_sparse_method"] = sparsevllm_method
             warnings.append("`sparse_method` was normalized to `vllm_sparse_method`.")
-        elif backend == "hf":
-            mapped_model_cls = _SPARSE_METHOD_TO_HF_MODEL_CLS.get(sparse_method, sparse_method)
-            if hf_model_cls is not None and hf_model_cls != mapped_model_cls:
-                raise ValueError(
-                    f"Conflicting method selectors: hf_model_cls={hf_model_cls!r}, "
-                    f"sparse_method={sparse_method!r} -> {mapped_model_cls!r}."
-                )
-            hf_model_cls = mapped_model_cls
-            warnings.append("`sparse_method` was normalized to HF backend class.")
         else:
             normalized["sparse_method"] = sparse_method
 
@@ -227,11 +185,6 @@ def normalize_runtime_params(
         if checkpoint_path is not None:
             normalized["deltakv_path"] = checkpoint_path
             warnings.append("`deltakv_checkpoint_path` was normalized to `deltakv_path`.")
-        hf_deltakv_checkpoint_path = None
-    elif backend == "hf":
-        if checkpoint_path is not None:
-            hf_deltakv_checkpoint_path = str(checkpoint_path)
-            warnings.append("`deltakv_checkpoint_path` was normalized for the HF DeltaKV loader.")
     elif checkpoint_path is not None:
         normalized["deltakv_checkpoint_path"] = checkpoint_path
 
@@ -241,7 +194,5 @@ def normalize_runtime_params(
 
     return NormalizedRuntimeParams(
         infer_config=normalized,
-        hf_model_cls=hf_model_cls,
-        hf_deltakv_checkpoint_path=hf_deltakv_checkpoint_path,
         warnings=tuple(warnings),
     )

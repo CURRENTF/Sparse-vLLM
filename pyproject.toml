@@ -3,14 +3,14 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "deltakv"
+name = "sparsevllm"
 version = "0.1.0"
-description = "DeltaKV: Compressing KV Cache for Efficient Inference"
+description = "A sparse-first inference engine for long-context LLM serving"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "Apache-2.0"}
 authors = [
-    {name = "DeltaKV Team"}
+    {name = "Sparse-vLLM Team"}
 ]
 dependencies = [
     "fire",
@@ -19,18 +19,13 @@ dependencies = [
     "triton==3.6.0",
     "torchvision==0.26.0",
     "pillow",
-    "accelerate",
-    "deepspeed",
     "datasets",
     "matplotlib",
     "seaborn",
-    "wandb",
     "loguru",
     "ansible",
     "bitsandbytes",
-    "datatrove",
     "tqdm",
-    "loguru",
     "fastapi>=0.100",
     "uvicorn[standard]",
     "pydantic>=2",
@@ -56,14 +51,13 @@ test = [
 ]
 
 [project.scripts]
-deltakv-train = "deltakv.train_compressor:main"
 sparsevllm-openai-server = "sparsevllm.entrypoints.openai.api_server:main"
 sparsevllm-openai-router = "sparsevllm.entrypoints.openai.smart_router:main"
 sparsevllm-openai-client = "sparsevllm.entrypoints.openai.client:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["deltakv*", "sparsevllm*"]
+include = ["sparsevllm*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

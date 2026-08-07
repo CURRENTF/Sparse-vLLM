@@ -39,34 +39,21 @@ attention heads, KV heads, or vocabulary sizes fail before model construction.
 The source model directory is still required for configuration and tokenizer
 metadata, but its `.safetensors` files are not opened.
 
-## Qwen3-8B two-GPU check
+## Native Qwen3-8B two-GPU check
 
 Use the project-root uv environment:
 
 ```bash
 CUDA_VISIBLE_DEVICES=5,6 \
 PYTHONPATH="$PWD:$PWD/src" \
-.venv/bin/python scripts/debug/compare_logits_hf_sparsevllm.py \
+.venv/bin/python scripts/benchmarks/bench_sparse_vllm.py \
   --model_path /data2/pretrain_models/Qwen3-8B \
-  --cases short \
+  --lengths 128 \
+  --batch_sizes 1 \
   --methods vanilla \
-  --tiny_random_config "$PWD/configs/debug/qwen3_tiny_random.json" \
-  --tiny_random_seed 17 \
-  --tensor_parallel_size 2 \
-  --max_model_len 2048 \
-  --engine_prefill_chunk_size 256 \
-  --max_num_batched_tokens 512 \
-  --max_num_seqs_in_batch 1 \
-  --max_decoding_seqs 1 \
-  --gpu_memory_utilization 0.02 \
-  --mlp_chunk_size 256 \
-  --teacher_forced_decode_steps 2 \
-  --output_dir /tmp/sparsevllm_tiny_random_qwen3_8b_tp2
+  --output_len 2 \
+  --hyper_params '{"tensor_parallel_size":2,"max_model_len":2048,"engine_prefill_chunk_size":256,"max_num_batched_tokens":512,"max_num_seqs_in_batch":1,"max_decoding_seqs":1,"gpu_memory_utilization":0.02,"mlp_chunk_size":256}'
 ```
-
-The comparison script constructs the HF reference from the same reduced config
-and seed, then compares teacher-forced prefill and decode logits. Tiny-random HF
-comparison currently supports `vanilla` only.
 
 ## Limitations
 

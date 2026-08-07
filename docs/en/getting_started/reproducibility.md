@@ -46,9 +46,9 @@ id can be passed directly everywhere.
 
 LongBench and MathBench read data roots from environment variables:
 
-- `DELTAKV_OUTPUT_DIR`: output root for benchmark predictions and logs.
-- `DELTAKV_DATA_DIR`: general benchmark dataset root.
-- `DELTAKV_LONGBENCH_DATA_DIR`: LongBench root containing `data/*.jsonl`.
+- `SPARSEVLLM_OUTPUT_DIR`: output root for benchmark predictions and logs.
+- `SPARSEVLLM_DATA_DIR`: general benchmark dataset root.
+- `SPARSEVLLM_LONGBENCH_DATA_DIR`: LongBench root containing `data/*.jsonl`.
 - `SCBENCH_LOCAL_DATA_DIR`: optional local root for standard SCBench files.
 - `SCBENCH_PREPROCESSED_ROOT`: root containing SCBench preprocessed `<task>.parquet` files.
 
@@ -67,22 +67,19 @@ Use canonical public parameter names:
 - `sparse_method`
 - `deltakv_checkpoint_path`
 - `decode_keep_tokens`
-- `prefill_keep_tokens`
 - `sink_keep_tokens`
 - `recent_keep_tokens`
 - `full_attention_layers`
-- `hf_prefill_chunk_size` for HF wrappers
-- `engine_prefill_chunk_size` for Sparse-vLLM
+- `engine_prefill_chunk_size`
 
 Do not use legacy public keys such as `chunk_prefill_size`,
 `vllm_sparse_method`, `model_cls`, `compressor_path`, `deltakv_path`,
 `num_top_tokens`, or `seq_chunk_size` in new commands. See
 [runtime-parameter-semantics.md](../configuration/runtime-parameter-semantics.md) for the full
-alias map and backend-specific behavior.
+alias map and native behavior.
 
-Sparse-vLLM requires explicit integer keep budgets. HF paths may accept ratios
-such as `decode_keep_tokens=0.17`; convert ratios to token counts before moving
-the same policy to Sparse-vLLM.
+Sparse-vLLM requires explicit integer keep budgets. Do not pass ratios such as
+`decode_keep_tokens=0.17`; convert each policy to a token count first.
 
 ## Smoke Checks
 
@@ -107,7 +104,7 @@ PYTHONPATH=$PWD/src python scripts/benchmarks/bench_sparse_vllm.py \
   --batch_sizes 2 \
   --methods deltakv \
   --output_len 4 \
-  --hyper_params '{"gpu_memory_utilization":0.9,"engine_prefill_chunk_size":512,"max_num_seqs_in_batch":2,"max_decoding_seqs":2,"max_num_batched_tokens":2048,"full_attention_layers":"0,1","sink_keep_tokens":4,"recent_keep_tokens":32,"decode_keep_tokens":64,"prefill_keep_tokens":64,"deltakv_checkpoint_path":"<LOCAL_COMPRESSOR_CHECKPOINT>","deltakv_center_ratio":0.1,"deltakv_neighbor_count":1,"deltakv_latent_dim":256,"deltakv_latent_quant_bits":4,"full_layer_kv_quant_bits":4,"enable_full_layer_kivi_quant":true,"deltakv_full_pool_reserve_ratio":0.2}'
+  --hyper_params '{"gpu_memory_utilization":0.9,"engine_prefill_chunk_size":512,"max_num_seqs_in_batch":2,"max_decoding_seqs":2,"max_num_batched_tokens":2048,"full_attention_layers":"0,1","sink_keep_tokens":4,"recent_keep_tokens":32,"decode_keep_tokens":64,"deltakv_checkpoint_path":"<LOCAL_COMPRESSOR_CHECKPOINT>","deltakv_center_ratio":0.1,"deltakv_neighbor_count":1,"deltakv_latent_dim":256,"deltakv_latent_quant_bits":4,"full_layer_kv_quant_bits":4,"enable_full_layer_kivi_quant":true,"deltakv_full_pool_reserve_ratio":0.2}'
 ```
 
 Verify the loader logs that compressor weights were loaded. Omit the checkpoint

@@ -25,9 +25,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-DEFAULT_MODEL_ROOT = Path(os.getenv("DELTAKV_MODEL_ROOT", PROJECT_ROOT / "models"))
-DEFAULT_DATA_ROOT = Path(os.getenv("DELTAKV_DATA_DIR", PROJECT_ROOT / "data"))
-DEFAULT_OUTPUT_ROOT = Path(os.getenv("DELTAKV_OUTPUT_DIR", PROJECT_ROOT / "outputs"))
+DEFAULT_MODEL_ROOT = Path(os.getenv("SPARSEVLLM_MODEL_ROOT", PROJECT_ROOT / "models"))
+DEFAULT_DATA_ROOT = Path(os.getenv("SPARSEVLLM_DATA_DIR", PROJECT_ROOT / "data"))
+DEFAULT_OUTPUT_ROOT = Path(os.getenv("SPARSEVLLM_OUTPUT_DIR", PROJECT_ROOT / "outputs"))
 
 TASK_CSV_FILES = {
     "real": "Real_Time_Visual_Understanding.csv",
@@ -125,16 +125,14 @@ The best option is:"""
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Benchmark LLaVA-OneVision on StreamingBench multiple-choice video QA "
-            "with vanilla HF generation and standard DeltaKV."
+            "Benchmark LLaVA-OneVision on StreamingBench multiple-choice video QA."
         )
     )
     parser.add_argument("--model_path", default=str(DEFAULT_MODEL_ROOT / "llava-onevision-qwen2-0.5b-ov-hf"))
-    parser.add_argument("--deltakv_checkpoint_path", default="none")
     parser.add_argument("--dataset_dir", default=str(DEFAULT_DATA_ROOT / "StreamingBench_hf"))
     parser.add_argument("--csv_dir", default="")
     parser.add_argument("--video_dir", default="")
-    parser.add_argument("--output_dir", default=str(DEFAULT_OUTPUT_ROOT / "deltakv_multimodal" / "streamingbench"))
+    parser.add_argument("--output_dir", default=str(DEFAULT_OUTPUT_ROOT / "multimodal" / "streamingbench"))
     parser.add_argument(
         "--tasks",
         default="real",
@@ -191,16 +189,6 @@ def parse_args():
         action="store_true",
         help="Use the fast Transformers image/video processor implementation when available.",
     )
-    parser.add_argument("--recent_keep_tokens", type=int, default=128)
-    parser.add_argument("--sink_keep_tokens", type=int, default=8)
-    parser.add_argument("--decode_keep_tokens", type=int, default=1024)
-    parser.add_argument("--prefill_keep_tokens", type=int, default=4096)
-    parser.add_argument("--hf_prefill_chunk_size", type=int, default=100000000)
-    parser.add_argument("--chunk_prefill_accel_omnikv", action="store_true")
-    parser.add_argument("--full_attention_layers", default="0,1,2,3,8,16,22")
-    parser.add_argument("--visual_keep_ratio", type=float, default=1.0)
-    parser.add_argument("--deltakv_center_ratio", type=float, default=0.1)
-    parser.add_argument("--deltakv_neighbor_count", type=int, default=1)
     parser.add_argument("--frame_cache_dir", default="")
     parser.add_argument("--reuse_frame_cache", action="store_true")
     parser.add_argument(
@@ -271,21 +259,6 @@ def validate_args(args) -> None:
         raise ValueError("--context_seconds must be -1 for all context or a non-negative window in seconds.")
     if args.visual_keep_ratio <= 0.0 or args.visual_keep_ratio > 1.0:
         raise ValueError("--visual_keep_ratio must be in (0, 1].")
-    if args.deltakv_center_ratio <= 0.0 or args.deltakv_center_ratio > 1.0:
-        raise ValueError("--deltakv_center_ratio must be in (0, 1].")
-    for name in (
-        "recent_keep_tokens",
-        "sink_keep_tokens",
-        "decode_keep_tokens",
-        "prefill_keep_tokens",
-        "deltakv_neighbor_count",
-    ):
-        if getattr(args, name) < 0:
-            raise ValueError(f"--{name} must be non-negative.")
-    if args.hf_prefill_chunk_size < 1:
-        raise ValueError("--hf_prefill_chunk_size must be >= 1.")
-
-
 def parse_timestamp(value: str) -> float:
     parts = [part.strip() for part in str(value).split(":") if part.strip()]
     if not parts:
@@ -939,7 +912,6 @@ def build_run_info(args, dataset_info: dict, row_count: int) -> dict:
         "cwd": os.getcwd(),
         "git_commit": get_git_commit(),
         "model_path": args.model_path,
-        "deltakv_checkpoint_path": args.deltakv_checkpoint_path,
         "methods": args.methods,
         "dataset_dir": args.dataset_dir,
         "csv_dir": dataset_info["csv_dir"],
@@ -964,16 +936,6 @@ def build_run_info(args, dataset_info: dict, row_count: int) -> dict:
         "evaluated_sample_count": row_count,
         "dataset_info": dataset_info,
         "runtime_params": {
-            "recent_keep_tokens": args.recent_keep_tokens,
-            "sink_keep_tokens": args.sink_keep_tokens,
-            "decode_keep_tokens": args.decode_keep_tokens,
-            "prefill_keep_tokens": args.prefill_keep_tokens,
-            "hf_prefill_chunk_size": args.hf_prefill_chunk_size,
-            "full_attention_layers": args.full_attention_layers,
-            "visual_keep_ratio": args.visual_keep_ratio,
-            "deltakv_center_ratio": args.deltakv_center_ratio,
-            "deltakv_neighbor_count": args.deltakv_neighbor_count,
-            "chunk_prefill_accel_omnikv": bool(args.chunk_prefill_accel_omnikv),
             "frame_load_workers": args.frame_load_workers,
             "preprocess_prefetch_batches": args.preprocess_prefetch_batches,
         },
@@ -1572,10 +1534,8 @@ def iter_methods(methods: str):
         method = raw_method.lower()
         if method == "vanilla":
             yield "vanilla", "vanilla"
-        elif method in {"deltakv", "llava_deltakv"}:
-            yield raw_method, "deltakv"
         else:
-            raise ValueError("StreamingBench script currently supports methods: vanilla, deltakv.")
+            raise ValueError("StreamingBench script currently supports only method: vanilla.")
 
 
 def main():
@@ -1613,17 +1573,11 @@ def main():
     )
     results = []
     for requested_method, method_kind in iter_methods(args.methods):
-        if method_kind == "vanilla":
-            from benchmark.multimodal.model_adapters.llava_onevision import load_vanilla_model
+        from benchmark.multimodal.model_adapters.llava_onevision import load_vanilla_model
 
-            model = load_vanilla_model(args, dtype, device)
-            method_label = "vanilla"
-            policy = None
-        else:
-            from benchmark.multimodal.model_adapters.llava_onevision import load_llava_deltakv_model
-
-            model, policy = load_llava_deltakv_model(args, dtype, device)
-            method_label = policy["method"]
+        model = load_vanilla_model(args, dtype, device)
+        method_label = "vanilla"
+        policy = None
 
         result = run_method(method_label, model, processor, rows, args, dtype, device, policy=policy)
         result["requested_method"] = requested_method

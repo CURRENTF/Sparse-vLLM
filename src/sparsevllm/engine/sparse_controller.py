@@ -952,11 +952,11 @@ class SparseController:
                 if context.is_prefill:
                     chunk_lens = context.cu_seqlens_q[1:] - context.cu_seqlens_q[:-1]
                     state.attn_score /= chunk_lens.view(-1, 1, 1)  # 不除其实也无所谓
-                    # HF DeltaKV prefill uses raw QK averaged over valid queries,
+                    # DeltaKV prefill uses raw QK averaged over valid queries,
                     # then max over heads.
                     state.attn_score = state.attn_score.max(dim=1).values
                 elif is_dynamic_deltakv:
-                    # HF DeltaKV decode applies softmax over compressed candidates,
+                    # DeltaKV decode applies softmax over compressed candidates,
                     # then max over heads. The kernel returns raw QK logits.
                     scores = state.attn_score
                     compressed_lens = self.cache_manager.get_compressed_lens(state.req_indices)

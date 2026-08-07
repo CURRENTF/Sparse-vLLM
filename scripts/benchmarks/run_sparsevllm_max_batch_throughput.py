@@ -15,11 +15,19 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from deltakv.configs.default_paths import compressor_path, model_path, output_path
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+SRC_ROOT = REPO_ROOT / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
 
-DEFAULT_MODEL_PATH = model_path("Qwen2.5-7B-Instruct-1M")
-DEFAULT_COMPRESSOR_PATH = compressor_path("Qwen2.5-7B-Instruct-1M-Compressor")
-DEFAULT_OUTPUT_ROOT = output_path("deltakv", "sparsevllm_max_batch_throughput")
+DEFAULT_MODEL_PATH = os.getenv("SPARSEVLLM_MODEL_PATH")
+DEFAULT_COMPRESSOR_PATH = os.getenv("SPARSEVLLM_DELTAKV_CHECKPOINT_PATH")
+DEFAULT_OUTPUT_ROOT = os.getenv(
+    "SPARSEVLLM_OUTPUT_DIR",
+    str(REPO_ROOT / "outputs" / "sparsevllm_max_batch_throughput"),
+)
 DEFAULT_LENGTHS = "64000,128000,256000,512000,900000"
 DEFAULT_METHODS = "deltakv-less-memory-cudagraph,omnikv,snapkv,vanilla"
 DEFAULT_GPUS = "4,5,6,7"
@@ -373,8 +381,16 @@ def _write_summary_markdown(run_root: Path, payload: dict[str, Any]) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Find max usable Sparse-VLLM batch size per method and context length.")
-    parser.add_argument("--model_path", default=DEFAULT_MODEL_PATH)
-    parser.add_argument("--compressor_path", default=DEFAULT_COMPRESSOR_PATH)
+    parser.add_argument(
+        "--model_path",
+        default=DEFAULT_MODEL_PATH,
+        required=DEFAULT_MODEL_PATH is None,
+    )
+    parser.add_argument(
+        "--compressor_path",
+        default=DEFAULT_COMPRESSOR_PATH,
+        required=DEFAULT_COMPRESSOR_PATH is None,
+    )
     parser.add_argument("--methods", default=DEFAULT_METHODS)
     parser.add_argument("--lengths", default=DEFAULT_LENGTHS)
     parser.add_argument("--gpus", default=DEFAULT_GPUS)

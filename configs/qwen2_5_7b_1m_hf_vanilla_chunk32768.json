@@ -1,4 +1,0 @@
-{
-  "sparse_method": "vanilla",
-  "hf_prefill_chunk_size": 32768
-}

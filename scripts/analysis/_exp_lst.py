@@ -1,3 +1,0 @@
-omnikv_lst = [
-
-]

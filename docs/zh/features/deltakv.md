@@ -1,6 +1,7 @@
 # DeltaKV
 
-DeltaKV 为长上下文推理压缩 KV cache。本仓库包含 Sparse-vLLM inference path、HF wrapper 对比、compressor 训练入口和 benchmark 集成。
+DeltaKV 为长上下文推理压缩 KV cache。本仓库只包含原生 Sparse-vLLM
+inference path 和原生 benchmark 集成。
 
 ## 推理
 
@@ -39,49 +40,13 @@ python scripts/benchmarks/bench_sparse_vllm.py \
   --methods deltakv \
   --output_len 4 \
   --temperature 0 \
-  --hyper_params '{"gpu_memory_utilization":0.9,"engine_prefill_chunk_size":512,"max_num_seqs_in_batch":2,"max_decoding_seqs":2,"max_num_batched_tokens":2048,"chunk_prefill_accel_omnikv":true,"full_attention_layers":"0,1","sink_keep_tokens":4,"recent_keep_tokens":32,"decode_keep_tokens":64,"prefill_keep_tokens":64,"deltakv_checkpoint_path":"<COMPRESSOR_ROOT>/Qwen2.5-7B-Instruct-1M-Compressor","deltakv_center_ratio":0.1,"deltakv_neighbor_count":1,"deltakv_latent_dim":256,"deltakv_latent_quant_bits":4,"full_layer_kv_quant_bits":4,"enable_full_layer_kivi_quant":true,"deltakv_full_pool_reserve_ratio":0.2}'
+  --hyper_params '{"gpu_memory_utilization":0.9,"engine_prefill_chunk_size":512,"max_num_seqs_in_batch":2,"max_decoding_seqs":2,"max_num_batched_tokens":2048,"full_attention_layers":"0,1","sink_keep_tokens":4,"recent_keep_tokens":32,"decode_keep_tokens":64,"deltakv_checkpoint_path":"<COMPRESSOR_ROOT>/Qwen2.5-7B-Instruct-1M-Compressor","deltakv_center_ratio":0.1,"deltakv_neighbor_count":1,"deltakv_latent_dim":256,"deltakv_latent_quant_bits":4,"full_layer_kv_quant_bits":4,"enable_full_layer_kivi_quant":true,"deltakv_full_pool_reserve_ratio":0.2}'
 ```
 
-## 训练 Compressor
+## Compressor 训练
 
-主入口为：
-
-- Python：`python src/deltakv/train_compressor.py ...`
-- 安装后的 CLI：`deltakv-train ...`
-
-训练脚本要求输入由 Hugging Face `datasets` tokenization 和 packing 后、通过 `load_from_disk` 保存的数据集。
-
-```bash
-python src/deltakv/train_compressor.py \
-  --model_name_or_path <PATH_TO_BASE_MODEL> \
-  --dataset_path <PATH_TO_DATASET_ON_DISK> \
-  --output_dir <PATH_TO_OUTPUT_CHECKPOINT_DIR> \
-  --deltakv_latent_dim 512 \
-  --compressor_token_group_size 1 \
-  --deltakv_neighbor_count 4 \
-  --layer_chunk_size 1 \
-  --batch_size 1 \
-  --warmup_ratio 0.02 \
-  --max_steps 20000 \
-  --learning_rate 2e-4 \
-  --use_nonlinear_compressor True \
-  --ref_mode avg \
-  --collect_kv_before_rope True \
-  --model_type cluster_e2e \
-  --cluster_soft_assignment False \
-  --compressor_down_type mlp_swiglu \
-  --compressor_down_intermediate_size 3072 \
-  --compressor_up_type linear \
-  --compressor_linear_bias False
-```
-
-常用参数：
-
-- `--deltakv_latent_dim`：压缩 KV 的 latent width。
-- `--compressor_token_group_size`：non-cluster compressor reference 的 token grouping。
-- `--deltakv_neighbor_count`：cluster DeltaKV 选择的 ref/center token 数量。
-- `--model_type`：`e2e`、`cluster_e2e`、`cluster_e2e_big`。
-- `--collect_kv_before_rope`：是否在 RoPE 之前收集 KV。
+Compressor 训练代码由独立仓库
+[CURRENTF/DeltaKV](https://github.com/CURRENTF/DeltaKV) 维护。请在该仓库中准备训练数据、训练 compressor checkpoint 和运行训练消融实验；Sparse-vLLM 仅消费兼容 checkpoint，用于推理和 benchmark。
 
 ## 在 LongBench 上评估
 
@@ -94,19 +59,16 @@ python benchmark/long_bench/pred.py \
   --tokenizer_path <PATH_TO_TOKENIZER_OR_MODEL> \
   --ws 1 \
   --batch_size 1 \
-  --backend hf \
   --sparse_method deltakv \
   --deltakv_checkpoint_path "<LOCAL_PATH_TO_TRAINED_COMPRESSOR_DIR>" \
-  --hyper_param '{"hf_prefill_chunk_size": 2048000, "prefill_keep_tokens": 4096,
-  "chunk_prefill_accel_omnikv": true, "decode_keep_tokens": 0.17, "full_attention_layers": "0,1,2,8,18",
-  "recent_keep_tokens": 128, "sink_keep_tokens": 8, "use_compression": true, "use_cluster": true, "deltakv_center_ratio": 0.1}'
+  --hyper_param '{"engine_prefill_chunk_size":16384,"decode_keep_tokens":2048,"full_attention_layers":"0,1,2,8,18","recent_keep_tokens":128,"sink_keep_tokens":8,"use_compression":true,"deltakv_center_ratio":0.1}'
 ```
 
 说明：
 
-- `--backend` 支持 `hf` 和 `sparsevllm`。
 - `--hyper_param` 接受 JSON 字符串或 JSON 文件路径。
 - `full_attention_layers` 以逗号分隔的 layer index 字符串传入。
+- 原生 runtime 中 keep budget 必须使用显式 token 数。
 
 ## Checkpoint
 

@@ -6,7 +6,15 @@ import subprocess
 import sys
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import List
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+SRC_ROOT = REPO_ROOT / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
 
 import numpy as np
 import torch
@@ -14,12 +22,11 @@ import torch.multiprocessing as mp
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
-from deltakv.configs.default_paths import dataset_path, output_path
-from deltakv.get_chat_api import get_generate_api
+from benchmark.model_adapters.sparsevllm import get_sparsevllm_generate_api
 
 # Keep defaults consistent with benchmark/long_bench/pred.py, but allow env overrides.
-BASE_PATH = os.getenv("DELTAKV_OUTPUT_DIR", output_path())
-DATA_PREFIX_PATH = os.getenv("DELTAKV_DATA_DIR", dataset_path())
+BASE_PATH = os.getenv("SPARSEVLLM_OUTPUT_DIR", str(REPO_ROOT / "outputs"))
+DATA_PREFIX_PATH = os.getenv("SPARSEVLLM_DATA_DIR")
 DEFAULT_GSM8K_DATASET = ("openai/gsm8k", "main", "test")
 DEFAULT_AIME2024_DATASET = ("Maxwell-Jia/AIME_2024", None, "train")
 DEFAULT_MATH500_DATASET = ("HuggingFaceH4/MATH-500", None, "test")
@@ -65,34 +72,6 @@ def build_chat(
     if os.getenv("DEBUG"):
         print("input prompt:", prompt)
     return prompt
-
-
-def build_kvzip_prompt_parts(tokenizer, prompt: str, no_chat_template: bool):
-    if no_chat_template or not hasattr(tokenizer, "apply_chat_template") or tokenizer.chat_template is None:
-        return None
-
-    msgs = [{"role": "user", "content": prompt}]
-    enable_thinking = os.getenv("ENABLE_THINKING", "1") not in ("0", "false", "False")
-    prefill_text = tokenizer.apply_chat_template(
-        msgs,
-        tokenize=False,
-        add_generation_prompt=False,
-        enable_thinking=enable_thinking,
-    )
-    full_text = tokenizer.apply_chat_template(
-        msgs,
-        tokenize=False,
-        add_generation_prompt=True,
-        enable_thinking=enable_thinking,
-    )
-    if not full_text.startswith(prefill_text):
-        raise ValueError("KVzip math adapter expected add_generation_prompt=True output to extend the prefill prefix.")
-
-    return {
-        "prefill_text": prefill_text,
-        "query_text": full_text[len(prefill_text):],
-        "use_kvzip_template": False,
-    }
 
 
 def _read_json_or_jsonl(path: str):
@@ -247,14 +226,11 @@ def load_model_and_tokenizer(rank: int, args):
                     f"It is neither a valid file path nor a valid JSON string. Error: {e}"
                 )
 
-    generate_fn = get_generate_api(
+    generate_fn = get_sparsevllm_generate_api(
         model_path=args.model_path,
         infer_config=infer_config,
         deltakv_checkpoint_path=args.deltakv_checkpoint_path,
-        tokenizer_path=args.tokenizer_path,
         sparse_method=args.sparse_method,
-        cuda_device=rank,
-        backend=args.backend,
     )
 
     tokenizer_path = args.tokenizer_path if args.tokenizer_path else args.model_path
@@ -314,36 +290,6 @@ def get_pred(rank: int, data, dataset: str, args, model, tokenizer, out_path: st
         for j, example in enumerate(batch_data):
             problem = _get_problem_text(example, dataset)
             prompt = _build_prompt(dataset, problem, think_instruction, args.prompt_style)
-
-            if args.sparse_method == "kvzip" and args.backend == "hf":
-                prompt_parts = build_kvzip_prompt_parts(tokenizer, prompt, args.no_chat_template)
-                if prompt_parts is not None:
-                    query_ids = tokenizer(
-                        prompt_parts["query_text"],
-                        truncation=False,
-                        return_tensors="pt",
-                    ).input_ids[0]
-                    max_prefill_len = max(max_prompt_len - len(query_ids), 1)
-                    prefill_ids = tokenizer(
-                        prompt_parts["prefill_text"],
-                        truncation=False,
-                        return_tensors="pt",
-                    ).input_ids[0]
-                    if len(prefill_ids) > max_prefill_len:
-                        half = int(max_prefill_len / 2)
-                        if half == 0:
-                            prompt_parts["prefill_text"] = tokenizer.decode(
-                                prefill_ids[-max_prefill_len:],
-                                skip_special_tokens=False,
-                            )
-                        else:
-                            prompt_parts["prefill_text"] = (
-                                tokenizer.decode(prefill_ids[:half], skip_special_tokens=False)
-                                + tokenizer.decode(prefill_ids[-half:], skip_special_tokens=False)
-                            )
-                    prompts.append(prompt_parts)
-                    meta.append({"id": _get_example_id(example, i + j)})
-                    continue
 
             tokenized_prompt = tokenizer(prompt, truncation=False, return_tensors="pt").input_ids[0]
             if len(tokenized_prompt) > max_prompt_len:
@@ -487,11 +433,11 @@ def worker(rank: int, world_size: int, datasets: List[str], args, out_root: str)
 
     total_tokens = sum(int(record["generated_text_tokens"]) for record in perf_records)
     total_elapsed = sum(float(record["generation_elapsed_s"]) for record in perf_records)
-    graph_status = _decode_cuda_graph_status(model) if args.backend == "sparsevllm" else {}
+    graph_status = _decode_cuda_graph_status(model)
     perf_summary = {
         "rank": rank,
         "world_size": world_size,
-        "backend": args.backend,
+        "backend": "sparsevllm",
         "sparse_method": args.sparse_method,
         "model": args.model,
         "model_path": args.model_path,
@@ -519,8 +465,7 @@ def worker(rank: int, world_size: int, datasets: List[str], args, out_root: str)
         json.dump(perf_summary, f, ensure_ascii=False, indent=2)
     print(f"Wrote performance summary to: {perf_path}")
     if (
-        args.backend == "sparsevllm"
-        and bool(perf_summary.get("decode_cuda_graph_configured"))
+        bool(perf_summary.get("decode_cuda_graph_configured"))
         and not bool(perf_summary.get("decode_cuda_graph_active"))
     ):
         raise RuntimeError(
@@ -558,7 +503,6 @@ def parse_args():
     parser.add_argument("--deltakv_checkpoint_path", type=str, default=None)
     parser.add_argument("--tokenizer_path", type=str, default=None)
     parser.add_argument("--sparse_method", type=str, default="deltakv")
-    parser.add_argument("--backend", type=str, default="hf", choices=["hf", "sparsevllm"])
     parser.add_argument("--num_samples", type=int, default=None, help="Limit number of samples per task")
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size for inference")
     parser.add_argument("--no_chat_template", action="store_true", help="Do not use chat template")
@@ -596,11 +540,6 @@ if __name__ == "__main__":
     compressor_name = os.path.basename(args.deltakv_checkpoint_path.rstrip("/")) if args.deltakv_checkpoint_path else "None"
 
     datasets = [d.strip() for d in args.task.split(",") if d.strip()]
-    if args.sparse_method == "kvzip" and "aime2024" in datasets:
-        raise AssertionError(
-            "KVzip is disabled for aime2024 in math_bench. "
-            "Use another sparse_method or remove aime2024 from --task."
-        )
     time_tag = datetime.now().strftime("%m%d_%H%M")
     out_root = os.path.join(BASE_PATH, f"benchmark/math_bench/pred/{model_name}/{compressor_name}_{time_tag}")
     os.makedirs(out_root, exist_ok=True)

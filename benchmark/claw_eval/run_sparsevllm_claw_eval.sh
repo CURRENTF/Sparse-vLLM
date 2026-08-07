@@ -3,7 +3,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 MODEL_ROOT="${DELTAKV_MODEL_ROOT:-${REPO_ROOT}/models}"
-OUTPUT_BASE="${DELTAKV_OUTPUT_DIR:-${REPO_ROOT}/outputs}"
+OUTPUT_BASE="${SPARSEVLLM_OUTPUT_DIR:-${REPO_ROOT}/outputs}"
 CACHE_ROOT="${DELTAKV_CACHE_DIR:-${REPO_ROOT}/.cache}"
 CONDA_ENVS_ROOT="${CONDA_ENVS_ROOT:-${HOME}/.conda/envs}"
 RUN_NAME="${RUN_NAME:-claw_eval_$(date +%Y%m%d_%H%M%S)}"

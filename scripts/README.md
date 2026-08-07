@@ -2,7 +2,6 @@
 
 Top-level scripts are grouped by their primary use:
 
-- `analysis/`: dataset statistics, plotting, simulation, and small tuning helpers.
 - `benchmarks/`: full benchmark drivers, experiment runners, and job queues.
 - `data/`: dataset download and background-download wrappers.
 - `profiling/`: low-level performance microbenchmarks and kernel benchmarks.

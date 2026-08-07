@@ -10,7 +10,7 @@
 
 <p align="center"><a href="README.md">English</a> | 简体中文</p>
 
-Sparse-vLLM 是一个面向长上下文大语言模型服务、以稀疏机制为首要设计原则的推理引擎，同时也包含 DeltaKV 压缩器的训练与评测工具。
+Sparse-vLLM 是一个面向长上下文大语言模型服务、以稀疏机制为首要设计原则的推理引擎。
 
 <div align="center">
   <img src="docs/assets/sparse_vllm_throughput.png" alt="Sparse-vLLM 吞吐量" style="width:86%; height:auto;">
@@ -20,7 +20,10 @@ Sparse-vLLM 是一个面向长上下文大语言模型服务、以稀疏机制�
 
 Sparse-vLLM 是一个从设计之初就以稀疏性为核心原则的推理框架。它并非简单地在传统 KV 缓存之上叠加稀疏方法，而是重新设计缓存布局、控制流程和内核，使多种稀疏机制能够清晰地接入框架。
 
-与 DeltaKV 相关的压缩器训练、Hugging Face 封装对比和基准测试适配器位于 `src/deltakv/` 和 `benchmark/` 目录中。
+> **说明：** DeltaKV 压缩器训练代码由独立仓库
+> [CURRENTF/DeltaKV](https://github.com/CURRENTF/DeltaKV) 维护。本仓库仅保留
+> `src/sparsevllm/` 下的原生 DeltaKV 推理实现，不包含 DeltaKV 训练代码或
+> Hugging Face reference implementation。
 
 ## 核心运行原则
 
@@ -71,7 +74,7 @@ Sparse-vLLM 支持物理淘汰、逻辑掩码、查询感知选择和混合 KV �
 | 运行时架构 | [架构](docs/zh/design/README.md) |
 | 运行时参数语义 | [运行时参数语义](docs/zh/configuration/runtime-parameter-semantics.md) |
 | 基准测试命令 | [基准测试](docs/zh/benchmarking/README.md) |
-| DeltaKV 推理与训练 | [DeltaKV](docs/zh/features/deltakv.md) |
+| DeltaKV 推理 | [DeltaKV](docs/zh/features/deltakv.md) |
 | 可复现性检查清单 | [可复现性](docs/zh/getting_started/reproducibility.md) |
 
 完整文档索引维护在 [docs/zh/README.md](docs/zh/README.md) 中。

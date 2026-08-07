@@ -60,7 +60,7 @@ def code_revision_info() -> dict[str, str | bool | None]:
         else _git_command(repo_root, "status", "--porcelain")
     )
     try:
-        package_version = version("deltakv")
+        package_version = version("sparsevllm")
     except PackageNotFoundError:
         package_version = None
     return {

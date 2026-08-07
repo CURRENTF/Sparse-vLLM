@@ -19,14 +19,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-DEFAULT_MODEL_ROOT = Path(os.getenv("DELTAKV_MODEL_ROOT", PROJECT_ROOT / "models"))
-DEFAULT_DATA_ROOT = Path(os.getenv("DELTAKV_DATA_DIR", PROJECT_ROOT / "data"))
-DEFAULT_OUTPUT_ROOT = Path(os.getenv("DELTAKV_OUTPUT_DIR", PROJECT_ROOT / "outputs"))
+DEFAULT_MODEL_ROOT = Path(os.getenv("SPARSEVLLM_MODEL_ROOT", PROJECT_ROOT / "models"))
+DEFAULT_DATA_ROOT = Path(os.getenv("SPARSEVLLM_DATA_DIR", PROJECT_ROOT / "data"))
+DEFAULT_OUTPUT_ROOT = Path(os.getenv("SPARSEVLLM_OUTPUT_DIR", PROJECT_ROOT / "outputs"))
 
 from benchmark.multimodal.model_adapters.llava_onevision import (
     batch_to_device,
     ensure_left_padding,
-    load_llava_deltakv_model,
     load_vanilla_model,
 )
 
@@ -43,11 +42,10 @@ def parse_args():
         )
     )
     parser.add_argument("--model_path", default=str(DEFAULT_MODEL_ROOT / "llava-onevision-qwen2-7b-ov-hf"))
-    parser.add_argument("--deltakv_checkpoint_path", default="none")
     parser.add_argument("--dataset_dir", default=str(DEFAULT_DATA_ROOT / "rekv_qaego4d"))
     parser.add_argument("--anno_path", default="")
     parser.add_argument("--video_dir", default="")
-    parser.add_argument("--output_dir", default=str(DEFAULT_OUTPUT_ROOT / "deltakv_multimodal" / "rekv_qaego4d"))
+    parser.add_argument("--output_dir", default=str(DEFAULT_OUTPUT_ROOT / "multimodal" / "rekv_qaego4d"))
     parser.add_argument("--methods", default="vanilla")
     parser.add_argument("--num_samples", type=int, default=32, help="Number of QA pairs to evaluate. Use -1 for all 500.")
     parser.add_argument("--sample_start", type=int, default=0)
@@ -58,16 +56,6 @@ def parse_args():
     parser.add_argument("--cuda_device", type=int, default=7)
     parser.add_argument("--torch_dtype", default="float16", choices=["bfloat16", "float16"])
     parser.add_argument("--attn_implementation", default="flash_attention_2")
-    parser.add_argument("--recent_keep_tokens", type=int, default=128)
-    parser.add_argument("--sink_keep_tokens", type=int, default=8)
-    parser.add_argument("--decode_keep_tokens", type=int, default=1024)
-    parser.add_argument("--prefill_keep_tokens", type=int, default=4096)
-    parser.add_argument("--hf_prefill_chunk_size", type=int, default=100000000)
-    parser.add_argument("--chunk_prefill_accel_omnikv", action="store_true")
-    parser.add_argument("--full_attention_layers", default="0,1,2,3,8,16,22")
-    parser.add_argument("--visual_keep_ratio", type=float, default=1.0)
-    parser.add_argument("--deltakv_center_ratio", type=float, default=0.1)
-    parser.add_argument("--deltakv_neighbor_count", type=int, default=1)
     parser.add_argument("--frame_cache_dir", default="")
     parser.add_argument("--reuse_frame_cache", action="store_true")
     parser.add_argument("--log_every", type=int, default=10)
@@ -358,10 +346,8 @@ def iter_methods(methods: str):
         method = raw_method.lower()
         if method == "vanilla":
             yield "vanilla", "vanilla"
-        elif method in {"deltakv", "llava_deltakv"}:
-            yield raw_method, "deltakv"
         else:
-            raise ValueError("QAEGO4D ReKV protocol script supports methods: vanilla, deltakv.")
+            raise ValueError("QAEGO4D ReKV protocol script supports only method: vanilla.")
 
 
 def write_official_style_csv(result: dict, output_dir: Path):
@@ -420,13 +406,9 @@ def main():
     processor = LlavaOnevisionProcessor.from_pretrained(args.model_path, trust_remote_code=True)
     results = []
     for requested_method, method_kind in iter_methods(args.methods):
-        if method_kind == "vanilla":
-            model = load_vanilla_model(args, dtype, device)
-            method_label = "vanilla"
-            policy = None
-        else:
-            model, policy = load_llava_deltakv_model(args, dtype, device)
-            method_label = policy["method"]
+        model = load_vanilla_model(args, dtype, device)
+        method_label = "vanilla"
+        policy = None
 
         result = run_method(method_label, model, processor, rows, args, dtype, device, policy=policy)
         result["requested_method"] = requested_method

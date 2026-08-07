@@ -12,7 +12,7 @@ from sparsevllm.utils.code_revision import code_revision_info
 from sparsevllm.utils.log import logger
 import sys
 
-from deltakv.configs.runtime_params import normalize_runtime_params
+from sparsevllm.configs.runtime_params import normalize_runtime_params
 
 from sparsevllm.config import Config
 from sparsevllm.sampling_params import SamplingParams
@@ -575,8 +575,8 @@ class LLMEngine:
 
     def _tokenize_prompt(self, prompt: str | list[int]) -> list[int]:
         if isinstance(prompt, str):
-            # Match HF manual_generate: add BOS for raw prompts, but do not
-            # duplicate it when a chat template already starts with BOS.
+            # Add BOS for raw prompts, but do not duplicate it when a chat
+            # template already starts with BOS.
             add_special_tokens = True
             if self.tokenizer.bos_token is None or prompt.startswith(self.tokenizer.bos_token):
                 add_special_tokens = False

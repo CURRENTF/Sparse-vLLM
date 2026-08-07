@@ -40,7 +40,6 @@ REQUIRED_ARTIFACTS = [
     "parsed_outputs.jsonl",
     "sample_results.jsonl",
     "metrics.json",
-    "logits_alignment.json",
     "perf.jsonl",
     "memory.json",
     "stress.json",
@@ -117,7 +116,7 @@ def load_manifest(path: str | Path | None = None) -> dict[str, Any]:
 def validate_manifest(manifest: dict[str, Any]) -> None:
     if not isinstance(manifest, dict):
         raise ManifestError("manifest must be a JSON object.")
-    for key in ("models", "methods", "quality", "logits", "performance", "stress", "stress_v2", "scbench", "outputs"):
+    for key in ("models", "methods", "quality", "performance", "stress", "stress_v2", "scbench", "outputs"):
         if key not in manifest:
             raise ManifestError(f"manifest is missing required key: {key}")
 
@@ -204,7 +203,7 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
                 raise ManifestError(
                     f"method {method_id!r} supported_tensor_parallel_sizes must be a non-empty positive integer list."
                 )
-        for bool_key in ("requires_compressor", "hf_logits_reference"):
+        for bool_key in ("requires_compressor",):
             if bool_key not in method or not isinstance(method[bool_key], bool):
                 raise ManifestError(f"method {method_id!r} must define boolean {bool_key}.")
         compressor_env = method.get("compressor_path_env")

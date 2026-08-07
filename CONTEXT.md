@@ -28,12 +28,8 @@ _Avoid_: Qwen3-VL support, all Qwen3 variants, TP-ready Qwen3 DeltaKV
 A tensor-parallel sparse decode semantics where ranks share execution schedule and cache lifecycle, while each rank makes sparse-token decisions from its own local attention heads or KV heads without cross-rank sparse-index aggregation. It is not algorithmically equivalent to a single-rank or global-head sparse selection unless separately validated.
 _Avoid_: global sparse-index aggregation, TP-equivalent sparse selection
 
-**HF DeltaKV Sanity Alignment**:
-A small validation check that compares a Sparse-VLLM DeltaKV run against the repository's HF DeltaKV path on the same text-only model, compressor, prompt, and sparse-method settings. It is a smoke-level correctness gate, not a full benchmark or a guarantee of exact token-by-token equivalence across all tasks.
-_Avoid_: full LongBench validation, exact parity proof, benchmark score
-
 **Qwen3 Delta-Quant First-Stage Check**:
-The first-stage no-checkpoint Qwen3 DeltaKV Delta-Quant validation uses 4-bit residual or full-layer quantization settings and compares against the HF origin-codec DeltaKV path with `use_compression=false`. It is not a 2-bit quantization claim.
+The first-stage no-checkpoint Qwen3 DeltaKV Delta-Quant validation uses 4-bit residual or full-layer quantization settings on the native Sparse-VLLM runtime. It is not a 2-bit quantization claim or a compressor-backed DeltaKV validation.
 _Avoid_: Qwen3 2-bit validation, compressor-backed DeltaKV validation
 
 **Full-Layer Policy**:

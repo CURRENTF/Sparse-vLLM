@@ -111,8 +111,6 @@ llm = LLM(
     sparse_method="omnikv",
     full_attention_layers="0,1,2,4,7,14",
     decode_keep_tokens=2096,
-    prefill_keep_tokens=8192,
-    chunk_prefill_accel_omnikv=False,
 )
 
 outputs = llm.generate(
@@ -141,8 +139,7 @@ Sparse-vLLM runtime 参数定义在 `src/sparsevllm/config.py` 中，可以作�
 - `deltakv_checkpoint_path`：本地 DeltaKV compressor checkpoint 目录或文件。
 - `sink_keep_tokens`：始终保留的 prefix/sink token。
 - `recent_keep_tokens`：始终保留的 recent tail token。
-- `decode_keep_tokens`：decode 阶段 top/important token budget。
-- `prefill_keep_tokens`：prefill/finalization 阶段 top/important token budget。
+- `decode_keep_tokens`：共享的 sparse top/important token budget。
 - `full_attention_layers`：运行 full attention 的 layer index，以逗号分隔的字符串或列表表示。
 
 ## 文档导航

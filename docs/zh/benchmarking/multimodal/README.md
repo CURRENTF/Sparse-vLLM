@@ -8,9 +8,8 @@
 | --- | --- | --- |
 | Video QA | `benchmark/multimodal/video_qa/evaluate.py` | `mvbench`、`longvideobench`、`mlvu` 和 `videomme` 的统一 evaluator。新 video run 优先使用此入口。 |
 | Image QA suite | `benchmark/multimodal/image_qa/small_image_bench.py` | ScienceQA-IMG、POPE、MMBench_EN、MME 和 MMMU。 |
-| AI2D | `benchmark/multimodal/image_qa/ai2d.py` | 仅支持 LLaVA-OneVision `vanilla`/`deltakv`。 |
-| VQAv2 | `benchmark/multimodal/image_qa/vqav2.py` | 仅支持 LLaVA-OneVision `vanilla`/`deltakv`。 |
-| Visual-cache ablation | `benchmark/multimodal/visual_cache/run_visual_cache.py` | LLaVA-OneVision visual-token uniform-pruning baseline 与 DeltaKV 对比。 |
+| AI2D | `benchmark/multimodal/image_qa/ai2d.py` | LLaVA-OneVision 和受支持的 visual-token pruning 方法。 |
+| VQAv2 | `benchmark/multimodal/image_qa/vqav2.py` | LLaVA-OneVision 和受支持的 visual-token pruning 方法。 |
 
 `streamingbench.py`、`videomme.py` 和 `qaego4d.py` 等 dataset-specific script 仍保留，以兼容旧 workflow；除非当前任务需要，否则不要为它们维护独立 runbook。新的 Video-MME run 应使用统一 video evaluator。
 
@@ -18,19 +17,15 @@
 
 | 入口 | 模型类别 | 支持的方法 |
 | --- | --- | --- |
-| `video_qa/evaluate.py` | `llava_onevision` | `vanilla`, `deltakv`, `snapkv`, `omnikv`, `divprune`, `divprune_official`, `fastv`, `visionzip`, `fastvid_official_repo`, `pact_official_repo` |
-| `video_qa/evaluate.py` | `qwen3_vl` | `vanilla`, `deltakv`, `divprune`, `divprune_official`, `fastv`, `fastvid` |
+| `video_qa/evaluate.py` | `llava_onevision` | `vanilla`, `divprune`, `divprune_official`, `fastv`, `visionzip`, `fastvid_official_repo`, `pact_official_repo` |
+| `video_qa/evaluate.py` | `qwen3_vl` | `vanilla`, `divprune`, `divprune_official`, `fastv`, `fastvid` |
 | `image_qa/small_image_bench.py` | `llava_onevision` | 与上面的 LLaVA adapter 相同，但 `fastvid_official_repo` 仅支持 video。 |
 | `image_qa/small_image_bench.py` | `qwen3_vl` | 与上面的 Qwen3-VL adapter 相同。 |
-| `image_qa/ai2d.py`, `image_qa/vqav2.py` | LLaVA-OneVision | `vanilla`, `deltakv` |
-| `visual_cache/run_visual_cache.py` | LLaVA-OneVision | `vanilla`, `deltakv`, `visual_uniform_keep` |
+| `image_qa/ai2d.py`, `image_qa/vqav2.py` | LLaVA-OneVision | 与 image suite 使用相同 adapter。 |
 
 方法限制：
 
-- `deltakv` 需要针对同一 base model 训练的真实 `--deltakv_checkpoint_path`。
-- `visual_uniform_keep` 要求 `--deltakv_checkpoint_path none`；它是 uniform visual-token pruning baseline，不是 DeltaKV compressor inference。
-- `snapkv`、`omnikv` 和 `visual_uniform_keep` 不使用 learned compressor checkpoint。
-- `pact_official_repo` 必须在新的 evaluator process 中单独运行；不要在一条命令中与 HF 方法混合。
+- `pact_official_repo` 必须在新的 evaluator process 中单独运行；不要在一条命令中与其他方法混合。
 - Qwen3-VL 评估要求 Transformers build 提供 `Qwen3VLForConditionalGeneration`；adapter 使用 batch size 1。
 
 ## 示例命令
@@ -63,21 +58,6 @@ python benchmark/multimodal/image_qa/small_image_bench.py \
   --dataset_dir <DATA_ROOT>/ScienceQA \
   --output_dir <OUTPUT_ROOT>/scienceqa_llava_vanilla_smoke \
   --methods vanilla \
-  --num_samples 16 \
-  --batch_size 1
-```
-
-Visual uniform baseline：
-
-```bash
-CUDA_VISIBLE_DEVICES=<GPU_ID> PYTHONPATH=$PWD:$PWD/src \
-python benchmark/multimodal/visual_cache/run_visual_cache.py \
-  --model_path <MODEL_ROOT>/llava-onevision-qwen2-7b-ov-hf \
-  --deltakv_checkpoint_path none \
-  --source_vqa_dir <DATA_ROOT>/VQAv2 \
-  --output_dir <OUTPUT_ROOT>/vqav2_visual_uniform_keep_smoke \
-  --methods vanilla,visual_uniform_keep \
-  --visual_keep_ratio 0.1 \
   --num_samples 16 \
   --batch_size 1
 ```

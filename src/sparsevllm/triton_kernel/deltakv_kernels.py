@@ -3791,7 +3791,7 @@ def _deltakv_static_decode_plan_kernel(
     ).to(tl.int32)
     # Full-prefill DeltaKV stores latent payloads for all finalized compressed
     # positions, including center tokens that also retain raw slots as refs.
-    # HF reconstructs selected compressed positions through the latent path, so
+    # Selected compressed positions reconstruct through the latent path, so
     # static decode must prefer latent when present instead of short-circuiting
     # on an existing raw center slot.
     need_reconstruct = valid_top & (top_latent_slots >= 0)

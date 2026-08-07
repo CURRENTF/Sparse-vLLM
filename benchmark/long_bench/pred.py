@@ -7,6 +7,13 @@ import traceback
 from typing import Any, Union
 from pathlib import Path
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+SRC_ROOT = REPO_ROOT / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
+
 from tqdm import tqdm
 import numpy as np
 import random
@@ -15,12 +22,11 @@ import torch.multiprocessing as mp
 import torch
 from transformers import AutoTokenizer, GenerationConfig
 import torch.distributed as dist
-from deltakv.get_chat_api import get_generate_api
+from benchmark.model_adapters.sparsevllm import get_sparsevllm_generate_api
 from datetime import datetime
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-BASE_PATH = os.getenv("DELTAKV_OUTPUT_DIR", str(REPO_ROOT / "outputs"))
-DATA_PREFIX_PATH = os.getenv("DELTAKV_LONGBENCH_DATA_DIR") or os.getenv("DELTAKV_DATA_DIR")
+BASE_PATH = os.getenv("SPARSEVLLM_OUTPUT_DIR", str(REPO_ROOT / "outputs"))
+DATA_PREFIX_PATH = os.getenv("SPARSEVLLM_LONGBENCH_DATA_DIR") or os.getenv("SPARSEVLLM_DATA_DIR")
 NO_CHAT_TEMPLATE_DATASETS = {"trec", "triviaqa", "samsum", "lsht", "lcc", "repobench-p"}
 SAMPLE_STATUSES = {
     "success",
@@ -36,7 +42,7 @@ def get_longbench_data_path(dataset, use_longbench_e):
     if not DATA_PREFIX_PATH:
         raise FileNotFoundError(
             "LongBench data root is not configured.\n"
-            "Set DELTAKV_LONGBENCH_DATA_DIR or DELTAKV_DATA_DIR to the LongBench "
+            "Set SPARSEVLLM_LONGBENCH_DATA_DIR or SPARSEVLLM_DATA_DIR to the LongBench "
             "root directory that contains data/*.jsonl."
         )
     suffix = "_e" if use_longbench_e else ""
@@ -47,14 +53,14 @@ def validate_longbench_data_paths(datasets, use_longbench_e):
     if not DATA_PREFIX_PATH:
         raise FileNotFoundError(
             "LongBench data root is not configured.\n"
-            "Set DELTAKV_LONGBENCH_DATA_DIR or DELTAKV_DATA_DIR to the LongBench "
+            "Set SPARSEVLLM_LONGBENCH_DATA_DIR or SPARSEVLLM_DATA_DIR to the LongBench "
             "root directory that contains data/*.jsonl."
         )
     if not os.path.isdir(DATA_PREFIX_PATH):
         raise FileNotFoundError(
             "LongBench data root does not exist: "
             f"{DATA_PREFIX_PATH}\n"
-            "Set DELTAKV_LONGBENCH_DATA_DIR or DELTAKV_DATA_DIR to the LongBench root "
+            "Set SPARSEVLLM_LONGBENCH_DATA_DIR or SPARSEVLLM_DATA_DIR to the LongBench root "
             "directory that contains data/*.jsonl."
         )
 
@@ -63,7 +69,7 @@ def validate_longbench_data_paths(datasets, use_longbench_e):
         raise FileNotFoundError(
             "LongBench data directory does not exist: "
             f"{data_dir}\n"
-            "Set DELTAKV_LONGBENCH_DATA_DIR or DELTAKV_DATA_DIR to the LongBench root "
+            "Set SPARSEVLLM_LONGBENCH_DATA_DIR or SPARSEVLLM_DATA_DIR to the LongBench root "
             "directory that contains a data/ subdirectory."
         )
 
@@ -76,7 +82,7 @@ def validate_longbench_data_paths(datasets, use_longbench_e):
         raise FileNotFoundError(
             "Missing LongBench dataset files:\n"
             + "\n".join(missing_paths)
-            + "\nCheck DELTAKV_LONGBENCH_DATA_DIR / DELTAKV_DATA_DIR."
+            + "\nCheck SPARSEVLLM_LONGBENCH_DATA_DIR / SPARSEVLLM_DATA_DIR."
         )
 
 def seed_everything(seed):
@@ -267,23 +273,6 @@ def _write_sample_record(
     _append_jsonl(task_out_path, task_record)
 
 
-def build_kvzip_prompt_parts(prompt_format, json_obj, use_kvzip_template=True):
-    if "{context}" not in prompt_format:
-        raise ValueError("KVzip LongBench adapter requires '{context}' in the prompt template.")
-
-    pre_context, post_context = prompt_format.split("{context}", 1)
-    format_fields = dict(json_obj)
-    context_text = format_fields.pop("context")
-
-    context_prefix = pre_context.format(**format_fields)
-    query_suffix = post_context.format(**format_fields)
-    return {
-        "prefill_text": context_prefix + context_text,
-        "query_text": query_suffix,
-        "use_kvzip_template": use_kvzip_template,
-    }
-
-
 def load_model_and_tokenizer(rank, args):
     infer_config = {
         'max_model_len': args.max_model_len,
@@ -305,14 +294,11 @@ def load_model_and_tokenizer(rank, args):
                 raise ValueError(f"Failed to parse --hyper_param '{args.hyper_param}'. "
                                  f"It is neither a valid file path nor a valid JSON string. Error: {e}")
 
-    generate_fn = get_generate_api(
+    generate_fn = get_sparsevllm_generate_api(
         model_path=args.model_path,
         infer_config=infer_config,
         deltakv_checkpoint_path=args.deltakv_checkpoint_path,
-        tokenizer_path=args.tokenizer_path,
         sparse_method=args.sparse_method,
-        cuda_device=rank,
-        backend=args.backend
     )
     
     # 我们还需要 tokenizer 来进行长度检查和截断
@@ -365,58 +351,20 @@ def get_pred(rank, data, dataset_info, args, model, tokenizer, model_max_length,
                 if "answers" not in json_obj or "all_classes" not in json_obj:
                     raise ValueError("LongBench sample must contain answers and all_classes fields.")
 
-                if args.sparse_method == "kvzip" and args.backend == "hf":
-                    use_kvzip_template = should_use_chat_template(
-                        dataset,
-                        args.no_chat_template,
-                        args.thinking_mode,
+                prompt = prompt_format.format(**json_obj)
+                tokenized_prompt = tokenizer(prompt, truncation=False, return_tensors="pt").input_ids[0]
+                if len(tokenized_prompt) > max_length:
+                    half = int(max_length / 2)
+                    prompt = (
+                            tokenizer.decode(tokenized_prompt[:half], skip_special_tokens=True) +
+                            tokenizer.decode(tokenized_prompt[-half:], skip_special_tokens=True)
                     )
-                    prompt_parts = build_kvzip_prompt_parts(
-                        prompt_format,
-                        json_obj,
-                        use_kvzip_template=use_kvzip_template,
-                    )
-                    query_ids = tokenizer(
-                        prompt_parts["query_text"],
-                        truncation=False,
-                        return_tensors="pt",
-                    ).input_ids[0]
-                    max_context_length = max(max_length - len(query_ids), 1)
-                    context_ids = tokenizer(
-                        prompt_parts["prefill_text"],
-                        truncation=False,
-                        return_tensors="pt",
-                    ).input_ids[0]
-                    if prompt_tokens is None:
-                        prompt_tokens = int(len(context_ids) + len(query_ids))
-                    if len(context_ids) > max_context_length:
-                        half = int(max_context_length / 2)
-                        if half == 0:
-                            prompt_parts["prefill_text"] = tokenizer.decode(
-                                context_ids[-max_context_length:],
-                                skip_special_tokens=True,
-                            )
-                        else:
-                            prompt_parts["prefill_text"] = (
-                                tokenizer.decode(context_ids[:half], skip_special_tokens=True) +
-                                tokenizer.decode(context_ids[-half:], skip_special_tokens=True)
-                            )
-                    prompt = prompt_parts
-                else:
-                    prompt = prompt_format.format(**json_obj)
-                    tokenized_prompt = tokenizer(prompt, truncation=False, return_tensors="pt").input_ids[0]
-                    if len(tokenized_prompt) > max_length:
-                        half = int(max_length / 2)
-                        prompt = (
-                                tokenizer.decode(tokenized_prompt[:half], skip_special_tokens=True) +
-                                tokenizer.decode(tokenized_prompt[-half:], skip_special_tokens=True)
-                        )
-                    prompt = build_chat(tokenizer, prompt, dataset, args.no_chat_template, args.thinking_mode)
-                    if prompt_tokens is None:
-                        add_special_tokens = True
-                        if tokenizer.bos_token is None or prompt.startswith(tokenizer.bos_token):
-                            add_special_tokens = False
-                        prompt_tokens = len(tokenizer.encode(prompt, add_special_tokens=add_special_tokens))
+                prompt = build_chat(tokenizer, prompt, dataset, args.no_chat_template, args.thinking_mode)
+                if prompt_tokens is None:
+                    add_special_tokens = True
+                    if tokenizer.bos_token is None or prompt.startswith(tokenizer.bos_token):
+                        add_special_tokens = False
+                    prompt_tokens = len(tokenizer.encode(prompt, add_special_tokens=add_special_tokens))
                 prompts.append(prompt)
                 prepared_records.append(
                     _sample_base_record(
@@ -632,12 +580,11 @@ def worker(rank, world_size, datasets, dataset2prompt, dataset2maxlen, args, out
         )
         torch.cuda.empty_cache()
 
-    if args.backend == "sparsevllm":
-        _write_decode_cuda_graph_status(
-            generate_fn=model,
-            out_root=out_root,
-            rank=rank,
-        )
+    _write_decode_cuda_graph_status(
+        generate_fn=model,
+        out_root=out_root,
+        rank=rank,
+    )
 
 
 def launch_single_gpu_workers(args, out_root):
@@ -706,7 +653,6 @@ def parse_args():
     parser.add_argument("--deltakv_checkpoint_path", type=str, default=None)
     parser.add_argument("--tokenizer_path", type=str, default=None)
     parser.add_argument("--sparse_method", type=str, default='deltakv')
-    parser.add_argument("--backend", type=str, default='hf', choices=['hf', 'sparsevllm'])
     parser.add_argument("--num_samples", type=int, default=None, help="Limit the number of samples to process per task")
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size for inference")
     parser.add_argument("--no_chat_template", action='store_true', help="Do not use chat template")
@@ -773,7 +719,7 @@ if __name__ == '__main__':
             "model": args.model,
             "model_path": args.model_path,
             "tokenizer_path": args.tokenizer_path or args.model_path,
-            "backend": args.backend,
+            "backend": "sparsevllm",
             "sparse_method": args.sparse_method,
             "deltakv_checkpoint_path": args.deltakv_checkpoint_path,
             "datasets": datasets,
@@ -798,24 +744,8 @@ if __name__ == '__main__':
 
     if args.worker_rank >= 0:
         worker(args.worker_rank, args.worker_world_size, datasets, dataset2prompt, dataset2maxlen, args, out_root, max_length_limit)
-    elif args.ws > 1 and (args.sparse_method == "kvzip" or args.backend == "sparsevllm"):
-        launch_single_gpu_workers(args, out_root)
     elif args.ws > 1:
-        processes = []
-        for rank in range(args.ws):
-            p = mp.Process(target=worker, args=(rank, args.ws, datasets, dataset2prompt, dataset2maxlen, args, out_root, max_length_limit))
-            p.start()
-            processes.append(p)
-        failed_ranks = []
-        for rank, p in enumerate(processes):
-            p.join()
-            if p.exitcode != 0:
-                failed_ranks.append((rank, p.exitcode))
-        if failed_ranks:
-            raise RuntimeError(
-                "LongBench worker failed; aborting evaluation. "
-                + ", ".join(f"rank={rank}, exitcode={exitcode}" for rank, exitcode in failed_ranks)
-            )
+        launch_single_gpu_workers(args, out_root)
     else:
         worker(0, 1, datasets, dataset2prompt, dataset2maxlen, args, out_root, max_length_limit)
 

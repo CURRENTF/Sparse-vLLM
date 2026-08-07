@@ -8,7 +8,6 @@ This document describes how to run the fixed SparseVLLM regression harness under
 The harness is intended for reproducible method/model checks across:
 
 - `quality`: LongBench-mini generation quality.
-- `logits`: HF-reference vs SparseVLLM logits alignment.
 - `perf`: prefill/decode throughput and memory accounting.
 - `stress`: fixed-length high-concurrency SparseVLLM admission/decode stress.
 - `stress_v2`: synthetic serving-trace stress with shared-prefix and multi-turn
@@ -41,8 +40,8 @@ Set the environment before running the suite:
 ```bash
 cd <REPO_ROOT>
 
-export DELTAKV_OUTPUT_DIR=<OUTPUT_ROOT>
-export DELTAKV_LONGBENCH_DATA_DIR=<LONGBENCH_ROOT>
+export SPARSEVLLM_OUTPUT_DIR=<OUTPUT_ROOT>
+export SPARSEVLLM_LONGBENCH_DATA_DIR=<LONGBENCH_ROOT>
 
 export DELTAKV_MODEL_QWEN25_7B=<MODEL_ROOT>/Qwen2.5-7B-Instruct-1M
 export DELTAKV_MODEL_QWEN3_4B=<MODEL_ROOT>/Qwen3-4B-Instruct-2507
@@ -220,22 +219,6 @@ conda run -n <CONDA_ENV> --no-capture-output \
   --output_root <OUTPUT_ROOT>
 ```
 
-### Correctness / Logits
-
-`logits` compares HF sparse reference outputs with SparseVLLM for methods that
-declare `hf_logits_reference=true`. Methods without an HF reference are graded
-`N/A` by policy.
-
-```bash
-conda run -n <CONDA_ENV> --no-capture-output \
-  python benchmark/sparsevllm_regression/run_suite.py \
-  --layer logits \
-  --models qwen25_7b,qwen3_4b,llama31_8b \
-  --methods omnikv \
-  --run_id omnikv_logits_$(date -u +%Y%m%d_%H%M%S) \
-  --output_root <OUTPUT_ROOT>
-```
-
 ### Performance
 
 Performance uses:
@@ -334,7 +317,7 @@ conda run -n <CONDA_ENV> --no-capture-output \
 
 ### Combined Layers
 
-`nightly` runs quality, logits, and performance. It does not run stress.
+`nightly` runs quality and performance. It does not run stress.
 
 ```bash
 conda run -n <CONDA_ENV> --no-capture-output \
@@ -346,7 +329,7 @@ conda run -n <CONDA_ENV> --no-capture-output \
   --output_root <OUTPUT_ROOT>
 ```
 
-`pre-refactor` runs quality, logits, performance, and stress.
+`pre-refactor` runs quality, performance, and stress.
 
 ## Result Records
 
@@ -357,7 +340,7 @@ is needed, cite the original run artifact path directly.
 ## OmniKV Full-Layer Selection
 
 OmniKV full layers are model-specific. Use
-`scripts/analysis/select_omnikv_full_layers.py` before publishing a new model's
+`python -m sparsevllm.utils.select_omnikv_full_layers` before publishing a new model's
 OmniKV or OmniKV-aligned DeltaKV regression numbers.
 
 The selector runs an offline decode-attention coverage calibration on a
@@ -369,7 +352,7 @@ Example for Qwen2.5-7B with six full layers:
 
 ```bash
 conda run -n <CONDA_ENV> --no-capture-output \
-  python scripts/analysis/select_omnikv_full_layers.py \
+  python -m sparsevllm.utils.select_omnikv_full_layers \
   --model-path <MODEL_ROOT>/Qwen2.5-7B-Instruct-1M \
   --longbench-root <LONGBENCH_ROOT> \
   --config-dir benchmark/long_bench/config \
@@ -394,8 +377,6 @@ Key outputs:
 - `pair_scores.npy` and `segment_scores.npy`: raw coverage matrices for audit.
 - `run_info.json`: command, git state, model/data paths, and calibration
   settings.
-- `top128_kl_metrics.json`: optional validation output when running with
-  `--top128-kl-only`.
 
 To use the selected layers in an ad hoc Sparse-VLLM run, copy the
 `full_attention_layers` value into `--hyper_params`:
@@ -422,7 +403,7 @@ qwen3_4b:   0,1,3,9,13,16,21,28
 llama31_8b: 0,2,7,13,16,26
 ```
 
-Run `validate` and rerun OmniKV quality/logits/perf/stress after changing these
+Run `validate` and rerun OmniKV quality/perf/stress after changing these
 layers.
 
 ## Outputs
@@ -432,7 +413,6 @@ Each run writes:
 - `resolved_manifest.json`: manifest after environment-variable resolution.
 - `grade_summary.json`: command records, grades, and final status.
 - `metrics.json`: quality aggregate records.
-- `logits_alignment.json`: logits comparison summaries.
 - `perf.jsonl`: flattened performance rows.
 - `memory.json`: memory grades derived from performance rows.
 - `stress.json`: stress rows and stress grades.
@@ -441,7 +421,6 @@ Each run writes:
   generation artifacts, when quality is run.
 - Layer-specific logs:
   - `quality/<model>/<method>/run.log`
-  - `logits/<model>/<method>/run.log`
   - `perf/<model>/<method>.log`
   - `stress/<model>/<method>.log`
 
@@ -481,7 +460,7 @@ run IDs, or remote log paths to the rubric file.
   - Ensure `PYTHONPATH=<REPO_ROOT>:<REPO_ROOT>/src:${PYTHONPATH:-}`.
   - Use an environment with the dependencies from [Getting Started](../getting_started/README.md).
 - Quality dataset errors:
-  - Set `DELTAKV_LONGBENCH_DATA_DIR=<LONGBENCH_ROOT>`.
+  - Set `SPARSEVLLM_LONGBENCH_DATA_DIR=<LONGBENCH_ROOT>`.
 - GPU memory failures:
   - Do not add fallback behavior inside the harness.
   - Record the exact run ID, model, method, layer, log path, and error in the

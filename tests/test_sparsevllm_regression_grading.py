@@ -12,7 +12,6 @@ import numpy as np
 import torch
 
 from benchmark.sparsevllm_regression.grading import (
-    grade_logits,
     grade_memory,
     grade_perf,
     grade_quality,
@@ -712,18 +711,7 @@ class SparseVLLMRegressionGradingTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "ended before </think>"):
             strip_thinking_content("truncated reasoning")
 
-    def test_logits_perf_memory_and_stress_grades(self):
-        metrics = {
-            "decode_steps": [
-                {
-                    "argmax_match": True,
-                    "topk_overlap": {"5": {"ratio": 0.8}, "10": {"ratio": 0.9}},
-                    "p99_abs_diff": 0.01,
-                }
-            ]
-        }
-        self.assertEqual(grade_logits(metrics, p99_threshold=0.1).grade, "A")
-        self.assertEqual(grade_logits(None).grade, "N/A")
+    def test_perf_memory_and_stress_grades(self):
         self.assertEqual(grade_perf(1.1, graph_expected=True, graph_active=True).grade, "C")
         self.assertEqual(grade_perf(0.8, graph_expected=True, graph_active=True, require_speedup=False).grade, "A")
         self.assertEqual(grade_perf(2.1, graph_expected=True, graph_active=False).grade, "D")

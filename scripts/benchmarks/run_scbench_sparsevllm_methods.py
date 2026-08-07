@@ -256,7 +256,6 @@ def method_runtime_config(
     method = manifest["methods"][method_id]
     cfg = dict(method.get("config") or {})
     cfg.update((method.get("model_configs") or {}).get(model_id, {}))
-    cfg.pop("hf_sparse_method", None)
     cfg["sparse_method"] = method["sparse_method"]
     compressor_path = compressor_path_for(manifest["models"][model_id], method)
     if compressor_path:

@@ -17,9 +17,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-DEFAULT_MODEL_ROOT = Path(os.getenv("DELTAKV_MODEL_ROOT", PROJECT_ROOT / "models"))
-DEFAULT_DATA_ROOT = Path(os.getenv("DELTAKV_DATA_DIR", PROJECT_ROOT / "data"))
-DEFAULT_OUTPUT_ROOT = Path(os.getenv("DELTAKV_OUTPUT_DIR", PROJECT_ROOT / "outputs"))
+DEFAULT_MODEL_ROOT = Path(os.getenv("SPARSEVLLM_MODEL_ROOT", PROJECT_ROOT / "models"))
+DEFAULT_DATA_ROOT = Path(os.getenv("SPARSEVLLM_DATA_DIR", PROJECT_ROOT / "data"))
+DEFAULT_OUTPUT_ROOT = Path(os.getenv("SPARSEVLLM_OUTPUT_DIR", PROJECT_ROOT / "outputs"))
 
 from benchmark.multimodal.video_qa import streamingbench as streaming
 
@@ -42,15 +42,14 @@ CHOICES = {"A", "B", "C", "D"}
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Benchmark LLaVA-OneVision vanilla and DeltaKV less-memory on Video-MME."
+        description="Benchmark LLaVA-OneVision on Video-MME."
     )
     parser.add_argument("--model_path", default=str(DEFAULT_MODEL_ROOT / "llava-onevision-qwen2-0.5b-ov-hf"))
-    parser.add_argument("--deltakv_checkpoint_path", default="none")
     parser.add_argument("--dataset_dir", default=str(DEFAULT_DATA_ROOT / "Video-MME_hf"))
     parser.add_argument("--annotation_path", default="")
     parser.add_argument("--video_dir", default="")
     parser.add_argument("--subtitle_dir", default="")
-    parser.add_argument("--output_dir", default=str(DEFAULT_OUTPUT_ROOT / "deltakv_multimodal" / "videomme"))
+    parser.add_argument("--output_dir", default=str(DEFAULT_OUTPUT_ROOT / "multimodal" / "videomme"))
     parser.add_argument(
         "--durations",
         default="all",
@@ -72,16 +71,6 @@ def parse_args():
     parser.add_argument("--torch_dtype", default="bfloat16", choices=["bfloat16", "float16"])
     parser.add_argument("--attn_implementation", default="flash_attention_2")
     parser.add_argument("--image_processor_use_fast", action="store_true")
-    parser.add_argument("--recent_keep_tokens", type=int, default=128)
-    parser.add_argument("--sink_keep_tokens", type=int, default=8)
-    parser.add_argument("--decode_keep_tokens", type=int, default=1024)
-    parser.add_argument("--prefill_keep_tokens", type=int, default=4096)
-    parser.add_argument("--hf_prefill_chunk_size", type=int, default=100000000)
-    parser.add_argument("--chunk_prefill_accel_omnikv", action="store_true")
-    parser.add_argument("--full_attention_layers", default="0,1,2,3,8,16,22")
-    parser.add_argument("--visual_keep_ratio", type=float, default=1.0)
-    parser.add_argument("--deltakv_center_ratio", type=float, default=0.1)
-    parser.add_argument("--deltakv_neighbor_count", type=int, default=1)
     parser.add_argument("--frame_cache_dir", default="")
     parser.add_argument("--reuse_frame_cache", action="store_true")
     parser.add_argument("--frame_load_workers", type=int, default=1)
@@ -121,10 +110,6 @@ def validate_args(args):
         raise ValueError("--log_every must be >= 1.")
     if args.frame_load_workers < 1:
         raise ValueError("--frame_load_workers must be >= 1.")
-    if args.visual_keep_ratio <= 0.0 or args.visual_keep_ratio > 1.0:
-        raise ValueError("--visual_keep_ratio must be in (0, 1].")
-    if args.deltakv_center_ratio <= 0.0 or args.deltakv_center_ratio > 1.0:
-        raise ValueError("--deltakv_center_ratio must be in (0, 1].")
 
 
 def selected_values(raw: str, valid: set[str], *, field: str) -> set[str] | None:
@@ -340,7 +325,6 @@ def build_run_info(args, dataset_info: dict, row_count: int) -> dict:
         "git_commit": get_git_commit(),
         "benchmark": "Video-MME",
         "model_path": args.model_path,
-        "deltakv_checkpoint_path": args.deltakv_checkpoint_path,
         "methods": args.methods,
         "dataset_dir": args.dataset_dir,
         "annotation_path": dataset_info["annotation_path"],
@@ -363,16 +347,6 @@ def build_run_info(args, dataset_info: dict, row_count: int) -> dict:
         "evaluated_sample_count": row_count,
         "dataset_info": dataset_info,
         "runtime_params": {
-            "recent_keep_tokens": args.recent_keep_tokens,
-            "sink_keep_tokens": args.sink_keep_tokens,
-            "decode_keep_tokens": args.decode_keep_tokens,
-            "prefill_keep_tokens": args.prefill_keep_tokens,
-            "hf_prefill_chunk_size": args.hf_prefill_chunk_size,
-            "full_attention_layers": args.full_attention_layers,
-            "visual_keep_ratio": args.visual_keep_ratio,
-            "deltakv_center_ratio": args.deltakv_center_ratio,
-            "deltakv_neighbor_count": args.deltakv_neighbor_count,
-            "chunk_prefill_accel_omnikv": bool(args.chunk_prefill_accel_omnikv),
             "frame_load_workers": args.frame_load_workers,
             "preprocess_prefetch_batches": args.preprocess_prefetch_batches,
         },
@@ -447,17 +421,11 @@ def main():
     )
     results = []
     for requested_method, method_kind in streaming.iter_methods(args.methods):
-        if method_kind == "vanilla":
-            from benchmark.multimodal.model_adapters.llava_onevision import load_vanilla_model
+        from benchmark.multimodal.model_adapters.llava_onevision import load_vanilla_model
 
-            model = load_vanilla_model(args, dtype, device)
-            method_label = "vanilla"
-            policy = None
-        else:
-            from benchmark.multimodal.model_adapters.llava_onevision import load_llava_deltakv_model
-
-            model, policy = load_llava_deltakv_model(args, dtype, device)
-            method_label = policy["method"]
+        model = load_vanilla_model(args, dtype, device)
+        method_label = "vanilla"
+        policy = None
 
         result = streaming.run_method(method_label, model, processor, rows, args, dtype, device, policy=policy)
         result["requested_method"] = requested_method

@@ -7,7 +7,6 @@
 harness 用于对以下层进行可复现的方法/模型检查：
 
 - `quality`：LongBench-mini generation quality。
-- `logits`：HF reference 与 SparseVLLM logits alignment。
 - `perf`：prefill/decode throughput 和 memory accounting。
 - `stress`：固定长度、高并发的 SparseVLLM admission/decode stress。
 - `stress_v2`：带 shared-prefix 和 multi-turn workload、可变 prompt length，并对支持方法验证 prefix-cache hit 的 synthetic serving trace stress。
@@ -37,8 +36,8 @@ test plan 由 `benchmark/sparsevllm_regression/manifest.json` 控制。
 ```bash
 cd <REPO_ROOT>
 
-export DELTAKV_OUTPUT_DIR=<OUTPUT_ROOT>
-export DELTAKV_LONGBENCH_DATA_DIR=<LONGBENCH_ROOT>
+export SPARSEVLLM_OUTPUT_DIR=<OUTPUT_ROOT>
+export SPARSEVLLM_LONGBENCH_DATA_DIR=<LONGBENCH_ROOT>
 
 export DELTAKV_MODEL_QWEN25_7B=<MODEL_ROOT>/Qwen2.5-7B-Instruct-1M
 export DELTAKV_MODEL_QWEN3_4B=<MODEL_ROOT>/Qwen3-4B-Instruct-2507
@@ -205,20 +204,6 @@ conda run -n <CONDA_ENV> --no-capture-output \
   --output_root <OUTPUT_ROOT>
 ```
 
-### Correctness / Logits
-
-`logits` 对声明 `hf_logits_reference=true` 的方法比较 HF sparse reference output 与 SparseVLLM。没有 HF reference 的方法按 policy 评为 `N/A`。
-
-```bash
-conda run -n <CONDA_ENV> --no-capture-output \
-  python benchmark/sparsevllm_regression/run_suite.py \
-  --layer logits \
-  --models qwen25_7b,qwen3_4b,llama31_8b \
-  --methods omnikv \
-  --run_id omnikv_logits_$(date -u +%Y%m%d_%H%M%S) \
-  --output_root <OUTPUT_ROOT>
-```
-
 ### Performance
 
 Performance 使用：
@@ -309,7 +294,7 @@ conda run -n <CONDA_ENV> --no-capture-output \
 
 ### 组合 Layer
 
-`nightly` 运行 quality、logits 和 performance，不运行 stress。
+`nightly` 运行 quality 和 performance，不运行 stress。
 
 ```bash
 conda run -n <CONDA_ENV> --no-capture-output \
@@ -321,7 +306,7 @@ conda run -n <CONDA_ENV> --no-capture-output \
   --output_root <OUTPUT_ROOT>
 ```
 
-`pre-refactor` 运行 quality、logits、performance 和 stress。
+`pre-refactor` 运行 quality、performance 和 stress。
 
 ## 结果记录
 
@@ -329,7 +314,7 @@ conda run -n <CONDA_ENV> --no-capture-output \
 
 ## OmniKV Full-Layer Selection
 
-OmniKV full layer 与模型相关。发布新模型的 OmniKV 或与 OmniKV 对齐的 DeltaKV regression 数值前，使用 `scripts/analysis/select_omnikv_full_layers.py`。
+OmniKV full layer 与模型相关。发布新模型的 OmniKV 或与 OmniKV 对齐的 DeltaKV regression 数值前，使用 `python -m sparsevllm.utils.select_omnikv_full_layers`。
 
 selector 在 LongBench task 上运行离线 decode-attention coverage calibration，选择 `--num-full-layers` 个 layer，并把选中的 layer 字符串写入 `selected_full_layers.json`。这不是 online runtime mode：必须将该字符串作为 `full_attention_layers` 传回。
 
@@ -337,7 +322,7 @@ Qwen2.5-7B 选择六个 full layer 的示例：
 
 ```bash
 conda run -n <CONDA_ENV> --no-capture-output \
-  python scripts/analysis/select_omnikv_full_layers.py \
+  python -m sparsevllm.utils.select_omnikv_full_layers \
   --model-path <MODEL_ROOT>/Qwen2.5-7B-Instruct-1M \
   --longbench-root <LONGBENCH_ROOT> \
   --config-dir benchmark/long_bench/config \
@@ -360,7 +345,6 @@ conda run -n <CONDA_ENV> --no-capture-output \
 - `per_sample_points.jsonl`：calibration 使用的 sampled decode point。
 - `pair_scores.npy` 和 `segment_scores.npy`：用于审计的 raw coverage matrix。
 - `run_info.json`：命令、Git state、model/data path 和 calibration setting。
-- `top128_kl_metrics.json`：使用 `--top128-kl-only` 运行时的可选 validation output。
 
 在临时 Sparse-VLLM run 中使用选中 layer 时，将 `full_attention_layers` 值复制到 `--hyper_params`：
 
@@ -382,7 +366,7 @@ qwen3_4b:   0,1,3,9,13,16,21,28
 llama31_8b: 0,2,7,13,16,26
 ```
 
-更改这些 layer 后，运行 `validate`，并重新运行 OmniKV quality/logits/perf/stress。
+更改这些 layer 后，运行 `validate`，并重新运行 OmniKV quality/perf/stress。
 
 ## 输出
 
@@ -391,7 +375,6 @@ llama31_8b: 0,2,7,13,16,26
 - `resolved_manifest.json`：环境变量解析后的 manifest。
 - `grade_summary.json`：command record、grade 和 final status。
 - `metrics.json`：quality aggregate record。
-- `logits_alignment.json`：logits comparison summary。
 - `perf.jsonl`：展平的 performance row。
 - `memory.json`：根据 performance row 得到的 memory grade。
 - `stress.json`：stress row 和 stress grade。
@@ -399,7 +382,6 @@ llama31_8b: 0,2,7,13,16,26
 - `raw_outputs.jsonl`、`parsed_outputs.jsonl`、`sample_results.jsonl`：运行 quality 时的 generation artifact。
 - Layer-specific log：
   - `quality/<model>/<method>/run.log`
-  - `logits/<model>/<method>/run.log`
   - `perf/<model>/<method>.log`
   - `stress/<model>/<method>.log`
 
@@ -435,7 +417,7 @@ PY
   - 确保 `PYTHONPATH=<REPO_ROOT>:<REPO_ROOT>/src:${PYTHONPATH:-}`。
   - 使用包含[快速开始](../getting_started/README.md)所列依赖的环境。
 - Quality dataset error：
-  - 设置 `DELTAKV_LONGBENCH_DATA_DIR=<LONGBENCH_ROOT>`。
+  - 设置 `SPARSEVLLM_LONGBENCH_DATA_DIR=<LONGBENCH_ROOT>`。
 - GPU memory failure：
   - 不要在 harness 内添加 fallback。
   - 在 issue note 中记录准确 run ID、model、method、layer、log path 和 error。

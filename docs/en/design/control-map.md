@@ -68,7 +68,7 @@ flowchart TD
 | `src/sparsevllm/engine/sparse_controller.py` | Cross-layer attention-score collection, dynamic token selection, post-forward compression triggers. | Keep persistent method metadata in cache managers, not here. |
 | `src/sparsevllm/layers/attention.py` | Generic KV store + attention kernel dispatch + hook calls. | Add generic hooks if needed; avoid method-specific branches. |
 | `src/sparsevllm/triton_kernel/` | Kernel implementations. | Kernel wrappers should fail fast on invalid shape/dtype assumptions. |
-| `src/deltakv/` | HF wrappers, compressor training, HF-side caches and model integration. | Use for HF parity and compressor behavior, not Sparse-VLLM engine ownership. |
+| `benchmark/model_adapters/sparsevllm.py` | Shared native text-benchmark generation adapter. | Keep it thin; runtime behavior belongs in `src/sparsevllm/`. |
 | `benchmark/` and `scripts/` | Evaluation, debugging, analysis, throughput scripts. | Preserve raw outputs, parsed outputs, per-sample status, aggregate metrics, and run info separately. |
 
 ## Method Families
@@ -78,7 +78,7 @@ flowchart TD
 | Dense | `vanilla` / `""` | Full KV cache, no sparse selection. | `standard.py`, generic attention path |
 | Streaming window | `streamingllm`, `attention-sink`, `attention_sink` | Physical eviction to sink + recent tokens. | `streamingllm.py`, `standard.py`-style mechanics |
 | SnapKV / PyramidKV | `snapkv`, `pyramidkv` | Physical eviction after score-based keep selection; PyramidKV changes per-layer budgets. | `snapkv.py`, `sparse_controller.py` |
-| OmniKV | `omnikv` | Logical masking/view building from observation-layer scores. Full layers should be model-calibrated with `scripts/analysis/select_omnikv_full_layers.py` and then passed as `full_attention_layers`. | `omnikv.py`, `sparse_controller.py`, `omnikv_fused.py` |
+| OmniKV | `omnikv` | Logical masking/view building from observation-layer scores. Full layers should be model-calibrated with `python -m sparsevllm.utils.select_omnikv_full_layers` and then passed as `full_attention_layers`. | `omnikv.py`, `sparse_controller.py`, `omnikv_fused.py` |
 | QuEST | `quest` | Query-aware decode page/chunk selection. | `quest.py` |
 | DeltaKV | `deltakv` | Compressor-backed hybrid cache: sparse full/reference pool plus compressed latent state. | `deltakv.py`, `deltakv_kernels.py` |
 | DeltaKV | `deltakv` plus legacy `deltakv-less-memory*` aliases | Slim compressor-backed DeltaKV runtime with graph-stable decode metadata. | `deltakv_runtime.py`, `deltakv_less_memory*.py`, `deltakv_kernels.py` |
@@ -105,22 +105,21 @@ flowchart TD
 | File | Why it is hard | How to approach it |
 | --- | --- | --- |
 | `src/sparsevllm/engine/cache_manager/deltakv_less_memory.py` | Very large direct-residual/full-layer-KIVI/static-graph implementation. | Treat as several logical regions: allocation, prefill staging, full-layer KIVI, sparse raw/ref views, static decode plan, reconstruction/writeback. Add tests around the region touched. |
-| `src/sparsevllm/engine/cache_manager/deltakv.py` | Compressor-backed V4 path combines clustering, latent storage, full pool, staging, reconstruction, and graph hooks. | Avoid cosmetic edits. Change only with a focused HF-vs-Sparse or kernel comparison. |
+| `src/sparsevllm/engine/cache_manager/deltakv.py` | Compressor-backed V4 path combines clustering, latent storage, full pool, staging, reconstruction, and graph hooks. | Avoid cosmetic edits. Change only with focused native runtime and kernel tests. |
 | `src/sparsevllm/engine/sparse_controller.py` | Cross-layer policy for OmniKV, DeltaKV, SnapKV, PyramidKV, score dtype, and debug capture all meet here. | Keep new persistent state out. Only add orchestration or score/selection logic here. |
 | `src/sparsevllm/layers/attention.py` | Small enough, but high blast radius because every method passes through it. | Keep it method-agnostic. Prefer adding a cache-manager hook over adding a branch here. |
 ## Change Guardrails
 
 Before changing Sparse-VLLM runtime code:
 
-1. Identify the backend: HF, Sparse-VLLM, or both.
+1. Identify the affected native Sparse-vLLM runtime path.
 2. Identify the method family and graph mode: eager, decode graph, prefill
    graph, or both.
 3. Identify the state owner. If the state persists across steps, it belongs in
    a cache manager.
 4. Do not use legacy public runtime names in new configs. Use
    `sparse_method`, `deltakv_checkpoint_path`, `decode_keep_tokens`,
-   `prefill_keep_tokens`, `sink_keep_tokens`, `recent_keep_tokens`,
-   `full_attention_layers`, `hf_prefill_chunk_size`, and
+   `sink_keep_tokens`, `recent_keep_tokens`, `full_attention_layers`, and
    `engine_prefill_chunk_size`.
 5. Sparse-VLLM keep budgets are token counts, not ratios.
 6. Any fallback must be explicit and documented. Do not silently ignore bad
@@ -161,22 +160,17 @@ CUDA_VISIBLE_DEVICES=<GPU> PYTHONPATH=$PWD:$PWD/src python -m unittest \
   tests.test_deltakv_less_memory_kernel
 ```
 
-Correctness checks before claiming HF/Sparse parity:
+Native DeltaKV path smoke:
 
 ```bash
 CUDA_VISIBLE_DEVICES=<GPU> PYTHONPATH=$PWD:$PWD/src python \
-  scripts/debug/compare_logits_hf_sparsevllm.py \
+  scripts/benchmarks/bench_sparse_vllm.py \
   --model_path <MODEL_DIR> \
-  --compressor_path <COMPRESSOR_DIR> \
-  --cases longbench \
   --methods deltakv \
-  --sparse_method deltakv \
-  --hf_sparse_method delta_compressed_quant_kivi_full_fp8_ref \
-  --longbench_task hotpotqa \
-  --longbench_sample_idx 0 \
-  --teacher_forced_decode_steps 3 \
-  --output_dir <OUTPUT_DIR> \
-  <explicit sparse/runtime params>
+  --lengths 1024 \
+  --batch_sizes 1 \
+  --output_len 4 \
+  --hyper_params '{"deltakv_checkpoint_path":"<COMPRESSOR_DIR>","engine_prefill_chunk_size":512,"decode_keep_tokens":64,"recent_keep_tokens":32,"sink_keep_tokens":4}'
 ```
 
 Throughput checks after correctness:

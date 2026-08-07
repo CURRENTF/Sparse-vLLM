@@ -34,25 +34,17 @@ JSON override 文件仅接受：
 ```bash
 CUDA_VISIBLE_DEVICES=5,6 \
 PYTHONPATH="$PWD:$PWD/src" \
-.venv/bin/python scripts/debug/compare_logits_hf_sparsevllm.py \
+.venv/bin/python scripts/benchmarks/bench_sparse_vllm.py \
   --model_path /data2/pretrain_models/Qwen3-8B \
-  --cases short \
+  --lengths 128 \
+  --batch_sizes 1 \
   --methods vanilla \
-  --tiny_random_config "$PWD/configs/debug/qwen3_tiny_random.json" \
-  --tiny_random_seed 17 \
-  --tensor_parallel_size 2 \
-  --max_model_len 2048 \
-  --engine_prefill_chunk_size 256 \
-  --max_num_batched_tokens 512 \
-  --max_num_seqs_in_batch 1 \
-  --max_decoding_seqs 1 \
-  --gpu_memory_utilization 0.02 \
-  --mlp_chunk_size 256 \
-  --teacher_forced_decode_steps 2 \
-  --output_dir /tmp/sparsevllm_tiny_random_qwen3_8b_tp2
+  --output_len 2 \
+  --hyper_params '{"tensor_parallel_size":2,"max_model_len":2048,"engine_prefill_chunk_size":256,"max_num_batched_tokens":512,"max_num_seqs_in_batch":1,"max_decoding_seqs":1,"gpu_memory_utilization":0.02,"mlp_chunk_size":256}'
 ```
 
-对比脚本使用相同的缩减配置和 seed 构造 HF reference，然后比较 teacher-forced prefill 和 decode logits。Tiny-random HF 对比目前只支持 `vanilla`。
+该命令只验证原生 Sparse-vLLM tiny-random 的 model construction、TP、prefill
+和 decode 路径，不代表模型质量。
 
 ## 限制
 

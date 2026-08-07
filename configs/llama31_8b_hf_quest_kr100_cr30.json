@@ -1,9 +1,0 @@
-{
-  "sparse_method": "quest",
-  "hf_prefill_chunk_size": 32768,
-  "decode_keep_tokens": 0.3,
-  "prefill_keep_tokens": 0.3,
-  "chunk_size": 16,
-  "use_cluster": false,
-  "use_compression": false
-}

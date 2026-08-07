@@ -11,7 +11,7 @@
 - [快速开始](getting_started/README.md)：安装、checkpoint 下载和最小 Sparse-vLLM 使用示例。
 - [功能](features/README.md)：稀疏方法分类、DeltaKV 说明和 Qwen3MoE 专家并行。
 - [设计](design/README.md)：仓库布局、运行时流程和方法所有权边界。
-- [配置](configuration/README.md)：规范的运行时参数和后端特定语义。
+- [配置](configuration/README.md)：规范的运行时参数和原生运行时语义。
 - [基准测试](benchmarking/README.md)：吞吐量、LongBench、MathBench / AIME /
   MATH-500、SCBench、Claw-Eval、多模态、RULER-VT、NIAH 和回归基准入口。
 - [治理](governance/README.md)：研究代码可靠性规则。
@@ -20,7 +20,6 @@
 
 - [支持的模型](features/supported-models.md)
 - [研究代码指南](governance/research-code-guidelines.md)
-- [HF 与 Sparse-vLLM 后端参数指南](configuration/hf-vs-sparsevllm-parameter-guide.md)
 - [运行时参数语义](configuration/runtime-parameter-semantics.md)
 - [Sparse-vLLM 控制图](design/control-map.md)
 

@@ -18,7 +18,7 @@ class CodeRevisionTest(unittest.TestCase):
 
         revision = code_revision_info()
 
-        mock_version.assert_called_once_with("deltakv")
+        mock_version.assert_called_once_with("sparsevllm")
         self.assertEqual(revision["package_version"], "0.1.0")
         self.assertIsNone(revision["git_commit"])
 

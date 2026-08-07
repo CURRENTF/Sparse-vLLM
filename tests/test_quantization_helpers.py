@@ -5,7 +5,7 @@ from pathlib import Path
 import torch
 from safetensors.torch import save_file
 
-from deltakv.quantization import build_model_load_kwargs, restore_modules_to_dtype
+from benchmark.model_adapters.quantization import build_model_load_kwargs, restore_modules_to_dtype
 from sparsevllm.utils.loader import load_model
 
 

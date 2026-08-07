@@ -13,8 +13,7 @@ summary of those rules.
 - `A`, `B`, and `C` are passing grades with decreasing confidence.
 - `D` is a required-gate failure; the harness writes the failure artifacts,
   marks the run failed, and exits nonzero.
-- `N/A` means the gate was skipped by policy, such as a method without an HF
-  logits reference.
+- `N/A` means the gate was skipped by policy.
 - Dated run results and blockers belong in run artifacts, issue notes, or a
   campaign-specific report outside this rubric file.
 
@@ -30,19 +29,6 @@ same run.
 | `B` | Sparse score loss `<= 0.5`. |
 | `C` | Sparse score loss `<= 1.0`. |
 | `D` | Vanilla is below the absolute baseline floor, sparse score loss `> 1.0`, missing aggregate score, or failed quality run. |
-
-## Logits
-
-Logits compares HF-reference decode outputs with SparseVLLM decode outputs when
-the method declares an HF logits reference.
-
-| Grade | Rule |
-| --- | --- |
-| `A` | Every decode step matches top-1, mean top-5 overlap `>= 0.8`, mean top-10 overlap `>= 0.9`, and p99 absolute difference is within the configured threshold when one is set. |
-| `B` | Top-1 matches for every decode step and mean top-5 overlap `>= 0.8`, but at least one `A` condition is missed. |
-| `C` | Top-1 matches for every decode step, but `B` and `A` overlap conditions are missed. |
-| `D` | Missing decode-step metrics, top-1 mismatch, or failed logits run. |
-| `N/A` | No HF logits reference exists for that method. |
 
 ## Performance
 

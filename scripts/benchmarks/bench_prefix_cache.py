@@ -597,7 +597,7 @@ def _trace_sparse_path_summary(
     multiturn_base_prefix = int(args.system_prompt_len) + int(args.session_prefix_len)
     return {
         "history_update": str(args.history_update),
-        "chunk_prefill_accel_omnikv": bool(args.chunk_prefill_accel_omnikv),
+        "require_omnikv_prefill_path": bool(args.require_omnikv_prefill_path),
         "omnikv_prefill_long_text_threshold": prefill_threshold,
         "omnikv_decode_long_text_threshold": decode_threshold,
         "quest_sparse_decode_threshold": decode_threshold,
@@ -676,9 +676,9 @@ def _validate_sparse_path_requirements(args: argparse.Namespace, cases: list[str
             )
 
     if "prefix_omnikv" in cases:
-        if not args.chunk_prefill_accel_omnikv:
+        if not args.require_omnikv_prefill_path:
             errors.append(
-                "prefix_omnikv requires --chunk_prefill_accel_omnikv for a TTFT/prefill sparse-path benchmark."
+                "prefix_omnikv requires --require_omnikv_prefill_path for a TTFT/prefill sparse-path benchmark."
             )
         if "shared_prefix" in workloads and shared_prompt <= prefill_threshold:
             errors.append(
@@ -1427,8 +1427,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_sink_tokens", type=int, default=8)
     parser.add_argument("--num_recent_tokens", type=int, default=256)
     parser.add_argument("--num_top_tokens", type=int, default=2048)
-    parser.add_argument("--num_top_tokens_in_prefill", type=int, default=2048)
-    parser.add_argument("--chunk_prefill_accel_omnikv", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--require_omnikv_prefill_path", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
         "--full_attention_layers",
         "--full_attn_layers",

@@ -128,8 +128,6 @@ llm = LLM(
     sparse_method="omnikv",
     full_attention_layers="0,1,2,4,7,14",
     decode_keep_tokens=2096,
-    prefill_keep_tokens=8192,
-    chunk_prefill_accel_omnikv=False,
 )
 
 outputs = llm.generate(
@@ -162,8 +160,7 @@ Sparse knobs:
 - `deltakv_checkpoint_path`: local DeltaKV compressor checkpoint directory or file.
 - `sink_keep_tokens`: always-kept prefix/sink tokens.
 - `recent_keep_tokens`: always-kept recent tail tokens.
-- `decode_keep_tokens`: decode-time top/important token budget.
-- `prefill_keep_tokens`: prefill/finalization top/important token budget.
+- `decode_keep_tokens`: shared sparse top/important token budget.
 - `full_attention_layers`: comma-separated layer indices or list of layers that run full attention.
 
 ## Documentation Map

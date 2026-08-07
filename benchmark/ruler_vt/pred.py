@@ -3,7 +3,7 @@
 
 This is a small, self-contained VT runner that mirrors NVIDIA RULER's
 synthetic variable-tracking generation and string-match-all scoring while
-using this repo's `get_generate_api` inference path.
+using this repo's native Sparse-vLLM inference path.
 """
 
 from __future__ import annotations
@@ -22,12 +22,19 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+SRC_ROOT = REPO_ROOT / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
+
 import numpy as np
 import torch
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
-from deltakv.get_chat_api import get_generate_api
+from benchmark.model_adapters.sparsevllm import get_sparsevllm_generate_api
 
 
 TASK_TEMPLATE = (
@@ -247,7 +254,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--hyper-param", default=None)
     parser.add_argument("--sparse-method", default=None)
-    parser.add_argument("--backend", default="hf", choices=["hf", "sparsevllm"])
     parser.add_argument("--deltakv-checkpoint-path", default=None)
     parser.add_argument("--context-lengths", default="4096,8192,16384,32768,65536,98304")
     parser.add_argument("--samples-per-length", type=int, default=20)
@@ -345,14 +351,11 @@ def evaluate_samples(args: argparse.Namespace, samples: list[VTSample], output_d
         path.write_text("", encoding="utf-8")
 
     tokenizer_path = args.tokenizer_path or args.model_path
-    generate = get_generate_api(
+    generate = get_sparsevllm_generate_api(
         model_path=args.model_path,
         infer_config=infer_config,
         deltakv_checkpoint_path=args.deltakv_checkpoint_path,
-        tokenizer_path=tokenizer_path,
         sparse_method=args.sparse_method,
-        cuda_device=args.cuda_device,
-        backend=args.backend,
     )
 
     raw_rows: list[dict[str, Any]] = []
