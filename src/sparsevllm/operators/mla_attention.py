@@ -471,7 +471,8 @@ class MlaSglFa3Provider(MlaTritonProvider):
             view.meta.req_indices,
             view.meta.context_lens,
             output,
-            num_splits=5,
+            # Zero enables FA3's measured context-aware split heuristic.
+            num_splits=0,
             validation_scope=validation_scope,
         )
 
@@ -557,6 +558,40 @@ class MlaSglFa3Provider(MlaTritonProvider):
                 raise TypeError(
                     f"{name} must use {expected_dtype}, got {tensor.dtype}."
                 )
+        metadata = payload.metadata or {}
+        if metadata.get("layout") == "mla_packed_varlen":
+            cu_seqlens_k = metadata.get("cu_seqlens_k")
+            if not isinstance(cu_seqlens_k, torch.Tensor):
+                raise TypeError(
+                    "MLA packed varlen prefill requires tensor cu_seqlens_k."
+                )
+            if cu_seqlens_k.shape != (batch_size + 1,):
+                raise ValueError(
+                    f"cu_seqlens_k must have shape ({batch_size + 1},), got "
+                    f"{tuple(cu_seqlens_k.shape)}."
+                )
+            if (
+                cu_seqlens_k.device != self.device
+                or cu_seqlens_k.dtype != torch.int32
+            ):
+                raise TypeError(
+                    "cu_seqlens_k must be int32 on the provider device, got "
+                    f"{cu_seqlens_k.device}/{cu_seqlens_k.dtype}."
+                )
+            if view.meta.max_context_len is None:
+                raise ValueError(
+                    "MLA packed varlen prefill requires max_context_len."
+                )
+            return self.fa3.run_contiguous_explicit_varlen(
+                q,
+                payload.k_cache,
+                payload.v_cache,
+                output,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=int(max_seqlen_q),
+                max_seqlen_k=int(view.meta.max_context_len),
+            )
         return self.fa3.run_explicit_varlen(
             q,
             payload.k_cache,

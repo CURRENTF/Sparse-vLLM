@@ -506,5 +506,58 @@ class SglFa3DecodeKernel:
             raise RuntimeError("sgl-kernel FA3 did not write to the supplied output")
         return output
 
+    def run_contiguous_explicit_varlen(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        output: torch.Tensor,
+        *,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_k: torch.Tensor,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+    ) -> torch.Tensor:
+        """Run causal varlen attention over packed contiguous KV."""
+
+        args: list[object] = [
+            q,
+            k,
+            v,
+            None,
+            None,
+            None,
+            output,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            None,
+            None,
+            None,
+            int(max_seqlen_q),
+            int(max_seqlen_k),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            self.softmax_scale,
+            True,
+            -1,
+            -1,
+        ]
+        if self._has_attention_chunk:
+            args.append(0)
+        args.extend((0.0, True, None, self.num_splits, None, 0, None))
+        if self._has_04_arguments:
+            args.extend((None, False))
+        result: Sequence[torch.Tensor] = self._op(*args)
+        if not result or result[0].data_ptr() != output.data_ptr():
+            raise RuntimeError("sgl-kernel FA3 did not write to the supplied output")
+        return output
+
 
 __all__ = ["SglFa3DecodeKernel", "sgl_fa3_support"]

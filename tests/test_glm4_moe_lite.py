@@ -498,6 +498,27 @@ def test_glm_sparse_moe_reduces_hybrid_tp_ep_shards_over_outer_world() -> None:
     assert all_reduce.call_args.kwargs["group"] is world_process_group
 
 
+def test_glm_hybrid_tp_ep_shared_expert_defers_reduction_to_moe_block() -> None:
+    world_process_group = object()
+    context = ParallelContext(
+        world=ParallelGroup(world_process_group, (0, 1), 0, 2),
+        tensor=ParallelGroup(world_process_group, (0, 1), 0, 2),
+        expert=ParallelGroup(world_process_group, (0, 1), 0, 2),
+        data=ParallelGroup(None, (0,), 0, 1),
+        moe_tensor=ParallelGroup(None, (0,), 0, 1),
+    )
+    config = _config()
+    with _construction_context(context):
+        block = Glm4MoeLiteSparseMoeBlock(
+            config,
+            mlp_chunk_size=config.mlp_chunk_size,
+            decode_cuda_graph=False,
+        )
+
+    assert block.shared_experts is not None
+    assert block.shared_experts.down_proj.reduce_results is False
+
+
 def test_glm_moe_debug_contract_populates_model_runner_summaries() -> None:
     context = _ep_context()
     block = object.__new__(Glm4MoeLiteSparseMoeBlock)

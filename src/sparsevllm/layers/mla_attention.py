@@ -33,6 +33,7 @@ class MlaPrefillHistory:
     gathered_latent: torch.Tensor
     gathered_rope: torch.Tensor
     packed_offsets: torch.Tensor
+    packed_cu_seqlens: torch.Tensor
     packed_slots: torch.Tensor
     local_req_indices: torch.Tensor
     context_lens: torch.Tensor
@@ -66,6 +67,7 @@ class _MlaPrefillPlan:
     source_query_tokens: int
     cache_slot_count: int
     packed_offsets: torch.Tensor
+    packed_cu_seqlens: torch.Tensor
     packed_slots: torch.Tensor
     local_req_indices: torch.Tensor
     context_lengths: tuple[int, ...]
@@ -469,6 +471,11 @@ class MLAAttention:
             dtype=torch.int32,
             device=self.device,
         )
+        packed_cu_seqlens = torch.tensor(
+            (*packed_starts, total_visible_tokens),
+            dtype=torch.int32,
+            device=self.device,
+        )
         local_req_indices = torch.arange(
             batch_size,
             dtype=torch.int32,
@@ -498,6 +505,7 @@ class MLAAttention:
             source_query_tokens=int(query_tokens),
             cache_slot_count=int(cache_slot_count),
             packed_offsets=packed_offsets,
+            packed_cu_seqlens=packed_cu_seqlens,
             packed_slots=packed_slots,
             local_req_indices=local_req_indices,
             context_lengths=lengths,
@@ -554,6 +562,7 @@ class MLAAttention:
             gathered_latent=gathered_latent,
             gathered_rope=gathered_rope,
             packed_offsets=plan.packed_offsets,
+            packed_cu_seqlens=plan.packed_cu_seqlens,
             packed_slots=plan.packed_slots,
             local_req_indices=plan.local_req_indices,
             context_lens=meta.context_lens,
@@ -832,6 +841,10 @@ class MLAAttention:
             payload=ExplicitKVPayload(
                 k_cache=workset.expanded_k,
                 v_cache=workset.expanded_v,
+                metadata={
+                    "layout": "mla_packed_varlen",
+                    "cu_seqlens_k": history.packed_cu_seqlens,
+                },
             ),
         )
 

@@ -290,7 +290,11 @@ def test_sgl_fa3_varlen_explicit_prefill_matches_causal_torch() -> None:
     k_cache = torch.randn(
         2 * width, heads, head_dim, device=device, dtype=torch.bfloat16
     )
-    v_cache = torch.randn_like(k_cache)
+    v_backing = torch.randn(
+        2 * width, heads, 448, device=device, dtype=torch.bfloat16
+    )
+    v_cache = v_backing[..., 192:]
+    assert not v_cache.is_contiguous()
     page_table = torch.arange(
         2 * width, device=device, dtype=torch.int32
     ).view(2, width)
@@ -312,6 +316,25 @@ def test_sgl_fa3_varlen_explicit_prefill_matches_causal_torch() -> None:
         output,
         cu_seqlens_q=cu_seqlens_q,
         max_seqlen_q=max(chunk_lens),
+    )
+    packed_indices = torch.cat(
+        (
+            page_table[1, : int(context_lens[0].item())],
+            page_table[0, : int(context_lens[1].item())],
+        )
+    ).long()
+    packed_output = torch.empty_like(q)
+    kernel.run_contiguous_explicit_varlen(
+        q,
+        k_cache[packed_indices],
+        v_cache[packed_indices],
+        packed_output,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=torch.tensor(
+            [0, 5, 9], device=device, dtype=torch.int32
+        ),
+        max_seqlen_q=max(chunk_lens),
+        max_seqlen_k=int(context_lens.max().item()),
     )
     expected_rows = []
     query_start = 0
@@ -341,3 +364,4 @@ def test_sgl_fa3_varlen_explicit_prefill_matches_causal_torch() -> None:
         rtol=3e-2,
         atol=3e-2,
     )
+    torch.testing.assert_close(packed_output, output)

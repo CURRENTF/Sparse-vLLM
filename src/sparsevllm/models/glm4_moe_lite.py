@@ -577,7 +577,7 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
                 hidden_act=str(config.hidden_act),
                 mlp_chunk_size=self.mlp_chunk_size,
                 quantization=None,
-                reduce_results=self.parallel_context.ep_size > 1,
+                reduce_results=False,
             )
         )
 
@@ -686,16 +686,27 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
             )
         if debug_enabled:
             # Preserve the general EP composition and routed-only debug
-            # evidence. The single-reduction specialization below is TP-only.
+            # evidence while keeping shared-expert reductions explicit.
             self.parallel_context.world_all_reduce(routed)
             self.debug_last_routed_output = routed.detach().clone()
             shared = self._shared_chunk(hidden_states)
-            if self.parallel_context.ep_size == 1:
+            if self.parallel_context.tp_size > 1:
                 shared = self.parallel_context.tp_all_reduce(shared)
             output = routed + shared
         elif self.parallel_context.ep_size > 1:
-            self.parallel_context.world_all_reduce(routed)
-            output = routed + self._shared_chunk(hidden_states)
+            shared_local = self._shared_chunk(hidden_states)
+            if self.parallel_context.tp_size > 1:
+                # Hybrid TP+EP makes both branches partial over the same
+                # outer world. Sum them locally so one collective completes
+                # routed experts and the TP-sharded shared expert together.
+                output = self.parallel_context.world_all_reduce_out_of_place(
+                    routed + shared_local
+                )
+            else:
+                # Retain the pure-EP semantic path for direct module use: the
+                # shared expert is replicated rather than TP-sharded.
+                self.parallel_context.world_all_reduce(routed)
+                output = routed + shared_local
         else:
             shared_local = self._shared_chunk(hidden_states)
             if context.is_prefill:

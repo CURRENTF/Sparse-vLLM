@@ -338,6 +338,7 @@ def test_no_score_path_remains_fa3() -> None:
 
     tilelang.assert_not_called()
     fa3.assert_called_once()
+    assert fa3.call_args.kwargs["num_splits"] == 0
 
 
 @pytest.mark.parametrize(

@@ -100,6 +100,8 @@ _GLM_DECODE_32 = MoeGemmConfig(16, 64, 128, 16, 4, 3)
 _GLM_DECODE_64 = MoeGemmConfig(64, 128, 64, 8, 8, 3)
 _GLM_MID_BATCH = MoeGemmConfig(64, 128, 64, 1, 8, 3)
 _GLM_LARGE_BATCH = MoeGemmConfig(128, 128, 64, 1, 8, 3)
+_GLM_EP2_TINY_BATCH = MoeGemmConfig(16, 128, 32, 8, 4, 4)
+_GLM_EP2_SMALL_BATCH = MoeGemmConfig(16, 64, 128, 1, 4, 4)
 
 
 def _glm_h100_tp2_config(
@@ -138,6 +140,32 @@ def _glm_h100_tp2_config(
         return _GLM_DECODE_64
     if num_tokens <= 512:
         return _GLM_MID_BATCH
+    return _GLM_LARGE_BATCH
+
+
+def _glm_h100_tp2_ep2_config(
+    shape: MoeGemmShape,
+    *,
+    num_tokens: int,
+    stage: str,
+) -> MoeGemmConfig | None:
+    """Return measured BF16 configs for the GLM outer-TP2/EP2 shape."""
+
+    profiled_shape = MoeGemmShape(
+        "NVIDIA H100 80GB HBM3",
+        (9, 0),
+        torch.bfloat16,
+        4,
+        32,
+        2048,
+        1536,
+    )
+    if stage not in {"w13", "w2"} or shape != profiled_shape:
+        return None
+    if num_tokens <= 4:
+        return _GLM_EP2_TINY_BATCH
+    if num_tokens <= 128:
+        return _GLM_EP2_SMALL_BATCH
     return _GLM_LARGE_BATCH
 
 
@@ -434,7 +462,11 @@ def _resolve_moe_gemm_config(
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
     )
-    glm_config = _glm_h100_tp2_config(
+    glm_config = _glm_h100_tp2_ep2_config(
+        shape,
+        num_tokens=num_tokens,
+        stage=stage,
+    ) or _glm_h100_tp2_config(
         shape,
         num_tokens=num_tokens,
         stage=stage,

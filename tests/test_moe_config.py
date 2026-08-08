@@ -404,3 +404,39 @@ def test_glm_h100_tp2_profile_covers_decode_and_large_prefill(
             config.block_k,
             config.group_m,
         ) == expected
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "expected"),
+    [
+        (1, (16, 128, 32, 8, 4, 4)),
+        (8, (16, 64, 128, 1, 4, 4)),
+        (128, (16, 64, 128, 1, 4, 4)),
+        (512, (128, 128, 64, 1, 8, 3)),
+        (65536, (128, 128, 64, 1, 8, 3)),
+    ],
+)
+def test_glm_h100_tp2_ep2_profile_covers_decode_and_long_prefill(
+    num_tokens,
+    expected,
+):
+    common = dict(
+        dtype=torch.bfloat16,
+        num_tokens=num_tokens,
+        top_k=4,
+        num_local_experts=32,
+        hidden_size=2048,
+        intermediate_size=1536,
+        device_name="NVIDIA H100 80GB HBM3",
+        device_capability=(9, 0),
+    )
+    for stage in ("w13", "w2"):
+        config = resolve_moe_gemm_config(**common, stage=stage)
+        assert (
+            config.block_m,
+            config.block_n,
+            config.block_k,
+            config.group_m,
+            config.num_warps,
+            config.num_stages,
+        ) == expected

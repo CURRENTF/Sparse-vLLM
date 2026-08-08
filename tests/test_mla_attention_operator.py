@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -10,6 +10,7 @@ from sparsevllm.engine.cache_manager import (
     DecodeComputeView,
     ExplicitKVPayload,
     MlaLatentPayload,
+    PrefillComputeView,
 )
 from sparsevllm.operators.mla_attention import (
     MLA_ATTENTION_REGISTRY,
@@ -263,6 +264,69 @@ def test_mla_provider_rejects_explicit_kv_before_kernel() -> None:
             torch.empty(1, 20, 512, dtype=torch.bfloat16),
         )
     kernel.assert_not_called()
+
+
+def test_sgl_provider_uses_packed_varlen_prefill_metadata() -> None:
+    spec = _spec(tp_size=4)
+    workspace = _cpu_workspace(batch_size=1, head_count=5)
+    fa3 = Mock()
+    with (
+        patch(
+            "sparsevllm.operators.mla_attention.allocate_mla_decode_workspace",
+            return_value=workspace,
+        ),
+        patch(
+            "sparsevllm.operators.mla_attention.SglFa3DecodeKernel",
+            return_value=fa3,
+        ),
+    ):
+        provider = MlaSglFa3Provider(
+            op_spec=spec,
+            device="cpu",
+            max_batch_size=1,
+        )
+    q = torch.empty(2, 5, 256, dtype=torch.bfloat16)
+    output = torch.empty_like(q)
+    cu_seqlens_q = torch.tensor([0, 2], dtype=torch.int32)
+    cu_seqlens_k = torch.tensor([0, 4], dtype=torch.int32)
+    view = PrefillComputeView(
+        meta=AttentionViewMeta(
+            active_slots=torch.arange(4, dtype=torch.int32).view(1, 4),
+            req_indices=torch.tensor([0], dtype=torch.int32),
+            context_lens=torch.tensor([4], dtype=torch.int32),
+            max_context_len=4,
+        ),
+        payload=ExplicitKVPayload(
+            k_cache=torch.empty(4, 5, 256, dtype=torch.bfloat16),
+            v_cache=torch.empty(4, 5, 256, dtype=torch.bfloat16),
+            metadata={
+                "layout": "mla_packed_varlen",
+                "cu_seqlens_k": cu_seqlens_k,
+            },
+        ),
+    )
+    fa3.run_contiguous_explicit_varlen.return_value = output
+
+    actual = provider.run_explicit_prefill(
+        q,
+        view,
+        output,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=2,
+    )
+
+    assert actual is output
+    fa3.run_contiguous_explicit_varlen.assert_called_once_with(
+        q,
+        view.payload.k_cache,
+        view.payload.v_cache,
+        output,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=2,
+        max_seqlen_k=4,
+    )
+    fa3.run_explicit_varlen.assert_not_called()
 
 
 def test_mla_provider_run_does_not_resolve_or_allocate() -> None:

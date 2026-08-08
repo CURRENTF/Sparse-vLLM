@@ -313,6 +313,7 @@ def test_mla_prefill_reuses_validated_packing_across_layers() -> None:
     assert validate.call_count == 2
     assert gather.call_count == 3
     assert first.packed_offsets is second.packed_offsets
+    assert first.packed_cu_seqlens is second.packed_cu_seqlens
     assert first.packed_slots is second.packed_slots
 
 
@@ -385,6 +386,14 @@ def test_mla_prefill_exposes_expanded_explicit_score_view() -> None:
     assert isinstance(score_view.payload, ExplicitKVPayload)
     assert score_view.payload.k_cache is workset.expanded_k
     assert score_view.payload.v_cache is workset.expanded_v
+    assert score_view.payload.metadata == {
+        "layout": "mla_packed_varlen",
+        "cu_seqlens_k": history.packed_cu_seqlens,
+    }
+    torch.testing.assert_close(
+        history.packed_cu_seqlens,
+        torch.tensor([0, 2], dtype=torch.int32),
+    )
     assert score_view.meta.active_slots is history.packed_slots
     assert score_view.meta.req_indices is history.local_req_indices
     assert score_view.meta.context_lens is history.context_lens
