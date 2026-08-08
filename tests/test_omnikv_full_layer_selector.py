@@ -1,14 +1,19 @@
 import random
+import typing
 import unittest
 from types import SimpleNamespace
 
 import numpy as np
+import torch
 
 from sparsevllm.utils.select_omnikv_full_layers import (
     CalibrationPoint,
     add_topk_to_pair_scores,
     attention_layer_indices_from_config,
     compute_segment_scores,
+    install_typing_compatibility,
+    model_input_device,
+    parse_args,
     prepare_fp8_transformers_config,
     sample_decode_points,
     select_full_layers_dp,
@@ -17,6 +22,39 @@ from sparsevllm.utils.select_omnikv_full_layers import (
 
 
 class OmniKVFullLayerSelectorTest(unittest.TestCase):
+    def test_remote_model_code_can_be_disabled(self):
+        args = parse_args(
+            [
+                "--model-path",
+                "/model",
+                "--longbench-root",
+                "/longbench",
+                "--no-trust-remote-code",
+            ]
+        )
+
+        self.assertFalse(args.trust_remote_code)
+
+    def test_python310_typing_compatibility_is_idempotent(self):
+        had_unpack = hasattr(typing, "Unpack")
+
+        first = install_typing_compatibility()
+        second = install_typing_compatibility()
+
+        self.assertTrue(hasattr(typing, "Unpack"))
+        self.assertEqual(second, [])
+        self.assertEqual(first, [] if had_unpack else ["typing.Unpack"])
+
+    def test_model_input_device_uses_embedding_weight_device(self):
+        class FakeModel:
+            def get_input_embeddings(self):
+                return SimpleNamespace(weight=torch.empty(1, device="cpu"))
+
+        self.assertEqual(
+            model_input_device(FakeModel(), torch.device("cuda:0")),
+            torch.device("cpu"),
+        )
+
     def test_add_topk_to_pair_scores_counts_forward_layer_intersections(self):
         pair_scores = np.zeros((4, 4), dtype=np.int64)
         add_topk_to_pair_scores(

@@ -69,7 +69,6 @@ Read the method overview and integration rules in
 | Qwen3 | ✅ |
 | Qwen3MoE | ✅ |
 | Qwen3.5 / Qwen3.6 | ✅ |
-| Qwen3.5 / Qwen3.6 MoE | ✅ |
 | GLM-4.7-Flash | ✅ |
 | Llama 3 / 3.1 | ✅ |
 | MiniMax M2.7 | ✅ |
@@ -94,8 +93,9 @@ The full documentation index is maintained in [docs/en/README.md](docs/en/README
 
 ## Quick Start
 
-Sparse-vLLM requires Python 3.10 or newer. Install the package from the
-repository root using the runtime versions pinned in `pyproject.toml`.
+Sparse-vLLM requires Python 3.10 or newer. The validated CUDA 12.9 runtime and
+test environment is frozen in
+`requirements/locks/canonical-cu129-py310.txt`.
 
 ### Conda
 
@@ -103,14 +103,9 @@ repository root using the runtime versions pinned in `pyproject.toml`.
 conda create -n svllm python=3.10 -y
 conda activate svllm
 
-pip install torch==2.11.0 torchvision==0.26.0 triton==3.6.0 \
-  --index-url https://download.pytorch.org/whl/cu130
-
-# FlashInfer publishes the CUDA-specific JIT cache on a separate index.
-pip install "flashinfer-jit-cache>=0.6.15" \
-  --index-url https://flashinfer.ai/whl/cu130
-
-pip install -e .
+PYTHONNOUSERSITE=1 python -s -m pip install \
+  -r requirements/locks/canonical-cu129-py310.txt
+PYTHONNOUSERSITE=1 python -s -m pip install --no-deps -e .
 
 # Optional
 MAX_JOBS=8 pip install flash-attn --no-build-isolation
@@ -126,44 +121,23 @@ PyTorch wheels include their CUDA runtime, while compiled extensions such as
 uv venv --python 3.10
 source .venv/bin/activate
 
-uv pip install torch==2.11.0 torchvision==0.26.0 triton==3.6.0 \
-  --index-url https://download.pytorch.org/whl/cu130
-uv pip install "flashinfer-jit-cache>=0.6.15" \
-  --index-url https://flashinfer.ai/whl/cu130
-
-uv pip install -e .
+uv pip install -r requirements/locks/canonical-cu129-py310.txt
+uv pip install --no-deps -e .
 
 # Optional
 MAX_JOBS=8 uv pip install flash-attn --no-build-isolation
 uv pip install flashinfer-cubin --index-url https://flashinfer.ai/whl
 ```
 
-The explicit indexes select the CUDA 13.0 builds of PyTorch and the FlashInfer
-JIT cache.
+The lock selects the CUDA 12.9 builds of PyTorch and the FlashInfer JIT cache.
+`einops`, `sgl-kernel`, and the training, benchmark, and test packages are all
+part of the main installation; no workflow-specific extras are required.
 
-
-Qwen3.5/Qwen3.6 mixed-attention inference additionally requires the
-optional Python dependencies:
-
-```bash
-# uv
-uv pip install -e ".[qwen35]"
-
-# Conda/pip
-pip install -e ".[qwen35]"
-```
-
-Vanilla, OmniKV, or QuEST prefix-cache offload without Qwen3.5/Qwen3.6 uses
-the smaller CUDA-specific extra:
-
-```bash
-pip install -e ".[prefix-offload]"
-```
-
+Sparse-vLLM supports Qwen3.5/Qwen3.6 checkpoints in unquantized BF16 and
+block-scaled FP8 formats.
 
 The Qwen3.5/Qwen3.6 prefill causal Conv1D and decode Conv1D/GDN packing paths
-use repository-local Triton kernels; `sglang-kernel` and a local CUDA extension
-build are not required.
+use repository-local Triton kernels; they do not call `sgl-kernel` themselves.
 
 For the full dependency list and a minimal `LLM(...)` example, see
 [Getting Started](docs/en/getting_started/README.md).

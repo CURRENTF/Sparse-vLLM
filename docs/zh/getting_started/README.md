@@ -8,14 +8,9 @@
 conda create -n svllm python=3.10 -y
 conda activate svllm
 
-pip install torch==2.11.0 torchvision==0.26.0 triton==3.6.0 \
-  --index-url https://download.pytorch.org/whl/cu130
-
-# FlashInfer publishes the CUDA-specific JIT cache on a separate index.
-pip install "flashinfer-jit-cache>=0.6.15" \
-  --index-url https://flashinfer.ai/whl/cu130
-
-pip install -e .
+PYTHONNOUSERSITE=1 python -s -m pip install \
+  -r requirements/locks/canonical-cu129-py310.txt
+PYTHONNOUSERSITE=1 python -s -m pip install --no-deps -e .
 
 # Optional
 MAX_JOBS=8 pip install flash-attn --no-build-isolation
@@ -23,48 +18,32 @@ MAX_JOBS=8 pip install flash-attn --no-build-isolation
 
 ## 使用 uv 安装
 
-项目使用 CUDA 13.0 build：
+Canonical 环境使用 CUDA 12.9 build：
 
 ```bash
-uv venv --python 3.12
+uv venv --python 3.10
 source .venv/bin/activate
 
-uv pip install torch==2.11.0 torchvision==0.26.0 triton==3.6.0 \
-  --index-url https://download.pytorch.org/whl/cu130
-uv pip install "flashinfer-jit-cache>=0.6.15" \
-  --index-url https://flashinfer.ai/whl/cu130
-
-uv pip install -e .
+uv pip install -r requirements/locks/canonical-cu129-py310.txt
+uv pip install --no-deps -e .
 
 # Optional
 MAX_JOBS=8 uv pip install flash-attn --no-build-isolation
 ```
 
-对于 Qwen3.5/Qwen3.6 mixed-attention inference，还需安装可选 Python 依赖：
-
-```bash
-# uv
-uv pip install -e ".[qwen35]"
-
-# Conda/pip
-pip install -e ".[qwen35]"
-```
-
-如果只需为 vanilla、OmniKV 或 QuEST 启用 prefix-cache offload：
-
-```bash
-pip install -e ".[prefix-offload]"
-```
+`einops`、`sgl-kernel` 以及训练、benchmark 和测试包均已是主依赖，
+不再需要工作流专用 extra。
 
 Sparse-vLLM 当前支持未量化 BF16 和 block-scaled FP8 格式的 Qwen3.5/Qwen3.6 checkpoint。
 
-其 prefill causal Conv1D 和 decode Conv1D/GDN packing path 使用仓库本地 Triton kernel，不需要 `sglang-kernel` 或编译仓库 CUDA extension。
+其 prefill causal Conv1D 和 decode Conv1D/GDN packing path 使用仓库本地
+Triton kernel，本身不调用 `sgl-kernel`。
 
 必需的 `flashinfer-jit-cache` package 提供针对特定 CUDA toolkit 版本构建的 module。请选择与 PyTorch 所用 CUDA 版本匹配的 index。`flashinfer-cubin` 是可选加速 package，包含特定架构的 device binary：
 
 ```bash
-pip install "flashinfer-jit-cache>=0.6.15" \
-  --index-url https://flashinfer.ai/whl/cu130
+pip install "flashinfer-jit-cache==0.6.15.post1" \
+  --index-url https://flashinfer.ai/whl/cu129
 
 # Optional
 pip install flashinfer-cubin --index-url https://flashinfer.ai/whl

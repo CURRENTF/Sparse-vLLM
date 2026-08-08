@@ -9,19 +9,19 @@ evidence, cite the original run artifact path.
 The README contains the current install command. The expected baseline is:
 
 - Python 3.10.
-- PyTorch 2.11.0 with the CUDA 13.0 wheel.
-- Triton 3.6.0 and torchvision 0.26.0.
-- `flashinfer-jit-cache>=0.6.15` installed from the FlashInfer wheel index that
-  matches `torch.version.cuda`.
+- The complete runtime and test environment from
+  `requirements/locks/canonical-cu129-py310.txt`.
+- PyTorch 2.9.1 with the CUDA 12.9 wheel and Triton 3.5.1.
+- `flashinfer-python==0.6.15.post1` and the CUDA 12.9 build of
+  `flashinfer-jit-cache==0.6.15.post1`.
+- `sgl-kernel==0.3.21` and `einops>=0.8.2` as runtime dependencies.
 - Optional matching `flashinfer-cubin` installed from the generic FlashInfer
   wheel index when precompiled device binaries are desired.
-- `transformers[torch]==5.13.1`.
+- `transformers==5.13.1`.
 - `flash-attn` installed with `MAX_JOBS=8 pip install flash-attn --no-build-isolation`.
-- Editable install from the repository root with `pip install -e .`.
-- Qwen3.5/Qwen3.6 FP8 runs install the CUDA-specific extra with
-  `pip install -e ".[qwen35]"`.
-- Vanilla, OmniKV, and QuEST prefix-cache offload runs install
-  `pip install -e ".[prefix-offload]"` when the Qwen3.5 extra is not needed.
+- Editable install from the repository root with `pip install --no-deps -e .`
+  after installing the lock. Training, benchmark, and test dependencies are
+  included in the main installation.
 - Record the selected operator provider and CUDA compute capability. FP8
   providers are selected locally from device capabilities and do not download
   Hub kernels during warmup.

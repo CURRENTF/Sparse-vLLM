@@ -15,6 +15,7 @@ from sparsevllm.operators.mla_attention import (
     MLA_ATTENTION_REGISTRY,
     MlaAttentionOpSpec,
     MlaSglFa3Provider,
+    MlaTileLangScoreProvider,
     MlaTritonProvider,
 )
 from sparsevllm.operators.registry import OpResolver
@@ -118,6 +119,7 @@ def test_mla_resolver_selects_h100_triton_provider() -> None:
     assert isinstance(resolved.provider, MlaTritonProvider)
     assert resolved.rejected == (
         ("sgl_fa3_h100", "sgl-kernel is not installed"),
+        ("tilelang_score_sgl_fa3_h100", "sgl-kernel is not installed"),
     )
     allocate.assert_called_once_with(
         batch_size=8,
@@ -137,6 +139,10 @@ def test_mla_resolver_prefers_sgl_fa3_when_available() -> None:
             return_value=(True, "validated test API"),
         ),
         patch(
+            "sparsevllm.operators.mla_attention.tilelang_mla_support",
+            return_value=(False, "tilelang unavailable"),
+        ),
+        patch(
             "sparsevllm.operators.mla_attention.allocate_mla_decode_workspace",
             return_value=workspace,
         ),
@@ -151,16 +157,33 @@ def test_mla_resolver_prefers_sgl_fa3_when_available() -> None:
         )
 
     assert type(resolved.provider) is MlaSglFa3Provider
-    assert resolved.rejected == ()
+    assert resolved.rejected == (
+        (
+            "tilelang_score_sgl_fa3_h100",
+            "tilelang unavailable",
+        ),
+    )
 
 
 def test_mla_resolver_accepts_cuda_graph_after_capture_gate() -> None:
     spec = _spec(cuda_graph=True)
     workspace = _cpu_workspace(batch_size=8, head_count=spec.local_q_heads)
 
-    with patch(
-        "sparsevllm.operators.mla_attention.allocate_mla_decode_workspace",
-        return_value=workspace,
+    with (
+        patch(
+            "sparsevllm.operators.mla_attention.sgl_fa3_support",
+            return_value=(True, "validated test API"),
+        ),
+        patch(
+            "sparsevllm.operators.mla_attention.tilelang_mla_support",
+            return_value=(True, "validated test API"),
+        ),
+        patch(
+            "sparsevllm.operators.mla_attention.allocate_mla_decode_workspace",
+            return_value=workspace,
+        ),
+        patch("sparsevllm.operators.mla_attention.SglFa3DecodeKernel"),
+        patch("sparsevllm.operators.mla_attention.TileMlaDecodeKernel"),
     ):
         resolved = OpResolver(MLA_ATTENTION_REGISTRY).resolve(
             spec,
@@ -170,7 +193,7 @@ def test_mla_resolver_accepts_cuda_graph_after_capture_gate() -> None:
             max_batch_size=8,
         )
 
-    assert isinstance(resolved.provider, MlaTritonProvider)
+    assert type(resolved.provider) is MlaTileLangScoreProvider
     assert resolved.rejected == ()
 
 

@@ -17,6 +17,10 @@ from sparsevllm.operators.registry import (
     SupportResult,
 )
 from sparsevllm.operators.sgl_fa3 import SglFa3DecodeKernel, sgl_fa3_support
+from sparsevllm.operators.tilelang_mla import (
+    TileMlaDecodeKernel,
+    tilelang_mla_support,
+)
 from sparsevllm.platforms.interface import DeviceCaps, PlatformEnum
 from sparsevllm.triton_kernel.mla import (
     DEFAULT_GLM_MLA_DECODE_CONFIG,
@@ -566,6 +570,150 @@ class MlaSglFa3Provider(MlaTritonProvider):
             validation_scope=validation_scope,
         )
 
+
+@MLA_ATTENTION_REGISTRY.register
+class MlaTileLangScoreProvider(MlaSglFa3Provider):
+    """FA3 output path plus fused TileLang output-and-score for GLM MLA."""
+
+    name = "tilelang_score_sgl_fa3_h100"
+    priority = 300
+
+    def __init__(
+        self,
+        *,
+        op_spec: MlaAttentionOpSpec,
+        device: torch.device | str,
+        max_batch_size: int,
+        launch_config: MlaDecodeLaunchConfig | None = None,
+    ) -> None:
+        super().__init__(
+            op_spec=op_spec,
+            device=device,
+            max_batch_size=max_batch_size,
+            launch_config=launch_config,
+        )
+        self.tilelang_score = TileMlaDecodeKernel(
+            device=self.device,
+            softmax_scale=self.spec.softmax_scale,
+            valid_heads=self.spec.local_q_heads,
+        )
+
+    @classmethod
+    def supports(
+        cls,
+        spec: MlaAttentionOpSpec,
+        caps: DeviceCaps,
+    ) -> SupportResult:
+        base = MlaSglFa3Provider.supports(spec, caps)
+        if not base.supported:
+            return base
+        supported, reason = tilelang_mla_support()
+        return SupportResult.yes(reason) if supported else SupportResult.no(reason)
+
+    @staticmethod
+    def _tilelang_score_shape_supported(
+        attn_score: torch.Tensor,
+        *,
+        max_context_len: int | None,
+    ) -> bool:
+        score_capacity = int(attn_score.shape[1]) if attn_score.ndim >= 2 else 0
+        return (
+            attn_score.ndim == 2
+            and attn_score.dtype == torch.float32
+            and score_capacity > 0
+            and score_capacity % 64 == 0
+            and max_context_len is not None
+            and int(max_context_len) <= score_capacity
+        )
+
+    @staticmethod
+    def _tilelang_layout_supported(
+        q_nope_absorbed: torch.Tensor,
+        q_rope: torch.Tensor,
+        view: DecodeComputeView,
+        output: torch.Tensor,
+    ) -> bool:
+        if not isinstance(view.payload, MlaLatentPayload):
+            return False
+        tensors = (
+            q_nope_absorbed,
+            q_rope,
+            view.payload.latent_cache,
+            view.payload.rope_cache,
+            view.meta.active_slots,
+            view.meta.req_indices,
+            view.meta.context_lens,
+            view.meta.attn_score,
+            output,
+        )
+        return all(
+            isinstance(tensor, torch.Tensor) and tensor.is_contiguous()
+            for tensor in tensors
+        )
+
+    @torch.no_grad()
+    def run(
+        self,
+        q_nope_absorbed: torch.Tensor,
+        q_rope: torch.Tensor,
+        view: DecodeComputeView,
+        output: torch.Tensor,
+        *,
+        validation_scope: object | None = None,
+    ) -> torch.Tensor:
+        attn_score = view.meta.attn_score
+        if attn_score is None:
+            return super().run(
+                q_nope_absorbed,
+                q_rope,
+                view,
+                output,
+                validation_scope=validation_scope,
+            )
+        # Per-head or non-tile-aligned score buffers remain on the existing
+        # Triton implementation.  This is a static shape dispatch before any
+        # TileLang kernel launch, not an exception-driven runtime fallback.
+        if not self._tilelang_score_shape_supported(
+            attn_score,
+            max_context_len=view.meta.max_context_len,
+        ) or not self._tilelang_layout_supported(
+            q_nope_absorbed,
+            q_rope,
+            view,
+            output,
+        ):
+            return MlaTritonProvider.run(
+                self,
+                q_nope_absorbed,
+                q_rope,
+                view,
+                output,
+                validation_scope=validation_scope,
+            )
+        payload = self._validate_run_inputs(
+            q_nope_absorbed,
+            q_rope,
+            view,
+            output,
+        )
+        self._validate_metadata(
+            view,
+            payload,
+            validation_scope=validation_scope,
+        )
+        return self.tilelang_score(
+            q_nope_absorbed,
+            q_rope,
+            payload.latent_cache,
+            payload.rope_cache,
+            view.meta.active_slots,
+            view.meta.req_indices,
+            view.meta.context_lens,
+            output,
+            attn_score=attn_score,
+            max_context_len=int(view.meta.max_context_len),
+        )
+
 def resolve_mla_attention_provider(
     spec: MlaAttentionOpSpec,
     *,
@@ -593,6 +741,7 @@ __all__ = [
     "MlaAttentionOpSpec",
     "MlaAttentionProvider",
     "MlaSglFa3Provider",
+    "MlaTileLangScoreProvider",
     "MlaTritonProvider",
     "resolve_mla_attention_provider",
 ]
