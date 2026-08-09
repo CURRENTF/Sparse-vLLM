@@ -95,6 +95,7 @@ class MlaAttentionProvider:
         output: torch.Tensor,
         *,
         validation_scope: object | None = None,
+        valid_batch_size: int | None = None,
     ) -> torch.Tensor:
         raise NotImplementedError
 
@@ -289,6 +290,7 @@ class MlaTritonProvider(MlaAttentionProvider):
         payload: MlaLatentPayload,
         *,
         validation_scope: object | None,
+        valid_batch_size: int | None,
     ) -> None:
         cache_slot_count = int(payload.latent_cache.shape[0])
         metadata_key = (
@@ -297,6 +299,7 @@ class MlaTritonProvider(MlaAttentionProvider):
             view.meta.context_lens,
             cache_slot_count,
             view.meta.max_context_len,
+            valid_batch_size,
         )
         cached = self._validated_decode_metadata
         cached_entries = (
@@ -312,6 +315,7 @@ class MlaTritonProvider(MlaAttentionProvider):
             and entry[2] is metadata_key[2]
             and entry[3] == metadata_key[3]
             and entry[4] == metadata_key[4]
+            and entry[5] == metadata_key[5]
             for entry in cached_entries
         )
         if metadata_is_validated:
@@ -322,6 +326,7 @@ class MlaTritonProvider(MlaAttentionProvider):
             view.meta.context_lens,
             cache_slot_count=cache_slot_count,
             max_context_len=view.meta.max_context_len,
+            valid_batch_size=valid_batch_size,
         )
         if validation_scope is None:
             self._validated_decode_metadata = None
@@ -358,6 +363,7 @@ class MlaTritonProvider(MlaAttentionProvider):
         output: torch.Tensor,
         *,
         validation_scope: object | None = None,
+        valid_batch_size: int | None = None,
     ) -> torch.Tensor:
         payload = self._validate_run_inputs(
             q_nope_absorbed,
@@ -369,6 +375,7 @@ class MlaTritonProvider(MlaAttentionProvider):
             view,
             payload,
             validation_scope=validation_scope,
+            valid_batch_size=valid_batch_size,
         )
         launch_config = self._launch_config_for(
             batch_size=int(q_nope_absorbed.shape[0]),
@@ -442,6 +449,7 @@ class MlaSglFa3Provider(MlaTritonProvider):
         output: torch.Tensor,
         *,
         validation_scope: object | None = None,
+        valid_batch_size: int | None = None,
     ) -> torch.Tensor:
         if view.meta.attn_score is not None:
             return super().run(
@@ -450,6 +458,7 @@ class MlaSglFa3Provider(MlaTritonProvider):
                 view,
                 output,
                 validation_scope=validation_scope,
+                valid_batch_size=valid_batch_size,
             )
         payload = self._validate_run_inputs(
             q_nope_absorbed,
@@ -461,6 +470,7 @@ class MlaSglFa3Provider(MlaTritonProvider):
             view,
             payload,
             validation_scope=validation_scope,
+            valid_batch_size=valid_batch_size,
         )
         return self.fa3(
             q_rope,
@@ -695,6 +705,7 @@ class MlaTileLangScoreProvider(MlaSglFa3Provider):
         output: torch.Tensor,
         *,
         validation_scope: object | None = None,
+        valid_batch_size: int | None = None,
     ) -> torch.Tensor:
         attn_score = view.meta.attn_score
         if attn_score is None:
@@ -704,6 +715,7 @@ class MlaTileLangScoreProvider(MlaSglFa3Provider):
                 view,
                 output,
                 validation_scope=validation_scope,
+                valid_batch_size=valid_batch_size,
             )
         # Per-head or non-tile-aligned score buffers remain on the existing
         # Triton implementation.  This is a static shape dispatch before any
@@ -724,6 +736,7 @@ class MlaTileLangScoreProvider(MlaSglFa3Provider):
                 view,
                 output,
                 validation_scope=validation_scope,
+                valid_batch_size=valid_batch_size,
             )
         payload = self._validate_run_inputs(
             q_nope_absorbed,
@@ -735,6 +748,7 @@ class MlaTileLangScoreProvider(MlaSglFa3Provider):
             view,
             payload,
             validation_scope=validation_scope,
+            valid_batch_size=valid_batch_size,
         )
         return self.tilelang_score(
             q_nope_absorbed,

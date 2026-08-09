@@ -861,12 +861,19 @@ class MLAAttention:
             )
         self._require_mla_payload(view, operation="MLA decode")
         output = torch.empty_like(q_nope_absorbed)
+        context = get_context()
+        valid_batch_size = (
+            int(q_nope_absorbed.shape[0])
+            if context.seqs is None
+            else len(context.seqs)
+        )
         return self.provider.run(
             q_nope_absorbed,
             q_rope,
             view,
             output,
-            validation_scope=get_context().attention_validation_scope,
+            validation_scope=context.attention_validation_scope,
+            valid_batch_size=valid_batch_size,
         )
 
 __all__ = [

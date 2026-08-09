@@ -319,6 +319,7 @@ def validate_mla_decode_metadata(
     *,
     cache_slot_count: int,
     max_context_len: int | None = None,
+    valid_batch_size: int | None = None,
 ) -> None:
     """Synchronously validate one decode view before per-layer reuse."""
 
@@ -343,6 +344,14 @@ def validate_mla_decode_metadata(
     if context_lens.ndim != 1 or context_lens.numel() == 0:
         raise ValueError("context_lens must be a non-empty one-dimensional tensor")
     batch_size = context_lens.numel()
+    if valid_batch_size is None:
+        valid_batch_size = batch_size
+    valid_batch_size = int(valid_batch_size)
+    if not 0 < valid_batch_size <= batch_size:
+        raise ValueError(
+            "valid_batch_size must be within the metadata batch: "
+            f"valid={valid_batch_size} batch={batch_size}"
+        )
     if request_indices.shape != (batch_size,):
         raise ValueError(
             f"request_indices must have shape ({batch_size},), got "
@@ -384,7 +393,8 @@ def validate_mla_decode_metadata(
                 f"request_indices[{batch_index}]={request_row} is outside "
                 f"[0, {active_slots.shape[0]})"
             )
-        real_request_rows.append(request_row)
+        if batch_index < valid_batch_size:
+            real_request_rows.append(request_row)
         if length == 0:
             continue
         slots = active_slots[request_row, :length]

@@ -9,6 +9,7 @@ import sparsevllm.layers.mla_attention as mla_attention_module
 from sparsevllm.engine.cache_manager import (
     AttentionKeyComputeView,
     AttentionViewMeta,
+    DecodeComputeView,
     ExplicitKVPayload,
     MlaLatentPayload,
     PrefillComputeView,
@@ -275,6 +276,54 @@ def test_set_context_starts_a_new_attention_validation_scope() -> None:
 
     assert first_step_scope is not initial_scope
     assert second_step_scope is not first_step_scope
+
+
+def test_mla_decode_passes_valid_batch_size_to_provider() -> None:
+    class _RecordingProvider(_TestProvider):
+        def run(
+            self,
+            q_nope_absorbed,
+            q_rope,
+            view,
+            output,
+            *,
+            validation_scope=None,
+            valid_batch_size=None,
+        ):
+            self.valid_batch_size = valid_batch_size
+            return output
+
+    spec = _spec(tp_size=4)
+    provider = _RecordingProvider(spec, device="cpu", max_batch_size=4)
+    attention = MLAAttention(
+        spec=spec,
+        provider=provider,
+        prefill_workspace_bytes=64 * 1024 * 1024,
+        hidden_size=64,
+        projection_chunk_size=8,
+    )
+    view = DecodeComputeView(
+        meta=AttentionViewMeta(
+            active_slots=torch.arange(16, dtype=torch.int32).view(4, 4),
+            req_indices=torch.tensor([0, 1, 2, 0], dtype=torch.int32),
+            context_lens=torch.tensor([4, 4, 4, 4], dtype=torch.int32),
+        ),
+        payload=MlaLatentPayload(
+            latent_cache=torch.empty(16, 1, 512, dtype=torch.bfloat16),
+            rope_cache=torch.empty(16, 1, 64, dtype=torch.bfloat16),
+        ),
+    )
+    q_nope_absorbed = torch.empty(4, 5, 512, dtype=torch.bfloat16)
+    q_rope = torch.empty(4, 5, 64, dtype=torch.bfloat16)
+
+    set_context(False, seqs=[object(), object(), object()])
+    try:
+        output = attention.run_decode(q_nope_absorbed, q_rope, view)
+    finally:
+        reset_context()
+
+    assert output.shape == q_nope_absorbed.shape
+    assert provider.valid_batch_size == 3
 
 
 def test_mla_prefill_reuses_validated_packing_across_layers() -> None:

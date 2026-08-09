@@ -19,6 +19,7 @@ from sparsevllm.triton_kernel.mla import (
     prepare_mla_decode_schedule,
     run_mla_decode,
     select_glm_mla_decode_config,
+    validate_mla_decode_metadata,
 )
 
 
@@ -662,6 +663,37 @@ def test_mla_decode_rejects_duplicate_active_slots() -> None:
             output,
             workspace,
             softmax_scale=GLM_MLA_SOFTMAX_SCALE,
+        )
+
+
+@CUDA_REQUIRED
+def test_mla_decode_metadata_ignores_duplicate_graph_padding_rows() -> None:
+    active_slots = torch.tensor(
+        [[0, 1], [2, 3]], dtype=torch.int32, device="cuda"
+    )
+    context_lens = torch.tensor([2, 2, 2, 2], dtype=torch.int32, device="cuda")
+    padded_request_indices = torch.tensor(
+        [0, 1, 0, 0], dtype=torch.int32, device="cuda"
+    )
+
+    validate_mla_decode_metadata(
+        active_slots,
+        padded_request_indices,
+        context_lens,
+        cache_slot_count=4,
+        valid_batch_size=2,
+    )
+
+    duplicate_real_request_indices = torch.tensor(
+        [0, 0, 0, 0], dtype=torch.int32, device="cuda"
+    )
+    with pytest.raises(ValueError, match="duplicate non-padding rows"):
+        validate_mla_decode_metadata(
+            active_slots,
+            duplicate_real_request_indices,
+            context_lens,
+            cache_slot_count=4,
+            valid_batch_size=2,
         )
 
 

@@ -403,6 +403,7 @@ def test_mla_provider_run_does_not_resolve_or_allocate() -> None:
         view.meta.context_lens,
         cache_slot_count=4,
         max_context_len=None,
+        valid_batch_size=None,
     )
     assert kernel.call_count == 3
     kernel.assert_called_with(
