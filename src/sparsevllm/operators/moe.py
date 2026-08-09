@@ -267,7 +267,7 @@ class SglAlignedTritonGlmMoeProvider(MoeProvider):
 @MOE_REGISTRY.register
 class TritonMinimaxM2FusedMoeProvider(MoeProvider):
     name = "triton_minimax_m2_fused"
-    priority = 110
+    priority = 125
     gate_up_order = "gate_up"
 
     @classmethod
@@ -369,7 +369,7 @@ class TritonMinimaxM2FusedMoeProvider(MoeProvider):
 @MOE_REGISTRY.register
 class FlashInferCutlassFp8MoeProvider(MoeProvider):
     name = "flashinfer_cutlass_fp8_sm90"
-    priority = 100
+    priority = 120
     gate_up_order = "up_gate"
 
     @classmethod
@@ -615,7 +615,7 @@ class HopperQwen36HybridFp8MoeProvider(FlashInferCutlassFp8MoeProvider):
     """Bind one weight layout and dispatch profiled token buckets by kernel."""
 
     name = "hopper_qwen36_hybrid_fp8"
-    priority = 110
+    priority = 130
     PROFILED_DEVICE_NAME = "NVIDIA H100 80GB HBM3"
     PROFILED_SHAPES = frozenset(
         {
@@ -711,7 +711,7 @@ class HopperQwen36HybridFp8MoeProvider(FlashInferCutlassFp8MoeProvider):
 @MOE_REGISTRY.register
 class H20Qwen36HybridFp8MoeProvider(HopperQwen36HybridFp8MoeProvider):
     name = "h20_qwen36_hybrid_fp8"
-    priority = 111
+    priority = 131
     PROFILED_DEVICE_NAME = "NVIDIA H20"
     TRITON_MAX_TOKENS_BY_EP_SIZE = {1: 8, 2: 1}
 

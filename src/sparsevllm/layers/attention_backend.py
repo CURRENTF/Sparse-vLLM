@@ -118,6 +118,52 @@ class TritonAttentionBackend:
     def __init__(self) -> None:
         record_operator_binding("Attention", self)
 
+    @staticmethod
+    def gqa_decode_launch_config(
+        *,
+        block_seq: int,
+        max_context_len: int,
+        num_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        requires_attention_scores: bool,
+    ) -> tuple[int, int, int]:
+        if (
+            block_seq == 256
+            and max_context_len > 32768
+            and (num_heads, num_kv_heads, head_dim) == (12, 2, 128)
+            and not requires_attention_scores
+        ):
+            return 1024, 128, 4
+        return block_seq, 16, 2
+
+    def maybe_run_fake_prefill(
+        self,
+        q: torch.Tensor,
+        view: PrefillComputeView,
+        *,
+        chunk_lens: torch.Tensor,
+        max_input_len: int,
+    ) -> torch.Tensor | None:
+        if not _fake_prefill_attention_enabled():
+            return None
+        meta = view.meta
+        probe_context_tokens = int(meta.max_context_len or max_input_len)
+        real_probe_min_context = _warmup_real_prefill_probe_min_context()
+        if (
+            real_probe_min_context is not None
+            and probe_context_tokens >= real_probe_min_context
+        ):
+            log_once(
+                "Warmup real prefill attention probe executing at "
+                f"context_tokens={probe_context_tokens} query_tokens={int(q.shape[0])} "
+                f"batch_seqs={int(chunk_lens.shape[0])}.",
+                level="INFO",
+            )
+            return None
+        _fill_fake_attention_score(meta.attn_score)
+        return _fake_attention_output(q)
+
     def run_prefill(
         self,
         q: torch.Tensor,
@@ -140,7 +186,7 @@ class TritonAttentionBackend:
                 f"active_slots_shape={tuple(meta.active_slots.shape)}"
             )
         b_prompt_cache_len = b_seq_len - chunk_lens
-        self._debug_check_prefill_bounds(q, view, chunk_lens=chunk_lens)
+        self.debug_check_prefill_bounds(q, view, chunk_lens=chunk_lens)
         if _fake_prefill_attention_enabled():
             real_probe_min_context = _warmup_real_prefill_probe_min_context()
             probe_context_tokens = (
@@ -177,7 +223,7 @@ class TritonAttentionBackend:
         )
         return o
 
-    def _debug_check_prefill_bounds(
+    def debug_check_prefill_bounds(
         self,
         q: torch.Tensor,
         view: PrefillComputeView,
@@ -250,6 +296,8 @@ class TritonAttentionBackend:
         block_seq: int,
         num_heads: int,
         num_kv_heads: int,
+        gqa_block_n: int = 16,
+        gqa_num_warps: int = 2,
     ) -> torch.Tensor:
         payload = _require_explicit_payload(view, operation="Triton decode")
         meta = view.meta
@@ -349,6 +397,8 @@ class TritonAttentionBackend:
                         mid_o,
                         mid_o_logexpsum,
                         block_seq,
+                        gqa_block_n,
+                        gqa_num_warps,
                     )
                 else:
                     mha_flash_decode_stage1(

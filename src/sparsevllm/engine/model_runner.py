@@ -170,6 +170,12 @@ class ModelRunner:
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device(self.device)
         setattr(hf_config, "mlp_chunk_size", config.mlp_chunk_size)
+        if hf_config.model_type == "minimax_m2":
+            setattr(
+                hf_config,
+                "prefill_kv_view_layer_invariant",
+                config.vllm_sparse_method == "",
+            )
         setattr(
             hf_config,
             "decode_cuda_graph",

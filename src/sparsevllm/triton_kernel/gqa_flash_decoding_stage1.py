@@ -328,10 +328,22 @@ def _assert_supported_layout(
 
 @torch.no_grad()
 def flash_decode_stage1(
-    q, k, v, Req_to_tokens, B_req_idx, B_Seqlen, max_len_in_batch, mid_out, mid_out_logsumexp, block_seq
+    q,
+    k,
+    v,
+    Req_to_tokens,
+    B_req_idx,
+    B_Seqlen,
+    max_len_in_batch,
+    mid_out,
+    mid_out_logsumexp,
+    block_seq,
+    block_n=16,
+    num_warps=2,
+    num_stages=2,
 ):
     BLOCK_SEQ = block_seq
-    BLOCK_N = 16
+    BLOCK_N = block_n
     assert BLOCK_SEQ % BLOCK_N == 0
     # shape constraints
     Lq, Lk = q.shape[-1], k.shape[-1]
@@ -376,8 +388,8 @@ def flash_decode_stage1(
         BLOCK_SEQ=BLOCK_SEQ,
         BLOCK_DMODEL=Lk,
         BLOCK_N=BLOCK_N,
-        num_warps=2,
-        num_stages=2,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     return
 

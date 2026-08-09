@@ -550,24 +550,6 @@ def test_dense_layers_use_tp_group_in_replicated_ep_topology():
     assert embedding.weight.shape == (32, 8)
 
 
-def test_parallel_group_uses_bound_all_reduce_provider():
-    provider = Mock()
-    input_tensor, output_tensor = torch.randn(2), torch.randn(2)
-    provider.run.return_value = output_tensor
-    group = ParallelGroup(
-        process_group=None,
-        ranks=(0, 1),
-        rank=0,
-        size=2,
-        all_reduce_provider=provider,
-    )
-
-    actual = ParallelContext._all_reduce(input_tensor, group)
-
-    assert actual is output_tensor
-    provider.run.assert_called_once_with(input_tensor)
-
-
 def test_vocab_parallel_embedding_uses_out_of_place_reduction():
     reduced = torch.randn(2, 4)
     context = SimpleNamespace(

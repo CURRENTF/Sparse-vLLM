@@ -5,6 +5,10 @@ from torch import nn
 
 from sparsevllm.engine.cache_manager import ExplicitKVPayload
 from sparsevllm.layers.attention_backend import TritonAttentionBackend
+from sparsevllm.operators.prefill_attention import (
+    PrefillAttentionOpSpec,
+    resolve_prefill_attention_provider,
+)
 from sparsevllm.utils.context import get_context
 
 from sparsevllm.engine.sparse_controller import SparseController
@@ -57,6 +61,8 @@ class Attention(nn.Module):
         head_dim,
         scale,
         num_kv_heads,
+        *,
+        prefill_op_spec: PrefillAttentionOpSpec | None = None,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -64,6 +70,14 @@ class Attention(nn.Module):
         self.scale = scale
         self.num_kv_heads = num_kv_heads
         self.attention_backend = TritonAttentionBackend()
+        self.prefill_op_spec = prefill_op_spec
+        self.prefill_provider = (
+            resolve_prefill_attention_provider(prefill_op_spec)
+            if prefill_op_spec is not None
+            else None
+        )
+        if self.prefill_provider is not None:
+            self.prefill_provider.prepare(prefill_op_spec)
 
     def forward(
         self,
@@ -108,13 +122,37 @@ class Attention(nn.Module):
                 else:
                     max_input_len = prefill_meta.context_lens.max().item()
 
-                o = self.attention_backend.run_prefill(
+                fake_output = self.attention_backend.maybe_run_fake_prefill(
                     q,
                     prefill_view,
-                    b_start_loc=b_start_loc,
                     chunk_lens=chunk_lens,
                     max_input_len=max_input_len,
                 )
+                if fake_output is not None:
+                    o = fake_output
+                elif self.prefill_provider is None:
+                    o = self.attention_backend.run_prefill(
+                        q,
+                        prefill_view,
+                        b_start_loc=b_start_loc,
+                        chunk_lens=chunk_lens,
+                        max_input_len=max_input_len,
+                    )
+                else:
+                    self.attention_backend.debug_check_prefill_bounds(
+                        q,
+                        prefill_view,
+                        chunk_lens=chunk_lens,
+                    )
+                    o = self.prefill_provider.run(
+                        self.prefill_op_spec,
+                        q,
+                        prefill_view,
+                        qo_indptr=context.cu_seqlens_q,
+                        chunk_lens=chunk_lens,
+                        max_context_len=max_input_len,
+                        layer_idx=int(layer_idx),
+                    )
                 cache_manager.collect_prefill_attention_score(
                     layer_idx,
                     q,
@@ -184,6 +222,16 @@ class Attention(nn.Module):
                             f"decode requires a positive context length, got {max_len_in_batch} at layer={layer_idx}"
                         )
                 BLOCK_SEQ = cache_manager.get_decode_block_seq(layer_idx, 256)
+                BLOCK_SEQ, gqa_block_n, gqa_num_warps = (
+                    self.attention_backend.gqa_decode_launch_config(
+                        block_seq=BLOCK_SEQ,
+                        max_context_len=max_len_in_batch,
+                        num_heads=self.num_heads,
+                        num_kv_heads=self.num_kv_heads,
+                        head_dim=self.head_dim,
+                        requires_attention_scores=decode_meta.attn_score is not None,
+                    )
+                )
                 num_seq_blocks = (max_len_in_batch + BLOCK_SEQ - 1) // BLOCK_SEQ
 
                 mid_o, mid_o_logexpsum = get_decode_workspace(
@@ -204,6 +252,8 @@ class Attention(nn.Module):
                     block_seq=BLOCK_SEQ,
                     num_heads=self.num_heads,
                     num_kv_heads=self.num_kv_heads,
+                    gqa_block_n=gqa_block_n,
+                    gqa_num_warps=gqa_num_warps,
                 )
                 cache_manager.record_decode_query(layer_idx, q)
 

@@ -22,6 +22,7 @@ from sparsevllm.operators.moe import (
     model_activation_dtype,
     resolve_moe_provider,
 )
+from sparsevllm.operators.prefill_attention import PrefillAttentionOpSpec
 from sparsevllm.platforms import device_runtime
 from sparsevllm.quantization.fp8_tp import Fp8ExpertTpShard
 from sparsevllm.utils.context import get_context
@@ -336,11 +337,27 @@ class MiniMaxM2Attention(nn.Module):
             base=float(config.rope_theta),
             rope_scaling=None,
         )
+        prefill_op_spec = None
+        if hasattr(config, "prefill_kv_view_layer_invariant"):
+            prefill_op_spec = PrefillAttentionOpSpec(
+                num_query_heads=self.num_heads,
+                num_kv_heads=self.num_kv_heads,
+                head_dim=self.head_dim,
+                activation_dtype=model_activation_dtype(config),
+                softmax_scale=self.head_dim**-0.5,
+                causal=True,
+                page_size=1,
+                requires_attention_scores=False,
+                layer_invariant_page_table=bool(
+                    config.prefill_kv_view_layer_invariant
+                ),
+            )
         self.attn = Attention(
             self.num_heads,
             self.head_dim,
             self.head_dim**-0.5,
             self.num_kv_heads,
+            prefill_op_spec=prefill_op_spec,
         )
 
     def forward(
@@ -641,11 +658,18 @@ class MiniMaxM2ForCausalLM(nn.Module):
                 f"weights={unexpected_skips[:4]}, scales={unexpected_scale_skips[:4]}."
             )
         logger.info(
-            "Loaded MiniMax M2 rank {} provider={} attention TP {}/{} MoE TP "
+            "Loaded MiniMax M2 rank {} provider={} prefill_provider={} all_reduce_provider={} "
+            "attention TP {}/{} MoE TP "
             "{}/{} local experts [{}, {}) across {} layers; intentionally skipped "
             "{} remote expert weight/scale pairs.",
             self.parallel_context.world_rank,
             self.model.layers[0].block_sparse_moe.experts.provider.name,
+            getattr(
+                self.model.layers[0].self_attn.attn.prefill_provider,
+                "name",
+                "legacy_triton",
+            ),
+            getattr(self.parallel_context.all_reduce_provider, "name", "unconfigured"),
             self.parallel_context.tp_rank,
             self.parallel_context.tp_size,
             self.parallel_context.moe_tp_rank,

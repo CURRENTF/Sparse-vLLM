@@ -5,13 +5,13 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
-from sparsevllm.operators.all_reduce import HopperTp2FlashInferAllReduceProvider
 from sparsevllm.operators.activation import (
     SILU_AND_MUL_REGISTRY,
     SiluAndMulSpec,
     TorchSiluAndMulProvider,
     TritonSiluAndMulProvider,
 )
+from sparsevllm.operators.all_reduce import ALL_REDUCE_REGISTRY, AllReduceOpSpec
 from sparsevllm.operators.fp8_linear import (
     FP8_LINEAR_REGISTRY,
     FlashInferSm90Fp8LinearProvider,
@@ -130,16 +130,33 @@ def _gate_up_spec(**overrides) -> GateUpSwiGLUOpSpec:
     return GateUpSwiGLUOpSpec(**values)
 
 
-def test_flashinfer_all_reduce_falls_back_before_unsupported_shape_launch():
-    provider = HopperTp2FlashInferAllReduceProvider.__new__(
-        HopperTp2FlashInferAllReduceProvider
-    )
-    provider.fallback = Mock()
-    tensor = torch.randn(1, 248320, dtype=torch.bfloat16)
-    provider.fallback.run.return_value = tensor
+def _all_reduce_spec(**overrides) -> AllReduceOpSpec:
+    values = {
+        "world_size": 4,
+        "max_tokens": 8,
+        "hidden_size": 3072,
+        "dtype": torch.bfloat16,
+        "cuda_graph": True,
+    }
+    values.update(overrides)
+    return AllReduceOpSpec(**values)
 
-    assert provider.run(tensor) is tensor
-    provider.fallback.run.assert_called_once_with(tensor)
+
+def test_minimax_all_reduce_prefers_flashinfer_for_profiled_h100_shape():
+    with (
+        patch("sparsevllm.operators.all_reduce.find_spec", return_value=object()),
+        patch("sparsevllm.operators.all_reduce.version", return_value="0.6.15.post1"),
+    ):
+        resolved = OpResolver(ALL_REDUCE_REGISTRY).resolve(
+            _all_reduce_spec(),
+            _cuda_caps(
+                (9, 0),
+                runtime_version="12.9",
+                device_name="NVIDIA H100 80GB HBM3",
+            ),
+        )
+
+    assert resolved.provider.name == "flashinfer_trtllm_sm90"
 
 
 @pytest.mark.parametrize("tp_size", [1, 2])

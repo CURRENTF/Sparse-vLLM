@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from typing import Iterator, Protocol
 
 import torch
 import torch.distributed as dist
 
 from sparsevllm.distributed.topology import ParallelTopology, parallel_group_ranks
-from sparsevllm.operators.all_reduce import AllReduceProvider, resolve_all_reduce_provider
 from sparsevllm.utils.log import logger
 
 
@@ -28,7 +27,6 @@ class ParallelGroup:
     ranks: tuple[int, ...]
     rank: int
     size: int
-    all_reduce_provider: AllReduceProvider | None = field(default=None, compare=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.size != len(self.ranks):
@@ -109,10 +107,7 @@ class ParallelContext:
         op: dist.ReduceOp = dist.ReduceOp.SUM,
     ) -> torch.Tensor:
         if group.size > 1:
-            if op != dist.ReduceOp.SUM or group.all_reduce_provider is None:
-                dist.all_reduce(tensor, op=op, group=group.process_group)
-            else:
-                tensor = group.all_reduce_provider.run(tensor)
+            dist.all_reduce(tensor, op=op, group=group.process_group)
         return tensor
 
     def world_all_reduce(
@@ -307,25 +302,7 @@ def init_parallel_context(
             ranks_by_dimension["moe_tensor"], process_groups, world_rank
         ),
     )
-    providers: dict[tuple[int, ...], AllReduceProvider] = {}
-
-    def bind_provider(group: ParallelGroup) -> ParallelGroup:
-        if group.size == 1:
-            return group
-        provider = providers.get(group.ranks)
-        if provider is None:
-            provider = providers[group.ranks] = resolve_all_reduce_provider(
-                group.process_group, group.size
-            )
-        return replace(group, all_reduce_provider=provider)
-
-    _PARALLEL_CONTEXT = ParallelContext(
-        world=bind_provider(context.world),
-        tensor=bind_provider(context.tensor),
-        expert=bind_provider(context.expert),
-        data=bind_provider(context.data),
-        moe_tensor=bind_provider(context.moe_tensor or context.tensor),
-    )
+    _PARALLEL_CONTEXT = context
     if enable_flashinfer_custom_all_reduce:
         from sparsevllm.distributed.flashinfer_custom_all_reduce import (
             FlashInferCustomAllReduce,
