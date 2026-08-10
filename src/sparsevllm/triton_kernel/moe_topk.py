@@ -205,8 +205,8 @@ def topk_softmax(
     num_experts = int(router_logits.shape[1])
     if num_experts not in {128, 256} or int(top_k) != 8:
         raise ValueError(
-            "Triton topk_softmax currently requires num_experts in {128, 256} "
-            "and top_k=8, "
+            "Triton topk_softmax currently requires num_experts=128 or "
+            "num_experts=256 and top_k=8, "
             f"got num_experts={router_logits.shape[1]}, top_k={top_k}."
         )
 

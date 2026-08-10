@@ -31,7 +31,10 @@ from sparsevllm.engine.chain_cache import (
     RequestAdmission,
     stable_token_digest,
 )
-from sparsevllm.method_registry import normalize_sparse_method
+from sparsevllm.method_registry import (
+    OUTER_TP_MOE_MODEL_TYPES,
+    normalize_sparse_method,
+)
 from sparsevllm.utils.profiler import profiler
 
 def _deltakv_graph_warmup_profile(config: Config) -> str:
@@ -62,7 +65,9 @@ def _use_graph_scaled_warmup(config: Config) -> bool:
 
 
 def _moe_workspace_warmup_token_counts(config: Config) -> tuple[int, ...]:
-    if int(getattr(config.hf_config, "num_experts", 0) or 0) <= 0:
+    model_type = str(getattr(config.hf_config, "model_type", "") or "")
+    has_experts = int(getattr(config.hf_config, "num_experts", 0) or 0) > 0
+    if not has_experts and model_type not in OUTER_TP_MOE_MODEL_TYPES:
         return ()
 
     max_batched_tokens = int(config.max_num_batched_tokens)

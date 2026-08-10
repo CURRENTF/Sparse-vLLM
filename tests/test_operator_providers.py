@@ -1,4 +1,3 @@
-import os
 import sys
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -13,16 +12,7 @@ from sparsevllm.operators.fp8_linear import (
     TritonFp8LinearProvider,
     resolve_fp8_linear_provider,
 )
-from sparsevllm.operators.moe import (
-    MOE_REGISTRY,
-    MoeOpSpec,
-    TorchMoeProvider,
-    resolve_moe_provider,
-)
-from sparsevllm.operators.moe_router import (
-    MoeRouterOpSpec,
-    resolve_moe_router_provider,
-)
+from sparsevllm.operators.moe import MOE_REGISTRY, MoeOpSpec, resolve_moe_provider
 from sparsevllm.operators.registry import OpResolver
 from sparsevllm.platforms import DeviceCaps, PlatformEnum
 
@@ -74,7 +64,6 @@ def _moe_spec(
     tp_size=1,
     routing_method="softmax",
     scale_dtype=None,
-    cuda_graph=True,
 ) -> MoeOpSpec:
     return MoeOpSpec(
         num_experts=num_experts,
@@ -86,7 +75,7 @@ def _moe_spec(
         weight_dtype=weight_dtype,
         block_shape=block_shape,
         ep_size=ep_size,
-        cuda_graph=cuda_graph,
+        cuda_graph=True,
         tp_size=tp_size,
         routing_method=routing_method,
         scale_dtype=scale_dtype,
@@ -355,110 +344,6 @@ def test_unquantized_moe_uses_triton_on_supported_cuda(dtype, capability):
     )
 
     assert resolved.provider.name == "triton"
-
-
-def test_torch_moe_reference_matches_explicit_expert_routing():
-    spec = _moe_spec(
-        activation_dtype=torch.float32,
-        weight_dtype=torch.float32,
-        block_shape=None,
-        hidden_size=3,
-        intermediate_size=2,
-        num_local_experts=2,
-        num_experts=4,
-        top_k=2,
-        ep_size=2,
-        cuda_graph=False,
-    )
-    hidden_states = torch.tensor(
-        [[1.0, -2.0, 0.5], [0.25, 1.0, -0.75], [-1.0, 0.5, 2.0]]
-    )
-    topk_ids = torch.tensor([[2, 0], [3, 2], [1, 0]])
-    topk_weights = torch.tensor([[0.7, 0.3], [0.4, 0.6], [0.8, 0.2]])
-    w13_weight = torch.arange(24, dtype=torch.float32).reshape(2, 4, 3) / 17
-    w2_weight = torch.arange(12, dtype=torch.float32).reshape(2, 3, 2) / 11
-
-    actual = TorchMoeProvider().run(
-        spec,
-        hidden_states,
-        topk_ids,
-        topk_weights,
-        w13_weight,
-        w2_weight,
-        None,
-        None,
-        local_expert_start=2,
-        ep_rank=1,
-    )
-
-    expected = torch.zeros_like(hidden_states)
-    for token_index, routes in enumerate(zip(topk_ids, topk_weights)):
-        for expert_id, route_weight in zip(*routes):
-            local_expert_id = int(expert_id) - 2
-            if not 0 <= local_expert_id < 2:
-                continue
-            gate_up = hidden_states[token_index] @ w13_weight[local_expert_id].T
-            gate, up = gate_up.chunk(2)
-            expert_output = (
-                torch.nn.functional.silu(gate) * up
-            ) @ w2_weight[local_expert_id].T
-            expected[token_index] += expert_output * route_weight
-
-    torch.testing.assert_close(actual, expected)
-    assert torch.equal(actual[2], torch.zeros(3))
-
-
-def test_explicit_torch_moe_provider_selection_is_eager_only():
-    caps = _cuda_caps((9, 0), native_fp8=False)
-    platform = SimpleNamespace(get_device_caps=lambda _: caps)
-    eager_spec = _moe_spec(
-        activation_dtype=torch.bfloat16,
-        weight_dtype=torch.bfloat16,
-        block_shape=None,
-        cuda_graph=False,
-    )
-    graph_spec = _moe_spec(
-        activation_dtype=torch.bfloat16,
-        weight_dtype=torch.bfloat16,
-        block_shape=None,
-        cuda_graph=True,
-    )
-
-    with (
-        patch("sparsevllm.operators.moe.platforms.current_platform", platform),
-        patch.dict(os.environ, {"SPARSEVLLM_MOE_PROVIDER": "torch"}),
-    ):
-        assert resolve_moe_provider(eager_spec, device_index=0).name == "torch"
-        with pytest.raises(RuntimeError, match="eager-only"):
-            resolve_moe_provider(graph_spec, device_index=0)
-
-
-def test_explicit_torch_router_provider_selection_is_eager_only():
-    caps = _cuda_caps((9, 0), native_fp8=False)
-    platform = SimpleNamespace(get_device_caps=lambda _: caps)
-
-    def spec(cuda_graph):
-        return MoeRouterOpSpec(
-            num_experts=256,
-            top_k=8,
-            activation_dtype=torch.bfloat16,
-            norm_topk_prob=True,
-            cuda_graph=cuda_graph,
-        )
-
-    with (
-        patch(
-            "sparsevllm.operators.moe_router.platforms.current_platform",
-            platform,
-        ),
-        patch.dict(
-            os.environ,
-            {"SPARSEVLLM_MOE_ROUTER_PROVIDER": "torch"},
-        ),
-    ):
-        assert resolve_moe_router_provider(spec(False), device_index=0).name == "torch"
-        with pytest.raises(RuntimeError, match="eager-only"):
-            resolve_moe_router_provider(spec(True), device_index=0)
 
 
 def test_hopper_fused_moe_uses_profiled_tp_ep_shape():

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import re
 
 import torch
@@ -71,12 +70,12 @@ class Qwen35MoeRouter(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         router_logits = F.linear(hidden_states, self.weight)
         topk_weights, topk_ids = self.provider.run(
             self.op_spec, router_logits
         )
-        return router_logits, topk_weights, topk_ids
+        return topk_weights, topk_ids
 
 
 class Qwen35MoePackedExperts(Qwen3MoePackedExperts):
@@ -224,7 +223,6 @@ class Qwen35MoeSparseMoeBlock(nn.Module):
     def __init__(self, config) -> None:
         super().__init__()
         self.parallel_context = get_parallel_context()
-        self.debug_enabled = os.getenv("SPARSEVLLM_DEBUG_MOE", "0") == "1"
         self.mlp_chunk_size = int(getattr(config, "mlp_chunk_size", 16384))
         if self.mlp_chunk_size <= 0:
             raise ValueError(
@@ -243,28 +241,14 @@ class Qwen35MoeSparseMoeBlock(nn.Module):
     def _forward_chunk(
         self,
         hidden_states: torch.Tensor,
-    ) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-    ]:
+    ) -> torch.Tensor:
         shared_output = self.shared_expert(hidden_states)
-        router_logits, topk_weights, topk_ids = self.gate(hidden_states)
+        topk_weights, topk_ids = self.gate(hidden_states)
         local_output = self.experts(hidden_states, topk_ids, topk_weights)
         routed_output = self.parallel_context.world_all_reduce(local_output)
         shared_gate = torch.sigmoid(self.shared_expert_gate(hidden_states))
         gated_shared_output = shared_gate * shared_output
-        return (
-            routed_output + gated_shared_output,
-            router_logits,
-            topk_weights,
-            topk_ids,
-            local_output,
-            gated_shared_output,
-        )
+        return routed_output + gated_shared_output
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if hidden_states.dim() != 2:
@@ -272,62 +256,11 @@ class Qwen35MoeSparseMoeBlock(nn.Module):
                 "Qwen35MoeSparseMoeBlock expects [tokens, hidden], "
                 f"got {tuple(hidden_states.shape)}."
             )
-        debug_enabled = self.debug_enabled
-        if debug_enabled:
-            self.debug_last_input = hidden_states.detach().clone()
-
         chunks = hidden_states.split(self.mlp_chunk_size, dim=0)
         outputs = []
-        router_logits_chunks = []
-        topk_weights_chunks = []
-        topk_ids_chunks = []
-        local_output_chunks = []
-        shared_output_chunks = []
         for chunk in chunks:
-            (
-                output,
-                router_logits,
-                topk_weights,
-                topk_ids,
-                local_output,
-                shared_output,
-            ) = self._forward_chunk(chunk)
-            outputs.append(output)
-            if debug_enabled:
-                router_logits_chunks.append(router_logits)
-                topk_weights_chunks.append(topk_weights)
-                topk_ids_chunks.append(topk_ids)
-                local_output_chunks.append(local_output)
-                shared_output_chunks.append(shared_output)
-        output = outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=0)
-
-        if debug_enabled:
-            self.debug_last_router_logits = torch.cat(
-                router_logits_chunks, dim=0
-            ).detach().clone()
-            self.debug_last_topk_weights = torch.cat(
-                topk_weights_chunks, dim=0
-            ).detach().clone()
-            self.debug_last_topk_ids = torch.cat(
-                topk_ids_chunks, dim=0
-            ).detach().clone()
-            self.debug_last_local_output = torch.cat(
-                local_output_chunks, dim=0
-            ).detach().clone()
-            self.debug_last_shared_output = torch.cat(
-                shared_output_chunks, dim=0
-            ).detach().clone()
-            local_mask = (
-                self.debug_last_topk_ids >= self.experts.local_expert_start
-            ) & (self.debug_last_topk_ids < self.experts.local_expert_end)
-            local_hit_count = local_mask.sum()
-            self.debug_last_local_hit_count = (
-                local_hit_count
-                if device_runtime.is_stream_capturing()
-                else int(local_hit_count.item())
-            )
-            self.debug_last_output = output.detach().clone()
-        return output
+            outputs.append(self._forward_chunk(chunk))
+        return outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=0)
 
 
 class Qwen35MoeDecoderLayer(Qwen35DecoderLayer):
@@ -387,23 +320,6 @@ class Qwen35MoeForCausalLM(Qwen35ForCausalLM):
                 ),
             ),
         )
-
-    def runtime_diagnostic_status(self) -> dict[str, object]:
-        experts = self.model.layers[0].mlp.experts
-        router = self.model.layers[0].mlp.gate
-        shared_linear = self.model.layers[0].mlp.shared_expert.gate_up_proj
-        return {
-            "moe_expert_provider": experts.provider.name,
-            "moe_router_provider": router.provider.name,
-            "moe_weight_dtype": str(experts.w13_weight.dtype),
-            "fp8_linear_provider": (
-                shared_linear.quant_provider.name
-                if shared_linear.quantized
-                else None
-            ),
-            "local_expert_start": int(experts.local_expert_start),
-            "local_expert_end": int(experts.local_expert_end),
-        }
 
     @torch.inference_mode()
     def warmup_moe(self, num_tokens: int = 1) -> None:

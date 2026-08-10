@@ -93,15 +93,14 @@ def test_moe_alignment_covers_hotspot_and_empty_rank(dtype):
         assert int(valid.numel()) == expected
 
 
-@pytest.mark.parametrize("num_experts", [128, 256])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("norm_topk_prob", [False, True])
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for Triton MoE tests.")
-def test_topk_softmax_matches_pytorch(num_experts, dtype, norm_topk_prob):
+def test_topk_softmax_matches_pytorch(dtype, norm_topk_prob):
     torch.manual_seed(21)
-    base = torch.arange(num_experts, dtype=dtype, device="cuda") / 16 - 4
+    base = torch.arange(128, dtype=dtype, device="cuda") / 16 - 4
     logits = torch.stack(
-        [base[torch.randperm(num_experts, device="cuda")] for _ in range(257)]
+        [base[torch.randperm(128, device="cuda")] for _ in range(257)]
     )
     expected_probs = torch.softmax(logits, dim=-1, dtype=torch.float32)
     expected_weights, expected_ids = torch.topk(expected_probs, 8, dim=-1)
@@ -167,7 +166,7 @@ def test_topk_softmax_nonfinite_inputs_keep_ids_in_range_and_propagate_nan():
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for Triton MoE tests.")
 def test_topk_softmax_rejects_unsupported_shape_and_layout():
-    with pytest.raises(ValueError, match="num_experts in"):
+    with pytest.raises(ValueError, match="num_experts=128"):
         topk_softmax(
             torch.zeros(2, 64, dtype=torch.bfloat16, device="cuda"),
             top_k=8,

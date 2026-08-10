@@ -27,7 +27,6 @@ from sparsevllm.method_registry import (
     is_tp_decode_cuda_graph_supported,
     normalize_sparse_method,
 )
-from benchmark.runtime_validation import collect_worker_runtime_status
 
 
 DEFAULT_ALL_CHUNKED_PREFILL_SIZE = 96 * 1024
@@ -157,8 +156,6 @@ def _selected_env_snapshot() -> dict[str, str]:
         "SPARSEVLLM_LONG_PREFILL_OFFLOAD_MIN_TOKENS",
         "SPARSEVLLM_RAWKV_BUFFER_MODE",
         "SPARSEVLLM_RAWKV_PREFETCH",
-        "SPARSEVLLM_MOE_ROUTER_PROVIDER",
-        "SPARSEVLLM_MOE_PROVIDER",
     ]
     return {key: os.environ[key] for key in keys if key in os.environ}
 
@@ -279,10 +276,6 @@ def _artifact_records(args, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "synchronize_step_timing",
             bool(getattr(args, "synchronize_step_timing", False)),
         )
-        record.setdefault(
-            "warmup_output_len",
-            int(getattr(args, "warmup_output_len", 0) or 0),
-        )
         if "prefill_tp" in row:
             record.setdefault("prefill_tok_s", row["prefill_tp"])
         if "decode_tp" in row:
@@ -293,8 +286,6 @@ def _artifact_records(args, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             record.setdefault("itl_ms", row["itl"])
         if "mem" in row:
             record.setdefault("peak_memory_gb", row["mem"])
-        if "end_to_end_tp" in row:
-            record.setdefault("end_to_end_tok_s", row["end_to_end_tp"])
         records.append(record)
     return records
 
@@ -320,11 +311,9 @@ def _write_output_dir(args, rows: list[dict[str, Any]]) -> None:
         "output_len": int(args.output_len),
         "temperature": float(args.temperature),
         "top_p": float(args.top_p),
-        "seed": int(getattr(args, "seed", 20260810)),
         "synchronize_step_timing": bool(
             getattr(args, "synchronize_step_timing", False)
         ),
-        "warmup_output_len": int(getattr(args, "warmup_output_len", 0) or 0),
         "hyper_params": args.hyper_params_dict,
         "env": _selected_env_snapshot(),
     }
@@ -400,10 +389,6 @@ def _decode_cuda_graph_status(llm) -> dict[str, Any]:
         "decode_cuda_graph_last_state_key": str(getattr(runner, "last_state_key", None)) if runner is not None else None,
         "decode_cuda_graph_active": bool(configured and graph_count > 0),
     }
-
-
-def _worker_runtime_status(llm) -> list[dict[str, Any]]:
-    return collect_worker_runtime_status(llm)
 
 
 def _jsonable_config_value(value: Any) -> Any:
@@ -487,9 +472,6 @@ def _finished_outputs_have_tokens(finished_outputs) -> bool:
 
 
 def benchmark_task(method, length, bs, args, results_dict):
-    seed = int(getattr(args, "seed", 20260810))
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
     # 为每个子进程重置显存统计
     torch.cuda.reset_peak_memory_stats()
     torch.cuda.empty_cache()
@@ -559,41 +541,6 @@ def benchmark_task(method, length, bs, args, results_dict):
         }
         llm = LLM(args.model_path, **engine_kwargs)
         resolved_engine_config = _resolved_engine_config(llm)
-        warmup_output_len = int(getattr(args, "warmup_output_len", 0) or 0)
-        if warmup_output_len < 0:
-            raise ValueError("warmup_output_len must be non-negative.")
-        if warmup_output_len:
-            warmup_prompt_len = min(int(length), 1024)
-            warmup_prompts = [[100] * warmup_prompt_len for _ in range(bs)]
-            warmup_sampling = [
-                SamplingParams(
-                    temperature=0.0,
-                    top_p=1.0,
-                    ignore_eos=True,
-                    max_tokens=warmup_output_len,
-                )
-                for _ in range(bs)
-            ]
-            warmup_outputs = llm.generate(
-                warmup_prompts,
-                warmup_sampling,
-                use_tqdm=False,
-            )
-            if len(warmup_outputs) != bs or not llm.is_finished():
-                raise RuntimeError(
-                    "Microbenchmark warmup did not finish every request: "
-                    f"expected={bs}, outputs={len(warmup_outputs)}, "
-                    f"engine_finished={llm.is_finished()}."
-                )
-            if bool(base_hyper_params.get("decode_cuda_graph")) and not all(
-                bool(status.get("decode_cuda_graph_active"))
-                for status in _worker_runtime_status(llm)
-            ):
-                raise RuntimeError(
-                    "Decode CUDA Graph was requested but did not activate during warmup."
-                )
-            torch.cuda.synchronize()
-            torch.cuda.reset_peak_memory_stats()
         prefix_cache_stats_before = _cache_stats(llm)
 
         prompt_token_ids = [[100] * length for _ in range(bs)]
@@ -739,25 +686,8 @@ def benchmark_task(method, length, bs, args, results_dict):
         t_end = perf_counter()
         
         duration = t_end - t_start
-        end_to_end_tokens = int(prefill_tokens + decode_tokens)
-        end_to_end_tp = end_to_end_tokens / duration if duration > 0 else 0.0
         peak_mem = get_peak_memory()
         graph_status = _decode_cuda_graph_status(llm)
-        worker_runtime_status = _worker_runtime_status(llm)
-        primary_worker_status = worker_runtime_status[0]
-        provider_status = {
-            key: primary_worker_status[key]
-            for key in ("moe_expert_provider", "moe_router_provider")
-            if key in primary_worker_status
-        }
-        if bool(base_hyper_params.get("decode_cuda_graph")) and not all(
-            bool(status.get("decode_cuda_graph_active"))
-            for status in worker_runtime_status
-        ):
-            raise RuntimeError(
-                "Decode CUDA Graph was requested but was not active on every "
-                f"worker: {worker_runtime_status!r}."
-            )
         prefix_cache_stats_after = _cache_stats(llm)
         prefix_cache_stats_delta = _numeric_delta(prefix_cache_stats_before, prefix_cache_stats_after)
         observed_prefix_hit_tokens = int(sum(prefix_hits_by_seq_id.values()))
@@ -827,9 +757,6 @@ def benchmark_task(method, length, bs, args, results_dict):
             "itl": avg_itl,
             "avg_bs": avg_active_bs,
             "mem": peak_mem,
-            "duration_s": duration,
-            "end_to_end_tokens": end_to_end_tokens,
-            "end_to_end_tp": end_to_end_tp,
             "has_queued": has_queued,
             "full_admission_reached": full_admission_reached,
             "impossible_full_admission": impossible_full_admission,
@@ -846,8 +773,6 @@ def benchmark_task(method, length, bs, args, results_dict):
             "scheduler_recompute_replays": recompute_replays,
             "decode_cuda_graph_expected": bool(base_hyper_params.get("decode_cuda_graph")),
             **graph_status,
-            **provider_status,
-            "worker_runtime_status": worker_runtime_status,
             "prefix_cache_required": bool(getattr(args, "require_prefix_cache_hit", False)),
             "prefix_cache_stats_before": prefix_cache_stats_before,
             "prefix_cache_stats_after": prefix_cache_stats_after,
@@ -918,7 +843,6 @@ def main():
         default=1.0,
         help="Nucleus sampling top-p. Only used when temperature > 0.",
     )
-    parser.add_argument("--seed", type=int, default=20260810)
     parser.add_argument(
         "--admission_wave_size",
         type=int,
@@ -943,15 +867,6 @@ def main():
         help=(
             "Synchronize CUDA after each llm.step() before measuring its duration, "
             "so post-sparse work is attributed to the step that launched it."
-        ),
-    )
-    parser.add_argument(
-        "--warmup_output_len",
-        type=int,
-        default=0,
-        help=(
-            "Run an unmeasured same-batch warmup before each case; a positive value "
-            "also forces decode CUDA Graph capture before timed steps."
         ),
     )
     parser.add_argument(

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 
 import torch
@@ -95,35 +94,6 @@ class TritonMoeRouterProvider(MoeRouterProvider):
         )
 
 
-@MOE_ROUTER_REGISTRY.register
-class TorchMoeRouterProvider(MoeRouterProvider):
-    name = "torch"
-    priority = 0
-
-    @classmethod
-    def supports(
-        cls,
-        spec: MoeRouterOpSpec,
-        caps: DeviceCaps,
-    ) -> SupportResult:
-        if caps.platform != PlatformEnum.CUDA:
-            return SupportResult.no(f"requires CUDA, got {caps.platform.name}")
-        if spec.cuda_graph:
-            return SupportResult.no("reference provider is eager-only")
-        return SupportResult.yes()
-
-    def run(
-        self,
-        spec: MoeRouterOpSpec,
-        router_logits: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        probabilities = torch.softmax(router_logits, dim=-1, dtype=torch.float32)
-        weights, ids = torch.topk(probabilities, spec.top_k, dim=-1)
-        if spec.norm_topk_prob:
-            weights = weights / weights.sum(dim=-1, keepdim=True)
-        return weights.to(dtype=router_logits.dtype), ids.to(dtype=torch.int32)
-
-
 def resolve_moe_router_provider(
     spec: MoeRouterOpSpec,
     *,
@@ -133,24 +103,4 @@ def resolve_moe_router_provider(
     if device_index is None:
         device_index = torch.cuda.current_device() if platform.is_cuda_alike() else 0
     caps = platform.get_device_caps(int(device_index))
-    requested = os.getenv("SPARSEVLLM_MOE_ROUTER_PROVIDER", "auto").strip().lower()
-    if requested == "auto":
-        return OpResolver(MOE_ROUTER_REGISTRY).resolve(spec, caps).provider
-
-    providers = {
-        provider.name: provider for provider in MOE_ROUTER_REGISTRY.providers
-    }
-    if requested not in providers:
-        choices = ", ".join(["auto", *sorted(providers)])
-        raise ValueError(
-            "SPARSEVLLM_MOE_ROUTER_PROVIDER must be one of "
-            f"{choices}, got {requested!r}."
-        )
-    provider_cls = providers[requested]
-    support = provider_cls.supports(spec, caps)
-    if not support.supported:
-        raise RuntimeError(
-            f"Requested MoE router provider {requested!r} does not support "
-            f"spec={spec!r} on device={caps.device_name!r}: {support.reason}."
-        )
-    return provider_cls()
+    return OpResolver(MOE_ROUTER_REGISTRY).resolve(spec, caps).provider

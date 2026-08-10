@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from importlib.util import find_spec
 
 import torch
-import torch.nn.functional as F
 
 import sparsevllm.platforms as platforms
 from sparsevllm.operators.registry import (
@@ -176,69 +174,6 @@ class MoeProvider:
 
 
 MOE_REGISTRY: OpRegistry[MoeOpSpec, MoeProvider] = OpRegistry("routed MoE")
-
-
-@MOE_REGISTRY.register
-class TorchMoeProvider(MoeProvider):
-    """Clear eager-only CUDA reference for routed-expert semantics."""
-
-    name = "torch"
-    priority = 0
-    gate_up_order = "gate_up"
-
-    @classmethod
-    def supports(cls, spec: MoeOpSpec, caps: DeviceCaps) -> SupportResult:
-        if caps.platform != PlatformEnum.CUDA:
-            return SupportResult.no(f"requires CUDA, got {caps.platform.name}")
-        if spec.cuda_graph:
-            return SupportResult.no("reference provider is eager-only")
-        if spec.weight_dtype != spec.activation_dtype:
-            return SupportResult.no(
-                "reference provider requires unquantized weights matching activations"
-            )
-        if spec.block_shape is not None:
-            return SupportResult.no("reference provider does not support quantized weights")
-        return SupportResult.yes()
-
-    def run(
-        self,
-        spec,
-        hidden_states,
-        topk_ids,
-        topk_weights,
-        w13_weight,
-        w2_weight,
-        w13_scale_inv,
-        w2_scale_inv,
-        *,
-        local_expert_start,
-        ep_rank,
-    ):
-        del ep_rank
-        if w13_scale_inv is not None or w2_scale_inv is not None:
-            raise RuntimeError("Torch MoE reference does not accept expert scales.")
-        output = torch.zeros_like(hidden_states)
-        for local_expert_id in range(spec.num_local_experts):
-            global_expert_id = int(local_expert_start) + local_expert_id
-            token_indices, topk_slots = torch.where(
-                topk_ids == global_expert_id
-            )
-            if token_indices.numel() == 0:
-                continue
-            projected = F.linear(
-                hidden_states[token_indices],
-                w13_weight[local_expert_id],
-            )
-            gate, up = projected.chunk(2, dim=-1)
-            expert_output = F.linear(
-                F.silu(gate) * up,
-                w2_weight[local_expert_id],
-            )
-            routed = expert_output * topk_weights[
-                token_indices, topk_slots
-            ].unsqueeze(-1)
-            output.index_add_(0, token_indices, routed)
-        return output
 
 
 @MOE_REGISTRY.register
@@ -578,22 +513,4 @@ def resolve_moe_provider(
     if device_index is None:
         device_index = torch.cuda.current_device() if platform.is_cuda_alike() else 0
     caps = platform.get_device_caps(int(device_index))
-    requested = os.getenv("SPARSEVLLM_MOE_PROVIDER", "auto").strip().lower()
-    if requested == "auto":
-        return OpResolver(MOE_REGISTRY).resolve(spec, caps).provider
-
-    providers = {provider.name: provider for provider in MOE_REGISTRY.providers}
-    if requested not in providers:
-        choices = ", ".join(["auto", *sorted(providers)])
-        raise ValueError(
-            "SPARSEVLLM_MOE_PROVIDER must be one of "
-            f"{choices}, got {requested!r}."
-        )
-    provider_cls = providers[requested]
-    support = provider_cls.supports(spec, caps)
-    if not support.supported:
-        raise RuntimeError(
-            f"Requested MoE provider {requested!r} does not support "
-            f"spec={spec!r} on device={caps.device_name!r}: {support.reason}."
-        )
-    return provider_cls()
+    return OpResolver(MOE_REGISTRY).resolve(spec, caps).provider

@@ -191,15 +191,7 @@ class SparseVLLMRegressionGradingTest(unittest.TestCase):
         method = manifest["methods"]["h2o"]
         self.assertEqual(
             method["supported_model_families"],
-            [
-                "qwen2",
-                "qwen3",
-                "qwen3_moe",
-                "qwen3_5",
-                "qwen3_5_moe",
-                "llama",
-                "minimax_m2",
-            ],
+            ["qwen2", "qwen3", "qwen3_moe", "qwen3_5", "qwen3_5_moe", "llama", "minimax_m2"],
         )
         self.assertEqual(
             set(method["supported_model_families"]),

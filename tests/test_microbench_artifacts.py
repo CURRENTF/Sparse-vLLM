@@ -9,30 +9,8 @@ from benchmark.microbench import (
     _benchmark_sparse_method,
     _record_child_exit_failure,
     _resolved_engine_config,
-    _worker_runtime_status,
     _write_output_dir,
 )
-
-
-def test_worker_runtime_status_preserves_per_rank_graph_and_provider_data():
-    expected = [
-        {
-            "world_rank": 0,
-            "decode_cuda_graph_active": True,
-            "moe_router_provider": "triton",
-        },
-        {
-            "world_rank": 1,
-            "decode_cuda_graph_active": True,
-            "moe_router_provider": "triton",
-        },
-    ]
-    llm = SimpleNamespace(
-        config=SimpleNamespace(world_size=2),
-        model_runner=SimpleNamespace(call=lambda method: expected),
-    )
-
-    assert _worker_runtime_status(llm) == expected
 
 
 @pytest.mark.parametrize(
