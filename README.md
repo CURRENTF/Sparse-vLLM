@@ -140,7 +140,7 @@ The explicit indexes select the CUDA 13.0 builds of PyTorch and the FlashInfer
 JIT cache.
 
 
-Qwen3.5/Qwen3.6 FP8 mixed-attention inference additionally requires the
+Qwen3.5/Qwen3.6 mixed-attention inference additionally requires the
 optional Python dependencies:
 
 ```bash
@@ -158,8 +158,8 @@ the smaller CUDA-specific extra:
 pip install -e ".[prefix-offload]"
 ```
 
-Sparse-vLLM currently supports Qwen3.5/Qwen3.6 checkpoints only in the
-block-scaled FP8 format.
+Sparse-vLLM supports Qwen3.5/Qwen3.6 checkpoints in unquantized BF16 and
+block-scaled FP8 formats.
 
 The Qwen3.5/Qwen3.6 prefill causal Conv1D and decode Conv1D/GDN packing paths
 use repository-local Triton kernels; `sglang-kernel` and a local CUDA extension

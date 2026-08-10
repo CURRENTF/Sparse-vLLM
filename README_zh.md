@@ -127,7 +127,7 @@ uv pip install flashinfer-cubin --index-url https://flashinfer.ai/whl
 以上显式索引分别用于安装 CUDA 13.0 版本的 PyTorch 和 FlashInfer JIT
 缓存。
 
-Qwen3.5/Qwen3.6 FP8 混合注意力推理还需要安装 CUDA 专用的可选依赖：
+Qwen3.5/Qwen3.6 混合注意力推理还需要安装 CUDA 专用的可选依赖：
 
 ```bash
 # uv

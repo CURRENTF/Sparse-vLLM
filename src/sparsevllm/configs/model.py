@@ -186,6 +186,36 @@ class QuantizationConfig:
         )
 
 
+def _validate_qwen35_checkpoint_precision(
+    hf_config: Any,
+    raw_quantization_config: Any,
+    quantization_config: QuantizationConfig,
+) -> None:
+    if quantization_config.enabled:
+        return
+
+    quant_method = str(
+        _config_get(
+            raw_quantization_config,
+            "quant_method",
+            _config_get(raw_quantization_config, "method", ""),
+        )
+        or ""
+    ).strip().lower()
+    if quant_method:
+        raise NotImplementedError(
+            "qwen3_5 supports unquantized BF16 or block FP8 checkpoints only, "
+            f"got quant_method={quant_method!r}."
+        )
+
+    configured_dtype = _config_get(hf_config, "torch_dtype", None)
+    if configured_dtype not in {torch.bfloat16, "bfloat16"}:
+        raise NotImplementedError(
+            "Unquantized qwen3_5 checkpoints require BF16 weights, "
+            f"got torch_dtype={configured_dtype!r}."
+        )
+
+
 _MINIMAX_M2_FIXED_FIELDS = {
     "vocab_size": 200064,
     "hidden_size": 3072,
@@ -799,9 +829,15 @@ def load_and_validate_model(config) -> bool:
         quantized_model_name = "Qwen3MoE"
     config.quantization_config = QuantizationConfig.from_hf_config(
         raw_quantization_config,
-        required_fp8=is_qwen35 or is_minimax_m2,
+        required_fp8=is_minimax_m2,
         model_name=quantized_model_name,
     )
+    if is_qwen35:
+        _validate_qwen35_checkpoint_precision(
+            config.hf_config,
+            raw_quantization_config,
+            config.quantization_config,
+        )
     if config.tiny_random and config.quantization_config.enabled:
         raise NotImplementedError("Tiny random mode does not support quantized model weights.")
     setattr(config.hf_config, "quantization_config", config.quantization_config)

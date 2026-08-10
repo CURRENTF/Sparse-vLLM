@@ -40,7 +40,7 @@ uv pip install -e .
 MAX_JOBS=8 uv pip install flash-attn --no-build-isolation
 ```
 
-对于 Qwen3.5/Qwen3.6 FP8 mixed-attention inference，还需安装可选 Python 依赖：
+对于 Qwen3.5/Qwen3.6 mixed-attention inference，还需安装可选 Python 依赖：
 
 ```bash
 # uv
@@ -56,7 +56,7 @@ pip install -e ".[qwen35]"
 pip install -e ".[prefix-offload]"
 ```
 
-Sparse-vLLM 当前仅支持 block-scaled FP8 格式的 Qwen3.5/Qwen3.6 checkpoint。
+Sparse-vLLM 当前支持未量化 BF16 和 block-scaled FP8 格式的 Qwen3.5/Qwen3.6 checkpoint。
 
 其 prefill causal Conv1D 和 decode Conv1D/GDN packing path 使用仓库本地 Triton kernel，不需要 `sglang-kernel` 或编译仓库 CUDA extension。
 

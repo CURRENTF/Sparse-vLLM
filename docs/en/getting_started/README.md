@@ -43,7 +43,7 @@ MAX_JOBS=8 uv pip install flash-attn --no-build-isolation
 ```
 
 
-For Qwen3.5/Qwen3.6 FP8 mixed-attention inference, install the optional Python
+For Qwen3.5/Qwen3.6 mixed-attention inference, install the optional Python
 dependencies as well:
 
 ```bash
@@ -60,8 +60,8 @@ For prefix-cache offload with vanilla, OmniKV, or QuEST only:
 pip install -e ".[prefix-offload]"
 ```
 
-Sparse-vLLM currently supports Qwen3.5/Qwen3.6 checkpoints only in the
-block-scaled FP8 format.
+Sparse-vLLM supports Qwen3.5/Qwen3.6 checkpoints in unquantized BF16 and
+block-scaled FP8 formats.
 
 Its prefill causal Conv1D and decode Conv1D/GDN packing paths use local Triton
 kernels. They do not require `sglang-kernel` or a repository CUDA-extension

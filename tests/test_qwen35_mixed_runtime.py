@@ -1046,6 +1046,37 @@ def test_qwen35_raw_config_fallback_when_transformers_autoconfig_is_unknown(tmp_
     assert cfg.runtime_layout.num_kv_layers == 16
 
 
+def test_qwen35_accepts_unquantized_bf16_checkpoint(tmp_path):
+    outer_config = _qwen35_outer_config()
+    outer_config.text_config.torch_dtype = torch.bfloat16
+    outer_config.text_config.quantization_config = None
+
+    with patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", return_value=outer_config):
+        cfg = Config(model=str(tmp_path))
+
+    assert cfg.hf_config.torch_dtype == torch.bfloat16
+    assert cfg.quantization_config.enabled is False
+    assert cfg.hf_config.quantization_config.enabled is False
+
+
+def test_qwen35_rejects_unquantized_fp16_checkpoint(tmp_path):
+    outer_config = _qwen35_outer_config()
+    outer_config.text_config.quantization_config = None
+
+    with patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", return_value=outer_config):
+        with pytest.raises(NotImplementedError, match="require BF16 weights"):
+            Config(model=str(tmp_path))
+
+
+def test_qwen35_rejects_unsupported_quantization(tmp_path):
+    outer_config = _qwen35_outer_config()
+    outer_config.text_config.quantization_config = {"quant_method": "awq"}
+
+    with patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", return_value=outer_config):
+        with pytest.raises(NotImplementedError, match="unquantized BF16 or block FP8"):
+            Config(model=str(tmp_path))
+
+
 def test_qwen35_linear_conv1d_matches_hf_biasless_checkpoint():
     with patch(
         "sparsevllm.models.qwen3_5.get_parallel_context",
