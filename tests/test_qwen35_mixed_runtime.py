@@ -54,6 +54,37 @@ def _single_process_parallel_context() -> ParallelContext:
     return ParallelContext(world=group, tensor=group, expert=group, data=group)
 
 
+def test_model_runner_debug_logits_capture_is_explicit():
+    runner = SimpleNamespace(debug_runtime_enabled=True)
+
+    ModelRunner._capture_debug_logits(runner, None)
+    assert not hasattr(runner, "debug_last_logits")
+
+    logits = torch.tensor([[1.0, 2.0]])
+    ModelRunner._capture_debug_logits(runner, logits)
+    torch.testing.assert_close(runner.debug_last_logits, logits)
+    assert runner.debug_last_logits.data_ptr() != logits.data_ptr()
+
+
+def test_model_runner_debug_logits_non_output_rank_returns_none():
+    runner = SimpleNamespace(rank=1)
+
+    assert ModelRunner.debug_last_logits_cpu(runner) is None
+
+
+def test_model_runner_tp_replica_consistency_does_not_require_rank_local_logits():
+    runner = SimpleNamespace(
+        world_size=2,
+        model=SimpleNamespace(model=SimpleNamespace(layers=[])),
+    )
+
+    assert ModelRunner.debug_replica_consistency(runner) == {
+        "last_logits_max_abs": None,
+        "last_logits_tolerance_ratio": None,
+        "moe_layers": {},
+    }
+
+
 def _qwen35_outer_config(*, num_layers: int = 64, full_layers: tuple[int, ...] | None = None):
     if full_layers is None:
         full_layers = tuple(range(0, num_layers, 4))

@@ -60,6 +60,48 @@ class LongBenchDeltaKVContractsTest(unittest.TestCase):
         finally:
             longbench_pred.DATA_PREFIX_PATH = old_root
 
+    def test_longbench_writes_prompt_and_canonical_per_sample_artifact(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            task_path = str(Path(tmp) / "qasper.jsonl")
+            record = {
+                "dataset": "qasper",
+                "sample_idx": 0,
+                "source_idx": 12,
+                "status": "success",
+                "prompt_tokens": 16001,
+                "rendered_prompt": "fixed rendered prompt",
+                "rendered_prompt_sha256": longbench_pred._sha256_text(
+                    "fixed rendered prompt"
+                ),
+                "pred": "answer",
+                "raw_pred": "answer",
+                "answers": ["answer"],
+                "all_classes": [],
+                "length": 16001,
+            }
+
+            longbench_pred._write_sample_record(
+                out_root=tmp,
+                task_out_path=task_path,
+                record=record,
+            )
+
+            canonical = (Path(tmp) / "per_sample_results.jsonl").read_text(
+                encoding="utf-8"
+            )
+            historical = (Path(tmp) / "sample_results.jsonl").read_text(
+                encoding="utf-8"
+            )
+            raw = json.loads(
+                (Path(tmp) / "raw_outputs.jsonl").read_text(encoding="utf-8")
+            )
+            self.assertEqual(canonical, historical)
+            self.assertEqual(raw["rendered_prompt"], "fixed rendered prompt")
+            self.assertEqual(
+                raw["rendered_prompt_sha256"],
+                longbench_pred._sha256_text("fixed rendered prompt"),
+            )
+
     def test_sparsevllm_data_workers_receive_distinct_master_ports(self):
         launched = []
 
@@ -95,18 +137,27 @@ class LongBenchDeltaKVContractsTest(unittest.TestCase):
         )
 
     def test_longbench_records_actual_decode_cuda_graph_state(self):
-        graph_runner = SimpleNamespace(
-            _graphs={
-                "captured": SimpleNamespace(graph=object()),
-                "uncaptured": SimpleNamespace(graph=None),
+        worker_statuses = [
+            {
+                "world_rank": 0,
+                "decode_cuda_graph_configured": True,
+                "decode_cuda_graph_state_count": 2,
+                "decode_cuda_graph_graph_count": 1,
+                "decode_cuda_graph_active": True,
             },
-            last_state_key="captured",
-        )
+            {
+                "world_rank": 1,
+                "decode_cuda_graph_configured": True,
+                "decode_cuda_graph_state_count": 2,
+                "decode_cuda_graph_graph_count": 1,
+                "decode_cuda_graph_active": True,
+            },
+        ]
         generate_fn = SimpleNamespace(
             _sparsevllm_llm=SimpleNamespace(
-                config=SimpleNamespace(decode_cuda_graph=True),
+                config=SimpleNamespace(world_size=2),
                 model_runner=SimpleNamespace(
-                    decode_cuda_graph_runner=graph_runner,
+                    call=lambda method: worker_statuses
                 ),
             )
         )
@@ -119,17 +170,70 @@ class LongBenchDeltaKVContractsTest(unittest.TestCase):
             )
             path = Path(tmp) / "decode_cuda_graph_status_rank2.json"
 
-            self.assertEqual(status["rank"], 2)
-            self.assertTrue(status["configured"])
-            self.assertTrue(status["runner_initialized"])
-            self.assertEqual(status["state_count"], 2)
-            self.assertEqual(status["graph_count"], 1)
-            self.assertTrue(status["active"])
-            self.assertEqual(status["last_state_key"], "captured")
+            self.assertEqual(status["launcher_rank"], 2)
+            self.assertTrue(status["configured_on_all_workers"])
+            self.assertTrue(status["active_on_all_workers"])
+            self.assertEqual(status["workers"], worker_statuses)
             self.assertEqual(
                 json.loads(path.read_text(encoding="utf-8")),
                 status,
             )
+
+    def test_longbench_fails_if_any_requested_graph_worker_is_inactive(self):
+        generate_fn = SimpleNamespace(
+            _sparsevllm_llm=SimpleNamespace(
+                config=SimpleNamespace(world_size=2),
+                model_runner=SimpleNamespace(
+                    call=lambda method: [
+                        {
+                            "world_rank": 0,
+                            "decode_cuda_graph_configured": True,
+                            "decode_cuda_graph_active": True,
+                        },
+                        {
+                            "world_rank": 1,
+                            "decode_cuda_graph_configured": True,
+                            "decode_cuda_graph_active": False,
+                        },
+                    ]
+                ),
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(RuntimeError, "not active on every"):
+                longbench_pred._write_decode_cuda_graph_status(
+                    generate_fn=generate_fn,
+                    out_root=tmp,
+                    rank=0,
+                )
+
+    def test_longbench_fails_if_requested_graph_is_unconfigured(self):
+        generate_fn = SimpleNamespace(
+            _sparsevllm_llm=SimpleNamespace(
+                config=SimpleNamespace(
+                    world_size=1,
+                    decode_cuda_graph=True,
+                ),
+                model_runner=SimpleNamespace(
+                    call=lambda method: [
+                        {
+                            "world_rank": 0,
+                            "decode_cuda_graph_configured": False,
+                            "decode_cuda_graph_active": False,
+                        }
+                    ]
+                ),
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(RuntimeError, "not configured on every"):
+                longbench_pred._write_decode_cuda_graph_status(
+                    generate_fn=generate_fn,
+                    out_root=tmp,
+                    rank=0,
+                )
 
     def test_longbench_fails_if_sparsevllm_graph_state_is_unavailable(self):
         with tempfile.TemporaryDirectory() as tmp:

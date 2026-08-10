@@ -41,10 +41,10 @@ def _load_raw_qwen35_config(model_path: str, error: Exception) -> SimpleNamespac
         ) from error
     with open(config_path, "r", encoding="utf-8") as f:
         raw_config = json.load(f)
-    if not _is_qwen35_outer_config(raw_config):
+    if not _is_qwen35_family_outer_config(raw_config):
         raise RuntimeError(
             "AutoConfig.from_pretrained failed. Refusing to silently fall back to raw "
-            f"`config.json` for non-qwen3_5 model. model={model_path} "
+            f"`config.json` for a non-Qwen3.5-family model. model={model_path} "
             f"error={type(error).__name__}: {error}"
         ) from error
     log_once(
@@ -91,8 +91,8 @@ class QuantizationConfig:
     model_name: str = "qwen3_5"
 
     @classmethod
-    def disabled(cls) -> "QuantizationConfig":
-        return cls()
+    def disabled(cls, *, model_name: str = "qwen3_5") -> "QuantizationConfig":
+        return cls(model_name=model_name)
 
     def to_dict(self) -> dict[str, Any]:
         if not self.enabled:
@@ -120,7 +120,7 @@ class QuantizationConfig:
                     f"{model_name} requires FP8 quantization_config; "
                     "BF16/FP16 fallback is not supported."
                 )
-            return cls.disabled()
+            return cls.disabled(model_name=model_name)
 
         quant_method = str(
             _config_get(value, "quant_method", _config_get(value, "method", ""))
@@ -213,6 +213,87 @@ def _validate_qwen35_checkpoint_precision(
         raise NotImplementedError(
             "Unquantized qwen3_5 checkpoints require BF16 weights, "
             f"got torch_dtype={configured_dtype!r}."
+        )
+
+
+_QWEN35_MOE_FIXED_FIELDS = {
+    "vocab_size": 248320,
+    "hidden_size": 2048,
+    "num_hidden_layers": 40,
+    "num_attention_heads": 16,
+    "num_key_value_heads": 2,
+    "head_dim": 256,
+    "linear_num_key_heads": 16,
+    "linear_num_value_heads": 32,
+    "linear_key_head_dim": 128,
+    "linear_value_head_dim": 128,
+    "linear_conv_kernel_dim": 4,
+    "num_experts": 256,
+    "num_experts_per_tok": 8,
+    "moe_intermediate_size": 512,
+    "shared_expert_intermediate_size": 512,
+    "max_position_embeddings": 262144,
+}
+
+
+def _validate_qwen35_moe_checkpoint_config(
+    outer_hf_config: Any,
+    hf_config: Any,
+    quantization_config: QuantizationConfig,
+) -> None:
+    architectures = tuple(
+        _config_get(outer_hf_config, "architectures", ()) or ()
+    )
+    if architectures != ("Qwen3_5MoeForConditionalGeneration",):
+        raise ValueError(
+            "Qwen3.6 MoE requires "
+            "architectures=['Qwen3_5MoeForConditionalGeneration'], "
+            f"got {list(architectures)}."
+        )
+    if quantization_config.enabled:
+        raise NotImplementedError(
+            "Qwen3.6 MoE v1 supports BF16 checkpoints only; FP8 is out of scope."
+        )
+    configured_dtype = _config_get(hf_config, "torch_dtype", None)
+    if configured_dtype is None:
+        configured_dtype = _config_get(hf_config, "dtype", None)
+    if configured_dtype not in {torch.bfloat16, "bfloat16"}:
+        raise NotImplementedError(
+            "Qwen3.6 MoE v1 requires BF16 language-model weights, "
+            f"got dtype={configured_dtype!r}."
+        )
+    for field_name, expected in _QWEN35_MOE_FIXED_FIELDS.items():
+        actual = _config_get(hf_config, field_name, None)
+        if actual != expected:
+            raise ValueError(
+                f"Qwen3.6 MoE requires {field_name}={expected!r}, "
+                f"got {actual!r}."
+            )
+    expected_values = {
+        "hidden_act": "silu",
+        "attn_output_gate": True,
+        "attention_bias": False,
+        "partial_rotary_factor": 0.25,
+        "mamba_ssm_dtype": "float32",
+        "rms_norm_eps": 1.0e-6,
+        "tie_word_embeddings": False,
+    }
+    for field_name, expected in expected_values.items():
+        actual = _config_get(hf_config, field_name, None)
+        if actual != expected:
+            raise ValueError(
+                f"Qwen3.6 MoE requires {field_name}={expected!r}, "
+                f"got {actual!r}."
+            )
+    layer_types = tuple(_config_get(hf_config, "layer_types", ()) or ())
+    expected_layer_types = tuple(
+        "full_attention" if (layer_idx + 1) % 4 == 0 else "linear_attention"
+        for layer_idx in range(40)
+    )
+    if layer_types != expected_layer_types:
+        raise ValueError(
+            "Qwen3.6 MoE requires the checkpoint's 3:1 Gated DeltaNet/full-"
+            "attention layer layout."
         )
 
 
@@ -543,6 +624,17 @@ def _is_qwen35_outer_config(config: Any) -> bool:
     return str(_config_get(config, "model_type", "") or "").strip().lower() in {"qwen3_5", "qwen3_6"}
 
 
+def _is_qwen35_moe_outer_config(config: Any) -> bool:
+    return str(_config_get(config, "model_type", "") or "").strip().lower() in {
+        "qwen3_5_moe",
+        "qwen3_6_moe",
+    }
+
+
+def _is_qwen35_family_outer_config(config: Any) -> bool:
+    return _is_qwen35_outer_config(config) or _is_qwen35_moe_outer_config(config)
+
+
 def _extract_text_config(config: Any) -> Any:
     text_config = _config_get(config, "text_config", None)
     if text_config is None:
@@ -678,6 +770,67 @@ def _validate_qwen3_moe_runtime(config, *, model_type: str) -> None:
     _validate_runtime_compatibility(config, model_type=model_type)
 
 
+def _validate_qwen35_moe_runtime(config, *, model_type: str) -> None:
+    outer_tp_size = int(config.tensor_parallel_size)
+    ep_size = int(config.expert_parallel_size)
+    if int(config.data_parallel_size) != 1:
+        raise ValueError(
+            "Qwen3.6 MoE requires DP=1, got "
+            f"TP={outer_tp_size}, EP={ep_size}, DP={config.data_parallel_size}."
+        )
+    if outer_tp_size % ep_size:
+        raise ValueError(
+            "Qwen3.6 MoE outer tensor_parallel_size must be divisible by "
+            f"expert_parallel_size, got outer TP={outer_tp_size}, EP={ep_size}."
+        )
+    hf_config = config.hf_config
+    num_experts = int(hf_config.num_experts)
+    if ep_size > num_experts or num_experts % ep_size:
+        raise ValueError(
+            "Qwen3.6 MoE num_experts must be divisible by expert_parallel_size "
+            f"and EP must not exceed experts, got experts={num_experts}, EP={ep_size}."
+        )
+    attention_tp_fields = {
+        "num_attention_heads": int(hf_config.num_attention_heads),
+        "num_key_value_heads": int(hf_config.num_key_value_heads),
+        "linear_num_key_heads": int(hf_config.linear_num_key_heads),
+        "linear_num_value_heads": int(hf_config.linear_num_value_heads),
+        "vocab_size": int(hf_config.vocab_size),
+        "shared_expert_intermediate_size": int(
+            hf_config.shared_expert_intermediate_size
+        ),
+    }
+    invalid_attention_fields = {
+        name: value
+        for name, value in attention_tp_fields.items()
+        if value % outer_tp_size
+    }
+    if invalid_attention_fields:
+        raise ValueError(
+            "Qwen3.6 MoE attention/GDN/vocabulary/shared-expert dimensions "
+            "must be divisible by outer tensor_parallel_size, "
+            f"got TP={outer_tp_size}, invalid={invalid_attention_fields}."
+        )
+    moe_tp_size = outer_tp_size // ep_size
+    if int(hf_config.moe_intermediate_size) % moe_tp_size:
+        raise ValueError(
+            "Qwen3.6 MoE moe_intermediate_size must be divisible by MoE TP "
+            f"size, got {hf_config.moe_intermediate_size} and {moe_tp_size}."
+        )
+    top_k = int(hf_config.num_experts_per_tok)
+    if not 1 <= top_k <= num_experts:
+        raise ValueError(
+            "Qwen3.6 MoE num_experts_per_tok must be in [1, num_experts], "
+            f"got top_k={top_k}, num_experts={num_experts}."
+        )
+    if getattr(hf_config, "torch_dtype", None) != torch.bfloat16:
+        raise NotImplementedError(
+            "Qwen3.6 MoE v1 requires BF16 weights, got "
+            f"torch_dtype={getattr(hf_config, 'torch_dtype', None)}."
+        )
+    _validate_runtime_compatibility(config, model_type=model_type)
+
+
 def _validate_minimax_runtime(config, *, model_type: str) -> None:
     tp_size = int(config.tensor_parallel_size)
     ep_size = int(config.expert_parallel_size)
@@ -781,9 +934,13 @@ def load_and_validate_model(config) -> bool:
     except Exception as e:
         config.outer_hf_config = _load_raw_qwen35_config(config.model, e)
     is_qwen35 = _is_qwen35_outer_config(config.outer_hf_config)
+    is_qwen35_moe = _is_qwen35_moe_outer_config(config.outer_hf_config)
+    is_qwen35_family = is_qwen35 or is_qwen35_moe
     config.hf_config = _extract_text_config(config.outer_hf_config)
     if is_qwen35:
         setattr(config.hf_config, "model_type", "qwen3_5")
+    elif is_qwen35_moe:
+        setattr(config.hf_config, "model_type", "qwen3_5_moe")
     model_type = str(getattr(config.hf_config, "model_type", "") or "")
     is_minimax_m2 = model_type == "minimax_m2"
     is_qwen3 = model_type == "qwen3"
@@ -802,8 +959,10 @@ def load_and_validate_model(config) -> bool:
     if config.tiny_random:
         from sparsevllm.debug.tiny_random import apply_tiny_random_overrides
 
-        if is_qwen35:
-            raise NotImplementedError("Tiny random mode does not support qwen3_5 yet.")
+        if is_qwen35_family:
+            raise NotImplementedError(
+                "Tiny random mode does not support qwen3_5 family models yet."
+            )
         config.tiny_random_overrides = apply_tiny_random_overrides(
             config.hf_config,
             config.tiny_random_config,
@@ -827,6 +986,8 @@ def load_and_validate_model(config) -> bool:
         quantized_model_name = "Qwen3"
     elif is_qwen3_moe:
         quantized_model_name = "Qwen3MoE"
+    elif is_qwen35_moe:
+        quantized_model_name = "Qwen3.6 MoE"
     config.quantization_config = QuantizationConfig.from_hf_config(
         raw_quantization_config,
         required_fp8=is_minimax_m2,
@@ -836,6 +997,12 @@ def load_and_validate_model(config) -> bool:
         _validate_qwen35_checkpoint_precision(
             config.hf_config,
             raw_quantization_config,
+            config.quantization_config,
+        )
+    if is_qwen35_moe:
+        _validate_qwen35_moe_checkpoint_config(
+            config.outer_hf_config,
+            config.hf_config,
             config.quantization_config,
         )
     if config.tiny_random and config.quantization_config.enabled:
@@ -865,9 +1032,11 @@ def load_and_validate_model(config) -> bool:
 
     if model_type == "qwen3_moe":
         _validate_qwen3_moe_runtime(config, model_type=model_type)
+    elif model_type == "qwen3_5_moe":
+        _validate_qwen35_moe_runtime(config, model_type=model_type)
     elif model_type == "minimax_m2":
         _validate_minimax_runtime(config, model_type=model_type)
     else:
         _validate_dense_parallelism(config, model_type=model_type)
-    _finalize_model_config(config, is_qwen35=is_qwen35)
-    return is_qwen35
+    _finalize_model_config(config, is_qwen35=is_qwen35_family)
+    return is_qwen35_family

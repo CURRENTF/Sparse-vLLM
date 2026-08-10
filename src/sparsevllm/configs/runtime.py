@@ -38,7 +38,7 @@ from sparsevllm.configs.sparse import (
     normalize_sparse_method_name,
     normalize_sparse_methods,
 )
-from sparsevllm.method_registry import PREFILL_POLICY_AUTO
+from sparsevllm.method_registry import OUTER_TP_MOE_MODEL_TYPES, PREFILL_POLICY_AUTO
 from sparsevllm.utils.log import logger
 
 
@@ -85,7 +85,7 @@ class Config(
     @property
     def uses_outer_tp_moe_layout(self) -> bool:
         model_type = str(getattr(self.hf_config, "model_type", "") or "")
-        return model_type in {"qwen3_moe", "minimax_m2"} and int(
+        return model_type in OUTER_TP_MOE_MODEL_TYPES and int(
             self.tensor_parallel_size
         ) > 1
 

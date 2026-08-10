@@ -258,6 +258,10 @@ def test_moe_workspace_warmup_uses_failure_synchronized_world_rpc():
     assert "warmup_moe_workspace" in TP_RPC_STATUS_SYNC_METHODS
 
 
+def test_runtime_diagnostics_use_failure_synchronized_world_rpc():
+    assert "runtime_diagnostic_status" in TP_RPC_STATUS_SYNC_METHODS
+
+
 def test_fake_prefill_warmup_uses_failure_synchronized_world_rpc():
     assert "set_warmup_fake_prefill_attention" in TP_RPC_STATUS_SYNC_METHODS
 

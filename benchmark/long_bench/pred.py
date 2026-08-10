@@ -1,5 +1,6 @@
 import os
 import json
+import hashlib
 import sys
 import subprocess
 import re
@@ -23,6 +24,7 @@ import torch
 from transformers import AutoTokenizer, GenerationConfig
 import torch.distributed as dist
 from benchmark.model_adapters.sparsevllm import get_sparsevllm_generate_api
+from benchmark.runtime_validation import collect_worker_runtime_status
 from datetime import datetime
 
 BASE_PATH = os.getenv("SPARSEVLLM_OUTPUT_DIR", str(REPO_ROOT / "outputs"))
@@ -36,6 +38,30 @@ SAMPLE_STATUSES = {
     "metric_failed",
     "skipped_by_policy",
 }
+
+
+def _sha256(path: str | os.PathLike[str]) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _git_value(*args: str) -> str | None:
+    result = subprocess.run(
+        ["git", *args],
+        cwd=REPO_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    value = result.stdout.strip()
+    return value or None
 
 
 def get_longbench_data_path(dataset, use_longbench_e):
@@ -145,6 +171,7 @@ def _artifact_paths(out_root: str) -> dict[str, str]:
         "raw": os.path.join(out_root, "raw_outputs.jsonl"),
         "parsed": os.path.join(out_root, "parsed_outputs.jsonl"),
         "sample": os.path.join(out_root, "sample_results.jsonl"),
+        "per_sample": os.path.join(out_root, "per_sample_results.jsonl"),
     }
 
 
@@ -161,28 +188,23 @@ def _write_decode_cuda_graph_status(
             "cannot verify decode CUDA graph execution."
         )
 
-    runner = getattr(llm, "model_runner", None)
-    graph_runner = getattr(runner, "decode_cuda_graph_runner", None)
-    graph_states = (
-        getattr(graph_runner, "_graphs", {})
-        if graph_runner is not None
-        else {}
-    )
-    graph_count = sum(
-        getattr(state, "graph", None) is not None
-        for state in graph_states.values()
+    statuses = collect_worker_runtime_status(llm)
+    if not statuses:
+        raise RuntimeError("Runtime validation returned no worker status records.")
+    configured_flags = [
+        bool(status.get("decode_cuda_graph_configured")) for status in statuses
+    ]
+    configured = all(configured_flags)
+    expected = bool(getattr(llm.config, "decode_cuda_graph", False))
+    all_active = all(
+        bool(status.get("decode_cuda_graph_active")) for status in statuses
     )
     graph_status = {
-        "rank": int(rank),
-        "configured": bool(
-            getattr(getattr(llm, "config", None), "decode_cuda_graph", False)
-        ),
-        "runner_initialized": graph_runner is not None,
-        "state_count": int(len(graph_states)),
-        "graph_count": int(graph_count),
-        "active": bool(graph_count > 0),
-        "last_state_key": str(getattr(graph_runner, "last_state_key", None)),
-        "state_keys": [str(key) for key in graph_states],
+        "launcher_rank": int(rank),
+        "expected": expected,
+        "configured_on_all_workers": configured,
+        "active_on_all_workers": all_active,
+        "workers": statuses,
     }
     status_path = os.path.join(
         out_root,
@@ -191,6 +213,16 @@ def _write_decode_cuda_graph_status(
     with open(status_path, "w", encoding="utf-8") as handle:
         json.dump(graph_status, handle, ensure_ascii=False, indent=2)
         handle.write("\n")
+    if expected and not configured:
+        raise RuntimeError(
+            "Decode CUDA Graph was requested but is not configured on every worker: "
+            f"{statuses!r}."
+        )
+    if configured and not all_active:
+        raise RuntimeError(
+            "Decode CUDA Graph was requested but was not active on every model worker: "
+            f"{statuses!r}."
+        )
     return graph_status
 
 
@@ -234,6 +266,8 @@ def _write_sample_record(
             "source_idx",
             "status",
             "prompt_tokens",
+            "rendered_prompt",
+            "rendered_prompt_sha256",
             "raw_pred",
             "error",
             "traceback",
@@ -256,6 +290,7 @@ def _write_sample_record(
     _append_jsonl(paths["raw"], raw_record)
     _append_jsonl(paths["parsed"], parsed_record)
     _append_jsonl(paths["sample"], record)
+    _append_jsonl(paths["per_sample"], record)
 
     # Keep the historical per-task files for benchmark/long_bench/eval.py.
     task_record = {
@@ -374,6 +409,10 @@ def get_pred(rank, data, dataset_info, args, model, tokenizer, model_max_length,
                         prompt_tokens=prompt_tokens,
                     )
                 )
+                prepared_records[-1]["rendered_prompt"] = prompt
+                prepared_records[-1]["rendered_prompt_sha256"] = _sha256_text(
+                    prompt
+                )
             except Exception as exc:
                 record = _sample_base_record(
                     dataset=dataset,
@@ -491,8 +530,28 @@ def get_pred(rank, data, dataset_info, args, model, tokenizer, model_max_length,
 
 
 def worker(rank, world_size, datasets, dataset2prompt, dataset2maxlen, args, out_root, max_length_limit):
-    seed_everything(42)
+    seed_everything(args.seed)
     model, tokenizer, model_max_length, eos_token_ids = load_model_and_tokenizer(rank, args)
+    if rank == 0:
+        tokenizer_runtime = {
+            "tokenizer_class": type(tokenizer).__name__,
+            "tokenizer_path": args.tokenizer_path or args.model_path,
+            "chat_template": tokenizer.chat_template,
+            "bos_token": tokenizer.bos_token,
+            "bos_token_id": tokenizer.bos_token_id,
+            "eos_token": tokenizer.eos_token,
+            "eos_token_id": tokenizer.eos_token_id,
+            "effective_eos_token_ids": eos_token_ids,
+            "no_chat_template": args.no_chat_template,
+            "thinking_mode": args.thinking_mode,
+        }
+        with open(
+            os.path.join(out_root, "tokenizer_runtime.json"),
+            "w",
+            encoding="utf-8",
+        ) as handle:
+            json.dump(tokenizer_runtime, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
     
     for dataset in datasets:
         data_path = get_longbench_data_path(dataset, args.e)
@@ -665,6 +724,7 @@ def parse_args():
     parser.add_argument("--min_prompt_tokens", type=int, default=None)
     parser.add_argument("--samples_per_task", type=int, default=20)
     parser.add_argument("--min_required_samples", type=int, default=5)
+    parser.add_argument("--seed", type=int, default=20260810)
     parser.add_argument("--worker_rank", type=int, default=-1)
     parser.add_argument("--worker_world_size", type=int, default=1)
     parser.add_argument("--output_root", type=str, default=None)
@@ -707,7 +767,13 @@ if __name__ == '__main__':
         for dataset in datasets:
             with open(os.path.join(out_root, f"{dataset}.jsonl"), 'w') as f:
                 pass
-        for artifact in ("raw_outputs.jsonl", "parsed_outputs.jsonl", "sample_results.jsonl", "longbench_mini_selection.jsonl"):
+        for artifact in (
+            "raw_outputs.jsonl",
+            "parsed_outputs.jsonl",
+            "sample_results.jsonl",
+            "per_sample_results.jsonl",
+            "longbench_mini_selection.jsonl",
+        ):
             with open(os.path.join(out_root, artifact), "w", encoding="utf-8") as f:
                 pass
 
@@ -715,16 +781,79 @@ if __name__ == '__main__':
     args.max_model_len = max_length_limit
 
     if args.worker_rank < 0:
+        dataset_files = []
+        for dataset in datasets:
+            data_path = Path(get_longbench_data_path(dataset, args.e)).resolve()
+            dataset_files.append(
+                {
+                    "dataset": dataset,
+                    "path": str(data_path),
+                    "size_bytes": data_path.stat().st_size,
+                    "sha256": _sha256(data_path),
+                }
+            )
+        model_path = Path(args.model_path).resolve()
+        model_files = {}
+        for name in ("config.json", "model.safetensors.index.json"):
+            path = model_path / name
+            if not path.is_file():
+                raise FileNotFoundError(f"Required model metadata file is missing: {path}")
+            model_files[name] = {"path": str(path), "sha256": _sha256(path)}
+        tokenizer_files = {}
+        for name in (
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "generation_config.json",
+            "chat_template.jinja",
+        ):
+            path = model_path / name
+            if path.is_file():
+                tokenizer_files[name] = {
+                    "path": str(path),
+                    "sha256": _sha256(path),
+                }
+        prompt_config_path = REPO_ROOT / "benchmark/long_bench/config/dataset2prompt.json"
+        maxlen_config_path = REPO_ROOT / "benchmark/long_bench/config/dataset2maxlen.json"
         resolved_config = {
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "command": " ".join([sys.executable, *sys.argv]),
+            "git_commit": _git_value("rev-parse", "HEAD"),
+            "git_branch": _git_value("branch", "--show-current"),
+            "git_dirty": bool(_git_value("status", "--porcelain")),
             "model": args.model,
             "model_path": args.model_path,
+            "model_files": model_files,
+            "tokenizer_files": tokenizer_files,
             "tokenizer_path": args.tokenizer_path or args.model_path,
             "backend": "sparsevllm",
+            "provider_env": {
+                key: os.environ.get(key, "auto")
+                for key in (
+                    "SPARSEVLLM_MOE_PROVIDER",
+                    "SPARSEVLLM_MOE_ROUTER_PROVIDER",
+                )
+            },
             "sparse_method": args.sparse_method,
             "deltakv_checkpoint_path": args.deltakv_checkpoint_path,
             "datasets": datasets,
             "longbench_data_root": DATA_PREFIX_PATH,
+            "dataset_files": dataset_files,
+            "prompt_config": {
+                "path": str(prompt_config_path),
+                "sha256": _sha256(prompt_config_path),
+                "selected_formats": {
+                    dataset: dataset2prompt[dataset] for dataset in datasets
+                },
+            },
+            "maxlen_config": {
+                "path": str(maxlen_config_path),
+                "sha256": _sha256(maxlen_config_path),
+                "selected_values": {
+                    dataset: dataset2maxlen[dataset] for dataset in datasets
+                },
+            },
             "max_model_len": args.max_model_len,
+            "seed": args.seed,
             "decoding": {
                 "temperature": args.temperature,
                 "top_p": args.top_p,

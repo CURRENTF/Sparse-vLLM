@@ -327,5 +327,7 @@ if __name__ == '__main__':
         json.dump(scores, f, ensure_ascii=False, indent=4)
     with open(os.path.join(path, "metrics.json"), "w") as f:
         json.dump(scores, f, ensure_ascii=False, indent=4)
+    with open(os.path.join(path, "aggregate_metrics.json"), "w") as f:
+        json.dump(scores, f, ensure_ascii=False, indent=4)
     if failed_tasks:
         raise SystemExit(1)

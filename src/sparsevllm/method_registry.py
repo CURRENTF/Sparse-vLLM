@@ -141,6 +141,14 @@ QWEN3_MOE_TP_EP_COMPATIBILITY = ModelRuntimeCompatibility(
 
 QWEN3_MOE_TP_COMPATIBILITY = QWEN3_MOE_TP_EP_COMPATIBILITY
 
+QWEN35_MOE_COMPATIBILITY = ModelRuntimeCompatibility(
+    parallel_mode="outer_tp_moe_tp_ep",
+    sparse_methods=frozenset({""}),
+    prefix_cache_methods=frozenset(),
+    requires_eager=False,
+    decode_cuda_graph_methods=frozenset({""}),
+)
+
 MINIMAX_M2_EP_COMPATIBILITY = ModelRuntimeCompatibility(
     parallel_mode="ep_replicated_kv",
     sparse_methods=frozenset(
@@ -181,7 +189,18 @@ MINIMAX_M2_TP_EP_COMPATIBILITY = ModelRuntimeCompatibility(
 
 MODEL_RUNTIME_COMPATIBILITY = {
     "qwen3_moe": QWEN3_MOE_EP_COMPATIBILITY,
+    "qwen3_5_moe": QWEN35_MOE_COMPATIBILITY,
     "minimax_m2": MINIMAX_M2_EP_COMPATIBILITY,
+}
+
+OUTER_TP_MOE_MODEL_TYPES = frozenset(
+    {"qwen3_moe", "qwen3_5_moe", "minimax_m2"}
+)
+
+OUTER_TP_RUNTIME_COMPATIBILITY = {
+    "qwen3_moe": QWEN3_MOE_TP_EP_COMPATIBILITY,
+    "qwen3_5_moe": QWEN35_MOE_COMPATIBILITY,
+    "minimax_m2": MINIMAX_M2_TP_EP_COMPATIBILITY,
 }
 
 # All shipped cache managers now expose a graph-stable decode preparation path.
@@ -266,12 +285,8 @@ def validate_model_runtime_compatibility(
     tp_size = int(tensor_parallel_size)
     ep_size = int(expert_parallel_size)
     dp_size = int(data_parallel_size)
-    if model_type in {"qwen3_moe", "minimax_m2"} and tp_size > 1:
-        compatibility = (
-            QWEN3_MOE_TP_EP_COMPATIBILITY
-            if model_type == "qwen3_moe"
-            else MINIMAX_M2_TP_EP_COMPATIBILITY
-        )
+    if model_type in OUTER_TP_MOE_MODEL_TYPES and tp_size > 1:
+        compatibility = OUTER_TP_RUNTIME_COMPATIBILITY[model_type]
         if dp_size != 1:
             raise ValueError(
                 f"{model_type} outer_tp_moe_tp_ep requires DP=1, got "

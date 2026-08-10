@@ -76,6 +76,7 @@ def _gather_candidate(
     equal_rank,
     num_greater,
     slot: tl.constexpr,
+    num_experts: tl.constexpr,
 ):
     use_greater = slot < num_greater
     rank = tl.where(use_greater, slot, slot - num_greater)
@@ -84,7 +85,7 @@ def _gather_candidate(
         greater_mask & (greater_rank == rank),
         equal_mask & (equal_rank == rank),
     )
-    expert_id = tl.min(tl.where(mask, offsets, 128), axis=0)
+    expert_id = tl.min(tl.where(mask, offsets, num_experts), axis=0)
     value = tl.sum(tl.where(mask, values, 0.0), axis=0)
     return value, expert_id
 
@@ -97,9 +98,10 @@ def _topk_softmax_kernel(
     stride_logits_m,
     stride_weights_m,
     stride_ids_m,
+    NUM_EXPERTS: tl.constexpr,
 ):
     row = tl.program_id(0)
-    offsets = tl.arange(0, 128)
+    offsets = tl.arange(0, NUM_EXPERTS)
     logits = tl.load(logits_ptr + row * stride_logits_m + offsets).to(tl.float32)
     row_max = tl.max(logits, axis=0)
     probabilities = libdevice.exp(logits - row_max)
@@ -119,35 +121,35 @@ def _topk_softmax_kernel(
 
     v0, i0 = _gather_candidate(
         probabilities, offsets, greater_mask, equal_mask,
-        greater_rank, equal_rank, num_greater, 0,
+        greater_rank, equal_rank, num_greater, 0, NUM_EXPERTS,
     )
     v1, i1 = _gather_candidate(
         probabilities, offsets, greater_mask, equal_mask,
-        greater_rank, equal_rank, num_greater, 1,
+        greater_rank, equal_rank, num_greater, 1, NUM_EXPERTS,
     )
     v2, i2 = _gather_candidate(
         probabilities, offsets, greater_mask, equal_mask,
-        greater_rank, equal_rank, num_greater, 2,
+        greater_rank, equal_rank, num_greater, 2, NUM_EXPERTS,
     )
     v3, i3 = _gather_candidate(
         probabilities, offsets, greater_mask, equal_mask,
-        greater_rank, equal_rank, num_greater, 3,
+        greater_rank, equal_rank, num_greater, 3, NUM_EXPERTS,
     )
     v4, i4 = _gather_candidate(
         probabilities, offsets, greater_mask, equal_mask,
-        greater_rank, equal_rank, num_greater, 4,
+        greater_rank, equal_rank, num_greater, 4, NUM_EXPERTS,
     )
     v5, i5 = _gather_candidate(
         probabilities, offsets, greater_mask, equal_mask,
-        greater_rank, equal_rank, num_greater, 5,
+        greater_rank, equal_rank, num_greater, 5, NUM_EXPERTS,
     )
     v6, i6 = _gather_candidate(
         probabilities, offsets, greater_mask, equal_mask,
-        greater_rank, equal_rank, num_greater, 6,
+        greater_rank, equal_rank, num_greater, 6, NUM_EXPERTS,
     )
     v7, i7 = _gather_candidate(
         probabilities, offsets, greater_mask, equal_mask,
-        greater_rank, equal_rank, num_greater, 7,
+        greater_rank, equal_rank, num_greater, 7, NUM_EXPERTS,
     )
     values_and_ids = _torch_sort8(
         v0, i0, v1, i1, v2, i2, v3, i3,
@@ -200,9 +202,11 @@ def topk_softmax(
         raise ValueError("Triton topk_softmax requires contiguous router_logits.")
     if int(router_logits.shape[0]) <= 0:
         raise ValueError("Triton topk_softmax requires at least one token.")
-    if int(router_logits.shape[1]) != 128 or int(top_k) != 8:
+    num_experts = int(router_logits.shape[1])
+    if num_experts not in {128, 256} or int(top_k) != 8:
         raise ValueError(
-            "Triton topk_softmax currently requires num_experts=128 and top_k=8, "
+            "Triton topk_softmax currently requires num_experts in {128, 256} "
+            "and top_k=8, "
             f"got num_experts={router_logits.shape[1]}, top_k={top_k}."
         )
 
@@ -223,6 +227,7 @@ def topk_softmax(
         router_logits.stride(0),
         weights.stride(0),
         ids.stride(0),
+        NUM_EXPERTS=num_experts,
         num_warps=1,
     )
     return weights, ids

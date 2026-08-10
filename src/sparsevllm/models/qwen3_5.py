@@ -375,6 +375,16 @@ class Qwen35LinearAttention(nn.Module):
         if self.activation not in ("silu", "swish"):
             raise NotImplementedError(f"qwen3_5 linear attention supports silu/swish activation, got {self.activation!r}.")
         self.proj_chunk_size = int(getattr(config, "mlp_chunk_size", 16384))
+        self.recurrent_state_dtype = getattr(
+            config,
+            "runtime_recurrent_state_dtype",
+            getattr(config, "torch_dtype", torch.bfloat16),
+        )
+        if not isinstance(self.recurrent_state_dtype, torch.dtype):
+            raise TypeError(
+                "qwen3_5 runtime_recurrent_state_dtype must be a torch.dtype, "
+                f"got {self.recurrent_state_dtype!r}."
+            )
         quantization = getattr(config, "quantization_config", None)
 
         hidden_size = int(config.hidden_size)
@@ -625,7 +635,7 @@ class Qwen35LinearAttention(nn.Module):
         if seqs is None:
             raise RuntimeError("qwen3_5 linear attention requires context.seqs.")
         conv_dtype = activation_dtype
-        recurrent_dtype = activation_dtype
+        recurrent_dtype = self.recurrent_state_dtype
         conv_states = []
         recurrent_states = []
         has_initial = []
@@ -663,7 +673,9 @@ class Qwen35LinearAttention(nn.Module):
                 layer_idx,
                 {
                     "conv_state": conv_states[row],
-                    "recurrent_state": recurrent_states[row].to(dtype=conv_states.dtype),
+                    "recurrent_state": recurrent_states[row].to(
+                        dtype=self.recurrent_state_dtype
+                    ),
                 },
             )
 
@@ -811,17 +823,20 @@ class Qwen35LinearAttention(nn.Module):
 
 
 class Qwen35MLP(nn.Module):
-    def __init__(self, config) -> None:
+    def __init__(self, config, *, intermediate_size: int | None = None) -> None:
         super().__init__()
+        intermediate_size = int(
+            config.intermediate_size if intermediate_size is None else intermediate_size
+        )
         quantization = getattr(config, "quantization_config", None)
         self.gate_up_proj = MergedColumnParallelLinear(
             int(config.hidden_size),
-            [int(config.intermediate_size)] * 2,
+            [intermediate_size] * 2,
             bias=False,
             quantization=quantization,
         )
         self.down_proj = RowParallelLinear(
-            int(config.intermediate_size),
+            intermediate_size,
             int(config.hidden_size),
             bias=False,
             quantization=quantization,
@@ -845,7 +860,7 @@ class Qwen35MLP(nn.Module):
 
 
 class Qwen35DecoderLayer(nn.Module):
-    def __init__(self, config, layer_idx: int) -> None:
+    def __init__(self, config, layer_idx: int, mlp_cls=Qwen35MLP) -> None:
         super().__init__()
         self.layer_idx = int(layer_idx)
         runtime_layout = getattr(config, "runtime_layout", None)
@@ -857,7 +872,7 @@ class Qwen35DecoderLayer(nn.Module):
         else:
             self.linear_attn = Qwen35LinearAttention(config)
             self.attention_type = "linear_attention"
-        self.mlp = Qwen35MLP(config)
+        self.mlp = mlp_cls(config)
         self.input_layernorm = Qwen35RMSNorm(int(config.hidden_size), eps=float(config.rms_norm_eps))
         self.post_attention_layernorm = Qwen35RMSNorm(int(config.hidden_size), eps=float(config.rms_norm_eps))
 
@@ -881,12 +896,12 @@ class Qwen35DecoderLayer(nn.Module):
 
 
 class Qwen35Model(nn.Module):
-    def __init__(self, config) -> None:
+    def __init__(self, config, layer_cls=Qwen35DecoderLayer) -> None:
         super().__init__()
         self.config = config
         self.embed_tokens = VocabParallelEmbedding(int(config.vocab_size), int(config.hidden_size))
         self.layers = nn.ModuleList(
-            [Qwen35DecoderLayer(config, layer_idx) for layer_idx in range(int(config.num_hidden_layers))]
+            [layer_cls(config, layer_idx) for layer_idx in range(int(config.num_hidden_layers))]
         )
         self.norm = Qwen35RMSNorm(int(config.hidden_size), eps=float(config.rms_norm_eps))
         self.sparse_controller = None

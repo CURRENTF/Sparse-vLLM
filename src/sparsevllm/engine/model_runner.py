@@ -56,6 +56,13 @@ except ImportError as exc:
     Qwen35ForCausalLM = None
     _QWEN35_IMPORT_ERROR = exc
 
+try:
+    from sparsevllm.models.qwen3_5_moe import Qwen35MoeForCausalLM
+    _QWEN35_MOE_IMPORT_ERROR = None
+except ImportError as exc:
+    Qwen35MoeForCausalLM = None
+    _QWEN35_MOE_IMPORT_ERROR = exc
+
 
 TP_SHM_NAME_PREFIX = "sparsevllm_"
 TP_SHM_SIZE = 2**20
@@ -81,6 +88,7 @@ TP_RPC_STATUS_SYNC_METHODS = PREFIX_CACHE_CONTROL_RPC_METHODS | {
     "refresh_prefix_cache_hit",
     "reset_after_warmup",
     "run",
+    "runtime_diagnostic_status",
     "set_warmup_fake_prefill_attention",
     "warmup_moe_workspace",
 }
@@ -111,6 +119,9 @@ class ModelRunner:
         profiler.set_enabled(config.enable_profiler and rank == 0)
         hf_config = config.hf_config
         self.enforce_eager = config.enforce_eager
+        self.debug_runtime_enabled = (
+            os.getenv("SPARSEVLLM_DEBUG_RUNTIME", "0") == "1"
+        )
         self.world_size = config.world_size
         self.rank = rank
         self.event = event
@@ -146,6 +157,11 @@ class ModelRunner:
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device(self.device)
         setattr(hf_config, "mlp_chunk_size", config.mlp_chunk_size)
+        setattr(
+            hf_config,
+            "decode_cuda_graph",
+            bool(getattr(config, "decode_cuda_graph", False)),
+        )
         
         # 加载对应的模型分片 (Shards)
         if hf_config.model_type == "qwen2":
@@ -179,6 +195,13 @@ class ModelRunner:
                     f"dependencies and verify vendored kernels import correctly: {_QWEN35_IMPORT_ERROR}"
                 ) from _QWEN35_IMPORT_ERROR
             self.model = Qwen35ForCausalLM(hf_config)
+        elif hf_config.model_type == "qwen3_5_moe":
+            if Qwen35MoeForCausalLM is None:
+                raise ImportError(
+                    "Qwen35MoeForCausalLM is unavailable; verify the Qwen3.6 MoE "
+                    f"runtime imports: {_QWEN35_MOE_IMPORT_ERROR}"
+                ) from _QWEN35_MOE_IMPORT_ERROR
+            self.model = Qwen35MoeForCausalLM(hf_config)
         elif hf_config.model_type == "llama":
             self.model = LlamaForCausalLM(hf_config)
         else:
@@ -201,8 +224,9 @@ class ModelRunner:
                 show_progress=self.parallel_context.world_rank == 0,
                 progress_rank=0 if self.parallel_context.world_rank == 0 else None,
             )
-        if hf_config.model_type in {"qwen3_moe", "minimax_m2"}:
-            self.model.warmup_moe()
+        warmup_moe = getattr(self.model, "warmup_moe", None)
+        if callable(warmup_moe):
+            warmup_moe()
         
         self.sampler = Sampler()
 
@@ -822,12 +846,14 @@ class ModelRunner:
         }
 
     def debug_last_logits_cpu(self) -> torch.Tensor | None:
+        if self.rank != 0:
+            return None
         logits = getattr(self, "debug_last_logits", None)
         if logits is None:
             raise RuntimeError(
                 "No debug logits are available. Set SPARSEVLLM_DEBUG_RUNTIME=1 before engine startup."
             )
-        return logits.detach().cpu() if self.rank == 0 else None
+        return logits.detach().cpu()
 
     def debug_hidden_states_cpu(self) -> dict[int, torch.Tensor] | None:
         model = getattr(getattr(self, "model", None), "model", None)
@@ -911,13 +937,15 @@ class ModelRunner:
 
     def debug_replica_consistency(self) -> dict[str, object] | None:
         logits = getattr(self, "debug_last_logits", None)
-        if logits is None:
+        if self.world_size == 1 and logits is None:
             return None
-        logits_max_abs, logits_tolerance_ratio = self._debug_float_error_from_world_rank_zero(
-            logits,
-            atol=0.05,
-            rtol=0.05,
-        )
+        if self.world_size == 1:
+            logits_max_abs, logits_tolerance_ratio = 0.0, 0.0
+        else:
+            # Only world rank 0 materializes LM-head logits under tensor
+            # parallelism. Cross-rank consistency is checked on the synchronized
+            # MoE outputs below instead.
+            logits_max_abs, logits_tolerance_ratio = None, None
         result: dict[str, object] = {
             "last_logits_max_abs": logits_max_abs,
             "last_logits_tolerance_ratio": logits_tolerance_ratio,
@@ -974,6 +1002,62 @@ class ModelRunner:
             group=self.parallel_context.world.process_group,
         )
         return summaries if self.rank == 0 else None
+
+    def runtime_diagnostic_status(self) -> list[dict[str, object]] | None:
+        graph_states = getattr(self.decode_cuda_graph_runner, "_graphs", {})
+        graph_count = sum(
+            1
+            for state in graph_states.values()
+            if getattr(state, "graph", None) is not None
+        )
+        local_status = {
+            "world_rank": int(self.parallel_context.world_rank),
+            "attention_tp_rank": int(self.parallel_context.attention_tp_rank),
+            "attention_tp_size": int(self.parallel_context.attention_tp_size),
+            "moe_tp_rank": int(self.parallel_context.moe_tp_rank),
+            "moe_tp_size": int(self.parallel_context.moe_tp_size),
+            "ep_rank": int(self.parallel_context.ep_rank),
+            "ep_size": int(self.parallel_context.ep_size),
+            "decode_cuda_graph_configured": bool(self.config.decode_cuda_graph),
+            "decode_cuda_graph_state_count": int(len(graph_states)),
+            "decode_cuda_graph_graph_count": int(graph_count),
+            "decode_cuda_graph_active": bool(
+                self.config.decode_cuda_graph and graph_count > 0
+            ),
+        }
+        model_status = getattr(self.model, "runtime_diagnostic_status", None)
+        if callable(model_status):
+            try:
+                extra_status = model_status()
+                if not isinstance(extra_status, dict):
+                    raise TypeError(
+                        "Model runtime_diagnostic_status() must return a dict, "
+                        f"got {extra_status!r}."
+                    )
+                local_status.update(extra_status)
+            except Exception as exc:
+                if self.world_size == 1:
+                    raise
+                local_status["runtime_diagnostic_error"] = repr(exc)
+        if self.world_size == 1:
+            return [local_status]
+        statuses = [None] * self.world_size
+        dist.all_gather_object(
+            statuses,
+            local_status,
+            group=self.parallel_context.world.process_group,
+        )
+        errors = [
+            status.get("runtime_diagnostic_error")
+            for status in statuses
+            if status.get("runtime_diagnostic_error") is not None
+        ]
+        if errors:
+            raise RuntimeError(
+                "Model runtime diagnostics failed on at least one worker: "
+                f"{errors}."
+            )
+        return statuses if self.rank == 0 else None
 
     def _long_text_threshold(self, is_prefill: bool) -> int:
         del is_prefill
@@ -1169,14 +1253,20 @@ class ModelRunner:
     def set_omnikv_decode_graph_max_context_len_override(self, max_context_len: int | None):
         self.set_decode_cuda_graph_max_context_len_override(max_context_len)
 
+    def _capture_debug_logits(self, logits: torch.Tensor | None) -> None:
+        if (
+            getattr(self, "debug_runtime_enabled", False)
+            and isinstance(logits, torch.Tensor)
+        ):
+            self.debug_last_logits = logits.detach().clone()
+
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
         """物理执行逻辑：统一使用 Eager 模式"""
         _stage = 'prefill' if is_prefill else 'decode'
         with profiler.record(f"model_run_model_{_stage}"):
             logits = self.model.compute_logits(self.model(input_ids, positions))
-        if os.getenv("SPARSEVLLM_DEBUG_RUNTIME", "0") == "1":
-            self.debug_last_logits = logits.detach().clone()
+        self._capture_debug_logits(logits)
         return logits
 
     def run_logits_for_compare(self, seqs: list[Sequence], is_prefill: bool) -> torch.Tensor | None:
@@ -1257,6 +1347,7 @@ class ModelRunner:
                     else:
                         logits = self.decode_cuda_graph_runner.run_eager_static(seqs)
                         graph_token_ids = None
+                    self._capture_debug_logits(logits)
                     if self.rank != 0:
                         self._post_sparse_forward(seqs, is_prefill)
                         return None, None

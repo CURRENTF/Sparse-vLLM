@@ -1685,7 +1685,7 @@ class DecodeCudaGraphWarmupPolicyTest(unittest.TestCase):
         config.max_decoding_seqs = 24
         config.max_num_batched_tokens = 56_214
         config.mlp_chunk_size = 16_384
-        config.hf_config = SimpleNamespace(model_type="qwen3_moe")
+        config.hf_config = SimpleNamespace(model_type="qwen3_moe", num_experts=128)
 
         self.assertEqual(
             _moe_workspace_warmup_token_counts(config),
@@ -1704,7 +1704,7 @@ class DecodeCudaGraphWarmupPolicyTest(unittest.TestCase):
             max_decoding_seqs=24,
             max_num_batched_tokens=56_214,
             mlp_chunk_size=16_384,
-            hf_config=SimpleNamespace(model_type="qwen3_moe"),
+            hf_config=SimpleNamespace(model_type="qwen3_moe", num_experts=128),
         )
         calls = []
         engine.model_runner = SimpleNamespace(
@@ -1727,7 +1727,7 @@ class DecodeCudaGraphWarmupPolicyTest(unittest.TestCase):
             max_decoding_seqs=24,
             max_num_batched_tokens=56_214,
             mlp_chunk_size=16_384,
-            hf_config=SimpleNamespace(model_type="qwen3_moe"),
+            hf_config=SimpleNamespace(model_type="qwen3_moe", num_experts=128),
         )
 
         def fail_on_workspace(_method, _num_tokens):
