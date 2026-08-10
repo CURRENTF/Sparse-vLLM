@@ -38,6 +38,14 @@ _PACKED_EXPERT_TARGET_RE = re.compile(
     r"^model\.layers\.(\d+)\.mlp\.experts\."
     r"(gate_up_proj|down_proj)\.packed_expert_weight$"
 )
+_FP8_EXPERT_SOURCE_RE = re.compile(
+    r"^model\.language_model\.layers\.(\d+)\.mlp\.experts\.(\d+)\."
+    r"(gate_proj|up_proj|down_proj)\.weight$"
+)
+_FP8_EXPERT_TARGET_RE = re.compile(
+    r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\."
+    r"(gate_proj|up_proj|down_proj)\.expert_weight$"
+)
 
 
 class Qwen35MoeRouter(nn.Module):
@@ -72,28 +80,40 @@ class Qwen35MoeRouter(nn.Module):
 
 
 class Qwen35MoePackedExperts(Qwen3MoePackedExperts):
-    """Qwen3.6 packed-3D checkpoint adapter for the shared MoE provider."""
+    """Adapt Qwen3.6 BF16/FP8 checkpoints to the shared MoE provider."""
 
     checkpoint_projection_map = {
         "gate_up_proj": "gate_up",
         "down_proj": "down",
+        "gate_proj": "gate",
+        "up_proj": "up",
     }
 
     def __init__(self, config) -> None:
         super().__init__(config)
-        if self.fp8_enabled:
-            raise NotImplementedError(
-                "Qwen3.6 MoE v1 accepts BF16 expert weights only."
-            )
         self._loaded_packed_projections: set[str] = set()
 
     def rank_local_weight_slice(
         self,
         source_shape: tuple[int, ...],
         *,
-        loaded_shard_id: str,
+        loaded_shard_id: str | tuple[int, str],
         is_scale: bool = False,
     ) -> tuple[slice, ...] | None:
+        if isinstance(loaded_shard_id, tuple):
+            if not self.fp8_enabled:
+                raise ValueError(
+                    "Qwen3.6 BF16 checkpoints must use packed 3D expert weights."
+                )
+            return super().rank_local_weight_slice(
+                source_shape,
+                loaded_shard_id=loaded_shard_id,
+                is_scale=is_scale,
+            )
+        if self.fp8_enabled:
+            raise ValueError(
+                "Qwen3.6 FP8 checkpoints must use per-expert projections and scales."
+            )
         if is_scale:
             raise ValueError("Qwen3.6 MoE BF16 experts do not have weight scales.")
         expected = {
@@ -129,6 +149,10 @@ class Qwen35MoePackedExperts(Qwen3MoePackedExperts):
         projection: str,
         loaded_weight: torch.Tensor,
     ) -> None:
+        if self.fp8_enabled:
+            raise ValueError(
+                "Qwen3.6 FP8 checkpoints must use per-expert projections and scales."
+            )
         projection = str(projection)
         if projection in self._loaded_packed_projections:
             raise ValueError(
@@ -185,6 +209,9 @@ class Qwen35MoePackedExperts(Qwen3MoePackedExperts):
         self._loaded_packed_projections.add(projection)
 
     def validate_loaded_weights(self) -> None:
+        if self.fp8_enabled:
+            super().validate_loaded_weights()
+            return
         missing = {"gate_up_proj", "down_proj"} - self._loaded_packed_projections
         if missing:
             raise ValueError(
@@ -319,6 +346,7 @@ class Qwen35MoeForCausalLM(Qwen35ForCausalLM):
     special_weight_loaders = {
         **Qwen35ForCausalLM.special_weight_loaders,
         ".packed_expert_weight": "load_packed_expert_weight",
+        ".expert_weight": "load_expert_weight",
     }
 
     def __init__(self, config) -> None:
@@ -333,6 +361,8 @@ class Qwen35MoeForCausalLM(Qwen35ForCausalLM):
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
         self._loaded_linear_special_weights: set[str] = set()
         self._intentionally_skipped_weights: set[str] = set()
+        self._intentionally_skipped_expert_weights: set[str] = set()
+        self._intentionally_skipped_expert_scales: set[str] = set()
 
     @staticmethod
     def recurrent_state_spec(config, attention_tp_size: int) -> RecurrentStateSpec:
@@ -361,9 +391,16 @@ class Qwen35MoeForCausalLM(Qwen35ForCausalLM):
     def runtime_diagnostic_status(self) -> dict[str, object]:
         experts = self.model.layers[0].mlp.experts
         router = self.model.layers[0].mlp.gate
+        shared_linear = self.model.layers[0].mlp.shared_expert.gate_up_proj
         return {
             "moe_expert_provider": experts.provider.name,
             "moe_router_provider": router.provider.name,
+            "moe_weight_dtype": str(experts.w13_weight.dtype),
+            "fp8_linear_provider": (
+                shared_linear.quant_provider.name
+                if shared_linear.quantized
+                else None
+            ),
             "local_expert_start": int(experts.local_expert_start),
             "local_expert_end": int(experts.local_expert_end),
         }
@@ -397,10 +434,32 @@ class Qwen35MoeForCausalLM(Qwen35ForCausalLM):
         block(hidden_states)
         device_runtime.synchronize()
 
-    def map_weight_name(self, source_weight_name: str) -> str:
+    def map_weight_name(self, source_weight_name: str) -> str | None:
+        match = _FP8_EXPERT_SOURCE_RE.match(source_weight_name)
+        if match is not None:
+            layer_idx, global_expert_id, projection = match.groups()
+            global_expert_id = int(global_expert_id)
+            experts = self.model.layers[int(layer_idx)].mlp.experts
+            if not experts.fp8_enabled:
+                raise ValueError(
+                    "Qwen3.6 BF16 checkpoints must use packed 3D expert weights, "
+                    f"got {source_weight_name!r}."
+                )
+            if not experts.is_local_expert(global_expert_id):
+                return None
+            return (
+                f"model.layers.{layer_idx}.mlp.experts.{global_expert_id}."
+                f"{projection}.expert_weight"
+            )
         match = _PACKED_EXPERT_SOURCE_RE.match(source_weight_name)
         if match is not None:
             layer_idx, projection = match.groups()
+            experts = self.model.layers[int(layer_idx)].mlp.experts
+            if experts.fp8_enabled:
+                raise ValueError(
+                    "Qwen3.6 FP8 checkpoints must use per-expert projections and scales, "
+                    f"got packed tensor {source_weight_name!r}."
+                )
             return (
                 f"model.layers.{layer_idx}.mlp.experts.{projection}."
                 "packed_expert_weight"
@@ -411,6 +470,13 @@ class Qwen35MoeForCausalLM(Qwen35ForCausalLM):
         self,
         target_weight_name: str,
     ) -> WeightTarget | None:
+        match = _FP8_EXPERT_TARGET_RE.match(target_weight_name)
+        if match is not None:
+            layer_idx, global_expert_id, projection = match.groups()
+            return WeightTarget(
+                self.model.layers[int(layer_idx)].mlp.experts,
+                (int(global_expert_id), projection),
+            )
         match = _PACKED_EXPERT_TARGET_RE.match(target_weight_name)
         if match is not None:
             layer_idx, projection = match.groups()
@@ -426,6 +492,16 @@ class Qwen35MoeForCausalLM(Qwen35ForCausalLM):
         loaded_weight: torch.Tensor,
         loaded_scale: torch.Tensor | None,
     ) -> int:
+        match = _FP8_EXPERT_TARGET_RE.match(target_weight_name)
+        if match is not None:
+            layer_idx, global_expert_id, projection = match.groups()
+            self.model.layers[int(layer_idx)].mlp.experts.load_expert_weight(
+                int(global_expert_id),
+                projection,
+                loaded_weight,
+                loaded_scale,
+            )
+            return 1
         match = _PACKED_EXPERT_TARGET_RE.match(target_weight_name)
         if match is not None:
             if loaded_scale is not None:
@@ -455,15 +531,94 @@ class Qwen35MoeForCausalLM(Qwen35ForCausalLM):
         loaded_scale_shape: tuple[int, ...] | None,
         loaded_scale_dtype: str | None,
     ) -> None:
-        del loaded_weight_shape, loaded_weight_dtype
+        match = _FP8_EXPERT_SOURCE_RE.match(source_weight_name)
+        if match is not None:
+            layer_idx, global_expert_id, projection = match.groups()
+            experts = self.model.layers[int(layer_idx)].mlp.experts
+            if not experts.fp8_enabled:
+                raise ValueError(
+                    f"Qwen3.6 BF16 loader unexpectedly skipped {source_weight_name!r}."
+                )
+            if experts.is_local_expert(int(global_expert_id)):
+                raise ValueError(
+                    f"Qwen3.6 FP8 loader skipped local expert {source_weight_name!r}."
+                )
+            expected_weight_shape = (
+                (experts.hidden_size, experts.global_intermediate_size)
+                if projection == "down_proj"
+                else (experts.global_intermediate_size, experts.hidden_size)
+            )
+            expected_scale_shape = (
+                (experts.hidden_size // 128, experts.global_intermediate_size // 128)
+                if projection == "down_proj"
+                else (
+                    experts.global_intermediate_size // 128,
+                    experts.hidden_size // 128,
+                )
+            )
+            if loaded_weight_shape != expected_weight_shape:
+                raise ValueError(
+                    "Remote Qwen3.6 FP8 expert weight shape mismatch for "
+                    f"{source_weight_name!r}: expected={expected_weight_shape}, "
+                    f"got={loaded_weight_shape}."
+                )
+            if loaded_weight_dtype != "F8_E4M3":
+                raise TypeError(
+                    "Remote Qwen3.6 expert weight must be FP8 E4M3, got "
+                    f"safetensors dtype {loaded_weight_dtype}."
+                )
+            if loaded_scale_shape != expected_scale_shape:
+                raise ValueError(
+                    "Remote Qwen3.6 FP8 expert scale shape mismatch for "
+                    f"{source_weight_name!r}: expected={expected_scale_shape}, "
+                    f"got={loaded_scale_shape}."
+                )
+            if loaded_scale_dtype != "BF16":
+                raise TypeError(
+                    "Remote Qwen3.6 expert scale must be BF16, got "
+                    f"safetensors dtype {loaded_scale_dtype}."
+                )
+            self._intentionally_skipped_expert_weights.add(source_weight_name)
+            self._intentionally_skipped_expert_scales.add(
+                source_weight_name[: -len(".weight")] + ".weight_scale_inv"
+            )
+            return
         if not source_weight_name.startswith(self.ignored_weight_prefixes):
             raise ValueError(
                 f"Qwen3.6 MoE loader unexpectedly skipped {source_weight_name!r}."
             )
-        if loaded_scale_shape is not None or loaded_scale_dtype is not None:
+        is_mtp = source_weight_name.startswith("mtp.")
+        if not is_mtp and (
+            loaded_scale_shape is not None or loaded_scale_dtype is not None
+        ):
             raise ValueError(
-                "Qwen3.6 MoE visual/MTP intentional skips must not consume "
+                "Qwen3.6 MoE visual intentional skips must not consume "
                 f"quantization scales: {source_weight_name!r}."
+            )
+        if is_mtp and loaded_scale_shape is not None:
+            if loaded_weight_dtype != "F8_E4M3" or loaded_scale_dtype != "BF16":
+                raise TypeError(
+                    "Qwen3.6 skipped MTP quantized weights require FP8 E4M3 weights "
+                    f"and BF16 scales: {source_weight_name!r}."
+                )
+            if loaded_weight_shape is None or len(loaded_weight_shape) != 2:
+                raise ValueError(
+                    "Qwen3.6 skipped MTP FP8 weights must be rank-2, "
+                    f"got {source_weight_name!r} shape={loaded_weight_shape}."
+                )
+            expected_scale_shape = tuple(
+                (int(dimension) + 127) // 128
+                for dimension in loaded_weight_shape
+            )
+            if loaded_scale_shape != expected_scale_shape:
+                raise ValueError(
+                    "Qwen3.6 skipped MTP FP8 scale shape mismatch for "
+                    f"{source_weight_name!r}: expected={expected_scale_shape}, "
+                    f"got={loaded_scale_shape}."
+                )
+        elif is_mtp and loaded_weight_dtype == "F8_E4M3":
+            raise ValueError(
+                f"Qwen3.6 skipped MTP FP8 weight is missing its scale: {source_weight_name!r}."
             )
         self._intentionally_skipped_weights.add(source_weight_name)
 
@@ -504,6 +659,49 @@ class Qwen35MoeForCausalLM(Qwen35ForCausalLM):
         for layer in self.model.layers:
             layer.mlp.experts.validate_loaded_weights()
 
+        first_experts = self.model.layers[0].mlp.experts
+        if first_experts.fp8_enabled:
+            expected_skipped_experts = {
+                "model.language_model.layers."
+                f"{layer_idx}.mlp.experts.{expert_id}.{projection}.weight"
+                for layer_idx in range(int(self.config.num_hidden_layers))
+                for expert_id in range(int(self.config.num_experts))
+                if not self.model.layers[layer_idx].mlp.experts.is_local_expert(
+                    expert_id
+                )
+                for projection in ("gate_proj", "up_proj", "down_proj")
+            }
+            expected_skipped_scales = {
+                name[: -len(".weight")] + ".weight_scale_inv"
+                for name in expected_skipped_experts
+            }
+            if self._intentionally_skipped_expert_weights != expected_skipped_experts:
+                missing = sorted(
+                    expected_skipped_experts
+                    - self._intentionally_skipped_expert_weights
+                )
+                unexpected = sorted(
+                    self._intentionally_skipped_expert_weights
+                    - expected_skipped_experts
+                )
+                raise ValueError(
+                    "Qwen3.6 FP8 remote expert skip audit failed: "
+                    f"missing={missing[:4]}, unexpected={unexpected[:4]}."
+                )
+            if self._intentionally_skipped_expert_scales != expected_skipped_scales:
+                missing = sorted(
+                    expected_skipped_scales
+                    - self._intentionally_skipped_expert_scales
+                )
+                unexpected = sorted(
+                    self._intentionally_skipped_expert_scales
+                    - expected_skipped_scales
+                )
+                raise ValueError(
+                    "Qwen3.6 FP8 remote expert scale skip audit failed: "
+                    f"missing={missing[:4]}, unexpected={unexpected[:4]}."
+                )
+
         skip_groups = {
             "visual": any(
                 name.startswith(("model.visual.", "visual."))
@@ -520,13 +718,14 @@ class Qwen35MoeForCausalLM(Qwen35ForCausalLM):
                 "Qwen3.6 MoE checkpoint is missing expected intentional-skip "
                 f"groups: {missing_skip_groups}."
             )
-        first_experts = self.model.layers[0].mlp.experts
         logger.info(
-            "Loaded Qwen3.6 MoE rank {} expert_provider={} router_provider={} "
+            "Loaded Qwen3.6 MoE rank {} quantization={} expert_provider={} "
+            "router_provider={} "
             "attention TP {}/{} "
             "MoE TP {}/{} EP {}/{} local experts [{}, {}) across {} layers; "
             "intentionally skipped {} visual/MTP tensors.",
             self.parallel_context.world_rank,
+            "fp8" if first_experts.fp8_enabled else "bf16",
             first_experts.provider.name,
             self.model.layers[0].mlp.gate.provider.name,
             self.parallel_context.attention_tp_rank,

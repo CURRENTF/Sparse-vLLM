@@ -69,7 +69,7 @@ Read the method overview and integration rules in
 | Qwen3 | ✅ |
 | Qwen3MoE | ✅ |
 | Qwen3.5 / Qwen3.6 | ✅ |
-| Qwen3.6 MoE | ✅ (BF16 text-only) |
+| Qwen3.6 MoE | ✅ (BF16 / block FP8, text-only) |
 | Llama 3 / 3.1 | ✅ |
 | MiniMax M2.7 | ✅ |
 
@@ -159,8 +159,8 @@ the smaller CUDA-specific extra:
 pip install -e ".[prefix-offload]"
 ```
 
-Sparse-vLLM supports Qwen3.5/Qwen3.6 checkpoints in unquantized BF16 and
-block-scaled FP8 formats.
+Sparse-vLLM supports Qwen3.5/Qwen3.6 dense and MoE checkpoints in unquantized
+BF16 and block-scaled FP8 formats.
 
 The Qwen3.5/Qwen3.6 prefill causal Conv1D and decode Conv1D/GDN packing paths
 use repository-local Triton kernels; `sglang-kernel` and a local CUDA extension

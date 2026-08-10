@@ -12,7 +12,7 @@
 | Qwen3 Dense | `qwen3` | BF16 / FP16 / 块级 FP8 | ✅（FP8：1/2/4/8） | 仅支持 1 | 仅支持 1 |
 | Qwen3MoE | `qwen3_moe` | BF16 / FP16 / 块级 FP8 | ✅（TP > 1 时模型 dtype 仅支持 BF16） | 仅支持 1 | ✅ |
 | Qwen3.5 / Qwen3.6 | `qwen3_5` | BF16 / 块级 FP8 | ✅ | 仅支持 1 | 仅支持 1 |
-| Qwen3.6 MoE | `qwen3_5_moe` | 仅 BF16 | ✅ | 仅支持 1 | ✅ |
+| Qwen3.6 MoE | `qwen3_5_moe` | BF16 / 块级 FP8 | 1/2 | 仅支持 1 | ✅ |
 | Llama 3 / 3.1 | `llama` | BF16 / FP16 | ✅ | 仅支持 1 | 仅支持 1 |
 | MiniMax M2.7 | `minimax_m2` | 块级 FP8，非量化权重使用 BF16 | ✅ | 仅支持 1 | ✅ |
 
@@ -27,11 +27,15 @@ TP 要求模型 dtype 为 BF16；FP16 Qwen3MoE checkpoint 仅支持 `TP=1`。当
 
 Qwen3.6 MoE 始终使用 outer-TP 布局：attention 与 Gated DeltaNet TP 为
 `T`、MoE EP 为 `E`、MoE TP 为 `T / E`，world size 为 `T`。该模型要求
-`DP=1`、`T % E == 0` 且语言模型权重为 BF16。首版仅支持纯文本 CausalLM，
-明确拒绝 image/video 与 MTP 输入，只支持 Vanilla KV runtime；CUDA Graph
-仅覆盖 decode，不覆盖 prefill。
+`DP=1`、`T % E == 0`，激活为 BF16，语言模型权重可使用 BF16 或块级 FP8。
+当前 runtime 仅支持纯文本 CausalLM，明确拒绝 image/video 与 MTP 输入，只
+支持 Vanilla KV runtime；CUDA Graph 仅覆盖 decode，不覆盖 prefill。两个
+KV heads 将 outer TP 限定为 1 或 2；FP8 还要求所有 TP-local 量化 Linear
+维度保持 128 对齐。
 
-块级 FP8 要求使用 E4M3 权重、动态激活量化以及 `128 x 128` 的权重块大小。Qwen3.5 和 Qwen3.6 的配置在内部统一规范为 `model_type=qwen3_5`。
+块级 FP8 要求使用 E4M3 权重、动态激活量化以及 `128 x 128` 的权重块大小。
+Qwen3.5/Qwen3.6 Dense 配置在内部统一规范为 `model_type=qwen3_5`；Qwen3.6
+MoE 使用 `model_type=qwen3_5_moe`。
 
 ## 稀疏方法支持
 

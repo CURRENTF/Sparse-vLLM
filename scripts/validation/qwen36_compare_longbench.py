@@ -30,7 +30,38 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
-def _load_run(path: Path) -> dict[str, Any]:
+def _validate_worker_providers(
+    workers: list[dict[str, Any]],
+    *,
+    precision: str,
+    path: Path,
+) -> None:
+    if precision == "bf16":
+        valid = all(
+            worker.get("moe_expert_provider") == "triton"
+            and worker.get("moe_router_provider") == "triton"
+            for worker in workers
+        )
+    else:
+        valid_expert_providers = {
+            "flashinfer_cutlass_fp8_sm90",
+            "triton",
+        }
+        valid = all(
+            worker.get("moe_expert_provider") in valid_expert_providers
+            and worker.get("moe_router_provider") == "triton"
+            and worker.get("moe_weight_dtype") == "torch.float8_e4m3fn"
+            and isinstance(worker.get("fp8_linear_provider"), str)
+            and bool(worker["fp8_linear_provider"])
+            for worker in workers
+        )
+    if not valid:
+        raise RuntimeError(
+            f"LongBench run {path} has invalid {precision.upper()} providers."
+        )
+
+
+def _load_run(path: Path, *, precision: str) -> dict[str, Any]:
     required = (
         "resolved_config.json",
         "raw_outputs.jsonl",
@@ -57,12 +88,7 @@ def _load_run(path: Path) -> dict[str, Any]:
     workers = graph.get("workers")
     if not isinstance(workers, list) or not workers:
         raise RuntimeError(f"LongBench run {path} has no worker status records.")
-    if any(
-        worker.get("moe_expert_provider") != "triton"
-        or worker.get("moe_router_provider") != "triton"
-        for worker in workers
-    ):
-        raise RuntimeError(f"LongBench run {path} did not use Triton providers.")
+    _validate_worker_providers(workers, precision=precision, path=path)
     config = _read_json(path / "resolved_config.json")
     expected_per_task = int(config["selection"]["samples_per_task"])
     counts = {
@@ -136,12 +162,17 @@ def main() -> int:
     parser.add_argument("--single", type=Path, required=True)
     parser.add_argument("--pure-tp", type=Path, required=True)
     parser.add_argument("--tp-ep", type=Path, required=True)
+    parser.add_argument(
+        "--precision",
+        choices=("bf16", "fp8"),
+        default="bf16",
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
     runs = {
-        "single": _load_run(args.single.resolve()),
-        "pure_tp": _load_run(args.pure_tp.resolve()),
-        "tp_ep": _load_run(args.tp_ep.resolve()),
+        "single": _load_run(args.single.resolve(), precision=args.precision),
+        "pure_tp": _load_run(args.pure_tp.resolve(), precision=args.precision),
+        "tp_ep": _load_run(args.tp_ep.resolve(), precision=args.precision),
     }
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=False)
@@ -252,6 +283,7 @@ def main() -> int:
             ["git", "rev-parse", "HEAD"], text=True, capture_output=True, check=True
         ).stdout.strip(),
         "sources": {topology: str(run["path"]) for topology, run in runs.items()},
+        "precision": args.precision,
     }
     _write_json(output_dir / "run_info.json", run_info)
     _write_json(output_dir / "raw_outputs.json", run_info["sources"])

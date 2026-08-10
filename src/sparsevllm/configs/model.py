@@ -250,16 +250,13 @@ def _validate_qwen35_moe_checkpoint_config(
             "architectures=['Qwen3_5MoeForConditionalGeneration'], "
             f"got {list(architectures)}."
         )
-    if quantization_config.enabled:
-        raise NotImplementedError(
-            "Qwen3.6 MoE v1 supports BF16 checkpoints only; FP8 is out of scope."
-        )
     configured_dtype = _config_get(hf_config, "torch_dtype", None)
     if configured_dtype is None:
         configured_dtype = _config_get(hf_config, "dtype", None)
     if configured_dtype not in {torch.bfloat16, "bfloat16"}:
         raise NotImplementedError(
-            "Qwen3.6 MoE v1 requires BF16 language-model weights, "
+            "Qwen3.6 MoE requires BF16 activations with either BF16 or block-FP8 "
+            "language-model weights, "
             f"got dtype={configured_dtype!r}."
         )
     for field_name, expected in _QWEN35_MOE_FIXED_FIELDS.items():
@@ -825,9 +822,33 @@ def _validate_qwen35_moe_runtime(config, *, model_type: str) -> None:
         )
     if getattr(hf_config, "torch_dtype", None) != torch.bfloat16:
         raise NotImplementedError(
-            "Qwen3.6 MoE v1 requires BF16 weights, got "
+            "Qwen3.6 MoE requires BF16 activations, got "
             f"torch_dtype={getattr(hf_config, 'torch_dtype', None)}."
         )
+    if config.quantization_config.enabled:
+        block_size = tuple(config.quantization_config.weight_block_size or ())
+        if block_size != (128, 128):
+            raise ValueError(
+                "Qwen3.6 MoE FP8 requires weight_block_size=(128, 128), "
+                f"got {block_size}."
+            )
+        fp8_local_dimensions = {
+            "hidden_size": int(hf_config.hidden_size),
+            "shared_expert_intermediate_size": int(
+                hf_config.shared_expert_intermediate_size
+            )
+            // outer_tp_size,
+        }
+        invalid_fp8_dimensions = {
+            name: value
+            for name, value in fp8_local_dimensions.items()
+            if value % 128
+        }
+        if invalid_fp8_dimensions:
+            raise ValueError(
+                "Qwen3.6 MoE FP8 local Linear dimensions must be 128-aligned, "
+                f"got TP={outer_tp_size}, invalid={invalid_fp8_dimensions}."
+            )
     _validate_runtime_compatibility(config, model_type=model_type)
 
 

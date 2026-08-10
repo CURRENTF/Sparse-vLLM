@@ -21,7 +21,7 @@ from sparsevllm.operators.moe_router import (
 )
 
 
-def _outer_config():
+def _outer_config(*, fp8: bool = False):
     layer_types = [
         "full_attention" if (layer_idx + 1) % 4 == 0 else "linear_attention"
         for layer_idx in range(40)
@@ -55,11 +55,20 @@ def _outer_config():
         torch_dtype=torch.bfloat16,
         quantization_config=None,
     )
-    return SimpleNamespace(
+    outer_config = SimpleNamespace(
         model_type="qwen3_5_moe",
         architectures=["Qwen3_5MoeForConditionalGeneration"],
         text_config=text_config,
     )
+    if fp8:
+        del text_config.quantization_config
+        outer_config.quantization_config = {
+            "quant_method": "fp8",
+            "fmt": "e4m3",
+            "activation_scheme": "dynamic",
+            "weight_block_size": [128, 128],
+        }
+    return outer_config
 
 
 def _make_config(tmp_path, **overrides):
@@ -104,6 +113,40 @@ def _pure_tp_context(world_rank: int) -> ParallelContext:
     )
 
 
+def _fp8_expert_config():
+    return SimpleNamespace(
+        num_experts=2,
+        hidden_size=128,
+        moe_intermediate_size=128,
+        num_experts_per_tok=1,
+        dtype=torch.bfloat16,
+        torch_dtype=torch.bfloat16,
+        decode_cuda_graph=True,
+        quantization_config=QuantizationConfig(
+            enabled=True,
+            quant_method="fp8",
+            weight_dtype="e4m3",
+            activation_scheme="dynamic",
+            weight_block_size=(128, 128),
+            model_name="Qwen3.6 MoE",
+        ),
+    )
+
+
+def _make_fp8_experts():
+    with (
+        patch(
+            "sparsevllm.models.qwen3_moe.get_parallel_context",
+            return_value=_single_context(),
+        ),
+        patch(
+            "sparsevllm.models.qwen3_moe.resolve_moe_provider",
+            return_value=TritonMoeProvider(),
+        ),
+    ):
+        return Qwen35MoePackedExperts(_fp8_expert_config())
+
+
 def test_qwen36_moe_config_normalizes_text_runtime_and_topology(tmp_path):
     config = _make_config(
         tmp_path,
@@ -146,6 +189,27 @@ def test_qwen36_moe_rejects_non_bf16_checkpoint(tmp_path):
     ):
         with pytest.raises(NotImplementedError, match="requires BF16"):
             Config(model=str(tmp_path))
+
+
+def test_qwen36_moe_accepts_outer_block_fp8_config(tmp_path):
+    with patch(
+        "sparsevllm.configs.runtime.AutoConfig.from_pretrained",
+        return_value=_outer_config(fp8=True),
+    ):
+        config = Config(model=str(tmp_path))
+
+    assert config.quantization_config.enabled is True
+    assert config.quantization_config.weight_dtype == "e4m3"
+    assert config.quantization_config.weight_block_size == (128, 128)
+
+
+def test_qwen36_moe_fp8_rejects_unsupported_outer_tp(tmp_path):
+    with patch(
+        "sparsevllm.configs.runtime.AutoConfig.from_pretrained",
+        return_value=_outer_config(fp8=True),
+    ):
+        with pytest.raises(ValueError, match="num_key_value_heads"):
+            Config(model=str(tmp_path), tensor_parallel_size=8)
 
 
 def test_qwen36_moe_recurrent_state_uses_attention_tp_and_fp32_state():
@@ -364,6 +428,66 @@ def test_packed_expert_pure_tp_shards_reconstruct_checkpoint():
     torch.testing.assert_close(gate, gate_up[:, :4])
     torch.testing.assert_close(up, gate_up[:, 4:])
     torch.testing.assert_close(reconstructed_down, down)
+
+
+def test_qwen36_fp8_experts_load_per_expert_weights_and_scales():
+    experts = _make_fp8_experts()
+    sources = {}
+    for expert_id in range(experts.num_experts):
+        for projection in ("gate_proj", "up_proj", "down_proj"):
+            weight = (
+                torch.randn(128, 128)
+                .clamp(-4.0, 4.0)
+                .to(torch.float8_e4m3fn)
+            )
+            scale = torch.rand(1, 1, dtype=torch.bfloat16) + 0.1
+            sources[(expert_id, projection)] = (weight, scale)
+            experts.load_expert_weight(expert_id, projection, weight, scale)
+
+    experts.validate_loaded_weights()
+    for expert_id in range(experts.num_experts):
+        gate, gate_scale = sources[(expert_id, "gate_proj")]
+        up, up_scale = sources[(expert_id, "up_proj")]
+        down, down_scale = sources[(expert_id, "down_proj")]
+        assert torch.equal(experts.w13_weight[expert_id, :128], gate)
+        assert torch.equal(experts.w13_weight[expert_id, 128:], up)
+        assert torch.equal(experts.w13_scale_inv[expert_id, :1], gate_scale)
+        assert torch.equal(experts.w13_scale_inv[expert_id, 1:], up_scale)
+        assert torch.equal(experts.w2_weight[expert_id], down)
+        assert torch.equal(experts.w2_scale_inv[expert_id], down_scale)
+
+
+def test_qwen36_checkpoint_adapter_keeps_fp8_layout_model_local():
+    experts = _make_fp8_experts()
+    model = Qwen35MoeForCausalLM.__new__(Qwen35MoeForCausalLM)
+    torch.nn.Module.__init__(model)
+    model.model = torch.nn.Module()
+    model.model.layers = torch.nn.ModuleList([torch.nn.Module()])
+    model.model.layers[0].mlp = torch.nn.Module()
+    model.model.layers[0].mlp.experts = experts
+
+    source_name = (
+        "model.language_model.layers.0.mlp.experts.1.gate_proj.weight"
+    )
+    target_name = model.map_weight_name(source_name)
+
+    assert target_name == "model.layers.0.mlp.experts.1.gate_proj.expert_weight"
+    target = model.resolve_special_weight(target_name)
+    assert target is not None
+    assert target.module is experts
+    assert target.shard_id == (1, "gate_proj")
+    with pytest.raises(ValueError, match="must use per-expert"):
+        model.map_weight_name(
+            "model.language_model.layers.0.mlp.experts.gate_up_proj"
+        )
+
+
+def test_qwen36_fp8_experts_require_scale():
+    experts = _make_fp8_experts()
+    weight = torch.ones(128, 128).to(torch.float8_e4m3fn)
+
+    with pytest.raises(ValueError, match="Missing FP8 weight_scale_inv"):
+        experts.load_expert_weight(0, "gate_proj", weight, None)
 
 
 def test_routed_output_reduces_without_reducing_shared_output_twice():
