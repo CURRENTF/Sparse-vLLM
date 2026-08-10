@@ -28,10 +28,10 @@ TP 要求模型 dtype 为 BF16；FP16 Qwen3MoE checkpoint 仅支持 `TP=1`。当
 Qwen3.6 MoE 始终使用 outer-TP 布局：attention 与 Gated DeltaNet TP 为
 `T`、MoE EP 为 `E`、MoE TP 为 `T / E`，world size 为 `T`。该模型要求
 `DP=1`、`T % E == 0`，激活为 BF16，语言模型权重可使用 BF16 或块级 FP8。
-当前 runtime 仅支持纯文本 CausalLM，明确拒绝 image/video 与 MTP 输入，只
-支持 Vanilla KV runtime；CUDA Graph 仅覆盖 decode，不覆盖 prefill。两个
-KV heads 将 outer TP 限定为 1 或 2；FP8 还要求所有 TP-local 量化 Linear
-维度保持 128 对齐。
+当前 runtime 仅支持纯文本 CausalLM，明确拒绝 image/video 与 MTP 输入。
+两个 KV heads 将 outer TP 限定为 1 或 2；CUDA Graph 仅覆盖 decode，不覆盖
+prefill。稀疏方法只作用于 full-attention 层，Gated DeltaNet 层继续使用独立
+的递归状态路径；FP8 还要求所有 TP-local 量化 Linear 维度保持 128 对齐。
 
 块级 FP8 要求使用 E4M3 权重、动态激活量化以及 `128 x 128` 的权重块大小。
 Qwen3.5/Qwen3.6 Dense 配置在内部统一规范为 `model_type=qwen3_5`；Qwen3.6
@@ -45,7 +45,7 @@ MoE 使用 `model_type=qwen3_5_moe`。
 | Qwen3 | ✅ | ✅ | ✅ | 实验性⁴ | ✅ | ✅ | ✅ | ✅ | — | 需要压缩器² |
 | Qwen3MoE | ✅ | ✅ | ✅ | 实验性⁴ | ✅ | ✅ | ✅ | ✅ | — | — |
 | Qwen3.5 / Qwen3.6 | ✅ | ✅ | ✅ | 实验性⁴ | ✅ | ✅ | ✅ | ✅ | — | 匹配的 checkpoint³ |
-| Qwen3.6 MoE | ✅ | — | — | — | — | — | — | — | — | — |
+| Qwen3.6 MoE | ✅ | ✅ | ✅ | 实验性⁴ | ✅ | ✅ | ✅ | ✅ | — | — |
 | Llama 3 / 3.1 | ✅ | ✅ | ✅ | 实验性⁴ | ✅ | ✅ | ✅ | ✅ | 指定 checkpoint¹ | 需要 compressor² |
 | MiniMax M2.7 | ✅ | ✅ | ✅ | 实验性⁴ | ✅ | ✅ | ✅ | ✅ | — | — |
 

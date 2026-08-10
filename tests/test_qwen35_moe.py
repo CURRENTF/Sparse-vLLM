@@ -166,9 +166,45 @@ def test_qwen36_moe_config_normalizes_text_runtime_and_topology(tmp_path):
     assert config.runtime_layout.num_kv_layers == 10
 
 
-def test_qwen36_moe_rejects_non_vanilla_sparse_method(tmp_path):
-    with pytest.raises(ValueError, match="validated methods: 'vanilla'"):
-        _make_config(tmp_path, vllm_sparse_method="quest")
+@pytest.mark.parametrize(
+    "method",
+    [
+        "streamingllm",
+        "snapkv",
+        "h2o",
+        "pyramidkv",
+        "omnikv",
+        "quest",
+        "rkv",
+    ],
+)
+def test_qwen36_moe_accepts_asset_free_sparse_graph_methods(tmp_path, method):
+    config = _make_config(
+        tmp_path,
+        vllm_sparse_method=method,
+        full_attn_layers="3,11,19,27,35",
+        decode_cuda_graph=True,
+        enforce_eager=False,
+    )
+
+    assert config.vllm_sparse_method == method
+    assert config.decode_cuda_graph is True
+
+
+@pytest.mark.parametrize(
+    ("method", "error"),
+    [
+        ("skipkv", "official models with released steering vectors"),
+        ("deltakv", "validated methods"),
+    ],
+)
+def test_qwen36_moe_rejects_sparse_methods_requiring_model_assets(
+    tmp_path,
+    method,
+    error,
+):
+    with pytest.raises(ValueError, match=error):
+        _make_config(tmp_path, vllm_sparse_method=method)
 
 
 def test_qwen36_moe_rejects_invalid_outer_tp_ep_topology(tmp_path):

@@ -62,6 +62,7 @@ H2O_SUPPORTED_MODEL_TYPES = frozenset(
         "qwen3",
         "qwen3_moe",
         "qwen3_5",
+        "qwen3_5_moe",
         "llama",
         "minimax_m2",
     }
@@ -143,10 +144,12 @@ QWEN3_MOE_TP_COMPATIBILITY = QWEN3_MOE_TP_EP_COMPATIBILITY
 
 QWEN35_MOE_COMPATIBILITY = ModelRuntimeCompatibility(
     parallel_mode="outer_tp_moe_tp_ep",
-    sparse_methods=frozenset({""}),
+    sparse_methods=QWEN3_MOE_TP_EP_COMPATIBILITY.sparse_methods,
     prefix_cache_methods=frozenset(),
     requires_eager=False,
-    decode_cuda_graph_methods=frozenset({""}),
+    decode_cuda_graph_methods=(
+        QWEN3_MOE_TP_EP_COMPATIBILITY.decode_cuda_graph_methods
+    ),
 )
 
 MINIMAX_M2_EP_COMPATIBILITY = ModelRuntimeCompatibility(

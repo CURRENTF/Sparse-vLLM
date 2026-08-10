@@ -36,9 +36,10 @@ Qwen3.6 MoE always uses the outer-TP layout: attention and Gated DeltaNet TP
 are `T`, MoE EP is `E`, MoE TP is `T / E`, and world size is `T`. It requires
 `DP=1`, `T % E == 0`, and BF16 activations with either BF16 or block FP8
 language-model weights. The runtime is text-only, rejects image/video and MTP
-inputs, supports only Vanilla KV runtime, and captures decode (not prefill)
-with CUDA Graph. Outer TP is limited to 1 or 2 by the two KV heads; FP8 also
-requires every TP-local quantized Linear dimension to remain 128-aligned.
+inputs, and captures decode (not prefill) with CUDA Graph. Sparse methods apply
+only to the full-attention layers; Gated DeltaNet layers keep their recurrent
+state path. Outer TP is limited to 1 or 2 by the two KV heads; FP8 also requires
+every TP-local quantized Linear dimension to remain 128-aligned.
 
 Block FP8 support requires E4M3 weights, dynamic activation quantization, and
 a `128 x 128` weight block size. Qwen3.5/Qwen3.6 dense configurations are
@@ -53,7 +54,7 @@ normalized internally to `model_type=qwen3_5`; Qwen3.6 MoE uses
 | Qwen3 | ✅ | ✅ | ✅ | Experimental⁴ | ✅ | ✅ | ✅ | ✅ | — | Compressor required² |
 | Qwen3MoE | ✅ | ✅ | ✅ | Experimental⁴ | ✅ | ✅ | ✅ | ✅ | — | — |
 | Qwen3.5 / Qwen3.6 | ✅ | ✅ | ✅ | Experimental⁴ | ✅ | ✅ | ✅ | ✅ | — | Matched checkpoint³ |
-| Qwen3.6 MoE | ✅ | — | — | — | — | — | — | — | — | — |
+| Qwen3.6 MoE | ✅ | ✅ | ✅ | Experimental⁴ | ✅ | ✅ | ✅ | ✅ | — | — |
 | Llama 3 / 3.1 | ✅ | ✅ | ✅ | Experimental⁴ | ✅ | ✅ | ✅ | ✅ | Selected checkpoint¹ | Compressor required² |
 | MiniMax M2.7 | ✅ | ✅ | ✅ | Experimental⁴ | ✅ | ✅ | ✅ | ✅ | — | — |
 
