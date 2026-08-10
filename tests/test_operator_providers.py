@@ -6,6 +6,12 @@ import pytest
 import torch
 
 from sparsevllm.operators.all_reduce import HopperTp2FlashInferAllReduceProvider
+from sparsevllm.operators.activation import (
+    SILU_AND_MUL_REGISTRY,
+    SiluAndMulSpec,
+    TorchSiluAndMulProvider,
+    TritonSiluAndMulProvider,
+)
 from sparsevllm.operators.fp8_linear import (
     FP8_LINEAR_REGISTRY,
     FlashInferSm90Fp8LinearProvider,
@@ -23,6 +29,7 @@ from sparsevllm.operators.moe import (
     FlashInferCutlassFp8MoeProvider,
     HopperQwen36HybridFp8MoeProvider,
     MoeOpSpec,
+    SglAlignedTritonGlmMoeProvider,
     resolve_moe_provider,
 )
 from sparsevllm.operators.registry import OpResolver
@@ -190,6 +197,22 @@ def test_native_gate_up_provider_matches_swiglu_semantics():
         )
 
     torch.testing.assert_close(actual, expected)
+
+
+def test_silu_and_mul_provider_respects_platform_capability():
+    cuda_provider = OpResolver(SILU_AND_MUL_REGISTRY).resolve(
+        SiluAndMulSpec(activation_dtype=torch.bfloat16),
+        _cuda_caps((9, 0)),
+        op_spec=SiluAndMulSpec(activation_dtype=torch.bfloat16),
+    ).provider
+    cpu_provider = OpResolver(SILU_AND_MUL_REGISTRY).resolve(
+        SiluAndMulSpec(activation_dtype=torch.float32),
+        _non_cuda_caps(PlatformEnum.CPU),
+        op_spec=SiluAndMulSpec(activation_dtype=torch.float32),
+    ).provider
+
+    assert isinstance(cuda_provider, TritonSiluAndMulProvider)
+    assert isinstance(cpu_provider, TorchSiluAndMulProvider)
 
 
 @pytest.mark.parametrize(
@@ -513,6 +536,82 @@ def test_glm_tp2_fused_shared_decode_uses_sgl_aligned_provider():
         )
 
     assert resolved.provider.name == "sgl_aligned_triton_glm"
+
+
+def test_glm_tp2_ep2_moe_uses_sgl_aligned_provider():
+    spec = _moe_spec(
+        activation_dtype=torch.bfloat16,
+        weight_dtype=torch.bfloat16,
+        block_shape=None,
+        hidden_size=2048,
+        intermediate_size=1536,
+        num_local_experts=32,
+        num_experts=64,
+        top_k=4,
+        ep_size=2,
+        tp_size=1,
+        routing_method="biased_sigmoid",
+    )
+
+    with patch(
+        "sparsevllm.operators.sgl_moe.sgl_moe_ep_alignment_support",
+        return_value=(True, "supported"),
+    ):
+        resolved = OpResolver(MOE_REGISTRY).resolve(
+            spec,
+            _cuda_caps(
+                (9, 0),
+                native_fp8=False,
+                device_name="NVIDIA H100 80GB HBM3",
+            ),
+        )
+
+    assert resolved.provider.name == "sgl_aligned_triton_glm"
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "expects_sgl_alignment"),
+    [(4, False), (5, True), (64, True), (65, False)],
+)
+def test_glm_tp2_ep2_sgl_alignment_is_bounded(
+    num_tokens,
+    expects_sgl_alignment,
+):
+    spec = _moe_spec(
+        activation_dtype=torch.bfloat16,
+        weight_dtype=torch.bfloat16,
+        block_shape=None,
+        hidden_size=2048,
+        intermediate_size=1536,
+        num_local_experts=32,
+        num_experts=64,
+        top_k=4,
+        ep_size=2,
+        tp_size=1,
+        routing_method="biased_sigmoid",
+    )
+    hidden_states = torch.empty(num_tokens, 2048)
+    topk_ids = torch.empty(num_tokens, 4, dtype=torch.int64)
+    topk_weights = torch.empty(num_tokens, 4)
+    weights = torch.empty(0)
+    provider = SglAlignedTritonGlmMoeProvider()
+
+    with patch("sparsevllm.triton_kernel.moe.fused_moe") as fused_moe:
+        provider.run(
+            spec,
+            hidden_states,
+            topk_ids,
+            topk_weights,
+            weights,
+            weights,
+            None,
+            None,
+            local_expert_start=0,
+            ep_rank=0,
+        )
+
+    alignment_impl = fused_moe.call_args.kwargs["alignment_impl"]
+    assert (alignment_impl is not None) is expects_sgl_alignment
 
 
 @pytest.mark.parametrize(

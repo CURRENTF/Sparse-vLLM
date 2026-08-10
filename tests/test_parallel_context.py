@@ -12,12 +12,17 @@ from sparsevllm.distributed import (
     ParallelGroup,
     ParallelMode,
     ParallelTopology,
-    get_parallel_context,
-    init_parallel_context,
     parallel_group_ranks,
     parallel_ranks_from_world_rank,
-    reset_parallel_context,
     world_rank_from_parallel_ranks,
+)
+from sparsevllm.distributed.flashinfer_custom_all_reduce import (
+    FlashInferCustomAllReduce,
+)
+from sparsevllm.distributed.parallel_context import (
+    get_parallel_context,
+    init_parallel_context,
+    reset_parallel_context,
 )
 from sparsevllm.engine.cache_manager.base import CacheManager
 from sparsevllm.layers.embed_head import VocabParallelEmbedding
@@ -156,6 +161,88 @@ def test_hybrid_moe_parallel_context_uses_explicit_groups():
     assert context.expert.ranks == (0, 2)
     assert context.ep_rank == 1
     reset_parallel_context()
+
+
+@pytest.mark.parametrize(
+    ("local_reason", "rank_reasons", "expects_provider"),
+    [
+        (None, [None, None], True),
+        ("peer access is unavailable", ["peer access is unavailable"] * 2, False),
+        (None, [None, "peer access is unavailable"], False),
+    ],
+)
+def test_hybrid_tp2_ep2_resolves_custom_all_reduce_at_init(
+    local_reason,
+    rank_reasons,
+    expects_provider,
+):
+    reset_parallel_context()
+    provider = Mock()
+    provider_cls = Mock(return_value=provider)
+    provider_cls.unsupported_reason.return_value = local_reason
+
+    def all_gather_object(output, _local_reason, *, group):
+        assert group is dist.group.WORLD
+        output[:] = rank_reasons
+
+    with (
+        patch.object(dist, "is_initialized", return_value=True),
+        patch.object(dist, "get_world_size", return_value=2),
+        patch.object(dist, "get_rank", return_value=0),
+        patch.object(dist, "all_gather_object", side_effect=all_gather_object),
+        patch(
+            "sparsevllm.distributed.flashinfer_custom_all_reduce."
+            "FlashInferCustomAllReduce",
+            provider_cls,
+        ),
+    ):
+        context = init_parallel_context(
+            topology=ParallelTopology(2, 2, 1, ParallelMode.OUTER_TP_MOE),
+            enable_flashinfer_custom_all_reduce=True,
+        )
+
+    selected_group = provider_cls.unsupported_reason.call_args.args[0]
+    assert selected_group.ranks == (0, 1)
+    assert context.attention.ranks == (0, 1)
+    assert context.expert.ranks == (0, 1)
+    assert context.moe_tensor.ranks == (0,)
+    if expects_provider:
+        provider_cls.assert_called_once_with(selected_group)
+        assert context.all_reduce_provider is provider
+    else:
+        provider_cls.assert_not_called()
+        assert context.all_reduce_provider is None
+    reset_parallel_context()
+
+
+def test_custom_all_reduce_support_rejects_missing_peer_access():
+    group = ParallelGroup(object(), (0, 1), 0, 2)
+    with (
+        patch.object(dist, "get_backend", return_value=dist.Backend.NCCL),
+        patch.object(torch.cuda, "is_available", return_value=True),
+        patch.object(torch.cuda, "device_count", return_value=2),
+        patch.object(torch.cuda, "current_device", return_value=0),
+        patch.object(torch.cuda, "get_device_capability", return_value=(9, 0)),
+        patch.object(torch.cuda, "can_device_access_peer", return_value=False),
+    ):
+        reason = FlashInferCustomAllReduce.unsupported_reason(group)
+
+    assert reason is not None
+    assert "peer access" in reason
+
+
+def test_custom_all_reduce_support_rejects_non_sm90_rank():
+    group = ParallelGroup(object(), (0, 1), 0, 2)
+    with (
+        patch.object(dist, "get_backend", return_value=dist.Backend.NCCL),
+        patch.object(torch.cuda, "is_available", return_value=True),
+        patch.object(torch.cuda, "device_count", return_value=2),
+        patch.object(torch.cuda, "current_device", return_value=0),
+        patch.object(torch.cuda, "get_device_capability", return_value=(8, 9)),
+    ):
+        reason = FlashInferCustomAllReduce.unsupported_reason(group)
+
+    assert reason == "requires CUDA SM90, got (8, 9)"
 
 
 def test_parallel_context_lifecycle_and_local_groups():

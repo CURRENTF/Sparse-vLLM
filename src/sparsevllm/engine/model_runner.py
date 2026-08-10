@@ -153,10 +153,8 @@ class ModelRunner:
                 hf_config.model_type == "glm4_moe_lite"
                 and bool(config.decode_cuda_graph)
                 and config.tensor_parallel_size == 2
-                and config.expert_parallel_size == 1
                 and config.data_parallel_size == 1
                 and self.platform.is_cuda()
-                and self.platform.get_device_caps(rank).compute_capability == (9, 0)
             ),
         )
         if self.parallel_context.all_reduce_provider is not None:

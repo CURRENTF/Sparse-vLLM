@@ -7,6 +7,7 @@ from sparsevllm.utils.log import logger
 from sparsevllm.utils.context import get_context
 
 from sparsevllm.layers.activation import SiluAndMul
+from sparsevllm.operators.activation import SiluAndMulProvider
 from sparsevllm.layers.attention import Attention
 from sparsevllm.layers.layernorm import RMSNorm
 from sparsevllm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
@@ -170,6 +171,7 @@ class Qwen3MLP(nn.Module):
         mlp_chunk_size: int = 16384,
         quantization=None,
         reduce_results: bool = True,
+        activation_provider: SiluAndMulProvider | None = None,
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
@@ -186,7 +188,7 @@ class Qwen3MLP(nn.Module):
             reduce_results=reduce_results,
         )
         assert hidden_act == "silu"
-        self.act_fn = SiluAndMul()
+        self.act_fn = SiluAndMul(provider=activation_provider)
         self.mlp_chunk_size = int(mlp_chunk_size)
         if self.mlp_chunk_size <= 0:
             raise ValueError(f"mlp_chunk_size must be > 0, got {mlp_chunk_size}.")

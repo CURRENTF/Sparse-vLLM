@@ -9,6 +9,7 @@ import torch.distributed as dist
 
 from sparsevllm.distributed.topology import ParallelTopology, parallel_group_ranks
 from sparsevllm.operators.all_reduce import AllReduceProvider, resolve_all_reduce_provider
+from sparsevllm.utils.log import logger
 
 
 class GraphAllReduceProvider(Protocol):
@@ -330,10 +331,26 @@ def init_parallel_context(
             FlashInferCustomAllReduce,
         )
 
-        _PARALLEL_CONTEXT = replace(
-            _PARALLEL_CONTEXT,
-            all_reduce_provider=FlashInferCustomAllReduce(_PARALLEL_CONTEXT.tensor),
-        )
+        group = _PARALLEL_CONTEXT.tensor
+        local_reason = FlashInferCustomAllReduce.unsupported_reason(group)
+        rank_reasons = [None] * group.size
+        dist.all_gather_object(rank_reasons, local_reason, group=group.process_group)
+        unsupported = [
+            (rank, reason)
+            for rank, reason in zip(group.ranks, rank_reasons)
+            if reason is not None
+        ]
+        if unsupported:
+            logger.info(
+                "Using NCCL TP all-reduce because FlashInfer custom all-reduce "
+                "is unsupported on ranks {}.",
+                unsupported,
+            )
+        else:
+            _PARALLEL_CONTEXT = replace(
+                _PARALLEL_CONTEXT,
+                all_reduce_provider=FlashInferCustomAllReduce(group),
+            )
     return _PARALLEL_CONTEXT
 
 

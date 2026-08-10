@@ -16,6 +16,65 @@ if TYPE_CHECKING:
 class FlashInferCustomAllReduce:
     """Small-tensor TP all-reduce using FlashInfer's vLLM kernel."""
 
+    _REQUIRED_COMM_APIS = (
+        "CudaRTLibrary",
+        "create_shared_buffer",
+        "vllm_all_reduce",
+        "vllm_dispose",
+        "vllm_get_graph_buffer_ipc_meta",
+        "vllm_init_custom_ar",
+        "vllm_meta_size",
+        "vllm_register_buffer",
+        "vllm_register_graph_buffers",
+    )
+
+    @classmethod
+    def unsupported_reason(cls, group: ParallelGroup) -> str | None:
+        """Return why this group cannot use the provider, or ``None``."""
+
+        if group.size != 2 or group.process_group is None:
+            return "requires a two-rank process group"
+        if dist.get_backend(group.process_group) != dist.Backend.NCCL:
+            return "requires an NCCL process group"
+        if not torch.cuda.is_available():
+            return "requires CUDA"
+
+        device_count = int(torch.cuda.device_count())
+        if any(rank < 0 or rank >= device_count for rank in group.ranks):
+            return (
+                "requires all group ranks to map to visible local CUDA devices, "
+                f"got ranks={group.ranks}, device_count={device_count}"
+            )
+        current_device = int(torch.cuda.current_device())
+        capability = tuple(
+            int(value) for value in torch.cuda.get_device_capability(current_device)
+        )
+        if capability != (9, 0):
+            return f"requires CUDA SM90, got {capability}"
+        expected_device = int(group.ranks[group.rank])
+        if current_device != expected_device:
+            return (
+                "requires world-rank-to-device mapping for CUDA IPC, "
+                f"got current_device={current_device}, expected={expected_device}"
+            )
+        for peer_rank, peer_device in enumerate(group.ranks):
+            if peer_rank == group.rank:
+                continue
+            if not torch.cuda.can_device_access_peer(current_device, peer_device):
+                return (
+                    "requires CUDA peer access between all ranks, "
+                    f"missing {current_device}->{peer_device} for ranks={group.ranks}"
+                )
+
+        try:
+            from flashinfer import comm
+        except (ImportError, OSError, RuntimeError) as exc:
+            return f"FlashInfer communication APIs are unavailable: {exc}"
+        missing = [name for name in cls._REQUIRED_COMM_APIS if not hasattr(comm, name)]
+        if missing:
+            return "FlashInfer communication APIs are missing: " + ", ".join(missing)
+        return None
+
     def __init__(
         self,
         group: ParallelGroup,
@@ -23,25 +82,16 @@ class FlashInferCustomAllReduce:
         max_size_bytes: int = 8 * 1024 * 1024,
         num_ctas: int = 32,
     ) -> None:
-        if group.size != 2 or group.process_group is None:
-            raise ValueError(
-                "FlashInfer custom all-reduce requires a two-rank process group."
-            )
-        if dist.get_backend(group.process_group) != dist.Backend.NCCL:
-            raise ValueError("FlashInfer custom all-reduce requires an NCCL group.")
         if max_size_bytes <= 0 or num_ctas <= 0:
             raise ValueError(
                 "FlashInfer custom all-reduce sizes must be positive, got "
                 f"max_size_bytes={max_size_bytes}, num_ctas={num_ctas}."
             )
-        if not all(
-            torch.cuda.can_device_access_peer(group.rank, peer_rank)
-            for peer_rank in range(group.size)
-            if peer_rank != group.rank
-        ):
+        unsupported_reason = self.unsupported_reason(group)
+        if unsupported_reason is not None:
             raise RuntimeError(
-                "FlashInfer custom all-reduce requires CUDA peer access between "
-                f"all ranks in {group.ranks}."
+                "FlashInfer custom all-reduce is unsupported: "
+                f"{unsupported_reason}."
             )
 
         from flashinfer.comm import (

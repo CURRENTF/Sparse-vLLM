@@ -80,6 +80,12 @@ def sgl_moe_alignment_support() -> tuple[bool, str]:
     return _sgl_moe_support("MoE alignment")
 
 
+def sgl_moe_ep_alignment_support() -> tuple[bool, str]:
+    """Check the invalid-route filtering required by expert parallelism."""
+
+    return _sgl_moe_support("MoE EP alignment")
+
+
 class SglGlmFusedMoeGate:
     """One-kernel sigmoid, biased top-k, normalization, and route scaling."""
 
@@ -168,13 +174,42 @@ def sgl_moe_align_block_size(
     local_expert_start: int,
     local_expert_end: int,
 ) -> MoeAlignment:
-    """Build a full-expert MoE assignment with the SGL CUDA kernel."""
+    """Build a local MoE assignment with the SGL CUDA kernel."""
 
-    if (int(local_expert_start), int(local_expert_end)) != (0, int(num_experts)):
-        raise ValueError("SGL MoE alignment currently requires EP size 1.")
-    num_assignments = int(topk_ids.numel())
+    local_expert_start = int(local_expert_start)
+    local_expert_end = int(local_expert_end)
+    num_local_experts = local_expert_end - local_expert_start
+    if not 0 <= local_expert_start < local_expert_end <= int(num_experts):
+        raise ValueError(
+            "Invalid local expert range "
+            f"[{local_expert_start}, {local_expert_end}) for {num_experts} experts."
+        )
+    supported, reason = sgl_moe_alignment_support()
+    if not supported:
+        raise RuntimeError(reason)
+    installed = _installed_sgl_kernel_version()
+    if installed is None:
+        raise RuntimeError("sgl-kernel package metadata is unavailable")
+    _, parsed = installed
+
+    local_topk_ids = topk_ids
+    has_remote_experts = num_local_experts != int(num_experts)
+    ignore_invalid_expert = has_remote_experts and parsed[:2] == (0, 4)
+    if num_local_experts != int(num_experts):
+        from sparsevllm.triton_kernel.moe import localize_expert_ids
+
+        local_topk_ids = localize_expert_ids(
+            topk_ids,
+            local_expert_start=local_expert_start,
+            local_expert_end=local_expert_end,
+            remote_expert_id=-1 if ignore_invalid_expert else num_local_experts,
+        )
+    num_assignments = int(local_topk_ids.numel())
+    padding_experts = num_local_experts + int(
+        has_remote_experts and parsed[:2] == (0, 3)
+    )
     max_num_tokens_padded = triton.cdiv(
-        num_assignments + int(num_experts) * (int(block_size) - 1),
+        num_assignments + padding_experts * (int(block_size) - 1),
         int(block_size),
     ) * int(block_size)
     sorted_token_ids = torch.empty(
@@ -193,25 +228,18 @@ def sgl_moe_align_block_size(
         device=topk_ids.device,
     )
     cumsum_buffer = torch.empty(
-        int(num_experts) + 1,
+        num_local_experts + 1,
         dtype=torch.int32,
         device=topk_ids.device,
     )
-    supported, reason = sgl_moe_alignment_support()
-    if not supported:
-        raise RuntimeError(reason)
-    installed = _installed_sgl_kernel_version()
-    if installed is None:
-        raise RuntimeError("sgl-kernel package metadata is unavailable")
-    _, parsed = installed
     from sgl_kernel import moe_align_block_size
 
     # Both validated APIs iterate to num_experts - 1. The extra empty logical
     # expert makes the complete [0, num_experts) range participate.
     if parsed[:2] == (0, 3):
         moe_align_block_size(
-            topk_ids,
-            int(num_experts) + 1,
+            local_topk_ids,
+            num_local_experts + 1,
             int(block_size),
             sorted_token_ids,
             expert_ids,
@@ -221,15 +249,15 @@ def sgl_moe_align_block_size(
         )
     else:
         moe_align_block_size(
-            topk_ids,
-            int(num_experts) + 1,
+            local_topk_ids,
+            num_local_experts + 1,
             int(block_size),
             sorted_token_ids,
             expert_ids,
             num_tokens_post_padded,
             cumsum_buffer,
             True,
-            False,
+            ignore_invalid_expert,
         )
     return MoeAlignment(
         sorted_token_ids=sorted_token_ids,
@@ -244,5 +272,6 @@ __all__ = [
     "SglGlmFusedMoeGate",
     "sgl_fused_moe_gate_support",
     "sgl_moe_alignment_support",
+    "sgl_moe_ep_alignment_support",
     "sgl_moe_align_block_size",
 ]

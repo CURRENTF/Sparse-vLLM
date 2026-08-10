@@ -30,6 +30,7 @@ from sparsevllm.layers.packed_moe import PackedMoeExperts
 from sparsevllm.layers.rotary_embedding import RotaryEmbedding, get_rope
 from sparsevllm.models.qwen3 import Qwen3MLP
 from sparsevllm.operators.mla_attention import MlaAttentionOpSpec
+from sparsevllm.operators.activation import resolve_silu_and_mul_provider
 from sparsevllm.operators.moe import (
     MoeOpSpec,
     model_activation_dtype,
@@ -472,7 +473,11 @@ class Glm4MoeLitePackedExperts(PackedMoeExperts):
         self.shared_expert_id = (
             self.routed_num_experts if self.fuses_shared_decode else None
         )
-        self.shared_act = SiluAndMul()
+        self.shared_act = SiluAndMul(
+            provider=resolve_silu_and_mul_provider(
+                activation_dtype=model_activation_dtype(config),
+            )
+        )
         if self.fuses_shared_decode:
             self.routed_op_spec = MoeOpSpec(
                 num_experts=self.routed_num_experts,
@@ -578,6 +583,9 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
                 mlp_chunk_size=self.mlp_chunk_size,
                 quantization=None,
                 reduce_results=False,
+                activation_provider=resolve_silu_and_mul_provider(
+                    activation_dtype=model_activation_dtype(config),
+                ),
             )
         )
 
@@ -763,6 +771,9 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
                 hidden_act=str(config.hidden_act),
                 mlp_chunk_size=int(mlp_chunk_size),
                 quantization=None,
+                activation_provider=resolve_silu_and_mul_provider(
+                    activation_dtype=model_activation_dtype(config),
+                ),
             )
         elif layer_type == "sparse":
             self.mlp = Glm4MoeLiteSparseMoeBlock(

@@ -29,6 +29,66 @@ class MoeAlignment:
 
 
 @triton.jit
+def _localize_expert_ids_kernel(
+    input_ids_ptr,
+    output_ids_ptr,
+    num_assignments,
+    local_expert_start: tl.constexpr,
+    local_expert_end: tl.constexpr,
+    remote_expert_id: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    valid = offsets < num_assignments
+    expert_ids = tl.load(input_ids_ptr + offsets, mask=valid, other=-1)
+    local_ids = tl.where(
+        (expert_ids >= local_expert_start) & (expert_ids < local_expert_end),
+        expert_ids - local_expert_start,
+        remote_expert_id,
+    )
+    tl.store(output_ids_ptr + offsets, local_ids, mask=valid)
+
+
+def localize_expert_ids(
+    expert_ids: torch.Tensor,
+    *,
+    local_expert_start: int,
+    local_expert_end: int,
+    remote_expert_id: int = -1,
+) -> torch.Tensor:
+    """Map global expert IDs to one EP shard and encode remote routes."""
+
+    if not expert_ids.is_cuda or not expert_ids.is_contiguous():
+        raise ValueError("Expert ID localization requires a contiguous CUDA tensor.")
+    if expert_ids.dtype not in (torch.int32, torch.int64):
+        raise TypeError("Expert ID localization requires int32 or int64 IDs.")
+    if expert_ids.numel() <= 0:
+        raise ValueError("Expert ID localization requires at least one ID.")
+    local_expert_start = int(local_expert_start)
+    local_expert_end = int(local_expert_end)
+    remote_expert_id = int(remote_expert_id)
+    if not 0 <= local_expert_start < local_expert_end:
+        raise ValueError(
+            "Invalid local expert range "
+            f"[{local_expert_start}, {local_expert_end})."
+        )
+    output = torch.empty_like(expert_ids, dtype=torch.int32)
+    block_size = 256
+    _localize_expert_ids_kernel[
+        (triton.cdiv(int(expert_ids.numel()), block_size),)
+    ](
+        expert_ids,
+        output,
+        int(expert_ids.numel()),
+        local_expert_start=local_expert_start,
+        local_expert_end=local_expert_end,
+        remote_expert_id=remote_expert_id,
+        BLOCK_SIZE=block_size,
+    )
+    return output
+
+
+@triton.jit
 def _append_shared_expert_route_kernel(
     input_ids_ptr,
     input_weights_ptr,

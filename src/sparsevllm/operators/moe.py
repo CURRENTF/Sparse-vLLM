@@ -191,6 +191,7 @@ class SglAlignedTritonGlmMoeProvider(MoeProvider):
         expected = {
             (64, 64, 2048, 768, 4, 2, 1, "biased_sigmoid"),
             (65, 65, 2048, 768, 5, 2, 1, "biased_sigmoid"),
+            (64, 32, 2048, 1536, 4, 1, 2, "biased_sigmoid"),
         }
         actual = (
             spec.num_experts,
@@ -210,9 +211,15 @@ class SglAlignedTritonGlmMoeProvider(MoeProvider):
             return SupportResult.no("requires BF16 activations")
         if spec.weight_dtype != torch.bfloat16 or spec.block_shape is not None:
             return SupportResult.no("requires unquantized BF16 expert weights")
-        from sparsevllm.operators.sgl_moe import sgl_moe_alignment_support
+        from sparsevllm.operators.sgl_moe import (
+            sgl_moe_alignment_support,
+            sgl_moe_ep_alignment_support,
+        )
 
-        supported, reason = sgl_moe_alignment_support()
+        if spec.ep_size > 1:
+            supported, reason = sgl_moe_ep_alignment_support()
+        else:
+            supported, reason = sgl_moe_alignment_support()
         return SupportResult.yes() if supported else SupportResult.no(reason)
 
     def run(
@@ -235,6 +242,13 @@ class SglAlignedTritonGlmMoeProvider(MoeProvider):
         from sparsevllm.operators.sgl_moe import sgl_moe_align_block_size
         from sparsevllm.triton_kernel.moe import fused_moe
 
+        alignment_impl = None
+        num_tokens = int(hidden_states.shape[0])
+        if (
+            num_tokens <= 64
+            and num_tokens * int(spec.top_k) * 4 > int(spec.num_experts)
+        ):
+            alignment_impl = sgl_moe_align_block_size
         return fused_moe(
             hidden_states,
             w13_weight,
@@ -243,7 +257,7 @@ class SglAlignedTritonGlmMoeProvider(MoeProvider):
             topk_weights,
             num_experts=spec.num_experts,
             local_expert_start=local_expert_start,
-            alignment_impl=sgl_moe_align_block_size,
+            alignment_impl=alignment_impl,
         )
 
 
