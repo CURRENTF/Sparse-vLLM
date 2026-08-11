@@ -366,6 +366,35 @@ def test_hopper_fused_moe_uses_profiled_tp_ep_shape():
     assert resolved.provider.name == "triton_hopper_fused"
 
 
+def test_h20_qwen36_bf16_moe_uses_profiled_provider():
+    spec = _moe_spec(
+        activation_dtype=torch.bfloat16,
+        weight_dtype=torch.bfloat16,
+        block_shape=None,
+        hidden_size=2048,
+        intermediate_size=512,
+        num_local_experts=256,
+        num_experts=256,
+        top_k=8,
+        ep_size=1,
+        tp_size=1,
+    )
+
+    resolved = OpResolver(MOE_REGISTRY).resolve(
+        spec,
+        _cuda_caps((9, 0), native_fp8=False, device_name="NVIDIA H20"),
+    )
+
+    assert resolved.provider.name == "h20_qwen36_fused_bf16"
+    h100 = OpResolver(MOE_REGISTRY).resolve(
+        spec,
+        _cuda_caps(
+            (9, 0), native_fp8=False, device_name="NVIDIA H100 80GB HBM3"
+        ),
+    )
+    assert h100.provider.name == "triton"
+
+
 @pytest.mark.parametrize(
     ("tp_size", "ep_size", "intermediate_size", "num_local_experts"),
     [(4, 1, 384, 256), (2, 2, 768, 128), (1, 4, 1536, 64)],

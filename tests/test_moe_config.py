@@ -106,6 +106,32 @@ def test_h20_qwen3_moe_config_is_shape_and_stage_aware():
     assert large.block_m == 64
 
 
+def test_h20_qwen36_decode_uses_profiled_bf16_configs():
+    common = dict(
+        dtype=torch.bfloat16,
+        num_tokens=1,
+        top_k=8,
+        num_local_experts=256,
+        hidden_size=2048,
+        intermediate_size=512,
+        device_name="NVIDIA H20",
+        device_capability=(9, 0),
+    )
+    w13 = resolve_moe_gemm_config(**common, stage="w13")
+    fused = resolve_moe_gemm_config(**common, stage="gate_up_swiglu")
+    w2 = resolve_moe_gemm_config(**common, stage="w2")
+
+    assert (w13.block_n, w13.block_k, w13.num_stages) == (32, 64, 4)
+    assert fused == w13
+    assert (w2.block_n, w2.block_k, w2.num_stages) == (32, 64, 3)
+
+    unprofiled = resolve_moe_gemm_config(
+        **{**common, "num_tokens": 2},
+        stage="w13",
+    )
+    assert (unprofiled.block_n, unprofiled.block_k) == (128, 32)
+
+
 def test_fallback_heuristic_uses_logical_assignment_count():
     common = dict(
         dtype=torch.float16,

@@ -107,9 +107,13 @@ def _stage_table(
     }
 
 
-# Qwen3-30B-A3B BF16 profiles tuned offline on H20. Profiles are keyed by the
-# kernel-relevant hardware and GEMM shape rather than by model name.
+# BF16 profiles are keyed by kernel-relevant hardware and GEMM shape rather
+# than by model name.
 _TUNED_CONFIGS = {
+    MoeGemmShape("H20", (9, 0), torch.bfloat16, 8, 256, 2048, 512): {
+        "w13": {1: _G},
+        "w2": {1: _H},
+    },
     MoeGemmShape("H20", (9, 0), torch.bfloat16, 8, 128, 2048, 768): _stage_table(
         (_D, _D, _D, _A, _A, _A, _B, _B, _B, _F, _F, _F),
         (_D, _D, _D, _B, _B, _B, _B, _B, _B, _F, _F, _F),
@@ -137,9 +141,18 @@ _TUNED_CONFIGS = {
 }
 
 
-# BF16 TP2 expert shards profiled on H100. The fused stage has two FP32
-# accumulators, so reusing the unfused W13 tile creates register pressure.
+# The fused BF16 stage has two FP32 accumulators, so reusing a wide unfused W13
+# tile can create register pressure.
 _TUNED_GATE_UP_SWIGLU_CONFIGS = {
+    MoeGemmShape(
+        "H20",
+        (9, 0),
+        torch.bfloat16,
+        8,
+        256,
+        2048,
+        512,
+    ): {1: _G},
     MoeGemmShape(
         "NVIDIA H100 80GB HBM3",
         (9, 0),
@@ -253,7 +266,9 @@ def _resolve_moe_gemm_config(
     if stage == "gate_up_swiglu":
         fused_table = _TUNED_GATE_UP_SWIGLU_CONFIGS.get(shape)
         if fused_table is not None:
-            return fused_table[token_bucket(num_tokens)]
+            tuned = fused_table.get(token_bucket(num_tokens))
+            if tuned is not None:
+                return tuned
         assignments = num_tokens * top_k
         return MoeGemmConfig(
             block_m=16,
@@ -264,7 +279,9 @@ def _resolve_moe_gemm_config(
             num_stages=4 if assignments <= 64 else 3,
         )
     if table is not None:
-        return table[stage][token_bucket(num_tokens)]
+        tuned = table[stage].get(token_bucket(num_tokens))
+        if tuned is not None:
+            return tuned
 
     output_size = 2 * intermediate_size if stage == "w13" else hidden_size
     return _heuristic_config(

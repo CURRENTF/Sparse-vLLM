@@ -356,6 +356,8 @@ class TritonHopperFusedMoeProvider(MoeProvider):
     name = "triton_hopper_fused"
     priority = 20
     gate_up_order = "gate_up"
+    PROFILED_DEVICE_NAME = "NVIDIA H100 80GB HBM3"
+    PROFILED_SHAPE = (128, 64, 2048, 384, 8, 2, 2)
 
     @classmethod
     def supports(cls, spec: MoeOpSpec, caps: DeviceCaps) -> SupportResult:
@@ -373,14 +375,13 @@ class TritonHopperFusedMoeProvider(MoeProvider):
             )
         if spec.weight_dtype != torch.bfloat16 or spec.block_shape is not None:
             return SupportResult.no("requires unquantized BF16 expert weights")
-        if caps.device_name != "NVIDIA H100 80GB HBM3":
+        if caps.device_name != cls.PROFILED_DEVICE_NAME:
             return SupportResult.no(
-                "requires profiled NVIDIA H100 80GB HBM3 hardware, "
+                f"requires profiled {cls.PROFILED_DEVICE_NAME} hardware, "
                 f"got {caps.device_name}"
             )
         if not caps.supports_bfloat16:
             return SupportResult.no("device does not support BF16")
-        profiled_shape = (128, 64, 2048, 384, 8, 2, 2)
         actual_shape = (
             spec.num_experts,
             spec.num_local_experts,
@@ -390,10 +391,10 @@ class TritonHopperFusedMoeProvider(MoeProvider):
             spec.tp_size,
             spec.ep_size,
         )
-        if actual_shape != profiled_shape:
+        if actual_shape != cls.PROFILED_SHAPE:
             return SupportResult.no(
-                "requires profiled TP2xEP2 MoE shape "
-                f"{profiled_shape}, got {actual_shape}"
+                "requires profiled MoE shape "
+                f"{cls.PROFILED_SHAPE}, got {actual_shape}"
             )
         return SupportResult.yes()
 
@@ -425,6 +426,14 @@ class TritonHopperFusedMoeProvider(MoeProvider):
             num_experts=spec.num_experts,
             local_expert_start=local_expert_start,
         )
+
+
+@MOE_REGISTRY.register
+class H20Qwen36FusedMoeProvider(TritonHopperFusedMoeProvider):
+    name = "h20_qwen36_fused_bf16"
+    priority = 21
+    PROFILED_DEVICE_NAME = "NVIDIA H20"
+    PROFILED_SHAPE = (256, 256, 2048, 512, 8, 1, 1)
 
 
 @MOE_REGISTRY.register
