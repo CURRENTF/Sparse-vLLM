@@ -93,6 +93,7 @@ _D = MoeGemmConfig(16, 128, 32, 8, 4, 4)
 _F = MoeGemmConfig(64, 64, 64, 8, 8, 3)
 _G = MoeGemmConfig(16, 32, 64, 8, 4, 4)
 _H = MoeGemmConfig(16, 32, 64, 8, 4, 3)
+_I = MoeGemmConfig(16, 64, 64, 8, 4, 4)
 
 
 def _stage_table(
@@ -113,6 +114,14 @@ _TUNED_CONFIGS = {
     MoeGemmShape("H20", (9, 0), torch.bfloat16, 8, 256, 2048, 512): {
         "w13": {1: _G},
         "w2": {1: _H},
+    },
+    MoeGemmShape("H20", (9, 0), torch.bfloat16, 8, 256, 2048, 256): {
+        "w13": {1: _G},
+        "w2": {1: _H},
+    },
+    MoeGemmShape("H20", (9, 0), torch.bfloat16, 8, 128, 2048, 512): {
+        "w13": {1: _G},
+        "w2": {1: _I},
     },
     MoeGemmShape("H20", (9, 0), torch.bfloat16, 8, 128, 2048, 768): _stage_table(
         (_D, _D, _D, _A, _A, _A, _B, _B, _B, _F, _F, _F),
@@ -150,6 +159,24 @@ _TUNED_GATE_UP_SWIGLU_CONFIGS = {
         torch.bfloat16,
         8,
         256,
+        2048,
+        512,
+    ): {1: _G},
+    MoeGemmShape(
+        "H20",
+        (9, 0),
+        torch.bfloat16,
+        8,
+        256,
+        2048,
+        256,
+    ): {1: _G},
+    MoeGemmShape(
+        "H20",
+        (9, 0),
+        torch.bfloat16,
+        8,
+        128,
         2048,
         512,
     ): {1: _G},

@@ -357,7 +357,7 @@ class TritonHopperFusedMoeProvider(MoeProvider):
     priority = 20
     gate_up_order = "gate_up"
     PROFILED_DEVICE_NAME = "NVIDIA H100 80GB HBM3"
-    PROFILED_SHAPE = (128, 64, 2048, 384, 8, 2, 2)
+    PROFILED_SHAPES = ((128, 64, 2048, 384, 8, 2, 2),)
 
     @classmethod
     def supports(cls, spec: MoeOpSpec, caps: DeviceCaps) -> SupportResult:
@@ -391,10 +391,10 @@ class TritonHopperFusedMoeProvider(MoeProvider):
             spec.tp_size,
             spec.ep_size,
         )
-        if actual_shape != cls.PROFILED_SHAPE:
+        if actual_shape not in cls.PROFILED_SHAPES:
             return SupportResult.no(
-                "requires profiled MoE shape "
-                f"{cls.PROFILED_SHAPE}, got {actual_shape}"
+                "requires a profiled MoE shape in "
+                f"{cls.PROFILED_SHAPES}, got {actual_shape}"
             )
         return SupportResult.yes()
 
@@ -433,7 +433,11 @@ class H20Qwen36FusedMoeProvider(TritonHopperFusedMoeProvider):
     name = "h20_qwen36_fused_bf16"
     priority = 21
     PROFILED_DEVICE_NAME = "NVIDIA H20"
-    PROFILED_SHAPE = (256, 256, 2048, 512, 8, 1, 1)
+    PROFILED_SHAPES = (
+        (256, 256, 2048, 512, 8, 1, 1),
+        (256, 256, 2048, 256, 8, 2, 1),
+        (256, 128, 2048, 512, 8, 1, 2),
+    )
 
 
 @MOE_REGISTRY.register

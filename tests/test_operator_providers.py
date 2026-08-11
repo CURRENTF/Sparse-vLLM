@@ -366,18 +366,27 @@ def test_hopper_fused_moe_uses_profiled_tp_ep_shape():
     assert resolved.provider.name == "triton_hopper_fused"
 
 
-def test_h20_qwen36_bf16_moe_uses_profiled_provider():
+@pytest.mark.parametrize(
+    ("tp_size", "ep_size", "intermediate_size", "num_local_experts"),
+    [(1, 1, 512, 256), (2, 1, 256, 256), (1, 2, 512, 128)],
+)
+def test_h20_qwen36_bf16_moe_uses_profiled_provider(
+    tp_size,
+    ep_size,
+    intermediate_size,
+    num_local_experts,
+):
     spec = _moe_spec(
         activation_dtype=torch.bfloat16,
         weight_dtype=torch.bfloat16,
         block_shape=None,
         hidden_size=2048,
-        intermediate_size=512,
-        num_local_experts=256,
+        intermediate_size=intermediate_size,
+        num_local_experts=num_local_experts,
         num_experts=256,
         top_k=8,
-        ep_size=1,
-        tp_size=1,
+        ep_size=ep_size,
+        tp_size=tp_size,
     )
 
     resolved = OpResolver(MOE_REGISTRY).resolve(

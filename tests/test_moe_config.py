@@ -132,6 +132,32 @@ def test_h20_qwen36_decode_uses_profiled_bf16_configs():
     assert (unprofiled.block_n, unprofiled.block_k) == (128, 32)
 
 
+@pytest.mark.parametrize(
+    ("num_local_experts", "intermediate_size", "expected_w2"),
+    [(256, 256, (32, 64, 3)), (128, 512, (64, 64, 4))],
+)
+def test_h20_qwen36_parallel_decode_uses_profiled_bf16_configs(
+    num_local_experts,
+    intermediate_size,
+    expected_w2,
+):
+    common = dict(
+        dtype=torch.bfloat16,
+        num_tokens=1,
+        top_k=8,
+        num_local_experts=num_local_experts,
+        hidden_size=2048,
+        intermediate_size=intermediate_size,
+        device_name="NVIDIA H20",
+        device_capability=(9, 0),
+    )
+
+    fused = resolve_moe_gemm_config(**common, stage="gate_up_swiglu")
+    w2 = resolve_moe_gemm_config(**common, stage="w2")
+    assert (fused.block_n, fused.block_k, fused.num_stages) == (32, 64, 4)
+    assert (w2.block_n, w2.block_k, w2.num_stages) == expected_w2
+
+
 def test_fallback_heuristic_uses_logical_assignment_count():
     common = dict(
         dtype=torch.float16,
