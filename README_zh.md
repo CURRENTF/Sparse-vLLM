@@ -58,7 +58,7 @@ Sparse-vLLM 支持物理淘汰、逻辑掩码、查询感知选择和混合 KV �
 | Qwen3 | ✅ |
 | Qwen3MoE | ✅ |
 | Qwen3.5 / Qwen3.6 | ✅ |
-| Qwen3.6 MoE | ✅（仅 BF16 纯文本） |
+| Qwen3.5 / Qwen3.6 MoE | ✅ |
 | Llama 3 / 3.1 | ✅ |
 | MiniMax M2.7 | ✅ |
 

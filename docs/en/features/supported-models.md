@@ -16,7 +16,7 @@ parallel size must use that value.
 | Qwen3 Dense | `qwen3` | BF16 / FP16 / block FP8 | ✅ (FP8: 1/2/4/8) | 1 only | 1 only |
 | Qwen3MoE | `qwen3_moe` | BF16 / FP16 / block FP8 | ✅ (TP > 1: BF16 model dtype only) | 1 only | ✅ |
 | Qwen3.5 / Qwen3.6 | `qwen3_5` | BF16 / block FP8 | ✅ | 1 only | 1 only |
-| Qwen3.6 MoE | `qwen3_5_moe` | BF16 / block FP8 | 1/2 | 1 only | ✅ |
+| Qwen3.6 MoE | `qwen3_5_moe` | BF16 / block FP8 | ✅ | 1 only | ✅ |
 | Llama 3 / 3.1 | `llama` | BF16 / FP16 | ✅ | 1 only | 1 only |
 | MiniMax M2.7 | `minimax_m2` | block FP8 with BF16 non-quantized weights | ✅ | 1 only | ✅ |
 
@@ -31,15 +31,6 @@ the distributed world size is `T`. This layout requires `DP=1` and `T % E ==
 dimension must be divisible by `T / E`. Qwen3MoE outer TP requires a BF16
 model dtype; FP16 Qwen3MoE checkpoints are limited to `TP=1`. When `TP=1`,
 the existing EP layout uses world size `E`.
-
-Qwen3.6 MoE always uses the outer-TP layout: attention and Gated DeltaNet TP
-are `T`, MoE EP is `E`, MoE TP is `T / E`, and world size is `T`. It requires
-`DP=1`, `T % E == 0`, and BF16 activations with either BF16 or block FP8
-language-model weights. The runtime is text-only, rejects image/video and MTP
-inputs, and captures decode (not prefill) with CUDA Graph. Sparse methods apply
-only to the full-attention layers; Gated DeltaNet layers keep their recurrent
-state path. Outer TP is limited to 1 or 2 by the two KV heads; FP8 also requires
-every TP-local quantized Linear dimension to remain 128-aligned.
 
 Block FP8 support requires E4M3 weights, dynamic activation quantization, and
 a `128 x 128` weight block size. Qwen3.5/Qwen3.6 dense configurations are
