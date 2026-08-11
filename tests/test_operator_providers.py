@@ -592,6 +592,25 @@ def test_qwen36_hybrid_moe_uses_profiled_single_gpu_shape_on_h100():
     assert resolved.provider.gate_up_order == "up_gate"
 
 
+def test_qwen36_pure_tp_uses_triton_for_sharded_experts():
+    spec = _moe_spec(
+        hidden_size=2048,
+        intermediate_size=256,
+        num_local_experts=256,
+        num_experts=256,
+        top_k=8,
+        ep_size=1,
+        tp_size=2,
+    )
+    with patch("sparsevllm.operators.moe.find_spec", return_value=object()):
+        resolved = OpResolver(MOE_REGISTRY).resolve(
+            spec,
+            _cuda_caps((9, 0), device_name="NVIDIA H100 80GB HBM3"),
+        )
+
+    assert resolved.provider.name == "triton"
+
+
 @pytest.mark.parametrize(
     ("spec_overrides", "caps_overrides", "reason"),
     [
