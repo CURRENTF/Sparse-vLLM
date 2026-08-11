@@ -23,7 +23,7 @@ def _implementation_name(provider: object) -> str:
     return getattr(provider, "implementation_name", None) or getattr(provider, "name", None) or provider.provider_name
 
 
-def log_operator_implementations(world_rank: int) -> None:
+def log_operator_implementations() -> None:
     entries = sorted(
         (
             operator_type,
@@ -35,7 +35,7 @@ def log_operator_implementations(world_rank: int) -> None:
     if not entries:
         return
     rows = "\n".join(f"  {operator_type}: {implementation}" for operator_type, implementation in entries)
-    logger.info("Operator implementations (rank {}):\n{}", world_rank, rows)
+    logger.info("Operator implementations:\n{}", rows)
 
 
 def runtime_version_at_least(

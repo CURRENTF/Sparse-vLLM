@@ -100,14 +100,17 @@ def test_prefix_offload_release_rpcs_use_failure_synchronized_world_path():
 
 
 def test_operator_implementation_log_is_aligned_and_failure_synchronized():
-    runner = object.__new__(ModelRunner)
-    runner.parallel_context = SimpleNamespace(world_rank=2)
+    rank_zero = object.__new__(ModelRunner)
+    rank_zero.parallel_context = SimpleNamespace(world_rank=0)
+    rank_one = object.__new__(ModelRunner)
+    rank_one.parallel_context = SimpleNamespace(world_rank=1)
 
     with patch.object(operator_registry, "log_operator_implementations") as log_implementations:
-        ModelRunner.log_operator_implementations(runner)
+        ModelRunner.log_operator_implementations(rank_zero)
+        ModelRunner.log_operator_implementations(rank_one)
 
     assert "log_operator_implementations" in TP_RPC_STATUS_SYNC_METHODS
-    log_implementations.assert_called_once_with(2)
+    log_implementations.assert_called_once_with()
 
 
 def test_prefix_offload_release_rpc_surfaces_local_failure_after_status_sync():

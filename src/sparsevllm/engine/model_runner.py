@@ -589,7 +589,8 @@ class ModelRunner:
             self.sparse_controller.clear_decode_attn_score_buffers()
 
     def log_operator_implementations(self) -> None:
-        operator_registry.log_operator_implementations(self.parallel_context.world_rank)
+        if self.parallel_context.world_rank == 0:
+            operator_registry.log_operator_implementations()
 
     def warmup_moe_workspace(self, num_tokens: int) -> None:
         warmup_moe = getattr(self.model, "warmup_moe", None)

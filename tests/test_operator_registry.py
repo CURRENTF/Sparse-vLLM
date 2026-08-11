@@ -176,11 +176,10 @@ def test_operator_organization_logs_live_bound_implementations():
         record_operator_binding("block-scaled FP8 Linear", linear)
         record_operator_binding("block-scaled FP8 Linear", linear_fallback)
 
-        log_operator_implementations(3)
+        log_operator_implementations()
 
     log_info.assert_called_once_with(
-        "Operator implementations (rank {}):\n{}",
-        3,
+        "Operator implementations:\n{}",
         "  Attention: triton\n"
         "  block-scaled FP8 Linear: flashinfer_sm90, triton",
     )
