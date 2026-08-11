@@ -1,5 +1,5 @@
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -124,9 +124,10 @@ def test_hybrid_moe_parallel_context_uses_explicit_groups():
     reset_parallel_context()
     with (
         patch.object(dist, "is_initialized", return_value=True),
-        patch.object(dist, "get_world_size", return_value=4),
-        patch.object(dist, "get_rank", return_value=2),
-        patch.object(dist, "new_group", side_effect=lambda _ranks: object()),
+            patch.object(dist, "get_world_size", return_value=4),
+            patch.object(dist, "get_rank", return_value=2),
+            patch.object(dist, "get_backend", return_value=dist.Backend.GLOO),
+            patch.object(dist, "new_group", side_effect=lambda _ranks: object()),
     ):
         context = init_parallel_context(
             tp_size=4,
@@ -156,6 +157,7 @@ def test_parallel_context_lifecycle_and_local_groups():
         patch.object(dist, "is_initialized", return_value=True),
         patch.object(dist, "get_world_size", return_value=4),
         patch.object(dist, "get_rank", return_value=2),
+        patch.object(dist, "get_backend", return_value=dist.Backend.GLOO),
         patch.object(dist, "new_group", side_effect=new_group),
     ):
         context = init_parallel_context(tp_size=1, ep_size=2, dp_size=2)
@@ -369,6 +371,24 @@ def test_dense_layers_use_tp_group_in_replicated_ep_topology():
     assert column.weight.shape == (16, 8)
     assert row.weight.shape == (16, 8)
     assert embedding.weight.shape == (32, 8)
+
+
+def test_parallel_group_uses_bound_all_reduce_provider():
+    provider = Mock()
+    input_tensor, output_tensor = torch.randn(2), torch.randn(2)
+    provider.run.return_value = output_tensor
+    group = ParallelGroup(
+        process_group=None,
+        ranks=(0, 1),
+        rank=0,
+        size=2,
+        all_reduce_provider=provider,
+    )
+
+    actual = ParallelContext._all_reduce(input_tensor, group)
+
+    assert actual is output_tensor
+    provider.run.assert_called_once_with(input_tensor)
 
 
 def test_cache_kv_heads_depend_on_tp_not_ep():
