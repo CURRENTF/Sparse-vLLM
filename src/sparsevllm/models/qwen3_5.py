@@ -7,7 +7,6 @@ from torch import nn
 import torch.nn.functional as F
 
 from sparsevllm.distributed import get_parallel_context
-from sparsevllm.layers.activation import SiluAndMul
 from sparsevllm.layers.attention import Attention
 from sparsevllm.layers.layernorm import GemmaRMSNorm
 from sparsevllm.layers.linear import (
@@ -15,6 +14,10 @@ from sparsevllm.layers.linear import (
     MergedColumnParallelLinear,
     RowParallelLinear,
     divide,
+)
+from sparsevllm.operators.gate_up_swiglu import (
+    GateUpSwiGLUOpSpec,
+    resolve_gate_up_swiglu_provider,
 )
 from sparsevllm.layers.rotary_embedding import apply_partial_rotary_emb, get_rope
 from sparsevllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
@@ -840,11 +843,32 @@ class Qwen35MLP(nn.Module):
         )
         if getattr(config, "hidden_act", "silu") != "silu":
             raise NotImplementedError(f"qwen3_5 supports hidden_act='silu', got {config.hidden_act!r}.")
-        self.act_fn = SiluAndMul()
+        activation_dtype = getattr(config, "dtype", None) or getattr(
+            config, "torch_dtype", torch.bfloat16
+        )
+        self.gate_up_swiglu_spec = GateUpSwiGLUOpSpec(
+            hidden_size=int(config.hidden_size),
+            intermediate_size=intermediate_size,
+            tp_size=self.gate_up_proj.tp_size,
+            activation_dtype=activation_dtype,
+            weight_dtype=(
+                torch.float8_e4m3fn
+                if self.gate_up_proj.quantized
+                else activation_dtype
+            ),
+            cuda_graph=bool(getattr(config, "decode_cuda_graph", False)),
+        )
+        self.gate_up_swiglu_provider = resolve_gate_up_swiglu_provider(
+            self.gate_up_swiglu_spec
+        )
         self.mlp_chunk_size = int(getattr(config, "mlp_chunk_size", 16384))
 
     def _forward_chunk(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(self.act_fn(self.gate_up_proj(x)))
+        return self.down_proj(
+            self.gate_up_swiglu_provider.run(
+                self.gate_up_swiglu_spec, x, self.gate_up_proj
+            )
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if int(x.shape[0]) <= self.mlp_chunk_size:
