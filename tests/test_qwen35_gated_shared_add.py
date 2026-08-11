@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from sparsevllm.triton_kernel.qwen3_5.gated_shared_add import gated_shared_add
+from sparsevllm.operators.gated_shared_add import gated_shared_add
 
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

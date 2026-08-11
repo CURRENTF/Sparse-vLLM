@@ -19,13 +19,13 @@ from sparsevllm.models.qwen3_5 import (
     Qwen35Model,
 )
 from sparsevllm.models.qwen3_moe import Qwen3MoePackedExperts
+from sparsevllm.operators.gated_shared_add import gated_shared_add
 from sparsevllm.operators.moe import model_activation_dtype
 from sparsevllm.operators.moe_router import (
     MoeRouterOpSpec,
     resolve_moe_router_provider,
 )
 from sparsevllm.platforms import device_runtime
-from sparsevllm.triton_kernel.qwen3_5.gated_shared_add import gated_shared_add
 from sparsevllm.utils.log import logger
 from sparsevllm.utils.weight_target import WeightTarget
 
