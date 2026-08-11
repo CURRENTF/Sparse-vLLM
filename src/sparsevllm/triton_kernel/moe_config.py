@@ -204,8 +204,8 @@ _FP8_N128 = MoeGemmConfig(16, 128, 128, 1, 4, 3)
 _FP8_N128_SWAP_S4 = MoeGemmConfig(16, 128, 128, 1, 4, 4, True)
 
 
-# Qwen3.6-35B-A3B block-FP8 decode profiles tuned offline on H100. Larger
-# token buckets retain the explicit generic configuration until profiled.
+# Qwen3.6-35B-A3B block-FP8 decode profiles. Unprofiled token buckets retain
+# the explicit generic configuration.
 _TUNED_FP8_ROUTED_CONFIGS = {
     MoeGemmShape(
         "H20",

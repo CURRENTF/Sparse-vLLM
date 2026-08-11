@@ -1,10 +1,7 @@
 import pytest
 import torch
 
-from sparsevllm.triton_kernel.gate_up_swiglu import (
-    gate_up_swiglu,
-    resolve_h20_gate_up_swiglu_config,
-)
+from sparsevllm.triton_kernel.gate_up_swiglu import h20_gate_up_swiglu
 
 
 def _is_h20() -> bool:
@@ -26,10 +23,6 @@ def test_h20_gate_up_swiglu_matches_torch(intermediate_size):
     gate, up = projected.chunk(2, dim=-1)
     expected = torch.nn.functional.silu(gate.float()) * up.float()
 
-    actual = gate_up_swiglu(
-        inputs,
-        weight,
-        resolve_h20_gate_up_swiglu_config(1, 2048, intermediate_size),
-    )
+    actual = h20_gate_up_swiglu(inputs, weight)
 
     torch.testing.assert_close(actual.float(), expected, rtol=0.02, atol=0.01)

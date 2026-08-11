@@ -4,27 +4,11 @@ import torch
 import triton
 import triton.language as tl
 
-from sparsevllm.triton_kernel.moe_config import MoeGemmConfig
-
 
 _H20_DECODE_CONFIGS = {
-    (1, 2048, 512): MoeGemmConfig(16, 32, 64, 8, 4, 4),
-    (1, 2048, 256): MoeGemmConfig(16, 32, 64, 8, 4, 4),
+    (2048, 256): dict(block_m=16, block_n=32, block_k=64, warps=4, stages=4),
+    (2048, 512): dict(block_m=16, block_n=32, block_k=64, warps=4, stages=4),
 }
-
-
-def resolve_h20_gate_up_swiglu_config(
-    num_tokens: int,
-    hidden_size: int,
-    intermediate_size: int,
-) -> MoeGemmConfig:
-    shape = (int(num_tokens), int(hidden_size), int(intermediate_size))
-    try:
-        return _H20_DECODE_CONFIGS[shape]
-    except KeyError as error:
-        raise ValueError(
-            f"No H20 gate/up SwiGLU config for shape {shape}."
-        ) from error
 
 
 @triton.jit
@@ -32,55 +16,26 @@ def _gate_up_swiglu_kernel(
     input_ptr,
     weight_ptr,
     output_ptr,
-    M: tl.constexpr,
     N: tl.constexpr,
     K: tl.constexpr,
-    stride_am: tl.constexpr,
-    stride_ak: tl.constexpr,
-    stride_bn: tl.constexpr,
-    stride_bk: tl.constexpr,
-    stride_cm: tl.constexpr,
-    stride_cn: tl.constexpr,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
-    GROUP_SIZE_M: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
 ):
-    pid = tl.program_id(0)
-    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    num_pid_in_group = GROUP_SIZE_M * num_pid_n
-    group_id = pid // num_pid_in_group
-    first_pid_m = group_id * GROUP_SIZE_M
-    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-    pid_m = first_pid_m + (pid % num_pid_in_group) % group_size_m
-    pid_n = (pid % num_pid_in_group) // group_size_m
+    m_offsets = tl.arange(0, BLOCK_M)
+    n_offsets = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
+    k_offsets = tl.arange(0, BLOCK_K)
+    input_ptrs = input_ptr + m_offsets[:, None] * K + k_offsets[None, :]
+    gate_ptrs = weight_ptr + n_offsets[None, :] * K + k_offsets[:, None]
+    up_ptrs = gate_ptrs + N * K
+    gate_accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    up_accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-    m_offsets = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    n_offsets = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    k_offsets = tl.arange(0, BLOCK_SIZE_K)
-    input_ptrs = (
-        input_ptr
-        + m_offsets[:, None] * stride_am
-        + k_offsets[None, :] * stride_ak
-    )
-    gate_ptrs = (
-        weight_ptr
-        + n_offsets[None, :] * stride_bn
-        + k_offsets[:, None] * stride_bk
-    )
-    up_ptrs = gate_ptrs + N * stride_bn
-    gate_accumulator = tl.zeros(
-        (BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32
-    )
-    up_accumulator = tl.zeros(
-        (BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32
-    )
-    for k_start in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        remaining_k = K - k_start * BLOCK_SIZE_K
+    for k_start in range(0, tl.cdiv(K, BLOCK_K)):
+        remaining_k = K - k_start * BLOCK_K
         input_values = tl.load(
             input_ptrs,
-            mask=(m_offsets[:, None] < M)
+            mask=(m_offsets[:, None] == 0)
             & (k_offsets[None, :] < remaining_k),
             other=0.0,
         )
@@ -95,82 +50,48 @@ def _gate_up_swiglu_kernel(
             input_values,
             tl.load(up_ptrs, mask=weight_mask, other=0.0),
         )
-        input_ptrs += BLOCK_SIZE_K * stride_ak
-        gate_ptrs += BLOCK_SIZE_K * stride_bk
-        up_ptrs += BLOCK_SIZE_K * stride_bk
+        input_ptrs += BLOCK_K
+        gate_ptrs += BLOCK_K
+        up_ptrs += BLOCK_K
 
     element_dtype = weight_ptr.dtype.element_ty
     gate = gate_accumulator.to(element_dtype).to(tl.float32)
     up = up_accumulator.to(element_dtype)
     gate = (gate / (1.0 + tl.exp(-gate))).to(element_dtype)
     tl.store(
-        output_ptr
-        + m_offsets[:, None] * stride_cm
-        + n_offsets[None, :] * stride_cn,
+        output_ptr + m_offsets[:, None] * N + n_offsets[None, :],
         gate * up,
-        mask=(m_offsets[:, None] < M) & (n_offsets[None, :] < N),
+        mask=(m_offsets[:, None] == 0) & (n_offsets[None, :] < N),
     )
 
 
-def gate_up_swiglu(
-    inputs: torch.Tensor,
-    weight: torch.Tensor,
-    config: MoeGemmConfig,
-    output: torch.Tensor | None = None,
-) -> torch.Tensor:
-    if (
-        inputs.ndim != 2
-        or weight.ndim != 2
-        or weight.shape[1] != inputs.shape[1]
-    ):
+def h20_gate_up_swiglu(inputs: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    if inputs.ndim != 2 or weight.ndim != 2 or weight.shape[0] % 2:
         raise ValueError(
-            "gate_up_swiglu expects input [M, K] and weight [2N, K], "
-            f"got {tuple(inputs.shape)} and {tuple(weight.shape)}."
+            "h20_gate_up_swiglu expects input [1, K] and weight [2N, K]."
         )
-    if weight.shape[0] % 2:
-        raise ValueError(
-            f"gate_up_swiglu weight rows must be even, got {weight.shape[0]}."
-        )
+    shape = (int(inputs.shape[1]), int(weight.shape[0]) // 2)
+    config = _H20_DECODE_CONFIGS.get(shape)
+    if inputs.shape != (1, shape[0]) or weight.shape != (2 * shape[1], shape[0]) or config is None:
+        raise ValueError(f"No H20 gate/up SwiGLU config for shape {shape}.")
     if inputs.dtype != torch.bfloat16 or weight.dtype != inputs.dtype:
-        raise TypeError("gate_up_swiglu requires matching BF16 inputs and weights.")
+        raise TypeError("h20_gate_up_swiglu requires matching BF16 tensors.")
     if not inputs.is_cuda or weight.device != inputs.device:
-        raise ValueError("gate_up_swiglu requires CUDA tensors on one device.")
+        raise ValueError("h20_gate_up_swiglu requires CUDA tensors on one device.")
     if not inputs.is_contiguous() or not weight.is_contiguous():
-        raise ValueError("gate_up_swiglu requires contiguous inputs and weights.")
+        raise ValueError("h20_gate_up_swiglu requires contiguous tensors.")
 
-    m, k = inputs.shape
-    n = weight.shape[0] // 2
-    output = (
-        torch.empty((m, n), dtype=inputs.dtype, device=inputs.device)
-        if output is None
-        else output
-    )
-    if (
-        output.shape != (m, n)
-        or output.dtype != inputs.dtype
-        or output.device != inputs.device
-    ):
-        raise ValueError(
-            f"gate_up_swiglu output must be {(m, n)} {inputs.dtype} on {inputs.device}."
-        )
-    launch = config.as_triton_kwargs()
-    grid = (
-        triton.cdiv(m, launch["BLOCK_SIZE_M"])
-        * triton.cdiv(n, launch["BLOCK_SIZE_N"]),
-    )
-    _gate_up_swiglu_kernel[grid](
+    output = torch.empty((1, shape[1]), dtype=inputs.dtype, device=inputs.device)
+    _gate_up_swiglu_kernel[(triton.cdiv(shape[1], config["block_n"]),)](
         inputs,
         weight,
         output,
-        M=m,
-        N=n,
-        K=k,
-        stride_am=inputs.stride(0),
-        stride_ak=inputs.stride(1),
-        stride_bn=weight.stride(0),
-        stride_bk=weight.stride(1),
-        stride_cm=output.stride(0),
-        stride_cn=output.stride(1),
-        **launch,
+        N=shape[1],
+        K=shape[0],
+        BLOCK_M=config["block_m"],
+        BLOCK_N=config["block_n"],
+        BLOCK_K=config["block_k"],
+        num_warps=config["warps"],
+        num_stages=config["stages"],
     )
     return output

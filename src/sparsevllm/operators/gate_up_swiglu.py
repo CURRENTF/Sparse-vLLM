@@ -1,20 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol
-
 import torch
 import torch.nn.functional as F
 
 import sparsevllm.platforms as platforms
 from sparsevllm.operators.registry import OpRegistry, OpResolver, SupportResult
 from sparsevllm.platforms.interface import DeviceCaps, PlatformEnum
-
-
-class GateUpProjection(Protocol):
-    weight: torch.Tensor
-
-    def __call__(self, inputs: torch.Tensor) -> torch.Tensor: ...
 
 
 @dataclass(frozen=True)
@@ -33,8 +25,13 @@ class GateUpSwiGLUOpSpec:
             raise ValueError(
                 "Gate/up SwiGLU intermediate size must be divisible by TP size."
             )
-        if not self.activation_dtype.is_floating_point or not self.weight_dtype.is_floating_point:
-            raise TypeError("Gate/up SwiGLU activations and weights must be floating point.")
+        if not (
+            self.activation_dtype.is_floating_point
+            and self.weight_dtype.is_floating_point
+        ):
+            raise TypeError(
+                "Gate/up SwiGLU activations and weights must be floating point."
+            )
 
 
 class GateUpSwiGLUProvider:
@@ -45,7 +42,7 @@ class GateUpSwiGLUProvider:
         self,
         spec: GateUpSwiGLUOpSpec,
         inputs: torch.Tensor,
-        projection: GateUpProjection,
+        projection,
     ) -> torch.Tensor:
         raise NotImplementedError
 
@@ -56,8 +53,8 @@ GATE_UP_SWIGLU_REGISTRY: OpRegistry[
 
 
 @GATE_UP_SWIGLU_REGISTRY.register
-class TorchGateUpSwiGLUProvider(GateUpSwiGLUProvider):
-    name = "torch"
+class NativeGateUpSwiGLUProvider(GateUpSwiGLUProvider):
+    name = "native"
     priority = 0
 
     @classmethod
@@ -73,7 +70,7 @@ class TorchGateUpSwiGLUProvider(GateUpSwiGLUProvider):
         self,
         spec: GateUpSwiGLUOpSpec,
         inputs: torch.Tensor,
-        projection: GateUpProjection,
+        projection,
     ) -> torch.Tensor:
         del spec
         gate, up = projection(inputs).chunk(2, dim=-1)
@@ -81,7 +78,7 @@ class TorchGateUpSwiGLUProvider(GateUpSwiGLUProvider):
 
 
 @GATE_UP_SWIGLU_REGISTRY.register
-class H20GateUpSwiGLUProvider(TorchGateUpSwiGLUProvider):
+class H20GateUpSwiGLUProvider(NativeGateUpSwiGLUProvider):
     name = "h20_triton_decode"
     priority = 20
 
@@ -125,23 +122,13 @@ class H20GateUpSwiGLUProvider(TorchGateUpSwiGLUProvider):
         self,
         spec: GateUpSwiGLUOpSpec,
         inputs: torch.Tensor,
-        projection: GateUpProjection,
+        projection,
     ) -> torch.Tensor:
         if inputs.shape[0] != 1:
             return super().run(spec, inputs, projection)
-        from sparsevllm.triton_kernel.gate_up_swiglu import (
-            gate_up_swiglu,
-            resolve_h20_gate_up_swiglu_config,
-        )
+        from sparsevllm.triton_kernel.gate_up_swiglu import h20_gate_up_swiglu
 
-        local_intermediate_size = spec.intermediate_size // spec.tp_size
-        return gate_up_swiglu(
-            inputs,
-            projection.weight,
-            resolve_h20_gate_up_swiglu_config(
-                inputs.shape[0], spec.hidden_size, local_intermediate_size
-            ),
-        )
+        return h20_gate_up_swiglu(inputs, projection.weight)
 
 
 def resolve_gate_up_swiglu_provider(

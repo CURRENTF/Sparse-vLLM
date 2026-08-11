@@ -4,7 +4,7 @@ import torch
 from sparsevllm.operators.gate_up_swiglu import (
     GATE_UP_SWIGLU_REGISTRY,
     GateUpSwiGLUOpSpec,
-    TorchGateUpSwiGLUProvider,
+    NativeGateUpSwiGLUProvider,
 )
 from sparsevllm.operators.registry import OpResolver
 from sparsevllm.platforms import DeviceCaps, PlatformEnum
@@ -56,13 +56,13 @@ def test_h20_provider_requires_profiled_qwen36_shape(tp_size):
         (_spec(), _caps(capability=(8, 9))),
     ],
 )
-def test_unprofiled_shape_uses_torch_provider(spec, caps):
+def test_unprofiled_shape_uses_native_provider(spec, caps):
     resolved = OpResolver(GATE_UP_SWIGLU_REGISTRY).resolve(spec, caps)
 
-    assert resolved.provider.name == "torch"
+    assert resolved.provider.name == "native"
 
 
-def test_torch_provider_matches_gate_up_swiglu_semantics():
+def test_native_provider_matches_gate_up_swiglu_semantics():
     torch.manual_seed(0)
     inputs = torch.randn(3, 8)
     projection = torch.nn.Linear(8, 12, bias=False)
@@ -70,7 +70,7 @@ def test_torch_provider_matches_gate_up_swiglu_semantics():
         projected = projection(inputs)
         gate, up = projected.chunk(2, dim=-1)
         expected = torch.nn.functional.silu(gate) * up
-        actual = TorchGateUpSwiGLUProvider().run(
+        actual = NativeGateUpSwiGLUProvider().run(
             _spec(
                 hidden_size=8,
                 intermediate_size=6,
