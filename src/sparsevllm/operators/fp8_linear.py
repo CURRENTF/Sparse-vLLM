@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from importlib.util import find_spec
-from shutil import which
 
 import torch
 
@@ -14,7 +13,6 @@ from sparsevllm.operators.registry import (
     runtime_version_at_least,
 )
 from sparsevllm.platforms.interface import DeviceCaps, PlatformEnum
-from sparsevllm.utils.log import logger
 
 
 @dataclass(frozen=True)
@@ -53,13 +51,6 @@ class FlashInferSm90Fp8LinearProvider(Fp8LinearProvider):
     name = "flashinfer_sm90"
     priority = 100
 
-    def __init__(self) -> None:
-        self._fallback: TritonFp8LinearProvider | None = None
-
-    @property
-    def implementation_name(self) -> str:
-        return self._fallback.name if self._fallback is not None else self.name
-
     @classmethod
     def supports(cls, spec: Fp8LinearSpec, caps: DeviceCaps) -> SupportResult:
         if spec.block_shape != (128, 128):
@@ -92,8 +83,6 @@ class FlashInferSm90Fp8LinearProvider(Fp8LinearProvider):
         return SupportResult.yes()
 
     def __call__(self, x, weight, weight_scale_inv, bias=None):
-        if self._fallback is not None:
-            return self._fallback(x, weight, weight_scale_inv, bias)
         if x.dtype != torch.bfloat16:
             raise TypeError(
                 f"FlashInfer SM90 FP8 Linear requires BF16 activations, got {x.dtype}."
@@ -101,32 +90,12 @@ class FlashInferSm90Fp8LinearProvider(Fp8LinearProvider):
         from flashinfer.gemm import fp8_blockscale_gemm_sm90
 
         original_shape = x.shape[:-1]
-        try:
-            output = fp8_blockscale_gemm_sm90(
-                x.reshape(-1, x.shape[-1]).contiguous(),
-                weight,
-                weight_scale=weight_scale_inv,
-                out_dtype=torch.bfloat16,
-            )
-        except RuntimeError as exc:
-            message = str(exc)
-            missing_jit_artifact = (
-                which("nvcc") is None
-                and (
-                    "!cubin.empty() || isPathValid(path_)" in message
-                    or "nvcc not found" in message.lower()
-                    or "could not find nvcc" in message.lower()
-                )
-            )
-            if not missing_jit_artifact:
-                raise
-            self._fallback = TritonFp8LinearProvider()
-            logger.warning(
-                "FlashInfer SM90 FP8 Linear has no cached kernel for "
-                f"shape={tuple(x.shape)}x{tuple(weight.shape)} and nvcc is "
-                "unavailable; binding this Linear instance to Triton."
-            )
-            return self._fallback(x, weight, weight_scale_inv, bias)
+        output = fp8_blockscale_gemm_sm90(
+            x.reshape(-1, x.shape[-1]).contiguous(),
+            weight,
+            weight_scale=weight_scale_inv,
+            out_dtype=torch.bfloat16,
+        )
         if bias is not None:
             output.add_(bias)
         return output.reshape(*original_shape, weight.shape[0])

@@ -14,6 +14,7 @@ class MoeGemmConfig:
     group_m: int
     num_warps: int
     num_stages: int
+    swap_ab: bool = False
 
     def as_triton_kwargs(self) -> dict[str, int]:
         return {
@@ -156,6 +157,52 @@ _TUNED_GATE_UP_SWIGLU_CONFIGS = {
 }
 
 
+_FP8_N64_SWAP = MoeGemmConfig(16, 64, 128, 1, 4, 3, True)
+_FP8_N64_SWAP_S4 = MoeGemmConfig(16, 64, 128, 1, 4, 4, True)
+_FP8_N64_SWAP_S5 = MoeGemmConfig(16, 64, 128, 1, 4, 5, True)
+_FP8_N128 = MoeGemmConfig(16, 128, 128, 1, 4, 3)
+
+
+# Qwen3.6-35B-A3B block-FP8 decode profiles tuned offline on H100. Larger
+# token buckets retain the explicit generic configuration until profiled.
+_TUNED_FP8_ROUTED_CONFIGS = {
+    MoeGemmShape(
+        "NVIDIA H100 80GB HBM3",
+        (9, 0),
+        torch.float8_e4m3fn,
+        8,
+        256,
+        2048,
+        512,
+    ): {
+        "w13": {
+            1: _FP8_N64_SWAP,
+            2: _FP8_N64_SWAP_S4,
+            4: _FP8_N64_SWAP,
+            8: _FP8_N128,
+        },
+        "w2": {
+            1: _FP8_N64_SWAP_S4,
+            2: _FP8_N64_SWAP,
+            4: _FP8_N128,
+            8: _FP8_N64_SWAP,
+        },
+    },
+    MoeGemmShape(
+        "NVIDIA H100 80GB HBM3",
+        (9, 0),
+        torch.float8_e4m3fn,
+        8,
+        128,
+        2048,
+        512,
+    ): {
+        "w13": {1: _FP8_N64_SWAP_S5},
+        "w2": {1: _FP8_N64_SWAP_S4},
+    },
+}
+
+
 @lru_cache(maxsize=None)
 def _resolve_moe_gemm_config(
     dtype: torch.dtype,
@@ -234,3 +281,35 @@ def resolve_moe_gemm_config(
         device_name,
         device_capability,
     )
+
+
+def resolve_fp8_routed_gemm_config(
+    *,
+    num_tokens: int,
+    top_k: int,
+    num_local_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    stage: str,
+    device_name: str | None = None,
+    device_capability: tuple[int, int] | None = None,
+) -> MoeGemmConfig:
+    if stage not in {"w13", "w2"}:
+        raise ValueError(f"FP8 routed GEMM stage must be 'w13' or 'w2', got {stage!r}.")
+    if device_name is None:
+        device_name = torch.cuda.get_device_name()
+    if device_capability is None:
+        device_capability = torch.cuda.get_device_capability()
+    shape = MoeGemmShape(
+        _hardware_family(device_name),
+        device_capability,
+        torch.float8_e4m3fn,
+        int(top_k),
+        int(num_local_experts),
+        int(hidden_size),
+        int(intermediate_size),
+    )
+    tuned = _TUNED_FP8_ROUTED_CONFIGS.get(shape, {}).get(stage, {}).get(
+        token_bucket(num_tokens)
+    )
+    return tuned or _FP8_N128

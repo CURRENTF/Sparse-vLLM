@@ -2,6 +2,7 @@ import pytest
 import torch
 
 from sparsevllm.triton_kernel.moe_config import (
+    resolve_fp8_routed_gemm_config,
     resolve_moe_gemm_config,
     token_bucket,
 )
@@ -155,3 +156,65 @@ def test_h100_profile_switches_to_large_token_config():
     )
     assert resolve_moe_gemm_config(**common, num_tokens=512).block_m == 16
     assert resolve_moe_gemm_config(**common, num_tokens=1024).block_m == 64
+
+
+@pytest.mark.parametrize(
+    ("stage", "tokens", "block_n", "num_stages", "swap_ab"),
+    [
+        ("w13", 1, 64, 3, True),
+        ("w13", 2, 64, 4, True),
+        ("w13", 8, 128, 3, False),
+        ("w2", 1, 64, 4, True),
+        ("w2", 4, 128, 3, False),
+        ("w2", 8, 64, 3, True),
+    ],
+)
+def test_h100_qwen36_fp8_routed_config(stage, tokens, block_n, num_stages, swap_ab):
+    config = resolve_fp8_routed_gemm_config(
+        num_tokens=tokens,
+        top_k=8,
+        num_local_experts=256,
+        hidden_size=2048,
+        intermediate_size=512,
+        stage=stage,
+        device_name="NVIDIA H100 80GB HBM3",
+        device_capability=(9, 0),
+    )
+
+    assert (config.block_n, config.num_stages, config.swap_ab) == (
+        block_n,
+        num_stages,
+        swap_ab,
+    )
+
+
+def test_h100_qwen36_fp8_ep2_uses_profiled_configs():
+    common = dict(
+        num_tokens=1,
+        top_k=8,
+        num_local_experts=128,
+        hidden_size=2048,
+        intermediate_size=512,
+        device_name="NVIDIA H100 80GB HBM3",
+        device_capability=(9, 0),
+    )
+    w13 = resolve_fp8_routed_gemm_config(**common, stage="w13")
+    w2 = resolve_fp8_routed_gemm_config(**common, stage="w2")
+
+    assert (w13.block_n, w13.num_stages, w13.swap_ab) == (64, 5, True)
+    assert (w2.block_n, w2.num_stages, w2.swap_ab) == (64, 4, True)
+
+
+def test_fp8_routed_unknown_shape_uses_explicit_default():
+    config = resolve_fp8_routed_gemm_config(
+        num_tokens=1,
+        top_k=8,
+        num_local_experts=64,
+        hidden_size=2048,
+        intermediate_size=512,
+        stage="w13",
+        device_name="NVIDIA H100 80GB HBM3",
+        device_capability=(9, 0),
+    )
+
+    assert (config.block_n, config.block_k, config.swap_ab) == (128, 128, False)

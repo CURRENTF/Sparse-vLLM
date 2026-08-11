@@ -8,7 +8,9 @@ import triton.language as tl
 
 from sparsevllm.triton_kernel.silu_and_mul import silu_and_mul_fwd
 from sparsevllm.triton_kernel.moe_config import (
+    MoeGemmConfig,
     device_info,
+    resolve_fp8_routed_gemm_config,
     resolve_moe_gemm_config,
 )
 
@@ -87,6 +89,31 @@ def _fill_local_assignments_kernel(
         mask=is_local,
     )
     tl.store(sorted_token_ids_ptr + positions, assignment_ids, mask=is_local)
+
+
+@triton.jit
+def _prepare_naive_assignment_kernel(
+    topk_ids_ptr,
+    expert_ids_ptr,
+    num_tokens_post_padded_ptr,
+    num_assignments: tl.constexpr,
+    local_expert_start: tl.constexpr,
+    local_expert_end: tl.constexpr,
+    num_tokens_post_padded: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    offsets = tl.arange(0, BLOCK_SIZE)
+    valid = offsets < num_assignments
+    global_expert_ids = tl.load(topk_ids_ptr + offsets, mask=valid)
+    is_local = (global_expert_ids >= local_expert_start) & (
+        global_expert_ids < local_expert_end
+    )
+    tl.store(
+        expert_ids_ptr + offsets,
+        tl.where(is_local, global_expert_ids - local_expert_start, -1),
+        mask=valid,
+    )
+    tl.store(num_tokens_post_padded_ptr, num_tokens_post_padded)
 
 
 def _validate_alignment_inputs(
@@ -262,24 +289,25 @@ def _prepare_expert_assignment(
 ) -> MoeAlignment:
     num_assignments = int(topk_ids.numel())
     if num_assignments * 4 <= int(num_experts):
-        flat_ids = topk_ids.view(-1)
-        is_local = (flat_ids >= local_expert_start) & (
-            flat_ids < local_expert_end
+        metadata = torch.empty(
+            num_assignments + 1, dtype=torch.int32, device=topk_ids.device
         )
-        expert_ids = torch.where(
-            is_local,
-            flat_ids - local_expert_start,
-            torch.full_like(flat_ids, -1),
-        ).to(torch.int32)
+        expert_ids, num_tokens_post_padded = metadata[:-1], metadata[-1:]
+        _prepare_naive_assignment_kernel[(1,)](
+            topk_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            num_assignments=num_assignments,
+            local_expert_start=local_expert_start,
+            local_expert_end=local_expert_end,
+            num_tokens_post_padded=num_assignments * block_size,
+            BLOCK_SIZE=triton.next_power_of_2(num_assignments),
+            num_warps=1,
+        )
         return MoeAlignment(
             sorted_token_ids=None,
-            expert_ids=expert_ids.contiguous(),
-            num_tokens_post_padded=torch.full(
-                (1,),
-                num_assignments * block_size,
-                dtype=torch.int32,
-                device=topk_ids.device,
-            ),
+            expert_ids=expert_ids,
+            num_tokens_post_padded=num_tokens_post_padded,
             block_size=block_size,
             naive=True,
         )
@@ -657,6 +685,7 @@ def _routed_fp8_gemm_kernel(
     INPUT_TOP_K: tl.constexpr,
     MUL_ROUTING_WEIGHT: tl.constexpr,
     NAIVE_ASSIGNMENT: tl.constexpr,
+    SWAP_AB: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -686,38 +715,70 @@ def _routed_fp8_gemm_kernel(
     offsets_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     offsets_k = tl.arange(0, BLOCK_SIZE_K)
     input_rows = assignment_ids // INPUT_TOP_K
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    accumulator = tl.zeros(
+        (BLOCK_SIZE_N, BLOCK_SIZE_M) if SWAP_AB else (BLOCK_SIZE_M, BLOCK_SIZE_N),
+        dtype=tl.float32,
+    )
 
     for k_block in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         remaining_k = K - k_block * BLOCK_SIZE_K
-        a_raw = tl.load(
-            a_ptr
-            + input_rows[:, None] * stride_am
-            + (k_block * BLOCK_SIZE_K + offsets_k[None, :]) * stride_ak,
-            mask=assignment_mask[:, None]
-            & (offsets_k[None, :] < remaining_k),
-            other=0.0,
-        ).to(tl.float32)
-        a_scale = tl.max(tl.abs(a_raw), axis=1) / 448.0
-        a_quant = (a_raw / tl.maximum(a_scale[:, None], 1.0e-12)).to(
-            tl.float8e4nv
-        )
-        b = tl.load(
-            b_ptr
-            + expert_id * stride_be
-            + offsets_n[None, :] * stride_bn
-            + (k_block * BLOCK_SIZE_K + offsets_k[:, None]) * stride_bk,
-            mask=(offsets_n[None, :] < N)
-            & (offsets_k[:, None] < remaining_k),
-            other=0.0,
-        )
+        if SWAP_AB:
+            a_raw = tl.load(
+                a_ptr
+                + input_rows[None, :] * stride_am
+                + (k_block * BLOCK_SIZE_K + offsets_k[:, None]) * stride_ak,
+                mask=assignment_mask[None, :]
+                & (offsets_k[:, None] < remaining_k),
+                other=0.0,
+            ).to(tl.float32)
+            a_scale = tl.max(tl.abs(a_raw), axis=0) / 448.0
+            a_quant = (a_raw / tl.maximum(a_scale[None, :], 1.0e-12)).to(
+                tl.float8e4nv
+            )
+            b = tl.load(
+                b_ptr
+                + expert_id * stride_be
+                + offsets_n[:, None] * stride_bn
+                + (k_block * BLOCK_SIZE_K + offsets_k[None, :]) * stride_bk,
+                mask=(offsets_n[:, None] < N)
+                & (offsets_k[None, :] < remaining_k),
+                other=0.0,
+            )
+        else:
+            a_raw = tl.load(
+                a_ptr
+                + input_rows[:, None] * stride_am
+                + (k_block * BLOCK_SIZE_K + offsets_k[None, :]) * stride_ak,
+                mask=assignment_mask[:, None]
+                & (offsets_k[None, :] < remaining_k),
+                other=0.0,
+            ).to(tl.float32)
+            a_scale = tl.max(tl.abs(a_raw), axis=1) / 448.0
+            a_quant = (a_raw / tl.maximum(a_scale[:, None], 1.0e-12)).to(
+                tl.float8e4nv
+            )
+            b = tl.load(
+                b_ptr
+                + expert_id * stride_be
+                + offsets_n[None, :] * stride_bn
+                + (k_block * BLOCK_SIZE_K + offsets_k[:, None]) * stride_bk,
+                mask=(offsets_n[None, :] < N)
+                & (offsets_k[:, None] < remaining_k),
+                other=0.0,
+            )
         b_scale = tl.load(
             b_scale_ptr
             + expert_id * stride_bse
-            + pid_n * stride_bsn
+            + (pid_n * BLOCK_SIZE_N // 128) * stride_bsn
             + k_block * stride_bsk
         ).to(tl.float32)
-        accumulator += tl.dot(a_quant, b) * a_scale[:, None] * b_scale
+        if SWAP_AB:
+            accumulator += tl.dot(b, a_quant) * b_scale * a_scale[None, :]
+        else:
+            accumulator += tl.dot(a_quant, b) * a_scale[:, None] * b_scale
+
+    if SWAP_AB:
+        accumulator = tl.trans(accumulator, (1, 0))
 
     if MUL_ROUTING_WEIGHT:
         routing_weights = tl.load(
@@ -746,7 +807,11 @@ def _routed_fp8_gemm(
     *,
     input_top_k: int,
     multiply_routing_weight: bool,
+    config: MoeGemmConfig | None = None,
 ) -> None:
+    config = config or MoeGemmConfig(alignment.block_size, 128, 128, 1, 4, 3)
+    if config.block_m != alignment.block_size:
+        raise ValueError("Routed FP8 GEMM config and assignment block sizes must match.")
     num_assignments = int(topk_weights.numel())
     if alignment.naive:
         em = num_assignments * alignment.block_size
@@ -757,8 +822,8 @@ def _routed_fp8_gemm(
         em = int(alignment.sorted_token_ids.numel())
         sorted_token_ids = alignment.sorted_token_ids
     grid = (
-        triton.cdiv(em, alignment.block_size),
-        triton.cdiv(int(weights.shape[1]), 128),
+        triton.cdiv(em, config.block_m),
+        triton.cdiv(int(weights.shape[1]), config.block_n),
     )
     _routed_fp8_gemm_kernel[grid](
         inputs,
@@ -786,11 +851,12 @@ def _routed_fp8_gemm(
         INPUT_TOP_K=int(input_top_k),
         MUL_ROUTING_WEIGHT=bool(multiply_routing_weight),
         NAIVE_ASSIGNMENT=alignment.naive,
-        BLOCK_SIZE_M=alignment.block_size,
-        BLOCK_SIZE_N=128,
-        BLOCK_SIZE_K=128,
-        num_warps=4,
-        num_stages=3,
+        SWAP_AB=config.swap_ab,
+        BLOCK_SIZE_M=config.block_m,
+        BLOCK_SIZE_N=config.block_n,
+        BLOCK_SIZE_K=config.block_k,
+        num_warps=config.num_warps,
+        num_stages=config.num_stages,
     )
 
 
@@ -1067,7 +1133,6 @@ def fused_moe(
         local_expert_start=local_expert_start,
         local_expert_end=local_expert_end,
     )
-
     if _fuse_gate_up_swiglu:
         activated = torch.empty(
             (num_assignments, intermediate_size),
@@ -1274,9 +1339,26 @@ def fused_moe_fp8(
     num_tokens = int(hidden_states.shape[0])
     top_k = int(topk_ids.shape[1])
     num_assignments = num_tokens * top_k
+    device_name, capability = device_info(
+        hidden_states.device.type,
+        hidden_states.device.index or 0,
+    )
+    config_kwargs = {
+        "num_tokens": num_tokens,
+        "top_k": top_k,
+        "num_local_experts": num_local_experts,
+        "hidden_size": hidden_size,
+        "intermediate_size": intermediate_size,
+        "device_name": device_name,
+        "device_capability": capability,
+    }
+    w13_config = resolve_fp8_routed_gemm_config(**config_kwargs, stage="w13")
+    w2_config = resolve_fp8_routed_gemm_config(**config_kwargs, stage="w2")
+    if w13_config.block_m != w2_config.block_m:
+        raise ValueError("FP8 routed GEMM stages must share one assignment block size.")
     alignment = _prepare_expert_assignment(
         topk_ids,
-        block_size=16,
+        block_size=w13_config.block_m,
         num_experts=num_experts,
         local_expert_start=local_expert_start,
         local_expert_end=local_expert_end,
@@ -1295,6 +1377,7 @@ def fused_moe_fp8(
         alignment,
         input_top_k=top_k,
         multiply_routing_weight=False,
+        config=w13_config,
     )
     activated = silu_and_mul_fwd(w13_output, gate_up_order=gate_up_order)
     w2_output = torch.empty(
@@ -1311,6 +1394,7 @@ def fused_moe_fp8(
         alignment,
         input_top_k=1,
         multiply_routing_weight=True,
+        config=w2_config,
     )
     return moe_sum(
         w2_output.view(num_tokens, top_k, hidden_size),

@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 
 from sparsevllm.triton_kernel.moe import (
+    _prepare_expert_assignment,
     fused_moe,
     fused_moe_gate_up_swiglu,
     moe_align_block_size,
@@ -69,6 +70,22 @@ def test_moe_align_block_size_filters_ep_experts_and_pads_blocks():
     assert all(expert_id == -1 for expert_id in expert_ids[2:].tolist())
     assert sorted(sorted_ids[:4].tolist()) == sorted([0, 3, 5, invalid])
     assert sorted(sorted_ids[4:8].tolist()) == sorted([2, invalid, invalid, invalid])
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for Triton MoE tests.")
+def test_naive_assignment_filters_ep_experts_in_one_kernel():
+    alignment = _prepare_expert_assignment(
+        torch.tensor([[3, 12]], dtype=torch.int64, device="cuda"),
+        block_size=1,
+        num_experts=16,
+        local_expert_start=8,
+        local_expert_end=16,
+    )
+    torch.cuda.synchronize()
+
+    assert alignment.naive
+    assert alignment.expert_ids.tolist() == [-1, 4]
+    assert alignment.num_tokens_post_padded.item() == 2
 
 
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
@@ -136,6 +153,18 @@ def test_topk_softmax_accepts_any_valid_experts_for_ties():
         weights.float(),
         torch.full((1, 8), 1 / 8, device="cuda"),
     )
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for Triton MoE tests.")
+def test_topk_softmax_accepts_padded_row_stride():
+    logits = torch.randn(3, 257, dtype=torch.bfloat16, device="cuda")[:, :256]
+    expected_weights, expected_ids = _pytorch_topk_reference(logits, True)
+
+    weights, ids = topk_softmax(logits, top_k=8, norm_topk_prob=True)
+    torch.cuda.synchronize()
+
+    assert torch.equal(ids, expected_ids.to(torch.int32))
+    assert torch.allclose(weights.float(), expected_weights, atol=2e-2, rtol=2e-2)
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for Triton MoE tests.")

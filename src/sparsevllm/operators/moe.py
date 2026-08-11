@@ -504,6 +504,103 @@ class TritonMoeProvider(MoeProvider):
         )
 
 
+@MOE_REGISTRY.register
+class HopperQwen36HybridFp8MoeProvider(FlashInferCutlassFp8MoeProvider):
+    """Bind one weight layout and dispatch profiled token buckets by kernel."""
+
+    name = "hopper_qwen36_hybrid_fp8"
+    priority = 110
+    PROFILED_SHAPES = frozenset(
+        {
+            (256, 256, 2048, 512, 8, 1, 1),
+            (256, 128, 2048, 512, 8, 1, 2),
+        }
+    )
+    TRITON_MAX_TOKENS_BY_EP_SIZE = {1: 8, 2: 4}
+
+    @classmethod
+    def supports(cls, spec: MoeOpSpec, caps: DeviceCaps) -> SupportResult:
+        if spec.cuda_graph and not caps.supports_graph_capture:
+            return SupportResult.no("device does not support CUDA Graph capture")
+        if caps.device_name != "NVIDIA H100 80GB HBM3":
+            return SupportResult.no(
+                "requires profiled NVIDIA H100 80GB HBM3 hardware, "
+                f"got {caps.device_name}"
+            )
+        actual_shape = (
+            spec.num_experts,
+            spec.num_local_experts,
+            spec.hidden_size,
+            spec.intermediate_size,
+            spec.top_k,
+            spec.tp_size,
+            spec.ep_size,
+        )
+        if actual_shape not in cls.PROFILED_SHAPES:
+            return SupportResult.no(
+                "requires profiled Qwen3.6 TP1/EP1 or "
+                "global-TP2/MoE-TP1xEP2 shape "
+                f"{sorted(cls.PROFILED_SHAPES)}, "
+                f"got {actual_shape}"
+            )
+        flashinfer_support = super().supports(spec, caps)
+        if not flashinfer_support.supported:
+            return SupportResult.no(
+                f"FlashInfer prefill path: {flashinfer_support.reason}"
+            )
+        triton_support = TritonMoeProvider.supports(spec, caps)
+        if not triton_support.supported:
+            return SupportResult.no(
+                f"Triton decode path: {triton_support.reason}"
+            )
+        return SupportResult.yes()
+
+    def run(
+        self,
+        spec,
+        hidden_states,
+        topk_ids,
+        topk_weights,
+        w13_weight,
+        w2_weight,
+        w13_scale_inv,
+        w2_scale_inv,
+        *,
+        local_expert_start,
+        ep_rank,
+    ):
+        triton_max_tokens = self.TRITON_MAX_TOKENS_BY_EP_SIZE[int(spec.ep_size)]
+        if int(hidden_states.shape[0]) > triton_max_tokens:
+            return super().run(
+                spec,
+                hidden_states,
+                topk_ids,
+                topk_weights,
+                w13_weight,
+                w2_weight,
+                w13_scale_inv,
+                w2_scale_inv,
+                local_expert_start=local_expert_start,
+                ep_rank=ep_rank,
+            )
+        if w13_scale_inv is None or w2_scale_inv is None:
+            raise RuntimeError("Qwen3.6 hybrid FP8 MoE requires expert scales.")
+        from sparsevllm.triton_kernel.moe import fused_moe_fp8
+
+        return fused_moe_fp8(
+            hidden_states,
+            w13_weight,
+            w2_weight,
+            w13_scale_inv,
+            w2_scale_inv,
+            topk_ids,
+            topk_weights,
+            num_experts=spec.num_experts,
+            local_expert_start=local_expert_start,
+            gate_up_order=self.gate_up_order,
+        )
+
+
 def resolve_moe_provider(
     spec: MoeOpSpec,
     *,
