@@ -165,7 +165,7 @@ def test_benchmark_sparse_method_preserves_graph_enabling_legacy_alias(method):
 
 
 @pytest.mark.parametrize("enabled", [False, True])
-def test_artifact_records_include_step_timing_mode(enabled):
+def test_artifact_records_include_step_timing_mode_and_e2e_latency(enabled):
     args = SimpleNamespace(
         output_len=8,
         temperature=0.0,
@@ -173,9 +173,13 @@ def test_artifact_records_include_step_timing_mode(enabled):
         synchronize_step_timing=enabled,
     )
 
-    records = _artifact_records(args, [{"status": "SUCCESS", "length": 16}])
+    records = _artifact_records(
+        args,
+        [{"status": "SUCCESS", "length": 16, "duration_s": 1.25}],
+    )
 
     assert records[0]["synchronize_step_timing"] is enabled
+    assert records[0]["e2e_latency_s"] == 1.25
 
 
 def test_output_metadata_records_step_timing_mode(tmp_path, monkeypatch):
