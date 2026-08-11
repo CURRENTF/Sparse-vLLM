@@ -263,10 +263,11 @@ class Qwen35MoeSparseMoeBlock(nn.Module):
         shared_output = self.shared_expert(hidden_states)
         topk_weights, topk_ids, shared_gate_logits = self.gate(hidden_states)
         local_output = self.experts(hidden_states, topk_ids, topk_weights)
-        routed_output, shared_output = self.parallel_context.world_all_reduce(
-            torch.stack((local_output, shared_output))
-        )
-        return gated_shared_add(routed_output, shared_output, shared_gate_logits)
+        if self.parallel_context.world.size > 1:
+            local_output, shared_output = self.parallel_context.world_all_reduce(
+                torch.stack((local_output, shared_output))
+            )
+        return gated_shared_add(local_output, shared_output, shared_gate_logits)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if hidden_states.dim() != 2:

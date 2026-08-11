@@ -202,6 +202,7 @@ def test_qwen35_moe_reduces_routed_and_shared_outputs_together():
     block.gate = ReturnValue((torch.ones(2, 1), torch.zeros(2, 1, dtype=torch.int32), gate_logits))
     block.experts = ReturnValue(local_output)
     block.parallel_context = Mock()
+    block.parallel_context.world.size = 2
     block.parallel_context.world_all_reduce.side_effect = lambda outputs: outputs + 1
 
     with patch(
@@ -215,6 +216,34 @@ def test_qwen35_moe_reduces_routed_and_shared_outputs_together():
     torch.testing.assert_close(
         actual,
         local_output + 1 + (shared_output + 1) * gate_logits.sigmoid(),
+    )
+
+
+def test_qwen35_moe_skips_single_rank_output_packing():
+    hidden_states = torch.randn(2, 4)
+    block = Qwen35MoeSparseMoeBlock.__new__(Qwen35MoeSparseMoeBlock)
+    torch.nn.Module.__init__(block)
+    block.shared_expert = Mock(return_value=hidden_states + 1)
+    block.gate = Mock(
+        return_value=(
+            torch.ones(2, 1),
+            torch.zeros(2, 1, dtype=torch.int32),
+            torch.zeros(2, 1),
+        )
+    )
+    block.experts = Mock(return_value=hidden_states + 2)
+    block.parallel_context = Mock()
+    block.parallel_context.world.size = 1
+
+    with patch(
+        "sparsevllm.models.qwen3_5_moe.gated_shared_add",
+        side_effect=lambda routed, shared, gate: routed + shared * gate.sigmoid(),
+    ):
+        actual = block._forward_chunk(hidden_states)
+
+    block.parallel_context.world_all_reduce.assert_not_called()
+    torch.testing.assert_close(
+        actual, hidden_states + 2 + 0.5 * (hidden_states + 1)
     )
 
 
