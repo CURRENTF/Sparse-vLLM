@@ -370,7 +370,7 @@ def test_hopper_fused_moe_uses_profiled_tp_ep_shape():
     ("tp_size", "ep_size", "intermediate_size", "num_local_experts"),
     [(1, 1, 512, 256), (2, 1, 256, 256), (1, 2, 512, 128)],
 )
-def test_h20_qwen36_bf16_moe_uses_profiled_provider(
+def test_qwen36_bf16_moe_uses_profiled_hopper_provider(
     tp_size,
     ep_size,
     intermediate_size,
@@ -401,7 +401,7 @@ def test_h20_qwen36_bf16_moe_uses_profiled_provider(
             (9, 0), native_fp8=False, device_name="NVIDIA H100 80GB HBM3"
         ),
     )
-    assert h100.provider.name == "triton"
+    assert h100.provider.name == "triton_hopper_fused"
 
 
 @pytest.mark.parametrize(
@@ -669,7 +669,7 @@ def test_h20_qwen36_hybrid_moe_uses_profiled_provider():
 
 
 def test_h20_qwen36_hybrid_moe_limits_triton_to_profiled_token_count():
-    assert H20Qwen36HybridFp8MoeProvider.TRITON_MAX_TOKENS_BY_EP_SIZE == {1: 1, 2: 1}
+    assert H20Qwen36HybridFp8MoeProvider.TRITON_MAX_TOKENS_BY_EP_SIZE == {1: 8, 2: 1}
 
 
 def test_qwen36_hybrid_moe_dispatches_by_token_bucket():
