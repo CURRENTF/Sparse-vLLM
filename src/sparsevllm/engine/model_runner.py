@@ -18,6 +18,7 @@ from sparsevllm.engine.sequence import Sequence
 from sparsevllm.models.qwen2 import Qwen2ForCausalLM
 from sparsevllm.models.llama import LlamaForCausalLM
 from sparsevllm.layers.sampler import Sampler
+from sparsevllm.operators import registry as operator_registry
 from sparsevllm.utils.context import set_context, get_context, reset_context
 from sparsevllm.utils.loader import load_model, sync_deltakv_config_from_checkpoint
 
@@ -85,6 +86,7 @@ TP_RPC_STATUS_SYNC_METHODS = PREFIX_CACHE_CONTROL_RPC_METHODS | {
     "debug_moe_states_cpu",
     "free_slots",
     "free_slots_batch",
+    "log_operator_implementations",
     "refresh_prefix_cache_hit",
     "reset_after_warmup",
     "run",
@@ -585,6 +587,9 @@ class ModelRunner:
             self.decode_cuda_graph_runner.clear_captured_graphs()
         if os.getenv("SPARSEVLLM_DELTAKV_CLEAR_ATTN_SCORE_BUFFERS_AFTER_WARMUP", "0") == "1":
             self.sparse_controller.clear_decode_attn_score_buffers()
+
+    def log_operator_implementations(self) -> None:
+        operator_registry.log_operator_implementations(self.parallel_context.world_rank)
 
     def warmup_moe_workspace(self, num_tokens: int) -> None:
         warmup_moe = getattr(self.model, "warmup_moe", None)

@@ -1,13 +1,41 @@
 from __future__ import annotations
 
+import weakref
 from dataclasses import dataclass
 from typing import Generic, Protocol, TypeVar
 
 from sparsevllm.platforms.interface import DeviceCaps
+from sparsevllm.utils.log import logger
 
 
 SpecT = TypeVar("SpecT")
 ProviderT = TypeVar("ProviderT", bound="OperatorProvider")
+
+
+_OPERATOR_BINDINGS: dict[str, weakref.WeakSet[object]] = {}
+
+
+def record_operator_binding(operator_type: str, provider: object) -> None:
+    _OPERATOR_BINDINGS.setdefault(operator_type, weakref.WeakSet()).add(provider)
+
+
+def _implementation_name(provider: object) -> str:
+    return getattr(provider, "implementation_name", None) or getattr(provider, "name", None) or provider.provider_name
+
+
+def log_operator_implementations(world_rank: int) -> None:
+    entries = sorted(
+        (
+            operator_type,
+            ", ".join(sorted({_implementation_name(provider) for provider in providers})),
+        )
+        for operator_type, providers in _OPERATOR_BINDINGS.items()
+        if providers
+    )
+    if not entries:
+        return
+    rows = "\n".join(f"  {operator_type}: {implementation}" for operator_type, implementation in entries)
+    logger.info("Operator implementations (rank {}):\n{}", world_rank, rows)
 
 
 def runtime_version_at_least(
@@ -99,4 +127,5 @@ class OpResolver(Generic[SpecT, ProviderT]):
             )
         supported.sort(key=lambda provider: (-int(provider.priority), provider.name))
         selected = supported[0](**provider_kwargs)
+        record_operator_binding(self.registry.family, selected)
         return ResolvedProvider(selected, tuple(rejected))

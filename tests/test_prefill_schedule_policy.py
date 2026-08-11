@@ -1639,6 +1639,7 @@ class DecodeCudaGraphWarmupPolicyTest(unittest.TestCase):
             [
                 ("set_warmup_fake_prefill_attention", True, 2046),
                 ("set_warmup_fake_prefill_attention", False),
+                ("log_operator_implementations",),
             ],
         )
 

@@ -1,8 +1,16 @@
 from dataclasses import dataclass
+from unittest.mock import patch
 
 import pytest
 
-from sparsevllm.operators.registry import OpRegistry, OpResolver, SupportResult
+import sparsevllm.operators.registry as operator_registry
+from sparsevllm.operators.registry import (
+    OpRegistry,
+    OpResolver,
+    SupportResult,
+    log_operator_implementations,
+    record_operator_binding,
+)
 from sparsevllm.platforms.interface import DeviceCaps, PlatformEnum
 
 
@@ -42,7 +50,9 @@ def test_resolver_uses_deterministic_supported_priority():
         def supports(cls, spec, caps):
             return SupportResult.yes() if spec.enabled else SupportResult.no("disabled")
 
-    resolved = OpResolver(registry).resolve(_Spec(), _caps())
+    with patch.dict(operator_registry._OPERATOR_BINDINGS, {}, clear=True):
+        resolved = OpResolver(registry).resolve(_Spec(), _caps())
+        assert resolved.provider in operator_registry._OPERATOR_BINDINGS["_test"]
 
     assert resolved.provider.name == "specialized"
 
@@ -147,6 +157,33 @@ def test_resolver_falls_back_and_preserves_rejection_diagnostics():
 
     assert resolved.provider.name == "portable"
     assert resolved.rejected == (("specialized", "missing optional library"),)
+
+
+def test_operator_organization_logs_live_bound_implementations():
+    class Provider:
+        def __init__(self, implementation_name):
+            self.implementation_name = implementation_name
+
+    attention = Provider("triton")
+    linear = Provider("flashinfer_sm90")
+    linear_fallback = Provider("triton")
+
+    with (
+        patch.dict(operator_registry._OPERATOR_BINDINGS, {}, clear=True),
+        patch("sparsevllm.operators.registry.logger.info") as log_info,
+    ):
+        record_operator_binding("Attention", attention)
+        record_operator_binding("block-scaled FP8 Linear", linear)
+        record_operator_binding("block-scaled FP8 Linear", linear_fallback)
+
+        log_operator_implementations(3)
+
+    log_info.assert_called_once_with(
+        "Operator implementations (rank {}):\n{}",
+        3,
+        "  Attention: triton\n"
+        "  block-scaled FP8 Linear: flashinfer_sm90, triton",
+    )
 
 
 def test_resolver_forwards_provider_constructor_arguments():

@@ -19,6 +19,7 @@ from sparsevllm.engine.model_runner import (
     TP_SHM_NAME_PREFIX,
     make_tp_shm_name,
 )
+from sparsevllm.operators import registry as operator_registry
 
 
 def test_write_shm_waits_until_worker_reads_command():
@@ -96,6 +97,17 @@ def test_free_slots_batch_releases_each_seq_id():
 def test_prefix_offload_release_rpcs_use_failure_synchronized_world_path():
     assert "free_slots" in TP_RPC_STATUS_SYNC_METHODS
     assert "free_slots_batch" in TP_RPC_STATUS_SYNC_METHODS
+
+
+def test_operator_implementation_log_is_aligned_and_failure_synchronized():
+    runner = object.__new__(ModelRunner)
+    runner.parallel_context = SimpleNamespace(world_rank=2)
+
+    with patch.object(operator_registry, "log_operator_implementations") as log_implementations:
+        ModelRunner.log_operator_implementations(runner)
+
+    assert "log_operator_implementations" in TP_RPC_STATUS_SYNC_METHODS
+    log_implementations.assert_called_once_with(2)
 
 
 def test_prefix_offload_release_rpc_surfaces_local_failure_after_status_sync():

@@ -458,6 +458,7 @@ class LLMEngine:
 
         self._warmup_moe_workspaces()
         self._after_warmup_debug_cleanup()
+        self.model_runner.call("log_operator_implementations")
         logger.info("Warmup finished.")
 
     def _warmup_moe_workspaces(self) -> None:

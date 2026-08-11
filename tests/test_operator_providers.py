@@ -199,6 +199,7 @@ def test_flashinfer_linear_binds_triton_for_missing_uncached_kernel():
     )
     fallback_output = torch.ones(2, 128, dtype=torch.bfloat16)
     provider = FlashInferSm90Fp8LinearProvider()
+    assert provider.implementation_name == "flashinfer_sm90"
     x = torch.ones(2, 128, dtype=torch.bfloat16)
     weight = torch.ones(128, 128).to(torch.float8_e4m3fn)
     scale = torch.ones(1, 1)
@@ -226,6 +227,7 @@ def test_flashinfer_linear_binds_triton_for_missing_uncached_kernel():
     assert second is fallback_output
     assert flashinfer_call.call_count == 1
     assert triton_call.call_count == 2
+    assert provider.implementation_name == "triton"
 
 
 def test_flashinfer_linear_does_not_mask_other_runtime_failures():

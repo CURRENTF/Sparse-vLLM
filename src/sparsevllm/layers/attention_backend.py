@@ -3,6 +3,7 @@ import os
 import torch
 
 from sparsevllm.engine.cache_manager import DecodeComputeView, PrefillComputeView
+from sparsevllm.operators.registry import record_operator_binding
 from sparsevllm.utils.context import get_context
 from sparsevllm.triton_kernel.context_flashattention_nopad import context_attention_fwd
 from sparsevllm.triton_kernel.flash_decoding_stage1 import flash_decode_stage1 as mha_flash_decode_stage1
@@ -93,6 +94,11 @@ def _fill_fake_attention_score(attn_score: torch.Tensor | None) -> None:
 
 class TritonAttentionBackend:
     """Thin backend wrapper around the existing Sparse-vLLM Triton attention kernels."""
+
+    name = "triton"
+
+    def __init__(self) -> None:
+        record_operator_binding("Attention", self)
 
     def run_prefill(
         self,

@@ -56,6 +56,10 @@ class FlashInferSm90Fp8LinearProvider(Fp8LinearProvider):
     def __init__(self) -> None:
         self._fallback: TritonFp8LinearProvider | None = None
 
+    @property
+    def implementation_name(self) -> str:
+        return self._fallback.name if self._fallback is not None else self.name
+
     @classmethod
     def supports(cls, spec: Fp8LinearSpec, caps: DeviceCaps) -> SupportResult:
         if spec.block_shape != (128, 128):
