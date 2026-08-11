@@ -2,6 +2,7 @@ import pytest
 
 from sparsevllm.method_registry import (
     MODEL_RUNTIME_COMPATIBILITY,
+    QWEN35_MOE_COMPATIBILITY,
     QWEN3_MOE_EP_COMPATIBILITY,
     QWEN3_MOE_TP_COMPATIBILITY,
     QWEN3_MOE_TP_EP_COMPATIBILITY,
@@ -57,6 +58,19 @@ def test_qwen3_moe_registry_lists_only_v1_validated_combinations():
         "quest",
         "rkv",
     }
+
+
+def test_qwen35_moe_registry_accepts_vanilla_prefix_cache():
+    assert validate_model_runtime_compatibility(
+        model_type="qwen3_5_moe",
+        sparse_method="",
+        tensor_parallel_size=2,
+        expert_parallel_size=2,
+        data_parallel_size=1,
+        enforce_eager=True,
+        decode_cuda_graph=False,
+        enable_prefix_caching=True,
+    ) is QWEN35_MOE_COMPATIBILITY
 
 
 @pytest.mark.parametrize("method", sorted(QWEN3_MOE_EP_COMPATIBILITY.sparse_methods))

@@ -145,7 +145,7 @@ QWEN3_MOE_TP_COMPATIBILITY = QWEN3_MOE_TP_EP_COMPATIBILITY
 QWEN35_MOE_COMPATIBILITY = ModelRuntimeCompatibility(
     parallel_mode="outer_tp_moe_tp_ep",
     sparse_methods=QWEN3_MOE_TP_EP_COMPATIBILITY.sparse_methods,
-    prefix_cache_methods=frozenset(),
+    prefix_cache_methods=frozenset({""}),
     requires_eager=False,
     decode_cuda_graph_methods=(
         QWEN3_MOE_TP_EP_COMPATIBILITY.decode_cuda_graph_methods
