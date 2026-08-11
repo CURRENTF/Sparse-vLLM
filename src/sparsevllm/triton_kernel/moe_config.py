@@ -94,6 +94,8 @@ _F = MoeGemmConfig(64, 64, 64, 8, 8, 3)
 _G = MoeGemmConfig(16, 32, 64, 8, 4, 4)
 _H = MoeGemmConfig(16, 32, 64, 8, 4, 3)
 _I = MoeGemmConfig(16, 64, 64, 8, 4, 4)
+_J = MoeGemmConfig(16, 64, 64, 8, 4, 2)
+_K = MoeGemmConfig(16, 128, 64, 8, 4, 2)
 
 
 def _stage_table(
@@ -112,16 +114,16 @@ def _stage_table(
 # than by model name.
 _TUNED_CONFIGS = {
     MoeGemmShape("H20", (9, 0), torch.bfloat16, 8, 256, 2048, 512): {
-        "w13": {1: _G},
-        "w2": {1: _H},
+        "w13": {1: _G, 2: _G, 4: _A, 8: _C},
+        "w2": {1: _G, 2: _A, 4: _K, 8: _I},
     },
     MoeGemmShape("H20", (9, 0), torch.bfloat16, 8, 256, 2048, 256): {
-        "w13": {1: _G},
-        "w2": {1: _H},
+        "w13": {1: _G, 2: _G, 4: _G, 8: _A},
+        "w2": {1: _H, 2: _J, 4: _K, 8: _K},
     },
     MoeGemmShape("H20", (9, 0), torch.bfloat16, 8, 128, 2048, 512): {
-        "w13": {1: _G},
-        "w2": {1: _I},
+        "w13": {1: _G, 2: _I, 4: _I, 8: _C},
+        "w2": {1: _I, 2: _H, 4: _A, 8: _I},
     },
     MoeGemmShape("H20", (9, 0), torch.bfloat16, 8, 128, 2048, 768): _stage_table(
         (_D, _D, _D, _A, _A, _A, _B, _B, _B, _F, _F, _F),
@@ -147,6 +149,18 @@ _TUNED_CONFIGS = {
         (_A, _D, _D, _A, _A, _A, _A, _A, _A, _A, _F, _F),
         (_A, _D, _D, _A, _A, _A, _A, _A, _A, _A, _A, _B),
     ),
+    MoeGemmShape("NVIDIA H100 80GB HBM3", (9, 0), torch.bfloat16, 8, 256, 2048, 512): {
+        "w13": {1: _G, 2: _I, 4: _A, 8: _A},
+        "w2": {1: _G, 2: _G, 4: _A, 8: _H},
+    },
+    MoeGemmShape("NVIDIA H100 80GB HBM3", (9, 0), torch.bfloat16, 8, 256, 2048, 256): {
+        "w13": {1: _G, 2: _G, 4: _G, 8: _H},
+        "w2": {1: _G, 2: _I, 4: _J, 8: _H},
+    },
+    MoeGemmShape("NVIDIA H100 80GB HBM3", (9, 0), torch.bfloat16, 8, 128, 2048, 512): {
+        "w13": {1: _G, 2: _G, 4: _G, 8: _A},
+        "w2": {1: _G, 2: _G, 4: _H, 8: _H},
+    },
 }
 
 
@@ -161,7 +175,7 @@ _TUNED_GATE_UP_SWIGLU_CONFIGS = {
         256,
         2048,
         512,
-    ): {1: _G},
+    ): {1: _G, 2: _G, 4: _H, 8: _G},
     MoeGemmShape(
         "H20",
         (9, 0),
@@ -170,7 +184,7 @@ _TUNED_GATE_UP_SWIGLU_CONFIGS = {
         256,
         2048,
         256,
-    ): {1: _G},
+    ): {1: _G, 2: _G, 4: _G, 8: _H},
     MoeGemmShape(
         "H20",
         (9, 0),
@@ -179,7 +193,34 @@ _TUNED_GATE_UP_SWIGLU_CONFIGS = {
         128,
         2048,
         512,
-    ): {1: _G},
+    ): {1: _G, 2: _G, 4: _G, 8: _H},
+    MoeGemmShape(
+        "NVIDIA H100 80GB HBM3",
+        (9, 0),
+        torch.bfloat16,
+        8,
+        256,
+        2048,
+        512,
+    ): {1: _G, 2: _G, 4: _H, 8: _H},
+    MoeGemmShape(
+        "NVIDIA H100 80GB HBM3",
+        (9, 0),
+        torch.bfloat16,
+        8,
+        256,
+        2048,
+        256,
+    ): {1: _G, 2: _G, 4: _G, 8: _H},
+    MoeGemmShape(
+        "NVIDIA H100 80GB HBM3",
+        (9, 0),
+        torch.bfloat16,
+        8,
+        128,
+        2048,
+        512,
+    ): {1: _G, 2: _G, 4: _G, 8: _H},
     MoeGemmShape(
         "NVIDIA H100 80GB HBM3",
         (9, 0),
@@ -198,9 +239,11 @@ _TUNED_GATE_UP_SWIGLU_CONFIGS = {
 
 
 _FP8_N64_SWAP = MoeGemmConfig(16, 64, 128, 1, 4, 3, True)
+_FP8_N64_SWAP_S2 = MoeGemmConfig(16, 64, 128, 1, 4, 2, True)
 _FP8_N64_SWAP_S4 = MoeGemmConfig(16, 64, 128, 1, 4, 4, True)
 _FP8_N64_SWAP_S5 = MoeGemmConfig(16, 64, 128, 1, 4, 5, True)
 _FP8_N128 = MoeGemmConfig(16, 128, 128, 1, 4, 3)
+_FP8_N128_SWAP_S2 = MoeGemmConfig(16, 128, 128, 1, 4, 2, True)
 _FP8_N128_SWAP_S4 = MoeGemmConfig(16, 128, 128, 1, 4, 4, True)
 
 
@@ -216,8 +259,35 @@ _TUNED_FP8_ROUTED_CONFIGS = {
         2048,
         512,
     ): {
-        "w13": {1: _FP8_N64_SWAP_S4},
-        "w2": {1: _FP8_N128_SWAP_S4},
+        "w13": {
+            1: _FP8_N64_SWAP_S4,
+            2: _FP8_N128_SWAP_S4,
+            4: _FP8_N64_SWAP_S4,
+            8: _FP8_N64_SWAP,
+        },
+        "w2": {
+            1: _FP8_N64_SWAP,
+            2: _FP8_N64_SWAP_S2,
+            4: _FP8_N64_SWAP_S2,
+            8: _FP8_N128_SWAP_S2,
+        },
+    },
+    MoeGemmShape(
+        "H20",
+        (9, 0),
+        torch.float8_e4m3fn,
+        8,
+        256,
+        2048,
+        256,
+    ): {
+        "w13": dict.fromkeys((1, 2, 4, 8), _FP8_N64_SWAP_S4),
+        "w2": {
+            1: _FP8_N64_SWAP,
+            2: _FP8_N64_SWAP_S2,
+            4: _FP8_N64_SWAP_S2,
+            8: _FP8_N128_SWAP_S2,
+        },
     },
     MoeGemmShape(
         "H20",
@@ -228,8 +298,13 @@ _TUNED_FP8_ROUTED_CONFIGS = {
         2048,
         512,
     ): {
-        "w13": {1: _FP8_N64_SWAP_S4},
-        "w2": {1: _FP8_N64_SWAP},
+        "w13": dict.fromkeys((1, 2, 4, 8), _FP8_N64_SWAP_S4),
+        "w2": {
+            1: _FP8_N64_SWAP,
+            2: _FP8_N128_SWAP_S4,
+            4: _FP8_N64_SWAP_S2,
+            8: _FP8_N64_SWAP_S2,
+        },
     },
     MoeGemmShape(
         "NVIDIA H100 80GB HBM3",
@@ -241,16 +316,38 @@ _TUNED_FP8_ROUTED_CONFIGS = {
         512,
     ): {
         "w13": {
-            1: _FP8_N64_SWAP,
+            1: _FP8_N64_SWAP_S5,
             2: _FP8_N64_SWAP_S4,
             4: _FP8_N64_SWAP,
-            8: _FP8_N128,
+            8: _FP8_N64_SWAP_S4,
         },
         "w2": {
             1: _FP8_N64_SWAP_S4,
-            2: _FP8_N64_SWAP,
-            4: _FP8_N128,
+            2: _FP8_N128_SWAP_S4,
+            4: _FP8_N64_SWAP_S2,
             8: _FP8_N64_SWAP,
+        },
+    },
+    MoeGemmShape(
+        "NVIDIA H100 80GB HBM3",
+        (9, 0),
+        torch.float8_e4m3fn,
+        8,
+        256,
+        2048,
+        256,
+    ): {
+        "w13": {
+            1: _FP8_N64_SWAP_S4,
+            2: _FP8_N64_SWAP_S5,
+            4: _FP8_N64_SWAP_S4,
+            8: _FP8_N64_SWAP,
+        },
+        "w2": {
+            1: _FP8_N64_SWAP,
+            2: _FP8_N64_SWAP_S2,
+            4: _FP8_N64_SWAP_S2,
+            8: _FP8_N64_SWAP_S2,
         },
     },
     MoeGemmShape(
@@ -262,8 +359,13 @@ _TUNED_FP8_ROUTED_CONFIGS = {
         2048,
         512,
     ): {
-        "w13": {1: _FP8_N64_SWAP_S5},
-        "w2": {1: _FP8_N64_SWAP_S4},
+        "w13": dict.fromkeys((1, 2, 4, 8), _FP8_N64_SWAP_S4),
+        "w2": {
+            1: _FP8_N64_SWAP_S4,
+            2: _FP8_N64_SWAP,
+            4: _FP8_N64_SWAP_S2,
+            8: _FP8_N64_SWAP_S2,
+        },
     },
 }
 

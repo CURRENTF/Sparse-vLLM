@@ -357,7 +357,12 @@ class TritonHopperFusedMoeProvider(MoeProvider):
     priority = 20
     gate_up_order = "gate_up"
     PROFILED_DEVICE_NAME = "NVIDIA H100 80GB HBM3"
-    PROFILED_SHAPES = ((128, 64, 2048, 384, 8, 2, 2),)
+    PROFILED_SHAPES = (
+        (128, 64, 2048, 384, 8, 2, 2),
+        (256, 256, 2048, 512, 8, 1, 1),
+        (256, 256, 2048, 256, 8, 2, 1),
+        (256, 128, 2048, 512, 8, 1, 2),
+    )
 
     @classmethod
     def supports(cls, spec: MoeOpSpec, caps: DeviceCaps) -> SupportResult:
@@ -620,7 +625,7 @@ class H20Qwen36HybridFp8MoeProvider(HopperQwen36HybridFp8MoeProvider):
     name = "h20_qwen36_hybrid_fp8"
     priority = 111
     PROFILED_DEVICE_NAME = "NVIDIA H20"
-    TRITON_MAX_TOKENS_BY_EP_SIZE = {1: 1, 2: 1}
+    TRITON_MAX_TOKENS_BY_EP_SIZE = {1: 8, 2: 1}
 
 
 def resolve_moe_provider(
