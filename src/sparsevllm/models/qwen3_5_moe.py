@@ -25,6 +25,7 @@ from sparsevllm.operators.moe_router import (
     resolve_moe_router_provider,
 )
 from sparsevllm.platforms import device_runtime
+from sparsevllm.triton_kernel.qwen3_5.gated_shared_add import gated_shared_add
 from sparsevllm.utils.log import logger
 from sparsevllm.utils.weight_target import WeightTarget
 
@@ -64,18 +65,37 @@ class Qwen35MoeRouter(nn.Module):
         )
         self.provider = resolve_moe_router_provider(self.op_spec)
         self.weight = nn.Parameter(
-            torch.empty(self.num_experts, self.hidden_size)
+            torch.empty(self.num_experts + 1, self.hidden_size)
         )
+        self.weight.weight_loader = self.weight_loader
+
+    def weight_loader(
+        self,
+        param: nn.Parameter,
+        loaded_weight: torch.Tensor,
+        loaded_shard_id: str | None = None,
+    ) -> None:
+        target = param.data[-1:] if loaded_shard_id == "shared" else param.data[:-1]
+        if loaded_shard_id not in {None, "shared"} or target.shape != loaded_weight.shape:
+            raise ValueError(
+                "Qwen3.6 fused router/shared gate weight mismatch: "
+                f"shard={loaded_shard_id!r} expected={tuple(target.shape)} "
+                f"got={tuple(loaded_weight.shape)}."
+            )
+        target.copy_(loaded_weight)
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        router_logits = F.linear(hidden_states, self.weight)
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        router_logits, shared_gate_logits = F.linear(
+            hidden_states,
+            self.weight,
+        ).split((self.num_experts, 1), dim=-1)
         topk_weights, topk_ids = self.provider.run(
             self.op_spec, router_logits
         )
-        return topk_weights, topk_ids
+        return topk_weights, topk_ids, shared_gate_logits
 
 
 class Qwen35MoePackedExperts(Qwen3MoePackedExperts):
@@ -233,9 +253,7 @@ class Qwen35MoeSparseMoeBlock(nn.Module):
         self.shared_expert = Qwen35MLP(
             config,
             intermediate_size=int(config.shared_expert_intermediate_size),
-        )
-        self.shared_expert_gate = nn.Linear(
-            int(config.hidden_size), 1, bias=False
+            reduce_results=False,
         )
 
     def _forward_chunk(
@@ -243,12 +261,12 @@ class Qwen35MoeSparseMoeBlock(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         shared_output = self.shared_expert(hidden_states)
-        topk_weights, topk_ids = self.gate(hidden_states)
+        topk_weights, topk_ids, shared_gate_logits = self.gate(hidden_states)
         local_output = self.experts(hidden_states, topk_ids, topk_weights)
-        routed_output = self.parallel_context.world_all_reduce(local_output)
-        shared_gate = torch.sigmoid(self.shared_expert_gate(hidden_states))
-        gated_shared_output = shared_gate * shared_output
-        return routed_output + gated_shared_output
+        routed_output, shared_output = self.parallel_context.world_all_reduce(
+            torch.stack((local_output, shared_output))
+        )
+        return gated_shared_add(routed_output, shared_output, shared_gate_logits)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if hidden_states.dim() != 2:

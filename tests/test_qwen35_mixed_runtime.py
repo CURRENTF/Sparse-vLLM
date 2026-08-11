@@ -1,7 +1,7 @@
 import json
 from collections import deque
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -40,10 +40,12 @@ from sparsevllm.engine.sequence import Sequence
 from sparsevllm.engine.sparse_controller import LayerBatchSparseState, SparseController
 from sparsevllm.models.qwen3_5 import (
     Qwen35ForCausalLM,
+    Qwen35LinearAttention,
     Qwen35LinearConv1D,
     Qwen35RMSNorm,
     _get_rotary_dim,
 )
+from sparsevllm.models.qwen3_5_moe import Qwen35MoeRouter, Qwen35MoeSparseMoeBlock
 from sparsevllm.platforms.cpu import CpuPlatform
 from sparsevllm.sampling_params import SamplingParams
 from sparsevllm.utils.loader import _target_weight_name_for_model, _validate_all_quantized_weights_loaded
@@ -94,6 +96,126 @@ def _qwen35_outer_config(*, num_layers: int = 64, full_layers: tuple[int, ...] |
 def _make_config(tmp_path, **kwargs):
     with patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", return_value=_qwen35_outer_config()):
         return Config(model=str(tmp_path), **kwargs)
+
+
+def test_linear_attention_fuses_qkvz_and_ba_projections():
+    config = _qwen35_outer_config(num_layers=1, full_layers=()).text_config
+    config.quantization_config = None
+    config.runtime_recurrent_state_dtype = torch.float32
+    parallel_context = _single_process_parallel_context()
+    with (
+        patch(
+            "sparsevllm.models.qwen3_5.get_parallel_context",
+            return_value=parallel_context,
+        ),
+        patch(
+            "sparsevllm.layers.linear.get_parallel_context",
+            return_value=parallel_context,
+        ),
+    ):
+        attention = Qwen35LinearAttention(config)
+
+    torch.manual_seed(0)
+    attention.in_proj_qkvz.weight.data.normal_()
+    attention.in_proj_ba.weight.data.normal_()
+    hidden_states = torch.randn(3, config.hidden_size)
+    qkvz = torch.nn.functional.linear(
+        hidden_states,
+        attention.in_proj_qkvz.weight,
+    )
+    q, k, v, z = qkvz.split(
+        [
+            attention.tp_key_dim,
+            attention.tp_key_dim,
+            attention.tp_value_dim,
+            attention.tp_value_dim,
+        ],
+        dim=-1,
+    )
+    expected_b, expected_a = torch.nn.functional.linear(
+        hidden_states,
+        attention.in_proj_ba.weight,
+    ).chunk(2, dim=-1)
+
+    mixed_qkv, actual_z, actual_b, actual_a = attention._project_qkvzba(
+        hidden_states
+    )
+
+    torch.testing.assert_close(mixed_qkv, torch.cat((q, k, v), dim=-1))
+    torch.testing.assert_close(
+        actual_z,
+        z.view(-1, attention.num_v_heads, attention.head_v_dim),
+    )
+    torch.testing.assert_close(actual_b, expected_b)
+    torch.testing.assert_close(actual_a, expected_a)
+    assert Qwen35ForCausalLM.packed_modules_mapping["in_proj_z"] == (
+        "in_proj_qkvz",
+        3,
+    )
+
+
+def test_qwen35_moe_fuses_router_and_shared_gate_projection():
+    router = Qwen35MoeRouter.__new__(Qwen35MoeRouter)
+    torch.nn.Module.__init__(router)
+    router.num_experts, router.hidden_size = 4, 3
+    router.weight = torch.nn.Parameter(torch.empty(5, 3))
+    router.op_spec = object()
+    topk_weights, topk_ids = torch.ones(2, 1), torch.zeros(2, 1, dtype=torch.int32)
+    router.provider = Mock()
+    router.provider.run.return_value = (topk_weights, topk_ids)
+    expert_weight = torch.arange(12, dtype=torch.float32).view(4, 3)
+    shared_weight = torch.tensor([[2.0, 3.0, 5.0]])
+    router.weight_loader(router.weight, expert_weight)
+    router.weight_loader(router.weight, shared_weight, "shared")
+    hidden_states = torch.tensor([[1.0, 2.0, 3.0], [3.0, 2.0, 1.0]])
+
+    actual_weights, actual_ids, shared_logits = router(hidden_states)
+
+    assert actual_weights is topk_weights
+    assert actual_ids is topk_ids
+    torch.testing.assert_close(
+        shared_logits,
+        torch.nn.functional.linear(hidden_states, shared_weight),
+    )
+    router.provider.run.assert_called_once()
+    assert Qwen35ForCausalLM.packed_modules_mapping["shared_expert_gate"] == (
+        "gate",
+        "shared",
+    )
+
+
+def test_qwen35_moe_reduces_routed_and_shared_outputs_together():
+    class ReturnValue(torch.nn.Module):
+        def __init__(self, value):
+            super().__init__()
+            self.value = value
+
+        def forward(self, *_):
+            return self.value
+
+    hidden_states = torch.randn(2, 4)
+    local_output, shared_output = torch.randn_like(hidden_states), torch.randn_like(hidden_states)
+    gate_logits = torch.randn(2, 1)
+    block = Qwen35MoeSparseMoeBlock.__new__(Qwen35MoeSparseMoeBlock)
+    torch.nn.Module.__init__(block)
+    block.shared_expert = ReturnValue(shared_output)
+    block.gate = ReturnValue((torch.ones(2, 1), torch.zeros(2, 1, dtype=torch.int32), gate_logits))
+    block.experts = ReturnValue(local_output)
+    block.parallel_context = Mock()
+    block.parallel_context.world_all_reduce.side_effect = lambda outputs: outputs + 1
+
+    with patch(
+        "sparsevllm.models.qwen3_5_moe.gated_shared_add",
+        side_effect=lambda routed, shared, gate: routed + shared * gate.sigmoid(),
+    ):
+        actual = block._forward_chunk(hidden_states)
+
+    packed = block.parallel_context.world_all_reduce.call_args.args[0]
+    torch.testing.assert_close(packed, torch.stack((local_output, shared_output)))
+    torch.testing.assert_close(
+        actual,
+        local_output + 1 + (shared_output + 1) * gate_logits.sigmoid(),
+    )
 
 
 class _ResidentAdmissionCache:

@@ -403,9 +403,11 @@ class RowParallelLinear(LinearBase):
         output_size: int,
         bias: bool = False,
         quantization=None,
+        reduce_results: bool = True,
     ):
         tp_size = get_parallel_context().tp_size
         super().__init__(divide(input_size, tp_size), output_size, bias, 1, quantization=quantization)
+        self.reduce_results = bool(reduce_results)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param_data = param.data
@@ -452,4 +454,4 @@ class RowParallelLinear(LinearBase):
             y = self.quant_provider(x, self.weight, self.weight_scale_inv, bias)
         else:
             y = F.linear(x, self.weight, bias)
-        return self.parallel_context.tp_all_reduce(y)
+        return self.parallel_context.tp_all_reduce(y) if self.reduce_results else y

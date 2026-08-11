@@ -198,8 +198,8 @@ def topk_softmax(
             "Triton topk_softmax supports BF16 and FP16 logits, got "
             f"{router_logits.dtype}."
         )
-    if not router_logits.is_contiguous():
-        raise ValueError("Triton topk_softmax requires contiguous router_logits.")
+    if router_logits.stride(1) != 1:
+        raise ValueError("Triton topk_softmax requires a contiguous expert dimension.")
     if int(router_logits.shape[0]) <= 0:
         raise ValueError("Triton topk_softmax requires at least one token.")
     num_experts = int(router_logits.shape[1])
