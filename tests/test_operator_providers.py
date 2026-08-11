@@ -15,6 +15,7 @@ from sparsevllm.operators.fp8_linear import (
 from sparsevllm.operators.moe import (
     MOE_REGISTRY,
     FlashInferCutlassFp8MoeProvider,
+    H20Qwen36HybridFp8MoeProvider,
     HopperQwen36HybridFp8MoeProvider,
     MoeOpSpec,
     resolve_moe_provider,
@@ -608,6 +609,29 @@ def test_qwen36_hybrid_moe_supports_eager_execution():
         )
 
     assert resolved.provider.name == "hopper_qwen36_hybrid_fp8"
+
+
+def test_h20_qwen36_hybrid_moe_uses_profiled_provider():
+    spec = _moe_spec(
+        hidden_size=2048,
+        intermediate_size=512,
+        num_local_experts=256,
+        num_experts=256,
+        top_k=8,
+        ep_size=1,
+        tp_size=1,
+    )
+    with patch("sparsevllm.operators.moe.find_spec", return_value=object()):
+        resolved = OpResolver(MOE_REGISTRY).resolve(
+            spec,
+            _cuda_caps((9, 0), device_name="NVIDIA H20"),
+        )
+
+    assert resolved.provider.name == "h20_qwen36_hybrid_fp8"
+
+
+def test_h20_qwen36_hybrid_moe_limits_triton_to_profiled_token_count():
+    assert H20Qwen36HybridFp8MoeProvider.TRITON_MAX_TOKENS_BY_EP_SIZE == {1: 1, 2: 1}
 
 
 def test_qwen36_hybrid_moe_dispatches_by_token_bucket():

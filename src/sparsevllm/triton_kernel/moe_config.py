@@ -161,11 +161,36 @@ _FP8_N64_SWAP = MoeGemmConfig(16, 64, 128, 1, 4, 3, True)
 _FP8_N64_SWAP_S4 = MoeGemmConfig(16, 64, 128, 1, 4, 4, True)
 _FP8_N64_SWAP_S5 = MoeGemmConfig(16, 64, 128, 1, 4, 5, True)
 _FP8_N128 = MoeGemmConfig(16, 128, 128, 1, 4, 3)
+_FP8_N128_SWAP_S4 = MoeGemmConfig(16, 128, 128, 1, 4, 4, True)
 
 
 # Qwen3.6-35B-A3B block-FP8 decode profiles tuned offline on H100. Larger
 # token buckets retain the explicit generic configuration until profiled.
 _TUNED_FP8_ROUTED_CONFIGS = {
+    MoeGemmShape(
+        "H20",
+        (9, 0),
+        torch.float8_e4m3fn,
+        8,
+        256,
+        2048,
+        512,
+    ): {
+        "w13": {1: _FP8_N64_SWAP_S4},
+        "w2": {1: _FP8_N128_SWAP_S4},
+    },
+    MoeGemmShape(
+        "H20",
+        (9, 0),
+        torch.float8_e4m3fn,
+        8,
+        128,
+        2048,
+        512,
+    ): {
+        "w13": {1: _FP8_N64_SWAP_S4},
+        "w2": {1: _FP8_N64_SWAP},
+    },
     MoeGemmShape(
         "NVIDIA H100 80GB HBM3",
         (9, 0),

@@ -205,6 +205,36 @@ def test_h100_qwen36_fp8_ep2_uses_profiled_configs():
     assert (w2.block_n, w2.num_stages, w2.swap_ab) == (64, 4, True)
 
 
+@pytest.mark.parametrize(
+    ("local_experts", "stage", "block_n", "num_stages"),
+    [
+        (256, "w13", 64, 4),
+        (256, "w2", 128, 4),
+        (128, "w13", 64, 4),
+        (128, "w2", 64, 3),
+    ],
+)
+def test_h20_qwen36_fp8_uses_profiled_decode_configs(
+    local_experts, stage, block_n, num_stages
+):
+    config = resolve_fp8_routed_gemm_config(
+        num_tokens=1,
+        top_k=8,
+        num_local_experts=local_experts,
+        hidden_size=2048,
+        intermediate_size=512,
+        stage=stage,
+        device_name="NVIDIA H20",
+        device_capability=(9, 0),
+    )
+
+    assert (config.block_n, config.num_stages, config.swap_ab) == (
+        block_n,
+        num_stages,
+        True,
+    )
+
+
 def test_fp8_routed_unknown_shape_uses_explicit_default():
     config = resolve_fp8_routed_gemm_config(
         num_tokens=1,

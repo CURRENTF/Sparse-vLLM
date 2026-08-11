@@ -510,6 +510,7 @@ class HopperQwen36HybridFp8MoeProvider(FlashInferCutlassFp8MoeProvider):
 
     name = "hopper_qwen36_hybrid_fp8"
     priority = 110
+    PROFILED_DEVICE_NAME = "NVIDIA H100 80GB HBM3"
     PROFILED_SHAPES = frozenset(
         {
             (256, 256, 2048, 512, 8, 1, 1),
@@ -522,9 +523,9 @@ class HopperQwen36HybridFp8MoeProvider(FlashInferCutlassFp8MoeProvider):
     def supports(cls, spec: MoeOpSpec, caps: DeviceCaps) -> SupportResult:
         if spec.cuda_graph and not caps.supports_graph_capture:
             return SupportResult.no("device does not support CUDA Graph capture")
-        if caps.device_name != "NVIDIA H100 80GB HBM3":
+        if caps.device_name != cls.PROFILED_DEVICE_NAME:
             return SupportResult.no(
-                "requires profiled NVIDIA H100 80GB HBM3 hardware, "
+                f"requires profiled {cls.PROFILED_DEVICE_NAME} hardware, "
                 f"got {caps.device_name}"
             )
         actual_shape = (
@@ -599,6 +600,14 @@ class HopperQwen36HybridFp8MoeProvider(FlashInferCutlassFp8MoeProvider):
             local_expert_start=local_expert_start,
             gate_up_order=self.gate_up_order,
         )
+
+
+@MOE_REGISTRY.register
+class H20Qwen36HybridFp8MoeProvider(HopperQwen36HybridFp8MoeProvider):
+    name = "h20_qwen36_hybrid_fp8"
+    priority = 111
+    PROFILED_DEVICE_NAME = "NVIDIA H20"
+    TRITON_MAX_TOKENS_BY_EP_SIZE = {1: 1, 2: 1}
 
 
 def resolve_moe_provider(
