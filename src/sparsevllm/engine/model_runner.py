@@ -18,6 +18,7 @@ from sparsevllm.engine.sequence import Sequence
 from sparsevllm.models.qwen2 import Qwen2ForCausalLM
 from sparsevllm.models.llama import LlamaForCausalLM
 from sparsevllm.layers.sampler import Sampler
+from sparsevllm.operators import registry as operator_registry
 from sparsevllm.utils.context import set_context, get_context, reset_context
 from sparsevllm.utils.loader import load_model, sync_deltakv_config_from_checkpoint
 
@@ -29,6 +30,7 @@ from sparsevllm.engine.chain_cache import ChainAdmissionPlan, ChainCacheCoordina
 from sparsevllm.engine.recurrent_state_manager import RecurrentStateManager, RecurrentStateSpec
 from sparsevllm.engine.runtime_state import RuntimeState
 from sparsevllm.engine.sparse_controller import SparseController
+from sparsevllm.models.spec import ModelSpec
 import sparsevllm.platforms as platforms
 from sparsevllm.utils.profiler import profiler
 
@@ -44,17 +46,26 @@ except ImportError:
 
 try:
     from sparsevllm.models.minimax_m2 import MiniMaxM2ForCausalLM
-    _MINIMAX_M2_IMPORT_ERROR = None
-except ImportError as exc:
+except ImportError:
     MiniMaxM2ForCausalLM = None
-    _MINIMAX_M2_IMPORT_ERROR = exc
 
 try:
     from sparsevllm.models.qwen3_5 import Qwen35ForCausalLM
-    _QWEN35_IMPORT_ERROR = None
-except ImportError as exc:
+except ImportError:
     Qwen35ForCausalLM = None
-    _QWEN35_IMPORT_ERROR = exc
+
+try:
+    from sparsevllm.models.qwen3_5_moe import Qwen35MoeForCausalLM
+except ImportError:
+    Qwen35MoeForCausalLM = None
+
+
+def _create_model(hf_config, model_spec: ModelSpec):
+    class_name = model_spec.runtime_class_name
+    model_class = globals().get(class_name)
+    if model_class is None:
+        raise ImportError(f"{class_name} is unavailable for {model_spec.name}.")
+    return model_class(hf_config)
 
 
 TP_SHM_NAME_PREFIX = "sparsevllm_"
@@ -78,6 +89,7 @@ TP_RPC_STATUS_SYNC_METHODS = PREFIX_CACHE_CONTROL_RPC_METHODS | {
     "debug_moe_states_cpu",
     "free_slots",
     "free_slots_batch",
+    "log_operator_implementations",
     "refresh_prefix_cache_hit",
     "reset_after_warmup",
     "run",
@@ -131,10 +143,7 @@ class ModelRunner:
                 rank=rank,
             )
         self.parallel_context = init_parallel_context(
-            tp_size=config.tensor_parallel_size,
-            ep_size=config.expert_parallel_size,
-            dp_size=config.data_parallel_size,
-            hybrid_moe=config.uses_outer_tp_moe_layout,
+            topology=config.parallel_topology,
         )
 
         # CUDA allocator peaks are process-global and survive LLMEngine.exit().
@@ -146,43 +155,13 @@ class ModelRunner:
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device(self.device)
         setattr(hf_config, "mlp_chunk_size", config.mlp_chunk_size)
+        setattr(
+            hf_config,
+            "decode_cuda_graph",
+            bool(getattr(config, "decode_cuda_graph", False)),
+        )
         
-        # 加载对应的模型分片 (Shards)
-        if hf_config.model_type == "qwen2":
-            self.model = Qwen2ForCausalLM(hf_config)
-        elif hf_config.model_type == "qwen3":
-            if Qwen3ForCausalLM is None:
-                raise ImportError(
-                    "Qwen3ForCausalLM is unavailable in this Transformers installation. "
-                    "Use a Transformers version with Qwen3 support for Qwen3 models."
-                )
-            self.model = Qwen3ForCausalLM(hf_config)
-        elif hf_config.model_type == "qwen3_moe":
-            if Qwen3MoeForCausalLM is None:
-                raise ImportError(
-                    "Qwen3MoeForCausalLM is unavailable in this Transformers installation. "
-                    "Use a Transformers version with Qwen3MoE config support."
-                )
-            self.model = Qwen3MoeForCausalLM(hf_config)
-        elif hf_config.model_type == "minimax_m2":
-            if MiniMaxM2ForCausalLM is None:
-                raise ImportError(
-                    "MiniMaxM2ForCausalLM is unavailable; verify the MiniMax FP8 "
-                    "runtime dependencies in the active uv environment: "
-                    f"{_MINIMAX_M2_IMPORT_ERROR}"
-                ) from _MINIMAX_M2_IMPORT_ERROR
-            self.model = MiniMaxM2ForCausalLM(hf_config)
-        elif hf_config.model_type == "qwen3_5":
-            if Qwen35ForCausalLM is None:
-                raise ImportError(
-                    "Qwen35ForCausalLM is unavailable. Install the qwen3_5 runtime "
-                    f"dependencies and verify vendored kernels import correctly: {_QWEN35_IMPORT_ERROR}"
-                ) from _QWEN35_IMPORT_ERROR
-            self.model = Qwen35ForCausalLM(hf_config)
-        elif hf_config.model_type == "llama":
-            self.model = LlamaForCausalLM(hf_config)
-        else:
-            raise NotImplementedError(f"Unsupported Sparse-vLLM model_type={hf_config.model_type!r}.")
+        self.model = _create_model(hf_config, config.model_spec)
         if config.tiny_random:
             from sparsevllm.debug.tiny_random import initialize_sparse_model
 
@@ -201,8 +180,9 @@ class ModelRunner:
                 show_progress=self.parallel_context.world_rank == 0,
                 progress_rank=0 if self.parallel_context.world_rank == 0 else None,
             )
-        if hf_config.model_type in {"qwen3_moe", "minimax_m2"}:
-            self.model.warmup_moe()
+        warmup_moe = getattr(self.model, "warmup_moe", None)
+        if callable(warmup_moe):
+            warmup_moe()
         
         self.sampler = Sampler()
 
@@ -565,6 +545,10 @@ class ModelRunner:
             self.decode_cuda_graph_runner.clear_captured_graphs()
         if os.getenv("SPARSEVLLM_DELTAKV_CLEAR_ATTN_SCORE_BUFFERS_AFTER_WARMUP", "0") == "1":
             self.sparse_controller.clear_decode_attn_score_buffers()
+
+    def log_operator_implementations(self) -> None:
+        if self.parallel_context.world_rank == 0:
+            operator_registry.log_operator_implementations()
 
     def warmup_moe_workspace(self, num_tokens: int) -> None:
         warmup_moe = getattr(self.model, "warmup_moe", None)

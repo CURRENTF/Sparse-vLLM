@@ -10,6 +10,8 @@ from typing import Callable
 import torch
 from torch import nn
 
+from sparsevllm.operators.registry import record_operator_binding
+
 
 RMSNormFn = Callable[[torch.Tensor, torch.Tensor, float], torch.Tensor]
 FusedAddRMSNormFn = Callable[
@@ -140,6 +142,7 @@ class RMSNorm(nn.Module):
             zero_centered_weight=self.zero_centered_weight,
             provider=provider,
         )
+        record_operator_binding("RMSNorm", self)
 
     @property
     def provider_name(self) -> str:

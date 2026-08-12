@@ -644,7 +644,6 @@ def benchmark_task(method, length, bs, args, results_dict):
                 ):
                     ttft = perf_counter() - t_start
             elif num_tokens < 0:
-                # print(f'one decode step ... {perf_counter() - last_time}')
                 decode_started = True
                 decode_steps_since_last_wave += 1
                 decode_times.append(step_dt)
@@ -680,12 +679,7 @@ def benchmark_task(method, length, bs, args, results_dict):
                 f"{decode_warmup_steps_after_full} warmup steps."
             )
 
-        print(f'@@@ {decode_tokens=}')
-                
         torch.cuda.synchronize()
-        t_end = perf_counter()
-        
-        duration = t_end - t_start
         peak_mem = get_peak_memory()
         graph_status = _decode_cuda_graph_status(llm)
         prefix_cache_stats_after = _cache_stats(llm)
@@ -722,7 +716,6 @@ def benchmark_task(method, length, bs, args, results_dict):
         prefill_s = sum(prefill_times)
         decode_s = sum(decode_times)
 
-        print(f'[debug] {prefill_tokens=} {prefill_s=} {ttft=} {decode_tokens=} {decode_s=} {has_queued=}')
         prefill_tp = prefill_tokens / prefill_s if prefill_s > 0 else 0
         used_full_admission_window = bool(decode_times_after_full)
         decode_s_effective = sum(decode_times_after_full) if used_full_admission_window else decode_s

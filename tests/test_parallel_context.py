@@ -1,16 +1,18 @@
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
 import torch.distributed as dist
 
 import sparsevllm.platforms as platforms
-from sparsevllm.config import Config
-from sparsevllm.distributed import ParallelContext, ParallelGroup
-from sparsevllm.distributed.parallel_context import (
+from sparsevllm.config import Config, RuntimeLayout
+from sparsevllm.distributed import (
+    ParallelContext,
+    ParallelGroup,
+    ParallelMode,
+    ParallelTopology,
     get_parallel_context,
-    hybrid_moe_group_ranks,
     init_parallel_context,
     parallel_group_ranks,
     parallel_ranks_from_world_rank,
@@ -88,51 +90,64 @@ def _hf_config(model_type: str = "qwen3_moe", *, num_experts: int = 8):
 
 
 def test_world_rank_mapping_round_trips():
+    topology = ParallelTopology(2, 3, 4)
     for world_rank in range(24):
-        ranks = parallel_ranks_from_world_rank(
-            world_rank,
-            tp_size=2,
-            ep_size=3,
-            dp_size=4,
-        )
-        assert world_rank_from_parallel_ranks(
-            *ranks,
-            tp_size=2,
-            ep_size=3,
-            dp_size=4,
-        ) == world_rank
+        ranks = parallel_ranks_from_world_rank(topology, world_rank)
+        assert world_rank_from_parallel_ranks(topology, *ranks) == world_rank
 
 
 def test_parallel_group_members_follow_dp_ep_tp_layout():
-    assert parallel_group_ranks(tp_size=2, ep_size=2, dp_size=2) == {
-        "tensor": ((0, 1), (2, 3), (4, 5), (6, 7)),
+    tensor_groups = ((0, 1), (2, 3), (4, 5), (6, 7))
+    assert parallel_group_ranks(ParallelTopology(2, 2, 2)) == {
+        "tensor": tensor_groups,
         "expert": ((0, 2), (1, 3), (4, 6), (5, 7)),
         "data": ((0, 4), (1, 5), (2, 6), (3, 7)),
+        "moe_tensor": tensor_groups,
     }
 
 
 def test_hybrid_moe_groups_split_outer_attention_world():
-    assert hybrid_moe_group_ranks(outer_tp_size=4, moe_ep_size=2) == {
-        "attention": ((0, 1, 2, 3),),
+    topology = ParallelTopology(4, 2, 1, ParallelMode.OUTER_TP_MOE)
+    assert parallel_group_ranks(topology) == {
+        "tensor": ((0, 1, 2, 3),),
         "moe_tensor": ((0, 1), (2, 3)),
-        "moe_expert": ((0, 2), (1, 3)),
+        "expert": ((0, 2), (1, 3)),
         "data": ((0,), (1,), (2,), (3,)),
     }
+
+
+def test_parallel_topology_resolves_rank_local_sizes():
+    standard = ParallelTopology(2, 4, 1)
+    hybrid = ParallelTopology(4, 2, 1, ParallelMode.OUTER_TP_MOE)
+
+    assert (standard.world_size, standard.attention_tp_size, standard.moe_tp_size) == (8, 2, 2)
+    assert (hybrid.world_size, hybrid.attention_tp_size, hybrid.moe_tp_size) == (4, 4, 2)
+
+
+@pytest.mark.parametrize(
+    "topology",
+    [
+        (0, 1, 1, ParallelMode.STANDARD),
+        (4, 3, 1, ParallelMode.OUTER_TP_MOE),
+        (4, 2, 2, ParallelMode.OUTER_TP_MOE),
+    ],
+)
+def test_parallel_topology_rejects_invalid_sizes(topology):
+    with pytest.raises(ValueError):
+        ParallelTopology(*topology)
 
 
 def test_hybrid_moe_parallel_context_uses_explicit_groups():
     reset_parallel_context()
     with (
         patch.object(dist, "is_initialized", return_value=True),
-        patch.object(dist, "get_world_size", return_value=4),
-        patch.object(dist, "get_rank", return_value=2),
-        patch.object(dist, "new_group", side_effect=lambda _ranks: object()),
+            patch.object(dist, "get_world_size", return_value=4),
+            patch.object(dist, "get_rank", return_value=2),
+            patch.object(dist, "get_backend", return_value=dist.Backend.GLOO),
+            patch.object(dist, "new_group", side_effect=lambda _ranks: object()),
     ):
         context = init_parallel_context(
-            tp_size=4,
-            ep_size=2,
-            dp_size=1,
-            hybrid_moe=True,
+            topology=ParallelTopology(4, 2, 1, ParallelMode.OUTER_TP_MOE),
         )
     assert context.attention.ranks == (0, 1, 2, 3)
     assert context.attention_tp_rank == 2
@@ -156,9 +171,11 @@ def test_parallel_context_lifecycle_and_local_groups():
         patch.object(dist, "is_initialized", return_value=True),
         patch.object(dist, "get_world_size", return_value=4),
         patch.object(dist, "get_rank", return_value=2),
+        patch.object(dist, "get_backend", return_value=dist.Backend.GLOO),
         patch.object(dist, "new_group", side_effect=new_group),
     ):
-        context = init_parallel_context(tp_size=1, ep_size=2, dp_size=2)
+        topology = ParallelTopology(1, 2, 2)
+        context = init_parallel_context(topology=topology)
         assert context.world_rank == 2
         assert context.tp_rank == 0
         assert context.tp_size == 1
@@ -168,7 +185,7 @@ def test_parallel_context_lifecycle_and_local_groups():
         assert context.data.ranks == (0, 2)
         assert get_parallel_context() is context
         with pytest.raises(RuntimeError, match="already initialized"):
-            init_parallel_context(tp_size=1, ep_size=2, dp_size=2)
+            init_parallel_context(topology=topology)
 
     assert [ranks for ranks, _ in fake_groups] == [
         (0, 1),
@@ -189,7 +206,7 @@ def test_parallel_context_rejects_world_size_mismatch():
         patch.object(dist, "get_rank", return_value=0),
     ):
         with pytest.raises(ValueError, match="does not match"):
-            init_parallel_context(tp_size=1, ep_size=4, dp_size=1)
+            init_parallel_context(topology=ParallelTopology(1, 4, 1))
 
 
 def test_ep_broadcast_uses_source_world_rank():
@@ -235,7 +252,7 @@ def test_qwen3_moe_parallel_config_validation(tmp_path):
     assert config.expert_parallel_size == 1
 
     with patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", return_value=_hf_config()):
-        with pytest.raises(ValueError, match="num_key_value_heads must be divisible"):
+        with pytest.raises(ValueError, match="num_key_value_heads"):
             Config(model=str(tmp_path), tensor_parallel_size=4)
 
     fp16 = _hf_config()
@@ -245,7 +262,7 @@ def test_qwen3_moe_parallel_config_validation(tmp_path):
             Config(model=str(tmp_path), tensor_parallel_size=2)
 
     with patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", return_value=_hf_config()):
-        with pytest.raises(ValueError, match="outer tensor_parallel_size"):
+        with pytest.raises(ValueError, match="TP divisible by EP"):
             Config(model=str(tmp_path), tensor_parallel_size=3, expert_parallel_size=2)
 
     with patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", return_value=_hf_config(num_experts=6)):
@@ -352,7 +369,7 @@ def test_qwen3_dense_fp8_rejects_wrong_architecture(tmp_path):
 
 def test_dense_config_rejects_expert_or_data_parallelism(tmp_path):
     with patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", return_value=_hf_config("qwen3")):
-        with pytest.raises(ValueError, match="requires EP=1 and DP=1"):
+        with pytest.raises(ValueError, match="does not support expert parallelism"):
             Config(model=str(tmp_path), expert_parallel_size=2)
 
 
@@ -371,6 +388,24 @@ def test_dense_layers_use_tp_group_in_replicated_ep_topology():
     assert embedding.weight.shape == (32, 8)
 
 
+def test_parallel_group_uses_bound_all_reduce_provider():
+    provider = Mock()
+    input_tensor, output_tensor = torch.randn(2), torch.randn(2)
+    provider.run.return_value = output_tensor
+    group = ParallelGroup(
+        process_group=None,
+        ranks=(0, 1),
+        rank=0,
+        size=2,
+        all_reduce_provider=provider,
+    )
+
+    actual = ParallelContext._all_reduce(input_tensor, group)
+
+    assert actual is output_tensor
+    provider.run.assert_called_once_with(input_tensor)
+
+
 def test_cache_kv_heads_depend_on_tp_not_ep():
     context = _replicated_ep_context()
     config = SimpleNamespace(
@@ -381,7 +416,7 @@ def test_cache_kv_heads_depend_on_tp_not_ep():
             hidden_size=32,
             head_dim=4,
         ),
-        runtime_layout=None,
+        runtime_layout=RuntimeLayout.dense(2),
         max_model_len=128,
         max_num_seqs_in_gpu=2,
         max_num_seqs_in_batch=2,

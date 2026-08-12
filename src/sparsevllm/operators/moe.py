@@ -356,6 +356,13 @@ class TritonHopperFusedMoeProvider(MoeProvider):
     name = "triton_hopper_fused"
     priority = 20
     gate_up_order = "gate_up"
+    PROFILED_DEVICE_NAME = "NVIDIA H100 80GB HBM3"
+    PROFILED_SHAPES = (
+        (128, 64, 2048, 384, 8, 2, 2),
+        (256, 256, 2048, 512, 8, 1, 1),
+        (256, 256, 2048, 256, 8, 2, 1),
+        (256, 128, 2048, 512, 8, 1, 2),
+    )
 
     @classmethod
     def supports(cls, spec: MoeOpSpec, caps: DeviceCaps) -> SupportResult:
@@ -373,14 +380,13 @@ class TritonHopperFusedMoeProvider(MoeProvider):
             )
         if spec.weight_dtype != torch.bfloat16 or spec.block_shape is not None:
             return SupportResult.no("requires unquantized BF16 expert weights")
-        if caps.device_name != "NVIDIA H100 80GB HBM3":
+        if caps.device_name != cls.PROFILED_DEVICE_NAME:
             return SupportResult.no(
-                "requires profiled NVIDIA H100 80GB HBM3 hardware, "
+                f"requires profiled {cls.PROFILED_DEVICE_NAME} hardware, "
                 f"got {caps.device_name}"
             )
         if not caps.supports_bfloat16:
             return SupportResult.no("device does not support BF16")
-        profiled_shape = (128, 64, 2048, 384, 8, 2, 2)
         actual_shape = (
             spec.num_experts,
             spec.num_local_experts,
@@ -390,10 +396,10 @@ class TritonHopperFusedMoeProvider(MoeProvider):
             spec.tp_size,
             spec.ep_size,
         )
-        if actual_shape != profiled_shape:
+        if actual_shape not in cls.PROFILED_SHAPES:
             return SupportResult.no(
-                "requires profiled TP2xEP2 MoE shape "
-                f"{profiled_shape}, got {actual_shape}"
+                "requires a profiled MoE shape in "
+                f"{cls.PROFILED_SHAPES}, got {actual_shape}"
             )
         return SupportResult.yes()
 
@@ -425,6 +431,18 @@ class TritonHopperFusedMoeProvider(MoeProvider):
             num_experts=spec.num_experts,
             local_expert_start=local_expert_start,
         )
+
+
+@MOE_REGISTRY.register
+class H20Qwen36FusedMoeProvider(TritonHopperFusedMoeProvider):
+    name = "h20_qwen36_fused_bf16"
+    priority = 21
+    PROFILED_DEVICE_NAME = "NVIDIA H20"
+    PROFILED_SHAPES = (
+        (256, 256, 2048, 512, 8, 1, 1),
+        (256, 256, 2048, 256, 8, 2, 1),
+        (256, 128, 2048, 512, 8, 1, 2),
+    )
 
 
 @MOE_REGISTRY.register
@@ -502,6 +520,112 @@ class TritonMoeProvider(MoeProvider):
             num_experts=spec.num_experts,
             local_expert_start=local_expert_start,
         )
+
+
+@MOE_REGISTRY.register
+class HopperQwen36HybridFp8MoeProvider(FlashInferCutlassFp8MoeProvider):
+    """Bind one weight layout and dispatch profiled token buckets by kernel."""
+
+    name = "hopper_qwen36_hybrid_fp8"
+    priority = 110
+    PROFILED_DEVICE_NAME = "NVIDIA H100 80GB HBM3"
+    PROFILED_SHAPES = frozenset(
+        {
+            (256, 256, 2048, 512, 8, 1, 1),
+            (256, 128, 2048, 512, 8, 1, 2),
+        }
+    )
+    TRITON_MAX_TOKENS_BY_EP_SIZE = {1: 8, 2: 4}
+
+    @classmethod
+    def supports(cls, spec: MoeOpSpec, caps: DeviceCaps) -> SupportResult:
+        if spec.cuda_graph and not caps.supports_graph_capture:
+            return SupportResult.no("device does not support CUDA Graph capture")
+        if caps.device_name != cls.PROFILED_DEVICE_NAME:
+            return SupportResult.no(
+                f"requires profiled {cls.PROFILED_DEVICE_NAME} hardware, "
+                f"got {caps.device_name}"
+            )
+        actual_shape = (
+            spec.num_experts,
+            spec.num_local_experts,
+            spec.hidden_size,
+            spec.intermediate_size,
+            spec.top_k,
+            spec.tp_size,
+            spec.ep_size,
+        )
+        if actual_shape not in cls.PROFILED_SHAPES:
+            return SupportResult.no(
+                "requires profiled Qwen3.6 TP1/EP1 or "
+                "global-TP2/MoE-TP1xEP2 shape "
+                f"{sorted(cls.PROFILED_SHAPES)}, "
+                f"got {actual_shape}"
+            )
+        flashinfer_support = super().supports(spec, caps)
+        if not flashinfer_support.supported:
+            return SupportResult.no(
+                f"FlashInfer prefill path: {flashinfer_support.reason}"
+            )
+        triton_support = TritonMoeProvider.supports(spec, caps)
+        if not triton_support.supported:
+            return SupportResult.no(
+                f"Triton decode path: {triton_support.reason}"
+            )
+        return SupportResult.yes()
+
+    def run(
+        self,
+        spec,
+        hidden_states,
+        topk_ids,
+        topk_weights,
+        w13_weight,
+        w2_weight,
+        w13_scale_inv,
+        w2_scale_inv,
+        *,
+        local_expert_start,
+        ep_rank,
+    ):
+        triton_max_tokens = self.TRITON_MAX_TOKENS_BY_EP_SIZE[int(spec.ep_size)]
+        if int(hidden_states.shape[0]) > triton_max_tokens:
+            return super().run(
+                spec,
+                hidden_states,
+                topk_ids,
+                topk_weights,
+                w13_weight,
+                w2_weight,
+                w13_scale_inv,
+                w2_scale_inv,
+                local_expert_start=local_expert_start,
+                ep_rank=ep_rank,
+            )
+        if w13_scale_inv is None or w2_scale_inv is None:
+            raise RuntimeError("Qwen3.6 hybrid FP8 MoE requires expert scales.")
+        from sparsevllm.triton_kernel.moe import fused_moe_fp8
+
+        return fused_moe_fp8(
+            hidden_states,
+            w13_weight,
+            w2_weight,
+            w13_scale_inv,
+            w2_scale_inv,
+            topk_ids,
+            topk_weights,
+            num_experts=spec.num_experts,
+            local_expert_start=local_expert_start,
+            gate_up_order=self.gate_up_order,
+        )
+
+
+@MOE_REGISTRY.register
+class H20Qwen36HybridFp8MoeProvider(HopperQwen36HybridFp8MoeProvider):
+    name = "h20_qwen36_hybrid_fp8"
+    priority = 111
+    PROFILED_DEVICE_NAME = "NVIDIA H20"
+    TRITON_MAX_TOKENS_BY_EP_SIZE = {1: 8, 2: 1}
 
 
 def resolve_moe_provider(

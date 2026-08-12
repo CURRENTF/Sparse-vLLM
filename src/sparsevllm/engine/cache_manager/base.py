@@ -191,9 +191,7 @@ class CacheManager(ABC):
         self.num_layers = self.hf_config.num_hidden_layers
         self.runtime_layout = getattr(config, "runtime_layout", None)
         if self.runtime_layout is None:
-            from sparsevllm.config import RuntimeLayout
-
-            self.runtime_layout = RuntimeLayout.dense(self.num_layers)
+            raise ValueError("CacheManager requires config.runtime_layout.")
         self.num_kv_layers = int(self.runtime_layout.num_kv_layers)
 
         self.num_kv_heads = self.hf_config.num_key_value_heads // self.tp_size
@@ -268,10 +266,6 @@ class CacheManager(ABC):
     @staticmethod
     def create(config: Config, parallel_context: ParallelContext) -> "CacheManager":
         sparse_method = normalize_sparse_method(config.vllm_sparse_method)
-        model_type = getattr(getattr(config, "hf_config", None), "model_type", "") or ""
-
-        if model_type in {"deepseek_v2", "deepseek_v32"}:
-            raise NotImplementedError(f"Unsupported Sparse-vLLM model_type={model_type!r}.")
         if sparse_method not in SUPPORTED_SPARSE_METHODS:
             raise ValueError(f"Unsupported vllm_sparse_method={sparse_method!r}.")
         if sparse_method == "deltakv":

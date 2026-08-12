@@ -7,7 +7,6 @@ from torch import nn
 import torch.nn.functional as F
 
 from sparsevllm.distributed import get_parallel_context
-from sparsevllm.layers.activation import SiluAndMul
 from sparsevllm.layers.attention import Attention
 from sparsevllm.layers.layernorm import GemmaRMSNorm
 from sparsevllm.layers.linear import (
@@ -15,6 +14,10 @@ from sparsevllm.layers.linear import (
     MergedColumnParallelLinear,
     RowParallelLinear,
     divide,
+)
+from sparsevllm.operators.gate_up_swiglu import (
+    GateUpSwiGLUOpSpec,
+    resolve_gate_up_swiglu_provider,
 )
 from sparsevllm.layers.rotary_embedding import apply_partial_rotary_emb, get_rope
 from sparsevllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
@@ -375,42 +378,28 @@ class Qwen35LinearAttention(nn.Module):
         if self.activation not in ("silu", "swish"):
             raise NotImplementedError(f"qwen3_5 linear attention supports silu/swish activation, got {self.activation!r}.")
         self.proj_chunk_size = int(getattr(config, "mlp_chunk_size", 16384))
+        self.recurrent_state_dtype = getattr(
+            config,
+            "runtime_recurrent_state_dtype",
+            getattr(config, "torch_dtype", torch.bfloat16),
+        )
+        if not isinstance(self.recurrent_state_dtype, torch.dtype):
+            raise TypeError(
+                "qwen3_5 runtime_recurrent_state_dtype must be a torch.dtype, "
+                f"got {self.recurrent_state_dtype!r}."
+            )
         quantization = getattr(config, "quantization_config", None)
 
         hidden_size = int(config.hidden_size)
-        self.in_proj_q = ColumnParallelLinear(
+        self.in_proj_qkvz = MergedColumnParallelLinear(
             hidden_size,
-            self.key_dim,
+            [self.key_dim, self.key_dim, self.value_dim, self.value_dim],
             bias=False,
             quantization=quantization,
         )
-        self.in_proj_k = ColumnParallelLinear(
+        self.in_proj_ba = MergedColumnParallelLinear(
             hidden_size,
-            self.key_dim,
-            bias=False,
-            quantization=quantization,
-        )
-        self.in_proj_v = ColumnParallelLinear(
-            hidden_size,
-            self.value_dim,
-            bias=False,
-            quantization=quantization,
-        )
-        self.in_proj_z = ColumnParallelLinear(
-            hidden_size,
-            self.value_dim,
-            bias=False,
-            quantization=quantization,
-        )
-        self.in_proj_b = ColumnParallelLinear(
-            hidden_size,
-            self.total_num_v_heads,
-            bias=False,
-            quantization=None,
-        )
-        self.in_proj_a = ColumnParallelLinear(
-            hidden_size,
-            self.total_num_v_heads,
+            [self.total_num_v_heads, self.total_num_v_heads],
             bias=False,
             quantization=None,
         )
@@ -462,16 +451,21 @@ class Qwen35LinearAttention(nn.Module):
 
     def _load_projection_weight(
         self,
-        module: ColumnParallelLinear,
+        module: MergedColumnParallelLinear,
         loaded_weight: torch.Tensor,
         loaded_scale: torch.Tensor | None,
+        shard_id: int,
     ) -> None:
         if loaded_scale is not None:
-            module.load_quantized_weight(loaded_weight, loaded_scale)
+            module.load_quantized_weight(
+                loaded_weight,
+                loaded_scale,
+                loaded_shard_id=shard_id,
+            )
             return
         if bool(getattr(module, "quantized", False)):
             raise ValueError(f"Missing FP8 weight_scale_inv for quantized qwen3_5 projection {module}.")
-        module.weight_loader(module.weight, loaded_weight)
+        module.weight_loader(module.weight, loaded_weight, shard_id)
 
     def load_packed_in_proj_qkv(
         self,
@@ -485,9 +479,15 @@ class Qwen35LinearAttention(nn.Module):
             )
         q, k, v = torch.split(loaded_weight, row_sizes, dim=0)
         q_scale, k_scale, v_scale = self._split_row_block_scale(loaded_scale, row_sizes)
-        self._load_projection_weight(self.in_proj_q, q, q_scale)
-        self._load_projection_weight(self.in_proj_k, k, k_scale)
-        self._load_projection_weight(self.in_proj_v, v, v_scale)
+        for shard_id, (weight, scale) in enumerate(
+            ((q, q_scale), (k, k_scale), (v, v_scale))
+        ):
+            self._load_projection_weight(
+                self.in_proj_qkvz,
+                weight,
+                scale,
+                shard_id,
+            )
         return 3
 
     def _split_interleaved_qkvz(
@@ -546,10 +546,15 @@ class Qwen35LinearAttention(nn.Module):
     ) -> int:
         q, k, v, z = self._split_interleaved_qkvz(loaded_weight)
         q_scale, k_scale, v_scale, z_scale = self._split_interleaved_qkvz_scale(loaded_scale)
-        self._load_projection_weight(self.in_proj_q, q, q_scale)
-        self._load_projection_weight(self.in_proj_k, k, k_scale)
-        self._load_projection_weight(self.in_proj_v, v, v_scale)
-        self._load_projection_weight(self.in_proj_z, z, z_scale)
+        for shard_id, (weight, scale) in enumerate(
+            ((q, q_scale), (k, k_scale), (v, v_scale), (z, z_scale))
+        ):
+            self._load_projection_weight(
+                self.in_proj_qkvz,
+                weight,
+                scale,
+                shard_id,
+            )
         return 4
 
     def load_packed_in_proj_ba(
@@ -569,8 +574,8 @@ class Qwen35LinearAttention(nn.Module):
         b = weight[:, :num_v_per_k, :].reshape(-1, hidden)
         a = weight[:, num_v_per_k:, :].reshape(-1, hidden)
         b_scale, a_scale = self._split_row_block_scale(loaded_scale, [self.total_num_v_heads, self.total_num_v_heads])
-        self._load_projection_weight(self.in_proj_b, b, b_scale)
-        self._load_projection_weight(self.in_proj_a, a, a_scale)
+        self._load_projection_weight(self.in_proj_ba, b, b_scale, 0)
+        self._load_projection_weight(self.in_proj_ba, a, a_scale, 1)
         return 2
 
     def _tp_vector_weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
@@ -585,13 +590,11 @@ class Qwen35LinearAttention(nn.Module):
         param.data.copy_(loaded_weight.reshape(-1).narrow(0, start, shard_size).to(dtype=param.dtype))
 
     def _project_qkvzba(self, hidden_states: torch.Tensor):
-        q = self.in_proj_q(hidden_states)
-        k = self.in_proj_k(hidden_states)
-        v = self.in_proj_v(hidden_states)
-        z = self.in_proj_z(hidden_states)
-        b = self.in_proj_b(hidden_states)
-        a = self.in_proj_a(hidden_states)
-        mixed_qkv = torch.cat([q, k, v], dim=-1)
+        mixed_qkv, z = self.in_proj_qkvz(hidden_states).split(
+            [2 * self.tp_key_dim + self.tp_value_dim, self.tp_value_dim],
+            dim=-1,
+        )
+        b, a = self.in_proj_ba(hidden_states).chunk(2, dim=-1)
         z = z.view(-1, self.num_v_heads, self.head_v_dim)
         return mixed_qkv, z, b, a
 
@@ -625,7 +628,7 @@ class Qwen35LinearAttention(nn.Module):
         if seqs is None:
             raise RuntimeError("qwen3_5 linear attention requires context.seqs.")
         conv_dtype = activation_dtype
-        recurrent_dtype = activation_dtype
+        recurrent_dtype = self.recurrent_state_dtype
         conv_states = []
         recurrent_states = []
         has_initial = []
@@ -663,7 +666,9 @@ class Qwen35LinearAttention(nn.Module):
                 layer_idx,
                 {
                     "conv_state": conv_states[row],
-                    "recurrent_state": recurrent_states[row].to(dtype=conv_states.dtype),
+                    "recurrent_state": recurrent_states[row].to(
+                        dtype=self.recurrent_state_dtype
+                    ),
                 },
             )
 
@@ -811,28 +816,59 @@ class Qwen35LinearAttention(nn.Module):
 
 
 class Qwen35MLP(nn.Module):
-    def __init__(self, config) -> None:
+    def __init__(
+        self,
+        config,
+        *,
+        intermediate_size: int | None = None,
+        reduce_results: bool = True,
+    ) -> None:
         super().__init__()
+        intermediate_size = int(
+            config.intermediate_size if intermediate_size is None else intermediate_size
+        )
         quantization = getattr(config, "quantization_config", None)
         self.gate_up_proj = MergedColumnParallelLinear(
             int(config.hidden_size),
-            [int(config.intermediate_size)] * 2,
+            [intermediate_size] * 2,
             bias=False,
             quantization=quantization,
         )
         self.down_proj = RowParallelLinear(
-            int(config.intermediate_size),
+            intermediate_size,
             int(config.hidden_size),
             bias=False,
             quantization=quantization,
+            reduce_results=reduce_results,
         )
         if getattr(config, "hidden_act", "silu") != "silu":
             raise NotImplementedError(f"qwen3_5 supports hidden_act='silu', got {config.hidden_act!r}.")
-        self.act_fn = SiluAndMul()
+        activation_dtype = getattr(config, "dtype", None) or getattr(
+            config, "torch_dtype", torch.bfloat16
+        )
+        self.gate_up_swiglu_spec = GateUpSwiGLUOpSpec(
+            hidden_size=int(config.hidden_size),
+            intermediate_size=intermediate_size,
+            tp_size=self.gate_up_proj.tp_size,
+            activation_dtype=activation_dtype,
+            weight_dtype=(
+                torch.float8_e4m3fn
+                if self.gate_up_proj.quantized
+                else activation_dtype
+            ),
+            cuda_graph=bool(getattr(config, "decode_cuda_graph", False)),
+        )
+        self.gate_up_swiglu_provider = resolve_gate_up_swiglu_provider(
+            self.gate_up_swiglu_spec
+        )
         self.mlp_chunk_size = int(getattr(config, "mlp_chunk_size", 16384))
 
     def _forward_chunk(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(self.act_fn(self.gate_up_proj(x)))
+        return self.down_proj(
+            self.gate_up_swiglu_provider.run(
+                self.gate_up_swiglu_spec, x, self.gate_up_proj
+            )
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if int(x.shape[0]) <= self.mlp_chunk_size:
@@ -845,7 +881,7 @@ class Qwen35MLP(nn.Module):
 
 
 class Qwen35DecoderLayer(nn.Module):
-    def __init__(self, config, layer_idx: int) -> None:
+    def __init__(self, config, layer_idx: int, mlp_cls=Qwen35MLP) -> None:
         super().__init__()
         self.layer_idx = int(layer_idx)
         runtime_layout = getattr(config, "runtime_layout", None)
@@ -857,7 +893,7 @@ class Qwen35DecoderLayer(nn.Module):
         else:
             self.linear_attn = Qwen35LinearAttention(config)
             self.attention_type = "linear_attention"
-        self.mlp = Qwen35MLP(config)
+        self.mlp = mlp_cls(config)
         self.input_layernorm = Qwen35RMSNorm(int(config.hidden_size), eps=float(config.rms_norm_eps))
         self.post_attention_layernorm = Qwen35RMSNorm(int(config.hidden_size), eps=float(config.rms_norm_eps))
 
@@ -881,12 +917,12 @@ class Qwen35DecoderLayer(nn.Module):
 
 
 class Qwen35Model(nn.Module):
-    def __init__(self, config) -> None:
+    def __init__(self, config, layer_cls=Qwen35DecoderLayer) -> None:
         super().__init__()
         self.config = config
         self.embed_tokens = VocabParallelEmbedding(int(config.vocab_size), int(config.hidden_size))
         self.layers = nn.ModuleList(
-            [Qwen35DecoderLayer(config, layer_idx) for layer_idx in range(int(config.num_hidden_layers))]
+            [layer_cls(config, layer_idx) for layer_idx in range(int(config.num_hidden_layers))]
         )
         self.norm = Qwen35RMSNorm(int(config.hidden_size), eps=float(config.rms_norm_eps))
         self.sparse_controller = None
@@ -936,6 +972,10 @@ class Qwen35ForCausalLM(nn.Module):
         "q_proj": ("qkv_gate_proj", "q"),
         "k_proj": ("qkv_gate_proj", "k"),
         "v_proj": ("qkv_gate_proj", "v"),
+        "in_proj_z": ("in_proj_qkvz", 3),
+        "in_proj_b": ("in_proj_ba", 0),
+        "in_proj_a": ("in_proj_ba", 1),
+        "shared_expert_gate": ("gate", "shared"),
         "gate_proj": ("gate_up_proj", 0),
         "up_proj": ("gate_up_proj", 1),
     }

@@ -14,6 +14,7 @@ class MoeGemmConfig:
     group_m: int
     num_warps: int
     num_stages: int
+    swap_ab: bool = False
 
     def as_triton_kwargs(self) -> dict[str, int]:
         return {
@@ -92,6 +93,9 @@ _D = MoeGemmConfig(16, 128, 32, 8, 4, 4)
 _F = MoeGemmConfig(64, 64, 64, 8, 8, 3)
 _G = MoeGemmConfig(16, 32, 64, 8, 4, 4)
 _H = MoeGemmConfig(16, 32, 64, 8, 4, 3)
+_I = MoeGemmConfig(16, 64, 64, 8, 4, 4)
+_J = MoeGemmConfig(16, 64, 64, 8, 4, 2)
+_K = MoeGemmConfig(16, 128, 64, 8, 4, 2)
 
 
 def _stage_table(
@@ -106,9 +110,21 @@ def _stage_table(
     }
 
 
-# Qwen3-30B-A3B BF16 profiles tuned offline on H20. Profiles are keyed by the
-# kernel-relevant hardware and GEMM shape rather than by model name.
+# BF16 profiles are keyed by kernel-relevant hardware and GEMM shape rather
+# than by model name.
 _TUNED_CONFIGS = {
+    MoeGemmShape("H20", (9, 0), torch.bfloat16, 8, 256, 2048, 512): {
+        "w13": {1: _G, 2: _G, 4: _A, 8: _C},
+        "w2": {1: _G, 2: _A, 4: _K, 8: _I},
+    },
+    MoeGemmShape("H20", (9, 0), torch.bfloat16, 8, 256, 2048, 256): {
+        "w13": {1: _G, 2: _G, 4: _G, 8: _A},
+        "w2": {1: _H, 2: _J, 4: _K, 8: _K},
+    },
+    MoeGemmShape("H20", (9, 0), torch.bfloat16, 8, 128, 2048, 512): {
+        "w13": {1: _G, 2: _I, 4: _I, 8: _C},
+        "w2": {1: _I, 2: _H, 4: _A, 8: _I},
+    },
     MoeGemmShape("H20", (9, 0), torch.bfloat16, 8, 128, 2048, 768): _stage_table(
         (_D, _D, _D, _A, _A, _A, _B, _B, _B, _F, _F, _F),
         (_D, _D, _D, _B, _B, _B, _B, _B, _B, _F, _F, _F),
@@ -133,12 +149,78 @@ _TUNED_CONFIGS = {
         (_A, _D, _D, _A, _A, _A, _A, _A, _A, _A, _F, _F),
         (_A, _D, _D, _A, _A, _A, _A, _A, _A, _A, _A, _B),
     ),
+    MoeGemmShape("NVIDIA H100 80GB HBM3", (9, 0), torch.bfloat16, 8, 256, 2048, 512): {
+        "w13": {1: _G, 2: _I, 4: _A, 8: _A},
+        "w2": {1: _G, 2: _G, 4: _A, 8: _H},
+    },
+    MoeGemmShape("NVIDIA H100 80GB HBM3", (9, 0), torch.bfloat16, 8, 256, 2048, 256): {
+        "w13": {1: _G, 2: _G, 4: _G, 8: _H},
+        "w2": {1: _G, 2: _I, 4: _J, 8: _H},
+    },
+    MoeGemmShape("NVIDIA H100 80GB HBM3", (9, 0), torch.bfloat16, 8, 128, 2048, 512): {
+        "w13": {1: _G, 2: _G, 4: _G, 8: _A},
+        "w2": {1: _G, 2: _G, 4: _H, 8: _H},
+    },
 }
 
 
-# BF16 TP2 expert shards profiled on H100. The fused stage has two FP32
-# accumulators, so reusing the unfused W13 tile creates register pressure.
+# The fused BF16 stage has two FP32 accumulators, so reusing a wide unfused W13
+# tile can create register pressure.
 _TUNED_GATE_UP_SWIGLU_CONFIGS = {
+    MoeGemmShape(
+        "H20",
+        (9, 0),
+        torch.bfloat16,
+        8,
+        256,
+        2048,
+        512,
+    ): {1: _G, 2: _G, 4: _H, 8: _G},
+    MoeGemmShape(
+        "H20",
+        (9, 0),
+        torch.bfloat16,
+        8,
+        256,
+        2048,
+        256,
+    ): {1: _G, 2: _G, 4: _G, 8: _H},
+    MoeGemmShape(
+        "H20",
+        (9, 0),
+        torch.bfloat16,
+        8,
+        128,
+        2048,
+        512,
+    ): {1: _G, 2: _G, 4: _G, 8: _H},
+    MoeGemmShape(
+        "NVIDIA H100 80GB HBM3",
+        (9, 0),
+        torch.bfloat16,
+        8,
+        256,
+        2048,
+        512,
+    ): {1: _G, 2: _G, 4: _H, 8: _H},
+    MoeGemmShape(
+        "NVIDIA H100 80GB HBM3",
+        (9, 0),
+        torch.bfloat16,
+        8,
+        256,
+        2048,
+        256,
+    ): {1: _G, 2: _G, 4: _G, 8: _H},
+    MoeGemmShape(
+        "NVIDIA H100 80GB HBM3",
+        (9, 0),
+        torch.bfloat16,
+        8,
+        128,
+        2048,
+        512,
+    ): {1: _G, 2: _G, 4: _G, 8: _H},
     MoeGemmShape(
         "NVIDIA H100 80GB HBM3",
         (9, 0),
@@ -153,6 +235,138 @@ _TUNED_GATE_UP_SWIGLU_CONFIGS = {
             (_G, _G, _G, _G, _H, _H, _A, _B, _H, _G, _B, _B),
         )
     ),
+}
+
+
+_FP8_N64_SWAP = MoeGemmConfig(16, 64, 128, 1, 4, 3, True)
+_FP8_N64_SWAP_S2 = MoeGemmConfig(16, 64, 128, 1, 4, 2, True)
+_FP8_N64_SWAP_S4 = MoeGemmConfig(16, 64, 128, 1, 4, 4, True)
+_FP8_N64_SWAP_S5 = MoeGemmConfig(16, 64, 128, 1, 4, 5, True)
+_FP8_N128 = MoeGemmConfig(16, 128, 128, 1, 4, 3)
+_FP8_N128_SWAP_S2 = MoeGemmConfig(16, 128, 128, 1, 4, 2, True)
+_FP8_N128_SWAP_S4 = MoeGemmConfig(16, 128, 128, 1, 4, 4, True)
+
+
+# Qwen3.6-35B-A3B block-FP8 decode profiles. Unprofiled token buckets retain
+# the explicit generic configuration.
+_TUNED_FP8_ROUTED_CONFIGS = {
+    MoeGemmShape(
+        "H20",
+        (9, 0),
+        torch.float8_e4m3fn,
+        8,
+        256,
+        2048,
+        512,
+    ): {
+        "w13": {
+            1: _FP8_N64_SWAP_S4,
+            2: _FP8_N128_SWAP_S4,
+            4: _FP8_N64_SWAP_S4,
+            8: _FP8_N64_SWAP,
+        },
+        "w2": {
+            1: _FP8_N64_SWAP,
+            2: _FP8_N64_SWAP_S2,
+            4: _FP8_N64_SWAP_S2,
+            8: _FP8_N128_SWAP_S2,
+        },
+    },
+    MoeGemmShape(
+        "H20",
+        (9, 0),
+        torch.float8_e4m3fn,
+        8,
+        256,
+        2048,
+        256,
+    ): {
+        "w13": dict.fromkeys((1, 2, 4, 8), _FP8_N64_SWAP_S4),
+        "w2": {
+            1: _FP8_N64_SWAP,
+            2: _FP8_N64_SWAP_S2,
+            4: _FP8_N64_SWAP_S2,
+            8: _FP8_N128_SWAP_S2,
+        },
+    },
+    MoeGemmShape(
+        "H20",
+        (9, 0),
+        torch.float8_e4m3fn,
+        8,
+        128,
+        2048,
+        512,
+    ): {
+        "w13": dict.fromkeys((1, 2, 4, 8), _FP8_N64_SWAP_S4),
+        "w2": {
+            1: _FP8_N64_SWAP,
+            2: _FP8_N128_SWAP_S4,
+            4: _FP8_N64_SWAP_S2,
+            8: _FP8_N64_SWAP_S2,
+        },
+    },
+    MoeGemmShape(
+        "NVIDIA H100 80GB HBM3",
+        (9, 0),
+        torch.float8_e4m3fn,
+        8,
+        256,
+        2048,
+        512,
+    ): {
+        "w13": {
+            1: _FP8_N64_SWAP_S5,
+            2: _FP8_N64_SWAP_S4,
+            4: _FP8_N64_SWAP,
+            8: _FP8_N64_SWAP_S4,
+        },
+        "w2": {
+            1: _FP8_N64_SWAP_S4,
+            2: _FP8_N128_SWAP_S4,
+            4: _FP8_N64_SWAP_S2,
+            8: _FP8_N64_SWAP,
+        },
+    },
+    MoeGemmShape(
+        "NVIDIA H100 80GB HBM3",
+        (9, 0),
+        torch.float8_e4m3fn,
+        8,
+        256,
+        2048,
+        256,
+    ): {
+        "w13": {
+            1: _FP8_N64_SWAP_S4,
+            2: _FP8_N64_SWAP_S5,
+            4: _FP8_N64_SWAP_S4,
+            8: _FP8_N64_SWAP,
+        },
+        "w2": {
+            1: _FP8_N64_SWAP,
+            2: _FP8_N64_SWAP_S2,
+            4: _FP8_N64_SWAP_S2,
+            8: _FP8_N64_SWAP_S2,
+        },
+    },
+    MoeGemmShape(
+        "NVIDIA H100 80GB HBM3",
+        (9, 0),
+        torch.float8_e4m3fn,
+        8,
+        128,
+        2048,
+        512,
+    ): {
+        "w13": dict.fromkeys((1, 2, 4, 8), _FP8_N64_SWAP_S4),
+        "w2": {
+            1: _FP8_N64_SWAP_S4,
+            2: _FP8_N64_SWAP,
+            4: _FP8_N64_SWAP_S2,
+            8: _FP8_N64_SWAP_S2,
+        },
+    },
 }
 
 
@@ -181,7 +395,9 @@ def _resolve_moe_gemm_config(
     if stage == "gate_up_swiglu":
         fused_table = _TUNED_GATE_UP_SWIGLU_CONFIGS.get(shape)
         if fused_table is not None:
-            return fused_table[token_bucket(num_tokens)]
+            tuned = fused_table.get(token_bucket(num_tokens))
+            if tuned is not None:
+                return tuned
         assignments = num_tokens * top_k
         return MoeGemmConfig(
             block_m=16,
@@ -192,7 +408,9 @@ def _resolve_moe_gemm_config(
             num_stages=4 if assignments <= 64 else 3,
         )
     if table is not None:
-        return table[stage][token_bucket(num_tokens)]
+        tuned = table[stage].get(token_bucket(num_tokens))
+        if tuned is not None:
+            return tuned
 
     output_size = 2 * intermediate_size if stage == "w13" else hidden_size
     return _heuristic_config(
@@ -234,3 +452,35 @@ def resolve_moe_gemm_config(
         device_name,
         device_capability,
     )
+
+
+def resolve_fp8_routed_gemm_config(
+    *,
+    num_tokens: int,
+    top_k: int,
+    num_local_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    stage: str,
+    device_name: str | None = None,
+    device_capability: tuple[int, int] | None = None,
+) -> MoeGemmConfig:
+    if stage not in {"w13", "w2"}:
+        raise ValueError(f"FP8 routed GEMM stage must be 'w13' or 'w2', got {stage!r}.")
+    if device_name is None:
+        device_name = torch.cuda.get_device_name()
+    if device_capability is None:
+        device_capability = torch.cuda.get_device_capability()
+    shape = MoeGemmShape(
+        _hardware_family(device_name),
+        device_capability,
+        torch.float8_e4m3fn,
+        int(top_k),
+        int(num_local_experts),
+        int(hidden_size),
+        int(intermediate_size),
+    )
+    tuned = _TUNED_FP8_ROUTED_CONFIGS.get(shape, {}).get(stage, {}).get(
+        token_bucket(num_tokens)
+    )
+    return tuned or _FP8_N128

@@ -2,8 +2,7 @@
 
 import os
 
-from sparsevllm.configs.common import _coerce_bool_config, _model_path_basename
-from sparsevllm.configs.delta import SUPPORTED_SKIPKV_MODEL_NAMES
+from sparsevllm.configs.common import _coerce_bool_config
 
 
 def _normalize_platform_aliases(config) -> None:
@@ -39,14 +38,6 @@ def _normalize_platform_aliases(config) -> None:
 def normalize_platform(config) -> None:
     if not os.path.isdir(config.model):
         raise FileNotFoundError(f"Model directory does not exist: {config.model}")
-    if config.vllm_sparse_method == "skipkv":
-        model_name = _model_path_basename(config.model)
-        if model_name not in SUPPORTED_SKIPKV_MODEL_NAMES:
-            supported = ", ".join(sorted(SUPPORTED_SKIPKV_MODEL_NAMES))
-            raise ValueError(
-                "SkipKV is supported only for the official models with released steering vectors: "
-                f"{supported}. Got model basename {model_name!r} from model path {config.model!r}."
-            )
     config.tensor_parallel_size = int(config.tensor_parallel_size)
     config.expert_parallel_size = int(config.expert_parallel_size)
     config.data_parallel_size = int(config.data_parallel_size)

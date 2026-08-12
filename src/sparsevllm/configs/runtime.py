@@ -1,7 +1,7 @@
 """Top-level configuration composition and initialization orchestration."""
 
 from dataclasses import dataclass, field
-from typing import Any, Union
+from typing import Any
 
 from sparsevllm.configs.bootstrap import normalize_bootstrap
 from sparsevllm.configs.cuda_graph import (
@@ -22,9 +22,6 @@ from sparsevllm.configs.groups import (
 )
 from sparsevllm.configs.model import (
     AutoConfig,
-    Qwen3Config,
-    QuantizationConfig,
-    RuntimeLayout,
     load_and_validate_model,
 )
 from sparsevllm.configs.platform import normalize_platform
@@ -38,7 +35,11 @@ from sparsevllm.configs.sparse import (
     normalize_sparse_method_name,
     normalize_sparse_methods,
 )
+from sparsevllm.distributed import ParallelTopology
 from sparsevllm.method_registry import PREFILL_POLICY_AUTO
+from sparsevllm.models.layout import RuntimeLayout
+from sparsevllm.models.spec import ModelSpec
+from sparsevllm.quantization import QuantizationConfig
 from sparsevllm.utils.log import logger
 
 
@@ -70,10 +71,12 @@ class Config(
     # least one synchronous loading path when the budget is smaller.
     weight_loading_workers: int = 1
     enforce_eager: bool = True
-    hf_config: Union[Qwen3Config, AutoConfig] | None = None
+    hf_config: AutoConfig | None = None
     outer_hf_config: Any | None = None
     runtime_layout: RuntimeLayout | None = None
     quantization_config: QuantizationConfig = field(default_factory=QuantizationConfig.disabled)
+    model_spec: ModelSpec = field(init=False, repr=False)
+    parallel_topology: ParallelTopology = field(init=False, repr=False)
     tiny_random: bool = False
     tiny_random_config: str | None = None
     tiny_random_seed: int = 0
@@ -84,14 +87,11 @@ class Config(
 
     @property
     def uses_outer_tp_moe_layout(self) -> bool:
-        model_type = str(getattr(self.hf_config, "model_type", "") or "")
-        return model_type in {"qwen3_moe", "minimax_m2"} and int(
-            self.tensor_parallel_size
-        ) > 1
+        return self.parallel_topology.is_outer_tp_moe
 
     @property
     def attention_tensor_parallel_size(self) -> int:
-        return int(self.tensor_parallel_size)
+        return self.parallel_topology.attention_tp_size
 
     @property
     def moe_expert_parallel_size(self) -> int:
@@ -99,19 +99,11 @@ class Config(
 
     @property
     def moe_tensor_parallel_size(self) -> int:
-        if self.uses_outer_tp_moe_layout:
-            return int(self.tensor_parallel_size) // int(self.expert_parallel_size)
-        return int(self.tensor_parallel_size)
+        return self.parallel_topology.moe_tp_size
 
     @property
     def world_size(self) -> int:
-        if self.uses_outer_tp_moe_layout:
-            return int(self.tensor_parallel_size) * int(self.data_parallel_size)
-        return (
-            int(self.tensor_parallel_size)
-            * int(self.expert_parallel_size)
-            * int(self.data_parallel_size)
-        )
+        return self.parallel_topology.world_size
 
     @property
     def weight_loading_workers_per_rank(self) -> int:
@@ -128,10 +120,10 @@ class Config(
             self,
             legacy_deltakv_graph_method=legacy_deltakv_graph_method,
         )
-        is_qwen35 = load_and_validate_model(self)
+        load_and_validate_model(self)
         normalize_sparse_methods(self)
-        finalize_prefix_cache(self, is_qwen35=is_qwen35)
-        validate_deltakv_runtime(self, is_qwen35=is_qwen35)
+        finalize_prefix_cache(self)
+        validate_deltakv_runtime(self)
         finalize_sparse_layout(self)
 
         logger.info(f"LLM Config: {self}".replace('\n', ' '))

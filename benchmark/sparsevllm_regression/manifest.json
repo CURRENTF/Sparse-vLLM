@@ -75,7 +75,7 @@
     "h2o": {
       "sparse_method": "h2o",
       "requires_compressor": false,
-      "supported_model_families": ["qwen2", "qwen3", "qwen3_moe", "qwen3_5", "llama", "minimax_m2"],
+      "supported_model_families": ["qwen2", "qwen3", "qwen3_moe", "qwen3_5", "qwen3_5_moe", "llama", "minimax_m2"],
       "supported_tensor_parallel_sizes": [1, 2],
       "config": {
         "sparse_method": "h2o",

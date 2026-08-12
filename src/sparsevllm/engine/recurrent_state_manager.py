@@ -360,13 +360,36 @@ class RecurrentStateManager:
                 f"layer_idx={layer_idx}; missing={missing}."
             )
         state_buffers = {name: buffers[name] for name in self.state_spec.state_names}
+        tensor_specs = {
+            tensor_spec.name: tensor_spec
+            for tensor_spec in self.state_spec.tensor_specs
+        }
         for name, buffer in state_buffers.items():
-            if buffer.dtype != dtype or buffer.device != device:
+            expected_dtype = tensor_specs[name].dtype
+            if buffer.dtype != expected_dtype or buffer.device != device:
                 raise RuntimeError(
-                    f"{self.state_spec.name} decode recurrent pool dtype/device does not match activations: "
+                    f"{self.state_spec.name} decode recurrent pool does not match its model schema: "
                     f"layer_idx={layer_idx} name={name} pool={buffer.dtype}/{buffer.device} "
-                    f"expected={dtype}/{device}."
+                    f"expected={expected_dtype}/{device}."
                 )
+        activation_state_name = (
+            "conv_state"
+            if "conv_state" in tensor_specs
+            else (
+                self.state_spec.state_names[0]
+                if len({spec.dtype for spec in self.state_spec.tensor_specs}) == 1
+                else None
+            )
+        )
+        if (
+            activation_state_name is not None
+            and tensor_specs[activation_state_name].dtype != dtype
+        ):
+            raise RuntimeError(
+                f"{self.state_spec.name} decode activation dtype does not match "
+                f"{activation_state_name}: activation={dtype} "
+                f"state={tensor_specs[activation_state_name].dtype}."
+            )
         expected_rows: list[int] = []
         for seq in seqs:
             row = self.seq_id_to_row.get(int(seq.seq_id))

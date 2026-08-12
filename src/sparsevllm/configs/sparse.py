@@ -5,8 +5,11 @@ from sparsevllm.configs.common import (
     _normalize_int_attr,
     _normalize_positive_int,
 )
-from sparsevllm.configs.delta import SUPPORTED_SKIPKV_MODEL_NAMES
-from sparsevllm.method_registry import SUPPORTED_SPARSE_METHODS, normalize_sparse_method
+from sparsevllm.method_registry import (
+    SKIPKV_ASSET_MODEL_NAMES,
+    SUPPORTED_SPARSE_METHODS,
+    normalize_sparse_method,
+)
 from sparsevllm.utils.log import logger, log_once
 
 def normalize_sparse_method_name(config) -> bool:
@@ -168,7 +171,7 @@ def _normalize_skipkv(config) -> None:
         raise ValueError(
             "skipkv_enable_activation_steering=True requires skipkv_steering_vector_path. "
             "Official SkipKV support is limited to the released steering vectors for "
-            f"{', '.join(sorted(SUPPORTED_SKIPKV_MODEL_NAMES))}."
+            f"{', '.join(sorted(SKIPKV_ASSET_MODEL_NAMES))}."
         )
 
 def normalize_sparse_methods(config) -> None:

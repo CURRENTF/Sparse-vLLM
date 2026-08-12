@@ -1,15 +1,15 @@
 import json
 from collections import deque
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
 
 import sparsevllm.platforms as platforms
 from sparsevllm.platforms import device_runtime
-from sparsevllm.config import Config, RuntimeLayout
-from sparsevllm.distributed import ParallelContext, ParallelGroup
+from sparsevllm.config import Config, QuantizationConfig, RuntimeLayout
+from sparsevllm.distributed import ParallelContext, ParallelGroup, ParallelTopology
 from sparsevllm.engine.cache_manager.base import (
     CacheManager,
     LayerBatchStates,
@@ -40,10 +40,14 @@ from sparsevllm.engine.sequence import Sequence
 from sparsevllm.engine.sparse_controller import LayerBatchSparseState, SparseController
 from sparsevllm.models.qwen3_5 import (
     Qwen35ForCausalLM,
+    Qwen35LinearAttention,
     Qwen35LinearConv1D,
     Qwen35RMSNorm,
     _get_rotary_dim,
 )
+from sparsevllm.models.qwen3_5_moe import Qwen35MoeRouter, Qwen35MoeSparseMoeBlock
+from sparsevllm.models.checkpoint import validate_checkpoint
+from sparsevllm.models.spec import resolve_model_spec
 from sparsevllm.platforms.cpu import CpuPlatform
 from sparsevllm.sampling_params import SamplingParams
 from sparsevllm.utils.loader import _target_weight_name_for_model, _validate_all_quantized_weights_loaded
@@ -94,6 +98,185 @@ def _qwen35_outer_config(*, num_layers: int = 64, full_layers: tuple[int, ...] |
 def _make_config(tmp_path, **kwargs):
     with patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", return_value=_qwen35_outer_config()):
         return Config(model=str(tmp_path), **kwargs)
+
+
+def test_qwen35_moe_checkpoint_validation_accepts_architecture_variants():
+    hf_config = SimpleNamespace(
+        vocab_size=32000,
+        hidden_size=1536,
+        num_hidden_layers=8,
+        num_experts=128,
+        num_experts_per_tok=4,
+        layer_types=["linear_attention", "full_attention"] * 4,
+        torch_dtype=torch.bfloat16,
+        hidden_act="silu",
+        attn_output_gate=True,
+        attention_bias=False,
+        partial_rotary_factor=0.25,
+        mamba_ssm_dtype="float32",
+        rms_norm_eps=1.0e-6,
+        tie_word_embeddings=False,
+    )
+
+    validate_checkpoint(
+        "qwen3_5_moe",
+        outer_config=SimpleNamespace(
+            architectures=["Qwen3_5MoeForConditionalGeneration"]
+        ),
+        config=hf_config,
+        raw_quantization_config=None,
+        quantization=QuantizationConfig.disabled(model_name="Qwen3.6 MoE"),
+        topology=ParallelTopology(1, 1, 1),
+    )
+
+
+def test_linear_attention_fuses_qkvz_and_ba_projections():
+    config = _qwen35_outer_config(num_layers=1, full_layers=()).text_config
+    config.quantization_config = None
+    config.runtime_recurrent_state_dtype = torch.float32
+    parallel_context = _single_process_parallel_context()
+    with (
+        patch(
+            "sparsevllm.models.qwen3_5.get_parallel_context",
+            return_value=parallel_context,
+        ),
+        patch(
+            "sparsevllm.layers.linear.get_parallel_context",
+            return_value=parallel_context,
+        ),
+    ):
+        attention = Qwen35LinearAttention(config)
+
+    torch.manual_seed(0)
+    attention.in_proj_qkvz.weight.data.normal_()
+    attention.in_proj_ba.weight.data.normal_()
+    hidden_states = torch.randn(3, config.hidden_size)
+    qkvz = torch.nn.functional.linear(
+        hidden_states,
+        attention.in_proj_qkvz.weight,
+    )
+    q, k, v, z = qkvz.split(
+        [
+            attention.tp_key_dim,
+            attention.tp_key_dim,
+            attention.tp_value_dim,
+            attention.tp_value_dim,
+        ],
+        dim=-1,
+    )
+    expected_b, expected_a = torch.nn.functional.linear(
+        hidden_states,
+        attention.in_proj_ba.weight,
+    ).chunk(2, dim=-1)
+
+    mixed_qkv, actual_z, actual_b, actual_a = attention._project_qkvzba(
+        hidden_states
+    )
+
+    torch.testing.assert_close(mixed_qkv, torch.cat((q, k, v), dim=-1))
+    torch.testing.assert_close(
+        actual_z,
+        z.view(-1, attention.num_v_heads, attention.head_v_dim),
+    )
+    torch.testing.assert_close(actual_b, expected_b)
+    torch.testing.assert_close(actual_a, expected_a)
+    assert Qwen35ForCausalLM.packed_modules_mapping["in_proj_z"] == (
+        "in_proj_qkvz",
+        3,
+    )
+
+
+def test_qwen35_moe_fuses_router_and_shared_gate_projection():
+    router = Qwen35MoeRouter.__new__(Qwen35MoeRouter)
+    torch.nn.Module.__init__(router)
+    router.num_experts, router.hidden_size = 4, 3
+    router.weight = torch.nn.Parameter(torch.empty(5, 3))
+    router.op_spec = object()
+    topk_weights, topk_ids = torch.ones(2, 1), torch.zeros(2, 1, dtype=torch.int32)
+    router.provider = Mock()
+    router.provider.run.return_value = (topk_weights, topk_ids)
+    expert_weight = torch.arange(12, dtype=torch.float32).view(4, 3)
+    shared_weight = torch.tensor([[2.0, 3.0, 5.0]])
+    router.weight_loader(router.weight, expert_weight)
+    router.weight_loader(router.weight, shared_weight, "shared")
+    hidden_states = torch.tensor([[1.0, 2.0, 3.0], [3.0, 2.0, 1.0]])
+
+    actual_weights, actual_ids, shared_logits = router(hidden_states)
+
+    assert actual_weights is topk_weights
+    assert actual_ids is topk_ids
+    torch.testing.assert_close(
+        shared_logits,
+        torch.nn.functional.linear(hidden_states, shared_weight),
+    )
+    router.provider.run.assert_called_once()
+    assert Qwen35ForCausalLM.packed_modules_mapping["shared_expert_gate"] == (
+        "gate",
+        "shared",
+    )
+
+
+def test_qwen35_moe_reduces_routed_and_shared_outputs_together():
+    class ReturnValue(torch.nn.Module):
+        def __init__(self, value):
+            super().__init__()
+            self.value = value
+
+        def forward(self, *_):
+            return self.value
+
+    hidden_states = torch.randn(2, 4)
+    local_output, shared_output = torch.randn_like(hidden_states), torch.randn_like(hidden_states)
+    gate_logits = torch.randn(2, 1)
+    block = Qwen35MoeSparseMoeBlock.__new__(Qwen35MoeSparseMoeBlock)
+    torch.nn.Module.__init__(block)
+    block.shared_expert = ReturnValue(shared_output)
+    block.gate = ReturnValue((torch.ones(2, 1), torch.zeros(2, 1, dtype=torch.int32), gate_logits))
+    block.experts = ReturnValue(local_output)
+    block.parallel_context = Mock()
+    block.parallel_context.world.size = 2
+    block.parallel_context.world_all_reduce.side_effect = lambda outputs: outputs + 1
+
+    with patch(
+        "sparsevllm.models.qwen3_5_moe.gated_shared_add",
+        side_effect=lambda routed, shared, gate: routed + shared * gate.sigmoid(),
+    ):
+        actual = block._forward_chunk(hidden_states)
+
+    packed = block.parallel_context.world_all_reduce.call_args.args[0]
+    torch.testing.assert_close(packed, torch.stack((local_output, shared_output)))
+    torch.testing.assert_close(
+        actual,
+        local_output + 1 + (shared_output + 1) * gate_logits.sigmoid(),
+    )
+
+
+def test_qwen35_moe_skips_single_rank_output_packing():
+    hidden_states = torch.randn(2, 4)
+    block = Qwen35MoeSparseMoeBlock.__new__(Qwen35MoeSparseMoeBlock)
+    torch.nn.Module.__init__(block)
+    block.shared_expert = Mock(return_value=hidden_states + 1)
+    block.gate = Mock(
+        return_value=(
+            torch.ones(2, 1),
+            torch.zeros(2, 1, dtype=torch.int32),
+            torch.zeros(2, 1),
+        )
+    )
+    block.experts = Mock(return_value=hidden_states + 2)
+    block.parallel_context = Mock()
+    block.parallel_context.world.size = 1
+
+    with patch(
+        "sparsevllm.models.qwen3_5_moe.gated_shared_add",
+        side_effect=lambda routed, shared, gate: routed + shared * gate.sigmoid(),
+    ):
+        actual = block._forward_chunk(hidden_states)
+
+    block.parallel_context.world_all_reduce.assert_not_called()
+    torch.testing.assert_close(
+        actual, hidden_states + 2 + 0.5 * (hidden_states + 1)
+    )
 
 
 class _ResidentAdmissionCache:
@@ -721,9 +904,11 @@ def test_model_runner_resets_inherited_allocator_peak_before_model_construction(
         tensor_parallel_size=1,
         expert_parallel_size=1,
         data_parallel_size=1,
+        parallel_topology=ParallelTopology(1, 1, 1),
         uses_outer_tp_moe_layout=False,
         mlp_chunk_size=16384,
         hf_config=SimpleNamespace(model_type="qwen2", torch_dtype=torch.float32),
+        model_spec=resolve_model_spec("qwen2"),
     )
     with (
         patch.object(platforms, "_current_platform", platform),
@@ -1016,7 +1201,7 @@ def test_qwen35_mixed_prefix_offload_allows_decode_graph(tmp_path):
 
 
 def test_qwen35_deltakv_requires_compatible_checkpoint_even_when_missing_allowed(tmp_path):
-    with pytest.raises(ValueError, match="DeltaKV for qwen3_5 requires"):
+    with pytest.raises(ValueError, match="DeltaKV for Qwen3.5 requires"):
         _make_config(
             tmp_path,
             vllm_sparse_method="deltakv",
@@ -1042,7 +1227,7 @@ def test_qwen35_raw_config_fallback_when_transformers_autoconfig_is_unknown(tmp_
         cfg = Config(model=str(tmp_path))
 
     assert cfg.outer_hf_config.model_type == "qwen3_5"
-    assert cfg.hf_config.model_type == "qwen3_5"
+    assert cfg.hf_config.model_type == "qwen3_5_text"
     assert cfg.runtime_layout.num_kv_layers == 16
 
 
@@ -1064,7 +1249,7 @@ def test_qwen35_rejects_unquantized_fp16_checkpoint(tmp_path):
     outer_config.text_config.quantization_config = None
 
     with patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", return_value=outer_config):
-        with pytest.raises(NotImplementedError, match="require BF16 weights"):
+        with pytest.raises(ValueError, match="requires BF16 weights"):
             Config(model=str(tmp_path))
 
 
@@ -1073,7 +1258,7 @@ def test_qwen35_rejects_unsupported_quantization(tmp_path):
     outer_config.text_config.quantization_config = {"quant_method": "awq"}
 
     with patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", return_value=outer_config):
-        with pytest.raises(NotImplementedError, match="unquantized BF16 or block FP8"):
+        with pytest.raises(NotImplementedError, match="quant_method='awq'"):
             Config(model=str(tmp_path))
 
 

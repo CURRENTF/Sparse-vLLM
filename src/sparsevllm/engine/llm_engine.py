@@ -19,6 +19,7 @@ from sparsevllm.sampling_params import SamplingParams
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.engine.scheduler import Scheduler
 from sparsevllm.engine.model_runner import ModelRunner, make_tp_shm_name
+from sparsevllm.engine.input_processor import tokenize_text_prompt
 from sparsevllm.engine.prefix_cache import PrefixCacheRoutingSnapshot
 from sparsevllm.engine.chain_cache import (
     ChainCacheIndex,
@@ -61,8 +62,7 @@ def _use_graph_scaled_warmup(config: Config) -> bool:
 
 
 def _moe_workspace_warmup_token_counts(config: Config) -> tuple[int, ...]:
-    model_type = str(getattr(config.hf_config, "model_type", "") or "")
-    if model_type not in {"qwen3_moe", "minimax_m2"}:
+    if config.model_spec.num_experts_field is None:
         return ()
 
     max_batched_tokens = int(config.max_num_batched_tokens)
@@ -453,6 +453,7 @@ class LLMEngine:
 
         self._warmup_moe_workspaces()
         self._after_warmup_debug_cleanup()
+        self.model_runner.call("log_operator_implementations")
         logger.info("Warmup finished.")
 
     def _warmup_moe_workspaces(self) -> None:
@@ -574,16 +575,8 @@ class LLMEngine:
         return runner_exit_completed, runner_platform
 
     def _tokenize_prompt(self, prompt: str | list[int]) -> list[int]:
-        if isinstance(prompt, str):
-            # Add BOS for raw prompts, but do not duplicate it when a chat
-            # template already starts with BOS.
-            add_special_tokens = True
-            if self.tokenizer.bos_token is None or prompt.startswith(self.tokenizer.bos_token):
-                add_special_tokens = False
-            return self.tokenizer.encode(
-                prompt, add_special_tokens=add_special_tokens
-            )
-        return [int(token_id) for token_id in prompt]
+        tokenizer = self.tokenizer if isinstance(prompt, str) else None
+        return tokenize_text_prompt(tokenizer, prompt)
 
     def admit_request(
         self,

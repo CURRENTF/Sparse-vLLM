@@ -1,4 +1,4 @@
-"""Prefix-cache normalization and model-dependent validation."""
+"""Prefix-cache normalization and validation."""
 
 import math
 
@@ -105,17 +105,22 @@ def normalize_prefix_cache(config) -> None:
         )
     config.prefix_cache_salt = str(config.prefix_cache_salt or "")
 
-def finalize_prefix_cache(config, *, is_qwen35: bool) -> None:
+def finalize_prefix_cache(config) -> None:
+    block_multiple = config.model_spec.prefix_cache_block_size_multiple
     if (
-        is_qwen35
+        block_multiple is not None
         and config.resolved_prefix_cache_mode == "radix"
         and config.prefix_cache_block_size is None
     ):
-        config.prefix_cache_block_size = 4096
+        config.prefix_cache_block_size = block_multiple
     config.prefix_cache_block_size = resolve_prefix_cache_block_size(config)
-    if is_qwen35 and config.resolved_prefix_cache_mode == "radix":
-        if config.prefix_cache_block_size < 4096 or config.prefix_cache_block_size % 4096 != 0:
+    if block_multiple is not None and config.resolved_prefix_cache_mode == "radix":
+        if (
+            config.prefix_cache_block_size < block_multiple
+            or config.prefix_cache_block_size % block_multiple
+        ):
             raise ValueError(
-                "qwen3_5 mixed prefix cache requires prefix_cache_block_size to be "
-                f"4096*N, got {config.prefix_cache_block_size}."
+                f"{config.model_spec.name} prefix cache requires "
+                f"prefix_cache_block_size to be {block_multiple}*N, "
+                f"got {config.prefix_cache_block_size}."
             )

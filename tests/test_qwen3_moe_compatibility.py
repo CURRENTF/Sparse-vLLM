@@ -1,7 +1,10 @@
 import pytest
 
+from sparsevllm.distributed import ParallelMode, ParallelTopology
 from sparsevllm.method_registry import (
+    DENSE_MODEL_COMPATIBILITY,
     MODEL_RUNTIME_COMPATIBILITY,
+    QWEN35_MOE_COMPATIBILITY,
     QWEN3_MOE_EP_COMPATIBILITY,
     QWEN3_MOE_TP_COMPATIBILITY,
     QWEN3_MOE_TP_EP_COMPATIBILITY,
@@ -21,12 +24,23 @@ def _validate(method="", **overrides):
         "enable_prefix_caching": False,
     }
     values.update(overrides)
+    tp_size = values.pop("tensor_parallel_size")
+    ep_size = values.pop("expert_parallel_size")
+    dp_size = values.pop("data_parallel_size")
+    values["topology"] = ParallelTopology(
+        tp_size,
+        ep_size,
+        dp_size,
+        ParallelMode.OUTER_TP_MOE if tp_size > 1 else ParallelMode.STANDARD,
+    )
     return validate_model_runtime_compatibility(**values)
 
 
 def test_qwen3_moe_registry_lists_only_v1_validated_combinations():
-    assert MODEL_RUNTIME_COMPATIBILITY["qwen3_moe"] is QWEN3_MOE_EP_COMPATIBILITY
-    assert QWEN3_MOE_EP_COMPATIBILITY.parallel_mode == "ep_replicated_kv"
+    assert (
+        MODEL_RUNTIME_COMPATIBILITY["qwen3_moe", ParallelMode.STANDARD]
+        is QWEN3_MOE_EP_COMPATIBILITY
+    )
     assert QWEN3_MOE_EP_COMPATIBILITY.sparse_methods == {
         "",
         "streamingllm",
@@ -59,6 +73,17 @@ def test_qwen3_moe_registry_lists_only_v1_validated_combinations():
     }
 
 
+def test_qwen35_moe_registry_accepts_vanilla_prefix_cache():
+    assert validate_model_runtime_compatibility(
+        model_type="qwen3_5_moe",
+        sparse_method="",
+        topology=ParallelTopology(2, 2, 1, ParallelMode.OUTER_TP_MOE),
+        enforce_eager=True,
+        decode_cuda_graph=False,
+        enable_prefix_caching=True,
+    ) is QWEN35_MOE_COMPATIBILITY
+
+
 @pytest.mark.parametrize("method", sorted(QWEN3_MOE_EP_COMPATIBILITY.sparse_methods))
 def test_qwen3_moe_registry_accepts_first_batch_sparse_methods(method):
     assert _validate(method) is QWEN3_MOE_EP_COMPATIBILITY
@@ -79,9 +104,9 @@ def test_qwen3_moe_registry_rejects_unvalidated_prefix_cache_methods(method):
 
 
 def test_qwen3_moe_registry_rejects_conditional_and_out_of_scope_methods():
-    with pytest.raises(NotImplementedError, match="steering asset"):
+    with pytest.raises(ValueError, match="validated methods"):
         _validate("skipkv")
-    with pytest.raises(NotImplementedError, match="not part of the validated"):
+    with pytest.raises(ValueError, match="validated methods"):
         _validate("deltakv")
 
 
@@ -140,14 +165,20 @@ def test_qwen3_moe_registry_accepts_decode_cuda_graph(method):
         _validate(method, enforce_eager=False, decode_cuda_graph=True)
         is QWEN3_MOE_EP_COMPATIBILITY
     )
-def test_dense_models_do_not_inherit_qwen3_moe_compatibility():
+def test_dense_models_use_shared_runtime_compatibility():
     assert validate_model_runtime_compatibility(
         model_type="qwen3",
         sparse_method="deltakv",
-        tensor_parallel_size=1,
-        expert_parallel_size=1,
-        data_parallel_size=1,
+        topology=ParallelTopology(1, 1, 1),
         enforce_eager=True,
         decode_cuda_graph=False,
         enable_prefix_caching=False,
-    ) is None
+    ) is DENSE_MODEL_COMPATIBILITY
+
+
+def test_all_dense_architectures_are_registered():
+    assert {
+        model_type
+        for model_type, mode in MODEL_RUNTIME_COMPATIBILITY
+        if mode is ParallelMode.STANDARD
+    } >= {"qwen2", "qwen3", "qwen3_5", "llama"}

@@ -58,6 +58,7 @@ Sparse-vLLM 支持物理淘汰、逻辑掩码、查询感知选择和混合 KV �
 | Qwen3 | ✅ |
 | Qwen3MoE | ✅ |
 | Qwen3.5 / Qwen3.6 | ✅ |
+| Qwen3.5 / Qwen3.6 MoE | ✅ |
 | Llama 3 / 3.1 | ✅ |
 | MiniMax M2.7 | ✅ |
 
@@ -127,7 +128,7 @@ uv pip install flashinfer-cubin --index-url https://flashinfer.ai/whl
 以上显式索引分别用于安装 CUDA 13.0 版本的 PyTorch 和 FlashInfer JIT
 缓存。
 
-Qwen3.5/Qwen3.6 混合注意力推理还需要安装 CUDA 专用的可选依赖：
+Qwen3.5/Qwen3.6 混合注意力推理还需要安装可选 Python 依赖：
 
 ```bash
 # uv
@@ -136,6 +137,17 @@ uv pip install -e ".[qwen35]"
 # Conda/pip
 pip install -e ".[qwen35]"
 ```
+
+对于不使用 Qwen3.5/Qwen3.6 的 Vanilla、OmniKV 或 QuEST 前缀缓存卸载，
+可以安装更精简的 CUDA 专用可选依赖：
+
+```bash
+pip install -e ".[prefix-offload]"
+```
+
+Qwen3.5/Qwen3.6 的 prefill causal Conv1D 和 decode Conv1D/GDN packing
+路径使用仓库内置的 Triton kernel；无需安装 `sglang-kernel`，也无需编译
+本地 CUDA 扩展。
 
 完整依赖列表和最小 `LLM(...)` 示例请参阅[快速开始](docs/zh/getting_started/README.md)。
 

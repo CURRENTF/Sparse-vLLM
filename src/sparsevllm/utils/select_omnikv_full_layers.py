@@ -71,19 +71,12 @@ def text_model_config(config):
 
 
 def attention_layer_indices_from_config(config) -> list[int]:
+    from sparsevllm.models.layout import RuntimeLayout
+
     text_config = text_model_config(config)
-    num_hidden_layers = int(text_config.num_hidden_layers)
-    layer_types = getattr(text_config, "layer_types", None)
-    if layer_types is None:
-        return list(range(num_hidden_layers))
-    if len(layer_types) != num_hidden_layers:
-        raise ValueError(
-            "layer_types length does not match num_hidden_layers: "
-            f"{len(layer_types)} != {num_hidden_layers}."
-        )
-    indices = [idx for idx, layer_type in enumerate(layer_types) if layer_type == "full_attention"]
+    indices = list(RuntimeLayout.from_config(text_config).full_attention_layer_indices)
     if not indices:
-        raise ValueError("Model layer_types does not contain any full_attention layer.")
+        raise ValueError("Model layout does not contain any full-attention layer.")
     return indices
 
 

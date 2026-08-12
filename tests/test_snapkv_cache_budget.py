@@ -5,6 +5,7 @@ import pytest
 import torch
 
 import sparsevllm.platforms as platforms
+from sparsevllm.config import RuntimeLayout
 from sparsevllm.engine.cache_manager.base import CacheManager
 from sparsevllm.engine.cache_manager.rkv import RKVCacheManager
 from sparsevllm.engine.cache_manager.snapkv import (
@@ -37,7 +38,7 @@ def _manager_config(*, method: str, compression_interval: int = 1):
             head_dim=5,
             torch_dtype=torch.float32,
         ),
-        runtime_layout=None,
+        runtime_layout=RuntimeLayout.dense(2),
         max_model_len=5,
         max_num_batched_tokens=10,
         max_num_seqs_in_gpu=3,
