@@ -17,43 +17,6 @@ from sparsevllm.triton_kernel.gqa_flash_decoding_stage1 import (
 
 
 class Qwen35Hd256DecodeRoutingTest(unittest.TestCase):
-    def test_minimax_long_decode_uses_tuned_launch_config(self):
-        config = TritonAttentionBackend.gqa_decode_launch_config(
-            block_seq=256,
-            max_context_len=65536,
-            num_heads=12,
-            num_kv_heads=2,
-            head_dim=128,
-            requires_attention_scores=False,
-        )
-
-        self.assertEqual(config, (1024, 128, 4))
-
-    def test_other_gqa_decode_shapes_keep_default_launch_config(self):
-        cases = (
-            {"max_context_len": 32768},
-            {"num_heads": 16},
-            {"num_kv_heads": 4},
-            {"head_dim": 256},
-            {"requires_attention_scores": True},
-            {"block_seq": 128},
-        )
-        defaults = {
-            "block_seq": 256,
-            "max_context_len": 65536,
-            "num_heads": 12,
-            "num_kv_heads": 2,
-            "head_dim": 128,
-            "requires_attention_scores": False,
-        }
-
-        for override in cases:
-            with self.subTest(override=override):
-                config = TritonAttentionBackend.gqa_decode_launch_config(
-                    **(defaults | override)
-                )
-                self.assertEqual(config, (override.get("block_seq", 256), 16, 2))
-
     def _make_view(self, *, head_dim: int, attn_score=None):
         active_slots = torch.tensor([[0, 1, 2]], dtype=torch.int32)
         req_indices = torch.tensor([0], dtype=torch.int32)

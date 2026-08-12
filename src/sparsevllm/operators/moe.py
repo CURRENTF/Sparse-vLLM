@@ -369,7 +369,7 @@ class TritonMinimaxM2FusedMoeProvider(MoeProvider):
 @MOE_REGISTRY.register
 class FlashInferCutlassFp8MoeProvider(MoeProvider):
     name = "flashinfer_cutlass_fp8_sm90"
-    priority = 120
+    priority = 100
     gate_up_order = "up_gate"
 
     @classmethod
@@ -433,7 +433,7 @@ class FlashInferCutlassFp8MoeProvider(MoeProvider):
             output=output,
             use_deepseek_fp8_block_scale=True,
             use_fused_finalize=False,
-            enable_pdl=False,
+            enable_pdl=None,
             activation_type=ActivationType.Swiglu,
         )
         return output

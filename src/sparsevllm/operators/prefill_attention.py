@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
@@ -45,8 +46,16 @@ class PrefillAttentionProvider:
     name = ""
     priority = 0
 
-    def prepare(self, spec: PrefillAttentionOpSpec) -> None:
-        del spec
+    def prepare(
+        self,
+        spec: PrefillAttentionOpSpec,
+        *,
+        device_index: int | None = None,
+    ) -> None:
+        del spec, device_index
+
+    def close(self) -> None:
+        pass
 
     def run(
         self,
@@ -60,6 +69,19 @@ class PrefillAttentionProvider:
         layer_idx: int,
     ) -> torch.Tensor:
         raise NotImplementedError
+
+
+def _validate_token_page_table(view: Any) -> None:
+    if view.active_slots.dtype != torch.int32:
+        raise TypeError(
+            "Paged prefill requires an int32 physical-slot page table, got "
+            f"{view.active_slots.dtype}."
+        )
+    if view.active_slots.ndim != 2:
+        raise ValueError(
+            "Paged prefill expects a 2D physical-slot page table, got "
+            f"shape={tuple(view.active_slots.shape)}."
+        )
 
 
 PREFILL_ATTENTION_REGISTRY: OpRegistry[
@@ -136,20 +158,27 @@ class FlashInferPagedPrefillAttentionProvider(PrefillAttentionProvider):
     def __init__(self) -> None:
         self._state: _FlashInferPagedPrefillState | None = None
 
-    def prepare(self, spec: PrefillAttentionOpSpec) -> None:
-        device = torch.device("cuda", torch.cuda.current_device())
-        key = (
-            device.index,
-            spec.num_query_heads,
-            spec.num_kv_heads,
-            spec.head_dim,
-            spec.activation_dtype,
-        )
-        state = _FLASHINFER_PREFILL_STATES.get(key)
-        if state is None:
-            state = _FlashInferPagedPrefillState(device)
-            _FLASHINFER_PREFILL_STATES[key] = state
-        self._state = state
+    def prepare(
+        self,
+        spec: PrefillAttentionOpSpec,
+        *,
+        device_index: int | None = None,
+    ) -> None:
+        if self._state is not None:
+            return
+        current_device = torch.cuda.current_device()
+        if device_index is None:
+            device_index = current_device
+        if int(device_index) != current_device:
+            raise RuntimeError(
+                "FlashInfer prefill must be prepared on the selected CUDA device: "
+                f"selected={device_index} current={current_device}."
+            )
+        device = torch.device("cuda", int(device_index))
+        self._state = _FlashInferPagedPrefillState(device)
+
+    def close(self) -> None:
+        self._state = None
 
     def run(
         self,
@@ -164,8 +193,9 @@ class FlashInferPagedPrefillAttentionProvider(PrefillAttentionProvider):
     ):
         del chunk_lens
         payload, meta = _view_parts(view)
+        _validate_token_page_table(meta)
         if self._state is None:
-            self.prepare(spec)
+            self.prepare(spec, device_index=q.device.index)
         state = self._state
         assert state is not None
         if q.dtype != spec.activation_dtype:
@@ -287,9 +317,6 @@ class _FlashInferPagedPrefillState:
         self.planned = True
 
 
-_FLASHINFER_PREFILL_STATES: dict[tuple, _FlashInferPagedPrefillState] = {}
-
-
 @PREFILL_ATTENTION_REGISTRY.register
 class TritonPagedPrefillAttentionProvider(PrefillAttentionProvider):
     name = "triton_paged_prefill"
@@ -309,6 +336,23 @@ class TritonPagedPrefillAttentionProvider(PrefillAttentionProvider):
             )
         if spec.head_dim not in {16, 32, 64, 128, 256}:
             return SupportResult.no(f"unsupported head_dim={spec.head_dim}")
+        if not spec.causal:
+            return SupportResult.no("legacy Triton prefill requires causal attention")
+        if spec.page_size != 1:
+            return SupportResult.no(
+                f"legacy Triton prefill requires page_size=1, got {spec.page_size}"
+            )
+        expected_scale = spec.head_dim**-0.5
+        if not math.isclose(
+            spec.softmax_scale,
+            expected_scale,
+            rel_tol=1.0e-6,
+            abs_tol=0.0,
+        ):
+            return SupportResult.no(
+                "legacy Triton prefill requires the default head-dimension scale "
+                f"{expected_scale}, got {spec.softmax_scale}"
+            )
         return SupportResult.yes()
 
     def run(
@@ -324,6 +368,7 @@ class TritonPagedPrefillAttentionProvider(PrefillAttentionProvider):
     ):
         del spec, layer_idx
         payload, meta = _view_parts(view)
+        _validate_token_page_table(meta)
         from sparsevllm.triton_kernel.context_flashattention_nopad import (
             context_attention_fwd,
         )
@@ -355,3 +400,41 @@ def resolve_prefill_attention_provider(
         device_index = torch.cuda.current_device() if platform.is_cuda_alike() else 0
     caps = platform.get_device_caps(int(device_index))
     return OpResolver(PREFILL_ATTENTION_REGISTRY).resolve(spec, caps).provider
+
+
+class PreparedPrefillAttentionOp:
+    """One prepared provider shared by all layers in one model runtime."""
+
+    def __init__(
+        self,
+        spec: PrefillAttentionOpSpec,
+        provider: PrefillAttentionProvider,
+    ) -> None:
+        self.spec = spec
+        self.provider = provider
+        self._closed = False
+
+    @property
+    def name(self) -> str:
+        return self.provider.name
+
+    def run(self, q, view, **kwargs):
+        if self._closed:
+            raise RuntimeError("Prefill attention operator is closed.")
+        return self.provider.run(self.spec, q, view, **kwargs)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self.provider.close()
+        self._closed = True
+
+
+def prepare_prefill_attention_op(
+    spec: PrefillAttentionOpSpec,
+    *,
+    device_index: int | None = None,
+) -> PreparedPrefillAttentionOp:
+    provider = resolve_prefill_attention_provider(spec, device_index=device_index)
+    provider.prepare(spec, device_index=device_index)
+    return PreparedPrefillAttentionOp(spec, provider)

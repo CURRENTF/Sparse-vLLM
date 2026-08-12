@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
+from functools import partial
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
-from sparsevllm.distributed import get_parallel_context
+from sparsevllm.distributed import (
+    ParallelContext,
+    ParallelGroup,
+    get_parallel_context,
+)
 from sparsevllm.layers.attention import Attention
 from sparsevllm.layers.embed_head import ParallelLMHead
 from sparsevllm.layers.expert_weights import PackedExpertWeightLoader
@@ -22,7 +28,21 @@ from sparsevllm.operators.moe import (
     model_activation_dtype,
     resolve_moe_provider,
 )
-from sparsevllm.operators.prefill_attention import PrefillAttentionOpSpec
+from sparsevllm.operators.all_reduce import (
+    AllReduceOpSpec,
+    PreparedAllReduceOp,
+    prepare_all_reduce_op,
+)
+from sparsevllm.operators.decode_attention import (
+    DecodeAttentionLaunchSpec,
+    PreparedDecodeAttentionLaunchOp,
+    prepare_decode_attention_launch_op,
+)
+from sparsevllm.operators.prefill_attention import (
+    PrefillAttentionOpSpec,
+    PreparedPrefillAttentionOp,
+    prepare_prefill_attention_op,
+)
 from sparsevllm.platforms import device_runtime
 from sparsevllm.quantization.fp8_tp import Fp8ExpertTpShard
 from sparsevllm.utils.context import get_context
@@ -38,6 +58,127 @@ _EXPERT_TARGET_RE = re.compile(
     r"^model\.layers\.(\d+)\.block_sparse_moe\.experts\.(\d+)\."
     r"(w1|w2|w3)\.expert_weight$"
 )
+
+
+@dataclass
+class MiniMaxM2RuntimeConfig:
+    prefill_attention_op: PreparedPrefillAttentionOp
+    decode_launch_op: PreparedDecodeAttentionLaunchOp
+    attention_decode_all_reduce: PreparedAllReduceOp
+    moe_decode_all_reduce: PreparedAllReduceOp
+    cuda_graph: bool
+    _closed: bool = False
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self.prefill_attention_op.close()
+        seen: set[int] = set()
+        for op in (
+            self.attention_decode_all_reduce,
+            self.moe_decode_all_reduce,
+        ):
+            if id(op) in seen:
+                continue
+            seen.add(id(op))
+            op.close()
+        self._closed = True
+
+
+def _prepare_decode_all_reduce(
+    group: ParallelGroup,
+    *,
+    max_tokens: int,
+    hidden_size: int,
+    dtype: torch.dtype,
+    cuda_graph: bool,
+    device_index: int,
+) -> PreparedAllReduceOp:
+    return prepare_all_reduce_op(
+        AllReduceOpSpec(
+            world_size=group.size,
+            max_tokens=max_tokens,
+            hidden_size=hidden_size,
+            dtype=dtype,
+            cuda_graph=cuda_graph,
+        ),
+        group=group.process_group,
+        rank=group.rank,
+        device_index=device_index,
+    )
+
+
+def build_minimax_m2_runtime_config(
+    config,
+    parallel_context: ParallelContext,
+    *,
+    layer_invariant_page_table: bool,
+    max_decode_tokens: int,
+    cuda_graph: bool,
+    device_index: int,
+) -> MiniMaxM2RuntimeConfig:
+    tp_size = int(parallel_context.attention_tp_size)
+    if (
+        int(config.num_attention_heads) % tp_size
+        or int(config.num_key_value_heads) % tp_size
+    ):
+        raise ValueError(
+            "MiniMax attention heads must be divisible by attention TP size."
+        )
+    num_query_heads = int(config.num_attention_heads) // tp_size
+    num_kv_heads = int(config.num_key_value_heads) // tp_size
+    head_dim = int(config.head_dim)
+    activation_dtype = model_activation_dtype(config)
+    prefill_attention_op = prepare_prefill_attention_op(
+        PrefillAttentionOpSpec(
+            num_query_heads=num_query_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            activation_dtype=activation_dtype,
+            softmax_scale=head_dim**-0.5,
+            causal=True,
+            page_size=1,
+            requires_attention_scores=False,
+            layer_invariant_page_table=bool(layer_invariant_page_table),
+        ),
+        device_index=device_index,
+    )
+    decode_launch_op = prepare_decode_attention_launch_op(
+        DecodeAttentionLaunchSpec(
+            num_query_heads=num_query_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            activation_dtype=activation_dtype,
+            page_size=1,
+        ),
+        device_index=device_index,
+    )
+    moe_decode_all_reduce = _prepare_decode_all_reduce(
+        parallel_context.world,
+        max_tokens=int(max_decode_tokens),
+        hidden_size=int(config.hidden_size),
+        dtype=activation_dtype,
+        cuda_graph=bool(cuda_graph),
+        device_index=device_index,
+    )
+    if parallel_context.attention.ranks == parallel_context.world.ranks:
+        attention_decode_all_reduce = moe_decode_all_reduce
+    else:
+        attention_decode_all_reduce = _prepare_decode_all_reduce(
+            parallel_context.attention,
+            max_tokens=int(max_decode_tokens),
+            hidden_size=int(config.hidden_size),
+            dtype=activation_dtype,
+            cuda_graph=bool(cuda_graph),
+            device_index=device_index,
+        )
+    return MiniMaxM2RuntimeConfig(
+        prefill_attention_op=prefill_attention_op,
+        decode_launch_op=decode_launch_op,
+        attention_decode_all_reduce=attention_decode_all_reduce,
+        moe_decode_all_reduce=moe_decode_all_reduce,
+        cuda_graph=bool(cuda_graph),
+    )
 
 
 class MiniMaxM2Router(nn.Module):
@@ -74,7 +215,12 @@ class MiniMaxM2Router(nn.Module):
 class MiniMaxM2PackedExperts(PackedExpertWeightLoader, nn.Module):
     checkpoint_projection_map = {"w1": "gate", "w2": "down", "w3": "up"}
 
-    def __init__(self, config) -> None:
+    def __init__(
+        self,
+        config,
+        *,
+        cuda_graph: bool | None = None,
+    ) -> None:
         super().__init__()
         parallel_context = get_parallel_context()
         self.tp_rank = int(parallel_context.moe_tp_rank)
@@ -114,7 +260,11 @@ class MiniMaxM2PackedExperts(PackedExpertWeightLoader, nn.Module):
             weight_dtype=torch.float8_e4m3fn,
             block_shape=tuple(config.quantization_config.weight_block_size),
             ep_size=self.ep_size,
-            cuda_graph=bool(getattr(config, "decode_cuda_graph", False)),
+            cuda_graph=(
+                bool(getattr(config, "decode_cuda_graph", False))
+                if cuda_graph is None
+                else bool(cuda_graph)
+            ),
             tp_size=self.tp_size,
             routing_method="biased_sigmoid",
             scale_dtype=torch.float32,
@@ -253,16 +403,24 @@ class MiniMaxM2PackedExperts(PackedExpertWeightLoader, nn.Module):
 
 
 class MiniMaxM2SparseMoeBlock(nn.Module):
-    def __init__(self, config) -> None:
+    def __init__(
+        self,
+        config,
+        runtime_config: MiniMaxM2RuntimeConfig | None = None,
+    ) -> None:
         super().__init__()
         self.parallel_context = get_parallel_context()
+        self.runtime_config = runtime_config
         self.mlp_chunk_size = int(getattr(config, "mlp_chunk_size", 16384))
         if self.mlp_chunk_size <= 0:
             raise ValueError(
                 f"mlp_chunk_size must be > 0, got {self.mlp_chunk_size}."
             )
         self.gate = MiniMaxM2Router(config)
-        self.experts = MiniMaxM2PackedExperts(config)
+        self.experts = MiniMaxM2PackedExperts(
+            config,
+            cuda_graph=(None if runtime_config is None else runtime_config.cuda_graph),
+        )
 
     @property
     def e_score_correction_bias(self) -> nn.Parameter:
@@ -288,13 +446,22 @@ class MiniMaxM2SparseMoeBlock(nn.Module):
                     self.experts(chunk, topk_ids, topk_weights)
                 )
             local_output = torch.cat(local_output_chunks, dim=0)
+        if self.runtime_config is not None:
+            context = get_context()
+            if not context.is_prefill:
+                return self.runtime_config.moe_decode_all_reduce.run(local_output)
         return self.parallel_context.world_all_reduce(local_output)
 
 
 class MiniMaxM2Attention(nn.Module):
-    def __init__(self, config) -> None:
+    def __init__(
+        self,
+        config,
+        runtime_config: MiniMaxM2RuntimeConfig | None = None,
+    ) -> None:
         super().__init__()
         self.parallel_context = get_parallel_context()
+        self.runtime_config = runtime_config
         tp_size = int(self.parallel_context.tp_size)
         self.total_num_heads = int(config.num_attention_heads)
         self.total_num_kv_heads = int(config.num_key_value_heads)
@@ -319,6 +486,7 @@ class MiniMaxM2Attention(nn.Module):
             int(config.hidden_size),
             bias=False,
             quantization=config.quantization_config,
+            reduce_results=runtime_config is None,
         )
         self.q_norm = ColumnParallelRMSNorm(
             self.total_num_heads * self.head_dim,
@@ -337,27 +505,17 @@ class MiniMaxM2Attention(nn.Module):
             base=float(config.rope_theta),
             rope_scaling=None,
         )
-        prefill_op_spec = None
-        if hasattr(config, "prefill_kv_view_layer_invariant"):
-            prefill_op_spec = PrefillAttentionOpSpec(
-                num_query_heads=self.num_heads,
-                num_kv_heads=self.num_kv_heads,
-                head_dim=self.head_dim,
-                activation_dtype=model_activation_dtype(config),
-                softmax_scale=self.head_dim**-0.5,
-                causal=True,
-                page_size=1,
-                requires_attention_scores=False,
-                layer_invariant_page_table=bool(
-                    config.prefill_kv_view_layer_invariant
-                ),
-            )
         self.attn = Attention(
             self.num_heads,
             self.head_dim,
             self.head_dim**-0.5,
             self.num_kv_heads,
-            prefill_op_spec=prefill_op_spec,
+            prefill_op=(
+                None if runtime_config is None else runtime_config.prefill_attention_op
+            ),
+            decode_launch_op=(
+                None if runtime_config is None else runtime_config.decode_launch_op
+            ),
         )
 
     def forward(
@@ -382,15 +540,24 @@ class MiniMaxM2Attention(nn.Module):
         )
         context.cache_manager.save_rope_kv_if_needed(layer_idx, k, v)
         output = self.attn(q, k, v).flatten(1, -1)
-        return self.o_proj(output)
+        output = self.o_proj(output)
+        if self.runtime_config is not None:
+            if context.is_prefill:
+                return self.parallel_context.attention_tp_all_reduce(output)
+            return self.runtime_config.attention_decode_all_reduce.run(output)
+        return output
 
 
 class MiniMaxM2DecoderLayer(nn.Module):
-    def __init__(self, config) -> None:
+    def __init__(
+        self,
+        config,
+        runtime_config: MiniMaxM2RuntimeConfig | None = None,
+    ) -> None:
         super().__init__()
         self.parallel_context = get_parallel_context()
-        self.self_attn = MiniMaxM2Attention(config)
-        self.block_sparse_moe = MiniMaxM2SparseMoeBlock(config)
+        self.self_attn = MiniMaxM2Attention(config, runtime_config)
+        self.block_sparse_moe = MiniMaxM2SparseMoeBlock(config, runtime_config)
         self.input_layernorm = RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
@@ -422,8 +589,16 @@ class MiniMaxM2DecoderLayer(nn.Module):
 
 
 class MiniMaxM2Model(Qwen3ModelBase):
-    def __init__(self, config) -> None:
-        super().__init__(config, MiniMaxM2DecoderLayer)
+    def __init__(
+        self,
+        config,
+        runtime_config: MiniMaxM2RuntimeConfig | None = None,
+    ) -> None:
+        layer_factory = partial(
+            MiniMaxM2DecoderLayer,
+            runtime_config=runtime_config,
+        )
+        super().__init__(config, layer_factory)
         self.norm = RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
@@ -438,14 +613,23 @@ class MiniMaxM2ForCausalLM(nn.Module):
         "v_proj": ("qkv_proj", "v"),
     }
 
-    def __init__(self, config) -> None:
+    def __init__(
+        self,
+        config,
+        runtime_config: MiniMaxM2RuntimeConfig | None = None,
+    ) -> None:
         super().__init__()
         self.config = config
         self.parallel_context = get_parallel_context()
-        self.model = MiniMaxM2Model(config)
+        self.runtime_config = runtime_config
+        self.model = MiniMaxM2Model(config, runtime_config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         self._intentionally_skipped_expert_weights: set[str] = set()
         self._intentionally_skipped_expert_scales: set[str] = set()
+
+    def close_runtime_operators(self) -> None:
+        if self.runtime_config is not None:
+            self.runtime_config.close()
 
     @torch.inference_mode()
     def warmup_moe(self, num_tokens: int = 1) -> None:
@@ -657,19 +841,30 @@ class MiniMaxM2ForCausalLM(nn.Module):
                 "Unexpectedly skipped MiniMax expert entries: "
                 f"weights={unexpected_skips[:4]}, scales={unexpected_scale_skips[:4]}."
             )
+        prefill_provider = (
+            self.runtime_config.prefill_attention_op.name
+            if self.runtime_config is not None
+            else "legacy_triton"
+        )
+        if self.runtime_config is None:
+            all_reduce_providers = "legacy_torch_distributed"
+        else:
+            all_reduce_providers = (
+                "attention="
+                f"{self.runtime_config.attention_decode_all_reduce.name},"
+                "moe="
+                f"{self.runtime_config.moe_decode_all_reduce.name}"
+            )
         logger.info(
-            "Loaded MiniMax M2 rank {} provider={} prefill_provider={} all_reduce_provider={} "
+            "Loaded MiniMax M2 rank {} provider={} prefill_provider={} "
+            "all_reduce_providers={} "
             "attention TP {}/{} MoE TP "
             "{}/{} local experts [{}, {}) across {} layers; intentionally skipped "
             "{} remote expert weight/scale pairs.",
             self.parallel_context.world_rank,
             self.model.layers[0].block_sparse_moe.experts.provider.name,
-            getattr(
-                self.model.layers[0].self_attn.attn.prefill_provider,
-                "name",
-                "legacy_triton",
-            ),
-            getattr(self.parallel_context.all_reduce_provider, "name", "unconfigured"),
+            prefill_provider,
+            all_reduce_providers,
             self.parallel_context.tp_rank,
             self.parallel_context.tp_size,
             self.parallel_context.moe_tp_rank,

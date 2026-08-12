@@ -393,6 +393,28 @@ def test_all_reduce_capture_and_close_delegate_to_provider():
     provider.close.assert_called_once_with()
 
 
+@pytest.mark.parametrize("op", [dist.ReduceOp.SUM, dist.ReduceOp.MAX])
+def test_parallel_context_collectives_are_always_in_place_torch_operations(op):
+    world_group = object()
+    context = ParallelContext(
+        world=ParallelGroup(world_group, (0, 1, 2, 3), 0, 4),
+        tensor=ParallelGroup(world_group, (0, 1, 2, 3), 0, 4),
+        expert=ParallelGroup(None, (0,), 0, 1),
+        data=ParallelGroup(None, (0,), 0, 1),
+    )
+    tensor = torch.ones(2, 3072, dtype=torch.bfloat16)
+
+    with patch.object(dist, "all_reduce") as all_reduce:
+        returned = context.world_all_reduce(tensor, op=op)
+
+    assert returned is tensor
+    all_reduce.assert_called_once_with(
+        tensor,
+        op=op,
+        group=world_group,
+    )
+
+
 def test_qwen3_moe_parallel_config_validation(tmp_path):
     with patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", return_value=_hf_config()):
         config = Config(model=str(tmp_path), expert_parallel_size=4)

@@ -81,6 +81,48 @@ def _resolve_decode_cuda_graph_capture_sizes(
     return sizes
 
 
+def _select_decode_cuda_graph_batch_size(
+    real_batch_size: int,
+    capture_sizes: list[int] | tuple[int, ...],
+) -> int:
+    real_batch_size = int(real_batch_size)
+    if real_batch_size <= 0:
+        raise ValueError(
+            f"decode batch size must be > 0, got {real_batch_size}."
+        )
+    sizes = sorted(set(int(size) for size in capture_sizes))
+    if not sizes or any(size <= 0 for size in sizes):
+        raise ValueError(
+            "decode_cuda_graph_capture_sizes must contain positive integers, "
+            f"got {sizes}."
+        )
+    for size in sizes:
+        if size >= real_batch_size:
+            return size
+    raise ValueError(
+        "decode_cuda_graph capture sizes do not cover current decode batch: "
+        f"batch_size={real_batch_size}, capture_sizes={sizes}."
+    )
+
+
+def _resolve_decode_static_batch_capacity(
+    capture_sizes: list[int] | tuple[int, ...],
+    *,
+    max_num_seqs_in_batch: int,
+    max_decoding_seqs: int,
+) -> int:
+    """Return the largest padded decode batch reachable by the scheduler."""
+
+    max_real_batch_size = min(
+        int(max_num_seqs_in_batch),
+        int(max_decoding_seqs),
+    )
+    return _select_decode_cuda_graph_batch_size(
+        max_real_batch_size,
+        capture_sizes,
+    )
+
+
 def _default_decode_cuda_graph_context_sizes(max_model_len: int) -> list[int]:
     """Default decode graph context buckets: 1k, 2k, 4k, ... up to max_model_len."""
     max_model_len = int(max_model_len)

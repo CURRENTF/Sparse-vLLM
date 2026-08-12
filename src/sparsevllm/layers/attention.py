@@ -5,10 +5,8 @@ from torch import nn
 
 from sparsevllm.engine.cache_manager import ExplicitKVPayload
 from sparsevllm.layers.attention_backend import TritonAttentionBackend
-from sparsevllm.operators.prefill_attention import (
-    PrefillAttentionOpSpec,
-    resolve_prefill_attention_provider,
-)
+from sparsevllm.operators.decode_attention import PreparedDecodeAttentionLaunchOp
+from sparsevllm.operators.prefill_attention import PreparedPrefillAttentionOp
 from sparsevllm.utils.context import get_context
 
 from sparsevllm.engine.sparse_controller import SparseController
@@ -62,7 +60,8 @@ class Attention(nn.Module):
         scale,
         num_kv_heads,
         *,
-        prefill_op_spec: PrefillAttentionOpSpec | None = None,
+        prefill_op: PreparedPrefillAttentionOp | None = None,
+        decode_launch_op: PreparedDecodeAttentionLaunchOp | None = None,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -70,14 +69,8 @@ class Attention(nn.Module):
         self.scale = scale
         self.num_kv_heads = num_kv_heads
         self.attention_backend = TritonAttentionBackend()
-        self.prefill_op_spec = prefill_op_spec
-        self.prefill_provider = (
-            resolve_prefill_attention_provider(prefill_op_spec)
-            if prefill_op_spec is not None
-            else None
-        )
-        if self.prefill_provider is not None:
-            self.prefill_provider.prepare(prefill_op_spec)
+        self.prefill_op = prefill_op
+        self.decode_launch_op = decode_launch_op
 
     def forward(
         self,
@@ -130,7 +123,7 @@ class Attention(nn.Module):
                 )
                 if fake_output is not None:
                     o = fake_output
-                elif self.prefill_provider is None:
+                elif self.prefill_op is None:
                     o = self.attention_backend.run_prefill(
                         q,
                         prefill_view,
@@ -144,8 +137,7 @@ class Attention(nn.Module):
                         prefill_view,
                         chunk_lens=chunk_lens,
                     )
-                    o = self.prefill_provider.run(
-                        self.prefill_op_spec,
+                    o = self.prefill_op.run(
                         q,
                         prefill_view,
                         qo_indptr=context.cu_seqlens_q,
@@ -222,16 +214,16 @@ class Attention(nn.Module):
                             f"decode requires a positive context length, got {max_len_in_batch} at layer={layer_idx}"
                         )
                 BLOCK_SEQ = cache_manager.get_decode_block_seq(layer_idx, 256)
-                BLOCK_SEQ, gqa_block_n, gqa_num_warps = (
-                    self.attention_backend.gqa_decode_launch_config(
-                        block_seq=BLOCK_SEQ,
-                        max_context_len=max_len_in_batch,
-                        num_heads=self.num_heads,
-                        num_kv_heads=self.num_kv_heads,
-                        head_dim=self.head_dim,
-                        requires_attention_scores=decode_meta.attn_score is not None,
+                if self.decode_launch_op is None:
+                    gqa_block_n, gqa_num_warps = 16, 2
+                else:
+                    BLOCK_SEQ, gqa_block_n, gqa_num_warps = (
+                        self.decode_launch_op.launch_config(
+                            block_seq=BLOCK_SEQ,
+                            max_context_len=max_len_in_batch,
+                            requires_attention_scores=decode_meta.attn_score is not None,
+                        )
                     )
-                )
                 num_seq_blocks = (max_len_in_batch + BLOCK_SEQ - 1) // BLOCK_SEQ
 
                 mid_o, mid_o_logexpsum = get_decode_workspace(

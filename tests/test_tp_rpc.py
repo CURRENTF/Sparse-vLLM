@@ -443,6 +443,9 @@ def test_model_runner_exit_drains_graphs_before_barrier():
     runner.decode_cuda_graph_runner = SimpleNamespace(
         clear_captured_graphs=lambda: calls.append("clear_graphs")
     )
+    runner.model = SimpleNamespace(
+        close_runtime_operators=lambda: calls.append("close_ops")
+    )
     runner.world_size = 2
     runner.rank = 0
     runner.shm = SimpleNamespace(
@@ -469,6 +472,8 @@ def test_model_runner_exit_drains_graphs_before_barrier():
     assert calls == [
         "sync",
         "clear_graphs",
+        "sync",
+        "close_ops",
         "sync",
         "close_shm",
         "barrier",

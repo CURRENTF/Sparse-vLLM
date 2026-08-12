@@ -118,25 +118,6 @@ class TritonAttentionBackend:
     def __init__(self) -> None:
         record_operator_binding("Attention", self)
 
-    @staticmethod
-    def gqa_decode_launch_config(
-        *,
-        block_seq: int,
-        max_context_len: int,
-        num_heads: int,
-        num_kv_heads: int,
-        head_dim: int,
-        requires_attention_scores: bool,
-    ) -> tuple[int, int, int]:
-        if (
-            block_seq == 256
-            and max_context_len > 32768
-            and (num_heads, num_kv_heads, head_dim) == (12, 2, 128)
-            and not requires_attention_scores
-        ):
-            return 1024, 128, 4
-        return block_seq, 16, 2
-
     def maybe_run_fake_prefill(
         self,
         q: torch.Tensor,

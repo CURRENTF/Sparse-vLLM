@@ -1,5 +1,5 @@
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -12,6 +12,7 @@ from sparsevllm.models.minimax_m2 import (
     MiniMaxM2Attention,
     MiniMaxM2ForCausalLM,
     MiniMaxM2PackedExperts,
+    MiniMaxM2RuntimeConfig,
 )
 from sparsevllm.utils.loader import load_model
 
@@ -147,7 +148,7 @@ def _tp_context(tp_rank: int, tp_size: int) -> ParallelContext:
     )
 
 
-def _instantiate_model(config, context):
+def _instantiate_model(config, context, runtime_config=None):
     with (
         patch(
             "sparsevllm.models.minimax_m2.get_parallel_context",
@@ -166,7 +167,38 @@ def _instantiate_model(config, context):
             return_value=context,
         ),
     ):
-        return MiniMaxM2ForCausalLM(config)
+        return MiniMaxM2ForCausalLM(config, runtime_config=runtime_config)
+
+
+def test_model_construction_shares_explicit_runtime_operators_across_layers():
+    config = _config(num_hidden_layers=2)
+    prefill_op = SimpleNamespace(name="prefill", close=Mock())
+    decode_op = SimpleNamespace(name="decode")
+    all_reduce_op = SimpleNamespace(name="all_reduce", run=Mock(), close=Mock())
+    runtime_config = MiniMaxM2RuntimeConfig(
+        prefill_attention_op=prefill_op,
+        decode_launch_op=decode_op,
+        attention_decode_all_reduce=all_reduce_op,
+        moe_decode_all_reduce=all_reduce_op,
+        cuda_graph=True,
+    )
+
+    model = _instantiate_model(
+        config,
+        _tp_context(0, 1),
+        runtime_config=runtime_config,
+    )
+
+    assert not hasattr(config, "prefill_kv_view_layer_invariant")
+    for layer in model.model.layers:
+        assert layer.self_attn.attn.prefill_op is prefill_op
+        assert layer.self_attn.attn.decode_launch_op is decode_op
+        assert not layer.self_attn.o_proj.reduce_results
+        assert layer.block_sparse_moe.experts.op_spec.cuda_graph
+    model.close_runtime_operators()
+    model.close_runtime_operators()
+    prefill_op.close.assert_called_once_with()
+    all_reduce_op.close.assert_called_once_with()
 
 
 def _random_fp8(shape):

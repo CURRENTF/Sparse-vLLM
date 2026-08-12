@@ -11,6 +11,7 @@ import numpy as np
 import torch
 
 from sparsevllm.config import Config
+from sparsevllm.configs.cuda_graph import _resolve_decode_static_batch_capacity
 from sparsevllm.engine.cache_manager.standard import StandardCacheManager
 from sparsevllm.engine.cache_manager.deltakv import DeltaKVCacheManager
 from sparsevllm.engine.cache_manager.deltakv_less_memory import DeltaKVLessMemoryCacheManager
@@ -1139,6 +1140,27 @@ class PrefillPolicyConfigTest(unittest.TestCase):
                 self.assertEqual(cfg.decode_cuda_graph_capture_sizes, expected_sizes)
                 self.assertTrue(cfg.decode_graph)
                 self.assertEqual(cfg.decode_graph_capture_sizes, expected_sizes)
+
+    def test_decode_static_batch_capacity_uses_reachable_padding_bucket(self):
+        cases = (
+            ([1, 2, 4, 8, 16, 32, 64], 32, 64, 32),
+            ([1, 4, 8, 64], 32, 64, 64),
+            ([1, 2, 4, 8, 16, 32, 64], 80, 64, 64),
+        )
+        for capture_sizes, max_batch, max_decode, expected in cases:
+            with self.subTest(
+                capture_sizes=capture_sizes,
+                max_batch=max_batch,
+                max_decode=max_decode,
+            ):
+                self.assertEqual(
+                    _resolve_decode_static_batch_capacity(
+                        capture_sizes,
+                        max_num_seqs_in_batch=max_batch,
+                        max_decoding_seqs=max_decode,
+                    ),
+                    expected,
+                )
 
     def test_decode_graph_aliases_normalize_to_canonical_fields(self):
         cfg = self.make_config(

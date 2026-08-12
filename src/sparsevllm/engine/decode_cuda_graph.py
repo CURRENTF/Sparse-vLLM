@@ -7,6 +7,7 @@ from typing import Callable
 import torch
 
 from sparsevllm.engine.sequence import Sequence
+from sparsevllm.configs.cuda_graph import _select_decode_cuda_graph_batch_size
 import sparsevllm.platforms as platforms
 from sparsevllm.utils.context import get_context, set_context
 from sparsevllm.utils.profiler import profiler
@@ -212,12 +213,9 @@ class DecodeCudaGraphRunner:
             if selected is not None:
                 return int(selected)
 
-        for size in self.capture_sizes:
-            if size >= real_batch_size:
-                return int(size)
-        raise ValueError(
-            "decode_cuda_graph capture sizes do not cover current decode batch: "
-            f"batch_size={real_batch_size}, capture_sizes={self.capture_sizes}."
+        return _select_decode_cuda_graph_batch_size(
+            real_batch_size,
+            self.capture_sizes,
         )
 
     def _select_state(
