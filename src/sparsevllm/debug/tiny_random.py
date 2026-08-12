@@ -85,7 +85,12 @@ def load_tiny_random_overrides(path: str) -> dict[str, int]:
     return overrides
 
 
-def apply_tiny_random_overrides(hf_config: Any, path: str) -> dict[str, int]:
+def apply_tiny_random_overrides(
+    hf_config: Any,
+    path: str,
+    *,
+    validate_standard_head_shape: bool = True,
+) -> dict[str, int]:
     overrides = load_tiny_random_overrides(path)
     original_values = {
         name: int(getattr(hf_config, name))
@@ -130,8 +135,7 @@ def apply_tiny_random_overrides(hf_config: Any, path: str) -> dict[str, int]:
     num_heads = int(hf_config.num_attention_heads)
     num_kv_heads = int(hf_config.num_key_value_heads)
     head_dim = int(getattr(hf_config, "head_dim", hidden_size // num_heads))
-    is_mla = str(getattr(hf_config, "model_type", "") or "") == "glm4_moe_lite"
-    if not is_mla and hidden_size != num_heads * head_dim:
+    if validate_standard_head_shape and hidden_size != num_heads * head_dim:
         raise ValueError(
             "Tiny random config requires hidden_size == num_attention_heads * head_dim, "
             f"got {hidden_size} != {num_heads} * {head_dim}."

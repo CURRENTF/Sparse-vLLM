@@ -15,14 +15,7 @@ def create_attention_cache_storage(
     num_kv_heads: int,
     head_dim: int,
 ) -> AttentionCacheStorage:
-    configured_layout = getattr(config, "attention_cache_layout", None)
-    if configured_layout is None:
-        model_type = str(getattr(config.hf_config, "model_type", "") or "")
-        configured_layout = (
-            CacheLayout.MLA_LATENT.value
-            if model_type == "glm4_moe_lite"
-            else CacheLayout.EXPLICIT_KV.value
-        )
+    configured_layout = config.attention_cache_layout
     layout = (
         configured_layout
         if isinstance(configured_layout, CacheLayout)

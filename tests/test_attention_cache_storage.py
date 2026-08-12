@@ -98,24 +98,6 @@ def test_storage_factory_uses_configured_layout():
         MlaLatentStorage,
     )
 
-    inferred_mla_config = SimpleNamespace(
-        hf_config=SimpleNamespace(
-            model_type="glm4_moe_lite",
-            torch_dtype=torch.bfloat16,
-            kv_lora_rank=512,
-            qk_rope_head_dim=64,
-        )
-    )
-    assert isinstance(
-        create_attention_cache_storage(
-            inferred_mla_config,
-            num_kv_heads=4,
-            head_dim=64,
-        ),
-        MlaLatentStorage,
-    )
-
-
 @pytest.mark.parametrize(
     ("storage", "num_layers", "num_slots", "expected_shape"),
     [
