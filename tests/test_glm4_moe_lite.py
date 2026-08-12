@@ -34,6 +34,7 @@ from sparsevllm.models.glm4_moe_lite import (
 from sparsevllm.models.qwen3 import Qwen3MLP
 from sparsevllm.operators.mla_attention import MlaAttentionOpSpec
 from sparsevllm.operators.moe import TritonMoeProvider
+from sparsevllm.operators.moe_router import GlmBiasedSigmoidRouterProvider
 from sparsevllm.platforms import device_runtime
 
 
@@ -135,6 +136,12 @@ def _construction_context(context: ParallelContext):
             patch(
                 "sparsevllm.models.glm4_moe_lite.resolve_moe_provider",
                 return_value=TritonMoeProvider(),
+            )
+        )
+        stack.enter_context(
+            patch(
+                "sparsevllm.models.glm4_moe_lite.resolve_moe_router_provider",
+                return_value=GlmBiasedSigmoidRouterProvider(),
             )
         )
         stack.enter_context(torch.device("cpu"))
@@ -322,7 +329,11 @@ def test_glm_attention_binds_key_materializer_once_per_manager_context() -> None
 
 def test_glm_router_uses_bias_only_for_selection_and_scales_weights() -> None:
     torch.manual_seed(23)
-    router = Glm4MoeLiteRouter(_config())
+    with patch(
+        "sparsevllm.models.glm4_moe_lite.resolve_moe_router_provider",
+        return_value=GlmBiasedSigmoidRouterProvider(),
+    ):
+        router = Glm4MoeLiteRouter(_config())
     router.weight.data.normal_(mean=0.0, std=0.1)
     router.e_score_correction_bias.data.zero_()
     router.e_score_correction_bias.data[:4] = 100.0
