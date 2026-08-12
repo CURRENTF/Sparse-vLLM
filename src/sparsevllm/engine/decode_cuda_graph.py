@@ -88,8 +88,6 @@ class DecodeCudaGraphRunner:
         run_model: Callable[[torch.Tensor, torch.Tensor, bool], torch.Tensor],
         is_long_text_batch: Callable[[list[Sequence], bool], bool],
         method: str,
-        rank: int,
-        parallel_context,
         capture_sizes: list[int],
         context_sizes: list[int] | tuple[int, ...] | str | int | None = None,
         graph_pool=None,
@@ -101,8 +99,6 @@ class DecodeCudaGraphRunner:
         self.run_model = run_model
         self.is_long_text_batch = is_long_text_batch
         self.method = str(method or "")
-        self.rank = int(rank)
-        self.parallel_context = parallel_context
         self.platform = platforms.current_platform
         self.capture_sizes = sorted(set(int(size) for size in capture_sizes))
         if not self.capture_sizes or any(size <= 0 for size in self.capture_sizes):
@@ -478,7 +474,7 @@ class DecodeCudaGraphRunner:
         if sparse_keepalive is not None:
             keepalive.extend(sparse_keepalive())
         state.keepalive = keepalive
-        self.capture_count = int(getattr(self, "capture_count", 0)) + 1
+        self.capture_count += 1
         return state
 
     def run(
@@ -503,9 +499,7 @@ class DecodeCudaGraphRunner:
         real_batch_size = len(seqs)
         force_eager = getattr(self.cache_manager, "decode_cuda_graph_force_eager", None)
         if force_eager is not None and force_eager():
-            self.force_eager_count = int(
-                getattr(self, "force_eager_count", 0)
-            ) + 1
+            self.force_eager_count += 1
             return self.run_eager_static(seqs), None
 
         graph_batch_size = self._select_graph_batch_size(real_batch_size)
@@ -528,7 +522,7 @@ class DecodeCudaGraphRunner:
             self._restore_sparse_state_refs(state)
             with profiler.record("decode_cuda_graph_replay_after_capture"):
                 state.graph.replay()
-            self.replay_count = int(getattr(self, "replay_count", 0)) + 1
+            self.replay_count += 1
             logits = state.logits[:real_batch_size] if state.logits is not None else None
             token_ids = state.token_ids[:real_batch_size] if state.token_ids is not None else None
             return logits, token_ids
@@ -536,7 +530,7 @@ class DecodeCudaGraphRunner:
         self._restore_sparse_state_refs(state)
         with profiler.record("decode_cuda_graph_replay"):
             state.graph.replay()
-        self.replay_count = int(getattr(self, "replay_count", 0)) + 1
+        self.replay_count += 1
         logits = state.logits[:real_batch_size] if state.logits is not None else None
         token_ids = state.token_ids[:real_batch_size] if state.token_ids is not None else None
         return logits, token_ids
@@ -545,9 +539,7 @@ class DecodeCudaGraphRunner:
         """Run decode eagerly through the same static-compatible path used by graphs."""
         if not seqs:
             raise ValueError("static decode requires a non-empty decode batch.")
-        self.eager_static_count = int(
-            getattr(self, "eager_static_count", 0)
-        ) + 1
+        self.eager_static_count += 1
 
         real_batch_size = len(seqs)
         graph_batch_size = self._select_graph_batch_size(real_batch_size)

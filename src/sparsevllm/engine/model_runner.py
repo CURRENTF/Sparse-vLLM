@@ -297,8 +297,6 @@ class ModelRunner:
             run_model=self.run_model,
             is_long_text_batch=self._is_long_text_batch,
             method=self.config.vllm_sparse_method,
-            rank=self.rank,
-            parallel_context=self.parallel_context,
             capture_sizes=decode_static_capture_sizes,
             context_sizes=decode_static_context_sizes,
             graph_pool=self.cuda_graph_pool,
