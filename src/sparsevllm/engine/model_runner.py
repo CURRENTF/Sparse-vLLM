@@ -104,6 +104,13 @@ PREFIX_CACHE_CONTROL_RPC_METHODS = {
     "prefix_cache_delete_subtree",
     "prefix_cache_set_eviction_priority",
 }
+RECOVERABLE_TP_CONTROL_RPC_METHODS = PREFIX_CACHE_CONTROL_RPC_METHODS | {
+    "finish_slots_batch",
+    "free_multimodal",
+    "free_slots",
+    "free_slots_batch",
+    "register_multimodal_shared",
+}
 TP_RPC_STATUS_SYNC_METHODS = PREFIX_CACHE_CONTROL_RPC_METHODS | {
     "chain_admission_plan",
     "chain_apply_admission",
@@ -373,8 +380,13 @@ class ModelRunner:
             try:
                 self.call(method_name, *args)
             except Exception as exc:
-                if method_name in PREFIX_CACHE_CONTROL_RPC_METHODS:
-                    logger.error("TP worker prefix-cache control RPC failed: {}: {}", type(exc).__name__, exc)
+                if method_name in RECOVERABLE_TP_CONTROL_RPC_METHODS:
+                    logger.error(
+                        "TP worker recoverable control RPC {} failed: {}: {}",
+                        method_name,
+                        type(exc).__name__,
+                        exc,
+                    )
                 else:
                     raise
             if method_name == "exit":

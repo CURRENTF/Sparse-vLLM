@@ -13,6 +13,7 @@ import torch.distributed as dist
 from sparsevllm.engine.model_runner import (
     ModelRunner,
     PREFIX_CACHE_CONTROL_RPC_METHODS,
+    RECOVERABLE_TP_CONTROL_RPC_METHODS,
     TP_RUN_STATUS_FAILED,
     TP_RUN_STATUS_SUCCESS,
     TP_RPC_STATUS_SYNC_METHODS,
@@ -431,6 +432,30 @@ def test_model_runner_prefix_cache_lookup_returns_sequence_metadata():
 def test_hidden_state_debug_uses_failure_synchronized_world_rpc():
     assert "debug_hidden_states_cpu" in TP_RPC_STATUS_SYNC_METHODS
     assert "debug_moe_states_cpu" in TP_RPC_STATUS_SYNC_METHODS
+
+
+def test_tp_worker_continues_after_multimodal_registration_failure():
+    assert "register_multimodal_shared" in RECOVERABLE_TP_CONTROL_RPC_METHODS
+    runner = object.__new__(ModelRunner)
+    commands = iter(
+        [
+            ("register_multimodal_shared", []),
+            ("free_multimodal", []),
+            ("exit", []),
+        ]
+    )
+    calls = []
+    runner.read_shm = lambda: next(commands)
+
+    def call(method_name, *_args):
+        calls.append(method_name)
+        if method_name == "register_multimodal_shared":
+            raise ValueError("rank-local encoder failure")
+
+    runner.call = call
+    ModelRunner.loop(runner)
+
+    assert calls == ["register_multimodal_shared", "free_multimodal", "exit"]
 
 
 def test_model_runner_reset_after_warmup_resets_local_runtime_state():

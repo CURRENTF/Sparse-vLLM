@@ -9,7 +9,11 @@ import torch
 
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.engine.llm_engine import LLMEngine
-from sparsevllm.multimodal.inputs import MultiModalInputProcessor, normalize_messages
+from sparsevllm.multimodal.inputs import (
+    MultiModalInputProcessor,
+    ProcessedMultiModalPrompt,
+    normalize_messages,
+)
 from sparsevllm.multimodal.runtime import MultiModalRuntime, MultiModalState
 from sparsevllm.models.qwen3_5_multimodal import qwen35_mrope_positions
 from sparsevllm.operators.qwen35_mrope import Qwen35MRotaryEmbedding
@@ -65,6 +69,24 @@ def test_normalize_openai_wav_audio_without_optional_dependencies():
         torch.from_numpy(part["audio"]),
         torch.tensor([-1.0, 0.0, 32767 / 32768]),
     )
+
+
+def test_normalize_openai_audio_rejects_invalid_base64_wav():
+    with pytest.raises(ValueError, match="valid base64 WAV"):
+        normalize_messages(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_audio",
+                            "input_audio": {"format": "wav", "data": "not-base64"},
+                        }
+                    ],
+                }
+            ]
+        )
+
 
 def test_multimodal_processor_returns_stable_cpu_payload():
     class Processor:
@@ -229,23 +251,61 @@ def test_abort_queued_multimodal_request_releases_encoder_state_only():
     assert calls == [("free_multimodal", (seq.seq_id,))]
 
 
+def test_multimodal_registration_error_survives_failed_rollback():
+    calls = []
+
+    class Runner:
+        def call(self, method, *args):
+            calls.append(method)
+            if method == "register_multimodal_shared":
+                raise ValueError("rank-local encoder failure")
+            raise TimeoutError("rollback timeout")
+
+    engine = object.__new__(LLMEngine)
+    engine.config = SimpleNamespace(
+        hf_config=SimpleNamespace(use_bidirectional_attention=None),
+        max_model_len=16,
+        resolved_prefix_cache_mode="disabled",
+    )
+    engine.multimodal_processor = SimpleNamespace(
+        process=lambda _prompt: ProcessedMultiModalPrompt(
+            token_ids=[1, 2],
+            tensors={"mm_token_type_ids": torch.tensor([[0, 1]])},
+            digest="digest",
+        )
+    )
+    engine.model_runner = Runner()
+
+    with pytest.raises(ValueError, match="rank-local encoder failure"):
+        engine.admit_request(
+            {"messages": [{"role": "user", "content": []}]},
+            SamplingParams(max_tokens=1),
+        )
+
+    assert calls == ["register_multimodal_shared", "free_multimodal"]
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_gemma4_multimodal_context_attention_matches_reference():
+@pytest.mark.parametrize("score_ndim", [2, 3])
+def test_gemma4_multimodal_context_attention_matches_reference(score_ndim):
     from sparsevllm.kernels.triton.gemma4_multimodal_context_attention import (
         gemma4_multimodal_context_attention,
     )
 
     device = torch.device("cuda")
     torch.manual_seed(0)
-    length, num_heads, head_dim, window = 9, 2, 256, 4
+    length, num_heads, head_dim, window = 73, 2, 256, 64
     q = (torch.randn(length, num_heads, head_dim, device=device) / head_dim**0.5).bfloat16()
     k = torch.randn(length, 1, head_dim, device=device).bfloat16()
     v = torch.randn_like(k)
     output = torch.empty_like(q)
     attention_score = torch.zeros(
-        1, num_heads, length, device=device, dtype=torch.float32
+        (1, num_heads, length) if score_ndim == 3 else (1, length),
+        device=device,
+        dtype=torch.float32,
     )
-    groups = torch.tensor([0, 0, 1, 1, 1, 1, 0, 0, 0], device=device, dtype=torch.int32)
+    groups = torch.zeros(length, device=device, dtype=torch.int32)
+    groups[20:51] = 1
     gemma4_multimodal_context_attention(
         q,
         k,
@@ -267,7 +327,16 @@ def test_gemma4_multimodal_context_attention_matches_reference():
     key = torch.arange(length, device=device)[None, :]
     same_group = (groups[:, None] == groups[None, :]) & (groups[:, None] > 0)
     visible = ((key <= query) | same_group) & (key > query - window)
-    expected_score = torch.where(visible.unsqueeze(0), scores, 0).sum(1)
+    visible_scores = torch.where(visible.unsqueeze(0), scores, 0)
+    if score_ndim == 3:
+        expected_score = visible_scores.sum(1)
+    else:
+        expected_score = torch.stack(
+            [
+                visible_scores[:, start : start + 32].sum(1) / length
+                for start in range(0, length, 32)
+            ]
+        ).amax((0, 1)).clamp_min_(0)
     scores.masked_fill_(~visible.unsqueeze(0), float("-inf"))
     reference = torch.einsum("hqk,khd->qhd", scores.softmax(-1), v.expand(-1, num_heads, -1).float())
 

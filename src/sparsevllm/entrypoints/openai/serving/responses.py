@@ -86,6 +86,8 @@ async def serve_response(
         )
     except ChainCacheError as exc:
         raise _chain_http_exception(exc) from exc
+    except (ValueError, TypeError, NotImplementedError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     headers = (
         {"X-SparseVLLM-Chain-ID": getattr(handle, "chain_id", None)}
         if getattr(handle, "chain_id", None) is not None

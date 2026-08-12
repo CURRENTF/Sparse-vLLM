@@ -686,8 +686,17 @@ class LLMEngine:
                         len(payload),
                     )
                 )
-            except Exception:
-                self.model_runner.call("free_multimodal", int(seq.seq_id))
+            except Exception as register_error:
+                try:
+                    self.model_runner.call("free_multimodal", int(seq.seq_id))
+                except Exception as cleanup_error:
+                    logger.error(
+                        "Failed to roll back multimodal seq_id={} after registration "
+                        "error {}: {}",
+                        seq.seq_id,
+                        type(register_error).__name__,
+                        cleanup_error,
+                    )
                 raise
             finally:
                 payload_shm.close()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
 import io
 import wave
@@ -39,15 +40,19 @@ def _audio_part(part: dict[str, Any]) -> dict[str, Any]:
         raise TypeError("input_audio requires a base64 data string.")
     if str(audio.get("format", "wav")).lower() != "wav":
         raise ValueError("Only WAV input_audio is supported.")
-    with wave.open(io.BytesIO(base64.b64decode(audio["data"])), "rb") as wav:
-        if wav.getcomptype() != "NONE":
-            raise ValueError("Compressed WAV input_audio is unsupported.")
-        channels, sample_width, sampling_rate = (
-            wav.getnchannels(),
-            wav.getsampwidth(),
-            wav.getframerate(),
-        )
-        raw = wav.readframes(wav.getnframes())
+    try:
+        encoded = base64.b64decode(audio["data"], validate=True)
+        with wave.open(io.BytesIO(encoded), "rb") as wav:
+            if wav.getcomptype() != "NONE":
+                raise ValueError("Compressed WAV input_audio is unsupported.")
+            channels, sample_width, sampling_rate = (
+                wav.getnchannels(),
+                wav.getsampwidth(),
+                wav.getframerate(),
+            )
+            raw = wav.readframes(wav.getnframes())
+    except (binascii.Error, wave.Error) as exc:
+        raise ValueError("input_audio data must contain a valid base64 WAV file.") from exc
     if sample_width == 1:
         waveform = (np.frombuffer(raw, np.uint8).astype(np.float32) - 128) / 128
     elif sample_width in {2, 4}:

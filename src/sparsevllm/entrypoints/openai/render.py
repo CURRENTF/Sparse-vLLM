@@ -437,8 +437,27 @@ def _response_content(content: Any) -> str | list[dict[str, Any]]:
             if not isinstance(part, dict):
                 raise ValueError("message content parts must be JSON objects.")
             part_type = part.get("type")
-            if part_type in {"input_image", "input_audio", "input_video"}:
-                normalized.append(dict(part))
+            if part_type in {"input_image", "input_video"}:
+                field = "image_url" if part_type == "input_image" else "video_url"
+                if set(part) - {"type", field}:
+                    raise ValueError(f"{part_type} contains unsupported fields.")
+                value = part.get(field)
+                url = value.get("url") if isinstance(value, dict) else value
+                if not isinstance(url, str) or not url:
+                    raise ValueError(f"{part_type} requires a non-empty {field}.")
+                normalized.append({"type": part_type, field: value})
+                continue
+            if part_type == "input_audio":
+                if set(part) - {"type", "input_audio"}:
+                    raise ValueError("input_audio contains unsupported fields.")
+                audio = part.get("input_audio")
+                if not isinstance(audio, dict) or set(audio) - {"data", "format"}:
+                    raise ValueError("input_audio requires data and optional format fields.")
+                if not isinstance(audio.get("data"), str) or not audio["data"]:
+                    raise ValueError("input_audio requires a non-empty base64 data string.")
+                if "format" in audio and str(audio["format"]).lower() != "wav":
+                    raise ValueError("Only WAV input_audio is supported.")
+                normalized.append({"type": "input_audio", "input_audio": dict(audio)})
                 continue
             if part_type not in {"text", "input_text", "output_text"}:
                 raise ValueError(f"Unsupported message content part type: {part_type!r}.")

@@ -4993,6 +4993,90 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(prompt.messages[0]["content"][0]["type"], "input_image")
         self.assertEqual(prompt.messages[0]["content"][1], {"type": "text", "text": "describe"})
 
+    def test_response_prompt_validates_multimodal_parts(self):
+        from sparsevllm.entrypoints.openai.api_server import ResponseRequest, _response_prompt
+
+        cases = [
+            ({"type": "input_image"}, "requires a non-empty image_url"),
+            ({"type": "input_video", "video_url": ""}, "requires a non-empty video_url"),
+            ({"type": "input_audio", "input_audio": {}}, "base64 data string"),
+            (
+                {
+                    "type": "input_audio",
+                    "input_audio": {"data": "AAAA", "format": "mp3"},
+                },
+                "Only WAV",
+            ),
+            (
+                {"type": "input_image", "image_url": "https://x/image.png", "extra": 1},
+                "unsupported fields",
+            ),
+        ]
+        for part, error in cases:
+            with self.subTest(part=part), self.assertRaisesRegex(ValueError, error):
+                _response_prompt(
+                    object(),
+                    ResponseRequest(
+                        model="model",
+                        input=[
+                            {
+                                "type": "message",
+                                "role": "user",
+                                "content": [part],
+                            }
+                        ],
+                    ),
+                )
+
+    async def test_multimodal_admission_errors_return_bad_request(self):
+        from fastapi import HTTPException
+
+        from sparsevllm.entrypoints.openai.api_server import (
+            ChatCompletionRequest,
+            ResponseRequest,
+        )
+        from sparsevllm.entrypoints.openai.serving.chat import serve_chat_completion
+        from sparsevllm.entrypoints.openai.serving.responses import serve_response
+
+        class Dispatcher:
+            admission_ack_enabled = True
+
+            async def submit(self, *_args, **_kwargs):
+                raise AssertionError("submit_admitted must be used")
+
+            async def submit_admitted(self, *_args, **_kwargs):
+                raise NotImplementedError("checkpoint does not support audio")
+
+        class Tokenizer:
+            chat_template = "template"
+
+            def apply_chat_template(self, *_args, **_kwargs):
+                return "rendered"
+
+        requests = [
+            serve_chat_completion(
+                ChatCompletionRequest(
+                    model="model", messages=[{"role": "user", "content": "hello"}]
+                ),
+                Dispatcher(),
+                Tokenizer(),
+                "model",
+                None,
+            ),
+            serve_response(
+                ResponseRequest(model="model", input="hello"),
+                Dispatcher(),
+                Tokenizer(),
+                "model",
+                None,
+                None,
+            ),
+        ]
+        for request in requests:
+            with self.assertRaises(HTTPException) as ctx:
+                await request
+            self.assertEqual(ctx.exception.status_code, 400)
+
     def test_response_prompt_passes_tools_and_tool_outputs(self):
         from sparsevllm.entrypoints.openai.api_server import ResponseRequest, _response_prompt
 
