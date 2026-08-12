@@ -41,6 +41,7 @@ from benchmark.sparsevllm_regression.run_suite import (
     main as run_suite_main,
 )
 from benchmark.sparsevllm_regression.run_suite import _quality_command
+from sparsevllm.config import RuntimeLayout
 from sparsevllm.engine.cache_manager.base import CacheManager
 from sparsevllm.distributed import ParallelContext, ParallelGroup
 from sparsevllm.method_registry import (
@@ -76,6 +77,7 @@ class FakeCacheManager(CacheManager):
         )
         config = types.SimpleNamespace(
             hf_config=hf_config,
+            runtime_layout=RuntimeLayout.dense(2),
             max_model_len=10,
             max_num_seqs_in_gpu=2,
             max_num_seqs_in_batch=2,
