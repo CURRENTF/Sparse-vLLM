@@ -509,9 +509,22 @@ class Gemma4Model(nn.Module):
         )
         return (model_inputs + token_inputs) * self.per_layer_input_scale
 
-    def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        hidden_states = self.embed_tokens(input_ids) * self.embedding_scale
-        per_layer_inputs = self.get_per_layer_inputs(input_ids, hidden_states)
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        inputs_embeds: torch.Tensor | None = None,
+        multimodal_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        hidden_states = (
+            self.embed_tokens(input_ids) * self.embedding_scale
+            if inputs_embeds is None
+            else inputs_embeds
+        )
+        per_layer_ids = input_ids
+        if self.hidden_size_per_layer_input and multimodal_mask is not None:
+            per_layer_ids = input_ids.masked_fill(multimodal_mask, int(self.config.pad_token_id))
+        per_layer_inputs = self.get_per_layer_inputs(per_layer_ids, hidden_states)
         context = get_context()
         for layer_idx, layer in enumerate(self.layers):
             context.now_layer_idx = layer_idx
@@ -530,6 +543,7 @@ class Gemma4Model(nn.Module):
 
 class Gemma4ForCausalLM(nn.Module):
     special_weight_loaders = (".expert_weight",)
+    packed_modules_excluded_prefixes = ("multimodal_encoder.",)
     packed_modules_mapping: ClassVar = {
         "q_proj": ("qkv_proj", "q"),
         "k_proj": ("qkv_proj", "k"),
@@ -550,6 +564,33 @@ class Gemma4ForCausalLM(nn.Module):
         if config.tie_word_embeddings:
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
         self.logit_softcap = float(config.final_logit_softcapping or 0.0)
+        self.multimodal_encoder = None
+
+    def configure_multimodal(self, outer_config) -> None:
+        from sparsevllm.models.gemma4_multimodal import Gemma4MultimodalEncoder
+
+        self.multimodal_encoder = Gemma4MultimodalEncoder(outer_config)
+        self.multimodal_bidirectional = (
+            getattr(outer_config.text_config, "use_bidirectional_attention", None)
+            == "vision"
+        )
+
+    def encode_multimodal(self, input_ids, tensors):
+        if self.multimodal_encoder is None:
+            raise RuntimeError("Gemma 4 multimodal encoder is disabled.")
+        return self.multimodal_encoder.encode(input_ids, tensors)
+
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.model.embed_tokens(input_ids) * self.model.embedding_scale
+
+    def forward_multimodal(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        inputs_embeds: torch.Tensor,
+        multimodal_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.model(input_ids, positions, inputs_embeds, multimodal_mask)
 
     @classmethod
     def build_runtime_kwargs(cls, config, *, device, **_):
@@ -591,6 +632,19 @@ class Gemma4ForCausalLM(nn.Module):
                 "v_norm",
             }:
                 return None
+        multimodal_prefixes = (
+            ("model.vision_tower.", "multimodal_encoder.vision_tower."),
+            ("model.audio_tower.", "multimodal_encoder.audio_tower."),
+            ("model.embed_vision.", "multimodal_encoder.embed_vision."),
+            ("model.embed_audio.", "multimodal_encoder.embed_audio."),
+        )
+        if self.multimodal_encoder is None and source_weight_name.startswith(
+            tuple(prefix for prefix, _ in multimodal_prefixes)
+        ):
+            return None
+        for source_prefix, target_prefix in multimodal_prefixes:
+            if source_weight_name.startswith(source_prefix):
+                return target_prefix + source_weight_name[len(source_prefix) :]
         return (
             "model." + source_weight_name[len(prefix) :]
             if source_weight_name.startswith(prefix)
@@ -663,8 +717,14 @@ class Gemma4ForCausalLM(nn.Module):
         experts(hidden, ids, weights)
         device_runtime.synchronize()
 
-    def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        return self.model(input_ids, positions)
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        inputs_embeds: torch.Tensor | None = None,
+        multimodal_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return self.model(input_ids, positions, inputs_embeds, multimodal_mask)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         logits = self.lm_head(hidden_states)

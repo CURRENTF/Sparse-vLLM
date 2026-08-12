@@ -228,15 +228,24 @@ class Qwen35MoePackedExperts(Qwen3MoePackedExperts):
         self._loaded_packed_projections.add(projection)
 
     def validate_loaded_weights(self) -> None:
-        if self.fp8_enabled:
-            super().validate_loaded_weights()
-            return
-        missing = {"gate_up_proj", "down_proj"} - self._loaded_packed_projections
+        if not self.fp8_enabled:
+            missing = {"gate_up_proj", "down_proj"} - self._loaded_packed_projections
+            if missing:
+                raise ValueError(
+                    f"Missing Qwen3.6 packed expert projections: {sorted(missing)}."
+                )
+        expected = {
+            (expert_id, projection)
+            for expert_id in range(self.local_expert_start, self.local_expert_end)
+            for projection in ("gate_proj", "up_proj", "down_proj")
+        }
+        missing = sorted(expected - self._loaded_expert_shards)
         if missing:
             raise ValueError(
-                f"Missing Qwen3.6 packed expert projections: {sorted(missing)}."
+                "Missing local Qwen3.6 expert weights: "
+                f"local_range=[{self.local_expert_start}, "
+                f"{self.local_expert_end}), missing={missing[:8]}."
             )
-        super().validate_loaded_weights()
 
 
 class Qwen35MoeSparseMoeBlock(nn.Module):
@@ -311,6 +320,7 @@ class Qwen35MoeForCausalLM(Qwen35ForCausalLM):
         )
         if bool(getattr(config, "tie_word_embeddings", False)):
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
+        self.multimodal_encoder = None
         self._loaded_linear_special_weights: set[str] = set()
         self._intentionally_skipped_weights: set[str] = set()
         self._intentionally_skipped_expert_weights: set[str] = set()
@@ -647,7 +657,12 @@ class Qwen35MoeForCausalLM(Qwen35ForCausalLM):
                 for name in self._intentionally_skipped_weights
             ),
         }
-        missing_skip_groups = [name for name, seen in skip_groups.items() if not seen]
+        required_skip_groups = (
+            {"mtp"} if self.multimodal_encoder is not None else {"visual", "mtp"}
+        )
+        missing_skip_groups = [
+            name for name in required_skip_groups if not skip_groups[name]
+        ]
         if missing_skip_groups:
             raise ValueError(
                 "Qwen3.6 MoE checkpoint is missing expected intentional-skip "

@@ -1237,6 +1237,27 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(prompt, "rendered")
         self.assertEqual(tokenizer.chat, [{"role": "system", "content": "policy\ndetails"}])
 
+    def test_chat_prompt_preserves_multimodal_parts_for_model_processor(self):
+        from sparsevllm.entrypoints.openai.api_server import ChatMessage, _chat_prompt
+        from sparsevllm.multimodal import MultiModalPrompt
+
+        prompt = _chat_prompt(
+            object(),
+            [
+                ChatMessage(
+                    role="user",
+                    content=[
+                        {"type": "image_url", "image_url": {"url": "https://x/image.png"}},
+                        {"type": "text", "text": "describe"},
+                    ],
+                )
+            ],
+        )
+
+        self.assertIsInstance(prompt, MultiModalPrompt)
+        self.assertEqual(prompt.messages[0]["content"][0]["type"], "image_url")
+        self.assertEqual(prompt.messages[0]["content"][1]["text"], "describe")
+
     def test_chat_prompt_preserves_reasoning_content_for_templates(self):
         from sparsevllm.entrypoints.openai.api_server import ChatMessage, _chat_prompt
 
@@ -4947,6 +4968,30 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
                 Tokenizer(),
                 ResponseRequest(model="model", input=[{"type": "image", "image_url": "x"}]),
             )
+
+    def test_response_prompt_preserves_multimodal_parts_for_model_processor(self):
+        from sparsevllm.entrypoints.openai.api_server import ResponseRequest, _response_prompt
+        from sparsevllm.multimodal import MultiModalPrompt
+
+        request = ResponseRequest(
+            model="model",
+            input=[
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_image", "image_url": "https://x/image.png"},
+                        {"type": "input_text", "text": "describe"},
+                    ],
+                }
+            ],
+        )
+
+        prompt = _response_prompt(object(), request)
+
+        self.assertIsInstance(prompt, MultiModalPrompt)
+        self.assertEqual(prompt.messages[0]["content"][0]["type"], "input_image")
+        self.assertEqual(prompt.messages[0]["content"][1], {"type": "text", "text": "describe"})
 
     def test_response_prompt_passes_tools_and_tool_outputs(self):
         from sparsevllm.entrypoints.openai.api_server import ResponseRequest, _response_prompt

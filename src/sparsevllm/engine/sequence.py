@@ -108,6 +108,9 @@ class Sequence:
         self.chain_id: str | None = None
         self.chain_status = "disabled"
         self.chain_reused_tokens = 0
+        self.multimodal_digest: str | None = None
+        self.multimodal_position_delta = 0
+        self.multimodal_full_prefill = False
         # None means normal generation. During recompute replay the original
         # prompt is prefetched again, then accepted completion tokens before the
         # current last token are replayed through decode without being sampled
@@ -294,8 +297,10 @@ class Sequence:
     @property
     def decode_input_position(self) -> int:
         if self.is_recompute_decode:
-            return int(self.num_prompt_tokens + int(self.recompute_replay_cursor or 0))
-        return int(self.num_tokens - 1)
+            position = self.num_prompt_tokens + int(self.recompute_replay_cursor or 0)
+        else:
+            position = self.num_tokens - 1
+        return int(position + self.multimodal_position_delta)
 
     @property
     def should_publish_sample(self) -> bool:
@@ -392,6 +397,9 @@ class Sequence:
             self.chain_reused_tokens,
             self.recompute_replay_cursor,
             self.decode_progress_checkpoint,
+            self.multimodal_digest,
+            self.multimodal_position_delta,
+            self.multimodal_full_prefill,
         )
 
     def __setstate__(self, state):
@@ -403,7 +411,9 @@ class Sequence:
          self.prefix_cache_enabled, self.prefix_cache_hit_len, self.prefix_cache_hit_block_count,
          self.prefix_cache_hit_last_block_id, self.prefix_cache_block_size, self.prefix_cache_method,
          self.chain_id, self.chain_status, self.chain_reused_tokens,
-         self.recompute_replay_cursor, self.decode_progress_checkpoint) = state
+         self.recompute_replay_cursor, self.decode_progress_checkpoint,
+         self.multimodal_digest, self.multimodal_position_delta,
+         self.multimodal_full_prefill) = state
         self.completion_token_logprobs = []
         self.completion_top_logprobs = []
         # TP workers intentionally receive only the active prompt chunk or one

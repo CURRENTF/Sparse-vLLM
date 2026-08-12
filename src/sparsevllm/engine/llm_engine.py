@@ -1,7 +1,9 @@
 import atexit
 import gc
 import os
+import pickle
 from dataclasses import fields
+from multiprocessing.shared_memory import SharedMemory
 from time import perf_counter
 import threading
 from tqdm.auto import tqdm
@@ -20,6 +22,11 @@ from sparsevllm.engine.sequence import Sequence
 from sparsevllm.engine.scheduler import Scheduler
 from sparsevllm.engine.model_runner import ModelRunner, make_tp_shm_name
 from sparsevllm.engine.input_processor import tokenize_text_prompt
+from sparsevllm.multimodal.inputs import (
+    MultiModalInputProcessor,
+    MultiModalPrompt,
+    is_multimodal_prompt,
+)
 from sparsevllm.engine.prefix_cache import PrefixCacheRoutingSnapshot
 from sparsevllm.engine.chain_cache import (
     ChainCacheIndex,
@@ -246,6 +253,12 @@ class LLMEngine:
         
         # 加载分词器
         self.tokenizer: Qwen2Tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
+        self.multimodal_processor = (
+            MultiModalInputProcessor(config.model)
+            if config.enable_multimodal
+            and callable(getattr(self.model_runner.model, "encode_multimodal", None))
+            else None
+        )
         generation_config = GenerationConfig.from_pretrained(config.model)
         eos_values = generation_config.eos_token_id
         if eos_values is None:
@@ -580,7 +593,7 @@ class LLMEngine:
 
     def admit_request(
         self,
-        prompt: str | list[int],
+        prompt: str | list[int] | MultiModalPrompt | dict,
         sampling_params: SamplingParams,
         chain_id: str | None = None,
         chain_append_only: bool = False,
@@ -590,6 +603,16 @@ class LLMEngine:
         In chain mode the returned seq_id is the resident sequence identity and
         remains stable across turns. The caller's request identity is separate.
         """
+        multimodal = None
+        if is_multimodal_prompt(prompt):
+            if self.multimodal_processor is None:
+                raise NotImplementedError(
+                    "Multimodal input is disabled or unsupported by this model."
+                )
+            if chain_id or chain_append_only:
+                raise ChainModeError("Multimodal requests do not support chain mode.")
+            multimodal = self.multimodal_processor.process(prompt)
+            prompt = multimodal.token_ids
         mode = str(
             getattr(self.config, "resolved_prefix_cache_mode", "disabled")
         )
@@ -644,6 +667,31 @@ class LLMEngine:
             )
         logger.debug(f'add prompt with {len(prompt)} tokens.')
         seq = Sequence(prompt, sampling_params)
+        if multimodal is not None:
+            seq.multimodal_digest = multimodal.digest
+            seq.multimodal_full_prefill = (
+                getattr(self.config.hf_config, "use_bidirectional_attention", None)
+                == "vision"
+            )
+            payload = pickle.dumps(multimodal.tensors, protocol=pickle.HIGHEST_PROTOCOL)
+            payload_shm = SharedMemory(create=True, size=len(payload))
+            try:
+                payload_shm.buf[: len(payload)] = payload
+                seq.multimodal_position_delta = int(
+                    self.model_runner.call(
+                        "register_multimodal_shared",
+                        int(seq.seq_id),
+                        list(prompt),
+                        payload_shm.name,
+                        len(payload),
+                    )
+                )
+            except Exception:
+                self.model_runner.call("free_multimodal", int(seq.seq_id))
+                raise
+            finally:
+                payload_shm.close()
+                payload_shm.unlink()
         if mode != "chain":
             if normalized_chain_id:
                 raise ChainModeError(
@@ -651,13 +699,19 @@ class LLMEngine:
                     "prefix_cache_mode='chain'.",
                     chain_id=normalized_chain_id,
                 )
-            self.scheduler.add(seq)
+            try:
+                self.scheduler.add(seq)
+            except Exception:
+                if multimodal is not None:
+                    self.model_runner.call("free_multimodal", int(seq.seq_id))
+                raise
             return RequestAdmission(
                 seq_id=int(seq.seq_id),
                 chain_id=None,
                 chain_status="disabled",
                 reused_tokens=0,
                 prefilled_tokens=prompt_len,
+                prompt_token_ids=list(prompt),
             )
 
         coordinator = self.model_runner.runtime_state.chain_cache_coordinator
@@ -743,9 +797,14 @@ class LLMEngine:
             chain_status=chain_status,
             reused_tokens=int(plan.reused_tokens),
             prefilled_tokens=prompt_len - int(plan.reused_tokens),
+            prompt_token_ids=list(prompt),
         )
 
-    def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
+    def add_request(
+        self,
+        prompt: str | list[int] | MultiModalPrompt | dict,
+        sampling_params: SamplingParams,
+    ):
         """Backward-compatible request API returning only seq_id."""
         return self.admit_request(prompt, sampling_params).seq_id
 
@@ -762,6 +821,14 @@ class LLMEngine:
                 f"{disposition!r}."
             )
         chain_seq = self._active_chain_sequences.get(int(seq_id))
+        multimodal = any(
+            seq.seq_id == seq_id and seq.multimodal_digest is not None
+            for queue in (
+                getattr(self.scheduler, "waiting", ()),
+                getattr(self.scheduler, "decoding", ()),
+            )
+            for seq in queue
+        )
         should_free = self.scheduler.abort(seq_id)
         if chain_seq is not None:
             self._active_chain_sequences.pop(int(seq_id), None)
@@ -787,6 +854,8 @@ class LLMEngine:
                 return
         if should_free:
             self.model_runner.call("free_slots", seq_id)
+        elif multimodal:
+            self.model_runner.call("free_multimodal", seq_id)
 
     def chain_cache_routing_match(self, chain_id: str) -> dict[str, object]:
         return self.model_runner.runtime_state.chain_routing_match(
@@ -1258,7 +1327,7 @@ class LLMEngine:
                             )
                         )
                 if finished_seq_ids:
-                    self.model_runner.call("free_slots_batch", finished_seq_ids)
+                    self.model_runner.call("finish_slots_batch", finished_seq_ids)
         
         # 计算吞吐量统计数据 (正数表示 Prefill，负数表示 Decode)
         num_tokens = sum(seq.current_chunk_size for seq in seqs) if is_prefill else -len(seqs)
@@ -1294,7 +1363,7 @@ class LLMEngine:
 
     def generate(
         self,
-        prompts: list[str] | list[list[int]],
+        prompts: list[str] | list[list[int]] | list[MultiModalPrompt] | list[dict],
         sampling_params: SamplingParams | list[SamplingParams],
         use_tqdm: bool = True,
     ) -> list[dict]:

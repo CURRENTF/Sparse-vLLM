@@ -20,6 +20,7 @@ from sparsevllm.operators.gate_up_swiglu import (
     resolve_gate_up_swiglu_provider,
 )
 from sparsevllm.layers.rotary_embedding import apply_partial_rotary_emb, get_rope
+from sparsevllm.operators.qwen35_mrope import Qwen35MRotaryEmbedding
 from sparsevllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 from sparsevllm.utils.context import get_context
 from sparsevllm.utils.weight_target import WeightTarget
@@ -245,12 +246,28 @@ class Qwen35FullAttention(nn.Module):
             bias=False,
             quantization=quantization,
         )
-        self.rotary_emb = get_rope(
-            self.rotary_dim,
-            rotary_dim=self.rotary_dim,
-            max_position=int(config.max_position_embeddings),
-            base=_get_rope_theta(config),
-            rope_scaling=_get_rope_scaling(config),
+        rope_parameters = getattr(config, "rope_parameters", None)
+        mrope_sections = (
+            rope_parameters.get("mrope_section")
+            if isinstance(rope_parameters, dict)
+            else None
+        )
+        self.rotary_emb = (
+            Qwen35MRotaryEmbedding(
+                self.head_dim,
+                self.rotary_dim,
+                int(config.max_position_embeddings),
+                _get_rope_theta(config),
+                mrope_sections,
+            )
+            if mrope_sections
+            else get_rope(
+                self.rotary_dim,
+                rotary_dim=self.rotary_dim,
+                max_position=int(config.max_position_embeddings),
+                base=_get_rope_theta(config),
+                rope_scaling=_get_rope_scaling(config),
+            )
         )
         self.attn = Attention(self.num_heads, self.head_dim, self.scaling, self.num_kv_heads)
         self.q_norm = Qwen35RMSNorm(self.head_dim, eps=float(getattr(config, "rms_norm_eps", 1.0e-6)))
@@ -280,12 +297,12 @@ class Qwen35FullAttention(nn.Module):
         cache_manager.save_raw_kv_if_needed(layer_idx, pre_rope_k, v)
         q = self.q_norm(q)
         k = self.k_norm(k)
-        q, k = apply_partial_rotary_emb(
-            self.rotary_emb,
-            positions,
-            q,
-            k,
-            self.rotary_dim,
+        q, k = (
+            self.rotary_emb(positions, q, k)
+            if isinstance(self.rotary_emb, Qwen35MRotaryEmbedding)
+            else apply_partial_rotary_emb(
+                self.rotary_emb, positions, q, k, self.rotary_dim
+            )
         )
         cache_manager.save_rope_kv_if_needed(layer_idx, k, v)
         o = self.attn(q, k, v)
@@ -928,8 +945,13 @@ class Qwen35Model(nn.Module):
         self.sparse_controller = None
         self.recurrent_state_manager = None
 
-    def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        hidden_states = self.embed_tokens(input_ids)
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        hidden_states = self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
         residual = None
         context = get_context()
         debug_layers_env = os.getenv("SPARSEVLLM_DEBUG_HIDDEN_LAYERS")
@@ -962,6 +984,7 @@ class Qwen35Model(nn.Module):
 
 class Qwen35ForCausalLM(nn.Module):
     ignored_weight_prefixes = ("model.visual.", "visual.", "mtp.")
+    packed_modules_excluded_prefixes = ("multimodal_encoder.",)
     special_weight_loaders = {
         ".linear_attn.in_proj_qkv.weight": "load_packed_in_proj_qkv",
         ".linear_attn.in_proj_qkvz.weight": "load_packed_in_proj_qkvz",
@@ -986,6 +1009,31 @@ class Qwen35ForCausalLM(nn.Module):
         self.lm_head = ParallelLMHead(int(config.vocab_size), int(config.hidden_size))
         if bool(getattr(config, "tie_word_embeddings", False)):
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
+        self.multimodal_encoder = None
+
+    def configure_multimodal(self, outer_config) -> None:
+        from sparsevllm.models.qwen3_5_multimodal import Qwen35MultimodalEncoder
+
+        self.multimodal_encoder = Qwen35MultimodalEncoder(outer_config)
+        self.ignored_weight_prefixes = ("mtp.",)
+
+    def encode_multimodal(self, input_ids, tensors):
+        if self.multimodal_encoder is None:
+            raise RuntimeError("Qwen3.5 multimodal encoder is disabled.")
+        return self.multimodal_encoder.encode(input_ids, tensors)
+
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.model.embed_tokens(input_ids)
+
+    def forward_multimodal(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        inputs_embeds: torch.Tensor,
+        multimodal_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        del multimodal_mask
+        return self.model(input_ids, positions, inputs_embeds)
 
     @staticmethod
     def recurrent_state_spec(config, world_size: int) -> RecurrentStateSpec:
@@ -1015,6 +1063,10 @@ class Qwen35ForCausalLM(nn.Module):
         prefix = "model.language_model."
         if source_weight_name.startswith(prefix):
             return "model." + source_weight_name[len(prefix) :]
+        if source_weight_name.startswith("model.visual."):
+            return "multimodal_encoder.visual." + source_weight_name[len("model.visual.") :]
+        if source_weight_name.startswith("visual."):
+            return "multimodal_encoder.visual." + source_weight_name[len("visual.") :]
         return source_weight_name
 
     def resolve_special_weight(
@@ -1046,8 +1098,13 @@ class Qwen35ForCausalLM(nn.Module):
             )
         return int(loader(loaded_weight, loaded_scale))
 
-    def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        return self.model(input_ids, positions)
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return self.model(input_ids, positions, inputs_embeds)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.lm_head(hidden_states)

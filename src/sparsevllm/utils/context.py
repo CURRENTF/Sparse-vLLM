@@ -12,6 +12,7 @@ class Context:
         self.seqs = None
         self.decode_mid_o = None
         self.decode_mid_o_logexpsum = None
+        self.multimodal_image_groups = None
 
 
 _CONTEXT = Context()
@@ -38,6 +39,7 @@ def set_context(
     _CONTEXT.cache_manager = cache_manager
     _CONTEXT.recurrent_state_manager = recurrent_state_manager
     _CONTEXT.seqs = seqs
+    _CONTEXT.multimodal_image_groups = None
 
 def reset_context():
     global _CONTEXT

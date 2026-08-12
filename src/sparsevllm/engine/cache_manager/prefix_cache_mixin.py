@@ -296,6 +296,8 @@ class PrefixCacheMixin:
         token_ids: list[int],
         slots: torch.Tensor,
     ) -> None:
+        if getattr(seq, "multimodal_digest", None) is not None:
+            return
         if not self.enable_prefix_caching or self.prefix_cache is None:
             return
         if len(token_ids) != int(slots.numel()):

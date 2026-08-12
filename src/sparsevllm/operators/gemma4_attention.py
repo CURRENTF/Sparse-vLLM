@@ -28,6 +28,30 @@ class Gemma4AttentionBackend(TritonAttentionBackend):
     ) -> torch.Tensor:
         payload = _require_explicit_payload(view, operation="Gemma 4 prefill")
         output = torch.empty_like(q)
+        from sparsevllm.utils.context import get_context
+
+        image_groups = getattr(get_context(), "multimodal_image_groups", None)
+        if self.sliding_window is not None and isinstance(image_groups, torch.Tensor):
+            from sparsevllm.kernels.triton.gemma4_multimodal_context_attention import (
+                gemma4_multimodal_context_attention,
+            )
+
+            gemma4_multimodal_context_attention(
+                q,
+                payload.k_cache,
+                payload.v_cache,
+                output,
+                view.meta.req_indices,
+                b_start_loc,
+                view.meta.context_lens,
+                view.meta.context_lens - chunk_lens,
+                max_input_len,
+                view.meta.active_slots,
+                image_groups,
+                sliding_window=self.sliding_window,
+                attn_score=view.meta.attn_score,
+            )
+            return output
         from sparsevllm.kernels.triton.gemma4_context_attention import (
             gemma4_context_attention,
         )

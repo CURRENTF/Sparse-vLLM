@@ -574,6 +574,8 @@ class PrefixCacheCoordinator:
         self._step_h2d_operations.clear()
 
     def _record_tokens(self, seq: Sequence, token_ids: list[int]) -> None:
+        if getattr(seq, "multimodal_digest", None) is not None:
+            return
         if not token_ids:
             return
         state = self.runtime_states.get(int(seq.seq_id))

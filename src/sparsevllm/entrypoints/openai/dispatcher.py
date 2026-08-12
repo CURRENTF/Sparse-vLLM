@@ -581,8 +581,13 @@ class AsyncEngineDispatcher:
                 item.handle.terminal.set()
                 self._resolve_admission(item, asyncio.CancelledError())
                 return
+            admitted_prompt_token_ids = (
+                getattr(admission, "prompt_token_ids", None) if callable(admit) else None
+            )
             prompt_token_ids = (
-                list(item.prompt)
+                list(admitted_prompt_token_ids)
+                if admitted_prompt_token_ids is not None
+                else list(item.prompt)
                 if isinstance(item.prompt, list)
                 else self.engine.tokenizer.encode(item.prompt)
             )

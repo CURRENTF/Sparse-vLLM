@@ -26,6 +26,7 @@ from sparsevllm.distributed import ParallelContext, ParallelGroup, ParallelMode
 from sparsevllm.method_registry import MODEL_RUNTIME_COMPATIBILITY
 from sparsevllm.models.gemma4 import (
     Gemma4Attention,
+    Gemma4ForCausalLM,
     Gemma4MLP,
     Gemma4Model,
     Gemma4RotaryEmbedding,
@@ -105,6 +106,14 @@ def _patch_parallel_context():
     ):
         stack.enter_context(patch(target, return_value=context))
     return stack
+
+
+def test_gemma4_skips_multimodal_weights_when_disabled():
+    model = SimpleNamespace(multimodal_encoder=None)
+
+    assert Gemma4ForCausalLM.map_weight_name(
+        model, "model.vision_tower.encoder.layers.0.weight"
+    ) is None
 
 
 def _config(**overrides) -> Gemma4TextConfig:

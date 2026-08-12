@@ -30,6 +30,7 @@ from sparsevllm.engine.prefix_cache_coordinator import PrefixCacheCoordinator
 from sparsevllm.engine.chain_cache import ChainAdmissionPlan, ChainCacheCoordinator
 from sparsevllm.engine.recurrent_state_manager import RecurrentStateManager, RecurrentStateSpec
 from sparsevllm.engine.runtime_state import RuntimeState
+from sparsevllm.multimodal.runtime import MultiModalRuntime
 from sparsevllm.engine.sparse_controller import SparseController
 from sparsevllm.models.spec import ModelSpec
 import sparsevllm.platforms as platforms
@@ -77,10 +78,19 @@ def _create_model(hf_config, model_spec: ModelSpec, **runtime_kwargs):
     if model_class is None:
         raise ImportError(f"{class_name} is unavailable for {model_spec.name}.")
     builder = getattr(model_class, "build_runtime_kwargs", None)
-    return model_class(
+    model = model_class(
         hf_config,
         **(builder(hf_config, **runtime_kwargs) if callable(builder) else {}),
     )
+    engine_config = runtime_kwargs.get("engine_config")
+    configure_multimodal = getattr(model, "configure_multimodal", None)
+    if (
+        callable(configure_multimodal)
+        and bool(getattr(engine_config, "enable_multimodal", True))
+        and getattr(engine_config, "outer_hf_config", hf_config) is not hf_config
+    ):
+        configure_multimodal(engine_config.outer_hf_config)
+    return model
 
 
 TP_SHM_NAME_PREFIX = "sparsevllm_"
@@ -104,10 +114,13 @@ TP_RPC_STATUS_SYNC_METHODS = PREFIX_CACHE_CONTROL_RPC_METHODS | {
     "debug_moe_states_cpu",
     "free_slots",
     "free_slots_batch",
+    "finish_slots_batch",
+    "free_multimodal",
     "log_operator_implementations",
     "refresh_prefix_cache_hit",
     "reset_after_warmup",
     "run",
+    "register_multimodal_shared",
     "set_warmup_fake_prefill_attention",
     "warmup_moe_workspace",
 }
@@ -208,6 +221,10 @@ class ModelRunner:
                 show_progress=self.parallel_context.world_rank == 0,
                 progress_rank=0 if self.parallel_context.world_rank == 0 else None,
             )
+        self.model.eval()
+        self.multimodal_runtime = MultiModalRuntime(self.model, self.device)
+        self._prefill_inputs_embeds = None
+        self._prefill_multimodal_mask = None
         warmup_moe = getattr(self.model, "warmup_moe", None)
         if callable(warmup_moe):
             warmup_moe()
@@ -648,6 +665,7 @@ class ModelRunner:
                 before = self.cache_manager.free_slot_stats()
                 logger.info("model_runner.free_slots seq_id={} before={}", seq_id, before)
             self.runtime_state.free_seq(seq_id)
+            self.multimodal_runtime.free(seq_id)
             if os.getenv("SPARSEVLLM_DEBUG_SLOTS", "0") == "1":
                 after = self.cache_manager.free_slot_stats()
                 logger.info("model_runner.free_slots seq_id={} after={}", seq_id, after)
@@ -666,6 +684,27 @@ class ModelRunner:
             if os.getenv("SPARSEVLLM_DEBUG_SLOTS", "0") == "1":
                 after = self.cache_manager.free_slot_stats()
                 logger.info("model_runner.free_slots_batch seq_ids={} after={}", seq_ids, after)
+
+    def finish_slots_batch(self, seq_ids: list[int]):
+        self.free_slots_batch(seq_ids)
+        self.multimodal_runtime.free_batch(seq_ids)
+
+    def free_multimodal(self, seq_id: int):
+        self.multimodal_runtime.free(seq_id)
+
+    def register_multimodal_shared(
+        self,
+        seq_id: int,
+        input_ids: list[int],
+        shared_name: str,
+        payload_size: int,
+    ) -> int:
+        payload_shm = SharedMemory(name=shared_name)
+        try:
+            tensors = pickle.loads(bytes(payload_shm.buf[: int(payload_size)]))
+        finally:
+            payload_shm.close()
+        return self.multimodal_runtime.register(seq_id, input_ids, tensors)
 
     def chain_admission_plan(
         self,
@@ -1114,6 +1153,11 @@ class ModelRunner:
             seqs=seqs,
             recurrent_state_manager=self.recurrent_state_manager,
         )
+        (
+            self._prefill_inputs_embeds,
+            positions,
+            self._prefill_multimodal_mask,
+        ) = self.multimodal_runtime.prepare(seqs, input_ids, positions, is_prefill)
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):
@@ -1274,7 +1318,16 @@ class ModelRunner:
         """物理执行逻辑：统一使用 Eager 模式"""
         _stage = 'prefill' if is_prefill else 'decode'
         with profiler.record(f"model_run_model_{_stage}"):
-            logits = self.model.compute_logits(self.model(input_ids, positions))
+            if is_prefill and self._prefill_inputs_embeds is not None:
+                hidden_states = self.multimodal_runtime.forward(
+                    input_ids,
+                    positions,
+                    self._prefill_inputs_embeds,
+                    self._prefill_multimodal_mask,
+                )
+            else:
+                hidden_states = self.model(input_ids, positions)
+            logits = self.model.compute_logits(hidden_states)
         self._record_debug_logits(logits)
         return logits
 
