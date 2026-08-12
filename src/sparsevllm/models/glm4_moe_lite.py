@@ -36,6 +36,10 @@ from sparsevllm.operators.moe import (
     model_activation_dtype,
     resolve_moe_provider,
 )
+from sparsevllm.operators.moe_router import (
+    MoeRouterOpSpec,
+    resolve_moe_router_provider,
+)
 from sparsevllm.platforms import device_runtime
 from sparsevllm.utils.context import get_context
 from sparsevllm.utils.log import logger
@@ -400,33 +404,27 @@ class Glm4MoeLiteRouter(nn.Module):
         self.e_score_correction_bias = nn.Parameter(
             torch.empty(self.num_experts, dtype=torch.float32)
         )
-        from sparsevllm.operators.sgl_moe import SglGlmFusedMoeGate
-
-        self.topk_impl = SglGlmFusedMoeGate(
+        self.op_spec = MoeRouterOpSpec(
             num_experts=self.num_experts,
             top_k=self.top_k,
+            activation_dtype=torch.float32,
+            norm_topk_prob=True,
+            cuda_graph=bool(getattr(config, "decode_cuda_graph", False)),
+            routing_method="biased_sigmoid",
         )
-        self._fused_topk_impl = self.topk_impl
+        self.provider = resolve_moe_router_provider(self.op_spec)
 
     def forward(
         self,
         hidden_states: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         router_logits = F.linear(hidden_states.float(), self.weight)
-        if self.topk_impl is self._fused_topk_impl:
-            topk_weights, topk_ids = self.topk_impl(
-                router_logits,
-                self.e_score_correction_bias,
-                top_k=self.top_k,
-                routed_scaling_factor=self.routed_scaling_factor,
-            )
-        else:
-            topk_weights, topk_ids = self.topk_impl(
-                router_logits,
-                self.e_score_correction_bias,
-                top_k=self.top_k,
-            )
-            topk_weights = topk_weights * self.routed_scaling_factor
+        topk_weights, topk_ids = self.provider.run(
+            self.op_spec,
+            router_logits,
+            self.e_score_correction_bias,
+            routed_scaling_factor=self.routed_scaling_factor,
+        )
         return router_logits, topk_weights, topk_ids
 
 

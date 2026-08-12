@@ -9,6 +9,66 @@ _SUPPORTED_SHAPES = frozenset({(64, 4), (256, 8)})
 
 
 @triton.jit
+def _fused_topk_biased_sigmoid_kernel(
+    logits_ptr,
+    correction_bias_ptr,
+    weights_ptr,
+    ids_ptr,
+    stride_logits_m,
+    stride_weights_m,
+    stride_ids_m,
+    normalization_epsilon: tl.constexpr,
+    routed_scaling_factor: tl.constexpr,
+    NUM_EXPERTS: tl.constexpr,
+    TOP_K: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK_SIZE)
+    expert_mask = offsets < NUM_EXPERTS
+    logits = tl.load(
+        logits_ptr + row * stride_logits_m + offsets,
+        mask=expert_mask,
+        other=-float("inf"),
+    )
+    routing_weights = tl.sigmoid(logits)
+    correction_bias = tl.load(
+        correction_bias_ptr + offsets,
+        mask=expert_mask,
+        other=0.0,
+    )
+    scores = routing_weights + correction_bias
+    selection_values = tl.where(scores == scores, scores, float("inf"))
+    threshold = tl.min(tl.topk(selection_values, TOP_K), axis=0)
+    greater_mask = expert_mask & (selection_values > threshold)
+    equal_mask = expert_mask & (selection_values == threshold)
+    greater_rank = tl.cumsum(greater_mask.to(tl.int32), axis=0) - 1
+    equal_rank = tl.cumsum(equal_mask.to(tl.int32), axis=0) - 1
+    num_greater = tl.sum(greater_mask.to(tl.int32), axis=0)
+    selected_equal = equal_mask & (equal_rank < TOP_K - num_greater)
+    selected = greater_mask | selected_equal
+    output_slot = tl.where(
+        greater_mask,
+        greater_rank,
+        num_greater + equal_rank,
+    )
+    denominator = tl.sum(
+        tl.where(selected, routing_weights, 0.0),
+        axis=0,
+    )
+    weights_base = weights_ptr + row * stride_weights_m
+    ids_base = ids_ptr + row * stride_ids_m
+    tl.store(
+        weights_base + output_slot,
+        routing_weights
+        / (denominator + normalization_epsilon)
+        * routed_scaling_factor,
+        mask=selected,
+    )
+    tl.store(ids_base + output_slot, offsets, mask=selected)
+
+
+@triton.jit
 def _topk_biased_sigmoid_kernel(
     routing_weights_ptr,
     correction_bias_ptr,
@@ -91,6 +151,54 @@ def _validate_inputs(
     return num_tokens, num_experts
 
 
+def fused_topk_biased_sigmoid(
+    router_logits: torch.Tensor,
+    correction_bias: torch.Tensor,
+    *,
+    top_k: int,
+    routed_scaling_factor: float,
+    normalization_epsilon: float = 1e-20,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Route the fixed GLM 64x4 shape in one graph-capturable kernel."""
+
+    num_tokens, num_experts = _validate_inputs(
+        router_logits,
+        correction_bias,
+        top_k=top_k,
+    )
+    if (num_experts, int(top_k)) != (64, 4):
+        raise ValueError(
+            "Fused biased-sigmoid routing requires 64 experts and top-k 4, "
+            f"got {num_experts} and {top_k}."
+        )
+    weights = torch.empty(
+        (num_tokens, int(top_k)),
+        dtype=torch.float32,
+        device=router_logits.device,
+    )
+    ids = torch.empty(
+        (num_tokens, int(top_k)),
+        dtype=torch.int32,
+        device=router_logits.device,
+    )
+    _fused_topk_biased_sigmoid_kernel[(num_tokens,)](
+        router_logits,
+        correction_bias,
+        weights,
+        ids,
+        router_logits.stride(0),
+        weights.stride(0),
+        ids.stride(0),
+        normalization_epsilon=float(normalization_epsilon),
+        routed_scaling_factor=float(routed_scaling_factor),
+        NUM_EXPERTS=num_experts,
+        TOP_K=int(top_k),
+        BLOCK_SIZE=triton.next_power_of_2(num_experts),
+        num_warps=1,
+    )
+    return weights, ids
+
+
 def topk_biased_sigmoid(
     router_logits: torch.Tensor,
     correction_bias: torch.Tensor,
@@ -130,4 +238,4 @@ def topk_biased_sigmoid(
     return weights, ids
 
 
-__all__ = ["topk_biased_sigmoid"]
+__all__ = ["fused_topk_biased_sigmoid", "topk_biased_sigmoid"]

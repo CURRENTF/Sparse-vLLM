@@ -327,18 +327,14 @@ def test_glm_router_uses_bias_only_for_selection_and_scales_weights() -> None:
     router.e_score_correction_bias.data.zero_()
     router.e_score_correction_bias.data[:4] = 100.0
 
-    def torch_topk(logits, correction_bias, *, top_k):
+    def torch_topk(_spec, logits, correction_bias, *, routed_scaling_factor):
         scores = logits.sigmoid()
-        ids = torch.topk(
-            scores + correction_bias,
-            top_k,
-            dim=-1,
-            sorted=False,
-        ).indices
+        ids = torch.topk(scores + correction_bias, 4, dim=-1, sorted=False).indices
         weights = scores.gather(1, ids)
-        return weights / (weights.sum(dim=-1, keepdim=True) + 1e-20), ids
+        weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
+        return weights * routed_scaling_factor, ids
 
-    router.topk_impl = torch_topk
+    router.provider.run = torch_topk
     hidden_states = torch.randn(7, 64, dtype=torch.bfloat16)
     logits, weights, ids = router(hidden_states)
     original_scores = logits.sigmoid()

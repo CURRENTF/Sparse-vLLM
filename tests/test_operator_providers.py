@@ -571,7 +571,7 @@ def test_glm_tp2_ep2_moe_uses_sgl_aligned_provider():
 
 @pytest.mark.parametrize(
     ("num_tokens", "expects_sgl_alignment"),
-    [(4, False), (5, True), (64, True), (65, False)],
+    [(1, True), (2, True), (4, True), (5, True), (64, True), (65, False)],
 )
 def test_glm_tp2_ep2_sgl_alignment_is_bounded(
     num_tokens,

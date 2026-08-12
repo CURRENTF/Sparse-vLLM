@@ -242,11 +242,13 @@ def test_sgl_moe_alignment_matches_ep_shard(
     not torch.cuda.is_available() or not sgl_moe_ep_alignment_support()[0],
     reason="CUDA and a validated sgl-kernel are required",
 )
-@pytest.mark.parametrize("num_tokens", [5, 64])
+@pytest.mark.parametrize("num_tokens", [1, 2, 4, 5, 64])
 @pytest.mark.parametrize("all_remote", [False, True])
+@pytest.mark.parametrize("local_start", [0, 4])
 def test_sgl_ep_alignment_preserves_full_fused_moe_output(
     num_tokens: int,
     all_remote: bool,
+    local_start: int,
 ) -> None:
     torch.manual_seed(20260810 + num_tokens + int(all_remote))
     device = torch.device("cuda")
@@ -276,9 +278,10 @@ def test_sgl_ep_alignment_preserves_full_fused_moe_output(
         device=device,
     )
     if all_remote:
+        remote_start = num_local_experts if local_start == 0 else 0
         topk_ids = torch.randint(
-            num_local_experts,
-            num_experts,
+            remote_start,
+            remote_start + num_local_experts,
             (num_tokens, top_k),
             dtype=torch.int64,
             device=device,
@@ -291,7 +294,11 @@ def test_sgl_ep_alignment_preserves_full_fused_moe_output(
             dtype=torch.int64,
             device=device,
         )
-        topk_ids[0] = torch.tensor([0, num_local_experts], device=device)
+        remote_id = num_local_experts if local_start == 0 else 0
+        topk_ids[0] = torch.tensor(
+            [local_start, remote_id],
+            device=device,
+        )
     topk_weights = torch.rand(
         num_tokens,
         top_k,
@@ -301,7 +308,7 @@ def test_sgl_ep_alignment_preserves_full_fused_moe_output(
     topk_weights /= topk_weights.sum(dim=-1, keepdim=True)
     kwargs = {
         "num_experts": num_experts,
-        "local_expert_start": 0,
+        "local_expert_start": local_start,
     }
 
     expected = fused_moe(
@@ -324,3 +331,53 @@ def test_sgl_ep_alignment_preserves_full_fused_moe_output(
     torch.cuda.synchronize()
 
     assert torch.equal(actual, expected)
+
+    if num_tokens == 2:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            graph_actual = fused_moe(
+                hidden_states,
+                w13_weight,
+                w2_weight,
+                topk_ids,
+                topk_weights,
+                alignment_impl=sgl_moe_align_block_size,
+                **kwargs,
+            )
+        hidden_states.copy_(torch.randn_like(hidden_states))
+        if all_remote:
+            replay_ids = torch.randint(
+                remote_start,
+                remote_start + num_local_experts,
+                topk_ids.shape,
+                dtype=topk_ids.dtype,
+                device=device,
+            )
+        else:
+            replay_ids = torch.randint(
+                0,
+                num_experts,
+                topk_ids.shape,
+                dtype=topk_ids.dtype,
+                device=device,
+            )
+            remote_id = num_local_experts if local_start == 0 else 0
+            replay_ids[0] = torch.tensor(
+                [local_start + 1, remote_id],
+                device=device,
+            )
+        topk_ids.copy_(replay_ids)
+        replay_weights = torch.rand_like(topk_weights)
+        replay_weights /= replay_weights.sum(dim=-1, keepdim=True)
+        topk_weights.copy_(replay_weights)
+        replay_expected = fused_moe(
+            hidden_states,
+            w13_weight,
+            w2_weight,
+            topk_ids,
+            topk_weights,
+            **kwargs,
+        )
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(graph_actual, replay_expected)

@@ -246,7 +246,10 @@ class SglAlignedTritonGlmMoeProvider(MoeProvider):
         num_tokens = int(hidden_states.shape[0])
         if (
             num_tokens <= 64
-            and num_tokens * int(spec.top_k) * 4 > int(spec.num_experts)
+            and (
+                int(spec.ep_size) > 1
+                or num_tokens * int(spec.top_k) * 4 > int(spec.num_experts)
+            )
         ):
             alignment_impl = sgl_moe_align_block_size
         return fused_moe(
