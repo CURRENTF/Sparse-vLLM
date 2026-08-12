@@ -16,9 +16,6 @@ from sparsevllm.distributed import (
     parallel_ranks_from_world_rank,
     world_rank_from_parallel_ranks,
 )
-from sparsevllm.distributed.flashinfer_custom_all_reduce import (
-    FlashInferCustomAllReduce,
-)
 from sparsevllm.distributed.parallel_context import (
     get_parallel_context,
     init_parallel_context,
@@ -163,88 +160,6 @@ def test_hybrid_moe_parallel_context_uses_explicit_groups():
     reset_parallel_context()
 
 
-@pytest.mark.parametrize(
-    ("local_reason", "rank_reasons", "expects_provider"),
-    [
-        (None, [None, None], True),
-        ("peer access is unavailable", ["peer access is unavailable"] * 2, False),
-        (None, [None, "peer access is unavailable"], False),
-    ],
-)
-def test_hybrid_tp2_ep2_resolves_custom_all_reduce_at_init(
-    local_reason,
-    rank_reasons,
-    expects_provider,
-):
-    reset_parallel_context()
-    provider = Mock()
-    provider_cls = Mock(return_value=provider)
-    provider_cls.unsupported_reason.return_value = local_reason
-
-    def all_gather_object(output, _local_reason, *, group):
-        assert group is dist.group.WORLD
-        output[:] = rank_reasons
-
-    with (
-        patch.object(dist, "is_initialized", return_value=True),
-        patch.object(dist, "get_world_size", return_value=2),
-        patch.object(dist, "get_rank", return_value=0),
-        patch.object(dist, "all_gather_object", side_effect=all_gather_object),
-        patch(
-            "sparsevllm.distributed.flashinfer_custom_all_reduce."
-            "FlashInferCustomAllReduce",
-            provider_cls,
-        ),
-    ):
-        context = init_parallel_context(
-            topology=ParallelTopology(2, 2, 1, ParallelMode.OUTER_TP_MOE),
-            enable_flashinfer_custom_all_reduce=True,
-        )
-
-    selected_group = provider_cls.unsupported_reason.call_args.args[0]
-    assert selected_group.ranks == (0, 1)
-    assert context.attention.ranks == (0, 1)
-    assert context.expert.ranks == (0, 1)
-    assert context.moe_tensor.ranks == (0,)
-    if expects_provider:
-        provider_cls.assert_called_once_with(selected_group)
-        assert context.all_reduce_provider is provider
-    else:
-        provider_cls.assert_not_called()
-        assert context.all_reduce_provider is None
-    reset_parallel_context()
-
-
-def test_custom_all_reduce_support_rejects_missing_peer_access():
-    group = ParallelGroup(object(), (0, 1), 0, 2)
-    with (
-        patch.object(dist, "get_backend", return_value=dist.Backend.NCCL),
-        patch.object(torch.cuda, "is_available", return_value=True),
-        patch.object(torch.cuda, "device_count", return_value=2),
-        patch.object(torch.cuda, "current_device", return_value=0),
-        patch.object(torch.cuda, "get_device_capability", return_value=(9, 0)),
-        patch.object(torch.cuda, "can_device_access_peer", return_value=False),
-    ):
-        reason = FlashInferCustomAllReduce.unsupported_reason(group)
-
-    assert reason is not None
-    assert "peer access" in reason
-
-
-def test_custom_all_reduce_support_rejects_non_sm90_rank():
-    group = ParallelGroup(object(), (0, 1), 0, 2)
-    with (
-        patch.object(dist, "get_backend", return_value=dist.Backend.NCCL),
-        patch.object(torch.cuda, "is_available", return_value=True),
-        patch.object(torch.cuda, "device_count", return_value=2),
-        patch.object(torch.cuda, "current_device", return_value=0),
-        patch.object(torch.cuda, "get_device_capability", return_value=(8, 9)),
-    ):
-        reason = FlashInferCustomAllReduce.unsupported_reason(group)
-
-    assert reason == "requires CUDA SM90, got (8, 9)"
-
-
 def test_parallel_context_lifecycle_and_local_groups():
     reset_parallel_context()
     fake_groups = []
@@ -316,81 +231,6 @@ def test_ep_broadcast_rejects_invalid_source_rank():
 
     with pytest.raises(ValueError, match="EP broadcast source"):
         context.ep_broadcast(torch.tensor([1.0]), src_ep_rank=4)
-
-
-def test_small_out_of_place_all_reduce_uses_bound_provider():
-    ranks = (0, 1)
-    group = ParallelGroup(object(), ranks, 0, 2)
-    reduced = torch.tensor([3.0])
-    provider = SimpleNamespace(
-        group=group,
-        all_reduce=Mock(return_value=reduced),
-    )
-    context = ParallelContext(
-        world=group,
-        tensor=group,
-        expert=ParallelGroup(None, (0,), 0, 1),
-        data=ParallelGroup(None, (0,), 0, 1),
-        all_reduce_provider=provider,
-    )
-    tensor = torch.tensor([1.0])
-
-    with patch.object(dist, "all_reduce") as nccl_all_reduce:
-        output = context.tp_all_reduce_out_of_place(tensor)
-
-    assert output is reduced
-    provider.all_reduce.assert_called_once_with(tensor)
-    nccl_all_reduce.assert_not_called()
-
-
-def test_small_out_of_place_all_reduce_falls_back_to_nccl():
-    ranks = (0, 1)
-    group = ParallelGroup(object(), ranks, 0, 2)
-    provider = SimpleNamespace(group=group, all_reduce=Mock(return_value=None))
-    context = ParallelContext(
-        world=group,
-        tensor=group,
-        expert=ParallelGroup(None, (0,), 0, 1),
-        data=ParallelGroup(None, (0,), 0, 1),
-        all_reduce_provider=provider,
-    )
-    tensor = torch.tensor([1.0])
-
-    with patch.object(dist, "all_reduce") as nccl_all_reduce:
-        output = context.world_all_reduce_out_of_place(tensor)
-
-    assert output is tensor
-    nccl_all_reduce.assert_called_once_with(
-        tensor,
-        op=dist.ReduceOp.SUM,
-        group=group.process_group,
-    )
-
-
-def test_all_reduce_capture_and_close_delegate_to_provider():
-    group = ParallelGroup(None, (0,), 0, 1)
-    capture = Mock()
-    capture.return_value.__enter__ = Mock(return_value=None)
-    capture.return_value.__exit__ = Mock(return_value=False)
-    provider = SimpleNamespace(
-        group=group,
-        capture=capture,
-        close=Mock(),
-    )
-    context = ParallelContext(
-        world=group,
-        tensor=group,
-        expert=group,
-        data=group,
-        all_reduce_provider=provider,
-    )
-
-    with context.all_reduce_capture():
-        pass
-    context.close_all_reduce_provider()
-
-    capture.assert_called_once_with()
-    provider.close.assert_called_once_with()
 
 
 @pytest.mark.parametrize("op", [dist.ReduceOp.SUM, dist.ReduceOp.MAX])

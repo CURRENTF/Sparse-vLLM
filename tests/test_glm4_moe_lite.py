@@ -426,6 +426,7 @@ def test_glm_sparse_moe_reduces_pure_ep_over_world(ep_size: int) -> None:
     block = object.__new__(Glm4MoeLiteSparseMoeBlock)
     nn.Module.__init__(block)
     block.parallel_context = context
+    block.runtime_config = None
     block.mlp_chunk_size = 8
     block.shared_experts = nn.Identity()
     block._routed_chunk = lambda hidden_states: hidden_states.clone()
@@ -458,6 +459,7 @@ def test_glm_sparse_moe_reduces_pure_tp_over_world(
     block = object.__new__(Glm4MoeLiteSparseMoeBlock)
     nn.Module.__init__(block)
     block.parallel_context = context
+    block.runtime_config = None
     block.mlp_chunk_size = 8
     block.shared_experts = nn.Identity()
     block._routed_chunk = lambda hidden_states: hidden_states.clone()
@@ -492,6 +494,7 @@ def test_glm_sparse_moe_reduces_hybrid_tp_ep_shards_over_outer_world() -> None:
     block = object.__new__(Glm4MoeLiteSparseMoeBlock)
     nn.Module.__init__(block)
     block.parallel_context = context
+    block.runtime_config = None
     block.mlp_chunk_size = 8
     block.shared_experts = nn.Identity()
     block._routed_chunk = lambda hidden_states: hidden_states.clone()
@@ -531,6 +534,7 @@ def test_glm_moe_debug_contract_populates_model_runner_summaries() -> None:
     block = object.__new__(Glm4MoeLiteSparseMoeBlock)
     nn.Module.__init__(block)
     block.parallel_context = context
+    block.runtime_config = None
     block.mlp_chunk_size = 8
 
     class _Gate(nn.Module):
@@ -628,6 +632,7 @@ def test_glm_decoder_syncs_replicated_attention_before_post_norm(
     layer = object.__new__(Glm4MoeLiteDecoderLayer)
     nn.Module.__init__(layer)
     layer.parallel_context = context
+    layer.runtime_config = None
 
     class _InputNorm(nn.Module):
         def forward(self, hidden_states, residual):

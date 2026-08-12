@@ -1,26 +1,11 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
-from dataclasses import dataclass, replace
-from typing import Iterator, Protocol
+from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
 
 from sparsevllm.distributed.topology import ParallelTopology, parallel_group_ranks
-from sparsevllm.utils.log import logger
-
-
-class GraphAllReduceProvider(Protocol):
-    group: ParallelGroup
-
-    def all_reduce(self, tensor: torch.Tensor) -> torch.Tensor | None: ...
-
-    def capture(self): ...
-
-    def close(self) -> None: ...
-
-
 @dataclass(frozen=True)
 class ParallelGroup:
     process_group: dist.ProcessGroup | None
@@ -46,7 +31,6 @@ class ParallelContext:
     expert: ParallelGroup
     data: ParallelGroup
     moe_tensor: ParallelGroup | None = None
-    all_reduce_provider: GraphAllReduceProvider | None = None
 
     @property
     def world_rank(self) -> int:
@@ -137,15 +121,6 @@ class ParallelContext:
         group: ParallelGroup,
         op: dist.ReduceOp,
     ) -> torch.Tensor:
-        provider = self.all_reduce_provider
-        if (
-            provider is not None
-            and provider.group.ranks == group.ranks
-            and op == dist.ReduceOp.SUM
-        ):
-            output = provider.all_reduce(tensor)
-            if output is not None:
-                return output
         return self._all_reduce(tensor, group, op)
 
     def tp_all_reduce_out_of_place(
@@ -161,19 +136,6 @@ class ParallelContext:
         op: dist.ReduceOp = dist.ReduceOp.SUM,
     ) -> torch.Tensor:
         return self._all_reduce_out_of_place(tensor, self.world, op)
-
-    @contextmanager
-    def all_reduce_capture(self) -> Iterator[None]:
-        provider = self.all_reduce_provider
-        if provider is None:
-            yield
-            return
-        with provider.capture():
-            yield
-
-    def close_all_reduce_provider(self) -> None:
-        if self.all_reduce_provider is not None:
-            self.all_reduce_provider.close()
 
     def ep_all_reduce(
         self,
@@ -257,7 +219,6 @@ def _local_group(
 def init_parallel_context(
     *,
     topology: ParallelTopology,
-    enable_flashinfer_custom_all_reduce: bool = False,
 ) -> ParallelContext:
     global _PARALLEL_CONTEXT
     if _PARALLEL_CONTEXT is not None:
@@ -303,31 +264,6 @@ def init_parallel_context(
         ),
     )
     _PARALLEL_CONTEXT = context
-    if enable_flashinfer_custom_all_reduce:
-        from sparsevllm.distributed.flashinfer_custom_all_reduce import (
-            FlashInferCustomAllReduce,
-        )
-
-        group = _PARALLEL_CONTEXT.tensor
-        local_reason = FlashInferCustomAllReduce.unsupported_reason(group)
-        rank_reasons = [None] * group.size
-        dist.all_gather_object(rank_reasons, local_reason, group=group.process_group)
-        unsupported = [
-            (rank, reason)
-            for rank, reason in zip(group.ranks, rank_reasons)
-            if reason is not None
-        ]
-        if unsupported:
-            logger.info(
-                "Using NCCL TP all-reduce because FlashInfer custom all-reduce "
-                "is unsupported on ranks {}.",
-                unsupported,
-            )
-        else:
-            _PARALLEL_CONTEXT = replace(
-                _PARALLEL_CONTEXT,
-                all_reduce_provider=FlashInferCustomAllReduce(group),
-            )
     return _PARALLEL_CONTEXT
 
 

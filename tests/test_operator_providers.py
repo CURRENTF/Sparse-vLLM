@@ -133,10 +133,12 @@ def _gate_up_spec(**overrides) -> GateUpSwiGLUOpSpec:
 def _all_reduce_spec(**overrides) -> AllReduceOpSpec:
     values = {
         "world_size": 4,
-        "max_tokens": 8,
+        "ranks": (0, 1, 2, 3),
+        "max_rows": 8,
         "hidden_size": 3072,
         "dtype": torch.bfloat16,
         "cuda_graph": True,
+        "backend": "nccl",
     }
     values.update(overrides)
     return AllReduceOpSpec(**values)
@@ -157,6 +159,77 @@ def test_minimax_all_reduce_prefers_flashinfer_for_profiled_h100_shape():
         )
 
     assert resolved.provider.name == "flashinfer_trtllm_sm90"
+
+
+def test_glm_tp2_all_reduce_prefers_profiled_flashinfer_provider():
+    with (
+        patch("sparsevllm.operators.all_reduce.find_spec", return_value=object()),
+        patch("sparsevllm.operators.all_reduce.version", return_value="0.6.15.post1"),
+    ):
+        resolved = OpResolver(ALL_REDUCE_REGISTRY).resolve(
+            _all_reduce_spec(
+                world_size=2, ranks=(0, 1), max_rows=256, hidden_size=2048
+            ),
+            _cuda_caps(
+                (9, 0),
+                runtime_version="12.9",
+                device_name="NVIDIA H100 80GB HBM3",
+            ),
+        )
+
+    assert resolved.provider.name == "flashinfer_trtllm_sm90"
+
+
+def test_glm_tp2_eager_all_reduce_prefers_vllm_provider():
+    required_apis = SimpleNamespace(
+        CudaRTLibrary=object(),
+        create_shared_buffer=object(),
+        vllm_all_reduce=object(),
+        vllm_dispose=object(),
+        vllm_init_custom_ar=object(),
+        vllm_meta_size=object(),
+        vllm_register_buffer=object(),
+    )
+    with (
+        patch("sparsevllm.operators.all_reduce.find_spec", return_value=object()),
+        patch("sparsevllm.operators.all_reduce.version", return_value="0.6.15.post1"),
+        patch.dict(sys.modules, {"flashinfer": SimpleNamespace(comm=required_apis)}),
+    ):
+        resolved = OpResolver(ALL_REDUCE_REGISTRY).resolve(
+            _all_reduce_spec(
+                world_size=2,
+                ranks=(0, 1),
+                max_rows=256,
+                hidden_size=2048,
+                cuda_graph=False,
+            ),
+            _cuda_caps(
+                (9, 0),
+                runtime_version="12.9",
+                device_name="NVIDIA H100 80GB HBM3",
+            ),
+        )
+
+    assert resolved.provider.name == "flashinfer_vllm_sm90"
+
+
+def test_unprofiled_all_reduce_rows_use_torch_provider():
+    with (
+        patch("sparsevllm.operators.all_reduce.find_spec", return_value=object()),
+        patch("sparsevllm.operators.all_reduce.version", return_value="0.6.15.post1"),
+    ):
+        resolved = OpResolver(ALL_REDUCE_REGISTRY).resolve(
+            _all_reduce_spec(
+                world_size=2, ranks=(0, 1), max_rows=257, hidden_size=2048
+            ),
+            _cuda_caps(
+                (9, 0),
+                runtime_version="12.9",
+                device_name="NVIDIA H100 80GB HBM3",
+            ),
+        )
+
+    assert resolved.provider.name == "torch_distributed"
 
 
 @pytest.mark.parametrize("tp_size", [1, 2])

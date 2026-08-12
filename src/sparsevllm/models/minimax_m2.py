@@ -88,7 +88,7 @@ class MiniMaxM2RuntimeConfig:
 def _prepare_decode_all_reduce(
     group: ParallelGroup,
     *,
-    max_tokens: int,
+    max_rows: int,
     hidden_size: int,
     dtype: torch.dtype,
     cuda_graph: bool,
@@ -97,10 +97,16 @@ def _prepare_decode_all_reduce(
     return prepare_all_reduce_op(
         AllReduceOpSpec(
             world_size=group.size,
-            max_tokens=max_tokens,
+            ranks=group.ranks,
+            max_rows=max_rows,
             hidden_size=hidden_size,
             dtype=dtype,
             cuda_graph=cuda_graph,
+            backend=(
+                "none"
+                if group.process_group is None
+                else str(torch.distributed.get_backend(group.process_group))
+            ),
         ),
         group=group.process_group,
         rank=group.rank,
@@ -155,7 +161,7 @@ def build_minimax_m2_runtime_config(
     )
     moe_decode_all_reduce = _prepare_decode_all_reduce(
         parallel_context.world,
-        max_tokens=int(max_decode_tokens),
+        max_rows=int(max_decode_tokens),
         hidden_size=int(config.hidden_size),
         dtype=activation_dtype,
         cuda_graph=bool(cuda_graph),
@@ -166,7 +172,7 @@ def build_minimax_m2_runtime_config(
     else:
         attention_decode_all_reduce = _prepare_decode_all_reduce(
             parallel_context.attention,
-            max_tokens=int(max_decode_tokens),
+            max_rows=int(max_decode_tokens),
             hidden_size=int(config.hidden_size),
             dtype=activation_dtype,
             cuda_graph=bool(cuda_graph),

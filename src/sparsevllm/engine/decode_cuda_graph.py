@@ -438,16 +438,15 @@ class DecodeCudaGraphRunner:
             graph_input_sparse_state_refs = self._snapshot_sparse_state_refs()
             graph = torch.cuda.CUDAGraph()
             try:
-                with self.parallel_context.all_reduce_capture():
-                    with torch.cuda.graph(graph, pool=self.graph_pool):
-                        self._reset_graph_input_attn_scores(graph_input_sparse_state_refs)
-                        logits = self.run_model(input_ids, positions, is_prefill=False)
-                        if state.key.capture_sampling:
-                            if logits is None:
-                                raise RuntimeError("decode_cuda_graph capture_sampling requires rank-0 logits.")
-                            token_ids = logits.argmax(dim=-1)
-                        else:
-                            token_ids = None
+                with torch.cuda.graph(graph, pool=self.graph_pool):
+                    self._reset_graph_input_attn_scores(graph_input_sparse_state_refs)
+                    logits = self.run_model(input_ids, positions, is_prefill=False)
+                    if state.key.capture_sampling:
+                        if logits is None:
+                            raise RuntimeError("decode_cuda_graph capture_sampling requires rank-0 logits.")
+                        token_ids = logits.argmax(dim=-1)
+                    else:
+                        token_ids = None
             except Exception as exc:
                 raise RuntimeError(f"decode_cuda_graph capture failed: {exc!r}") from exc
 

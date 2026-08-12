@@ -46,9 +46,13 @@ except ImportError:
     Qwen3MoeForCausalLM = None
 
 try:
-    from sparsevllm.models.glm4_moe_lite import Glm4MoeLiteForCausalLM
+    from sparsevllm.models.glm4_moe_lite import (
+        Glm4MoeLiteForCausalLM,
+        build_glm4_moe_lite_runtime_config,
+    )
 except ImportError:
     Glm4MoeLiteForCausalLM = None
+    build_glm4_moe_lite_runtime_config = None
 
 try:
     from sparsevllm.models.minimax_m2 import (
@@ -154,18 +158,7 @@ class ModelRunner:
             )
         self.parallel_context = init_parallel_context(
             topology=config.parallel_topology,
-            enable_flashinfer_custom_all_reduce=(
-                hf_config.model_type == "glm4_moe_lite"
-                and bool(config.decode_cuda_graph)
-                and config.tensor_parallel_size == 2
-                and config.data_parallel_size == 1
-                and self.platform.is_cuda()
-            ),
         )
-        if self.parallel_context.all_reduce_provider is not None:
-            logger.info(
-                "Enabled FlashInfer custom TP all-reduce for tensors up to 8 MiB."
-            )
         # CUDA allocator peaks are process-global and survive LLMEngine.exit().
         # Start a new lifecycle before model construction so KV sizing observes
         # only this engine's model load and persistent allocations.
@@ -212,6 +205,20 @@ class ModelRunner:
                 "decode_cuda_graph": config.decode_cuda_graph,
                 "expect_mtp_weights": not config.tiny_random,
             }
+            if self.parallel_context.world_size > 1:
+                if build_glm4_moe_lite_runtime_config is None:
+                    raise ImportError("GLM runtime operators are unavailable.")
+                model_kwargs["runtime_config"] = build_glm4_moe_lite_runtime_config(
+                    hf_config,
+                    self.parallel_context,
+                    max_decode_tokens=_resolve_decode_static_batch_capacity(
+                        decode_static_capture_sizes,
+                        max_num_seqs_in_batch=config.max_num_seqs_in_batch,
+                        max_decoding_seqs=config.max_decoding_seqs,
+                    ),
+                    cuda_graph=config.decode_cuda_graph,
+                    device_index=int(self.device.index or 0),
+                )
         elif config.model_spec.runtime_class_name == "MiniMaxM2ForCausalLM":
             if build_minimax_m2_runtime_config is None:
                 raise ImportError("MiniMax M2 runtime operators are unavailable.")
@@ -227,7 +234,7 @@ class ModelRunner:
                 cuda_graph=config.decode_cuda_graph,
                 device_index=int(self.device.index or 0),
             )
-        
+
         self.model = _create_model(hf_config, config.model_spec, **model_kwargs)
         if config.tiny_random:
             from sparsevllm.debug.tiny_random import initialize_sparse_model
@@ -387,7 +394,6 @@ class ModelRunner:
             )
             if self.rank == 0:
                 self.shm.unlink()
-        self.parallel_context.close_all_reduce_provider()
         reset_parallel_context()
         dist.destroy_process_group()
 
