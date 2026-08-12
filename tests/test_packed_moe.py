@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import torch
 
 from sparsevllm.layers.packed_moe import PackedMoeExperts
+from sparsevllm.models.minimax_m2 import MiniMaxM2PackedExperts
 from sparsevllm.models.qwen3_moe import Qwen3MoePackedExperts
 from sparsevllm.operators.moe import TritonMoeProvider
 
@@ -34,8 +35,9 @@ def _experts(**overrides) -> PackedMoeExperts:
     return PackedMoeExperts(**values)
 
 
-def test_qwen_packed_experts_use_shared_physical_module() -> None:
+def test_model_packed_experts_use_shared_physical_module() -> None:
     assert issubclass(Qwen3MoePackedExperts, PackedMoeExperts)
+    assert issubclass(MiniMaxM2PackedExperts, PackedMoeExperts)
 
 
 def test_packed_experts_accept_glm_router_contract_without_owning_router() -> None:

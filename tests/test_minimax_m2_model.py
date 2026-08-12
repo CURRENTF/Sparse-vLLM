@@ -487,7 +487,7 @@ def test_local_expert_loader_rejects_missing_duplicate_and_bad_tensors():
         experts.load_expert_weight(0, "w1", weight, None)
     with pytest.raises(TypeError, match="FP8 E4M3"):
         experts.load_expert_weight(0, "w1", weight.float(), scale)
-    with pytest.raises(TypeError, match="must be FP32"):
+    with pytest.raises(TypeError, match=r"must use torch\.float32"):
         experts.load_expert_weight(0, "w1", weight, scale.bfloat16())
     with pytest.raises(ValueError, match="shape mismatch"):
         experts.load_expert_weight(0, "w1", _random_fp8((128, 256)), scale)

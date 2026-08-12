@@ -15,19 +15,15 @@ from sparsevllm.distributed import (
 )
 from sparsevllm.layers.attention import Attention
 from sparsevllm.layers.embed_head import ParallelLMHead
-from sparsevllm.layers.expert_weights import PackedExpertWeightLoader
 from sparsevllm.layers.layernorm import ColumnParallelRMSNorm, RMSNorm
 from sparsevllm.layers.linear import QKVParallelLinear, RowParallelLinear
+from sparsevllm.layers.packed_moe import PackedMoeExperts
 from sparsevllm.layers.rotary_embedding import (
     apply_partial_rotary_emb,
     get_rope,
 )
 from sparsevllm.models.qwen3 import Qwen3ModelBase
-from sparsevllm.operators.moe import (
-    MoeOpSpec,
-    model_activation_dtype,
-    resolve_moe_provider,
-)
+from sparsevllm.operators.moe import model_activation_dtype, resolve_moe_provider
 from sparsevllm.operators.all_reduce import (
     AllReduceOpSpec,
     PreparedAllReduceOp,
@@ -44,7 +40,6 @@ from sparsevllm.operators.prefill_attention import (
     prepare_prefill_attention_op,
 )
 from sparsevllm.platforms import device_runtime
-from sparsevllm.quantization.fp8_tp import Fp8ExpertTpShard
 from sparsevllm.utils.context import get_context
 from sparsevllm.utils.log import logger
 from sparsevllm.utils.weight_target import WeightTarget
@@ -218,8 +213,9 @@ class MiniMaxM2Router(nn.Module):
         return router_logits, topk_weights, topk_ids
 
 
-class MiniMaxM2PackedExperts(PackedExpertWeightLoader, nn.Module):
+class MiniMaxM2PackedExperts(PackedMoeExperts):
     checkpoint_projection_map = {"w1": "gate", "w2": "down", "w3": "up"}
+    checkpoint_scale_dtype = torch.float32
 
     def __init__(
         self,
@@ -227,184 +223,29 @@ class MiniMaxM2PackedExperts(PackedExpertWeightLoader, nn.Module):
         *,
         cuda_graph: bool | None = None,
     ) -> None:
-        super().__init__()
-        parallel_context = get_parallel_context()
-        self.tp_rank = int(parallel_context.moe_tp_rank)
-        self.tp_size = int(parallel_context.moe_tp_size)
-        self.ep_rank = int(parallel_context.ep_rank)
-        self.ep_size = int(parallel_context.ep_size)
-        self.num_experts = int(config.num_local_experts)
-        self.hidden_size = int(config.hidden_size)
-        self.global_intermediate_size = int(config.intermediate_size)
-        self.fp8_tp_shard = Fp8ExpertTpShard(
-            self.global_intermediate_size,
-            self.tp_rank,
-            self.tp_size,
-        )
-        self.checkpoint_tp_shard = self.fp8_tp_shard
-        self.logical_intermediate_size = self.fp8_tp_shard.logical_size
-        self.intermediate_size = self.fp8_tp_shard.physical_size
-        if self.num_experts % self.ep_size:
+        block_shape = tuple(config.quantization_config.weight_block_size)
+        if block_shape != (128, 128):
             raise ValueError(
-                f"MiniMax experts={self.num_experts} must be divisible by EP={self.ep_size}."
+                "MiniMax packed FP8 experts require weight_block_size=(128, 128), "
+                f"got {block_shape}."
             )
-        if self.hidden_size % 128 or self.global_intermediate_size % 128:
-            raise ValueError(
-                "MiniMax packed FP8 experts require hidden/intermediate dimensions "
-                f"aligned to 128, got {self.hidden_size}/{self.global_intermediate_size}."
-            )
-        self.num_local_experts = self.num_experts // self.ep_size
-        self.local_expert_start = self.ep_rank * self.num_local_experts
-        self.local_expert_end = self.local_expert_start + self.num_local_experts
-        self.op_spec = MoeOpSpec(
-            num_experts=self.num_experts,
-            num_local_experts=self.num_local_experts,
-            hidden_size=self.hidden_size,
-            intermediate_size=self.intermediate_size,
+        super().__init__(
+            num_experts=int(config.num_local_experts),
+            hidden_size=int(config.hidden_size),
+            intermediate_size=int(config.intermediate_size),
             top_k=int(config.num_experts_per_tok),
             activation_dtype=model_activation_dtype(config),
-            weight_dtype=torch.float8_e4m3fn,
-            block_shape=tuple(config.quantization_config.weight_block_size),
-            ep_size=self.ep_size,
+            fp8_enabled=True,
             cuda_graph=(
                 bool(getattr(config, "decode_cuda_graph", False))
                 if cuda_graph is None
                 else bool(cuda_graph)
             ),
-            tp_size=self.tp_size,
             routing_method="biased_sigmoid",
             scale_dtype=torch.float32,
-        )
-        self.provider = resolve_moe_provider(self.op_spec)
-        self.w13_weight = nn.Parameter(
-            torch.empty(
-                self.num_local_experts,
-                2 * self.intermediate_size,
-                self.hidden_size,
-                dtype=torch.float8_e4m3fn,
-            ),
-            requires_grad=False,
-        )
-        self.w2_weight = nn.Parameter(
-            torch.empty(
-                self.num_local_experts,
-                self.hidden_size,
-                self.intermediate_size,
-                dtype=torch.float8_e4m3fn,
-            ),
-            requires_grad=False,
-        )
-        self.register_buffer(
-            "w13_scale_inv",
-            torch.empty(
-                self.num_local_experts,
-                2 * self.intermediate_size // 128,
-                self.hidden_size // 128,
-                dtype=torch.float32,
-            ),
-        )
-        self.register_buffer(
-            "w2_scale_inv",
-            torch.empty(
-                self.num_local_experts,
-                self.hidden_size // 128,
-                self.intermediate_size // 128,
-                dtype=torch.float32,
-            ),
-        )
-        self._loaded_expert_shards: set[tuple[int, str]] = set()
-
-    def is_local_expert(self, global_expert_id: int) -> bool:
-        return self.local_expert_start <= int(global_expert_id) < self.local_expert_end
-
-    def load_expert_weight(
-        self,
-        global_expert_id: int,
-        projection: str,
-        loaded_weight: torch.Tensor,
-        loaded_scale: torch.Tensor | None,
-    ) -> None:
-        global_expert_id = int(global_expert_id)
-        if not self.is_local_expert(global_expert_id):
-            raise ValueError(
-                f"Expert {global_expert_id} is outside local range "
-                f"[{self.local_expert_start}, {self.local_expert_end})."
-            )
-        if projection not in {"w1", "w2", "w3"}:
-            raise ValueError(f"Unsupported MiniMax expert projection {projection!r}.")
-        load_key = (global_expert_id, projection)
-        if load_key in self._loaded_expert_shards:
-            raise ValueError(
-                f"Duplicate MiniMax expert weight for expert={global_expert_id}, "
-                f"projection={projection}."
-            )
-        if loaded_scale is None:
-            raise ValueError(
-                f"Missing FP8 weight_scale_inv for MiniMax expert={global_expert_id}, "
-                f"projection={projection}."
-            )
-        if loaded_weight.dtype != torch.float8_e4m3fn:
-            raise TypeError(
-                f"MiniMax expert weight must be FP8 E4M3, got {loaded_weight.dtype}."
-            )
-        if loaded_scale.dtype != torch.float32:
-            raise TypeError(
-                "MiniMax expert weight_scale_inv must be FP32, "
-                f"got {loaded_scale.dtype}."
-            )
-
-        loaded_weight, loaded_scale = self.fp8_tp_shard.prepare_projection(
-            loaded_weight,
-            loaded_scale,
-            hidden_size=self.hidden_size,
-            down_projection=projection == "w2",
-        )
-        local_expert_id = global_expert_id - self.local_expert_start
-        logical_projection = {"w1": "gate", "w2": "down", "w3": "up"}[projection]
-        self.provider.load_expert_projection(
-            self.op_spec,
-            local_expert_id=local_expert_id,
-            projection=logical_projection,
-            loaded_weight=loaded_weight,
-            loaded_scale=loaded_scale,
-            w13_weight=self.w13_weight.data,
-            w2_weight=self.w2_weight.data,
-            w13_scale_inv=self.w13_scale_inv,
-            w2_scale_inv=self.w2_scale_inv,
-        )
-        self._loaded_expert_shards.add(load_key)
-
-    def validate_loaded_weights(self) -> None:
-        expected = {
-            (expert_id, projection)
-            for expert_id in range(self.local_expert_start, self.local_expert_end)
-            for projection in ("w1", "w2", "w3")
-        }
-        missing = sorted(expected - self._loaded_expert_shards)
-        if missing:
-            raise ValueError(
-                "Missing local MiniMax expert weights/scales: "
-                f"local_range=[{self.local_expert_start}, {self.local_expert_end}), "
-                f"missing={missing[:8]}."
-            )
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        topk_ids: torch.Tensor,
-        topk_weights: torch.Tensor,
-    ) -> torch.Tensor:
-        return self.provider.run(
-            self.op_spec,
-            hidden_states,
-            topk_ids,
-            topk_weights,
-            self.w13_weight,
-            self.w2_weight,
-            self.w13_scale_inv,
-            self.w2_scale_inv,
-            local_expert_start=self.local_expert_start,
-            ep_rank=self.ep_rank,
+            model_label="MiniMax",
+            provider_resolver=resolve_moe_provider,
+            parallel_context=get_parallel_context(),
         )
 
 

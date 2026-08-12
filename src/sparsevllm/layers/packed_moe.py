@@ -26,6 +26,7 @@ class PackedMoeExperts(PackedExpertWeightLoader, nn.Module):
         "up_proj": "up",
         "down_proj": "down",
     }
+    checkpoint_scale_dtype = torch.bfloat16
 
     def __init__(
         self,
@@ -64,6 +65,7 @@ class PackedMoeExperts(PackedExpertWeightLoader, nn.Module):
             self.global_intermediate_size // self.tp_size
         )
         self.fp8_enabled = bool(fp8_enabled)
+        scale_dtype = (scale_dtype or torch.float32) if self.fp8_enabled else None
         if self.fp8_enabled and (
             self.hidden_size % 128 or self.global_intermediate_size % 128
         ):
@@ -146,7 +148,7 @@ class PackedMoeExperts(PackedExpertWeightLoader, nn.Module):
                     self.num_local_experts,
                     2 * self.intermediate_size // 128,
                     self.hidden_size // 128,
-                    dtype=torch.float32,
+                    dtype=scale_dtype,
                 ),
             )
             self.register_buffer(
@@ -155,7 +157,7 @@ class PackedMoeExperts(PackedExpertWeightLoader, nn.Module):
                     self.num_local_experts,
                     self.hidden_size // 128,
                     self.intermediate_size // 128,
-                    dtype=torch.float32,
+                    dtype=scale_dtype,
                 ),
             )
         else:
@@ -200,9 +202,10 @@ class PackedMoeExperts(PackedExpertWeightLoader, nn.Module):
                     f"{self.model_label} expert weight must be FP8 E4M3, "
                     f"got {loaded_weight.dtype}."
                 )
-            if loaded_scale.dtype != torch.bfloat16:
+            if loaded_scale.dtype != self.checkpoint_scale_dtype:
                 raise TypeError(
-                    f"{self.model_label} expert weight_scale_inv must be BF16, "
+                    f"{self.model_label} expert weight_scale_inv must use "
+                    f"{self.checkpoint_scale_dtype}, "
                     f"got {loaded_scale.dtype}."
                 )
         elif loaded_scale is not None:
