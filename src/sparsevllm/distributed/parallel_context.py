@@ -115,28 +115,6 @@ class ParallelContext:
     ) -> torch.Tensor:
         return self.attention_tp_all_reduce(tensor, op)
 
-    def _all_reduce_out_of_place(
-        self,
-        tensor: torch.Tensor,
-        group: ParallelGroup,
-        op: dist.ReduceOp,
-    ) -> torch.Tensor:
-        return self._all_reduce(tensor, group, op)
-
-    def tp_all_reduce_out_of_place(
-        self,
-        tensor: torch.Tensor,
-        op: dist.ReduceOp = dist.ReduceOp.SUM,
-    ) -> torch.Tensor:
-        return self._all_reduce_out_of_place(tensor, self.attention, op)
-
-    def world_all_reduce_out_of_place(
-        self,
-        tensor: torch.Tensor,
-        op: dist.ReduceOp = dist.ReduceOp.SUM,
-    ) -> torch.Tensor:
-        return self._all_reduce_out_of_place(tensor, self.world, op)
-
     def ep_all_reduce(
         self,
         tensor: torch.Tensor,

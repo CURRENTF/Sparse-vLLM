@@ -733,7 +733,7 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
                 )
             if self.runtime_config is not None:
                 return self.runtime_config.moe_decode_all_reduce.run(local_output)
-            return self.parallel_context.world_all_reduce_out_of_place(local_output)
+            return self.parallel_context.world_all_reduce(local_output)
         if not debug_enabled:
             if int(hidden_states.shape[0]) <= self.mlp_chunk_size:
                 routed = self._routed_chunk(hidden_states)
@@ -801,9 +801,7 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
                 output = (
                     self.runtime_config.moe_decode_all_reduce.run(local_output)
                     if self.runtime_config is not None and not context.is_prefill
-                    else self.parallel_context.world_all_reduce_out_of_place(
-                        local_output
-                    )
+                    else self.parallel_context.world_all_reduce(local_output)
                 )
             else:
                 # Retain the pure-EP semantic path for direct module use: the
@@ -820,9 +818,7 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
                 # Both branches are TP partials. Compose them locally so the
                 # full MoE block needs one collective, matching the fused-MoE
                 # communication contract used by the reference runtime.
-                output = self.parallel_context.world_all_reduce_out_of_place(
-                    routed + shared_local
-                )
+                output = self.parallel_context.world_all_reduce(routed + shared_local)
             else:
                 # Decode tensors are small. Pack both partials into one
                 # collective, then add the independently reduced rows. This
@@ -831,9 +827,7 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
                 partials = (
                     self.runtime_config.moe_decode_all_reduce.run(partials)
                     if self.runtime_config is not None
-                    else self.parallel_context.world_all_reduce_out_of_place(
-                        partials
-                    )
+                    else self.parallel_context.world_all_reduce(partials)
                 )
                 output = partials[0] + partials[1]
         if debug_enabled:

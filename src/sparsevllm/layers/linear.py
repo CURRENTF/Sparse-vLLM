@@ -492,5 +492,5 @@ class RowParallelLinear(LinearBase):
         else:
             y = F.linear(x, self.weight, bias)
         if self.reduce_results:
-            return self.parallel_context.tp_all_reduce_out_of_place(y)
+            return self.parallel_context.tp_all_reduce(y)
         return y

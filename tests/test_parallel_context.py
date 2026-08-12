@@ -412,12 +412,12 @@ def test_dense_layers_use_tp_group_in_replicated_ep_topology():
     assert embedding.weight.shape == (32, 8)
 
 
-def test_vocab_parallel_embedding_uses_out_of_place_reduction():
+def test_vocab_parallel_embedding_reduces_results():
     reduced = torch.randn(2, 4)
     context = SimpleNamespace(
         tp_rank=0,
         tp_size=2,
-        tp_all_reduce_out_of_place=Mock(return_value=reduced),
+        tp_all_reduce=Mock(return_value=reduced),
     )
     with patch(
         "sparsevllm.layers.embed_head.get_parallel_context",
@@ -428,7 +428,7 @@ def test_vocab_parallel_embedding_uses_out_of_place_reduction():
     output = embedding(torch.tensor([0, 5]))
 
     assert output is reduced
-    context.tp_all_reduce_out_of_place.assert_called_once()
+    context.tp_all_reduce.assert_called_once()
 
 
 def test_cache_kv_heads_depend_on_tp_not_ep():

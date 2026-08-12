@@ -58,7 +58,7 @@ class VocabParallelEmbedding(nn.Module):
         y = F.embedding(x, self.weight)
         if self.tp_size > 1:
             y = mask.unsqueeze(1) * y
-        return self.parallel_context.tp_all_reduce_out_of_place(y) if self.reduce_results else y
+        return self.parallel_context.tp_all_reduce(y) if self.reduce_results else y
 
 
 class ParallelLMHead(VocabParallelEmbedding):
