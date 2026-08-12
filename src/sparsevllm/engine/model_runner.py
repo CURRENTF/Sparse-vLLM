@@ -65,6 +65,11 @@ try:
 except ImportError:
     Qwen35MoeForCausalLM = None
 
+try:
+    from sparsevllm.models.gemma4 import Gemma4ForCausalLM
+except ImportError:
+    Gemma4ForCausalLM = None
+
 
 def _create_model(hf_config, model_spec: ModelSpec, **runtime_kwargs):
     class_name = model_spec.runtime_class_name

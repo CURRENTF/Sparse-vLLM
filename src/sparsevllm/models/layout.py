@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from sparsevllm.utils.config import config_get
@@ -25,7 +25,9 @@ def resolve_attention_qk_head_dim(hf_config: Any) -> int:
             )
         head_dim = hidden_size // num_heads
     if head_dim <= 0:
-        raise ValueError(f"Attention QK head dimension must be positive, got {head_dim}.")
+        raise ValueError(
+            f"Attention QK head dimension must be positive, got {head_dim}."
+        )
     return head_dim
 
 
@@ -79,9 +81,41 @@ class RuntimeLayout:
     linear_attention_layer_indices: tuple[int, ...]
     layer_idx_to_kv_idx: tuple[int | None, ...]
     kv_idx_to_layer_idx: tuple[int, ...]
+    kv_num_heads: tuple[int, ...] = ()
+    kv_head_dims: tuple[int, ...] = ()
+
+    @property
+    def heterogeneous_kv(self) -> bool:
+        return len(set(zip(self.kv_num_heads, self.kv_head_dims))) > 1
+
+    def local_kv_shapes(self, tp_size: int) -> tuple[tuple[int, int], ...]:
+        tp_size = int(tp_size)
+        if not self.kv_num_heads:
+            return ()
+        shapes = []
+        for num_heads, head_dim in zip(self.kv_num_heads, self.kv_head_dims):
+            if num_heads >= tp_size:
+                if num_heads % tp_size:
+                    raise ValueError(
+                        f"KV heads must be divisible by TP: heads={num_heads}, TP={tp_size}."
+                    )
+                local_heads = num_heads // tp_size
+            else:
+                if tp_size % num_heads:
+                    raise ValueError(
+                        f"TP must be divisible by replicated KV heads: heads={num_heads}, TP={tp_size}."
+                    )
+                local_heads = 1
+            shapes.append((local_heads, head_dim))
+        return tuple(shapes)
+
+    def local_kv_shape(self, layer_idx: int, tp_size: int) -> tuple[int, int] | None:
+        if not self.kv_num_heads:
+            return None
+        return self.local_kv_shapes(tp_size)[self.kv_layer_index(layer_idx)]
 
     @classmethod
-    def dense(cls, num_layers: int) -> "RuntimeLayout":
+    def dense(cls, num_layers: int) -> RuntimeLayout:
         num_layers = int(num_layers)
         if num_layers <= 0:
             raise ValueError(f"num_hidden_layers must be positive, got {num_layers}.")
@@ -101,7 +135,7 @@ class RuntimeLayout:
         hf_config: Any,
         *,
         require_mixed: bool = False,
-    ) -> "RuntimeLayout":
+    ) -> RuntimeLayout:
         num_layers = int(config_get(hf_config, "num_hidden_layers"))
         if num_layers <= 0:
             raise ValueError(f"num_hidden_layers must be positive, got {num_layers}.")
@@ -144,7 +178,7 @@ class RuntimeLayout:
                     "Mixed-attention models require layer_types or explicit "
                     "full/linear attention layer indices."
                 )
-            return cls.dense(num_layers)
+            return cls._with_attention_shapes(cls.dense(num_layers), hf_config)
         if full_layers is None:
             linear_set = set(linear_layers or ())
             full_layers = [idx for idx in range(num_layers) if idx not in linear_set]
@@ -173,6 +207,35 @@ class RuntimeLayout:
             layer_to_kv: list[int | None] = [None] * num_layers
             for kv_idx, layer_idx in enumerate(full_tuple):
                 layer_to_kv[layer_idx] = kv_idx
+            num_shared = int(config_get(hf_config, "num_kv_shared_layers", 0) or 0)
+            if num_shared:
+                if str(config_get(hf_config, "model_type", "")) != "gemma4_text":
+                    raise NotImplementedError(
+                        "Automatic KV sharing is only defined for Gemma 4."
+                    )
+                shared_start = num_layers - num_shared
+                if shared_start <= 0:
+                    raise ValueError(
+                        "Gemma 4 num_kv_shared_layers must leave at least one "
+                        f"physical KV layer, got {num_shared}/{num_layers}."
+                    )
+                layer_types = tuple(config_get(hf_config, "layer_types"))
+                sources = {
+                    layer_type: max(
+                        idx
+                        for idx in range(shared_start)
+                        if layer_types[idx] == layer_type
+                    )
+                    for layer_type in set(layer_types[shared_start:])
+                }
+                physical_to_kv = {
+                    layer_idx: kv_idx
+                    for kv_idx, layer_idx in enumerate(full_tuple[:shared_start])
+                }
+                for layer_idx in range(shared_start, num_layers):
+                    layer_to_kv[layer_idx] = physical_to_kv[
+                        sources[layer_types[layer_idx]]
+                    ]
         else:
             if len(raw_layer_to_kv) != num_layers:
                 raise ValueError(
@@ -194,37 +257,77 @@ class RuntimeLayout:
                     f"{invalid_linear}."
                 )
 
-        kv_pairs = sorted(
-            (kv_idx, layer_idx)
-            for layer_idx, kv_idx in enumerate(layer_to_kv)
-            if kv_idx is not None
-        )
-        if len(kv_pairs) != len(full_tuple):
+        assigned_layers = [
+            layer_idx for layer_idx in full_tuple if layer_to_kv[layer_idx] is not None
+        ]
+        if len(assigned_layers) != len(full_tuple):
             raise ValueError(
                 "RuntimeLayout must assign one KV index to each full-attention "
-                f"layer: full={len(full_tuple)}, assigned={len(kv_pairs)}."
+                f"layer: full={len(full_tuple)}, assigned={len(assigned_layers)}."
             )
-        kv_indices = [kv_idx for kv_idx, _ in kv_pairs]
-        if kv_indices != list(range(len(kv_pairs))):
+        kv_indices = sorted({int(layer_to_kv[idx]) for idx in assigned_layers})
+        if kv_indices != list(range(len(kv_indices))):
             raise ValueError(f"KV layer indices must be contiguous, got {kv_indices}.")
-        kv_tuple = tuple(layer_idx for _, layer_idx in kv_pairs)
+        kv_tuple = tuple(
+            next(
+                layer_idx
+                for layer_idx in assigned_layers
+                if layer_to_kv[layer_idx] == kv_idx
+            )
+            for kv_idx in kv_indices
+        )
         configured_num_kv_layers = config_get(hf_config, "num_kv_layers", None)
-        if (
-            configured_num_kv_layers is not None
-            and int(configured_num_kv_layers) != len(kv_tuple)
-        ):
+        if configured_num_kv_layers is not None and int(
+            configured_num_kv_layers
+        ) != len(kv_tuple):
             raise ValueError(
                 f"num_kv_layers={configured_num_kv_layers} does not match "
-                f"full-attention layers={len(kv_tuple)}."
+                f"physical KV layers={len(kv_tuple)}."
             )
-        return cls(
-            num_layers=num_layers,
-            num_kv_layers=len(kv_tuple),
-            full_attention_layer_indices=full_tuple,
-            linear_attention_layer_indices=linear_tuple,
-            layer_idx_to_kv_idx=tuple(layer_to_kv),
-            kv_idx_to_layer_idx=kv_tuple,
+        return cls._with_attention_shapes(
+            cls(
+                num_layers=num_layers,
+                num_kv_layers=len(kv_tuple),
+                full_attention_layer_indices=full_tuple,
+                linear_attention_layer_indices=linear_tuple,
+                layer_idx_to_kv_idx=tuple(layer_to_kv),
+                kv_idx_to_layer_idx=kv_tuple,
+            ),
+            hf_config,
         )
+
+    @classmethod
+    def _with_attention_shapes(
+        cls, layout: RuntimeLayout, hf_config: Any
+    ) -> RuntimeLayout:
+        if str(config_get(hf_config, "model_type", "")) != "gemma4_text":
+            return layout
+        layer_types = tuple(config_get(hf_config, "layer_types"))
+        if len(layer_types) != layout.num_layers:
+            raise ValueError(
+                "Gemma 4 layer_types must match num_hidden_layers, "
+                f"got {len(layer_types)} and {layout.num_layers}."
+            )
+        invalid_types = sorted(
+            set(layer_types) - {"sliding_attention", "full_attention"}
+        )
+        if invalid_types:
+            raise ValueError(f"Unsupported Gemma 4 layer types: {invalid_types}.")
+        sliding_heads = int(config_get(hf_config, "num_key_value_heads"))
+        sliding_dim = int(config_get(hf_config, "head_dim"))
+        global_dim = int(config_get(hf_config, "global_head_dim", sliding_dim))
+        use_k_eq_v = bool(config_get(hf_config, "attention_k_eq_v", False))
+        global_heads = int(
+            config_get(hf_config, "num_global_key_value_heads", sliding_heads)
+            if use_k_eq_v
+            else sliding_heads
+        )
+        heads, dims = [], []
+        for layer_idx in layout.kv_idx_to_layer_idx:
+            is_full = str(layer_types[layer_idx]) == "full_attention"
+            heads.append(global_heads if is_full else sliding_heads)
+            dims.append(global_dim if is_full else sliding_dim)
+        return replace(layout, kv_num_heads=tuple(heads), kv_head_dims=tuple(dims))
 
     def is_full_attention(self, layer_idx: int) -> bool:
         return self.layer_idx_to_kv_idx[int(layer_idx)] is not None

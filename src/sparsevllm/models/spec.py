@@ -17,6 +17,7 @@ class ModelSpec:
     supports_tiny_random: bool = True
     supports_expert_parallel: bool = False
     supports_outer_tp_moe: bool = False
+    outer_tp_moe_config_field: str | None = None
     supports_data_parallel: bool = False
     prefix_cache_block_size_multiple: int | None = None
     deltakv_checkpoint_model_types: frozenset[str] = frozenset()
@@ -27,14 +28,24 @@ class ModelSpec:
     moe_tp_fields: tuple[str, ...] = ()
     top_k_field: str | None = None
 
-    def topology(self, tp_size: int, ep_size: int, dp_size: int) -> ParallelTopology:
+    def topology(
+        self,
+        tp_size: int,
+        ep_size: int,
+        dp_size: int,
+        hf_config: Any | None = None,
+    ) -> ParallelTopology:
+        use_outer_tp_moe = self.supports_outer_tp_moe and (
+            self.outer_tp_moe_config_field is None
+            or bool(config_get(hf_config, self.outer_tp_moe_config_field, False))
+        )
         topology = ParallelTopology(
             int(tp_size),
             int(ep_size),
             int(dp_size),
             (
                 ParallelMode.OUTER_TP_MOE
-                if self.supports_outer_tp_moe and int(tp_size) > 1
+                if use_outer_tp_moe and int(tp_size) > 1
                 else ParallelMode.STANDARD
             ),
         )
@@ -170,6 +181,23 @@ MODEL_SPECS.update(
             num_experts_field="n_routed_experts",
             moe_tp_fields=("intermediate_size", "moe_intermediate_size"),
             top_k_field="num_experts_per_tok",
+        ),
+        "gemma4": ModelSpec(
+            "Gemma 4",
+            allow_raw_config=True,
+            supports_tiny_random=False,
+            supports_expert_parallel=True,
+            supports_outer_tp_moe=True,
+            outer_tp_moe_config_field="enable_moe_block",
+            runtime_class_name="Gemma4ForCausalLM",
+            attention_tp_fields=(
+                "num_attention_heads",
+                "vocab_size",
+                "intermediate_size",
+            ),
+            num_experts_field="num_experts",
+            moe_tp_fields=("moe_intermediate_size",),
+            top_k_field="top_k_experts",
         ),
     }
 )

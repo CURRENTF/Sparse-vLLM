@@ -38,6 +38,7 @@ from .prefix_offload import (
 )
 from .storage import (
     ExplicitKVStorage,
+    HeterogeneousExplicitKVStorage,
     create_attention_cache_storage,
 )
 
@@ -139,7 +140,7 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
         host_size_gb = getattr(self.config, "prefix_cache_host_size_gb", None)
         if host_size_gb is None:
             raise RuntimeError("Prefix cache offload requires prefix_cache_host_size_gb.")
-        storage = self._require_explicit_storage("Prefix cache offload")
+        storage = self._require_uniform_explicit_storage("Prefix cache offload")
         kv_cache = storage.cache
         bytes_per_block = int(
             self.prefix_cache_block_size
@@ -186,7 +187,12 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
         available_memory, slot_bytes_per_layer = self._get_available_slots_info()
         num_layers = self.num_kv_layers
 
-        slot_bytes = num_layers * slot_bytes_per_layer
+        storage = self.attention_cache_storage
+        slot_bytes = (
+            storage.bytes_per_slot()
+            if isinstance(storage, HeterogeneousExplicitKVStorage)
+            else num_layers * slot_bytes_per_layer
+        )
         self.config.num_kvcache_slots = available_memory // slot_bytes
         assert self.config.num_kvcache_slots > 0, "可用显存不足以分配 KV Cache"
 
@@ -198,11 +204,7 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
             num_slots=self.config.num_kvcache_slots,
             device=self.device,
         )
-        self.kv_cache = (
-            self.attention_cache_storage.kv_cache
-            if isinstance(self.attention_cache_storage, ExplicitKVStorage)
-            else None
-        )
+        self.kv_cache = getattr(self.attention_cache_storage, "kv_cache", None)
 
     def attention_cache_bytes_per_slot_per_layer(self) -> int:
         storage = getattr(self, "attention_cache_storage", None)
@@ -210,12 +212,28 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
             return super().attention_cache_bytes_per_slot_per_layer()
         return int(storage.bytes_per_slot_per_layer())
 
-    def _require_explicit_storage(self, operation: str) -> ExplicitKVStorage:
+    def _logical_live_kv_bytes(self) -> int:
+        storage = getattr(self, "attention_cache_storage", None)
+        if not isinstance(storage, HeterogeneousExplicitKVStorage):
+            return super()._logical_live_kv_bytes()
+        return int(self.row_seq_lens.sum()) * storage.bytes_per_slot()
+
+    def _require_explicit_storage(
+        self, operation: str
+    ) -> ExplicitKVStorage | HeterogeneousExplicitKVStorage:
         storage = self.attention_cache_storage
-        if not isinstance(storage, ExplicitKVStorage):
+        if not isinstance(storage, (ExplicitKVStorage, HeterogeneousExplicitKVStorage)):
             raise TypeError(
                 f"{operation} requires ExplicitKVStorage, got "
                 f"{type(storage).__name__}."
+            )
+        return storage
+
+    def _require_uniform_explicit_storage(self, operation: str) -> ExplicitKVStorage:
+        storage = self.attention_cache_storage
+        if not isinstance(storage, ExplicitKVStorage):
+            raise NotImplementedError(
+                f"{operation} does not support heterogeneous per-layer KV shapes."
             )
         return storage
 
@@ -771,6 +789,9 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
             raise RuntimeError("Standard mixed prefix KV payload is missing token slots.")
         if not isinstance(payload.token_slots, torch.Tensor):
             raise RuntimeError("Standard mixed prefix KV payload has no device slots.")
+        storage = self.attention_cache_storage
+        if isinstance(storage, HeterogeneousExplicitKVStorage):
+            return int(payload.token_slots.numel()) * storage.bytes_per_slot()
         dtype_size = self._cache_slot_dtype_size()
         return int(
             payload.token_slots.numel()

@@ -40,6 +40,7 @@ class PackedMoeExperts(PackedExpertWeightLoader, nn.Module):
         cuda_graph: bool,
         routing_method: str = "softmax",
         scale_dtype: torch.dtype | None = None,
+        activation: str = "silu",
         model_label: str = "PackedMoE",
         provider_resolver: Callable[[MoeOpSpec], MoeProvider] = resolve_moe_provider,
         parallel_context=None,
@@ -121,6 +122,7 @@ class PackedMoeExperts(PackedExpertWeightLoader, nn.Module):
             tp_size=int(self.tp_size),
             routing_method=str(routing_method),
             scale_dtype=scale_dtype,
+            activation=str(activation),
         )
         self.provider = provider_resolver(self.op_spec)
         self.w13_weight = nn.Parameter(

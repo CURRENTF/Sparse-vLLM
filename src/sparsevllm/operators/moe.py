@@ -31,6 +31,7 @@ class MoeOpSpec:
     tp_size: int = 1
     routing_method: str = "softmax"
     scale_dtype: torch.dtype | None = None
+    activation: str = "silu"
 
     def __post_init__(self) -> None:
         if self.num_experts <= 0 or self.num_local_experts <= 0:
@@ -60,6 +61,11 @@ class MoeOpSpec:
             raise ValueError(
                 "MoE routing_method must be 'softmax' or 'biased_sigmoid', "
                 f"got {self.routing_method!r}."
+            )
+        if self.activation not in {"silu", "gelu_tanh"}:
+            raise ValueError(
+                "MoE activation must be 'silu' or 'gelu_tanh', "
+                f"got {self.activation!r}."
             )
 
 

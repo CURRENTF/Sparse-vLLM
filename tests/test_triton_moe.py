@@ -4,8 +4,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from sparsevllm.operators.gated_shared_add import gated_shared_add
 from sparsevllm.kernels.triton.gate_up_swiglu import h20_gate_up_swiglu
+from sparsevllm.kernels.triton.gemma4_moe import fused_gemma4_moe
 from sparsevllm.kernels.triton.moe import (
     _prepare_expert_assignment,
     append_shared_expert_route,
@@ -15,6 +15,7 @@ from sparsevllm.kernels.triton.moe import (
 )
 from sparsevllm.kernels.triton.moe_topk import topk_softmax
 from sparsevllm.kernels.triton.silu_and_mul import _resolve_silu_launch_config
+from sparsevllm.operators.gated_shared_add import gated_shared_add
 
 
 def test_silu_launch_config_uses_decode_tile_only_for_small_rows():
@@ -94,6 +95,71 @@ def _oracle_local_moe(
         expert_output *= topk_weights[token_ids, topk_slots, None]
         output.index_add_(0, token_ids, expert_output.to(output.dtype))
     return output
+
+
+def _oracle_gemma4_moe(
+    hidden_states,
+    w13_weight,
+    w2_weight,
+    topk_ids,
+    topk_weights,
+    local_expert_start,
+):
+    output = torch.zeros_like(hidden_states)
+    for local_id in range(w13_weight.shape[0]):
+        global_id = local_expert_start + local_id
+        token_ids, routes = torch.where(topk_ids == global_id)
+        if token_ids.numel() == 0:
+            continue
+        gate, up = F.linear(hidden_states[token_ids], w13_weight[local_id]).chunk(2, -1)
+        routed = F.linear(F.gelu(gate, approximate="tanh") * up, w2_weight[local_id])
+        output.index_add_(0, token_ids, routed * topk_weights[token_ids, routes, None])
+    return output
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("num_tokens", [1, 19])
+def test_gemma4_moe_matches_torch(num_tokens):
+    torch.manual_seed(71 + num_tokens)
+    hidden_size, intermediate_size, num_experts, top_k = 64, 32, 7, 3
+    hidden_states = torch.randn(
+        num_tokens, hidden_size, dtype=torch.bfloat16, device="cuda"
+    )
+    w13_weight = torch.randn(
+        num_experts,
+        2 * intermediate_size,
+        hidden_size,
+        dtype=torch.bfloat16,
+        device="cuda",
+    ) * 0.1
+    w2_weight = torch.randn(
+        num_experts,
+        hidden_size,
+        intermediate_size,
+        dtype=torch.bfloat16,
+        device="cuda",
+    ) * 0.1
+    ids = torch.randint(
+        num_experts,
+        (num_tokens, top_k),
+        dtype=torch.int64,
+        device="cuda",
+    )
+    weights = torch.rand(num_tokens, top_k, dtype=torch.bfloat16, device="cuda")
+    weights /= weights.sum(-1, keepdim=True)
+    expected = _oracle_gemma4_moe(
+        hidden_states, w13_weight, w2_weight, ids, weights, 0
+    )
+    actual = fused_gemma4_moe(
+        hidden_states,
+        w13_weight,
+        w2_weight,
+        ids,
+        weights,
+        num_experts=num_experts,
+        local_expert_start=0,
+    )
+    torch.testing.assert_close(actual, expected, atol=0.04, rtol=0.04)
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for Triton MoE tests.")

@@ -270,10 +270,33 @@ def _qwen3_moe_checkpoint(_outer, config, raw, quantization, topology) -> None:
     _validate_qwen3_moe(config, raw, quantization, topology)
 
 
+def _gemma4_checkpoint(outer, config, _raw, quantization, topology) -> None:
+    _validate_architecture("Gemma 4", outer, "Gemma4ForConditionalGeneration")
+    _validate_bf16("Gemma 4", config, "BF16 weights")
+    _validate_fields(
+        "Gemma 4",
+        config,
+        {
+            "attention_bias": False,
+            "hidden_activation": "gelu_pytorch_tanh",
+            "rms_norm_eps": 1.0e-6,
+            "tie_word_embeddings": True,
+        },
+    )
+    if quantization.enabled:
+        raise NotImplementedError("Gemma 4 currently supports unquantized BF16 checkpoints only.")
+    enable_moe = bool(config_get(config, "enable_moe_block", False))
+    if topology.expert_parallel_size > 1 and not enable_moe:
+        raise ValueError("Gemma 4 dense checkpoints require expert_parallel_size=1.")
+    if enable_moe and not int(config_get(config, "num_experts", 0) or 0):
+        raise ValueError("Gemma 4 MoE requires a positive num_experts.")
+
+
 CHECKPOINT_VALIDATORS = {
     "qwen3": _qwen3_checkpoint,
     "qwen3_moe": _qwen3_moe_checkpoint,
     "qwen3_5": _qwen35_checkpoint,
     "qwen3_5_moe": _qwen35_moe_checkpoint,
     "minimax_m2": _minimax_checkpoint,
+    "gemma4": _gemma4_checkpoint,
 }

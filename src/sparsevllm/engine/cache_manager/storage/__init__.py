@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Any
 
 from .base import AttentionCacheStorage, CacheLayout
 from .explicit_kv import ExplicitKVStorage
+from .heterogeneous_explicit_kv import HeterogeneousExplicitKVStorage
 
 if TYPE_CHECKING:
     from .mla_latent import MlaLatentStorage
@@ -23,6 +24,18 @@ def create_attention_cache_storage(
     )
     dtype = config.hf_config.torch_dtype
     if layout is CacheLayout.EXPLICIT_KV:
+        runtime_layout = getattr(config, "runtime_layout", None)
+        parallel_topology = getattr(config, "parallel_topology", None)
+        layer_shapes = (
+            runtime_layout.local_kv_shapes(parallel_topology.attention_tp_size)
+            if runtime_layout is not None and parallel_topology is not None
+            else ()
+        )
+        if len(set(layer_shapes)) > 1:
+            return HeterogeneousExplicitKVStorage(
+                layer_shapes=layer_shapes,
+                dtype=dtype,
+            )
         return ExplicitKVStorage(
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
@@ -51,6 +64,7 @@ __all__ = [
     "AttentionCacheStorage",
     "CacheLayout",
     "ExplicitKVStorage",
+    "HeterogeneousExplicitKVStorage",
     "MlaLatentStorage",
     "create_attention_cache_storage",
 ]
