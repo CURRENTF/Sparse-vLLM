@@ -9,7 +9,6 @@ from torch import nn
 from transformers import Gemma4TextConfig
 
 from sparsevllm.distributed import get_parallel_context
-from sparsevllm.layers.activation import GeluTanhAndMul
 from sparsevllm.layers.attention import Attention
 from sparsevllm.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
 from sparsevllm.layers.gemma4_rmsnorm import Gemma4RMSNorm
@@ -21,14 +20,13 @@ from sparsevllm.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
-from sparsevllm.layers.packed_moe import PackedMoeExperts
 from sparsevllm.layers.rotary_embedding import apply_rotary_emb
-from sparsevllm.operators.activation import (
-    GeluTanhAndMulProvider,
-    resolve_gelu_tanh_and_mul_provider,
+from sparsevllm.operators.gemma4 import (
+    Gemma4OperatorProvider,
+    Gemma4OpSpec,
+    resolve_gemma4_provider,
 )
-from sparsevllm.operators.gemma4_attention import Gemma4AttentionBackend
-from sparsevllm.operators.gemma4_moe import resolve_gemma4_moe_provider
+from sparsevllm.operators.gemma4_moe import Gemma4PackedExperts
 from sparsevllm.operators.moe import model_activation_dtype
 from sparsevllm.platforms import device_runtime
 from sparsevllm.utils.context import get_context
@@ -142,6 +140,7 @@ class Gemma4Attention(nn.Module):
         config: Gemma4TextConfig,
         layer_idx: int,
         rotary_emb: Gemma4RotaryEmbedding,
+        operator_provider: Gemma4OperatorProvider,
     ) -> None:
         super().__init__()
         parallel_context = get_parallel_context()
@@ -193,15 +192,23 @@ class Gemma4Attention(nn.Module):
             bias=config.attention_bias,
             quantization=getattr(config, "quantization_config", None),
         )
-        self.q_norm = Gemma4RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.q_norm = Gemma4RMSNorm(
+            self.head_dim, eps=config.rms_norm_eps, provider=operator_provider
+        )
         if not self.is_kv_shared_layer:
-            self.k_norm = Gemma4RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+            self.k_norm = Gemma4RMSNorm(
+                self.head_dim, eps=config.rms_norm_eps, provider=operator_provider
+            )
             self.v_norm = Gemma4RMSNorm(
-                self.head_dim, eps=config.rms_norm_eps, with_scale=False
+                self.head_dim,
+                eps=config.rms_norm_eps,
+                with_scale=False,
+                provider=operator_provider,
             )
         self.rotary_emb = rotary_emb
+        self._ops = operator_provider
         self.attn = Attention(self.num_heads, self.head_dim, 1.0, self.num_kv_heads)
-        self.attn.attention_backend = Gemma4AttentionBackend(
+        self.attn.attention_backend = operator_provider.attention_backend(
             sliding_window=self.sliding_window
         )
 
@@ -210,23 +217,16 @@ class Gemma4Attention(nn.Module):
     ) -> torch.Tensor:
         if self.is_kv_shared_layer:
             q = self.qkv_proj(hidden_states).view(-1, self.num_heads, self.head_dim)
-            if q.is_cuda:
-                from sparsevllm.kernels.triton.gemma4_qkv_norm_rope import (
-                    gemma4_qkv_norm_rope,
-                )
-
-                gemma4_qkv_norm_rope(
-                    q,
-                    None,
-                    None,
-                    self.q_norm.weight,
-                    None,
-                    self.rotary_emb.cos_sin_cache,
-                    positions,
-                    self.q_norm.eps,
-                )
-            else:
-                q = self.rotary_emb.forward_query(positions, self.q_norm(q))
+            q, _, _ = self._ops.qkv_norm_rope(
+                q,
+                None,
+                None,
+                self.q_norm.weight,
+                None,
+                self.rotary_emb.cos_sin_cache,
+                positions,
+                self.q_norm.eps,
+            )
             empty = q.new_empty((0, self.num_kv_heads, self.head_dim))
             return self.o_proj(self.attn(q, empty, empty).flatten(1))
         q, k, v = self.qkv_proj(hidden_states).split(
@@ -235,24 +235,16 @@ class Gemma4Attention(nn.Module):
         q = q.view(-1, self.num_heads, self.head_dim)
         k = k.view(-1, self.num_kv_heads, self.head_dim)
         v = v.view(-1, self.num_kv_heads, self.head_dim)
-        if q.is_cuda:
-            from sparsevllm.kernels.triton.gemma4_qkv_norm_rope import (
-                gemma4_qkv_norm_rope,
-            )
-
-            gemma4_qkv_norm_rope(
-                q,
-                k,
-                v,
-                self.q_norm.weight,
-                self.k_norm.weight,
-                self.rotary_emb.cos_sin_cache,
-                positions,
-                self.q_norm.eps,
-            )
-        else:
-            q, k = self.rotary_emb(positions, self.q_norm(q), self.k_norm(k))
-            v = self.v_norm(v)
+        q, k, v = self._ops.qkv_norm_rope(
+            q,
+            k,
+            v,
+            self.q_norm.weight,
+            self.k_norm.weight,
+            self.rotary_emb.cos_sin_cache,
+            positions,
+            self.q_norm.eps,
+        )
         context = get_context()
         context.cache_manager.save_rope_kv_if_needed(context.now_layer_idx, k, v)
         output = self.attn(q, k, v)
@@ -264,7 +256,7 @@ class Gemma4MLP(nn.Module):
         self,
         config: Gemma4TextConfig,
         layer_idx: int,
-        activation_provider: GeluTanhAndMulProvider | None,
+        operator_provider: Gemma4OperatorProvider,
     ) -> None:
         super().__init__()
         shared_start = int(config.num_hidden_layers) - int(config.num_kv_shared_layers)
@@ -283,103 +275,40 @@ class Gemma4MLP(nn.Module):
             config.hidden_size,
             quantization=getattr(config, "quantization_config", None),
         )
-        self.activation = GeluTanhAndMul(activation_provider)
+        self._ops = operator_provider
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(self.activation(self.gate_up_proj(hidden_states)))
+        return self.down_proj(
+            self._ops.gelu_tanh_and_mul(self.gate_up_proj(hidden_states))
+        )
 
 
 class Gemma4Router(nn.Module):
-    def __init__(self, config: Gemma4TextConfig) -> None:
+    def __init__(
+        self,
+        config: Gemma4TextConfig,
+        operator_provider: Gemma4OperatorProvider,
+    ) -> None:
         super().__init__()
         self.top_k = int(config.top_k_experts)
         self.root_size = float(config.hidden_size) ** -0.5
         self.norm = Gemma4RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps, with_scale=False
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            with_scale=False,
+            provider=operator_provider,
         )
+        self._ops = operator_provider
         self.scale = nn.Parameter(torch.ones(config.hidden_size))
         self.proj = ReplicatedLinear(config.hidden_size, config.num_experts)
         self.per_expert_scale = nn.Parameter(torch.ones(config.num_experts))
 
     def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        if hidden_states.is_cuda:
-            from sparsevllm.kernels.triton.gemma4_router import (
-                gemma4_router_input,
-                gemma4_router_topk,
-            )
-
-            router_input = gemma4_router_input(
-                hidden_states, self.scale, self.root_size, self.norm.eps
-            )
-            return gemma4_router_topk(
-                self.proj(router_input), self.per_expert_scale, self.top_k
-            )
-        logits = self.proj(self.norm(hidden_states) * self.scale * self.root_size)
-        probabilities = F.softmax(logits, dim=-1, dtype=torch.float32)
-        weights, ids = probabilities.topk(self.top_k, dim=-1)
-        weights.div_(weights.sum(-1, keepdim=True)).mul_(self.per_expert_scale[ids])
-        return weights, ids
-
-
-class Gemma4PackedExperts(PackedMoeExperts):
-    def __init__(self, config: Gemma4TextConfig) -> None:
-        super().__init__(
-            num_experts=config.num_experts,
-            hidden_size=config.hidden_size,
-            intermediate_size=config.moe_intermediate_size,
-            top_k=config.top_k_experts,
-            activation_dtype=model_activation_dtype(config),
-            fp8_enabled=False,
-            cuda_graph=bool(getattr(config, "decode_cuda_graph", False)),
-            activation="gelu_tanh",
-            model_label="Gemma4MoE",
-            provider_resolver=resolve_gemma4_moe_provider,
-            parallel_context=get_parallel_context(),
+        router_input = self._ops.router_input(
+            hidden_states, self.scale, self.root_size, self.norm.eps
         )
-
-    def rank_local_weight_slice(
-        self,
-        source_shape: tuple[int, ...],
-        *,
-        loaded_shard_id: str,
-        is_scale: bool = False,
-    ) -> tuple[slice, ...] | None:
-        if is_scale:
-            raise ValueError("Gemma 4 BF16 experts do not use weight scales.")
-        if len(source_shape) != 3 or int(source_shape[0]) != self.num_experts:
-            raise ValueError(f"Invalid Gemma 4 packed expert shape {source_shape}.")
-        if self.ep_size == 1:
-            return None
-        return (
-            slice(self.local_expert_start, self.local_expert_end),
-            slice(None),
-            slice(None),
-        )
-
-    def load_packed_weight(self, projection: str, loaded_weight: torch.Tensor) -> None:
-        if loaded_weight.shape[0] == self.num_experts:
-            loaded_weight = loaded_weight[
-                self.local_expert_start : self.local_expert_end
-            ]
-        if projection == "gate_up_proj":
-            gate, up = loaded_weight.chunk(2, 1)
-            gate = gate.chunk(self.tp_size, 1)[self.tp_rank]
-            up = up.chunk(self.tp_size, 1)[self.tp_rank]
-            self.w13_weight.data.copy_(torch.cat((gate, up), 1))
-            projections = ("gate_proj", "up_proj")
-        elif projection == "down_proj":
-            self.w2_weight.data.copy_(
-                loaded_weight.chunk(self.tp_size, 2)[self.tp_rank]
-            )
-            projections = ("down_proj",)
-        else:
-            raise ValueError(
-                f"Unsupported Gemma 4 packed expert projection {projection!r}."
-            )
-        self._loaded_expert_shards.update(
-            (expert_id, name)
-            for expert_id in range(self.local_expert_start, self.local_expert_end)
-            for name in projections
+        return self._ops.router_topk(
+            self.proj(router_input), self.per_expert_scale, self.top_k
         )
 
 
@@ -388,7 +317,7 @@ class Gemma4DecoderLayer(nn.Module):
         self,
         config: Gemma4TextConfig,
         layer_idx: int,
-        activation_provider: GeluTanhAndMulProvider | None,
+        operator_provider: Gemma4OperatorProvider,
         rotary_embeddings: nn.ModuleDict,
     ) -> None:
         super().__init__()
@@ -397,19 +326,21 @@ class Gemma4DecoderLayer(nn.Module):
             config,
             layer_idx,
             rotary_embeddings[layer_type],
+            operator_provider,
         )
-        self.mlp = Gemma4MLP(config, layer_idx, activation_provider)
+        self._ops = operator_provider
+        self.mlp = Gemma4MLP(config, layer_idx, operator_provider)
         self.input_layernorm = Gemma4RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+            config.hidden_size, eps=config.rms_norm_eps, provider=operator_provider
         )
         self.post_attention_layernorm = Gemma4RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+            config.hidden_size, eps=config.rms_norm_eps, provider=operator_provider
         )
         self.pre_feedforward_layernorm = Gemma4RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+            config.hidden_size, eps=config.rms_norm_eps, provider=operator_provider
         )
         self.post_feedforward_layernorm = Gemma4RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+            config.hidden_size, eps=config.rms_norm_eps, provider=operator_provider
         )
         self.hidden_size_per_layer_input = int(config.hidden_size_per_layer_input)
         if self.hidden_size_per_layer_input:
@@ -424,20 +355,27 @@ class Gemma4DecoderLayer(nn.Module):
             self.post_per_layer_input_norm = Gemma4RMSNorm(
                 config.hidden_size,
                 eps=config.rms_norm_eps,
+                provider=operator_provider,
             )
         self.enable_moe_block = bool(config.enable_moe_block)
         if self.enable_moe_block:
             self.parallel_context = get_parallel_context()
-            self.router = Gemma4Router(config)
+            self.router = Gemma4Router(config, operator_provider)
             self.experts = Gemma4PackedExperts(config)
             self.post_feedforward_layernorm_1 = Gemma4RMSNorm(
-                config.hidden_size, eps=config.rms_norm_eps
+                config.hidden_size,
+                eps=config.rms_norm_eps,
+                provider=operator_provider,
             )
             self.pre_feedforward_layernorm_2 = Gemma4RMSNorm(
-                config.hidden_size, eps=config.rms_norm_eps
+                config.hidden_size,
+                eps=config.rms_norm_eps,
+                provider=operator_provider,
             )
             self.post_feedforward_layernorm_2 = Gemma4RMSNorm(
-                config.hidden_size, eps=config.rms_norm_eps
+                config.hidden_size,
+                eps=config.rms_norm_eps,
+                provider=operator_provider,
             )
         self.layer_scalar = nn.Parameter(torch.ones(1), requires_grad=False)
 
@@ -449,19 +387,12 @@ class Gemma4DecoderLayer(nn.Module):
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.self_attn(positions, self.input_layernorm(hidden_states))
-        if hidden_states.is_cuda:
-            from sparsevllm.kernels.triton.gemma4_fused_ops import (
-                gemma4_rmsnorm_residual,
-            )
-
-            hidden_states = gemma4_rmsnorm_residual(
-                hidden_states,
-                self.post_attention_layernorm.weight,
-                residual,
-                self.post_attention_layernorm.eps,
-            )
-        else:
-            hidden_states = self.post_attention_layernorm(hidden_states) + residual
+        hidden_states = self._ops.rmsnorm_residual(
+            hidden_states,
+            self.post_attention_layernorm.weight,
+            residual,
+            self.post_attention_layernorm.eps,
+        )
         residual = hidden_states
         dense_input = self.pre_feedforward_layernorm(hidden_states)
         hidden_states = self.mlp(dense_input)
@@ -473,52 +404,35 @@ class Gemma4DecoderLayer(nn.Module):
             hidden_states = self.post_feedforward_layernorm_1(
                 hidden_states
             ) + self.post_feedforward_layernorm_2(expert_output)
-        if hidden_states.is_cuda:
-            hidden_states = gemma4_rmsnorm_residual(
-                hidden_states,
-                self.post_feedforward_layernorm.weight,
-                residual,
-                self.post_feedforward_layernorm.eps,
-                None if self.hidden_size_per_layer_input else self.layer_scalar,
-            )
-        else:
-            hidden_states = self.post_feedforward_layernorm(hidden_states) + residual
+        hidden_states = self._ops.rmsnorm_residual(
+            hidden_states,
+            self.post_feedforward_layernorm.weight,
+            residual,
+            self.post_feedforward_layernorm.eps,
+            None if self.hidden_size_per_layer_input else self.layer_scalar,
+        )
         if self.hidden_size_per_layer_input:
             if per_layer_input is None:
                 raise RuntimeError("Gemma 4 PLE layer requires per_layer_input.")
             residual = hidden_states
             hidden_states = self.per_layer_input_gate(hidden_states)
-            if hidden_states.is_cuda:
-                from sparsevllm.kernels.triton.gemma4_fused_ops import gemma4_gelu_mul
-
-                hidden_states = gemma4_gelu_mul(hidden_states, per_layer_input)
-            else:
-                hidden_states = (
-                    F.gelu(hidden_states, approximate="tanh") * per_layer_input
-                )
+            hidden_states = self._ops.gelu_mul(hidden_states, per_layer_input)
             hidden_states = self.per_layer_projection(hidden_states)
-            if hidden_states.is_cuda:
-                hidden_states = gemma4_rmsnorm_residual(
-                    hidden_states,
-                    self.post_per_layer_input_norm.weight,
-                    residual,
-                    self.post_per_layer_input_norm.eps,
-                    self.layer_scalar,
-                )
-            else:
-                hidden_states = self.post_per_layer_input_norm(hidden_states) + residual
-        return (
-            hidden_states
-            if hidden_states.is_cuda
-            else hidden_states * self.layer_scalar
-        )
+            hidden_states = self._ops.rmsnorm_residual(
+                hidden_states,
+                self.post_per_layer_input_norm.weight,
+                residual,
+                self.post_per_layer_input_norm.eps,
+                self.layer_scalar,
+            )
+        return hidden_states
 
 
 class Gemma4Model(nn.Module):
     def __init__(
         self,
         config: Gemma4TextConfig,
-        activation_provider: GeluTanhAndMulProvider | None,
+        operator_provider: Gemma4OperatorProvider,
     ) -> None:
         super().__init__()
         self.config = config
@@ -541,6 +455,7 @@ class Gemma4Model(nn.Module):
             self.per_layer_projection_norm = Gemma4RMSNorm(
                 self.hidden_size_per_layer_input,
                 eps=config.rms_norm_eps,
+                provider=operator_provider,
             )
             self.per_layer_model_projection_scale = float(config.hidden_size) ** -0.5
             self.per_layer_input_scale = 2.0**-0.5
@@ -560,12 +475,14 @@ class Gemma4Model(nn.Module):
             Gemma4DecoderLayer(
                 config,
                 layer_idx,
-                activation_provider,
+                operator_provider,
                 self.rotary_embeddings,
             )
             for layer_idx in range(config.num_hidden_layers)
         )
-        self.norm = Gemma4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = Gemma4RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps, provider=operator_provider
+        )
         self.embedding_scale = float(config.hidden_size) ** 0.5
         self.sparse_controller = None
 
@@ -624,11 +541,11 @@ class Gemma4ForCausalLM(nn.Module):
     def __init__(
         self,
         config: Gemma4TextConfig,
-        activation_provider: GeluTanhAndMulProvider | None = None,
+        operator_provider: Gemma4OperatorProvider,
     ) -> None:
         super().__init__()
         self.config = config
-        self.model = Gemma4Model(config, activation_provider)
+        self.model = Gemma4Model(config, operator_provider)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if config.tie_word_embeddings:
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
@@ -636,9 +553,21 @@ class Gemma4ForCausalLM(nn.Module):
 
     @classmethod
     def build_runtime_kwargs(cls, config, *, device, **_):
+        head_dims = tuple(
+            sorted(
+                {
+                    int(config.head_dim),
+                    int(getattr(config, "global_head_dim", config.head_dim)),
+                }
+            )
+        )
         return {
-            "activation_provider": resolve_gelu_tanh_and_mul_provider(
-                activation_dtype=model_activation_dtype(config),
+            "operator_provider": resolve_gemma4_provider(
+                Gemma4OpSpec(
+                    activation_dtype=model_activation_dtype(config),
+                    head_dims=head_dims,
+                    cuda_graph=bool(getattr(config, "decode_cuda_graph", False)),
+                ),
                 device_index=device.index,
             )
         }

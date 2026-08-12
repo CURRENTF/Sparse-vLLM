@@ -2,13 +2,10 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from sparsevllm.layers.activation import GeluTanhAndMul, SiluAndMul
+from sparsevllm.layers.activation import SiluAndMul
 from sparsevllm.operators.activation import (
-    GeluTanhAndMulSpec,
     SiluAndMulSpec,
-    TorchGeluTanhAndMulProvider,
     TorchSiluAndMulProvider,
-    TritonGeluTanhAndMulProvider,
     TritonSiluAndMulProvider,
 )
 
@@ -30,30 +27,6 @@ def test_silu_and_mul_cpu_matches_reference():
 def test_silu_and_mul_rejects_odd_width():
     with pytest.raises(ValueError, match="even final dimension"):
         SiluAndMul(provider=TorchSiluAndMulProvider())(torch.randn(2, 7))
-
-
-def test_gemma4_gelu_and_mul_cpu_matches_reference():
-    x = torch.randn(3, 16)
-    gate, up = x.chunk(2, -1)
-    expected = F.gelu(gate, approximate="tanh") * up
-    actual = GeluTanhAndMul(provider=TorchGeluTanhAndMulProvider())(x)
-    torch.testing.assert_close(actual, expected)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("rows", [1, 256, 257])
-def test_gemma4_gelu_and_mul_cuda_matches_reference(dtype, rows):
-    torch.manual_seed(20260813)
-    x = torch.randn(rows, 1408, dtype=dtype, device="cuda")
-    gate, up = x.chunk(2, -1)
-    expected = F.gelu(gate, approximate="tanh") * up
-    actual_input = x.clone()
-    actual = GeluTanhAndMul(
-        TritonGeluTanhAndMulProvider(op_spec=GeluTanhAndMulSpec(dtype))
-    )(actual_input)
-    torch.testing.assert_close(actual, expected, rtol=3e-3, atol=3e-3)
-    assert actual.data_ptr() == actual_input.data_ptr()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

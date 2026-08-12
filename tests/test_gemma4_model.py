@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import pytest
 import torch
+import torch.nn.functional as F
 from transformers import Gemma4TextConfig
 from transformers.models.gemma4.modeling_gemma4 import (
     Gemma4TextMLP as HFGemma4MLP,
@@ -31,7 +32,15 @@ from sparsevllm.models.gemma4 import (
     Gemma4Router,
 )
 from sparsevllm.models.layout import RuntimeLayout
-from sparsevllm.operators.activation import TorchGeluTanhAndMulProvider
+from sparsevllm.operators.gemma4 import (
+    TorchGemma4OperatorProvider,
+    TritonGemma4OperatorProvider,
+)
+from sparsevllm.operators.gemma4_moe import (
+    GEMMA4_MOE_REGISTRY,
+    TorchGemma4MoeProvider,
+    TritonGemma4MoeProvider,
+)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -60,6 +69,25 @@ def test_gemma4_router_kernels_match_torch():
     )
     assert torch.equal(actual_ids, expected_ids)
     torch.testing.assert_close(actual_weights, expected_weights, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("rows", [1, 256, 257])
+def test_gemma4_provider_gelu_tanh_and_mul_matches_torch(dtype, rows):
+    torch.manual_seed(20260813)
+    x = torch.randn(rows, 1408, dtype=dtype, device="cuda")
+    gate, up = x.chunk(2, -1)
+    expected = F.gelu(gate, approximate="tanh") * up
+    actual_input = x.clone()
+    actual = TritonGemma4OperatorProvider().gelu_tanh_and_mul(actual_input)
+    torch.testing.assert_close(actual, expected, rtol=3e-3, atol=3e-3)
+    assert actual.data_ptr() == actual_input.data_ptr()
+
+
+def test_gemma4_moe_torch_oracle_is_not_a_production_fallback():
+    assert GEMMA4_MOE_REGISTRY.providers == (TritonGemma4MoeProvider,)
+    assert TorchGemma4MoeProvider not in GEMMA4_MOE_REGISTRY.providers
 
 
 def _parallel_context() -> ParallelContext:
@@ -128,7 +156,7 @@ def test_gemma4_rope_matches_transformers_for_both_layer_types():
 def test_gemma4_dense_mlp_matches_transformers():
     config = _config()
     with _patch_parallel_context():
-        actual = Gemma4MLP(config, 0, TorchGeluTanhAndMulProvider())
+        actual = Gemma4MLP(config, 0, TorchGemma4OperatorProvider())
     reference = HFGemma4MLP(config, 0)
     torch.manual_seed(3)
     for parameter in reference.parameters():
@@ -151,7 +179,7 @@ def test_gemma4_router_matches_transformers():
         enable_moe_block=True, num_experts=4, top_k_experts=2, moe_intermediate_size=4
     )
     with _patch_parallel_context():
-        actual = Gemma4Router(config)
+        actual = Gemma4Router(config, TorchGemma4OperatorProvider())
     reference = HFGemma4Router(config)
     torch.manual_seed(5)
     reference.proj.weight.data.normal_(0, 0.2)
@@ -172,6 +200,7 @@ def test_gemma4_k_eq_v_loader_duplicates_normalized_projection_slot():
             config,
             1,
             Gemma4RotaryEmbedding(config, "full_attention", config.global_head_dim),
+            TorchGemma4OperatorProvider(),
         )
     loaded_key = torch.randn(
         config.num_global_key_value_heads * config.global_head_dim, config.hidden_size
@@ -190,7 +219,7 @@ def test_gemma4_ple_matches_transformers():
         vocab_size_per_layer_input=32,
     )
     with _patch_parallel_context():
-        actual = Gemma4Model(config, TorchGeluTanhAndMulProvider())
+        actual = Gemma4Model(config, TorchGemma4OperatorProvider())
     reference = HFGemma4Model(config)
     torch.manual_seed(11)
     for parameter in reference.parameters():
@@ -260,6 +289,7 @@ def test_gemma4_shared_kv_attention_only_allocates_query_projection():
             config,
             2,
             Gemma4RotaryEmbedding(config, "sliding_attention", config.head_dim),
+            TorchGemma4OperatorProvider(),
         )
     assert attention.is_kv_shared_layer
     assert tuple(attention.qkv_proj.weight.shape) == (

@@ -4,17 +4,48 @@ import torch
 import torch.nn.functional as F
 
 from sparsevllm import platforms
-from sparsevllm.operators.moe import MoeOpSpec, MoeProvider
+from sparsevllm.distributed import get_parallel_context
+from sparsevllm.layers.packed_moe import PackedMoeExperts
+from sparsevllm.operators.moe import MoeOpSpec, MoeProvider, model_activation_dtype
 from sparsevllm.operators.registry import OpRegistry, OpResolver, SupportResult
 from sparsevllm.platforms.interface import DeviceCaps, PlatformEnum
 
-GEMMA4_MOE_REGISTRY: OpRegistry[MoeOpSpec, MoeProvider] = OpRegistry(
+
+class Gemma4MoeProvider(MoeProvider):
+    def load_packed_projection(
+        self,
+        spec: MoeOpSpec,
+        *,
+        projection: str,
+        loaded_weight: torch.Tensor,
+        tp_rank: int,
+        tp_size: int,
+        local_expert_start: int,
+        local_expert_end: int,
+        w13_weight: torch.Tensor,
+        w2_weight: torch.Tensor,
+    ) -> tuple[str, ...]:
+        if loaded_weight.shape[0] == spec.num_experts:
+            loaded_weight = loaded_weight[local_expert_start:local_expert_end]
+        if projection == "gate_up_proj":
+            gate, up = loaded_weight.chunk(2, 1)
+            gate = gate.chunk(tp_size, 1)[tp_rank]
+            up = up.chunk(tp_size, 1)[tp_rank]
+            w13_weight.copy_(torch.cat((gate, up), 1))
+            return "gate_proj", "up_proj"
+        if projection == "down_proj":
+            w2_weight.copy_(loaded_weight.chunk(tp_size, 2)[tp_rank])
+            return ("down_proj",)
+        raise ValueError(f"Unsupported Gemma 4 projection {projection!r}.")
+
+
+GEMMA4_MOE_REGISTRY: OpRegistry[MoeOpSpec, Gemma4MoeProvider] = OpRegistry(
     "Gemma 4 routed GEGLU MoE"
 )
 
 
 @GEMMA4_MOE_REGISTRY.register
-class TritonGemma4MoeProvider(MoeProvider):
+class TritonGemma4MoeProvider(Gemma4MoeProvider):
     name = "triton_gemma4_geglu"
     priority = 10
     gate_up_order = "gate_up"
@@ -65,8 +96,9 @@ class TritonGemma4MoeProvider(MoeProvider):
         )
 
 
-@GEMMA4_MOE_REGISTRY.register
-class TorchGemma4MoeProvider(MoeProvider):
+class TorchGemma4MoeProvider(Gemma4MoeProvider):
+    """Explicit correctness oracle; never selected for production inference."""
+
     name = "torch_gemma4_geglu"
     priority = 0
 
@@ -118,7 +150,7 @@ def resolve_gemma4_moe_provider(
     spec: MoeOpSpec,
     *,
     device_index: int | None = None,
-) -> MoeProvider:
+) -> Gemma4MoeProvider:
     if spec.activation != "gelu_tanh":
         raise ValueError(
             "Gemma 4 MoE resolver requires activation='gelu_tanh', "
@@ -131,8 +163,64 @@ def resolve_gemma4_moe_provider(
     return OpResolver(GEMMA4_MOE_REGISTRY).resolve(spec, caps).provider
 
 
+class Gemma4PackedExperts(PackedMoeExperts):
+    def __init__(self, config) -> None:
+        super().__init__(
+            num_experts=config.num_experts,
+            hidden_size=config.hidden_size,
+            intermediate_size=config.moe_intermediate_size,
+            top_k=config.top_k_experts,
+            activation_dtype=model_activation_dtype(config),
+            fp8_enabled=False,
+            cuda_graph=bool(getattr(config, "decode_cuda_graph", False)),
+            activation="gelu_tanh",
+            model_label="Gemma4MoE",
+            provider_resolver=resolve_gemma4_moe_provider,
+            parallel_context=get_parallel_context(),
+        )
+
+    def rank_local_weight_slice(
+        self,
+        source_shape: tuple[int, ...],
+        *,
+        loaded_shard_id: str,
+        is_scale: bool = False,
+    ) -> tuple[slice, ...] | None:
+        if is_scale:
+            raise ValueError("Gemma 4 BF16 experts do not use weight scales.")
+        if len(source_shape) != 3 or int(source_shape[0]) != self.num_experts:
+            raise ValueError(f"Invalid Gemma 4 packed expert shape {source_shape}.")
+        if self.ep_size == 1:
+            return None
+        return (
+            slice(self.local_expert_start, self.local_expert_end),
+            slice(None),
+            slice(None),
+        )
+
+    def load_packed_weight(self, projection: str, loaded_weight: torch.Tensor) -> None:
+        projections = self.provider.load_packed_projection(
+            self.op_spec,
+            projection=projection,
+            loaded_weight=loaded_weight,
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
+            local_expert_start=self.local_expert_start,
+            local_expert_end=self.local_expert_end,
+            w13_weight=self.w13_weight.data,
+            w2_weight=self.w2_weight.data,
+        )
+        self._loaded_expert_shards.update(
+            (expert_id, name)
+            for expert_id in range(self.local_expert_start, self.local_expert_end)
+            for name in projections
+        )
+
+
 __all__ = [
     "GEMMA4_MOE_REGISTRY",
+    "Gemma4MoeProvider",
+    "Gemma4PackedExperts",
     "TorchGemma4MoeProvider",
     "TritonGemma4MoeProvider",
     "resolve_gemma4_moe_provider",
