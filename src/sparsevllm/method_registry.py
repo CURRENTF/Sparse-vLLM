@@ -59,8 +59,6 @@ PREFIX_CACHE_SUPPORTED_METHODS = {
     "skipkv",
 }
 
-H2O_SUPPORTED_MODEL_TYPES = frozenset(MODEL_SPECS)
-
 SKIPKV_ASSET_MODEL_NAMES = frozenset(
     {
         "DeepSeek-R1-Distill-Llama-8B",
@@ -117,6 +115,13 @@ QWEN35_MOE_COMPATIBILITY = ModelRuntimeCompatibility(
     ),
 )
 
+DEEPSEEK_V4_DPA_EP_COMPATIBILITY = ModelRuntimeCompatibility(
+    sparse_methods=frozenset({""}),
+    prefix_cache_methods=frozenset(),
+    requires_eager=False,
+    decode_cuda_graph_methods=frozenset({""}),
+)
+
 MINIMAX_M2_EP_COMPATIBILITY = ModelRuntimeCompatibility(
     sparse_methods=_MOE_SPARSE_METHODS,
     prefix_cache_methods=frozenset({"", "omnikv", "quest"}),
@@ -142,7 +147,14 @@ MODEL_RUNTIME_COMPATIBILITY = {
     ("qwen3_5_moe", ParallelMode.OUTER_TP_MOE): QWEN35_MOE_COMPATIBILITY,
     ("minimax_m2", ParallelMode.STANDARD): MINIMAX_M2_EP_COMPATIBILITY,
     ("minimax_m2", ParallelMode.OUTER_TP_MOE): MINIMAX_M2_TP_EP_COMPATIBILITY,
+    ("deepseek_v4", ParallelMode.DPA_EP): DEEPSEEK_V4_DPA_EP_COMPATIBILITY,
 }
+
+H2O_SUPPORTED_MODEL_TYPES = frozenset(
+    model_type
+    for (model_type, _parallel_mode), compatibility in MODEL_RUNTIME_COMPATIBILITY.items()
+    if "h2o" in compatibility.sparse_methods
+)
 
 # All shipped cache managers now expose a graph-stable decode preparation path.
 DECODE_CUDA_GRAPH_SUPPORTED_METHODS = set(CANONICAL_SPARSE_METHODS)

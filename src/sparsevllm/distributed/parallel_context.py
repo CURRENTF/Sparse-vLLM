@@ -129,6 +129,41 @@ class ParallelContext:
     ) -> torch.Tensor:
         return self._all_reduce(tensor, self.expert, op)
 
+    def ep_all_gather_into_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
+        if self.ep_size == 1:
+            return tensor
+        output = torch.empty(
+            (self.ep_size * tensor.shape[0], *tensor.shape[1:]),
+            dtype=tensor.dtype,
+            device=tensor.device,
+        )
+        dist.all_gather_into_tensor(
+            output,
+            tensor.contiguous(),
+            group=self.expert.process_group,
+        )
+        return output
+
+    def ep_reduce_scatter_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
+        if self.ep_size == 1:
+            return tensor
+        if tensor.shape[0] % self.ep_size:
+            raise ValueError(
+                "EP reduce-scatter requires dim 0 divisible by EP size: "
+                f"{tensor.shape[0]} % {self.ep_size}."
+            )
+        output = torch.empty(
+            (tensor.shape[0] // self.ep_size, *tensor.shape[1:]),
+            dtype=tensor.dtype,
+            device=tensor.device,
+        )
+        dist.reduce_scatter_tensor(
+            output,
+            tensor.contiguous(),
+            group=self.expert.process_group,
+        )
+        return output
+
     def moe_tp_all_reduce(
         self,
         tensor: torch.Tensor,

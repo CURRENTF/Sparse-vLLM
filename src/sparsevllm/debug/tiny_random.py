@@ -22,6 +22,17 @@ SUPPORTED_OVERRIDES = frozenset(
         "num_hidden_layers",
         "num_key_value_heads",
         "vocab_size",
+        "q_lora_rank",
+        "o_lora_rank",
+        "o_groups",
+        "index_n_heads",
+        "index_head_dim",
+        "index_topk",
+        "num_local_experts",
+        "n_routed_experts",
+        "num_experts_per_tok",
+        "hc_mult",
+        "sliding_window",
     }
 )
 
@@ -106,21 +117,29 @@ def apply_tiny_random_overrides(hf_config: Any, path: str) -> dict[str, int]:
                 f"{overrides[name]} > {original_values[name]}."
             )
 
-    layer_types = getattr(hf_config, "layer_types", None)
-    if layer_types is not None:
+    for field_name in ("layer_types", "mlp_layer_types", "compress_ratios"):
+        layer_types = getattr(hf_config, field_name, None)
+        if layer_types is None:
+            continue
         num_layers = int(hf_config.num_hidden_layers)
         if len(layer_types) < num_layers:
             raise ValueError(
-                "Tiny random config cannot expand layer_types: "
+                f"Tiny random config cannot expand {field_name}: "
                 f"requested={num_layers}, available={len(layer_types)}."
             )
-        hf_config.layer_types = list(layer_types[:num_layers])
+        setattr(hf_config, field_name, list(layer_types[:num_layers]))
 
     hidden_size = int(hf_config.hidden_size)
     num_heads = int(hf_config.num_attention_heads)
     num_kv_heads = int(hf_config.num_key_value_heads)
     head_dim = int(getattr(hf_config, "head_dim", hidden_size // num_heads))
-    if hidden_size != num_heads * head_dim:
+    if getattr(hf_config, "model_type", "") == "deepseek_v4":
+        partial_rotary_factor = int(hf_config.qk_rope_head_dim) / head_dim
+        hf_config.partial_rotary_factor = partial_rotary_factor
+        for rope_parameters in getattr(hf_config, "rope_parameters", {}).values():
+            if isinstance(rope_parameters, dict):
+                rope_parameters["partial_rotary_factor"] = partial_rotary_factor
+    if getattr(hf_config, "model_type", "") != "deepseek_v4" and hidden_size != num_heads * head_dim:
         raise ValueError(
             "Tiny random config requires hidden_size == num_attention_heads * head_dim, "
             f"got {hidden_size} != {num_heads} * {head_dim}."
@@ -172,6 +191,7 @@ def initialize_sparse_model(
     from sparsevllm.utils.loader import (
         _target_weight_name_for_model,
         default_weight_loader,
+        get_parameter_or_buffer,
     )
 
     reference = build_tiny_random_hf_model(hf_config, seed=seed)
@@ -204,7 +224,7 @@ def initialize_sparse_model(
                     loaded_count += 1
                     break
             else:
-                param = model.get_parameter(param_name)
+                param = get_parameter_or_buffer(model, param_name)
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
                 loaded_parameter_names.add(param_name)

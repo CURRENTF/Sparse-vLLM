@@ -20,6 +20,7 @@ from sparsevllm.operators.gate_up_swiglu import (
 )
 from sparsevllm.operators.moe import (
     MOE_REGISTRY,
+    FlashInferCutlassFp4MoeProvider,
     FlashInferCutlassFp8MoeProvider,
     HopperQwen36HybridFp8MoeProvider,
     MoeOpSpec,
@@ -77,6 +78,7 @@ def _moe_spec(
     routing_method="softmax",
     scale_dtype=None,
     cuda_graph=True,
+    activation_limit=None,
 ) -> MoeOpSpec:
     return MoeOpSpec(
         num_experts=num_experts,
@@ -92,6 +94,7 @@ def _moe_spec(
         tp_size=tp_size,
         routing_method=routing_method,
         scale_dtype=scale_dtype,
+        activation_limit=activation_limit,
     )
 
 
@@ -637,6 +640,60 @@ def test_fp8_moe_prefers_flashinfer_only_on_sm90():
 
     assert hopper.provider.name == "flashinfer_cutlass_fp8_sm90"
     assert blackwell.provider.name == "triton"
+
+
+def test_fp4_moe_prefers_flashinfer_on_sm90():
+    spec = _moe_spec(
+        hidden_size=4096,
+        intermediate_size=2048,
+        num_experts=256,
+        num_local_experts=64,
+        top_k=6,
+        ep_size=4,
+        weight_dtype=torch.uint8,
+        scale_dtype=torch.uint8,
+        block_shape=(1, 32),
+        activation_limit=10.0,
+    )
+    with patch("sparsevllm.operators.moe.find_spec", return_value=object()):
+        resolved = OpResolver(MOE_REGISTRY).resolve(spec, _cuda_caps((9, 0)))
+
+    assert resolved.provider.name == "flashinfer_cutlass_fp4_sm90"
+
+
+def test_fp4_moe_loader_preserves_packed_bytes():
+    provider = FlashInferCutlassFp4MoeProvider()
+    spec = _moe_spec(
+        hidden_size=256,
+        intermediate_size=128,
+        weight_dtype=torch.uint8,
+        scale_dtype=torch.uint8,
+        block_shape=(1, 32),
+        activation_limit=10.0,
+    )
+    w13 = torch.zeros(4, 256, 128, dtype=torch.uint8)
+    w2 = torch.zeros(4, 256, 64, dtype=torch.uint8)
+    s13 = torch.zeros(4, 256, 8, dtype=torch.uint8)
+    s2 = torch.zeros(4, 256, 4, dtype=torch.uint8)
+    weight_bits = torch.arange(128 * 128, dtype=torch.int64).to(torch.uint8)
+    weight_bits = weight_bits.view(128, 128)
+    scale_bits = torch.arange(128 * 8, dtype=torch.int64).to(torch.uint8)
+    scale_bits = scale_bits.view(128, 8)
+
+    provider.load_expert_projection(
+        spec,
+        local_expert_id=1,
+        projection="up",
+        loaded_weight=weight_bits.view(torch.int8),
+        loaded_scale=scale_bits.view(torch.float8_e8m0fnu),
+        w13_weight=w13,
+        w2_weight=w2,
+        w13_scale_inv=s13,
+        w2_scale_inv=s2,
+    )
+
+    assert torch.equal(w13[1, :128], weight_bits)
+    assert torch.equal(s13[1, :128], scale_bits)
 
 
 def test_qwen36_hybrid_moe_uses_profiled_graph_shape_on_h100():

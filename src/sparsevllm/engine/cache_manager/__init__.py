@@ -20,6 +20,7 @@ __all__ = [
     "DeltaKVCacheTritonManagerV4",
     "DeltaKVLessMemoryCacheManager",
     "DeltaKVLessMemoryCudaGraphCacheManager",
+    "DeepseekV4CacheManager",
 ]
 
 
@@ -72,5 +73,9 @@ def __getattr__(name: str):
         from .deltakv_less_memory_cuda_graph import DeltaKVLessMemoryCudaGraphCacheManager
 
         return DeltaKVLessMemoryCudaGraphCacheManager
+    if name == "DeepseekV4CacheManager":
+        from .deepseek_v4 import DeepseekV4CacheManager
+
+        return DeepseekV4CacheManager
 
     raise AttributeError(name)

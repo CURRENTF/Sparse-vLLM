@@ -59,6 +59,11 @@ try:
 except ImportError:
     Qwen35MoeForCausalLM = None
 
+try:
+    from sparsevllm.models.deepseek_v4 import DeepseekV4ForCausalLM
+except ImportError:
+    DeepseekV4ForCausalLM = None
+
 
 def _create_model(hf_config, model_spec: ModelSpec):
     class_name = model_spec.runtime_class_name
@@ -159,6 +164,11 @@ class ModelRunner:
             hf_config,
             "decode_cuda_graph",
             bool(getattr(config, "decode_cuda_graph", False)),
+        )
+        setattr(
+            hf_config,
+            "sparsevllm_tiny_random",
+            bool(getattr(config, "tiny_random", False)),
         )
         
         self.model = _create_model(hf_config, config.model_spec)
@@ -1022,6 +1032,8 @@ class ModelRunner:
         )
 
     def _auto_capture_greedy_sampling(self, seqs: list[Sequence]) -> bool:
+        if self._uses_dpa_ep() and self.parallel_context.dp_size > 1:
+            return False
         if any(self._has_sampling_penalty(seq) for seq in seqs):
             return False
         if self.config.decode_cuda_graph_capture_sampling:
@@ -1037,6 +1049,71 @@ class ModelRunner:
             and seq.temperature <= 1e-10
             for seq in seqs
         )
+
+    def _uses_dpa_ep(self) -> bool:
+        topology = getattr(self.config, "parallel_topology", None)
+        return bool(
+            getattr(
+                topology,
+                "is_dpa_ep",
+                getattr(self.config, "uses_dpa_ep_layout", False),
+            )
+        )
+
+    def _deepseek_v4_decode_partition(
+        self,
+        seqs: list[Sequence],
+    ) -> tuple[list[Sequence], int]:
+        """Use stable DPA owners while keeping one graph shape on every rank."""
+        dp_size = int(self.parallel_context.dp_size)
+        dp_rank = int(self.parallel_context.dp_rank)
+        if dp_size == 1:
+            return list(seqs), len(seqs)
+        owner_counts = [0] * dp_size
+        for seq in seqs:
+            owner_counts[int(seq.seq_id) % dp_size] += 1
+        target = max(owner_counts)
+        owned = [seq for seq in seqs if int(seq.seq_id) % dp_size == dp_rank]
+        if len(owned) == target:
+            return owned, len(owned)
+        fillers = [seq for seq in seqs if int(seq.seq_id) % dp_size != dp_rank]
+        needed = target - len(owned)
+        if len(fillers) < needed:
+            raise RuntimeError(
+                "DeepSeek V4 DPA could not balance decode ranks: "
+                f"rank={dp_rank} owned={len(owned)} target={target} "
+                f"fillers={len(fillers)}."
+            )
+        return owned + fillers[:needed], len(owned)
+
+    def _gather_deepseek_v4_logits(
+        self,
+        local_logits: torch.Tensor,
+        seqs: list[Sequence],
+        local_owned: int,
+    ) -> torch.Tensor | None:
+        dp_size = int(self.parallel_context.dp_size)
+        if dp_size == 1:
+            return local_logits
+        target = int(local_logits.shape[0])
+        if local_owned > target:
+            raise RuntimeError(
+                f"DeepSeek V4 local owned batch {local_owned} exceeds "
+                f"padded batch {target}."
+            )
+        owned_logits = torch.zeros_like(local_logits)
+        owned_logits[:local_owned].copy_(local_logits[:local_owned])
+        gathered = self.parallel_context.ep_all_gather_into_tensor(owned_logits)
+        if self.rank != 0:
+            return None
+        gathered = gathered.view(dp_size, target, -1)
+        owner_offsets = [0] * dp_size
+        ordered = []
+        for seq in seqs:
+            owner = int(seq.seq_id) % dp_size
+            ordered.append(gathered[owner, owner_offsets[owner]])
+            owner_offsets[owner] += 1
+        return torch.stack(ordered, dim=0)
 
     @staticmethod
     def _has_sampling_penalty(seq: Sequence) -> bool:
@@ -1233,28 +1310,48 @@ class ModelRunner:
         with profiler.record(name):
             if not is_prefill:
                 try:
+                    global_seqs = seqs
+                    run_seqs, local_owned = (
+                        self._deepseek_v4_decode_partition(seqs)
+                        if self._uses_dpa_ep()
+                        else (seqs, len(seqs))
+                    )
                     if self.config.decode_cuda_graph:
                         logits, graph_token_ids = self.decode_cuda_graph_runner.run(
-                            seqs,
-                            capture_sampling=self._auto_capture_greedy_sampling(seqs),
+                            run_seqs,
+                            capture_sampling=self._auto_capture_greedy_sampling(run_seqs),
                         )
                     else:
-                        logits = self.decode_cuda_graph_runner.run_eager_static(seqs)
+                        logits = self.decode_cuda_graph_runner.run_eager_static(run_seqs)
+                        graph_token_ids = None
+                    if self._uses_dpa_ep():
+                        logits = self._gather_deepseek_v4_logits(
+                            logits,
+                            global_seqs,
+                            local_owned,
+                        )
                         graph_token_ids = None
                     if self.rank != 0:
-                        self._post_sparse_forward(seqs, is_prefill)
+                        self._post_sparse_forward(run_seqs, is_prefill)
                         return None, None
-                    self._post_sparse_forward(seqs, is_prefill)
+                    self._post_sparse_forward(run_seqs, is_prefill)
                     with profiler.record("model_sampler"):
-                        sampling_logits = self._apply_sampling_penalties(logits, seqs)
+                        sampling_logits = self._apply_sampling_penalties(
+                            logits,
+                            global_seqs,
+                        )
                         token_ids = self._sample_model_outputs(
                             sampling_logits,
-                            seqs,
+                            global_seqs,
                             graph_token_ids=graph_token_ids,
                         )
                     logprob_outputs = self._mask_recompute_logprobs(
-                        seqs,
-                        self._collect_logprobs(sampling_logits, token_ids, seqs),
+                        global_seqs,
+                        self._collect_logprobs(
+                            sampling_logits,
+                            token_ids,
+                            global_seqs,
+                        ),
                     )
                     return token_ids, logprob_outputs
                 finally:

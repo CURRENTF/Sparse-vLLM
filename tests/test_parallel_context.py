@@ -116,12 +116,24 @@ def test_hybrid_moe_groups_split_outer_attention_world():
     }
 
 
+def test_dpa_ep_groups_overlap_data_and_expert_worlds():
+    topology = ParallelTopology(1, 4, 4, ParallelMode.DPA_EP)
+    assert parallel_group_ranks(topology) == {
+        "tensor": ((0,), (1,), (2,), (3,)),
+        "moe_tensor": ((0,), (1,), (2,), (3,)),
+        "expert": ((0, 1, 2, 3),),
+        "data": ((0, 1, 2, 3),),
+    }
+
+
 def test_parallel_topology_resolves_rank_local_sizes():
     standard = ParallelTopology(2, 4, 1)
     hybrid = ParallelTopology(4, 2, 1, ParallelMode.OUTER_TP_MOE)
+    dpa = ParallelTopology(1, 4, 4, ParallelMode.DPA_EP)
 
     assert (standard.world_size, standard.attention_tp_size, standard.moe_tp_size) == (8, 2, 2)
     assert (hybrid.world_size, hybrid.attention_tp_size, hybrid.moe_tp_size) == (4, 4, 2)
+    assert (dpa.world_size, dpa.attention_tp_size, dpa.moe_tp_size) == (4, 1, 1)
 
 
 @pytest.mark.parametrize(
@@ -130,6 +142,8 @@ def test_parallel_topology_resolves_rank_local_sizes():
         (0, 1, 1, ParallelMode.STANDARD),
         (4, 3, 1, ParallelMode.OUTER_TP_MOE),
         (4, 2, 2, ParallelMode.OUTER_TP_MOE),
+        (2, 2, 2, ParallelMode.DPA_EP),
+        (1, 2, 3, ParallelMode.DPA_EP),
     ],
 )
 def test_parallel_topology_rejects_invalid_sizes(topology):
@@ -141,10 +155,10 @@ def test_hybrid_moe_parallel_context_uses_explicit_groups():
     reset_parallel_context()
     with (
         patch.object(dist, "is_initialized", return_value=True),
-            patch.object(dist, "get_world_size", return_value=4),
-            patch.object(dist, "get_rank", return_value=2),
-            patch.object(dist, "get_backend", return_value=dist.Backend.GLOO),
-            patch.object(dist, "new_group", side_effect=lambda _ranks: object()),
+        patch.object(dist, "get_world_size", return_value=4),
+        patch.object(dist, "get_rank", return_value=2),
+        patch.object(dist, "get_backend", return_value=dist.Backend.GLOO),
+        patch.object(dist, "new_group", side_effect=lambda _ranks: object()),
     ):
         context = init_parallel_context(
             topology=ParallelTopology(4, 2, 1, ParallelMode.OUTER_TP_MOE),
@@ -155,6 +169,27 @@ def test_hybrid_moe_parallel_context_uses_explicit_groups():
     assert context.moe_tp_rank == 0
     assert context.expert.ranks == (0, 2)
     assert context.ep_rank == 1
+    reset_parallel_context()
+
+
+def test_dpa_ep_parallel_context_uses_overlapping_groups():
+    reset_parallel_context()
+    with (
+        patch.object(dist, "is_initialized", return_value=True),
+        patch.object(dist, "get_world_size", return_value=4),
+        patch.object(dist, "get_rank", return_value=2),
+        patch.object(dist, "get_backend", return_value=dist.Backend.GLOO),
+        patch.object(dist, "new_group", side_effect=lambda _ranks: object()),
+    ):
+        context = init_parallel_context(
+            topology=ParallelTopology(1, 4, 4, ParallelMode.DPA_EP),
+        )
+    assert context.attention.ranks == (2,)
+    assert context.expert.ranks == (0, 1, 2, 3)
+    assert context.data.ranks == (0, 1, 2, 3)
+    assert context.moe_tensor.ranks == (2,)
+    assert context.tp_rank == context.moe_tp_rank == 0
+    assert context.dp_rank == context.ep_rank == 2
     reset_parallel_context()
 
 

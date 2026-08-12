@@ -19,6 +19,16 @@ def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
     param.data.copy_(loaded_weight)
 
 
+def get_parameter_or_buffer(model: nn.Module, name: str) -> torch.Tensor:
+    try:
+        return model.get_parameter(name)
+    except AttributeError as parameter_error:
+        try:
+            return model.get_buffer(name)
+        except AttributeError:
+            raise parameter_error
+
+
 @dataclass(frozen=True)
 class TensorMetadata:
     shape: tuple[int, ...]
@@ -70,12 +80,10 @@ def _rank_local_slice_for_tensor(
     source_weight_name: str,
     source_shape: tuple[int, ...],
 ) -> tuple[slice, ...] | None:
-    is_scale = source_weight_name.endswith(".weight_scale_inv")
-    source_parameter_name = (
-        source_weight_name[: -len(".weight_scale_inv")] + ".weight"
-        if is_scale
-        else source_weight_name
-    )
+    source_parameter_name = _weight_key_for_scale_key(model, source_weight_name)
+    is_scale = source_parameter_name is not None
+    if source_parameter_name is None:
+        source_parameter_name = source_weight_name
     target_parameter_name = _target_weight_name_for_model(
         model, source_parameter_name
     )
@@ -112,12 +120,7 @@ def _read_safetensors_shard(
                 tensors[key] = handle.get_tensor(key)
                 continue
 
-            is_scale = key.endswith(".weight_scale_inv")
-            source_parameter_name = (
-                key[: -len(".weight_scale_inv")] + ".weight"
-                if is_scale
-                else key
-            )
+            source_parameter_name = _weight_key_for_scale_key(model, key) or key
             if _target_weight_name_for_model(model, source_parameter_name) is None:
                 continue
             rank_slice = _rank_local_slice_for_tensor(
@@ -175,10 +178,36 @@ def _module_for_parameter(model: nn.Module, param_name: str) -> nn.Module:
     return model.get_submodule(module_name)
 
 
-def _scale_key_for_weight_key(weight_key: str) -> str:
+def _scale_key_for_weight_key(model: nn.Module, weight_key: str) -> str:
     if not weight_key.endswith(".weight"):
         raise ValueError(f"Expected a weight key ending in '.weight', got {weight_key!r}.")
+    resolver = getattr(model, "scale_key_for_weight", None)
+    if callable(resolver):
+        scale_key = resolver(weight_key)
+        if scale_key is not None:
+            if not isinstance(scale_key, str):
+                raise TypeError(
+                    "scale_key_for_weight() must return str or None, "
+                    f"got {type(scale_key).__name__}."
+                )
+            return scale_key
     return weight_key[: -len(".weight")] + ".weight_scale_inv"
+
+
+def _weight_key_for_scale_key(model: nn.Module, scale_key: str) -> str | None:
+    resolver = getattr(model, "weight_key_for_scale", None)
+    if callable(resolver):
+        weight_key = resolver(scale_key)
+        if weight_key is not None and not isinstance(weight_key, str):
+            raise TypeError(
+                "weight_key_for_scale() must return str or None, "
+                f"got {type(weight_key).__name__}."
+            )
+        if weight_key is not None:
+            return weight_key
+    if scale_key.endswith(".weight_scale_inv"):
+        return scale_key[: -len(".weight_scale_inv")] + ".weight"
+    return None
 
 
 def _target_weight_name_for_model(model: nn.Module, source_weight_name: str) -> str | None:
@@ -696,14 +725,18 @@ def load_model(
                     f"{duplicate_source_keys[:5]}."
                 )
             seen_source_keys.update(keys)
-            scale_keys = {key for key in keys if key.endswith(".weight_scale_inv")}
+            scale_keys = {
+                _scale_key_for_weight_key(model, key)
+                for key in keys
+                if key.endswith(".weight")
+            }.intersection(keys)
             consumed_scale_keys: set[str] = set()
             for source_weight_name in keys:
-                if source_weight_name.endswith(".weight_scale_inv"):
+                if source_weight_name in scale_keys:
                     continue
                 scale_key = None
                 if source_weight_name.endswith(".weight"):
-                    scale_key = _scale_key_for_weight_key(source_weight_name)
+                    scale_key = _scale_key_for_weight_key(model, source_weight_name)
                 param_name = _target_weight_name_for_model(model, source_weight_name)
                 if param_name is None:
                     skipped_weight_hook = getattr(model, "record_skipped_weight", None)
@@ -778,7 +811,7 @@ def load_model(
                     module = _module_for_parameter(model, param_name)
                     loaded_scale = None
                     if source_weight_name.endswith(".weight"):
-                        scale_key = _scale_key_for_weight_key(source_weight_name)
+                        scale_key = _scale_key_for_weight_key(model, source_weight_name)
                         loaded_scale = tensors.get(scale_key)
                     if loaded_scale is not None:
                         consumed_scale_keys.add(scale_key)
@@ -793,7 +826,7 @@ def load_model(
                         loaded_parameter_names.add(param_name)
                         loaded_count += 1
                         continue
-                    param = model.get_parameter(param_name)
+                    param = get_parameter_or_buffer(model, param_name)
                     weight_loader = getattr(param, "weight_loader", default_weight_loader)
                     weight_loader(param, tensors[source_weight_name])
                     loaded_parameter_names.add(param_name)

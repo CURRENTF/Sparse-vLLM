@@ -268,6 +268,22 @@ class CacheManager(ABC):
         sparse_method = normalize_sparse_method(config.vllm_sparse_method)
         if sparse_method not in SUPPORTED_SPARSE_METHODS:
             raise ValueError(f"Unsupported vllm_sparse_method={sparse_method!r}.")
+        cache_manager_class_name = str(
+            getattr(
+                getattr(config, "model_spec", None),
+                "cache_manager_class_name",
+                "",
+            )
+            or ""
+        )
+        if cache_manager_class_name:
+            from importlib import import_module
+
+            cache_manager_class = getattr(
+                import_module("sparsevllm.engine.cache_manager"),
+                cache_manager_class_name,
+            )
+            return cache_manager_class(config, parallel_context)
         if sparse_method == "deltakv":
             from .deltakv_runtime import DeltaKVCacheManager
 

@@ -30,6 +30,7 @@ class MoeOpSpec:
     tp_size: int = 1
     routing_method: str = "softmax"
     scale_dtype: torch.dtype | None = None
+    activation_limit: float | None = None
 
     def __post_init__(self) -> None:
         if self.num_experts <= 0 or self.num_local_experts <= 0:
@@ -344,6 +345,161 @@ class FlashInferCutlassFp8MoeProvider(MoeProvider):
             ep_rank=int(ep_rank),
             output=output,
             use_deepseek_fp8_block_scale=True,
+            use_fused_finalize=False,
+            enable_pdl=False,
+            activation_type=ActivationType.Swiglu,
+        )
+        return output
+
+
+@MOE_REGISTRY.register
+class FlashInferCutlassFp4MoeProvider(MoeProvider):
+    """Hopper W4A16 MoE for DeepSeek V4's packed MXFP4 experts."""
+
+    name = "flashinfer_cutlass_fp4_sm90"
+    priority = 105
+    gate_up_order = "up_gate"
+
+    @classmethod
+    def supports(cls, spec: MoeOpSpec, caps: DeviceCaps) -> SupportResult:
+        if spec.tp_size != 1:
+            return SupportResult.no("does not support tensor-parallel expert shards")
+        if spec.weight_dtype != torch.uint8:
+            return SupportResult.no(f"requires packed FP4 uint8 weights, got {spec.weight_dtype}")
+        if spec.scale_dtype != torch.uint8:
+            return SupportResult.no(f"requires raw UE8M0 uint8 scales, got {spec.scale_dtype}")
+        if spec.block_shape != (1, 32):
+            return SupportResult.no(f"requires per-row K32 scales, got {spec.block_shape}")
+        if spec.hidden_size % 128 or spec.intermediate_size % 128:
+            return SupportResult.no("FP4 hidden/intermediate sizes must be 128-aligned")
+        if spec.activation_dtype != torch.bfloat16:
+            return SupportResult.no(
+                f"requires BF16 activations, got {spec.activation_dtype}"
+            )
+        if caps.platform != PlatformEnum.CUDA or caps.compute_capability != (9, 0):
+            return SupportResult.no(
+                f"requires CUDA SM90, got {caps.platform.name} {caps.compute_capability}"
+            )
+        if not runtime_version_at_least(caps.runtime_version, (12, 8)):
+            return SupportResult.no(
+                "requires CUDA runtime >= 12.8, "
+                f"got {caps.runtime_version or 'unknown'}"
+            )
+        if find_spec("flashinfer") is None:
+            return SupportResult.no("flashinfer is not installed")
+        return SupportResult.yes()
+
+    def load_expert_projection(
+        self,
+        spec,
+        *,
+        local_expert_id,
+        projection,
+        loaded_weight,
+        loaded_scale,
+        w13_weight,
+        w2_weight,
+        w13_scale_inv,
+        w2_scale_inv,
+    ) -> None:
+        if loaded_scale is None or w13_scale_inv is None or w2_scale_inv is None:
+            raise RuntimeError("DeepSeek V4 FP4 experts require UE8M0 scales.")
+        if projection == "down":
+            weight_target = w2_weight[local_expert_id]
+            scale_target = w2_scale_inv[local_expert_id]
+        elif projection in {"gate", "up"}:
+            offset = self._packed_projection_offset(projection, spec.intermediate_size)
+            weight_target = w13_weight[
+                local_expert_id, offset : offset + spec.intermediate_size
+            ]
+            scale_target = w13_scale_inv[
+                local_expert_id, offset : offset + spec.intermediate_size
+            ]
+        else:
+            raise ValueError(f"Unknown logical MoE projection {projection!r}.")
+        if tuple(loaded_weight.shape) != tuple(weight_target.shape):
+            raise ValueError(
+                "Packed FP4 expert weight shape mismatch: "
+                f"expected={tuple(weight_target.shape)}, got={tuple(loaded_weight.shape)}."
+            )
+        if tuple(loaded_scale.shape) != tuple(scale_target.shape):
+            raise ValueError(
+                "FP4 expert scale shape mismatch: "
+                f"expected={tuple(scale_target.shape)}, got={tuple(loaded_scale.shape)}."
+            )
+        weight_target.copy_(loaded_weight.contiguous().view(torch.uint8))
+        scale_target.copy_(loaded_scale.contiguous().view(torch.uint8))
+
+    @staticmethod
+    def prepare_weights(
+        w13_weight: torch.Tensor,
+        w2_weight: torch.Tensor,
+        w13_scale: torch.Tensor,
+        w2_scale: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        from flashinfer import fused_moe
+
+        return (
+            fused_moe.interleave_moe_weights_for_sm90_mixed_gemm(
+                w13_weight.contiguous(), "fp4"
+            ),
+            fused_moe.interleave_moe_weights_for_sm90_mixed_gemm(
+                w2_weight.contiguous(), "fp4"
+            ),
+            fused_moe.interleave_moe_scales_for_sm90_mixed_gemm(
+                w13_scale.contiguous()
+            ).view(torch.int32),
+            fused_moe.interleave_moe_scales_for_sm90_mixed_gemm(
+                w2_scale.contiguous()
+            ).view(torch.int32),
+        )
+
+    def run(
+        self,
+        spec,
+        hidden_states,
+        topk_ids,
+        topk_weights,
+        w13_weight,
+        w2_weight,
+        w13_scale_inv,
+        w2_scale_inv,
+        *,
+        local_expert_start,
+        ep_rank,
+    ):
+        del local_expert_start
+        if w13_scale_inv is None or w2_scale_inv is None:
+            raise RuntimeError("FlashInfer FP4 MoE requires prepared expert scales.")
+        if w13_scale_inv.dtype != torch.int32 or w2_scale_inv.dtype != torch.int32:
+            raise RuntimeError("FP4 expert weights must be prepared before inference.")
+        from flashinfer.fused_moe import cutlass_fused_moe
+        from flashinfer.tllm_enums import ActivationType
+
+        output = torch.empty_like(hidden_states)
+        activation_limit = float(spec.activation_limit or 0.0)
+        if activation_limit <= 0:
+            raise RuntimeError("DeepSeek V4 FP4 MoE requires a positive activation limit.")
+        alpha = torch.ones(
+            spec.num_local_experts, dtype=torch.float32, device=hidden_states.device
+        )
+        beta = torch.zeros_like(alpha)
+        limit = torch.full_like(alpha, activation_limit)
+        cutlass_fused_moe(
+            hidden_states,
+            topk_ids.to(dtype=torch.int32),
+            topk_weights.to(dtype=torch.float32),
+            w13_weight,
+            w2_weight,
+            hidden_states.dtype,
+            quant_scales=[w13_scale_inv, w2_scale_inv],
+            swiglu_alpha=alpha,
+            swiglu_beta=beta,
+            swiglu_limit=limit,
+            ep_size=int(spec.ep_size),
+            ep_rank=int(ep_rank),
+            output=output,
+            use_w4_group_scaling=True,
             use_fused_finalize=False,
             enable_pdl=False,
             activation_type=ActivationType.Swiglu,

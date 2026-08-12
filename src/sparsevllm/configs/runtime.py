@@ -90,6 +90,10 @@ class Config(
         return self.parallel_topology.is_outer_tp_moe
 
     @property
+    def uses_dpa_ep_layout(self) -> bool:
+        return self.parallel_topology.is_dpa_ep
+
+    @property
     def attention_tensor_parallel_size(self) -> int:
         return self.parallel_topology.attention_tp_size
 

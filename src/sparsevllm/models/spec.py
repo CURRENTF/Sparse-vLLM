@@ -18,24 +18,29 @@ class ModelSpec:
     supports_expert_parallel: bool = False
     supports_outer_tp_moe: bool = False
     supports_data_parallel: bool = False
+    parallel_mode: ParallelMode = ParallelMode.STANDARD
+    tiny_random_unquantized: bool = False
+    skip_checkpoint_validation_in_tiny_random: bool = False
     prefix_cache_block_size_multiple: int | None = None
     deltakv_checkpoint_model_types: frozenset[str] = frozenset()
     runtime_class_name: str = ""
+    cache_manager_class_name: str = ""
     attention_tp_fields: tuple[str, ...] = ()
     num_experts_field: str | None = None
     moe_tp_fields: tuple[str, ...] = ()
     top_k_field: str | None = None
 
     def topology(self, tp_size: int, ep_size: int, dp_size: int) -> ParallelTopology:
+        mode = (
+            ParallelMode.OUTER_TP_MOE
+            if self.supports_outer_tp_moe and int(tp_size) > 1
+            else self.parallel_mode
+        )
         topology = ParallelTopology(
             int(tp_size),
             int(ep_size),
             int(dp_size),
-            (
-                ParallelMode.OUTER_TP_MOE
-                if self.supports_outer_tp_moe and int(tp_size) > 1
-                else ParallelMode.STANDARD
-            ),
+            mode,
         )
         if topology.expert_parallel_size > 1 and not self.supports_expert_parallel:
             raise ValueError(
@@ -157,6 +162,21 @@ MODEL_SPECS.update(
             attention_tp_fields=_MOE_TP_FIELDS,
             num_experts_field="num_local_experts",
             moe_tp_fields=("intermediate_size",),
+            top_k_field="num_experts_per_tok",
+        ),
+        "deepseek_v4": ModelSpec(
+            "DeepSeek V4 Flash",
+            requires_fp8=True,
+            supports_expert_parallel=True,
+            supports_data_parallel=True,
+            parallel_mode=ParallelMode.DPA_EP,
+            tiny_random_unquantized=True,
+            skip_checkpoint_validation_in_tiny_random=True,
+            runtime_class_name="DeepseekV4ForCausalLM",
+            cache_manager_class_name="DeepseekV4CacheManager",
+            attention_tp_fields=("num_attention_heads", "num_key_value_heads"),
+            num_experts_field="n_routed_experts",
+            moe_tp_fields=("moe_intermediate_size",),
             top_k_field="num_experts_per_tok",
         ),
     }

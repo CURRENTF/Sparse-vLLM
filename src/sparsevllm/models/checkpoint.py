@@ -228,6 +228,70 @@ def _validate_minimax(config: Any, raw_quantization_config: Any) -> None:
     )
 
 
+_DEEPSEEK_V4_FLASH_FIXED_FIELDS = {
+    "hidden_size": 4096,
+    "head_dim": 512,
+    "num_attention_heads": 64,
+    "num_key_value_heads": 1,
+    "q_lora_rank": 1024,
+    "o_lora_rank": 1024,
+    "o_groups": 8,
+    "qk_rope_head_dim": 64,
+    "index_n_heads": 64,
+    "index_head_dim": 128,
+    "index_topk": 512,
+    "n_routed_experts": 256,
+    "num_experts_per_tok": 6,
+    "hc_mult": 4,
+    "sliding_window": 128,
+}
+
+
+def _validate_deepseek_v4(config: Any, raw_quantization_config: Any) -> None:
+    _validate_architecture(
+        "DeepSeek V4 Flash", config, "DeepseekV4ForCausalLM"
+    )
+    _validate_bf16(
+        "DeepSeek V4 Flash", config, "BF16 non-quantized parameters"
+    )
+    _validate_fields(
+        "DeepSeek V4 Flash",
+        config,
+        _DEEPSEEK_V4_FLASH_FIXED_FIELDS,
+    )
+    expected_compress_rates = {
+        "compressed_sparse_attention": 4,
+        "heavily_compressed_attention": 128,
+    }
+    if config_get(config, "compress_rates", {}) != expected_compress_rates:
+        raise ValueError(
+            "DeepSeek V4 Flash requires CSA/HCA compression rates 4/128, got "
+            f"{config_get(config, 'compress_rates', {})!r}."
+        )
+    _validate_fields(
+        "DeepSeek V4 Flash",
+        config,
+        {
+            "num_nextn_predict_layers": 1,
+            "expert_dtype": "fp4",
+        },
+    )
+    expected_quantization = {
+        "activation_scheme": "dynamic",
+        "fmt": "e4m3",
+        "quant_method": "fp8",
+        "scale_fmt": "ue8m0",
+        "weight_block_size": [128, 128],
+    }
+    for field, expected in expected_quantization.items():
+        actual = config_get(raw_quantization_config, field, None)
+        if actual != expected:
+            raise ValueError(
+                "DeepSeek V4 Flash quantization_config requires "
+                f"{field}={expected!r}, got {actual!r}."
+            )
+
+
 def validate_checkpoint(
     model_type: str,
     *,
@@ -270,10 +334,15 @@ def _qwen3_moe_checkpoint(_outer, config, raw, quantization, topology) -> None:
     _validate_qwen3_moe(config, raw, quantization, topology)
 
 
+def _deepseek_v4_checkpoint(_outer, config, raw, _quantization, _topology) -> None:
+    _validate_deepseek_v4(config, raw)
+
+
 CHECKPOINT_VALIDATORS = {
     "qwen3": _qwen3_checkpoint,
     "qwen3_moe": _qwen3_moe_checkpoint,
     "qwen3_5": _qwen35_checkpoint,
     "qwen3_5_moe": _qwen35_moe_checkpoint,
     "minimax_m2": _minimax_checkpoint,
+    "deepseek_v4": _deepseek_v4_checkpoint,
 }
