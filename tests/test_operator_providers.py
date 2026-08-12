@@ -31,6 +31,7 @@ from sparsevllm.operators.moe import (
     MoeOpSpec,
     SglAlignedTritonGlmMoeProvider,
     resolve_moe_provider,
+    use_packed_shared_experts,
 )
 from sparsevllm.operators.registry import OpResolver
 from sparsevllm.platforms import DeviceCaps, PlatformEnum
@@ -626,6 +627,31 @@ def test_glm_tp2_fused_shared_decode_uses_sgl_aligned_provider():
         )
 
     assert resolved.provider.name == "sgl_aligned_triton_glm"
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        ({}, True),
+        ({"cuda_graph": False}, False),
+        ({"tp_size": 1}, False),
+        ({"num_shared_experts": 2}, False),
+    ],
+)
+def test_glm_packed_shared_expert_profile(overrides, expected):
+    values = {
+        "num_routed_experts": 64,
+        "num_shared_experts": 1,
+        "top_k": 4,
+        "hidden_size": 2048,
+        "intermediate_size": 1536,
+        "tp_size": 2,
+        "ep_size": 1,
+        "cuda_graph": True,
+    }
+    values.update(overrides)
+
+    assert use_packed_shared_experts(**values) is expected
 
 
 def test_glm_tp2_ep2_moe_uses_sgl_aligned_provider():

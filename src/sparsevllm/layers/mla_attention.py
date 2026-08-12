@@ -10,6 +10,7 @@ from sparsevllm.engine.cache_manager.base import (
     AttentionViewMeta,
     DecodeComputeView,
     ExplicitKVPayload,
+    MlaLatentWrite,
     MlaLatentPayload,
     PrefillComputeView,
 )
@@ -303,6 +304,7 @@ class MLAAttention:
         self.prefill_backend = TritonAttentionBackend()
         self._prefill_plan: _MlaPrefillPlan | None = None
         self._prefill_query_plan: _MlaPrefillQueryPlan | None = None
+        self._key_materializer_bindings: dict[int, tuple[object, Callable]] = {}
 
     @classmethod
     def bind(
@@ -875,6 +877,142 @@ class MLAAttention:
             validation_scope=context.attention_validation_scope,
             valid_batch_size=valid_batch_size,
         )
+
+    def _ensure_key_materializer(
+        self,
+        cache_manager,
+        layer_idx: int,
+        project_latent: Callable[[torch.Tensor], torch.Tensor],
+    ) -> None:
+        layer_idx = int(layer_idx)
+        binding = self._key_materializer_bindings.get(layer_idx)
+        if binding is not None and binding[0] is cache_manager:
+            return
+
+        def materialize(view: AttentionKeyComputeView) -> torch.Tensor:
+            return self.materialize_expanded_keys(
+                view,
+                project_latent=project_latent,
+            )
+
+        cache_manager.register_attention_key_materializer(layer_idx, materialize)
+        self._key_materializer_bindings[layer_idx] = (cache_manager, materialize)
+
+    def run_cached_attention(
+        self,
+        q: torch.Tensor,
+        q_nope: torch.Tensor,
+        q_rope: torch.Tensor,
+        latent: torch.Tensor,
+        rope: torch.Tensor,
+        *,
+        project_latent: Callable[[torch.Tensor], torch.Tensor],
+        absorb_query: Callable[[torch.Tensor], torch.Tensor],
+        reconstruct_values: Callable[[torch.Tensor], torch.Tensor],
+    ) -> torch.Tensor:
+        """Execute MLA over the active cache view for the current layer."""
+
+        context = get_context()
+        cache_manager = context.cache_manager
+        sparse_controller = context.sparse_controller
+        layer_idx = int(context.now_layer_idx)
+        self._ensure_key_materializer(cache_manager, layer_idx, project_latent)
+        slot_mapping = cache_manager.store_attention_payload(
+            layer_idx,
+            MlaLatentWrite(latent=latent.unsqueeze(1), rope=rope.unsqueeze(1)),
+        )
+        cache_manager.on_kv_stored(layer_idx, latent, slot_mapping)
+
+        temp_slots = None
+        try:
+            if context.is_prefill:
+                selection = sparse_controller.get_prefill_selection(layer_idx)
+                cache_manager.before_prefill_layer_attention(layer_idx, selection)
+                view = cache_manager.build_prefill_compute_view(
+                    layer_idx,
+                    latent,
+                    rope,
+                    selection,
+                )
+                temp_slots = view.meta.temp_slots
+                if context.cu_seqlens_q is None or context.cu_seqlens_q.numel() <= 1:
+                    return torch.empty_like(q)
+                history = self.prepare_prefill_history(
+                    view,
+                    query_tokens=int(q.shape[0]),
+                )
+                qk_nope_head_dim = self.spec.qk_head_dim - self.spec.rope_dim
+                projected_width = qk_nope_head_dim + self.spec.value_head_dim
+                expanded = project_latent(history.gathered_latent).view(
+                    history.visible_tokens,
+                    self.spec.local_q_heads,
+                    projected_width,
+                )
+                expanded_k_nope, expanded_v = expanded.split(
+                    [qk_nope_head_dim, self.spec.value_head_dim],
+                    dim=-1,
+                )
+                expanded_k = torch.empty(
+                    (
+                        history.visible_tokens,
+                        self.spec.local_q_heads,
+                        self.spec.qk_head_dim,
+                    ),
+                    dtype=expanded.dtype,
+                    device=expanded.device,
+                )
+                expanded_k[..., :qk_nope_head_dim].copy_(expanded_k_nope)
+                expanded_k[..., qk_nope_head_dim:].copy_(
+                    history.gathered_rope[:, None, :]
+                )
+                workset = self.bind_prefill_kv(
+                    history,
+                    expanded_k=expanded_k,
+                    expanded_v=expanded_v,
+                )
+                b_start_loc = context.cu_seqlens_q[:-1]
+                chunk_lens = context.cu_seqlens_q[1:] - context.cu_seqlens_q[:-1]
+                output = self.run_prefill(
+                    q,
+                    workset,
+                    b_start_loc=b_start_loc,
+                    chunk_lens=chunk_lens,
+                )
+                explicit_view = self.build_prefill_explicit_view(workset)
+                cache_manager.collect_prefill_attention_score(
+                    layer_idx,
+                    q,
+                    explicit_view,
+                    b_start_loc=b_start_loc,
+                    chunk_lens=chunk_lens,
+                )
+                cache_manager.record_prefill_query(
+                    layer_idx,
+                    q,
+                    view,
+                    b_start_loc=b_start_loc,
+                    chunk_lens=chunk_lens,
+                )
+            else:
+                selection = sparse_controller.get_decode_selection(layer_idx, q)
+                view = cache_manager.build_decode_compute_view(
+                    layer_idx,
+                    q,
+                    selection,
+                    num_heads=self.spec.local_q_heads,
+                    num_kv_heads=1,
+                )
+                output = reconstruct_values(
+                    self.run_decode(absorb_query(q_nope), q_rope, view)
+                )
+                cache_manager.record_decode_query(layer_idx, q)
+
+            sparse_controller.on_layer_attention_end(layer_idx)
+            cache_manager.on_layer_attention_end(layer_idx)
+            return output
+        finally:
+            if temp_slots is not None and temp_slots.numel() > 0:
+                cache_manager.release_layer_temp_slots(layer_idx, temp_slots)
 
 __all__ = [
     "MLAAttention",

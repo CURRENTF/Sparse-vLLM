@@ -438,7 +438,6 @@ def _make_glm_full_graph_lane(
                 mla_attention=mla_attention,
                 mlp_chunk_size=8,
                 decode_cuda_graph=True,
-                expect_mtp_weights=False,
             )
     finally:
         torch.set_default_dtype(previous_dtype)

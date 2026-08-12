@@ -29,7 +29,6 @@ from sparsevllm.models.glm4_moe_lite import (
     Glm4MoeLiteForCausalLM,
     Glm4MoeLiteRouter,
     Glm4MoeLiteSparseMoeBlock,
-    _expected_mtp_weight_names,
 )
 from sparsevllm.models.qwen3 import Qwen3MLP
 from sparsevllm.operators.mla_attention import MlaAttentionOpSpec
@@ -162,7 +161,6 @@ def _model(config=None, *, tp_rank: int = 0, tp_size: int = 1):
             mla_attention=_fake_mla(tp_size),
             mlp_chunk_size=config.mlp_chunk_size,
             decode_cuda_graph=config.decode_cuda_graph,
-            expect_mtp_weights=False,
         )
 
 
@@ -213,7 +211,6 @@ def test_glm_runtime_kwargs_bind_model_owned_operators() -> None:
         "mla_attention": mla,
         "mlp_chunk_size": 16,
         "decode_cuda_graph": True,
-        "expect_mtp_weights": True,
         "runtime_config": all_reduce,
     }
     build_mla.assert_called_once_with(
@@ -359,29 +356,6 @@ def test_glm_decode_absorption_and_value_reconstruction_match_linear_algebra() -
     torch.testing.assert_close(reconstructed, expected_reconstructed)
 
 
-def test_glm_attention_binds_key_materializer_once_per_manager_context() -> None:
-    attention = _model().model.layers[0].self_attn
-    first_manager = SimpleNamespace(
-        register_attention_key_materializer=Mock()
-    )
-    second_manager = SimpleNamespace(
-        register_attention_key_materializer=Mock()
-    )
-
-    attention._ensure_attention_key_materializer(first_manager, 0)
-    attention._ensure_attention_key_materializer(first_manager, 0)
-    attention._ensure_attention_key_materializer(second_manager, 0)
-
-    first_manager.register_attention_key_materializer.assert_called_once_with(
-        0,
-        attention._materialize_attention_keys,
-    )
-    second_manager.register_attention_key_materializer.assert_called_once_with(
-        0,
-        attention._materialize_attention_keys,
-    )
-
-
 def test_glm_router_uses_bias_only_for_selection_and_scales_weights() -> None:
     torch.manual_seed(23)
     with patch(
@@ -421,7 +395,6 @@ def test_tiny_transformers_weights_load_through_strict_glm_mapping() -> None:
             mla_attention=_fake_mla(),
             mlp_chunk_size=config.mlp_chunk_size,
             decode_cuda_graph=config.decode_cuda_graph,
-            expect_mtp_weights=False,
         )
         initialize_sparse_model(model, config, seed=29)
     reference = build_tiny_random_hf_model(config, seed=29)
@@ -449,7 +422,7 @@ def test_tiny_transformers_weights_load_through_strict_glm_mapping() -> None:
 
 
 @pytest.mark.parametrize(("ep_rank", "ep_size"), [(1, 2), (3, 4)])
-def test_glm_ep_loader_keeps_only_local_experts_and_accounts_remote_skips(
+def test_glm_ep_loader_keeps_only_local_experts(
     ep_rank: int,
     ep_size: int,
 ) -> None:
@@ -461,7 +434,6 @@ def test_glm_ep_loader_keeps_only_local_experts_and_accounts_remote_skips(
             mla_attention=_fake_mla(),
             mlp_chunk_size=config.mlp_chunk_size,
             decode_cuda_graph=config.decode_cuda_graph,
-            expect_mtp_weights=False,
         )
         initialize_sparse_model(model, config, seed=31)
 
@@ -470,9 +442,6 @@ def test_glm_ep_loader_keeps_only_local_experts_and_accounts_remote_skips(
     assert experts.local_expert_start == ep_rank * expected_local
     assert experts.local_expert_end == (ep_rank + 1) * expected_local
     assert len(experts._loaded_expert_shards) == expected_local * 3
-    assert len(model._intentionally_skipped_expert_weights) == (
-        64 - expected_local
-    ) * 3
 
 
 @pytest.mark.parametrize("ep_size", [1, 2, 4])
@@ -744,42 +713,3 @@ def test_glm_decoder_syncs_replicated_attention_before_post_norm(
         broadcast.assert_called_once()
         assert broadcast.call_args.kwargs["src"] == context.expert.ranks[0]
         assert broadcast.call_args.kwargs["group"] is context.expert.process_group
-
-
-def test_glm_mtp_skip_set_is_exact() -> None:
-    config = _config()
-    context = _tp_context()
-    with _construction_context(context):
-        model = Glm4MoeLiteForCausalLM(
-            config,
-            mla_attention=_fake_mla(),
-            mlp_chunk_size=config.mlp_chunk_size,
-            decode_cuda_graph=config.decode_cuda_graph,
-            expect_mtp_weights=True,
-        )
-    dense_names = {
-        name
-        for name, _ in model.named_parameters()
-        if not name.endswith(".mlp.experts.w13_weight")
-        and not name.endswith(".mlp.experts.w2_weight")
-    }
-    for block in (
-        layer.mlp
-        for layer in model.model.layers
-        if isinstance(layer.mlp, Glm4MoeLiteSparseMoeBlock)
-    ):
-        block.experts._loaded_expert_shards = {
-            (expert_id, projection)
-            for expert_id in range(64)
-            for projection in ("gate_proj", "up_proj", "down_proj")
-        }
-    expected_mtp = _expected_mtp_weight_names(64)
-    for name in expected_mtp:
-        model.record_skipped_weight(name, (1,), "BF16", None, None)
-
-    model.validate_loaded_weights(dense_names)
-    assert len(model._intentionally_skipped_mtp_weights) == 212
-
-    model._intentionally_skipped_mtp_weights.remove(next(iter(expected_mtp)))
-    with pytest.raises(ValueError, match="MTP skip set is inconsistent"):
-        model.validate_loaded_weights(dense_names)

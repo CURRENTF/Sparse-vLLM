@@ -5,6 +5,7 @@ import re
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
 from importlib.util import find_spec
+from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
@@ -17,6 +18,9 @@ from sparsevllm.operators.registry import (
     runtime_version_at_least,
 )
 from sparsevllm.platforms.interface import DeviceCaps, PlatformEnum
+
+if TYPE_CHECKING:
+    from sparsevllm.distributed.parallel_context import ParallelGroup
 
 
 @dataclass(frozen=True)
@@ -535,3 +539,34 @@ def prepare_all_reduce_op(
         device_index=device_index,
     )
     return PreparedAllReduceOp(spec, provider, group=group)
+
+
+def prepare_parallel_all_reduce(
+    group: ParallelGroup,
+    *,
+    max_rows: int,
+    hidden_size: int,
+    dtype: torch.dtype,
+    cuda_graph: bool,
+    device_index: int,
+) -> PreparedAllReduceOp:
+    """Bind an all-reduce operator to an initialized parallel group."""
+
+    return prepare_all_reduce_op(
+        AllReduceOpSpec(
+            world_size=group.size,
+            ranks=group.ranks,
+            max_rows=max_rows,
+            hidden_size=hidden_size,
+            dtype=dtype,
+            cuda_graph=cuda_graph,
+            backend=(
+                "none"
+                if group.process_group is None
+                else str(dist.get_backend(group.process_group))
+            ),
+        ),
+        group=group.process_group,
+        rank=group.rank,
+        device_index=device_index,
+    )

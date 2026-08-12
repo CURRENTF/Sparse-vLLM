@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -120,6 +121,21 @@ def _view(
             rope_cache=rope_cache,
         ),
     )
+
+
+def test_mla_binds_key_materializer_once_per_manager_and_layer() -> None:
+    attention = _attention()
+    project_latent = Mock()
+    first_manager = SimpleNamespace(register_attention_key_materializer=Mock())
+    second_manager = SimpleNamespace(register_attention_key_materializer=Mock())
+
+    attention._ensure_key_materializer(first_manager, 0, project_latent)
+    attention._ensure_key_materializer(first_manager, 0, project_latent)
+    attention._ensure_key_materializer(first_manager, 1, project_latent)
+    attention._ensure_key_materializer(second_manager, 0, project_latent)
+
+    assert first_manager.register_attention_key_materializer.call_count == 2
+    second_manager.register_attention_key_materializer.assert_called_once()
 
 
 def _expand_history(attention: MLAAttention, history):

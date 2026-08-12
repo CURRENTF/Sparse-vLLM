@@ -10,7 +10,6 @@ from torch import nn
 
 from sparsevllm.distributed import (
     ParallelContext,
-    ParallelGroup,
     get_parallel_context,
 )
 from sparsevllm.layers.attention import Attention
@@ -25,9 +24,8 @@ from sparsevllm.layers.rotary_embedding import (
 from sparsevllm.models.qwen3 import Qwen3ModelBase
 from sparsevllm.operators.moe import model_activation_dtype, resolve_moe_provider
 from sparsevllm.operators.all_reduce import (
-    AllReduceOpSpec,
     PreparedAllReduceOp,
-    prepare_all_reduce_op,
+    prepare_parallel_all_reduce,
 )
 from sparsevllm.operators.decode_attention import (
     DecodeAttentionLaunchSpec,
@@ -80,35 +78,6 @@ class MiniMaxM2RuntimeConfig:
         self._closed = True
 
 
-def _prepare_decode_all_reduce(
-    group: ParallelGroup,
-    *,
-    max_rows: int,
-    hidden_size: int,
-    dtype: torch.dtype,
-    cuda_graph: bool,
-    device_index: int,
-) -> PreparedAllReduceOp:
-    return prepare_all_reduce_op(
-        AllReduceOpSpec(
-            world_size=group.size,
-            ranks=group.ranks,
-            max_rows=max_rows,
-            hidden_size=hidden_size,
-            dtype=dtype,
-            cuda_graph=cuda_graph,
-            backend=(
-                "none"
-                if group.process_group is None
-                else str(torch.distributed.get_backend(group.process_group))
-            ),
-        ),
-        group=group.process_group,
-        rank=group.rank,
-        device_index=device_index,
-    )
-
-
 def build_minimax_m2_runtime_config(
     config,
     parallel_context: ParallelContext,
@@ -154,7 +123,7 @@ def build_minimax_m2_runtime_config(
         ),
         device_index=device_index,
     )
-    moe_decode_all_reduce = _prepare_decode_all_reduce(
+    moe_decode_all_reduce = prepare_parallel_all_reduce(
         parallel_context.world,
         max_rows=int(max_decode_tokens),
         hidden_size=int(config.hidden_size),
@@ -165,7 +134,7 @@ def build_minimax_m2_runtime_config(
     if parallel_context.attention.ranks == parallel_context.world.ranks:
         attention_decode_all_reduce = moe_decode_all_reduce
     else:
-        attention_decode_all_reduce = _prepare_decode_all_reduce(
+        attention_decode_all_reduce = prepare_parallel_all_reduce(
             parallel_context.attention,
             max_rows=int(max_decode_tokens),
             hidden_size=int(config.hidden_size),

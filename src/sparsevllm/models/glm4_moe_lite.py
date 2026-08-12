@@ -9,12 +9,11 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import Glm4MoeLiteConfig
 
-from sparsevllm.distributed import ParallelContext, ParallelGroup, get_parallel_context
-from sparsevllm.models.layout import resolve_attention_qk_head_dim
-from sparsevllm.engine.cache_manager import (
-    AttentionKeyComputeView,
-    MlaLatentWrite,
+from sparsevllm.distributed import (
+    ParallelContext,
+    get_parallel_context,
 )
+from sparsevllm.models.layout import resolve_attention_qk_head_dim
 from sparsevllm.layers.embed_head import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -32,15 +31,16 @@ from sparsevllm.layers.rotary_embedding import RotaryEmbedding, get_rope
 from sparsevllm.models.qwen3 import Qwen3MLP
 from sparsevllm.operators.mla_attention import MlaAttentionOpSpec
 from sparsevllm.operators.all_reduce import (
-    AllReduceOpSpec,
     PreparedAllReduceOp,
-    prepare_all_reduce_op,
+    prepare_parallel_all_reduce,
 )
 from sparsevllm.operators.activation import resolve_silu_and_mul_provider
 from sparsevllm.operators.moe import (
     MoeOpSpec,
+    append_shared_expert_route,
     model_activation_dtype,
     resolve_moe_provider,
+    use_packed_shared_experts,
 )
 from sparsevllm.operators.moe_router import (
     MoeRouterOpSpec,
@@ -48,7 +48,6 @@ from sparsevllm.operators.moe_router import (
 )
 from sparsevllm.platforms import device_runtime
 from sparsevllm.utils.context import get_context
-from sparsevllm.utils.log import logger
 from sparsevllm.utils.weight_target import WeightTarget
 
 
@@ -64,8 +63,6 @@ _SHARED_EXPERT_SOURCE_RE = re.compile(
     r"^model\.layers\.(\d+)\.mlp\.shared_experts\."
     r"(gate_proj|up_proj|down_proj)\.weight$"
 )
-_MTP_LAYER_INDEX = 47
-_MTP_PREFIX = f"model.layers.{_MTP_LAYER_INDEX}."
 
 
 @dataclass
@@ -83,35 +80,6 @@ class Glm4MoeLiteRuntimeConfig:
         self._closed = True
 
 
-def _prepare_decode_all_reduce(
-    group: ParallelGroup,
-    *,
-    max_rows: int,
-    hidden_size: int,
-    dtype: torch.dtype,
-    cuda_graph: bool,
-    device_index: int,
-) -> PreparedAllReduceOp:
-    return prepare_all_reduce_op(
-        AllReduceOpSpec(
-            world_size=group.size,
-            ranks=group.ranks,
-            max_rows=max_rows,
-            hidden_size=hidden_size,
-            dtype=dtype,
-            cuda_graph=cuda_graph,
-            backend=(
-                "none"
-                if group.process_group is None
-                else str(torch.distributed.get_backend(group.process_group))
-            ),
-        ),
-        group=group.process_group,
-        rank=group.rank,
-        device_index=device_index,
-    )
-
-
 def build_glm4_moe_lite_runtime_config(
     config: Glm4MoeLiteConfig,
     parallel_context: ParallelContext,
@@ -121,7 +89,7 @@ def build_glm4_moe_lite_runtime_config(
     device_index: int,
 ) -> Glm4MoeLiteRuntimeConfig:
     max_decode_tokens = int(max_decode_tokens)
-    moe_op = _prepare_decode_all_reduce(
+    moe_op = prepare_parallel_all_reduce(
         parallel_context.world,
         max_rows=2 * max_decode_tokens,
         hidden_size=int(config.hidden_size),
@@ -132,7 +100,7 @@ def build_glm4_moe_lite_runtime_config(
     attention_op = (
         moe_op
         if parallel_context.attention.ranks == parallel_context.world.ranks
-        else _prepare_decode_all_reduce(
+        else prepare_parallel_all_reduce(
             parallel_context.attention,
             max_rows=max_decode_tokens,
             hidden_size=int(config.hidden_size),
@@ -250,7 +218,6 @@ class Glm4MoeLiteAttention(nn.Module):
             bias=bool(config.attention_bias),
             reduce_results=runtime_config is None,
         )
-        self._attention_key_materializer_binding: tuple[int, int] | None = None
 
     def _project_kv_history(self, latent: torch.Tensor) -> torch.Tensor:
         if int(latent.shape[0]) <= self.proj_chunk_size:
@@ -300,138 +267,6 @@ class Glm4MoeLiteAttention(nn.Module):
             v_weight.transpose(1, 2),
         ).transpose(0, 1)
 
-    def _materialize_attention_keys(
-        self,
-        view: AttentionKeyComputeView,
-    ) -> torch.Tensor:
-        return self.mla_attention.materialize_expanded_keys(
-            view,
-            project_latent=self._project_kv_history,
-        )
-
-    def _ensure_attention_key_materializer(self, cache_manager, layer_idx: int) -> None:
-        binding = (id(cache_manager), int(layer_idx))
-        if self._attention_key_materializer_binding == binding:
-            return
-        cache_manager.register_attention_key_materializer(
-            int(layer_idx),
-            self._materialize_attention_keys,
-        )
-        self._attention_key_materializer_binding = binding
-
-    def _run_attention(
-        self,
-        q: torch.Tensor,
-        q_nope: torch.Tensor,
-        q_rope: torch.Tensor,
-        latent: torch.Tensor,
-        rope: torch.Tensor,
-    ) -> torch.Tensor:
-        context = get_context()
-        cache_manager = context.cache_manager
-        sparse_controller = context.sparse_controller
-        layer_idx = int(context.now_layer_idx)
-        self._ensure_attention_key_materializer(cache_manager, layer_idx)
-        slot_mapping = cache_manager.store_attention_payload(
-            layer_idx,
-            MlaLatentWrite(
-                latent=latent.unsqueeze(1),
-                rope=rope.unsqueeze(1),
-            ),
-        )
-        cache_manager.on_kv_stored(layer_idx, latent, slot_mapping)
-
-        temp_slots = None
-        try:
-            if context.is_prefill:
-                selection = sparse_controller.get_prefill_selection(layer_idx)
-                cache_manager.before_prefill_layer_attention(layer_idx, selection)
-                view = cache_manager.build_prefill_compute_view(
-                    layer_idx,
-                    latent,
-                    rope,
-                    selection,
-                )
-                temp_slots = view.meta.temp_slots
-                if context.cu_seqlens_q is None or context.cu_seqlens_q.numel() <= 1:
-                    return torch.empty_like(q)
-                history = self.mla_attention.prepare_prefill_history(
-                    view,
-                    query_tokens=int(q.shape[0]),
-                )
-                expanded = self._project_kv_history(history.gathered_latent).view(
-                    history.visible_tokens,
-                    self.local_heads,
-                    self.qk_nope_head_dim + self.v_head_dim,
-                )
-                expanded_k_nope, expanded_v = expanded.split(
-                    [self.qk_nope_head_dim, self.v_head_dim],
-                    dim=-1,
-                )
-                expanded_k = torch.empty(
-                    (
-                        history.visible_tokens,
-                        self.local_heads,
-                        self.qk_head_dim,
-                    ),
-                    dtype=expanded_k_nope.dtype,
-                    device=expanded_k_nope.device,
-                )
-                expanded_k[..., : self.qk_nope_head_dim].copy_(expanded_k_nope)
-                expanded_k[..., self.qk_nope_head_dim :].copy_(
-                    history.gathered_rope[:, None, :]
-                )
-                workset = self.mla_attention.bind_prefill_kv(
-                    history,
-                    expanded_k=expanded_k,
-                    expanded_v=expanded_v,
-                )
-                b_start_loc = context.cu_seqlens_q[:-1]
-                chunk_lens = context.cu_seqlens_q[1:] - context.cu_seqlens_q[:-1]
-                output = self.mla_attention.run_prefill(
-                    q,
-                    workset,
-                    b_start_loc=b_start_loc,
-                    chunk_lens=chunk_lens,
-                )
-                cache_manager.collect_prefill_attention_score(
-                    layer_idx,
-                    q,
-                    self.mla_attention.build_prefill_explicit_view(workset),
-                    b_start_loc=b_start_loc,
-                    chunk_lens=chunk_lens,
-                )
-                cache_manager.record_prefill_query(
-                    layer_idx,
-                    q,
-                    view,
-                    b_start_loc=b_start_loc,
-                    chunk_lens=chunk_lens,
-                )
-            else:
-                selection = sparse_controller.get_decode_selection(layer_idx, q)
-                view = cache_manager.build_decode_compute_view(
-                    layer_idx,
-                    q,
-                    selection,
-                    num_heads=self.local_heads,
-                    num_kv_heads=1,
-                )
-                latent_output = self.mla_attention.run_decode(
-                    self._decode_absorbed_query(q_nope),
-                    q_rope,
-                    view,
-                )
-                output = self._reconstruct_decode_values(latent_output)
-                cache_manager.record_decode_query(layer_idx, q)
-
-            sparse_controller.on_layer_attention_end(layer_idx)
-            cache_manager.on_layer_attention_end(layer_idx)
-            return output
-        finally:
-            if temp_slots is not None and temp_slots.numel() > 0:
-                cache_manager.release_layer_temp_slots(layer_idx, temp_slots)
-
     def forward(
         self,
         positions: torch.Tensor,
@@ -462,12 +297,15 @@ class Glm4MoeLiteAttention(nn.Module):
         )
         k_rope = k_rope.squeeze(1)
         q = torch.cat((q_nope, q_rope), dim=-1)
-        value_output = self._run_attention(
+        value_output = self.mla_attention.run_cached_attention(
             q,
             q_nope,
             q_rope,
             latent,
             k_rope,
+            project_latent=self._project_kv_history,
+            absorb_query=self._decode_absorbed_query,
+            reconstruct_values=self._reconstruct_decode_values,
         )
         output = self._project_output(value_output, hidden_states)
         if self.runtime_config is None:
@@ -528,18 +366,15 @@ class Glm4MoeLitePackedExperts(PackedMoeExperts):
         parallel_context = get_parallel_context()
         self.routed_num_experts = int(config.n_routed_experts)
         self.routed_top_k = int(config.num_experts_per_tok)
-        self.fuses_shared_decode = bool(
-            decode_cuda_graph
-            and (
-                self.routed_num_experts,
-                int(config.n_shared_experts),
-                self.routed_top_k,
-                int(config.hidden_size),
-                int(config.moe_intermediate_size),
-                int(parallel_context.moe_tp_size),
-                int(parallel_context.ep_size),
-            )
-            == (64, 1, 4, 2048, 1536, 2, 1)
+        self.fuses_shared_decode = use_packed_shared_experts(
+            num_routed_experts=self.routed_num_experts,
+            num_shared_experts=int(config.n_shared_experts),
+            top_k=self.routed_top_k,
+            hidden_size=int(config.hidden_size),
+            intermediate_size=int(config.moe_intermediate_size),
+            tp_size=int(parallel_context.moe_tp_size),
+            ep_size=int(parallel_context.ep_size),
+            cuda_graph=decode_cuda_graph,
         )
         packed_num_experts = self.routed_num_experts + int(
             self.fuses_shared_decode
@@ -628,8 +463,6 @@ class Glm4MoeLitePackedExperts(PackedMoeExperts):
     ) -> torch.Tensor:
         if self.shared_expert_id is None:
             raise RuntimeError("Packed shared expert is not enabled.")
-        from sparsevllm.kernels.triton.moe import append_shared_expert_route
-
         fused_ids, fused_weights = append_shared_expert_route(
             topk_ids,
             topk_weights,
@@ -1027,41 +860,6 @@ class Glm4MoeLiteModel(nn.Module):
         return hidden_states
 
 
-def _expected_mtp_weight_names(num_experts: int) -> set[str]:
-    prefix = _MTP_PREFIX
-    names = {
-        prefix + suffix
-        for suffix in (
-            "eh_proj.weight",
-            "embed_tokens.weight",
-            "enorm.weight",
-            "hnorm.weight",
-            "input_layernorm.weight",
-            "post_attention_layernorm.weight",
-            "self_attn.kv_a_layernorm.weight",
-            "self_attn.kv_a_proj_with_mqa.weight",
-            "self_attn.kv_b_proj.weight",
-            "self_attn.o_proj.weight",
-            "self_attn.q_a_layernorm.weight",
-            "self_attn.q_a_proj.weight",
-            "self_attn.q_b_proj.weight",
-            "mlp.gate.e_score_correction_bias",
-            "mlp.gate.weight",
-            "mlp.shared_experts.down_proj.weight",
-            "mlp.shared_experts.gate_proj.weight",
-            "mlp.shared_experts.up_proj.weight",
-            "shared_head.head.weight",
-            "shared_head.norm.weight",
-        )
-    }
-    names.update(
-        f"{prefix}mlp.experts.{expert_id}.{projection}.weight"
-        for expert_id in range(int(num_experts))
-        for projection in ("gate_proj", "up_proj", "down_proj")
-    )
-    return names
-
-
 class Glm4MoeLiteForCausalLM(nn.Module):
     special_weight_loaders = (".expert_weight",)
     packed_modules_mapping = {
@@ -1095,7 +893,6 @@ class Glm4MoeLiteForCausalLM(nn.Module):
             ),
             "mlp_chunk_size": engine_config.mlp_chunk_size,
             "decode_cuda_graph": decode_cuda_graph,
-            "expect_mtp_weights": not engine_config.tiny_random,
         }
         if parallel_context.world_size > 1:
             kwargs["runtime_config"] = build_glm4_moe_lite_runtime_config(
@@ -1114,7 +911,6 @@ class Glm4MoeLiteForCausalLM(nn.Module):
         mla_attention: MLAAttention,
         mlp_chunk_size: int,
         decode_cuda_graph: bool,
-        expect_mtp_weights: bool,
         runtime_config: Glm4MoeLiteRuntimeConfig | None = None,
     ) -> None:
         super().__init__()
@@ -1131,9 +927,14 @@ class Glm4MoeLiteForCausalLM(nn.Module):
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if config.tie_word_embeddings:
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
-        self.expect_mtp_weights = bool(expect_mtp_weights)
-        self._intentionally_skipped_expert_weights: set[str] = set()
-        self._intentionally_skipped_mtp_weights: set[str] = set()
+        self.ignored_weight_prefixes = tuple(
+            f"model.layers.{layer_idx}."
+            for layer_idx in range(
+                int(config.num_hidden_layers),
+                int(config.num_hidden_layers)
+                + int(getattr(config, "num_nextn_predict_layers", 0)),
+            )
+        )
 
     def close_runtime_operators(self) -> None:
         if self.runtime_config is not None:
@@ -1176,12 +977,79 @@ class Glm4MoeLiteForCausalLM(nn.Module):
             if source_name.endswith(down_suffix):
                 prefix = source_name[: -len("down_proj")]
                 for expert_id in range(int(weight.shape[0])):
-                    yield (
-                        f"{prefix}{expert_id}.down_proj.weight",
-                        weight[expert_id],
-                    )
+                    yield f"{prefix}{expert_id}.down_proj.weight", weight[expert_id]
                 continue
             yield source_name, weight
+
+    def map_weight_name(self, source_weight_name: str) -> str | None:
+        shared_match = _SHARED_EXPERT_SOURCE_RE.match(source_weight_name)
+        if shared_match is not None:
+            layer_idx, projection = shared_match.groups()
+            experts = self._sparse_block(int(layer_idx)).experts
+            if experts.shared_expert_id is not None:
+                return (
+                    f"model.layers.{layer_idx}.mlp.experts."
+                    f"{experts.shared_expert_id}.{projection}.expert_weight"
+                )
+        match = _EXPERT_SOURCE_RE.match(source_weight_name)
+        if match is None:
+            return source_weight_name
+        layer_idx, global_expert_id, projection = match.groups()
+        experts = self._sparse_block(int(layer_idx)).experts
+        if not experts.is_local_expert(int(global_expert_id)):
+            return None
+        return (
+            f"model.layers.{layer_idx}.mlp.experts.{global_expert_id}."
+            f"{projection}.expert_weight"
+        )
+
+    def resolve_special_weight(
+        self,
+        target_weight_name: str,
+    ) -> WeightTarget | None:
+        match = _EXPERT_TARGET_RE.match(target_weight_name)
+        if match is None:
+            return None
+        layer_idx, global_expert_id, projection = match.groups()
+        return WeightTarget(
+            self._sparse_block(int(layer_idx)).experts,
+            (int(global_expert_id), projection),
+        )
+
+    def load_special_weight(
+        self,
+        target_weight_name: str,
+        loaded_weight: torch.Tensor,
+        loaded_scale: torch.Tensor | None,
+    ) -> int:
+        target = self.resolve_special_weight(target_weight_name)
+        if target is None:
+            return 0
+        expert_id, projection = target.shard_id
+        target.module.load_expert_weight(
+            expert_id,
+            projection,
+            loaded_weight,
+            loaded_scale,
+        )
+        return 1
+
+    def validate_loaded_weights(self, loaded_parameter_names: set[str]) -> None:
+        packed_experts = {
+            name
+            for name, _ in self.named_parameters()
+            if name.endswith((".mlp.experts.w13_weight", ".mlp.experts.w2_weight"))
+        }
+        missing = sorted(
+            {name for name, _ in self.named_parameters()}
+            - packed_experts
+            - loaded_parameter_names
+        )
+        if missing:
+            raise ValueError(f"Missing replicated GLM base weights: {missing[:8]}.")
+        for layer_idx, layer_type in enumerate(self.config.mlp_layer_types):
+            if layer_type == "sparse":
+                self._sparse_block(layer_idx).experts.validate_loaded_weights()
 
     @torch.inference_mode()
     def warmup_moe(self, num_tokens: int = 1) -> None:
@@ -1224,205 +1092,6 @@ class Glm4MoeLiteForCausalLM(nn.Module):
         )
         experts(hidden_states, topk_ids, topk_weights)
         device_runtime.synchronize()
-
-    def map_weight_name(self, source_weight_name: str) -> str | None:
-        if source_weight_name.startswith(_MTP_PREFIX):
-            return None
-        shared_match = _SHARED_EXPERT_SOURCE_RE.match(source_weight_name)
-        if shared_match is not None:
-            layer_idx, projection = shared_match.groups()
-            experts = self._sparse_block(int(layer_idx)).experts
-            if experts.shared_expert_id is not None:
-                return (
-                    f"model.layers.{layer_idx}.mlp.experts."
-                    f"{experts.shared_expert_id}.{projection}.expert_weight"
-                )
-        match = _EXPERT_SOURCE_RE.match(source_weight_name)
-        if match is None:
-            return source_weight_name
-        layer_idx, global_expert_id, projection = match.groups()
-        block = self._sparse_block(int(layer_idx))
-        global_expert_id = int(global_expert_id)
-        if not block.experts.is_local_expert(global_expert_id):
-            self._intentionally_skipped_expert_weights.add(source_weight_name)
-            return None
-        return (
-            f"model.layers.{layer_idx}.mlp.experts.{global_expert_id}."
-            f"{projection}.expert_weight"
-        )
-
-    def resolve_special_weight(
-        self,
-        target_weight_name: str,
-    ) -> WeightTarget | None:
-        match = _EXPERT_TARGET_RE.match(target_weight_name)
-        if match is None:
-            return None
-        layer_idx, global_expert_id, projection = match.groups()
-        experts = self._sparse_block(int(layer_idx)).experts
-        return WeightTarget(experts, (int(global_expert_id), projection))
-
-    def record_skipped_weight(
-        self,
-        source_weight_name: str,
-        loaded_weight_shape: tuple[int, ...] | None,
-        loaded_weight_dtype: str | None,
-        loaded_scale_shape: tuple[int, ...] | None,
-        loaded_scale_dtype: str | None,
-    ) -> None:
-        if source_weight_name.startswith(_MTP_PREFIX):
-            if loaded_weight_shape is None or any(
-                int(dim) <= 0 for dim in loaded_weight_shape
-            ):
-                raise ValueError(
-                    f"Invalid GLM MTP tensor shape for {source_weight_name!r}: "
-                    f"{loaded_weight_shape}."
-                )
-            if loaded_weight_dtype not in {"BF16", "F32"}:
-                raise TypeError(
-                    f"Unsupported GLM MTP dtype for {source_weight_name!r}: "
-                    f"{loaded_weight_dtype}."
-                )
-            if loaded_scale_shape is not None or loaded_scale_dtype is not None:
-                raise ValueError(
-                    f"Unquantized GLM MTP tensor has an unexpected scale: "
-                    f"{source_weight_name!r}."
-                )
-            self._intentionally_skipped_mtp_weights.add(source_weight_name)
-            return
-
-        match = _EXPERT_SOURCE_RE.match(source_weight_name)
-        if match is None:
-            raise ValueError(
-                f"GLM loader unexpectedly skipped {source_weight_name!r}."
-            )
-        layer_idx, global_expert_id, projection = match.groups()
-        experts = self._sparse_block(int(layer_idx)).experts
-        global_expert_id = int(global_expert_id)
-        if experts.is_local_expert(global_expert_id):
-            raise ValueError(
-                f"GLM loader skipped local expert weight {source_weight_name!r}."
-            )
-        expected_shape = (
-            (experts.hidden_size, experts.global_intermediate_size)
-            if projection == "down_proj"
-            else (experts.global_intermediate_size, experts.hidden_size)
-        )
-        if loaded_weight_shape != expected_shape:
-            raise ValueError(
-                "Remote GLM expert weight shape mismatch for "
-                f"{source_weight_name!r}: expected={expected_shape}, "
-                f"got={loaded_weight_shape}."
-            )
-        if loaded_weight_dtype not in {"BF16", "F16", "F32"}:
-            raise TypeError(
-                f"Unsupported remote GLM expert dtype for "
-                f"{source_weight_name!r}: {loaded_weight_dtype}."
-            )
-        if loaded_scale_shape is not None or loaded_scale_dtype is not None:
-            raise ValueError(
-                f"Unquantized remote GLM expert has an unexpected scale: "
-                f"{source_weight_name!r}."
-            )
-        self._intentionally_skipped_expert_weights.add(source_weight_name)
-
-    def load_special_weight(
-        self,
-        target_weight_name: str,
-        loaded_weight: torch.Tensor,
-        loaded_scale: torch.Tensor | None,
-    ) -> int:
-        target = self.resolve_special_weight(target_weight_name)
-        if target is None:
-            return 0
-        global_expert_id, projection = target.shard_id
-        target.module.load_expert_weight(
-            global_expert_id,
-            projection,
-            loaded_weight,
-            loaded_scale,
-        )
-        return 1
-
-    def validate_loaded_weights(self, loaded_parameter_names: set[str]) -> None:
-        packed_expert_parameters = {
-            name
-            for name, _ in self.named_parameters()
-            if name.endswith(".mlp.experts.w13_weight")
-            or name.endswith(".mlp.experts.w2_weight")
-        }
-        expected_dense_parameters = {
-            name for name, _ in self.named_parameters()
-        } - packed_expert_parameters
-        missing_dense = sorted(expected_dense_parameters - loaded_parameter_names)
-        if missing_dense:
-            raise ValueError(
-                f"Missing replicated GLM base weights: {missing_dense[:8]}."
-            )
-
-        sparse_blocks = [
-            layer.mlp
-            for layer in self.model.layers
-            if isinstance(layer.mlp, Glm4MoeLiteSparseMoeBlock)
-        ]
-        for block in sparse_blocks:
-            block.experts.validate_loaded_weights()
-
-        expected_remote = {
-            f"model.layers.{layer_idx}.mlp.experts.{expert_id}."
-            f"{projection}.weight"
-            for layer_idx, layer in enumerate(self.model.layers)
-            if isinstance(layer.mlp, Glm4MoeLiteSparseMoeBlock)
-            for expert_id in range(int(self.config.n_routed_experts))
-            if not layer.mlp.experts.is_local_expert(expert_id)
-            for projection in ("gate_proj", "up_proj", "down_proj")
-        }
-        missing_remote = sorted(
-            expected_remote - self._intentionally_skipped_expert_weights
-        )
-        unexpected_remote = sorted(
-            self._intentionally_skipped_expert_weights - expected_remote
-        )
-        if missing_remote or unexpected_remote:
-            raise ValueError(
-                "GLM remote expert skip set is inconsistent: "
-                f"missing={missing_remote[:4]} unexpected={unexpected_remote[:4]}."
-            )
-
-        expected_mtp = _expected_mtp_weight_names(self.config.n_routed_experts)
-        if self.expect_mtp_weights:
-            missing_mtp = sorted(
-                expected_mtp - self._intentionally_skipped_mtp_weights
-            )
-            unexpected_mtp = sorted(
-                self._intentionally_skipped_mtp_weights - expected_mtp
-            )
-            if missing_mtp or unexpected_mtp:
-                raise ValueError(
-                    "GLM MTP skip set is inconsistent: "
-                    f"missing={missing_mtp[:4]} unexpected={unexpected_mtp[:4]}."
-                )
-        elif self._intentionally_skipped_mtp_weights:
-            raise ValueError(
-                "GLM checkpoint supplied MTP weights when they were not expected: "
-                f"{sorted(self._intentionally_skipped_mtp_weights)[:4]}."
-            )
-
-        first_sparse = sparse_blocks[0] if sparse_blocks else None
-        logger.info(
-            "Loaded GLM-4.7-Flash rank {} MLA provider={} MoE provider={} "
-            "attention TP {}/{} across {} base layers; local expert shards={} "
-            "remote expert skips={} MTP skips={}.",
-            self.parallel_context.world_rank,
-            self.model.mla_attention.provider.name,
-            first_sparse.experts.provider.name if first_sparse is not None else "none",
-            self.parallel_context.attention_tp_rank,
-            self.parallel_context.attention_tp_size,
-            len(self.model.layers),
-            sum(len(block.experts._loaded_expert_shards) for block in sparse_blocks),
-            len(self._intentionally_skipped_expert_weights),
-            len(self._intentionally_skipped_mtp_weights),
-        )
 
     def forward(
         self,

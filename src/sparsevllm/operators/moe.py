@@ -173,8 +173,51 @@ class MoeProvider:
     ) -> torch.Tensor:
         raise NotImplementedError
 
-
 MOE_REGISTRY: OpRegistry[MoeOpSpec, MoeProvider] = OpRegistry("routed MoE")
+
+_PACKED_SHARED_EXPERT_PROFILES = frozenset(
+    {(64, 1, 4, 2048, 1536, 2, 1)}
+)
+
+
+def use_packed_shared_experts(
+    *,
+    num_routed_experts: int,
+    num_shared_experts: int,
+    top_k: int,
+    hidden_size: int,
+    intermediate_size: int,
+    tp_size: int,
+    ep_size: int,
+    cuda_graph: bool,
+) -> bool:
+    """Return whether a profiled decode path packs shared experts as routes."""
+
+    profile = (
+        int(num_routed_experts),
+        int(num_shared_experts),
+        int(top_k),
+        int(hidden_size),
+        int(intermediate_size),
+        int(tp_size),
+        int(ep_size),
+    )
+    return bool(cuda_graph) and profile in _PACKED_SHARED_EXPERT_PROFILES
+
+
+def append_shared_expert_route(
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    *,
+    shared_expert_id: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from sparsevllm.kernels.triton.moe import append_shared_expert_route as run
+
+    return run(
+        topk_ids,
+        topk_weights,
+        shared_expert_id=shared_expert_id,
+    )
 
 
 def _sgl_moe_align_block_size(
