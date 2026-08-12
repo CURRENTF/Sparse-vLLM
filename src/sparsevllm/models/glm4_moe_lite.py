@@ -1077,6 +1077,42 @@ class Glm4MoeLiteForCausalLM(nn.Module):
         "up_proj": ("gate_up_proj", 1),
     }
 
+    @staticmethod
+    def build_runtime_kwargs(
+        config: Glm4MoeLiteConfig,
+        *,
+        engine_config,
+        parallel_context: ParallelContext,
+        device: torch.device,
+        max_decode_tokens: int,
+    ) -> dict:
+        decode_cuda_graph = bool(engine_config.decode_cuda_graph)
+        kwargs = {
+            "mla_attention": build_glm4_moe_lite_mla_attention(
+                config,
+                device=device,
+                max_batch_size=max(
+                    engine_config.max_num_seqs_in_batch,
+                    engine_config.max_decoding_seqs,
+                ),
+                prefill_workspace_bytes=engine_config.mla_prefill_workspace_bytes,
+                decode_cuda_graph=decode_cuda_graph,
+                projection_chunk_size=engine_config.mlp_chunk_size,
+            ),
+            "mlp_chunk_size": engine_config.mlp_chunk_size,
+            "decode_cuda_graph": decode_cuda_graph,
+            "expect_mtp_weights": not engine_config.tiny_random,
+        }
+        if parallel_context.world_size > 1:
+            kwargs["runtime_config"] = build_glm4_moe_lite_runtime_config(
+                config,
+                parallel_context,
+                max_decode_tokens=max_decode_tokens,
+                cuda_graph=decode_cuda_graph,
+                device_index=int(device.index or 0),
+            )
+        return kwargs
+
     def __init__(
         self,
         config: Glm4MoeLiteConfig,

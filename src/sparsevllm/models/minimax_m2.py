@@ -619,6 +619,26 @@ class MiniMaxM2ForCausalLM(nn.Module):
         "v_proj": ("qkv_proj", "v"),
     }
 
+    @staticmethod
+    def build_runtime_kwargs(
+        config,
+        *,
+        engine_config,
+        parallel_context: ParallelContext,
+        device: torch.device,
+        max_decode_tokens: int,
+    ) -> dict:
+        return {
+            "runtime_config": build_minimax_m2_runtime_config(
+                config,
+                parallel_context,
+                layer_invariant_page_table=engine_config.vllm_sparse_method == "",
+                max_decode_tokens=max_decode_tokens,
+                cuda_graph=engine_config.decode_cuda_graph,
+                device_index=int(device.index or 0),
+            )
+        }
+
     def __init__(
         self,
         config,

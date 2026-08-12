@@ -201,6 +201,34 @@ def test_model_construction_shares_explicit_runtime_operators_across_layers():
     all_reduce_op.close.assert_called_once_with()
 
 
+def test_minimax_runtime_kwargs_bind_model_owned_operators():
+    config = _config()
+    context = _tp_context(0, 1)
+    runtime = SimpleNamespace(vllm_sparse_method="", decode_cuda_graph=True)
+    bound = object()
+    with patch(
+        "sparsevllm.models.minimax_m2.build_minimax_m2_runtime_config",
+        return_value=bound,
+    ) as build:
+        kwargs = MiniMaxM2ForCausalLM.build_runtime_kwargs(
+            config,
+            engine_config=runtime,
+            parallel_context=context,
+            device=torch.device("cuda", 1),
+            max_decode_tokens=8,
+        )
+
+    assert kwargs == {"runtime_config": bound}
+    build.assert_called_once_with(
+        config,
+        context,
+        layer_invariant_page_table=True,
+        max_decode_tokens=8,
+        cuda_graph=True,
+        device_index=1,
+    )
+
+
 def _random_fp8(shape):
     return torch.randn(shape).clamp(-4.0, 4.0).to(torch.float8_e4m3fn)
 

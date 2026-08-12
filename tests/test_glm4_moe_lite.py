@@ -178,6 +178,61 @@ def test_glm_topology_reuses_one_mla_object_and_qwen_dense_mlp() -> None:
     assert model.model.layers[1].mlp.experts.op_spec.routing_method == "biased_sigmoid"
 
 
+def test_glm_runtime_kwargs_bind_model_owned_operators() -> None:
+    config = _config()
+    context = _tp_context(tp_size=2)
+    runtime = SimpleNamespace(
+        decode_cuda_graph=True,
+        max_num_seqs_in_batch=4,
+        max_decoding_seqs=8,
+        mla_prefill_workspace_bytes=1024,
+        mlp_chunk_size=16,
+        tiny_random=False,
+    )
+    mla = object()
+    all_reduce = object()
+    with (
+        patch(
+            "sparsevllm.models.glm4_moe_lite.build_glm4_moe_lite_mla_attention",
+            return_value=mla,
+        ) as build_mla,
+        patch(
+            "sparsevllm.models.glm4_moe_lite.build_glm4_moe_lite_runtime_config",
+            return_value=all_reduce,
+        ) as build_all_reduce,
+    ):
+        kwargs = Glm4MoeLiteForCausalLM.build_runtime_kwargs(
+            config,
+            engine_config=runtime,
+            parallel_context=context,
+            device=torch.device("cuda", 1),
+            max_decode_tokens=8,
+        )
+
+    assert kwargs == {
+        "mla_attention": mla,
+        "mlp_chunk_size": 16,
+        "decode_cuda_graph": True,
+        "expect_mtp_weights": True,
+        "runtime_config": all_reduce,
+    }
+    build_mla.assert_called_once_with(
+        config,
+        device=torch.device("cuda", 1),
+        max_batch_size=8,
+        prefill_workspace_bytes=1024,
+        decode_cuda_graph=True,
+        projection_chunk_size=16,
+    )
+    build_all_reduce.assert_called_once_with(
+        config,
+        context,
+        max_decode_tokens=8,
+        cuda_graph=True,
+        device_index=1,
+    )
+
+
 def test_glm_interleaved_rope_matches_transformers() -> None:
     torch.manual_seed(13)
     q = torch.randn(1, 3, 5, 64)

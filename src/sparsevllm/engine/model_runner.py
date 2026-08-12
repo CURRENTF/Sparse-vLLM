@@ -46,22 +46,14 @@ except ImportError:
     Qwen3MoeForCausalLM = None
 
 try:
-    from sparsevllm.models.glm4_moe_lite import (
-        Glm4MoeLiteForCausalLM,
-        build_glm4_moe_lite_runtime_config,
-    )
+    from sparsevllm.models.glm4_moe_lite import Glm4MoeLiteForCausalLM
 except ImportError:
     Glm4MoeLiteForCausalLM = None
-    build_glm4_moe_lite_runtime_config = None
 
 try:
-    from sparsevllm.models.minimax_m2 import (
-        MiniMaxM2ForCausalLM,
-        build_minimax_m2_runtime_config,
-    )
+    from sparsevllm.models.minimax_m2 import MiniMaxM2ForCausalLM
 except ImportError:
     MiniMaxM2ForCausalLM = None
-    build_minimax_m2_runtime_config = None
 
 try:
     from sparsevllm.models.qwen3_5 import Qwen35ForCausalLM
@@ -74,12 +66,16 @@ except ImportError:
     Qwen35MoeForCausalLM = None
 
 
-def _create_model(hf_config, model_spec: ModelSpec, **kwargs):
+def _create_model(hf_config, model_spec: ModelSpec, **runtime_kwargs):
     class_name = model_spec.runtime_class_name
     model_class = globals().get(class_name)
     if model_class is None:
         raise ImportError(f"{class_name} is unavailable for {model_spec.name}.")
-    return model_class(hf_config, **kwargs)
+    builder = getattr(model_class, "build_runtime_kwargs", None)
+    return model_class(
+        hf_config,
+        **(builder(hf_config, **runtime_kwargs) if callable(builder) else {}),
+    )
 
 
 TP_SHM_NAME_PREFIX = "sparsevllm_"
@@ -168,12 +164,6 @@ class ModelRunner:
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device(self.device)
         setattr(hf_config, "mlp_chunk_size", config.mlp_chunk_size)
-        if hf_config.model_type == "minimax_m2":
-            setattr(
-                hf_config,
-                "prefill_kv_view_layer_invariant",
-                config.vllm_sparse_method == "",
-            )
         setattr(
             hf_config,
             "decode_cuda_graph",
@@ -183,59 +173,18 @@ class ModelRunner:
             config.decode_cuda_graph_capture_sizes,
             config.max_decoding_seqs,
         )
-        model_kwargs = {}
-        if config.model_spec.runtime_class_name == "Glm4MoeLiteForCausalLM":
-            from sparsevllm.models.glm4_moe_lite import (
-                build_glm4_moe_lite_mla_attention,
-            )
-
-            model_kwargs = {
-                "mla_attention": build_glm4_moe_lite_mla_attention(
-                    hf_config,
-                    device=self.device,
-                    max_batch_size=max(
-                        config.max_num_seqs_in_batch,
-                        config.max_decoding_seqs,
-                    ),
-                    prefill_workspace_bytes=config.mla_prefill_workspace_bytes,
-                    decode_cuda_graph=config.decode_cuda_graph,
-                    projection_chunk_size=config.mlp_chunk_size,
-                ),
-                "mlp_chunk_size": config.mlp_chunk_size,
-                "decode_cuda_graph": config.decode_cuda_graph,
-                "expect_mtp_weights": not config.tiny_random,
-            }
-            if self.parallel_context.world_size > 1:
-                if build_glm4_moe_lite_runtime_config is None:
-                    raise ImportError("GLM runtime operators are unavailable.")
-                model_kwargs["runtime_config"] = build_glm4_moe_lite_runtime_config(
-                    hf_config,
-                    self.parallel_context,
-                    max_decode_tokens=_resolve_decode_static_batch_capacity(
-                        decode_static_capture_sizes,
-                        max_num_seqs_in_batch=config.max_num_seqs_in_batch,
-                        max_decoding_seqs=config.max_decoding_seqs,
-                    ),
-                    cuda_graph=config.decode_cuda_graph,
-                    device_index=int(self.device.index or 0),
-                )
-        elif config.model_spec.runtime_class_name == "MiniMaxM2ForCausalLM":
-            if build_minimax_m2_runtime_config is None:
-                raise ImportError("MiniMax M2 runtime operators are unavailable.")
-            model_kwargs["runtime_config"] = build_minimax_m2_runtime_config(
-                hf_config,
-                self.parallel_context,
-                layer_invariant_page_table=config.vllm_sparse_method == "",
-                max_decode_tokens=_resolve_decode_static_batch_capacity(
-                    decode_static_capture_sizes,
-                    max_num_seqs_in_batch=config.max_num_seqs_in_batch,
-                    max_decoding_seqs=config.max_decoding_seqs,
-                ),
-                cuda_graph=config.decode_cuda_graph,
-                device_index=int(self.device.index or 0),
-            )
-
-        self.model = _create_model(hf_config, config.model_spec, **model_kwargs)
+        self.model = _create_model(
+            hf_config,
+            config.model_spec,
+            engine_config=config,
+            parallel_context=self.parallel_context,
+            device=self.device,
+            max_decode_tokens=_resolve_decode_static_batch_capacity(
+                decode_static_capture_sizes,
+                max_num_seqs_in_batch=config.max_num_seqs_in_batch,
+                max_decoding_seqs=config.max_decoding_seqs,
+            ),
+        )
         if config.tiny_random:
             from sparsevllm.debug.tiny_random import initialize_sparse_model
 
