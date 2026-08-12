@@ -5,142 +5,8 @@ from dataclasses import dataclass, field, replace
 import torch
 import torch.distributed as dist
 
-from sparsevllm.distributed.topology import ParallelTopology
+from sparsevllm.distributed.topology import ParallelTopology, parallel_group_ranks
 from sparsevllm.operators.all_reduce import AllReduceProvider, resolve_all_reduce_provider
-
-
-def _validate_sizes(tp_size: int, ep_size: int, dp_size: int) -> tuple[int, int, int]:
-    sizes = (int(tp_size), int(ep_size), int(dp_size))
-    if any(size <= 0 for size in sizes):
-        raise ValueError(
-            "Parallel sizes must be positive, "
-            f"got TP={sizes[0]}, EP={sizes[1]}, DP={sizes[2]}."
-        )
-    return sizes
-
-
-def world_rank_from_parallel_ranks(
-    dp_rank: int,
-    ep_rank: int,
-    tp_rank: int,
-    *,
-    tp_size: int,
-    ep_size: int,
-    dp_size: int,
-) -> int:
-    tp_size, ep_size, dp_size = _validate_sizes(tp_size, ep_size, dp_size)
-    dp_rank, ep_rank, tp_rank = int(dp_rank), int(ep_rank), int(tp_rank)
-    if not 0 <= dp_rank < dp_size:
-        raise ValueError(f"dp_rank must be in [0, {dp_size}), got {dp_rank}.")
-    if not 0 <= ep_rank < ep_size:
-        raise ValueError(f"ep_rank must be in [0, {ep_size}), got {ep_rank}.")
-    if not 0 <= tp_rank < tp_size:
-        raise ValueError(f"tp_rank must be in [0, {tp_size}), got {tp_rank}.")
-    return ((dp_rank * ep_size) + ep_rank) * tp_size + tp_rank
-
-
-def parallel_ranks_from_world_rank(
-    world_rank: int,
-    *,
-    tp_size: int,
-    ep_size: int,
-    dp_size: int,
-) -> tuple[int, int, int]:
-    tp_size, ep_size, dp_size = _validate_sizes(tp_size, ep_size, dp_size)
-    world_size = tp_size * ep_size * dp_size
-    world_rank = int(world_rank)
-    if not 0 <= world_rank < world_size:
-        raise ValueError(f"world_rank must be in [0, {world_size}), got {world_rank}.")
-    dp_ep_rank, tp_rank = divmod(world_rank, tp_size)
-    dp_rank, ep_rank = divmod(dp_ep_rank, ep_size)
-    return dp_rank, ep_rank, tp_rank
-
-
-def parallel_group_ranks(
-    *,
-    tp_size: int,
-    ep_size: int,
-    dp_size: int,
-) -> dict[str, tuple[tuple[int, ...], ...]]:
-    tp_size, ep_size, dp_size = _validate_sizes(tp_size, ep_size, dp_size)
-
-    tensor_groups = tuple(
-        tuple(
-            world_rank_from_parallel_ranks(
-                dp_rank,
-                ep_rank,
-                tp_rank,
-                tp_size=tp_size,
-                ep_size=ep_size,
-                dp_size=dp_size,
-            )
-            for tp_rank in range(tp_size)
-        )
-        for dp_rank in range(dp_size)
-        for ep_rank in range(ep_size)
-    )
-    expert_groups = tuple(
-        tuple(
-            world_rank_from_parallel_ranks(
-                dp_rank,
-                ep_rank,
-                tp_rank,
-                tp_size=tp_size,
-                ep_size=ep_size,
-                dp_size=dp_size,
-            )
-            for ep_rank in range(ep_size)
-        )
-        for dp_rank in range(dp_size)
-        for tp_rank in range(tp_size)
-    )
-    data_groups = tuple(
-        tuple(
-            world_rank_from_parallel_ranks(
-                dp_rank,
-                ep_rank,
-                tp_rank,
-                tp_size=tp_size,
-                ep_size=ep_size,
-                dp_size=dp_size,
-            )
-            for dp_rank in range(dp_size)
-        )
-        for ep_rank in range(ep_size)
-        for tp_rank in range(tp_size)
-    )
-    return {
-        "tensor": tensor_groups,
-        "expert": expert_groups,
-        "data": data_groups,
-    }
-
-
-def hybrid_moe_group_ranks(
-    *,
-    topology: ParallelTopology,
-) -> dict[str, tuple[tuple[int, ...], ...]]:
-    if not topology.is_outer_tp_moe:
-        raise ValueError("Hybrid MoE groups require an Outer-TP MoE topology.")
-    outer_tp_size = topology.attention_tp_size
-    moe_ep_size = topology.expert_parallel_size
-    moe_tp_size = topology.moe_tp_size
-    attention_groups = (tuple(range(outer_tp_size)),)
-    moe_tensor_groups = tuple(
-        tuple(range(ep_rank * moe_tp_size, (ep_rank + 1) * moe_tp_size))
-        for ep_rank in range(moe_ep_size)
-    )
-    moe_expert_groups = tuple(
-        tuple(ep_rank * moe_tp_size + moe_tp_rank for ep_rank in range(moe_ep_size))
-        for moe_tp_rank in range(moe_tp_size)
-    )
-    singleton_groups = tuple((rank,) for rank in range(outer_tp_size))
-    return {
-        "attention": attention_groups,
-        "moe_tensor": moe_tensor_groups,
-        "moe_expert": moe_expert_groups,
-        "data": singleton_groups,
-    }
 
 
 @dataclass(frozen=True)
@@ -357,21 +223,7 @@ def init_parallel_context(
             f"world_size={world_size}, TP={tp_size}, EP={ep_size}, DP={dp_size}."
         )
 
-    if topology.is_outer_tp_moe:
-        hybrid_groups = hybrid_moe_group_ranks(topology=topology)
-        ranks_by_dimension = {
-            "tensor": hybrid_groups["attention"],
-            "expert": hybrid_groups["moe_expert"],
-            "data": hybrid_groups["data"],
-            "moe_tensor": hybrid_groups["moe_tensor"],
-        }
-    else:
-        ranks_by_dimension = parallel_group_ranks(
-            tp_size=tp_size,
-            ep_size=ep_size,
-            dp_size=dp_size,
-        )
-        ranks_by_dimension["moe_tensor"] = ranks_by_dimension["tensor"]
+    ranks_by_dimension = parallel_group_ranks(topology)
     world_ranks = tuple(range(world_size))
     process_groups: dict[tuple[int, ...], dist.ProcessGroup | None] = {
         world_ranks: dist.group.WORLD,

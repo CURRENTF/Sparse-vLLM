@@ -12,10 +12,7 @@ from sparsevllm.distributed import (
     ParallelGroup,
     ParallelMode,
     ParallelTopology,
-)
-from sparsevllm.distributed.parallel_context import (
     get_parallel_context,
-    hybrid_moe_group_ranks,
     init_parallel_context,
     parallel_group_ranks,
     parallel_ranks_from_world_rank,
@@ -93,36 +90,28 @@ def _hf_config(model_type: str = "qwen3_moe", *, num_experts: int = 8):
 
 
 def test_world_rank_mapping_round_trips():
+    topology = ParallelTopology(2, 3, 4)
     for world_rank in range(24):
-        ranks = parallel_ranks_from_world_rank(
-            world_rank,
-            tp_size=2,
-            ep_size=3,
-            dp_size=4,
-        )
-        assert world_rank_from_parallel_ranks(
-            *ranks,
-            tp_size=2,
-            ep_size=3,
-            dp_size=4,
-        ) == world_rank
+        ranks = parallel_ranks_from_world_rank(topology, world_rank)
+        assert world_rank_from_parallel_ranks(topology, *ranks) == world_rank
 
 
 def test_parallel_group_members_follow_dp_ep_tp_layout():
-    assert parallel_group_ranks(tp_size=2, ep_size=2, dp_size=2) == {
-        "tensor": ((0, 1), (2, 3), (4, 5), (6, 7)),
+    tensor_groups = ((0, 1), (2, 3), (4, 5), (6, 7))
+    assert parallel_group_ranks(ParallelTopology(2, 2, 2)) == {
+        "tensor": tensor_groups,
         "expert": ((0, 2), (1, 3), (4, 6), (5, 7)),
         "data": ((0, 4), (1, 5), (2, 6), (3, 7)),
+        "moe_tensor": tensor_groups,
     }
 
 
 def test_hybrid_moe_groups_split_outer_attention_world():
-    assert hybrid_moe_group_ranks(
-        topology=ParallelTopology(4, 2, 1, ParallelMode.OUTER_TP_MOE)
-    ) == {
-        "attention": ((0, 1, 2, 3),),
+    topology = ParallelTopology(4, 2, 1, ParallelMode.OUTER_TP_MOE)
+    assert parallel_group_ranks(topology) == {
+        "tensor": ((0, 1, 2, 3),),
         "moe_tensor": ((0, 1), (2, 3)),
-        "moe_expert": ((0, 2), (1, 3)),
+        "expert": ((0, 2), (1, 3)),
         "data": ((0,), (1,), (2,), (3,)),
     }
 
