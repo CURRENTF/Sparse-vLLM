@@ -7,6 +7,7 @@ from enum import Enum
 class ParallelMode(str, Enum):
     STANDARD = "standard"
     OUTER_TP_MOE = "outer_tp_moe_tp_ep"
+    DPA_EP = "dpa_ep"
 
 
 @dataclass(frozen=True)
@@ -45,17 +46,32 @@ class ParallelTopology:
                     "Outer-TP MoE requires TP divisible by EP, "
                     f"got TP={self.tensor_parallel_size}, EP={self.expert_parallel_size}."
                 )
+        elif self.mode is ParallelMode.DPA_EP and (
+            self.tensor_parallel_size != 1
+            or self.expert_parallel_size != self.data_parallel_size
+        ):
+            raise ValueError(
+                "DPA+EP requires TP=1 and matching DP/EP sizes, "
+                f"got TP={self.tensor_parallel_size}, "
+                f"EP={self.expert_parallel_size}, DP={self.data_parallel_size}."
+            )
 
     @property
     def is_outer_tp_moe(self) -> bool:
         return self.mode is ParallelMode.OUTER_TP_MOE
 
     @property
+    def is_dpa_ep(self) -> bool:
+        return self.mode is ParallelMode.DPA_EP
+
+    @property
     def attention_tp_size(self) -> int:
-        return self.tensor_parallel_size
+        return 1 if self.is_dpa_ep else self.tensor_parallel_size
 
     @property
     def moe_tp_size(self) -> int:
+        if self.is_dpa_ep:
+            return 1
         return (
             self.tensor_parallel_size // self.expert_parallel_size
             if self.is_outer_tp_moe
@@ -64,6 +80,8 @@ class ParallelTopology:
 
     @property
     def world_size(self) -> int:
+        if self.is_dpa_ep:
+            return self.data_parallel_size
         return (
             self.tensor_parallel_size
             if self.is_outer_tp_moe
@@ -79,8 +97,10 @@ def world_rank_from_parallel_ranks(
     ep_rank: int,
     tp_rank: int,
 ) -> int:
-    if topology.is_outer_tp_moe:
-        raise ValueError("Outer-TP MoE does not use standard DP/EP/TP rank mapping.")
+    if topology.mode is not ParallelMode.STANDARD:
+        raise ValueError(
+            f"{topology.mode.value} does not use standard DP/EP/TP rank mapping."
+        )
     dp_rank, ep_rank, tp_rank = int(dp_rank), int(ep_rank), int(tp_rank)
     for name, rank, size in (
         ("dp_rank", dp_rank, topology.data_parallel_size),
@@ -100,8 +120,10 @@ def parallel_ranks_from_world_rank(
     topology: ParallelTopology,
     world_rank: int,
 ) -> tuple[int, int, int]:
-    if topology.is_outer_tp_moe:
-        raise ValueError("Outer-TP MoE does not use standard DP/EP/TP rank mapping.")
+    if topology.mode is not ParallelMode.STANDARD:
+        raise ValueError(
+            f"{topology.mode.value} does not use standard DP/EP/TP rank mapping."
+        )
     world_rank = int(world_rank)
     if not 0 <= world_rank < topology.world_size:
         raise ValueError(
@@ -166,11 +188,24 @@ def _outer_tp_moe_group_ranks(
     }
 
 
+def _dpa_ep_group_ranks(
+    topology: ParallelTopology,
+) -> dict[str, tuple[tuple[int, ...], ...]]:
+    world = tuple(range(topology.world_size))
+    singletons = tuple((rank,) for rank in world)
+    return {
+        "tensor": singletons,
+        "expert": (world,),
+        "data": (world,),
+        "moe_tensor": singletons,
+    }
+
+
 def parallel_group_ranks(
     topology: ParallelTopology,
 ) -> dict[str, tuple[tuple[int, ...], ...]]:
-    return (
-        _outer_tp_moe_group_ranks(topology)
-        if topology.is_outer_tp_moe
-        else _standard_group_ranks(topology)
-    )
+    if topology.is_dpa_ep:
+        return _dpa_ep_group_ranks(topology)
+    if topology.is_outer_tp_moe:
+        return _outer_tp_moe_group_ranks(topology)
+    return _standard_group_ranks(topology)

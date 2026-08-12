@@ -122,9 +122,14 @@ def load_and_validate_model(config) -> None:
         "quantization_config",
         config_get(config.outer_hf_config, "quantization_config", None),
     )
+    use_unquantized_tiny = bool(
+        config.tiny_random and model_spec.tiny_random_unquantized
+    )
+    if use_unquantized_tiny:
+        raw_quantization_config = None
     config.quantization_config = QuantizationConfig.from_hf_config(
         raw_quantization_config,
-        required_fp8=model_spec.requires_fp8,
+        required_fp8=model_spec.requires_fp8 and not use_unquantized_tiny,
         model_name=model_spec.name,
     )
     if config.tiny_random and config.quantization_config.enabled:
@@ -132,14 +137,17 @@ def load_and_validate_model(config) -> None:
             "Tiny random mode does not support quantized model weights."
         )
     setattr(config.hf_config, "quantization_config", config.quantization_config)
-    validate_checkpoint(
-        model_type,
-        outer_config=config.outer_hf_config,
-        config=config.hf_config,
-        raw_quantization_config=raw_quantization_config,
-        quantization=config.quantization_config,
-        topology=config.parallel_topology,
-    )
+    if not (
+        config.tiny_random and model_spec.skip_checkpoint_validation_in_tiny_random
+    ):
+        validate_checkpoint(
+            model_type,
+            outer_config=config.outer_hf_config,
+            config=config.hf_config,
+            raw_quantization_config=raw_quantization_config,
+            quantization=config.quantization_config,
+            topology=config.parallel_topology,
+        )
 
     validate_model_runtime_compatibility(
         model_type=model_type,

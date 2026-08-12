@@ -15,6 +15,7 @@
 | Qwen3.6 MoE | `qwen3_5_moe` | BF16 / 块级 FP8 | ✅ | 仅支持 1 | ✅ |
 | Llama 3 / 3.1 | `llama` | BF16 / FP16 | ✅ | 仅支持 1 | 仅支持 1 |
 | MiniMax M2.7 | `minimax_m2` | 块级 FP8，非量化权重使用 BF16 | ✅ | 仅支持 1 | ✅ |
+| DeepSeek V4 Flash | `deepseek_v4` | Dense E4M3 FP8 + Expert MXFP4 | 仅支持 1 | ✅，且 DP=EP | ✅，且 EP=DP |
 
 TP 规模限制为 1 到 8，并且 checkpoint 维度（包括 attention head 数和 vocabulary 大小）必须能被所选 TP 规模整除。Qwen3MoE 的 EP 规模必须整除 `num_experts`；MiniMax M2.7 的 EP 规模必须整除 `num_local_experts`。
 
@@ -40,6 +41,7 @@ MoE 使用 `model_type=qwen3_5_moe`。
 | Qwen3.6 MoE | ✅ | ✅ | ✅ | 实验性⁴ | ✅ | ✅ | ✅ | ✅ | — | — |
 | Llama 3 / 3.1 | ✅ | ✅ | ✅ | 实验性⁴ | ✅ | ✅ | ✅ | ✅ | 指定 checkpoint¹ | 需要 compressor² |
 | MiniMax M2.7 | ✅ | ✅ | ✅ | 实验性⁴ | ✅ | ✅ | ✅ | ✅ | — | — |
+| DeepSeek V4 Flash | ✅ | — | — | — | — | — | — | — | — | — |
 
 ¹ SkipKV 仅支持已发布 steering vector 的模型：
 `DeepSeek-R1-Distill-Qwen-7B`、`DeepSeek-R1-Distill-Qwen-14B` 和

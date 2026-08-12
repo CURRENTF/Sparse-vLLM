@@ -34,6 +34,8 @@ def _attention_type(value: Any) -> str:
         "attention",
         "self_attention",
         "sliding_attention",
+        "compressed_sparse_attention",
+        "heavily_compressed_attention",
     }:
         return "full"
     if value in {

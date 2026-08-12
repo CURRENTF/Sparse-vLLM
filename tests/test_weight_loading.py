@@ -96,6 +96,39 @@ class _ExpertOwnershipModel(nn.Module):
         )
 
 
+class _CustomScaleLinear(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.quantized = True
+        self._quantized_weight_loaded = False
+        self.weight = nn.Parameter(
+            torch.empty(2, 2, dtype=torch.float8_e4m3fn), requires_grad=False
+        )
+        self.register_buffer("weight_scale_inv", torch.empty(1, 1))
+
+    def load_quantized_weight(self, weight, scale, loaded_shard_id=None):
+        assert loaded_shard_id is None
+        self.weight.copy_(weight)
+        self.weight_scale_inv.copy_(scale.float())
+        self._quantized_weight_loaded = True
+
+
+class _CustomScaleModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.proj = _CustomScaleLinear()
+
+    @staticmethod
+    def scale_key_for_weight(weight_key):
+        return weight_key.removesuffix(".weight") + ".scale"
+
+    @staticmethod
+    def weight_key_for_scale(scale_key):
+        if not scale_key.endswith(".scale"):
+            return None
+        return scale_key.removesuffix(".scale") + ".weight"
+
+
 def _write_two_shards(path):
     left = torch.arange(4, dtype=torch.float32).reshape(2, 2)
     right = torch.arange(4, 8, dtype=torch.float32).reshape(2, 2)
@@ -209,6 +242,21 @@ def test_load_model_keeps_remote_expert_tensors_as_metadata(tmp_path):
     assert model.skipped == [
         ("remote.weight", (4, 2), "F32", (1, 1), "F32")
     ]
+
+
+def test_load_model_supports_model_specific_scale_keys(tmp_path):
+    weight = torch.tensor([[1.0, 2.0], [3.0, 4.0]]).to(torch.float8_e4m3fn)
+    scale = torch.tensor([[0.5]], dtype=torch.float8_e8m0fnu)
+    save_file(
+        {"proj.weight": weight, "proj.scale": scale},
+        tmp_path / "model.safetensors",
+    )
+    model = _CustomScaleModel()
+
+    loader.load_model(model, str(tmp_path), show_progress=False)
+
+    torch.testing.assert_close(model.proj.weight.float(), weight.float())
+    torch.testing.assert_close(model.proj.weight_scale_inv, scale.float())
 
 
 def test_load_model_selects_all_files_for_local_checkpoint_rank(tmp_path):

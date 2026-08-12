@@ -20,6 +20,7 @@
 | RULER-VT | `benchmark/ruler_vt/pred.py` | 使用原生 benchmark adapter、自包含的 RULER variable-tracking generator/evaluator。 |
 | NIAH | `benchmark/niah/test_niah.py` | 原生 Sparse-vLLM needle-in-a-haystack 长上下文 runner。 |
 | Regression harness | [`sparsevllm-regression-tests.md`](sparsevllm-regression-tests.md) | 固定的 quality/performance/stress 检查。 |
+| DeepSeek V4 Flash | [`deepseek-v4-flash.md`](deepseek-v4-flash.md) | DPA+EP、CUDA Graph、正确性与性能验收记录。 |
 
 ## 吞吐量 Benchmark
 
