@@ -286,8 +286,6 @@ def _artifact_records(args, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             record.setdefault("itl_ms", row["itl"])
         if "mem" in row:
             record.setdefault("peak_memory_gb", row["mem"])
-        if "duration_s" in row:
-            record.setdefault("e2e_latency_s", row["duration_s"])
         records.append(record)
     return records
 
@@ -347,19 +345,18 @@ def _write_output_dir(args, rows: list[dict[str, Any]]) -> None:
         f"- Batch sizes: `{args.batch_sizes}`",
         f"- Output length: `{args.output_len}`",
         "",
-        "| Method | Prompt tokens | Batch | Status | E2E s | TTFT s | Prefill tok/s | Decode tok/s | Peak GB | Decode speedup |",
-        "| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| Method | Prompt tokens | Batch | Status | TTFT s | Prefill tok/s | Decode tok/s | Peak GB | Decode speedup |",
+        "| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: |",
     ]
     for record in records:
         ok = record["status"] == "success"
         speedup = record.get("speedup_vs_vanilla_decode")
         report_lines.append(
-            "| {method} | {prompt} | {batch} | {status} | {e2e} | {ttft} | {prefill} | {decode} | {mem} | {speedup} |".format(
+            "| {method} | {prompt} | {batch} | {status} | {ttft} | {prefill} | {decode} | {mem} | {speedup} |".format(
                 method=record.get("method", ""),
                 prompt=record.get("prompt_tokens", ""),
                 batch=record.get("batch_size", ""),
                 status=record["status"],
-                e2e=f"{record.get('e2e_latency_s', 0.0):.3f}" if ok else "",
                 ttft=f"{record.get('ttft_s', 0.0):.3f}" if ok else "",
                 prefill=f"{record.get('prefill_tok_s', 0.0):.1f}" if ok else "",
                 decode=f"{record.get('decode_tok_s', 0.0):.1f}" if ok else "",
@@ -683,9 +680,6 @@ def benchmark_task(method, length, bs, args, results_dict):
             )
 
         torch.cuda.synchronize()
-        t_end = perf_counter()
-        
-        duration = t_end - t_start
         peak_mem = get_peak_memory()
         graph_status = _decode_cuda_graph_status(llm)
         prefix_cache_stats_after = _cache_stats(llm)
@@ -753,7 +747,6 @@ def benchmark_task(method, length, bs, args, results_dict):
             "prefill_tp": prefill_tp,
             "decode_tp": decode_tp,
             "ttft": ttft,
-            "duration_s": duration,
             "itl": avg_itl,
             "avg_bs": avg_active_bs,
             "mem": peak_mem,
