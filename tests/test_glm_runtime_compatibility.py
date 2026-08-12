@@ -29,11 +29,6 @@ def test_mla_prefill_workspace_budget_must_be_positive():
     ("override", "error_type", "message"),
     [
         ({"vllm_sparse_method": "quest"}, ValueError, "Unsupported glm4_moe_lite"),
-        (
-            {"enforce_eager": False},
-            ValueError,
-            "requires enforce_eager=True",
-        ),
     ],
 )
 def test_glm_config_rejects_unsupported_storage_combinations(

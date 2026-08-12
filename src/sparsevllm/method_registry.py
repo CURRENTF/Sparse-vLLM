@@ -138,7 +138,7 @@ GLM4_MOE_LITE_EP_COMPATIBILITY = ModelRuntimeCompatibility(
     prefix_cache_methods=frozenset(
         {"", "streamingllm", "snapkv", "h2o", "omnikv", "rkv"}
     ),
-    requires_eager=True,
+    requires_eager=False,
     decode_cuda_graph_methods=frozenset(
         {"", "streamingllm", "snapkv", "h2o", "omnikv", "rkv"}
     ),
