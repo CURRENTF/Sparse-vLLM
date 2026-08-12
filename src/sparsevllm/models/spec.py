@@ -116,7 +116,7 @@ MODEL_SPECS.update(
             allow_raw_config=True,
             supports_tiny_random=False,
             prefix_cache_block_size_multiple=4096,
-            deltakv_checkpoint_model_types=frozenset({"qwen3_5", "qwen3_6"}),
+            deltakv_checkpoint_model_types=frozenset({"qwen3_5"}),
             runtime_class_name="Qwen35ForCausalLM",
             attention_tp_fields=_QWEN35_TP_FIELDS,
         ),
@@ -138,7 +138,7 @@ MODEL_SPECS.update(
             supports_expert_parallel=True,
             supports_outer_tp_moe=True,
             prefix_cache_block_size_multiple=4096,
-            deltakv_checkpoint_model_types=frozenset({"qwen3_5", "qwen3_6"}),
+            deltakv_checkpoint_model_types=frozenset({"qwen3_5"}),
             runtime_class_name="Qwen35MoeForCausalLM",
             attention_tp_fields=(
                 *_QWEN35_TP_FIELDS,
@@ -163,19 +163,7 @@ MODEL_SPECS.update(
 )
 
 
-MODEL_TYPE_ALIASES = {
-    "qwen3_6": "qwen3_5",
-    "qwen3_6_moe": "qwen3_5_moe",
-}
-
-
-def canonical_model_type(model_type: str | None) -> str:
-    normalized = str(model_type or "").strip().lower()
-    return MODEL_TYPE_ALIASES.get(normalized, normalized)
-
-
 def resolve_model_spec(model_type: str) -> ModelSpec:
-    model_type = canonical_model_type(model_type)
     if model_type not in MODEL_SPECS:
         supported = ", ".join(sorted(MODEL_SPECS))
         raise NotImplementedError(

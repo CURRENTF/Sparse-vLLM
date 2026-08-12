@@ -13,11 +13,7 @@ from sparsevllm.method_registry import (
 )
 from sparsevllm.models.checkpoint import validate_checkpoint
 from sparsevllm.models.layout import RuntimeLayout
-from sparsevllm.models.spec import (
-    ModelSpec,
-    canonical_model_type,
-    resolve_model_spec,
-)
+from sparsevllm.models.spec import ModelSpec, resolve_model_spec
 from sparsevllm.quantization import QuantizationConfig
 from sparsevllm.utils.config import config_get
 from sparsevllm.utils.log import logger, log_once
@@ -41,7 +37,7 @@ def _load_model_config(model_path: str) -> Any:
         ) from load_error
     with open(config_path, "r", encoding="utf-8") as f:
         raw_config = json.load(f)
-    model_type = canonical_model_type(config_get(raw_config, "model_type", ""))
+    model_type = str(config_get(raw_config, "model_type", "") or "")
     model_spec = resolve_model_spec(model_type)
     if not model_spec.allow_raw_config:
         raise RuntimeError(
@@ -93,12 +89,9 @@ def load_and_validate_model(config) -> None:
             "Tiny random mode does not support DeltaKV compressor weights yet."
         )
     config.outer_hf_config = _load_model_config(config.model)
-    model_type = canonical_model_type(
-        config_get(config.outer_hf_config, "model_type", "")
-    )
+    model_type = str(config_get(config.outer_hf_config, "model_type", "") or "")
     model_spec = resolve_model_spec(model_type)
     config.hf_config = _extract_text_config(config.outer_hf_config)
-    setattr(config.hf_config, "model_type", model_type)
     config.model_spec = model_spec
     config.parallel_topology = model_spec.topology(
         config.tensor_parallel_size,

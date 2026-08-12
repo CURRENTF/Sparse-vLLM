@@ -30,7 +30,7 @@ from sparsevllm.engine.chain_cache import ChainAdmissionPlan, ChainCacheCoordina
 from sparsevllm.engine.recurrent_state_manager import RecurrentStateManager, RecurrentStateSpec
 from sparsevllm.engine.runtime_state import RuntimeState
 from sparsevllm.engine.sparse_controller import SparseController
-from sparsevllm.models.spec import resolve_model_spec
+from sparsevllm.models.spec import ModelSpec
 import sparsevllm.platforms as platforms
 from sparsevllm.utils.profiler import profiler
 
@@ -60,8 +60,7 @@ except ImportError:
     Qwen35MoeForCausalLM = None
 
 
-def _create_model(hf_config):
-    model_spec = resolve_model_spec(hf_config.model_type)
+def _create_model(hf_config, model_spec: ModelSpec):
     class_name = model_spec.runtime_class_name
     model_class = globals().get(class_name)
     if model_class is None:
@@ -162,7 +161,7 @@ class ModelRunner:
             bool(getattr(config, "decode_cuda_graph", False)),
         )
         
-        self.model = _create_model(hf_config)
+        self.model = _create_model(hf_config, config.model_spec)
         if config.tiny_random:
             from sparsevllm.debug.tiny_random import initialize_sparse_model
 

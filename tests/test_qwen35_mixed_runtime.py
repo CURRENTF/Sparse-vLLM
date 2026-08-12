@@ -47,6 +47,7 @@ from sparsevllm.models.qwen3_5 import (
 )
 from sparsevllm.models.qwen3_5_moe import Qwen35MoeRouter, Qwen35MoeSparseMoeBlock
 from sparsevllm.models.checkpoint import validate_checkpoint
+from sparsevllm.models.spec import resolve_model_spec
 from sparsevllm.platforms.cpu import CpuPlatform
 from sparsevllm.sampling_params import SamplingParams
 from sparsevllm.utils.loader import _target_weight_name_for_model, _validate_all_quantized_weights_loaded
@@ -907,6 +908,7 @@ def test_model_runner_resets_inherited_allocator_peak_before_model_construction(
         uses_outer_tp_moe_layout=False,
         mlp_chunk_size=16384,
         hf_config=SimpleNamespace(model_type="qwen2", torch_dtype=torch.float32),
+        model_spec=resolve_model_spec("qwen2"),
     )
     with (
         patch.object(platforms, "_current_platform", platform),
@@ -1225,7 +1227,7 @@ def test_qwen35_raw_config_fallback_when_transformers_autoconfig_is_unknown(tmp_
         cfg = Config(model=str(tmp_path))
 
     assert cfg.outer_hf_config.model_type == "qwen3_5"
-    assert cfg.hf_config.model_type == "qwen3_5"
+    assert cfg.hf_config.model_type == "qwen3_5_text"
     assert cfg.runtime_layout.num_kv_layers == 16
 
 

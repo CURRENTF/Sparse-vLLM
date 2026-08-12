@@ -1595,6 +1595,7 @@ class DecodeCudaGraphWarmupPolicyTest(unittest.TestCase):
             max_decoding_seqs=3,
             max_model_len=2048,
             hf_config=SimpleNamespace(vocab_size=32),
+            model_spec=SimpleNamespace(num_experts_field=None),
         )
         prompts = []
         pending = 0
@@ -1686,7 +1687,7 @@ class DecodeCudaGraphWarmupPolicyTest(unittest.TestCase):
         config.max_decoding_seqs = 24
         config.max_num_batched_tokens = 56_214
         config.mlp_chunk_size = 16_384
-        config.hf_config = SimpleNamespace(model_type="qwen3_moe")
+        config.model_spec = SimpleNamespace(num_experts_field="num_experts")
 
         self.assertEqual(
             _moe_workspace_warmup_token_counts(config),
@@ -1695,7 +1696,7 @@ class DecodeCudaGraphWarmupPolicyTest(unittest.TestCase):
 
     def test_dense_model_skips_moe_workspace_warmup(self):
         config = self.make_config(method="vanilla")
-        config.hf_config = SimpleNamespace(model_type="qwen2")
+        config.model_spec = SimpleNamespace(num_experts_field=None)
 
         self.assertEqual(_moe_workspace_warmup_token_counts(config), ())
 
@@ -1705,7 +1706,7 @@ class DecodeCudaGraphWarmupPolicyTest(unittest.TestCase):
             max_decoding_seqs=24,
             max_num_batched_tokens=56_214,
             mlp_chunk_size=16_384,
-            hf_config=SimpleNamespace(model_type="qwen3_moe"),
+            model_spec=SimpleNamespace(num_experts_field="num_experts"),
         )
         calls = []
         engine.model_runner = SimpleNamespace(
@@ -1728,7 +1729,7 @@ class DecodeCudaGraphWarmupPolicyTest(unittest.TestCase):
             max_decoding_seqs=24,
             max_num_batched_tokens=56_214,
             mlp_chunk_size=16_384,
-            hf_config=SimpleNamespace(model_type="qwen3_moe"),
+            model_spec=SimpleNamespace(num_experts_field="num_experts"),
         )
 
         def fail_on_workspace(_method, _num_tokens):
