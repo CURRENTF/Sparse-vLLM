@@ -18,6 +18,7 @@ parallel size must use that value.
 | Qwen3.5 / Qwen3.6 | `qwen3_5` | BF16 / block FP8 | ✅ | 1 only | 1 only |
 | Qwen3.6 MoE | `qwen3_5_moe` | BF16 / block FP8 | ✅ | 1 only | ✅ |
 | GLM-4.7-Flash | `glm4_moe_lite` | BF16 | 1 / 2 / 4 (H100 only)⁵ | 1 only | 1 / 2 / 4⁵ |
+| Gemma 4 Dense / MoE | `gemma4` | BF16 / FP16 | ✅ | 1 only | ✅ (MoE only) |
 | Llama 3 / 3.1 | `llama` | BF16 / FP16 | ✅ | 1 only | 1 only |
 | MiniMax M2.7 | `minimax_m2` | block FP8 with BF16 non-quantized weights | ✅ | 1 only | ✅ |
 
@@ -59,6 +60,7 @@ layer.
 | Qwen3.5 / Qwen3.6 | ✅ | ✅ | ✅ | Experimental⁴ | ✅ | ✅ | ✅ | ✅ | — | Matched checkpoint³ |
 | Qwen3.6 MoE | ✅ | ✅ | ✅ | Experimental⁴ | ✅ | ✅ | ✅ | ✅ | — | — |
 | GLM-4.7-Flash | ✅⁵ | ✅⁵ | ✅⁵ | Experimental⁴⁵ | — | ✅⁵ | — | ✅⁵ | — | — |
+| Gemma 4 Dense / MoE | ✅ | ✅⁶ | — | — | — | ✅ | — | — | — | — |
 | Llama 3 / 3.1 | ✅ | ✅ | ✅ | Experimental⁴ | ✅ | ✅ | ✅ | ✅ | Selected checkpoint¹ | Compressor required² |
 | MiniMax M2.7 | ✅ | ✅ | ✅ | Experimental⁴ | ✅ | ✅ | ✅ | ✅ | — | — |
 
@@ -80,5 +82,20 @@ global-head selection. Model-specific TP, EP, and DP restrictions still apply.
 `DP=1`. At `TP>1`, head-scored sparse methods use TP-local selection without
 cross-rank sparse-index aggregation, so their selection semantics are not
 guaranteed to match `TP=1`.
+
+⁶ Gemma 4 checkpoints with shared KV layers reject per-layer StreamingLLM
+eviction. Vanilla and OmniKV remain supported.
+
+## Native Multimodal Support
+
+Set `enable_multimodal=True` to use a checkpoint's native media towers.
+Sparse-vLLM accepts OpenAI-compatible Chat and Responses content parts and
+uses the checkpoint processor and chat template. Unsupported media fail
+explicitly during admission.
+
+| Model family | Image | Video | Audio |
+| --- | :---: | :---: | :---: |
+| Qwen3.5 / Qwen3.6 Dense and MoE | ✅ | ✅ | — |
+| Gemma 4 Dense and MoE | ✅ | ✅ | Checkpoint dependent |
 
 `—` means that the combination is not currently supported.
