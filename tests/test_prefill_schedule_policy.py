@@ -831,7 +831,7 @@ class PrefillPolicyConfigTest(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(
                     NotImplementedError,
-                    "model types already implemented",
+                    "Unsupported Sparse-vLLM model_type",
                 ):
                     Config(model=str(Path(tmp)), vllm_sparse_method="h2o")
 

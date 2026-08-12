@@ -5,6 +5,7 @@ from dataclasses import dataclass, field, replace
 import torch
 import torch.distributed as dist
 
+from sparsevllm.distributed.topology import ParallelTopology
 from sparsevllm.operators.all_reduce import AllReduceProvider, resolve_all_reduce_provider
 
 
@@ -117,22 +118,13 @@ def parallel_group_ranks(
 
 def hybrid_moe_group_ranks(
     *,
-    outer_tp_size: int,
-    moe_ep_size: int,
+    topology: ParallelTopology,
 ) -> dict[str, tuple[tuple[int, ...], ...]]:
-    outer_tp_size = int(outer_tp_size)
-    moe_ep_size = int(moe_ep_size)
-    if outer_tp_size <= 0 or moe_ep_size <= 0:
-        raise ValueError(
-            "Hybrid MoE parallel sizes must be positive, "
-            f"got outer TP={outer_tp_size}, MoE EP={moe_ep_size}."
-        )
-    if outer_tp_size % moe_ep_size:
-        raise ValueError(
-            "Hybrid MoE outer TP must be divisible by MoE EP, "
-            f"got outer TP={outer_tp_size}, MoE EP={moe_ep_size}."
-        )
-    moe_tp_size = outer_tp_size // moe_ep_size
+    if not topology.is_outer_tp_moe:
+        raise ValueError("Hybrid MoE groups require an Outer-TP MoE topology.")
+    outer_tp_size = topology.attention_tp_size
+    moe_ep_size = topology.expert_parallel_size
+    moe_tp_size = topology.moe_tp_size
     attention_groups = (tuple(range(outer_tp_size)),)
     moe_tensor_groups = tuple(
         tuple(range(ep_rank * moe_tp_size, (ep_rank + 1) * moe_tp_size))
@@ -345,10 +337,7 @@ def _local_group(
 
 def init_parallel_context(
     *,
-    tp_size: int,
-    ep_size: int,
-    dp_size: int,
-    hybrid_moe: bool = False,
+    topology: ParallelTopology,
 ) -> ParallelContext:
     global _PARALLEL_CONTEXT
     if _PARALLEL_CONTEXT is not None:
@@ -356,10 +345,10 @@ def init_parallel_context(
     if not dist.is_initialized():
         raise RuntimeError("torch.distributed must be initialized before ParallelContext.")
 
-    tp_size, ep_size, dp_size = _validate_sizes(tp_size, ep_size, dp_size)
-    if hybrid_moe and dp_size != 1:
-        raise ValueError(f"Hybrid MoE parallelism requires DP=1, got DP={dp_size}.")
-    expected_world_size = tp_size if hybrid_moe else tp_size * ep_size * dp_size
+    tp_size = topology.tensor_parallel_size
+    ep_size = topology.expert_parallel_size
+    dp_size = topology.data_parallel_size
+    expected_world_size = topology.world_size
     world_size = dist.get_world_size()
     world_rank = dist.get_rank()
     if world_size != expected_world_size:
@@ -368,11 +357,8 @@ def init_parallel_context(
             f"world_size={world_size}, TP={tp_size}, EP={ep_size}, DP={dp_size}."
         )
 
-    if hybrid_moe:
-        hybrid_groups = hybrid_moe_group_ranks(
-            outer_tp_size=tp_size,
-            moe_ep_size=ep_size,
-        )
+    if topology.is_outer_tp_moe:
+        hybrid_groups = hybrid_moe_group_ranks(topology=topology)
         ranks_by_dimension = {
             "tensor": hybrid_groups["attention"],
             "expert": hybrid_groups["moe_expert"],

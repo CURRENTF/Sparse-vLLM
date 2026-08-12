@@ -6,8 +6,13 @@ import torch
 import torch.distributed as dist
 
 import sparsevllm.platforms as platforms
-from sparsevllm.config import Config
-from sparsevllm.distributed import ParallelContext, ParallelGroup
+from sparsevllm.config import Config, RuntimeLayout
+from sparsevllm.distributed import (
+    ParallelContext,
+    ParallelGroup,
+    ParallelMode,
+    ParallelTopology,
+)
 from sparsevllm.distributed.parallel_context import (
     get_parallel_context,
     hybrid_moe_group_ranks,
@@ -112,12 +117,35 @@ def test_parallel_group_members_follow_dp_ep_tp_layout():
 
 
 def test_hybrid_moe_groups_split_outer_attention_world():
-    assert hybrid_moe_group_ranks(outer_tp_size=4, moe_ep_size=2) == {
+    assert hybrid_moe_group_ranks(
+        topology=ParallelTopology(4, 2, 1, ParallelMode.OUTER_TP_MOE)
+    ) == {
         "attention": ((0, 1, 2, 3),),
         "moe_tensor": ((0, 1), (2, 3)),
         "moe_expert": ((0, 2), (1, 3)),
         "data": ((0,), (1,), (2,), (3,)),
     }
+
+
+def test_parallel_topology_resolves_rank_local_sizes():
+    standard = ParallelTopology(2, 4, 1)
+    hybrid = ParallelTopology(4, 2, 1, ParallelMode.OUTER_TP_MOE)
+
+    assert (standard.world_size, standard.attention_tp_size, standard.moe_tp_size) == (8, 2, 2)
+    assert (hybrid.world_size, hybrid.attention_tp_size, hybrid.moe_tp_size) == (4, 4, 2)
+
+
+@pytest.mark.parametrize(
+    "topology",
+    [
+        (0, 1, 1, ParallelMode.STANDARD),
+        (4, 3, 1, ParallelMode.OUTER_TP_MOE),
+        (4, 2, 2, ParallelMode.OUTER_TP_MOE),
+    ],
+)
+def test_parallel_topology_rejects_invalid_sizes(topology):
+    with pytest.raises(ValueError):
+        ParallelTopology(*topology)
 
 
 def test_hybrid_moe_parallel_context_uses_explicit_groups():
@@ -130,10 +158,7 @@ def test_hybrid_moe_parallel_context_uses_explicit_groups():
             patch.object(dist, "new_group", side_effect=lambda _ranks: object()),
     ):
         context = init_parallel_context(
-            tp_size=4,
-            ep_size=2,
-            dp_size=1,
-            hybrid_moe=True,
+            topology=ParallelTopology(4, 2, 1, ParallelMode.OUTER_TP_MOE),
         )
     assert context.attention.ranks == (0, 1, 2, 3)
     assert context.attention_tp_rank == 2
@@ -160,7 +185,8 @@ def test_parallel_context_lifecycle_and_local_groups():
         patch.object(dist, "get_backend", return_value=dist.Backend.GLOO),
         patch.object(dist, "new_group", side_effect=new_group),
     ):
-        context = init_parallel_context(tp_size=1, ep_size=2, dp_size=2)
+        topology = ParallelTopology(1, 2, 2)
+        context = init_parallel_context(topology=topology)
         assert context.world_rank == 2
         assert context.tp_rank == 0
         assert context.tp_size == 1
@@ -170,7 +196,7 @@ def test_parallel_context_lifecycle_and_local_groups():
         assert context.data.ranks == (0, 2)
         assert get_parallel_context() is context
         with pytest.raises(RuntimeError, match="already initialized"):
-            init_parallel_context(tp_size=1, ep_size=2, dp_size=2)
+            init_parallel_context(topology=topology)
 
     assert [ranks for ranks, _ in fake_groups] == [
         (0, 1),
@@ -191,7 +217,7 @@ def test_parallel_context_rejects_world_size_mismatch():
         patch.object(dist, "get_rank", return_value=0),
     ):
         with pytest.raises(ValueError, match="does not match"):
-            init_parallel_context(tp_size=1, ep_size=4, dp_size=1)
+            init_parallel_context(topology=ParallelTopology(1, 4, 1))
 
 
 def test_ep_broadcast_uses_source_world_rank():
@@ -237,7 +263,7 @@ def test_qwen3_moe_parallel_config_validation(tmp_path):
     assert config.expert_parallel_size == 1
 
     with patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", return_value=_hf_config()):
-        with pytest.raises(ValueError, match="num_key_value_heads must be divisible"):
+        with pytest.raises(ValueError, match="num_key_value_heads"):
             Config(model=str(tmp_path), tensor_parallel_size=4)
 
     fp16 = _hf_config()
@@ -247,7 +273,7 @@ def test_qwen3_moe_parallel_config_validation(tmp_path):
             Config(model=str(tmp_path), tensor_parallel_size=2)
 
     with patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", return_value=_hf_config()):
-        with pytest.raises(ValueError, match="outer tensor_parallel_size"):
+        with pytest.raises(ValueError, match="TP divisible by EP"):
             Config(model=str(tmp_path), tensor_parallel_size=3, expert_parallel_size=2)
 
     with patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", return_value=_hf_config(num_experts=6)):
@@ -354,7 +380,7 @@ def test_qwen3_dense_fp8_rejects_wrong_architecture(tmp_path):
 
 def test_dense_config_rejects_expert_or_data_parallelism(tmp_path):
     with patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", return_value=_hf_config("qwen3")):
-        with pytest.raises(ValueError, match="requires EP=1 and DP=1"):
+        with pytest.raises(ValueError, match="does not support expert parallelism"):
             Config(model=str(tmp_path), expert_parallel_size=2)
 
 
@@ -401,7 +427,7 @@ def test_cache_kv_heads_depend_on_tp_not_ep():
             hidden_size=32,
             head_dim=4,
         ),
-        runtime_layout=None,
+        runtime_layout=RuntimeLayout.dense(2),
         max_model_len=128,
         max_num_seqs_in_gpu=2,
         max_num_seqs_in_batch=2,

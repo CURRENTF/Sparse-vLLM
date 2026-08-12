@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from sparsevllm.config import Config
+from sparsevllm.distributed import ParallelMode, ParallelTopology
 from sparsevllm.method_registry import (
     MINIMAX_M2_EP_COMPATIBILITY,
     MINIMAX_M2_TP_EP_COMPATIBILITY,
@@ -92,15 +93,12 @@ def test_minimax_config_accepts_first_milestone_runtime(
 @pytest.mark.parametrize(
     ("field_name", "invalid_value"),
     [
-        ("hidden_size", 4096),
-        ("rotary_dim", 128),
         ("qk_norm_type", "per_head"),
         ("scoring_func", "softmax"),
         ("use_mtp", False),
-        ("num_mtp_modules", 0),
     ],
 )
-def test_minimax_config_rejects_checkpoint_drift(
+def test_minimax_config_rejects_unsupported_semantics(
     tmp_path,
     field_name,
     invalid_value,
@@ -108,6 +106,30 @@ def test_minimax_config_rejects_checkpoint_drift(
     hf_config = _official_config(**{field_name: invalid_value})
     with pytest.raises(ValueError, match=field_name):
         _make_config(tmp_path, hf_config=hf_config)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("vocab_size", 200192),
+        ("hidden_size", 4096),
+        ("num_hidden_layers", 48),
+        ("rotary_dim", 128),
+        ("max_position_embeddings", 262144),
+        ("num_mtp_modules", 0),
+    ],
+)
+def test_minimax_config_accepts_checkpoint_shape_variants(
+    tmp_path,
+    field_name,
+    value,
+):
+    config = _make_config(
+        tmp_path,
+        hf_config=_official_config(**{field_name: value}),
+    )
+
+    assert getattr(config.hf_config, field_name) == value
 
 
 def test_minimax_config_requires_all_fp8_exclusions(tmp_path):
@@ -132,7 +154,7 @@ def test_minimax_config_rejects_unvalidated_parallel_layout(
     tmp_path,
     parallel_kwargs,
 ):
-    with pytest.raises(ValueError, match="MiniMax M2.7"):
+    with pytest.raises(ValueError, match="MiniMax M2.7|Outer-TP MoE"):
         _make_config(tmp_path, **parallel_kwargs)
 
 
@@ -171,12 +193,23 @@ def _validate(method="", **overrides):
         "enable_prefix_caching": True,
     }
     values.update(overrides)
+    tp_size = values.pop("tensor_parallel_size")
+    ep_size = values.pop("expert_parallel_size")
+    dp_size = values.pop("data_parallel_size")
+    values["topology"] = ParallelTopology(
+        tp_size,
+        ep_size,
+        dp_size,
+        ParallelMode.OUTER_TP_MOE if tp_size > 1 else ParallelMode.STANDARD,
+    )
     return validate_model_runtime_compatibility(**values)
 
 
 def test_minimax_compatibility_matches_qwen3_moe_sparse_runtime():
-    assert MODEL_RUNTIME_COMPATIBILITY["minimax_m2"] is MINIMAX_M2_EP_COMPATIBILITY
-    assert MINIMAX_M2_EP_COMPATIBILITY.parallel_mode == "ep_replicated_kv"
+    assert (
+        MODEL_RUNTIME_COMPATIBILITY["minimax_m2", ParallelMode.STANDARD]
+        is MINIMAX_M2_EP_COMPATIBILITY
+    )
     assert MINIMAX_M2_EP_COMPATIBILITY.sparse_methods == {
         "",
         "streamingllm",
@@ -200,7 +233,6 @@ def test_minimax_compatibility_matches_qwen3_moe_sparse_runtime():
 
 
 def test_minimax_outer_tp_compatibility_preserves_sparse_matrix():
-    assert MINIMAX_M2_TP_EP_COMPATIBILITY.parallel_mode == "outer_tp_moe_tp_ep"
     assert (
         MINIMAX_M2_TP_EP_COMPATIBILITY.sparse_methods
         == MINIMAX_M2_EP_COMPATIBILITY.sparse_methods

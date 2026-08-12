@@ -1,6 +1,8 @@
 """DeltaKV configuration normalization and runtime validation."""
 
 import importlib.util
+import json
+import os
 from typing import Any
 
 from sparsevllm.configs.common import (
@@ -8,10 +10,6 @@ from sparsevllm.configs.common import (
     _normalize_int_attr,
     _normalize_positive_int,
     _normalize_positive_multiple,
-)
-from sparsevllm.configs.model import (
-    _is_qwen35_deltakv_checkpoint,
-    _qwen35_deltakv_message,
 )
 from sparsevllm.utils.log import log_once
 
@@ -40,15 +38,6 @@ def _resolve_deltakv_sparse_decode_backend(value: Any) -> str:
             "use 'custom' or leave it as 'auto' when flash_attn is not installed."
         )
     return backend
-
-
-SUPPORTED_SKIPKV_MODEL_NAMES = frozenset(
-    {
-        "DeepSeek-R1-Distill-Llama-8B",
-        "DeepSeek-R1-Distill-Qwen-7B",
-        "DeepSeek-R1-Distill-Qwen-14B",
-    }
-)
 
 
 def _normalize_deltakv_kernel_options(config) -> None:
@@ -150,7 +139,24 @@ def normalize_deltakv_storage(config) -> None:
     _normalize_deltakv_capacity(config)
 
 
-def validate_deltakv_runtime(config, *, is_qwen35: bool) -> None:
+def _checkpoint_targets_model(path: str | None, model_types: frozenset[str]) -> bool:
+    config_path = os.path.join(path, "config.json") if path and os.path.isdir(path) else None
+    if config_path is None or not os.path.isfile(config_path):
+        return False
+    with open(config_path, "r", encoding="utf-8") as f:
+        checkpoint_config = json.load(f)
+    return any(
+        str(checkpoint_config.get(field, "")).strip().lower() in model_types
+        for field in (
+            "model_type",
+            "base_model_type",
+            "target_model_type",
+            "runtime_model_type",
+        )
+    )
+
+
+def validate_deltakv_runtime(config) -> None:
     # Normalize compressor type strings.
     for attr in ("compressor_down_type", "compressor_up_type"):
         v = getattr(config, attr, "auto")
@@ -165,8 +171,15 @@ def validate_deltakv_runtime(config, *, is_qwen35: bool) -> None:
             "verify results carefully before treating them as final.",
             level="WARNING",
         )
-        if is_qwen35 and not _is_qwen35_deltakv_checkpoint(config.deltakv_path):
-            raise ValueError(_qwen35_deltakv_message())
+        checkpoint_model_types = config.model_spec.deltakv_checkpoint_model_types
+        if checkpoint_model_types and not _checkpoint_targets_model(
+            config.deltakv_path,
+            checkpoint_model_types,
+        ):
+            raise ValueError(
+                f"DeltaKV for {config.model_spec.name} requires a compatible "
+                "deltakv_path. Use vllm_sparse_method='' to run vanilla inference."
+            )
         if not bool(getattr(config, "use_compression", True)):
             raise ValueError("DeltaKV runtime is compressor-only; set use_compression=True.")
         if bool(getattr(config, "enable_sparse_ref_fp8", False)):

@@ -8,8 +8,8 @@ import torch
 
 import sparsevllm.platforms as platforms
 from sparsevllm.platforms import device_runtime
-from sparsevllm.config import Config, RuntimeLayout
-from sparsevllm.distributed import ParallelContext, ParallelGroup
+from sparsevllm.config import Config, QuantizationConfig, RuntimeLayout
+from sparsevllm.distributed import ParallelContext, ParallelGroup, ParallelTopology
 from sparsevllm.engine.cache_manager.base import (
     CacheManager,
     LayerBatchStates,
@@ -46,6 +46,7 @@ from sparsevllm.models.qwen3_5 import (
     _get_rotary_dim,
 )
 from sparsevllm.models.qwen3_5_moe import Qwen35MoeRouter, Qwen35MoeSparseMoeBlock
+from sparsevllm.models.checkpoint import validate_checkpoint
 from sparsevllm.platforms.cpu import CpuPlatform
 from sparsevllm.sampling_params import SamplingParams
 from sparsevllm.utils.loader import _target_weight_name_for_model, _validate_all_quantized_weights_loaded
@@ -96,6 +97,36 @@ def _qwen35_outer_config(*, num_layers: int = 64, full_layers: tuple[int, ...] |
 def _make_config(tmp_path, **kwargs):
     with patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", return_value=_qwen35_outer_config()):
         return Config(model=str(tmp_path), **kwargs)
+
+
+def test_qwen35_moe_checkpoint_validation_accepts_architecture_variants():
+    hf_config = SimpleNamespace(
+        vocab_size=32000,
+        hidden_size=1536,
+        num_hidden_layers=8,
+        num_experts=128,
+        num_experts_per_tok=4,
+        layer_types=["linear_attention", "full_attention"] * 4,
+        torch_dtype=torch.bfloat16,
+        hidden_act="silu",
+        attn_output_gate=True,
+        attention_bias=False,
+        partial_rotary_factor=0.25,
+        mamba_ssm_dtype="float32",
+        rms_norm_eps=1.0e-6,
+        tie_word_embeddings=False,
+    )
+
+    validate_checkpoint(
+        "qwen3_5_moe",
+        outer_config=SimpleNamespace(
+            architectures=["Qwen3_5MoeForConditionalGeneration"]
+        ),
+        config=hf_config,
+        raw_quantization_config=None,
+        quantization=QuantizationConfig.disabled(model_name="Qwen3.6 MoE"),
+        topology=ParallelTopology(1, 1, 1),
+    )
 
 
 def test_linear_attention_fuses_qkvz_and_ba_projections():
@@ -872,6 +903,7 @@ def test_model_runner_resets_inherited_allocator_peak_before_model_construction(
         tensor_parallel_size=1,
         expert_parallel_size=1,
         data_parallel_size=1,
+        parallel_topology=ParallelTopology(1, 1, 1),
         uses_outer_tp_moe_layout=False,
         mlp_chunk_size=16384,
         hf_config=SimpleNamespace(model_type="qwen2", torch_dtype=torch.float32),
@@ -1167,7 +1199,7 @@ def test_qwen35_mixed_prefix_offload_allows_decode_graph(tmp_path):
 
 
 def test_qwen35_deltakv_requires_compatible_checkpoint_even_when_missing_allowed(tmp_path):
-    with pytest.raises(ValueError, match="DeltaKV for qwen3_5 requires"):
+    with pytest.raises(ValueError, match="DeltaKV for Qwen3.5 requires"):
         _make_config(
             tmp_path,
             vllm_sparse_method="deltakv",
@@ -1215,7 +1247,7 @@ def test_qwen35_rejects_unquantized_fp16_checkpoint(tmp_path):
     outer_config.text_config.quantization_config = None
 
     with patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", return_value=outer_config):
-        with pytest.raises(NotImplementedError, match="require BF16 weights"):
+        with pytest.raises(ValueError, match="requires BF16 weights"):
             Config(model=str(tmp_path))
 
 
@@ -1224,7 +1256,7 @@ def test_qwen35_rejects_unsupported_quantization(tmp_path):
     outer_config.text_config.quantization_config = {"quant_method": "awq"}
 
     with patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", return_value=outer_config):
-        with pytest.raises(NotImplementedError, match="unquantized BF16 or block FP8"):
+        with pytest.raises(NotImplementedError, match="quant_method='awq'"):
             Config(model=str(tmp_path))
 
 

@@ -104,7 +104,3 @@ def _resolve_long_prefill_offload_threshold(configured: Any) -> int:
     if resolved is None:
         raise ValueError("long_prefill_offload_threshold must be a positive integer.")
     return int(resolved)
-
-
-def _model_path_basename(model_path: str) -> str:
-    return str(model_path).rstrip("/").split("/")[-1]

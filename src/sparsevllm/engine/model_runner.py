@@ -30,6 +30,7 @@ from sparsevllm.engine.chain_cache import ChainAdmissionPlan, ChainCacheCoordina
 from sparsevllm.engine.recurrent_state_manager import RecurrentStateManager, RecurrentStateSpec
 from sparsevllm.engine.runtime_state import RuntimeState
 from sparsevllm.engine.sparse_controller import SparseController
+from sparsevllm.models.spec import resolve_model_spec
 import sparsevllm.platforms as platforms
 from sparsevllm.utils.profiler import profiler
 
@@ -45,24 +46,27 @@ except ImportError:
 
 try:
     from sparsevllm.models.minimax_m2 import MiniMaxM2ForCausalLM
-    _MINIMAX_M2_IMPORT_ERROR = None
-except ImportError as exc:
+except ImportError:
     MiniMaxM2ForCausalLM = None
-    _MINIMAX_M2_IMPORT_ERROR = exc
 
 try:
     from sparsevllm.models.qwen3_5 import Qwen35ForCausalLM
-    _QWEN35_IMPORT_ERROR = None
-except ImportError as exc:
+except ImportError:
     Qwen35ForCausalLM = None
-    _QWEN35_IMPORT_ERROR = exc
 
 try:
     from sparsevllm.models.qwen3_5_moe import Qwen35MoeForCausalLM
-    _QWEN35_MOE_IMPORT_ERROR = None
-except ImportError as exc:
+except ImportError:
     Qwen35MoeForCausalLM = None
-    _QWEN35_MOE_IMPORT_ERROR = exc
+
+
+def _create_model(hf_config):
+    model_spec = resolve_model_spec(hf_config.model_type)
+    class_name = model_spec.runtime_class_name
+    model_class = globals().get(class_name)
+    if model_class is None:
+        raise ImportError(f"{class_name} is unavailable for {model_spec.name}.")
+    return model_class(hf_config)
 
 
 TP_SHM_NAME_PREFIX = "sparsevllm_"
@@ -140,10 +144,7 @@ class ModelRunner:
                 rank=rank,
             )
         self.parallel_context = init_parallel_context(
-            tp_size=config.tensor_parallel_size,
-            ep_size=config.expert_parallel_size,
-            dp_size=config.data_parallel_size,
-            hybrid_moe=config.uses_outer_tp_moe_layout,
+            topology=config.parallel_topology,
         )
 
         # CUDA allocator peaks are process-global and survive LLMEngine.exit().
@@ -161,49 +162,7 @@ class ModelRunner:
             bool(getattr(config, "decode_cuda_graph", False)),
         )
         
-        # 加载对应的模型分片 (Shards)
-        if hf_config.model_type == "qwen2":
-            self.model = Qwen2ForCausalLM(hf_config)
-        elif hf_config.model_type == "qwen3":
-            if Qwen3ForCausalLM is None:
-                raise ImportError(
-                    "Qwen3ForCausalLM is unavailable in this Transformers installation. "
-                    "Use a Transformers version with Qwen3 support for Qwen3 models."
-                )
-            self.model = Qwen3ForCausalLM(hf_config)
-        elif hf_config.model_type == "qwen3_moe":
-            if Qwen3MoeForCausalLM is None:
-                raise ImportError(
-                    "Qwen3MoeForCausalLM is unavailable in this Transformers installation. "
-                    "Use a Transformers version with Qwen3MoE config support."
-                )
-            self.model = Qwen3MoeForCausalLM(hf_config)
-        elif hf_config.model_type == "minimax_m2":
-            if MiniMaxM2ForCausalLM is None:
-                raise ImportError(
-                    "MiniMaxM2ForCausalLM is unavailable; verify the MiniMax FP8 "
-                    "runtime dependencies in the active uv environment: "
-                    f"{_MINIMAX_M2_IMPORT_ERROR}"
-                ) from _MINIMAX_M2_IMPORT_ERROR
-            self.model = MiniMaxM2ForCausalLM(hf_config)
-        elif hf_config.model_type == "qwen3_5":
-            if Qwen35ForCausalLM is None:
-                raise ImportError(
-                    "Qwen35ForCausalLM is unavailable. Install the qwen3_5 runtime "
-                    f"dependencies and verify vendored kernels import correctly: {_QWEN35_IMPORT_ERROR}"
-                ) from _QWEN35_IMPORT_ERROR
-            self.model = Qwen35ForCausalLM(hf_config)
-        elif hf_config.model_type == "qwen3_5_moe":
-            if Qwen35MoeForCausalLM is None:
-                raise ImportError(
-                    "Qwen35MoeForCausalLM is unavailable; verify the Qwen3.6 MoE "
-                    f"runtime imports: {_QWEN35_MOE_IMPORT_ERROR}"
-                ) from _QWEN35_MOE_IMPORT_ERROR
-            self.model = Qwen35MoeForCausalLM(hf_config)
-        elif hf_config.model_type == "llama":
-            self.model = LlamaForCausalLM(hf_config)
-        else:
-            raise NotImplementedError(f"Unsupported Sparse-vLLM model_type={hf_config.model_type!r}.")
+        self.model = _create_model(hf_config)
         if config.tiny_random:
             from sparsevllm.debug.tiny_random import initialize_sparse_model
 
