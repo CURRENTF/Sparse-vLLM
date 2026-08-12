@@ -7,20 +7,12 @@ ranges. Training, benchmark, and test packages are part of the main install.
 The lock remains the only fully validated package combination; versions inside
 the wider ranges are candidates until they pass the same validation gates.
 
-Create the environment on shared machines under `/data2`:
+Create an isolated environment from the repository root:
 
 ```bash
-CONDA_PKGS_DIRS=/data2/$USER/cache/conda_pkgs \
-  conda create -p /data2/$USER/conda_envs/sparse-vllm-cu129-py310 \
-  python=3.10 pip setuptools wheel -y
-
-PYTHONNOUSERSITE=1 PIP_CACHE_DIR=/data2/$USER/cache/pip \
-  /data2/$USER/conda_envs/sparse-vllm-cu129-py310/bin/python -s -m pip \
-  install -r requirements/locks/canonical-cu129-py310.txt
-
-PYTHONNOUSERSITE=1 \
-  /data2/$USER/conda_envs/sparse-vllm-cu129-py310/bin/python -s -m pip \
-  install --no-deps -e .
+uv venv --python 3.10
+uv pip install -r requirements/locks/canonical-cu129-py310.txt
+uv pip install --no-deps -e .
 ```
 
 The lock is the compatibility contract. An unlocked install is a development

@@ -1,5 +1,5 @@
 # Canonical main-dependency lock for Python 3.10 and CUDA 12.9.
-# Validated on 2026-08-08 with GLM-4.7-Flash TP=2 and CUDA Graph enabled.
+# Validated with GLM-4.7-Flash TP=2 and CUDA Graph enabled.
 # Keep the CUDA-specific local versions; install from the listed indexes.
 --index-url https://pypi.mirrors.ustc.edu.cn/simple
 --extra-index-url https://download.pytorch.org/whl/cu129
