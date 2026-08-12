@@ -279,19 +279,3 @@ def test_glm_config_accepts_sparse_latent_layout(method):
 
     assert config.attention_cache_layout == CacheLayout.MLA_LATENT.value
     assert config.vllm_sparse_method == method
-
-
-@pytest.mark.parametrize(
-    ("hf_override", "message"),
-    [
-        ({"torch_dtype": torch.float16}, "requires BF16"),
-        ({"kv_lora_rank": 256}, "requires kv_lora_rank=512"),
-        ({"qk_rope_head_dim": 32}, "qk_rope_head_dim=64"),
-    ],
-)
-def test_glm_config_rejects_unsupported_mla_storage_contract(
-    hf_override,
-    message,
-):
-    with pytest.raises(NotImplementedError, match=message):
-        _glm_config(hf_overrides=hf_override)

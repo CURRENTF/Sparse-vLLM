@@ -571,7 +571,7 @@ def test_glm_tp2_ep2_moe_uses_sgl_aligned_provider():
     )
 
     with patch(
-        "sparsevllm.operators.sgl_moe.sgl_moe_ep_alignment_support",
+        "sparsevllm.operators.sgl_moe.sgl_moe_alignment_support",
         return_value=(True, "supported"),
     ):
         resolved = OpResolver(MOE_REGISTRY).resolve(

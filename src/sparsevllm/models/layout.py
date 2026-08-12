@@ -6,6 +6,29 @@ from typing import Any
 from sparsevllm.utils.config import config_get
 
 
+def resolve_attention_qk_head_dim(hf_config: Any) -> int:
+    dimensions = (
+        config_get(hf_config, "qk_nope_head_dim", None),
+        config_get(hf_config, "qk_rope_head_dim", None),
+    )
+    if all(value is not None for value in dimensions):
+        head_dim = sum(map(int, dimensions))
+    elif (value := config_get(hf_config, "head_dim", None)) is not None:
+        head_dim = int(value)
+    else:
+        hidden_size = int(config_get(hf_config, "hidden_size", 0) or 0)
+        num_heads = int(config_get(hf_config, "num_attention_heads", 0) or 0)
+        if hidden_size <= 0 or num_heads <= 0 or hidden_size % num_heads:
+            raise ValueError(
+                "Attention QK head dimension requires valid head_dim or divisible "
+                "hidden_size/num_attention_heads."
+            )
+        head_dim = hidden_size // num_heads
+    if head_dim <= 0:
+        raise ValueError(f"Attention QK head dimension must be positive, got {head_dim}.")
+    return head_dim
+
+
 def _coerce_int_list(
     name: str,
     value: Any,

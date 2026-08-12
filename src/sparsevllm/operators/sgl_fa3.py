@@ -1,19 +1,11 @@
 from __future__ import annotations
 
-import importlib.metadata
-import importlib.util
-import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
 
-
-_SGL_KERNEL_DISTRIBUTIONS = ("sglang-kernel", "sgl-kernel")
-_MIN_VALIDATED_VERSIONS = {
-    (0, 3): (0, 3, 14),
-    (0, 4): (0, 4, 5),
-}
+from sparsevllm.operators.sgl_kernel import sgl_kernel_support
 
 _COMMON_FWD_ARGUMENTS = (
     "q",
@@ -53,10 +45,7 @@ _FWD_TRAILING_ARGUMENTS = (
     "sm_margin",
     "sinks",
 )
-_FWD_04_EXTRA_ARGUMENTS = (
-    "sparse_mask_fine",
-    "only_qv",
-)
+_FWD_ARGUMENTS = _COMMON_FWD_ARGUMENTS + ("attention_chunk",) + _FWD_TRAILING_ARGUMENTS
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,57 +98,8 @@ class _SchedulerMetadataPlan:
         )
 
 
-def _parse_version(version: str) -> tuple[int, int, int] | None:
-    parts = str(version).split(".")
-    if len(parts) < 3:
-        return None
-    parsed: list[int] = []
-    for part in parts[:3]:
-        match = re.match(r"(\d+)", part)
-        if match is None:
-            return None
-        parsed.append(int(match.group(1)))
-    return tuple(parsed)  # type: ignore[return-value]
-
-
-def _installed_sgl_kernel_version() -> tuple[str, tuple[int, int, int]] | None:
-    for distribution in _SGL_KERNEL_DISTRIBUTIONS:
-        try:
-            version = importlib.metadata.version(distribution)
-        except importlib.metadata.PackageNotFoundError:
-            continue
-        parsed = _parse_version(version)
-        if parsed is None:
-            return version, (-1, -1, -1)
-        return version, parsed
-    return None
-
-
 def sgl_fa3_support() -> tuple[bool, str]:
-    """Probe package metadata without importing optional SGL Python wrappers."""
-
-    try:
-        module_spec = importlib.util.find_spec("sgl_kernel")
-    except (ImportError, ValueError):
-        module_spec = None
-    if module_spec is None:
-        return False, "sgl-kernel is not installed"
-    installed = _installed_sgl_kernel_version()
-    if installed is None:
-        return False, "sgl-kernel package metadata is unavailable"
-    version, parsed = installed
-    minimum = _MIN_VALIDATED_VERSIONS.get(parsed[:2])
-    if minimum is None:
-        return (
-            False,
-            "requires validated sgl-kernel 0.3.x or sglang-kernel 0.4.x "
-            f"API, got {version}",
-        )
-    if parsed < minimum:
-        package = "sglang-kernel" if parsed[:2] == (0, 4) else "sgl-kernel"
-        required = ".".join(str(value) for value in minimum)
-        return False, f"requires {package} >= {required}, got {version}"
-    return True, f"SGL kernel {version} FA3 raw op is available"
+    return sgl_kernel_support("FA3 raw op")
 
 
 class SglFa3DecodeKernel:
@@ -184,23 +124,7 @@ class SglFa3DecodeKernel:
 
         op = torch.ops.sgl_kernel.fwd.default
         argument_names = tuple(argument.name for argument in op._schema.arguments)
-        legacy = _COMMON_FWD_ARGUMENTS + _FWD_TRAILING_ARGUMENTS
-        chunked = (
-            _COMMON_FWD_ARGUMENTS
-            + ("attention_chunk",)
-            + _FWD_TRAILING_ARGUMENTS
-        )
-        chunked_04 = chunked + _FWD_04_EXTRA_ARGUMENTS
-        if argument_names == legacy:
-            self._has_attention_chunk = False
-            self._has_04_arguments = False
-        elif argument_names == chunked:
-            self._has_attention_chunk = True
-            self._has_04_arguments = False
-        elif argument_names == chunked_04:
-            self._has_attention_chunk = True
-            self._has_04_arguments = True
-        else:
+        if argument_names != _FWD_ARGUMENTS:
             raise RuntimeError(
                 "Unsupported sgl-kernel FA3 fwd schema: "
                 f"arguments={argument_names}."
@@ -211,9 +135,6 @@ class SglFa3DecodeKernel:
             "get_scheduler_metadata",
             None,
         )
-        # sgl-kernel 0.3.14 exposes the FA3 scheduler only internally. Keep
-        # its validated per-call scheduling path; 0.4.5 exposes the reusable
-        # raw op used below.
         self._scheduler_op = (
             None if scheduler_packet is None else scheduler_packet.default
         )
@@ -425,13 +346,10 @@ class SglFa3DecodeKernel:
             -1,
             -1,
         ]
-        if self._has_attention_chunk:
-            args.append(0)
+        args.append(0)
         args.extend(
             (0.0, True, scheduler_metadata, split_count, None, 0, None)
         )
-        if self._has_04_arguments:
-            args.extend((None, False))
         result: Sequence[torch.Tensor] = self._op(*args)
         if not result or result[0].data_ptr() != output.data_ptr():
             raise RuntimeError("sgl-kernel FA3 did not write to the supplied output")
@@ -494,13 +412,10 @@ class SglFa3DecodeKernel:
             -1,
             -1,
         ]
-        if self._has_attention_chunk:
-            args.append(0)
+        args.append(0)
         args.extend(
             (0.0, True, scheduler_metadata, self.num_splits, None, 0, None)
         )
-        if self._has_04_arguments:
-            args.extend((None, False))
         result: Sequence[torch.Tensor] = self._op(*args)
         if not result or result[0].data_ptr() != output.data_ptr():
             raise RuntimeError("sgl-kernel FA3 did not write to the supplied output")
@@ -549,11 +464,8 @@ class SglFa3DecodeKernel:
             -1,
             -1,
         ]
-        if self._has_attention_chunk:
-            args.append(0)
+        args.append(0)
         args.extend((0.0, True, None, self.num_splits, None, 0, None))
-        if self._has_04_arguments:
-            args.extend((None, False))
         result: Sequence[torch.Tensor] = self._op(*args)
         if not result or result[0].data_ptr() != output.data_ptr():
             raise RuntimeError("sgl-kernel FA3 did not write to the supplied output")

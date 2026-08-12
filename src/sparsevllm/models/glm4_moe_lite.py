@@ -9,7 +9,7 @@ from torch import nn
 from transformers import Glm4MoeLiteConfig
 
 from sparsevllm.distributed import get_parallel_context
-from sparsevllm.configs.model import resolve_attention_qk_head_dim
+from sparsevllm.models.layout import resolve_attention_qk_head_dim
 from sparsevllm.engine.cache_manager import (
     AttentionKeyComputeView,
     MlaLatentWrite,

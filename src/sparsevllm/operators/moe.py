@@ -211,15 +211,9 @@ class SglAlignedTritonGlmMoeProvider(MoeProvider):
             return SupportResult.no("requires BF16 activations")
         if spec.weight_dtype != torch.bfloat16 or spec.block_shape is not None:
             return SupportResult.no("requires unquantized BF16 expert weights")
-        from sparsevllm.operators.sgl_moe import (
-            sgl_moe_alignment_support,
-            sgl_moe_ep_alignment_support,
-        )
+        from sparsevllm.operators.sgl_moe import sgl_moe_alignment_support
 
-        if spec.ep_size > 1:
-            supported, reason = sgl_moe_ep_alignment_support()
-        else:
-            supported, reason = sgl_moe_alignment_support()
+        supported, reason = sgl_moe_alignment_support()
         return SupportResult.yes() if supported else SupportResult.no(reason)
 
     def run(

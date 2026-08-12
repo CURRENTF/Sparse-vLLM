@@ -20,7 +20,7 @@ from sparsevllm.engine.prefill import (
 from sparsevllm.method_registry import SUPPORTED_SPARSE_METHODS, normalize_sparse_method
 from sparsevllm.triton_kernel.store_kvcache import store_kvcache
 import sparsevllm.platforms as platforms
-from sparsevllm.configs.model import resolve_attention_qk_head_dim
+from sparsevllm.models.layout import resolve_attention_qk_head_dim
 from sparsevllm.utils.log import logger, log_level
 
 

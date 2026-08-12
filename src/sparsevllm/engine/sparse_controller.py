@@ -3,7 +3,7 @@ import os
 import torch
 import torch.nn.functional as F
 from sparsevllm.config import Config
-from sparsevllm.configs.model import resolve_attention_qk_head_dim
+from sparsevllm.models.layout import resolve_attention_qk_head_dim
 from sparsevllm.engine.activation_controller import ActivationController
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.engine.cache_manager import CacheManager, SparseSelection

@@ -12,7 +12,7 @@ import torch
 from torch import nn
 
 from sparsevllm.config import RuntimeLayout
-from sparsevllm.configs.model import resolve_attention_qk_head_dim
+from sparsevllm.models.layout import resolve_attention_qk_head_dim
 from sparsevllm.distributed import ParallelContext
 from sparsevllm.engine.cache_manager import LayerBatchStates
 from sparsevllm.engine.cache_manager.h2o import H2OCacheManager

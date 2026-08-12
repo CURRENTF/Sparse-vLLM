@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib.metadata
 from unittest.mock import patch
 
 import pytest
@@ -8,13 +7,8 @@ import torch
 
 from sparsevllm.operators.sgl_fa3 import (
     SglFa3DecodeKernel,
-    _parse_version,
     sgl_fa3_support,
 )
-
-
-def test_sgl_fa3_version_parser_accepts_post_release() -> None:
-    assert _parse_version("0.3.14.post1+cu128") == (0, 3, 14)
 
 
 def test_sgl_fa3_support_rejects_missing_package() -> None:
@@ -25,39 +19,34 @@ def test_sgl_fa3_support_rejects_missing_package() -> None:
 def test_sgl_fa3_support_rejects_old_package() -> None:
     with (
         patch("importlib.util.find_spec", return_value=object()),
-        patch("importlib.metadata.version", return_value="0.3.13"),
+        patch("importlib.metadata.version", return_value="0.3.20"),
     ):
         supported, reason = sgl_fa3_support()
 
     assert not supported
-    assert ">= 0.3.14" in reason
+    assert ">=0.3.21,<0.4" in reason
 
 
-def test_sgl_fa3_support_rejects_old_04_package() -> None:
+def test_sgl_fa3_support_rejects_04_package() -> None:
     with (
         patch("importlib.util.find_spec", return_value=object()),
-        patch("importlib.metadata.version", return_value="0.4.0"),
+        patch("importlib.metadata.version", return_value="0.4.5"),
     ):
         supported, reason = sgl_fa3_support()
 
     assert not supported
-    assert "sglang-kernel >= 0.4.5" in reason
+    assert ">=0.3.21,<0.4" in reason
 
 
-def test_sgl_fa3_support_accepts_sglang_kernel_04_package() -> None:
-    def package_version(distribution: str) -> str:
-        if distribution == "sglang-kernel":
-            return "0.4.5"
-        raise importlib.metadata.PackageNotFoundError(distribution)
-
+def test_sgl_fa3_support_accepts_declared_package() -> None:
     with (
         patch("importlib.util.find_spec", return_value=object()),
-        patch("importlib.metadata.version", side_effect=package_version),
+        patch("importlib.metadata.version", return_value="0.3.21"),
     ):
         supported, reason = sgl_fa3_support()
 
     assert supported
-    assert "0.4.5" in reason
+    assert "0.3.21" in reason
 
 
 @pytest.mark.skipif(

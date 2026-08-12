@@ -5,7 +5,6 @@ import os
 from types import SimpleNamespace
 from typing import Any
 
-import torch
 from transformers import AutoConfig
 
 from sparsevllm.method_registry import (
@@ -22,30 +21,6 @@ from sparsevllm.utils.log import logger, log_once
 
 def _config_to_namespace(config: dict[str, Any]) -> SimpleNamespace:
     return SimpleNamespace(**config)
-
-
-def resolve_attention_qk_head_dim(hf_config: Any) -> int:
-    qk_nope_head_dim = config_get(hf_config, "qk_nope_head_dim", None)
-    qk_rope_head_dim = config_get(hf_config, "qk_rope_head_dim", None)
-    if qk_nope_head_dim is not None and qk_rope_head_dim is not None:
-        head_dim = int(qk_nope_head_dim) + int(qk_rope_head_dim)
-        if head_dim <= 0:
-            raise ValueError(f"Attention QK head dimension must be positive, got {head_dim}.")
-        return head_dim
-    head_dim = config_get(hf_config, "head_dim", None)
-    if head_dim is not None:
-        head_dim = int(head_dim)
-        if head_dim <= 0:
-            raise ValueError(f"Attention QK head dimension must be positive, got {head_dim}.")
-        return head_dim
-    hidden_size = int(config_get(hf_config, "hidden_size", 0) or 0)
-    num_heads = int(config_get(hf_config, "num_attention_heads", 0) or 0)
-    if hidden_size <= 0 or num_heads <= 0 or hidden_size % num_heads:
-        raise ValueError(
-            "Attention QK head dimension requires valid head_dim or divisible "
-            "hidden_size/num_attention_heads."
-        )
-    return hidden_size // num_heads
 
 
 def _load_model_config(model_path: str) -> Any:
@@ -85,44 +60,6 @@ def _extract_text_config(config: Any) -> Any:
     if isinstance(text_config, dict):
         return _config_to_namespace(text_config)
     return text_config
-
-
-def _resolve_attention_cache_layout(config, model_type: str) -> None:
-    config.attention_cache_layout = (
-        "mla_latent" if model_type == "glm4_moe_lite" else "explicit_kv"
-    )
-    if config.attention_cache_layout == "explicit_kv":
-        return
-    if config.enable_prefix_cache_offload:
-        raise NotImplementedError(
-            "GLM-4.7-Flash latent MLA does not support prefix cache offload."
-        )
-    if config.quantization_config.enabled:
-        raise NotImplementedError(
-            "GLM-4.7-Flash latent MLA does not support quantized checkpoints."
-        )
-    if config.hf_config.torch_dtype != torch.bfloat16:
-        raise NotImplementedError(
-            "GLM-4.7-Flash latent MLA requires BF16 checkpoints."
-        )
-    expected = {
-        "num_attention_heads": 20,
-        "q_lora_rank": 768,
-        "kv_lora_rank": 512,
-        "qk_nope_head_dim": 192,
-        "qk_rope_head_dim": 64,
-        "v_head_dim": 256,
-    }
-    invalid = {
-        field: config_get(config.hf_config, field, None)
-        for field, value in expected.items()
-        if config_get(config.hf_config, field, None) != value
-    }
-    if invalid:
-        field, actual = next(iter(invalid.items()))
-        raise NotImplementedError(
-            f"GLM-4.7-Flash latent MLA requires {field}={expected[field]}, got {actual}."
-        )
 
 
 def _finalize_model_config(config, model_spec: ModelSpec) -> None:
@@ -195,7 +132,7 @@ def load_and_validate_model(config) -> None:
             "Tiny random mode does not support quantized model weights."
         )
     setattr(config.hf_config, "quantization_config", config.quantization_config)
-    _resolve_attention_cache_layout(config, model_type)
+    config.attention_cache_layout = model_spec.attention_cache_layout
     validate_checkpoint(
         model_type,
         outer_config=config.outer_hf_config,
