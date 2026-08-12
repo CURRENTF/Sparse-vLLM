@@ -4,6 +4,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from sparsevllm.operators.gated_shared_add import gated_shared_add
+from sparsevllm.triton_kernel.gate_up_swiglu import h20_gate_up_swiglu
 from sparsevllm.triton_kernel.moe import (
     _prepare_expert_assignment,
     fused_moe,
@@ -11,6 +13,45 @@ from sparsevllm.triton_kernel.moe import (
     moe_align_block_size,
 )
 from sparsevllm.triton_kernel.moe_topk import topk_softmax
+
+
+def _is_h20() -> bool:
+    return torch.cuda.is_available() and torch.cuda.get_device_name() == "NVIDIA H20"
+
+
+@pytest.mark.skipif(not _is_h20(), reason="requires NVIDIA H20")
+@pytest.mark.parametrize("intermediate_size", [256, 512])
+def test_h20_gate_up_swiglu_matches_torch(intermediate_size):
+    torch.manual_seed(0)
+    inputs = torch.randn(1, 2048, dtype=torch.bfloat16, device="cuda")
+    weight = 0.02 * torch.randn(
+        2 * intermediate_size,
+        2048,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    projected = torch.nn.functional.linear(inputs, weight)
+    gate, up = projected.chunk(2, dim=-1)
+    expected = torch.nn.functional.silu(gate.float()) * up.float()
+
+    actual = h20_gate_up_swiglu(inputs, weight)
+
+    torch.testing.assert_close(actual.float(), expected, rtol=0.02, atol=0.01)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("num_tokens", [1, 2, 4, 8, 1024])
+def test_gated_shared_add_matches_torch(num_tokens):
+    torch.manual_seed(num_tokens)
+    routed = torch.randn((num_tokens, 2048), device="cuda", dtype=torch.bfloat16)
+    shared = torch.randn_like(routed)
+    padded_gate = torch.randn((num_tokens, 257), device="cuda", dtype=torch.bfloat16)
+    gate_logits = padded_gate[:, -1:]
+
+    actual = gated_shared_add(routed, shared, gate_logits)
+    expected = routed + torch.sigmoid(gate_logits) * shared
+
+    torch.testing.assert_close(actual, expected, atol=0.03125, rtol=0.005)
 
 
 def _pytorch_topk_reference(

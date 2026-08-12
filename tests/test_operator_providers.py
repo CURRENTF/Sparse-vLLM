@@ -5,6 +5,7 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
+from sparsevllm.operators.all_reduce import HopperTp2FlashInferAllReduceProvider
 from sparsevllm.operators.fp8_linear import (
     FP8_LINEAR_REGISTRY,
     FlashInferSm90Fp8LinearProvider,
@@ -12,10 +13,14 @@ from sparsevllm.operators.fp8_linear import (
     TritonFp8LinearProvider,
     resolve_fp8_linear_provider,
 )
+from sparsevllm.operators.gate_up_swiglu import (
+    GATE_UP_SWIGLU_REGISTRY,
+    GateUpSwiGLUOpSpec,
+    NativeGateUpSwiGLUProvider,
+)
 from sparsevllm.operators.moe import (
     MOE_REGISTRY,
     FlashInferCutlassFp8MoeProvider,
-    H20Qwen36HybridFp8MoeProvider,
     HopperQwen36HybridFp8MoeProvider,
     MoeOpSpec,
     resolve_moe_provider,
@@ -103,6 +108,88 @@ def _linear_spec(
         output_features=output_features,
         activation_dtype=activation_dtype,
     )
+
+
+def _gate_up_spec(**overrides) -> GateUpSwiGLUOpSpec:
+    values = {
+        "hidden_size": 2048,
+        "intermediate_size": 512,
+        "tp_size": 1,
+        "activation_dtype": torch.bfloat16,
+        "weight_dtype": torch.bfloat16,
+        "cuda_graph": True,
+    }
+    values.update(overrides)
+    return GateUpSwiGLUOpSpec(**values)
+
+
+def test_flashinfer_all_reduce_falls_back_before_unsupported_shape_launch():
+    provider = HopperTp2FlashInferAllReduceProvider.__new__(
+        HopperTp2FlashInferAllReduceProvider
+    )
+    provider.fallback = Mock()
+    tensor = torch.randn(1, 248320, dtype=torch.bfloat16)
+    provider.fallback.run.return_value = tensor
+
+    assert provider.run(tensor) is tensor
+    provider.fallback.run.assert_called_once_with(tensor)
+
+
+@pytest.mark.parametrize("tp_size", [1, 2])
+def test_h20_gate_up_provider_accepts_profiled_qwen36_shape(tp_size):
+    resolved = OpResolver(GATE_UP_SWIGLU_REGISTRY).resolve(
+        _gate_up_spec(tp_size=tp_size),
+        _cuda_caps((9, 0), device_name="NVIDIA H20"),
+    )
+
+    assert resolved.provider.name == "h20_triton_decode"
+
+
+@pytest.mark.parametrize(
+    "spec,caps",
+    [
+        (
+            _gate_up_spec(weight_dtype=torch.float8_e4m3fn),
+            _cuda_caps((9, 0), device_name="NVIDIA H20"),
+        ),
+        (
+            _gate_up_spec(intermediate_size=768),
+            _cuda_caps((9, 0), device_name="NVIDIA H20"),
+        ),
+        (
+            _gate_up_spec(),
+            _cuda_caps((9, 0), device_name="NVIDIA H100 80GB HBM3"),
+        ),
+        (_gate_up_spec(), _cuda_caps((8, 9), device_name="NVIDIA H20")),
+    ],
+)
+def test_unprofiled_gate_up_shape_uses_native_provider(spec, caps):
+    resolved = OpResolver(GATE_UP_SWIGLU_REGISTRY).resolve(spec, caps)
+
+    assert resolved.provider.name == "native"
+
+
+def test_native_gate_up_provider_matches_swiglu_semantics():
+    torch.manual_seed(0)
+    inputs = torch.randn(3, 8)
+    projection = torch.nn.Linear(8, 12, bias=False)
+    with torch.inference_mode():
+        projected = projection(inputs)
+        gate, up = projected.chunk(2, dim=-1)
+        expected = torch.nn.functional.silu(gate) * up
+        actual = NativeGateUpSwiGLUProvider().run(
+            _gate_up_spec(
+                hidden_size=8,
+                intermediate_size=6,
+                activation_dtype=torch.float32,
+                weight_dtype=torch.float32,
+                cuda_graph=False,
+            ),
+            inputs,
+            projection,
+        )
+
+    torch.testing.assert_close(actual, expected)
 
 
 @pytest.mark.parametrize(
@@ -685,10 +772,6 @@ def test_h20_qwen36_hybrid_moe_uses_profiled_provider():
         )
 
     assert resolved.provider.name == "h20_qwen36_hybrid_fp8"
-
-
-def test_h20_qwen36_hybrid_moe_limits_triton_to_profiled_token_count():
-    assert H20Qwen36HybridFp8MoeProvider.TRITON_MAX_TOKENS_BY_EP_SIZE == {1: 8, 2: 1}
 
 
 def test_qwen36_hybrid_moe_dispatches_by_token_bucket():
