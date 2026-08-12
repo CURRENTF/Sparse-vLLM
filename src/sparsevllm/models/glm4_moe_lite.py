@@ -628,7 +628,7 @@ class Glm4MoeLitePackedExperts(PackedMoeExperts):
     ) -> torch.Tensor:
         if self.shared_expert_id is None:
             raise RuntimeError("Packed shared expert is not enabled.")
-        from sparsevllm.triton_kernel.moe import append_shared_expert_route
+        from sparsevllm.kernels.triton.moe import append_shared_expert_route
 
         fused_ids, fused_weights = append_shared_expert_route(
             topk_ids,

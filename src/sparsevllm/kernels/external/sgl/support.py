@@ -4,7 +4,6 @@ import importlib.metadata
 import importlib.util
 import re
 
-
 _MIN_VERSION = (0, 3, 21)
 _MAX_VERSION = (0, 4, 0)
 

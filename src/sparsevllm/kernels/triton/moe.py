@@ -1,31 +1,21 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
 
 import torch
 import triton
 import triton.language as tl
 
-from sparsevllm.triton_kernel.silu_and_mul import silu_and_mul_fwd
-from sparsevllm.triton_kernel.moe_config import (
+from sparsevllm.kernels.moe import MoeAlignment
+from sparsevllm.kernels.triton.moe_config import (
     MoeGemmConfig,
     device_info,
     resolve_fp8_routed_gemm_config,
     resolve_moe_gemm_config,
 )
-
+from sparsevllm.kernels.triton.silu_and_mul import silu_and_mul_fwd
 
 _SUPPORTED_DTYPES = (torch.bfloat16, torch.float16)
-
-
-@dataclass(frozen=True)
-class MoeAlignment:
-    sorted_token_ids: torch.Tensor | None
-    expert_ids: torch.Tensor
-    num_tokens_post_padded: torch.Tensor
-    block_size: int
-    naive: bool
 
 
 @triton.jit

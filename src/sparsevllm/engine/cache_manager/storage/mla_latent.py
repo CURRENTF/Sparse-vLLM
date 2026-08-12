@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import torch
 
-from sparsevllm.triton_kernel.mla.copy_latent import (
+from sparsevllm.kernels.triton.mla.copy_latent import (
     copy_latent_to_cache,
     validate_copy_slot_mapping,
 )
-from sparsevllm.triton_kernel.mla.decode_stage1 import MLA_LATENT_DIM, MLA_ROPE_DIM
+from sparsevllm.kernels.triton.mla.decode_stage1 import MLA_LATENT_DIM, MLA_ROPE_DIM
 
 from ..base import AttentionCacheWrite, MlaLatentPayload, MlaLatentWrite
 from .base import CacheLayout

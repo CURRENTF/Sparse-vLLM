@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 
 from sparsevllm.engine.sequence import Sequence
-from sparsevllm.triton_kernel.prefill_score import prefill_score_fwd
+from sparsevllm.kernels.triton.prefill_score import prefill_score_fwd
 from sparsevllm.utils.context import get_context
 from sparsevllm.utils.profiler import profiler
 

@@ -1,7 +1,7 @@
 # Triton Kernel Guide
 
 Use this guide for repository-owned Triton kernels and wrappers under
-`src/sparsevllm/triton_kernel/`.
+`src/sparsevllm/kernels/triton/`.
 
 ## Inspect Before Editing
 

@@ -13,7 +13,7 @@ import torch
 
 import triton
 import triton.language as tl
-from sparsevllm.triton_kernel.qwen3_5.autotuner import autotune
+from sparsevllm.kernels.triton.qwen3_5.autotuner import autotune
 
 BT_LIST = [8, 16, 32, 64, 128]
 

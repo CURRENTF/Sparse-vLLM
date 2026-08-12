@@ -11,6 +11,12 @@ from sparsevllm.engine.cache_manager import (
     DecodeComputeView,
     MlaLatentPayload,
 )
+from sparsevllm.kernels.tilelang.mla.runtime import (
+    TileMlaDecodeKernel,
+    select_tile_mla_config,
+    tilelang_mla_support,
+)
+from sparsevllm.kernels.triton.mla import MlaDecodeWorkspace
 from sparsevllm.operators.mla_attention import (
     MLA_ATTENTION_REGISTRY,
     MlaAttentionOpSpec,
@@ -18,13 +24,7 @@ from sparsevllm.operators.mla_attention import (
     MlaTileLangScoreProvider,
 )
 from sparsevllm.operators.registry import OpResolver
-from sparsevllm.operators.tilelang_mla import (
-    TileMlaDecodeKernel,
-    select_tile_mla_config,
-    tilelang_mla_support,
-)
 from sparsevllm.platforms import DeviceCaps, PlatformEnum
-from sparsevllm.triton_kernel.mla import MlaDecodeWorkspace
 
 
 def _spec(*, tp_size: int = 2) -> MlaAttentionOpSpec:

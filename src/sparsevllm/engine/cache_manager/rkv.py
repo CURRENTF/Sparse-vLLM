@@ -5,7 +5,7 @@ import torch
 from sparsevllm.config import Config
 from sparsevllm.distributed import ParallelContext
 from sparsevllm.engine.sequence import Sequence
-from sparsevllm.triton_kernel.prefill_score import prefill_score_fwd
+from sparsevllm.kernels.triton.prefill_score import prefill_score_fwd
 
 from .base import PrefillComputeView
 from .snapkv import SnapKVCacheManager

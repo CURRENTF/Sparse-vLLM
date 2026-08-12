@@ -582,7 +582,7 @@ def test_glm_tp2_moe_uses_sgl_aligned_provider():
     )
 
     with patch(
-        "sparsevllm.operators.sgl_moe.sgl_moe_alignment_support",
+        "sparsevllm.kernels.external.sgl.moe.sgl_moe_alignment_support",
         return_value=(True, "available"),
     ):
         resolved = OpResolver(MOE_REGISTRY).resolve(
@@ -613,7 +613,7 @@ def test_glm_tp2_fused_shared_decode_uses_sgl_aligned_provider():
     )
 
     with patch(
-        "sparsevllm.operators.sgl_moe.sgl_moe_alignment_support",
+        "sparsevllm.kernels.external.sgl.moe.sgl_moe_alignment_support",
         return_value=(True, "available"),
     ):
         resolved = OpResolver(MOE_REGISTRY).resolve(
@@ -644,7 +644,7 @@ def test_glm_tp2_ep2_moe_uses_sgl_aligned_provider():
     )
 
     with patch(
-        "sparsevllm.operators.sgl_moe.sgl_moe_alignment_support",
+        "sparsevllm.kernels.external.sgl.moe.sgl_moe_alignment_support",
         return_value=(True, "supported"),
     ):
         resolved = OpResolver(MOE_REGISTRY).resolve(
@@ -686,7 +686,7 @@ def test_glm_tp2_ep2_sgl_alignment_is_bounded(
     weights = torch.empty(0)
     provider = SglAlignedTritonGlmMoeProvider()
 
-    with patch("sparsevllm.triton_kernel.moe.fused_moe") as fused_moe:
+    with patch("sparsevllm.kernels.triton.moe.fused_moe") as fused_moe:
         provider.run(
             spec,
             hidden_states,
@@ -1044,7 +1044,7 @@ def test_qwen36_hybrid_moe_dispatches_by_token_bucket():
     with patch.dict(
         sys.modules,
         {
-            "sparsevllm.triton_kernel.moe": SimpleNamespace(
+            "sparsevllm.kernels.triton.moe": SimpleNamespace(
                 fused_moe_fp8=triton_call
             )
         },
@@ -1105,7 +1105,7 @@ def test_qwen36_hybrid_moe_uses_larger_triton_bucket_on_single_gpu():
     with patch.dict(
         sys.modules,
         {
-            "sparsevllm.triton_kernel.moe": SimpleNamespace(
+            "sparsevllm.kernels.triton.moe": SimpleNamespace(
                 fused_moe_fp8=triton_call
             )
         },

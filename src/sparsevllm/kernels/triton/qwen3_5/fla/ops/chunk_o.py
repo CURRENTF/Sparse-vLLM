@@ -18,7 +18,7 @@ import triton.language as tl
 from .index import prepare_chunk_indices
 from .op import exp, safe_exp
 from .utils import FLA_GDN_FIX_BT, check_shared_mem, is_nvidia_hopper
-from sparsevllm.triton_kernel.qwen3_5.autotuner import autotune
+from sparsevllm.kernels.triton.qwen3_5.autotuner import autotune
 
 BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]

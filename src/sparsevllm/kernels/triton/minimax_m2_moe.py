@@ -4,7 +4,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sparsevllm.triton_kernel.moe import (
+from sparsevllm.kernels.triton.moe import (
     _prepare_expert_assignment,
     _routed_fp8_gemm,
     moe_sum,

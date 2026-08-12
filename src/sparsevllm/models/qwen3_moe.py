@@ -38,7 +38,7 @@ class Qwen3MoeRouter(nn.Module):
         self.num_experts = int(config.num_experts)
         self.top_k = int(config.num_experts_per_tok)
         self.norm_topk_prob = bool(config.norm_topk_prob)
-        from sparsevllm.triton_kernel.moe_topk import topk_softmax
+        from sparsevllm.kernels.triton.moe_topk import topk_softmax
 
         self.topk_impl = topk_softmax
         self.weight = nn.Parameter(torch.empty(self.num_experts, self.hidden_size))

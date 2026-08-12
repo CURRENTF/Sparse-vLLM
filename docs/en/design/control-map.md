@@ -67,7 +67,9 @@ flowchart TD
 | `src/sparsevllm/engine/cache_manager/*.py` | Physical/logical KV state for each sparse method. | This is the primary place for sparse-method implementation. |
 | `src/sparsevllm/engine/sparse_controller.py` | Cross-layer attention-score collection, dynamic token selection, post-forward compression triggers. | Keep persistent method metadata in cache managers, not here. |
 | `src/sparsevllm/layers/attention.py` | Generic KV store + attention kernel dispatch + hook calls. | Add generic hooks if needed; avoid method-specific branches. |
-| `src/sparsevllm/triton_kernel/` | Kernel implementations. | Kernel wrappers should fail fast on invalid shape/dtype assumptions. |
+| `src/sparsevllm/kernels/triton/` | Repository-owned Triton kernels. | Kernel wrappers should fail fast on invalid shape/dtype assumptions. |
+| `src/sparsevllm/kernels/tilelang/` | Repository-owned TileLang kernels and runtime bindings. | Keep compilation and launch details out of operators. |
+| `src/sparsevllm/kernels/external/` | Thin adapters for third-party kernel libraries. | Keep optional imports lazy and validate supported API versions. |
 | `benchmark/model_adapters/sparsevllm.py` | Shared native text-benchmark generation adapter. | Keep it thin; runtime behavior belongs in `src/sparsevllm/`. |
 | `benchmark/` and `scripts/` | Evaluation, debugging, analysis, throughput scripts. | Preserve raw outputs, parsed outputs, per-sample status, aggregate metrics, and run info separately. |
 

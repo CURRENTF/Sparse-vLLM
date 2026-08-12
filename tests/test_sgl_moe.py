@@ -5,12 +5,12 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from sparsevllm.operators.sgl_moe import (
-    sgl_moe_alignment_support,
+from sparsevllm.kernels.external.sgl.moe import (
     sgl_moe_align_block_size,
+    sgl_moe_alignment_support,
 )
-from sparsevllm.triton_kernel.moe import moe_align_block_size
-from sparsevllm.triton_kernel.moe import fused_moe
+from sparsevllm.kernels.triton.moe import fused_moe, moe_align_block_size
+from sparsevllm.operators.moe import _sgl_moe_align_block_size
 
 
 def test_sgl_moe_support_rejects_missing_package() -> None:
@@ -66,8 +66,6 @@ def test_sgl_moe_alignment_matches_grouped_assignments() -> None:
         topk_ids,
         block_size=16,
         num_experts=64,
-        local_expert_start=0,
-        local_expert_end=64,
     )
     torch.cuda.synchronize()
     count = int(reference_count.item())
@@ -117,7 +115,7 @@ def test_sgl_moe_alignment_matches_ep_shard(
         local_expert_start=local_start,
         local_expert_end=local_end,
     )
-    actual = sgl_moe_align_block_size(
+    actual = _sgl_moe_align_block_size(
         topk_ids,
         block_size=16,
         num_experts=64,
@@ -242,7 +240,7 @@ def test_sgl_ep_alignment_preserves_full_fused_moe_output(
         w2_weight,
         topk_ids,
         topk_weights,
-        alignment_impl=sgl_moe_align_block_size,
+        alignment_impl=_sgl_moe_align_block_size,
         **kwargs,
     )
     torch.cuda.synchronize()
@@ -258,7 +256,7 @@ def test_sgl_ep_alignment_preserves_full_fused_moe_output(
                 w2_weight,
                 topk_ids,
                 topk_weights,
-                alignment_impl=sgl_moe_align_block_size,
+                alignment_impl=_sgl_moe_align_block_size,
                 **kwargs,
             )
         hidden_states.copy_(torch.randn_like(hidden_states))

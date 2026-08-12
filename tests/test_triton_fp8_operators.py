@@ -4,9 +4,9 @@ import torch.nn.functional as F
 
 from sparsevllm.operators.fp8_linear import resolve_fp8_linear_provider
 from sparsevllm.quantization.fp8 import fp8_blockwise_linear_reference
-from sparsevllm.triton_kernel.fp8_blockwise import fp8_blockwise_matmul
-from sparsevllm.triton_kernel.moe import fused_moe_fp8
-from sparsevllm.triton_kernel.minimax_m2_moe import fused_minimax_m2_moe_fp8
+from sparsevllm.kernels.triton.fp8_blockwise import fp8_blockwise_matmul
+from sparsevllm.kernels.triton.moe import fused_moe_fp8
+from sparsevllm.kernels.triton.minimax_m2_moe import fused_minimax_m2_moe_fp8
 
 
 pytestmark = pytest.mark.skipif(

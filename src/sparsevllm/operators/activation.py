@@ -85,7 +85,7 @@ class TritonSiluAndMulProvider(SiluAndMulProvider):
         _validate_bound_input(x, self.spec)
         if not x.is_cuda:
             raise ValueError("Triton SiluAndMul provider requires a CUDA input.")
-        from sparsevllm.triton_kernel.silu_and_mul import silu_and_mul_fwd
+        from sparsevllm.kernels.triton.silu_and_mul import silu_and_mul_fwd
 
         return silu_and_mul_fwd(x)
 

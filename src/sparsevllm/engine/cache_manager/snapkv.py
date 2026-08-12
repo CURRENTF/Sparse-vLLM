@@ -15,7 +15,7 @@ from sparsevllm.engine.prefill import (
 )
 from sparsevllm.method_registry import PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH
 from sparsevllm.platforms import device_runtime
-from sparsevllm.triton_kernel.prefill_score import prefill_score_fwd
+from sparsevllm.kernels.triton.prefill_score import prefill_score_fwd
 from sparsevllm.utils.context import get_context
 from sparsevllm.utils.log import logger, log_level
 from sparsevllm.utils.profiler import profiler

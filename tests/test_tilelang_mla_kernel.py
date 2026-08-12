@@ -3,11 +3,10 @@ from __future__ import annotations
 import pytest
 import torch
 
-from sparsevllm.operators.tilelang_mla import (
+from sparsevllm.kernels.tilelang.mla.runtime import (
     TileMlaDecodeKernel,
     TileMlaLaunchConfig,
 )
-
 
 CUDA_REQUIRED = pytest.mark.skipif(
     not torch.cuda.is_available(),

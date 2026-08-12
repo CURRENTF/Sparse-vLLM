@@ -269,7 +269,7 @@ def test_qwen3_attention_passes_raw_key_without_clone():
 
 
 def test_moe_block_uses_triton_kernels():
-    from sparsevllm.triton_kernel.moe_topk import topk_softmax
+    from sparsevllm.kernels.triton.moe_topk import topk_softmax
 
     config = _config()
     context = _ep_context(0, 1)

@@ -5,7 +5,7 @@ from dataclasses import dataclass
 
 import torch
 
-from sparsevllm.operators.sgl_kernel import sgl_kernel_support
+from sparsevllm.kernels.external.sgl.support import sgl_kernel_support
 
 _COMMON_FWD_ARGUMENTS = (
     "q",

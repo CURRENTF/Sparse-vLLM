@@ -369,7 +369,7 @@ class TritonPagedPrefillAttentionProvider(PrefillAttentionProvider):
         del spec, layer_idx
         payload, meta = _view_parts(view)
         _validate_token_page_table(meta)
-        from sparsevllm.triton_kernel.context_flashattention_nopad import (
+        from sparsevllm.kernels.triton.context_flashattention_nopad import (
             context_attention_fwd,
         )
 

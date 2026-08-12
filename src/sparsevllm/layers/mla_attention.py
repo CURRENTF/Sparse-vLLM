@@ -19,7 +19,7 @@ from sparsevllm.operators.mla_attention import (
     MlaAttentionProvider,
     resolve_mla_attention_provider,
 )
-from sparsevllm.triton_kernel.mla import (
+from sparsevllm.kernels.triton.mla import (
     gather_latent_history,
     validate_gather_metadata,
 )

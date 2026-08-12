@@ -57,7 +57,9 @@ flowchart TD
 | `src/sparsevllm/engine/cache_manager/*.py` | 各稀疏方法的 physical/logical KV state。 | 稀疏方法实现的主要位置。 |
 | `src/sparsevllm/engine/sparse_controller.py` | 跨 layer attention-score 收集、动态 token selection、post-forward compression trigger。 | Persistent method metadata 应保存在 cache manager，而不是这里。 |
 | `src/sparsevllm/layers/attention.py` | 通用 KV store、attention kernel dispatch 和 hook 调用。 | 必要时添加 generic hook；避免方法特定 branch。 |
-| `src/sparsevllm/triton_kernel/` | Kernel 实现。 | shape/dtype 假设无效时，kernel wrapper 应快速失败。 |
+| `src/sparsevllm/kernels/triton/` | 仓库维护的 Triton kernel。 | shape/dtype 假设无效时，kernel wrapper 应快速失败。 |
+| `src/sparsevllm/kernels/tilelang/` | 仓库维护的 TileLang kernel 和 runtime binding。 | 编译和 launch 细节不能放入 operators。 |
+| `src/sparsevllm/kernels/external/` | 第三方 kernel 库的薄适配。 | 可选依赖保持惰性导入，并校验支持的 API 版本。 |
 | `benchmark/model_adapters/sparsevllm.py` | 文本 benchmark 共用的原生 generation adapter。 | 保持轻量；runtime 行为属于 `src/sparsevllm/`。 |
 | `benchmark/` 和 `scripts/` | 评估、调试、分析和吞吐量脚本。 | 分别保存 raw output、parsed output、per-sample status、aggregate metric 和 run info。 |
 

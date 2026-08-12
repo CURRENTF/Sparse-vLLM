@@ -14,7 +14,7 @@ from sparsevllm.utils.log import logger, log_level
 
 
 def build_omnikv_keep_and_slots(*args, **kwargs):
-    from sparsevllm.triton_kernel.omnikv_fused import build_omnikv_keep_and_slots as _build
+    from sparsevllm.kernels.triton.omnikv_fused import build_omnikv_keep_and_slots as _build
 
     return _build(*args, **kwargs)
 

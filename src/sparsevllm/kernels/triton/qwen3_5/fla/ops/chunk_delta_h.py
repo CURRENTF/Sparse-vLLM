@@ -15,7 +15,7 @@ import triton.language as tl
 
 from .index import prepare_chunk_indices, prepare_chunk_offsets
 from .op import exp, safe_exp
-from sparsevllm.triton_kernel.qwen3_5.autotuner import autotune
+from sparsevllm.kernels.triton.qwen3_5.autotuner import autotune
 
 NUM_WARPS = [2, 4, 8, 16]
 

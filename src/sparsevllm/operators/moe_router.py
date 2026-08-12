@@ -98,7 +98,7 @@ class TritonMoeRouterProvider(MoeRouterProvider):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if correction_bias is not None or routed_scaling_factor != 1.0:
             raise ValueError("Softmax routing does not accept bias or route scaling.")
-        from sparsevllm.triton_kernel.moe_topk import topk_softmax
+        from sparsevllm.kernels.triton.moe_topk import topk_softmax
 
         return topk_softmax(
             router_logits,
@@ -134,7 +134,7 @@ class GlmBiasedSigmoidRouterProvider(MoeRouterProvider):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if correction_bias is None:
             raise ValueError("Biased-sigmoid routing requires correction_bias.")
-        from sparsevllm.triton_kernel.moe_biased_sigmoid import (
+        from sparsevllm.kernels.triton.moe_biased_sigmoid import (
             fused_topk_biased_sigmoid,
         )
 

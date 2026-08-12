@@ -57,7 +57,7 @@ Do not bury a full method implementation in `attention.py`.
 
 ## Add Kernel Code Only When Needed
 
-Touch `src/sparsevllm/triton_kernel/` or another explicit kernel module when:
+Touch `src/sparsevllm/kernels/triton/` or another explicit kernel module when:
 
 - the existing decode or prefill kernels are the bottleneck
 - the method requires a new layout-aware fused operator

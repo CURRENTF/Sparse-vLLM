@@ -18,7 +18,7 @@ from sparsevllm.engine.prefill import (
     PREFILL_EXECUTION_RAW_OFFLOAD,
 )
 from sparsevllm.method_registry import SUPPORTED_SPARSE_METHODS, normalize_sparse_method
-from sparsevllm.triton_kernel.store_kvcache import store_kvcache
+from sparsevllm.kernels.triton.store_kvcache import store_kvcache
 import sparsevllm.platforms as platforms
 from sparsevllm.models.layout import resolve_attention_qk_head_dim
 from sparsevllm.utils.log import logger, log_level

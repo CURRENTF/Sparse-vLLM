@@ -11,18 +11,12 @@ from sparsevllm.engine.cache_manager.base import (
     MlaLatentPayload,
     PrefillComputeView,
 )
-from sparsevllm.operators.registry import (
-    OpRegistry,
-    OpResolver,
-    SupportResult,
-)
-from sparsevllm.operators.sgl_fa3 import SglFa3DecodeKernel, sgl_fa3_support
-from sparsevllm.operators.tilelang_mla import (
+from sparsevllm.kernels.external.sgl.fa3 import SglFa3DecodeKernel, sgl_fa3_support
+from sparsevllm.kernels.tilelang.mla.runtime import (
     TileMlaDecodeKernel,
     tilelang_mla_support,
 )
-from sparsevllm.platforms.interface import DeviceCaps, PlatformEnum
-from sparsevllm.triton_kernel.mla import (
+from sparsevllm.kernels.triton.mla import (
     DEFAULT_GLM_MLA_DECODE_CONFIG,
     GLM_MLA_MAX_WORKSPACE_CONFIG,
     MlaDecodeLaunchConfig,
@@ -31,7 +25,12 @@ from sparsevllm.triton_kernel.mla import (
     select_glm_mla_decode_config,
     validate_mla_decode_metadata,
 )
-
+from sparsevllm.operators.registry import (
+    OpRegistry,
+    OpResolver,
+    SupportResult,
+)
+from sparsevllm.platforms.interface import DeviceCaps, PlatformEnum
 
 _GLM_MLA_NUM_Q_HEADS = 20
 _GLM_MLA_KV_LORA_RANK = 512

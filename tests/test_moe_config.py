@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from sparsevllm.triton_kernel.moe_config import (
+from sparsevllm.kernels.triton.moe_config import (
     resolve_fp8_routed_gemm_config,
     resolve_moe_gemm_config,
     token_bucket,

@@ -21,7 +21,7 @@ from sparsevllm.operators.mla_attention import (
 )
 from sparsevllm.operators.registry import OpResolver
 from sparsevllm.platforms import DeviceCaps, PlatformEnum
-from sparsevllm.triton_kernel.mla import (
+from sparsevllm.kernels.triton.mla import (
     GLM_MLA_MAX_WORKSPACE_CONFIG,
     MlaDecodeWorkspace,
 )

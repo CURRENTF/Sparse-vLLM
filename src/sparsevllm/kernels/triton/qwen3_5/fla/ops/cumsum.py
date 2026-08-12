@@ -14,7 +14,7 @@ import triton.language as tl
 
 from .index import prepare_chunk_indices
 from .utils import check_shared_mem, input_guard
-from sparsevllm.triton_kernel.qwen3_5.autotuner import autotune
+from sparsevllm.kernels.triton.qwen3_5.autotuner import autotune
 
 BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
 

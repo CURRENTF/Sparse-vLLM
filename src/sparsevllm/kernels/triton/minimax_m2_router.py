@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from sparsevllm.triton_kernel.moe_biased_sigmoid import (
+from sparsevllm.kernels.triton.moe_biased_sigmoid import (
     topk_biased_sigmoid as _topk_biased_sigmoid,
 )
 

@@ -7,13 +7,13 @@ from dataclasses import replace
 import torch
 
 from sparsevllm.engine.sequence import Sequence
-from sparsevllm.triton_kernel.quant import (
+from sparsevllm.kernels.triton.quant import (
     triton_dequantize_2d_int4_grouped,
     triton_quantize_and_pack_2d_int4_grouped,
     triton_quantize_and_pack_along_last_dim,
     unpack_quantized_to_16bit,
 )
-from sparsevllm.triton_kernel.deltakv_kernels import deltakv_materialize_sparse_view
+from sparsevllm.kernels.triton.deltakv_kernels import deltakv_materialize_sparse_view
 from sparsevllm.layers.rotary_embedding import apply_rotary_emb
 from sparsevllm.platforms import device_runtime
 from sparsevllm.utils.compressor import create_compressor
@@ -2814,7 +2814,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         v_cache: torch.Tensor,
         l_idx: int | None = None,
     ):
-        from sparsevllm.triton_kernel.deltakv_kernels import deltakv_reconstruct_writeback_grouped_heads
+        from sparsevllm.kernels.triton.deltakv_kernels import deltakv_reconstruct_writeback_grouped_heads
 
         hp = int(getattr(self.config, "deltakv_triton_reconstruct_heads_per_program", 4) or 1)
         hp = max(1, min(hp, int(self.num_kv_heads)))
@@ -2911,7 +2911,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         buffers = self._ensure_decode_static_plan_buffers(bsz, k_max, max_s, req_indices.device)
         active_slots, active_pos, local_req, new_context_lens, no_free_temp_slots, recon_pos, recon_latent, recon_out_slot = buffers
 
-        from sparsevllm.triton_kernel.deltakv_kernels import deltakv_static_decode_plan
+        from sparsevllm.kernels.triton.deltakv_kernels import deltakv_static_decode_plan
 
         deltakv_static_decode_plan(
             raw_slots_map=self.sparse_layer_raw_slots_map,
@@ -3359,7 +3359,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         flat_raw_slots = raw_slots.reshape(-1)
         total_slots = bsz * max_len
 
-        from sparsevllm.triton_kernel.deltakv_kernels import full_layer_copy_raw_or_zero
+        from sparsevllm.kernels.triton.deltakv_kernels import full_layer_copy_raw_or_zero
 
         full_layer_copy_raw_or_zero(
             raw_k=self.full_kv_cache[0, l_idx],
@@ -3423,7 +3423,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         if ((local_offsets < 0) | (local_offsets >= self._full_layer_kivi_group_size())).any():
             raise RuntimeError("Full-layer KIVI token position is outside its packed block.")
 
-        from sparsevllm.triton_kernel.deltakv_kernels import full_layer_kivi_dequant_tokens
+        from sparsevllm.kernels.triton.deltakv_kernels import full_layer_kivi_dequant_tokens
 
         if out_k is None or out_v is None:
             raise RuntimeError("Full-layer KIVI dequantization requires explicit output buffers.")

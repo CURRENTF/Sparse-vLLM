@@ -5,7 +5,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from sparsevllm.operators.sgl_fa3 import (
+from sparsevllm.kernels.external.sgl.fa3 import (
     SglFa3DecodeKernel,
     sgl_fa3_support,
 )

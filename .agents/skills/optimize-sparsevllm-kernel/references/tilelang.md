@@ -1,6 +1,6 @@
 # TileLang Kernel Guide
 
-Use this guide for kernels under `src/sparsevllm/tilelang_kernel/` and their
+Use this guide for kernels under `src/sparsevllm/kernels/tilelang/` and their
 lazy adapters under `src/sparsevllm/operators/`.
 
 ## Establish the Contract

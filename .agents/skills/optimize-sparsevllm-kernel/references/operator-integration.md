@@ -16,9 +16,10 @@ model semantic call
   -> Triton, TileLang, JIT, or external kernel
 ```
 
-- Keep repository-owned Triton kernels under `src/sparsevllm/triton_kernel/`.
+- Keep repository-owned Triton kernels under `src/sparsevllm/kernels/triton/`.
 - Keep repository-owned TileLang kernels under
-  `src/sparsevllm/tilelang_kernel/`.
+  `src/sparsevllm/kernels/tilelang/`.
+- Keep thin third-party adapters under `src/sparsevllm/kernels/external/`.
 - Keep support checks, dependency availability, static launch selection,
   workspaces, and provider binding under `src/sparsevllm/operators/`.
 - Keep models expressed in semantic operations rather than backend names,

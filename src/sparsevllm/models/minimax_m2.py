@@ -199,7 +199,7 @@ class MiniMaxM2Router(nn.Module):
         self.e_score_correction_bias = nn.Parameter(
             torch.empty(self.num_experts, dtype=torch.float32)
         )
-        from sparsevllm.triton_kernel.minimax_m2_router import (
+        from sparsevllm.kernels.triton.minimax_m2_router import (
             topk_biased_sigmoid,
         )
 

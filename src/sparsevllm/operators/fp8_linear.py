@@ -125,7 +125,7 @@ class TritonFp8LinearProvider(Fp8LinearProvider):
         return SupportResult.yes()
 
     def __call__(self, x, weight, weight_scale_inv, bias=None):
-        from sparsevllm.triton_kernel.fp8_blockwise import fp8_blockwise_matmul
+        from sparsevllm.kernels.triton.fp8_blockwise import fp8_blockwise_matmul
 
         original_shape = x.shape[:-1]
         output = fp8_blockwise_matmul(

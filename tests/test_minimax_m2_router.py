@@ -4,11 +4,11 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from sparsevllm.triton_kernel.minimax_m2_router import (
+from sparsevllm.kernels.triton.minimax_m2_router import (
     minimax_m2_router,
     topk_biased_sigmoid,
 )
-from sparsevllm.triton_kernel.moe_biased_sigmoid import (
+from sparsevllm.kernels.triton.moe_biased_sigmoid import (
     topk_biased_sigmoid as generic_topk_biased_sigmoid,
 )
 

@@ -9,12 +9,12 @@ from sparsevllm.engine.cache_manager import (
 )
 from sparsevllm.operators.registry import record_operator_binding
 from sparsevllm.utils.context import get_context
-from sparsevllm.triton_kernel.context_flashattention_nopad import context_attention_fwd
-from sparsevllm.triton_kernel.flash_decoding_stage1 import flash_decode_stage1 as mha_flash_decode_stage1
-from sparsevllm.triton_kernel.flash_decoding_stage1 import flash_decode_stage1_with_score as mha_flash_decode_stage1_with_score
-from sparsevllm.triton_kernel.flash_decoding_stage2 import flash_decode_stage2
-from sparsevllm.triton_kernel.gqa_flash_decoding_stage1 import flash_decode_stage1 as gqa_flash_decode_stage1
-from sparsevllm.triton_kernel.gqa_flash_decoding_stage1 import flash_decode_stage1_with_score as gqa_flash_decode_stage1_with_score
+from sparsevllm.kernels.triton.context_flashattention_nopad import context_attention_fwd
+from sparsevllm.kernels.triton.flash_decoding_stage1 import flash_decode_stage1 as mha_flash_decode_stage1
+from sparsevllm.kernels.triton.flash_decoding_stage1 import flash_decode_stage1_with_score as mha_flash_decode_stage1_with_score
+from sparsevllm.kernels.triton.flash_decoding_stage2 import flash_decode_stage2
+from sparsevllm.kernels.triton.gqa_flash_decoding_stage1 import flash_decode_stage1 as gqa_flash_decode_stage1
+from sparsevllm.kernels.triton.gqa_flash_decoding_stage1 import flash_decode_stage1_with_score as gqa_flash_decode_stage1_with_score
 from sparsevllm.utils.log import log_once
 from sparsevllm.utils.profiler import profiler
 
@@ -418,7 +418,7 @@ class TritonAttentionBackend:
         backend_metadata = payload.metadata
         if backend_metadata is None:
             raise RuntimeError("full_layer_kivi decode view is missing metadata.")
-        from sparsevllm.triton_kernel.deltakv_kernels import full_layer_kivi_flash_decode_stage1
+        from sparsevllm.kernels.triton.deltakv_kernels import full_layer_kivi_flash_decode_stage1
 
         full_layer_kivi_flash_decode_stage1(
             q=q,

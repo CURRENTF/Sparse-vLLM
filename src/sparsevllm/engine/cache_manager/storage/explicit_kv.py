@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from sparsevllm.triton_kernel.store_kvcache import store_kvcache
+from sparsevllm.kernels.triton.store_kvcache import store_kvcache
 
 from ..base import AttentionCacheWrite, ExplicitKVPayload, ExplicitKVWrite
 from .base import CacheLayout

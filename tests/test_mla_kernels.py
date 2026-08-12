@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from sparsevllm.triton_kernel.mla import (
+from sparsevllm.kernels.triton.mla import (
     DEFAULT_GLM_MLA_DECODE_CONFIG,
     GLM_MLA_SOFTMAX_SCALE,
     MlaDecodeWorkspace,
@@ -159,7 +159,8 @@ def test_vendor_python_files_do_not_import_lightllm() -> None:
         Path(__file__).parents[1]
         / "src"
         / "sparsevllm"
-        / "triton_kernel"
+        / "kernels"
+        / "triton"
         / "mla"
     )
     for path in kernel_dir.glob("*.py"):

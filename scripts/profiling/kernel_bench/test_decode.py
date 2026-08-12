@@ -2,14 +2,14 @@ import torch
 import time
 import numpy as np
 from flash_attn import flash_attn_with_kvcache
-from sparsevllm.triton_kernel.flash_decoding_stage1 import (
+from sparsevllm.kernels.triton.flash_decoding_stage1 import (
     flash_decode_stage1,
     flash_decode_stage1_with_score
 )
-from sparsevllm.triton_kernel.flash_decoding_stage2 import flash_decode_stage2
-from sparsevllm.triton_kernel.gqa_decode_flashattention_nopad import gqa_decode_attention_fwd
-from sparsevllm.triton_kernel.gqa_flash_decoding_stage1 import flash_decode_stage1 as gqa_flash_decode_stage1
-from sparsevllm.triton_kernel.gqa_flash_decoding_stage2 import flash_decode_stage2 as gqa_flash_decode_stage2
+from sparsevllm.kernels.triton.flash_decoding_stage2 import flash_decode_stage2
+from sparsevllm.kernels.triton.gqa_decode_flashattention_nopad import gqa_decode_attention_fwd
+from sparsevllm.kernels.triton.gqa_flash_decoding_stage1 import flash_decode_stage1 as gqa_flash_decode_stage1
+from sparsevllm.kernels.triton.gqa_flash_decoding_stage2 import flash_decode_stage2 as gqa_flash_decode_stage2
 
 def benchmark_gqa_kernels(
     batch_sizes=[1, 8, 32],

@@ -24,11 +24,11 @@ from sparsevllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 from sparsevllm.utils.context import get_context
 from sparsevllm.utils.weight_target import WeightTarget
 from sparsevllm.engine.recurrent_state_manager import RecurrentStateSpec, RecurrentTensorSpec
-from sparsevllm.triton_kernel.qwen3_5.causal_conv1d import causal_conv1d_fn
-from sparsevllm.triton_kernel.qwen3_5.fused_gdn_gating import fused_gdn_gating
-from sparsevllm.triton_kernel.qwen3_5.gated_rmsnorm import gated_rmsnorm_forward
-from sparsevllm.triton_kernel.qwen3_5.gdn_decode_pack import conv_pack_gdn_decode_inputs
-from sparsevllm.triton_kernel.qwen3_5.fla.ops import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
+from sparsevllm.kernels.triton.qwen3_5.causal_conv1d import causal_conv1d_fn
+from sparsevllm.kernels.triton.qwen3_5.fused_gdn_gating import fused_gdn_gating
+from sparsevllm.kernels.triton.qwen3_5.gated_rmsnorm import gated_rmsnorm_forward
+from sparsevllm.kernels.triton.qwen3_5.gdn_decode_pack import conv_pack_gdn_decode_inputs
+from sparsevllm.kernels.triton.qwen3_5.fla.ops import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
 
 
 def _get_rope_theta(config) -> float:

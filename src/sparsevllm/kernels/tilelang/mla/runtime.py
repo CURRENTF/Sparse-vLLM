@@ -7,12 +7,11 @@ call and caches them by the CUDA Graph's static batch/context shape.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from importlib import metadata
-from typing import Callable
 
 import torch
-
 
 _VALIDATED_TILELANG_VERSION = "0.1.9"
 _VALIDATED_TVM_FFI_VERSION = "0.1.10"
@@ -243,7 +242,7 @@ class TileMlaDecodeKernel:
             raise RuntimeError(reason)
         # Importing TileLang can initialize its compiler, so keep it behind the
         # selected provider and outside module import/resolver paths.
-        from sparsevllm.tilelang_kernel.mla.decode import (
+        from sparsevllm.kernels.tilelang.mla.decode import (
             build_glm_mla_decode_kernel,
         )
 
@@ -465,8 +464,9 @@ class TileMlaDecodeKernel:
             bound = self._bind(key)
             self._kernels[key] = bound
 
-        from sparsevllm.tilelang_kernel.mla.decode import pad_glm_q_kernel
         import triton
+
+        from sparsevllm.kernels.tilelang.mla.decode import pad_glm_q_kernel
 
         workspace = bound.workspace
         pad_glm_q_kernel[

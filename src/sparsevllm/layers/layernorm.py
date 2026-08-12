@@ -59,7 +59,7 @@ def _load_flashinfer_ops(*, zero_centered_weight: bool) -> _RMSNormOps:
 
 
 def _load_triton_ops(*, zero_centered_weight: bool) -> _RMSNormOps:
-    from sparsevllm.triton_kernel.rmsnorm import (
+    from sparsevllm.kernels.triton.rmsnorm import (
         fused_add_rmsnorm_forward,
         rmsnorm_forward,
     )
@@ -223,7 +223,7 @@ class ColumnParallelRMSNorm(RMSNorm):
         if self.parallel_context is not other_norm.parallel_context:
             raise ValueError("Paired column-parallel RMSNorms must share a context.")
         if x.is_cuda or other.is_cuda:
-            from sparsevllm.triton_kernel.column_parallel_rmsnorm import (
+            from sparsevllm.kernels.triton.column_parallel_rmsnorm import (
                 paired_rms_apply,
                 paired_square_sums,
             )

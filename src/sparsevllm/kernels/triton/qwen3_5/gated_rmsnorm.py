@@ -1,7 +1,7 @@
 import triton
 import triton.language as tl
 import torch
-from sparsevllm.triton_kernel.qwen3_5.autotuner import autotune
+from sparsevllm.kernels.triton.qwen3_5.autotuner import autotune
 
 
 @triton.heuristics(

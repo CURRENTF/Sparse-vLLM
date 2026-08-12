@@ -6,6 +6,7 @@ from importlib.util import find_spec
 import torch
 
 import sparsevllm.platforms as platforms
+from sparsevllm.kernels.moe import MoeAlignment
 from sparsevllm.operators.registry import (
     OpRegistry,
     OpResolver,
@@ -176,6 +177,33 @@ class MoeProvider:
 MOE_REGISTRY: OpRegistry[MoeOpSpec, MoeProvider] = OpRegistry("routed MoE")
 
 
+def _sgl_moe_align_block_size(
+    topk_ids: torch.Tensor,
+    *,
+    block_size: int,
+    num_experts: int,
+    local_expert_start: int,
+    local_expert_end: int,
+) -> MoeAlignment:
+    from sparsevllm.kernels.external.sgl.moe import sgl_moe_align_block_size
+    from sparsevllm.kernels.triton.moe import localize_expert_ids
+
+    num_local_experts = int(local_expert_end) - int(local_expert_start)
+    has_remote_experts = num_local_experts != int(num_experts)
+    if has_remote_experts:
+        topk_ids = localize_expert_ids(
+            topk_ids,
+            local_expert_start=local_expert_start,
+            local_expert_end=local_expert_end,
+            remote_expert_id=num_local_experts,
+        )
+    return sgl_moe_align_block_size(
+        topk_ids,
+        block_size=block_size,
+        num_experts=num_local_experts + int(has_remote_experts),
+    )
+
+
 @MOE_REGISTRY.register
 class SglAlignedTritonGlmMoeProvider(MoeProvider):
     name = "sgl_aligned_triton_glm"
@@ -211,7 +239,7 @@ class SglAlignedTritonGlmMoeProvider(MoeProvider):
             return SupportResult.no("requires BF16 activations")
         if spec.weight_dtype != torch.bfloat16 or spec.block_shape is not None:
             return SupportResult.no("requires unquantized BF16 expert weights")
-        from sparsevllm.operators.sgl_moe import sgl_moe_alignment_support
+        from sparsevllm.kernels.external.sgl.moe import sgl_moe_alignment_support
 
         supported, reason = sgl_moe_alignment_support()
         return SupportResult.yes() if supported else SupportResult.no(reason)
@@ -233,8 +261,7 @@ class SglAlignedTritonGlmMoeProvider(MoeProvider):
         del ep_rank
         if w13_scale_inv is not None or w2_scale_inv is not None:
             raise RuntimeError("SGL-aligned BF16 MoE does not accept expert scales.")
-        from sparsevllm.operators.sgl_moe import sgl_moe_align_block_size
-        from sparsevllm.triton_kernel.moe import fused_moe
+        from sparsevllm.kernels.triton.moe import fused_moe
 
         alignment_impl = None
         num_tokens = int(hidden_states.shape[0])
@@ -245,7 +272,7 @@ class SglAlignedTritonGlmMoeProvider(MoeProvider):
                 or num_tokens * int(spec.top_k) * 4 > int(spec.num_experts)
             )
         ):
-            alignment_impl = sgl_moe_align_block_size
+            alignment_impl = _sgl_moe_align_block_size
         return fused_moe(
             hidden_states,
             w13_weight,
@@ -343,7 +370,7 @@ class TritonMinimaxM2FusedMoeProvider(MoeProvider):
         del ep_rank
         if w13_scale_inv is None or w2_scale_inv is None:
             raise RuntimeError("MiniMax M2.7 fused MoE requires expert scales.")
-        from sparsevllm.triton_kernel.minimax_m2_moe import (
+        from sparsevllm.kernels.triton.minimax_m2_moe import (
             fused_minimax_m2_moe_fp8,
         )
 
@@ -502,7 +529,7 @@ class TritonHopperFusedMoeProvider(MoeProvider):
         del ep_rank
         if w13_scale_inv is not None or w2_scale_inv is not None:
             raise RuntimeError("Fused Hopper BF16 MoE does not accept expert scales.")
-        from sparsevllm.triton_kernel.moe import fused_moe_gate_up_swiglu
+        from sparsevllm.kernels.triton.moe import fused_moe_gate_up_swiglu
 
         return fused_moe_gate_up_swiglu(
             hidden_states,
@@ -577,7 +604,7 @@ class TritonMoeProvider(MoeProvider):
         if spec.weight_dtype == torch.float8_e4m3fn:
             if w13_scale_inv is None or w2_scale_inv is None:
                 raise RuntimeError("Triton FP8 MoE requires expert scales.")
-            from sparsevllm.triton_kernel.moe import fused_moe_fp8
+            from sparsevllm.kernels.triton.moe import fused_moe_fp8
 
             return fused_moe_fp8(
                 hidden_states,
@@ -591,7 +618,7 @@ class TritonMoeProvider(MoeProvider):
                 local_expert_start=local_expert_start,
                 gate_up_order=self.gate_up_order,
             )
-        from sparsevllm.triton_kernel.moe import fused_moe
+        from sparsevllm.kernels.triton.moe import fused_moe
 
         return fused_moe(
             hidden_states,
@@ -686,7 +713,7 @@ class HopperQwen36HybridFp8MoeProvider(FlashInferCutlassFp8MoeProvider):
             )
         if w13_scale_inv is None or w2_scale_inv is None:
             raise RuntimeError("Qwen3.6 hybrid FP8 MoE requires expert scales.")
-        from sparsevllm.triton_kernel.moe import fused_moe_fp8
+        from sparsevllm.kernels.triton.moe import fused_moe_fp8
 
         return fused_moe_fp8(
             hidden_states,
