@@ -243,7 +243,7 @@ def _sgl_moe_align_block_size(
     return sgl_moe_align_block_size(
         topk_ids,
         block_size=block_size,
-        num_experts=num_local_experts + int(has_remote_experts),
+        num_experts=num_local_experts,
     )
 
 
