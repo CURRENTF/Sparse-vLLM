@@ -63,14 +63,6 @@ class Gemma4OperatorProvider:
     ) -> torch.Tensor:
         raise NotImplementedError
 
-    def router_topk(
-        self,
-        logits: torch.Tensor,
-        per_expert_scale: torch.Tensor,
-        top_k: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        raise NotImplementedError
-
     def gelu_tanh_and_mul(self, x: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
 
@@ -137,11 +129,6 @@ class TritonGemma4OperatorProvider(Gemma4OperatorProvider):
 
         return gemma4_router_input(hidden_states, scale, root_size, eps)
 
-    def router_topk(self, logits, per_expert_scale, top_k):
-        from sparsevllm.kernels.triton.gemma4_router import gemma4_router_topk
-
-        return gemma4_router_topk(logits, per_expert_scale, top_k)
-
     def gelu_tanh_and_mul(self, x):
         from sparsevllm.kernels.triton.gemma4_gelu_and_mul import (
             gelu_tanh_and_mul_fwd,
@@ -206,13 +193,6 @@ class H20Gemma4OperatorProvider(TritonGemma4OperatorProvider):
 
         self._prefill = Gemma4FlashInferPrefill()
 
-    def router_topk(self, logits, per_expert_scale, top_k):
-        from sparsevllm.kernels.triton.gemma4_fused_router import (
-            gemma4_fused_router_topk,
-        )
-
-        return gemma4_fused_router_topk(logits, per_expert_scale, top_k)
-
     def attention_backend(self, *, sliding_window: int | None):
         from sparsevllm.operators.gemma4_attention import Gemma4AttentionBackend
 
@@ -254,12 +234,6 @@ class TorchGemma4OperatorProvider(Gemma4OperatorProvider):
 
     def router_input(self, hidden_states, scale, root_size, eps):
         return self.rmsnorm(hidden_states, None, eps) * scale * root_size
-
-    def router_topk(self, logits, per_expert_scale, top_k):
-        probabilities = F.softmax(logits, dim=-1, dtype=torch.float32)
-        weights, ids = probabilities.topk(top_k, dim=-1)
-        weights.div_(weights.sum(-1, keepdim=True)).mul_(per_expert_scale[ids])
-        return weights, ids
 
     def gelu_tanh_and_mul(self, x):
         gate, up = x.chunk(2, -1)

@@ -47,6 +47,13 @@ from sparsevllm.operators.gemma4_moe import (
     TorchGemma4MoeProvider,
     TritonGemma4MoeProvider,
 )
+from sparsevllm.operators.gemma4_router import (
+    GEMMA4_ROUTER_REGISTRY,
+    Gemma4RouterOpSpec,
+    H20Gemma4RouterProvider,
+    TorchGemma4RouterProvider,
+    TritonGemma4RouterProvider,
+)
 from sparsevllm.operators.moe import MoeOpSpec
 from sparsevllm.operators.registry import OpResolver
 from sparsevllm.platforms import DeviceCaps, PlatformEnum
@@ -171,6 +178,53 @@ def test_gemma4_h20_prefers_dedicated_flashinfer_prefill(_find, _version):
     assert isinstance(moe.provider, H20Gemma4MoeProvider)
 
 
+@pytest.mark.parametrize(
+    ("num_experts", "provider_type"),
+    ((1024, H20Gemma4RouterProvider), (1025, TritonGemma4RouterProvider)),
+)
+def test_gemma4_h20_router_resolves_expert_boundary(num_experts, provider_type):
+    caps = DeviceCaps(
+        platform=PlatformEnum.CUDA,
+        device_type="cuda",
+        device_index=0,
+        device_name="NVIDIA H20",
+        compute_capability=(9, 0),
+        runtime_version="13.0",
+        supports_graph_capture=True,
+        supports_triton=True,
+        supports_bfloat16=True,
+        supports_native_fp8=True,
+    )
+    resolved = OpResolver(GEMMA4_ROUTER_REGISTRY).resolve(
+        Gemma4RouterOpSpec(torch.bfloat16, num_experts, 8, True), caps
+    )
+    assert isinstance(resolved.provider, provider_type)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("num_experts", [1024, 1025])
+def test_gemma4_h20_router_expert_boundary_matches_torch(num_experts):
+    provider_type = (
+        H20Gemma4RouterProvider
+        if num_experts == 1024
+        else TritonGemma4RouterProvider
+    )
+    torch.manual_seed(41)
+    logits = torch.randn(3, num_experts, dtype=torch.bfloat16, device="cuda")
+    scales = torch.randn(num_experts, dtype=torch.bfloat16, device="cuda")
+    weights, ids = provider_type().topk(logits, scales, 8)
+    probabilities = logits.float().softmax(-1)
+    expected_weights, expected_ids = probabilities.topk(8, dim=-1)
+    expected_weights.div_(expected_weights.sum(-1, keepdim=True)).mul_(
+        scales[expected_ids]
+    )
+    actual = torch.zeros_like(probabilities).scatter_(1, ids.long(), weights)
+    expected = torch.zeros_like(probabilities).scatter_(
+        1, expected_ids, expected_weights
+    )
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+
+
 def _parallel_context() -> ParallelContext:
     group = ParallelGroup(process_group=None, ranks=(0,), rank=0, size=1)
     return ParallelContext(world=group, tensor=group, expert=group, data=group)
@@ -261,6 +315,23 @@ def test_gemma4_rope_matches_transformers_for_both_layer_types():
         )
 
 
+def test_gemma4_rope_cache_separates_same_type_head_dims():
+    config = _config(
+        num_hidden_layers=3,
+        layer_types=["sliding_attention", "sliding_attention", "full_attention"],
+        per_layer_config={
+            "0": {"head_dim": 4},
+            "1": {"head_dim": 8},
+            "2": {"head_dim": 8},
+        },
+    )
+    with _patch_parallel_context():
+        model = Gemma4Model(config, TorchGemma4OperatorProvider())
+    assert len(model.rotary_embeddings) == 3
+    assert model.layers[0].self_attn.rotary_emb.cos_sin_cache.shape[-1] == 4
+    assert model.layers[1].self_attn.rotary_emb.cos_sin_cache.shape[-1] == 8
+
+
 def test_gemma4_dense_mlp_matches_transformers():
     config = _config()
     with _patch_parallel_context():
@@ -287,7 +358,9 @@ def test_gemma4_router_matches_transformers():
         enable_moe_block=True, num_experts=4, top_k_experts=2, moe_intermediate_size=4
     )
     with _patch_parallel_context():
-        actual = Gemma4Router(config, TorchGemma4OperatorProvider())
+        actual = Gemma4Router(
+            config, TorchGemma4OperatorProvider(), TorchGemma4RouterProvider()
+        )
     reference = HFGemma4Router(config)
     torch.manual_seed(5)
     reference.proj.weight.data.normal_(0, 0.2)

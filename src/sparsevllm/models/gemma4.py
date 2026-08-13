@@ -26,6 +26,11 @@ from sparsevllm.operators.gemma4 import (
     Gemma4OpSpec,
     resolve_gemma4_provider,
 )
+from sparsevllm.operators.gemma4_router import (
+    Gemma4RouterOpSpec,
+    Gemma4RouterProvider,
+    resolve_gemma4_router_provider,
+)
 from sparsevllm.operators.gemma4_moe import Gemma4PackedExperts
 from sparsevllm.operators.moe import model_activation_dtype
 from sparsevllm.platforms import device_runtime
@@ -299,6 +304,7 @@ class Gemma4Router(nn.Module):
         self,
         config: Gemma4TextConfig,
         operator_provider: Gemma4OperatorProvider,
+        router_provider: Gemma4RouterProvider,
     ) -> None:
         super().__init__()
         self.top_k = int(config.top_k_experts)
@@ -310,6 +316,7 @@ class Gemma4Router(nn.Module):
             provider=operator_provider,
         )
         self._ops = operator_provider
+        self._router_ops = router_provider
         self.scale = nn.Parameter(torch.ones(config.hidden_size))
         self.proj = ReplicatedLinear(config.hidden_size, config.num_experts)
         self.per_expert_scale = nn.Parameter(torch.ones(config.num_experts))
@@ -318,7 +325,7 @@ class Gemma4Router(nn.Module):
         router_input = self._ops.router_input(
             hidden_states, self.scale, self.root_size, self.norm.eps
         )
-        return self._ops.router_topk(
+        return self._router_ops.topk(
             self.proj(router_input), self.per_expert_scale, self.top_k
         )
 
@@ -329,14 +336,14 @@ class Gemma4DecoderLayer(nn.Module):
         config: Gemma4TextConfig,
         layer_idx: int,
         operator_provider: Gemma4OperatorProvider,
-        rotary_embeddings: nn.ModuleDict,
+        router_provider: Gemma4RouterProvider | None,
+        rotary_emb: Gemma4RotaryEmbedding,
     ) -> None:
         super().__init__()
-        layer_type = str(config.layer_types[layer_idx])
         self.self_attn = Gemma4Attention(
             config,
             layer_idx,
-            rotary_embeddings[layer_type],
+            rotary_emb,
             operator_provider,
         )
         self._ops = operator_provider
@@ -371,7 +378,9 @@ class Gemma4DecoderLayer(nn.Module):
         self.enable_moe_block = bool(config.enable_moe_block)
         if self.enable_moe_block:
             self.parallel_context = get_parallel_context()
-            self.router = Gemma4Router(config, operator_provider)
+            if router_provider is None:
+                raise RuntimeError("Gemma 4 MoE requires a router provider.")
+            self.router = Gemma4Router(config, operator_provider, router_provider)
             self.experts = Gemma4PackedExperts(config)
             self.post_feedforward_layernorm_1 = Gemma4RMSNorm(
                 config.hidden_size,
@@ -444,6 +453,7 @@ class Gemma4Model(nn.Module):
         self,
         config: Gemma4TextConfig,
         operator_provider: Gemma4OperatorProvider,
+        router_provider: Gemma4RouterProvider | None = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -470,29 +480,46 @@ class Gemma4Model(nn.Module):
             )
             self.per_layer_model_projection_scale = float(config.hidden_size) ** -0.5
             self.per_layer_input_scale = 2.0**-0.5
-        self.rotary_embeddings = nn.ModuleDict(
-            {
-                layer_type: Gemma4RotaryEmbedding(
+        rotary_keys = []
+        rotary_embeddings = {}
+        rotary_signatures = {}
+        for layer_idx, layer_type in enumerate(config.layer_types):
+            head_dim = int(
+                config_layer_get(
                     config,
-                    layer_type,
-                    config_layer_get(
-                        config,
-                        config.layer_types.index(layer_type),
-                        "head_dim",
-                        "head_dim"
-                        if layer_type == "sliding_attention"
-                        else "global_head_dim",
-                    ),
+                    layer_idx,
+                    "head_dim",
+                    "head_dim"
+                    if layer_type == "sliding_attention"
+                    else "global_head_dim",
                 )
-                for layer_type in set(config.layer_types)
-            }
-        )
+            )
+            signature = (
+                str(layer_type),
+                head_dim,
+                tuple(
+                    sorted(
+                        (key, repr(value))
+                        for key, value in config.rope_parameters[layer_type].items()
+                    )
+                ),
+            )
+            key = rotary_signatures.setdefault(
+                signature, f"rope_{len(rotary_signatures)}"
+            )
+            rotary_keys.append(key)
+            if key not in rotary_embeddings:
+                rotary_embeddings[key] = Gemma4RotaryEmbedding(
+                    config, str(layer_type), head_dim
+                )
+        self.rotary_embeddings = nn.ModuleDict(rotary_embeddings)
         self.layers = nn.ModuleList(
             Gemma4DecoderLayer(
                 config,
                 layer_idx,
                 operator_provider,
-                self.rotary_embeddings,
+                router_provider,
+                self.rotary_embeddings[rotary_keys[layer_idx]],
             )
             for layer_idx in range(config.num_hidden_layers)
         )
@@ -572,10 +599,11 @@ class Gemma4ForCausalLM(nn.Module):
         self,
         config: Gemma4TextConfig,
         operator_provider: Gemma4OperatorProvider,
+        router_provider: Gemma4RouterProvider | None = None,
     ) -> None:
         super().__init__()
         self.config = config
-        self.model = Gemma4Model(config, operator_provider)
+        self.model = Gemma4Model(config, operator_provider, router_provider)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if config.tie_word_embeddings:
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
@@ -618,7 +646,7 @@ class Gemma4ForCausalLM(nn.Module):
                 }
             )
         )
-        return {
+        runtime_kwargs = {
             "operator_provider": resolve_gemma4_provider(
                 Gemma4OpSpec(
                     activation_dtype=model_activation_dtype(config),
@@ -628,6 +656,17 @@ class Gemma4ForCausalLM(nn.Module):
                 device_index=device.index,
             )
         }
+        if bool(config.enable_moe_block):
+            runtime_kwargs["router_provider"] = resolve_gemma4_router_provider(
+                Gemma4RouterOpSpec(
+                    activation_dtype=model_activation_dtype(config),
+                    num_experts=int(config.num_experts),
+                    top_k=int(config.top_k_experts),
+                    cuda_graph=bool(getattr(config, "decode_cuda_graph", False)),
+                ),
+                device_index=device.index,
+            )
+        return runtime_kwargs
 
     def map_weight_name(self, source_weight_name: str) -> str | None:
         match = _EXPERT_SOURCE_RE.match(source_weight_name)
