@@ -567,7 +567,8 @@ def test_hopper_fused_moe_uses_profiled_tp_ep_shape():
     assert resolved.provider.name == "triton_hopper_fused"
 
 
-def test_glm_tp2_moe_uses_sgl_aligned_provider():
+@pytest.mark.parametrize("device_name", ["NVIDIA H100 80GB HBM3", "NVIDIA H20"])
+def test_glm_tp2_moe_uses_sgl_aligned_provider(device_name):
     spec = _moe_spec(
         activation_dtype=torch.bfloat16,
         weight_dtype=torch.bfloat16,
@@ -591,14 +592,15 @@ def test_glm_tp2_moe_uses_sgl_aligned_provider():
             _cuda_caps(
                 (9, 0),
                 native_fp8=False,
-                device_name="NVIDIA H100 80GB HBM3",
+                device_name=device_name,
             ),
         )
 
     assert resolved.provider.name == "sgl_aligned_triton_glm"
 
 
-def test_glm_tp2_fused_shared_decode_uses_sgl_aligned_provider():
+@pytest.mark.parametrize("device_name", ["NVIDIA H100 80GB HBM3", "NVIDIA H20"])
+def test_glm_tp2_fused_shared_decode_uses_sgl_aligned_provider(device_name):
     spec = _moe_spec(
         activation_dtype=torch.bfloat16,
         weight_dtype=torch.bfloat16,
@@ -622,7 +624,7 @@ def test_glm_tp2_fused_shared_decode_uses_sgl_aligned_provider():
             _cuda_caps(
                 (9, 0),
                 native_fp8=False,
-                device_name="NVIDIA H100 80GB HBM3",
+                device_name=device_name,
             ),
         )
 
@@ -654,7 +656,8 @@ def test_glm_packed_shared_expert_profile(overrides, expected):
     assert use_packed_shared_experts(**values) is expected
 
 
-def test_glm_tp2_ep2_moe_uses_sgl_aligned_provider():
+@pytest.mark.parametrize("device_name", ["NVIDIA H100 80GB HBM3", "NVIDIA H20"])
+def test_glm_tp2_ep2_moe_uses_sgl_aligned_provider(device_name):
     spec = _moe_spec(
         activation_dtype=torch.bfloat16,
         weight_dtype=torch.bfloat16,
@@ -678,7 +681,7 @@ def test_glm_tp2_ep2_moe_uses_sgl_aligned_provider():
             _cuda_caps(
                 (9, 0),
                 native_fp8=False,
-                device_name="NVIDIA H100 80GB HBM3",
+                device_name=device_name,
             ),
         )
 

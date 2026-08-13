@@ -38,6 +38,8 @@ _GLM_MLA_ROPE_DIM = 64
 _GLM_MLA_QK_HEAD_DIM = 256
 _GLM_MLA_VALUE_HEAD_DIM = 256
 _VALIDATED_H100_NAME = "NVIDIA H100 80GB HBM3"
+_VALIDATED_H20_NAME = "NVIDIA H20"
+_VALIDATED_SM90_NAMES = frozenset({_VALIDATED_H100_NAME, _VALIDATED_H20_NAME})
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,9 +109,9 @@ MLA_ATTENTION_REGISTRY: OpRegistry[
 
 @MLA_ATTENTION_REGISTRY.register
 class MlaTritonProvider(MlaAttentionProvider):
-    """H100 provider bound once with caller-independent decode workspace."""
+    """Validated SM90 provider with caller-independent decode workspace."""
 
-    name = "triton_h100"
+    name = "triton_sm90"
     priority = 100
 
     def __init__(
@@ -162,9 +164,9 @@ class MlaTritonProvider(MlaAttentionProvider):
                 f"requires CUDA SM90, got {caps.platform.name} "
                 f"{caps.compute_capability}"
             )
-        if caps.device_name != _VALIDATED_H100_NAME:
+        if caps.device_name not in _VALIDATED_SM90_NAMES:
             return SupportResult.no(
-                "requires validated NVIDIA H100 80GB HBM3 hardware, got "
+                "requires validated H100 80GB HBM3 or H20 hardware, got "
                 f"{caps.device_name}"
             )
         if not caps.supports_triton:
@@ -204,6 +206,10 @@ class MlaTritonProvider(MlaAttentionProvider):
         if spec.tp_size not in {1, 2, 4}:
             return SupportResult.no(
                 f"requires tensor parallel size 1, 2, or 4, got {spec.tp_size}"
+            )
+        if caps.device_name == _VALIDATED_H20_NAME and spec.tp_size not in {1, 2}:
+            return SupportResult.no(
+                f"H20 MLA currently requires tensor parallel size 1 or 2, got {spec.tp_size}"
             )
         return SupportResult.yes()
 
@@ -403,7 +409,7 @@ class MlaTritonProvider(MlaAttentionProvider):
 class MlaSglFa3Provider(MlaTritonProvider):
     """SGL FA3 decode with the score-producing Triton path kept explicit."""
 
-    name = "sgl_fa3_h100"
+    name = "sgl_fa3_sm90"
     priority = 200
     supports_explicit_prefill = True
 
@@ -651,6 +657,10 @@ class MlaTileLangScoreProvider(MlaSglFa3Provider):
         base = MlaSglFa3Provider.supports(spec, caps)
         if not base.supported:
             return base
+        if caps.device_name != _VALIDATED_H100_NAME:
+            return SupportResult.no(
+                "requires H100-validated TileLang MLA schedules"
+            )
         supported, reason = tilelang_mla_support()
         return SupportResult.yes(reason) if supported else SupportResult.no(reason)
 

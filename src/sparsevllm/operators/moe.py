@@ -257,8 +257,8 @@ class SglAlignedTritonGlmMoeProvider(MoeProvider):
     def supports(cls, spec: MoeOpSpec, caps: DeviceCaps) -> SupportResult:
         if caps.platform != PlatformEnum.CUDA or caps.compute_capability != (9, 0):
             return SupportResult.no("requires CUDA SM90")
-        if caps.device_name != "NVIDIA H100 80GB HBM3":
-            return SupportResult.no("requires profiled NVIDIA H100 80GB HBM3")
+        if caps.device_name not in {"NVIDIA H100 80GB HBM3", "NVIDIA H20"}:
+            return SupportResult.no("requires validated H100 80GB HBM3 or H20 hardware")
         expected = {
             (64, 64, 2048, 768, 4, 2, 1, "biased_sigmoid"),
             (65, 65, 2048, 768, 5, 2, 1, "biased_sigmoid"),

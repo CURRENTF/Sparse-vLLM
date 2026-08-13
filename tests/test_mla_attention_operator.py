@@ -95,8 +95,14 @@ def test_mla_attention_scale_uses_qk_head_dimension() -> None:
     assert spec.softmax_scale != pytest.approx((512 + 64) ** -0.5)
 
 
-def test_mla_resolver_selects_h100_triton_provider() -> None:
-    spec = _spec()
+@pytest.mark.parametrize(
+    ("device_name", "tp_size"),
+    [("NVIDIA H100 80GB HBM3", 4), ("NVIDIA H20", 1), ("NVIDIA H20", 2)],
+)
+def test_mla_resolver_selects_sm90_triton_provider(
+    device_name: str, tp_size: int
+) -> None:
+    spec = _spec(tp_size=tp_size)
     workspace = _cpu_workspace(batch_size=8, head_count=spec.local_q_heads)
 
     with (
@@ -111,7 +117,7 @@ def test_mla_resolver_selects_h100_triton_provider() -> None:
     ):
         resolved = OpResolver(MLA_ATTENTION_REGISTRY).resolve(
             spec,
-            _h100_caps(),
+            _h100_caps(device_name=device_name),
             op_spec=spec,
             device="cpu",
             max_batch_size=8,
@@ -119,19 +125,29 @@ def test_mla_resolver_selects_h100_triton_provider() -> None:
 
     assert isinstance(resolved.provider, MlaTritonProvider)
     assert resolved.rejected == (
-        ("sgl_fa3_h100", "sglang-kernel is not installed"),
+        ("sgl_fa3_sm90", "sglang-kernel is not installed"),
         ("tilelang_score_sgl_fa3_h100", "sglang-kernel is not installed"),
     )
     allocate.assert_called_once_with(
         batch_size=8,
-        head_count=5,
+        head_count=spec.local_q_heads,
         device=torch.device("cpu"),
         config=GLM_MLA_MAX_WORKSPACE_CONFIG,
     )
 
 
-def test_mla_resolver_prefers_sgl_fa3_when_available() -> None:
-    spec = _spec()
+@pytest.mark.parametrize(
+    ("device_name", "tp_size", "tilelang_reason"),
+    [
+        ("NVIDIA H100 80GB HBM3", 4, "tilelang unavailable"),
+        ("NVIDIA H20", 1, "requires H100-validated TileLang MLA schedules"),
+        ("NVIDIA H20", 2, "requires H100-validated TileLang MLA schedules"),
+    ],
+)
+def test_mla_resolver_prefers_sgl_fa3_on_supported_sm90(
+    device_name: str, tp_size: int, tilelang_reason: str
+) -> None:
+    spec = _spec(tp_size=tp_size)
     workspace = _cpu_workspace(batch_size=8, head_count=spec.local_q_heads)
 
     with (
@@ -151,7 +167,7 @@ def test_mla_resolver_prefers_sgl_fa3_when_available() -> None:
     ):
         resolved = OpResolver(MLA_ATTENTION_REGISTRY).resolve(
             spec,
-            _h100_caps(),
+            _h100_caps(device_name=device_name),
             op_spec=spec,
             device="cpu",
             max_batch_size=8,
@@ -161,7 +177,7 @@ def test_mla_resolver_prefers_sgl_fa3_when_available() -> None:
     assert resolved.rejected == (
         (
             "tilelang_score_sgl_fa3_h100",
-            "tilelang unavailable",
+            tilelang_reason,
         ),
     )
 
@@ -204,6 +220,11 @@ def test_mla_resolver_accepts_cuda_graph_after_capture_gate() -> None:
         ({}, {"platform": PlatformEnum.CPU}, "requires CUDA SM90"),
         ({}, {"compute_capability": (8, 0)}, "requires CUDA SM90"),
         ({}, {"device_name": "NVIDIA H100 PCIe"}, "validated"),
+        (
+            {"tp_size": 4},
+            {"device_name": "NVIDIA H20"},
+            "H20 MLA currently requires tensor parallel size 1 or 2",
+        ),
         ({}, {"supports_triton": False}, "does not support Triton"),
         ({}, {"supports_bfloat16": False}, "does not support BF16"),
         (
