@@ -67,6 +67,14 @@ include = ["sparsevllm*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
+[tool.uv]
+conflicts = [
+    [
+        { extra = "cu129" },
+        { extra = "cu130" },
+    ],
+]
+
 [tool.uv.sources]
 torch = [
     { index = "pytorch-cu129", extra = "cu129" },
