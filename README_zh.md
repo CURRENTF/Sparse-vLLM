@@ -91,9 +91,10 @@ Sparse-vLLM 需要 Python 3.10 或更高版本，默认依赖声明在
 conda create -n svllm python=3.10 -y
 conda activate svllm
 
+CUDA_VERSION=cu130
 python -m pip config --site set global.extra-index-url \
-  "https://download.pytorch.org/whl/cu130 https://flashinfer.ai/whl/cu130"
-python -m pip install -e .
+  "https://download.pytorch.org/whl/${CUDA_VERSION} https://flashinfer.ai/whl/${CUDA_VERSION}"
+python -m pip install -e ".[${CUDA_VERSION}]"
 
 # 可选安装
 MAX_JOBS=8 pip install flash-attn --no-build-isolation
@@ -109,16 +110,15 @@ PyTorch wheel 自带 CUDA 运行时，而 `flash-attn` 等编译扩展使用当�
 uv venv --python 3.10
 source .venv/bin/activate
 
-uv pip install -e .
+uv pip install -e ".[cu130]"
 
 # 可选安装
 MAX_JOBS=8 uv pip install flash-attn --no-build-isolation
 uv pip install flashinfer-cubin --index-url https://flashinfer.ai/whl
 ```
 
-uv 会从 `pyproject.toml` 读取 CUDA index；pip 只需按上面的命令在环境中
-配置一次。已验证的 CUDA 12.9 [依赖 lock](requirements/locks/README.md)
-为可选复现方式。
+CUDA 12.9 环境将 `cu130` 换成 `cu129`。已验证的 CUDA 12.9
+[依赖 lock](requirements/locks/README.md) 为可选复现方式。
 
 Qwen3.5/Qwen3.6 的 prefill causal Conv1D 和 decode Conv1D/GDN packing
 路径使用仓库内置的 Triton kernel；无需安装 `sglang-kernel`，也无需编译

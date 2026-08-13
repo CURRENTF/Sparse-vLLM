@@ -11,13 +11,10 @@ def test_runtime_compatibility_bounds_cover_canonical_lock():
     project = tomllib.loads(pyproject_path.read_text())["project"]
     dependencies = set(project["dependencies"])
 
-    assert "torch>=2.9,<3" in dependencies
     assert "triton>=3.5,<4" in dependencies
     assert "tilelang==0.1.9" in dependencies
     assert "apache-tvm-ffi==0.1.10" in dependencies
     assert "transformers>=5.13,<6" in dependencies
-    assert "flashinfer-python>=0.6.15,<0.7" in dependencies
-    assert "flashinfer-jit-cache>=0.6.15,<0.7" in dependencies
     assert "sgl-kernel>=0.3.21,<0.4" in dependencies
     assert {"fire", "pillow", "einops", "tqdm", "loguru"} <= dependencies
     assert not any(
@@ -51,14 +48,42 @@ def test_uv_routes_cuda_packages_to_explicit_indexes():
     config = tomllib.loads(pyproject_path.read_text())
     uv_config = config["tool"]["uv"]
 
+    assert config["project"]["optional-dependencies"] == {
+        "cu129": [
+            "torch>=2.9,<3",
+            "flashinfer-python[cu12]>=0.6.15,<0.7",
+            "flashinfer-jit-cache>=0.6.15,<0.7",
+        ],
+        "cu130": [
+            "torch>=2.9,<3",
+            "flashinfer-python[cu13]>=0.6.15,<0.7",
+            "flashinfer-jit-cache>=0.6.15,<0.7",
+        ],
+    }
     assert uv_config["sources"] == {
-        "torch": {"index": "pytorch-cu130"},
-        "flashinfer-jit-cache": {"index": "flashinfer-cu130"},
+        "torch": [
+            {"index": "pytorch-cu129", "extra": "cu129"},
+            {"index": "pytorch-cu130", "extra": "cu130"},
+        ],
+        "flashinfer-jit-cache": [
+            {"index": "flashinfer-cu129", "extra": "cu129"},
+            {"index": "flashinfer-cu130", "extra": "cu130"},
+        ],
     }
     assert uv_config["index"] == [
         {
+            "name": "pytorch-cu129",
+            "url": "https://download.pytorch.org/whl/cu129",
+            "explicit": True,
+        },
+        {
             "name": "pytorch-cu130",
             "url": "https://download.pytorch.org/whl/cu130",
+            "explicit": True,
+        },
+        {
+            "name": "flashinfer-cu129",
+            "url": "https://flashinfer.ai/whl/cu129",
             "explicit": True,
         },
         {
@@ -74,7 +99,6 @@ def test_workflow_dependencies_are_part_of_main_install():
     project = tomllib.loads(pyproject_path.read_text())["project"]
     dependencies = set(project["dependencies"])
 
-    assert "optional-dependencies" not in project
     assert {
         "accelerate",
         "datasets",

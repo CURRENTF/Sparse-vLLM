@@ -14,7 +14,6 @@ authors = [
 ]
 dependencies = [
     "fire",
-    "torch>=2.9,<3",
     "transformers>=5.13,<6",
     "socksio>=1,<2",
     "triton>=3.5,<4",
@@ -28,8 +27,6 @@ dependencies = [
     "fastapi>=0.100",
     "uvicorn[standard]",
     "pydantic>=2",
-    "flashinfer-python>=0.6.15,<0.7",
-    "flashinfer-jit-cache>=0.6.15,<0.7",
     "accelerate",
     "datasets",
     "wandb",
@@ -45,6 +42,18 @@ dependencies = [
     "tomli; python_version < '3.11'",
 ]
 
+[project.optional-dependencies]
+cu129 = [
+    "torch>=2.9,<3",
+    "flashinfer-python[cu12]>=0.6.15,<0.7",
+    "flashinfer-jit-cache>=0.6.15,<0.7",
+]
+cu130 = [
+    "torch>=2.9,<3",
+    "flashinfer-python[cu13]>=0.6.15,<0.7",
+    "flashinfer-jit-cache>=0.6.15,<0.7",
+]
+
 [project.scripts]
 sparsevllm-openai-server = "sparsevllm.entrypoints.openai.api_server:main"
 sparsevllm-openai-router = "sparsevllm.entrypoints.openai.smart_router:main"
@@ -58,12 +67,28 @@ include = ["sparsevllm*"]
 testpaths = ["tests"]
 
 [tool.uv.sources]
-torch = { index = "pytorch-cu130" }
-flashinfer-jit-cache = { index = "flashinfer-cu130" }
+torch = [
+    { index = "pytorch-cu129", extra = "cu129" },
+    { index = "pytorch-cu130", extra = "cu130" },
+]
+flashinfer-jit-cache = [
+    { index = "flashinfer-cu129", extra = "cu129" },
+    { index = "flashinfer-cu130", extra = "cu130" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu129"
+url = "https://download.pytorch.org/whl/cu129"
+explicit = true
 
 [[tool.uv.index]]
 name = "pytorch-cu130"
 url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[[tool.uv.index]]
+name = "flashinfer-cu129"
+url = "https://flashinfer.ai/whl/cu129"
 explicit = true
 
 [[tool.uv.index]]

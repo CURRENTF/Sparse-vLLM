@@ -103,9 +103,10 @@ Sparse-vLLM requires Python 3.10 or newer. Default dependencies are declared in
 conda create -n svllm python=3.10 -y
 conda activate svllm
 
+CUDA_VERSION=cu130
 python -m pip config --site set global.extra-index-url \
-  "https://download.pytorch.org/whl/cu130 https://flashinfer.ai/whl/cu130"
-python -m pip install -e .
+  "https://download.pytorch.org/whl/${CUDA_VERSION} https://flashinfer.ai/whl/${CUDA_VERSION}"
+python -m pip install -e ".[${CUDA_VERSION}]"
 
 # Optional
 MAX_JOBS=8 pip install flash-attn --no-build-isolation
@@ -121,15 +122,14 @@ PyTorch wheels include their CUDA runtime, while compiled extensions such as
 uv venv --python 3.10
 source .venv/bin/activate
 
-uv pip install -e .
+uv pip install -e ".[cu130]"
 
 # Optional
 MAX_JOBS=8 uv pip install flash-attn --no-build-isolation
 uv pip install flashinfer-cubin --index-url https://flashinfer.ai/whl
 ```
 
-uv reads the CUDA indexes from `pyproject.toml`; pip requires the one-time
-environment configuration shown above. The validated CUDA 12.9
+Use `cu129` instead of `cu130` for CUDA 12.9. The validated CUDA 12.9
 [dependency lock](requirements/locks/README.md) is optional.
 
 `einops`, `sgl-kernel`, and the training, benchmark, and test packages are all

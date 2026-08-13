@@ -8,9 +8,10 @@
 conda create -n svllm python=3.10 -y
 conda activate svllm
 
+CUDA_VERSION=cu130
 python -m pip config --site set global.extra-index-url \
-  "https://download.pytorch.org/whl/cu130 https://flashinfer.ai/whl/cu130"
-python -m pip install -e .
+  "https://download.pytorch.org/whl/${CUDA_VERSION} https://flashinfer.ai/whl/${CUDA_VERSION}"
+python -m pip install -e ".[${CUDA_VERSION}]"
 
 # Optional
 MAX_JOBS=8 pip install flash-attn --no-build-isolation
@@ -22,14 +23,13 @@ MAX_JOBS=8 pip install flash-attn --no-build-isolation
 uv venv --python 3.10
 source .venv/bin/activate
 
-uv pip install -e .
+uv pip install -e ".[cu130]"
 
 # Optional
 MAX_JOBS=8 uv pip install flash-attn --no-build-isolation
 ```
 
-uv 会从 `pyproject.toml` 读取 CUDA index；pip 只需按上面的命令在环境中
-配置一次。已验证的 CUDA 12.9
+CUDA 12.9 环境将 `cu130` 换成 `cu129`。已验证的 CUDA 12.9
 [依赖 lock](../../../requirements/locks/README.md) 为可选复现方式。
 
 `einops`、`sgl-kernel` 以及训练、benchmark 和测试包均已是主依赖，
