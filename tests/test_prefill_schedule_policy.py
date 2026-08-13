@@ -1350,6 +1350,7 @@ class DecodeCudaGraphCapacityPolicyTest(unittest.TestCase):
         runner.recurrent_state_manager = None
         runner.max_context_len_override = None
         runner._graphs = {}
+        runner.eager_static_count = 0
         runner.capture_sizes = [1, 2, 4, 8, 16]
         runner.context_sizes = [1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072]
         return runner
