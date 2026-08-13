@@ -332,6 +332,48 @@ def test_gemma4_rope_cache_separates_same_type_head_dims():
     assert model.layers[1].self_attn.rotary_emb.cos_sin_cache.shape[-1] == 8
 
 
+def test_gemma4_rope_cache_separates_per_layer_parameters():
+    parameters = {
+        "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0},
+        "full_attention": {
+            "rope_type": "proportional",
+            "rope_theta": 1000000.0,
+            "partial_rotary_factor": 0.25,
+        },
+    }
+    second_parameters = {
+        **parameters,
+        "sliding_attention": {"rope_type": "default", "rope_theta": 20000.0},
+    }
+    config = _config(
+        num_hidden_layers=3,
+        layer_types=["sliding_attention", "sliding_attention", "full_attention"],
+        allow_global_per_layer_attribute_access=True,
+        per_layer_config={
+            "0": {"head_dim": 4, "rope_parameters": parameters},
+            "1": {
+                "head_dim": 4,
+                "rope_parameters": second_parameters,
+            },
+            "2": {"head_dim": 8, "rope_parameters": parameters},
+        },
+    )
+    config.allow_global_per_layer_attribute_access = False
+    with _patch_parallel_context():
+        model = Gemma4Model(config, TorchGemma4OperatorProvider())
+    first = model.layers[0].self_attn.rotary_emb.cos_sin_cache
+    second = model.layers[1].self_attn.rotary_emb.cos_sin_cache
+    assert len(model.rotary_embeddings) == 3
+    assert not torch.equal(first, second)
+    expected = Gemma4RotaryEmbedding(
+        config,
+        "sliding_attention",
+        4,
+        second_parameters,
+    )
+    torch.testing.assert_close(second, expected.cos_sin_cache)
+
+
 def test_gemma4_dense_mlp_matches_transformers():
     config = _config()
     with _patch_parallel_context():

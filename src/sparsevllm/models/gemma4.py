@@ -48,10 +48,16 @@ _EXPERT_TARGET_RE = re.compile(
 
 class Gemma4RotaryEmbedding(nn.Module):
     def __init__(
-        self, config: Gemma4TextConfig, layer_type: str, head_dim: int
+        self,
+        config: Gemma4TextConfig,
+        layer_type: str,
+        head_dim: int,
+        parameters: dict | None = None,
     ) -> None:
         super().__init__()
-        parameters = dict(config.rope_parameters[layer_type])
+        if parameters is None:
+            parameters = config_layer_get(config, 0, "rope_parameters")
+        parameters = dict(parameters.get(layer_type, parameters))
         rope_type = str(parameters.get("rope_type", "default"))
         if rope_type not in {"default", "proportional"}:
             raise NotImplementedError(f"Unsupported Gemma 4 RoPE type {rope_type!r}.")
@@ -494,14 +500,13 @@ class Gemma4Model(nn.Module):
                     else "global_head_dim",
                 )
             )
+            rope_parameters = config_layer_get(config, layer_idx, "rope_parameters")
+            parameters = dict(rope_parameters.get(layer_type, rope_parameters))
             signature = (
                 str(layer_type),
                 head_dim,
                 tuple(
-                    sorted(
-                        (key, repr(value))
-                        for key, value in config.rope_parameters[layer_type].items()
-                    )
+                    sorted((key, repr(value)) for key, value in parameters.items())
                 ),
             )
             key = rotary_signatures.setdefault(
@@ -510,7 +515,7 @@ class Gemma4Model(nn.Module):
             rotary_keys.append(key)
             if key not in rotary_embeddings:
                 rotary_embeddings[key] = Gemma4RotaryEmbedding(
-                    config, str(layer_type), head_dim
+                    config, str(layer_type), head_dim, parameters
                 )
         self.rotary_embeddings = nn.ModuleDict(rotary_embeddings)
         self.layers = nn.ModuleList(
