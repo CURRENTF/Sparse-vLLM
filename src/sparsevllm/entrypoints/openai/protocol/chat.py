@@ -11,8 +11,18 @@ from pydantic import model_validator
 class ChatContentPart(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    type: Literal["text"]
-    text: str
+    type: Literal["text", "image_url", "video_url", "input_audio"]
+    text: str | None = None
+    image_url: str | dict[str, Any] | None = None
+    video_url: str | dict[str, Any] | None = None
+    input_audio: dict[str, Any] | None = None
+
+    @model_validator(mode="after")
+    def validate_content(self):
+        value = getattr(self, self.type)
+        if value is None:
+            raise ValueError(f"{self.type} content requires its matching field.")
+        return self
 
 
 class ChatMessage(BaseModel):

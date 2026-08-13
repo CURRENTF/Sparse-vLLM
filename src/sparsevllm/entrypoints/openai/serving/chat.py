@@ -109,6 +109,8 @@ async def serve_chat_completion(
             )
     except ChainCacheError as exc:
         raise _chain_http_exception(exc) from exc
+    except (ValueError, TypeError, NotImplementedError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     handles = [handle]
     headers = (
         {"X-SparseVLLM-Chain-ID": getattr(handle, "chain_id", None)}
@@ -127,7 +129,7 @@ async def serve_chat_completion(
                 started,
                 tokenizer,
                 _stream_include_usage(request.stream_options),
-                prompt=prompt,
+                prompt=prompt if isinstance(prompt, str) else "",
                 reasoning_parser_name=reasoning_parser_name,
                 parse_tools=bool(chat_tools),
                 response_parser=response_parser,
@@ -144,7 +146,7 @@ async def serve_chat_completion(
             request.model,
             handles,
             tokenizer,
-            prompt=prompt,
+            prompt=prompt if isinstance(prompt, str) else "",
             reasoning_parser_name=reasoning_parser_name,
             parse_tools=bool(chat_tools),
             response_parser=response_parser,

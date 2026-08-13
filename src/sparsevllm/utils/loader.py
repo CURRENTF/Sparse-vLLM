@@ -19,6 +19,15 @@ def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
     param.data.copy_(loaded_weight)
 
 
+def _packed_mapping_for(model: nn.Module, target_parameter_name: str) -> dict:
+    excluded = tuple(getattr(model, "packed_modules_excluded_prefixes", ()))
+    return (
+        {}
+        if target_parameter_name.startswith(excluded)
+        else getattr(model, "packed_modules_mapping", {})
+    )
+
+
 @dataclass(frozen=True)
 class TensorMetadata:
     shape: tuple[int, ...]
@@ -52,7 +61,7 @@ def _resolve_weight_target(
         return target
 
     loaded_shard_id = None
-    packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
+    packed_modules_mapping = _packed_mapping_for(model, target_parameter_name)
     for source_fragment, (target_fragment, shard_id) in packed_modules_mapping.items():
         if source_fragment in target_parameter_name:
             target_parameter_name = target_parameter_name.replace(
@@ -626,7 +635,6 @@ def load_model(
     num_threads = int(num_threads)
     if num_threads <= 0:
         raise ValueError(f"num_threads must be positive, got {num_threads}.")
-    packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
     files = sorted(glob(os.path.join(path, "*.safetensors")))
     assert len(files) > 0, f"No safetensors found in {path}"
     checkpoint_is_rank_local = False
@@ -752,9 +760,9 @@ def load_model(
                             consumed_scale_keys.add(scale_key)
                         loaded_count += special_count
                         continue
-                for k in packed_modules_mapping:
+                packed_modules_mapping = _packed_mapping_for(model, param_name)
+                for k, (v, shard_id) in packed_modules_mapping.items():
                     if k in param_name:
-                        v, shard_id = packed_modules_mapping[k]
                         packed_param_name = param_name.replace(k, v)
                         module = _module_for_parameter(model, packed_param_name)
                         if _load_grouped_quantized_weight(
@@ -775,6 +783,25 @@ def load_model(
                         loaded_count += 1
                         break
                 else:
+                    try:
+                        buffer = model.get_buffer(param_name)
+                    except AttributeError:
+                        buffer = None
+                    if buffer is not None:
+                        loaded_weight = tensors[source_weight_name]
+                        if loaded_scale is not None:
+                            raise ValueError(
+                                f"Buffer {param_name!r} cannot load a quantization scale."
+                            )
+                        if buffer.shape != loaded_weight.shape:
+                            raise ValueError(
+                                f"Buffer {param_name!r} shape mismatch: "
+                                f"expected {tuple(buffer.shape)}, got {tuple(loaded_weight.shape)}."
+                            )
+                        buffer.copy_(loaded_weight)
+                        loaded_parameter_names.add(param_name)
+                        loaded_count += 1
+                        continue
                     module = _module_for_parameter(model, param_name)
                     loaded_scale = None
                     if source_weight_name.endswith(".weight"):

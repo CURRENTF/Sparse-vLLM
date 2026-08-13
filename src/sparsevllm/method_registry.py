@@ -60,7 +60,7 @@ PREFIX_CACHE_SUPPORTED_METHODS = {
     "skipkv",
 }
 
-H2O_SUPPORTED_MODEL_TYPES = frozenset(MODEL_SPECS)
+H2O_SUPPORTED_MODEL_TYPES = frozenset(MODEL_SPECS) - {"gemma4"}
 
 SKIPKV_ASSET_MODEL_NAMES = frozenset(
     {
@@ -144,6 +144,13 @@ GLM4_MOE_LITE_EP_COMPATIBILITY = ModelRuntimeCompatibility(
     ),
 )
 
+GEMMA4_COMPATIBILITY = ModelRuntimeCompatibility(
+    sparse_methods=frozenset({"", "streamingllm", "omnikv"}),
+    prefix_cache_methods=frozenset({"", "streamingllm", "omnikv"}),
+    requires_eager=False,
+    decode_cuda_graph_methods=frozenset({"", "streamingllm", "omnikv"}),
+)
+
 MODEL_RUNTIME_COMPATIBILITY = {
     **{
         (model_type, ParallelMode.STANDARD): DENSE_MODEL_COMPATIBILITY
@@ -157,6 +164,8 @@ MODEL_RUNTIME_COMPATIBILITY = {
     ("minimax_m2", ParallelMode.OUTER_TP_MOE): MINIMAX_M2_TP_EP_COMPATIBILITY,
     ("glm4_moe_lite", ParallelMode.STANDARD): GLM4_MOE_LITE_EP_COMPATIBILITY,
     ("glm4_moe_lite", ParallelMode.OUTER_TP_MOE): GLM4_MOE_LITE_EP_COMPATIBILITY,
+    ("gemma4", ParallelMode.STANDARD): GEMMA4_COMPATIBILITY,
+    ("gemma4", ParallelMode.OUTER_TP_MOE): GEMMA4_COMPATIBILITY,
 }
 
 # All shipped cache managers now expose a graph-stable decode preparation path.

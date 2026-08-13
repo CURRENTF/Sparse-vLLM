@@ -97,6 +97,7 @@ def load_and_validate_model(config) -> None:
         config.tensor_parallel_size,
         config.expert_parallel_size,
         config.data_parallel_size,
+        config.hf_config,
     )
     if config.tiny_random:
         from sparsevllm.debug.tiny_random import apply_tiny_random_overrides

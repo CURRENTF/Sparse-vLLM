@@ -71,11 +71,15 @@ Read the method overview and integration rules in
 | Qwen3.5 / Qwen3.6 | ✅ |
 | Qwen3.5 / Qwen3.6 MoE | ✅ |
 | GLM-4.7-Flash | ✅ |
+| Gemma 4 Dense / MoE | ✅ |
 | Llama 3 / 3.1 | ✅ |
 | MiniMax M2.7 | ✅ |
 
 See [Supported Models](docs/en/features/supported-models.md) for the precision,
 parallelism, and sparse-method compatibility matrices.
+
+Native image, video, and audio inputs are enabled per checkpoint with
+`enable_multimodal=True`; see the supported-model matrix for media coverage.
 
 ## Documentation
 

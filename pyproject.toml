@@ -21,6 +21,7 @@ dependencies = [
     "apache-tvm-ffi==0.1.10",
     "nvidia-cutlass-dsl>=4.6,<5",
     "pillow",
+    "torchvision",
     "einops",
     "sglang-kernel>=0.4.5,<0.4.6",
     "tqdm",

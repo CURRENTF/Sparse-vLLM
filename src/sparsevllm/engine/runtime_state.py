@@ -308,6 +308,9 @@ class RuntimeState:
         self._resident_seq_ids.clear()
 
     def refresh_prefix_cache_hit(self, seq: Sequence) -> None:
+        if getattr(seq, "multimodal_digest", None) is not None:
+            self.clear_prefix_cache_hit(seq)
+            return
         if self.prefix_cache_coordinator is not None:
             self.prefix_cache_coordinator.refresh_prefix_cache_hit(seq)
             return
@@ -337,6 +340,8 @@ class RuntimeState:
         return int(self.cache_manager.remaining_prefill_tokens(seq))
 
     def prefill_execution_mode(self, seq: Sequence) -> str:
+        if getattr(seq, "multimodal_full_prefill", False):
+            return "full"
         return str(self.cache_manager.prefill_execution_mode(seq))
 
     def prefill_batch_compatibility_key(self, seq: Sequence) -> object:

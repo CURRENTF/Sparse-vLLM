@@ -15,14 +15,63 @@ from sparsevllm.engine.cache_manager import (
     MlaLatentPayload,
     MlaLatentWrite,
 )
-from sparsevllm.engine.cache_manager.standard import StandardCacheManager
 from sparsevllm.engine.cache_manager.snapkv import SnapKVCacheManager
+from sparsevllm.engine.cache_manager.standard import StandardCacheManager
 from sparsevllm.engine.cache_manager.storage import (
     CacheLayout,
     ExplicitKVStorage,
+    HeterogeneousExplicitKVStorage,
     MlaLatentStorage,
     create_attention_cache_storage,
 )
+
+
+def test_heterogeneous_explicit_storage_preserves_per_layer_shapes():
+    storage = HeterogeneousExplicitKVStorage(
+        layer_shapes=((2, 256), (1, 512)),
+        dtype=torch.bfloat16,
+    )
+    storage.allocate(num_layers=2, num_slots=5, device=torch.device("cpu"))
+
+    assert storage.layer_payload(0).k_cache.shape == (5, 2, 256)
+    assert storage.layer_payload(1).k_cache.shape == (5, 1, 512)
+    assert storage.bytes_per_slot_per_layer() == 2048
+    assert storage.bytes_per_slot() == 4096
+
+    key = torch.randn(2, 1, 512, dtype=torch.bfloat16)
+    value = torch.randn_like(key)
+    slots = torch.tensor([1, 3], dtype=torch.int32)
+    storage.store(1, slots, ExplicitKVWrite(key=key, value=value))
+    payload = storage.layer_payload(1)
+    torch.testing.assert_close(payload.k_cache[slots.long()], key)
+    torch.testing.assert_close(payload.v_cache[slots.long()], value)
+
+    storage.copy_slots(1, slots, torch.tensor([0, 2], dtype=torch.int32))
+    torch.testing.assert_close(payload.k_cache[[0, 2]], key)
+    torch.testing.assert_close(payload.v_cache[[0, 2]], value)
+
+
+def test_standard_manager_uses_exact_heterogeneous_slot_size():
+    storage = HeterogeneousExplicitKVStorage(
+        layer_shapes=((1, 256), (1, 512)),
+        dtype=torch.bfloat16,
+    )
+    manager = object.__new__(StandardCacheManager)
+    manager.attention_cache_storage = storage
+    manager.num_kv_layers = 2
+    manager.device = torch.device("cpu")
+    manager.config = SimpleNamespace(num_kvcache_slots=-1)
+    manager._get_available_slots_info = lambda: (
+        7 * storage.bytes_per_slot(),
+        storage.bytes_per_slot_per_layer(),
+    )
+
+    manager.allocate_kv_cache()
+
+    assert manager.config.num_kvcache_slots == 7
+    assert all(cache.shape[1] == 7 for cache in storage.cache)
+
+
 def test_explicit_storage_preserves_legacy_tensor_layout_and_size():
     storage = ExplicitKVStorage(
         num_kv_heads=2,

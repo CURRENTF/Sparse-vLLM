@@ -80,6 +80,7 @@ class RequestAdmission:
     chain_status: str
     reused_tokens: int
     prefilled_tokens: int = 0
+    prompt_token_ids: list[int] | None = None
 
 
 @dataclass(slots=True)

@@ -17,10 +17,14 @@ def test_runtime_compatibility_bounds_cover_canonical_lock():
     assert "transformers>=5.13,<6" in dependencies
     assert "nvidia-cutlass-dsl>=4.6,<5" in dependencies
     assert "sglang-kernel>=0.4.5,<0.4.6" in dependencies
-    assert {"fire", "pillow", "einops", "tqdm", "loguru"} <= dependencies
-    assert not any(
-        dependency.startswith("torchvision") for dependency in dependencies
-    )
+    assert {
+        "fire",
+        "pillow",
+        "torchvision",
+        "einops",
+        "tqdm",
+        "loguru",
+    } <= dependencies
     assert not any(
         dependency.startswith("flashinfer-cubin")
         for dependency in dependencies

@@ -45,7 +45,11 @@ from sparsevllm.models.qwen3_5 import (
     Qwen35RMSNorm,
     _get_rotary_dim,
 )
-from sparsevllm.models.qwen3_5_moe import Qwen35MoeRouter, Qwen35MoeSparseMoeBlock
+from sparsevllm.models.qwen3_5_moe import (
+    Qwen35MoePackedExperts,
+    Qwen35MoeRouter,
+    Qwen35MoeSparseMoeBlock,
+)
 from sparsevllm.models.checkpoint import validate_checkpoint
 from sparsevllm.models.spec import resolve_model_spec
 from sparsevllm.platforms.cpu import CpuPlatform
@@ -56,6 +60,22 @@ from sparsevllm.utils.loader import _target_weight_name_for_model, _validate_all
 def _single_process_parallel_context() -> ParallelContext:
     group = ParallelGroup(process_group=None, ranks=(0,), rank=0, size=1)
     return ParallelContext(world=group, tensor=group, expert=group, data=group)
+
+
+def test_qwen35_fp8_expert_validation_uses_per_projection_weights():
+    experts = SimpleNamespace(
+        fp8_enabled=True,
+        local_expert_start=0,
+        local_expert_end=2,
+        _loaded_packed_projections=set(),
+        _loaded_expert_shards={
+            (expert_id, projection)
+            for expert_id in range(2)
+            for projection in ("gate_proj", "up_proj", "down_proj")
+        },
+    )
+
+    Qwen35MoePackedExperts.validate_loaded_weights(experts)
 
 
 def _qwen35_outer_config(*, num_layers: int = 64, full_layers: tuple[int, ...] | None = None):

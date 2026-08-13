@@ -432,6 +432,99 @@ class QKVParallelLinear(ColumnParallelLinear):
         )
 
 
+class ReplicatedKVQKVParallelLinear(QKVParallelLinear):
+    """QKV projection with replicated KV heads when TP exceeds KV heads."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        head_size: int,
+        total_num_heads: int,
+        total_num_kv_heads: int,
+        bias: bool = False,
+        quantization=None,
+    ):
+        tp_size = get_parallel_context().tp_size
+        if total_num_kv_heads >= tp_size:
+            raise ValueError(
+                "ReplicatedKVQKVParallelLinear requires total_num_kv_heads < TP size, "
+                f"got KV heads={total_num_kv_heads}, TP={tp_size}."
+            )
+        self.head_size = int(head_size)
+        self.num_heads = divide(total_num_heads, tp_size)
+        self.total_num_kv_heads = int(total_num_kv_heads)
+        self.num_kv_head_replicas = divide(tp_size, self.total_num_kv_heads)
+        self.num_kv_heads = 1
+        output_size = (self.num_heads + 2) * self.head_size
+        LinearBase.__init__(self, hidden_size, output_size, bias, 0, quantization=quantization)
+
+    def _shard(self, loaded_shard_id: str) -> tuple[int, int, int, int]:
+        if loaded_shard_id == "q":
+            return self.num_heads * self.head_size, 0, self.tp_size, self.tp_rank
+        if loaded_shard_id not in ("k", "v"):
+            raise ValueError(f"Invalid QKV shard id {loaded_shard_id!r}.")
+        offset = self.num_heads * self.head_size
+        if loaded_shard_id == "v":
+            offset += self.head_size
+        return self.head_size, offset, self.total_num_kv_heads, self.tp_rank // self.num_kv_head_replicas
+
+    def rank_local_weight_slice(
+        self,
+        source_shape: tuple[int, ...],
+        *,
+        loaded_shard_id=None,
+        is_scale: bool = False,
+    ) -> tuple[slice, ...] | None:
+        if self.tp_size == 1 or loaded_shard_id is None:
+            return None
+        _, _, shard_count, shard_rank = self._shard(str(loaded_shard_id))
+        shard_size = divide(int(source_shape[self.tp_dim]), shard_count)
+        if is_scale and shard_size * shard_count != int(source_shape[self.tp_dim]):
+            raise ValueError("Replicated KV FP8 scale is not shardable.")
+        slices = [slice(None)] * len(source_shape)
+        slices[self.tp_dim] = slice(shard_rank * shard_size, (shard_rank + 1) * shard_size)
+        return tuple(slices)
+
+    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: str):
+        shard_size, shard_offset, shard_count, shard_rank = self._shard(loaded_shard_id)
+        target = param.data.narrow(self.tp_dim, shard_offset, shard_size)
+        if loaded_weight.size(self.tp_dim) != shard_size:
+            loaded_weight = loaded_weight.chunk(shard_count, self.tp_dim)[shard_rank]
+        target.copy_(loaded_weight)
+
+    def load_quantized_weight(
+        self,
+        loaded_weight: torch.Tensor,
+        loaded_scale: torch.Tensor,
+        loaded_shard_id: str,
+    ) -> None:
+        self._ensure_quantized_loader()
+        shard_size, shard_offset, shard_count, shard_rank = self._shard(loaded_shard_id)
+        if shard_offset % 128 or shard_size % 128:
+            raise ValueError(
+                "Replicated KV QKV FP8 loading requires 128-aligned shards, "
+                f"got offset={shard_offset}, size={shard_size}."
+            )
+        weight_target = self.weight.data.narrow(0, shard_offset, shard_size)
+        weight_shard = (
+            loaded_weight
+            if loaded_weight.size(0) == shard_size
+            else loaded_weight.chunk(shard_count, 0)[shard_rank]
+        )
+        scale_target = self.weight_scale_inv.narrow(0, shard_offset // 128, shard_size // 128)
+        scale_shard = (
+            loaded_scale
+            if tuple(loaded_scale.shape) == tuple(scale_target.shape)
+            else loaded_scale.chunk(shard_count, 0)[shard_rank]
+        )
+        self._copy_quantized_weight_and_scale(
+            weight_shard,
+            scale_shard,
+            weight_target=weight_target,
+            scale_target=scale_target,
+        )
+
+
 class RowParallelLinear(LinearBase):
 
     def __init__(

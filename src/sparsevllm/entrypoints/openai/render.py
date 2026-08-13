@@ -3,6 +3,7 @@ import json
 from typing import Any
 
 from sparsevllm.entrypoints.openai.protocol.chat import ChatContentPart
+from sparsevllm.multimodal import MultiModalPrompt
 from sparsevllm.entrypoints.openai.protocol.chat import ChatCompletionRequest
 from sparsevllm.entrypoints.openai.protocol.chat import ChatMessage
 from sparsevllm.entrypoints.openai.protocol.responses import ResponseRequest
@@ -98,7 +99,15 @@ def _chat_content_text(content: str | list[ChatContentPart] | None) -> str:
         return ""
     if isinstance(content, str):
         return content
-    return "\n".join(part.text for part in content)
+    return "\n".join(part.text or "" for part in content)
+
+
+def _has_multimodal_content(messages) -> bool:
+    return any(
+        isinstance(message.content, list)
+        and any(part.type != "text" for part in message.content)
+        for message in messages
+    )
 
 
 def validate_chat_template_kwargs(value: Any) -> dict[str, Any] | None:
@@ -155,6 +164,8 @@ def _chat_request_append_prompt(
     tokenizer: Any,
     request: ChatCompletionRequest,
 ) -> str:
+    if _has_multimodal_content(request.messages):
+        raise ValueError("Multimodal chat does not support chain append rendering.")
     append_start = request.chain_append_start
     if append_start is None:
         raise ValueError("chain_append_start is required for append rendering.")
@@ -217,12 +228,18 @@ def _chat_prompt(
     tools: list[dict[str, Any]] | None = None,
     *,
     add_generation_prompt: bool = True,
-) -> str:
+) -> str | MultiModalPrompt:
     chat = []
     for message in messages:
         rendered_message = {
             "role": _chat_template_role(message.role),
-            "content": None if message.content is None else _chat_content_text(message.content),
+            "content": (
+                None
+                if message.content is None
+                else [part.model_dump(exclude_none=True) for part in message.content]
+                if isinstance(message.content, list) and _has_multimodal_content(messages)
+                else _chat_content_text(message.content)
+            ),
         }
         if message.reasoning_content is not None:
             rendered_message["reasoning_content"] = message.reasoning_content
@@ -231,6 +248,13 @@ def _chat_prompt(
         if message.tool_call_id is not None:
             rendered_message["tool_call_id"] = message.tool_call_id
         chat.append(rendered_message)
+    if _has_multimodal_content(messages):
+        return MultiModalPrompt(
+            chat,
+            chat_template_kwargs=chat_template_kwargs,
+            tools=_tools_for_chat_template(tokenizer, tools) if tools else None,
+            add_generation_prompt=add_generation_prompt,
+        )
     if getattr(tokenizer, "chat_template", None) and hasattr(tokenizer, "apply_chat_template"):
         kwargs = {
             "tokenize": False,
@@ -280,10 +304,20 @@ def _chat_template_tool_calls(tool_calls: list[dict[str, Any]]) -> list[dict[str
     return rendered
 
 
-def _response_prompt(tokenizer: Any, request: ResponseRequest) -> str:
+def _response_prompt(tokenizer: Any, request: ResponseRequest) -> str | MultiModalPrompt:
     chat_template_kwargs = resolve_response_chat_template_kwargs(request)
     tools = normalize_tools(request.tools) if request.tools else None
     messages = _response_messages(request)
+    if any(
+        isinstance(message.get("content"), list)
+        and any(part.get("type") in {"input_image", "input_audio", "input_video"} for part in message["content"])
+        for message in messages
+    ):
+        return MultiModalPrompt(
+            messages,
+            chat_template_kwargs=chat_template_kwargs,
+            tools=_tools_for_chat_template(tokenizer, tools) if tools else None,
+        )
 
     has_template = bool(getattr(tokenizer, "chat_template", None)) and hasattr(tokenizer, "apply_chat_template")
     if has_template:
@@ -357,7 +391,7 @@ def _response_message_item(item: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("message.role must be one of developer, system, user, assistant.")
     return {
         "role": _chat_template_role(str(role)),
-        "content": _response_content_text(item.get("content")),
+        "content": _response_content(item.get("content")),
     }
 
 
@@ -394,23 +428,45 @@ def _minimax_response_messages(messages: list[dict[str, Any]]) -> list[dict[str,
     return adapted
 
 
-def _response_content_text(content: Any) -> str:
+def _response_content(content: Any) -> str | list[dict[str, Any]]:
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        texts = []
+        normalized = []
         for part in content:
             if not isinstance(part, dict):
                 raise ValueError("message content parts must be JSON objects.")
             part_type = part.get("type")
+            if part_type in {"input_image", "input_video"}:
+                field = "image_url" if part_type == "input_image" else "video_url"
+                if set(part) - {"type", field}:
+                    raise ValueError(f"{part_type} contains unsupported fields.")
+                value = part.get(field)
+                url = value.get("url") if isinstance(value, dict) else value
+                if not isinstance(url, str) or not url:
+                    raise ValueError(f"{part_type} requires a non-empty {field}.")
+                normalized.append({"type": part_type, field: value})
+                continue
+            if part_type == "input_audio":
+                if set(part) - {"type", "input_audio"}:
+                    raise ValueError("input_audio contains unsupported fields.")
+                audio = part.get("input_audio")
+                if not isinstance(audio, dict) or set(audio) - {"data", "format"}:
+                    raise ValueError("input_audio requires data and optional format fields.")
+                if not isinstance(audio.get("data"), str) or not audio["data"]:
+                    raise ValueError("input_audio requires a non-empty base64 data string.")
+                if "format" in audio and str(audio["format"]).lower() != "wav":
+                    raise ValueError("Only WAV input_audio is supported.")
+                normalized.append({"type": "input_audio", "input_audio": dict(audio)})
+                continue
             if part_type not in {"text", "input_text", "output_text"}:
                 raise ValueError(f"Unsupported message content part type: {part_type!r}.")
             text = part.get("text")
             if not isinstance(text, str):
                 raise ValueError("message content text parts require a string text field.")
-            texts.append(text)
-        return "\n".join(texts)
-    raise ValueError("message.content must be a string or a text-only content part list.")
+            normalized.append({"type": "text", "text": text})
+        return normalized if any(part["type"] != "text" for part in normalized) else "\n".join(part["text"] for part in normalized)
+    raise ValueError("message.content must be a string or a content part list.")
 
 
 def _messages_require_chat_template(messages: list[dict[str, Any]]) -> bool:

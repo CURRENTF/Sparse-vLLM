@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-__all__ = ["LLM", "SamplingParams"]
+__all__ = ["LLM", "MultiModalPrompt", "SamplingParams"]
 
 
 def __getattr__(name: str):
@@ -12,4 +12,8 @@ def __getattr__(name: str):
         from sparsevllm.sampling_params import SamplingParams
 
         return SamplingParams
+    if name == "MultiModalPrompt":
+        from sparsevllm.multimodal import MultiModalPrompt
+
+        return MultiModalPrompt
     raise AttributeError(f"module 'sparsevllm' has no attribute {name!r}")

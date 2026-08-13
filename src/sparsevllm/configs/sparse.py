@@ -12,6 +12,7 @@ from sparsevllm.method_registry import (
 )
 from sparsevllm.utils.log import logger, log_once
 
+
 def normalize_sparse_method_name(config) -> bool:
     raw_sparse_method = config.vllm_sparse_method
     raw_sparse_method_normalized = "" if raw_sparse_method is None else str(raw_sparse_method).strip().lower()
@@ -175,6 +176,15 @@ def _normalize_skipkv(config) -> None:
         )
 
 def normalize_sparse_methods(config) -> None:
+    if (
+        getattr(config.hf_config, "model_type", "") == "gemma4_text"
+        and int(getattr(config.hf_config, "num_kv_shared_layers", 0) or 0)
+        and config.vllm_sparse_method == "streamingllm"
+    ):
+        raise NotImplementedError(
+            "Gemma 4 StreamingLLM requires independent per-layer KV caches; "
+            "KV-sharing variants support vanilla and OmniKV."
+        )
     _normalize_quest(config)
     _normalize_h2o(config)
     _normalize_rkv(config)
