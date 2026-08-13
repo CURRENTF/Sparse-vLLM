@@ -134,7 +134,7 @@ def _default_decode_cuda_graph_context_sizes(max_model_len: int) -> list[int]:
     while size < max_model_len:
         sizes.append(size)
         size *= 2
-    sizes.append(size)
+    sizes.append(max_model_len)
     return sorted(set(sizes))
 
 

@@ -1321,7 +1321,7 @@ class PrefillPolicyConfigTest(unittest.TestCase):
             decode_cuda_graph=True,
             max_model_len=9000,
         )
-        self.assertEqual(cfg.decode_cuda_graph_context_sizes, [1024, 2048, 4096, 8192, 16384])
+        self.assertEqual(cfg.decode_cuda_graph_context_sizes, [1024, 2048, 4096, 8192, 9000])
 
     def test_decode_cuda_graph_explicit_context_sizes_are_sorted(self):
         cfg = self.make_config(
