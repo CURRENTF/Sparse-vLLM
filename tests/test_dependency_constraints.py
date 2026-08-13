@@ -17,10 +17,14 @@ def test_runtime_compatibility_bounds_cover_canonical_lock():
     assert "transformers>=5.13,<6" in dependencies
     assert "nvidia-cutlass-dsl>=4.6,<5" in dependencies
     assert "sglang-kernel>=0.4.5,<0.4.6" in dependencies
-    assert {"fire", "pillow", "einops", "tqdm", "loguru"} <= dependencies
-    assert not any(
-        dependency.startswith("torchvision") for dependency in dependencies
-    )
+    assert {
+        "fire",
+        "pillow",
+        "torchvision",
+        "einops",
+        "tqdm",
+        "loguru",
+    } <= dependencies
     assert not any(
         dependency.startswith("flashinfer-cubin")
         for dependency in dependencies
@@ -52,23 +56,17 @@ def test_uv_routes_cuda_packages_to_explicit_indexes():
     assert config["project"]["optional-dependencies"] == {
         "cu129": [
             "torch==2.11.0",
-            "torchvision==0.26.0",
             "flashinfer-python[cu12]>=0.6.15,<0.7",
             "flashinfer-jit-cache>=0.6.15,<0.7",
         ],
         "cu130": [
             "torch==2.11.0",
-            "torchvision==0.26.0",
             "flashinfer-python[cu13]>=0.6.15,<0.7",
             "flashinfer-jit-cache>=0.6.15,<0.7",
         ],
     }
     assert uv_config["sources"] == {
         "torch": [
-            {"index": "pytorch-cu129", "extra": "cu129"},
-            {"index": "pytorch-cu130", "extra": "cu130"},
-        ],
-        "torchvision": [
             {"index": "pytorch-cu129", "extra": "cu129"},
             {"index": "pytorch-cu130", "extra": "cu130"},
         ],
