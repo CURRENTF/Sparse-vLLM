@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import importlib
+
 import torch
 import triton
 
@@ -10,7 +12,20 @@ from sparsevllm.kernels.moe import MoeAlignment
 def sgl_moe_alignment_support() -> tuple[bool, str]:
     """Check the SGL expert-alignment API used by the Triton MoE provider."""
 
-    return sgl_kernel_support("MoE alignment")
+    supported, reason = sgl_kernel_support("MoE alignment")
+    if not supported:
+        return supported, reason
+    try:
+        alignment = importlib.import_module("sgl_kernel").moe_align_block_size
+    except Exception as error:
+        return False, (
+            "sgl-kernel MoE alignment failed to load: "
+            f"{type(error).__name__}: {error}"
+        )
+    return (True, reason) if callable(alignment) else (
+        False,
+        "sgl-kernel moe_align_block_size is not callable",
+    )
 
 
 def sgl_moe_align_block_size(

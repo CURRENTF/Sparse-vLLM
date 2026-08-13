@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -98,8 +99,27 @@ class _SchedulerMetadataPlan:
         )
 
 
+def _sgl_fa3_op():
+    # Register FA3 without importing the unrelated optional FA4 wrapper.
+    importlib.import_module("sgl_kernel.flash_ops")
+    return torch.ops.sgl_kernel.fwd.default
+
+
 def sgl_fa3_support() -> tuple[bool, str]:
-    return sgl_kernel_support("FA3 raw op")
+    supported, reason = sgl_kernel_support("FA3 raw op")
+    if not supported:
+        return supported, reason
+    try:
+        op = _sgl_fa3_op()
+        argument_names = tuple(argument.name for argument in op._schema.arguments)
+    except Exception as error:
+        return False, (
+            "sgl-kernel FA3 raw op failed to load: "
+            f"{type(error).__name__}: {error}"
+        )
+    if argument_names != _FWD_ARGUMENTS:
+        return False, f"unsupported sgl-kernel FA3 fwd schema: {argument_names}"
+    return True, reason
 
 
 class SglFa3DecodeKernel:
@@ -117,19 +137,7 @@ class SglFa3DecodeKernel:
         if not supported:
             raise RuntimeError(reason)
 
-        # Importing flash_ops registers FA3 only.  Importing
-        # sgl_kernel.flash_attn would also import the optional FA4 wrapper,
-        # whose CUTLASS Python dependency is unrelated to this provider.
-        from sgl_kernel import flash_ops as _flash_ops  # noqa: F401
-
-        op = torch.ops.sgl_kernel.fwd.default
-        argument_names = tuple(argument.name for argument in op._schema.arguments)
-        if argument_names != _FWD_ARGUMENTS:
-            raise RuntimeError(
-                "Unsupported sgl-kernel FA3 fwd schema: "
-                f"arguments={argument_names}."
-            )
-        self._op = op
+        self._op = _sgl_fa3_op()
         scheduler_packet = getattr(
             torch.ops.sgl_kernel,
             "get_scheduler_metadata",

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 import torch
 
 from sparsevllm.kernels.external.sgl.fa3 import (
+    _FWD_ARGUMENTS,
     SglFa3DecodeKernel,
     sgl_fa3_support,
 )
@@ -39,14 +41,59 @@ def test_sgl_fa3_support_rejects_04_package() -> None:
 
 
 def test_sgl_fa3_support_accepts_declared_package() -> None:
+    op = SimpleNamespace(
+        _schema=SimpleNamespace(
+            arguments=[
+                SimpleNamespace(name=name)
+                for name in _FWD_ARGUMENTS
+            ]
+        )
+    )
     with (
+        patch(
+            "sparsevllm.kernels.external.sgl.fa3._sgl_fa3_op",
+            return_value=op,
+        ),
         patch("importlib.util.find_spec", return_value=object()),
         patch("importlib.metadata.version", return_value="0.3.21"),
+        patch("importlib.import_module", return_value=object()),
     ):
         supported, reason = sgl_fa3_support()
 
     assert supported
     assert "0.3.21" in reason
+
+
+def test_sgl_fa3_support_rejects_binary_load_failure() -> None:
+    with (
+        patch("importlib.util.find_spec", return_value=object()),
+        patch("importlib.metadata.version", return_value="0.3.21"),
+        patch(
+            "importlib.import_module",
+            side_effect=ImportError("undefined symbol: c10_cuda_check"),
+        ),
+    ):
+        supported, reason = sgl_fa3_support()
+
+    assert not supported
+    assert "undefined symbol" in reason
+
+
+def test_sgl_fa3_support_rejects_missing_op_schema() -> None:
+    with (
+        patch(
+            "sparsevllm.kernels.external.sgl.fa3.sgl_kernel_support",
+            return_value=(True, "available"),
+        ),
+        patch(
+            "sparsevllm.kernels.external.sgl.fa3._sgl_fa3_op",
+            return_value=object(),
+        ),
+    ):
+        supported, reason = sgl_fa3_support()
+
+    assert not supported
+    assert "failed to load" in reason
 
 
 @pytest.mark.skipif(

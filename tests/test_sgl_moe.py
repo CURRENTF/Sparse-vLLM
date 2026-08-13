@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -33,14 +34,28 @@ def test_sgl_moe_support_rejects_04_package() -> None:
 
 
 def test_sgl_moe_support_accepts_declared_package() -> None:
+    module = SimpleNamespace(moe_align_block_size=lambda *_args: None)
     with (
         patch("importlib.util.find_spec", return_value=object()),
         patch("importlib.metadata.version", return_value="0.3.21"),
+        patch("importlib.import_module", return_value=module),
     ):
         supported, reason = sgl_moe_alignment_support()
 
     assert supported
     assert "0.3.21" in reason
+
+
+def test_sgl_moe_support_rejects_missing_alignment_api() -> None:
+    with (
+        patch("importlib.util.find_spec", return_value=object()),
+        patch("importlib.metadata.version", return_value="0.3.21"),
+        patch("importlib.import_module", return_value=SimpleNamespace()),
+    ):
+        supported, reason = sgl_moe_alignment_support()
+
+    assert not supported
+    assert "moe_align_block_size" in reason
 
 
 @pytest.mark.skipif(
