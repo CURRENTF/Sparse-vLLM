@@ -14,40 +14,45 @@ authors = [
 ]
 dependencies = [
     "fire",
-    "torch==2.11.0",
-    "transformers==5.13.1",
-    "triton==3.6.0",
-    "torchvision==0.26.0",
+    "transformers>=5.13,<6",
+    "socksio>=1,<2",
+    "triton>=3.5,<4",
+    "tilelang==0.1.9",
+    "apache-tvm-ffi==0.1.10",
+    "nvidia-cutlass-dsl>=4.6,<5",
     "pillow",
-    "datasets",
-    "matplotlib",
-    "seaborn",
-    "loguru",
-    "ansible",
-    "bitsandbytes",
+    "einops",
+    "sglang-kernel>=0.4.5,<0.4.6",
     "tqdm",
+    "loguru",
     "fastapi>=0.100",
     "uvicorn[standard]",
     "pydantic>=2",
-    "pytest",
+    "accelerate",
+    "datasets",
+    "wandb",
+    "bitsandbytes",
+    "datatrove",
+    "matplotlib",
+    "seaborn",
     "math-verify==0.9.0",
-    "flashinfer-python>=0.6.15",
-    "flashinfer-jit-cache>=0.6.15",
-]
-
-[project.optional-dependencies]
-prefix-offload = [
-    "sgl-kernel @ https://github.com/sgl-project/whl/releases/download/v0.3.14.post1/sgl_kernel-0.3.14.post1%2Bcu128-cp310-abi3-manylinux2014_x86_64.whl",
-]
-qwen35 = [
-    "einops",
-]
-
-test = [
     "fuzzywuzzy",
     "jieba",
     "pytest",
     "rouge",
+    "tomli; python_version < '3.11'",
+]
+
+[project.optional-dependencies]
+cu129 = [
+    "torch==2.11.0",
+    "flashinfer-python[cu12]>=0.6.15,<0.7",
+    "flashinfer-jit-cache>=0.6.15,<0.7",
+]
+cu130 = [
+    "torch==2.11.0",
+    "flashinfer-python[cu13]>=0.6.15,<0.7",
+    "flashinfer-jit-cache>=0.6.15,<0.7",
 ]
 
 [project.scripts]
@@ -61,3 +66,41 @@ include = ["sparsevllm*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.uv]
+conflicts = [
+    [
+        { extra = "cu129" },
+        { extra = "cu130" },
+    ],
+]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu129", extra = "cu129" },
+    { index = "pytorch-cu130", extra = "cu130" },
+]
+flashinfer-jit-cache = [
+    { index = "flashinfer-cu129", extra = "cu129" },
+    { index = "flashinfer-cu130", extra = "cu130" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu129"
+url = "https://download.pytorch.org/whl/cu129"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[[tool.uv.index]]
+name = "flashinfer-cu129"
+url = "https://flashinfer.ai/whl/cu129"
+explicit = true
+
+[[tool.uv.index]]
+name = "flashinfer-cu130"
+url = "https://flashinfer.ai/whl/cu130"
+explicit = true

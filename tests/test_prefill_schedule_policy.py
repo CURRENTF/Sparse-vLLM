@@ -11,6 +11,7 @@ import numpy as np
 import torch
 
 from sparsevllm.config import Config
+from sparsevllm.configs.cuda_graph import _resolve_decode_static_batch_capacity
 from sparsevllm.engine.cache_manager.standard import StandardCacheManager
 from sparsevllm.engine.cache_manager.deltakv import DeltaKVCacheManager
 from sparsevllm.engine.cache_manager.deltakv_less_memory import DeltaKVLessMemoryCacheManager
@@ -1140,6 +1141,27 @@ class PrefillPolicyConfigTest(unittest.TestCase):
                 self.assertTrue(cfg.decode_graph)
                 self.assertEqual(cfg.decode_graph_capture_sizes, expected_sizes)
 
+    def test_decode_static_batch_capacity_uses_reachable_padding_bucket(self):
+        cases = (
+            ([1, 2, 4, 8, 16, 32, 64], 32, 64, 32),
+            ([1, 4, 8, 64], 32, 64, 64),
+            ([1, 2, 4, 8, 16, 32, 64], 80, 64, 64),
+        )
+        for capture_sizes, max_batch, max_decode, expected in cases:
+            with self.subTest(
+                capture_sizes=capture_sizes,
+                max_batch=max_batch,
+                max_decode=max_decode,
+            ):
+                self.assertEqual(
+                    _resolve_decode_static_batch_capacity(
+                        capture_sizes,
+                        max_num_seqs_in_batch=max_batch,
+                        max_decoding_seqs=max_decode,
+                    ),
+                    expected,
+                )
+
     def test_decode_graph_aliases_normalize_to_canonical_fields(self):
         cfg = self.make_config(
             vllm_sparse_method="omnikv",
@@ -1299,7 +1321,7 @@ class PrefillPolicyConfigTest(unittest.TestCase):
             decode_cuda_graph=True,
             max_model_len=9000,
         )
-        self.assertEqual(cfg.decode_cuda_graph_context_sizes, [1024, 2048, 4096, 8192, 16384])
+        self.assertEqual(cfg.decode_cuda_graph_context_sizes, [1024, 2048, 4096, 8192, 9000])
 
     def test_decode_cuda_graph_explicit_context_sizes_are_sorted(self):
         cfg = self.make_config(
@@ -1328,8 +1350,10 @@ class DecodeCudaGraphCapacityPolicyTest(unittest.TestCase):
         runner.recurrent_state_manager = None
         runner.max_context_len_override = None
         runner._graphs = {}
+        runner.eager_static_count = 0
         runner.capture_sizes = [1, 2, 4, 8, 16]
         runner.context_sizes = [1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072]
+        runner.eager_static_count = 0
         return runner
 
     def make_seq(self, *, prompt_len=100, max_tokens=900, num_tokens=101):
@@ -3745,7 +3769,11 @@ class DeltaKVFullPrefillStagingTest(unittest.TestCase):
         self.assertEqual(int(manager.row_seq_lens[row_idx]), 8)
 
     def test_deltakv_sparse_decode_backend_controls_fa2_view(self):
-        from sparsevllm.engine.cache_manager import DecodeComputeView
+        from sparsevllm.engine.cache_manager import (
+            AttentionViewMeta,
+            DecodeComputeView,
+            ExplicitKVPayload,
+        )
         from sparsevllm.engine.cache_manager.deltakv_base import DeltaKVCacheTritonManagerV4
         from sparsevllm.engine.cache_manager.deltakv_less_memory import DeltaKVLessMemoryCacheManager
 
@@ -3771,12 +3799,16 @@ class DeltaKVFullPrefillStagingTest(unittest.TestCase):
                 manager.deltakv_layer_to_idx = {1: 0}
                 manager.has_prefill_staging_view = lambda layer_idx, active=staging_active: active
                 view = DecodeComputeView(
-                    k_cache=torch.empty((2, 1, 4), dtype=torch.float32),
-                    v_cache=torch.empty((2, 1, 4), dtype=torch.float32),
-                    active_slots=torch.tensor([[0, 1]], dtype=torch.int32),
-                    req_indices=selection.req_indices,
-                    context_lens=selection.context_lens,
-                    backend="dense",
+                    meta=AttentionViewMeta(
+                        active_slots=torch.tensor([[0, 1]], dtype=torch.int32),
+                        req_indices=selection.req_indices,
+                        context_lens=selection.context_lens,
+                    ),
+                    payload=ExplicitKVPayload(
+                        k_cache=torch.empty((2, 1, 4), dtype=torch.float32),
+                        v_cache=torch.empty((2, 1, 4), dtype=torch.float32),
+                        backend="dense",
+                    ),
                 )
 
                 with patch.object(DeltaKVCacheTritonManagerV4, "build_decode_compute_view", return_value=view):
@@ -3789,7 +3821,8 @@ class DeltaKVFullPrefillStagingTest(unittest.TestCase):
                         num_kv_heads=1,
                     )
 
-                self.assertEqual(out.backend, expected)
+                self.assertIsInstance(out.payload, ExplicitKVPayload)
+                self.assertEqual(out.payload.backend, expected)
 
     def test_static_decode_resets_deltakv_view_cache_before_validation(self):
         manager = object.__new__(DeltaKVCacheManager)

@@ -6,6 +6,7 @@ import os
 import random
 import subprocess
 import sys
+import typing
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -64,6 +65,21 @@ def require_path(path: str | Path, kind: str) -> Path:
     if not resolved.exists():
         raise FileNotFoundError(f"{kind} does not exist: {resolved}")
     return resolved
+
+
+def install_typing_compatibility() -> list[str]:
+    installed: list[str] = []
+    if not hasattr(typing, "Unpack"):
+        try:
+            from typing_extensions import Unpack
+        except ImportError as exc:
+            raise RuntimeError(
+                "Python < 3.11 requires typing_extensions.Unpack to load "
+                "the MiniMax Transformers remote model code."
+            ) from exc
+        typing.Unpack = Unpack  # type: ignore[attr-defined]
+        installed.append("typing.Unpack")
+    return installed
 
 
 def text_model_config(config):
@@ -382,6 +398,14 @@ def move_inputs(token_ids: list[int], device: torch.device) -> torch.Tensor:
     return torch.tensor([token_ids], dtype=torch.long, device=device)
 
 
+def model_input_device(model, fallback: torch.device) -> torch.device:
+    embeddings = model.get_input_embeddings()
+    weight = getattr(embeddings, "weight", None)
+    if weight is None or weight.device.type == "meta":
+        return fallback
+    return weight.device
+
+
 @torch.no_grad()
 def advance_cache(model, past_key_values, token_ids: list[int], *, device: torch.device, chunk_size: int):
     if chunk_size <= 0:
@@ -475,13 +499,20 @@ def run_calibration(args: argparse.Namespace) -> dict[str, Any]:
     if args.dataset not in dataset2prompt:
         raise ValueError(f"Dataset {args.dataset!r} is missing from {prompt_path}.")
     prompt_format = dataset2prompt[args.dataset]
+    typing_compatibility = (
+        install_typing_compatibility() if args.trust_remote_code else []
+    )
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = Path(args.output_dir) if args.output_dir else Path(args.output_root) / f"{args.dataset}_{timestamp}"
     output_dir.mkdir(parents=True, exist_ok=False)
 
-    tokenizer = AutoTokenizer.from_pretrained(str(model_path), trust_remote_code=True)
-    base_config = AutoConfig.from_pretrained(str(model_path), trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        str(model_path), trust_remote_code=args.trust_remote_code
+    )
+    base_config = AutoConfig.from_pretrained(
+        str(model_path), trust_remote_code=args.trust_remote_code
+    )
     text_config = text_model_config(base_config)
     attention_layer_indices = attention_layer_indices_from_config(base_config)
     max_length = int(args.max_length or getattr(text_config, "max_position_embeddings", 32000))
@@ -489,25 +520,52 @@ def run_calibration(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError(f"Resolved max_length must be > 0, got {max_length}.")
 
     dtype = torch_dtype_from_name(args.torch_dtype)
-    device = torch.device(args.device)
-    if device.type == "cuda" and not torch.cuda.is_available():
+    requested_device = torch.device(args.device)
+    if requested_device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA device requested, but torch.cuda.is_available() is False.")
+    if args.max_memory_per_device_gib <= 0:
+        raise ValueError(
+            "max_memory_per_device_gib must be > 0, "
+            f"got {args.max_memory_per_device_gib}."
+        )
 
     removed_fp8_exclusions = prepare_fp8_transformers_config(base_config)
     model_kwargs = {
         "config": base_config,
         "torch_dtype": dtype,
-        "trust_remote_code": True,
+        "trust_remote_code": args.trust_remote_code,
         "attn_implementation": "eager",
     }
-    if device.type == "cuda":
-        model_kwargs["device_map"] = {"": str(device)}
+    if args.device_map == "auto":
+        if requested_device.type != "cuda":
+            raise ValueError("--device-map auto requires a CUDA --device.")
+        visible_devices = torch.cuda.device_count()
+        if visible_devices <= 0:
+            raise RuntimeError("--device-map auto requires at least one visible CUDA device.")
+        model_kwargs["device_map"] = "auto"
+        model_kwargs["max_memory"] = {
+            index: f"{args.max_memory_per_device_gib}GiB"
+            for index in range(visible_devices)
+        }
+    elif requested_device.type == "cuda":
+        model_kwargs["device_map"] = {"": str(requested_device)}
     model = AutoModelForCausalLM.from_pretrained(
         str(model_path),
         **model_kwargs,
     )
-    if device.type != "cuda":
-        model.to(device)
+    if args.device_map == "auto":
+        hf_device_map = getattr(model, "hf_device_map", {})
+        offloaded = sorted(
+            {str(value) for value in hf_device_map.values() if str(value) in {"cpu", "disk"}}
+        )
+        if offloaded:
+            raise RuntimeError(
+                "Automatic device placement offloaded model modules to "
+                f"{offloaded}; increase visible GPU memory instead of running a mixed CPU/disk calibration."
+            )
+    elif requested_device.type != "cuda":
+        model.to(requested_device)
+    device = model_input_device(model, requested_device)
     model.eval()
 
     num_hidden_layers = int(text_config.num_hidden_layers)
@@ -635,9 +693,18 @@ def run_calibration(args: argparse.Namespace) -> dict[str, Any]:
         "model_config_num_hidden_layers": num_hidden_layers,
         "attention_layer_indices": attention_layer_indices,
         "removed_fp8_modules_to_not_convert": removed_fp8_exclusions,
+        "typing_compatibility": typing_compatibility,
+        "trust_remote_code": bool(args.trust_remote_code),
         "attention_implementation": "eager",
         "torch_dtype": args.torch_dtype,
         "device": args.device,
+        "device_map": args.device_map,
+        "max_memory_per_device_gib": int(args.max_memory_per_device_gib),
+        "resolved_input_device": str(device),
+        "hf_device_map": {
+            str(key): str(value)
+            for key, value in getattr(model, "hf_device_map", {}).items()
+        },
         "prefill_chunk_size": int(args.prefill_chunk_size),
         "max_length": int(max_length),
         "no_chat_template": bool(args.no_chat_template),
@@ -669,6 +736,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--prefill-chunk-size", type=int, default=512)
     parser.add_argument("--max-length", type=int, default=None)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--trust-remote-code",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--device-map", default="single", choices=("single", "auto"))
+    parser.add_argument("--max-memory-per-device-gib", type=int, default=76)
     parser.add_argument("--torch-dtype", default="bfloat16")
     parser.add_argument("--thinking-mode", default="off", choices=("off", "on"))
     parser.add_argument("--no-chat-template", action="store_true")

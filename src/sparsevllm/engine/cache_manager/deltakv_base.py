@@ -24,7 +24,15 @@ from sparsevllm.utils.profiler import profiler
 from sparsevllm.layers.rotary_embedding import get_rope, apply_rotary_emb
 from sparsevllm.platforms import device_runtime
 
-from .base import CacheManager, DecodeComputeView, LayerBatchStates, PrefillComputeView, SparseSelection
+from .base import (
+    AttentionViewMeta,
+    CacheManager,
+    DecodeComputeView,
+    ExplicitKVPayload,
+    LayerBatchStates,
+    PrefillComputeView,
+    SparseSelection,
+)
 from .raw_kv_offload import RawKVOffloadBuffer
 
 
@@ -953,14 +961,15 @@ class DeltaKVCacheManager(CacheManager):
             context_lens,
         )
         return PrefillComputeView(
-            k_cache=k_cache,
-            v_cache=v_cache,
-            active_slots=active_slots,
-            req_indices=req_indices,
-            context_lens=context_lens,
-            attn_score=selection.attn_score,
-            max_context_len=selection.max_context_len,
-            temp_slots=temp_slots,
+            meta=AttentionViewMeta(
+                active_slots=active_slots,
+                req_indices=req_indices,
+                context_lens=context_lens,
+                attn_score=selection.attn_score,
+                max_context_len=selection.max_context_len,
+                temp_slots=temp_slots,
+            ),
+            payload=ExplicitKVPayload(k_cache=k_cache, v_cache=v_cache),
         )
 
     def build_decode_compute_view(
@@ -997,14 +1006,15 @@ class DeltaKVCacheManager(CacheManager):
             selection,
         )
         return DecodeComputeView(
-            k_cache=k_cache,
-            v_cache=v_cache,
-            active_slots=active_slots,
-            req_indices=req_indices,
-            context_lens=context_lens,
-            attn_score=selection.attn_score,
-            max_context_len=selection.max_context_len,
-            temp_slots=temp_slots,
+            meta=AttentionViewMeta(
+                active_slots=active_slots,
+                req_indices=req_indices,
+                context_lens=context_lens,
+                attn_score=selection.attn_score,
+                max_context_len=selection.max_context_len,
+                temp_slots=temp_slots,
+            ),
+            payload=ExplicitKVPayload(k_cache=k_cache, v_cache=v_cache),
         )
 
     def has_prefill_staging_view(self, layer_idx: int) -> bool:
@@ -2742,7 +2752,7 @@ class DeltaKVCacheManager(CacheManager):
         buffers = self._ensure_decode_static_plan_buffers(bsz, k_max, max_s, req_indices.device)
         active_slots, active_pos, local_req, new_context_lens, no_free_temp_slots, recon_pos, recon_latent, recon_out_slot = buffers
 
-        from sparsevllm.triton_kernel.deltakv_kernels import deltakv_static_decode_plan
+        from sparsevllm.kernels.triton.deltakv_kernels import deltakv_static_decode_plan
 
         deltakv_static_decode_plan(
             raw_slots_map=self.sparse_layer_raw_slots_map,
@@ -2957,7 +2967,7 @@ class DeltaKVCacheTritonManagerV4(DeltaKVCacheManager):
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
     ) -> torch.Tensor:
-        from sparsevllm.triton_kernel.deltakv_kernels import deltakv_gather_raw_kv_grouped_heads
+        from sparsevllm.kernels.triton.deltakv_kernels import deltakv_gather_raw_kv_grouped_heads
 
         hp = int(getattr(self.config, "deltakv_triton_gather_heads_per_program", 4) or 1)
         hp = max(1, min(hp, int(self.num_kv_heads)))
@@ -2983,7 +2993,7 @@ class DeltaKVCacheTritonManagerV4(DeltaKVCacheManager):
         v_cache: torch.Tensor,
         l_idx: int | None = None,
     ):
-        from sparsevllm.triton_kernel.deltakv_kernels import deltakv_reconstruct_writeback_grouped_heads
+        from sparsevllm.kernels.triton.deltakv_kernels import deltakv_reconstruct_writeback_grouped_heads
 
         hp = int(getattr(self.config, "deltakv_triton_reconstruct_heads_per_program", 4) or 1)
         hp = max(1, min(hp, int(self.num_kv_heads)))
@@ -3326,7 +3336,7 @@ class DeltaKVCacheTritonManagerV4(DeltaKVCacheManager):
                 new_center_rel=new_center_rel,
             )
 
-        from sparsevllm.triton_kernel.deltakv_kernels import batch_gather_mean, deltakv_l2_topk_blockwise
+        from sparsevllm.kernels.triton.deltakv_kernels import batch_gather_mean, deltakv_l2_topk_blockwise
 
         with profiler.record("deltakv_cluster_metric"):
             partial_scores, partial_idx = deltakv_l2_topk_blockwise(

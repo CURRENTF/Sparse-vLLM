@@ -7,15 +7,17 @@
 README 包含当前安装命令。预期 baseline 为：
 
 - Python 3.10。
-- 带 CUDA 13.0 wheel 的 PyTorch 2.11.0。
-- Triton 3.6.0 和 torchvision 0.26.0。
-- 从与 `torch.version.cuda` 匹配的 FlashInfer wheel index 安装 `flashinfer-jit-cache>=0.6.15`。
+- 使用 `requirements/locks/canonical-cu129-py310.txt` 中冻结的完整 runtime
+  与 test 环境。
+- 带匹配 CUDA wheel 的 PyTorch 2.11.0，以及 Triton 3.6.0。
+- `flashinfer-python==0.6.15.post1`，以及 CUDA 12.9 build 的
+  `flashinfer-jit-cache==0.6.15.post1`。
+- `sglang-kernel==0.4.5` 和 `einops>=0.8.2` 是 runtime 依赖。
 - 需要预编译 device binary 时，可从通用 FlashInfer wheel index 安装匹配的 `flashinfer-cubin`。
-- `transformers[torch]==5.13.1`。
+- `transformers==5.13.1`。
 - 使用 `MAX_JOBS=8 pip install flash-attn --no-build-isolation` 安装 `flash-attn`。
-- 在仓库根目录运行 `pip install -e .` 进行 editable install。
-- Qwen3.5/Qwen3.6 FP8 run 使用 `pip install -e ".[qwen35]"` 安装 CUDA-specific extra。
-- 不需要 Qwen3.5 extra 时，vanilla、OmniKV 和 QuEST prefix-cache offload run 安装 `pip install -e ".[prefix-offload]"`。
+- 安装 lock 后，在仓库根目录运行 `pip install --no-deps -e .`。训练、
+  benchmark 和测试依赖均包含在主安装中。
 - 记录选择的 operator provider 和 CUDA compute capability。FP8 provider 根据本地 device capability 选择，warmup 期间不会下载 Hub kernel。
 - RMSNorm 默认使用 `SPARSEVLLM_RMSNORM_PROVIDER=auto`，在已安装时优先选择 FlashInfer。设为 `triton` 可强制使用本地 Triton kernel；设为 `flashinfer` 可明确要求 FlashInfer。
 

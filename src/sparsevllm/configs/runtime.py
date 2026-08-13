@@ -61,6 +61,7 @@ class Config(
     chunk_prefill_size: int | None = None
     long_prefill_offload_threshold: int = 64 * 1024
     mlp_chunk_size: int = 16384
+    mla_prefill_workspace_bytes: int = 2 * 1024**3
     prefill_schedule_policy: str = PREFILL_POLICY_AUTO
     gpu_memory_utilization: float = 0.8
     device_memory_utilization: float | None = None
@@ -74,6 +75,7 @@ class Config(
     hf_config: AutoConfig | None = None
     outer_hf_config: Any | None = None
     runtime_layout: RuntimeLayout | None = None
+    attention_cache_layout: str = field(default="explicit_kv", init=False)
     quantization_config: QuantizationConfig = field(default_factory=QuantizationConfig.disabled)
     model_spec: ModelSpec = field(init=False, repr=False)
     parallel_topology: ParallelTopology = field(init=False, repr=False)

@@ -12,6 +12,7 @@ class VocabParallelEmbedding(nn.Module):
         self,
         num_embeddings: int,
         embedding_dim: int,
+        reduce_results: bool = True,
     ):
         super().__init__()
         self.parallel_context = get_parallel_context()
@@ -19,6 +20,7 @@ class VocabParallelEmbedding(nn.Module):
         self.tp_size = self.parallel_context.tp_size
         assert num_embeddings % self.tp_size == 0
         self.num_embeddings = num_embeddings
+        self.reduce_results = bool(reduce_results)
         self.num_embeddings_per_partition = self.num_embeddings // self.tp_size
         self.vocab_start_idx = self.num_embeddings_per_partition * self.tp_rank
         self.vocab_end_idx = self.vocab_start_idx + self.num_embeddings_per_partition
@@ -56,7 +58,7 @@ class VocabParallelEmbedding(nn.Module):
         y = F.embedding(x, self.weight)
         if self.tp_size > 1:
             y = mask.unsqueeze(1) * y
-        return self.parallel_context.tp_all_reduce(y)
+        return self.parallel_context.tp_all_reduce(y) if self.reduce_results else y
 
 
 class ParallelLMHead(VocabParallelEmbedding):

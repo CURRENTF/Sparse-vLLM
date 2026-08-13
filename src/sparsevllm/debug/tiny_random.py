@@ -85,7 +85,12 @@ def load_tiny_random_overrides(path: str) -> dict[str, int]:
     return overrides
 
 
-def apply_tiny_random_overrides(hf_config: Any, path: str) -> dict[str, int]:
+def apply_tiny_random_overrides(
+    hf_config: Any,
+    path: str,
+    *,
+    validate_standard_head_shape: bool = True,
+) -> dict[str, int]:
     overrides = load_tiny_random_overrides(path)
     original_values = {
         name: int(getattr(hf_config, name))
@@ -116,11 +121,21 @@ def apply_tiny_random_overrides(hf_config: Any, path: str) -> dict[str, int]:
             )
         hf_config.layer_types = list(layer_types[:num_layers])
 
+    mlp_layer_types = getattr(hf_config, "mlp_layer_types", None)
+    if mlp_layer_types is not None:
+        num_layers = int(hf_config.num_hidden_layers)
+        if len(mlp_layer_types) < num_layers:
+            raise ValueError(
+                "Tiny random config cannot expand mlp_layer_types: "
+                f"requested={num_layers}, available={len(mlp_layer_types)}."
+            )
+        hf_config.mlp_layer_types = list(mlp_layer_types[:num_layers])
+
     hidden_size = int(hf_config.hidden_size)
     num_heads = int(hf_config.num_attention_heads)
     num_kv_heads = int(hf_config.num_key_value_heads)
     head_dim = int(getattr(hf_config, "head_dim", hidden_size // num_heads))
-    if hidden_size != num_heads * head_dim:
+    if validate_standard_head_shape and hidden_size != num_heads * head_dim:
         raise ValueError(
             "Tiny random config requires hidden_size == num_attention_heads * head_dim, "
             f"got {hidden_size} != {num_heads} * {head_dim}."
@@ -179,7 +194,12 @@ def initialize_sparse_model(
     loaded_count = 0
     loaded_parameter_names: set[str] = set()
     try:
-        for source_weight_name, loaded_weight in reference.state_dict().items():
+        reference_state = reference.state_dict()
+        reference_items = reference_state.items()
+        reference_adapter = getattr(model, "iter_tiny_reference_weights", None)
+        if callable(reference_adapter):
+            reference_items = reference_adapter(reference_state)
+        for source_weight_name, loaded_weight in reference_items:
             param_name = _target_weight_name_for_model(model, source_weight_name)
             if param_name is None:
                 continue

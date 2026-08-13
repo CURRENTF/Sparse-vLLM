@@ -5,14 +5,21 @@ import torch
 import torch.nn.functional as F
 
 from sparsevllm.operators.gated_shared_add import gated_shared_add
-from sparsevllm.triton_kernel.gate_up_swiglu import h20_gate_up_swiglu
-from sparsevllm.triton_kernel.moe import (
+from sparsevllm.kernels.triton.gate_up_swiglu import h20_gate_up_swiglu
+from sparsevllm.kernels.triton.moe import (
     _prepare_expert_assignment,
+    append_shared_expert_route,
     fused_moe,
     fused_moe_gate_up_swiglu,
     moe_align_block_size,
 )
-from sparsevllm.triton_kernel.moe_topk import topk_softmax
+from sparsevllm.kernels.triton.moe_topk import topk_softmax
+from sparsevllm.kernels.triton.silu_and_mul import _resolve_silu_launch_config
+
+
+def test_silu_launch_config_uses_decode_tile_only_for_small_rows():
+    assert _resolve_silu_launch_config(160) == (32, 128, 4)
+    assert _resolve_silu_launch_config(257) == (128, 128, None)
 
 
 def _is_h20() -> bool:
@@ -87,6 +94,48 @@ def _oracle_local_moe(
         expert_output *= topk_weights[token_ids, topk_slots, None]
         output.index_add_(0, token_ids, expert_output.to(output.dtype))
     return output
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for Triton MoE tests.")
+def test_append_shared_expert_route_matches_cat_and_replays_graph():
+    ids = torch.tensor(
+        [[3, 1, 7, 2], [9, 8, 4, 6]],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    weights = torch.tensor(
+        [[0.1, 0.2, 0.3, 0.4], [0.4, 0.3, 0.2, 0.1]],
+        dtype=torch.float32,
+        device="cuda",
+    )
+    actual_ids, actual_weights = append_shared_expert_route(
+        ids,
+        weights,
+        shared_expert_id=64,
+    )
+    expected_ids = torch.cat(
+        (ids, torch.full_like(ids[:, :1], 64)),
+        dim=1,
+    )
+    expected_weights = torch.cat(
+        (weights, torch.ones_like(weights[:, :1])),
+        dim=1,
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(actual_ids, expected_ids)
+    assert torch.equal(actual_weights, expected_weights)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_ids, graph_weights = append_shared_expert_route(
+            ids,
+            weights,
+            shared_expert_id=64,
+        )
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(graph_ids, expected_ids)
+    assert torch.equal(graph_weights, expected_weights)
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for Triton MoE tests.")

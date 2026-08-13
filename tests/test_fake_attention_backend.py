@@ -4,7 +4,13 @@ from unittest.mock import patch
 
 import torch
 
-from sparsevllm.engine.cache_manager import DecodeComputeView, PrefillComputeView
+from sparsevllm.engine.cache_manager import (
+    AttentionViewMeta,
+    DecodeComputeView,
+    ExplicitKVPayload,
+    MlaLatentPayload,
+    PrefillComputeView,
+)
 from sparsevllm.layers.attention_backend import TritonAttentionBackend
 
 
@@ -31,24 +37,32 @@ class FakeAttentionBackendTest(unittest.TestCase):
 
     def _make_prefill_view(self, *, attn_score=None):
         return PrefillComputeView(
-            k_cache=torch.ones(8, 2, 4),
-            v_cache=torch.ones(8, 2, 4),
-            active_slots=torch.tensor([[0, 1, 2]], dtype=torch.int32),
-            req_indices=torch.tensor([0], dtype=torch.int32),
-            context_lens=torch.tensor([3], dtype=torch.int32),
-            attn_score=attn_score,
-            max_context_len=3,
+            meta=AttentionViewMeta(
+                active_slots=torch.tensor([[0, 1, 2]], dtype=torch.int32),
+                req_indices=torch.tensor([0], dtype=torch.int32),
+                context_lens=torch.tensor([3], dtype=torch.int32),
+                attn_score=attn_score,
+                max_context_len=3,
+            ),
+            payload=ExplicitKVPayload(
+                k_cache=torch.ones(8, 2, 4),
+                v_cache=torch.ones(8, 2, 4),
+            ),
         )
 
     def _make_decode_view(self, *, attn_score=None):
         return DecodeComputeView(
-            k_cache=torch.ones(8, 2, 4),
-            v_cache=torch.ones(8, 2, 4),
-            active_slots=torch.tensor([[0, 1, 2]], dtype=torch.int32),
-            req_indices=torch.tensor([0], dtype=torch.int32),
-            context_lens=torch.tensor([3], dtype=torch.int32),
-            attn_score=attn_score,
-            max_context_len=3,
+            meta=AttentionViewMeta(
+                active_slots=torch.tensor([[0, 1, 2]], dtype=torch.int32),
+                req_indices=torch.tensor([0], dtype=torch.int32),
+                context_lens=torch.tensor([3], dtype=torch.int32),
+                attn_score=attn_score,
+                max_context_len=3,
+            ),
+            payload=ExplicitKVPayload(
+                k_cache=torch.ones(8, 2, 4),
+                v_cache=torch.ones(8, 2, 4),
+            ),
         )
 
     def test_fake_prefill_returns_zeros_and_skips_kernel(self):
@@ -160,13 +174,17 @@ class FakeAttentionBackendTest(unittest.TestCase):
         os.environ["SVLLM_DEBUG_DECODE_BOUNDS"] = "1"
         q = torch.zeros(1, 2, 4)
         view = DecodeComputeView(
-            k_cache=torch.ones(3, 2, 4),
-            v_cache=torch.ones(3, 2, 4),
-            active_slots=torch.tensor([[0, 1, 99]], dtype=torch.int32),
-            req_indices=torch.tensor([0], dtype=torch.int32),
-            context_lens=torch.tensor([3], dtype=torch.int32),
-            max_context_len=3,
-            backend="flash_attn_contiguous",
+            meta=AttentionViewMeta(
+                active_slots=torch.tensor([[0, 1, 99]], dtype=torch.int32),
+                req_indices=torch.tensor([0], dtype=torch.int32),
+                context_lens=torch.tensor([3], dtype=torch.int32),
+                max_context_len=3,
+            ),
+            payload=ExplicitKVPayload(
+                k_cache=torch.ones(3, 2, 4),
+                v_cache=torch.ones(3, 2, 4),
+                backend="flash_attn_contiguous",
+            ),
         )
 
         with self.assertRaisesRegex(RuntimeError, "decode physical slot out of bounds"):
@@ -230,6 +248,47 @@ class FakeAttentionBackendTest(unittest.TestCase):
         self.assertEqual(calls, ["stage1", "stage2"])
         self.assertTrue(torch.equal(out, torch.zeros_like(q)))
         self.assertTrue(torch.equal(attn_score, torch.full_like(attn_score, -1e20)))
+
+    def test_prefill_rejects_mla_payload_before_kernel(self):
+        explicit_view = self._make_prefill_view()
+        view = PrefillComputeView(
+            meta=explicit_view.meta,
+            payload=MlaLatentPayload(
+                latent_cache=torch.empty(8, 1, 512),
+                rope_cache=torch.empty(8, 1, 64),
+            ),
+        )
+
+        with self.assertRaisesRegex(TypeError, "requires ExplicitKVPayload"):
+            TritonAttentionBackend().run_prefill(
+                torch.empty(3, 2, 4),
+                view,
+                b_start_loc=torch.tensor([0], dtype=torch.int32),
+                chunk_lens=torch.tensor([3], dtype=torch.int32),
+                max_input_len=3,
+            )
+
+    def test_decode_rejects_mla_payload_before_kernel(self):
+        explicit_view = self._make_decode_view()
+        view = DecodeComputeView(
+            meta=explicit_view.meta,
+            payload=MlaLatentPayload(
+                latent_cache=torch.empty(8, 1, 512),
+                rope_cache=torch.empty(8, 1, 64),
+            ),
+        )
+
+        with self.assertRaisesRegex(TypeError, "requires ExplicitKVPayload"):
+            TritonAttentionBackend().run_decode(
+                torch.empty(1, 2, 4),
+                view,
+                mid_o=torch.empty(1, 2, 1, 4),
+                mid_o_logexpsum=torch.empty(1, 2, 1),
+                max_len_in_batch=3,
+                block_seq=256,
+                num_heads=2,
+                num_kv_heads=1,
+            )
 
 
 if __name__ == "__main__":

@@ -10,6 +10,22 @@ from benchmark.long_bench.metrics import classification_score, qa_f1_score
 
 
 class LongBenchDeltaKVContractsTest(unittest.TestCase):
+    def test_longbench_accepts_explicit_runtime_context_limit(self):
+        with patch.object(
+            longbench_pred.sys,
+            "argv",
+            [
+                "pred.py",
+                "--model_path",
+                "/models/glm",
+                "--max_model_len",
+                "32768",
+            ],
+        ):
+            args = longbench_pred.parse_args()
+
+        self.assertEqual(args.max_model_len, 32768)
+
     def test_no_chat_datasets_remain_raw_for_every_thinking_mode(self):
         for dataset in longbench_pred.NO_CHAT_TEMPLATE_DATASETS:
             for thinking_mode in ("off", "on", "on_strip"):
@@ -101,6 +117,10 @@ class LongBenchDeltaKVContractsTest(unittest.TestCase):
                 "uncaptured": SimpleNamespace(graph=None),
             },
             last_state_key="captured",
+            capture_count=2,
+            replay_count=7,
+            eager_static_count=0,
+            force_eager_count=0,
         )
         generate_fn = SimpleNamespace(
             _sparsevllm_llm=SimpleNamespace(
@@ -125,11 +145,50 @@ class LongBenchDeltaKVContractsTest(unittest.TestCase):
             self.assertEqual(status["state_count"], 2)
             self.assertEqual(status["graph_count"], 1)
             self.assertTrue(status["active"])
+            self.assertEqual(status["capture_count"], 2)
+            self.assertEqual(status["replay_count"], 7)
             self.assertEqual(status["last_state_key"], "captured")
             self.assertEqual(
                 json.loads(path.read_text(encoding="utf-8")),
                 status,
             )
+
+    def test_longbench_records_business_graph_counter_delta(self):
+        graph_runner = SimpleNamespace(
+            _graphs={"captured": SimpleNamespace(graph=object())},
+            last_state_key="captured",
+            capture_count=1,
+            replay_count=3,
+            eager_static_count=0,
+            force_eager_count=0,
+        )
+        generate_fn = SimpleNamespace(
+            _sparsevllm_llm=SimpleNamespace(
+                config=SimpleNamespace(decode_cuda_graph=True),
+                model_runner=SimpleNamespace(
+                    decode_cuda_graph_runner=graph_runner,
+                ),
+            )
+        )
+        before = longbench_pred._decode_cuda_graph_status(
+            generate_fn=generate_fn,
+            rank=0,
+        )
+        graph_runner.replay_count = 11
+
+        with tempfile.TemporaryDirectory() as tmp:
+            status = longbench_pred._write_decode_cuda_graph_status(
+                generate_fn=generate_fn,
+                out_root=tmp,
+                rank=0,
+                before=before,
+            )
+
+        self.assertEqual(status["before"]["replay_count"], 3)
+        self.assertEqual(status["replay_count"], 11)
+        self.assertEqual(status["counter_delta"]["replay_count"], 8)
+        self.assertEqual(status["counter_delta"]["eager_static_count"], 0)
+        self.assertEqual(status["counter_delta"]["force_eager_count"], 0)
 
     def test_longbench_fails_if_sparsevllm_graph_state_is_unavailable(self):
         with tempfile.TemporaryDirectory() as tmp:

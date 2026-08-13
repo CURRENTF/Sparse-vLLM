@@ -11,6 +11,7 @@ from sparsevllm.engine.prefill import (
 )
 from sparsevllm.engine.sequence import Sequence, SequenceStatus
 from sparsevllm.engine.runtime_state import MemoryOracle
+from sparsevllm.sampling_params import resolve_eos_token_ids
 from sparsevllm.utils.log import logger
 
 
@@ -38,10 +39,12 @@ class Scheduler:
         self.chunk_prefill_size = config.chunk_prefill_size
         self.prefill_schedule_policy = config.prefill_schedule_policy
         self.eos = config.eos
-        configured_eos = tuple(int(token_id) for token_id in getattr(config, "eos_token_ids", ()) or ())
-        if not configured_eos and int(self.eos) >= 0:
-            configured_eos = (int(self.eos),)
-        self.eos_token_ids = frozenset(configured_eos)
+        self.eos_token_ids = resolve_eos_token_ids(
+            configured_eos_token_ids=getattr(
+                config, "eos_token_ids", ()
+            ),
+            fallback_eos_token_id=self.eos,
+        )
 
         self.num_sink_tokens = config.num_sink_tokens
         self.num_recent_tokens = config.num_recent_tokens
@@ -831,7 +834,10 @@ class Scheduler:
                     # 记录模型生成的第一个 Token
                     seq.append_token(token_id, token_logprob, top_logprob)
                     # 检查是否命中结束条件
-                    request_eos = frozenset(seq.eos_token_ids) or self.eos_token_ids
+                    request_eos = resolve_eos_token_ids(
+                        seq.eos_token_ids,
+                        self.eos_token_ids,
+                    )
                     if (not seq.ignore_eos and token_id in request_eos) or seq.num_completion_tokens == seq.max_tokens:
                         seq.status = SequenceStatus.FINISHED
                         self.decoding.remove(seq)
@@ -852,7 +858,10 @@ class Scheduler:
                     )
                 continue
             seq.append_token(token_id, token_logprob, top_logprob)
-            request_eos = frozenset(seq.eos_token_ids) or self.eos_token_ids
+            request_eos = resolve_eos_token_ids(
+                seq.eos_token_ids,
+                self.eos_token_ids,
+            )
             if (not seq.ignore_eos and token_id in request_eos) or seq.num_completion_tokens == seq.max_tokens:
                 seq.status = SequenceStatus.FINISHED
                 if seq in self.decoding:

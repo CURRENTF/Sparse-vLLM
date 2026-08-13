@@ -82,8 +82,8 @@ Sparse-vLLM 支持物理淘汰、逻辑掩码、查询感知选择和混合 KV �
 
 ## 快速开始
 
-Sparse-vLLM 需要 Python 3.10 或更高版本。请在仓库根目录中，使用
-`pyproject.toml` 固定的运行时版本安装软件包。
+Sparse-vLLM 需要 Python 3.10 或更高版本，默认依赖声明在
+`pyproject.toml` 中。
 
 ### Conda
 
@@ -91,14 +91,10 @@ Sparse-vLLM 需要 Python 3.10 或更高版本。请在仓库根目录中，使�
 conda create -n svllm python=3.10 -y
 conda activate svllm
 
-pip install torch==2.11.0 torchvision==0.26.0 triton==3.6.0 \
-  --index-url https://download.pytorch.org/whl/cu130
-
-# FlashInfer 在单独的索引中发布 CUDA 专用 JIT 缓存。
-pip install "flashinfer-jit-cache>=0.6.15" \
-  --index-url https://flashinfer.ai/whl/cu130
-
-pip install -e .
+CUDA_VERSION=cu130
+python -m pip config --site set global.extra-index-url \
+  "https://download.pytorch.org/whl/${CUDA_VERSION} https://flashinfer.ai/whl/${CUDA_VERSION}"
+python -m pip install -e ".[${CUDA_VERSION}]"
 
 # 可选安装
 MAX_JOBS=8 pip install flash-attn --no-build-isolation
@@ -113,37 +109,16 @@ PyTorch wheel 自带 CUDA 运行时，而 `flash-attn` 等编译扩展使用当�
 ```bash
 uv venv --python 3.10
 source .venv/bin/activate
-uv pip install torch==2.11.0 torchvision==0.26.0 triton==3.6.0 \
-  --index-url https://download.pytorch.org/whl/cu130
-uv pip install "flashinfer-jit-cache>=0.6.15" \
-  --index-url https://flashinfer.ai/whl/cu130
 
-uv pip install -e .
+uv pip install -e ".[cu130]"
 
 # 可选安装
 MAX_JOBS=8 uv pip install flash-attn --no-build-isolation
 uv pip install flashinfer-cubin --index-url https://flashinfer.ai/whl
 ```
 
-以上显式索引分别用于安装 CUDA 13.0 版本的 PyTorch 和 FlashInfer JIT
-缓存。
-
-Qwen3.5/Qwen3.6 混合注意力推理还需要安装可选 Python 依赖：
-
-```bash
-# uv
-uv pip install -e ".[qwen35]"
-
-# Conda/pip
-pip install -e ".[qwen35]"
-```
-
-对于不使用 Qwen3.5/Qwen3.6 的 Vanilla、OmniKV 或 QuEST 前缀缓存卸载，
-可以安装更精简的 CUDA 专用可选依赖：
-
-```bash
-pip install -e ".[prefix-offload]"
-```
+CUDA 12.9 环境将 `cu130` 换成 `cu129`。已验证的 CUDA 12.9
+[依赖 lock](requirements/locks/README.md) 为可选复现方式。
 
 Qwen3.5/Qwen3.6 的 prefill causal Conv1D 和 decode Conv1D/GDN packing
 路径使用仓库内置的 Triton kernel；无需安装 `sglang-kernel`，也无需编译

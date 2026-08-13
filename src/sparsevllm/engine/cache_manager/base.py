@@ -5,7 +5,7 @@ import hashlib
 from collections import deque
 from dataclasses import dataclass, fields, is_dataclass
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import Any, Callable
 
 import torch
 import torch.distributed as dist
@@ -18,8 +18,9 @@ from sparsevllm.engine.prefill import (
     PREFILL_EXECUTION_RAW_OFFLOAD,
 )
 from sparsevllm.method_registry import SUPPORTED_SPARSE_METHODS, normalize_sparse_method
-from sparsevllm.triton_kernel.store_kvcache import store_kvcache
+from sparsevllm.kernels.triton.store_kvcache import store_kvcache
 import sparsevllm.platforms as platforms
+from sparsevllm.models.layout import resolve_attention_qk_head_dim
 from sparsevllm.utils.log import logger, log_level
 
 
@@ -141,34 +142,83 @@ class SparseSelection:
     release_temp_slots: bool = False
 
 
-@dataclass
-class DecodeComputeView:
-    """Physical KV/view tensors consumed by decode attention kernels."""
+@dataclass(frozen=True)
+class AttentionViewMeta:
+    """Logical request/slot coordinates shared by attention payloads."""
 
-    k_cache: torch.Tensor
-    v_cache: torch.Tensor
     active_slots: torch.Tensor
     req_indices: torch.Tensor
     context_lens: torch.Tensor
-    attn_score: torch.Tensor | None = None
     max_context_len: int | None = None
+    attn_score: torch.Tensor | None = None
     temp_slots: torch.Tensor | None = None
+
+
+@dataclass(frozen=True)
+class ExplicitKVPayload:
+    """Materialized key/value tensors consumed by ordinary attention."""
+
+    k_cache: torch.Tensor
+    v_cache: torch.Tensor
     backend: str = "dense"
     metadata: dict[str, Any] | None = None
 
 
-@dataclass
-class PrefillComputeView:
-    """Physical KV/view tensors consumed by prefill attention kernels."""
+@dataclass(frozen=True)
+class MlaLatentPayload:
+    """Latent and RoPE caches consumed by MLA attention providers."""
 
-    k_cache: torch.Tensor
-    v_cache: torch.Tensor
+    latent_cache: torch.Tensor
+    rope_cache: torch.Tensor
+
+
+AttentionPayload = ExplicitKVPayload | MlaLatentPayload
+
+
+@dataclass(frozen=True)
+class ExplicitKVWrite:
+    """Current-token key/value tensors to persist."""
+
+    key: torch.Tensor
+    value: torch.Tensor
+
+
+@dataclass(frozen=True)
+class MlaLatentWrite:
+    """Current-token latent and RoPE tensors to persist."""
+
+    latent: torch.Tensor
+    rope: torch.Tensor
+
+
+AttentionCacheWrite = ExplicitKVWrite | MlaLatentWrite
+
+
+@dataclass(frozen=True)
+class DecodeComputeView:
+    """Decode metadata paired with exactly one physical payload layout."""
+
+    meta: AttentionViewMeta
+    payload: AttentionPayload
+
+
+@dataclass(frozen=True)
+class PrefillComputeView:
+    """Prefill metadata paired with exactly one physical payload layout."""
+
+    meta: AttentionViewMeta
+    payload: AttentionPayload
+
+
+@dataclass(frozen=True)
+class AttentionKeyComputeView:
+    """Physical payload plus the slots whose actual attention keys are needed."""
+
     active_slots: torch.Tensor
-    req_indices: torch.Tensor
-    context_lens: torch.Tensor
-    attn_score: torch.Tensor | None = None
-    max_context_len: int | None = None
-    temp_slots: torch.Tensor | None = None
+    payload: AttentionPayload
+
+
+AttentionKeyMaterializer = Callable[[AttentionKeyComputeView], torch.Tensor]
 
 
 class CacheManager(ABC):
@@ -195,11 +245,7 @@ class CacheManager(ABC):
         self.num_kv_layers = int(self.runtime_layout.num_kv_layers)
 
         self.num_kv_heads = self.hf_config.num_key_value_heads // self.tp_size
-        self.head_dim = getattr(
-            self.hf_config,
-            "head_dim",
-            self.hf_config.hidden_size // self.hf_config.num_attention_heads,
-        )
+        self.head_dim = resolve_attention_qk_head_dim(self.hf_config)
 
         self.max_model_len = config.max_model_len
         resident_buffer_rows = int(config.max_num_seqs_in_gpu)
@@ -226,6 +272,7 @@ class CacheManager(ABC):
         self.kv_cache = None
         self._decode_static_max_context_len: int | None = None
         self._raw_offload_prefill_phases: dict[int, bool] = {}
+        self._attention_key_materializers: dict[int, AttentionKeyMaterializer] = {}
 
     def synchronize_prefix_cache_delete_plan(
         self,
@@ -417,7 +464,7 @@ class CacheManager(ABC):
             + current
             - recurrent_explicit_deduction
         )
-        slot_bytes_per_layer = 2 * self.num_kv_heads * self.head_dim * dtype_size
+        slot_bytes_per_layer = self.attention_cache_bytes_per_slot_per_layer()
 
         recurrent_bytes_per_block = int(
             getattr(config, "prefix_recurrent_bytes_per_block", 0) or 0
@@ -508,6 +555,11 @@ class CacheManager(ABC):
 
         return available_memory, slot_bytes_per_layer
 
+    def attention_cache_bytes_per_slot_per_layer(self) -> int:
+        """Persistent attention-cache bytes for one token in one KV layer."""
+        dtype_size = self._cache_slot_dtype_size()
+        return int(2 * self.num_kv_heads * self.head_dim * dtype_size)
+
     def _kv_allocation_bytes_per_prefix_block(
         self,
         slot_bytes_per_layer: int,
@@ -576,6 +628,23 @@ class CacheManager(ABC):
         store_kvcache(k, v, k_cache, v_cache, slot_mapping)
         return slot_mapping
 
+    def store_attention_payload(
+        self,
+        layer_idx: int,
+        payload: AttentionCacheWrite,
+    ) -> torch.Tensor:
+        """Store one layer's current-token payload using the configured layout."""
+        if not isinstance(payload, ExplicitKVWrite):
+            raise TypeError(
+                f"{type(self).__name__} supports only ExplicitKVWrite stores, got "
+                f"{type(payload).__name__}."
+            )
+        return self._store_layer_kv(
+            layer_idx,
+            payload.key,
+            payload.value,
+        )
+
     def save_raw_kv_if_needed(
         self,
         layer_idx: int,
@@ -598,7 +667,10 @@ class CacheManager(ABC):
             k_post_rope=k_post_rope,
             v=v,
         )
-        slot_mapping = self._store_layer_kv(layer_idx, store_k, store_v)
+        slot_mapping = self.store_attention_payload(
+            layer_idx,
+            ExplicitKVWrite(key=store_k, value=store_v),
+        )
         self.on_kv_stored(
             layer_idx,
             store_k,
@@ -620,6 +692,133 @@ class CacheManager(ABC):
             k_cache, v_cache = self.get_layer_kv_cache(layer_idx)
         return k_cache, v_cache, active_slots, req_indices, context_lens
 
+    def get_layer_compute_payload(
+        self,
+        layer_idx: int,
+        active_slots: torch.Tensor,
+        req_indices: torch.Tensor,
+        context_lens: torch.Tensor,
+        selection: SparseSelection | None = None,
+    ) -> tuple[AttentionPayload, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return the physical payload and logical coordinates for decode."""
+        k_cache, v_cache, active_slots, req_indices, context_lens = (
+            self.get_layer_compute_view(
+                layer_idx,
+                active_slots,
+                req_indices,
+                context_lens,
+                selection,
+            )
+        )
+        return (
+            ExplicitKVPayload(k_cache=k_cache, v_cache=v_cache),
+            active_slots,
+            req_indices,
+            context_lens,
+        )
+
+    def register_attention_key_materializer(
+        self,
+        layer_idx: int,
+        materializer: AttentionKeyMaterializer,
+    ) -> None:
+        """Bind a model/operator hook that reconstructs actual keys from a layout."""
+
+        layer_idx = int(layer_idx)
+        self.kv_layer_index(layer_idx)
+        if not callable(materializer):
+            raise TypeError(
+                "Attention key materializer must be callable, got "
+                f"{type(materializer).__name__}."
+            )
+        registry = getattr(self, "_attention_key_materializers", None)
+        if registry is None:
+            registry = {}
+            self._attention_key_materializers = registry
+        existing = registry.get(layer_idx)
+        if existing is not None and existing != materializer:
+            raise RuntimeError(
+                "Attention key materializer is already bound for "
+                f"layer={layer_idx}."
+            )
+        registry[layer_idx] = materializer
+
+    def has_attention_key_materializer(self, layer_idx: int) -> bool:
+        registry = getattr(self, "_attention_key_materializers", {})
+        return int(layer_idx) in registry
+
+    def build_attention_key_compute_view(
+        self,
+        layer_idx: int,
+        active_slots: torch.Tensor,
+    ) -> AttentionKeyComputeView:
+        """Build a tagged view without assuming an explicit or latent layout."""
+
+        layer_idx = int(layer_idx)
+        kv_idx = self.kv_layer_index(layer_idx)
+        storage = getattr(self, "attention_cache_storage", None)
+        if storage is None:
+            k_cache, v_cache = self.get_layer_kv_cache(layer_idx)
+            payload: AttentionPayload = ExplicitKVPayload(
+                k_cache=k_cache,
+                v_cache=v_cache,
+            )
+        else:
+            payload = storage.layer_payload(kv_idx)
+        return AttentionKeyComputeView(
+            active_slots=active_slots,
+            payload=payload,
+        )
+
+    @torch.no_grad()
+    def materialize_attention_keys(
+        self,
+        layer_idx: int,
+        active_slots: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return the actual post-RoPE per-head keys for arbitrary cache slots."""
+
+        view = self.build_attention_key_compute_view(layer_idx, active_slots)
+        slots = view.active_slots
+        if slots.ndim == 0:
+            raise ValueError("Attention key slots must have at least one dimension.")
+        if slots.dtype not in (torch.int32, torch.int64):
+            raise TypeError(
+                "Attention key slots must use int32 or int64, got "
+                f"{slots.dtype}."
+            )
+
+        if isinstance(view.payload, ExplicitKVPayload):
+            k_cache = view.payload.k_cache
+            flat_slots = slots.to(device=k_cache.device, dtype=torch.long).reshape(-1)
+            keys = k_cache.index_select(0, flat_slots).view(
+                *slots.shape,
+                *k_cache.shape[1:],
+            )
+        else:
+            registry = getattr(self, "_attention_key_materializers", {})
+            materializer = registry.get(int(layer_idx))
+            if materializer is None:
+                raise RuntimeError(
+                    "The attention cache layout requires an actual-key "
+                    f"materializer at layer={int(layer_idx)}."
+                )
+            keys = materializer(view)
+
+        expected_ndim = int(slots.ndim) + 2
+        if keys.ndim != expected_ndim or tuple(keys.shape[: slots.ndim]) != tuple(slots.shape):
+            raise RuntimeError(
+                "Attention key materializer returned an invalid shape: "
+                f"slots={tuple(slots.shape)} keys={tuple(keys.shape)}; expected "
+                "the slot shape followed by [heads, head_dim]."
+            )
+        if keys.device != slots.device:
+            raise RuntimeError(
+                "Materialized attention keys must share the slot device: "
+                f"slots={slots.device} keys={keys.device}."
+            )
+        return keys
+
     def get_prefill_compute_view(
         self,
         layer_idx: int,
@@ -638,6 +837,35 @@ class CacheManager(ABC):
             req_indices,
             context_lens,
             selection,
+        )
+
+    def get_prefill_compute_payload(
+        self,
+        layer_idx: int,
+        k_current: torch.Tensor,
+        v_current: torch.Tensor,
+        selection: SparseSelection,
+        active_slots: torch.Tensor,
+        req_indices: torch.Tensor,
+        context_lens: torch.Tensor,
+    ) -> tuple[AttentionPayload, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return the physical payload and logical coordinates for prefill."""
+        k_cache, v_cache, active_slots, req_indices, context_lens = (
+            self.get_prefill_compute_view(
+                layer_idx,
+                k_current,
+                v_current,
+                selection,
+                active_slots,
+                req_indices,
+                context_lens,
+            )
+        )
+        return (
+            ExplicitKVPayload(k_cache=k_cache, v_cache=v_cache),
+            active_slots,
+            req_indices,
+            context_lens,
         )
 
     def _default_active_slots_for_selection(self, layer_idx: int, selection: SparseSelection) -> torch.Tensor:
@@ -665,7 +893,7 @@ class CacheManager(ABC):
             active_slots = self._default_active_slots_for_selection(layer_idx, selection)
             req_indices = selection.req_indices
             context_lens = selection.context_lens
-        k_cache, v_cache, active_slots, req_indices, context_lens = self.get_prefill_compute_view(
+        payload, active_slots, req_indices, context_lens = self.get_prefill_compute_payload(
             layer_idx,
             k_current,
             v_current,
@@ -675,14 +903,15 @@ class CacheManager(ABC):
             context_lens,
         )
         return PrefillComputeView(
-            k_cache=k_cache,
-            v_cache=v_cache,
-            active_slots=active_slots,
-            req_indices=req_indices,
-            context_lens=context_lens,
-            attn_score=selection.attn_score,
-            max_context_len=selection.max_context_len,
-            temp_slots=temp_slots,
+            meta=AttentionViewMeta(
+                active_slots=active_slots,
+                req_indices=req_indices,
+                context_lens=context_lens,
+                attn_score=selection.attn_score,
+                max_context_len=selection.max_context_len,
+                temp_slots=temp_slots,
+            ),
+            payload=payload,
         )
 
     def collect_prefill_attention_score(
@@ -768,6 +997,31 @@ class CacheManager(ABC):
     def decode_cuda_graph_keepalive_tensors(self) -> list[torch.Tensor]:
         """Cache-manager-owned tensors captured by decode CUDA graphs."""
         return []
+
+    def validate_decode_cuda_graph_slot_mappings(self) -> None:
+        """Validate every layer's static decode mapping as one store scope.
+
+        Static preparation calls this for every decode step. Graph capture then
+        calls it again after its eager warmup because a storage backend may
+        consume the one-forward prevalidation during that warmup. Sparse
+        methods may bind a different stable mapping tensor per layer, so the
+        storage is given the exact layer-ordered set instead of only the
+        runner's common metadata buffer.
+        """
+        storage = getattr(self, "attention_cache_storage", None)
+        if storage is None:
+            return
+        slot_mappings: list[torch.Tensor] = []
+        for layer_idx in self.kv_transformer_layer_indices():
+            state = self.get_layer_batch_states(layer_idx)
+            slot_mapping = state.slot_mapping
+            if slot_mapping is None:
+                raise RuntimeError(
+                    "Decode CUDA graph capture requires a slot mapping for "
+                    f"layer={layer_idx}."
+                )
+            slot_mappings.append(slot_mapping)
+        storage.validate_slot_mappings(tuple(slot_mappings))
 
     def decode_cuda_graph_max_cached_graphs(self) -> int | None:
         """Optional bound for captured decode graph states.
@@ -913,21 +1167,24 @@ class CacheManager(ABC):
                 num_heads=num_heads,
                 num_kv_heads=num_kv_heads,
             )
-        k_cache, v_cache, active_slots, req_indices, context_lens = self.get_layer_compute_view(
-            layer_idx,
-            active_slots,
-            req_indices,
-            context_lens,
-            selection,
+        payload, active_slots, req_indices, context_lens = (
+            self.get_layer_compute_payload(
+                layer_idx,
+                active_slots,
+                req_indices,
+                context_lens,
+                selection,
+            )
         )
         return DecodeComputeView(
-            k_cache=k_cache,
-            v_cache=v_cache,
-            active_slots=active_slots,
-            req_indices=req_indices,
-            context_lens=context_lens,
-            attn_score=selection.attn_score,
-            max_context_len=selection.max_context_len,
+            meta=AttentionViewMeta(
+                active_slots=active_slots,
+                req_indices=req_indices,
+                context_lens=context_lens,
+                attn_score=selection.attn_score,
+                max_context_len=selection.max_context_len,
+            ),
+            payload=payload,
         )
 
     def get_decode_block_seq(self, layer_idx: int, default: int) -> int:
@@ -1264,7 +1521,8 @@ class CacheManager(ABC):
         }
 
     def _cache_slot_dtype_size(self) -> int:
-        dtype = getattr(self.hf_config, "torch_dtype", torch.float16)
+        hf_config = getattr(self, "hf_config", getattr(self.config, "hf_config", None))
+        dtype = getattr(hf_config, "torch_dtype", torch.float16)
         if not isinstance(dtype, torch.dtype):
             dtype = torch.float16
         return int(torch.tensor([], dtype=dtype).element_size())
@@ -1285,7 +1543,36 @@ class CacheManager(ABC):
     def _dense_baseline_bytes(self) -> int:
         dtype_size = self._cache_slot_dtype_size()
         slots = self._dense_baseline_slots()
-        return int(slots * self.num_kv_layers * 2 * self.num_kv_heads * self.head_dim * dtype_size)
+        storage = getattr(self, "attention_cache_storage", None)
+        layout = getattr(storage, "layout", None)
+        layout_name = str(getattr(layout, "value", layout) or "")
+        if layout_name == "mla_latent":
+            hf_config = self.hf_config
+            global_heads = int(hf_config.num_attention_heads)
+            attention_tp_size = int(
+                getattr(
+                    getattr(self, "parallel_context", None),
+                    "attention_tp_size",
+                    getattr(self, "tp_size", 1),
+                )
+            )
+            if global_heads % attention_tp_size != 0:
+                raise ValueError(
+                    "MLA dense baseline requires attention heads divisible by TP: "
+                    f"heads={global_heads} tp={attention_tp_size}."
+                )
+            local_heads = global_heads // attention_tp_size
+            qk_head_dim = resolve_attention_qk_head_dim(hf_config)
+            value_head_dim = int(hf_config.v_head_dim)
+            values_per_token = local_heads * (qk_head_dim + value_head_dim)
+        else:
+            values_per_token = 2 * self.num_kv_heads * self.head_dim
+        return int(
+            slots
+            * self.num_kv_layers
+            * values_per_token
+            * dtype_size
+        )
 
     @staticmethod
     def _tensor_storage_key(tensor: torch.Tensor) -> tuple[Any, ...]:
@@ -1329,8 +1616,14 @@ class CacheManager(ABC):
                 for field_name, item in value.__dict__.items():
                     yield from visit(f"{path}.{field_name}", item)
 
+        storage = getattr(self, "attention_cache_storage", None)
+        if storage is not None:
+            layout = getattr(getattr(storage, "layout", None), "value", "unknown")
+            for index, tensor in enumerate(storage.accounting_tensors()):
+                yield f"attention_cache_storage.{layout}.{index}_cache", tensor
+
         for name, value in self.__dict__.items():
-            if name in {"config", "hf_config"}:
+            if name in {"config", "hf_config", "attention_cache_storage"}:
                 continue
             yield from visit(name, value)
 
@@ -1355,8 +1648,11 @@ class CacheManager(ABC):
             live_tokens = int(row_seq_lens.sum())
         except Exception:
             return 0
-        dtype_size = self._cache_slot_dtype_size()
-        return int(live_tokens * self.num_kv_layers * 2 * self.num_kv_heads * self.head_dim * dtype_size)
+        return int(
+            live_tokens
+            * self.num_kv_layers
+            * self.attention_cache_bytes_per_slot_per_layer()
+        )
 
     def memory_accounting(self) -> dict[str, Any]:
         """Return read-only tensor memory accounting for regression gates.

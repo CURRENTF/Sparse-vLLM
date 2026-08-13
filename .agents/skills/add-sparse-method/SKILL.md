@@ -28,7 +28,7 @@ Follow this placement order.
 5. Keep `src/sparsevllm/layers/attention.py` method-agnostic. It may call generic hooks, but should not grow method-specific branches unless adding a new reusable hook.
 6. Put cross-layer observation, attention-score collection, or scheduler-facing sparse orchestration in `src/sparsevllm/engine/sparse_controller.py`.
 7. Use `src/sparsevllm/utils/` only for truly generic helpers shared by multiple methods. Do not place an entire method implementation there.
-8. Add custom kernels under `src/sparsevllm/triton_kernel/` or another explicit runtime module, then call them through the method's cache manager or shared decode path.
+8. Add custom kernels under `src/sparsevllm/kernels/triton/` or another explicit runtime module, then call them through the method's cache manager or shared decode path.
 
 ## Decision Rules
 

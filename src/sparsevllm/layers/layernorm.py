@@ -59,7 +59,7 @@ def _load_flashinfer_ops(*, zero_centered_weight: bool) -> _RMSNormOps:
 
 
 def _load_triton_ops(*, zero_centered_weight: bool) -> _RMSNormOps:
-    from sparsevllm.triton_kernel.rmsnorm import (
+    from sparsevllm.kernels.triton.rmsnorm import (
         fused_add_rmsnorm_forward,
         rmsnorm_forward,
     )
@@ -222,6 +222,25 @@ class ColumnParallelRMSNorm(RMSNorm):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.parallel_context is not other_norm.parallel_context:
             raise ValueError("Paired column-parallel RMSNorms must share a context.")
+        if x.is_cuda or other.is_cuda:
+            from sparsevllm.kernels.triton.column_parallel_rmsnorm import (
+                paired_rms_apply,
+                paired_square_sums,
+            )
+
+            square_sums = paired_square_sums(x, other)
+            self.parallel_context.attention_tp_all_reduce(square_sums)
+            return paired_rms_apply(
+                x,
+                other,
+                square_sums,
+                self.weight,
+                other_norm.weight,
+                x_global_hidden_size=self.global_hidden_size,
+                other_global_hidden_size=other_norm.global_hidden_size,
+                x_eps=self.eps,
+                other_eps=other_norm.eps,
+            )
         square_sums = torch.stack(
             (
                 x.float().square().sum(dim=-1),

@@ -10,14 +10,10 @@ Sparse-vLLM usage example.
 conda create -n svllm python=3.10 -y
 conda activate svllm
 
-pip install torch==2.11.0 torchvision==0.26.0 triton==3.6.0 \
-  --index-url https://download.pytorch.org/whl/cu130
-
-# FlashInfer publishes the CUDA-specific JIT cache on a separate index.
-pip install "flashinfer-jit-cache>=0.6.15" \
-  --index-url https://flashinfer.ai/whl/cu130
-
-pip install -e .
+CUDA_VERSION=cu130
+python -m pip config --site set global.extra-index-url \
+  "https://download.pytorch.org/whl/${CUDA_VERSION} https://flashinfer.ai/whl/${CUDA_VERSION}"
+python -m pip install -e ".[${CUDA_VERSION}]"
 
 # Optional
 MAX_JOBS=8 pip install flash-attn --no-build-isolation
@@ -25,58 +21,32 @@ MAX_JOBS=8 pip install flash-attn --no-build-isolation
 
 ## Install with uv
 
-The project uses the CUDA 13.0 build:
-
 ```bash
-uv venv --python 3.12
+uv venv --python 3.10
 source .venv/bin/activate
 
-uv pip install torch==2.11.0 torchvision==0.26.0 triton==3.6.0 \
-  --index-url https://download.pytorch.org/whl/cu130
-uv pip install "flashinfer-jit-cache>=0.6.15" \
-  --index-url https://flashinfer.ai/whl/cu130
-
-uv pip install -e .
+uv pip install -e ".[cu130]"
 
 # Optional
 MAX_JOBS=8 uv pip install flash-attn --no-build-isolation
 ```
 
 
-For Qwen3.5/Qwen3.6 mixed-attention inference, install the optional Python
-dependencies as well:
+Use `cu129` instead of `cu130` for CUDA 12.9. The validated CUDA 12.9
+[dependency lock](../../../requirements/locks/README.md) is optional.
 
-```bash
-# uv
-uv pip install -e ".[qwen35]"
-
-# Conda/pip
-pip install -e ".[qwen35]"
-```
-
-For prefix-cache offload with vanilla, OmniKV, or QuEST only:
-
-```bash
-pip install -e ".[prefix-offload]"
-```
+`einops`, `sglang-kernel`, and the training, benchmark, and test packages are all
+runtime dependencies, so workflow-specific extras are not required.
 
 Sparse-vLLM supports Qwen3.5/Qwen3.6 checkpoints in unquantized BF16 and
 block-scaled FP8 formats.
 
 Its prefill causal Conv1D and decode Conv1D/GDN packing paths use local Triton
-kernels. They do not require `sglang-kernel` or a repository CUDA-extension
-build.
+kernels and do not call `sglang-kernel` themselves.
 
-The required `flashinfer-jit-cache` package provides modules built for a
-specific CUDA toolkit version. Select the index matching the CUDA version used
-by PyTorch. `flashinfer-cubin` is an optional acceleration package containing
-architecture-specific device binaries:
+`flashinfer-cubin` is an optional acceleration package:
 
 ```bash
-pip install "flashinfer-jit-cache>=0.6.15" \
-  --index-url https://flashinfer.ai/whl/cu130
-
-# Optional
 pip install flashinfer-cubin --index-url https://flashinfer.ai/whl
 ```
 

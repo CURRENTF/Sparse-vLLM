@@ -23,12 +23,22 @@ from sparsevllm.utils.log import logger, log_level
 from sparsevllm.utils.profiler import profiler
 from sparsevllm.platforms import device_runtime
 
-from .base import CacheManager, LayerBatchStates, SparseSelection
+from .base import (
+    AttentionCacheWrite,
+    AttentionPayload,
+    CacheManager,
+    LayerBatchStates,
+    SparseSelection,
+)
 from .prefix_cache_mixin import PrefixCacheMixin
 from .prefix_offload import (
     PinnedPrefixKVPool,
     PrefixH2DOperation,
     StandardPrefixOffloadController,
+)
+from .storage import (
+    ExplicitKVStorage,
+    create_attention_cache_storage,
 )
 
 
@@ -68,6 +78,11 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
 
     def __init__(self, config: Config, parallel_context: ParallelContext):
         super().__init__(config, parallel_context)
+        self.attention_cache_storage = create_attention_cache_storage(
+            config,
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_dim,
+        )
         self.allocate_kv_cache()
 
         num_slots = config.num_kvcache_slots
@@ -124,13 +139,12 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
         host_size_gb = getattr(self.config, "prefix_cache_host_size_gb", None)
         if host_size_gb is None:
             raise RuntimeError("Prefix cache offload requires prefix_cache_host_size_gb.")
+        storage = self._require_explicit_storage("Prefix cache offload")
+        kv_cache = storage.cache
         bytes_per_block = int(
             self.prefix_cache_block_size
             * self.num_kv_layers
-            * 2
-            * self.num_kv_heads
-            * self.head_dim
-            * self.kv_cache.element_size()
+            * storage.bytes_per_slot_per_layer()
         )
         host_bytes = int(float(host_size_gb) * (1024**3))
         host_capacity_blocks = host_bytes // bytes_per_block
@@ -148,13 +162,13 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
             capacity_blocks=host_capacity_blocks,
             num_layers=self.num_kv_layers,
             block_size=self.prefix_cache_block_size,
-            num_kv_heads=self.num_kv_heads,
-            head_dim=self.head_dim,
-            dtype=self.kv_cache.dtype,
+            num_kv_heads=storage.num_kv_heads,
+            head_dim=storage.head_dim,
+            dtype=storage.dtype,
         )
         self.prefix_offload_controller = StandardPrefixOffloadController(
             prefix_cache=self.prefix_cache,
-            kv_cache=self.kv_cache,
+            kv_cache=kv_cache,
             host_pool=host_pool,
             block_size=self.prefix_cache_block_size,
             device=self.device,
@@ -179,26 +193,101 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
         logger.info(
             f"Standard Mode: Each layer can accommodate {self.config.num_kvcache_slots} tokens."
         )
-        self.kv_cache = torch.empty(
-            2,
-            num_layers,
-            self.config.num_kvcache_slots,
-            self.num_kv_heads,
-            self.head_dim,
-            dtype=self.hf_config.torch_dtype,
+        self.attention_cache_storage.allocate(
+            num_layers=num_layers,
+            num_slots=self.config.num_kvcache_slots,
             device=self.device,
         )
+        self.kv_cache = (
+            self.attention_cache_storage.kv_cache
+            if isinstance(self.attention_cache_storage, ExplicitKVStorage)
+            else None
+        )
+
+    def attention_cache_bytes_per_slot_per_layer(self) -> int:
+        storage = getattr(self, "attention_cache_storage", None)
+        if storage is None:
+            return super().attention_cache_bytes_per_slot_per_layer()
+        return int(storage.bytes_per_slot_per_layer())
+
+    def _require_explicit_storage(self, operation: str) -> ExplicitKVStorage:
+        storage = self.attention_cache_storage
+        if not isinstance(storage, ExplicitKVStorage):
+            raise TypeError(
+                f"{operation} requires ExplicitKVStorage, got "
+                f"{type(storage).__name__}."
+            )
+        return storage
 
     def get_layer_batch_states(self, layer_idx: int) -> LayerBatchStates:
         return self.layer_batch_state
 
     def get_layer_kv_cache(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
         kv_idx = self.kv_layer_index(layer_idx)
-        return self.kv_cache[0, kv_idx], self.kv_cache[1, kv_idx]
+        payload = self._require_explicit_storage("get_layer_kv_cache").layer_payload(kv_idx)
+        return payload.k_cache, payload.v_cache
 
     def get_layer_store_view(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        kv_idx = self.kv_layer_index(layer_idx)
-        return self.kv_cache[0, kv_idx], self.kv_cache[1, kv_idx], self.layer_batch_state.slot_mapping
+        k_cache, v_cache = self.get_layer_kv_cache(layer_idx)
+        return k_cache, v_cache, self.layer_batch_state.slot_mapping
+
+    def store_attention_payload(
+        self,
+        layer_idx: int,
+        payload: AttentionCacheWrite,
+    ) -> torch.Tensor:
+        slot_mapping = self.layer_batch_state.slot_mapping
+        if slot_mapping is None:
+            raise RuntimeError(
+                f"Attention cache store requires slot_mapping at layer={layer_idx}."
+            )
+        self.attention_cache_storage.store(
+            self.kv_layer_index(layer_idx),
+            slot_mapping,
+            payload,
+        )
+        return slot_mapping
+
+    def _validate_attention_slot_mapping(self, slot_mapping: torch.Tensor) -> None:
+        storage = getattr(self, "attention_cache_storage", None)
+        if storage is not None:
+            storage.validate_slot_mapping(slot_mapping)
+
+    def get_layer_compute_payload(
+        self,
+        layer_idx: int,
+        active_slots: torch.Tensor,
+        req_indices: torch.Tensor,
+        context_lens: torch.Tensor,
+        selection: SparseSelection | None = None,
+    ) -> tuple[AttentionPayload, torch.Tensor, torch.Tensor, torch.Tensor]:
+        del selection
+        return (
+            self.attention_cache_storage.layer_payload(
+                self.kv_layer_index(layer_idx)
+            ),
+            active_slots,
+            req_indices,
+            context_lens,
+        )
+
+    def get_prefill_compute_payload(
+        self,
+        layer_idx: int,
+        k_current: torch.Tensor,
+        v_current: torch.Tensor,
+        selection: SparseSelection,
+        active_slots: torch.Tensor,
+        req_indices: torch.Tensor,
+        context_lens: torch.Tensor,
+    ) -> tuple[AttentionPayload, torch.Tensor, torch.Tensor, torch.Tensor]:
+        del k_current, v_current, selection
+        return self.get_layer_compute_payload(
+            layer_idx,
+            active_slots,
+            req_indices,
+            context_lens,
+        )
 
     def get_layer_compute_tensors(self, layer_idx: int, selection: SparseSelection | None = None):
         del selection
@@ -1283,6 +1372,7 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
             self.layer_batch_state.context_lens = context_lens
             self.layer_batch_state.max_context_len = max(context_lens_list) if context_lens_list else 0
             self.layer_batch_state.req_indices = req_indices_tensor
+            self._validate_attention_slot_mapping(slot_mapping)
 
             if log_level == 'DEBUG':
                 logger.debug(f'{context_lens_list=}   {req_indices=}  {slot_mapping[:10].tolist()=}  {slot_mapping[-10:].tolist()=}')
@@ -1319,6 +1409,7 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
             self.layer_batch_state.context_lens = context_lens
             self.layer_batch_state.max_context_len = int(max(self.row_seq_lens[row_indices])) if row_indices else 0
             self.layer_batch_state.req_indices = req_indices
+            self._validate_attention_slot_mapping(slot_mapping)
 
             if log_level == 'DEBUG':
                 logger.debug(f'{slot_mapping=}   {context_lens.tolist()=}  {slot_mapping[:10]=}  {slot_mapping[-10:]=}')
@@ -1414,5 +1505,6 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
             self.layer_batch_state.context_lens = context_lens
             self.layer_batch_state.max_context_len = int(real_context_lens.max()) if real_batch_size > 0 else 0
             self.layer_batch_state.req_indices = req_indices
+            self.validate_decode_cuda_graph_slot_mappings()
 
             return input_ids, positions, None

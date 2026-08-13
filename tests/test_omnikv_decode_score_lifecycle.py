@@ -1,5 +1,5 @@
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -21,6 +21,10 @@ class _Manager:
             max_context_len=self.context_len,
             req_indices=torch.tensor([0], dtype=torch.int32),
         )
+
+    def get_layer_buffer_req_to_token_slots(self, layer_idx):
+        del layer_idx
+        return torch.arange(self.context_len, dtype=torch.int32).reshape(1, -1)
 
 
 def _make_controller():
@@ -125,3 +129,45 @@ def test_omnikv_graph_reset_and_keepalive_cover_the_shared_workspace():
 
     controller.clear_decode_attn_score_buffers()
     assert controller._omnikv_decode_attn_score_buffer is None
+
+
+def test_omnikv_decode_graph_reuses_selection_output_buffers():
+    controller = _make_controller()
+    states = controller.layer_batch_sparse_states
+
+    def fake_build(*args, **kwargs):
+        del args
+        keep = kwargs["keep_indices_out"]
+        slots = kwargs["active_slots_out"]
+        context_lens = kwargs["new_context_lens_out"]
+        keep.copy_(torch.arange(keep.shape[1], dtype=torch.int32).expand_as(keep))
+        slots.copy_(keep)
+        context_lens.fill_(keep.shape[1])
+        return keep, slots, context_lens
+
+    pointers = []
+    with patch(
+        "sparsevllm.engine.sparse_controller.build_omnikv_keep_and_slots",
+        side_effect=fake_build,
+    ):
+        for _ in range(2):
+            states[0].attn_score = torch.arange(6, dtype=torch.float32).reshape(1, 6)
+            controller._update_dynamic_omnikv_indices(0, [1])
+            pointers.append(
+                tuple(
+                    int(tensor.data_ptr())
+                    for tensor in (
+                        states[1].active_indices,
+                        states[1].active_slots,
+                        states[1].context_lens,
+                        states[1].req_indices,
+                    )
+                )
+            )
+
+    assert pointers[0] == pointers[1]
+    keepalive_ptrs = {
+        int(tensor.data_ptr())
+        for tensor in controller.decode_cuda_graph_keepalive_tensors()
+    }
+    assert set(pointers[0]).issubset(keepalive_ptrs)

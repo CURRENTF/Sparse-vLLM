@@ -29,7 +29,7 @@ class _FastTokenizerAdapter:
 class _TransformersResponseTokenizer:
     response_template = None
 
-    def __init__(self, *, xml_tools=False, minimax_tools=False):
+    def __init__(self, *, xml_tools=False, minimax_tools=False, glm_tools=False):
         self.chat_template = "<think><tool_call>"
         if xml_tools:
             self.chat_template += "<function=name><parameter=key>"
@@ -37,6 +37,10 @@ class _TransformersResponseTokenizer:
             self.chat_template = (
                 '<think><minimax:tool_call><invoke name="tool">'
                 '<parameter name="key">'
+            )
+        if glm_tools:
+            self.chat_template = (
+                "<|assistant|><think><tool_call><arg_key><arg_value>"
             )
 
     def parse_response(self, response, schema, *, prefix=None):
@@ -50,13 +54,16 @@ class _TransformersResponseTokenizer:
         return ResponseParser(response_template, prefix=prefix)
 
 
-def _transformers_response_parser(*, xml_tools=False, minimax_tools=False):
+def _transformers_response_parser(
+    *, xml_tools=False, minimax_tools=False, glm_tools=False
+):
     from sparsevllm.entrypoints.openai.serving.response_parsing import TransformersResponseParser
 
     parser = TransformersResponseParser.from_tokenizer(
         _TransformersResponseTokenizer(
             xml_tools=xml_tools,
             minimax_tools=minimax_tools,
+            glm_tools=glm_tools,
         )
     )
     assert parser is not None
@@ -76,12 +83,15 @@ def _byte_level_tokenizer(*, special_tokens=()):
     return _FastTokenizerAdapter(tokenizer)
 
 
-async def _dispatcher_items_for_text(text, *, stop=()):
+async def _dispatcher_items_for_token_ids(
+    tokenizer,
+    token_ids,
+    *,
+    stop=(),
+    incremental=True,
+):
     from sparsevllm.entrypoints.openai.api_server import AsyncEngineDispatcher, _ActiveRequest
     from sparsevllm.entrypoints.openai.detokenizer import IncrementalDetokenizer
-
-    tokenizer = _byte_level_tokenizer()
-    token_ids = tokenizer.encode(text)
 
     class Engine:
         def __init__(self):
@@ -115,15 +125,16 @@ async def _dispatcher_items_for_text(text, *, stop=()):
     }
     items = []
     try:
-        for token_id in token_ids:
-            engine.last_step_token_outputs = [(7, [token_id])]
-            engine.last_step_logprob_outputs = [(7, [None], [None])]
-            dispatcher._publish_token_deltas(active)
-            await asyncio.sleep(0)
-            while not output_queue.empty():
-                items.append(output_queue.get_nowait())
-            if 7 not in active:
-                break
+        if incremental:
+            for token_id in token_ids:
+                engine.last_step_token_outputs = [(7, [token_id])]
+                engine.last_step_logprob_outputs = [(7, [None], [None])]
+                dispatcher._publish_token_deltas(active)
+                await asyncio.sleep(0)
+                while not output_queue.empty():
+                    items.append(output_queue.get_nowait())
+                if 7 not in active:
+                    break
 
         if 7 in active:
             dispatcher._publish_finished(
@@ -136,6 +147,15 @@ async def _dispatcher_items_for_text(text, *, stop=()):
     finally:
         dispatcher.close()
     return items
+
+
+async def _dispatcher_items_for_text(text, *, stop=()):
+    tokenizer = _byte_level_tokenizer()
+    return await _dispatcher_items_for_token_ids(
+        tokenizer,
+        tokenizer.encode(text),
+        stop=stop,
+    )
 
 
 class _TestRequest:
@@ -197,6 +217,12 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
             parser.parse_args(
                 ["--model", "/tmp/model", "--reasoning-parser", "minimax_m2"]
             )
+
+        for alias in ("auto", "glm47"):
+            args = parser.parse_args(
+                ["--model", "/tmp/model", "--response-parser", alias]
+            )
+            self.assertEqual(args.response_parser, alias)
 
     def test_incremental_detokenizer_waits_for_complete_unicode(self):
         from sparsevllm.entrypoints.openai.detokenizer import IncrementalDetokenizer
@@ -2593,6 +2619,7 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
                 completion_top_logprobs=[None],
                 detokenizer=detokenizer,
                 emitted_text_len=1,
+                emitted_raw_text_len=1,
             )
         }
         try:
@@ -2604,6 +2631,150 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item["text"], "b")
         self.assertEqual(item["raw_text_delta"], "b")
         self.assertEqual(active[7].completion_token_ids, token_ids)
+
+    async def test_dispatcher_strips_terminal_eos_from_parser_text(self):
+        from sparsevllm.entrypoints.openai.api_server import AsyncEngineDispatcher, _ActiveRequest
+        from sparsevllm.entrypoints.openai.detokenizer import IncrementalDetokenizer
+
+        tokenizer = _byte_level_tokenizer(special_tokens=["<eos>"])
+        content_token_ids = tokenizer.encode("Paris")
+        eos_token_id = tokenizer._tokenizer.token_to_id("<eos>")
+        completion_token_ids = content_token_ids + [eos_token_id]
+
+        class Engine:
+            def __init__(self):
+                self.tokenizer = tokenizer
+                self.last_step_token_outputs = []
+                self.last_step_logprob_outputs = []
+
+            def exit(self):
+                pass
+
+        engine = Engine()
+        dispatcher = AsyncEngineDispatcher(engine)
+        output_queue = asyncio.Queue()
+        active = {
+            7: _ActiveRequest(
+                index=0,
+                loop=asyncio.get_running_loop(),
+                output_queue=output_queue,
+                prompt_token_ids=[10],
+                max_tokens=len(completion_token_ids),
+                stop=[],
+                completion_token_ids=[],
+                completion_token_logprobs=[],
+                completion_top_logprobs=[],
+                detokenizer=IncrementalDetokenizer(tokenizer),
+                eos_token_ids=frozenset({eos_token_id}),
+            )
+        }
+        try:
+            engine.last_step_token_outputs = [(7, content_token_ids)]
+            engine.last_step_logprob_outputs = [
+                (
+                    7,
+                    [None] * len(content_token_ids),
+                    [None] * len(content_token_ids),
+                )
+            ]
+            dispatcher._publish_token_deltas(active)
+            token_item = await asyncio.wait_for(output_queue.get(), timeout=1)
+
+            engine.last_step_token_outputs = [(7, [eos_token_id])]
+            engine.last_step_logprob_outputs = [(7, [None], [None])]
+            dispatcher._publish_token_deltas(active)
+            self.assertTrue(output_queue.empty())
+
+            dispatcher._publish_finished(
+                active,
+                [
+                    (
+                        7,
+                        completion_token_ids,
+                        [None] * len(completion_token_ids),
+                        [None] * len(completion_token_ids),
+                    )
+                ],
+            )
+            final_item = await asyncio.wait_for(output_queue.get(), timeout=1)
+        finally:
+            dispatcher.close()
+
+        self.assertEqual(token_item["raw_text_delta"], "Paris")
+        self.assertEqual(final_item["raw_text"], "Paris")
+        self.assertEqual(final_item["finish_reason"], "stop")
+        self.assertEqual(final_item["token_ids"], completion_token_ids)
+        self.assertEqual(
+            final_item["completion_tokens"],
+            len(completion_token_ids),
+        )
+
+    async def test_dispatcher_preserves_eos_when_ignored(self):
+        from sparsevllm.entrypoints.openai.api_server import AsyncEngineDispatcher, _ActiveRequest
+        from sparsevllm.entrypoints.openai.detokenizer import IncrementalDetokenizer
+
+        tokenizer = _byte_level_tokenizer(special_tokens=["<eos>"])
+        content_token_ids = tokenizer.encode("Paris")
+        eos_token_id = tokenizer._tokenizer.token_to_id("<eos>")
+        completion_token_ids = content_token_ids + [eos_token_id]
+
+        class Engine:
+            def __init__(self):
+                self.tokenizer = tokenizer
+                self.last_step_token_outputs = [
+                    (7, completion_token_ids)
+                ]
+                self.last_step_logprob_outputs = [
+                    (
+                        7,
+                        [None] * len(completion_token_ids),
+                        [None] * len(completion_token_ids),
+                    )
+                ]
+
+            def exit(self):
+                pass
+
+        engine = Engine()
+        dispatcher = AsyncEngineDispatcher(engine)
+        output_queue = asyncio.Queue()
+        active = {
+            7: _ActiveRequest(
+                index=0,
+                loop=asyncio.get_running_loop(),
+                output_queue=output_queue,
+                prompt_token_ids=[10],
+                max_tokens=len(completion_token_ids),
+                stop=[],
+                completion_token_ids=[],
+                completion_token_logprobs=[],
+                completion_top_logprobs=[],
+                detokenizer=IncrementalDetokenizer(tokenizer),
+                eos_token_ids=frozenset({eos_token_id}),
+                ignore_eos=True,
+            )
+        }
+        try:
+            dispatcher._publish_token_deltas(active)
+            token_item = await asyncio.wait_for(output_queue.get(), timeout=1)
+            dispatcher._publish_finished(
+                active,
+                [
+                    (
+                        7,
+                        completion_token_ids,
+                        [None] * len(completion_token_ids),
+                        [None] * len(completion_token_ids),
+                    )
+                ],
+            )
+            final_item = await asyncio.wait_for(output_queue.get(), timeout=1)
+        finally:
+            dispatcher.close()
+
+        self.assertEqual(token_item["raw_text_delta"], "Paris<eos>")
+        self.assertEqual(final_item["raw_text"], "Paris<eos>")
+        self.assertEqual(final_item["finish_reason"], "length")
 
     async def test_dispatcher_streams_complete_unicode_with_pending_logprobs(self):
         from sparsevllm.entrypoints.openai.api_server import AsyncEngineDispatcher, _ActiveRequest
@@ -3110,6 +3281,7 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
             dispatcher._publish_token_deltas(active)
             token_item = await asyncio.wait_for(output_queue.get(), timeout=1)
             self.assertEqual(token_item["text"], "a")
+            self.assertEqual(token_item["raw_text_delta"], "a")
             engine.last_step_token_outputs = [(7, token_ids[2:])]
             engine.last_step_logprob_outputs = [
                 (7, [None] * len(token_ids[2:]), [None] * len(token_ids[2:]))
@@ -3121,8 +3293,56 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(final_item["type"], "final")
         self.assertEqual(final_item["text"], "a")
+        self.assertEqual(final_item["raw_text"], "a")
         self.assertEqual(final_item["text_delta"], "")
         self.assertEqual(engine.aborted, [7])
+
+    async def test_dispatcher_maps_visible_stop_across_special_tokens(self):
+        tokenizer = _byte_level_tokenizer(
+            special_tokens=["<special>"],
+        )
+        special_token_id = tokenizer._tokenizer.token_to_id("<special>")
+        cases = [
+            (
+                [special_token_id] + tokenizer.encode("special"),
+                "special",
+                "",
+                "<special>",
+            ),
+            (
+                tokenizer.encode("okST")
+                + [special_token_id]
+                + tokenizer.encode("OP"),
+                "STOP",
+                "ok",
+                "ok",
+            ),
+        ]
+
+        for incremental in (True, False):
+            for token_ids, stop, expected_text, expected_raw in cases:
+                with self.subTest(
+                    incremental=incremental,
+                    stop=stop,
+                ):
+                    items = await _dispatcher_items_for_token_ids(
+                        tokenizer,
+                        token_ids,
+                        stop=[stop],
+                        incremental=incremental,
+                    )
+                    streamed_raw = "".join(
+                        item["raw_text_delta"]
+                        for item in items
+                        if item["type"] == "token"
+                    )
+                    final = next(
+                        item for item in items if item["type"] == "final"
+                    )
+
+                    self.assertEqual(streamed_raw, expected_raw)
+                    self.assertEqual(final["text"], expected_text)
+                    self.assertEqual(final["raw_text"], expected_raw)
 
     async def test_chat_completion_response_shape(self):
         from sparsevllm.entrypoints.openai.api_server import RequestHandle, _chat_completion_response
@@ -3531,6 +3751,7 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
 
         final = next(item for item in items if item["type"] == "final")
         self.assertEqual(final["text"], "answer")
+        self.assertEqual(final["raw_text"], "answer")
         self.assertEqual(final["chain_status"], "invalidated")
         self.assertEqual(engine.aborted, [(7, "invalidate")])
 
@@ -3626,6 +3847,12 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
             prefilled_tokens = 1
 
         class Engine:
+            config = type(
+                "Config",
+                (),
+                {"eos_token_ids": (41, 42), "eos": -1},
+            )()
+
             def __init__(self):
                 self.tokenizer = tokenizer
 
@@ -3660,6 +3887,7 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
 
         dispatcher._admit(item, active)
         await asyncio.wait_for(future, timeout=1)
+        self.assertEqual(active[7].eos_token_ids, frozenset({41, 42}))
         dispatcher._publish_finished(active, [(7, [], [], [])])
         final = await asyncio.wait_for(output_queue.get(), timeout=1)
 
@@ -5469,6 +5697,94 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
             "name": "bash",
             "arguments": '{"command":"pwd"}',
         })
+
+    def test_glm_response_parser_handles_thinking_and_plain_content(self):
+        parser = _transformers_response_parser(glm_tools=True)
+
+        parsed = parser.parse(
+            "先分析🙂</think>最终答案<|endoftext|>",
+            prefix="[gMASK]<sop><|assistant|><think>",
+            parse_tools=False,
+        )
+        nonthinking = parser.parse(
+            "直接回答<|endoftext|>",
+            prefix="[gMASK]<sop><|assistant|></think>",
+            parse_tools=False,
+        )
+
+        self.assertEqual(parsed.reasoning_content, "先分析🙂")
+        self.assertEqual(parsed.content, "最终答案")
+        self.assertEqual(nonthinking.reasoning_content, None)
+        self.assertEqual(nonthinking.content, "直接回答")
+
+    def test_glm_response_parser_handles_parallel_tool_calls(self):
+        parsed = _transformers_response_parser(glm_tools=True).parse(
+            "分析</think>"
+            "<tool_call>天气查询"
+            "<arg_key>城市</arg_key><arg_value>北京</arg_value>"
+            "<arg_key>天数</arg_key><arg_value>2</arg_value>"
+            "</tool_call>"
+            "<tool_call>echo"
+            "<arg_key>text</arg_key><arg_value>你好🙂</arg_value>"
+            "</tool_call><|endoftext|>",
+            prefix="[gMASK]<sop><|assistant|><think>",
+            parse_tools=True,
+        )
+
+        self.assertEqual(parsed.reasoning_content, "分析")
+        self.assertEqual(parsed.content, "")
+        self.assertEqual(
+            [call["function"]["name"] for call in parsed.tool_calls],
+            ["天气查询", "echo"],
+        )
+        self.assertEqual(
+            parsed.tool_calls[0]["function"]["arguments"],
+            '{"城市":"北京","天数":2}',
+        )
+        self.assertEqual(
+            parsed.tool_calls[1]["function"]["arguments"],
+            '{"text":"你好🙂"}',
+        )
+
+    def test_glm_response_stream_parser_handles_split_tags(self):
+        parser = _transformers_response_parser(glm_tools=True).stream(
+            prefix="[gMASK]<sop><|assistant|><think>",
+            parse_tools=True,
+        )
+        deltas = []
+        for chunk in [
+            "推",
+            "理</thi",
+            "nk>答",
+            "案<tool_",
+            "call>天气<arg_key>城市</arg_key><arg_value>北",
+            "京</arg_value></tool_",
+            "call><|endoftext|>",
+        ]:
+            deltas.extend(parser.feed(chunk))
+        deltas.extend(parser.finish())
+
+        reasoning = "".join(
+            delta.get("reasoning_content", "") for delta in deltas
+        )
+        content = "".join(delta.get("content", "") for delta in deltas)
+        calls = [delta["tool_calls"][0] for delta in deltas if "tool_calls" in delta]
+        self.assertEqual(reasoning, "推理")
+        self.assertEqual(content, "答案")
+        self.assertEqual(calls[0]["function"]["name"], "天气")
+        self.assertEqual(calls[0]["function"]["arguments"], '{"城市":"北京"}')
+
+    def test_glm_response_parser_rejects_empty_tool_name(self):
+        from sparsevllm.entrypoints.openai.serving.response_parsing import (
+            ResponseParseError,
+        )
+
+        with self.assertRaisesRegex(ResponseParseError, "non-empty function name"):
+            _transformers_response_parser(glm_tools=True).parse(
+                "</think><tool_call></tool_call>",
+                prefix="[gMASK]<sop><|assistant|><think>",
+                parse_tools=True,
+            )
 
     def test_minimax_tool_calls_parse_reasoning_and_parallel_invokes(self):
         from sparsevllm.entrypoints.openai.api_server import _response_output_items

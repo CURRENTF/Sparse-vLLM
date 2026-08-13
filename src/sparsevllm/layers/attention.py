@@ -3,7 +3,10 @@ import os
 import torch
 from torch import nn
 
+from sparsevllm.engine.cache_manager import ExplicitKVPayload
 from sparsevllm.layers.attention_backend import TritonAttentionBackend
+from sparsevllm.operators.decode_attention import PreparedDecodeAttentionLaunchOp
+from sparsevllm.operators.prefill_attention import PreparedPrefillAttentionOp
 from sparsevllm.utils.context import get_context
 
 from sparsevllm.engine.sparse_controller import SparseController
@@ -56,6 +59,9 @@ class Attention(nn.Module):
         head_dim,
         scale,
         num_kv_heads,
+        *,
+        prefill_op: PreparedPrefillAttentionOp | None = None,
+        decode_launch_op: PreparedDecodeAttentionLaunchOp | None = None,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -63,6 +69,8 @@ class Attention(nn.Module):
         self.scale = scale
         self.num_kv_heads = num_kv_heads
         self.attention_backend = TritonAttentionBackend()
+        self.prefill_op = prefill_op
+        self.decode_launch_op = decode_launch_op
 
     def forward(
         self,
@@ -86,28 +94,57 @@ class Attention(nn.Module):
                     v,
                     selection,
                 )
-                temp_slots = prefill_view.temp_slots
+                if not isinstance(prefill_view.payload, ExplicitKVPayload):
+                    raise TypeError(
+                        "Attention prefill requires ExplicitKVPayload, got "
+                        f"{type(prefill_view.payload).__name__}."
+                    )
+                prefill_meta = prefill_view.meta
+                temp_slots = prefill_meta.temp_slots
 
                 if context.cu_seqlens_q is None or context.cu_seqlens_q.numel() <= 1:
                     return torch.empty_like(q)
 
                 b_start_loc = context.cu_seqlens_q[:-1]
                 chunk_lens = context.cu_seqlens_q[1:] - context.cu_seqlens_q[:-1]
-                max_context_len = prefill_view.max_context_len
+                max_context_len = prefill_meta.max_context_len
                 if max_context_len is not None:
                     max_input_len = int(max_context_len)
                 elif torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
-                    max_input_len = int(prefill_view.active_slots.shape[1])
+                    max_input_len = int(prefill_meta.active_slots.shape[1])
                 else:
-                    max_input_len = prefill_view.context_lens.max().item()
+                    max_input_len = prefill_meta.context_lens.max().item()
 
-                o = self.attention_backend.run_prefill(
+                fake_output = self.attention_backend.maybe_run_fake_prefill(
                     q,
                     prefill_view,
-                    b_start_loc=b_start_loc,
                     chunk_lens=chunk_lens,
                     max_input_len=max_input_len,
                 )
+                if fake_output is not None:
+                    o = fake_output
+                elif self.prefill_op is None:
+                    o = self.attention_backend.run_prefill(
+                        q,
+                        prefill_view,
+                        b_start_loc=b_start_loc,
+                        chunk_lens=chunk_lens,
+                        max_input_len=max_input_len,
+                    )
+                else:
+                    self.attention_backend.debug_check_prefill_bounds(
+                        q,
+                        prefill_view,
+                        chunk_lens=chunk_lens,
+                    )
+                    o = self.prefill_op.run(
+                        q,
+                        prefill_view,
+                        qo_indptr=context.cu_seqlens_q,
+                        chunk_lens=chunk_lens,
+                        max_context_len=max_input_len,
+                        layer_idx=int(layer_idx),
+                    )
                 cache_manager.collect_prefill_attention_score(
                     layer_idx,
                     q,
@@ -135,9 +172,15 @@ class Attention(nn.Module):
                     num_heads=self.num_heads,
                     num_kv_heads=self.num_kv_heads,
                 )
-                temp_slots = decode_view.temp_slots
+                if not isinstance(decode_view.payload, ExplicitKVPayload):
+                    raise TypeError(
+                        "Attention decode requires ExplicitKVPayload, got "
+                        f"{type(decode_view.payload).__name__}."
+                    )
+                decode_meta = decode_view.meta
+                temp_slots = decode_meta.temp_slots
 
-                max_context_len = decode_view.max_context_len
+                max_context_len = decode_meta.max_context_len
                 static_cap = getattr(cache_manager, "_decode_static_max_context_len", None)
                 if static_cap is not None:
                     max_context_len = max(
@@ -147,13 +190,17 @@ class Attention(nn.Module):
                 if max_context_len is None:
                     raise RuntimeError(f"static decode requires max_context_len, got None at layer={layer_idx}")
                 max_len_in_batch = int(max_context_len)
-                if decode_view.active_slots.dim() == 2:
-                    slot_table_len = int(decode_view.active_slots.shape[1])
+                if decode_meta.active_slots.dim() == 2:
+                    slot_table_len = int(decode_meta.active_slots.shape[1])
                     if (
                         os.environ.get("SVLLM_DEBUG_DECODE_BOUNDS", "0") == "1"
                         and not (torch.cuda.is_available() and torch.cuda.is_current_stream_capturing())
                     ):
-                        actual_max_len = int(decode_view.context_lens.max().item()) if decode_view.context_lens.numel() > 0 else 0
+                        actual_max_len = (
+                            int(decode_meta.context_lens.max().item())
+                            if decode_meta.context_lens.numel() > 0
+                            else 0
+                        )
                         if actual_max_len > slot_table_len:
                             raise RuntimeError(
                                 "decode context length exceeds active slot table width: "
@@ -167,6 +214,16 @@ class Attention(nn.Module):
                             f"decode requires a positive context length, got {max_len_in_batch} at layer={layer_idx}"
                         )
                 BLOCK_SEQ = cache_manager.get_decode_block_seq(layer_idx, 256)
+                if self.decode_launch_op is None:
+                    gqa_block_n, gqa_num_warps = 16, 2
+                else:
+                    BLOCK_SEQ, gqa_block_n, gqa_num_warps = (
+                        self.decode_launch_op.launch_config(
+                            block_seq=BLOCK_SEQ,
+                            max_context_len=max_len_in_batch,
+                            requires_attention_scores=decode_meta.attn_score is not None,
+                        )
+                    )
                 num_seq_blocks = (max_len_in_batch + BLOCK_SEQ - 1) // BLOCK_SEQ
 
                 mid_o, mid_o_logexpsum = get_decode_workspace(
@@ -187,6 +244,8 @@ class Attention(nn.Module):
                     block_seq=BLOCK_SEQ,
                     num_heads=self.num_heads,
                     num_kv_heads=self.num_kv_heads,
+                    gqa_block_n=gqa_block_n,
+                    gqa_num_warps=gqa_num_warps,
                 )
                 cache_manager.record_decode_query(layer_idx, q)
 

@@ -4,11 +4,18 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+import numpy as np
 import torch
 
 from sparsevllm.config import Config, RuntimeLayout
-from sparsevllm.engine.cache_manager.base import LayerBatchStates
+from sparsevllm.engine.cache_manager.base import (
+    AttentionViewMeta,
+    ExplicitKVPayload,
+    LayerBatchStates,
+    PrefillComputeView,
+)
 from sparsevllm.engine.cache_manager.rkv import RKVCacheManager
+from sparsevllm.engine.cache_manager.storage import MlaLatentStorage
 from sparsevllm.engine.cache_manager.skipkv import (
     SkipKVCacheManager,
     SkipKVSentence,
@@ -16,6 +23,10 @@ from sparsevllm.engine.cache_manager.skipkv import (
 )
 from sparsevllm.engine.activation_controller import ActivationController
 from sparsevllm.engine.sequence import Sequence
+from sparsevllm.engine.sparse_controller import (
+    LayerBatchSparseState,
+    SparseController,
+)
 from sparsevllm.method_registry import (
     get_default_prefill_schedule_policy,
     normalize_sparse_method,
@@ -93,6 +104,19 @@ class RKVSkipKVMethodTest(unittest.TestCase):
 
         expected = 0.25 * importance - 0.75 * redundancy
         self.assertTrue(torch.allclose(score, expected))
+
+    def test_attention_key_materializer_registration_is_idempotent_and_strict(self):
+        manager = object.__new__(RKVCacheManager)
+        manager.runtime_layout = RuntimeLayout.dense(1)
+        first = lambda view: view.payload
+        second = lambda view: view.payload
+
+        manager.register_attention_key_materializer(0, first)
+        manager.register_attention_key_materializer(0, first)
+
+        self.assertTrue(manager.has_attention_key_materializer(0))
+        with self.assertRaisesRegex(RuntimeError, "already bound"):
+            manager.register_attention_key_materializer(0, second)
 
     def test_skipkv_segment_penalty_marks_older_similar_segment(self):
         keys = torch.tensor(
@@ -502,9 +526,16 @@ class RKVSkipKVMethodTest(unittest.TestCase):
         manager._rkv_query_positions = [torch.full((1, 3), -1, dtype=torch.int32)]
 
         q_prefill = torch.arange(10, dtype=torch.float32).view(5, 1, 2)
-        view = SimpleNamespace(
-            req_indices=torch.tensor([0], dtype=torch.int32),
-            context_lens=torch.tensor([5], dtype=torch.int32),
+        view = PrefillComputeView(
+            meta=AttentionViewMeta(
+                active_slots=torch.empty((1, 0), dtype=torch.int32),
+                req_indices=torch.tensor([0], dtype=torch.int32),
+                context_lens=torch.tensor([5], dtype=torch.int32),
+            ),
+            payload=ExplicitKVPayload(
+                k_cache=torch.empty((0, 1, 2)),
+                v_cache=torch.empty((0, 1, 2)),
+            ),
         )
         manager.record_prefill_query(
             0,
@@ -531,6 +562,313 @@ class RKVSkipKVMethodTest(unittest.TestCase):
         self.assertEqual(manager._rkv_query_positions[0][0, cols].tolist(), [3, 4, 5])
         expected = torch.cat((q_prefill[3:5], q_decode), dim=0)
         torch.testing.assert_close(manager._rkv_query_cache[0][0, cols], expected)
+
+    def test_rkv_mla_query_attention_scores_match_expanded_key_oracle(self):
+        torch.manual_seed(37)
+        kv_len = 6
+        observation_tokens = 2
+        num_heads = 2
+        seq = Sequence([1])
+        manager = object.__new__(RKVCacheManager)
+        manager.runtime_layout = RuntimeLayout.dense(1)
+        manager.config = SimpleNamespace(
+            rkv_observation_tokens=observation_tokens,
+            sparse_attn_score_dtype="float32",
+        )
+        manager.device = torch.device("cpu")
+        manager._rkv_query_cache_enabled = True
+        manager._rkv_observation_tokens = observation_tokens
+        manager.seq_id_to_row = [{seq.seq_id: 0}]
+        slots = torch.tensor([5, 1, 8, 3, 7, 2], dtype=torch.int32)
+        manager.buffer_req_to_token_slots = [slots.view(1, kv_len)]
+        storage = MlaLatentStorage(
+            kv_lora_rank=512,
+            rope_dim=64,
+            dtype=torch.bfloat16,
+        )
+        storage.allocate(num_layers=1, num_slots=10, device=torch.device("cpu"))
+        manager.attention_cache_storage = storage
+        payload = storage.layer_payload(0)
+        payload.latent_cache.copy_(
+            torch.randn_like(payload.latent_cache)
+        )
+        payload.rope_cache.copy_(torch.randn_like(payload.rope_cache))
+        k_weight = torch.randn(
+            num_heads,
+            192,
+            512,
+            dtype=torch.bfloat16,
+        )
+
+        def materialize(view):
+            flat_slots = view.active_slots.long().reshape(-1)
+            latent = view.payload.latent_cache[flat_slots, 0]
+            rope = view.payload.rope_cache[flat_slots, 0]
+            k_nope = torch.einsum(
+                "cr,hdr->chd",
+                latent.float(),
+                k_weight.float(),
+            ).to(torch.bfloat16)
+            keys = torch.cat(
+                (k_nope, rope[:, None, :].expand(-1, num_heads, -1)),
+                dim=-1,
+            )
+            return keys.view(*view.active_slots.shape, num_heads, 256)
+
+        manager.register_attention_key_materializer(0, materialize)
+        manager._rkv_query_cache = [
+            torch.empty(
+                (1, observation_tokens, num_heads, 256),
+                dtype=torch.bfloat16,
+            )
+        ]
+        manager._rkv_query_positions = [
+            torch.full((1, observation_tokens), -1, dtype=torch.int32)
+        ]
+        query_positions = torch.tensor([4, 5], dtype=torch.long)
+        query_cols = query_positions.remainder(observation_tokens)
+        q_window = torch.randn(
+            observation_tokens,
+            num_heads,
+            256,
+            dtype=torch.bfloat16,
+        )
+        manager._rkv_query_cache[0][0, query_cols] = q_window
+        manager._rkv_query_positions[0][0, query_cols] = query_positions.to(
+            torch.int32
+        )
+
+        scores = manager.rkv_query_attention_scores(
+            0,
+            seq,
+            kv_len,
+            candidate_start=1,
+            num_recent_tokens=1,
+        )
+
+        candidate_positions = torch.arange(1, 5, dtype=torch.long)
+        candidate_slots = slots.index_select(0, candidate_positions).long()
+        latent = payload.latent_cache[candidate_slots, 0]
+        rope = payload.rope_cache[candidate_slots, 0]
+        k_nope = torch.einsum(
+            "cr,hdr->chd",
+            latent.float(),
+            k_weight.float(),
+        ).to(torch.bfloat16).float()
+        expanded_keys = torch.cat(
+            (k_nope, rope.float()[:, None, :].expand(-1, num_heads, -1)),
+            dim=-1,
+        )
+        logits = torch.einsum(
+            "qhd,chd->qhc",
+            q_window.float(),
+            expanded_keys,
+        )
+        logits.mul_(256**-0.5)
+        valid = candidate_positions.unsqueeze(0) <= query_positions.unsqueeze(1)
+        logits.masked_fill_(~valid[:, None, :], torch.finfo(logits.dtype).min)
+        expected = torch.zeros((kv_len,), dtype=torch.float32)
+        expected[1:5] = (
+            torch.softmax(logits, dim=-1)
+            .masked_fill(~valid[:, None, :], 0.0)
+            .mean(dim=0)
+            .amax(dim=0)
+        )
+        torch.testing.assert_close(scores, expected, rtol=1e-4, atol=1e-4)
+
+    def test_rkv_mla_redundancy_uses_actual_expanded_keys(self):
+        manager = object.__new__(RKVCacheManager)
+        manager.runtime_layout = RuntimeLayout.dense(1)
+        manager.config = SimpleNamespace(
+            num_sink_tokens=1,
+            num_recent_tokens=1,
+            rkv_redundancy_window=0,
+            rkv_similarity_threshold=0.0,
+            rkv_recent_similar_keep=0,
+            rkv_max_redundancy_tokens=8,
+            rkv_alpha=0.5,
+        )
+        seq = Sequence([1])
+        manager.seq_id_to_row = [{seq.seq_id: 0}]
+        manager.buffer_req_to_token_slots = [
+            torch.arange(6, dtype=torch.int32).view(1, 6)
+        ]
+        storage = MlaLatentStorage(
+            kv_lora_rank=512,
+            rope_dim=64,
+            dtype=torch.bfloat16,
+        )
+        storage.allocate(num_layers=1, num_slots=6, device=torch.device("cpu"))
+        manager.attention_cache_storage = storage
+        payload = storage.layer_payload(0)
+        for slot in range(6):
+            payload.latent_cache[slot].fill_(slot)
+            payload.rope_cache[slot].fill_(slot + 100)
+        num_heads = 2
+        k_weight = torch.arange(
+            num_heads * 192 * 512,
+            dtype=torch.float32,
+        ).remainder(17).sub_(8).mul_(1.0e-4).view(num_heads, 192, 512)
+
+        def materialize(view):
+            flat_slots = view.active_slots.long().reshape(-1)
+            latent = view.payload.latent_cache[flat_slots, 0]
+            rope = view.payload.rope_cache[flat_slots, 0]
+            k_nope = torch.einsum(
+                "cr,hdr->chd",
+                latent.float(),
+                k_weight,
+            ).to(torch.bfloat16)
+            keys = torch.cat(
+                (k_nope, rope[:, None, :].expand(-1, num_heads, -1)),
+                dim=-1,
+            )
+            return keys.view(*view.active_slots.shape, num_heads, 256)
+
+        manager.register_attention_key_materializer(0, materialize)
+        captured = []
+
+        def fake_redundancy(keys, **kwargs):
+            del kwargs
+            captured.append(keys.clone())
+            return torch.zeros((keys.shape[0],), dtype=torch.float32)
+
+        with patch.object(
+            manager,
+            "redundancy_scores_from_keys",
+            side_effect=fake_redundancy,
+        ):
+            manager.select_rkv_indices(
+                0,
+                seq,
+                torch.arange(6, dtype=torch.float32),
+                kv_len=6,
+                budget=4,
+            )
+
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(tuple(captured[0].shape), (4, num_heads, 256))
+        expected_slots = torch.arange(1, 5, dtype=torch.int32)
+        expected_view = manager.build_attention_key_compute_view(
+            0,
+            expected_slots,
+        )
+        torch.testing.assert_close(captured[0], materialize(expected_view))
+
+    def test_rkv_mla_budget_trigger_compacts_actual_latent_slots(self):
+        row_len = 6
+        storage = MlaLatentStorage(
+            kv_lora_rank=512,
+            rope_dim=64,
+            dtype=torch.bfloat16,
+        )
+        storage.allocate(num_layers=1, num_slots=8, device=torch.device("cpu"))
+        manager = object.__new__(RKVCacheManager)
+        manager.attention_cache_storage = storage
+        manager.kv_cache = None
+        manager.device = torch.device("cpu")
+        manager.runtime_layout = RuntimeLayout.dense(1)
+        manager.num_layers = 1
+        manager.num_kv_layers = 1
+        manager._uniform_decode_metadata = True
+        manager.buffer_req_to_token_slots_tensor = torch.zeros(
+            (1, 1, 8),
+            dtype=torch.int32,
+        )
+        manager.buffer_req_to_token_slots_tensor[0, 0, :row_len] = torch.arange(
+            row_len,
+            dtype=torch.int32,
+        )
+        manager.buffer_req_to_token_slots = [
+            manager.buffer_req_to_token_slots_tensor[0]
+        ]
+        manager.seq_id_to_row = [{0: 0}]
+        manager.row_seq_lens = [np.asarray([row_len], dtype=np.int32)]
+        manager.free_slots_stack_tensor = None
+        manager.free_slots_stack = [torch.zeros((8,), dtype=torch.int32)]
+        manager._num_free_slots = [0]
+        manager._rkv_query_cache_enabled = True
+        manager._rkv_observation_tokens = 2
+        manager._rkv_batch_clear_query_cache_rows = True
+        manager._rkv_query_cache = [
+            torch.zeros((1, 2, 2, 256), dtype=torch.bfloat16)
+        ]
+        manager._rkv_query_positions = [
+            torch.full((1, 2), -1, dtype=torch.int32)
+        ]
+        query_positions = torch.tensor([4, 5], dtype=torch.long)
+        query_cols = query_positions.remainder(2)
+        manager._rkv_query_cache[0][0, query_cols, :, 0] = 1
+        manager._rkv_query_positions[0][0, query_cols] = query_positions.to(
+            torch.int32
+        )
+        manager.config = SimpleNamespace(
+            num_sink_tokens=1,
+            decode_keep_tokens=2,
+            num_recent_tokens=1,
+            rkv_compression_interval=2,
+            rkv_redundancy_window=4,
+            rkv_similarity_threshold=0.0,
+            rkv_recent_similar_keep=0,
+            rkv_max_redundancy_tokens=8,
+            rkv_alpha=1.0,
+            sparse_attn_score_dtype="float32",
+        )
+
+        payload = storage.layer_payload(0)
+        key_values = torch.tensor([0, -2, 5, 1, 4, 0], dtype=torch.bfloat16)
+        for slot, key_value in enumerate(key_values):
+            payload.latent_cache[slot].zero_()
+            payload.latent_cache[slot, 0, 0] = key_value
+            payload.rope_cache[slot].fill_(slot + 100)
+
+        def materialize(view):
+            flat_slots = view.active_slots.long().reshape(-1)
+            latent = view.payload.latent_cache[flat_slots, 0]
+            rope = view.payload.rope_cache[flat_slots, 0]
+            keys = torch.zeros(
+                (flat_slots.numel(), 2, 256),
+                dtype=torch.bfloat16,
+            )
+            keys[:, :, 0] = latent[:, None, 0]
+            keys[:, :, 192:] = rope[:, None, :]
+            return keys.view(*view.active_slots.shape, 2, 256)
+
+        manager.register_attention_key_materializer(0, materialize)
+        seq = Sequence(list(range(row_len)))
+        seq.seq_id = 0
+        controller = object.__new__(SparseController)
+        controller.cache_manager = manager
+        controller.device = torch.device("cpu")
+        controller.sparse_method = "rkv"
+        controller.num_layers = 1
+        controller.num_sink = 1
+        controller.num_recent = 1
+        controller.decode_keep_tokens = 2
+        controller.config = manager.config
+        controller.layer_batch_sparse_states = {
+            0: LayerBatchSparseState(
+                context_lens=torch.tensor([row_len], dtype=torch.int32)
+            )
+        }
+        controller._is_kv_layer = lambda layer_idx: int(layer_idx) == 0
+
+        controller._rkv_decode_eviction([seq])
+
+        active_slots = manager.buffer_req_to_token_slots[0][0, :4].long()
+        self.assertEqual(active_slots.tolist(), [0, 2, 4, 5])
+        self.assertEqual(manager.row_seq_lens[0].tolist(), [4])
+        self.assertEqual(sorted(manager.free_slots_stack[0][:2].tolist()), [1, 3])
+        self.assertEqual(manager._num_free_slots, [2])
+        torch.testing.assert_close(
+            payload.latent_cache[active_slots, 0, 0],
+            torch.tensor([0, 5, 4, 0], dtype=torch.bfloat16),
+        )
+        torch.testing.assert_close(
+            payload.rope_cache[active_slots, 0, 0],
+            torch.tensor([100, 102, 104, 105], dtype=torch.bfloat16),
+        )
+        self.assertEqual(manager._rkv_query_positions[0][0].tolist(), [-1, -1])
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for R-KV query score kernel tests.")
     def test_rkv_query_attention_scores_reuse_prefill_score_kernel(self):
@@ -598,6 +936,32 @@ class RKVSkipKVMethodTest(unittest.TestCase):
             num_recent_tokens,
         )[0, :kv_len]
         torch.testing.assert_close(scores, expected, rtol=2e-2, atol=2e-2)
+
+        candidate_positions = torch.arange(
+            candidate_start,
+            kv_len - num_recent_tokens,
+            dtype=torch.long,
+            device=device,
+        )
+        candidate_slots = manager.buffer_req_to_token_slots[0][
+            0,
+            candidate_start : kv_len - num_recent_tokens,
+        ].long()
+        materialized = torch.zeros_like(scores)
+        materialized[candidate_start : kv_len - num_recent_tokens] = (
+            RKVCacheManager.attention_scores_from_materialized_keys(
+                q_window,
+                k_cache.index_select(0, candidate_slots),
+                positions,
+                candidate_positions,
+            )
+        )
+        torch.testing.assert_close(
+            materialized,
+            scores,
+            rtol=2e-2,
+            atol=2e-2,
+        )
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for R-KV query score kernel tests.")
     def test_rkv_query_attention_scores_batch_matches_single_path(self):

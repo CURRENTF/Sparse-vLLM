@@ -2,17 +2,18 @@ from __future__ import annotations
 
 import math
 import os
+from dataclasses import replace
 
 import torch
 
 from sparsevllm.engine.sequence import Sequence
-from sparsevllm.triton_kernel.quant import (
+from sparsevllm.kernels.triton.quant import (
     triton_dequantize_2d_int4_grouped,
     triton_quantize_and_pack_2d_int4_grouped,
     triton_quantize_and_pack_along_last_dim,
     unpack_quantized_to_16bit,
 )
-from sparsevllm.triton_kernel.deltakv_kernels import deltakv_materialize_sparse_view
+from sparsevllm.kernels.triton.deltakv_kernels import deltakv_materialize_sparse_view
 from sparsevllm.layers.rotary_embedding import apply_rotary_emb
 from sparsevllm.platforms import device_runtime
 from sparsevllm.utils.compressor import create_compressor
@@ -20,7 +21,12 @@ from sparsevllm.utils.context import get_context
 from sparsevllm.utils.log import logger
 from sparsevllm.utils.profiler import profiler
 
-from .base import DecodeComputeView, SparseSelection
+from .base import (
+    AttentionViewMeta,
+    DecodeComputeView,
+    ExplicitKVPayload,
+    SparseSelection,
+)
 from .deltakv_base import DeltaKVCacheTritonManagerV4
 
 
@@ -2808,7 +2814,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         v_cache: torch.Tensor,
         l_idx: int | None = None,
     ):
-        from sparsevllm.triton_kernel.deltakv_kernels import deltakv_reconstruct_writeback_grouped_heads
+        from sparsevllm.kernels.triton.deltakv_kernels import deltakv_reconstruct_writeback_grouped_heads
 
         hp = int(getattr(self.config, "deltakv_triton_reconstruct_heads_per_program", 4) or 1)
         hp = max(1, min(hp, int(self.num_kv_heads)))
@@ -2905,7 +2911,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         buffers = self._ensure_decode_static_plan_buffers(bsz, k_max, max_s, req_indices.device)
         active_slots, active_pos, local_req, new_context_lens, no_free_temp_slots, recon_pos, recon_latent, recon_out_slot = buffers
 
-        from sparsevllm.triton_kernel.deltakv_kernels import deltakv_static_decode_plan
+        from sparsevllm.kernels.triton.deltakv_kernels import deltakv_static_decode_plan
 
         deltakv_static_decode_plan(
             raw_slots_map=self.sparse_layer_raw_slots_map,
@@ -2947,28 +2953,32 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
             if self.full_layer_kivi_key_packed is None or self.full_layer_kivi_value_packed is None:
                 raise RuntimeError("Full-layer KIVI decode was requested before KIVI storage was initialized.")
             return DecodeComputeView(
-                k_cache=self.full_kv_cache[0, l_idx],
-                v_cache=self.full_kv_cache[1, l_idx],
-                active_slots=self.full_layer_slots_map,
-                req_indices=selection.req_indices,
-                context_lens=selection.context_lens,
-                attn_score=selection.attn_score,
-                max_context_len=selection.max_context_len,
-                backend="full_layer_kivi",
-                metadata={
-                    "kivi_block_slots_map": self.full_layer_kivi_block_slots_map,
-                    "kivi_block_start_pos": self.full_layer_kivi_block_start_pos,
-                    "key_packed": self.full_layer_kivi_key_packed[l_idx],
-                    "key_scales": self.full_layer_kivi_key_scales[l_idx],
-                    "key_mins": self.full_layer_kivi_key_mins[l_idx],
-                    "value_packed": self.full_layer_kivi_value_packed[l_idx],
-                    "value_scales": self.full_layer_kivi_value_scales[l_idx],
-                    "value_mins": self.full_layer_kivi_value_mins[l_idx],
-                    "group_size": self._full_layer_kivi_group_size(),
-                    "block_n": int(getattr(self.config, "full_layer_kivi_decode_block_n", 16) or 16),
-                    "num_warps": int(getattr(self.config, "full_layer_kivi_decode_num_warps", 2) or 2),
-                    "num_stages": int(getattr(self.config, "full_layer_kivi_decode_num_stages", 3) or 3),
-                },
+                meta=AttentionViewMeta(
+                    active_slots=self.full_layer_slots_map,
+                    req_indices=selection.req_indices,
+                    context_lens=selection.context_lens,
+                    attn_score=selection.attn_score,
+                    max_context_len=selection.max_context_len,
+                ),
+                payload=ExplicitKVPayload(
+                    k_cache=self.full_kv_cache[0, l_idx],
+                    v_cache=self.full_kv_cache[1, l_idx],
+                    backend="full_layer_kivi",
+                    metadata={
+                        "kivi_block_slots_map": self.full_layer_kivi_block_slots_map,
+                        "kivi_block_start_pos": self.full_layer_kivi_block_start_pos,
+                        "key_packed": self.full_layer_kivi_key_packed[l_idx],
+                        "key_scales": self.full_layer_kivi_key_scales[l_idx],
+                        "key_mins": self.full_layer_kivi_key_mins[l_idx],
+                        "value_packed": self.full_layer_kivi_value_packed[l_idx],
+                        "value_scales": self.full_layer_kivi_value_scales[l_idx],
+                        "value_mins": self.full_layer_kivi_value_mins[l_idx],
+                        "group_size": self._full_layer_kivi_group_size(),
+                        "block_n": int(getattr(self.config, "full_layer_kivi_decode_block_n", 16) or 16),
+                        "num_warps": int(getattr(self.config, "full_layer_kivi_decode_num_warps", 2) or 2),
+                        "num_stages": int(getattr(self.config, "full_layer_kivi_decode_num_stages", 3) or 3),
+                    },
+                ),
             )
         view = super().build_decode_compute_view(
             layer_idx,
@@ -2982,7 +2992,18 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
             and not self.has_prefill_staging_view(layer_idx)
             and getattr(self.config, "deltakv_sparse_decode_backend", "custom") == "fa2"
         ):
-            view.backend = "flash_attn_contiguous"
+            if not isinstance(view.payload, ExplicitKVPayload):
+                raise TypeError(
+                    "DeltaKV FA2 decode requires ExplicitKVPayload, got "
+                    f"{type(view.payload).__name__}."
+                )
+            view = replace(
+                view,
+                payload=replace(
+                    view.payload,
+                    backend="flash_attn_contiguous",
+                ),
+            )
         return view
 
     def get_layer_compute_tensors(self, layer_idx: int, selection: SparseSelection | None = None):
@@ -3338,7 +3359,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         flat_raw_slots = raw_slots.reshape(-1)
         total_slots = bsz * max_len
 
-        from sparsevllm.triton_kernel.deltakv_kernels import full_layer_copy_raw_or_zero
+        from sparsevllm.kernels.triton.deltakv_kernels import full_layer_copy_raw_or_zero
 
         full_layer_copy_raw_or_zero(
             raw_k=self.full_kv_cache[0, l_idx],
@@ -3402,7 +3423,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         if ((local_offsets < 0) | (local_offsets >= self._full_layer_kivi_group_size())).any():
             raise RuntimeError("Full-layer KIVI token position is outside its packed block.")
 
-        from sparsevllm.triton_kernel.deltakv_kernels import full_layer_kivi_dequant_tokens
+        from sparsevllm.kernels.triton.deltakv_kernels import full_layer_kivi_dequant_tokens
 
         if out_k is None or out_v is None:
             raise RuntimeError("Full-layer KIVI dequantization requires explicit output buffers.")

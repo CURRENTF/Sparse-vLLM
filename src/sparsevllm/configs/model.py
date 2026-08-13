@@ -108,6 +108,9 @@ def load_and_validate_model(config) -> None:
         config.tiny_random_overrides = apply_tiny_random_overrides(
             config.hf_config,
             config.tiny_random_config,
+            validate_standard_head_shape=(
+                model_spec.attention_cache_layout == "explicit_kv"
+            ),
         )
         log_once(
             "TINY RANDOM MODE is enabled: checkpoint weights will not be read and "
@@ -132,6 +135,7 @@ def load_and_validate_model(config) -> None:
             "Tiny random mode does not support quantized model weights."
         )
     setattr(config.hf_config, "quantization_config", config.quantization_config)
+    config.attention_cache_layout = model_spec.attention_cache_layout
     validate_checkpoint(
         model_type,
         outer_config=config.outer_hf_config,

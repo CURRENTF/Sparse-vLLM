@@ -3,10 +3,14 @@ from unittest.mock import patch
 
 import torch
 
-from sparsevllm.engine.cache_manager import DecodeComputeView
+from sparsevllm.engine.cache_manager import (
+    AttentionViewMeta,
+    DecodeComputeView,
+    ExplicitKVPayload,
+)
 from sparsevllm.layers.attention_backend import TritonAttentionBackend
-from sparsevllm.triton_kernel.flash_decoding_stage2 import flash_decode_stage2
-from sparsevllm.triton_kernel.gqa_flash_decoding_stage1 import (
+from sparsevllm.kernels.triton.flash_decoding_stage2 import flash_decode_stage2
+from sparsevllm.kernels.triton.gqa_flash_decoding_stage1 import (
     flash_decode_stage1,
     flash_decode_stage1_with_score,
 )
@@ -20,13 +24,14 @@ class Qwen35Hd256DecodeRoutingTest(unittest.TestCase):
         k_cache = torch.zeros(4, 4, head_dim, dtype=torch.float32)
         v_cache = torch.zeros_like(k_cache)
         return DecodeComputeView(
-            k_cache=k_cache,
-            v_cache=v_cache,
-            active_slots=active_slots,
-            req_indices=req_indices,
-            context_lens=context_lens,
-            attn_score=attn_score,
-            max_context_len=3,
+            meta=AttentionViewMeta(
+                active_slots=active_slots,
+                req_indices=req_indices,
+                context_lens=context_lens,
+                attn_score=attn_score,
+                max_context_len=3,
+            ),
+            payload=ExplicitKVPayload(k_cache=k_cache, v_cache=v_cache),
         )
 
     def test_head_dim_256_uses_grouped_gqa_stage1_and_unified_stage2(self):
@@ -174,7 +179,7 @@ class Qwen35Hd256DecodeRoutingTest(unittest.TestCase):
         attn_score = torch.empty(1, 24, 3)
 
         with patch(
-            "sparsevllm.triton_kernel.gqa_flash_decoding_stage1._fwd_kernel_flash_decode_stage1"
+            "sparsevllm.kernels.triton.gqa_flash_decoding_stage1._fwd_kernel_flash_decode_stage1"
         ) as kernel:
             flash_decode_stage1(
                 q,
@@ -191,7 +196,7 @@ class Qwen35Hd256DecodeRoutingTest(unittest.TestCase):
             kernel.__getitem__.return_value.assert_called_once()
 
         with patch(
-            "sparsevllm.triton_kernel.gqa_flash_decoding_stage1._fwd_kernel_flash_decode_stage1_with_score"
+            "sparsevllm.kernels.triton.gqa_flash_decoding_stage1._fwd_kernel_flash_decode_stage1_with_score"
         ) as kernel:
             flash_decode_stage1_with_score(
                 q,
@@ -256,7 +261,7 @@ class Qwen35Hd256DecodeRoutingTest(unittest.TestCase):
                 b_seqlen = torch.tensor([257], dtype=torch.int32)
                 output = torch.empty(1, 24, head_dim * 2)[..., ::2]
                 with patch(
-                    "sparsevllm.triton_kernel.flash_decoding_stage2._fwd_kernel_flash_decode_stage2"
+                    "sparsevllm.kernels.triton.flash_decoding_stage2._fwd_kernel_flash_decode_stage2"
                 ) as kernel:
                     flash_decode_stage2(mid_out, mid_lse, b_seqlen, output, 256)
 

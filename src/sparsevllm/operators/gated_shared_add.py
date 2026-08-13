@@ -37,7 +37,7 @@ def gated_shared_add(
     ):
         raise ValueError("gated_shared_add requires contiguous hidden dimensions.")
 
-    from sparsevllm.triton_kernel.qwen3_5.gated_shared_add import (
+    from sparsevllm.kernels.triton.qwen3_5.gated_shared_add import (
         triton_gated_shared_add,
     )
 

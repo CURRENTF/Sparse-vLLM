@@ -1,18 +1,17 @@
 import torch
 from torch import nn
-import torch.nn.functional as F
+
+from sparsevllm.operators.activation import (
+    SiluAndMulProvider,
+    TorchSiluAndMulProvider,
+)
 
 
 class SiluAndMul(nn.Module):
 
-    def __init__(self):
+    def __init__(self, provider: SiluAndMulProvider | None = None):
         super().__init__()
+        self.provider = provider if provider is not None else TorchSiluAndMulProvider()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # In-place activation to reduce peak memory:
-        # x is typically (num_tokens, 2 * intermediate_size) in prefill; allocating an extra
-        # (num_tokens, intermediate_size) output can be multiple GiB at long-context, large-batch.
-        x, y = x.chunk(2, -1)
-        F.silu(x, inplace=True)
-        x.mul_(y)
-        return x
+        return self.provider(x)

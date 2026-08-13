@@ -27,6 +27,7 @@ from datetime import datetime
 
 BASE_PATH = os.getenv("SPARSEVLLM_OUTPUT_DIR", str(REPO_ROOT / "outputs"))
 DATA_PREFIX_PATH = os.getenv("SPARSEVLLM_LONGBENCH_DATA_DIR") or os.getenv("SPARSEVLLM_DATA_DIR")
+DEFAULT_MAX_MODEL_LEN = 121_000
 NO_CHAT_TEMPLATE_DATASETS = {"trec", "triviaqa", "samsum", "lsht", "lcc", "repobench-p"}
 SAMPLE_STATUSES = {
     "success",
@@ -148,10 +149,9 @@ def _artifact_paths(out_root: str) -> dict[str, str]:
     }
 
 
-def _write_decode_cuda_graph_status(
+def _decode_cuda_graph_status(
     *,
     generate_fn,
-    out_root: str,
     rank: int,
 ) -> dict[str, Any]:
     llm = getattr(generate_fn, "_sparsevllm_llm", None)
@@ -181,9 +181,35 @@ def _write_decode_cuda_graph_status(
         "state_count": int(len(graph_states)),
         "graph_count": int(graph_count),
         "active": bool(graph_count > 0),
+        "capture_count": int(getattr(graph_runner, "capture_count", 0)),
+        "replay_count": int(getattr(graph_runner, "replay_count", 0)),
+        "eager_static_count": int(getattr(graph_runner, "eager_static_count", 0)),
+        "force_eager_count": int(getattr(graph_runner, "force_eager_count", 0)),
         "last_state_key": str(getattr(graph_runner, "last_state_key", None)),
         "state_keys": [str(key) for key in graph_states],
     }
+    return graph_status
+
+
+def _write_decode_cuda_graph_status(
+    *,
+    generate_fn,
+    out_root: str,
+    rank: int,
+    before: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    graph_status = _decode_cuda_graph_status(generate_fn=generate_fn, rank=rank)
+    if before is not None:
+        counter_keys = (
+            "capture_count",
+            "replay_count",
+            "eager_static_count",
+            "force_eager_count",
+        )
+        graph_status["before"] = before
+        graph_status["counter_delta"] = {
+            key: int(graph_status[key]) - int(before[key]) for key in counter_keys
+        }
     status_path = os.path.join(
         out_root,
         f"decode_cuda_graph_status_rank{rank}.json",
@@ -493,6 +519,7 @@ def get_pred(rank, data, dataset_info, args, model, tokenizer, model_max_length,
 def worker(rank, world_size, datasets, dataset2prompt, dataset2maxlen, args, out_root, max_length_limit):
     seed_everything(42)
     model, tokenizer, model_max_length, eos_token_ids = load_model_and_tokenizer(rank, args)
+    graph_status_before = _decode_cuda_graph_status(generate_fn=model, rank=rank)
     
     for dataset in datasets:
         data_path = get_longbench_data_path(dataset, args.e)
@@ -584,6 +611,7 @@ def worker(rank, world_size, datasets, dataset2prompt, dataset2maxlen, args, out
         generate_fn=model,
         out_root=out_root,
         rank=rank,
+        before=graph_status_before,
     )
 
 
@@ -668,6 +696,12 @@ def parse_args():
     parser.add_argument("--worker_rank", type=int, default=-1)
     parser.add_argument("--worker_world_size", type=int, default=1)
     parser.add_argument("--output_root", type=str, default=None)
+    parser.add_argument(
+        "--max_model_len",
+        type=int,
+        default=None,
+        help="Runtime context limit (default: 121000).",
+    )
 
     return parser.parse_args()
 
@@ -711,7 +745,9 @@ if __name__ == '__main__':
             with open(os.path.join(out_root, artifact), "w", encoding="utf-8") as f:
                 pass
 
-    max_length_limit = 120_000 + 1000
+    max_length_limit = DEFAULT_MAX_MODEL_LEN if args.max_model_len is None else args.max_model_len
+    if max_length_limit <= 0:
+        raise ValueError(f"--max_model_len must be > 0, got {max_length_limit}.")
     args.max_model_len = max_length_limit
 
     if args.worker_rank < 0:

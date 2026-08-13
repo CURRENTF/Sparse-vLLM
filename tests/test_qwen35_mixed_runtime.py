@@ -907,6 +907,10 @@ def test_model_runner_resets_inherited_allocator_peak_before_model_construction(
         parallel_topology=ParallelTopology(1, 1, 1),
         uses_outer_tp_moe_layout=False,
         mlp_chunk_size=16384,
+        decode_cuda_graph=False,
+        decode_cuda_graph_capture_sizes=None,
+        max_decoding_seqs=64,
+        max_num_seqs_in_batch=32,
         hf_config=SimpleNamespace(model_type="qwen2", torch_dtype=torch.float32),
         model_spec=resolve_model_spec("qwen2"),
     )

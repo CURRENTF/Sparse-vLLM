@@ -1,9 +1,11 @@
+import os
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
 from sparsevllm.engine.cache_manager.base import _debug_tensor_summary
+from sparsevllm.distributed import ParallelContext, ParallelGroup
 from sparsevllm.engine.model_runner import ModelRunner
 from sparsevllm.engine.sparse_controller import LayerBatchSparseState, SparseController
 
@@ -61,13 +63,43 @@ def test_model_runner_gathers_one_debug_summary_per_world_rank():
     runner = object.__new__(ModelRunner)
     runner.world_size = 2
     runner.rank = 0
-    runner.parallel_context = SimpleNamespace(
-        world_rank=0,
-        ep_rank=0,
-        world=SimpleNamespace(process_group=object()),
+    process_group = object()
+    world_group = ParallelGroup(
+        process_group=process_group,
+        ranks=(0, 1),
+        rank=0,
+        size=2,
+    )
+    singleton_group = ParallelGroup(
+        process_group=None,
+        ranks=(0,),
+        rank=0,
+        size=1,
+    )
+    runner.parallel_context = ParallelContext(
+        world=world_group,
+        tensor=singleton_group,
+        expert=world_group,
+        data=singleton_group,
+        moe_tensor=singleton_group,
     )
     runner.sparse_controller = SimpleNamespace(
         debug_state_summary=lambda: {"sparse_method": "", "layers": {}}
+    )
+    runner.config = SimpleNamespace(decode_cuda_graph=True)
+    runner.decode_cuda_graph_runner = SimpleNamespace(
+        capture_count=1,
+        replay_count=3,
+        eager_static_count=0,
+        force_eager_count=0,
+        _graphs={"graph": object()},
+        last_state_key=SimpleNamespace(
+            method="snapkv",
+            batch_size=2,
+            context_capacity=1024,
+            is_long_text=True,
+            capture_sampling=False,
+        ),
     )
 
     def gather(output, local, group):
@@ -82,4 +114,78 @@ def test_model_runner_gathers_one_debug_summary_per_world_rank():
 
     assert [summary["world_rank"] for summary in summaries] == [0, 1]
     assert summaries[0]["state"] == summaries[1]["state"]
+    assert summaries[0]["decode_cuda_graph"] == {
+        "enabled": True,
+        "capture_count": 1,
+        "replay_count": 3,
+        "eager_static_count": 0,
+        "force_eager_count": 0,
+        "cached_graph_count": 1,
+        "last_state_key": {
+            "method": "snapkv",
+            "batch_size": 2,
+            "context_capacity": 1024,
+            "is_long_text": True,
+            "capture_sampling": False,
+        },
+    }
     sync_status.assert_called_once_with("debug_sparse_state_summaries", None)
+
+
+def test_tp_debug_replica_consistency_marks_vocab_sharded_logits_not_applicable():
+    runner = object.__new__(ModelRunner)
+    runner.world_size = 2
+    runner.parallel_context = ParallelContext(
+        world=ParallelGroup(process_group=object(), ranks=(0, 1), rank=1, size=2),
+        tensor=ParallelGroup(process_group=object(), ranks=(0, 1), rank=1, size=2),
+        expert=ParallelGroup(process_group=None, ranks=(1,), rank=0, size=1),
+        data=ParallelGroup(process_group=None, ranks=(1,), rank=0, size=1),
+    )
+    runner.model = SimpleNamespace(model=SimpleNamespace(layers=()))
+
+    consistency = runner.debug_replica_consistency()
+
+    assert consistency == {
+        "last_logits_max_abs": None,
+        "last_logits_tolerance_ratio": None,
+        "last_logits_comparison": "not_applicable_tp_vocab_sharded",
+        "moe_layers": {},
+    }
+
+
+def test_nonzero_rank_debug_logits_rpc_returns_none_before_tensor_access():
+    runner = object.__new__(ModelRunner)
+    runner.rank = 1
+
+    assert runner.debug_last_logits_cpu() is None
+
+
+def test_run_model_does_not_capture_non_tensor_tp_logits():
+    runner = object.__new__(ModelRunner)
+
+    class FakeModel:
+        def __call__(self, input_ids, positions):
+            return torch.ones(1)
+
+        def compute_logits(self, hidden_states):
+            return None
+
+    runner.model = FakeModel()
+    with patch.dict(os.environ, {"SPARSEVLLM_DEBUG_RUNTIME": "1"}):
+        logits = runner.run_model(torch.ones(1), torch.ones(1), is_prefill=False)
+
+    assert logits is None
+    assert not hasattr(runner, "debug_last_logits")
+
+
+def test_debug_logits_can_be_refreshed_after_cuda_graph_replay():
+    runner = object.__new__(ModelRunner)
+    capture_value = torch.tensor([[1.0, 2.0]])
+    replay_value = torch.tensor([[3.0, 4.0]])
+
+    with patch.dict(os.environ, {"SPARSEVLLM_DEBUG_RUNTIME": "1"}):
+        runner._record_debug_logits(capture_value)
+        runner._record_debug_logits(replay_value)
+
+    torch.testing.assert_close(runner.debug_last_logits, replay_value)
+    assert runner.debug_last_logits.data_ptr() != replay_value.data_ptr()

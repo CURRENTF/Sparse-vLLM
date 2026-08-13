@@ -61,7 +61,7 @@ def _prefill_score_baseline(
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for prefill score Triton tests.")
 class PrefillScoreKernelTest(unittest.TestCase):
     def test_prefill_score_matches_torch_for_query_range(self):
-        from sparsevllm.triton_kernel.prefill_score import prefill_score_fwd
+        from sparsevllm.kernels.triton.prefill_score import prefill_score_fwd
 
         torch.manual_seed(7)
         device = "cuda"
@@ -121,7 +121,7 @@ class PrefillScoreKernelTest(unittest.TestCase):
         torch.testing.assert_close(attn_score, expected, rtol=2e-2, atol=2e-2)
 
     def test_prefill_score_handles_offset_query_window(self):
-        from sparsevllm.triton_kernel.prefill_score import prefill_score_fwd
+        from sparsevllm.kernels.triton.prefill_score import prefill_score_fwd
 
         torch.manual_seed(11)
         device = "cuda"
@@ -179,7 +179,7 @@ class PrefillScoreKernelTest(unittest.TestCase):
         torch.testing.assert_close(acc, expected, rtol=2e-2, atol=2e-2)
 
     def test_prefill_score_matches_torch_for_gqa_seven_heads(self):
-        from sparsevllm.triton_kernel.prefill_score import prefill_score_fwd
+        from sparsevllm.kernels.triton.prefill_score import prefill_score_fwd
 
         torch.manual_seed(17)
         device = "cuda"

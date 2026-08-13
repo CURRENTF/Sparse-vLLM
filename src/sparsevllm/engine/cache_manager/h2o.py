@@ -7,12 +7,13 @@ import torch
 import torch.nn.functional as F
 
 from sparsevllm.engine.sequence import Sequence
-from sparsevllm.triton_kernel.prefill_score import prefill_score_fwd
+from sparsevllm.kernels.triton.prefill_score import prefill_score_fwd
 from sparsevllm.utils.context import get_context
 from sparsevllm.utils.profiler import profiler
 
-from .base import PrefillComputeView
+from .base import ExplicitKVPayload, PrefillComputeView
 from .snapkv import SnapKVCacheManager
+from .storage import ExplicitKVStorage
 
 
 class H2OCacheManager(SnapKVCacheManager):
@@ -417,6 +418,8 @@ class H2OCacheManager(SnapKVCacheManager):
                     state.req_indices = layers_req_indices[layer_id]
                 self._decode_static_state_binding_key = binding_key
 
+            self.validate_decode_cuda_graph_slot_mappings()
+
             slot_mapping.copy_(layers_slot_mapping[first_layer])
             context_lens.copy_(layers_context_lens[first_layer])
             req_indices.copy_(layers_req_indices[first_layer])
@@ -754,6 +757,13 @@ class H2OCacheManager(SnapKVCacheManager):
         ranges = self.prefill_score_ranges(layer_idx, seqs)
         if not ranges:
             return None
+        if not isinstance(view.payload, ExplicitKVPayload):
+            raise TypeError(
+                "H2O prefill scoring requires ExplicitKVPayload, got "
+                f"{type(view.payload).__name__}."
+            )
+        meta = view.meta
+        payload = view.payload
 
         score_starts = torch.tensor(
             [item[3] for item in ranges], dtype=torch.int32, device=q.device
@@ -765,31 +775,31 @@ class H2OCacheManager(SnapKVCacheManager):
             [item[4] for item in ranges], dtype=torch.int32, device=q.device
         )
         physical_coordinates_match = (
-            view.context_lens[: len(seqs)] == physical_context_lens
+            meta.context_lens[: len(seqs)] == physical_context_lens
         ).all()
         if physical_coordinates_match.is_cuda:
             torch._assert_async(physical_coordinates_match)
         elif not bool(physical_coordinates_match.item()):
             raise RuntimeError(
                 "H2O prefill score view is not in compressed physical coordinates: "
-                f"layer={layer_idx} view={view.context_lens.tolist()} "
+                f"layer={layer_idx} view={meta.context_lens.tolist()} "
                 f"physical={physical_context_lens.tolist()}."
             )
         max_context_len = max(item[4] for item in ranges)
         step_score = torch.zeros(
             (len(seqs), max_context_len), dtype=torch.float32, device=q.device
         )
-        prompt_cache_lens = view.context_lens - chunk_lens
+        prompt_cache_lens = meta.context_lens - chunk_lens
         prefill_score_fwd(
             q,
-            view.k_cache,
+            payload.k_cache,
             step_score,
-            view.req_indices,
+            meta.req_indices,
             b_start_loc,
-            view.context_lens,
+            meta.context_lens,
             prompt_cache_lens,
             max(int(seq.current_chunk_size) for seq in seqs),
-            view.active_slots,
+            meta.active_slots,
             score_starts,
             score_ends,
             candidate_start=0,
@@ -1117,7 +1127,7 @@ class H2OCacheManager(SnapKVCacheManager):
         """Move final H2O selections into ascending physical destination slots."""
         if not seqs:
             raise RuntimeError("H2O final-prefill dense compaction requires sequences.")
-        self.kv_layer_index(layer_idx)
+        kv_idx = self.kv_layer_index(layer_idx)
         budget = self.h2o_decode_budget
         batch_size = len(seqs)
         keep_indices = keep_indices.to(
@@ -1179,13 +1189,19 @@ class H2OCacheManager(SnapKVCacheManager):
                 f"capacity={int(free_stack.numel())}."
             )
 
-        k_cache, v_cache = self.get_layer_kv_cache(layer_idx)
-        workspace = self._get_final_prefill_workspace(
-            batch_size=batch_size,
-            budget=budget,
-            k_cache=k_cache,
-            v_cache=v_cache,
-        )
+        storage = getattr(self, "attention_cache_storage", None)
+        uses_explicit_kv = storage is None or isinstance(storage, ExplicitKVStorage)
+        if uses_explicit_kv:
+            k_cache, v_cache = self.get_layer_kv_cache(layer_idx)
+            workspace = self._get_final_prefill_workspace(
+                batch_size=batch_size,
+                budget=budget,
+                k_cache=k_cache,
+                v_cache=v_cache,
+            )
+            slot_capacity = int(k_cache.shape[0])
+        else:
+            slot_capacity = storage.slot_capacity()
         rows_gpu = torch.tensor(row_indices, dtype=torch.long, device=self.device)
         old_slots = self.buffer_req_to_token_slots[layer_idx][
             rows_gpu, :kv_len
@@ -1202,9 +1218,9 @@ class H2OCacheManager(SnapKVCacheManager):
                 f"layer={layer_idx}.",
             )
         self._assert_final_prefill_tensor(
-            ((old_slots >= 0) & (old_slots < int(k_cache.shape[0]))).all(),
+            ((old_slots >= 0) & (old_slots < slot_capacity)).all(),
             "H2O final-prefill slot map contains an out-of-range physical slot: "
-            f"layer={layer_idx} num_slots={int(k_cache.shape[0])}.",
+            f"layer={layer_idx} num_slots={slot_capacity}.",
         )
 
         globally_sorted_slots = torch.sort(old_slots.reshape(-1)).values
@@ -1221,42 +1237,44 @@ class H2OCacheManager(SnapKVCacheManager):
         released_slots = sorted_old_slots[:, budget:].reshape(-1).contiguous()
 
         selected_flat = selected_slots.reshape(-1)
-        workspace[0].copy_(
-            k_cache.index_select(0, selected_flat).view(
-                batch_size,
-                budget,
-                int(k_cache.shape[1]),
-                int(k_cache.shape[2]),
-            )
-        )
-        workspace[1].copy_(
-            v_cache.index_select(0, selected_flat).view(
-                batch_size,
-                budget,
-                int(v_cache.shape[1]),
-                int(v_cache.shape[2]),
-            )
-        )
-
         destination_flat = destination_slots.reshape(-1).to(torch.long)
-        k_cache.index_copy_(
-            0,
-            destination_flat,
-            workspace[0].reshape(
-                batch_size * budget,
-                int(k_cache.shape[1]),
-                int(k_cache.shape[2]),
-            ),
-        )
-        v_cache.index_copy_(
-            0,
-            destination_flat,
-            workspace[1].reshape(
-                batch_size * budget,
-                int(v_cache.shape[1]),
-                int(v_cache.shape[2]),
-            ),
-        )
+        if uses_explicit_kv:
+            workspace[0].copy_(
+                k_cache.index_select(0, selected_flat).view(
+                    batch_size,
+                    budget,
+                    int(k_cache.shape[1]),
+                    int(k_cache.shape[2]),
+                )
+            )
+            workspace[1].copy_(
+                v_cache.index_select(0, selected_flat).view(
+                    batch_size,
+                    budget,
+                    int(v_cache.shape[1]),
+                    int(v_cache.shape[2]),
+                )
+            )
+            k_cache.index_copy_(
+                0,
+                destination_flat,
+                workspace[0].reshape(
+                    batch_size * budget,
+                    int(k_cache.shape[1]),
+                    int(k_cache.shape[2]),
+                ),
+            )
+            v_cache.index_copy_(
+                0,
+                destination_flat,
+                workspace[1].reshape(
+                    batch_size * budget,
+                    int(v_cache.shape[1]),
+                    int(v_cache.shape[2]),
+                ),
+            )
+        else:
+            storage.copy_slots(kv_idx, selected_flat, destination_flat)
 
         free_stack[free_ptr : free_ptr + free_count] = released_slots.to(
             dtype=free_stack.dtype,

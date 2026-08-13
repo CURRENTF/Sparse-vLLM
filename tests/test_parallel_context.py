@@ -12,12 +12,14 @@ from sparsevllm.distributed import (
     ParallelGroup,
     ParallelMode,
     ParallelTopology,
-    get_parallel_context,
-    init_parallel_context,
     parallel_group_ranks,
     parallel_ranks_from_world_rank,
-    reset_parallel_context,
     world_rank_from_parallel_ranks,
+)
+from sparsevllm.distributed.parallel_context import (
+    get_parallel_context,
+    init_parallel_context,
+    reset_parallel_context,
 )
 from sparsevllm.engine.cache_manager.base import CacheManager
 from sparsevllm.layers.embed_head import VocabParallelEmbedding
@@ -231,6 +233,28 @@ def test_ep_broadcast_rejects_invalid_source_rank():
         context.ep_broadcast(torch.tensor([1.0]), src_ep_rank=4)
 
 
+@pytest.mark.parametrize("op", [dist.ReduceOp.SUM, dist.ReduceOp.MAX])
+def test_parallel_context_collectives_are_always_in_place_torch_operations(op):
+    world_group = object()
+    context = ParallelContext(
+        world=ParallelGroup(world_group, (0, 1, 2, 3), 0, 4),
+        tensor=ParallelGroup(world_group, (0, 1, 2, 3), 0, 4),
+        expert=ParallelGroup(None, (0,), 0, 1),
+        data=ParallelGroup(None, (0,), 0, 1),
+    )
+    tensor = torch.ones(2, 3072, dtype=torch.bfloat16)
+
+    with patch.object(dist, "all_reduce") as all_reduce:
+        returned = context.world_all_reduce(tensor, op=op)
+
+    assert returned is tensor
+    all_reduce.assert_called_once_with(
+        tensor,
+        op=op,
+        group=world_group,
+    )
+
+
 def test_qwen3_moe_parallel_config_validation(tmp_path):
     with patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", return_value=_hf_config()):
         config = Config(model=str(tmp_path), expert_parallel_size=4)
@@ -388,22 +412,23 @@ def test_dense_layers_use_tp_group_in_replicated_ep_topology():
     assert embedding.weight.shape == (32, 8)
 
 
-def test_parallel_group_uses_bound_all_reduce_provider():
-    provider = Mock()
-    input_tensor, output_tensor = torch.randn(2), torch.randn(2)
-    provider.run.return_value = output_tensor
-    group = ParallelGroup(
-        process_group=None,
-        ranks=(0, 1),
-        rank=0,
-        size=2,
-        all_reduce_provider=provider,
+def test_vocab_parallel_embedding_reduces_results():
+    reduced = torch.randn(2, 4)
+    context = SimpleNamespace(
+        tp_rank=0,
+        tp_size=2,
+        tp_all_reduce=Mock(return_value=reduced),
     )
+    with patch(
+        "sparsevllm.layers.embed_head.get_parallel_context",
+        return_value=context,
+    ):
+        embedding = VocabParallelEmbedding(8, 4)
 
-    actual = ParallelContext._all_reduce(input_tensor, group)
+    output = embedding(torch.tensor([0, 5]))
 
-    assert actual is output_tensor
-    provider.run.assert_called_once_with(input_tensor)
+    assert output is reduced
+    context.tp_all_reduce.assert_called_once()
 
 
 def test_cache_kv_heads_depend_on_tp_not_ep():

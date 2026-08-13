@@ -126,7 +126,7 @@ class H20GateUpSwiGLUProvider(NativeGateUpSwiGLUProvider):
     ) -> torch.Tensor:
         if inputs.shape[0] != 1:
             return super().run(spec, inputs, projection)
-        from sparsevllm.triton_kernel.gate_up_swiglu import h20_gate_up_swiglu
+        from sparsevllm.kernels.triton.gate_up_swiglu import h20_gate_up_swiglu
 
         return h20_gate_up_swiglu(inputs, projection.weight)
 

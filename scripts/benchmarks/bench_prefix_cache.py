@@ -42,6 +42,11 @@ CASE_PRESETS: dict[str, dict[str, Any]] = {
         "enable_prefix_caching": True,
         "label": "QuEST, prefix cache on",
     },
+    "chain_streamingllm": {
+        "method": "streamingllm",
+        "enable_prefix_caching": True,
+        "label": "StreamingLLM, linear chain prefix cache",
+    },
     "chain_snapkv": {
         "method": "snapkv",
         "enable_prefix_caching": True,
@@ -77,6 +82,9 @@ CASE_ALIASES = {
     "prefix_vanilla": "prefix_full",
     "omnikv": "prefix_omnikv",
     "quest": "prefix_quest",
+    "streamingllm": "chain_streamingllm",
+    "attention-sink": "chain_streamingllm",
+    "attention_sink": "chain_streamingllm",
     "snapkv": "chain_snapkv",
     "h2o": "chain_h2o",
     "pyramidkv": "chain_pyramidkv",
@@ -461,6 +469,12 @@ def _case_engine_kwargs(args: argparse.Namespace, case_name: str, max_prompt_len
         "enforce_eager": True,
         "gpu_memory_utilization": float(args.gpu_memory_utilization),
         "tensor_parallel_size": int(args.tensor_parallel_size),
+        "expert_parallel_size": int(
+            getattr(args, "expert_parallel_size", 1)
+        ),
+        "decode_cuda_graph": bool(
+            getattr(args, "decode_cuda_graph", False)
+        ),
         "max_num_seqs_in_batch": int(args.max_active_requests),
         "max_decoding_seqs": int(args.max_active_requests),
         "max_num_batched_tokens": int(args.max_num_batched_tokens),
@@ -493,6 +507,55 @@ def _case_engine_kwargs(args: argparse.Namespace, case_name: str, max_prompt_len
     hyper_params["max_num_seqs_in_batch"] = int(args.max_active_requests)
     hyper_params["max_decoding_seqs"] = int(args.max_active_requests)
     return {key: value for key, value in hyper_params.items() if value is not None}
+
+
+def _decode_graph_rank_summaries(llm: Any) -> list[dict[str, Any]]:
+    summaries = llm.debug_sparse_state_summaries()
+    graph_summaries: list[dict[str, Any]] = []
+    for summary in summaries:
+        graph = summary.get("decode_cuda_graph")
+        if not isinstance(graph, dict):
+            raise RuntimeError(
+                "Worker debug summary is missing decode_cuda_graph evidence: "
+                f"world_rank={summary.get('world_rank')}."
+            )
+        graph_summaries.append(
+            {
+                "world_rank": int(summary["world_rank"]),
+                **graph,
+            }
+        )
+    return graph_summaries
+
+
+def _decode_graph_rank_deltas(
+    before: list[dict[str, Any]],
+    after: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    before_by_rank = {int(item["world_rank"]): item for item in before}
+    after_by_rank = {int(item["world_rank"]): item for item in after}
+    if set(before_by_rank) != set(after_by_rank):
+        raise RuntimeError(
+            "Decode CUDA Graph evidence changed world ranks: "
+            f"before={sorted(before_by_rank)} after={sorted(after_by_rank)}."
+        )
+    counter_names = (
+        "capture_count",
+        "replay_count",
+        "eager_static_count",
+        "force_eager_count",
+    )
+    return [
+        {
+            "world_rank": rank,
+            **{
+                name: int(after_by_rank[rank][name])
+                - int(before_by_rank[rank][name])
+                for name in counter_names
+            },
+        }
+        for rank in sorted(before_by_rank)
+    ]
 
 
 def _token_vocab(tokenizer: Any) -> list[int]:
@@ -1060,6 +1123,8 @@ def _summarize_records(
     cache_stats_after: dict[str, int],
     peak_memory_gb: float,
     elapsed_s: float,
+    decode_graph_before: list[dict[str, Any]] | None = None,
+    decode_graph_after: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     success = [record for record in records if record.get("status") == "success"]
     failures = [record for record in records if record.get("status") != "success"]
@@ -1092,6 +1157,43 @@ def _summarize_records(
         key: int(cache_stats_after.get(key, 0)) - int(cache_stats_before.get(key, 0))
         for key in sorted(set(cache_stats_before) | set(cache_stats_after))
     }
+    graph_required = bool(getattr(args, "decode_cuda_graph", False))
+    graph_deltas = _decode_graph_rank_deltas(
+        decode_graph_before or [],
+        decode_graph_after or [],
+    )
+    graph_failures: list[str] = []
+    if graph_required:
+        if not graph_deltas:
+            graph_failures.append("missing per-rank CUDA Graph counters")
+        after_by_rank = {
+            int(item["world_rank"]): item
+            for item in (decode_graph_after or [])
+        }
+        for delta in graph_deltas:
+            rank = int(delta["world_rank"])
+            after = after_by_rank[rank]
+            if int(after["capture_count"]) <= 0:
+                graph_failures.append(
+                    f"world rank {rank} did not capture a decode graph"
+                )
+            if int(delta["replay_count"]) <= 0:
+                graph_failures.append(
+                    f"world rank {rank} did not replay a decode graph"
+                )
+            if int(delta["eager_static_count"]) != 0:
+                graph_failures.append(
+                    f"world rank {rank} used eager static decode"
+                )
+            if int(delta["force_eager_count"]) != 0:
+                graph_failures.append(
+                    f"world rank {rank} used forced eager fallback"
+                )
+        if graph_failures:
+            summary_status = "metric_failed"
+            failure_status_counts["metric_failed"] = (
+                failure_status_counts.get("metric_failed", 0) + 1
+            )
 
     by_turn: dict[str, dict[str, Any]] = {}
     for record in bench_success:
@@ -1162,6 +1264,11 @@ def _summarize_records(
         "prefix_cache_stats_before": cache_stats_before,
         "prefix_cache_stats_after": cache_stats_after,
         "prefix_cache_stats_delta": stats_delta,
+        "decode_cuda_graph_required": graph_required,
+        "decode_cuda_graph_failures": graph_failures,
+        "decode_cuda_graph_before": decode_graph_before or [],
+        "decode_cuda_graph_after": decode_graph_after or [],
+        "decode_cuda_graph_delta": graph_deltas,
         "per_turn": per_turn,
     }
     return summary
@@ -1200,6 +1307,7 @@ def _run_case_worker(case_name: str, args_dict: dict[str, Any], case_dir: str) -
         started_s = time.perf_counter()
         llm = LLM(args.model_path, **engine_kwargs)
         cache_stats_before = _cache_stats(llm)
+        decode_graph_before = _decode_graph_rank_summaries(llm)
 
         records: list[dict[str, Any]] = []
         workloads = set(_split_csv(args.workloads))
@@ -1237,6 +1345,7 @@ def _run_case_worker(case_name: str, args_dict: dict[str, Any], case_dir: str) -
             torch.cuda.max_memory_allocated() / (1024**3) if torch.cuda.is_available() else 0.0
         )
         cache_stats_after = _cache_stats(llm)
+        decode_graph_after = _decode_graph_rank_summaries(llm)
         summary = _summarize_records(
             case_name=case_name,
             case_config=CASE_PRESETS[case_name],
@@ -1247,6 +1356,8 @@ def _run_case_worker(case_name: str, args_dict: dict[str, Any], case_dir: str) -
             cache_stats_after=cache_stats_after,
             peak_memory_gb=peak_memory_gb,
             elapsed_s=elapsed_s,
+            decode_graph_before=decode_graph_before,
+            decode_graph_after=decode_graph_after,
         )
         (case_dir_path / "aggregate_metrics.json").write_text(
             json.dumps(summary, indent=2, ensure_ascii=False) + "\n",
@@ -1414,6 +1525,12 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--gpu_memory_utilization", type=float, default=0.65)
     parser.add_argument("--tensor_parallel_size", type=int, default=1)
+    parser.add_argument("--expert_parallel_size", type=int, default=1)
+    parser.add_argument(
+        "--decode_cuda_graph",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     parser.add_argument("--max_active_requests", type=int, default=4)
     parser.add_argument("--max_num_batched_tokens", type=int, default=8192)
     parser.add_argument("--chunk_prefill_size", type=int, default=4096)

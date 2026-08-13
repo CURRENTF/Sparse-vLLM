@@ -6,6 +6,7 @@ from importlib.util import find_spec
 import torch
 
 import sparsevllm.platforms as platforms
+from sparsevllm.kernels.moe import MoeAlignment
 from sparsevllm.operators.registry import (
     OpRegistry,
     OpResolver,
@@ -172,14 +173,165 @@ class MoeProvider:
     ) -> torch.Tensor:
         raise NotImplementedError
 
-
 MOE_REGISTRY: OpRegistry[MoeOpSpec, MoeProvider] = OpRegistry("routed MoE")
+
+_PACKED_SHARED_EXPERT_PROFILES = frozenset(
+    {(64, 1, 4, 2048, 1536, 2, 1)}
+)
+
+
+def use_packed_shared_experts(
+    *,
+    num_routed_experts: int,
+    num_shared_experts: int,
+    top_k: int,
+    hidden_size: int,
+    intermediate_size: int,
+    tp_size: int,
+    ep_size: int,
+    cuda_graph: bool,
+) -> bool:
+    """Return whether a profiled decode path packs shared experts as routes."""
+
+    profile = (
+        int(num_routed_experts),
+        int(num_shared_experts),
+        int(top_k),
+        int(hidden_size),
+        int(intermediate_size),
+        int(tp_size),
+        int(ep_size),
+    )
+    return bool(cuda_graph) and profile in _PACKED_SHARED_EXPERT_PROFILES
+
+
+def append_shared_expert_route(
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    *,
+    shared_expert_id: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from sparsevllm.kernels.triton.moe import append_shared_expert_route as run
+
+    return run(
+        topk_ids,
+        topk_weights,
+        shared_expert_id=shared_expert_id,
+    )
+
+
+def _sgl_moe_align_block_size(
+    topk_ids: torch.Tensor,
+    *,
+    block_size: int,
+    num_experts: int,
+    local_expert_start: int,
+    local_expert_end: int,
+) -> MoeAlignment:
+    from sparsevllm.kernels.external.sgl.moe import sgl_moe_align_block_size
+    from sparsevllm.kernels.triton.moe import localize_expert_ids
+
+    num_local_experts = int(local_expert_end) - int(local_expert_start)
+    has_remote_experts = num_local_experts != int(num_experts)
+    if has_remote_experts:
+        topk_ids = localize_expert_ids(
+            topk_ids,
+            local_expert_start=local_expert_start,
+            local_expert_end=local_expert_end,
+            remote_expert_id=num_local_experts,
+        )
+    return sgl_moe_align_block_size(
+        topk_ids,
+        block_size=block_size,
+        num_experts=num_local_experts,
+    )
+
+
+@MOE_REGISTRY.register
+class SglAlignedTritonGlmMoeProvider(MoeProvider):
+    name = "sgl_aligned_triton_glm"
+    priority = 30
+    gate_up_order = "gate_up"
+
+    @classmethod
+    def supports(cls, spec: MoeOpSpec, caps: DeviceCaps) -> SupportResult:
+        if caps.platform != PlatformEnum.CUDA or caps.compute_capability != (9, 0):
+            return SupportResult.no("requires CUDA SM90")
+        if caps.device_name not in {"NVIDIA H100 80GB HBM3", "NVIDIA H20"}:
+            return SupportResult.no("requires validated H100 80GB HBM3 or H20 hardware")
+        expected = {
+            (64, 64, 2048, 768, 4, 2, 1, "biased_sigmoid"),
+            (65, 65, 2048, 768, 5, 2, 1, "biased_sigmoid"),
+            (64, 32, 2048, 1536, 4, 1, 2, "biased_sigmoid"),
+        }
+        actual = (
+            spec.num_experts,
+            spec.num_local_experts,
+            spec.hidden_size,
+            spec.intermediate_size,
+            spec.top_k,
+            spec.tp_size,
+            spec.ep_size,
+            spec.routing_method,
+        )
+        if actual not in expected:
+            return SupportResult.no(
+                f"requires a profiled GLM TP2 MoE shape {expected}, got {actual}"
+            )
+        if spec.activation_dtype != torch.bfloat16:
+            return SupportResult.no("requires BF16 activations")
+        if spec.weight_dtype != torch.bfloat16 or spec.block_shape is not None:
+            return SupportResult.no("requires unquantized BF16 expert weights")
+        from sparsevllm.kernels.external.sgl.moe import sgl_moe_alignment_support
+
+        supported, reason = sgl_moe_alignment_support()
+        return SupportResult.yes() if supported else SupportResult.no(reason)
+
+    def run(
+        self,
+        spec,
+        hidden_states,
+        topk_ids,
+        topk_weights,
+        w13_weight,
+        w2_weight,
+        w13_scale_inv,
+        w2_scale_inv,
+        *,
+        local_expert_start,
+        ep_rank,
+    ):
+        del ep_rank
+        if w13_scale_inv is not None or w2_scale_inv is not None:
+            raise RuntimeError("SGL-aligned BF16 MoE does not accept expert scales.")
+        from sparsevllm.kernels.triton.moe import fused_moe
+
+        alignment_impl = None
+        num_tokens = int(hidden_states.shape[0])
+        if (
+            num_tokens <= 64
+            and (
+                int(spec.ep_size) > 1
+                or num_tokens * int(spec.top_k) * 4 > int(spec.num_experts)
+            )
+        ):
+            alignment_impl = _sgl_moe_align_block_size
+        return fused_moe(
+            hidden_states,
+            w13_weight,
+            w2_weight,
+            topk_ids,
+            topk_weights,
+            num_experts=spec.num_experts,
+            local_expert_start=local_expert_start,
+            alignment_impl=alignment_impl,
+        )
 
 
 @MOE_REGISTRY.register
 class TritonMinimaxM2FusedMoeProvider(MoeProvider):
     name = "triton_minimax_m2_fused"
-    priority = 110
+    priority = 125
     gate_up_order = "gate_up"
 
     @classmethod
@@ -261,7 +413,7 @@ class TritonMinimaxM2FusedMoeProvider(MoeProvider):
         del ep_rank
         if w13_scale_inv is None or w2_scale_inv is None:
             raise RuntimeError("MiniMax M2.7 fused MoE requires expert scales.")
-        from sparsevllm.triton_kernel.minimax_m2_moe import (
+        from sparsevllm.kernels.triton.minimax_m2_moe import (
             fused_minimax_m2_moe_fp8,
         )
 
@@ -345,7 +497,7 @@ class FlashInferCutlassFp8MoeProvider(MoeProvider):
             output=output,
             use_deepseek_fp8_block_scale=True,
             use_fused_finalize=False,
-            enable_pdl=False,
+            enable_pdl=None,
             activation_type=ActivationType.Swiglu,
         )
         return output
@@ -420,7 +572,7 @@ class TritonHopperFusedMoeProvider(MoeProvider):
         del ep_rank
         if w13_scale_inv is not None or w2_scale_inv is not None:
             raise RuntimeError("Fused Hopper BF16 MoE does not accept expert scales.")
-        from sparsevllm.triton_kernel.moe import fused_moe_gate_up_swiglu
+        from sparsevllm.kernels.triton.moe import fused_moe_gate_up_swiglu
 
         return fused_moe_gate_up_swiglu(
             hidden_states,
@@ -495,7 +647,7 @@ class TritonMoeProvider(MoeProvider):
         if spec.weight_dtype == torch.float8_e4m3fn:
             if w13_scale_inv is None or w2_scale_inv is None:
                 raise RuntimeError("Triton FP8 MoE requires expert scales.")
-            from sparsevllm.triton_kernel.moe import fused_moe_fp8
+            from sparsevllm.kernels.triton.moe import fused_moe_fp8
 
             return fused_moe_fp8(
                 hidden_states,
@@ -509,7 +661,7 @@ class TritonMoeProvider(MoeProvider):
                 local_expert_start=local_expert_start,
                 gate_up_order=self.gate_up_order,
             )
-        from sparsevllm.triton_kernel.moe import fused_moe
+        from sparsevllm.kernels.triton.moe import fused_moe
 
         return fused_moe(
             hidden_states,
@@ -527,7 +679,7 @@ class HopperQwen36HybridFp8MoeProvider(FlashInferCutlassFp8MoeProvider):
     """Bind one weight layout and dispatch profiled token buckets by kernel."""
 
     name = "hopper_qwen36_hybrid_fp8"
-    priority = 110
+    priority = 130
     PROFILED_DEVICE_NAME = "NVIDIA H100 80GB HBM3"
     PROFILED_SHAPES = frozenset(
         {
@@ -604,7 +756,7 @@ class HopperQwen36HybridFp8MoeProvider(FlashInferCutlassFp8MoeProvider):
             )
         if w13_scale_inv is None or w2_scale_inv is None:
             raise RuntimeError("Qwen3.6 hybrid FP8 MoE requires expert scales.")
-        from sparsevllm.triton_kernel.moe import fused_moe_fp8
+        from sparsevllm.kernels.triton.moe import fused_moe_fp8
 
         return fused_moe_fp8(
             hidden_states,
@@ -623,7 +775,7 @@ class HopperQwen36HybridFp8MoeProvider(FlashInferCutlassFp8MoeProvider):
 @MOE_REGISTRY.register
 class H20Qwen36HybridFp8MoeProvider(HopperQwen36HybridFp8MoeProvider):
     name = "h20_qwen36_hybrid_fp8"
-    priority = 111
+    priority = 131
     PROFILED_DEVICE_NAME = "NVIDIA H20"
     TRITON_MAX_TOKENS_BY_EP_SIZE = {1: 8, 2: 1}
 

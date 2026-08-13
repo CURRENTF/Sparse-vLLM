@@ -185,6 +185,15 @@ def test_prefix_cache_bench_exposes_h2o_chain_case():
     assert bench.CASE_ALIASES["h2o"] == "chain_h2o"
 
 
+def test_prefix_cache_bench_exposes_streamingllm_chain_case():
+    assert bench.CASE_PRESETS["chain_streamingllm"] == {
+        "method": "streamingllm",
+        "enable_prefix_caching": True,
+        "label": "StreamingLLM, linear chain prefix cache",
+    }
+    assert bench.CASE_ALIASES["streamingllm"] == "chain_streamingllm"
+
+
 def test_prefix_cache_bench_labels_chain_reuse_as_logical_tokens():
     summary = bench._summarize_records(
         case_name="chain_snapkv",
@@ -247,6 +256,8 @@ def test_prefix_cache_bench_engine_kwargs_are_sparsevllm_config_fields():
     args = types.SimpleNamespace(
         gpu_memory_utilization=0.65,
         tensor_parallel_size=1,
+        expert_parallel_size=2,
+        decode_cuda_graph=True,
         max_active_requests=4,
         max_num_batched_tokens=8192,
         chunk_prefill_size=4096,
@@ -270,6 +281,89 @@ def test_prefix_cache_bench_engine_kwargs_are_sparsevllm_config_fields():
     config_fields = set(Config.__dataclass_fields__)
     unknown = sorted(set(normalized.infer_config) - config_fields)
     assert unknown == []
+    assert normalized.infer_config["expert_parallel_size"] == 2
+    assert normalized.infer_config["decode_cuda_graph"] is True
+
+
+def test_prefix_cache_bench_requires_graph_capture_and_replay_on_every_rank():
+    args = _summary_args()
+    args.decode_cuda_graph = True
+    summary = bench._summarize_records(
+        case_name="prefix_full",
+        case_config=bench.CASE_PRESETS["prefix_full"],
+        records=[],
+        args=args,
+        engine_kwargs={},
+        cache_stats_before={},
+        cache_stats_after={},
+        peak_memory_gb=0.0,
+        elapsed_s=1.0,
+        decode_graph_before=[
+            {
+                "world_rank": rank,
+                "capture_count": 0,
+                "replay_count": 0,
+                "eager_static_count": 0,
+                "force_eager_count": 0,
+            }
+            for rank in (0, 1)
+        ],
+        decode_graph_after=[
+            {
+                "world_rank": rank,
+                "capture_count": 1,
+                "replay_count": 3,
+                "eager_static_count": 0,
+                "force_eager_count": 0,
+            }
+            for rank in (0, 1)
+        ],
+    )
+
+    assert summary["decode_cuda_graph_failures"] == []
+    assert summary["decode_cuda_graph_delta"] == [
+        {
+            "world_rank": rank,
+            "capture_count": 1,
+            "replay_count": 3,
+            "eager_static_count": 0,
+            "force_eager_count": 0,
+        }
+        for rank in (0, 1)
+    ]
+
+
+def test_prefix_cache_bench_accepts_warmup_capture_and_business_replay():
+    args = _summary_args()
+    args.decode_cuda_graph = True
+    counters = {
+        "capture_count": 1,
+        "eager_static_count": 0,
+        "force_eager_count": 0,
+    }
+
+    summary = bench._summarize_records(
+        case_name="prefix_full",
+        case_config=bench.CASE_PRESETS["prefix_full"],
+        records=[],
+        args=args,
+        engine_kwargs={},
+        cache_stats_before={},
+        cache_stats_after={},
+        peak_memory_gb=0.0,
+        elapsed_s=1.0,
+        decode_graph_before=[
+            {"world_rank": 0, "replay_count": 1, **counters}
+        ],
+        decode_graph_after=[
+            {"world_rank": 0, "replay_count": 5, **counters}
+        ],
+    )
+
+    assert summary["status"] == "success"
+    assert summary["decode_cuda_graph_failures"] == []
+    assert summary["decode_cuda_graph_delta"][0]["capture_count"] == 0
+    assert summary["decode_cuda_graph_delta"][0]["replay_count"] == 4
 
 
 def test_prefix_cache_bench_trace_uses_resolved_sparse_budgets():

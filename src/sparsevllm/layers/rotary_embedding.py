@@ -16,6 +16,20 @@ def apply_rotary_emb(
     return torch.cat((y1, y2), dim=-1).to(x.dtype)
 
 
+def apply_interleaved_rotary_emb(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> torch.Tensor:
+    """Rotate adjacent pairs and return the split-half layout used by GLM."""
+
+    x_even = x.float()[..., 0::2]
+    x_odd = x.float()[..., 1::2]
+    y_even = x_even * cos - x_odd * sin
+    y_odd = x_odd * cos + x_even * sin
+    return torch.cat((y_even, y_odd), dim=-1).to(x.dtype)
+
+
 def apply_partial_rotary_emb(
     rotary_emb: "RotaryEmbedding",
     positions: torch.Tensor,
@@ -83,6 +97,7 @@ class RotaryEmbedding(nn.Module):
         base: float,
         rope_scaling: tuple[tuple[str, object], ...] | None = None,
         backend: str = "flashinfer",
+        interleaved: bool = False,
     ) -> None:
         super().__init__()
         if backend not in {"flashinfer", "torch"}:
@@ -90,6 +105,7 @@ class RotaryEmbedding(nn.Module):
                 f"Unsupported RoPE backend={backend!r}; expected 'flashinfer' or 'torch'."
             )
         self.backend = backend
+        self.interleaved = bool(interleaved)
         self.head_size = head_size
         assert rotary_dim == head_size
         inv_freq = 1.0 / (base**(torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))
@@ -141,8 +157,13 @@ class RotaryEmbedding(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         cos_sin = self.cos_sin_cache[positions]
         cos, sin = cos_sin.chunk(2, dim=-1)
-        query = apply_rotary_emb(query, cos, sin)
-        key = apply_rotary_emb(key, cos, sin)
+        apply = (
+            apply_interleaved_rotary_emb
+            if self.interleaved
+            else apply_rotary_emb
+        )
+        query = apply(query, cos, sin)
+        key = apply(key, cos, sin)
         return query, key
 
     def flashinfer_forward(
@@ -162,9 +183,14 @@ class RotaryEmbedding(nn.Module):
             key=key_flat,
             head_size=head_size,
             cos_sin_cache=cos_sin_cache,
-            is_neox=True,
+            is_neox=not self.interleaved,
         )
-        return query_out.view_as(query), key_out.view_as(key)
+        query_out = query_out.view_as(query)
+        key_out = key_out.view_as(key)
+        if self.interleaved:
+            query_out = query_out.unflatten(-1, (-1, 2)).transpose(-1, -2).flatten(-2)
+            key_out = key_out.unflatten(-1, (-1, 2)).transpose(-1, -2).flatten(-2)
+        return query_out, key_out
 
     def forward(
         self,
@@ -185,6 +211,7 @@ def get_rope(
     base: float,
     rope_scaling: tuple[tuple[str, object], ...] | None = None,
     backend: str = "flashinfer",
+    interleaved: bool = False,
 ):
     rotary_emb = RotaryEmbedding(
         head_size,
@@ -193,5 +220,6 @@ def get_rope(
         base,
         rope_scaling=rope_scaling,
         backend=backend,
+        interleaved=interleaved,
     )
     return rotary_emb

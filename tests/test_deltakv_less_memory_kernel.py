@@ -4,7 +4,7 @@ import unittest
 
 import torch
 
-from sparsevllm.triton_kernel.deltakv_kernels import (
+from sparsevllm.kernels.triton.deltakv_kernels import (
     _validate_full_layer_kivi_decode_maps,
     deltakv_less_memory_reconstruct_writeback_quantized,
     deltakv_l2_topk_blockwise,
@@ -18,11 +18,11 @@ from sparsevllm.triton_kernel.deltakv_kernels import (
     full_layer_kivi_flash_decode_stage1_token_group_map,
     full_layer_kivi_flash_decode_stage1_token_map,
 )
-from sparsevllm.triton_kernel.gqa_flash_decoding_stage1 import flash_decode_stage1 as gqa_flash_decode_stage1
-from sparsevllm.triton_kernel.gqa_flash_decoding_stage1 import (
+from sparsevllm.kernels.triton.gqa_flash_decoding_stage1 import flash_decode_stage1 as gqa_flash_decode_stage1
+from sparsevllm.kernels.triton.gqa_flash_decoding_stage1 import (
     flash_decode_stage1_with_score as gqa_flash_decode_stage1_with_score,
 )
-from sparsevllm.triton_kernel.quant import (
+from sparsevllm.kernels.triton.quant import (
     triton_dequantize_2d_int4_grouped,
     triton_quantize_and_pack_2d_int4_grouped,
     triton_quantize_and_pack_along_last_dim,
@@ -95,7 +95,7 @@ class DeltaKVLessMemoryKernelTest(unittest.TestCase):
         self.assertTrue(torch.allclose(got, ref, atol=1e-6, rtol=1e-6))
 
     def test_store_kvcache_chunks_large_launches(self):
-        from sparsevllm.triton_kernel.store_kvcache import store_kvcache
+        from sparsevllm.kernels.triton.store_kvcache import store_kvcache
 
         old_value = os.environ.get("SPARSEVLLM_STORE_KVCACHE_CHUNK_TOKENS")
         os.environ["SPARSEVLLM_STORE_KVCACHE_CHUNK_TOKENS"] = "3"

@@ -42,7 +42,7 @@ Follow this placement order.
 6. Put cross-layer observation, attention-score collection, or scheduler-facing sparse orchestration in `src/sparsevllm/engine/sparse_controller.py`.
 7. Put hidden-state capture, activation steering, and per-sequence steering state in `src/sparsevllm/engine/activation_controller.py`, with `SparseController` owning the lifecycle and model files calling only a generic hook.
 8. Use `src/sparsevllm/utils/` only for truly generic helpers shared by multiple methods. Do not place an entire method implementation there.
-9. Add custom kernels under `src/sparsevllm/triton_kernel/` or another explicit runtime module, then call them through the method's cache manager or shared decode path.
+9. Add custom kernels under `src/sparsevllm/kernels/triton/` or another explicit runtime module, then call them through the method's cache manager or shared decode path.
 
 ## Decision Rules
 

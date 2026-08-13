@@ -21,6 +21,7 @@ class ModelSpec:
     prefix_cache_block_size_multiple: int | None = None
     deltakv_checkpoint_model_types: frozenset[str] = frozenset()
     runtime_class_name: str = ""
+    attention_cache_layout: str = "explicit_kv"
     attention_tp_fields: tuple[str, ...] = ()
     num_experts_field: str | None = None
     moe_tp_fields: tuple[str, ...] = ()
@@ -157,6 +158,17 @@ MODEL_SPECS.update(
             attention_tp_fields=_MOE_TP_FIELDS,
             num_experts_field="num_local_experts",
             moe_tp_fields=("intermediate_size",),
+            top_k_field="num_experts_per_tok",
+        ),
+        "glm4_moe_lite": ModelSpec(
+            "GLM-4.7-Flash",
+            supports_expert_parallel=True,
+            supports_outer_tp_moe=True,
+            runtime_class_name="Glm4MoeLiteForCausalLM",
+            attention_cache_layout="mla_latent",
+            attention_tp_fields=("num_attention_heads", "vocab_size"),
+            num_experts_field="n_routed_experts",
+            moe_tp_fields=("intermediate_size", "moe_intermediate_size"),
             top_k_field="num_experts_per_tok",
         ),
     }

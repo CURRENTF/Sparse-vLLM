@@ -1,9 +1,9 @@
 import pytest
 import torch
 
-from sparsevllm.triton_kernel.flash_decoding_stage2 import flash_decode_stage2
-from sparsevllm.triton_kernel.gqa_flash_decoding_stage1 import flash_decode_stage1
-from sparsevllm.triton_kernel.store_kvcache import store_kvcache
+from sparsevllm.kernels.triton.flash_decoding_stage2 import flash_decode_stage2
+from sparsevllm.kernels.triton.gqa_flash_decoding_stage1 import flash_decode_stage1
+from sparsevllm.kernels.triton.store_kvcache import store_kvcache
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

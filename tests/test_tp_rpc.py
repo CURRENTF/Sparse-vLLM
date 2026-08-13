@@ -17,9 +17,35 @@ from sparsevllm.engine.model_runner import (
     TP_RUN_STATUS_SUCCESS,
     TP_RPC_STATUS_SYNC_METHODS,
     TP_SHM_NAME_PREFIX,
+    _create_model,
     make_tp_shm_name,
 )
+from sparsevllm.models.spec import ModelSpec
 from sparsevllm.operators import registry as operator_registry
+
+
+def test_create_model_delegates_optional_runtime_binding():
+    config = object()
+    context = object()
+
+    class Model:
+        @classmethod
+        def build_runtime_kwargs(cls, hf_config, **runtime_kwargs):
+            assert hf_config is config
+            assert runtime_kwargs == {"parallel_context": context}
+            return {"runtime": "bound"}
+
+        def __init__(self, hf_config, *, runtime):
+            self.args = hf_config, runtime
+
+    with patch.dict(_create_model.__globals__, {"Model": Model}):
+        model = _create_model(
+            config,
+            ModelSpec("test", runtime_class_name="Model"),
+            parallel_context=context,
+        )
+
+    assert model.args == (config, "bound")
 
 
 def test_write_shm_waits_until_worker_reads_command():
@@ -443,6 +469,9 @@ def test_model_runner_exit_drains_graphs_before_barrier():
     runner.decode_cuda_graph_runner = SimpleNamespace(
         clear_captured_graphs=lambda: calls.append("clear_graphs")
     )
+    runner.model = SimpleNamespace(
+        close_runtime_operators=lambda: calls.append("close_ops")
+    )
     runner.world_size = 2
     runner.rank = 0
     runner.shm = SimpleNamespace(
@@ -450,7 +479,7 @@ def test_model_runner_exit_drains_graphs_before_barrier():
         unlink=lambda: calls.append("unlink_shm"),
     )
     runner.parallel_context = SimpleNamespace(
-        world_barrier=lambda **_: calls.append("barrier")
+        world_barrier=lambda **_: calls.append("barrier"),
     )
 
     with (
@@ -468,6 +497,8 @@ def test_model_runner_exit_drains_graphs_before_barrier():
     assert calls == [
         "sync",
         "clear_graphs",
+        "sync",
+        "close_ops",
         "sync",
         "close_shm",
         "barrier",

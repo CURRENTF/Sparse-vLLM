@@ -188,6 +188,43 @@ class ReplicatedLinear(LinearBase):
         return F.linear(x, self.weight, self.bias)
 
 
+class MergedReplicatedLinear(ReplicatedLinear):
+    """One replicated GEMM loaded from multiple output-row shards."""
+
+    def __init__(
+        self,
+        input_size: int,
+        output_sizes: list[int],
+        bias: bool = False,
+    ):
+        if not output_sizes or any(int(size) <= 0 for size in output_sizes):
+            raise ValueError(f"output_sizes must be positive, got {output_sizes}.")
+        self.output_sizes = [int(size) for size in output_sizes]
+        super().__init__(input_size, sum(self.output_sizes), bias)
+
+    def weight_loader(
+        self,
+        param: nn.Parameter,
+        loaded_weight: torch.Tensor,
+        loaded_shard_id: int,
+    ) -> None:
+        loaded_shard_id = int(loaded_shard_id)
+        if loaded_shard_id < 0 or loaded_shard_id >= len(self.output_sizes):
+            raise ValueError(
+                f"loaded_shard_id must be in [0, {len(self.output_sizes)}), "
+                f"got {loaded_shard_id}."
+            )
+        shard_offset = sum(self.output_sizes[:loaded_shard_id])
+        shard_size = self.output_sizes[loaded_shard_id]
+        target = param.data.narrow(0, shard_offset, shard_size)
+        if tuple(target.shape) != tuple(loaded_weight.shape):
+            raise ValueError(
+                "MergedReplicatedLinear shard shape mismatch: "
+                f"expected={tuple(target.shape)}, got={tuple(loaded_weight.shape)}."
+            )
+        target.copy_(loaded_weight)
+
+
 class ColumnParallelLinear(LinearBase):
 
     def __init__(
@@ -454,4 +491,6 @@ class RowParallelLinear(LinearBase):
             y = self.quant_provider(x, self.weight, self.weight_scale_inv, bias)
         else:
             y = F.linear(x, self.weight, bias)
-        return self.parallel_context.tp_all_reduce(y) if self.reduce_results else y
+        if self.reduce_results:
+            return self.parallel_context.tp_all_reduce(y)
+        return y

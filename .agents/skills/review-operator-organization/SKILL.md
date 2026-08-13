@@ -25,7 +25,9 @@ Read all changed and directly coupled files in these areas:
 
 - `src/sparsevllm/operators/`: specs, providers, registries, and resolvers.
 - `src/sparsevllm/platforms/`: platform discovery and `DeviceCaps`.
-- `src/sparsevllm/triton_kernel/`: repository-owned implementations.
+- `src/sparsevllm/kernels/triton/`: repository-owned Triton implementations.
+- `src/sparsevllm/kernels/tilelang/`: repository-owned TileLang implementations.
+- `src/sparsevllm/kernels/external/`: thin external-kernel adapters.
 - Model and loader call sites that construct specs or prepare physical weights.
 - Dependency declarations and installation documentation for external providers.
 - Resolver, kernel-equivalence, integration, and model tests.

@@ -10,18 +10,13 @@ from transformers import Qwen3MoeConfig
 
 from sparsevllm.distributed import get_parallel_context
 from sparsevllm.layers.embed_head import ParallelLMHead
-from sparsevllm.layers.expert_weights import (
-    PackedExpertWeightLoader,
-    UnquantizedExpertTpShard,
-)
+from sparsevllm.layers.packed_moe import PackedMoeExperts
 from sparsevllm.models.qwen3 import Qwen3DecoderLayerBase, Qwen3ModelBase
 from sparsevllm.operators.moe import (
-    MoeOpSpec,
     model_activation_dtype,
     resolve_moe_provider,
 )
 from sparsevllm.platforms import device_runtime
-from sparsevllm.quantization.fp8_tp import Fp8ExpertTpShard
 from sparsevllm.utils.log import logger
 from sparsevllm.utils.weight_target import WeightTarget
 
@@ -43,7 +38,7 @@ class Qwen3MoeRouter(nn.Module):
         self.num_experts = int(config.num_experts)
         self.top_k = int(config.num_experts_per_tok)
         self.norm_topk_prob = bool(config.norm_topk_prob)
-        from sparsevllm.triton_kernel.moe_topk import topk_softmax
+        from sparsevllm.kernels.triton.moe_topk import topk_softmax
 
         self.topk_impl = topk_softmax
         self.weight = nn.Parameter(torch.empty(self.num_experts, self.hidden_size))
@@ -61,260 +56,25 @@ class Qwen3MoeRouter(nn.Module):
         return router_logits, topk_weights, topk_ids
 
 
-class Qwen3MoePackedExperts(PackedExpertWeightLoader, nn.Module):
-    checkpoint_projection_map = {
-        "gate_proj": "gate",
-        "up_proj": "up",
-        "down_proj": "down",
-    }
-
+class Qwen3MoePackedExperts(PackedMoeExperts):
     def __init__(self, config: Qwen3MoeConfig) -> None:
-        super().__init__()
-        parallel_context = get_parallel_context()
-        self.tp_rank = parallel_context.moe_tp_rank
-        self.tp_size = parallel_context.moe_tp_size
-        self.ep_rank = parallel_context.ep_rank
-        self.ep_size = parallel_context.ep_size
-        self.num_experts = int(config.num_experts)
-        self.hidden_size = int(config.hidden_size)
-        self.global_intermediate_size = int(config.moe_intermediate_size)
-        if self.global_intermediate_size % self.tp_size:
-            raise ValueError(
-                "Qwen3MoE moe_intermediate_size must be divisible by "
-                f"tensor_parallel_size, got {self.global_intermediate_size} and "
-                f"{self.tp_size}."
-            )
-        self.logical_intermediate_size = self.global_intermediate_size // self.tp_size
-        self.fp8_enabled = bool(
-            getattr(getattr(config, "quantization_config", None), "enabled", False)
-        )
-        if self.fp8_enabled and (
-            self.hidden_size % 128 or self.global_intermediate_size % 128
-        ):
-            raise ValueError(
-                "Qwen3MoE FP8 requires hidden_size and moe_intermediate_size "
-                f"aligned to 128, got {self.hidden_size}/{self.global_intermediate_size}."
-            )
-        self.fp8_tp_shard = (
-            Fp8ExpertTpShard(
-                self.global_intermediate_size,
-                self.tp_rank,
-                self.tp_size,
-            )
-            if self.fp8_enabled
-            else None
-        )
-        self.checkpoint_tp_shard = (
-            self.fp8_tp_shard
-            if self.fp8_tp_shard is not None
-            else UnquantizedExpertTpShard(
-                self.global_intermediate_size,
-                self.tp_rank,
-                self.tp_size,
-            )
-        )
-        self.intermediate_size = (
-            self.fp8_tp_shard.physical_size
-            if self.fp8_tp_shard is not None
-            else self.logical_intermediate_size
-        )
-        self.num_local_experts = self.num_experts // self.ep_size
-        self.local_expert_start = self.ep_rank * self.num_local_experts
-        self.local_expert_end = self.local_expert_start + self.num_local_experts
-        activation_dtype = model_activation_dtype(config)
-        self.op_spec = MoeOpSpec(
-            num_experts=self.num_experts,
-            num_local_experts=self.num_local_experts,
-            hidden_size=self.hidden_size,
-            intermediate_size=self.intermediate_size,
+        super().__init__(
+            num_experts=int(config.num_experts),
+            hidden_size=int(config.hidden_size),
+            intermediate_size=int(config.moe_intermediate_size),
             top_k=int(config.num_experts_per_tok),
-            activation_dtype=activation_dtype,
-            weight_dtype=(
-                torch.float8_e4m3fn if self.fp8_enabled else activation_dtype
+            activation_dtype=model_activation_dtype(config),
+            fp8_enabled=bool(
+                getattr(
+                    getattr(config, "quantization_config", None),
+                    "enabled",
+                    False,
+                )
             ),
-            block_shape=(128, 128) if self.fp8_enabled else None,
-            ep_size=int(self.ep_size),
             cuda_graph=bool(getattr(config, "decode_cuda_graph", False)),
-            tp_size=int(self.tp_size),
-        )
-        self.provider = resolve_moe_provider(self.op_spec)
-        self.w13_weight = nn.Parameter(
-            torch.empty(
-                self.num_local_experts,
-                2 * self.intermediate_size,
-                self.hidden_size,
-                dtype=torch.float8_e4m3fn if self.fp8_enabled else None,
-            ),
-            requires_grad=not self.fp8_enabled,
-        )
-        self.w2_weight = nn.Parameter(
-            torch.empty(
-                self.num_local_experts,
-                self.hidden_size,
-                self.intermediate_size,
-                dtype=torch.float8_e4m3fn if self.fp8_enabled else None,
-            ),
-            requires_grad=not self.fp8_enabled,
-        )
-        if self.fp8_enabled:
-            self.register_buffer(
-                "w13_scale_inv",
-                torch.empty(
-                    self.num_local_experts,
-                    2 * self.intermediate_size // 128,
-                    self.hidden_size // 128,
-                    dtype=torch.float32,
-                ),
-            )
-            self.register_buffer(
-                "w2_scale_inv",
-                torch.empty(
-                    self.num_local_experts,
-                    self.hidden_size // 128,
-                    self.intermediate_size // 128,
-                    dtype=torch.float32,
-                ),
-            )
-        else:
-            self.register_buffer("w13_scale_inv", None)
-            self.register_buffer("w2_scale_inv", None)
-        self._loaded_expert_shards: set[tuple[int, str]] = set()
-
-    def is_local_expert(self, global_expert_id: int) -> bool:
-        return self.local_expert_start <= int(global_expert_id) < self.local_expert_end
-
-    def load_expert_weight(
-        self,
-        global_expert_id: int,
-        projection: str,
-        loaded_weight: torch.Tensor,
-        loaded_scale: torch.Tensor | None = None,
-    ) -> None:
-        global_expert_id = int(global_expert_id)
-        if not self.is_local_expert(global_expert_id):
-            raise ValueError(
-                f"Expert {global_expert_id} is outside local range "
-                f"[{self.local_expert_start}, {self.local_expert_end})."
-            )
-        if projection not in {"gate_proj", "up_proj", "down_proj"}:
-            raise ValueError(f"Unsupported expert projection {projection!r}.")
-        load_key = (global_expert_id, projection)
-        if load_key in self._loaded_expert_shards:
-            raise ValueError(
-                f"Duplicate Qwen3MoE expert weight for expert={global_expert_id}, "
-                f"projection={projection}."
-            )
-
-        if self.fp8_enabled:
-            if loaded_scale is None:
-                raise ValueError(
-                    "Missing FP8 weight_scale_inv for Qwen3MoE "
-                    f"expert={global_expert_id}, projection={projection}."
-                )
-            if loaded_weight.dtype != torch.float8_e4m3fn:
-                raise TypeError(
-                    "Qwen3MoE expert weight must be FP8 E4M3, "
-                    f"got {loaded_weight.dtype}."
-                )
-            if loaded_scale.dtype != torch.bfloat16:
-                raise TypeError(
-                    "Qwen3MoE expert weight_scale_inv must be BF16, "
-                    f"got {loaded_scale.dtype}."
-                )
-        elif loaded_scale is not None:
-            raise ValueError(
-                "Unexpected weight_scale_inv for unquantized Qwen3MoE "
-                f"expert={global_expert_id}, projection={projection}."
-            )
-
-        if self.fp8_tp_shard is not None:
-            loaded_weight, loaded_scale = self.fp8_tp_shard.prepare_projection(
-                loaded_weight,
-                loaded_scale,
-                hidden_size=self.hidden_size,
-                down_projection=projection == "down_proj",
-            )
-        else:
-            loaded_weight = self._local_projection_shard(projection, loaded_weight)
-        local_expert_id = global_expert_id - self.local_expert_start
-        logical_projection = {
-            "gate_proj": "gate",
-            "up_proj": "up",
-            "down_proj": "down",
-        }[projection]
-        self.provider.load_expert_projection(
-            self.op_spec,
-            local_expert_id=local_expert_id,
-            projection=logical_projection,
-            loaded_weight=loaded_weight,
-            loaded_scale=loaded_scale,
-            w13_weight=self.w13_weight.data,
-            w2_weight=self.w2_weight.data,
-            w13_scale_inv=self.w13_scale_inv,
-            w2_scale_inv=self.w2_scale_inv,
-        )
-        self._loaded_expert_shards.add(load_key)
-
-    def _local_projection_shard(
-        self,
-        projection: str,
-        loaded_weight: torch.Tensor,
-    ) -> torch.Tensor:
-        local_shape = (
-            (self.hidden_size, self.intermediate_size)
-            if projection == "down_proj"
-            else (self.intermediate_size, self.hidden_size)
-        )
-        if tuple(loaded_weight.shape) == local_shape:
-            return loaded_weight
-
-        global_shape = (
-            (self.hidden_size, self.global_intermediate_size)
-            if projection == "down_proj"
-            else (self.global_intermediate_size, self.hidden_size)
-        )
-        if tuple(loaded_weight.shape) != global_shape:
-            raise ValueError(
-                "Qwen3MoE expert projection shape mismatch: "
-                f"projection={projection}, expected local={local_shape} or "
-                f"global={global_shape}, got={tuple(loaded_weight.shape)}."
-            )
-        shard_dim = 1 if projection == "down_proj" else 0
-        return loaded_weight.chunk(self.tp_size, dim=shard_dim)[self.tp_rank]
-
-    def validate_loaded_weights(self) -> None:
-        expected = {
-            (global_expert_id, projection)
-            for global_expert_id in range(
-                self.local_expert_start, self.local_expert_end
-            )
-            for projection in ("gate_proj", "up_proj", "down_proj")
-        }
-        missing = sorted(expected - self._loaded_expert_shards)
-        if missing:
-            raise ValueError(
-                "Missing local Qwen3MoE expert weights: "
-                f"local_range=[{self.local_expert_start}, {self.local_expert_end}), "
-                f"missing={missing[:8]}."
-            )
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        topk_ids: torch.Tensor,
-        topk_weights: torch.Tensor,
-    ) -> torch.Tensor:
-        return self.provider.run(
-            self.op_spec,
-            hidden_states,
-            topk_ids,
-            topk_weights,
-            self.w13_weight,
-            self.w2_weight,
-            self.w13_scale_inv,
-            self.w2_scale_inv,
-            local_expert_start=self.local_expert_start,
-            ep_rank=int(self.ep_rank),
+            model_label="Qwen3MoE",
+            provider_resolver=resolve_moe_provider,
+            parallel_context=get_parallel_context(),
         )
 
 

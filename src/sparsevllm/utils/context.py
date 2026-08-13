@@ -1,5 +1,6 @@
 class Context:
     def __init__(self):
+        self.attention_validation_scope = object()
         self.is_prefill = False
         self.is_long_text = False
         self.cu_seqlens_q = None
@@ -29,6 +30,7 @@ def set_context(
     recurrent_state_manager=None,
 ):
     global _CONTEXT
+    _CONTEXT.attention_validation_scope = object()
     _CONTEXT.is_prefill = is_prefill
     _CONTEXT.is_long_text = is_long_text
     _CONTEXT.cu_seqlens_q = cu_seqlens_q

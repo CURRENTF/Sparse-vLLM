@@ -1,0 +1,1022 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Callable
+
+import torch
+
+from sparsevllm.engine.cache_manager.base import (
+    AttentionKeyComputeView,
+    AttentionViewMeta,
+    DecodeComputeView,
+    ExplicitKVPayload,
+    MlaLatentWrite,
+    MlaLatentPayload,
+    PrefillComputeView,
+)
+from sparsevllm.layers.attention_backend import TritonAttentionBackend
+from sparsevllm.operators.mla_attention import (
+    MlaAttentionOpSpec,
+    MlaAttentionProvider,
+    resolve_mla_attention_provider,
+)
+from sparsevllm.kernels.triton.mla import (
+    gather_latent_history,
+    validate_gather_metadata,
+)
+from sparsevllm.utils.context import get_context
+
+
+@dataclass(frozen=True, slots=True)
+class MlaPrefillHistory:
+    """Gathered full history and its packed logical coordinates."""
+
+    gathered_latent: torch.Tensor
+    gathered_rope: torch.Tensor
+    packed_offsets: torch.Tensor
+    packed_cu_seqlens: torch.Tensor
+    packed_slots: torch.Tensor
+    local_req_indices: torch.Tensor
+    context_lens: torch.Tensor
+    context_lengths: tuple[int, ...]
+    max_context_len: int
+    required_workspace_bytes: int
+
+    @property
+    def visible_tokens(self) -> int:
+        return int(self.gathered_latent.shape[0])
+
+
+@dataclass(frozen=True, slots=True)
+class MlaPrefillWorkset:
+    """Full-history MLA buffers ready for ordinary 256-wide attention."""
+
+    history: MlaPrefillHistory
+    expanded_k: torch.Tensor
+    expanded_v: torch.Tensor
+
+
+@dataclass(frozen=True, slots=True)
+class _MlaPrefillPlan:
+    """Step-local packing metadata shared by every MLA layer."""
+
+    validation_scope: object
+    source_active_slots: torch.Tensor
+    source_req_indices: torch.Tensor
+    source_context_lens: torch.Tensor
+    source_max_context_len: int | None
+    source_query_tokens: int
+    cache_slot_count: int
+    packed_offsets: torch.Tensor
+    packed_cu_seqlens: torch.Tensor
+    packed_slots: torch.Tensor
+    local_req_indices: torch.Tensor
+    context_lengths: tuple[int, ...]
+    total_visible_tokens: int
+    max_context_len: int
+    required_workspace_bytes: int
+
+    def matches(
+        self,
+        validation_scope: object,
+        meta: AttentionViewMeta,
+        cache_slot_count: int,
+        query_tokens: int,
+    ) -> bool:
+        return (
+            self.validation_scope is validation_scope
+            and self.source_active_slots is meta.active_slots
+            and self.source_req_indices is meta.req_indices
+            and self.source_context_lens is meta.context_lens
+            and self.source_max_context_len == meta.max_context_len
+            and self.source_query_tokens == int(query_tokens)
+            and self.cache_slot_count == int(cache_slot_count)
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _MlaPrefillQueryPlan:
+    """Step-local query-packing validation shared by every MLA layer."""
+
+    validation_scope: object
+    source_context_lens: torch.Tensor
+    query_tokens: int
+    max_query_len: int
+
+    def matches(
+        self,
+        validation_scope: object,
+        context_lens: torch.Tensor,
+        query_tokens: int,
+    ) -> bool:
+        return (
+            self.validation_scope is validation_scope
+            and self.source_context_lens is context_lens
+            and self.query_tokens == int(query_tokens)
+        )
+
+
+def _host_int_values(tensor: torch.Tensor) -> tuple[int, ...]:
+    """Synchronize an integer tensor once inside a validation scope."""
+
+    return tuple(int(value) for value in tensor.tolist())
+
+
+def estimate_mla_prefill_workspace_bytes(
+    *,
+    total_visible_tokens: int,
+    query_tokens: int,
+    batch_size: int,
+    max_context_len: int,
+    local_q_heads: int,
+    kv_lora_rank: int,
+    rope_dim: int,
+    qk_head_dim: int,
+    value_head_dim: int,
+    hidden_size: int,
+    projection_chunk_size: int,
+    activation_dtype: torch.dtype,
+    cache_dtype: torch.dtype,
+) -> int:
+    """Bound the peak modeled transient storage for MLA full-history prefill."""
+
+    values = {
+        "total_visible_tokens": total_visible_tokens,
+        "query_tokens": query_tokens,
+        "batch_size": batch_size,
+        "max_context_len": max_context_len,
+        "local_q_heads": local_q_heads,
+        "kv_lora_rank": kv_lora_rank,
+        "rope_dim": rope_dim,
+        "qk_head_dim": qk_head_dim,
+        "value_head_dim": value_head_dim,
+        "hidden_size": hidden_size,
+        "projection_chunk_size": projection_chunk_size,
+    }
+    for name, value in values.items():
+        if int(value) < 0:
+            raise ValueError(f"{name} must be non-negative, got {value}.")
+    positive_values = (
+        "total_visible_tokens",
+        "query_tokens",
+        "batch_size",
+        "local_q_heads",
+        "kv_lora_rank",
+        "rope_dim",
+        "qk_head_dim",
+        "value_head_dim",
+        "hidden_size",
+        "projection_chunk_size",
+    )
+    for name in positive_values:
+        if int(values[name]) == 0:
+            raise ValueError(f"{name} must be positive, got 0.")
+    if int(query_tokens) > int(total_visible_tokens):
+        raise ValueError(
+            "query_tokens cannot exceed total_visible_tokens, got "
+            f"{query_tokens} > {total_visible_tokens}."
+        )
+    qk_nope_head_dim = int(qk_head_dim) - int(rope_dim)
+    if qk_nope_head_dim <= 0:
+        raise ValueError(
+            "qk_head_dim must be larger than rope_dim, got "
+            f"{qk_head_dim} and {rope_dim}."
+        )
+
+    cache_element_size = torch.empty((), dtype=cache_dtype).element_size()
+    activation_element_size = torch.empty(
+        (),
+        dtype=activation_dtype,
+    ).element_size()
+    visible_tokens = int(total_visible_tokens)
+    current_tokens = int(query_tokens)
+    heads = int(local_q_heads)
+    projected_width = qk_nope_head_dim + int(value_head_dim)
+    gathered_bytes = (
+        visible_tokens
+        * (int(kv_lora_rank) + int(rope_dim))
+        * cache_element_size
+    )
+    projected_bytes = (
+        visible_tokens * heads * projected_width * activation_element_size
+    )
+    projection_scratch_bytes = 0
+    if visible_tokens > int(projection_chunk_size):
+        projection_scratch_bytes = (
+            min(visible_tokens, int(projection_chunk_size))
+            * heads
+            * projected_width
+            * activation_element_size
+        )
+    expanded_k_bytes = (
+        visible_tokens
+        * heads
+        * int(qk_head_dim)
+        * activation_element_size
+    )
+    attention_output_bytes = (
+        current_tokens
+        * heads
+        * int(value_head_dim)
+        * activation_element_size
+    )
+    output_projection_scratch_bytes = (
+        min(current_tokens, int(projection_chunk_size))
+        * int(hidden_size)
+        * activation_element_size
+    )
+    kv_projection_phase_bytes = (
+        gathered_bytes + projected_bytes + projection_scratch_bytes
+    )
+    attention_phase_bytes = (
+        gathered_bytes
+        + projected_bytes
+        + expanded_k_bytes
+        + attention_output_bytes
+    )
+    output_projection_phase_bytes = (
+        attention_output_bytes + output_projection_scratch_bytes
+    )
+    metadata_values = (
+        int(batch_size) * int(max_context_len)
+        + 2 * int(batch_size)
+        + int(max_context_len)
+    )
+    metadata_bytes = (
+        metadata_values * torch.empty((), dtype=torch.int32).element_size()
+    )
+    return int(
+        max(
+            kv_projection_phase_bytes,
+            attention_phase_bytes,
+            output_projection_phase_bytes,
+        )
+        + metadata_bytes
+    )
+
+
+class MLAAttention:
+    """Semantic MLA execution over tagged cache views.
+
+    Model code owns projection weights, query absorption, and V reconstruction.
+    This object owns provider binding, decode workspace, full-history gathering,
+    and reuse of the existing 256-wide prefill attention backend.
+    """
+
+    def __init__(
+        self,
+        *,
+        spec: MlaAttentionOpSpec,
+        provider: MlaAttentionProvider,
+        prefill_workspace_bytes: int,
+        hidden_size: int,
+        projection_chunk_size: int,
+    ) -> None:
+        self.spec = spec
+        self.provider = provider
+        provider_spec = getattr(provider, "spec", None)
+        if provider_spec is not None and provider_spec != spec:
+            raise ValueError(
+                "MLA semantic layer and provider specs must match: "
+                f"layer={spec!r} provider={provider_spec!r}."
+            )
+        self.max_batch_size = int(getattr(provider, "max_batch_size", 0))
+        if self.max_batch_size <= 0:
+            raise ValueError("MLA provider must expose a positive max_batch_size.")
+        self.prefill_workspace_bytes = int(prefill_workspace_bytes)
+        if self.prefill_workspace_bytes <= 0:
+            raise ValueError(
+                "MLA prefill_workspace_bytes must be positive, got "
+                f"{self.prefill_workspace_bytes}."
+            )
+        self.hidden_size = int(hidden_size)
+        self.projection_chunk_size = int(projection_chunk_size)
+        if self.hidden_size <= 0 or self.projection_chunk_size <= 0:
+            raise ValueError(
+                "MLA hidden_size and projection_chunk_size must be positive, "
+                f"got {self.hidden_size} and {self.projection_chunk_size}."
+            )
+        if self.spec.qk_head_dim != self.spec.value_head_dim:
+            raise ValueError(
+                "The existing prefill backend requires equal QK/value widths, "
+                f"got {self.spec.qk_head_dim}/{self.spec.value_head_dim}."
+            )
+        self.prefill_backend = TritonAttentionBackend()
+        self._prefill_plan: _MlaPrefillPlan | None = None
+        self._prefill_query_plan: _MlaPrefillQueryPlan | None = None
+        self._key_materializer_bindings: dict[int, tuple[object, Callable]] = {}
+
+    @classmethod
+    def bind(
+        cls,
+        *,
+        spec: MlaAttentionOpSpec,
+        device: torch.device | str,
+        max_batch_size: int,
+        prefill_workspace_bytes: int,
+        hidden_size: int,
+        projection_chunk_size: int,
+    ) -> "MLAAttention":
+        provider = resolve_mla_attention_provider(
+            spec,
+            device=device,
+            max_batch_size=max_batch_size,
+        )
+        return cls(
+            spec=spec,
+            provider=provider,
+            prefill_workspace_bytes=prefill_workspace_bytes,
+            hidden_size=hidden_size,
+            projection_chunk_size=projection_chunk_size,
+        )
+
+    @property
+    def device(self) -> torch.device:
+        return torch.device(getattr(self.provider, "device"))
+
+    @property
+    def supports_explicit_prefill(self) -> bool:
+        return bool(getattr(self.provider, "supports_explicit_prefill", False))
+
+    def _require_mla_payload(
+        self,
+        view: PrefillComputeView | DecodeComputeView | AttentionKeyComputeView,
+        *,
+        operation: str,
+    ) -> MlaLatentPayload:
+        payload = view.payload
+        if not isinstance(payload, MlaLatentPayload):
+            raise TypeError(
+                f"{operation} requires MlaLatentPayload, got "
+                f"{type(payload).__name__}."
+            )
+        for name, tensor, width in (
+            ("latent_cache", payload.latent_cache, self.spec.kv_lora_rank),
+            ("rope_cache", payload.rope_cache, self.spec.rope_dim),
+        ):
+            if tensor.device != self.device:
+                raise ValueError(
+                    f"{name} is on {tensor.device}, expected {self.device}."
+                )
+            if tensor.dtype != self.spec.cache_dtype:
+                raise TypeError(
+                    f"{name} must use {self.spec.cache_dtype}, got {tensor.dtype}."
+                )
+            if tensor.ndim != 3 or tuple(tensor.shape[1:]) != (1, width):
+                raise ValueError(
+                    f"{name} must have shape [slots, 1, {width}], got "
+                    f"{tuple(tensor.shape)}."
+                )
+        if payload.latent_cache.shape[0] != payload.rope_cache.shape[0]:
+            raise ValueError("MLA latent and RoPE caches must have equal slots.")
+        return payload
+
+    def _get_prefill_plan(
+        self,
+        meta: AttentionViewMeta,
+        *,
+        cache_slot_count: int,
+        query_tokens: int,
+    ) -> _MlaPrefillPlan:
+        cached = self._prefill_plan
+        validation_scope = get_context().attention_validation_scope
+        if cached is not None and cached.matches(
+            validation_scope,
+            meta,
+            cache_slot_count,
+            query_tokens,
+        ):
+            return cached
+
+        metadata = {
+            "active_slots": meta.active_slots,
+            "req_indices": meta.req_indices,
+            "context_lens": meta.context_lens,
+        }
+        for name, tensor in metadata.items():
+            if tensor.device != self.device:
+                raise ValueError(
+                    f"{name} is on {tensor.device}, expected {self.device}."
+                )
+            if tensor.dtype != torch.int32:
+                raise TypeError(
+                    f"{name} must use {torch.int32}, got {tensor.dtype}."
+                )
+        if meta.context_lens.ndim != 1 or meta.context_lens.numel() == 0:
+            raise ValueError(
+                "MLA prefill context_lens must be a non-empty 1D tensor."
+            )
+        batch_size = int(meta.context_lens.numel())
+        if meta.active_slots.ndim != 2:
+            raise ValueError(
+                "MLA prefill active_slots must have shape "
+                "[rows, max_context_len]."
+            )
+        if meta.req_indices.shape != (batch_size,):
+            raise ValueError(
+                f"MLA prefill req_indices must have shape ({batch_size},), "
+                f"got {tuple(meta.req_indices.shape)}."
+            )
+        if batch_size > self.max_batch_size:
+            raise ValueError(
+                "MLA prefill batch exceeds the bound operator capacity: "
+                f"batch={batch_size} max_batch_size={self.max_batch_size}."
+            )
+
+        lengths = _host_int_values(meta.context_lens)
+        if any(length < 0 for length in lengths):
+            raise ValueError(
+                f"MLA prefill context lengths must be non-negative: {lengths}."
+            )
+        total_visible_tokens = int(sum(lengths))
+        if total_visible_tokens <= 0:
+            raise ValueError("MLA prefill requires at least one visible token.")
+        max_context_len = int(max(lengths))
+        if (
+            meta.max_context_len is not None
+            and int(meta.max_context_len) < max_context_len
+        ):
+            raise ValueError(
+                "MLA prefill max_context_len is smaller than an actual context: "
+                f"declared={meta.max_context_len} actual={max_context_len}."
+            )
+        required_bytes = estimate_mla_prefill_workspace_bytes(
+            total_visible_tokens=total_visible_tokens,
+            query_tokens=query_tokens,
+            batch_size=batch_size,
+            max_context_len=max_context_len,
+            local_q_heads=self.spec.local_q_heads,
+            kv_lora_rank=self.spec.kv_lora_rank,
+            rope_dim=self.spec.rope_dim,
+            qk_head_dim=self.spec.qk_head_dim,
+            value_head_dim=self.spec.value_head_dim,
+            hidden_size=self.hidden_size,
+            projection_chunk_size=self.projection_chunk_size,
+            activation_dtype=self.spec.activation_dtype,
+            cache_dtype=self.spec.cache_dtype,
+        )
+        if required_bytes > self.prefill_workspace_bytes:
+            raise MemoryError(
+                "MLA full-history prefill workspace exceeds its configured "
+                f"budget: required={required_bytes} bytes budget="
+                f"{self.prefill_workspace_bytes} bytes visible_tokens="
+                f"{total_visible_tokens} local_heads={self.spec.local_q_heads}."
+            )
+
+        packed_starts: list[int] = []
+        cursor = 0
+        for length in lengths:
+            packed_starts.append(cursor)
+            cursor += length
+        packed_offsets = torch.tensor(
+            packed_starts,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        packed_cu_seqlens = torch.tensor(
+            (*packed_starts, total_visible_tokens),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        local_req_indices = torch.arange(
+            batch_size,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        positions = torch.arange(
+            max_context_len,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        packed_slots = packed_offsets[:, None] + positions[None, :]
+        validate_gather_metadata(
+            meta.active_slots,
+            meta.req_indices,
+            meta.context_lens,
+            packed_offsets,
+            cache_slot_count=cache_slot_count,
+            output_capacity=total_visible_tokens,
+            max_context_len=max_context_len,
+        )
+        plan = _MlaPrefillPlan(
+            validation_scope=validation_scope,
+            source_active_slots=meta.active_slots,
+            source_req_indices=meta.req_indices,
+            source_context_lens=meta.context_lens,
+            source_max_context_len=meta.max_context_len,
+            source_query_tokens=int(query_tokens),
+            cache_slot_count=int(cache_slot_count),
+            packed_offsets=packed_offsets,
+            packed_cu_seqlens=packed_cu_seqlens,
+            packed_slots=packed_slots,
+            local_req_indices=local_req_indices,
+            context_lengths=lengths,
+            total_visible_tokens=total_visible_tokens,
+            max_context_len=max_context_len,
+            required_workspace_bytes=required_bytes,
+        )
+        self._prefill_plan = plan
+        return plan
+
+    def prepare_prefill_history(
+        self,
+        view: PrefillComputeView,
+        *,
+        query_tokens: int,
+    ) -> MlaPrefillHistory:
+        if not isinstance(view, PrefillComputeView):
+            raise TypeError(
+                "MLA prefill requires PrefillComputeView, got "
+                f"{type(view).__name__}."
+            )
+        payload = self._require_mla_payload(view, operation="MLA prefill")
+        meta = view.meta
+        plan = self._get_prefill_plan(
+            meta,
+            cache_slot_count=int(payload.latent_cache.shape[0]),
+            query_tokens=query_tokens,
+        )
+        gathered_latent = torch.empty(
+            plan.total_visible_tokens,
+            self.spec.kv_lora_rank,
+            dtype=self.spec.cache_dtype,
+            device=self.device,
+        )
+        gathered_rope = torch.empty(
+            plan.total_visible_tokens,
+            self.spec.rope_dim,
+            dtype=self.spec.cache_dtype,
+            device=self.device,
+        )
+        gather_latent_history(
+            payload.latent_cache,
+            payload.rope_cache,
+            meta.active_slots,
+            meta.req_indices,
+            meta.context_lens,
+            plan.packed_offsets,
+            gathered_latent,
+            gathered_rope,
+            max_context_len=plan.max_context_len,
+            validate_metadata=False,
+        )
+        return MlaPrefillHistory(
+            gathered_latent=gathered_latent,
+            gathered_rope=gathered_rope,
+            packed_offsets=plan.packed_offsets,
+            packed_cu_seqlens=plan.packed_cu_seqlens,
+            packed_slots=plan.packed_slots,
+            local_req_indices=plan.local_req_indices,
+            context_lens=meta.context_lens,
+            context_lengths=plan.context_lengths,
+            max_context_len=plan.max_context_len,
+            required_workspace_bytes=plan.required_workspace_bytes,
+        )
+
+    def bind_prefill_kv(
+        self,
+        history: MlaPrefillHistory,
+        *,
+        expanded_k: torch.Tensor,
+        expanded_v: torch.Tensor,
+    ) -> MlaPrefillWorkset:
+        if not isinstance(history, MlaPrefillHistory):
+            raise TypeError(
+                "bind_prefill_kv requires MlaPrefillHistory, got "
+                f"{type(history).__name__}."
+            )
+        if (
+            history.gathered_latent.device != self.device
+            or history.gathered_rope.device != self.device
+        ):
+            raise ValueError("MLA prefill history is on the wrong device.")
+        if (
+            history.gathered_latent.dtype != self.spec.cache_dtype
+            or history.gathered_rope.dtype != self.spec.cache_dtype
+        ):
+            raise TypeError("MLA prefill history uses the wrong cache dtype.")
+        expected_k_shape = (
+            history.visible_tokens,
+            self.spec.local_q_heads,
+            self.spec.qk_head_dim,
+        )
+        expected_v_shape = (
+            history.visible_tokens,
+            self.spec.local_q_heads,
+            self.spec.value_head_dim,
+        )
+        for name, tensor, expected_shape in (
+            ("expanded_k", expanded_k, expected_k_shape),
+            ("expanded_v", expanded_v, expected_v_shape),
+        ):
+            if tuple(tensor.shape) != expected_shape:
+                raise ValueError(
+                    f"{name} must have shape {expected_shape}, got "
+                    f"{tuple(tensor.shape)}."
+                )
+            if tensor.device != self.device:
+                raise ValueError(
+                    f"{name} is on {tensor.device}, expected {self.device}."
+                )
+            if tensor.dtype != self.spec.activation_dtype:
+                raise TypeError(
+                    f"{name} must use {self.spec.activation_dtype}, got "
+                    f"{tensor.dtype}."
+                )
+            if tensor.stride(-1) != 1:
+                raise ValueError(f"{name} must be contiguous in its last dimension.")
+        return MlaPrefillWorkset(
+            history=history,
+            expanded_k=expanded_k,
+            expanded_v=expanded_v,
+        )
+
+    @torch.no_grad()
+    def materialize_expanded_keys(
+        self,
+        view: AttentionKeyComputeView,
+        *,
+        project_latent: Callable[[torch.Tensor], torch.Tensor],
+    ) -> torch.Tensor:
+        """Reconstruct the exact post-RoPE per-head keys for selected slots."""
+
+        if not isinstance(view, AttentionKeyComputeView):
+            raise TypeError(
+                "MLA key materialization requires AttentionKeyComputeView, got "
+                f"{type(view).__name__}."
+            )
+        payload = self._require_mla_payload(
+            view,
+            operation="MLA key materialization",
+        )
+        slots = view.active_slots
+        if slots.ndim == 0:
+            raise ValueError("MLA key materialization slots must not be scalar.")
+        if slots.dtype not in (torch.int32, torch.int64):
+            raise TypeError(
+                "MLA key materialization slots must use int32 or int64, got "
+                f"{slots.dtype}."
+            )
+        if slots.device != self.device:
+            raise ValueError(
+                "MLA key materialization slots are on the wrong device: "
+                f"slots={slots.device} expected={self.device}."
+            )
+
+        flat_slots = slots.to(torch.long).reshape(-1)
+        latent = payload.latent_cache.index_select(0, flat_slots).squeeze(1)
+        rope = payload.rope_cache.index_select(0, flat_slots).squeeze(1)
+        projected = project_latent(latent)
+        qk_nope_head_dim = int(self.spec.qk_head_dim) - int(self.spec.rope_dim)
+        projected_width = qk_nope_head_dim + int(self.spec.value_head_dim)
+        expected_shape = (
+            int(flat_slots.numel()),
+            int(self.spec.local_q_heads) * projected_width,
+        )
+        if tuple(projected.shape) != expected_shape:
+            raise RuntimeError(
+                "MLA key projection returned an invalid shape: "
+                f"got={tuple(projected.shape)} expected={expected_shape}."
+            )
+        if projected.device != self.device:
+            raise RuntimeError(
+                "MLA key projection returned the wrong device: "
+                f"got={projected.device} expected={self.device}."
+            )
+        if projected.dtype != self.spec.activation_dtype:
+            raise TypeError(
+                "MLA key projection returned the wrong dtype: "
+                f"got={projected.dtype} expected={self.spec.activation_dtype}."
+            )
+
+        expanded = projected.view(
+            int(flat_slots.numel()),
+            self.spec.local_q_heads,
+            projected_width,
+        )
+        expanded_k_nope = expanded[..., :qk_nope_head_dim]
+        expanded_rope = rope[:, None, :].expand(
+            -1,
+            self.spec.local_q_heads,
+            -1,
+        )
+        keys = torch.cat((expanded_k_nope, expanded_rope), dim=-1)
+        return keys.view(
+            *slots.shape,
+            self.spec.local_q_heads,
+            self.spec.qk_head_dim,
+        )
+
+    def run_prefill(
+        self,
+        q: torch.Tensor,
+        workset: MlaPrefillWorkset,
+        *,
+        b_start_loc: torch.Tensor,
+        chunk_lens: torch.Tensor,
+    ) -> torch.Tensor:
+        history = workset.history
+        if q.ndim != 3:
+            raise ValueError(
+                "MLA prefill q must have shape [tokens, local_heads, 256], "
+                f"got {tuple(q.shape)}."
+            )
+        expected_q_shape = (
+            int(q.shape[0]),
+            self.spec.local_q_heads,
+            self.spec.qk_head_dim,
+        )
+        if tuple(q.shape) != expected_q_shape:
+            raise ValueError(
+                f"MLA prefill q must have shape {expected_q_shape}, got "
+                f"{tuple(q.shape)}."
+            )
+        if q.device != self.device or q.dtype != self.spec.activation_dtype:
+            raise TypeError(
+                "MLA prefill q must match the operator device/dtype: "
+                f"q={q.device}/{q.dtype} expected="
+                f"{self.device}/{self.spec.activation_dtype}."
+            )
+        query_tokens = int(q.shape[0])
+        validation_scope = get_context().attention_validation_scope
+        batch_size = int(history.context_lens.numel())
+        for name, tensor in (
+            ("b_start_loc", b_start_loc),
+            ("chunk_lens", chunk_lens),
+        ):
+            if tensor.shape != (batch_size,):
+                raise ValueError(
+                    f"{name} must have shape ({batch_size},), got "
+                    f"{tuple(tensor.shape)}."
+                )
+            if tensor.device != self.device or tensor.dtype != torch.int32:
+                raise TypeError(
+                    f"{name} must be int32 on {self.device}, got "
+                    f"{tensor.device}/{tensor.dtype}."
+                )
+        cached_query_plan = self._prefill_query_plan
+        if cached_query_plan is None or not cached_query_plan.matches(
+            validation_scope,
+            history.context_lens,
+            query_tokens,
+        ):
+            chunks = _host_int_values(chunk_lens)
+            starts = _host_int_values(b_start_loc)
+            expected_starts: list[int] = []
+            cursor = 0
+            for chunk in chunks:
+                expected_starts.append(cursor)
+                cursor += chunk
+            if starts != tuple(expected_starts) or cursor != query_tokens:
+                raise ValueError(
+                    "MLA prefill query packing is inconsistent: "
+                    f"starts={starts} expected_starts={expected_starts} "
+                    f"chunk_tokens={cursor} q_tokens={query_tokens}."
+                )
+            contexts = history.context_lengths
+            if any(
+                chunk <= 0 or chunk > context
+                for chunk, context in zip(chunks, contexts)
+            ):
+                raise ValueError(
+                    "MLA prefill chunk lengths must be positive and no larger "
+                    f"than their contexts: chunks={chunks} contexts={contexts}."
+                )
+            self._prefill_query_plan = _MlaPrefillQueryPlan(
+                validation_scope=validation_scope,
+                source_context_lens=history.context_lens,
+                query_tokens=query_tokens,
+                max_query_len=max(chunks),
+            )
+
+        explicit_view = self.build_prefill_explicit_view(workset)
+        if self.supports_explicit_prefill:
+            run_prefill = getattr(self.provider, "run_explicit_prefill", None)
+            if not callable(run_prefill):
+                raise RuntimeError(
+                    f"MLA provider {self.provider.name!r} advertises explicit "
+                    "prefill without a run_explicit_prefill implementation."
+                )
+            cu_seqlens_q = get_context().cu_seqlens_q
+            if cu_seqlens_q is None:
+                raise RuntimeError("MLA explicit prefill requires cu_seqlens_q.")
+            output = torch.empty(
+                (query_tokens, self.spec.local_q_heads, self.spec.value_head_dim),
+                dtype=q.dtype,
+                device=q.device,
+            )
+            return run_prefill(
+                q,
+                explicit_view,
+                output,
+                cu_seqlens_q=cu_seqlens_q,
+                max_seqlen_q=self._prefill_query_plan.max_query_len,
+                validation_scope=validation_scope,
+            )
+        return self.prefill_backend.run_prefill(
+            q,
+            explicit_view,
+            b_start_loc=b_start_loc,
+            chunk_lens=chunk_lens,
+            max_input_len=history.max_context_len,
+        )
+
+    def build_prefill_explicit_view(
+        self,
+        workset: MlaPrefillWorkset,
+    ) -> PrefillComputeView:
+        """Expose the exact expanded KV view used by prefill score kernels."""
+
+        if not isinstance(workset, MlaPrefillWorkset):
+            raise TypeError(
+                "build_prefill_explicit_view requires MlaPrefillWorkset, got "
+                f"{type(workset).__name__}."
+            )
+        history = workset.history
+        return PrefillComputeView(
+            meta=AttentionViewMeta(
+                active_slots=history.packed_slots,
+                req_indices=history.local_req_indices,
+                context_lens=history.context_lens,
+                max_context_len=history.max_context_len,
+            ),
+            payload=ExplicitKVPayload(
+                k_cache=workset.expanded_k,
+                v_cache=workset.expanded_v,
+                metadata={
+                    "layout": "mla_packed_varlen",
+                    "cu_seqlens_k": history.packed_cu_seqlens,
+                },
+            ),
+        )
+
+    def run_decode(
+        self,
+        q_nope_absorbed: torch.Tensor,
+        q_rope: torch.Tensor,
+        view: DecodeComputeView,
+    ) -> torch.Tensor:
+        if not isinstance(view, DecodeComputeView):
+            raise TypeError(
+                "MLA decode requires DecodeComputeView, got "
+                f"{type(view).__name__}."
+            )
+        self._require_mla_payload(view, operation="MLA decode")
+        output = torch.empty_like(q_nope_absorbed)
+        context = get_context()
+        valid_batch_size = (
+            int(q_nope_absorbed.shape[0])
+            if context.seqs is None
+            else len(context.seqs)
+        )
+        return self.provider.run(
+            q_nope_absorbed,
+            q_rope,
+            view,
+            output,
+            validation_scope=context.attention_validation_scope,
+            valid_batch_size=valid_batch_size,
+        )
+
+    def _ensure_key_materializer(
+        self,
+        cache_manager,
+        layer_idx: int,
+        project_latent: Callable[[torch.Tensor], torch.Tensor],
+    ) -> None:
+        layer_idx = int(layer_idx)
+        binding = self._key_materializer_bindings.get(layer_idx)
+        if binding is not None and binding[0] is cache_manager:
+            return
+
+        def materialize(view: AttentionKeyComputeView) -> torch.Tensor:
+            return self.materialize_expanded_keys(
+                view,
+                project_latent=project_latent,
+            )
+
+        cache_manager.register_attention_key_materializer(layer_idx, materialize)
+        self._key_materializer_bindings[layer_idx] = (cache_manager, materialize)
+
+    def run_cached_attention(
+        self,
+        q: torch.Tensor,
+        q_nope: torch.Tensor,
+        q_rope: torch.Tensor,
+        latent: torch.Tensor,
+        rope: torch.Tensor,
+        *,
+        project_latent: Callable[[torch.Tensor], torch.Tensor],
+        absorb_query: Callable[[torch.Tensor], torch.Tensor],
+        reconstruct_values: Callable[[torch.Tensor], torch.Tensor],
+    ) -> torch.Tensor:
+        """Execute MLA over the active cache view for the current layer."""
+
+        context = get_context()
+        cache_manager = context.cache_manager
+        sparse_controller = context.sparse_controller
+        layer_idx = int(context.now_layer_idx)
+        self._ensure_key_materializer(cache_manager, layer_idx, project_latent)
+        slot_mapping = cache_manager.store_attention_payload(
+            layer_idx,
+            MlaLatentWrite(latent=latent.unsqueeze(1), rope=rope.unsqueeze(1)),
+        )
+        cache_manager.on_kv_stored(layer_idx, latent, slot_mapping)
+
+        temp_slots = None
+        try:
+            if context.is_prefill:
+                selection = sparse_controller.get_prefill_selection(layer_idx)
+                cache_manager.before_prefill_layer_attention(layer_idx, selection)
+                view = cache_manager.build_prefill_compute_view(
+                    layer_idx,
+                    latent,
+                    rope,
+                    selection,
+                )
+                temp_slots = view.meta.temp_slots
+                if context.cu_seqlens_q is None or context.cu_seqlens_q.numel() <= 1:
+                    return torch.empty_like(q)
+                history = self.prepare_prefill_history(
+                    view,
+                    query_tokens=int(q.shape[0]),
+                )
+                qk_nope_head_dim = self.spec.qk_head_dim - self.spec.rope_dim
+                projected_width = qk_nope_head_dim + self.spec.value_head_dim
+                expanded = project_latent(history.gathered_latent).view(
+                    history.visible_tokens,
+                    self.spec.local_q_heads,
+                    projected_width,
+                )
+                expanded_k_nope, expanded_v = expanded.split(
+                    [qk_nope_head_dim, self.spec.value_head_dim],
+                    dim=-1,
+                )
+                expanded_k = torch.empty(
+                    (
+                        history.visible_tokens,
+                        self.spec.local_q_heads,
+                        self.spec.qk_head_dim,
+                    ),
+                    dtype=expanded.dtype,
+                    device=expanded.device,
+                )
+                expanded_k[..., :qk_nope_head_dim].copy_(expanded_k_nope)
+                expanded_k[..., qk_nope_head_dim:].copy_(
+                    history.gathered_rope[:, None, :]
+                )
+                workset = self.bind_prefill_kv(
+                    history,
+                    expanded_k=expanded_k,
+                    expanded_v=expanded_v,
+                )
+                b_start_loc = context.cu_seqlens_q[:-1]
+                chunk_lens = context.cu_seqlens_q[1:] - context.cu_seqlens_q[:-1]
+                output = self.run_prefill(
+                    q,
+                    workset,
+                    b_start_loc=b_start_loc,
+                    chunk_lens=chunk_lens,
+                )
+                explicit_view = self.build_prefill_explicit_view(workset)
+                cache_manager.collect_prefill_attention_score(
+                    layer_idx,
+                    q,
+                    explicit_view,
+                    b_start_loc=b_start_loc,
+                    chunk_lens=chunk_lens,
+                )
+                cache_manager.record_prefill_query(
+                    layer_idx,
+                    q,
+                    view,
+                    b_start_loc=b_start_loc,
+                    chunk_lens=chunk_lens,
+                )
+            else:
+                selection = sparse_controller.get_decode_selection(layer_idx, q)
+                view = cache_manager.build_decode_compute_view(
+                    layer_idx,
+                    q,
+                    selection,
+                    num_heads=self.spec.local_q_heads,
+                    num_kv_heads=1,
+                )
+                output = reconstruct_values(
+                    self.run_decode(absorb_query(q_nope), q_rope, view)
+                )
+                cache_manager.record_decode_query(layer_idx, q)
+
+            sparse_controller.on_layer_attention_end(layer_idx)
+            cache_manager.on_layer_attention_end(layer_idx)
+            return output
+        finally:
+            if temp_slots is not None and temp_slots.numel() > 0:
+                cache_manager.release_layer_temp_slots(layer_idx, temp_slots)
+
+__all__ = [
+    "MLAAttention",
+    "MlaPrefillHistory",
+    "MlaPrefillWorkset",
+    "estimate_mla_prefill_workspace_bytes",
+]

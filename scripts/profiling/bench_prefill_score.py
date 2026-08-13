@@ -5,7 +5,7 @@ from collections.abc import Callable
 
 import torch
 
-from sparsevllm.triton_kernel.prefill_score import prefill_score_fwd
+from sparsevllm.kernels.triton.prefill_score import prefill_score_fwd
 
 
 def _make_case(

@@ -2,15 +2,19 @@ import os
 
 import torch
 
-from sparsevllm.engine.cache_manager import DecodeComputeView, PrefillComputeView
+from sparsevllm.engine.cache_manager import (
+    DecodeComputeView,
+    ExplicitKVPayload,
+    PrefillComputeView,
+)
 from sparsevllm.operators.registry import record_operator_binding
 from sparsevllm.utils.context import get_context
-from sparsevllm.triton_kernel.context_flashattention_nopad import context_attention_fwd
-from sparsevllm.triton_kernel.flash_decoding_stage1 import flash_decode_stage1 as mha_flash_decode_stage1
-from sparsevllm.triton_kernel.flash_decoding_stage1 import flash_decode_stage1_with_score as mha_flash_decode_stage1_with_score
-from sparsevllm.triton_kernel.flash_decoding_stage2 import flash_decode_stage2
-from sparsevllm.triton_kernel.gqa_flash_decoding_stage1 import flash_decode_stage1 as gqa_flash_decode_stage1
-from sparsevllm.triton_kernel.gqa_flash_decoding_stage1 import flash_decode_stage1_with_score as gqa_flash_decode_stage1_with_score
+from sparsevllm.kernels.triton.context_flashattention_nopad import context_attention_fwd
+from sparsevllm.kernels.triton.flash_decoding_stage1 import flash_decode_stage1 as mha_flash_decode_stage1
+from sparsevllm.kernels.triton.flash_decoding_stage1 import flash_decode_stage1_with_score as mha_flash_decode_stage1_with_score
+from sparsevllm.kernels.triton.flash_decoding_stage2 import flash_decode_stage2
+from sparsevllm.kernels.triton.gqa_flash_decoding_stage1 import flash_decode_stage1 as gqa_flash_decode_stage1
+from sparsevllm.kernels.triton.gqa_flash_decoding_stage1 import flash_decode_stage1_with_score as gqa_flash_decode_stage1_with_score
 from sparsevllm.utils.log import log_once
 from sparsevllm.utils.profiler import profiler
 
@@ -92,6 +96,20 @@ def _fill_fake_attention_score(attn_score: torch.Tensor | None) -> None:
         attn_score.zero_()
 
 
+def _require_explicit_payload(
+    view: PrefillComputeView | DecodeComputeView,
+    *,
+    operation: str,
+) -> ExplicitKVPayload:
+    payload = view.payload
+    if not isinstance(payload, ExplicitKVPayload):
+        raise TypeError(
+            f"{operation} requires ExplicitKVPayload, got "
+            f"{type(payload).__name__}."
+        )
+    return payload
+
+
 class TritonAttentionBackend:
     """Thin backend wrapper around the existing Sparse-vLLM Triton attention kernels."""
 
@@ -99,6 +117,33 @@ class TritonAttentionBackend:
 
     def __init__(self) -> None:
         record_operator_binding("Attention", self)
+
+    def maybe_run_fake_prefill(
+        self,
+        q: torch.Tensor,
+        view: PrefillComputeView,
+        *,
+        chunk_lens: torch.Tensor,
+        max_input_len: int,
+    ) -> torch.Tensor | None:
+        if not _fake_prefill_attention_enabled():
+            return None
+        meta = view.meta
+        probe_context_tokens = int(meta.max_context_len or max_input_len)
+        real_probe_min_context = _warmup_real_prefill_probe_min_context()
+        if (
+            real_probe_min_context is not None
+            and probe_context_tokens >= real_probe_min_context
+        ):
+            log_once(
+                "Warmup real prefill attention probe executing at "
+                f"context_tokens={probe_context_tokens} query_tokens={int(q.shape[0])} "
+                f"batch_seqs={int(chunk_lens.shape[0])}.",
+                level="INFO",
+            )
+            return None
+        _fill_fake_attention_score(meta.attn_score)
+        return _fake_attention_output(q)
 
     def run_prefill(
         self,
@@ -109,30 +154,32 @@ class TritonAttentionBackend:
         chunk_lens: torch.Tensor,
         max_input_len: int,
     ) -> torch.Tensor:
-        b_seq_len = view.context_lens
+        payload = _require_explicit_payload(view, operation="Triton prefill")
+        meta = view.meta
+        b_seq_len = meta.context_lens
         if b_seq_len.numel() != chunk_lens.numel():
             layer_idx = getattr(get_context(), "now_layer_idx", None)
             raise RuntimeError(
                 "prefill context_lens/chunk_lens batch mismatch: "
                 f"layer={layer_idx} context_lens_shape={tuple(b_seq_len.shape)} "
                 f"chunk_lens_shape={tuple(chunk_lens.shape)} q_shape={tuple(q.shape)} "
-                f"req_indices_shape={tuple(view.req_indices.shape)} "
-                f"active_slots_shape={tuple(view.active_slots.shape)}"
+                f"req_indices_shape={tuple(meta.req_indices.shape)} "
+                f"active_slots_shape={tuple(meta.active_slots.shape)}"
             )
         b_prompt_cache_len = b_seq_len - chunk_lens
-        self._debug_check_prefill_bounds(q, view, chunk_lens=chunk_lens)
+        self.debug_check_prefill_bounds(q, view, chunk_lens=chunk_lens)
         if _fake_prefill_attention_enabled():
             real_probe_min_context = _warmup_real_prefill_probe_min_context()
             probe_context_tokens = (
-                int(view.max_context_len)
-                if view.max_context_len is not None
+                int(meta.max_context_len)
+                if meta.max_context_len is not None
                 else int(max_input_len)
             )
             if (
                 real_probe_min_context is None
                 or probe_context_tokens < real_probe_min_context
             ):
-                _fill_fake_attention_score(view.attn_score)
+                _fill_fake_attention_score(meta.attn_score)
                 return _fake_attention_output(q)
             log_once(
                 "Warmup real prefill attention probe executing at "
@@ -144,20 +191,20 @@ class TritonAttentionBackend:
         o = torch.empty_like(q)
         context_attention_fwd(
             q,
-            view.k_cache,
-            view.v_cache,
+            payload.k_cache,
+            payload.v_cache,
             o,
-            view.req_indices,
+            meta.req_indices,
             b_start_loc,
             b_seq_len,
             b_prompt_cache_len,
             max_input_len,
-            view.active_slots,
-            attn_score=view.attn_score,
+            meta.active_slots,
+            attn_score=meta.attn_score,
         )
         return o
 
-    def _debug_check_prefill_bounds(
+    def debug_check_prefill_bounds(
         self,
         q: torch.Tensor,
         view: PrefillComputeView,
@@ -168,39 +215,41 @@ class TritonAttentionBackend:
             return
         if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
             return
-        if view.active_slots.dim() != 2:
+        payload = _require_explicit_payload(view, operation="Prefill bounds check")
+        meta = view.meta
+        if meta.active_slots.dim() != 2:
             raise RuntimeError(
-                f"prefill bounds check expects 2D active_slots, got shape={tuple(view.active_slots.shape)}"
+                f"prefill bounds check expects 2D active_slots, got shape={tuple(meta.active_slots.shape)}"
             )
-        rows = view.req_indices.to(torch.long)
+        rows = meta.req_indices.to(torch.long)
         row_min = int(rows.min().item()) if rows.numel() > 0 else 0
         row_max = int(rows.max().item()) if rows.numel() > 0 else -1
-        if row_min < 0 or row_max >= int(view.active_slots.shape[0]):
+        if row_min < 0 or row_max >= int(meta.active_slots.shape[0]):
             raise RuntimeError(
                 "prefill req row index out of bounds: "
-                f"row_min={row_min} row_max={row_max} num_rows={int(view.active_slots.shape[0])}"
+                f"row_min={row_min} row_max={row_max} num_rows={int(meta.active_slots.shape[0])}"
             )
         if int(chunk_lens.sum().item()) != int(q.shape[0]):
             raise RuntimeError(
                 "prefill q/chunk length mismatch: "
                 f"q_tokens={int(q.shape[0])} chunk_tokens={int(chunk_lens.sum().item())}"
             )
-        if bool((view.context_lens < chunk_lens).any().item()):
+        if bool((meta.context_lens < chunk_lens).any().item()):
             raise RuntimeError(
                 "prefill context_lens shorter than chunk_lens: "
-                f"context_lens={view.context_lens.detach().cpu().tolist()} "
+                f"context_lens={meta.context_lens.detach().cpu().tolist()} "
                 f"chunk_lens={chunk_lens.detach().cpu().tolist()}"
             )
-        visible_len = int(view.context_lens.max().item()) if view.context_lens.numel() > 0 else 0
-        if visible_len > int(view.active_slots.shape[1]):
+        visible_len = int(meta.context_lens.max().item()) if meta.context_lens.numel() > 0 else 0
+        if visible_len > int(meta.active_slots.shape[1]):
             raise RuntimeError(
                 "prefill visible length exceeds active slot table width: "
-                f"visible_len={visible_len} active_slots_width={int(view.active_slots.shape[1])}"
+                f"visible_len={visible_len} active_slots_width={int(meta.active_slots.shape[1])}"
             )
-        visible_slots = view.active_slots.index_select(0, rows)[:, :visible_len]
+        visible_slots = meta.active_slots.index_select(0, rows)[:, :visible_len]
         pos = torch.arange(visible_len, device=visible_slots.device)[None, :]
-        valid_pos = pos < view.context_lens[:, None]
-        slot_cap = int(view.k_cache.shape[0])
+        valid_pos = pos < meta.context_lens[:, None]
+        slot_cap = int(payload.k_cache.shape[0])
         bad = ((visible_slots < 0) | (visible_slots >= slot_cap)) & valid_pos
         if bool(bad.any().item()):
             layer_idx = getattr(get_context(), "now_layer_idx", None)
@@ -212,9 +261,9 @@ class TritonAttentionBackend:
             raise RuntimeError(
                 "prefill physical slot out of bounds before attention: "
                 f"layer={layer_idx} batch={bad_b} req_row={bad_req_row} pos={bad_pos} "
-                f"slot={bad_slot} slot_cap={slot_cap} context_len={int(view.context_lens[bad_b].item())} "
-                f"k_shape={tuple(view.k_cache.shape)} v_shape={tuple(view.v_cache.shape)} "
-                f"active_slots_shape={tuple(view.active_slots.shape)}"
+                f"slot={bad_slot} slot_cap={slot_cap} context_len={int(meta.context_lens[bad_b].item())} "
+                f"k_shape={tuple(payload.k_cache.shape)} v_shape={tuple(payload.v_cache.shape)} "
+                f"active_slots_shape={tuple(meta.active_slots.shape)}"
             )
 
     def run_decode(
@@ -228,11 +277,15 @@ class TritonAttentionBackend:
         block_seq: int,
         num_heads: int,
         num_kv_heads: int,
+        gqa_block_n: int = 16,
+        gqa_num_warps: int = 2,
     ) -> torch.Tensor:
+        payload = _require_explicit_payload(view, operation="Triton decode")
+        meta = view.meta
         if _fake_decode_attention_enabled():
-            _fill_fake_attention_score(view.attn_score)
+            _fill_fake_attention_score(meta.attn_score)
             return _fake_attention_output(q)
-        if view.backend == "full_layer_kivi":
+        if payload.backend == "full_layer_kivi":
             self._run_full_layer_kivi_decode_stage1(
                 q,
                 view,
@@ -242,30 +295,40 @@ class TritonAttentionBackend:
                 block_seq=block_seq,
             )
             o = torch.empty_like(q)
-            flash_decode_stage2(mid_o, mid_o_logexpsum, view.context_lens, o, block_seq)
+            flash_decode_stage2(mid_o, mid_o_logexpsum, meta.context_lens, o, block_seq)
             return o
         self._debug_check_decode_bounds(view)
-        if view.backend == "flash_attn_contiguous":
+        if payload.backend == "flash_attn_contiguous":
             from flash_attn import flash_attn_with_kvcache
 
-            if view.active_slots.dim() != 2:
+            if meta.active_slots.dim() != 2:
                 raise RuntimeError("flash_attn_contiguous decode expects a 2D active slot table.")
-            batch, width = int(view.active_slots.shape[0]), int(view.active_slots.shape[1])
+            batch, width = int(meta.active_slots.shape[0]), int(meta.active_slots.shape[1])
             expected = batch * width
-            if int(view.k_cache.shape[0]) < expected or int(view.v_cache.shape[0]) < expected:
+            if int(payload.k_cache.shape[0]) < expected or int(payload.v_cache.shape[0]) < expected:
                 raise RuntimeError(
                     "flash_attn_contiguous decode got a cache smaller than the materialized active view: "
-                    f"cache={int(view.k_cache.shape[0])}/{int(view.v_cache.shape[0])} expected={expected}."
+                    f"cache={int(payload.k_cache.shape[0])}/{int(payload.v_cache.shape[0])} expected={expected}."
                 )
-            k_cache = view.k_cache[:expected].view(batch, width, int(view.k_cache.shape[1]), int(view.k_cache.shape[2]))
-            v_cache = view.v_cache[:expected].view(batch, width, int(view.v_cache.shape[1]), int(view.v_cache.shape[2]))
+            k_cache = payload.k_cache[:expected].view(
+                batch,
+                width,
+                int(payload.k_cache.shape[1]),
+                int(payload.k_cache.shape[2]),
+            )
+            v_cache = payload.v_cache[:expected].view(
+                batch,
+                width,
+                int(payload.v_cache.shape[1]),
+                int(payload.v_cache.shape[2]),
+            )
             with profiler.record("decode_attention_flash_attn_sparse"):
                 # Decode uses q_len=1 and the materialized KV view contains no future tokens.
                 out = flash_attn_with_kvcache(
                     q.unsqueeze(1),
                     k_cache,
                     v_cache,
-                    cache_seqlens=view.context_lens.to(torch.int32),
+                    cache_seqlens=meta.context_lens.to(torch.int32),
                     causal=False,
                 )
             return out.squeeze(1)
@@ -273,57 +336,59 @@ class TritonAttentionBackend:
         profile_kind = "full" if int(max_len_in_batch) > 8192 else "sparse"
         is_gqa = int(num_heads) > int(num_kv_heads)
         with profiler.record(f"decode_attention_stage1_{profile_kind}"):
-            if view.attn_score is not None:
+            if meta.attn_score is not None:
                 if is_gqa:
                     gqa_flash_decode_stage1_with_score(
                         q,
-                        view.k_cache,
-                        view.v_cache,
-                        view.active_slots,
-                        view.req_indices,
-                        view.context_lens,
+                        payload.k_cache,
+                        payload.v_cache,
+                        meta.active_slots,
+                        meta.req_indices,
+                        meta.context_lens,
                         max_len_in_batch,
                         mid_o,
                         mid_o_logexpsum,
-                        view.attn_score,
+                        meta.attn_score,
                         block_seq,
                     )
                 else:
                     mha_flash_decode_stage1_with_score(
                         q,
-                        view.k_cache,
-                        view.v_cache,
-                        view.active_slots,
-                        view.req_indices,
-                        view.context_lens,
+                        payload.k_cache,
+                        payload.v_cache,
+                        meta.active_slots,
+                        meta.req_indices,
+                        meta.context_lens,
                         max_len_in_batch,
                         mid_o,
                         mid_o_logexpsum,
-                        view.attn_score,
+                        meta.attn_score,
                         block_seq,
                     )
             else:
                 if is_gqa:
                     gqa_flash_decode_stage1(
                         q,
-                        view.k_cache,
-                        view.v_cache,
-                        view.active_slots,
-                        view.req_indices,
-                        view.context_lens,
+                        payload.k_cache,
+                        payload.v_cache,
+                        meta.active_slots,
+                        meta.req_indices,
+                        meta.context_lens,
                         max_len_in_batch,
                         mid_o,
                         mid_o_logexpsum,
                         block_seq,
+                        gqa_block_n,
+                        gqa_num_warps,
                     )
                 else:
                     mha_flash_decode_stage1(
                         q,
-                        view.k_cache,
-                        view.v_cache,
-                        view.active_slots,
-                        view.req_indices,
-                        view.context_lens,
+                        payload.k_cache,
+                        payload.v_cache,
+                        meta.active_slots,
+                        meta.req_indices,
+                        meta.context_lens,
                         max_len_in_batch,
                         mid_o,
                         mid_o_logexpsum,
@@ -332,7 +397,7 @@ class TritonAttentionBackend:
 
         o = torch.empty_like(q)
         with profiler.record(f"decode_attention_stage2_{profile_kind}"):
-            flash_decode_stage2(mid_o, mid_o_logexpsum, view.context_lens, o, block_seq)
+            flash_decode_stage2(mid_o, mid_o_logexpsum, meta.context_lens, o, block_seq)
         return o
 
     def _run_full_layer_kivi_decode_stage1(
@@ -345,66 +410,73 @@ class TritonAttentionBackend:
         max_len_in_batch: int,
         block_seq: int,
     ):
-        meta = view.metadata
-        if meta is None:
+        payload = _require_explicit_payload(
+            view,
+            operation="Full-layer KIVI decode",
+        )
+        view_meta = view.meta
+        backend_metadata = payload.metadata
+        if backend_metadata is None:
             raise RuntimeError("full_layer_kivi decode view is missing metadata.")
-        from sparsevllm.triton_kernel.deltakv_kernels import full_layer_kivi_flash_decode_stage1
+        from sparsevllm.kernels.triton.deltakv_kernels import full_layer_kivi_flash_decode_stage1
 
         full_layer_kivi_flash_decode_stage1(
             q=q,
-            raw_k=view.k_cache,
-            raw_v=view.v_cache,
-            raw_slots_map=view.active_slots,
-            kivi_block_slots_map=meta["kivi_block_slots_map"],
-            kivi_block_start_pos=meta["kivi_block_start_pos"],
-            key_packed=meta["key_packed"],
-            key_scales=meta["key_scales"],
-            key_mins=meta["key_mins"],
-            value_packed=meta["value_packed"],
-            value_scales=meta["value_scales"],
-            value_mins=meta["value_mins"],
-            req_indices=view.req_indices,
-            context_lens=view.context_lens,
+            raw_k=payload.k_cache,
+            raw_v=payload.v_cache,
+            raw_slots_map=view_meta.active_slots,
+            kivi_block_slots_map=backend_metadata["kivi_block_slots_map"],
+            kivi_block_start_pos=backend_metadata["kivi_block_start_pos"],
+            key_packed=backend_metadata["key_packed"],
+            key_scales=backend_metadata["key_scales"],
+            key_mins=backend_metadata["key_mins"],
+            value_packed=backend_metadata["value_packed"],
+            value_scales=backend_metadata["value_scales"],
+            value_mins=backend_metadata["value_mins"],
+            req_indices=view_meta.req_indices,
+            context_lens=view_meta.context_lens,
             max_len_in_batch=max_len_in_batch,
             mid_out=mid_o,
             mid_out_logsumexp=mid_o_logexpsum,
-            group_size=int(meta["group_size"]),
+            group_size=int(backend_metadata["group_size"]),
             block_seq=block_seq,
-            block_n=int(meta.get("block_n", 16)),
-            num_warps=int(meta.get("num_warps", 2)),
-            num_stages=int(meta.get("num_stages", 3)),
-            attn_score=view.attn_score,
+            block_n=int(backend_metadata.get("block_n", 16)),
+            num_warps=int(backend_metadata.get("num_warps", 2)),
+            num_stages=int(backend_metadata.get("num_stages", 3)),
+            attn_score=view_meta.attn_score,
         )
 
     def _debug_check_decode_bounds(self, view: DecodeComputeView):
         if os.environ.get("SVLLM_DEBUG_DECODE_BOUNDS", "0") != "1":
             return
-        if view.backend not in {"dense", "flash_attn_contiguous"}:
+        payload = _require_explicit_payload(view, operation="Decode bounds check")
+        meta = view.meta
+        if payload.backend not in {"dense", "flash_attn_contiguous"}:
             return
         if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
             return
-        if view.active_slots.dim() != 2:
+        if meta.active_slots.dim() != 2:
             raise RuntimeError(
-                f"debug slot bounds check expects 2D active_slots, got shape={tuple(view.active_slots.shape)}"
+                f"debug slot bounds check expects 2D active_slots, got shape={tuple(meta.active_slots.shape)}"
             )
-        rows = view.req_indices.to(torch.long)
+        rows = meta.req_indices.to(torch.long)
         row_min = int(rows.min().item()) if rows.numel() > 0 else 0
         row_max = int(rows.max().item()) if rows.numel() > 0 else -1
-        if row_min < 0 or row_max >= int(view.active_slots.shape[0]):
+        if row_min < 0 or row_max >= int(meta.active_slots.shape[0]):
             raise RuntimeError(
                 "decode req row index out of bounds: "
-                f"row_min={row_min} row_max={row_max} num_rows={int(view.active_slots.shape[0])}"
+                f"row_min={row_min} row_max={row_max} num_rows={int(meta.active_slots.shape[0])}"
             )
-        visible_len = int(view.context_lens.max().item()) if view.context_lens.numel() > 0 else 0
-        if visible_len > int(view.active_slots.shape[1]):
+        visible_len = int(meta.context_lens.max().item()) if meta.context_lens.numel() > 0 else 0
+        if visible_len > int(meta.active_slots.shape[1]):
             raise RuntimeError(
                 "decode visible length exceeds Req_to_tokens width: "
-                f"visible_len={visible_len} req_to_tokens_width={int(view.active_slots.shape[1])}"
+                f"visible_len={visible_len} req_to_tokens_width={int(meta.active_slots.shape[1])}"
             )
-        visible_slots = view.active_slots.index_select(0, rows)[:, :visible_len]
+        visible_slots = meta.active_slots.index_select(0, rows)[:, :visible_len]
         pos = torch.arange(visible_len, device=visible_slots.device)[None, :]
-        valid_pos = pos < view.context_lens[:, None]
-        slot_cap = int(view.k_cache.shape[0])
+        valid_pos = pos < meta.context_lens[:, None]
+        slot_cap = int(payload.k_cache.shape[0])
         bad = ((visible_slots < 0) | (visible_slots >= slot_cap)) & valid_pos
         if bool(bad.any().item()):
             loc = bad.nonzero(as_tuple=False)[0]
@@ -415,5 +487,5 @@ class TritonAttentionBackend:
             raise RuntimeError(
                 "decode physical slot out of bounds before attention: "
                 f"batch={bad_b} req_row={bad_req_row} pos={bad_pos} "
-                f"slot={bad_slot} slot_cap={slot_cap} context_len={int(view.context_lens[bad_b].item())}"
+                f"slot={bad_slot} slot_cap={slot_cap} context_len={int(meta.context_lens[bad_b].item())}"
             )
