@@ -96,6 +96,6 @@ explicitly during admission.
 | Model family | Image | Video | Audio |
 | --- | :---: | :---: | :---: |
 | Qwen3.5 / Qwen3.6 Dense and MoE | ✅ | ✅ | — |
-| Gemma 4 Dense and MoE | ✅ | ✅ | Checkpoint dependent |
+| Gemma 4 Dense and MoE | ✅ | ✅ | — |
 
 `—` means that the combination is not currently supported.

@@ -85,6 +85,6 @@ checkpoint 自身的 processor 和 chat template；不受支持的媒体会在�
 | 模型家族 | 图片 | 视频 | 音频 |
 | --- | :---: | :---: | :---: |
 | Qwen3.5 / Qwen3.6 Dense 与 MoE | ✅ | ✅ | — |
-| Gemma 4 Dense 与 MoE | ✅ | ✅ | 取决于 checkpoint |
+| Gemma 4 Dense 与 MoE | ✅ | ✅ | — |
 
 `—` 表示当前不支持该组合。
