@@ -84,7 +84,14 @@ class SparseController:
         self.num_sink = self.config.num_sink_tokens
         self.num_recent = self.config.num_recent_tokens
         self.decode_keep_tokens = self.config.decode_keep_tokens
-        head_dim = resolve_attention_qk_head_dim(self.config.hf_config)
+        layout_dims = tuple(
+            getattr(getattr(self.config, "runtime_layout", None), "kv_head_dims", ())
+        )
+        head_dim = (
+            int(layout_dims[0])
+            if layout_dims
+            else resolve_attention_qk_head_dim(self.config.hf_config)
+        )
         self.attn_softmax_scale = float(head_dim) ** -0.5
         score_dtype_name = str(getattr(self.config, "sparse_attn_score_dtype", "float32") or "float32").lower()
         self.attn_score_dtype = {

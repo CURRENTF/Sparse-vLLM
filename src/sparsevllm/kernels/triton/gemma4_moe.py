@@ -12,17 +12,21 @@ from sparsevllm.kernels.triton.moe import (
 from sparsevllm.kernels.triton.moe_config import device_info, resolve_moe_gemm_config
 
 
-def _gemma4_moe_config(num_tokens: int) -> dict[str, int] | None:
-    if int(num_tokens) > 32:
+def _gemma4_moe_config(
+    num_tokens: int, large_token_config: dict[str, int] | None
+) -> dict[str, int] | None:
+    if int(num_tokens) <= 32:
+        return {
+            "BLOCK_SIZE_M": 16,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 128,
+            "GROUP_SIZE_M": 1,
+            "num_warps": 4,
+            "num_stages": 4,
+        }
+    if int(num_tokens) < 512:
         return None
-    return {
-        "BLOCK_SIZE_M": 16,
-        "BLOCK_SIZE_N": 64,
-        "BLOCK_SIZE_K": 128,
-        "GROUP_SIZE_M": 1,
-        "num_warps": 4,
-        "num_stages": 4,
-    }
+    return None if large_token_config is None else dict(large_token_config)
 
 
 def fused_gemma4_moe(
@@ -34,6 +38,7 @@ def fused_gemma4_moe(
     *,
     num_experts: int,
     local_expert_start: int,
+    large_token_config: dict[str, int] | None = None,
 ) -> torch.Tensor:
     """Run Gemma 4 routed GEGLU experts without changing generic MoE kernels."""
 
@@ -55,7 +60,9 @@ def fused_gemma4_moe(
         hidden_states.device.type,
         int(hidden_states.device.index),
     )
-    w13_config = _gemma4_moe_config(num_tokens) or resolve_moe_gemm_config(
+    w13_config = _gemma4_moe_config(
+        num_tokens, large_token_config
+    ) or resolve_moe_gemm_config(
         dtype=hidden_states.dtype,
         num_tokens=num_tokens,
         top_k=top_k,
@@ -89,7 +96,9 @@ def fused_gemma4_moe(
         launch_config=w13_config,
     )
     activated = gelu_tanh_and_mul_fwd(w13_output)
-    w2_config = _gemma4_moe_config(num_tokens) or resolve_moe_gemm_config(
+    w2_config = _gemma4_moe_config(
+        num_tokens, large_token_config
+    ) or resolve_moe_gemm_config(
         dtype=hidden_states.dtype,
         num_tokens=num_tokens,
         top_k=top_k,

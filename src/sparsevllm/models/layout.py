@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Any
 
-from sparsevllm.utils.config import config_get
+from sparsevllm.utils.config import config_get, config_layer_get
 
 
 def resolve_attention_qk_head_dim(hf_config: Any) -> int:
@@ -313,20 +313,32 @@ class RuntimeLayout:
         )
         if invalid_types:
             raise ValueError(f"Unsupported Gemma 4 layer types: {invalid_types}.")
-        sliding_heads = int(config_get(hf_config, "num_key_value_heads"))
-        sliding_dim = int(config_get(hf_config, "head_dim"))
-        global_dim = int(config_get(hf_config, "global_head_dim", sliding_dim))
-        use_k_eq_v = bool(config_get(hf_config, "attention_k_eq_v", False))
-        global_heads = int(
-            config_get(hf_config, "num_global_key_value_heads", sliding_heads)
-            if use_k_eq_v
-            else sliding_heads
-        )
         heads, dims = [], []
         for layer_idx in layout.kv_idx_to_layer_idx:
             is_full = str(layer_types[layer_idx]) == "full_attention"
-            heads.append(global_heads if is_full else sliding_heads)
-            dims.append(global_dim if is_full else sliding_dim)
+            dims.append(
+                int(
+                    config_layer_get(
+                        hf_config,
+                        layer_idx,
+                        "head_dim",
+                        "global_head_dim" if is_full else "head_dim",
+                    )
+                )
+            )
+            heads.append(
+                int(
+                    config_layer_get(
+                        hf_config,
+                        layer_idx,
+                        "num_key_value_heads",
+                        "num_global_key_value_heads"
+                        if is_full
+                        and config_get(hf_config, "attention_k_eq_v", False)
+                        else "num_key_value_heads",
+                    )
+                )
+            )
         return replace(layout, kv_num_heads=tuple(heads), kv_head_dims=tuple(dims))
 
     def is_full_attention(self, layer_idx: int) -> bool:

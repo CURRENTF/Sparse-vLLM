@@ -30,6 +30,7 @@ from sparsevllm.operators.gemma4_moe import Gemma4PackedExperts
 from sparsevllm.operators.moe import model_activation_dtype
 from sparsevllm.platforms import device_runtime
 from sparsevllm.utils.context import get_context
+from sparsevllm.utils.config import config_get, config_layer_get
 from sparsevllm.utils.weight_target import WeightTarget
 
 _EXPERT_SOURCE_RE = re.compile(
@@ -151,15 +152,25 @@ class Gemma4Attention(nn.Module):
         self.is_kv_shared_layer = layer_idx >= shared_start > 0
         self.sliding_window = int(config.sliding_window) if self.is_sliding else None
         self.head_dim = int(
-            config.head_dim if self.is_sliding else config.global_head_dim
+            config_layer_get(
+                config,
+                layer_idx,
+                "head_dim",
+                "head_dim" if self.is_sliding else "global_head_dim",
+            )
         )
         self.total_num_heads = int(config.num_attention_heads)
         self.num_heads = self.total_num_heads // tp_size
         self.use_k_eq_v = bool(config.attention_k_eq_v and not self.is_sliding)
         self.total_num_kv_heads = int(
-            config.num_global_key_value_heads
-            if self.use_k_eq_v
-            else config.num_key_value_heads
+            config_layer_get(
+                config,
+                layer_idx,
+                "num_key_value_heads",
+                "num_global_key_value_heads"
+                if self.use_k_eq_v
+                else "num_key_value_heads",
+            )
         )
         self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
         self.q_size = self.num_heads * self.head_dim
@@ -464,9 +475,14 @@ class Gemma4Model(nn.Module):
                 layer_type: Gemma4RotaryEmbedding(
                     config,
                     layer_type,
-                    config.head_dim
-                    if layer_type == "sliding_attention"
-                    else config.global_head_dim,
+                    config_layer_get(
+                        config,
+                        config.layer_types.index(layer_type),
+                        "head_dim",
+                        "head_dim"
+                        if layer_type == "sliding_attention"
+                        else "global_head_dim",
+                    ),
                 )
                 for layer_type in set(config.layer_types)
             }
@@ -597,8 +613,8 @@ class Gemma4ForCausalLM(nn.Module):
         head_dims = tuple(
             sorted(
                 {
-                    int(config.head_dim),
-                    int(getattr(config, "global_head_dim", config.head_dim)),
+                    int(config_layer_get(config, layer_idx, "head_dim"))
+                    for layer_idx in range(int(config.num_hidden_layers))
                 }
             )
         )

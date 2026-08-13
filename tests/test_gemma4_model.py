@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -34,21 +35,31 @@ from sparsevllm.models.gemma4 import (
 )
 from sparsevllm.models.layout import RuntimeLayout
 from sparsevllm.operators.gemma4 import (
+    GEMMA4_REGISTRY,
+    Gemma4OpSpec,
+    H20Gemma4OperatorProvider,
     TorchGemma4OperatorProvider,
     TritonGemma4OperatorProvider,
 )
 from sparsevllm.operators.gemma4_moe import (
     GEMMA4_MOE_REGISTRY,
+    H20Gemma4MoeProvider,
     TorchGemma4MoeProvider,
     TritonGemma4MoeProvider,
 )
+from sparsevllm.operators.moe import MoeOpSpec
+from sparsevllm.operators.registry import OpResolver
+from sparsevllm.platforms import DeviceCaps, PlatformEnum
+from sparsevllm.utils.config import config_layer_get
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_gemma4_router_kernels_match_torch():
+    from sparsevllm.kernels.triton.gemma4_fused_router import (
+        gemma4_fused_router_topk,
+    )
     from sparsevllm.kernels.triton.gemma4_router import (
         gemma4_router_input,
-        gemma4_router_topk,
     )
 
     torch.manual_seed(19)
@@ -62,14 +73,32 @@ def test_gemma4_router_kernels_match_torch():
 
     logits = torch.randn(7, 128, dtype=torch.bfloat16, device="cuda")
     expert_scale = torch.randn(128, dtype=torch.bfloat16, device="cuda")
-    actual_weights, actual_ids = gemma4_router_topk(logits, expert_scale, 8)
+    actual_weights, actual_ids = gemma4_fused_router_topk(logits, expert_scale, 8)
     probabilities = logits.float().softmax(-1)
     expected_weights, expected_ids = probabilities.topk(8, dim=-1)
     expected_weights.div_(expected_weights.sum(-1, keepdim=True)).mul_(
         expert_scale[expected_ids]
     )
-    assert torch.equal(actual_ids, expected_ids)
-    torch.testing.assert_close(actual_weights, expected_weights, rtol=1e-5, atol=1e-6)
+    actual_routes = torch.zeros_like(probabilities).scatter_(
+        1, actual_ids.long(), actual_weights
+    )
+    expected_routes = torch.zeros_like(probabilities).scatter_(
+        1, expected_ids, expected_weights
+    )
+    torch.testing.assert_close(actual_routes, expected_routes, rtol=1e-5, atol=1e-6)
+    assert actual_ids.dtype == torch.int32
+
+    for _ in range(3):
+        gemma4_fused_router_topk(logits, expert_scale, 8)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_weights, graph_ids = gemma4_fused_router_topk(logits, expert_scale, 8)
+    logits.copy_(torch.randn_like(logits))
+    graph.replay()
+    replay_weights, replay_ids = graph_weights.clone(), graph_ids.clone()
+    graph.replay()
+    assert torch.equal(replay_ids, graph_ids)
+    assert torch.equal(replay_weights, graph_weights)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -87,8 +116,59 @@ def test_gemma4_provider_gelu_tanh_and_mul_matches_torch(dtype, rows):
 
 
 def test_gemma4_moe_torch_oracle_is_not_a_production_fallback():
-    assert GEMMA4_MOE_REGISTRY.providers == (TritonGemma4MoeProvider,)
+    assert GEMMA4_MOE_REGISTRY.providers == (
+        TritonGemma4MoeProvider,
+        H20Gemma4MoeProvider,
+    )
     assert TorchGemma4MoeProvider not in GEMMA4_MOE_REGISTRY.providers
+
+
+@patch("sparsevllm.operators.gemma4.version", return_value="0.6.15")
+@patch("sparsevllm.operators.gemma4.find_spec", return_value=object())
+def test_gemma4_h20_prefers_dedicated_flashinfer_prefill(_find, _version):
+    caps = DeviceCaps(
+        platform=PlatformEnum.CUDA,
+        device_type="cuda",
+        device_index=0,
+        device_name="NVIDIA H20",
+        compute_capability=(9, 0),
+        runtime_version="13.0",
+        supports_graph_capture=True,
+        supports_triton=True,
+        supports_bfloat16=True,
+        supports_native_fp8=True,
+    )
+    resolved = OpResolver(GEMMA4_REGISTRY).resolve(
+        Gemma4OpSpec(torch.bfloat16, (256, 512), True), caps
+    )
+    assert resolved.provider.name == "gemma4_h20"
+    assert isinstance(resolved.provider, H20Gemma4OperatorProvider)
+    h20_backend = resolved.provider.attention_backend(sliding_window=1024)
+    generic_backend = TritonGemma4OperatorProvider().attention_backend(
+        sliding_window=1024
+    )
+    assert h20_backend.use_window_decode
+    assert h20_backend.global_decode_heads_per_program == 4
+    assert not generic_backend.use_window_decode
+    assert generic_backend.global_decode_heads_per_program is None
+    assert TorchGemma4OperatorProvider not in GEMMA4_REGISTRY.providers
+    moe = OpResolver(GEMMA4_MOE_REGISTRY).resolve(
+        MoeOpSpec(
+            num_experts=128,
+            num_local_experts=128,
+            hidden_size=2816,
+            intermediate_size=1408,
+            top_k=8,
+            activation_dtype=torch.bfloat16,
+            weight_dtype=torch.bfloat16,
+            block_shape=None,
+            ep_size=1,
+            cuda_graph=True,
+            activation="gelu_tanh",
+        ),
+        caps,
+    )
+    assert isinstance(moe.provider, H20Gemma4MoeProvider)
 
 
 def _parallel_context() -> ParallelContext:
@@ -145,13 +225,32 @@ def _config(**overrides) -> Gemma4TextConfig:
     return Gemma4TextConfig(**values)
 
 
+def test_gemma4_serialized_layer_config_uses_global_defaults():
+    config = {
+        "head_dim": 256,
+        "num_key_value_heads": 8,
+        "per_layer_config": {"05": {"head_dim": 512}},
+    }
+    assert config_layer_get(config, 0, "head_dim") == 256
+    assert config_layer_get(config, 5, "head_dim") == 512
+    assert config_layer_get(config, 5, "num_key_value_heads") == 8
+
+
 def test_gemma4_rope_matches_transformers_for_both_layer_types():
     config = _config()
     positions = torch.arange(9)
-    for layer_type, head_dim in (("sliding_attention", 4), ("full_attention", 8)):
+    for layer_idx, (layer_type, head_dim) in enumerate(
+        (("sliding_attention", 4), ("full_attention", 8))
+    ):
         actual = Gemma4RotaryEmbedding(config, layer_type, head_dim)
-        reference = HFGemma4RotaryEmbedding(config, layer_type=layer_type)
-        cos, sin = reference(torch.zeros(1), positions.unsqueeze(0), layer_type)
+        if "layer_type" in inspect.signature(HFGemma4RotaryEmbedding).parameters:
+            reference = HFGemma4RotaryEmbedding(config, layer_type=layer_type)
+            cos, sin = reference(torch.zeros(1), positions.unsqueeze(0), layer_type)
+        else:
+            reference = HFGemma4RotaryEmbedding(config.per_layer_config[layer_idx])
+            cos, sin = reference(
+                torch.zeros(1), positions.unsqueeze(0), layer_type
+            )
         torch.testing.assert_close(
             actual.cos_sin_cache[positions, 0, : head_dim // 2],
             cos[0, :, : head_dim // 2],
@@ -208,11 +307,11 @@ def test_gemma4_k_eq_v_loader_duplicates_normalized_projection_slot():
         attention = Gemma4Attention(
             config,
             1,
-            Gemma4RotaryEmbedding(config, "full_attention", config.global_head_dim),
+            Gemma4RotaryEmbedding(config, "full_attention", 8),
             TorchGemma4OperatorProvider(),
         )
     loaded_key = torch.randn(
-        config.num_global_key_value_heads * config.global_head_dim, config.hidden_size
+        8, config.hidden_size
     )
     attention.qkv_proj.weight_loader(attention.qkv_proj.weight, loaded_key, "k")
     q_end = attention.q_size
@@ -297,12 +396,12 @@ def test_gemma4_shared_kv_attention_only_allocates_query_projection():
         attention = Gemma4Attention(
             config,
             2,
-            Gemma4RotaryEmbedding(config, "sliding_attention", config.head_dim),
+            Gemma4RotaryEmbedding(config, "sliding_attention", 4),
             TorchGemma4OperatorProvider(),
         )
     assert attention.is_kv_shared_layer
     assert tuple(attention.qkv_proj.weight.shape) == (
-        config.num_attention_heads * config.head_dim,
+        config.num_attention_heads * 4,
         config.hidden_size,
     )
     assert not hasattr(attention, "k_norm")

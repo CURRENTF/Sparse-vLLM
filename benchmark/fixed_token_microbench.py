@@ -84,9 +84,13 @@ def _validate(args: argparse.Namespace) -> Path:
         raise ValueError("gpu_memory_utilization must be in (0, 1]")
     if not -1 <= args.nsys_iteration < args.num_iters:
         raise ValueError("nsys_iteration must be -1 or a timed iteration index")
-    if args.backend == "vllm" and args.expert_parallel_size != 1:
+    if args.backend == "vllm" and args.expert_parallel_size not in {
+        1,
+        args.tensor_parallel_size,
+    }:
         raise ValueError(
-            "vLLM uses --expert-parallel-size=1 or --enable-expert-parallel"
+            "vLLM expert parallelism is disabled with EP=1 or spans TP ranks "
+            "with EP=TP"
         )
     output_dir = Path(args.output_dir).expanduser().resolve()
     if output_dir.exists() and any(output_dir.iterdir()):
@@ -105,7 +109,23 @@ def _build_engine(args: argparse.Namespace):
         "enable_prefix_caching": False,
     }
     if args.backend == "vllm":
+        import vllm.config.model as vllm_model_config
         from vllm import LLM
+
+        get_config = vllm_model_config.get_config
+
+        def get_compatible_config(*config_args, **config_kwargs):
+            config = get_config(*config_args, **config_kwargs)
+            text = getattr(config, "text_config", config)
+            layers = getattr(text, "per_layer_config", None)
+            if str(getattr(config, "model_type", "")) == "gemma4" and layers:
+                text.allow_global_per_layer_attribute_access = True
+                full_idx = text.layer_types.index("full_attention")
+                text.global_head_dim = layers[full_idx].head_dim
+                text.num_global_key_value_heads = layers[full_idx].num_key_value_heads
+            return config
+
+        vllm_model_config.get_config = get_compatible_config
 
         return LLM(
             **common,
@@ -127,6 +147,7 @@ def _build_engine(args: argparse.Namespace):
         max_num_seqs_in_gpu=args.batch_size,
         max_num_batched_tokens=args.batch_size * args.input_len,
         decode_cuda_graph=True,
+        enable_multimodal=False,
     )
 
 
@@ -215,12 +236,14 @@ def main() -> int:
                 import torch
 
                 torch.cuda.nvtx.range_push(f"fixed_token_iteration_{iteration}")
+                torch.cuda.cudart().cudaProfilerStart()
             started = perf_counter()
             try:
                 outputs = engine.generate(prompts, params, use_tqdm=False)
                 elapsed = perf_counter() - started
             finally:
                 if profiling:
+                    torch.cuda.cudart().cudaProfilerStop()
                     torch.cuda.nvtx.range_pop()
             if len(outputs) != args.batch_size:
                 raise RuntimeError(

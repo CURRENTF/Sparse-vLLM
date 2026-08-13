@@ -7,7 +7,12 @@ from sparsevllm import platforms
 from sparsevllm.distributed import get_parallel_context
 from sparsevllm.layers.packed_moe import PackedMoeExperts
 from sparsevllm.operators.moe import MoeOpSpec, MoeProvider, model_activation_dtype
-from sparsevllm.operators.registry import OpRegistry, OpResolver, SupportResult
+from sparsevllm.operators.registry import (
+    OpRegistry,
+    OpResolver,
+    SupportResult,
+    runtime_version_at_least,
+)
 from sparsevllm.platforms.interface import DeviceCaps, PlatformEnum
 
 
@@ -49,6 +54,7 @@ class TritonGemma4MoeProvider(Gemma4MoeProvider):
     name = "triton_gemma4_geglu"
     priority = 10
     gate_up_order = "gate_up"
+    _large_token_config = None
 
     @classmethod
     def supports(cls, spec: MoeOpSpec, caps: DeviceCaps) -> SupportResult:
@@ -93,8 +99,33 @@ class TritonGemma4MoeProvider(Gemma4MoeProvider):
             topk_weights,
             num_experts=spec.num_experts,
             local_expert_start=local_expert_start,
+            large_token_config=self._large_token_config,
         )
 
+
+@GEMMA4_MOE_REGISTRY.register
+class H20Gemma4MoeProvider(TritonGemma4MoeProvider):
+    name = "triton_gemma4_geglu_h20"
+    priority = 100
+    _large_token_config = {
+        "BLOCK_SIZE_M": 64,
+        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_K": 64,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 4,
+        "num_stages": 3,
+    }
+
+    @classmethod
+    def supports(cls, spec: MoeOpSpec, caps: DeviceCaps) -> SupportResult:
+        triton = super().supports(spec, caps)
+        if not triton.supported:
+            return triton
+        if caps.compute_capability != (9, 0) or caps.device_name != "NVIDIA H20":
+            return SupportResult.no("requires profiled NVIDIA H20 SM90 hardware")
+        if not runtime_version_at_least(caps.runtime_version, (12, 8)):
+            return SupportResult.no("requires CUDA runtime >= 12.8")
+        return SupportResult.yes()
 
 class TorchGemma4MoeProvider(Gemma4MoeProvider):
     """Explicit correctness oracle; never selected for production inference."""
@@ -221,6 +252,7 @@ __all__ = [
     "GEMMA4_MOE_REGISTRY",
     "Gemma4MoeProvider",
     "Gemma4PackedExperts",
+    "H20Gemma4MoeProvider",
     "TorchGemma4MoeProvider",
     "TritonGemma4MoeProvider",
     "resolve_gemma4_moe_provider",

@@ -1,13 +1,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from importlib.metadata import PackageNotFoundError, version
+from importlib.util import find_spec
 
 import torch
 import torch.nn.functional as F
 
 import sparsevllm.platforms as platforms
 from sparsevllm.layers.rotary_embedding import apply_rotary_emb
-from sparsevllm.operators.registry import OpRegistry, OpResolver, SupportResult
+from sparsevllm.operators.registry import (
+    OpRegistry,
+    OpResolver,
+    SupportResult,
+    runtime_version_at_least,
+)
 from sparsevllm.platforms.interface import DeviceCaps, PlatformEnum
 
 
@@ -155,6 +162,68 @@ class TritonGemma4OperatorProvider(Gemma4OperatorProvider):
         return gemma4_rmsnorm_residual(x, weight, residual, eps, scalar)
 
 
+@GEMMA4_REGISTRY.register
+class H20Gemma4OperatorProvider(TritonGemma4OperatorProvider):
+    """Profiled H20 provider; generic Gemma kernels remain unchanged."""
+
+    name = "gemma4_h20"
+    priority = 100
+
+    @classmethod
+    def supports(cls, spec: Gemma4OpSpec, caps: DeviceCaps) -> SupportResult:
+        triton = super().supports(spec, caps)
+        if not triton.supported:
+            return triton
+        if caps.compute_capability != (9, 0) or caps.device_name != "NVIDIA H20":
+            return SupportResult.no(
+                "requires profiled NVIDIA H20 SM90 hardware, "
+                f"got {caps.device_name} {caps.compute_capability}"
+            )
+        if not runtime_version_at_least(caps.runtime_version, (12, 8)):
+            return SupportResult.no(
+                f"requires CUDA runtime >= 12.8, got {caps.runtime_version or 'unknown'}"
+            )
+        if find_spec("flashinfer") is None:
+            return SupportResult.no("flashinfer is not installed")
+        try:
+            installed = version("flashinfer-python")
+        except PackageNotFoundError:
+            return SupportResult.no("flashinfer-python package metadata is unavailable")
+        try:
+            numeric = tuple(int(part) for part in installed.split(".")[:3])
+        except ValueError:
+            return SupportResult.no(
+                f"cannot parse flashinfer-python version {installed!r}"
+            )
+        if numeric < (0, 6, 15):
+            return SupportResult.no(
+                f"requires flashinfer-python >= 0.6.15, got {installed}"
+            )
+        return SupportResult.yes()
+
+    def __init__(self) -> None:
+        from sparsevllm.operators.gemma4_attention import Gemma4FlashInferPrefill
+
+        self._prefill = Gemma4FlashInferPrefill()
+
+    def router_topk(self, logits, per_expert_scale, top_k):
+        from sparsevllm.kernels.triton.gemma4_fused_router import (
+            gemma4_fused_router_topk,
+        )
+
+        return gemma4_fused_router_topk(logits, per_expert_scale, top_k)
+
+    def attention_backend(self, *, sliding_window: int | None):
+        from sparsevllm.operators.gemma4_attention import Gemma4AttentionBackend
+
+        return Gemma4AttentionBackend(
+            sliding_window=sliding_window,
+            flashinfer_prefill=self._prefill,
+            use_window_decode=True,
+            global_decode_heads_per_program=4,
+        )
+
+
 class TorchGemma4OperatorProvider(Gemma4OperatorProvider):
     """Explicit correctness oracle; never selected for production inference."""
 
@@ -216,6 +285,7 @@ def resolve_gemma4_provider(
 
 __all__ = [
     "GEMMA4_REGISTRY",
+    "H20Gemma4OperatorProvider",
     "Gemma4OperatorProvider",
     "Gemma4OpSpec",
     "TorchGemma4OperatorProvider",

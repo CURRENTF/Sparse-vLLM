@@ -107,10 +107,17 @@ def _gemma4_context_attention_kernel(
                 mask=key_positions < max_key,
             )
         logits = tl.where(visible, logits, -float("inf"))
+        has_visible_key = tl.max(visible.to(tl.int32), axis=1) > 0
         block_max = tl.max(logits, axis=1)
-        new_max = tl.maximum(max_logit, block_max)
-        probabilities = tl.exp2(logits - new_max[:, None])
-        correction = tl.exp2(max_logit - new_max)
+        new_max = tl.where(
+            has_visible_key, tl.maximum(max_logit, block_max), max_logit
+        )
+        probabilities = tl.where(
+            visible, tl.exp2(logits - new_max[:, None]), 0.0
+        )
+        correction = tl.where(
+            has_visible_key, tl.exp2(max_logit - new_max), 1.0
+        )
         denominator = denominator * correction + tl.sum(probabilities, axis=1)
         accumulator *= correction[:, None]
         value = tl.load(

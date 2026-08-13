@@ -244,8 +244,18 @@ class CacheManager(ABC):
             raise ValueError("CacheManager requires config.runtime_layout.")
         self.num_kv_layers = int(self.runtime_layout.num_kv_layers)
 
-        self.num_kv_heads = self.hf_config.num_key_value_heads // self.tp_size
-        self.head_dim = resolve_attention_qk_head_dim(self.hf_config)
+        layout_heads = tuple(getattr(self.runtime_layout, "kv_num_heads", ()))
+        layout_dims = tuple(getattr(self.runtime_layout, "kv_head_dims", ()))
+        self.num_kv_heads = (
+            int(layout_heads[0]) // self.tp_size
+            if layout_heads
+            else int(self.hf_config.num_key_value_heads) // self.tp_size
+        )
+        self.head_dim = (
+            int(layout_dims[0])
+            if layout_dims
+            else resolve_attention_qk_head_dim(self.hf_config)
+        )
 
         self.max_model_len = config.max_model_len
         resident_buffer_rows = int(config.max_num_seqs_in_gpu)
