@@ -39,6 +39,7 @@ def _manager_config(*, method: str, compression_interval: int = 1):
             torch_dtype=torch.float32,
         ),
         runtime_layout=RuntimeLayout.dense(2),
+        attention_cache_layout="explicit_kv",
         max_model_len=5,
         max_num_batched_tokens=10,
         max_num_seqs_in_gpu=3,

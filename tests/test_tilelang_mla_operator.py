@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import subprocess
+import sys
 from importlib import metadata
 from unittest.mock import Mock, patch
 
@@ -94,6 +96,22 @@ def test_tilelang_support_does_not_import_runtime() -> None:
             True,
             "tilelang 0.1.9, apache-tvm-ffi 0.1.10",
         )
+
+
+def test_tilelang_runtime_import_does_not_require_tilelang() -> None:
+    code = """
+import sys
+
+class RejectTileLang:
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "tilelang" or fullname.startswith("tilelang."):
+            raise ModuleNotFoundError("blocked optional tilelang import")
+
+sys.meta_path.insert(0, RejectTileLang())
+from sparsevllm.kernels.tilelang.mla.runtime import tilelang_mla_support
+assert "tilelang" not in sys.modules
+"""
+    subprocess.run([sys.executable, "-c", code], check=True)
 
 
 @pytest.mark.parametrize(
