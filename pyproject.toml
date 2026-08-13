@@ -19,6 +19,7 @@ dependencies = [
     "triton>=3.5,<4",
     "tilelang==0.1.9",
     "apache-tvm-ffi==0.1.10",
+    "nvidia-cutlass-dsl>=4.6,<5",
     "pillow",
     "einops",
     "sgl-kernel>=0.3.21,<0.4",
