@@ -11,10 +11,10 @@ The README contains the current install command. The expected baseline is:
 - Python 3.10.
 - The complete runtime and test environment from
   `requirements/locks/canonical-cu129-py310.txt`.
-- PyTorch 2.9.1 with the CUDA 12.9 wheel and Triton 3.5.1.
+- PyTorch 2.11.0 with the matching CUDA wheel and Triton 3.6.0.
 - `flashinfer-python==0.6.15.post1` and the CUDA 12.9 build of
   `flashinfer-jit-cache==0.6.15.post1`.
-- `sgl-kernel==0.3.21` and `einops>=0.8.2` as runtime dependencies.
+- `sglang-kernel==0.4.5` and `einops>=0.8.2` as runtime dependencies.
 - Optional matching `flashinfer-cubin` installed from the generic FlashInfer
   wheel index when precompiled device binaries are desired.
 - `transformers==5.13.1`.

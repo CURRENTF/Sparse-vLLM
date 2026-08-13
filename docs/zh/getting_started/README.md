@@ -32,13 +32,13 @@ MAX_JOBS=8 uv pip install flash-attn --no-build-isolation
 CUDA 12.9 环境将 `cu130` 换成 `cu129`。已验证的 CUDA 12.9
 [依赖 lock](../../../requirements/locks/README.md) 为可选复现方式。
 
-`einops`、`sgl-kernel` 以及训练、benchmark 和测试包均已是主依赖，
+`einops`、`sglang-kernel` 以及训练、benchmark 和测试包均已是主依赖，
 不再需要工作流专用 extra。
 
 Sparse-vLLM 当前支持未量化 BF16 和 block-scaled FP8 格式的 Qwen3.5/Qwen3.6 checkpoint。
 
 其 prefill causal Conv1D 和 decode Conv1D/GDN packing path 使用仓库本地
-Triton kernel，本身不调用 `sgl-kernel`。
+Triton kernel，本身不调用 `sglang-kernel`。
 
 `flashinfer-cubin` 是可选加速 package：
 

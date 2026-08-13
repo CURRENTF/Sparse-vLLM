@@ -102,7 +102,7 @@ def test_mla_resolver_selects_h100_triton_provider() -> None:
     with (
         patch(
             "sparsevllm.operators.mla_attention.sgl_fa3_support",
-            return_value=(False, "sgl-kernel is not installed"),
+            return_value=(False, "sglang-kernel is not installed"),
         ),
         patch(
             "sparsevllm.operators.mla_attention.allocate_mla_decode_workspace",
@@ -119,8 +119,8 @@ def test_mla_resolver_selects_h100_triton_provider() -> None:
 
     assert isinstance(resolved.provider, MlaTritonProvider)
     assert resolved.rejected == (
-        ("sgl_fa3_h100", "sgl-kernel is not installed"),
-        ("tilelang_score_sgl_fa3_h100", "sgl-kernel is not installed"),
+        ("sgl_fa3_h100", "sglang-kernel is not installed"),
+        ("tilelang_score_sgl_fa3_h100", "sglang-kernel is not installed"),
     )
     allocate.assert_called_once_with(
         batch_size=8,

@@ -15,32 +15,23 @@ from sparsevllm.kernels.external.sgl.fa3 import (
 
 def test_sgl_fa3_support_rejects_missing_package() -> None:
     with patch("importlib.util.find_spec", return_value=None):
-        assert sgl_fa3_support() == (False, "sgl-kernel is not installed")
+        assert sgl_fa3_support() == (False, "sglang-kernel is not installed")
 
 
-def test_sgl_fa3_support_rejects_old_package() -> None:
+@pytest.mark.parametrize("version", ["0.4.4", "0.4.6"])
+def test_sgl_fa3_support_rejects_outside_declared_range(version: str) -> None:
     with (
         patch("importlib.util.find_spec", return_value=object()),
-        patch("importlib.metadata.version", return_value="0.3.20"),
+        patch("importlib.metadata.version", return_value=version),
     ):
         supported, reason = sgl_fa3_support()
 
     assert not supported
-    assert ">=0.3.21,<0.4" in reason
+    assert "sglang-kernel>=0.4.5,<0.4.6" in reason
 
 
-def test_sgl_fa3_support_rejects_04_package() -> None:
-    with (
-        patch("importlib.util.find_spec", return_value=object()),
-        patch("importlib.metadata.version", return_value="0.4.5"),
-    ):
-        supported, reason = sgl_fa3_support()
-
-    assert not supported
-    assert ">=0.3.21,<0.4" in reason
-
-
-def test_sgl_fa3_support_accepts_declared_package() -> None:
+def test_sgl_fa3_support_accepts_declared_range() -> None:
+    version = "0.4.5"
     op = SimpleNamespace(
         _schema=SimpleNamespace(
             arguments=[
@@ -55,19 +46,19 @@ def test_sgl_fa3_support_accepts_declared_package() -> None:
             return_value=op,
         ),
         patch("importlib.util.find_spec", return_value=object()),
-        patch("importlib.metadata.version", return_value="0.3.21"),
+        patch("importlib.metadata.version", return_value=version),
         patch("importlib.import_module", return_value=object()),
     ):
         supported, reason = sgl_fa3_support()
 
     assert supported
-    assert "0.3.21" in reason
+    assert version in reason
 
 
 def test_sgl_fa3_support_rejects_binary_load_failure() -> None:
     with (
         patch("importlib.util.find_spec", return_value=object()),
-        patch("importlib.metadata.version", return_value="0.3.21"),
+        patch("importlib.metadata.version", return_value="0.4.5"),
         patch(
             "importlib.import_module",
             side_effect=ImportError("undefined symbol: c10_cuda_check"),
@@ -98,7 +89,7 @@ def test_sgl_fa3_support_rejects_missing_op_schema() -> None:
 
 @pytest.mark.skipif(
     not torch.cuda.is_available() or not sgl_fa3_support()[0],
-    reason="CUDA and a validated sgl-kernel are required",
+    reason="CUDA and a validated sglang-kernel are required",
 )
 def test_sgl_fa3_decode_matches_torch_and_replays_cuda_graph() -> None:
     torch.manual_seed(20260807)
@@ -238,7 +229,7 @@ def test_sgl_fa3_decode_matches_torch_and_replays_cuda_graph() -> None:
 
 @pytest.mark.skipif(
     not torch.cuda.is_available() or not sgl_fa3_support()[0],
-    reason="CUDA and a validated sgl-kernel are required",
+    reason="CUDA and a validated sglang-kernel are required",
 )
 def test_sgl_fa3_varlen_latent_prefill_matches_causal_torch() -> None:
     torch.manual_seed(20260807)
@@ -310,7 +301,7 @@ def test_sgl_fa3_varlen_latent_prefill_matches_causal_torch() -> None:
 
 @pytest.mark.skipif(
     not torch.cuda.is_available() or not sgl_fa3_support()[0],
-    reason="CUDA and a validated sgl-kernel are required",
+    reason="CUDA and a validated sglang-kernel are required",
 )
 def test_sgl_fa3_varlen_explicit_prefill_matches_causal_torch() -> None:
     torch.manual_seed(20260807)

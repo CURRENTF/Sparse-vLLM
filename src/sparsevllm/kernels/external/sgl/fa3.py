@@ -45,6 +45,8 @@ _FWD_TRAILING_ARGUMENTS = (
     "pack_gqa",
     "sm_margin",
     "sinks",
+    "sparse_mask_fine",
+    "only_qv",
 )
 _FWD_ARGUMENTS = _COMMON_FWD_ARGUMENTS + ("attention_chunk",) + _FWD_TRAILING_ARGUMENTS
 
@@ -114,11 +116,11 @@ def sgl_fa3_support() -> tuple[bool, str]:
         argument_names = tuple(argument.name for argument in op._schema.arguments)
     except Exception as error:
         return False, (
-            "sgl-kernel FA3 raw op failed to load: "
+            "sglang-kernel FA3 raw op failed to load: "
             f"{type(error).__name__}: {error}"
         )
     if argument_names != _FWD_ARGUMENTS:
-        return False, f"unsupported sgl-kernel FA3 fwd schema: {argument_names}"
+        return False, f"unsupported sglang-kernel FA3 fwd schema: {argument_names}"
     return True, reason
 
 
@@ -356,11 +358,11 @@ class SglFa3DecodeKernel:
         ]
         args.append(0)
         args.extend(
-            (0.0, True, scheduler_metadata, split_count, None, 0, None)
+            (0.0, True, scheduler_metadata, split_count, None, 0, None, None, False)
         )
         result: Sequence[torch.Tensor] = self._op(*args)
         if not result or result[0].data_ptr() != output.data_ptr():
-            raise RuntimeError("sgl-kernel FA3 did not write to the supplied output")
+            raise RuntimeError("sglang-kernel FA3 did not write to the supplied output")
         return output
 
     def run_explicit_varlen(
@@ -422,11 +424,11 @@ class SglFa3DecodeKernel:
         ]
         args.append(0)
         args.extend(
-            (0.0, True, scheduler_metadata, self.num_splits, None, 0, None)
+            (0.0, True, scheduler_metadata, self.num_splits, None, 0, None, None, False)
         )
         result: Sequence[torch.Tensor] = self._op(*args)
         if not result or result[0].data_ptr() != output.data_ptr():
-            raise RuntimeError("sgl-kernel FA3 did not write to the supplied output")
+            raise RuntimeError("sglang-kernel FA3 did not write to the supplied output")
         return output
 
     def run_contiguous_explicit_varlen(
@@ -473,10 +475,10 @@ class SglFa3DecodeKernel:
             -1,
         ]
         args.append(0)
-        args.extend((0.0, True, None, self.num_splits, None, 0, None))
+        args.extend((0.0, True, None, self.num_splits, None, 0, None, None, False))
         result: Sequence[torch.Tensor] = self._op(*args)
         if not result or result[0].data_ptr() != output.data_ptr():
-            raise RuntimeError("sgl-kernel FA3 did not write to the supplied output")
+            raise RuntimeError("sglang-kernel FA3 did not write to the supplied output")
         return output
 
 

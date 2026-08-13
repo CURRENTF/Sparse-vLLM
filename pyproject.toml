@@ -22,7 +22,7 @@ dependencies = [
     "nvidia-cutlass-dsl>=4.6,<5",
     "pillow",
     "einops",
-    "sgl-kernel>=0.3.21,<0.4",
+    "sglang-kernel>=0.4.5,<0.4.6",
     "tqdm",
     "loguru",
     "fastapi>=0.100",
@@ -45,12 +45,12 @@ dependencies = [
 
 [project.optional-dependencies]
 cu129 = [
-    "torch>=2.9,<3",
+    "torch==2.11.0",
     "flashinfer-python[cu12]>=0.6.15,<0.7",
     "flashinfer-jit-cache>=0.6.15,<0.7",
 ]
 cu130 = [
-    "torch>=2.9,<3",
+    "torch==2.11.0",
     "flashinfer-python[cu13]>=0.6.15,<0.7",
     "flashinfer-jit-cache>=0.6.15,<0.7",
 ]

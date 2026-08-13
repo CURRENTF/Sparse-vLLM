@@ -35,14 +35,14 @@ MAX_JOBS=8 uv pip install flash-attn --no-build-isolation
 Use `cu129` instead of `cu130` for CUDA 12.9. The validated CUDA 12.9
 [dependency lock](../../../requirements/locks/README.md) is optional.
 
-`einops`, `sgl-kernel`, and the training, benchmark, and test packages are all
+`einops`, `sglang-kernel`, and the training, benchmark, and test packages are all
 runtime dependencies, so workflow-specific extras are not required.
 
 Sparse-vLLM supports Qwen3.5/Qwen3.6 checkpoints in unquantized BF16 and
 block-scaled FP8 formats.
 
 Its prefill causal Conv1D and decode Conv1D/GDN packing paths use local Triton
-kernels and do not call `sgl-kernel` themselves.
+kernels and do not call `sglang-kernel` themselves.
 
 `flashinfer-cubin` is an optional acceleration package:
 

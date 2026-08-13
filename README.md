@@ -132,14 +132,14 @@ uv pip install flashinfer-cubin --index-url https://flashinfer.ai/whl
 Use `cu129` instead of `cu130` for CUDA 12.9. The validated CUDA 12.9
 [dependency lock](requirements/locks/README.md) is optional.
 
-`einops`, `sgl-kernel`, and the training, benchmark, and test packages are all
+`einops`, `sglang-kernel`, and the training, benchmark, and test packages are all
 part of the main installation; no workflow-specific extras are required.
 
 Sparse-vLLM supports Qwen3.5/Qwen3.6 checkpoints in unquantized BF16 and
 block-scaled FP8 formats.
 
 The Qwen3.5/Qwen3.6 prefill causal Conv1D and decode Conv1D/GDN packing paths
-use repository-local Triton kernels; they do not call `sgl-kernel` themselves.
+use repository-local Triton kernels; they do not call `sglang-kernel` themselves.
 
 For the full dependency list and a minimal `LLM(...)` example, see
 [Getting Started](docs/en/getting_started/README.md).

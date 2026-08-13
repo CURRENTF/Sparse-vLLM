@@ -19,12 +19,12 @@ def sgl_moe_alignment_support() -> tuple[bool, str]:
         alignment = importlib.import_module("sgl_kernel").moe_align_block_size
     except Exception as error:
         return False, (
-            "sgl-kernel MoE alignment failed to load: "
+            "sglang-kernel MoE alignment failed to load: "
             f"{type(error).__name__}: {error}"
         )
     return (True, reason) if callable(alignment) else (
         False,
-        "sgl-kernel moe_align_block_size is not callable",
+        "sglang-kernel moe_align_block_size is not callable",
     )
 
 
@@ -69,8 +69,8 @@ def sgl_moe_align_block_size(
     )
     from sgl_kernel import moe_align_block_size
 
-    # sgl-kernel 0.3.x iterates to num_experts - 1. The extra empty logical
-    # expert makes the complete [0, num_experts) range participate.
+    # The extra empty logical expert makes the complete [0, num_experts)
+    # range participate; hardware tests cover assignments to the final expert.
     moe_align_block_size(
         topk_ids,
         num_experts + 1,

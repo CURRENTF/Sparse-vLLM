@@ -9,10 +9,10 @@ README 包含当前安装命令。预期 baseline 为：
 - Python 3.10。
 - 使用 `requirements/locks/canonical-cu129-py310.txt` 中冻结的完整 runtime
   与 test 环境。
-- 带 CUDA 12.9 wheel 的 PyTorch 2.9.1，以及 Triton 3.5.1。
+- 带匹配 CUDA wheel 的 PyTorch 2.11.0，以及 Triton 3.6.0。
 - `flashinfer-python==0.6.15.post1`，以及 CUDA 12.9 build 的
   `flashinfer-jit-cache==0.6.15.post1`。
-- `sgl-kernel==0.3.21` 和 `einops>=0.8.2` 是 runtime 依赖。
+- `sglang-kernel==0.4.5` 和 `einops>=0.8.2` 是 runtime 依赖。
 - 需要预编译 device binary 时，可从通用 FlashInfer wheel index 安装匹配的 `flashinfer-cubin`。
 - `transformers==5.13.1`。
 - 使用 `MAX_JOBS=8 pip install flash-attn --no-build-isolation` 安装 `flash-attn`。

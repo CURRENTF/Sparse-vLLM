@@ -15,7 +15,8 @@ def test_runtime_compatibility_bounds_cover_canonical_lock():
     assert "tilelang==0.1.9" in dependencies
     assert "apache-tvm-ffi==0.1.10" in dependencies
     assert "transformers>=5.13,<6" in dependencies
-    assert "sgl-kernel>=0.3.21,<0.4" in dependencies
+    assert "nvidia-cutlass-dsl>=4.6,<5" in dependencies
+    assert "sglang-kernel>=0.4.5,<0.4.6" in dependencies
     assert {"fire", "pillow", "einops", "tqdm", "loguru"} <= dependencies
     assert not any(
         dependency.startswith("torchvision") for dependency in dependencies
@@ -50,12 +51,12 @@ def test_uv_routes_cuda_packages_to_explicit_indexes():
 
     assert config["project"]["optional-dependencies"] == {
         "cu129": [
-            "torch>=2.9,<3",
+            "torch==2.11.0",
             "flashinfer-python[cu12]>=0.6.15,<0.7",
             "flashinfer-jit-cache>=0.6.15,<0.7",
         ],
         "cu130": [
-            "torch>=2.9,<3",
+            "torch==2.11.0",
             "flashinfer-python[cu13]>=0.6.15,<0.7",
             "flashinfer-jit-cache>=0.6.15,<0.7",
         ],
