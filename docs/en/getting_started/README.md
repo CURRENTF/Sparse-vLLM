@@ -10,9 +10,9 @@ Sparse-vLLM usage example.
 conda create -n svllm python=3.10 -y
 conda activate svllm
 
-PYTHONNOUSERSITE=1 python -s -m pip install \
-  -r requirements/locks/canonical-cu129-py310.txt
-PYTHONNOUSERSITE=1 python -s -m pip install --no-deps -e .
+python -m pip config --site set global.extra-index-url \
+  "https://download.pytorch.org/whl/cu130 https://flashinfer.ai/whl/cu130"
+python -m pip install -e .
 
 # Optional
 MAX_JOBS=8 pip install flash-attn --no-build-isolation
@@ -20,19 +20,20 @@ MAX_JOBS=8 pip install flash-attn --no-build-isolation
 
 ## Install with uv
 
-The canonical environment uses the CUDA 12.9 build:
-
 ```bash
 uv venv --python 3.10
 source .venv/bin/activate
 
-uv pip install -r requirements/locks/canonical-cu129-py310.txt
-uv pip install --no-deps -e .
+uv pip install -e .
 
 # Optional
 MAX_JOBS=8 uv pip install flash-attn --no-build-isolation
 ```
 
+
+uv reads the CUDA indexes from `pyproject.toml`; pip requires the one-time
+environment configuration shown above. The validated CUDA 12.9
+[dependency lock](../../../requirements/locks/README.md) is optional.
 
 `einops`, `sgl-kernel`, and the training, benchmark, and test packages are all
 runtime dependencies, so workflow-specific extras are not required.
@@ -43,16 +44,9 @@ block-scaled FP8 formats.
 Its prefill causal Conv1D and decode Conv1D/GDN packing paths use local Triton
 kernels and do not call `sgl-kernel` themselves.
 
-The required `flashinfer-jit-cache` package provides modules built for a
-specific CUDA toolkit version. Select the index matching the CUDA version used
-by PyTorch. `flashinfer-cubin` is an optional acceleration package containing
-architecture-specific device binaries:
+`flashinfer-cubin` is an optional acceleration package:
 
 ```bash
-pip install "flashinfer-jit-cache==0.6.15.post1" \
-  --index-url https://flashinfer.ai/whl/cu129
-
-# Optional
 pip install flashinfer-cubin --index-url https://flashinfer.ai/whl
 ```
 

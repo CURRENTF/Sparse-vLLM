@@ -94,9 +94,8 @@ The full documentation index is maintained in [docs/en/README.md](docs/en/README
 
 ## Quick Start
 
-Sparse-vLLM requires Python 3.10 or newer. The validated CUDA 12.9 runtime and
-test environment is frozen in
-`requirements/locks/canonical-cu129-py310.txt`.
+Sparse-vLLM requires Python 3.10 or newer. Default dependencies are declared in
+`pyproject.toml`.
 
 ### Conda
 
@@ -104,9 +103,9 @@ test environment is frozen in
 conda create -n svllm python=3.10 -y
 conda activate svllm
 
-PYTHONNOUSERSITE=1 python -s -m pip install \
-  -r requirements/locks/canonical-cu129-py310.txt
-PYTHONNOUSERSITE=1 python -s -m pip install --no-deps -e .
+python -m pip config --site set global.extra-index-url \
+  "https://download.pytorch.org/whl/cu130 https://flashinfer.ai/whl/cu130"
+python -m pip install -e .
 
 # Optional
 MAX_JOBS=8 pip install flash-attn --no-build-isolation
@@ -122,15 +121,17 @@ PyTorch wheels include their CUDA runtime, while compiled extensions such as
 uv venv --python 3.10
 source .venv/bin/activate
 
-uv pip install -r requirements/locks/canonical-cu129-py310.txt
-uv pip install --no-deps -e .
+uv pip install -e .
 
 # Optional
 MAX_JOBS=8 uv pip install flash-attn --no-build-isolation
 uv pip install flashinfer-cubin --index-url https://flashinfer.ai/whl
 ```
 
-The lock selects the CUDA 12.9 builds of PyTorch and the FlashInfer JIT cache.
+uv reads the CUDA indexes from `pyproject.toml`; pip requires the one-time
+environment configuration shown above. The validated CUDA 12.9
+[dependency lock](requirements/locks/README.md) is optional.
+
 `einops`, `sgl-kernel`, and the training, benchmark, and test packages are all
 part of the main installation; no workflow-specific extras are required.
 

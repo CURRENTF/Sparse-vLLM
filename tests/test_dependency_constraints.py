@@ -46,6 +46,29 @@ def test_canonical_lock_pins_validated_tilelang_runtime():
     assert "apache-tvm-ffi==0.1.10" in locked_requirements
 
 
+def test_uv_routes_cuda_packages_to_explicit_indexes():
+    pyproject_path = Path(__file__).parents[1] / "pyproject.toml"
+    config = tomllib.loads(pyproject_path.read_text())
+    uv_config = config["tool"]["uv"]
+
+    assert uv_config["sources"] == {
+        "torch": {"index": "pytorch-cu130"},
+        "flashinfer-jit-cache": {"index": "flashinfer-cu130"},
+    }
+    assert uv_config["index"] == [
+        {
+            "name": "pytorch-cu130",
+            "url": "https://download.pytorch.org/whl/cu130",
+            "explicit": True,
+        },
+        {
+            "name": "flashinfer-cu130",
+            "url": "https://flashinfer.ai/whl/cu130",
+            "explicit": True,
+        },
+    ]
+
+
 def test_workflow_dependencies_are_part_of_main_install():
     pyproject_path = Path(__file__).parents[1] / "pyproject.toml"
     project = tomllib.loads(pyproject_path.read_text())["project"]
