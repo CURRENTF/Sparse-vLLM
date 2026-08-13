@@ -52,17 +52,23 @@ def test_uv_routes_cuda_packages_to_explicit_indexes():
     assert config["project"]["optional-dependencies"] == {
         "cu129": [
             "torch==2.11.0",
+            "torchvision==0.26.0",
             "flashinfer-python[cu12]>=0.6.15,<0.7",
             "flashinfer-jit-cache>=0.6.15,<0.7",
         ],
         "cu130": [
             "torch==2.11.0",
+            "torchvision==0.26.0",
             "flashinfer-python[cu13]>=0.6.15,<0.7",
             "flashinfer-jit-cache>=0.6.15,<0.7",
         ],
     }
     assert uv_config["sources"] == {
         "torch": [
+            {"index": "pytorch-cu129", "extra": "cu129"},
+            {"index": "pytorch-cu130", "extra": "cu130"},
+        ],
+        "torchvision": [
             {"index": "pytorch-cu129", "extra": "cu129"},
             {"index": "pytorch-cu130", "extra": "cu130"},
         ],
