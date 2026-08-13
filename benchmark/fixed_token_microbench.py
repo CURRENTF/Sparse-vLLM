@@ -29,6 +29,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--expert-parallel-size", type=int, default=1)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.8)
+    parser.add_argument(
+        "--nsys-iteration",
+        type=int,
+        default=-1,
+        help="Wrap one timed iteration in an NVTX range for nsys capture.",
+    )
     return parser
 
 
@@ -76,6 +82,8 @@ def _validate(args: argparse.Namespace) -> Path:
             raise ValueError(f"{name} must be positive")
     if not 0 < args.gpu_memory_utilization <= 1:
         raise ValueError("gpu_memory_utilization must be in (0, 1]")
+    if not -1 <= args.nsys_iteration < args.num_iters:
+        raise ValueError("nsys_iteration must be -1 or a timed iteration index")
     if args.backend == "vllm" and args.expert_parallel_size != 1:
         raise ValueError(
             "vLLM uses --expert-parallel-size=1 or --enable-expert-parallel"
@@ -94,6 +102,7 @@ def _build_engine(args: argparse.Namespace):
         "gpu_memory_utilization": args.gpu_memory_utilization,
         "tensor_parallel_size": args.tensor_parallel_size,
         "enforce_eager": False,
+        "enable_prefix_caching": False,
     }
     if args.backend == "vllm":
         from vllm import LLM
@@ -162,6 +171,11 @@ def main() -> int:
             "tensor_parallel_size": args.tensor_parallel_size,
             "expert_parallel_size": args.expert_parallel_size,
             "cuda_graph": True,
+            "prefix_cache": False,
+        },
+        "profiler": {
+            "kind": "nsys_nvtx" if args.nsys_iteration >= 0 else None,
+            "iteration": args.nsys_iteration if args.nsys_iteration >= 0 else None,
         },
         "environment": {
             "cuda_visible_devices": os.getenv("CUDA_VISIBLE_DEVICES"),
@@ -196,9 +210,18 @@ def main() -> int:
             if len(outputs) != args.batch_size:
                 raise RuntimeError(f"warmup returned {len(outputs)} requests")
         for iteration in range(args.num_iters):
+            profiling = iteration == args.nsys_iteration
+            if profiling:
+                import torch
+
+                torch.cuda.nvtx.range_push(f"fixed_token_iteration_{iteration}")
             started = perf_counter()
-            outputs = engine.generate(prompts, params, use_tqdm=False)
-            elapsed = perf_counter() - started
+            try:
+                outputs = engine.generate(prompts, params, use_tqdm=False)
+                elapsed = perf_counter() - started
+            finally:
+                if profiling:
+                    torch.cuda.nvtx.range_pop()
             if len(outputs) != args.batch_size:
                 raise RuntimeError(
                     f"iteration {iteration} returned {len(outputs)} requests"
