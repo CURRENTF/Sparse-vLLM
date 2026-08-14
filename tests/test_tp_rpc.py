@@ -300,42 +300,6 @@ def test_moe_workspace_warmup_uses_failure_synchronized_world_rpc():
     assert "warmup_moe_workspace" in TP_RPC_STATUS_SYNC_METHODS
 
 
-def test_fake_prefill_warmup_uses_failure_synchronized_world_rpc():
-    assert "set_warmup_fake_prefill_attention" in TP_RPC_STATUS_SYNC_METHODS
-
-
-def test_model_runner_fake_prefill_warmup_restores_environment():
-    runner = object.__new__(ModelRunner)
-    env_keys = {
-        "SPARSEVLLM_ALLOW_FAKE_ATTENTION": "existing-allow",
-        "SPARSEVLLM_FAKE_PREFILL_ATTENTION": None,
-        "SPARSEVLLM_FAKE_ATTENTION_MODE": "zero",
-        "SPARSEVLLM_WARMUP_REAL_PREFILL_MIN_CONTEXT_TOKENS": "77",
-    }
-
-    with patch.dict(
-        os.environ,
-        {
-            key: value
-            for key, value in env_keys.items()
-            if value is not None
-        },
-        clear=True,
-    ):
-        ModelRunner.set_warmup_fake_prefill_attention(runner, True, 2046)
-        assert os.environ["SPARSEVLLM_ALLOW_FAKE_ATTENTION"] == "1"
-        assert os.environ["SPARSEVLLM_FAKE_PREFILL_ATTENTION"] == "1"
-        assert os.environ["SPARSEVLLM_FAKE_ATTENTION_MODE"] == "copy"
-        assert os.environ["SPARSEVLLM_WARMUP_REAL_PREFILL_MIN_CONTEXT_TOKENS"] == "2046"
-
-        ModelRunner.set_warmup_fake_prefill_attention(runner, False)
-
-        assert os.environ.get("SPARSEVLLM_ALLOW_FAKE_ATTENTION") == "existing-allow"
-        assert "SPARSEVLLM_FAKE_PREFILL_ATTENTION" not in os.environ
-        assert os.environ.get("SPARSEVLLM_FAKE_ATTENTION_MODE") == "zero"
-        assert os.environ.get("SPARSEVLLM_WARMUP_REAL_PREFILL_MIN_CONTEXT_TOKENS") == "77"
-
-
 def test_model_runner_moe_workspace_warmup_delegates_token_count():
     calls = []
     runner = object.__new__(ModelRunner)

@@ -1612,10 +1612,7 @@ class DecodeCudaGraphWarmupPolicyTest(unittest.TestCase):
         engine.config = SimpleNamespace(
             vllm_sparse_method="omnikv",
             decode_cuda_graph=True,
-            num_sink_tokens=1,
-            decode_keep_tokens=1,
-            num_recent_tokens=1,
-            chunk_prefill_size=1,
+            chunk_prefill_size=8,
             max_decoding_seqs=3,
             max_model_len=2048,
             hf_config=SimpleNamespace(vocab_size=32),
@@ -1623,15 +1620,10 @@ class DecodeCudaGraphWarmupPolicyTest(unittest.TestCase):
         )
         prompts = []
         pending = 0
-        fake_prefill_enabled = False
-        fake_prefill_step_states = []
         runner_calls = []
 
         def runner_call(method, *args):
-            nonlocal fake_prefill_enabled
             runner_calls.append((method, *args))
-            if method == "set_warmup_fake_prefill_attention":
-                fake_prefill_enabled = bool(args[0])
 
         def add_request(prompt, sampling_params):
             nonlocal pending
@@ -1640,10 +1632,12 @@ class DecodeCudaGraphWarmupPolicyTest(unittest.TestCase):
 
         def step():
             nonlocal pending
-            fake_prefill_step_states.append(fake_prefill_enabled)
             pending = 0
 
-        engine.model_runner = SimpleNamespace(call=runner_call)
+        engine.model_runner = SimpleNamespace(
+            call=runner_call,
+            runtime_state=SimpleNamespace(prompt_admission_free_slots=lambda: 100),
+        )
         engine.add_request = add_request
         engine.is_finished = lambda: pending == 0
         engine.step = step
@@ -1655,27 +1649,16 @@ class DecodeCudaGraphWarmupPolicyTest(unittest.TestCase):
         self.assertEqual([prompt[0] for prompt, _ in prompts], list(range(6)))
         self.assertEqual(
             [len(prompt) for prompt, _ in prompts],
-            [2046, 1, 1, 1028, 1028, 1028],
+            [8, 1, 1, 8, 1, 1],
         )
         self.assertEqual([max_tokens for _, max_tokens in prompts], [2, 2, 2, 1, 1, 1])
-        self.assertEqual(fake_prefill_step_states, [True, False])
-        self.assertEqual(
-            runner_calls,
-            [
-                ("set_warmup_fake_prefill_attention", True, 2046),
-                ("set_warmup_fake_prefill_attention", False),
-                ("log_operator_implementations",),
-            ],
-        )
+        self.assertEqual(runner_calls, [("log_operator_implementations",)])
 
-    def test_graph_warmup_restores_real_prefill_after_failure(self):
+    def test_graph_warmup_propagates_failure(self):
         engine = object.__new__(LLMEngine)
         engine.config = SimpleNamespace(
             vllm_sparse_method="omnikv",
             decode_cuda_graph=True,
-            num_sink_tokens=1,
-            decode_keep_tokens=1,
-            num_recent_tokens=1,
             chunk_prefill_size=1,
             max_decoding_seqs=2,
             max_model_len=2048,
@@ -1689,7 +1672,8 @@ class DecodeCudaGraphWarmupPolicyTest(unittest.TestCase):
             pending += 1
 
         engine.model_runner = SimpleNamespace(
-            call=lambda method, *args: calls.append((method, *args))
+            call=lambda method, *args: calls.append((method, *args)),
+            runtime_state=SimpleNamespace(prompt_admission_free_slots=lambda: 100),
         )
         engine.add_request = add_request
         engine.is_finished = lambda: pending == 0
@@ -1698,13 +1682,43 @@ class DecodeCudaGraphWarmupPolicyTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "warmup failed"):
             engine._warmup()
 
-        self.assertEqual(
-            calls,
-            [
-                ("set_warmup_fake_prefill_attention", True, 2046),
-                ("set_warmup_fake_prefill_attention", False),
-            ],
+        self.assertEqual(calls, [])
+
+    def test_graph_warmup_is_clamped_to_runtime_capacity(self):
+        engine = object.__new__(LLMEngine)
+        engine.config = SimpleNamespace(
+            vllm_sparse_method="omnikv",
+            decode_cuda_graph=True,
+            chunk_prefill_size=64,
+            max_decoding_seqs=3,
+            max_model_len=2048,
+            hf_config=SimpleNamespace(vocab_size=32),
+            model_spec=SimpleNamespace(num_experts_field=None),
         )
+        prompts = []
+        pending = 0
+
+        def add_request(prompt, _sampling_params):
+            nonlocal pending
+            prompts.append(list(prompt))
+            pending += 1
+
+        def step():
+            nonlocal pending
+            pending = 0
+
+        engine.model_runner = SimpleNamespace(
+            call=lambda *_args: None,
+            runtime_state=SimpleNamespace(prompt_admission_free_slots=lambda: 10),
+        )
+        engine.add_request = add_request
+        engine.is_finished = lambda: pending == 0
+        engine.step = step
+        engine._after_warmup_debug_cleanup = lambda: None
+
+        engine._warmup()
+
+        self.assertEqual([len(prompt) for prompt in prompts], [2, 1, 1, 2, 1, 1])
 
     def test_moe_workspace_warmup_profiles_decode_and_maximum_mlp_shapes(self):
         config = self.make_config(method="omnikv")

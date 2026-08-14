@@ -353,9 +353,6 @@ class LLMEngine:
         """预热模型，确保所有算子和显存都已就绪"""
         logger.info("Warming up the engine...")
         
-        # 预热只需触发算子编译，使用固定短长度即可
-        warmup_len = self.config.num_sink_tokens + self.config.decode_keep_tokens\
-                     + self.config.num_recent_tokens + self.config.chunk_prefill_size + 1024
         warmup_profile = _deltakv_graph_warmup_profile(self.config)
         graph_sized_batch = warmup_profile in ("graph", "big_prefill_only")
         decode_warmup = warmup_profile in ("graph", "decode_1seq")
@@ -368,6 +365,7 @@ class LLMEngine:
             ignore_eos=decode_warmup,
         )
         max_prompt_len = max(1, int(self.config.max_model_len) - int(sampling_params.max_tokens))
+        warmup_len = min(int(self.config.chunk_prefill_size), max_prompt_len)
         warmup_len_override = os.getenv("SPARSEVLLM_DELTAKV_GRAPH_WARMUP_PROMPT_LEN", "").strip().lower()
         if warmup_len_override:
             if warmup_len_override in {"max", "full", "max_model_len", "max-model-len"}:
@@ -385,12 +383,22 @@ class LLMEngine:
                         "SPARSEVLLM_DELTAKV_GRAPH_WARMUP_PROMPT_LEN must be positive, "
                         f"got {warmup_len}."
                     )
-        if warmup_len > max_prompt_len:
-            logger.warning(
-                f"Warmup prompt length ({warmup_len}) exceeds max_model_len - max_tokens "
-                f"({max_prompt_len}). Clamping warmup_len to {max_prompt_len}."
+        free_slots = int(self.model_runner.runtime_state.prompt_admission_free_slots())
+        capacity = free_slots - (num_seqs - 1) - num_seqs * int(sampling_params.max_tokens)
+        if capacity <= 0:
+            raise RuntimeError(
+                "Insufficient runtime capacity for warmup: "
+                f"free_slots={free_slots} "
+                f"num_seqs={num_seqs} max_tokens={sampling_params.max_tokens}."
             )
-            warmup_len = max_prompt_len
+        max_warmup_len = min(max_prompt_len, capacity)
+        if warmup_len > max_warmup_len:
+            logger.warning(
+                "Warmup prompt length ({}) exceeds runtime capacity ({}); clamping.",
+                warmup_len,
+                max_warmup_len,
+            )
+            warmup_len = max_warmup_len
         num_warmup_rounds = 2 if warmup_profile == "graph" else 1
         vocab_size = int(self.config.hf_config.vocab_size)
         num_dummy_prompts = num_seqs * num_warmup_rounds
@@ -405,55 +413,17 @@ class LLMEngine:
             f"ignore_eos={sampling_params.ignore_eos})."
         )
 
-        def run_warmup(
-            params: SamplingParams,
-            prompt_offset: int,
-            *,
-            stress_max_context: bool = False,
-        ) -> None:
+        def run_warmup(params: SamplingParams, prompt_offset: int) -> None:
             for request_idx in range(num_seqs):
                 # Distinct leading tokens prevent prefix-cache reuse within or
                 # across warmup rounds.
-                prompt_len = warmup_len
-                if stress_max_context:
-                    prompt_len = max_prompt_len if request_idx == 0 else 1
+                prompt_len = warmup_len if request_idx == 0 else 1
                 dummy_prompt = [prompt_offset + request_idx] + [0] * (prompt_len - 1)
                 self.add_request(dummy_prompt, params)
             while not self.is_finished():
                 self.step()
 
-        stress_max_context = warmup_profile == "graph" and not warmup_len_override
-        if stress_max_context:
-            logger.info(
-                "CUDA Graph maximum-context warmup: one prompt with {} tokens "
-                "and {} one-token prompts; prefill attention uses the scoped "
-                "fake kernel until the final maximum-context chunk, which uses "
-                "real attention; decode remains real.",
-                max_prompt_len,
-                num_seqs - 1,
-            )
-            self.model_runner.call(
-                "set_warmup_fake_prefill_attention",
-                True,
-                max_prompt_len,
-            )
-            try:
-                run_warmup(
-                    sampling_params,
-                    prompt_offset=0,
-                    stress_max_context=True,
-                )
-            finally:
-                self.model_runner.call(
-                    "set_warmup_fake_prefill_attention",
-                    False,
-                )
-        else:
-            run_warmup(
-                sampling_params,
-                prompt_offset=0,
-                stress_max_context=False,
-            )
+        run_warmup(sampling_params, prompt_offset=0)
 
         if warmup_profile == "graph":
             # CUDA Graph capture establishes its private allocator pool. Warm

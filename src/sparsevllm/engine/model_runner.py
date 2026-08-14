@@ -128,7 +128,6 @@ TP_RPC_STATUS_SYNC_METHODS = PREFIX_CACHE_CONTROL_RPC_METHODS | {
     "reset_after_warmup",
     "run",
     "register_multimodal_shared",
-    "set_warmup_fake_prefill_attention",
     "warmup_moe_workspace",
 }
 
@@ -612,62 +611,6 @@ class ModelRunner:
                 f"Model {type(self.model).__name__} does not provide warmup_moe()."
             )
         warmup_moe(num_tokens=int(num_tokens))
-
-    def set_warmup_fake_prefill_attention(
-        self,
-        enabled: bool,
-        real_probe_min_context_tokens: int | None = None,
-    ) -> None:
-        env_keys = (
-            "SPARSEVLLM_ALLOW_FAKE_ATTENTION",
-            "SPARSEVLLM_FAKE_PREFILL_ATTENTION",
-            "SPARSEVLLM_FAKE_ATTENTION_MODE",
-            "SPARSEVLLM_WARMUP_REAL_PREFILL_MIN_CONTEXT_TOKENS",
-        )
-        saved = getattr(self, "_warmup_fake_prefill_saved_env", None)
-        if enabled:
-            if saved is not None:
-                raise RuntimeError("Warmup fake prefill attention is already enabled.")
-            if real_probe_min_context_tokens is not None:
-                real_probe_min_context_tokens = int(real_probe_min_context_tokens)
-                if real_probe_min_context_tokens <= 0:
-                    raise ValueError(
-                        "real_probe_min_context_tokens must be positive, got "
-                        f"{real_probe_min_context_tokens}."
-                    )
-            self._warmup_fake_prefill_saved_env = {
-                key: os.environ.get(key) for key in env_keys
-            }
-            os.environ["SPARSEVLLM_ALLOW_FAKE_ATTENTION"] = "1"
-            os.environ["SPARSEVLLM_FAKE_PREFILL_ATTENTION"] = "1"
-            os.environ["SPARSEVLLM_FAKE_ATTENTION_MODE"] = "copy"
-            if real_probe_min_context_tokens is None:
-                os.environ.pop(
-                    "SPARSEVLLM_WARMUP_REAL_PREFILL_MIN_CONTEXT_TOKENS",
-                    None,
-                )
-            else:
-                os.environ[
-                    "SPARSEVLLM_WARMUP_REAL_PREFILL_MIN_CONTEXT_TOKENS"
-                ] = str(real_probe_min_context_tokens)
-            logger.info("Warmup fake prefill attention enabled (mode=copy).")
-            if real_probe_min_context_tokens is not None:
-                logger.info(
-                    "Warmup will run real prefill attention when context reaches "
-                    "{} tokens.",
-                    real_probe_min_context_tokens,
-                )
-            return
-
-        if saved is None:
-            raise RuntimeError("Warmup fake prefill attention is not enabled.")
-        for key, value in saved.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
-        self._warmup_fake_prefill_saved_env = None
-        logger.info("Warmup fake prefill attention disabled; environment restored.")
 
     def free_slots(self, seq_id: int):
         """通知 CacheManager 释放该序列占用的物理显存位子"""

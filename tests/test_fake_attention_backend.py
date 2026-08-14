@@ -21,7 +21,6 @@ class FakeAttentionBackendTest(unittest.TestCase):
         "SPARSEVLLM_FAKE_DECODE_ATTENTION",
         "SPARSEVLLM_FAKE_ATTENTION_MODE",
         "SPARSEVLLM_ALLOW_FAKE_ATTENTION",
-        "SPARSEVLLM_WARMUP_REAL_PREFILL_MIN_CONTEXT_TOKENS",
         "SVLLM_DEBUG_DECODE_BOUNDS",
     )
 
@@ -86,56 +85,6 @@ class FakeAttentionBackendTest(unittest.TestCase):
 
         self.assertTrue(torch.equal(out, torch.zeros_like(q)))
         self.assertTrue(torch.equal(attn_score, torch.zeros_like(attn_score)))
-
-    def test_fake_prefill_runs_real_kernel_at_probe_context(self):
-        os.environ["SPARSEVLLM_FAKE_PREFILL_ATTENTION"] = "1"
-        os.environ["SPARSEVLLM_ALLOW_FAKE_ATTENTION"] = "1"
-        os.environ["SPARSEVLLM_FAKE_ATTENTION_MODE"] = "copy"
-        os.environ["SPARSEVLLM_WARMUP_REAL_PREFILL_MIN_CONTEXT_TOKENS"] = "3"
-        q = torch.ones(3, 2, 4)
-        view = self._make_prefill_view()
-        calls = []
-
-        def real_prefill(q_arg, _k, _v, out, *_args, **_kwargs):
-            calls.append(tuple(q_arg.shape))
-            out.fill_(7)
-
-        with patch(
-            "sparsevllm.layers.attention_backend.context_attention_fwd",
-            side_effect=real_prefill,
-        ):
-            out = TritonAttentionBackend().run_prefill(
-                q,
-                view,
-                b_start_loc=torch.tensor([0], dtype=torch.int32),
-                chunk_lens=torch.tensor([3], dtype=torch.int32),
-                max_input_len=3,
-            )
-
-        self.assertEqual(calls, [(3, 2, 4)])
-        self.assertTrue(torch.equal(out, torch.full_like(q, 7)))
-
-    def test_fake_prefill_keeps_fake_kernel_below_probe_context(self):
-        os.environ["SPARSEVLLM_FAKE_PREFILL_ATTENTION"] = "1"
-        os.environ["SPARSEVLLM_ALLOW_FAKE_ATTENTION"] = "1"
-        os.environ["SPARSEVLLM_FAKE_ATTENTION_MODE"] = "copy"
-        os.environ["SPARSEVLLM_WARMUP_REAL_PREFILL_MIN_CONTEXT_TOKENS"] = "4"
-        q = torch.ones(3, 2, 4)
-        view = self._make_prefill_view()
-
-        with patch(
-            "sparsevllm.layers.attention_backend.context_attention_fwd",
-            side_effect=AssertionError("real prefill kernel called below threshold"),
-        ):
-            out = TritonAttentionBackend().run_prefill(
-                q,
-                view,
-                b_start_loc=torch.tensor([0], dtype=torch.int32),
-                chunk_lens=torch.tensor([3], dtype=torch.int32),
-                max_input_len=3,
-            )
-
-        self.assertTrue(torch.equal(out, q))
 
     def test_fake_decode_copy_mode_skips_kernels(self):
         os.environ["SPARSEVLLM_FAKE_ATTENTION"] = "1"
