@@ -54,7 +54,8 @@ class Config(
     model: str
     max_num_batched_tokens: int = 65536
     max_num_seqs_in_batch: int = 32  # 不能设置太大
-    max_model_len: int = 128_000
+    max_model_len: int | None = None
+    max_model_len_auto: bool = field(default=False, init=False)
     max_decoding_seqs: int = 64
     max_num_seqs_in_gpu: int | None = None
 
@@ -111,6 +112,25 @@ class Config(
     def weight_loading_workers_per_rank(self) -> int:
         return max(1, self.weight_loading_workers // self.world_size)
 
+    def limit_auto_max_model_len(self, capacity: int) -> None:
+        if not self.max_model_len_auto:
+            return
+        resolved = min(int(self.max_model_len), int(capacity))
+        if resolved <= 0:
+            raise RuntimeError(f"Runtime capacity must be positive, got {capacity}.")
+        if resolved == self.max_model_len:
+            return
+        logger.info(
+            "Limiting auto max_model_len from model capacity {} to runtime capacity {}.",
+            self.max_model_len,
+            resolved,
+        )
+        self.max_model_len = resolved
+        if self.decode_cuda_graph and self.decode_cuda_graph_context_sizes_auto:
+            self.decode_cuda_graph_context_sizes = _resolve_decode_cuda_graph_context_sizes(
+                "auto", resolved
+            )
+
     def __post_init__(self):
         normalize_bootstrap(self)
         legacy_deltakv_graph_method = normalize_sparse_method_name(self)
@@ -118,11 +138,14 @@ class Config(
         normalize_scheduling(self)
         normalize_deltakv_storage(self)
         normalize_platform(self)
+        if legacy_deltakv_graph_method:
+            self.decode_cuda_graph = True
+            self.decode_graph = True
+        load_and_validate_model(self)
         normalize_decode_cuda_graph(
             self,
             legacy_deltakv_graph_method=legacy_deltakv_graph_method,
         )
-        load_and_validate_model(self)
         normalize_sparse_methods(self)
         finalize_prefix_cache(self)
         validate_deltakv_runtime(self)

@@ -191,8 +191,24 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
             if isinstance(storage, HeterogeneousExplicitKVStorage)
             else num_layers * slot_bytes_per_layer
         )
+        slot_bytes += torch.tensor([], dtype=torch.int32).element_size()
+        row_bytes_per_token = self.max_buffer_rows * torch.tensor([], dtype=torch.int32).element_size()
+        self.config.limit_auto_max_model_len(
+            available_memory // (slot_bytes + row_bytes_per_token)
+        )
+        self.max_model_len = self.config.max_model_len
+        available_memory -= self.max_model_len * row_bytes_per_token
         self.config.num_kvcache_slots = available_memory // slot_bytes
-        assert self.config.num_kvcache_slots > 0, "可用显存不足以分配 KV Cache"
+        if self.config.num_kvcache_slots < self.max_model_len:
+            raise RuntimeError(
+                "KV cache capacity is smaller than max_model_len after reserving runtime metadata: "
+                f"capacity={self.config.num_kvcache_slots} max_model_len={self.max_model_len}."
+            )
+        if self.config.prefix_cache_max_blocks is not None:
+            self.config.prefix_cache_max_blocks = min(
+                self.config.prefix_cache_max_blocks,
+                self.config.num_kvcache_slots // self.config.prefix_cache_block_size,
+            )
 
         logger.info(
             f"Standard Mode: Each layer can accommodate {self.config.num_kvcache_slots} tokens."

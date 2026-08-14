@@ -179,6 +179,10 @@ def normalize_decode_cuda_graph(config, *, legacy_deltakv_graph_method: bool) ->
     config.decode_cuda_graph_context_policy = _normalize_decode_cuda_graph_context_policy(
         config.decode_cuda_graph_context_policy
     )
+    context_sizes = config.decode_cuda_graph_context_sizes
+    config.decode_cuda_graph_context_sizes_auto = context_sizes is None or (
+        isinstance(context_sizes, str) and context_sizes.strip().lower() in {"", "auto"}
+    )
     if config.decode_cuda_graph:
         if config.enable_prefix_caching:
             if config.decode_cuda_graph_capture_sampling:

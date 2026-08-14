@@ -19,6 +19,15 @@ from sparsevllm.utils.config import config_get
 from sparsevllm.utils.log import logger, log_once
 
 
+_CONTEXT_LENGTH_KEYS = (
+    "max_sequence_length",
+    "seq_length",
+    "max_seq_len",
+    "model_max_length",
+    "max_position_embeddings",
+)
+
+
 def _config_to_namespace(config: dict[str, Any]) -> SimpleNamespace:
     return SimpleNamespace(**config)
 
@@ -62,14 +71,48 @@ def _extract_text_config(config: Any) -> Any:
     return text_config
 
 
+def _model_context_length(hf_config: Any) -> int:
+    rope_scaling = config_get(hf_config, "rope_scaling", None) or config_get(
+        hf_config, "rope_parameters", None
+    )
+    factor = 1.0
+    if isinstance(rope_scaling, dict):
+        rope_type = str(rope_scaling.get("rope_type", rope_scaling.get("type", ""))).lower()
+        if "original_max_position_embeddings" not in rope_scaling and rope_type != "llama3":
+            factor = float(rope_scaling.get("factor", 1.0))
+
+    for key in _CONTEXT_LENGTH_KEYS:
+        value = config_get(hf_config, key, None)
+        if value is not None:
+            context_length = int(float(value) * factor)
+            if context_length <= 0:
+                raise ValueError(f"Model config {key} must be positive, got {value!r}.")
+            return context_length
+    raise ValueError(
+        "Model config does not declare a supported context length; expected one of "
+        f"{', '.join(_CONTEXT_LENGTH_KEYS)}. Set max_model_len explicitly."
+    )
+
+
 def _finalize_model_config(config, model_spec: ModelSpec) -> None:
+    model_context_length = _model_context_length(config.hf_config)
+    config.max_model_len_auto = config.max_model_len is None
+    if config.max_model_len_auto:
+        config.max_model_len = model_context_length
+    else:
+        config.max_model_len = int(config.max_model_len)
+        if config.max_model_len <= 0:
+            raise ValueError(f"max_model_len must be positive, got {config.max_model_len}.")
+        if config.max_model_len > model_context_length:
+            raise ValueError(
+                "max_model_len exceeds the model context length: "
+                f"requested={config.max_model_len} supported={model_context_length}."
+            )
+
     config.runtime_layout = RuntimeLayout.from_config(
         config.hf_config,
         require_mixed=model_spec.mixed_attention,
     )
-    if config.max_model_len > config.hf_config.max_position_embeddings:
-        logger.warning('max_model_len > model.max_position_embeddings 输出可能不正常')
-        config.hf_config.max_position_embeddings = config.max_model_len
 
     if config.max_num_seqs_in_batch > 32:
         logger.warning('max_num_seqs_in_batch 过大或许会占用太多显存')
