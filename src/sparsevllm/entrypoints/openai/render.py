@@ -69,11 +69,24 @@ def _uses_minimax_tool_format(tokenizer: Any) -> bool:
     return "<minimax:tool_call>" in chat_template and "tool.function" in chat_template
 
 
+def _uses_nested_tool_format(tokenizer: Any) -> bool:
+    chat_template = _chat_template_source(tokenizer)
+    if _uses_minimax_tool_format(tokenizer):
+        return True
+    return "format_function_declaration(tool)" in chat_template and any(
+        marker in chat_template
+        for marker in (
+            "tool_data['function']",
+            'tool_data["function"]',
+        )
+    )
+
+
 def _tools_for_chat_template(
     tokenizer: Any,
     tools: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    if not _uses_minimax_tool_format(tokenizer):
+    if not _uses_nested_tool_format(tokenizer):
         return tools
 
     nested = []

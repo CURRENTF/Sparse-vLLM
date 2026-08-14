@@ -1556,6 +1556,64 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+    def test_multimodal_chat_adapts_tools_for_gemma4_template(self):
+        from sparsevllm.entrypoints.openai.api_server import (
+            ChatCompletionRequest,
+            _chat_request_prompt,
+        )
+        from sparsevllm.multimodal import MultiModalPrompt
+
+        class Tokenizer:
+            chat_template = """
+                {% macro format_function_declaration(tool_data) %}
+                {{ tool_data['function']['name'] }}
+                {% endmacro %}
+                {% for tool in tools %}{{ format_function_declaration(tool) }}{% endfor %}
+            """
+
+        request = ChatCompletionRequest(
+            model="m",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "https://x/image.png"},
+                        },
+                        {"type": "text", "text": "describe"},
+                    ],
+                }
+            ],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "description": "Get weather",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+        )
+
+        prompt = _chat_request_prompt(Tokenizer(), request)
+
+        self.assertIsInstance(prompt, MultiModalPrompt)
+        self.assertEqual(
+            prompt.tools,
+            [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "description": "Get weather",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+        )
+
     def test_chat_prompt_rejects_invalid_tool_history_arguments(self):
         from sparsevllm.entrypoints.openai.api_server import ChatMessage, _chat_prompt
 

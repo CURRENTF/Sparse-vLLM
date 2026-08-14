@@ -100,10 +100,11 @@ def _gemma4_decode_stage1_kernel(
                 mask=visible,
             )
         logits = tl.where(visible, logits, -float("inf"))
+        has_visible_key = tl.max(visible.to(tl.int32), axis=0) > 0
         block_max = tl.max(logits, axis=0)
-        new_max = tl.maximum(max_logit, block_max)
-        probabilities = tl.exp2(logits - new_max)
-        correction = tl.exp2(max_logit - new_max)
+        new_max = tl.where(has_visible_key, tl.maximum(max_logit, block_max), max_logit)
+        probabilities = tl.where(visible, tl.exp2(logits - new_max), 0.0)
+        correction = tl.where(has_visible_key, tl.exp2(max_logit - new_max), 1.0)
         denominator = denominator * correction + tl.sum(probabilities, axis=0)
         accumulator *= correction
         value = tl.load(

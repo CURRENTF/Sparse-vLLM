@@ -319,6 +319,48 @@ def test_gemma4_decode_matches_torch(head_dim, sliding_window):
     assert cosine > 0.999
 
 
+def test_gemma4_long_window_decode_matches_torch():
+    torch.manual_seed(13)
+    length, window, block_seq = 1486, 1024, 256
+    slots = torch.arange(length, dtype=torch.int32, device="cuda").view(1, -1)
+    lengths = torch.tensor([length], dtype=torch.int32, device="cuda")
+    key = torch.randn(length, 2, 256, dtype=torch.bfloat16, device="cuda")
+    value = torch.randn_like(key)
+    query = torch.randn(1, 4, 256, dtype=torch.bfloat16, device="cuda")
+    blocks = (length + block_seq - 1) // block_seq
+    mid = torch.empty(1, 4, blocks, 256, dtype=torch.float32, device="cuda")
+    lse = torch.empty(1, 4, blocks, dtype=torch.float32, device="cuda")
+    output = torch.empty_like(query)
+
+    gemma4_decode_stage1(
+        query,
+        key,
+        value,
+        slots,
+        torch.zeros(1, dtype=torch.int32, device="cuda"),
+        lengths,
+        mid,
+        lse,
+        block_seq=block_seq,
+        sliding_window=window,
+    )
+    gemma4_decode_stage2(
+        mid,
+        lse,
+        lengths,
+        output,
+        block_seq=block_seq,
+        sliding_window=window,
+    )
+
+    reference = _decode_reference(query, key, value, slots, lengths, window)
+    cosine = torch.nn.functional.cosine_similarity(
+        output.float().flatten(), reference.float().flatten(), dim=0
+    )
+    assert torch.isfinite(output).all()
+    assert cosine > 0.999
+
+
 @pytest.mark.parametrize("group_size", [2, 4, 8])
 @pytest.mark.parametrize("head_dim", [256, 512])
 def test_gemma4_single_block_decode_matches_torch(group_size, head_dim):

@@ -294,7 +294,10 @@ def test_gemma4_multimodal_context_attention_matches_reference(score_ndim):
 
     device = torch.device("cuda")
     torch.manual_seed(0)
-    length, num_heads, head_dim, window = 73, 2, 256, 64
+    # Keep the sequence longer than two windows so late query blocks encounter
+    # fully masked early key blocks. Those blocks must not poison online
+    # softmax state with -inf - -inf NaNs.
+    length, num_heads, head_dim, window = 193, 2, 256, 64
     q = (torch.randn(length, num_heads, head_dim, device=device) / head_dim**0.5).bfloat16()
     k = torch.randn(length, 1, head_dim, device=device).bfloat16()
     v = torch.randn_like(k)
