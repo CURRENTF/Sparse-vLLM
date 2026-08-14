@@ -124,18 +124,20 @@ def _resolve_decode_static_batch_capacity(
 
 
 def _default_decode_cuda_graph_context_sizes(max_model_len: int) -> list[int]:
-    """Default decode graph context buckets: 1k, 2k, 4k, ... up to max_model_len."""
+    """Return block-aligned context buckets with at most about 25% padding."""
     max_model_len = int(max_model_len)
     if max_model_len <= 0:
         raise ValueError(f"max_model_len must be > 0, got {max_model_len}.")
 
+    alignment = 256
     size = min(1024, max_model_len)
+    blocks = (size + alignment - 1) // alignment
     sizes: list[int] = []
-    while size < max_model_len:
-        sizes.append(size)
-        size *= 2
+    while blocks * alignment < max_model_len:
+        sizes.append(blocks * alignment)
+        blocks = max(blocks + 1, blocks * 5 // 4)
     sizes.append(max_model_len)
-    return sorted(set(sizes))
+    return sizes
 
 
 def _resolve_decode_cuda_graph_context_sizes(

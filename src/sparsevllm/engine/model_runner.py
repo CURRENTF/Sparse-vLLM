@@ -893,8 +893,21 @@ class ModelRunner:
             "force_eager_count": int(
                 getattr(graph_runner, "force_eager_count", 0)
             ),
+            "eviction_count": int(
+                getattr(graph_runner, "eviction_count", 0)
+            ),
+            "recapture_count": int(
+                getattr(graph_runner, "recapture_count", 0)
+            ),
             "cached_graph_count": len(
                 getattr(graph_runner, "_graphs", {})
+            ),
+            "max_cached_graphs": getattr(graph_runner, "max_cached_graphs", None),
+            "last_actual_context_len": getattr(
+                graph_runner, "last_actual_context_len", None
+            ),
+            "last_context_padding_ratio": getattr(
+                graph_runner, "last_context_padding_ratio", None
             ),
             "last_state_key": (
                 {

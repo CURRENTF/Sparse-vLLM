@@ -132,7 +132,21 @@ def test_runtime_capacity_updates_auto_cuda_graph_context_sizes():
     Config.limit_auto_max_model_len(config, 9000)
 
     assert config.max_model_len == 9000
-    assert config.decode_cuda_graph_context_sizes == [1024, 2048, 4096, 8192, 9000]
+    assert config.decode_cuda_graph_context_sizes == [
+        1024,
+        1280,
+        1536,
+        1792,
+        2048,
+        2560,
+        3072,
+        3840,
+        4608,
+        5632,
+        6912,
+        8448,
+        9000,
+    ]
 
 
 def test_standard_cache_rejects_explicit_length_above_runtime_capacity():
