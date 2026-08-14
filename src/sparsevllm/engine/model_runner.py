@@ -1,5 +1,6 @@
 import os
 import pickle
+import socket
 import time
 import uuid
 import torch
@@ -98,6 +99,7 @@ TP_SHM_SIZE = 2**20
 TP_RUN_STATUS_PENDING = 0
 TP_RUN_STATUS_SUCCESS = 1
 TP_RUN_STATUS_FAILED = 2
+DEFAULT_MASTER_PORT = 2333
 PREFIX_CACHE_CONTROL_RPC_METHODS = {
     "prefix_cache_inspect",
     "prefix_cache_match",
@@ -136,6 +138,32 @@ def make_tp_shm_name() -> str:
     return f"{TP_SHM_NAME_PREFIX}{os.getpid()}_{uuid.uuid4().hex}"
 
 
+def select_master_port() -> int:
+    configured = os.getenv("SPARSEVLLM_MASTER_PORT")
+    if configured is not None:
+        try:
+            port = int(configured)
+        except ValueError as exc:
+            raise ValueError(
+                f"SPARSEVLLM_MASTER_PORT must be an integer, got {configured!r}."
+            ) from exc
+        if not 1 <= port <= 65535:
+            raise ValueError(f"SPARSEVLLM_MASTER_PORT must be in [1, 65535], got {port}.")
+    else:
+        port = DEFAULT_MASTER_PORT
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        try:
+            sock.bind(("127.0.0.1", port))
+        except OSError as exc:
+            if configured is not None:
+                raise RuntimeError(
+                    f"SPARSEVLLM_MASTER_PORT={port} is already in use."
+                ) from exc
+            sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
 class ModelRunner:
     """
     负责模型执行的类。每个 GPU Rank 进程都拥有一个 ModelRunner 实例。
@@ -148,6 +176,7 @@ class ModelRunner:
         rank: int,
         event: tuple[Event, Event] | list[tuple[Event, Event]],
         tp_shm_name: str | None = None,
+        master_port: int | None = None,
     ):
         self.config = config
         # Inference-only engine: disable autograd graph construction globally in this process.
@@ -168,7 +197,7 @@ class ModelRunner:
         # 初始化分布式环境并绑定对应的设备
         self.platform.set_device(self.device)
         if not dist.is_initialized():
-            master_port = int(os.getenv("SPARSEVLLM_MASTER_PORT", "2333"))
+            master_port = select_master_port() if master_port is None else master_port
             dist.init_process_group(
                 self.platform.get_distributed_backend(),
                 f"tcp://localhost:{master_port}",

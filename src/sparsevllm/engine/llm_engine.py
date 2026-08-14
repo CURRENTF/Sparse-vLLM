@@ -20,7 +20,7 @@ from sparsevllm.config import Config
 from sparsevllm.sampling_params import SamplingParams
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.engine.scheduler import Scheduler
-from sparsevllm.engine.model_runner import ModelRunner, make_tp_shm_name
+from sparsevllm.engine.model_runner import ModelRunner, make_tp_shm_name, select_master_port
 from sparsevllm.engine.input_processor import tokenize_text_prompt
 from sparsevllm.multimodal.inputs import (
     MultiModalInputProcessor,
@@ -235,6 +235,8 @@ class LLMEngine:
         profiler.set_enabled(config.enable_profiler)
         
         # 2. 启动 world worker 进程；TP/EP/DP 语义由 ParallelContext 管理。
+        master_port = select_master_port()
+        logger.info("Using distributed master port: {}", master_port)
         self.ps = []
         self.events = []
         ctx = mp.get_context("spawn")
@@ -242,14 +244,17 @@ class LLMEngine:
         for i in range(1, config.world_size):
             event = (ctx.Event(), ctx.Event())
             # 为每一个非零 Rank 启动一个独立的 ModelRunner 进程
-            process = ctx.Process(target=ModelRunner, args=(config, i, event, tp_shm_name))
+            process = ctx.Process(
+                target=ModelRunner,
+                args=(config, i, event, tp_shm_name, master_port),
+            )
             process.start()
             self.ps.append(process)
             self.events.append(event)
         
         # 3. 初始化主进程的 ModelRunner (Rank 0)
         # 注意：必须先初始化 ModelRunner 以便在本地 GPU 分配 KV Cache 账本
-        self.model_runner = ModelRunner(config, 0, self.events, tp_shm_name)
+        self.model_runner = ModelRunner(config, 0, self.events, tp_shm_name, master_port)
         
         # 加载分词器
         self.tokenizer: Qwen2Tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
