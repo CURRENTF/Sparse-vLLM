@@ -121,8 +121,6 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
             )
         if self.tp_size not in (1, 2):
             raise RuntimeError("Prefix cache offload currently supports only TP=1 or TP=2.")
-        if not bool(getattr(self.config, "enforce_eager", False)):
-            raise RuntimeError("Prefix cache offload currently requires eager prefill execution.")
         if not device_runtime.supports_pin_memory():
             raise RuntimeError("Prefix cache offload requires pinned host memory support.")
         if not device_runtime.supports_streams(self.device):

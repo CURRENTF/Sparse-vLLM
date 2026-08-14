@@ -62,10 +62,6 @@ def normalize_prefix_cache(config) -> None:
             raise ValueError(
                 "prefix cache offload currently supports tensor_parallel_size=1 or 2."
             )
-        if not config.enforce_eager:
-            raise ValueError(
-                "prefix cache offload currently requires enforce_eager=True."
-            )
         if config.prefix_cache_host_size_gb is None:
             raise ValueError(
                 "enable_prefix_cache_offload requires an explicit "

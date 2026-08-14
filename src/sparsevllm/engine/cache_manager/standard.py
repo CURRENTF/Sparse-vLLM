@@ -131,8 +131,6 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
             raise RuntimeError("Prefix cache offload requires the Standard prefix cache.")
         if self.tp_size not in (1, 2):
             raise RuntimeError("Prefix cache offload currently supports only TP=1 or TP=2.")
-        if not bool(getattr(self.config, "enforce_eager", False)):
-            raise RuntimeError("Prefix cache offload currently requires eager execution.")
         if not device_runtime.supports_pin_memory():
             raise RuntimeError("Prefix cache offload requires pinned host memory support.")
         if not device_runtime.supports_streams(self.device):

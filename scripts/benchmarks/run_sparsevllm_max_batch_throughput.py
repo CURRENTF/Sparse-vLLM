@@ -88,7 +88,6 @@ def _base_hparams(args: argparse.Namespace, method: str, batch_size: int) -> dic
         "max_num_seqs_in_batch": batch_size,
         "max_decoding_seqs": batch_size,
         "decode_cuda_graph": not args.disable_decode_cuda_graph,
-        "enforce_eager": bool(args.enforce_eager),
         "throughput_log_interval_s": 0.0,
     }
 
@@ -405,7 +404,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mlp_chunk_size", type=int, default=16384)
     parser.add_argument("--max_num_batched_tokens", type=int, default=65536)
     parser.add_argument("--disable_decode_cuda_graph", action="store_true")
-    parser.add_argument("--enforce_eager", action="store_true")
     parser.add_argument("--master_port_base", type=int, default=29800)
     parser.add_argument("--full_attention_layers", default="0,2,4,11,16,22")
     parser.add_argument("--recent_keep_tokens", type=int, default=32)

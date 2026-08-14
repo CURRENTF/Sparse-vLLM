@@ -64,7 +64,6 @@ def _load_json_arg(value: str) -> dict[str, Any]:
 def _build_engine_hyper_params(args) -> dict[str, Any]:
     # Keep benchmark defaults stable (do not rely on sparsevllm.Config defaults).
     hyper_params: dict[str, Any] = {
-        "enforce_eager": False,
         "decode_cuda_graph": True,
         "gpu_memory_utilization": 0.8,
         "tensor_parallel_size": 1,

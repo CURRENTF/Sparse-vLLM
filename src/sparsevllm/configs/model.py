@@ -150,7 +150,6 @@ def load_and_validate_model(config) -> None:
         model_type=model_type,
         sparse_method=config.vllm_sparse_method,
         topology=config.parallel_topology,
-        enforce_eager=config.enforce_eager,
         decode_cuda_graph=config.decode_cuda_graph,
         enable_prefix_caching=config.enable_prefix_caching,
     )

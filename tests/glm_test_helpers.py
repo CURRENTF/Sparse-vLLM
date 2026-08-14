@@ -54,7 +54,6 @@ def _glm_config(*, hf_overrides=None, **overrides) -> Config:
         "max_model_len": 128,
         "max_num_batched_tokens": 64,
         "chunk_prefill_size": 64,
-        "enforce_eager": True,
     }
     kwargs.update(overrides)
     with patch(

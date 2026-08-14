@@ -112,8 +112,6 @@ def test(
     full_layer_kv_quant_bits: int = 0,
     enable_full_layer_kivi_quant: bool = True,
     pyramid_last_layer_ratio: float = None,
-    enforce_eager: bool = True,
-
     # Palu related arguments
     lt_bits: int = 16,
     lt_group_size: int = 0,
@@ -147,7 +145,6 @@ def test(
         'gpu_memory_utilization': gpu_memory_utilization,
         'max_model_len': max_model_len,
         'pyramid_last_layer_ratio': pyramid_last_layer_ratio,
-        'enforce_eager': enforce_eager,
         'lt_bits': lt_bits,
         'lt_group_size': lt_group_size,
         'lt_sym': lt_sym,

@@ -22,8 +22,7 @@ def main():
     
     print(f"Loading model from: {path}")
     tokenizer = AutoTokenizer.from_pretrained(path)
-    # 使用 enforce_eager=True 方便调试，如果通过则可尝试 False (CUDA Graph)
-    llm = LLM(path, enforce_eager=True, tensor_parallel_size=args.tp, sparse_method=args.sparse_method)
+    llm = LLM(path, tensor_parallel_size=args.tp, sparse_method=args.sparse_method)
     
     # 接近贪婪搜索，保证结果可复现，方便对比
     sampling_params = SamplingParams(temperature=1e-5, max_tokens=128)

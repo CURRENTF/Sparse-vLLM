@@ -1038,7 +1038,6 @@ def load_model(
         if max_seq_length is not None:
             sparse_hyper_param.setdefault("max_model_len", int(max_seq_length))
         sparse_hyper_param.setdefault("tensor_parallel_size", int(tensor_parallel_size))
-        sparse_hyper_param.setdefault("enforce_eager", True)
         sparse_hyper_param.setdefault("throughput_log_interval_s", 0.0)
 
         llm = SparseLLM(model_name, **sparse_hyper_param)
@@ -1070,7 +1069,6 @@ def load_model(
             enable_chunked_prefill=False,
             trust_remote_code=True,
             swap_space=64,
-            enforce_eager=True,
             enable_kvcompress=True,
             block_size=16,
             kv_head_bias_path=None,

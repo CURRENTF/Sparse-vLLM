@@ -332,8 +332,7 @@
     "lengths": [32000, 64000],
     "batch_sizes": [4, 8],
     "output_len": 256,
-    "decode_cuda_graph": true,
-    "enforce_eager": false
+    "decode_cuda_graph": true
   },
   "stress": {
     "length": 16000,

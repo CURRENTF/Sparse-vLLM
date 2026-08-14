@@ -75,7 +75,6 @@ SKIPKV_ASSET_MODEL_NAMES = frozenset(
 class ModelRuntimeCompatibility:
     sparse_methods: frozenset[str]
     prefix_cache_methods: frozenset[str]
-    requires_eager: bool = True
     decode_cuda_graph_methods: frozenset[str] = frozenset()
 
 
@@ -86,7 +85,6 @@ _MOE_SPARSE_METHODS = frozenset(
 DENSE_MODEL_COMPATIBILITY = ModelRuntimeCompatibility(
     sparse_methods=frozenset(CANONICAL_SPARSE_METHODS),
     prefix_cache_methods=frozenset(PREFIX_CACHE_SUPPORTED_METHODS),
-    requires_eager=False,
     decode_cuda_graph_methods=frozenset(CANONICAL_SPARSE_METHODS),
 )
 
@@ -95,14 +93,12 @@ QWEN3_MOE_EP_COMPATIBILITY = ModelRuntimeCompatibility(
     prefix_cache_methods=frozenset(
         {"", "omnikv", "quest", "snapkv", "h2o", "pyramidkv", "rkv"}
     ),
-    requires_eager=False,
     decode_cuda_graph_methods=_MOE_SPARSE_METHODS,
 )
 
 QWEN3_MOE_TP_EP_COMPATIBILITY = ModelRuntimeCompatibility(
     sparse_methods=_MOE_SPARSE_METHODS,
     prefix_cache_methods=frozenset({""}),
-    requires_eager=False,
     decode_cuda_graph_methods=_MOE_SPARSE_METHODS,
 )
 
@@ -111,7 +107,6 @@ QWEN3_MOE_TP_COMPATIBILITY = QWEN3_MOE_TP_EP_COMPATIBILITY
 QWEN35_MOE_COMPATIBILITY = ModelRuntimeCompatibility(
     sparse_methods=QWEN3_MOE_TP_EP_COMPATIBILITY.sparse_methods,
     prefix_cache_methods=frozenset({""}),
-    requires_eager=False,
     decode_cuda_graph_methods=(
         QWEN3_MOE_TP_EP_COMPATIBILITY.decode_cuda_graph_methods
     ),
@@ -120,14 +115,12 @@ QWEN35_MOE_COMPATIBILITY = ModelRuntimeCompatibility(
 MINIMAX_M2_EP_COMPATIBILITY = ModelRuntimeCompatibility(
     sparse_methods=_MOE_SPARSE_METHODS,
     prefix_cache_methods=frozenset({"", "omnikv", "quest"}),
-    requires_eager=False,
     decode_cuda_graph_methods=_MOE_SPARSE_METHODS,
 )
 
 MINIMAX_M2_TP_EP_COMPATIBILITY = ModelRuntimeCompatibility(
     sparse_methods=MINIMAX_M2_EP_COMPATIBILITY.sparse_methods,
     prefix_cache_methods=MINIMAX_M2_EP_COMPATIBILITY.prefix_cache_methods,
-    requires_eager=False,
     decode_cuda_graph_methods=MINIMAX_M2_EP_COMPATIBILITY.decode_cuda_graph_methods,
 )
 
@@ -138,7 +131,6 @@ GLM4_MOE_LITE_EP_COMPATIBILITY = ModelRuntimeCompatibility(
     prefix_cache_methods=frozenset(
         {"", "streamingllm", "snapkv", "h2o", "omnikv", "rkv"}
     ),
-    requires_eager=False,
     decode_cuda_graph_methods=frozenset(
         {"", "streamingllm", "snapkv", "h2o", "omnikv", "rkv"}
     ),
@@ -147,7 +139,6 @@ GLM4_MOE_LITE_EP_COMPATIBILITY = ModelRuntimeCompatibility(
 GEMMA4_COMPATIBILITY = ModelRuntimeCompatibility(
     sparse_methods=frozenset({"", "streamingllm", "omnikv"}),
     prefix_cache_methods=frozenset({"", "streamingllm", "omnikv"}),
-    requires_eager=False,
     decode_cuda_graph_methods=frozenset({"", "streamingllm", "omnikv"}),
 )
 
@@ -247,7 +238,6 @@ def validate_model_runtime_compatibility(
     model_type: str,
     sparse_method: str | None,
     topology: ParallelTopology,
-    enforce_eager: bool,
     decode_cuda_graph: bool,
     enable_prefix_caching: bool,
 ) -> ModelRuntimeCompatibility:
@@ -260,8 +250,6 @@ def validate_model_runtime_compatibility(
             f"parallel mode={topology.mode.value!r}."
         )
 
-    if compatibility.requires_eager and not bool(enforce_eager):
-        raise ValueError(f"{model_type} v1 requires enforce_eager=True.")
     if bool(decode_cuda_graph) and method not in compatibility.decode_cuda_graph_methods:
         supported = ", ".join(
             "'vanilla'" if item == "" else repr(item)

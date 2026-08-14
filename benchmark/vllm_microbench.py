@@ -117,7 +117,6 @@ def main() -> int:
         "enable_prefix_caching": False,
         "language_model_only": True,
         "seed": 0,
-        "enforce_eager": False,
         "disable_log_stats": True,
         "compilation_config": {
             "cudagraph_capture_sizes": batch_sizes,

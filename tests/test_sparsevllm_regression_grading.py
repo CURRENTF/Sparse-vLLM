@@ -216,7 +216,6 @@ class SparseVLLMRegressionGradingTest(unittest.TestCase):
                 model_type="glm4_moe_lite",
                 sparse_method="h2o",
                 topology=ParallelTopology(tp_size, ep_size, 1, mode),
-                enforce_eager=True,
                 decode_cuda_graph=True,
                 enable_prefix_caching=True,
             )
@@ -451,7 +450,6 @@ class SparseVLLMRegressionGradingTest(unittest.TestCase):
             "batch_sizes": [1],
             "output_len": 1,
             "decode_cuda_graph": True,
-            "enforce_eager": False,
         }
         stress = {
             "length": 16,

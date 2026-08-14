@@ -440,7 +440,6 @@ def _quality_command(
     _apply_profiler_config(cfg, quality, performance)
     if tensor_parallel_size > 1:
         cfg["decode_cuda_graph_capture_sampling"] = False
-    cfg["enforce_eager"] = bool((performance or {}).get("enforce_eager", False))
     if "sparsevllm_max_num_seqs_in_batch" in quality:
         cfg["max_num_seqs_in_batch"] = int(quality["sparsevllm_max_num_seqs_in_batch"])
     if "sparsevllm_max_decoding_seqs" in quality:
@@ -492,7 +491,6 @@ def _perf_command(
 ) -> list[str]:
     tensor_parallel_size = _tensor_parallel_size_from_config(performance)
     hyper_params = {
-        "enforce_eager": bool(performance["enforce_eager"]),
         "decode_cuda_graph": _decode_cuda_graph_for_method(
             method,
             bool(performance["decode_cuda_graph"]),
@@ -549,7 +547,6 @@ def _stress_command(
     request_counts = [int(x) for x in stress["request_counts"]]
     tensor_parallel_size = _tensor_parallel_size_from_config(stress, performance)
     hyper_params = {
-        "enforce_eager": bool(performance.get("enforce_eager", False)),
         "decode_cuda_graph": _decode_cuda_graph_for_method(
             method,
             bool(performance.get("decode_cuda_graph", True)),
@@ -799,8 +796,6 @@ def _scbench_command(
         cmd.extend(["--gpu_memory_utilization", str(float(scbench["gpu_memory_utilization"]))])
     if bool(scbench.get("decode_cuda_graph", False)):
         cmd.append("--decode_cuda_graph")
-    if "enforce_eager" in scbench:
-        cmd.append("--enforce_eager" if bool(scbench["enforce_eager"]) else "--no-enforce_eager")
     return cmd
 
 
@@ -867,12 +862,6 @@ def parse_args() -> argparse.Namespace:
         "--scbench_decode_cuda_graph",
         action="store_true",
         help="Run the SCBench regression subset with decode CUDA graph enabled.",
-    )
-    parser.add_argument(
-        "--scbench_enforce_eager",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="Override SCBench Sparse-VLLM enforce_eager. Defaults to false when graph is enabled.",
     )
     parser.add_argument(
         "--enable_prefix_caching",
@@ -1074,13 +1063,9 @@ def main() -> int:
                 raise ValueError(f"stress_v2 {key} must be >= 0, got {stress_v2_cfg[key]}.")
         resolved["stress_v2"] = stress_v2_cfg
 
-    if args.scbench_decode_cuda_graph or args.scbench_enforce_eager is not None:
+    if args.scbench_decode_cuda_graph:
         scbench_cfg = dict(resolved.get("scbench") or {})
-        if args.scbench_decode_cuda_graph:
-            scbench_cfg["decode_cuda_graph"] = True
-            scbench_cfg.setdefault("enforce_eager", False)
-        if args.scbench_enforce_eager is not None:
-            scbench_cfg["enforce_eager"] = bool(args.scbench_enforce_eager)
+        scbench_cfg["decode_cuda_graph"] = True
         resolved["scbench"] = scbench_cfg
     if args.enable_prefix_caching:
         for section in ("quality", "performance", "stress"):

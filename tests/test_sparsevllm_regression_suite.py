@@ -36,7 +36,6 @@ class SparseVLLMRegressionSuiteTest(unittest.TestCase):
             quality=self._quality_cfg(),
             performance={
                 "decode_cuda_graph": True,
-                "enforce_eager": False,
                 "tensor_parallel_size": 2,
             },
             output_root=Path("/tmp/sparsevllm-quality"),
@@ -65,7 +64,6 @@ class SparseVLLMRegressionSuiteTest(unittest.TestCase):
             },
             performance={
                 "decode_cuda_graph": True,
-                "enforce_eager": False,
                 "tensor_parallel_size": 2,
             },
             output_root=Path("/tmp/sparsevllm-quality"),
@@ -95,7 +93,6 @@ class SparseVLLMRegressionSuiteTest(unittest.TestCase):
             },
             performance={
                 "decode_cuda_graph": True,
-                "enforce_eager": False,
                 "tensor_parallel_size": 2,
             },
             output_root=Path("/tmp/sparsevllm-quality"),
@@ -119,7 +116,6 @@ class SparseVLLMRegressionSuiteTest(unittest.TestCase):
                 "batch_sizes": [2],
                 "output_len": 8,
                 "decode_cuda_graph": True,
-                "enforce_eager": False,
                 "tensor_parallel_size": 2,
             },
             output_jsonl=Path("/tmp/perf.jsonl"),
@@ -147,7 +143,6 @@ class SparseVLLMRegressionSuiteTest(unittest.TestCase):
                 "batch_sizes": [2],
                 "output_len": 8,
                 "decode_cuda_graph": True,
-                "enforce_eager": False,
             },
             output_jsonl=Path("/tmp/perf.jsonl"),
         )
@@ -179,7 +174,6 @@ class SparseVLLMRegressionSuiteTest(unittest.TestCase):
             quality=self._quality_cfg(),
             performance={
                 "decode_cuda_graph": True,
-                "enforce_eager": False,
                 "tensor_parallel_size": 2,
             },
             output_root=Path("/tmp/sparsevllm-quality"),
@@ -208,17 +202,15 @@ class SparseVLLMRegressionSuiteTest(unittest.TestCase):
             output_dir=Path("/tmp/scbench"),
         )
         self.assertNotIn("--decode_cuda_graph", default_cmd)
-        self.assertNotIn("--no-enforce_eager", default_cmd)
 
         graph_cmd = run_suite._scbench_command(
             manifest_path=Path("/tmp/manifest.json"),
             model_id="qwen3_4b",
             method_ids=["vanilla"],
-            scbench={**base, "decode_cuda_graph": True, "enforce_eager": False, "tensor_parallel_size": 2},
+            scbench={**base, "decode_cuda_graph": True, "tensor_parallel_size": 2},
             output_dir=Path("/tmp/scbench"),
         )
         self.assertIn("--decode_cuda_graph", graph_cmd)
-        self.assertIn("--no-enforce_eager", graph_cmd)
         self.assertEqual(graph_cmd[graph_cmd.index("--tensor_parallel_size") + 1], "2")
 
     def test_stress_command_can_require_prefix_cache_hit(self):
@@ -232,7 +224,6 @@ class SparseVLLMRegressionSuiteTest(unittest.TestCase):
             },
             performance={
                 "decode_cuda_graph": True,
-                "enforce_eager": False,
                 "tensor_parallel_size": 2,
             },
             stress={

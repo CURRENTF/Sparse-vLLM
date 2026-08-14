@@ -466,7 +466,6 @@ def _case_block_size(args: argparse.Namespace, case_name: str) -> int:
 def _case_engine_kwargs(args: argparse.Namespace, case_name: str, max_prompt_len: int) -> dict[str, Any]:
     preset = CASE_PRESETS[case_name]
     hyper_params = {
-        "enforce_eager": True,
         "gpu_memory_utilization": float(args.gpu_memory_utilization),
         "tensor_parallel_size": int(args.tensor_parallel_size),
         "expert_parallel_size": int(

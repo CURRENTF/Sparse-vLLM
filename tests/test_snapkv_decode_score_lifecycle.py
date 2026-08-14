@@ -42,7 +42,6 @@ class WorkerInfoTest(unittest.TestCase):
             vllm_sparse_method="snapkv",
             pool_kernel_size=7,
             sparse_attn_score_dtype="float16",
-            enforce_eager=False,
         )
 
         benchmark_config = engine.worker_info()["benchmark_config"]
@@ -52,7 +51,6 @@ class WorkerInfoTest(unittest.TestCase):
             benchmark_config["sparse_attn_score_dtype"],
             "float16",
         )
-        self.assertIs(benchmark_config["enforce_eager"], False)
         self.assertEqual(engine.worker_info()["vocab_size"], 32_000)
         revision = engine.worker_info()["code_revision"]
         self.assertTrue(revision["git_commit"] or revision["package_version"])

@@ -41,7 +41,7 @@ normalized internally to `model_type=qwen3_5`; Qwen3.6 MoE uses
 `model_type=qwen3_5_moe`.
 
 GLM-4.7-Flash uses BF16 latent MLA on NVIDIA H100 80GB HBM3 and requires
-`DP=1` plus `enforce_eager=True`. The validated `(TP, EP)` layouts are
+`DP=1`. The validated `(TP, EP)` layouts are
 `(1,1)`, `(2,1)`, `(4,1)`, `(1,2)`, `(1,4)`, `(2,2)`, `(4,2)`, and `(4,4)`.
 Across all eight layouts, vanilla, StreamingLLM, SnapKV, H2O, OmniKV, and R-KV
 support decode CUDA Graph and prefix caching together. Prefix caching uses

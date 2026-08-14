@@ -1388,7 +1388,7 @@ def test_config_rejects_unvalidated_prefix_cache_options():
         _make_config(prefix_cache_max_blocks="16.9")
 
 
-def test_config_restricts_prefix_cache_offload_to_explicit_eager_tp1_tp2_modes():
+def test_config_restricts_prefix_cache_offload_to_explicit_tp1_tp2_modes():
     with pytest.raises(ValueError, match="enable_prefix_caching"):
         _make_config(
             enable_prefix_cache_offload=True,
@@ -1421,13 +1421,6 @@ def test_config_restricts_prefix_cache_offload_to_explicit_eager_tp1_tp2_modes()
             enable_prefix_cache_offload=True,
             prefix_cache_host_size_gb=1,
             tensor_parallel_size=3,
-        )
-    with pytest.raises(ValueError, match="enforce_eager=True"):
-        _make_config(
-            enable_prefix_caching=True,
-            enable_prefix_cache_offload=True,
-            prefix_cache_host_size_gb=1,
-            enforce_eager=False,
         )
     graph = _make_config(
         enable_prefix_caching=True,

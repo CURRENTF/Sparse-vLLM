@@ -71,7 +71,6 @@ class Config(
     # Soft host-side I/O budget shared across ranks; every rank retains at
     # least one synchronous loading path when the budget is smaller.
     weight_loading_workers: int = 1
-    enforce_eager: bool = True
     enable_multimodal: bool = True
     hf_config: AutoConfig | None = None
     outer_hf_config: Any | None = None

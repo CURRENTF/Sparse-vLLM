@@ -46,7 +46,6 @@ def test_tp2_prefix_offload_engine_demotes_and_promotes_real_model():
         llm = LLM(
             model,
             tensor_parallel_size=2,
-            enforce_eager=True,
             enable_prefix_caching=True,
             enable_prefix_cache_offload=True,
             prefix_cache_block_size=16,

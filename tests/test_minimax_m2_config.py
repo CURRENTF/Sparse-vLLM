@@ -82,7 +82,6 @@ def test_minimax_config_accepts_first_milestone_runtime(
         expert_parallel_size=expert_parallel_size,
         enable_prefix_caching=True,
         decode_cuda_graph=True,
-        enforce_eager=False,
     )
 
     assert config.hf_config.model_type == "minimax_m2"
@@ -173,7 +172,6 @@ def test_minimax_config_accepts_outer_tp_layout(
         tensor_parallel_size=tensor_parallel_size,
         expert_parallel_size=expert_parallel_size,
         decode_cuda_graph=True,
-        enforce_eager=False,
     )
 
     assert config.uses_outer_tp_moe_layout
@@ -188,7 +186,6 @@ def _validate(method="", **overrides):
         "tensor_parallel_size": 1,
         "expert_parallel_size": 4,
         "data_parallel_size": 1,
-        "enforce_eager": False,
         "decode_cuda_graph": True,
         "enable_prefix_caching": True,
     }
@@ -294,7 +291,6 @@ def test_minimax_config_accepts_non_deltakv_sparse_methods(tmp_path, method):
     config = _make_config(
         tmp_path,
         vllm_sparse_method=method,
-        enforce_eager=True,
         decode_cuda_graph=False,
         enable_prefix_caching=False,
     )
@@ -318,7 +314,6 @@ def test_minimax_sparse_methods_accept_decode_cuda_graph(tmp_path, method):
     config = _make_config(
         tmp_path,
         vllm_sparse_method=method,
-        enforce_eager=False,
         decode_cuda_graph=True,
         enable_prefix_caching=False,
     )

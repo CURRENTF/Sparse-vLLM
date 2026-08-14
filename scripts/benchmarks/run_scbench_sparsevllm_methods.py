@@ -251,7 +251,6 @@ def method_runtime_config(
     scbench_max_steps: int,
     prefix_cache_salt: str,
     decode_cuda_graph: bool = False,
-    enforce_eager: bool | None = None,
 ) -> dict[str, Any]:
     method = manifest["methods"][method_id]
     cfg = dict(method.get("config") or {})
@@ -262,7 +261,6 @@ def method_runtime_config(
         cfg.setdefault("deltakv_checkpoint_path", compressor_path)
     cfg["enable_prefix_caching"] = method["sparse_method"] in {"vanilla", "omnikv", "quest"}
     cfg["decode_cuda_graph"] = bool(decode_cuda_graph)
-    cfg["enforce_eager"] = bool(not decode_cuda_graph) if enforce_eager is None else bool(enforce_eager)
     if decode_cuda_graph:
         cfg["decode_cuda_graph_capture_sampling"] = False
     cfg["max_model_len"] = int(max_seq_length)
@@ -911,7 +909,6 @@ def run_method(
         scbench_max_steps=int(args.scbench_max_steps),
         prefix_cache_salt=f"{args.prefix_cache_salt}:{model_id}:{method_id}",
         decode_cuda_graph=bool(args.decode_cuda_graph),
-        enforce_eager=args.enforce_eager,
     )
     write_json(method_dir / "runtime_config.json", runtime_cfg)
 
@@ -1016,8 +1013,6 @@ def child_command(args: argparse.Namespace, method_id: str) -> list[str]:
     ]
     if args.decode_cuda_graph:
         cmd.append("--decode_cuda_graph")
-    if args.enforce_eager is not None:
-        cmd.append("--enforce_eager" if args.enforce_eager else "--no-enforce_eager")
     if args.gpu_memory_utilization is not None:
         cmd.extend(["--gpu_memory_utilization", str(float(args.gpu_memory_utilization))])
     if args.trust_remote_code:
@@ -1047,7 +1042,6 @@ def run_methods_in_subprocesses(
         "max_seq_length": int(args.max_seq_length),
         "batch_size": int(args.batch_size),
         "decode_cuda_graph": bool(args.decode_cuda_graph),
-        "enforce_eager": args.enforce_eager,
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
         "scbench_local_data_dir": os.environ.get("SCBENCH_LOCAL_DATA_DIR"),
         "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -1122,7 +1116,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gpu_memory_utilization", type=float, default=None)
     parser.add_argument("--scbench_max_steps", type=int, default=200_000)
     parser.add_argument("--decode_cuda_graph", action="store_true")
-    parser.add_argument("--enforce_eager", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--context_min_tokens", type=int, default=-1)
     parser.add_argument("--context_max_tokens", type=int, default=-1)
     parser.add_argument("--trust_remote_code", action="store_true")
@@ -1170,7 +1163,6 @@ def main() -> int:
         "max_seq_length": int(args.max_seq_length),
         "batch_size": int(args.batch_size),
         "decode_cuda_graph": bool(args.decode_cuda_graph),
-        "enforce_eager": args.enforce_eager,
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
         "scbench_local_data_dir": os.environ.get("SCBENCH_LOCAL_DATA_DIR"),
         "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),

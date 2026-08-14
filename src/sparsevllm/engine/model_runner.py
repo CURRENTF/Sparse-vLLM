@@ -157,7 +157,6 @@ class ModelRunner:
         profiler.set_rank(rank)
         profiler.set_enabled(config.enable_profiler and rank == 0)
         hf_config = config.hf_config
-        self.enforce_eager = config.enforce_eager
         self.world_size = config.world_size
         self.rank = rank
         self.event = event

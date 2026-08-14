@@ -72,7 +72,7 @@ Use these rules before editing code.
 8. Run at least one correctness-oriented benchmark or regression task that exercises the new public method end to end and saves result artifacts.
 9. Run at least one throughput benchmark.
 10. Cover multiple batch sizes: at minimum `bs=1` and one `bs>1` benchmark/smoke. If `bs>1` fails, keep the failure explicit and do not call the method first-class complete.
-11. Compare decode throughput against `vanilla` and the closest existing sparse method using the same model, GPU, prompt length, batch size, output length, `decode_cuda_graph`, and `enforce_eager` settings.
+11. Compare decode throughput against `vanilla` and the closest existing sparse method using the same model, GPU, prompt length, batch size, output length, and `decode_cuda_graph` setting.
 12. If the method is slower than expected, profile the method-owned hooks first, then optimize or document the implementation as prototype/blocked instead of declaring support complete.
 13. For performance claims, use enough generated tokens to reach a stable decode region. Prefer `output_len >= 128` for quick checks and `output_len >= 256` for meaningful comparisons; use the benchmark's full-admission/stable-window metrics when available.
 
@@ -127,7 +127,7 @@ python scripts/benchmarks/bench_sparse_vllm.py \
   --lengths <REALISTIC_LENGTH> \
   --batch_sizes 1,<REALISTIC_BATCH_GT_1> \
   --output_len 256 \
-  --hyper_params '{"gpu_memory_utilization":0.9,"chunk_prefill_size":4096,"tensor_parallel_size":1,"decode_cuda_graph":true,"enforce_eager":false}'
+  --hyper_params '{"gpu_memory_utilization":0.9,"chunk_prefill_size":4096,"tensor_parallel_size":1,"decode_cuda_graph":true}'
 ```
 
 Report decode throughput, prefill throughput, memory accounting, graph status,

@@ -33,7 +33,7 @@ Qwen3.5/Qwen3.6 Dense 配置在内部统一规范为 `model_type=qwen3_5`；Qwen
 MoE 使用 `model_type=qwen3_5_moe`。
 
 GLM-4.7-Flash 在 NVIDIA H100 80GB HBM3 上使用 BF16 latent MLA，要求
-`DP=1` 且 `enforce_eager=True`。已验证的 `(TP, EP)` 布局为 `(1,1)`、
+`DP=1`。已验证的 `(TP, EP)` 布局为 `(1,1)`、
 `(2,1)`、`(4,1)`、`(1,2)`、`(1,4)`、`(2,2)`、`(4,2)` 和 `(4,4)`。
 在全部八种布局中，vanilla、StreamingLLM、SnapKV、H2O、OmniKV 和 R-KV
 均支持 decode CUDA Graph 与 Prefix Cache 的联合组合。Prefix Cache 对

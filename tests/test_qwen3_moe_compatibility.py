@@ -19,7 +19,6 @@ def _validate(method="", **overrides):
         "tensor_parallel_size": 1,
         "expert_parallel_size": 2,
         "data_parallel_size": 1,
-        "enforce_eager": True,
         "decode_cuda_graph": False,
         "enable_prefix_caching": False,
     }
@@ -60,7 +59,6 @@ def test_qwen3_moe_registry_lists_only_v1_validated_combinations():
         "pyramidkv",
         "rkv",
     }
-    assert QWEN3_MOE_EP_COMPATIBILITY.requires_eager is False
     assert QWEN3_MOE_EP_COMPATIBILITY.decode_cuda_graph_methods == {
         "",
         "streamingllm",
@@ -78,7 +76,6 @@ def test_qwen35_moe_registry_accepts_vanilla_prefix_cache():
         model_type="qwen3_5_moe",
         sparse_method="",
         topology=ParallelTopology(2, 2, 1, ParallelMode.OUTER_TP_MOE),
-        enforce_eager=True,
         decode_cuda_graph=False,
         enable_prefix_caching=True,
     ) is QWEN35_MOE_COMPATIBILITY
@@ -124,7 +121,6 @@ def test_qwen3_moe_registry_accepts_vanilla_pure_tp_modes():
         assert _validate(
             tensor_parallel_size=tp_size,
             expert_parallel_size=1,
-            enforce_eager=False,
             decode_cuda_graph=True,
             enable_prefix_caching=True,
         ) is QWEN3_MOE_TP_COMPATIBILITY
@@ -143,7 +139,6 @@ def test_qwen3_moe_registry_accepts_tp_sparse_graph_modes(
         method,
         tensor_parallel_size=4,
         expert_parallel_size=expert_parallel_size,
-        enforce_eager=False,
         decode_cuda_graph=True,
     ) is QWEN3_MOE_TP_COMPATIBILITY
 
@@ -162,7 +157,7 @@ def test_qwen3_moe_tp_sparse_methods_exclude_deltakv_and_skipkv():
 )
 def test_qwen3_moe_registry_accepts_decode_cuda_graph(method):
     assert (
-        _validate(method, enforce_eager=False, decode_cuda_graph=True)
+        _validate(method, decode_cuda_graph=True)
         is QWEN3_MOE_EP_COMPATIBILITY
     )
 def test_dense_models_use_shared_runtime_compatibility():
@@ -170,7 +165,6 @@ def test_dense_models_use_shared_runtime_compatibility():
         model_type="qwen3",
         sparse_method="deltakv",
         topology=ParallelTopology(1, 1, 1),
-        enforce_eager=True,
         decode_cuda_graph=False,
         enable_prefix_caching=False,
     ) is DENSE_MODEL_COMPATIBILITY
