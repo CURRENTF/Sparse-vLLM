@@ -27,6 +27,7 @@ from sparsevllm.engine.chain_cache import ChainCacheError
 from sparsevllm.entrypoints.openai.serving.response_parsing import ParsedModelResponse
 from sparsevllm.entrypoints.openai.serving.response_parsing import ResponseParseError
 from sparsevllm.entrypoints.openai.serving.response_parsing import TransformersResponseParser
+from sparsevllm.entrypoints.openai.serving.response_parsing import response_parser_prefix
 from sparsevllm.utils.log import logger
 
 
@@ -88,6 +89,19 @@ async def serve_response(
         raise _chain_http_exception(exc) from exc
     except (ValueError, TypeError, NotImplementedError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    should_parse = reasoning_parser_name is not None or bool(request.tools)
+    try:
+        parser_prompt = (
+            response_parser_prefix(tokenizer, prompt, handle)
+            if should_parse
+            else ""
+        )
+    except ResponseParseError as exc:
+        dispatcher.cancel(handle)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Responses parser setup failed: {exc}",
+        ) from exc
     headers = (
         {"X-SparseVLLM-Chain-ID": getattr(handle, "chain_id", None)}
         if getattr(handle, "chain_id", None) is not None
@@ -113,7 +127,7 @@ async def serve_response(
                 started,
                 request_log_path,
                 request,
-                prompt=prompt if isinstance(prompt, str) else "",
+                prompt=parser_prompt,
                 reasoning_parser_name=reasoning_parser_name,
                 response_parser=response_parser,
                 is_disconnected=is_disconnected,
@@ -128,7 +142,7 @@ async def serve_response(
             created_at,
             request.model,
             handle,
-            prompt=prompt if isinstance(prompt, str) else "",
+            prompt=parser_prompt,
             reasoning_parser_name=reasoning_parser_name,
             parse_tools=bool(request.tools),
             response_parser=response_parser,

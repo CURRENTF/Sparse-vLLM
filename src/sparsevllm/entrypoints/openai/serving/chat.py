@@ -32,6 +32,7 @@ from sparsevllm.entrypoints.openai.serving.response_parsing import ParsedModelRe
 from sparsevllm.entrypoints.openai.serving.response_parsing import ModelOutputParseError
 from sparsevllm.entrypoints.openai.serving.response_parsing import ResponseParseError
 from sparsevllm.entrypoints.openai.serving.response_parsing import TransformersResponseParser
+from sparsevllm.entrypoints.openai.serving.response_parsing import response_parser_prefix
 from sparsevllm.utils.log import logger
 
 
@@ -112,6 +113,19 @@ async def serve_chat_completion(
     except (ValueError, TypeError, NotImplementedError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     handles = [handle]
+    should_parse = reasoning_parser_name is not None or bool(chat_tools)
+    try:
+        parser_prompt = (
+            response_parser_prefix(tokenizer, prompt, handle)
+            if should_parse
+            else ""
+        )
+    except ResponseParseError as exc:
+        dispatcher.cancel(handle)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Chat Completions parser setup failed: {exc}",
+        ) from exc
     headers = (
         {"X-SparseVLLM-Chain-ID": getattr(handle, "chain_id", None)}
         if getattr(handle, "chain_id", None) is not None
@@ -129,7 +143,7 @@ async def serve_chat_completion(
                 started,
                 tokenizer,
                 _stream_include_usage(request.stream_options),
-                prompt=prompt if isinstance(prompt, str) else "",
+                prompt=parser_prompt,
                 reasoning_parser_name=reasoning_parser_name,
                 parse_tools=bool(chat_tools),
                 response_parser=response_parser,
@@ -146,7 +160,7 @@ async def serve_chat_completion(
             request.model,
             handles,
             tokenizer,
-            prompt=prompt if isinstance(prompt, str) else "",
+            prompt=parser_prompt,
             reasoning_parser_name=reasoning_parser_name,
             parse_tools=bool(chat_tools),
             response_parser=response_parser,

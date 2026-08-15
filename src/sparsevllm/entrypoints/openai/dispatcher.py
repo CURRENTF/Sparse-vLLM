@@ -28,6 +28,7 @@ class RequestHandle:
     chain_status: str = "disabled"
     reused_tokens: int = 0
     prefilled_tokens: int = 0
+    prompt_token_ids: list[int] | None = None
     admission_future: asyncio.Future | None = None
     admission_error: BaseException | None = None
 
@@ -591,6 +592,7 @@ class AsyncEngineDispatcher:
                 if isinstance(item.prompt, list)
                 else self.engine.tokenizer.encode(item.prompt)
             )
+            item.handle.prompt_token_ids = prompt_token_ids
             engine_config = getattr(self.engine, "config", None)
             eos_token_ids = resolve_eos_token_ids(
                 getattr(item.sampling_params, "eos_token_ids", ()),

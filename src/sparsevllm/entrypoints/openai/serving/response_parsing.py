@@ -151,6 +151,37 @@ class ModelOutputParseError(ResponseParseError):
     """The generated text is malformed, while the parser contract is valid."""
 
 
+def response_parser_prefix(
+    tokenizer: Any,
+    prompt: Any,
+    handle: Any,
+) -> str:
+    """Return the exact admitted prompt text needed to resume parser state."""
+    if isinstance(prompt, str):
+        return prompt
+    prompt_token_ids = getattr(handle, "prompt_token_ids", None)
+    if prompt_token_ids is None:
+        raise ResponseParseError(
+            "Multimodal response parsing requires admitted prompt token IDs."
+        )
+    decode = getattr(tokenizer, "decode", None)
+    if not callable(decode):
+        raise ResponseParseError(
+            "Multimodal response parsing requires tokenizer.decode()."
+        )
+    try:
+        prefix = decode(prompt_token_ids, skip_special_tokens=False)
+    except (TypeError, ValueError) as exc:
+        raise ResponseParseError(
+            f"Failed to decode the multimodal parser prefix: {exc}"
+        ) from exc
+    if not isinstance(prefix, str):
+        raise ResponseParseError(
+            "Tokenizer decoded the multimodal parser prefix to a non-string value."
+        )
+    return prefix
+
+
 def _caused_by_json_decode_error(exc: BaseException) -> bool:
     current: BaseException | None = exc
     seen: set[int] = set()

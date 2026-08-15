@@ -3924,6 +3924,7 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
             chain_status = "resumed"
             reused_tokens = 2
             prefilled_tokens = 1
+            prompt_token_ids = [11, 12, 13]
 
         class Engine:
             config = type(
@@ -3971,6 +3972,7 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         final = await asyncio.wait_for(output_queue.get(), timeout=1)
 
         self.assertIsNone(handle.admission_error)
+        self.assertEqual(handle.prompt_token_ids, [11, 12, 13])
         self.assertEqual(final["type"], "final")
         self.assertEqual(final["prompt_tokens"], 3)
         self.assertTrue(handle.terminal.is_set())
@@ -4721,6 +4723,119 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(final_choice["finish_reason"], "tool_calls")
         usage = [payload["usage"] for payload in payloads if not payload.get("choices")][0]
         self.assertEqual(usage, {"prompt_tokens": 3, "completion_tokens": 3, "total_tokens": 6})
+
+    async def test_multimodal_chat_stream_uses_admitted_parser_prefix(self):
+        from sparsevllm.entrypoints.openai.api_server import (
+            ChatCompletionRequest,
+            RequestHandle,
+        )
+        from sparsevllm.entrypoints.openai.serving.chat import (
+            serve_chat_completion,
+        )
+
+        raw_text = "inspect image</think>\n\nanswer<|im_end|>"
+        queue = asyncio.Queue()
+        await queue.put(
+            {
+                "type": "token",
+                "index": 0,
+                "text": "",
+                "raw_text_delta": raw_text,
+                "token_ids": [20],
+                "token_logprobs": [None],
+                "top_logprobs": [None],
+            }
+        )
+        await queue.put(
+            {
+                "type": "final",
+                "index": 0,
+                "text": "answer",
+                "raw_text": raw_text,
+                "finish_reason": "stop",
+                "prompt_tokens": 3,
+                "completion_tokens": 1,
+                "token_ids": [20],
+                "token_logprobs": [None],
+                "top_logprobs": [None],
+            }
+        )
+
+        class Tokenizer(_TransformersResponseTokenizer):
+            def decode(self, token_ids, *, skip_special_tokens):
+                self.asserted_token_ids = list(token_ids)
+                self.asserted_skip_special_tokens = skip_special_tokens
+                return (
+                    "<|im_start|>user\n<|vision_start|><|image_pad|>"
+                    "<|vision_end|>describe<|im_end|>\n"
+                    "<|im_start|>assistant\n<think>\n"
+                )
+
+        tokenizer = Tokenizer()
+        handle = RequestHandle(
+            output_queue=queue,
+            cancelled=threading.Event(),
+            prompt_token_ids=[10, 11, 12],
+        )
+
+        class Dispatcher:
+            admission_ack_enabled = True
+
+            async def submit(self, *_args, **_kwargs):
+                raise AssertionError("submit_admitted must be used")
+
+            async def submit_admitted(self, *_args, **_kwargs):
+                return handle
+
+            def cancel(self, _handle):
+                raise AssertionError("finished stream should not be cancelled")
+
+        response = await serve_chat_completion(
+            ChatCompletionRequest(
+                model="model",
+                stream=True,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": "https://x/image.png"},
+                            },
+                            {"type": "text", "text": "describe"},
+                        ],
+                    }
+                ],
+            ),
+            Dispatcher(),
+            tokenizer,
+            "model",
+            None,
+            reasoning_parser_name="qwen3",
+            response_parser=_transformers_response_parser(),
+        )
+        chunks = [chunk async for chunk in response.body_iterator]
+        payloads = [
+            payload
+            for event, payload in _response_sse_events(chunks)
+            if event != "[DONE]"
+        ]
+        deltas = [
+            choice["delta"]
+            for payload in payloads
+            for choice in payload.get("choices", [])
+        ]
+
+        self.assertEqual(tokenizer.asserted_token_ids, [10, 11, 12])
+        self.assertFalse(tokenizer.asserted_skip_special_tokens)
+        self.assertEqual(
+            "".join(delta.get("reasoning_content", "") for delta in deltas),
+            "inspect image",
+        )
+        self.assertEqual(
+            "".join(delta.get("content", "") for delta in deltas),
+            "\n\nanswer",
+        )
 
     async def test_chat_stream_parser_disabled_preserves_raw_content(self):
         from sparsevllm.entrypoints.openai.api_server import RequestHandle, _chat_completion_stream
@@ -5808,6 +5923,44 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(output[0]["type"], "reasoning")
         self.assertEqual(output[0]["text"], "reason")
         self.assertEqual(output[1]["content"][0]["text"], "answer")
+
+    def test_multimodal_parser_prefix_restores_template_opened_think(self):
+        from sparsevllm.entrypoints.openai.dispatcher import RequestHandle
+        from sparsevllm.entrypoints.openai.serving.response_parsing import (
+            response_parser_prefix,
+        )
+        from sparsevllm.multimodal import MultiModalPrompt
+
+        class Tokenizer:
+            def decode(self, token_ids, *, skip_special_tokens):
+                self.asserted_token_ids = list(token_ids)
+                self.asserted_skip_special_tokens = skip_special_tokens
+                return (
+                    "<|im_start|>user\n<|vision_start|><|image_pad|>"
+                    "<|vision_end|>describe<|im_end|>\n"
+                    "<|im_start|>assistant\n<think>\n"
+                )
+
+        tokenizer = Tokenizer()
+        handle = RequestHandle(
+            output_queue=asyncio.Queue(),
+            cancelled=threading.Event(),
+            prompt_token_ids=[10, 11, 12],
+        )
+        prompt = MultiModalPrompt(
+            [{"role": "user", "content": [{"type": "image"}]}]
+        )
+        prefix = response_parser_prefix(tokenizer, prompt, handle)
+        parsed = _transformers_response_parser().parse(
+            "reason</think>\n\nanswer<|im_end|>",
+            prefix=prefix,
+            parse_tools=False,
+        )
+
+        self.assertEqual(tokenizer.asserted_token_ids, [10, 11, 12])
+        self.assertFalse(tokenizer.asserted_skip_special_tokens)
+        self.assertEqual(parsed.reasoning_content, "reason")
+        self.assertEqual(parsed.content, "answer")
 
     def test_qwen3_reasoning_parser_handles_unclosed_region(self):
         from sparsevllm.entrypoints.openai.api_server import _response_output_items
