@@ -62,11 +62,9 @@ This is a research codebase. The priority is trustworthy experimental results.
 
 ## Git Commit Messages Rules
 1. **Specification**: Strictly follow the Conventional Commits specification.
-2. **Format**: Use the format `<type>: <short description>` (e.g., `feat: add hybrid attention support`).
+2. **Format**: Use the format `<type>: <description>`.
 3. **Allowed Types**: `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `chore`.
 4. **Style**:
    - Write the description in English, using the imperative mood (e.g., "add" not "added").
    - Start the description with a lowercase letter.
-   - Do NOT end the message with a period.
-   - Keep the entire line under 50 characters.
-5. **Constraint**: Return ONLY the single line of the commit message. Do NOT include any markdown code blocks, introductory text, or explanations.
+   - Keep the entire line under 200 characters.

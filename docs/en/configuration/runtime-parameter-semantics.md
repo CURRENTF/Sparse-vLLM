@@ -50,6 +50,15 @@ Do not duplicate method policy decisions in benchmark scripts. Runtime reports
 should record the resolved method, policy, chunk size, context length, batch
 size, and checkpoint path.
 
+## Runtime invariant validation
+
+`validate_runtime_invariants=False` is the serving fast-path default. Set it to
+`True` in allocator, eviction, and CUDA Graph diagnostics to enable expensive
+internal checks such as MLA slot range/uniqueness, H2O decode context bounds,
+and H2O/SnapKV cross-layer metadata alignment. The option is resolved when the
+engine is initialized and is independent of `enable_profiler`, so profiling
+does not silently enable debug work.
+
 ## DeltaKV
 
 Reportable DeltaKV inference requires a compatible compressor checkpoint:

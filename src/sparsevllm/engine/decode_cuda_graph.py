@@ -421,9 +421,8 @@ class DecodeCudaGraphRunner:
                 _ = logits.argmax(dim=-1)
         self.platform.synchronize()
 
-        # Static metadata was validated before the eager warmup. Some cache
-        # layouts use that validation to suppress graph-unsafe host checks for
-        # exactly one model forward, so establish a fresh scope for capture.
+        # In runtime-invariant mode, eager warmup consumes the prevalidated
+        # storage scope. Establish a fresh scope for capture.
         self.cache_manager.validate_decode_cuda_graph_slot_mappings()
 
         with profiler.record("decode_cuda_graph_capture"):

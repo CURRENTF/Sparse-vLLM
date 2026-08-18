@@ -303,31 +303,32 @@ class H2OCacheManager(SnapKVCacheManager):
             row_indices = tuple(
                 int(self.seq_id_to_row[first_layer][seq_id]) for seq_id in seq_ids
             )
-            first_row_lens = tuple(
-                int(self.row_seq_lens[first_layer][row_idx])
-                for row_idx in row_indices
-            )
-            for layer_id in layer_ids[1:]:
-                layer_rows = tuple(
-                    int(self.seq_id_to_row[layer_id].get(seq_id, -1))
-                    for seq_id in seq_ids
+            if self.validate_runtime_invariants:
+                first_row_lens = tuple(
+                    int(self.row_seq_lens[first_layer][row_idx])
+                    for row_idx in row_indices
                 )
-                if layer_rows != row_indices:
-                    raise RuntimeError(
-                        "H2O static decode requires uniform request rows across KV layers: "
-                        f"first_layer={first_layer} rows={row_indices} "
-                        f"layer={layer_id} layer_rows={layer_rows}."
+                for layer_id in layer_ids[1:]:
+                    layer_rows = tuple(
+                        int(self.seq_id_to_row[layer_id].get(seq_id, -1))
+                        for seq_id in seq_ids
                     )
-                layer_row_lens = tuple(
-                    int(self.row_seq_lens[layer_id][row_idx])
-                    for row_idx in layer_rows
-                )
-                if layer_row_lens != first_row_lens:
-                    raise RuntimeError(
-                        "H2O static decode requires uniform row lengths across KV layers: "
-                        f"first_layer={first_layer} lengths={first_row_lens} "
-                        f"layer={layer_id} layer_lengths={layer_row_lens}."
+                    if layer_rows != row_indices:
+                        raise RuntimeError(
+                            "H2O static decode requires uniform request rows across KV layers: "
+                            f"first_layer={first_layer} rows={row_indices} "
+                            f"layer={layer_id} layer_rows={layer_rows}."
+                        )
+                    layer_row_lens = tuple(
+                        int(self.row_seq_lens[layer_id][row_idx])
+                        for row_idx in layer_rows
                     )
+                    if layer_row_lens != first_row_lens:
+                        raise RuntimeError(
+                            "H2O static decode requires uniform row lengths across KV layers: "
+                            f"first_layer={first_layer} lengths={first_row_lens} "
+                            f"layer={layer_id} layer_lengths={layer_row_lens}."
+                        )
             row_cache_key = (seq_ids, row_indices, layer_ids)
             cached_rows = getattr(self, "_h2o_decode_static_rows", None)
             if cached_rows is None or cached_rows[0] != row_cache_key:
@@ -379,16 +380,19 @@ class H2OCacheManager(SnapKVCacheManager):
                 )
 
             free_ptrs = tuple(int(self._num_free_slots[layer_id]) for layer_id in layer_ids)
-            if any(ptr != free_ptrs[0] for ptr in free_ptrs[1:]):
+            if self.validate_runtime_invariants and any(
+                ptr != free_ptrs[0] for ptr in free_ptrs[1:]
+            ):
                 raise RuntimeError(
                     "H2O static decode requires aligned per-layer free-stack pointers: "
                     f"layers={layer_ids} ptrs={free_ptrs}."
                 )
             free_ptr = free_ptrs[0]
-            if free_ptr < real_batch_size:
+            min_free_ptr = min(free_ptrs)
+            if min_free_ptr < real_batch_size:
                 raise RuntimeError(
                     "Out of KV cache slots in H2O static decode: "
-                    f"need={real_batch_size} free={free_ptr}."
+                    f"need={real_batch_size} free={min_free_ptr}."
                 )
             new_slots = self.free_slots_stack_tensor[
                 kv_layers_gpu,

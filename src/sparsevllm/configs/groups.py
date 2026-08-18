@@ -152,5 +152,6 @@ class ObservabilityConfig:
     """Diagnostics and config-loading behavior."""
 
     enable_profiler: bool = False
+    validate_runtime_invariants: bool = False
     throughput_log_interval_s: float = 10.0
     allow_unknown_config_keys: bool = False

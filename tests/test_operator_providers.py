@@ -30,6 +30,7 @@ from sparsevllm.operators.moe import (
     HopperQwen36HybridFp8MoeProvider,
     MoeOpSpec,
     SglAlignedTritonGlmMoeProvider,
+    SglTritonHybridMoeProvider,
     resolve_moe_provider,
     use_packed_shared_experts,
 )
@@ -565,6 +566,177 @@ def test_hopper_fused_moe_uses_profiled_tp_ep_shape():
     )
 
     assert resolved.provider.name == "triton_hopper_fused"
+
+
+@pytest.mark.parametrize(
+    ("tp_size", "intermediate_size", "expected_provider"),
+    [
+        (1, 768, "sgl_triton_hybrid"),
+        (2, 384, "sgl_triton_hybrid"),
+        (4, 192, "triton"),
+    ],
+)
+def test_qwen3_bf16_moe_uses_sgl_triton_provider(
+    tp_size,
+    intermediate_size,
+    expected_provider,
+):
+    spec = _moe_spec(
+        activation_dtype=torch.bfloat16,
+        weight_dtype=torch.bfloat16,
+        block_shape=None,
+        hidden_size=2048,
+        intermediate_size=intermediate_size,
+        num_local_experts=128,
+        num_experts=128,
+        top_k=8,
+        ep_size=1,
+        tp_size=tp_size,
+    )
+
+    with patch(
+        "sparsevllm.kernels.external.sgl.moe.sgl_moe_alignment_support",
+        return_value=(True, "available"),
+    ):
+        resolved = OpResolver(MOE_REGISTRY).resolve(
+            spec,
+            _cuda_caps(
+                (9, 0),
+                native_fp8=False,
+                device_name="NVIDIA H100 80GB HBM3",
+            ),
+        )
+
+    assert resolved.provider.name == expected_provider
+
+
+def test_sgl_triton_moe_falls_back_when_alignment_is_unavailable():
+    spec = _moe_spec(
+        activation_dtype=torch.bfloat16,
+        weight_dtype=torch.bfloat16,
+        block_shape=None,
+        hidden_size=2048,
+        intermediate_size=384,
+        num_local_experts=128,
+        num_experts=128,
+        top_k=8,
+        ep_size=1,
+        tp_size=2,
+    )
+
+    with patch(
+        "sparsevllm.kernels.external.sgl.moe.sgl_moe_alignment_support",
+        return_value=(False, "unavailable"),
+    ):
+        resolved = OpResolver(MOE_REGISTRY).resolve(
+            spec,
+            _cuda_caps(
+                (9, 0),
+                native_fp8=False,
+                device_name="NVIDIA H100 80GB HBM3",
+            ),
+        )
+
+    assert resolved.provider.name == "triton"
+    assert dict(resolved.rejected)["sgl_triton_hybrid"] == "unavailable"
+
+
+@pytest.mark.parametrize(
+    ("overrides", "reason"),
+    [
+        ({"activation_dtype": torch.float32}, "profiled BF16 activations"),
+        ({"block_shape": (128, 128)}, "unquantized expert weights"),
+    ],
+)
+def test_sgl_triton_moe_rejects_unsupported_specs(overrides, reason):
+    values = dict(
+        activation_dtype=torch.bfloat16,
+        weight_dtype=torch.bfloat16,
+        block_shape=None,
+        hidden_size=2048,
+        intermediate_size=384,
+        num_local_experts=128,
+        num_experts=128,
+        top_k=8,
+        ep_size=1,
+        tp_size=2,
+    )
+    values.update(overrides)
+    if "activation_dtype" in overrides and "weight_dtype" not in overrides:
+        values["weight_dtype"] = overrides["activation_dtype"]
+    support = SglTritonHybridMoeProvider.supports(
+        _moe_spec(**values),
+        _cuda_caps(
+            (9, 0),
+            native_fp8=False,
+            device_name="NVIDIA H100 80GB HBM3",
+        ),
+    )
+
+    assert not support.supported
+    assert reason in support.reason
+
+
+@pytest.mark.parametrize(
+    ("tp_size", "intermediate_size", "num_tokens", "expected_path"),
+    [
+        (1, 768, 4096, "triton_fused_moe"),
+        (1, 768, 8192, "sgl_fused_moe"),
+        (2, 384, 1, "triton_fused_moe"),
+        (2, 384, 4096, "sgl_fused_moe"),
+    ],
+)
+def test_sgl_triton_provider_dispatches_profiled_token_ranges(
+    tp_size,
+    intermediate_size,
+    num_tokens,
+    expected_path,
+):
+    provider = SglTritonHybridMoeProvider()
+    spec = _moe_spec(
+        activation_dtype=torch.bfloat16,
+        weight_dtype=torch.bfloat16,
+        block_shape=None,
+        hidden_size=2048,
+        intermediate_size=intermediate_size,
+        num_local_experts=128,
+        num_experts=128,
+        top_k=8,
+        ep_size=1,
+        tp_size=tp_size,
+    )
+    tensors = [torch.empty(0) for _ in range(5)]
+    tensors[0] = torch.empty(num_tokens, 0)
+    with patch(
+        "sparsevllm.kernels.triton.sgl_fused_moe.sgl_fused_moe",
+        return_value=tensors[0],
+    ) as sgl_run, patch(
+        "sparsevllm.kernels.triton.moe.fused_moe",
+        return_value=tensors[0],
+    ) as triton_run, patch(
+        "sparsevllm.operators.moe.device_runtime.is_stream_capturing",
+        return_value=False,
+    ):
+        actual = provider.run(
+            spec,
+            *tensors,
+            None,
+            None,
+            local_expert_start=4,
+            ep_rank=1,
+        )
+
+    assert actual is tensors[0]
+    run = sgl_run if expected_path == "sgl_fused_moe" else triton_run
+    assert run.call_count == 1
+    assert run.call_args.kwargs["num_experts"] == spec.num_experts
+    assert run.call_args.kwargs["local_expert_start"] == 4
+    other = triton_run if run is sgl_run else sgl_run
+    assert other.call_count == 0
+    assert provider.runtime_kernel_stats()["kernel_paths"][expected_path] == {
+        "cuda_graph_capture_dispatches": 0,
+        "eager_dispatches": 1,
+    }
 
 
 @pytest.mark.parametrize("device_name", ["NVIDIA H100 80GB HBM3", "NVIDIA H20"])

@@ -44,6 +44,19 @@ def test_config_groups_are_keyword_only():
         assert all(item.kw_only for item in fields(group) if item.init)
 
 
+def test_runtime_invariant_validation_is_opt_in_and_profiler_independent():
+    assert ObservabilityConfig().validate_runtime_invariants is False
+    assert (
+        ObservabilityConfig(enable_profiler=True).validate_runtime_invariants
+        is False
+    )
+    assert (
+        ObservabilityConfig(validate_runtime_invariants=True)
+        .validate_runtime_invariants
+        is True
+    )
+
+
 def test_runtime_constructor_only_orchestrates_config_stages():
     tree = ast.parse(textwrap.dedent(inspect.getsource(Config.__post_init__)))
     forbidden = (ast.For, ast.If, ast.Raise, ast.Try, ast.While)

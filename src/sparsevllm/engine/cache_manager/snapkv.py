@@ -2554,13 +2554,32 @@ class SnapKVCacheManager(CacheManager):
         layer_ids = self.kv_transformer_layer_indices()
         first_layer = int(layer_ids[0])
         row_indices = [self.seq_id_to_row[first_layer][sid] for sid in seq_ids]
-        if any(
-            self.seq_id_to_row[layer_id].get(sid) != row_idx
-            for layer_id in layer_ids[1:]
-            for sid, row_idx in zip(seq_ids, row_indices)
-        ):
-            self._uniform_decode_metadata = False
-            return None
+        if self.validate_runtime_invariants:
+            first_row_lens = tuple(
+                int(self.row_seq_lens[first_layer][row_idx])
+                for row_idx in row_indices
+            )
+            for layer_id in layer_ids[1:]:
+                layer_rows = tuple(
+                    int(self.seq_id_to_row[layer_id].get(sid, -1))
+                    for sid in seq_ids
+                )
+                if layer_rows != tuple(row_indices):
+                    raise RuntimeError(
+                        "Uniform static decode requires identical request rows across KV layers: "
+                        f"first_layer={first_layer} rows={tuple(row_indices)} "
+                        f"layer={layer_id} layer_rows={layer_rows}."
+                    )
+                layer_row_lens = tuple(
+                    int(self.row_seq_lens[layer_id][row_idx])
+                    for row_idx in layer_rows
+                )
+                if layer_row_lens != first_row_lens:
+                    raise RuntimeError(
+                        "Uniform static decode requires identical row lengths across KV layers: "
+                        f"first_layer={first_layer} lengths={first_row_lens} "
+                        f"layer={layer_id} layer_lengths={layer_row_lens}."
+                    )
 
         cur_lens = self.row_seq_lens[first_layer][row_indices]
         if len(cur_lens) > 0 and int(max(cur_lens)) + 1 > int(self.max_model_len):
@@ -2573,6 +2592,16 @@ class SnapKVCacheManager(CacheManager):
                 "Out of KV cache slots in uniform prepare_decode_static: "
                 f"need={real_batch_size} free={min(int(self._num_free_slots[layer_id]) for layer_id in layer_ids)}"
             )
+
+        if self.validate_runtime_invariants:
+            free_ptrs = tuple(
+                int(self._num_free_slots[layer_id]) for layer_id in layer_ids
+            )
+            if any(ptr != free_ptrs[0] for ptr in free_ptrs[1:]):
+                raise RuntimeError(
+                    "Uniform static decode requires aligned per-layer free-stack pointers: "
+                    f"layers={layer_ids} ptrs={free_ptrs}."
+                )
 
         ptr = int(self._num_free_slots[first_layer])
         new_slots_batch = self.free_slots_stack[first_layer][ptr - real_batch_size : ptr]

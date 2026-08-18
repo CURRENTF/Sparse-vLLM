@@ -224,8 +224,9 @@ def copy_latent_to_cache(
     """Copy one token batch into latent MLA caches.
 
     Negative slots are padding and are never read or written. Set
-    ``validate_slots=False`` only when the owning cache manager has already
-    validated this exact mapping; doing so avoids a per-layer host sync.
+    ``validate_slots=False`` when the owning runtime trusts its allocator
+    invariants or has already validated this exact mapping. The kernel still
+    masks padding and out-of-range slots.
     """
 
     _validate_copy_tensors(

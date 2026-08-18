@@ -12,7 +12,7 @@ logger.remove()
 
 # 添加自定义格式的 handler
 # 格式包含：时间 | 级别 | 文件名:函数名:行号 - 消息
-log_level = os.environ.get('LOG_LEVEL', 'INFO')
+log_level = os.environ.get('LOG_LEVEL', 'INFO').upper()
 logger.add(
     sys.stdout,
     colorize=True,

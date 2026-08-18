@@ -58,6 +58,9 @@ class SparseController:
     """
     def __init__(self, config: Config, cache_manager: CacheManager):
         self.sparse_method = config.vllm_sparse_method
+        self.validate_runtime_invariants = bool(
+            getattr(config, "validate_runtime_invariants", False)
+        )
         self.is_deltakv_family = isinstance(self.sparse_method, str) and self.sparse_method.startswith('deltakv')
         self.debug_dynamic_selection = {}
         self.debug_dynamic_selection_detail = os.environ.get(
@@ -1224,7 +1227,7 @@ class SparseController:
         """Accumulate normalized decode attention mass, then evict outside graphs."""
         with profiler.record("h2o_decode_eviction"):
             layer_tensors = {}
-            layer_context_lens = []
+            layer_context_lens = [] if self.validate_runtime_invariants else None
             for layer_idx in self._h2o_kv_layer_indices():
                 state = self.layer_batch_sparse_states[layer_idx]
                 if state.attn_score is None or state.context_lens is None:
@@ -1244,24 +1247,26 @@ class SparseController:
                         f"score_batch={int(state.attn_score.shape[0])}."
                     )
                 layer_tensors[layer_idx] = state.attn_score
-                layer_context_lens.append(state.context_lens)
+                if layer_context_lens is not None:
+                    layer_context_lens.append(state.context_lens)
 
             layer_indices, normalized_scores = self._resolve_h2o_decode_attn_score_buffer(
                 layer_tensors
             )
-            context_lens = torch.stack(layer_context_lens, dim=0)
-            bounds_ok = (
-                (context_lens >= 0)
-                & (context_lens <= int(normalized_scores.shape[2]))
-            ).all()
-            if context_lens.is_cuda:
-                torch._assert_async(bounds_ok)
-            elif not bool(bounds_ok.item()):
-                raise RuntimeError(
-                    "H2O decode context lengths exceed the reduced score width: "
-                    f"width={int(normalized_scores.shape[2])} "
-                    f"contexts={context_lens.tolist()}."
-                )
+            if layer_context_lens is not None:
+                context_lens = torch.stack(layer_context_lens, dim=0)
+                bounds_ok = (
+                    (context_lens >= 0)
+                    & (context_lens <= int(normalized_scores.shape[2]))
+                ).all()
+                if context_lens.is_cuda:
+                    torch._assert_async(bounds_ok)
+                elif not bool(bounds_ok.item()):
+                    raise RuntimeError(
+                        "H2O decode context lengths exceed the reduced score width: "
+                        f"width={int(normalized_scores.shape[2])} "
+                        f"contexts={context_lens.tolist()}."
+                    )
             if int(normalized_scores.shape[1]) < len(seqs):
                 raise RuntimeError(
                     "H2O decode score batch does not cover current sequences: "

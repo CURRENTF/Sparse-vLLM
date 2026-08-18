@@ -35,6 +35,13 @@ must be divisible by `T / E`. Qwen3MoE outer TP requires a BF16 model dtype;
 FP16 Qwen3MoE checkpoints are limited to `TP=1`. When `TP=1`, the existing EP
 layout uses world size `E`.
 
+On H100 80GB, unquantized BF16 Qwen3-30B-A3B with EP1 uses the
+`sgl_triton_hybrid` MoE provider for TP1 and TP2. The provider runs the ported
+SGL fused-MoE kernel for profiled large-token buckets (TP1 at 8192 or more
+tokens; TP2 at 4096 or more) and the generic Triton kernel below those
+thresholds. Other shapes and topologies keep their existing providers. Runtime
+operator statistics report the kernel used by each branch.
+
 Block FP8 support requires E4M3 weights, dynamic activation quantization, and
 a `128 x 128` weight block size. Qwen3.5, Qwen3.6, and Qwen3.8 dense
 checkpoints share the `qwen3_5` runtime architecture and therefore the same

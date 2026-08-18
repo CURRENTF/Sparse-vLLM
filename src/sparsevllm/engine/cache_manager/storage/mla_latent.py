@@ -23,10 +23,12 @@ class MlaLatentStorage:
         kv_lora_rank: int,
         rope_dim: int,
         dtype: torch.dtype,
+        validate_runtime_invariants: bool = False,
     ) -> None:
         self.kv_lora_rank = int(kv_lora_rank)
         self.rope_dim = int(rope_dim)
         self.dtype = dtype
+        self.validate_runtime_invariants = bool(validate_runtime_invariants)
         if self.kv_lora_rank != MLA_LATENT_DIM or self.rope_dim != MLA_ROPE_DIM:
             raise ValueError(
                 "The vendored MLA storage kernel requires "
@@ -171,7 +173,10 @@ class MlaLatentStorage:
             slot_mapping,
             destination.latent_cache,
             destination.rope_cache,
-            validate_slots=not use_prevalidated_mapping,
+            validate_slots=(
+                self.validate_runtime_invariants
+                and not use_prevalidated_mapping
+            ),
         )
         if use_prevalidated_mapping:
             if remaining == 1:

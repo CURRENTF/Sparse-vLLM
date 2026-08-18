@@ -53,6 +53,7 @@ def _manager_with_layer_rows(
     decode_eviction_interval=3,
     prefill_budget=8,
     chunk_prefill_size=4,
+    validate_runtime_invariants=False,
 ):
     if not lengths_by_layer:
         raise ValueError("lengths_by_layer must not be empty")
@@ -78,7 +79,9 @@ def _manager_with_layer_rows(
         pyramid_layer_ratios=None,
         prefill_schedule_policy=PREFILL_POLICY_ALL_CHUNKED,
         chunk_prefill_size=chunk_prefill_size,
+        validate_runtime_invariants=validate_runtime_invariants,
     )
+    manager.validate_runtime_invariants = bool(validate_runtime_invariants)
     manager.max_model_len = 64
     manager.num_kv_heads = 2
     manager.head_dim = 2
@@ -1489,7 +1492,10 @@ def test_h2o_static_decode_reuses_uniform_rows_without_generic_metadata_rebuild(
 
 
 def test_h2o_static_decode_rejects_divergent_layer_row_lengths_before_allocation():
-    manager = _manager_with_layer_rows([[4], [3]])
+    manager = _manager_with_layer_rows(
+        [[4], [3]],
+        validate_runtime_invariants=True,
+    )
     manager.max_buffer_rows = 1
     manager.layer_batch_states = [LayerBatchStates(), LayerBatchStates()]
     manager._decode_static_buffers = {}
@@ -1524,7 +1530,10 @@ def test_h2o_static_decode_rejects_divergent_layer_row_lengths_before_allocation
 
 
 def test_h2o_static_decode_rechecks_row_lengths_after_row_cache_reuse():
-    manager = _manager_with_layer_rows([[4], [4]])
+    manager = _manager_with_layer_rows(
+        [[4], [4]],
+        validate_runtime_invariants=True,
+    )
     manager.max_buffer_rows = 1
     manager.layer_batch_states = [LayerBatchStates(), LayerBatchStates()]
     manager._decode_static_buffers = {}
@@ -1561,6 +1570,58 @@ def test_h2o_static_decode_rechecks_row_lengths_after_row_cache_reuse():
 
     assert manager._num_free_slots == [31, 31]
     assert [int(lengths[0]) for lengths in manager.row_seq_lens] == [5, 4]
+
+
+def test_snapkv_uniform_decode_cross_layer_checks_are_debug_only():
+    def make_manager(enabled: bool):
+        manager = object.__new__(SnapKVCacheManager)
+        manager.validate_runtime_invariants = enabled
+        manager.device = torch.device("cpu")
+        manager.runtime_layout = _layout(2)
+        manager.max_model_len = 8
+        manager.seq_id_to_row = [{0: 0}, {0: 1}]
+        manager.row_seq_lens = [
+            np.asarray([1, 0], dtype=np.int32),
+            np.asarray([0, 1], dtype=np.int32),
+        ]
+        manager._num_free_slots = [4, 4]
+        manager.free_slots_stack = [
+            torch.arange(4, dtype=torch.int32),
+            torch.arange(4, dtype=torch.int32),
+        ]
+        manager.buffer_req_to_token_slots_tensor = torch.zeros(
+            (2, 2, 8), dtype=torch.int32
+        )
+        manager.layer_batch_states = [LayerBatchStates(), LayerBatchStates()]
+        manager._decode_static_state_binding_key = None
+        manager.attention_cache_storage = None
+        return manager
+
+    seq = _seq(0, 2, prefilled=1, chunk=1)
+
+    debug_manager = make_manager(True)
+    with pytest.raises(RuntimeError, match="identical request rows"):
+        debug_manager._prepare_decode_static_uniform(
+            [seq],
+            torch.empty(1, dtype=torch.int64),
+            torch.empty(1, dtype=torch.int64),
+            torch.empty(1, dtype=torch.int32),
+            torch.empty(1, dtype=torch.int32),
+            torch.empty(1, dtype=torch.int32),
+        )
+    assert debug_manager._num_free_slots == [4, 4]
+
+    fast_manager = make_manager(False)
+    result = fast_manager._prepare_decode_static_uniform(
+        [seq],
+        torch.empty(1, dtype=torch.int64),
+        torch.empty(1, dtype=torch.int64),
+        torch.empty(1, dtype=torch.int32),
+        torch.empty(1, dtype=torch.int32),
+        torch.empty(1, dtype=torch.int32),
+    )
+    assert result is not None
+    assert fast_manager._num_free_slots == [3, 3]
 
 
 def test_h2o_multilayer_reduced_decode_context_bounds_are_checked_together():
@@ -1604,6 +1665,7 @@ def test_h2o_multilayer_reduced_decode_context_bounds_are_checked_together():
         decode_keep_tokens=4,
         sparse_attn_score_dtype="float32",
         decode_cuda_graph=False,
+        validate_runtime_invariants=True,
     )
     controller = SparseController(config, manager)
     reduced_scores = controller._get_h2o_decode_score_buffer(2, 1, 3)
@@ -1624,6 +1686,22 @@ def test_h2o_multilayer_reduced_decode_context_bounds_are_checked_together():
         controller._h2o_decode_eviction(seqs)
     assert manager.updates == 1
     assert manager.evictions == 1
+
+    config.validate_runtime_invariants = False
+    fast_controller = SparseController(config, manager)
+    config.validate_runtime_invariants = True
+    fast_scores = fast_controller._get_h2o_decode_score_buffer(2, 1, 3)
+    fast_scores.zero_()
+    fast_controller.layer_batch_sparse_states[0].attn_score = fast_scores[0]
+    fast_controller.layer_batch_sparse_states[1].attn_score = fast_scores[1]
+    fast_controller.layer_batch_sparse_states[0].context_lens = torch.tensor([3])
+    fast_controller.layer_batch_sparse_states[1].context_lens = torch.tensor([4])
+
+    fast_controller._h2o_decode_eviction(seqs)
+
+    assert fast_controller.validate_runtime_invariants is False
+    assert manager.updates == 2
+    assert manager.evictions == 2
 
 
 def test_h2o_contiguous_decode_buffer_handles_padded_graph_batch_and_low_dtype():

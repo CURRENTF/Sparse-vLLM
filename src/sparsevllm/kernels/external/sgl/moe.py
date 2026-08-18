@@ -43,17 +43,19 @@ def sgl_moe_align_block_size(
     if not supported:
         raise RuntimeError(reason)
     num_assignments = int(topk_ids.numel())
-    max_num_tokens_padded = triton.cdiv(
-        num_assignments + num_experts * (int(block_size) - 1),
-        int(block_size),
-    ) * int(block_size)
+    if num_assignments < num_experts + 1:
+        max_num_tokens_padded = num_assignments * int(block_size)
+    else:
+        max_num_tokens_padded = (
+            num_assignments + (num_experts + 1) * (int(block_size) - 1)
+        )
     sorted_token_ids = torch.empty(
         max_num_tokens_padded,
         dtype=torch.int32,
         device=topk_ids.device,
     )
     expert_ids = torch.empty(
-        max_num_tokens_padded // int(block_size),
+        triton.cdiv(max_num_tokens_padded, int(block_size)),
         dtype=torch.int32,
         device=topk_ids.device,
     )
@@ -62,15 +64,35 @@ def sgl_moe_align_block_size(
         dtype=torch.int32,
         device=topk_ids.device,
     )
+    from sparsevllm.kernels.triton.sgl_moe_align import (
+        SMALL_NUMEL_LIMIT,
+        sgl_moe_align_small_numel,
+    )
+
+    if num_assignments <= SMALL_NUMEL_LIMIT and num_experts + 1 > 64:
+        sgl_moe_align_small_numel(
+            topk_ids,
+            num_experts=num_experts,
+            block_size=block_size,
+            sorted_token_ids=sorted_token_ids,
+            expert_ids=expert_ids,
+            num_tokens_post_padded=num_tokens_post_padded,
+        )
+        return MoeAlignment(
+            sorted_token_ids=sorted_token_ids,
+            expert_ids=expert_ids,
+            num_tokens_post_padded=num_tokens_post_padded,
+            block_size=int(block_size),
+            naive=False,
+        )
     cumsum_buffer = torch.empty(
-        num_experts + 1,
+        num_experts + 2,
         dtype=torch.int32,
         device=topk_ids.device,
     )
     from sgl_kernel import moe_align_block_size
 
-    # The extra empty logical expert makes the complete [0, num_experts)
-    # range participate; hardware tests cover assignments to the final expert.
+    # The +1 bucket maps filtered expert -1 to a skipped expert block.
     moe_align_block_size(
         topk_ids,
         num_experts + 1,

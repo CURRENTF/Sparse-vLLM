@@ -28,6 +28,12 @@ dimension 必须能被 `T / E` 整除。Qwen3MoE 的外层 TP 要求模型 dtype
 BF16；FP16 Qwen3MoE checkpoint 仅支持 `TP=1`。当 `TP=1` 时，原有 EP
 布局的 world size 为 `E`。
 
+在 H100 80GB 上，未量化 BF16 Qwen3-30B-A3B 的 EP1 TP1/TP2 默认选择
+`sgl_triton_hybrid` MoE provider。经过 profile 的大 token bucket 使用移植的
+SGL fused-MoE kernel（TP1 为 8192 token 及以上，TP2 为 4096 token 及以上）；
+较小 bucket 继续使用通用 Triton kernel。其他 shape 和 topology 保持原有
+provider。operator runtime statistics 会分别记录各分支实际执行的 kernel。
+
 块级 FP8 要求使用 E4M3 权重、动态激活量化以及 `128 x 128` 的权重块大小。
 Qwen3.5、Qwen3.6 和 Qwen3.8 Dense checkpoint 共享 `qwen3_5` 运行时架构，
 因此具有相同的精度、并行方式、稀疏方法和多模态支持。Qwen3.6 MoE 使用

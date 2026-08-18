@@ -139,13 +139,24 @@ def test_storage_factory_uses_configured_layout():
         ExplicitKVStorage,
     )
     assert isinstance(
-        create_attention_cache_storage(
+        mla_storage := create_attention_cache_storage(
             mla_config,
             num_kv_heads=4,
             head_dim=64,
         ),
         MlaLatentStorage,
     )
+    assert mla_storage.validate_runtime_invariants is False
+
+    mla_config.validate_runtime_invariants = True
+    debug_mla_storage = create_attention_cache_storage(
+        mla_config,
+        num_kv_heads=4,
+        head_dim=64,
+    )
+    assert isinstance(debug_mla_storage, MlaLatentStorage)
+    assert debug_mla_storage.validate_runtime_invariants is True
+
 
 @pytest.mark.parametrize(
     ("storage", "num_layers", "num_slots", "expected_shape"),
@@ -278,6 +289,7 @@ def test_mla_storage_reuses_one_manager_validation_across_layers():
         kv_lora_rank=512,
         rope_dim=64,
         dtype=torch.bfloat16,
+        validate_runtime_invariants=True,
     )
     storage.allocate(num_layers=2, num_slots=2, device=torch.device("cpu"))
     slots = torch.tensor([0], dtype=torch.int32)
@@ -306,6 +318,7 @@ def test_mla_storage_can_revalidate_between_graph_warmup_and_capture():
         kv_lora_rank=512,
         rope_dim=64,
         dtype=torch.bfloat16,
+        validate_runtime_invariants=True,
     )
     storage.allocate(num_layers=2, num_slots=2, device=torch.device("cpu"))
     slots = torch.tensor([0], dtype=torch.int32)
@@ -337,6 +350,7 @@ def test_mla_storage_prevalidates_nonuniform_layer_mappings():
         kv_lora_rank=512,
         rope_dim=64,
         dtype=torch.bfloat16,
+        validate_runtime_invariants=True,
     )
     storage.allocate(num_layers=2, num_slots=2, device=torch.device("cpu"))
     layer_slots = (
@@ -479,6 +493,7 @@ def test_graph_capture_prevalidates_nonuniform_latent_layer_mappings():
     )
     storage.allocate(num_layers=2, num_slots=4, device=torch.device("cpu"))
     manager = object.__new__(SnapKVCacheManager)
+    manager.validate_runtime_invariants = True
     manager.attention_cache_storage = storage
     manager.runtime_layout = RuntimeLayout.dense(2)
     manager.layer_batch_states = [
@@ -501,6 +516,53 @@ def test_graph_capture_prevalidates_nonuniform_latent_layer_mappings():
         False,
         False,
     ]
+
+
+def test_mla_storage_automatic_slot_validation_respects_runtime_policy():
+    write = MlaLatentWrite(
+        latent=torch.empty(1, 1, 512, dtype=torch.bfloat16),
+        rope=torch.empty(1, 1, 64, dtype=torch.bfloat16),
+    )
+    slots = torch.tensor([0], dtype=torch.int32)
+
+    validate_flags = []
+    for enabled in (False, True):
+        storage = MlaLatentStorage(
+            kv_lora_rank=512,
+            rope_dim=64,
+            dtype=torch.bfloat16,
+            validate_runtime_invariants=enabled,
+        )
+        storage.allocate(num_layers=1, num_slots=2, device=torch.device("cpu"))
+        with patch(
+            "sparsevllm.engine.cache_manager.storage.mla_latent.copy_latent_to_cache"
+        ) as copy:
+            storage.store(0, slots, write)
+        validate_flags.append(copy.call_args.kwargs["validate_slots"])
+
+    assert validate_flags == [False, True]
+
+
+def test_manager_slot_mapping_validation_respects_runtime_policy():
+    storage = MlaLatentStorage(
+        kv_lora_rank=512,
+        rope_dim=64,
+        dtype=torch.bfloat16,
+    )
+    storage.allocate(num_layers=1, num_slots=2, device=torch.device("cpu"))
+    manager = object.__new__(SnapKVCacheManager)
+    manager.attention_cache_storage = storage
+    manager.runtime_layout = RuntimeLayout.dense(1)
+    manager.layer_batch_states = [
+        LayerBatchStates(slot_mapping=torch.tensor([2], dtype=torch.int32))
+    ]
+
+    manager.validate_runtime_invariants = False
+    manager.validate_decode_cuda_graph_slot_mappings()
+
+    manager.validate_runtime_invariants = True
+    with pytest.raises(ValueError, match="outside"):
+        manager.validate_decode_cuda_graph_slot_mappings()
 
 
 def test_snapkv_explicit_compute_view_preserves_legacy_payload():

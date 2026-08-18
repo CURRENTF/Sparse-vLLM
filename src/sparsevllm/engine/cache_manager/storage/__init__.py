@@ -48,6 +48,9 @@ def create_attention_cache_storage(
             kv_lora_rank=int(config.hf_config.kv_lora_rank),
             rope_dim=int(config.hf_config.qk_rope_head_dim),
             dtype=dtype,
+            validate_runtime_invariants=bool(
+                getattr(config, "validate_runtime_invariants", False)
+            ),
         )
     raise AssertionError(f"Unhandled attention cache layout: {layout!r}")
 

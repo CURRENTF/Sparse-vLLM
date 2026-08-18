@@ -6,6 +6,7 @@ from importlib.util import find_spec
 import torch
 
 import sparsevllm.platforms as platforms
+from sparsevllm.platforms import device_runtime
 from sparsevllm.kernels.moe import MoeAlignment
 from sparsevllm.operators.registry import (
     OpRegistry,
@@ -244,7 +245,7 @@ def _sgl_moe_align_block_size(
             topk_ids,
             local_expert_start=local_expert_start,
             local_expert_end=local_expert_end,
-            remote_expert_id=num_local_experts,
+            remote_expert_id=-1,
         )
     return sgl_moe_align_block_size(
         topk_ids,
@@ -588,6 +589,140 @@ class TritonHopperFusedMoeProvider(MoeProvider):
             topk_weights,
             num_experts=spec.num_experts,
             local_expert_start=local_expert_start,
+        )
+
+
+@MOE_REGISTRY.register
+class SglTritonHybridMoeProvider(MoeProvider):
+    """Use SGL's profiled prefill kernel without regressing decode."""
+
+    name = "sgl_triton_hybrid"
+    priority = 15
+    gate_up_order = "gate_up"
+    MIN_SGL_TOKENS_BY_TP_SIZE = {1: 8192, 2: 4096}
+    PROFILED_SHAPES = frozenset(
+        {
+            (128, 128, 2048, 768, 8, 1, 1),
+            (128, 128, 2048, 384, 8, 2, 1),
+        }
+    )
+
+    def __init__(self) -> None:
+        self._runtime_kernel_path_counts: dict[str, dict[str, int]] = {}
+
+    def _record_runtime_kernel_path(self, path: str) -> None:
+        counts = self._runtime_kernel_path_counts.setdefault(
+            str(path),
+            {"eager_dispatches": 0, "cuda_graph_capture_dispatches": 0},
+        )
+        key = (
+            "cuda_graph_capture_dispatches"
+            if device_runtime.is_stream_capturing()
+            else "eager_dispatches"
+        )
+        counts[key] += 1
+
+    def runtime_kernel_stats(self) -> dict[str, object]:
+        return {
+            "kernel_paths": {
+                path: {key: int(value) for key, value in sorted(counts.items())}
+                for path, counts in sorted(
+                    self._runtime_kernel_path_counts.items()
+                )
+            },
+            "fallback_reasons": {},
+        }
+
+    @classmethod
+    def supports(cls, spec: MoeOpSpec, caps: DeviceCaps) -> SupportResult:
+        if caps.platform != PlatformEnum.CUDA or caps.compute_capability != (9, 0):
+            return SupportResult.no(
+                f"requires validated CUDA SM90, got {caps.platform.name} "
+                f"{caps.compute_capability}"
+            )
+        if caps.device_name != "NVIDIA H100 80GB HBM3":
+            return SupportResult.no(
+                "requires validated NVIDIA H100 80GB HBM3 hardware, "
+                f"got {caps.device_name}"
+            )
+        if not caps.supports_triton:
+            return SupportResult.no("platform does not support Triton")
+        if spec.cuda_graph and not caps.supports_graph_capture:
+            return SupportResult.no("device does not support CUDA Graph capture")
+        if spec.activation_dtype != torch.bfloat16:
+            return SupportResult.no(
+                f"requires profiled BF16 activations, got {spec.activation_dtype}"
+            )
+        if spec.weight_dtype != spec.activation_dtype or spec.block_shape is not None:
+            return SupportResult.no(
+                "requires unquantized expert weights matching the activation dtype"
+            )
+        if spec.activation != "silu":
+            return SupportResult.no(f"requires SiLU activation, got {spec.activation}")
+        if not caps.supports_bfloat16:
+            return SupportResult.no("device does not support BF16")
+        actual_shape = (
+            spec.num_experts,
+            spec.num_local_experts,
+            spec.hidden_size,
+            spec.intermediate_size,
+            spec.top_k,
+            spec.tp_size,
+            spec.ep_size,
+        )
+        if actual_shape not in cls.PROFILED_SHAPES:
+            return SupportResult.no(
+                "requires a profiled Qwen3-MoE TP1/TP2 shape in "
+                f"{sorted(cls.PROFILED_SHAPES)}, got {actual_shape}"
+            )
+        from sparsevllm.kernels.external.sgl.moe import sgl_moe_alignment_support
+
+        supported, reason = sgl_moe_alignment_support()
+        return SupportResult.yes() if supported else SupportResult.no(reason)
+
+    def run(
+        self,
+        spec,
+        hidden_states,
+        topk_ids,
+        topk_weights,
+        w13_weight,
+        w2_weight,
+        w13_scale_inv,
+        w2_scale_inv,
+        *,
+        local_expert_start,
+        ep_rank,
+    ):
+        del ep_rank
+        if w13_scale_inv is not None or w2_scale_inv is not None:
+            raise RuntimeError("SGL Triton BF16/FP16 MoE does not accept scales.")
+        min_sgl_tokens = self.MIN_SGL_TOKENS_BY_TP_SIZE[int(spec.tp_size)]
+        if int(hidden_states.shape[0]) < min_sgl_tokens:
+            self._record_runtime_kernel_path("triton_fused_moe")
+            from sparsevllm.kernels.triton.moe import fused_moe
+
+            return fused_moe(
+                hidden_states,
+                w13_weight,
+                w2_weight,
+                topk_ids,
+                topk_weights,
+                num_experts=spec.num_experts,
+                local_expert_start=local_expert_start,
+            )
+        self._record_runtime_kernel_path("sgl_fused_moe")
+        from sparsevllm.kernels.triton.sgl_fused_moe import sgl_fused_moe
+
+        return sgl_fused_moe(
+            hidden_states,
+            w13_weight,
+            w2_weight,
+            topk_ids,
+            topk_weights,
+            num_experts=spec.num_experts,
+            local_expert_start=local_expert_start,
+            alignment_impl=_sgl_moe_align_block_size,
         )
 
 

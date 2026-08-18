@@ -225,8 +225,13 @@ AttentionKeyMaterializer = Callable[[AttentionKeyComputeView], torch.Tensor]
 class CacheManager(ABC):
     """每个 Rank 只有一个 CacheManager，内部管理所有层的物理槽位和 KV Cache。"""
 
+    validate_runtime_invariants = False
+
     def __init__(self, config: Config, parallel_context: ParallelContext):
         self.config = config
+        self.validate_runtime_invariants = bool(
+            getattr(config, "validate_runtime_invariants", False)
+        )
         self.parallel_context = parallel_context
         self.rank = parallel_context.world_rank
         self.world_size = parallel_context.world_size
@@ -1010,15 +1015,16 @@ class CacheManager(ABC):
         return []
 
     def validate_decode_cuda_graph_slot_mappings(self) -> None:
-        """Validate every layer's static decode mapping as one store scope.
+        """Optionally validate every layer's static decode mapping together.
 
-        Static preparation calls this for every decode step. Graph capture then
-        calls it again after its eager warmup because a storage backend may
-        consume the one-forward prevalidation during that warmup. Sparse
-        methods may bind a different stable mapping tensor per layer, so the
-        storage is given the exact layer-ordered set instead of only the
-        runner's common metadata buffer.
+        Runtime validation is a debug invariant, not part of cache allocation.
+        When enabled, graph capture calls it again after eager warmup because a
+        storage backend may consume the one-forward prevalidation during that
+        warmup. Sparse methods may bind a different stable mapping per layer,
+        so storage receives the exact layer-ordered set.
         """
+        if not self.validate_runtime_invariants:
+            return
         storage = getattr(self, "attention_cache_storage", None)
         if storage is None:
             return
