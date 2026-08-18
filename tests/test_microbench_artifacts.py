@@ -230,6 +230,7 @@ def test_resolved_engine_config_records_backend_and_jsonable_values():
             full_attn_layers=(0, 1, 2, 8),
             obs_layer_ids=[2, 8],
             h2o_decode_budget=4096,
+            h2o_decode_eviction_interval=128,
             h2o_prefill_budget=8192,
             h2o_recent_ratio=0.5,
             h2o_prefill_score_window=128,
@@ -243,6 +244,7 @@ def test_resolved_engine_config_records_backend_and_jsonable_values():
     assert resolved["full_attn_layers"] == [0, 1, 2, 8]
     assert resolved["obs_layer_ids"] == [2, 8]
     assert resolved["h2o_decode_budget"] == 4096
+    assert resolved["h2o_decode_eviction_interval"] == 128
     assert resolved["h2o_prefill_budget"] == 8192
     assert resolved["h2o_recent_ratio"] == 0.5
     assert resolved["h2o_prefill_score_window"] == 128

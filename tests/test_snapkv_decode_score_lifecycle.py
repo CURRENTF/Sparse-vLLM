@@ -19,6 +19,7 @@ class WorkerInfoTest(unittest.TestCase):
             hf_config=SimpleNamespace(model_type="qwen2", vocab_size=32_000),
             vllm_sparse_method="h2o",
             h2o_decode_budget=4096,
+            h2o_decode_eviction_interval=128,
             h2o_prefill_budget=8192,
             h2o_recent_ratio=0.5,
             h2o_prefill_score_window=128,
@@ -27,6 +28,7 @@ class WorkerInfoTest(unittest.TestCase):
         benchmark_config = engine.worker_info()["benchmark_config"]
 
         self.assertEqual(benchmark_config["h2o_decode_budget"], 4096)
+        self.assertEqual(benchmark_config["h2o_decode_eviction_interval"], 128)
         self.assertEqual(benchmark_config["h2o_prefill_budget"], 8192)
         self.assertEqual(benchmark_config["h2o_recent_ratio"], 0.5)
         self.assertEqual(benchmark_config["h2o_prefill_score_window"], 128)

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum, auto
 
 from sparsevllm.distributed.topology import ParallelMode, ParallelTopology
 from sparsevllm.models.spec import MODEL_SPECS
+from sparsevllm.operators.attention_capabilities import AttentionScoreKind
 
 PREFILL_POLICY_ALL_CHUNKED = "all_chunked"
 PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH = "long_bs1full_short_batch"
@@ -76,6 +78,39 @@ class ModelRuntimeCompatibility:
     sparse_methods: frozenset[str]
     prefix_cache_methods: frozenset[str]
     decode_cuda_graph_methods: frozenset[str] = frozenset()
+
+
+class PrefillScoreCollectionKind(Enum):
+    NONE = auto()
+    METHOD_OWNED_POSTHOC_REDUCED = auto()
+
+
+@dataclass(frozen=True)
+class SparsePrefillAttentionContract:
+    main_score_kind: AttentionScoreKind
+    score_collection: PrefillScoreCollectionKind
+
+
+_PREFILL_POSTHOC_SCORE_METHODS = frozenset(
+    {"snapkv", "pyramidkv", "h2o", "rkv"}
+)
+
+
+def sparse_prefill_attention_contract(
+    method: str | None,
+) -> SparsePrefillAttentionContract:
+    normalized = normalize_sparse_method(method)
+    if normalized not in CANONICAL_SPARSE_METHODS:
+        raise ValueError(f"Unknown sparse method {normalized!r}.")
+    collection = (
+        PrefillScoreCollectionKind.METHOD_OWNED_POSTHOC_REDUCED
+        if normalized in _PREFILL_POSTHOC_SCORE_METHODS
+        else PrefillScoreCollectionKind.NONE
+    )
+    return SparsePrefillAttentionContract(
+        main_score_kind=AttentionScoreKind.NONE,
+        score_collection=collection,
+    )
 
 
 _MOE_SPARSE_METHODS = frozenset(

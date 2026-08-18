@@ -188,7 +188,7 @@ def test_tilelang_config_selection_is_static(
 def test_tilelang_provider_supports_all_glm_tp_sizes(tp_size: int) -> None:
     with (
         patch(
-            "sparsevllm.operators.mla_attention.sgl_fa3_support",
+            "sparsevllm.operators.mla_attention.sgl_fa3_device_support",
             return_value=(True, "sgl test"),
         ),
         patch(
@@ -205,7 +205,7 @@ def test_resolver_prefers_tilelang_score_provider_for_tp2() -> None:
     workspace = _cpu_workspace()
     with (
         patch(
-            "sparsevllm.operators.mla_attention.sgl_fa3_support",
+            "sparsevllm.operators.mla_attention.sgl_fa3_device_support",
             return_value=(True, "sgl test"),
         ),
         patch(
@@ -262,7 +262,7 @@ def test_missing_tilelang_keeps_existing_sgl_provider() -> None:
     workspace = _cpu_workspace()
     with (
         patch(
-            "sparsevllm.operators.mla_attention.sgl_fa3_support",
+            "sparsevllm.operators.mla_attention.sgl_fa3_device_support",
             return_value=(True, "sgl test"),
         ),
         patch(
@@ -388,6 +388,29 @@ def test_score_capacity_smaller_than_declared_context_uses_triton() -> None:
     provider, fa3, tilelang = _provider_with_mocks()
     view = _view(score=torch.empty(2, 64, dtype=torch.float32))
     object.__setattr__(view.meta, "max_context_len", 128)
+    q_latent = torch.empty(2, 10, 512, dtype=torch.bfloat16)
+    q_rope = torch.empty(2, 10, 64, dtype=torch.bfloat16)
+    output = torch.empty_like(q_latent)
+
+    with patch.object(
+        MlaSglFa3Provider.__mro__[1], "run", return_value=output
+    ) as triton:
+        provider.run(q_latent, q_rope, view, output)
+
+    fa3.assert_not_called()
+    tilelang.assert_not_called()
+    triton.assert_called_once()
+
+
+def test_score_capacity_larger_than_active_slots_uses_triton() -> None:
+    provider, fa3, tilelang = _provider_with_mocks()
+    view = _view(score=torch.empty(2, 64, dtype=torch.float32))
+    object.__setattr__(
+        view.meta,
+        "active_slots",
+        torch.zeros((2, 4), dtype=torch.int32),
+    )
+    object.__setattr__(view.meta, "max_context_len", 4)
     q_latent = torch.empty(2, 10, 512, dtype=torch.bfloat16)
     q_rope = torch.empty(2, 10, 64, dtype=torch.bfloat16)
     output = torch.empty_like(q_latent)

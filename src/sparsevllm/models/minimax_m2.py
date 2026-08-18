@@ -22,6 +22,10 @@ from sparsevllm.layers.rotary_embedding import (
     get_rope,
 )
 from sparsevllm.models.qwen3 import Qwen3ModelBase
+from sparsevllm.models.attention_runtime import (
+    bind_mha_prefill_attention_op,
+    build_mha_prefill_attention_op,
+)
 from sparsevllm.operators.moe import model_activation_dtype, resolve_moe_provider
 from sparsevllm.operators.all_reduce import (
     PreparedAllReduceOp,
@@ -32,11 +36,7 @@ from sparsevllm.operators.decode_attention import (
     PreparedDecodeAttentionLaunchOp,
     prepare_decode_attention_launch_op,
 )
-from sparsevllm.operators.prefill_attention import (
-    PrefillAttentionOpSpec,
-    PreparedPrefillAttentionOp,
-    prepare_prefill_attention_op,
-)
+from sparsevllm.operators.prefill_attention import PreparedPrefillAttentionOp
 from sparsevllm.platforms import device_runtime
 from sparsevllm.utils.context import get_context
 from sparsevllm.utils.log import logger
@@ -82,10 +82,10 @@ def build_minimax_m2_runtime_config(
     config,
     parallel_context: ParallelContext,
     *,
-    layer_invariant_page_table: bool,
+    sparse_method: str | None,
     max_decode_tokens: int,
     cuda_graph: bool,
-    device_index: int,
+    device: torch.device,
 ) -> MiniMaxM2RuntimeConfig:
     tp_size = int(parallel_context.attention_tp_size)
     if (
@@ -99,19 +99,11 @@ def build_minimax_m2_runtime_config(
     num_kv_heads = int(config.num_key_value_heads) // tp_size
     head_dim = int(config.head_dim)
     activation_dtype = model_activation_dtype(config)
-    prefill_attention_op = prepare_prefill_attention_op(
-        PrefillAttentionOpSpec(
-            num_query_heads=num_query_heads,
-            num_kv_heads=num_kv_heads,
-            head_dim=head_dim,
-            activation_dtype=activation_dtype,
-            softmax_scale=head_dim**-0.5,
-            causal=True,
-            page_size=1,
-            requires_attention_scores=False,
-            layer_invariant_page_table=bool(layer_invariant_page_table),
-        ),
-        device_index=device_index,
+    prefill_attention_op = build_mha_prefill_attention_op(
+        config,
+        sparse_method=sparse_method,
+        attention_tp_size=parallel_context.attention_tp_size,
+        device=device,
     )
     decode_launch_op = prepare_decode_attention_launch_op(
         DecodeAttentionLaunchSpec(
@@ -121,7 +113,7 @@ def build_minimax_m2_runtime_config(
             activation_dtype=activation_dtype,
             page_size=1,
         ),
-        device_index=device_index,
+        device_index=int(device.index or 0),
     )
     moe_decode_all_reduce = prepare_parallel_all_reduce(
         parallel_context.world,
@@ -129,7 +121,7 @@ def build_minimax_m2_runtime_config(
         hidden_size=int(config.hidden_size),
         dtype=activation_dtype,
         cuda_graph=bool(cuda_graph),
-        device_index=device_index,
+        device_index=int(device.index or 0),
     )
     if parallel_context.attention.ranks == parallel_context.world.ranks:
         attention_decode_all_reduce = moe_decode_all_reduce
@@ -140,7 +132,7 @@ def build_minimax_m2_runtime_config(
             hidden_size=int(config.hidden_size),
             dtype=activation_dtype,
             cuda_graph=bool(cuda_graph),
-            device_index=device_index,
+            device_index=int(device.index or 0),
         )
     return MiniMaxM2RuntimeConfig(
         prefill_attention_op=prefill_attention_op,
@@ -326,9 +318,6 @@ class MiniMaxM2Attention(nn.Module):
             self.head_dim,
             self.head_dim**-0.5,
             self.num_kv_heads,
-            prefill_op=(
-                None if runtime_config is None else runtime_config.prefill_attention_op
-            ),
             decode_launch_op=(
                 None if runtime_config is None else runtime_config.decode_launch_op
             ),
@@ -442,10 +431,10 @@ class MiniMaxM2ForCausalLM(nn.Module):
             "runtime_config": build_minimax_m2_runtime_config(
                 config,
                 parallel_context,
-                layer_invariant_page_table=engine_config.vllm_sparse_method == "",
+                sparse_method=engine_config.vllm_sparse_method,
                 max_decode_tokens=max_decode_tokens,
                 cuda_graph=engine_config.decode_cuda_graph,
-                device_index=int(device.index or 0),
+                device=device,
             )
         }
 
@@ -459,6 +448,11 @@ class MiniMaxM2ForCausalLM(nn.Module):
         self.parallel_context = get_parallel_context()
         self.runtime_config = runtime_config
         self.model = MiniMaxM2Model(config, runtime_config)
+        if runtime_config is not None:
+            bind_mha_prefill_attention_op(
+                self.model,
+                runtime_config.prefill_attention_op,
+            )
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         self._intentionally_skipped_expert_weights: set[str] = set()
         self._intentionally_skipped_expert_scales: set[str] = set()

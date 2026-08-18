@@ -992,6 +992,7 @@ class LLMEngine:
             "snapkv_window_size",
             "snapkv_num_full_layers",
             "h2o_decode_budget",
+            "h2o_decode_eviction_interval",
             "h2o_prefill_budget",
             "h2o_recent_ratio",
             "h2o_prefill_score_window",

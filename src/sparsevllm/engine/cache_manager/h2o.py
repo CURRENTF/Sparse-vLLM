@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
+from typing import NamedTuple
 
 import numpy as np
 import torch
@@ -16,6 +17,12 @@ from .snapkv import SnapKVCacheManager
 from .storage import ExplicitKVStorage
 
 
+class _H2ORowRef(NamedTuple):
+    """Minimal owner handle for an unscheduled resident decode row."""
+
+    seq_id: int
+
+
 class H2OCacheManager(SnapKVCacheManager):
     """H2O physical KV eviction with one score vector per layer and sequence.
 
@@ -28,22 +35,29 @@ class H2OCacheManager(SnapKVCacheManager):
     def __init__(self, config, parallel_context):
         super().__init__(config, parallel_context)
         self._h2o_scores: dict[tuple[int, int], torch.Tensor] = {}
-        self._h2o_recent_cursors: dict[tuple[int, int], int] = {}
+        # Decode rows remain reclaimable while temporarily absent from a
+        # scheduled batch. Keep only ids here: caching full Sequence objects
+        # would retain their logical token histories on every worker.
+        self._h2o_active_decode_seq_ids: set[int] = set()
         self._h2o_counters = {
             "intermediate_prefill_evictions": 0,
             "final_prefill_evictions": 0,
+            # One burst is one sequence compacted by either the periodic
+            # trigger or cache pressure. Row and drop counters below count
+            # physical layer rows/tokens instead.
+            "decode_eviction_bursts": 0,
             "decode_evictions": 0,
             "dropped_tokens": 0,
-        }
-        self._h2o_ring_counters = {
-            "fast_rows": 0,
-            "fallback_rows": 0,
         }
         self._h2o_final_prefill_workspace: torch.Tensor | None = None
 
     @property
     def h2o_decode_budget(self) -> int:
         return int(self.config.h2o_decode_budget)
+
+    @property
+    def h2o_decode_eviction_interval(self) -> int:
+        return int(self.config.h2o_decode_eviction_interval)
 
     @property
     def h2o_prefill_budget(self) -> int:
@@ -55,11 +69,27 @@ class H2OCacheManager(SnapKVCacheManager):
         recent_count = min(recent_count, budget)
         return budget - recent_count, recent_count
 
+    def _prefill_append_peak(
+        self,
+        resident_len: int,
+        remaining_tokens: int,
+        chunk_prefill_size: int,
+    ) -> int:
+        """Reserve the append-before-evict peak for a resident H2O row."""
+        resident_len = int(resident_len)
+        remaining_tokens = max(0, int(remaining_tokens))
+        chunk_size = max(1, int(chunk_prefill_size))
+        return min(
+            resident_len + remaining_tokens,
+            max(resident_len, self.h2o_prefill_budget) + chunk_size,
+        )
+
     def _prompt_prefill_peak(self, seq: Sequence, chunk_prefill_size: int) -> int:
         """Peak physical row size needed to make chunked prefill progress."""
-        return min(
+        return self._prefill_append_peak(
+            0,
             int(seq.num_prompt_tokens),
-            self.h2o_prefill_budget + max(1, int(chunk_prefill_size)),
+            chunk_prefill_size,
         )
 
     def prompt_admission_cost(self, seq: Sequence) -> int:
@@ -90,8 +120,12 @@ class H2OCacheManager(SnapKVCacheManager):
                 continue
             remaining = int(seq.num_prompt_tokens) - int(seq.num_prefilled_tokens)
             physical_len = self._physical_row_len(first_layer, seq)
-            peak_len = self._prompt_prefill_peak(seq, chunk_prefill_size)
-            reserved += min(remaining, max(0, peak_len - physical_len))
+            peak_len = self._prefill_append_peak(
+                physical_len,
+                remaining,
+                chunk_prefill_size,
+            )
+            reserved += max(0, peak_len - physical_len)
         return int(reserved)
 
     def prefill_step_free_slots(self) -> int:
@@ -138,18 +172,29 @@ class H2OCacheManager(SnapKVCacheManager):
                 if local_layer < len(existing_slots_by_layer)
                 else 0
             )
-            prefill_peak = min(
-                existing + suffix_tokens,
-                self.h2o_prefill_budget + chunk_size,
+            prefill_peak = self._prefill_append_peak(
+                existing,
+                suffix_tokens,
+                chunk_size,
             )
-            resident_after_prefill = min(
-                existing + suffix_tokens,
-                self.h2o_decode_budget,
+            # Final-prefill compaction only runs when a suffix chunk executes.
+            resident_after_prefill = (
+                min(existing + suffix_tokens, self.h2o_decode_budget)
+                if suffix_tokens > 0
+                else existing
             )
-            decode_peak = resident_after_prefill + min(
-                generated_kv_tokens,
-                max(0, self.h2o_decode_budget + 1 - resident_after_prefill),
+            decode_trigger = (
+                self.h2o_decode_budget + self.h2o_decode_eviction_interval
             )
+            if generated_kv_tokens <= 0:
+                decode_peak = resident_after_prefill
+            elif resident_after_prefill >= decode_trigger:
+                decode_peak = resident_after_prefill + 1
+            else:
+                decode_peak = resident_after_prefill + min(
+                    generated_kv_tokens,
+                    decode_trigger - resident_after_prefill,
+                )
             required_by_layer.append(
                 max(0, max(prefill_peak, decode_peak) - existing)
             )
@@ -199,10 +244,10 @@ class H2OCacheManager(SnapKVCacheManager):
         requested_context_capacity: int,
         current_context_capacity: int,
     ) -> tuple[int, bool]:
-        """Use the stable post-eviction row width instead of logical prompt length."""
+        """Capture H2O's periodic decode peak instead of logical prompt length."""
         del seqs, requested_context_capacity, current_context_capacity
         capacity = min(
-            self.h2o_decode_budget + 1,
+            self.h2o_decode_budget + self.h2o_decode_eviction_interval,
             int(self.config.max_model_len),
         )
         return max(1, capacity), False
@@ -451,12 +496,12 @@ class H2OCacheManager(SnapKVCacheManager):
         recent = torch.arange(recent_start, kv_len, dtype=torch.long, device=scores.device)
         if heavy_count == 0:
             return recent
-        heavy = torch.topk(
+        heavy = torch.argsort(
             scores[:recent_start],
-            k=min(heavy_count, recent_start),
             dim=0,
-            sorted=False,
-        ).indices
+            descending=True,
+            stable=True,
+        )[: min(heavy_count, recent_start)]
         keep = torch.cat((heavy, recent))
         if int(keep.numel()) != budget:
             raise RuntimeError(
@@ -498,12 +543,12 @@ class H2OCacheManager(SnapKVCacheManager):
         ).expand(int(scores.shape[0]), -1)
         if heavy_count == 0:
             return recent
-        heavy = torch.topk(
+        heavy = torch.argsort(
             scores[:, :recent_start],
-            k=min(heavy_count, recent_start),
             dim=1,
-            sorted=False,
-        ).indices
+            descending=True,
+            stable=True,
+        )[:, : min(heavy_count, recent_start)]
         keep = torch.cat((heavy, recent), dim=1)
         if int(keep.shape[1]) != budget:
             raise RuntimeError(
@@ -511,55 +556,6 @@ class H2OCacheManager(SnapKVCacheManager):
                 f"kv_len={kv_len} budget={budget} selected={int(keep.shape[1])}."
             )
         return torch.sort(keep, dim=1).values
-
-    @staticmethod
-    def select_h2o_drop_one_indices_batch(
-        scores: torch.Tensor,
-        *,
-        budget: int,
-        recent_ratio: float,
-    ) -> torch.Tensor:
-        """Steady-decode selection for kv_len == budget + 1.
-
-        The heavy candidate prefix then contains exactly heavy_budget + 1
-        tokens, so keeping the top heavy_budget tokens is equivalent to
-        excluding its single minimum-score token.
-        """
-        if scores.dim() != 2:
-            raise ValueError(
-                "Batched H2O scores must have shape [batch, kv_len], "
-                f"got {tuple(scores.shape)}."
-            )
-        budget = int(budget)
-        kv_len = int(scores.shape[1])
-        if budget <= 0:
-            raise ValueError(f"H2O budget must be positive, got {budget}.")
-        if kv_len != budget + 1:
-            raise ValueError(
-                "H2O drop-one selection requires kv_len == budget + 1, "
-                f"got kv_len={kv_len} budget={budget}."
-            )
-        if not 0.0 < float(recent_ratio) < 1.0:
-            raise ValueError(f"H2O recent_ratio must be in (0, 1), got {recent_ratio}.")
-
-        recent_count = max(1, int(budget * float(recent_ratio)))
-        recent_count = min(recent_count, budget, kv_len)
-        heavy_count = budget - recent_count
-        recent_start = kv_len - recent_count
-        if recent_start != heavy_count + 1:
-            raise RuntimeError(
-                "H2O drop-one heavy-prefix invariant failed: "
-                f"recent_start={recent_start} heavy_count={heavy_count}."
-            )
-        drop_indices = scores[:, :recent_start].argmin(dim=1, keepdim=True)
-        heavy = torch.arange(
-            heavy_count, dtype=torch.long, device=scores.device
-        ).expand(int(scores.shape[0]), -1)
-        heavy = heavy + (heavy >= drop_indices).to(dtype=torch.long)
-        recent = torch.arange(
-            recent_start, kv_len, dtype=torch.long, device=scores.device
-        ).expand(int(scores.shape[0]), -1)
-        return torch.cat((heavy, recent), dim=1)
 
     def _score_key(self, layer_idx: int, seq_id: int) -> tuple[int, int]:
         return int(layer_idx), int(seq_id)
@@ -657,9 +653,6 @@ class H2OCacheManager(SnapKVCacheManager):
                 if logical_start == 0:
                     for layer_idx in layer_ids:
                         self._h2o_scores.pop(self._score_key(layer_idx, seq.seq_id), None)
-                        self._h2o_recent_cursors.pop(
-                            self._score_key(layer_idx, seq.seq_id), None
-                        )
 
                 for layer_idx in layer_ids:
                     row_idx = self._get_free_row(layer_idx, int(seq.seq_id))
@@ -961,14 +954,12 @@ class H2OCacheManager(SnapKVCacheManager):
         previous_scores = torch.stack(previous_rows, dim=0).view(
             len(layer_indices), len(seqs), previous_len
         )
-        # The reduced score buffer is CUDA-graph scratch. Steady-state long
-        # decode immediately clones it in ring eviction, but rows that are still
-        # within budget are not evicted and must not survive as scratch views:
-        # graph replay resets the backing buffer before the next token.
+        # The reduced score buffer is replay/eager scratch and is reset before
+        # the next token. Periodic eviction can leave an over-budget row alive
+        # for many steps, so persistent cumulative scores must never alias it.
         cumulative = reduced_scores[:, :, :kv_len]
         cumulative[:, :, :previous_len].add_(previous_scores)
-        if kv_len <= self.h2o_decode_budget:
-            cumulative = cumulative.clone()
+        cumulative = cumulative.clone()
         for local_layer, layer_idx in enumerate(layer_indices):
             for batch_idx, seq in enumerate(seqs):
                 self._h2o_scores[
@@ -988,7 +979,6 @@ class H2OCacheManager(SnapKVCacheManager):
             return
         kv_len = self._physical_row_len(layer_idx, seq)
         score = self._require_score_length(layer_idx, seq, kv_len)
-        self._h2o_recent_cursors.pop(self._score_key(layer_idx, seq.seq_id), None)
         keep_indices = keep_indices.to(device=self.device, dtype=torch.long).contiguous()
         if not keep_indices_sorted:
             keep_indices = torch.sort(keep_indices).values
@@ -1376,18 +1366,11 @@ class H2OCacheManager(SnapKVCacheManager):
             with profiler.record("h2o_evict_score_stack"):
                 scores = torch.stack(score_rows, dim=0)
             with profiler.record("h2o_evict_select"):
-                if not is_prefill and kv_len == budget + 1:
-                    keep_indices = self.select_h2o_drop_one_indices_batch(
-                        scores,
-                        budget=budget,
-                        recent_ratio=float(self.config.h2o_recent_ratio),
-                    )
-                else:
-                    keep_indices = self.select_h2o_indices_batch(
-                        scores,
-                        budget=budget,
-                        recent_ratio=float(self.config.h2o_recent_ratio),
-                    )
+                keep_indices = self.select_h2o_indices_batch(
+                    scores,
+                    budget=budget,
+                    recent_ratio=float(self.config.h2o_recent_ratio),
+                )
                 kept_scores = scores.gather(1, keep_indices)
 
             # Bypass H2O's scalar free_part_slots override: scores are updated
@@ -1428,12 +1411,9 @@ class H2OCacheManager(SnapKVCacheManager):
 
     def evict_after_prefill(self, seqs: list[Sequence]):
         self._evict(seqs, is_prefill=True)
-        heavy_count, _recent_count = self._h2o_budget_partition()
         for layer_idx in self.kv_transformer_layer_indices():
             for seq in seqs:
-                key = self._score_key(layer_idx, seq.seq_id)
                 if not seq.is_last_chunk_prefill:
-                    self._h2o_recent_cursors.pop(key, None)
                     continue
                 kv_len = self._physical_row_len(layer_idx, seq)
                 if kv_len > self.h2o_decode_budget:
@@ -1442,273 +1422,170 @@ class H2OCacheManager(SnapKVCacheManager):
                         f"layer={layer_idx} seq_id={seq.seq_id} "
                         f"kv_len={kv_len} budget={self.h2o_decode_budget}."
                     )
-                if kv_len == self.h2o_decode_budget:
-                    self._h2o_recent_cursors[key] = heavy_count
-                else:
-                    self._h2o_recent_cursors.pop(key, None)
+        if self.num_free_slots <= 0:
+            self._evict_decode_rows([])
 
-    def evict_after_decode(self, seqs: list[Sequence]):
-        self._evict_after_decode_ring(seqs)
-
-    def _decode_ring_plans(
+    def _decode_eviction_groups(
         self,
         seqs: list[Sequence],
-    ) -> dict[int, list[tuple[Sequence, int, torch.Tensor, int]]]:
+    ) -> tuple[list[int], dict[int, list[Sequence | _H2ORowRef]]]:
         seq_ids = [int(seq.seq_id) for seq in seqs]
         if len(seq_ids) != len(set(seq_ids)):
             raise RuntimeError(
-                f"H2O ring eviction received duplicate sequence ids: {seq_ids}."
+                f"H2O decode eviction received duplicate sequence ids: {seq_ids}."
             )
+        self._h2o_active_decode_seq_ids.update(seq_ids)
+        layer_indices = [int(layer) for layer in self.kv_transformer_layer_indices()]
         budget = self.h2o_decode_budget
-        heavy_count, _recent_count = self._h2o_budget_partition()
-        plans: dict[int, list[tuple[Sequence, int, torch.Tensor, int]]] = {}
-        for layer_idx in self.kv_transformer_layer_indices():
-            layer_plans = []
-            for seq in seqs:
-                key = self._score_key(layer_idx, seq.seq_id)
-                kv_len = self._physical_row_len(layer_idx, seq)
-                cursor = self._h2o_recent_cursors.get(key)
-                if kv_len > budget + 1:
-                    raise RuntimeError(
-                        "H2O ring eviction requires at most one appended token: "
-                        f"layer={layer_idx} seq_id={seq.seq_id} "
-                        f"kv_len={kv_len} budget={budget}."
-                    )
-                if kv_len <= budget:
-                    if cursor is not None:
-                        raise RuntimeError(
-                            "H2O ring cursor exists without one appended decode token: "
-                            f"layer={layer_idx} seq_id={seq.seq_id} "
-                            f"kv_len={kv_len} budget={budget} cursor={cursor}."
-                        )
-                    continue
-                score = self._require_score_length(layer_idx, seq, budget + 1)
-                if cursor is None:
-                    cursor = heavy_count
-                if not heavy_count <= int(cursor) < budget:
-                    raise RuntimeError(
-                        "H2O recent cursor is outside the fixed recent ring: "
-                        f"layer={layer_idx} seq_id={seq.seq_id} cursor={cursor} "
-                        f"heavy_count={heavy_count} budget={budget}."
-                    )
-                row_idx = self.seq_id_to_row[layer_idx].get(int(seq.seq_id))
-                if row_idx is None:
-                    raise RuntimeError(
-                        f"H2O physical row is missing: layer={layer_idx} "
-                        f"seq_id={seq.seq_id}."
-                    )
-                layer_plans.append((seq, int(row_idx), score, int(cursor)))
-            plans[int(layer_idx)] = layer_plans
-        return plans
+        periodic_trigger = budget + self.h2o_decode_eviction_interval
+        # The scheduler reads physical free capacity before the next forward.
+        # If this step consumed the final slot, every active decode row that is
+        # already over budget is reclaimable, including temporarily
+        # unscheduled rows. Idle chain and prefill-only rows are not active.
+        under_pressure = self.num_free_slots <= 0
+        trigger = budget + 1 if under_pressure else periodic_trigger
+        seq_by_id = {int(seq.seq_id): seq for seq in seqs}
+        candidate_ids = list(seq_ids)
+        if under_pressure:
+            candidate_ids.extend(
+                sorted(self._h2o_active_decode_seq_ids.difference(seq_ids))
+            )
+        groups: dict[int, list[Sequence | _H2ORowRef]] = {}
+        for seq_id in candidate_ids:
+            seq = seq_by_id.get(seq_id, _H2ORowRef(seq_id))
+            physical_lens = [
+                self._physical_row_len(layer_idx, seq)
+                for layer_idx in layer_indices
+            ]
+            if any(length != physical_lens[0] for length in physical_lens[1:]):
+                raise RuntimeError(
+                    "H2O decode eviction requires aligned KV-layer row lengths: "
+                    f"seq_id={seq.seq_id} lengths={physical_lens}."
+                )
+            kv_len = int(physical_lens[0])
+            if kv_len >= trigger:
+                groups.setdefault(kv_len, []).append(seq)
+        return layer_indices, groups
 
-    def _can_batch_decode_ring(
+    def _preflight_decode_eviction_capacity(
         self,
-        plans: dict[int, list[tuple[Sequence, int, torch.Tensor, int]]],
-    ) -> bool:
-        if self.buffer_req_to_token_slots_tensor is None:
-            return False
-        layer_plans = list(plans.values())
-        if not layer_plans or not layer_plans[0]:
-            return False
-        expected_seq_ids = [int(plan[0].seq_id) for plan in layer_plans[0]]
-        for current in layer_plans[1:]:
-            if [int(plan[0].seq_id) for plan in current] != expected_seq_ids:
-                return False
-        return True
+        layer_indices: list[int],
+        groups: dict[int, list[Sequence | _H2ORowRef]],
+    ) -> None:
+        dropped_per_layer = sum(
+            (kv_len - self.h2o_decode_budget) * len(group_seqs)
+            for kv_len, group_seqs in groups.items()
+        )
+        for layer_idx in layer_indices:
+            free_stack = self.free_slots_stack[layer_idx]
+            end = int(self._num_free_slots[layer_idx]) + int(dropped_per_layer)
+            if end > int(free_stack.numel()):
+                raise RuntimeError(
+                    "H2O decode eviction would overflow the free-slot stack: "
+                    f"layer={layer_idx} end={end} capacity={int(free_stack.numel())}."
+                )
 
-    def _evict_after_decode_ring(self, seqs: list[Sequence]):
+    def _evict_decode_rows(self, seqs: list[Sequence]) -> None:
+        layer_indices, groups = self._decode_eviction_groups(seqs)
+        if not groups:
+            return
+        self._preflight_decode_eviction_capacity(layer_indices, groups)
+
+        budget = self.h2o_decode_budget
+        ratio = float(self.config.h2o_recent_ratio)
+        fast_path = self.buffer_req_to_token_slots_tensor is not None
+        evicted_rows = 0
+        dropped_tokens = 0
+        burst_count = 0
+        for kv_len, group_seqs in groups.items():
+            burst_count += len(group_seqs)
+            if fast_path:
+                with profiler.record("h2o_decode_burst_select"):
+                    scores = torch.stack(
+                        [
+                            self._require_score_length(layer_idx, seq, kv_len)
+                            for layer_idx in layer_indices
+                            for seq in group_seqs
+                        ],
+                        dim=0,
+                    ).view(len(layer_indices), len(group_seqs), kv_len)
+                    keep_indices = self.select_h2o_indices_batch(
+                        scores.view(-1, kv_len),
+                        budget=budget,
+                        recent_ratio=ratio,
+                    ).view(len(layer_indices), len(group_seqs), budget)
+                    kept_scores = scores.gather(2, keep_indices)
+                with profiler.record("h2o_decode_burst_compact_layers"):
+                    SnapKVCacheManager.free_part_slots_batch_layers(
+                        self,
+                        layer_indices,
+                        group_seqs,
+                        keep_indices,
+                        keep_indices_sorted=True,
+                    )
+                for local_layer, layer_idx in enumerate(layer_indices):
+                    for batch_idx, seq in enumerate(group_seqs):
+                        self._h2o_scores[
+                            self._score_key(layer_idx, seq.seq_id)
+                        ] = kept_scores[local_layer, batch_idx]
+            else:
+                with profiler.record("h2o_decode_burst_fallback"):
+                    for layer_idx in layer_indices:
+                        for seq in group_seqs:
+                            score = self._require_score_length(
+                                layer_idx, seq, kv_len
+                            )
+                            keep_indices = self.select_h2o_indices(
+                                score,
+                                budget=budget,
+                                recent_ratio=ratio,
+                            )
+                            self.free_part_slots(
+                                layer_idx,
+                                seq,
+                                keep_indices,
+                                keep_indices_sorted=True,
+                            )
+            rows = len(layer_indices) * len(group_seqs)
+            evicted_rows += rows
+            dropped_tokens += (kv_len - budget) * rows
+
+        self._h2o_counters["decode_eviction_bursts"] += int(burst_count)
+        self._h2o_counters["decode_evictions"] += int(evicted_rows)
+        self._h2o_counters["dropped_tokens"] += int(dropped_tokens)
+
+    def evict_after_decode(self, seqs: list[Sequence]):
         if not seqs:
             return
-        plans = self._decode_ring_plans(seqs)
-        num_rows = sum(len(layer_plans) for layer_plans in plans.values())
-        if num_rows == 0:
-            return
-        if self._can_batch_decode_ring(plans):
-            with profiler.record("h2o_ring_fast"):
-                self._evict_decode_ring_batch(plans)
-            self._h2o_ring_counters["fast_rows"] += int(num_rows)
-        else:
-            for layer_idx, layer_plans in plans.items():
-                ptr = int(self._num_free_slots[layer_idx])
-                if ptr + len(layer_plans) > int(
-                    self.free_slots_stack[layer_idx].numel()
-                ):
-                    raise RuntimeError("H2O ring eviction overflowed the free-slot stack.")
-            with profiler.record("h2o_ring_fallback"):
-                for layer_idx, layer_plans in plans.items():
-                    for seq, row_idx, score, cursor in layer_plans:
-                        self._evict_decode_ring_row(
-                            layer_idx,
-                            seq,
-                            row_idx,
-                            score,
-                            cursor,
-                        )
-            self._h2o_ring_counters["fallback_rows"] += int(num_rows)
-        self._h2o_counters["decode_evictions"] += int(num_rows)
-        self._h2o_counters["dropped_tokens"] += int(num_rows)
-
-    def _evict_decode_ring_batch(
-        self,
-        plans: dict[int, list[tuple[Sequence, int, torch.Tensor, int]]],
-    ):
-        budget = self.h2o_decode_budget
-        heavy_count, recent_count = self._h2o_budget_partition()
-        layer_indices = list(plans)
-        batch_size = len(plans[layer_indices[0]])
-        kv_layers_gpu = torch.tensor(
-            [self.kv_layer_index(layer_idx) for layer_idx in layer_indices],
-            dtype=torch.long,
-            device=self.device,
-        )
-        rows_np = np.asarray(
-            [[plan[1] for plan in plans[layer_idx]] for layer_idx in layer_indices],
-            dtype=np.int64,
-        )
-        rows_gpu = torch.from_numpy(rows_np).to(device=self.device, dtype=torch.long)
-        cursors = torch.tensor(
-            [[plan[3] for plan in plans[layer_idx]] for layer_idx in layer_indices],
-            dtype=torch.long,
-            device=self.device,
-        )
-        scores = torch.stack(
-            [plan[2] for layer_idx in layer_indices for plan in plans[layer_idx]],
-            dim=0,
-        ).view(len(layer_indices), batch_size, budget + 1)
-        oldest_scores = scores.gather(2, cursors.unsqueeze(2))
-        candidates = torch.cat((scores[:, :, :heavy_count], oldest_scores), dim=2)
-        drop_candidates = candidates.argmin(dim=2)
-        drop_positions = torch.where(
-            drop_candidates == heavy_count,
-            cursors,
-            drop_candidates,
-        )
-        updated_scores = scores[:, :, :budget].clone()
-        updated_scores.scatter_(2, drop_positions.unsqueeze(2), oldest_scores)
-        updated_scores.scatter_(
-            2,
-            cursors.unsqueeze(2),
-            scores[:, :, budget : budget + 1],
-        )
-
-        slots = self.buffer_req_to_token_slots_tensor
-        layer_grid = kv_layers_gpu[:, None].expand(-1, batch_size)
-        dropped_slots = slots[layer_grid, rows_gpu, drop_positions].clone()
-        oldest_slots = slots[layer_grid, rows_gpu, cursors].clone()
-        appended_slots = slots[layer_grid, rows_gpu, budget].clone()
-
-        drop_count = batch_size
-        if self.free_slots_stack_tensor is not None:
-            ptrs = np.asarray(
-                [self._num_free_slots[layer_idx] for layer_idx in layer_indices],
-                dtype=np.int64,
-            )
-            offsets = ptrs[:, None] + np.arange(drop_count, dtype=np.int64)[None, :]
-            if bool((offsets >= int(self.free_slots_stack_tensor.shape[1])).any()):
-                raise RuntimeError("H2O ring eviction overflowed the free-slot stack.")
-        else:
-            for layer_idx in layer_indices:
-                ptr = int(self._num_free_slots[layer_idx])
-                if ptr + drop_count > int(self.free_slots_stack[layer_idx].numel()):
-                    raise RuntimeError("H2O ring eviction overflowed the free-slot stack.")
-
-        slots[layer_grid, rows_gpu, drop_positions] = oldest_slots
-        slots[layer_grid, rows_gpu, cursors] = appended_slots
-        slots[layer_grid, rows_gpu, budget] = 0
-        if self.free_slots_stack_tensor is not None:
-            self.free_slots_stack_tensor[
-                kv_layers_gpu[:, None],
-                torch.from_numpy(offsets).to(device=self.device, dtype=torch.long),
-            ] = dropped_slots.to(torch.int32)
-        else:
-            for local_layer, layer_idx in enumerate(layer_indices):
-                ptr = int(self._num_free_slots[layer_idx])
-                self.free_slots_stack[layer_idx][ptr : ptr + drop_count] = dropped_slots[
-                    local_layer
-                ].to(torch.int32)
-        for local_layer, layer_idx in enumerate(layer_indices):
-            self._num_free_slots[layer_idx] += drop_count
-            self.row_seq_lens[layer_idx][rows_np[local_layer]] = budget
-            for batch_idx, (seq, _row_idx, _score, cursor) in enumerate(
-                plans[layer_idx]
-            ):
-                key = self._score_key(layer_idx, seq.seq_id)
-                self._h2o_scores[key] = updated_scores[local_layer, batch_idx]
-                self._h2o_recent_cursors[key] = (
-                    heavy_count + ((cursor - heavy_count + 1) % recent_count)
-                )
-        self._uniform_decode_metadata = False
-
-    def _evict_decode_ring_row(
-        self,
-        layer_idx: int,
-        seq: Sequence,
-        row_idx: int,
-        score: torch.Tensor,
-        cursor: int,
-    ):
-        budget = self.h2o_decode_budget
-        heavy_count, recent_count = self._h2o_budget_partition()
-        oldest_score = score[cursor].clone()
-        candidates = torch.cat((score[:heavy_count], oldest_score.view(1)))
-        drop_candidate = int(candidates.argmin().item())
-        drop_position = cursor if drop_candidate == heavy_count else drop_candidate
-
-        updated_score = score[:budget].clone()
-        updated_score[drop_position] = oldest_score
-        updated_score[cursor] = score[budget]
-
-        slot_row = self.buffer_req_to_token_slots[layer_idx][row_idx]
-        dropped_slot = slot_row[drop_position].clone()
-        oldest_slot = slot_row[cursor].clone()
-        appended_slot = slot_row[budget].clone()
-
-        ptr = int(self._num_free_slots[layer_idx])
-        if ptr >= int(self.free_slots_stack[layer_idx].numel()):
-            raise RuntimeError("H2O ring eviction overflowed the free-slot stack.")
-        slot_row[drop_position] = oldest_slot
-        slot_row[cursor] = appended_slot
-        slot_row[budget] = 0
-        self.free_slots_stack[layer_idx][ptr] = dropped_slot.to(torch.int32)
-        self._num_free_slots[layer_idx] += 1
-        self.row_seq_lens[layer_idx][row_idx] = budget
-        key = self._score_key(layer_idx, seq.seq_id)
-        self._h2o_scores[key] = updated_score
-        self._h2o_recent_cursors[key] = (
-            heavy_count + ((cursor - heavy_count + 1) % recent_count)
-        )
-        self._uniform_decode_metadata = False
+        self._evict_decode_rows(seqs)
 
     def free_seq(self, seq_id: int):
         seq_id = int(seq_id)
+        self._h2o_active_decode_seq_ids.discard(seq_id)
         for key in list(self._h2o_scores):
             if key[1] == seq_id:
                 self._h2o_scores.pop(key, None)
-        for key in list(self._h2o_recent_cursors):
-            if key[1] == seq_id:
-                self._h2o_recent_cursors.pop(key, None)
         super().free_seq(seq_id)
+
+    def on_chain_turn_finished(
+        self,
+        seq_id: int,
+        processed_token_count: int,
+    ) -> None:
+        self._h2o_active_decode_seq_ids.discard(int(seq_id))
+        super().on_chain_turn_finished(seq_id, processed_token_count)
 
     def reset_after_warmup(self) -> None:
         self._h2o_scores.clear()
-        self._h2o_recent_cursors.clear()
+        self._h2o_active_decode_seq_ids.clear()
         for counter in self._h2o_counters:
             self._h2o_counters[counter] = 0
-        for counter in self._h2o_ring_counters:
-            self._h2o_ring_counters[counter] = 0
 
     def debug_state_summary(self) -> dict[str, object]:
         summary = super().debug_state_summary()
         workspace = getattr(self, "_h2o_final_prefill_workspace", None)
         summary["h2o"] = {
             "counters": dict(self._h2o_counters),
-            "ring_counters": dict(self._h2o_ring_counters),
-            "recent_cursors": {
-                f"{layer_idx}:{seq_id}": int(cursor)
-                for (layer_idx, seq_id), cursor in sorted(
-                    self._h2o_recent_cursors.items()
-                )
-            },
             "score_lengths": {
                 f"{layer_idx}:{seq_id}": int(score.numel())
                 for (layer_idx, seq_id), score in sorted(self._h2o_scores.items())

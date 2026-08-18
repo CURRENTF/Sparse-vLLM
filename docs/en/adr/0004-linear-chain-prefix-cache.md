@@ -25,7 +25,7 @@ The chain implementation is independent of `RadixPrefixIndex`:
   digest, compact driver-side logical token history, strict IDLE-only LRU
   metadata, and bounded tombstones.
 - `ChainCacheCoordinator` owns logical coordination only.
-- Cache managers own KV rows, physical slots, H2O score/cursor state, R-KV
+- Cache managers own KV rows, physical slots, H2O cumulative-score state, R-KV
   queries, SkipKV sentence state, and all other method metadata.
 - `RuntimeState` is the payload reclamation entrypoint.
 

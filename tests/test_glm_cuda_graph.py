@@ -748,6 +748,7 @@ def _glm_method_runtime_config(method: str, *, num_layers: int):
         pool_kernel_size=1,
         prefill_schedule_policy="chunked",
         h2o_decode_budget=3,
+        h2o_decode_eviction_interval=1,
         h2o_prefill_budget=4,
         h2o_recent_ratio=0.5,
         h2o_prefill_score_window=2,
@@ -914,14 +915,14 @@ def _initialize_glm_method_cache_manager(
             )
             for layer_idx in range(manager.num_layers)
         }
-        manager._h2o_recent_cursors = {}
+        manager._h2o_active_decode_seq_ids = set()
         manager._h2o_counters = {
             "intermediate_prefill_evictions": 0,
             "final_prefill_evictions": 0,
+            "decode_eviction_bursts": 0,
             "decode_evictions": 0,
             "dropped_tokens": 0,
         }
-        manager._h2o_ring_counters = {"fast_rows": 0, "fallback_rows": 0}
         manager._h2o_final_prefill_workspace = None
         manager._h2o_decode_static_rows = None
         manager._h2o_decode_static_topology = None

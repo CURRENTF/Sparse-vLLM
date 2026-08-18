@@ -794,10 +794,17 @@ class PrefillPolicyConfigTest(unittest.TestCase):
             prefill_schedule_policy=PREFILL_POLICY_ALL_CHUNKED,
         )
         self.assertEqual(h2o_cfg.prefill_schedule_policy, PREFILL_POLICY_ALL_CHUNKED)
+        self.assertEqual(h2o_cfg.h2o_decode_eviction_interval, 128)
 
     def test_h2o_config_validation_fails_fast(self):
         invalid = (
             ({"h2o_decode_budget": 0}, "h2o_decode_budget"),
+            ({"h2o_decode_eviction_interval": 0}, "h2o_decode_eviction_interval"),
+            ({"h2o_decode_eviction_interval": -1}, "h2o_decode_eviction_interval"),
+            (
+                {"h2o_decode_eviction_interval": 1},
+                "h2o_decode_budget.*h2o_decode_eviction_interval.*divisible by 64",
+            ),
             (
                 {"h2o_decode_budget": 8, "h2o_prefill_budget": 7},
                 "h2o_prefill_budget",
@@ -811,6 +818,16 @@ class PrefillPolicyConfigTest(unittest.TestCase):
             with self.subTest(values=values):
                 with self.assertRaisesRegex(ValueError, message):
                     self.make_config(vllm_sparse_method="h2o", **values)
+
+    def test_h2o_accepts_aligned_decode_peak(self):
+        config = self.make_config(
+            vllm_sparse_method="h2o",
+            h2o_decode_budget=4096,
+            h2o_decode_eviction_interval=64,
+        )
+
+        self.assertEqual(config.h2o_decode_budget, 4096)
+        self.assertEqual(config.h2o_decode_eviction_interval, 64)
 
     def test_h2o_accepts_supported_dense_model_tp_and_rejects_unknown_model(self):
         llama_config = self.hf_config()

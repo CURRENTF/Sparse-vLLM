@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import weakref
 from dataclasses import dataclass
 from typing import Generic, Protocol, TypeVar
@@ -44,13 +45,10 @@ def runtime_version_at_least(
 ) -> bool:
     if version is None:
         return False
-    parts = str(version).split(".")
-    if len(parts) < 2:
+    match = re.match(r"^\s*(\d+)\.(\d+)", str(version))
+    if match is None:
         return False
-    try:
-        current = (int(parts[0]), int(parts[1]))
-    except ValueError:
-        return False
+    current = tuple(map(int, match.groups()))
     return current >= minimum
 
 

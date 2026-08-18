@@ -725,6 +725,7 @@ def test_resumed_h2o_capacity_uses_chunked_physical_peak():
     manager.config = SimpleNamespace(
         vllm_sparse_method="h2o",
         h2o_decode_budget=4,
+        h2o_decode_eviction_interval=3,
         h2o_prefill_budget=8,
         chunk_prefill_size=4,
     )
@@ -750,11 +751,97 @@ def test_resumed_h2o_capacity_uses_chunked_physical_peak():
     assert row_deficit == 0
 
 
+def test_resumed_h2o_capacity_reserves_over_budget_first_prefill_chunk():
+    manager = object.__new__(H2OCacheManager)
+    manager.config = SimpleNamespace(
+        vllm_sparse_method="h2o",
+        h2o_decode_budget=4,
+        h2o_decode_eviction_interval=3,
+        h2o_prefill_budget=4,
+        chunk_prefill_size=4,
+    )
+    manager.kv_transformer_layer_indices = lambda: [0]
+    manager._num_free_slots = [2]
+    manager.free_rows = [[]]
+
+    required, required_rows, deficits, row_deficit = (
+        manager.chain_capacity_deficits(
+            suffix_tokens=100,
+            generation_tokens=0,
+            existing_slots_by_layer=(6,),
+            needs_resident_row=False,
+        )
+    )
+
+    assert required == (4,)
+    assert required_rows == 0
+    assert deficits == (2,)
+    assert row_deficit == 0
+
+
+def test_resumed_h2o_capacity_handles_small_suffix_and_outstanding_by_layer():
+    manager = object.__new__(H2OCacheManager)
+    manager.config = SimpleNamespace(
+        vllm_sparse_method="h2o",
+        h2o_decode_budget=4,
+        h2o_decode_eviction_interval=3,
+        h2o_prefill_budget=4,
+        chunk_prefill_size=4,
+    )
+    manager.kv_transformer_layer_indices = lambda: [0, 2]
+    manager._num_free_slots = [3, 0, 4]
+    manager.free_rows = [[], [], []]
+
+    required, required_rows, deficits, row_deficit = (
+        manager.chain_capacity_deficits(
+            suffix_tokens=2,
+            generation_tokens=0,
+            existing_slots_by_layer=(6, 4),
+            outstanding_reserved_slots_by_layer=(2, 3),
+            needs_resident_row=False,
+        )
+    )
+
+    assert required == (2, 2)
+    assert required_rows == 0
+    assert deficits == (1, 1)
+    assert row_deficit == 0
+
+
+def test_resumed_h2o_capacity_without_suffix_starts_decode_from_existing_row():
+    manager = object.__new__(H2OCacheManager)
+    manager.config = SimpleNamespace(
+        vllm_sparse_method="h2o",
+        h2o_decode_budget=4,
+        h2o_decode_eviction_interval=3,
+        h2o_prefill_budget=4,
+        chunk_prefill_size=4,
+    )
+    manager.kv_transformer_layer_indices = lambda: [0]
+    manager._num_free_slots = [0]
+    manager.free_rows = [[]]
+
+    required, required_rows, deficits, row_deficit = (
+        manager.chain_capacity_deficits(
+            suffix_tokens=0,
+            generation_tokens=2,
+            existing_slots_by_layer=(6,),
+            needs_resident_row=False,
+        )
+    )
+
+    assert required == (1,)
+    assert required_rows == 0
+    assert deficits == (1,)
+    assert row_deficit == 0
+
+
 def test_new_h2o_chain_capacity_reserves_row_and_outstanding_slots():
     manager = object.__new__(H2OCacheManager)
     manager.config = SimpleNamespace(
         vllm_sparse_method="h2o",
         h2o_decode_budget=4,
+        h2o_decode_eviction_interval=3,
         h2o_prefill_budget=8,
         chunk_prefill_size=4,
     )
@@ -778,11 +865,12 @@ def test_new_h2o_chain_capacity_reserves_row_and_outstanding_slots():
     assert row_deficit == 0
 
 
-def test_h2o_chain_capacity_reserves_one_decode_ring_slot():
+def test_h2o_chain_capacity_reserves_periodic_decode_peak():
     manager = object.__new__(H2OCacheManager)
     manager.config = SimpleNamespace(
         vllm_sparse_method="h2o",
         h2o_decode_budget=4,
+        h2o_decode_eviction_interval=3,
         h2o_prefill_budget=8,
         chunk_prefill_size=4,
     )
@@ -799,9 +887,9 @@ def test_h2o_chain_capacity_reserves_one_decode_ring_slot():
         )
     )
 
-    assert required == (1,)
+    assert required == (3,)
     assert required_rows == 0
-    assert deficits == (0,)
+    assert deficits == (2,)
     assert row_deficit == 0
 
 
@@ -818,6 +906,7 @@ def _h2o_fingerprint_config(**overrides):
         "full_attn_layers": [],
         "prefix_cache_salt": "",
         "h2o_decode_budget": 4,
+        "h2o_decode_eviction_interval": 3,
         "h2o_prefill_budget": 8,
         "h2o_recent_ratio": 0.5,
         "h2o_prefill_score_window": 4,
@@ -831,6 +920,7 @@ def _h2o_fingerprint_config(**overrides):
     ("field_name", "changed_value"),
     [
         ("h2o_decode_budget", 5),
+        ("h2o_decode_eviction_interval", 4),
         ("h2o_prefill_budget", 9),
         ("h2o_recent_ratio", 0.25),
         ("h2o_prefill_score_window", 8),

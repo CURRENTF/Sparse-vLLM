@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 from types import SimpleNamespace
-from unittest.mock import ANY, patch
+from unittest.mock import ANY, Mock, patch
 
 import numpy as np
 import pytest
@@ -11,8 +11,10 @@ import torch
 from sparsevllm.engine.cache_manager.base import (
     AttentionViewMeta,
     CacheManager,
+    DecodeComputeView,
     ExplicitKVPayload,
     LayerBatchStates,
+    MlaLatentPayload,
     PrefillComputeView,
 )
 from sparsevllm.engine.cache_manager.h2o import H2OCacheManager
@@ -25,6 +27,7 @@ from sparsevllm.method_registry import (
     PREFILL_POLICY_ALL_CHUNKED,
     get_default_prefill_schedule_policy,
 )
+from sparsevllm.operators.mla_attention import MlaTileLangScoreProvider
 from sparsevllm.utils.context import reset_context, set_context
 
 
@@ -47,6 +50,7 @@ def _manager_with_layer_rows(
     lengths_by_layer: list[list[int]],
     *,
     decode_budget=4,
+    decode_eviction_interval=3,
     prefill_budget=8,
     chunk_prefill_size=4,
 ):
@@ -64,6 +68,7 @@ def _manager_with_layer_rows(
     manager.config = SimpleNamespace(
         vllm_sparse_method="h2o",
         h2o_decode_budget=decode_budget,
+        h2o_decode_eviction_interval=decode_eviction_interval,
         h2o_prefill_budget=prefill_budget,
         h2o_recent_ratio=0.5,
         h2o_prefill_score_window=4,
@@ -79,16 +84,13 @@ def _manager_with_layer_rows(
     manager.head_dim = 2
     manager.hf_config = SimpleNamespace(torch_dtype=torch.float32)
     manager._h2o_scores = {}
-    manager._h2o_recent_cursors = {}
+    manager._h2o_active_decode_seq_ids = set()
     manager._h2o_counters = {
         "intermediate_prefill_evictions": 0,
         "final_prefill_evictions": 0,
+        "decode_eviction_bursts": 0,
         "decode_evictions": 0,
         "dropped_tokens": 0,
-    }
-    manager._h2o_ring_counters = {
-        "fast_rows": 0,
-        "fallback_rows": 0,
     }
     manager._h2o_final_prefill_workspace = None
     manager._uniform_decode_metadata = False
@@ -136,12 +138,14 @@ def _manager_with_rows(
     lengths: list[int],
     *,
     decode_budget=4,
+    decode_eviction_interval=3,
     prefill_budget=8,
     chunk_prefill_size=4,
 ):
     return _manager_with_layer_rows(
         [lengths],
         decode_budget=decode_budget,
+        decode_eviction_interval=decode_eviction_interval,
         prefill_budget=prefill_budget,
         chunk_prefill_size=chunk_prefill_size,
     )
@@ -208,24 +212,25 @@ def _assert_scores_match_slot_rows(manager: H2OCacheManager):
             )
 
 
-def _append_ring_token(
+def _append_decode_token(
     manager: H2OCacheManager,
     layer_idx: int,
     seq_id: int,
     *,
     token_slot: int,
     token_score: float,
+    append_score: bool = True,
 ):
     row_idx = manager.seq_id_to_row[layer_idx][seq_id]
-    budget = manager.h2o_decode_budget
-    assert int(manager.row_seq_lens[layer_idx][row_idx]) == budget
+    row_len = int(manager.row_seq_lens[layer_idx][row_idx])
     score = manager._h2o_scores[(layer_idx, seq_id)]
-    assert int(score.numel()) == budget
-    manager.buffer_req_to_token_slots[layer_idx][row_idx, budget] = int(token_slot)
-    manager.row_seq_lens[layer_idx][row_idx] = budget + 1
-    manager._h2o_scores[(layer_idx, seq_id)] = torch.cat(
-        (score, torch.tensor([token_score], dtype=torch.float32))
-    )
+    assert int(score.numel()) == row_len
+    manager.buffer_req_to_token_slots[layer_idx][row_idx, row_len] = int(token_slot)
+    manager.row_seq_lens[layer_idx][row_idx] = row_len + 1
+    if append_score:
+        manager._h2o_scores[(layer_idx, seq_id)] = torch.cat(
+            (score, torch.tensor([token_score], dtype=torch.float32))
+        )
 
 
 def _token_score_map(manager: H2OCacheManager, layer_idx: int, seq_id: int):
@@ -282,26 +287,6 @@ def test_h2o_selection_keeps_heavy_and_recent_in_logical_order():
     scores = torch.tensor([1.0, 9.0, 2.0, 8.0, 3.0, 0.0, 0.0, 0.0])
     keep = H2OCacheManager.select_h2o_indices(scores, budget=4, recent_ratio=0.5)
     assert keep.tolist() == [1, 3, 6, 7]
-
-
-def test_h2o_drop_one_batch_matches_general_selection():
-    scores = torch.tensor(
-        [
-            [3.0, 1.0, 2.0, 8.0, 9.0],
-            [1.0, 4.0, 2.0, 8.0, 9.0],
-            [5.0, 3.0, 4.0, 8.0, 9.0],
-            [7.0, 9.0, 8.0, 5.0, 6.0],
-        ]
-    )
-
-    drop_one = H2OCacheManager.select_h2o_drop_one_indices_batch(
-        scores, budget=4, recent_ratio=0.5
-    )
-    general = H2OCacheManager.select_h2o_indices_batch(
-        scores, budget=4, recent_ratio=0.5
-    )
-
-    assert torch.equal(drop_one, general)
 
 
 def test_h2o_general_batch_selection_matches_scalar_multi_drop():
@@ -460,7 +445,6 @@ def test_h2o_intermediate_and_final_prefill_use_distinct_budgets_and_counters():
     assert manager.row_seq_lens[0][0] == 4
     assert manager._h2o_counters["final_prefill_evictions"] == 1
     assert manager._h2o_counters["dropped_tokens"] == 8
-    assert manager._h2o_recent_cursors == {(0, 0): 2}
 
 
 def test_h2o_decode_score_update_supports_batch_with_different_kv_lengths():
@@ -479,15 +463,17 @@ def test_h2o_decode_score_update_supports_batch_with_different_kv_lengths():
     assert manager._h2o_scores[(0, 1)].tolist() == pytest.approx([4.5, 5.6, 0.7])
 
 
-def test_h2o_all_layer_score_does_not_alias_graph_scratch_below_budget():
-    manager = _manager_with_layer_rows([[3], [3]], decode_budget=4)
+def test_h2o_all_layer_score_does_not_alias_graph_scratch_between_bursts():
+    manager = _manager_with_layer_rows(
+        [[6], [6]], decode_budget=4, decode_eviction_interval=3
+    )
     seq = _seq(0, 10, prefilled=10, chunk=1)
-    manager._h2o_scores[(0, 0)] = torch.tensor([1.0, 2.0])
-    manager._h2o_scores[(1, 0)] = torch.tensor([3.0, 4.0])
+    manager._h2o_scores[(0, 0)] = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0])
+    manager._h2o_scores[(1, 0)] = torch.tensor([6.0, 7.0, 8.0, 9.0, 10.0])
     graph_scratch = torch.tensor(
         [
-            [[0.1, 0.2, 0.7, -1e20]],
-            [[0.3, 0.4, 0.3, -1e20]],
+            [[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, -1e20]],
+            [[0.6, 0.5, 0.4, 0.3, 0.2, 0.1, -1e20]],
         ],
         dtype=torch.float32,
     )
@@ -498,8 +484,8 @@ def test_h2o_all_layer_score_does_not_alias_graph_scratch_below_budget():
         graph_scratch,
     )
     expected = {
-        (0, 0): torch.tensor([1.1, 2.2, 0.7]),
-        (1, 0): torch.tensor([3.3, 4.4, 0.3]),
+        (0, 0): torch.tensor([1.1, 2.2, 3.3, 4.4, 5.5, 0.6]),
+        (1, 0): torch.tensor([6.6, 7.5, 8.4, 9.3, 10.2, 0.1]),
     }
     assert used_fast_path
     graph_scratch.fill_(-1e20)
@@ -509,6 +495,49 @@ def test_h2o_all_layer_score_does_not_alias_graph_scratch_below_budget():
         assert manager._h2o_scores[key].untyped_storage().data_ptr() != (
             graph_scratch.untyped_storage().data_ptr()
         )
+
+
+def test_h2o_eager_and_replayed_score_scratch_match_across_burst_boundary():
+    def run(*, reuse_scratch: bool):
+        manager = _manager_with_rows(
+            [4], decode_budget=4, decode_eviction_interval=3, prefill_budget=8
+        )
+        seq = _seq(0, 7, prefilled=7, chunk=1)
+        manager._h2o_scores[(0, 0)] = torch.tensor([10.0, 1.0, 5.0, 0.5])
+        scratch = torch.empty((1, 1, 64), dtype=torch.float32)
+        for token_slot in (4, 5, 6):
+            _append_decode_token(
+                manager,
+                0,
+                0,
+                token_slot=token_slot,
+                token_score=0.0,
+                append_score=False,
+            )
+            if not reuse_scratch:
+                scratch = torch.empty((1, 1, 64), dtype=torch.float32)
+            scratch.fill_(-1e20)
+            kv_len = int(manager.row_seq_lens[0][0])
+            scratch[0, 0, :kv_len] = torch.linspace(
+                0.1, 0.1 * kv_len, kv_len
+            )
+            manager.update_decode_attention_scores_all_layers(
+                [0], [seq], scratch
+            )
+            manager.evict_after_decode([seq])
+            scratch.fill_(-1e20)
+        return (
+            manager.buffer_req_to_token_slots[0][0, :4].clone(),
+            manager._h2o_scores[(0, 0)].clone(),
+            dict(manager._h2o_counters),
+        )
+
+    eager = run(reuse_scratch=False)
+    replayed = run(reuse_scratch=True)
+
+    assert torch.equal(eager[0], replayed[0])
+    assert torch.allclose(eager[1], replayed[1])
+    assert eager[2] == replayed[2]
 
 
 def test_h2o_decode_score_update_batches_uniform_lengths():
@@ -616,35 +645,43 @@ def test_h2o_all_layer_score_update_explicitly_falls_back_for_nonuniform_rows():
         assert manager._h2o_scores[(layer_idx, 1)].tolist() == [5.0, 6.0, 1.0]
 
 
-def test_h2o_decode_ring_fast_path_updates_all_layers_without_ordered_compaction():
+def test_h2o_decode_burst_compacts_all_layers_and_batch_once():
     manager = _manager_with_layer_rows(
-        [[5, 5] for _ in range(28)], decode_budget=4, prefill_budget=8
+        [[7, 7] for _ in range(28)],
+        decode_budget=4,
+        decode_eviction_interval=3,
+        prefill_budget=8,
     )
     seqs = [
-        _seq(0, 5, prefilled=5, chunk=1),
-        _seq(1, 5, prefilled=5, chunk=1),
+        _seq(0, 7, prefilled=7, chunk=1),
+        _seq(1, 7, prefilled=7, chunk=1),
     ]
     _set_scores_from_slot_rows(manager)
+    calls = []
+    original = SnapKVCacheManager.free_part_slots_batch_layers
 
-    with patch.object(
-        SnapKVCacheManager,
-        "free_part_slots_batch",
-        side_effect=AssertionError("decode ring used ordered batch compaction"),
-    ):
+    def tracked_compact(self, layer_indices, batch_seqs, keep_indices, **kwargs):
+        calls.append((list(layer_indices), list(batch_seqs), keep_indices.clone()))
+        return original(self, layer_indices, batch_seqs, keep_indices, **kwargs)
+
+    with patch.object(SnapKVCacheManager, "free_part_slots_batch_layers", tracked_compact):
         manager.evict_after_decode(seqs)
 
+    assert len(calls) == 1
+    assert calls[0][0] == list(range(28))
+    assert calls[0][1] == seqs
+    assert calls[0][2].shape == (28, 2, 4)
     assert [lengths.tolist() for lengths in manager.row_seq_lens] == [
         [4, 4] for _ in range(28)
     ]
     _assert_scores_match_slot_rows(manager)
-    assert set(manager._h2o_recent_cursors.values()) == {3}
-    assert manager._h2o_ring_counters == {"fast_rows": 56, "fallback_rows": 0}
-    assert manager._num_free_slots == [34 for _ in range(28)]
+    assert manager._num_free_slots == [38 for _ in range(28)]
     assert manager._h2o_counters == {
         "intermediate_prefill_evictions": 0,
         "final_prefill_evictions": 0,
+        "decode_eviction_bursts": 2,
         "decode_evictions": 56,
-        "dropped_tokens": 56,
+        "dropped_tokens": 168,
     }
 
 
@@ -678,6 +715,7 @@ def test_h2o_intermediate_prefill_reuses_uniform_batch_fast_path():
     assert manager._h2o_counters == {
         "intermediate_prefill_evictions": 4,
         "final_prefill_evictions": 0,
+        "decode_eviction_bursts": 0,
         "decode_evictions": 0,
         "dropped_tokens": 10,
     }
@@ -709,6 +747,7 @@ def test_h2o_mixed_prefill_budgets_fall_back_with_exact_counters():
     assert manager._h2o_counters == {
         "intermediate_prefill_evictions": 1,
         "final_prefill_evictions": 1,
+        "decode_eviction_bursts": 0,
         "decode_evictions": 0,
         "dropped_tokens": 5,
     }
@@ -882,179 +921,309 @@ def test_h2o_final_prefill_capacity_preflight_prevents_partial_layer_updates():
     assert manager._h2o_final_prefill_workspace is None
 
 
-def test_h2o_decode_ring_rejects_more_than_one_appended_token():
-    manager = _manager_with_rows([6], decode_budget=4, prefill_budget=8)
-    seqs = [_seq(0, 6, prefilled=6, chunk=1)]
-    _set_scores_from_slot_rows(manager)
-
-    with pytest.raises(RuntimeError, match="at most one appended token"):
-        manager.evict_after_decode(seqs)
-
-
-def test_h2o_decode_ring_rejects_cursor_without_appended_token():
-    manager = _manager_with_rows([4], decode_budget=4, prefill_budget=8)
-    seq = _seq(0, 4, prefilled=4, chunk=1)
-    _set_scores_from_slot_rows(manager)
-    manager._h2o_recent_cursors[(0, 0)] = 2
-
-    with pytest.raises(RuntimeError, match="cursor exists without one appended"):
-        manager.evict_after_decode([seq])
-
-
-def test_h2o_decode_ring_fallback_preserves_score_slot_alignment():
-    manager = _manager_with_layer_rows(
-        [[5, 5], [5, 5]], decode_budget=4, prefill_budget=8
+def test_h2o_decode_waits_for_interval_then_drops_full_burst():
+    manager = _manager_with_rows(
+        [5], decode_budget=4, decode_eviction_interval=3, prefill_budget=8
     )
-    seqs = [
-        _seq(0, 5, prefilled=5, chunk=1),
-        _seq(1, 5, prefilled=5, chunk=1),
-    ]
+    seq = _seq(0, 7, prefilled=7, chunk=1)
     _set_scores_from_slot_rows(manager)
-    manager.buffer_req_to_token_slots_tensor = None
 
-    manager.evict_after_decode(seqs)
+    manager.evict_after_decode([seq])
+    assert manager.row_seq_lens[0].tolist() == [5]
+    _append_decode_token(manager, 0, 0, token_slot=5, token_score=5.0)
+    manager.evict_after_decode([seq])
+    assert manager.row_seq_lens[0].tolist() == [6]
+    assert manager._h2o_counters["decode_evictions"] == 0
 
-    assert [lengths.tolist() for lengths in manager.row_seq_lens] == [[4, 4], [4, 4]]
-    _assert_scores_match_slot_rows(manager)
-    assert manager._h2o_ring_counters == {"fast_rows": 0, "fallback_rows": 4}
-    assert manager._h2o_counters["decode_evictions"] == 4
-    assert manager._h2o_counters["dropped_tokens"] == 4
+    _append_decode_token(manager, 0, 0, token_slot=6, token_score=6.0)
+    manager.evict_after_decode([seq])
+
+    assert manager.row_seq_lens[0].tolist() == [4]
+    assert manager.buffer_req_to_token_slots[0][0, :4].tolist() == [3, 4, 5, 6]
+    assert manager._h2o_scores[(0, 0)].tolist() == [3.0, 4.0, 5.0, 6.0]
+    assert manager._h2o_counters["decode_eviction_bursts"] == 1
+    assert manager._h2o_counters["decode_evictions"] == 1
+    assert manager._h2o_counters["dropped_tokens"] == 3
 
 
-def test_h2o_decode_evicts_every_over_budget_step_and_counts_drops():
-    manager = _manager_with_rows([5], decode_budget=4, prefill_budget=8)
-    seq = _seq(0, 5, prefilled=5, chunk=1)
-    manager._h2o_scores[(0, 0)] = torch.arange(5, dtype=torch.float32)
+def test_h2o_decode_pressure_reclaims_over_budget_row_before_interval():
+    manager = _manager_with_rows(
+        [5], decode_budget=4, decode_eviction_interval=3, prefill_budget=8
+    )
+    seq = _seq(0, 4, prefilled=4, chunk=1)
+    seq.append_token(4)
+    _set_scores_from_slot_rows(manager)
+    manager._num_free_slots = [0]
 
     manager.evict_after_decode([seq])
 
-    assert manager.row_seq_lens[0][0] == 4
+    assert manager.row_seq_lens[0].tolist() == [4]
+    assert manager.buffer_req_to_token_slots[0][0, :4].tolist() == [1, 2, 3, 4]
+    assert manager._h2o_scores[(0, 0)].tolist() == [1.0, 2.0, 3.0, 4.0]
+    assert manager._num_free_slots == [1]
+    assert manager.decode_step_free_slots() == 1
+    assert manager._h2o_counters == {
+        "intermediate_prefill_evictions": 0,
+        "final_prefill_evictions": 0,
+        "decode_eviction_bursts": 1,
+        "decode_evictions": 1,
+        "dropped_tokens": 1,
+    }
+
+    scheduler = Scheduler(
+        SimpleNamespace(
+            max_num_seqs_in_batch=1,
+            max_num_batched_tokens=1,
+            max_decoding_seqs=1,
+            chunk_prefill_size=1,
+            prefill_schedule_policy=PREFILL_POLICY_ALL_CHUNKED,
+            eos=-1,
+            num_sink_tokens=0,
+            num_recent_tokens=0,
+            decode_keep_tokens=4,
+            vllm_sparse_method="h2o",
+        ),
+        manager,
+    )
+    scheduler.decoding.append(seq)
+
+    scheduled, is_prefill, preempted = scheduler.schedule()
+
+    assert scheduled == [seq]
+    assert not is_prefill
+    assert preempted == []
+
+
+@pytest.mark.parametrize("use_tensor_table", [True, False])
+def test_h2o_final_prefill_pressure_reclaims_unscheduled_active_decode_row(
+    use_tensor_table: bool,
+):
+    manager = _manager_with_layer_rows(
+        [[5, 2], [5, 2]],
+        decode_budget=4,
+        decode_eviction_interval=3,
+        prefill_budget=8,
+    )
+    active_decode = _seq(0, 5, prefilled=5, chunk=1)
+    final_prefill = _seq(1, 2, prefilled=0, chunk=2)
+    _set_scores_from_slot_rows(manager)
+    manager.evict_after_decode([active_decode])
+    # Post-forward state: this final prefill consumed the last physical slot.
+    manager._num_free_slots = [0, 0]
+    if not use_tensor_table:
+        manager.buffer_req_to_token_slots_tensor = None
+
+    manager.evict_after_prefill([final_prefill])
+
+    assert [lengths.tolist() for lengths in manager.row_seq_lens] == [
+        [4, 2],
+        [4, 2],
+    ]
+    _assert_scores_match_slot_rows(manager)
+    assert manager._num_free_slots == [1, 1]
+    assert manager._h2o_counters == {
+        "intermediate_prefill_evictions": 0,
+        "final_prefill_evictions": 0,
+        "decode_eviction_bursts": 1,
+        "decode_evictions": 2,
+        "dropped_tokens": 2,
+    }
+
+
+def test_h2o_decode_pressure_reclaims_unscheduled_active_row():
+    manager = _manager_with_rows(
+        [5, 4], decode_budget=4, decode_eviction_interval=3, prefill_budget=8
+    )
+    unscheduled = _seq(0, 5, prefilled=5, chunk=1)
+    scheduled = _seq(1, 4, prefilled=4, chunk=1)
+    _set_scores_from_slot_rows(manager)
+    manager.evict_after_decode([unscheduled])
+    manager._num_free_slots = [0]
+
+    manager.evict_after_decode([scheduled])
+
+    assert manager.row_seq_lens[0].tolist() == [4, 4]
+    assert manager.buffer_req_to_token_slots[0][0, :4].tolist() == [1, 2, 3, 4]
+    assert manager.buffer_req_to_token_slots[0][1, :4].tolist() == [100, 101, 102, 103]
+    assert manager._h2o_scores[(0, 0)].tolist() == [1.0, 2.0, 3.0, 4.0]
+    assert manager._h2o_scores[(0, 1)].tolist() == [100.0, 101.0, 102.0, 103.0]
+    assert manager._num_free_slots == [1]
+    assert manager._h2o_counters["decode_eviction_bursts"] == 1
     assert manager._h2o_counters["decode_evictions"] == 1
     assert manager._h2o_counters["dropped_tokens"] == 1
 
 
-def test_h2o_decode_ring_matches_ordered_token_sets_across_steps():
-    manager = _manager_with_rows([4], decode_budget=4, prefill_budget=8)
-    seq = _seq(0, 4, prefilled=0, chunk=4)
-    manager._h2o_scores[(0, 0)] = torch.tensor([10.0, 1.0, 5.0, 0.5])
-    manager.evict_after_prefill([seq])
-    assert manager._h2o_recent_cursors[(0, 0)] == 2
+def test_h2o_decode_without_pressure_leaves_unscheduled_row_until_interval():
+    manager = _manager_with_rows(
+        [5, 4], decode_budget=4, decode_eviction_interval=3, prefill_budget=8
+    )
+    unscheduled = _seq(0, 5, prefilled=5, chunk=1)
+    scheduled = _seq(1, 4, prefilled=4, chunk=1)
+    _set_scores_from_slot_rows(manager)
 
-    ordered_tokens = [0, 1, 2, 3]
-    score_by_token = {0: 10.0, 1: 1.0, 2: 5.0, 3: 0.5}
-    for token_slot, token_score in ((4, 9.0), (5, 8.0), (6, 7.0)):
-        score_by_token[token_slot] = token_score
-        ordered_with_new = ordered_tokens + [token_slot]
-        heavy_candidates = ordered_with_new[:3]
-        dropped_token = min(heavy_candidates, key=score_by_token.__getitem__)
-        ordered_tokens = [
-            token for token in ordered_with_new if token != dropped_token
+    manager.evict_after_decode([unscheduled])
+    assert manager._h2o_active_decode_seq_ids == {0}
+    manager.evict_after_decode([scheduled])
+
+    assert manager.row_seq_lens[0].tolist() == [5, 4]
+    assert manager._h2o_active_decode_seq_ids == {0, 1}
+    _assert_scores_match_slot_rows(manager)
+    assert manager._num_free_slots == [32]
+    assert manager._h2o_counters["decode_evictions"] == 0
+
+
+def test_h2o_decode_pressure_reclaims_all_unscheduled_rows_fast_and_fallback():
+    retained = []
+    for use_tensor_table in (True, False):
+        manager = _manager_with_layer_rows(
+            [[5, 6, 4], [5, 6, 4]],
+            decode_budget=4,
+            decode_eviction_interval=3,
+            prefill_budget=8,
+        )
+        seqs = [
+            _seq(0, 5, prefilled=5, chunk=1),
+            _seq(1, 6, prefilled=6, chunk=1),
+            _seq(2, 4, prefilled=4, chunk=1),
         ]
-
-        _append_ring_token(
-            manager,
-            0,
-            0,
-            token_slot=token_slot,
-            token_score=token_score,
-        )
-        manager.evict_after_decode([seq])
-
-        actual = _token_score_map(manager, 0, 0)
-        assert set(actual) == set(ordered_tokens)
-        assert actual == pytest.approx(
-            {token: score_by_token[token] for token in ordered_tokens}
-        )
-
-    assert manager._num_free_slots[0] == 35
-    assert manager._h2o_ring_counters == {"fast_rows": 3, "fallback_rows": 0}
-
-
-def test_h2o_decode_ring_ties_are_deterministic_across_fast_and_fallback():
-    retained_sets = []
-    for use_fast_path in (True, False):
-        manager = _manager_with_rows([5], decode_budget=4, prefill_budget=8)
-        seq = _seq(0, 5, prefilled=5, chunk=1)
-        manager._h2o_scores[(0, 0)] = torch.tensor([1.0, 1.0, 1.0, 8.0, 9.0])
-        if not use_fast_path:
+        _set_scores_from_slot_rows(manager)
+        manager.evict_after_decode(seqs[:2])
+        manager._num_free_slots = [0, 1]
+        if not use_tensor_table:
             manager.buffer_req_to_token_slots_tensor = None
 
-        manager.evict_after_decode([seq])
-        retained = set(_token_score_map(manager, 0, 0))
-        retained_sets.append(retained)
+        manager.evict_after_decode([seqs[2]])
 
-        assert len(retained) == 4
-        assert {3, 4}.issubset(retained)
-        assert len(retained.intersection({0, 1, 2})) == 2
+        retained.append(
+            [
+                manager.buffer_req_to_token_slots[layer_idx][seq_id, :4].tolist()
+                for layer_idx in range(2)
+                for seq_id in range(3)
+            ]
+        )
+        assert [lengths.tolist() for lengths in manager.row_seq_lens] == [
+            [4, 4, 4],
+            [4, 4, 4],
+        ]
+        _assert_scores_match_slot_rows(manager)
+        assert manager._num_free_slots == [3, 4]
+        assert manager._h2o_counters == {
+            "intermediate_prefill_evictions": 0,
+            "final_prefill_evictions": 0,
+            "decode_eviction_bursts": 2,
+            "decode_evictions": 4,
+            "dropped_tokens": 6,
+        }
 
-    assert retained_sets[0] == retained_sets[1]
+    assert retained[0] == retained[1]
 
 
-def test_h2o_decode_ring_handles_mixed_short_and_mature_batch():
+def test_h2o_decode_pressure_does_not_compact_idle_chain_row():
+    manager = _manager_with_rows(
+        [5, 4], decode_budget=4, decode_eviction_interval=3, prefill_budget=8
+    )
+    idle = _seq(0, 5, prefilled=5, chunk=1)
+    scheduled = _seq(1, 4, prefilled=4, chunk=1)
+    _set_scores_from_slot_rows(manager)
+    manager.evict_after_decode([idle])
+    assert manager._h2o_active_decode_seq_ids == {0}
+    manager.on_chain_turn_finished(0, processed_token_count=5)
+    assert manager._h2o_active_decode_seq_ids == set()
+    manager._num_free_slots = [0]
+
+    manager.evict_after_decode([scheduled])
+
+    assert manager.row_seq_lens[0].tolist() == [5, 4]
+    _assert_scores_match_slot_rows(manager)
+    assert manager._num_free_slots == [0]
+    assert manager._h2o_counters["decode_evictions"] == 0
+
+
+def test_h2o_decode_fallback_matches_cross_layer_batch_fast_path_with_ties():
+    retained = []
+    for use_tensor_table in (True, False):
+        manager = _manager_with_layer_rows(
+            [[7, 7], [7, 7]],
+            decode_budget=4,
+            decode_eviction_interval=3,
+            prefill_budget=8,
+        )
+        seqs = [
+            _seq(0, 7, prefilled=7, chunk=1),
+            _seq(1, 7, prefilled=7, chunk=1),
+        ]
+        for layer_idx in range(2):
+            for seq_id in range(2):
+                manager._h2o_scores[(layer_idx, seq_id)] = torch.tensor(
+                    [1.0, 1.0, 1.0, 1.0, 1.0, 8.0, 9.0]
+                )
+        if not use_tensor_table:
+            manager.buffer_req_to_token_slots_tensor = None
+
+        manager.evict_after_decode(seqs)
+
+        retained.append(
+            [
+                manager.buffer_req_to_token_slots[layer_idx][seq_id, :4].tolist()
+                for layer_idx in range(2)
+                for seq_id in range(2)
+            ]
+        )
+        assert manager._h2o_counters["decode_eviction_bursts"] == 2
+        assert manager._h2o_counters["decode_evictions"] == 4
+        assert manager._h2o_counters["dropped_tokens"] == 12
+
+    assert retained[0] == retained[1]
+
+
+def test_h2o_decode_mixed_batch_only_compacts_triggered_sequence():
     manager = _manager_with_layer_rows(
-        [[5, 3], [5, 3]], decode_budget=4, prefill_budget=8
+        [[7, 6], [7, 6]],
+        decode_budget=4,
+        decode_eviction_interval=3,
+        prefill_budget=8,
     )
     seqs = [
-        _seq(0, 5, prefilled=5, chunk=1),
-        _seq(1, 3, prefilled=3, chunk=1),
+        _seq(0, 7, prefilled=7, chunk=1),
+        _seq(1, 6, prefilled=6, chunk=1),
     ]
     _set_scores_from_slot_rows(manager)
 
     manager.evict_after_decode(seqs)
 
-    assert [lengths.tolist() for lengths in manager.row_seq_lens] == [[4, 3], [4, 3]]
+    assert [lengths.tolist() for lengths in manager.row_seq_lens] == [[4, 6], [4, 6]]
     _assert_scores_match_slot_rows(manager)
-    assert set(manager._h2o_recent_cursors) == {(0, 0), (1, 0)}
-    assert manager._h2o_ring_counters == {"fast_rows": 2, "fallback_rows": 0}
-    assert manager._num_free_slots == [33, 33]
+    assert manager._num_free_slots == [35, 35]
+    assert manager._h2o_counters["decode_eviction_bursts"] == 1
+    assert manager._h2o_counters["decode_evictions"] == 2
+    assert manager._h2o_counters["dropped_tokens"] == 6
 
 
-def test_h2o_decode_ring_survives_sequence_reorder_and_temporary_absence():
-    manager = _manager_with_rows([4, 4], decode_budget=4, prefill_budget=8)
-    seq0 = _seq(0, 4, prefilled=0, chunk=4)
-    seq1 = _seq(1, 4, prefilled=0, chunk=4)
+def test_h2o_decode_sequence_reorder_and_temporary_absence_are_independent():
+    manager = _manager_with_rows(
+        [4, 4], decode_budget=4, decode_eviction_interval=3, prefill_budget=8
+    )
+    seq0 = _seq(0, 7, prefilled=7, chunk=1)
+    seq1 = _seq(1, 7, prefilled=7, chunk=1)
     _set_scores_from_slot_rows(manager)
-    manager.evict_after_prefill([seq0, seq1])
 
-    _append_ring_token(manager, 0, 1, token_slot=1_000, token_score=1_000.0)
-    manager.evict_after_decode([seq1])
-    assert manager._h2o_recent_cursors[(0, 0)] == 2
-    assert manager._h2o_recent_cursors[(0, 1)] == 3
+    for slot in (1_000, 1_001):
+        _append_decode_token(manager, 0, 1, token_slot=slot, token_score=float(slot))
+        manager.evict_after_decode([seq1])
+    assert manager.row_seq_lens[0].tolist() == [4, 6]
 
-    _append_ring_token(manager, 0, 0, token_slot=2_000, token_score=2_000.0)
-    manager.evict_after_decode([seq0])
-    assert manager._h2o_recent_cursors[(0, 0)] == 3
+    for slot in (2_000, 2_001, 2_002):
+        _append_decode_token(manager, 0, 0, token_slot=slot, token_score=float(slot))
+        manager.evict_after_decode([seq0])
+    assert manager.row_seq_lens[0].tolist() == [4, 6]
 
-    _append_ring_token(manager, 0, 1, token_slot=3_000, token_score=3_000.0)
-    _append_ring_token(manager, 0, 0, token_slot=4_000, token_score=4_000.0)
+    _append_decode_token(manager, 0, 1, token_slot=1_002, token_score=1_002.0)
     manager.evict_after_decode([seq1, seq0])
 
-    assert manager._h2o_recent_cursors == {(0, 0): 2, (0, 1): 2}
+    assert manager.row_seq_lens[0].tolist() == [4, 4]
     _assert_scores_match_slot_rows(manager)
-    active_slots = []
-    for row_idx, row_len in enumerate(manager.row_seq_lens[0]):
-        active_slots.extend(
-            manager.buffer_req_to_token_slots[0][row_idx, : int(row_len)].tolist()
-        )
-    assert len(active_slots) == len(set(active_slots))
-    assert manager._num_free_slots[0] == 36
-
-
-def test_h2o_prefill_cursor_lifecycle_initializes_and_clears_by_phase():
-    manager = _manager_with_rows([4], decode_budget=4, prefill_budget=8)
-    seq = _seq(0, 4, prefilled=0, chunk=4)
-    _set_scores_from_slot_rows(manager)
-
-    manager.evict_after_prefill([seq])
-    assert manager._h2o_recent_cursors == {(0, 0): 2}
-
-    seq.token_ids.extend(range(4, 10))
-    seq.num_prompt_tokens = 10
-    seq.num_tokens = 10
-    seq.num_prefilled_tokens = 4
-    seq.current_chunk_size = 1
-    manager.evict_after_prefill([seq])
-    assert manager._h2o_recent_cursors == {}
+    assert manager._h2o_counters["decode_eviction_bursts"] == 2
+    assert manager._num_free_slots[0] == 38
 
 
 def test_h2o_controller_consumes_snapkv_style_normalized_decode_scores():
@@ -1168,6 +1337,69 @@ def test_h2o_prepare_uses_one_contiguous_snapkv_style_buffer_for_all_kv_layers()
     )
     assert resolved_layers == [0, 1]
     assert resolved.data_ptr() == backing.data_ptr()
+
+
+def test_h2o_aligned_graph_score_workspace_routes_mla_call_to_tilelang():
+    manager = SimpleNamespace(
+        device=torch.device("cpu"),
+        _decode_static_max_context_len=64,
+    )
+    config = SimpleNamespace(
+        vllm_sparse_method="h2o",
+        obs_layer_ids=[],
+        full_attn_layers=[],
+        runtime_layout=_layout(),
+        hf_config=SimpleNamespace(
+            num_hidden_layers=1,
+            hidden_size=2,
+            num_attention_heads=2,
+            head_dim=1,
+            torch_dtype=torch.float32,
+        ),
+        tensor_parallel_size=1,
+        num_sink_tokens=0,
+        num_recent_tokens=0,
+        decode_keep_tokens=4,
+        sparse_attn_score_dtype="float32",
+        decode_cuda_graph=True,
+    )
+    controller = SparseController(config, manager)
+    state = controller.layer_batch_sparse_states[0]
+    state.context_lens = torch.tensor([4], dtype=torch.int32)
+    state.max_context_len = 4
+    controller._prepare_h2o_decode_attn_score_buffer(
+        [_seq(0, 4, prefilled=4, chunk=1)]
+    )
+    score = state.attn_score
+    assert score is not None
+    assert score.shape == (1, 64)
+
+    payload = MlaLatentPayload(
+        latent_cache=torch.empty(64, 1, 512),
+        rope_cache=torch.empty(64, 1, 64),
+    )
+    view = DecodeComputeView(
+        meta=AttentionViewMeta(
+            active_slots=torch.zeros((1, 64), dtype=torch.int32),
+            req_indices=torch.zeros(1, dtype=torch.int32),
+            context_lens=torch.tensor([4], dtype=torch.int32),
+            max_context_len=4,
+            attn_score=score,
+        ),
+        payload=payload,
+    )
+    q_nope = torch.empty(1, 1, 512)
+    q_rope = torch.empty(1, 1, 64)
+    output = torch.empty_like(q_nope)
+    provider = object.__new__(MlaTileLangScoreProvider)
+    provider.tilelang_score = Mock(return_value=output)
+    provider._validate_run_inputs = Mock(return_value=payload)
+    provider._validate_metadata = Mock()
+
+    actual = provider.run(q_nope, q_rope, view, output)
+
+    assert actual is output
+    provider.tilelang_score.assert_called_once()
 
 
 def test_h2o_layer_end_normalizes_the_fused_2d_score_in_place():
@@ -1485,50 +1717,50 @@ def test_h2o_contiguous_decode_buffer_handles_padded_graph_batch_and_low_dtype()
 def test_h2o_free_seq_cleans_score_vectors():
     manager = _manager_with_rows([2])
     manager._h2o_scores[(0, 0)] = torch.ones(2)
-    manager._h2o_recent_cursors[(0, 0)] = 1
+    manager._h2o_active_decode_seq_ids.add(0)
     with patch.object(SnapKVCacheManager, "free_seq", autospec=True) as parent_free:
         manager.free_seq(0)
     assert manager._h2o_scores == {}
-    assert manager._h2o_recent_cursors == {}
+    assert manager._h2o_active_decode_seq_ids == set()
     parent_free.assert_called_once_with(manager, 0)
 
 
-def test_h2o_chain_turn_retains_score_and_cursor_until_reclaimed():
+def test_h2o_chain_turn_retains_score_until_reclaimed():
     manager = _manager_with_rows([4])
     manager._h2o_scores[(0, 0)] = torch.arange(4, dtype=torch.float32)
-    manager._h2o_recent_cursors[(0, 0)] = 2
+    manager._h2o_active_decode_seq_ids.add(0)
 
     manager.on_chain_turn_finished(0, processed_token_count=100)
 
     assert manager._h2o_scores[(0, 0)].tolist() == [0.0, 1.0, 2.0, 3.0]
-    assert manager._h2o_recent_cursors == {(0, 0): 2}
+    assert manager._h2o_active_decode_seq_ids == set()
     assert manager.chain_physical_residency(0) == (4,)
 
 
 def test_h2o_reset_after_warmup_clears_scores_and_counters():
     manager = _manager_with_rows([2])
     manager._h2o_scores[(0, 0)] = torch.ones(2)
-    manager._h2o_recent_cursors[(0, 0)] = 1
+    manager._h2o_active_decode_seq_ids.add(0)
     manager._h2o_counters.update(
         {
             "intermediate_prefill_evictions": 1,
             "final_prefill_evictions": 2,
+            "decode_eviction_bursts": 2,
             "decode_evictions": 3,
             "dropped_tokens": 4,
         }
     )
-    manager._h2o_ring_counters.update({"fast_rows": 5, "fallback_rows": 6})
 
     manager.reset_after_warmup()
     assert manager._h2o_scores == {}
-    assert manager._h2o_recent_cursors == {}
+    assert manager._h2o_active_decode_seq_ids == set()
     assert manager._h2o_counters == {
         "intermediate_prefill_evictions": 0,
         "final_prefill_evictions": 0,
+        "decode_eviction_bursts": 0,
         "decode_evictions": 0,
         "dropped_tokens": 0,
     }
-    assert manager._h2o_ring_counters == {"fast_rows": 0, "fallback_rows": 0}
 
 
 def test_h2o_capacity_hooks_reserve_prefill_peak_and_gate_chunk_with_real_free_slots():
@@ -1547,7 +1779,13 @@ def test_h2o_capacity_hooks_reserve_prefill_peak_and_gate_chunk_with_real_free_s
         [seq],
         requested_context_capacity=128,
         current_context_capacity=64,
-    ) == (5, False)
+    ) == (7, False)
+    manager.config.max_model_len = 6
+    assert manager.decode_cuda_graph_context_capacity(
+        [seq],
+        requested_context_capacity=128,
+        current_context_capacity=64,
+    ) == (6, False)
 
     scheduler_config = SimpleNamespace(
         max_num_seqs_in_batch=4,
@@ -1567,6 +1805,19 @@ def test_h2o_capacity_hooks_reserve_prefill_peak_and_gate_chunk_with_real_free_s
     assert is_prefill
     assert scheduled == [seq]
     assert seq.current_chunk_size == 4
+
+
+def test_h2o_reserved_prefill_slots_keeps_over_budget_resume_headroom():
+    manager = _manager_with_rows(
+        [6],
+        decode_budget=4,
+        decode_eviction_interval=3,
+        prefill_budget=4,
+        chunk_prefill_size=4,
+    )
+    seq = _seq(0, 110, prefilled=100, chunk=0)
+
+    assert manager.reserved_prefill_slots(deque([seq]), 4) == 4
 
 
 def test_h2o_scheduler_does_not_admit_partial_prefills_that_fill_all_slots():
@@ -1664,9 +1915,8 @@ def test_h2o_scheduler_reserves_until_first_prefill_eviction_peak():
 def test_h2o_debug_summary_exposes_auditable_eviction_counters():
     manager = _manager_with_rows([2])
     manager._h2o_scores[(0, 0)] = torch.ones(2)
-    manager._h2o_recent_cursors[(0, 0)] = 1
     with patch.object(SnapKVCacheManager, "debug_state_summary", return_value={"live_rows": {}}):
         summary = manager.debug_state_summary()
     assert summary["h2o"]["counters"]["dropped_tokens"] == 0
+    assert summary["h2o"]["counters"]["decode_eviction_bursts"] == 0
     assert summary["h2o"]["score_lengths"] == {"0:0": 2}
-    assert summary["h2o"]["recent_cursors"] == {"0:0": 1}

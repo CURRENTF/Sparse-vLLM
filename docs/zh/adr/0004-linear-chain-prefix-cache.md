@@ -24,7 +24,7 @@ Chain 实现与 `RadixPrefixIndex` 完全独立：
   digest、紧凑的 driver-side 逻辑 token 历史、严格的 IDLE-only LRU metadata
   以及有界 tombstone。
 - `ChainCacheCoordinator` 只负责逻辑协调。
-- Cache manager 负责 KV row、物理 slot、H2O score/cursor state、R-KV
+- Cache manager 负责 KV row、物理 slot、H2O 累计 score state、R-KV
   query、SkipKV sentence state 以及其他所有方法 metadata。
 - `RuntimeState` 是 payload 回收入口。
 

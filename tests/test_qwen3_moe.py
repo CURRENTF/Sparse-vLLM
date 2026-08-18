@@ -1,6 +1,6 @@
 from contextlib import ExitStack
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -11,11 +11,13 @@ from sparsevllm.config import QuantizationConfig
 from sparsevllm.distributed import ParallelContext, ParallelGroup
 from sparsevllm.layers.layernorm import RMSNorm
 from sparsevllm.models.qwen3 import Qwen3Attention
+from sparsevllm.models.qwen3 import build_qwen3_prefill_attention_op
 from sparsevllm.models.qwen3_moe import (
     Qwen3MoeForCausalLM,
     Qwen3MoePackedExperts,
     Qwen3MoeSparseMoeBlock,
 )
+from sparsevllm.operators.attention_capabilities import AttentionScoreKind
 from sparsevllm.operators.moe import (
     FlashInferCutlassFp8MoeProvider,
     TritonMoeProvider,
@@ -108,7 +110,7 @@ def _hybrid_context(world_rank: int) -> ParallelContext:
     )
 
 
-def _instantiate_model(config, context):
+def _instantiate_model(config, context, prefill_attention_op=None):
     with ExitStack() as stack:
         stack.enter_context(
             patch(
@@ -149,7 +151,86 @@ def _instantiate_model(config, context):
                     return_value=lambda *_args, **_kwargs: None,
                 )
             )
-        return Qwen3MoeForCausalLM(config)
+        return Qwen3MoeForCausalLM(
+            config,
+            prefill_attention_op=prefill_attention_op,
+        )
+
+
+@pytest.mark.parametrize(
+    ("tp_size", "expected_q_heads", "expected_kv_heads"),
+    [(1, 32, 4), (2, 16, 2)],
+)
+def test_qwen3_moe_builds_real_prefill_shape_spec(
+    tp_size,
+    expected_q_heads,
+    expected_kv_heads,
+):
+    config = _config(
+        hidden_size=2048,
+        num_attention_heads=32,
+        num_key_value_heads=4,
+        head_dim=128,
+    )
+    prepared = SimpleNamespace(name="prepared")
+    with patch(
+        "sparsevllm.models.attention_runtime.prepare_prefill_attention_op",
+        return_value=prepared,
+    ) as prepare:
+        actual = build_qwen3_prefill_attention_op(
+            config,
+            engine_config=SimpleNamespace(vllm_sparse_method=""),
+            parallel_context=_tp_context(0, tp_size),
+            device=torch.device("cuda", 0),
+        )
+
+    spec = prepare.call_args.args[0]
+    assert actual is prepared
+    assert spec.num_query_heads == expected_q_heads
+    assert spec.num_kv_heads == expected_kv_heads
+    assert spec.head_dim == 128
+    assert spec.page_size == 1
+    assert not spec.layer_varying_page_table
+    assert spec.score_output is AttentionScoreKind.NONE
+
+
+def test_qwen3_moe_shares_and_closes_prepared_prefill_operator():
+    prepared = SimpleNamespace(name="sgl_fa3", close=Mock())
+    model = _instantiate_model(
+        _config(num_hidden_layers=2),
+        _tp_context(0, 1),
+        prefill_attention_op=prepared,
+    )
+
+    assert all(
+        layer.self_attn.attn.prefill_op is prepared
+        for layer in model.model.layers
+    )
+    model.close_runtime_operators()
+    prepared.close.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+    "method",
+    ["snapkv", "h2o", "pyramidkv", "omnikv", "quest", "rkv", "deltakv"],
+)
+def test_qwen3_sparse_methods_use_resolved_prefill_provider(method):
+    prepared = SimpleNamespace(name="prepared")
+    with patch(
+        "sparsevllm.models.attention_runtime.prepare_prefill_attention_op",
+        return_value=prepared,
+    ) as prepare:
+        actual = build_qwen3_prefill_attention_op(
+            _config(),
+            engine_config=SimpleNamespace(vllm_sparse_method=method),
+            parallel_context=_tp_context(0, 1),
+            device=torch.device("cuda", 0),
+        )
+
+    assert actual is prepared
+    spec = prepare.call_args.args[0]
+    assert spec.score_output is AttentionScoreKind.NONE
+    assert spec.layer_varying_page_table
 
 
 def _rmsnorm_reference(

@@ -32,8 +32,7 @@ MAX_JOBS=8 uv pip install flash-attn --no-build-isolation
 ```
 
 
-Use `cu129` instead of `cu130` for CUDA 12.9. The validated CUDA 12.9
-[dependency lock](../../../requirements/locks/README.md) is optional.
+Use `cu129` instead of `cu130` for CUDA 12.9.
 
 `einops`, `sglang-kernel`, and the training, benchmark, and test packages are all
 runtime dependencies, so workflow-specific extras are not required.

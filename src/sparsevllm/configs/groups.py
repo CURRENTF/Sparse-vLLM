@@ -59,6 +59,7 @@ class SparseMethodConfig:
     snapkv_num_full_layers: int = 0
 
     h2o_decode_budget: int = 4096
+    h2o_decode_eviction_interval: int = 128
     h2o_prefill_budget: int = 8192
     h2o_recent_ratio: float = 0.5
     h2o_prefill_score_window: int = 128

@@ -124,6 +124,31 @@ def sgl_fa3_support() -> tuple[bool, str]:
     return True, reason
 
 
+def sgl_fa3_device_support(device_index: int) -> tuple[bool, str]:
+    """Run the package/ABI probe and SGL's low-level device probe lazily."""
+
+    supported, reason = sgl_fa3_support()
+    if not supported:
+        return supported, reason
+    try:
+        from sgl_kernel.flash_attn import is_fa3_supported
+
+        device_supported = bool(
+            is_fa3_supported(torch.device("cuda", int(device_index)))
+        )
+    except Exception as error:
+        return False, (
+            "sglang-kernel FA3 device probe failed: "
+            f"{type(error).__name__}: {error}"
+        )
+    if not device_supported:
+        return False, (
+            "sglang-kernel reports FA3 unsupported on "
+            f"cuda:{int(device_index)}"
+        )
+    return True, reason
+
+
 class SglFa3DecodeKernel:
     """Allocation-free GLM MLA decode adapter for the SGL FA3 raw op."""
 
@@ -482,4 +507,8 @@ class SglFa3DecodeKernel:
         return output
 
 
-__all__ = ["SglFa3DecodeKernel", "sgl_fa3_support"]
+__all__ = [
+    "SglFa3DecodeKernel",
+    "sgl_fa3_device_support",
+    "sgl_fa3_support",
+]

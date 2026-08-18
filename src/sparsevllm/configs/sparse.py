@@ -61,11 +61,22 @@ def _normalize_quest(config) -> None:
 
 def _normalize_h2o(config) -> None:
     _normalize_positive_int(config, "h2o_decode_budget", fallback=0)
+    _normalize_positive_int(config, "h2o_decode_eviction_interval", fallback=0)
     _normalize_int_attr(config, "h2o_prefill_budget", fallback=0)
     if config.h2o_prefill_budget < config.h2o_decode_budget:
         raise ValueError(
             "h2o_prefill_budget must be >= h2o_decode_budget, "
             f"got prefill={config.h2o_prefill_budget} decode={config.h2o_decode_budget}."
+        )
+    decode_peak = (
+        config.h2o_decode_budget + config.h2o_decode_eviction_interval
+    )
+    if decode_peak % 64 != 0:
+        raise ValueError(
+            "h2o_decode_budget + h2o_decode_eviction_interval must be "
+            "divisible by 64 for the scored decode kernel, "
+            f"got {config.h2o_decode_budget} + "
+            f"{config.h2o_decode_eviction_interval} = {decode_peak}."
         )
     _normalize_float_attr(config, "h2o_recent_ratio")
     if not 0.0 < config.h2o_recent_ratio < 1.0:

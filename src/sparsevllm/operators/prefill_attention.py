@@ -10,13 +10,23 @@ from typing import Any
 import torch
 
 import sparsevllm.platforms as platforms
+from sparsevllm.kernels.external.sgl.fa3 import (
+    SglFa3DecodeKernel,
+    sgl_fa3_device_support,
+)
+from sparsevllm.operators.attention_capabilities import (
+    AttentionKernelCapabilities,
+    AttentionKernelRequest,
+    AttentionScoreKind,
+    match_attention_capabilities,
+)
 from sparsevllm.operators.registry import (
     OpRegistry,
     OpResolver,
     SupportResult,
-    runtime_version_at_least,
 )
 from sparsevllm.platforms.interface import DeviceCaps, PlatformEnum
+from sparsevllm.utils.log import logger
 
 
 @dataclass(frozen=True)
@@ -28,8 +38,10 @@ class PrefillAttentionOpSpec:
     softmax_scale: float
     causal: bool = True
     page_size: int = 1
-    requires_attention_scores: bool = False
-    layer_invariant_page_table: bool = False
+    score_output: AttentionScoreKind = AttentionScoreKind.NONE
+    layer_varying_page_table: bool = False
+    varlen: bool = True
+    cuda_graph: bool = False
 
     def __post_init__(self) -> None:
         if self.num_query_heads <= 0 or self.num_kv_heads <= 0:
@@ -41,10 +53,23 @@ class PrefillAttentionOpSpec:
         if self.softmax_scale <= 0:
             raise ValueError("Prefill attention softmax_scale must be positive.")
 
+    @property
+    def kernel_request(self) -> AttentionKernelRequest:
+        return AttentionKernelRequest(
+            activation_dtype=self.activation_dtype,
+            head_dim=self.head_dim,
+            page_size=self.page_size,
+            score_output=self.score_output,
+            layer_varying_page_table=self.layer_varying_page_table,
+            varlen=self.varlen,
+            cuda_graph=self.cuda_graph,
+        )
+
 
 class PrefillAttentionProvider:
     name = ""
     priority = 0
+    capabilities: AttentionKernelCapabilities
 
     def prepare(
         self,
@@ -95,32 +120,50 @@ def _view_parts(view: Any) -> tuple[Any, Any]:
     return getattr(view, "payload", view), getattr(view, "meta", view)
 
 
+def _view_score_kind(view: Any) -> AttentionScoreKind:
+    _, meta = _view_parts(view)
+    score = meta.attn_score
+    if score is None:
+        return AttentionScoreKind.NONE
+    if score.ndim == 3:
+        return AttentionScoreKind.RAW_QK_PER_HEAD
+    if score.ndim == 2:
+        return AttentionScoreKind.RAW_QK_REDUCED
+    raise ValueError(
+        "Prefill attention score must have shape [batch, heads, tokens] or "
+        f"[batch, tokens], got {tuple(score.shape)}."
+    )
+
+
 @PREFILL_ATTENTION_REGISTRY.register
 class FlashInferPagedPrefillAttentionProvider(PrefillAttentionProvider):
     name = "flashinfer_paged_prefill_fa3_sm90"
     priority = 100
+    capabilities = AttentionKernelCapabilities(
+        platforms=frozenset({PlatformEnum.CUDA}),
+        compute_capabilities=frozenset({(9, 0)}),
+        activation_dtypes=frozenset({torch.bfloat16}),
+        head_dims=frozenset({128}),
+        page_sizes=frozenset({1}),
+        score_outputs=frozenset({AttentionScoreKind.NONE}),
+        layer_varying_page_table=False,
+        varlen=True,
+        minimum_runtime_version=(12, 8),
+    )
 
     @classmethod
     def supports(
         cls, spec: PrefillAttentionOpSpec, caps: DeviceCaps
     ) -> SupportResult:
-        if caps.platform != PlatformEnum.CUDA or caps.compute_capability != (9, 0):
-            return SupportResult.no(
-                f"requires CUDA SM90, got {caps.platform.name} {caps.compute_capability}"
-            )
+        common = match_attention_capabilities(
+            spec.kernel_request, caps, cls.capabilities
+        )
+        if not common.supported:
+            return common
         if caps.device_name != "NVIDIA H100 80GB HBM3":
             return SupportResult.no(
                 "requires profiled NVIDIA H100 80GB HBM3 hardware, "
                 f"got {caps.device_name}"
-            )
-        if not runtime_version_at_least(caps.runtime_version, (12, 8)):
-            return SupportResult.no(
-                "requires CUDA runtime >= 12.8, "
-                f"got {caps.runtime_version or 'unknown'}"
-            )
-        if spec.activation_dtype != torch.bfloat16:
-            return SupportResult.no(
-                f"requires BF16 Q/K/V, got {spec.activation_dtype}"
             )
         expected_shape = (12, 2, 128)
         actual_shape = (
@@ -134,14 +177,6 @@ class FlashInferPagedPrefillAttentionProvider(PrefillAttentionProvider):
             )
         if not spec.causal:
             return SupportResult.no("requires causal attention")
-        if spec.page_size != 1:
-            return SupportResult.no(
-                f"requires token-page KV storage (page_size=1), got {spec.page_size}"
-            )
-        if spec.requires_attention_scores:
-            return SupportResult.no("does not produce per-token attention scores")
-        if not spec.layer_invariant_page_table:
-            return SupportResult.no("requires one page table shared across model layers")
         if find_spec("flashinfer") is None:
             return SupportResult.no("flashinfer is not installed")
         try:
@@ -195,7 +230,7 @@ class FlashInferPagedPrefillAttentionProvider(PrefillAttentionProvider):
         payload, meta = _view_parts(view)
         _validate_token_page_table(meta)
         if self._state is None:
-            self.prepare(spec, device_index=q.device.index)
+            raise RuntimeError("FlashInfer prefill provider was not prepared.")
         state = self._state
         assert state is not None
         if q.dtype != spec.activation_dtype:
@@ -206,11 +241,6 @@ class FlashInferPagedPrefillAttentionProvider(PrefillAttentionProvider):
             raise TypeError(
                 "FlashInfer paged prefill requires Q/K/V with the same dtype, got "
                 f"{q.dtype}/{payload.k_cache.dtype}/{payload.v_cache.dtype}."
-            )
-        if meta.attn_score is not None:
-            raise RuntimeError(
-                "FlashInfer paged prefill was selected for a view that requires "
-                "per-token attention scores."
             )
         if layer_idx == 0:
             state.plan(
@@ -318,30 +348,148 @@ class _FlashInferPagedPrefillState:
 
 
 @PREFILL_ATTENTION_REGISTRY.register
-class TritonPagedPrefillAttentionProvider(PrefillAttentionProvider):
-    name = "triton_paged_prefill"
-    priority = 10
+class SglFa3PagedPrefillAttentionProvider(PrefillAttentionProvider):
+    """SGL FA3 over Sparse-vLLM's page-size-one physical KV table."""
+
+    name = "sgl_fa3_paged_prefill_sm90"
+    priority = 200
+    capabilities = AttentionKernelCapabilities(
+        platforms=frozenset({PlatformEnum.CUDA}),
+        compute_capabilities=frozenset({(9, 0)}),
+        activation_dtypes=frozenset({torch.bfloat16}),
+        head_dims=frozenset({128}),
+        page_sizes=frozenset({1}),
+        score_outputs=frozenset({AttentionScoreKind.NONE}),
+        layer_varying_page_table=True,
+        varlen=True,
+        minimum_runtime_version=(12, 3),
+    )
 
     @classmethod
     def supports(
         cls, spec: PrefillAttentionOpSpec, caps: DeviceCaps
     ) -> SupportResult:
-        if caps.platform not in {PlatformEnum.CUDA, PlatformEnum.ROCM}:
-            return SupportResult.no(f"requires a GPU platform, got {caps.platform.name}")
-        if not caps.supports_triton:
-            return SupportResult.no("platform does not support Triton")
-        if spec.activation_dtype not in {torch.bfloat16, torch.float16}:
-            return SupportResult.no(
-                f"requires BF16 or FP16 Q/K/V, got {spec.activation_dtype}"
-            )
-        if spec.head_dim not in {16, 32, 64, 128, 256}:
-            return SupportResult.no(f"unsupported head_dim={spec.head_dim}")
+        common = match_attention_capabilities(
+            spec.kernel_request, caps, cls.capabilities
+        )
+        if not common.supported:
+            return common
         if not spec.causal:
-            return SupportResult.no("legacy Triton prefill requires causal attention")
-        if spec.page_size != 1:
-            return SupportResult.no(
-                f"legacy Triton prefill requires page_size=1, got {spec.page_size}"
+            return SupportResult.no("requires causal attention")
+        supported, reason = sgl_fa3_device_support(caps.device_index)
+        return SupportResult.yes(reason) if supported else SupportResult.no(reason)
+
+    def __init__(self) -> None:
+        self._kernel: SglFa3DecodeKernel | None = None
+        self._query_plan_scope: object | None = None
+        self._max_query_len = 0
+
+    def prepare(
+        self,
+        spec: PrefillAttentionOpSpec,
+        *,
+        device_index: int | None = None,
+    ) -> None:
+        if self._kernel is not None:
+            return
+        current_device = torch.cuda.current_device()
+        if device_index is None:
+            device_index = current_device
+        if int(device_index) != current_device:
+            raise RuntimeError(
+                "SGL FA3 prefill must be prepared on the selected CUDA device: "
+                f"selected={device_index} current={current_device}."
             )
+        self._kernel = SglFa3DecodeKernel(
+            device=torch.device("cuda", int(device_index)),
+            # Explicit prefill supplies its own cu_seqlens_q. The decode-only
+            # buffer capacity is therefore intentionally unused by this provider.
+            max_batch_size=1,
+            softmax_scale=spec.softmax_scale,
+        )
+
+    def close(self) -> None:
+        self._kernel = None
+        self._query_plan_scope = None
+        self._max_query_len = 0
+
+    def run(
+        self,
+        spec,
+        q,
+        view,
+        *,
+        qo_indptr,
+        chunk_lens,
+        max_context_len,
+        layer_idx,
+    ):
+        del max_context_len, layer_idx
+        payload, meta = _view_parts(view)
+        _validate_token_page_table(meta)
+        if self._kernel is None:
+            raise RuntimeError("SGL FA3 prefill provider was not prepared.")
+        kernel = self._kernel
+        assert kernel is not None
+        if q.dtype != spec.activation_dtype:
+            raise TypeError(
+                f"SGL FA3 paged prefill expected {spec.activation_dtype} Q, got {q.dtype}."
+            )
+        if payload.k_cache.dtype != q.dtype or payload.v_cache.dtype != q.dtype:
+            raise TypeError(
+                "SGL FA3 paged prefill requires Q/K/V with the same dtype, got "
+                f"{q.dtype}/{payload.k_cache.dtype}/{payload.v_cache.dtype}."
+            )
+        if qo_indptr.dtype != torch.int32 or chunk_lens.dtype != torch.int32:
+            raise TypeError("SGL FA3 paged prefill requires int32 sequence metadata.")
+
+        from sparsevllm.utils.context import get_context
+
+        validation_scope = get_context().attention_validation_scope
+        if self._query_plan_scope is not validation_scope:
+            self._max_query_len = int(chunk_lens.max().item())
+            self._query_plan_scope = validation_scope
+        output = torch.empty_like(q)
+        return kernel.run_explicit_varlen(
+            q,
+            payload.k_cache,
+            payload.v_cache,
+            meta.active_slots,
+            meta.req_indices,
+            meta.context_lens,
+            output,
+            cu_seqlens_q=qo_indptr,
+            max_seqlen_q=self._max_query_len,
+            validation_scope=validation_scope,
+        )
+
+
+@PREFILL_ATTENTION_REGISTRY.register
+class TritonPagedPrefillAttentionProvider(PrefillAttentionProvider):
+    name = "triton_paged_prefill"
+    priority = 10
+    capabilities = AttentionKernelCapabilities(
+        platforms=frozenset({PlatformEnum.CUDA, PlatformEnum.ROCM}),
+        activation_dtypes=frozenset({torch.bfloat16, torch.float16}),
+        head_dims=frozenset({16, 32, 64, 128, 256}),
+        page_sizes=frozenset({1}),
+        score_outputs=frozenset(AttentionScoreKind),
+        layer_varying_page_table=True,
+        varlen=True,
+        requires_triton=True,
+    )
+
+    @classmethod
+    def supports(
+        cls, spec: PrefillAttentionOpSpec, caps: DeviceCaps
+    ) -> SupportResult:
+        common = match_attention_capabilities(
+            spec.kernel_request, caps, cls.capabilities
+        )
+        if not common.supported:
+            return common
+        if not spec.causal:
+            return SupportResult.no("Triton prefill requires causal attention")
         expected_scale = spec.head_dim**-0.5
         if not math.isclose(
             spec.softmax_scale,
@@ -350,7 +498,7 @@ class TritonPagedPrefillAttentionProvider(PrefillAttentionProvider):
             abs_tol=0.0,
         ):
             return SupportResult.no(
-                "legacy Triton prefill requires the default head-dimension scale "
+                "Triton prefill requires the default head-dimension scale "
                 f"{expected_scale}, got {spec.softmax_scale}"
             )
         return SupportResult.yes()
@@ -399,7 +547,13 @@ def resolve_prefill_attention_provider(
     if device_index is None:
         device_index = torch.cuda.current_device() if platform.is_cuda_alike() else 0
     caps = platform.get_device_caps(int(device_index))
-    return OpResolver(PREFILL_ATTENTION_REGISTRY).resolve(spec, caps).provider
+    resolved = OpResolver(PREFILL_ATTENTION_REGISTRY).resolve(spec, caps)
+    logger.info(
+        "Resolved MHA prefill provider={} rejected={}",
+        resolved.provider.name,
+        dict(resolved.rejected),
+    )
+    return resolved.provider
 
 
 class PreparedPrefillAttentionOp:
@@ -421,6 +575,12 @@ class PreparedPrefillAttentionOp:
     def run(self, q, view, **kwargs):
         if self._closed:
             raise RuntimeError("Prefill attention operator is closed.")
+        actual_score = _view_score_kind(view)
+        if actual_score is not self.spec.score_output:
+            raise RuntimeError(
+                "Prefill attention view violates the resolved score contract: "
+                f"resolved={self.spec.score_output.name} actual={actual_score.name}."
+            )
         return self.provider.run(self.spec, q, view, **kwargs)
 
     def close(self) -> None:

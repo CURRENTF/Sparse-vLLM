@@ -403,19 +403,23 @@ class SparseController:
             self._state_max_context_len(self.layer_batch_sparse_states[layer_idx])
             for layer_idx in layer_indices
         )
-        if not bool(getattr(self.config, "decode_cuda_graph", False)):
-            return max_len
-        graph_capacity = getattr(
-            self.cache_manager,
-            "_decode_static_max_context_len",
-            None,
-        )
-        if graph_capacity is None or int(graph_capacity) < max_len:
-            raise RuntimeError(
-                "H2O decode CUDA graph requires a score capacity covering the "
-                f"current context: graph_capacity={graph_capacity} current={max_len}."
+        required_width = max_len
+        if bool(getattr(self.config, "decode_cuda_graph", False)):
+            graph_capacity = getattr(
+                self.cache_manager,
+                "_decode_static_max_context_len",
+                None,
             )
-        return int(graph_capacity)
+            if graph_capacity is None or int(graph_capacity) < max_len:
+                raise RuntimeError(
+                    "H2O decode CUDA graph requires a score capacity covering the "
+                    f"current context: graph_capacity={graph_capacity} current={max_len}."
+                )
+            required_width = int(graph_capacity)
+        # Graph capacities inherit the strict H2O budget-plus-interval
+        # alignment contract. Eager shapes stay exact; the MLA provider's
+        # static shape gate routes an unaligned score buffer to Triton.
+        return int(required_width)
 
     def _get_h2o_decode_score_buffer(
         self,

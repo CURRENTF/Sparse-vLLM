@@ -8,20 +8,17 @@ evidence, cite the original run artifact path.
 
 The README contains the current install command. The expected baseline is:
 
-- Python 3.10.
-- The complete runtime and test environment from
-  `requirements/locks/canonical-cu129-py310.txt`.
-- PyTorch 2.11.0 with the matching CUDA wheel and Triton 3.6.0.
-- `flashinfer-python==0.6.15.post1` and the CUDA 12.9 build of
-  `flashinfer-jit-cache==0.6.15.post1`.
-- `sglang-kernel==0.4.5` and `einops>=0.8.2` as runtime dependencies.
+- Python 3.10 or newer.
+- Install one CUDA extra from `pyproject.toml`: `cu129` or `cu130`.
+- Treat `pyproject.toml` as the current dependency contract; record the resolved
+  package versions with each experiment because the repository does not ship a
+  frozen environment lock.
 - Optional matching `flashinfer-cubin` installed from the generic FlashInfer
   wheel index when precompiled device binaries are desired.
-- `transformers==5.13.1`.
 - `flash-attn` installed with `MAX_JOBS=8 pip install flash-attn --no-build-isolation`.
-- Editable install from the repository root with `pip install --no-deps -e .`
-  after installing the lock. Training, benchmark, and test dependencies are
-  included in the main installation.
+- Editable install from the repository root with `pip install -e ".[cu129]"`
+  or `pip install -e ".[cu130]"`. Training, benchmark, and test dependencies
+  are included in the main installation.
 - Record the selected operator provider and CUDA compute capability. FP8
   providers are selected locally from device capabilities and do not download
   Hub kernels during warmup.

@@ -421,6 +421,7 @@ def _resolved_engine_config(llm) -> dict[str, Any]:
         "full_attn_layers",
         "obs_layer_ids",
         "h2o_decode_budget",
+        "h2o_decode_eviction_interval",
         "h2o_prefill_budget",
         "h2o_recent_ratio",
         "h2o_prefill_score_window",

@@ -13,6 +13,28 @@ from sparsevllm.layers.layernorm import RMSNorm
 from sparsevllm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
 from sparsevllm.layers.rotary_embedding import get_rope
 from sparsevllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
+from sparsevllm.models.attention_runtime import (
+    bind_mha_prefill_attention_op,
+    build_mha_prefill_attention_op,
+)
+from sparsevllm.operators.prefill_attention import PreparedPrefillAttentionOp
+
+
+def build_qwen3_prefill_attention_op(
+    config: Qwen3Config,
+    *,
+    engine_config,
+    parallel_context,
+    device: torch.device,
+) -> PreparedPrefillAttentionOp:
+    """Resolve the shared Qwen3 prefill operator before model execution."""
+
+    return build_mha_prefill_attention_op(
+        config,
+        sparse_method=engine_config.vllm_sparse_method,
+        attention_tp_size=parallel_context.attention_tp_size,
+        device=device,
+    )
 
 
 def _get_rope_theta(config: Qwen3Config) -> float:
@@ -332,15 +354,45 @@ class Qwen3ForCausalLM(nn.Module):
         "up_proj": ("gate_up_proj", 1),
     }
 
+    @staticmethod
+    def build_runtime_kwargs(
+        config: Qwen3Config,
+        *,
+        engine_config,
+        parallel_context,
+        device: torch.device,
+        **_,
+    ) -> dict:
+        return {
+            "prefill_attention_op": build_qwen3_prefill_attention_op(
+                config,
+                engine_config=engine_config,
+                parallel_context=parallel_context,
+                device=device,
+            )
+        }
+
     def __init__(
         self,
-        config: Qwen3Config
+        config: Qwen3Config,
+        prefill_attention_op: PreparedPrefillAttentionOp | None = None,
     ) -> None:
         super().__init__()
+        self.prefill_attention_op = prefill_attention_op
         self.model = Qwen3Model(config)
+        if prefill_attention_op is not None:
+            bind_mha_prefill_attention_op(self.model, prefill_attention_op)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if config.tie_word_embeddings:
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
+        logger.info(
+            "Loaded Qwen3 prefill_provider={}",
+            "legacy_triton" if prefill_attention_op is None else prefill_attention_op.name,
+        )
+
+    def close_runtime_operators(self) -> None:
+        if self.prefill_attention_op is not None:
+            self.prefill_attention_op.close()
 
     def forward(
         self,

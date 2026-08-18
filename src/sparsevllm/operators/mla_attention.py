@@ -11,7 +11,10 @@ from sparsevllm.engine.cache_manager.base import (
     MlaLatentPayload,
     PrefillComputeView,
 )
-from sparsevllm.kernels.external.sgl.fa3 import SglFa3DecodeKernel, sgl_fa3_support
+from sparsevllm.kernels.external.sgl.fa3 import (
+    SglFa3DecodeKernel,
+    sgl_fa3_device_support,
+)
 from sparsevllm.kernels.tilelang.mla.runtime import (
     TileMlaDecodeKernel,
     tilelang_mla_support,
@@ -29,6 +32,12 @@ from sparsevllm.operators.registry import (
     OpRegistry,
     OpResolver,
     SupportResult,
+)
+from sparsevllm.operators.attention_capabilities import (
+    AttentionKernelCapabilities,
+    AttentionKernelRequest,
+    AttentionScoreKind,
+    match_attention_capabilities,
 )
 from sparsevllm.platforms.interface import DeviceCaps, PlatformEnum
 
@@ -82,10 +91,22 @@ class MlaAttentionOpSpec:
     def softmax_scale(self) -> float:
         return float(self.qk_head_dim**-0.5)
 
+    @property
+    def kernel_request(self) -> AttentionKernelRequest:
+        return AttentionKernelRequest(
+            activation_dtype=self.activation_dtype,
+            head_dim=self.qk_head_dim,
+            score_output=None,
+            layer_varying_page_table=True,
+            varlen=True,
+            cuda_graph=self.cuda_graph,
+        )
+
 
 class MlaAttentionProvider:
     name = ""
     priority = 0
+    capabilities: AttentionKernelCapabilities
     supports_explicit_prefill = False
 
     def run(
@@ -113,6 +134,17 @@ class MlaTritonProvider(MlaAttentionProvider):
 
     name = "triton_sm90"
     priority = 100
+    capabilities = AttentionKernelCapabilities(
+        platforms=frozenset({PlatformEnum.CUDA}),
+        compute_capabilities=frozenset({(9, 0)}),
+        activation_dtypes=frozenset({torch.bfloat16}),
+        head_dims=frozenset({_GLM_MLA_QK_HEAD_DIM}),
+        score_outputs=frozenset(AttentionScoreKind),
+        layer_varying_page_table=True,
+        varlen=True,
+        cuda_graph=True,
+        requires_triton=True,
+    )
 
     def __init__(
         self,
@@ -159,27 +191,19 @@ class MlaTritonProvider(MlaAttentionProvider):
         spec: MlaAttentionOpSpec,
         caps: DeviceCaps,
     ) -> SupportResult:
-        if caps.platform != PlatformEnum.CUDA or caps.compute_capability != (9, 0):
-            return SupportResult.no(
-                f"requires CUDA SM90, got {caps.platform.name} "
-                f"{caps.compute_capability}"
-            )
+        common = match_attention_capabilities(
+            spec.kernel_request, caps, cls.capabilities
+        )
+        if not common.supported:
+            return common
         if caps.device_name not in _VALIDATED_SM90_NAMES:
             return SupportResult.no(
                 "requires validated H100 80GB HBM3 or H20 hardware, got "
                 f"{caps.device_name}"
             )
-        if not caps.supports_triton:
-            return SupportResult.no("platform does not support Triton")
-        if not caps.supports_bfloat16:
-            return SupportResult.no("device does not support BF16")
         if spec.cuda_graph and not caps.supports_graph_capture:
             return SupportResult.no(
                 "decode CUDA Graph requires platform graph capture support"
-            )
-        if spec.activation_dtype != torch.bfloat16:
-            return SupportResult.no(
-                f"requires BF16 activations, got {spec.activation_dtype}"
             )
         if spec.cache_dtype != torch.bfloat16:
             return SupportResult.no(
@@ -442,7 +466,7 @@ class MlaSglFa3Provider(MlaTritonProvider):
         base = MlaTritonProvider.supports(spec, caps)
         if not base.supported:
             return base
-        supported, reason = sgl_fa3_support()
+        supported, reason = sgl_fa3_device_support(caps.device_index)
         return SupportResult.yes(reason) if supported else SupportResult.no(reason)
 
     @torch.no_grad()
@@ -688,6 +712,13 @@ class MlaTileLangScoreProvider(MlaSglFa3Provider):
         output: torch.Tensor,
     ) -> bool:
         if not isinstance(view.payload, MlaLatentPayload):
+            return False
+        attn_score = view.meta.attn_score
+        if (
+            attn_score is not None
+            and attn_score.ndim == 2
+            and int(attn_score.shape[1]) > int(view.meta.active_slots.shape[1])
+        ):
             return False
         tensors = (
             q_nope_absorbed,

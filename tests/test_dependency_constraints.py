@@ -6,7 +6,7 @@ except ModuleNotFoundError:  # Python 3.10
     import tomli as tomllib
 
 
-def test_runtime_compatibility_bounds_cover_canonical_lock():
+def test_runtime_compatibility_bounds_cover_supported_dependencies():
     pyproject_path = Path(__file__).parents[1] / "pyproject.toml"
     project = tomllib.loads(pyproject_path.read_text())["project"]
     dependencies = set(project["dependencies"])
@@ -29,23 +29,6 @@ def test_runtime_compatibility_bounds_cover_canonical_lock():
         dependency.startswith("flashinfer-cubin")
         for dependency in dependencies
     )
-
-
-def test_canonical_lock_pins_validated_tilelang_runtime():
-    lock_path = (
-        Path(__file__).parents[1]
-        / "requirements"
-        / "locks"
-        / "canonical-cu129-py310.txt"
-    )
-    locked_requirements = {
-        line.strip()
-        for line in lock_path.read_text().splitlines()
-        if line and not line.startswith(("#", "--"))
-    }
-
-    assert "tilelang==0.1.9" in locked_requirements
-    assert "apache-tvm-ffi==0.1.10" in locked_requirements
 
 
 def test_uv_routes_cuda_packages_to_explicit_indexes():

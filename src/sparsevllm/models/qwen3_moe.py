@@ -11,11 +11,17 @@ from transformers import Qwen3MoeConfig
 from sparsevllm.distributed import get_parallel_context
 from sparsevllm.layers.embed_head import ParallelLMHead
 from sparsevllm.layers.packed_moe import PackedMoeExperts
-from sparsevllm.models.qwen3 import Qwen3DecoderLayerBase, Qwen3ModelBase
+from sparsevllm.models.qwen3 import (
+    Qwen3DecoderLayerBase,
+    Qwen3ModelBase,
+    build_qwen3_prefill_attention_op,
+)
+from sparsevllm.models.attention_runtime import bind_mha_prefill_attention_op
 from sparsevllm.operators.moe import (
     model_activation_dtype,
     resolve_moe_provider,
 )
+from sparsevllm.operators.prefill_attention import PreparedPrefillAttentionOp
 from sparsevllm.platforms import device_runtime
 from sparsevllm.utils.log import logger
 from sparsevllm.utils.weight_target import WeightTarget
@@ -194,16 +200,49 @@ class Qwen3MoeForCausalLM(nn.Module):
         "v_proj": ("qkv_proj", "v"),
     }
 
-    def __init__(self, config: Qwen3MoeConfig) -> None:
+    @staticmethod
+    def build_runtime_kwargs(
+        config: Qwen3MoeConfig,
+        *,
+        engine_config,
+        parallel_context,
+        device: torch.device,
+        **_,
+    ) -> dict:
+        return {
+            "prefill_attention_op": build_qwen3_prefill_attention_op(
+                config,
+                engine_config=engine_config,
+                parallel_context=parallel_context,
+                device=device,
+            )
+        }
+
+    def __init__(
+        self,
+        config: Qwen3MoeConfig,
+        prefill_attention_op: PreparedPrefillAttentionOp | None = None,
+    ) -> None:
         super().__init__()
         self.config = config
         self.parallel_context = get_parallel_context()
+        self.prefill_attention_op = prefill_attention_op
         self.model = Qwen3MoeModel(config)
+        if prefill_attention_op is not None:
+            bind_mha_prefill_attention_op(self.model, prefill_attention_op)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if config.tie_word_embeddings:
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
         self._intentionally_skipped_expert_weights: set[str] = set()
         self._intentionally_skipped_expert_scales: set[str] = set()
+        logger.info(
+            "Loaded Qwen3MoE prefill_provider={}",
+            "legacy_triton" if prefill_attention_op is None else prefill_attention_op.name,
+        )
+
+    def close_runtime_operators(self) -> None:
+        if self.prefill_attention_op is not None:
+            self.prefill_attention_op.close()
 
     @torch.inference_mode()
     def warmup_moe(self, num_tokens: int = 1) -> None:

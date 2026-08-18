@@ -6,13 +6,25 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
+from sparsevllm.engine.cache_manager.base import (
+    AttentionViewMeta,
+    ExplicitKVPayload,
+    PrefillComputeView,
+)
+from sparsevllm.layers.attention import Attention
+from sparsevllm.method_registry import (
+    PrefillScoreCollectionKind,
+    sparse_prefill_attention_contract,
+)
 from sparsevllm.operators.prefill_attention import (
     PREFILL_ATTENTION_REGISTRY,
     FlashInferPagedPrefillAttentionProvider,
     PreparedPrefillAttentionOp,
     PrefillAttentionOpSpec,
+    SglFa3PagedPrefillAttentionProvider,
     TritonPagedPrefillAttentionProvider,
 )
+from sparsevllm.operators.attention_capabilities import AttentionScoreKind
 from sparsevllm.operators.registry import OpResolver
 from sparsevllm.platforms import DeviceCaps, PlatformEnum
 
@@ -26,8 +38,8 @@ def _spec(**overrides) -> PrefillAttentionOpSpec:
         "softmax_scale": 128**-0.5,
         "causal": True,
         "page_size": 1,
-        "requires_attention_scores": False,
-        "layer_invariant_page_table": True,
+        "score_output": AttentionScoreKind.NONE,
+        "layer_varying_page_table": False,
     }
     values.update(overrides)
     return PrefillAttentionOpSpec(**values)
@@ -50,38 +62,117 @@ def _h100_caps(**overrides) -> DeviceCaps:
     return DeviceCaps(**values)
 
 
+@pytest.mark.parametrize(
+    ("method", "collection"),
+    [
+        ("", PrefillScoreCollectionKind.NONE),
+        ("snapkv", PrefillScoreCollectionKind.METHOD_OWNED_POSTHOC_REDUCED),
+        ("pyramidkv", PrefillScoreCollectionKind.METHOD_OWNED_POSTHOC_REDUCED),
+        ("h2o", PrefillScoreCollectionKind.METHOD_OWNED_POSTHOC_REDUCED),
+        ("rkv", PrefillScoreCollectionKind.METHOD_OWNED_POSTHOC_REDUCED),
+        ("omnikv", PrefillScoreCollectionKind.NONE),
+        ("deltakv", PrefillScoreCollectionKind.NONE),
+    ],
+)
+def test_sparse_prefill_contract_separates_main_and_posthoc_scores(
+    method, collection
+):
+    contract = sparse_prefill_attention_contract(method)
+
+    assert contract.main_score_kind is AttentionScoreKind.NONE
+    assert contract.score_collection is collection
+
+
 @patch(
     "sparsevllm.operators.prefill_attention.version",
     return_value="0.6.15",
 )
 @patch("sparsevllm.operators.prefill_attention.find_spec", return_value=object())
-def test_resolver_prefers_flashinfer_for_profiled_minimax_shape(_find, _version):
+@patch(
+    "sparsevllm.operators.prefill_attention.sgl_fa3_device_support",
+    return_value=(False, "sglang-kernel is not installed"),
+)
+def test_resolver_prefers_flashinfer_for_profiled_minimax_shape(
+    _sgl, _find, _version
+):
     resolved = OpResolver(PREFILL_ATTENTION_REGISTRY).resolve(
         _spec(), _h100_caps()
     )
     assert resolved.provider.name == "flashinfer_paged_prefill_fa3_sm90"
 
 
+@patch(
+    "sparsevllm.operators.prefill_attention.sgl_fa3_device_support",
+    return_value=(True, "available"),
+)
+@pytest.mark.parametrize(
+    ("query_heads", "kv_heads"),
+    [(32, 4), (16, 2), (12, 2)],
+)
+def test_resolver_prefers_sgl_fa3_for_supported_local_shapes(
+    _support, query_heads, kv_heads
+):
+    resolved = OpResolver(PREFILL_ATTENTION_REGISTRY).resolve(
+        _spec(num_query_heads=query_heads, num_kv_heads=kv_heads),
+        _h100_caps(),
+    )
+
+    assert resolved.provider.name == "sgl_fa3_paged_prefill_sm90"
+
+
+@pytest.mark.parametrize(
+    ("spec", "reason"),
+    [
+        (_spec(num_query_heads=32, num_kv_heads=4, head_dim=64), "head_dim"),
+        (
+            _spec(
+                num_query_heads=32,
+                num_kv_heads=4,
+                activation_dtype=torch.float16,
+            ),
+            "activation dtype",
+        ),
+        (
+            _spec(
+                num_query_heads=32,
+                num_kv_heads=4,
+                score_output=AttentionScoreKind.RAW_QK_PER_HEAD,
+            ),
+            "RAW_QK_PER_HEAD",
+        ),
+        (
+            _spec(num_query_heads=32, num_kv_heads=4, cuda_graph=True),
+            "CUDA Graph",
+        ),
+    ],
+)
+def test_sgl_fa3_provider_rejects_unvalidated_contracts(spec, reason):
+    result = SglFa3PagedPrefillAttentionProvider.supports(spec, _h100_caps())
+
+    assert not result.supported
+    assert reason in result.reason
+
+
 @pytest.mark.parametrize(
     ("spec", "caps", "reason"),
     [
-        (_spec(head_dim=64), _h100_caps(), "profiled local"),
-        (_spec(activation_dtype=torch.float16), _h100_caps(), "BF16"),
+        (_spec(head_dim=64), _h100_caps(), "head_dim"),
+        (_spec(activation_dtype=torch.float16), _h100_caps(), "activation dtype"),
         (_spec(page_size=16), _h100_caps(), "page_size=1"),
         (
-            _spec(requires_attention_scores=True),
+            _spec(score_output=AttentionScoreKind.RAW_QK_PER_HEAD),
             _h100_caps(),
-            "attention scores",
+            "RAW_QK_PER_HEAD",
         ),
         (
-            _spec(layer_invariant_page_table=False),
+            _spec(layer_varying_page_table=True),
             _h100_caps(),
-            "shared across model layers",
+            "layer-varying",
         ),
         (
             _spec(),
             _h100_caps(compute_capability=(8, 0), device_name="NVIDIA A100"),
-            "SM90",
+            "compute capability",
         ),
     ],
 )
@@ -96,7 +187,11 @@ def test_flashinfer_provider_rejects_unsupported_contracts(spec, caps, reason):
     return_value="0.6.14",
 )
 @patch("sparsevllm.operators.prefill_attention.find_spec", return_value=object())
-def test_resolver_falls_back_when_flashinfer_is_too_old(_find, _version):
+@patch(
+    "sparsevllm.operators.prefill_attention.sgl_fa3_device_support",
+    return_value=(False, "sglang-kernel is not installed"),
+)
+def test_resolver_falls_back_when_flashinfer_is_too_old(_sgl, _find, _version):
     resolved = OpResolver(PREFILL_ATTENTION_REGISTRY).resolve(
         _spec(), _h100_caps()
     )
@@ -105,6 +200,86 @@ def test_resolver_falls_back_when_flashinfer_is_too_old(_find, _version):
         "flashinfer_paged_prefill_fa3_sm90",
         "requires flashinfer-python >= 0.6.15, got 0.6.14",
     ) in resolved.rejected
+
+
+@patch(
+    "sparsevllm.operators.prefill_attention.sgl_fa3_device_support",
+    return_value=(False, "unsupported sglang-kernel FA3 fwd schema"),
+)
+def test_resolver_falls_back_to_triton_for_variant_table_when_sgl_abi_rejected(
+    _support,
+):
+    resolved = OpResolver(PREFILL_ATTENTION_REGISTRY).resolve(
+        _spec(
+            num_query_heads=32,
+            num_kv_heads=4,
+            layer_varying_page_table=True,
+        ),
+        _h100_caps(),
+    )
+
+    assert resolved.provider.name == "triton_paged_prefill"
+    assert (
+        "sgl_fa3_paged_prefill_sm90",
+        "unsupported sglang-kernel FA3 fwd schema",
+    ) in resolved.rejected
+
+
+@patch(
+    "sparsevllm.operators.prefill_attention.sgl_fa3_device_support",
+    return_value=(True, "available"),
+)
+def test_sgl_accepts_sm90_without_exact_device_name_and_cuda_12_3(_support):
+    result = SglFa3PagedPrefillAttentionProvider.supports(
+        _spec(num_query_heads=32, num_kv_heads=4),
+        _h100_caps(device_name="NVIDIA GH200", runtime_version="12.3"),
+    )
+
+    assert result.supported
+
+
+def test_resolver_falls_back_to_triton_on_non_sm90():
+    resolved = OpResolver(PREFILL_ATTENTION_REGISTRY).resolve(
+        _spec(num_query_heads=32, num_kv_heads=4),
+        _h100_caps(
+            compute_capability=(8, 0),
+            device_name="NVIDIA A100",
+        ),
+    )
+
+    assert resolved.provider.name == "triton_paged_prefill"
+
+
+def test_resolver_falls_back_to_triton_for_fp16():
+    resolved = OpResolver(PREFILL_ATTENTION_REGISTRY).resolve(
+        _spec(
+            num_query_heads=32,
+            num_kv_heads=4,
+            activation_dtype=torch.float16,
+        ),
+        _h100_caps(),
+    )
+
+    assert resolved.provider.name == "triton_paged_prefill"
+
+
+@pytest.mark.parametrize(
+    ("runtime_version", "supported"),
+    [("12.2", False), ("12.3", True), ("12.10", True)],
+)
+@patch(
+    "sparsevllm.operators.prefill_attention.sgl_fa3_device_support",
+    return_value=(True, "available"),
+)
+def test_sgl_uses_numeric_cuda_version_check(_support, runtime_version, supported):
+    result = SglFa3PagedPrefillAttentionProvider.supports(
+        _spec(num_query_heads=32, num_kv_heads=4),
+        _h100_caps(runtime_version=runtime_version),
+    )
+
+    assert result.supported is supported
+    if not supported:
+        assert "runtime >= 12.3" in result.reason
 
 
 @pytest.mark.parametrize(
@@ -202,6 +377,119 @@ def test_flashinfer_prefill_passes_kv_cache_as_page_views_without_copying():
     assert paged_v.shape == (5, 1, 2, 128)
     assert paged_k.data_ptr() == k_cache.data_ptr()
     assert paged_v.data_ptr() == v_cache.data_ptr()
+
+
+def test_sgl_fa3_prefill_passes_token_page_view_without_copying():
+    kernel = Mock()
+    kernel.run_explicit_varlen.side_effect = lambda *args, **_kwargs: args[6]
+    provider = SglFa3PagedPrefillAttentionProvider()
+    provider._kernel = kernel
+    q = torch.empty(5, 32, 128, dtype=torch.bfloat16)
+    k_cache = torch.empty(23, 4, 128, dtype=torch.bfloat16)
+    v_cache = torch.empty_like(k_cache)
+    active_slots = torch.tensor(
+        [[7, 3, 11, 1, 9, 0], [6, 4, 10, 2, 8, 5]], dtype=torch.int32
+    )
+    req_indices = torch.tensor([1, 0], dtype=torch.int32)
+    context_lens = torch.tensor([6, 5], dtype=torch.int32)
+    view = SimpleNamespace(
+        k_cache=k_cache,
+        v_cache=v_cache,
+        active_slots=active_slots,
+        req_indices=req_indices,
+        context_lens=context_lens,
+        attn_score=None,
+    )
+    qo_indptr = torch.tensor([0, 3, 5], dtype=torch.int32)
+
+    actual = provider.run(
+        _spec(num_query_heads=32, num_kv_heads=4),
+        q,
+        view,
+        qo_indptr=qo_indptr,
+        chunk_lens=torch.tensor([3, 2], dtype=torch.int32),
+        max_context_len=6,
+        layer_idx=0,
+    )
+
+    call = kernel.run_explicit_varlen.call_args
+    assert call.args[0].data_ptr() == q.data_ptr()
+    assert call.args[1].data_ptr() == k_cache.data_ptr()
+    assert call.args[2].data_ptr() == v_cache.data_ptr()
+    assert call.args[3].data_ptr() == active_slots.data_ptr()
+    assert call.args[4].data_ptr() == req_indices.data_ptr()
+    assert call.args[5].data_ptr() == context_lens.data_ptr()
+    assert call.kwargs["cu_seqlens_q"].data_ptr() == qo_indptr.data_ptr()
+    assert call.kwargs["max_seqlen_q"] == 3
+    assert actual.shape == q.shape
+
+
+def test_attention_forward_runs_sgl_before_posthoc_cache_manager_hooks():
+    events = []
+    kernel = Mock()
+
+    def run_sgl(*args, **_kwargs):
+        events.append("sgl")
+        return args[6]
+
+    kernel.run_explicit_varlen.side_effect = run_sgl
+    provider = SglFa3PagedPrefillAttentionProvider()
+    provider._kernel = kernel
+    prepared = PreparedPrefillAttentionOp(
+        _spec(num_query_heads=32, num_kv_heads=4), provider
+    )
+    q = torch.empty(2, 32, 128, dtype=torch.bfloat16)
+    k_cache = torch.empty(7, 4, 128, dtype=torch.bfloat16)
+    v_cache = torch.empty_like(k_cache)
+    view = PrefillComputeView(
+        payload=ExplicitKVPayload(k_cache=k_cache, v_cache=v_cache),
+        meta=AttentionViewMeta(
+            active_slots=torch.tensor([[4, 1]], dtype=torch.int32),
+            req_indices=torch.tensor([0], dtype=torch.int32),
+            context_lens=torch.tensor([2], dtype=torch.int32),
+            max_context_len=2,
+        ),
+    )
+    cache_manager = SimpleNamespace(
+        before_prefill_layer_attention=Mock(),
+        build_prefill_compute_view=Mock(return_value=view),
+        collect_prefill_attention_score=Mock(
+            side_effect=lambda *_args, **_kwargs: events.append("collect_score")
+        ),
+        record_prefill_query=Mock(
+            side_effect=lambda *_args, **_kwargs: events.append("record_query")
+        ),
+        on_layer_attention_end=Mock(),
+    )
+    sparse_controller = SimpleNamespace(
+        get_prefill_selection=Mock(return_value=object()),
+        on_layer_attention_end=Mock(),
+    )
+    context = SimpleNamespace(
+        is_prefill=True,
+        cache_manager=cache_manager,
+        sparse_controller=sparse_controller,
+        now_layer_idx=0,
+        cu_seqlens_q=torch.tensor([0, 2], dtype=torch.int32),
+        attention_validation_scope=object(),
+    )
+    attention = Attention(32, 128, 128**-0.5, 4, prefill_op=prepared)
+    attention.attention_backend = SimpleNamespace(
+        maybe_run_fake_prefill=Mock(return_value=None),
+        debug_check_prefill_bounds=Mock(),
+    )
+
+    with (
+        patch("sparsevllm.layers.attention.get_context", return_value=context),
+        patch("sparsevllm.utils.context.get_context", return_value=context),
+    ):
+        actual = attention(q, torch.empty_like(k_cache[:2]), torch.empty_like(v_cache[:2]))
+
+    assert actual.shape == q.shape
+    kernel.run_explicit_varlen.assert_called_once()
+    cache_manager.collect_prefill_attention_score.assert_called_once()
+    cache_manager.record_prefill_query.assert_called_once()
+    assert events == ["sgl", "collect_score", "record_query"]
 
 
 def _torch_prefill_oracle(q, logical_k, logical_v, q_lens, kv_lens):

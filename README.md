@@ -53,7 +53,7 @@ and hybrid KV compression. The main method families are `streamingllm`,
 | `vanilla` | Dense baseline | Runs full attention and keeps the standard KV cache behavior for correctness and performance baselines. |
 | `streamingllm` / `attention-sink` | Physical eviction | Keeps fixed sink tokens plus a recent window, then physically evicts older tokens outside that policy. |
 | `snapkv`, `pyramidkv` | Physical eviction | Selects important historical tokens during prefill/finalization and stores only the retained KV tokens. |
-| `h2o` | Physical eviction | Accumulates normalized token importance in one score vector per layer/sequence, retaining heavy hitters plus a recent suffix after every prefill chunk and decode step. Prefill uses normalized attention mass; the optimized decode path max-reduces raw QK logits across query heads before token-wise normalization. The total intermediate/final budgets are `h2o_prefill_budget` and `h2o_decode_budget`; `h2o_recent_ratio` splits each budget and `h2o_prefill_score_window` controls chunk scoring. |
+| `h2o` | Physical eviction | Accumulates normalized token importance in one score vector per layer/sequence. Prefill scores and physically evicts after every chunk; decode scores every token and normally selects, compacts, and frees in a burst when a row reaches `h2o_decode_budget + h2o_decode_eviction_interval`, then returns it to `h2o_decode_budget` (interval default: 128). If a decode step consumes the final free KV slot, all active decode rows already over budget compact early, including temporarily unscheduled rows, so the next step can proceed. Idle chain rows are excluded. The budget-plus-interval sum must be divisible by 64 for the scored decode kernel. Each eviction retains heavy hitters plus a recent suffix. Prefill uses normalized attention mass; the optimized decode path max-reduces raw QK logits across query heads before token-wise normalization. `h2o_prefill_budget` controls intermediate prefill rows, `h2o_recent_ratio` splits each budget, and `h2o_prefill_score_window` controls chunk scoring. |
 | `omnikv` | Logical masking | Keeps tokens in storage but masks the attention read view so sparse layers attend only selected context. |
 | `quest` | Query-aware selection | Uses decode-time query-aware page selection while keeping prefill dense. |
 | `deltakv` / `deltakv-*` | Hybrid compression | Keeps a small full-precision pool and stores older context through DeltaKV compression or related ablations. |
@@ -133,8 +133,7 @@ MAX_JOBS=8 uv pip install flash-attn --no-build-isolation
 uv pip install flashinfer-cubin --index-url https://flashinfer.ai/whl
 ```
 
-Use `cu129` instead of `cu130` for CUDA 12.9. The validated CUDA 12.9
-[dependency lock](requirements/locks/README.md) is optional.
+Use `cu129` instead of `cu130` for CUDA 12.9.
 
 `einops`, `sglang-kernel`, and the training, benchmark, and test packages are all
 part of the main installation; no workflow-specific extras are required.

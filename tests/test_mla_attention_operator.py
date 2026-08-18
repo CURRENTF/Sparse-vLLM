@@ -107,7 +107,7 @@ def test_mla_resolver_selects_sm90_triton_provider(
 
     with (
         patch(
-            "sparsevllm.operators.mla_attention.sgl_fa3_support",
+            "sparsevllm.operators.mla_attention.sgl_fa3_device_support",
             return_value=(False, "sglang-kernel is not installed"),
         ),
         patch(
@@ -152,7 +152,7 @@ def test_mla_resolver_prefers_sgl_fa3_on_supported_sm90(
 
     with (
         patch(
-            "sparsevllm.operators.mla_attention.sgl_fa3_support",
+            "sparsevllm.operators.mla_attention.sgl_fa3_device_support",
             return_value=(True, "validated test API"),
         ),
         patch(
@@ -188,7 +188,7 @@ def test_mla_resolver_accepts_cuda_graph_after_capture_gate() -> None:
 
     with (
         patch(
-            "sparsevllm.operators.mla_attention.sgl_fa3_support",
+            "sparsevllm.operators.mla_attention.sgl_fa3_device_support",
             return_value=(True, "validated test API"),
         ),
         patch(
@@ -217,8 +217,8 @@ def test_mla_resolver_accepts_cuda_graph_after_capture_gate() -> None:
 @pytest.mark.parametrize(
     ("spec_overrides", "caps_overrides", "reason"),
     [
-        ({}, {"platform": PlatformEnum.CPU}, "requires CUDA SM90"),
-        ({}, {"compute_capability": (8, 0)}, "requires CUDA SM90"),
+        ({}, {"platform": PlatformEnum.CPU}, "requires platform"),
+        ({}, {"compute_capability": (8, 0)}, "compute capability"),
         ({}, {"device_name": "NVIDIA H100 PCIe"}, "validated"),
         (
             {"tp_size": 4},
@@ -232,7 +232,7 @@ def test_mla_resolver_accepts_cuda_graph_after_capture_gate() -> None:
             {"supports_graph_capture": False},
             "graph capture support",
         ),
-        ({"activation_dtype": torch.float16}, {}, "BF16 activations"),
+        ({"activation_dtype": torch.float16}, {}, "activation dtype"),
         ({"cache_dtype": torch.float16}, {}, "BF16 cache"),
         ({"kv_lora_rank": 256}, {}, "GLM MLA shape"),
         ({"tp_size": 5}, {}, "tensor parallel size"),

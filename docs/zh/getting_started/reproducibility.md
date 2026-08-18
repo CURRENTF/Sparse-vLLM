@@ -6,18 +6,14 @@
 
 README 包含当前安装命令。预期 baseline 为：
 
-- Python 3.10。
-- 使用 `requirements/locks/canonical-cu129-py310.txt` 中冻结的完整 runtime
-  与 test 环境。
-- 带匹配 CUDA wheel 的 PyTorch 2.11.0，以及 Triton 3.6.0。
-- `flashinfer-python==0.6.15.post1`，以及 CUDA 12.9 build 的
-  `flashinfer-jit-cache==0.6.15.post1`。
-- `sglang-kernel==0.4.5` 和 `einops>=0.8.2` 是 runtime 依赖。
+- Python 3.10 或更高版本。
+- 从 `pyproject.toml` 中选择一个 CUDA extra 安装：`cu129` 或 `cu130`。
+- 将 `pyproject.toml` 视为当前依赖契约；仓库不再提供冻结环境 lock，
+  因此每次实验都要记录实际解析出的 package 版本。
 - 需要预编译 device binary 时，可从通用 FlashInfer wheel index 安装匹配的 `flashinfer-cubin`。
-- `transformers==5.13.1`。
 - 使用 `MAX_JOBS=8 pip install flash-attn --no-build-isolation` 安装 `flash-attn`。
-- 安装 lock 后，在仓库根目录运行 `pip install --no-deps -e .`。训练、
-  benchmark 和测试依赖均包含在主安装中。
+- 在仓库根目录运行 `pip install -e ".[cu129]"` 或
+  `pip install -e ".[cu130]"`。训练、benchmark 和测试依赖均包含在主安装中。
 - 记录选择的 operator provider 和 CUDA compute capability。FP8 provider 根据本地 device capability 选择，warmup 期间不会下载 Hub kernel。
 - RMSNorm 默认使用 `SPARSEVLLM_RMSNORM_PROVIDER=auto`，在已安装时优先选择 FlashInfer。设为 `triton` 可强制使用本地 Triton kernel；设为 `flashinfer` 可明确要求 FlashInfer。
 

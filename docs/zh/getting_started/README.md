@@ -29,8 +29,7 @@ uv pip install -e ".[cu130]"
 MAX_JOBS=8 uv pip install flash-attn --no-build-isolation
 ```
 
-CUDA 12.9 环境将 `cu130` 换成 `cu129`。已验证的 CUDA 12.9
-[依赖 lock](../../../requirements/locks/README.md) 为可选复现方式。
+CUDA 12.9 环境将 `cu130` 换成 `cu129`。
 
 `einops`、`sglang-kernel` 以及训练、benchmark 和测试包均已是主依赖，
 不再需要工作流专用 extra。

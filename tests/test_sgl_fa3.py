@@ -9,6 +9,7 @@ import torch
 from sparsevllm.kernels.external.sgl.fa3 import (
     _FWD_ARGUMENTS,
     SglFa3DecodeKernel,
+    sgl_fa3_device_support,
     sgl_fa3_support,
 )
 
@@ -85,6 +86,14 @@ def test_sgl_fa3_support_rejects_missing_op_schema() -> None:
 
     assert not supported
     assert "failed to load" in reason
+
+
+def test_sgl_fa3_device_support_keeps_package_probe_and_device_probe_separate() -> None:
+    with patch(
+        "sparsevllm.kernels.external.sgl.fa3.sgl_fa3_support",
+        return_value=(False, "ABI mismatch"),
+    ):
+        assert sgl_fa3_device_support(3) == (False, "ABI mismatch")
 
 
 @pytest.mark.skipif(
@@ -332,6 +341,7 @@ def test_sgl_fa3_varlen_explicit_prefill_matches_causal_torch() -> None:
         max_batch_size=2,
         softmax_scale=head_dim**-0.5,
     )
+    validation_scope = object()
 
     kernel.run_explicit_varlen(
         q,
@@ -343,6 +353,7 @@ def test_sgl_fa3_varlen_explicit_prefill_matches_causal_torch() -> None:
         output,
         cu_seqlens_q=cu_seqlens_q,
         max_seqlen_q=max(chunk_lens),
+        validation_scope=validation_scope,
     )
     packed_indices = torch.cat(
         (
@@ -391,4 +402,117 @@ def test_sgl_fa3_varlen_explicit_prefill_matches_causal_torch() -> None:
         rtol=3e-2,
         atol=3e-2,
     )
+
+    # Scheduler metadata is intentionally reusable across layers, while the
+    # raw op must consume each layer's own logical-to-physical page table.
+    second_page_table = page_table.flip((0, 1))
+    second_output = torch.empty_like(q)
+    kernel.run_explicit_varlen(
+        q,
+        k_cache,
+        v_cache,
+        second_page_table,
+        request_indices,
+        context_lens,
+        second_output,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=max(chunk_lens),
+        validation_scope=validation_scope,
+    )
+    expected_rows = []
+    query_start = 0
+    for batch_index, chunk_len in enumerate(chunk_lens):
+        context_len = int(context_lens[batch_index].item())
+        row = int(request_indices[batch_index].item())
+        for query_offset in range(chunk_len):
+            visible_len = context_len - chunk_len + query_offset + 1
+            active = second_page_table[row, :visible_len].long()
+            query_index = query_start + query_offset
+            keys = k_cache[active]
+            values = v_cache[active]
+            logits = torch.einsum("hd,lhd->hl", q[query_index].float(), keys.float())
+            probabilities = torch.softmax(logits * (head_dim**-0.5), dim=-1)
+            expected_rows.append(
+                torch.einsum("hl,lhd->hd", probabilities, values.float()).to(
+                    torch.bfloat16
+                )
+            )
+        query_start += chunk_len
+    torch.testing.assert_close(
+        second_output,
+        torch.stack(expected_rows),
+        rtol=3e-2,
+        atol=3e-2,
+    )
     torch.testing.assert_close(packed_output, output)
+
+
+@pytest.mark.parametrize("q_heads,kv_heads", [(32, 4), (16, 2), (12, 2)])
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not sgl_fa3_support()[0],
+    reason="CUDA and a validated sglang-kernel are required",
+)
+def test_sgl_fa3_qwen3_moe_gqa_prefill_matches_torch(
+    q_heads: int,
+    kv_heads: int,
+) -> None:
+    torch.manual_seed(20260817 + q_heads)
+    device = torch.device("cuda")
+    head_dim = 128
+    chunk_lens = (3, 2)
+    context_lens = torch.tensor([7, 5], device=device, dtype=torch.int32)
+    cu_seqlens_q = torch.tensor([0, 3, 5], device=device, dtype=torch.int32)
+    q = torch.randn(5, q_heads, head_dim, device=device, dtype=torch.bfloat16)
+    k_cache = torch.randn(29, kv_heads, head_dim, device=device, dtype=torch.bfloat16)
+    v_cache = torch.randn_like(k_cache)
+    physical_slots = torch.randperm(29, device=device)[:12]
+    page_table = torch.zeros(2, 7, device=device, dtype=torch.int32)
+    page_table[0, :7] = physical_slots[:7].to(torch.int32)
+    page_table[1, :5] = physical_slots[7:].to(torch.int32)
+    request_indices = torch.tensor([0, 1], device=device, dtype=torch.int32)
+    output = torch.empty_like(q)
+    kernel = SglFa3DecodeKernel(
+        device=device,
+        max_batch_size=2,
+        softmax_scale=head_dim**-0.5,
+    )
+
+    kernel.run_explicit_varlen(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        request_indices,
+        context_lens,
+        output,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=max(chunk_lens),
+    )
+
+    group_size = q_heads // kv_heads
+    expected_rows = []
+    query_start = 0
+    for batch_index, chunk_len in enumerate(chunk_lens):
+        context_len = int(context_lens[batch_index].item())
+        row = int(request_indices[batch_index].item())
+        for query_offset in range(chunk_len):
+            visible_len = context_len - chunk_len + query_offset + 1
+            active = page_table[row, :visible_len].long()
+            query_index = query_start + query_offset
+            keys = k_cache[active].repeat_interleave(group_size, dim=1)
+            values = v_cache[active].repeat_interleave(group_size, dim=1)
+            logits = torch.einsum("hd,lhd->hl", q[query_index].float(), keys.float())
+            probabilities = torch.softmax(logits * (head_dim**-0.5), dim=-1)
+            expected_rows.append(
+                torch.einsum("hl,lhd->hd", probabilities, values.float()).to(
+                    torch.bfloat16
+                )
+            )
+        query_start += chunk_len
+
+    torch.testing.assert_close(
+        output,
+        torch.stack(expected_rows),
+        rtol=3e-2,
+        atol=3e-2,
+    )

@@ -222,10 +222,10 @@ def test_minimax_runtime_kwargs_bind_model_owned_operators():
     build.assert_called_once_with(
         config,
         context,
-        layer_invariant_page_table=True,
+        sparse_method="",
         max_decode_tokens=8,
         cuda_graph=True,
-        device_index=1,
+        device=torch.device("cuda", 1),
     )
 
 

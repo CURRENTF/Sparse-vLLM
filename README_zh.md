@@ -43,7 +43,7 @@ Sparse-vLLM 支持物理淘汰、逻辑掩码、查询感知选择和混合 KV �
 | `vanilla` | 稠密基线 | 执行完整注意力计算并保留标准 KV 缓存行为，作为正确性和性能基线。 |
 | `streamingllm` / `attention-sink` | 物理淘汰 | 保留固定的注意力汇聚 token 和最近窗口，并物理淘汰策略范围之外的旧 token。 |
 | `snapkv`、`pyramidkv` | 物理淘汰 | 在预填充或收尾阶段选择重要的历史 token，仅存储保留下来的 KV token。 |
-| `h2o` | 物理淘汰 | 每层、每序列用一个 score vector 累积归一化 token importance，并在每个 prefill chunk 和 decode step 后保留 heavy hitter 与 recent 后缀。Prefill 使用归一化 attention mass；优化后的 decode 路径先在 query head 间对 raw QK logit 做 max reduction，再按 token 归一化。中间/最终总预算分别由 `h2o_prefill_budget` 和 `h2o_decode_budget` 控制，`h2o_recent_ratio` 切分预算，`h2o_prefill_score_window` 控制 chunk 评分窗口。 |
+| `h2o` | 物理淘汰 | 每层、每序列用一个 score vector 累积归一化 token importance。Prefill 每个 chunk 评分并物理淘汰；decode 每个 token 都评分，通常在物理 row 达到 `h2o_decode_budget + h2o_decode_eviction_interval` 时批量选择、compact 和释放，再回到 `h2o_decode_budget`（interval 默认 128）。若某次 decode 用尽最后一个空闲 KV slot，所有已超过 budget 的 active decode row 都会提前 compact，包括暂时未调度的 row，以保证下一步可继续；idle chain row 不参与。budget 与 interval 之和必须能被 64 整除，以满足 scored decode kernel 的对齐要求。每次淘汰保留 heavy hitter 与 recent 后缀。Prefill 使用归一化 attention mass；优化后的 decode 路径先在 query head 间对 raw QK logit 做 max reduction，再按 token 归一化。`h2o_prefill_budget` 控制中间 prefill row，`h2o_recent_ratio` 切分预算，`h2o_prefill_score_window` 控制 chunk 评分窗口。 |
 | `omnikv` | 逻辑掩码 | 保留存储中的 token，但对注意力读取视图进行掩码，使稀疏层仅关注选定的上下文。 |
 | `quest` | 查询感知选择 | 保持预填充阶段为稠密计算，在解码阶段使用查询感知的分页选择。 |
 | `deltakv` / `deltakv-*` | 混合压缩 | 保留一个小型全精度池，并通过 DeltaKV 压缩或相关消融方法存储较早的上下文。 |
@@ -117,8 +117,7 @@ MAX_JOBS=8 uv pip install flash-attn --no-build-isolation
 uv pip install flashinfer-cubin --index-url https://flashinfer.ai/whl
 ```
 
-CUDA 12.9 环境将 `cu130` 换成 `cu129`。已验证的 CUDA 12.9
-[依赖 lock](requirements/locks/README.md) 为可选复现方式。
+CUDA 12.9 环境将 `cu130` 换成 `cu129`。
 
 Qwen3.5/Qwen3.6 的 prefill causal Conv1D 和 decode Conv1D/GDN packing
 路径使用仓库内置的 Triton kernel；无需安装 `sglang-kernel`，也无需编译

@@ -49,6 +49,7 @@ def _latent_chain_manager(manager_type, method: str):
         prefill_schedule_policy="chunked",
         chunk_prefill_size=8,
         h2o_decode_budget=4,
+        h2o_decode_eviction_interval=3,
         h2o_prefill_budget=8,
         h2o_recent_ratio=0.5,
         h2o_prefill_score_window=2,
@@ -104,16 +105,13 @@ def _latent_chain_manager(manager_type, method: str):
     manager._prefill_score_bounds = None
     manager._uniform_decode_metadata = False
     manager._h2o_scores = {}
-    manager._h2o_recent_cursors = {}
+    manager._h2o_active_decode_seq_ids = set()
     manager._h2o_counters = {
         "intermediate_prefill_evictions": 0,
         "final_prefill_evictions": 0,
+        "decode_eviction_bursts": 0,
         "decode_evictions": 0,
         "dropped_tokens": 0,
-    }
-    manager._h2o_ring_counters = {
-        "fast_rows": 0,
-        "fallback_rows": 0,
     }
     manager._h2o_final_prefill_workspace = None
     manager._rkv_query_cache_enabled = True
@@ -294,7 +292,6 @@ def test_h2o_chain_resume_preserves_aligned_scores_and_cleans_side_state():
         torch.tensor([101, 103, 104, 105], dtype=torch.bfloat16),
     )
     assert manager._h2o_scores[(0, owner.seq_id)].tolist() == [9.0, 8.0, 0.0, 0.0]
-    assert manager._h2o_recent_cursors[(0, owner.seq_id)] == 2
     assert manager._h2o_final_prefill_workspace is None
     coordinator.index.finish(
         owner.chain_id,
@@ -324,7 +321,6 @@ def test_h2o_chain_resume_preserves_aligned_scores_and_cleans_side_state():
     assert input_ids.tolist() == [6, 7]
     assert positions.tolist() == [6, 7]
     assert manager._h2o_scores[(0, resumed.seq_id)].tolist() == [9.0, 8.0, 0.0, 0.0]
-    assert manager._h2o_recent_cursors[(0, resumed.seq_id)] == 2
     resumed_row = manager.seq_id_to_row[0][resumed.seq_id]
     resumed_slots = manager.buffer_req_to_token_slots[0][
         resumed_row, :6
@@ -350,7 +346,6 @@ def test_h2o_chain_resume_preserves_aligned_scores_and_cleans_side_state():
         torch.tensor([101, 103, 106, 107], dtype=torch.bfloat16),
     )
     assert manager._h2o_scores[(0, resumed.seq_id)].tolist() == [9.0, 8.0, 7.0, 6.0]
-    assert manager._h2o_recent_cursors[(0, resumed.seq_id)] == 2
     assert manager._h2o_counters["final_prefill_evictions"] == 2
     assert manager._h2o_final_prefill_workspace is None
 
@@ -363,7 +358,6 @@ def test_h2o_chain_resume_preserves_aligned_scores_and_cleans_side_state():
     coordinator.invalidate(owner.chain_id)
     manager.free_seq(resumed.seq_id)
     assert manager._h2o_scores == {}
-    assert manager._h2o_recent_cursors == {}
     assert manager._prefill_attn_score_accumulators == {}
     assert manager.seq_id_to_row == [{}]
     assert manager._num_free_slots == [32]
