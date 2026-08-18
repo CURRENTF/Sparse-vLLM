@@ -680,10 +680,10 @@ def test_sgl_triton_moe_rejects_unsupported_specs(overrides, reason):
 @pytest.mark.parametrize(
     ("tp_size", "intermediate_size", "num_tokens", "expected_path"),
     [
-        (1, 768, 4096, "triton_fused_moe"),
-        (1, 768, 8192, "sgl_fused_moe"),
+        (1, 768, 4, "triton_fused_moe"),
+        (1, 768, 64, "sgl_fused_moe"),
         (2, 384, 1, "triton_fused_moe"),
-        (2, 384, 4096, "sgl_fused_moe"),
+        (2, 384, 64, "sgl_fused_moe"),
     ],
 )
 def test_sgl_triton_provider_dispatches_profiled_token_ranges(

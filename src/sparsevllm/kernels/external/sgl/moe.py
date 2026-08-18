@@ -39,9 +39,6 @@ def sgl_moe_align_block_size(
     num_experts = int(num_experts)
     if num_experts <= 0:
         raise ValueError(f"SGL MoE alignment requires experts, got {num_experts}.")
-    supported, reason = sgl_moe_alignment_support()
-    if not supported:
-        raise RuntimeError(reason)
     num_assignments = int(topk_ids.numel())
     if num_assignments < num_experts + 1:
         max_num_tokens_padded = num_assignments * int(block_size)

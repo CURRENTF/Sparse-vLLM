@@ -599,7 +599,7 @@ class SglTritonHybridMoeProvider(MoeProvider):
     name = "sgl_triton_hybrid"
     priority = 15
     gate_up_order = "gate_up"
-    MIN_SGL_TOKENS_BY_TP_SIZE = {1: 8192, 2: 4096}
+    MIN_SGL_TOKENS_BY_TP_SIZE = {1: 64, 2: 64}
     PROFILED_SHAPES = frozenset(
         {
             (128, 128, 2048, 768, 8, 1, 1),
