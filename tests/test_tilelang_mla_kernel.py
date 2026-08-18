@@ -57,11 +57,11 @@ def test_tilelang_mla_score_matches_torch_with_indirect_slots_and_graph(
     capacity = 64
     cache_slots = 96
     q_latent = torch.randn(
-        batch_size, valid_heads, 512, dtype=torch.bfloat16, device=device
-    )
+        valid_heads, batch_size, 512, dtype=torch.bfloat16, device=device
+    ).transpose(0, 1)
     q_rope = torch.randn(
-        batch_size, valid_heads, 64, dtype=torch.bfloat16, device=device
-    )
+        valid_heads, batch_size, 64, dtype=torch.bfloat16, device=device
+    ).transpose(0, 1)
     latent_cache = torch.randn(
         cache_slots, 1, 512, dtype=torch.bfloat16, device=device
     )
@@ -79,7 +79,9 @@ def test_tilelang_mla_score_matches_torch_with_indirect_slots_and_graph(
     )[:33].to(torch.int32)
     request_indices = torch.tensor([2, -1], dtype=torch.int32, device=device)
     context_lens = torch.tensor([33, 0], dtype=torch.int32, device=device)
-    output = torch.empty_like(q_latent)
+    output = torch.empty(
+        q_latent.shape, dtype=q_latent.dtype, device=q_latent.device
+    )
     score = torch.full(
         (batch_size, capacity),
         -1e20,
@@ -96,6 +98,9 @@ def test_tilelang_mla_score_matches_torch_with_indirect_slots_and_graph(
             score_mode=score_mode,
         ),
     )
+    assert not q_latent.is_contiguous()
+    assert not q_rope.is_contiguous()
+    assert output.is_contiguous()
 
     def run() -> None:
         score.fill_(-1e20)

@@ -7,10 +7,40 @@ from benchmark.microbench import (
     _apply_prefill_policy_defaults,
     _artifact_records,
     _benchmark_sparse_method,
+    _decode_cuda_graph_status,
     _record_child_exit_failure,
     _resolved_engine_config,
     _write_output_dir,
 )
+
+
+def test_decode_cuda_graph_status_records_execution_counters():
+    graph = object()
+    runner = SimpleNamespace(
+        _graphs={"bs4": SimpleNamespace(graph=graph)},
+        last_state_key="bs4",
+        capture_count=2,
+        replay_count=17,
+        eager_static_count=3,
+        force_eager_count=1,
+    )
+    llm = SimpleNamespace(
+        model_runner=SimpleNamespace(decode_cuda_graph_runner=runner),
+        config=SimpleNamespace(decode_cuda_graph=True),
+    )
+
+    assert _decode_cuda_graph_status(llm) == {
+        "decode_cuda_graph_configured": True,
+        "decode_cuda_graph_runner_initialized": True,
+        "decode_cuda_graph_state_count": 1,
+        "decode_cuda_graph_graph_count": 1,
+        "decode_cuda_graph_capture_count": 2,
+        "decode_cuda_graph_replay_count": 17,
+        "decode_cuda_graph_eager_static_count": 3,
+        "decode_cuda_graph_force_eager_count": 1,
+        "decode_cuda_graph_last_state_key": "bs4",
+        "decode_cuda_graph_active": True,
+    }
 
 
 @pytest.mark.parametrize(

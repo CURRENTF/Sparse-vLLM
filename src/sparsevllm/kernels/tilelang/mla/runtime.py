@@ -372,7 +372,7 @@ class TileMlaDecodeKernel:
                     f"TileLang MLA {name} must be {dtype} on "
                     f"{q_latent.device}, got {tensor.dtype} on {tensor.device}."
                 )
-            if not tensor.is_contiguous():
+            if name not in {"q_latent", "q_rope"} and not tensor.is_contiguous():
                 raise ValueError(
                     f"TileLang MLA {name} must be contiguous, got stride "
                     f"{tuple(tensor.stride())}."
@@ -476,6 +476,12 @@ class TileMlaDecodeKernel:
             q_rope,
             workspace.padded_latent,
             workspace.padded_rope,
+            q_latent.stride(0),
+            q_latent.stride(1),
+            q_latent.stride(2),
+            q_rope.stride(0),
+            q_rope.stride(1),
+            q_rope.stride(2),
             batch_size=batch_size,
             valid_heads=self.valid_heads,
             padded_heads=self.padded_heads,

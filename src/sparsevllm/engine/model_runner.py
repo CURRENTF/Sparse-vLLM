@@ -633,6 +633,29 @@ class ModelRunner:
         if self.parallel_context.world_rank == 0:
             operator_registry.log_operator_implementations()
 
+    def operator_runtime_stats(self) -> list[dict[str, object]] | None:
+        local_error: BaseException | None = None
+        local_stats = None
+        try:
+            local_stats = {
+                "world_rank": int(self.parallel_context.world_rank),
+                "operators": operator_registry.operator_runtime_stats(),
+            }
+        except BaseException as exc:
+            local_error = exc
+        self._sync_tp_rpc_status("operator_runtime_stats", local_error)
+        if local_error is not None:
+            raise local_error
+        if self.world_size == 1:
+            return [local_stats]
+        stats = [None] * self.world_size
+        dist.all_gather_object(
+            stats,
+            local_stats,
+            group=self.parallel_context.world.process_group,
+        )
+        return stats if self.rank == 0 else None
+
     def warmup_moe_workspace(self, num_tokens: int) -> None:
         warmup_moe = getattr(self.model, "warmup_moe", None)
         if not callable(warmup_moe):

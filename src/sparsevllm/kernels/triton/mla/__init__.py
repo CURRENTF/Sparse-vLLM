@@ -1,6 +1,10 @@
 """Latent MLA Triton kernels with explicit Sparse-vLLM contracts."""
 
-from .copy_latent import copy_latent_to_cache, validate_copy_slot_mapping
+from .copy_latent import (
+    copy_latent_to_cache,
+    validate_copy_slot_mapping,
+    validate_copy_slot_mappings,
+)
 from .decode_schedule import (
     DEFAULT_GLM_MLA_DECODE_CONFIG,
     GLM_MLA_MAX_WORKSPACE_CONFIG,
@@ -39,6 +43,7 @@ __all__ = [
     "run_mla_decode",
     "select_glm_mla_decode_config",
     "validate_copy_slot_mapping",
+    "validate_copy_slot_mappings",
     "validate_gather_metadata",
     "validate_mla_decode_metadata",
 ]

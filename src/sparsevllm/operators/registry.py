@@ -21,22 +21,87 @@ def record_operator_binding(operator_type: str, provider: object) -> None:
 
 
 def _implementation_name(provider: object) -> str:
-    return getattr(provider, "implementation_name", None) or getattr(provider, "name", None) or provider.provider_name
+    return (
+        getattr(provider, "implementation_name", None)
+        or getattr(provider, "name", None)
+        or provider.provider_name
+    )
+
+
+def operator_runtime_stats() -> dict[str, list[dict[str, object]]]:
+    """Return aggregate runtime kernel paths for every live bound provider."""
+
+    result: dict[str, list[dict[str, object]]] = {}
+    for operator_type, providers in sorted(_OPERATOR_BINDINGS.items()):
+        grouped: dict[str, list[object]] = {}
+        for provider in providers:
+            grouped.setdefault(_implementation_name(provider), []).append(provider)
+        entries: list[dict[str, object]] = []
+        for implementation, bound_providers in sorted(grouped.items()):
+            kernel_paths: dict[str, dict[str, int]] = {}
+            fallback_reasons: dict[str, int] = {}
+            instrumented = 0
+            for provider in bound_providers:
+                stats_fn = getattr(provider, "runtime_kernel_stats", None)
+                if not callable(stats_fn):
+                    continue
+                instrumented += 1
+                stats = stats_fn()
+                for path, counts in stats.get("kernel_paths", {}).items():
+                    aggregate = kernel_paths.setdefault(str(path), {})
+                    for key, count in counts.items():
+                        aggregate[str(key)] = int(aggregate.get(str(key), 0)) + int(count)
+                for reason, count in stats.get("fallback_reasons", {}).items():
+                    fallback_reasons[str(reason)] = (
+                        int(fallback_reasons.get(str(reason), 0)) + int(count)
+                    )
+            entries.append(
+                {
+                    "implementation": implementation,
+                    "bound_provider_count": len(bound_providers),
+                    "instrumented_provider_count": instrumented,
+                    "kernel_paths": {
+                        path: dict(sorted(counts.items()))
+                        for path, counts in sorted(kernel_paths.items())
+                    },
+                    "fallback_reasons": dict(sorted(fallback_reasons.items())),
+                }
+            )
+        if entries:
+            result[operator_type] = entries
+    return result
 
 
 def log_operator_implementations() -> None:
     entries = sorted(
         (
             operator_type,
-            ", ".join(sorted({_implementation_name(provider) for provider in providers})),
+            ", ".join(
+                sorted({_implementation_name(provider) for provider in providers})
+            ),
         )
         for operator_type, providers in _OPERATOR_BINDINGS.items()
         if providers
     )
     if not entries:
         return
-    rows = "\n".join(f"  {operator_type}: {implementation}" for operator_type, implementation in entries)
+    rows = "\n".join(
+        f"  {operator_type}: {implementation}"
+        for operator_type, implementation in entries
+    )
     logger.info("Operator implementations:\n{}", rows)
+    runtime_rows = []
+    for operator_type, implementations in operator_runtime_stats().items():
+        for implementation in implementations:
+            for path, counts in implementation["kernel_paths"].items():
+                runtime_rows.append(
+                    f"  {operator_type}/{implementation['implementation']}/{path}: "
+                    + ", ".join(
+                        f"{key}={value}" for key, value in counts.items()
+                    )
+                )
+    if runtime_rows:
+        logger.info("Operator runtime kernels:\n{}", "\n".join(runtime_rows))
 
 
 def runtime_version_at_least(

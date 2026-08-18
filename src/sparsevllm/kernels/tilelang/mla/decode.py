@@ -19,6 +19,12 @@ def pad_glm_q_kernel(
     q_rope,
     padded_latent,
     padded_rope,
+    stride_q_latent_batch,
+    stride_q_latent_head,
+    stride_q_latent_dim,
+    stride_q_rope_batch,
+    stride_q_rope_head,
+    stride_q_rope_dim,
     batch_size: tl.constexpr,
     valid_heads: tl.constexpr,
     padded_heads: tl.constexpr,
@@ -33,9 +39,9 @@ def pad_glm_q_kernel(
     latent_batch = offsets // (padded_heads * latent_dim)
     latent_col = offsets % latent_dim
     latent_src = (
-        latent_batch * valid_heads * latent_dim
-        + latent_head * latent_dim
-        + latent_col
+        latent_batch * stride_q_latent_batch
+        + latent_head * stride_q_latent_head
+        + latent_col * stride_q_latent_dim
     )
     latent_value = tl.load(
         q_latent + latent_src,
@@ -50,9 +56,9 @@ def pad_glm_q_kernel(
     rope_batch = offsets // (padded_heads * rope_dim)
     rope_col = offsets % rope_dim
     rope_src = (
-        rope_batch * valid_heads * rope_dim
-        + rope_head * rope_dim
-        + rope_col
+        rope_batch * stride_q_rope_batch
+        + rope_head * stride_q_rope_head
+        + rope_col * stride_q_rope_dim
     )
     rope_value = tl.load(
         q_rope + rope_src,

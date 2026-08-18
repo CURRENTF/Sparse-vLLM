@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import torch
 
 import sparsevllm.platforms as platforms
+from sparsevllm.platforms import device_runtime
 from sparsevllm.engine.cache_manager.base import (
     DecodeComputeView,
     ExplicitKVPayload,
@@ -184,6 +185,44 @@ class MlaTritonProvider(MlaAttentionProvider):
                 ]
             ],
         ] | None = None
+        self._runtime_kernel_path_counts: dict[str, dict[str, int]] = {}
+        self._runtime_fallback_reasons: dict[str, int] = {}
+
+    def _record_runtime_kernel_path(self, path: str) -> None:
+        counts = getattr(self, "_runtime_kernel_path_counts", None)
+        if counts is None:
+            counts = {}
+            self._runtime_kernel_path_counts = counts
+        path_counts = counts.setdefault(
+            str(path),
+            {"eager_dispatches": 0, "cuda_graph_capture_dispatches": 0},
+        )
+        key = (
+            "cuda_graph_capture_dispatches"
+            if device_runtime.is_stream_capturing()
+            else "eager_dispatches"
+        )
+        path_counts[key] += 1
+
+    def _record_runtime_fallback(self, reason: str) -> None:
+        reasons = getattr(self, "_runtime_fallback_reasons", None)
+        if reasons is None:
+            reasons = {}
+            self._runtime_fallback_reasons = reasons
+        reasons[str(reason)] = int(reasons.get(str(reason), 0)) + 1
+
+    def runtime_kernel_stats(self) -> dict[str, object]:
+        paths = getattr(self, "_runtime_kernel_path_counts", {})
+        reasons = getattr(self, "_runtime_fallback_reasons", {})
+        return {
+            "kernel_paths": {
+                path: {key: int(value) for key, value in sorted(counts.items())}
+                for path, counts in sorted(paths.items())
+            },
+            "fallback_reasons": {
+                reason: int(count) for reason, count in sorted(reasons.items())
+            },
+        }
 
     @classmethod
     def supports(
@@ -411,6 +450,9 @@ class MlaTritonProvider(MlaAttentionProvider):
             max_context_len=view.meta.max_context_len,
             active_slot_width=int(view.meta.active_slots.shape[1]),
         )
+        self._record_runtime_kernel_path(
+            "triton_score" if view.meta.attn_score is not None else "triton"
+        )
         return run_mla_decode(
             q_nope_absorbed,
             q_rope,
@@ -501,6 +543,7 @@ class MlaSglFa3Provider(MlaTritonProvider):
             validation_scope=validation_scope,
             valid_batch_size=valid_batch_size,
         )
+        self._record_runtime_kernel_path("sgl_fa3")
         return self.fa3(
             q_rope,
             q_nope_absorbed,
@@ -621,6 +664,7 @@ class MlaSglFa3Provider(MlaTritonProvider):
                 raise ValueError(
                     "MLA packed varlen prefill requires max_context_len."
                 )
+            self._record_runtime_kernel_path("sgl_fa3_prefill_contiguous")
             return self.fa3.run_contiguous_explicit_varlen(
                 q,
                 payload.k_cache,
@@ -631,6 +675,7 @@ class MlaSglFa3Provider(MlaTritonProvider):
                 max_seqlen_q=int(max_seqlen_q),
                 max_seqlen_k=int(view.meta.max_context_len),
             )
+        self._record_runtime_kernel_path("sgl_fa3_prefill_paged")
         return self.fa3.run_explicit_varlen(
             q,
             payload.k_cache,
@@ -705,36 +750,34 @@ class MlaTileLangScoreProvider(MlaSglFa3Provider):
         )
 
     @staticmethod
-    def _tilelang_layout_supported(
-        q_nope_absorbed: torch.Tensor,
-        q_rope: torch.Tensor,
+    def _tilelang_layout_rejection_reason(
         view: DecodeComputeView,
         output: torch.Tensor,
-    ) -> bool:
+    ) -> str | None:
         if not isinstance(view.payload, MlaLatentPayload):
-            return False
+            return "payload_type"
         attn_score = view.meta.attn_score
         if (
             attn_score is not None
             and attn_score.ndim == 2
             and int(attn_score.shape[1]) > int(view.meta.active_slots.shape[1])
         ):
-            return False
-        tensors = (
-            q_nope_absorbed,
-            q_rope,
-            view.payload.latent_cache,
-            view.payload.rope_cache,
-            view.meta.active_slots,
-            view.meta.req_indices,
-            view.meta.context_lens,
-            view.meta.attn_score,
-            output,
-        )
-        return all(
-            isinstance(tensor, torch.Tensor) and tensor.is_contiguous()
-            for tensor in tensors
-        )
+            return "score_capacity_exceeds_active_slots"
+        tensors = {
+            "latent_cache": view.payload.latent_cache,
+            "rope_cache": view.payload.rope_cache,
+            "active_slots": view.meta.active_slots,
+            "request_indices": view.meta.req_indices,
+            "context_lens": view.meta.context_lens,
+            "attn_score": view.meta.attn_score,
+            "output": output,
+        }
+        rejected = [
+            name
+            for name, tensor in tensors.items()
+            if not isinstance(tensor, torch.Tensor) or not tensor.is_contiguous()
+        ]
+        return None if not rejected else "noncontiguous:" + ",".join(rejected)
 
     @torch.no_grad()
     def run(
@@ -763,12 +806,20 @@ class MlaTileLangScoreProvider(MlaSglFa3Provider):
         if not self._tilelang_score_shape_supported(
             attn_score,
             max_context_len=view.meta.max_context_len,
-        ) or not self._tilelang_layout_supported(
-            q_nope_absorbed,
-            q_rope,
-            view,
-            output,
         ):
+            self._record_runtime_fallback("unsupported_score_shape")
+            return MlaTritonProvider.run(
+                self,
+                q_nope_absorbed,
+                q_rope,
+                view,
+                output,
+                validation_scope=validation_scope,
+                valid_batch_size=valid_batch_size,
+            )
+        layout_rejection = self._tilelang_layout_rejection_reason(view, output)
+        if layout_rejection is not None:
+            self._record_runtime_fallback(layout_rejection)
             return MlaTritonProvider.run(
                 self,
                 q_nope_absorbed,
@@ -790,6 +841,7 @@ class MlaTileLangScoreProvider(MlaSglFa3Provider):
             validation_scope=validation_scope,
             valid_batch_size=valid_batch_size,
         )
+        self._record_runtime_kernel_path("tilelang_score")
         return self.tilelang_score(
             q_nope_absorbed,
             q_rope,

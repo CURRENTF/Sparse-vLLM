@@ -862,7 +862,11 @@ class MLAAttention:
                 f"{type(view).__name__}."
             )
         self._require_mla_payload(view, operation="MLA decode")
-        output = torch.empty_like(q_nope_absorbed)
+        output = torch.empty(
+            q_nope_absorbed.shape,
+            dtype=q_nope_absorbed.dtype,
+            device=q_nope_absorbed.device,
+        )
         context = get_context()
         valid_batch_size = (
             int(q_nope_absorbed.shape[0])

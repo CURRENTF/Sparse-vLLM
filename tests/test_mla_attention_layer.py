@@ -307,6 +307,7 @@ def test_mla_decode_passes_valid_batch_size_to_provider() -> None:
             valid_batch_size=None,
         ):
             self.valid_batch_size = valid_batch_size
+            self.output_is_contiguous = output.is_contiguous()
             return output
 
     spec = _spec(tp_size=4)
@@ -329,8 +330,8 @@ def test_mla_decode_passes_valid_batch_size_to_provider() -> None:
             rope_cache=torch.empty(16, 1, 64, dtype=torch.bfloat16),
         ),
     )
-    q_nope_absorbed = torch.empty(4, 5, 512, dtype=torch.bfloat16)
-    q_rope = torch.empty(4, 5, 64, dtype=torch.bfloat16)
+    q_nope_absorbed = torch.empty(5, 4, 512, dtype=torch.bfloat16).transpose(0, 1)
+    q_rope = torch.empty(5, 4, 64, dtype=torch.bfloat16).transpose(0, 1)
 
     set_context(False, seqs=[object(), object(), object()])
     try:
@@ -339,6 +340,9 @@ def test_mla_decode_passes_valid_batch_size_to_provider() -> None:
         reset_context()
 
     assert output.shape == q_nope_absorbed.shape
+    assert not q_nope_absorbed.is_contiguous()
+    assert output.is_contiguous()
+    assert provider.output_is_contiguous
     assert provider.valid_batch_size == 3
 
 

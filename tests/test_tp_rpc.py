@@ -140,6 +140,36 @@ def test_operator_implementation_log_is_aligned_and_failure_synchronized():
     log_implementations.assert_called_once_with()
 
 
+def test_operator_runtime_stats_gather_one_record_per_world_rank():
+    runner = object.__new__(ModelRunner)
+    runner.world_size = 2
+    runner.rank = 0
+    runner.parallel_context = SimpleNamespace(
+        world_rank=0,
+        world=SimpleNamespace(process_group="world"),
+    )
+    sync_calls = []
+    runner._sync_tp_rpc_status = (
+        lambda method_name, error: sync_calls.append((method_name, error))
+    )
+
+    def gather(output, local, *, group):
+        assert group == "world"
+        output[:] = [local, {"world_rank": 1, "operators": {}}]
+
+    with (
+        patch.object(operator_registry, "operator_runtime_stats", return_value={"MLA": []}),
+        patch.object(dist, "all_gather_object", side_effect=gather),
+    ):
+        stats = ModelRunner.operator_runtime_stats(runner)
+
+    assert sync_calls == [("operator_runtime_stats", None)]
+    assert stats == [
+        {"world_rank": 0, "operators": {"MLA": []}},
+        {"world_rank": 1, "operators": {}},
+    ]
+
+
 def test_prefix_offload_release_rpc_surfaces_local_failure_after_status_sync():
     for method_name, args in (("free_slots", (7,)), ("free_slots_batch", ([7, 9],))):
         runner = object.__new__(ModelRunner)

@@ -19,6 +19,7 @@ from sparsevllm.kernels.triton.mla import (
     prepare_mla_decode_schedule,
     run_mla_decode,
     select_glm_mla_decode_config,
+    validate_copy_slot_mappings,
     validate_mla_decode_metadata,
 )
 
@@ -247,6 +248,23 @@ def test_copy_latent_rejects_duplicate_and_out_of_range_slots() -> None:
             torch.tensor([0, 4], dtype=torch.int32, device="cuda"),
             latent_cache,
             rope_cache,
+        )
+
+
+def test_batched_copy_slot_validation_is_row_local() -> None:
+    validate_copy_slot_mappings(
+        torch.tensor([[0, 1, -1], [0, 1, -1]], dtype=torch.int32),
+        cache_slot_count=4,
+    )
+    with pytest.raises(ValueError, match="duplicate"):
+        validate_copy_slot_mappings(
+            torch.tensor([[0, 0], [1, 2]], dtype=torch.int32),
+            cache_slot_count=4,
+        )
+    with pytest.raises(ValueError, match="outside"):
+        validate_copy_slot_mappings(
+            torch.tensor([[0, 4], [1, 2]], dtype=torch.int32),
+            cache_slot_count=4,
         )
 
 

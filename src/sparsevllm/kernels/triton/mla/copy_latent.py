@@ -167,6 +167,50 @@ def validate_copy_slot_mapping(
         raise ValueError("slot_mapping contains duplicate non-padding slots")
 
 
+def validate_copy_slot_mappings(
+    slot_mappings: torch.Tensor,
+    *,
+    cache_slot_count: int,
+) -> None:
+    """Validate equally-sized layer mappings with one device synchronization."""
+
+    if cache_slot_count <= 0:
+        raise ValueError("cache_slot_count must be positive")
+    if slot_mappings.ndim != 2:
+        raise ValueError(
+            "slot_mappings must have shape [layers, tokens], got "
+            f"{tuple(slot_mappings.shape)}"
+        )
+    if slot_mappings.numel() == 0:
+        return
+
+    valid = slot_mappings >= 0
+    out_of_bounds = torch.any(valid & (slot_mappings >= cache_slot_count))
+    if int(slot_mappings.shape[1]) > 1:
+        padding = torch.full_like(slot_mappings, cache_slot_count)
+        sorted_slots = torch.sort(
+            torch.where(valid, slot_mappings, padding),
+            dim=1,
+        ).values
+        duplicate = torch.any(
+            (sorted_slots[:, 1:] == sorted_slots[:, :-1])
+            & (sorted_slots[:, 1:] != cache_slot_count)
+        )
+    else:
+        duplicate = torch.zeros((), dtype=torch.bool, device=slot_mappings.device)
+
+    # Materialize both flags together. The old per-layer path performed up to
+    # one host synchronization per layer; decode mappings all share a width, so
+    # this keeps exact ValueError diagnostics with one synchronization total.
+    flags = torch.stack((out_of_bounds, duplicate)).to(device="cpu").tolist()
+    if bool(flags[0]):
+        raise ValueError(
+            f"slot_mapping contains a slot outside [0, {cache_slot_count})"
+        )
+    if bool(flags[1]):
+        raise ValueError("slot_mapping contains duplicate non-padding slots")
+
+
 @torch.no_grad()
 def copy_latent_to_cache(
     latent: torch.Tensor,

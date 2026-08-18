@@ -4,7 +4,7 @@ import torch
 
 from sparsevllm.kernels.triton.mla.copy_latent import (
     copy_latent_to_cache,
-    validate_copy_slot_mapping,
+    validate_copy_slot_mappings,
 )
 from sparsevllm.kernels.triton.mla.decode_stage1 import MLA_LATENT_DIM, MLA_ROPE_DIM
 
@@ -100,7 +100,7 @@ class MlaLatentStorage:
             int(slot_mapping.numel()),
         )
 
-    def _validate_slot_mapping(self, slot_mapping: torch.Tensor) -> None:
+    def _validate_slot_mapping_contract(self, slot_mapping: torch.Tensor) -> None:
         latent_cache, _ = self._require_caches()
         if slot_mapping.ndim != 1:
             raise ValueError(
@@ -115,10 +115,6 @@ class MlaLatentStorage:
                 "MLA slot_mapping must share the cache device, got "
                 f"slots={slot_mapping.device} cache={latent_cache.device}."
             )
-        validate_copy_slot_mapping(
-            slot_mapping,
-            cache_slot_count=int(latent_cache.shape[1]),
-        )
 
     def validate_slot_mappings(
         self,
@@ -127,13 +123,22 @@ class MlaLatentStorage:
         if not slot_mappings:
             raise ValueError("MLA slot mapping validation requires at least one layer.")
         remaining: dict[tuple[str, int, int], int] = {}
-        validated: set[tuple[str, int, int]] = set()
+        unique_mappings: dict[tuple[str, int, int], torch.Tensor] = {}
         for slot_mapping in slot_mappings:
             key = self._slot_mapping_key(slot_mapping)
-            if key not in validated:
-                self._validate_slot_mapping(slot_mapping)
-                validated.add(key)
+            if key not in unique_mappings:
+                self._validate_slot_mapping_contract(slot_mapping)
+                unique_mappings[key] = slot_mapping
             remaining[key] = remaining.get(key, 0) + 1
+        latent_cache, _ = self._require_caches()
+        mappings_by_width: dict[int, list[torch.Tensor]] = {}
+        for mapping in unique_mappings.values():
+            mappings_by_width.setdefault(int(mapping.numel()), []).append(mapping)
+        for mappings in mappings_by_width.values():
+            validate_copy_slot_mappings(
+                torch.stack(mappings),
+                cache_slot_count=int(latent_cache.shape[1]),
+            )
         self._validated_store_calls_remaining = remaining
 
     def validate_slot_mapping(self, slot_mapping: torch.Tensor) -> None:

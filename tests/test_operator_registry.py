@@ -9,6 +9,7 @@ from sparsevllm.operators.registry import (
     OpResolver,
     SupportResult,
     log_operator_implementations,
+    operator_runtime_stats,
     record_operator_binding,
 )
 from sparsevllm.platforms.interface import DeviceCaps, PlatformEnum
@@ -183,6 +184,52 @@ def test_operator_organization_logs_live_bound_implementations():
         "  Attention: triton\n"
         "  block-scaled FP8 Linear: flashinfer_sm90, triton",
     )
+
+
+def test_operator_runtime_stats_aggregate_live_provider_kernel_paths():
+    class Provider:
+        name = "composite"
+
+        def __init__(self, eager: int, captured: int, fallback: int):
+            self.eager = eager
+            self.captured = captured
+            self.fallback = fallback
+
+        def runtime_kernel_stats(self):
+            return {
+                "kernel_paths": {
+                    "tilelang_score": {
+                        "eager_dispatches": self.eager,
+                        "cuda_graph_capture_dispatches": self.captured,
+                    }
+                },
+                "fallback_reasons": {"noncontiguous:output": self.fallback},
+            }
+
+    first = Provider(2, 1, 0)
+    second = Provider(3, 4, 1)
+    with patch.dict(operator_registry._OPERATOR_BINDINGS, {}, clear=True):
+        record_operator_binding("MLA attention", first)
+        record_operator_binding("MLA attention", second)
+
+        stats = operator_runtime_stats()
+
+    assert stats == {
+        "MLA attention": [
+            {
+                "implementation": "composite",
+                "bound_provider_count": 2,
+                "instrumented_provider_count": 2,
+                "kernel_paths": {
+                    "tilelang_score": {
+                        "cuda_graph_capture_dispatches": 5,
+                        "eager_dispatches": 5,
+                    }
+                },
+                "fallback_reasons": {"noncontiguous:output": 1},
+            }
+        ]
+    }
 
 
 def test_resolver_forwards_provider_constructor_arguments():

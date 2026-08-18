@@ -385,6 +385,18 @@ def _decode_cuda_graph_status(llm) -> dict[str, Any]:
         "decode_cuda_graph_runner_initialized": runner is not None,
         "decode_cuda_graph_state_count": int(len(states)),
         "decode_cuda_graph_graph_count": int(graph_count),
+        "decode_cuda_graph_capture_count": int(
+            getattr(runner, "capture_count", 0)
+        ),
+        "decode_cuda_graph_replay_count": int(
+            getattr(runner, "replay_count", 0)
+        ),
+        "decode_cuda_graph_eager_static_count": int(
+            getattr(runner, "eager_static_count", 0)
+        ),
+        "decode_cuda_graph_force_eager_count": int(
+            getattr(runner, "force_eager_count", 0)
+        ),
         "decode_cuda_graph_last_state_key": str(getattr(runner, "last_state_key", None)) if runner is not None else None,
         "decode_cuda_graph_active": bool(configured and graph_count > 0),
     }
@@ -682,6 +694,7 @@ def benchmark_task(method, length, bs, args, results_dict):
         torch.cuda.synchronize()
         peak_mem = get_peak_memory()
         graph_status = _decode_cuda_graph_status(llm)
+        operator_runtime_stats = llm.operator_runtime_stats()
         prefix_cache_stats_after = _cache_stats(llm)
         prefix_cache_stats_delta = _numeric_delta(prefix_cache_stats_before, prefix_cache_stats_after)
         observed_prefix_hit_tokens = int(sum(prefix_hits_by_seq_id.values()))
@@ -766,6 +779,7 @@ def benchmark_task(method, length, bs, args, results_dict):
             "scheduler_recompute_replays": recompute_replays,
             "decode_cuda_graph_expected": bool(base_hyper_params.get("decode_cuda_graph")),
             **graph_status,
+            "operator_runtime_stats": operator_runtime_stats,
             "prefix_cache_required": bool(getattr(args, "require_prefix_cache_hit", False)),
             "prefix_cache_stats_before": prefix_cache_stats_before,
             "prefix_cache_stats_after": prefix_cache_stats_after,

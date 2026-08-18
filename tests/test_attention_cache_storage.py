@@ -363,6 +363,30 @@ def test_mla_storage_prevalidates_nonuniform_layer_mappings():
     ]
 
 
+def test_mla_storage_batches_equal_width_layer_validation_once():
+    storage = MlaLatentStorage(
+        kv_lora_rank=512,
+        rope_dim=64,
+        dtype=torch.bfloat16,
+    )
+    storage.allocate(num_layers=2, num_slots=4, device=torch.device("cpu"))
+    layer_slots = (
+        torch.tensor([0, 1], dtype=torch.int32),
+        torch.tensor([0, 2], dtype=torch.int32),
+    )
+
+    from sparsevllm.engine.cache_manager.storage import mla_latent
+
+    with patch(
+        "sparsevllm.engine.cache_manager.storage.mla_latent.validate_copy_slot_mappings",
+        wraps=mla_latent.validate_copy_slot_mappings,
+    ) as validate_batch:
+        storage.validate_slot_mappings(layer_slots)
+
+    validate_batch.assert_called_once()
+    assert validate_batch.call_args.args[0].shape == (2, 2)
+
+
 def test_standard_manager_delegates_payload_store_and_compute_view():
     storage = MlaLatentStorage(
         kv_lora_rank=512,

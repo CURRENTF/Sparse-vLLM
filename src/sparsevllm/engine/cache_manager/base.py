@@ -22,6 +22,7 @@ from sparsevllm.kernels.triton.store_kvcache import store_kvcache
 import sparsevllm.platforms as platforms
 from sparsevllm.models.layout import resolve_attention_qk_head_dim
 from sparsevllm.utils.log import logger, log_level
+from sparsevllm.utils.profiler import profiler
 
 
 def _debug_tensor_summary(tensor: torch.Tensor) -> dict[str, Any]:
@@ -1031,7 +1032,8 @@ class CacheManager(ABC):
                     f"layer={layer_idx}."
                 )
             slot_mappings.append(slot_mapping)
-        storage.validate_slot_mappings(tuple(slot_mappings))
+        with profiler.record("cache_validate_decode_slot_mappings"):
+            storage.validate_slot_mappings(tuple(slot_mappings))
 
     def decode_cuda_graph_max_cached_graphs(self) -> int | None:
         """Optional bound for captured decode graph states.

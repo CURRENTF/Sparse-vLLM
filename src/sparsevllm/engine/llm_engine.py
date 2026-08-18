@@ -948,6 +948,15 @@ class LLMEngine:
             )
         return summaries
 
+    def operator_runtime_stats(self) -> list[dict[str, object]]:
+        stats = self.model_runner.call("operator_runtime_stats")
+        if not isinstance(stats, list) or len(stats) != self.config.world_size:
+            raise RuntimeError(
+                "Operator runtime stats did not return one record per world rank: "
+                f"expected={self.config.world_size}, got={stats!r}."
+            )
+        return stats
+
     def debug_last_logits(self) -> torch.Tensor:
         logits = self.model_runner.call("debug_last_logits_cpu")
         if not isinstance(logits, torch.Tensor):

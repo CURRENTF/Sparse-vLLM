@@ -340,6 +340,59 @@ def test_score_path_routes_to_tilelang_with_caller_owned_score() -> None:
         attn_score=score,
         max_context_len=64,
     )
+    assert provider.runtime_kernel_stats() == {
+        "kernel_paths": {
+            "tilelang_score": {
+                "cuda_graph_capture_dispatches": 0,
+                "eager_dispatches": 1,
+            }
+        },
+        "fallback_reasons": {},
+    }
+
+
+def test_noncontiguous_glm_queries_route_to_tilelang() -> None:
+    provider, fa3, tilelang = _provider_with_mocks()
+    score = torch.full((2, 64), -1e20, dtype=torch.float32)
+    view = _view(score=score)
+    q_latent = torch.empty(10, 2, 512, dtype=torch.bfloat16).transpose(0, 1)
+    q_rope = torch.empty(10, 2, 64, dtype=torch.bfloat16).transpose(0, 1)
+    output = torch.empty(q_latent.shape, dtype=q_latent.dtype)
+
+    assert not q_latent.is_contiguous()
+    assert not q_rope.is_contiguous()
+    with patch(
+        "sparsevllm.operators.mla_attention.validate_mla_decode_metadata"
+    ):
+        provider.run(q_latent, q_rope, view, output)
+
+    fa3.assert_not_called()
+    tilelang.assert_called_once()
+
+
+def test_runtime_kernel_stats_distinguish_cuda_graph_capture() -> None:
+    provider, _, tilelang = _provider_with_mocks()
+    view = _view(score=torch.empty(2, 64, dtype=torch.float32))
+    q_latent = torch.empty(2, 10, 512, dtype=torch.bfloat16)
+    q_rope = torch.empty(2, 10, 64, dtype=torch.bfloat16)
+    output = torch.empty_like(q_latent)
+
+    with (
+        patch(
+            "sparsevllm.operators.mla_attention.validate_mla_decode_metadata"
+        ),
+        patch(
+            "sparsevllm.operators.mla_attention.device_runtime.is_stream_capturing",
+            return_value=True,
+        ),
+    ):
+        provider.run(q_latent, q_rope, view, output)
+
+    tilelang.assert_called_once()
+    assert provider.runtime_kernel_stats()["kernel_paths"]["tilelang_score"] == {
+        "cuda_graph_capture_dispatches": 1,
+        "eager_dispatches": 0,
+    }
 
 
 def test_no_score_path_remains_fa3() -> None:
@@ -452,6 +505,9 @@ def test_noncontiguous_tilelang_inputs_use_triton(noncontiguous: str) -> None:
     fa3.assert_not_called()
     tilelang.assert_not_called()
     triton.assert_called_once()
+    assert provider.runtime_kernel_stats()["fallback_reasons"] == {
+        f"noncontiguous:{noncontiguous}": 1
+    }
 
 
 def test_tilelang_runner_rejects_unaligned_score_capacity_before_import() -> None:
