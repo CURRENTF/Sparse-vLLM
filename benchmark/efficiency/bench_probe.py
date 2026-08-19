@@ -300,6 +300,8 @@ def run_vllm_probe(
         tensor_parallel_size=args.tensor_parallel_size,
         gpu_memory_utilization=args.gpu_memory_utilization,
         max_model_len=max_len_needed,
+        enable_prefix_caching=False,
+        disable_log_stats=True,
         trust_remote_code=True,
     )
 
@@ -307,47 +309,54 @@ def run_vllm_probe(
         for o_len in args.output_lens:
             for bs in args.batch_sizes:
                 print(f"\n---> Benchmarking vLLM Sweep: PromptLen={p_len}, OutputLen={o_len}, BatchSize={bs} <---")
-                prompt_tokens = [{"prompt_token_ids": [100] * p_len} for _ in range(bs)]
                 sampling_params = SamplingParams(
                     temperature=0.0,
                     top_p=1.0,
                     top_k=1,
                     ignore_eos=True,
                     max_tokens=o_len,
+                    detokenize=False,
                 )
 
-                # Warmup
+                # Warmup with unique token IDs
                 for w_idx in range(args.num_warmups):
                     print(f"  [Warmup {w_idx + 1}/{args.num_warmups}]...")
-                    llm.generate(prompt_tokens, sampling_params=sampling_params)
+                    warmup_prompts = [{"prompt_token_ids": [50 + w_idx] * p_len} for _ in range(bs)]
+                    llm.generate(warmup_prompts, sampling_params=sampling_params, use_tqdm=False)
 
                 torch.cuda.synchronize()
                 torch.cuda.reset_peak_memory_stats()
 
                 iter_records = []
                 for it in range(args.num_iters):
+                    prompt_token_id = 100 + it * 17
+                    prompt_tokens = [{"prompt_token_ids": [prompt_token_id] * p_len} for _ in range(bs)]
+                    
+                    # 1. Measure TTFT via single-token prefill
+                    torch.cuda.synchronize()
+                    t_ttft_0 = time.perf_counter()
+                    llm.generate(
+                        prompt_tokens,
+                        sampling_params=SamplingParams(temperature=0.0, max_tokens=1, ignore_eos=True, detokenize=False),
+                        use_tqdm=False,
+                    )
+                    torch.cuda.synchronize()
+                    ttft_ms = (time.perf_counter() - t_ttft_0) * 1000.0
+
+                    # 2. Measure full generation with fresh prompt tokens to avoid any cache
+                    gen_prompt_tokens = [{"prompt_token_ids": [prompt_token_id + 1] * p_len} for _ in range(bs)]
                     torch.cuda.synchronize()
                     t0 = time.perf_counter()
                     outputs = llm.generate(
-                        prompt_tokens,
+                        gen_prompt_tokens,
                         sampling_params=sampling_params,
+                        use_tqdm=False,
                     )
                     torch.cuda.synchronize()
                     t1 = time.perf_counter()
 
                     total_duration_ms = (t1 - t0) * 1000.0
                     peak_mem_gb = torch.cuda.max_memory_allocated() / (1024 ** 3)
-
-                    # Estimate TTFT & TPOT
-                    # In standard generate, TTFT is roughly prefill duration, TPOT is rest / o_len
-                    # For vLLM, measure TTFT with single-token generation:
-                    t_ttft_0 = time.perf_counter()
-                    llm.generate(
-                        prompt_tokens,
-                        sampling_params=SamplingParams(temperature=0.0, max_tokens=1, ignore_eos=True),
-                    )
-                    torch.cuda.synchronize()
-                    ttft_ms = (time.perf_counter() - t_ttft_0) * 1000.0
 
                     decode_time_ms = max(0.001, total_duration_ms - ttft_ms)
                     tpot_ms = decode_time_ms / max(1, (o_len - 1))
