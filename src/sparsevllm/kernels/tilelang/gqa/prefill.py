@@ -28,14 +28,9 @@ import tilelang.language as T
     },
 )
 def _build_fused_gqa_kernel(
-    batch_size: int,
-    total_q_tokens: int,
     h_q: int,
     h_kv: int,
     head_dim: int,
-    cache_slots: int,
-    slot_rows: int,
-    max_context_len: int,
     block_M: int = 64,
     block_N: int = 64,
     softmax_scale: float | None = None,
@@ -48,18 +43,28 @@ def _build_fused_gqa_kernel(
     accum_dtype = T.float32
     gqa_ratio = h_q // h_kv
 
+    total_q = T.symbolic("total_q")
+    cache_slots = T.symbolic("cache_slots")
+    slot_rows = T.symbolic("slot_rows")
+    slot_cols = T.symbolic("slot_cols")
+    B = T.symbolic("B")
+    B_plus_1 = T.symbolic("B_plus_1")
+    score_len = T.symbolic("score_len")
+
     @T.prim_func
     def main_gqa(
-        Q: T.Tensor([total_q_tokens, h_q, head_dim], dtype),
+        Q: T.Tensor([total_q, h_q, head_dim], dtype),
         K: T.Tensor([cache_slots, h_kv, head_dim], dtype),
         V: T.Tensor([cache_slots, h_kv, head_dim], dtype),
-        active_slots: T.Tensor([slot_rows, max_context_len], T.int32),
-        request_indices: T.Tensor([batch_size], T.int32),
-        context_lens: T.Tensor([batch_size], T.int32),
-        prompt_cache_lens: T.Tensor([batch_size], T.int32),
-        cu_seqlens_q: T.Tensor([batch_size + 1], T.int32),
-        Output: T.Tensor([total_q_tokens, h_q, head_dim], dtype),
-        AttnScore: T.Tensor([batch_size, max_context_len], accum_dtype),
+        active_slots: T.Tensor([slot_rows, slot_cols], T.int32),
+        request_indices: T.Tensor([B], T.int32),
+        context_lens: T.Tensor([B], T.int32),
+        prompt_cache_lens: T.Tensor([B], T.int32),
+        cu_seqlens_q: T.Tensor([B_plus_1], T.int32),
+        Output: T.Tensor([total_q, h_q, head_dim], dtype),
+        AttnScore: T.Tensor([B, score_len], accum_dtype),
+        batch_size: T.int32,
+        max_context_len: T.int32,
     ):
         with T.Kernel(batch_size, h_q, T.ceildiv(max_context_len, block_M), threads=128) as (bx, by, bz):
             Q_shared = T.alloc_shared([block_M, head_dim], dtype)
@@ -161,14 +166,9 @@ def _build_fused_gqa_kernel(
 
 
 def _get_fused_prefill_kernel(
-    batch_size: int,
-    total_q_tokens: int,
     h_q: int,
     h_kv: int,
     head_dim: int,
-    cache_slots: int,
-    slot_rows: int,
-    max_context_len: int,
     block_M: int = 64,
     block_N: int = 64,
     softmax_scale: float | None = None,
@@ -179,14 +179,9 @@ def _get_fused_prefill_kernel(
     scale = float(softmax_scale * 1.44269504)  # log2(e)
 
     key = (
-        batch_size,
-        total_q_tokens,
         h_q,
         h_kv,
         head_dim,
-        cache_slots,
-        slot_rows,
-        max_context_len,
         block_M,
         block_N,
         round(scale, 6),
@@ -196,14 +191,9 @@ def _get_fused_prefill_kernel(
         return _KERNEL_CACHE[key]
 
     compiled = _build_fused_gqa_kernel(
-        batch_size=batch_size,
-        total_q_tokens=total_q_tokens,
         h_q=h_q,
         h_kv=h_kv,
         head_dim=head_dim,
-        cache_slots=cache_slots,
-        slot_rows=slot_rows,
-        max_context_len=max_context_len,
         block_M=block_M,
         block_N=block_N,
         softmax_scale=softmax_scale,
@@ -214,36 +204,18 @@ def _get_fused_prefill_kernel(
 
 
 def _get_kv_score_kernel(
-    batch_size: int,
-    total_q_tokens: int,
     h_q: int,
     h_kv: int,
     head_dim: int,
-    cache_slots: int,
-    slot_rows: int,
-    slot_cols: int,
-    score_len: int,
-    max_context_len: int,
-    candidate_start: int,
-    num_recent_tokens: int,
     block_M_per_head: int = 32,
     heads_per_group: int = 8,
     block_N: int = 128,
     threads: int = 128,
 ):
     key = (
-        batch_size,
-        total_q_tokens,
         h_q,
         h_kv,
         head_dim,
-        cache_slots,
-        slot_rows,
-        slot_cols,
-        score_len,
-        max_context_len,
-        candidate_start,
-        num_recent_tokens,
         block_M_per_head,
         heads_per_group,
         block_N,
@@ -260,6 +232,13 @@ def _get_kv_score_kernel(
     num_head_groups = gqa_ratio // heads_per_group
     total_block_M = heads_per_group * block_M_per_head
 
+    total_q = T.symbolic("total_q")
+    num_slots = T.symbolic("num_slots")
+    slot_rows = T.symbolic("slot_rows")
+    slot_cols = T.symbolic("slot_cols")
+    score_len = T.symbolic("score_len")
+    B = T.symbolic("B")
+
     @tilelang.jit(
         out_idx=[],
         pass_configs={
@@ -269,16 +248,20 @@ def _get_kv_score_kernel(
     def _jit_kernel():
         @T.prim_func
         def main_kv_score_pruned(
-            Q: T.Tensor([total_q_tokens, h_q, head_dim], dtype),
-            K: T.Tensor([cache_slots, h_kv, head_dim], dtype),
+            Q: T.Tensor([total_q, h_q, head_dim], dtype),
+            K: T.Tensor([num_slots, h_kv, head_dim], dtype),
             active_slots: T.Tensor([slot_rows, slot_cols], T.int32),
-            request_indices: T.Tensor([batch_size], T.int32),
-            context_lens: T.Tensor([batch_size], T.int32),
-            prompt_cache_lens: T.Tensor([batch_size], T.int32),
-            b_start_loc: T.Tensor([batch_size], T.int32),
-            score_q_starts: T.Tensor([batch_size], T.int32),
-            score_q_ends: T.Tensor([batch_size], T.int32),
-            AttnScore: T.Tensor([batch_size, score_len], accum_dtype),
+            request_indices: T.Tensor([B], T.int32),
+            context_lens: T.Tensor([B], T.int32),
+            prompt_cache_lens: T.Tensor([B], T.int32),
+            b_start_loc: T.Tensor([B], T.int32),
+            score_q_starts: T.Tensor([B], T.int32),
+            score_q_ends: T.Tensor([B], T.int32),
+            AttnScore: T.Tensor([B, score_len], accum_dtype),
+            batch_size: T.int32,
+            max_context_len: T.int32,
+            candidate_start: T.int32,
+            num_recent_tokens: T.int32,
         ):
             num_kv_head_splits = h_kv * num_head_groups
             with T.Kernel(
@@ -438,14 +421,9 @@ def gqa_paged_prefill_attention_tilelang(
         target_score.fill_(-torch.inf)
 
     kernel = _get_fused_prefill_kernel(
-        batch_size=batch_size,
-        total_q_tokens=total_q_tokens,
         h_q=h_q,
         h_kv=h_kv,
         head_dim=head_dim,
-        cache_slots=cache_slots,
-        slot_rows=slot_rows,
-        max_context_len=max_context_len,
         block_M=64,
         block_N=64,
         softmax_scale=sm_scale,
@@ -462,6 +440,8 @@ def gqa_paged_prefill_attention_tilelang(
         cu_seqlens_q,
         output,
         target_score,
+        batch_size,
+        max_context_len,
     )
     return output
 
@@ -552,18 +532,9 @@ def gqa_prefill_score_tilelang(
 
     attn_score.fill_(-torch.inf)
     kernel = _get_kv_score_kernel(
-        batch_size=batch_size,
-        total_q_tokens=total_q_tokens,
         h_q=h_q,
         h_kv=h_kv,
         head_dim=head_dim,
-        cache_slots=cache_slots,
-        slot_rows=slot_rows,
-        slot_cols=slot_cols,
-        score_len=score_len,
-        max_context_len=max_context_len,
-        candidate_start=int(candidate_start),
-        num_recent_tokens=int(num_recent_tokens),
         block_M_per_head=32,
         heads_per_group=heads_per_group,
         block_N=128,
@@ -580,4 +551,8 @@ def gqa_prefill_score_tilelang(
         score_q_start,
         score_q_end,
         attn_score,
+        batch_size,
+        max_context_len,
+        int(candidate_start),
+        int(num_recent_tokens),
     )
