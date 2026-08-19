@@ -206,6 +206,7 @@ def build_chain_cache_fingerprint(config: Any) -> bytes:
             "decode_keep_tokens",
             "snapkv_window_size",
             "snapkv_num_full_layers",
+            "sparse_prefill_score_mode",
             "sparse_attn_score_dtype",
             "pool_kernel_size",
         ),
@@ -215,6 +216,7 @@ def build_chain_cache_fingerprint(config: Any) -> bytes:
             "h2o_prefill_budget",
             "h2o_recent_ratio",
             "h2o_prefill_score_window",
+            "sparse_prefill_score_mode",
             "sparse_attn_score_dtype",
         ),
         "pyramidkv": (
@@ -222,6 +224,7 @@ def build_chain_cache_fingerprint(config: Any) -> bytes:
             "num_recent_tokens",
             "decode_keep_tokens",
             "snapkv_window_size",
+            "sparse_prefill_score_mode",
             "pyramid_layer_ratios",
             "pyramidkv_start_layer",
             "pyramidkv_start_ratio",

@@ -138,7 +138,7 @@ def _view_score_kind(view: Any) -> AttentionScoreKind:
 @PREFILL_ATTENTION_REGISTRY.register
 class FlashInferPagedPrefillAttentionProvider(PrefillAttentionProvider):
     name = "flashinfer_paged_prefill_fa3_sm90"
-    priority = 100
+    priority = 180
     capabilities = AttentionKernelCapabilities(
         platforms=frozenset({PlatformEnum.CUDA}),
         compute_capabilities=frozenset({(9, 0)}),
@@ -461,6 +461,92 @@ class SglFa3PagedPrefillAttentionProvider(PrefillAttentionProvider):
             cu_seqlens_q=qo_indptr,
             max_seqlen_q=self._max_query_len,
             validation_scope=validation_scope,
+        )
+
+
+@PREFILL_ATTENTION_REGISTRY.register
+class TilelangGqaPagedPrefillAttentionProvider(PrefillAttentionProvider):
+    """TileLang GQA paged prefill with optional fused score extraction on SM90."""
+
+    name = "tilelang_gqa_paged_prefill_sm90"
+    priority = 150
+    capabilities = AttentionKernelCapabilities(
+        platforms=frozenset({PlatformEnum.CUDA}),
+        compute_capabilities=frozenset({(9, 0)}),
+        activation_dtypes=frozenset({torch.bfloat16}),
+        head_dims=frozenset({128}),
+        page_sizes=frozenset({1}),
+        score_outputs=frozenset({
+            AttentionScoreKind.NONE,
+            AttentionScoreKind.RAW_QK_REDUCED,
+        }),
+        layer_varying_page_table=True,
+        varlen=True,
+        minimum_runtime_version=(12, 3),
+    )
+
+    @classmethod
+    def supports(
+        cls, spec: PrefillAttentionOpSpec, caps: DeviceCaps
+    ) -> SupportResult:
+        common = match_attention_capabilities(
+            spec.kernel_request, caps, cls.capabilities
+        )
+        if not common.supported:
+            return common
+        if not spec.causal:
+            return SupportResult.no("requires causal attention")
+        from sparsevllm.kernels.tilelang.gqa.runtime import (
+            tilelang_gqa_device_support,
+        )
+
+        supported, reason = tilelang_gqa_device_support(caps.device_index)
+        return SupportResult.yes(reason) if supported else SupportResult.no(reason)
+
+    def run(
+        self,
+        spec,
+        q,
+        view,
+        *,
+        qo_indptr,
+        chunk_lens,
+        max_context_len,
+        layer_idx,
+    ):
+        del max_context_len, layer_idx
+        payload, meta = _view_parts(view)
+        _validate_token_page_table(meta)
+        if q.dtype != spec.activation_dtype:
+            raise TypeError(
+                f"TileLang GQA paged prefill expected {spec.activation_dtype} Q, got {q.dtype}."
+            )
+        if payload.k_cache.dtype != q.dtype or payload.v_cache.dtype != q.dtype:
+            raise TypeError(
+                "TileLang GQA paged prefill requires Q/K/V with the same dtype, got "
+                f"{q.dtype}/{payload.k_cache.dtype}/{payload.v_cache.dtype}."
+            )
+        if qo_indptr.dtype != torch.int32 or chunk_lens.dtype != torch.int32:
+            raise TypeError("TileLang GQA paged prefill requires int32 sequence metadata.")
+
+        from sparsevllm.kernels.tilelang.gqa.prefill import (
+            gqa_paged_prefill_attention_tilelang,
+        )
+
+        prompt_cache_lens = meta.context_lens - chunk_lens
+        output = torch.empty_like(q)
+        return gqa_paged_prefill_attention_tilelang(
+            q,
+            payload.k_cache,
+            payload.v_cache,
+            meta.active_slots,
+            meta.req_indices,
+            meta.context_lens,
+            prompt_cache_lens,
+            qo_indptr,
+            output,
+            attn_score=meta.attn_score,
+            sm_scale=spec.softmax_scale,
         )
 
 

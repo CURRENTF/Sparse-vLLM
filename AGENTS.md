@@ -23,6 +23,56 @@ This repository includes repo-local Codex skills.
 # Task Running Rules
 
 1. Before running a task, check whether each device is idle. Select an idle device when one is available. If all devices are busy, wait first; if the wait becomes too long, report the situation instead of starting the task on a busy device.
+2. Do not hardcode private paths (including local machine paths and remote paths) in test scripts; pass them via variables or arguments instead. Scripts located under `scripts/tmp/` are exempt from this restriction.
+
+# Standardized Efficiency & Performance Benchmark Suite
+
+This repo provides a unified, multidimensional efficiency benchmark suite under `benchmark/efficiency/` and `scripts/benchmarks/run_efficiency_probe.sh` to quantify GPU compute/bandwidth saturation and CPU scheduling bubbles.
+
+## Core Metrics
+- **Prefill MFU (%)**: Model FLOPs Utilization against hardware BF16 Tensor Core peak (e.g., 989 TFLOPS/H100).
+- **Decode MBU (%)**: Model Bandwidth Utilization against HBM physical bandwidth peak (e.g., 3.35 TB/s/H100).
+- **Active Duty Cycle (%)**: Time fraction where GPU is actively executing kernels.
+- **Host Launch Bubble (%)**: `100% - Active Duty Cycle`, measuring CPU scheduling, Python GIL, and kernel launch latency gaps.
+- **Phase Decoupling**: TTFT (Time to First Token) and TPOT (Time per Output Token) measured via CUDA Events.
+- **Artifact Standards**: Automatically saves `run_manifest.json`, `raw_samples.jsonl`, `summary.json`, and `comparison_report.md`.
+
+## Standard Usage
+
+### 1. Cross-System Length Ladder Sweep (Synthetic Probe)
+To run a fast (~2 min) controlled length sweep (8k, 16k, 32k) comparing Sparse-vLLM and vLLM:
+```bash
+# Compare svllm-vanilla, svllm-snapkv, and vllm-vanilla on Qwen3-30B (TP=2)
+bash scripts/benchmarks/run_efficiency_probe.sh \
+  "svllm-vanilla,svllm-snapkv,vllm-vanilla" \
+  "qwen3_30b" \
+  "0,1"
+
+# Custom prompt lengths, output lengths (512 is recommended for representative decode metrics), and output directory
+PROMPT_LENS="8192,16384,32768" OUTPUT_LENS="512" SPARSEVLLM_OUTPUT_DIR="outputs/my_probe" \
+  bash scripts/benchmarks/run_efficiency_probe.sh "svllm-vanilla,svllm-snapkv,vllm-vanilla" "qwen3_30b" "0,1"
+```
+
+### 2. Standalone Efficiency Probe CLI
+```bash
+python3 benchmark/efficiency/bench_probe.py \
+  --engine sparsevllm \
+  --sparse-method snapkv \
+  --model-path <MODEL_PATH> \
+  --prompt-lens 8192,16384,32768 \
+  --output-lens 512 \
+  --tensor-parallel-size 2 \
+  --output-dir outputs/probe_results
+```
+
+### 3. High-Resolution Hardware & Bubble Monitor
+```bash
+python3 benchmark/efficiency/hardware_monitor.py \
+  --gpus "0,1" \
+  --interval_ms 200 \
+  --output_file outputs/gpu_timeline.json
+```
+
 
 # Research Code Skill
 

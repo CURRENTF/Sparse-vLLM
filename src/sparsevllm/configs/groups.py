@@ -57,6 +57,7 @@ class SparseMethodConfig:
 
     snapkv_window_size: int = 32
     snapkv_num_full_layers: int = 0
+    sparse_prefill_score_mode: str = "probability"
 
     h2o_decode_budget: int = 4096
     h2o_decode_eviction_interval: int = 128

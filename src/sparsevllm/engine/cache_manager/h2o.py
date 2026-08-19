@@ -8,7 +8,6 @@ import torch
 import torch.nn.functional as F
 
 from sparsevllm.engine.sequence import Sequence
-from sparsevllm.kernels.triton.prefill_score import prefill_score_fwd
 from sparsevllm.utils.context import get_context
 from sparsevllm.utils.profiler import profiler
 
@@ -27,9 +26,11 @@ class H2OCacheManager(SnapKVCacheManager):
     """H2O physical KV eviction with one score vector per layer and sequence.
 
     Sparse-vLLM owns one physical token row shared by all KV heads, so this v1
-    implementation takes the max raw QK logit across query heads, normalizes the
-    resulting token vector, and maintains one cumulative importance vector
-    aligned with that row.
+    implementation maintains one cumulative normalized token-importance vector
+    aligned with that row. The default prefill path accumulates normalized
+    attention mass. The experimental TileLang path max-reduces raw QK over the
+    observation queries and query heads, normalizes that token vector, and then
+    accumulates it on the same per-query mass scale.
     """
 
     def __init__(self, config, parallel_context):
@@ -624,6 +625,36 @@ class H2OCacheManager(SnapKVCacheManager):
         cumulative.add_(step_score[:new_len].float(), alpha=float(weight))
         return cumulative
 
+    @staticmethod
+    def _normalize_raw_prefill_score(
+        step_score: torch.Tensor,
+        *,
+        new_len: int,
+    ) -> torch.Tensor:
+        """Normalize raw-QK prefill logits to step attention probabilities.
+
+        In TileLang raw-QK mode, un-scored positions (e.g. non-candidates outside
+        the observation window or sink/recent boundaries) retain -inf and map to
+        zero probability under softmax.
+        """
+        if step_score.dim() != 1 or int(step_score.numel()) < int(new_len):
+            raise ValueError(
+                "H2O raw prefill score must be a 1D vector covering new_len: "
+                f"shape={tuple(step_score.shape)} new_len={int(new_len)}."
+            )
+        logits = step_score[: int(new_len)].float()
+        has_invalid = (torch.isnan(logits) | (logits == torch.inf)).any()
+        has_finite = torch.isfinite(logits).any()
+        valid = (~has_invalid) & has_finite
+        if valid.is_cuda:
+            torch._assert_async(valid)
+        elif not bool(valid.item()):
+            raise RuntimeError(
+                "H2O raw prefill score contains invalid non-finite values (NaN or +inf) "
+                "or lacks any finite score."
+            )
+        return torch.softmax(logits, dim=0)
+
     def _physical_row_len(self, layer_idx: int, seq: Sequence) -> int:
         row_idx = self.seq_id_to_row[layer_idx].get(int(seq.seq_id))
         if row_idx is None:
@@ -731,7 +762,11 @@ class H2OCacheManager(SnapKVCacheManager):
                     f"context={context_len} chunk={chunk_len}."
                 )
             score_end = context_len
-            score_start = max(prompt_cache_len, context_len - window)
+            score_start = (
+                max(prompt_cache_len, context_len - window)
+                if window > 0
+                else prompt_cache_len
+            )
             ranges.append((batch_idx, seq, prompt_cache_len, score_start, score_end))
         return ranges
 
@@ -783,20 +818,21 @@ class H2OCacheManager(SnapKVCacheManager):
                 f"physical={physical_context_lens.tolist()}."
             )
         max_context_len = max(item[4] for item in ranges)
-        step_score = torch.zeros(
-            (len(seqs), max_context_len), dtype=torch.float32, device=q.device
+        step_score = torch.full(
+            (len(seqs), max_context_len),
+            self._prefill_score_initial_value(),
+            dtype=torch.float32,
+            device=q.device,
         )
         prompt_cache_lens = meta.context_lens - chunk_lens
-        prefill_score_fwd(
+        self._run_prefill_score(
             q,
             payload.k_cache,
             step_score,
-            meta.req_indices,
+            meta,
             b_start_loc,
-            meta.context_lens,
             prompt_cache_lens,
             max(int(seq.current_chunk_size) for seq in seqs),
-            meta.active_slots,
             score_starts,
             score_ends,
             candidate_start=0,
@@ -818,9 +854,15 @@ class H2OCacheManager(SnapKVCacheManager):
                     f"prompt_cache_len={prompt_cache_len}."
                 )
             effective_queries = score_end - score_start
+            score_row = step_score[batch_idx]
+            if self.config.sparse_prefill_score_mode == "tilelang_raw_qk":
+                score_row = self._normalize_raw_prefill_score(
+                    score_row,
+                    new_len=score_end,
+                )
             cumulative = self._accumulate_score(
                 previous,
-                step_score[batch_idx],
+                score_row,
                 new_len=score_end,
                 weight=float(effective_queries),
             )

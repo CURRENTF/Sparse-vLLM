@@ -73,6 +73,9 @@ def build_prefix_cache_fingerprint(config: Any, block_size: int) -> bytes:
         "decode_keep_tokens": _jsonable(getattr(config, "decode_keep_tokens", None)),
         "num_sink_tokens": _jsonable(getattr(config, "num_sink_tokens", None)),
         "num_recent_tokens": _jsonable(getattr(config, "num_recent_tokens", None)),
+        "sparse_prefill_score_mode": _jsonable(
+            getattr(config, "sparse_prefill_score_mode", None)
+        ),
         "full_attn_layers": _jsonable(getattr(config, "full_attn_layers", None)),
         "obs_layer_ids": _jsonable(getattr(config, "obs_layer_ids", None)),
         "quest_chunk_size": _jsonable(getattr(config, "quest_chunk_size", None)),

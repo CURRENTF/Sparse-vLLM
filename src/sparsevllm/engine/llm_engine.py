@@ -1001,6 +1001,7 @@ class LLMEngine:
             "obs_layer_ids",
             "snapkv_window_size",
             "snapkv_num_full_layers",
+            "sparse_prefill_score_mode",
             "h2o_decode_budget",
             "h2o_decode_eviction_interval",
             "h2o_prefill_budget",

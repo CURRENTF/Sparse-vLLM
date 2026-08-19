@@ -364,7 +364,7 @@ def get_pred(rank, data, dataset_info, args, model, tokenizer, model_max_length,
     out_path = dataset_info['out_path']
     out_root = dataset_info['out_root']
 
-    batch_size = args.batch_size
+    batch_size = len(data) if args.batch_size <= 0 else args.batch_size
     failures: list[dict[str, Any]] = []
     for i in tqdm(range(0, len(data), batch_size), desc=f'[Rank {rank}] {dataset}'):
         batch_data = data[i:i + batch_size]
@@ -606,6 +606,15 @@ def worker(rank, world_size, datasets, dataset2prompt, dataset2maxlen, args, out
             eos_token_ids,
         )
         torch.cuda.empty_cache()
+
+    try:
+        from sparsevllm.utils.profiler import profiler
+        snap = profiler.snapshot()
+        if snap:
+            with open(os.path.join(out_root, f"profiler_snapshot_rank{rank}.json"), "w", encoding="utf-8") as f:
+                json.dump(snap, f, indent=2, ensure_ascii=False)
+    except Exception as exc:
+        print(f"[Warning] Failed to dump profiler snapshot: {exc}")
 
     _write_decode_cuda_graph_status(
         generate_fn=model,

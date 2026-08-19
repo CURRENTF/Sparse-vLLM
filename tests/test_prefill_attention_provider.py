@@ -1,4 +1,9 @@
+import builtins
 import gc
+import importlib
+import os
+import sys
+import tempfile
 import weakref
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -22,6 +27,7 @@ from sparsevllm.operators.prefill_attention import (
     PreparedPrefillAttentionOp,
     PrefillAttentionOpSpec,
     SglFa3PagedPrefillAttentionProvider,
+    TilelangGqaPagedPrefillAttentionProvider,
     TritonPagedPrefillAttentionProvider,
 )
 from sparsevllm.operators.attention_capabilities import AttentionScoreKind
@@ -63,23 +69,23 @@ def _h100_caps(**overrides) -> DeviceCaps:
 
 
 @pytest.mark.parametrize(
-    ("method", "collection"),
+    ("method", "main_score", "collection"),
     [
-        ("", PrefillScoreCollectionKind.NONE),
-        ("snapkv", PrefillScoreCollectionKind.METHOD_OWNED_POSTHOC_REDUCED),
-        ("pyramidkv", PrefillScoreCollectionKind.METHOD_OWNED_POSTHOC_REDUCED),
-        ("h2o", PrefillScoreCollectionKind.METHOD_OWNED_POSTHOC_REDUCED),
-        ("rkv", PrefillScoreCollectionKind.METHOD_OWNED_POSTHOC_REDUCED),
-        ("omnikv", PrefillScoreCollectionKind.NONE),
-        ("deltakv", PrefillScoreCollectionKind.NONE),
+        ("", AttentionScoreKind.NONE, PrefillScoreCollectionKind.NONE),
+        ("snapkv", AttentionScoreKind.NONE, PrefillScoreCollectionKind.METHOD_OWNED_POSTHOC_REDUCED),
+        ("pyramidkv", AttentionScoreKind.NONE, PrefillScoreCollectionKind.METHOD_OWNED_POSTHOC_REDUCED),
+        ("h2o", AttentionScoreKind.NONE, PrefillScoreCollectionKind.METHOD_OWNED_POSTHOC_REDUCED),
+        ("rkv", AttentionScoreKind.NONE, PrefillScoreCollectionKind.METHOD_OWNED_POSTHOC_REDUCED),
+        ("omnikv", AttentionScoreKind.NONE, PrefillScoreCollectionKind.NONE),
+        ("deltakv", AttentionScoreKind.NONE, PrefillScoreCollectionKind.NONE),
     ],
 )
 def test_sparse_prefill_contract_separates_main_and_posthoc_scores(
-    method, collection
+    method, main_score, collection
 ):
     contract = sparse_prefill_attention_contract(method)
 
-    assert contract.main_score_kind is AttentionScoreKind.NONE
+    assert contract.main_score_kind is main_score
     assert contract.score_collection is collection
 
 
@@ -183,6 +189,10 @@ def test_flashinfer_provider_rejects_unsupported_contracts(spec, caps, reason):
 
 
 @patch(
+    "sparsevllm.kernels.tilelang.gqa.runtime.tilelang_gqa_device_support",
+    return_value=(False, "tilelang is not installed"),
+)
+@patch(
     "sparsevllm.operators.prefill_attention.version",
     return_value="0.6.14",
 )
@@ -191,7 +201,7 @@ def test_flashinfer_provider_rejects_unsupported_contracts(spec, caps, reason):
     "sparsevllm.operators.prefill_attention.sgl_fa3_device_support",
     return_value=(False, "sglang-kernel is not installed"),
 )
-def test_resolver_falls_back_when_flashinfer_is_too_old(_sgl, _find, _version):
+def test_resolver_falls_back_when_flashinfer_is_too_old(_sgl, _find, _version, _tl):
     resolved = OpResolver(PREFILL_ATTENTION_REGISTRY).resolve(
         _spec(), _h100_caps()
     )
@@ -203,11 +213,15 @@ def test_resolver_falls_back_when_flashinfer_is_too_old(_sgl, _find, _version):
 
 
 @patch(
+    "sparsevllm.kernels.tilelang.gqa.runtime.tilelang_gqa_device_support",
+    return_value=(False, "tilelang is not installed"),
+)
+@patch(
     "sparsevllm.operators.prefill_attention.sgl_fa3_device_support",
     return_value=(False, "unsupported sglang-kernel FA3 fwd schema"),
 )
 def test_resolver_falls_back_to_triton_for_variant_table_when_sgl_abi_rejected(
-    _support,
+    _support, _tl
 ):
     resolved = OpResolver(PREFILL_ATTENTION_REGISTRY).resolve(
         _spec(
@@ -223,6 +237,101 @@ def test_resolver_falls_back_to_triton_for_variant_table_when_sgl_abi_rejected(
         "sgl_fa3_paged_prefill_sm90",
         "unsupported sglang-kernel FA3 fwd schema",
     ) in resolved.rejected
+
+
+@patch(
+    "sparsevllm.kernels.tilelang.gqa.runtime.tilelang_gqa_device_support",
+    return_value=(True, "available"),
+)
+@patch(
+    "sparsevllm.operators.prefill_attention.sgl_fa3_device_support",
+    return_value=(True, "available"),
+)
+def test_resolver_prefers_tilelang_for_scored_prefill(_sgl, _tl):
+    resolved = OpResolver(PREFILL_ATTENTION_REGISTRY).resolve(
+        _spec(
+            num_query_heads=16,
+            num_kv_heads=2,
+            score_output=AttentionScoreKind.RAW_QK_REDUCED,
+        ),
+        _h100_caps(),
+    )
+    assert resolved.provider.name == "tilelang_gqa_paged_prefill_sm90"
+
+
+@patch(
+    "sparsevllm.kernels.tilelang.gqa.runtime.tilelang_gqa_device_support",
+    return_value=(True, "available"),
+)
+@patch(
+    "sparsevllm.operators.prefill_attention.sgl_fa3_device_support",
+    return_value=(False, "sglang-kernel is not installed"),
+)
+def test_resolver_prefers_tilelang_when_sgl_not_installed(_sgl, _tl):
+    resolved = OpResolver(PREFILL_ATTENTION_REGISTRY).resolve(
+        _spec(num_query_heads=16, num_kv_heads=2),
+        _h100_caps(),
+    )
+    assert resolved.provider.name == "tilelang_gqa_paged_prefill_sm90"
+
+
+@patch(
+    "sparsevllm.kernels.tilelang.gqa.runtime.tilelang_gqa_device_support",
+    return_value=(True, "available"),
+)
+@patch(
+    "sparsevllm.operators.prefill_attention.sgl_fa3_device_support",
+    return_value=(True, "available"),
+)
+def test_resolver_keeps_sgl_priority_when_tilelang_is_also_available(_sgl, _tl):
+    resolved = OpResolver(PREFILL_ATTENTION_REGISTRY).resolve(
+        _spec(num_query_heads=16, num_kv_heads=2),
+        _h100_caps(),
+    )
+    assert resolved.provider.name == "sgl_fa3_paged_prefill_sm90"
+
+
+def test_tilelang_provider_rejects_per_head_score_contract():
+    result = TilelangGqaPagedPrefillAttentionProvider.supports(
+        _spec(
+            num_query_heads=16,
+            num_kv_heads=2,
+            score_output=AttentionScoreKind.RAW_QK_PER_HEAD,
+        ),
+        _h100_caps(),
+    )
+
+    assert not result.supported
+    assert "RAW_QK_PER_HEAD" in result.reason
+
+
+def test_tilelang_support_probe_does_not_import_compiler(monkeypatch):
+    module_name = "sparsevllm.kernels.tilelang.gqa.runtime"
+    package_name = "sparsevllm.kernels.tilelang.gqa"
+    sys.modules.pop(module_name, None)
+    sys.modules.pop(package_name, None)
+    compiler_modules_before = {
+        name for name in sys.modules if name == "tilelang" or name.startswith("tilelang.")
+    }
+    monkeypatch.delenv("TMPDIR", raising=False)
+    original_tempdir = tempfile.tempdir
+    real_import = builtins.__import__
+
+    def guarded_import(name, *args, **kwargs):
+        if name == "tilelang" or name.startswith("tilelang."):
+            raise AssertionError(f"support probe imported compiler module {name}")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    runtime = importlib.import_module(module_name)
+
+    assert callable(runtime.tilelang_gqa_device_support)
+    compiler_modules_after = {
+        name for name in sys.modules if name == "tilelang" or name.startswith("tilelang.")
+    }
+    assert compiler_modules_after == compiler_modules_before
+    assert "TMPDIR" not in os.environ
+    assert tempfile.tempdir is original_tempdir
 
 
 @patch(

@@ -829,6 +829,53 @@ class PrefillPolicyConfigTest(unittest.TestCase):
         self.assertEqual(config.h2o_decode_budget, 4096)
         self.assertEqual(config.h2o_decode_eviction_interval, 64)
 
+    def test_h2o_raw_prefill_score_accepts_full_chunk_window(self):
+        full_chunk = self.make_config(
+            vllm_sparse_method="h2o",
+            sparse_prefill_score_mode="tilelang_raw_qk",
+            h2o_prefill_score_window=0,
+        )
+        large_window = self.make_config(
+            vllm_sparse_method="h2o",
+            sparse_prefill_score_mode="tilelang_raw_qk",
+            h2o_prefill_score_window=512,
+        )
+
+        self.assertEqual(full_chunk.h2o_prefill_score_window, 0)
+        self.assertEqual(large_window.h2o_prefill_score_window, 512)
+        with self.assertRaisesRegex(ValueError, "must be non-negative"):
+            self.make_config(
+                vllm_sparse_method="h2o",
+                sparse_prefill_score_mode="tilelang_raw_qk",
+                h2o_prefill_score_window=-1,
+            )
+
+    def test_sparse_prefill_score_mode_is_explicit_and_validated(self):
+        default = self.make_config(vllm_sparse_method="snapkv")
+        raw = self.make_config(
+            vllm_sparse_method="pyramidkv",
+            sparse_prefill_score_mode=" TileLang_RAW_QK ",
+        )
+
+        self.assertEqual(default.sparse_prefill_score_mode, "probability")
+        self.assertEqual(raw.sparse_prefill_score_mode, "tilelang_raw_qk")
+        with self.assertRaisesRegex(ValueError, "sparse_prefill_score_mode"):
+            self.make_config(
+                vllm_sparse_method="snapkv",
+                sparse_prefill_score_mode="auto",
+            )
+        with self.assertRaisesRegex(ValueError, "only applies to SnapKV/PyramidKV/H2O"):
+            self.make_config(
+                vllm_sparse_method="rkv",
+                sparse_prefill_score_mode="tilelang_raw_qk",
+            )
+        with self.assertRaisesRegex(ValueError, "sparse_attn_score_dtype='float32'"):
+            self.make_config(
+                vllm_sparse_method="snapkv",
+                sparse_prefill_score_mode="tilelang_raw_qk",
+                sparse_attn_score_dtype="float16",
+            )
+
     def test_h2o_accepts_supported_dense_model_tp_and_rejects_unknown_model(self):
         llama_config = self.hf_config()
         llama_config.model_type = "llama"

@@ -84,11 +84,44 @@ def _normalize_h2o(config) -> None:
             f"h2o_recent_ratio must be in (0, 1), got {config.h2o_recent_ratio}."
         )
     _normalize_int_attr(config, "h2o_prefill_score_window", fallback=0)
-    if not 1 <= config.h2o_prefill_score_window <= 128:
+    score_mode = getattr(config, "sparse_prefill_score_mode", "probability")
+    if score_mode == "tilelang_raw_qk":
+        if config.h2o_prefill_score_window < 0:
+            raise ValueError(
+                "h2o_prefill_score_window must be non-negative in TileLang raw-QK "
+                f"mode (0 means the full chunk), got {config.h2o_prefill_score_window}."
+            )
+    elif not 1 <= config.h2o_prefill_score_window <= 128:
         raise ValueError(
             "h2o_prefill_score_window must be in [1, 128] because the prefill "
             f"score kernel supports at most 128 query tokens, got {config.h2o_prefill_score_window}."
         )
+
+
+def _normalize_sparse_prefill_score(config) -> None:
+    mode = str(config.sparse_prefill_score_mode).strip().lower()
+    allowed = {"probability", "tilelang_raw_qk"}
+    if mode not in allowed:
+        raise ValueError(
+            "sparse_prefill_score_mode must be one of "
+            f"{sorted(allowed)}, got {config.sparse_prefill_score_mode!r}."
+        )
+    if mode != "probability" and config.vllm_sparse_method not in {
+        "snapkv",
+        "pyramidkv",
+        "h2o",
+    }:
+        raise ValueError(
+            "sparse_prefill_score_mode='tilelang_raw_qk' only applies to "
+            f"SnapKV/PyramidKV/H2O, got method={config.vllm_sparse_method!r}."
+        )
+    if mode == "tilelang_raw_qk" and config.sparse_attn_score_dtype != "float32":
+        raise ValueError(
+            "sparse_prefill_score_mode='tilelang_raw_qk' requires "
+            "sparse_attn_score_dtype='float32', got "
+            f"{config.sparse_attn_score_dtype!r}."
+        )
+    config.sparse_prefill_score_mode = mode
 
 def _normalize_rkv(config) -> None:
     _normalize_positive_int(config, "rkv_compression_interval", fallback=0)
@@ -197,6 +230,9 @@ def normalize_sparse_methods(config) -> None:
             "KV-sharing variants support vanilla and OmniKV."
         )
     _normalize_quest(config)
+    # _normalize_sparse_prefill_score must run before _normalize_h2o to validate
+    # and canonicalize config.sparse_prefill_score_mode before H2O window checks.
+    _normalize_sparse_prefill_score(config)
     _normalize_h2o(config)
     _normalize_rkv(config)
     _normalize_skipkv(config)
