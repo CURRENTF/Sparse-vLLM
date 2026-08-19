@@ -1237,7 +1237,23 @@ class SnapKVCacheManager(CacheManager):
             self.buffer_req_to_token_slots[layer_idx][row_idx, cur_len: cur_len + size] = select_index
             self.row_seq_lens[layer_idx][row_idx] += size
 
-            return select_index
+    def _ensure_decode_buffers(self, batch_size: int):
+        if not hasattr(self, "_decode_buf_capacity") or self._decode_buf_capacity < batch_size:
+            cap = max(batch_size, getattr(self, "_decode_buf_capacity", 0) * 2, 64)
+            self._decode_buf_capacity = cap
+            self._pinned_input_ids = torch.empty(cap, dtype=torch.int64, pin_memory=True)
+            self._pinned_positions = torch.empty(cap, dtype=torch.int64, pin_memory=True)
+            self._cuda_input_ids = torch.empty(cap, dtype=torch.int64, device=self.device)
+            self._cuda_positions = torch.empty(cap, dtype=torch.int64, device=self.device)
+
+            self._pinned_layers_context_lens = torch.empty((self.num_layers, cap), dtype=torch.int32, pin_memory=True)
+            self._cuda_layers_context_lens = torch.empty((self.num_layers, cap), dtype=torch.int32, device=self.device)
+            self._cuda_layers_slot_mapping = torch.empty((self.num_layers, cap), dtype=torch.int32, device=self.device)
+            self._pinned_layers_req_indices = torch.empty((self.num_layers, cap), dtype=torch.int32, pin_memory=True)
+            self._cuda_layers_req_indices = torch.empty((self.num_layers, cap), dtype=torch.int32, device=self.device)
+
+            self._static_rows_gpu = torch.empty(cap, dtype=torch.long, device=self.device)
+            self._static_cols_gpu = torch.empty(cap, dtype=torch.long, device=self.device)
 
     @torch.no_grad()
     def _allocate_batch(self, layer_idx: int, seq_ids: list[int], size: int) -> torch.Tensor:
@@ -1246,6 +1262,7 @@ class SnapKVCacheManager(CacheManager):
         assert self._num_free_slots[layer_idx] >= batch_size, (
             f"Out of KV cache slots: need {batch_size}, free {self._num_free_slots[layer_idx]}"
         )
+        self._ensure_decode_buffers(batch_size)
 
         row_indices = [self._get_free_row(layer_idx, sid) for sid in seq_ids]
         cur_lens = self.row_seq_lens[layer_idx][row_indices]
@@ -1260,8 +1277,10 @@ class SnapKVCacheManager(CacheManager):
         select_indices = self.free_slots_stack[layer_idx][ptr - batch_size: ptr]
         self._num_free_slots[layer_idx] -= batch_size
 
-        rows_gpu = torch.tensor(row_indices, dtype=torch.long, device=self.device)
-        cols_gpu = torch.tensor(cur_lens, dtype=torch.long, device=self.device)
+        rows_gpu = self._static_rows_gpu[:batch_size]
+        cols_gpu = self._static_cols_gpu[:batch_size]
+        rows_gpu.copy_(torch.as_tensor(row_indices, dtype=torch.long), non_blocking=True)
+        cols_gpu.copy_(torch.as_tensor(cur_lens, dtype=torch.long), non_blocking=True)
         self.buffer_req_to_token_slots[layer_idx][rows_gpu, cols_gpu] = select_indices.to(torch.int32)
         self.row_seq_lens[layer_idx][row_indices] += 1
 
@@ -2491,47 +2510,75 @@ class SnapKVCacheManager(CacheManager):
             self._decode_static_state_binding_key = None
             layer_ids = self.kv_transformer_layer_indices()
             batch_size = len(seqs)
+            self._ensure_decode_buffers(batch_size)
+
             input_ids_list = [seq.decode_input_token for seq in seqs]
             positions_list = [seq.decode_input_position for seq in seqs]
             seq_ids = [seq.seq_id for seq in seqs]
 
-            layers_slot_mapping_cuda = torch.empty(
-                (self.num_layers, batch_size), dtype=torch.int32, device=self.device
-            )
-            layers_context_lens = []
+            layers_slot_mapping_cuda = self._cuda_layers_slot_mapping[:, :batch_size]
 
-            for layer_id in layer_ids:
-                new_slots_batch = self._allocate_batch(layer_id, seq_ids, 1)
-                layers_slot_mapping_cuda[layer_id] = new_slots_batch
+            rows_gpu = self._static_rows_gpu[:batch_size]
+            cols_gpu = self._static_cols_gpu[:batch_size]
 
-                row_indices = [self.seq_id_to_row[layer_id][sid] for sid in seq_ids]
-                layers_context_lens.append(self.row_seq_lens[layer_id][row_indices])
+            if self.free_slots_stack_tensor is not None and self.buffer_req_to_token_slots_tensor is not None:
+                first_layer = layer_ids[0]
+                row_indices = [self._get_free_row(first_layer, sid) for sid in seq_ids]
+                cur_lens = self.row_seq_lens[first_layer][row_indices]
+                ptr = self._num_free_slots[first_layer]
+                assert ptr >= batch_size, f"Out of KV slots: need {batch_size}, free {ptr}"
 
-            layers_context_lens_np = np.zeros((self.num_layers, batch_size), dtype=np.int32)
-            for local_layer, layer_id in enumerate(layer_ids):
-                layers_context_lens_np[layer_id] = layers_context_lens[local_layer]
-            layers_context_lens_cuda = torch.from_numpy(layers_context_lens_np).to(
-                device=self.device,
-                dtype=torch.int32,
-            )
+                select_indices_3d = self.free_slots_stack_tensor[:, ptr - batch_size: ptr]
+                for l in layer_ids:
+                    self._num_free_slots[l] -= batch_size
+
+                rows_gpu.copy_(torch.as_tensor(row_indices, dtype=torch.long), non_blocking=True)
+                cols_gpu.copy_(torch.as_tensor(cur_lens, dtype=torch.long), non_blocking=True)
+
+                self.buffer_req_to_token_slots_tensor[:, rows_gpu, cols_gpu] = select_indices_3d
+                for l in layer_ids:
+                    self.row_seq_lens[l][row_indices] += 1
+
+                layers_slot_mapping_cuda.copy_(select_indices_3d, non_blocking=True)
+                for l in layer_ids:
+                    self._pinned_layers_context_lens[l, :batch_size] = torch.as_tensor(self.row_seq_lens[l][row_indices], dtype=torch.int32)
+                    self._pinned_layers_req_indices[l, :batch_size] = torch.as_tensor(row_indices, dtype=torch.int32)
+            else:
+                for layer_id in layer_ids:
+                    assert self._num_free_slots[layer_id] >= batch_size
+                    row_indices = [self._get_free_row(layer_id, sid) for sid in seq_ids]
+                    cur_lens = self.row_seq_lens[layer_id][row_indices]
+
+                    ptr = self._num_free_slots[layer_id]
+                    select_indices = self.free_slots_stack[layer_id][ptr - batch_size: ptr]
+                    self._num_free_slots[layer_id] -= batch_size
+
+                    rows_gpu.copy_(torch.as_tensor(row_indices, dtype=torch.long), non_blocking=True)
+                    cols_gpu.copy_(torch.as_tensor(cur_lens, dtype=torch.long), non_blocking=True)
+                    self.buffer_req_to_token_slots[layer_id][rows_gpu, cols_gpu] = select_indices.to(torch.int32)
+                    self.row_seq_lens[layer_id][row_indices] += 1
+
+                    layers_slot_mapping_cuda[layer_id].copy_(select_indices, non_blocking=True)
+                    self._pinned_layers_context_lens[layer_id, :batch_size] = torch.as_tensor(self.row_seq_lens[layer_id][row_indices], dtype=torch.int32)
+                    self._pinned_layers_req_indices[layer_id, :batch_size] = torch.as_tensor(row_indices, dtype=torch.int32)
+
+            self._cuda_layers_context_lens[:, :batch_size].copy_(self._pinned_layers_context_lens[:, :batch_size], non_blocking=True)
+            self._cuda_layers_req_indices[:, :batch_size].copy_(self._pinned_layers_req_indices[:, :batch_size], non_blocking=True)
 
             for layer_id in layer_ids:
                 state = self.layer_batch_states[layer_id]
                 state.slot_mapping = layers_slot_mapping_cuda[layer_id]
-                state.context_lens = layers_context_lens_cuda[layer_id]
-                # row_seq_lens is layer-wise after prefill/decode eviction; attention
-                # uses this to size flash decode stage1/stage2 workspaces.
-                state.max_context_len = (
-                    int(max(layers_context_lens_np[layer_id]))
-                    if len(layers_context_lens_np[layer_id]) > 0
-                    else 0
-                )
-                req_ids = [self.seq_id_to_row[layer_id][seq.seq_id] for seq in seqs]
-                state.req_indices = torch.tensor(req_ids, dtype=torch.int32, device=self.device)
+                state.context_lens = self._cuda_layers_context_lens[layer_id, :batch_size]
+                lens_layer = self._pinned_layers_context_lens[layer_id, :batch_size]
+                state.max_context_len = int(lens_layer.max().item()) if batch_size > 0 else 0
+                state.req_indices = self._cuda_layers_req_indices[layer_id, :batch_size]
 
-            input_ids = torch.tensor(input_ids_list, dtype=torch.int64, device=self.device)
-            positions = torch.tensor(positions_list, dtype=torch.int64, device=self.device)
-            return input_ids, positions, None
+            self._pinned_input_ids[:batch_size].copy_(torch.as_tensor(input_ids_list, dtype=torch.int64))
+            self._pinned_positions[:batch_size].copy_(torch.as_tensor(positions_list, dtype=torch.int64))
+            self._cuda_input_ids[:batch_size].copy_(self._pinned_input_ids[:batch_size], non_blocking=True)
+            self._cuda_positions[:batch_size].copy_(self._pinned_positions[:batch_size], non_blocking=True)
+
+            return self._cuda_input_ids[:batch_size], self._cuda_positions[:batch_size], None
 
     def _get_decode_static_buffers(
         self,

@@ -191,23 +191,25 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
             if isinstance(storage, HeterogeneousExplicitKVStorage)
             else num_layers * slot_bytes_per_layer
         )
-        slot_bytes += torch.tensor([], dtype=torch.int32).element_size()
-        row_bytes_per_token = self.max_buffer_rows * torch.tensor([], dtype=torch.int32).element_size()
-        self.config.limit_auto_max_model_len(
-            available_memory // (slot_bytes + row_bytes_per_token)
-        )
-        self.max_model_len = self.config.max_model_len
-        available_memory -= self.max_model_len * row_bytes_per_token
+        if getattr(self, "max_buffer_rows", None) is not None and hasattr(self.config, "limit_auto_max_model_len"):
+            slot_bytes += torch.tensor([], dtype=torch.int32).element_size()
+            row_bytes_per_token = self.max_buffer_rows * torch.tensor([], dtype=torch.int32).element_size()
+            self.config.limit_auto_max_model_len(
+                available_memory // (slot_bytes + row_bytes_per_token)
+            )
+            self.max_model_len = self.config.max_model_len
+            available_memory -= self.max_model_len * row_bytes_per_token
+
         self.config.num_kvcache_slots = available_memory // slot_bytes
-        if self.config.num_kvcache_slots < self.max_model_len:
+        if getattr(self, "max_model_len", None) is not None and self.config.num_kvcache_slots < self.max_model_len:
             raise RuntimeError(
                 "KV cache capacity is smaller than max_model_len after reserving runtime metadata: "
                 f"capacity={self.config.num_kvcache_slots} max_model_len={self.max_model_len}."
             )
-        if self.config.prefix_cache_max_blocks is not None:
+        if getattr(self.config, "prefix_cache_max_blocks", None) is not None:
             self.config.prefix_cache_max_blocks = min(
                 self.config.prefix_cache_max_blocks,
-                self.config.num_kvcache_slots // self.config.prefix_cache_block_size,
+                self.config.num_kvcache_slots // getattr(self.config, "prefix_cache_block_size", 16),
             )
 
         logger.info(
@@ -1227,6 +1229,22 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
 
             return select_index
 
+    def _ensure_decode_buffers(self, batch_size: int):
+        if not hasattr(self, "_decode_buf_capacity") or self._decode_buf_capacity < batch_size:
+            cap = max(batch_size, getattr(self, "_decode_buf_capacity", 0) * 2, 64)
+            self._decode_buf_capacity = cap
+            self._pinned_input_ids = torch.empty(cap, dtype=torch.int64, pin_memory=True)
+            self._pinned_positions = torch.empty(cap, dtype=torch.int64, pin_memory=True)
+            self._pinned_context_lens = torch.empty(cap, dtype=torch.int32, pin_memory=True)
+            self._pinned_req_indices = torch.empty(cap, dtype=torch.int32, pin_memory=True)
+            self._cuda_input_ids = torch.empty(cap, dtype=torch.int64, device=self.device)
+            self._cuda_positions = torch.empty(cap, dtype=torch.int64, device=self.device)
+            self._cuda_context_lens = torch.empty(cap, dtype=torch.int32, device=self.device)
+            self._cuda_req_indices = torch.empty(cap, dtype=torch.int32, device=self.device)
+            self._cuda_slot_mapping = torch.empty(cap, dtype=torch.int32, device=self.device)
+            self._static_rows_gpu = torch.empty(cap, dtype=torch.long, device=self.device)
+            self._static_cols_gpu = torch.empty(cap, dtype=torch.long, device=self.device)
+
     @torch.no_grad()
     def _allocate_batch(self, seq_ids: list[int], size: int) -> torch.Tensor:
         assert size == 1, "Batch allocation currently only supports size=1 (Decode)"
@@ -1235,6 +1253,7 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
         assert self._num_free_slots >= batch_size, (
             f"Out of KV cache slots: need {batch_size}, free {self._num_free_slots}"
         )
+        self._ensure_decode_buffers(batch_size)
 
         row_indices = [self._get_free_row(sid) for sid in seq_ids]
         cur_lens = self.row_seq_lens[row_indices]
@@ -1243,8 +1262,10 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
         select_indices = self.free_slots_stack[ptr - batch_size: ptr]
         self._num_free_slots -= batch_size
 
-        rows_gpu = torch.tensor(row_indices, dtype=torch.long, device=self.device)
-        cols_gpu = torch.tensor(cur_lens, dtype=torch.long, device=self.device)
+        rows_gpu = self._static_rows_gpu[:batch_size]
+        cols_gpu = self._static_cols_gpu[:batch_size]
+        rows_gpu.copy_(torch.as_tensor(row_indices, dtype=torch.long), non_blocking=True)
+        cols_gpu.copy_(torch.as_tensor(cur_lens, dtype=torch.long), non_blocking=True)
         self.buffer_req_to_token_slots[rows_gpu, cols_gpu] = select_indices
         self.row_seq_lens[row_indices] += 1
 
@@ -1422,6 +1443,8 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
             self._poll_prefix_offload()
             self._prefix_offload_step_h2d_operations = []
             batch_size = len(seqs)
+            self._ensure_decode_buffers(batch_size)
+
             input_ids_list = [seq.decode_input_token for seq in seqs]
             positions_list = [seq.decode_input_position for seq in seqs]
             seq_ids = [seq.seq_id for seq in seqs]
@@ -1430,27 +1453,41 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
             row_indices = [self.seq_id_to_row[sid] for sid in seq_ids]
             for seq, slot in zip(seqs, new_slots_batch):
                 self._record_prefix_materialization(seq, [seq.decode_input_token], slot.reshape(1))
-            context_lens = torch.tensor(
-                self.row_seq_lens[row_indices],
-                dtype=torch.int32,
-                device=self.device,
-            )
-            req_indices = torch.tensor(row_indices, dtype=torch.int32, device=self.device)
 
-            slot_mapping = torch.empty((batch_size,), dtype=torch.int32, device=self.device)
-            slot_mapping[:] = new_slots_batch
+            self._pinned_context_lens[:batch_size].copy_(
+                torch.as_tensor(self.row_seq_lens[row_indices], dtype=torch.int32)
+            )
+            self._pinned_req_indices[:batch_size].copy_(
+                torch.as_tensor(row_indices, dtype=torch.int32)
+            )
+            self._pinned_input_ids[:batch_size].copy_(
+                torch.as_tensor(input_ids_list, dtype=torch.int64)
+            )
+            self._pinned_positions[:batch_size].copy_(
+                torch.as_tensor(positions_list, dtype=torch.int64)
+            )
+
+            context_lens = self._cuda_context_lens[:batch_size]
+            context_lens.copy_(self._pinned_context_lens[:batch_size], non_blocking=True)
+            req_indices = self._cuda_req_indices[:batch_size]
+            req_indices.copy_(self._pinned_req_indices[:batch_size], non_blocking=True)
+
+            slot_mapping = self._cuda_slot_mapping[:batch_size]
+            slot_mapping.copy_(new_slots_batch, non_blocking=True)
 
             self.layer_batch_state.slot_mapping = slot_mapping
             self.layer_batch_state.context_lens = context_lens
-            self.layer_batch_state.max_context_len = int(max(self.row_seq_lens[row_indices])) if row_indices else 0
+            self.layer_batch_state.max_context_len = int(self._pinned_context_lens[:batch_size].max().item()) if row_indices else 0
             self.layer_batch_state.req_indices = req_indices
             self._validate_attention_slot_mapping(slot_mapping)
 
             if log_level == 'DEBUG':
                 logger.debug(f'{slot_mapping=}   {context_lens.tolist()=}  {slot_mapping[:10]=}  {slot_mapping[-10:]=}')
 
-            input_ids = torch.tensor(input_ids_list, dtype=torch.int64, device=self.device)
-            positions = torch.tensor(positions_list, dtype=torch.int64, device=self.device)
+            input_ids = self._cuda_input_ids[:batch_size]
+            input_ids.copy_(self._pinned_input_ids[:batch_size], non_blocking=True)
+            positions = self._cuda_positions[:batch_size]
+            positions.copy_(self._pinned_positions[:batch_size], non_blocking=True)
             return input_ids, positions, None
 
     def before_prefill_layer_attention(
