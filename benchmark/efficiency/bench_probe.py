@@ -178,25 +178,27 @@ def run_sparsevllm_probe(
                     for b_i in range(bs):
                         llm.add_request(prompt_tokens[b_i], sampling_params[b_i])
 
-                    # Step 1: Prefill
+                    # 1. Prefill phase: time all prefill chunk steps until first token is generated
                     prefill_start_event.record()
                     out, num_tokens = llm.step()
+                    while num_tokens == 0 and not llm.is_finished():
+                        out, num_tokens = llm.step()
                     prefill_end_event.record()
                     torch.cuda.synchronize()
                     ttft_ms = prefill_start_event.elapsed_time(prefill_end_event)
                     prefill_times_ms.append(ttft_ms)
 
-                    # Step 2..N: Decode
-                    step_count = 0
+                    # 2. Decode phase: time subsequent decode steps
+                    decode_step_times_ms = []
                     while not llm.is_finished():
                         step_s = torch.cuda.Event(enable_timing=True)
                         step_e = torch.cuda.Event(enable_timing=True)
                         step_s.record()
-                        llm.step()
+                        out, num_tokens = llm.step()
                         step_e.record()
                         torch.cuda.synchronize()
-                        decode_step_times_ms.append(step_s.elapsed_time(step_e))
-                        step_count += 1
+                        if num_tokens > 0:
+                            decode_step_times_ms.append(step_s.elapsed_time(step_e))
 
                     tpot_ms = (
                         sum(decode_step_times_ms) / len(decode_step_times_ms)
