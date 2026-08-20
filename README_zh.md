@@ -57,7 +57,7 @@ Sparse-vLLM 支持物理淘汰、逻辑掩码、查询感知选择和混合 KV �
 | Qwen2.5 | ✅ |
 | Qwen3 | ✅ |
 | Qwen3MoE | ✅ |
-| Qwen3.5 / Qwen3.6 | ✅ |
+| Qwen3.5 / 3.6 / 3.8 | ✅ |
 | Qwen3.5 / Qwen3.6 MoE | ✅ |
 | Llama 3 / 3.1 | ✅ |
 | MiniMax M2.7 | ✅ |
@@ -119,9 +119,11 @@ uv pip install flashinfer-cubin --index-url https://flashinfer.ai/whl
 
 CUDA 12.9 环境将 `cu130` 换成 `cu129`。
 
-Qwen3.5/Qwen3.6 的 prefill causal Conv1D 和 decode Conv1D/GDN packing
-路径使用仓库内置的 Triton kernel；无需安装 `sglang-kernel`，也无需编译
-本地 CUDA 扩展。
+Sparse-vLLM 支持未量化 BF16 和 block-scaled FP8 格式的
+Qwen3.5/Qwen3.6/Qwen3.8 checkpoint。三者共享 `qwen3_5` 运行时架构，以及
+相同的精度、并行方式、稀疏方法和多模态支持。其 prefill causal Conv1D 和
+decode Conv1D/GDN packing 路径使用仓库内置的 Triton kernel；无需安装
+`sglang-kernel`，也无需编译本地 CUDA 扩展。
 
 完整依赖列表和最小 `LLM(...)` 示例请参阅[快速开始](docs/zh/getting_started/README.md)。
 

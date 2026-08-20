@@ -15,7 +15,7 @@ parallel size must use that value.
 | Qwen2.5 | `qwen2` | BF16 / FP16 | ✅ | 1 only | 1 only |
 | Qwen3 Dense | `qwen3` | BF16 / FP16 / block FP8 | ✅ (FP8: 1/2/4/8) | 1 only | 1 only |
 | Qwen3MoE | `qwen3_moe` | BF16 / FP16 / block FP8 | ✅ (TP > 1: BF16 model dtype only) | 1 only | ✅ |
-| Qwen3.5 / Qwen3.6 | `qwen3_5` | BF16 / block FP8 | ✅ | 1 only | 1 only |
+| Qwen3.5 / 3.6 / 3.8 | `qwen3_5` | BF16 / block FP8 | ✅ | 1 only | 1 only |
 | Qwen3.6 MoE | `qwen3_5_moe` | BF16 / block FP8 | ✅ | 1 only | ✅ |
 | GLM-4.7-Flash | `glm4_moe_lite` | BF16 | 1 / 2 / 4 (H100 only)⁵ | 1 only | 1 / 2 / 4⁵ |
 | Gemma 4 Dense / MoE | `gemma4` | BF16 / FP16 | ✅ | 1 only | ✅ (MoE only) |
@@ -36,9 +36,10 @@ FP16 Qwen3MoE checkpoints are limited to `TP=1`. When `TP=1`, the existing EP
 layout uses world size `E`.
 
 Block FP8 support requires E4M3 weights, dynamic activation quantization, and
-a `128 x 128` weight block size. Qwen3.5/Qwen3.6 dense configurations are
-normalized internally to `model_type=qwen3_5`; Qwen3.6 MoE uses
-`model_type=qwen3_5_moe`.
+a `128 x 128` weight block size. Qwen3.5, Qwen3.6, and Qwen3.8 dense
+checkpoints share the `qwen3_5` runtime architecture and therefore the same
+precision, parallelism, sparse-method, and multimodal support. Qwen3.6 MoE
+uses `model_type=qwen3_5_moe`.
 
 GLM-4.7-Flash uses BF16 latent MLA on NVIDIA H100 80GB HBM3 and requires
 `DP=1`. The validated `(TP, EP)` layouts are
@@ -57,7 +58,7 @@ layer.
 | Qwen2.5 | ✅ | ✅ | ✅ | Experimental⁴ | ✅ | ✅ | ✅ | ✅ | Selected checkpoints¹ | Compressor required² |
 | Qwen3 | ✅ | ✅ | ✅ | Experimental⁴ | ✅ | ✅ | ✅ | ✅ | — | Compressor required² |
 | Qwen3MoE | ✅ | ✅ | ✅ | Experimental⁴ | ✅ | ✅ | ✅ | ✅ | — | — |
-| Qwen3.5 / Qwen3.6 | ✅ | ✅ | ✅ | Experimental⁴ | ✅ | ✅ | ✅ | ✅ | — | Matched checkpoint³ |
+| Qwen3.5 / 3.6 / 3.8 | ✅ | ✅ | ✅ | Experimental⁴ | ✅ | ✅ | ✅ | ✅ | — | Matched checkpoint³ |
 | Qwen3.6 MoE | ✅ | ✅ | ✅ | Experimental⁴ | ✅ | ✅ | ✅ | ✅ | — | — |
 | GLM-4.7-Flash | ✅⁵ | ✅⁵ | ✅⁵ | Experimental⁴⁵ | — | ✅⁵ | — | ✅⁵ | — | — |
 | Gemma 4 Dense / MoE | ✅ | ✅⁶ | — | — | — | ✅ | — | — | — | — |
@@ -70,8 +71,8 @@ layer.
 
 ² DeltaKV requires a compressor checkpoint trained for the base model.
 
-³ Qwen3.5 and Qwen3.6 require a matching DeltaKV checkpoint accepted by the
-mixed-attention runtime.
+³ Qwen3.5, Qwen3.6, and Qwen3.8 require a matching DeltaKV checkpoint accepted
+by the mixed-attention runtime.
 
 ⁴ H2O supports tensor parallelism with TP-local sparse selection: each rank
 scores and retains tokens using its local heads or KV heads, without cross-rank
@@ -95,7 +96,7 @@ explicitly during admission.
 
 | Model family | Image | Video | Audio |
 | --- | :---: | :---: | :---: |
-| Qwen3.5 / Qwen3.6 Dense and MoE | ✅ | ✅ | — |
+| Qwen3.5 / 3.6 / 3.8 Dense and Qwen3.5 / 3.6 MoE | ✅ | ✅ | — |
 | Gemma 4 Dense and MoE | ✅ | ✅ | — |
 
 `—` means that the combination is not currently supported.

@@ -68,7 +68,7 @@ Read the method overview and integration rules in
 | Qwen2.5 | ✅ |
 | Qwen3 | ✅ |
 | Qwen3MoE | ✅ |
-| Qwen3.5 / Qwen3.6 | ✅ |
+| Qwen3.5 / 3.6 / 3.8 | ✅ |
 | Qwen3.5 / Qwen3.6 MoE | ✅ |
 | GLM-4.7-Flash | ✅ |
 | Gemma 4 Dense / MoE | ✅ |
@@ -138,11 +138,13 @@ Use `cu129` instead of `cu130` for CUDA 12.9.
 `einops`, `sglang-kernel`, and the training, benchmark, and test packages are all
 part of the main installation; no workflow-specific extras are required.
 
-Sparse-vLLM supports Qwen3.5/Qwen3.6 checkpoints in unquantized BF16 and
-block-scaled FP8 formats.
+Sparse-vLLM supports Qwen3.5/Qwen3.6/Qwen3.8 checkpoints in unquantized BF16
+and block-scaled FP8 formats. These releases share the `qwen3_5` runtime
+architecture and the same precision, parallelism, sparse-method, and
+multimodal support.
 
-The Qwen3.5/Qwen3.6 prefill causal Conv1D and decode Conv1D/GDN packing paths
-use repository-local Triton kernels; they do not call `sglang-kernel` themselves.
+Their prefill causal Conv1D and decode Conv1D/GDN packing paths use
+repository-local Triton kernels; they do not call `sglang-kernel` themselves.
 
 For the full dependency list and a minimal `LLM(...)` example, see
 [Getting Started](docs/en/getting_started/README.md).

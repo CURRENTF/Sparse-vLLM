@@ -11,7 +11,7 @@
 | Qwen2.5 | `qwen2` | BF16 / FP16 | ✅ | 仅支持 1 | 仅支持 1 |
 | Qwen3 Dense | `qwen3` | BF16 / FP16 / 块级 FP8 | ✅（FP8：1/2/4/8） | 仅支持 1 | 仅支持 1 |
 | Qwen3MoE | `qwen3_moe` | BF16 / FP16 / 块级 FP8 | ✅（TP > 1 时模型 dtype 仅支持 BF16） | 仅支持 1 | ✅ |
-| Qwen3.5 / Qwen3.6 | `qwen3_5` | BF16 / 块级 FP8 | ✅ | 仅支持 1 | 仅支持 1 |
+| Qwen3.5 / 3.6 / 3.8 | `qwen3_5` | BF16 / 块级 FP8 | ✅ | 仅支持 1 | 仅支持 1 |
 | Qwen3.6 MoE | `qwen3_5_moe` | BF16 / 块级 FP8 | ✅ | 仅支持 1 | ✅ |
 | GLM-4.7-Flash | `glm4_moe_lite` | BF16 | 1 / 2 / 4（仅 H100）⁵ | 仅支持 1 | 1 / 2 / 4⁵ |
 | Gemma 4 Dense / MoE | `gemma4` | BF16 / FP16 | ✅ | 仅支持 1 | ✅（仅 MoE） |
@@ -29,8 +29,9 @@ BF16；FP16 Qwen3MoE checkpoint 仅支持 `TP=1`。当 `TP=1` 时，原有 EP
 布局的 world size 为 `E`。
 
 块级 FP8 要求使用 E4M3 权重、动态激活量化以及 `128 x 128` 的权重块大小。
-Qwen3.5/Qwen3.6 Dense 配置在内部统一规范为 `model_type=qwen3_5`；Qwen3.6
-MoE 使用 `model_type=qwen3_5_moe`。
+Qwen3.5、Qwen3.6 和 Qwen3.8 Dense checkpoint 共享 `qwen3_5` 运行时架构，
+因此具有相同的精度、并行方式、稀疏方法和多模态支持。Qwen3.6 MoE 使用
+`model_type=qwen3_5_moe`。
 
 GLM-4.7-Flash 在 NVIDIA H100 80GB HBM3 上使用 BF16 latent MLA，要求
 `DP=1`。已验证的 `(TP, EP)` 布局为 `(1,1)`、
@@ -48,7 +49,7 @@ vanilla 和 OmniKV 使用 radix 模式，对 StreamingLLM、SnapKV、H2O 和 R-K
 | Qwen2.5 | ✅ | ✅ | ✅ | 实验性⁴ | ✅ | ✅ | ✅ | ✅ | 指定 checkpoint¹ | 需要 compressor² |
 | Qwen3 | ✅ | ✅ | ✅ | 实验性⁴ | ✅ | ✅ | ✅ | ✅ | — | 需要压缩器² |
 | Qwen3MoE | ✅ | ✅ | ✅ | 实验性⁴ | ✅ | ✅ | ✅ | ✅ | — | — |
-| Qwen3.5 / Qwen3.6 | ✅ | ✅ | ✅ | 实验性⁴ | ✅ | ✅ | ✅ | ✅ | — | 匹配的 checkpoint³ |
+| Qwen3.5 / 3.6 / 3.8 | ✅ | ✅ | ✅ | 实验性⁴ | ✅ | ✅ | ✅ | ✅ | — | 匹配的 checkpoint³ |
 | Qwen3.6 MoE | ✅ | ✅ | ✅ | 实验性⁴ | ✅ | ✅ | ✅ | ✅ | — | — |
 | GLM-4.7-Flash | ✅⁵ | ✅⁵ | ✅⁵ | 实验性⁴⁵ | — | ✅⁵ | — | ✅⁵ | — | — |
 | Gemma 4 Dense / MoE | ✅ | ✅⁶ | — | — | — | ✅ | — | — | — | — |
@@ -61,7 +62,7 @@ vanilla 和 OmniKV 使用 radix 模式，对 StreamingLLM、SnapKV、H2O 和 R-K
 
 ² DeltaKV 需要针对 base model 训练的 compressor checkpoint。
 
-³ Qwen3.5 和 Qwen3.6 需要 mixed-attention runtime 可接受的匹配 DeltaKV checkpoint。
+³ Qwen3.5、Qwen3.6 和 Qwen3.8 需要 mixed-attention runtime 可接受的匹配 DeltaKV checkpoint。
 
 ⁴ H2O 通过 TP-local 稀疏选择支持 tensor parallel：每个 rank 使用本地
 attention head 或 KV head 独立计算分数并保留 token，不跨 rank 聚合 sparse
@@ -84,7 +85,7 @@ checkpoint 自身的 processor 和 chat template；不受支持的媒体会在�
 
 | 模型家族 | 图片 | 视频 | 音频 |
 | --- | :---: | :---: | :---: |
-| Qwen3.5 / Qwen3.6 Dense 与 MoE | ✅ | ✅ | — |
+| Qwen3.5 / 3.6 / 3.8 Dense 与 Qwen3.5 / 3.6 MoE | ✅ | ✅ | — |
 | Gemma 4 Dense 与 MoE | ✅ | ✅ | — |
 
 `—` 表示当前不支持该组合。

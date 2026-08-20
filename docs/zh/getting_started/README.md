@@ -34,7 +34,8 @@ CUDA 12.9 环境将 `cu130` 换成 `cu129`。
 `einops`、`sglang-kernel` 以及训练、benchmark 和测试包均已是主依赖，
 不再需要工作流专用 extra。
 
-Sparse-vLLM 当前支持未量化 BF16 和 block-scaled FP8 格式的 Qwen3.5/Qwen3.6 checkpoint。
+Sparse-vLLM 当前支持未量化 BF16 和 block-scaled FP8 格式的
+Qwen3.5/Qwen3.6/Qwen3.8 checkpoint。三者共享 `qwen3_5` 运行时架构和支持矩阵。
 
 其 prefill causal Conv1D 和 decode Conv1D/GDN packing path 使用仓库本地
 Triton kernel，本身不调用 `sglang-kernel`。

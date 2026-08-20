@@ -37,8 +37,9 @@ Use `cu129` instead of `cu130` for CUDA 12.9.
 `einops`, `sglang-kernel`, and the training, benchmark, and test packages are all
 runtime dependencies, so workflow-specific extras are not required.
 
-Sparse-vLLM supports Qwen3.5/Qwen3.6 checkpoints in unquantized BF16 and
-block-scaled FP8 formats.
+Sparse-vLLM supports Qwen3.5/Qwen3.6/Qwen3.8 checkpoints in unquantized BF16
+and block-scaled FP8 formats. All three share the `qwen3_5` runtime architecture
+and support matrix.
 
 Its prefill causal Conv1D and decode Conv1D/GDN packing paths use local Triton
 kernels and do not call `sglang-kernel` themselves.
