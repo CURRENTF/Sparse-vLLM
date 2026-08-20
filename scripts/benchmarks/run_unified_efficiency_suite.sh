@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
-# Unified End-to-End Efficiency, Sequence Lifecycle & Hardware Profiling Suite
-# Robust orchestration without abrupt 'set -e' failure.
+# Unified synthetic-efficiency and matched LongBench lifecycle benchmark suite.
+set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${REPO_ROOT}"
@@ -11,23 +11,33 @@ SYSTEMS="${2:-svllm-vanilla,svllm-snapkv,vllm-vanilla}"
 MODEL_NAME="${3:-qwen3_30b}"
 PROMPT_LENS="${PROMPT_LENS:-8192,16384,32768}"
 OUTPUT_LENS="${OUTPUT_LENS:-512}"
-LONGBENCH_SAMPLES="${LONGBENCH_SAMPLES:-10}" # 10 samples/task for fast dynamic sequence churn analysis
-
-# 1. Environment & Paths
-PYTHON_BIN="${PYTHON_BIN:-/data2/haojitai/conda_envs/sparse-vllm-glm47-torch211/bin/python}"
-if [ ! -f "${PYTHON_BIN}" ]; then
-  PYTHON_BIN="python3"
-fi
-
-CUDA_HOME="${CUDA_HOME:-/usr/local/cuda-13.0}"
-TMPDIR="${TMPDIR:-/data2/haojitai/tmp}"
-DATA_ROOT="${SPARSEVLLM_LONGBENCH_DATA_DIR:-${SPARSEVLLM_DATA_DIR:-/data2/haojitai/datasets/LongBench}}"
+BATCH_SIZES="${BATCH_SIZES:-1,4,8}"
+LONGBENCH_SAMPLES="${LONGBENCH_SAMPLES:-10}"
+BENCH_SCENARIO="${BENCH_SCENARIO:-all}"
+BENCH_SEED="${BENCH_SEED:-42}"
+PROMPT_LENGTH_JITTER="${PROMPT_LENGTH_JITTER:-0.10}"
+OUTPUT_LENGTH_JITTER="${OUTPUT_LENGTH_JITTER:-0.25}"
+CHURN_REQUEST_MULTIPLIER="${CHURN_REQUEST_MULTIPLIER:-4}"
+MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-8192}"
+SPARSE_PREFILL_SCORE_MODE="${SPARSE_PREFILL_SCORE_MODE:-probability}"
+DELTAKV_COMPRESSOR_PATH="${DELTAKV_COMPRESSOR_PATH:-}"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
+DATA_ROOT="${SPARSEVLLM_LONGBENCH_DATA_DIR:-${SPARSEVLLM_DATA_DIR:-data/LongBench}}"
 BASE_OUT="${SPARSEVLLM_OUTPUT_DIR:-outputs}/unified_efficiency_$(date +%Y%m%d_%H%M%S)"
-mkdir -p "${BASE_OUT}" "${TMPDIR}"
+TASKS="qasper,hotpotqa,multi_news,trec,passage_retrieval_en,lcc"
+
+case "${SPARSE_PREFILL_SCORE_MODE}" in
+  probability|tilelang_raw_qk) ;;
+  *)
+    echo "ERROR: SPARSE_PREFILL_SCORE_MODE must be probability or tilelang_raw_qk." >&2
+    exit 2
+    ;;
+esac
 
 case "${MODEL_NAME}" in
   qwen3_30b)
-    MODEL_PATH="${MODEL_PATH:-/data2/haojitai/models/Qwen3-30B-A3B-Instruct-2507}"
+    MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3-30B-A3B-Instruct-2507}"
     TP_SIZE=2
     ;;
   qwen3_8b)
@@ -40,215 +50,213 @@ case "${MODEL_NAME}" in
     ;;
   *)
     MODEL_PATH="${MODEL_NAME}"
-    TP_SIZE=2
+    TP_SIZE="${TP_SIZE:-1}"
     ;;
 esac
 
-export CUDA_VISIBLE_DEVICES="${GPUS}"
-export PYTHONPATH="${REPO_ROOT}:${REPO_ROOT}/src:${PYTHONPATH:-}"
-export CUDA_HOME="${CUDA_HOME}"
-export TMPDIR="${TMPDIR}"
-export PATH="/home/haojitai/miniconda3/envs/svllm/bin:${CUDA_HOME}/bin:/data2/haojitai/conda_envs/sparse-vllm-glm47-torch211/bin:${PATH}"
-export TOKENIZERS_PARALLELISM="false"
-export SPARSEVLLM_DATA_DIR="${DATA_ROOT}"
-export SPARSEVLLM_LONGBENCH_DATA_DIR="${DATA_ROOT}"
-
-echo "=========================================================================================="
-echo "UNIFIED EFFICIENCY & SEQUENCE LIFECYCLE BENCHMARK"
-echo "=========================================================================================="
-echo "Model:       ${MODEL_PATH} (TP=${TP_SIZE})"
-echo "GPUs:        ${GPUS}"
-echo "Systems:     ${SYSTEMS}"
-echo "Prompt Lens: ${PROMPT_LENS} | Output Len: ${OUTPUT_LENS}"
-echo "Output Root: ${BASE_OUT}"
-echo "=========================================================================================="
-
-# ========================================================================================
-# 1. SCENARIO A: SYNTHETIC LENGTH SWEED (STATIC UNIFORM BATCH)
-# ========================================================================================
-SCENARIO_A_DIR="${BASE_OUT}/scenario_a_synthetic"
-mkdir -p "${SCENARIO_A_DIR}"
-echo ""
-echo ">>> [STAGE 1/2] Starting Scenario A (Synthetic Length Sweep: 8k/16k/32k -> ${OUTPUT_LENS}) <<<"
-
-IFS=',' read -ra SYS_ARR <<< "${SYSTEMS}"
-for SYS in "${SYS_ARR[@]}"; do
-  SYS_TRIM=$(echo "${SYS}" | xargs)
-  SYS_OUT="${SCENARIO_A_DIR}/${SYS_TRIM}"
-  mkdir -p "${SYS_OUT}"
-  
-  echo "--- Running Scenario A on System: [${SYS_TRIM}] ---"
-  
-  # Start Hardware Monitor
-  HW_LOG="${SYS_OUT}/gpu_timeline.json"
-  "${PYTHON_BIN}" "${REPO_ROOT}/benchmark/efficiency/hardware_monitor.py" \
-    --gpus "${GPUS}" \
-    --interval_ms 200 \
-    --output_file "${HW_LOG}" >/dev/null 2>&1 &
-  MON_PID=$!
-
-  case "${SYS_TRIM}" in
+resolve_system() {
+  local system="$1"
+  SYSTEM_ENGINE=""
+  SYSTEM_METHOD=""
+  SYSTEM_LONG_BENCH_ARGS=()
+  case "${system}" in
     svllm-vanilla)
-      ENGINE="sparsevllm"
-      METHOD="vanilla"
+      SYSTEM_ENGINE=sparsevllm
+      SYSTEM_METHOD=vanilla
       ;;
     svllm-snapkv)
-      ENGINE="sparsevllm"
-      METHOD="snapkv"
+      SYSTEM_ENGINE=sparsevllm
+      SYSTEM_METHOD=snapkv
+      ;;
+    svllm-h2o)
+      SYSTEM_ENGINE=sparsevllm
+      SYSTEM_METHOD=h2o
+      ;;
+    svllm-omnikv)
+      SYSTEM_ENGINE=sparsevllm
+      SYSTEM_METHOD=omnikv
+      ;;
+    svllm-deltakv)
+      SYSTEM_ENGINE=sparsevllm
+      SYSTEM_METHOD=deltakv
+      if [ -z "${DELTAKV_COMPRESSOR_PATH}" ]; then
+        echo "ERROR: svllm-deltakv requires DELTAKV_COMPRESSOR_PATH." >&2
+        return 2
+      fi
+      if [ ! -e "${DELTAKV_COMPRESSOR_PATH}" ]; then
+        echo "ERROR: DELTAKV_COMPRESSOR_PATH does not exist: ${DELTAKV_COMPRESSOR_PATH}" >&2
+        return 2
+      fi
+      SYSTEM_LONG_BENCH_ARGS=(--deltakv_checkpoint_path "${DELTAKV_COMPRESSOR_PATH}")
       ;;
     vllm-vanilla|vllm)
-      ENGINE="vllm"
-      METHOD="vanilla"
+      SYSTEM_ENGINE=vllm
+      SYSTEM_METHOD=vanilla
       ;;
     *)
-      ENGINE="sparsevllm"
-      METHOD="${SYS_TRIM}"
+      echo "ERROR: unknown benchmark system '${system}'." >&2
+      return 2
       ;;
   esac
 
-  # Run probe without set -e
-  "${PYTHON_BIN}" -u "${REPO_ROOT}/benchmark/efficiency/bench_probe.py" \
-    --engine "${ENGINE}" \
-    --model-path "${MODEL_PATH}" \
-    --sparse-method "${METHOD}" \
-    --prompt-lens "${PROMPT_LENS}" \
-    --output-lens "${OUTPUT_LENS}" \
-    --batch-sizes 1 \
-    --tensor-parallel-size "${TP_SIZE}" \
-    --gpu-memory-utilization 0.85 \
-    --num-warmups 1 \
-    --num-iters 3 \
-    --output-dir "${SYS_OUT}" || echo "[WARNING] Scenario A failed on ${SYS_TRIM}, continuing..."
+  SYSTEM_HPARAMS=$("${PYTHON_BIN}" -c '
+import json, sys
+tp_size, method, score_mode, compressor = sys.argv[1:]
+params = {"tensor_parallel_size": int(tp_size), "gpu_memory_utilization": 0.85}
+if method == "snapkv":
+    params.update({
+        "snapkv_window_size": 64,
+        "sparse_prefill_score_mode": score_mode,
+        "sink_keep_tokens": 64,
+        "decode_keep_tokens": 2048,
+        "recent_keep_tokens": 64,
+        "pool_kernel_size": 7,
+    })
+if method == "deltakv":
+    params["deltakv_checkpoint_path"] = compressor
+print(json.dumps(params, separators=(",", ":")))
+' "${TP_SIZE}" "${SYSTEM_METHOD}" "${SPARSE_PREFILL_SCORE_MODE}" "${DELTAKV_COMPRESSOR_PATH}")
+}
 
-  # Stop monitor
-  if kill -0 "${MON_PID}" 2>/dev/null; then
-    kill -INT "${MON_PID}" 2>/dev/null || true
-    wait "${MON_PID}" 2>/dev/null || true
+IFS=',' read -ra SYS_ARR <<< "${SYSTEMS}"
+if [ "${#SYS_ARR[@]}" -eq 0 ]; then
+  echo "ERROR: SYSTEMS must contain at least one system." >&2
+  exit 2
+fi
+for SYS in "${SYS_ARR[@]}"; do
+  SYS_TRIM=$(printf '%s' "${SYS}" | xargs)
+  if [ -z "${SYS_TRIM}" ]; then
+    echo "ERROR: SYSTEMS contains an empty system name." >&2
+    exit 2
+  fi
+  resolve_system "${SYS_TRIM}" || exit $?
+done
+
+IFS=',' read -ra GPU_ARR <<< "${GPUS}"
+for GPU_ID in "${GPU_ARR[@]}"; do
+  if ! ACTIVE_APPS=$(nvidia-smi -i "${GPU_ID}" --query-compute-apps=pid --format=csv,noheader,nounits); then
+    echo "ERROR: failed to query GPU ${GPU_ID}." >&2
+    exit 2
+  fi
+  ACTIVE_APPS=$(printf '%s\n' "${ACTIVE_APPS}" | sed '/^[[:space:]]*$/d')
+  if [ -n "${ACTIVE_APPS}" ]; then
+    echo "ERROR: GPU ${GPU_ID} is busy; active PIDs: ${ACTIVE_APPS}" >&2
+    exit 2
   fi
 done
 
-# ========================================================================================
-# 2. SCENARIO B: LONGBENCH DYNAMIC SEQUENCE CHURN & CONTINUOUS BATCHING
-# ========================================================================================
-SCENARIO_B_DIR="${BASE_OUT}/scenario_b_longbench"
-mkdir -p "${SCENARIO_B_DIR}"
-echo ""
-echo ">>> [STAGE 2/2] Starting Scenario B (LongBench Dynamic Sequence Lifecycle & Churn) <<<"
+mkdir -p "${BASE_OUT}"
+export CUDA_VISIBLE_DEVICES="${GPUS}"
+export PYTHONPATH="${REPO_ROOT}:${REPO_ROOT}/src:${PYTHONPATH:-}"
+export CUDA_HOME
+export PATH="${CUDA_HOME}/bin:${PATH}"
+export TOKENIZERS_PARALLELISM=false
+export SPARSEVLLM_DATA_DIR="${DATA_ROOT}"
+export SPARSEVLLM_LONGBENCH_DATA_DIR="${DATA_ROOT}"
 
-TASKS="qasper,hotpotqa,multi_news,trec,passage_retrieval_en,lcc"
+MON_PID=""
+stop_monitor() {
+  local rc=0
+  if [ -n "${MON_PID}" ]; then
+    if kill -0 "${MON_PID}" 2>/dev/null; then
+      kill -INT "${MON_PID}" 2>/dev/null || true
+    fi
+    wait "${MON_PID}" || rc=$?
+  fi
+  MON_PID=""
+  return "${rc}"
+}
+cleanup_monitor() {
+  stop_monitor >/dev/null 2>&1 || true
+}
+trap cleanup_monitor EXIT
+
+record_stage_status() {
+  local output_dir="$1"
+  local stage="$2"
+  local system="$3"
+  local task_rc="$4"
+  local monitor_rc="$5"
+  "${PYTHON_BIN}" -c \
+    'import json, pathlib, sys; p=pathlib.Path(sys.argv[1]); task=int(sys.argv[4]); mon=int(sys.argv[5]); p.write_text(json.dumps({"stage":sys.argv[2],"system":sys.argv[3],"status":"success" if task == 0 and mon == 0 else "failed","task_exit_code":task,"monitor_exit_code":mon}, indent=2)+"\n")' \
+    "${output_dir}/stage_status.json" "${stage}" "${system}" "${task_rc}" "${monitor_rc}"
+}
+
+SCENARIO_A_DIR="${BASE_OUT}/scenario_a_synthetic"
+SCENARIO_B_DIR="${BASE_OUT}/scenario_b_longbench"
+mkdir -p "${SCENARIO_A_DIR}" "${SCENARIO_B_DIR}"
+OVERALL_FAILED=0
+
 for SYS in "${SYS_ARR[@]}"; do
-  SYS_TRIM=$(echo "${SYS}" | xargs)
+  SYS_TRIM=$(printf '%s' "${SYS}" | xargs)
+  SYS_OUT="${SCENARIO_A_DIR}/${SYS_TRIM}"
+  mkdir -p "${SYS_OUT}"
+  resolve_system "${SYS_TRIM}" || exit $?
+
+  PROBE_ARGS=(
+    --engine "${SYSTEM_ENGINE}" --model-path "${MODEL_PATH}" --sparse-method "${SYSTEM_METHOD}"
+    --prompt-lens "${PROMPT_LENS}" --output-lens "${OUTPUT_LENS}" --batch-sizes "${BATCH_SIZES}"
+    --scenario "${BENCH_SCENARIO}" --seed "${BENCH_SEED}"
+    --prompt-length-jitter "${PROMPT_LENGTH_JITTER}"
+    --output-length-jitter "${OUTPUT_LENGTH_JITTER}"
+    --churn-request-multiplier "${CHURN_REQUEST_MULTIPLIER}"
+    --tensor-parallel-size "${TP_SIZE}" --gpu-memory-utilization 0.85
+    --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}"
+    --num-warmups 1 --num-iters 3 --output-dir "${SYS_OUT}"
+    --monitor-gpus "${GPUS}"
+    --hyper-params "${SYSTEM_HPARAMS}"
+  )
+  if [ "${SYSTEM_METHOD}" = snapkv ]; then
+    PROBE_ARGS+=(--sparse-prefill-score-mode "${SPARSE_PREFILL_SCORE_MODE}")
+  fi
+  TASK_RC=0
+  "${PYTHON_BIN}" -u "${REPO_ROOT}/benchmark/efficiency/bench_probe.py" "${PROBE_ARGS[@]}" || TASK_RC=$?
+  MONITOR_RC=0  # Synthetic hardware metrics are collected inside each measured case.
+  record_stage_status "${SYS_OUT}" scenario_a "${SYS_TRIM}" "${TASK_RC}" "${MONITOR_RC}"
+  if [ "${TASK_RC}" -ne 0 ] || [ "${MONITOR_RC}" -ne 0 ]; then
+    OVERALL_FAILED=1
+  fi
+done
+
+for SYS in "${SYS_ARR[@]}"; do
+  SYS_TRIM=$(printf '%s' "${SYS}" | xargs)
   SYS_OUT="${SCENARIO_B_DIR}/${SYS_TRIM}"
   mkdir -p "${SYS_OUT}"
-  
-  echo "--- Running Scenario B on System: [${SYS_TRIM}] ---"
-  HW_LOG="${SYS_OUT}/gpu_timeline.json"
+  resolve_system "${SYS_TRIM}" || exit $?
   "${PYTHON_BIN}" "${REPO_ROOT}/benchmark/efficiency/hardware_monitor.py" \
-    --gpus "${GPUS}" \
-    --interval_ms 200 \
-    --output_file "${HW_LOG}" >/dev/null 2>&1 &
+    --gpus "${GPUS}" --interval_ms 200 --output_file "${SYS_OUT}/gpu_timeline.json" &
   MON_PID=$!
 
-  if [ "${SYS_TRIM}" = "vllm-vanilla" ] || [ "${SYS_TRIM}" = "vllm" ]; then
-    "${PYTHON_BIN}" -u benchmark/long_bench/pred_vllm.py \
-      --model_path "${MODEL_PATH}" \
-      --task "${TASKS}" \
-      --output_root "${SYS_OUT}" \
-      --tensor_parallel_size "${TP_SIZE}" \
-      --gpu_memory_utilization 0.85 \
-      --max_model_len 32768 \
-      --samples_per_task "${LONGBENCH_SAMPLES}" \
-      --min_required_samples "${LONGBENCH_SAMPLES}" \
-      --temperature 0.0 \
-      --top_p 1.0 \
-      --top_k 1 \
-      --batch_size 16 || echo "[WARNING] LongBench vLLM failed on ${SYS_TRIM}, continuing..."
+  TASK_RC=0
+  if [ "${SYSTEM_ENGINE}" = vllm ]; then
+    "${PYTHON_BIN}" -u "${REPO_ROOT}/benchmark/long_bench/pred_vllm.py" \
+      --model_path "${MODEL_PATH}" --task "${TASKS}" --output_root "${SYS_OUT}" \
+      --tensor_parallel_size "${TP_SIZE}" --gpu_memory_utilization 0.85 \
+      --max_model_len 32768 --num_samples "${LONGBENCH_SAMPLES}" \
+      --min_required_samples "${LONGBENCH_SAMPLES}" --temperature 0.0 \
+      --top_p 1.0 --top_k 1 --batch_size 16 || TASK_RC=$?
   else
-    METHOD="vanilla"
-    if [ "${SYS_TRIM}" = "svllm-snapkv" ]; then
-      METHOD="snapkv"
-      HPARAMS="{\"tensor_parallel_size\": ${TP_SIZE}, \"gpu_memory_utilization\": 0.85, \"snapkv_window_size\": 64, \"sparse_prefill_score_mode\": \"tilelang_raw_qk\", \"sink_keep_tokens\": 64, \"decode_keep_tokens\": 2048, \"recent_keep_tokens\": 64, \"pool_kernel_size\": 7}"
-    else
-      HPARAMS="{\"tensor_parallel_size\": ${TP_SIZE}, \"gpu_memory_utilization\": 0.85}"
-    fi
-
-    "${PYTHON_BIN}" -u benchmark/long_bench/pred.py \
-      --model_path "${MODEL_PATH}" \
-      --task "${TASKS}" \
-      --output_root "${SYS_OUT}" \
-      --sparse_method "${METHOD}" \
-      --hyper_param "${HPARAMS}" \
-      --max_model_len 32768 \
-      --samples_per_task "${LONGBENCH_SAMPLES}" \
-      --min_required_samples "${LONGBENCH_SAMPLES}" \
-      --temperature 0.0 \
-      --top_p 1.0 \
-      --top_k 1 \
-      --batch_size -1 || echo "[WARNING] LongBench svLLM failed on ${SYS_TRIM}, continuing..."
+    "${PYTHON_BIN}" -u "${REPO_ROOT}/benchmark/long_bench/pred.py" \
+      --model_path "${MODEL_PATH}" --task "${TASKS}" --output_root "${SYS_OUT}" \
+      --sparse_method "${SYSTEM_METHOD}" --hyper_param "${SYSTEM_HPARAMS}" --max_model_len 32768 \
+      --num_samples "${LONGBENCH_SAMPLES}" --temperature 0.0 --top_p 1.0 \
+      --top_k 1 --batch_size 16 "${SYSTEM_LONG_BENCH_ARGS[@]}" || TASK_RC=$?
   fi
-
-  if kill -0 "${MON_PID}" 2>/dev/null; then
-    kill -INT "${MON_PID}" 2>/dev/null || true
-    wait "${MON_PID}" 2>/dev/null || true
+  MONITOR_RC=0
+  stop_monitor || MONITOR_RC=$?
+  record_stage_status "${SYS_OUT}" scenario_b "${SYS_TRIM}" "${TASK_RC}" "${MONITOR_RC}"
+  if [ "${TASK_RC}" -ne 0 ] || [ "${MONITOR_RC}" -ne 0 ]; then
+    OVERALL_FAILED=1
   fi
 done
 
-# ========================================================================================
-# 3. MASTER COMPARISON & SEQUENCE LIFECYCLE BREAKDOWN REPORT
-# ========================================================================================
-"${PYTHON_BIN}" - <<PY
-import json
-import os
-from pathlib import Path
+AGGREGATE_RC=0
+"${PYTHON_BIN}" "${REPO_ROOT}/benchmark/efficiency/validate_unified_suite.py" \
+  --root "${BASE_OUT}" --systems "${SYSTEMS}" --tasks "${TASKS}" \
+  --expected-count "${LONGBENCH_SAMPLES}" || AGGREGATE_RC=$?
 
-root = Path("${BASE_OUT}")
-scen_a = root / "scenario_a_synthetic"
-scen_b = root / "scenario_b_longbench"
-
-print("\n" + "=" * 120)
-print(f"MASTER UNIFIED EFFICIENCY & SEQUENCE LIFECYCLE REPORT ({root.name})")
-print("=" * 120)
-
-print("\n[1] SCENARIO A: SYNTHETIC LENGTH LADDER (Static Uniform Batches)")
-print("-" * 120)
-print(f"{'System':<16} | {'Prompt':<8} | {'Out':<5} | {'TTFT (ms)':<11} | {'TPOT (ms)':<10} | {'Prefill MFU':<12} | {'Decode MBU':<12} | {'Peak VRAM':<10}")
-print("-" * 120)
-if scen_a.exists():
-    for sys_dir in sorted(scen_a.iterdir()):
-        sum_f = sys_dir / "summary.json"
-        if sum_f.exists():
-            try:
-                with open(sum_f) as f:
-                    d = json.load(f)
-                    for r in d.get("summary", []):
-                        label = f"{r.get('engine')}-{r.get('sparse_method')}"
-                        print(f"{label:<16} | {r.get('prompt_len'):<8} | {r.get('output_len'):<5} | {r.get('ttft_ms_mean', 0.0):<11.2f} | {r.get('tpot_ms_mean', 0.0):<10.2f} | {r.get('prefill_mfu_pct_mean', 0.0):<11.1f}% | {r.get('decode_mbu_pct_mean', 0.0):<11.1f}% | {r.get('peak_vram_gb_max', 0.0):<8.2f}GB")
-            except Exception as e:
-                pass
-
-print("\n[2] SCENARIO B: LONGBENCH DYNAMIC SEQUENCE LIFECYCLE & HARDWARE TIMELINE")
-print("-" * 120)
-print(f"{'System':<16} | {'Duration (s)':<13} | {'Avg Compute %':<14} | {'Active Duty %':<14} | {'Host Bubble %':<14} | {'Avg Power (W)':<14}")
-print("-" * 120)
-if scen_b.exists():
-    for sys_dir in sorted(scen_b.iterdir()):
-        hw_f = sys_dir / "gpu_summary.json"
-        if not hw_f.exists():
-            hw_f = sys_dir / "gpu_timeline_summary.json"
-        if hw_f.exists():
-            try:
-                with open(hw_f) as f:
-                    d = json.load(f)
-                    agg = d.get("aggregate", {})
-                    dur = d.get("duration_seconds", 0.0)
-                    c_util = agg.get("mean_compute_util_pct", 0.0)
-                    duty = agg.get("mean_active_duty_cycle_pct", 0.0)
-                    bubble = agg.get("mean_host_launch_bubble_pct", 0.0)
-                    pwr = agg.get("avg_total_power_w", 0.0)
-                    print(f"{sys_dir.name:<16} | {dur:<13.1f} | {c_util:<14.1f}% | {duty:<14.1f}% | {bubble:<14.1f}% | {pwr:<14.1f}W")
-            except Exception:
-                pass
-print("=" * 120 + "\n")
-PY
-
-echo "Unified report saved under: ${BASE_OUT}"
+if [ "${AGGREGATE_RC}" -ne 0 ]; then
+  OVERALL_FAILED=1
+fi
+echo "Unified suite artifacts: ${BASE_OUT}"
+exit "${OVERALL_FAILED}"

@@ -30,7 +30,7 @@ BF16；FP16 Qwen3MoE checkpoint 仅支持 `TP=1`。当 `TP=1` 时，原有 EP
 
 在 H100 80GB 上，未量化 BF16 Qwen3-30B-A3B 的 EP1 TP1/TP2 默认选择
 `sgl_triton_hybrid` MoE provider。经过 profile 的大 token bucket 使用移植的
-SGL fused-MoE kernel（TP1 为 8192 token 及以上，TP2 为 4096 token 及以上）；
+SGL fused-MoE kernel（TP1/TP2 均为 64 token 及以上）；
 较小 bucket 继续使用通用 Triton kernel。其他 shape 和 topology 保持原有
 provider。operator runtime statistics 会分别记录各分支实际执行的 kernel。
 

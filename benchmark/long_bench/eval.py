@@ -198,7 +198,10 @@ if __name__ == '__main__':
         with open(f"{path}/{filename}", "r", encoding="utf-8") as f:
             for line_idx, line in enumerate(f):
                 data = json.loads(line)
-                status = data.get("status", "success")
+                status = data.get("status")
+                if status is None:
+                    invalid_statuses["missing"] += 1
+                    status = "parse_failed"
                 if status not in SAMPLE_STATUSES:
                     invalid_statuses[status] += 1
                     status = "parse_failed"

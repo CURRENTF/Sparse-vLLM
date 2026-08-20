@@ -24,6 +24,49 @@ from sparsevllm.engine.cache_manager.storage import (
     MlaLatentStorage,
     create_attention_cache_storage,
 )
+from sparsevllm.platforms import device_runtime
+
+
+@pytest.mark.parametrize(
+    ("manager_cls", "num_layers", "host_buffer_names"),
+    [
+        (
+            StandardCacheManager,
+            None,
+            (
+                "_pinned_input_ids",
+                "_pinned_positions",
+                "_pinned_context_lens",
+                "_pinned_req_indices",
+            ),
+        ),
+        (
+            SnapKVCacheManager,
+            2,
+            (
+                "_pinned_input_ids",
+                "_pinned_positions",
+                "_pinned_layers_context_lens",
+                "_pinned_layers_req_indices",
+            ),
+        ),
+    ],
+)
+def test_decode_buffers_respect_platform_pin_memory_support(
+    manager_cls,
+    num_layers,
+    host_buffer_names,
+):
+    manager = object.__new__(manager_cls)
+    manager.device = torch.device("cpu")
+    if num_layers is not None:
+        manager.num_layers = num_layers
+
+    with patch.object(device_runtime, "supports_pin_memory", return_value=False):
+        manager._ensure_decode_buffers(3)
+
+    for name in host_buffer_names:
+        assert not getattr(manager, name).is_pinned()
 
 
 def test_heterogeneous_explicit_storage_preserves_per_layer_shapes():

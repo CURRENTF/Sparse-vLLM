@@ -2872,6 +2872,67 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
         self.assertEqual(k_cache[[6, 7, 4, 5], 0, 0].tolist(), [10.0, 12.0, 15.0, 17.0])
         self.assertEqual(v_cache[[6, 7, 4, 5], 0, 0].tolist(), [20.0, 22.0, 25.0, 27.0])
 
+    def test_snapkv_eager_decode_falls_back_when_layer_metadata_diverges(self):
+        manager = object.__new__(SnapKVCacheManager)
+        manager.runtime_layout = identity_runtime_layout(2)
+        manager.device = torch.device("cpu")
+        manager.num_layers = 2
+        manager.num_kv_layers = 2
+        manager.max_model_len = 8
+        manager._uniform_decode_metadata = False
+        manager._decode_static_state_binding_key = None
+        manager.seq_id_to_row = [{10: 0}, {10: 1}]
+        manager.free_rows = [deque([1]), deque([0])]
+        manager.row_seq_lens = [
+            np.array([2, 0], dtype=np.int32),
+            np.array([0, 3], dtype=np.int32),
+        ]
+        manager.free_slots_stack_tensor = torch.tensor(
+            [[10, 11, 12, 13], [20, 21, 22, 23]], dtype=torch.int32
+        )
+        manager.free_slots_stack = [
+            manager.free_slots_stack_tensor[0],
+            manager.free_slots_stack_tensor[1],
+        ]
+        manager._num_free_slots = [4, 3]
+        manager.buffer_req_to_token_slots_tensor = torch.zeros((2, 2, 8), dtype=torch.int32)
+        manager.buffer_req_to_token_slots = [
+            manager.buffer_req_to_token_slots_tensor[0],
+            manager.buffer_req_to_token_slots_tensor[1],
+        ]
+        manager.layer_batch_states = [SimpleNamespace(), SimpleNamespace()]
+
+        cap = 1
+        manager._decode_buf_capacity = cap
+        manager._pinned_input_ids = torch.empty(cap, dtype=torch.int64)
+        manager._pinned_positions = torch.empty(cap, dtype=torch.int64)
+        manager._cuda_input_ids = torch.empty(cap, dtype=torch.int64)
+        manager._cuda_positions = torch.empty(cap, dtype=torch.int64)
+        manager._pinned_layers_context_lens = torch.empty((2, cap), dtype=torch.int32)
+        manager._cuda_layers_context_lens = torch.empty((2, cap), dtype=torch.int32)
+        manager._cuda_layers_slot_mapping = torch.empty((2, cap), dtype=torch.int32)
+        manager._pinned_layers_req_indices = torch.empty((2, cap), dtype=torch.int32)
+        manager._cuda_layers_req_indices = torch.empty((2, cap), dtype=torch.int32)
+        manager._static_rows_gpu = torch.empty(cap, dtype=torch.long)
+        manager._static_cols_gpu = torch.empty(cap, dtype=torch.long)
+
+        seq = Sequence([1, 2, 3], SamplingParams(max_tokens=2))
+        seq.seq_id = 10
+        seq.num_prefilled_tokens = seq.num_prompt_tokens
+        seq.append_token(4)
+
+        manager._prepare_decode([seq])
+
+        self.assertEqual(manager._num_free_slots, [3, 2])
+        self.assertEqual(manager.row_seq_lens[0].tolist(), [3, 0])
+        self.assertEqual(manager.row_seq_lens[1].tolist(), [0, 4])
+        self.assertEqual(manager.buffer_req_to_token_slots[0][0, 2].item(), 13)
+        self.assertEqual(manager.buffer_req_to_token_slots[1][1, 3].item(), 22)
+        self.assertEqual(manager.layer_batch_states[0].slot_mapping.tolist(), [13])
+        self.assertEqual(manager.layer_batch_states[1].slot_mapping.tolist(), [22])
+        self.assertEqual(manager.layer_batch_states[0].context_lens.tolist(), [3])
+        self.assertEqual(manager.layer_batch_states[1].context_lens.tolist(), [4])
+
     def test_pyramidkv_long_prefill_offload_candidate_uses_chunked_staging(self):
         manager = object.__new__(SnapKVCacheManager)
         manager.config = SimpleNamespace(

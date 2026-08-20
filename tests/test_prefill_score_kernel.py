@@ -178,6 +178,32 @@ class PrefillScoreRoutingTest(unittest.TestCase):
                 attn_score=torch.empty((1, 16, 1), dtype=torch.float32),
             )
 
+    def test_tilelang_prefill_launch_uses_query_length_not_page_table_capacity(self):
+        try:
+            from sparsevllm.kernels.tilelang.gqa import prefill as tilelang_prefill
+        except ImportError as exc:
+            self.skipTest(str(exc))
+
+        captured = {}
+
+        def fake_kernel(*args):
+            captured["max_query_len"] = args[-1]
+
+        with patch.object(tilelang_prefill, "_get_fused_prefill_kernel", return_value=fake_kernel):
+            tilelang_prefill.gqa_paged_prefill_attention_tilelang(
+                torch.empty((4, 16, 128), dtype=torch.bfloat16),
+                torch.empty((8, 2, 128), dtype=torch.bfloat16),
+                torch.empty((8, 2, 128), dtype=torch.bfloat16),
+                torch.zeros((1, 65536), dtype=torch.int32),
+                torch.tensor([0], dtype=torch.int32),
+                torch.tensor([4], dtype=torch.int32),
+                torch.tensor([0], dtype=torch.int32),
+                torch.tensor([0, 4], dtype=torch.int32),
+                torch.empty((4, 16, 128), dtype=torch.bfloat16),
+            )
+
+        self.assertEqual(captured["max_query_len"], 4)
+
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for prefill score Triton tests.")
 class PrefillScoreKernelTest(unittest.TestCase):

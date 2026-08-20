@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Theoretical FLOPs, Memory Bandwidth, MFU, and MBU Calculator for LLM Serving."""
+"""Legacy analytical FLOP/byte helpers for offline studies.
+
+The standardized efficiency suite intentionally does not report these estimates;
+``bench_probe.py`` uses directly sampled GPU activity metrics instead.
+"""
 
 from __future__ import annotations
 
@@ -75,16 +79,21 @@ GPU_HARDWARE_REGISTRY: dict[str, GPUHardwareProfile] = {
 
 def detect_gpu_hardware(device_name: str | None = None) -> GPUHardwareProfile:
     """Detect or match GPU hardware profile from device string or CUDA device."""
+    if device_name in GPU_HARDWARE_REGISTRY:
+        return GPU_HARDWARE_REGISTRY[device_name]
     if device_name is None:
         try:
             import torch
-            if torch.cuda.is_available():
-                device_name = torch.cuda.get_device_name(0)
-        except Exception:
-            pass
+        except Exception as exc:
+            raise RuntimeError("Cannot import torch while detecting GPU hardware.") from exc
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "CUDA is unavailable; pass an explicit --hardware profile only for offline metric tests."
+            )
+        device_name = torch.cuda.get_device_name(0)
 
     if not device_name:
-        return GPU_HARDWARE_REGISTRY["h100_sxm"]
+        raise ValueError("GPU hardware name is empty.")
 
     d_lower = device_name.lower()
     if "h100" in d_lower:
@@ -92,8 +101,10 @@ def detect_gpu_hardware(device_name: str | None = None) -> GPUHardwareProfile:
             return GPU_HARDWARE_REGISTRY["h100_nvl"]
         elif "pcie" in d_lower:
             return GPU_HARDWARE_REGISTRY["h100_pcie"]
-        else:
-            return GPU_HARDWARE_REGISTRY["h100_sxm"]
+        raise ValueError(
+            f"Ambiguous H100 device name {device_name!r}; pass --hardware as one of "
+            "h100_sxm, h100_nvl, or h100_pcie."
+        )
     elif "h800" in d_lower:
         return GPU_HARDWARE_REGISTRY["h800_sxm"]
     elif "h20" in d_lower:
@@ -104,7 +115,10 @@ def detect_gpu_hardware(device_name: str | None = None) -> GPUHardwareProfile:
         else:
             return GPU_HARDWARE_REGISTRY["a100_sxm"]
 
-    return GPU_HARDWARE_REGISTRY["h100_sxm"]
+    raise ValueError(
+        f"Unknown GPU hardware {device_name!r}; pass --hardware as one of "
+        f"{', '.join(sorted(GPU_HARDWARE_REGISTRY))}."
+    )
 
 
 @dataclass
@@ -124,12 +138,24 @@ class ModelArchitectureSpecs:
 
     @classmethod
     def from_config_dict(cls, cfg: dict[str, Any], bytes_per_param: int = 2) -> ModelArchitectureSpecs:
-        hidden_size = int(cfg.get("hidden_size", 2048))
-        num_hidden_layers = int(cfg.get("num_hidden_layers", 48))
-        num_attention_heads = int(cfg.get("num_attention_heads", 16))
+        if isinstance(cfg.get("text_config"), dict):
+            cfg = cfg["text_config"]
+        required = ("hidden_size", "num_hidden_layers", "num_attention_heads", "vocab_size")
+        missing = [key for key in required if cfg.get(key) is None]
+        if missing:
+            raise ValueError(f"Model config is missing required architecture fields: {missing}.")
+
+        hidden_size = int(cfg["hidden_size"])
+        num_hidden_layers = int(cfg["num_hidden_layers"])
+        num_attention_heads = int(cfg["num_attention_heads"])
         num_key_value_heads = int(cfg.get("num_key_value_heads", num_attention_heads))
+        if num_attention_heads <= 0 or hidden_size % num_attention_heads != 0:
+            raise ValueError(
+                "Model config must have positive num_attention_heads dividing hidden_size, got "
+                f"hidden_size={hidden_size}, num_attention_heads={num_attention_heads}."
+            )
         head_dim = int(cfg.get("head_dim", hidden_size // num_attention_heads))
-        vocab_size = int(cfg.get("vocab_size", 152064))
+        vocab_size = int(cfg["vocab_size"])
 
         # MoE parameters
         num_experts = int(cfg.get("num_experts", cfg.get("n_routed_experts", 1)))
@@ -143,6 +169,12 @@ class ModelArchitectureSpecs:
 
         if is_moe and moe_intermediate_size == 0:
             moe_intermediate_size = dense_intermediate_size
+        if is_moe and (num_experts_per_tok <= 0 or moe_intermediate_size <= 0):
+            raise ValueError(
+                "MoE model config must define positive active-expert and intermediate-size fields."
+            )
+        if not is_moe and dense_intermediate_size <= 0:
+            raise ValueError("Dense model config must define a positive intermediate_size.")
 
         return cls(
             hidden_size=hidden_size,
@@ -169,72 +201,16 @@ class ModelArchitectureSpecs:
                 data = json.load(f)
             return cls.from_config_dict(data)
 
-        # Try transformers AutoConfig if model_path is a huggingface name or dir
+        # Try transformers AutoConfig if model_path is a Hugging Face name or directory.
         try:
             from transformers import AutoConfig
             hf_cfg = AutoConfig.from_pretrained(str(model_path), trust_remote_code=True)
             return cls.from_config_dict(hf_cfg.to_dict())
-        except Exception:
-            pass
-
-        # Fallback to predefined Qwen3-30B-A3B if string matches
-        name = str(model_path).lower()
-        if "qwen3-30b" in name or "qwen3_30b" in name:
-            # Qwen3-30B-A3B canonical specs
-            return cls(
-                hidden_size=2048,
-                num_hidden_layers=48,
-                num_attention_heads=32,
-                num_key_value_heads=4,
-                head_dim=128,
-                vocab_size=152064,
-                is_moe=True,
-                num_experts=128,
-                num_experts_per_tok=8,
-                moe_intermediate_size=768,
-                dense_intermediate_size=0,
-                bytes_per_param=2,
-            )
-        elif "qwen3-8b" in name or "qwen3_8b" in name:
-            return cls(
-                hidden_size=4096,
-                num_hidden_layers=36,
-                num_attention_heads=32,
-                num_key_value_heads=8,
-                head_dim=128,
-                vocab_size=152064,
-                is_moe=False,
-                dense_intermediate_size=11008,
-                bytes_per_param=2,
-            )
-        elif "qwen2.5-7b" in name or "qwen25_7b" in name:
-            return cls(
-                hidden_size=3584,
-                num_hidden_layers=28,
-                num_attention_heads=28,
-                num_key_value_heads=4,
-                head_dim=128,
-                vocab_size=152064,
-                is_moe=False,
-                dense_intermediate_size=18944,
-                bytes_per_param=2,
-            )
-
-        # Default fallback
-        return cls(
-            hidden_size=2048,
-            num_hidden_layers=48,
-            num_attention_heads=32,
-            num_key_value_heads=4,
-            head_dim=128,
-            vocab_size=152064,
-            is_moe=True,
-            num_experts=128,
-            num_experts_per_tok=8,
-            moe_intermediate_size=768,
-            dense_intermediate_size=0,
-            bytes_per_param=2,
-        )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to load model architecture config from {model_path!s}; "
+                "MFU/MBU cannot be computed safely."
+            ) from exc
 
     def calculate_prefill_flops(self, prompt_len: int, batch_size: int = 1) -> float:
         """Calculate theoretical FLOPs for prefilling a prompt of length N.
@@ -342,7 +318,10 @@ def calculate_mfu(
 ) -> float:
     """Calculate Model FLOPs Utilization (MFU) in percent."""
     if duration_seconds <= 0 or peak_tflops_bf16 <= 0 or tp_size <= 0:
-        return 0.0
+        raise ValueError(
+            "MFU requires positive duration, peak TFLOPS, and TP size, got "
+            f"duration={duration_seconds}, peak={peak_tflops_bf16}, tp={tp_size}."
+        )
     achieved_tflops = (flops / duration_seconds) / 1e12
     total_peak_tflops = float(tp_size) * peak_tflops_bf16
     return (achieved_tflops / total_peak_tflops) * 100.0
@@ -356,7 +335,10 @@ def calculate_mbu(
 ) -> float:
     """Calculate Model Bandwidth Utilization (MBU) in percent."""
     if duration_seconds <= 0 or peak_bandwidth_tbs <= 0 or tp_size <= 0:
-        return 0.0
+        raise ValueError(
+            "MBU requires positive duration, peak bandwidth, and TP size, got "
+            f"duration={duration_seconds}, peak={peak_bandwidth_tbs}, tp={tp_size}."
+        )
     achieved_tbs = (bytes_accessed / duration_seconds) / 1e12
     total_peak_tbs = float(tp_size) * peak_bandwidth_tbs
     return (achieved_tbs / total_peak_tbs) * 100.0

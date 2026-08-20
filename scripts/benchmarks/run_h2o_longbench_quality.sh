@@ -91,11 +91,11 @@ echo "Output Directory: ${OUTPUT_ROOT}"
 for METHOD in vanilla h2o; do
   METHOD_OUT="${OUTPUT_ROOT}/${METHOD}"
   mkdir -p "${METHOD_OUT}"
-  
+
   echo "------------------------------------------------------------"
   echo "Starting LongBench Quality Run for [${METHOD}]..."
   echo "------------------------------------------------------------"
-  
+
   if [ "${METHOD}" = "h2o" ]; then
     HPARAMS="{\"tensor_parallel_size\": ${TP_SIZE}, \"gpu_memory_utilization\": 0.85, \"h2o_decode_budget\": 2048, \"h2o_decode_eviction_interval\": 128, \"h2o_prefill_score_window\": ${H2O_PREFILL_SCORE_WINDOW}, \"sparse_prefill_score_mode\": \"${SPARSE_PREFILL_SCORE_MODE}\", \"h2o_recent_ratio\": 0.2}"
   else
@@ -109,8 +109,7 @@ for METHOD in vanilla h2o; do
     --sparse_method "${METHOD}" \
     --hyper_param "${HPARAMS}" \
     --max_model_len 32768 \
-    --samples_per_task "${SAMPLES_PER_TASK}" \
-    --min_required_samples "${SAMPLES_PER_TASK}" \
+    --num_samples "${SAMPLES_PER_TASK}" \
     --temperature 0.0 \
     --top_p 1.0 \
     --top_k 1 \

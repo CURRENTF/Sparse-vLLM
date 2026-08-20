@@ -40,10 +40,12 @@ esac
 TASKS="qasper,hotpotqa,multi_news,trec,passage_retrieval_en,lcc"
 if [ "${MODE}" = "smoke" ]; then
   SAMPLES_PER_TASK=2
+  SAMPLE_ARGS=(--num_samples "${SAMPLES_PER_TASK}")
   BATCH_SIZE=2
   echo "=== Running vLLM LongBench Smoke Test (${SAMPLES_PER_TASK} samples/task) ==="
 else
   SAMPLES_PER_TASK=-1
+  SAMPLE_ARGS=()
   BATCH_SIZE=16
   echo "=== Running vLLM LongBench Full Regression Test (Full 1500 samples) ==="
 fi
@@ -80,6 +82,18 @@ MONITOR_LOG="${OUTPUT_ROOT}/vllm/gpu_timeline.json"
   --interval_ms 200 \
   --output_file "${MONITOR_LOG}" &
 MONITOR_PID=$!
+cleanup_monitor() {
+  local rc=0
+  if [ -n "${MONITOR_PID:-}" ]; then
+    if kill -0 "${MONITOR_PID}" 2>/dev/null; then
+      kill -INT "${MONITOR_PID}" 2>/dev/null || true
+    fi
+    wait "${MONITOR_PID}" 2>/dev/null || rc=$?
+  fi
+  MONITOR_PID=""
+  return "${rc}"
+}
+trap 'cleanup_monitor || true' EXIT
 echo "[Monitor] GPU Lifecycle Logger started (PID: ${MONITOR_PID}). Sampling every 200ms..."
 
 # 7. Run vLLM Benchmark on LongBench
@@ -90,18 +104,14 @@ echo "[Monitor] GPU Lifecycle Logger started (PID: ${MONITOR_PID}). Sampling eve
   --tensor_parallel_size "${TP_SIZE}" \
   --gpu_memory_utilization 0.85 \
   --max_model_len 32768 \
-  --samples_per_task "${SAMPLES_PER_TASK}" \
-  --min_required_samples "${SAMPLES_PER_TASK}" \
+  "${SAMPLE_ARGS[@]}" \
   --temperature 0.0 \
   --top_p 1.0 \
   --top_k 1 \
   --batch_size "${BATCH_SIZE}"
 
 # 8. Stop GPU Monitor & Flush Stats
-if kill -0 "${MONITOR_PID}" 2>/dev/null; then
-  kill -INT "${MONITOR_PID}" 2>/dev/null || true
-  wait "${MONITOR_PID}" 2>/dev/null || true
-fi
+cleanup_monitor
 
 echo "============================================================"
 echo "vLLM LongBench Quality & GPU Lifecycle Run Completed!"

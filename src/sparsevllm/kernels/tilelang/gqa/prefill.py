@@ -64,9 +64,9 @@ def _build_fused_gqa_kernel(
         Output: T.Tensor([total_q, h_q, head_dim], dtype),
         AttnScore: T.Tensor([B, score_len], accum_dtype),
         batch_size: T.int32,
-        max_context_len: T.int32,
+        max_query_len: T.int32,
     ):
-        with T.Kernel(batch_size, h_q, T.ceildiv(max_context_len, block_M), threads=128) as (bx, by, bz):
+        with T.Kernel(batch_size, h_q, T.ceildiv(max_query_len, block_M), threads=128) as (bx, by, bz):
             Q_shared = T.alloc_shared([block_M, head_dim], dtype)
             K_shared = T.alloc_shared([block_N, head_dim], dtype)
             V_shared = T.alloc_shared([block_N, head_dim], dtype)
@@ -391,12 +391,25 @@ def gqa_paged_prefill_attention_tilelang(
     output: torch.Tensor,
     attn_score: torch.Tensor | None = None,
     sm_scale: float | None = None,
+    max_query_len: int | None = None,
 ) -> torch.Tensor:
     """Execute paged GQA prefill forward pass via TileLang."""
     total_q_tokens, h_q, head_dim = q.shape
     cache_slots, h_kv, _ = k_cache.shape
     batch_size = int(context_lens.numel())
     slot_rows, max_context_len = int(active_slots.shape[0]), int(active_slots.shape[1])
+    if cu_seqlens_q.numel() != batch_size + 1:
+        raise ValueError(
+            "TileLang GQA prefill requires cu_seqlens_q with batch_size + 1 entries, "
+            f"got {cu_seqlens_q.numel()} for batch_size={batch_size}."
+        )
+    if max_query_len is None:
+        query_lens = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
+        max_query_len = int(query_lens.max().item()) if batch_size else 0
+    else:
+        max_query_len = int(max_query_len)
+    if max_query_len <= 0:
+        raise ValueError(f"TileLang GQA prefill requires a positive query length, got {max_query_len}.")
 
     need_score = attn_score is not None
     if attn_score is None:
@@ -441,7 +454,7 @@ def gqa_paged_prefill_attention_tilelang(
         output,
         target_score,
         batch_size,
-        max_context_len,
+        max_query_len,
     )
     return output
 

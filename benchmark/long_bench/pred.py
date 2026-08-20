@@ -23,6 +23,7 @@ import torch
 from transformers import AutoTokenizer, GenerationConfig
 import torch.distributed as dist
 from benchmark.model_adapters.sparsevllm import get_sparsevllm_generate_api
+from benchmark.long_bench.prompt_budget import encode_prompt_with_generation_budget
 from datetime import datetime
 
 BASE_PATH = os.getenv("SPARSEVLLM_OUTPUT_DIR", str(REPO_ROOT / "outputs"))
@@ -326,18 +327,9 @@ def load_model_and_tokenizer(rank, args):
         deltakv_checkpoint_path=args.deltakv_checkpoint_path,
         sparse_method=args.sparse_method,
     )
-    
-    # 我们还需要 tokenizer 来进行长度检查和截断
+
     tokenizer_path = args.tokenizer_path if args.tokenizer_path else args.model_path
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
-    
-    # 尝试从模型配置中获取 max_position_embeddings
-    try:
-        from transformers import AutoConfig
-        config = AutoConfig.from_pretrained(args.model_path, trust_remote_code=True)
-        max_length = getattr(config, "max_position_embeddings", 32000)
-    except:
-        max_length = 32000
 
     generation_config = GenerationConfig.from_pretrained(args.model_path, trust_remote_code=True)
     eos_token_ids = generation_config.eos_token_id
@@ -353,14 +345,14 @@ def load_model_and_tokenizer(rank, args):
         eos_token_ids.append(int(tokenizer.eot_token_id))
     eos_token_ids = list(dict.fromkeys(int(token_id) for token_id in eos_token_ids))
 
-    return generate_fn, tokenizer, max_length, eos_token_ids
+    return generate_fn, tokenizer, int(args.max_model_len), eos_token_ids
 
 
 def get_pred(rank, data, dataset_info, args, model, tokenizer, model_max_length, eos_token_ids):
     dataset = dataset_info['dataset']
     prompt_format = dataset_info['prompt_format']
     max_gen = args.max_new_tokens_override if args.max_new_tokens_override is not None else dataset_info['max_gen']
-    max_length = model_max_length if model_max_length else dataset_info['max_length']
+    runtime_max_model_len = int(model_max_length)
     out_path = dataset_info['out_path']
     out_root = dataset_info['out_root']
 
@@ -372,26 +364,21 @@ def get_pred(rank, data, dataset_info, args, model, tokenizer, model_max_length,
         prepared_records: list[dict[str, Any]] = []
         for json_obj in batch_data:
             selected_idx = int(json_obj.get("_longbench_selected_idx", i + len(prepared_records)))
-            prompt_tokens = json_obj.get("_longbench_prompt_tokens")
+            prompt_tokens = None
             try:
                 if "answers" not in json_obj or "all_classes" not in json_obj:
                     raise ValueError("LongBench sample must contain answers and all_classes fields.")
 
                 prompt = prompt_format.format(**json_obj)
-                tokenized_prompt = tokenizer(prompt, truncation=False, return_tensors="pt").input_ids[0]
-                if len(tokenized_prompt) > max_length:
-                    half = int(max_length / 2)
-                    prompt = (
-                            tokenizer.decode(tokenized_prompt[:half], skip_special_tokens=True) +
-                            tokenizer.decode(tokenized_prompt[-half:], skip_special_tokens=True)
-                    )
                 prompt = build_chat(tokenizer, prompt, dataset, args.no_chat_template, args.thinking_mode)
-                if prompt_tokens is None:
-                    add_special_tokens = True
-                    if tokenizer.bos_token is None or prompt.startswith(tokenizer.bos_token):
-                        add_special_tokens = False
-                    prompt_tokens = len(tokenizer.encode(prompt, add_special_tokens=add_special_tokens))
-                prompts.append(prompt)
+                prompt_token_ids = encode_prompt_with_generation_budget(
+                    tokenizer,
+                    prompt,
+                    max_model_len=runtime_max_model_len,
+                    max_gen=max_gen,
+                )
+                prompt_tokens = len(prompt_token_ids)
+                prompts.append(prompt_token_ids)
                 prepared_records.append(
                     _sample_base_record(
                         dataset=dataset,
@@ -528,8 +515,17 @@ def worker(rank, world_size, datasets, dataset2prompt, dataset2maxlen, args, out
                 f"LongBench dataset file not found for dataset '{dataset}': {data_path}"
             )
         
-        data = [json.loads(line) for line in open(data_path, 'r', encoding="utf-8")]
-        if args.num_samples: data = data[:args.num_samples]
+        with open(data_path, "r", encoding="utf-8") as handle:
+            data = [json.loads(line) for line in handle if line.strip()]
+        for source_idx, row in enumerate(data):
+            row.setdefault("_source_idx", source_idx)
+        if args.num_samples is not None:
+            if len(data) < args.num_samples:
+                raise RuntimeError(
+                    f"LongBench dataset={dataset} has {len(data)} rows, fewer than "
+                    f"--num_samples={args.num_samples}."
+                )
+            data = data[:args.num_samples]
 
         if args.min_prompt_tokens is not None:
             from benchmark.sparsevllm_regression.longbench_mini import select_longbench_mini_samples
@@ -717,6 +713,8 @@ def parse_args():
 
 if __name__ == '__main__':
     args = parse_args()
+    if args.num_samples is not None and args.num_samples <= 0:
+        raise ValueError(f"--num_samples must be > 0 when set, got {args.num_samples}.")
     mp.set_start_method('spawn', force=True)
     
     model_name = args.model

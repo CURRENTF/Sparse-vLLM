@@ -39,7 +39,7 @@ def get_sparsevllm_generate_api(
     llm = LLM(model_path, **public_infer_config)
 
     def generate(
-        prompt: str | Sequence[str],
+        prompt: str | list[int] | Sequence[str | list[int]],
         **kwargs,
     ):
         if kwargs.get("past_key_values") is not None:
@@ -47,7 +47,9 @@ def get_sparsevllm_generate_api(
                 "The native Sparse-vLLM benchmark adapter does not accept "
                 "external past_key_values."
             )
-        if isinstance(prompt, str):
+        if isinstance(prompt, (str, list)) and (
+            isinstance(prompt, str) or all(isinstance(token_id, int) for token_id in prompt)
+        ):
             prompts = [prompt]
             is_single = True
         else:

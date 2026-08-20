@@ -1233,10 +1233,11 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
         if not hasattr(self, "_decode_buf_capacity") or self._decode_buf_capacity < batch_size:
             cap = max(batch_size, getattr(self, "_decode_buf_capacity", 0) * 2, 64)
             self._decode_buf_capacity = cap
-            self._pinned_input_ids = torch.empty(cap, dtype=torch.int64, pin_memory=True)
-            self._pinned_positions = torch.empty(cap, dtype=torch.int64, pin_memory=True)
-            self._pinned_context_lens = torch.empty(cap, dtype=torch.int32, pin_memory=True)
-            self._pinned_req_indices = torch.empty(cap, dtype=torch.int32, pin_memory=True)
+            pin_memory = device_runtime.supports_pin_memory()
+            self._pinned_input_ids = torch.empty(cap, dtype=torch.int64, pin_memory=pin_memory)
+            self._pinned_positions = torch.empty(cap, dtype=torch.int64, pin_memory=pin_memory)
+            self._pinned_context_lens = torch.empty(cap, dtype=torch.int32, pin_memory=pin_memory)
+            self._pinned_req_indices = torch.empty(cap, dtype=torch.int32, pin_memory=pin_memory)
             self._cuda_input_ids = torch.empty(cap, dtype=torch.int64, device=self.device)
             self._cuda_positions = torch.empty(cap, dtype=torch.int64, device=self.device)
             self._cuda_context_lens = torch.empty(cap, dtype=torch.int32, device=self.device)

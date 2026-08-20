@@ -1236,20 +1236,22 @@ class SnapKVCacheManager(CacheManager):
 
             self.buffer_req_to_token_slots[layer_idx][row_idx, cur_len: cur_len + size] = select_index
             self.row_seq_lens[layer_idx][row_idx] += size
+            return select_index
 
     def _ensure_decode_buffers(self, batch_size: int):
         if not hasattr(self, "_decode_buf_capacity") or self._decode_buf_capacity < batch_size:
             cap = max(batch_size, getattr(self, "_decode_buf_capacity", 0) * 2, 64)
             self._decode_buf_capacity = cap
-            self._pinned_input_ids = torch.empty(cap, dtype=torch.int64, pin_memory=True)
-            self._pinned_positions = torch.empty(cap, dtype=torch.int64, pin_memory=True)
+            pin_memory = device_runtime.supports_pin_memory()
+            self._pinned_input_ids = torch.empty(cap, dtype=torch.int64, pin_memory=pin_memory)
+            self._pinned_positions = torch.empty(cap, dtype=torch.int64, pin_memory=pin_memory)
             self._cuda_input_ids = torch.empty(cap, dtype=torch.int64, device=self.device)
             self._cuda_positions = torch.empty(cap, dtype=torch.int64, device=self.device)
 
-            self._pinned_layers_context_lens = torch.empty((self.num_layers, cap), dtype=torch.int32, pin_memory=True)
+            self._pinned_layers_context_lens = torch.empty((self.num_layers, cap), dtype=torch.int32, pin_memory=pin_memory)
             self._cuda_layers_context_lens = torch.empty((self.num_layers, cap), dtype=torch.int32, device=self.device)
             self._cuda_layers_slot_mapping = torch.empty((self.num_layers, cap), dtype=torch.int32, device=self.device)
-            self._pinned_layers_req_indices = torch.empty((self.num_layers, cap), dtype=torch.int32, pin_memory=True)
+            self._pinned_layers_req_indices = torch.empty((self.num_layers, cap), dtype=torch.int32, pin_memory=pin_memory)
             self._cuda_layers_req_indices = torch.empty((self.num_layers, cap), dtype=torch.int32, device=self.device)
 
             self._static_rows_gpu = torch.empty(cap, dtype=torch.long, device=self.device)
@@ -2521,7 +2523,14 @@ class SnapKVCacheManager(CacheManager):
             rows_gpu = self._static_rows_gpu[:batch_size]
             cols_gpu = self._static_cols_gpu[:batch_size]
 
-            if self.free_slots_stack_tensor is not None and self.buffer_req_to_token_slots_tensor is not None:
+            can_use_uniform_tensor_fast_path = (
+                self._uniform_decode_metadata
+                and self.free_slots_stack_tensor is not None
+                and self.buffer_req_to_token_slots_tensor is not None
+                and int(self.num_layers) == int(self.num_kv_layers)
+                and tuple(layer_ids) == tuple(range(int(self.num_layers)))
+            )
+            if can_use_uniform_tensor_fast_path:
                 first_layer = layer_ids[0]
                 row_indices = [self._get_free_row(first_layer, sid) for sid in seq_ids]
                 cur_lens = self.row_seq_lens[first_layer][row_indices]

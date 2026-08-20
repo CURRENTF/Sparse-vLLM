@@ -485,6 +485,14 @@ class TilelangGqaPagedPrefillAttentionProvider(PrefillAttentionProvider):
         minimum_runtime_version=(12, 3),
     )
 
+    def __init__(self) -> None:
+        self._query_plan_scope: object | None = None
+        self._max_query_len = 0
+
+    def close(self) -> None:
+        self._query_plan_scope = None
+        self._max_query_len = 0
+
     @classmethod
     def supports(
         cls, spec: PrefillAttentionOpSpec, caps: DeviceCaps
@@ -532,8 +540,13 @@ class TilelangGqaPagedPrefillAttentionProvider(PrefillAttentionProvider):
         from sparsevllm.kernels.tilelang.gqa.prefill import (
             gqa_paged_prefill_attention_tilelang,
         )
+        from sparsevllm.utils.context import get_context
 
         prompt_cache_lens = meta.context_lens - chunk_lens
+        validation_scope = get_context().attention_validation_scope
+        if self._query_plan_scope is not validation_scope:
+            self._max_query_len = int(chunk_lens.max().item())
+            self._query_plan_scope = validation_scope
         output = torch.empty_like(q)
         return gqa_paged_prefill_attention_tilelang(
             q,
@@ -547,6 +560,7 @@ class TilelangGqaPagedPrefillAttentionProvider(PrefillAttentionProvider):
             output,
             attn_score=meta.attn_score,
             sm_scale=spec.softmax_scale,
+            max_query_len=self._max_query_len,
         )
 
 

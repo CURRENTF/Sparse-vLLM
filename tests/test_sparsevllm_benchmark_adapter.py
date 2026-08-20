@@ -68,6 +68,17 @@ class SparseVLLMBenchmarkAdapterTest(unittest.TestCase):
         self.assertEqual(llm.calls[1][1].kwargs["temperature"], 0.7)
         self.assertEqual(llm.calls[1][1].kwargs["max_tokens"], 4)
 
+    def test_forwards_final_prompt_token_ids_without_retokenizing(self):
+        with (
+            patch("sparsevllm.LLM", _FakeLLM),
+            patch("sparsevllm.SamplingParams", _FakeSamplingParams),
+        ):
+            generate = get_sparsevllm_generate_api("/models/qwen", {})
+            batch = generate([[1, 2], [3, 4]], max_tokens=1)
+
+        self.assertEqual(batch, ["generated:[1, 2]", "generated:[3, 4]"])
+        self.assertEqual(_FakeLLM.instances[0].calls[0][0], [[1, 2], [3, 4]])
+
     def test_rejects_conflicting_or_unsupported_contracts(self):
         with (
             patch("sparsevllm.LLM", _FakeLLM),
