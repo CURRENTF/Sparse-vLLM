@@ -32,7 +32,7 @@ _QWEN_JSON_TOOL_FIELD = {
 }
 
 _QWEN_XML_TOOL_FIELD = {
-    "open_pattern": r"<tool_call>\s*<function=(?P<name>[^>\n]+)>\s*",
+    "open_pattern": r"(?:<tool_call>\s*)+(?:<function=|\[|<parameter=)(?P<name>[^>\n]+)>?\s*",
     "close_pattern": r"\s*</function>\s*</tool_call>",
     "content": "xml-inline",
     "content_args": {

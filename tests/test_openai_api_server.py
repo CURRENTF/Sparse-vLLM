@@ -6054,6 +6054,40 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
             "arguments": '{"command":"pwd"}',
         })
 
+    def test_qwen_xml_parser_normalizes_tool_openers(self):
+        parser = _transformers_response_parser(xml_tools=True)
+        raw = (
+            "<tool_call><tool_call>\n\n<tool_call>\n\n<tool_call>\n"
+            "[bash><parameter=command>pwd</parameter>"
+            "</function></tool_call>"
+        )
+
+        parsed = parser.parse(raw, prefix="", parse_tools=True)
+        stream = parser.stream(prefix="", parse_tools=True)
+        deltas = []
+        for chunk in (
+            "<tool_call>",
+            "<tool_call>\n\n",
+            "<tool_call>\n\n",
+            "<tool_call>\n[bash><parameter=command>pwd</parameter>",
+            "</function></tool_call>",
+        ):
+            deltas.extend(stream.feed(chunk))
+        deltas.extend(stream.finish())
+
+        self.assertEqual(parsed.content, "")
+        self.assertEqual(parsed.tool_calls[0]["function"]["name"], "bash")
+        self.assertFalse(any("content" in delta for delta in deltas))
+        self.assertEqual(deltas[0]["tool_calls"][0]["function"]["name"], "bash")
+
+        parsed = parser.parse(
+            "<tool_call><parameter=bash\n<parameter=command>pwd</parameter>"
+            "</function></tool_call>",
+            prefix="",
+            parse_tools=True,
+        )
+        self.assertEqual(parsed.tool_calls[0]["function"]["name"], "bash")
+
     def test_glm_response_parser_handles_thinking_and_plain_content(self):
         parser = _transformers_response_parser(glm_tools=True)
 
