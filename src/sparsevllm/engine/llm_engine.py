@@ -298,6 +298,7 @@ class LLMEngine:
         self._exited = False
         self._throughput_logger = _ThroughputIntervalLogger(config.throughput_log_interval_s)
         self.last_step_token_outputs: list[tuple[int, list[int]]] = []
+        self.last_step_prompt_cache_hits: list[tuple[int, int]] = []
         self.last_step_logprob_outputs: list[
             tuple[int, list[float | None], list[dict[int, float] | None]]
         ] = []
@@ -1159,10 +1160,16 @@ class LLMEngine:
         """
         with profiler.record("step"):
             self.last_step_token_outputs = []
+            self.last_step_prompt_cache_hits = []
             self.last_step_logprob_outputs = []
             # 1. 调度：决定哪些序列进入本次 Batch
             with profiler.record("schedule"):
                 seqs, is_prefill, preempted_seqs = self.scheduler.schedule()
+            if is_prefill:
+                self.last_step_prompt_cache_hits = [
+                    (int(seq.seq_id), int(seq.prefix_cache_hit_len))
+                    for seq in seqs
+                ]
             prefill_batch_mode = (
                 self.scheduler.prefill_execution_mode_for_batch(seqs)
                 if seqs and is_prefill

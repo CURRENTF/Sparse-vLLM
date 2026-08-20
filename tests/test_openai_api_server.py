@@ -928,7 +928,48 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         response = await _completion_response("cmpl-test", 123, "model-a", handles)
 
         self.assertEqual([choice["text"] for choice in response["choices"]], ["first", "second"])
-        self.assertEqual(response["usage"], {"prompt_tokens": 7, "completion_tokens": 10, "total_tokens": 17})
+        self.assertEqual(response["usage"], {
+            "prompt_tokens": 7,
+            "completion_tokens": 10,
+            "total_tokens": 17,
+            "prompt_tokens_details": {"cached_tokens": 0},
+        })
+
+    async def test_dispatcher_records_prompt_cache_hits(self):
+        from sparsevllm.entrypoints.openai.api_server import (
+            AsyncEngineDispatcher,
+            RequestHandle,
+            _ActiveRequest,
+        )
+        from sparsevllm.entrypoints.openai.detokenizer import IncrementalDetokenizer
+
+        tokenizer = _byte_level_tokenizer()
+        handle = RequestHandle(
+            output_queue=asyncio.Queue(),
+            cancelled=threading.Event(),
+        )
+        request = _ActiveRequest(
+            index=0,
+            loop=asyncio.get_running_loop(),
+            output_queue=handle.output_queue,
+            prompt_token_ids=[1, 2, 3, 4, 5, 6],
+            max_tokens=1,
+            stop=[],
+            completion_token_ids=[],
+            completion_token_logprobs=[],
+            completion_top_logprobs=[],
+            detokenizer=IncrementalDetokenizer(tokenizer),
+            handle=handle,
+        )
+        dispatcher = object.__new__(AsyncEngineDispatcher)
+        dispatcher.engine = type(
+            "Engine", (), {"last_step_prompt_cache_hits": [(7, 4)]}
+        )()
+
+        dispatcher._update_prompt_cache_usage({7: request})
+
+        self.assertEqual((request.reused_tokens, request.prefilled_tokens), (4, 2))
+        self.assertEqual((handle.reused_tokens, handle.prefilled_tokens), (4, 2))
 
     def test_sse_serializes_openai_data_frame(self):
         from sparsevllm.entrypoints.openai.api_server import _sse
@@ -3514,9 +3555,15 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(chat["chain_id"], "chain-1")
         self.assertEqual(chat["chain_status"], "resumed")
         self.assertEqual(chat["usage"]["reused_tokens"], 4)
+        self.assertEqual(
+            chat["usage"]["prompt_tokens_details"]["cached_tokens"], 4
+        )
         self.assertEqual(completion["chain_id"], "chain-1")
         self.assertEqual(completion["chain_status"], "resumed")
         self.assertEqual(completion["usage"]["reused_tokens"], 4)
+        self.assertEqual(
+            completion["usage"]["prompt_tokens_details"]["cached_tokens"], 4
+        )
         self.assertEqual(responses_usage["reused_tokens"], 4)
         self.assertEqual(
             responses_usage["input_tokens_details"]["cached_tokens"], 4
@@ -4738,7 +4785,12 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         ][0]
         self.assertEqual(final_choice["finish_reason"], "tool_calls")
         usage = [payload["usage"] for payload in payloads if not payload.get("choices")][0]
-        self.assertEqual(usage, {"prompt_tokens": 3, "completion_tokens": 3, "total_tokens": 6})
+        self.assertEqual(usage, {
+            "prompt_tokens": 3,
+            "completion_tokens": 3,
+            "total_tokens": 6,
+            "prompt_tokens_details": {"cached_tokens": 0},
+        })
 
     async def test_multimodal_chat_stream_uses_admitted_parser_prefix(self):
         from sparsevllm.entrypoints.openai.api_server import (

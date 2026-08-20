@@ -487,10 +487,11 @@ def _usage_from_final(final: dict[str, Any]) -> dict[str, Any]:
         "output_tokens": final["completion_tokens"],
         "total_tokens": final["prompt_tokens"] + final["completion_tokens"],
     }
-    if final.get("chain_id"):
+    if "reused_tokens" in final:
         usage["input_tokens_details"] = {
             "cached_tokens": int(final.get("reused_tokens", 0))
         }
+    if final.get("chain_id"):
         usage["reused_tokens"] = int(final.get("reused_tokens", 0))
     return usage
 

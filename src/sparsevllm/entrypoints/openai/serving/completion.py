@@ -247,6 +247,11 @@ async def _completion_response(
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
         "total_tokens": prompt_tokens + completion_tokens,
+        "prompt_tokens_details": {
+            "cached_tokens": sum(
+                int(getattr(handle, "reused_tokens", 0)) for handle in handles
+            )
+        },
     }
     if any(getattr(handle, "chain_id", None) for handle in handles):
         reused_tokens = sum(

@@ -331,6 +331,10 @@ async def _chat_completion_response(
         "completion_tokens": final["completion_tokens"],
         "total_tokens": final["prompt_tokens"] + final["completion_tokens"],
     }
+    if "reused_tokens" in final:
+        usage["prompt_tokens_details"] = {
+            "cached_tokens": int(final["reused_tokens"])
+        }
     if final.get("chain_id"):
         usage["cached_tokens"] = int(final.get("reused_tokens", 0))
         usage["reused_tokens"] = int(final.get("reused_tokens", 0))
@@ -509,6 +513,9 @@ async def _chat_completion_stream(
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
                 "total_tokens": prompt_tokens + completion_tokens,
+                "prompt_tokens_details": {
+                    "cached_tokens": int(getattr(handles[0], "reused_tokens", 0))
+                },
             }
             if chain_id:
                 reused_tokens = int(

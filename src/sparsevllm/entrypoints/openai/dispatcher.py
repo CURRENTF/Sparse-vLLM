@@ -74,6 +74,7 @@ class _ActiveRequest:
     prefilled_tokens: int = 0
     request_token: str | None = None
     prompt_token_count: int | None = None
+    handle: RequestHandle | None = None
 
 
 @dataclass
@@ -492,6 +493,7 @@ class AsyncEngineDispatcher:
                 self._refresh_routing_snapshots()
                 finished_outputs, _num_tokens = self.engine.step()
                 self._refresh_routing_snapshots()
+                self._update_prompt_cache_usage(active)
                 self._publish_token_deltas(active)
                 self._publish_finished(active, finished_outputs)
         except Exception as exc:
@@ -628,6 +630,7 @@ class AsyncEngineDispatcher:
                     if callable(admit)
                     else len(prompt_token_ids)
                 ),
+                handle=item.handle,
             )
             latest_request_tokens = getattr(
                 self, "_latest_request_tokens", None
@@ -709,6 +712,20 @@ class AsyncEngineDispatcher:
             raw_text_limit=len(parser_raw_text),
         )
         return parser_raw_text[:raw_text_len]
+
+    def _update_prompt_cache_usage(self, active: dict[int, _ActiveRequest]) -> None:
+        for seq_id, hit_tokens in getattr(
+            self.engine, "last_step_prompt_cache_hits", []
+        ):
+            request = active.get(seq_id)
+            if request is None:
+                continue
+            request.reused_tokens = max(request.reused_tokens, int(hit_tokens))
+            prompt_tokens = request.prompt_token_count or len(request.prompt_token_ids)
+            request.prefilled_tokens = max(0, prompt_tokens - request.reused_tokens)
+            if request.handle is not None:
+                request.handle.reused_tokens = request.reused_tokens
+                request.handle.prefilled_tokens = request.prefilled_tokens
 
     def _publish_token_deltas(self, active: dict[int, _ActiveRequest]):
         logprob_outputs = {
