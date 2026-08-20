@@ -1453,6 +1453,22 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(HTTPException, "conflicts"):
             _validate_chat_request(conflicting, "m")
 
+    def test_chat_accepts_store_false_and_rejects_store_true(self):
+        from fastapi import HTTPException
+
+        from sparsevllm.entrypoints.openai.api_server import ChatCompletionRequest, _validate_chat_request
+
+        request = ChatCompletionRequest(
+            model="m",
+            messages=[{"role": "user", "content": "p"}],
+            store=False,
+        )
+        _validate_chat_request(request, "m")
+
+        with self.assertRaisesRegex(HTTPException, "store=true") as ctx:
+            _validate_chat_request(request.model_copy(update={"store": True}), "m")
+        self.assertEqual(ctx.exception.status_code, 400)
+
     def test_chat_prompt_passes_tools_and_tool_history(self):
         from sparsevllm.entrypoints.openai.api_server import (
             ChatCompletionRequest,

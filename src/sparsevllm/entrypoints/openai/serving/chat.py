@@ -233,6 +233,8 @@ def _validate_chat_request(
         )
     if request.n != 1:
         raise HTTPException(status_code=400, detail="Sparse-vLLM chat completions currently supports n=1 only.")
+    if request.store:
+        raise HTTPException(status_code=400, detail="Chat Completions store=true is not supported; completions are not persisted.")
     if (
         request.max_completion_tokens is not None
         and _field_was_set(request, "max_tokens")

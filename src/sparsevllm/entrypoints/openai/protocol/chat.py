@@ -70,6 +70,7 @@ class ChatCompletionRequest(BaseModel):
     repetition_penalty: float = Field(default=1.0, gt=0.0)
     n: int = Field(default=1, ge=1)
     stream: bool = False
+    store: bool = False
     ignore_eos: bool = False
     stop: str | list[str] | None = None
     logprobs: bool = False
