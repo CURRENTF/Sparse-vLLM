@@ -11,6 +11,7 @@ from fastapi.responses import StreamingResponse
 from sparsevllm.entrypoints.openai.dispatcher import AsyncEngineDispatcher
 from sparsevllm.entrypoints.openai.dispatcher import RequestHandle
 from sparsevllm.entrypoints.openai.protocol.responses import ResponseRequest
+from sparsevllm.entrypoints.openai.reasoning import ReasoningCapabilities
 from sparsevllm.entrypoints.openai.render import _response_prompt
 from sparsevllm.entrypoints.openai.render import normalize_tools
 from sparsevllm.entrypoints.openai.render import resolve_response_chat_template_kwargs
@@ -39,6 +40,7 @@ async def serve_response(
     request_log_path: Path | None,
     reasoning_parser_name: str | None,
     response_parser: TransformersResponseParser | None = None,
+    reasoning_capabilities: ReasoningCapabilities | None = None,
     *,
     is_disconnected: DisconnectChecker | None = None,
 ):
@@ -47,6 +49,7 @@ async def serve_response(
         served_model_name,
         reasoning_parser_name=reasoning_parser_name,
         response_parser=response_parser,
+        reasoning_capabilities=reasoning_capabilities,
     )
 
     request_id = f"resp_{uuid.uuid4().hex}"
@@ -63,7 +66,7 @@ async def serve_response(
         request.top_k,
     )
     try:
-        prompt = _response_prompt(tokenizer, request)
+        prompt = _response_prompt(tokenizer, request, reasoning_capabilities)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -197,6 +200,7 @@ def _validate_response_request(
     *,
     reasoning_parser_name: str | None = None,
     response_parser: TransformersResponseParser | None = None,
+    reasoning_capabilities: ReasoningCapabilities | None = None,
 ):
     if request.model != served_model_name:
         raise HTTPException(
@@ -206,7 +210,7 @@ def _validate_response_request(
     if request.store:
         raise HTTPException(status_code=400, detail="Responses store=true is not supported; responses are not persisted.")
     try:
-        resolve_response_chat_template_kwargs(request)
+        resolve_response_chat_template_kwargs(request, reasoning_capabilities)
         normalize_tools(request.tools)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

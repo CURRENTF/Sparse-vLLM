@@ -18,5 +18,6 @@ async def responses(body: ResponseRequest, request: Request):
         request.app.state.request_log_dir,
         request.app.state.response_parser_name,
         request.app.state.response_parser,
+        request.app.state.reasoning_capabilities,
         is_disconnected=request.is_disconnected,
     )

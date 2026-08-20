@@ -11,6 +11,7 @@ from fastapi.responses import StreamingResponse
 from sparsevllm.entrypoints.openai.dispatcher import AsyncEngineDispatcher
 from sparsevllm.entrypoints.openai.dispatcher import RequestHandle
 from sparsevllm.entrypoints.openai.protocol.chat import ChatCompletionRequest
+from sparsevllm.entrypoints.openai.reasoning import ReasoningCapabilities
 from sparsevllm.entrypoints.openai.render import _chat_request_prompt
 from sparsevllm.entrypoints.openai.render import _chat_request_append_prompt
 from sparsevllm.entrypoints.openai.render import resolve_chat_template_kwargs
@@ -44,6 +45,7 @@ async def serve_chat_completion(
     request_log_path: Path | None,
     reasoning_parser_name: str | None = None,
     response_parser: TransformersResponseParser | None = None,
+    reasoning_capabilities: ReasoningCapabilities | None = None,
     *,
     is_disconnected: DisconnectChecker | None = None,
 ):
@@ -53,6 +55,7 @@ async def serve_chat_completion(
         tokenizer,
         reasoning_parser_name=reasoning_parser_name,
         response_parser=response_parser,
+        reasoning_capabilities=reasoning_capabilities,
     )
     request_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
@@ -72,9 +75,9 @@ async def serve_chat_completion(
     stop = _normalize_stop(request.stop)
     try:
         prompt = (
-            _chat_request_append_prompt(tokenizer, request)
+            _chat_request_append_prompt(tokenizer, request, reasoning_capabilities)
             if request.chain_append_start is not None
-            else _chat_request_prompt(tokenizer, request)
+            else _chat_request_prompt(tokenizer, request, reasoning_capabilities)
         )
         chat_tools = resolve_chat_tools(request)
     except ValueError as exc:
@@ -212,6 +215,7 @@ def _validate_chat_request(
     *,
     reasoning_parser_name: str | None = None,
     response_parser: TransformersResponseParser | None = None,
+    reasoning_capabilities: ReasoningCapabilities | None = None,
 ):
     if request.model != served_model_name:
         raise HTTPException(
@@ -243,7 +247,10 @@ def _validate_chat_request(
     if request.stop and request.logprobs:
         raise HTTPException(status_code=400, detail="stop with logprobs is not supported yet.")
     try:
-        chat_template_kwargs = resolve_chat_template_kwargs(request)
+        chat_template_kwargs = resolve_chat_template_kwargs(
+            request,
+            reasoning_capabilities,
+        )
         tools = resolve_chat_tools(request)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

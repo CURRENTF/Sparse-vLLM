@@ -11,6 +11,7 @@ from sparsevllm.entrypoints.openai.protocol.prefix_cache import PrefixCacheInspe
 from sparsevllm.entrypoints.openai.protocol.prefix_cache import PrefixCacheMatchRequest
 from sparsevllm.entrypoints.openai.protocol.prefix_cache import PrefixCacheSetEvictionPriorityRequest
 from sparsevllm.entrypoints.openai.protocol.responses import ResponseRequest
+from sparsevllm.entrypoints.openai.reasoning import ReasoningCapabilities
 from sparsevllm.entrypoints.openai.render import _chat_prompt
 from sparsevllm.entrypoints.openai.render import _chat_request_prompt
 from sparsevllm.entrypoints.openai.render import _response_prompt
@@ -35,8 +36,13 @@ async def serve_prefix_cache_match(
     request: PrefixCacheMatchRequest,
     dispatcher: AsyncEngineDispatcher,
     tokenizer: Any,
+    reasoning_capabilities: ReasoningCapabilities | None = None,
 ):
-    token_ids = _prefix_cache_match_token_ids_from_request(request, tokenizer)
+    token_ids = _prefix_cache_match_token_ids_from_request(
+        request,
+        tokenizer,
+        reasoning_capabilities,
+    )
     result = await _run_prefix_cache_control(
         dispatcher,
         "prefix_cache_match",
@@ -49,8 +55,13 @@ async def serve_prefix_cache_routing_match(
     request: PrefixCacheMatchRequest,
     dispatcher: AsyncEngineDispatcher,
     tokenizer: Any,
+    reasoning_capabilities: ReasoningCapabilities | None = None,
 ):
-    token_ids = _prefix_cache_match_token_ids_from_request(request, tokenizer)
+    token_ids = _prefix_cache_match_token_ids_from_request(
+        request,
+        tokenizer,
+        reasoning_capabilities,
+    )
     try:
         result = dispatcher.prefix_cache_routing_match(token_ids)
     except RuntimeError as exc:
@@ -103,6 +114,7 @@ def _prefix_cache_token_ids_from_request(
 def _prefix_cache_match_token_ids_from_request(
     request: PrefixCacheMatchRequest,
     tokenizer: Any,
+    reasoning_capabilities: ReasoningCapabilities | None = None,
 ) -> list[int]:
     selectors = [
         request.token_ids is not None,
@@ -127,14 +139,22 @@ def _prefix_cache_match_token_ids_from_request(
     if request.chat is not None:
         try:
             chat_request = ChatCompletionRequest.model_validate(request.chat)
-            prompt = _chat_request_prompt(tokenizer, chat_request)
+            prompt = _chat_request_prompt(
+                tokenizer,
+                chat_request,
+                reasoning_capabilities,
+            )
         except (ValidationError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return _encode_prefix_cache_text(tokenizer, prompt)
     if request.response is not None:
         try:
             response_request = ResponseRequest.model_validate(request.response)
-            prompt = _response_prompt(tokenizer, response_request)
+            prompt = _response_prompt(
+                tokenizer,
+                response_request,
+                reasoning_capabilities,
+            )
         except (ValidationError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return _encode_prefix_cache_text(tokenizer, prompt)

@@ -30,6 +30,7 @@ async def prefix_cache_match(body: PrefixCacheMatchRequest, request: Request):
         body,
         request.app.state.dispatcher,
         request.app.state.engine.tokenizer,
+        request.app.state.reasoning_capabilities,
     )
 
 
@@ -39,6 +40,7 @@ async def prefix_cache_routing_match(body: PrefixCacheMatchRequest, request: Req
         body,
         request.app.state.dispatcher,
         request.app.state.engine.tokenizer,
+        request.app.state.reasoning_capabilities,
     )
 
 

@@ -7,6 +7,8 @@ from sparsevllm.multimodal import MultiModalPrompt
 from sparsevllm.entrypoints.openai.protocol.chat import ChatCompletionRequest
 from sparsevllm.entrypoints.openai.protocol.chat import ChatMessage
 from sparsevllm.entrypoints.openai.protocol.responses import ResponseRequest
+from sparsevllm.entrypoints.openai.reasoning import ReasoningCapabilities
+from sparsevllm.entrypoints.openai.reasoning import reasoning_template_kwargs
 
 
 BOOLEAN_CHAT_TEMPLATE_KWARGS = {"enable_thinking", "preserve_thinking"}
@@ -134,16 +136,18 @@ def validate_chat_template_kwargs(value: Any) -> dict[str, Any] | None:
     return dict(value)
 
 
-def resolve_chat_template_kwargs(request: ChatCompletionRequest) -> dict[str, Any] | None:
+def resolve_chat_template_kwargs(
+    request: ChatCompletionRequest,
+    reasoning_capabilities: ReasoningCapabilities | None = None,
+) -> dict[str, Any] | None:
     kwargs = validate_chat_template_kwargs(request.chat_template_kwargs) or {}
     _merge_chat_template_kwarg(kwargs, "preserve_thinking", request.preserve_thinking)
-    enable_thinking = request.enable_thinking
-    if request.reasoning_effort is not None:
-        effort_enable_thinking = request.reasoning_effort != "none"
-        if enable_thinking is not None and enable_thinking != effort_enable_thinking:
-            raise ValueError("reasoning_effort conflicts with enable_thinking.")
-        enable_thinking = effort_enable_thinking
-    _merge_chat_template_kwarg(kwargs, "enable_thinking", enable_thinking)
+    _merge_chat_template_kwarg(kwargs, "enable_thinking", request.enable_thinking)
+    for name, value in reasoning_template_kwargs(
+        request.reasoning_effort,
+        reasoning_capabilities,
+    ).items():
+        _merge_chat_template_kwarg(kwargs, name, value)
     return kwargs or None
 
 
@@ -164,11 +168,15 @@ def resolve_chat_tools(request: ChatCompletionRequest) -> list[dict[str, Any]] |
     return None if request.tool_choice == "none" else tools
 
 
-def _chat_request_prompt(tokenizer: Any, request: ChatCompletionRequest) -> str:
+def _chat_request_prompt(
+    tokenizer: Any,
+    request: ChatCompletionRequest,
+    reasoning_capabilities: ReasoningCapabilities | None = None,
+) -> str:
     return _chat_prompt(
         tokenizer,
         request.messages,
-        resolve_chat_template_kwargs(request),
+        resolve_chat_template_kwargs(request, reasoning_capabilities),
         resolve_chat_tools(request),
     )
 
@@ -176,6 +184,7 @@ def _chat_request_prompt(tokenizer: Any, request: ChatCompletionRequest) -> str:
 def _chat_request_append_prompt(
     tokenizer: Any,
     request: ChatCompletionRequest,
+    reasoning_capabilities: ReasoningCapabilities | None = None,
 ) -> str:
     if _has_multimodal_content(request.messages):
         raise ValueError("Multimodal chat does not support chain append rendering.")
@@ -196,7 +205,7 @@ def _chat_request_append_prompt(
         ChatMessage(role="user", content="chain append context"),
         previous_response,
     ]
-    kwargs = resolve_chat_template_kwargs(request)
+    kwargs = resolve_chat_template_kwargs(request, reasoning_capabilities)
     prefix = _chat_prompt(
         tokenizer,
         context,
@@ -221,17 +230,15 @@ def _chat_request_append_prompt(
     return suffix
 
 
-def resolve_response_chat_template_kwargs(request: ResponseRequest) -> dict[str, Any] | None:
+def resolve_response_chat_template_kwargs(
+    request: ResponseRequest,
+    reasoning_capabilities: ReasoningCapabilities | None = None,
+) -> dict[str, Any] | None:
     kwargs = validate_chat_template_kwargs(request.chat_template_kwargs) or {}
     effort = request.reasoning.effort if request.reasoning is not None else None
-    if effort is None:
-        return kwargs or None
-
-    effort_enable_thinking = effort != "none"
-    if "enable_thinking" in kwargs and kwargs["enable_thinking"] != effort_enable_thinking:
-        raise ValueError("reasoning.effort conflicts with chat_template_kwargs.enable_thinking.")
-    kwargs["enable_thinking"] = effort_enable_thinking
-    return kwargs
+    for name, value in reasoning_template_kwargs(effort, reasoning_capabilities).items():
+        _merge_chat_template_kwarg(kwargs, name, value)
+    return kwargs or None
 
 
 def _chat_prompt(
@@ -317,8 +324,15 @@ def _chat_template_tool_calls(tool_calls: list[dict[str, Any]]) -> list[dict[str
     return rendered
 
 
-def _response_prompt(tokenizer: Any, request: ResponseRequest) -> str | MultiModalPrompt:
-    chat_template_kwargs = resolve_response_chat_template_kwargs(request)
+def _response_prompt(
+    tokenizer: Any,
+    request: ResponseRequest,
+    reasoning_capabilities: ReasoningCapabilities | None = None,
+) -> str | MultiModalPrompt:
+    chat_template_kwargs = resolve_response_chat_template_kwargs(
+        request,
+        reasoning_capabilities,
+    )
     tools = normalize_tools(request.tools) if request.tools else None
     messages = _response_messages(request)
     if any(

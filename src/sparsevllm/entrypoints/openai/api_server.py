@@ -20,6 +20,8 @@ from sparsevllm.entrypoints.openai.protocol.prefix_cache import PrefixCacheMatch
 from sparsevllm.entrypoints.openai.protocol.prefix_cache import PrefixCacheSetEvictionPriorityRequest
 from sparsevllm.entrypoints.openai.protocol.responses import ResponseReasoning
 from sparsevllm.entrypoints.openai.protocol.responses import ResponseRequest
+from sparsevllm.entrypoints.openai.reasoning import detect_reasoning_capabilities
+from sparsevllm.entrypoints.openai.reasoning import ReasoningCapabilities
 from sparsevllm.entrypoints.openai.render import _chat_content_text
 from sparsevllm.entrypoints.openai.render import _chat_prompt
 from sparsevllm.entrypoints.openai.render import _chat_request_prompt
@@ -107,6 +109,9 @@ def create_app(
     response_parser_impl = TransformersResponseParser.from_tokenizer(
         getattr(engine, "tokenizer", None)
     )
+    reasoning_capabilities = detect_reasoning_capabilities(
+        getattr(engine, "tokenizer", None)
+    )
     request_log_path = Path(request_log_dir) if request_log_dir else None
     if request_log_path is not None:
         request_log_path.mkdir(parents=True, exist_ok=True)
@@ -125,6 +130,7 @@ def create_app(
     app.state.request_log_dir = request_log_path
     app.state.response_parser_name = response_parser
     app.state.response_parser = response_parser_impl
+    app.state.reasoning_capabilities = reasoning_capabilities
     app.include_router(models_router)
     app.include_router(worker_router)
     app.include_router(prefix_cache_router)
