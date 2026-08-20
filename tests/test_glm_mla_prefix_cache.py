@@ -102,7 +102,6 @@ def _latent_chain_manager(manager_type, method: str):
     manager._decode_static_buffers = {}
     manager._decode_static_index_buffers = {}
     manager._prefill_attn_score_accumulators = {}
-    manager._prefill_score_bounds = None
     manager._uniform_decode_metadata = False
     manager._h2o_scores = {}
     manager._h2o_active_decode_seq_ids = set()

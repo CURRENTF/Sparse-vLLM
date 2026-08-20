@@ -85,10 +85,10 @@ def _normalize_h2o(config) -> None:
         )
     _normalize_int_attr(config, "h2o_prefill_score_window", fallback=0)
     score_mode = getattr(config, "sparse_prefill_score_mode", "probability")
-    if score_mode == "tilelang_raw_qk":
+    if score_mode == "logits":
         if config.h2o_prefill_score_window < 0:
             raise ValueError(
-                "h2o_prefill_score_window must be non-negative in TileLang raw-QK "
+                "h2o_prefill_score_window must be non-negative in logits "
                 f"mode (0 means the full chunk), got {config.h2o_prefill_score_window}."
             )
     elif not 1 <= config.h2o_prefill_score_window <= 128:
@@ -100,7 +100,7 @@ def _normalize_h2o(config) -> None:
 
 def _normalize_sparse_prefill_score(config) -> None:
     mode = str(config.sparse_prefill_score_mode).strip().lower()
-    allowed = {"probability", "tilelang_raw_qk"}
+    allowed = {"probability", "logits"}
     if mode not in allowed:
         raise ValueError(
             "sparse_prefill_score_mode must be one of "
@@ -112,12 +112,12 @@ def _normalize_sparse_prefill_score(config) -> None:
         "h2o",
     }:
         raise ValueError(
-            "sparse_prefill_score_mode='tilelang_raw_qk' only applies to "
+            "sparse_prefill_score_mode='logits' only applies to "
             f"SnapKV/PyramidKV/H2O, got method={config.vllm_sparse_method!r}."
         )
-    if mode == "tilelang_raw_qk" and config.sparse_attn_score_dtype != "float32":
+    if mode == "logits" and config.sparse_attn_score_dtype != "float32":
         raise ValueError(
-            "sparse_prefill_score_mode='tilelang_raw_qk' requires "
+            "sparse_prefill_score_mode='logits' requires "
             "sparse_attn_score_dtype='float32', got "
             f"{config.sparse_attn_score_dtype!r}."
         )

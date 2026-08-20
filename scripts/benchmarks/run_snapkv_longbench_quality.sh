@@ -11,9 +11,9 @@ MODEL_NAME="${2:-qwen3_30b}" # qwen3_30b | qwen3_8b | qwen25_7b
 GPUS="${3:-2,3}"
 SPARSE_PREFILL_SCORE_MODE="${SPARSE_PREFILL_SCORE_MODE:-probability}"
 case "${SPARSE_PREFILL_SCORE_MODE}" in
-  probability|tilelang_raw_qk) ;;
+  probability|logits) ;;
   *)
-    echo "ERROR: SPARSE_PREFILL_SCORE_MODE must be probability or tilelang_raw_qk." >&2
+    echo "ERROR: SPARSE_PREFILL_SCORE_MODE must be probability or logits." >&2
     exit 2
     ;;
 esac

@@ -28,9 +28,9 @@ BASE_OUT="${SPARSEVLLM_OUTPUT_DIR:-outputs}/unified_efficiency_$(date +%Y%m%d_%H
 TASKS="qasper,hotpotqa,multi_news,trec,passage_retrieval_en,lcc"
 
 case "${SPARSE_PREFILL_SCORE_MODE}" in
-  probability|tilelang_raw_qk) ;;
+  probability|logits) ;;
   *)
-    echo "ERROR: SPARSE_PREFILL_SCORE_MODE must be probability or tilelang_raw_qk." >&2
+    echo "ERROR: SPARSE_PREFILL_SCORE_MODE must be probability or logits." >&2
     exit 2
     ;;
 esac

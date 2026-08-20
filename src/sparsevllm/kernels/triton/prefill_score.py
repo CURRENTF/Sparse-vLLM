@@ -3,6 +3,70 @@ import triton
 import triton.language as tl
 
 
+class PrefillScoreWorkspace:
+    """Reusable probability-score workspace owned by one runtime worker."""
+
+    def __init__(self) -> None:
+        self._partial_m: torch.Tensor | None = None
+        self._partial_l: torch.Tensor | None = None
+        self._global_m: torch.Tensor | None = None
+        self._global_l: torch.Tensor | None = None
+
+    @staticmethod
+    def _reserve(
+        tensor: torch.Tensor | None,
+        elements: int,
+        *,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if (
+            tensor is None
+            or tensor.device != device
+            or int(tensor.numel()) < int(elements)
+        ):
+            tensor = torch.empty((int(elements),), device=device, dtype=torch.float32)
+        return tensor
+
+    def probability_buffers(
+        self,
+        *,
+        group_count: int,
+        candidate_blocks: int,
+        block_rows: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        partial_elements = int(group_count) * int(candidate_blocks) * int(block_rows)
+        global_elements = int(group_count) * int(block_rows)
+        self._partial_m = self._reserve(
+            self._partial_m,
+            partial_elements,
+            device=device,
+        )
+        self._partial_l = self._reserve(
+            self._partial_l,
+            partial_elements,
+            device=device,
+        )
+        self._global_m = self._reserve(
+            self._global_m,
+            global_elements,
+            device=device,
+        )
+        self._global_l = self._reserve(
+            self._global_l,
+            global_elements,
+            device=device,
+        )
+        partial_shape = (int(group_count), int(candidate_blocks), int(block_rows))
+        global_shape = (int(group_count), int(block_rows))
+        return (
+            self._partial_m[:partial_elements].view(partial_shape),
+            self._partial_l[:partial_elements].view(partial_shape),
+            self._global_m[:global_elements].view(global_shape),
+            self._global_l[:global_elements].view(global_shape),
+        )
+
+
 @triton.jit
 def _prefill_score_partial_stats_kernel(
     Q,
@@ -12,6 +76,7 @@ def _prefill_score_partial_stats_kernel(
     B_Seqlen,
     Req_to_tokens,
     B_req_idx,
+    Batch_Indices,
     Score_Q_Start,
     Score_Q_End,
     B_Start_Loc,
@@ -27,6 +92,7 @@ def _prefill_score_partial_stats_kernel(
     H_PER_KV: tl.constexpr,
     H_KV: tl.constexpr,
     HEAD_BLOCKS: tl.constexpr,
+    USE_BATCH_INDICES: tl.constexpr,
     candidate_start: tl.constexpr,
     num_recent_tokens: tl.constexpr,
     sm_scale: tl.constexpr,
@@ -43,12 +109,15 @@ def _prefill_score_partial_stats_kernel(
     cur_bkv = cur_group // HEAD_BLOCKS
     cur_batch = cur_bkv // H_KV
     cur_kv_head = cur_bkv % H_KV
+    source_batch = (
+        tl.load(Batch_Indices + cur_batch) if USE_BATCH_INDICES else cur_batch
+    )
 
-    cur_batch_in_all_start_index = tl.load(B_Start_Loc + cur_batch)
-    prompt_cache_len = tl.load(B_Prompt_Cache_Len + cur_batch)
-    context_len = tl.load(B_Seqlen + cur_batch)
+    cur_batch_in_all_start_index = tl.load(B_Start_Loc + source_batch)
+    prompt_cache_len = tl.load(B_Prompt_Cache_Len + source_batch)
+    context_len = tl.load(B_Seqlen + source_batch)
     cur_batch_seq_len = context_len - prompt_cache_len
-    cur_batch_req_idx = tl.load(B_req_idx + cur_batch)
+    cur_batch_req_idx = tl.load(B_req_idx + source_batch)
     score_q_start = tl.load(Score_Q_Start + cur_batch)
     score_q_end = tl.load(Score_Q_End + cur_batch)
 
@@ -141,6 +210,7 @@ def _prefill_score_final_kernel(
     B_Seqlen,
     Req_to_tokens,
     B_req_idx,
+    Batch_Indices,
     Score_Q_Start,
     Score_Q_End,
     B_Start_Loc,
@@ -158,6 +228,7 @@ def _prefill_score_final_kernel(
     H_PER_KV: tl.constexpr,
     H_KV: tl.constexpr,
     HEAD_BLOCKS: tl.constexpr,
+    USE_BATCH_INDICES: tl.constexpr,
     candidate_start: tl.constexpr,
     num_recent_tokens: tl.constexpr,
     sm_scale: tl.constexpr,
@@ -174,12 +245,15 @@ def _prefill_score_final_kernel(
     cur_bkv = cur_group // HEAD_BLOCKS
     cur_batch = cur_bkv // H_KV
     cur_kv_head = cur_bkv % H_KV
+    source_batch = (
+        tl.load(Batch_Indices + cur_batch) if USE_BATCH_INDICES else cur_batch
+    )
 
-    cur_batch_in_all_start_index = tl.load(B_Start_Loc + cur_batch)
-    prompt_cache_len = tl.load(B_Prompt_Cache_Len + cur_batch)
-    context_len = tl.load(B_Seqlen + cur_batch)
+    cur_batch_in_all_start_index = tl.load(B_Start_Loc + source_batch)
+    prompt_cache_len = tl.load(B_Prompt_Cache_Len + source_batch)
+    context_len = tl.load(B_Seqlen + source_batch)
     cur_batch_seq_len = context_len - prompt_cache_len
-    cur_batch_req_idx = tl.load(B_req_idx + cur_batch)
+    cur_batch_req_idx = tl.load(B_req_idx + source_batch)
     score_q_start = tl.load(Score_Q_Start + cur_batch)
     score_q_end = tl.load(Score_Q_End + cur_batch)
     score_q_len = tl.maximum(score_q_end - score_q_start, 1)
@@ -243,6 +317,118 @@ def _prefill_score_final_kernel(
     )
 
 
+@triton.jit
+def _prefill_logit_score_kernel(
+    Q,
+    K,
+    Attn_Score,
+    B_Seqlen,
+    Req_to_tokens,
+    B_req_idx,
+    Batch_Indices,
+    Score_Q_Start,
+    Score_Q_End,
+    B_Start_Loc,
+    B_Prompt_Cache_Len,
+    stride_qt,
+    stride_qh,
+    stride_qd,
+    stride_ks,
+    stride_kh,
+    stride_kd,
+    stride_asb,
+    stride_asl,
+    stride_req_to_tokens_b,
+    stride_req_to_tokens_s,
+    H_PER_KV: tl.constexpr,
+    H_KV: tl.constexpr,
+    HEAD_BLOCKS: tl.constexpr,
+    QUERY_BLOCKS: tl.constexpr,
+    USE_BATCH_INDICES: tl.constexpr,
+    candidate_start: tl.constexpr,
+    num_recent_tokens: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    cur_group = tl.program_id(0)
+    cur_n_block = tl.program_id(1)
+    cur_query_block = cur_group % QUERY_BLOCKS
+    cur_group = cur_group // QUERY_BLOCKS
+    cur_head_block = cur_group % HEAD_BLOCKS
+    cur_bkv = cur_group // HEAD_BLOCKS
+    cur_batch = cur_bkv // H_KV
+    cur_kv_head = cur_bkv % H_KV
+    source_batch = (
+        tl.load(Batch_Indices + cur_batch) if USE_BATCH_INDICES else cur_batch
+    )
+
+    cur_batch_in_all_start_index = tl.load(B_Start_Loc + source_batch)
+    prompt_cache_len = tl.load(B_Prompt_Cache_Len + source_batch)
+    context_len = tl.load(B_Seqlen + source_batch)
+    cur_batch_seq_len = context_len - prompt_cache_len
+    cur_batch_req_idx = tl.load(B_req_idx + source_batch)
+    score_q_start = tl.load(Score_Q_Start + cur_batch)
+    score_q_end = tl.load(Score_Q_End + cur_batch)
+
+    offs_rows = tl.arange(0, BLOCK_ROWS)
+    offs_d = tl.arange(0, BLOCK_DMODEL)
+    offs_n = tl.arange(0, BLOCK_N)
+    local_head = cur_head_block * BLOCK_H + offs_rows // BLOCK_M
+    q_head = cur_kv_head * H_PER_KV + local_head
+    q_abs_pos = (
+        score_q_start
+        + cur_query_block * BLOCK_M
+        + (offs_rows % BLOCK_M)
+    )
+    q_rel_pos = q_abs_pos - prompt_cache_len
+    q_row_valid = (
+        (local_head < H_PER_KV)
+        & (q_abs_pos < score_q_end)
+        & (q_rel_pos >= 0)
+        & (q_rel_pos < cur_batch_seq_len)
+    )
+
+    off_q = (
+        (cur_batch_in_all_start_index + q_rel_pos[:, None]) * stride_qt
+        + q_head[:, None] * stride_qh
+        + offs_d[None, :] * stride_qd
+    )
+    q = tl.load(Q + off_q, mask=q_row_valid[:, None], other=0.0)
+
+    kv_pos = cur_n_block * BLOCK_N + offs_n
+    candidate_end = tl.maximum(candidate_start, context_len - num_recent_tokens)
+    kv_in_candidate = (kv_pos >= candidate_start) & (kv_pos < candidate_end)
+    kv_loc = tl.load(
+        Req_to_tokens
+        + stride_req_to_tokens_b * cur_batch_req_idx
+        + stride_req_to_tokens_s * kv_pos,
+        mask=kv_in_candidate,
+        other=0,
+    )
+    off_k = (
+        kv_loc[None, :] * stride_ks
+        + cur_kv_head * stride_kh
+        + offs_d[:, None] * stride_kd
+    )
+    k = tl.load(K + off_k, mask=kv_in_candidate[None, :], other=0.0)
+
+    qk = tl.dot(q, k)
+    valid = (
+        q_row_valid[:, None]
+        & kv_in_candidate[None, :]
+        & (q_abs_pos[:, None] >= kv_pos[None, :])
+    )
+    token_score = tl.max(tl.where(valid, qk, -1.0e20), axis=0)
+    tl.atomic_max(
+        Attn_Score + cur_batch * stride_asb + kv_pos * stride_asl,
+        token_score,
+        mask=kv_in_candidate,
+    )
+
+
 @torch.no_grad()
 def prefill_score_fwd(
     q: torch.Tensor,
@@ -259,6 +445,9 @@ def prefill_score_fwd(
     *,
     candidate_start: int = 0,
     num_recent_tokens: int = 0,
+    score_mode: str = "probability",
+    workspace: PrefillScoreWorkspace | None = None,
+    batch_indices: torch.Tensor | None = None,
 ):
     head_dim = q.shape[-1]
     assert k.shape[-1] == head_dim
@@ -266,20 +455,55 @@ def prefill_score_fwd(
     assert q.stride(-1) == 1 and k.stride(-1) == 1
     assert attn_score.dim() == 2
     assert head_dim in {16, 32, 64, 128, 256}
-    batch, head = b_seq_len.shape[0], q.shape[1]
+    batch, head = score_q_start.shape[0], q.shape[1]
+    if score_q_end.shape != score_q_start.shape:
+        raise ValueError(
+            "score_q_start and score_q_end must have the same shape, got "
+            f"{tuple(score_q_start.shape)} and {tuple(score_q_end.shape)}."
+        )
+    if int(attn_score.shape[0]) != int(batch):
+        raise ValueError(
+            "attn_score must have one row per score range, got "
+            f"score_batch={batch} output_shape={tuple(attn_score.shape)}."
+        )
+    if batch_indices is not None:
+        if batch_indices.shape != score_q_start.shape:
+            raise ValueError(
+                "batch_indices must have one entry per score range, got "
+                f"{tuple(batch_indices.shape)} and {tuple(score_q_start.shape)}."
+            )
+        if batch_indices.dtype != torch.int32 or batch_indices.device != q.device:
+            raise TypeError(
+                "batch_indices must be int32 on the query device, got "
+                f"{batch_indices.dtype} on {batch_indices.device}."
+            )
+    launch_batch_indices = b_req_idx if batch_indices is None else batch_indices
     kv_head = k.shape[1]
     kv_group_num = head // kv_head
     if kv_group_num <= 0 or head % kv_head != 0:
         raise ValueError(f"num query heads must be divisible by num kv heads: q={head} k={kv_head}")
-    max_score_len = int((score_q_end - score_q_start).max().item())
+    score_mode = str(score_mode).strip().lower()
+    if score_mode not in {"probability", "logits"}:
+        raise ValueError(
+            "prefill score_mode must be 'probability' or 'logits', "
+            f"got {score_mode!r}."
+        )
+    max_score_len = int(max_query_len)
     if max_score_len <= 0:
         return
-    block_m = max(16, triton.next_power_of_2(max_score_len))
-    if block_m > 128:
-        raise ValueError(f"prefill score query range is too large for this kernel: {max_score_len} > 128")
+    if score_mode == "logits":
+        block_m = min(32, max(16, triton.next_power_of_2(max_score_len)))
+        query_blocks = triton.cdiv(max_score_len, block_m)
+    else:
+        block_m = max(16, triton.next_power_of_2(max_score_len))
+        if block_m > 128:
+            raise ValueError(
+                "probability prefill score query range is too large for this "
+                f"kernel: {max_score_len} > 128"
+            )
+        query_blocks = 1
 
-    candidate_ends = torch.clamp(b_seq_len - int(num_recent_tokens), min=int(candidate_start))
-    max_candidate_end = int(candidate_ends.max().item()) if batch > 0 else 0
+    max_candidate_end = int(attn_score.shape[1])
     if max_candidate_end <= 0:
         return
 
@@ -295,8 +519,51 @@ def prefill_score_fwd(
     block_h = min(triton.next_power_of_2(kv_group_num), block_h_limit)
     head_blocks = triton.cdiv(kv_group_num, block_h)
     block_rows = block_h * block_m
-    group_count = batch * kv_head * head_blocks
+    base_group_count = batch * kv_head * head_blocks
+    group_count = base_group_count * query_blocks if score_mode == "logits" else base_group_count
     if group_count <= 0:
+        return
+
+    attn_score.fill_(-torch.inf if score_mode == "logits" else 0.0)
+    dot_warps = 8 if block_rows >= 128 or block_n >= 128 else 4
+    if score_mode == "logits":
+        _prefill_logit_score_kernel[(group_count, candidate_blocks)](
+            q,
+            k,
+            attn_score,
+            b_seq_len,
+            req_to_token_indexs,
+            b_req_idx,
+            launch_batch_indices,
+            score_q_start,
+            score_q_end,
+            b_start_loc,
+            b_prompt_cache_len,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            k.stride(0),
+            k.stride(1),
+            k.stride(2),
+            attn_score.stride(0),
+            attn_score.stride(1),
+            req_to_token_indexs.stride(0),
+            req_to_token_indexs.stride(1),
+            H_PER_KV=kv_group_num,
+            H_KV=kv_head,
+            HEAD_BLOCKS=head_blocks,
+            QUERY_BLOCKS=query_blocks,
+            USE_BATCH_INDICES=batch_indices is not None,
+            candidate_start=int(candidate_start),
+            num_recent_tokens=int(num_recent_tokens),
+            BLOCK_H=block_h,
+            BLOCK_ROWS=block_rows,
+            BLOCK_DMODEL=head_dim,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            num_warps=dot_warps,
+            num_stages=3,
+        )
         return
 
     reduce_blocks = triton.next_power_of_2(candidate_blocks)
@@ -304,12 +571,13 @@ def prefill_score_fwd(
     while reduce_rows > 1 and reduce_rows * reduce_blocks > 32768:
         reduce_rows //= 2
 
-    partial_m = torch.empty((group_count, candidate_blocks, block_rows), device=q.device, dtype=torch.float32)
-    partial_l = torch.empty_like(partial_m)
-    global_m = torch.empty((group_count, block_rows), device=q.device, dtype=torch.float32)
-    global_l = torch.empty_like(global_m)
-
-    dot_warps = 8 if block_rows >= 128 or block_n >= 128 else 4
+    workspace = PrefillScoreWorkspace() if workspace is None else workspace
+    partial_m, partial_l, global_m, global_l = workspace.probability_buffers(
+        group_count=group_count,
+        candidate_blocks=candidate_blocks,
+        block_rows=block_rows,
+        device=q.device,
+    )
     _prefill_score_partial_stats_kernel[(group_count, candidate_blocks)](
         q,
         k,
@@ -318,6 +586,7 @@ def prefill_score_fwd(
         b_seq_len,
         req_to_token_indexs,
         b_req_idx,
+        launch_batch_indices,
         score_q_start,
         score_q_end,
         b_start_loc,
@@ -333,6 +602,7 @@ def prefill_score_fwd(
         H_PER_KV=kv_group_num,
         H_KV=kv_head,
         HEAD_BLOCKS=head_blocks,
+        USE_BATCH_INDICES=batch_indices is not None,
         candidate_start=int(candidate_start),
         num_recent_tokens=int(num_recent_tokens),
         sm_scale=float(head_dim) ** -0.5,
@@ -367,6 +637,7 @@ def prefill_score_fwd(
         b_seq_len,
         req_to_token_indexs,
         b_req_idx,
+        launch_batch_indices,
         score_q_start,
         score_q_end,
         b_start_loc,
@@ -384,6 +655,7 @@ def prefill_score_fwd(
         H_PER_KV=kv_group_num,
         H_KV=kv_head,
         HEAD_BLOCKS=head_blocks,
+        USE_BATCH_INDICES=batch_indices is not None,
         candidate_start=int(candidate_start),
         num_recent_tokens=int(num_recent_tokens),
         sm_scale=float(head_dim) ** -0.5,

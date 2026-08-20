@@ -295,7 +295,7 @@ def test_h2o_probe_records_explicit_budget_protocol():
         gpu_memory_utilization=0.85,
         max_num_batched_tokens=8192,
         sparse_method="h2o",
-        sparse_prefill_score_mode=None,
+        sparse_prefill_score_mode="probability",
     )
 
     hyper, budget, protocol, label = _resolve_sparse_probe_protocol(args)
@@ -304,8 +304,9 @@ def test_h2o_probe_records_explicit_budget_protocol():
     assert hyper["h2o_decode_budget"] == 4096
     assert protocol["decode_budget"] == 4096
     assert protocol["prefill_budget"] == 8192
+    assert protocol["score_mode"] == "probability"
     assert protocol["max_num_batched_tokens"] == 8192
-    assert "h2o-decode4096-prefill8192-window128" in label
+    assert "h2o-probability-decode4096-prefill8192-window128" in label
 
 
 def test_random_trace_is_matched_reproducible_and_variable_length():

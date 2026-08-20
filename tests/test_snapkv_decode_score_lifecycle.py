@@ -44,7 +44,7 @@ class WorkerInfoTest(unittest.TestCase):
             vllm_sparse_method="snapkv",
             pool_kernel_size=7,
             sparse_attn_score_dtype="float32",
-            sparse_prefill_score_mode="tilelang_raw_qk",
+            sparse_prefill_score_mode="logits",
         )
 
         benchmark_config = engine.worker_info()["benchmark_config"]
@@ -56,7 +56,7 @@ class WorkerInfoTest(unittest.TestCase):
         )
         self.assertEqual(
             benchmark_config["sparse_prefill_score_mode"],
-            "tilelang_raw_qk",
+            "logits",
         )
         self.assertEqual(engine.worker_info()["vocab_size"], 32_000)
         revision = engine.worker_info()["code_revision"]

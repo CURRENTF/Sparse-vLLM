@@ -13,9 +13,9 @@ SAMPLES_PER_TASK="${SAMPLES_PER_TASK:-8}"
 TASKS="${TASKS:-qasper,hotpotqa,multi_news,trec,passage_retrieval_en,lcc}"
 SPARSE_PREFILL_SCORE_MODE="${SPARSE_PREFILL_SCORE_MODE:-probability}"
 case "${SPARSE_PREFILL_SCORE_MODE}" in
-  probability|tilelang_raw_qk) ;;
+  probability|logits) ;;
   *)
-    echo "ERROR: SPARSE_PREFILL_SCORE_MODE must be probability or tilelang_raw_qk." >&2
+    echo "ERROR: SPARSE_PREFILL_SCORE_MODE must be probability or logits." >&2
     exit 2
     ;;
 esac

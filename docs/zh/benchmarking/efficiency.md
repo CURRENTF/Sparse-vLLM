@@ -226,7 +226,7 @@ run_efficiency_probe.sh SYSTEMS MODEL_NAME_OR_PATH PHYSICAL_GPU_IDS
 | `MAX_NUM_BATCHED_TOKENS` | `8192` | 两个 engine 匹配的 scheduler token budget。 |
 | `NUM_WARMUPS` | `1` | 每个 synthetic case 的 warmup iteration。 |
 | `NUM_ITERS` | `3` | 每个 synthetic case 的实测 iteration。 |
-| `SPARSE_PREFILL_SCORE_MODE` | `probability` | SnapKV prefill score mode：`probability` 或 `tilelang_raw_qk`。 |
+| `SPARSE_PREFILL_SCORE_MODE` | `probability` | SnapKV prefill score mode：`probability` 或 `logits`。 |
 | `CUDA_HOME` | `/usr/local/cuda-13.0` | Probe wrapper 使用的 CUDA toolkit 根目录。 |
 
 该套件始终关闭 prefix caching；这个入口不提供 prefix-caching benchmark 模式。

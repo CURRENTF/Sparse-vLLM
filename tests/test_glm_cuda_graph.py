@@ -882,7 +882,6 @@ def _initialize_glm_method_cache_manager(
     manager._decode_static_index_buffers = {}
     manager._decode_static_state_binding_key = None
     manager._prefill_attn_score_accumulators = {}
-    manager._prefill_score_bounds = None
     manager._uniform_decode_metadata = method == "streamingllm"
     manager.pyramidkv_prefill_staging_num_slots = 0
     manager.pyramidkv_prefill_staging_kv_cache = None

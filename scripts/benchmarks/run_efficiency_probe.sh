@@ -22,9 +22,9 @@ CHURN_REQUEST_MULTIPLIER="${CHURN_REQUEST_MULTIPLIER:-4}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-8192}"
 SPARSE_PREFILL_SCORE_MODE="${SPARSE_PREFILL_SCORE_MODE:-probability}"
 case "${SPARSE_PREFILL_SCORE_MODE}" in
-  probability|tilelang_raw_qk) ;;
+  probability|logits) ;;
   *)
-    echo "ERROR: SPARSE_PREFILL_SCORE_MODE must be probability or tilelang_raw_qk." >&2
+    echo "ERROR: SPARSE_PREFILL_SCORE_MODE must be probability or logits." >&2
     exit 2
     ;;
 esac

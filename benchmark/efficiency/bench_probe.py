@@ -394,11 +394,20 @@ def _resolve_sparse_probe_protocol(
         hyper_params.setdefault("decode_keep_tokens", 2048)
         hyper_params.setdefault("recent_keep_tokens", 64)
         hyper_params.setdefault("pool_kernel_size", 7)
+    elif args.sparse_method == "h2o":
+        hyper_params.setdefault("h2o_decode_budget", 4096)
+        hyper_params.setdefault("h2o_decode_eviction_interval", 128)
+        hyper_params.setdefault("h2o_prefill_budget", 8192)
+        hyper_params.setdefault("h2o_recent_ratio", 0.5)
+        hyper_params.setdefault("h2o_prefill_score_window", 128)
+
+    if args.sparse_method in {"snapkv", "h2o"}:
         configured_mode = hyper_params.get("sparse_prefill_score_mode")
         if args.sparse_prefill_score_mode is None and configured_mode is None:
             raise ValueError(
-                "SnapKV efficiency probes require an explicit --sparse-prefill-score-mode "
-                "(probability or tilelang_raw_qk)."
+                f"{args.sparse_method} efficiency probes require an explicit "
+                "--sparse-prefill-score-mode "
+                "(probability or logits)."
             )
         if (
             args.sparse_prefill_score_mode is not None
@@ -414,12 +423,6 @@ def _resolve_sparse_probe_protocol(
             if args.sparse_prefill_score_mode is not None
             else str(configured_mode)
         )
-    elif args.sparse_method == "h2o":
-        hyper_params.setdefault("h2o_decode_budget", 4096)
-        hyper_params.setdefault("h2o_decode_eviction_interval", 128)
-        hyper_params.setdefault("h2o_prefill_budget", 8192)
-        hyper_params.setdefault("h2o_recent_ratio", 0.5)
-        hyper_params.setdefault("h2o_prefill_score_window", 128)
 
     sparse_budget = (
         int(hyper_params.get("sink_keep_tokens", 64))
@@ -453,7 +456,8 @@ def _resolve_sparse_probe_protocol(
             }
         )
         protocol_label += (
-            f"-decode{protocol['decode_budget']}-prefill{protocol['prefill_budget']}"
+            f"-{protocol['score_mode']}-decode{protocol['decode_budget']}"
+            f"-prefill{protocol['prefill_budget']}"
             f"-window{protocol['score_window']}"
         )
     return hyper_params, sparse_budget, protocol, protocol_label
@@ -1531,9 +1535,9 @@ def parse_args():
     parser.add_argument("--hyper-params", type=str, default="{}")
     parser.add_argument(
         "--sparse-prefill-score-mode",
-        choices=["probability", "tilelang_raw_qk"],
+        choices=["probability", "logits"],
         default=None,
-        help="Required for SnapKV probes so probability and raw-QK results cannot be conflated.",
+        help="Required for SnapKV probes so probability and logits results cannot be conflated.",
     )
     parser.add_argument(
         "--hardware",

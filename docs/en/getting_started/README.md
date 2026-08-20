@@ -7,13 +7,13 @@ Sparse-vLLM usage example.
 ## Install with Conda
 
 ```bash
-conda create -n svllm python=3.10 -y
-conda activate svllm
+conda create -n sparse-vllm-cu130-py312 python=3.12 -y
+conda activate sparse-vllm-cu130-py312
 
-CUDA_VERSION=cu130
 python -m pip config --site set global.extra-index-url \
-  "https://download.pytorch.org/whl/${CUDA_VERSION} https://flashinfer.ai/whl/${CUDA_VERSION}"
-python -m pip install -e ".[${CUDA_VERSION}]"
+  "https://download.pytorch.org/whl/cu130 https://flashinfer.ai/whl/cu130"
+python -m pip install "transformers==5.13.1" -e ".[cu130]"
+python -m pip check
 
 # Optional
 MAX_JOBS=8 pip install flash-attn --no-build-isolation
@@ -22,7 +22,7 @@ MAX_JOBS=8 pip install flash-attn --no-build-isolation
 ## Install with uv
 
 ```bash
-uv venv --python 3.10
+uv venv --python 3.12
 source .venv/bin/activate
 
 uv pip install -e ".[cu130]"

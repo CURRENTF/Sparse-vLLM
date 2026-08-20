@@ -15,7 +15,10 @@ from sparsevllm.engine.prefill import (
 )
 from sparsevllm.method_registry import PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH
 from sparsevllm.platforms import device_runtime
-from sparsevllm.kernels.triton.prefill_score import prefill_score_fwd
+from sparsevllm.kernels.triton.prefill_score import (
+    PrefillScoreWorkspace,
+    prefill_score_fwd,
+)
 from sparsevllm.utils.context import get_context
 from sparsevllm.utils.log import logger, log_level
 from sparsevllm.utils.profiler import profiler
@@ -144,7 +147,15 @@ class SnapKVCacheManager(CacheManager):
         self._decode_static_index_buffers: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
         self._decode_static_state_binding_key: tuple[int, int, int, int] | None = None
         self._prefill_attn_score_accumulators: dict[tuple[int, int], torch.Tensor] = {}
-        self._prefill_score_bounds: tuple[torch.Tensor, torch.Tensor] | None = None
+        self._prefill_context_lens_cpu_by_layer: dict[int, tuple[int, ...]] = {}
+        self._prefill_score_metadata_cache: dict[
+            tuple,
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+        ] = {}
+        self._prefill_step_score_buffers: dict[
+            tuple[torch.device, torch.dtype], torch.Tensor
+        ] = {}
+        self._prefill_score_workspace = PrefillScoreWorkspace()
         self._uniform_decode_metadata = self._sparse_eviction_never_triggers()
         self.buffer_req_to_token_slots_tensor = torch.zeros(
             (self.num_kv_layers, self.max_buffer_rows, self.max_model_len),
@@ -1034,7 +1045,7 @@ class SnapKVCacheManager(CacheManager):
 
     def _prefill_score_initial_value(self) -> float:
         mode = getattr(self.config, "sparse_prefill_score_mode", "probability")
-        return -torch.inf if mode == "tilelang_raw_qk" else 0.0
+        return -torch.inf if mode == "logits" else 0.0
 
     def _run_prefill_score(
         self,
@@ -1050,9 +1061,10 @@ class SnapKVCacheManager(CacheManager):
         *,
         candidate_start: int,
         num_recent_tokens: int,
+        batch_indices: torch.Tensor | None = None,
     ) -> None:
         mode = getattr(self.config, "sparse_prefill_score_mode", "probability")
-        if mode == "probability":
+        with profiler.record("prefill_token_score"):
             prefill_score_fwd(
                 q,
                 k_cache,
@@ -1067,65 +1079,139 @@ class SnapKVCacheManager(CacheManager):
                 score_ends,
                 candidate_start=candidate_start,
                 num_recent_tokens=num_recent_tokens,
+                score_mode=mode,
+                workspace=getattr(self, "_prefill_score_workspace", None),
+                batch_indices=batch_indices,
             )
-            return
-        if mode != "tilelang_raw_qk":
-            raise ValueError(f"Unsupported SnapKV prefill score mode: {mode!r}.")
 
-        if q.dtype != torch.bfloat16 or q.shape[-1] != 128:
+    def _prefill_score_metadata_tensors(
+        self,
+        layer_idx: int,
+        seqs: list[Sequence],
+        rows: list[tuple[int, Sequence, int, int]],
+        *,
+        device: torch.device,
+    ) -> tuple[
+        tuple[int, ...],
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        context_lens_by_layer = getattr(
+            self,
+            "_prefill_context_lens_cpu_by_layer",
+            None,
+        )
+        context_lens = (
+            None
+            if context_lens_by_layer is None
+            else context_lens_by_layer.get(int(layer_idx))
+        )
+        if context_lens is None:
             raise RuntimeError(
-                "sparse_prefill_score_mode='tilelang_raw_qk' requires "
-                f"BF16 Q with head_dim=128, got dtype={q.dtype} head_dim={q.shape[-1]}."
+                "SnapKV prefill scoring requires CPU context lengths prepared "
+                f"for layer={layer_idx}."
             )
-        from sparsevllm.kernels.tilelang.gqa.runtime import (
-            tilelang_gqa_device_support,
-        )
-
-        device_index = q.device.index if q.device.type == "cuda" else None
-        supported, reason = tilelang_gqa_device_support(device_index)
-        if not supported:
+        if len(context_lens) != len(seqs):
             raise RuntimeError(
-                "sparse_prefill_score_mode='tilelang_raw_qk' is unavailable: "
-                f"{reason}."
+                "SnapKV prefill scoring context-length batch mismatch: "
+                f"layer={layer_idx} lengths={len(context_lens)} seqs={len(seqs)}."
             )
 
-        from sparsevllm.kernels.tilelang.gqa.prefill import (
-            gqa_prefill_score_tilelang,
+        prompt_cache_lens = tuple(
+            int(context_len) - int(seq.current_chunk_size)
+            for context_len, seq in zip(context_lens, seqs)
         )
+        if any(value < 0 for value in prompt_cache_lens):
+            raise RuntimeError(
+                "SnapKV prefill scoring received a context shorter than its chunk: "
+                f"layer={layer_idx} context_lens={context_lens} "
+                f"prompt_cache_lens={prompt_cache_lens}."
+            )
+        batch_indices = []
+        score_starts = []
+        score_ends = []
+        for b_idx, _seq, score_start, score_end in rows:
+            if not 0 <= int(b_idx) < len(seqs):
+                raise RuntimeError(
+                    "SnapKV prefill score row is outside the current batch: "
+                    f"layer={layer_idx} row={b_idx} batch={len(seqs)}."
+                )
+            batch_indices.append(int(b_idx))
+            score_starts.append(int(score_start))
+            score_ends.append(int(score_end))
 
-        gqa_prefill_score_tilelang(
-            q,
-            k_cache,
-            step_score,
-            meta.req_indices,
-            b_start_loc,
-            meta.context_lens,
-            b_prompt_cache_len,
-            max_query_len,
-            meta.active_slots,
-            score_starts,
-            score_ends,
-            candidate_start=candidate_start,
-            num_recent_tokens=num_recent_tokens,
+        tensors = self._cached_prefill_score_metadata_tensors(
+            device=device,
+            context_lens=context_lens,
+            prompt_cache_lens=prompt_cache_lens,
+            batch_indices=tuple(batch_indices),
+            score_starts=tuple(score_starts),
+            score_ends=tuple(score_ends),
         )
+        return context_lens, *tensors
 
-    def _prefill_score_bound_tensors(
+    def _cached_prefill_score_metadata_tensors(
         self,
         *,
-        score_start: int,
-        score_end: int,
         device: torch.device,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        bounds = self._prefill_score_bounds
-        if bounds is None or bounds[0].device != device:
-            bounds = (
-                torch.empty((1,), dtype=torch.int32, device=device),
-                torch.empty((1,), dtype=torch.int32, device=device),
+        context_lens: tuple[int, ...],
+        prompt_cache_lens: tuple[int, ...],
+        batch_indices: tuple[int, ...],
+        score_starts: tuple[int, ...],
+        score_ends: tuple[int, ...],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        signature = (
+            device,
+            context_lens,
+            prompt_cache_lens,
+            batch_indices,
+            score_starts,
+            score_ends,
+        )
+        cache = getattr(self, "_prefill_score_metadata_cache", None)
+        if cache is None:
+            cache = {}
+            self._prefill_score_metadata_cache = cache
+        tensors = cache.get(signature)
+        if tensors is None:
+            tensors = (
+                torch.tensor(prompt_cache_lens, dtype=torch.int32, device=device),
+                torch.tensor(batch_indices, dtype=torch.int32, device=device),
+                torch.tensor(score_starts, dtype=torch.int32, device=device),
+                torch.tensor(score_ends, dtype=torch.int32, device=device),
             )
-            self._prefill_score_bounds = bounds
-        bounds[0].fill_(int(score_start))
-        bounds[1].fill_(int(score_end))
-        return bounds
+            cache[signature] = tensors
+        return tensors
+
+    def _prefill_step_score_buffer(
+        self,
+        *,
+        batch_size: int,
+        max_context_len: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        dtype = self._prefill_score_dtype()
+        key = (device, dtype)
+        buffers = getattr(self, "_prefill_step_score_buffers", None)
+        if buffers is None:
+            buffers = {}
+            self._prefill_step_score_buffers = buffers
+        buffer = buffers.get(key)
+        if (
+            buffer is None
+            or int(buffer.shape[0]) < int(batch_size)
+            or int(buffer.shape[1]) < int(max_context_len)
+        ):
+            rows = max(int(batch_size), 0 if buffer is None else int(buffer.shape[0]))
+            columns = max(
+                int(max_context_len),
+                0 if buffer is None else int(buffer.shape[1]),
+            )
+            buffer = torch.empty((rows, columns), dtype=dtype, device=device)
+            buffers[key] = buffer
+        return buffer[:batch_size, :max_context_len]
 
     @torch.no_grad()
     def collect_prefill_attention_score(
@@ -1157,24 +1243,34 @@ class SnapKVCacheManager(CacheManager):
         meta = view.meta
         payload = view.payload
 
-        b_prompt_cache_len = meta.context_lens - chunk_lens
-        max_query_len = max(int(seq.current_chunk_size) for seq in seqs)
-
-        score_starts = torch.zeros((len(seqs),), dtype=torch.int32, device=q.device)
-        score_ends = torch.zeros((len(seqs),), dtype=torch.int32, device=q.device)
-        for b_idx, _seq, score_start, score_end in rows:
-            score_starts[b_idx] = int(score_start)
-            score_ends[b_idx] = int(score_end)
-
-        max_context_len = (
-            int(meta.max_context_len)
-            if meta.max_context_len is not None
-            else max(int(seq.num_prefilled_tokens + seq.current_chunk_size) for seq in seqs)
+        if int(chunk_lens.ndim) != 1 or int(chunk_lens.shape[0]) != len(seqs):
+            raise RuntimeError(
+                "SnapKV prefill scoring chunk-length batch mismatch: "
+                f"shape={tuple(chunk_lens.shape)} seqs={len(seqs)}."
+            )
+        max_score_len = max(
+            int(score_end) - int(score_start)
+            for _b_idx, _seq, score_start, score_end in rows
         )
-        step_score = torch.full(
-            (len(seqs), max_context_len),
-            self._prefill_score_initial_value(),
-            dtype=self._prefill_score_dtype(),
+        (
+            context_lens,
+            b_prompt_cache_len,
+            score_batch_indices,
+            score_starts,
+            score_ends,
+        ) = self._prefill_score_metadata_tensors(
+            layer_idx,
+            seqs,
+            rows,
+            device=q.device,
+        )
+
+        max_context_len = max(
+            int(context_lens[b_idx]) for b_idx, _seq, _start, _end in rows
+        )
+        step_score = self._prefill_step_score_buffer(
+            batch_size=len(rows),
+            max_context_len=max_context_len,
             device=q.device,
         )
         self._run_prefill_score(
@@ -1184,22 +1280,27 @@ class SnapKVCacheManager(CacheManager):
             meta,
             b_start_loc,
             b_prompt_cache_len,
-            max_query_len,
+            max_score_len,
             score_starts,
             score_ends,
             candidate_start=int(self.config.num_sink_tokens),
             num_recent_tokens=int(self.config.num_recent_tokens),
+            batch_indices=score_batch_indices,
         )
 
-        for b_idx, seq, _score_start, _score_end in rows:
+        for score_row_idx, (b_idx, seq, _score_start, _score_end) in enumerate(rows):
+            context_len = int(context_lens[b_idx])
             acc = self._get_prefill_attention_score_accumulator(
                 layer_idx,
                 seq,
-                prompt_len=int(meta.context_lens[b_idx].item()),
+                prompt_len=context_len,
                 device=q.device,
             )
-            context_len = int(meta.context_lens[b_idx].item())
-            acc[:context_len] = torch.maximum(acc[:context_len], step_score[b_idx, :context_len])
+            torch.maximum(
+                acc[:context_len],
+                step_score[score_row_idx, :context_len],
+                out=acc[:context_len],
+            )
         return None
 
     def pop_prefill_attention_score(self, layer_idx: int, seq: Sequence) -> torch.Tensor | None:
@@ -2232,6 +2333,8 @@ class SnapKVCacheManager(CacheManager):
             self._pyramidkv_prefill_staging_active_slots_by_layer = {}
             self._pyramidkv_prefill_staging_context_lens_by_layer = {}
             self._pyramidkv_prefill_staging_context_lens_cpu_by_layer = {}
+            self._prefill_context_lens_cpu_by_layer = {}
+            self._prefill_score_metadata_cache = {}
             self._pyramidkv_long_prefill_offload_resident_prefix_lens = {}
             for seq in seqs:
                 starts_resumed_turn = (
@@ -2415,6 +2518,9 @@ class SnapKVCacheManager(CacheManager):
             layers_context_lens_np = np.zeros((self.num_layers, len(seqs)), dtype=np.int32)
             for layer_id in layer_ids:
                 layers_context_lens_np[layer_id] = context_lens_list[layer_id]
+                self._prefill_context_lens_cpu_by_layer[int(layer_id)] = tuple(
+                    int(value) for value in context_lens_list[layer_id]
+                )
             layers_context_lens_cuda = torch.from_numpy(layers_context_lens_np).to(
                 device=self.device,
                 dtype=torch.int32,

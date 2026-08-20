@@ -5,7 +5,10 @@ from collections.abc import Callable
 
 import torch
 
-from sparsevllm.kernels.triton.prefill_score import prefill_score_fwd
+from sparsevllm.kernels.triton.prefill_score import (
+    PrefillScoreWorkspace,
+    prefill_score_fwd,
+)
 
 
 def _make_case(
@@ -21,20 +24,32 @@ def _make_case(
     dtype: torch.dtype,
     device: torch.device,
 ):
-    if batch != 1:
-        raise ValueError("This microbench currently fixes batch=1 to match the H100 target shape.")
     prompt_cache_len = length - window
     if prompt_cache_len < 0:
         raise ValueError(f"length must be >= window, got length={length} window={window}")
-    q = torch.randn((window, num_heads, head_dim), dtype=dtype, device=device)
-    k_cache = torch.randn((length, num_kv_heads, head_dim), dtype=dtype, device=device)
-    req_to_tokens = torch.arange(0, length, dtype=torch.int32, device=device).unsqueeze(0)
-    b_req_idx = torch.tensor([0], dtype=torch.int32, device=device)
-    b_start_loc = torch.tensor([0], dtype=torch.int32, device=device)
-    context_lens = torch.tensor([length], dtype=torch.int32, device=device)
-    prompt_cache_lens = torch.tensor([prompt_cache_len], dtype=torch.int32, device=device)
-    score_starts = torch.tensor([prompt_cache_len], dtype=torch.int32, device=device)
-    score_ends = torch.tensor([length], dtype=torch.int32, device=device)
+    q = torch.randn((batch * window, num_heads, head_dim), dtype=dtype, device=device)
+    k_cache = torch.randn(
+        (batch * length, num_kv_heads, head_dim),
+        dtype=dtype,
+        device=device,
+    )
+    req_to_tokens = torch.arange(
+        0,
+        batch * length,
+        dtype=torch.int32,
+        device=device,
+    ).view(batch, length)
+    b_req_idx = torch.arange(batch, dtype=torch.int32, device=device)
+    b_start_loc = torch.arange(batch, dtype=torch.int32, device=device) * window
+    context_lens = torch.full((batch,), length, dtype=torch.int32, device=device)
+    prompt_cache_lens = torch.full(
+        (batch,),
+        prompt_cache_len,
+        dtype=torch.int32,
+        device=device,
+    )
+    score_starts = prompt_cache_lens.clone()
+    score_ends = context_lens.clone()
     return {
         "q": q,
         "k_cache": k_cache,
@@ -49,13 +64,23 @@ def _make_case(
         "length": length,
         "candidate_start": candidate_start,
         "num_recent_tokens": num_recent_tokens,
+        "workspace": PrefillScoreWorkspace(),
+        "probability_out": torch.empty(
+            (batch, length), dtype=torch.float32, device=device
+        ),
+        "logits_out": torch.empty(
+            (batch, length), dtype=torch.float32, device=device
+        ),
     }
 
 
 @torch.inference_mode()
-def _optimized_triton(case: dict[str, torch.Tensor | int]) -> torch.Tensor:
-    length = int(case["length"])
-    out = torch.zeros((1, length), dtype=torch.float32, device=case["q"].device)
+def _optimized_triton(
+    case: dict[str, torch.Tensor | int | PrefillScoreWorkspace],
+    *,
+    score_mode: str,
+) -> torch.Tensor:
+    out = case[f"{score_mode}_out"]
     prefill_score_fwd(
         case["q"],
         case["k_cache"],
@@ -70,6 +95,8 @@ def _optimized_triton(case: dict[str, torch.Tensor | int]) -> torch.Tensor:
         case["score_ends"],
         candidate_start=int(case["candidate_start"]),
         num_recent_tokens=int(case["num_recent_tokens"]),
+        score_mode=score_mode,
+        workspace=case["workspace"],
     )
     return out
 
@@ -82,23 +109,31 @@ def _torch_expanded(case: dict[str, torch.Tensor | int]) -> torch.Tensor:
     window = int(case["window"])
     candidate_start = int(case["candidate_start"])
     candidate_end = max(candidate_start, length - int(case["num_recent_tokens"]))
-    out = torch.zeros((1, length), dtype=torch.float32, device=q.device)
+    batch = int(case["context_lens"].numel())
+    out = torch.zeros((batch, length), dtype=torch.float32, device=q.device)
     if candidate_end <= candidate_start:
         return out
 
-    positions = torch.arange(candidate_start, candidate_end, dtype=torch.int64, device=q.device)
-    q_positions = torch.arange(length - window, length, dtype=torch.int64, device=q.device)
-    k_candidates = k_cache[candidate_start:candidate_end]
+    positions = torch.arange(
+        candidate_start, candidate_end, dtype=torch.int64, device=q.device
+    )
+    q_positions = torch.arange(
+        length - window, length, dtype=torch.int64, device=q.device
+    )
     kv_group = q.shape[1] // k_cache.shape[1]
     head_to_kv = torch.arange(q.shape[1], device=q.device) // kv_group
-    k_expanded = k_candidates.index_select(1, head_to_kv)
-    logits = torch.einsum("mhd,chd->hmc", q.float(), k_expanded.float())
-    logits = logits * (q.shape[-1] ** -0.5)
     causal = q_positions[None, :, None] >= positions[None, None, :]
-    logits = logits.masked_fill(~causal, -torch.inf)
-    probs = torch.softmax(logits, dim=-1)
-    scores = probs.sum(dim=1) / float(window)
-    out[0, candidate_start:candidate_end] = scores.max(dim=0).values
+    for batch_idx in range(batch):
+        q_batch = q[batch_idx * window : (batch_idx + 1) * window]
+        slots = case["req_to_tokens"][batch_idx, candidate_start:candidate_end].long()
+        k_candidates = k_cache.index_select(0, slots)
+        k_expanded = k_candidates.index_select(1, head_to_kv)
+        logits = torch.einsum("mhd,chd->hmc", q_batch.float(), k_expanded.float())
+        logits = logits * (q.shape[-1] ** -0.5)
+        logits = logits.masked_fill(~causal, -torch.inf)
+        probs = torch.softmax(logits, dim=-1)
+        scores = probs.sum(dim=1) / float(window)
+        out[batch_idx, candidate_start:candidate_end] = scores.max(dim=0).values
     return out
 
 
@@ -110,26 +145,78 @@ def _torch_grouped(case: dict[str, torch.Tensor | int]) -> torch.Tensor:
     window = int(case["window"])
     candidate_start = int(case["candidate_start"])
     candidate_end = max(candidate_start, length - int(case["num_recent_tokens"]))
-    out = torch.zeros((1, length), dtype=torch.float32, device=q.device)
+    batch = int(case["context_lens"].numel())
+    out = torch.zeros((batch, length), dtype=torch.float32, device=q.device)
     if candidate_end <= candidate_start:
         return out
 
     positions = torch.arange(candidate_start, candidate_end, dtype=torch.int64, device=q.device)
     q_positions = torch.arange(length - window, length, dtype=torch.int64, device=q.device)
-    k_candidates = k_cache[candidate_start:candidate_end]
     causal = q_positions[None, :, None] >= positions[None, None, :]
     kv_group = q.shape[1] // k_cache.shape[1]
-    best = torch.zeros((candidate_end - candidate_start,), dtype=torch.float32, device=q.device)
     scale = q.shape[-1] ** -0.5
-    for kv_h in range(k_cache.shape[1]):
-        q_group = q[:, kv_h * kv_group : (kv_h + 1) * kv_group, :]
-        k_group = k_candidates[:, kv_h, :]
-        logits = torch.einsum("mhd,cd->hmc", q_group.float(), k_group.float()) * scale
-        logits = logits.masked_fill(~causal, -torch.inf)
-        probs = torch.softmax(logits, dim=-1)
-        scores = probs.sum(dim=1) / float(window)
-        best = torch.maximum(best, scores.max(dim=0).values)
-    out[0, candidate_start:candidate_end] = best
+    for batch_idx in range(batch):
+        q_batch = q[batch_idx * window : (batch_idx + 1) * window]
+        slots = case["req_to_tokens"][batch_idx, candidate_start:candidate_end].long()
+        k_candidates = k_cache.index_select(0, slots)
+        best = torch.zeros(
+            (candidate_end - candidate_start,), dtype=torch.float32, device=q.device
+        )
+        for kv_h in range(k_cache.shape[1]):
+            q_group = q_batch[:, kv_h * kv_group : (kv_h + 1) * kv_group, :]
+            k_group = k_candidates[:, kv_h, :]
+            logits = (
+                torch.einsum("mhd,cd->hmc", q_group.float(), k_group.float())
+                * scale
+            )
+            logits = logits.masked_fill(~causal, -torch.inf)
+            probs = torch.softmax(logits, dim=-1)
+            scores = probs.sum(dim=1) / float(window)
+            best = torch.maximum(best, scores.max(dim=0).values)
+        out[batch_idx, candidate_start:candidate_end] = best
+    return out
+
+
+@torch.inference_mode()
+def _torch_logits(case: dict[str, torch.Tensor | int]) -> torch.Tensor:
+    q = case["q"]
+    k_cache = case["k_cache"]
+    length = int(case["length"])
+    window = int(case["window"])
+    candidate_start = int(case["candidate_start"])
+    candidate_end = max(candidate_start, length - int(case["num_recent_tokens"]))
+    batch = int(case["context_lens"].numel())
+    out = torch.full(
+        (batch, length), -torch.inf, dtype=torch.float32, device=q.device
+    )
+    if candidate_end <= candidate_start:
+        return out
+
+    positions = torch.arange(
+        candidate_start, candidate_end, dtype=torch.int64, device=q.device
+    )
+    q_positions = torch.arange(
+        length - window, length, dtype=torch.int64, device=q.device
+    )
+    causal = q_positions[:, None] >= positions[None, :]
+    kv_group = q.shape[1] // k_cache.shape[1]
+    for batch_idx in range(batch):
+        q_batch = q[batch_idx * window : (batch_idx + 1) * window]
+        slots = case["req_to_tokens"][batch_idx, candidate_start:candidate_end].long()
+        k_candidates = k_cache.index_select(0, slots)
+        best = torch.full(
+            (candidate_end - candidate_start,),
+            -torch.inf,
+            dtype=torch.float32,
+            device=q.device,
+        )
+        for kv_h in range(k_cache.shape[1]):
+            q_group = q_batch[:, kv_h * kv_group : (kv_h + 1) * kv_group, :]
+            k_group = k_candidates[:, kv_h, :]
+            logits = torch.einsum("mhd,cd->hmc", q_group.float(), k_group.float())
+            logits = logits.masked_fill(~causal[None, :, :], -torch.inf)
+            best = torch.maximum(best, logits.amax(dim=(0, 1)))
+        out[batch_idx, candidate_start:candidate_end] = best
     return out
 
 
@@ -210,11 +297,24 @@ def main():
             device=device,
         )
         methods = [
-            ("optimized_triton", lambda case=case: _optimized_triton(case)),
-            ("torch_expanded", lambda case=case: _torch_expanded(case)),
-            ("torch_grouped", lambda case=case: _torch_grouped(case)),
+            (
+                "probability_triton",
+                lambda case=case: _optimized_triton(
+                    case, score_mode="probability"
+                ),
+            ),
+            ("probability_torch_expanded", lambda case=case: _torch_expanded(case)),
+            ("probability_torch_grouped", lambda case=case: _torch_grouped(case)),
+            (
+                "logits_triton",
+                lambda case=case: _optimized_triton(case, score_mode="logits"),
+            ),
+            ("logits_torch", lambda case=case: _torch_logits(case)),
         ]
-        compiled_once = _optimized_triton(case)
+        compiled_once = [
+            _optimized_triton(case, score_mode="probability"),
+            _optimized_triton(case, score_mode="logits"),
+        ]
         torch.cuda.synchronize()
         del compiled_once
         torch.cuda.empty_cache()
@@ -228,16 +328,27 @@ def main():
             outputs[name] = out
             peaks[name] = peak_mib
             latencies[name] = _measure_latency(fn, warmup=args.warmup, iters=iters)
-        ref = outputs["torch_grouped"]
-        grouped_ms = latencies["torch_grouped"]
+        refs = {
+            "probability": outputs["probability_torch_grouped"],
+            "logits": outputs["logits_torch"],
+        }
+        torch_latencies = {
+            "probability": latencies["probability_torch_grouped"],
+            "logits": latencies["logits_torch"],
+        }
         for name, _fn in methods:
-            max_abs_diff = (outputs[name] - ref).abs().max().item()
-            speedup = grouped_ms / latencies[name] if latencies[name] > 0 else math.inf
+            mode = "logits" if name.startswith("logits") else "probability"
+            max_abs_diff = (outputs[name] - refs[mode]).abs().nan_to_num().max().item()
+            speedup = (
+                torch_latencies[mode] / latencies[name]
+                if latencies[name] > 0
+                else math.inf
+            )
             print(
                 f"| {length} | {name} | {latencies[name]:.4f} | {speedup:.3f} | "
                 f"{peaks[name]:.1f} | {max_abs_diff:.6g} |"
             )
-        del case, outputs, peaks, latencies, ref
+        del case, outputs, peaks, latencies, refs, torch_latencies
         torch.cuda.empty_cache()
 
 

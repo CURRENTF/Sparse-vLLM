@@ -536,6 +536,100 @@ class PrefillPolicyRegistryTest(unittest.TestCase):
         self.assertEqual(len(manager.freed), 1)
         self.assertEqual(manager.freed[0][1], final_seq.seq_id)
 
+    def test_snapkv_prefill_score_reuses_cpu_metadata_without_tensor_item(self):
+        from sparsevllm.engine.cache_manager import (
+            AttentionViewMeta,
+            ExplicitKVPayload,
+            PrefillComputeView,
+        )
+        from sparsevllm.utils.context import reset_context, set_context
+
+        manager = object.__new__(SnapKVCacheManager)
+        manager.config = SimpleNamespace(
+            vllm_sparse_method="snapkv",
+            sparse_prefill_score_mode="probability",
+            sparse_attn_score_dtype="float32",
+            num_sink_tokens=1,
+            num_recent_tokens=1,
+        )
+        manager._prefill_attn_score_accumulators = {}
+        manager._prefill_context_lens_cpu_by_layer = {0: (6,), 1: (6,)}
+        manager._prefill_score_metadata_cache = {}
+        manager._prefill_step_score_buffers = {}
+
+        seq = seq_with_len(6)
+        seq.num_prefilled_tokens = 4
+        seq.current_chunk_size = 2
+        manager._prefill_score_rows = lambda layer_idx, seqs: [
+            (0, seqs[0], 4, 6)
+        ]
+        view = PrefillComputeView(
+            meta=AttentionViewMeta(
+                active_slots=torch.arange(6, dtype=torch.int32)[None, :],
+                req_indices=torch.tensor([0], dtype=torch.int32),
+                context_lens=torch.tensor([6], dtype=torch.int32),
+                max_context_len=6,
+            ),
+            payload=ExplicitKVPayload(
+                k_cache=torch.empty((6, 1, 1)),
+                v_cache=torch.empty((6, 1, 1)),
+            ),
+        )
+        score_buffer_ids = []
+        metadata_ids = []
+
+        def fake_run_prefill_score(
+            q,
+            k_cache,
+            step_score,
+            meta,
+            b_start_loc,
+            prompt_cache_lens,
+            max_query_len,
+            score_starts,
+            score_ends,
+            **kwargs,
+        ):
+            del q, k_cache, meta, b_start_loc, max_query_len, kwargs
+            score_buffer_ids.append(step_score.data_ptr())
+            metadata_ids.append(
+                (id(prompt_cache_lens), id(score_starts), id(score_ends))
+            )
+            step_score[0, :6] = torch.arange(6, dtype=torch.float32)
+
+        reset_context()
+        set_context(is_prefill=True, cache_manager=manager, seqs=[seq])
+        try:
+            with (
+                patch.object(
+                    manager,
+                    "_run_prefill_score",
+                    side_effect=fake_run_prefill_score,
+                ),
+                patch.object(
+                    torch.Tensor,
+                    "item",
+                    side_effect=AssertionError("unexpected tensor.item()"),
+                ),
+            ):
+                for layer_idx in (0, 1):
+                    manager.collect_prefill_attention_score(
+                        layer_idx,
+                        torch.empty((2, 1, 1)),
+                        view,
+                        b_start_loc=torch.tensor([0], dtype=torch.int32),
+                        chunk_lens=torch.tensor([2], dtype=torch.int32),
+                    )
+        finally:
+            reset_context()
+
+        self.assertEqual(score_buffer_ids[0], score_buffer_ids[1])
+        self.assertEqual(metadata_ids[0], metadata_ids[1])
+        self.assertEqual(
+            manager._prefill_attn_score_accumulators[(0, seq.seq_id)].tolist(),
+            [0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
+        )
+
     def test_pyramid_materialization_uses_cpu_context_lengths_once_per_layer(self):
         from sparsevllm.utils.context import reset_context, set_context
 
@@ -829,15 +923,15 @@ class PrefillPolicyConfigTest(unittest.TestCase):
         self.assertEqual(config.h2o_decode_budget, 4096)
         self.assertEqual(config.h2o_decode_eviction_interval, 64)
 
-    def test_h2o_raw_prefill_score_accepts_full_chunk_window(self):
+    def test_h2o_logit_prefill_score_accepts_full_chunk_window(self):
         full_chunk = self.make_config(
             vllm_sparse_method="h2o",
-            sparse_prefill_score_mode="tilelang_raw_qk",
+            sparse_prefill_score_mode="logits",
             h2o_prefill_score_window=0,
         )
         large_window = self.make_config(
             vllm_sparse_method="h2o",
-            sparse_prefill_score_mode="tilelang_raw_qk",
+            sparse_prefill_score_mode="logits",
             h2o_prefill_score_window=512,
         )
 
@@ -846,19 +940,19 @@ class PrefillPolicyConfigTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "must be non-negative"):
             self.make_config(
                 vllm_sparse_method="h2o",
-                sparse_prefill_score_mode="tilelang_raw_qk",
+                sparse_prefill_score_mode="logits",
                 h2o_prefill_score_window=-1,
             )
 
     def test_sparse_prefill_score_mode_is_explicit_and_validated(self):
         default = self.make_config(vllm_sparse_method="snapkv")
-        raw = self.make_config(
+        logits = self.make_config(
             vllm_sparse_method="pyramidkv",
-            sparse_prefill_score_mode=" TileLang_RAW_QK ",
+            sparse_prefill_score_mode=" LOGITS ",
         )
 
         self.assertEqual(default.sparse_prefill_score_mode, "probability")
-        self.assertEqual(raw.sparse_prefill_score_mode, "tilelang_raw_qk")
+        self.assertEqual(logits.sparse_prefill_score_mode, "logits")
         with self.assertRaisesRegex(ValueError, "sparse_prefill_score_mode"):
             self.make_config(
                 vllm_sparse_method="snapkv",
@@ -867,12 +961,12 @@ class PrefillPolicyConfigTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "only applies to SnapKV/PyramidKV/H2O"):
             self.make_config(
                 vllm_sparse_method="rkv",
-                sparse_prefill_score_mode="tilelang_raw_qk",
+                sparse_prefill_score_mode="logits",
             )
         with self.assertRaisesRegex(ValueError, "sparse_attn_score_dtype='float32'"):
             self.make_config(
                 vllm_sparse_method="snapkv",
-                sparse_prefill_score_mode="tilelang_raw_qk",
+                sparse_prefill_score_mode="logits",
                 sparse_attn_score_dtype="float16",
             )
 

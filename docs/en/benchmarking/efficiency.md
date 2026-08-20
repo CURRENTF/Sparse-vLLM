@@ -238,7 +238,7 @@ The principal environment variables are:
 | `MAX_NUM_BATCHED_TOKENS` | `8192` | Matched scheduler token budget for both engines. |
 | `NUM_WARMUPS` | `1` | Warmup iterations per synthetic case. |
 | `NUM_ITERS` | `3` | Measured iterations per synthetic case. |
-| `SPARSE_PREFILL_SCORE_MODE` | `probability` | SnapKV prefill score mode: `probability` or `tilelang_raw_qk`. |
+| `SPARSE_PREFILL_SCORE_MODE` | `probability` | SnapKV prefill score mode: `probability` or `logits`. |
 | `CUDA_HOME` | `/usr/local/cuda-13.0` | CUDA toolkit root used by the probe wrapper. |
 
 Prefix caching is always disabled by this suite. There is no prefix-caching

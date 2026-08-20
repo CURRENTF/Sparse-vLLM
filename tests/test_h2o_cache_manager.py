@@ -347,9 +347,9 @@ def test_h2o_prefill_score_ranges_use_compressed_physical_coordinates():
     assert ranges[0][2:] == (8, 8, 11)
 
 
-def test_h2o_raw_prefill_score_window_zero_covers_full_current_chunk():
+def test_h2o_logit_prefill_score_window_zero_covers_full_current_chunk():
     manager = _manager_with_rows([11])
-    manager.config.sparse_prefill_score_mode = "tilelang_raw_qk"
+    manager.config.sparse_prefill_score_mode = "logits"
     manager.config.h2o_prefill_score_window = 0
     seq = _seq(0, 100, prefilled=64, chunk=6)
 
@@ -358,9 +358,9 @@ def test_h2o_raw_prefill_score_window_zero_covers_full_current_chunk():
     assert ranges[0][2:] == (5, 5, 11)
 
 
-def test_h2o_raw_prefill_score_is_normalized_before_weighted_accumulation():
+def test_h2o_logit_prefill_score_is_normalized_before_weighted_accumulation():
     logits = torch.tensor([0.0, 1.0, 2.0])
-    normalized = H2OCacheManager._normalize_raw_prefill_score(logits, new_len=3)
+    normalized = H2OCacheManager._normalize_logit_prefill_score(logits, new_len=3)
     cumulative = H2OCacheManager._accumulate_score(
         torch.tensor([1.0, 2.0]),
         normalized,
@@ -376,22 +376,22 @@ def test_h2o_raw_prefill_score_is_normalized_before_weighted_accumulation():
     )
 
 
-def test_h2o_raw_prefill_score_converts_unscored_minus_inf_to_zero_prob():
+def test_h2o_logit_prefill_score_converts_unscored_minus_inf_to_zero_prob():
     logits = torch.tensor([0.0, -torch.inf, 2.0])
-    normalized = H2OCacheManager._normalize_raw_prefill_score(logits, new_len=3)
+    normalized = H2OCacheManager._normalize_logit_prefill_score(logits, new_len=3)
     assert normalized[1].item() == 0.0
     assert torch.isfinite(normalized).all()
     assert normalized.sum().item() == pytest.approx(1.0)
 
 
-def test_h2o_raw_prefill_score_rejects_nan_or_all_inf():
+def test_h2o_logit_prefill_score_rejects_nan_or_all_inf():
     with pytest.raises(RuntimeError, match="invalid non-finite values"):
-        H2OCacheManager._normalize_raw_prefill_score(
+        H2OCacheManager._normalize_logit_prefill_score(
             torch.tensor([float("nan"), 1.0]),
             new_len=2,
         )
     with pytest.raises(RuntimeError, match="invalid non-finite values"):
-        H2OCacheManager._normalize_raw_prefill_score(
+        H2OCacheManager._normalize_logit_prefill_score(
             torch.tensor([-torch.inf, -torch.inf]),
             new_len=2,
         )
@@ -452,9 +452,9 @@ def test_h2o_prefill_score_collection_accumulates_in_physical_coordinates():
     )
 
 
-def test_h2o_raw_prefill_score_collection_normalizes_tilelang_logits():
+def test_h2o_logit_prefill_score_collection_normalizes_logits():
     manager = _manager_with_rows([6])
-    manager.config.sparse_prefill_score_mode = "tilelang_raw_qk"
+    manager.config.sparse_prefill_score_mode = "logits"
     manager.config.h2o_prefill_score_window = 0
     seq = _seq(0, 20, prefilled=8, chunk=2)
     manager._h2o_scores[(0, 0)] = torch.tensor([1.0, 2.0, 3.0, 4.0])

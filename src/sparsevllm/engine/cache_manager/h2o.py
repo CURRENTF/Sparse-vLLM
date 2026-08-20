@@ -27,10 +27,10 @@ class H2OCacheManager(SnapKVCacheManager):
 
     Sparse-vLLM owns one physical token row shared by all KV heads, so this v1
     implementation maintains one cumulative normalized token-importance vector
-    aligned with that row. The default prefill path accumulates normalized
-    attention mass. The experimental TileLang path max-reduces raw QK over the
-    observation queries and query heads, normalizes that token vector, and then
-    accumulates it on the same per-query mass scale.
+    aligned with that row. The probability prefill path accumulates normalized
+    attention mass. The logits path max-reduces raw QK over the observation
+    queries and query heads, normalizes that token vector, and then accumulates
+    it on the same per-query mass scale.
     """
 
     def __init__(self, config, parallel_context):
@@ -626,20 +626,19 @@ class H2OCacheManager(SnapKVCacheManager):
         return cumulative
 
     @staticmethod
-    def _normalize_raw_prefill_score(
+    def _normalize_logit_prefill_score(
         step_score: torch.Tensor,
         *,
         new_len: int,
     ) -> torch.Tensor:
-        """Normalize raw-QK prefill logits to step attention probabilities.
+        """Normalize max-reduced prefill logits to step token probabilities.
 
-        In TileLang raw-QK mode, un-scored positions (e.g. non-candidates outside
-        the observation window or sink/recent boundaries) retain -inf and map to
-        zero probability under softmax.
+        Unscored positions retain -inf and map to zero probability under
+        softmax.
         """
         if step_score.dim() != 1 or int(step_score.numel()) < int(new_len):
             raise ValueError(
-                "H2O raw prefill score must be a 1D vector covering new_len: "
+                "H2O logit prefill score must be a 1D vector covering new_len: "
                 f"shape={tuple(step_score.shape)} new_len={int(new_len)}."
             )
         logits = step_score[: int(new_len)].float()
@@ -650,7 +649,7 @@ class H2OCacheManager(SnapKVCacheManager):
             torch._assert_async(valid)
         elif not bool(valid.item()):
             raise RuntimeError(
-                "H2O raw prefill score contains invalid non-finite values (NaN or +inf) "
+                "H2O logit prefill score contains invalid non-finite values (NaN or +inf) "
                 "or lacks any finite score."
             )
         return torch.softmax(logits, dim=0)
@@ -667,6 +666,8 @@ class H2OCacheManager(SnapKVCacheManager):
         """Append a logical prompt chunk to each compressed physical KV row."""
         with profiler.record("cache_prepare_prefill"):
             self._decode_static_state_binding_key = None
+            self._prefill_context_lens_cpu_by_layer = {}
+            self._prefill_score_metadata_cache = {}
             layer_ids = self.kv_transformer_layer_indices()
             total_chunk_tokens = sum(int(seq.current_chunk_size) for seq in seqs)
             input_ids_np = np.empty(total_chunk_tokens, dtype=np.int64)
@@ -725,6 +726,9 @@ class H2OCacheManager(SnapKVCacheManager):
 
             for layer_idx in layer_ids:
                 context_lens = layer_context_lens[int(layer_idx)]
+                self._prefill_context_lens_cpu_by_layer[int(layer_idx)] = tuple(
+                    int(value) for value in context_lens
+                )
                 state = self.layer_batch_states[layer_idx]
                 state.slot_mapping = layers_slot_mapping[layer_idx]
                 state.context_lens = torch.tensor(
@@ -786,6 +790,11 @@ class H2OCacheManager(SnapKVCacheManager):
         seqs = getattr(ctx, "seqs", None)
         if seqs is None:
             raise RuntimeError("H2O prefill score collection requires current seqs in context.")
+        if int(chunk_lens.ndim) != 1 or int(chunk_lens.shape[0]) != len(seqs):
+            raise RuntimeError(
+                "H2O prefill scoring chunk-length batch mismatch: "
+                f"shape={tuple(chunk_lens.shape)} seqs={len(seqs)}."
+            )
         ranges = self.prefill_score_ranges(layer_idx, seqs)
         if not ranges:
             return None
@@ -797,34 +806,49 @@ class H2OCacheManager(SnapKVCacheManager):
         meta = view.meta
         payload = view.payload
 
-        score_starts = torch.tensor(
-            [item[3] for item in ranges], dtype=torch.int32, device=q.device
-        )
-        score_ends = torch.tensor(
-            [item[4] for item in ranges], dtype=torch.int32, device=q.device
-        )
-        physical_context_lens = torch.tensor(
-            [item[4] for item in ranges], dtype=torch.int32, device=q.device
-        )
-        physical_coordinates_match = (
-            meta.context_lens[: len(seqs)] == physical_context_lens
-        ).all()
-        if physical_coordinates_match.is_cuda:
-            torch._assert_async(physical_coordinates_match)
-        elif not bool(physical_coordinates_match.item()):
+        context_lens = tuple(int(item[4]) for item in ranges)
+        prepared_context_lens = getattr(
+            self,
+            "_prefill_context_lens_cpu_by_layer",
+            {},
+        ).get(int(layer_idx))
+        if prepared_context_lens is None and meta.context_lens.device.type == "cpu":
+            prepared_context_lens = tuple(
+                int(value) for value in meta.context_lens.tolist()
+            )
+        if prepared_context_lens is None:
+            raise RuntimeError(
+                "H2O prefill scoring requires CPU context lengths prepared "
+                f"for layer={layer_idx}."
+            )
+        if tuple(prepared_context_lens) != context_lens:
             raise RuntimeError(
                 "H2O prefill score view is not in compressed physical coordinates: "
-                f"layer={layer_idx} view={meta.context_lens.tolist()} "
-                f"physical={physical_context_lens.tolist()}."
+                f"layer={layer_idx} view={tuple(prepared_context_lens)} "
+                f"physical={context_lens}."
             )
-        max_context_len = max(item[4] for item in ranges)
-        step_score = torch.full(
-            (len(seqs), max_context_len),
-            self._prefill_score_initial_value(),
-            dtype=torch.float32,
+        prompt_cache_lens_cpu = tuple(int(item[2]) for item in ranges)
+        score_starts_cpu = tuple(int(item[3]) for item in ranges)
+        score_ends_cpu = tuple(int(item[4]) for item in ranges)
+        (
+            prompt_cache_lens,
+            _batch_indices,
+            score_starts,
+            score_ends,
+        ) = self._cached_prefill_score_metadata_tensors(
+            device=q.device,
+            context_lens=context_lens,
+            prompt_cache_lens=prompt_cache_lens_cpu,
+            batch_indices=tuple(range(len(ranges))),
+            score_starts=score_starts_cpu,
+            score_ends=score_ends_cpu,
+        )
+        max_context_len = max(context_lens)
+        step_score = self._prefill_step_score_buffer(
+            batch_size=len(seqs),
+            max_context_len=max_context_len,
             device=q.device,
         )
-        prompt_cache_lens = meta.context_lens - chunk_lens
         self._run_prefill_score(
             q,
             payload.k_cache,
@@ -832,7 +856,7 @@ class H2OCacheManager(SnapKVCacheManager):
             meta,
             b_start_loc,
             prompt_cache_lens,
-            max(int(seq.current_chunk_size) for seq in seqs),
+            max(item[4] - item[3] for item in ranges),
             score_starts,
             score_ends,
             candidate_start=0,
@@ -855,8 +879,8 @@ class H2OCacheManager(SnapKVCacheManager):
                 )
             effective_queries = score_end - score_start
             score_row = step_score[batch_idx]
-            if self.config.sparse_prefill_score_mode == "tilelang_raw_qk":
-                score_row = self._normalize_raw_prefill_score(
+            if self.config.sparse_prefill_score_mode == "logits":
+                score_row = self._normalize_logit_prefill_score(
                     score_row,
                     new_len=score_end,
                 )

@@ -140,20 +140,17 @@ class PrefillScoreRoutingTest(unittest.TestCase):
 
         score_kernel.assert_called_once()
 
-    def test_raw_mode_fails_instead_of_falling_back_when_tilelang_is_unavailable(self):
+    def test_logits_mode_uses_shared_triton_scorer(self):
         manager = object.__new__(SnapKVCacheManager)
-        manager.config = SimpleNamespace(sparse_prefill_score_mode="tilelang_raw_qk")
+        manager.config = SimpleNamespace(sparse_prefill_score_mode="logits")
         inputs = self._inputs(head_dim=128, dtype=torch.bfloat16)
         with patch(
-            "sparsevllm.kernels.tilelang.gqa.runtime.tilelang_gqa_device_support",
-            return_value=(False, "CUDA is not available"),
-        ), patch(
             "sparsevllm.engine.cache_manager.snapkv.prefill_score_fwd"
-        ) as probability_kernel:
-            with self.assertRaisesRegex(RuntimeError, "CUDA is not available"):
-                manager._run_prefill_score(**inputs)
+        ) as score_kernel:
+            manager._run_prefill_score(**inputs)
 
-        probability_kernel.assert_not_called()
+        score_kernel.assert_called_once()
+        self.assertEqual(score_kernel.call_args.kwargs["score_mode"], "logits")
         self.assertEqual(manager._prefill_score_initial_value(), -torch.inf)
 
     def test_tilelang_prefill_wrapper_rejects_per_head_score_tensor(self):
@@ -207,23 +204,92 @@ class PrefillScoreRoutingTest(unittest.TestCase):
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for prefill score Triton tests.")
 class PrefillScoreKernelTest(unittest.TestCase):
-    def test_tilelang_raw_qk_score_matches_torch(self):
-        from sparsevllm.kernels.tilelang.gqa.runtime import (
-            tilelang_gqa_device_support,
-        )
+    def test_shared_scorer_matches_torch_for_mha_reconstruction(self):
+        """MLA prefill reconstructs one explicit K head per query head."""
+        from sparsevllm.kernels.triton.prefill_score import prefill_score_fwd
 
-        supported, reason = tilelang_gqa_device_support(torch.cuda.current_device())
-        if not supported:
-            self.skipTest(reason)
-        from sparsevllm.kernels.tilelang.gqa.prefill import (
-            gqa_prefill_score_tilelang,
+        torch.manual_seed(19)
+        device = "cuda"
+        prompt_len = 8
+        prompt_cache_len = 5
+        score_start = 5
+        score_end = 8
+        num_heads = 4
+        head_dim = 16
+        q = torch.randn(
+            (score_end - prompt_cache_len, num_heads, head_dim),
+            dtype=torch.float32,
+            device=device,
         )
+        k_cache = torch.randn(
+            (prompt_len, num_heads, head_dim),
+            dtype=torch.float32,
+            device=device,
+        )
+        req_to_tokens = torch.arange(
+            prompt_len, dtype=torch.int32, device=device
+        ).unsqueeze(0)
+        req_indices = torch.tensor([0], dtype=torch.int32, device=device)
+        b_start_loc = torch.tensor([0], dtype=torch.int32, device=device)
+        context_lens = torch.tensor(
+            [prompt_len], dtype=torch.int32, device=device
+        )
+        prompt_cache_lens = torch.tensor(
+            [prompt_cache_len], dtype=torch.int32, device=device
+        )
+        score_starts = torch.tensor(
+            [score_start], dtype=torch.int32, device=device
+        )
+        score_ends = torch.tensor([score_end], dtype=torch.int32, device=device)
+
+        for mode, baseline in (
+            ("probability", _prefill_score_baseline),
+            ("logits", _raw_qk_score_baseline),
+        ):
+            with self.subTest(mode=mode):
+                actual = torch.empty(
+                    (1, prompt_len), dtype=torch.float32, device=device
+                )
+                prefill_score_fwd(
+                    q,
+                    k_cache,
+                    actual,
+                    req_indices,
+                    b_start_loc,
+                    context_lens,
+                    prompt_cache_lens,
+                    score_end - score_start,
+                    req_to_tokens,
+                    score_starts,
+                    score_ends,
+                    candidate_start=1,
+                    num_recent_tokens=1,
+                    score_mode=mode,
+                )
+                expected = baseline(
+                    q,
+                    k_cache,
+                    req_to_tokens,
+                    req_indices,
+                    b_start_loc,
+                    context_lens,
+                    prompt_cache_lens,
+                    score_starts,
+                    score_ends,
+                    candidate_start=1,
+                    num_recent_tokens=1,
+                )
+                torch.testing.assert_close(
+                    actual, expected, rtol=2e-2, atol=2e-2
+                )
+
+    def test_logits_score_matches_torch(self):
+        from sparsevllm.kernels.triton.prefill_score import prefill_score_fwd
 
         torch.manual_seed(23)
         device = "cuda"
         context_lens = torch.tensor([9, 7], dtype=torch.int32, device=device)
         prompt_cache_lens = torch.tensor([5, 4], dtype=torch.int32, device=device)
-        chunk_lens = context_lens - prompt_cache_lens
         b_start_loc = torch.tensor([0, 4], dtype=torch.int32, device=device)
         active_slots = torch.full((2, 9), -1, dtype=torch.int32, device=device)
         active_slots[0, :7] = torch.tensor(
@@ -245,7 +311,7 @@ class PrefillScoreKernelTest(unittest.TestCase):
         )
         actual = torch.empty((2, 9), dtype=torch.float32, device=device)
 
-        gqa_prefill_score_tilelang(
+        prefill_score_fwd(
             q,
             k_cache,
             actual,
@@ -253,12 +319,13 @@ class PrefillScoreKernelTest(unittest.TestCase):
             b_start_loc,
             context_lens,
             prompt_cache_lens,
-            int(chunk_lens.max().item()),
+            int((score_ends - score_starts).max().item()),
             active_slots,
             score_starts,
             score_ends,
             candidate_start=1,
             num_recent_tokens=1,
+            score_mode="logits",
         )
         torch.cuda.synchronize()
 
@@ -276,6 +343,125 @@ class PrefillScoreKernelTest(unittest.TestCase):
             num_recent_tokens=1,
         )
         torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+    def test_logit_score_supports_query_windows_larger_than_128(self):
+        from sparsevllm.kernels.triton.prefill_score import prefill_score_fwd
+
+        torch.manual_seed(29)
+        device = "cuda"
+        prompt_len = 192
+        window = 160
+        num_heads = 4
+        num_kv_heads = 2
+        head_dim = 16
+        q = torch.randn(
+            (window, num_heads, head_dim), dtype=torch.float32, device=device
+        )
+        k_cache = torch.randn(
+            (prompt_len, num_kv_heads, head_dim),
+            dtype=torch.float32,
+            device=device,
+        )
+        req_to_tokens = torch.arange(
+            prompt_len, dtype=torch.int32, device=device
+        ).unsqueeze(0)
+        req_indices = torch.tensor([0], dtype=torch.int32, device=device)
+        b_start_loc = torch.tensor([0], dtype=torch.int32, device=device)
+        context_lens = torch.tensor([prompt_len], dtype=torch.int32, device=device)
+        prompt_cache_lens = torch.tensor(
+            [prompt_len - window], dtype=torch.int32, device=device
+        )
+        score_starts = prompt_cache_lens.clone()
+        score_ends = context_lens.clone()
+        actual = torch.empty((1, prompt_len), dtype=torch.float32, device=device)
+
+        prefill_score_fwd(
+            q,
+            k_cache,
+            actual,
+            req_indices,
+            b_start_loc,
+            context_lens,
+            prompt_cache_lens,
+            window,
+            req_to_tokens,
+            score_starts,
+            score_ends,
+            candidate_start=1,
+            num_recent_tokens=1,
+            score_mode="logits",
+        )
+        expected = _raw_qk_score_baseline(
+            q,
+            k_cache,
+            req_to_tokens,
+            req_indices,
+            b_start_loc,
+            context_lens,
+            prompt_cache_lens,
+            score_starts,
+            score_ends,
+            candidate_start=1,
+            num_recent_tokens=1,
+        )
+        torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+    def test_score_batch_indices_pack_active_rows(self):
+        from sparsevllm.kernels.triton.prefill_score import prefill_score_fwd
+
+        torch.manual_seed(31)
+        device = "cuda"
+        context_lens = torch.tensor([12, 9], dtype=torch.int32, device=device)
+        prompt_cache_lens = torch.tensor([8, 5], dtype=torch.int32, device=device)
+        b_start_loc = torch.tensor([0, 4], dtype=torch.int32, device=device)
+        req_indices = torch.tensor([0, 1], dtype=torch.int32, device=device)
+        req_to_tokens = torch.full((2, 12), -1, dtype=torch.int32, device=device)
+        req_to_tokens[0, :12] = torch.arange(12, dtype=torch.int32, device=device)
+        req_to_tokens[1, :9] = torch.arange(12, 21, dtype=torch.int32, device=device)
+        q = torch.randn((8, 4, 16), dtype=torch.float32, device=device)
+        k_cache = torch.randn((21, 2, 16), dtype=torch.float32, device=device)
+        full_starts = torch.tensor([8, 5], dtype=torch.int32, device=device)
+        full_ends = torch.tensor([12, 9], dtype=torch.int32, device=device)
+        batch_indices = torch.tensor([1], dtype=torch.int32, device=device)
+
+        for mode in ("probability", "logits"):
+            with self.subTest(mode=mode):
+                full = torch.empty((2, 12), dtype=torch.float32, device=device)
+                packed = torch.empty((1, 12), dtype=torch.float32, device=device)
+                prefill_score_fwd(
+                    q,
+                    k_cache,
+                    full,
+                    req_indices,
+                    b_start_loc,
+                    context_lens,
+                    prompt_cache_lens,
+                    4,
+                    req_to_tokens,
+                    full_starts,
+                    full_ends,
+                    candidate_start=1,
+                    num_recent_tokens=1,
+                    score_mode=mode,
+                )
+                prefill_score_fwd(
+                    q,
+                    k_cache,
+                    packed,
+                    req_indices,
+                    b_start_loc,
+                    context_lens,
+                    prompt_cache_lens,
+                    4,
+                    req_to_tokens,
+                    full_starts[1:],
+                    full_ends[1:],
+                    candidate_start=1,
+                    num_recent_tokens=1,
+                    score_mode=mode,
+                    batch_indices=batch_indices,
+                )
+                torch.testing.assert_close(packed[0], full[1], rtol=2e-2, atol=2e-2)
 
     def test_prefill_score_matches_torch_for_query_range(self):
         from sparsevllm.kernels.triton.prefill_score import prefill_score_fwd
