@@ -6,6 +6,7 @@ import triton.language as tl
 
 from sparsevllm.kernels.triton.moe import (
     _prepare_expert_assignment,
+    _quantize_fp8_group128,
     _routed_fp8_gemm,
     moe_sum,
 )
@@ -299,8 +300,10 @@ def fused_minimax_m2_moe_fp8(
         dtype=hidden_states.dtype,
         device=hidden_states.device,
     )
+    activated_q, activated_scale = _quantize_fp8_group128(activated)
     _routed_fp8_gemm(
-        activated,
+        activated_q,
+        activated_scale,
         w2_weight,
         w2_scale_inv,
         w2_output,

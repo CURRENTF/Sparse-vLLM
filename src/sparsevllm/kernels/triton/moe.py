@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -795,6 +797,7 @@ def _routed_gate_up_swiglu(
 @triton.jit(do_not_specialize=["EM", "num_assignments"])
 def _routed_fp8_gemm_kernel(
     a_ptr,
+    a_scale_ptr,
     b_ptr,
     b_scale_ptr,
     c_ptr,
@@ -808,6 +811,8 @@ def _routed_fp8_gemm_kernel(
     num_assignments,
     stride_am,
     stride_ak,
+    stride_asm,
+    stride_ask,
     stride_be,
     stride_bn,
     stride_bk,
@@ -823,9 +828,20 @@ def _routed_fp8_gemm_kernel(
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
 ):
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
+    # Adapted from vLLM's Apache-2.0 licensed fused_moe_kernel at
+    # vllm-project/vllm@ffd46bfab2128bb84146050e98b51a617c6575ab.
+    # Grouped program ordering improves L2 reuse across expert output tiles.
+    pid = tl.program_id(0)
+    num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + (pid % num_pid_in_group) % group_size_m
+    pid_n = (pid % num_pid_in_group) // group_size_m
     row_offsets = tl.arange(0, BLOCK_SIZE_M)
     if NAIVE_ASSIGNMENT:
         assignment_ids = tl.where(
@@ -857,17 +873,13 @@ def _routed_fp8_gemm_kernel(
     for k_block in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         remaining_k = K - k_block * BLOCK_SIZE_K
         if SWAP_AB:
-            a_raw = tl.load(
+            a = tl.load(
                 a_ptr
                 + input_rows[None, :] * stride_am
                 + (k_block * BLOCK_SIZE_K + offsets_k[:, None]) * stride_ak,
                 mask=assignment_mask[None, :]
                 & (offsets_k[:, None] < remaining_k),
                 other=0.0,
-            ).to(tl.float32)
-            a_scale = tl.max(tl.abs(a_raw), axis=0) / 448.0
-            a_quant = (a_raw / tl.maximum(a_scale[None, :], 1.0e-12)).to(
-                tl.float8e4nv
             )
             b = tl.load(
                 b_ptr
@@ -879,17 +891,13 @@ def _routed_fp8_gemm_kernel(
                 other=0.0,
             )
         else:
-            a_raw = tl.load(
+            a = tl.load(
                 a_ptr
                 + input_rows[:, None] * stride_am
                 + (k_block * BLOCK_SIZE_K + offsets_k[None, :]) * stride_ak,
                 mask=assignment_mask[:, None]
                 & (offsets_k[None, :] < remaining_k),
                 other=0.0,
-            ).to(tl.float32)
-            a_scale = tl.max(tl.abs(a_raw), axis=1) / 448.0
-            a_quant = (a_raw / tl.maximum(a_scale[:, None], 1.0e-12)).to(
-                tl.float8e4nv
             )
             b = tl.load(
                 b_ptr
@@ -900,16 +908,23 @@ def _routed_fp8_gemm_kernel(
                 & (offsets_k[:, None] < remaining_k),
                 other=0.0,
             )
+        a_scale = tl.load(
+            a_scale_ptr
+            + input_rows * stride_asm
+            + k_block * stride_ask,
+            mask=assignment_mask,
+            other=0.0,
+        ).to(tl.float32)
         b_scale = tl.load(
             b_scale_ptr
             + expert_id * stride_bse
-            + (pid_n * BLOCK_SIZE_N // 128) * stride_bsn
+            + (offsets_n // 128) * stride_bsn
             + k_block * stride_bsk
         ).to(tl.float32)
         if SWAP_AB:
-            accumulator += tl.dot(b, a_quant) * b_scale * a_scale[None, :]
+            accumulator += tl.dot(b, a) * b_scale[:, None] * a_scale[None, :]
         else:
-            accumulator += tl.dot(a_quant, b) * a_scale[:, None] * b_scale
+            accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
 
     if SWAP_AB:
         accumulator = tl.trans(accumulator, (1, 0))
@@ -933,6 +948,7 @@ def _routed_fp8_gemm_kernel(
 
 def _routed_fp8_gemm(
     inputs: torch.Tensor,
+    input_scales: torch.Tensor,
     weights: torch.Tensor,
     scales: torch.Tensor,
     output: torch.Tensor,
@@ -956,11 +972,12 @@ def _routed_fp8_gemm(
         em = int(alignment.sorted_token_ids.numel())
         sorted_token_ids = alignment.sorted_token_ids
     grid = (
-        triton.cdiv(em, config.block_m),
-        triton.cdiv(int(weights.shape[1]), config.block_n),
+        triton.cdiv(em, config.block_m)
+        * triton.cdiv(int(weights.shape[1]), config.block_n),
     )
     _routed_fp8_gemm_kernel[grid](
         inputs,
+        input_scales,
         weights,
         scales,
         output,
@@ -974,6 +991,8 @@ def _routed_fp8_gemm(
         num_assignments=num_assignments,
         stride_am=inputs.stride(0),
         stride_ak=inputs.stride(1),
+        stride_asm=input_scales.stride(0),
+        stride_ask=input_scales.stride(1),
         stride_be=weights.stride(0),
         stride_bn=weights.stride(1),
         stride_bk=weights.stride(2),
@@ -989,9 +1008,34 @@ def _routed_fp8_gemm(
         BLOCK_SIZE_M=config.block_m,
         BLOCK_SIZE_N=config.block_n,
         BLOCK_SIZE_K=config.block_k,
+        GROUP_SIZE_M=config.group_m,
         num_warps=config.num_warps,
         num_stages=config.num_stages,
     )
+
+
+def _quantize_fp8_group128(inputs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    from sgl_kernel.gemm import sgl_per_token_group_quant_8bit
+
+    output_columns = int(inputs.shape[-1])
+    quantized = torch.empty_like(inputs, dtype=torch.float8_e4m3fn)
+    scales = torch.empty(
+        (*inputs.shape[:-1], output_columns // 128),
+        dtype=torch.float32,
+        device=inputs.device,
+    )
+    fp8_info = torch.finfo(torch.float8_e4m3fn)
+    sgl_per_token_group_quant_8bit(
+        inputs,
+        quantized,
+        scales,
+        128,
+        1.0e-10,
+        fp8_info.min,
+        fp8_info.max,
+        enable_v2=True,
+    )
+    return quantized, scales
 
 
 @triton.jit(
@@ -1505,8 +1549,10 @@ def fused_moe_fp8(
         dtype=hidden_states.dtype,
         device=hidden_states.device,
     )
+    hidden_states_q, hidden_states_scale = _quantize_fp8_group128(hidden_states)
     _routed_fp8_gemm(
-        hidden_states,
+        hidden_states_q,
+        hidden_states_scale,
         w13_weight,
         w13_scale_inv,
         w13_output,
@@ -1516,14 +1562,25 @@ def fused_moe_fp8(
         multiply_routing_weight=False,
         config=w13_config,
     )
-    activated = silu_and_mul_fwd(w13_output, gate_up_order=gate_up_order)
+    activated = torch.empty(
+        (num_assignments, intermediate_size),
+        dtype=hidden_states.dtype,
+        device=hidden_states.device,
+    )
+    silu_and_mul_fwd(
+        w13_output,
+        gate_up_order=gate_up_order,
+        output=activated,
+    )
+    activated_q, activated_scale = _quantize_fp8_group128(activated)
     w2_output = torch.empty(
         (num_assignments, hidden_size),
         dtype=hidden_states.dtype,
         device=hidden_states.device,
     )
     _routed_fp8_gemm(
-        activated,
+        activated_q,
+        activated_scale,
         w2_weight,
         w2_scale_inv,
         w2_output,

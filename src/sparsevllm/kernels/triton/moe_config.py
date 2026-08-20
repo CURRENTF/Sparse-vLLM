@@ -565,4 +565,21 @@ def resolve_fp8_routed_gemm_config(
     tuned = _TUNED_FP8_ROUTED_CONFIGS.get(shape, {}).get(stage, {}).get(
         token_bucket(num_tokens)
     )
-    return tuned or _FP8_N128
+    if tuned is not None:
+        return tuned
+
+    # Match vLLM's block-FP8 defaults for unprofiled shapes. In particular,
+    # large prefill batches need wider M tiles and grouped program ordering;
+    # the decode-oriented 16x128 fallback leaves the H100 underoccupied.
+    # Source: vllm-project/vllm@ffd46bfab2128bb84146050e98b51a617c6575ab.
+    block_m = 16 if num_tokens <= 64 else 64
+    block_n = 64 if num_tokens <= 8 else 128
+    return MoeGemmConfig(
+        block_m=block_m,
+        block_n=block_n,
+        block_k=128,
+        group_m=1 if num_tokens <= 16 else 32,
+        num_warps=4,
+        num_stages=4 if num_tokens <= 4 else 3,
+        swap_ab=device_capability == (9, 0) and block_m < 64,
+    )

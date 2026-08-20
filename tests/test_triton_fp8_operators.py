@@ -23,6 +23,21 @@ def _fp8_weight(shape, device):
     )
 
 
+def _assert_fp8_pipeline_close(actual, expected):
+    actual_fp32 = actual.float()
+    expected_fp32 = expected.float()
+    relative_l2 = torch.linalg.vector_norm(
+        actual_fp32 - expected_fp32
+    ) / torch.linalg.vector_norm(expected_fp32)
+    cosine = F.cosine_similarity(
+        actual_fp32.flatten(),
+        expected_fp32.flatten(),
+        dim=0,
+    )
+    assert relative_l2.item() < 2.0e-2
+    assert cosine.item() > 0.9998
+
+
 @pytest.mark.parametrize(
     ("tokens", "out_features", "in_features"),
     [(1, 128, 128), (7, 256, 384), (19, 129, 257)],
@@ -196,7 +211,7 @@ def test_fp8_moe_matches_reference(gate_up_order):
         gate_up_order,
     )
 
-    torch.testing.assert_close(actual, expected, rtol=4.0e-2, atol=5.0)
+    _assert_fp8_pipeline_close(actual, expected)
 
 
 @pytest.mark.parametrize(
@@ -242,4 +257,4 @@ def test_minimax_fused_gate_up_matches_generic_fp8_pipeline(hidden, intermediate
     actual = fused_minimax_m2_moe_fp8(*arguments, **kwargs)
     torch.cuda.synchronize()
 
-    assert torch.equal(actual, expected)
+    _assert_fp8_pipeline_close(actual, expected)

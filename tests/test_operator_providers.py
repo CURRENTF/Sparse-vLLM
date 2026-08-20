@@ -29,6 +29,7 @@ from sparsevllm.operators.moe import (
     FlashInferCutlassFp8MoeProvider,
     HopperQwen36HybridFp8MoeProvider,
     MoeOpSpec,
+    Qwen3HybridFp8MoeProvider,
     SglAlignedTritonGlmMoeProvider,
     SglTritonHybridMoeProvider,
     resolve_moe_provider,
@@ -1089,6 +1090,131 @@ def test_fp8_moe_prefers_flashinfer_only_on_sm90():
 
     assert hopper.provider.name == "flashinfer_cutlass_fp8_sm90"
     assert blackwell.provider.name == "triton"
+
+
+@pytest.mark.parametrize(
+    ("tp_size", "intermediate_size"),
+    [(1, 768), (2, 384)],
+)
+def test_qwen3_fp8_uses_profiled_hybrid_provider(tp_size, intermediate_size):
+    spec = _moe_spec(
+        num_experts=128,
+        num_local_experts=128,
+        hidden_size=2048,
+        intermediate_size=intermediate_size,
+        top_k=8,
+        tp_size=tp_size,
+        ep_size=1,
+    )
+    with patch("sparsevllm.operators.moe.find_spec", return_value=object()):
+        resolved = OpResolver(MOE_REGISTRY).resolve(
+            spec,
+            _cuda_caps((9, 0), device_name="NVIDIA H100 80GB HBM3"),
+        )
+
+    assert resolved.provider.name == "qwen3_hybrid_fp8"
+    assert resolved.provider.gate_up_order == "up_gate"
+
+
+def test_qwen3_fp8_hybrid_dispatches_at_measured_crossover():
+    provider = Qwen3HybridFp8MoeProvider()
+    spec = _moe_spec(
+        num_experts=128,
+        num_local_experts=128,
+        hidden_size=2048,
+        intermediate_size=768,
+        top_k=8,
+        tp_size=1,
+        ep_size=1,
+    )
+    weights = torch.empty(1)
+    flashinfer_output = torch.ones(128, 2)
+    triton_output = torch.ones(256, 2)
+    triton_call = Mock(return_value=triton_output)
+
+    with patch.object(
+        FlashInferCutlassFp8MoeProvider,
+        "run",
+        return_value=flashinfer_output,
+    ) as flashinfer_call:
+        actual_decode = provider.run(
+            spec,
+            torch.empty(128, 2),
+            torch.empty(128, 8, dtype=torch.int32),
+            torch.empty(128, 8),
+            weights,
+            weights,
+            weights,
+            weights,
+            local_expert_start=0,
+            ep_rank=0,
+        )
+
+    with patch.dict(
+        sys.modules,
+        {
+            "sparsevllm.kernels.triton.moe": SimpleNamespace(
+                fused_moe_fp8=triton_call
+            )
+        },
+    ):
+        actual_prefill = provider.run(
+            spec,
+            torch.empty(256, 2),
+            torch.empty(256, 8, dtype=torch.int32),
+            torch.empty(256, 8),
+            weights,
+            weights,
+            weights,
+            weights,
+            local_expert_start=0,
+            ep_rank=0,
+        )
+
+    assert actual_decode is flashinfer_output
+    assert actual_prefill is triton_output
+    flashinfer_call.assert_called_once()
+    assert triton_call.call_args.kwargs["gate_up_order"] == "up_gate"
+
+
+def test_qwen3_tp2_fp8_uses_triton_for_decode():
+    provider = Qwen3HybridFp8MoeProvider()
+    spec = _moe_spec(
+        num_experts=128,
+        num_local_experts=128,
+        hidden_size=2048,
+        intermediate_size=384,
+        top_k=8,
+        tp_size=2,
+        ep_size=1,
+    )
+    triton_output = torch.ones(1, 2)
+    triton_call = Mock(return_value=triton_output)
+    weights = torch.empty(1)
+
+    with patch.dict(
+        sys.modules,
+        {
+            "sparsevllm.kernels.triton.moe": SimpleNamespace(
+                fused_moe_fp8=triton_call
+            )
+        },
+    ):
+        actual = provider.run(
+            spec,
+            torch.empty(1, 2),
+            torch.empty(1, 8, dtype=torch.int32),
+            torch.empty(1, 8),
+            weights,
+            weights,
+            weights,
+            weights,
+            local_expert_start=0,
+            ep_rank=0,
+        )
+
+    assert actual is triton_output
+    assert triton_call.call_args.kwargs["gate_up_order"] == "up_gate"
 
 
 def test_qwen36_hybrid_moe_uses_profiled_graph_shape_on_h100():

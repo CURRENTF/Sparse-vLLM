@@ -7,6 +7,7 @@ import triton.language as tl
 @triton.jit(do_not_specialize=["size_m"])
 def _silu_and_mul_kernel(
     input_ptr,
+    output_ptr,
     stride_input_m,
     stride_input_n,
     stride_output_m,
@@ -52,7 +53,7 @@ def _silu_and_mul_kernel(
     gate = gate.to(input_ptr.dtype.element_ty)
 
     tl.store(
-        input_ptr + res_offsets,
+        output_ptr + res_offsets,
         up * gate,
         mask=(output_n_offsets < size_n)[None, :] * (output_m_offsets < size_m)[:, None],
     )
@@ -64,7 +65,12 @@ def _resolve_silu_launch_config(size_m: int) -> tuple[int, int, int | None]:
     return 128, 128, None
 
 
-def silu_and_mul_fwd(input, *, gate_up_order: str = "gate_up"):
+def silu_and_mul_fwd(
+    input,
+    *,
+    gate_up_order: str = "gate_up",
+    output: torch.Tensor | None = None,
+):
     if gate_up_order not in {"gate_up", "up_gate"}:
         raise ValueError(
             "gate_up_order must be 'gate_up' or 'up_gate', "
@@ -72,10 +78,17 @@ def silu_and_mul_fwd(input, *, gate_up_order: str = "gate_up"):
         )
     stride_input_m = input.stride(0)
     stride_input_n = input.stride(1)
-    stride_output_m = input.stride(0)
-    stride_output_n = input.stride(1)
     size_m = input.shape[0]
     size_n = input.shape[-1] // 2
+    if output is None:
+        output = input[:, :size_n]
+    elif tuple(output.shape) != (size_m, size_n):
+        raise ValueError(
+            f"SwiGLU output must have shape {(size_m, size_n)}, "
+            f"got {tuple(output.shape)}."
+        )
+    stride_output_m = output.stride(0)
+    stride_output_n = output.stride(1)
     BLOCK_M, BLOCK_N, num_warps = _resolve_silu_launch_config(size_m)
     grid = (
         triton.cdiv(size_m, BLOCK_M),
@@ -84,6 +97,7 @@ def silu_and_mul_fwd(input, *, gate_up_order: str = "gate_up"):
     launch_kwargs = {} if num_warps is None else {"num_warps": num_warps}
     _silu_and_mul_kernel[grid](
         input,
+        output,
         stride_input_m,
         stride_input_n,
         stride_output_m,
@@ -95,7 +109,7 @@ def silu_and_mul_fwd(input, *, gate_up_order: str = "gate_up"):
         BLOCK_N=BLOCK_N,
         **launch_kwargs,
     )
-    return input[:, 0 : (input.shape[-1] // 2)]
+    return output
 
 
 def torch_silu_and_mul(input: torch.Tensor):
