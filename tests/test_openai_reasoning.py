@@ -1,10 +1,7 @@
-from types import SimpleNamespace
-
 import pytest
 
 from sparsevllm.entrypoints.openai.reasoning import detect_reasoning_capabilities
 from sparsevllm.entrypoints.openai.reasoning import reasoning_template_kwargs
-from sparsevllm.entrypoints.openai.routes.models import models
 
 
 class SwitchableTokenizer:
@@ -64,21 +61,3 @@ def test_ignores_unknown_template_kwargs_when_detecting_capabilities():
     assert capabilities.mode == "none"
     with pytest.raises(ValueError, match="does not accept an explicit reasoning effort"):
         reasoning_template_kwargs("none", capabilities)
-
-
-def test_models_route_exposes_detected_reasoning_capabilities():
-    capabilities = detect_reasoning_capabilities(RequiredNativeEffortTokenizer())
-    state = SimpleNamespace(
-        served_model_name="qwen",
-        engine=SimpleNamespace(config=None),
-        reasoning_capabilities=capabilities,
-    )
-
-    model = models(SimpleNamespace(app=SimpleNamespace(state=state)))["data"][0]
-
-    assert model["reasoning"] == {
-        "mode": "required",
-        "effort_control": "native",
-        "supported_efforts": ["low", "medium", "xhigh"],
-        "default_effort": "xhigh",
-    }

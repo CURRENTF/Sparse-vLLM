@@ -16,15 +16,6 @@ class ReasoningCapabilities:
     supported_efforts: tuple[str, ...] = ()
     default_effort: str | None = None
 
-    def as_dict(self) -> dict[str, Any]:
-        return {
-            "mode": self.mode,
-            "effort_control": self.effort_control,
-            "supported_efforts": list(self.supported_efforts),
-            "default_effort": self.default_effort,
-        }
-
-
 NO_REASONING = ReasoningCapabilities()
 
 

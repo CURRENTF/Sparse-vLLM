@@ -1859,6 +1859,7 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         payload = models(Request())
 
         self.assertEqual(payload["data"][0]["max_model_len"], 128000)
+        self.assertNotIn("reasoning", payload["data"][0])
 
     def test_create_app_disables_periodic_throughput_logs_by_default(self):
         from sparsevllm.entrypoints.openai import api_server

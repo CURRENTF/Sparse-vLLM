@@ -49,9 +49,6 @@ def models(request: Request):
     }
     if max_model_len > 0:
         model["max_model_len"] = max_model_len
-    capabilities = getattr(request.app.state, "reasoning_capabilities", None)
-    if capabilities is not None:
-        model["reasoning"] = capabilities.as_dict()
     return {
         "object": "list",
         "data": [model],
