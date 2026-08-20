@@ -8,6 +8,7 @@
 
 | 领域 | 入口 | 范围与说明 |
 | --- | --- | --- |
+| 效率与吞吐 | [`efficiency.md`](efficiency.md) | 匹配的 Sparse-vLLM/vLLM length、并发度、churn、TP、延迟、吞吐和 GPU 活动率直接采样套件。 |
 | Sparse-vLLM microbenchmark | `benchmark/microbench.py` | Synthetic prompt length 下的 engine throughput、TTFT、prefill/decode throughput、ITL 和 GPU memory。 |
 | 模拟 Deep Research | [`simulated-deep-research.md`](simulated-deep-research.md) | 通过 non-uniform smart router 运行 synthetic 10-round main-agent/subagent serving workload。 |
 | Max-batch throughput | `scripts/benchmarks/run_sparsevllm_max_batch_throughput.py` | 面向 capacity 的 Sparse-vLLM stress/throughput run。 |

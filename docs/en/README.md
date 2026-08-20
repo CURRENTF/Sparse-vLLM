@@ -35,5 +35,6 @@ repo-facing result claim needs evidence.
 ## Benchmark Runbooks
 
 - [Benchmark inventory](benchmarking/README.md)
+- [Efficiency and throughput suite](benchmarking/efficiency.md)
 - [Sparse-vLLM regression tests](benchmarking/sparsevllm-regression-tests.md)
 - [Multimodal benchmarks](benchmarking/multimodal/README.md)

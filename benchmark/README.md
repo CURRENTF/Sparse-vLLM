@@ -6,6 +6,7 @@ as a lightweight source-tree map.
 
 | Directory | Main entrypoints | Notes |
 | --- | --- | --- |
+| `efficiency/` | `bench_probe.py`, `hardware_monitor.py`, `validate_unified_suite.py` | Matched synthetic efficiency, request-churn, directly sampled GPU activity, and unified-suite validation. See the [runbook](../docs/en/benchmarking/efficiency.md). |
 | `long_bench/` | `pred.py`, `eval.py` | LongBench prediction and scoring through the native Sparse-vLLM runtime. |
 | `math_bench/` | `pred.py`, `eval.py` | GSM8K, AIME 2024, MATH-500, and HMMT Nov tasks. |
 | `scbench/` | `run_scbench.py`, `run_scbench_preprocessed.py`, `compute_scores.py`, `run_kvzip_preprocessed.py` | SCBench standard, preprocessed, scoring, and KVZip routes. |

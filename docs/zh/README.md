@@ -26,5 +26,6 @@
 ## 基准测试运行手册
 
 - [基准测试目录](benchmarking/README.md)
+- [效率与吞吐性能套件](benchmarking/efficiency.md)
 - [Sparse-vLLM 回归测试](benchmarking/sparsevllm-regression-tests.md)
 - [多模态基准测试](benchmarking/multimodal/README.md)

@@ -27,51 +27,14 @@ This repository includes repo-local Codex skills.
 
 # Standardized Efficiency & Performance Benchmark Suite
 
-This repo provides a unified, multidimensional efficiency benchmark suite under `benchmark/efficiency/` and `scripts/benchmarks/run_efficiency_probe.sh` to quantify GPU compute/bandwidth saturation and CPU scheduling bubbles.
+The canonical runbooks are:
 
-## Core Metrics
-- **Prefill MFU (%)**: Model FLOPs Utilization against hardware BF16 Tensor Core peak (e.g., 989 TFLOPS/H100).
-- **Decode MBU (%)**: Model Bandwidth Utilization against HBM physical bandwidth peak (e.g., 3.35 TB/s/H100).
-- **Active Duty Cycle (%)**: Time fraction where GPU is actively executing kernels.
-- **Host Launch Bubble (%)**: `100% - Active Duty Cycle`, measuring CPU scheduling, Python GIL, and kernel launch latency gaps.
-- **Phase Decoupling**: TTFT (Time to First Token) and TPOT (Time per Output Token) measured via CUDA Events.
-- **Artifact Standards**: Automatically saves `run_manifest.json`, `raw_samples.jsonl`, `summary.json`, and `comparison_report.md`.
+- [English efficiency benchmark runbook](docs/en/benchmarking/efficiency.md)
+- [简体中文效率基准运行手册](docs/zh/benchmarking/efficiency.md)
 
-## Standard Usage
-
-### 1. Cross-System Length Ladder Sweep (Synthetic Probe)
-To run a fast (~2 min) controlled length sweep (8k, 16k, 32k) comparing Sparse-vLLM and vLLM:
-```bash
-# Compare svllm-vanilla, svllm-snapkv, and vllm-vanilla on Qwen3-30B (TP=2)
-bash scripts/benchmarks/run_efficiency_probe.sh \
-  "svllm-vanilla,svllm-snapkv,vllm-vanilla" \
-  "qwen3_30b" \
-  "0,1"
-
-# Custom prompt lengths, output lengths (512 is recommended for representative decode metrics), and output directory
-PROMPT_LENS="8192,16384,32768" OUTPUT_LENS="512" SPARSEVLLM_OUTPUT_DIR="outputs/my_probe" \
-  bash scripts/benchmarks/run_efficiency_probe.sh "svllm-vanilla,svllm-snapkv,vllm-vanilla" "qwen3_30b" "0,1"
-```
-
-### 2. Standalone Efficiency Probe CLI
-```bash
-python3 benchmark/efficiency/bench_probe.py \
-  --engine sparsevllm \
-  --sparse-method snapkv \
-  --model-path <MODEL_PATH> \
-  --prompt-lens 8192,16384,32768 \
-  --output-lens 512 \
-  --tensor-parallel-size 2 \
-  --output-dir outputs/probe_results
-```
-
-### 3. High-Resolution Hardware & Bubble Monitor
-```bash
-python3 benchmark/efficiency/hardware_monitor.py \
-  --gpus "0,1" \
-  --interval_ms 200 \
-  --output_file outputs/gpu_timeline.json
-```
+Follow the runbook's matched-trace, idle-GPU, artifact-validation, and metric-
+interpretation rules. Do not treat sampled GPU activity as theoretical MFU/MBU;
+use the documented Nsight diagnostic for kernel-timeline attribution.
 
 
 # Research Code Skill
