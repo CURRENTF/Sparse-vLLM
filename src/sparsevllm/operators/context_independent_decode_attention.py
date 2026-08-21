@@ -28,7 +28,7 @@ from sparsevllm.utils.profiler import profiler
 @dataclass(frozen=True)
 class ContextIndependentDecodeTuning:
     max_kv_splits: int = 16
-    target_tokens_per_split: int = 1024
+    target_tokens_per_split: int = 256
     block_n: int = 64
     num_warps: int = 2
 
