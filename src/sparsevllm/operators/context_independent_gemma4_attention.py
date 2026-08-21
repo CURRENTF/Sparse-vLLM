@@ -45,6 +45,16 @@ class ContextIndependentGemma4AttentionBackend(Gemma4AttentionBackend):
         )
         self.workspace = workspace
         self.target_tokens_per_split = int(target_tokens_per_split)
+        device_name = (
+            torch.cuda.get_device_name(workspace.mid_output.device)
+            if workspace.mid_output.device.type == "cuda"
+            else ""
+        )
+        # H20 Triton miscompiles the grouped global partial-tile path; the
+        # per-query-head copy is correct there. Window attention is unaffected.
+        self.use_grouped_no_score = (
+            self.sliding_window is not None or "H20" not in device_name
+        )
 
     def get_decode_workspace(
         self,
@@ -112,6 +122,7 @@ class ContextIndependentGemma4AttentionBackend(Gemma4AttentionBackend):
             sliding_window=self.sliding_window,
             attn_score=view.meta.attn_score,
             target_tokens_per_split=self.target_tokens_per_split,
+            use_grouped_no_score=self.use_grouped_no_score,
         )
 
 

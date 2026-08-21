@@ -380,6 +380,7 @@ def context_independent_gemma4_decode(
     sliding_window: int | None,
     attn_score: torch.Tensor | None = None,
     target_tokens_per_split: int = 1024,
+    use_grouped_no_score: bool | None = None,
 ) -> torch.Tensor:
     head_dim = int(q.shape[-1])
     if q.ndim != 3 or k.ndim != 3 or v.shape != k.shape:
@@ -410,7 +411,14 @@ def context_independent_gemma4_decode(
         if head_dim == 256 and group_size in {2, 4}
         else (4 if group_size % 4 == 0 else 2)
     )
-    use_grouped = attn_score is None and group_size % heads_per_program == 0
+    if use_grouped_no_score is None:
+        device_name = torch.cuda.get_device_name(q.device)
+        use_grouped_no_score = sliding_window is not None or "H20" not in device_name
+    use_grouped = (
+        attn_score is None
+        and use_grouped_no_score
+        and group_size % heads_per_program == 0
+    )
     if use_grouped:
         _gemma4_context_independent_grouped_stage1[
             (batch_size, num_heads // heads_per_program, max_splits)
