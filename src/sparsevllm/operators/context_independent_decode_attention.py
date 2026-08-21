@@ -161,7 +161,7 @@ def bind_context_independent_triton_attention(
     modules are intentionally not matched here and are handled by their own
     experimental providers.
     """
-    tuning = tuning or ContextIndependentDecodeTuning()
+    default_tuning = tuning or ContextIndependentDecodeTuning()
     providers: dict[tuple[int, int], ContextIndependentTritonAttentionBackend] = {}
     bound = 0
     for module in model.modules():
@@ -173,12 +173,22 @@ def bind_context_independent_triton_attention(
         signature = (num_heads, head_dim)
         provider = providers.get(signature)
         if provider is None:
+            shape_tuning = (
+                ContextIndependentDecodeTuning(
+                    max_kv_splits=default_tuning.max_kv_splits,
+                    target_tokens_per_split=default_tuning.target_tokens_per_split,
+                    block_n=128,
+                    num_warps=4,
+                )
+                if tuning is None and head_dim == 256
+                else default_tuning
+            )
             provider = ContextIndependentTritonAttentionBackend(
                 max_batch_size=max_batch_size,
                 num_heads=num_heads,
                 head_dim=head_dim,
                 device=device,
-                tuning=tuning,
+                tuning=shape_tuning,
             )
             providers[signature] = provider
         module.attention_backend = provider

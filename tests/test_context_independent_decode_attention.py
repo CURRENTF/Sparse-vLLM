@@ -19,6 +19,7 @@ class _AttentionContainer(torch.nn.Module):
         self.first = Attention(8, 64, 0.125, 2)
         self.second = Attention(8, 64, 0.125, 2)
         self.other_shape = Attention(8, 128, 0.125, 2)
+        self.hd256 = Attention(8, 256, 0.125, 2)
 
 
 def test_context_independent_binding_shares_workspace_by_shape() -> None:
@@ -29,10 +30,13 @@ def test_context_independent_binding_shares_workspace_by_shape() -> None:
         device=torch.device("cpu"),
     )
 
-    assert bound == 3
+    assert bound == 4
     assert isinstance(model.first.attention_backend, ContextIndependentTritonAttentionBackend)
     assert model.first.attention_backend is model.second.attention_backend
     assert model.first.attention_backend is not model.other_shape.attention_backend
+    assert model.first.attention_backend.tuning.block_n == 64
+    assert model.hd256.attention_backend.tuning.block_n == 128
+    assert model.hd256.attention_backend.tuning.num_warps == 4
     assert workspace_bytes > 0
 
 

@@ -34,6 +34,9 @@ from sparsevllm.operators.context_independent_mla_attention import (
 from sparsevllm.operators.context_independent_gemma4_attention import (
     bind_context_independent_gemma4_attention,
 )
+from sparsevllm.operators.context_independent_qwen35 import (
+    bind_context_independent_qwen35_linear_attention,
+)
 from sparsevllm.utils.context import set_context, get_context, reset_context
 from sparsevllm.utils.loader import load_model, sync_deltakv_config_from_checkpoint
 
@@ -252,6 +255,9 @@ class ModelRunner:
         )
         if self.config.decode_cuda_graph_shape_policy == "batch_only":
             mla_provider = bind_context_independent_mla_attention(self.model)
+            qwen35_linear_layers = (
+                bind_context_independent_qwen35_linear_attention(self.model)
+            )
             gemma_layers, gemma_workspace_bytes = (
                 bind_context_independent_gemma4_attention(
                     self.model,
@@ -274,9 +280,10 @@ class ModelRunner:
             )
             logger.info(
                 "Context-independent decode providers: mla=%s gemma_layers=%d "
-                "generic_layers=%d shared_workspace_mib=%.2f",
+                "qwen35_linear_layers=%d generic_layers=%d shared_workspace_mib=%.2f",
                 mla_provider or "none",
                 gemma_layers,
+                qwen35_linear_layers,
                 bound_layers,
                 (workspace_bytes + gemma_workspace_bytes) / (1024**2),
             )
