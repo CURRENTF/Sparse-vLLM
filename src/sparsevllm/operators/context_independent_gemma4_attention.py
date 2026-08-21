@@ -39,6 +39,7 @@ class ContextIndependentGemma4AttentionBackend(Gemma4AttentionBackend):
         target_tokens_per_split: int = 256,
         use_grouped_no_score: bool = True,
         safe_fp32_reduction: bool = False,
+        stage1_num_warps: int = 8,
     ) -> None:
         super().__init__(
             sliding_window=baseline.sliding_window,
@@ -50,8 +51,9 @@ class ContextIndependentGemma4AttentionBackend(Gemma4AttentionBackend):
         self.target_tokens_per_split = int(target_tokens_per_split)
         self.use_grouped_no_score = bool(use_grouped_no_score)
         self.safe_fp32_reduction = bool(safe_fp32_reduction)
-        if self.sliding_window is None and self.safe_fp32_reduction:
-            self.name = "triton_gemma4_context_independent_h20_safe"
+        self.stage1_num_warps = int(stage1_num_warps)
+        if self.sliding_window is None and self.stage1_num_warps == 4:
+            self.name = "triton_gemma4_context_independent_h20_tuned"
 
     def get_decode_workspace(
         self,
@@ -121,6 +123,7 @@ class ContextIndependentGemma4AttentionBackend(Gemma4AttentionBackend):
             target_tokens_per_split=self.target_tokens_per_split,
             use_grouped_no_score=self.use_grouped_no_score,
             safe_fp32_reduction=self.safe_fp32_reduction,
+            stage1_num_warps=self.stage1_num_warps,
         )
 
 
@@ -167,13 +170,15 @@ def bind_context_independent_gemma4_attention(
         module.attention_backend = ContextIndependentGemma4AttentionBackend(
             baseline=baseline,
             workspace=workspace,
-            # H20 global HD=512 reductions are unstable in the tensor-core path.
+            # H20 global HD=512 needs the per-head four-warp specialization.
             # Window attention is unaffected and keeps the tuned grouped kernel.
             use_grouped_no_score=(
                 baseline.sliding_window is not None or not use_h20_global_safe_path
             ),
-            safe_fp32_reduction=(
-                baseline.sliding_window is None and use_h20_global_safe_path
+            stage1_num_warps=(
+                4
+                if baseline.sliding_window is None and use_h20_global_safe_path
+                else 8
             ),
         )
         bound += 1

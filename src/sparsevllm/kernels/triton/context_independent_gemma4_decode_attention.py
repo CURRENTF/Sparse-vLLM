@@ -395,6 +395,7 @@ def context_independent_gemma4_decode(
     target_tokens_per_split: int = 1024,
     use_grouped_no_score: bool = True,
     safe_fp32_reduction: bool = False,
+    stage1_num_warps: int = 8,
 ) -> torch.Tensor:
     head_dim = int(q.shape[-1])
     if q.ndim != 3 or k.ndim != 3 or v.shape != k.shape:
@@ -463,7 +464,7 @@ def context_independent_gemma4_decode(
             WINDOW=int(sliding_window or 0),
             MAX_KV_SPLITS=max_splits,
             TARGET_TOKENS_PER_SPLIT=int(target_tokens_per_split),
-            num_warps=8,
+            num_warps=int(stage1_num_warps),
             num_stages=1,
         )
     else:
@@ -504,7 +505,7 @@ def context_independent_gemma4_decode(
             TARGET_TOKENS_PER_SPLIT=int(target_tokens_per_split),
             SCORE_MODE=0 if attn_score is None else attn_score.dim(),
             SAFE_FP32_REDUCTION=bool(safe_fp32_reduction),
-            num_warps=8,
+            num_warps=int(stage1_num_warps),
             num_stages=1,
         )
     output = torch.empty_like(q)

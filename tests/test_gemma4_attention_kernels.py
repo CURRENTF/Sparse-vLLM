@@ -324,13 +324,19 @@ def test_gemma4_decode_matches_torch(head_dim, sliding_window):
 
 @pytest.mark.parametrize("head_dim", [256, 512])
 @pytest.mark.parametrize(
-    ("sliding_window", "force_safe_reduction"),
-    [(None, False), (None, True), (8, False)],
+    ("sliding_window", "force_safe_reduction", "force_dot4"),
+    [
+        (None, False, False),
+        (None, True, False),
+        (None, False, True),
+        (8, False, False),
+    ],
 )
 def test_context_independent_gemma4_decode_matches_torch_and_replays_new_lengths(
     head_dim,
     sliding_window,
     force_safe_reduction,
+    force_dot4,
 ):
     torch.manual_seed(9)
     slots, lengths = _slots_and_lengths()
@@ -341,7 +347,9 @@ def test_context_independent_gemma4_decode_matches_torch_and_replays_new_lengths
     lse = torch.empty(2, 4, 16, dtype=torch.float32, device="cuda")
     request_indices = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
     safe_reduction = force_safe_reduction or (
-        sliding_window is None and "H20" in torch.cuda.get_device_name()
+        sliding_window is None
+        and "H20" in torch.cuda.get_device_name()
+        and not force_dot4
     )
 
     def run():
@@ -357,9 +365,10 @@ def test_context_independent_gemma4_decode_matches_torch_and_replays_new_lengths
             sliding_window=sliding_window,
             target_tokens_per_split=8,
             use_grouped_no_score=(
-                sliding_window is not None or not safe_reduction
+                sliding_window is not None or (not safe_reduction and not force_dot4)
             ),
             safe_fp32_reduction=safe_reduction,
+            stage1_num_warps=4 if force_dot4 else 8,
         )
 
     output = run()
