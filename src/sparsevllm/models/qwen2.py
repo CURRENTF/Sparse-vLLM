@@ -13,6 +13,14 @@ from sparsevllm.layers.layernorm import RMSNorm
 from sparsevllm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
 from sparsevllm.layers.rotary_embedding import get_rope
 from sparsevllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
+from sparsevllm.models.attention_runtime import (
+    bind_mha_decode_attention_op,
+    bind_mha_prefill_attention_op,
+    build_mha_decode_attention_op,
+    build_mha_prefill_attention_op,
+)
+from sparsevllm.operators.decode_attention import PreparedDecodeAttentionOp
+from sparsevllm.operators.prefill_attention import PreparedPrefillAttentionOp
 
 
 def _get_rope_theta(config: Qwen2Config) -> float:
@@ -53,6 +61,7 @@ class Qwen2Attention(nn.Module):
         rope_theta: float = 10000,
         rope_scaling: tuple | None = None,
         proj_chunk_size: int = 16384,
+        quantization=None,
     ) -> None:
         super().__init__()
         tp_size = get_parallel_context().tp_size
@@ -77,11 +86,13 @@ class Qwen2Attention(nn.Module):
             self.total_num_heads,
             self.total_num_kv_heads,
             bias=qkv_bias,
+            quantization=quantization,
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=False,
+            quantization=quantization,
         )
         self.rotary_emb = get_rope(
             self.head_dim,
@@ -158,17 +169,20 @@ class Qwen2MLP(nn.Module):
         intermediate_size: int,
         hidden_act: str,
         mlp_chunk_size: int = 16384,
+        quantization=None,
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
             bias=False,
+            quantization=quantization,
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
             bias=False,
+            quantization=quantization,
         )
         assert hidden_act == "silu"
         self.act_fn = SiluAndMul()
@@ -202,6 +216,7 @@ class Qwen2DecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        quantization = getattr(config, "quantization_config", None)
         self.self_attn = Qwen2Attention(
             hidden_size=config.hidden_size,
             num_heads=config.num_attention_heads,
@@ -213,12 +228,14 @@ class Qwen2DecoderLayer(nn.Module):
             rope_theta=_get_rope_theta(config),
             rope_scaling=_get_rope_scaling(config),
             proj_chunk_size=getattr(config, "mlp_chunk_size", 16384),
+            quantization=quantization,
         )
         self.mlp = Qwen2MLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
             mlp_chunk_size=getattr(config, "mlp_chunk_size", 16384),
+            quantization=quantization,
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -303,15 +320,60 @@ class Qwen2ForCausalLM(nn.Module):
         "up_proj": ("gate_up_proj", 1),
     }
 
+    @staticmethod
+    def build_runtime_kwargs(
+        config: Qwen2Config,
+        *,
+        engine_config,
+        parallel_context,
+        device: torch.device,
+        **_,
+    ) -> dict:
+        return {
+            "prefill_attention_op": build_mha_prefill_attention_op(
+                config,
+                sparse_method=engine_config.vllm_sparse_method,
+                attention_tp_size=parallel_context.attention_tp_size,
+                device=device,
+            ),
+            "decode_attention_op": build_mha_decode_attention_op(
+                config,
+                sparse_method=engine_config.vllm_sparse_method,
+                attention_tp_size=parallel_context.attention_tp_size,
+                device=device,
+                max_batch_size=engine_config.max_decoding_seqs,
+                cuda_graph=engine_config.decode_cuda_graph,
+            ),
+        }
+
     def __init__(
         self,
-        config: Qwen2Config
+        config: Qwen2Config,
+        prefill_attention_op: PreparedPrefillAttentionOp | None = None,
+        decode_attention_op: PreparedDecodeAttentionOp | None = None,
     ) -> None:
         super().__init__()
+        self.prefill_attention_op = prefill_attention_op
+        self.decode_attention_op = decode_attention_op
         self.model = Qwen2Model(config)
+        if prefill_attention_op is not None:
+            bind_mha_prefill_attention_op(self.model, prefill_attention_op)
+        if decode_attention_op is not None:
+            bind_mha_decode_attention_op(self.model, decode_attention_op)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if config.tie_word_embeddings:
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
+        logger.info(
+            "Loaded Qwen2 prefill_provider={} decode_provider={}",
+            "legacy_triton" if prefill_attention_op is None else prefill_attention_op.name,
+            "legacy_triton" if decode_attention_op is None else decode_attention_op.name,
+        )
+
+    def close_runtime_operators(self) -> None:
+        if self.prefill_attention_op is not None:
+            self.prefill_attention_op.close()
+        if self.decode_attention_op is not None:
+            self.decode_attention_op.close()
 
     def forward(
         self,

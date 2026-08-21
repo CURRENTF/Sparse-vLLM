@@ -1065,9 +1065,11 @@ def run_vllm_probe(
         gpu_memory_utilization=args.gpu_memory_utilization,
         max_model_len=max_len_needed,
         max_num_batched_tokens=args.max_num_batched_tokens,
+        max_num_seqs=max(args.batch_sizes),
         enable_prefix_caching=False,
         disable_log_stats=False,
         trust_remote_code=True,
+        seed=args.seed,
     )
 
     for p_len in args.prompt_lens:

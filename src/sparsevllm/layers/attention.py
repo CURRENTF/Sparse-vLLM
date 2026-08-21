@@ -5,51 +5,15 @@ from torch import nn
 
 from sparsevllm.engine.cache_manager import ExplicitKVPayload
 from sparsevllm.layers.attention_backend import TritonAttentionBackend
-from sparsevllm.operators.decode_attention import PreparedDecodeAttentionLaunchOp
+from sparsevllm.operators.decode_attention import (
+    PreparedDecodeAttentionLaunchOp,
+    PreparedDecodeAttentionOp,
+    get_decode_workspace,
+)
 from sparsevllm.operators.prefill_attention import PreparedPrefillAttentionOp
 from sparsevllm.utils.context import get_context
 
 from sparsevllm.engine.sparse_controller import SparseController
-
-
-def get_decode_workspace(
-    context,
-    batch_size: int,
-    num_heads: int,
-    num_blocks: int,
-    head_dim: int,
-    device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    shape_o = (batch_size, num_heads, num_blocks, head_dim)
-    shape_lse = (batch_size, num_heads, num_blocks)
-    mid_o = context.decode_mid_o
-    if (
-        mid_o is None
-        or mid_o.device != device
-        or mid_o.shape[0] < batch_size
-        or mid_o.shape[1] < num_heads
-        or mid_o.shape[2] < num_blocks
-        or mid_o.shape[3] < head_dim
-    ):
-        mid_o = torch.empty(shape_o, dtype=torch.float32, device=device)
-        context.decode_mid_o = mid_o
-
-    mid_lse = context.decode_mid_o_logexpsum
-    if (
-        mid_lse is None
-        or mid_lse.device != device
-        or mid_lse.shape[0] < batch_size
-        or mid_lse.shape[1] < num_heads
-        or mid_lse.shape[2] < num_blocks
-    ):
-        mid_lse = torch.empty(shape_lse, dtype=torch.float32, device=device)
-        context.decode_mid_o_logexpsum = mid_lse
-
-    return (
-        mid_o[:batch_size, :num_heads, :num_blocks, :head_dim],
-        mid_lse[:batch_size, :num_heads, :num_blocks],
-    )
-
 
 class Attention(nn.Module):
 
@@ -61,6 +25,7 @@ class Attention(nn.Module):
         num_kv_heads,
         *,
         prefill_op: PreparedPrefillAttentionOp | None = None,
+        decode_op: PreparedDecodeAttentionOp | None = None,
         decode_launch_op: PreparedDecodeAttentionLaunchOp | None = None,
     ):
         super().__init__()
@@ -70,6 +35,7 @@ class Attention(nn.Module):
         self.num_kv_heads = num_kv_heads
         self.attention_backend = TritonAttentionBackend()
         self.prefill_op = prefill_op
+        self.decode_op = decode_op
         self.decode_launch_op = decode_launch_op
 
     def forward(
@@ -180,73 +146,99 @@ class Attention(nn.Module):
                 decode_meta = decode_view.meta
                 temp_slots = decode_meta.temp_slots
 
-                max_context_len = decode_meta.max_context_len
-                static_cap = getattr(cache_manager, "_decode_static_max_context_len", None)
-                if static_cap is not None:
-                    max_context_len = max(
-                        int(max_context_len) if max_context_len is not None else 0,
-                        int(static_cap),
+                if (
+                    decode_meta.active_slots.dim() == 2
+                    and os.environ.get("SVLLM_DEBUG_DECODE_BOUNDS", "0") == "1"
+                    and not (
+                        torch.cuda.is_available()
+                        and torch.cuda.is_current_stream_capturing()
                     )
-                if max_context_len is None:
-                    raise RuntimeError(f"static decode requires max_context_len, got None at layer={layer_idx}")
-                max_len_in_batch = int(max_context_len)
-                if decode_meta.active_slots.dim() == 2:
+                ):
                     slot_table_len = int(decode_meta.active_slots.shape[1])
-                    if (
-                        os.environ.get("SVLLM_DEBUG_DECODE_BOUNDS", "0") == "1"
-                        and not (torch.cuda.is_available() and torch.cuda.is_current_stream_capturing())
-                    ):
-                        actual_max_len = (
-                            int(decode_meta.context_lens.max().item())
-                            if decode_meta.context_lens.numel() > 0
-                            else 0
-                        )
-                        if actual_max_len > slot_table_len:
-                            raise RuntimeError(
-                                "decode context length exceeds active slot table width: "
-                                f"layer={layer_idx} context_lens_max={actual_max_len} "
-                                f"slot_table_len={slot_table_len}"
-                            )
-                    if max_len_in_batch > slot_table_len:
-                        max_len_in_batch = slot_table_len
-                    if max_len_in_batch <= 0:
-                        raise RuntimeError(
-                            f"decode requires a positive context length, got {max_len_in_batch} at layer={layer_idx}"
-                        )
-                BLOCK_SEQ = cache_manager.get_decode_block_seq(layer_idx, 256)
-                if self.decode_launch_op is None:
-                    gqa_block_n, gqa_num_warps = 16, 2
-                else:
-                    BLOCK_SEQ, gqa_block_n, gqa_num_warps = (
-                        self.decode_launch_op.launch_config(
-                            block_seq=BLOCK_SEQ,
-                            max_context_len=max_len_in_batch,
-                            requires_attention_scores=decode_meta.attn_score is not None,
-                        )
+                    actual_max_len = (
+                        int(decode_meta.context_lens.max().item())
+                        if decode_meta.context_lens.numel() > 0
+                        else 0
                     )
-                num_seq_blocks = (max_len_in_batch + BLOCK_SEQ - 1) // BLOCK_SEQ
+                    if actual_max_len > slot_table_len:
+                        raise RuntimeError(
+                            "decode context length exceeds active slot table "
+                            f"width: layer={layer_idx} "
+                            f"context_lens_max={actual_max_len} "
+                            f"slot_table_len={slot_table_len}"
+                        )
 
-                mid_o, mid_o_logexpsum = get_decode_workspace(
-                    context,
-                    batch_size,
-                    self.num_heads,
-                    num_seq_blocks,
-                    self.head_dim,
-                    q.device,
-                )
-
-                o = self.attention_backend.run_decode(
-                    q,
-                    decode_view,
-                    mid_o=mid_o,
-                    mid_o_logexpsum=mid_o_logexpsum,
-                    max_len_in_batch=max_len_in_batch,
-                    block_seq=BLOCK_SEQ,
-                    num_heads=self.num_heads,
-                    num_kv_heads=self.num_kv_heads,
-                    gqa_block_n=gqa_block_n,
-                    gqa_num_warps=gqa_num_warps,
-                )
+                if self.decode_op is not None:
+                    o = self.decode_op.run(
+                        q,
+                        decode_view,
+                        decode_launch_op=self.decode_launch_op,
+                    )
+                else:
+                    max_context_len = decode_meta.max_context_len
+                    static_cap = getattr(
+                        cache_manager,
+                        "_decode_static_max_context_len",
+                        None,
+                    )
+                    if static_cap is not None:
+                        max_context_len = max(
+                            int(max_context_len)
+                            if max_context_len is not None
+                            else 0,
+                            int(static_cap),
+                        )
+                    if max_context_len is None:
+                        raise RuntimeError(
+                            "static decode requires max_context_len, got None "
+                            f"at layer={layer_idx}"
+                        )
+                    max_len_in_batch = int(max_context_len)
+                    if decode_meta.active_slots.dim() == 2:
+                        slot_table_len = int(decode_meta.active_slots.shape[1])
+                        if max_len_in_batch > slot_table_len:
+                            max_len_in_batch = slot_table_len
+                        if max_len_in_batch <= 0:
+                            raise RuntimeError(
+                                "decode requires a positive context length, got "
+                                f"{max_len_in_batch} at layer={layer_idx}"
+                            )
+                    block_seq = cache_manager.get_decode_block_seq(layer_idx, 256)
+                    if self.decode_launch_op is None:
+                        gqa_block_n, gqa_num_warps = 16, 2
+                    else:
+                        block_seq, gqa_block_n, gqa_num_warps = (
+                            self.decode_launch_op.launch_config(
+                                block_seq=block_seq,
+                                max_context_len=max_len_in_batch,
+                                requires_attention_scores=(
+                                    decode_meta.attn_score is not None
+                                ),
+                            )
+                        )
+                    num_seq_blocks = (
+                        max_len_in_batch + block_seq - 1
+                    ) // block_seq
+                    mid_o, mid_o_logexpsum = get_decode_workspace(
+                        context,
+                        batch_size,
+                        self.num_heads,
+                        num_seq_blocks,
+                        self.head_dim,
+                        q.device,
+                    )
+                    o = self.attention_backend.run_decode(
+                        q,
+                        decode_view,
+                        mid_o=mid_o,
+                        mid_o_logexpsum=mid_o_logexpsum,
+                        max_len_in_batch=max_len_in_batch,
+                        block_seq=block_seq,
+                        num_heads=self.num_heads,
+                        num_kv_heads=self.num_kv_heads,
+                        gqa_block_n=gqa_block_n,
+                        gqa_num_warps=gqa_num_warps,
+                    )
                 cache_manager.record_decode_query(layer_idx, q)
 
             sparse_controller.on_layer_attention_end(layer_idx)

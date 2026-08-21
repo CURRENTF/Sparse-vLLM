@@ -28,6 +28,7 @@ from sparsevllm.layers.linear import (
 from sparsevllm.layers.mla_attention import MLAAttention
 from sparsevllm.layers.packed_moe import PackedMoeExperts
 from sparsevllm.layers.rotary_embedding import RotaryEmbedding, get_rope
+from sparsevllm.method_registry import sparse_decode_attention_requires_scores
 from sparsevllm.models.qwen3 import Qwen3MLP
 from sparsevllm.operators.mla_attention import MlaAttentionOpSpec
 from sparsevllm.operators.all_reduce import (
@@ -120,6 +121,7 @@ def build_glm4_moe_lite_mla_attention(
     prefill_workspace_bytes: int,
     decode_cuda_graph: bool,
     projection_chunk_size: int,
+    may_require_attention_scores: bool = False,
 ) -> MLAAttention:
     """Bind the one process-local MLA operator from explicit runtime inputs."""
 
@@ -135,6 +137,7 @@ def build_glm4_moe_lite_mla_attention(
         cache_dtype=activation_dtype,
         tp_size=int(parallel_context.attention_tp_size),
         cuda_graph=bool(decode_cuda_graph),
+        may_require_attention_scores=bool(may_require_attention_scores),
     )
     return MLAAttention.bind(
         spec=spec,
@@ -890,6 +893,11 @@ class Glm4MoeLiteForCausalLM(nn.Module):
                 prefill_workspace_bytes=engine_config.mla_prefill_workspace_bytes,
                 decode_cuda_graph=decode_cuda_graph,
                 projection_chunk_size=engine_config.mlp_chunk_size,
+                may_require_attention_scores=(
+                    sparse_decode_attention_requires_scores(
+                        engine_config.vllm_sparse_method
+                    )
+                ),
             ),
             "mlp_chunk_size": engine_config.mlp_chunk_size,
             "decode_cuda_graph": decode_cuda_graph,

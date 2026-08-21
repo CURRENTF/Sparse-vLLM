@@ -1,10 +1,7 @@
 from __future__ import annotations
 
 import math
-import re
 from dataclasses import dataclass
-from importlib.metadata import PackageNotFoundError, version
-from importlib.util import find_spec
 from typing import Any
 
 import torch
@@ -13,6 +10,10 @@ import sparsevllm.platforms as platforms
 from sparsevllm.kernels.external.sgl.fa3 import (
     SglFa3DecodeKernel,
     sgl_fa3_device_support,
+)
+from sparsevllm.kernels.external.flashinfer.prefill import (
+    flashinfer_paged_prefill_support,
+    make_flashinfer_paged_prefill_wrapper,
 )
 from sparsevllm.operators.attention_capabilities import (
     AttentionKernelCapabilities,
@@ -139,6 +140,7 @@ def _view_score_kind(view: Any) -> AttentionScoreKind:
 class FlashInferPagedPrefillAttentionProvider(PrefillAttentionProvider):
     name = "flashinfer_paged_prefill_fa3_sm90"
     priority = 180
+    backend = "fa3"
     capabilities = AttentionKernelCapabilities(
         platforms=frozenset({PlatformEnum.CUDA}),
         compute_capabilities=frozenset({(9, 0)}),
@@ -177,18 +179,8 @@ class FlashInferPagedPrefillAttentionProvider(PrefillAttentionProvider):
             )
         if not spec.causal:
             return SupportResult.no("requires causal attention")
-        if find_spec("flashinfer") is None:
-            return SupportResult.no("flashinfer is not installed")
-        try:
-            installed = version("flashinfer-python")
-        except PackageNotFoundError:
-            return SupportResult.no("flashinfer-python package metadata is unavailable")
-        numeric = tuple(int(part) for part in re.findall(r"\d+", installed)[:3])
-        if numeric < (0, 6, 15):
-            return SupportResult.no(
-                f"requires flashinfer-python >= 0.6.15, got {installed}"
-            )
-        return SupportResult.yes()
+        supported, reason = flashinfer_paged_prefill_support(cls.backend)
+        return SupportResult.yes(reason) if supported else SupportResult.no(reason)
 
     def __init__(self) -> None:
         self._state: _FlashInferPagedPrefillState | None = None
@@ -210,7 +202,16 @@ class FlashInferPagedPrefillAttentionProvider(PrefillAttentionProvider):
                 f"selected={device_index} current={current_device}."
             )
         device = torch.device("cuda", int(device_index))
-        self._state = _FlashInferPagedPrefillState(device)
+        self._state = _FlashInferPagedPrefillState(device, backend=self.backend)
+
+    def binding_metadata(self) -> dict[str, object]:
+        return {
+            "implementation_kind": "atomic_provider",
+            "source": "flashinfer-python",
+            "backend": self.backend,
+            "kv_layout": "NHD",
+            "page_size": 1,
+        }
 
     def close(self) -> None:
         self._state = None
@@ -268,18 +269,15 @@ class FlashInferPagedPrefillAttentionProvider(PrefillAttentionProvider):
 
 
 class _FlashInferPagedPrefillState:
-    def __init__(self, device: torch.device) -> None:
-        from flashinfer.prefill import BatchPrefillWithPagedKVCacheWrapper
-
+    def __init__(self, device: torch.device, *, backend: str) -> None:
         self.workspace = torch.empty(
             128 * 1024 * 1024,
             dtype=torch.uint8,
             device=device,
         )
-        self.wrapper = BatchPrefillWithPagedKVCacheWrapper(
+        self.wrapper = make_flashinfer_paged_prefill_wrapper(
             self.workspace,
-            kv_layout="NHD",
-            backend="fa3",
+            backend=backend,
         )
         self.planned = False
 
@@ -348,6 +346,57 @@ class _FlashInferPagedPrefillState:
 
 
 @PREFILL_ATTENTION_REGISTRY.register
+class FlashInferFa2Sm120PagedPrefillAttentionProvider(
+    FlashInferPagedPrefillAttentionProvider
+):
+    """FlashInfer FA2 for the profiled Qwen3.6 SM120 prefill contract."""
+
+    name = "flashinfer_paged_prefill_fa2_sm120"
+    priority = 190
+    backend = "fa2"
+    capabilities = AttentionKernelCapabilities(
+        platforms=frozenset({PlatformEnum.CUDA}),
+        compute_capabilities=frozenset({(12, 0)}),
+        activation_dtypes=frozenset({torch.bfloat16}),
+        head_dims=frozenset({256}),
+        page_sizes=frozenset({1}),
+        score_outputs=frozenset({AttentionScoreKind.NONE}),
+        layer_varying_page_table=False,
+        varlen=True,
+        minimum_runtime_version=(12, 8),
+    )
+
+    @classmethod
+    def supports(
+        cls, spec: PrefillAttentionOpSpec, caps: DeviceCaps
+    ) -> SupportResult:
+        common = match_attention_capabilities(
+            spec.kernel_request, caps, cls.capabilities
+        )
+        if not common.supported:
+            return common
+        if caps.device_name != "NVIDIA RTX PRO 6000 Blackwell Server Edition":
+            return SupportResult.no(
+                "requires profiled NVIDIA RTX PRO 6000 SM120 hardware, "
+                f"got {caps.device_name}"
+            )
+        expected_shape = (24, 4, 256)
+        actual_shape = (
+            spec.num_query_heads,
+            spec.num_kv_heads,
+            spec.head_dim,
+        )
+        if actual_shape != expected_shape:
+            return SupportResult.no(
+                f"requires profiled local Q/KV/head shape {expected_shape}, got {actual_shape}"
+            )
+        if not spec.causal:
+            return SupportResult.no("requires causal attention")
+        supported, reason = flashinfer_paged_prefill_support(cls.backend)
+        return SupportResult.yes(reason) if supported else SupportResult.no(reason)
+
+
+@PREFILL_ATTENTION_REGISTRY.register
 class SglFa3PagedPrefillAttentionProvider(PrefillAttentionProvider):
     """SGL FA3 over Sparse-vLLM's page-size-one physical KV table."""
 
@@ -357,7 +406,7 @@ class SglFa3PagedPrefillAttentionProvider(PrefillAttentionProvider):
         platforms=frozenset({PlatformEnum.CUDA}),
         compute_capabilities=frozenset({(9, 0)}),
         activation_dtypes=frozenset({torch.bfloat16}),
-        head_dims=frozenset({128}),
+        head_dims=frozenset({128, 256}),
         page_sizes=frozenset({1}),
         score_outputs=frozenset({AttentionScoreKind.NONE}),
         layer_varying_page_table=True,

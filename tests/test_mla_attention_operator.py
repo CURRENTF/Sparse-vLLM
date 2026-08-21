@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
@@ -124,9 +125,17 @@ def test_mla_resolver_selects_sm90_triton_provider(
         )
 
     assert isinstance(resolved.provider, MlaTritonProvider)
+    tilelang_reason = (
+        "score-capable Composite is not required by this operation"
+        if device_name == "NVIDIA H100 80GB HBM3"
+        else "requires H100-validated TileLang MLA schedules"
+    )
     assert resolved.rejected == (
         ("sgl_fa3_sm90", "sglang-kernel is not installed"),
-        ("tilelang_score_sgl_fa3_h100", "sglang-kernel is not installed"),
+        (
+            "tilelang_score_sgl_fa3_h100",
+            tilelang_reason,
+        ),
     )
     allocate.assert_called_once_with(
         batch_size=8,
@@ -139,7 +148,11 @@ def test_mla_resolver_selects_sm90_triton_provider(
 @pytest.mark.parametrize(
     ("device_name", "tp_size", "tilelang_reason"),
     [
-        ("NVIDIA H100 80GB HBM3", 4, "tilelang unavailable"),
+        (
+            "NVIDIA H100 80GB HBM3",
+            4,
+            "score-capable Composite is not required by this operation",
+        ),
         ("NVIDIA H20", 1, "requires H100-validated TileLang MLA schedules"),
         ("NVIDIA H20", 2, "requires H100-validated TileLang MLA schedules"),
     ],
@@ -183,7 +196,7 @@ def test_mla_resolver_prefers_sgl_fa3_on_supported_sm90(
 
 
 def test_mla_resolver_accepts_cuda_graph_after_capture_gate() -> None:
-    spec = _spec(cuda_graph=True)
+    spec = _spec(cuda_graph=True, may_require_attention_scores=True)
     workspace = _cpu_workspace(batch_size=8, head_count=spec.local_q_heads)
 
     with (
@@ -211,7 +224,45 @@ def test_mla_resolver_accepts_cuda_graph_after_capture_gate() -> None:
         )
 
     assert type(resolved.provider) is MlaTileLangScoreProvider
-    assert resolved.rejected == ()
+    assert resolved.rejected == (
+        (
+            "sgl_fa3_sm90",
+            "does not satisfy the prepared score-output contract",
+        ),
+    )
+
+
+def test_vanilla_mla_binds_atomic_sgl_instead_of_score_composite() -> None:
+    spec = _spec(cuda_graph=True, may_require_attention_scores=False)
+    workspace = _cpu_workspace(batch_size=8, head_count=spec.local_q_heads)
+
+    with (
+        patch(
+            "sparsevllm.operators.mla_attention.sgl_fa3_device_support",
+            return_value=(True, "validated test API"),
+        ),
+        patch(
+            "sparsevllm.operators.mla_attention.tilelang_mla_support"
+        ) as tilelang_support,
+        patch(
+            "sparsevllm.operators.mla_attention.allocate_mla_decode_workspace",
+            return_value=workspace,
+        ),
+        patch("sparsevllm.operators.mla_attention.SglFa3DecodeKernel"),
+    ):
+        resolved = OpResolver(MLA_ATTENTION_REGISTRY).resolve(
+            spec,
+            _h100_caps(),
+            op_spec=spec,
+            device="cpu",
+            max_batch_size=8,
+        )
+
+    assert type(resolved.provider) is MlaSglFa3Provider
+    assert dict(resolved.report.provider_metadata.items)[
+        "implementation_kind"
+    ] == "atomic_provider"
+    tilelang_support.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -348,6 +399,14 @@ def test_sgl_provider_uses_packed_varlen_prefill_metadata() -> None:
         max_seqlen_k=4,
     )
     fa3.run_explicit_varlen.assert_not_called()
+
+
+def test_atomic_sgl_provider_rejects_late_score_request() -> None:
+    provider = object.__new__(MlaSglFa3Provider)
+    view = SimpleNamespace(meta=SimpleNamespace(attn_score=torch.empty(1)))
+
+    with pytest.raises(RuntimeError, match="score-free operation"):
+        provider.run(None, None, view, None)
 
 
 def test_mla_provider_run_does_not_resolve_or_allocate() -> None:

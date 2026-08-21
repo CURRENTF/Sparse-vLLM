@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import re
 import weakref
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass
+from enum import Enum
 from typing import Generic, Protocol, TypeVar
 
 from sparsevllm.platforms.interface import DeviceCaps
@@ -14,10 +15,20 @@ ProviderT = TypeVar("ProviderT", bound="OperatorProvider")
 
 
 _OPERATOR_BINDINGS: dict[str, weakref.WeakSet[object]] = {}
+_BINDING_REPORTS: weakref.WeakKeyDictionary[object, BindingReport] = (
+    weakref.WeakKeyDictionary()
+)
 
 
-def record_operator_binding(operator_type: str, provider: object) -> None:
+def record_operator_binding(
+    operator_type: str,
+    provider: object,
+    *,
+    report: BindingReport | None = None,
+) -> None:
     _OPERATOR_BINDINGS.setdefault(operator_type, weakref.WeakSet()).add(provider)
+    if report is not None:
+        _BINDING_REPORTS[provider] = report
 
 
 def _implementation_name(provider: object) -> str:
@@ -26,6 +37,124 @@ def _implementation_name(provider: object) -> str:
         or getattr(provider, "name", None)
         or provider.provider_name
     )
+
+
+@dataclass(frozen=True, slots=True)
+class _FrozenMapping:
+    items: tuple[tuple[str, object], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _FrozenSequence:
+    items: tuple[object, ...]
+
+
+def _freeze_snapshot(value: object) -> object:
+    if is_dataclass(value) and not isinstance(value, type):
+        return _FrozenMapping(
+            tuple(
+                (field.name, _freeze_snapshot(getattr(value, field.name)))
+                for field in fields(value)
+            )
+        )
+    if isinstance(value, Enum):
+        return value.name
+    if isinstance(value, dict):
+        return _FrozenMapping(
+            tuple(
+                (str(key), _freeze_snapshot(item))
+                for key, item in sorted(
+                    value.items(),
+                    key=lambda pair: str(pair[0]),
+                )
+            )
+        )
+    if isinstance(value, (list, tuple)):
+        return _FrozenSequence(tuple(_freeze_snapshot(item) for item in value))
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    return str(value)
+
+
+def _thaw_snapshot(value: object) -> object:
+    if isinstance(value, _FrozenMapping):
+        return {key: _thaw_snapshot(item) for key, item in value.items}
+    if isinstance(value, _FrozenSequence):
+        return [_thaw_snapshot(item) for item in value.items]
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderDecision:
+    provider: str
+    priority: int
+    supported: bool
+    reason: str
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "provider": self.provider,
+            "priority": self.priority,
+            "supported": self.supported,
+            "reason": self.reason,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class BindingReport:
+    operator_type: str
+    spec_type: str
+    spec: object
+    device_caps: object
+    selected_provider: str
+    selected_priority: int
+    selected_reason: str
+    candidates: tuple[ProviderDecision, ...]
+    provider_metadata: _FrozenMapping = _FrozenMapping(())
+
+    @property
+    def rejected(self) -> tuple[ProviderDecision, ...]:
+        return tuple(candidate for candidate in self.candidates if not candidate.supported)
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "operator_type": self.operator_type,
+            "spec_type": self.spec_type,
+            "spec": _thaw_snapshot(self.spec),
+            "device_caps": _thaw_snapshot(self.device_caps),
+            "selected_provider": self.selected_provider,
+            "selected_priority": self.selected_priority,
+            "selected_reason": self.selected_reason,
+            "candidates": [candidate.as_dict() for candidate in self.candidates],
+            "provider_metadata": _thaw_snapshot(self.provider_metadata),
+        }
+
+
+def operator_binding_reports() -> list[dict[str, object]]:
+    """Return stable, JSON-ready decisions for every live resolver binding."""
+
+    counts: dict[BindingReport, int] = {}
+    for report in _BINDING_REPORTS.values():
+        counts[report] = counts.get(report, 0) + 1
+    rows = []
+    for report, count in sorted(
+        counts.items(),
+        key=lambda item: (
+            item[0].operator_type,
+            item[0].selected_provider,
+            repr(item[0].spec),
+        ),
+    ):
+        row = report.as_dict()
+        row["bound_provider_count"] = count
+        rows.append(row)
+    return rows
+
+
+def operator_binding_report(provider: object) -> BindingReport | None:
+    """Return the immutable resolver decision associated with one provider."""
+
+    return _BINDING_REPORTS.get(provider)
 
 
 def operator_runtime_stats() -> dict[str, list[dict[str, object]]]:
@@ -102,6 +231,20 @@ def log_operator_implementations() -> None:
                 )
     if runtime_rows:
         logger.info("Operator runtime kernels:\n{}", "\n".join(runtime_rows))
+    binding_rows = []
+    for report in operator_binding_reports():
+        rejected = [
+            f"{candidate['provider']}: {candidate['reason']}"
+            for candidate in report["candidates"]
+            if not candidate["supported"]
+        ]
+        binding_rows.append(
+            f"  {report['operator_type']}: selected={report['selected_provider']} "
+            f"count={report['bound_provider_count']} "
+            f"rejected={rejected or 'none'}"
+        )
+    if binding_rows:
+        logger.info("Operator binding decisions:\n{}", "\n".join(binding_rows))
 
 
 def runtime_version_at_least(
@@ -162,6 +305,7 @@ class OpRegistry(Generic[SpecT, ProviderT]):
 class ResolvedProvider(Generic[ProviderT]):
     provider: ProviderT
     rejected: tuple[tuple[str, str], ...]
+    report: BindingReport
 
 
 class OpResolver(Generic[SpecT, ProviderT]):
@@ -174,12 +318,21 @@ class OpResolver(Generic[SpecT, ProviderT]):
         caps: DeviceCaps,
         **provider_kwargs,
     ) -> ResolvedProvider[ProviderT]:
-        supported: list[type[ProviderT]] = []
+        supported: list[tuple[type[ProviderT], SupportResult]] = []
         rejected: list[tuple[str, str]] = []
+        decisions: list[ProviderDecision] = []
         for provider in self.registry.providers:
             result = provider.supports(spec, caps)
+            decisions.append(
+                ProviderDecision(
+                    provider=str(provider.name),
+                    priority=int(provider.priority),
+                    supported=result.supported,
+                    reason=result.reason,
+                )
+            )
             if result.supported:
-                supported.append(provider)
+                supported.append((provider, result))
             else:
                 rejected.append((provider.name, result.reason))
         if not supported:
@@ -188,7 +341,32 @@ class OpResolver(Generic[SpecT, ProviderT]):
                 f"No {self.registry.family} provider supports spec={spec!r} on "
                 f"device={caps.device_name!r}: {details or 'no providers registered'}."
             )
-        supported.sort(key=lambda provider: (-int(provider.priority), provider.name))
-        selected = supported[0](**provider_kwargs)
-        record_operator_binding(self.registry.family, selected)
-        return ResolvedProvider(selected, tuple(rejected))
+        supported.sort(key=lambda item: (-int(item[0].priority), item[0].name))
+        selected_type, selected_support = supported[0]
+        bind_fn = getattr(selected_type, "bind", None)
+        if callable(bind_fn):
+            selected = bind_fn(spec, caps, **provider_kwargs)
+        else:
+            selected = selected_type(**provider_kwargs)
+        metadata_fn = getattr(selected, "binding_metadata", None)
+        metadata = metadata_fn() if callable(metadata_fn) else {}
+        if not isinstance(metadata, dict):
+            raise TypeError(
+                f"Provider {selected_type.name!r} binding_metadata() must return "
+                f"a dict, got {type(metadata).__name__}."
+            )
+        report = BindingReport(
+            operator_type=self.registry.family,
+            spec_type=type(spec).__name__,
+            spec=_freeze_snapshot(spec),
+            device_caps=_freeze_snapshot(caps),
+            selected_provider=str(selected_type.name),
+            selected_priority=int(selected_type.priority),
+            selected_reason=selected_support.reason,
+            candidates=tuple(
+                sorted(decisions, key=lambda decision: decision.provider)
+            ),
+            provider_metadata=_freeze_snapshot(metadata),
+        )
+        record_operator_binding(self.registry.family, selected, report=report)
+        return ResolvedProvider(selected, tuple(rejected), report)

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 import torch
 
+from sparsevllm.kernels.external.support import ExternalKernelContractError
 from sparsevllm.kernels.external.sgl.support import sgl_kernel_support
 
 _COMMON_FWD_ARGUMENTS = (
@@ -115,12 +116,17 @@ def sgl_fa3_support() -> tuple[bool, str]:
         op = _sgl_fa3_op()
         argument_names = tuple(argument.name for argument in op._schema.arguments)
     except Exception as error:
-        return False, (
-            "sglang-kernel FA3 raw op failed to load: "
-            f"{type(error).__name__}: {error}"
-        )
+        raise ExternalKernelContractError(
+            "sglang-kernel",
+            "FA3 raw op",
+            f"failed to load: {type(error).__name__}: {error}",
+        ) from error
     if argument_names != _FWD_ARGUMENTS:
-        return False, f"unsupported sglang-kernel FA3 fwd schema: {argument_names}"
+        raise ExternalKernelContractError(
+            "sglang-kernel",
+            "FA3 raw op",
+            f"unsupported fwd schema: {argument_names}",
+        )
     return True, reason
 
 
@@ -137,10 +143,11 @@ def sgl_fa3_device_support(device_index: int) -> tuple[bool, str]:
             is_fa3_supported(torch.device("cuda", int(device_index)))
         )
     except Exception as error:
-        return False, (
-            "sglang-kernel FA3 device probe failed: "
-            f"{type(error).__name__}: {error}"
-        )
+        raise ExternalKernelContractError(
+            "sglang-kernel",
+            "FA3 device probe",
+            f"failed: {type(error).__name__}: {error}",
+        ) from error
     if not device_supported:
         return False, (
             "sglang-kernel reports FA3 unsupported on "
@@ -455,6 +462,39 @@ class SglFa3DecodeKernel:
         if not result or result[0].data_ptr() != output.data_ptr():
             raise RuntimeError("sglang-kernel FA3 did not write to the supplied output")
         return output
+
+    def run_explicit(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        page_table: torch.Tensor,
+        request_indices: torch.Tensor,
+        context_lens: torch.Tensor,
+        output: torch.Tensor,
+        *,
+        validation_scope: object | None = None,
+    ) -> torch.Tensor:
+        """Run one-token decode over page-size-one explicit KV storage."""
+
+        batch_size = int(q.shape[0])
+        if batch_size > int(self._cu_seqlens_q.numel()) - 1:
+            raise ValueError(
+                "FA3 decode batch exceeds prepared capacity: "
+                f"batch={batch_size} capacity={int(self._cu_seqlens_q.numel()) - 1}."
+            )
+        return self.run_explicit_varlen(
+            q,
+            k_cache,
+            v_cache,
+            page_table,
+            request_indices,
+            context_lens,
+            output,
+            cu_seqlens_q=self._cu_seqlens_q[: batch_size + 1],
+            max_seqlen_q=1,
+            validation_scope=validation_scope,
+        )
 
     def run_contiguous_explicit_varlen(
         self,

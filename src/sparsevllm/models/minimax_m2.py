@@ -23,7 +23,9 @@ from sparsevllm.layers.rotary_embedding import (
 )
 from sparsevllm.models.qwen3 import Qwen3ModelBase
 from sparsevllm.models.attention_runtime import (
+    bind_mha_decode_attention_op,
     bind_mha_prefill_attention_op,
+    build_mha_decode_attention_op,
     build_mha_prefill_attention_op,
 )
 from sparsevllm.operators.moe import model_activation_dtype, resolve_moe_provider
@@ -33,6 +35,7 @@ from sparsevllm.operators.all_reduce import (
 )
 from sparsevllm.operators.decode_attention import (
     DecodeAttentionLaunchSpec,
+    PreparedDecodeAttentionOp,
     PreparedDecodeAttentionLaunchOp,
     prepare_decode_attention_launch_op,
 )
@@ -56,6 +59,7 @@ _EXPERT_TARGET_RE = re.compile(
 @dataclass
 class MiniMaxM2RuntimeConfig:
     prefill_attention_op: PreparedPrefillAttentionOp
+    decode_attention_op: PreparedDecodeAttentionOp
     decode_launch_op: PreparedDecodeAttentionLaunchOp
     attention_decode_all_reduce: PreparedAllReduceOp
     moe_decode_all_reduce: PreparedAllReduceOp
@@ -66,6 +70,7 @@ class MiniMaxM2RuntimeConfig:
         if self._closed:
             return
         self.prefill_attention_op.close()
+        self.decode_attention_op.close()
         seen: set[int] = set()
         for op in (
             self.attention_decode_all_reduce,
@@ -105,6 +110,14 @@ def build_minimax_m2_runtime_config(
         attention_tp_size=parallel_context.attention_tp_size,
         device=device,
     )
+    decode_attention_op = build_mha_decode_attention_op(
+        config,
+        sparse_method=sparse_method,
+        attention_tp_size=parallel_context.attention_tp_size,
+        device=device,
+        max_batch_size=max_decode_tokens,
+        cuda_graph=cuda_graph,
+    )
     decode_launch_op = prepare_decode_attention_launch_op(
         DecodeAttentionLaunchSpec(
             num_query_heads=num_query_heads,
@@ -136,6 +149,7 @@ def build_minimax_m2_runtime_config(
         )
     return MiniMaxM2RuntimeConfig(
         prefill_attention_op=prefill_attention_op,
+        decode_attention_op=decode_attention_op,
         decode_launch_op=decode_launch_op,
         attention_decode_all_reduce=attention_decode_all_reduce,
         moe_decode_all_reduce=moe_decode_all_reduce,
@@ -452,6 +466,10 @@ class MiniMaxM2ForCausalLM(nn.Module):
             bind_mha_prefill_attention_op(
                 self.model,
                 runtime_config.prefill_attention_op,
+            )
+            bind_mha_decode_attention_op(
+                self.model,
+                runtime_config.decode_attention_op,
             )
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         self._intentionally_skipped_expert_weights: set[str] = set()

@@ -24,6 +24,7 @@ from sparsevllm.operators.mla_attention import (
     MlaAttentionOpSpec,
     MlaSglFa3Provider,
     MlaTileLangScoreProvider,
+    MlaTritonProvider,
 )
 from sparsevllm.operators.registry import OpResolver
 from sparsevllm.platforms import DeviceCaps, PlatformEnum
@@ -40,6 +41,7 @@ def _spec(*, tp_size: int = 2) -> MlaAttentionOpSpec:
         cache_dtype=torch.bfloat16,
         tp_size=tp_size,
         cuda_graph=True,
+        may_require_attention_scores=True,
     )
 
 
@@ -258,7 +260,7 @@ def test_tilelang_provider_binds_rank_local_head_count(
     )
 
 
-def test_missing_tilelang_keeps_existing_sgl_provider() -> None:
+def test_missing_tilelang_binds_score_capable_triton_provider() -> None:
     workspace = _cpu_workspace()
     with (
         patch(
@@ -282,7 +284,11 @@ def test_missing_tilelang_keeps_existing_sgl_provider() -> None:
             device="cpu",
             max_batch_size=2,
         )
-    assert type(resolved.provider) is MlaSglFa3Provider
+    assert type(resolved.provider) is MlaTritonProvider
+    assert (
+        "sgl_fa3_sm90",
+        "does not satisfy the prepared score-output contract",
+    ) in resolved.rejected
     assert (
         "tilelang_score_sgl_fa3_h100",
         "tilelang missing",

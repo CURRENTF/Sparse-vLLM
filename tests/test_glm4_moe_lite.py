@@ -176,7 +176,20 @@ def test_glm_topology_reuses_one_mla_object_and_qwen_dense_mlp() -> None:
     assert model.model.layers[1].mlp.experts.op_spec.routing_method == "biased_sigmoid"
 
 
-def test_glm_runtime_kwargs_bind_model_owned_operators() -> None:
+@pytest.mark.parametrize(
+    ("sparse_method", "requires_scores"),
+    [
+        (None, False),
+        ("streamingllm", False),
+        ("rkv", False),
+        ("h2o", True),
+        ("omnikv", True),
+    ],
+)
+def test_glm_runtime_kwargs_bind_model_owned_operators(
+    sparse_method,
+    requires_scores,
+) -> None:
     config = _config()
     context = _tp_context(tp_size=2)
     runtime = SimpleNamespace(
@@ -186,6 +199,7 @@ def test_glm_runtime_kwargs_bind_model_owned_operators() -> None:
         mla_prefill_workspace_bytes=1024,
         mlp_chunk_size=16,
         tiny_random=False,
+        vllm_sparse_method=sparse_method,
     )
     mla = object()
     all_reduce = object()
@@ -220,6 +234,7 @@ def test_glm_runtime_kwargs_bind_model_owned_operators() -> None:
         prefill_workspace_bytes=1024,
         decode_cuda_graph=True,
         projection_chunk_size=16,
+        may_require_attention_scores=requires_scores,
     )
     build_all_reduce.assert_called_once_with(
         config,

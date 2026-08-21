@@ -36,11 +36,12 @@ FP16 Qwen3MoE checkpoints are limited to `TP=1`. When `TP=1`, the existing EP
 layout uses world size `E`.
 
 On H100 80GB, unquantized BF16 Qwen3-30B-A3B with EP1 uses the
-`sgl_triton_hybrid` MoE provider for TP1 and TP2. The provider runs the ported
-SGL fused-MoE kernel for profiled token buckets (64 tokens or more for both
-TP1 and TP2) and the generic Triton kernel below those
-thresholds. Other shapes and topologies keep their existing providers. Runtime
-operator statistics report the kernel used by each branch.
+`qwen3_bf16_dispatch_plan` for TP1 and TP2. During model preparation, the plan
+binds the atomic `sgl_derived_triton_bf16` and `triton` providers over fixed
+token ranges. The SGL-derived provider handles 64 tokens or more; the generic
+Triton provider handles smaller inputs. Other shapes and topologies keep their
+existing providers. Binding reports record the ranges and runtime operator
+statistics report the atomic kernel path used by each dispatch.
 
 Block FP8 support requires E4M3 weights, dynamic activation quantization, and
 a `128 x 128` weight block size. Qwen3.5, Qwen3.6, and Qwen3.8 dense

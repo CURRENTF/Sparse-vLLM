@@ -173,6 +173,10 @@ def load_and_validate_model(config) -> None:
         raw_quantization_config,
         required_fp8=model_spec.requires_fp8,
         model_name=model_spec.name,
+        activation_dtype=(
+            config_get(config.hf_config, "torch_dtype", None)
+            or config_get(config.outer_hf_config, "torch_dtype", "bfloat16")
+        ),
     )
     if config.tiny_random and config.quantization_config.enabled:
         raise NotImplementedError(

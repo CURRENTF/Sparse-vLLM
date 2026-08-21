@@ -639,6 +639,7 @@ class ModelRunner:
         try:
             local_stats = {
                 "world_rank": int(self.parallel_context.world_rank),
+                "bindings": operator_registry.operator_binding_reports(),
                 "operators": operator_registry.operator_runtime_stats(),
             }
         except BaseException as exc:

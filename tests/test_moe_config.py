@@ -369,7 +369,15 @@ def test_fp8_routed_unknown_shape_uses_explicit_default():
         device_capability=(9, 0),
     )
 
-    assert (config.block_n, config.block_k, config.swap_ab) == (128, 128, False)
+    assert (
+        config.block_m,
+        config.block_n,
+        config.block_k,
+        config.group_m,
+        config.num_warps,
+        config.num_stages,
+        config.swap_ab,
+    ) == (16, 64, 128, 1, 4, 4, True)
 
 
 @pytest.mark.parametrize(

@@ -14,10 +14,40 @@ class QuantizationConfig:
     activation_scheme: str = ""
     weight_block_size: tuple[int, int] | None = None
     model_name: str = "qwen3_5"
+    activation_dtype: str = "bfloat16"
 
     @classmethod
-    def disabled(cls, *, model_name: str = "qwen3_5") -> "QuantizationConfig":
-        return cls(model_name=model_name)
+    def disabled(
+        cls,
+        *,
+        model_name: str = "qwen3_5",
+        activation_dtype: Any = "bfloat16",
+    ) -> "QuantizationConfig":
+        return cls(
+            model_name=model_name,
+            activation_dtype=cls._normalize_activation_dtype(activation_dtype),
+        )
+
+    @staticmethod
+    def _normalize_activation_dtype(value: Any) -> str:
+        normalized = str(value or "bfloat16").strip().lower().removeprefix("torch.")
+        aliases = {
+            "bf16": "bfloat16",
+            "bfloat16": "bfloat16",
+            "fp16": "float16",
+            "half": "float16",
+            "float16": "float16",
+            "fp32": "float32",
+            "float": "float32",
+            "float32": "float32",
+        }
+        try:
+            return aliases[normalized]
+        except KeyError as error:
+            raise ValueError(
+                "Unsupported model activation dtype for quantization: "
+                f"{value!r}."
+            ) from error
 
     def to_dict(self) -> dict[str, Any]:
         if not self.enabled:
@@ -38,14 +68,21 @@ class QuantizationConfig:
         *,
         required_fp8: bool = False,
         model_name: str = "qwen3_5",
+        activation_dtype: Any = "bfloat16",
     ) -> "QuantizationConfig":
+        normalized_activation_dtype = cls._normalize_activation_dtype(
+            activation_dtype
+        )
         if value is None:
             if required_fp8:
                 raise ValueError(
                     f"{model_name} requires FP8 quantization_config; "
                     "BF16/FP16 fallback is not supported."
                 )
-            return cls.disabled(model_name=model_name)
+            return cls.disabled(
+                model_name=model_name,
+                activation_dtype=normalized_activation_dtype,
+            )
 
         quant_method = str(
             config_get(value, "quant_method", config_get(value, "method", ""))
@@ -62,7 +99,10 @@ class QuantizationConfig:
                     f"Sparse-vLLM does not support quant_method={quant_method!r} "
                     f"for {model_name}."
                 )
-            return cls.disabled(model_name=model_name)
+            return cls.disabled(
+                model_name=model_name,
+                activation_dtype=normalized_activation_dtype,
+            )
 
         weight_dtype = str(
             config_get(
@@ -121,4 +161,5 @@ class QuantizationConfig:
             activation_scheme="dynamic",
             weight_block_size=block_tuple,
             model_name=model_name,
+            activation_dtype=normalized_activation_dtype,
         )

@@ -11,15 +11,16 @@ from sparsevllm.kernels.external.support import (
     KernelFamilyState,
 )
 
-_MIN_VERSION = (0, 4, 5)
-_MAX_VERSION = (0, 4, 6)
-_DISTRIBUTION = "sglang-kernel"
+_MIN_VERSION = (0, 6, 15)
+_MAX_VERSION = (0, 7, 0)
+_DISTRIBUTION = "flashinfer-python"
 
 
-def sgl_kernel_health() -> KernelFamilyHealth:
-    """Inspect the required SGL binary family independently of any feature."""
+def flashinfer_kernel_health() -> KernelFamilyHealth:
+    """Inspect FlashInfer package metadata and its top-level import."""
+
     try:
-        package_spec = importlib.util.find_spec("sgl_kernel")
+        package_spec = importlib.util.find_spec("flashinfer")
     except (ImportError, ValueError) as error:
         return KernelFamilyHealth(
             _DISTRIBUTION,
@@ -50,32 +51,32 @@ def sgl_kernel_health() -> KernelFamilyHealth:
             _DISTRIBUTION,
             KernelFamilyState.BROKEN,
             version,
-            f"requires {_DISTRIBUTION}>=0.4.5,<0.4.6, got {version}",
+            f"requires {_DISTRIBUTION}>=0.6.15,<0.7, got {version}",
         )
     try:
-        importlib.import_module("sgl_kernel")
+        importlib.import_module("flashinfer")
     except Exception as error:
         return KernelFamilyHealth(
             _DISTRIBUTION,
             KernelFamilyState.BROKEN,
             version,
-            f"binary failed to load: {type(error).__name__}: {error}",
+            f"package failed to load: {type(error).__name__}: {error}",
         )
     return KernelFamilyHealth(
         _DISTRIBUTION,
         KernelFamilyState.READY,
         version,
-        f"{_DISTRIBUTION} {version} binary family is ready",
+        f"{_DISTRIBUTION} {version} package family is ready",
     )
 
 
-def sgl_kernel_support(feature: str) -> tuple[bool, str]:
-    """Require a healthy SGL binary family before checking a feature contract."""
+def flashinfer_kernel_support(feature: str) -> tuple[bool, str]:
+    """Require a healthy FlashInfer family before probing one feature."""
 
-    health = sgl_kernel_health()
+    health = flashinfer_kernel_health()
     if not health.ready:
         raise ExternalKernelFamilyError(health, feature=feature)
     return True, f"{_DISTRIBUTION} {health.version} {feature} is available"
 
 
-__all__ = ["sgl_kernel_health", "sgl_kernel_support"]
+__all__ = ["flashinfer_kernel_health", "flashinfer_kernel_support"]

@@ -66,6 +66,12 @@ sparsevllm-openai-client = "sparsevllm.entrypoints.openai.client:main"
 where = ["src"]
 include = ["sparsevllm*"]
 
+[tool.setuptools.package-data]
+sparsevllm = [
+    "kernels/triton/profiles/*.json",
+    "operators/profiles/*.json",
+]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 

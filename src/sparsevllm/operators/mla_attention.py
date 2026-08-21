@@ -65,6 +65,7 @@ class MlaAttentionOpSpec:
     cache_dtype: torch.dtype
     tp_size: int
     cuda_graph: bool
+    may_require_attention_scores: bool = False
 
     def __post_init__(self) -> None:
         dimensions = {
@@ -97,7 +98,11 @@ class MlaAttentionOpSpec:
         return AttentionKernelRequest(
             activation_dtype=self.activation_dtype,
             head_dim=self.qk_head_dim,
-            score_output=None,
+            score_output=(
+                AttentionScoreKind.RAW_QK_REDUCED
+                if self.may_require_attention_scores
+                else AttentionScoreKind.NONE
+            ),
             layer_varying_page_table=True,
             varlen=True,
             cuda_graph=self.cuda_graph,
@@ -187,6 +192,13 @@ class MlaTritonProvider(MlaAttentionProvider):
         ] | None = None
         self._runtime_kernel_path_counts: dict[str, dict[str, int]] = {}
         self._runtime_fallback_reasons: dict[str, int] = {}
+
+    def binding_metadata(self) -> dict[str, object]:
+        return {
+            "implementation_kind": "atomic_provider",
+            "implementation_source": "repo_triton",
+            "decode_kernel_path": "triton_mla_stage1_stage2",
+        }
 
     def _record_runtime_kernel_path(self, path: str) -> None:
         counts = getattr(self, "_runtime_kernel_path_counts", None)
@@ -508,8 +520,20 @@ class MlaSglFa3Provider(MlaTritonProvider):
         base = MlaTritonProvider.supports(spec, caps)
         if not base.supported:
             return base
+        if spec.may_require_attention_scores:
+            return SupportResult.no(
+                "does not satisfy the prepared score-output contract"
+            )
         supported, reason = sgl_fa3_device_support(caps.device_index)
         return SupportResult.yes(reason) if supported else SupportResult.no(reason)
+
+    def binding_metadata(self) -> dict[str, object]:
+        return {
+            "implementation_kind": "atomic_provider",
+            "implementation_source": "sglang-kernel",
+            "prefill_kernel_path": "sgl_kernel.fa3.fwd",
+            "decode_kernel_path": "sgl_kernel.fa3.fwd",
+        }
 
     @torch.no_grad()
     def run(
@@ -523,13 +547,9 @@ class MlaSglFa3Provider(MlaTritonProvider):
         valid_batch_size: int | None = None,
     ) -> torch.Tensor:
         if view.meta.attn_score is not None:
-            return super().run(
-                q_nope_absorbed,
-                q_rope,
-                view,
-                output,
-                validation_scope=validation_scope,
-                valid_batch_size=valid_batch_size,
+            raise RuntimeError(
+                "SGL FA3 MLA was bound for a score-free operation, but the "
+                "runtime view requested attention scores."
             )
         payload = self._validate_run_inputs(
             q_nope_absorbed,
@@ -692,7 +712,7 @@ class MlaSglFa3Provider(MlaTritonProvider):
 
 @MLA_ATTENTION_REGISTRY.register
 class MlaTileLangScoreProvider(MlaSglFa3Provider):
-    """FA3 output path plus fused TileLang output-and-score for GLM MLA."""
+    """Explicit score-aware Composite over FA3, TileLang, and Triton."""
 
     name = "tilelang_score_sgl_fa3_h100"
     priority = 300
@@ -723,15 +743,33 @@ class MlaTileLangScoreProvider(MlaSglFa3Provider):
         spec: MlaAttentionOpSpec,
         caps: DeviceCaps,
     ) -> SupportResult:
-        base = MlaSglFa3Provider.supports(spec, caps)
+        base = MlaTritonProvider.supports(spec, caps)
         if not base.supported:
             return base
         if caps.device_name != _VALIDATED_H100_NAME:
             return SupportResult.no(
                 "requires H100-validated TileLang MLA schedules"
             )
+        if not spec.may_require_attention_scores:
+            return SupportResult.no(
+                "score-capable Composite is not required by this operation"
+            )
+        supported, reason = sgl_fa3_device_support(caps.device_index)
+        if not supported:
+            return SupportResult.no(reason)
         supported, reason = tilelang_mla_support()
         return SupportResult.yes(reason) if supported else SupportResult.no(reason)
+
+    def binding_metadata(self) -> dict[str, object]:
+        return {
+            "implementation_kind": "composite_provider",
+            "implementation_source": "sglang-kernel+tilelang+repo_triton",
+            "routes": {
+                "score_free": "sgl_kernel.fa3.fwd",
+                "reduced_score": "tilelang_mla_decode",
+                "unsupported_score_contract": "triton_mla_stage1_stage2",
+            },
+        }
 
     @staticmethod
     def _tilelang_score_shape_supported(

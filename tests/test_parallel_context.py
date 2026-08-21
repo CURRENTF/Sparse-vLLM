@@ -364,6 +364,7 @@ def test_qwen3_dense_fp8_config_validation(tmp_path):
         config = Config(model=str(tmp_path), tensor_parallel_size=8)
     assert config.quantization_config.enabled
     assert config.quantization_config.model_name == "Qwen3"
+    assert config.quantization_config.activation_dtype == "bfloat16"
 
     hf_config.intermediate_size = 12160
     with patch(

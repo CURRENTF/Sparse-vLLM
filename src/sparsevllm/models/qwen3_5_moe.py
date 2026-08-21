@@ -18,6 +18,14 @@ from sparsevllm.models.qwen3_5 import (
     Qwen35MLP,
     Qwen35Model,
 )
+from sparsevllm.models.attention_runtime import (
+    bind_mha_decode_attention_op,
+    bind_mha_prefill_attention_op,
+)
+from sparsevllm.models.gdn_runtime import bind_gated_delta_rule_op
+from sparsevllm.operators.decode_attention import PreparedDecodeAttentionOp
+from sparsevllm.operators.gated_delta_rule import PreparedGatedDeltaRuleOp
+from sparsevllm.operators.prefill_attention import PreparedPrefillAttentionOp
 from sparsevllm.models.qwen3_moe import Qwen3MoePackedExperts
 from sparsevllm.operators.gated_shared_add import gated_shared_add
 from sparsevllm.operators.moe import model_activation_dtype
@@ -310,11 +318,33 @@ class Qwen35MoeForCausalLM(Qwen35ForCausalLM):
         ".expert_weight": "load_expert_weight",
     }
 
-    def __init__(self, config) -> None:
+    @staticmethod
+    def build_runtime_kwargs(config, **runtime_kwargs) -> dict:
+        # Qwen3.5/3.6 MoE checkpoints use FP32 live recurrent state. Resolve
+        # the GDN provider against that contract before model construction.
+        setattr(config, "runtime_recurrent_state_dtype", torch.float32)
+        return Qwen35ForCausalLM.build_runtime_kwargs(config, **runtime_kwargs)
+
+    def __init__(
+        self,
+        config,
+        prefill_attention_op: PreparedPrefillAttentionOp | None = None,
+        decode_attention_op: PreparedDecodeAttentionOp | None = None,
+        gated_delta_rule_op: PreparedGatedDeltaRuleOp | None = None,
+    ) -> None:
         nn.Module.__init__(self)
         self.config = config
         self.parallel_context = get_parallel_context()
+        self.prefill_attention_op = prefill_attention_op
+        self.decode_attention_op = decode_attention_op
+        self.gated_delta_rule_op = gated_delta_rule_op
         self.model = Qwen35MoeModel(config)
+        if prefill_attention_op is not None:
+            bind_mha_prefill_attention_op(self.model, prefill_attention_op)
+        if decode_attention_op is not None:
+            bind_mha_decode_attention_op(self.model, decode_attention_op)
+        if gated_delta_rule_op is not None:
+            bind_gated_delta_rule_op(self.model, gated_delta_rule_op)
         self.lm_head = ParallelLMHead(
             int(config.vocab_size), int(config.hidden_size)
         )
@@ -325,6 +355,12 @@ class Qwen35MoeForCausalLM(Qwen35ForCausalLM):
         self._intentionally_skipped_weights: set[str] = set()
         self._intentionally_skipped_expert_weights: set[str] = set()
         self._intentionally_skipped_expert_scales: set[str] = set()
+        logger.info(
+            "Loaded Qwen3.5 MoE prefill_provider={} decode_provider={} gdn_provider={}",
+            "legacy_triton" if prefill_attention_op is None else prefill_attention_op.name,
+            "legacy_triton" if decode_attention_op is None else decode_attention_op.name,
+            "unbound" if gated_delta_rule_op is None else gated_delta_rule_op.name,
+        )
 
     @staticmethod
     def recurrent_state_spec(config, attention_tp_size: int) -> RecurrentStateSpec:

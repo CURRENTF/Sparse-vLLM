@@ -8,13 +8,23 @@ import torch
 import torch.nn.functional as F
 
 from sparsevllm.kernels.external.sgl.moe import (
+    _FP8_GROUP_QUANT_ARGUMENTS,
+    _sgl_fp8_group_quant_op,
+    sgl_fp8_group_quantization_support,
     sgl_moe_align_block_size,
     sgl_moe_alignment_support,
+)
+from sparsevllm.kernels.external.support import (
+    ExternalKernelContractError,
+    ExternalKernelFamilyError,
+    KernelFamilyState,
 )
 from sparsevllm.kernels.triton.moe import fused_moe, moe_align_block_size
 from sparsevllm.kernels.triton.sgl_fused_moe import (
     resolve_sgl_moe_config,
     sgl_fused_moe,
+    sgl_moe_profile_metadata,
+    sgl_moe_profile_support,
 )
 from sparsevllm.operators.moe import _sgl_moe_align_block_size
 
@@ -72,8 +82,13 @@ def test_sgl_qwen3_tp2_config_matches_upstream_profile(num_tokens, expected):
         num_tokens=num_tokens,
         top_k=8,
         num_local_experts=128,
+        hidden_size=2048,
         intermediate_size=384,
+        activation_dtype=torch.bfloat16,
+        weight_dtype=torch.bfloat16,
+        ep_size=1,
         device_name="NVIDIA H100 80GB HBM3",
+        device_capability=(9, 0),
     )
 
     assert tuple(config.values()) == expected
@@ -84,8 +99,53 @@ def test_sgl_moe_config_has_generic_shape_fallback():
         num_tokens=3,
         top_k=2,
         num_local_experts=64,
+        hidden_size=2048,
         intermediate_size=352,
+        activation_dtype=torch.bfloat16,
+        weight_dtype=torch.bfloat16,
+        ep_size=1,
         device_name="NVIDIA H100 80GB HBM3",
+        device_capability=(9, 0),
+    ) == {
+        "BLOCK_SIZE_M": 16,
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 32,
+        "GROUP_SIZE_M": 8,
+        "num_warps": 4,
+        "num_stages": 4,
+    }
+
+
+def test_sgl_moe_profile_records_upstream_provenance() -> None:
+    metadata = sgl_moe_profile_metadata()
+
+    assert metadata["profile_id"] == "sgl_h100_qwen3_bf16_24d6256_v1"
+    assert metadata["profile_status"] == "tuned"
+    assert metadata["kernel"] == "sgl_fused_moe_triton_v1"
+    assert metadata["profile_source"]["source_revision"] == (
+        "24d625698d44c78f6e8ab8b7c19f96f45bbaa90a"
+    )
+
+
+def test_sgl_moe_profile_rejects_unmatched_triton(monkeypatch) -> None:
+    monkeypatch.setattr("triton.__version__", "4.0.0")
+
+    assert sgl_moe_profile_support() == (
+        False,
+        "profile sgl_h100_qwen3_bf16_24d6256_v1 requires Triton >=3.5,<4, "
+        "got 4.0.0",
+    )
+    assert resolve_sgl_moe_config(
+        num_tokens=1,
+        top_k=8,
+        num_local_experts=128,
+        hidden_size=2048,
+        intermediate_size=384,
+        activation_dtype=torch.bfloat16,
+        weight_dtype=torch.bfloat16,
+        ep_size=1,
+        device_name="NVIDIA H100 80GB HBM3",
+        device_capability=(9, 0),
     ) == {
         "BLOCK_SIZE_M": 16,
         "BLOCK_SIZE_N": 128,
@@ -290,10 +350,11 @@ def test_sgl_fused_moe_matches_qwen3_tp2_shape(num_tokens) -> None:
 
 def test_sgl_moe_support_rejects_missing_package() -> None:
     with patch("importlib.util.find_spec", return_value=None):
-        assert sgl_moe_alignment_support() == (
-            False,
-            "sglang-kernel is not installed",
-        )
+        with pytest.raises(ExternalKernelFamilyError) as exc_info:
+            sgl_moe_alignment_support()
+
+    assert exc_info.value.health.state is KernelFamilyState.ABSENT
+    assert "sglang-kernel is not installed" in str(exc_info.value)
 
 
 @pytest.mark.parametrize("version", ["0.4.4", "0.4.6"])
@@ -302,10 +363,11 @@ def test_sgl_moe_support_rejects_outside_declared_range(version: str) -> None:
         patch("importlib.util.find_spec", return_value=object()),
         patch("importlib.metadata.version", return_value=version),
     ):
-        supported, reason = sgl_moe_alignment_support()
+        with pytest.raises(ExternalKernelFamilyError) as exc_info:
+            sgl_moe_alignment_support()
 
-    assert not supported
-    assert "sglang-kernel>=0.4.5,<0.4.6" in reason
+    assert exc_info.value.health.state is KernelFamilyState.BROKEN
+    assert "sglang-kernel>=0.4.5,<0.4.6" in str(exc_info.value)
 
 
 def test_sgl_moe_support_accepts_declared_range() -> None:
@@ -328,10 +390,60 @@ def test_sgl_moe_support_rejects_missing_alignment_api() -> None:
         patch("importlib.metadata.version", return_value="0.4.5"),
         patch("importlib.import_module", return_value=SimpleNamespace()),
     ):
-        supported, reason = sgl_moe_alignment_support()
+        with pytest.raises(ExternalKernelContractError) as exc_info:
+            sgl_moe_alignment_support()
 
-    assert not supported
-    assert "moe_align_block_size" in reason
+    assert "moe_align_block_size" in str(exc_info.value)
+
+
+def test_sgl_fp8_group_quantization_accepts_pinned_contract() -> None:
+    def quantize(
+        input,
+        output_q,
+        output_s,
+        group_size,
+        eps,
+        fp8_min,
+        fp8_max,
+        scale_ue8m0,
+        fuse_silu_and_mul,
+        masked_m,
+        enable_v2,
+    ):
+        pass
+
+    module = SimpleNamespace(sgl_per_token_group_quant_8bit=quantize)
+    _sgl_fp8_group_quant_op.cache_clear()
+    try:
+        with (
+            patch(
+                "sparsevllm.kernels.external.sgl.moe.sgl_kernel_support",
+                return_value=(True, "available"),
+            ),
+            patch("importlib.import_module", return_value=module),
+        ):
+            assert sgl_fp8_group_quantization_support() == (True, "available")
+    finally:
+        _sgl_fp8_group_quant_op.cache_clear()
+
+
+def test_sgl_fp8_group_quantization_rejects_schema_drift() -> None:
+    module = SimpleNamespace(
+        sgl_per_token_group_quant_8bit=lambda input, output_q: None
+    )
+    _sgl_fp8_group_quant_op.cache_clear()
+    try:
+        with (
+            patch(
+                "sparsevllm.kernels.external.sgl.moe.sgl_kernel_support",
+                return_value=(True, "available"),
+            ),
+            patch("importlib.import_module", return_value=module),
+        ):
+            with pytest.raises(ExternalKernelContractError, match="unsupported schema"):
+                sgl_fp8_group_quantization_support()
+    finally:
+        _sgl_fp8_group_quant_op.cache_clear()
 
 
 @pytest.mark.skipif(

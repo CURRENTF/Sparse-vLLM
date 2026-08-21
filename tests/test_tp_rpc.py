@@ -155,9 +155,10 @@ def test_operator_runtime_stats_gather_one_record_per_world_rank():
 
     def gather(output, local, *, group):
         assert group == "world"
-        output[:] = [local, {"world_rank": 1, "operators": {}}]
+        output[:] = [local, {"world_rank": 1, "bindings": [], "operators": {}}]
 
     with (
+        patch.object(operator_registry, "operator_binding_reports", return_value=[]),
         patch.object(operator_registry, "operator_runtime_stats", return_value={"MLA": []}),
         patch.object(dist, "all_gather_object", side_effect=gather),
     ):
@@ -165,8 +166,8 @@ def test_operator_runtime_stats_gather_one_record_per_world_rank():
 
     assert sync_calls == [("operator_runtime_stats", None)]
     assert stats == [
-        {"world_rank": 0, "operators": {"MLA": []}},
-        {"world_rank": 1, "operators": {}},
+        {"world_rank": 0, "bindings": [], "operators": {"MLA": []}},
+        {"world_rank": 1, "bindings": [], "operators": {}},
     ]
 
 

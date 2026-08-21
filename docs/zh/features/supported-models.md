@@ -29,10 +29,11 @@ BF16；FP16 Qwen3MoE checkpoint 仅支持 `TP=1`。当 `TP=1` 时，原有 EP
 布局的 world size 为 `E`。
 
 在 H100 80GB 上，未量化 BF16 Qwen3-30B-A3B 的 EP1 TP1/TP2 默认选择
-`sgl_triton_hybrid` MoE provider。经过 profile 的大 token bucket 使用移植的
-SGL fused-MoE kernel（TP1/TP2 均为 64 token 及以上）；
-较小 bucket 继续使用通用 Triton kernel。其他 shape 和 topology 保持原有
-provider。operator runtime statistics 会分别记录各分支实际执行的 kernel。
+`qwen3_bf16_dispatch_plan`。该计划在模型准备阶段将 atomic
+`sgl_derived_triton_bf16` 与 `triton` provider 绑定到固定 token 区间：
+前者处理 64 token 及以上，后者处理更小输入。其他 shape 和 topology
+保持原有 provider。binding report 会记录区间，operator runtime statistics
+会记录每次 dispatch 实际执行的 atomic kernel path。
 
 块级 FP8 要求使用 E4M3 权重、动态激活量化以及 `128 x 128` 的权重块大小。
 Qwen3.5、Qwen3.6 和 Qwen3.8 Dense checkpoint 共享 `qwen3_5` 运行时架构，

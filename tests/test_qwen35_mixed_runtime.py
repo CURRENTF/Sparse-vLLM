@@ -1381,26 +1381,6 @@ def test_qwen35_rmsnorm_supports_strided_qkv_views(dtype):
     )
 
 
-def test_qwen35_linear_attention_repeats_qk_to_value_heads():
-    from sparsevllm.models.qwen3_5 import Qwen35LinearAttention
-
-    attn = object.__new__(Qwen35LinearAttention)
-    attn.num_k_heads = 2
-    attn.num_v_heads = 6
-    q = torch.arange(1 * 4 * 2 * 3, dtype=torch.float32).reshape(1, 4, 2, 3)
-    k = q + 100
-
-    q_rep, k_rep = attn._repeat_qk_for_value_heads(q, k)
-
-    assert q_rep.shape == (1, 4, 6, 3)
-    assert k_rep.shape == (1, 4, 6, 3)
-    assert torch.equal(q_rep[:, :, 0], q[:, :, 0])
-    assert torch.equal(q_rep[:, :, 1], q[:, :, 0])
-    assert torch.equal(q_rep[:, :, 2], q[:, :, 0])
-    assert torch.equal(q_rep[:, :, 3], q[:, :, 1])
-    assert torch.equal(k_rep[:, :, 5], k[:, :, 1])
-
-
 def test_qwen35_decode_state_padding_preserves_real_rows_for_static_batch():
     from sparsevllm.models.qwen3_5 import Qwen35LinearAttention
 

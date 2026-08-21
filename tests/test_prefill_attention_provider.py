@@ -16,6 +16,14 @@ from sparsevllm.engine.cache_manager.base import (
     ExplicitKVPayload,
     PrefillComputeView,
 )
+from sparsevllm.kernels.external.support import (
+    ExternalKernelFamilyError,
+    KernelFamilyHealth,
+    KernelFamilyState,
+)
+from sparsevllm.kernels.triton.context_flashattention_nopad import (
+    select_context_attention_launch_config,
+)
 from sparsevllm.layers.attention import Attention
 from sparsevllm.method_registry import (
     PrefillScoreCollectionKind,
@@ -23,6 +31,7 @@ from sparsevllm.method_registry import (
 )
 from sparsevllm.operators.prefill_attention import (
     PREFILL_ATTENTION_REGISTRY,
+    FlashInferFa2Sm120PagedPrefillAttentionProvider,
     FlashInferPagedPrefillAttentionProvider,
     PreparedPrefillAttentionOp,
     PrefillAttentionOpSpec,
@@ -68,6 +77,38 @@ def _h100_caps(**overrides) -> DeviceCaps:
     return DeviceCaps(**values)
 
 
+def _sm120_caps(**overrides) -> DeviceCaps:
+    values = {
+        "device_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+        "compute_capability": (12, 0),
+    }
+    values.update(overrides)
+    return _h100_caps(**values)
+
+
+@pytest.fixture(autouse=True)
+def _mock_flashinfer_paged_prefill_contract():
+    with patch(
+        "sparsevllm.operators.prefill_attention.flashinfer_paged_prefill_support",
+        return_value=(True, "flashinfer prefill available"),
+    ):
+        yield
+
+
+def test_head_dim_256_prefill_launch_uses_sm120_resource_safe_tile():
+    assert select_context_attention_launch_config(
+        256,
+        max_shared_memory=101_376,
+    ) == (64, 64, 8, 1)
+
+
+def test_head_dim_256_prefill_launch_keeps_h100_tile():
+    assert select_context_attention_launch_config(
+        256,
+        max_shared_memory=227_328,
+    ) == (128, 128, 8, 1)
+
+
 @pytest.mark.parametrize(
     ("method", "main_score", "collection"),
     [
@@ -90,21 +131,37 @@ def test_sparse_prefill_contract_separates_main_and_posthoc_scores(
 
 
 @patch(
-    "sparsevllm.operators.prefill_attention.version",
-    return_value="0.6.15",
-)
-@patch("sparsevllm.operators.prefill_attention.find_spec", return_value=object())
-@patch(
     "sparsevllm.operators.prefill_attention.sgl_fa3_device_support",
     return_value=(False, "sglang-kernel is not installed"),
 )
 def test_resolver_prefers_flashinfer_for_profiled_minimax_shape(
-    _sgl, _find, _version
+    _sgl,
 ):
     resolved = OpResolver(PREFILL_ATTENTION_REGISTRY).resolve(
         _spec(), _h100_caps()
     )
     assert resolved.provider.name == "flashinfer_paged_prefill_fa3_sm90"
+
+
+def test_resolver_selects_profiled_flashinfer_fa2_on_sm120():
+    resolved = OpResolver(PREFILL_ATTENTION_REGISTRY).resolve(
+        _spec(
+            num_query_heads=24,
+            num_kv_heads=4,
+            head_dim=256,
+            softmax_scale=256**-0.5,
+        ),
+        _sm120_caps(),
+    )
+
+    assert resolved.provider.name == "flashinfer_paged_prefill_fa2_sm120"
+    assert resolved.report.as_dict()["provider_metadata"] == {
+        "implementation_kind": "atomic_provider",
+        "source": "flashinfer-python",
+        "backend": "fa2",
+        "kv_layout": "NHD",
+        "page_size": 1,
+    }
 
 
 @patch(
@@ -188,28 +245,91 @@ def test_flashinfer_provider_rejects_unsupported_contracts(spec, caps, reason):
     assert reason in result.reason
 
 
+@pytest.mark.parametrize(
+    ("spec", "caps", "reason"),
+    [
+        (
+            _spec(num_query_heads=24, num_kv_heads=4),
+            _sm120_caps(),
+            "head_dim",
+        ),
+        (
+            _spec(
+                num_query_heads=24,
+                num_kv_heads=4,
+                head_dim=256,
+                softmax_scale=256**-0.5,
+                activation_dtype=torch.float16,
+            ),
+            _sm120_caps(),
+            "activation dtype",
+        ),
+        (
+            _spec(
+                num_query_heads=24,
+                num_kv_heads=4,
+                head_dim=256,
+                softmax_scale=256**-0.5,
+                score_output=AttentionScoreKind.RAW_QK_REDUCED,
+            ),
+            _sm120_caps(),
+            "RAW_QK_REDUCED",
+        ),
+        (
+            _spec(
+                num_query_heads=24,
+                num_kv_heads=4,
+                head_dim=256,
+                softmax_scale=256**-0.5,
+                layer_varying_page_table=True,
+            ),
+            _sm120_caps(),
+            "layer-varying",
+        ),
+        (
+            _spec(
+                num_query_heads=24,
+                num_kv_heads=4,
+                head_dim=256,
+                softmax_scale=256**-0.5,
+            ),
+            _sm120_caps(device_name="NVIDIA GeForce RTX 5090"),
+            "profiled NVIDIA RTX PRO 6000",
+        ),
+    ],
+)
+def test_flashinfer_fa2_sm120_rejects_unprofiled_contracts(spec, caps, reason):
+    result = FlashInferFa2Sm120PagedPrefillAttentionProvider.supports(spec, caps)
+
+    assert not result.supported
+    assert reason in result.reason
+
+
 @patch(
     "sparsevllm.kernels.tilelang.gqa.runtime.tilelang_gqa_device_support",
     return_value=(False, "tilelang is not installed"),
 )
 @patch(
-    "sparsevllm.operators.prefill_attention.version",
-    return_value="0.6.14",
-)
-@patch("sparsevllm.operators.prefill_attention.find_spec", return_value=object())
-@patch(
     "sparsevllm.operators.prefill_attention.sgl_fa3_device_support",
     return_value=(False, "sglang-kernel is not installed"),
 )
-def test_resolver_falls_back_when_flashinfer_is_too_old(_sgl, _find, _version, _tl):
-    resolved = OpResolver(PREFILL_ATTENTION_REGISTRY).resolve(
-        _spec(), _h100_caps()
+def test_resolver_does_not_hide_broken_flashinfer_family(_sgl, _tl):
+    health = KernelFamilyHealth(
+        family="flashinfer-python",
+        state=KernelFamilyState.BROKEN,
+        version="0.6.14",
+        reason="requires flashinfer-python>=0.6.15,<0.7",
     )
-    assert resolved.provider.name == "triton_paged_prefill"
-    assert (
-        "flashinfer_paged_prefill_fa3_sm90",
-        "requires flashinfer-python >= 0.6.15, got 0.6.14",
-    ) in resolved.rejected
+    with (
+        patch(
+            "sparsevllm.operators.prefill_attention.flashinfer_paged_prefill_support",
+            side_effect=ExternalKernelFamilyError(health, feature="FA3 paged prefill"),
+        ),
+        pytest.raises(ExternalKernelFamilyError, match="0.6.15"),
+    ):
+        OpResolver(PREFILL_ATTENTION_REGISTRY).resolve(
+            _spec(), _h100_caps()
+        )
 
 
 @patch(
@@ -347,6 +467,19 @@ def test_sgl_accepts_sm90_without_exact_device_name_and_cuda_12_3(_support):
     assert result.supported
 
 
+@patch(
+    "sparsevllm.operators.prefill_attention.sgl_fa3_device_support",
+    return_value=(True, "available"),
+)
+def test_sgl_accepts_h100_head_dim_256_after_real_kernel_validation(_support):
+    result = SglFa3PagedPrefillAttentionProvider.supports(
+        _spec(num_query_heads=16, num_kv_heads=2, head_dim=256),
+        _h100_caps(),
+    )
+
+    assert result.supported
+
+
 def test_resolver_falls_back_to_triton_on_non_sm90():
     resolved = OpResolver(PREFILL_ATTENTION_REGISTRY).resolve(
         _spec(num_query_heads=32, num_kv_heads=4),
@@ -406,12 +539,7 @@ def test_triton_provider_rejects_unimplemented_attention_semantics(spec, reason)
     assert reason in result.reason
 
 
-@patch(
-    "sparsevllm.operators.prefill_attention.version",
-    return_value="0.6.15",
-)
-@patch("sparsevllm.operators.prefill_attention.find_spec", return_value=object())
-def test_resolver_rejects_page_sizes_without_a_valid_kernel(_find, _version):
+def test_resolver_rejects_page_sizes_without_a_valid_kernel():
     with pytest.raises(RuntimeError, match="No paged prefill attention provider"):
         OpResolver(PREFILL_ATTENTION_REGISTRY).resolve(
             _spec(page_size=16),
@@ -453,6 +581,26 @@ def test_prepared_prefill_close_releases_provider_state():
     assert state_ref() is None
     with pytest.raises(RuntimeError, match="closed"):
         op.run(None, None)
+
+
+def test_flashinfer_fa2_sm120_prepare_binds_fa2_backend():
+    provider = FlashInferFa2Sm120PagedPrefillAttentionProvider()
+    spec = _spec(
+        num_query_heads=24,
+        num_kv_heads=4,
+        head_dim=256,
+        softmax_scale=256**-0.5,
+    )
+
+    with (
+        patch("torch.cuda.current_device", return_value=0),
+        patch(
+            "sparsevllm.operators.prefill_attention._FlashInferPagedPrefillState"
+        ) as state,
+    ):
+        provider.prepare(spec, device_index=0)
+
+    state.assert_called_once_with(torch.device("cuda", 0), backend="fa2")
 
 
 def test_flashinfer_prefill_passes_kv_cache_as_page_views_without_copying():
@@ -607,12 +755,13 @@ def _torch_prefill_oracle(q, logical_k, logical_v, q_lens, kv_lens):
     for q_len, kv_len, k, v in zip(q_lens, kv_lens, logical_k, logical_v):
         q_seq = q[q_cursor : q_cursor + q_len].transpose(0, 1).float()
         q_cursor += q_len
-        k = k.transpose(0, 1).float().repeat_interleave(6, dim=0)
-        v = v.transpose(0, 1).float().repeat_interleave(6, dim=0)
+        query_groups = q.shape[1] // k.shape[1]
+        k = k.transpose(0, 1).float().repeat_interleave(query_groups, dim=0)
+        v = v.transpose(0, 1).float().repeat_interleave(query_groups, dim=0)
         q_positions = kv_len - q_len + torch.arange(q_len, device=q.device)
         k_positions = torch.arange(kv_len, device=q.device)
         allowed = k_positions.unsqueeze(0) <= q_positions.unsqueeze(1)
-        scores = torch.matmul(q_seq, k.transpose(-1, -2)) * (128**-0.5)
+        scores = torch.matmul(q_seq, k.transpose(-1, -2)) * (q.shape[2] ** -0.5)
         scores.masked_fill_(~allowed.unsqueeze(0), -torch.inf)
         output = torch.matmul(torch.softmax(scores, dim=-1), v)
         outputs.append(output.transpose(0, 1).to(torch.bfloat16))
@@ -659,6 +808,53 @@ def test_flashinfer_page_size_one_matches_noncontiguous_torch_oracle():
     expected = _torch_prefill_oracle(
         q, logical_k, logical_v, q_lens, kv_lens
     )
+    torch.testing.assert_close(actual, expected, rtol=0.03, atol=0.03)
+    provider.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_flashinfer_fa2_sm120_matches_noncontiguous_torch_oracle():
+    if torch.cuda.get_device_capability() != (12, 0):
+        pytest.skip("The specialized provider requires SM120.")
+    pytest.importorskip("flashinfer")
+    torch.manual_seed(20260822)
+    q_lens = [3, 2]
+    kv_lens = [5, 6]
+    q = torch.randn(5, 24, 256, device="cuda", dtype=torch.bfloat16)
+    k_cache = torch.randn(23, 4, 256, device="cuda", dtype=torch.bfloat16)
+    v_cache = torch.randn_like(k_cache)
+    pages = torch.randperm(23, device="cuda")[:11]
+    rows = torch.zeros(2, 6, device="cuda", dtype=torch.int32)
+    rows[0, :5] = pages[:5].to(torch.int32)
+    rows[1, :6] = pages[5:].to(torch.int32)
+    logical_k = [k_cache[pages[:5]], k_cache[pages[5:]]]
+    logical_v = [v_cache[pages[:5]], v_cache[pages[5:]]]
+    view = SimpleNamespace(
+        k_cache=k_cache,
+        v_cache=v_cache,
+        active_slots=rows,
+        req_indices=torch.tensor([0, 1], device="cuda", dtype=torch.int32),
+        context_lens=torch.tensor(kv_lens, device="cuda", dtype=torch.int32),
+        attn_score=None,
+    )
+    provider = FlashInferFa2Sm120PagedPrefillAttentionProvider()
+    spec = _spec(
+        num_query_heads=24,
+        num_kv_heads=4,
+        head_dim=256,
+        softmax_scale=256**-0.5,
+    )
+    provider.prepare(spec)
+    actual = provider.run(
+        spec,
+        q,
+        view,
+        qo_indptr=torch.tensor([0, 3, 5], device="cuda", dtype=torch.int32),
+        chunk_lens=torch.tensor(q_lens, device="cuda", dtype=torch.int32),
+        max_context_len=6,
+        layer_idx=0,
+    )
+    expected = _torch_prefill_oracle(q, logical_k, logical_v, q_lens, kv_lens)
     torch.testing.assert_close(actual, expected, rtol=0.03, atol=0.03)
     provider.close()
 

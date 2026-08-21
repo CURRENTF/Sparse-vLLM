@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import torch
+
 from sparsevllm.operators.fp8_linear import resolve_fp8_linear_provider
 
 
@@ -20,8 +22,24 @@ class QuantizationRegistry:
         quant_method = str(getattr(quantization, "quant_method", "") or "").strip().lower()
         if quant_method != "fp8":
             raise ValueError(f"Unsupported quantized Linear method={quant_method!r}.")
+        activation_dtype_name = str(
+            getattr(quantization, "activation_dtype", "bfloat16") or ""
+        ).strip().lower()
+        activation_dtypes = {
+            "bfloat16": torch.bfloat16,
+            "float16": torch.float16,
+            "float32": torch.float32,
+        }
+        try:
+            activation_dtype = activation_dtypes[activation_dtype_name]
+        except KeyError as error:
+            raise ValueError(
+                "Unsupported quantized Linear activation dtype="
+                f"{activation_dtype_name!r}."
+            ) from error
         return resolve_fp8_linear_provider(
             tuple(quantization.weight_block_size),
             input_features=input_features,
             output_features=output_features,
+            activation_dtype=activation_dtype,
         )

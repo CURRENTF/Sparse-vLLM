@@ -6,6 +6,11 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from sparsevllm.kernels.external.support import (
+    ExternalKernelContractError,
+    ExternalKernelFamilyError,
+    KernelFamilyState,
+)
 from sparsevllm.kernels.external.sgl.fa3 import (
     _FWD_ARGUMENTS,
     SglFa3DecodeKernel,
@@ -16,7 +21,11 @@ from sparsevllm.kernels.external.sgl.fa3 import (
 
 def test_sgl_fa3_support_rejects_missing_package() -> None:
     with patch("importlib.util.find_spec", return_value=None):
-        assert sgl_fa3_support() == (False, "sglang-kernel is not installed")
+        with pytest.raises(ExternalKernelFamilyError) as exc_info:
+            sgl_fa3_support()
+
+    assert exc_info.value.health.state is KernelFamilyState.ABSENT
+    assert "sglang-kernel is not installed" in str(exc_info.value)
 
 
 @pytest.mark.parametrize("version", ["0.4.4", "0.4.6"])
@@ -25,10 +34,11 @@ def test_sgl_fa3_support_rejects_outside_declared_range(version: str) -> None:
         patch("importlib.util.find_spec", return_value=object()),
         patch("importlib.metadata.version", return_value=version),
     ):
-        supported, reason = sgl_fa3_support()
+        with pytest.raises(ExternalKernelFamilyError) as exc_info:
+            sgl_fa3_support()
 
-    assert not supported
-    assert "sglang-kernel>=0.4.5,<0.4.6" in reason
+    assert exc_info.value.health.state is KernelFamilyState.BROKEN
+    assert "sglang-kernel>=0.4.5,<0.4.6" in str(exc_info.value)
 
 
 def test_sgl_fa3_support_accepts_declared_range() -> None:
@@ -65,10 +75,11 @@ def test_sgl_fa3_support_rejects_binary_load_failure() -> None:
             side_effect=ImportError("undefined symbol: c10_cuda_check"),
         ),
     ):
-        supported, reason = sgl_fa3_support()
+        with pytest.raises(ExternalKernelFamilyError) as exc_info:
+            sgl_fa3_support()
 
-    assert not supported
-    assert "undefined symbol" in reason
+    assert exc_info.value.health.state is KernelFamilyState.BROKEN
+    assert "undefined symbol" in str(exc_info.value)
 
 
 def test_sgl_fa3_support_rejects_missing_op_schema() -> None:
@@ -82,18 +93,19 @@ def test_sgl_fa3_support_rejects_missing_op_schema() -> None:
             return_value=object(),
         ),
     ):
-        supported, reason = sgl_fa3_support()
+        with pytest.raises(ExternalKernelContractError) as exc_info:
+            sgl_fa3_support()
 
-    assert not supported
-    assert "failed to load" in reason
+    assert "failed to load" in str(exc_info.value)
 
 
 def test_sgl_fa3_device_support_keeps_package_probe_and_device_probe_separate() -> None:
     with patch(
         "sparsevllm.kernels.external.sgl.fa3.sgl_fa3_support",
-        return_value=(False, "ABI mismatch"),
+        side_effect=RuntimeError("ABI mismatch"),
     ):
-        assert sgl_fa3_device_support(3) == (False, "ABI mismatch")
+        with pytest.raises(RuntimeError, match="ABI mismatch"):
+            sgl_fa3_device_support(3)
 
 
 @pytest.mark.skipif(

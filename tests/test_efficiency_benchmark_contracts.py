@@ -71,6 +71,41 @@ def test_model_specs_require_real_architecture_fields():
         ModelArchitectureSpecs.from_config_dict({"hidden_size": 2048})
 
 
+def test_model_specs_accept_nested_explicit_non_factorized_head_dim():
+    specs = ModelArchitectureSpecs.from_config_dict(
+        {
+            "model_type": "qwen3_5",
+            "text_config": {
+                "hidden_size": 5120,
+                "num_hidden_layers": 64,
+                "num_attention_heads": 24,
+                "num_key_value_heads": 4,
+                "head_dim": 256,
+                "vocab_size": 248320,
+                "intermediate_size": 17408,
+            },
+        }
+    )
+
+    assert specs.hidden_size == 5120
+    assert specs.num_attention_heads == 24
+    assert specs.num_key_value_heads == 4
+    assert specs.head_dim == 256
+
+
+def test_model_specs_require_factorized_head_dim_when_not_explicit():
+    with pytest.raises(ValueError, match="without an explicit head_dim"):
+        ModelArchitectureSpecs.from_config_dict(
+            {
+                "hidden_size": 5120,
+                "num_hidden_layers": 64,
+                "num_attention_heads": 24,
+                "vocab_size": 248320,
+                "intermediate_size": 17408,
+            }
+        )
+
+
 def test_probe_writes_metric_failed_when_model_discovery_fails(tmp_path, monkeypatch):
     model_dir = tmp_path / "model"
     model_dir.mkdir()

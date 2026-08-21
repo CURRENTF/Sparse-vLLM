@@ -2,7 +2,12 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from sparsevllm.operators.fp8_linear import resolve_fp8_linear_provider
+from sparsevllm.operators.fp8_linear import (
+    FlashInferGroupwiseSm120Fp8LinearProvider,
+    Fp8LinearSpec,
+    resolve_fp8_linear_provider,
+)
+from sparsevllm.platforms import current_platform
 from sparsevllm.quantization.fp8 import fp8_blockwise_linear_reference
 from sparsevllm.kernels.triton.fp8_blockwise import fp8_blockwise_matmul
 from sparsevllm.kernels.triton.moe import fused_moe_fp8
@@ -91,6 +96,119 @@ def test_resolved_fp8_linear_provider_matches_reference():
     )
 
     torch.testing.assert_close(actual, expected, rtol=2.0e-2, atol=2.0e-1)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() != (12, 0),
+    reason="profiled FP8 Linear dispatch requires SM120",
+)
+def test_resolver_binds_profiled_sm120_fp8_linear_dispatch_plan():
+    torch.manual_seed(20260821)
+    device = torch.device("cuda")
+    weight = _fp8_weight((5120, 2048), device)
+    scales = torch.rand(40, 16, device=device) + 0.25
+    provider = resolve_fp8_linear_provider(
+        (128, 128),
+        input_features=2048,
+        output_features=5120,
+    )
+
+    assert provider.name == "sm120_fp8_linear_dispatch_plan"
+    assert provider._route(511).provider.name == "triton"
+    assert provider._route(512).provider.name == "flashinfer_groupwise_sm120"
+
+    for tokens in (1, 512):
+        inputs = torch.randn(
+            tokens,
+            2048,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        actual = provider(inputs, weight, scales)
+        expected = fp8_blockwise_linear_reference(inputs, weight, scales)
+        _assert_fp8_pipeline_close(actual, expected)
+
+    assert provider.runtime_kernel_stats()["kernel_paths"] == {
+        "flashinfer_groupwise_sm120": {
+            "cuda_graph_capture_dispatches": 0,
+            "eager_dispatches": 1,
+        },
+        "triton": {
+            "cuda_graph_capture_dispatches": 0,
+            "eager_dispatches": 1,
+        },
+    }
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() != (12, 0),
+    reason="FlashInfer groupwise FP8 Linear requires SM120",
+)
+def test_flashinfer_sm120_fp8_linear_cuda_graph_replay():
+    torch.manual_seed(20260821)
+    device = torch.device("cuda")
+    inputs = torch.randn(3, 384, device=device, dtype=torch.bfloat16)
+    weight = _fp8_weight((256, 384), device)
+    scales = torch.rand(2, 3, device=device) + 0.25
+    spec = Fp8LinearSpec(
+        block_shape=(128, 128),
+        input_features=int(weight.shape[1]),
+        output_features=int(weight.shape[0]),
+    )
+    caps = current_platform.get_device_caps(torch.cuda.current_device())
+    assert FlashInferGroupwiseSm120Fp8LinearProvider.supports(
+        spec, caps
+    ).supported
+    provider = FlashInferGroupwiseSm120Fp8LinearProvider.bind(
+        spec,
+        caps,
+    )
+    assert provider.name == "flashinfer_groupwise_sm120"
+
+    provider(inputs, weight, scales)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = provider(inputs, weight, scales)
+    inputs.copy_(torch.randn_like(inputs))
+    graph.replay()
+    torch.cuda.synchronize()
+
+    expected = fp8_blockwise_linear_reference(inputs, weight, scales)
+    _assert_fp8_pipeline_close(actual, expected)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() != (9, 0),
+    reason="FlashInfer block-scale FP8 Linear requires SM90",
+)
+def test_resolved_sm90_fp8_linear_cuda_graph_replay():
+    torch.manual_seed(20260822)
+    device = torch.device("cuda")
+    inputs = torch.randn(3, 384, device=device, dtype=torch.bfloat16)
+    weight = _fp8_weight((256, 384), device)
+    scales = torch.rand(2, 3, device=device) + 0.25
+    provider = resolve_fp8_linear_provider(
+        (128, 128),
+        input_features=int(weight.shape[1]),
+        output_features=int(weight.shape[0]),
+    )
+
+    assert provider.name == "flashinfer_sm90"
+    provider(inputs, weight, scales)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = provider(inputs, weight, scales)
+    inputs.copy_(torch.randn_like(inputs))
+    graph.replay()
+    torch.cuda.synchronize()
+
+    expected = fp8_blockwise_linear_reference(inputs, weight, scales)
+    _assert_fp8_pipeline_close(actual, expected)
 
 
 def test_resolver_uses_triton_for_non_sm90_aligned_shape():

@@ -15,7 +15,10 @@ providers.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
+from functools import lru_cache
+from importlib.resources import files
 
 import torch
 import triton
@@ -153,83 +156,128 @@ def _config(
     }
 
 
-def _table(
-    rows: tuple[tuple[int, tuple[int, int, int, int, int, int]], ...],
-) -> dict[int, dict[str, int]]:
-    return {tokens: _config(*values) for tokens, values in rows}
+_PROFILE_RESOURCE = "profiles/sgl_h100_qwen3_bf16.json"
+_PROFILE_CONFIG_KEYS = (
+    "BLOCK_SIZE_M",
+    "BLOCK_SIZE_N",
+    "BLOCK_SIZE_K",
+    "GROUP_SIZE_M",
+    "num_warps",
+    "num_stages",
+)
 
 
-# These are the upstream H100 BF16/FP16 profiles for Qwen3-MoE's TP1/TP2/TP4
-# expert widths. SGLang falls back to the same table across Triton versions
-# when an exact-version profile is unavailable.
-_SGL_H100_QWEN3_CONFIGS = {
-    192: _table(
-        (
-            (1, (16, 64, 64, 1, 4, 5)),
-            (2, (16, 64, 64, 64, 4, 5)),
-            (4, (16, 64, 64, 32, 4, 5)),
-            (8, (16, 128, 64, 16, 4, 5)),
-            (16, (16, 128, 64, 1, 8, 3)),
-            (24, (16, 128, 64, 1, 8, 3)),
-            (32, (16, 128, 128, 16, 4, 3)),
-            (48, (16, 128, 64, 64, 4, 4)),
-            (64, (16, 64, 64, 32, 4, 3)),
-            (96, (16, 128, 128, 16, 4, 2)),
-            (128, (16, 128, 128, 32, 4, 3)),
-            (256, (32, 128, 128, 32, 4, 2)),
-            (512, (64, 128, 64, 16, 4, 3)),
-            (1024, (64, 128, 64, 32, 4, 3)),
-            (1536, (128, 256, 64, 16, 8, 4)),
-            (2048, (128, 256, 64, 16, 8, 4)),
-            (3072, (128, 128, 64, 16, 8, 3)),
-            (4096, (128, 128, 64, 16, 4, 3)),
+@lru_cache(maxsize=1)
+def _load_sgl_h100_qwen3_profile() -> tuple[
+    dict[str, object],
+    dict[int, dict[int, dict[str, int]]],
+]:
+    resource = files("sparsevllm.kernels.triton").joinpath(_PROFILE_RESOURCE)
+    try:
+        payload = json.loads(resource.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(
+            f"Failed to load SGL MoE profile {_PROFILE_RESOURCE}: {error}"
+        ) from error
+    if not isinstance(payload, dict):
+        raise RuntimeError("SGL MoE profile root must be a mapping.")
+    if payload.get("schema_version") != 1:
+        raise RuntimeError(
+            "Unsupported SGL MoE profile schema: "
+            f"{payload.get('schema_version')!r}."
         )
-    ),
-    384: _table(
-        (
-            (1, (16, 64, 64, 1, 4, 5)),
-            (2, (16, 64, 64, 1, 4, 5)),
-            (4, (16, 64, 128, 1, 4, 2)),
-            (8, (16, 64, 128, 64, 4, 3)),
-            (16, (16, 32, 128, 64, 4, 2)),
-            (24, (16, 128, 128, 16, 8, 3)),
-            (32, (16, 128, 128, 16, 8, 5)),
-            (48, (16, 128, 128, 16, 4, 3)),
-            (64, (16, 128, 128, 64, 8, 2)),
-            (96, (16, 128, 128, 16, 4, 2)),
-            (128, (16, 128, 128, 16, 4, 2)),
-            (256, (32, 128, 128, 32, 4, 2)),
-            (512, (64, 64, 64, 16, 4, 3)),
-            (1024, (64, 128, 64, 32, 4, 3)),
-            (1536, (128, 128, 64, 16, 8, 3)),
-            (2048, (128, 256, 64, 16, 8, 4)),
-            (3072, (128, 256, 64, 32, 8, 4)),
-            (4096, (128, 256, 64, 16, 8, 4)),
+    contract = payload.get("contract")
+    provenance = payload.get("provenance")
+    raw_tables = payload.get("tables")
+    if not isinstance(contract, dict) or not isinstance(provenance, dict):
+        raise RuntimeError("SGL MoE profile is missing contract or provenance.")
+    expected_contract = {
+        "device_name": "NVIDIA H100 80GB HBM3",
+        "compute_capability": [9, 0],
+        "activation_dtype": "bfloat16",
+        "weight_dtype": "bfloat16",
+        "num_local_experts": 128,
+        "hidden_size": 2048,
+        "top_k": 8,
+        "ep_size": 1,
+        "weight_layout_id": "packed_gate_up_v1",
+        "stages": ["w13", "w2"],
+        "tp_size_by_intermediate_size": {"768": 1, "384": 2, "192": 4},
+    }
+    mismatches = {
+        key: (contract.get(key), expected)
+        for key, expected in expected_contract.items()
+        if contract.get(key) != expected
+    }
+    if mismatches:
+        raise RuntimeError(f"SGL MoE profile contract mismatch: {mismatches}.")
+    if not isinstance(payload.get("profile_id"), str) or not isinstance(
+        payload.get("kernel"), str
+    ):
+        raise RuntimeError("SGL MoE profile must identify its profile and kernel.")
+    if payload.get("toolchain") != {"triton": ">=3.5,<4"}:
+        raise RuntimeError(
+            f"Unsupported SGL MoE profile toolchain: {payload.get('toolchain')!r}."
         )
-    ),
-    768: _table(
-        (
-            (1, (16, 64, 128, 1, 4, 3)),
-            (2, (16, 64, 64, 1, 4, 3)),
-            (4, (16, 64, 64, 64, 4, 5)),
-            (8, (16, 128, 128, 1, 8, 5)),
-            (16, (16, 128, 128, 1, 8, 5)),
-            (24, (16, 64, 256, 16, 4, 3)),
-            (32, (16, 128, 256, 1, 8, 3)),
-            (48, (16, 128, 256, 1, 8, 3)),
-            (64, (16, 256, 128, 1, 8, 3)),
-            (96, (16, 128, 128, 1, 4, 2)),
-            (128, (16, 128, 128, 16, 4, 2)),
-            (256, (32, 256, 128, 1, 4, 2)),
-            (512, (64, 128, 128, 1, 4, 2)),
-            (1024, (64, 128, 64, 1, 4, 3)),
-            (1536, (128, 256, 64, 1, 8, 4)),
-            (2048, (128, 256, 64, 1, 8, 4)),
-            (3072, (128, 256, 64, 1, 8, 4)),
-            (4096, (128, 256, 64, 1, 8, 4)),
+    if not isinstance(raw_tables, dict):
+        raise RuntimeError("SGL MoE profile tables must be a mapping.")
+    tables: dict[int, dict[int, dict[str, int]]] = {}
+    for intermediate_size, rows in raw_tables.items():
+        if not isinstance(rows, list) or not rows:
+            raise RuntimeError(
+                f"SGL MoE profile table {intermediate_size!r} is empty."
+            )
+        table: dict[int, dict[str, int]] = {}
+        for row in rows:
+            if not isinstance(row, list) or len(row) != 7:
+                raise RuntimeError(
+                    f"Invalid SGL MoE profile row for {intermediate_size}: {row!r}."
+                )
+            tokens, *values = (int(value) for value in row)
+            if tokens <= 0 or tokens in table or any(value <= 0 for value in values):
+                raise RuntimeError(
+                    f"Invalid SGL MoE profile values for {intermediate_size}: {row!r}."
+                )
+            table[tokens] = dict(zip(_PROFILE_CONFIG_KEYS, values))
+        parsed_intermediate_size = int(intermediate_size)
+        if parsed_intermediate_size in tables:
+            raise RuntimeError(
+                f"Duplicate SGL MoE intermediate size {parsed_intermediate_size}."
+            )
+        tables[parsed_intermediate_size] = table
+    return payload, tables
+
+
+def sgl_moe_profile_support() -> tuple[bool, str]:
+    payload, _ = _load_sgl_h100_qwen3_profile()
+    raw_version = str(triton.__version__).split("+", 1)[0]
+    try:
+        major, minor = (int(part) for part in raw_version.split(".")[:2])
+    except (TypeError, ValueError):
+        return False, f"cannot parse Triton version {triton.__version__!r}"
+    if major != 3 or minor < 5:
+        return (
+            False,
+            f"profile {payload['profile_id']} requires Triton >=3.5,<4, "
+            f"got {triton.__version__}",
         )
-    ),
-}
+    return True, f"profile {payload['profile_id']} matches Triton {triton.__version__}"
+
+
+def sgl_moe_profile_metadata() -> dict[str, object]:
+    payload, _ = _load_sgl_h100_qwen3_profile()
+    provenance = payload["provenance"]
+    return {
+        "profile_id": payload["profile_id"],
+        "profile_status": "tuned",
+        "profile_source": {
+            "kind": provenance["kind"],
+            "source_repository": provenance["source_repository"],
+            "source_revision": provenance["source_revision"],
+            "source_paths": list(provenance["source_paths"]),
+        },
+        "kernel": payload["kernel"],
+    }
 
 
 def resolve_sgl_moe_config(
@@ -237,17 +285,35 @@ def resolve_sgl_moe_config(
     num_tokens: int,
     top_k: int,
     num_local_experts: int,
+    hidden_size: int,
     intermediate_size: int,
+    activation_dtype: torch.dtype,
+    weight_dtype: torch.dtype,
+    ep_size: int,
     device_name: str,
+    device_capability: tuple[int, int],
 ) -> dict[str, int]:
     """Resolve an offline SGL profile or its generic unquantized heuristic."""
 
     num_tokens = int(num_tokens)
     if num_tokens <= 0:
         raise ValueError(f"num_tokens must be positive, got {num_tokens}.")
+    payload, tables = _load_sgl_h100_qwen3_profile()
+    contract = payload["contract"]
+    profile_supported, _ = sgl_moe_profile_support()
     table = None
-    if device_name == "NVIDIA H100 80GB HBM3" and num_local_experts == 128:
-        table = _SGL_H100_QWEN3_CONFIGS.get(int(intermediate_size))
+    if (
+        profile_supported
+        and device_name == contract["device_name"]
+        and tuple(device_capability) == tuple(contract["compute_capability"])
+        and activation_dtype == torch.bfloat16
+        and weight_dtype == torch.bfloat16
+        and int(ep_size) == int(contract["ep_size"])
+        and int(top_k) == int(contract["top_k"])
+        and int(num_local_experts) == int(contract["num_local_experts"])
+        and int(hidden_size) == int(contract["hidden_size"])
+    ):
+        table = tables.get(int(intermediate_size))
     if table:
         bucket = min(table, key=lambda value: abs(value - num_tokens))
         return dict(table[bucket])
@@ -335,8 +401,13 @@ def sgl_fused_moe(
         num_tokens=num_tokens,
         top_k=top_k,
         num_local_experts=num_local_experts,
+        hidden_size=hidden_size,
         intermediate_size=intermediate_size,
+        activation_dtype=hidden_states.dtype,
+        weight_dtype=w13_weight.dtype,
+        ep_size=num_experts // num_local_experts,
         device_name=torch.cuda.get_device_name(hidden_states.device),
+        device_capability=torch.cuda.get_device_capability(hidden_states.device),
     )
     alignment = alignment_impl(
         topk_ids,
@@ -386,4 +457,9 @@ def sgl_fused_moe(
     )
 
 
-__all__ = ["resolve_sgl_moe_config", "sgl_fused_moe"]
+__all__ = [
+    "resolve_sgl_moe_config",
+    "sgl_fused_moe",
+    "sgl_moe_profile_metadata",
+    "sgl_moe_profile_support",
+]

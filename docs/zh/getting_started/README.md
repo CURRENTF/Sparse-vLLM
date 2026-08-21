@@ -37,8 +37,11 @@ CUDA 12.9 环境将 `cu130` 换成 `cu129`。
 Sparse-vLLM 当前支持未量化 BF16 和 block-scaled FP8 格式的
 Qwen3.5/Qwen3.6/Qwen3.8 checkpoint。三者共享 `qwen3_5` 运行时架构和支持矩阵。
 
-其 prefill causal Conv1D 和 decode Conv1D/GDN packing path 使用仓库本地
-Triton kernel，本身不调用 `sglang-kernel`。
+其 causal Conv1D 与 decode packing path 仍使用仓库自有 Triton kernel。
+GDN core 在模型准备阶段只解析一次：经验证的 H100 环境若安装
+`flashinfer-python>=0.6.17`，会绑定 FlashInfer prefill 与仓库本地 fused
+Triton decode；其他受支持契约绑定本地 Triton 实现。项目保留更低的依赖
+版本下限是合法的，因为 FlashInfer GDN Provider 会在执行前拒绝旧版本。
 
 `flashinfer-cubin` 是可选加速 package：
 
@@ -46,7 +49,17 @@ Triton kernel，本身不调用 `sglang-kernel`。
 pip install flashinfer-cubin --index-url https://flashinfer.ai/whl
 ```
 
-Block-scaled FP8 Linear 会根据当前 CUDA device capability，从本地 operator registry 选择实现。SM90 使用优化后的 FlashInfer 实现；其他支持原生 FP8 的 CUDA device 使用通用 Triton 实现。warmup 期间不会下载 Hub kernel。
+Block-scaled FP8 Linear 会根据当前 CUDA device capability，从本地 operator
+registry 选择实现。SM90 上匹配 BF16 block-scale 契约的算子使用 FlashInfer
+实现，其他受支持的 SM90 契约使用通用 Triton；RTX PRO 6000 上任何模型只要
+FP8 Linear 的 shape 与语义契约命中 profile，都会绑定同一个模型无关
+dispatch plan：`M < 512` 使用 Triton，`M >= 512` 使用由 SGL
+per-token-group activation quantization 与
+FlashInfer 公开 `gemm_fp8_nt_groupwise` CUTLASS kernel 组成的 atomic
+Provider。未 profile 的 SM120 shape 与其他支持原生 FP8 的 CUDA device 使用
+通用 Triton。binding report 会记录 profile 和两条 route；warmup 期间不会下载
+Hub kernel。当前 profile 的测量 workload 是 Qwen3-30B TP1，但模型名只属于
+provenance，不参与选择。
 
 ## DeltaKV Checkpoint
 

@@ -1015,7 +1015,9 @@ def _routed_fp8_gemm(
 
 
 def _quantize_fp8_group128(inputs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    from sgl_kernel.gemm import sgl_per_token_group_quant_8bit
+    from sparsevllm.kernels.external.sgl.moe import (
+        sgl_per_token_group_quant_8bit,
+    )
 
     output_columns = int(inputs.shape[-1])
     quantized = torch.empty_like(inputs, dtype=torch.float8_e4m3fn)

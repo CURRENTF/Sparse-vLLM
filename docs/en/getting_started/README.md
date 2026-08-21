@@ -41,8 +41,12 @@ Sparse-vLLM supports Qwen3.5/Qwen3.6/Qwen3.8 checkpoints in unquantized BF16
 and block-scaled FP8 formats. All three share the `qwen3_5` runtime architecture
 and support matrix.
 
-Its prefill causal Conv1D and decode Conv1D/GDN packing paths use local Triton
-kernels and do not call `sglang-kernel` themselves.
+Its causal Conv1D and decode packing paths remain repo-owned Triton kernels.
+The GDN core is resolved once during model preparation: validated H100 runs
+with `flashinfer-python>=0.6.17` bind FlashInfer prefill plus the repo fused
+Triton decode kernel, while other supported contracts bind the repo Triton
+implementation. The lower project dependency floor remains legal because the
+FlashInfer GDN Provider rejects older package versions before execution.
 
 `flashinfer-cubin` is an optional acceleration package:
 
@@ -51,9 +55,17 @@ pip install flashinfer-cubin --index-url https://flashinfer.ai/whl
 ```
 
 Block-scaled FP8 Linear selects an implementation from the local operator
-registry using the active CUDA device capabilities. SM90 uses the optimized
-FlashInfer implementation; other supported native-FP8 CUDA devices use the
-generic Triton implementation. No Hub kernel is downloaded during warmup.
+registry using the active CUDA device capabilities. An SM90 operation matching
+the BF16 block-scale contract uses the optimized FlashInfer implementation;
+other supported SM90 contracts use generic Triton. Any model whose FP8 Linear
+operation matches a profiled shape and contract on the RTX PRO 6000 binds the
+same model-independent dispatch plan: `M < 512` uses Triton, while `M >= 512`
+uses an atomic provider composed of SGL per-token-group activation quantization
+and FlashInfer's public `gemm_fp8_nt_groupwise` CUTLASS kernel. Unprofiled SM120
+shapes and other supported native-FP8 CUDA devices use generic Triton. The
+binding report records the profile and both routes. No Hub kernel is downloaded
+during warmup. The current profile was measured with Qwen3-30B TP1 shapes, but
+the model name is provenance rather than a selection key.
 
 ## DeltaKV Checkpoints
 

@@ -1,3 +1,5 @@
+import json
+import weakref
 from dataclasses import dataclass
 from unittest.mock import patch
 
@@ -9,6 +11,8 @@ from sparsevllm.operators.registry import (
     OpResolver,
     SupportResult,
     log_operator_implementations,
+    operator_binding_report,
+    operator_binding_reports,
     operator_runtime_stats,
     record_operator_binding,
 )
@@ -51,11 +55,59 @@ def test_resolver_uses_deterministic_supported_priority():
         def supports(cls, spec, caps):
             return SupportResult.yes() if spec.enabled else SupportResult.no("disabled")
 
-    with patch.dict(operator_registry._OPERATOR_BINDINGS, {}, clear=True):
+    with (
+        patch.dict(operator_registry._OPERATOR_BINDINGS, {}, clear=True),
+        patch.object(
+            operator_registry,
+            "_BINDING_REPORTS",
+            weakref.WeakKeyDictionary(),
+        ),
+    ):
         resolved = OpResolver(registry).resolve(_Spec(), _caps())
         assert resolved.provider in operator_registry._OPERATOR_BINDINGS["_test"]
+        assert operator_binding_report(resolved.provider) is resolved.report
+        reports = operator_binding_reports()
 
     assert resolved.provider.name == "specialized"
+    assert resolved.report.as_dict() == {
+        "operator_type": "_test",
+        "spec_type": "_Spec",
+        "spec": {"enabled": True},
+        "device_caps": {
+            "platform": "CUDA",
+            "device_type": "cuda",
+            "device_index": 0,
+            "device_name": "test",
+            "compute_capability": [9, 0],
+            "runtime_version": None,
+            "supports_graph_capture": False,
+            "supports_torch_compile": False,
+            "supports_triton": False,
+            "supports_pin_memory": False,
+            "supports_bfloat16": False,
+            "supports_native_fp8": False,
+        },
+        "selected_provider": "specialized",
+        "selected_priority": 20,
+        "selected_reason": "supported",
+        "candidates": [
+            {
+                "provider": "portable",
+                "priority": 10,
+                "supported": True,
+                "reason": "supported",
+            },
+            {
+                "provider": "specialized",
+                "priority": 20,
+                "supported": True,
+                "reason": "supported",
+            },
+        ],
+        "provider_metadata": {},
+    }
+    assert reports == [{**resolved.report.as_dict(), "bound_provider_count": 1}]
+    json.dumps(reports)
 
 
 def test_resolver_reports_every_rejection():
@@ -243,12 +295,72 @@ def test_resolver_forwards_provider_constructor_arguments():
         def __init__(self, marker):
             self.marker = marker
 
+        def binding_metadata(self):
+            return {
+                "empty_mapping": {},
+                "empty_sequence": [],
+                "layout_id": "test_layout",
+                "profile": {"status": "generic"},
+            }
+
         @classmethod
         def supports(cls, spec, caps):
             return SupportResult.yes()
 
     resolved = OpResolver(registry).resolve(_Spec(), _caps(), marker="ready")
 
+    assert resolved.provider.marker == "ready"
+    assert resolved.report.as_dict()["provider_metadata"] == {
+        "empty_mapping": {},
+        "empty_sequence": [],
+        "layout_id": "test_layout",
+        "profile": {"status": "generic"},
+    }
+
+
+def test_resolver_rejects_invalid_binding_metadata() -> None:
+    registry = OpRegistry("_test")
+
+    @registry.register
+    class Invalid:
+        name = "invalid"
+        priority = 1
+
+        @classmethod
+        def supports(cls, spec, caps):
+            return SupportResult.yes()
+
+        def binding_metadata(self):
+            return "not structured"
+
+    with pytest.raises(TypeError, match="binding_metadata.*dict"):
+        OpResolver(registry).resolve(_Spec(), _caps())
+
+
+def test_resolver_uses_provider_bind_hook_for_prepared_plans() -> None:
+    registry = OpRegistry("_test")
+
+    @registry.register
+    class Prepared:
+        name = "prepared"
+        priority = 1
+
+        def __init__(self, spec, marker):
+            self.spec = spec
+            self.marker = marker
+
+        @classmethod
+        def supports(cls, spec, caps):
+            return SupportResult.yes()
+
+        @classmethod
+        def bind(cls, spec, caps, *, marker):
+            assert caps.device_name == "test"
+            return cls(spec, marker)
+
+    resolved = OpResolver(registry).resolve(_Spec(), _caps(), marker="ready")
+
+    assert resolved.provider.spec == _Spec()
     assert resolved.provider.marker == "ready"
 
 

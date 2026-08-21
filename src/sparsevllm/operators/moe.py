@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from importlib.util import find_spec
 
 import torch
 
@@ -86,6 +85,16 @@ class MoeProvider:
     name = ""
     priority = 0
     gate_up_order = "gate_up"
+
+    @property
+    def weight_layout_id(self) -> str:
+        return f"packed_{self.gate_up_order}_v1"
+
+    def binding_metadata(self) -> dict[str, object]:
+        return {
+            "implementation_kind": "atomic_provider",
+            "weight_layout_id": self.weight_layout_id,
+        }
 
     def _packed_projection_offset(
         self,
@@ -179,6 +188,150 @@ class MoeProvider:
         ep_rank: int,
     ) -> torch.Tensor:
         raise NotImplementedError
+
+
+@dataclass(frozen=True, slots=True)
+class MoeDispatchRoute:
+    min_tokens: int
+    max_tokens: int | None
+    provider: MoeProvider
+    kernel_path: str
+
+    def matches(self, num_tokens: int) -> bool:
+        return num_tokens >= self.min_tokens and (
+            self.max_tokens is None or num_tokens <= self.max_tokens
+        )
+
+
+class MoeDispatchPlan(MoeProvider):
+    """Prepared token-range dispatch over layout-compatible atomic providers."""
+
+    def __init__(self, spec: MoeOpSpec) -> None:
+        self.spec = spec
+        self.routes = tuple(self._build_routes(spec))
+        self._validate_routes()
+        self._runtime_kernel_path_counts: dict[str, dict[str, int]] = {}
+
+    @classmethod
+    def bind(cls, spec: MoeOpSpec, caps: DeviceCaps, **kwargs) -> MoeDispatchPlan:
+        del caps
+        if kwargs:
+            raise TypeError(
+                f"{cls.name} does not accept provider arguments: {sorted(kwargs)}"
+            )
+        return cls(spec)
+
+    def _build_routes(self, spec: MoeOpSpec) -> tuple[MoeDispatchRoute, ...]:
+        raise NotImplementedError
+
+    def _validate_routes(self) -> None:
+        if not self.routes:
+            raise ValueError(f"{self.name} must contain at least one dispatch route.")
+        expected_min = 0
+        for index, route in enumerate(self.routes):
+            if route.min_tokens != expected_min:
+                raise ValueError(
+                    f"{self.name} has a token-range gap or overlap before "
+                    f"M={route.min_tokens}; expected M={expected_min}."
+                )
+            if route.max_tokens is not None and route.max_tokens < route.min_tokens:
+                raise ValueError(
+                    f"{self.name} has an invalid token range "
+                    f"[{route.min_tokens}, {route.max_tokens}]."
+                )
+            if route.max_tokens is None and index != len(self.routes) - 1:
+                raise ValueError(
+                    f"{self.name} has routes after an unbounded token range."
+                )
+            if route.provider.weight_layout_id != self.weight_layout_id:
+                raise ValueError(
+                    f"{self.name} route {route.provider.name!r} requires layout "
+                    f"{route.provider.weight_layout_id!r}, but the plan owns "
+                    f"{self.weight_layout_id!r}."
+                )
+            expected_min = (
+                route.max_tokens + 1
+                if route.max_tokens is not None
+                else expected_min
+            )
+        if self.routes[-1].max_tokens is not None:
+            raise ValueError(f"{self.name} must cover all token counts.")
+
+    def _route(self, num_tokens: int) -> MoeDispatchRoute:
+        for route in self.routes:
+            if route.matches(num_tokens):
+                return route
+        raise RuntimeError(f"{self.name} has no prepared route for M={num_tokens}.")
+
+    def _record_runtime_kernel_path(self, path: str) -> None:
+        counts = self._runtime_kernel_path_counts.setdefault(
+            str(path),
+            {"eager_dispatches": 0, "cuda_graph_capture_dispatches": 0},
+        )
+        key = (
+            "cuda_graph_capture_dispatches"
+            if device_runtime.is_stream_capturing()
+            else "eager_dispatches"
+        )
+        counts[key] += 1
+
+    def runtime_kernel_stats(self) -> dict[str, object]:
+        return {
+            "kernel_paths": {
+                path: {key: int(value) for key, value in sorted(counts.items())}
+                for path, counts in sorted(self._runtime_kernel_path_counts.items())
+            },
+            "fallback_reasons": {},
+        }
+
+    def binding_metadata(self) -> dict[str, object]:
+        return {
+            "implementation_kind": "dispatch_plan",
+            "weight_layout_id": self.weight_layout_id,
+            "routes": [
+                {
+                    "min_tokens": route.min_tokens,
+                    "max_tokens": route.max_tokens,
+                    "provider": route.provider.name,
+                    "kernel_path": route.kernel_path,
+                    "provider_metadata": route.provider.binding_metadata(),
+                }
+                for route in self.routes
+            ],
+        }
+
+    def run(
+        self,
+        spec,
+        hidden_states,
+        topk_ids,
+        topk_weights,
+        w13_weight,
+        w2_weight,
+        w13_scale_inv,
+        w2_scale_inv,
+        *,
+        local_expert_start,
+        ep_rank,
+    ):
+        if spec is not self.spec:
+            raise RuntimeError(
+                f"{self.name} was bound for {self.spec!r}, got {spec!r}."
+            )
+        route = self._route(int(hidden_states.shape[0]))
+        self._record_runtime_kernel_path(route.kernel_path)
+        return route.provider.run(
+            spec,
+            hidden_states,
+            topk_ids,
+            topk_weights,
+            w13_weight,
+            w2_weight,
+            w13_scale_inv,
+            w2_scale_inv,
+            local_expert_start=local_expert_start,
+            ep_rank=ep_rank,
+        )
 
 MOE_REGISTRY: OpRegistry[MoeOpSpec, MoeProvider] = OpRegistry("routed MoE")
 
@@ -466,9 +619,12 @@ class FlashInferCutlassFp8MoeProvider(MoeProvider):
                 "requires CUDA runtime >= 12.8, "
                 f"got {caps.runtime_version or 'unknown'}"
             )
-        if find_spec("flashinfer") is None:
-            return SupportResult.no("flashinfer is not installed")
-        return SupportResult.yes()
+        from sparsevllm.kernels.external.flashinfer.moe import (
+            flashinfer_cutlass_fp8_moe_support,
+        )
+
+        supported, reason = flashinfer_cutlass_fp8_moe_support()
+        return SupportResult.yes(reason) if supported else SupportResult.no(reason)
 
     def run(
         self,
@@ -487,25 +643,22 @@ class FlashInferCutlassFp8MoeProvider(MoeProvider):
         del local_expert_start
         if w13_scale_inv is None or w2_scale_inv is None:
             raise RuntimeError("FlashInfer FP8 MoE requires expert scales.")
-        from flashinfer.fused_moe import cutlass_fused_moe
-        from flashinfer.tllm_enums import ActivationType
+        from sparsevllm.kernels.external.flashinfer.moe import (
+            flashinfer_cutlass_fused_moe,
+        )
 
         output = torch.empty_like(hidden_states)
-        cutlass_fused_moe(
+        flashinfer_cutlass_fused_moe(
             hidden_states,
-            topk_ids.to(dtype=torch.int32),
-            topk_weights.to(dtype=torch.float32),
+            topk_ids,
+            topk_weights,
             w13_weight,
             w2_weight,
-            hidden_states.dtype,
-            quant_scales=[w13_scale_inv, w2_scale_inv],
+            w13_scale_inv,
+            w2_scale_inv,
             ep_size=int(spec.ep_size),
             ep_rank=int(ep_rank),
             output=output,
-            use_deepseek_fp8_block_scale=True,
-            use_fused_finalize=False,
-            enable_pdl=None,
-            activation_type=ActivationType.Swiglu,
         )
         return output
 
@@ -592,46 +745,17 @@ class TritonHopperFusedMoeProvider(MoeProvider):
         )
 
 
-@MOE_REGISTRY.register
-class SglTritonHybridMoeProvider(MoeProvider):
-    """Use SGL's profiled prefill kernel without regressing decode."""
+class SglDerivedTritonMoeProvider(MoeProvider):
+    """Repository-owned BF16 Triton MoE port using SGL expert alignment."""
 
-    name = "sgl_triton_hybrid"
-    priority = 15
+    name = "sgl_derived_triton_bf16"
     gate_up_order = "gate_up"
-    MIN_SGL_TOKENS_BY_TP_SIZE = {1: 64, 2: 64}
     PROFILED_SHAPES = frozenset(
         {
             (128, 128, 2048, 768, 8, 1, 1),
             (128, 128, 2048, 384, 8, 2, 1),
         }
     )
-
-    def __init__(self) -> None:
-        self._runtime_kernel_path_counts: dict[str, dict[str, int]] = {}
-
-    def _record_runtime_kernel_path(self, path: str) -> None:
-        counts = self._runtime_kernel_path_counts.setdefault(
-            str(path),
-            {"eager_dispatches": 0, "cuda_graph_capture_dispatches": 0},
-        )
-        key = (
-            "cuda_graph_capture_dispatches"
-            if device_runtime.is_stream_capturing()
-            else "eager_dispatches"
-        )
-        counts[key] += 1
-
-    def runtime_kernel_stats(self) -> dict[str, object]:
-        return {
-            "kernel_paths": {
-                path: {key: int(value) for key, value in sorted(counts.items())}
-                for path, counts in sorted(
-                    self._runtime_kernel_path_counts.items()
-                )
-            },
-            "fallback_reasons": {},
-        }
 
     @classmethod
     def supports(cls, spec: MoeOpSpec, caps: DeviceCaps) -> SupportResult:
@@ -676,9 +800,24 @@ class SglTritonHybridMoeProvider(MoeProvider):
                 f"{sorted(cls.PROFILED_SHAPES)}, got {actual_shape}"
             )
         from sparsevllm.kernels.external.sgl.moe import sgl_moe_alignment_support
+        from sparsevllm.kernels.triton.sgl_fused_moe import (
+            sgl_moe_profile_support,
+        )
 
+        profile_supported, profile_reason = sgl_moe_profile_support()
+        if not profile_supported:
+            return SupportResult.no(profile_reason)
         supported, reason = sgl_moe_alignment_support()
-        return SupportResult.yes() if supported else SupportResult.no(reason)
+        if not supported:
+            return SupportResult.no(reason)
+        return SupportResult.yes(f"{profile_reason}; {reason}")
+
+    def binding_metadata(self) -> dict[str, object]:
+        from sparsevllm.kernels.triton.sgl_fused_moe import (
+            sgl_moe_profile_metadata,
+        )
+
+        return {**super().binding_metadata(), **sgl_moe_profile_metadata()}
 
     def run(
         self,
@@ -696,22 +835,7 @@ class SglTritonHybridMoeProvider(MoeProvider):
     ):
         del ep_rank
         if w13_scale_inv is not None or w2_scale_inv is not None:
-            raise RuntimeError("SGL Triton BF16/FP16 MoE does not accept scales.")
-        min_sgl_tokens = self.MIN_SGL_TOKENS_BY_TP_SIZE[int(spec.tp_size)]
-        if int(hidden_states.shape[0]) < min_sgl_tokens:
-            self._record_runtime_kernel_path("triton_fused_moe")
-            from sparsevllm.kernels.triton.moe import fused_moe
-
-            return fused_moe(
-                hidden_states,
-                w13_weight,
-                w2_weight,
-                topk_ids,
-                topk_weights,
-                num_experts=spec.num_experts,
-                local_expert_start=local_expert_start,
-            )
-        self._record_runtime_kernel_path("sgl_fused_moe")
+            raise RuntimeError("SGL-derived BF16 Triton MoE does not accept scales.")
         from sparsevllm.kernels.triton.sgl_fused_moe import sgl_fused_moe
 
         return sgl_fused_moe(
@@ -723,6 +847,45 @@ class SglTritonHybridMoeProvider(MoeProvider):
             num_experts=spec.num_experts,
             local_expert_start=local_expert_start,
             alignment_impl=_sgl_moe_align_block_size,
+        )
+
+
+@MOE_REGISTRY.register
+class Qwen3Bf16MoeDispatchPlan(MoeDispatchPlan):
+    """Prepared Qwen3 BF16 token ranges over two atomic Triton providers."""
+
+    name = "qwen3_bf16_dispatch_plan"
+    priority = 15
+    gate_up_order = "gate_up"
+    MIN_SGL_TOKENS_BY_TP_SIZE = {1: 64, 2: 64}
+
+    @classmethod
+    def supports(cls, spec: MoeOpSpec, caps: DeviceCaps) -> SupportResult:
+        sgl_support = SglDerivedTritonMoeProvider.supports(spec, caps)
+        if not sgl_support.supported:
+            return SupportResult.no(
+                f"SGL-derived Triton path: {sgl_support.reason}"
+            )
+        triton_support = TritonMoeProvider.supports(spec, caps)
+        if not triton_support.supported:
+            return SupportResult.no(f"Triton path: {triton_support.reason}")
+        return SupportResult.yes("profiled Qwen3 BF16 token dispatch")
+
+    def _build_routes(self, spec: MoeOpSpec) -> tuple[MoeDispatchRoute, ...]:
+        min_sgl_tokens = self.MIN_SGL_TOKENS_BY_TP_SIZE[int(spec.tp_size)]
+        return (
+            MoeDispatchRoute(
+                min_tokens=0,
+                max_tokens=min_sgl_tokens - 1,
+                provider=TritonMoeProvider(),
+                kernel_path="triton_fused_moe",
+            ),
+            MoeDispatchRoute(
+                min_tokens=min_sgl_tokens,
+                max_tokens=None,
+                provider=SglDerivedTritonMoeProvider(),
+                kernel_path="sgl_fused_moe",
+            ),
         )
 
 
@@ -763,7 +926,12 @@ class TritonMoeProvider(MoeProvider):
                 return SupportResult.no("device does not provide native FP8 tensor cores")
             if spec.hidden_size % 128 or spec.intermediate_size % 128:
                 return SupportResult.no("FP8 hidden/intermediate sizes must be 128-aligned")
-            return SupportResult.yes()
+            from sparsevllm.kernels.external.sgl.moe import (
+                sgl_fp8_group_quantization_support,
+            )
+
+            supported, reason = sgl_fp8_group_quantization_support()
+            return SupportResult.yes(reason) if supported else SupportResult.no(reason)
         if spec.weight_dtype != spec.activation_dtype:
             return SupportResult.no(
                 "unquantized weights must match the activation dtype"
@@ -815,11 +983,18 @@ class TritonMoeProvider(MoeProvider):
         )
 
 
-@MOE_REGISTRY.register
-class Qwen3HybridFp8MoeProvider(FlashInferCutlassFp8MoeProvider):
-    """Use the measured Qwen3 FP8 kernel crossover on H100."""
+class TritonUpGateFp8MoeProvider(TritonMoeProvider):
+    """Atomic Triton FP8 MoE over FlashInfer-compatible packed weights."""
 
-    name = "qwen3_hybrid_fp8"
+    name = "triton_fp8_up_gate"
+    gate_up_order = "up_gate"
+
+
+@MOE_REGISTRY.register
+class Qwen3Fp8MoeDispatchPlan(MoeDispatchPlan):
+    """Prepared Qwen3 FP8 token ranges over layout-compatible providers."""
+
+    name = "qwen3_fp8_dispatch_plan"
     priority = 120
     gate_up_order = "up_gate"
     FLASHINFER_MAX_TOKENS = 128
@@ -853,7 +1028,7 @@ class Qwen3HybridFp8MoeProvider(FlashInferCutlassFp8MoeProvider):
             return SupportResult.no(
                 f"requires a profiled Qwen3 FP8 shape, got {actual_shape}"
             )
-        triton_support = TritonMoeProvider.supports(spec, caps)
+        triton_support = TritonUpGateFp8MoeProvider.supports(spec, caps)
         if not triton_support.supported:
             return SupportResult.no(f"Triton path: {triton_support.reason}")
         if spec.tp_size == 1:
@@ -862,63 +1037,43 @@ class Qwen3HybridFp8MoeProvider(FlashInferCutlassFp8MoeProvider):
                 return SupportResult.no(
                     f"FlashInfer decode path: {flashinfer_support.reason}"
                 )
-        return SupportResult.yes()
+        return SupportResult.yes("profiled Qwen3 FP8 token dispatch")
 
-    def run(
-        self,
-        spec,
-        hidden_states,
-        topk_ids,
-        topk_weights,
-        w13_weight,
-        w2_weight,
-        w13_scale_inv,
-        w2_scale_inv,
-        *,
-        local_expert_start,
-        ep_rank,
-    ):
-        if (
-            spec.tp_size == 1
-            and int(hidden_states.shape[0]) <= self.FLASHINFER_MAX_TOKENS
-        ):
-            return super().run(
-                spec,
-                hidden_states,
-                topk_ids,
-                topk_weights,
-                w13_weight,
-                w2_weight,
-                w13_scale_inv,
-                w2_scale_inv,
-                local_expert_start=local_expert_start,
-                ep_rank=ep_rank,
+    def _build_routes(self, spec: MoeOpSpec) -> tuple[MoeDispatchRoute, ...]:
+        triton = TritonUpGateFp8MoeProvider()
+        if spec.tp_size != 1:
+            return (
+                MoeDispatchRoute(
+                    min_tokens=0,
+                    max_tokens=None,
+                    provider=triton,
+                    kernel_path=triton.name,
+                ),
             )
-        del ep_rank
-        if w13_scale_inv is None or w2_scale_inv is None:
-            raise RuntimeError("Qwen3 hybrid FP8 MoE requires expert scales.")
-        from sparsevllm.kernels.triton.moe import fused_moe_fp8
-
-        return fused_moe_fp8(
-            hidden_states,
-            w13_weight,
-            w2_weight,
-            w13_scale_inv,
-            w2_scale_inv,
-            topk_ids,
-            topk_weights,
-            num_experts=spec.num_experts,
-            local_expert_start=local_expert_start,
-            gate_up_order=self.gate_up_order,
+        flashinfer = FlashInferCutlassFp8MoeProvider()
+        return (
+            MoeDispatchRoute(
+                min_tokens=0,
+                max_tokens=self.FLASHINFER_MAX_TOKENS,
+                provider=flashinfer,
+                kernel_path=flashinfer.name,
+            ),
+            MoeDispatchRoute(
+                min_tokens=self.FLASHINFER_MAX_TOKENS + 1,
+                max_tokens=None,
+                provider=triton,
+                kernel_path=triton.name,
+            ),
         )
 
 
 @MOE_REGISTRY.register
-class HopperQwen36HybridFp8MoeProvider(FlashInferCutlassFp8MoeProvider):
-    """Bind one weight layout and dispatch profiled token buckets by kernel."""
+class HopperQwen36Fp8MoeDispatchPlan(MoeDispatchPlan):
+    """Prepared Qwen3.6 FP8 token ranges over layout-compatible providers."""
 
-    name = "hopper_qwen36_hybrid_fp8"
+    name = "hopper_qwen36_fp8_dispatch_plan"
     priority = 130
+    gate_up_order = "up_gate"
     PROFILED_DEVICE_NAME = "NVIDIA H100 80GB HBM3"
     PROFILED_SHAPES = frozenset(
         {
@@ -953,67 +1108,41 @@ class HopperQwen36HybridFp8MoeProvider(FlashInferCutlassFp8MoeProvider):
                 f"{sorted(cls.PROFILED_SHAPES)}, "
                 f"got {actual_shape}"
             )
-        flashinfer_support = super().supports(spec, caps)
+        flashinfer_support = FlashInferCutlassFp8MoeProvider.supports(spec, caps)
         if not flashinfer_support.supported:
             return SupportResult.no(
                 f"FlashInfer prefill path: {flashinfer_support.reason}"
             )
-        triton_support = TritonMoeProvider.supports(spec, caps)
+        triton_support = TritonUpGateFp8MoeProvider.supports(spec, caps)
         if not triton_support.supported:
             return SupportResult.no(
                 f"Triton decode path: {triton_support.reason}"
             )
-        return SupportResult.yes()
+        return SupportResult.yes("profiled Qwen3.6 FP8 token dispatch")
 
-    def run(
-        self,
-        spec,
-        hidden_states,
-        topk_ids,
-        topk_weights,
-        w13_weight,
-        w2_weight,
-        w13_scale_inv,
-        w2_scale_inv,
-        *,
-        local_expert_start,
-        ep_rank,
-    ):
+    def _build_routes(self, spec: MoeOpSpec) -> tuple[MoeDispatchRoute, ...]:
         triton_max_tokens = self.TRITON_MAX_TOKENS_BY_EP_SIZE[int(spec.ep_size)]
-        if int(hidden_states.shape[0]) > triton_max_tokens:
-            return super().run(
-                spec,
-                hidden_states,
-                topk_ids,
-                topk_weights,
-                w13_weight,
-                w2_weight,
-                w13_scale_inv,
-                w2_scale_inv,
-                local_expert_start=local_expert_start,
-                ep_rank=ep_rank,
-            )
-        if w13_scale_inv is None or w2_scale_inv is None:
-            raise RuntimeError("Qwen3.6 hybrid FP8 MoE requires expert scales.")
-        from sparsevllm.kernels.triton.moe import fused_moe_fp8
-
-        return fused_moe_fp8(
-            hidden_states,
-            w13_weight,
-            w2_weight,
-            w13_scale_inv,
-            w2_scale_inv,
-            topk_ids,
-            topk_weights,
-            num_experts=spec.num_experts,
-            local_expert_start=local_expert_start,
-            gate_up_order=self.gate_up_order,
+        triton = TritonUpGateFp8MoeProvider()
+        flashinfer = FlashInferCutlassFp8MoeProvider()
+        return (
+            MoeDispatchRoute(
+                min_tokens=0,
+                max_tokens=triton_max_tokens,
+                provider=triton,
+                kernel_path=triton.name,
+            ),
+            MoeDispatchRoute(
+                min_tokens=triton_max_tokens + 1,
+                max_tokens=None,
+                provider=flashinfer,
+                kernel_path=flashinfer.name,
+            ),
         )
 
 
 @MOE_REGISTRY.register
-class H20Qwen36HybridFp8MoeProvider(HopperQwen36HybridFp8MoeProvider):
-    name = "h20_qwen36_hybrid_fp8"
+class H20Qwen36Fp8MoeDispatchPlan(HopperQwen36Fp8MoeDispatchPlan):
+    name = "h20_qwen36_fp8_dispatch_plan"
     priority = 131
     PROFILED_DEVICE_NAME = "NVIDIA H20"
     TRITON_MAX_TOKENS_BY_EP_SIZE = {1: 8, 2: 1}

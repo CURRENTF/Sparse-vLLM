@@ -5,6 +5,11 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
+from sparsevllm.kernels.external.support import (
+    ExternalKernelFamilyError,
+    KernelFamilyHealth,
+    KernelFamilyState,
+)
 from sparsevllm.operators.activation import (
     SILU_AND_MUL_REGISTRY,
     SiluAndMulSpec,
@@ -14,8 +19,10 @@ from sparsevllm.operators.activation import (
 from sparsevllm.operators.all_reduce import ALL_REDUCE_REGISTRY, AllReduceOpSpec
 from sparsevllm.operators.fp8_linear import (
     FP8_LINEAR_REGISTRY,
+    FlashInferGroupwiseSm120Fp8LinearProvider,
     FlashInferSm90Fp8LinearProvider,
     Fp8LinearSpec,
+    Sm120Fp8LinearDispatchPlan,
     TritonFp8LinearProvider,
     resolve_fp8_linear_provider,
 )
@@ -27,16 +34,97 @@ from sparsevllm.operators.gate_up_swiglu import (
 from sparsevllm.operators.moe import (
     MOE_REGISTRY,
     FlashInferCutlassFp8MoeProvider,
-    HopperQwen36HybridFp8MoeProvider,
+    HopperQwen36Fp8MoeDispatchPlan,
     MoeOpSpec,
-    Qwen3HybridFp8MoeProvider,
+    Qwen3Bf16MoeDispatchPlan,
+    Qwen3Fp8MoeDispatchPlan,
     SglAlignedTritonGlmMoeProvider,
-    SglTritonHybridMoeProvider,
     resolve_moe_provider,
     use_packed_shared_experts,
 )
 from sparsevllm.operators.registry import OpResolver
 from sparsevllm.platforms import DeviceCaps, PlatformEnum
+from sparsevllm.quantization.config import QuantizationConfig
+from sparsevllm.quantization.registry import QuantizationRegistry
+
+
+@pytest.fixture(autouse=True)
+def _mock_sgl_fp8_quantization_contract():
+    with (
+        patch(
+            "sparsevllm.kernels.external.sgl.moe.sgl_fp8_group_quantization_support",
+            return_value=(True, "sgl quant available"),
+        ),
+        patch(
+            "sparsevllm.kernels.external.flashinfer.fp8_linear.flashinfer_sm90_fp8_linear_support",
+            return_value=(True, "flashinfer sm90 available"),
+        ),
+        patch(
+            "sparsevllm.kernels.external.flashinfer.fp8_linear.flashinfer_sm120_groupwise_fp8_linear_support",
+            return_value=(True, "flashinfer sm120 available"),
+        ),
+        patch(
+            "sparsevllm.kernels.external.flashinfer.moe.flashinfer_cutlass_fp8_moe_support",
+            return_value=(True, "flashinfer moe available"),
+        ),
+        patch(
+            "sparsevllm.kernels.external.flashinfer.support.flashinfer_kernel_health",
+            return_value=KernelFamilyHealth(
+                family="flashinfer-python",
+                state=KernelFamilyState.READY,
+                version="0.6.15.post1",
+                reason="ready",
+            ),
+        ),
+        patch(
+            "sparsevllm.kernels.external.sgl.support.sgl_kernel_health",
+            return_value=KernelFamilyHealth(
+                family="sglang-kernel",
+                state=KernelFamilyState.READY,
+                version="0.4.5",
+                reason="ready",
+            ),
+        ),
+        patch("torch.__version__", "2.11.0"),
+        patch("triton.__version__", "3.6.0"),
+    ):
+        yield
+
+
+def _broken_sgl_family(feature: str) -> ExternalKernelFamilyError:
+    return ExternalKernelFamilyError(
+        KernelFamilyHealth(
+            family="sglang-kernel",
+            state=KernelFamilyState.BROKEN,
+            version="0.4.5",
+            reason="binary failed to load: undefined symbol",
+        ),
+        feature=feature,
+    )
+
+
+def _broken_flashinfer_family(feature: str) -> ExternalKernelFamilyError:
+    return ExternalKernelFamilyError(
+        KernelFamilyHealth(
+            family="flashinfer-python",
+            state=KernelFamilyState.BROKEN,
+            version="0.6.15.post1",
+            reason="package failed to load: undefined symbol",
+        ),
+        feature=feature,
+    )
+
+
+def _missing_flashinfer_family(feature: str) -> ExternalKernelFamilyError:
+    return ExternalKernelFamilyError(
+        KernelFamilyHealth(
+            family="flashinfer-python",
+            state=KernelFamilyState.ABSENT,
+            version=None,
+            reason="flashinfer-python is not installed",
+        ),
+        feature=feature,
+    )
 
 
 def _cuda_caps(
@@ -356,48 +444,249 @@ def test_fp8_linear_uses_generic_triton_when_specialization_does_not_match(
     capability,
     activation_dtype,
 ):
-    with patch("sparsevllm.operators.fp8_linear.find_spec", return_value=object()):
-        resolved = OpResolver(FP8_LINEAR_REGISTRY).resolve(
-            _linear_spec(activation_dtype=activation_dtype),
-            _cuda_caps(capability),
-        )
+    resolved = OpResolver(FP8_LINEAR_REGISTRY).resolve(
+        _linear_spec(activation_dtype=activation_dtype),
+        _cuda_caps(capability),
+    )
 
     assert resolved.provider.name == "triton"
 
 
 def test_fp8_linear_prefers_flashinfer_on_sm90():
-    with patch(
-        "sparsevllm.operators.fp8_linear.find_spec",
-        return_value=object(),
-    ):
-        resolved = OpResolver(FP8_LINEAR_REGISTRY).resolve(
-            _linear_spec(),
-            _cuda_caps((9, 0)),
-        )
+    resolved = OpResolver(FP8_LINEAR_REGISTRY).resolve(
+        _linear_spec(),
+        _cuda_caps((9, 0)),
+    )
 
     assert resolved.provider.name == "flashinfer_sm90"
 
 
-def test_fp8_linear_uses_triton_when_flashinfer_is_missing_on_sm90():
-    with patch("sparsevllm.operators.fp8_linear.find_spec", return_value=None):
-        resolved = OpResolver(FP8_LINEAR_REGISTRY).resolve(
+def test_fp8_linear_uses_model_independent_profile_on_sm120():
+    resolved = OpResolver(FP8_LINEAR_REGISTRY).resolve(
+        _linear_spec(input_features=2048, output_features=5120),
+        _cuda_caps(
+            (12, 0),
+            device_name="NVIDIA RTX PRO 6000 Blackwell Server Edition",
+        ),
+    )
+
+    assert resolved.provider.name == "sm120_fp8_linear_dispatch_plan"
+    assert isinstance(resolved.provider, Sm120Fp8LinearDispatchPlan)
+    assert resolved.provider._route(511).provider.name == "triton"
+    assert resolved.provider._route(512).provider.name == "flashinfer_groupwise_sm120"
+    assert resolved.report.as_dict()["provider_metadata"] == {
+        "implementation_kind": "dispatch_plan",
+        "profile_id": "sm120_fp8_linear_20260822_v2",
+        "profile_source": {
+            "benchmark_workload": (
+                "Qwen3-30B and Qwen3.6-27B TP1 dense Linear shapes"
+            ),
+            "decision": (
+                "Use the conservative common measured bucket: Triton for M<512 "
+                "and FlashInfer for M>=512"
+            ),
+            "kind": "repo_offline_microbenchmark",
+            "observed_date": "2026-08-22",
+            "protocol": (
+                "CUDA-event eager timing at M=1/512/1024 with per-call "
+                "allocation included; CUDA-Graph replay validated separately"
+            ),
+            "source_repository": "Sparse-vLLM",
+            "source_revision": "bcc93aa+uncommitted-unified-provider-refactor",
+            "source_state": (
+                "Benchmarked the atomic Triton and FlashInfer groupwise Providers "
+                "before extending this dispatch profile; run artifacts record the "
+                "dirty git state"
+            ),
+        },
+        "profile_status": "tuned",
+        "routes": [
+            {
+                "max_tokens": 511,
+                "min_tokens": 0,
+                "provider": "triton",
+                "provider_metadata": {
+                    "implementation_kind": "atomic_provider",
+                    "weight_layout_id": "block_128x128_nt_k_major",
+                },
+            },
+            {
+                "max_tokens": None,
+                "min_tokens": 512,
+                "provider": "flashinfer_groupwise_sm120",
+                "provider_metadata": {
+                    "activation_quantizer": (
+                        "sglang-kernel:sgl_per_token_group_quant_8bit"
+                    ),
+                    "activation_scale_layout": "K-major_per_token_group128",
+                    "gemm": "flashinfer:gemm_fp8_nt_groupwise",
+                    "implementation_kind": "atomic_provider",
+                    "weight_layout_id": "block_128x128_nt_k_major",
+                    "weight_scale_layout": "K-major_block128x128",
+                },
+            },
+        ],
+        "weight_layout_id": "block_128x128_nt_k_major",
+    }
+
+
+@pytest.mark.parametrize("model_name", ["Llama", "Qwen2", "Qwen3"])
+def test_fp8_linear_profile_selection_does_not_use_model_name(model_name):
+    quantization = QuantizationConfig(
+        enabled=True,
+        quant_method="fp8",
+        weight_dtype="e4m3",
+        activation_scheme="dynamic",
+        weight_block_size=(128, 128),
+        model_name=model_name,
+    )
+    caps = _cuda_caps(
+        (12, 0),
+        device_name="NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    )
+    platform = SimpleNamespace(
+        is_cuda_alike=lambda: False,
+        get_device_caps=lambda _device_index: caps,
+    )
+
+    with patch(
+        "sparsevllm.operators.fp8_linear.platforms",
+        SimpleNamespace(current_platform=platform),
+    ):
+        provider = QuantizationRegistry.resolve_linear_provider(
+            quantization,
+            input_features=2048,
+            output_features=5120,
+        )
+
+    assert provider.name == "sm120_fp8_linear_dispatch_plan"
+
+
+@pytest.mark.parametrize(
+    ("input_features", "output_features"),
+    [
+        (17408, 5120),
+        (5120, 14336),
+        (5120, 16384),
+        (5120, 34816),
+        (6144, 5120),
+    ],
+)
+def test_fp8_linear_profile_covers_qwen36_dense_shapes(
+    input_features,
+    output_features,
+):
+    resolved = OpResolver(FP8_LINEAR_REGISTRY).resolve(
+        _linear_spec(
+            input_features=input_features,
+            output_features=output_features,
+        ),
+        _cuda_caps(
+            (12, 0),
+            device_name="NVIDIA RTX PRO 6000 Blackwell Server Edition",
+        ),
+    )
+
+    assert resolved.provider.name == "sm120_fp8_linear_dispatch_plan"
+    assert resolved.provider._route(511).provider.name == "triton"
+    assert resolved.provider._route(512).provider.name == (
+        "flashinfer_groupwise_sm120"
+    )
+
+
+@pytest.mark.parametrize(
+    ("activation_dtype_name", "activation_dtype", "expected_provider"),
+    [
+        ("bfloat16", torch.bfloat16, "flashinfer_sm90"),
+        ("float16", torch.float16, "triton"),
+    ],
+)
+def test_quantization_registry_preserves_model_activation_dtype(
+    activation_dtype_name,
+    activation_dtype,
+    expected_provider,
+):
+    quantization = QuantizationConfig(
+        enabled=True,
+        quant_method="fp8",
+        weight_dtype="e4m3",
+        activation_scheme="dynamic",
+        weight_block_size=(128, 128),
+        model_name="Llama",
+        activation_dtype=activation_dtype_name,
+    )
+    caps = _cuda_caps((9, 0))
+    platform = SimpleNamespace(
+        is_cuda_alike=lambda: False,
+        get_device_caps=lambda _device_index: caps,
+    )
+
+    with patch(
+        "sparsevllm.operators.fp8_linear.platforms",
+        SimpleNamespace(current_platform=platform),
+    ):
+        provider = QuantizationRegistry.resolve_linear_provider(
+            quantization,
+            input_features=128,
+            output_features=128,
+        )
+
+    assert provider.spec.activation_dtype == activation_dtype
+    assert provider.name == expected_provider
+
+
+def test_quantization_config_normalizes_model_activation_dtype():
+    quantization = QuantizationConfig.from_hf_config(
+        {
+            "quant_method": "fp8",
+            "fmt": "e4m3",
+            "activation_scheme": "dynamic",
+            "weight_block_size": [128, 128],
+        },
+        model_name="Qwen2",
+        activation_dtype="torch.float16",
+    )
+
+    assert quantization.activation_dtype == "float16"
+
+
+def test_fp8_linear_uses_triton_for_unprofiled_sm120_shape():
+    resolved = OpResolver(FP8_LINEAR_REGISTRY).resolve(
+        _linear_spec(),
+        _cuda_caps(
+            (12, 0),
+            device_name="NVIDIA RTX PRO 6000 Blackwell Server Edition",
+        ),
+    )
+
+    assert resolved.provider.name == "triton"
+    assert any(
+        name == "sm120_fp8_linear_dispatch_plan"
+        and "requires a profiled SM120 FP8 Linear shape" in reason
+        for name, reason in resolved.rejected
+    )
+
+
+def test_fp8_linear_does_not_hide_broken_flashinfer_family_on_sm90():
+    error = _broken_flashinfer_family("SM90 block-scale FP8 Linear")
+    with (
+        patch(
+            "sparsevllm.kernels.external.flashinfer.fp8_linear.flashinfer_sm90_fp8_linear_support",
+            side_effect=error,
+        ),
+        pytest.raises(ExternalKernelFamilyError, match="undefined symbol"),
+    ):
+        OpResolver(FP8_LINEAR_REGISTRY).resolve(
             _linear_spec(),
             _cuda_caps((9, 0)),
         )
-
-    assert resolved.provider.name == "triton"
-    assert resolved.rejected == (("flashinfer_sm90", "flashinfer is not installed"),)
 
 
 def test_fp8_linear_resolution_does_not_require_nvcc():
-    with patch(
-        "sparsevllm.operators.fp8_linear.find_spec",
-        return_value=object(),
-    ):
-        resolved = OpResolver(FP8_LINEAR_REGISTRY).resolve(
-            _linear_spec(),
-            _cuda_caps((9, 0)),
-        )
+    resolved = OpResolver(FP8_LINEAR_REGISTRY).resolve(
+        _linear_spec(),
+        _cuda_caps((9, 0)),
+    )
 
     assert resolved.provider.name == "flashinfer_sm90"
 
@@ -414,13 +703,9 @@ def test_flashinfer_linear_does_not_mask_missing_jit_artifact():
     scale = torch.ones(1, 1)
 
     with (
-        patch.dict(
-            sys.modules,
-            {
-                "flashinfer.gemm": SimpleNamespace(
-                    fp8_blockscale_gemm_sm90=flashinfer_call
-                )
-            },
+        patch(
+            "sparsevllm.kernels.external.flashinfer.fp8_linear.flashinfer_fp8_blockscale_gemm_sm90",
+            flashinfer_call,
         ),
         pytest.raises(RuntimeError, match="cubin.empty"),
     ):
@@ -437,17 +722,39 @@ def test_flashinfer_linear_does_not_mask_other_runtime_failures():
     scale = torch.ones(1, 1)
 
     with (
-        patch.dict(
-            sys.modules,
-            {
-                "flashinfer.gemm": SimpleNamespace(
-                    fp8_blockscale_gemm_sm90=flashinfer_call
-                )
-            },
+        patch(
+            "sparsevllm.kernels.external.flashinfer.fp8_linear.flashinfer_fp8_blockscale_gemm_sm90",
+            flashinfer_call,
         ),
         pytest.raises(RuntimeError, match="invalid scale layout"),
     ):
         provider(x, weight, scale)
+
+
+def test_flashinfer_sm120_linear_composes_quantizer_and_gemm():
+    quantize_call = Mock()
+    gemm_call = Mock(return_value=torch.full((2, 128), 3.0, dtype=torch.bfloat16))
+    provider = FlashInferGroupwiseSm120Fp8LinearProvider()
+    x = torch.ones(2, 128, dtype=torch.bfloat16)
+    weight = torch.ones(128, 128).to(torch.float8_e4m3fn)
+    scale = torch.ones(1, 1)
+
+    with (
+        patch(
+            "sparsevllm.kernels.external.sgl.moe.sgl_per_token_group_quant_8bit",
+            quantize_call,
+        ),
+        patch(
+            "sparsevllm.kernels.external.flashinfer.fp8_linear.flashinfer_fp8_nt_groupwise_sm120",
+            gemm_call,
+        ),
+    ):
+        output = provider(x, weight, scale)
+
+    assert quantize_call.call_count == 1
+    assert gemm_call.call_count == 1
+    assert torch.equal(output, torch.full_like(output, 3.0))
+
 
 def test_fp8_linear_reports_unsupported_pre_fp8_device():
     with pytest.raises(RuntimeError, match="native FP8 tensor cores"):
@@ -478,11 +785,14 @@ def test_fp8_linear_rejects_non_cuda_platforms(platform):
         )
 
 
-def test_fp8_linear_rejects_cuda_without_triton_or_flashinfer():
+def test_fp8_linear_rejects_cuda_without_triton_or_flashinfer_feature():
     caps = _cuda_caps((9, 0))
     caps = DeviceCaps(**{**caps.__dict__, "supports_triton": False})
     with (
-        patch("sparsevllm.operators.fp8_linear.find_spec", return_value=None),
+        patch(
+            "sparsevllm.kernels.external.flashinfer.fp8_linear.flashinfer_sm90_fp8_linear_support",
+            return_value=(False, "SM90 feature unavailable"),
+        ),
         pytest.raises(RuntimeError, match="does not support Triton"),
     ):
         OpResolver(FP8_LINEAR_REGISTRY).resolve(
@@ -499,11 +809,10 @@ def test_fp8_linear_rejects_cuda_without_triton_or_flashinfer():
     ],
 )
 def test_fp8_linear_uses_triton_for_unsupported_flashinfer_shapes(spec, reason):
-    with patch("sparsevllm.operators.fp8_linear.find_spec", return_value=object()):
-        resolved = OpResolver(FP8_LINEAR_REGISTRY).resolve(
-            spec,
-            _cuda_caps((9, 0)),
-        )
+    resolved = OpResolver(FP8_LINEAR_REGISTRY).resolve(
+        spec,
+        _cuda_caps((9, 0)),
+    )
 
     assert resolved.provider.name == "triton"
     assert resolved.rejected[0][0] == "flashinfer_sm90"
@@ -513,9 +822,10 @@ def test_fp8_linear_uses_triton_for_unsupported_flashinfer_shapes(spec, reason):
 @pytest.mark.parametrize("runtime_version", [None, "12.7", "invalid"])
 def test_flashinfer_providers_require_cuda_12_8(runtime_version):
     caps = _cuda_caps((9, 0), runtime_version=runtime_version)
-    with (
-        patch("sparsevllm.operators.fp8_linear.find_spec", return_value=object()),
-        patch("sparsevllm.operators.moe.find_spec", return_value=object()),
+    with patch(
+        "sparsevllm.kernels.external.flashinfer.moe."
+        "flashinfer_cutlass_fp8_moe_support",
+        return_value=(True, "available"),
     ):
         linear = OpResolver(FP8_LINEAR_REGISTRY).resolve(_linear_spec(), caps)
         moe = OpResolver(MOE_REGISTRY).resolve(_moe_spec(), caps)
@@ -572,8 +882,8 @@ def test_hopper_fused_moe_uses_profiled_tp_ep_shape():
 @pytest.mark.parametrize(
     ("tp_size", "intermediate_size", "expected_provider"),
     [
-        (1, 768, "sgl_triton_hybrid"),
-        (2, 384, "sgl_triton_hybrid"),
+        (1, 768, "qwen3_bf16_dispatch_plan"),
+        (2, 384, "qwen3_bf16_dispatch_plan"),
         (4, 192, "triton"),
     ],
 )
@@ -609,9 +919,57 @@ def test_qwen3_bf16_moe_uses_sgl_triton_provider(
         )
 
     assert resolved.provider.name == expected_provider
+    if expected_provider == "qwen3_bf16_dispatch_plan":
+        metadata = resolved.report.as_dict()["provider_metadata"]
+        assert metadata == {
+            "implementation_kind": "dispatch_plan",
+            "weight_layout_id": "packed_gate_up_v1",
+            "routes": [
+                {
+                    "min_tokens": 0,
+                    "max_tokens": 63,
+                    "provider": "triton",
+                    "kernel_path": "triton_fused_moe",
+                    "provider_metadata": {
+                        "implementation_kind": "atomic_provider",
+                        "weight_layout_id": "packed_gate_up_v1",
+                    },
+                },
+                {
+                    "min_tokens": 64,
+                    "max_tokens": None,
+                    "provider": "sgl_derived_triton_bf16",
+                    "kernel_path": "sgl_fused_moe",
+                    "provider_metadata": {
+                        "implementation_kind": "atomic_provider",
+                        "weight_layout_id": "packed_gate_up_v1",
+                        "profile_id": "sgl_h100_qwen3_bf16_24d6256_v1",
+                        "profile_status": "tuned",
+                        "profile_source": {
+                            "kind": "upstream_offline_profile",
+                            "source_repository": "sgl-project/sglang",
+                            "source_revision": (
+                                "24d625698d44c78f6e8ab8b7c19f96f45bbaa90a"
+                            ),
+                            "source_paths": [
+                                (
+                                    "python/sglang/kernels/ops/moe/"
+                                    "fused_moe_triton_kernels.py"
+                                ),
+                                (
+                                    "python/sglang/srt/layers/moe/moe_runner/"
+                                    "triton_utils/fused_moe.py"
+                                ),
+                            ],
+                        },
+                        "kernel": "sgl_fused_moe_triton_v1",
+                    },
+                },
+            ],
+        }
 
 
-def test_sgl_triton_moe_falls_back_when_alignment_is_unavailable():
+def test_sgl_triton_moe_does_not_hide_broken_alignment() -> None:
     spec = _moe_spec(
         activation_dtype=torch.bfloat16,
         weight_dtype=torch.bfloat16,
@@ -627,19 +985,17 @@ def test_sgl_triton_moe_falls_back_when_alignment_is_unavailable():
 
     with patch(
         "sparsevllm.kernels.external.sgl.moe.sgl_moe_alignment_support",
-        return_value=(False, "unavailable"),
+        side_effect=_broken_sgl_family("MoE alignment"),
     ):
-        resolved = OpResolver(MOE_REGISTRY).resolve(
-            spec,
-            _cuda_caps(
-                (9, 0),
-                native_fp8=False,
-                device_name="NVIDIA H100 80GB HBM3",
-            ),
-        )
-
-    assert resolved.provider.name == "triton"
-    assert dict(resolved.rejected)["sgl_triton_hybrid"] == "unavailable"
+        with pytest.raises(ExternalKernelFamilyError, match="undefined symbol"):
+            OpResolver(MOE_REGISTRY).resolve(
+                spec,
+                _cuda_caps(
+                    (9, 0),
+                    native_fp8=False,
+                    device_name="NVIDIA H100 80GB HBM3",
+                ),
+            )
 
 
 @pytest.mark.parametrize(
@@ -665,7 +1021,7 @@ def test_sgl_triton_moe_rejects_unsupported_specs(overrides, reason):
     values.update(overrides)
     if "activation_dtype" in overrides and "weight_dtype" not in overrides:
         values["weight_dtype"] = overrides["activation_dtype"]
-    support = SglTritonHybridMoeProvider.supports(
+    support = Qwen3Bf16MoeDispatchPlan.supports(
         _moe_spec(**values),
         _cuda_caps(
             (9, 0),
@@ -693,7 +1049,6 @@ def test_sgl_triton_provider_dispatches_profiled_token_ranges(
     num_tokens,
     expected_path,
 ):
-    provider = SglTritonHybridMoeProvider()
     spec = _moe_spec(
         activation_dtype=torch.bfloat16,
         weight_dtype=torch.bfloat16,
@@ -706,6 +1061,7 @@ def test_sgl_triton_provider_dispatches_profiled_token_ranges(
         ep_size=1,
         tp_size=tp_size,
     )
+    provider = Qwen3Bf16MoeDispatchPlan(spec)
     tensors = [torch.empty(0) for _ in range(5)]
     tensors[0] = torch.empty(num_tokens, 0)
     with patch(
@@ -1084,7 +1440,11 @@ def test_hopper_fused_moe_falls_back_for_missing_graph_support():
 
 def test_fp8_moe_prefers_flashinfer_only_on_sm90():
     spec = _moe_spec()
-    with patch("sparsevllm.operators.moe.find_spec", return_value=object()):
+    with patch(
+        "sparsevllm.kernels.external.flashinfer.moe."
+        "flashinfer_cutlass_fp8_moe_support",
+        return_value=(True, "available"),
+    ):
         hopper = OpResolver(MOE_REGISTRY).resolve(spec, _cuda_caps((9, 0)))
         blackwell = OpResolver(MOE_REGISTRY).resolve(spec, _cuda_caps((10, 0)))
 
@@ -1092,11 +1452,20 @@ def test_fp8_moe_prefers_flashinfer_only_on_sm90():
     assert blackwell.provider.name == "triton"
 
 
+def test_triton_fp8_moe_does_not_hide_broken_sgl_quantization() -> None:
+    with patch(
+        "sparsevllm.kernels.external.sgl.moe.sgl_fp8_group_quantization_support",
+        side_effect=_broken_sgl_family("per-token FP8 group quantization"),
+    ):
+        with pytest.raises(ExternalKernelFamilyError, match="undefined symbol"):
+            OpResolver(MOE_REGISTRY).resolve(_moe_spec(), _cuda_caps((12, 0)))
+
+
 @pytest.mark.parametrize(
     ("tp_size", "intermediate_size"),
     [(1, 768), (2, 384)],
 )
-def test_qwen3_fp8_uses_profiled_hybrid_provider(tp_size, intermediate_size):
+def test_qwen3_fp8_uses_profiled_dispatch_plan(tp_size, intermediate_size):
     spec = _moe_spec(
         num_experts=128,
         num_local_experts=128,
@@ -1106,18 +1475,29 @@ def test_qwen3_fp8_uses_profiled_hybrid_provider(tp_size, intermediate_size):
         tp_size=tp_size,
         ep_size=1,
     )
-    with patch("sparsevllm.operators.moe.find_spec", return_value=object()):
+    with patch(
+        "sparsevllm.kernels.external.flashinfer.moe."
+        "flashinfer_cutlass_fp8_moe_support",
+        return_value=(True, "available"),
+    ):
         resolved = OpResolver(MOE_REGISTRY).resolve(
             spec,
             _cuda_caps((9, 0), device_name="NVIDIA H100 80GB HBM3"),
         )
 
-    assert resolved.provider.name == "qwen3_hybrid_fp8"
+    assert resolved.provider.name == "qwen3_fp8_dispatch_plan"
     assert resolved.provider.gate_up_order == "up_gate"
+    metadata = resolved.report.as_dict()["provider_metadata"]
+    assert metadata["implementation_kind"] == "dispatch_plan"
+    assert metadata["weight_layout_id"] == "packed_up_gate_v1"
+    assert [route["provider"] for route in metadata["routes"]] == (
+        ["flashinfer_cutlass_fp8_sm90", "triton_fp8_up_gate"]
+        if tp_size == 1
+        else ["triton_fp8_up_gate"]
+    )
 
 
-def test_qwen3_fp8_hybrid_dispatches_at_measured_crossover():
-    provider = Qwen3HybridFp8MoeProvider()
+def test_qwen3_fp8_dispatch_plan_uses_measured_crossover():
     spec = _moe_spec(
         num_experts=128,
         num_local_experts=128,
@@ -1127,6 +1507,7 @@ def test_qwen3_fp8_hybrid_dispatches_at_measured_crossover():
         tp_size=1,
         ep_size=1,
     )
+    provider = Qwen3Fp8MoeDispatchPlan(spec)
     weights = torch.empty(1)
     flashinfer_output = torch.ones(128, 2)
     triton_output = torch.ones(256, 2)
@@ -1178,7 +1559,6 @@ def test_qwen3_fp8_hybrid_dispatches_at_measured_crossover():
 
 
 def test_qwen3_tp2_fp8_uses_triton_for_decode():
-    provider = Qwen3HybridFp8MoeProvider()
     spec = _moe_spec(
         num_experts=128,
         num_local_experts=128,
@@ -1188,6 +1568,7 @@ def test_qwen3_tp2_fp8_uses_triton_for_decode():
         tp_size=2,
         ep_size=1,
     )
+    provider = Qwen3Fp8MoeDispatchPlan(spec)
     triton_output = torch.ones(1, 2)
     triton_call = Mock(return_value=triton_output)
     weights = torch.empty(1)
@@ -1217,7 +1598,7 @@ def test_qwen3_tp2_fp8_uses_triton_for_decode():
     assert triton_call.call_args.kwargs["gate_up_order"] == "up_gate"
 
 
-def test_qwen36_hybrid_moe_uses_profiled_graph_shape_on_h100():
+def test_qwen36_dispatch_plan_uses_profiled_graph_shape_on_h100():
     spec = _moe_spec(
         hidden_size=2048,
         intermediate_size=512,
@@ -1227,17 +1608,21 @@ def test_qwen36_hybrid_moe_uses_profiled_graph_shape_on_h100():
         ep_size=2,
         tp_size=1,
     )
-    with patch("sparsevllm.operators.moe.find_spec", return_value=object()):
+    with patch(
+        "sparsevllm.kernels.external.flashinfer.moe."
+        "flashinfer_cutlass_fp8_moe_support",
+        return_value=(True, "available"),
+    ):
         resolved = OpResolver(MOE_REGISTRY).resolve(
             spec,
             _cuda_caps((9, 0), device_name="NVIDIA H100 80GB HBM3"),
         )
 
-    assert resolved.provider.name == "hopper_qwen36_hybrid_fp8"
+    assert resolved.provider.name == "hopper_qwen36_fp8_dispatch_plan"
     assert resolved.provider.gate_up_order == "up_gate"
 
 
-def test_qwen36_hybrid_moe_uses_profiled_single_gpu_shape_on_h100():
+def test_qwen36_dispatch_plan_uses_profiled_single_gpu_shape_on_h100():
     spec = _moe_spec(
         hidden_size=2048,
         intermediate_size=512,
@@ -1247,13 +1632,17 @@ def test_qwen36_hybrid_moe_uses_profiled_single_gpu_shape_on_h100():
         ep_size=1,
         tp_size=1,
     )
-    with patch("sparsevllm.operators.moe.find_spec", return_value=object()):
+    with patch(
+        "sparsevllm.kernels.external.flashinfer.moe."
+        "flashinfer_cutlass_fp8_moe_support",
+        return_value=(True, "available"),
+    ):
         resolved = OpResolver(MOE_REGISTRY).resolve(
             spec,
             _cuda_caps((9, 0), device_name="NVIDIA H100 80GB HBM3"),
         )
 
-    assert resolved.provider.name == "hopper_qwen36_hybrid_fp8"
+    assert resolved.provider.name == "hopper_qwen36_fp8_dispatch_plan"
     assert resolved.provider.gate_up_order == "up_gate"
 
 
@@ -1267,7 +1656,11 @@ def test_qwen36_pure_tp_uses_triton_for_sharded_experts():
         ep_size=1,
         tp_size=2,
     )
-    with patch("sparsevllm.operators.moe.find_spec", return_value=object()):
+    with patch(
+        "sparsevllm.kernels.external.flashinfer.moe."
+        "flashinfer_cutlass_fp8_moe_support",
+        return_value=(True, "available"),
+    ):
         resolved = OpResolver(MOE_REGISTRY).resolve(
             spec,
             _cuda_caps((9, 0), device_name="NVIDIA H100 80GB HBM3"),
@@ -1287,7 +1680,7 @@ def test_qwen36_pure_tp_uses_triton_for_sharded_experts():
         ({"intermediate_size": 640}, {}, "requires profiled Qwen3.6"),
     ],
 )
-def test_qwen36_hybrid_moe_rejects_unprofiled_execution(
+def test_qwen36_dispatch_plan_rejects_unprofiled_execution(
     spec_overrides,
     caps_overrides,
     reason,
@@ -1306,14 +1699,18 @@ def test_qwen36_hybrid_moe_rejects_unprofiled_execution(
     caps = _cuda_caps((9, 0), device_name="NVIDIA H100 80GB HBM3")
     caps = DeviceCaps(**{**caps.__dict__, **caps_overrides})
 
-    with patch("sparsevllm.operators.moe.find_spec", return_value=object()):
+    with patch(
+        "sparsevllm.kernels.external.flashinfer.moe."
+        "flashinfer_cutlass_fp8_moe_support",
+        return_value=(True, "available"),
+    ):
         resolved = OpResolver(MOE_REGISTRY).resolve(spec, caps)
 
     assert resolved.provider.name == "flashinfer_cutlass_fp8_sm90"
-    assert reason in dict(resolved.rejected)["hopper_qwen36_hybrid_fp8"]
+    assert reason in dict(resolved.rejected)["hopper_qwen36_fp8_dispatch_plan"]
 
 
-def test_qwen36_hybrid_moe_supports_eager_execution():
+def test_qwen36_dispatch_plan_supports_eager_execution():
     spec = _moe_spec(
         hidden_size=2048,
         intermediate_size=512,
@@ -1324,16 +1721,20 @@ def test_qwen36_hybrid_moe_supports_eager_execution():
         tp_size=1,
         cuda_graph=False,
     )
-    with patch("sparsevllm.operators.moe.find_spec", return_value=object()):
+    with patch(
+        "sparsevllm.kernels.external.flashinfer.moe."
+        "flashinfer_cutlass_fp8_moe_support",
+        return_value=(True, "available"),
+    ):
         resolved = OpResolver(MOE_REGISTRY).resolve(
             spec,
             _cuda_caps((9, 0), device_name="NVIDIA H100 80GB HBM3"),
         )
 
-    assert resolved.provider.name == "hopper_qwen36_hybrid_fp8"
+    assert resolved.provider.name == "hopper_qwen36_fp8_dispatch_plan"
 
 
-def test_h20_qwen36_hybrid_moe_uses_profiled_provider():
+def test_h20_qwen36_uses_profiled_dispatch_plan():
     spec = _moe_spec(
         hidden_size=2048,
         intermediate_size=512,
@@ -1343,17 +1744,20 @@ def test_h20_qwen36_hybrid_moe_uses_profiled_provider():
         ep_size=1,
         tp_size=1,
     )
-    with patch("sparsevllm.operators.moe.find_spec", return_value=object()):
+    with patch(
+        "sparsevllm.kernels.external.flashinfer.moe."
+        "flashinfer_cutlass_fp8_moe_support",
+        return_value=(True, "available"),
+    ):
         resolved = OpResolver(MOE_REGISTRY).resolve(
             spec,
             _cuda_caps((9, 0), device_name="NVIDIA H20"),
         )
 
-    assert resolved.provider.name == "h20_qwen36_hybrid_fp8"
+    assert resolved.provider.name == "h20_qwen36_fp8_dispatch_plan"
 
 
-def test_qwen36_hybrid_moe_dispatches_by_token_bucket():
-    provider = HopperQwen36HybridFp8MoeProvider()
+def test_qwen36_dispatch_plan_dispatches_by_token_bucket():
     spec = _moe_spec(
         hidden_size=2048,
         intermediate_size=512,
@@ -1363,6 +1767,7 @@ def test_qwen36_hybrid_moe_dispatches_by_token_bucket():
         ep_size=2,
         tp_size=1,
     )
+    provider = HopperQwen36Fp8MoeDispatchPlan(spec)
     small_output = torch.ones(4, 2)
     large_output = torch.ones(5, 2)
     triton_call = Mock(return_value=small_output)
@@ -1413,8 +1818,7 @@ def test_qwen36_hybrid_moe_dispatches_by_token_bucket():
     flashinfer_call.assert_called_once()
 
 
-def test_qwen36_hybrid_moe_uses_larger_triton_bucket_on_single_gpu():
-    provider = HopperQwen36HybridFp8MoeProvider()
+def test_qwen36_dispatch_plan_uses_larger_triton_bucket_on_single_gpu():
     spec = _moe_spec(
         hidden_size=2048,
         intermediate_size=512,
@@ -1424,6 +1828,7 @@ def test_qwen36_hybrid_moe_uses_larger_triton_bucket_on_single_gpu():
         ep_size=1,
         tp_size=1,
     )
+    provider = HopperQwen36Fp8MoeDispatchPlan(spec)
     triton_output = torch.ones(8, 2)
     flashinfer_output = torch.ones(9, 2)
     triton_call = Mock(return_value=triton_output)
@@ -1474,22 +1879,19 @@ def test_qwen36_hybrid_moe_uses_larger_triton_bucket_on_single_gpu():
     flashinfer_call.assert_called_once()
 
 
-def test_fp8_moe_uses_triton_when_flashinfer_is_missing_on_sm90():
-    with patch("sparsevllm.operators.moe.find_spec", return_value=None):
-        resolved = OpResolver(MOE_REGISTRY).resolve(
+def test_fp8_moe_does_not_hide_missing_flashinfer_on_sm90():
+    with (
+        patch(
+            "sparsevllm.kernels.external.flashinfer.moe."
+            "flashinfer_cutlass_fp8_moe_support",
+            side_effect=_missing_flashinfer_family("SM90 CUTLASS FP8 MoE"),
+        ),
+        pytest.raises(ExternalKernelFamilyError, match="is absent"),
+    ):
+        OpResolver(MOE_REGISTRY).resolve(
             _moe_spec(),
             _cuda_caps((9, 0)),
         )
-
-    assert resolved.provider.name == "triton"
-    assert (
-        "flashinfer_cutlass_fp8_sm90",
-        "flashinfer is not installed",
-    ) in resolved.rejected
-    assert (
-        "triton_hopper_fused",
-        "requires unquantized BF16 expert weights",
-    ) in resolved.rejected
 
 
 @pytest.mark.parametrize(
@@ -1517,7 +1919,11 @@ def test_fp8_moe_rejects_pre_fp8_cuda():
 
 
 def test_fp8_moe_uses_triton_for_tensor_parallel_expert_shards():
-    with patch("sparsevllm.operators.moe.find_spec", return_value=object()):
+    with patch(
+        "sparsevllm.kernels.external.flashinfer.moe."
+        "flashinfer_cutlass_fp8_moe_support",
+        return_value=(True, "available"),
+    ):
         resolved = OpResolver(MOE_REGISTRY).resolve(
             _moe_spec(tp_size=2, ep_size=1, num_local_experts=8),
             _cuda_caps((9, 0)),
@@ -1558,7 +1964,11 @@ def test_provider_owns_packed_gate_up_layout():
         _cuda_caps((9, 0)),
     ).provider
     flashinfer_spec = _moe_spec()
-    with patch("sparsevllm.operators.moe.find_spec", return_value=object()):
+    with patch(
+        "sparsevllm.kernels.external.flashinfer.moe."
+        "flashinfer_cutlass_fp8_moe_support",
+        return_value=(True, "available"),
+    ):
         flashinfer = OpResolver(MOE_REGISTRY).resolve(
             flashinfer_spec,
             _cuda_caps((9, 0)),
@@ -1631,6 +2041,16 @@ def test_public_resolvers_match_live_device_capabilities():
     )
 
     assert unquantized_moe.name == "triton"
-    assert linear.name in {"flashinfer_sm90", "triton"}
+    assert linear.name in {
+        "flashinfer_groupwise_sm120",
+        "flashinfer_sm90",
+        "sm120_fp8_linear_dispatch_plan",
+        "triton",
+    }
     if linear.name == "flashinfer_sm90":
         assert caps.compute_capability == (9, 0)
+    if linear.name in {
+        "flashinfer_groupwise_sm120",
+        "sm120_fp8_linear_dispatch_plan",
+    }:
+        assert caps.compute_capability == (12, 0)

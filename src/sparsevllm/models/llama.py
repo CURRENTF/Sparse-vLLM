@@ -11,7 +11,16 @@ from sparsevllm.layers.layernorm import RMSNorm
 from sparsevllm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
 from sparsevllm.layers.rotary_embedding import get_rope
 from sparsevllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
+from sparsevllm.models.attention_runtime import (
+    bind_mha_decode_attention_op,
+    bind_mha_prefill_attention_op,
+    build_mha_decode_attention_op,
+    build_mha_prefill_attention_op,
+)
+from sparsevllm.operators.decode_attention import PreparedDecodeAttentionOp
+from sparsevllm.operators.prefill_attention import PreparedPrefillAttentionOp
 from sparsevllm.utils.context import get_context
+from sparsevllm.utils.log import logger
 
 
 def _get_rope_theta(config: Any) -> float:
@@ -63,6 +72,7 @@ class LlamaAttention(nn.Module):
         rope_theta: float,
         rope_scaling: tuple[tuple[str, object], ...] | None,
         proj_chunk_size: int = 16384,
+        quantization=None,
     ) -> None:
         super().__init__()
         tp_size = get_parallel_context().tp_size
@@ -86,11 +96,13 @@ class LlamaAttention(nn.Module):
             self.total_num_heads,
             self.total_num_kv_heads,
             bias=qkv_bias,
+            quantization=quantization,
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=qkv_bias,
+            quantization=quantization,
         )
         self.rotary_emb = get_rope(
             self.head_dim,
@@ -147,17 +159,20 @@ class LlamaMLP(nn.Module):
         hidden_act: str,
         mlp_bias: bool,
         mlp_chunk_size: int = 16384,
+        quantization=None,
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
             bias=mlp_bias,
+            quantization=quantization,
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
             bias=mlp_bias,
+            quantization=quantization,
         )
         if hidden_act != "silu":
             raise NotImplementedError(f"Unsupported Llama hidden_act={hidden_act!r}.")
@@ -187,6 +202,7 @@ class LlamaDecoderLayer(nn.Module):
     def __init__(self, config: Any) -> None:
         super().__init__()
         head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        quantization = getattr(config, "quantization_config", None)
         self.self_attn = LlamaAttention(
             hidden_size=config.hidden_size,
             num_heads=config.num_attention_heads,
@@ -197,6 +213,7 @@ class LlamaDecoderLayer(nn.Module):
             rope_theta=_get_rope_theta(config),
             rope_scaling=_get_rope_scaling(config),
             proj_chunk_size=getattr(config, "mlp_chunk_size", 16384),
+            quantization=quantization,
         )
         self.mlp = LlamaMLP(
             hidden_size=config.hidden_size,
@@ -204,6 +221,7 @@ class LlamaDecoderLayer(nn.Module):
             hidden_act=config.hidden_act,
             mlp_bias=getattr(config, "mlp_bias", False),
             mlp_chunk_size=getattr(config, "mlp_chunk_size", 16384),
+            quantization=quantization,
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -275,12 +293,60 @@ class LlamaForCausalLM(nn.Module):
         "up_proj": ("gate_up_proj", 1),
     }
 
-    def __init__(self, config: Any) -> None:
+    @staticmethod
+    def build_runtime_kwargs(
+        config: Any,
+        *,
+        engine_config,
+        parallel_context,
+        device: torch.device,
+        **_,
+    ) -> dict:
+        return {
+            "prefill_attention_op": build_mha_prefill_attention_op(
+                config,
+                sparse_method=engine_config.vllm_sparse_method,
+                attention_tp_size=parallel_context.attention_tp_size,
+                device=device,
+            ),
+            "decode_attention_op": build_mha_decode_attention_op(
+                config,
+                sparse_method=engine_config.vllm_sparse_method,
+                attention_tp_size=parallel_context.attention_tp_size,
+                device=device,
+                max_batch_size=engine_config.max_decoding_seqs,
+                cuda_graph=engine_config.decode_cuda_graph,
+            ),
+        }
+
+    def __init__(
+        self,
+        config: Any,
+        prefill_attention_op: PreparedPrefillAttentionOp | None = None,
+        decode_attention_op: PreparedDecodeAttentionOp | None = None,
+    ) -> None:
         super().__init__()
+        self.prefill_attention_op = prefill_attention_op
+        self.decode_attention_op = decode_attention_op
         self.model = LlamaModel(config)
+        if prefill_attention_op is not None:
+            bind_mha_prefill_attention_op(self.model, prefill_attention_op)
+        if decode_attention_op is not None:
+            bind_mha_decode_attention_op(self.model, decode_attention_op)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if config.tie_word_embeddings:
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
+        logger.info(
+            "Loaded Llama prefill_provider={} decode_provider={}",
+            "legacy_triton" if prefill_attention_op is None else prefill_attention_op.name,
+            "legacy_triton" if decode_attention_op is None else decode_attention_op.name,
+        )
+
+    def close_runtime_operators(self) -> None:
+        if self.prefill_attention_op is not None:
+            self.prefill_attention_op.close()
+        if self.decode_attention_op is not None:
+            self.decode_attention_op.close()
 
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         return self.model(input_ids, positions)

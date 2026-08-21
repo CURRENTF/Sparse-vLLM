@@ -95,6 +95,13 @@ _PREFILL_POSTHOC_SCORE_METHODS = frozenset(
     {"snapkv", "pyramidkv", "h2o", "rkv"}
 )
 
+# These methods can request a score-producing decode launch on at least one
+# layer or decode step.  The answer is deliberately static so Provider
+# selection happens before CUDA Graph capture and never changes in run().
+_DECODE_ATTENTION_SCORE_METHODS = frozenset(
+    {"snapkv", "h2o", "pyramidkv", "omnikv", "skipkv", "deltakv"}
+)
+
 
 def sparse_prefill_attention_contract(
     method: str | None,
@@ -111,6 +118,15 @@ def sparse_prefill_attention_contract(
         main_score_kind=AttentionScoreKind.NONE,
         score_collection=collection,
     )
+
+
+def sparse_decode_attention_requires_scores(method: str | None) -> bool:
+    """Return whether a prepared decode implementation must support scores."""
+
+    normalized = normalize_sparse_method(method)
+    if normalized not in CANONICAL_SPARSE_METHODS:
+        raise ValueError(f"Unknown sparse method {normalized!r}.")
+    return normalized in _DECODE_ATTENTION_SCORE_METHODS
 
 
 _MOE_SPARSE_METHODS = frozenset(

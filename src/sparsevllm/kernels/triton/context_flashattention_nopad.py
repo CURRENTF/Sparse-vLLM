@@ -1,11 +1,60 @@
+from functools import lru_cache
+import math
+
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
-import math
-import torch.nn.functional as F
+
 from sparsevllm.platforms import device_runtime
 
 TESLA = "Tesla" in device_runtime.optional_device_name(0)
+_HD256_BLOCK128_REQUIRED_SHARED_MEMORY = 163_840
+
+
+def select_context_attention_launch_config(
+    head_dim: int,
+    *,
+    max_shared_memory: int,
+    is_tesla: bool = False,
+) -> tuple[int, int, int, int]:
+    """Return a resource-safe static launch specialization.
+
+    The head-dim-256 BLOCK_M/BLOCK_N=128 specialization uses 163,840 bytes of
+    shared memory with Triton 3.6. SM120 exposes only 101,376 bytes per block,
+    while H100 can retain the larger tile.
+    """
+
+    if head_dim not in {16, 32, 64, 128, 256}:
+        raise ValueError(f"Unsupported context-attention head_dim={head_dim}.")
+    if max_shared_memory <= 0:
+        raise ValueError(
+            "Context-attention max shared memory must be positive, got "
+            f"{max_shared_memory}."
+        )
+    resource_limited_hd256 = (
+        head_dim == 256
+        and max_shared_memory < _HD256_BLOCK128_REQUIRED_SHARED_MEMORY
+    )
+    block_m = 64 if is_tesla or resource_limited_hd256 else 128
+    block_n = block_m
+    num_warps = 4 if head_dim <= 64 else 8
+    return block_m, block_n, num_warps, 1
+
+
+@lru_cache(maxsize=None)
+def _device_max_shared_memory(device_index: int) -> int:
+    properties = triton.runtime.driver.active.utils.get_device_properties(
+        int(device_index)
+    )
+    try:
+        max_shared_memory = int(properties["max_shared_mem"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise RuntimeError(
+            "Triton device properties do not expose a valid max_shared_mem: "
+            f"{properties!r}."
+        ) from error
+    return max_shared_memory
 
 
 @triton.jit
@@ -243,7 +292,6 @@ def context_attention_fwd(
     q, k, v, o, b_req_idx, b_start_loc, b_seq_len, b_prompt_cache_len, max_input_len, req_to_token_indexs,
     attn_score=None
 ):
-    BLOCK_M = 128 if not TESLA else 64
     Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
     
     # 补齐断言：安全防护
@@ -255,10 +303,17 @@ def context_attention_fwd(
     sm_scale = 1.0 / (Lq ** 0.5) * 1.4426950408889634
     batch, head = b_seq_len.shape[0], q.shape[1]
     kv_group_num = q.shape[1] // k.shape[1]
+    device_index = q.device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    BLOCK_M, BLOCK_N, num_warps, num_stages = (
+        select_context_attention_launch_config(
+            Lk,
+            max_shared_memory=_device_max_shared_memory(device_index),
+            is_tesla=TESLA,
+        )
+    )
     grid = lambda meta: (triton.cdiv(max_input_len, meta["BLOCK_M"]), batch * head, 1)
-    BLOCK_N = BLOCK_M
-    num_warps = 4 if Lk <= 64 else 8
-    num_stages = 1
 
     if attn_score is None:
         _fwd_kernel[grid](

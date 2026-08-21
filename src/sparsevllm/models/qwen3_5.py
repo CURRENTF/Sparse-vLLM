@@ -15,6 +15,19 @@ from sparsevllm.layers.linear import (
     RowParallelLinear,
     divide,
 )
+from sparsevllm.models.attention_runtime import (
+    bind_mha_decode_attention_op,
+    bind_mha_prefill_attention_op,
+    build_mha_decode_attention_op,
+    build_mha_prefill_attention_op,
+)
+from sparsevllm.models.gdn_runtime import (
+    bind_gated_delta_rule_op,
+    build_gated_delta_rule_op,
+)
+from sparsevllm.operators.decode_attention import PreparedDecodeAttentionOp
+from sparsevllm.operators.gated_delta_rule import PreparedGatedDeltaRuleOp
+from sparsevllm.operators.prefill_attention import PreparedPrefillAttentionOp
 from sparsevllm.operators.gate_up_swiglu import (
     GateUpSwiGLUOpSpec,
     resolve_gate_up_swiglu_provider,
@@ -23,13 +36,13 @@ from sparsevllm.layers.rotary_embedding import apply_partial_rotary_emb, get_rop
 from sparsevllm.operators.qwen35_mrope import Qwen35MRotaryEmbedding
 from sparsevllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 from sparsevllm.utils.context import get_context
+from sparsevllm.utils.log import logger
 from sparsevllm.utils.weight_target import WeightTarget
 from sparsevllm.engine.recurrent_state_manager import RecurrentStateSpec, RecurrentTensorSpec
 from sparsevllm.kernels.triton.qwen3_5.causal_conv1d import causal_conv1d_fn
 from sparsevllm.kernels.triton.qwen3_5.fused_gdn_gating import fused_gdn_gating
 from sparsevllm.kernels.triton.qwen3_5.gated_rmsnorm import gated_rmsnorm_forward
 from sparsevllm.kernels.triton.qwen3_5.gdn_decode_pack import conv_pack_gdn_decode_inputs
-from sparsevllm.kernels.triton.qwen3_5.fla.ops import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
 
 
 def _get_rope_theta(config) -> float:
@@ -372,6 +385,8 @@ class Qwen35LinearConv1D(nn.Module):
         param.data.copy_(self._shard_qkv_conv_rows(loaded_weight))
 
 class Qwen35LinearAttention(nn.Module):
+    is_gated_delta_rule_layer = True
+
     def __init__(self, config) -> None:
         super().__init__()
         tp_size = get_parallel_context().tp_size
@@ -437,6 +452,7 @@ class Qwen35LinearAttention(nn.Module):
         self.dt_bias = nn.Parameter(torch.empty(self.num_v_heads, dtype=torch.float32), requires_grad=False)
         self.A_log.weight_loader = self._tp_vector_weight_loader
         self.dt_bias.weight_loader = self._tp_vector_weight_loader
+        self.gated_delta_rule_op: PreparedGatedDeltaRuleOp | None = None
 
     @staticmethod
     def _split_row_block_scale(loaded_scale: torch.Tensor | None, row_sizes: list[int]) -> list[torch.Tensor | None]:
@@ -621,17 +637,6 @@ class Qwen35LinearAttention(nn.Module):
     def _empty_recurrent_state(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         return torch.zeros(self.num_v_heads, self.head_k_dim, self.head_v_dim, dtype=dtype, device=device)
 
-    def _repeat_qk_for_value_heads(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        num_v_per_k = self.num_v_heads // self.num_k_heads
-        if num_v_per_k > 1:
-            q = q.repeat_interleave(num_v_per_k, dim=2)
-            k = k.repeat_interleave(num_v_per_k, dim=2)
-        return q, k
-
     def _load_batch_states(
         self,
         context,
@@ -739,18 +744,18 @@ class Qwen35LinearAttention(nn.Module):
         q = q.view(1, -1, self.num_k_heads, self.head_k_dim)
         k = k.view(1, -1, self.num_k_heads, self.head_k_dim)
         v = v.view(1, -1, self.num_v_heads, self.head_v_dim)
-        q, k = self._repeat_qk_for_value_heads(q, k)
-        core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
+        if self.gated_delta_rule_op is None:
+            raise RuntimeError(
+                "qwen3_5 linear attention requires a prepared GDN provider."
+            )
+        core_attn_out, last_recurrent_state = self.gated_delta_rule_op.run_prefill(
             q=q,
             k=k,
             v=v,
             g=g.unsqueeze(0),
             beta=beta.unsqueeze(0),
             initial_state=recurrent_states,
-            output_final_state=True,
             cu_seqlens=context.cu_seqlens_q,
-            head_first=False,
-            use_qk_l2norm_in_kernel=True,
         )
         self._store_batch_states(context, recurrent_state_manager, conv_states, last_recurrent_state)
         return core_attn_out, z
@@ -782,18 +787,20 @@ class Qwen35LinearAttention(nn.Module):
             self.num_v_heads,
             self.head_v_dim,
         )
-        q, k = self._repeat_qk_for_value_heads(q, k)
-        g, beta = fused_gdn_gating(self.A_log, a, b, self.dt_bias)
-        core_attn_out, _ = fused_recurrent_gated_delta_rule(
+        if self.gated_delta_rule_op is None:
+            raise RuntimeError(
+                "qwen3_5 linear attention requires a prepared GDN provider."
+            )
+        core_attn_out = self.gated_delta_rule_op.run_decode(
             q=q,
             k=k,
             v=v,
-            g=g,
-            beta=beta,
             initial_state=recurrent_states,
-            inplace_final_state=True,
-            ssm_state_indices=state_indices,
-            use_qk_l2norm_in_kernel=True,
+            state_indices=state_indices,
+            A_log=self.A_log,
+            a=a,
+            dt_bias=self.dt_bias,
+            b=b,
         )
         return core_attn_out, z
 
@@ -1003,13 +1010,74 @@ class Qwen35ForCausalLM(nn.Module):
         "up_proj": ("gate_up_proj", 1),
     }
 
-    def __init__(self, config) -> None:
+    @staticmethod
+    def build_runtime_kwargs(
+        config,
+        *,
+        engine_config,
+        parallel_context,
+        device: torch.device,
+        **_,
+    ) -> dict:
+        return {
+            "prefill_attention_op": build_mha_prefill_attention_op(
+                config,
+                sparse_method=engine_config.vllm_sparse_method,
+                attention_tp_size=parallel_context.attention_tp_size,
+                device=device,
+            ),
+            "decode_attention_op": build_mha_decode_attention_op(
+                config,
+                sparse_method=engine_config.vllm_sparse_method,
+                attention_tp_size=parallel_context.attention_tp_size,
+                device=device,
+                max_batch_size=engine_config.max_decoding_seqs,
+                cuda_graph=engine_config.decode_cuda_graph,
+            ),
+            "gated_delta_rule_op": build_gated_delta_rule_op(
+                config,
+                attention_tp_size=parallel_context.attention_tp_size,
+                device=device,
+                cuda_graph=engine_config.decode_cuda_graph,
+            ),
+        }
+
+    def __init__(
+        self,
+        config,
+        prefill_attention_op: PreparedPrefillAttentionOp | None = None,
+        decode_attention_op: PreparedDecodeAttentionOp | None = None,
+        gated_delta_rule_op: PreparedGatedDeltaRuleOp | None = None,
+    ) -> None:
         super().__init__()
+        self.prefill_attention_op = prefill_attention_op
+        self.decode_attention_op = decode_attention_op
+        self.gated_delta_rule_op = gated_delta_rule_op
         self.model = Qwen35Model(config)
+        if prefill_attention_op is not None:
+            bind_mha_prefill_attention_op(self.model, prefill_attention_op)
+        if decode_attention_op is not None:
+            bind_mha_decode_attention_op(self.model, decode_attention_op)
+        if gated_delta_rule_op is not None:
+            bind_gated_delta_rule_op(self.model, gated_delta_rule_op)
         self.lm_head = ParallelLMHead(int(config.vocab_size), int(config.hidden_size))
         if bool(getattr(config, "tie_word_embeddings", False)):
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
         self.multimodal_encoder = None
+        logger.info(
+            "Loaded Qwen3.5 prefill_provider={} decode_provider={} gdn_provider={}",
+            "legacy_triton" if prefill_attention_op is None else prefill_attention_op.name,
+            "legacy_triton" if decode_attention_op is None else decode_attention_op.name,
+            "unbound" if gated_delta_rule_op is None else gated_delta_rule_op.name,
+        )
+
+    def close_runtime_operators(self) -> None:
+        if self.prefill_attention_op is not None:
+            self.prefill_attention_op.close()
+        if self.decode_attention_op is not None:
+            self.decode_attention_op.close()
+        if self.gated_delta_rule_op is not None:
+            self.gated_delta_rule_op.close()
 
     def configure_multimodal(self, outer_config) -> None:
         from sparsevllm.models.qwen3_5_multimodal import Qwen35MultimodalEncoder
