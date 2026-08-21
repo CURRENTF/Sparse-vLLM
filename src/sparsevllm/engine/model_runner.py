@@ -25,6 +25,9 @@ from sparsevllm.operators import registry as operator_registry
 from sparsevllm.operators.decode_attention import (
     validate_context_independent_decode_graph_model,
 )
+from sparsevllm.operators.context_independent_decode_attention import (
+    bind_context_independent_triton_attention,
+)
 from sparsevllm.utils.context import set_context, get_context, reset_context
 from sparsevllm.utils.loader import load_model, sync_deltakv_config_from_checkpoint
 
@@ -242,6 +245,21 @@ class ModelRunner:
             ),
         )
         if self.config.decode_cuda_graph_shape_policy == "batch_only":
+            bound_layers, workspace_bytes = bind_context_independent_triton_attention(
+                self.model,
+                max_batch_size=_resolve_decode_static_batch_capacity(
+                    decode_static_capture_sizes,
+                    max_num_seqs_in_batch=config.max_num_seqs_in_batch,
+                    max_decoding_seqs=config.max_decoding_seqs,
+                ),
+                device=self.device,
+            )
+            logger.info(
+                "Context-independent decode providers: generic_layers=%d "
+                "shared_workspace_mib=%.2f",
+                bound_layers,
+                workspace_bytes / (1024**2),
+            )
             validate_context_independent_decode_graph_model(self.model)
         if config.tiny_random:
             from sparsevllm.debug.tiny_random import initialize_sparse_model
