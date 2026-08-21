@@ -20,6 +20,9 @@ from sparsevllm.kernels.triton.gemma4_single_block_decode_attention import (
 from sparsevllm.kernels.triton.gemma4_window_decode_attention import (
     gemma4_window_decode,
 )
+from sparsevllm.kernels.triton.context_independent_gemma4_decode_attention import (
+    context_independent_gemma4_decode,
+)
 from sparsevllm.operators.gemma4_attention import Gemma4FlashInferPrefill
 from sparsevllm.utils.context import reset_context, set_context
 
@@ -319,6 +322,69 @@ def test_gemma4_decode_matches_torch(head_dim, sliding_window):
     assert cosine > 0.999
 
 
+@pytest.mark.parametrize("head_dim", [256, 512])
+@pytest.mark.parametrize("sliding_window", [None, 8])
+def test_context_independent_gemma4_decode_matches_torch_and_replays_new_lengths(
+    head_dim,
+    sliding_window,
+):
+    torch.manual_seed(9)
+    slots, lengths = _slots_and_lengths()
+    key = torch.randn(34, 2, head_dim, dtype=torch.bfloat16, device="cuda")
+    value = torch.randn_like(key)
+    query = torch.randn(2, 4, head_dim, dtype=torch.bfloat16, device="cuda")
+    mid = torch.empty(2, 4, 16, head_dim, dtype=torch.float32, device="cuda")
+    lse = torch.empty(2, 4, 16, dtype=torch.float32, device="cuda")
+    request_indices = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
+
+    def run():
+        return context_independent_gemma4_decode(
+            query,
+            key,
+            value,
+            slots,
+            request_indices,
+            lengths,
+            mid,
+            lse,
+            sliding_window=sliding_window,
+            target_tokens_per_split=8,
+        )
+
+    output = run()
+    reference = _decode_reference(
+        query,
+        key,
+        value,
+        slots,
+        lengths,
+        sliding_window,
+    )
+    cosine = torch.nn.functional.cosine_similarity(
+        output.float().flatten(), reference.float().flatten(), dim=0
+    )
+    assert cosine > 0.999
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_output = run()
+    lengths.copy_(torch.tensor([5, 11], dtype=torch.int32, device="cuda"))
+    query.copy_(torch.randn_like(query))
+    graph.replay()
+    reference = _decode_reference(
+        query,
+        key,
+        value,
+        slots,
+        lengths,
+        sliding_window,
+    )
+    cosine = torch.nn.functional.cosine_similarity(
+        graph_output.float().flatten(), reference.float().flatten(), dim=0
+    )
+    assert cosine > 0.999
+
+
 def test_gemma4_long_window_decode_matches_torch():
     torch.manual_seed(13)
     length, window, block_seq = 1486, 1024, 256
@@ -556,6 +622,51 @@ def test_gemma4_decode_collects_raw_qk_scores(score_dims):
                 @ key[indices, head // 2].float().T
             )
     expected = expected if score_dims == 3 else expected.max(1).values
+    torch.testing.assert_close(score, expected, rtol=2e-2, atol=1.0)
+
+
+@pytest.mark.parametrize("score_dims", [2, 3])
+def test_context_independent_gemma4_decode_collects_raw_qk_scores(score_dims):
+    torch.manual_seed(15)
+    slots, lengths = _slots_and_lengths()
+    query = torch.randn(2, 4, 256, dtype=torch.bfloat16, device="cuda")
+    key = torch.randn(34, 2, 256, dtype=torch.bfloat16, device="cuda")
+    value = torch.randn_like(key)
+    mid = torch.empty(2, 4, 16, 256, dtype=torch.float32, device="cuda")
+    lse = torch.empty(2, 4, 16, dtype=torch.float32, device="cuda")
+    score = torch.full(
+        (2, 4, 21) if score_dims == 3 else (2, 21),
+        -1e20,
+        dtype=torch.float32,
+        device="cuda",
+    )
+    context_independent_gemma4_decode(
+        query,
+        key,
+        value,
+        slots,
+        torch.tensor([0, 1], dtype=torch.int32, device="cuda"),
+        lengths,
+        mid,
+        lse,
+        sliding_window=None,
+        attn_score=score,
+        target_tokens_per_split=8,
+    )
+    expected = torch.full(
+        (2, 4, 21),
+        -1e20,
+        dtype=torch.float32,
+        device="cuda",
+    )
+    for batch, length in enumerate(lengths.tolist()):
+        for head in range(4):
+            indices = slots[batch, :length].long()
+            expected[batch, head, :length] = (
+                query[batch, head].float() @ key[indices, head // 2].float().T
+            )
+    if score_dims == 2:
+        expected = expected.max(1).values
     torch.testing.assert_close(score, expected, rtol=2e-2, atol=1.0)
 
 
