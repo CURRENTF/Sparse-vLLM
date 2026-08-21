@@ -7,13 +7,9 @@ from typing import Callable
 import torch
 
 from sparsevllm.engine.sequence import Sequence
-from sparsevllm.configs.cuda_graph import (
-    _default_decode_cuda_graph_context_sizes,
-    _select_decode_cuda_graph_batch_size,
-)
+from sparsevllm.configs.cuda_graph import _select_decode_cuda_graph_batch_size
 import sparsevllm.platforms as platforms
 from sparsevllm.utils.context import get_context, set_context
-from sparsevllm.utils.log import log_once
 from sparsevllm.utils.profiler import profiler
 
 
@@ -21,7 +17,13 @@ def _default_context_buckets(max_context_len: int) -> list[int]:
     max_context_len = int(max_context_len)
     if max_context_len <= 0:
         max_context_len = 1024
-    return _default_decode_cuda_graph_context_sizes(max_context_len)
+    size = min(1024, max_context_len)
+    buckets: list[int] = []
+    while size < max_context_len:
+        buckets.append(size)
+        size *= 2
+    buckets.append(size)
+    return sorted(set(buckets))
 
 
 def _normalize_context_buckets(value) -> list[int]:
@@ -112,11 +114,6 @@ class DecodeCudaGraphRunner:
         self.replay_count = 0
         self.eager_static_count = 0
         self.force_eager_count = 0
-        self.eviction_count = 0
-        self.recapture_count = 0
-        self._captured_keys: set[DecodeCudaGraphKey] = set()
-        self.last_actual_context_len: int | None = None
-        self.last_context_padding_ratio: float | None = None
 
     def _resolve_max_cached_graphs(self) -> int | None:
         resolver = getattr(self.cache_manager, "decode_cuda_graph_max_cached_graphs", None)
@@ -168,7 +165,6 @@ class DecodeCudaGraphRunner:
                     continue
                 state = self._graphs.pop(key)
                 self._release_graph_state(state)
-                self.eviction_count = getattr(self, "eviction_count", 0) + 1
                 break
             else:
                 break
@@ -339,33 +335,7 @@ class DecodeCudaGraphRunner:
                 or "current"
             ),
             "max_cached_graphs": self.max_cached_graphs,
-            "cached_graph_keys": [
-                {
-                    "method": key.method,
-                    "batch_size": key.batch_size,
-                    "context_capacity": key.context_capacity,
-                    "is_long_text": key.is_long_text,
-                    "capture_sampling": key.capture_sampling,
-                }
-                for key in self._graphs
-            ],
-            "capture_count": self.capture_count,
-            "eviction_count": self.eviction_count,
-            "recapture_count": self.recapture_count,
-            "last_actual_context_len": self.last_actual_context_len,
-            "last_context_padding_ratio": self.last_context_padding_ratio,
         }
-
-    def _record_context_selection(
-        self,
-        seqs: list[Sequence],
-        context_capacity: int,
-    ) -> None:
-        actual_context_len = max(int(seq.num_tokens) for seq in seqs)
-        self.last_actual_context_len = actual_context_len
-        self.last_context_padding_ratio = float(context_capacity) / max(
-            1, actual_context_len
-        )
 
     def _cache_manager_graph_context_capacity(self, seqs: list[Sequence]) -> tuple[int, bool] | None:
         resolver = getattr(self.cache_manager, "decode_cuda_graph_context_capacity", None)
@@ -503,19 +473,6 @@ class DecodeCudaGraphRunner:
         if sparse_keepalive is not None:
             keepalive.extend(sparse_keepalive())
         state.keepalive = keepalive
-        captured_keys = getattr(self, "_captured_keys", None)
-        if captured_keys is None:
-            captured_keys = set()
-            self._captured_keys = captured_keys
-        if state.key in captured_keys:
-            self.recapture_count = getattr(self, "recapture_count", 0) + 1
-            log_once(
-                "Decode CUDA graph was evicted and recaptured for "
-                f"key={state.key}; increase decode_cuda_graph_max_cached_graphs "
-                "if this repeats during steady-state serving.",
-                level="WARNING",
-            )
-        captured_keys.add(state.key)
         self.capture_count += 1
         return state
 
@@ -547,7 +504,6 @@ class DecodeCudaGraphRunner:
         graph_batch_size = self._select_graph_batch_size(real_batch_size)
         is_long_text = self.is_long_text_batch(seqs, False)
         context_capacity, allow_larger_context_capacity = self._graph_context_capacity_policy(seqs)
-        self._record_context_selection(seqs, context_capacity)
         state = self._select_state(
             method=self.method,
             batch_size=graph_batch_size,
@@ -588,7 +544,6 @@ class DecodeCudaGraphRunner:
         graph_batch_size = self._select_graph_batch_size(real_batch_size)
         is_long_text = self.is_long_text_batch(seqs, False)
         context_capacity, allow_larger_context_capacity = self._static_context_capacity_policy(seqs)
-        self._record_context_selection(seqs, context_capacity)
         state = self._select_state(
             method=self.method,
             batch_size=graph_batch_size,

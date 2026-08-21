@@ -11,10 +11,7 @@ import numpy as np
 import torch
 
 from sparsevllm.config import Config
-from sparsevllm.configs.cuda_graph import (
-    _default_decode_cuda_graph_context_sizes,
-    _resolve_decode_static_batch_capacity,
-)
+from sparsevllm.configs.cuda_graph import _resolve_decode_static_batch_capacity
 from sparsevllm.engine.cache_manager.standard import StandardCacheManager
 from sparsevllm.engine.cache_manager.deltakv import DeltaKVCacheManager
 from sparsevllm.engine.cache_manager.deltakv_less_memory import DeltaKVLessMemoryCacheManager
@@ -1476,48 +1473,13 @@ class PrefillPolicyConfigTest(unittest.TestCase):
                 decode_cuda_graph_capture_sizes=[1, 2, 4],
             )
 
-    def test_decode_cuda_graph_auto_context_sizes_use_fine_block_buckets(self):
+    def test_decode_cuda_graph_auto_context_sizes_use_powers_of_two_from_1k(self):
         cfg = self.make_config(
             vllm_sparse_method="omnikv",
             decode_cuda_graph=True,
             max_model_len=9000,
         )
-        self.assertEqual(
-            cfg.decode_cuda_graph_context_sizes,
-            [
-                1024,
-                1280,
-                1536,
-                1792,
-                2048,
-                2560,
-                3072,
-                3840,
-                4608,
-                5632,
-                6912,
-                8448,
-                9000,
-            ],
-        )
-        self.assertEqual(cfg.decode_cuda_graph_max_cached_graphs, 32)
-
-    def test_decode_cuda_graph_auto_context_sizes_bound_padding(self):
-        sizes = _default_decode_cuda_graph_context_sizes(131072)
-        self.assertEqual(sizes[-1], 131072)
-        self.assertTrue(all(size % 256 == 0 for size in sizes[:-1]))
-        self.assertTrue(all(left < right for left, right in zip(sizes, sizes[1:])))
-        self.assertTrue(
-            all(right / left <= 1.25 for left, right in zip(sizes, sizes[1:-1]))
-        )
-
-    def test_decode_cuda_graph_auto_context_sizes_preserve_short_limit(self):
-        cfg = self.make_config(
-            vllm_sparse_method="omnikv",
-            decode_cuda_graph=True,
-            max_model_len=900,
-        )
-        self.assertEqual(cfg.decode_cuda_graph_context_sizes, [900])
+        self.assertEqual(cfg.decode_cuda_graph_context_sizes, [1024, 2048, 4096, 8192, 9000])
 
     def test_decode_cuda_graph_explicit_context_sizes_are_sorted(self):
         cfg = self.make_config(
@@ -1733,7 +1695,6 @@ class DecodeCudaGraphCapacityPolicyTest(unittest.TestCase):
     def test_evict_cached_graphs_releases_oldest_unprotected_state(self):
         runner = self.make_runner("deltakv")
         runner.max_cached_graphs = 1
-        runner.eviction_count = 0
         runner._graphs = OrderedDict()
         old_key = DecodeCudaGraphKey("deltakv", 1, 1024, False, False)
         new_key = DecodeCudaGraphKey("deltakv", 1, 2048, False, False)
@@ -1750,20 +1711,6 @@ class DecodeCudaGraphCapacityPolicyTest(unittest.TestCase):
         self.assertIn(new_key, runner._graphs)
         self.assertEqual(old_state.keepalive, [])
         self.assertEqual(old_state.sparse_state_refs, {})
-        self.assertEqual(runner.eviction_count, 1)
-
-    def test_context_selection_observability_reports_padding(self):
-        runner = self.make_runner("quest")
-        runner.last_actual_context_len = None
-        runner.last_context_padding_ratio = None
-
-        runner._record_context_selection(
-            [self.make_seq(num_tokens=1025), self.make_seq(num_tokens=255)],
-            1280,
-        )
-
-        self.assertEqual(runner.last_actual_context_len, 1025)
-        self.assertAlmostEqual(runner.last_context_padding_ratio, 1280 / 1025)
 
     def test_deltakv_graph_uses_shared_decode_batch_bucket(self):
         runner = self.make_runner(
