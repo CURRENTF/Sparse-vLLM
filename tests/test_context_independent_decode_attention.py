@@ -125,6 +125,72 @@ def test_context_independent_decode_matches_reference(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("score_dims", [2, 3])
+def test_context_independent_decode_reduces_2d_scores_across_heads(
+    score_dims: int,
+) -> None:
+    torch.manual_seed(17)
+    device = torch.device("cuda")
+    batch, num_heads, num_kv_heads, head_dim = 2, 16, 2, 128
+    capacity, max_splits = 257, 8
+    q = torch.randn(batch, num_heads, head_dim, dtype=torch.bfloat16, device=device)
+    k = torch.randn(
+        batch * capacity,
+        num_kv_heads,
+        head_dim,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    v = torch.randn_like(k)
+    slots = torch.arange(
+        batch * capacity, dtype=torch.int64, device=device
+    ).view(batch, capacity)
+    req_indices = torch.arange(batch, dtype=torch.int64, device=device)
+    context_lens = torch.tensor([129, 257], dtype=torch.int32, device=device)
+    mid_o = torch.empty(
+        batch, num_heads, max_splits, head_dim, dtype=torch.float32, device=device
+    )
+    mid_lse = torch.empty(
+        batch, num_heads, max_splits, dtype=torch.float32, device=device
+    )
+    score_shape = (
+        (batch, capacity)
+        if score_dims == 2
+        else (batch, num_heads, capacity)
+    )
+    score = torch.full(score_shape, -1e20, dtype=torch.float32, device=device)
+
+    context_independent_flash_decode(
+        q,
+        k,
+        v,
+        slots,
+        req_indices,
+        context_lens,
+        mid_o,
+        mid_lse,
+        attn_score=score,
+        target_tokens_per_split=64,
+    )
+    _, expected_3d = _reference_decode(
+        q,
+        k,
+        v,
+        slots,
+        req_indices,
+        context_lens,
+    )
+    expected = expected_3d.amax(dim=1) if score_dims == 2 else expected_3d
+    for batch_id, length in enumerate(context_lens.tolist()):
+        torch.testing.assert_close(
+            score[batch_id, ..., :length],
+            expected[batch_id, ..., :length],
+            atol=2e-2,
+            rtol=2e-2,
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_context_independent_decode_graph_replays_different_lengths() -> None:
     torch.manual_seed(11)
     device = torch.device("cuda")

@@ -49,7 +49,7 @@ def _context_independent_decode_stage1(
     MAX_KV_SPLITS: tl.constexpr,
     MAX_EFFECTIVE_SPLITS: tl.constexpr,
     TARGET_TOKENS_PER_SPLIT: tl.constexpr,
-    HAS_SCORE: tl.constexpr,
+    SCORE_MODE: tl.constexpr,
 ):
     batch_id = tl.program_id(0)
     head_id = tl.program_id(1)
@@ -89,13 +89,16 @@ def _context_independent_decode_stage1(
         v = tl.load(V + v_offsets, mask=position_mask[:, None], other=0.0)
         logits = tl.sum(q[None, :].to(tl.float32) * k.to(tl.float32), axis=1)
         logits = tl.where(position_mask, logits, -float("inf"))
-        if HAS_SCORE:
+        if SCORE_MODE == 3:
             score_offsets = (
                 batch_id * stride_score_b
                 + head_id * stride_score_h
                 + positions * stride_score_s
             )
             tl.store(Attn_Score + score_offsets, logits, mask=position_mask)
+        elif SCORE_MODE == 2:
+            score_offsets = batch_id * stride_score_b + positions * stride_score_s
+            tl.atomic_max(Attn_Score + score_offsets, logits, mask=position_mask)
         logits *= sm_scale
 
         block_max = tl.max(logits, axis=0)
@@ -159,7 +162,7 @@ def _context_independent_grouped_decode_stage1(
     MAX_KV_SPLITS: tl.constexpr,
     MAX_EFFECTIVE_SPLITS: tl.constexpr,
     TARGET_TOKENS_PER_SPLIT: tl.constexpr,
-    HAS_SCORE: tl.constexpr,
+    SCORE_MODE: tl.constexpr,
 ):
     batch_id = tl.program_id(0)
     kv_head_id = tl.program_id(1)
@@ -202,7 +205,7 @@ def _context_independent_grouped_decode_stage1(
         v = tl.load(V + v_offsets, mask=position_mask[:, None], other=0.0)
         logits = tl.dot(q, k)
         logits = tl.where(position_mask[None, :], logits, -float("inf"))
-        if HAS_SCORE:
+        if SCORE_MODE == 3:
             score_offsets = (
                 batch_id * stride_score_b
                 + query_heads[:, None] * stride_score_h
@@ -212,6 +215,17 @@ def _context_independent_grouped_decode_stage1(
                 Attn_Score + score_offsets,
                 logits,
                 mask=head_mask[:, None] & position_mask[None, :],
+            )
+        elif SCORE_MODE == 2:
+            score_offsets = batch_id * stride_score_b + positions * stride_score_s
+            reduced_logits = tl.max(
+                tl.where(head_mask[:, None], logits, -float("inf")),
+                axis=0,
+            )
+            tl.atomic_max(
+                Attn_Score + score_offsets,
+                reduced_logits,
+                mask=position_mask,
             )
         logits *= sm_scale
 
@@ -413,7 +427,7 @@ def context_independent_flash_decode(
         MAX_KV_SPLITS=max_kv_splits,
         MAX_EFFECTIVE_SPLITS=max_effective_splits,
         TARGET_TOKENS_PER_SPLIT=target_tokens_per_split,
-        HAS_SCORE=attn_score is not None,
+        SCORE_MODE=0 if attn_score is None else attn_score.dim(),
         num_warps=num_warps,
         num_stages=2,
     )
