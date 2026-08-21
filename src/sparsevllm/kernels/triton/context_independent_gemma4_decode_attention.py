@@ -47,6 +47,7 @@ def _gemma4_context_independent_stage1(
     MAX_KV_SPLITS: tl.constexpr,
     TARGET_TOKENS_PER_SPLIT: tl.constexpr,
     SCORE_MODE: tl.constexpr,
+    SAFE_FP32_REDUCTION: tl.constexpr,
 ):
     batch = tl.program_id(0)
     query_head = tl.program_id(1)
@@ -90,10 +91,16 @@ def _gemma4_context_independent_stage1(
             mask=visible[None, :],
             other=0.0,
         )
-        logits = tl.reshape(
-            tl.dot(query[None, :], key),
-            (BLOCK_N,),
-        ) * 1.4426950408889634
+        if SAFE_FP32_REDUCTION:
+            logits = tl.sum(
+                query[:, None].to(tl.float32) * key.to(tl.float32),
+                axis=0,
+            ) * 1.4426950408889634
+        else:
+            logits = tl.reshape(
+                tl.dot(query[None, :], key),
+                (BLOCK_N,),
+            ) * 1.4426950408889634
         if SCORE_MODE == 3:
             tl.store(
                 attn_score
@@ -121,10 +128,16 @@ def _gemma4_context_independent_stage1(
             mask=visible[:, None],
             other=0.0,
         )
-        accumulator += tl.reshape(
-            tl.dot(probabilities[None, :].to(value.dtype), value),
-            (HEAD_DIM,),
-        )
+        if SAFE_FP32_REDUCTION:
+            accumulator += tl.sum(
+                probabilities[:, None] * value.to(tl.float32),
+                axis=0,
+            )
+        else:
+            accumulator += tl.reshape(
+                tl.dot(probabilities[None, :].to(value.dtype), value),
+                (HEAD_DIM,),
+            )
         max_logit = next_max
 
     mid_offset = batch * stride_mob + query_head * stride_moh + split * stride_mos
@@ -380,7 +393,8 @@ def context_independent_gemma4_decode(
     sliding_window: int | None,
     attn_score: torch.Tensor | None = None,
     target_tokens_per_split: int = 1024,
-    use_grouped_no_score: bool | None = None,
+    use_grouped_no_score: bool = True,
+    safe_fp32_reduction: bool = False,
 ) -> torch.Tensor:
     head_dim = int(q.shape[-1])
     if q.ndim != 3 or k.ndim != 3 or v.shape != k.shape:
@@ -411,9 +425,6 @@ def context_independent_gemma4_decode(
         if head_dim == 256 and group_size in {2, 4}
         else (4 if group_size % 4 == 0 else 2)
     )
-    if use_grouped_no_score is None:
-        device_name = torch.cuda.get_device_name(q.device)
-        use_grouped_no_score = sliding_window is not None or "H20" not in device_name
     use_grouped = (
         attn_score is None
         and use_grouped_no_score
@@ -492,6 +503,7 @@ def context_independent_gemma4_decode(
             MAX_KV_SPLITS=max_splits,
             TARGET_TOKENS_PER_SPLIT=int(target_tokens_per_split),
             SCORE_MODE=0 if attn_score is None else attn_score.dim(),
+            SAFE_FP32_REDUCTION=bool(safe_fp32_reduction),
             num_warps=8,
             num_stages=1,
         )

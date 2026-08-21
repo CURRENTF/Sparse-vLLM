@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 import torch
 
+from sparsevllm import platforms
 from sparsevllm.kernels.triton.context_independent_gemma4_decode_attention import (
     context_independent_gemma4_decode,
 )
@@ -36,6 +37,8 @@ class ContextIndependentGemma4AttentionBackend(Gemma4AttentionBackend):
         baseline: Gemma4AttentionBackend,
         workspace: _Gemma4DecodeWorkspace,
         target_tokens_per_split: int = 256,
+        use_grouped_no_score: bool = True,
+        safe_fp32_reduction: bool = False,
     ) -> None:
         super().__init__(
             sliding_window=baseline.sliding_window,
@@ -45,16 +48,10 @@ class ContextIndependentGemma4AttentionBackend(Gemma4AttentionBackend):
         )
         self.workspace = workspace
         self.target_tokens_per_split = int(target_tokens_per_split)
-        device_name = (
-            torch.cuda.get_device_name(workspace.mid_output.device)
-            if workspace.mid_output.device.type == "cuda"
-            else ""
-        )
-        # H20 Triton miscompiles the grouped global partial-tile path; the
-        # per-query-head copy is correct there. Window attention is unaffected.
-        self.use_grouped_no_score = (
-            self.sliding_window is not None or "H20" not in device_name
-        )
+        self.use_grouped_no_score = bool(use_grouped_no_score)
+        self.safe_fp32_reduction = bool(safe_fp32_reduction)
+        if self.sliding_window is None and self.safe_fp32_reduction:
+            self.name = "triton_gemma4_context_independent_h20_safe"
 
     def get_decode_workspace(
         self,
@@ -123,6 +120,7 @@ class ContextIndependentGemma4AttentionBackend(Gemma4AttentionBackend):
             attn_score=view.meta.attn_score,
             target_tokens_per_split=self.target_tokens_per_split,
             use_grouped_no_score=self.use_grouped_no_score,
+            safe_fp32_reduction=self.safe_fp32_reduction,
         )
 
 
@@ -134,6 +132,9 @@ def bind_context_independent_gemma4_attention(
     global_max_kv_splits: int = 64,
     window_max_kv_splits: int = 16,
 ) -> tuple[int, int]:
+    device_index = 0 if device.index is None else int(device.index)
+    device_name = platforms.current_platform.get_device_caps(device_index).device_name
+    use_h20_global_safe_path = "H20" in device_name
     workspaces: dict[tuple[int, int, int], _Gemma4DecodeWorkspace] = {}
     bound = 0
     for module in model.modules():
@@ -166,6 +167,14 @@ def bind_context_independent_gemma4_attention(
         module.attention_backend = ContextIndependentGemma4AttentionBackend(
             baseline=baseline,
             workspace=workspace,
+            # H20 global HD=512 reductions are unstable in the tensor-core path.
+            # Window attention is unaffected and keeps the tuned grouped kernel.
+            use_grouped_no_score=(
+                baseline.sliding_window is not None or not use_h20_global_safe_path
+            ),
+            safe_fp32_reduction=(
+                baseline.sliding_window is None and use_h20_global_safe_path
+            ),
         )
         bound += 1
     return bound, sum(workspace.nbytes for workspace in workspaces.values())
