@@ -279,13 +279,11 @@ class ModelRunner:
                 device=self.device,
             )
             logger.info(
-                "Context-independent decode providers: mla=%s gemma_layers=%d "
-                "qwen35_linear_layers=%d generic_layers=%d shared_workspace_mib=%.2f",
-                mla_provider or "none",
-                gemma_layers,
-                qwen35_linear_layers,
-                bound_layers,
-                (workspace_bytes + gemma_workspace_bytes) / (1024**2),
+                "Context-independent decode providers: "
+                f"mla={mla_provider or 'none'} gemma_layers={gemma_layers} "
+                f"qwen35_linear_layers={qwen35_linear_layers} "
+                f"generic_layers={bound_layers} shared_workspace_mib="
+                f"{(workspace_bytes + gemma_workspace_bytes) / (1024**2):.2f}"
             )
             validate_context_independent_decode_graph_model(self.model)
         if config.tiny_random:
