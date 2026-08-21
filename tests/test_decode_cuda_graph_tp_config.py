@@ -24,6 +24,7 @@ class DecodeCudaGraphTPConfigTest(unittest.TestCase):
         )
 
     def _config(self, method: str, *, model_name: str = "TinyModel", **kwargs):
+        tensor_parallel_size = kwargs.pop("tensor_parallel_size", 2)
         with tempfile.TemporaryDirectory() as tmp:
             model_dir = Path(tmp) / model_name
             model_dir.mkdir()
@@ -32,7 +33,7 @@ class DecodeCudaGraphTPConfigTest(unittest.TestCase):
                     model=str(model_dir),
                     vllm_sparse_method=method,
                     decode_cuda_graph=True,
-                    tensor_parallel_size=2,
+                    tensor_parallel_size=tensor_parallel_size,
                     max_decoding_seqs=4,
                     **kwargs,
                 )
@@ -59,6 +60,15 @@ class DecodeCudaGraphTPConfigTest(unittest.TestCase):
     def test_tp_decode_cuda_graph_rejects_deltakv(self):
         with self.assertRaisesRegex(ValueError, "DeltaKV is not supported"):
             self._config("deltakv", allow_missing_deltakv_path=True)
+
+    def test_batch_only_decode_cuda_graph_rejects_deltakv_provider_paths(self):
+        with self.assertRaisesRegex(ValueError, "does not support DeltaKV"):
+            self._config(
+                "deltakv-less-memory-cudagraph",
+                tensor_parallel_size=1,
+                decode_cuda_graph_shape_policy="batch_only",
+                allow_missing_deltakv_path=True,
+            )
 
     def test_tp_decode_cuda_graph_accepts_prefix_cache_methods(self):
         for method in ["vanilla", "omnikv", "quest"]:

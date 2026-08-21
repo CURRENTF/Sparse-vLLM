@@ -515,6 +515,16 @@ def normalize_decode_cuda_graph(config, *, legacy_deltakv_graph_method: bool) ->
     config.decode_cuda_graph_shape_policy = _normalize_decode_cuda_graph_shape_policy(
         getattr(config, "decode_cuda_graph_shape_policy", "bucketed")
     )
+    if (
+        config.decode_cuda_graph
+        and config.decode_cuda_graph_shape_policy == "batch_only"
+        and str(config.vllm_sparse_method or "") == "deltakv"
+    ):
+        raise ValueError(
+            "decode_cuda_graph_shape_policy='batch_only' does not support DeltaKV: "
+            "its full-layer KIVI and sparse decode views do not yet have validated "
+            "context-independent providers. Use 'bucketed'."
+        )
     if config.decode_cuda_graph_max_cached_graphs is not None:
         config.decode_cuda_graph_max_cached_graphs = int(config.decode_cuda_graph_max_cached_graphs)
         if config.decode_cuda_graph_max_cached_graphs <= 0:
