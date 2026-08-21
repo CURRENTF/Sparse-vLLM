@@ -107,3 +107,59 @@ def test_glm_config_rejects_nondivisible_outer_tp_moe_ep_layout():
 def test_glm_config_rejects_data_parallelism():
     with pytest.raises(ValueError, match="does not support data parallelism"):
         _glm_config(data_parallel_size=2)
+
+
+def test_glm_config_defaults_to_bounded_vanilla_startup_graph_capture():
+    config = _glm_config(decode_cuda_graph=True)
+
+    assert config.decode_cuda_graph_startup_capture is True
+    assert config.decode_cuda_graph_startup_capture_limit == 32
+    assert config.decode_cuda_graph_max_cached_graphs == 32
+
+
+def test_glm_config_allows_disabling_default_startup_graph_capture():
+    config = _glm_config(
+        decode_cuda_graph=True,
+        decode_cuda_graph_startup_capture=False,
+    )
+
+    assert config.decode_cuda_graph_startup_capture is False
+    assert config.decode_cuda_graph_max_cached_graphs is None
+
+
+def test_glm_config_defaults_to_larger_sparse_startup_capture_budget():
+    config = _glm_config(
+        decode_cuda_graph=True,
+        vllm_sparse_method="snapkv",
+    )
+
+    assert config.decode_cuda_graph_startup_capture is True
+    assert config.decode_cuda_graph_startup_capture_limit == 48
+    assert config.decode_cuda_graph_max_cached_graphs == 48
+
+
+def test_glm_config_rejects_startup_capture_without_cuda_graph():
+    with pytest.raises(ValueError, match="requires decode_cuda_graph=True"):
+        _glm_config(decode_cuda_graph_startup_capture=True)
+
+
+def test_glm_config_allows_disabling_sparse_startup_capture():
+    config = _glm_config(
+        decode_cuda_graph=True,
+        decode_cuda_graph_startup_capture=False,
+        vllm_sparse_method="snapkv",
+    )
+
+    assert config.decode_cuda_graph_startup_capture is False
+    assert config.decode_cuda_graph_max_cached_graphs is None
+
+
+def test_glm_config_rejects_startup_budget_smaller_than_batch_plan():
+    with pytest.raises(ValueError, match="must cover every batch bucket"):
+        _glm_config(
+            decode_cuda_graph=True,
+            decode_cuda_graph_startup_capture=True,
+            decode_cuda_graph_capture_sizes=[1, 2, 3, 4, 5],
+            decode_cuda_graph_max_cached_graphs=4,
+            max_decoding_seqs=5,
+        )

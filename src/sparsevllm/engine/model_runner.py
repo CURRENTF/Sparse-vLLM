@@ -20,6 +20,7 @@ from sparsevllm.engine.sequence import Sequence
 from sparsevllm.models.qwen2 import Qwen2ForCausalLM
 from sparsevllm.models.llama import LlamaForCausalLM
 from sparsevllm.layers.sampler import Sampler
+from sparsevllm.method_registry import decode_sparse_long_text_threshold
 from sparsevllm.operators import registry as operator_registry
 from sparsevllm.utils.context import set_context, get_context, reset_context
 from sparsevllm.utils.loader import load_model, sync_deltakv_config_from_checkpoint
@@ -923,8 +924,19 @@ class ModelRunner:
             "force_eager_count": int(
                 getattr(graph_runner, "force_eager_count", 0)
             ),
+            "eviction_count": int(
+                getattr(graph_runner, "eviction_count", 0)
+            ),
+            "recapture_count": int(
+                getattr(graph_runner, "recapture_count", 0)
+            ),
             "cached_graph_count": len(
                 getattr(graph_runner, "_graphs", {})
+            ),
+            "bucket_plan": (
+                graph_runner.bucket_plan()
+                if callable(getattr(graph_runner, "bucket_plan", None))
+                else None
             ),
             "last_state_key": (
                 {
@@ -1152,15 +1164,12 @@ class ModelRunner:
 
     def _long_text_threshold(self, is_prefill: bool) -> int:
         del is_prefill
-        if self.config.sparse_method in ("streamingllm", "attention-sink", "attention_sink"):
-            base = self.config.sink_keep_tokens + self.config.recent_keep_tokens
-        else:
-            base = (
-                self.config.sink_keep_tokens
-                + self.config.recent_keep_tokens
-                + self.config.decode_keep_tokens
-            )
-        return base
+        return decode_sparse_long_text_threshold(
+            self.config.sparse_method,
+            num_sink_tokens=self.config.sink_keep_tokens,
+            decode_keep_tokens=self.config.decode_keep_tokens,
+            num_recent_tokens=self.config.recent_keep_tokens,
+        )
 
     def _is_long_text_batch(self, seqs: list[Sequence], is_prefill: bool) -> bool:
         # Prefill execution is per-sequence and cache-manager owned.  This
@@ -1220,13 +1229,11 @@ class ModelRunner:
     def _auto_capture_greedy_sampling(self, seqs: list[Sequence]) -> bool:
         if any(self._has_sampling_penalty(seq) for seq in seqs):
             return False
-        if self.config.decode_graph_capture_sampling:
-            return all(bool(getattr(seq, "should_publish_sample", True)) for seq in seqs)
+        if not self.config.decode_graph_capture_sampling:
+            return False
         if self.config.tensor_parallel_size != 1:
             return False
         if self.config.enable_prefix_caching:
-            return False
-        if str(self.config.sparse_method or "") not in {"", "omnikv"}:
             return False
         return all(
             bool(getattr(seq, "should_publish_sample", True))
@@ -1345,6 +1352,16 @@ class ModelRunner:
 
     def set_decode_cuda_graph_max_context_len_override(self, max_context_len: int | None):
         self.decode_graph_runner.set_max_context_len_override(max_context_len)
+
+    def set_decode_cuda_graph_reuse_larger_context_graphs(self, enabled: bool):
+        self.decode_cuda_graph_runner.set_reuse_larger_context_graphs(enabled)
+
+    def capture_decode_cuda_graph_warmup(self, seqs: list[Sequence]) -> None:
+        """Capture one planned graph without advancing scheduler sequence state."""
+        try:
+            self.decode_cuda_graph_runner.run(seqs, capture_sampling=False)
+        finally:
+            reset_context()
 
     def set_omnikv_decode_graph_max_context_len_override(self, max_context_len: int | None):
         self.set_decode_cuda_graph_max_context_len_override(max_context_len)
