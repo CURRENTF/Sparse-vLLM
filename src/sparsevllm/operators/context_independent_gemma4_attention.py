@@ -133,7 +133,7 @@ def bind_context_independent_gemma4_attention(
     max_batch_size: int,
     device: torch.device,
     global_max_kv_splits: int = 64,
-    window_max_kv_splits: int = 16,
+    window_max_kv_splits: int = 4,
 ) -> tuple[int, int]:
     device_index = 0 if device.index is None else int(device.index)
     device_name = platforms.current_platform.get_device_caps(device_index).device_name
