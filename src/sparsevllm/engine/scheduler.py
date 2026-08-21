@@ -11,6 +11,7 @@ from sparsevllm.engine.prefill import (
 )
 from sparsevllm.engine.sequence import Sequence, SequenceStatus
 from sparsevllm.engine.runtime_state import MemoryOracle
+from sparsevllm.method_registry import decode_sparse_long_text_threshold
 from sparsevllm.sampling_params import resolve_eos_token_ids
 from sparsevllm.utils.log import logger
 
@@ -67,11 +68,13 @@ class Scheduler:
 
     def _long_text_threshold(self, is_prefill: bool) -> int:
         """Long-text boundary retained only for decode batch partitioning."""
-        if self.config.vllm_sparse_method in ("streamingllm", "attention-sink", "attention_sink"):
-            base = self.num_sink_tokens + self.num_recent_tokens
-        else:
-            base = self.num_sink_tokens + self.decode_keep_tokens + self.num_recent_tokens
-        return base
+        del is_prefill
+        return decode_sparse_long_text_threshold(
+            self.config.vllm_sparse_method,
+            num_sink_tokens=self.num_sink_tokens,
+            decode_keep_tokens=self.decode_keep_tokens,
+            num_recent_tokens=self.num_recent_tokens,
+        )
 
     def _is_long_text(self, seq: Sequence, is_prefill: bool) -> bool:
         if not self.config.vllm_sparse_method:

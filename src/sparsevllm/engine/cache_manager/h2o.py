@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 
 from sparsevllm.engine.sequence import Sequence
+from sparsevllm.method_registry import fixed_decode_cuda_graph_context_capacity
 from sparsevllm.utils.context import get_context
 from sparsevllm.utils.profiler import profiler
 
@@ -247,10 +248,13 @@ class H2OCacheManager(SnapKVCacheManager):
     ) -> tuple[int, bool]:
         """Capture H2O's periodic decode peak instead of logical prompt length."""
         del seqs, requested_context_capacity, current_context_capacity
-        capacity = min(
-            self.h2o_decode_budget + self.h2o_decode_eviction_interval,
-            int(self.config.max_model_len),
+        capacity = fixed_decode_cuda_graph_context_capacity(
+            "h2o",
+            max_model_len=self.config.max_model_len,
+            h2o_decode_budget=self.h2o_decode_budget,
+            h2o_decode_eviction_interval=self.h2o_decode_eviction_interval,
         )
+        assert capacity is not None
         return max(1, capacity), False
 
     @torch.no_grad()

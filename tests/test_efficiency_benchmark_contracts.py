@@ -12,6 +12,7 @@ from benchmark.efficiency.bench_probe import (
     _actual_hardware_metrics,
     _attach_churn_comparisons,
     _attach_saturation_metrics,
+    _decode_graph_counter_delta,
     _record_batch_first_tokens,
     _resolve_sparse_probe_protocol,
     _vllm_phase_metrics,
@@ -55,6 +56,23 @@ def test_probe_cli_parser_builds_with_new_workload_options(monkeypatch):
     assert args.churn_request_multiplier == 4
 
 
+def test_decode_graph_counter_delta_reports_runtime_capture_churn():
+    delta = _decode_graph_counter_delta(
+        {"capture_count": 28, "replay_count": 10, "eviction_count": 0},
+        {
+            "capture_count": 30,
+            "replay_count": 110,
+            "eviction_count": 2,
+            "recapture_count": 1,
+        },
+    )
+
+    assert delta["capture_count"] == 2
+    assert delta["replay_count"] == 100
+    assert delta["eviction_count"] == 2
+    assert delta["recapture_count"] == 1
+
+
 def test_unknown_hardware_does_not_fall_back_to_h100():
     with pytest.raises(ValueError, match="Unknown GPU hardware"):
         detect_gpu_hardware("Mystery Accelerator")
@@ -69,6 +87,26 @@ def test_ambiguous_h100_requires_explicit_profile():
 def test_model_specs_require_real_architecture_fields():
     with pytest.raises(ValueError, match="missing required architecture fields"):
         ModelArchitectureSpecs.from_config_dict({"hidden_size": 2048})
+
+
+def test_model_specs_resolve_mla_qk_head_dim():
+    specs = ModelArchitectureSpecs.from_config_dict(
+        {
+            "hidden_size": 2048,
+            "num_hidden_layers": 47,
+            "num_attention_heads": 20,
+            "num_key_value_heads": 20,
+            "qk_nope_head_dim": 192,
+            "qk_rope_head_dim": 64,
+            "vocab_size": 154880,
+            "n_routed_experts": 64,
+            "num_experts_per_tok": 4,
+            "moe_intermediate_size": 1536,
+            "intermediate_size": 10240,
+        }
+    )
+
+    assert specs.head_dim == 256
 
 
 def test_probe_writes_metric_failed_when_model_discovery_fails(tmp_path, monkeypatch):

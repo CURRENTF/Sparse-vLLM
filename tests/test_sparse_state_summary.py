@@ -120,7 +120,10 @@ def test_model_runner_gathers_one_debug_summary_per_world_rank():
         "replay_count": 3,
         "eager_static_count": 0,
         "force_eager_count": 0,
+        "eviction_count": 0,
+        "recapture_count": 0,
         "cached_graph_count": 1,
+        "bucket_plan": None,
         "last_state_key": {
             "method": "snapkv",
             "batch_size": 2,

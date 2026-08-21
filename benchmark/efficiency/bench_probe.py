@@ -84,6 +84,26 @@ def _percentile(values: list[float], quantile: float) -> float:
     return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
 
 
+_DECODE_GRAPH_COUNTERS = (
+    "capture_count",
+    "replay_count",
+    "eager_static_count",
+    "force_eager_count",
+    "eviction_count",
+    "recapture_count",
+)
+
+
+def _decode_graph_counter_delta(
+    before: dict[str, Any],
+    after: dict[str, Any],
+) -> dict[str, int]:
+    return {
+        name: int(after.get(name, 0)) - int(before.get(name, 0))
+        for name in _DECODE_GRAPH_COUNTERS
+    }
+
+
 def _monitor_gpu_ids(explicit: str | None) -> list[int]:
     value = explicit or os.environ.get("CUDA_VISIBLE_DEVICES", "")
     if not value:
@@ -788,7 +808,12 @@ def run_sparsevllm_churn(
             "[Sparse-vLLM Churn] Initializing "
             f"method={args.sparse_method}, max_concurrency={concurrency}..."
         )
+        engine_init_started = time.perf_counter()
         llm = LLM(args.model_path, **engine_kwargs)
+        engine_init_s = time.perf_counter() - engine_init_started
+        startup_graph_summary = llm.debug_sparse_state_summaries()[0][
+            "decode_cuda_graph"
+        ]
         try:
             request_count = concurrency * args.churn_request_multiplier
             for p_len in args.prompt_lens:
@@ -828,6 +853,9 @@ def run_sparsevllm_churn(
                     try:
                         for iteration in range(args.num_iters):
                             profiler.reset()
+                            graph_before = llm.debug_sparse_state_summaries()[0][
+                                "decode_cuda_graph"
+                            ]
                             trace = _trace_for_iteration(
                                 args,
                                 model_specs,
@@ -890,6 +918,9 @@ def run_sparsevllm_churn(
                                     finished_times[seq_id] = now
                                     generated_counts[seq_id] = len(token_ids)
                             elapsed_s = time.perf_counter() - started
+                            graph_after = llm.debug_sparse_state_summaries()[0][
+                                "decode_cuda_graph"
+                            ]
 
                             expected_seq_ids = set(seq_to_request)
                             for name, observed in (
@@ -945,6 +976,13 @@ def run_sparsevllm_churn(
                                 "status": "success",
                                 "elapsed_s": elapsed_s,
                                 "step_count": step_count,
+                                "engine_init_s": engine_init_s,
+                                "startup_decode_cuda_graph": startup_graph_summary,
+                                "decode_cuda_graph_before": graph_before,
+                                "decode_cuda_graph_after": graph_after,
+                                "decode_cuda_graph_counter_delta": (
+                                    _decode_graph_counter_delta(graph_before, graph_after)
+                                ),
                                 "request_throughput_rps": request_count / elapsed_s,
                                 "input_token_throughput_tps": total_input / elapsed_s,
                                 "output_token_throughput_tps": total_output / elapsed_s,

@@ -11,7 +11,10 @@ import numpy as np
 import torch
 
 from sparsevllm.config import Config
-from sparsevllm.configs.cuda_graph import _resolve_decode_static_batch_capacity
+from sparsevllm.configs.cuda_graph import (
+    _default_decode_cuda_graph_capture_sizes,
+    _resolve_decode_static_batch_capacity,
+)
 from sparsevllm.engine.cache_manager.standard import StandardCacheManager
 from sparsevllm.engine.cache_manager.deltakv import DeltaKVCacheManager
 from sparsevllm.engine.cache_manager.deltakv_less_memory import DeltaKVLessMemoryCacheManager
@@ -1285,9 +1288,9 @@ class PrefillPolicyConfigTest(unittest.TestCase):
     def test_decode_cuda_graph_auto_capture_sizes_end_at_decode_limit(self):
         for max_decoding_seqs, expected_sizes in (
             (1, [1]),
-            (6, [1, 2, 4, 6]),
-            (8, [1, 2, 4, 8]),
-            (24, [1, 2, 4, 8, 16, 24]),
+            (6, [1, 2, 3, 4, 5, 6]),
+            (8, [1, 2, 3, 4, 5, 6, 7, 8]),
+            (24, [1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 20, 24]),
         ):
             with self.subTest(max_decoding_seqs=max_decoding_seqs):
                 cfg = self.make_config(
@@ -1298,6 +1301,15 @@ class PrefillPolicyConfigTest(unittest.TestCase):
                 self.assertEqual(cfg.decode_cuda_graph_capture_sizes, expected_sizes)
                 self.assertTrue(cfg.decode_graph)
                 self.assertEqual(cfg.decode_graph_capture_sizes, expected_sizes)
+
+    def test_decode_cuda_graph_auto_capture_sizes_are_bounded_for_large_limits(self):
+        for max_decoding_seqs in (64, 80, 128, 256, 1024):
+            with self.subTest(max_decoding_seqs=max_decoding_seqs):
+                sizes = _default_decode_cuda_graph_capture_sizes(max_decoding_seqs)
+                self.assertLessEqual(len(sizes), 32)
+                self.assertEqual(sizes[:8], list(range(1, 9)))
+                self.assertEqual(sizes[-1], max_decoding_seqs)
+                self.assertEqual(sizes, sorted(set(sizes)))
 
     def test_decode_static_batch_capacity_uses_reachable_padding_bucket(self):
         cases = (
@@ -1351,10 +1363,10 @@ class PrefillPolicyConfigTest(unittest.TestCase):
             enable_prefix_caching=False,
             vllm_sparse_method="",
         )
-        self.assertTrue(runner._auto_capture_greedy_sampling(seqs))
+        self.assertFalse(runner._auto_capture_greedy_sampling(seqs))
 
         runner.config.vllm_sparse_method = "omnikv"
-        self.assertTrue(runner._auto_capture_greedy_sampling(seqs))
+        self.assertFalse(runner._auto_capture_greedy_sampling(seqs))
 
         runner.config.vllm_sparse_method = "quest"
         self.assertFalse(runner._auto_capture_greedy_sampling(seqs))
@@ -1372,7 +1384,13 @@ class PrefillPolicyConfigTest(unittest.TestCase):
         self.assertFalse(runner._auto_capture_greedy_sampling(seqs))
 
         runner.config.decode_cuda_graph_capture_sampling = True
+        self.assertFalse(runner._auto_capture_greedy_sampling(seqs))
+        runner.config.tensor_parallel_size = 1
         self.assertTrue(runner._auto_capture_greedy_sampling(seqs))
+
+        seqs[0].temperature = 0.7
+        self.assertFalse(runner._auto_capture_greedy_sampling(seqs))
+        seqs[0].temperature = 0.0
 
         seqs[0].presence_penalty = 0.1
         self.assertFalse(runner._auto_capture_greedy_sampling(seqs))
