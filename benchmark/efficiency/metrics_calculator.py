@@ -154,22 +154,22 @@ class ModelArchitectureSpecs:
                 "Model config must have positive num_attention_heads, got "
                 f"num_attention_heads={num_attention_heads}."
             )
-        configured_head_dim = cfg.get("head_dim")
-        if configured_head_dim is None:
+        explicit_head_dim = cfg.get("head_dim")
+        if explicit_head_dim is None and cfg.get("qk_nope_head_dim") is not None:
+            explicit_head_dim = int(cfg["qk_nope_head_dim"]) + int(
+                cfg.get("qk_rope_head_dim", 0)
+            )
+        if explicit_head_dim is None:
             if hidden_size % num_attention_heads != 0:
                 raise ValueError(
-                    "Model config without an explicit head_dim requires "
-                    "num_attention_heads to divide hidden_size, got "
-                    f"hidden_size={hidden_size}, "
-                    f"num_attention_heads={num_attention_heads}."
+                    "Model config must define head_dim when hidden_size is not "
+                    "divisible by num_attention_heads, got "
+                    f"hidden_size={hidden_size}, num_attention_heads={num_attention_heads}."
                 )
-            head_dim = hidden_size // num_attention_heads
-        else:
-            head_dim = int(configured_head_dim)
-            if head_dim <= 0:
-                raise ValueError(
-                    f"Model config head_dim must be positive, got {head_dim}."
-                )
+            explicit_head_dim = hidden_size // num_attention_heads
+        head_dim = int(explicit_head_dim)
+        if head_dim <= 0:
+            raise ValueError(f"Model config must have positive head_dim, got {head_dim}.")
         vocab_size = int(cfg["vocab_size"])
 
         # MoE parameters

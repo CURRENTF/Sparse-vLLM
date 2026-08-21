@@ -114,6 +114,10 @@ class DecodeCudaGraphRunner:
         self.replay_count = 0
         self.eager_static_count = 0
         self.force_eager_count = 0
+        self.eviction_count = 0
+        self.recapture_count = 0
+        self._captured_keys: set[DecodeCudaGraphKey] = set()
+        self.reuse_larger_context_graphs = False
 
     def _resolve_max_cached_graphs(self) -> int | None:
         resolver = getattr(self.cache_manager, "decode_graph_max_cached_graphs", None)
@@ -129,6 +133,9 @@ class DecodeCudaGraphRunner:
 
     def set_max_context_len_override(self, max_context_len: int | None):
         self.max_context_len_override = None if max_context_len is None else int(max_context_len)
+
+    def set_reuse_larger_context_graphs(self, enabled: bool):
+        self.reuse_larger_context_graphs = bool(enabled)
 
     def clear_captured_graphs(self):
         for state in list(self._graphs.values()):
@@ -165,6 +172,7 @@ class DecodeCudaGraphRunner:
                     continue
                 state = self._graphs.pop(key)
                 self._release_graph_state(state)
+                self.eviction_count = int(getattr(self, "eviction_count", 0)) + 1
                 break
             else:
                 break
@@ -318,13 +326,17 @@ class DecodeCudaGraphRunner:
             or "current"
         ).strip().lower()
         if policy in {"requested", "request", "final"}:
-            return self._requested_context_capacity(seqs), False
+            return self._requested_context_capacity(seqs), bool(
+                getattr(self, "reuse_larger_context_graphs", False)
+            )
         if policy not in {"current", "cur", "now"}:
             raise ValueError(
                 "decode_graph_context_policy must be 'current' or 'requested', "
                 f"got {policy!r}."
             )
-        return self._current_context_capacity(seqs), False
+        return self._current_context_capacity(seqs), bool(
+            getattr(self, "reuse_larger_context_graphs", False)
+        )
 
     def bucket_plan(self) -> dict[str, object]:
         return {
@@ -335,6 +347,17 @@ class DecodeCudaGraphRunner:
                 or "current"
             ),
             "max_cached_graphs": self.max_cached_graphs,
+            "cached_graph_keys": [
+                {
+                    "method": key.method,
+                    "batch_size": key.batch_size,
+                    "context_capacity": key.context_capacity,
+                    "is_long_text": key.is_long_text,
+                    "capture_sampling": key.capture_sampling,
+                }
+                for key, state in self._graphs.items()
+                if state.graph is not None
+            ],
         }
 
     def _cache_manager_graph_context_capacity(self, seqs: list[Sequence]) -> tuple[int, bool] | None:
@@ -473,6 +496,14 @@ class DecodeCudaGraphRunner:
         if sparse_keepalive is not None:
             keepalive.extend(sparse_keepalive())
         state.keepalive = keepalive
+        captured_keys = getattr(self, "_captured_keys", None)
+        if captured_keys is None:
+            captured_keys = set()
+            self._captured_keys = captured_keys
+        if state.key in captured_keys:
+            self.recapture_count = int(getattr(self, "recapture_count", 0)) + 1
+        else:
+            captured_keys.add(state.key)
         self.capture_count += 1
         return state
 

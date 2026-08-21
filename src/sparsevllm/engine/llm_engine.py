@@ -14,6 +14,9 @@ from sparsevllm.utils.code_revision import code_revision_info
 from sparsevllm.utils.log import logger
 import sys
 
+from sparsevllm.configs.cuda_graph import (
+    build_decode_cuda_graph_startup_family_plan,
+)
 
 from sparsevllm.config import Config
 from sparsevllm.sampling_params import SamplingParams
@@ -352,12 +355,16 @@ class LLMEngine:
         graph_sized_batch = warmup_profile in ("graph", "big_prefill_only")
         decode_warmup = warmup_profile in ("graph", "decode_1seq")
         num_seqs = int(self.config.max_decoding_seqs) if graph_sized_batch else 1
+        startup_capture = bool(
+            getattr(self.config, "decode_graph_startup_capture", False)
+        )
         
-        # 预热 1 个 Token 的生成（包含 Prefill 和 Decode）
+        # Startup precapture owns decode warmup when enabled. Keep this first
+        # pass prefill-only so it cannot create unplanned short/long graph keys.
         sampling_params = SamplingParams(
-            max_tokens=2 if decode_warmup else 1,
+            max_tokens=2 if decode_warmup and not startup_capture else 1,
             temperature=0.0,
-            ignore_eos=decode_warmup,
+            ignore_eos=decode_warmup and not startup_capture,
         )
         max_prompt_len = max(1, int(self.config.max_model_len) - int(sampling_params.max_tokens))
         warmup_len = min(int(self.config.engine_prefill_chunk_size), max_prompt_len)
@@ -394,9 +401,23 @@ class LLMEngine:
                 max_warmup_len,
             )
             warmup_len = max_warmup_len
+        startup_plan = (
+            build_decode_cuda_graph_startup_family_plan(self.config)
+            if startup_capture
+            else []
+        )
+        capture_groups: dict[tuple[int, bool], list[int]] = {}
+        for batch_size, context_capacity, is_long_text in startup_plan:
+            capture_groups.setdefault((batch_size, is_long_text), []).append(
+                context_capacity
+            )
+
         num_warmup_rounds = 2 if warmup_profile == "graph" else 1
         vocab_size = int(self.config.hf_config.vocab_size)
-        num_dummy_prompts = num_seqs * num_warmup_rounds
+        num_dummy_prompts = (
+            num_seqs * num_warmup_rounds
+            + sum(batch_size for batch_size, _ in capture_groups)
+        )
         if num_dummy_prompts > vocab_size:
             raise ValueError(
                 "Warmup requires one distinct leading token per dummy prompt: "
@@ -408,25 +429,145 @@ class LLMEngine:
             f"ignore_eos={sampling_params.ignore_eos})."
         )
 
-        def run_warmup(params: SamplingParams, prompt_offset: int) -> None:
-            for request_idx in range(num_seqs):
+        def run_warmup(
+            params: SamplingParams,
+            prompt_offset: int,
+            *,
+            batch_size: int = num_seqs,
+            first_prompt_len: int = warmup_len,
+        ) -> int:
+            for request_idx in range(batch_size):
                 # Distinct leading tokens prevent prefix-cache reuse within or
                 # across warmup rounds.
-                prompt_len = warmup_len if request_idx == 0 else 1
+                prompt_len = first_prompt_len if request_idx == 0 else 1
                 dummy_prompt = [prompt_offset + request_idx] + [0] * (prompt_len - 1)
                 self.add_request(dummy_prompt, params)
             while not self.is_finished():
                 self.step()
+            return prompt_offset + batch_size
 
-        run_warmup(sampling_params, prompt_offset=0)
+        def prepare_capture_batch(
+            params: SamplingParams,
+            prompt_offset: int,
+            *,
+            batch_size: int,
+            prompt_len: int,
+        ) -> tuple[list[Sequence], int]:
+            seq_ids = []
+            for request_idx in range(batch_size):
+                dummy_prompt = [prompt_offset + request_idx] + [0] * (prompt_len - 1)
+                seq_ids.append(self.add_request(dummy_prompt, params))
+
+            parked: list[Sequence] = []
+            while self.scheduler.waiting:
+                self.step()
+                while self.scheduler.decoding:
+                    parked.append(self.scheduler.decoding.popleft())
+            while self.scheduler.decoding:
+                parked.append(self.scheduler.decoding.popleft())
+            if len(parked) != batch_size:
+                raise RuntimeError(
+                    "Startup decode CUDA Graph prefill did not park the requested "
+                    f"batch: expected={batch_size}, actual={len(parked)}."
+                )
+            if {int(seq.seq_id) for seq in parked} != set(seq_ids):
+                raise RuntimeError("Startup decode CUDA Graph prefill parked unexpected sequences.")
+            return parked, prompt_offset + batch_size
+
+        prompt_offset = run_warmup(sampling_params, prompt_offset=0)
+
+        if startup_plan:
+            short_graphs = sum(not is_long for _, _, is_long in startup_plan)
+            long_graphs = len(startup_plan) - short_graphs
+            logger.info(
+                "Startup decode CUDA Graph capture: {} coarse graphs "
+                "(limit={}, short={}, long={}, plan={}).",
+                len(startup_plan),
+                self.config.decode_graph_max_cached_graphs,
+                short_graphs,
+                long_graphs,
+                startup_plan,
+            )
+            capture_params = SamplingParams(
+                max_tokens=2,
+                temperature=0.0,
+                ignore_eos=True,
+            )
+            threshold = self.scheduler._long_text_threshold(is_prefill=False)
+            for (batch_size, is_long_text), context_capacities in capture_groups.items():
+                prompt_len = int(threshold) if is_long_text else 1
+                parked, prompt_offset = prepare_capture_batch(
+                    capture_params,
+                    prompt_offset,
+                    batch_size=batch_size,
+                    prompt_len=prompt_len,
+                )
+                try:
+                    observed_long = self.scheduler._is_long_text(
+                        parked[0],
+                        is_prefill=False,
+                    )
+                    if bool(observed_long) != bool(is_long_text):
+                        raise RuntimeError(
+                            "Startup decode CUDA Graph family prefill crossed the "
+                            "wrong long-text boundary: "
+                            f"expected={is_long_text}, observed={observed_long}, "
+                            f"threshold={threshold}, num_tokens={parked[0].num_tokens}."
+                        )
+                    for context_capacity in context_capacities:
+                        self.model_runner.call(
+                            "set_decode_cuda_graph_max_context_len_override",
+                            context_capacity,
+                        )
+                        self.model_runner.call(
+                            "capture_decode_cuda_graph_warmup",
+                            parked,
+                        )
+                finally:
+                    self.model_runner.call(
+                        "set_decode_cuda_graph_max_context_len_override",
+                        None,
+                    )
+                    self.scheduler.decoding.extend(parked)
+                    for seq in parked:
+                        self.abort_request(int(seq.seq_id))
+            self.model_runner.call(
+                "set_decode_cuda_graph_reuse_larger_context_graphs",
+                True,
+            )
+            graph_runner = self.model_runner.decode_cuda_graph_runner
+            captured = {
+                (
+                    int(key.batch_size),
+                    int(key.context_capacity),
+                    bool(key.is_long_text),
+                )
+                for key, state in graph_runner._graphs.items()
+                if state.graph is not None
+                and key.method == str(self.config.sparse_method or "")
+                and not key.capture_sampling
+            }
+            missing = sorted(set(startup_plan) - captured)
+            if missing:
+                raise RuntimeError(
+                    "Startup decode CUDA Graph capture did not materialize its plan: "
+                    f"missing={missing}."
+                )
+            logger.info(
+                "Startup decode CUDA Graph capture finished: cached={} "
+                "capture_count={} replay_count={}.",
+                len(captured),
+                graph_runner.capture_count,
+                graph_runner.replay_count,
+            )
 
         if warmup_profile == "graph":
             # CUDA Graph capture establishes its private allocator pool. Warm
             # prefill once more against the final allocator layout.
             logger.info(f"Post-capture prefill warmup (num_seqs={num_seqs}).")
-            run_warmup(
+            prompt_offset = run_warmup(
                 SamplingParams(max_tokens=1, temperature=0.0),
-                prompt_offset=num_seqs,
+                prompt_offset=prompt_offset,
             )
 
         self._warmup_moe_workspaces()
@@ -1016,6 +1157,8 @@ class LLMEngine:
             "decode_graph_context_sizes",
             "decode_graph_context_policy",
             "decode_graph_max_cached_graphs",
+            "decode_graph_startup_capture",
+            "decode_graph_startup_capture_limit",
             "enable_prefix_caching",
             "prefix_cache_mode",
             "resolved_prefix_cache_mode",
