@@ -41,6 +41,9 @@ from sparsevllm.models.glm4_moe_lite import (
     Glm4MoeLiteSparseMoeBlock,
 )
 from sparsevllm.operators.mla_attention import MlaAttentionOpSpec
+from sparsevllm.operators.decode_attention import (
+    validate_context_independent_decode_graph_model,
+)
 from sparsevllm.utils.context import get_context
 
 from glm_test_helpers import (
@@ -173,6 +176,121 @@ def test_sparse_startup_graph_plan_covers_default_64_sequence_limit():
     assert {(batch, is_long) for batch, _, is_long in plan} == {
         (batch, is_long) for batch in batches for is_long in (False, True)
     }
+
+
+def test_batch_only_startup_plan_spends_vanilla_budget_on_batch_anchors():
+    config = SimpleNamespace(
+        decode_cuda_graph_shape_policy="batch_only",
+        decode_cuda_graph_capture_sizes=list(range(1, 33)),
+        decode_cuda_graph_context_sizes=[1024, 2048, 4096],
+        decode_cuda_graph_startup_capture_limit=32,
+        decode_cuda_graph_max_cached_graphs=32,
+        vllm_sparse_method="",
+        num_sink_tokens=64,
+        decode_keep_tokens=4096,
+        num_recent_tokens=512,
+        max_model_len=131072,
+    )
+
+    plan = build_decode_cuda_graph_startup_family_plan(config)
+
+    assert plan == [
+        (batch_size, 131072, False) for batch_size in range(1, 33)
+    ]
+
+
+def test_batch_only_startup_plan_deduplicates_h2o_short_long_topology():
+    config = SimpleNamespace(
+        decode_cuda_graph_shape_policy="batch_only",
+        decode_cuda_graph_capture_sizes=[1, 2, 4, 8],
+        decode_cuda_graph_context_sizes=[1024, 2048, 4096],
+        decode_cuda_graph_startup_capture_limit=32,
+        decode_cuda_graph_max_cached_graphs=32,
+        vllm_sparse_method="h2o",
+        num_sink_tokens=64,
+        decode_keep_tokens=4096,
+        num_recent_tokens=512,
+        h2o_decode_budget=4096,
+        h2o_decode_eviction_interval=128,
+        max_model_len=131072,
+    )
+
+    plan = build_decode_cuda_graph_startup_family_plan(config)
+
+    assert plan == [
+        (batch_size, 4224, False) for batch_size in (1, 2, 4, 8)
+    ]
+
+
+def test_batch_only_runner_reuses_path_across_contexts_and_rejects_lazy_capture():
+    cache_manager = SimpleNamespace(
+        device=torch.device("cpu"),
+        decode_cuda_graph_max_cached_graphs=lambda: 2,
+    )
+    runner = DecodeCudaGraphRunner(
+        runtime_state=SimpleNamespace(),
+        cache_manager=cache_manager,
+        recurrent_state_manager=None,
+        sparse_controller=SimpleNamespace(layer_batch_sparse_states={}),
+        run_model=lambda *_args, **_kwargs: None,
+        is_long_text_batch=lambda *_args, **_kwargs: False,
+        method="",
+        capture_sizes=[1, 2],
+        context_sizes=[1024, 2048],
+        shape_policy="batch_only",
+    )
+
+    first = runner._select_state(
+        method="",
+        batch_size=1,
+        context_capacity=4096,
+        is_long_text=False,
+        capture_sampling=False,
+        graph_path_id="dense",
+    )
+    reused = runner._select_state(
+        method="",
+        batch_size=1,
+        context_capacity=2048,
+        is_long_text=False,
+        capture_sampling=False,
+        graph_path_id="dense",
+    )
+
+    assert reused is first
+    assert first.key.context_capacity == 0
+    assert first.capture_context_capacity == 4096
+
+    runner.seal_startup_plan()
+    with pytest.raises(RuntimeError, match="Runtime capture is disabled"):
+        runner._select_state(
+            method="",
+            batch_size=2,
+            context_capacity=4096,
+            is_long_text=False,
+            capture_sampling=False,
+            graph_path_id="dense",
+        )
+
+
+def test_batch_only_model_validation_rejects_unvalidated_original_backend():
+    model = nn.Module()
+    model.attention = nn.Module()
+    model.attention.attention_backend = SimpleNamespace(name="triton")
+
+    with pytest.raises(RuntimeError, match="backend=triton"):
+        validate_context_independent_decode_graph_model(model)
+
+
+def test_batch_only_model_validation_accepts_experimental_backend():
+    model = nn.Module()
+    model.attention = nn.Module()
+    model.attention.attention_backend = SimpleNamespace(
+        name="triton_context_independent",
+        cuda_graph_context_independent=True,
+    )
+
+    validate_context_independent_decode_graph_model(model)
 
 
 def _make_glm_graph_lane(

@@ -245,6 +245,22 @@ def fixed_decode_cuda_graph_context_capacity(
     )
 
 
+def decode_cuda_graph_path_id(method: str, is_long_text: bool) -> str:
+    """Return the captured GPU topology path for a decode family.
+
+    Only H2O is merged initially: it collects the same reduced score tensor on
+    every decode step and uses one fixed budget-plus-interval view capacity.
+    Other sparse methods retain separate short/long paths until their captured
+    node sequences and workspace layouts are verified equivalent.
+    """
+    method = str(method or "")
+    if not method:
+        return "dense"
+    if method == "h2o":
+        return "score"
+    return "long" if is_long_text else "short"
+
+
 _DEFAULT_PREFILL_POLICY_BY_METHOD = {
     "": PREFILL_POLICY_ALL_CHUNKED,
     "streamingllm": PREFILL_POLICY_ALL_CHUNKED,

@@ -25,6 +25,7 @@ class DecodeCudaGraphConfig:
     """Decode CUDA Graph capture and compatibility settings."""
 
     decode_cuda_graph: bool = False
+    decode_cuda_graph_shape_policy: str = "bucketed"
     decode_cuda_graph_capture_sampling: bool = False
     decode_cuda_graph_capture_sizes: str | int | list[int] | tuple[int, ...] | None = "auto"
     decode_cuda_graph_context_sizes: str | int | list[int] | tuple[int, ...] | None = "auto"

@@ -6,6 +6,7 @@ from typing import Any
 from sparsevllm.configs.common import _coerce_bool_config
 from sparsevllm.method_registry import (
     DECODE_CUDA_GRAPH_SUPPORTED_METHODS,
+    decode_cuda_graph_path_id,
     decode_sparse_long_text_threshold,
     fixed_decode_cuda_graph_context_capacity,
     is_decode_cuda_graph_supported,
@@ -174,6 +175,58 @@ def _normalize_decode_cuda_graph_context_policy(value: str | None) -> str:
     return policy
 
 
+def _normalize_decode_cuda_graph_shape_policy(value: str | None) -> str:
+    policy = str(value or "bucketed").strip().lower().replace("-", "_")
+    aliases = {
+        "context_bucketed": "bucketed",
+        "ctx_bucketed": "bucketed",
+        "batch": "batch_only",
+        "bs_only": "batch_only",
+        "context_independent": "batch_only",
+    }
+    policy = aliases.get(policy, policy)
+    if policy not in {"bucketed", "batch_only"}:
+        raise ValueError(
+            "decode_cuda_graph_shape_policy must be 'bucketed' or 'batch_only', "
+            f"got {policy!r}."
+        )
+    return policy
+
+
+def _select_evenly_spaced_sizes(
+    sizes: list[int] | tuple[int, ...],
+    limit: int,
+) -> list[int]:
+    """Retain dense small batches and spread the remaining BS anchors."""
+    candidates = sorted(set(int(size) for size in sizes))
+    limit = int(limit)
+    if limit <= 0:
+        raise ValueError(f"batch-only capture limit must be positive, got {limit}.")
+    if len(candidates) <= limit:
+        return candidates
+
+    dense = candidates[: min(8, limit)]
+    remaining = limit - len(dense)
+    if remaining <= 0:
+        dense[-1] = candidates[-1]
+        return sorted(set(dense))
+
+    tail = candidates[len(dense) :]
+    if remaining >= len(tail):
+        return candidates
+    indices = {
+        round(index * (len(tail) - 1) / (remaining - 1))
+        for index in range(remaining)
+    } if remaining > 1 else {len(tail) - 1}
+    selected = sorted(set(dense + [tail[index] for index in sorted(indices)]))
+    if len(selected) != limit or selected[-1] != candidates[-1]:
+        raise RuntimeError(
+            "batch-only capture-size selection failed to preserve its budget and "
+            f"maximum batch: limit={limit}, selected={selected}, candidates={candidates}."
+        )
+    return selected
+
+
 def build_decode_cuda_graph_startup_plan(
     capture_sizes: list[int] | tuple[int, ...],
     context_sizes: list[int] | tuple[int, ...],
@@ -261,8 +314,85 @@ def build_decode_cuda_graph_startup_plan(
     return plan
 
 
+def _decode_cuda_graph_reachable_families(config) -> list[tuple[bool, int]]:
+    """Return graph topology families and their capture-time capacities."""
+    method = str(config.vllm_sparse_method or "")
+    max_model_len = int(config.max_model_len)
+    if not method:
+        return [(False, max_model_len)]
+
+    threshold = decode_sparse_long_text_threshold(
+        method,
+        num_sink_tokens=config.num_sink_tokens,
+        decode_keep_tokens=config.decode_keep_tokens,
+        num_recent_tokens=config.num_recent_tokens,
+    )
+    fixed_context_capacity = fixed_decode_cuda_graph_context_capacity(
+        method,
+        max_model_len=max_model_len,
+        h2o_decode_budget=getattr(config, "h2o_decode_budget", 0),
+        h2o_decode_eviction_interval=getattr(
+            config,
+            "h2o_decode_eviction_interval",
+            0,
+        ),
+    )
+    families: list[tuple[bool, int]] = []
+    if threshold >= 2:
+        families.append(
+            (
+                False,
+                int(fixed_context_capacity or min(threshold, max_model_len)),
+            )
+        )
+    if threshold + 2 <= max_model_len:
+        families.append(
+            (True, int(fixed_context_capacity or max_model_len))
+        )
+    if not families:
+        raise ValueError(
+            "No reachable sparse decode CUDA Graph family for startup capture: "
+            f"method={method!r}, threshold={threshold}, max_model_len={max_model_len}."
+        )
+    deduplicated: dict[str, tuple[bool, int]] = {}
+    for is_long_text, capacity in families:
+        path_id = decode_cuda_graph_path_id(method, is_long_text)
+        previous = deduplicated.get(path_id)
+        if previous is None or int(capacity) > int(previous[1]):
+            deduplicated[path_id] = (is_long_text, int(capacity))
+    return list(deduplicated.values())
+
+
+def build_decode_cuda_graph_batch_only_startup_plan(
+    config,
+) -> list[tuple[int, int, bool]]:
+    """Capture every selected BS/topology lane exactly once."""
+    batches = sorted(set(int(size) for size in config.decode_cuda_graph_capture_sizes))
+    families = _decode_cuda_graph_reachable_families(config)
+    limit = min(
+        int(config.decode_cuda_graph_startup_capture_limit),
+        int(config.decode_cuda_graph_max_cached_graphs),
+    )
+    required = len(batches) * len(families)
+    if required > limit:
+        raise ValueError(
+            "batch-only decode CUDA Graph startup capture must cover every "
+            "batch/topology lane: "
+            f"required={required}, limit={limit}, batch_buckets={len(batches)}, "
+            f"graph_paths={len(families)}. Reduce explicit capture sizes or "
+            "increase the graph budget."
+        )
+    return [
+        (batch_size, context_capacity, is_long_text)
+        for batch_size in batches
+        for is_long_text, context_capacity in families
+    ]
+
+
 def build_decode_cuda_graph_startup_family_plan(config) -> list[tuple[int, int, bool]]:
     """Build startup graph keys, including short/long sparse families."""
+    if str(getattr(config, "decode_cuda_graph_shape_policy", "bucketed")) == "batch_only":
+        return build_decode_cuda_graph_batch_only_startup_plan(config)
     batches = sorted(set(int(size) for size in config.decode_cuda_graph_capture_sizes))
     contexts = sorted(set(int(size) for size in config.decode_cuda_graph_context_sizes))
     limit = min(
@@ -382,6 +512,9 @@ def normalize_decode_cuda_graph(config, *, legacy_deltakv_graph_method: bool) ->
     if legacy_deltakv_graph_method:
         config.decode_cuda_graph = True
         config.decode_graph = True
+    config.decode_cuda_graph_shape_policy = _normalize_decode_cuda_graph_shape_policy(
+        getattr(config, "decode_cuda_graph_shape_policy", "bucketed")
+    )
     if config.decode_cuda_graph_max_cached_graphs is not None:
         config.decode_cuda_graph_max_cached_graphs = int(config.decode_cuda_graph_max_cached_graphs)
         if config.decode_cuda_graph_max_cached_graphs <= 0:
@@ -400,7 +533,9 @@ def normalize_decode_cuda_graph(config, *, legacy_deltakv_graph_method: bool) ->
         )
     if config.decode_cuda_graph_startup_capture_limit is None:
         config.decode_cuda_graph_startup_capture_limit = (
-            48 if config.vllm_sparse_method else 32
+            32
+            if config.decode_cuda_graph_shape_policy == "batch_only"
+            else (48 if config.vllm_sparse_method else 32)
         )
     config.decode_cuda_graph_startup_capture_limit = int(
         config.decode_cuda_graph_startup_capture_limit
@@ -417,6 +552,16 @@ def normalize_decode_cuda_graph(config, *, legacy_deltakv_graph_method: bool) ->
             config.decode_cuda_graph_max_cached_graphs = (
                 config.decode_cuda_graph_startup_capture_limit
             )
+    if (
+        config.decode_cuda_graph_shape_policy == "batch_only"
+        and config.decode_cuda_graph
+        and not config.decode_cuda_graph_startup_capture
+    ):
+        raise ValueError(
+            "decode_cuda_graph_shape_policy='batch_only' requires "
+            "decode_cuda_graph_startup_capture=True because runtime capture and "
+            "LRU are disabled for the finite BS/path plan."
+        )
     if config.decode_cuda_graph_capture_sampling and not config.decode_cuda_graph:
         raise ValueError("decode_cuda_graph_capture_sampling requires decode_cuda_graph=True.")
     config.decode_cuda_graph_context_policy = _normalize_decode_cuda_graph_context_policy(
@@ -461,19 +606,44 @@ def normalize_decode_cuda_graph(config, *, legacy_deltakv_graph_method: bool) ->
                 repr(method) for method in sorted(DECODE_CUDA_GRAPH_SUPPORTED_METHODS) if method
             )
             raise ValueError(f"decode_cuda_graph supports these methods only: '', {supported}.")
+        capture_sizes_setting = config.decode_cuda_graph_capture_sizes
+        capture_sizes_auto = capture_sizes_setting is None or (
+            isinstance(capture_sizes_setting, str)
+            and capture_sizes_setting.strip().lower() in {"", "auto"}
+        )
         config.decode_cuda_graph_capture_sizes = _resolve_decode_cuda_graph_capture_sizes(
-            config.decode_cuda_graph_capture_sizes,
+            capture_sizes_setting,
             config.max_decoding_seqs,
         )
         config.decode_cuda_graph_context_sizes = _resolve_decode_cuda_graph_context_sizes(
             config.decode_cuda_graph_context_sizes,
             config.max_model_len,
         )
+        if (
+            config.decode_cuda_graph_shape_policy == "batch_only"
+            and capture_sizes_auto
+        ):
+            graph_path_count = len(_decode_cuda_graph_reachable_families(config))
+            graph_budget = min(
+                int(config.decode_cuda_graph_startup_capture_limit),
+                int(config.decode_cuda_graph_max_cached_graphs),
+            )
+            batch_budget = graph_budget // graph_path_count
+            if batch_budget <= 0:
+                raise ValueError(
+                    "batch-only decode CUDA Graph budget cannot cover one batch "
+                    f"for each graph path: budget={graph_budget}, paths={graph_path_count}."
+                )
+            config.decode_cuda_graph_capture_sizes = _select_evenly_spaced_sizes(
+                config.decode_cuda_graph_capture_sizes,
+                batch_budget,
+            )
         if config.decode_cuda_graph_startup_capture:
             startup_plan = build_decode_cuda_graph_startup_family_plan(config)
             log_once(
                 "Decode CUDA Graph startup precapture enabled "
                 f"({'default' if startup_capture_auto else 'explicit'}): "
+                f"shape_policy={config.decode_cuda_graph_shape_policy}, "
                 f"budget={config.decode_cuda_graph_startup_capture_limit}, "
                 f"cache_limit={config.decode_cuda_graph_max_cached_graphs}, "
                 f"planned_graphs={len(startup_plan)}, "

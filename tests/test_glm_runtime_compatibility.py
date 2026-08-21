@@ -231,6 +231,46 @@ def test_glm_config_defaults_to_larger_sparse_startup_capture_budget():
     assert config.decode_cuda_graph_max_cached_graphs == 48
 
 
+def test_glm_batch_only_graph_defaults_to_32_graph_bs_path_plan():
+    config = _glm_config(
+        hf_overrides={"max_position_embeddings": 65536},
+        decode_cuda_graph=True,
+        decode_cuda_graph_shape_policy="batch_only",
+        vllm_sparse_method="snapkv",
+        max_model_len=65536,
+        max_decoding_seqs=64,
+    )
+
+    assert config.decode_cuda_graph_shape_policy == "batch_only"
+    assert config.decode_cuda_graph_startup_capture_limit == 32
+    assert config.decode_cuda_graph_max_cached_graphs == 32
+    assert len(config.decode_cuda_graph_capture_sizes) == 16
+    assert config.decode_cuda_graph_capture_sizes[-1] == 64
+
+
+def test_glm_batch_only_graph_rejects_disabled_startup_capture():
+    with pytest.raises(ValueError, match="requires decode_cuda_graph_startup_capture=True"):
+        _glm_config(
+            decode_cuda_graph=True,
+            decode_cuda_graph_shape_policy="batch_only",
+            decode_cuda_graph_startup_capture=False,
+        )
+
+
+def test_glm_batch_only_graph_rejects_explicit_plan_over_budget():
+    with pytest.raises(ValueError, match="must cover every batch/topology lane"):
+        _glm_config(
+            hf_overrides={"max_position_embeddings": 65536},
+            decode_cuda_graph=True,
+            decode_cuda_graph_shape_policy="batch_only",
+            decode_cuda_graph_capture_sizes=list(range(1, 18)),
+            decode_cuda_graph_startup_capture_limit=32,
+            vllm_sparse_method="snapkv",
+            max_model_len=65536,
+            max_decoding_seqs=17,
+        )
+
+
 def test_glm_config_rejects_startup_capture_without_cuda_graph():
     with pytest.raises(ValueError, match="requires decode_cuda_graph=True"):
         _glm_config(decode_cuda_graph_startup_capture=True)
