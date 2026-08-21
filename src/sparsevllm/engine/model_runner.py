@@ -28,6 +28,9 @@ from sparsevllm.operators.decode_attention import (
 from sparsevllm.operators.context_independent_decode_attention import (
     bind_context_independent_triton_attention,
 )
+from sparsevllm.operators.context_independent_mla_attention import (
+    bind_context_independent_mla_attention,
+)
 from sparsevllm.utils.context import set_context, get_context, reset_context
 from sparsevllm.utils.loader import load_model, sync_deltakv_config_from_checkpoint
 
@@ -245,6 +248,7 @@ class ModelRunner:
             ),
         )
         if self.config.decode_cuda_graph_shape_policy == "batch_only":
+            mla_provider = bind_context_independent_mla_attention(self.model)
             bound_layers, workspace_bytes = bind_context_independent_triton_attention(
                 self.model,
                 max_batch_size=_resolve_decode_static_batch_capacity(
@@ -255,8 +259,9 @@ class ModelRunner:
                 device=self.device,
             )
             logger.info(
-                "Context-independent decode providers: generic_layers=%d "
+                "Context-independent decode providers: mla=%s generic_layers=%d "
                 "shared_workspace_mib=%.2f",
+                mla_provider or "none",
                 bound_layers,
                 workspace_bytes / (1024**2),
             )

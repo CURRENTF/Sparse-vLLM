@@ -19,6 +19,10 @@ from sparsevllm.operators.mla_attention import (
     MlaTileLangScoreProvider,
     MlaTritonProvider,
 )
+from sparsevllm.operators.context_independent_mla_attention import (
+    ContextIndependentMlaTritonProvider,
+    select_context_independent_mla_config,
+)
 from sparsevllm.operators.registry import OpResolver
 from sparsevllm.platforms import DeviceCaps, PlatformEnum
 from sparsevllm.kernels.triton.mla import (
@@ -93,6 +97,34 @@ def test_mla_attention_scale_uses_qk_head_dimension() -> None:
 
     assert spec.softmax_scale == pytest.approx(256**-0.5)
     assert spec.softmax_scale != pytest.approx((512 + 64) ** -0.5)
+
+
+@pytest.mark.parametrize("batch_size", [1, 4, 16, 64])
+def test_context_independent_mla_config_ignores_context_length(
+    batch_size: int,
+) -> None:
+    provider = ContextIndependentMlaTritonProvider.__new__(
+        ContextIndependentMlaTritonProvider
+    )
+    provider.spec = _spec(tp_size=2)
+    provider._fixed_launch_config = None
+
+    short = provider._launch_config_for(
+        batch_size=batch_size,
+        max_context_len=512,
+        active_slot_width=512,
+    )
+    long = provider._launch_config_for(
+        batch_size=batch_size,
+        max_context_len=65536,
+        active_slot_width=65536,
+    )
+
+    assert short == long == select_context_independent_mla_config(
+        batch_size=batch_size,
+        local_q_heads=10,
+    )
+    assert provider.cuda_graph_context_independent
 
 
 @pytest.mark.parametrize(
