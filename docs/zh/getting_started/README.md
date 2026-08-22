@@ -56,10 +56,11 @@ FP8 Linear 的 shape 与语义契约命中 profile，都会绑定同一个模型
 dispatch plan：`M < 512` 使用 Triton，`M >= 512` 使用由 SGL
 per-token-group activation quantization 与
 FlashInfer 公开 `gemm_fp8_nt_groupwise` CUTLASS kernel 组成的 atomic
-Provider。未 profile 的 SM120 shape 与其他支持原生 FP8 的 CUDA device 使用
-通用 Triton。binding report 会记录 profile 和两条 route；warmup 期间不会下载
-Hub kernel。当前 profile 的测量 workload 是 Qwen3-30B TP1，但模型名只属于
-provenance，不参与选择。
+Provider。未命中 profile、但仍处于该上游 atomic contract 内的 SM120 shape，
+默认 portfolio 会使用上游 groupwise Provider；只有上游契约不适用或可选依赖
+缺失时，才绑定通用 Triton portable baseline。binding report 会记录 selection
+basis、profile 判断和 route；warmup 期间不会下载 Hub kernel。当前 profile 的
+测量 workload 是 Qwen3-30B TP1，但模型名只属于 provenance，不参与选择。
 
 ## DeltaKV Checkpoint
 

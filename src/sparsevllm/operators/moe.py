@@ -10,6 +10,9 @@ from sparsevllm.kernels.moe import MoeAlignment
 from sparsevllm.operators.registry import (
     OpRegistry,
     OpResolver,
+    PortfolioPolicy,
+    ProfileMatch,
+    ProviderRole,
     SupportResult,
     runtime_version_at_least,
 )
@@ -83,7 +86,6 @@ def model_activation_dtype(config) -> torch.dtype:
 
 class MoeProvider:
     name = ""
-    priority = 0
     gate_up_order = "gate_up"
 
     @property
@@ -333,7 +335,23 @@ class MoeDispatchPlan(MoeProvider):
             ep_rank=ep_rank,
         )
 
-MOE_REGISTRY: OpRegistry[MoeOpSpec, MoeProvider] = OpRegistry("routed MoE")
+MOE_REGISTRY: OpRegistry[MoeOpSpec, MoeProvider] = OpRegistry(
+    "routed MoE",
+    portfolio=PortfolioPolicy(
+        upstream_standard=("flashinfer_cutlass_fp8_sm90",),
+        repo_portable=("triton",),
+    ),
+    profile_order=(
+        "h20_qwen36_fp8_dispatch_plan",
+        "hopper_qwen36_fp8_dispatch_plan",
+        "triton_minimax_m2_profile",
+        "qwen3_fp8_dispatch_plan",
+        "sgl_aligned_triton_glm_bf16_profile",
+        "h20_qwen36_fused_bf16_profile",
+        "hopper_fused_bf16_profile",
+        "qwen3_bf16_dispatch_plan",
+    ),
+)
 
 _PACKED_SHARED_EXPERT_PROFILES = frozenset(
     {(64, 1, 4, 2048, 1536, 2, 1)}
@@ -407,45 +425,30 @@ def _sgl_moe_align_block_size(
     )
 
 
-@MOE_REGISTRY.register
+@MOE_REGISTRY.register_atomic(
+    ProviderRole.REPO_PORTABLE,
+    profile_only=True,
+)
 class SglAlignedTritonGlmMoeProvider(MoeProvider):
     name = "sgl_aligned_triton_glm"
-    priority = 30
     gate_up_order = "gate_up"
 
     @classmethod
     def supports(cls, spec: MoeOpSpec, caps: DeviceCaps) -> SupportResult:
         if caps.platform != PlatformEnum.CUDA or caps.compute_capability != (9, 0):
-            return SupportResult.no("requires CUDA SM90")
-        if caps.device_name not in {"NVIDIA H100 80GB HBM3", "NVIDIA H20"}:
-            return SupportResult.no("requires validated H100 80GB HBM3 or H20 hardware")
-        expected = {
-            (64, 64, 2048, 768, 4, 2, 1, "biased_sigmoid"),
-            (65, 65, 2048, 768, 5, 2, 1, "biased_sigmoid"),
-            (64, 32, 2048, 1536, 4, 1, 2, "biased_sigmoid"),
-        }
-        actual = (
-            spec.num_experts,
-            spec.num_local_experts,
-            spec.hidden_size,
-            spec.intermediate_size,
-            spec.top_k,
-            spec.tp_size,
-            spec.ep_size,
-            spec.routing_method,
-        )
-        if actual not in expected:
-            return SupportResult.no(
-                f"requires a profiled GLM TP2 MoE shape {expected}, got {actual}"
-            )
+            return SupportResult.unsupported("requires CUDA SM90")
+        if not caps.supports_triton:
+            return SupportResult.unsupported("platform does not support Triton")
+        if spec.cuda_graph and not caps.supports_graph_capture:
+            return SupportResult.unsupported("device does not support CUDA Graph capture")
         if spec.activation_dtype != torch.bfloat16:
-            return SupportResult.no("requires BF16 activations")
+            return SupportResult.unsupported("requires BF16 activations")
         if spec.weight_dtype != torch.bfloat16 or spec.block_shape is not None:
-            return SupportResult.no("requires unquantized BF16 expert weights")
+            return SupportResult.unsupported("requires unquantized BF16 expert weights")
         from sparsevllm.kernels.external.sgl.moe import sgl_moe_alignment_support
 
         supported, reason = sgl_moe_alignment_support()
-        return SupportResult.yes() if supported else SupportResult.no(reason)
+        return SupportResult.yes() if supported else SupportResult.unsupported(reason)
 
     def run(
         self,
@@ -488,51 +491,48 @@ class SglAlignedTritonGlmMoeProvider(MoeProvider):
         )
 
 
-@MOE_REGISTRY.register
+@MOE_REGISTRY.register_atomic(
+    ProviderRole.REPO_PORTABLE,
+    profile_only=True,
+)
 class TritonMinimaxM2FusedMoeProvider(MoeProvider):
     name = "triton_minimax_m2_fused"
-    priority = 125
     gate_up_order = "gate_up"
 
     @classmethod
     def supports(cls, spec: MoeOpSpec, caps: DeviceCaps) -> SupportResult:
         if spec.routing_method != "biased_sigmoid":
-            return SupportResult.no("requires biased-sigmoid routing")
+            return SupportResult.unsupported("requires biased-sigmoid routing")
         if caps.platform != PlatformEnum.CUDA or caps.compute_capability != (9, 0):
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 f"requires CUDA SM90, got {caps.platform.name} {caps.compute_capability}"
             )
-        if caps.device_name != "NVIDIA H100 80GB HBM3":
-            return SupportResult.no(
-                "requires profiled NVIDIA H100 80GB HBM3 hardware, "
-                f"got {caps.device_name}"
-            )
         if not caps.supports_triton:
-            return SupportResult.no("platform does not support Triton")
+            return SupportResult.unsupported("platform does not support Triton")
         if not caps.supports_bfloat16:
-            return SupportResult.no("device does not support BF16")
+            return SupportResult.unsupported("device does not support BF16")
         if not caps.supports_native_fp8:
-            return SupportResult.no("device does not provide native FP8 tensor cores")
+            return SupportResult.unsupported("device does not provide native FP8 tensor cores")
         if spec.cuda_graph and not caps.supports_graph_capture:
-            return SupportResult.no("device does not support CUDA Graph capture")
+            return SupportResult.unsupported("device does not support CUDA Graph capture")
         if spec.activation_dtype != torch.bfloat16:
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 f"requires BF16 activations, got {spec.activation_dtype}"
             )
         if spec.weight_dtype != torch.float8_e4m3fn:
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 f"requires FP8 E4M3 weights, got {spec.weight_dtype}"
             )
         if spec.block_shape != (128, 128):
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 f"requires block_shape=(128, 128), got {spec.block_shape}"
             )
         if spec.scale_dtype != torch.float32:
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 f"requires FP32 expert scales, got {spec.scale_dtype}"
             )
         if spec.tp_size not in {1, 2, 4}:
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 f"requires MoE TP size 1, 2, or 4, got {spec.tp_size}"
             )
         expected_shape = (
@@ -550,7 +550,7 @@ class TritonMinimaxM2FusedMoeProvider(MoeProvider):
             spec.top_k,
         )
         if actual_shape != expected_shape:
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 "requires MiniMax M2.7 expert shape "
                 f"{expected_shape}, got {actual_shape}"
             )
@@ -590,32 +590,31 @@ class TritonMinimaxM2FusedMoeProvider(MoeProvider):
         )
 
 
-@MOE_REGISTRY.register
+@MOE_REGISTRY.register_atomic(ProviderRole.UPSTREAM_STANDARD)
 class FlashInferCutlassFp8MoeProvider(MoeProvider):
     name = "flashinfer_cutlass_fp8_sm90"
-    priority = 100
     gate_up_order = "up_gate"
 
     @classmethod
     def supports(cls, spec: MoeOpSpec, caps: DeviceCaps) -> SupportResult:
         if spec.tp_size != 1:
-            return SupportResult.no("does not support tensor-parallel expert shards")
+            return SupportResult.unsupported("does not support tensor-parallel expert shards")
         if spec.weight_dtype != torch.float8_e4m3fn:
-            return SupportResult.no(f"requires FP8 E4M3 weights, got {spec.weight_dtype}")
+            return SupportResult.unsupported(f"requires FP8 E4M3 weights, got {spec.weight_dtype}")
         if spec.block_shape != (128, 128):
-            return SupportResult.no(f"requires block_shape=(128, 128), got {spec.block_shape}")
+            return SupportResult.unsupported(f"requires block_shape=(128, 128), got {spec.block_shape}")
         if spec.hidden_size % 128 or spec.intermediate_size % 128:
-            return SupportResult.no("FP8 hidden/intermediate sizes must be 128-aligned")
+            return SupportResult.unsupported("FP8 hidden/intermediate sizes must be 128-aligned")
         if spec.activation_dtype != torch.bfloat16:
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 f"requires BF16 activations, got {spec.activation_dtype}"
             )
         if caps.platform != PlatformEnum.CUDA or caps.compute_capability != (9, 0):
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 f"requires CUDA SM90, got {caps.platform.name} {caps.compute_capability}"
             )
         if not runtime_version_at_least(caps.runtime_version, (12, 8)):
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 "requires CUDA runtime >= 12.8, "
                 f"got {caps.runtime_version or 'unknown'}"
             )
@@ -624,7 +623,7 @@ class FlashInferCutlassFp8MoeProvider(MoeProvider):
         )
 
         supported, reason = flashinfer_cutlass_fp8_moe_support()
-        return SupportResult.yes(reason) if supported else SupportResult.no(reason)
+        return SupportResult.yes(reason) if supported else SupportResult.unsupported(reason)
 
     def run(
         self,
@@ -663,10 +662,12 @@ class FlashInferCutlassFp8MoeProvider(MoeProvider):
         return output
 
 
-@MOE_REGISTRY.register
+@MOE_REGISTRY.register_atomic(
+    ProviderRole.REPO_PORTABLE,
+    profile_only=True,
+)
 class TritonHopperFusedMoeProvider(MoeProvider):
     name = "triton_hopper_fused"
-    priority = 20
     gate_up_order = "gate_up"
     PROFILED_DEVICE_NAME = "NVIDIA H100 80GB HBM3"
     PROFILED_SHAPES = (
@@ -679,40 +680,21 @@ class TritonHopperFusedMoeProvider(MoeProvider):
     @classmethod
     def supports(cls, spec: MoeOpSpec, caps: DeviceCaps) -> SupportResult:
         if caps.platform != PlatformEnum.CUDA or caps.compute_capability != (9, 0):
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 f"requires CUDA SM90, got {caps.platform.name} {caps.compute_capability}"
             )
         if not caps.supports_triton:
-            return SupportResult.no("platform does not support Triton")
+            return SupportResult.unsupported("platform does not support Triton")
         if spec.cuda_graph and not caps.supports_graph_capture:
-            return SupportResult.no("device does not support CUDA Graph capture")
+            return SupportResult.unsupported("device does not support CUDA Graph capture")
         if spec.activation_dtype != torch.bfloat16:
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 f"requires BF16 activations, got {spec.activation_dtype}"
             )
         if spec.weight_dtype != torch.bfloat16 or spec.block_shape is not None:
-            return SupportResult.no("requires unquantized BF16 expert weights")
-        if caps.device_name != cls.PROFILED_DEVICE_NAME:
-            return SupportResult.no(
-                f"requires profiled {cls.PROFILED_DEVICE_NAME} hardware, "
-                f"got {caps.device_name}"
-            )
+            return SupportResult.unsupported("requires unquantized BF16 expert weights")
         if not caps.supports_bfloat16:
-            return SupportResult.no("device does not support BF16")
-        actual_shape = (
-            spec.num_experts,
-            spec.num_local_experts,
-            spec.hidden_size,
-            spec.intermediate_size,
-            spec.top_k,
-            spec.tp_size,
-            spec.ep_size,
-        )
-        if actual_shape not in cls.PROFILED_SHAPES:
-            return SupportResult.no(
-                "requires a profiled MoE shape in "
-                f"{cls.PROFILED_SHAPES}, got {actual_shape}"
-            )
+            return SupportResult.unsupported("device does not support BF16")
         return SupportResult.yes()
 
     def run(
@@ -745,6 +727,10 @@ class TritonHopperFusedMoeProvider(MoeProvider):
         )
 
 
+@MOE_REGISTRY.register_atomic(
+    ProviderRole.REPO_PORTABLE,
+    profile_only=True,
+)
 class SglDerivedTritonMoeProvider(MoeProvider):
     """Repository-owned BF16 Triton MoE port using SGL expert alignment."""
 
@@ -760,57 +746,32 @@ class SglDerivedTritonMoeProvider(MoeProvider):
     @classmethod
     def supports(cls, spec: MoeOpSpec, caps: DeviceCaps) -> SupportResult:
         if caps.platform != PlatformEnum.CUDA or caps.compute_capability != (9, 0):
-            return SupportResult.no(
-                f"requires validated CUDA SM90, got {caps.platform.name} "
+            return SupportResult.unsupported(
+                f"requires CUDA SM90, got {caps.platform.name} "
                 f"{caps.compute_capability}"
             )
-        if caps.device_name != "NVIDIA H100 80GB HBM3":
-            return SupportResult.no(
-                "requires validated NVIDIA H100 80GB HBM3 hardware, "
-                f"got {caps.device_name}"
-            )
         if not caps.supports_triton:
-            return SupportResult.no("platform does not support Triton")
+            return SupportResult.unsupported("platform does not support Triton")
         if spec.cuda_graph and not caps.supports_graph_capture:
-            return SupportResult.no("device does not support CUDA Graph capture")
+            return SupportResult.unsupported("device does not support CUDA Graph capture")
         if spec.activation_dtype != torch.bfloat16:
-            return SupportResult.no(
-                f"requires profiled BF16 activations, got {spec.activation_dtype}"
+            return SupportResult.unsupported(
+                f"requires BF16 activations, got {spec.activation_dtype}"
             )
         if spec.weight_dtype != spec.activation_dtype or spec.block_shape is not None:
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 "requires unquantized expert weights matching the activation dtype"
             )
         if spec.activation != "silu":
-            return SupportResult.no(f"requires SiLU activation, got {spec.activation}")
+            return SupportResult.unsupported(f"requires SiLU activation, got {spec.activation}")
         if not caps.supports_bfloat16:
-            return SupportResult.no("device does not support BF16")
-        actual_shape = (
-            spec.num_experts,
-            spec.num_local_experts,
-            spec.hidden_size,
-            spec.intermediate_size,
-            spec.top_k,
-            spec.tp_size,
-            spec.ep_size,
-        )
-        if actual_shape not in cls.PROFILED_SHAPES:
-            return SupportResult.no(
-                "requires a profiled Qwen3-MoE TP1/TP2 shape in "
-                f"{sorted(cls.PROFILED_SHAPES)}, got {actual_shape}"
-            )
+            return SupportResult.unsupported("device does not support BF16")
         from sparsevllm.kernels.external.sgl.moe import sgl_moe_alignment_support
-        from sparsevllm.kernels.triton.sgl_fused_moe import (
-            sgl_moe_profile_support,
-        )
 
-        profile_supported, profile_reason = sgl_moe_profile_support()
-        if not profile_supported:
-            return SupportResult.no(profile_reason)
         supported, reason = sgl_moe_alignment_support()
         if not supported:
-            return SupportResult.no(reason)
-        return SupportResult.yes(f"{profile_reason}; {reason}")
+            return SupportResult.unsupported(reason)
+        return SupportResult.yes(reason)
 
     def binding_metadata(self) -> dict[str, object]:
         from sparsevllm.kernels.triton.sgl_fused_moe import (
@@ -850,26 +811,46 @@ class SglDerivedTritonMoeProvider(MoeProvider):
         )
 
 
-@MOE_REGISTRY.register
+@MOE_REGISTRY.register_profile
 class Qwen3Bf16MoeDispatchPlan(MoeDispatchPlan):
     """Prepared Qwen3 BF16 token ranges over two atomic Triton providers."""
 
     name = "qwen3_bf16_dispatch_plan"
-    priority = 15
     gate_up_order = "gate_up"
     MIN_SGL_TOKENS_BY_TP_SIZE = {1: 64, 2: 64}
 
     @classmethod
-    def supports(cls, spec: MoeOpSpec, caps: DeviceCaps) -> SupportResult:
-        sgl_support = SglDerivedTritonMoeProvider.supports(spec, caps)
-        if not sgl_support.supported:
-            return SupportResult.no(
-                f"SGL-derived Triton path: {sgl_support.reason}"
+    def atomic_provider_names(cls, spec: MoeOpSpec) -> tuple[str, ...]:
+        del spec
+        return ("sgl_derived_triton_bf16", "triton")
+
+    @classmethod
+    def matches(cls, spec: MoeOpSpec, caps: DeviceCaps) -> ProfileMatch:
+        actual = (
+            spec.num_experts,
+            spec.num_local_experts,
+            spec.hidden_size,
+            spec.intermediate_size,
+            spec.top_k,
+            spec.tp_size,
+            spec.ep_size,
+        )
+        if caps.device_name != "NVIDIA H100 80GB HBM3":
+            return ProfileMatch.no("requires profiled NVIDIA H100 80GB HBM3")
+        if actual not in SglDerivedTritonMoeProvider.PROFILED_SHAPES:
+            return ProfileMatch.no(
+                "requires a profiled Qwen3 BF16 shape in "
+                f"{sorted(SglDerivedTritonMoeProvider.PROFILED_SHAPES)}, "
+                f"got {actual}"
             )
-        triton_support = TritonMoeProvider.supports(spec, caps)
-        if not triton_support.supported:
-            return SupportResult.no(f"Triton path: {triton_support.reason}")
-        return SupportResult.yes("profiled Qwen3 BF16 token dispatch")
+        from sparsevllm.kernels.triton.sgl_fused_moe import (
+            sgl_moe_profile_support,
+        )
+
+        profile_supported, profile_reason = sgl_moe_profile_support()
+        if not profile_supported:
+            return ProfileMatch.no(profile_reason)
+        return ProfileMatch.yes("matched Qwen3 BF16 token dispatch profile")
 
     def _build_routes(self, spec: MoeOpSpec) -> tuple[MoeDispatchRoute, ...]:
         min_sgl_tokens = self.MIN_SGL_TOKENS_BY_TP_SIZE[int(spec.tp_size)]
@@ -889,10 +870,12 @@ class Qwen3Bf16MoeDispatchPlan(MoeDispatchPlan):
         )
 
 
-@MOE_REGISTRY.register
+@MOE_REGISTRY.register_atomic(
+    ProviderRole.REPO_PORTABLE,
+    profile_only=True,
+)
 class H20Qwen36FusedMoeProvider(TritonHopperFusedMoeProvider):
     name = "h20_qwen36_fused_bf16"
-    priority = 21
     PROFILED_DEVICE_NAME = "NVIDIA H20"
     PROFILED_SHAPES = (
         (256, 256, 2048, 512, 8, 1, 1),
@@ -901,39 +884,140 @@ class H20Qwen36FusedMoeProvider(TritonHopperFusedMoeProvider):
     )
 
 
-@MOE_REGISTRY.register
+class _SingleAtomicMoeProfile:
+    atomic_provider_name = ""
+
+    @classmethod
+    def atomic_provider_names(cls, spec: MoeOpSpec) -> tuple[str, ...]:
+        del spec
+        return (cls.atomic_provider_name,)
+
+    @classmethod
+    def bind(cls, spec: MoeOpSpec, caps: DeviceCaps, **kwargs):
+        del spec, caps
+        if kwargs:
+            raise TypeError(
+                f"{cls.name} does not accept provider arguments: {sorted(kwargs)}"
+            )
+        provider_type = MOE_REGISTRY.atomic_registry.registration(
+            cls.atomic_provider_name
+        ).provider
+        return provider_type()
+
+
+@MOE_REGISTRY.register_profile
+class SglAlignedTritonGlmMoeProfile(_SingleAtomicMoeProfile):
+    name = "sgl_aligned_triton_glm_bf16_profile"
+    atomic_provider_name = "sgl_aligned_triton_glm"
+
+    @classmethod
+    def matches(cls, spec: MoeOpSpec, caps: DeviceCaps) -> ProfileMatch:
+        expected = {
+            (64, 64, 2048, 768, 4, 2, 1, "biased_sigmoid"),
+            (65, 65, 2048, 768, 5, 2, 1, "biased_sigmoid"),
+            (64, 32, 2048, 1536, 4, 1, 2, "biased_sigmoid"),
+        }
+        actual = (
+            spec.num_experts,
+            spec.num_local_experts,
+            spec.hidden_size,
+            spec.intermediate_size,
+            spec.top_k,
+            spec.tp_size,
+            spec.ep_size,
+            spec.routing_method,
+        )
+        if caps.device_name not in {"NVIDIA H100 80GB HBM3", "NVIDIA H20"}:
+            return ProfileMatch.no("requires profiled H100 or H20 hardware")
+        if actual not in expected:
+            return ProfileMatch.no(
+                f"requires a profiled GLM TP2 MoE shape {expected}, got {actual}"
+            )
+        return ProfileMatch.yes("matched SGL-aligned GLM BF16 profile")
+
+
+@MOE_REGISTRY.register_profile
+class TritonMinimaxM2MoeProfile(_SingleAtomicMoeProfile):
+    name = "triton_minimax_m2_profile"
+    atomic_provider_name = "triton_minimax_m2_fused"
+
+    @classmethod
+    def matches(cls, spec: MoeOpSpec, caps: DeviceCaps) -> ProfileMatch:
+        del spec
+        if caps.device_name != "NVIDIA H100 80GB HBM3":
+            return ProfileMatch.no("requires profiled NVIDIA H100 80GB HBM3")
+        return ProfileMatch.yes("matched MiniMax M2 FP8 MoE profile")
+
+
+@MOE_REGISTRY.register_profile
+class HopperFusedBf16MoeProfile(_SingleAtomicMoeProfile):
+    name = "hopper_fused_bf16_profile"
+    atomic_provider_name = "triton_hopper_fused"
+    profiled_device_name = "NVIDIA H100 80GB HBM3"
+    profiled_shapes = TritonHopperFusedMoeProvider.PROFILED_SHAPES
+
+    @classmethod
+    def matches(cls, spec: MoeOpSpec, caps: DeviceCaps) -> ProfileMatch:
+        actual = (
+            spec.num_experts,
+            spec.num_local_experts,
+            spec.hidden_size,
+            spec.intermediate_size,
+            spec.top_k,
+            spec.tp_size,
+            spec.ep_size,
+        )
+        if caps.device_name != cls.profiled_device_name:
+            return ProfileMatch.no(
+                f"requires profiled {cls.profiled_device_name} hardware"
+            )
+        if actual not in cls.profiled_shapes:
+            return ProfileMatch.no(
+                f"requires a profiled MoE shape in {cls.profiled_shapes}, got {actual}"
+            )
+        return ProfileMatch.yes("matched Hopper BF16 fused MoE profile")
+
+
+@MOE_REGISTRY.register_profile
+class H20Qwen36FusedBf16MoeProfile(HopperFusedBf16MoeProfile):
+    name = "h20_qwen36_fused_bf16_profile"
+    atomic_provider_name = "h20_qwen36_fused_bf16"
+    profiled_device_name = "NVIDIA H20"
+    profiled_shapes = H20Qwen36FusedMoeProvider.PROFILED_SHAPES
+
+
+@MOE_REGISTRY.register_atomic(ProviderRole.REPO_PORTABLE)
 class TritonMoeProvider(MoeProvider):
     name = "triton"
-    priority = 10
     gate_up_order = "gate_up"
 
     @classmethod
     def supports(cls, spec: MoeOpSpec, caps: DeviceCaps) -> SupportResult:
         if caps.platform != PlatformEnum.CUDA:
-            return SupportResult.no(f"requires CUDA, got {caps.platform.name}")
+            return SupportResult.unsupported(f"requires CUDA, got {caps.platform.name}")
         if not caps.supports_triton:
-            return SupportResult.no("platform does not support Triton")
+            return SupportResult.unsupported("platform does not support Triton")
         if spec.activation_dtype not in (torch.bfloat16, torch.float16):
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 f"requires BF16 or FP16 activations, got {spec.activation_dtype}"
             )
         if spec.weight_dtype == torch.float8_e4m3fn:
             if spec.block_shape != (128, 128):
-                return SupportResult.no(
+                return SupportResult.unsupported(
                     f"FP8 requires block_shape=(128, 128), got {spec.block_shape}"
                 )
             if not caps.supports_native_fp8:
-                return SupportResult.no("device does not provide native FP8 tensor cores")
+                return SupportResult.unsupported("device does not provide native FP8 tensor cores")
             if spec.hidden_size % 128 or spec.intermediate_size % 128:
-                return SupportResult.no("FP8 hidden/intermediate sizes must be 128-aligned")
+                return SupportResult.unsupported("FP8 hidden/intermediate sizes must be 128-aligned")
             from sparsevllm.kernels.external.sgl.moe import (
                 sgl_fp8_group_quantization_support,
             )
 
             supported, reason = sgl_fp8_group_quantization_support()
-            return SupportResult.yes(reason) if supported else SupportResult.no(reason)
+            return SupportResult.yes(reason) if supported else SupportResult.unsupported(reason)
         if spec.weight_dtype != spec.activation_dtype:
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 "unquantized weights must match the activation dtype"
             )
         return SupportResult.yes()
@@ -983,6 +1067,10 @@ class TritonMoeProvider(MoeProvider):
         )
 
 
+@MOE_REGISTRY.register_atomic(
+    ProviderRole.REPO_PORTABLE,
+    profile_only=True,
+)
 class TritonUpGateFp8MoeProvider(TritonMoeProvider):
     """Atomic Triton FP8 MoE over FlashInfer-compatible packed weights."""
 
@@ -990,12 +1078,11 @@ class TritonUpGateFp8MoeProvider(TritonMoeProvider):
     gate_up_order = "up_gate"
 
 
-@MOE_REGISTRY.register
+@MOE_REGISTRY.register_profile
 class Qwen3Fp8MoeDispatchPlan(MoeDispatchPlan):
     """Prepared Qwen3 FP8 token ranges over layout-compatible providers."""
 
     name = "qwen3_fp8_dispatch_plan"
-    priority = 120
     gate_up_order = "up_gate"
     FLASHINFER_MAX_TOKENS = 128
     PROFILED_SHAPES = frozenset(
@@ -1006,15 +1093,22 @@ class Qwen3Fp8MoeDispatchPlan(MoeDispatchPlan):
     )
 
     @classmethod
-    def supports(cls, spec: MoeOpSpec, caps: DeviceCaps) -> SupportResult:
+    def atomic_provider_names(cls, spec: MoeOpSpec) -> tuple[str, ...]:
+        names = ["triton_fp8_up_gate"]
+        if spec.tp_size == 1:
+            names.append("flashinfer_cutlass_fp8_sm90")
+        return tuple(names)
+
+    @classmethod
+    def matches(cls, spec: MoeOpSpec, caps: DeviceCaps) -> ProfileMatch:
         if caps.device_name != "NVIDIA H100 80GB HBM3":
-            return SupportResult.no(
+            return ProfileMatch.no(
                 "requires profiled NVIDIA H100 80GB HBM3 hardware"
             )
         if spec.weight_dtype != torch.float8_e4m3fn:
-            return SupportResult.no("requires FP8 E4M3 weights")
+            return ProfileMatch.no("requires FP8 E4M3 weights")
         if spec.block_shape != (128, 128):
-            return SupportResult.no("requires block_shape=(128, 128)")
+            return ProfileMatch.no("requires block_shape=(128, 128)")
         actual_shape = (
             spec.num_experts,
             spec.num_local_experts,
@@ -1025,19 +1119,10 @@ class Qwen3Fp8MoeDispatchPlan(MoeDispatchPlan):
             spec.ep_size,
         )
         if actual_shape not in cls.PROFILED_SHAPES:
-            return SupportResult.no(
+            return ProfileMatch.no(
                 f"requires a profiled Qwen3 FP8 shape, got {actual_shape}"
             )
-        triton_support = TritonUpGateFp8MoeProvider.supports(spec, caps)
-        if not triton_support.supported:
-            return SupportResult.no(f"Triton path: {triton_support.reason}")
-        if spec.tp_size == 1:
-            flashinfer_support = FlashInferCutlassFp8MoeProvider.supports(spec, caps)
-            if not flashinfer_support.supported:
-                return SupportResult.no(
-                    f"FlashInfer decode path: {flashinfer_support.reason}"
-                )
-        return SupportResult.yes("profiled Qwen3 FP8 token dispatch")
+        return ProfileMatch.yes("matched Qwen3 FP8 token dispatch profile")
 
     def _build_routes(self, spec: MoeOpSpec) -> tuple[MoeDispatchRoute, ...]:
         triton = TritonUpGateFp8MoeProvider()
@@ -1067,12 +1152,11 @@ class Qwen3Fp8MoeDispatchPlan(MoeDispatchPlan):
         )
 
 
-@MOE_REGISTRY.register
+@MOE_REGISTRY.register_profile
 class HopperQwen36Fp8MoeDispatchPlan(MoeDispatchPlan):
     """Prepared Qwen3.6 FP8 token ranges over layout-compatible providers."""
 
     name = "hopper_qwen36_fp8_dispatch_plan"
-    priority = 130
     gate_up_order = "up_gate"
     PROFILED_DEVICE_NAME = "NVIDIA H100 80GB HBM3"
     PROFILED_SHAPES = frozenset(
@@ -1084,11 +1168,16 @@ class HopperQwen36Fp8MoeDispatchPlan(MoeDispatchPlan):
     TRITON_MAX_TOKENS_BY_EP_SIZE = {1: 8, 2: 4}
 
     @classmethod
-    def supports(cls, spec: MoeOpSpec, caps: DeviceCaps) -> SupportResult:
+    def atomic_provider_names(cls, spec: MoeOpSpec) -> tuple[str, ...]:
+        del spec
+        return ("triton_fp8_up_gate", "flashinfer_cutlass_fp8_sm90")
+
+    @classmethod
+    def matches(cls, spec: MoeOpSpec, caps: DeviceCaps) -> ProfileMatch:
         if spec.cuda_graph and not caps.supports_graph_capture:
-            return SupportResult.no("device does not support CUDA Graph capture")
+            return ProfileMatch.no("device does not support CUDA Graph capture")
         if caps.device_name != cls.PROFILED_DEVICE_NAME:
-            return SupportResult.no(
+            return ProfileMatch.no(
                 f"requires profiled {cls.PROFILED_DEVICE_NAME} hardware, "
                 f"got {caps.device_name}"
             )
@@ -1102,23 +1191,13 @@ class HopperQwen36Fp8MoeDispatchPlan(MoeDispatchPlan):
             spec.ep_size,
         )
         if actual_shape not in cls.PROFILED_SHAPES:
-            return SupportResult.no(
+            return ProfileMatch.no(
                 "requires profiled Qwen3.6 TP1/EP1 or "
                 "global-TP2/MoE-TP1xEP2 shape "
                 f"{sorted(cls.PROFILED_SHAPES)}, "
                 f"got {actual_shape}"
             )
-        flashinfer_support = FlashInferCutlassFp8MoeProvider.supports(spec, caps)
-        if not flashinfer_support.supported:
-            return SupportResult.no(
-                f"FlashInfer prefill path: {flashinfer_support.reason}"
-            )
-        triton_support = TritonUpGateFp8MoeProvider.supports(spec, caps)
-        if not triton_support.supported:
-            return SupportResult.no(
-                f"Triton decode path: {triton_support.reason}"
-            )
-        return SupportResult.yes("profiled Qwen3.6 FP8 token dispatch")
+        return ProfileMatch.yes("matched Qwen3.6 FP8 token dispatch profile")
 
     def _build_routes(self, spec: MoeOpSpec) -> tuple[MoeDispatchRoute, ...]:
         triton_max_tokens = self.TRITON_MAX_TOKENS_BY_EP_SIZE[int(spec.ep_size)]
@@ -1140,10 +1219,9 @@ class HopperQwen36Fp8MoeDispatchPlan(MoeDispatchPlan):
         )
 
 
-@MOE_REGISTRY.register
+@MOE_REGISTRY.register_profile
 class H20Qwen36Fp8MoeDispatchPlan(HopperQwen36Fp8MoeDispatchPlan):
     name = "h20_qwen36_fp8_dispatch_plan"
-    priority = 131
     PROFILED_DEVICE_NAME = "NVIDIA H20"
     TRITON_MAX_TOKENS_BY_EP_SIZE = {1: 8, 2: 1}
 

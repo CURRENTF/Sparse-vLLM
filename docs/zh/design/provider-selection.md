@@ -1,0 +1,82 @@
+# Operator Provider 选择架构
+
+Sparse-vLLM 在模型构造阶段只解析一次 operator：
+
+```text
+OpSpec
+  -> atomic capability filter
+  -> exact local profile overlay
+     -> 命中：绑定 profiled dispatch plan
+     -> 未命中：执行默认 portfolio policy
+  -> prepare 已选择的实现
+  -> 运行期禁止重新进入 resolver 或静默 fallback
+```
+
+## Atomic Capability
+
+`supports()` 只回答 atomic 实现能否在当前平台上正确满足 operation contract，
+并返回一种有类型的状态：
+
+- `SUPPORTED`：实现正确满足契约。
+- `UNSUPPORTED_CONTRACT`：正常的语义或平台不匹配。
+- `DEPENDENCY_ABSENT`：可选上游依赖未安装。
+- `DEPENDENCY_BROKEN`：已安装依赖的版本、ABI 或 callable contract 损坏。
+
+本地 benchmark 覆盖不是 atomic support 状态。尤其不能因为 Sparse-vLLM 没有
+在本地测过某个 shape，就拒绝上游实现声明支持的 shape。
+
+## 默认 Portfolio
+
+每个 operator registry 都显式持有 `PortfolioPolicy`。标准上游 provider 排在
+repo portable baseline 之前；只有 attention score、特殊 cache layout、state
+mutation 等上游标准算子无法表达的契约，才使用 repo-owned nonstandard
+provider。Provider class 不再声明整数 priority。
+
+不进入默认 portfolio 的 atomic provider 必须显式注册为 `profile_only=True`。
+该入口只供 exact profile 引用 specialized implementation；未声明的隐藏
+provider 会在 registry 校验时失败。
+
+## Profile Overlay
+
+Profile 使用独立 registry。每个 profile 声明它引用的 atomic provider，严格
+匹配 device、shape、operation contract 和必要 toolchain，并构建 prepared
+dispatch plan。Resolver 会先验证所有 atomic 路径的正确性资格，再调用 profile
+matcher。Profile 未命中不会改变 atomic eligibility，也不会改变默认 portfolio。
+
+Profile 覆盖顺序由 operator registry 显式声明。Profile 可以覆盖默认性能选择，
+但不能定义标准上游算子的支持范围。
+
+## 依赖与证据
+
+适用的上游依赖缺失时，resolver 可以绑定 repo baseline，并记录
+`selection_basis=dependency_degraded`；已安装依赖损坏则直接终止绑定。运行期
+异常不会触发 provider 重选。
+
+每份 binding report 都记录最终 provider、可选 profile、`selection_basis`、
+全部 atomic/profile 判断和 `validation_evidence`。因此未命中本地 profile 的
+上游选择可以诚实表达：adapter equivalence 已验证，kernel 支持域来自上游声明，
+性能选择依赖上游默认 dispatcher，而不是本地 benchmark。
+
+验证证据遵循 ownership：只有纯上游 atomic 路径才能记录
+`adapter_equivalence` 和 `upstream_declared`。repo portable baseline、repo
+非标 kernel 以及混合 atomic role 的 profile plan 必须记录更窄的 contract
+证据，不能继承上游验证声明。
+
+## Ownership Rule
+
+标准算子优先复用上游 atomic provider，repo 只维护 adapter 和 portable
+baseline。只有新增稀疏语义或上游无法表达的 runtime contract，才新增
+repo-owned production kernel。本地 profile 只能覆盖默认选择，不能缩小上游
+支持域。
+
+## Phase 组合
+
+一个语义 operator 可以组合独立选择的执行阶段。Full attention 由一个 prepared
+`FullAttentionProvider` 统一拥有；prefill 和 decode 仍保留独立 atomic registry，
+因为它们的 kernel、workspace、CUDA Graph contract 和支持域可能不同。FlexPrefill
+这类只支持 prefill 的实现只进入 prefill portfolio，不需要伪造 decode 实现。
+
+Full-attention provider 会在准备任一阶段前，统一检查 head、dtype、scale、causal、
+page layout 和 page-table contract。之后两个 prepared phase operator 作为同一个
+生命周期一次性绑定到模型，并统一关闭。两个阶段仍独立选择，因此只要共享 cache
+contract 兼容，就允许组合不同的上游 prefill/decode provider。

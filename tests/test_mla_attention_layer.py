@@ -28,7 +28,6 @@ from sparsevllm.utils.context import get_context, reset_context, set_context
 
 class _TestProvider(MlaAttentionProvider):
     name = "test"
-    priority = 0
 
     def __init__(
         self,

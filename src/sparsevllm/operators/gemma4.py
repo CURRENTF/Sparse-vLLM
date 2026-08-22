@@ -13,6 +13,9 @@ from sparsevllm.layers.rotary_embedding import apply_rotary_emb
 from sparsevllm.operators.registry import (
     OpRegistry,
     OpResolver,
+    PortfolioPolicy,
+    ProfileMatch,
+    ProviderRole,
     SupportResult,
     runtime_version_at_least,
 )
@@ -32,7 +35,6 @@ class Gemma4OpSpec:
 
 class Gemma4OperatorProvider:
     name = ""
-    priority = 0
 
     def __init__(self) -> None:
         self._attention_backends: list[object] = []
@@ -123,25 +125,26 @@ class Gemma4OperatorProvider:
 
 
 GEMMA4_REGISTRY: OpRegistry[Gemma4OpSpec, Gemma4OperatorProvider] = OpRegistry(
-    "Gemma 4 model operations"
+    "Gemma 4 model operations",
+    portfolio=PortfolioPolicy(repo_nonstandard=("triton",)),
+    profile_order=("gemma4_h20_profile",),
 )
 
 
-@GEMMA4_REGISTRY.register
+@GEMMA4_REGISTRY.register_atomic(ProviderRole.REPO_NONSTANDARD)
 class TritonGemma4OperatorProvider(Gemma4OperatorProvider):
     name = "triton"
-    priority = 10
 
     @classmethod
     def supports(cls, spec: Gemma4OpSpec, caps: DeviceCaps) -> SupportResult:
         if caps.platform != PlatformEnum.CUDA or not caps.supports_triton:
-            return SupportResult.no("requires CUDA with Triton")
+            return SupportResult.unsupported("requires CUDA with Triton")
         if spec.cuda_graph and not caps.supports_graph_capture:
-            return SupportResult.no("device does not support CUDA Graph capture")
+            return SupportResult.unsupported("device does not support CUDA Graph capture")
         if spec.activation_dtype not in {torch.bfloat16, torch.float16}:
-            return SupportResult.no("requires BF16 or FP16 activations")
+            return SupportResult.unsupported("requires BF16 or FP16 activations")
         if any(head_dim not in {256, 512} for head_dim in spec.head_dims):
-            return SupportResult.no("requires attention head dimensions 256 or 512")
+            return SupportResult.unsupported("requires attention head dimensions 256 or 512")
         return SupportResult.yes()
 
     def attention_backend(self, *, sliding_window: int | None):
@@ -193,29 +196,30 @@ class TritonGemma4OperatorProvider(Gemma4OperatorProvider):
         return gemma4_rmsnorm_residual(x, weight, residual, eps, scalar)
 
 
-@GEMMA4_REGISTRY.register
+@GEMMA4_REGISTRY.register_atomic(
+    ProviderRole.REPO_NONSTANDARD,
+    profile_only=True,
+)
 class H20Gemma4OperatorProvider(TritonGemma4OperatorProvider):
     """Profiled H20 provider; generic Gemma kernels remain unchanged."""
 
     name = "gemma4_h20"
-    priority = 100
 
     @classmethod
     def supports(cls, spec: Gemma4OpSpec, caps: DeviceCaps) -> SupportResult:
         triton = super().supports(spec, caps)
         if not triton.supported:
             return triton
-        if caps.compute_capability != (9, 0) or caps.device_name != "NVIDIA H20":
-            return SupportResult.no(
-                "requires profiled NVIDIA H20 SM90 hardware, "
-                f"got {caps.device_name} {caps.compute_capability}"
+        if caps.compute_capability != (9, 0):
+            return SupportResult.unsupported(
+                f"requires CUDA SM90, got {caps.compute_capability}"
             )
         if not runtime_version_at_least(caps.runtime_version, (12, 8)):
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 f"requires CUDA runtime >= 12.8, got {caps.runtime_version or 'unknown'}"
             )
         supported, reason = flashinfer_paged_prefill_support("fa2")
-        return SupportResult.yes(reason) if supported else SupportResult.no(reason)
+        return SupportResult.yes(reason) if supported else SupportResult.unsupported(reason)
 
     @classmethod
     def bind(
@@ -274,6 +278,29 @@ class H20Gemma4OperatorProvider(TritonGemma4OperatorProvider):
                 global_decode_heads_per_program=4,
             )
         )
+
+
+@GEMMA4_REGISTRY.register_profile
+class H20Gemma4Profile:
+    name = "gemma4_h20_profile"
+
+    @classmethod
+    def atomic_provider_names(cls, spec: Gemma4OpSpec) -> tuple[str, ...]:
+        del spec
+        return ("gemma4_h20",)
+
+    @classmethod
+    def matches(cls, spec: Gemma4OpSpec, caps: DeviceCaps) -> ProfileMatch:
+        del spec
+        if caps.device_name != "NVIDIA H20":
+            return ProfileMatch.no(
+                f"requires profiled NVIDIA H20 hardware, got {caps.device_name}"
+            )
+        return ProfileMatch.yes("matched H20 Gemma 4 composite profile")
+
+    @classmethod
+    def bind(cls, spec: Gemma4OpSpec, caps: DeviceCaps, **kwargs):
+        return H20Gemma4OperatorProvider.bind(spec, caps, **kwargs)
 
 
 class TorchGemma4OperatorProvider(Gemma4OperatorProvider):

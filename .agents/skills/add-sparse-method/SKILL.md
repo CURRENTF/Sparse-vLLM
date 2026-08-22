@@ -75,9 +75,29 @@ Use `build_decode_view` when the method only changes the logical explicit-KV vie
 ## 6. Route Kernels At The Semantic Boundary
 
 - Put alternative attention computation behind `OpRegistry`, a typed `*OpSpec`, `DeviceCaps`, and an operator provider. Prepare and bind providers before capture when CUDA Graph is supported.
+- Preserve unified full-attention ownership when a method changes only one
+  phase. Prefill and decode may resolve different atomic providers, but their
+  shared cache contract must be validated and both phases must remain under one
+  prepared `FullAttentionProvider` lifecycle.
+- Reuse mature upstream providers for unchanged standard attention, GEMM, MoE,
+  normalization, and communication semantics across their declared support
+  domains. A sparse method may add requirements to `OpSpec`, but it must not
+  force a repository kernel when an upstream provider satisfies the same typed
+  contract.
+- Add repository-owned production kernels for the method's actual semantic
+  gap, such as score production, custom cache access, selection, compaction,
+  compression, reconstruction, or state mutation. Keep standard local kernels
+  as portable fallbacks or exact-profile overrides.
+- Keep local benchmark profiles separate from atomic correctness eligibility.
+  A method-specific measurement may add an exact dispatch route; it must not
+  narrow an upstream provider's standard support domain.
 - Invoke method-internal selection, metadata, compaction, compression, or reconstruction kernels from the state owner, usually CacheManager or SparseController.
 - Keep kernel adapters thin and keep policy, allocation, and lifecycle decisions out of kernel modules.
 - Do not silently fall back to another provider or dense behavior. Any fallback must be an explicit registered capability with tested semantics.
+
+Read and apply `$review-operator-organization` whenever a sparse-method change
+adds or changes provider selection, physical weight layout, or production
+kernel dispatch.
 
 ## 7. Integrate In Dependency Order
 

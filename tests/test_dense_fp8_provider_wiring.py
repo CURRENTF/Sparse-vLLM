@@ -252,7 +252,7 @@ def test_new_dense_fp8_models_load_shared_packed_weight_contract(
         ("qwen2", Qwen2ForCausalLM, "Qwen2"),
     ],
 )
-def test_dense_mha_models_build_and_bind_shared_prefill_provider(
+def test_dense_mha_models_build_and_bind_full_attention_provider(
     module_name,
     model_type,
     model_name,
@@ -264,20 +264,26 @@ def test_dense_mha_models_build_and_bind_shared_prefill_provider(
     engine_config.max_decoding_seqs = 64
     engine_config.decode_cuda_graph = True
     prepared_prefill = Mock(name="prepared_prefill")
-    prepared_prefill.name = "shared_prefill"
     prepared_decode = Mock(name="prepared_decode")
-    prepared_decode.name = "shared_decode"
+    full_attention = Mock(name="full_attention")
+    full_attention.prefill_op = prepared_prefill
+    full_attention.decode_op = prepared_decode
+    full_attention.prefill_name = "shared_prefill"
+    full_attention.decode_name = "shared_decode"
 
-    with (
-        patch(
-            f"sparsevllm.models.{module_name}.build_mha_prefill_attention_op",
-            return_value=prepared_prefill,
-        ) as build_prefill,
-        patch(
-            f"sparsevllm.models.{module_name}.build_mha_decode_attention_op",
-            return_value=prepared_decode,
-        ) as build_decode,
-    ):
+    def bind_full_attention(model):
+        for layer in model.layers:
+            layer.self_attn.attn.full_attention_provider = full_attention
+            layer.self_attn.attn.prefill_op = prepared_prefill
+            layer.self_attn.attn.decode_op = prepared_decode
+        return len(model.layers)
+
+    full_attention.bind.side_effect = bind_full_attention
+
+    with patch(
+        f"sparsevllm.models.{module_name}.build_mha_full_attention_provider",
+        return_value=full_attention,
+    ) as build_full_attention:
         kwargs = model_type.build_runtime_kwargs(
             config,
             engine_config=engine_config,
@@ -285,17 +291,8 @@ def test_dense_mha_models_build_and_bind_shared_prefill_provider(
             device=torch.device("cpu"),
         )
 
-    assert kwargs == {
-        "prefill_attention_op": prepared_prefill,
-        "decode_attention_op": prepared_decode,
-    }
-    build_prefill.assert_called_once_with(
-        config,
-        sparse_method="vanilla",
-        attention_tp_size=1,
-        device=torch.device("cpu"),
-    )
-    build_decode.assert_called_once_with(
+    assert kwargs == {"full_attention_provider": full_attention}
+    build_full_attention.assert_called_once_with(
         config,
         sparse_method="vanilla",
         attention_tp_size=1,
@@ -324,8 +321,7 @@ def test_dense_mha_models_build_and_bind_shared_prefill_provider(
     ):
         model = model_type(
             config,
-            prefill_attention_op=prepared_prefill,
-            decode_attention_op=prepared_decode,
+            full_attention_provider=full_attention,
         )
 
     assert all(
@@ -336,6 +332,9 @@ def test_dense_mha_models_build_and_bind_shared_prefill_provider(
         layer.self_attn.attn.decode_op is prepared_decode
         for layer in model.model.layers
     )
+    assert all(
+        layer.self_attn.attn.full_attention_provider is full_attention
+        for layer in model.model.layers
+    )
     model.close_runtime_operators()
-    prepared_prefill.close.assert_called_once_with()
-    prepared_decode.close.assert_called_once_with()
+    full_attention.close.assert_called_once_with()

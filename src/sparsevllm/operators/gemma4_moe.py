@@ -10,6 +10,9 @@ from sparsevllm.operators.moe import MoeOpSpec, MoeProvider, model_activation_dt
 from sparsevllm.operators.registry import (
     OpRegistry,
     OpResolver,
+    PortfolioPolicy,
+    ProfileMatch,
+    ProviderRole,
     SupportResult,
     runtime_version_at_least,
 )
@@ -45,29 +48,32 @@ class Gemma4MoeProvider(MoeProvider):
 
 
 GEMMA4_MOE_REGISTRY: OpRegistry[MoeOpSpec, Gemma4MoeProvider] = OpRegistry(
-    "Gemma 4 routed GEGLU MoE"
+    "Gemma 4 routed GEGLU MoE",
+    portfolio=PortfolioPolicy(
+        repo_nonstandard=("triton_gemma4_geglu",),
+    ),
+    profile_order=("triton_gemma4_geglu_h20_profile",),
 )
 
 
-@GEMMA4_MOE_REGISTRY.register
+@GEMMA4_MOE_REGISTRY.register_atomic(ProviderRole.REPO_NONSTANDARD)
 class TritonGemma4MoeProvider(Gemma4MoeProvider):
     name = "triton_gemma4_geglu"
-    priority = 10
     gate_up_order = "gate_up"
     _large_token_config = None
 
     @classmethod
     def supports(cls, spec: MoeOpSpec, caps: DeviceCaps) -> SupportResult:
         if spec.activation != "gelu_tanh" or spec.routing_method != "softmax":
-            return SupportResult.no("requires Gemma 4 GELU-tanh and softmax routing")
+            return SupportResult.unsupported("requires Gemma 4 GELU-tanh and softmax routing")
         if caps.platform != PlatformEnum.CUDA or not caps.supports_triton:
-            return SupportResult.no("requires CUDA with Triton")
+            return SupportResult.unsupported("requires CUDA with Triton")
         if spec.cuda_graph and not caps.supports_graph_capture:
-            return SupportResult.no("device does not support CUDA Graph capture")
+            return SupportResult.unsupported("device does not support CUDA Graph capture")
         if spec.activation_dtype not in {torch.bfloat16, torch.float16}:
-            return SupportResult.no("requires BF16 or FP16 activations")
+            return SupportResult.unsupported("requires BF16 or FP16 activations")
         if spec.weight_dtype != spec.activation_dtype or spec.block_shape is not None:
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 "requires unquantized experts matching activation dtype"
             )
         return SupportResult.yes()
@@ -103,10 +109,12 @@ class TritonGemma4MoeProvider(Gemma4MoeProvider):
         )
 
 
-@GEMMA4_MOE_REGISTRY.register
+@GEMMA4_MOE_REGISTRY.register_atomic(
+    ProviderRole.REPO_NONSTANDARD,
+    profile_only=True,
+)
 class H20Gemma4MoeProvider(TritonGemma4MoeProvider):
     name = "triton_gemma4_geglu_h20"
-    priority = 100
     _large_token_config = {
         "BLOCK_SIZE_M": 64,
         "BLOCK_SIZE_N": 64,
@@ -121,25 +129,54 @@ class H20Gemma4MoeProvider(TritonGemma4MoeProvider):
         triton = super().supports(spec, caps)
         if not triton.supported:
             return triton
-        if caps.compute_capability != (9, 0) or caps.device_name != "NVIDIA H20":
-            return SupportResult.no("requires profiled NVIDIA H20 SM90 hardware")
+        if caps.compute_capability != (9, 0):
+            return SupportResult.unsupported(
+                f"requires CUDA SM90, got {caps.compute_capability}"
+            )
         if not runtime_version_at_least(caps.runtime_version, (12, 8)):
-            return SupportResult.no("requires CUDA runtime >= 12.8")
+            return SupportResult.unsupported("requires CUDA runtime >= 12.8")
         return SupportResult.yes()
+
+
+@GEMMA4_MOE_REGISTRY.register_profile
+class H20Gemma4MoeProfile:
+    name = "triton_gemma4_geglu_h20_profile"
+
+    @classmethod
+    def atomic_provider_names(cls, spec: MoeOpSpec) -> tuple[str, ...]:
+        del spec
+        return ("triton_gemma4_geglu_h20",)
+
+    @classmethod
+    def matches(cls, spec: MoeOpSpec, caps: DeviceCaps) -> ProfileMatch:
+        del spec
+        if caps.device_name != "NVIDIA H20":
+            return ProfileMatch.no(
+                f"requires profiled NVIDIA H20 hardware, got {caps.device_name}"
+            )
+        return ProfileMatch.yes("matched H20 Gemma 4 MoE profile")
+
+    @classmethod
+    def bind(cls, spec: MoeOpSpec, caps: DeviceCaps, **kwargs):
+        del spec, caps
+        if kwargs:
+            raise TypeError(
+                f"{cls.name} does not accept provider arguments: {sorted(kwargs)}"
+            )
+        return H20Gemma4MoeProvider()
 
 class TorchGemma4MoeProvider(Gemma4MoeProvider):
     """Explicit correctness oracle; never selected for production inference."""
 
     name = "torch_gemma4_geglu"
-    priority = 0
 
     @classmethod
     def supports(cls, spec: MoeOpSpec, caps: DeviceCaps) -> SupportResult:
         del caps
         if spec.activation != "gelu_tanh" or spec.routing_method != "softmax":
-            return SupportResult.no("requires Gemma 4 GELU-tanh and softmax routing")
+            return SupportResult.unsupported("requires Gemma 4 GELU-tanh and softmax routing")
         if spec.weight_dtype != spec.activation_dtype or spec.block_shape is not None:
-            return SupportResult.no("requires unquantized Gemma 4 GELU-tanh experts")
+            return SupportResult.unsupported("requires unquantized Gemma 4 GELU-tanh experts")
         return SupportResult.yes()
 
     def run(

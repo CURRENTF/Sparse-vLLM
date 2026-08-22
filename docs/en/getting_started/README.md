@@ -61,11 +61,14 @@ other supported SM90 contracts use generic Triton. Any model whose FP8 Linear
 operation matches a profiled shape and contract on the RTX PRO 6000 binds the
 same model-independent dispatch plan: `M < 512` uses Triton, while `M >= 512`
 uses an atomic provider composed of SGL per-token-group activation quantization
-and FlashInfer's public `gemm_fp8_nt_groupwise` CUTLASS kernel. Unprofiled SM120
-shapes and other supported native-FP8 CUDA devices use generic Triton. The
-binding report records the profile and both routes. No Hub kernel is downloaded
-during warmup. The current profile was measured with Qwen3-30B TP1 shapes, but
-the model name is provenance rather than a selection key.
+and FlashInfer's public `gemm_fp8_nt_groupwise` CUTLASS kernel. On an unprofiled
+SM120 shape inside that upstream atomic contract, the default portfolio uses the
+upstream groupwise provider; generic Triton remains the portable baseline when
+the upstream contract is ineligible or its optional packages are absent. The
+binding report records the selection basis, profile decision, and routes. No Hub
+kernel is downloaded during warmup. The current profile was measured with
+Qwen3-30B TP1 shapes, but the model name is provenance rather than a selection
+key.
 
 ## DeltaKV Checkpoints
 

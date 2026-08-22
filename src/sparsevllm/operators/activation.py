@@ -6,7 +6,13 @@ import torch
 import torch.nn.functional as F
 
 import sparsevllm.platforms as platforms
-from sparsevllm.operators.registry import OpRegistry, OpResolver, SupportResult
+from sparsevllm.operators.registry import (
+    OpRegistry,
+    OpResolver,
+    PortfolioPolicy,
+    ProviderRole,
+    SupportResult,
+)
 from sparsevllm.platforms.interface import DeviceCaps, PlatformEnum
 
 
@@ -47,21 +53,20 @@ def _validate_bound_input(x: torch.Tensor, spec: SiluAndMulSpec) -> None:
 
 class SiluAndMulProvider:
     name = ""
-    priority = 0
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
 
 
 SILU_AND_MUL_REGISTRY: OpRegistry[SiluAndMulSpec, SiluAndMulProvider] = OpRegistry(
-    "SiLU-and-multiply"
+    "SiLU-and-multiply",
+    portfolio=PortfolioPolicy(repo_portable=("triton", "torch")),
 )
 
 
-@SILU_AND_MUL_REGISTRY.register
+@SILU_AND_MUL_REGISTRY.register_atomic(ProviderRole.REPO_PORTABLE)
 class TritonSiluAndMulProvider(SiluAndMulProvider):
     name = "triton"
-    priority = 10
 
     def __init__(self, *, op_spec: SiluAndMulSpec) -> None:
         self.spec = op_spec
@@ -69,16 +74,16 @@ class TritonSiluAndMulProvider(SiluAndMulProvider):
     @classmethod
     def supports(cls, spec: SiluAndMulSpec, caps: DeviceCaps) -> SupportResult:
         if caps.platform != PlatformEnum.CUDA:
-            return SupportResult.no(f"requires CUDA, got {caps.platform.name}")
+            return SupportResult.unsupported(f"requires CUDA, got {caps.platform.name}")
         if not caps.supports_triton:
-            return SupportResult.no("platform does not support Triton")
+            return SupportResult.unsupported("platform does not support Triton")
         if spec.activation_dtype not in (torch.float16, torch.bfloat16):
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 "requires FP16 or BF16 activations, "
                 f"got {spec.activation_dtype}"
             )
         if int(spec.input_ndim) != 2 or not spec.contiguous:
-            return SupportResult.no("requires contiguous rank-2 inputs")
+            return SupportResult.unsupported("requires contiguous rank-2 inputs")
         return SupportResult.yes()
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
@@ -90,10 +95,9 @@ class TritonSiluAndMulProvider(SiluAndMulProvider):
         return silu_and_mul_fwd(x)
 
 
-@SILU_AND_MUL_REGISTRY.register
+@SILU_AND_MUL_REGISTRY.register_atomic(ProviderRole.REPO_PORTABLE)
 class TorchSiluAndMulProvider(SiluAndMulProvider):
     name = "torch"
-    priority = 0
 
     def __init__(self, *, op_spec: SiluAndMulSpec | None = None) -> None:
         self.spec = op_spec

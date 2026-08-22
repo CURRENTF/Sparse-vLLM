@@ -6,10 +6,19 @@ from unittest.mock import patch
 import pytest
 
 import sparsevllm.operators.registry as operator_registry
+from sparsevllm.kernels.external.support import (
+    ExternalKernelFamilyError,
+    KernelFamilyHealth,
+    KernelFamilyState,
+)
 from sparsevllm.operators.registry import (
     OpRegistry,
     OpResolver,
+    PortfolioPolicy,
+    ProfileMatch,
+    ProviderRole,
     SupportResult,
+    SupportStatus,
     log_operator_implementations,
     operator_binding_report,
     operator_binding_reports,
@@ -34,26 +43,466 @@ def _caps() -> DeviceCaps:
     )
 
 
-def test_resolver_uses_deterministic_supported_priority():
-    registry = OpRegistry("_test")
+def test_support_result_has_typed_atomic_eligibility() -> None:
+    assert SupportResult.yes().status is SupportStatus.SUPPORTED
+    assert (
+        SupportResult.unsupported("wrong dtype").status
+        is SupportStatus.UNSUPPORTED_CONTRACT
+    )
+    assert (
+        SupportResult.dependency_absent("not installed").status
+        is SupportStatus.DEPENDENCY_ABSENT
+    )
+    assert (
+        SupportResult.dependency_broken("ABI mismatch").status
+        is SupportStatus.DEPENDENCY_BROKEN
+    )
 
-    @registry.register
+
+def test_default_portfolio_prefers_upstream_standard() -> None:
+    registry = OpRegistry(
+        "_test",
+        portfolio=PortfolioPolicy(
+            upstream_standard=("upstream",),
+            repo_portable=("portable",),
+        ),
+    )
+
+    @registry.register_atomic(ProviderRole.REPO_PORTABLE)
     class Portable:
         name = "portable"
-        priority = 10
 
         @classmethod
         def supports(cls, spec, caps):
             return SupportResult.yes()
 
-    @registry.register
-    class Specialized:
-        name = "specialized"
-        priority = 20
+    @registry.register_atomic(ProviderRole.UPSTREAM_STANDARD)
+    class Upstream:
+        name = "upstream"
 
         @classmethod
         def supports(cls, spec, caps):
-            return SupportResult.yes() if spec.enabled else SupportResult.no("disabled")
+            return SupportResult.yes("upstream-declared support")
+
+    resolved = OpResolver(registry).resolve(_Spec(), _caps())
+
+    assert resolved.provider.name == "upstream"
+    assert resolved.report.selection_basis == "upstream_default"
+    assert resolved.report.as_dict()["validation_evidence"] == {
+        "contract": "adapter_equivalence",
+        "kernel_support": "upstream_declared",
+        "performance": "upstream_default",
+    }
+
+
+def test_profile_overlay_is_separate_from_atomic_portfolio() -> None:
+    registry = OpRegistry(
+        "_test",
+        portfolio=PortfolioPolicy(repo_portable=("portable",)),
+        profile_order=("exact_profile",),
+    )
+
+    @registry.register_atomic(ProviderRole.REPO_PORTABLE)
+    class Portable:
+        name = "portable"
+
+        @classmethod
+        def supports(cls, spec, caps):
+            return SupportResult.yes()
+
+    @registry.register_atomic(ProviderRole.REPO_PORTABLE, profile_only=True)
+    class ProfiledAtomic:
+        name = "profiled_atomic"
+
+        @classmethod
+        def supports(cls, spec, caps):
+            return SupportResult.yes()
+
+        def binding_metadata(self):
+            return {"profile_id": "profile-v1"}
+
+    @registry.register_profile
+    class ExactProfile:
+        name = "exact_profile"
+
+        @classmethod
+        def atomic_provider_names(cls, spec):
+            del spec
+            return ("profiled_atomic",)
+
+        @classmethod
+        def matches(cls, spec, caps):
+            del caps
+            return (
+                ProfileMatch.yes("exact device/shape/toolchain match")
+                if spec.enabled
+                else ProfileMatch.no("shape is not profiled")
+            )
+
+        @classmethod
+        def bind(cls, spec, caps):
+            del spec, caps
+            return ProfiledAtomic()
+
+    profiled = OpResolver(registry).resolve(_Spec(enabled=True), _caps())
+    unprofiled = OpResolver(registry).resolve(_Spec(enabled=False), _caps())
+
+    assert profiled.provider.name == "profiled_atomic"
+    assert profiled.report.selected_provider == "profiled_atomic"
+    assert profiled.report.selected_profile == "exact_profile"
+    assert profiled.report.selection_basis == "profile_override"
+    assert profiled.report.as_dict()["validation_evidence"] == {
+        "contract": "eligible_atomic_contracts",
+        "kernel_support": "atomic_capability_filter",
+        "performance": "profile-v1",
+    }
+    assert unprofiled.provider.name == "portable"
+    assert unprofiled.report.profiles[0].matched is False
+    assert unprofiled.report.candidates[1].supported is True
+
+
+def test_profile_cannot_reference_ineligible_atomic_provider() -> None:
+    registry = OpRegistry(
+        "_test",
+        portfolio=PortfolioPolicy(repo_portable=("portable",)),
+        profile_order=("exact_profile",),
+    )
+
+    @registry.register_atomic(ProviderRole.REPO_PORTABLE)
+    class Portable:
+        name = "portable"
+
+        @classmethod
+        def supports(cls, spec, caps):
+            return SupportResult.yes()
+
+    @registry.register_atomic(ProviderRole.UPSTREAM_STANDARD, profile_only=True)
+    class Ineligible:
+        name = "ineligible"
+
+        @classmethod
+        def supports(cls, spec, caps):
+            return SupportResult.unsupported("wrong layout")
+
+    @registry.register_profile
+    class ExactProfile:
+        name = "exact_profile"
+
+        @classmethod
+        def atomic_provider_names(cls, spec):
+            del spec
+            return ("ineligible",)
+
+        @classmethod
+        def matches(cls, spec, caps):
+            raise AssertionError("ineligible profile must not be matched")
+
+    resolved = OpResolver(registry).resolve(_Spec(), _caps())
+
+    assert resolved.provider.name == "portable"
+    assert "wrong layout" in resolved.report.profiles[0].reason
+
+
+def test_profile_cannot_bind_an_undeclared_atomic_provider() -> None:
+    registry = OpRegistry(
+        "_test",
+        portfolio=PortfolioPolicy(repo_portable=("portable",)),
+        profile_order=("exact_profile",),
+    )
+
+    @registry.register_atomic(ProviderRole.REPO_PORTABLE)
+    class Portable:
+        name = "portable"
+
+        @classmethod
+        def supports(cls, spec, caps):
+            return SupportResult.yes()
+
+    @registry.register_atomic(ProviderRole.REPO_PORTABLE, profile_only=True)
+    class Declared:
+        name = "declared"
+
+        @classmethod
+        def supports(cls, spec, caps):
+            return SupportResult.yes()
+
+    @registry.register_profile
+    class ExactProfile:
+        name = "exact_profile"
+
+        @classmethod
+        def atomic_provider_names(cls, spec):
+            del spec
+            return ("declared",)
+
+        @classmethod
+        def matches(cls, spec, caps):
+            return ProfileMatch.yes("matched")
+
+        @classmethod
+        def bind(cls, spec, caps):
+            return Portable()
+
+    with pytest.raises(RuntimeError, match="bound undeclared provider"):
+        OpResolver(registry).resolve(_Spec(), _caps())
+
+
+def test_dependency_absent_binds_degraded_portable_baseline() -> None:
+    registry = OpRegistry(
+        "_test",
+        portfolio=PortfolioPolicy(
+            upstream_standard=("upstream",),
+            repo_portable=("portable",),
+        ),
+    )
+
+    @registry.register_atomic(ProviderRole.UPSTREAM_STANDARD)
+    class Upstream:
+        name = "upstream"
+
+        @classmethod
+        def supports(cls, spec, caps):
+            return SupportResult.dependency_absent("upstream package is absent")
+
+    @registry.register_atomic(ProviderRole.REPO_PORTABLE)
+    class Portable:
+        name = "portable"
+
+        @classmethod
+        def supports(cls, spec, caps):
+            return SupportResult.yes()
+
+    resolved = OpResolver(registry).resolve(_Spec(), _caps())
+
+    assert resolved.provider.name == "portable"
+    assert resolved.report.selection_basis == "dependency_degraded"
+    assert {
+        candidate.provider: candidate.status
+        for candidate in resolved.report.candidates
+    }["upstream"] == "dependency_absent"
+
+
+def test_absent_external_family_is_typed_and_does_not_abort_iteration() -> None:
+    registry = OpRegistry(
+        "_test",
+        portfolio=PortfolioPolicy(
+            upstream_standard=("upstream",),
+            repo_portable=("portable",),
+        ),
+    )
+    health = KernelFamilyHealth(
+        family="upstream",
+        state=KernelFamilyState.ABSENT,
+        version=None,
+        reason="not installed",
+    )
+
+    @registry.register_atomic(ProviderRole.UPSTREAM_STANDARD)
+    class Upstream:
+        name = "upstream"
+
+        @classmethod
+        def supports(cls, spec, caps):
+            raise ExternalKernelFamilyError(health, feature="test op")
+
+    @registry.register_atomic(ProviderRole.REPO_PORTABLE)
+    class Portable:
+        name = "portable"
+
+        @classmethod
+        def supports(cls, spec, caps):
+            return SupportResult.yes()
+
+    resolved = OpResolver(registry).resolve(_Spec(), _caps())
+
+    assert resolved.provider.name == "portable"
+    assert {
+        candidate.provider: candidate.status
+        for candidate in resolved.report.candidates
+    }["upstream"] == "dependency_absent"
+
+
+def test_dependency_broken_fails_binding() -> None:
+    registry = OpRegistry(
+        "_test",
+        portfolio=PortfolioPolicy(
+            upstream_standard=("upstream",),
+            repo_portable=("portable",),
+        ),
+    )
+
+    @registry.register_atomic(ProviderRole.UPSTREAM_STANDARD)
+    class Upstream:
+        name = "upstream"
+
+        @classmethod
+        def supports(cls, spec, caps):
+            return SupportResult.dependency_broken("undefined symbol")
+
+    @registry.register_atomic(ProviderRole.REPO_PORTABLE)
+    class Portable:
+        name = "portable"
+
+        @classmethod
+        def supports(cls, spec, caps):
+            return SupportResult.yes()
+
+    with pytest.raises(RuntimeError, match="broken dependency.*undefined symbol"):
+        OpResolver(registry).resolve(_Spec(), _caps())
+
+
+def test_registry_rejects_role_policy_mismatch() -> None:
+    registry = OpRegistry(
+        "_test",
+        portfolio=PortfolioPolicy(upstream_standard=("same",)),
+    )
+
+    @registry.register_atomic(ProviderRole.REPO_PORTABLE)
+    class Provider:
+        name = "same"
+
+        @classmethod
+        def supports(cls, spec, caps):
+            return SupportResult.yes()
+
+    with pytest.raises(ValueError, match="declared as repo_portable"):
+        OpResolver(registry).resolve(_Spec(), _caps())
+
+
+def test_registry_rejects_implicit_hidden_atomic_provider() -> None:
+    registry = OpRegistry(
+        "_test",
+        portfolio=PortfolioPolicy(repo_portable=("portable",)),
+    )
+
+    @registry.register_atomic(ProviderRole.REPO_PORTABLE)
+    class Portable:
+        name = "portable"
+
+        @classmethod
+        def supports(cls, spec, caps):
+            return SupportResult.yes()
+
+    @registry.register_atomic(ProviderRole.REPO_PORTABLE)
+    class Hidden:
+        name = "hidden"
+
+        @classmethod
+        def supports(cls, spec, caps):
+            return SupportResult.yes()
+
+    with pytest.raises(ValueError, match="must appear in the default portfolio"):
+        OpResolver(registry).resolve(_Spec(), _caps())
+
+
+def test_registry_rejects_duplicate_atomic_provider_names() -> None:
+    registry = OpRegistry("_test")
+
+    @registry.register_atomic(ProviderRole.REPO_PORTABLE)
+    class First:
+        name = "same"
+
+    with pytest.raises(ValueError, match="already registered"):
+
+        @registry.register_atomic(ProviderRole.REPO_PORTABLE)
+        class Second:
+            name = "same"
+
+
+@pytest.mark.parametrize(
+    ("atomic_names", "error"),
+    [
+        ((), "at least one atomic provider"),
+        (("portable", "portable"), "duplicate atomic providers"),
+        (("missing",), "unregistered atomic providers"),
+    ],
+)
+def test_registry_rejects_invalid_profile_atomic_references(
+    atomic_names,
+    error,
+) -> None:
+    registry = OpRegistry(
+        "_test",
+        portfolio=PortfolioPolicy(repo_portable=("portable",)),
+        profile_order=("invalid",),
+    )
+
+    @registry.register_atomic(ProviderRole.REPO_PORTABLE)
+    class Portable:
+        name = "portable"
+
+        @classmethod
+        def supports(cls, spec, caps):
+            return SupportResult.yes()
+
+    @registry.register_profile
+    class InvalidProfile:
+        name = "invalid"
+
+        @classmethod
+        def atomic_provider_names(cls, spec):
+            del spec
+            return atomic_names
+
+        @classmethod
+        def matches(cls, spec, caps):
+            raise AssertionError("invalid profile must not be matched")
+
+    with pytest.raises(ValueError, match=error):
+        OpResolver(registry).resolve(_Spec(), _caps())
+
+
+def test_profile_must_bind_a_plan_explicitly() -> None:
+    registry = OpRegistry(
+        "_test",
+        portfolio=PortfolioPolicy(repo_portable=("portable",)),
+        profile_order=("invalid",),
+    )
+
+    @registry.register_atomic(ProviderRole.REPO_PORTABLE)
+    class Portable:
+        name = "portable"
+
+        @classmethod
+        def supports(cls, spec, caps):
+            return SupportResult.yes()
+
+    @registry.register_profile
+    class InvalidProfile:
+        name = "invalid"
+
+        @classmethod
+        def atomic_provider_names(cls, spec):
+            del spec
+            return ("portable",)
+
+        @classmethod
+        def matches(cls, spec, caps):
+            return ProfileMatch.yes("matched")
+
+    with pytest.raises(TypeError, match="must define bind"):
+        OpResolver(registry).resolve(_Spec(), _caps())
+
+
+def test_binding_report_is_immutable_and_json_ready() -> None:
+    registry = OpRegistry(
+        "_test",
+        portfolio=PortfolioPolicy(repo_portable=("configured",)),
+    )
+
+    @registry.register_atomic(ProviderRole.REPO_PORTABLE)
+    class Configured:
+        name = "configured"
+
+        def __init__(self, marker):
+            self.marker = marker
+
+        @classmethod
+        def supports(cls, spec, caps):
+            return SupportResult.yes()
+
+        def binding_metadata(self):
+            return {"layout_id": "test_layout", "marker": self.marker}
 
     with (
         patch.dict(operator_registry._OPERATOR_BINDINGS, {}, clear=True),
@@ -63,156 +512,70 @@ def test_resolver_uses_deterministic_supported_priority():
             weakref.WeakKeyDictionary(),
         ),
     ):
-        resolved = OpResolver(registry).resolve(_Spec(), _caps())
-        assert resolved.provider in operator_registry._OPERATOR_BINDINGS["_test"]
+        resolved = OpResolver(registry).resolve(_Spec(), _caps(), marker="ready")
         assert operator_binding_report(resolved.provider) is resolved.report
         reports = operator_binding_reports()
 
-    assert resolved.provider.name == "specialized"
-    assert resolved.report.as_dict() == {
-        "operator_type": "_test",
-        "spec_type": "_Spec",
-        "spec": {"enabled": True},
-        "device_caps": {
-            "platform": "CUDA",
-            "device_type": "cuda",
-            "device_index": 0,
-            "device_name": "test",
-            "compute_capability": [9, 0],
-            "runtime_version": None,
-            "supports_graph_capture": False,
-            "supports_torch_compile": False,
-            "supports_triton": False,
-            "supports_pin_memory": False,
-            "supports_bfloat16": False,
-            "supports_native_fp8": False,
-        },
-        "selected_provider": "specialized",
-        "selected_priority": 20,
-        "selected_reason": "supported",
-        "candidates": [
-            {
-                "provider": "portable",
-                "priority": 10,
-                "supported": True,
-                "reason": "supported",
-            },
-            {
-                "provider": "specialized",
-                "priority": 20,
-                "supported": True,
-                "reason": "supported",
-            },
-        ],
-        "provider_metadata": {},
+    assert resolved.provider.marker == "ready"
+    assert resolved.report.as_dict()["provider_metadata"] == {
+        "layout_id": "test_layout",
+        "marker": "ready",
     }
     assert reports == [{**resolved.report.as_dict(), "bound_provider_count": 1}]
     json.dumps(reports)
 
 
-def test_resolver_reports_every_rejection():
-    registry = OpRegistry("_test")
+def test_resolver_rejects_invalid_binding_metadata() -> None:
+    registry = OpRegistry(
+        "_test",
+        portfolio=PortfolioPolicy(repo_portable=("invalid",)),
+    )
 
-    @registry.register
-    class First:
-        name = "first"
-        priority = 10
-
-        @classmethod
-        def supports(cls, spec, caps):
-            return SupportResult.no("wrong dtype")
-
-    @registry.register
-    class Second:
-        name = "second"
-        priority = 20
+    @registry.register_atomic(ProviderRole.REPO_PORTABLE)
+    class Invalid:
+        name = "invalid"
 
         @classmethod
         def supports(cls, spec, caps):
-            return SupportResult.no("wrong architecture")
+            return SupportResult.yes()
 
-    with pytest.raises(RuntimeError, match="wrong dtype.*wrong architecture"):
+        def binding_metadata(self):
+            return "not structured"
+
+    with pytest.raises(TypeError, match="binding_metadata.*dict"):
         OpResolver(registry).resolve(_Spec(), _caps())
 
 
-def test_registry_rejects_duplicate_provider_names():
-    registry = OpRegistry("_test")
+def test_resolver_uses_atomic_bind_hook() -> None:
+    registry = OpRegistry(
+        "_test",
+        portfolio=PortfolioPolicy(repo_portable=("prepared",)),
+    )
 
-    @registry.register
-    class First:
-        name = "same"
-        priority = 1
+    @registry.register_atomic(ProviderRole.REPO_PORTABLE)
+    class Prepared:
+        name = "prepared"
 
-        @classmethod
-        def supports(cls, spec, caps):
-            return SupportResult.yes()
-
-    with pytest.raises(ValueError, match="already registered"):
-
-        @registry.register
-        class Second:
-            name = "same"
-            priority = 2
-
-            @classmethod
-            def supports(cls, spec, caps):
-                return SupportResult.yes()
-
-
-def test_equal_priority_is_resolved_by_provider_name():
-    registry = OpRegistry("_test")
-
-    @registry.register
-    class Zulu:
-        name = "zulu"
-        priority = 10
+        def __init__(self, spec, marker):
+            self.spec = spec
+            self.marker = marker
 
         @classmethod
         def supports(cls, spec, caps):
             return SupportResult.yes()
 
-    @registry.register
-    class Alpha:
-        name = "alpha"
-        priority = 10
-
         @classmethod
-        def supports(cls, spec, caps):
-            return SupportResult.yes()
+        def bind(cls, spec, caps, *, marker):
+            assert caps.device_name == "test"
+            return cls(spec, marker)
 
-    resolved = OpResolver(registry).resolve(_Spec(), _caps())
+    resolved = OpResolver(registry).resolve(_Spec(), _caps(), marker="ready")
 
-    assert resolved.provider.name == "alpha"
-
-
-def test_resolver_falls_back_and_preserves_rejection_diagnostics():
-    registry = OpRegistry("_test")
-
-    @registry.register
-    class Specialized:
-        name = "specialized"
-        priority = 100
-
-        @classmethod
-        def supports(cls, spec, caps):
-            return SupportResult.no("missing optional library")
-
-    @registry.register
-    class Portable:
-        name = "portable"
-        priority = 10
-
-        @classmethod
-        def supports(cls, spec, caps):
-            return SupportResult.yes()
-
-    resolved = OpResolver(registry).resolve(_Spec(), _caps())
-
-    assert resolved.provider.name == "portable"
-    assert resolved.rejected == (("specialized", "missing optional library"),)
+    assert resolved.provider.spec == _Spec()
+    assert resolved.provider.marker == "ready"
 
 
-def test_operator_organization_logs_live_bound_implementations():
+def test_operator_organization_logs_live_bound_implementations() -> None:
     class Provider:
         def __init__(self, implementation_name):
             self.implementation_name = implementation_name
@@ -228,7 +591,6 @@ def test_operator_organization_logs_live_bound_implementations():
         record_operator_binding("Attention", attention)
         record_operator_binding("block-scaled FP8 Linear", linear)
         record_operator_binding("block-scaled FP8 Linear", linear_fallback)
-
         log_operator_implementations()
 
     log_info.assert_called_once_with(
@@ -238,7 +600,7 @@ def test_operator_organization_logs_live_bound_implementations():
     )
 
 
-def test_operator_runtime_stats_aggregate_live_provider_kernel_paths():
+def test_operator_runtime_stats_aggregate_live_provider_kernel_paths() -> None:
     class Provider:
         name = "composite"
 
@@ -263,7 +625,6 @@ def test_operator_runtime_stats_aggregate_live_provider_kernel_paths():
     with patch.dict(operator_registry._OPERATOR_BINDINGS, {}, clear=True):
         record_operator_binding("MLA attention", first)
         record_operator_binding("MLA attention", second)
-
         stats = operator_runtime_stats()
 
     assert stats == {
@@ -284,86 +645,6 @@ def test_operator_runtime_stats_aggregate_live_provider_kernel_paths():
     }
 
 
-def test_resolver_forwards_provider_constructor_arguments():
-    registry = OpRegistry("_test")
-
-    @registry.register
-    class Configured:
-        name = "configured"
-        priority = 1
-
-        def __init__(self, marker):
-            self.marker = marker
-
-        def binding_metadata(self):
-            return {
-                "empty_mapping": {},
-                "empty_sequence": [],
-                "layout_id": "test_layout",
-                "profile": {"status": "generic"},
-            }
-
-        @classmethod
-        def supports(cls, spec, caps):
-            return SupportResult.yes()
-
-    resolved = OpResolver(registry).resolve(_Spec(), _caps(), marker="ready")
-
-    assert resolved.provider.marker == "ready"
-    assert resolved.report.as_dict()["provider_metadata"] == {
-        "empty_mapping": {},
-        "empty_sequence": [],
-        "layout_id": "test_layout",
-        "profile": {"status": "generic"},
-    }
-
-
-def test_resolver_rejects_invalid_binding_metadata() -> None:
-    registry = OpRegistry("_test")
-
-    @registry.register
-    class Invalid:
-        name = "invalid"
-        priority = 1
-
-        @classmethod
-        def supports(cls, spec, caps):
-            return SupportResult.yes()
-
-        def binding_metadata(self):
-            return "not structured"
-
-    with pytest.raises(TypeError, match="binding_metadata.*dict"):
-        OpResolver(registry).resolve(_Spec(), _caps())
-
-
-def test_resolver_uses_provider_bind_hook_for_prepared_plans() -> None:
-    registry = OpRegistry("_test")
-
-    @registry.register
-    class Prepared:
-        name = "prepared"
-        priority = 1
-
-        def __init__(self, spec, marker):
-            self.spec = spec
-            self.marker = marker
-
-        @classmethod
-        def supports(cls, spec, caps):
-            return SupportResult.yes()
-
-        @classmethod
-        def bind(cls, spec, caps, *, marker):
-            assert caps.device_name == "test"
-            return cls(spec, marker)
-
-    resolved = OpResolver(registry).resolve(_Spec(), _caps(), marker="ready")
-
-    assert resolved.provider.spec == _Spec()
-    assert resolved.provider.marker == "ready"
-
-
-def test_empty_registry_fails_with_explicit_reason():
-    with pytest.raises(RuntimeError, match="no providers registered"):
+def test_empty_registry_fails_with_explicit_reason() -> None:
+    with pytest.raises(RuntimeError, match="no default portfolio providers"):
         OpResolver(OpRegistry("_empty")).resolve(_Spec(), _caps())

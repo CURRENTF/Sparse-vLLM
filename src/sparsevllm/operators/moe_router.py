@@ -8,6 +8,8 @@ import sparsevllm.platforms as platforms
 from sparsevllm.operators.registry import (
     OpRegistry,
     OpResolver,
+    PortfolioPolicy,
+    ProviderRole,
     SupportResult,
 )
 from sparsevllm.platforms.interface import DeviceCaps, PlatformEnum
@@ -41,7 +43,6 @@ class MoeRouterOpSpec:
 
 class MoeRouterProvider:
     name = ""
-    priority = 0
 
     def binding_metadata(self) -> dict[str, object]:
         return {
@@ -62,14 +63,20 @@ class MoeRouterProvider:
 
 
 MOE_ROUTER_REGISTRY: OpRegistry[MoeRouterOpSpec, MoeRouterProvider] = OpRegistry(
-    "MoE router"
+    "MoE router",
+    portfolio=PortfolioPolicy(
+        repo_nonstandard=(
+            "triton_glm_biased_sigmoid",
+            "triton_minimax_biased_sigmoid",
+            "triton",
+        )
+    ),
 )
 
 
-@MOE_ROUTER_REGISTRY.register
+@MOE_ROUTER_REGISTRY.register_atomic(ProviderRole.REPO_NONSTANDARD)
 class TritonMoeRouterProvider(MoeRouterProvider):
     name = "triton"
-    priority = 10
 
     def binding_metadata(self) -> dict[str, object]:
         return {
@@ -84,19 +91,19 @@ class TritonMoeRouterProvider(MoeRouterProvider):
         caps: DeviceCaps,
     ) -> SupportResult:
         if spec.routing_method != "softmax":
-            return SupportResult.no("requires softmax routing")
+            return SupportResult.unsupported("requires softmax routing")
         if caps.platform != PlatformEnum.CUDA:
-            return SupportResult.no(f"requires CUDA, got {caps.platform.name}")
+            return SupportResult.unsupported(f"requires CUDA, got {caps.platform.name}")
         if not caps.supports_triton:
-            return SupportResult.no("platform does not support Triton")
+            return SupportResult.unsupported("platform does not support Triton")
         if spec.cuda_graph and not caps.supports_graph_capture:
-            return SupportResult.no("device does not support CUDA Graph capture")
+            return SupportResult.unsupported("device does not support CUDA Graph capture")
         if spec.activation_dtype not in {torch.bfloat16, torch.float16}:
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 f"requires BF16 or FP16 logits, got {spec.activation_dtype}"
             )
         if spec.num_experts not in {128, 256} or spec.top_k != 8:
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 "requires num_experts in {128, 256} and top_k=8"
             )
         return SupportResult.yes()
@@ -120,10 +127,9 @@ class TritonMoeRouterProvider(MoeRouterProvider):
         )
 
 
-@MOE_ROUTER_REGISTRY.register
+@MOE_ROUTER_REGISTRY.register_atomic(ProviderRole.REPO_NONSTANDARD)
 class GlmBiasedSigmoidRouterProvider(MoeRouterProvider):
     name = "triton_glm_biased_sigmoid"
-    priority = 20
 
     def binding_metadata(self) -> dict[str, object]:
         return {
@@ -137,13 +143,13 @@ class GlmBiasedSigmoidRouterProvider(MoeRouterProvider):
     @classmethod
     def supports(cls, spec: MoeRouterOpSpec, caps: DeviceCaps) -> SupportResult:
         if spec.routing_method != "biased_sigmoid":
-            return SupportResult.no("requires biased-sigmoid routing")
+            return SupportResult.unsupported("requires biased-sigmoid routing")
         if caps.platform != PlatformEnum.CUDA or not caps.supports_triton:
-            return SupportResult.no("requires CUDA with Triton")
+            return SupportResult.unsupported("requires CUDA with Triton")
         if spec.cuda_graph and not caps.supports_graph_capture:
-            return SupportResult.no("device does not support CUDA Graph capture")
+            return SupportResult.unsupported("device does not support CUDA Graph capture")
         if (spec.num_experts, spec.top_k) != (64, 4):
-            return SupportResult.no("requires 64 experts and top-k 4")
+            return SupportResult.unsupported("requires 64 experts and top-k 4")
         return SupportResult.yes()
 
     def run(
@@ -168,29 +174,28 @@ class GlmBiasedSigmoidRouterProvider(MoeRouterProvider):
         )
 
 
-@MOE_ROUTER_REGISTRY.register
+@MOE_ROUTER_REGISTRY.register_atomic(ProviderRole.REPO_NONSTANDARD)
 class MiniMaxBiasedSigmoidRouterProvider(MoeRouterProvider):
     """MiniMax M2's exact FP32 biased-sigmoid routing contract."""
 
     name = "triton_minimax_biased_sigmoid"
-    priority = 20
 
     @classmethod
     def supports(cls, spec: MoeRouterOpSpec, caps: DeviceCaps) -> SupportResult:
         if spec.routing_method != "biased_sigmoid":
-            return SupportResult.no("requires biased-sigmoid routing")
+            return SupportResult.unsupported("requires biased-sigmoid routing")
         if caps.platform != PlatformEnum.CUDA or not caps.supports_triton:
-            return SupportResult.no("requires CUDA with Triton")
+            return SupportResult.unsupported("requires CUDA with Triton")
         if spec.cuda_graph and not caps.supports_graph_capture:
-            return SupportResult.no("device does not support CUDA Graph capture")
+            return SupportResult.unsupported("device does not support CUDA Graph capture")
         if (spec.num_experts, spec.top_k) != (256, 8):
-            return SupportResult.no("requires 256 experts and top-k 8")
+            return SupportResult.unsupported("requires 256 experts and top-k 8")
         if spec.activation_dtype != torch.float32:
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 f"requires FP32 logits, got {spec.activation_dtype}"
             )
         if not spec.norm_topk_prob:
-            return SupportResult.no("requires normalized top-k probabilities")
+            return SupportResult.unsupported("requires normalized top-k probabilities")
         return SupportResult.yes("MiniMax M2 FP32 biased-sigmoid router")
 
     def binding_metadata(self) -> dict[str, object]:

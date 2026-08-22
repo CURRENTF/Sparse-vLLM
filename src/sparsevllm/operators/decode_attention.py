@@ -16,7 +16,14 @@ from sparsevllm.operators.attention_capabilities import (
     AttentionScoreKind,
     match_attention_capabilities,
 )
-from sparsevllm.operators.registry import OpRegistry, OpResolver, SupportResult
+from sparsevllm.operators.registry import (
+    OpRegistry,
+    OpResolver,
+    PortfolioPolicy,
+    ProfileMatch,
+    ProviderRole,
+    SupportResult,
+)
 from sparsevllm.platforms.interface import DeviceCaps, PlatformEnum
 from sparsevllm.utils.context import get_context
 from sparsevllm.utils.log import logger
@@ -104,7 +111,6 @@ class DecodeAttentionOpSpec:
 
 class DecodeAttentionProvider:
     name = ""
-    priority = 0
     capabilities: AttentionKernelCapabilities
 
     def prepare(
@@ -130,13 +136,18 @@ class DecodeAttentionProvider:
 
 DECODE_ATTENTION_REGISTRY: OpRegistry[
     DecodeAttentionOpSpec, DecodeAttentionProvider
-] = OpRegistry("paged decode attention")
+] = OpRegistry(
+    "paged decode attention",
+    portfolio=PortfolioPolicy(
+        upstream_standard=("sgl_fa3_paged_decode_sm90",),
+        repo_portable=("triton_paged_decode",),
+    ),
+)
 
 
-@DECODE_ATTENTION_REGISTRY.register
+@DECODE_ATTENTION_REGISTRY.register_atomic(ProviderRole.UPSTREAM_STANDARD)
 class SglFa3PagedDecodeAttentionProvider(DecodeAttentionProvider):
     name = "sgl_fa3_paged_decode_sm90"
-    priority = 200
     capabilities = AttentionKernelCapabilities(
         platforms=frozenset({PlatformEnum.CUDA}),
         compute_capabilities=frozenset({(9, 0)}),
@@ -167,9 +178,9 @@ class SglFa3PagedDecodeAttentionProvider(DecodeAttentionProvider):
         if not common.supported:
             return common
         if not spec.causal:
-            return SupportResult.no("requires causal attention")
+            return SupportResult.unsupported("requires causal attention")
         supported, reason = sgl_fa3_device_support(caps.device_index)
-        return SupportResult.yes(reason) if supported else SupportResult.no(reason)
+        return SupportResult.yes(reason) if supported else SupportResult.unsupported(reason)
 
     def prepare(
         self,
@@ -250,10 +261,9 @@ class SglFa3PagedDecodeAttentionProvider(DecodeAttentionProvider):
         )
 
 
-@DECODE_ATTENTION_REGISTRY.register
+@DECODE_ATTENTION_REGISTRY.register_atomic(ProviderRole.REPO_PORTABLE)
 class TritonPagedDecodeAttentionProvider(DecodeAttentionProvider):
     name = "triton_paged_decode"
-    priority = 10
     capabilities = AttentionKernelCapabilities(
         platforms=frozenset({PlatformEnum.CUDA}),
         activation_dtypes=frozenset(
@@ -451,7 +461,6 @@ class DecodeAttentionLaunchSpec:
 
 class DecodeAttentionLaunchProvider:
     name = ""
-    priority = 0
 
     def launch_config(
         self,
@@ -465,13 +474,19 @@ class DecodeAttentionLaunchProvider:
 
 DECODE_ATTENTION_LAUNCH_REGISTRY: OpRegistry[
     DecodeAttentionLaunchSpec, DecodeAttentionLaunchProvider
-] = OpRegistry("decode attention launch")
+] = OpRegistry(
+    "decode attention launch",
+    portfolio=PortfolioPolicy(repo_portable=("default_gqa",)),
+    profile_order=("h100_long_gqa_12q_2kv_hd128_profile",),
+)
 
 
-@DECODE_ATTENTION_LAUNCH_REGISTRY.register
+@DECODE_ATTENTION_LAUNCH_REGISTRY.register_atomic(
+    ProviderRole.REPO_PORTABLE,
+    profile_only=True,
+)
 class H100LongGqaDecodeLaunchProvider(DecodeAttentionLaunchProvider):
     name = "h100_long_gqa_12q_2kv_hd128"
-    priority = 100
 
     @classmethod
     def supports(
@@ -480,32 +495,17 @@ class H100LongGqaDecodeLaunchProvider(DecodeAttentionLaunchProvider):
         caps: DeviceCaps,
     ) -> SupportResult:
         if caps.platform != PlatformEnum.CUDA or caps.compute_capability != (9, 0):
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 f"requires CUDA SM90, got {caps.platform.name} {caps.compute_capability}"
             )
-        if caps.device_name != "NVIDIA H100 80GB HBM3":
-            return SupportResult.no(
-                "requires profiled NVIDIA H100 80GB HBM3 hardware, "
-                f"got {caps.device_name}"
-            )
         if not caps.supports_triton:
-            return SupportResult.no("platform does not support Triton")
+            return SupportResult.unsupported("platform does not support Triton")
         if spec.activation_dtype != torch.bfloat16:
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 f"requires BF16 query/KV tensors, got {spec.activation_dtype}"
             )
-        expected_shape = (12, 2, 128)
-        actual_shape = (
-            spec.num_query_heads,
-            spec.num_kv_heads,
-            spec.head_dim,
-        )
-        if actual_shape != expected_shape:
-            return SupportResult.no(
-                f"requires profiled local Q/KV/head shape {expected_shape}, got {actual_shape}"
-            )
         if spec.page_size != 1:
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 f"requires token-page KV storage (page_size=1), got {spec.page_size}"
             )
         return SupportResult.yes()
@@ -526,10 +526,55 @@ class H100LongGqaDecodeLaunchProvider(DecodeAttentionLaunchProvider):
         return int(block_seq), 16, 2
 
 
-@DECODE_ATTENTION_LAUNCH_REGISTRY.register
+@DECODE_ATTENTION_LAUNCH_REGISTRY.register_profile
+class H100LongGqaDecodeLaunchProfile:
+    name = "h100_long_gqa_12q_2kv_hd128_profile"
+
+    @classmethod
+    def atomic_provider_names(
+        cls,
+        spec: DecodeAttentionLaunchSpec,
+    ) -> tuple[str, ...]:
+        del spec
+        return ("h100_long_gqa_12q_2kv_hd128",)
+
+    @classmethod
+    def matches(
+        cls,
+        spec: DecodeAttentionLaunchSpec,
+        caps: DeviceCaps,
+    ) -> ProfileMatch:
+        expected_shape = (12, 2, 128)
+        actual_shape = (
+            spec.num_query_heads,
+            spec.num_kv_heads,
+            spec.head_dim,
+        )
+        if caps.device_name != "NVIDIA H100 80GB HBM3":
+            return ProfileMatch.no(
+                "requires profiled NVIDIA H100 80GB HBM3 hardware, "
+                f"got {caps.device_name}"
+            )
+        if actual_shape != expected_shape:
+            return ProfileMatch.no(
+                f"requires profiled local Q/KV/head shape {expected_shape}, "
+                f"got {actual_shape}"
+            )
+        return ProfileMatch.yes("matched H100 long-GQA launch profile")
+
+    @classmethod
+    def bind(cls, spec: DecodeAttentionLaunchSpec, caps: DeviceCaps, **kwargs):
+        del spec, caps
+        if kwargs:
+            raise TypeError(
+                f"{cls.name} does not accept provider arguments: {sorted(kwargs)}"
+            )
+        return H100LongGqaDecodeLaunchProvider()
+
+
+@DECODE_ATTENTION_LAUNCH_REGISTRY.register_atomic(ProviderRole.REPO_PORTABLE)
 class DefaultGqaDecodeLaunchProvider(DecodeAttentionLaunchProvider):
     name = "default_gqa"
-    priority = 10
 
     @classmethod
     def supports(

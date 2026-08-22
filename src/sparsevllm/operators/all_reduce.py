@@ -14,6 +14,9 @@ import sparsevllm.platforms as platforms
 from sparsevllm.operators.registry import (
     OpRegistry,
     OpResolver,
+    PortfolioPolicy,
+    ProfileMatch,
+    ProviderRole,
     SupportResult,
     runtime_version_at_least,
 )
@@ -47,7 +50,6 @@ class AllReduceOpSpec:
 
 class AllReduceProvider:
     name = ""
-    priority = 0
 
     def prepare(
         self,
@@ -74,7 +76,12 @@ class AllReduceProvider:
 
 
 ALL_REDUCE_REGISTRY: OpRegistry[AllReduceOpSpec, AllReduceProvider] = OpRegistry(
-    "all-reduce"
+    "all-reduce",
+    portfolio=PortfolioPolicy(repo_portable=("torch_distributed",)),
+    profile_order=(
+        "flashinfer_trtllm_sm90_profile",
+        "flashinfer_vllm_sm90_profile",
+    ),
 )
 
 
@@ -97,61 +104,52 @@ _FLASHINFER_TRTLLM_PROFILES = {
 }
 
 
-def _flashinfer_dependency_reason() -> str | None:
+def _flashinfer_dependency_support() -> SupportResult:
     if find_spec("flashinfer") is None:
-        return "flashinfer is not installed"
+        return SupportResult.dependency_absent("flashinfer is not installed")
     try:
         installed = version("flashinfer-python")
     except PackageNotFoundError:
-        return "flashinfer-python package metadata is unavailable"
+        return SupportResult.dependency_broken(
+            "flashinfer-python package metadata is unavailable"
+        )
     numeric = tuple(int(part) for part in re.findall(r"\d+", installed)[:3])
-    return (
-        f"requires flashinfer-python >= 0.6.15, got {installed}"
-        if numeric < (0, 6, 15)
-        else None
+    if numeric < (0, 6, 15):
+        return SupportResult.dependency_broken(
+            f"requires flashinfer-python >= 0.6.15, got {installed}"
+        )
+    return SupportResult.yes(
+        f"flashinfer-python {installed} communication family is available"
     )
 
 
-@ALL_REDUCE_REGISTRY.register
+@ALL_REDUCE_REGISTRY.register_atomic(
+    ProviderRole.UPSTREAM_STANDARD,
+    profile_only=True,
+)
 class FlashInferTrtllmAllReduceProvider(AllReduceProvider):
     name = "flashinfer_trtllm_sm90"
-    priority = 100
 
     @classmethod
     def supports(cls, spec: AllReduceOpSpec, caps: DeviceCaps) -> SupportResult:
         if caps.platform != PlatformEnum.CUDA or caps.compute_capability != (9, 0):
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 f"requires CUDA SM90, got {caps.platform.name} {caps.compute_capability}"
             )
-        if caps.device_name != "NVIDIA H100 80GB HBM3":
-            return SupportResult.no(
-                "requires profiled NVIDIA H100 80GB HBM3 hardware, "
-                f"got {caps.device_name}"
-            )
         if not runtime_version_at_least(caps.runtime_version, (12, 8)):
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 "requires CUDA runtime >= 12.8, "
                 f"got {caps.runtime_version or 'unknown'}"
             )
         if not caps.supports_graph_capture or not spec.cuda_graph:
-            return SupportResult.no("requires CUDA Graph execution")
+            return SupportResult.unsupported("requires CUDA Graph execution")
         if spec.backend != "nccl":
-            return SupportResult.no(f"requires NCCL, got {spec.backend}")
-        profile = _FLASHINFER_TRTLLM_PROFILES.get(
-            (caps.device_name, spec.world_size, spec.hidden_size)
-        )
-        if profile is None or spec.dtype != torch.bfloat16:
-            return SupportResult.no(
-                "requires a profiled BF16 topology/shape, got "
-                f"world_size={spec.world_size} hidden_size={spec.hidden_size} "
-                f"dtype={spec.dtype}"
+            return SupportResult.unsupported(f"requires NCCL, got {spec.backend}")
+        if spec.dtype != torch.bfloat16:
+            return SupportResult.unsupported(
+                f"requires BF16 tensors, got {spec.dtype}"
             )
-        if spec.max_rows > profile.max_rows:
-            return SupportResult.no(
-                f"requires max_rows <= {profile.max_rows}, got {spec.max_rows}"
-            )
-        reason = _flashinfer_dependency_reason()
-        return SupportResult.no(reason) if reason else SupportResult.yes()
+        return _flashinfer_dependency_support()
 
     def __init__(self) -> None:
         self.workspace = None
@@ -244,46 +242,36 @@ class FlashInferTrtllmAllReduceProvider(AllReduceProvider):
         return result.view_as(tensor)
 
 
-@ALL_REDUCE_REGISTRY.register
+@ALL_REDUCE_REGISTRY.register_atomic(
+    ProviderRole.UPSTREAM_STANDARD,
+    profile_only=True,
+)
 class FlashInferVllmAllReduceProvider(AllReduceProvider):
     name = "flashinfer_vllm_sm90"
-    priority = 100
     max_rows = 256
     num_ctas = 32
 
     @classmethod
     def supports(cls, spec: AllReduceOpSpec, caps: DeviceCaps) -> SupportResult:
         if caps.platform != PlatformEnum.CUDA or caps.compute_capability != (9, 0):
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 f"requires CUDA SM90, got {caps.platform.name} {caps.compute_capability}"
             )
-        if caps.device_name != "NVIDIA H100 80GB HBM3":
-            return SupportResult.no(
-                "requires profiled NVIDIA H100 80GB HBM3 hardware, "
-                f"got {caps.device_name}"
-            )
         if spec.cuda_graph:
-            return SupportResult.no("requires eager execution")
+            return SupportResult.unsupported("requires eager execution")
         if spec.backend != "nccl":
-            return SupportResult.no(f"requires NCCL, got {spec.backend}")
-        if (
-            spec.world_size != 2
-            or spec.max_rows > cls.max_rows
-            or spec.hidden_size != 2048
-            or spec.dtype != torch.bfloat16
-        ):
-            return SupportResult.no(
-                "requires profiled TP2 BF16 [..., 2048] with max_rows <= 256, "
-                f"got world_size={spec.world_size} max_rows={spec.max_rows} "
-                f"hidden_size={spec.hidden_size} dtype={spec.dtype}"
+            return SupportResult.unsupported(f"requires NCCL, got {spec.backend}")
+        if spec.dtype != torch.bfloat16:
+            return SupportResult.unsupported(
+                f"requires BF16 tensors, got {spec.dtype}"
             )
-        reason = _flashinfer_dependency_reason()
-        if reason:
-            return SupportResult.no(reason)
+        dependency = _flashinfer_dependency_support()
+        if not dependency.supported:
+            return dependency
         try:
             from flashinfer import comm
         except (ImportError, OSError, RuntimeError) as exc:
-            return SupportResult.no(
+            return SupportResult.dependency_broken(
                 f"FlashInfer communication APIs are unavailable: {exc}"
             )
         required = (
@@ -297,11 +285,11 @@ class FlashInferVllmAllReduceProvider(AllReduceProvider):
         )
         missing = [name for name in required if not hasattr(comm, name)]
         return (
-            SupportResult.no(
+            SupportResult.dependency_broken(
                 "FlashInfer communication APIs are missing: " + ", ".join(missing)
             )
             if missing
-            else SupportResult.yes()
+            else dependency
         )
 
     def __init__(self) -> None:
@@ -409,10 +397,80 @@ class FlashInferVllmAllReduceProvider(AllReduceProvider):
         self._rank_data = None
 
 
-@ALL_REDUCE_REGISTRY.register
+class _FlashInferAllReduceProfile:
+    atomic_provider_name = ""
+
+    @classmethod
+    def atomic_provider_names(cls, spec: AllReduceOpSpec) -> tuple[str, ...]:
+        del spec
+        return (cls.atomic_provider_name,)
+
+    @classmethod
+    def bind(cls, spec: AllReduceOpSpec, caps: DeviceCaps, **kwargs):
+        del spec, caps
+        if kwargs:
+            raise TypeError(
+                f"{cls.name} does not accept provider arguments: {sorted(kwargs)}"
+            )
+        provider_type = ALL_REDUCE_REGISTRY.atomic_registry.registration(
+            cls.atomic_provider_name
+        ).provider
+        return provider_type()
+
+
+@ALL_REDUCE_REGISTRY.register_profile
+class FlashInferTrtllmAllReduceProfile(_FlashInferAllReduceProfile):
+    name = "flashinfer_trtllm_sm90_profile"
+    atomic_provider_name = "flashinfer_trtllm_sm90"
+
+    @classmethod
+    def matches(cls, spec: AllReduceOpSpec, caps: DeviceCaps) -> ProfileMatch:
+        profile = _FLASHINFER_TRTLLM_PROFILES.get(
+            (caps.device_name, spec.world_size, spec.hidden_size)
+        )
+        if profile is None or spec.dtype != torch.bfloat16:
+            return ProfileMatch.no(
+                "requires an exact H100 BF16 topology/shape profile, got "
+                f"device={caps.device_name} world_size={spec.world_size} "
+                f"hidden_size={spec.hidden_size} dtype={spec.dtype}"
+            )
+        if spec.max_rows > profile.max_rows:
+            return ProfileMatch.no(
+                f"profile requires max_rows <= {profile.max_rows}, "
+                f"got {spec.max_rows}"
+            )
+        return ProfileMatch.yes("matched exact FlashInfer TRT-LLM profile")
+
+
+@ALL_REDUCE_REGISTRY.register_profile
+class FlashInferVllmAllReduceProfile(_FlashInferAllReduceProfile):
+    name = "flashinfer_vllm_sm90_profile"
+    atomic_provider_name = "flashinfer_vllm_sm90"
+
+    @classmethod
+    def matches(cls, spec: AllReduceOpSpec, caps: DeviceCaps) -> ProfileMatch:
+        if caps.device_name != "NVIDIA H100 80GB HBM3":
+            return ProfileMatch.no(
+                "requires profiled NVIDIA H100 80GB HBM3 hardware, "
+                f"got {caps.device_name}"
+            )
+        if (
+            spec.world_size != 2
+            or spec.max_rows > FlashInferVllmAllReduceProvider.max_rows
+            or spec.hidden_size != 2048
+            or spec.dtype != torch.bfloat16
+        ):
+            return ProfileMatch.no(
+                "requires profiled TP2 BF16 [..., 2048] with max_rows <= 256, "
+                f"got world_size={spec.world_size} max_rows={spec.max_rows} "
+                f"hidden_size={spec.hidden_size} dtype={spec.dtype}"
+            )
+        return ProfileMatch.yes("matched exact FlashInfer vLLM profile")
+
+
+@ALL_REDUCE_REGISTRY.register_atomic(ProviderRole.REPO_PORTABLE)
 class TorchDistributedAllReduceProvider(AllReduceProvider):
     name = "torch_distributed"
-    priority = 10
 
     @classmethod
     def supports(cls, spec: AllReduceOpSpec, caps: DeviceCaps) -> SupportResult:

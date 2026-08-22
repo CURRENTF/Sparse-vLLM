@@ -14,12 +14,11 @@ from sparsevllm.layers.linear import QKVParallelLinear, MergedColumnParallelLine
 from sparsevllm.layers.rotary_embedding import get_rope
 from sparsevllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 from sparsevllm.models.attention_runtime import (
-    bind_mha_decode_attention_op,
-    bind_mha_prefill_attention_op,
-    build_mha_decode_attention_op,
+    bind_mha_full_attention_provider,
+    build_mha_full_attention_provider,
     build_mha_prefill_attention_op,
 )
-from sparsevllm.operators.decode_attention import PreparedDecodeAttentionOp
+from sparsevllm.operators.full_attention import FullAttentionProvider
 from sparsevllm.operators.prefill_attention import PreparedPrefillAttentionOp
 
 
@@ -367,13 +366,7 @@ class Qwen3ForCausalLM(nn.Module):
         **_,
     ) -> dict:
         return {
-            "prefill_attention_op": build_qwen3_prefill_attention_op(
-                config,
-                engine_config=engine_config,
-                parallel_context=parallel_context,
-                device=device,
-            ),
-            "decode_attention_op": build_mha_decode_attention_op(
+            "full_attention_provider": build_mha_full_attention_provider(
                 config,
                 sparse_method=engine_config.vllm_sparse_method,
                 attention_tp_size=parallel_context.attention_tp_size,
@@ -386,31 +379,33 @@ class Qwen3ForCausalLM(nn.Module):
     def __init__(
         self,
         config: Qwen3Config,
-        prefill_attention_op: PreparedPrefillAttentionOp | None = None,
-        decode_attention_op: PreparedDecodeAttentionOp | None = None,
+        full_attention_provider: FullAttentionProvider | None = None,
     ) -> None:
         super().__init__()
-        self.prefill_attention_op = prefill_attention_op
-        self.decode_attention_op = decode_attention_op
+        self.full_attention_provider = full_attention_provider
         self.model = Qwen3Model(config)
-        if prefill_attention_op is not None:
-            bind_mha_prefill_attention_op(self.model, prefill_attention_op)
-        if decode_attention_op is not None:
-            bind_mha_decode_attention_op(self.model, decode_attention_op)
+        if full_attention_provider is not None:
+            bind_mha_full_attention_provider(self.model, full_attention_provider)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if config.tie_word_embeddings:
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
         logger.info(
             "Loaded Qwen3 prefill_provider={} decode_provider={}",
-            "legacy_triton" if prefill_attention_op is None else prefill_attention_op.name,
-            "legacy_triton" if decode_attention_op is None else decode_attention_op.name,
+            (
+                "legacy_triton"
+                if full_attention_provider is None
+                else full_attention_provider.prefill_name
+            ),
+            (
+                "legacy_triton"
+                if full_attention_provider is None
+                else full_attention_provider.decode_name
+            ),
         )
 
     def close_runtime_operators(self) -> None:
-        if self.prefill_attention_op is not None:
-            self.prefill_attention_op.close()
-        if self.decode_attention_op is not None:
-            self.decode_attention_op.close()
+        if self.full_attention_provider is not None:
+            self.full_attention_provider.close()
 
     def forward(
         self,

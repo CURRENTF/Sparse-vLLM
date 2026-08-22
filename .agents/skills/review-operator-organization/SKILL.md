@@ -10,8 +10,10 @@ Review the complete selection path, not an isolated kernel:
 ```text
 model semantic call
   -> OpSpec
-  -> OpResolver(DeviceCaps)
-  -> selected OperatorProvider
+  -> atomic capability filter(DeviceCaps)
+  -> exact local profile overlay, when one matches
+  -> default kernel portfolio policy
+  -> selected atomic provider or prepared dispatch plan
   -> weight preparation / workspace
   -> local or external kernel
 ```
@@ -66,12 +68,30 @@ fallback path from model construction through execution.
   platform, architecture, dtype, quantization format, shape alignment,
   TP/EP topology, CUDA Graph behavior, workspace, toolchain, and external API
   availability.
+- Keep atomic eligibility about correctness and compatibility. Local benchmark
+  coverage, exact profiled devices or shapes, and performance confidence are
+  not atomic support conditions unless the kernel is actually incorrect or
+  unusable outside that domain.
+- Separate atomic providers, default portfolio policy, exact profile overlays,
+  and prepared dispatch plans. Flag a single free-form numeric priority that
+  mixes these decisions or a profile-backed plan registered as if it were an
+  atomic implementation.
+- Distinguish an unsupported semantic contract, an absent optional dependency,
+  and a broken or incompatible installed dependency. A normal candidate
+  rejection may select another provider during resolution; a broken legal
+  environment must remain an actionable startup failure rather than a silent
+  performance fallback.
 - Check optional dependencies lazily inside their provider. An unselected
   provider must not import or initialize a heavyweight dependency.
 - Resolve once before weight preparation and bind the provider outside the
   forward hot path.
-- Require deterministic priority among fully supported providers and useful
-  rejection reasons when none is usable.
+- Let one semantic provider own multi-phase lifecycles without forcing the
+  phases to share an atomic kernel. For full attention, keep prefill and decode
+  atomic registries independent, validate their shared cache contract, and bind
+  both through one prepared full-attention owner. Prefill-only kernels must not
+  implement a fake decode path.
+- Require a deterministic portfolio policy among fully supported atomic
+  providers and useful selection evidence and rejection reasons.
 - Allow fallback only during resolution or preparation: reject the unsupported
   provider and select another provider for that operator. Once execution has
   begun, do not catch a kernel failure and silently switch implementations.
@@ -80,10 +100,28 @@ fallback path from model construction through execution.
 
 ### Kernel Portfolio
 
-- Prefer a verified, broadly applicable Triton provider as the production
-  baseline.
-- Give specialized FlashInfer, CUTLASS, or architecture-specific providers
-  higher priority only under exact support conditions.
+- Treat standard operations as upstream-first. Prefer a mature upstream public
+  provider and its maintained dispatcher across the upstream-declared support
+  domain when it satisfies the Sparse-vLLM operator contract.
+- Keep repository-owned standard Triton or other local implementations as
+  portable production fallbacks, correctness baselines, or exact-profile
+  overrides. Do not make them the broad default merely because they perform
+  well on the limited hardware available to this repository.
+- Concentrate repository-owned production kernels on sparse or otherwise
+  non-standard semantics that upstream providers cannot express, such as
+  score production, custom cache layouts, state mutation, selection,
+  compaction, compression, or reconstruction.
+- Let matched local performance profiles override the upstream default only
+  for their exact recorded device, contract, shape, topology, graph mode, and
+  runtime bucket. A profile may add a dispatch route; it must not narrow an
+  atomic provider's correctness support domain.
+- Do not reject an upstream atomic provider only because every supported
+  device or shape was not benchmarked locally. Validate the adapter contract,
+  package/API compatibility, and the boundary conditions Sparse-vLLM adds,
+  then record upstream-declared support separately from local evidence.
+- Treat raw or internal upstream entry points as locally maintained adapter
+  contracts. Do not inherit broad upstream engine validation or dispatch
+  claims unless Sparse-vLLM actually uses the corresponding public interface.
 - Keep Torch or naive implementations as explicit correctness oracles, not
   automatic production candidates.
 - Do not introduce Hub-downloaded or frozen kernels as implicit runtime
@@ -125,19 +163,32 @@ Match validation to the changed selection surface:
 
 - Resolver tests: supported and rejected architectures, dtype/shape variants,
   dependency absent or too old, toolchain unavailable, graph mode, and TP/EP.
+- Portfolio tests: prove that an exact profile hit creates only its recorded
+  override, a profile miss returns to the upstream-first default, and sparse
+  semantic requirements select a compatible non-standard provider without
+  changing standard-operation policy.
 - Failure tests: aggregate actionable rejection reasons and prove fallback is
   local to the affected operator.
 - Kernel tests: compare against an independent Torch oracle over boundary
   lengths, non-contiguous layouts, state mutation, padding, real model shapes,
   and every claimed dtype.
-- Hardware tests: exercise each claimed architecture on an idle permitted
-  device. Do not generalize an SM90 result to other architectures.
+- Hardware tests for repository-owned kernels and local performance overrides:
+  exercise every claimed architecture and exact profile domain on an idle
+  permitted device. Do not generalize a local SM90 result to another
+  architecture or unmeasured shape.
+- External-provider tests: use upstream-declared device support for atomic
+  eligibility, validate the public API and Sparse-vLLM adapter on available
+  representative hardware, and label the evidence honestly. Lack of local
+  access to every upstream-supported device is not by itself a reason to
+  shrink that provider to a local hardware whitelist.
 - Integration tests: run the actual model path so provider binding, weight
   layout, prefill/decode routing, and generation are covered.
 - Quality checks: use the model chat template and deterministic decoding;
   non-empty output alone is not a quality assertion.
 - Reproducibility: record selected providers, capability summary, dependency
-  versions, model, command, device, and test result.
+  versions, selection basis (`upstream_default`, `profile_override`,
+  `semantic_fallback`, or dependency degradation), model, command, device,
+  and test result.
 
 Do not accept a performance result before correctness equivalence. Do not
 accept mocked provider-selection tests as proof that the minimum external
@@ -149,7 +200,9 @@ package version can execute the real call.
   layout that invalidates inference.
 - P1: a legal environment crashes, the resolver selects an unsupported
   provider, runtime silently changes providers, or model semantics depend on a
-  backend layout.
+  backend layout. Also use P1 when local profile evidence narrows a standard
+  upstream atomic support domain or a broadly preferred repository kernel has
+  no evidence appropriate to that scope.
 - P2: missing rejection coverage, incomplete observability, hot-path selection
   overhead, or unverified claimed hardware/shape support.
 - P3: naming or documentation clarity that does not change execution.

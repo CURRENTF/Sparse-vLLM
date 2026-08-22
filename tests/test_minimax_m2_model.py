@@ -192,11 +192,28 @@ def _instantiate_model(config, context, runtime_config=None):
 def test_model_construction_shares_explicit_runtime_operators_across_layers():
     config = _config(num_hidden_layers=2)
     prefill_op = SimpleNamespace(name="prefill", close=Mock())
-    decode_op = SimpleNamespace(name="decode")
+    decode_attention_op = SimpleNamespace(name="decode")
+    full_attention = SimpleNamespace(
+        prefill_op=prefill_op,
+        decode_op=decode_attention_op,
+        prefill_name=prefill_op.name,
+        decode_name=decode_attention_op.name,
+        close=Mock(),
+    )
+
+    def bind(model):
+        for layer in model.layers:
+            layer.self_attn.attn.full_attention_provider = full_attention
+            layer.self_attn.attn.prefill_op = prefill_op
+            layer.self_attn.attn.decode_op = decode_attention_op
+        return len(model.layers)
+
+    full_attention.bind = bind
+    decode_launch_op = SimpleNamespace(name="decode_launch")
     all_reduce_op = SimpleNamespace(name="all_reduce", run=Mock(), close=Mock())
     runtime_config = MiniMaxM2RuntimeConfig(
-        prefill_attention_op=prefill_op,
-        decode_launch_op=decode_op,
+        full_attention_provider=full_attention,
+        decode_launch_op=decode_launch_op,
         attention_decode_all_reduce=all_reduce_op,
         moe_decode_all_reduce=all_reduce_op,
         cuda_graph=True,
@@ -211,12 +228,13 @@ def test_model_construction_shares_explicit_runtime_operators_across_layers():
     assert not hasattr(config, "prefill_kv_view_layer_invariant")
     for layer in model.model.layers:
         assert layer.self_attn.attn.prefill_op is prefill_op
-        assert layer.self_attn.attn.decode_launch_op is decode_op
+        assert layer.self_attn.attn.decode_op is decode_attention_op
+        assert layer.self_attn.attn.decode_launch_op is decode_launch_op
         assert not layer.self_attn.o_proj.reduce_results
         assert layer.block_sparse_moe.experts.op_spec.cuda_graph
     model.close_runtime_operators()
     model.close_runtime_operators()
-    prefill_op.close.assert_called_once_with()
+    full_attention.close.assert_called_once_with()
     all_reduce_op.close.assert_called_once_with()
 
 

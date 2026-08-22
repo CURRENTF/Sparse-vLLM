@@ -52,14 +52,14 @@ def match_attention_capabilities(
         allowed = ", ".join(
             sorted(item.name for item in capabilities.platforms)
         )
-        return SupportResult.no(
+        return SupportResult.unsupported(
             f"requires platform in {{{allowed}}}, got {caps.platform.name}"
         )
     if (
         capabilities.compute_capabilities is not None
         and caps.compute_capability not in capabilities.compute_capabilities
     ):
-        return SupportResult.no(
+        return SupportResult.unsupported(
             "requires compute capability in "
             f"{sorted(capabilities.compute_capabilities)}, got {caps.compute_capability}"
         )
@@ -68,18 +68,18 @@ def match_attention_capabilities(
         capabilities.minimum_runtime_version,
     ):
         minimum = ".".join(map(str, capabilities.minimum_runtime_version))
-        return SupportResult.no(
+        return SupportResult.unsupported(
             f"requires runtime >= {minimum}, got {caps.runtime_version or 'unknown'}"
         )
     if request.activation_dtype not in capabilities.activation_dtypes:
-        return SupportResult.no(
+        return SupportResult.unsupported(
             f"unsupported activation dtype {request.activation_dtype}; "
             f"supported={sorted(map(str, capabilities.activation_dtypes))}"
         )
     if request.activation_dtype == torch.bfloat16 and not caps.supports_bfloat16:
-        return SupportResult.no("device does not support BF16")
+        return SupportResult.unsupported("device does not support BF16")
     if capabilities.head_dims is not None and request.head_dim not in capabilities.head_dims:
-        return SupportResult.no(
+        return SupportResult.unsupported(
             f"unsupported head_dim={request.head_dim}; "
             f"supported={sorted(capabilities.head_dims)}"
         )
@@ -88,7 +88,7 @@ def match_attention_capabilities(
         and capabilities.page_sizes is not None
         and request.page_size not in capabilities.page_sizes
     ):
-        return SupportResult.no(
+        return SupportResult.unsupported(
             f"unsupported page_size={request.page_size}; "
             f"supported={sorted(capabilities.page_sizes)}"
         )
@@ -96,17 +96,17 @@ def match_attention_capabilities(
         request.score_output is not None
         and request.score_output not in capabilities.score_outputs
     ):
-        return SupportResult.no(
+        return SupportResult.unsupported(
             f"does not produce attention score {request.score_output.name}"
         )
     if request.layer_varying_page_table and not capabilities.layer_varying_page_table:
-        return SupportResult.no("does not support layer-varying page tables")
+        return SupportResult.unsupported("does not support layer-varying page tables")
     if request.varlen and not capabilities.varlen:
-        return SupportResult.no("does not support variable-length batches")
+        return SupportResult.unsupported("does not support variable-length batches")
     if request.cuda_graph and not capabilities.cuda_graph:
-        return SupportResult.no("does not support CUDA Graph execution")
+        return SupportResult.unsupported("does not support CUDA Graph execution")
     if capabilities.requires_triton and not caps.supports_triton:
-        return SupportResult.no("platform does not support Triton")
+        return SupportResult.unsupported("platform does not support Triton")
     return SupportResult.yes()
 
 

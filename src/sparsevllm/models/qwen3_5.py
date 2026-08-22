@@ -16,18 +16,15 @@ from sparsevllm.layers.linear import (
     divide,
 )
 from sparsevllm.models.attention_runtime import (
-    bind_mha_decode_attention_op,
-    bind_mha_prefill_attention_op,
-    build_mha_decode_attention_op,
-    build_mha_prefill_attention_op,
+    bind_mha_full_attention_provider,
+    build_mha_full_attention_provider,
 )
 from sparsevllm.models.gdn_runtime import (
     bind_gated_delta_rule_op,
     build_gated_delta_rule_op,
 )
-from sparsevllm.operators.decode_attention import PreparedDecodeAttentionOp
+from sparsevllm.operators.full_attention import FullAttentionProvider
 from sparsevllm.operators.gated_delta_rule import PreparedGatedDeltaRuleOp
-from sparsevllm.operators.prefill_attention import PreparedPrefillAttentionOp
 from sparsevllm.operators.gate_up_swiglu import (
     GateUpSwiGLUOpSpec,
     resolve_gate_up_swiglu_provider,
@@ -1032,13 +1029,7 @@ class Qwen35ForCausalLM(nn.Module):
         **_,
     ) -> dict:
         return {
-            "prefill_attention_op": build_mha_prefill_attention_op(
-                config,
-                sparse_method=engine_config.vllm_sparse_method,
-                attention_tp_size=parallel_context.attention_tp_size,
-                device=device,
-            ),
-            "decode_attention_op": build_mha_decode_attention_op(
+            "full_attention_provider": build_mha_full_attention_provider(
                 config,
                 sparse_method=engine_config.vllm_sparse_method,
                 attention_tp_size=parallel_context.attention_tp_size,
@@ -1057,19 +1048,15 @@ class Qwen35ForCausalLM(nn.Module):
     def __init__(
         self,
         config,
-        prefill_attention_op: PreparedPrefillAttentionOp | None = None,
-        decode_attention_op: PreparedDecodeAttentionOp | None = None,
+        full_attention_provider: FullAttentionProvider | None = None,
         gated_delta_rule_op: PreparedGatedDeltaRuleOp | None = None,
     ) -> None:
         super().__init__()
-        self.prefill_attention_op = prefill_attention_op
-        self.decode_attention_op = decode_attention_op
+        self.full_attention_provider = full_attention_provider
         self.gated_delta_rule_op = gated_delta_rule_op
         self.model = Qwen35Model(config)
-        if prefill_attention_op is not None:
-            bind_mha_prefill_attention_op(self.model, prefill_attention_op)
-        if decode_attention_op is not None:
-            bind_mha_decode_attention_op(self.model, decode_attention_op)
+        if full_attention_provider is not None:
+            bind_mha_full_attention_provider(self.model, full_attention_provider)
         if gated_delta_rule_op is not None:
             bind_gated_delta_rule_op(self.model, gated_delta_rule_op)
         self.lm_head = ParallelLMHead(int(config.vocab_size), int(config.hidden_size))
@@ -1078,16 +1065,22 @@ class Qwen35ForCausalLM(nn.Module):
         self.multimodal_encoder = None
         logger.info(
             "Loaded Qwen3.5 prefill_provider={} decode_provider={} gdn_provider={}",
-            "legacy_triton" if prefill_attention_op is None else prefill_attention_op.name,
-            "legacy_triton" if decode_attention_op is None else decode_attention_op.name,
+            (
+                "legacy_triton"
+                if full_attention_provider is None
+                else full_attention_provider.prefill_name
+            ),
+            (
+                "legacy_triton"
+                if full_attention_provider is None
+                else full_attention_provider.decode_name
+            ),
             "unbound" if gated_delta_rule_op is None else gated_delta_rule_op.name,
         )
 
     def close_runtime_operators(self) -> None:
-        if self.prefill_attention_op is not None:
-            self.prefill_attention_op.close()
-        if self.decode_attention_op is not None:
-            self.decode_attention_op.close()
+        if self.full_attention_provider is not None:
+            self.full_attention_provider.close()
         if self.gated_delta_rule_op is not None:
             self.gated_delta_rule_op.close()
 

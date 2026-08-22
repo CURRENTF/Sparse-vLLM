@@ -270,12 +270,6 @@ def test_vanilla_mla_binds_atomic_sgl_instead_of_score_composite() -> None:
     [
         ({}, {"platform": PlatformEnum.CPU}, "requires platform"),
         ({}, {"compute_capability": (8, 0)}, "compute capability"),
-        ({}, {"device_name": "NVIDIA H100 PCIe"}, "validated"),
-        (
-            {"tp_size": 4},
-            {"device_name": "NVIDIA H20"},
-            "H20 MLA currently requires tensor parallel size 1 or 2",
-        ),
         ({}, {"supports_triton": False}, "does not support Triton"),
         ({}, {"supports_bfloat16": False}, "does not support BF16"),
         (
@@ -299,6 +293,49 @@ def test_mla_resolver_rejects_unvalidated_contracts(
             _spec(**spec_overrides),
             _h100_caps(**caps_overrides),
         )
+
+
+def test_repo_triton_mla_keeps_its_validated_h20_tp_boundary() -> None:
+    result = MlaTritonProvider.supports(
+        _spec(tp_size=4),
+        _h100_caps(device_name="NVIDIA H20"),
+    )
+
+    assert not result.supported
+    assert "H20 MLA currently requires tensor parallel size 1 or 2" in result.reason
+
+
+@pytest.mark.parametrize(
+    ("device_name", "tp_size"),
+    [("NVIDIA H100 PCIe", 2), ("NVIDIA H20", 4)],
+)
+def test_mla_upstream_provider_is_not_narrowed_to_repo_validated_domain(
+    device_name: str,
+    tp_size: int,
+) -> None:
+    spec = _spec(tp_size=tp_size)
+    workspace = _cpu_workspace(batch_size=8, head_count=spec.local_q_heads)
+    with (
+        patch(
+            "sparsevllm.operators.mla_attention.sgl_fa3_device_support",
+            return_value=(True, "upstream-declared device support"),
+        ),
+        patch(
+            "sparsevllm.operators.mla_attention.allocate_mla_decode_workspace",
+            return_value=workspace,
+        ),
+        patch("sparsevllm.operators.mla_attention.SglFa3DecodeKernel"),
+    ):
+        resolved = OpResolver(MLA_ATTENTION_REGISTRY).resolve(
+            spec,
+            _h100_caps(device_name=device_name),
+            op_spec=spec,
+            device="cpu",
+            max_batch_size=8,
+        )
+
+    assert type(resolved.provider) is MlaSglFa3Provider
+    assert resolved.report.selection_basis == "upstream_default"
 
 
 def test_mla_provider_rejects_explicit_kv_before_kernel() -> None:

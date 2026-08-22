@@ -79,7 +79,14 @@ and overlap opportunities, but treat them as hypotheses until measured.
 
 Prefer the smallest path that can express the required computation:
 
-- Keep or improve Triton for broadly applicable repository-owned kernels.
+- For unchanged standard semantics, first reuse a mature upstream public
+  provider and its maintained dispatcher. Do not create a repository-owned
+  replacement merely because the available local GPU favors one measured
+  shape.
+- Write or extend repository-owned kernels primarily for sparse or otherwise
+  non-standard semantics that upstream implementations cannot express.
+- Keep or improve Triton for portable repository fallbacks, correctness
+  baselines, and existing repository-owned semantic kernels.
 - Use TileLang when explicit tiling, pipelining, shared-memory layouts,
   tensor-core scheduling, TMA, or warp specialization materially helps.
 - Prefer JIT CUDA when custom CUDA is needed without CUTLASS or a large AOT
@@ -87,7 +94,10 @@ Prefer the smallest path that can express the required computation:
 - Use compiled SGL/CUTLASS/CuTe integration only when the required primitives,
   layouts, or performance cannot be reached cleanly with a JIT path.
 
-Do not replace a mature provider solely because another DSL looks promising.
+Do not replace a mature upstream provider solely because another DSL looks
+promising. Promote a faster local implementation for a standard operation
+through an exact, reproducible profile overlay rather than narrowing or
+reordering the broad atomic portfolio.
 
 ### 4. Establish Correctness
 
@@ -136,6 +146,11 @@ fallback policy under `src/sparsevllm/operators/`. Resolve and bind a provider
 before the forward hot path. Route unsupported configurations before launch;
 never catch a runtime kernel failure and silently switch providers.
 
+Keep atomic correctness eligibility separate from default upstream-first
+portfolio policy and exact local profile overlays. Follow
+[operator-integration.md](references/operator-integration.md) and treat
+`$review-operator-organization` as authoritative for production selection.
+
 ### 9. Return to End-to-End Measurement
 
 Repeat the original workload with the same model, request trace, concurrency,
@@ -149,12 +164,17 @@ Require all applicable gates before calling the work complete:
 
 1. Independent correctness equivalence passes.
 2. Provider selection and rejection paths are tested.
-3. Claimed devices, dtypes, shapes, and graph modes are exercised on hardware.
+3. Repository-owned kernel claims and local profile overrides exercise their
+   claimed devices, dtypes, shapes, and graph modes on hardware. External
+   atomic providers separately record upstream-declared support and the local
+   adapter coverage that was actually exercised.
 4. Microbenchmark raw samples and summary are saved.
 5. Nsight evidence exists for hardware-level bottleneck claims.
 6. Matched end-to-end validation supports serving-level claims.
 7. Commands, Git state, environment, selected provider, and artifacts are
    recorded.
 
-Mark any unrun gate explicitly. Preserve the best verified implementation and
-the baseline; do not leave an unverified candidate as the production default.
+Mark any unrun gate explicitly. Preserve the mature upstream default and the
+portable baseline. Do not promote a repository-owned standard candidate beyond
+its measured profile, but do not call an upstream-supported atomic contract
+unverified merely because Sparse-vLLM lacks every upstream-supported GPU.

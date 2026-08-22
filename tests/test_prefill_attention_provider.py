@@ -287,23 +287,27 @@ def test_flashinfer_provider_rejects_unsupported_contracts(spec, caps, reason):
             _sm120_caps(),
             "layer-varying",
         ),
-        (
-            _spec(
-                num_query_heads=24,
-                num_kv_heads=4,
-                head_dim=256,
-                softmax_scale=256**-0.5,
-            ),
-            _sm120_caps(device_name="NVIDIA GeForce RTX 5090"),
-            "profiled NVIDIA RTX PRO 6000",
-        ),
     ],
 )
-def test_flashinfer_fa2_sm120_rejects_unprofiled_contracts(spec, caps, reason):
+def test_flashinfer_fa2_sm120_rejects_unsupported_contracts(spec, caps, reason):
     result = FlashInferFa2Sm120PagedPrefillAttentionProvider.supports(spec, caps)
 
     assert not result.supported
     assert reason in result.reason
+
+
+def test_flashinfer_fa2_sm120_support_is_not_limited_by_local_device_profile():
+    result = FlashInferFa2Sm120PagedPrefillAttentionProvider.supports(
+        _spec(
+            num_query_heads=32,
+            num_kv_heads=8,
+            head_dim=256,
+            softmax_scale=256**-0.5,
+        ),
+        _sm120_caps(device_name="NVIDIA GeForce RTX 5090"),
+    )
+
+    assert result.supported
 
 
 @patch(
@@ -388,12 +392,12 @@ def test_resolver_prefers_tilelang_for_scored_prefill(_sgl, _tl):
     "sparsevllm.operators.prefill_attention.sgl_fa3_device_support",
     return_value=(False, "sglang-kernel is not installed"),
 )
-def test_resolver_prefers_tilelang_when_sgl_not_installed(_sgl, _tl):
+def test_resolver_prefers_upstream_flashinfer_when_sgl_not_installed(_sgl, _tl):
     resolved = OpResolver(PREFILL_ATTENTION_REGISTRY).resolve(
         _spec(num_query_heads=16, num_kv_heads=2),
         _h100_caps(),
     )
-    assert resolved.provider.name == "tilelang_gqa_paged_prefill_sm90"
+    assert resolved.provider.name == "flashinfer_paged_prefill_fa3_sm90"
 
 
 @patch(

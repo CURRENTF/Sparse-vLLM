@@ -131,7 +131,7 @@ def _hybrid_context(world_rank: int) -> ParallelContext:
     )
 
 
-def _instantiate_model(config, context, prefill_attention_op=None):
+def _instantiate_model(config, context, full_attention_provider=None):
     with ExitStack() as stack:
         stack.enter_context(
             patch(
@@ -174,7 +174,7 @@ def _instantiate_model(config, context, prefill_attention_op=None):
             )
         return Qwen3MoeForCausalLM(
             config,
-            prefill_attention_op=prefill_attention_op,
+            full_attention_provider=full_attention_provider,
         )
 
 
@@ -215,12 +215,29 @@ def test_qwen3_moe_builds_real_prefill_shape_spec(
     assert spec.score_output is AttentionScoreKind.NONE
 
 
-def test_qwen3_moe_shares_and_closes_prepared_prefill_operator():
-    prepared = SimpleNamespace(name="sgl_fa3", close=Mock())
+def test_qwen3_moe_shares_and_closes_full_attention_provider():
+    prepared = SimpleNamespace(name="sgl_fa3")
+    decode = SimpleNamespace(name="triton_decode")
+    full_attention = SimpleNamespace(
+        prefill_op=prepared,
+        decode_op=decode,
+        prefill_name=prepared.name,
+        decode_name=decode.name,
+        close=Mock(),
+    )
+
+    def bind(model):
+        for layer in model.layers:
+            layer.self_attn.attn.full_attention_provider = full_attention
+            layer.self_attn.attn.prefill_op = prepared
+            layer.self_attn.attn.decode_op = decode
+        return len(model.layers)
+
+    full_attention.bind = bind
     model = _instantiate_model(
         _config(num_hidden_layers=2),
         _tp_context(0, 1),
-        prefill_attention_op=prepared,
+        full_attention_provider=full_attention,
     )
 
     assert all(
@@ -228,7 +245,7 @@ def test_qwen3_moe_shares_and_closes_prepared_prefill_operator():
         for layer in model.model.layers
     )
     model.close_runtime_operators()
-    prepared.close.assert_called_once_with()
+    full_attention.close.assert_called_once_with()
 
 
 @pytest.mark.parametrize(

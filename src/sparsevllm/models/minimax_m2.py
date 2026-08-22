@@ -23,10 +23,8 @@ from sparsevllm.layers.rotary_embedding import (
 )
 from sparsevllm.models.qwen3 import Qwen3ModelBase
 from sparsevllm.models.attention_runtime import (
-    bind_mha_decode_attention_op,
-    bind_mha_prefill_attention_op,
-    build_mha_decode_attention_op,
-    build_mha_prefill_attention_op,
+    bind_mha_full_attention_provider,
+    build_mha_full_attention_provider,
 )
 from sparsevllm.operators.moe import model_activation_dtype, resolve_moe_provider
 from sparsevllm.operators.moe_router import (
@@ -39,11 +37,10 @@ from sparsevllm.operators.all_reduce import (
 )
 from sparsevllm.operators.decode_attention import (
     DecodeAttentionLaunchSpec,
-    PreparedDecodeAttentionOp,
     PreparedDecodeAttentionLaunchOp,
     prepare_decode_attention_launch_op,
 )
-from sparsevllm.operators.prefill_attention import PreparedPrefillAttentionOp
+from sparsevllm.operators.full_attention import FullAttentionProvider
 from sparsevllm.platforms import device_runtime
 from sparsevllm.utils.context import get_context
 from sparsevllm.utils.log import logger
@@ -62,8 +59,7 @@ _EXPERT_TARGET_RE = re.compile(
 
 @dataclass
 class MiniMaxM2RuntimeConfig:
-    prefill_attention_op: PreparedPrefillAttentionOp
-    decode_attention_op: PreparedDecodeAttentionOp
+    full_attention_provider: FullAttentionProvider
     decode_launch_op: PreparedDecodeAttentionLaunchOp
     attention_decode_all_reduce: PreparedAllReduceOp
     moe_decode_all_reduce: PreparedAllReduceOp
@@ -73,8 +69,7 @@ class MiniMaxM2RuntimeConfig:
     def close(self) -> None:
         if self._closed:
             return
-        self.prefill_attention_op.close()
-        self.decode_attention_op.close()
+        self.full_attention_provider.close()
         seen: set[int] = set()
         for op in (
             self.attention_decode_all_reduce,
@@ -108,13 +103,7 @@ def build_minimax_m2_runtime_config(
     num_kv_heads = int(config.num_key_value_heads) // tp_size
     head_dim = int(config.head_dim)
     activation_dtype = model_activation_dtype(config)
-    prefill_attention_op = build_mha_prefill_attention_op(
-        config,
-        sparse_method=sparse_method,
-        attention_tp_size=parallel_context.attention_tp_size,
-        device=device,
-    )
-    decode_attention_op = build_mha_decode_attention_op(
+    full_attention_provider = build_mha_full_attention_provider(
         config,
         sparse_method=sparse_method,
         attention_tp_size=parallel_context.attention_tp_size,
@@ -152,8 +141,7 @@ def build_minimax_m2_runtime_config(
             device_index=int(device.index or 0),
         )
     return MiniMaxM2RuntimeConfig(
-        prefill_attention_op=prefill_attention_op,
-        decode_attention_op=decode_attention_op,
+        full_attention_provider=full_attention_provider,
         decode_launch_op=decode_launch_op,
         attention_decode_all_reduce=attention_decode_all_reduce,
         moe_decode_all_reduce=moe_decode_all_reduce,
@@ -471,13 +459,9 @@ class MiniMaxM2ForCausalLM(nn.Module):
         self.runtime_config = runtime_config
         self.model = MiniMaxM2Model(config, runtime_config)
         if runtime_config is not None:
-            bind_mha_prefill_attention_op(
+            bind_mha_full_attention_provider(
                 self.model,
-                runtime_config.prefill_attention_op,
-            )
-            bind_mha_decode_attention_op(
-                self.model,
-                runtime_config.decode_attention_op,
+                runtime_config.full_attention_provider,
             )
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         self._intentionally_skipped_expert_weights: set[str] = set()
@@ -698,7 +682,7 @@ class MiniMaxM2ForCausalLM(nn.Module):
                 f"weights={unexpected_skips[:4]}, scales={unexpected_scale_skips[:4]}."
             )
         prefill_provider = (
-            self.runtime_config.prefill_attention_op.name
+            self.runtime_config.full_attention_provider.prefill_name
             if self.runtime_config is not None
             else "legacy_triton"
         )

@@ -8,6 +8,9 @@ import sparsevllm.platforms as platforms
 from sparsevllm.operators.registry import (
     OpRegistry,
     OpResolver,
+    PortfolioPolicy,
+    ProfileMatch,
+    ProviderRole,
     SupportResult,
     runtime_version_at_least,
 )
@@ -31,7 +34,6 @@ class Gemma4RouterOpSpec:
 
 class Gemma4RouterProvider:
     name = ""
-    priority = 0
 
     def topk(
         self,
@@ -43,23 +45,26 @@ class Gemma4RouterProvider:
 
 
 GEMMA4_ROUTER_REGISTRY: OpRegistry[Gemma4RouterOpSpec, Gemma4RouterProvider] = (
-    OpRegistry("Gemma 4 router")
+    OpRegistry(
+        "Gemma 4 router",
+        portfolio=PortfolioPolicy(repo_nonstandard=("triton",)),
+        profile_order=("gemma4_h20_profile",),
+    )
 )
 
 
-@GEMMA4_ROUTER_REGISTRY.register
+@GEMMA4_ROUTER_REGISTRY.register_atomic(ProviderRole.REPO_NONSTANDARD)
 class TritonGemma4RouterProvider(Gemma4RouterProvider):
     name = "triton"
-    priority = 10
 
     @classmethod
     def supports(cls, spec: Gemma4RouterOpSpec, caps: DeviceCaps) -> SupportResult:
         if caps.platform != PlatformEnum.CUDA or not caps.supports_triton:
-            return SupportResult.no("requires CUDA with Triton")
+            return SupportResult.unsupported("requires CUDA with Triton")
         if spec.cuda_graph and not caps.supports_graph_capture:
-            return SupportResult.no("device does not support CUDA Graph capture")
+            return SupportResult.unsupported("device does not support CUDA Graph capture")
         if spec.activation_dtype not in {torch.bfloat16, torch.float16}:
-            return SupportResult.no("requires BF16 or FP16 activations")
+            return SupportResult.unsupported("requires BF16 or FP16 activations")
         return SupportResult.yes()
 
     def topk(self, logits, per_expert_scale, top_k):
@@ -68,27 +73,28 @@ class TritonGemma4RouterProvider(Gemma4RouterProvider):
         return gemma4_router_topk(logits, per_expert_scale, top_k)
 
 
-@GEMMA4_ROUTER_REGISTRY.register
+@GEMMA4_ROUTER_REGISTRY.register_atomic(
+    ProviderRole.REPO_NONSTANDARD,
+    profile_only=True,
+)
 class H20Gemma4RouterProvider(TritonGemma4RouterProvider):
     name = "gemma4_h20"
-    priority = 100
 
     @classmethod
     def supports(cls, spec: Gemma4RouterOpSpec, caps: DeviceCaps) -> SupportResult:
         generic = super().supports(spec, caps)
         if not generic.supported:
             return generic
-        if caps.compute_capability != (9, 0) or caps.device_name != "NVIDIA H20":
-            return SupportResult.no(
-                "requires profiled NVIDIA H20 SM90 hardware, "
-                f"got {caps.device_name} {caps.compute_capability}"
+        if caps.compute_capability != (9, 0):
+            return SupportResult.unsupported(
+                f"requires CUDA SM90, got {caps.compute_capability}"
             )
         if not runtime_version_at_least(caps.runtime_version, (12, 8)):
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 f"requires CUDA runtime >= 12.8, got {caps.runtime_version or 'unknown'}"
             )
         if spec.num_experts > 1024:
-            return SupportResult.no("fused router requires at most 1024 experts")
+            return SupportResult.unsupported("fused router requires at most 1024 experts")
         return SupportResult.yes()
 
     def topk(self, logits, per_expert_scale, top_k):
@@ -97,6 +103,34 @@ class H20Gemma4RouterProvider(TritonGemma4RouterProvider):
         )
 
         return gemma4_fused_router_topk(logits, per_expert_scale, top_k)
+
+
+@GEMMA4_ROUTER_REGISTRY.register_profile
+class H20Gemma4RouterProfile:
+    name = "gemma4_h20_profile"
+
+    @classmethod
+    def atomic_provider_names(cls, spec: Gemma4RouterOpSpec) -> tuple[str, ...]:
+        del spec
+        return ("gemma4_h20",)
+
+    @classmethod
+    def matches(cls, spec: Gemma4RouterOpSpec, caps: DeviceCaps) -> ProfileMatch:
+        del spec
+        if caps.device_name != "NVIDIA H20":
+            return ProfileMatch.no(
+                f"requires profiled NVIDIA H20 hardware, got {caps.device_name}"
+            )
+        return ProfileMatch.yes("matched H20 Gemma 4 router profile")
+
+    @classmethod
+    def bind(cls, spec: Gemma4RouterOpSpec, caps: DeviceCaps, **kwargs):
+        del spec, caps
+        if kwargs:
+            raise TypeError(
+                f"{cls.name} does not accept provider arguments: {sorted(kwargs)}"
+            )
+        return H20Gemma4RouterProvider()
 
 
 class TorchGemma4RouterProvider(Gemma4RouterProvider):

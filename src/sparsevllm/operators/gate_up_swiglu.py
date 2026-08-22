@@ -6,7 +6,14 @@ import torch.nn.functional as F
 
 import sparsevllm.platforms as platforms
 from sparsevllm.platforms import device_runtime
-from sparsevllm.operators.registry import OpRegistry, OpResolver, SupportResult
+from sparsevllm.operators.registry import (
+    OpRegistry,
+    OpResolver,
+    PortfolioPolicy,
+    ProfileMatch,
+    ProviderRole,
+    SupportResult,
+)
 from sparsevllm.platforms.interface import DeviceCaps, PlatformEnum
 
 
@@ -37,7 +44,6 @@ class GateUpSwiGLUOpSpec:
 
 class GateUpSwiGLUProvider:
     name = ""
-    priority = 0
 
     def binding_metadata(self) -> dict[str, object]:
         return {"implementation_kind": "atomic_provider"}
@@ -53,13 +59,16 @@ class GateUpSwiGLUProvider:
 
 GATE_UP_SWIGLU_REGISTRY: OpRegistry[
     GateUpSwiGLUOpSpec, GateUpSwiGLUProvider
-] = OpRegistry("gate/up SwiGLU")
+] = OpRegistry(
+    "gate/up SwiGLU",
+    portfolio=PortfolioPolicy(repo_portable=("native",)),
+    profile_order=("h20_gate_up_dispatch_plan",),
+)
 
 
-@GATE_UP_SWIGLU_REGISTRY.register
+@GATE_UP_SWIGLU_REGISTRY.register_atomic(ProviderRole.REPO_PORTABLE)
 class NativeGateUpSwiGLUProvider(GateUpSwiGLUProvider):
     name = "native"
-    priority = 0
 
     @classmethod
     def supports(
@@ -81,8 +90,44 @@ class NativeGateUpSwiGLUProvider(GateUpSwiGLUProvider):
         return F.silu(gate, inplace=True).mul_(up)
 
 
+@GATE_UP_SWIGLU_REGISTRY.register_atomic(
+    ProviderRole.REPO_PORTABLE,
+    profile_only=True,
+)
 class H20DecodeGateUpSwiGLUProvider(GateUpSwiGLUProvider):
     name = "h20_triton_decode"
+
+    @classmethod
+    def supports(
+        cls,
+        spec: GateUpSwiGLUOpSpec,
+        caps: DeviceCaps,
+    ) -> SupportResult:
+        if caps.platform != PlatformEnum.CUDA or caps.compute_capability != (9, 0):
+            return SupportResult.unsupported(
+                f"requires CUDA SM90, got {caps.platform.name} "
+                f"{caps.compute_capability}"
+            )
+        if not caps.supports_triton:
+            return SupportResult.unsupported("platform does not support Triton")
+        if spec.cuda_graph and not caps.supports_graph_capture:
+            return SupportResult.unsupported(
+                "device does not support CUDA Graph capture"
+            )
+        if spec.activation_dtype != torch.bfloat16 or spec.weight_dtype != torch.bfloat16:
+            return SupportResult.unsupported(
+                "requires BF16 activations and weights, got "
+                f"{spec.activation_dtype} and {spec.weight_dtype}"
+            )
+        if (spec.hidden_size, spec.intermediate_size, spec.tp_size) not in {
+            (2048, 512, 1),
+            (2048, 512, 2),
+        }:
+            return SupportResult.unsupported(
+                "kernel contract requires (hidden, intermediate, TP) in "
+                "{(2048, 512, 1), (2048, 512, 2)}"
+            )
+        return SupportResult.yes()
 
     def binding_metadata(self) -> dict[str, object]:
         return {
@@ -121,46 +166,37 @@ class GateUpSwiGLUDispatchRoute:
         )
 
 
-@GATE_UP_SWIGLU_REGISTRY.register
+@GATE_UP_SWIGLU_REGISTRY.register_profile
 class H20GateUpSwiGLUDispatchPlan(GateUpSwiGLUProvider):
     name = "h20_gate_up_dispatch_plan"
-    priority = 20
 
     @classmethod
-    def supports(
+    def atomic_provider_names(
+        cls,
+        spec: GateUpSwiGLUOpSpec,
+    ) -> tuple[str, ...]:
+        del spec
+        return ("h20_triton_decode", "native")
+
+    @classmethod
+    def matches(
         cls,
         spec: GateUpSwiGLUOpSpec,
         caps: DeviceCaps,
-    ) -> SupportResult:
-        if caps.platform != PlatformEnum.CUDA or caps.compute_capability != (9, 0):
-            return SupportResult.no(
-                f"requires CUDA SM90, got {caps.platform.name} "
-                f"{caps.compute_capability}"
-            )
+    ) -> ProfileMatch:
         if caps.device_name != "NVIDIA H20":
-            return SupportResult.no(
+            return ProfileMatch.no(
                 f"requires profiled NVIDIA H20 hardware, got {caps.device_name}"
-            )
-        if not caps.supports_triton:
-            return SupportResult.no("platform does not support Triton")
-        if not caps.supports_bfloat16:
-            return SupportResult.no("device does not support BF16")
-        if spec.cuda_graph and not caps.supports_graph_capture:
-            return SupportResult.no("device does not support CUDA Graph capture")
-        if spec.activation_dtype != torch.bfloat16 or spec.weight_dtype != torch.bfloat16:
-            return SupportResult.no(
-                "requires BF16 activations and weights, got "
-                f"{spec.activation_dtype} and {spec.weight_dtype}"
             )
         if (spec.hidden_size, spec.intermediate_size, spec.tp_size) not in {
             (2048, 512, 1),
             (2048, 512, 2),
         }:
-            return SupportResult.no(
+            return ProfileMatch.no(
                 "requires profiled (hidden, intermediate, TP) shape in "
                 "{(2048, 512, 1), (2048, 512, 2)}"
             )
-        return SupportResult.yes()
+        return ProfileMatch.yes("matched H20 gate/up token-range profile")
 
     @classmethod
     def bind(

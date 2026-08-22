@@ -34,6 +34,7 @@ class Attention(nn.Module):
         self.scale = scale
         self.num_kv_heads = num_kv_heads
         self.attention_backend = TritonAttentionBackend()
+        self.full_attention_provider = None
         self.prefill_op = prefill_op
         self.decode_op = decode_op
         self.decode_launch_op = decode_launch_op

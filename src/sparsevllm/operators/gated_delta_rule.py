@@ -17,6 +17,8 @@ from sparsevllm.kernels.triton.qwen3_5.fla.ops.l2norm import l2norm_fwd
 from sparsevllm.operators.registry import (
     OpRegistry,
     OpResolver,
+    PortfolioPolicy,
+    ProviderRole,
     SupportResult,
     runtime_version_at_least,
 )
@@ -51,7 +53,6 @@ class GatedDeltaRuleOpSpec:
 
 class GatedDeltaRuleProvider:
     name = ""
-    priority = 0
 
     def prepare(
         self,
@@ -179,15 +180,22 @@ class GatedDeltaRuleProvider:
 
 GATED_DELTA_RULE_REGISTRY: OpRegistry[
     GatedDeltaRuleOpSpec, GatedDeltaRuleProvider
-] = OpRegistry("gated delta rule")
+] = OpRegistry(
+    "gated delta rule",
+    portfolio=PortfolioPolicy(
+        upstream_standard=(
+            "flashinfer_sm90_gdn_prefill_triton_decode",
+        ),
+        repo_nonstandard=("triton_gated_delta_rule",),
+    ),
+)
 
 
-@GATED_DELTA_RULE_REGISTRY.register
+@GATED_DELTA_RULE_REGISTRY.register_atomic(ProviderRole.UPSTREAM_STANDARD)
 class FlashInferSm90GatedDeltaRuleProvider(GatedDeltaRuleProvider):
     """Fixed FlashInfer-prefill/repo-decode GDN implementation plan."""
 
     name = "flashinfer_sm90_gdn_prefill_triton_decode"
-    priority = 200
 
     @classmethod
     def supports(
@@ -196,36 +204,36 @@ class FlashInferSm90GatedDeltaRuleProvider(GatedDeltaRuleProvider):
         caps: DeviceCaps,
     ) -> SupportResult:
         if caps.platform != PlatformEnum.CUDA or caps.compute_capability != (9, 0):
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 f"requires CUDA SM90, got {caps.platform.name} {caps.compute_capability}"
             )
         if not caps.supports_triton:
-            return SupportResult.no("decode implementation requires Triton")
+            return SupportResult.unsupported("decode implementation requires Triton")
         if not runtime_version_at_least(caps.runtime_version, (12, 8)):
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 "requires CUDA runtime >= 12.8, "
                 f"got {caps.runtime_version or 'unknown'}"
             )
         if spec.activation_dtype != torch.bfloat16:
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 f"requires the validated BF16 activation contract, got {spec.activation_dtype}"
             )
         if spec.recurrent_state_dtype not in (torch.bfloat16, torch.float32):
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 "requires BF16/FP32 recurrent state, got "
                 f"{spec.recurrent_state_dtype}"
             )
         if spec.key_head_dim != spec.value_head_dim:
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 "FlashInfer GDN requires equal key/value head dimensions, got "
                 f"{spec.key_head_dim}/{spec.value_head_dim}"
             )
         if not spec.varlen_prefill:
-            return SupportResult.no("requires varlen prefill")
+            return SupportResult.unsupported("requires varlen prefill")
         if spec.cuda_graph_decode and not caps.supports_graph_capture:
-            return SupportResult.no("device does not support CUDA Graph capture")
+            return SupportResult.unsupported("device does not support CUDA Graph capture")
         supported, reason = flashinfer_sm90_gdn_prefill_support()
-        return SupportResult.yes(reason) if supported else SupportResult.no(reason)
+        return SupportResult.yes(reason) if supported else SupportResult.unsupported(reason)
 
     def binding_metadata(self) -> dict[str, object]:
         return {
@@ -283,10 +291,9 @@ class FlashInferSm90GatedDeltaRuleProvider(GatedDeltaRuleProvider):
         return output.unsqueeze(0), repo_final_state
 
 
-@GATED_DELTA_RULE_REGISTRY.register
+@GATED_DELTA_RULE_REGISTRY.register_atomic(ProviderRole.REPO_NONSTANDARD)
 class TritonGatedDeltaRuleProvider(GatedDeltaRuleProvider):
     name = "triton_gated_delta_rule"
-    priority = 10
 
     @classmethod
     def supports(
@@ -295,20 +302,20 @@ class TritonGatedDeltaRuleProvider(GatedDeltaRuleProvider):
         caps: DeviceCaps,
     ) -> SupportResult:
         if caps.platform != PlatformEnum.CUDA:
-            return SupportResult.no(f"requires CUDA, got {caps.platform.name}")
+            return SupportResult.unsupported(f"requires CUDA, got {caps.platform.name}")
         if not caps.supports_triton:
-            return SupportResult.no("platform does not support Triton")
+            return SupportResult.unsupported("platform does not support Triton")
         if spec.activation_dtype not in (torch.bfloat16, torch.float16):
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 f"requires BF16/FP16 activations, got {spec.activation_dtype}"
             )
         if spec.recurrent_state_dtype not in (torch.bfloat16, torch.float32):
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 "requires BF16/FP32 recurrent state, got "
                 f"{spec.recurrent_state_dtype}"
             )
         if spec.cuda_graph_decode and not caps.supports_graph_capture:
-            return SupportResult.no("device does not support CUDA Graph capture")
+            return SupportResult.unsupported("device does not support CUDA Graph capture")
         return SupportResult.yes("generic repo Triton GDN implementation")
 
     def binding_metadata(self) -> dict[str, object]:

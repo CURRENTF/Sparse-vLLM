@@ -39,7 +39,12 @@ Prioritize:
 - inference correctness and tensor/cache invariants
 - Sparse-vLLM architecture boundaries
 - platform abstraction boundaries
-- operator/provider selection and kernel ownership
+- operator/provider selection and kernel ownership, including upstream-first
+  standard operations and repository ownership of non-standard sparse semantics
+- multi-phase operator ownership: independently selected prefill/decode kernels
+  must share one validated full-attention binding and lifecycle
+- separation of atomic correctness eligibility, default portfolio policy,
+  exact profile overlays, and prepared dispatch plans
 - prefill policy, long/short split, and `long_bs1full_short_batch`
 - OpenAI-compatible request lifecycle, streaming, cancellation, and sampling contracts
 - research reproducibility and fail-fast behavior
@@ -76,5 +81,9 @@ End with:
 
 - Do not approve without reading relevant code and tests.
 - Do not comment broadly on files outside the diff unless needed to explain the changed behavior.
+- Flag local benchmark, exact profiled device, or profiled shape conditions in
+  an upstream atomic provider's support predicate unless they are required for
+  correctness. Flag free-form priority changes that mix atomic eligibility,
+  upstream default policy, and exact performance routing.
 - Do not treat benchmark results as trustworthy if method, policy, config, command, checkpoint, sample status, or outputs are missing.
 - If no issues are found, say so clearly and mention residual test or benchmark risk.

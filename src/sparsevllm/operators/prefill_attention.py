@@ -24,6 +24,9 @@ from sparsevllm.operators.attention_capabilities import (
 from sparsevllm.operators.registry import (
     OpRegistry,
     OpResolver,
+    PortfolioPolicy,
+    ProfileMatch,
+    ProviderRole,
     SupportResult,
 )
 from sparsevllm.platforms.interface import DeviceCaps, PlatformEnum
@@ -69,7 +72,6 @@ class PrefillAttentionOpSpec:
 
 class PrefillAttentionProvider:
     name = ""
-    priority = 0
     capabilities: AttentionKernelCapabilities
 
     def prepare(
@@ -112,7 +114,18 @@ def _validate_token_page_table(view: Any) -> None:
 
 PREFILL_ATTENTION_REGISTRY: OpRegistry[
     PrefillAttentionOpSpec, PrefillAttentionProvider
-] = OpRegistry("paged prefill attention")
+] = OpRegistry(
+    "paged prefill attention",
+    portfolio=PortfolioPolicy(
+        upstream_standard=(
+            "sgl_fa3_paged_prefill_sm90",
+            "flashinfer_paged_prefill_fa3_sm90",
+            "flashinfer_paged_prefill_fa2_sm120",
+        ),
+        repo_portable=("triton_paged_prefill",),
+    ),
+    profile_order=("h100_tilelang_scored_prefill_profile",),
+)
 
 
 def _view_parts(view: Any) -> tuple[Any, Any]:
@@ -136,10 +149,9 @@ def _view_score_kind(view: Any) -> AttentionScoreKind:
     )
 
 
-@PREFILL_ATTENTION_REGISTRY.register
+@PREFILL_ATTENTION_REGISTRY.register_atomic(ProviderRole.UPSTREAM_STANDARD)
 class FlashInferPagedPrefillAttentionProvider(PrefillAttentionProvider):
     name = "flashinfer_paged_prefill_fa3_sm90"
-    priority = 180
     backend = "fa3"
     capabilities = AttentionKernelCapabilities(
         platforms=frozenset({PlatformEnum.CUDA}),
@@ -162,25 +174,10 @@ class FlashInferPagedPrefillAttentionProvider(PrefillAttentionProvider):
         )
         if not common.supported:
             return common
-        if caps.device_name != "NVIDIA H100 80GB HBM3":
-            return SupportResult.no(
-                "requires profiled NVIDIA H100 80GB HBM3 hardware, "
-                f"got {caps.device_name}"
-            )
-        expected_shape = (12, 2, 128)
-        actual_shape = (
-            spec.num_query_heads,
-            spec.num_kv_heads,
-            spec.head_dim,
-        )
-        if actual_shape != expected_shape:
-            return SupportResult.no(
-                f"requires profiled local Q/KV/head shape {expected_shape}, got {actual_shape}"
-            )
         if not spec.causal:
-            return SupportResult.no("requires causal attention")
+            return SupportResult.unsupported("requires causal attention")
         supported, reason = flashinfer_paged_prefill_support(cls.backend)
-        return SupportResult.yes(reason) if supported else SupportResult.no(reason)
+        return SupportResult.yes(reason) if supported else SupportResult.unsupported(reason)
 
     def __init__(self) -> None:
         self._state: _FlashInferPagedPrefillState | None = None
@@ -346,14 +343,13 @@ class _FlashInferPagedPrefillState:
         self.plan_scope = plan_scope
 
 
-@PREFILL_ATTENTION_REGISTRY.register
+@PREFILL_ATTENTION_REGISTRY.register_atomic(ProviderRole.UPSTREAM_STANDARD)
 class FlashInferFa2Sm120PagedPrefillAttentionProvider(
     FlashInferPagedPrefillAttentionProvider
 ):
-    """FlashInfer FA2 for the profiled Qwen3.6 SM120 prefill contract."""
+    """FlashInfer FA2 over its declared SM120 paged-prefill contract."""
 
     name = "flashinfer_paged_prefill_fa2_sm120"
-    priority = 190
     backend = "fa2"
     capabilities = AttentionKernelCapabilities(
         platforms=frozenset({PlatformEnum.CUDA}),
@@ -376,33 +372,17 @@ class FlashInferFa2Sm120PagedPrefillAttentionProvider(
         )
         if not common.supported:
             return common
-        if caps.device_name != "NVIDIA RTX PRO 6000 Blackwell Server Edition":
-            return SupportResult.no(
-                "requires profiled NVIDIA RTX PRO 6000 SM120 hardware, "
-                f"got {caps.device_name}"
-            )
-        expected_shape = (24, 4, 256)
-        actual_shape = (
-            spec.num_query_heads,
-            spec.num_kv_heads,
-            spec.head_dim,
-        )
-        if actual_shape != expected_shape:
-            return SupportResult.no(
-                f"requires profiled local Q/KV/head shape {expected_shape}, got {actual_shape}"
-            )
         if not spec.causal:
-            return SupportResult.no("requires causal attention")
+            return SupportResult.unsupported("requires causal attention")
         supported, reason = flashinfer_paged_prefill_support(cls.backend)
-        return SupportResult.yes(reason) if supported else SupportResult.no(reason)
+        return SupportResult.yes(reason) if supported else SupportResult.unsupported(reason)
 
 
-@PREFILL_ATTENTION_REGISTRY.register
+@PREFILL_ATTENTION_REGISTRY.register_atomic(ProviderRole.UPSTREAM_STANDARD)
 class SglFa3PagedPrefillAttentionProvider(PrefillAttentionProvider):
     """SGL FA3 over Sparse-vLLM's page-size-one physical KV table."""
 
     name = "sgl_fa3_paged_prefill_sm90"
-    priority = 200
     capabilities = AttentionKernelCapabilities(
         platforms=frozenset({PlatformEnum.CUDA}),
         compute_capabilities=frozenset({(9, 0)}),
@@ -425,9 +405,9 @@ class SglFa3PagedPrefillAttentionProvider(PrefillAttentionProvider):
         if not common.supported:
             return common
         if not spec.causal:
-            return SupportResult.no("requires causal attention")
+            return SupportResult.unsupported("requires causal attention")
         supported, reason = sgl_fa3_device_support(caps.device_index)
-        return SupportResult.yes(reason) if supported else SupportResult.no(reason)
+        return SupportResult.yes(reason) if supported else SupportResult.unsupported(reason)
 
     def __init__(self) -> None:
         self._kernel: SglFa3DecodeKernel | None = None
@@ -514,12 +494,14 @@ class SglFa3PagedPrefillAttentionProvider(PrefillAttentionProvider):
         )
 
 
-@PREFILL_ATTENTION_REGISTRY.register
+@PREFILL_ATTENTION_REGISTRY.register_atomic(
+    ProviderRole.REPO_NONSTANDARD,
+    profile_only=True,
+)
 class TilelangGqaPagedPrefillAttentionProvider(PrefillAttentionProvider):
     """TileLang GQA paged prefill with optional fused score extraction on SM90."""
 
     name = "tilelang_gqa_paged_prefill_sm90"
-    priority = 150
     capabilities = AttentionKernelCapabilities(
         platforms=frozenset({PlatformEnum.CUDA}),
         compute_capabilities=frozenset({(9, 0)}),
@@ -553,13 +535,13 @@ class TilelangGqaPagedPrefillAttentionProvider(PrefillAttentionProvider):
         if not common.supported:
             return common
         if not spec.causal:
-            return SupportResult.no("requires causal attention")
+            return SupportResult.unsupported("requires causal attention")
         from sparsevllm.kernels.tilelang.gqa.runtime import (
             tilelang_gqa_device_support,
         )
 
         supported, reason = tilelang_gqa_device_support(caps.device_index)
-        return SupportResult.yes(reason) if supported else SupportResult.no(reason)
+        return SupportResult.yes(reason) if supported else SupportResult.unsupported(reason)
 
     def run(
         self,
@@ -614,10 +596,43 @@ class TilelangGqaPagedPrefillAttentionProvider(PrefillAttentionProvider):
         )
 
 
-@PREFILL_ATTENTION_REGISTRY.register
+@PREFILL_ATTENTION_REGISTRY.register_profile
+class H100TilelangScoredPrefillProfile:
+    name = "h100_tilelang_scored_prefill_profile"
+
+    @classmethod
+    def atomic_provider_names(
+        cls,
+        spec: PrefillAttentionOpSpec,
+    ) -> tuple[str, ...]:
+        del spec
+        return ("tilelang_gqa_paged_prefill_sm90",)
+
+    @classmethod
+    def matches(
+        cls,
+        spec: PrefillAttentionOpSpec,
+        caps: DeviceCaps,
+    ) -> ProfileMatch:
+        if caps.device_name != "NVIDIA H100 80GB HBM3":
+            return ProfileMatch.no("requires profiled NVIDIA H100 80GB HBM3")
+        if spec.score_output is not AttentionScoreKind.RAW_QK_REDUCED:
+            return ProfileMatch.no("requires reduced scored-prefill semantics")
+        return ProfileMatch.yes("matched H100 TileLang scored-prefill profile")
+
+    @classmethod
+    def bind(cls, spec: PrefillAttentionOpSpec, caps: DeviceCaps, **kwargs):
+        del spec, caps
+        if kwargs:
+            raise TypeError(
+                f"{cls.name} does not accept provider arguments: {sorted(kwargs)}"
+            )
+        return TilelangGqaPagedPrefillAttentionProvider()
+
+
+@PREFILL_ATTENTION_REGISTRY.register_atomic(ProviderRole.REPO_PORTABLE)
 class TritonPagedPrefillAttentionProvider(PrefillAttentionProvider):
     name = "triton_paged_prefill"
-    priority = 10
     capabilities = AttentionKernelCapabilities(
         platforms=frozenset({PlatformEnum.CUDA, PlatformEnum.ROCM}),
         activation_dtypes=frozenset({torch.bfloat16, torch.float16}),
@@ -629,6 +644,14 @@ class TritonPagedPrefillAttentionProvider(PrefillAttentionProvider):
         requires_triton=True,
     )
 
+    def __init__(self) -> None:
+        self._query_plan_scope: object | None = None
+        self._max_query_len = 0
+
+    def close(self) -> None:
+        self._query_plan_scope = None
+        self._max_query_len = 0
+
     @classmethod
     def supports(
         cls, spec: PrefillAttentionOpSpec, caps: DeviceCaps
@@ -639,7 +662,7 @@ class TritonPagedPrefillAttentionProvider(PrefillAttentionProvider):
         if not common.supported:
             return common
         if not spec.causal:
-            return SupportResult.no("Triton prefill requires causal attention")
+            return SupportResult.unsupported("Triton prefill requires causal attention")
         expected_scale = spec.head_dim**-0.5
         if not math.isclose(
             spec.softmax_scale,
@@ -647,7 +670,7 @@ class TritonPagedPrefillAttentionProvider(PrefillAttentionProvider):
             rel_tol=1.0e-6,
             abs_tol=0.0,
         ):
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 "Triton prefill requires the default head-dimension scale "
                 f"{expected_scale}, got {spec.softmax_scale}"
             )
@@ -664,13 +687,19 @@ class TritonPagedPrefillAttentionProvider(PrefillAttentionProvider):
         max_context_len,
         layer_idx,
     ):
-        del spec, layer_idx
+        del spec, max_context_len, layer_idx
         payload, meta = _view_parts(view)
         _validate_token_page_table(meta)
         from sparsevllm.kernels.triton.context_flashattention_nopad import (
             context_attention_fwd,
         )
 
+        from sparsevllm.utils.context import get_context
+
+        validation_scope = get_context().attention_validation_scope
+        if self._query_plan_scope is not validation_scope:
+            self._max_query_len = int(chunk_lens.max().item())
+            self._query_plan_scope = validation_scope
         output = torch.empty_like(q)
         context_attention_fwd(
             q,
@@ -681,7 +710,7 @@ class TritonPagedPrefillAttentionProvider(PrefillAttentionProvider):
             qo_indptr[:-1],
             meta.context_lens,
             meta.context_lens - chunk_lens,
-            max_context_len,
+            self._max_query_len,
             meta.active_slots,
             attn_score=meta.attn_score,
         )

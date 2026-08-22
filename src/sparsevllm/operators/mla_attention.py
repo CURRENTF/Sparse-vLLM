@@ -32,6 +32,9 @@ from sparsevllm.kernels.triton.mla import (
 from sparsevllm.operators.registry import (
     OpRegistry,
     OpResolver,
+    PortfolioPolicy,
+    ProfileMatch,
+    ProviderRole,
     SupportResult,
 )
 from sparsevllm.operators.attention_capabilities import (
@@ -111,7 +114,6 @@ class MlaAttentionOpSpec:
 
 class MlaAttentionProvider:
     name = ""
-    priority = 0
     capabilities: AttentionKernelCapabilities
     supports_explicit_prefill = False
 
@@ -131,15 +133,21 @@ class MlaAttentionProvider:
 MLA_ATTENTION_REGISTRY: OpRegistry[
     MlaAttentionOpSpec,
     MlaAttentionProvider,
-] = OpRegistry("MLA attention")
+] = OpRegistry(
+    "MLA attention",
+    portfolio=PortfolioPolicy(
+        upstream_standard=("sgl_fa3_sm90",),
+        repo_nonstandard=("triton_sm90",),
+    ),
+    profile_order=("tilelang_score_sgl_fa3_h100_profile",),
+)
 
 
-@MLA_ATTENTION_REGISTRY.register
+@MLA_ATTENTION_REGISTRY.register_atomic(ProviderRole.REPO_NONSTANDARD)
 class MlaTritonProvider(MlaAttentionProvider):
     """Validated SM90 provider with caller-independent decode workspace."""
 
     name = "triton_sm90"
-    priority = 100
     capabilities = AttentionKernelCapabilities(
         platforms=frozenset({PlatformEnum.CUDA}),
         compute_capabilities=frozenset({(9, 0)}),
@@ -237,7 +245,7 @@ class MlaTritonProvider(MlaAttentionProvider):
         }
 
     @classmethod
-    def supports(
+    def _contract_support(
         cls,
         spec: MlaAttentionOpSpec,
         caps: DeviceCaps,
@@ -247,17 +255,12 @@ class MlaTritonProvider(MlaAttentionProvider):
         )
         if not common.supported:
             return common
-        if caps.device_name not in _VALIDATED_SM90_NAMES:
-            return SupportResult.no(
-                "requires validated H100 80GB HBM3 or H20 hardware, got "
-                f"{caps.device_name}"
-            )
         if spec.cuda_graph and not caps.supports_graph_capture:
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 "decode CUDA Graph requires platform graph capture support"
             )
         if spec.cache_dtype != torch.bfloat16:
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 f"requires BF16 cache storage, got {spec.cache_dtype}"
             )
         expected_shape = (
@@ -275,15 +278,31 @@ class MlaTritonProvider(MlaAttentionProvider):
             spec.value_head_dim,
         )
         if actual_shape != expected_shape:
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 f"requires GLM MLA shape {expected_shape}, got {actual_shape}"
             )
         if spec.tp_size not in {1, 2, 4}:
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 f"requires tensor parallel size 1, 2, or 4, got {spec.tp_size}"
             )
+        return SupportResult.yes()
+
+    @classmethod
+    def supports(
+        cls,
+        spec: MlaAttentionOpSpec,
+        caps: DeviceCaps,
+    ) -> SupportResult:
+        common = cls._contract_support(spec, caps)
+        if not common.supported:
+            return common
+        if caps.device_name not in _VALIDATED_SM90_NAMES:
+            return SupportResult.unsupported(
+                "requires validated H100 80GB HBM3 or H20 hardware, got "
+                f"{caps.device_name}"
+            )
         if caps.device_name == _VALIDATED_H20_NAME and spec.tp_size not in {1, 2}:
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 f"H20 MLA currently requires tensor parallel size 1 or 2, got {spec.tp_size}"
             )
         return SupportResult.yes()
@@ -483,12 +502,11 @@ class MlaTritonProvider(MlaAttentionProvider):
         )
 
 
-@MLA_ATTENTION_REGISTRY.register
+@MLA_ATTENTION_REGISTRY.register_atomic(ProviderRole.UPSTREAM_STANDARD)
 class MlaSglFa3Provider(MlaTritonProvider):
     """SGL FA3 decode with the score-producing Triton path kept explicit."""
 
     name = "sgl_fa3_sm90"
-    priority = 200
     supports_explicit_prefill = True
 
     def __init__(
@@ -517,15 +535,15 @@ class MlaSglFa3Provider(MlaTritonProvider):
         spec: MlaAttentionOpSpec,
         caps: DeviceCaps,
     ) -> SupportResult:
-        base = MlaTritonProvider.supports(spec, caps)
+        base = cls._contract_support(spec, caps)
         if not base.supported:
             return base
         if spec.may_require_attention_scores:
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 "does not satisfy the prepared score-output contract"
             )
         supported, reason = sgl_fa3_device_support(caps.device_index)
-        return SupportResult.yes(reason) if supported else SupportResult.no(reason)
+        return SupportResult.yes(reason) if supported else SupportResult.unsupported(reason)
 
     def binding_metadata(self) -> dict[str, object]:
         return {
@@ -710,12 +728,14 @@ class MlaSglFa3Provider(MlaTritonProvider):
         )
 
 
-@MLA_ATTENTION_REGISTRY.register
+@MLA_ATTENTION_REGISTRY.register_atomic(
+    ProviderRole.REPO_NONSTANDARD,
+    profile_only=True,
+)
 class MlaTileLangScoreProvider(MlaSglFa3Provider):
     """Explicit score-aware Composite over FA3, TileLang, and Triton."""
 
     name = "tilelang_score_sgl_fa3_h100"
-    priority = 300
 
     def __init__(
         self,
@@ -747,18 +767,18 @@ class MlaTileLangScoreProvider(MlaSglFa3Provider):
         if not base.supported:
             return base
         if caps.device_name != _VALIDATED_H100_NAME:
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 "requires H100-validated TileLang MLA schedules"
             )
         if not spec.may_require_attention_scores:
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 "score-capable Composite is not required by this operation"
             )
         supported, reason = sgl_fa3_device_support(caps.device_index)
         if not supported:
-            return SupportResult.no(reason)
+            return SupportResult.unsupported(reason)
         supported, reason = tilelang_mla_support()
-        return SupportResult.yes(reason) if supported else SupportResult.no(reason)
+        return SupportResult.yes(reason) if supported else SupportResult.unsupported(reason)
 
     def binding_metadata(self) -> dict[str, object]:
         return {
@@ -892,6 +912,31 @@ class MlaTileLangScoreProvider(MlaSglFa3Provider):
             attn_score=attn_score,
             max_context_len=int(view.meta.max_context_len),
         )
+
+
+@MLA_ATTENTION_REGISTRY.register_profile
+class MlaTileLangScoreProfile:
+    name = "tilelang_score_sgl_fa3_h100_profile"
+
+    @classmethod
+    def atomic_provider_names(cls, spec: MlaAttentionOpSpec) -> tuple[str, ...]:
+        del spec
+        return ("tilelang_score_sgl_fa3_h100",)
+
+    @classmethod
+    def matches(
+        cls,
+        spec: MlaAttentionOpSpec,
+        caps: DeviceCaps,
+    ) -> ProfileMatch:
+        del spec, caps
+        return ProfileMatch.yes("matched H100 TileLang MLA score profile")
+
+    @classmethod
+    def bind(cls, spec: MlaAttentionOpSpec, caps: DeviceCaps, **kwargs):
+        del spec, caps
+        return MlaTileLangScoreProvider(**kwargs)
+
 
 def resolve_mla_attention_provider(
     spec: MlaAttentionOpSpec,

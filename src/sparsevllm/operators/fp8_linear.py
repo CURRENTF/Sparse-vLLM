@@ -13,6 +13,9 @@ from sparsevllm.platforms import device_runtime
 from sparsevllm.operators.registry import (
     OpRegistry,
     OpResolver,
+    PortfolioPolicy,
+    ProfileMatch,
+    ProviderRole,
     SupportResult,
     runtime_version_at_least,
 )
@@ -41,7 +44,6 @@ class Fp8LinearSpec:
 
 class Fp8LinearProvider:
     name = ""
-    priority = 0
 
     def __init__(
         self,
@@ -128,7 +130,15 @@ class Fp8LinearProvider:
 
 
 FP8_LINEAR_REGISTRY: OpRegistry[Fp8LinearSpec, Fp8LinearProvider] = OpRegistry(
-    "block-scaled FP8 Linear"
+    "block-scaled FP8 Linear",
+    portfolio=PortfolioPolicy(
+        upstream_standard=(
+            "flashinfer_sm90",
+            "flashinfer_groupwise_sm120",
+        ),
+        repo_portable=("triton",),
+    ),
+    profile_order=("sm120_fp8_linear_dispatch_plan",),
 )
 
 
@@ -257,14 +267,14 @@ def _load_sm120_fp8_linear_profile() -> tuple[
 def _sm120_fp8_linear_profile_support(
     spec: Fp8LinearSpec,
     caps: DeviceCaps,
-) -> SupportResult:
+) -> ProfileMatch:
     payload, routes = _load_sm120_fp8_linear_profile()
     device = payload["device"]
     if (
         caps.device_name != device["name"]
         or list(caps.compute_capability or ()) != device["compute_capability"]
     ):
-        return SupportResult.no(
+        return ProfileMatch.no(
             "requires profiled NVIDIA RTX PRO 6000 SM120 hardware, got "
             f"{caps.device_name} {caps.compute_capability}"
         )
@@ -278,21 +288,23 @@ def _sm120_fp8_linear_profile_support(
         "cuda_graph": spec.cuda_graph,
     }
     if actual_contract != contract:
-        return SupportResult.no(
+        return ProfileMatch.no(
             f"requires profiled FP8 Linear contract {contract}, got {actual_contract}"
         )
     shape = (spec.input_features, spec.output_features)
     if shape not in routes:
-        return SupportResult.no(
+        return ProfileMatch.no(
             f"requires a profiled SM120 FP8 Linear shape, got {shape}"
         )
-
-    # Toolchain versions are profile provenance, not a substitute for runtime
-    # ABI/API probing. The atomic routes below independently validate their
-    # minimum versions and callable contracts before this plan can be bound.
-    return SupportResult.yes(
+    runtime_toolchain = _sm120_fp8_linear_runtime_toolchain(caps)
+    if runtime_toolchain != payload["toolchain"]:
+        return ProfileMatch.no(
+            "requires exact profiled toolchain "
+            f"{payload['toolchain']}, got {runtime_toolchain}"
+        )
+    return ProfileMatch.yes(
         f"matched offline profile {payload['profile_id']}; "
-        "runtime route contracts are checked independently"
+        "atomic route contracts are independently eligible"
     )
 
 
@@ -315,52 +327,51 @@ def _sm120_fp8_linear_runtime_toolchain(caps: DeviceCaps) -> dict[str, str | Non
     }
 
 
-@FP8_LINEAR_REGISTRY.register
+@FP8_LINEAR_REGISTRY.register_atomic(ProviderRole.UPSTREAM_STANDARD)
 class FlashInferSm90Fp8LinearProvider(Fp8LinearProvider):
     name = "flashinfer_sm90"
-    priority = 100
 
     @classmethod
     def supports(cls, spec: Fp8LinearSpec, caps: DeviceCaps) -> SupportResult:
         if spec.block_shape != (128, 128):
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 f"requires block_shape=(128, 128), got {spec.block_shape}"
             )
         if spec.activation_dtype != torch.bfloat16:
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 f"requires BF16 activations, got {spec.activation_dtype}"
             )
         if (
             spec.weight_dtype != torch.float8_e4m3fn
             or spec.scale_dtype != torch.float32
         ):
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 "requires E4M3 weights with FP32 block scales, got "
                 f"{spec.weight_dtype} and {spec.scale_dtype}"
             )
         if spec.weight_layout_id != "block_128x128_nt_k_major":
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 f"requires block_128x128_nt_k_major, got {spec.weight_layout_id}"
             )
         if caps.platform != PlatformEnum.CUDA or caps.compute_capability != (9, 0):
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 f"requires CUDA SM90, got {caps.platform.name} {caps.compute_capability}"
             )
         if not runtime_version_at_least(caps.runtime_version, (12, 8)):
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 "requires CUDA runtime >= 12.8, "
                 f"got {caps.runtime_version or 'unknown'}"
             )
         if spec.cuda_graph and not caps.supports_graph_capture:
-            return SupportResult.no("device does not support CUDA Graph capture")
+            return SupportResult.unsupported("device does not support CUDA Graph capture")
         if not caps.supports_native_fp8:
-            return SupportResult.no("device does not provide native FP8 tensor cores")
+            return SupportResult.unsupported("device does not provide native FP8 tensor cores")
         if spec.input_features % 128:
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 f"requires input_features divisible by 128, got {spec.input_features}"
             )
         if spec.output_features % 64:
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 f"requires output_features divisible by 64, got {spec.output_features}"
             )
         from sparsevllm.kernels.external.flashinfer.fp8_linear import (
@@ -368,7 +379,7 @@ class FlashInferSm90Fp8LinearProvider(Fp8LinearProvider):
         )
 
         supported, reason = flashinfer_sm90_fp8_linear_support()
-        return SupportResult.yes(reason) if supported else SupportResult.no(reason)
+        return SupportResult.yes(reason) if supported else SupportResult.unsupported(reason)
 
     def __call__(self, x, weight, weight_scale_inv, bias=None):
         self._validate_call(x, weight, weight_scale_inv)
@@ -392,54 +403,53 @@ class FlashInferSm90Fp8LinearProvider(Fp8LinearProvider):
         return output.reshape(*original_shape, weight.shape[0])
 
 
-@FP8_LINEAR_REGISTRY.register
+@FP8_LINEAR_REGISTRY.register_atomic(ProviderRole.UPSTREAM_STANDARD)
 class FlashInferGroupwiseSm120Fp8LinearProvider(Fp8LinearProvider):
     """SGL activation quantization plus FlashInfer SM120 CUTLASS GEMM."""
 
     name = "flashinfer_groupwise_sm120"
-    priority = 5
 
     @classmethod
     def supports(cls, spec: Fp8LinearSpec, caps: DeviceCaps) -> SupportResult:
         if spec.block_shape != (128, 128):
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 f"requires block_shape=(128, 128), got {spec.block_shape}"
             )
         if spec.activation_dtype != torch.bfloat16:
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 f"requires BF16 activations, got {spec.activation_dtype}"
             )
         if (
             spec.weight_dtype != torch.float8_e4m3fn
             or spec.scale_dtype != torch.float32
         ):
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 "requires E4M3 weights with FP32 block scales, got "
                 f"{spec.weight_dtype} and {spec.scale_dtype}"
             )
         if spec.weight_layout_id != "block_128x128_nt_k_major":
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 f"requires block_128x128_nt_k_major, got {spec.weight_layout_id}"
             )
         if caps.platform != PlatformEnum.CUDA or caps.compute_capability != (12, 0):
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 f"requires CUDA SM120, got {caps.platform.name} {caps.compute_capability}"
             )
         if not runtime_version_at_least(caps.runtime_version, (12, 8)):
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 "requires CUDA runtime >= 12.8, "
                 f"got {caps.runtime_version or 'unknown'}"
             )
         if spec.cuda_graph and not caps.supports_graph_capture:
-            return SupportResult.no("device does not support CUDA Graph capture")
+            return SupportResult.unsupported("device does not support CUDA Graph capture")
         if not caps.supports_native_fp8:
-            return SupportResult.no("device does not provide native FP8 tensor cores")
+            return SupportResult.unsupported("device does not provide native FP8 tensor cores")
         if spec.input_features % 128:
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 f"requires input_features divisible by 128, got {spec.input_features}"
             )
         if spec.output_features % 128:
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 f"requires output_features divisible by 128, got {spec.output_features}"
             )
         from sparsevllm.kernels.external.flashinfer.fp8_linear import (
@@ -453,10 +463,10 @@ class FlashInferGroupwiseSm120Fp8LinearProvider(Fp8LinearProvider):
             flashinfer_sm120_groupwise_fp8_linear_support()
         )
         if not gemm_supported:
-            return SupportResult.no(gemm_reason)
+            return SupportResult.unsupported(gemm_reason)
         quant_supported, quant_reason = sgl_fp8_group_quantization_support()
         if not quant_supported:
-            return SupportResult.no(quant_reason)
+            return SupportResult.unsupported(quant_reason)
         return SupportResult.yes(f"{quant_reason}; {gemm_reason}")
 
     def binding_metadata(self) -> dict[str, object]:
@@ -509,39 +519,38 @@ class FlashInferGroupwiseSm120Fp8LinearProvider(Fp8LinearProvider):
         return output.reshape(*original_shape, weight.shape[0])
 
 
-@FP8_LINEAR_REGISTRY.register
+@FP8_LINEAR_REGISTRY.register_atomic(ProviderRole.REPO_PORTABLE)
 class TritonFp8LinearProvider(Fp8LinearProvider):
     name = "triton"
-    priority = 10
 
     @classmethod
     def supports(cls, spec: Fp8LinearSpec, caps: DeviceCaps) -> SupportResult:
         if spec.block_shape != (128, 128):
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 f"requires block_shape=(128, 128), got {spec.block_shape}"
             )
         if caps.platform != PlatformEnum.CUDA:
-            return SupportResult.no(f"requires CUDA, got {caps.platform.name}")
+            return SupportResult.unsupported(f"requires CUDA, got {caps.platform.name}")
         if not caps.supports_triton:
-            return SupportResult.no("platform does not support Triton")
+            return SupportResult.unsupported("platform does not support Triton")
         if not caps.supports_native_fp8:
-            return SupportResult.no("device does not provide native FP8 tensor cores")
+            return SupportResult.unsupported("device does not provide native FP8 tensor cores")
         if spec.cuda_graph and not caps.supports_graph_capture:
-            return SupportResult.no("device does not support CUDA Graph capture")
+            return SupportResult.unsupported("device does not support CUDA Graph capture")
         if spec.activation_dtype not in (torch.bfloat16, torch.float16):
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 f"requires BF16 or FP16 activations, got {spec.activation_dtype}"
             )
         if (
             spec.weight_dtype != torch.float8_e4m3fn
             or spec.scale_dtype != torch.float32
         ):
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 "requires E4M3 weights with FP32 block scales, got "
                 f"{spec.weight_dtype} and {spec.scale_dtype}"
             )
         if spec.weight_layout_id != "block_128x128_nt_k_major":
-            return SupportResult.no(
+            return SupportResult.unsupported(
                 f"requires block_128x128_nt_k_major, got {spec.weight_layout_id}"
             )
         return SupportResult.yes()
@@ -574,12 +583,11 @@ class Fp8LinearDispatchRoute:
         )
 
 
-@FP8_LINEAR_REGISTRY.register
+@FP8_LINEAR_REGISTRY.register_profile
 class Sm120Fp8LinearDispatchPlan(Fp8LinearProvider):
     """Prepared model-independent token routes over atomic SM120 providers."""
 
     name = "sm120_fp8_linear_dispatch_plan"
-    priority = 200
 
     def __init__(self, spec: Fp8LinearSpec, caps: DeviceCaps) -> None:
         super().__init__(spec, caps)
@@ -602,21 +610,13 @@ class Sm120Fp8LinearDispatchPlan(Fp8LinearProvider):
         self._runtime_kernel_path_counts: dict[str, dict[str, int]] = {}
 
     @classmethod
-    def supports(cls, spec: Fp8LinearSpec, caps: DeviceCaps) -> SupportResult:
-        profile_support = _sm120_fp8_linear_profile_support(spec, caps)
-        if not profile_support.supported:
-            return profile_support
-        triton_support = TritonFp8LinearProvider.supports(spec, caps)
-        if not triton_support.supported:
-            return SupportResult.no(f"Triton route: {triton_support.reason}")
-        flashinfer_support = FlashInferGroupwiseSm120Fp8LinearProvider.supports(
-            spec, caps
-        )
-        if not flashinfer_support.supported:
-            return SupportResult.no(
-                f"FlashInfer route: {flashinfer_support.reason}"
-            )
-        return profile_support
+    def atomic_provider_names(cls, spec: Fp8LinearSpec) -> tuple[str, ...]:
+        del spec
+        return ("triton", "flashinfer_groupwise_sm120")
+
+    @classmethod
+    def matches(cls, spec: Fp8LinearSpec, caps: DeviceCaps) -> ProfileMatch:
+        return _sm120_fp8_linear_profile_support(spec, caps)
 
     def _route(self, num_tokens: int) -> Fp8LinearDispatchRoute:
         for route in self.routes:

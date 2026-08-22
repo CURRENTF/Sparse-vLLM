@@ -40,6 +40,7 @@ from sparsevllm.operators.moe import (
     Qwen3Bf16MoeDispatchPlan,
     Qwen3Fp8MoeDispatchPlan,
     SglAlignedTritonGlmMoeProvider,
+    SglDerivedTritonMoeProvider,
     resolve_moe_provider,
     use_packed_shared_experts,
 )
@@ -322,6 +323,10 @@ def test_unprofiled_all_reduce_rows_use_torch_provider():
         )
 
     assert resolved.provider.name == "torch_distributed"
+    candidates = {row.provider: row for row in resolved.report.candidates}
+    assert candidates["flashinfer_trtllm_sm90"].supported
+    profiles = {row.profile: row for row in resolved.report.profiles}
+    assert not profiles["flashinfer_trtllm_sm90_profile"].matched
 
 
 @pytest.mark.parametrize("tp_size", [1, 2])
@@ -557,7 +562,7 @@ def test_fp8_linear_uses_model_independent_profile_on_sm120():
     }
 
 
-def test_fp8_linear_profile_accepts_api_compatible_toolchain_upgrade():
+def test_fp8_linear_profile_requires_exact_toolchain_match():
     upgraded_flashinfer = KernelFamilyHealth(
         family="flashinfer-python",
         state=KernelFamilyState.READY,
@@ -591,9 +596,10 @@ def test_fp8_linear_profile_accepts_api_compatible_toolchain_upgrade():
             ),
         )
 
-    metadata = resolved.report.as_dict()["provider_metadata"]
-    assert resolved.provider.name == "sm120_fp8_linear_dispatch_plan"
-    assert metadata["profile_toolchain_match"] is False
+    assert resolved.provider.name == "flashinfer_groupwise_sm120"
+    profile = resolved.report.as_dict()["profiles"][0]
+    assert profile["matched"] is False
+    assert "requires exact profiled toolchain" in profile["reason"]
 
 
 def test_sm120_fp8_linear_requires_workspace_warmup_before_capture():
@@ -608,13 +614,6 @@ def test_sm120_fp8_linear_requires_workspace_warmup_before_capture():
             match="activation workspace was not created during warmup",
         ):
             _sm120_activation_workspace(inputs)
-    assert metadata["runtime_toolchain"] == {
-        "cuda_runtime": "13.1",
-        "flashinfer_python": "0.6.17",
-        "sglang_kernel": "0.4.6.post1",
-        "torch": "2.12",
-        "triton": "3.7",
-    }
 
 
 @pytest.mark.parametrize("model_name", ["Llama", "Qwen2", "Qwen3"])
@@ -737,7 +736,7 @@ def test_quantization_config_normalizes_model_activation_dtype():
     assert quantization.activation_dtype == "float16"
 
 
-def test_fp8_linear_uses_triton_for_unprofiled_sm120_shape():
+def test_fp8_linear_uses_upstream_for_unprofiled_sm120_shape():
     resolved = OpResolver(FP8_LINEAR_REGISTRY).resolve(
         _linear_spec(),
         _cuda_caps(
@@ -746,12 +745,11 @@ def test_fp8_linear_uses_triton_for_unprofiled_sm120_shape():
         ),
     )
 
-    assert resolved.provider.name == "triton"
-    assert any(
-        name == "sm120_fp8_linear_dispatch_plan"
-        and "requires a profiled SM120 FP8 Linear shape" in reason
-        for name, reason in resolved.rejected
-    )
+    assert resolved.provider.name == "flashinfer_groupwise_sm120"
+    assert resolved.report.selection_basis == "upstream_default"
+    profile = resolved.report.as_dict()["profiles"][0]
+    assert profile["matched"] is False
+    assert "requires a profiled SM120 FP8 Linear shape" in profile["reason"]
 
 
 def test_fp8_linear_does_not_hide_broken_flashinfer_family_on_sm90():
@@ -1088,7 +1086,7 @@ def test_sgl_triton_moe_does_not_hide_broken_alignment() -> None:
 @pytest.mark.parametrize(
     ("overrides", "reason"),
     [
-        ({"activation_dtype": torch.float32}, "profiled BF16 activations"),
+        ({"activation_dtype": torch.float32}, "requires BF16 activations"),
         ({"block_shape": (128, 128)}, "unquantized expert weights"),
     ],
 )
@@ -1108,7 +1106,7 @@ def test_sgl_triton_moe_rejects_unsupported_specs(overrides, reason):
     values.update(overrides)
     if "activation_dtype" in overrides and "weight_dtype" not in overrides:
         values["weight_dtype"] = overrides["activation_dtype"]
-    support = Qwen3Bf16MoeDispatchPlan.supports(
+    support = SglDerivedTritonMoeProvider.supports(
         _moe_spec(**values),
         _cuda_caps(
             (9, 0),
@@ -1794,7 +1792,10 @@ def test_qwen36_dispatch_plan_rejects_unprofiled_execution(
         resolved = OpResolver(MOE_REGISTRY).resolve(spec, caps)
 
     assert resolved.provider.name == "flashinfer_cutlass_fp8_sm90"
-    assert reason in dict(resolved.rejected)["hopper_qwen36_fp8_dispatch_plan"]
+    profile_reasons = {
+        profile.profile: profile.reason for profile in resolved.report.profiles
+    }
+    assert reason in profile_reasons["hopper_qwen36_fp8_dispatch_plan"]
 
 
 def test_qwen36_dispatch_plan_supports_eager_execution():
@@ -1966,19 +1967,19 @@ def test_qwen36_dispatch_plan_uses_larger_triton_bucket_on_single_gpu():
     flashinfer_call.assert_called_once()
 
 
-def test_fp8_moe_does_not_hide_missing_flashinfer_on_sm90():
-    with (
-        patch(
-            "sparsevllm.kernels.external.flashinfer.moe."
-            "flashinfer_cutlass_fp8_moe_support",
-            side_effect=_missing_flashinfer_family("SM90 CUTLASS FP8 MoE"),
-        ),
-        pytest.raises(ExternalKernelFamilyError, match="is absent"),
+def test_fp8_moe_marks_missing_flashinfer_as_degraded():
+    with patch(
+        "sparsevllm.kernels.external.flashinfer.moe."
+        "flashinfer_cutlass_fp8_moe_support",
+        side_effect=_missing_flashinfer_family("SM90 CUTLASS FP8 MoE"),
     ):
-        OpResolver(MOE_REGISTRY).resolve(
+        resolved = OpResolver(MOE_REGISTRY).resolve(
             _moe_spec(),
             _cuda_caps((9, 0)),
         )
+
+    assert resolved.provider.name == "triton"
+    assert resolved.report.selection_basis == "dependency_degraded"
 
 
 @pytest.mark.parametrize(
