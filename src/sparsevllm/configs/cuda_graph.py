@@ -7,7 +7,6 @@ from sparsevllm.configs.common import _coerce_bool_config
 from sparsevllm.method_registry import (
     DECODE_CUDA_GRAPH_SUPPORTED_METHODS,
     decode_sparse_long_text_threshold,
-    fixed_decode_cuda_graph_context_capacity,
     is_decode_cuda_graph_supported,
     is_tp_decode_cuda_graph_supported,
 )
@@ -262,7 +261,7 @@ def build_decode_cuda_graph_startup_plan(
 
 
 def build_decode_cuda_graph_startup_family_plan(config) -> list[tuple[int, int, bool]]:
-    """Build startup graph keys, including short/long sparse families."""
+    """Build graph keys largest-first so captures reuse the shared graph pool."""
     batches = sorted(set(int(size) for size in config.decode_graph_capture_sizes))
     contexts = sorted(set(int(size) for size in config.decode_graph_context_sizes))
     limit = min(
@@ -271,14 +270,17 @@ def build_decode_cuda_graph_startup_family_plan(config) -> list[tuple[int, int, 
     )
     method = str(config.sparse_method or "")
     if not method:
-        return [
-            (batch, context, False)
-            for batch, context in build_decode_cuda_graph_startup_plan(
-                batches,
-                contexts,
-                limit,
-            )
-        ]
+        return sorted(
+            (
+                (batch, context, False)
+                for batch, context in build_decode_cuda_graph_startup_plan(
+                    batches,
+                    contexts,
+                    limit,
+                )
+            ),
+            reverse=True,
+        )
 
     threshold = decode_sparse_long_text_threshold(
         method,
@@ -287,26 +289,10 @@ def build_decode_cuda_graph_startup_family_plan(config) -> list[tuple[int, int, 
         num_recent_tokens=config.recent_keep_tokens,
     )
     family_contexts: list[tuple[bool, list[int]]] = []
-    fixed_context_capacity = fixed_decode_cuda_graph_context_capacity(
-        method,
-        max_model_len=config.max_model_len,
-        h2o_decode_budget=getattr(config, "h2o_decode_budget", 0),
-        h2o_decode_eviction_interval=getattr(
-            config,
-            "h2o_decode_eviction_interval",
-            0,
-        ),
-    )
     if threshold >= 2:
-        family_contexts.append(
-            (False, [fixed_context_capacity] if fixed_context_capacity else contexts)
-        )
+        family_contexts.append((False, contexts))
     if threshold + 2 <= int(config.max_model_len):
-        long_contexts = (
-            [fixed_context_capacity]
-            if fixed_context_capacity
-            else [context for context in contexts if context > threshold]
-        )
+        long_contexts = [context for context in contexts if context > threshold]
         if long_contexts:
             family_contexts.append((True, long_contexts))
     if not family_contexts:
@@ -334,7 +320,7 @@ def build_decode_cuda_graph_startup_family_plan(config) -> list[tuple[int, int, 
         for context in lane_contexts
     ]
     if len(full_plan) <= limit:
-        return sorted(full_plan)
+        return sorted(full_plan, reverse=True)
 
     target_size = min(limit, len(full_plan))
     quotas = [1] * len(lanes)
@@ -369,7 +355,7 @@ def build_decode_cuda_graph_startup_family_plan(config) -> list[tuple[int, int, 
         selected.extend(
             (batch, context, is_long_text) for context in chosen
         )
-    plan = sorted(set(selected))
+    plan = sorted(set(selected), reverse=True)
     if len(plan) != target_size:
         raise RuntimeError(
             "decode CUDA Graph sparse startup planner produced an incomplete plan: "

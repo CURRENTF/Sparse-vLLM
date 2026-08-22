@@ -268,22 +268,6 @@ def decode_sparse_long_text_threshold(
     )
 
 
-def fixed_decode_cuda_graph_context_capacity(
-    method: str,
-    *,
-    max_model_len: int,
-    h2o_decode_budget: int,
-    h2o_decode_eviction_interval: int,
-) -> int | None:
-    """Return a method-owned fixed graph capacity, or ``None`` for normal buckets."""
-    if str(method or "") != "h2o":
-        return None
-    return min(
-        int(h2o_decode_budget) + int(h2o_decode_eviction_interval),
-        int(max_model_len),
-    )
-
-
 _DEFAULT_PREFILL_POLICY_BY_METHOD = {
     "": PREFILL_POLICY_ALL_CHUNKED,
     "streamingllm": PREFILL_POLICY_ALL_CHUNKED,

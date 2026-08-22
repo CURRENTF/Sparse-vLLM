@@ -18,6 +18,7 @@ from sparsevllm.configs.cuda_graph import (
     build_decode_cuda_graph_startup_plan,
 )
 from sparsevllm.models.layout import resolve_attention_qk_head_dim
+from sparsevllm.method_registry import sparse_decode_attention_requires_scores
 from sparsevllm.distributed import ParallelContext
 from sparsevllm.engine.cache_manager import LayerBatchStates
 from sparsevllm.engine.cache_manager.h2o import H2OCacheManager
@@ -128,7 +129,7 @@ def test_sparse_startup_graph_plan_covers_short_and_long_families():
     )
 
 
-def test_h2o_startup_graph_plan_uses_method_context_capacity():
+def test_h2o_startup_graph_plan_uses_normal_context_buckets():
     config = SimpleNamespace(
         decode_cuda_graph_capture_sizes=[1, 2, 4],
         decode_cuda_graph_context_sizes=[1024, 2048, 4096, 8192, 16384],
@@ -138,18 +139,24 @@ def test_h2o_startup_graph_plan_uses_method_context_capacity():
         num_sink_tokens=64,
         decode_keep_tokens=4096,
         num_recent_tokens=512,
-        h2o_decode_budget=4096,
-        h2o_decode_eviction_interval=128,
         max_model_len=16384,
     )
 
     plan = build_decode_cuda_graph_startup_family_plan(config)
 
-    assert plan == [
-        (batch, 4224, is_long)
-        for batch in (1, 2, 4)
-        for is_long in (False, True)
-    ]
+    assert plan == sorted(
+        [
+            (batch, context, False)
+            for batch in (1, 2, 4)
+            for context in (1024, 2048, 4096, 8192, 16384)
+        ]
+        + [
+            (batch, context, True)
+            for batch in (1, 2, 4)
+            for context in (8192, 16384)
+        ],
+        reverse=True,
+    )
 
 
 def test_sparse_startup_graph_plan_covers_default_64_sequence_limit():
@@ -200,6 +207,7 @@ def _make_glm_graph_lane(
         cache_dtype=torch.bfloat16,
         tp_size=1,
         cuda_graph=True,
+        may_require_attention_scores=sparse_decode_attention_requires_scores(method),
     )
     mla_attention = MLAAttention.bind(
         spec=spec,
