@@ -54,10 +54,48 @@ from sparsevllm.operators.gemma4_router import (
     TorchGemma4RouterProvider,
     TritonGemma4RouterProvider,
 )
+from sparsevllm.layers.attention import Attention
+from sparsevllm.operators.context_independent_gemma4_attention import (
+    ContextIndependentGemma4AttentionBackend,
+    bind_context_independent_gemma4_attention,
+)
+from sparsevllm.operators.gemma4_attention import Gemma4AttentionBackend
 from sparsevllm.operators.moe import MoeOpSpec
 from sparsevllm.operators.registry import OpResolver
 from sparsevllm.platforms import DeviceCaps, PlatformEnum
 from sparsevllm.utils.config import config_layer_get
+
+
+def test_context_independent_gemma4_binding_isolated_and_shared() -> None:
+    model = torch.nn.Module()
+    model.first = Attention(4, 256, 1.0, 2)
+    model.second = Attention(4, 256, 1.0, 2)
+    model.global_layer = Attention(8, 512, 1.0, 1)
+    model.first.attention_backend = Gemma4AttentionBackend(sliding_window=1024)
+    model.second.attention_backend = Gemma4AttentionBackend(sliding_window=1024)
+    model.global_layer.attention_backend = Gemma4AttentionBackend(
+        sliding_window=None
+    )
+
+    bound, workspace_bytes = bind_context_independent_gemma4_attention(
+        model,
+        max_batch_size=4,
+        device=torch.device("cpu"),
+    )
+
+    assert bound == 3
+    assert isinstance(
+        model.first.attention_backend,
+        ContextIndependentGemma4AttentionBackend,
+    )
+    assert (
+        model.first.attention_backend.workspace
+        is model.second.attention_backend.workspace
+    )
+    assert model.global_layer.attention_backend.workspace is not (
+        model.first.attention_backend.workspace
+    )
+    assert workspace_bytes > 0
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

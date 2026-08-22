@@ -20,7 +20,23 @@ from sparsevllm.engine.sequence import Sequence
 from sparsevllm.models.qwen2 import Qwen2ForCausalLM
 from sparsevllm.models.llama import LlamaForCausalLM
 from sparsevllm.layers.sampler import Sampler
+from sparsevllm.method_registry import decode_sparse_long_text_threshold
 from sparsevllm.operators import registry as operator_registry
+from sparsevllm.operators.decode_attention import (
+    validate_context_independent_decode_graph_model,
+)
+from sparsevllm.operators.context_independent_decode_attention import (
+    bind_context_independent_triton_attention,
+)
+from sparsevllm.operators.context_independent_mla_attention import (
+    bind_context_independent_mla_attention,
+)
+from sparsevllm.operators.context_independent_gemma4_attention import (
+    bind_context_independent_gemma4_attention,
+)
+from sparsevllm.operators.context_independent_qwen35 import (
+    bind_context_independent_qwen35_linear_attention,
+)
 from sparsevllm.utils.context import set_context, get_context, reset_context
 from sparsevllm.utils.loader import load_model, sync_deltakv_config_from_checkpoint
 
@@ -237,6 +253,39 @@ class ModelRunner:
                 max_decoding_seqs=config.max_decoding_seqs,
             ),
         )
+        if self.config.decode_cuda_graph_shape_policy == "batch_only":
+            mla_provider = bind_context_independent_mla_attention(self.model)
+            qwen35_linear_layers = (
+                bind_context_independent_qwen35_linear_attention(self.model)
+            )
+            gemma_layers, gemma_workspace_bytes = (
+                bind_context_independent_gemma4_attention(
+                    self.model,
+                    max_batch_size=_resolve_decode_static_batch_capacity(
+                        decode_static_capture_sizes,
+                        max_num_seqs_in_batch=config.max_num_seqs_in_batch,
+                        max_decoding_seqs=config.max_decoding_seqs,
+                    ),
+                    device=self.device,
+                )
+            )
+            bound_layers, workspace_bytes = bind_context_independent_triton_attention(
+                self.model,
+                max_batch_size=_resolve_decode_static_batch_capacity(
+                    decode_static_capture_sizes,
+                    max_num_seqs_in_batch=config.max_num_seqs_in_batch,
+                    max_decoding_seqs=config.max_decoding_seqs,
+                ),
+                device=self.device,
+            )
+            logger.info(
+                "Context-independent decode providers: "
+                f"mla={mla_provider or 'none'} gemma_layers={gemma_layers} "
+                f"qwen35_linear_layers={qwen35_linear_layers} "
+                f"generic_layers={bound_layers} shared_workspace_mib="
+                f"{(workspace_bytes + gemma_workspace_bytes) / (1024**2):.2f}"
+            )
+            validate_context_independent_decode_graph_model(self.model)
         if config.tiny_random:
             from sparsevllm.debug.tiny_random import initialize_sparse_model
 
@@ -355,6 +404,7 @@ class ModelRunner:
             method=self.config.vllm_sparse_method,
             capture_sizes=decode_static_capture_sizes,
             context_sizes=decode_static_context_sizes,
+            shape_policy=self.config.decode_cuda_graph_shape_policy,
             graph_pool=self.cuda_graph_pool,
         )
         torch.set_default_device("cpu")
@@ -893,8 +943,19 @@ class ModelRunner:
             "force_eager_count": int(
                 getattr(graph_runner, "force_eager_count", 0)
             ),
+            "eviction_count": int(
+                getattr(graph_runner, "eviction_count", 0)
+            ),
+            "recapture_count": int(
+                getattr(graph_runner, "recapture_count", 0)
+            ),
             "cached_graph_count": len(
                 getattr(graph_runner, "_graphs", {})
+            ),
+            "bucket_plan": (
+                graph_runner.bucket_plan()
+                if callable(getattr(graph_runner, "bucket_plan", None))
+                else None
             ),
             "last_state_key": (
                 {
@@ -1122,15 +1183,12 @@ class ModelRunner:
 
     def _long_text_threshold(self, is_prefill: bool) -> int:
         del is_prefill
-        if self.config.vllm_sparse_method in ("streamingllm", "attention-sink", "attention_sink"):
-            base = self.config.num_sink_tokens + self.config.num_recent_tokens
-        else:
-            base = (
-                self.config.num_sink_tokens
-                + self.config.num_recent_tokens
-                + self.config.decode_keep_tokens
-            )
-        return base
+        return decode_sparse_long_text_threshold(
+            self.config.vllm_sparse_method,
+            num_sink_tokens=self.config.num_sink_tokens,
+            decode_keep_tokens=self.config.decode_keep_tokens,
+            num_recent_tokens=self.config.num_recent_tokens,
+        )
 
     def _is_long_text_batch(self, seqs: list[Sequence], is_prefill: bool) -> bool:
         # Prefill execution is per-sequence and cache-manager owned.  This
@@ -1190,13 +1248,11 @@ class ModelRunner:
     def _auto_capture_greedy_sampling(self, seqs: list[Sequence]) -> bool:
         if any(self._has_sampling_penalty(seq) for seq in seqs):
             return False
-        if self.config.decode_cuda_graph_capture_sampling:
-            return all(bool(getattr(seq, "should_publish_sample", True)) for seq in seqs)
+        if not self.config.decode_cuda_graph_capture_sampling:
+            return False
         if self.config.tensor_parallel_size != 1:
             return False
         if self.config.enable_prefix_caching:
-            return False
-        if str(self.config.vllm_sparse_method or "") not in {"", "omnikv"}:
             return False
         return all(
             bool(getattr(seq, "should_publish_sample", True))
@@ -1315,6 +1371,19 @@ class ModelRunner:
 
     def set_decode_cuda_graph_max_context_len_override(self, max_context_len: int | None):
         self.decode_cuda_graph_runner.set_max_context_len_override(max_context_len)
+
+    def set_decode_cuda_graph_reuse_larger_context_graphs(self, enabled: bool):
+        self.decode_cuda_graph_runner.set_reuse_larger_context_graphs(enabled)
+
+    def seal_decode_cuda_graph_startup_plan(self):
+        self.decode_cuda_graph_runner.seal_startup_plan()
+
+    def capture_decode_cuda_graph_warmup(self, seqs: list[Sequence]) -> None:
+        """Capture one planned graph without advancing scheduler sequence state."""
+        try:
+            self.decode_cuda_graph_runner.run(seqs, capture_sampling=False)
+        finally:
+            reset_context()
 
     def set_omnikv_decode_graph_max_context_len_override(self, max_context_len: int | None):
         self.set_decode_cuda_graph_max_context_len_override(max_context_len)

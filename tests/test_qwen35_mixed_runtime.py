@@ -1422,6 +1422,152 @@ def test_qwen35_decode_state_padding_preserves_real_rows_for_static_batch():
     assert torch.equal(padded_recurrent[3], recurrent[0])
 
 
+def test_context_independent_qwen35_binding_marks_complete_linear_chain():
+    from sparsevllm.operators.context_independent_qwen35 import (
+        bind_context_independent_qwen35_linear_attention,
+    )
+
+    class Qwen35LinearAttention(torch.nn.Module):
+        def _decode_gdn(self):
+            pass
+
+        def _project_qkvzba(self):
+            pass
+
+        def _repeat_qk_for_value_heads(self):
+            pass
+
+    model = torch.nn.Module()
+    model.linear = Qwen35LinearAttention()
+
+    assert bind_context_independent_qwen35_linear_attention(model) == 1
+    assert model.linear.cuda_graph_context_independent
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_qwen35_linear_gdn_graph_replay_keeps_padding_state_isolated():
+    from sparsevllm.kernels.triton.qwen3_5.fused_gdn_gating import (
+        fused_gdn_gating,
+    )
+    from sparsevllm.kernels.triton.qwen3_5.gdn_decode_pack import (
+        conv_pack_gdn_decode_inputs,
+    )
+    from sparsevllm.kernels.triton.qwen3_5.fla.ops import (
+        fused_recurrent_gated_delta_rule,
+    )
+
+    torch.manual_seed(61)
+    batch, real_batch = 4, 2
+    num_k_heads, num_v_heads = 2, 6
+    head_k_dim = head_v_dim = 128
+    conv_size = 4
+    q_dim = num_k_heads * head_k_dim
+    v_dim = num_v_heads * head_v_dim
+    conv_dim = 2 * q_dim + v_dim
+    mixed_qkv = torch.randn(batch, conv_dim, dtype=torch.bfloat16, device="cuda")
+    z_raw = torch.randn(
+        batch,
+        num_v_heads,
+        head_v_dim,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    a_raw = torch.randn(batch, num_v_heads, dtype=torch.bfloat16, device="cuda")
+    b_raw = torch.randn_like(a_raw)
+    conv_weight = torch.randn(
+        conv_dim,
+        conv_size,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    conv_state = torch.randn(
+        real_batch + 1,
+        conv_dim,
+        conv_size - 1,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    recurrent_state = torch.randn(
+        real_batch + 1,
+        num_v_heads,
+        head_k_dim,
+        head_v_dim,
+        dtype=torch.float32,
+        device="cuda",
+    )
+    state_indices = torch.tensor([0, 1, 2, 2], dtype=torch.int32, device="cuda")
+    a_log = torch.randn(num_v_heads, dtype=torch.float32, device="cuda")
+    dt_bias = torch.randn(num_v_heads, dtype=torch.float32, device="cuda")
+
+    def run_chain():
+        conv_state[2].zero_()
+        recurrent_state[2].zero_()
+        q, k, v, z, a, b = conv_pack_gdn_decode_inputs(
+            mixed_qkv,
+            z_raw,
+            a_raw,
+            b_raw,
+            conv_state,
+            conv_weight,
+            None,
+            state_indices,
+            "silu",
+            conv_size,
+            num_k_heads,
+            head_k_dim,
+            num_v_heads,
+            head_v_dim,
+        )
+        q = q.repeat_interleave(num_v_heads // num_k_heads, dim=2)
+        k = k.repeat_interleave(num_v_heads // num_k_heads, dim=2)
+        g, beta = fused_gdn_gating(a_log, a, b, dt_bias)
+        output, _ = fused_recurrent_gated_delta_rule(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            initial_state=recurrent_state,
+            inplace_final_state=True,
+            ssm_state_indices=state_indices,
+            use_qk_l2norm_in_kernel=True,
+        )
+        return output, z
+
+    run_chain()
+    torch.cuda.synchronize()
+    initial_conv = conv_state[:real_batch].clone()
+    initial_recurrent = recurrent_state[:real_batch].clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_output, graph_z = run_chain()
+
+    conv_state[:real_batch].copy_(initial_conv)
+    recurrent_state[:real_batch].copy_(initial_recurrent)
+    state_indices.copy_(torch.tensor([1, 0, 2, 2], dtype=torch.int32, device="cuda"))
+    mixed_qkv.copy_(torch.randn_like(mixed_qkv))
+    graph.replay()
+    replay_output = graph_output.clone()
+    replay_z = graph_z.clone()
+    replay_conv = conv_state[:real_batch].clone()
+    replay_recurrent = recurrent_state[:real_batch].clone()
+
+    conv_state[:real_batch].copy_(initial_conv)
+    recurrent_state[:real_batch].copy_(initial_recurrent)
+    eager_output, eager_z = run_chain()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(replay_output, eager_output, rtol=0, atol=0)
+    torch.testing.assert_close(replay_z, eager_z, rtol=0, atol=0)
+    torch.testing.assert_close(replay_conv, conv_state[:real_batch], rtol=0, atol=0)
+    torch.testing.assert_close(
+        replay_recurrent,
+        recurrent_state[:real_batch],
+        rtol=0,
+        atol=0,
+    )
+
+
 def test_linear_layer_kv_hook_fails_fast_without_allocating_cache():
     manager = object.__new__(StandardCacheManager)
     manager.runtime_layout = RuntimeLayout.from_config(_qwen35_outer_config().text_config, require_mixed=True)

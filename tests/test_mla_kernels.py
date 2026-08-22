@@ -598,6 +598,52 @@ def test_mla_decode_cuda_graph_replay_resets_reduced_scores() -> None:
         )
         assert torch.all(graph_scores[batch_idx, length:] == -1.0e20)
 
+
+@CUDA_REQUIRED
+def test_mla_decode_cuda_graph_replays_different_context_lengths() -> None:
+    torch.manual_seed(229)
+    case = _make_decode_case(batch_size=2, head_count=10, max_context_len=257)
+    q_latent, q_rope, latent_cache, rope_cache = case[:4]
+    active_slots, request_indices, context_lens = case[4:]
+    output = torch.empty_like(q_latent)
+    workspace = allocate_mla_decode_workspace(
+        batch_size=2,
+        head_count=10,
+        device="cuda",
+    )
+
+    def run_decode() -> None:
+        run_mla_decode(
+            q_latent,
+            q_rope,
+            latent_cache,
+            rope_cache,
+            active_slots,
+            request_indices,
+            context_lens,
+            output,
+            workspace,
+            softmax_scale=GLM_MLA_SOFTMAX_SCALE,
+            config=DEFAULT_GLM_MLA_DECODE_CONFIG,
+            validate_metadata=False,
+        )
+
+    run_decode()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run_decode()
+
+    context_lens.copy_(torch.tensor([17, 239], dtype=torch.int32, device="cuda"))
+    q_latent.copy_(torch.randn_like(q_latent))
+    q_rope.copy_(torch.randn_like(q_rope))
+    graph.replay()
+    graph_output = output.clone()
+    run_decode()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(graph_output, output, rtol=0, atol=0)
+
 @CUDA_REQUIRED
 def test_mla_decode_zeroes_padded_rows() -> None:
     torch.manual_seed(19)

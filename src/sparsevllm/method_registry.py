@@ -208,6 +208,59 @@ TP_DECODE_CUDA_GRAPH_SUPPORTED_METHODS = {
     "skipkv",
 }
 
+
+def decode_sparse_long_text_threshold(
+    method: str,
+    *,
+    num_sink_tokens: int,
+    decode_keep_tokens: int,
+    num_recent_tokens: int,
+) -> int:
+    """Return the shared decode boundary between short and sparse graph families."""
+    method = str(method or "")
+    if not method:
+        return 0
+    if method in {"streamingllm", "attention-sink", "attention_sink"}:
+        return int(num_sink_tokens) + int(num_recent_tokens)
+    return (
+        int(num_sink_tokens)
+        + int(decode_keep_tokens)
+        + int(num_recent_tokens)
+    )
+
+
+def fixed_decode_cuda_graph_context_capacity(
+    method: str,
+    *,
+    max_model_len: int,
+    h2o_decode_budget: int,
+    h2o_decode_eviction_interval: int,
+) -> int | None:
+    """Return a method-owned fixed graph capacity, or ``None`` for normal buckets."""
+    if str(method or "") != "h2o":
+        return None
+    return min(
+        int(h2o_decode_budget) + int(h2o_decode_eviction_interval),
+        int(max_model_len),
+    )
+
+
+def decode_cuda_graph_path_id(method: str, is_long_text: bool) -> str:
+    """Return the captured GPU topology path for a decode family.
+
+    Only H2O is merged initially: it collects the same reduced score tensor on
+    every decode step and uses one fixed budget-plus-interval view capacity.
+    Other sparse methods retain separate short/long paths until their captured
+    node sequences and workspace layouts are verified equivalent.
+    """
+    method = str(method or "")
+    if not method:
+        return "dense"
+    if method == "h2o":
+        return "score"
+    return "long" if is_long_text else "short"
+
+
 _DEFAULT_PREFILL_POLICY_BY_METHOD = {
     "": PREFILL_POLICY_ALL_CHUNKED,
     "streamingllm": PREFILL_POLICY_ALL_CHUNKED,

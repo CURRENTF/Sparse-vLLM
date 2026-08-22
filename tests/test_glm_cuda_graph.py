@@ -12,6 +12,11 @@ import torch
 from torch import nn
 
 from sparsevllm.config import RuntimeLayout
+from sparsevllm.configs.cuda_graph import (
+    _default_decode_cuda_graph_capture_sizes,
+    build_decode_cuda_graph_startup_family_plan,
+    build_decode_cuda_graph_startup_plan,
+)
 from sparsevllm.models.layout import resolve_attention_qk_head_dim
 from sparsevllm.distributed import ParallelContext
 from sparsevllm.engine.cache_manager import LayerBatchStates
@@ -36,6 +41,9 @@ from sparsevllm.models.glm4_moe_lite import (
     Glm4MoeLiteSparseMoeBlock,
 )
 from sparsevllm.operators.mla_attention import MlaAttentionOpSpec
+from sparsevllm.operators.decode_attention import (
+    validate_context_independent_decode_graph_model,
+)
 from sparsevllm.utils.context import get_context
 
 from glm_test_helpers import (
@@ -43,6 +51,246 @@ from glm_test_helpers import (
     _single_rank_parallel_context,
     _tensor_sha256,
 )
+
+
+def test_startup_graph_plan_captures_complete_coarse_grid_when_it_fits():
+    plan = build_decode_cuda_graph_startup_plan(
+        [1, 2, 4, 8],
+        [1024, 2048, 4096, 8192, 16384, 32768, 33280],
+        32,
+    )
+
+    assert len(plan) == 28
+    assert plan[0] == (1, 1024)
+    assert plan[-1] == (8, 33280)
+
+
+def test_startup_graph_plan_spreads_contexts_and_preserves_mandatory_graph():
+    plan = build_decode_cuda_graph_startup_plan(
+        [1, 2, 4, 8],
+        [1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144],
+        12,
+        mandatory=(8, 8192),
+    )
+
+    assert len(plan) == 12
+    assert {batch for batch, _ in plan} == {1, 2, 4, 8}
+    assert (8, 8192) in plan
+    assert all(any(context == 262144 for b, context in plan if b == batch) for batch in (1, 2, 4))
+
+
+def test_startup_graph_plan_prioritizes_dense_batch_coverage():
+    batches = list(range(1, 9))
+    contexts = [1024, 2048, 4096, 8192, 16384, 32768, 65536]
+
+    plan = build_decode_cuda_graph_startup_plan(batches, contexts, 32)
+
+    assert len(plan) == 32
+    assert {batch for batch, _ in plan} == set(batches)
+    assert all((batch, 65536) in plan for batch in batches)
+    assert all(len([pair for pair in plan if pair[0] == batch]) == 4 for batch in batches)
+
+
+def test_startup_graph_plan_keeps_max_context_when_mandatory_cannot_fit():
+    plan = build_decode_cuda_graph_startup_plan(
+        [1, 2, 3],
+        [1024, 2048, 4096],
+        3,
+        mandatory=(3, 1024),
+    )
+
+    assert plan == [(1, 4096), (2, 4096), (3, 4096)]
+
+
+def test_sparse_startup_graph_plan_covers_short_and_long_families():
+    config = SimpleNamespace(
+        decode_cuda_graph_capture_sizes=list(range(1, 9)),
+        decode_cuda_graph_context_sizes=[1024, 2048, 4096, 8192, 16384, 32768],
+        decode_cuda_graph_startup_capture_limit=48,
+        decode_cuda_graph_max_cached_graphs=48,
+        vllm_sparse_method="snapkv",
+        num_sink_tokens=64,
+        decode_keep_tokens=4096,
+        num_recent_tokens=512,
+        max_model_len=32768,
+    )
+
+    plan = build_decode_cuda_graph_startup_family_plan(config)
+
+    assert len(plan) == 48
+    assert {(batch, is_long) for batch, _, is_long in plan} == {
+        (batch, is_long)
+        for batch in range(1, 9)
+        for is_long in (False, True)
+    }
+    assert all(context > 4672 for _, context, is_long in plan if is_long)
+    assert all(
+        len([key for key in plan if key[0] == batch and key[2] == is_long]) == 3
+        for batch in range(1, 9)
+        for is_long in (False, True)
+    )
+
+
+def test_h2o_startup_graph_plan_uses_method_context_capacity():
+    config = SimpleNamespace(
+        decode_cuda_graph_capture_sizes=[1, 2, 4],
+        decode_cuda_graph_context_sizes=[1024, 2048, 4096, 8192, 16384],
+        decode_cuda_graph_startup_capture_limit=48,
+        decode_cuda_graph_max_cached_graphs=48,
+        vllm_sparse_method="h2o",
+        num_sink_tokens=64,
+        decode_keep_tokens=4096,
+        num_recent_tokens=512,
+        h2o_decode_budget=4096,
+        h2o_decode_eviction_interval=128,
+        max_model_len=16384,
+    )
+
+    plan = build_decode_cuda_graph_startup_family_plan(config)
+
+    assert plan == [
+        (batch, 4224, is_long)
+        for batch in (1, 2, 4)
+        for is_long in (False, True)
+    ]
+
+
+def test_sparse_startup_graph_plan_covers_default_64_sequence_limit():
+    batches = _default_decode_cuda_graph_capture_sizes(64)
+    config = SimpleNamespace(
+        decode_cuda_graph_capture_sizes=batches,
+        decode_cuda_graph_context_sizes=[1024, 2048, 4096, 8192, 16384, 32768, 65536],
+        decode_cuda_graph_startup_capture_limit=48,
+        decode_cuda_graph_max_cached_graphs=48,
+        vllm_sparse_method="snapkv",
+        num_sink_tokens=64,
+        decode_keep_tokens=4096,
+        num_recent_tokens=512,
+        max_model_len=65536,
+    )
+
+    plan = build_decode_cuda_graph_startup_family_plan(config)
+
+    assert len(batches) == 22
+    assert len(plan) == 48
+    assert {(batch, is_long) for batch, _, is_long in plan} == {
+        (batch, is_long) for batch in batches for is_long in (False, True)
+    }
+
+
+def test_batch_only_startup_plan_spends_vanilla_budget_on_batch_anchors():
+    config = SimpleNamespace(
+        decode_cuda_graph_shape_policy="batch_only",
+        decode_cuda_graph_capture_sizes=list(range(1, 33)),
+        decode_cuda_graph_context_sizes=[1024, 2048, 4096],
+        decode_cuda_graph_startup_capture_limit=32,
+        decode_cuda_graph_max_cached_graphs=32,
+        vllm_sparse_method="",
+        num_sink_tokens=64,
+        decode_keep_tokens=4096,
+        num_recent_tokens=512,
+        max_model_len=131072,
+    )
+
+    plan = build_decode_cuda_graph_startup_family_plan(config)
+
+    assert plan == [
+        (batch_size, 131072, False) for batch_size in range(1, 33)
+    ]
+
+
+def test_batch_only_startup_plan_deduplicates_h2o_short_long_topology():
+    config = SimpleNamespace(
+        decode_cuda_graph_shape_policy="batch_only",
+        decode_cuda_graph_capture_sizes=[1, 2, 4, 8],
+        decode_cuda_graph_context_sizes=[1024, 2048, 4096],
+        decode_cuda_graph_startup_capture_limit=32,
+        decode_cuda_graph_max_cached_graphs=32,
+        vllm_sparse_method="h2o",
+        num_sink_tokens=64,
+        decode_keep_tokens=4096,
+        num_recent_tokens=512,
+        h2o_decode_budget=4096,
+        h2o_decode_eviction_interval=128,
+        max_model_len=131072,
+    )
+
+    plan = build_decode_cuda_graph_startup_family_plan(config)
+
+    assert plan == [
+        (batch_size, 4224, False) for batch_size in (1, 2, 4, 8)
+    ]
+
+
+def test_batch_only_runner_reuses_path_across_contexts_and_rejects_lazy_capture():
+    cache_manager = SimpleNamespace(
+        device=torch.device("cpu"),
+        decode_cuda_graph_max_cached_graphs=lambda: 2,
+    )
+    runner = DecodeCudaGraphRunner(
+        runtime_state=SimpleNamespace(),
+        cache_manager=cache_manager,
+        recurrent_state_manager=None,
+        sparse_controller=SimpleNamespace(layer_batch_sparse_states={}),
+        run_model=lambda *_args, **_kwargs: None,
+        is_long_text_batch=lambda *_args, **_kwargs: False,
+        method="",
+        capture_sizes=[1, 2],
+        context_sizes=[1024, 2048],
+        shape_policy="batch_only",
+    )
+
+    first = runner._select_state(
+        method="",
+        batch_size=1,
+        context_capacity=4096,
+        is_long_text=False,
+        capture_sampling=False,
+        graph_path_id="dense",
+    )
+    reused = runner._select_state(
+        method="",
+        batch_size=1,
+        context_capacity=2048,
+        is_long_text=False,
+        capture_sampling=False,
+        graph_path_id="dense",
+    )
+
+    assert reused is first
+    assert first.key.context_capacity == 0
+    assert first.capture_context_capacity == 4096
+
+    runner.seal_startup_plan()
+    with pytest.raises(RuntimeError, match="Runtime capture is disabled"):
+        runner._select_state(
+            method="",
+            batch_size=2,
+            context_capacity=4096,
+            is_long_text=False,
+            capture_sampling=False,
+            graph_path_id="dense",
+        )
+
+
+def test_batch_only_model_validation_rejects_unvalidated_original_backend():
+    model = nn.Module()
+    model.attention = nn.Module()
+    model.attention.attention_backend = SimpleNamespace(name="triton")
+
+    with pytest.raises(RuntimeError, match="backend=triton"):
+        validate_context_independent_decode_graph_model(model)
+
+
+def test_batch_only_model_validation_accepts_experimental_backend():
+    model = nn.Module()
+    model.attention = nn.Module()
+    model.attention.attention_backend = SimpleNamespace(
+        name="triton_context_independent",
+        cuda_graph_context_independent=True,
+    )
+
+    validate_context_independent_decode_graph_model(model)
 
 
 def _make_glm_graph_lane(

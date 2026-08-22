@@ -156,3 +156,49 @@ def prepare_decode_attention_launch_op(
     caps = platform.get_device_caps(int(device_index))
     provider = OpResolver(DECODE_ATTENTION_LAUNCH_REGISTRY).resolve(spec, caps).provider
     return PreparedDecodeAttentionLaunchOp(spec, provider)
+
+
+def validate_context_independent_decode_graph_model(model: torch.nn.Module) -> None:
+    """Require every decode-attention component to opt into batch-only graphs."""
+    checked: list[str] = []
+    rejected: list[str] = []
+    for module_name, module in model.named_modules():
+        backend = getattr(module, "attention_backend", None)
+        if backend is not None:
+            name = module_name or type(module).__name__
+            checked.append(name)
+            if not bool(
+                getattr(backend, "cuda_graph_context_independent", False)
+            ):
+                rejected.append(
+                    f"{name}: backend={getattr(backend, 'name', type(backend).__name__)}"
+                )
+        if type(module).__name__ == "Qwen35LinearAttention":
+            name = module_name or type(module).__name__
+            checked.append(name)
+            if not bool(
+                getattr(module, "cuda_graph_context_independent", False)
+            ):
+                rejected.append(f"{name}: linear GDN decode is not validated")
+
+    model_body = getattr(model, "model", None)
+    mla_attention = getattr(model_body, "mla_attention", None)
+    if mla_attention is not None:
+        provider = getattr(mla_attention, "provider", None)
+        checked.append("model.mla_attention")
+        if not bool(
+            getattr(provider, "cuda_graph_context_independent", False)
+        ):
+            rejected.append(
+                "model.mla_attention: provider="
+                f"{getattr(provider, 'name', type(provider).__name__)}"
+            )
+
+    if not checked:
+        rejected.append("model exposes no decode attention capability")
+    if rejected:
+        raise RuntimeError(
+            "decode_cuda_graph_shape_policy='batch_only' requires validated "
+            "context-independent experimental operators; unsupported="
+            f"{rejected}. Use 'bucketed' until those providers are selected."
+        )

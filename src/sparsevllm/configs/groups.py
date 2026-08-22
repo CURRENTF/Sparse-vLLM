@@ -25,12 +25,15 @@ class DecodeCudaGraphConfig:
     """Decode CUDA Graph capture and compatibility settings."""
 
     decode_cuda_graph: bool = False
+    decode_cuda_graph_shape_policy: str = "bucketed"
     decode_cuda_graph_capture_sampling: bool = False
     decode_cuda_graph_capture_sizes: str | int | list[int] | tuple[int, ...] | None = "auto"
     decode_cuda_graph_context_sizes: str | int | list[int] | tuple[int, ...] | None = "auto"
     decode_cuda_graph_context_sizes_auto: bool = field(default=False, init=False)
     decode_cuda_graph_context_policy: str = "current"
     decode_cuda_graph_max_cached_graphs: int | None = None
+    decode_cuda_graph_startup_capture: bool | None = None
+    decode_cuda_graph_startup_capture_limit: int | None = None
     sparse_attn_score_dtype: str = "float32"
 
     # Deprecated aliases retained for config-file and CLI compatibility.

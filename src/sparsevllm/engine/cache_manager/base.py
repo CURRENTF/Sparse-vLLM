@@ -17,7 +17,13 @@ from sparsevllm.engine.prefill import (
     PREFILL_EXECUTION_CHUNKED,
     PREFILL_EXECUTION_RAW_OFFLOAD,
 )
-from sparsevllm.method_registry import SUPPORTED_SPARSE_METHODS, normalize_sparse_method
+from sparsevllm.method_registry import (
+    SUPPORTED_SPARSE_METHODS,
+    decode_cuda_graph_path_id,
+    decode_sparse_long_text_threshold,
+    fixed_decode_cuda_graph_context_capacity,
+    normalize_sparse_method,
+)
 from sparsevllm.kernels.triton.store_kvcache import store_kvcache
 import sparsevllm.platforms as platforms
 from sparsevllm.models.layout import resolve_attention_qk_head_dim
@@ -1075,6 +1081,71 @@ class CacheManager(ABC):
         """
         del seqs, requested_context_capacity, current_context_capacity
         return None
+
+    def decode_cuda_graph_path_id(self, is_long_text: bool) -> str:
+        """Return the startup-bound graph topology path for this cache manager."""
+        return decode_cuda_graph_path_id(
+            str(getattr(self.config, "vllm_sparse_method", "") or ""),
+            bool(is_long_text),
+        )
+
+    def decode_cuda_graph_context_independent_capacity(
+        self,
+        is_long_text: bool,
+    ) -> int:
+        """Return the fixed tensor capacity for one ctx-independent path."""
+        method = str(getattr(self.config, "vllm_sparse_method", "") or "")
+        max_model_len = int(self.config.max_model_len)
+        fixed_capacity = fixed_decode_cuda_graph_context_capacity(
+            method,
+            max_model_len=max_model_len,
+            h2o_decode_budget=getattr(self.config, "h2o_decode_budget", 0),
+            h2o_decode_eviction_interval=getattr(
+                self.config,
+                "h2o_decode_eviction_interval",
+                0,
+            ),
+        )
+        if fixed_capacity is not None:
+            return int(fixed_capacity)
+        if not method or bool(is_long_text):
+            return max_model_len
+        threshold = decode_sparse_long_text_threshold(
+            method,
+            num_sink_tokens=self.config.num_sink_tokens,
+            decode_keep_tokens=self.config.decode_keep_tokens,
+            num_recent_tokens=self.config.num_recent_tokens,
+        )
+        return min(max_model_len, int(threshold))
+
+    def validate_decode_cuda_graph_context_independent_capacity(
+        self,
+        seqs: list[Sequence],
+        *,
+        capacity: int,
+        is_long_text: bool,
+    ) -> None:
+        """Validate logical capacity when the path is not physically bounded."""
+        method = str(getattr(self.config, "vllm_sparse_method", "") or "")
+        fixed_capacity = fixed_decode_cuda_graph_context_capacity(
+            method,
+            max_model_len=self.config.max_model_len,
+            h2o_decode_budget=getattr(self.config, "h2o_decode_budget", 0),
+            h2o_decode_eviction_interval=getattr(
+                self.config,
+                "h2o_decode_eviction_interval",
+                0,
+            ),
+        )
+        if fixed_capacity is not None:
+            return
+        actual_context_len = max(int(seq.num_tokens) for seq in seqs)
+        if int(capacity) < actual_context_len:
+            raise RuntimeError(
+                "batch-only decode CUDA Graph path capacity does not cover the "
+                f"current request: capacity={capacity}, actual={actual_context_len}, "
+                f"is_long_text={is_long_text}."
+            )
 
     def decode_cuda_graph_force_eager(self) -> bool:
         """Whether this method should bypass graph replay for diagnostics."""
