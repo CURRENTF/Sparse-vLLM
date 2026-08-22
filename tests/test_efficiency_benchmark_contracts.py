@@ -134,7 +134,7 @@ def test_model_specs_accept_nested_explicit_non_factorized_head_dim():
 
 
 def test_model_specs_require_factorized_head_dim_when_not_explicit():
-    with pytest.raises(ValueError, match="without an explicit head_dim"):
+    with pytest.raises(ValueError, match="must define head_dim"):
         ModelArchitectureSpecs.from_config_dict(
             {
                 "hidden_size": 5120,
