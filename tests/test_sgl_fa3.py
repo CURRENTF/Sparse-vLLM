@@ -28,7 +28,7 @@ def test_sgl_fa3_support_rejects_missing_package() -> None:
     assert "sglang-kernel is not installed" in str(exc_info.value)
 
 
-@pytest.mark.parametrize("version", ["0.4.4", "0.4.6"])
+@pytest.mark.parametrize("version", ["0.4.4", "0.5.0"])
 def test_sgl_fa3_support_rejects_outside_declared_range(version: str) -> None:
     with (
         patch("importlib.util.find_spec", return_value=object()),
@@ -38,11 +38,11 @@ def test_sgl_fa3_support_rejects_outside_declared_range(version: str) -> None:
             sgl_fa3_support()
 
     assert exc_info.value.health.state is KernelFamilyState.BROKEN
-    assert "sglang-kernel>=0.4.5,<0.4.6" in str(exc_info.value)
+    assert "sglang-kernel>=0.4.5,<0.5" in str(exc_info.value)
 
 
-def test_sgl_fa3_support_accepts_declared_range() -> None:
-    version = "0.4.5"
+@pytest.mark.parametrize("version", ["0.4.5", "0.4.6.post1"])
+def test_sgl_fa3_support_accepts_declared_range(version: str) -> None:
     op = SimpleNamespace(
         _schema=SimpleNamespace(
             arguments=[

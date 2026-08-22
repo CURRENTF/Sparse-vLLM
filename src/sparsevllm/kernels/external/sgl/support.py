@@ -12,7 +12,7 @@ from sparsevllm.kernels.external.support import (
 )
 
 _MIN_VERSION = (0, 4, 5)
-_MAX_VERSION = (0, 4, 6)
+_MAX_VERSION = (0, 5, 0)
 _DISTRIBUTION = "sglang-kernel"
 
 
@@ -50,7 +50,7 @@ def sgl_kernel_health() -> KernelFamilyHealth:
             _DISTRIBUTION,
             KernelFamilyState.BROKEN,
             version,
-            f"requires {_DISTRIBUTION}>=0.4.5,<0.4.6, got {version}",
+            f"requires {_DISTRIBUTION}>=0.4.5,<0.5, got {version}",
         )
     try:
         importlib.import_module("sgl_kernel")

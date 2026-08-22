@@ -29,6 +29,10 @@ from sparsevllm.models.attention_runtime import (
     build_mha_prefill_attention_op,
 )
 from sparsevllm.operators.moe import model_activation_dtype, resolve_moe_provider
+from sparsevllm.operators.moe_router import (
+    MoeRouterOpSpec,
+    resolve_moe_router_provider,
+)
 from sparsevllm.operators.all_reduce import (
     PreparedAllReduceOp,
     prepare_parallel_all_reduce,
@@ -169,21 +173,25 @@ class MiniMaxM2Router(nn.Module):
         self.e_score_correction_bias = nn.Parameter(
             torch.empty(self.num_experts, dtype=torch.float32)
         )
-        from sparsevllm.kernels.triton.minimax_m2_router import (
-            topk_biased_sigmoid,
+        self.op_spec = MoeRouterOpSpec(
+            num_experts=self.num_experts,
+            top_k=self.top_k,
+            activation_dtype=torch.float32,
+            norm_topk_prob=True,
+            cuda_graph=bool(getattr(config, "decode_cuda_graph", False)),
+            routing_method="biased_sigmoid",
         )
-
-        self.topk_impl = topk_biased_sigmoid
+        self.provider = resolve_moe_router_provider(self.op_spec)
 
     def forward(
         self,
         hidden_states: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         router_logits = F.linear(hidden_states.float(), self.weight)
-        topk_weights, topk_ids = self.topk_impl(
+        topk_weights, topk_ids = self.provider.run(
+            self.op_spec,
             router_logits,
             self.e_score_correction_bias,
-            top_k=self.top_k,
         )
         return router_logits, topk_weights, topk_ids
 

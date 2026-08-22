@@ -25,6 +25,10 @@ from sparsevllm.operators.moe import (
     model_activation_dtype,
     resolve_moe_provider,
 )
+from sparsevllm.operators.moe_router import (
+    MoeRouterOpSpec,
+    resolve_moe_router_provider,
+)
 from sparsevllm.operators.decode_attention import PreparedDecodeAttentionOp
 from sparsevllm.operators.prefill_attention import PreparedPrefillAttentionOp
 from sparsevllm.platforms import device_runtime
@@ -49,9 +53,14 @@ class Qwen3MoeRouter(nn.Module):
         self.num_experts = int(config.num_experts)
         self.top_k = int(config.num_experts_per_tok)
         self.norm_topk_prob = bool(config.norm_topk_prob)
-        from sparsevllm.kernels.triton.moe_topk import topk_softmax
-
-        self.topk_impl = topk_softmax
+        self.op_spec = MoeRouterOpSpec(
+            num_experts=self.num_experts,
+            top_k=self.top_k,
+            activation_dtype=model_activation_dtype(config),
+            norm_topk_prob=self.norm_topk_prob,
+            cuda_graph=bool(getattr(config, "decode_cuda_graph", False)),
+        )
+        self.provider = resolve_moe_router_provider(self.op_spec)
         self.weight = nn.Parameter(torch.empty(self.num_experts, self.hidden_size))
 
     def forward(
@@ -59,11 +68,7 @@ class Qwen3MoeRouter(nn.Module):
         hidden_states: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         router_logits = F.linear(hidden_states, self.weight)
-        topk_weights, topk_ids = self.topk_impl(
-            router_logits,
-            top_k=self.top_k,
-            norm_topk_prob=self.norm_topk_prob,
-        )
+        topk_weights, topk_ids = self.provider.run(self.op_spec, router_logits)
         return router_logits, topk_weights, topk_ids
 
 

@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from sparsevllm.operators.fp8_linear import (
     FlashInferGroupwiseSm120Fp8LinearProvider,
     Fp8LinearSpec,
+    _sm120_activation_workspace,
     resolve_fp8_linear_provider,
 )
 from sparsevllm.platforms import current_platform
@@ -178,6 +179,29 @@ def test_flashinfer_sm120_fp8_linear_cuda_graph_replay():
 
     expected = fp8_blockwise_linear_reference(inputs, weight, scales)
     _assert_fp8_pipeline_close(actual, expected)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() != (12, 0),
+    reason="FlashInfer groupwise FP8 Linear requires SM120",
+)
+def test_sm120_fp8_linear_reuses_geometric_activation_workspace():
+    device = torch.device("cuda")
+    first = torch.empty((513, 640), device=device, dtype=torch.bfloat16)
+    second = torch.empty((600, 640), device=device, dtype=torch.bfloat16)
+
+    first_quantized, first_scales = _sm120_activation_workspace(first)
+    second_quantized, second_scales = _sm120_activation_workspace(second)
+
+    assert first_quantized.untyped_storage().data_ptr() == (
+        second_quantized.untyped_storage().data_ptr()
+    )
+    assert first_scales.untyped_storage().data_ptr() == (
+        second_scales.untyped_storage().data_ptr()
+    )
+    assert first_quantized.shape == (513, 640)
+    assert second_quantized.shape == (600, 640)
 
 
 @pytest.mark.skipif(

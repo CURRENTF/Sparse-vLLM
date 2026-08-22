@@ -64,13 +64,14 @@ def test_h100_selects_fixed_flashinfer_prefill_triton_decode_plan(_support):
     resolved = OpResolver(GATED_DELTA_RULE_REGISTRY).resolve(_spec(), _caps())
 
     assert isinstance(resolved.provider, FlashInferSm90GatedDeltaRuleProvider)
-    metadata = dict(resolved.report.provider_metadata.items)
+    metadata = resolved.report.as_dict()["provider_metadata"]
     assert metadata["implementation_kind"] == "atomic_provider"
     assert "flashinfer.gdn_prefill" in metadata["prefill_kernel_path"]
     assert "fused_recurrent" in metadata["decode_kernel_path"]
     assert metadata["runtime_state_layout"] == "k_major_hkv"
     assert metadata["prefill_state_layout"] == "v_major_hvk"
     assert metadata["state_layout_adapter"] == "transpose_last_two_dims"
+    assert "triton.qwen3_5.gated_rmsnorm" in metadata["auxiliary_kernel_paths"]
 
 
 def test_non_sm90_selects_repo_triton_plan_without_probing_flashinfer():
@@ -280,6 +281,24 @@ def test_prepared_gdn_operator_rejects_calls_after_close():
         prepared.run_decode()
 
 
+def test_prepared_gdn_operator_forwards_auxiliary_pipeline_without_dispatch():
+    provider = Mock(name="provider")
+    provider.name = "test"
+    provider.run_gating.return_value = ("g", "beta")
+    provider.run_prefill_conv.return_value = "conv"
+    provider.prepare_decode_inputs.return_value = ("q", "k", "v", "z", "a", "b")
+    provider.run_gated_rmsnorm.return_value = "norm"
+    prepared = PreparedGatedDeltaRuleOp(_spec(), provider)
+
+    assert prepared.run_gating(A_log=1, a=2, b=3, dt_bias=4) == ("g", "beta")
+    assert prepared.run_prefill_conv(mixed_qkv=1) == "conv"
+    assert prepared.prepare_decode_inputs(mixed_qkv=1) == (
+        "q", "k", "v", "z", "a", "b"
+    )
+    assert prepared.run_gated_rmsnorm(x=1) == "norm"
+    provider.run_gating.assert_called_once_with(A_log=1, a=2, b=3, dt_bias=4)
+
+
 def test_model_runtime_builds_and_binds_one_shared_gdn_operator():
     config = SimpleNamespace(
         linear_num_key_heads=4,
@@ -295,6 +314,7 @@ def test_model_runtime_builds_and_binds_one_shared_gdn_operator():
     root.first.is_gated_delta_rule_layer = True
     root.second = nn.Module()
     root.second.is_gated_delta_rule_layer = True
+    root.second.bind_gated_delta_rule_op = Mock()
 
     with patch(
         "sparsevllm.models.gdn_runtime.prepare_gated_delta_rule_op",
@@ -314,4 +334,4 @@ def test_model_runtime_builds_and_binds_one_shared_gdn_operator():
     assert prepare.call_args.kwargs == {"device_index": 3}
     assert bind_gated_delta_rule_op(root, prepared) == 2
     assert root.first.gated_delta_rule_op is prepared
-    assert root.second.gated_delta_rule_op is prepared
+    root.second.bind_gated_delta_rule_op.assert_called_once_with(prepared)

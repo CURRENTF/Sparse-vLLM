@@ -38,6 +38,7 @@ from sparsevllm.operators.prefill_attention import (
     SglFa3PagedPrefillAttentionProvider,
     TilelangGqaPagedPrefillAttentionProvider,
     TritonPagedPrefillAttentionProvider,
+    _FlashInferPagedPrefillState,
 )
 from sparsevllm.operators.attention_capabilities import AttentionScoreKind
 from sparsevllm.operators.registry import OpResolver
@@ -606,7 +607,11 @@ def test_flashinfer_fa2_sm120_prepare_binds_fa2_backend():
 def test_flashinfer_prefill_passes_kv_cache_as_page_views_without_copying():
     wrapper = SimpleNamespace(run=Mock())
     provider = FlashInferPagedPrefillAttentionProvider()
-    provider._state = SimpleNamespace(planned=True, wrapper=wrapper)
+    provider._state = SimpleNamespace(
+        plan_scope=None,
+        plan=Mock(),
+        wrapper=wrapper,
+    )
     q = torch.empty(1, 12, 128, dtype=torch.bfloat16)
     k_cache = torch.empty(5, 2, 128, dtype=torch.bfloat16)
     v_cache = torch.empty_like(k_cache)
@@ -619,21 +624,101 @@ def test_flashinfer_prefill_passes_kv_cache_as_page_views_without_copying():
         attn_score=None,
     )
 
-    provider.run(
-        _spec(),
-        q,
-        view,
-        qo_indptr=torch.tensor([0, 1], dtype=torch.int32),
-        chunk_lens=torch.tensor([1], dtype=torch.int32),
-        max_context_len=2,
-        layer_idx=1,
-    )
+    plan_scope = object()
+    provider._state.plan_scope = plan_scope
+    with patch(
+        "sparsevllm.utils.context.get_context",
+        return_value=SimpleNamespace(attention_validation_scope=plan_scope),
+    ):
+        provider.run(
+            _spec(),
+            q,
+            view,
+            qo_indptr=torch.tensor([0, 1], dtype=torch.int32),
+            chunk_lens=torch.tensor([1], dtype=torch.int32),
+            max_context_len=2,
+            layer_idx=1,
+        )
 
+    provider._state.plan.assert_not_called()
     paged_k, paged_v = wrapper.run.call_args.args[1]
     assert paged_k.shape == (5, 1, 2, 128)
     assert paged_v.shape == (5, 1, 2, 128)
     assert paged_k.data_ptr() == k_cache.data_ptr()
     assert paged_v.data_ptr() == v_cache.data_ptr()
+
+
+def test_flashinfer_prefill_plans_on_first_full_attention_call_per_step():
+    wrapper = SimpleNamespace(plan=Mock(), run=Mock())
+    state = object.__new__(_FlashInferPagedPrefillState)
+    state.wrapper = wrapper
+    state.plan_scope = None
+    provider = FlashInferFa2Sm120PagedPrefillAttentionProvider()
+    provider._state = state
+    spec = _spec(
+        num_query_heads=24,
+        num_kv_heads=4,
+        head_dim=256,
+        softmax_scale=256**-0.5,
+    )
+    q = torch.empty(1, 24, 256, dtype=torch.bfloat16)
+    view = SimpleNamespace(
+        k_cache=torch.empty(5, 4, 256, dtype=torch.bfloat16),
+        v_cache=torch.empty(5, 4, 256, dtype=torch.bfloat16),
+        active_slots=torch.tensor([[4, 1]], dtype=torch.int32),
+        req_indices=torch.tensor([0], dtype=torch.int32),
+        context_lens=torch.tensor([2], dtype=torch.int32),
+        attn_score=None,
+    )
+    qo_indptr = torch.tensor([0, 1], dtype=torch.int32)
+    chunk_lens = torch.tensor([1], dtype=torch.int32)
+    context = SimpleNamespace(attention_validation_scope=object())
+
+    with patch("sparsevllm.utils.context.get_context", return_value=context):
+        provider.run(
+            spec,
+            q,
+            view,
+            qo_indptr=qo_indptr,
+            chunk_lens=chunk_lens,
+            max_context_len=2,
+            layer_idx=3,
+        )
+        provider.run(
+            spec,
+            q,
+            view,
+            qo_indptr=qo_indptr,
+            chunk_lens=chunk_lens,
+            max_context_len=2,
+            layer_idx=7,
+        )
+        first_scope = context.attention_validation_scope
+        context.attention_validation_scope = object()
+        view.active_slots = torch.tensor([[2, 3]], dtype=torch.int32)
+        view.context_lens = torch.tensor([1], dtype=torch.int32)
+        provider.run(
+            spec,
+            q,
+            view,
+            qo_indptr=qo_indptr,
+            chunk_lens=chunk_lens,
+            max_context_len=1,
+            layer_idx=3,
+        )
+
+    assert wrapper.plan.call_count == 2
+    torch.testing.assert_close(
+        wrapper.plan.call_args_list[0].args[2],
+        torch.tensor([4, 1], dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        wrapper.plan.call_args_list[1].args[2],
+        torch.tensor([2], dtype=torch.int32),
+    )
+    assert first_scope is not context.attention_validation_scope
+    assert state.plan_scope is context.attention_validation_scope
+    assert wrapper.run.call_count == 3
 
 
 def test_sgl_fa3_prefill_passes_token_page_view_without_copying():

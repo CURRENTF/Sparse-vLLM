@@ -123,6 +123,14 @@ The probe wrapper recognizes these model aliases:
 | `qwen3_8b` | `Qwen/Qwen3-8B` | 1 |
 | `qwen25_7b` | `Qwen/Qwen2.5-7B-Instruct-1M` | 1 |
 
+Sparse method parameters are resolved from
+`benchmark/sparsevllm_regression/manifest.json`, including model-specific
+OmniKV full-attention layers. An OmniKV run fails before model loading when the
+model has no calibrated manifest entry. For an explicitly calibrated custom
+model, set `BENCH_MANIFEST_MODEL_ID`; for a one-off external calibration, set
+`OMNIKV_FULL_ATTENTION_LAYERS`. A single-layer OmniKV configuration is rejected
+unless the standalone Python runner's explicit ablation flag is used.
+
 `MODEL_PATH` can override the model ID associated with an alias. The probe
 wrapper currently fixes TP from the alias and uses TP=2 for an arbitrary model
 path. Use the standalone CLI for explicit TP sweeps.
@@ -261,9 +269,15 @@ benchmark mode in this entrypoint.
 - Churn metrics compare the oversubscribed workload with its matched fixed-batch
   setting, including throughput ratio and tail-TTFT change.
 
-Use the same model checkpoint, code revision, engine configuration, TP, seed,
-lengths, scheduler token budget, warmups, and iteration count before treating
-rows as matched.
+Use the same model checkpoint, benchmark trace/metric contract, engine
+configuration, TP, seed, lengths, scheduler token budget, warmups, and
+iteration count before treating rows as matched.
+
+A successful vLLM sweep is an immutable baseline artifact. Reuse it for later
+Sparse-vLLM candidates instead of rerunning vLLM on every code change. Create a
+new baseline only when the GPU model, checkpoint, TP, request trace, scheduler
+budget, graph/backend policy, or metric contract changes; record package
+versions for provenance without silently overwriting an older baseline.
 
 ## Artifacts and Verification
 
@@ -271,13 +285,14 @@ Each standalone or per-system wrapper output contains:
 
 | Artifact | Meaning |
 | --- | --- |
-| `run_manifest.json` | Command, Git state, arguments, environment, model metadata, workload contract, and final status. |
+| `run_manifest.json` | Command, Git state, arguments, package/GPU environment, model metadata, workload contract, and final status. |
 | `run_status.json` | Terminal success or failure status. |
 | `raw_samples.jsonl` | One record per measured synthetic iteration. |
 | `request_samples.jsonl` | Per-request trace metadata and status. |
 | `summary.json` | Aggregated rows and terminal status. |
 | `comparison_report.md` | Human-readable metric table. |
 | `case_hardware/*.json` | Per-case sampled GPU timeline and summary. |
+| `operator_runtime_stats.json` | Sparse fixed-batch Provider bindings, rejection reasons, and observed runtime kernel paths. |
 
 Do not report a run as complete from terminal output alone. Check at least:
 

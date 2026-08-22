@@ -227,7 +227,7 @@ class FlashInferPagedPrefillAttentionProvider(PrefillAttentionProvider):
         max_context_len,
         layer_idx,
     ):
-        del chunk_lens
+        del chunk_lens, layer_idx
         payload, meta = _view_parts(view)
         _validate_token_page_table(meta)
         if self._state is None:
@@ -243,7 +243,10 @@ class FlashInferPagedPrefillAttentionProvider(PrefillAttentionProvider):
                 "FlashInfer paged prefill requires Q/K/V with the same dtype, got "
                 f"{q.dtype}/{payload.k_cache.dtype}/{payload.v_cache.dtype}."
             )
-        if layer_idx == 0:
+        from sparsevllm.utils.context import get_context
+
+        plan_scope = get_context().attention_validation_scope
+        if state.plan_scope is not plan_scope:
             state.plan(
                 spec,
                 qo_indptr=qo_indptr,
@@ -251,10 +254,7 @@ class FlashInferPagedPrefillAttentionProvider(PrefillAttentionProvider):
                 req_indices=meta.req_indices,
                 context_lens=meta.context_lens,
                 max_context_len=max_context_len,
-            )
-        elif not state.planned:
-            raise RuntimeError(
-                "FlashInfer paged prefill reached a nonzero layer before layer-0 planning."
+                plan_scope=plan_scope,
             )
         output = torch.empty_like(q)
         state.wrapper.run(
@@ -279,7 +279,7 @@ class _FlashInferPagedPrefillState:
             self.workspace,
             backend=backend,
         )
-        self.planned = False
+        self.plan_scope: object | None = None
 
     def plan(
         self,
@@ -290,6 +290,7 @@ class _FlashInferPagedPrefillState:
         req_indices: torch.Tensor,
         context_lens: torch.Tensor,
         max_context_len: int,
+        plan_scope: object,
     ) -> None:
         if active_slots.dim() != 2:
             raise ValueError(
@@ -342,7 +343,7 @@ class _FlashInferPagedPrefillState:
             kv_data_type=spec.activation_dtype,
             non_blocking=True,
         )
-        self.planned = True
+        self.plan_scope = plan_scope
 
 
 @PREFILL_ATTENTION_REGISTRY.register

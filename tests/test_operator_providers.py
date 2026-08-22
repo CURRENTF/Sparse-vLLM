@@ -24,6 +24,7 @@ from sparsevllm.operators.fp8_linear import (
     Fp8LinearSpec,
     Sm120Fp8LinearDispatchPlan,
     TritonFp8LinearProvider,
+    _sm120_activation_workspace,
     resolve_fp8_linear_provider,
 )
 from sparsevllm.operators.gate_up_swiglu import (
@@ -330,7 +331,13 @@ def test_h20_gate_up_provider_accepts_profiled_qwen36_shape(tp_size):
         _cuda_caps((9, 0), device_name="NVIDIA H20"),
     )
 
-    assert resolved.provider.name == "h20_triton_decode"
+    assert resolved.provider.name == "h20_gate_up_dispatch_plan"
+    metadata = resolved.report.as_dict()["provider_metadata"]
+    assert metadata["implementation_kind"] == "dispatch_plan"
+    assert [route["provider"] for route in metadata["routes"]] == [
+        "h20_triton_decode",
+        "native",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -493,13 +500,25 @@ def test_fp8_linear_uses_model_independent_profile_on_sm120():
             ),
             "source_repository": "Sparse-vLLM",
             "source_revision": "bcc93aa+uncommitted-unified-provider-refactor",
+            "reproducibility": (
+                "provisional: source worktree was dirty and no standalone "
+                "patch digest was recorded"
+            ),
             "source_state": (
                 "Benchmarked the atomic Triton and FlashInfer groupwise Providers "
                 "before extending this dispatch profile; run artifacts record the "
                 "dirty git state"
             ),
         },
-        "profile_status": "tuned",
+        "profile_status": "provisional",
+        "profile_toolchain_match": True,
+        "profiled_toolchain": {
+            "cuda_runtime": "13.0",
+            "flashinfer_python": "0.6.15.post1",
+            "sglang_kernel": "0.4.5",
+            "torch": "2.11",
+            "triton": "3.6",
+        },
         "routes": [
             {
                 "max_tokens": 511,
@@ -519,6 +538,7 @@ def test_fp8_linear_uses_model_independent_profile_on_sm120():
                         "sglang-kernel:sgl_per_token_group_quant_8bit"
                     ),
                     "activation_scale_layout": "K-major_per_token_group128",
+                    "activation_workspace": "shared_geometric_warmup_cache",
                     "gemm": "flashinfer:gemm_fp8_nt_groupwise",
                     "implementation_kind": "atomic_provider",
                     "weight_layout_id": "block_128x128_nt_k_major",
@@ -526,7 +546,74 @@ def test_fp8_linear_uses_model_independent_profile_on_sm120():
                 },
             },
         ],
+        "runtime_toolchain": {
+            "cuda_runtime": "13.0",
+            "flashinfer_python": "0.6.15.post1",
+            "sglang_kernel": "0.4.5",
+            "torch": "2.11",
+            "triton": "3.6",
+        },
         "weight_layout_id": "block_128x128_nt_k_major",
+    }
+
+
+def test_fp8_linear_profile_accepts_api_compatible_toolchain_upgrade():
+    upgraded_flashinfer = KernelFamilyHealth(
+        family="flashinfer-python",
+        state=KernelFamilyState.READY,
+        version="0.6.17",
+        reason="ready",
+    )
+    upgraded_sgl = KernelFamilyHealth(
+        family="sglang-kernel",
+        state=KernelFamilyState.READY,
+        version="0.4.6.post1",
+        reason="ready",
+    )
+    with (
+        patch(
+            "sparsevllm.kernels.external.flashinfer.support.flashinfer_kernel_health",
+            return_value=upgraded_flashinfer,
+        ),
+        patch(
+            "sparsevllm.kernels.external.sgl.support.sgl_kernel_health",
+            return_value=upgraded_sgl,
+        ),
+        patch("torch.__version__", "2.12.0"),
+        patch("triton.__version__", "3.7.0"),
+    ):
+        resolved = OpResolver(FP8_LINEAR_REGISTRY).resolve(
+            _linear_spec(input_features=2048, output_features=5120),
+            _cuda_caps(
+                (12, 0),
+                runtime_version="13.1",
+                device_name="NVIDIA RTX PRO 6000 Blackwell Server Edition",
+            ),
+        )
+
+    metadata = resolved.report.as_dict()["provider_metadata"]
+    assert resolved.provider.name == "sm120_fp8_linear_dispatch_plan"
+    assert metadata["profile_toolchain_match"] is False
+
+
+def test_sm120_fp8_linear_requires_workspace_warmup_before_capture():
+    inputs = torch.empty((3, 896), dtype=torch.bfloat16)
+
+    with patch(
+        "sparsevllm.operators.fp8_linear.device_runtime.is_stream_capturing",
+        return_value=True,
+    ):
+        with pytest.raises(
+            RuntimeError,
+            match="activation workspace was not created during warmup",
+        ):
+            _sm120_activation_workspace(inputs)
+    assert metadata["runtime_toolchain"] == {
+        "cuda_runtime": "13.1",
+        "flashinfer_python": "0.6.17",
+        "sglang_kernel": "0.4.6.post1",
+        "torch": "2.12",
+        "triton": "3.7",
     }
 
 

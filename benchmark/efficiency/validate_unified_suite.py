@@ -20,6 +20,101 @@ SYSTEM_PROTOCOLS = {
 }
 
 
+def _layer_ids(value: Any) -> list[int] | None:
+    if isinstance(value, str):
+        try:
+            return [int(part.strip()) for part in value.split(",") if part.strip()]
+        except ValueError:
+            return None
+    if isinstance(value, list) and not any(isinstance(item, bool) for item in value):
+        try:
+            return [int(item) for item in value]
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _validate_omnikv_runtime_config(
+    config: dict[str, Any],
+    *,
+    system: str,
+    errors: list[str],
+) -> None:
+    effective = config.get("effective_runtime")
+    benchmark_config = (
+        effective.get("benchmark_config") if isinstance(effective, dict) else None
+    )
+    if not isinstance(benchmark_config, dict):
+        errors.append(
+            f"missing effective OmniKV runtime config for {system}; "
+            "resolved_config.json must record worker_info benchmark_config"
+        )
+        return
+    full_layers = benchmark_config.get("full_attn_layers")
+    obs_layers = benchmark_config.get("obs_layer_ids")
+    effective_layers = _layer_ids(full_layers)
+    requested = config.get("requested_runtime")
+    normalized = (
+        requested.get("normalized") if isinstance(requested, dict) else None
+    )
+    requested_layers = _layer_ids(
+        normalized.get("full_attn_layers")
+        if isinstance(normalized, dict)
+        else None
+    )
+    if effective_layers is None or len(effective_layers) <= 1:
+        errors.append(
+            f"invalid OmniKV full_attn_layers for {system}: {full_layers!r}"
+        )
+    if requested_layers is None:
+        errors.append(
+            f"missing requested OmniKV full_attn_layers for {system}: "
+            f"{requested!r}"
+        )
+    elif effective_layers is not None and requested_layers != effective_layers:
+        errors.append(
+            f"OmniKV full-attention layer mismatch for {system}: "
+            f"requested={requested_layers} effective={effective_layers}"
+        )
+    if not isinstance(obs_layers, list) or not obs_layers:
+        errors.append(f"invalid OmniKV obs_layer_ids for {system}: {obs_layers!r}")
+
+
+def _validate_sparse_operator_stats(
+    system_dir: Path,
+    *,
+    system: str,
+    errors: list[str],
+) -> None:
+    stats = _read_json(system_dir / "operator_runtime_stats.json", errors)
+    if stats is None:
+        return
+    if stats.get("status") != "success":
+        errors.append(f"failed operator runtime stats for {system}: {stats}")
+    ranks = stats.get("world_ranks")
+    if not isinstance(ranks, list) or not ranks:
+        errors.append(f"empty operator runtime stats for {system}")
+        return
+    for index, rank in enumerate(ranks):
+        bindings = rank.get("bindings") if isinstance(rank, dict) else None
+        if not isinstance(bindings, list) or not bindings:
+            errors.append(
+                f"missing provider bindings in operator runtime stats "
+                f"for {system} rank[{index}]"
+            )
+            continue
+        invalid = [
+            binding
+            for binding in bindings
+            if not isinstance(binding, dict) or not binding.get("selected_provider")
+        ]
+        if invalid:
+            errors.append(
+                f"invalid provider binding records for {system} rank[{index}]: "
+                f"{invalid}"
+            )
+
+
 def _read_json(path: Path, errors: list[str]) -> dict[str, Any] | None:
     if not path.is_file():
         errors.append(f"missing artifact: {path}")
@@ -179,6 +274,7 @@ def validate_suite(
     scenario_a_rows: dict[str, list[dict[str, Any]]] = {}
     scenario_a_traces: dict[str, dict[str, dict[str, list[Any]]]] = {}
     scenario_b_hardware: dict[str, dict[str, Any]] = {}
+    scenario_b_seeds: dict[str, int] = {}
 
     unknown_systems = [system for system in systems if system not in SYSTEM_PROTOCOLS]
     if unknown_systems:
@@ -251,6 +347,12 @@ def validate_suite(
                     )
                 actual_engine = config.get("engine")
                 actual_method = config.get("sparse_method")
+                if actual_engine == "sparsevllm":
+                    _validate_sparse_operator_stats(
+                        system_dir,
+                        system=system,
+                        errors=errors,
+                    )
             else:
                 provenance = _read_json(system_dir / "resolved_config.json", errors)
                 config = provenance if provenance is not None else {}
@@ -260,6 +362,30 @@ def validate_suite(
                     if actual_engine == "sparsevllm"
                     else "vanilla"
                 )
+                args = config.get("args")
+                seed = args.get("seed") if isinstance(args, dict) else None
+                if not isinstance(seed, int):
+                    errors.append(f"missing LongBench seed for {system}: {seed!r}")
+                else:
+                    scenario_b_seeds[system] = seed
+                if actual_engine == "vllm":
+                    prefix_enabled = (
+                        args.get("enable_prefix_caching")
+                        if isinstance(args, dict)
+                        else None
+                    )
+                else:
+                    effective = config.get("effective_runtime")
+                    prefix_enabled = (
+                        effective.get("prefix_cache_enabled")
+                        if isinstance(effective, dict)
+                        else None
+                    )
+                if prefix_enabled is not False:
+                    errors.append(
+                        f"LongBench prefix caching is missing or enabled for {system}: "
+                        f"{prefix_enabled!r}"
+                    )
             if provenance is not None and (
                 actual_engine != expected_engine or actual_method != expected_method
             ):
@@ -267,6 +393,16 @@ def validate_suite(
                     f"protocol mismatch {scenario}/{system}: "
                     f"actual={actual_engine}/{actual_method} "
                     f"expected={expected_engine}/{expected_method}"
+                )
+            if (
+                scenario == "scenario_b_longbench"
+                and actual_engine == "sparsevllm"
+                and actual_method == "omnikv"
+            ):
+                _validate_omnikv_runtime_config(
+                    config,
+                    system=system,
+                    errors=errors,
                 )
 
     coverage = validate_longbench_coverage(
@@ -282,6 +418,8 @@ def validate_suite(
             reference_traces = traces
         elif traces != reference_traces:
             errors.append(f"synthetic random traces differ for system={system}")
+    if scenario_b_seeds and len(set(scenario_b_seeds.values())) != 1:
+        errors.append(f"LongBench seeds differ across systems: {scenario_b_seeds}")
 
     return {
         "status": "failed" if errors else "success",

@@ -12,6 +12,7 @@ from benchmark.efficiency.bench_probe import (
     _actual_hardware_metrics,
     _attach_churn_comparisons,
     _attach_saturation_metrics,
+    _physical_gpu_metadata,
     _record_batch_first_tokens,
     _resolve_sparse_probe_protocol,
     _vllm_phase_metrics,
@@ -53,6 +54,26 @@ def test_probe_cli_parser_builds_with_new_workload_options(monkeypatch):
     assert args.scenario == "all"
     assert args.batch_sizes == [1, 4]
     assert args.churn_request_multiplier == 4
+
+
+def test_physical_gpu_metadata_uses_nvidia_smi_without_cuda_init(monkeypatch):
+    monkeypatch.setattr(
+        bench_probe.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            stdout="1, NVIDIA H100 80GB HBM3, 9.0, 81559, 590.44\n"
+        ),
+    )
+
+    assert _physical_gpu_metadata([1]) == [
+        {
+            "physical_device_index": 1,
+            "name": "NVIDIA H100 80GB HBM3",
+            "compute_capability": [9, 0],
+            "total_memory_mib": 81559,
+            "driver_version": "590.44",
+        }
+    ]
 
 
 def test_unknown_hardware_does_not_fall_back_to_h100():
@@ -342,6 +363,37 @@ def test_h2o_probe_records_explicit_budget_protocol():
     assert protocol["score_mode"] == "probability"
     assert protocol["max_num_batched_tokens"] == 8192
     assert "h2o-probability-decode4096-prefill8192-window128" in label
+
+
+def test_omnikv_probe_requires_explicit_calibrated_layers():
+    args = SimpleNamespace(
+        hyper_params="{}",
+        tensor_parallel_size=1,
+        gpu_memory_utilization=0.85,
+        max_num_batched_tokens=8192,
+        sparse_method="omnikv",
+        sparse_prefill_score_mode=None,
+        allow_single_omnikv_full_layer=False,
+    )
+
+    with pytest.raises(ValueError, match="explicit calibrated method config"):
+        _resolve_sparse_probe_protocol(args)
+
+    args.hyper_params = json.dumps(
+        {
+            "engine_prefill_chunk_size": 16384,
+            "full_attention_layers": "0,2,4,11,16,22",
+            "sink_keep_tokens": 0,
+            "recent_keep_tokens": 32,
+            "decode_keep_tokens": 2048,
+            "pool_kernel_size": 1,
+        }
+    )
+    hyper, budget, _protocol, label = _resolve_sparse_probe_protocol(args)
+
+    assert hyper["full_attention_layers"] == "0,2,4,11,16,22"
+    assert budget is None
+    assert label == "sparsevllm-omnikv"
 
 
 def test_random_trace_is_matched_reproducible_and_variable_length():
@@ -644,6 +696,27 @@ def _write_valid_suite_fixture(root: Path, systems: list[str]) -> None:
                     )
                     + "\n"
                 )
+                if engine == "sparsevllm":
+                    (system_dir / "operator_runtime_stats.json").write_text(
+                        json.dumps(
+                            {
+                                "status": "success",
+                                "world_ranks": [
+                                    {
+                                        "world_rank": 0,
+                                        "bindings": [
+                                            {
+                                                "operator_type": "test",
+                                                "selected_provider": "test_provider",
+                                            }
+                                        ],
+                                        "operators": {},
+                                    }
+                                ],
+                            }
+                        )
+                        + "\n"
+                    )
             else:
                 (system_dir / "result.json").write_text(
                     json.dumps({"status": "success"}) + "\n"
@@ -651,9 +724,28 @@ def _write_valid_suite_fixture(root: Path, systems: list[str]) -> None:
                 (system_dir / "task.jsonl").write_text(
                     json.dumps({"status": "success", "source_idx": 0}) + "\n"
                 )
-                resolved = {"backend": engine}
+                resolved = {
+                    "backend": engine,
+                    "args": {
+                        "seed": 42,
+                        "enable_prefix_caching": False,
+                    },
+                }
                 if engine == "sparsevllm":
                     resolved["sparse_method"] = method
+                    resolved["effective_runtime"] = {
+                        "prefix_cache_enabled": False,
+                    }
+                if method == "omnikv":
+                    resolved["requested_runtime"] = {
+                        "normalized": {
+                            "full_attn_layers": "0,2,4,11,16,22",
+                        },
+                    }
+                    resolved["effective_runtime"]["benchmark_config"] = {
+                        "full_attn_layers": [0, 2, 4, 11, 16, 22],
+                        "obs_layer_ids": [0, 2, 4, 11, 16, 22],
+                    }
                 (system_dir / "resolved_config.json").write_text(
                     json.dumps(resolved) + "\n"
                 )
@@ -695,6 +787,57 @@ def test_unified_suite_validator_rejects_method_label_mismatch(tmp_path):
 
     assert report["status"] == "failed"
     assert any("protocol mismatch" in error for error in report["errors"])
+
+
+def test_unified_suite_validator_rejects_single_layer_omnikv_runtime(tmp_path):
+    systems = ["svllm-omnikv"]
+    _write_valid_suite_fixture(tmp_path, systems)
+    resolved_path = tmp_path / "scenario_b_longbench/svllm-omnikv/resolved_config.json"
+    resolved = json.loads(resolved_path.read_text())
+    resolved["effective_runtime"]["benchmark_config"]["full_attn_layers"] = [0]
+    resolved_path.write_text(json.dumps(resolved) + "\n")
+
+    report = validate_suite(tmp_path, systems, ["task"], 1)
+
+    assert report["status"] == "failed"
+    assert any("invalid OmniKV full_attn_layers" in error for error in report["errors"])
+
+
+def test_unified_suite_validator_rejects_omnikv_requested_effective_mismatch(
+    tmp_path,
+):
+    systems = ["svllm-omnikv"]
+    _write_valid_suite_fixture(tmp_path, systems)
+    resolved_path = tmp_path / "scenario_b_longbench/svllm-omnikv/resolved_config.json"
+    resolved = json.loads(resolved_path.read_text())
+    resolved["effective_runtime"]["benchmark_config"]["full_attn_layers"] = [
+        0,
+        3,
+        9,
+    ]
+    resolved_path.write_text(json.dumps(resolved) + "\n")
+
+    report = validate_suite(tmp_path, systems, ["task"], 1)
+
+    assert report["status"] == "failed"
+    assert any("layer mismatch" in error for error in report["errors"])
+
+
+def test_unified_suite_validator_requires_sparse_operator_bindings(tmp_path):
+    systems = ["svllm-vanilla"]
+    _write_valid_suite_fixture(tmp_path, systems)
+    stats_path = (
+        tmp_path
+        / "scenario_a_synthetic/svllm-vanilla/operator_runtime_stats.json"
+    )
+    stats_path.write_text(
+        json.dumps({"status": "success", "world_ranks": []}) + "\n"
+    )
+
+    report = validate_suite(tmp_path, systems, ["task"], 1)
+
+    assert report["status"] == "failed"
+    assert any("empty operator runtime stats" in error for error in report["errors"])
 
 
 def test_unified_suite_validator_requires_identical_random_traces(tmp_path):

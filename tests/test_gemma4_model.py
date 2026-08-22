@@ -130,9 +130,14 @@ def test_gemma4_moe_torch_oracle_is_not_a_production_fallback():
     assert TorchGemma4MoeProvider not in GEMMA4_MOE_REGISTRY.providers
 
 
-@patch("sparsevllm.operators.gemma4.version", return_value="0.6.15")
-@patch("sparsevllm.operators.gemma4.find_spec", return_value=object())
-def test_gemma4_h20_prefers_dedicated_flashinfer_prefill(_find, _version):
+@patch(
+    "sparsevllm.operators.gemma4.flashinfer_paged_prefill_support",
+    return_value=(True, "validated"),
+)
+@patch(
+    "sparsevllm.operators.gemma4_attention.Gemma4FlashInferPrefill.prepare"
+)
+def test_gemma4_h20_prefers_dedicated_flashinfer_prefill(_prepare, _support):
     caps = DeviceCaps(
         platform=PlatformEnum.CUDA,
         device_type="cuda",

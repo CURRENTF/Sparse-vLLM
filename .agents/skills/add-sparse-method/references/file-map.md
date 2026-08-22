@@ -1,64 +1,90 @@
-# File Map
+# Architecture And Integration Map
 
-Use this map to decide which repo files must change when adding a new Sparse-vLLM method.
+Use this map to locate architectural owners. "Inspect" does not mean "edit": a new method should touch only the boundaries whose contracts actually change.
 
-## Always Review
+## Public Configuration
 
-- `src/sparsevllm/config.py`
-- `src/sparsevllm/engine/cache_manager/base.py`
-- `src/sparsevllm/layers/attention.py`
-- `src/sparsevllm/engine/sparse_controller.py`
-- `README.md`
+| Concern | Primary source | Expected use |
+| --- | --- | --- |
+| Public parameter normalization | `src/sparsevllm/configs/runtime_params.py` | Map public `sparse_method` to canonical internal state; reject legacy/conflicting fields. |
+| Config composition | `src/sparsevllm/configs/groups.py` | Understand how focused config groups are assembled. |
+| Sparse semantics | `src/sparsevllm/configs/sparse.py` | Validate sparse-specific values and derived settings. |
+| Model/layout compatibility | `src/sparsevllm/configs/model.py` | Inspect model-derived storage and attention properties. |
+| Scheduling semantics | `src/sparsevllm/configs/scheduling.py` | Inspect prefill/decode scheduling constraints. |
+| Prefix and graph settings | `src/sparsevllm/configs/prefix_cache.py`, `src/sparsevllm/configs/cuda_graph.py` | Validate lifecycle combinations. |
+| Compatibility facade | `src/sparsevllm/config.py` | Inspect imports only; do not place new config ownership here. |
 
-## Add a First-Class Method
+## Static Method Contract
 
-Touch these files when the method becomes a supported `vllm_sparse_method`.
+Inspect `src/sparsevllm/method_registry.py` for:
 
-- `src/sparsevllm/config.py`
-  Add config fields, validation, and defaults.
-- `src/sparsevllm/engine/cache_manager/<method>.py`
-  Put method state, metadata, cache layout, and decode-time hooks here.
-- `src/sparsevllm/engine/cache_manager/base.py`
-  Register `CacheManager.create(...)` routing and add generic hooks only if the existing hooks are insufficient.
-- `src/sparsevllm/engine/cache_manager/__init__.py`
-  Export the new cache manager when appropriate.
-- `README.md`
-  Document method semantics, knobs, and benchmark examples.
+- aliases and canonical names;
+- prefill schedule defaults;
+- prefill/decode attention-score contracts;
+- model and parallel-topology compatibility;
+- prefix-cache and decode CUDA Graph support;
+- external asset requirements.
 
-## Touch `SparseController` Only for Controller Work
+The registry describes static capabilities. Do not put mutable runtime state or allocation policy there.
 
-Edit `src/sparsevllm/engine/sparse_controller.py` when the method:
+## Runtime Construction And Control Plane
 
-- reuses observed attention scores
-- needs cross-layer propagation
-- shares dynamic logical views with other layers
-- changes scheduler-facing sparse state
+| Owner | Typical responsibilities |
+| --- | --- |
+| `src/sparsevllm/engine/model_runner.py` | Construct and connect generic runtime components. Inspect wiring; avoid method-name branches. |
+| `src/sparsevllm/engine/runtime_state.py` | Expose runtime capacity, lifecycle, and scheduling-facing state. |
+| `src/sparsevllm/engine/cache_manager/factory.py` | Select the registered cache manager implementation. |
+| `src/sparsevllm/engine/cache_manager/base.py` | Shared allocation, typed view, and lifecycle contracts. Extend narrowly. |
+| `src/sparsevllm/engine/cache_manager/` | Persistent method state, physical mutation, metadata, and view materialization. |
+| `src/sparsevllm/engine/sparse_controller.py` | Per-step/cross-layer score and selection orchestration. |
+| `src/sparsevllm/engine/activation_controller.py` | Hidden-state capture and activation-based method state. |
+| `src/sparsevllm/engine/scheduler.py` via `MemoryOracle` | Consume generic capacity, reservation, batching, and execution-mode contracts. |
 
-Do not move method-owned cache metadata here.
+Search for the nearest method's canonical name across these owners before assuming that one factory registration is sufficient.
 
-## Touch `attention.py` Only for Generic Hooks
+## Attention Data Plane And Storage
 
-Edit `src/sparsevllm/layers/attention.py` when you need to:
+Inspect the definitions and call sites of:
 
-- call a new generic cache-manager hook
-- wire a new shared kernel path
-- keep the store-view, read-view, and decode-view call sequence consistent
+- `SparseSelection`;
+- `AttentionViewMeta`;
+- `PrefillComputeView` and `DecodeComputeView`;
+- `ExplicitKVPayload` and `MlaLatentPayload`;
+- typed cache-write records;
+- `AttentionCacheStorage` and its explicit, heterogeneous, and MLA implementations.
 
-Do not bury a full method implementation in `attention.py`.
+Relevant locations include `src/sparsevllm/engine/cache_manager/base.py`, cache-storage modules, `src/sparsevllm/layers/attention.py`, MLA attention code, and model attention-runtime adapters.
 
-## Add Kernel Code Only When Needed
+Attention should consume a typed compute view and payload without knowing the sparse-method name. Cache layout comes from model/runtime layout, not from a sparse-method-specific tensor convention.
 
-Touch `src/sparsevllm/kernels/triton/` or another explicit kernel module when:
+## Operators And Kernels
 
-- the existing decode or prefill kernels are the bottleneck
-- the method requires a new layout-aware fused operator
-- the method cannot be expressed as view selection plus existing kernels
+Inspect `src/sparsevllm/operators/`, `src/sparsevllm/platforms/`, and the relevant kernel tree when the method changes compute.
 
-## Minimum Validation Set
+- Attention compute alternatives belong behind `OpRegistry`, a typed `*OpSpec`, `DeviceCaps`, and provider selection.
+- Selection, metadata, compaction, compression, and reconstruction kernels belong to the state owner and may remain method-specific.
+- Provider capability and dependency validation must happen before execution or CUDA Graph capture.
 
-After editing code:
+Use `$review-operator-organization` for nontrivial provider/layout changes and `$optimize-sparsevllm-kernel` for implementation, tuning, profiling, or external kernel integration.
 
-1. Compile touched Python files with `python -m py_compile`.
-2. Run one small correctness task.
-3. Run one throughput benchmark.
-4. Compare against at least one existing method on the same machine.
+## Lifecycle Coordinators
+
+Inspect the prefix/radix or chain coordinators, `RuntimeState`, CacheManager lifecycle methods, and CUDA Graph preparation paths when advertising any of these capabilities:
+
+- sequence allocation, append, fork, restore, rollback, and free;
+- prefix match, attach, detach, eviction, and ownership transfer;
+- eager-to-captured buffer stability and replay-safe metadata updates;
+- CPU/offload movement and capacity accounting.
+
+Every persistent method tensor or metadata object must participate in the same lifecycle as the sequence/cache state it describes.
+
+## Documentation, Tests, And Benchmarks
+
+Inspect before editing:
+
+- focused unit tests near config, registry, cache manager, scheduler, storage, and operators;
+- method evaluation scripts/configs and documented model/assets;
+- `docs/en/benchmarking/efficiency.md` or the Chinese equivalent for performance runs;
+- public method documentation and support matrices.
+
+Avoid a single method-only smoke test. Test the contracts that other components depend on.

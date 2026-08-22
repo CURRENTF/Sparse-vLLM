@@ -1,99 +1,101 @@
 ---
 name: add-sparse-method
-description: Add or refactor a first-class Sparse-vLLM sparse method alongside vanilla, SnapKV, OmniKV, QuEST, and DeltaKV. Use when Codex needs to introduce a new `vllm_sparse_method`, move method logic out of `attention.py` or `utils/`, add method-specific cache metadata or decode-time view building, wire config and registration, and preserve the repo's cache-manager-first architecture.
+description: Add or refactor a first-class Sparse-vLLM sparse method across configuration, capability registration, cache and controller ownership, scheduler admission, typed attention views, model and storage compatibility, CUDA Graph and prefix-cache lifecycles, operators, and reproducible validation. Use for a new canonical sparse_method or an integration whose sparse runtime semantics change; do not use for a kernel/provider optimization that leaves method semantics unchanged.
 ---
 
 # Add Sparse Method
 
-Implement new Sparse-vLLM methods as explicit runtime methods, not as ad-hoc helpers. Keep `attention.py` generic, let `cache_manager` own method state, and let `SparseController` keep scheduling and cross-layer coordination responsibilities.
+Treat a sparse method as a runtime capability contract, not as a file template. Start from the method's semantics, route each responsibility to its existing owner, and add only the narrow contracts the method actually needs.
 
-## Start Here
+Always read [references/file-map.md](references/file-map.md) before editing. It maps the current architecture and distinguishes files to inspect from files that usually need modification.
 
-Read [references/file-map.md](references/file-map.md) before changing code.
+## 1. Classify The Change
 
-Read [references/quest-pattern.md](references/quest-pattern.md) when the new method:
-- stores persistent metadata
-- depends on decode-time `q`
-- needs a custom `build_decode_view(...)`
-- is being added as a full peer to `omnikv`, `snapkv`, `quest`, or `deltakv`
+Use this skill when the change introduces or materially changes a canonical `sparse_method`, including its state, selection, scheduling, storage, lifecycle, or compatibility semantics.
 
-## Placement Rules
+Do not create a new sparse method merely to add:
 
-Follow this placement order.
+- an attention compute implementation with unchanged semantics; use the operator/provider and kernel workflow;
+- a storage layout required by several methods; extend the storage/model layout contract;
+- a model integration that only adapts an existing method;
+- a config-only experiment or a private ablation with no first-class runtime contract.
 
-1. Put the method's core runtime logic in `src/sparsevllm/engine/cache_manager/<method>.py` when the method owns any persistent state.
-2. Put persistent page, chunk, token, or compressed metadata in the cache manager, not in `utils/`.
-3. Use `CacheManager.on_kv_stored(...)` when metadata must be updated after KV is written.
-4. Use `CacheManager.build_decode_view(...)` when the method needs the current layer's decode-time `q`.
-5. Keep `src/sparsevllm/layers/attention.py` method-agnostic. It may call generic hooks, but should not grow method-specific branches unless adding a new reusable hook.
-6. Put cross-layer observation, attention-score collection, or scheduler-facing sparse orchestration in `src/sparsevllm/engine/sparse_controller.py`.
-7. Use `src/sparsevllm/utils/` only for truly generic helpers shared by multiple methods. Do not place an entire method implementation there.
-8. Add custom kernels under `src/sparsevllm/kernels/triton/` or another explicit runtime module, then call them through the method's cache manager or shared decode path.
+If classification is ambiguous, write the semantic difference from the nearest existing method first. If there is no difference in runtime behavior, it is not a new method.
 
-## Decision Rules
+## 2. Declare The Capability Contract
 
-Use these rules before editing code.
+Before editing code, complete the contract in [references/runtime-contract.md](references/runtime-contract.md). At minimum, decide:
 
-- If the method only changes logical token selection and has no persistent state, reuse the existing cache manager if possible and prefer `SparseController`.
-- If the method keeps method-specific metadata across steps, create a dedicated cache manager file.
-- If the method needs the current `q`, do not try to force the logic into `prepare_forward()` or `get_read_view()` alone. Implement a decode-time hook through `build_decode_view(...)`.
-- If the method changes physical KV allocation or page ownership, keep that logic in the cache manager and register it as a first-class method.
-- If the method is meant to become a repo-supported algorithm, do not hide it behind a one-off helper in `attention.py`.
+- identity: public name, canonical internal name, aliases, defaults, and external assets;
+- state semantics: logical views, physical eviction, paged metadata, compression, activation state, or combinations;
+- selection semantics: when scores are produced, which queries/keys they describe, and whether state crosses layers or steps;
+- storage compatibility: explicit KV, heterogeneous explicit KV, MLA latent storage, and actual-key materialization needs;
+- scheduling and admission: prefill mode, batch compatibility, capacity budgets, reservation costs, and offload behavior;
+- lifecycle support: eager execution, CUDA Graph, radix prefix cache, chain prefix cache, and restore/fork/free behavior;
+- model and topology support: model types, TP/EP/DP assumptions, and provider requirements;
+- validation evidence: correctness oracle, quality workload, performance workload, and unsupported combinations.
 
-## Editing Workflow
+Do not fill unknowns with permissive defaults. Unsupported combinations must be represented explicitly and fail during validation or initialization, not in a later kernel.
 
-1. Add config knobs to `src/sparsevllm/config.py`.
-2. Register the method name and default prefill policy in `src/sparsevllm/method_registry.py`.
-3. Register the method in `src/sparsevllm/engine/cache_manager/base.py` and `src/sparsevllm/engine/cache_manager/__init__.py` if needed.
-4. Create or update `src/sparsevllm/engine/cache_manager/<method>.py`.
-5. Touch `src/sparsevllm/engine/sparse_controller.py` only for controller responsibilities.
-6. Touch `src/sparsevllm/layers/attention.py` only to use generic hooks or shared kernels.
-7. Update README and benchmark examples after the method runs.
-8. Compile touched Python files with `python -m py_compile`.
-9. Run at least one correctness-oriented task and one throughput benchmark.
+## 3. Route Responsibilities By Owner
 
-## Prefill Policy Rules
+Preserve these boundaries:
 
-Prefill policy is part of the method contract and must be owned by `src/sparsevllm/method_registry.py`.
+- Normalize the public `sparse_method` API and reject legacy or conflicting inputs in `configs/runtime_params.py`. Keep composed config validation in the relevant config group, not the compatibility facade `config.py`.
+- Register static method capabilities, aliases, schedule defaults, score contracts, model/topology compatibility, prefix-cache support, graph support, and assets in `method_registry.py`.
+- Keep persistent cache-coupled method state, physical allocation, eviction/compaction, and attention-view materialization in `engine/cache_manager/`.
+- Keep per-step and cross-layer score/selection orchestration in `engine/sparse_controller.py`.
+- Keep hidden-state capture and activation reuse in `engine/activation_controller.py`.
+- Expose admission budgets, reservation costs, execution modes, and lifecycle state through `RuntimeState` and `MemoryOracle`; the scheduler consumes this generic contract.
+- Pass typed selections, views, payloads, and writes through the cache/attention boundary. Keep `layers/attention.py` and model attention call sites method-agnostic.
+- Let `ModelSpec`, `RuntimeLayout`, `ParallelTopology`, and storage protocols own physical cache layout compatibility. A sparse method does not own the model's KV representation.
 
-- Use `all_chunked` for methods that can prefill every request in scheduler chunks.
-- Use `long_bs1full_short_batch` only for methods whose correctness or intended cache transformation depends on a complete long-prefill pass. Long requests run full-prefill with batch size 1; short requests still use chunked batching.
-- Do not override a method's policy in benchmark scripts or one-off config defaults unless the user is running an explicit ablation.
-- Add or update `tests/test_prefill_schedule_policy.py` when adding or changing a method's policy.
+Do not add method-name branches to Attention, Scheduler, or ModelRunner. If a method requires behavior not expressible by an existing generic contract, add the smallest typed hook at the owning boundary. Do not introduce a broad strategy framework solely to avoid one local branch.
 
-## Architecture Guardrails
+## 4. Choose A Mechanism, Not An Inheritance Parent
 
-Do not do these things.
+Read [references/method-families.md](references/method-families.md), then select reference implementations by shared mechanics: logical view, physical compaction, scored selection, query-aware paged selection, activation reuse, or compressed/multi-pool storage.
 
-- Do not put a new method's main logic in `src/sparsevllm/utils/`.
-- Do not add method-specific decode branches directly inside `Attention.forward()` when a cache-manager hook can express the same behavior.
-- Do not make `SparseController` own persistent cache metadata that belongs to one method.
-- Do not couple README claims to behavior that the code does not implement.
+Existing Python inheritance often represents incidental code reuse rather than a stable method taxonomy. Reuse a base only after verifying that allocation, state, admission, graph, prefix, and storage semantics are all compatible.
 
-## Validation
+For QuEST-like query-aware selection over explicit paged KV, also read [references/quest-pattern.md](references/quest-pattern.md). Do not apply that pattern to MLA latent or custom payload methods without proving the same view contract is valid.
 
-Compile first.
+## 5. Preserve Typed Data-Plane Contracts
 
-```bash
-python -m py_compile \
-  src/sparsevllm/config.py \
-  src/sparsevllm/engine/cache_manager/base.py \
-  src/sparsevllm/engine/cache_manager/__init__.py \
-  src/sparsevllm/engine/cache_manager/<method>.py \
-  src/sparsevllm/engine/sparse_controller.py \
-  src/sparsevllm/layers/attention.py
-```
+Prefer the existing data types and protocols:
 
-Benchmark after correctness is established.
+- `SparseSelection` for selection results;
+- `AttentionViewMeta` for logical attention metadata;
+- `PrefillComputeView` and `DecodeComputeView` for execution-time views;
+- `ExplicitKVPayload` and `MlaLatentPayload` for storage-specific payloads;
+- typed cache writes and `AttentionCacheStorage` for cache mutation and storage access.
 
-```bash
-python scripts/benchmarks/bench_sparse_vllm.py \
-  --model_path <MODEL_PATH> \
-  --methods <method> \
-  --lengths 128000 \
-  --batch_sizes 8 \
-  --output_len 128 \
-  --hyper_params '{"gpu_memory_utilization":0.9,"chunk_prefill_size":4096,"tensor_parallel_size":1}'
-```
+Use `build_decode_view` when the method only changes the logical explicit-KV view. Use `build_decode_compute_view` when execution requires a different payload or materialization step. Do not pass method-specific tuples, hidden tensor side channels, or config objects through attention.
 
-When the user asks to add a new method, follow this skill first and only then invent method-specific details.
+## 6. Route Kernels At The Semantic Boundary
+
+- Put alternative attention computation behind `OpRegistry`, a typed `*OpSpec`, `DeviceCaps`, and an operator provider. Prepare and bind providers before capture when CUDA Graph is supported.
+- Invoke method-internal selection, metadata, compaction, compression, or reconstruction kernels from the state owner, usually CacheManager or SparseController.
+- Keep kernel adapters thin and keep policy, allocation, and lifecycle decisions out of kernel modules.
+- Do not silently fall back to another provider or dense behavior. Any fallback must be an explicit registered capability with tested semantics.
+
+## 7. Integrate In Dependency Order
+
+Implement the smallest vertical slice in this order:
+
+1. Public normalization and static registry contract.
+2. Model/storage/topology validation.
+3. State ownership, allocation, and lifecycle operations.
+4. Score/selection orchestration and typed view construction.
+5. Scheduler admission and prefill execution semantics.
+6. Operator/provider or method-internal kernels, if required.
+7. Prefix-cache, CUDA Graph, and offload integration for every advertised capability.
+8. Documentation, evaluation configuration, and reproducibility artifacts.
+
+Inspect all layers, but edit only the owners affected by the declared contract. Research-code scope matters: do not combine a method addition with an unrelated architecture rewrite.
+
+## 8. Validate Claims, Not Just Imports
+
+Read and follow [references/validation.md](references/validation.md). Validation must cover every capability advertised by the registry and every relevant storage/layout path.
+
+Run cheap static and unit checks first, then targeted runtime correctness, lifecycle matrices, quality evaluation, and matched performance benchmarks. Fail fast on missing models, assets, datasets, unsupported layouts, or unavailable providers. Preserve raw outputs and per-sample status so experimental results remain auditable.

@@ -32,6 +32,7 @@ from benchmark.sparsevllm_regression.manifest import (
     compressor_path_for,
     load_manifest,
     missing_runtime_inputs,
+    resolve_method_config,
     resolve_manifest_paths,
     runtime_support_reason,
     select_entries,
@@ -302,11 +303,11 @@ def _method_config(
     model_id: str | None = None,
     include_method: bool = True,
 ) -> dict[str, Any]:
-    cfg = dict(method.get("config") or {})
-    if model_id:
-        cfg.update((method.get("model_configs") or {}).get(model_id, {}))
-    if include_method:
-        cfg["sparse_method"] = method["sparse_method"]
+    cfg = resolve_method_config(
+        method,
+        model_id=model_id,
+        include_method=include_method,
+    )
     compressor_path = compressor_path_for(model or {}, method)
     if method.get("requires_compressor") and compressor_path:
         cfg["deltakv_checkpoint_path"] = compressor_path

@@ -16,7 +16,7 @@ def test_runtime_compatibility_bounds_cover_supported_dependencies():
     assert "apache-tvm-ffi==0.1.10" in dependencies
     assert "transformers>=5.13,<6" in dependencies
     assert "nvidia-cutlass-dsl>=4.6,<5" in dependencies
-    assert "sglang-kernel>=0.4.5,<0.4.6" in dependencies
+    assert "sglang-kernel>=0.4.5,<0.5" in dependencies
     assert {
         "fire",
         "pillow",

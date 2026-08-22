@@ -64,6 +64,74 @@ class GatedDeltaRuleProvider:
     def close(self) -> None:
         pass
 
+    def run_gating(
+        self,
+        *,
+        A_log: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        dt_bias: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        from sparsevllm.kernels.triton.qwen3_5.fused_gdn_gating import (
+            fused_gdn_gating,
+        )
+
+        return fused_gdn_gating(A_log, a, b, dt_bias)
+
+    def run_prefill_conv(
+        self,
+        *,
+        mixed_qkv: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None,
+        query_start_loc: torch.Tensor,
+        cache_indices: torch.Tensor,
+        has_initial_state: torch.Tensor,
+        conv_states: torch.Tensor,
+        activation: str,
+    ) -> torch.Tensor:
+        from sparsevllm.kernels.triton.qwen3_5.causal_conv1d import (
+            causal_conv1d_fn,
+        )
+
+        return causal_conv1d_fn(
+            mixed_qkv.transpose(0, 1),
+            weight,
+            bias=bias,
+            query_start_loc=query_start_loc,
+            cache_indices=cache_indices,
+            has_initial_state=has_initial_state,
+            conv_states=conv_states,
+            activation=activation,
+        ).transpose(0, 1)
+
+    def prepare_decode_inputs(self, **kwargs) -> tuple[torch.Tensor, ...]:
+        from sparsevllm.kernels.triton.qwen3_5.gdn_decode_pack import (
+            conv_pack_gdn_decode_inputs,
+        )
+
+        return conv_pack_gdn_decode_inputs(**kwargs)
+
+    def run_gated_rmsnorm(
+        self,
+        *,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+        gate: torch.Tensor,
+    ) -> torch.Tensor:
+        from sparsevllm.kernels.triton.qwen3_5.gated_rmsnorm import (
+            gated_rmsnorm_forward,
+        )
+
+        return gated_rmsnorm_forward(
+            x=x.contiguous(),
+            weight=weight,
+            bias=None,
+            eps=eps,
+            z=gate.contiguous(),
+        )
+
     def run_prefill(
         self,
         spec: GatedDeltaRuleOpSpec,
@@ -169,6 +237,12 @@ class FlashInferSm90GatedDeltaRuleProvider(GatedDeltaRuleProvider):
             "prefill_state_layout": "v_major_hvk",
             "state_layout_adapter": "transpose_last_two_dims",
             "profile_source": "flashinfer-native",
+            "auxiliary_kernel_paths": [
+                "triton.qwen3_5.fused_gdn_gating",
+                "triton.qwen3_5.causal_conv1d",
+                "triton.qwen3_5.gdn_decode_pack",
+                "triton.qwen3_5.gated_rmsnorm",
+            ],
         }
 
     def run_prefill(
@@ -246,6 +320,12 @@ class TritonGatedDeltaRuleProvider(GatedDeltaRuleProvider):
             "runtime_state_layout": "k_major_hkv",
             "prefill_state_layout": "k_major_hkv",
             "profile_source": "repo-static",
+            "auxiliary_kernel_paths": [
+                "triton.qwen3_5.fused_gdn_gating",
+                "triton.qwen3_5.causal_conv1d",
+                "triton.qwen3_5.gdn_decode_pack",
+                "triton.qwen3_5.gated_rmsnorm",
+            ],
         }
 
     def run_prefill(
@@ -301,6 +381,26 @@ class PreparedGatedDeltaRuleOp:
         if self._closed:
             raise RuntimeError("GDN operator is closed.")
         return self.provider.run_decode(self.spec, **kwargs)
+
+    def run_gating(self, **kwargs) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._closed:
+            raise RuntimeError("GDN operator is closed.")
+        return self.provider.run_gating(**kwargs)
+
+    def run_prefill_conv(self, **kwargs) -> torch.Tensor:
+        if self._closed:
+            raise RuntimeError("GDN operator is closed.")
+        return self.provider.run_prefill_conv(**kwargs)
+
+    def prepare_decode_inputs(self, **kwargs) -> tuple[torch.Tensor, ...]:
+        if self._closed:
+            raise RuntimeError("GDN operator is closed.")
+        return self.provider.prepare_decode_inputs(**kwargs)
+
+    def run_gated_rmsnorm(self, **kwargs) -> torch.Tensor:
+        if self._closed:
+            raise RuntimeError("GDN operator is closed.")
+        return self.provider.run_gated_rmsnorm(**kwargs)
 
     def close(self) -> None:
         if self._closed:

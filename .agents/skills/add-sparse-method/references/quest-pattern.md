@@ -1,58 +1,63 @@
-# QuEST Pattern
+# QuEST-Like Explicit Paged Selection
 
-Use QuEST as the reference design for adding a method that is query-aware at decode time and owns persistent metadata.
+Use this reference only when the method performs query-aware logical selection over explicit paged KV and maintains persistent per-page metadata. It is not a universal template for sparse methods.
 
-## Structural Lessons
+## Required Semantics
 
-QuEST is treated as a full method, not a helper.
+A QuEST-like integration usually has three distinct pieces:
 
-- It lives in `src/sparsevllm/engine/cache_manager/quest.py`.
-- It is registered through `CacheManager.create(...)`.
-- It keeps page metadata in the cache manager.
-- It uses `build_decode_view(...)` because decode-time selection depends on the current `q`.
-- It does not store the method's main logic in `utils/`.
+1. CacheManager owns page metadata and keeps it synchronized with allocation, append, prefix attach/fork/restore, eviction, and free.
+2. SparseController or the method's selection path computes query-dependent page/token selection with an explicit score contract.
+3. CacheManager turns the selection into a typed decode view consumed by generic attention.
 
-## Why `build_decode_view(...)` Exists
+Keep query-dependent scratch state separate from persistent page metadata. Document tensor shapes, head grouping, page indexing, and whether scores describe logical tokens, physical slots, or pages.
 
-`prepare_forward()` and `SparseController.get_read_view()` happen before the current layer's decode-time `q` is available.
+## View Boundary
 
-If a method needs the current `q`, it cannot be fully resolved during controller preparation alone. In that case:
+Use `build_decode_view` only when the selected result can still be represented as a logical view over the existing explicit-KV payload.
 
-1. keep the method's persistent state in the cache manager
-2. let `attention.py` stay generic
-3. call `cache_manager.build_decode_view(...)` right before decode kernels
+Use `build_decode_compute_view` when the method must materialize a different execution payload, reconstruct keys, or adapt a storage-specific representation. Do not force MLA latent storage or a custom compressed payload into an explicit paged-KV tuple.
 
-This is the right pattern for methods like QuEST.
+The resulting view must preserve:
 
-## Why QuEST Does Not Belong in `utils/`
+- sequence boundaries and token order expected by the attention operator;
+- valid physical slot/page indices after compaction or prefix reuse;
+- query-head to KV-head mapping;
+- batch and graph-stable shapes where CUDA Graph support is advertised;
+- deterministic behavior for ties or bounded approximate selection.
 
-QuEST owns:
+## Metadata Lifecycle Audit
 
-- method-specific cache allocation policy
-- page slot bookkeeping
-- page min/max metadata
-- decode-time view construction
+For every persistent metadata tensor, verify:
 
-Those are runtime method responsibilities, not generic utilities. Use `utils/` only for helpers that are reusable across methods.
+- initialization on sequence allocation;
+- updates on prefill append and decode append;
+- behavior on partial pages;
+- fork/copy semantics for chain and radix prefix reuse;
+- rollback/restore semantics;
+- cleanup on free and eviction;
+- device/offload movement;
+- stable buffers or replay-safe updates under CUDA Graph.
 
-## Prefill Semantics
+Metadata that cannot be restored or forked correctly means the corresponding prefix mode is unsupported and must be rejected by the capability contract.
 
-QuEST prefill stays dense in the attention sense, but it still updates page metadata after KV writes through `on_kv_stored(...)`.
+## Storage And Topology Compatibility
 
-That means QuEST can affect prefill throughput even when sparse page selection only happens at decode time.
+Do not infer compatibility from the QuEST name or from a shared base class. Verify:
 
-## Performance Lessons
+- explicit homogeneous versus heterogeneous KV storage;
+- availability and semantics of actual-key materialization;
+- TP head partitioning and any cross-rank reductions;
+- model-specific rotary/key transformations;
+- page size and block-table assumptions;
+- whether the selected attention provider accepts the produced view.
 
-The first QuEST bottleneck was metadata maintenance, not decode attention itself.
+Treat MLA latent compatibility as unsupported unless a dedicated latent-aware score and compute-view path is implemented and validated.
 
-Useful optimizations:
+## Performance Rules
 
-- batch metadata updates instead of looping page-by-page in Python
-- keep `attention.py` unchanged and optimize method-owned hooks first
-- use profiler tags to split `quest_update_metadata`, `quest_build_decode_view`, `quest_score_pages`, and `quest_pack_slots`
-
-## Official Kernel Caveat
-
-The official QuEST repo is useful as a kernel reference, but its Python wrapper and controller path are still strongly shaped around batch size 1 in some places.
-
-Do not assume the official wrapper can be dropped into Sparse-vLLM's batched engine unchanged. Check the wrapper and batch assumptions before planning an integration.
+- Vectorize metadata updates and selection; avoid Python loops on the decode path.
+- Reuse scratch buffers when their ownership and graph lifetime are explicit.
+- Separate selection time, view-materialization time, and attention time in microbenchmarks.
+- Compare against a correctness oracle before tuning approximate kernels.
+- Do not bypass operator/provider preparation when selection changes the attention compute implementation.

@@ -4,23 +4,55 @@ from dataclasses import dataclass
 
 import torch
 
+from sparsevllm.kernels.external.flashinfer.prefill import (
+    make_flashinfer_paged_prefill_wrapper,
+)
 from sparsevllm.layers.attention_backend import (
     TritonAttentionBackend,
     _require_explicit_payload,
 )
+from sparsevllm.platforms import device_runtime
 
 
 @dataclass
 class _FlashInferState:
     wrapper: object
-    plan_key: tuple[object, int, int, int] | None = None
+    workspace: torch.Tensor
+    plan_key: tuple[object, ...] | None = None
 
 
 class Gemma4FlashInferPrefill:
     """Shared FlashInfer plans for Gemma 4 text-prefill head shapes."""
 
     def __init__(self) -> None:
-        self._states: dict[tuple[int, int, int, int], _FlashInferState] = {}
+        self._state: _FlashInferState | None = None
+
+    def prepare(self, *, device_index: int | None = None) -> None:
+        if self._state is not None:
+            return
+        current_device = torch.cuda.current_device()
+        if device_index is None:
+            device_index = current_device
+        if int(device_index) != int(current_device):
+            raise RuntimeError(
+                "Gemma 4 FlashInfer prefill must be prepared on the selected "
+                f"CUDA device: selected={device_index} current={current_device}."
+            )
+        workspace = torch.empty(
+            128 * 1024 * 1024,
+            dtype=torch.uint8,
+            device=torch.device("cuda", int(device_index)),
+        )
+        self._state = _FlashInferState(
+            wrapper=make_flashinfer_paged_prefill_wrapper(
+                workspace,
+                backend="fa2",
+            ),
+            workspace=workspace,
+        )
+
+    def close(self) -> None:
+        self._state = None
 
     @staticmethod
     def _page_metadata(view, max_context_len: int):
@@ -54,7 +86,6 @@ class Gemma4FlashInferPrefill:
         max_context_len: int,
         sliding_window: int | None,
     ) -> torch.Tensor:
-        from flashinfer.prefill import BatchPrefillWithPagedKVCacheWrapper
         from sparsevllm.utils.context import get_context
 
         payload = _require_explicit_payload(view, operation="Gemma 4 prefill")
@@ -65,22 +96,21 @@ class Gemma4FlashInferPrefill:
             int, (q.shape[1], payload.k_cache.shape[1], q.shape[2])
         )
         window_left = -1 if sliding_window is None else int(sliding_window) - 1
-        key = q_heads, kv_heads, head_dim, window_left
-        state = self._states.get(key)
+        state = self._state
         if state is None:
-            workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=q.device)
-            state = _FlashInferState(
-                BatchPrefillWithPagedKVCacheWrapper(
-                    workspace, kv_layout="NHD", backend="auto"
-                )
+            raise RuntimeError(
+                "Gemma 4 FlashInfer prefill was not prepared before execution."
             )
-            self._states[key] = state
         context = get_context()
         plan_key = (
             context.attention_validation_scope,
             meta.active_slots.data_ptr(),
             meta.req_indices.data_ptr(),
             meta.context_lens.data_ptr(),
+            q_heads,
+            kv_heads,
+            head_dim,
+            window_left,
         )
         if state.plan_key != plan_key:
             indices, kv_indptr, last_page_len = self._page_metadata(
@@ -131,6 +161,89 @@ class Gemma4AttentionBackend(TritonAttentionBackend):
         self.flashinfer_prefill = flashinfer_prefill
         self.use_window_decode = bool(use_window_decode)
         self.global_decode_heads_per_program = global_decode_heads_per_program
+        self._runtime_kernel_path_counts: dict[str, dict[str, int]] = {}
+
+    def binding_metadata(self) -> dict[str, object]:
+        prefill_routes = ["triton_multimodal_context", "triton_context"]
+        if self.flashinfer_prefill is not None:
+            prefill_routes.insert(1, "flashinfer_paged_prefill_fa2")
+        decode_routes = ["triton_single_block", "triton_two_stage"]
+        if self.use_window_decode:
+            decode_routes.insert(0, "triton_window")
+        if self.global_decode_heads_per_program is not None:
+            decode_routes.insert(-1, "triton_global")
+        return {
+            "implementation_kind": "dispatch_plan",
+            "prefill_routes": prefill_routes,
+            "decode_routes": decode_routes,
+            "sliding_window": self.sliding_window,
+        }
+
+    def _record_kernel_path(self, path: str) -> None:
+        counts = self._runtime_kernel_path_counts.setdefault(
+            path,
+            {"eager_dispatches": 0, "cuda_graph_capture_dispatches": 0},
+        )
+        key = (
+            "cuda_graph_capture_dispatches"
+            if device_runtime.is_stream_capturing()
+            else "eager_dispatches"
+        )
+        counts[key] += 1
+
+    def runtime_kernel_stats(self) -> dict[str, object]:
+        return {
+            "kernel_paths": {
+                path: dict(sorted(counts.items()))
+                for path, counts in sorted(self._runtime_kernel_path_counts.items())
+            },
+            "fallback_reasons": {},
+        }
+
+    def _prefill_route(self, view) -> str:
+        from sparsevllm.utils.context import get_context
+
+        image_groups = getattr(get_context(), "multimodal_image_groups", None)
+        if self.sliding_window is not None and isinstance(image_groups, torch.Tensor):
+            return "triton_multimodal_context"
+        if self.flashinfer_prefill is not None and view.meta.attn_score is None:
+            return "flashinfer_paged_prefill_fa2"
+        return "triton_context"
+
+    def _decode_route(
+        self,
+        q: torch.Tensor,
+        view,
+        *,
+        mid_o: torch.Tensor,
+        block_seq: int,
+        group_size: int,
+    ) -> str:
+        if (
+            self.use_window_decode
+            and self.sliding_window is not None
+            and view.meta.attn_score is None
+            and int(q.shape[-1]) == 256
+            and group_size in {2, 4}
+            and mid_o.shape[2]
+            >= (self.sliding_window + block_seq - 1) // block_seq
+        ):
+            return "triton_window"
+        if (
+            mid_o.shape[2] == 1
+            and view.meta.attn_score is None
+            and group_size in {2, 4, 8}
+        ):
+            return "triton_single_block"
+        if (
+            self.sliding_window is None
+            and view.meta.attn_score is None
+            and int(q.shape[-1]) == 512
+            and self.global_decode_heads_per_program is not None
+            and group_size % self.global_decode_heads_per_program == 0
+        ):
+            return "triton_global"
+        return "triton_two_stage"
 
     def run_prefill(
         self,
@@ -142,14 +255,15 @@ class Gemma4AttentionBackend(TritonAttentionBackend):
         max_input_len: int,
     ) -> torch.Tensor:
         payload = _require_explicit_payload(view, operation="Gemma 4 prefill")
-        from sparsevllm.utils.context import get_context
-
-        image_groups = getattr(get_context(), "multimodal_image_groups", None)
-        if self.sliding_window is not None and isinstance(image_groups, torch.Tensor):
+        route = self._prefill_route(view)
+        self._record_kernel_path(route)
+        if route == "triton_multimodal_context":
+            from sparsevllm.utils.context import get_context
             from sparsevllm.kernels.triton.gemma4_multimodal_context_attention import (
                 gemma4_multimodal_context_attention,
             )
 
+            image_groups = get_context().multimodal_image_groups
             output = torch.empty_like(q)
             gemma4_multimodal_context_attention(
                 q,
@@ -167,7 +281,8 @@ class Gemma4AttentionBackend(TritonAttentionBackend):
                 attn_score=view.meta.attn_score,
             )
             return output
-        if self.flashinfer_prefill is not None and view.meta.attn_score is None:
+        if route == "flashinfer_paged_prefill_fa2":
+            assert self.flashinfer_prefill is not None
             return self.flashinfer_prefill.run(
                 q,
                 view,
@@ -219,15 +334,15 @@ class Gemma4AttentionBackend(TritonAttentionBackend):
         )
 
         group_size = int(q.shape[1]) // int(payload.k_cache.shape[1])
-        if (
-            self.use_window_decode
-            and self.sliding_window is not None
-            and view.meta.attn_score is None
-            and int(q.shape[-1]) == 256
-            and group_size in {2, 4}
-            and mid_o.shape[2]
-            >= (self.sliding_window + block_seq - 1) // block_seq
-        ):
+        route = self._decode_route(
+            q,
+            view,
+            mid_o=mid_o,
+            block_seq=block_seq,
+            group_size=group_size,
+        )
+        self._record_kernel_path(route)
+        if route == "triton_window":
             from sparsevllm.kernels.triton.gemma4_window_decode_attention import (
                 gemma4_window_decode,
             )
@@ -248,7 +363,7 @@ class Gemma4AttentionBackend(TritonAttentionBackend):
                 sliding_window=self.sliding_window,
             )
             return output
-        if mid_o.shape[2] == 1 and view.meta.attn_score is None and group_size in {2, 4, 8}:
+        if route == "triton_single_block":
             from sparsevllm.kernels.triton.gemma4_single_block_decode_attention import (
                 gemma4_single_block_decode,
             )
@@ -260,13 +375,7 @@ class Gemma4AttentionBackend(TritonAttentionBackend):
                 block_seq=block_seq, sliding_window=self.sliding_window,
             )
             return output
-        if (
-            self.sliding_window is None
-            and view.meta.attn_score is None
-            and int(q.shape[-1]) == 512
-            and self.global_decode_heads_per_program is not None
-            and group_size % self.global_decode_heads_per_program == 0
-        ):
+        if route == "triton_global":
             from sparsevllm.kernels.triton.gemma4_global_decode_attention import (
                 gemma4_global_decode_stage1,
             )

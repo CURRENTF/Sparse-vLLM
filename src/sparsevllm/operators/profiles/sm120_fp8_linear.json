@@ -1,6 +1,7 @@
 {
   "schema_version": 1,
   "profile_id": "sm120_fp8_linear_20260822_v2",
+  "profile_status": "provisional",
   "operator": "block-scaled FP8 Linear",
   "scope": "semantic_contract_and_shape",
   "device": {
@@ -74,6 +75,7 @@
     "benchmark_workload": "Qwen3-30B and Qwen3.6-27B TP1 dense Linear shapes",
     "source_repository": "Sparse-vLLM",
     "source_revision": "bcc93aa+uncommitted-unified-provider-refactor",
+    "reproducibility": "provisional: source worktree was dirty and no standalone patch digest was recorded",
     "source_state": "Benchmarked the atomic Triton and FlashInfer groupwise Providers before extending this dispatch profile; run artifacts record the dirty git state",
     "observed_date": "2026-08-22",
     "protocol": "CUDA-event eager timing at M=1/512/1024 with per-call allocation included; CUDA-Graph replay validated separately",

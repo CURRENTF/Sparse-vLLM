@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import math
 import os
@@ -47,6 +48,14 @@ REQUIRED_ARTIFACTS = [
     "scbench.json",
     "grade_summary.json",
 ]
+OMNIKV_REQUIRED_BENCHMARK_PARAMS = {
+    "decode_keep_tokens",
+    "engine_prefill_chunk_size",
+    "full_attention_layers",
+    "pool_kernel_size",
+    "recent_keep_tokens",
+    "sink_keep_tokens",
+}
 
 
 class ManifestError(ValueError):
@@ -162,6 +171,8 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
             config=method["config"],
             config_label=f"method {method_id!r} config",
         )
+        if method["sparse_method"] == "omnikv":
+            validate_omnikv_benchmark_config(method["config"])
         model_configs = method.get("model_configs")
         if model_configs is not None:
             if not isinstance(model_configs, dict):
@@ -183,6 +194,8 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
                     config=merged_config,
                     config_label=f"method {method_id!r} model_configs[{model_id!r}]",
                 )
+                if method["sparse_method"] == "omnikv":
+                    validate_omnikv_benchmark_config(merged_config)
         supported_families = method.get("supported_model_families")
         if supported_families is not None:
             if (
@@ -279,6 +292,87 @@ def select_entries(manifest: dict[str, Any], models: list[str] | None, methods: 
     return model_ids, method_ids
 
 
+def resolve_method_config(
+    method: dict[str, Any],
+    *,
+    model_id: str | None = None,
+    require_model_config: bool = False,
+    include_method: bool = True,
+) -> dict[str, Any]:
+    """Merge one method's canonical config with its model-specific override."""
+    sparse_method = method.get("sparse_method")
+    if not isinstance(sparse_method, str):
+        raise ManifestError("method is missing string sparse_method.")
+    base = method.get("config")
+    if not isinstance(base, dict):
+        raise ManifestError(f"method {sparse_method!r} is missing config object.")
+
+    model_configs = method.get("model_configs") or {}
+    if not isinstance(model_configs, dict):
+        raise ManifestError(
+            f"method {sparse_method!r} model_configs must be a JSON object."
+        )
+    if require_model_config and (not model_id or model_id not in model_configs):
+        available = sorted(model_configs)
+        raise ManifestError(
+            f"method {sparse_method!r} requires a calibrated model-specific config; "
+            f"got model_id={model_id!r}, available={available}."
+        )
+
+    config = dict(base)
+    if model_id and model_id in model_configs:
+        override = model_configs[model_id]
+        if not isinstance(override, dict):
+            raise ManifestError(
+                f"method {sparse_method!r} model_configs[{model_id!r}] must be a JSON object."
+            )
+        config.update(override)
+    if include_method:
+        config["sparse_method"] = sparse_method
+    return config
+
+
+def validate_omnikv_benchmark_config(
+    config: dict[str, Any],
+    *,
+    allow_single_full_layer: bool = False,
+) -> list[int]:
+    """Validate the explicit, accuracy-affecting OmniKV benchmark contract."""
+    missing = sorted(OMNIKV_REQUIRED_BENCHMARK_PARAMS - set(config))
+    if missing:
+        raise ManifestError(
+            "OmniKV benchmarks require an explicit calibrated method config; "
+            f"missing parameters={missing}. Resolve the model-specific config from "
+            "benchmark/sparsevllm_regression/manifest.json."
+        )
+
+    value = config["full_attention_layers"]
+    if isinstance(value, str):
+        parts = [part.strip() for part in value.split(",") if part.strip()]
+        layers = [int(part) for part in parts]
+    elif isinstance(value, (list, tuple)):
+        if any(isinstance(layer, bool) for layer in value):
+            raise ManifestError("full_attention_layers cannot contain booleans.")
+        layers = [int(layer) for layer in value]
+    else:
+        raise ManifestError(
+            "full_attention_layers must be a comma-separated string or integer list."
+        )
+    if not layers:
+        raise ManifestError("full_attention_layers must contain at least one layer.")
+    if any(layer < 0 for layer in layers):
+        raise ManifestError("full_attention_layers cannot contain negative layers.")
+    if layers != sorted(set(layers)):
+        raise ManifestError("full_attention_layers must be unique and sorted.")
+    if len(layers) == 1 and not allow_single_full_layer:
+        raise ManifestError(
+            "OmniKV benchmarks refuse a single full-attention layer by default because "
+            "one observation layer would drive every later sparse layer. Pass a calibrated "
+            "multi-layer config, or explicitly enable the single-layer ablation."
+        )
+    return layers
+
+
 def runtime_support_reason(
     manifest: dict[str, Any],
     model_id: str,
@@ -357,3 +451,44 @@ def missing_runtime_inputs(resolved: dict[str, Any], model_id: str, method_id: s
         elif not Path(compressor_path).exists():
             missing.append(f"{compressor_env}={compressor_path}")
     return missing
+
+
+def _parse_cli_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Resolve one canonical Sparse-vLLM benchmark method config."
+    )
+    parser.add_argument("--manifest", type=Path, default=None)
+    parser.add_argument("--method", required=True)
+    parser.add_argument("--model-id", default=None)
+    parser.add_argument("--require-model-config", action="store_true")
+    parser.add_argument("--overrides-json", default="{}")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = _parse_cli_args()
+    manifest = load_manifest(args.manifest)
+    if args.method not in manifest["methods"]:
+        raise ManifestError(
+            f"Unknown method id {args.method!r}; available={sorted(manifest['methods'])}."
+        )
+    try:
+        overrides = json.loads(args.overrides_json)
+    except json.JSONDecodeError as exc:
+        raise ManifestError(f"--overrides-json is invalid JSON: {exc}") from exc
+    if not isinstance(overrides, dict):
+        raise ManifestError("--overrides-json must decode to a JSON object.")
+
+    config = resolve_method_config(
+        manifest["methods"][args.method],
+        model_id=args.model_id,
+        require_model_config=args.require_model_config,
+    )
+    config.update(overrides)
+    if manifest["methods"][args.method]["sparse_method"] == "omnikv":
+        validate_omnikv_benchmark_config(config)
+    print(json.dumps(config, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+
+
+if __name__ == "__main__":
+    main()

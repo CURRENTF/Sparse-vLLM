@@ -39,10 +39,6 @@ from sparsevllm.utils.context import get_context
 from sparsevllm.utils.log import logger
 from sparsevllm.utils.weight_target import WeightTarget
 from sparsevllm.engine.recurrent_state_manager import RecurrentStateSpec, RecurrentTensorSpec
-from sparsevllm.kernels.triton.qwen3_5.causal_conv1d import causal_conv1d_fn
-from sparsevllm.kernels.triton.qwen3_5.fused_gdn_gating import fused_gdn_gating
-from sparsevllm.kernels.triton.qwen3_5.gated_rmsnorm import gated_rmsnorm_forward
-from sparsevllm.kernels.triton.qwen3_5.gdn_decode_pack import conv_pack_gdn_decode_inputs
 
 
 def _get_rope_theta(config) -> float:
@@ -328,18 +324,22 @@ class Qwen35GatedRMSNorm(nn.Module):
         super().__init__()
         self.eps = float(eps)
         self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.gated_delta_rule_op: PreparedGatedDeltaRuleOp | None = None
 
     def forward(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
         if x.shape != gate.shape:
             raise RuntimeError(f"qwen3_5 gated RMSNorm shape mismatch: x={tuple(x.shape)} gate={tuple(gate.shape)}.")
         if not x.is_cuda:
             raise RuntimeError("qwen3_5 linear attention requires CUDA LightLLM kernels; CPU fallback is not supported.")
-        return gated_rmsnorm_forward(
-            x=x.contiguous(),
+        if self.gated_delta_rule_op is None:
+            raise RuntimeError(
+                "qwen3_5 gated RMSNorm requires a prepared GDN provider."
+            )
+        return self.gated_delta_rule_op.run_gated_rmsnorm(
+            x=x,
             weight=self.weight,
-            bias=None,
             eps=self.eps,
-            z=gate.contiguous(),
+            gate=gate,
         )
 
 
@@ -453,6 +453,13 @@ class Qwen35LinearAttention(nn.Module):
         self.A_log.weight_loader = self._tp_vector_weight_loader
         self.dt_bias.weight_loader = self._tp_vector_weight_loader
         self.gated_delta_rule_op: PreparedGatedDeltaRuleOp | None = None
+
+    def bind_gated_delta_rule_op(
+        self,
+        gated_delta_rule_op: PreparedGatedDeltaRuleOp,
+    ) -> None:
+        self.gated_delta_rule_op = gated_delta_rule_op
+        self.norm.gated_delta_rule_op = gated_delta_rule_op
 
     @staticmethod
     def _split_row_block_scale(loaded_scale: torch.Tensor | None, row_sizes: list[int]) -> list[torch.Tensor | None]:
@@ -720,6 +727,10 @@ class Qwen35LinearAttention(nn.Module):
         )
 
     def _prefill_gdn(self, mixed_qkv: torch.Tensor, z: torch.Tensor, b: torch.Tensor, a: torch.Tensor, context, recurrent_state_manager):
+        if self.gated_delta_rule_op is None:
+            raise RuntimeError(
+                "qwen3_5 linear attention requires a prepared GDN provider."
+            )
         if context.cu_seqlens_q is None:
             raise RuntimeError("qwen3_5 prefill linear attention requires cu_seqlens_q.")
         conv_states, recurrent_states, has_initial = self._load_batch_states(
@@ -729,25 +740,26 @@ class Qwen35LinearAttention(nn.Module):
             activation_dtype=mixed_qkv.dtype,
             device=mixed_qkv.device,
         )
-        g, beta = fused_gdn_gating(self.A_log, a, b, self.dt_bias)
-        mixed_qkv = causal_conv1d_fn(
-            mixed_qkv.transpose(0, 1),
-            self.conv1d.weight,
+        g, beta = self.gated_delta_rule_op.run_gating(
+            A_log=self.A_log,
+            a=a,
+            b=b,
+            dt_bias=self.dt_bias,
+        )
+        mixed_qkv = self.gated_delta_rule_op.run_prefill_conv(
+            mixed_qkv=mixed_qkv,
+            weight=self.conv1d.weight,
             bias=self.conv1d.bias,
             query_start_loc=context.cu_seqlens_q,
             cache_indices=torch.arange(len(context.seqs), dtype=torch.int32, device=mixed_qkv.device),
             has_initial_state=has_initial,
             conv_states=conv_states,
             activation=self.activation,
-        ).transpose(0, 1)
+        )
         q, k, v = torch.split(mixed_qkv, [self.tp_key_dim, self.tp_key_dim, self.tp_value_dim], dim=-1)
         q = q.view(1, -1, self.num_k_heads, self.head_k_dim)
         k = k.view(1, -1, self.num_k_heads, self.head_k_dim)
         v = v.view(1, -1, self.num_v_heads, self.head_v_dim)
-        if self.gated_delta_rule_op is None:
-            raise RuntimeError(
-                "qwen3_5 linear attention requires a prepared GDN provider."
-            )
         core_attn_out, last_recurrent_state = self.gated_delta_rule_op.run_prefill(
             q=q,
             k=k,
@@ -761,6 +773,10 @@ class Qwen35LinearAttention(nn.Module):
         return core_attn_out, z
 
     def _decode_gdn(self, mixed_qkv: torch.Tensor, z: torch.Tensor, b: torch.Tensor, a: torch.Tensor, context, recurrent_state_manager):
+        if self.gated_delta_rule_op is None:
+            raise RuntimeError(
+                "qwen3_5 linear attention requires a prepared GDN provider."
+            )
         token_batch = int(mixed_qkv.shape[0])
         state_buffers, state_indices = recurrent_state_manager.get_decode_layer_state(
             context.seqs,
@@ -771,26 +787,22 @@ class Qwen35LinearAttention(nn.Module):
         )
         conv_states = state_buffers["conv_state"]
         recurrent_states = state_buffers["recurrent_state"]
-        q, k, v, z, a, b = conv_pack_gdn_decode_inputs(
-            mixed_qkv,
-            z,
-            a,
-            b,
-            conv_states,
-            self.conv1d.weight,
-            self.conv1d.bias,
-            state_indices,
-            self.activation,
-            self.conv_kernel_dim,
-            self.num_k_heads,
-            self.head_k_dim,
-            self.num_v_heads,
-            self.head_v_dim,
+        q, k, v, z, a, b = self.gated_delta_rule_op.prepare_decode_inputs(
+            mixed_qkv=mixed_qkv,
+            z_raw=z,
+            a_raw=a,
+            b_raw=b,
+            conv_state=conv_states,
+            conv_weight=self.conv1d.weight,
+            conv_bias=self.conv1d.bias,
+            conv_state_indices=state_indices,
+            activation=self.activation,
+            conv_size=self.conv_kernel_dim,
+            num_k_heads=self.num_k_heads,
+            head_k_dim=self.head_k_dim,
+            num_v_heads=self.num_v_heads,
+            head_v_dim=self.head_v_dim,
         )
-        if self.gated_delta_rule_op is None:
-            raise RuntimeError(
-                "qwen3_5 linear attention requires a prepared GDN provider."
-            )
         core_attn_out = self.gated_delta_rule_op.run_decode(
             q=q,
             k=k,

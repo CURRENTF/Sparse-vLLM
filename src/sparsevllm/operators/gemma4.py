@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from importlib.metadata import PackageNotFoundError, version
-from importlib.util import find_spec
 
 import torch
 import torch.nn.functional as F
 
 import sparsevllm.platforms as platforms
+from sparsevllm.kernels.external.flashinfer.prefill import (
+    flashinfer_paged_prefill_support,
+)
 from sparsevllm.layers.rotary_embedding import apply_rotary_emb
 from sparsevllm.operators.registry import (
     OpRegistry,
@@ -32,6 +33,47 @@ class Gemma4OpSpec:
 class Gemma4OperatorProvider:
     name = ""
     priority = 0
+
+    def __init__(self) -> None:
+        self._attention_backends: list[object] = []
+
+    def _register_attention_backend(self, backend):
+        self._attention_backends.append(backend)
+        return backend
+
+    def binding_metadata(self) -> dict[str, object]:
+        return {
+            "implementation_kind": "composite_provider",
+            "implementation_source": "repo_triton",
+            "attention_dispatch": {
+                "prefill_routes": [
+                    "triton_multimodal_context",
+                    "triton_context",
+                ],
+                "decode_routes": [
+                    "triton_single_block",
+                    "triton_two_stage",
+                ],
+            },
+        }
+
+    def runtime_kernel_stats(self) -> dict[str, object]:
+        kernel_paths: dict[str, dict[str, int]] = {}
+        for backend in self._attention_backends:
+            stats_fn = getattr(backend, "runtime_kernel_stats", None)
+            if not callable(stats_fn):
+                continue
+            for path, counts in stats_fn().get("kernel_paths", {}).items():
+                aggregate = kernel_paths.setdefault(str(path), {})
+                for key, count in counts.items():
+                    aggregate[str(key)] = int(aggregate.get(str(key), 0)) + int(count)
+        return {
+            "kernel_paths": {
+                path: dict(sorted(counts.items()))
+                for path, counts in sorted(kernel_paths.items())
+            },
+            "fallback_reasons": {},
+        }
 
     def attention_backend(self, *, sliding_window: int | None):
         raise NotImplementedError
@@ -105,7 +147,9 @@ class TritonGemma4OperatorProvider(Gemma4OperatorProvider):
     def attention_backend(self, *, sliding_window: int | None):
         from sparsevllm.operators.gemma4_attention import Gemma4AttentionBackend
 
-        return Gemma4AttentionBackend(sliding_window=sliding_window)
+        return self._register_attention_backend(
+            Gemma4AttentionBackend(sliding_window=sliding_window)
+        )
 
     def rmsnorm(self, x, weight, eps):
         from sparsevllm.kernels.triton.gemma4_rmsnorm import gemma4_rmsnorm
@@ -170,37 +214,65 @@ class H20Gemma4OperatorProvider(TritonGemma4OperatorProvider):
             return SupportResult.no(
                 f"requires CUDA runtime >= 12.8, got {caps.runtime_version or 'unknown'}"
             )
-        if find_spec("flashinfer") is None:
-            return SupportResult.no("flashinfer is not installed")
-        try:
-            installed = version("flashinfer-python")
-        except PackageNotFoundError:
-            return SupportResult.no("flashinfer-python package metadata is unavailable")
-        try:
-            numeric = tuple(int(part) for part in installed.split(".")[:3])
-        except ValueError:
-            return SupportResult.no(
-                f"cannot parse flashinfer-python version {installed!r}"
-            )
-        if numeric < (0, 6, 15):
-            return SupportResult.no(
-                f"requires flashinfer-python >= 0.6.15, got {installed}"
-            )
-        return SupportResult.yes()
+        supported, reason = flashinfer_paged_prefill_support("fa2")
+        return SupportResult.yes(reason) if supported else SupportResult.no(reason)
 
-    def __init__(self) -> None:
+    @classmethod
+    def bind(
+        cls,
+        spec: Gemma4OpSpec,
+        caps: DeviceCaps,
+        **kwargs,
+    ) -> H20Gemma4OperatorProvider:
+        del spec
+        if kwargs:
+            raise TypeError(
+                f"{cls.name} does not accept provider arguments: {sorted(kwargs)}"
+            )
+        return cls(device_index=caps.device_index)
+
+    def __init__(self, *, device_index: int | None = None) -> None:
+        super().__init__()
         from sparsevllm.operators.gemma4_attention import Gemma4FlashInferPrefill
 
         self._prefill = Gemma4FlashInferPrefill()
+        self._prefill.prepare(device_index=device_index)
+
+    def binding_metadata(self) -> dict[str, object]:
+        return {
+            **super().binding_metadata(),
+            "implementation_source": "flashinfer-python+repo_triton",
+            "attention_dispatch": {
+                "prefill_routes": [
+                    "triton_multimodal_context",
+                    "flashinfer_paged_prefill_fa2",
+                    "triton_context",
+                ],
+                "decode_routes": [
+                    "triton_window",
+                    "triton_single_block",
+                    "triton_global",
+                    "triton_two_stage",
+                ],
+            },
+            "flashinfer_backend": "fa2",
+            "flashinfer_prepared_during_bind": True,
+        }
+
+    def close(self) -> None:
+        self._prefill.close()
+        self._attention_backends.clear()
 
     def attention_backend(self, *, sliding_window: int | None):
         from sparsevllm.operators.gemma4_attention import Gemma4AttentionBackend
 
-        return Gemma4AttentionBackend(
-            sliding_window=sliding_window,
-            flashinfer_prefill=self._prefill,
-            use_window_decode=True,
-            global_decode_heads_per_program=4,
+        return self._register_attention_backend(
+            Gemma4AttentionBackend(
+                sliding_window=sliding_window,
+                flashinfer_prefill=self._prefill,
+                use_window_decode=True,
+                global_decode_heads_per_program=4,
+            )
         )
 
 
@@ -212,7 +284,9 @@ class TorchGemma4OperatorProvider(Gemma4OperatorProvider):
     def attention_backend(self, *, sliding_window: int | None):
         from sparsevllm.operators.gemma4_attention import Gemma4AttentionBackend
 
-        return Gemma4AttentionBackend(sliding_window=sliding_window)
+        return self._register_attention_backend(
+            Gemma4AttentionBackend(sliding_window=sliding_window)
+        )
 
     def rmsnorm(self, x, weight, eps):
         output = x.float()

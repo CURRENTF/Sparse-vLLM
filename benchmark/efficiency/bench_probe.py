@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
 import json
 import os
+import platform
 import statistics
 import subprocess
 import sys
@@ -30,10 +32,87 @@ from benchmark.efficiency.workload import (
     derive_trace_seed,
     trace_metadata,
 )
+from benchmark.sparsevllm_regression.manifest import (
+    validate_omnikv_benchmark_config,
+)
 
 
 class HardwareMetricError(RuntimeError):
     """Raised when directly sampled GPU metrics are unavailable or incomplete."""
+
+
+def _installed_distribution_version(name: str) -> str | None:
+    try:
+        return importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
+def _physical_gpu_metadata(physical_gpu_ids: list[int]) -> list[dict[str, Any]]:
+    result = subprocess.run(
+        [
+            "nvidia-smi",
+            "-i",
+            ",".join(str(gpu_id) for gpu_id in physical_gpu_ids),
+            "--query-gpu=index,name,compute_cap,memory.total,driver_version",
+            "--format=csv,noheader,nounits",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    devices = []
+    for line in result.stdout.splitlines():
+        if not line.strip():
+            continue
+        fields = [field.strip() for field in line.split(",")]
+        if len(fields) != 5:
+            raise RuntimeError(f"Unexpected nvidia-smi GPU metadata row: {line!r}.")
+        gpu_id, name, compute_capability, total_memory_mib, driver_version = fields
+        capability_parts = compute_capability.split(".")
+        if len(capability_parts) != 2:
+            raise RuntimeError(
+                f"Unexpected nvidia-smi compute capability {compute_capability!r}."
+            )
+        devices.append(
+            {
+                "physical_device_index": int(gpu_id),
+                "name": name,
+                "compute_capability": [int(part) for part in capability_parts],
+                "total_memory_mib": int(total_memory_mib),
+                "driver_version": driver_version,
+            }
+        )
+    actual_ids = {device["physical_device_index"] for device in devices}
+    if actual_ids != set(physical_gpu_ids):
+        raise RuntimeError(
+            "nvidia-smi GPU metadata did not cover the selected devices: "
+            f"expected={sorted(physical_gpu_ids)} actual={sorted(actual_ids)}."
+        )
+    return devices
+
+
+def _runtime_environment_metadata(physical_gpu_ids: list[int]) -> dict[str, Any]:
+    import torch
+
+    return {
+        "python_executable": sys.executable,
+        "python_version": platform.python_version(),
+        "platform": platform.platform(),
+        "torch_version": torch.__version__,
+        "torch_cuda_version": torch.version.cuda,
+        "packages": {
+            name: _installed_distribution_version(name)
+            for name in (
+                "vllm",
+                "triton",
+                "flashinfer-python",
+                "sglang-kernel",
+                "tilelang",
+            )
+        },
+        "physical_cuda_devices": _physical_gpu_metadata(physical_gpu_ids),
+    }
 
 
 def _git_metadata() -> dict[str, Any]:
@@ -400,6 +479,11 @@ def _resolve_sparse_probe_protocol(
         hyper_params.setdefault("h2o_prefill_budget", 8192)
         hyper_params.setdefault("h2o_recent_ratio", 0.5)
         hyper_params.setdefault("h2o_prefill_score_window", 128)
+    elif args.sparse_method == "omnikv":
+        validate_omnikv_benchmark_config(
+            hyper_params,
+            allow_single_full_layer=args.allow_single_omnikv_full_layer,
+        )
 
     if args.sparse_method in {"snapkv", "h2o"}:
         configured_mode = hyper_params.get("sparse_prefill_score_mode")
@@ -752,6 +836,15 @@ def run_sparsevllm_probe(
                     **{key: value for key, value in hardware.items() if key != "per_gpu"},
                 }
                 results.append(summary_row)
+
+    operator_runtime_stats = llm.operator_runtime_stats()
+    with (output_dir / "operator_runtime_stats.json").open("w", encoding="utf-8") as handle:
+        json.dump(
+            {"status": "success", "world_ranks": operator_runtime_stats},
+            handle,
+            indent=2,
+            ensure_ascii=False,
+        )
 
     if hasattr(llm, "exit"):
         llm.exit()
@@ -1536,6 +1629,11 @@ def parse_args():
     parser.add_argument("--output-dir", type=str, required=True)
     parser.add_argument("--hyper-params", type=str, default="{}")
     parser.add_argument(
+        "--allow-single-omnikv-full-layer",
+        action="store_true",
+        help="Allow an explicit single-full-layer OmniKV ablation.",
+    )
+    parser.add_argument(
         "--sparse-prefill-score-mode",
         choices=["probability", "logits"],
         default=None,
@@ -1594,6 +1692,7 @@ def main():
         "summary.json",
         "comparison_report.md",
         "run_status.json",
+        "operator_runtime_stats.json",
     )
     collisions = [name for name in artifact_names if (output_dir / name).exists()]
     if collisions:
@@ -1607,6 +1706,7 @@ def main():
     try:
         model_specs = ModelArchitectureSpecs.from_model_path_or_name(args.model_path)
         monitor_gpus = _monitor_gpu_ids(args.monitor_gpus)
+        runtime_environment = _runtime_environment_metadata(monitor_gpus)
     except Exception as exc:
         failure = {
             "status": "metric_failed",
@@ -1651,6 +1751,7 @@ def main():
             )
             if key in os.environ
         },
+        "runtime_environment": runtime_environment,
         "hardware_metrics": {
             "source": "nvidia-smi sampled activity",
             "physical_gpu_ids": monitor_gpus,

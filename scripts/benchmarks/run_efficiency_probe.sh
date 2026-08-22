@@ -21,6 +21,9 @@ OUTPUT_LENGTH_JITTER="${OUTPUT_LENGTH_JITTER:-0.25}"
 CHURN_REQUEST_MULTIPLIER="${CHURN_REQUEST_MULTIPLIER:-4}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-8192}"
 SPARSE_PREFILL_SCORE_MODE="${SPARSE_PREFILL_SCORE_MODE:-probability}"
+DELTAKV_COMPRESSOR_PATH="${DELTAKV_COMPRESSOR_PATH:-}"
+OMNIKV_FULL_ATTENTION_LAYERS="${OMNIKV_FULL_ATTENTION_LAYERS:-}"
+MANIFEST_MODEL_ID="${BENCH_MANIFEST_MODEL_ID:-}"
 case "${SPARSE_PREFILL_SCORE_MODE}" in
   probability|logits) ;;
   *)
@@ -32,6 +35,7 @@ esac
 # 1. Environment & Path Configurations
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 BASE_OUT="${SPARSEVLLM_OUTPUT_DIR:-outputs}/efficiency_probe_$(date +%Y%m%d_%H%M%S)"
+MANIFEST_PATH="${SPARSEVLLM_REGRESSION_MANIFEST:-${REPO_ROOT}/benchmark/sparsevllm_regression/manifest.json}"
 mkdir -p "${BASE_OUT}"
 
 case "${MODEL_NAME}" in
@@ -46,6 +50,9 @@ case "${MODEL_NAME}" in
   qwen25_7b)
     MODEL_PATH="${MODEL_PATH:-Qwen/Qwen2.5-7B-Instruct-1M}"
     TP_SIZE=1
+    if [ -z "${MANIFEST_MODEL_ID}" ]; then
+      MANIFEST_MODEL_ID=qwen25_7b
+    fi
     ;;
   *)
     MODEL_PATH="${MODEL_NAME}"
@@ -119,6 +126,10 @@ for SYS in "${SYS_ARR[@]}"; do
     svllm-deltakv)
       ENGINE="sparsevllm"
       SPARSE_METHOD="deltakv"
+      if [ -z "${DELTAKV_COMPRESSOR_PATH}" ]; then
+        echo "ERROR: svllm-deltakv requires DELTAKV_COMPRESSOR_PATH." >&2
+        exit 2
+      fi
       ;;
     vllm-vanilla|vllm)
       ENGINE="vllm"
@@ -129,6 +140,35 @@ for SYS in "${SYS_ARR[@]}"; do
       SPARSE_METHOD="${SYS_TRIM}"
       ;;
   esac
+
+  SYSTEM_HPARAMS="{}"
+  if [ "${ENGINE}" = sparsevllm ]; then
+    OVERRIDES_JSON=$("${PYTHON_BIN}" -c '
+import json, sys
+tp_size, method, score_mode, compressor, omnikv_layers = sys.argv[1:]
+params = {"tensor_parallel_size": int(tp_size), "gpu_memory_utilization": 0.85}
+if method in {"snapkv", "h2o"}:
+    params["sparse_prefill_score_mode"] = score_mode
+if method == "deltakv":
+    params["deltakv_checkpoint_path"] = compressor
+if method == "omnikv" and omnikv_layers:
+    params["full_attention_layers"] = omnikv_layers
+print(json.dumps(params, separators=(",", ":")))
+' "${TP_SIZE}" "${SPARSE_METHOD}" "${SPARSE_PREFILL_SCORE_MODE}" "${DELTAKV_COMPRESSOR_PATH}" "${OMNIKV_FULL_ATTENTION_LAYERS}")
+    CONFIG_ARGS=(
+      -m benchmark.sparsevllm_regression.manifest
+      --manifest "${MANIFEST_PATH}"
+      --method "${SPARSE_METHOD}"
+      --overrides-json "${OVERRIDES_JSON}"
+    )
+    if [ -n "${MANIFEST_MODEL_ID}" ]; then
+      CONFIG_ARGS+=(--model-id "${MANIFEST_MODEL_ID}")
+    fi
+    if [ "${SPARSE_METHOD}" = omnikv ] && [ -z "${OMNIKV_FULL_ATTENTION_LAYERS}" ]; then
+      CONFIG_ARGS+=(--require-model-config)
+    fi
+    SYSTEM_HPARAMS=$("${PYTHON_BIN}" "${CONFIG_ARGS[@]}")
+  fi
 
   # 2. Execute Probe. The probe samples hardware only around measured cases.
   PROBE_ARGS=(
@@ -150,8 +190,9 @@ for SYS in "${SYS_ARR[@]}"; do
     --num-iters "${NUM_ITERS}"
     --monitor-gpus "${GPUS}"
     --output-dir "${SYS_OUT}"
+    --hyper-params "${SYSTEM_HPARAMS}"
   )
-  if [ "${SPARSE_METHOD}" = "snapkv" ]; then
+  if [ "${SPARSE_METHOD}" = "snapkv" ] || [ "${SPARSE_METHOD}" = "h2o" ]; then
     PROBE_ARGS+=(--sparse-prefill-score-mode "${SPARSE_PREFILL_SCORE_MODE}")
   fi
   "${PYTHON_BIN}" -u "${REPO_ROOT}/benchmark/efficiency/bench_probe.py" "${PROBE_ARGS[@]}"

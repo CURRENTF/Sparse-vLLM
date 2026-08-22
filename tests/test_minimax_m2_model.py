@@ -23,6 +23,25 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+class _TestMiniMaxRouterProvider:
+    name = "test_minimax_router"
+
+    def run(self, spec, logits, correction_bias, **_kwargs):
+        scores = torch.sigmoid(logits)
+        ids = torch.topk(scores + correction_bias, spec.top_k, dim=-1).indices
+        weights = scores.gather(1, ids)
+        return weights / weights.sum(dim=-1, keepdim=True), ids
+
+
+@pytest.fixture(autouse=True)
+def _bind_test_router_provider():
+    with patch(
+        "sparsevllm.models.minimax_m2.resolve_moe_router_provider",
+        return_value=_TestMiniMaxRouterProvider(),
+    ):
+        yield
+
+
 def _rmsnorm_reference(
     x: torch.Tensor,
     weight: torch.Tensor,

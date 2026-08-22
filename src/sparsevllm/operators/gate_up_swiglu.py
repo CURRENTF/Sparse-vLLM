@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 
 import sparsevllm.platforms as platforms
+from sparsevllm.platforms import device_runtime
 from sparsevllm.operators.registry import OpRegistry, OpResolver, SupportResult
 from sparsevllm.platforms.interface import DeviceCaps, PlatformEnum
 
@@ -37,6 +38,9 @@ class GateUpSwiGLUOpSpec:
 class GateUpSwiGLUProvider:
     name = ""
     priority = 0
+
+    def binding_metadata(self) -> dict[str, object]:
+        return {"implementation_kind": "atomic_provider"}
 
     def run(
         self,
@@ -77,9 +81,49 @@ class NativeGateUpSwiGLUProvider(GateUpSwiGLUProvider):
         return F.silu(gate, inplace=True).mul_(up)
 
 
-@GATE_UP_SWIGLU_REGISTRY.register
-class H20GateUpSwiGLUProvider(NativeGateUpSwiGLUProvider):
+class H20DecodeGateUpSwiGLUProvider(GateUpSwiGLUProvider):
     name = "h20_triton_decode"
+
+    def binding_metadata(self) -> dict[str, object]:
+        return {
+            **super().binding_metadata(),
+            "implementation_source": "repo_triton",
+            "kernel_path": "triton.gate_up_swiglu.h20_gate_up_swiglu",
+        }
+
+    def run(
+        self,
+        spec: GateUpSwiGLUOpSpec,
+        inputs: torch.Tensor,
+        projection,
+    ) -> torch.Tensor:
+        del spec
+        if int(inputs.shape[0]) != 1:
+            raise ValueError(
+                "H20 decode gate/up SwiGLU requires exactly one token, got "
+                f"M={inputs.shape[0]}."
+            )
+        from sparsevllm.kernels.triton.gate_up_swiglu import h20_gate_up_swiglu
+
+        return h20_gate_up_swiglu(inputs, projection.weight)
+
+
+@dataclass(frozen=True, slots=True)
+class GateUpSwiGLUDispatchRoute:
+    min_tokens: int
+    max_tokens: int | None
+    provider: GateUpSwiGLUProvider
+    kernel_path: str
+
+    def matches(self, num_tokens: int) -> bool:
+        return num_tokens >= self.min_tokens and (
+            self.max_tokens is None or num_tokens <= self.max_tokens
+        )
+
+
+@GATE_UP_SWIGLU_REGISTRY.register
+class H20GateUpSwiGLUDispatchPlan(GateUpSwiGLUProvider):
+    name = "h20_gate_up_dispatch_plan"
     priority = 20
 
     @classmethod
@@ -118,17 +162,95 @@ class H20GateUpSwiGLUProvider(NativeGateUpSwiGLUProvider):
             )
         return SupportResult.yes()
 
+    @classmethod
+    def bind(
+        cls,
+        spec: GateUpSwiGLUOpSpec,
+        caps: DeviceCaps,
+        **kwargs,
+    ) -> H20GateUpSwiGLUDispatchPlan:
+        del caps
+        if kwargs:
+            raise TypeError(
+                f"{cls.name} does not accept provider arguments: {sorted(kwargs)}"
+            )
+        return cls(spec)
+
+    def __init__(self, spec: GateUpSwiGLUOpSpec) -> None:
+        self.spec = spec
+        self.routes = (
+            GateUpSwiGLUDispatchRoute(
+                1,
+                1,
+                H20DecodeGateUpSwiGLUProvider(),
+                "triton.gate_up_swiglu.h20_gate_up_swiglu",
+            ),
+            GateUpSwiGLUDispatchRoute(
+                2,
+                None,
+                NativeGateUpSwiGLUProvider(),
+                "native.projection+silu_mul",
+            ),
+        )
+        self._runtime_kernel_path_counts: dict[str, dict[str, int]] = {}
+
+    def _route(self, num_tokens: int) -> GateUpSwiGLUDispatchRoute:
+        if num_tokens <= 0:
+            raise ValueError("Gate/up SwiGLU requires at least one token.")
+        for route in self.routes:
+            if route.matches(num_tokens):
+                return route
+        raise RuntimeError(f"{self.name} has no prepared route for M={num_tokens}.")
+
+    def _record_runtime_kernel_path(self, path: str) -> None:
+        counts = self._runtime_kernel_path_counts.setdefault(
+            path,
+            {"eager_dispatches": 0, "cuda_graph_capture_dispatches": 0},
+        )
+        key = (
+            "cuda_graph_capture_dispatches"
+            if device_runtime.is_stream_capturing()
+            else "eager_dispatches"
+        )
+        counts[key] += 1
+
+    def binding_metadata(self) -> dict[str, object]:
+        return {
+            "implementation_kind": "dispatch_plan",
+            "routes": [
+                {
+                    "min_tokens": route.min_tokens,
+                    "max_tokens": route.max_tokens,
+                    "provider": route.provider.name,
+                    "kernel_path": route.kernel_path,
+                    "provider_metadata": route.provider.binding_metadata(),
+                }
+                for route in self.routes
+            ],
+        }
+
+    def runtime_kernel_stats(self) -> dict[str, object]:
+        return {
+            "kernel_paths": {
+                path: dict(sorted(counts.items()))
+                for path, counts in sorted(self._runtime_kernel_path_counts.items())
+            },
+            "fallback_reasons": {},
+        }
+
     def run(
         self,
         spec: GateUpSwiGLUOpSpec,
         inputs: torch.Tensor,
         projection,
     ) -> torch.Tensor:
-        if inputs.shape[0] != 1:
-            return super().run(spec, inputs, projection)
-        from sparsevllm.kernels.triton.gate_up_swiglu import h20_gate_up_swiglu
-
-        return h20_gate_up_swiglu(inputs, projection.weight)
+        if spec is not self.spec:
+            raise RuntimeError(
+                f"{self.name} was bound for {self.spec!r}, got {spec!r}."
+            )
+        route = self._route(int(inputs.shape[0]))
+        self._record_runtime_kernel_path(route.kernel_path)
+        return route.provider.run(spec, inputs, projection)
 
 
 def resolve_gate_up_swiglu_provider(

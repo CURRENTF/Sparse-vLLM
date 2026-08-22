@@ -79,6 +79,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top_p", type=float, default=1.0)
     parser.add_argument("--top_k", type=int, default=-1)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--enable_prefix_caching", action="store_true")
     parser.add_argument("--e", action="store_true")
     return parser.parse_args()
 
@@ -179,6 +181,8 @@ def main() -> None:
         tensor_parallel_size=args.tensor_parallel_size,
         gpu_memory_utilization=args.gpu_memory_utilization,
         max_model_len=args.max_model_len,
+        seed=args.seed,
+        enable_prefix_caching=args.enable_prefix_caching,
         trust_remote_code=True,
     )
 

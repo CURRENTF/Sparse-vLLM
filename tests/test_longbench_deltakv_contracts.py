@@ -7,9 +7,92 @@ from unittest.mock import patch
 
 from benchmark.long_bench import pred as longbench_pred
 from benchmark.long_bench.metrics import classification_score, qa_f1_score
+from benchmark.sparsevllm_regression.manifest import load_manifest, resolve_method_config
 
 
 class LongBenchDeltaKVContractsTest(unittest.TestCase):
+    def _omnikv_args(self, hyper_param):
+        return SimpleNamespace(
+            hyper_param=json.dumps(hyper_param),
+            sparse_method="omnikv",
+            max_model_len=32768,
+            deltakv_checkpoint_path=None,
+            allow_single_omnikv_full_layer=False,
+        )
+
+    def test_longbench_requires_complete_calibrated_omnikv_config(self):
+        args = self._omnikv_args({})
+
+        with self.assertRaisesRegex(ValueError, "explicit calibrated method config"):
+            longbench_pred._build_infer_config(args)
+
+    def test_longbench_forces_prefix_caching_off(self):
+        args = self._omnikv_args(
+            resolve_method_config(
+                load_manifest()["methods"]["omnikv"],
+                model_id="qwen25_7b",
+                require_model_config=True,
+            )
+        )
+        config = longbench_pred._build_infer_config(args)
+        self.assertIs(config["enable_prefix_caching"], False)
+
+        requested = json.loads(args.hyper_param)
+        requested["enable_prefix_caching"] = True
+        args.hyper_param = json.dumps(requested)
+        with self.assertRaisesRegex(ValueError, "enable_prefix_caching=False"):
+            longbench_pred._build_infer_config(args)
+
+    def test_longbench_rejects_accidental_single_layer_omnikv_config(self):
+        config = resolve_method_config(load_manifest()["methods"]["omnikv"])
+        config["full_attention_layers"] = "0"
+        args = self._omnikv_args(config)
+
+        with self.assertRaisesRegex(ValueError, "single full-attention layer"):
+            longbench_pred._build_infer_config(args)
+
+        args.allow_single_omnikv_full_layer = True
+        self.assertEqual(
+            longbench_pred._build_infer_config(args)["full_attention_layers"],
+            "0",
+        )
+
+    def test_longbench_records_requested_and_effective_omnikv_config(self):
+        config = resolve_method_config(
+            load_manifest()["methods"]["omnikv"],
+            model_id="qwen25_7b",
+            require_model_config=True,
+        )
+        args = self._omnikv_args(config)
+        infer_config = longbench_pred._build_infer_config(args)
+        requested = longbench_pred._requested_runtime_config(args, infer_config)
+        self.assertEqual(
+            requested["normalized"]["full_attn_layers"],
+            "0,2,4,11,16,22",
+        )
+
+        runtime_info = {
+            "benchmark_config": {
+                "full_attn_layers": [0, 2, 4, 11, 16, 22],
+                "obs_layer_ids": [0, 2, 4, 11, 16, 22],
+            }
+        }
+        generate_fn = SimpleNamespace(
+            _sparsevllm_llm=SimpleNamespace(
+                worker_info=lambda **_kwargs: runtime_info,
+            )
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            resolved = Path(tmp) / "resolved_config.json"
+            resolved.write_text(json.dumps({"backend": "sparsevllm"}), encoding="utf-8")
+            longbench_pred._record_effective_runtime_config(
+                generate_fn=generate_fn,
+                out_root=tmp,
+            )
+            recorded = json.loads(resolved.read_text(encoding="utf-8"))
+
+        self.assertEqual(recorded["effective_runtime"], runtime_info)
+
     def test_longbench_accepts_explicit_runtime_context_limit(self):
         with patch.object(
             longbench_pred.sys,
@@ -25,6 +108,10 @@ class LongBenchDeltaKVContractsTest(unittest.TestCase):
             args = longbench_pred.parse_args()
 
         self.assertEqual(args.max_model_len, 32768)
+        self.assertEqual(args.temperature, 0.0)
+        self.assertEqual(args.top_p, 1.0)
+        self.assertEqual(args.top_k, 1)
+        self.assertEqual(args.seed, 42)
 
     def test_no_chat_datasets_remain_raw_for_every_thinking_mode(self):
         for dataset in longbench_pred.NO_CHAT_TEMPLATE_DATASETS:

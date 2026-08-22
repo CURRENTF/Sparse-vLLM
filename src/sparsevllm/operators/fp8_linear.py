@@ -4,6 +4,7 @@ import json
 from dataclasses import dataclass
 from functools import lru_cache
 from importlib.resources import files
+from threading import Lock
 
 import torch
 
@@ -130,6 +131,50 @@ FP8_LINEAR_REGISTRY: OpRegistry[Fp8LinearSpec, Fp8LinearProvider] = OpRegistry(
     "block-scaled FP8 Linear"
 )
 
+
+@dataclass(frozen=True, slots=True)
+class _Sm120ActivationWorkspace:
+    quantized: torch.Tensor
+    scales: torch.Tensor
+
+
+_SM120_ACTIVATION_WORKSPACES: dict[
+    tuple[str, int | None, int, int], _Sm120ActivationWorkspace
+] = {}
+_SM120_ACTIVATION_WORKSPACE_LOCK = Lock()
+
+
+def _sm120_activation_workspace(inputs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    rows, features = map(int, inputs.shape)
+    if rows <= 0:
+        raise ValueError("SM120 FP8 Linear requires at least one activation row.")
+    capacity = 1 << max(rows - 1, 0).bit_length()
+    key = (inputs.device.type, inputs.device.index, features, capacity)
+    workspace = _SM120_ACTIVATION_WORKSPACES.get(key)
+    if workspace is None:
+        if device_runtime.is_stream_capturing():
+            raise RuntimeError(
+                "SM120 FP8 Linear activation workspace was not created during "
+                f"warmup for shape bucket M<={capacity}, K={features}."
+            )
+        with _SM120_ACTIVATION_WORKSPACE_LOCK:
+            workspace = _SM120_ACTIVATION_WORKSPACES.get(key)
+            if workspace is None:
+                workspace = _Sm120ActivationWorkspace(
+                    quantized=torch.empty(
+                        (capacity, features),
+                        dtype=torch.float8_e4m3fn,
+                        device=inputs.device,
+                    ),
+                    scales=torch.empty(
+                        (capacity, features // 128),
+                        dtype=torch.float32,
+                        device=inputs.device,
+                    ),
+                )
+                _SM120_ACTIVATION_WORKSPACES[key] = workspace
+    return workspace.quantized[:rows], workspace.scales[:rows]
+
 _SM120_FP8_LINEAR_PROFILE_RESOURCE = "profiles/sm120_fp8_linear.json"
 
 
@@ -162,28 +207,37 @@ def _load_sm120_fp8_linear_profile() -> tuple[
         "weight_layout_id": "block_128x128_nt_k_major",
         "cuda_graph": True,
     }
-    expected_toolchain = {
-        "torch": "2.11",
-        "cuda_runtime": "13.0",
-        "triton": "3.6",
-        "flashinfer_python": "0.6.15.post1",
-        "sglang_kernel": "0.4.5",
-    }
     for field, expected in (
         ("device", expected_device),
         ("contract", expected_contract),
-        ("toolchain", expected_toolchain),
     ):
         if payload.get(field) != expected:
             raise RuntimeError(
                 f"SM120 FP8 Linear profile {field} mismatch: "
                 f"{payload.get(field)!r}."
             )
+    toolchain = payload.get("toolchain")
+    required_toolchain_fields = {
+        "torch",
+        "cuda_runtime",
+        "triton",
+        "flashinfer_python",
+        "sglang_kernel",
+    }
+    if not isinstance(toolchain, dict) or set(toolchain) != required_toolchain_fields:
+        raise RuntimeError(
+            "SM120 FP8 Linear profile must record the complete profiled "
+            f"toolchain, got {toolchain!r}."
+        )
     if not isinstance(payload.get("profile_id"), str) or not isinstance(
         payload.get("provenance"), dict
     ):
         raise RuntimeError(
             "SM120 FP8 Linear profile must identify its provenance."
+        )
+    if payload.get("profile_status") not in {"tuned", "provisional"}:
+        raise RuntimeError(
+            "SM120 FP8 Linear profile_status must be 'tuned' or 'provisional'."
         )
     raw_routes = payload.get("routes")
     if not isinstance(raw_routes, list) or not raw_routes:
@@ -233,6 +287,16 @@ def _sm120_fp8_linear_profile_support(
             f"requires a profiled SM120 FP8 Linear shape, got {shape}"
         )
 
+    # Toolchain versions are profile provenance, not a substitute for runtime
+    # ABI/API probing. The atomic routes below independently validate their
+    # minimum versions and callable contracts before this plan can be bound.
+    return SupportResult.yes(
+        f"matched offline profile {payload['profile_id']}; "
+        "runtime route contracts are checked independently"
+    )
+
+
+def _sm120_fp8_linear_runtime_toolchain(caps: DeviceCaps) -> dict[str, str | None]:
     import triton
 
     from sparsevllm.kernels.external.flashinfer.support import (
@@ -242,19 +306,13 @@ def _sm120_fp8_linear_profile_support(
 
     flashinfer_health = flashinfer_kernel_health()
     sgl_health = sgl_kernel_health()
-    actual_toolchain = {
+    return {
         "torch": str(torch.__version__).split("+", 1)[0].rsplit(".", 1)[0],
         "cuda_runtime": str(caps.runtime_version),
         "triton": str(triton.__version__).rsplit(".", 1)[0],
         "flashinfer_python": flashinfer_health.version,
         "sglang_kernel": sgl_health.version,
     }
-    if actual_toolchain != payload["toolchain"]:
-        return SupportResult.no(
-            "profile toolchain mismatch: "
-            f"expected={payload['toolchain']}, got={actual_toolchain}"
-        )
-    return SupportResult.yes(f"matched offline profile {payload['profile_id']}")
 
 
 @FP8_LINEAR_REGISTRY.register
@@ -408,6 +466,7 @@ class FlashInferGroupwiseSm120Fp8LinearProvider(Fp8LinearProvider):
             "gemm": "flashinfer:gemm_fp8_nt_groupwise",
             "activation_scale_layout": "K-major_per_token_group128",
             "weight_scale_layout": "K-major_block128x128",
+            "activation_workspace": "shared_geometric_warmup_cache",
         }
 
     def __call__(self, x, weight, weight_scale_inv, bias=None):
@@ -426,12 +485,7 @@ class FlashInferGroupwiseSm120Fp8LinearProvider(Fp8LinearProvider):
 
         original_shape = x.shape[:-1]
         inputs = x.reshape(-1, x.shape[-1]).contiguous()
-        quantized = torch.empty_like(inputs, dtype=torch.float8_e4m3fn)
-        scales = torch.empty(
-            (int(inputs.shape[0]), int(inputs.shape[1]) // 128),
-            dtype=torch.float32,
-            device=inputs.device,
-        )
+        quantized, scales = _sm120_activation_workspace(inputs)
         fp8_info = torch.finfo(torch.float8_e4m3fn)
         sgl_per_token_group_quant_8bit(
             inputs,
@@ -532,6 +586,7 @@ class Sm120Fp8LinearDispatchPlan(Fp8LinearProvider):
         payload, profiles = _load_sm120_fp8_linear_profile()
         threshold = profiles[(spec.input_features, spec.output_features)]
         self.profile = payload
+        self.runtime_toolchain = _sm120_fp8_linear_runtime_toolchain(caps)
         self.routes = (
             Fp8LinearDispatchRoute(
                 0,
@@ -600,8 +655,13 @@ class Sm120Fp8LinearDispatchPlan(Fp8LinearProvider):
             "implementation_kind": "dispatch_plan",
             "weight_layout_id": self.spec.weight_layout_id,
             "profile_id": self.profile["profile_id"],
-            "profile_status": "tuned",
+            "profile_status": self.profile["profile_status"],
             "profile_source": dict(provenance),
+            "profiled_toolchain": dict(self.profile["toolchain"]),
+            "runtime_toolchain": dict(self.runtime_toolchain),
+            "profile_toolchain_match": (
+                self.runtime_toolchain == self.profile["toolchain"]
+            ),
             "routes": [
                 {
                     "min_tokens": route.min_tokens,

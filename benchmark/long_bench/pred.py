@@ -24,6 +24,10 @@ from transformers import AutoTokenizer, GenerationConfig
 import torch.distributed as dist
 from benchmark.model_adapters.sparsevllm import get_sparsevllm_generate_api
 from benchmark.long_bench.prompt_budget import encode_prompt_with_generation_budget
+from benchmark.sparsevllm_regression.manifest import (
+    validate_omnikv_benchmark_config,
+)
+from sparsevllm.configs.runtime_params import normalize_runtime_params
 from datetime import datetime
 
 BASE_PATH = os.getenv("SPARSEVLLM_OUTPUT_DIR", str(REPO_ROOT / "outputs"))
@@ -135,6 +139,106 @@ def strip_thinking_content(text: str) -> str:
     return text.split(closing_tag, 1)[1].lstrip()
 
 
+def _load_hyper_params(value: str | None) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if os.path.exists(value):
+        with open(value, "r", encoding="utf-8") as handle:
+            loaded = json.load(handle)
+    else:
+        try:
+            loaded = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"Failed to parse --hyper_param {value!r}; it is neither an existing "
+                f"JSON file nor a valid JSON object: {exc}"
+            ) from exc
+    if not isinstance(loaded, dict):
+        raise ValueError(
+            f"--hyper_param must contain a JSON object, got {type(loaded).__name__}."
+        )
+    return loaded
+
+
+def _build_infer_config(args: argparse.Namespace) -> dict[str, Any]:
+    extra_config = _load_hyper_params(args.hyper_param)
+    configured_method = extra_config.get("sparse_method")
+    if configured_method is not None and configured_method != args.sparse_method:
+        raise ValueError(
+            f"Conflicting sparse_method values: --sparse_method={args.sparse_method!r}, "
+            f"--hyper_param sparse_method={configured_method!r}."
+        )
+    configured_max_model_len = extra_config.get("max_model_len")
+    if (
+        configured_max_model_len is not None
+        and int(configured_max_model_len) != int(args.max_model_len)
+    ):
+        raise ValueError(
+            "Conflicting max_model_len values: "
+            f"--max_model_len={args.max_model_len}, "
+            f"--hyper_param max_model_len={configured_max_model_len}."
+        )
+    if bool(extra_config.get("enable_prefix_caching", False)):
+        raise ValueError(
+            "LongBench quality regression requires enable_prefix_caching=False."
+        )
+
+    if args.sparse_method == "omnikv":
+        validate_omnikv_benchmark_config(
+            extra_config,
+            allow_single_full_layer=args.allow_single_omnikv_full_layer,
+        )
+
+    infer_config = dict(extra_config)
+    infer_config["max_model_len"] = int(args.max_model_len)
+    infer_config["enable_prefix_caching"] = False
+    return infer_config
+
+
+def _requested_runtime_config(
+    args: argparse.Namespace,
+    infer_config: dict[str, Any],
+) -> dict[str, Any]:
+    public = dict(infer_config)
+    public["sparse_method"] = args.sparse_method
+    if args.deltakv_checkpoint_path is not None:
+        public["deltakv_checkpoint_path"] = args.deltakv_checkpoint_path
+    normalized = normalize_runtime_params(public, backend="sparsevllm")
+    return {
+        "public": public,
+        "normalized": normalized.infer_config,
+        "normalization_warnings": list(normalized.warnings),
+    }
+
+
+def _record_effective_runtime_config(
+    *,
+    generate_fn,
+    out_root: str,
+) -> None:
+    llm = getattr(generate_fn, "_sparsevllm_llm", None)
+    if llm is None:
+        raise RuntimeError(
+            "SparseVLLM LongBench generation did not expose _sparsevllm_llm; "
+            "cannot record the effective runtime config."
+        )
+    runtime_info = llm.worker_info(tags=["longbench-quality"])
+    resolved_path = Path(out_root) / "resolved_config.json"
+    resolved = (
+        json.loads(resolved_path.read_text(encoding="utf-8"))
+        if resolved_path.is_file()
+        else {"backend": "sparsevllm"}
+    )
+    resolved["effective_runtime"] = runtime_info
+    temporary_path = resolved_path.with_name(
+        f".{resolved_path.name}.{os.getpid()}.tmp"
+    )
+    with open(temporary_path, "w", encoding="utf-8") as handle:
+        json.dump(resolved, handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+    os.replace(temporary_path, resolved_path)
+
+
 def _append_jsonl(path: str | os.PathLike[str], record: dict[str, Any]) -> None:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a", encoding="utf-8") as f:
@@ -148,6 +252,52 @@ def _artifact_paths(out_root: str) -> dict[str, str]:
         "parsed": os.path.join(out_root, "parsed_outputs.jsonl"),
         "sample": os.path.join(out_root, "sample_results.jsonl"),
     }
+
+
+def _write_run_status(
+    out_root: str,
+    status: str,
+    *,
+    error: BaseException | None = None,
+    traceback_text: str | None = None,
+) -> None:
+    record = {"status": status}
+    if error is not None:
+        record["error"] = repr(error)
+        record["traceback"] = traceback_text
+
+    status_path = Path(out_root) / "run_status.json"
+    temporary_path = status_path.with_name(
+        f".{status_path.name}.{os.getpid()}.tmp"
+    )
+    with open(temporary_path, "w", encoding="utf-8") as handle:
+        json.dump(record, handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+    os.replace(temporary_path, status_path)
+
+
+def _try_write_failed_run_status(
+    out_root: str | None,
+    status: str,
+    error: BaseException,
+    traceback_text: str,
+) -> None:
+    if out_root is None:
+        return
+    try:
+        os.makedirs(out_root, exist_ok=True)
+        _write_run_status(
+            out_root,
+            status,
+            error=error,
+            traceback_text=traceback_text,
+        )
+    except Exception as status_error:
+        print(
+            f"[Warning] Failed to write run_status.json while handling "
+            f"{error!r}: {status_error!r}",
+            file=sys.stderr,
+        )
 
 
 def _decode_cuda_graph_status(
@@ -300,26 +450,7 @@ def _write_sample_record(
     _append_jsonl(task_out_path, task_record)
 
 
-def load_model_and_tokenizer(rank, args):
-    infer_config = {
-        'max_model_len': args.max_model_len,
-    }
-
-    if args.hyper_param:
-        if os.path.exists(args.hyper_param):
-            with open(args.hyper_param, 'r') as f:
-                extra_config = json.load(f)
-            infer_config.update(extra_config)
-            print(f"Loaded hyper-parameters from {args.hyper_param}: {extra_config}")
-        else:
-            # Try to parse as JSON string
-            try:
-                extra_config = json.loads(args.hyper_param)
-                infer_config.update(extra_config)
-                print(f"Parsed hyper-parameters from string: \n{extra_config}")
-            except json.JSONDecodeError as e:
-                raise ValueError(f"Failed to parse --hyper_param '{args.hyper_param}'. "
-                                 f"It is neither a valid file path nor a valid JSON string. Error: {e}")
+def load_model_and_tokenizer(rank, args, infer_config):
 
     generate_fn = get_sparsevllm_generate_api(
         model_path=args.model_path,
@@ -503,9 +634,25 @@ def get_pred(rank, data, dataset_info, args, model, tokenizer, model_max_length,
         )
 
 
-def worker(rank, world_size, datasets, dataset2prompt, dataset2maxlen, args, out_root, max_length_limit):
-    seed_everything(42)
-    model, tokenizer, model_max_length, eos_token_ids = load_model_and_tokenizer(rank, args)
+def worker(
+    rank,
+    world_size,
+    datasets,
+    dataset2prompt,
+    dataset2maxlen,
+    args,
+    out_root,
+    max_length_limit,
+    infer_config,
+):
+    seed_everything(args.seed)
+    model, tokenizer, model_max_length, eos_token_ids = load_model_and_tokenizer(
+        rank,
+        args,
+        infer_config,
+    )
+    if rank == 0:
+        _record_effective_runtime_config(generate_fn=model, out_root=out_root)
     graph_status_before = _decode_cuda_graph_status(generate_fn=model, rank=rank)
     
     for dataset in datasets:
@@ -690,9 +837,15 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size for inference")
     parser.add_argument("--no_chat_template", action='store_true', help="Do not use chat template")
     parser.add_argument("--hyper_param", type=str, default=None, help="Path to a JSON file or a JSON string containing hyper-parameters")
-    parser.add_argument("--temperature", type=float, default=0.7)
-    parser.add_argument("--top_p", type=float, default=0.8)
-    parser.add_argument("--top_k", type=int, default=20)
+    parser.add_argument(
+        "--allow_single_omnikv_full_layer",
+        action="store_true",
+        help="Allow an explicit single-full-layer OmniKV ablation.",
+    )
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--top_p", type=float, default=1.0)
+    parser.add_argument("--top_k", type=int, default=1)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--thinking_mode", type=str, default="off", choices=["off", "on_strip"])
     parser.add_argument("--max_new_tokens_override", type=int, default=None)
     parser.add_argument("--min_prompt_tokens", type=int, default=None)
@@ -711,118 +864,189 @@ def parse_args():
     return parser.parse_args()
 
 
-if __name__ == '__main__':
-    args = parse_args()
-    if args.num_samples is not None and args.num_samples <= 0:
-        raise ValueError(f"--num_samples must be > 0 when set, got {args.num_samples}.")
-    mp.set_start_method('spawn', force=True)
-    
-    model_name = args.model
-    compressor_name = os.path.basename(args.deltakv_checkpoint_path.rstrip('/')) if args.deltakv_checkpoint_path else "None"
-    
-    if args.e:
-        datasets = ["qasper", "multifieldqa_en", "hotpotqa", "2wikimqa", "gov_report", "multi_news", "trec", "triviaqa", "samsum", "passage_count", "passage_retrieval_en", "lcc", "repobench-p"]
-    else:
-        # en + zh
-        # datasets = ["narrativeqa", "qasper", "multifieldqa_en", "multifieldqa_zh", "hotpotqa", "2wikimqa", "musique", "dureader", "gov_report", "qmsum", "multi_news", "vcsum", "trec", "triviaqa", "samsum", "lsht", "passage_count", "passage_retrieval_en", "passage_retrieval_zh", "lcc", "repobench-p"]
-        # en
-        datasets = ["narrativeqa", "qasper", "multifieldqa_en", "hotpotqa", "2wikimqa", "musique", "gov_report", "qmsum", "multi_news", "trec", "triviaqa", "samsum", "passage_count",
-                    "passage_retrieval_en", "lcc", "repobench-p"]
-    
-    datasets = datasets[args.task_start_id:]
-    if args.task: datasets = args.task.split(',')
+def main() -> None:
+    args = None
+    out_root = None
+    phase = "invalid_input"
+    try:
+        args = parse_args()
 
-    dataset2prompt = json.load(open("benchmark/long_bench/config/dataset2prompt.json", "r"))
-    dataset2maxlen = json.load(open("benchmark/long_bench/config/dataset2maxlen.json", "r"))
-    validate_longbench_data_paths(datasets, args.e)
-    
-    if args.output_root:
-        out_root = args.output_root
-    else:
-        time_tag = datetime.now().strftime("%m%d_%H%M")
-        out_root = os.path.join(BASE_PATH, f"benchmark/long_bench/{'pred_e' if args.e else 'pred'}/{model_name}/{compressor_name}_{time_tag}")
-    os.makedirs(out_root, exist_ok=True)
-    print(f"Results will be saved in: {out_root}")
+        model_name = args.model
+        compressor_name = (
+            os.path.basename(args.deltakv_checkpoint_path.rstrip('/'))
+            if args.deltakv_checkpoint_path
+            else "None"
+        )
+        if args.output_root:
+            out_root = args.output_root
+        else:
+            time_tag = datetime.now().strftime("%m%d_%H%M")
+            out_root = os.path.join(
+                BASE_PATH,
+                f"benchmark/long_bench/{'pred_e' if args.e else 'pred'}/"
+                f"{model_name}/{compressor_name}_{time_tag}",
+            )
+        os.makedirs(out_root, exist_ok=True)
+        _write_run_status(out_root, "running")
+        print(f"Results will be saved in: {out_root}")
 
-    if args.worker_rank < 0:
-        for dataset in datasets:
-            with open(os.path.join(out_root, f"{dataset}.jsonl"), 'w') as f:
-                pass
-        for artifact in ("raw_outputs.jsonl", "parsed_outputs.jsonl", "sample_results.jsonl", "longbench_mini_selection.jsonl"):
-            with open(os.path.join(out_root, artifact), "w", encoding="utf-8") as f:
-                pass
+        if args.num_samples is not None and args.num_samples <= 0:
+            raise ValueError(
+                f"--num_samples must be > 0 when set, got {args.num_samples}."
+            )
+        mp.set_start_method('spawn', force=True)
 
-    max_length_limit = DEFAULT_MAX_MODEL_LEN if args.max_model_len is None else args.max_model_len
-    if max_length_limit <= 0:
-        raise ValueError(f"--max_model_len must be > 0, got {max_length_limit}.")
-    args.max_model_len = max_length_limit
-
-    if args.worker_rank < 0:
-        resolved_config = {
-            "model": args.model,
-            "model_path": args.model_path,
-            "tokenizer_path": args.tokenizer_path or args.model_path,
-            "backend": "sparsevllm",
-            "sparse_method": args.sparse_method,
-            "deltakv_checkpoint_path": args.deltakv_checkpoint_path,
-            "datasets": datasets,
-            "longbench_data_root": DATA_PREFIX_PATH,
-            "max_model_len": args.max_model_len,
-            "decoding": {
-                "temperature": args.temperature,
-                "top_p": args.top_p,
-                "top_k": args.top_k,
-                "max_new_tokens_override": args.max_new_tokens_override,
-            },
-            "selection": {
-                "min_prompt_tokens": args.min_prompt_tokens,
-                "samples_per_task": args.samples_per_task,
-                "min_required_samples": args.min_required_samples,
-            },
-            "args": vars(args),
-        }
-        with open(os.path.join(out_root, "resolved_config.json"), "w", encoding="utf-8") as f:
-            json.dump(resolved_config, f, ensure_ascii=False, indent=2)
-            f.write("\n")
-
-    if args.worker_rank >= 0:
-        worker(args.worker_rank, args.worker_world_size, datasets, dataset2prompt, dataset2maxlen, args, out_root, max_length_limit)
-    elif args.ws > 1:
-        launch_single_gpu_workers(args, out_root)
-    else:
-        worker(0, 1, datasets, dataset2prompt, dataset2maxlen, args, out_root, max_length_limit)
-
-    if args.worker_rank < 0:
-        # 记录评测信息到日志文件
-        log_path = os.path.join(out_root, "longbench_eval.log")
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"Command: python {' '.join(sys.argv)}\n")
-            f.write(f"Output Root: {out_root}\n")
-            f.write(f"Args: {json.dumps(vars(args), indent=2)}\n")
-            f.write("-" * 80 + "\n")
-
-        # 自动运行评测并记录日志
-        print(f"正在对 {out_root} 进行自动评测...")
-        eval_cmd = [
-            sys.executable,
-            "benchmark/long_bench/eval.py",
-            "--path", out_root
-        ]
         if args.e:
-            eval_cmd.append("--e")
+            datasets = ["qasper", "multifieldqa_en", "hotpotqa", "2wikimqa", "gov_report", "multi_news", "trec", "triviaqa", "samsum", "passage_count", "passage_retrieval_en", "lcc", "repobench-p"]
+        else:
+            # en + zh
+            # datasets = ["narrativeqa", "qasper", "multifieldqa_en", "multifieldqa_zh", "hotpotqa", "2wikimqa", "musique", "dureader", "gov_report", "qmsum", "multi_news", "vcsum", "trec", "triviaqa", "samsum", "lsht", "passage_count", "passage_retrieval_en", "passage_retrieval_zh", "lcc", "repobench-p"]
+            # en
+            datasets = ["narrativeqa", "qasper", "multifieldqa_en", "hotpotqa", "2wikimqa", "musique", "gov_report", "qmsum", "multi_news", "trec", "triviaqa", "samsum", "passage_count",
+                        "passage_retrieval_en", "lcc", "repobench-p"]
 
-        subprocess.run(eval_cmd, check=True)
+        datasets = datasets[args.task_start_id:]
+        if args.task:
+            datasets = args.task.split(',')
 
-        # 读取评测结果并写入日志
-        result_path = os.path.join(out_root, "result.json")
-        if not os.path.exists(result_path):
-            raise FileNotFoundError(f"LongBench evaluation did not write result.json: {result_path}")
-        with open(result_path, "r", encoding="utf-8") as f:
-            scores = json.load(f)
+        with open("benchmark/long_bench/config/dataset2prompt.json", "r") as f:
+            dataset2prompt = json.load(f)
+        with open("benchmark/long_bench/config/dataset2maxlen.json", "r") as f:
+            dataset2maxlen = json.load(f)
+        validate_longbench_data_paths(datasets, args.e)
 
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(f"Evaluation Results ({'LongBench-E' if args.e else 'LongBench'}):\n")
-            f.write(json.dumps(scores, indent=4, ensure_ascii=False))
-            f.write("\n" + "="*80 + "\n\n")
-        print(f"评测结果已成功写入日志: {log_path}")
+        if args.worker_rank < 0:
+            for dataset in datasets:
+                with open(os.path.join(out_root, f"{dataset}.jsonl"), 'w') as f:
+                    pass
+            for artifact in ("raw_outputs.jsonl", "parsed_outputs.jsonl", "sample_results.jsonl", "longbench_mini_selection.jsonl"):
+                with open(os.path.join(out_root, artifact), "w", encoding="utf-8") as f:
+                    pass
+
+        max_length_limit = DEFAULT_MAX_MODEL_LEN if args.max_model_len is None else args.max_model_len
+        if max_length_limit <= 0:
+            raise ValueError(f"--max_model_len must be > 0, got {max_length_limit}.")
+        args.max_model_len = max_length_limit
+        infer_config = _build_infer_config(args)
+
+        if args.worker_rank < 0:
+            resolved_config = {
+                "model": args.model,
+                "model_path": args.model_path,
+                "tokenizer_path": args.tokenizer_path or args.model_path,
+                "backend": "sparsevllm",
+                "sparse_method": args.sparse_method,
+                "deltakv_checkpoint_path": args.deltakv_checkpoint_path,
+                "datasets": datasets,
+                "longbench_data_root": DATA_PREFIX_PATH,
+                "max_model_len": args.max_model_len,
+                "decoding": {
+                    "temperature": args.temperature,
+                    "top_p": args.top_p,
+                    "top_k": args.top_k,
+                    "max_new_tokens_override": args.max_new_tokens_override,
+                },
+                "selection": {
+                    "min_prompt_tokens": args.min_prompt_tokens,
+                    "samples_per_task": args.samples_per_task,
+                    "min_required_samples": args.min_required_samples,
+                },
+                "requested_runtime": _requested_runtime_config(args, infer_config),
+                "args": vars(args),
+            }
+            with open(os.path.join(out_root, "resolved_config.json"), "w", encoding="utf-8") as f:
+                json.dump(resolved_config, f, ensure_ascii=False, indent=2)
+                f.write("\n")
+
+        phase = "model"
+        if args.worker_rank >= 0:
+            worker(
+                args.worker_rank,
+                args.worker_world_size,
+                datasets,
+                dataset2prompt,
+                dataset2maxlen,
+                args,
+                out_root,
+                max_length_limit,
+                infer_config,
+            )
+        elif args.ws > 1:
+            launch_single_gpu_workers(args, out_root)
+        else:
+            worker(
+                0,
+                1,
+                datasets,
+                dataset2prompt,
+                dataset2maxlen,
+                args,
+                out_root,
+                max_length_limit,
+                infer_config,
+            )
+
+        if args.worker_rank < 0:
+            phase = "metric"
+            # 记录评测信息到日志文件
+            log_path = os.path.join(out_root, "longbench_eval.log")
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"Command: python {' '.join(sys.argv)}\n")
+                f.write(f"Output Root: {out_root}\n")
+                f.write(f"Args: {json.dumps(vars(args), indent=2)}\n")
+                f.write("-" * 80 + "\n")
+
+            # 自动运行评测并记录日志
+            print(f"正在对 {out_root} 进行自动评测...")
+            eval_cmd = [
+                sys.executable,
+                "benchmark/long_bench/eval.py",
+                "--path", out_root
+            ]
+            if args.e:
+                eval_cmd.append("--e")
+
+            subprocess.run(eval_cmd, check=True)
+
+            # 读取评测结果并写入日志
+            result_path = os.path.join(out_root, "result.json")
+            if not os.path.exists(result_path):
+                raise FileNotFoundError(
+                    f"LongBench evaluation did not write result.json: {result_path}"
+                )
+            with open(result_path, "r", encoding="utf-8") as f:
+                scores = json.load(f)
+
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(f"Evaluation Results ({'LongBench-E' if args.e else 'LongBench'}):\n")
+                f.write(json.dumps(scores, indent=4, ensure_ascii=False))
+                f.write("\n" + "="*80 + "\n\n")
+            print(f"评测结果已成功写入日志: {log_path}")
+            _write_run_status(out_root, "success")
+    except subprocess.CalledProcessError as error:
+        failure_status = "metric_failed" if phase == "metric" else (
+            "model_failed" if phase == "model" else "invalid_input"
+        )
+        _try_write_failed_run_status(
+            out_root or (args.output_root if args is not None else None),
+            failure_status,
+            error,
+            traceback.format_exc(),
+        )
+        raise
+    except Exception as error:
+        failure_status = "model_failed" if phase == "model" else (
+            "metric_failed" if phase == "metric" else "invalid_input"
+        )
+        _try_write_failed_run_status(
+            out_root or (args.output_root if args is not None else None),
+            failure_status,
+            error,
+            traceback.format_exc(),
+        )
+        raise
+
+
+if __name__ == '__main__':
+    main()

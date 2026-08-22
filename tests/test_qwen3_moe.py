@@ -26,6 +26,27 @@ from sparsevllm.quantization.fp8 import fp8_blockwise_linear_reference
 from sparsevllm.utils.loader import load_model
 
 
+class _TestRouterProvider:
+    name = "test_router"
+
+    def run(self, spec, router_logits, correction_bias=None, **_kwargs):
+        assert correction_bias is None
+        probabilities = torch.softmax(router_logits, dim=-1, dtype=torch.float32)
+        weights, ids = probabilities.topk(spec.top_k, dim=-1)
+        if spec.norm_topk_prob:
+            weights = weights / weights.sum(dim=-1, keepdim=True)
+        return weights.to(router_logits.dtype), ids
+
+
+@pytest.fixture(autouse=True)
+def _bind_test_router_provider():
+    with patch(
+        "sparsevllm.models.qwen3_moe.resolve_moe_router_provider",
+        return_value=_TestRouterProvider(),
+    ):
+        yield
+
+
 def _config(**overrides) -> Qwen3MoeConfig:
     values = {
         "vocab_size": 32,
@@ -349,9 +370,7 @@ def test_qwen3_attention_passes_raw_key_without_clone():
     assert torch.equal(cache.saved_raw_key, expected_raw_key)
 
 
-def test_moe_block_uses_triton_kernels():
-    from sparsevllm.kernels.triton.moe_topk import topk_softmax
-
+def test_moe_block_uses_bound_router_provider():
     config = _config()
     context = _ep_context(0, 1)
     with (
@@ -362,7 +381,9 @@ def test_moe_block_uses_triton_kernels():
         ),
     ):
         block = Qwen3MoeSparseMoeBlock(config)
-    assert block.gate.topk_impl is topk_softmax
+    assert block.gate.provider.name == "test_router"
+    assert block.gate.op_spec.num_experts == config.num_experts
+    assert block.gate.op_spec.top_k == config.num_experts_per_tok
     hidden_states = torch.randn(3, config.hidden_size)
     expected = torch.randn_like(hidden_states)
 

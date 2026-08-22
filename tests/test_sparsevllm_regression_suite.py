@@ -9,7 +9,12 @@ from unittest.mock import patch
 
 from benchmark.microbench import _apply_prefill_policy_defaults
 from benchmark.sparsevllm_regression import run_suite
-from benchmark.sparsevllm_regression.manifest import REQUIRED_ARTIFACTS
+from benchmark.sparsevllm_regression.manifest import (
+    REQUIRED_ARTIFACTS,
+    ManifestError,
+    load_manifest,
+    resolve_method_config,
+)
 
 
 class SparseVLLMRegressionSuiteTest(unittest.TestCase):
@@ -26,6 +31,29 @@ class SparseVLLMRegressionSuiteTest(unittest.TestCase):
             "top_p": 1.0,
             "top_k": 1,
         }
+
+    def test_method_config_resolver_applies_model_specific_omnikv_layers(self):
+        manifest = load_manifest()
+
+        config = resolve_method_config(
+            manifest["methods"]["omnikv"],
+            model_id="qwen25_7b",
+            require_model_config=True,
+        )
+
+        self.assertEqual(config["sparse_method"], "omnikv")
+        self.assertEqual(config["full_attention_layers"], "0,2,4,11,16,22")
+        self.assertEqual(config["decode_keep_tokens"], 2048)
+
+    def test_method_config_resolver_rejects_uncalibrated_omnikv_model(self):
+        manifest = load_manifest()
+
+        with self.assertRaisesRegex(ManifestError, "calibrated model-specific config"):
+            resolve_method_config(
+                manifest["methods"]["omnikv"],
+                model_id="qwen3_30b",
+                require_model_config=True,
+            )
 
     def test_quality_command_uses_engine_tp_without_changing_longbench_workers(self):
         cmd = run_suite._quality_command(

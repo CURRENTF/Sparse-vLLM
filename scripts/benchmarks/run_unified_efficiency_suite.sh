@@ -21,11 +21,16 @@ CHURN_REQUEST_MULTIPLIER="${CHURN_REQUEST_MULTIPLIER:-4}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-8192}"
 SPARSE_PREFILL_SCORE_MODE="${SPARSE_PREFILL_SCORE_MODE:-probability}"
 DELTAKV_COMPRESSOR_PATH="${DELTAKV_COMPRESSOR_PATH:-}"
+OMNIKV_FULL_ATTENTION_LAYERS="${OMNIKV_FULL_ATTENTION_LAYERS:-}"
+MANIFEST_MODEL_ID="${BENCH_MANIFEST_MODEL_ID:-}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
 DATA_ROOT="${SPARSEVLLM_LONGBENCH_DATA_DIR:-${SPARSEVLLM_DATA_DIR:-data/LongBench}}"
 BASE_OUT="${SPARSEVLLM_OUTPUT_DIR:-outputs}/unified_efficiency_$(date +%Y%m%d_%H%M%S)"
+MANIFEST_PATH="${SPARSEVLLM_REGRESSION_MANIFEST:-${REPO_ROOT}/benchmark/sparsevllm_regression/manifest.json}"
 TASKS="qasper,hotpotqa,multi_news,trec,passage_retrieval_en,lcc"
+
+export PYTHONPATH="${REPO_ROOT}:${REPO_ROOT}/src:${PYTHONPATH:-}"
 
 case "${SPARSE_PREFILL_SCORE_MODE}" in
   probability|logits) ;;
@@ -47,6 +52,9 @@ case "${MODEL_NAME}" in
   qwen25_7b)
     MODEL_PATH="${MODEL_PATH:-Qwen/Qwen2.5-7B-Instruct-1M}"
     TP_SIZE=1
+    if [ -z "${MANIFEST_MODEL_ID}" ]; then
+      MANIFEST_MODEL_ID=qwen25_7b
+    fi
     ;;
   *)
     MODEL_PATH="${MODEL_NAME}"
@@ -99,23 +107,34 @@ resolve_system() {
       ;;
   esac
 
-  SYSTEM_HPARAMS=$("${PYTHON_BIN}" -c '
+  local overrides_json
+  overrides_json=$("${PYTHON_BIN}" -c '
 import json, sys
-tp_size, method, score_mode, compressor = sys.argv[1:]
+tp_size, method, score_mode, compressor, omnikv_layers = sys.argv[1:]
 params = {"tensor_parallel_size": int(tp_size), "gpu_memory_utilization": 0.85}
-if method == "snapkv":
-    params.update({
-        "snapkv_window_size": 64,
-        "sparse_prefill_score_mode": score_mode,
-        "sink_keep_tokens": 64,
-        "decode_keep_tokens": 2048,
-        "recent_keep_tokens": 64,
-        "pool_kernel_size": 7,
-    })
+if method in {"snapkv", "h2o"}:
+    params["sparse_prefill_score_mode"] = score_mode
 if method == "deltakv":
     params["deltakv_checkpoint_path"] = compressor
+if method == "omnikv" and omnikv_layers:
+    params["full_attention_layers"] = omnikv_layers
 print(json.dumps(params, separators=(",", ":")))
-' "${TP_SIZE}" "${SYSTEM_METHOD}" "${SPARSE_PREFILL_SCORE_MODE}" "${DELTAKV_COMPRESSOR_PATH}")
+' "${TP_SIZE}" "${SYSTEM_METHOD}" "${SPARSE_PREFILL_SCORE_MODE}" "${DELTAKV_COMPRESSOR_PATH}" "${OMNIKV_FULL_ATTENTION_LAYERS}")
+
+  local -a config_args
+  config_args=(
+    -m benchmark.sparsevllm_regression.manifest
+    --manifest "${MANIFEST_PATH}"
+    --method "${SYSTEM_METHOD}"
+    --overrides-json "${overrides_json}"
+  )
+  if [ -n "${MANIFEST_MODEL_ID}" ]; then
+    config_args+=(--model-id "${MANIFEST_MODEL_ID}")
+  fi
+  if [ "${SYSTEM_METHOD}" = omnikv ] && [ -z "${OMNIKV_FULL_ATTENTION_LAYERS}" ]; then
+    config_args+=(--require-model-config)
+  fi
+  SYSTEM_HPARAMS=$("${PYTHON_BIN}" "${config_args[@]}")
 }
 
 IFS=',' read -ra SYS_ARR <<< "${SYSTEMS}"
@@ -147,7 +166,6 @@ done
 
 mkdir -p "${BASE_OUT}"
 export CUDA_VISIBLE_DEVICES="${GPUS}"
-export PYTHONPATH="${REPO_ROOT}:${REPO_ROOT}/src:${PYTHONPATH:-}"
 export CUDA_HOME
 export PATH="${CUDA_HOME}/bin:${PATH}"
 export TOKENIZERS_PARALLELISM=false
@@ -206,7 +224,7 @@ for SYS in "${SYS_ARR[@]}"; do
     --monitor-gpus "${GPUS}"
     --hyper-params "${SYSTEM_HPARAMS}"
   )
-  if [ "${SYSTEM_METHOD}" = snapkv ]; then
+  if [ "${SYSTEM_METHOD}" = snapkv ] || [ "${SYSTEM_METHOD}" = h2o ]; then
     PROBE_ARGS+=(--sparse-prefill-score-mode "${SPARSE_PREFILL_SCORE_MODE}")
   fi
   TASK_RC=0
@@ -234,13 +252,14 @@ for SYS in "${SYS_ARR[@]}"; do
       --tensor_parallel_size "${TP_SIZE}" --gpu_memory_utilization 0.85 \
       --max_model_len 32768 --num_samples "${LONGBENCH_SAMPLES}" \
       --min_required_samples "${LONGBENCH_SAMPLES}" --temperature 0.0 \
-      --top_p 1.0 --top_k 1 --batch_size 16 || TASK_RC=$?
+      --top_p 1.0 --top_k 1 --batch_size 16 --seed "${BENCH_SEED}" || TASK_RC=$?
   else
     "${PYTHON_BIN}" -u "${REPO_ROOT}/benchmark/long_bench/pred.py" \
       --model_path "${MODEL_PATH}" --task "${TASKS}" --output_root "${SYS_OUT}" \
       --sparse_method "${SYSTEM_METHOD}" --hyper_param "${SYSTEM_HPARAMS}" --max_model_len 32768 \
       --num_samples "${LONGBENCH_SAMPLES}" --temperature 0.0 --top_p 1.0 \
-      --top_k 1 --batch_size 16 "${SYSTEM_LONG_BENCH_ARGS[@]}" || TASK_RC=$?
+      --top_k 1 --batch_size 16 --seed "${BENCH_SEED}" \
+      "${SYSTEM_LONG_BENCH_ARGS[@]}" || TASK_RC=$?
   fi
   MONITOR_RC=0
   stop_monitor || MONITOR_RC=$?

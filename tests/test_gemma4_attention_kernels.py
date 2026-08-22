@@ -56,6 +56,7 @@ def test_gemma4_flashinfer_prefill_matches_torch(
     )
     prefill = Gemma4FlashInferPrefill()
     try:
+        prefill.prepare()
         output = prefill.run(
             query,
             view,
@@ -88,6 +89,7 @@ def test_gemma4_flashinfer_prefill_matches_torch(
             sliding_window=sliding_window,
         )
     finally:
+        prefill.close()
         reset_context()
     kv_head_ids = torch.arange(q_heads, device="cuda") // (q_heads // kv_heads)
     query_positions = prefix + torch.arange(chunk, device="cuda")

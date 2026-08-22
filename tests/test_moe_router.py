@@ -5,8 +5,22 @@ import torch
 
 from sparsevllm.operators.moe_router import (
     GlmBiasedSigmoidRouterProvider,
+    MiniMaxBiasedSigmoidRouterProvider,
     MoeRouterOpSpec,
+    TritonMoeRouterProvider,
 )
+from sparsevllm.platforms import DeviceCaps, PlatformEnum
+
+
+def _caps() -> DeviceCaps:
+    return DeviceCaps(
+        platform=PlatformEnum.CUDA,
+        device_type="cuda",
+        device_index=0,
+        device_name="test",
+        supports_graph_capture=True,
+        supports_triton=True,
+    )
 
 
 def _router():
@@ -64,6 +78,33 @@ def test_glm_router_rejects_wrong_shape() -> None:
         supports_triton=True,
     )
     assert not GlmBiasedSigmoidRouterProvider.supports(spec, caps).supported
+
+
+def test_qwen_and_minimax_router_contracts_select_disjoint_atomic_providers():
+    qwen = MoeRouterOpSpec(128, 8, torch.bfloat16, True, True, "softmax")
+    minimax = MoeRouterOpSpec(256, 8, torch.float32, True, True, "biased_sigmoid")
+
+    assert TritonMoeRouterProvider.supports(qwen, _caps()).supported
+    assert not MiniMaxBiasedSigmoidRouterProvider.supports(qwen, _caps()).supported
+    assert MiniMaxBiasedSigmoidRouterProvider.supports(minimax, _caps()).supported
+    assert not GlmBiasedSigmoidRouterProvider.supports(minimax, _caps()).supported
+    assert (
+        MiniMaxBiasedSigmoidRouterProvider().binding_metadata()["kernel_path"]
+        == "triton.minimax_m2_router.topk_biased_sigmoid"
+    )
+
+
+def test_minimax_router_rejects_route_scaling_before_kernel_call():
+    provider = MiniMaxBiasedSigmoidRouterProvider()
+    spec = MoeRouterOpSpec(256, 8, torch.float32, True, True, "biased_sigmoid")
+
+    with pytest.raises(ValueError, match="does not accept route scaling"):
+        provider.run(
+            spec,
+            torch.empty(1, 256),
+            torch.empty(256),
+            routed_scaling_factor=1.5,
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

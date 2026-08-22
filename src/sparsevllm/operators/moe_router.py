@@ -43,6 +43,13 @@ class MoeRouterProvider:
     name = ""
     priority = 0
 
+    def binding_metadata(self) -> dict[str, object]:
+        return {
+            "implementation_kind": "atomic_provider",
+            "implementation_source": "repo_triton",
+            "kernel_path": self.name,
+        }
+
     def run(
         self,
         spec: MoeRouterOpSpec,
@@ -63,6 +70,12 @@ MOE_ROUTER_REGISTRY: OpRegistry[MoeRouterOpSpec, MoeRouterProvider] = OpRegistry
 class TritonMoeRouterProvider(MoeRouterProvider):
     name = "triton"
     priority = 10
+
+    def binding_metadata(self) -> dict[str, object]:
+        return {
+            **super().binding_metadata(),
+            "kernel_path": "triton.moe_topk.topk_softmax",
+        }
 
     @classmethod
     def supports(
@@ -112,6 +125,15 @@ class GlmBiasedSigmoidRouterProvider(MoeRouterProvider):
     name = "triton_glm_biased_sigmoid"
     priority = 20
 
+    def binding_metadata(self) -> dict[str, object]:
+        return {
+            **super().binding_metadata(),
+            "kernel_path": (
+                "triton.moe_biased_sigmoid.fused_topk_biased_sigmoid"
+            ),
+            "routing_contract": "glm_group_limited_biased_sigmoid",
+        }
+
     @classmethod
     def supports(cls, spec: MoeRouterOpSpec, caps: DeviceCaps) -> SupportResult:
         if spec.routing_method != "biased_sigmoid":
@@ -143,6 +165,61 @@ class GlmBiasedSigmoidRouterProvider(MoeRouterProvider):
             correction_bias,
             top_k=spec.top_k,
             routed_scaling_factor=routed_scaling_factor,
+        )
+
+
+@MOE_ROUTER_REGISTRY.register
+class MiniMaxBiasedSigmoidRouterProvider(MoeRouterProvider):
+    """MiniMax M2's exact FP32 biased-sigmoid routing contract."""
+
+    name = "triton_minimax_biased_sigmoid"
+    priority = 20
+
+    @classmethod
+    def supports(cls, spec: MoeRouterOpSpec, caps: DeviceCaps) -> SupportResult:
+        if spec.routing_method != "biased_sigmoid":
+            return SupportResult.no("requires biased-sigmoid routing")
+        if caps.platform != PlatformEnum.CUDA or not caps.supports_triton:
+            return SupportResult.no("requires CUDA with Triton")
+        if spec.cuda_graph and not caps.supports_graph_capture:
+            return SupportResult.no("device does not support CUDA Graph capture")
+        if (spec.num_experts, spec.top_k) != (256, 8):
+            return SupportResult.no("requires 256 experts and top-k 8")
+        if spec.activation_dtype != torch.float32:
+            return SupportResult.no(
+                f"requires FP32 logits, got {spec.activation_dtype}"
+            )
+        if not spec.norm_topk_prob:
+            return SupportResult.no("requires normalized top-k probabilities")
+        return SupportResult.yes("MiniMax M2 FP32 biased-sigmoid router")
+
+    def binding_metadata(self) -> dict[str, object]:
+        return {
+            **super().binding_metadata(),
+            "kernel_path": "triton.minimax_m2_router.topk_biased_sigmoid",
+            "routing_contract": "minimax_m2_biased_sigmoid",
+        }
+
+    def run(
+        self,
+        spec: MoeRouterOpSpec,
+        router_logits: torch.Tensor,
+        correction_bias: torch.Tensor | None = None,
+        *,
+        routed_scaling_factor: float = 1.0,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if correction_bias is None:
+            raise ValueError("MiniMax biased-sigmoid routing requires correction_bias.")
+        if routed_scaling_factor != 1.0:
+            raise ValueError("MiniMax biased-sigmoid routing does not accept route scaling.")
+        from sparsevllm.kernels.triton.minimax_m2_router import (
+            topk_biased_sigmoid,
+        )
+
+        return topk_biased_sigmoid(
+            router_logits,
+            correction_bias,
+            top_k=spec.top_k,
         )
 
 

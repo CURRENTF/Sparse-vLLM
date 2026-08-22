@@ -65,7 +65,11 @@ def bind_gated_delta_rule_op(
     if not linear_attention_layers:
         raise ValueError("Cannot bind GDN operator: model has no GDN layers.")
     for layer in linear_attention_layers:
-        layer.gated_delta_rule_op = gated_delta_rule_op
+        bind = getattr(layer, "bind_gated_delta_rule_op", None)
+        if callable(bind):
+            bind(gated_delta_rule_op)
+        else:
+            layer.gated_delta_rule_op = gated_delta_rule_op
     return len(linear_attention_layers)
 
 

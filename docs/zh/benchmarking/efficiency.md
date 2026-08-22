@@ -114,6 +114,13 @@ Probe wrapper 支持以下模型别名：
 | `qwen3_8b` | `Qwen/Qwen3-8B` | 1 |
 | `qwen25_7b` | `Qwen/Qwen2.5-7B-Instruct-1M` | 1 |
 
+稀疏方法参数统一从 `benchmark/sparsevllm_regression/manifest.json` 解析，
+其中包括 OmniKV 的模型专用 full-attention 层。若模型没有经过校准的
+manifest 配置，OmniKV 会在加载模型前直接失败。已校准的自定义模型可通过
+`BENCH_MANIFEST_MODEL_ID` 指定 manifest 条目；一次性的外部校准结果可通过
+`OMNIKV_FULL_ATTENTION_LAYERS` 显式传入。单层 OmniKV 配置默认会被拒绝，
+只有 standalone Python runner 的显式消融开关可以放行。
+
 可以用 `MODEL_PATH` 覆盖别名对应的 model ID。当前 probe wrapper 按别名固定
 TP，并对任意自定义模型路径使用 TP=2。需要显式测试不同 TP 时，使用独立 CLI。
 
@@ -246,8 +253,14 @@ run_efficiency_probe.sh SYSTEMS MODEL_NAME_OR_PATH PHYSICAL_GPU_IDS
 - Churn 指标将 oversubscribed workload 与匹配的 fixed-batch setting 比较，包括
   throughput ratio 和 tail-TTFT 变化。
 
-只有模型 checkpoint、代码版本、engine config、TP、seed、长度、scheduler token
-budget、warmup 和 iteration count 一致时，才能把结果视为 matched comparison。
+只有模型 checkpoint、benchmark trace/metric contract、engine config、TP、seed、
+长度、scheduler token budget、warmup 和 iteration count 一致时，才能把结果视为
+matched comparison。
+
+成功的 vLLM sweep 应作为不可变 baseline artifact 保存。后续 Sparse-vLLM
+改动直接复用该 baseline，不要每次重跑 vLLM。只有 GPU 型号、checkpoint、TP、
+request trace、scheduler budget、graph/backend policy 或 metric contract 变化时才
+生成新 baseline；package 版本只记录 provenance，不能静默覆盖旧 baseline。
 
 ## Artifact 与验证
 
@@ -255,13 +268,14 @@ budget、warmup 和 iteration count 一致时，才能把结果视为 matched co
 
 | Artifact | 含义 |
 | --- | --- |
-| `run_manifest.json` | 命令、Git 状态、参数、环境、模型元数据、workload contract 和最终状态。 |
+| `run_manifest.json` | 命令、Git 状态、参数、package/GPU 环境、模型元数据、workload contract 和最终状态。 |
 | `run_status.json` | 终态成功或失败状态。 |
 | `raw_samples.jsonl` | 每个实测 synthetic iteration 一条记录。 |
 | `request_samples.jsonl` | 逐请求 trace 元数据和状态。 |
 | `summary.json` | 聚合结果和终态状态。 |
 | `comparison_report.md` | 便于阅读的指标表。 |
 | `case_hardware/*.json` | 每个 case 的 GPU 采样 timeline 和 summary。 |
+| `operator_runtime_stats.json` | Sparse fixed-batch 的 Provider 绑定、拒绝原因与实际 kernel path。 |
 
 不能只根据终端输出声明 run 完成。至少检查：
 
