@@ -23,7 +23,7 @@ from sparsevllm.operators.decode_attention import (
         ("streamingllm", False),
         ("quest", False),
         ("rkv", False),
-        ("snapkv", True),
+        ("snapkv", False),
         ("h2o", True),
         ("pyramidkv", True),
         ("omnikv", True),
@@ -85,6 +85,24 @@ def test_h100_score_free_decode_selects_sgl_fa3(_support):
 
     assert isinstance(resolved.provider, SglFa3PagedDecodeAttentionProvider)
     assert resolved.report.provider_metadata.items
+
+
+@patch(
+    "sparsevllm.operators.decode_attention.sgl_fa3_device_support",
+    return_value=(True, "ready"),
+)
+def test_snapkv_score_free_decode_selects_sgl_fa3(_support):
+    resolved = OpResolver(DECODE_ATTENTION_REGISTRY).resolve(
+        _spec(
+            may_require_attention_scores=(
+                sparse_decode_attention_requires_scores("snapkv")
+            ),
+            layer_varying_page_table=True,
+        ),
+        _h100_caps(),
+    )
+
+    assert isinstance(resolved.provider, SglFa3PagedDecodeAttentionProvider)
 
 
 @patch(

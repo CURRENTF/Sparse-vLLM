@@ -100,7 +100,7 @@ _PREFILL_POSTHOC_SCORE_METHODS = frozenset(
 # layer or decode step.  The answer is deliberately static so Provider
 # selection happens before CUDA Graph capture and never changes in run().
 _DECODE_ATTENTION_SCORE_METHODS = frozenset(
-    {"snapkv", "h2o", "pyramidkv", "omnikv", "skipkv", "deltakv"}
+    {"h2o", "pyramidkv", "omnikv", "skipkv", "deltakv"}
 )
 
 

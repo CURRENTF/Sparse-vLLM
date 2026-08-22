@@ -856,7 +856,9 @@ class SparseController:
         # Decode 阶段如果 Recent Buffer 溢出也需要压缩 (对于 DeltaKV)
         if not is_prefill and self.is_deltakv_family:
              self._deltakv_eviction(seqs)
-        if not is_prefill and self.sparse_method in ('snapkv', 'pyramidkv'):
+        # TODO: Restore SnapKV decode eviction by running score-producing steps
+        # eagerly and replaying score-free decode steps with CUDA Graphs.
+        if not is_prefill and self.sparse_method == 'pyramidkv':
             self._snapkv_decode_eviction(seqs)
         if not is_prefill and self.sparse_method == "h2o":
             self._h2o_decode_eviction(seqs)
@@ -1996,7 +1998,9 @@ class SparseController:
             if is_prefill:
                 return False
             return True
-        if self.sparse_method in ('snapkv', 'pyramidkv'):
+        if self.sparse_method == 'snapkv':
+            return False
+        if self.sparse_method == 'pyramidkv':
             if is_prefill:
                 return False
 

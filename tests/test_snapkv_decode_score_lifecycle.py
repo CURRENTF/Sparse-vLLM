@@ -196,34 +196,18 @@ class SnapKVDecodeScoreLifecycleTest(unittest.TestCase):
     def tearDown(self):
         reset_context()
 
-    def test_decode_uses_independent_fused_2d_layer_scores(self):
-        controller, _manager, _seqs = make_controller()
-        states = controller.layer_batch_sparse_states
-        stable_ptrs = [states[layer].attn_score.data_ptr() for layer in range(2)]
-        self.assertNotEqual(*stable_ptrs)
-        q = torch.empty((1, 2, 4))
-
-        score0 = controller.get_decode_selection(0, q).attn_score
-        self.assertEqual(tuple(score0.shape), (1, 6))
-        score0.copy_(torch.tensor([[7, 9, 8, 4, 6, 6]]))
-        controller.on_layer_attention_end(0)
-        torch.testing.assert_close(
-            states[0].attn_score,
-            torch.tensor([[7, 9, 8, 4, 6, 6]]).float(),
-        )
-        layer0 = states[0].attn_score.clone()
-
-        score1 = controller.get_decode_selection(1, q).attn_score
-        self.assertNotEqual(score0.data_ptr(), score1.data_ptr())
-        self.assertTrue(torch.equal(score1, torch.full_like(score1, -1e20)))
-        score1.copy_(torch.tensor([[4, 5, 2, 8, 2, 9]]))
-        controller.on_layer_attention_end(1)
-        torch.testing.assert_close(states[0].attn_score, layer0)
-        torch.testing.assert_close(
-            states[1].attn_score,
-            torch.tensor([[4, 5, 2, 8, 2, 9]]).float(),
-        )
-        self.assertEqual([states[layer].attn_score.dim() for layer in range(2)], [2, 2])
+    def test_snapkv_decode_does_not_request_scores_or_compact(self):
+        for graph in (False, True):
+            with self.subTest(graph=graph):
+                controller, manager, seqs = make_controller(
+                    graph=graph,
+                    graph_capacity=16 if graph else None,
+                )
+                states = controller.layer_batch_sparse_states
+                self.assertTrue(all(state.attn_score is None for state in states.values()))
+                self.assertFalse(controller._needs_attn_score(0, False, seqs))
+                controller.post_forward(seqs, is_prefill=False)
+                self.assertEqual(manager.compactions, [])
 
     def test_pyramidkv_uses_the_same_fused_2d_lifecycle(self):
         controller, _manager, _seqs = make_controller("pyramidkv", layers=1)
@@ -244,7 +228,7 @@ class SnapKVDecodeScoreLifecycleTest(unittest.TestCase):
             "float16": torch.float16,
             "bfloat16": torch.bfloat16,
         }
-        for method in ("snapkv", "pyramidkv"):
+        for method in ("pyramidkv",):
             for score_name, configured_dtype in configured_dtypes.items():
                 with self.subTest(method=method, score_dtype=score_name):
                     controller, manager, seqs = make_controller(
@@ -269,13 +253,14 @@ class SnapKVDecodeScoreLifecycleTest(unittest.TestCase):
 
     def test_graph_refs_are_2d_keepalive_and_score_before_trigger(self):
         controller, _manager, seqs = make_controller(
+            "pyramidkv",
             layers=1,
             kv_len=7,
             graph=True,
             graph_capacity=16,
             keep=4,
         )
-        self.assertEqual(controller._snapkv_decode_trigger_len(6), 8)
+        self.assertEqual(controller._snapkv_decode_trigger_len(6), 10)
         self.assertTrue(controller._needs_attn_score(0, False, seqs))
         score = controller.get_decode_selection(
             0,
@@ -378,7 +363,7 @@ class SnapKVDecodeScoreLifecycleTest(unittest.TestCase):
         self.assertEqual(manager.compactions[0][2].numel(), low_budget)
 
     def test_post_forward_consumes_2d_and_rejects_3d_scores(self):
-        controller, manager, seqs = make_controller(layers=1)
+        controller, manager, seqs = make_controller("pyramidkv", layers=1)
         score = controller.get_decode_selection(
             0,
             torch.empty((1, 2, 4)),

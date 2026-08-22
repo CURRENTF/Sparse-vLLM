@@ -1155,13 +1155,21 @@ def _glm_method_trigger_state(lane, method: str) -> dict[str, object]:
     state: dict[str, object] = {
         "row_lens": _glm_method_row_lens(lane, method),
     }
-    if method in {"snapkv", "h2o"}:
+    if method == "h2o":
         scores = lane.controller.layer_batch_sparse_states[0].attn_score
         assert scores is not None
         state.update(
             score_ptr=int(scores.data_ptr()),
             score_sha256=_tensor_sha256(scores),
             written_score_count=int((scores > -1e19).sum().item()),
+        )
+    elif method == "snapkv":
+        assert lane.controller.layer_batch_sparse_states[0].attn_score is None
+        mapping = lane.manager.layer_batch_states[0].slot_mapping
+        assert mapping is not None
+        state.update(
+            attention_score_requested=False,
+            mapping_ptr=int(mapping.data_ptr()),
         )
     elif method == "omnikv":
         target = lane.controller.layer_batch_sparse_states[1]
@@ -1279,7 +1287,7 @@ def test_glm_sparse_method_decode_cuda_graph_triggers_runtime_path(method: str):
             atol=0,
         )
 
-        if method in {"snapkv", "h2o"}:
+        if method == "h2o":
             assert graph_before["score_sha256"] == eager_before["score_sha256"]
             pointer = int(graph_before["score_ptr"])
             assert int(graph_before["written_score_count"]) > 0
@@ -1327,7 +1335,10 @@ def test_glm_sparse_method_decode_cuda_graph_triggers_runtime_path(method: str):
         eager.sequence.append_token(int(eager_token_ids.item()))
         graph.sequence.append_token(int(graph_token_ids.item()))
 
-    assert trigger_count > 0
+    if method == "snapkv":
+        assert trigger_count == 0
+    else:
+        assert trigger_count > 0
     if method == "h2o":
         assert graph.manager._h2o_counters["decode_evictions"] == 4
     evidence = {
