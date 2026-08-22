@@ -938,9 +938,10 @@ class CacheManager(ABC):
         *,
         b_start_loc: torch.Tensor,
         chunk_lens: torch.Tensor,
+        attention_lse: torch.Tensor | None = None,
     ):
         """Optional method-owned prefill score collection after attention output is computed."""
-        del layer_idx, q, view, b_start_loc, chunk_lens
+        del layer_idx, q, view, b_start_loc, chunk_lens, attention_lse
         return None
 
     def record_prefill_query(

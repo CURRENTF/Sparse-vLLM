@@ -905,7 +905,7 @@ class PrefillPolicyConfigTest(unittest.TestCase):
             ),
             ({"h2o_recent_ratio": 0.0}, "h2o_recent_ratio"),
             ({"h2o_recent_ratio": 1.0}, "h2o_recent_ratio"),
-            ({"h2o_prefill_score_window": 0}, "h2o_prefill_score_window"),
+            ({"h2o_prefill_score_window": -1}, "h2o_prefill_score_window"),
             ({"h2o_prefill_score_window": 129}, "h2o_prefill_score_window"),
         )
         for values, message in invalid:
@@ -943,6 +943,15 @@ class PrefillPolicyConfigTest(unittest.TestCase):
                 sparse_prefill_score_mode="logits",
                 h2o_prefill_score_window=-1,
             )
+
+    def test_h2o_probability_prefill_score_accepts_full_chunk_window(self):
+        config = self.make_config(
+            vllm_sparse_method="h2o",
+            sparse_prefill_score_mode="probability",
+            h2o_prefill_score_window=0,
+        )
+
+        self.assertEqual(config.h2o_prefill_score_window, 0)
 
     def test_sparse_prefill_score_mode_is_explicit_and_validated(self):
         default = self.make_config(vllm_sparse_method="snapkv")

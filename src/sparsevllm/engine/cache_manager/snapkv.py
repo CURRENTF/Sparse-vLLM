@@ -1222,7 +1222,9 @@ class SnapKVCacheManager(CacheManager):
         *,
         b_start_loc: torch.Tensor,
         chunk_lens: torch.Tensor,
+        attention_lse: torch.Tensor | None = None,
     ):
+        del attention_lse
         ctx = get_context()
         if not ctx.is_prefill:
             return None

@@ -51,6 +51,9 @@ class H2OCacheManager(SnapKVCacheManager):
             "dropped_tokens": 0,
         }
         self._h2o_final_prefill_workspace: torch.Tensor | None = None
+        self._h2o_decode_score_workspace: torch.Tensor | None = None
+        self._h2o_decode_score_signature: tuple[tuple[int, ...], tuple[int, ...]] | None = None
+        self._h2o_decode_score_length = 0
 
     @property
     def h2o_decode_budget(self) -> int:
@@ -662,13 +665,20 @@ class H2OCacheManager(SnapKVCacheManager):
             )
         return int(self.row_seq_lens[layer_idx][row_idx])
 
+    def _invalidate_h2o_decode_score_workspace(self) -> None:
+        """Invalidate row views when cache ownership or layout changes."""
+        self._h2o_decode_score_signature = None
+        self._h2o_decode_score_length = 0
+
     def _prepare_prefill(self, seqs: list[Sequence]):
         """Append a logical prompt chunk to each compressed physical KV row."""
         with profiler.record("cache_prepare_prefill"):
+            self._invalidate_h2o_decode_score_workspace()
             self._decode_static_state_binding_key = None
             self._prefill_context_lens_cpu_by_layer = {}
             self._prefill_score_metadata_cache = {}
             layer_ids = self.kv_transformer_layer_indices()
+            score_layer_ids = set(self.kv_transformer_layer_indices())
             total_chunk_tokens = sum(int(seq.current_chunk_size) for seq in seqs)
             input_ids_np = np.empty(total_chunk_tokens, dtype=np.int64)
             positions_np = np.empty(total_chunk_tokens, dtype=np.int64)
@@ -687,7 +697,7 @@ class H2OCacheManager(SnapKVCacheManager):
                 logical_start = int(seq.num_prefilled_tokens)
                 logical_end = logical_start + chunk_size
                 if logical_start == 0:
-                    for layer_idx in layer_ids:
+                    for layer_idx in score_layer_ids:
                         self._h2o_scores.pop(self._score_key(layer_idx, seq.seq_id), None)
 
                 for layer_idx in layer_ids:
@@ -698,7 +708,7 @@ class H2OCacheManager(SnapKVCacheManager):
                             "H2O first prefill chunk found a non-empty physical row: "
                             f"layer={layer_idx} seq_id={seq.seq_id} physical_len={physical_start}."
                         )
-                    if logical_start > 0:
+                    if logical_start > 0 and layer_idx in score_layer_ids:
                         self._require_score_length(layer_idx, seq, physical_start)
                     self._allocate(layer_idx, int(seq.seq_id), chunk_size)
                     physical_end = physical_start + chunk_size
@@ -783,6 +793,7 @@ class H2OCacheManager(SnapKVCacheManager):
         *,
         b_start_loc: torch.Tensor,
         chunk_lens: torch.Tensor,
+        attention_lse: torch.Tensor | None = None,
     ):
         ctx = get_context()
         if not ctx.is_prefill:
@@ -844,24 +855,71 @@ class H2OCacheManager(SnapKVCacheManager):
             score_ends=score_ends_cpu,
         )
         max_context_len = max(context_lens)
-        step_score = self._prefill_step_score_buffer(
-            batch_size=len(seqs),
-            max_context_len=max_context_len,
-            device=q.device,
-        )
-        self._run_prefill_score(
-            q,
-            payload.k_cache,
-            step_score,
-            meta,
-            b_start_loc,
-            prompt_cache_lens,
-            max(item[4] - item[3] for item in ranges),
-            score_starts,
-            score_ends,
-            candidate_start=0,
-            num_recent_tokens=0,
-        )
+        if meta.attn_score is None:
+            step_score = self._prefill_step_score_buffer(
+                batch_size=len(seqs),
+                max_context_len=max_context_len,
+                device=q.device,
+            )
+            max_score_len = max(item[4] - item[3] for item in ranges)
+            if attention_lse is None:
+                self._run_prefill_score(
+                    q,
+                    payload.k_cache,
+                    step_score,
+                    meta,
+                    b_start_loc,
+                    prompt_cache_lens,
+                    max_score_len,
+                    score_starts,
+                    score_ends,
+                    candidate_start=0,
+                    num_recent_tokens=0,
+                )
+            else:
+                if self.config.sparse_prefill_score_mode != "probability":
+                    raise RuntimeError(
+                        "FA3 softmax LSE is only valid for probability H2O scoring."
+                    )
+                from sparsevllm.kernels.triton.prefill_score import (
+                    prefill_score_from_lse_fwd,
+                )
+
+                prefill_score_from_lse_fwd(
+                    q,
+                    payload.k_cache,
+                    attention_lse,
+                    step_score,
+                    meta.req_indices,
+                    b_start_loc,
+                    meta.context_lens,
+                    prompt_cache_lens,
+                    max_score_len,
+                    meta.active_slots,
+                    score_starts,
+                    score_ends,
+                    workspace=getattr(self, "_prefill_score_workspace", None),
+                )
+        else:
+            if (
+                self.config.sparse_prefill_score_mode != "logits"
+                or int(self.config.h2o_prefill_score_window) != 0
+            ):
+                raise RuntimeError(
+                    "H2O main-attention prefill scores require logits mode with "
+                    "h2o_prefill_score_window=0."
+                )
+            step_score = meta.attn_score
+            if (
+                step_score.ndim != 2
+                or int(step_score.shape[0]) != len(seqs)
+                or int(step_score.shape[1]) < max_context_len
+            ):
+                raise ValueError(
+                    "H2O fused prefill scores must have shape [batch, context], "
+                    f"got {tuple(step_score.shape)} for batch={len(seqs)} "
+                    f"max_context_len={max_context_len}."
+                )
         for batch_idx, seq, prompt_cache_len, score_start, score_end in ranges:
             key = self._score_key(layer_idx, seq.seq_id)
             previous = self._h2o_scores.get(key)
@@ -960,12 +1018,16 @@ class H2OCacheManager(SnapKVCacheManager):
         layer_indices: list[int],
         seqs: list[Sequence],
         reduced_scores: torch.Tensor,
+        *,
+        normalize_logits: bool = False,
+        softmax_scale: float | None = None,
     ) -> bool:
         """Accumulate one reduced [layers, batch, width] decode score tensor.
 
         Returns True when all persistent rows shared one physical length and the
         cross-layer fast path was used. Non-uniform rows use the existing
-        per-layer implementation without changing its semantics.
+        per-layer implementation without changing its semantics. Raw QK logits
+        can be normalized and accumulated across all rows in one CUDA launch.
         """
         if reduced_scores.dim() != 3:
             raise ValueError(
@@ -980,14 +1042,27 @@ class H2OCacheManager(SnapKVCacheManager):
             )
         if not layer_indices or not seqs:
             return True
+        if normalize_logits and softmax_scale is None:
+            raise ValueError(
+                "H2O raw-logit accumulation requires an explicit softmax_scale."
+            )
 
         physical_lens = [
-            self._physical_row_len(layer_idx, seq)
-            for layer_idx in layer_indices
-            for seq in seqs
+            self._physical_row_len(layer_indices[0], seq) for seq in seqs
         ]
+        if self.validate_runtime_invariants:
+            physical_lens.extend(
+                self._physical_row_len(layer_idx, seq)
+                for layer_idx in layer_indices[1:]
+                for seq in seqs
+            )
         kv_len = int(physical_lens[0])
         if any(int(length) != kv_len for length in physical_lens[1:]):
+            if normalize_logits:
+                reduced_scores = torch.softmax(
+                    reduced_scores.float() * float(softmax_scale),
+                    dim=-1,
+                )
             for local_layer, layer_idx in enumerate(layer_indices):
                 self.update_decode_attention_scores(
                     layer_idx,
@@ -1006,35 +1081,91 @@ class H2OCacheManager(SnapKVCacheManager):
             )
 
         previous_len = kv_len - 1
-        previous_rows = []
-        for layer_idx in layer_indices:
-            for seq in seqs:
-                previous = self._h2o_scores.get(
-                    self._score_key(layer_idx, seq.seq_id)
-                )
-                if previous is None or int(previous.numel()) != previous_len:
-                    raise RuntimeError(
-                        "H2O all-layer score vector must align before appending: "
-                        f"layer={layer_idx} seq_id={seq.seq_id} "
-                        f"scores={None if previous is None else int(previous.numel())} "
-                        f"expected={previous_len} current_kv_len={kv_len}."
-                    )
-                previous_rows.append(previous)
-
-        previous_scores = torch.stack(previous_rows, dim=0).view(
-            len(layer_indices), len(seqs), previous_len
+        signature = (
+            tuple(int(layer_idx) for layer_idx in layer_indices),
+            tuple(int(seq.seq_id) for seq in seqs),
         )
-        # The reduced score buffer is replay/eager scratch and is reset before
-        # the next token. Periodic eviction can leave an over-budget row alive
-        # for many steps, so persistent cumulative scores must never alias it.
-        cumulative = reduced_scores[:, :, :kv_len]
-        cumulative[:, :, :previous_len].add_(previous_scores)
-        cumulative = cumulative.clone()
+        workspace = getattr(self, "_h2o_decode_score_workspace", None)
+        can_reuse = (
+            workspace is not None
+            and getattr(self, "_h2o_decode_score_signature", None) == signature
+            and getattr(self, "_h2o_decode_score_length", 0) == previous_len
+            and tuple(workspace.shape[:2]) == (len(layer_indices), len(seqs))
+            and int(workspace.shape[2]) >= kv_len
+        )
+        previous_rows = []
+        if not can_reuse or self.validate_runtime_invariants:
+            for layer_idx in layer_indices:
+                for seq in seqs:
+                    previous = self._h2o_scores.get(
+                        self._score_key(layer_idx, seq.seq_id)
+                    )
+                    if previous is None or int(previous.numel()) != previous_len:
+                        raise RuntimeError(
+                            "H2O all-layer score vector must align before appending: "
+                            f"layer={layer_idx} seq_id={seq.seq_id} "
+                            f"scores={None if previous is None else int(previous.numel())} "
+                            f"expected={previous_len} current_kv_len={kv_len}."
+                        )
+                    previous_rows.append(previous)
+
+        if can_reuse and self.validate_runtime_invariants:
+            storage_ptr = workspace.untyped_storage().data_ptr()
+            row_stride = int(workspace.stride(1))
+            for row_idx, previous in enumerate(previous_rows):
+                if (
+                    previous.untyped_storage().data_ptr() != storage_ptr
+                    or int(previous.storage_offset()) != row_idx * row_stride
+                    or int(previous.numel()) != previous_len
+                ):
+                    can_reuse = False
+                    break
+
+        if not can_reuse:
+            capacity = max(
+                kv_len,
+                self.h2o_decode_budget + self.h2o_decode_eviction_interval,
+            )
+            workspace = torch.empty(
+                (len(layer_indices), len(seqs), capacity),
+                dtype=torch.float32,
+                device=reduced_scores.device,
+            )
+            if previous_len:
+                previous_scores = torch.stack(previous_rows, dim=0).view(
+                    len(layer_indices), len(seqs), previous_len
+                )
+                workspace[:, :, :previous_len].copy_(previous_scores)
+
+        if normalize_logits:
+            from sparsevllm.kernels.triton.h2o_score import (
+                h2o_softmax_accumulate,
+            )
+
+            h2o_softmax_accumulate(
+                reduced_scores,
+                workspace,
+                width=kv_len,
+                previous_width=previous_len,
+                softmax_scale=float(softmax_scale),
+            )
+        else:
+            score_update = reduced_scores[:, :, :kv_len].float()
+            if previous_len:
+                workspace[:, :, :previous_len].add_(
+                    score_update[:, :, :previous_len]
+                )
+            workspace[:, :, previous_len:kv_len].copy_(
+                score_update[:, :, previous_len:kv_len]
+            )
+        self._h2o_decode_score_workspace = workspace
+        self._h2o_decode_score_signature = signature
+        self._h2o_decode_score_length = kv_len
         for local_layer, layer_idx in enumerate(layer_indices):
             for batch_idx, seq in enumerate(seqs):
                 self._h2o_scores[
                     self._score_key(layer_idx, seq.seq_id)
-                ] = cumulative[local_layer, batch_idx]
+                ] = workspace[local_layer, batch_idx, :kv_len]
         return True
 
     def free_part_slots(
@@ -1047,6 +1178,7 @@ class H2OCacheManager(SnapKVCacheManager):
     ):
         if keep_indices is None:
             return
+        self._invalidate_h2o_decode_score_workspace()
         kv_len = self._physical_row_len(layer_idx, seq)
         score = self._require_score_length(layer_idx, seq, kv_len)
         keep_indices = keep_indices.to(device=self.device, dtype=torch.long).contiguous()
@@ -1430,8 +1562,12 @@ class H2OCacheManager(SnapKVCacheManager):
             ]
             layer_rows.append((int(layer_idx), kv_len, score_rows))
 
-        num_evicted_rows = 0
-        dropped_tokens = 0
+        compact_layers = []
+        compact_indices = []
+        compact_scores = []
+        compact_lengths = []
+        if layer_rows:
+            self._invalidate_h2o_decode_score_workspace()
         for layer_idx, kv_len, score_rows in layer_rows:
             with profiler.record("h2o_evict_score_stack"):
                 scores = torch.stack(score_rows, dim=0)
@@ -1442,30 +1578,32 @@ class H2OCacheManager(SnapKVCacheManager):
                     recent_ratio=float(self.config.h2o_recent_ratio),
                 )
                 kept_scores = scores.gather(1, keep_indices)
+            compact_layers.append(layer_idx)
+            compact_indices.append(keep_indices)
+            compact_scores.append(kept_scores)
+            compact_lengths.append(kv_len)
 
-            # Bypass H2O's scalar free_part_slots override: scores are updated
-            # with the same batched keep_indices immediately after compaction.
+        if compact_layers:
+            # Each layer supplies its own keep indices. Page-table compaction
+            # avoids copying retained K/V rows into a dense destination range.
             with profiler.record("h2o_evict_compact"):
-                if is_prefill and final_flags[0]:
-                    self._compact_final_prefill_dense_batch(
-                        layer_idx,
-                        seqs,
-                        keep_indices,
-                    )
-                else:
-                    SnapKVCacheManager.free_part_slots_batch(
-                        self,
-                        layer_idx,
-                        seqs,
-                        keep_indices,
-                        keep_indices_sorted=True,
-                    )
-            for batch_idx, seq in enumerate(seqs):
-                self._h2o_scores[self._score_key(layer_idx, seq.seq_id)] = kept_scores[
-                    batch_idx
-                ]
-            num_evicted_rows += len(seqs)
-            dropped_tokens += (kv_len - budget) * len(seqs)
+                SnapKVCacheManager.free_part_slots_batch_layers(
+                    self,
+                    compact_layers,
+                    seqs,
+                    torch.stack(compact_indices, dim=0),
+                    keep_indices_sorted=True,
+                )
+            for local_layer, layer_idx in enumerate(compact_layers):
+                for batch_idx, seq in enumerate(seqs):
+                    self._h2o_scores[
+                        self._score_key(layer_idx, seq.seq_id)
+                    ] = compact_scores[local_layer][batch_idx]
+
+        num_evicted_rows = len(compact_layers) * len(seqs)
+        dropped_tokens = sum(
+            (kv_len - budget) * len(seqs) for kv_len in compact_lengths
+        )
 
         if is_prefill:
             counter = (
@@ -1523,16 +1661,18 @@ class H2OCacheManager(SnapKVCacheManager):
         groups: dict[int, list[Sequence | _H2ORowRef]] = {}
         for seq_id in candidate_ids:
             seq = seq_by_id.get(seq_id, _H2ORowRef(seq_id))
-            physical_lens = [
-                self._physical_row_len(layer_idx, seq)
-                for layer_idx in layer_indices
-            ]
-            if any(length != physical_lens[0] for length in physical_lens[1:]):
-                raise RuntimeError(
-                    "H2O decode eviction requires aligned KV-layer row lengths: "
-                    f"seq_id={seq.seq_id} lengths={physical_lens}."
+            kv_len = self._physical_row_len(layer_indices[0], seq)
+            if self.validate_runtime_invariants:
+                physical_lens = [kv_len]
+                physical_lens.extend(
+                    self._physical_row_len(layer_idx, seq)
+                    for layer_idx in layer_indices[1:]
                 )
-            kv_len = int(physical_lens[0])
+                if any(length != kv_len for length in physical_lens[1:]):
+                    raise RuntimeError(
+                        "H2O decode eviction requires aligned KV-layer row lengths: "
+                        f"seq_id={seq.seq_id} lengths={physical_lens}."
+                    )
             if kv_len >= trigger:
                 groups.setdefault(kv_len, []).append(seq)
         return layer_indices, groups
@@ -1559,6 +1699,7 @@ class H2OCacheManager(SnapKVCacheManager):
         layer_indices, groups = self._decode_eviction_groups(seqs)
         if not groups:
             return
+        self._invalidate_h2o_decode_score_workspace()
         self._preflight_decode_eviction_capacity(layer_indices, groups)
 
         budget = self.h2o_decode_budget
@@ -1631,6 +1772,7 @@ class H2OCacheManager(SnapKVCacheManager):
 
     def free_seq(self, seq_id: int):
         seq_id = int(seq_id)
+        self._invalidate_h2o_decode_score_workspace()
         self._h2o_active_decode_seq_ids.discard(seq_id)
         for key in list(self._h2o_scores):
             if key[1] == seq_id:
@@ -1648,6 +1790,9 @@ class H2OCacheManager(SnapKVCacheManager):
     def reset_after_warmup(self) -> None:
         self._h2o_scores.clear()
         self._h2o_active_decode_seq_ids.clear()
+        self._h2o_decode_score_workspace = None
+        self._h2o_decode_score_signature = None
+        self._h2o_decode_score_length = 0
         for counter in self._h2o_counters:
             self._h2o_counters[counter] = 0
 

@@ -131,6 +131,20 @@ def test_sparse_prefill_contract_separates_main_and_posthoc_scores(
     assert contract.score_collection is collection
 
 
+def test_h2o_full_query_logits_request_fused_reduced_prefill_score():
+    contract = sparse_prefill_attention_contract(
+        "h2o",
+        sparse_prefill_score_mode="logits",
+        h2o_prefill_score_window=0,
+    )
+
+    assert contract.main_score_kind is AttentionScoreKind.RAW_QK_REDUCED
+    assert (
+        contract.score_collection
+        is PrefillScoreCollectionKind.MAIN_ATTENTION_REDUCED
+    )
+
+
 @patch(
     "sparsevllm.operators.prefill_attention.sgl_fa3_device_support",
     return_value=(False, "sglang-kernel is not installed"),

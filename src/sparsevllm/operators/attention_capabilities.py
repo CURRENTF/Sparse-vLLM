@@ -13,6 +13,7 @@ class AttentionScoreKind(Enum):
     NONE = auto()
     RAW_QK_PER_HEAD = auto()
     RAW_QK_REDUCED = auto()
+    ATTENTION_PROBABILITY_REDUCED = auto()
 
 
 @dataclass(frozen=True, slots=True)

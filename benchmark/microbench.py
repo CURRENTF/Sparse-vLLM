@@ -437,6 +437,7 @@ def _resolved_engine_config(llm) -> dict[str, Any]:
         "h2o_prefill_budget",
         "h2o_recent_ratio",
         "h2o_prefill_score_window",
+        "h2o_score_scope",
     )
     return {
         key: _jsonable_config_value(getattr(config, key))

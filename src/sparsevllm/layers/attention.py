@@ -10,7 +10,10 @@ from sparsevllm.operators.decode_attention import (
     PreparedDecodeAttentionOp,
     get_decode_workspace,
 )
-from sparsevllm.operators.prefill_attention import PreparedPrefillAttentionOp
+from sparsevllm.operators.prefill_attention import (
+    PrefillAttentionRunResult,
+    PreparedPrefillAttentionOp,
+)
 from sparsevllm.utils.context import get_context
 
 from sparsevllm.engine.sparse_controller import SparseController
@@ -88,6 +91,7 @@ class Attention(nn.Module):
                     chunk_lens=chunk_lens,
                     max_input_len=max_input_len,
                 )
+                attention_lse = None
                 if fake_output is not None:
                     o = fake_output
                 elif self.prefill_op is None:
@@ -104,7 +108,7 @@ class Attention(nn.Module):
                         prefill_view,
                         chunk_lens=chunk_lens,
                     )
-                    o = self.prefill_op.run(
+                    prefill_result = self.prefill_op.run(
                         q,
                         prefill_view,
                         qo_indptr=context.cu_seqlens_q,
@@ -112,12 +116,18 @@ class Attention(nn.Module):
                         max_context_len=max_input_len,
                         layer_idx=int(layer_idx),
                     )
+                    if isinstance(prefill_result, PrefillAttentionRunResult):
+                        o = prefill_result.output
+                        attention_lse = prefill_result.softmax_lse
+                    else:
+                        o = prefill_result
                 cache_manager.collect_prefill_attention_score(
                     layer_idx,
                     q,
                     prefill_view,
                     b_start_loc=b_start_loc,
                     chunk_lens=chunk_lens,
+                    attention_lse=attention_lse,
                 )
                 cache_manager.record_prefill_query(
                     layer_idx,

@@ -46,6 +46,7 @@ class PrefillAttentionOpSpec:
     layer_varying_page_table: bool = False
     varlen: bool = True
     cuda_graph: bool = False
+    return_softmax_lse: bool = False
 
     def __post_init__(self) -> None:
         if self.num_query_heads <= 0 or self.num_kv_heads <= 0:
@@ -97,6 +98,12 @@ class PrefillAttentionProvider:
         layer_idx: int,
     ) -> torch.Tensor:
         raise NotImplementedError
+
+
+@dataclass(frozen=True)
+class PrefillAttentionRunResult:
+    output: torch.Tensor
+    softmax_lse: torch.Tensor
 
 
 def _validate_token_page_table(view: Any) -> None:
@@ -480,7 +487,7 @@ class SglFa3PagedPrefillAttentionProvider(PrefillAttentionProvider):
             self._max_query_len = int(chunk_lens.max().item())
             self._query_plan_scope = validation_scope
         output = torch.empty_like(q)
-        return kernel.run_explicit_varlen(
+        result = kernel.run_explicit_varlen(
             q,
             payload.k_cache,
             payload.v_cache,
@@ -491,7 +498,14 @@ class SglFa3PagedPrefillAttentionProvider(PrefillAttentionProvider):
             cu_seqlens_q=qo_indptr,
             max_seqlen_q=self._max_query_len,
             validation_scope=validation_scope,
+            return_softmax_lse=spec.return_softmax_lse,
         )
+        if not spec.return_softmax_lse:
+            return result
+        if not isinstance(result, tuple):
+            raise RuntimeError("SGL FA3 prefill did not return the requested softmax LSE.")
+        output, softmax_lse = result
+        return PrefillAttentionRunResult(output=output, softmax_lse=softmax_lse)
 
 
 @PREFILL_ATTENTION_REGISTRY.register_atomic(
@@ -554,7 +568,7 @@ class TilelangGqaPagedPrefillAttentionProvider(PrefillAttentionProvider):
         max_context_len,
         layer_idx,
     ):
-        del max_context_len, layer_idx
+        del layer_idx
         payload, meta = _view_parts(view)
         _validate_token_page_table(meta)
         if q.dtype != spec.activation_dtype:
@@ -568,6 +582,15 @@ class TilelangGqaPagedPrefillAttentionProvider(PrefillAttentionProvider):
             )
         if qo_indptr.dtype != torch.int32 or chunk_lens.dtype != torch.int32:
             raise TypeError("TileLang GQA paged prefill requires int32 sequence metadata.")
+        if meta.attn_score is not None and tuple(meta.attn_score.shape) != (
+            int(chunk_lens.numel()),
+            int(max_context_len),
+        ):
+            raise ValueError(
+                "TileLang scored prefill requires [batch, max_context_len] output, "
+                f"got {tuple(meta.attn_score.shape)} for batch={int(chunk_lens.numel())} "
+                f"max_context_len={int(max_context_len)}."
+            )
 
         from sparsevllm.kernels.tilelang.gqa.prefill import (
             gqa_paged_prefill_attention_tilelang,

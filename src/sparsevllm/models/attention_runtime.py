@@ -70,13 +70,23 @@ def build_mha_prefill_attention_spec(
     *,
     sparse_method: str | None,
     attention_tp_size: int,
+    runtime_config=None,
 ) -> PrefillAttentionOpSpec:
     query_heads, kv_heads, head_dim, activation_dtype = _resolve_mha_local_shape(
         config,
         attention_tp_size=attention_tp_size,
     )
     normalized_method = normalize_sparse_method(sparse_method)
-    contract = sparse_prefill_attention_contract(normalized_method)
+    score_config = config if runtime_config is None else runtime_config
+    contract = sparse_prefill_attention_contract(
+        normalized_method,
+        sparse_prefill_score_mode=getattr(
+            score_config, "sparse_prefill_score_mode", "probability"
+        ),
+        h2o_prefill_score_window=getattr(
+            score_config, "h2o_prefill_score_window", 0
+        ),
+    )
     return PrefillAttentionOpSpec(
         num_query_heads=query_heads,
         num_kv_heads=kv_heads,
@@ -87,6 +97,11 @@ def build_mha_prefill_attention_spec(
         page_size=1,
         score_output=contract.main_score_kind,
         layer_varying_page_table=bool(normalized_method),
+        return_softmax_lse=(
+            normalized_method == "h2o"
+            and getattr(score_config, "sparse_prefill_score_mode", "probability")
+            == "probability"
+        ),
     )
 
 
@@ -96,12 +111,14 @@ def build_mha_prefill_attention_op(
     sparse_method: str | None,
     attention_tp_size: int,
     device: torch.device,
+    runtime_config=None,
 ) -> PreparedPrefillAttentionOp:
     return prepare_prefill_attention_op(
         build_mha_prefill_attention_spec(
             config,
             sparse_method=sparse_method,
             attention_tp_size=attention_tp_size,
+            runtime_config=runtime_config,
         ),
         device_index=int(device.index or 0),
     )
@@ -114,12 +131,14 @@ def build_mha_decode_attention_spec(
     attention_tp_size: int,
     max_batch_size: int,
     cuda_graph: bool,
+    runtime_config=None,
 ) -> DecodeAttentionOpSpec:
     query_heads, kv_heads, head_dim, activation_dtype = _resolve_mha_local_shape(
         config,
         attention_tp_size=attention_tp_size,
     )
     normalized_method = normalize_sparse_method(sparse_method)
+    score_config = config if runtime_config is None else runtime_config
     return DecodeAttentionOpSpec(
         num_query_heads=query_heads,
         num_kv_heads=kv_heads,
@@ -137,6 +156,7 @@ def build_mha_decode_attention_spec(
         ),
         layer_varying_page_table=bool(normalized_method),
         cuda_graph=bool(cuda_graph),
+        h2o_layerwise_probability_scores=(normalized_method == "h2o"),
     )
 
 
@@ -169,12 +189,14 @@ def build_mha_full_attention_provider(
     device: torch.device,
     max_batch_size: int,
     cuda_graph: bool,
+    runtime_config=None,
 ) -> FullAttentionProvider:
     spec = FullAttentionOpSpec(
         prefill=build_mha_prefill_attention_spec(
             config,
             sparse_method=sparse_method,
             attention_tp_size=attention_tp_size,
+            runtime_config=runtime_config,
         ),
         decode=build_mha_decode_attention_spec(
             config,
@@ -182,6 +204,7 @@ def build_mha_full_attention_provider(
             attention_tp_size=attention_tp_size,
             max_batch_size=max_batch_size,
             cuda_graph=cuda_graph,
+            runtime_config=runtime_config,
         ),
     )
     return prepare_full_attention_provider(

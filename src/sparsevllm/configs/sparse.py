@@ -91,10 +91,11 @@ def _normalize_h2o(config) -> None:
                 "h2o_prefill_score_window must be non-negative in logits "
                 f"mode (0 means the full chunk), got {config.h2o_prefill_score_window}."
             )
-    elif not 1 <= config.h2o_prefill_score_window <= 128:
+    elif not 0 <= config.h2o_prefill_score_window <= 128:
         raise ValueError(
-            "h2o_prefill_score_window must be in [1, 128] because the prefill "
-            f"score kernel supports at most 128 query tokens, got {config.h2o_prefill_score_window}."
+            "h2o_prefill_score_window must be in [0, 128] in probability mode "
+            "(0 means the full current chunk), got "
+            f"{config.h2o_prefill_score_window}."
         )
 
 

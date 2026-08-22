@@ -63,7 +63,7 @@ class SparseMethodConfig:
     h2o_decode_eviction_interval: int = 128
     h2o_prefill_budget: int = 8192
     h2o_recent_ratio: float = 0.5
-    h2o_prefill_score_window: int = 128
+    h2o_prefill_score_window: int = 0
 
     rkv_compression_interval: int = 128
     rkv_observation_tokens: int = 8

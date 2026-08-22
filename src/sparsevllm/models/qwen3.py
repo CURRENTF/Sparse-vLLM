@@ -36,6 +36,7 @@ def build_qwen3_prefill_attention_op(
         sparse_method=engine_config.vllm_sparse_method,
         attention_tp_size=parallel_context.attention_tp_size,
         device=device,
+        runtime_config=engine_config,
     )
 
 
@@ -373,6 +374,7 @@ class Qwen3ForCausalLM(nn.Module):
                 device=device,
                 max_batch_size=engine_config.max_decoding_seqs,
                 cuda_graph=engine_config.decode_cuda_graph,
+                runtime_config=engine_config,
             ),
         }
 

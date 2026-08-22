@@ -73,6 +73,7 @@ def _manager_with_layer_rows(
         h2o_prefill_budget=prefill_budget,
         h2o_recent_ratio=0.5,
         h2o_prefill_score_window=4,
+        obs_layer_ids=[0],
         sparse_prefill_score_mode="probability",
         max_model_len=64,
         snapkv_window_size=4,
@@ -495,6 +496,46 @@ def test_h2o_logit_prefill_score_collection_normalizes_logits():
     assert torch.equal(manager._h2o_scores[(0, 0)], expected)
 
 
+def test_h2o_logit_prefill_score_collection_consumes_fused_main_score():
+    manager = _manager_with_rows([6])
+    manager.config.sparse_prefill_score_mode = "logits"
+    manager.config.h2o_prefill_score_window = 0
+    seq = _seq(0, 20, prefilled=8, chunk=2)
+    manager._h2o_scores[(0, 0)] = torch.tensor([1.0, 2.0, 3.0, 4.0])
+    logits = torch.arange(6, dtype=torch.float32).unsqueeze(0)
+    view = PrefillComputeView(
+        meta=AttentionViewMeta(
+            active_slots=manager.buffer_req_to_token_slots[0],
+            req_indices=torch.tensor([0], dtype=torch.int32),
+            context_lens=torch.tensor([6], dtype=torch.int32),
+            max_context_len=6,
+            attn_score=logits,
+        ),
+        payload=ExplicitKVPayload(
+            k_cache=torch.empty((16, 1, 1)),
+            v_cache=torch.empty((16, 1, 1)),
+        ),
+    )
+    set_context(is_prefill=True, cache_manager=manager, seqs=[seq])
+
+    with patch.object(
+        manager,
+        "_run_prefill_score",
+        side_effect=AssertionError("launched posthoc scorer"),
+    ):
+        manager.collect_prefill_attention_score(
+            0,
+            torch.empty((2, 1, 1)),
+            view,
+            b_start_loc=torch.tensor([0], dtype=torch.int32),
+            chunk_lens=torch.tensor([2], dtype=torch.int32),
+        )
+
+    expected = torch.tensor([1.0, 2.0, 3.0, 4.0, 0.0, 0.0])
+    expected.add_(torch.softmax(logits[0], dim=0), alpha=2.0)
+    assert torch.equal(manager._h2o_scores[(0, 0)], expected)
+
+
 def test_h2o_prefill_score_collection_rejects_misaligned_physical_view():
     manager = _manager_with_rows([6])
     seq = _seq(0, 20, prefilled=8, chunk=2)
@@ -723,6 +764,33 @@ def test_h2o_all_layer_score_update_batches_uniform_rows_once():
     assert len(storage_ptrs) == 1
 
 
+def test_h2o_all_layer_score_update_reuses_persistent_workspace():
+    manager = _manager_with_layer_rows([[4, 4], [4, 4]])
+    seqs = [
+        _seq(0, 10, prefilled=10, chunk=1),
+        _seq(1, 10, prefilled=10, chunk=1),
+    ]
+    for layer_idx in range(2):
+        for seq_id in range(2):
+            manager._h2o_scores[(layer_idx, seq_id)] = torch.ones(3)
+
+    first = torch.full((2, 2, 4), 0.25)
+    manager.update_decode_attention_scores_all_layers([0, 1], seqs, first)
+    workspace = manager._h2o_decode_score_workspace
+
+    for layer_idx in range(2):
+        manager.row_seq_lens[layer_idx][:2] = 5
+    second = torch.full((2, 2, 5), 0.5)
+    with patch("torch.stack", side_effect=AssertionError("rebuilt stable score rows")):
+        manager.update_decode_attention_scores_all_layers([0, 1], seqs, second)
+
+    assert manager._h2o_decode_score_workspace is workspace
+    expected = torch.tensor([1.75, 1.75, 1.75, 0.75, 0.5])
+    for layer_idx in range(2):
+        for seq_id in range(2):
+            assert torch.equal(manager._h2o_scores[(layer_idx, seq_id)], expected)
+
+
 def test_h2o_all_layer_score_update_explicitly_falls_back_for_nonuniform_rows():
     manager = _manager_with_layer_rows([[4, 3], [4, 3]])
     seqs = [
@@ -801,21 +869,22 @@ def test_h2o_intermediate_prefill_reuses_uniform_batch_fast_path():
     ]
     _set_scores_from_slot_rows(manager)
     calls = []
-    original = SnapKVCacheManager.free_part_slots_batch
+    original = SnapKVCacheManager.free_part_slots_batch_layers
 
-    def tracked_batch_free(self, layer_idx, batch_seqs, keep_indices, **kwargs):
-        calls.append((int(layer_idx), keep_indices.clone()))
-        return original(self, layer_idx, batch_seqs, keep_indices, **kwargs)
+    def tracked_batch_free(self, layer_indices, batch_seqs, keep_indices, **kwargs):
+        calls.append((list(layer_indices), keep_indices.clone()))
+        return original(self, layer_indices, batch_seqs, keep_indices, **kwargs)
 
     with patch.object(
         SnapKVCacheManager,
-        "free_part_slots_batch",
+        "free_part_slots_batch_layers",
         new=tracked_batch_free,
     ):
         assert manager._try_batched_evict(seqs, is_prefill=True)
 
-    assert [call[0] for call in calls] == [0, 1]
-    assert all(call[1].shape == (2, 4) for call in calls)
+    assert len(calls) == 1
+    assert calls[0][0] == [0, 1]
+    assert calls[0][1].shape == (2, 2, 4)
     assert [lengths.tolist() for lengths in manager.row_seq_lens] == [[4, 4], [4, 4]]
     _assert_scores_match_slot_rows(manager)
     assert manager._h2o_counters == {
@@ -860,7 +929,7 @@ def test_h2o_mixed_prefill_budgets_fall_back_with_exact_counters():
 
 
 @pytest.mark.parametrize("kv_layout", ["tensor", "list"])
-def test_h2o_final_prefill_dense_batch_preserves_logical_kv_alignment(
+def test_h2o_final_prefill_page_table_compaction_preserves_logical_kv_alignment(
     kv_layout: str,
 ):
     manager = _manager_with_layer_rows(
@@ -883,6 +952,7 @@ def test_h2o_final_prefill_dense_batch_preserves_logical_kv_alignment(
         _seq(1, 6, prefilled=0, chunk=6),
     ]
     keep = torch.tensor([1, 3, 4, 5], dtype=torch.long)
+    keep_set = set(keep.tolist())
     expected = {}
     for layer_idx in range(2):
         k_cache, v_cache = manager.get_layer_kv_cache(layer_idx)
@@ -893,29 +963,17 @@ def test_h2o_final_prefill_dense_batch_preserves_logical_kv_alignment(
                 v_cache.index_select(0, selected_slots).clone(),
             )
 
-    workspace_ptrs = []
-    original_workspace = manager._get_final_prefill_workspace
-
-    def tracked_workspace(**kwargs):
-        workspace = original_workspace(**kwargs)
-        workspace_ptrs.append(workspace.untyped_storage().data_ptr())
-        return workspace
-
-    with patch.object(
-        manager,
-        "_get_final_prefill_workspace",
-        side_effect=tracked_workspace,
-    ):
-        manager.evict_after_prefill(seqs)
+    manager.evict_after_prefill(seqs)
 
     for layer_idx, rows in enumerate(rows_by_layer):
         k_cache, v_cache = manager.get_layer_kv_cache(layer_idx)
         released = []
         active = []
         for seq_id, row_slots in enumerate(rows):
-            sorted_slots = sorted(row_slots)
-            destination = sorted_slots[:4]
-            released.extend(sorted_slots[4:])
+            destination = torch.tensor(row_slots, dtype=torch.long)[keep].tolist()
+            released.extend(
+                slot for idx, slot in enumerate(row_slots) if idx not in keep_set
+            )
             active.extend(destination)
             actual_slots = manager.buffer_req_to_token_slots[layer_idx][
                 seq_id, :4
@@ -934,18 +992,7 @@ def test_h2o_final_prefill_dense_batch_preserves_logical_kv_alignment(
         assert manager.free_slots_stack[layer_idx][32:36].tolist() == released
         assert manager._num_free_slots[layer_idx] == 36
 
-    assert workspace_ptrs[0] == workspace_ptrs[1]
-    workspace = manager._h2o_final_prefill_workspace
-    assert workspace is not None
-    assert list(workspace.shape) == [2, 2, 4, 2, 2]
-    accounting = manager.memory_accounting()
-    workspace_entries = [
-        item
-        for item in accounting["tensors"]
-        if item["path"] == "_h2o_final_prefill_workspace"
-    ]
-    assert len(workspace_entries) == 1
-    assert workspace_entries[0]["nbytes"] == workspace.untyped_storage().nbytes()
+    assert manager._h2o_final_prefill_workspace is None
 
 
 def test_h2o_final_prefill_compacts_mla_latent_and_rope_slots():
@@ -972,7 +1019,7 @@ def test_h2o_final_prefill_compacts_mla_latent_and_rope_slots():
     manager.evict_after_prefill([seq])
 
     destination_slots = manager.buffer_req_to_token_slots[0][0, :4].long()
-    assert destination_slots.tolist() == [1, 2, 4, 6]
+    assert destination_slots.tolist() == [2, 1, 6, 4]
     payload = storage.layer_payload(0)
     expected_sources = torch.tensor([2, 1, 6, 4], dtype=torch.bfloat16)
     torch.testing.assert_close(
@@ -1332,12 +1379,13 @@ def test_h2o_decode_sequence_reorder_and_temporary_absence_are_independent():
     assert manager._num_free_slots[0] == 38
 
 
-def test_h2o_controller_consumes_snapkv_style_normalized_decode_scores():
+def test_h2o_controller_batches_raw_decode_logits_for_cache_manager():
     class RecordingManager:
         device = torch.device("cpu")
 
         def __init__(self):
-            self.normalized = None
+            self.raw_logits = None
+            self.update_kwargs = None
             self.layer_indices = None
             self.evicted = False
 
@@ -1345,10 +1393,12 @@ def test_h2o_controller_consumes_snapkv_style_normalized_decode_scores():
             self,
             layer_indices,
             seqs,
-            normalized,
+            raw_logits,
+            **kwargs,
         ):
             self.layer_indices = list(layer_indices)
-            self.normalized = normalized.clone()
+            self.raw_logits = raw_logits.clone()
+            self.update_kwargs = kwargs
 
         def evict_after_decode(self, seqs):
             self.evicted = True
@@ -1381,8 +1431,9 @@ def test_h2o_controller_consumes_snapkv_style_normalized_decode_scores():
     controller._h2o_decode_eviction([_seq(0, 3, prefilled=3, chunk=1)])
 
     assert manager.layer_indices == [0]
-    assert manager.normalized.shape == (1, 1, 3)
-    assert torch.allclose(manager.normalized, reduced_scores)
+    assert manager.raw_logits.shape == (1, 1, 3)
+    assert torch.allclose(manager.raw_logits, reduced_scores)
+    assert manager.update_kwargs == {"normalize_logits": False}
     assert manager.evicted
 
 
@@ -1508,7 +1559,7 @@ def test_h2o_aligned_graph_score_workspace_routes_mla_call_to_tilelang():
     provider.tilelang_score.assert_called_once()
 
 
-def test_h2o_layer_end_normalizes_the_fused_2d_score_in_place():
+def test_h2o_layer_end_keeps_fused_2d_logits_for_batched_normalization():
     manager = SimpleNamespace(device=torch.device("cpu"))
     config = SimpleNamespace(
         vllm_sparse_method="h2o",
@@ -1539,7 +1590,7 @@ def test_h2o_layer_end_normalizes_the_fused_2d_score_in_place():
 
     assert score.data_ptr() == original_ptr
     assert score.dtype == torch.float32
-    assert torch.allclose(score, torch.softmax(torch.tensor([[0.0, 1.0, 2.0]]), dim=-1))
+    assert torch.equal(score, torch.tensor([[0.0, 1.0, 2.0]]))
 
 
 def test_h2o_static_decode_reuses_uniform_rows_without_generic_metadata_rebuild():
@@ -1739,11 +1790,13 @@ def test_h2o_multilayer_reduced_decode_context_bounds_are_checked_together():
             self,
             layer_indices,
             seqs,
-            normalized,
+            raw_logits,
+            **kwargs,
         ):
             assert list(layer_indices) == [0, 1]
             assert len(seqs) == 1
-            assert normalized.shape == (2, 1, 3)
+            assert raw_logits.shape == (2, 1, 3)
+            assert kwargs == {"normalize_logits": False}
             self.updates += 1
 
         def evict_after_decode(self, seqs):
@@ -1812,18 +1865,21 @@ def test_h2o_contiguous_decode_buffer_handles_padded_graph_batch_and_low_dtype()
         device = torch.device("cpu")
 
         def __init__(self):
-            self.normalized = None
+            self.raw_logits = None
+            self.update_kwargs = None
             self.evicted = False
 
         def update_decode_attention_scores_all_layers(
             self,
             layer_indices,
             seqs,
-            normalized,
+            raw_logits,
+            **kwargs,
         ):
             assert list(layer_indices) == [0, 1]
             assert len(seqs) == 3
-            self.normalized = normalized.clone()
+            self.raw_logits = raw_logits.clone()
+            self.update_kwargs = kwargs
 
         def evict_after_decode(self, seqs):
             self.evicted = True
@@ -1851,9 +1907,11 @@ def test_h2o_contiguous_decode_buffer_handles_padded_graph_batch_and_low_dtype()
     controller = SparseController(config, manager)
     reduced_scores = controller._get_h2o_decode_score_buffer(2, 4, 4)
     original_ptr = reduced_scores.data_ptr()
+    reduced_scores.fill_(7.0)
     same_scores = controller._get_h2o_decode_score_buffer(2, 4, 4)
     assert same_scores.data_ptr() == original_ptr
     assert same_scores.dtype == torch.float32
+    assert torch.all(same_scores == 7.0)
 
     valid_lens = torch.tensor([4, 3, 2, 0], dtype=torch.int32)
     for layer_idx in range(2):
@@ -1874,9 +1932,10 @@ def test_h2o_contiguous_decode_buffer_handles_padded_graph_batch_and_low_dtype()
         [_seq(seq_id, 4, prefilled=4, chunk=1) for seq_id in range(3)]
     )
 
-    assert manager.normalized.shape == (2, 3, 4)
-    assert manager.normalized.dtype == torch.float32
-    assert torch.allclose(manager.normalized, expected)
+    assert manager.raw_logits.shape == (2, 3, 4)
+    assert manager.raw_logits.dtype == torch.float32
+    assert torch.allclose(manager.raw_logits, expected)
+    assert manager.update_kwargs == {"normalize_logits": False}
     assert torch.equal(same_scores[:, :3], expected)
     assert manager.evicted
     assert any(

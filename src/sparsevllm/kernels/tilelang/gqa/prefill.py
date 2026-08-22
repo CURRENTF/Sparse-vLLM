@@ -32,6 +32,8 @@ def _build_fused_gqa_kernel(
     head_dim: int,
     block_M: int = 64,
     block_N: int = 64,
+    num_stages: int = 2,
+    threads: int = 128,
     softmax_scale: float | None = None,
     need_score: bool = True,
 ):
@@ -41,6 +43,7 @@ def _build_fused_gqa_kernel(
     dtype = T.bfloat16
     accum_dtype = T.float32
     gqa_ratio = h_q // h_kv
+    rows_per_group = gqa_ratio * block_M
 
     total_q = T.symbolic("total_q")
     cache_slots = T.symbolic("cache_slots")
@@ -65,21 +68,20 @@ def _build_fused_gqa_kernel(
         batch_size: T.int32,
         max_query_len: T.int32,
     ):
-        with T.Kernel(batch_size, h_q, T.ceildiv(max_query_len, block_M), threads=128) as (bx, by, bz):
-            Q_shared = T.alloc_shared([block_M, head_dim], dtype)
+        with T.Kernel(batch_size, h_kv, T.ceildiv(max_query_len, block_M), threads=threads) as (bx, by, bz):
+            Q_shared = T.alloc_shared([rows_per_group, head_dim], dtype)
             K_shared = T.alloc_shared([block_N, head_dim], dtype)
             V_shared = T.alloc_shared([block_N, head_dim], dtype)
-            acc_s = T.alloc_fragment([block_M, block_N], accum_dtype)
-            acc_s_cast = T.alloc_fragment([block_M, block_N], dtype)
-            acc_o = T.alloc_fragment([block_M, head_dim], accum_dtype)
-            scores_max = T.alloc_fragment([block_M], accum_dtype)
-            scores_max_prev = T.alloc_fragment([block_M], accum_dtype)
-            scores_scale = T.alloc_fragment([block_M], accum_dtype)
-            scores_sum = T.alloc_fragment([block_M], accum_dtype)
+            acc_s = T.alloc_fragment([rows_per_group, block_N], accum_dtype)
+            acc_s_cast = T.alloc_fragment([rows_per_group, block_N], dtype)
+            acc_o = T.alloc_fragment([rows_per_group, head_dim], accum_dtype)
+            scores_max = T.alloc_fragment([rows_per_group], accum_dtype)
+            scores_max_prev = T.alloc_fragment([rows_per_group], accum_dtype)
+            scores_scale = T.alloc_fragment([rows_per_group], accum_dtype)
+            scores_sum = T.alloc_fragment([rows_per_group], accum_dtype)
             token_scores = T.alloc_fragment([block_N], accum_dtype)
-            logsum = T.alloc_fragment([block_M], accum_dtype)
+            logsum = T.alloc_fragment([rows_per_group], accum_dtype)
 
-            cur_kv_head = by // gqa_ratio
             request_row = T.max(request_indices[bx], 0)
             q_start = cu_seqlens_q[bx]
             q_end = cu_seqlens_q[bx + 1]
@@ -90,11 +92,13 @@ def _build_fused_gqa_kernel(
             q_tile_start = bz * block_M
             if q_tile_start < q_len:
                 # Load Q tile
-                for i, d in T.Parallel(block_M, head_dim):
-                    q_idx = q_start + q_tile_start + i
-                    Q_shared[i, d] = T.if_then_else(
-                        q_tile_start + i < q_len,
-                        Q[q_idx, by, d],
+                for row, d in T.Parallel(rows_per_group, head_dim):
+                    q_local = row % block_M
+                    q_head = by * gqa_ratio + row // block_M
+                    q_idx = q_start + q_tile_start + q_local
+                    Q_shared[row, d] = T.if_then_else(
+                        q_tile_start + q_local < q_len,
+                        Q[q_idx, q_head, d],
                         0.0,
                     )
 
@@ -102,8 +106,15 @@ def _build_fused_gqa_kernel(
                 T.fill(logsum, 0)
                 T.fill(scores_max, -T.infinity(accum_dtype))
 
-                num_kv_blocks = T.ceildiv(ctx_len, block_N)
-                for k in T.Pipelined(num_kv_blocks, num_stages=2):
+                # Causal tiles never need keys beyond their last query position.
+                # Bounding the loop also avoids atomic score updates from tiles
+                # whose entire QK region is masked.
+                visible_kv_len = T.min(
+                    ctx_len,
+                    p_len + q_tile_start + block_M,
+                )
+                num_kv_blocks = T.ceildiv(visible_kv_len, block_N)
+                for k in T.Pipelined(num_kv_blocks, num_stages=num_stages):
                     for j, d in T.Parallel(block_N, head_dim):
                         kv_idx = k * block_N + j
                         slot = T.if_then_else(
@@ -111,8 +122,8 @@ def _build_fused_gqa_kernel(
                             active_slots[request_row, kv_idx],
                             0,
                         )
-                        K_shared[j, d] = K[slot, cur_kv_head, d]
-                        V_shared[j, d] = V[slot, cur_kv_head, d]
+                        K_shared[j, d] = K[slot, by, d]
+                        V_shared[j, d] = V[slot, by, d]
 
                     T.clear(acc_s)
                     T.gemm(Q_shared, K_shared, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullCol)
@@ -121,43 +132,50 @@ def _build_fused_gqa_kernel(
                     T.fill(scores_max, -T.infinity(accum_dtype))
 
                     # Apply causal mask
-                    for i, j in T.Parallel(block_M, block_N):
-                        q_abs = p_len + q_tile_start + i
+                    for row, j in T.Parallel(rows_per_group, block_N):
+                        q_local = row % block_M
+                        q_abs = p_len + q_tile_start + q_local
                         kv_abs = k * block_N + j
-                        is_valid = (q_tile_start + i < q_len) and (kv_abs < ctx_len) and (q_abs >= kv_abs)
-                        acc_s[i, j] = T.if_then_else(is_valid, acc_s[i, j], -T.infinity(accum_dtype))
+                        is_valid = (q_tile_start + q_local < q_len) and (kv_abs < ctx_len) and (q_abs >= kv_abs)
+                        acc_s[row, j] = T.if_then_else(is_valid, acc_s[row, j], -T.infinity(accum_dtype))
 
-                    # Extract Attention Scores into AttnScore via atomic_max
+                    # Extract max-reduced raw QK scores for the experimental
+                    # logits mode.
                     if need_score:
                         T.reduce_max(acc_s, token_scores, dim=0)
                         for j in T.Parallel(block_N):
                             kv_abs = k * block_N + j
                             if kv_abs < ctx_len:
-                                T.atomic_max(AttnScore[bx, kv_abs], token_scores[j])
+                                T.atomic_max(
+                                    AttnScore[bx, kv_abs],
+                                    token_scores[j],
+                                )
 
                     # Online softmax
                     T.reduce_max(acc_s, scores_max, dim=1, clear=False)
-                    for i in T.Parallel(block_M):
-                        scores_max[i] = T.max(scores_max[i], scores_max_prev[i])
-                    for i in T.Parallel(block_M):
-                        scores_scale[i] = T.exp2(scores_max_prev[i] * scale - scores_max[i] * scale)
-                    for i, j in T.Parallel(block_M, block_N):
-                        acc_s[i, j] = T.exp2(acc_s[i, j] * scale - scores_max[i] * scale)
+                    for row in T.Parallel(rows_per_group):
+                        scores_max[row] = T.max(scores_max[row], scores_max_prev[row])
+                    for row in T.Parallel(rows_per_group):
+                        scores_scale[row] = T.exp2(scores_max_prev[row] * scale - scores_max[row] * scale)
+                    for row, j in T.Parallel(rows_per_group, block_N):
+                        acc_s[row, j] = T.exp2(acc_s[row, j] * scale - scores_max[row] * scale)
                     T.reduce_sum(acc_s, scores_sum, dim=1)
                     T.copy(acc_s, acc_s_cast)
-                    for i in T.Parallel(block_M):
-                        logsum[i] = logsum[i] * scores_scale[i] + scores_sum[i]
-                    for i, d in T.Parallel(block_M, head_dim):
-                        acc_o[i, d] *= scores_scale[i]
+                    for row in T.Parallel(rows_per_group):
+                        logsum[row] = logsum[row] * scores_scale[row] + scores_sum[row]
+                    for row, d in T.Parallel(rows_per_group, head_dim):
+                        acc_o[row, d] *= scores_scale[row]
                     T.gemm(acc_s_cast, V_shared, acc_o, policy=T.GemmWarpPolicy.FullCol)
 
                 # Normalize output and write back
-                for i, d in T.Parallel(block_M, head_dim):
-                    q_idx = q_start + q_tile_start + i
-                    if q_tile_start + i < q_len:
-                        Output[q_idx, by, d] = T.if_then_else(
-                            logsum[i] > 0,
-                            acc_o[i, d] / logsum[i],
+                for row, d in T.Parallel(rows_per_group, head_dim):
+                    q_local = row % block_M
+                    q_head = by * gqa_ratio + row // block_M
+                    q_idx = q_start + q_tile_start + q_local
+                    if q_tile_start + q_local < q_len:
+                        Output[q_idx, q_head, d] = T.if_then_else(
+                            logsum[row] > 0,
+                            acc_o[row, d] / logsum[row],
                             0.0,
                         )
 
@@ -168,8 +186,10 @@ def _get_fused_prefill_kernel(
     h_q: int,
     h_kv: int,
     head_dim: int,
-    block_M: int = 64,
+    block_M: int = 16,
     block_N: int = 64,
+    num_stages: int = 2,
+    threads: int = 128,
     softmax_scale: float | None = None,
     need_score: bool = True,
 ):
@@ -183,6 +203,8 @@ def _get_fused_prefill_kernel(
         head_dim,
         block_M,
         block_N,
+        num_stages,
+        threads,
         round(scale, 6),
         need_score,
     )
@@ -195,6 +217,8 @@ def _get_fused_prefill_kernel(
         head_dim=head_dim,
         block_M=block_M,
         block_N=block_N,
+        num_stages=num_stages,
+        threads=threads,
         softmax_scale=softmax_scale,
         need_score=need_score,
     )
@@ -221,7 +245,7 @@ def gqa_paged_prefill_attention_tilelang(
     total_q_tokens, h_q, head_dim = q.shape
     cache_slots, h_kv, _ = k_cache.shape
     batch_size = int(context_lens.numel())
-    slot_rows, max_context_len = int(active_slots.shape[0]), int(active_slots.shape[1])
+    slot_rows, slot_table_width = int(active_slots.shape[0]), int(active_slots.shape[1])
     if cu_seqlens_q.numel() != batch_size + 1:
         raise ValueError(
             "TileLang GQA prefill requires cu_seqlens_q with batch_size + 1 entries, "
@@ -237,13 +261,17 @@ def gqa_paged_prefill_attention_tilelang(
 
     need_score = attn_score is not None
     if attn_score is None:
-        target_score = torch.empty((batch_size, max_context_len), dtype=torch.float32, device=q.device)
+        target_score = torch.empty((batch_size, 1), dtype=torch.float32, device=q.device)
     else:
-        expected_shape = (batch_size, max_context_len)
-        if attn_score.ndim != 2 or tuple(attn_score.shape) != expected_shape:
+        if attn_score.ndim != 2 or int(attn_score.shape[0]) != batch_size:
             raise ValueError(
                 "TileLang GQA prefill only supports reduced 2D scores with shape "
-                f"{expected_shape}, got {tuple(attn_score.shape)}."
+                f"[batch, context], got {tuple(attn_score.shape)}."
+            )
+        if int(attn_score.shape[1]) > slot_table_width:
+            raise ValueError(
+                "TileLang GQA prefill score width exceeds the slot table: "
+                f"score_width={int(attn_score.shape[1])} slot_width={slot_table_width}."
             )
         if attn_score.dtype != torch.float32:
             raise TypeError(
@@ -257,12 +285,15 @@ def gqa_paged_prefill_attention_tilelang(
         target_score = attn_score
         target_score.fill_(-torch.inf)
 
+    block_m = 16 if need_score else 8
+
     kernel = _get_fused_prefill_kernel(
         h_q=h_q,
         h_kv=h_kv,
         head_dim=head_dim,
-        block_M=64,
+        block_M=block_m,
         block_N=64,
+        num_stages=1,
         softmax_scale=sm_scale,
         need_score=need_score,
     )

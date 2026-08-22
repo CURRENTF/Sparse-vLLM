@@ -81,6 +81,7 @@ class DecodeAttentionOpSpec:
     may_require_attention_scores: bool = False
     layer_varying_page_table: bool = False
     cuda_graph: bool = True
+    h2o_layerwise_probability_scores: bool = False
 
     def __post_init__(self) -> None:
         if self.num_query_heads <= 0 or self.num_kv_heads <= 0:
@@ -99,7 +100,9 @@ class DecodeAttentionOpSpec:
             head_dim=self.head_dim,
             page_size=self.page_size,
             score_output=(
-                AttentionScoreKind.RAW_QK_PER_HEAD
+                AttentionScoreKind.ATTENTION_PROBABILITY_REDUCED
+                if self.h2o_layerwise_probability_scores
+                else AttentionScoreKind.RAW_QK_PER_HEAD
                 if self.may_require_attention_scores
                 else AttentionScoreKind.NONE
             ),
@@ -142,6 +145,7 @@ DECODE_ATTENTION_REGISTRY: OpRegistry[
         upstream_standard=("sgl_fa3_paged_decode_sm90",),
         repo_portable=("triton_paged_decode",),
     ),
+    profile_order=("h100_h2o_layerwise_probability_decode_profile",),
 )
 
 
@@ -219,6 +223,18 @@ class SglFa3PagedDecodeAttentionProvider(DecodeAttentionProvider):
         view: Any,
         **kwargs,
     ) -> torch.Tensor:
+        if view.meta.attn_score is not None:
+            raise RuntimeError("SGL FA3 decode does not produce attention scores.")
+        return self._run_sgl(spec, q, view, **kwargs)
+
+    def _run_sgl(
+        self,
+        spec: DecodeAttentionOpSpec,
+        q: torch.Tensor,
+        view: Any,
+        return_softmax_lse: bool = False,
+        **kwargs,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         kwargs.pop("decode_launch_op", None)
         if kwargs:
             raise TypeError(
@@ -229,8 +245,6 @@ class SglFa3PagedDecodeAttentionProvider(DecodeAttentionProvider):
             raise RuntimeError("SGL FA3 decode provider was not prepared.")
         payload = view.payload
         meta = view.meta
-        if meta.attn_score is not None:
-            raise RuntimeError("SGL FA3 decode does not produce attention scores.")
         if q.dtype != spec.activation_dtype:
             raise TypeError(
                 f"SGL FA3 decode expected {spec.activation_dtype} Q, got {q.dtype}."
@@ -258,7 +272,99 @@ class SglFa3PagedDecodeAttentionProvider(DecodeAttentionProvider):
             meta.context_lens,
             output,
             validation_scope=get_context().attention_validation_scope,
+            return_softmax_lse=return_softmax_lse,
         )
+
+
+@DECODE_ATTENTION_REGISTRY.register_atomic(
+    ProviderRole.REPO_NONSTANDARD,
+    profile_only=True,
+)
+class SglFa3H2OLayerwiseDecodeProvider(SglFa3PagedDecodeAttentionProvider):
+    """Run FA3 and exact H2O probability scoring on every decode layer."""
+
+    name = "sgl_fa3_h2o_layerwise_probability_decode_sm90"
+    capabilities = AttentionKernelCapabilities(
+        platforms=frozenset({PlatformEnum.CUDA}),
+        compute_capabilities=frozenset({(9, 0)}),
+        activation_dtypes=frozenset({torch.bfloat16}),
+        head_dims=frozenset({128}),
+        page_sizes=frozenset({1}),
+        score_outputs=frozenset({AttentionScoreKind.ATTENTION_PROBABILITY_REDUCED}),
+        layer_varying_page_table=True,
+        varlen=True,
+        cuda_graph=True,
+        minimum_runtime_version=(12, 3),
+    )
+
+    def run(
+        self,
+        spec: DecodeAttentionOpSpec,
+        q: torch.Tensor,
+        view: Any,
+        **kwargs,
+    ) -> torch.Tensor:
+        score = view.meta.attn_score
+        if score is None or score.ndim != 2:
+            raise RuntimeError(
+                "Layer-wise H2O decode requires a reduced [batch, width] score."
+            )
+        result = self._run_sgl(
+            spec,
+            q,
+            view,
+            return_softmax_lse=True,
+            **kwargs,
+        )
+        if not isinstance(result, tuple):
+            raise RuntimeError("SGL FA3 decode did not return the requested softmax LSE.")
+        output, softmax_lse = result
+        from sparsevllm.kernels.triton.h2o_decode_score import (
+            h2o_probability_from_lse,
+        )
+
+        h2o_probability_from_lse(
+            q,
+            view.payload.k_cache,
+            softmax_lse,
+            view.meta.active_slots,
+            view.meta.req_indices,
+            view.meta.context_lens,
+            score,
+            softmax_scale=spec.softmax_scale,
+        )
+        return output
+
+
+@DECODE_ATTENTION_REGISTRY.register_profile
+class H100H2OLayerwiseProbabilityDecodeProfile:
+    name = "h100_h2o_layerwise_probability_decode_profile"
+
+    @classmethod
+    def atomic_provider_names(cls, spec: DecodeAttentionOpSpec) -> tuple[str, ...]:
+        del spec
+        return ("sgl_fa3_h2o_layerwise_probability_decode_sm90",)
+
+    @classmethod
+    def matches(
+        cls,
+        spec: DecodeAttentionOpSpec,
+        caps: DeviceCaps,
+    ) -> ProfileMatch:
+        if caps.device_name != "NVIDIA H100 80GB HBM3":
+            return ProfileMatch.no("requires profiled NVIDIA H100 80GB HBM3")
+        if not spec.h2o_layerwise_probability_scores:
+            return ProfileMatch.no("requires layer-wise H2O probability scores")
+        return ProfileMatch.yes("matched layer-wise H2O FA3 probability profile")
+
+    @classmethod
+    def bind(cls, spec: DecodeAttentionOpSpec, caps: DeviceCaps, **kwargs):
+        del spec, caps
+        if kwargs:
+            raise TypeError(
+                f"{cls.name} does not accept provider arguments: {sorted(kwargs)}"
+            )
+        return SglFa3H2OLayerwiseDecodeProvider()
 
 
 @DECODE_ATTENTION_REGISTRY.register_atomic(ProviderRole.REPO_PORTABLE)
@@ -270,7 +376,13 @@ class TritonPagedDecodeAttentionProvider(DecodeAttentionProvider):
             {torch.bfloat16, torch.float16, torch.float32}
         ),
         page_sizes=frozenset({1}),
-        score_outputs=frozenset(AttentionScoreKind),
+        score_outputs=frozenset(
+            {
+                AttentionScoreKind.NONE,
+                AttentionScoreKind.RAW_QK_PER_HEAD,
+                AttentionScoreKind.RAW_QK_REDUCED,
+            }
+        ),
         layer_varying_page_table=True,
         varlen=True,
         cuda_graph=True,

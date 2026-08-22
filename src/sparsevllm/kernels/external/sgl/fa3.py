@@ -410,7 +410,8 @@ class SglFa3DecodeKernel:
         cu_seqlens_q: torch.Tensor,
         max_seqlen_q: int,
         validation_scope: object | None = None,
-    ) -> torch.Tensor:
+        return_softmax_lse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Run causal varlen attention over page-size-one explicit KV."""
 
         scheduler_metadata = self._scheduler_metadata(
@@ -461,6 +462,18 @@ class SglFa3DecodeKernel:
         result: Sequence[torch.Tensor] = self._op(*args)
         if not result or result[0].data_ptr() != output.data_ptr():
             raise RuntimeError("sglang-kernel FA3 did not write to the supplied output")
+        if return_softmax_lse:
+            if len(result) < 2 or result[1] is None:
+                raise RuntimeError("sglang-kernel FA3 did not return softmax LSE")
+            softmax_lse = result[1]
+            expected_shape = (int(q.shape[1]), int(q.shape[0]))
+            if softmax_lse.dtype != torch.float32 or tuple(softmax_lse.shape) != expected_shape:
+                raise RuntimeError(
+                    "sglang-kernel FA3 returned an unexpected softmax LSE: "
+                    f"shape={tuple(softmax_lse.shape)} dtype={softmax_lse.dtype} "
+                    f"expected={expected_shape}/torch.float32."
+                )
+            return output, softmax_lse
         return output
 
     def run_explicit(
@@ -474,7 +487,8 @@ class SglFa3DecodeKernel:
         output: torch.Tensor,
         *,
         validation_scope: object | None = None,
-    ) -> torch.Tensor:
+        return_softmax_lse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Run one-token decode over page-size-one explicit KV storage."""
 
         batch_size = int(q.shape[0])
@@ -494,6 +508,7 @@ class SglFa3DecodeKernel:
             cu_seqlens_q=self._cu_seqlens_q[: batch_size + 1],
             max_seqlen_q=1,
             validation_scope=validation_scope,
+            return_softmax_lse=return_softmax_lse,
         )
 
     def run_contiguous_explicit_varlen(

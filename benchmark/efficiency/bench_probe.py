@@ -478,7 +478,7 @@ def _resolve_sparse_probe_protocol(
         hyper_params.setdefault("h2o_decode_eviction_interval", 128)
         hyper_params.setdefault("h2o_prefill_budget", 8192)
         hyper_params.setdefault("h2o_recent_ratio", 0.5)
-        hyper_params.setdefault("h2o_prefill_score_window", 128)
+        hyper_params.setdefault("h2o_prefill_score_window", 0)
     elif args.sparse_method == "omnikv":
         validate_omnikv_benchmark_config(
             hyper_params,

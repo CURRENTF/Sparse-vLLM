@@ -9,6 +9,7 @@ from sparsevllm.operators.decode_attention import (
     DECODE_ATTENTION_REGISTRY,
     DecodeAttentionOpSpec,
     PreparedDecodeAttentionOp,
+    SglFa3H2OLayerwiseDecodeProvider,
     SglFa3PagedDecodeAttentionProvider,
     TritonPagedDecodeAttentionProvider,
 )
@@ -127,6 +128,31 @@ def test_score_capable_decode_binds_triton_before_execution(_support):
     assert isinstance(resolved.provider, TritonPagedDecodeAttentionProvider)
 
 
+@patch(
+    "sparsevllm.operators.decode_attention.sgl_fa3_device_support",
+    return_value=(True, "ready"),
+)
+def test_h2o_layerwise_probability_decode_binds_fa3_composite(_support):
+    spec = _spec(
+        may_require_attention_scores=True,
+        layer_varying_page_table=True,
+        h2o_layerwise_probability_scores=True,
+    )
+    resolved = OpResolver(DECODE_ATTENTION_REGISTRY).resolve(
+        spec,
+        _h100_caps(),
+    )
+
+    assert isinstance(resolved.provider, SglFa3H2OLayerwiseDecodeProvider)
+    assert (
+        resolved.report.selected_profile
+        == "h100_h2o_layerwise_probability_decode_profile"
+    )
+    assert not TritonPagedDecodeAttentionProvider.supports(
+        spec, _h100_caps()
+    ).supported
+
+
 def test_prepared_score_free_decode_rejects_late_score_request():
     provider = Mock(name="provider")
     provider.name = "score_free"
@@ -185,7 +211,10 @@ def test_sgl_decode_provider_uses_prepared_explicit_kv_adapter():
     )
     assert all(actual is expected for actual, expected in zip(call.args[:6], expected_inputs))
     assert call.args[6] is output
-    assert call.kwargs == {"validation_scope": scope}
+    assert call.kwargs == {
+        "validation_scope": scope,
+        "return_softmax_lse": False,
+    }
     decode_launch_op.launch_config.assert_not_called()
 
 

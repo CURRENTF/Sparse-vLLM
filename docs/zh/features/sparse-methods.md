@@ -12,7 +12,7 @@ Sparse-vLLM 围绕 cache-manager-first sparse runtime 构建。engine 支持 phy
 | `streamingllm` | Physical eviction | StreamingLLM 风格的固定 sink 加 recent-window cache。保留 prefix/tail 策略之外的 token 会从 active KV cache 中被物理淘汰。 | `sink_keep_tokens`, `recent_keep_tokens` |
 | `attention-sink` | Physical eviction | attention-sink alias policy，使用相同的 sink-token 和 recent-window 保留模型。适合将 sink-window 行为与其他 physical eviction 方法对比。 | `sink_keep_tokens`, `recent_keep_tokens` |
 | `snapkv` | Physical eviction | SnapKV 风格的 token selection 在 prefill 后保留紧凑的重要历史 token 集合，只物理保留选中的 KV position，以减小 cache footprint。 | `decode_keep_tokens`, `sink_keep_tokens`, `recent_keep_tokens`, `sparse_prefill_score_mode` |
-| `h2o` | Physical eviction | H2O 在与物理 row 对齐的 token vector 中累积归一化 token importance。Prefill 每个 chunk 都评分并物理淘汰；decode 每个 token 都评分，通常在 row 达到 `h2o_decode_budget + h2o_decode_eviction_interval` 时批量选择、compact 和释放，再回到 decode budget。若某次 decode 用尽最后一个空闲 KV slot，所有已超过 budget 的 active decode row 都会提前 compact，包括本轮未调度的 row，以保证下一步可继续；idle chain row 不参与这类压力淘汰。budget 与 interval 之和必须能被 64 整除，以满足 scored decode kernel 的对齐要求。每次淘汰保留 heavy hitter 与 recent 后缀，最后一个 prefill chunk 也收缩到 decode budget。Prefill 默认使用归一化 attention mass；`logits` 模式先对 observation window 的 max-logit token vector 做一次归一化再累计。decode 先在 query head 间对 raw QK logit 做 max reduction，再按 token 归一化。Sparse-vLLM v1 在 KV head 之间共享一套 token 选择。 | `h2o_decode_budget`, `h2o_decode_eviction_interval`（默认 128）, `h2o_prefill_budget`, `h2o_recent_ratio`, `h2o_prefill_score_window`, `sparse_prefill_score_mode` |
+| `h2o` | Physical eviction | H2O 为每个 KV layer 和物理 row 分别维护累计 attention-importance vector。Prefill 每个 chunk 都评分并物理淘汰；decode 每个 token 都评分，通常在 row 达到 `h2o_decode_budget + h2o_decode_eviction_interval` 时批量选择、compact 和释放，再回到 decode budget。每次淘汰保留 heavy hitter 与 recent 后缀，最后一个 prefill chunk 也收缩到 decode budget。Sparse-vLLM v1 在单层内的 KV head 之间共享一套 token 选择，但绝不跨 layer 共享 score 或保留索引。 | `h2o_decode_budget`, `h2o_decode_eviction_interval`（默认 128）, `h2o_prefill_budget`, `h2o_recent_ratio`, `h2o_prefill_score_window`, `sparse_prefill_score_mode` |
 | `pyramidkv` | Physical eviction | PyramidKV 风格、依赖 layer 的 KV 保留方式。它在 layer 之间分配 sparse budget，并物理存储选中的 context token。 | `decode_keep_tokens`, `sink_keep_tokens`, `recent_keep_tokens`, `sparse_prefill_score_mode` |
 | `omnikv` | Logical masking | OmniKV 保留 physical cache，但为选定 layer 构建 sparse attention view。适用于不改写 cache storage、同时降低 attention 计算量的场景。 | `full_attention_layers`, `decode_keep_tokens`, `sink_keep_tokens`, `recent_keep_tokens` |
 | `quest` | Query-aware page selection | QuEST 根据 decode query 选择 token page。prefill 保持 dense，decode 通过 page/chunk budget 执行 sparse selection。 | `quest_chunk_size`, `quest_skip_layers`, `sink_keep_tokens`, `decode_keep_tokens`, `recent_keep_tokens` |
@@ -21,13 +21,13 @@ Sparse-vLLM 围绕 cache-manager-first sparse runtime 构建。engine 支持 phy
 Sparse-vLLM 在内部将该值存为 `vllm_sparse_method`，但 public command 和 `LLM(...)` kwarg 应使用 `sparse_method`。
 
 SnapKV、PyramidKV 和 H2O 的 `sparse_prefill_score_mode` 默认值为
-`probability`，保持归一化 softmax probability 的评分定义。显式
-`logits` 模式改为按 observation query 与 query head 上的最大 raw QK
-值排序。两种模式都通过共享 Triton window scorer 支持 GQA 和重建后的
-MLA prefill；logits score 要求 FP32 storage，且不会静默切换评分定义。
-H2O 会先归一化 max-logit token vector，再按 observation query 数加权后
-累积。仅在 logits 模式下，`h2o_prefill_score_window=0` 表示完整当前
-chunk；probability 模式仍要求窗口位于 `[1, 128]`。
+`probability`。对 H2O 而言这是 canonical 路径：每个 KV layer 都独立地对
+完整当前 query chunk 的归一化 softmax attention probability 求和，并在
+chunk 与 decode step 之间累计 attention mass。Sparse-vLLM 复用 FA3 的
+softmax LSE；由于 FlashAttention 不物化 probability matrix，还需额外执行
+一遍 QK。`h2o_prefill_score_window=0` 表示完整当前 chunk，是 canonical
+默认设置；`[1, 128]` 的非零 window 或显式 `logits` 模式均属于非 canonical
+近似，但都不会改变每个 H2O KV layer 必须独立计算并保存 score 的要求。
 
 ## Prefill Scheduling Policy
 

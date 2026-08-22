@@ -58,7 +58,7 @@ def _prefill_score_baseline(
                     head_scores[pos] += prob / max(1, score_end - score_start)
             q_scores.append(head_scores)
         if q_scores:
-            out[b] = torch.stack(q_scores).max(dim=0).values
+            out[b] = torch.stack(q_scores).sum(dim=0)
     return out
 
 
@@ -403,6 +403,144 @@ class PrefillScoreKernelTest(unittest.TestCase):
             score_ends,
             candidate_start=1,
             num_recent_tokens=1,
+        )
+        torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+    def test_probability_score_supports_full_query_larger_than_128(self):
+        from sparsevllm.kernels.triton.prefill_score import prefill_score_fwd
+
+        torch.manual_seed(37)
+        device = "cuda"
+        prompt_len = 192
+        query_len = 160
+        num_heads = 4
+        num_kv_heads = 2
+        head_dim = 16
+        prompt_cache_len = prompt_len - query_len
+        q = torch.randn(
+            (query_len, num_heads, head_dim), dtype=torch.float32, device=device
+        )
+        k_cache = torch.randn(
+            (prompt_len, num_kv_heads, head_dim),
+            dtype=torch.float32,
+            device=device,
+        )
+        req_to_tokens = torch.arange(
+            prompt_len, dtype=torch.int32, device=device
+        ).unsqueeze(0)
+        req_indices = torch.tensor([0], dtype=torch.int32, device=device)
+        b_start_loc = torch.tensor([0], dtype=torch.int32, device=device)
+        context_lens = torch.tensor([prompt_len], dtype=torch.int32, device=device)
+        prompt_cache_lens = torch.tensor(
+            [prompt_cache_len], dtype=torch.int32, device=device
+        )
+        score_starts = prompt_cache_lens.clone()
+        score_ends = context_lens.clone()
+        actual = torch.empty((1, prompt_len), dtype=torch.float32, device=device)
+
+        prefill_score_fwd(
+            q,
+            k_cache,
+            actual,
+            req_indices,
+            b_start_loc,
+            context_lens,
+            prompt_cache_lens,
+            query_len,
+            req_to_tokens,
+            score_starts,
+            score_ends,
+            score_mode="probability",
+        )
+        expected = _prefill_score_baseline(
+            q,
+            k_cache,
+            req_to_tokens,
+            req_indices,
+            b_start_loc,
+            context_lens,
+            prompt_cache_lens,
+            score_starts,
+            score_ends,
+            0,
+            0,
+        )
+        torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+    def test_probability_score_reuses_fa3_lse(self):
+        from sparsevllm.kernels.triton.prefill_score import (
+            prefill_score_from_lse_fwd,
+        )
+
+        torch.manual_seed(41)
+        device = "cuda"
+        prompt_len = 73
+        query_len = 41
+        prompt_cache_len = prompt_len - query_len
+        num_heads = 4
+        num_kv_heads = 2
+        head_dim = 16
+        q = torch.randn(
+            (query_len, num_heads, head_dim), dtype=torch.float32, device=device
+        )
+        k_cache = torch.randn(
+            (prompt_len, num_kv_heads, head_dim),
+            dtype=torch.float32,
+            device=device,
+        )
+        req_to_tokens = torch.arange(
+            prompt_len, dtype=torch.int32, device=device
+        ).unsqueeze(0)
+        req_indices = torch.tensor([0], dtype=torch.int32, device=device)
+        b_start_loc = torch.tensor([0], dtype=torch.int32, device=device)
+        context_lens = torch.tensor([prompt_len], dtype=torch.int32, device=device)
+        prompt_cache_lens = torch.tensor(
+            [prompt_cache_len], dtype=torch.int32, device=device
+        )
+        score_starts = prompt_cache_lens.clone()
+        score_ends = context_lens.clone()
+        lse = torch.empty(
+            (num_heads, query_len), dtype=torch.float32, device=device
+        )
+        heads_per_kv = num_heads // num_kv_heads
+        scale = head_dim**-0.5
+        for q_rel in range(query_len):
+            q_pos = prompt_cache_len + q_rel
+            for head in range(num_heads):
+                kv_head = head // heads_per_kv
+                logits = torch.matmul(
+                    k_cache[: q_pos + 1, kv_head].float(),
+                    q[q_rel, head].float(),
+                ) * scale
+                lse[head, q_rel] = torch.logsumexp(logits, dim=0)
+        actual = torch.empty((1, prompt_len), dtype=torch.float32, device=device)
+
+        prefill_score_from_lse_fwd(
+            q,
+            k_cache,
+            lse,
+            actual,
+            req_indices,
+            b_start_loc,
+            context_lens,
+            prompt_cache_lens,
+            query_len,
+            req_to_tokens,
+            score_starts,
+            score_ends,
+        )
+        expected = _prefill_score_baseline(
+            q,
+            k_cache,
+            req_to_tokens,
+            req_indices,
+            b_start_loc,
+            context_lens,
+            prompt_cache_lens,
+            score_starts,
+            score_ends,
+            0,
+            0,
         )
         torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 

@@ -83,6 +83,7 @@ class ModelRuntimeCompatibility:
 class PrefillScoreCollectionKind(Enum):
     NONE = auto()
     METHOD_OWNED_POSTHOC_REDUCED = auto()
+    MAIN_ATTENTION_REDUCED = auto()
 
 
 @dataclass(frozen=True)
@@ -105,10 +106,23 @@ _DECODE_ATTENTION_SCORE_METHODS = frozenset(
 
 def sparse_prefill_attention_contract(
     method: str | None,
+    *,
+    sparse_prefill_score_mode: str = "probability",
+    h2o_prefill_score_window: int = 0,
 ) -> SparsePrefillAttentionContract:
     normalized = normalize_sparse_method(method)
     if normalized not in CANONICAL_SPARSE_METHODS:
         raise ValueError(f"Unknown sparse method {normalized!r}.")
+    fused_h2o_score = (
+        normalized == "h2o"
+        and str(sparse_prefill_score_mode).strip().lower() == "logits"
+        and int(h2o_prefill_score_window) == 0
+    )
+    if fused_h2o_score:
+        return SparsePrefillAttentionContract(
+            main_score_kind=AttentionScoreKind.RAW_QK_REDUCED,
+            score_collection=PrefillScoreCollectionKind.MAIN_ATTENTION_REDUCED,
+        )
     collection = (
         PrefillScoreCollectionKind.METHOD_OWNED_POSTHOC_REDUCED
         if normalized in _PREFILL_POSTHOC_SCORE_METHODS
@@ -117,6 +131,15 @@ def sparse_prefill_attention_contract(
     return SparsePrefillAttentionContract(
         main_score_kind=AttentionScoreKind.NONE,
         score_collection=collection,
+    )
+
+
+def h2o_uses_fused_prefill_score(config) -> bool:
+    return (
+        normalize_sparse_method(getattr(config, "vllm_sparse_method", None)) == "h2o"
+        and str(getattr(config, "sparse_prefill_score_mode", "probability")).strip().lower()
+        == "logits"
+        and int(getattr(config, "h2o_prefill_score_window", 0)) == 0
     )
 
 

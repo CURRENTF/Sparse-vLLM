@@ -257,13 +257,11 @@ def _fwd_kernel_with_score_2d(
         qk = tl.dot(q, k)
         mask = (offs_m[:, None] + prompt_cache_len) >= (start_n + offs_n[None, :])
         
-        # Mean across Q-tokens in this chunk (using raw logits)
-        score_to_collect = tl.where(mask, qk, 0.0)
-        block_mean = tl.sum(score_to_collect, 0) / (cur_batch_seq_len * 1.0) 
-        
-        # Max across Heads into 2D Attn_Score [batch, max_kv_len]
+        # Max across the complete query chunk and all heads. Query tiles and
+        # heads race through atomic_max into one [batch, context] raw-QK row.
+        block_max = tl.max(tl.where(mask, qk, -float("inf")), axis=0)
         tl.atomic_max(Attn_Score + cur_batch * stride_asb + (start_n + offs_n) * stride_asl, 
-                      block_mean, mask=(start_n + offs_n) < block_end_loc)
+                      block_max, mask=(start_n + offs_n) < block_end_loc)
 
         qk = tl.where(mask, qk * sm_scale, -1.0e8)
 

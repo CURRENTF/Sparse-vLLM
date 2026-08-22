@@ -1007,6 +1007,7 @@ class LLMEngine:
             "h2o_prefill_budget",
             "h2o_recent_ratio",
             "h2o_prefill_score_window",
+            "h2o_score_scope",
             "pool_kernel_size",
             "sparse_attn_score_dtype",
             "pyramid_layer_ratios",

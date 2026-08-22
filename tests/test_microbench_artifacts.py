@@ -264,6 +264,7 @@ def test_resolved_engine_config_records_backend_and_jsonable_values():
             h2o_prefill_budget=8192,
             h2o_recent_ratio=0.5,
             h2o_prefill_score_window=128,
+            h2o_score_scope="observation_layer",
         )
     )
 
@@ -278,3 +279,4 @@ def test_resolved_engine_config_records_backend_and_jsonable_values():
     assert resolved["h2o_prefill_budget"] == 8192
     assert resolved["h2o_recent_ratio"] == 0.5
     assert resolved["h2o_prefill_score_window"] == 128
+    assert resolved["h2o_score_scope"] == "observation_layer"

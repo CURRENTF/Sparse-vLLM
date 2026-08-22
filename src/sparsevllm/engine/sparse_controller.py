@@ -11,6 +11,7 @@ from sparsevllm.engine.cache_manager.base import _debug_tensor_summary, _debug_v
 from sparsevllm.utils.profiler import profiler
 from sparsevllm.utils.context import get_context
 from sparsevllm.utils.log import logger, log_level
+from sparsevllm.method_registry import h2o_uses_fused_prefill_score
 
 
 def build_omnikv_keep_and_slots(*args, **kwargs):
@@ -123,6 +124,9 @@ class SparseController:
         ] = {}
         self._snapkv_decode_reduced_attn_score_buffers: dict[int, torch.Tensor] = {}
         self._h2o_decode_attn_score_buffers: dict[tuple[int, ...], torch.Tensor] = {}
+        self._active_h2o_decode_score_view: (
+            tuple[list[int], torch.Tensor] | None
+        ) = None
 
         # 静态配置
         self.sparse_config = {
@@ -165,6 +169,7 @@ class SparseController:
         self._omnikv_decode_attn_score_buffer = None
         self._snapkv_decode_reduced_attn_score_buffers.clear()
         self._h2o_decode_attn_score_buffers.clear()
+        self._active_h2o_decode_score_view = None
 
     def decode_cuda_graph_keepalive_tensors(self) -> list[torch.Tensor]:
         tensors = self.activation_controller.decode_cuda_graph_keepalive_tensors()
@@ -349,12 +354,20 @@ class SparseController:
                     batch_size = len(seqs)
                 num_heads = self.config.hf_config.num_attention_heads // self.config.tensor_parallel_size
                 max_len = self._state_max_context_len(state)
-                _val = 0.0 if is_prefill else -1e20
+                fused_h2o_prefill = bool(
+                    is_prefill and h2o_uses_fused_prefill_score(self.config)
+                )
+                _val = -torch.inf if fused_h2o_prefill else (0.0 if is_prefill else -1e20)
                 with profiler.record("sparse_prepare_attn_score"):
                     if is_prefill:
                         # Prefill score shapes follow chunking and are not replayed by decode CUDA graphs.
+                        score_shape = (
+                            (batch_size, max_len)
+                            if fused_h2o_prefill
+                            else (batch_size, num_heads, max_len)
+                        )
                         state.attn_score = torch.full(
-                            (batch_size, num_heads, max_len),
+                            score_shape,
                             _val,
                             dtype=self.attn_score_dtype,
                             device=self.device,
@@ -457,12 +470,17 @@ class SparseController:
             )
             self._h2o_decode_attn_score_buffers[key] = buffer
         view = buffer[:num_kv_layers, :batch_size, :width]
-        view.fill_(-1e20)
+        # CUDA Graph replay resets this stable buffer inside the captured
+        # forward. Only initialize newly allocated storage here; eager decode
+        # still resets on every prepare.
+        if needs_alloc or not bool(getattr(self.config, "decode_cuda_graph", False)):
+            view.fill_(-1e20)
         return view
 
     def _prepare_h2o_decode_attn_score_buffer(self, seqs: list[Sequence]):
         layer_indices = self._h2o_kv_layer_indices()
         if not layer_indices:
+            self._active_h2o_decode_score_view = None
             return
         batch_sizes = []
         kv_indices = []
@@ -495,6 +513,7 @@ class SparseController:
         )
         for layer_idx, kv_idx in zip(layer_indices, kv_indices):
             self.layer_batch_sparse_states[layer_idx].attn_score = reduced_scores[kv_idx]
+        self._active_h2o_decode_score_view = (layer_indices, reduced_scores)
 
     def _resolve_h2o_decode_attn_score_buffer(
         self,
@@ -758,13 +777,8 @@ class SparseController:
                     f"[B, L] score tensor: layer={layer_idx} "
                     f"shape={tuple(attn_score.shape)}."
                 )
-            if self.sparse_method == "h2o" and attn_score is not None:
-                # The shared decode kernel writes max-reduced raw QK scores just
-                # like SnapKV. This intentionally approximates per-head softmax
-                # then max; normalize layer-locally so CUDA graph replay captures
-                # the work and post-forward only sees one [B, L] distribution.
-                attn_score.mul_(float(self.attn_softmax_scale))
-                torch.softmax(attn_score, dim=-1, out=attn_score)
+            # H2O providers write exact head-reduced probability mass for each
+            # layer; the cache manager accumulates all layer/batch rows together.
             return
         if not ctx.is_prefill or self.sparse_method != "pyramidkv":
             return
@@ -1224,59 +1238,73 @@ class SparseController:
 
     @torch.no_grad()
     def _h2o_decode_eviction(self, seqs: list[Sequence]):
-        """Accumulate normalized decode attention mass, then evict outside graphs."""
+        """Accumulate every layer's decode attention mass, then evict outside graphs."""
         with profiler.record("h2o_decode_eviction"):
-            layer_tensors = {}
-            layer_context_lens = [] if self.validate_runtime_invariants else None
-            for layer_idx in self._h2o_kv_layer_indices():
-                state = self.layer_batch_sparse_states[layer_idx]
-                if state.attn_score is None or state.context_lens is None:
-                    raise RuntimeError(
-                        "H2O decode requires normalized head-reduced scores for every KV layer: "
-                        f"layer={layer_idx}."
-                    )
-                if state.attn_score.dim() != 2:
-                    raise RuntimeError(
-                        "H2O decode must use the SnapKV-style [B, L] score path, "
-                        f"got layer={layer_idx} shape={tuple(state.attn_score.shape)}."
-                    )
-                if int(state.context_lens.numel()) != int(state.attn_score.shape[0]):
-                    raise RuntimeError(
-                        "H2O decode context lengths do not match score batch: "
-                        f"layer={layer_idx} contexts={int(state.context_lens.numel())} "
-                        f"score_batch={int(state.attn_score.shape[0])}."
-                    )
-                layer_tensors[layer_idx] = state.attn_score
-                if layer_context_lens is not None:
+            if self.validate_runtime_invariants:
+                layer_tensors = {}
+                layer_context_lens = []
+                for layer_idx in self._h2o_kv_layer_indices():
+                    state = self.layer_batch_sparse_states[layer_idx]
+                    if state.attn_score is None or state.context_lens is None:
+                        raise RuntimeError(
+                            "H2O decode requires reduced probability scores for every "
+                            f"KV layer: layer={layer_idx}."
+                        )
+                    if state.attn_score.dim() != 2:
+                        raise RuntimeError(
+                            "H2O decode must use the SnapKV-style [B, L] score path, "
+                            f"got layer={layer_idx} shape={tuple(state.attn_score.shape)}."
+                        )
+                    if int(state.context_lens.numel()) != int(state.attn_score.shape[0]):
+                        raise RuntimeError(
+                            "H2O decode context lengths do not match score batch: "
+                            f"layer={layer_idx} contexts={int(state.context_lens.numel())} "
+                            f"score_batch={int(state.attn_score.shape[0])}."
+                        )
+                    layer_tensors[layer_idx] = state.attn_score
                     layer_context_lens.append(state.context_lens)
-
-            layer_indices, normalized_scores = self._resolve_h2o_decode_attn_score_buffer(
-                layer_tensors
-            )
-            if layer_context_lens is not None:
+                layer_indices, probability_scores = (
+                    self._resolve_h2o_decode_attn_score_buffer(layer_tensors)
+                )
                 context_lens = torch.stack(layer_context_lens, dim=0)
                 bounds_ok = (
                     (context_lens >= 0)
-                    & (context_lens <= int(normalized_scores.shape[2]))
+                    & (context_lens <= int(probability_scores.shape[2]))
                 ).all()
                 if context_lens.is_cuda:
                     torch._assert_async(bounds_ok)
                 elif not bool(bounds_ok.item()):
                     raise RuntimeError(
                         "H2O decode context lengths exceed the reduced score width: "
-                        f"width={int(normalized_scores.shape[2])} "
+                        f"width={int(probability_scores.shape[2])} "
                         f"contexts={context_lens.tolist()}."
                     )
-            if int(normalized_scores.shape[1]) < len(seqs):
+            else:
+                active = self._active_h2o_decode_score_view
+                if active is None:
+                    # Preserve direct unit/debug invocation without prepare;
+                    # engine decode always binds the active view above.
+                    layer_tensors = {}
+                    for layer_idx in self._h2o_kv_layer_indices():
+                        score = self.layer_batch_sparse_states[layer_idx].attn_score
+                        if score is not None:
+                            layer_tensors[layer_idx] = score
+                    layer_indices, probability_scores = (
+                        self._resolve_h2o_decode_attn_score_buffer(layer_tensors)
+                    )
+                else:
+                    layer_indices, probability_scores = active
+            if int(probability_scores.shape[1]) < len(seqs):
                 raise RuntimeError(
                     "H2O decode score batch does not cover current sequences: "
-                    f"score_batch={int(normalized_scores.shape[1])} seqs={len(seqs)}."
+                    f"score_batch={int(probability_scores.shape[1])} seqs={len(seqs)}."
                 )
             with profiler.record("h2o_decode_score_update"):
                 self.cache_manager.update_decode_attention_scores_all_layers(
                     layer_indices,
                     seqs,
-                    normalized_scores[:, : len(seqs)],
+                    probability_scores[:, : len(seqs)],
+                    normalize_logits=False,
                 )
             with profiler.record("h2o_decode_compact_total"):
                 self.cache_manager.evict_after_decode(seqs)
@@ -2008,9 +2036,10 @@ class SparseController:
                 return int(max_context_len) >= int(trigger_len) and int(max_context_len) > int(budget)
             return bool(((state.context_lens >= trigger_len) & (state.context_lens > budget)).any())
         if self.sparse_method == "h2o":
-            # Prefill uses the dedicated normalized score kernel. Decode must
-            # collect every step because H2O accumulates attention mass over time.
-            return not is_prefill
+            # Full-query logit scoring is fused into the selected prefill
+            # attention provider. Other prefill modes retain their dedicated
+            # posthoc scorer. Decode always accumulates attention mass.
+            return h2o_uses_fused_prefill_score(self.config) if is_prefill else True
         if self.sparse_method == "rkv":
             return False
         if self.sparse_method == "skipkv":

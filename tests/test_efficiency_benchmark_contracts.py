@@ -362,7 +362,7 @@ def test_h2o_probe_records_explicit_budget_protocol():
     assert protocol["prefill_budget"] == 8192
     assert protocol["score_mode"] == "probability"
     assert protocol["max_num_batched_tokens"] == 8192
-    assert "h2o-probability-decode4096-prefill8192-window128" in label
+    assert "h2o-probability-decode4096-prefill8192-window0" in label
 
 
 def test_omnikv_probe_requires_explicit_calibrated_layers():
