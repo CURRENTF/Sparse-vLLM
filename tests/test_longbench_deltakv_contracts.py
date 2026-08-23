@@ -37,6 +37,46 @@ class LongBenchDeltaKVContractsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "enable_prefix_caching=False"):
             longbench_pred._build_infer_config(args)
 
+    def test_longbench_records_requested_and_effective_omnikv_config(self):
+        config = resolve_method_config(
+            load_manifest()["methods"]["omnikv"],
+            model_id="qwen25_7b",
+            require_model_config=True,
+        )
+        args = self._omnikv_args(config)
+        infer_config = longbench_pred._build_infer_config(args)
+        requested = longbench_pred._requested_runtime_config(args, infer_config)
+        normalized_layers = requested["normalized"]["full_attn_layers"]
+        self.assertTrue(normalized_layers)
+
+        runtime_info = {
+            "sparse_method": "omnikv",
+            "full_attn_layers": normalized_layers,
+        }
+        generate_fn = SimpleNamespace(
+            _sparsevllm_llm=SimpleNamespace(
+                worker_info=lambda **_kwargs: runtime_info,
+            )
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            resolved = Path(tmp) / "resolved_config.json"
+            resolved.write_text(
+                json.dumps({"backend": "sparsevllm", "requested": requested}),
+                encoding="utf-8",
+            )
+            longbench_pred._record_effective_runtime_config(
+                generate_fn=generate_fn,
+                out_root=tmp,
+            )
+            recorded = json.loads(resolved.read_text(encoding="utf-8"))
+
+        self.assertEqual(recorded["requested"], requested)
+        self.assertEqual(recorded["effective_runtime"], runtime_info)
+        self.assertEqual(
+            recorded["requested"]["normalized"]["full_attn_layers"],
+            recorded["effective_runtime"]["full_attn_layers"],
+        )
+
     def test_chat_template_policy_matches_regular_prompt_paths(self):
         self.assertTrue(
             longbench_pred.should_use_chat_template("hotpotqa", thinking_mode="off")

@@ -1036,6 +1036,7 @@ class Qwen35ForCausalLM(nn.Module):
                 device=device,
                 max_batch_size=engine_config.max_decoding_seqs,
                 cuda_graph=engine_config.decode_cuda_graph,
+                runtime_config=engine_config,
             ),
             "gated_delta_rule_op": build_gated_delta_rule_op(
                 config,

@@ -36,6 +36,7 @@ from .storage import ExplicitKVStorage, create_attention_cache_storage
 
 
 _INT32_BYTES = 4
+_PAGE_TABLE_COMPACTION_TILE_ELEMENTS = 256 * 1024
 
 
 def resolve_snapkv_cache_capacity(
@@ -619,15 +620,6 @@ class SnapKVCacheManager(CacheManager):
                     + int(self.config.decode_keep_tokens)
                     + int(self.config.num_recent_tokens)
                 )
-                top_budget = (
-                    int(budget)
-                    - int(self.config.num_sink_tokens)
-                    - int(self.config.num_recent_tokens)
-                )
-                trigger_len = max(
-                    int(budget) + 1,
-                    2 * max(0, int(top_budget)),
-                )
             elif method in ("rkv", "skipkv"):
                 budget = (
                     int(self.config.num_sink_tokens)
@@ -651,7 +643,20 @@ class SnapKVCacheManager(CacheManager):
             if use_new_pyramid_staging and budget is not None:
                 prefill_physical_peak = min(suffix_tokens, int(budget))
 
-            if budget is None or trigger_len is None:
+            if method == "snapkv" and budget is not None:
+                # SnapKV currently compacts only at final prefill. Decode is
+                # score-free and grows monotonically, so chain admission must
+                # reserve the full requested decode growth rather than the
+                # legacy periodic-eviction trigger.
+                resident_after_prefill = (
+                    min(existing + suffix_tokens, int(budget))
+                    if suffix_tokens > 0
+                    else existing
+                )
+                decode_physical_peak = (
+                    resident_after_prefill + generated_kv_tokens
+                )
+            elif budget is None or trigger_len is None:
                 decode_physical_peak = (
                     prefill_physical_peak + generated_kv_tokens
                 )
@@ -1527,6 +1532,336 @@ class SnapKVCacheManager(CacheManager):
             kv_lens.append(int(self.row_seq_lens[layer_idx][row_idx]))
         return kv_lens
 
+    @staticmethod
+    def _assert_compaction_indices(
+        condition: torch.Tensor,
+        message: str,
+        *,
+        synchronize: bool = False,
+    ) -> None:
+        if condition.numel() != 1:
+            raise RuntimeError(
+                "KV page-table compaction validation must reduce to one boolean: "
+                f"shape={tuple(condition.shape)}."
+            )
+        if condition.is_cuda and not synchronize:
+            torch._assert_async(condition)
+        elif not bool(condition.item()):
+            raise RuntimeError(message)
+
+    def _prepare_compaction_keep_indices(
+        self,
+        keep_indices: torch.Tensor,
+        row_lens: torch.Tensor,
+        *,
+        sort_dim: int,
+        keep_indices_sorted: bool,
+        operation: str,
+        synchronize_validation: bool = False,
+    ) -> torch.Tensor:
+        keep_indices = keep_indices.to(
+            device=self.device,
+            dtype=torch.long,
+        ).contiguous()
+        if not keep_indices_sorted:
+            keep_indices = torch.sort(keep_indices, dim=sort_dim).values
+        row_lens = row_lens.to(
+            device=self.device,
+            dtype=torch.long,
+        )
+        self._assert_compaction_indices(
+            ((keep_indices >= 0) & (keep_indices < row_lens.unsqueeze(-1))).all(),
+            f"{operation} keep_indices out of bounds.",
+            synchronize=synchronize_validation,
+        )
+        if int(keep_indices.shape[sort_dim]) > 1:
+            self._assert_compaction_indices(
+                (
+                    keep_indices.narrow(sort_dim, 1, keep_indices.shape[sort_dim] - 1)
+                    > keep_indices.narrow(sort_dim, 0, keep_indices.shape[sort_dim] - 1)
+                ).all(),
+                f"{operation} keep_indices must be unique.",
+                synchronize=synchronize_validation,
+            )
+        return keep_indices
+
+    def _preflight_compaction_free_capacity(
+        self,
+        layer_idx: int,
+        release_count: int,
+        *,
+        operation: str,
+    ) -> None:
+        layer_idx = int(layer_idx)
+        release_count = int(release_count)
+        free_stack = self.free_slots_stack[layer_idx]
+        if free_stack is None or free_stack.dim() != 1:
+            raise RuntimeError(
+                f"{operation} requires a one-dimensional free-slot stack: "
+                f"layer={layer_idx}."
+            )
+        ptr = int(self._num_free_slots[layer_idx])
+        if release_count < 0 or ptr < 0 or ptr + release_count > int(free_stack.numel()):
+            raise RuntimeError(
+                f"{operation} would overflow the free-slot stack: "
+                f"layer={layer_idx} ptr={ptr} release={release_count} "
+                f"capacity={int(free_stack.numel())}."
+            )
+
+    def _prepare_free_part_slots(
+        self,
+        layer_idx: int,
+        seq: Sequence,
+        keep_indices: torch.Tensor,
+        *,
+        keep_indices_sorted: bool,
+        synchronize_validation: bool = False,
+    ) -> tuple[int, int, torch.Tensor]:
+        self.kv_layer_index(layer_idx)
+        row_idx = self.seq_id_to_row[layer_idx].get(seq.seq_id)
+        if row_idx is None:
+            raise ValueError
+        cur_len = int(self.row_seq_lens[layer_idx][row_idx])
+        keep_indices = keep_indices.to(
+            device=self.device,
+            dtype=torch.long,
+        ).contiguous()
+        if keep_indices.dim() != 1:
+            raise RuntimeError(
+                "free_part_slots expected one-dimensional keep_indices: "
+                f"layer={layer_idx} seq_id={seq.seq_id} "
+                f"keep_shape={tuple(keep_indices.shape)}"
+            )
+        if keep_indices.numel() <= 0:
+            raise RuntimeError(
+                f"free_part_slots got empty keep_indices: layer={layer_idx} seq_id={seq.seq_id}"
+            )
+        keep_indices = self._prepare_compaction_keep_indices(
+            keep_indices,
+            torch.tensor(cur_len, dtype=torch.long, device=self.device),
+            sort_dim=0,
+            keep_indices_sorted=keep_indices_sorted,
+            operation="free_part_slots",
+            synchronize_validation=synchronize_validation,
+        )
+        self._preflight_compaction_free_capacity(
+            layer_idx,
+            cur_len - int(keep_indices.numel()),
+            operation="free_part_slots",
+        )
+        return int(row_idx), cur_len, keep_indices
+
+    def _append_compaction_free_slots(
+        self,
+        layer_idx: int,
+        dropped_slots: torch.Tensor,
+    ) -> None:
+        count = int(dropped_slots.numel())
+        if count <= 0:
+            return
+        ptr = int(self._num_free_slots[layer_idx])
+        self.free_slots_stack[layer_idx][ptr: ptr + count] = dropped_slots
+        self._num_free_slots[layer_idx] = ptr + count
+
+    def _apply_free_part_slots(
+        self,
+        layer_idx: int,
+        seq: Sequence,
+        row_idx: int,
+        cur_len: int,
+        keep_indices: torch.Tensor,
+    ) -> None:
+        self._uniform_decode_metadata = False
+        old_slots = self.buffer_req_to_token_slots[layer_idx][row_idx, :cur_len].clone()
+        new_slots = old_slots[keep_indices]
+
+        mask = torch.ones_like(old_slots, dtype=torch.bool)
+        mask[keep_indices] = False
+        dropped_slots = old_slots[mask]
+        self._append_compaction_free_slots(layer_idx, dropped_slots)
+        if dropped_slots.numel() <= 0:
+            logger.warning(
+                f"[SnapKV] dropped 0 tokens? layer={layer_idx} "
+                f"seq_id={seq.seq_id} row={row_idx} cur_len={cur_len}"
+            )
+
+        self.buffer_req_to_token_slots[layer_idx][row_idx, :] = 0
+        self.buffer_req_to_token_slots[layer_idx][row_idx, :new_slots.numel()] = new_slots
+        self.row_seq_lens[layer_idx][row_idx] = new_slots.numel()
+        if log_level == 'DEBUG':
+            logger.debug(
+                "[SnapKV] free_part_slots(after): "
+                f"layer={layer_idx} seq_id={seq.seq_id} row={row_idx} "
+                f"context_len={cur_len} -> {int(new_slots.numel())}"
+            )
+
+    def _page_table_compaction_tile_elements(self) -> int:
+        tile_elements = int(
+            getattr(
+                self,
+                "_page_table_compaction_tile_elements_override",
+                _PAGE_TABLE_COMPACTION_TILE_ELEMENTS,
+            )
+        )
+        if tile_elements <= 0:
+            raise RuntimeError(
+                "Page-table compaction tile size must be positive: "
+                f"tile_elements={tile_elements}."
+            )
+        return tile_elements
+
+    def _compact_uniform_row_tile(
+        self,
+        layer_idx: int,
+        row_indices: list[int],
+        cur_len: int,
+        keep_indices: torch.Tensor,
+    ) -> int:
+        rows_gpu = torch.tensor(row_indices, dtype=torch.long, device=self.device)
+        old_slots = self.buffer_req_to_token_slots[layer_idx][rows_gpu, :cur_len]
+        new_slots = old_slots.gather(1, keep_indices)
+        mask = torch.ones_like(old_slots, dtype=torch.bool)
+        mask.scatter_(1, keep_indices, False)
+        dropped_slots = old_slots[mask]
+        self._append_compaction_free_slots(layer_idx, dropped_slots)
+
+        new_len = int(new_slots.shape[1])
+        self.buffer_req_to_token_slots[layer_idx][rows_gpu, :new_len] = new_slots
+        self.buffer_req_to_token_slots[layer_idx][rows_gpu, new_len:] = 0
+        self.row_seq_lens[layer_idx][row_indices] = new_len
+        return int(dropped_slots.numel())
+
+    def _compact_single_row_column_tiles(
+        self,
+        layer_idx: int,
+        row_idx: int,
+        cur_len: int,
+        keep_indices: torch.Tensor,
+        tile_elements: int,
+    ) -> int:
+        slot_row = self.buffer_req_to_token_slots[layer_idx][row_idx]
+        dropped_count = 0
+
+        # Complete the dropped-slot read before rewriting any source entry.
+        # Each old-slot, mask, dropped-slot, and selected-slot temporary is
+        # capped at tile_elements entries.
+        for start in range(0, cur_len, tile_elements):
+            end = min(cur_len, start + tile_elements)
+            old_slots = slot_row[start:end].clone()
+            mask = torch.ones_like(old_slots, dtype=torch.bool)
+            left = int(torch.searchsorted(keep_indices, start).item())
+            right = int(torch.searchsorted(keep_indices, end).item())
+            if right > left:
+                mask[keep_indices[left:right] - start] = False
+            dropped_slots = old_slots[mask]
+            self._append_compaction_free_slots(layer_idx, dropped_slots)
+            dropped_count += int(dropped_slots.numel())
+
+        new_len = int(keep_indices.numel())
+        for start in range(0, new_len, tile_elements):
+            end = min(new_len, start + tile_elements)
+            selected_slots = slot_row.index_select(
+                0, keep_indices[start:end]
+            )
+            # Sorted unique keep indices satisfy keep[i] >= i. Therefore an
+            # earlier destination tile cannot overwrite a later source tile.
+            slot_row[start:end] = selected_slots
+        slot_row[new_len:] = 0
+        self.row_seq_lens[layer_idx][row_idx] = new_len
+        return dropped_count
+
+    def _compact_uniform_rows_bounded(
+        self,
+        layer_idx: int,
+        row_indices: list[int],
+        cur_len: int,
+        keep_indices: torch.Tensor,
+    ) -> None:
+        """Compact rows without a layer/batch/full-context temporary."""
+        tile_elements = self._page_table_compaction_tile_elements()
+        dropped_count = 0
+        if cur_len <= tile_elements:
+            rows_per_tile = max(1, tile_elements // max(1, cur_len))
+            for start in range(0, len(row_indices), rows_per_tile):
+                end = min(len(row_indices), start + rows_per_tile)
+                dropped_count += self._compact_uniform_row_tile(
+                    layer_idx,
+                    row_indices[start:end],
+                    cur_len,
+                    keep_indices[start:end],
+                )
+        else:
+            for row_idx, row_keep_indices in zip(row_indices, keep_indices):
+                dropped_count += self._compact_single_row_column_tiles(
+                    layer_idx,
+                    int(row_idx),
+                    cur_len,
+                    row_keep_indices,
+                    tile_elements,
+                )
+        if dropped_count <= 0:
+            logger.warning(
+                f"[SnapKV] dropped 0 tokens in bounded batch? layer={layer_idx} "
+                f"rows={row_indices} cur_len={cur_len}"
+            )
+
+    def _compact_uniform_layer_tile(
+        self,
+        layer_indices: list[int],
+        kv_layer_indices: list[int],
+        row_indices: np.ndarray,
+        cur_len: int,
+        keep_indices: torch.Tensor,
+        common_slot_table: torch.Tensor,
+    ) -> None:
+        """Compact a bounded tile of compatible layers in shared Torch ops."""
+        kv_layers_gpu = torch.tensor(
+            kv_layer_indices,
+            dtype=torch.long,
+            device=self.device,
+        )
+        rows_gpu = torch.from_numpy(row_indices).to(
+            device=self.device,
+            dtype=torch.long,
+        )
+        old_slots = common_slot_table[
+            kv_layers_gpu[:, None],
+            rows_gpu,
+            :cur_len,
+        ]
+        new_slots = old_slots.gather(2, keep_indices)
+        mask = torch.ones_like(old_slots, dtype=torch.bool)
+        mask.scatter_(2, keep_indices, False)
+        dropped_per_layer = old_slots[mask].view(
+            len(layer_indices),
+            int(row_indices.shape[1]) * (cur_len - int(keep_indices.shape[2])),
+        )
+        for local_layer, layer_idx in enumerate(layer_indices):
+            self._append_compaction_free_slots(
+                int(layer_idx),
+                dropped_per_layer[local_layer],
+            )
+
+        new_len = int(new_slots.shape[2])
+        common_slot_table[
+            kv_layers_gpu[:, None],
+            rows_gpu,
+            :new_len,
+        ] = new_slots
+        common_slot_table[
+            kv_layers_gpu[:, None],
+            rows_gpu,
+            new_len:,
+        ] = 0
+        for local_layer, layer_idx in enumerate(layer_indices):
+            self.row_seq_lens[int(layer_idx)][row_indices[local_layer]] = new_len
+        if dropped_per_layer.numel() <= 0:
+            logger.warning(
+                "[SnapKV] dropped 0 tokens in bounded layer batch? "
+                f"layers={layer_indices} rows={row_indices.tolist()} "
+                f"cur_len={cur_len}"
+            )
+
     def free_part_slots(
         self,
         layer_idx: int,
@@ -1537,14 +1872,12 @@ class SnapKVCacheManager(CacheManager):
     ):
         if keep_indices is None:
             return
-
-        self.kv_layer_index(layer_idx)
-        self._uniform_decode_metadata = False
-        row_idx = self.seq_id_to_row[layer_idx].get(seq.seq_id)
-        if row_idx is None:
-            raise ValueError
-
-        cur_len = self.row_seq_lens[layer_idx][row_idx]
+        row_idx, cur_len, keep_indices = self._prepare_free_part_slots(
+            layer_idx,
+            seq,
+            keep_indices,
+            keep_indices_sorted=keep_indices_sorted,
+        )
         if log_level == 'DEBUG':
             keep_cnt = int(keep_indices.numel())
             logger.debug(
@@ -1552,45 +1885,13 @@ class SnapKVCacheManager(CacheManager):
                 f"layer={layer_idx} seq_id={seq.seq_id} row={row_idx} "
                 f"context_len={int(cur_len)} keep={keep_cnt} drop={max(0, int(cur_len) - keep_cnt)}"
             )
-        old_slots = self.buffer_req_to_token_slots[layer_idx][row_idx, :cur_len].clone()
-
-        keep_indices = keep_indices.to(device=self.device, dtype=torch.long).contiguous()
-        if keep_indices.numel() <= 0:
-            raise RuntimeError(
-                f"free_part_slots got empty keep_indices: layer={layer_idx} seq_id={seq.seq_id}"
-            )
-        if bool((keep_indices < 0).any().item()) or bool((keep_indices >= int(cur_len)).any().item()):
-            raise RuntimeError(
-                "free_part_slots keep_indices out of bounds: "
-                f"layer={layer_idx} seq_id={seq.seq_id} cur_len={int(cur_len)} "
-                f"keep_min={int(keep_indices.min().item())} "
-                f"keep_max={int(keep_indices.max().item())}"
-            )
-        if not keep_indices_sorted:
-            keep_indices = torch.sort(keep_indices).values
-        new_slots = old_slots[keep_indices]
-
-        mask = torch.ones_like(old_slots, dtype=torch.bool)
-        mask[keep_indices] = False
-        dropped_slots = old_slots[mask]
-
-        if dropped_slots.numel() > 0:
-            count = dropped_slots.numel()
-            ptr = self._num_free_slots[layer_idx]
-            self.free_slots_stack[layer_idx][ptr: ptr + count] = dropped_slots
-            self._num_free_slots[layer_idx] += count
-        else:
-            logger.warning(f"[SnapKV] dropped 0 tokens? layer={layer_idx} seq_id={seq.seq_id} row={row_idx} cur_len={int(cur_len)}")
-
-        self.buffer_req_to_token_slots[layer_idx][row_idx, :] = 0
-        self.buffer_req_to_token_slots[layer_idx][row_idx, :new_slots.numel()] = new_slots
-        self.row_seq_lens[layer_idx][row_idx] = new_slots.numel()
-        if log_level == 'DEBUG':
-            logger.debug(
-                "[SnapKV] free_part_slots(after): "
-                f"layer={layer_idx} seq_id={seq.seq_id} row={row_idx} "
-                f"context_len={int(cur_len)} -> {int(new_slots.numel())}"
-            )
+        self._apply_free_part_slots(
+            layer_idx,
+            seq,
+            row_idx,
+            cur_len,
+            keep_indices,
+        )
 
     def free_part_slots_batch(
         self,
@@ -1605,16 +1906,6 @@ class SnapKVCacheManager(CacheManager):
         if not seqs:
             return
         self.kv_layer_index(layer_idx)
-        if len(seqs) == 1:
-            self.free_part_slots(
-                layer_idx,
-                seqs[0],
-                keep_indices[0],
-                keep_indices_sorted=keep_indices_sorted,
-            )
-            return
-
-        self._uniform_decode_metadata = False
         keep_indices = keep_indices.to(device=self.device, dtype=torch.long).contiguous()
         if keep_indices.dim() != 2 or int(keep_indices.shape[0]) != len(seqs):
             raise RuntimeError(
@@ -1623,6 +1914,15 @@ class SnapKVCacheManager(CacheManager):
             )
         if int(keep_indices.shape[1]) <= 0:
             raise RuntimeError(f"free_part_slots_batch got empty keep_indices: layer={layer_idx}")
+        if len(seqs) == 1:
+            SnapKVCacheManager.free_part_slots(
+                self,
+                layer_idx,
+                seqs[0],
+                keep_indices[0],
+                keep_indices_sorted=keep_indices_sorted,
+            )
+            return
 
         row_indices = []
         cur_lens = []
@@ -1633,52 +1933,46 @@ class SnapKVCacheManager(CacheManager):
             row_indices.append(int(row_idx))
             cur_lens.append(int(self.row_seq_lens[layer_idx][row_idx]))
 
+        if len(row_indices) != len(set(row_indices)):
+            raise RuntimeError(
+                "free_part_slots_batch received duplicate physical rows: "
+                f"layer={layer_idx} rows={row_indices}."
+            )
+        keep_indices = self._prepare_compaction_keep_indices(
+            keep_indices,
+            torch.tensor(cur_lens, dtype=torch.long, device=self.device),
+            sort_dim=1,
+            keep_indices_sorted=keep_indices_sorted,
+            operation="free_part_slots_batch",
+        )
+        total_release_count = sum(
+            int(cur_len) - int(keep_indices.shape[1]) for cur_len in cur_lens
+        )
+        self._preflight_compaction_free_capacity(
+            layer_idx,
+            total_release_count,
+            operation="free_part_slots_batch",
+        )
+        self._uniform_decode_metadata = False
+
         first_len = cur_lens[0]
         if any(cur_len != first_len for cur_len in cur_lens):
             for seq, seq_keep_indices in zip(seqs, keep_indices):
-                self.free_part_slots(
+                SnapKVCacheManager.free_part_slots(
+                    self,
                     layer_idx,
                     seq,
                     seq_keep_indices,
-                    keep_indices_sorted=keep_indices_sorted,
+                    keep_indices_sorted=True,
                 )
             return
         cur_len = int(first_len)
-        bounds_ok = ((keep_indices >= 0) & (keep_indices < cur_len)).all()
-        if keep_indices.is_cuda:
-            torch._assert_async(bounds_ok)
-        elif not bool(bounds_ok.item()):
-            raise RuntimeError(
-                "free_part_slots_batch keep_indices out of bounds: "
-                f"layer={layer_idx} cur_len={cur_len} "
-                f"keep_min={int(keep_indices.min().item())} "
-                f"keep_max={int(keep_indices.max().item())}"
-            )
-
-        if not keep_indices_sorted:
-            keep_indices = torch.sort(keep_indices, dim=1).values
-        rows_gpu = torch.tensor(row_indices, dtype=torch.long, device=self.device)
-        old_slots = self.buffer_req_to_token_slots[layer_idx][rows_gpu, :cur_len]
-        new_slots = old_slots.gather(1, keep_indices)
-
-        mask = torch.ones_like(old_slots, dtype=torch.bool)
-        mask.scatter_(1, keep_indices, False)
-        dropped_slots = old_slots[mask]
-        if dropped_slots.numel() > 0:
-            count = int(dropped_slots.numel())
-            ptr = self._num_free_slots[layer_idx]
-            self.free_slots_stack[layer_idx][ptr: ptr + count] = dropped_slots
-            self._num_free_slots[layer_idx] += count
-        else:
-            logger.warning(
-                f"[SnapKV] dropped 0 tokens in batch? layer={layer_idx} "
-                f"rows={row_indices} cur_len={cur_len}"
-            )
-
-        new_len = int(new_slots.shape[1])
-        self.buffer_req_to_token_slots[layer_idx][rows_gpu, :new_len] = new_slots
-        self.buffer_req_to_token_slots[layer_idx][rows_gpu, new_len:cur_len] = 0
-        self.row_seq_lens[layer_idx][row_indices] = new_len
+        self._compact_uniform_rows_bounded(
+            layer_idx,
+            row_indices,
+            cur_len,
+            keep_indices,
+        )
 
     def free_part_slots_batch_layers(
         self,
@@ -1694,16 +1988,6 @@ class SnapKVCacheManager(CacheManager):
             return
         for layer_idx in layer_indices:
             self.kv_layer_index(int(layer_idx))
-        if len(layer_indices) == 1:
-            self.free_part_slots_batch(
-                int(layer_indices[0]),
-                seqs,
-                keep_indices[0],
-                keep_indices_sorted=keep_indices_sorted,
-            )
-            return
-
-        self._uniform_decode_metadata = False
         keep_indices = keep_indices.to(device=self.device, dtype=torch.long).contiguous()
         num_layers = len(layer_indices)
         batch_size = len(seqs)
@@ -1714,6 +1998,21 @@ class SnapKVCacheManager(CacheManager):
             )
         if int(keep_indices.shape[2]) <= 0:
             raise RuntimeError("free_part_slots_batch_layers got empty keep_indices.")
+        normalized_layers = [int(layer_idx) for layer_idx in layer_indices]
+        if len(normalized_layers) != len(set(normalized_layers)):
+            raise RuntimeError(
+                "free_part_slots_batch_layers received duplicate layers: "
+                f"layers={normalized_layers}."
+            )
+        if len(layer_indices) == 1:
+            SnapKVCacheManager.free_part_slots_batch(
+                self,
+                normalized_layers[0],
+                seqs,
+                keep_indices[0],
+                keep_indices_sorted=keep_indices_sorted,
+            )
+            return
 
         row_indices = np.empty((num_layers, batch_size), dtype=np.int64)
         cur_lens = np.empty((num_layers, batch_size), dtype=np.int64)
@@ -1726,83 +2025,102 @@ class SnapKVCacheManager(CacheManager):
                 row_indices[local_layer, seq_idx] = int(row_idx)
                 cur_lens[local_layer, seq_idx] = int(self.row_seq_lens[layer_idx][row_idx])
 
+        for local_layer, layer_idx in enumerate(layer_indices):
+            rows = row_indices[local_layer].tolist()
+            if len(rows) != len(set(rows)):
+                raise RuntimeError(
+                    "free_part_slots_batch_layers received duplicate physical rows: "
+                    f"layer={int(layer_idx)} rows={rows}."
+                )
+        keep_indices = self._prepare_compaction_keep_indices(
+            keep_indices,
+            torch.from_numpy(cur_lens).to(device=self.device, dtype=torch.long),
+            sort_dim=2,
+            keep_indices_sorted=keep_indices_sorted,
+            operation="free_part_slots_batch_layers",
+        )
+        for local_layer, layer_idx in enumerate(layer_indices):
+            release_count = int(
+                np.sum(
+                    cur_lens[local_layer]
+                    - int(keep_indices.shape[2])
+                )
+            )
+            self._preflight_compaction_free_capacity(
+                int(layer_idx),
+                release_count,
+                operation="free_part_slots_batch_layers",
+            )
+        self._uniform_decode_metadata = False
+
+        tile_elements = self._page_table_compaction_tile_elements()
         cur_len = int(cur_lens[0, 0])
-        if not np.all(cur_lens == cur_len):
-            for local_layer, layer_idx in enumerate(layer_indices):
-                self.free_part_slots_batch(
-                    int(layer_idx),
-                    seqs,
-                    keep_indices[local_layer],
-                    keep_indices_sorted=keep_indices_sorted,
+        elements_per_layer = batch_size * cur_len
+        common_slot_table = getattr(
+            self,
+            "buffer_req_to_token_slots_tensor",
+            None,
+        )
+        kv_layer_indices = [
+            self.kv_layer_index(layer_idx) for layer_idx in normalized_layers
+        ]
+        common_views_match = (
+            common_slot_table is not None
+            and common_slot_table.dim() == 3
+            and len(kv_layer_indices) == len(set(kv_layer_indices))
+            and all(
+                self.buffer_req_to_token_slots[layer_idx] is not None
+                and tuple(self.buffer_req_to_token_slots[layer_idx].shape)
+                == tuple(common_slot_table[kv_idx].shape)
+                and self.buffer_req_to_token_slots[layer_idx].stride()
+                == common_slot_table[kv_idx].stride()
+                and self.buffer_req_to_token_slots[layer_idx].data_ptr()
+                == common_slot_table[kv_idx].data_ptr()
+                for layer_idx, kv_idx in zip(
+                    normalized_layers,
+                    kv_layer_indices,
+                )
+            )
+        )
+        can_compact_layer_tiles = (
+            common_views_match
+            and np.all(cur_lens == cur_len)
+            and elements_per_layer <= tile_elements
+        )
+        if can_compact_layer_tiles:
+            layers_per_tile = max(1, tile_elements // max(1, elements_per_layer))
+            for start in range(0, num_layers, layers_per_tile):
+                end = min(num_layers, start + layers_per_tile)
+                self._compact_uniform_layer_tile(
+                    normalized_layers[start:end],
+                    kv_layer_indices[start:end],
+                    row_indices[start:end],
+                    cur_len,
+                    keep_indices[start:end],
+                    common_slot_table,
                 )
             return
 
-        bounds_ok = ((keep_indices >= 0) & (keep_indices < cur_len)).all()
-        if keep_indices.is_cuda:
-            torch._assert_async(bounds_ok)
-        elif not bool(bounds_ok.item()):
-            raise RuntimeError(
-                "free_part_slots_batch_layers keep_indices out of bounds: "
-                f"cur_len={cur_len} keep_min={int(keep_indices.min().item())} "
-                f"keep_max={int(keep_indices.max().item())}"
-            )
-
-        if not keep_indices_sorted:
-            keep_indices = torch.sort(keep_indices, dim=2).values
-        kv_layers_gpu = torch.tensor(
-            [self.kv_layer_index(int(layer_idx)) for layer_idx in layer_indices],
-            dtype=torch.long,
-            device=self.device,
-        )
-        rows_gpu = torch.from_numpy(row_indices).to(device=self.device, dtype=torch.long)
-        old_slots = self.buffer_req_to_token_slots_tensor[
-            kv_layers_gpu[:, None],
-            rows_gpu,
-            :cur_len,
-        ]
-        new_slots = old_slots.gather(2, keep_indices)
-
-        mask = torch.ones_like(old_slots, dtype=torch.bool)
-        mask.scatter_(2, keep_indices, False)
-        dropped_per_layer = old_slots[mask].view(num_layers, -1)
-        drop_count = int(dropped_per_layer.shape[1])
-        if drop_count > 0:
-            if self.free_slots_stack_tensor is not None:
-                ptrs = np.asarray([self._num_free_slots[int(layer_idx)] for layer_idx in layer_indices], dtype=np.int64)
-                offsets = ptrs[:, None] + np.arange(drop_count, dtype=np.int64)[None, :]
-                self.free_slots_stack_tensor[
-                    kv_layers_gpu[:, None],
-                    torch.from_numpy(offsets).to(device=self.device, dtype=torch.long),
-                ] = dropped_per_layer.to(torch.int32)
-            else:
-                for local_layer, layer_idx in enumerate(layer_indices):
-                    layer_idx = int(layer_idx)
-                    ptr = self._num_free_slots[layer_idx]
-                    self.free_slots_stack[layer_idx][ptr: ptr + drop_count] = dropped_per_layer[local_layer]
-            for layer_idx in layer_indices:
-                self._num_free_slots[int(layer_idx)] += drop_count
-        else:
-            logger.warning(
-                f"[SnapKV] dropped 0 tokens in layer batch? layers={layer_indices} "
-                f"rows={row_indices.tolist()} cur_len={cur_len}"
-            )
-
-        new_len = int(new_slots.shape[2])
-        new_cols = torch.arange(new_len, dtype=torch.long, device=self.device)
-        self.buffer_req_to_token_slots_tensor[
-            kv_layers_gpu[:, None, None],
-            rows_gpu[:, :, None],
-            new_cols[None, None, :],
-        ] = new_slots
-        if new_len < cur_len:
-            tail_cols = torch.arange(new_len, cur_len, dtype=torch.long, device=self.device)
-            self.buffer_req_to_token_slots_tensor[
-                kv_layers_gpu[:, None, None],
-                rows_gpu[:, :, None],
-                tail_cols[None, None, :],
-            ] = 0
         for local_layer, layer_idx in enumerate(layer_indices):
-            self.row_seq_lens[int(layer_idx)][row_indices[local_layer]] = new_len
+            layer_idx = int(layer_idx)
+            layer_cur_lens = cur_lens[local_layer]
+            cur_len = int(layer_cur_lens[0])
+            if np.all(layer_cur_lens == cur_len):
+                self._compact_uniform_rows_bounded(
+                    layer_idx,
+                    row_indices[local_layer].tolist(),
+                    cur_len,
+                    keep_indices[local_layer],
+                )
+                continue
+            for seq_idx, seq in enumerate(seqs):
+                SnapKVCacheManager.free_part_slots(
+                    self,
+                    layer_idx,
+                    seq,
+                    keep_indices[local_layer, seq_idx],
+                    keep_indices_sorted=True,
+                )
 
     def free_prefix_recent_slots_batch_layers(
         self,

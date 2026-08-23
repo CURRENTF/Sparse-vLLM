@@ -46,6 +46,25 @@ Atomic eligibility 与验证、性能证据必须分开。`validation_evidence` 
 范围内。一个 kernel 可以在较宽设备范围内允许尝试，但只能在已有证据的范围内声称
 正确性已验证或性能占优。
 
+Repo-owned nonstandard kernel 应遵循**乐观可移植、保守声明证据**的原则。当一种
+非标准契约使用 portable Triton 或 TileLang primitives 实现，且没有已知不兼容时，
+它的通用 atomic provider 应允许在本地少量 GPU 之外的设备上尝试。如果该 provider
+是这项契约的常规实现，就应进入对应的默认 portfolio。本地硬件覆盖有限只应体现在
+`validation_evidence` 中，不能仅凭这一点把整个 provider 变成 exact-device profile。
+
+`profile_only=True` 应保留给真正的特化替代方案，例如 exact-device launch schedule、
+经过实测的 token-range dispatcher，或只应在已记录性能范围内覆盖通用 provider 的
+混合 dispatch plan。优先采用以下结构：
+
+```text
+非标准 operation contract
+  -> 默认 portfolio 中的通用 portable Triton/TileLang atomic provider
+  -> 可选 exact profile，选择调优 provider、schedule 或 dispatch plan
+```
+
+不能仅因为仓库无法测试很多 GPU 型号，就用 exact profile 代替 portable default。
+只要已知存在可移植实现，profile 未命中时仍应保留满足该非标准契约的有效实现。
+
 ## 默认 Portfolio
 
 每个 operator registry 都显式持有 `PortfolioPolicy`。标准上游 provider 排在
@@ -55,7 +74,8 @@ provider。Provider class 不再声明整数 priority。
 
 不进入默认 portfolio 的 atomic provider 必须显式注册为 `profile_only=True`。
 该入口只供 exact profile 引用 specialized implementation；未声明的隐藏
-provider 会在 registry 校验时失败。
+provider 会在 registry 校验时失败。该标记控制的是默认选择资格，而不是 provider
+的正确性支持域，也不是本地验证证据的覆盖范围。
 
 ## Profile Overlay
 

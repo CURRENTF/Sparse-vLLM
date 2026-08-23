@@ -1163,21 +1163,24 @@ class H2OCacheManager(SnapKVCacheManager):
     ):
         if keep_indices is None:
             return
-        self._invalidate_h2o_decode_score_workspace()
-        kv_len = self._physical_row_len(layer_idx, seq)
-        score = self._require_score_length(layer_idx, seq, kv_len)
-        keep_indices = keep_indices.to(device=self.device, dtype=torch.long).contiguous()
-        if not keep_indices_sorted:
-            keep_indices = torch.sort(keep_indices).values
-        self._h2o_scores[self._score_key(layer_idx, seq.seq_id)] = score.index_select(
-            0, keep_indices
-        ).contiguous()
-        super().free_part_slots(
+        row_idx, kv_len, keep_indices = self._prepare_free_part_slots(
             layer_idx,
             seq,
             keep_indices,
-            keep_indices_sorted=True,
+            keep_indices_sorted=keep_indices_sorted,
+            synchronize_validation=True,
         )
+        score = self._require_score_length(layer_idx, seq, kv_len)
+        kept_score = score.index_select(0, keep_indices).contiguous()
+        self._invalidate_h2o_decode_score_workspace()
+        self._apply_free_part_slots(
+            layer_idx,
+            seq,
+            row_idx,
+            kv_len,
+            keep_indices,
+        )
+        self._h2o_scores[self._score_key(layer_idx, seq.seq_id)] = kept_score
 
     def _get_final_prefill_workspace(
         self,
@@ -1769,7 +1772,26 @@ class H2OCacheManager(SnapKVCacheManager):
         seq_id: int,
         processed_token_count: int,
     ) -> None:
-        self._h2o_active_decode_seq_ids.discard(int(seq_id))
+        seq_id = int(seq_id)
+        self._h2o_active_decode_seq_ids.discard(seq_id)
+        for layer_idx in self.kv_transformer_layer_indices():
+            row_idx = self.seq_id_to_row[layer_idx].get(seq_id)
+            if row_idx is None:
+                continue
+            physical_len = int(self.row_seq_lens[layer_idx][row_idx])
+            key = self._score_key(layer_idx, seq_id)
+            score = self._h2o_scores.get(key)
+            if score is None:
+                raise RuntimeError(
+                    "H2O chain turn finished without a score vector for a resident "
+                    f"KV row: layer={layer_idx} seq_id={seq_id} "
+                    f"physical_len={physical_len}."
+                )
+            self._h2o_scores[key] = self._expand_score(
+                score,
+                physical_len,
+                device=score.device,
+            )
         super().on_chain_turn_finished(seq_id, processed_token_count)
 
     def reset_after_warmup(self) -> None:

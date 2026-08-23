@@ -340,6 +340,9 @@ def _prefill_score_final_kernel(
     # The physical row is shared by local heads, so accumulate their attention
     # mass into one per-layer token vector. Dividing by query count keeps the
     # existing chunk-weighted accumulator equivalent to a sum over queries.
+    # TODO: Validate matched downstream quality/performance for this shared
+    # probability reduction. Restore max reduction if summed head mass regresses
+    # R-KV, SnapKV, PyramidKV, or H2O behavior.
     token_score = tl.sum(probs, axis=0) / (score_q_len * 1.0)
     tl.atomic_add(
         Attn_Score + cur_batch * stride_asb + kv_pos * stride_asl,

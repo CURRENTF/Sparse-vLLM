@@ -84,7 +84,7 @@
         "h2o_decode_eviction_interval": 128,
         "h2o_prefill_budget": 8192,
         "h2o_recent_ratio": 0.5,
-        "h2o_prefill_score_window": 128,
+        "h2o_prefill_score_window": 0,
         "gpu_memory_utilization": 0.9
       },
       "performance": {"minimum_prefill_speedup": 1.0},

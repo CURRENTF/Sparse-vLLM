@@ -64,4 +64,3 @@ Before subclassing or copying an existing method, compare:
 - supported models and topologies.
 
 Reuse is safe only when these mechanics match. Otherwise share a small helper or protocol implementation rather than inheriting incompatible lifecycle assumptions.
-

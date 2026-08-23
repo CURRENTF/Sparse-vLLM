@@ -152,7 +152,7 @@ class RKVCacheManager(SnapKVCacheManager):
             return
         _, positions = self._rkv_layer_query_cache(layer_idx)
         rows_tensor = torch.tensor(rows, dtype=torch.long, device=self.device)
-        positions[rows_tensor].fill_(-1)
+        positions.index_fill_(0, rows_tensor, -1)
 
     @staticmethod
     def attention_scores_from_materialized_keys(

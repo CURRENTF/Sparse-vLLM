@@ -44,21 +44,23 @@ def _spec(*, tp_size: int = 2) -> MlaAttentionOpSpec:
     )
 
 
-def _h100_caps() -> DeviceCaps:
-    return DeviceCaps(
-        platform=PlatformEnum.CUDA,
-        device_type="cuda",
-        device_index=0,
-        device_name="NVIDIA H100 80GB HBM3",
-        compute_capability=(9, 0),
-        runtime_version="13.0",
-        supports_graph_capture=True,
-        supports_torch_compile=True,
-        supports_triton=True,
-        supports_pin_memory=True,
-        supports_bfloat16=True,
-        supports_native_fp8=True,
-    )
+def _h100_caps(**overrides) -> DeviceCaps:
+    values = {
+        "platform": PlatformEnum.CUDA,
+        "device_type": "cuda",
+        "device_index": 0,
+        "device_name": "NVIDIA H100 80GB HBM3",
+        "compute_capability": (9, 0),
+        "runtime_version": "13.0",
+        "supports_graph_capture": True,
+        "supports_torch_compile": True,
+        "supports_triton": True,
+        "supports_pin_memory": True,
+        "supports_bfloat16": True,
+        "supports_native_fp8": True,
+    }
+    values.update(overrides)
+    return DeviceCaps(**values)
 
 
 def _cpu_workspace() -> MlaDecodeWorkspace:
@@ -117,7 +119,12 @@ assert "tilelang" not in sys.modules
 
 @pytest.mark.parametrize(
     ("version", "supported"),
-    [("0.1.8", False), ("0.1.9", True), ("0.2.0+cu130", False)],
+    [
+        ("0.1.8", False),
+        ("0.1.9", True),
+        ("0.1.13", False),
+        ("0.2.0+cu130", False),
+    ],
 )
 def test_tilelang_support_version_boundary(version: str, supported: bool) -> None:
     def installed(package: str) -> str:
@@ -136,7 +143,7 @@ def test_tilelang_support_reports_missing_package() -> None:
         assert tilelang_mla_support() == (False, "tilelang is not installed")
 
 
-def test_tilelang_support_rejects_unvalidated_tvm_ffi() -> None:
+def test_tilelang_support_rejects_unvalidated_dependency_pair() -> None:
     def version(package: str) -> str:
         return {
             "tilelang": "0.1.9",
@@ -146,7 +153,25 @@ def test_tilelang_support_rejects_unvalidated_tvm_ffi() -> None:
     with patch.object(metadata, "version", side_effect=version):
         supported, reason = tilelang_mla_support()
     assert not supported
-    assert "apache-tvm-ffi==0.1.10" in reason
+    assert "requires the validated TileLang dependency pair" in reason
+
+
+@pytest.mark.parametrize(
+    ("version", "supported"),
+    [
+        ("0.1.1", False),
+        ("0.1.2", False),
+        ("0.1.10", True),
+        ("0.1.13.post2", False),
+        ("0.2.0", False),
+    ],
+)
+def test_tvm_ffi_support_version_boundary(version: str, supported: bool) -> None:
+    def installed(package: str) -> str:
+        return "0.1.9" if package == "tilelang" else version
+
+    with patch.object(metadata, "version", side_effect=installed):
+        assert tilelang_mla_support()[0] is supported
 
 
 @pytest.mark.parametrize(("tp_size", "local_heads"), [(1, 20), (2, 10), (4, 5)])
@@ -211,6 +236,69 @@ def test_missing_tilelang_binds_score_capable_triton_provider() -> None:
         "tilelang_score_sgl_fa3_h100",
         "tilelang missing",
     ) in resolved.rejected
+
+
+def test_tilelang_mla_profile_is_exact_but_atomic_support_is_portable() -> None:
+    spec = _spec(tp_size=4)
+    workspace = _cpu_workspace()
+    with (
+        patch(
+            "sparsevllm.operators.mla_attention.sgl_fa3_device_support",
+            return_value=(True, "sgl test"),
+        ),
+        patch(
+            "sparsevllm.operators.mla_attention.tilelang_mla_support",
+            return_value=(True, "tilelang test"),
+        ),
+        patch(
+            "sparsevllm.operators.mla_attention.allocate_mla_decode_workspace",
+            return_value=workspace,
+        ),
+    ):
+        resolved = OpResolver(MLA_ATTENTION_REGISTRY).resolve(
+            spec,
+            _h100_caps(device_name="NVIDIA H20"),
+            op_spec=spec,
+            device="cpu",
+            max_batch_size=2,
+        )
+
+    assert type(resolved.provider) is MlaTritonProvider
+    assert resolved.report.selected_profile is None
+    assert resolved.report.profiles[0].matched is False
+    assert resolved.report.candidates[2].supported is True
+
+
+def test_tilelang_mla_exact_h100_profile_overrides_default_portfolio() -> None:
+    spec = _spec()
+    workspace = _cpu_workspace()
+    with (
+        patch(
+            "sparsevllm.operators.mla_attention.sgl_fa3_device_support",
+            return_value=(True, "sgl test"),
+        ),
+        patch(
+            "sparsevllm.operators.mla_attention.tilelang_mla_support",
+            return_value=(True, "tilelang test"),
+        ),
+        patch(
+            "sparsevllm.operators.mla_attention.allocate_mla_decode_workspace",
+            return_value=workspace,
+        ),
+        patch("sparsevllm.operators.mla_attention.SglFa3DecodeKernel"),
+        patch("sparsevllm.operators.mla_attention.TileMlaDecodeKernel"),
+    ):
+        resolved = OpResolver(MLA_ATTENTION_REGISTRY).resolve(
+            spec,
+            _h100_caps(),
+            op_spec=spec,
+            device="cpu",
+            max_batch_size=2,
+        )
+
+    assert type(resolved.provider) is MlaTileLangScoreProvider
+    assert resolved.report.selected_profile == "tilelang_score_sgl_fa3_h100_profile"
+    assert resolved.report.selection_basis == "profile_override"
 
 
 def _provider_with_mocks() -> tuple[MlaTileLangScoreProvider, Mock, Mock]:

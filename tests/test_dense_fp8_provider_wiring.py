@@ -299,6 +299,7 @@ def test_dense_mha_models_build_and_bind_full_attention_provider(
         device=torch.device("cpu"),
         max_batch_size=64,
         cuda_graph=True,
+        runtime_config=engine_config,
     )
 
     with (

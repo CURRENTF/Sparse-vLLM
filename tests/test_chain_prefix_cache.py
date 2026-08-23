@@ -689,7 +689,7 @@ def test_new_pyramid_chain_capacity_uses_materialized_layer_budgets():
     assert decode_deficits == (12, 6)
 
 
-def test_resumed_snapkv_capacity_uses_physical_peak_not_token_sum():
+def test_resumed_snapkv_capacity_reserves_score_free_decode_growth():
     manager = object.__new__(SnapKVCacheManager)
     manager.config = SimpleNamespace(
         vllm_sparse_method="snapkv",
@@ -712,9 +712,39 @@ def test_resumed_snapkv_capacity_uses_physical_peak_not_token_sum():
         )
     )
 
-    # Prefill peaks at 12 physical tokens, then compression returns to budget
-    # 10; decode peaks at trigger 16. Only six new slots are ever simultaneous.
-    assert required == (6,)
+    # Final prefill compacts to ten slots, but score-free decode never evicts.
+    # generation_tokens includes the already-materialized decode input, so the
+    # resident row must reserve 99 additional slots.
+    assert required == (99,)
+    assert required_rows == 0
+    assert deficits == (96,)
+    assert row_deficit == 0
+
+
+def test_resumed_snapkv_without_suffix_reserves_growth_from_existing_row():
+    manager = object.__new__(SnapKVCacheManager)
+    manager.config = SimpleNamespace(
+        vllm_sparse_method="snapkv",
+        snapkv_num_full_layers=0,
+        num_sink_tokens=1,
+        decode_keep_tokens=8,
+        num_recent_tokens=1,
+    )
+    manager.kv_transformer_layer_indices = lambda: [0]
+    manager.kv_layer_index = lambda layer_idx: int(layer_idx)
+    manager._num_free_slots = [0]
+    manager.free_rows = [[]]
+
+    required, required_rows, deficits, row_deficit = (
+        manager.chain_capacity_deficits(
+            suffix_tokens=0,
+            generation_tokens=4,
+            existing_slots_by_layer=(12,),
+            needs_resident_row=False,
+        )
+    )
+
+    assert required == (3,)
     assert required_rows == 0
     assert deficits == (3,)
     assert row_deficit == 0

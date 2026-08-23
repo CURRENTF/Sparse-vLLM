@@ -35,6 +35,7 @@ class AllReduceOpSpec:
     dtype: torch.dtype
     cuda_graph: bool
     backend: str
+    device_ordinals: tuple[int, ...] | None = None
 
     def __post_init__(self) -> None:
         if self.world_size <= 0 or self.max_rows <= 0 or self.hidden_size <= 0:
@@ -45,6 +46,14 @@ class AllReduceOpSpec:
         ):
             raise ValueError(
                 f"All-reduce ranks must contain world_size unique ranks, got {self.ranks}."
+            )
+        if (
+            self.device_ordinals is not None
+            and len(self.device_ordinals) != self.world_size
+        ):
+            raise ValueError(
+                "All-reduce CUDA ordinal mapping must contain world_size entries, "
+                f"got {self.device_ordinals}."
             )
 
 
@@ -265,6 +274,15 @@ class FlashInferVllmAllReduceProvider(AllReduceProvider):
             return SupportResult.unsupported(
                 f"requires BF16 tensors, got {spec.dtype}"
             )
+        if spec.device_ordinals is None:
+            return SupportResult.unsupported(
+                "requires an explicit process-rank to CUDA-ordinal mapping"
+            )
+        if len(set(spec.device_ordinals)) != spec.world_size:
+            return SupportResult.unsupported(
+                "requires one rank per CUDA device on a single host; "
+                f"device_ordinals={spec.device_ordinals}"
+            )
         dependency = _flashinfer_dependency_support()
         if not dependency.supported:
             return dependency
@@ -320,16 +338,25 @@ class FlashInferVllmAllReduceProvider(AllReduceProvider):
         current_device = torch.cuda.current_device()
         if device_index is None:
             device_index = current_device
-        if int(device_index) != current_device or current_device != spec.ranks[rank]:
+        device_ordinals = spec.device_ordinals
+        if device_ordinals is None:
+            raise RuntimeError(
+                "FlashInfer vLLM all-reduce requires an explicit CUDA-ordinal mapping."
+            )
+        if (
+            int(device_index) != current_device
+            or current_device != device_ordinals[rank]
+        ):
             raise RuntimeError(
                 "FlashInfer vLLM all-reduce requires rank-to-device mapping: "
-                f"ranks={spec.ranks} rank={rank} selected={device_index} "
+                f"ranks={spec.ranks} device_ordinals={device_ordinals} rank={rank} "
+                f"selected={device_index} "
                 f"current={current_device}."
             )
         if any(
             peer != current_device
             and not torch.cuda.can_device_access_peer(current_device, peer)
-            for peer in spec.ranks
+            for peer in device_ordinals
         ):
             raise RuntimeError("FlashInfer vLLM all-reduce requires CUDA peer access.")
         max_size_bytes = spec.max_rows * spec.hidden_size * spec.dtype.itemsize
@@ -610,6 +637,29 @@ def prepare_parallel_all_reduce(
 ) -> PreparedAllReduceOp:
     """Bind an all-reduce operator to an initialized parallel group."""
 
+    device_ordinals: tuple[int, ...] | None = None
+    if group.process_group is not None and str(
+        dist.get_backend(group.process_group)
+    ) == "nccl":
+        current_device = torch.cuda.current_device()
+        if int(device_index) != current_device:
+            raise RuntimeError(
+                "All-reduce CUDA-ordinal discovery must run on the selected device: "
+                f"selected={device_index} current={current_device}."
+            )
+        local_ordinal = torch.tensor(
+            [current_device],
+            dtype=torch.int32,
+            device=torch.device("cuda", current_device),
+        )
+        gathered_ordinals = [torch.empty_like(local_ordinal) for _ in range(group.size)]
+        dist.all_gather(
+            gathered_ordinals,
+            local_ordinal,
+            group=group.process_group,
+        )
+        device_ordinals = tuple(int(item.item()) for item in gathered_ordinals)
+
     return prepare_all_reduce_op(
         AllReduceOpSpec(
             world_size=group.size,
@@ -623,6 +673,7 @@ def prepare_parallel_all_reduce(
                 if group.process_group is None
                 else str(dist.get_backend(group.process_group))
             ),
+            device_ordinals=device_ordinals,
         ),
         group=group.process_group,
         rank=group.rank,

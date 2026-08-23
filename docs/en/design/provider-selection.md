@@ -55,6 +55,31 @@ preferences, and cross-system performance claims must stay within reproducible
 measured evidence. A kernel may be eligible to run broadly while claiming
 validated correctness or superior performance only where evidence exists.
 
+Apply an **optimistic portability, conservative evidence** rule to
+repository-owned nonstandard kernels. When a nonstandard contract is implemented
+with portable Triton or TileLang primitives and has no known incompatibility, its
+general atomic provider should remain eligible beyond the small set of locally
+available GPUs. If that provider is the normal implementation of the contract,
+place it in the appropriate default portfolio. Limited local hardware coverage
+belongs in `validation_evidence`; it must not by itself turn the whole provider
+into an exact-device profile.
+
+Reserve `profile_only=True` for a genuinely specialized alternative: for example,
+an exact-device launch schedule, a measured token-range dispatcher, or a mixed
+provider plan that should override the general provider only inside its recorded
+performance domain. Prefer the following structure:
+
+```text
+nonstandard operation contract
+  -> general portable Triton/TileLang atomic provider in the default portfolio
+  -> optional exact profile selecting a tuned provider, schedule, or dispatch plan
+```
+
+Do not use an exact profile as a substitute for a portable default merely because
+the repository cannot test many GPU models. Profile misses must retain a valid
+implementation of the nonstandard contract whenever such an implementation is
+known to be portable.
+
 ## Default Portfolio
 
 Every operator registry owns an explicit `PortfolioPolicy`. Standard upstream
@@ -65,7 +90,9 @@ classes do not declare integer priorities.
 
 An atomic provider omitted from the default portfolio must be registered with
 `profile_only=True`. This is reserved for a specialized implementation referenced
-by an exact profile; accidental hidden providers fail registry validation.
+by an exact profile; accidental hidden providers fail registry validation. The
+flag controls default selection eligibility, not the provider's correctness
+support domain or the scope of local validation evidence.
 
 ## Profile Overlays
 

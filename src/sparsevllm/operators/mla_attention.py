@@ -50,9 +50,7 @@ _GLM_MLA_KV_LORA_RANK = 512
 _GLM_MLA_ROPE_DIM = 64
 _GLM_MLA_QK_HEAD_DIM = 256
 _GLM_MLA_VALUE_HEAD_DIM = 256
-_VALIDATED_H100_NAME = "NVIDIA H100 80GB HBM3"
-_VALIDATED_H20_NAME = "NVIDIA H20"
-_VALIDATED_SM90_NAMES = frozenset({_VALIDATED_H100_NAME, _VALIDATED_H20_NAME})
+_PROFILED_H100_NAME = "NVIDIA H100 80GB HBM3"
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,7 +143,7 @@ MLA_ATTENTION_REGISTRY: OpRegistry[
 
 @MLA_ATTENTION_REGISTRY.register_atomic(ProviderRole.REPO_NONSTANDARD)
 class MlaTritonProvider(MlaAttentionProvider):
-    """Validated SM90 provider with caller-independent decode workspace."""
+    """Portable SM90 provider with caller-independent decode workspace."""
 
     name = "triton_sm90"
     capabilities = AttentionKernelCapabilities(
@@ -293,19 +291,7 @@ class MlaTritonProvider(MlaAttentionProvider):
         spec: MlaAttentionOpSpec,
         caps: DeviceCaps,
     ) -> SupportResult:
-        common = cls._contract_support(spec, caps)
-        if not common.supported:
-            return common
-        if caps.device_name not in _VALIDATED_SM90_NAMES:
-            return SupportResult.unsupported(
-                "requires validated H100 80GB HBM3 or H20 hardware, got "
-                f"{caps.device_name}"
-            )
-        if caps.device_name == _VALIDATED_H20_NAME and spec.tp_size not in {1, 2}:
-            return SupportResult.unsupported(
-                f"H20 MLA currently requires tensor parallel size 1 or 2, got {spec.tp_size}"
-            )
-        return SupportResult.yes()
+        return cls._contract_support(spec, caps)
 
     def _validate_run_inputs(
         self,
@@ -763,13 +749,9 @@ class MlaTileLangScoreProvider(MlaSglFa3Provider):
         spec: MlaAttentionOpSpec,
         caps: DeviceCaps,
     ) -> SupportResult:
-        base = MlaTritonProvider.supports(spec, caps)
+        base = cls._contract_support(spec, caps)
         if not base.supported:
             return base
-        if caps.device_name != _VALIDATED_H100_NAME:
-            return SupportResult.unsupported(
-                "requires H100-validated TileLang MLA schedules"
-            )
         if not spec.may_require_attention_scores:
             return SupportResult.unsupported(
                 "score-capable Composite is not required by this operation"
@@ -929,7 +911,12 @@ class MlaTileLangScoreProfile:
         spec: MlaAttentionOpSpec,
         caps: DeviceCaps,
     ) -> ProfileMatch:
-        del spec, caps
+        del spec
+        if caps.device_name != _PROFILED_H100_NAME:
+            return ProfileMatch.no(
+                "requires profiled NVIDIA H100 80GB HBM3 hardware, "
+                f"got {caps.device_name}"
+            )
         return ProfileMatch.yes("matched H100 TileLang MLA score profile")
 
     @classmethod

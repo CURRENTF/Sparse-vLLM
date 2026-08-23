@@ -25,11 +25,23 @@ class Gemma4FlashInferPrefill:
     """Shared FlashInfer plans for Gemma 4 text-prefill head shapes."""
 
     def __init__(self) -> None:
-        self._state: _FlashInferState | None = None
+        self._states: dict[tuple[int, int, int, int], _FlashInferState] = {}
+        self._available_states: list[_FlashInferState] = []
 
-    def prepare(self, *, device_index: int | None = None) -> None:
-        if self._state is not None:
+    def prepare(
+        self,
+        *,
+        device_index: int | None = None,
+        max_contracts: int = 2,
+    ) -> None:
+        if self._states or self._available_states:
             return
+        max_contracts = int(max_contracts)
+        if max_contracts <= 0:
+            raise ValueError(
+                "Gemma 4 FlashInfer prefill requires max_contracts > 0, "
+                f"got {max_contracts}."
+            )
         current_device = torch.cuda.current_device()
         if device_index is None:
             device_index = current_device
@@ -38,21 +50,26 @@ class Gemma4FlashInferPrefill:
                 "Gemma 4 FlashInfer prefill must be prepared on the selected "
                 f"CUDA device: selected={device_index} current={current_device}."
             )
-        workspace = torch.empty(
-            128 * 1024 * 1024,
-            dtype=torch.uint8,
-            device=torch.device("cuda", int(device_index)),
-        )
-        self._state = _FlashInferState(
-            wrapper=make_flashinfer_paged_prefill_wrapper(
-                workspace,
-                backend="fa2",
-            ),
-            workspace=workspace,
-        )
+        device = torch.device("cuda", int(device_index))
+        for _ in range(max_contracts):
+            workspace = torch.empty(
+                128 * 1024 * 1024,
+                dtype=torch.uint8,
+                device=device,
+            )
+            self._available_states.append(
+                _FlashInferState(
+                    wrapper=make_flashinfer_paged_prefill_wrapper(
+                        workspace,
+                        backend="fa2",
+                    ),
+                    workspace=workspace,
+                )
+            )
 
     def close(self) -> None:
-        self._state = None
+        self._states.clear()
+        self._available_states.clear()
 
     @staticmethod
     def _page_metadata(view, max_context_len: int):
@@ -96,21 +113,23 @@ class Gemma4FlashInferPrefill:
             int, (q.shape[1], payload.k_cache.shape[1], q.shape[2])
         )
         window_left = -1 if sliding_window is None else int(sliding_window) - 1
-        state = self._state
+        contract = q_heads, kv_heads, head_dim, window_left
+        state = self._states.get(contract)
         if state is None:
-            raise RuntimeError(
-                "Gemma 4 FlashInfer prefill was not prepared before execution."
-            )
+            if not self._available_states:
+                raise RuntimeError(
+                    "Gemma 4 FlashInfer prefill exceeded its prepared attention "
+                    f"contract capacity: contract={contract} "
+                    f"prepared={tuple(self._states)}."
+                )
+            state = self._available_states.pop()
+            self._states[contract] = state
         context = get_context()
         plan_key = (
             context.attention_validation_scope,
             meta.active_slots.data_ptr(),
             meta.req_indices.data_ptr(),
             meta.context_lens.data_ptr(),
-            q_heads,
-            kv_heads,
-            head_dim,
-            window_left,
         )
         if state.plan_key != plan_key:
             indices, kv_indptr, last_page_len = self._page_metadata(

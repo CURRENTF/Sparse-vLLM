@@ -14,7 +14,7 @@ Set `sparse_method` to one of the following method names.
 | `streamingllm` | Physical eviction | StreamingLLM-style fixed sink plus recent-window cache. Tokens outside the retained prefix/tail policy are physically evicted from the active KV cache. | `sink_keep_tokens`, `recent_keep_tokens` |
 | `attention-sink` | Physical eviction | Alias-style attention-sink policy with the same sink-token and recent-window retention model. It is useful for comparing sink-window behavior against other physical eviction methods. | `sink_keep_tokens`, `recent_keep_tokens` |
 | `snapkv` | Physical eviction | SnapKV-style token selection keeps a compact set of important historical tokens after prefill. It reduces cache footprint by physically retaining only selected KV positions. | `decode_keep_tokens`, `sink_keep_tokens`, `recent_keep_tokens`, `sparse_prefill_score_mode` |
-| `h2o` | Physical eviction | H2O maintains an independent cumulative attention-importance vector for every KV layer and physical row. Prefill scores and physically evicts after every chunk. Decode scores every token, while physical selection/compaction/freeing normally occurs in a burst when a row reaches `h2o_decode_budget + h2o_decode_eviction_interval`, returning it to the decode budget. Each eviction retains heavy hitters plus a recent suffix; the final prefill chunk also contracts to the decode budget. Sparse-vLLM v1 shares one selected token set across KV heads within a layer, but never shares scores or selected indices across layers. | `h2o_decode_budget`, `h2o_decode_eviction_interval` (default 128), `h2o_prefill_budget`, `h2o_recent_ratio`, `h2o_prefill_score_window`, `sparse_prefill_score_mode` |
+| `h2o` | Physical eviction | H2O maintains an independent cumulative attention-importance vector for every KV layer and physical row. Prefill scores and physically evicts after every chunk, and the final prefill chunk contracts to the decode budget. Decode scoring and periodic eviction are currently disabled: decode is score-free and its physical row grows with generated tokens. Prefill eviction retains heavy hitters plus a recent suffix. Sparse-vLLM v1 shares one selected token set across KV heads within a layer, but never shares scores or selected indices across layers. | `h2o_decode_budget`, `h2o_prefill_budget`, `h2o_recent_ratio`, `h2o_prefill_score_window`, `sparse_prefill_score_mode` |
 | `pyramidkv` | Physical eviction | PyramidKV-style layer-dependent KV retention. It allocates sparse budgets across layers and physically stores the selected context tokens. | `decode_keep_tokens`, `sink_keep_tokens`, `recent_keep_tokens`, `sparse_prefill_score_mode` |
 | `omnikv` | Logical masking | OmniKV keeps the physical cache available but constructs sparse attention views for selected layers. This is useful when the method should avoid rewriting cache storage while still reducing attention work. | `full_attention_layers`, `decode_keep_tokens`, `sink_keep_tokens`, `recent_keep_tokens` |
 | `quest` | Query-aware page selection | QuEST selects token pages based on the decode query. Prefill stays dense, and sparse selection happens in decode through page/chunk budgets. | `quest_chunk_size`, `quest_skip_layers`, `sink_keep_tokens`, `decode_keep_tokens`, `recent_keep_tokens` |
@@ -23,15 +23,23 @@ Set `sparse_method` to one of the following method names.
 Sparse-vLLM internally stores this as `vllm_sparse_method`, but public commands
 and `LLM(...)` kwargs should use `sparse_method`.
 
+> [!NOTE]
+> Decode scoring and eviction for `snapkv` and `h2o` are future work. In the
+> current runtime, both methods use score-free decode and their physical KV rows
+> grow with generated tokens. This behavior must remain explicit until the
+> score-producing eager/CUDA Graph paths and eviction lifecycle are implemented
+> and validated.
+
 SnapKV, PyramidKV, and H2O default `sparse_prefill_score_mode` to `probability`.
 For H2O this is the canonical path: every KV layer independently sums its
 normalized softmax attention probabilities over the full current query chunk,
-then accumulates that attention mass across chunks and decode steps. Sparse-vLLM
+then accumulates that attention mass across prefill chunks. Decode score
+collection and eviction are intentionally disabled. Sparse-vLLM
 reuses FA3's softmax LSE and performs one additional QK sweep because FlashAttention
 does not materialize its probability matrix. `h2o_prefill_score_window=0` selects
 the full current chunk and is the canonical default. A nonzero window in `[1, 128]`
 or explicit `logits` mode is a non-canonical approximation; neither changes the
-requirement that every H2O KV layer computes and retains its own score.
+requirement that every H2O KV layer computes and retains its own prefill score.
 
 ## Prefill Scheduling Policies
 

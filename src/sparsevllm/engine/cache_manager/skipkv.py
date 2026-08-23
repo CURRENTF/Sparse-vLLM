@@ -363,13 +363,22 @@ class SkipKVCacheManager(RKVCacheManager):
         segment_penalty = redundant_future.max(dim=2).values
         return torch.repeat_interleave(segment_penalty, segment_size, dim=1)[:, :token_count]
 
-    def free_part_slots(self, layer_idx: int, seq: Sequence, keep_indices: torch.Tensor):
+    def free_part_slots(
+        self,
+        layer_idx: int,
+        seq: Sequence,
+        keep_indices: torch.Tensor,
+        *,
+        keep_indices_sorted: bool = False,
+    ):
         self.kv_layer_index(layer_idx)
         row_idx = self.seq_id_to_row[layer_idx].get(seq.seq_id)
         old_gen_indices = None
         if row_idx is not None:
             old_gen_indices = self._skipkv_row_gen_indices[layer_idx].get(int(row_idx), [])
-        keep_sorted = torch.sort(keep_indices.to(device=self.device, dtype=torch.long)).values
+        keep_sorted = keep_indices.to(device=self.device, dtype=torch.long)
+        if not keep_indices_sorted:
+            keep_sorted = torch.sort(keep_sorted).values
         keep_cpu = keep_sorted.detach().to(device="cpu").tolist()
         super().free_part_slots(
             layer_idx,
@@ -391,12 +400,19 @@ class SkipKVCacheManager(RKVCacheManager):
         layer_idx: int,
         seqs: list[Sequence],
         keep_indices: torch.Tensor,
+        *,
+        keep_indices_sorted: bool = False,
     ):
         self.kv_layer_index(layer_idx)
         if not seqs:
             return
         if len(seqs) == 1:
-            self.free_part_slots(layer_idx, seqs[0], keep_indices[0])
+            self.free_part_slots(
+                layer_idx,
+                seqs[0],
+                keep_indices[0],
+                keep_indices_sorted=keep_indices_sorted,
+            )
             return
 
         row_indices = []
@@ -409,7 +425,9 @@ class SkipKVCacheManager(RKVCacheManager):
             else:
                 old_gen_indices.append(self._skipkv_row_gen_indices[layer_idx].get(int(row_idx), []))
 
-        keep_sorted = torch.sort(keep_indices.to(device=self.device, dtype=torch.long), dim=1).values
+        keep_sorted = keep_indices.to(device=self.device, dtype=torch.long)
+        if not keep_indices_sorted:
+            keep_sorted = torch.sort(keep_sorted, dim=1).values
         keep_cpu = keep_sorted.detach().to(device="cpu").tolist()
         result = super().free_part_slots_batch(
             layer_idx,
@@ -438,13 +456,20 @@ class SkipKVCacheManager(RKVCacheManager):
         layer_indices: list[int],
         seqs: list[Sequence],
         keep_indices: torch.Tensor,
+        *,
+        keep_indices_sorted: bool = False,
     ):
         if not layer_indices or not seqs:
             return
         for layer_idx in layer_indices:
             self.kv_layer_index(int(layer_idx))
         if len(layer_indices) == 1:
-            self.free_part_slots_batch(int(layer_indices[0]), seqs, keep_indices[0])
+            self.free_part_slots_batch(
+                int(layer_indices[0]),
+                seqs,
+                keep_indices[0],
+                keep_indices_sorted=keep_indices_sorted,
+            )
             return
 
         row_indices_by_layer = []
@@ -464,7 +489,9 @@ class SkipKVCacheManager(RKVCacheManager):
             row_indices_by_layer.append(row_indices)
             old_gen_indices_by_layer.append(old_gen_indices)
 
-        keep_sorted = torch.sort(keep_indices.to(device=self.device, dtype=torch.long), dim=2).values
+        keep_sorted = keep_indices.to(device=self.device, dtype=torch.long)
+        if not keep_indices_sorted:
+            keep_sorted = torch.sort(keep_sorted, dim=2).values
         keep_cpu = keep_sorted.detach().to(device="cpu").tolist()
         result = super().free_part_slots_batch_layers(
             layer_indices,

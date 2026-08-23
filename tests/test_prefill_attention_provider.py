@@ -58,6 +58,16 @@ def _spec(**overrides) -> PrefillAttentionOpSpec:
     return PrefillAttentionOpSpec(**values)
 
 
+def test_prefill_softmax_lse_requirement_is_part_of_kernel_contract():
+    spec = _spec(return_softmax_lse=True)
+
+    assert spec.kernel_request.requires_softmax_lse
+    assert not TritonPagedPrefillAttentionProvider.supports(
+        spec,
+        _h100_caps(),
+    ).supported
+
+
 def _h100_caps(**overrides) -> DeviceCaps:
     values = {
         "platform": PlatformEnum.CUDA,
@@ -319,6 +329,23 @@ def test_tilelang_provider_rejects_per_head_score_contract():
 
     assert not result.supported
     assert "RAW_QK_PER_HEAD" in result.reason
+
+
+@patch(
+    "sparsevllm.kernels.tilelang.gqa.runtime.tilelang_gqa_device_support",
+    return_value=(True, "dependencies available"),
+)
+def test_tilelang_atomic_support_is_not_narrowed_to_the_profiled_h100(_support):
+    result = TilelangGqaPagedPrefillAttentionProvider.supports(
+        _spec(
+            num_query_heads=16,
+            num_kv_heads=2,
+            score_output=AttentionScoreKind.RAW_QK_REDUCED,
+        ),
+        _sm120_caps(),
+    )
+
+    assert result.supported
 
 
 def test_tilelang_support_probe_does_not_import_compiler(monkeypatch):

@@ -1984,14 +1984,14 @@ def test_h2o_free_seq_cleans_score_vectors():
     parent_free.assert_called_once_with(manager, 0)
 
 
-def test_h2o_chain_turn_retains_score_until_reclaimed():
+def test_h2o_chain_turn_aligns_score_free_decode_growth_until_reclaimed():
     manager = _manager_with_rows([4])
-    manager._h2o_scores[(0, 0)] = torch.arange(4, dtype=torch.float32)
+    manager._h2o_scores[(0, 0)] = torch.arange(2, dtype=torch.float32)
     manager._h2o_active_decode_seq_ids.add(0)
 
     manager.on_chain_turn_finished(0, processed_token_count=100)
 
-    assert manager._h2o_scores[(0, 0)].tolist() == [0.0, 1.0, 2.0, 3.0]
+    assert manager._h2o_scores[(0, 0)].tolist() == [0.0, 1.0, 0.0, 0.0]
     assert manager._h2o_active_decode_seq_ids == set()
     assert manager.chain_physical_residency(0) == (4,)
 

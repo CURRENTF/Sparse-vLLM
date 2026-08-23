@@ -46,6 +46,7 @@ from sparsevllm.models.qwen3_5 import (
     _get_rotary_dim,
 )
 from sparsevllm.models.qwen3_5_moe import (
+    Qwen35MoePackedExperts,
     Qwen35MoeRouter,
     Qwen35MoeSparseMoeBlock,
 )
@@ -58,6 +59,68 @@ from sparsevllm.utils.loader import _target_weight_name_for_model, _validate_all
 def _single_process_parallel_context() -> ParallelContext:
     group = ParallelGroup(process_group=None, ranks=(0,), rank=0, size=1)
     return ParallelContext(world=group, tensor=group, expert=group, data=group)
+
+
+def test_qwen35_runtime_passes_h2o_score_contract_to_full_attention_builder():
+    config = object()
+    engine_config = SimpleNamespace(
+        vllm_sparse_method="h2o",
+        sparse_prefill_score_mode="logits",
+        h2o_prefill_score_window=0,
+        max_decoding_seqs=8,
+        decode_cuda_graph=False,
+    )
+    context = SimpleNamespace(attention_tp_size=1)
+    full_attention = object()
+    gated_delta_rule = object()
+    with (
+        patch(
+            "sparsevllm.models.qwen3_5.build_mha_full_attention_provider",
+            return_value=full_attention,
+        ) as build_attention,
+        patch(
+            "sparsevllm.models.qwen3_5.build_gated_delta_rule_op",
+            return_value=gated_delta_rule,
+        ),
+    ):
+        kwargs = Qwen35ForCausalLM.build_runtime_kwargs(
+            config,
+            engine_config=engine_config,
+            parallel_context=context,
+            device=torch.device("cpu"),
+        )
+
+    assert kwargs["full_attention_provider"] is full_attention
+    build_attention.assert_called_once_with(
+        config,
+        sparse_method="h2o",
+        attention_tp_size=1,
+        device=torch.device("cpu"),
+        max_batch_size=8,
+        cuda_graph=False,
+        runtime_config=engine_config,
+    )
+
+
+def test_qwen35_fp8_expert_validation_uses_per_projection_weights():
+    loaded_shards = {
+        (expert_id, projection)
+        for expert_id in range(2)
+        for projection in ("gate_proj", "up_proj", "down_proj")
+    }
+    experts = SimpleNamespace(
+        fp8_enabled=True,
+        local_expert_start=0,
+        local_expert_end=2,
+        _loaded_packed_projections=set(),
+        _loaded_expert_shards=loaded_shards,
+    )
+
+    Qwen35MoePackedExperts.validate_loaded_weights(experts)
+
+    experts._loaded_expert_shards.remove((1, "down_proj"))
+    with pytest.raises(ValueError, match="Missing local Qwen3.6 expert weights"):
+        Qwen35MoePackedExperts.validate_loaded_weights(experts)
 
 
 def _qwen35_outer_config(*, num_layers: int = 64, full_layers: tuple[int, ...] | None = None):

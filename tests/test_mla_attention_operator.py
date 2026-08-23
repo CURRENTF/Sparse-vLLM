@@ -94,6 +94,15 @@ def test_mla_attention_scale_uses_qk_head_dimension() -> None:
     assert spec.softmax_scale != pytest.approx((512 + 64) ** -0.5)
 
 
+def test_mla_triton_atomic_support_is_not_narrowed_by_device_name() -> None:
+    result = MlaTritonProvider.supports(
+        _spec(tp_size=4),
+        _h100_caps(device_name="unprofiled SM90 GPU"),
+    )
+
+    assert result.supported
+
+
 @pytest.mark.parametrize(
     ("spec_overrides", "caps_overrides", "reason"),
     [

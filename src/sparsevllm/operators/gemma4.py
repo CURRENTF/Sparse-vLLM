@@ -228,19 +228,29 @@ class H20Gemma4OperatorProvider(TritonGemma4OperatorProvider):
         caps: DeviceCaps,
         **kwargs,
     ) -> H20Gemma4OperatorProvider:
-        del spec
         if kwargs:
             raise TypeError(
                 f"{cls.name} does not accept provider arguments: {sorted(kwargs)}"
             )
-        return cls(device_index=caps.device_index)
+        return cls(
+            device_index=caps.device_index,
+            max_prefill_contracts=len(spec.head_dims),
+        )
 
-    def __init__(self, *, device_index: int | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        device_index: int | None = None,
+        max_prefill_contracts: int = 2,
+    ) -> None:
         super().__init__()
         from sparsevllm.operators.gemma4_attention import Gemma4FlashInferPrefill
 
         self._prefill = Gemma4FlashInferPrefill()
-        self._prefill.prepare(device_index=device_index)
+        self._prefill.prepare(
+            device_index=device_index,
+            max_contracts=max_prefill_contracts,
+        )
 
     def binding_metadata(self) -> dict[str, object]:
         return {

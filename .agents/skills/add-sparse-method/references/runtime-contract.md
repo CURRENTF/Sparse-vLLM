@@ -65,4 +65,3 @@ Any untyped tuple, global side channel, or direct config inspection in attention
 List unsupported combinations explicitly, such as MLA latent storage, heterogeneous layers, radix prefix cache, decode graphs, TP greater than one, or a missing provider. Reject them during config/runtime validation with a precise reason.
 
 Do not silently disable the sparse method, switch schedules, change providers, or fall back to dense attention.
-

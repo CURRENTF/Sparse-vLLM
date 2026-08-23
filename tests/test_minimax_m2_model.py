@@ -263,6 +263,7 @@ def test_minimax_runtime_kwargs_bind_model_owned_operators():
         max_decode_tokens=8,
         cuda_graph=True,
         device=torch.device("cuda", 1),
+        engine_config=runtime,
     )
 
 

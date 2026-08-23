@@ -852,8 +852,8 @@ class SparseController:
         # eagerly and replaying score-free decode steps with CUDA Graphs.
         if not is_prefill and self.sparse_method == 'pyramidkv':
             self._snapkv_decode_eviction(seqs)
-        # TODO: Restore H2O decode eviction by running score-producing steps
-        # eagerly and replaying score-free decode steps with CUDA Graphs.
+        # H2O decode scoring and eviction are intentionally disabled; decode
+        # remains score-free and the physical row grows with generated tokens.
         if not is_prefill and self.sparse_method == "rkv":
             self._rkv_decode_eviction(seqs)
         if not is_prefill and self.sparse_method == "skipkv":
@@ -1066,15 +1066,35 @@ class SparseController:
 
     @torch.no_grad()
     def _snapkv_prefill_eviction(self, seqs: list[Sequence]):
+        final_seqs = [seq for seq in seqs if bool(seq.is_last_chunk_prefill)]
+        if not final_seqs:
+            return
+
+        free_batch = getattr(self.cache_manager, "free_part_slots_batch", None)
+        free_layers = getattr(
+            self.cache_manager,
+            "free_part_slots_batch_layers",
+            None,
+        )
+        pool_kernel_size = int(
+            getattr(self.config, "pool_kernel_size", 1) or 1
+        )
+        pending_layer_compactions: dict[
+            tuple[tuple[int, ...], int, int, int, int],
+            list[tuple[int, list[Sequence], torch.Tensor]],
+        ] = {}
+
         for layer_idx in range(self.num_layers):
             if not self._is_kv_layer(layer_idx):
                 continue
             budget = self._get_layer_budget(layer_idx, is_prefill=True)
             if budget is None:
                 continue
-            for seq in seqs:
-                if not seq.is_last_chunk_prefill:
-                    continue
+            compatible_rows: dict[
+                tuple[int, int, int],
+                list[tuple[Sequence, torch.Tensor]],
+            ] = {}
+            for seq in final_seqs:
                 physical_len = getattr(
                     self.cache_manager, "chain_physical_kv_len", None
                 )
@@ -1101,13 +1121,87 @@ class SparseController:
                         "[SnapKV] prefill eviction: "
                         f"layer={layer_idx} seq_id={seq.seq_id} kv_len={kv_len} budget={budget}"
                     )
-                keep_indices = self._snapkv_select_indices(
-                    seq_scores[:kv_len],
-                    kv_len,
-                    budget,
-                    pool_kernel_size=int(getattr(self.config, "pool_kernel_size", 1) or 1),
+                compatibility_key = (
+                    int(kv_len),
+                    int(budget),
+                    int(pool_kernel_size),
                 )
-                self.cache_manager.free_part_slots(layer_idx, seq, keep_indices)
+                compatible_rows.setdefault(compatibility_key, []).append(
+                    (seq, seq_scores[:kv_len])
+                )
+
+            for (kv_len, group_budget, group_pool_kernel_size), rows in (
+                compatible_rows.items()
+            ):
+                group_seqs = [seq for seq, _scores in rows]
+                if len(rows) == 1:
+                    seq, seq_scores = rows[0]
+                    with profiler.record("snapkv_prefill_select"):
+                        keep_indices = self._snapkv_select_indices(
+                            seq_scores,
+                            kv_len,
+                            group_budget,
+                            pool_kernel_size=group_pool_kernel_size,
+                        )
+                    keep_indices = keep_indices.unsqueeze(0)
+                else:
+                    with profiler.record("snapkv_prefill_select_batch"):
+                        scores = torch.stack(
+                            [seq_scores for _seq, seq_scores in rows],
+                            dim=0,
+                        )
+                        keep_indices = self._snapkv_select_indices_batch(
+                            scores,
+                            kv_len,
+                            group_budget,
+                            pool_kernel_size=group_pool_kernel_size,
+                        )
+
+                if free_layers is None:
+                    if len(group_seqs) > 1 and free_batch is not None:
+                        with profiler.record("snapkv_prefill_compact_batch"):
+                            free_batch(layer_idx, group_seqs, keep_indices)
+                    else:
+                        with profiler.record("snapkv_prefill_compact"):
+                            for seq_idx, seq in enumerate(group_seqs):
+                                self.cache_manager.free_part_slots(
+                                    layer_idx,
+                                    seq,
+                                    keep_indices[seq_idx],
+                                )
+                    continue
+
+                key = (
+                    tuple(int(seq.seq_id) for seq in group_seqs),
+                    int(kv_len),
+                    int(group_budget),
+                    int(group_pool_kernel_size),
+                    int(keep_indices.shape[1]),
+                )
+                pending_layer_compactions.setdefault(key, []).append(
+                    (int(layer_idx), group_seqs, keep_indices)
+                )
+
+        for entries in pending_layer_compactions.values():
+            if len(entries) == 1:
+                layer_idx, group_seqs, keep_indices = entries[0]
+                if len(group_seqs) > 1 and free_batch is not None:
+                    with profiler.record("snapkv_prefill_compact_batch"):
+                        free_batch(layer_idx, group_seqs, keep_indices)
+                else:
+                    with profiler.record("snapkv_prefill_compact"):
+                        for seq_idx, seq in enumerate(group_seqs):
+                            self.cache_manager.free_part_slots(
+                                layer_idx,
+                                seq,
+                                keep_indices[seq_idx],
+                            )
+                continue
+            layer_indices = [entry[0] for entry in entries]
+            group_seqs = entries[0][1]
+            keep_indices = torch.stack([entry[2] for entry in entries], dim=0)
+            with profiler.record("snapkv_prefill_compact_layers"):
+                free_layers(layer_indices, group_seqs, keep_indices)
 
     @torch.no_grad()
     def _snapkv_decode_eviction(self, seqs: list[Sequence]):

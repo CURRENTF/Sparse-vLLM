@@ -3,7 +3,7 @@ from __future__ import annotations
 import inspect
 from contextlib import ExitStack
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -24,6 +24,7 @@ from transformers.models.gemma4.modeling_gemma4 import (
 
 from sparsevllm.configs.sparse import normalize_sparse_methods
 from sparsevllm.distributed import ParallelContext, ParallelGroup
+from sparsevllm.engine.cache_manager.base import ExplicitKVPayload
 from sparsevllm.models.gemma4 import (
     Gemma4Attention,
     Gemma4ForCausalLM,
@@ -37,6 +38,10 @@ from sparsevllm.operators.gemma4 import (
     TorchGemma4OperatorProvider,
     TritonGemma4OperatorProvider,
 )
+from sparsevllm.operators.gemma4_attention import (
+    Gemma4FlashInferPrefill,
+    _FlashInferState,
+)
 from sparsevllm.operators.gemma4_moe import (
     GEMMA4_MOE_REGISTRY,
     TorchGemma4MoeProvider,
@@ -47,6 +52,65 @@ from sparsevllm.operators.gemma4_router import (
     TritonGemma4RouterProvider,
 )
 from sparsevllm.utils.config import config_layer_get
+from sparsevllm.utils.context import reset_context, set_context
+
+
+def test_gemma4_flashinfer_prefill_caches_alternating_attention_contracts():
+    prefill = Gemma4FlashInferPrefill()
+    wrappers = [Mock(), Mock()]
+    prefill._available_states = [
+        _FlashInferState(wrapper=wrapper, workspace=torch.empty(0))
+        for wrapper in wrappers
+    ]
+    meta = SimpleNamespace(
+        active_slots=torch.arange(4, dtype=torch.int32).view(1, -1),
+        req_indices=torch.zeros(1, dtype=torch.int32),
+        context_lens=torch.tensor([4], dtype=torch.int32),
+        attn_score=None,
+    )
+    cases = (
+        (
+            torch.empty(2, 4, 256),
+            SimpleNamespace(
+                payload=ExplicitKVPayload(
+                    torch.empty(4, 2, 256),
+                    torch.empty(4, 2, 256),
+                ),
+                meta=meta,
+            ),
+            4,
+        ),
+        (
+            torch.empty(2, 4, 512),
+            SimpleNamespace(
+                payload=ExplicitKVPayload(
+                    torch.empty(4, 1, 512),
+                    torch.empty(4, 1, 512),
+                ),
+                meta=meta,
+            ),
+            None,
+        ),
+    )
+    reset_context()
+    set_context(True, cu_seqlens_q=torch.tensor([0, 2], dtype=torch.int32))
+    try:
+        for index in range(4):
+            query, view, window = cases[index % 2]
+            prefill.run(
+                query,
+                view,
+                q_start=torch.zeros(1, dtype=torch.int32),
+                chunk_lens=torch.tensor([2], dtype=torch.int32),
+                max_context_len=4,
+                sliding_window=window,
+            )
+    finally:
+        prefill.close()
+        reset_context()
+
+    assert sum(wrapper.plan.call_count for wrapper in wrappers) == 2
+    assert all(wrapper.plan.call_count == 1 for wrapper in wrappers)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""TileLang GQA Prefill & Attention Score Extraction Kernels for SM90."""
+"""Portable TileLang GQA prefill and attention-score extraction kernels."""
 
 from typing import Any
 

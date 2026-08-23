@@ -9,12 +9,12 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from importlib import metadata
 
 import torch
 
-_VALIDATED_TILELANG_VERSION = "0.1.9"
-_VALIDATED_TVM_FFI_VERSION = "0.1.10"
+from sparsevllm.kernels.tilelang.support import tilelang_dependency_support
+
+
 _VALID_SPLITS = (1, 2, 4, 8, 16, 32)
 _SUPPORTED_VALID_HEADS = (5, 10, 20)
 _SCORE_MODES = ("direct", "atomic", "partial")
@@ -72,25 +72,7 @@ def _padded_head_count(valid_heads: int) -> int:
 def tilelang_mla_support() -> tuple[bool, str]:
     """Check the optional package without importing or initializing TileLang."""
 
-    try:
-        version = metadata.version("tilelang")
-    except metadata.PackageNotFoundError:
-        return False, "tilelang is not installed"
-    if version != _VALIDATED_TILELANG_VERSION:
-        return False, (
-            f"requires validated tilelang=={_VALIDATED_TILELANG_VERSION}, got "
-            f"{version!r}"
-        )
-    try:
-        tvm_ffi_version = metadata.version("apache-tvm-ffi")
-    except metadata.PackageNotFoundError:
-        return False, "apache-tvm-ffi is not installed"
-    if tvm_ffi_version != _VALIDATED_TVM_FFI_VERSION:
-        return False, (
-            "requires validated apache-tvm-ffi=="
-            f"{_VALIDATED_TVM_FFI_VERSION}, got {tvm_ffi_version!r}"
-        )
-    return True, f"tilelang {version}, apache-tvm-ffi {tvm_ffi_version}"
+    return tilelang_dependency_support()
 
 
 @dataclass(frozen=True, slots=True)

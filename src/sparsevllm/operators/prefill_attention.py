@@ -65,6 +65,7 @@ class PrefillAttentionOpSpec:
             head_dim=self.head_dim,
             page_size=self.page_size,
             score_output=self.score_output,
+            requires_softmax_lse=self.return_softmax_lse,
             layer_varying_page_table=self.layer_varying_page_table,
             varlen=self.varlen,
             cuda_graph=self.cuda_graph,
@@ -397,6 +398,7 @@ class SglFa3PagedPrefillAttentionProvider(PrefillAttentionProvider):
         head_dims=frozenset({128, 256}),
         page_sizes=frozenset({1}),
         score_outputs=frozenset({AttentionScoreKind.NONE}),
+        returns_softmax_lse=True,
         layer_varying_page_table=True,
         varlen=True,
         minimum_runtime_version=(12, 3),
@@ -513,12 +515,11 @@ class SglFa3PagedPrefillAttentionProvider(PrefillAttentionProvider):
     profile_only=True,
 )
 class TilelangGqaPagedPrefillAttentionProvider(PrefillAttentionProvider):
-    """TileLang GQA paged prefill with optional fused score extraction on SM90."""
+    """Portable TileLang GQA paged prefill with fused score extraction."""
 
-    name = "tilelang_gqa_paged_prefill_sm90"
+    name = "tilelang_gqa_paged_prefill"
     capabilities = AttentionKernelCapabilities(
         platforms=frozenset({PlatformEnum.CUDA}),
-        compute_capabilities=frozenset({(9, 0)}),
         activation_dtypes=frozenset({torch.bfloat16}),
         head_dims=frozenset({128}),
         page_sizes=frozenset({1}),
@@ -629,7 +630,7 @@ class H100TilelangScoredPrefillProfile:
         spec: PrefillAttentionOpSpec,
     ) -> tuple[str, ...]:
         del spec
-        return ("tilelang_gqa_paged_prefill_sm90",)
+        return ("tilelang_gqa_paged_prefill",)
 
     @classmethod
     def matches(

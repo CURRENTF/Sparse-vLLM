@@ -90,6 +90,7 @@ def build_minimax_m2_runtime_config(
     max_decode_tokens: int,
     cuda_graph: bool,
     device: torch.device,
+    engine_config=None,
 ) -> MiniMaxM2RuntimeConfig:
     tp_size = int(parallel_context.attention_tp_size)
     if (
@@ -110,6 +111,7 @@ def build_minimax_m2_runtime_config(
         device=device,
         max_batch_size=max_decode_tokens,
         cuda_graph=cuda_graph,
+        runtime_config=engine_config,
     )
     decode_launch_op = prepare_decode_attention_launch_op(
         DecodeAttentionLaunchSpec(
@@ -445,6 +447,7 @@ class MiniMaxM2ForCausalLM(nn.Module):
                 max_decode_tokens=max_decode_tokens,
                 cuda_graph=engine_config.decode_cuda_graph,
                 device=device,
+                engine_config=engine_config,
             )
         }
 
