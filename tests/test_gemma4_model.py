@@ -160,6 +160,30 @@ def test_gemma4_close_runtime_operators_releases_provider():
     router_provider.close.assert_called_once_with()
 
 
+def test_gemma4_runtime_closes_operator_if_router_prepare_fails():
+    config = _config(enable_moe_block=True, num_experts=4, top_k_experts=2)
+    operator_provider = Mock(name="operator_provider")
+    with (
+        patch(
+            "sparsevllm.models.gemma4.resolve_gemma4_provider",
+            return_value=operator_provider,
+        ),
+        patch(
+            "sparsevllm.models.gemma4.resolve_gemma4_router_provider",
+            side_effect=RuntimeError("router prepare failed"),
+        ),
+        pytest.raises(RuntimeError, match="router prepare failed"),
+    ):
+        Gemma4ForCausalLM.build_runtime_kwargs(
+            config,
+            engine_config=SimpleNamespace(decode_cuda_graph=False),
+            parallel_context=_parallel_context(),
+            device=torch.device("cuda", 0),
+        )
+
+    operator_provider.close.assert_called_once_with()
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_gemma4_router_kernels_match_torch():
     from sparsevllm.kernels.triton.gemma4_fused_router import (

@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 from uuid import uuid4
 
+import pytest
 import torch
 import torch.distributed as dist
 
@@ -44,6 +45,29 @@ def test_create_model_delegates_optional_runtime_binding():
         )
 
     assert model.args == (config, "bound")
+
+
+def test_create_model_closes_runtime_bindings_when_construction_fails():
+    binding = SimpleNamespace(close=lambda: calls.append("close"))
+    calls = []
+
+    class Model:
+        @classmethod
+        def build_runtime_kwargs(cls, hf_config, **runtime_kwargs):
+            del cls, hf_config, runtime_kwargs
+            return {"runtime": binding, "shared_runtime": binding}
+
+        def __init__(self, hf_config, *, runtime, shared_runtime):
+            del self, hf_config, runtime, shared_runtime
+            raise RuntimeError("model construction failed")
+
+    with (
+        patch.dict(_create_model.__globals__, {"Model": Model}),
+        pytest.raises(RuntimeError, match="model construction failed"),
+    ):
+        _create_model(object(), ModelSpec("test", runtime_class_name="Model"))
+
+    assert calls == ["close"]
 
 
 def test_write_shm_waits_until_worker_reads_command():

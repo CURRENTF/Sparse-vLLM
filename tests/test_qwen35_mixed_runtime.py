@@ -102,6 +102,36 @@ def test_qwen35_runtime_passes_h2o_score_contract_to_full_attention_builder():
     )
 
 
+def test_qwen35_runtime_closes_attention_if_gdn_prepare_fails():
+    config = object()
+    engine_config = SimpleNamespace(
+        vllm_sparse_method="vanilla",
+        max_decoding_seqs=8,
+        decode_cuda_graph=False,
+    )
+    context = SimpleNamespace(attention_tp_size=1)
+    full_attention = Mock(name="full_attention")
+    with (
+        patch(
+            "sparsevllm.models.qwen3_5.build_mha_full_attention_provider",
+            return_value=full_attention,
+        ),
+        patch(
+            "sparsevllm.models.qwen3_5.build_gated_delta_rule_op",
+            side_effect=RuntimeError("GDN prepare failed"),
+        ),
+        pytest.raises(RuntimeError, match="GDN prepare failed"),
+    ):
+        Qwen35ForCausalLM.build_runtime_kwargs(
+            config,
+            engine_config=engine_config,
+            parallel_context=context,
+            device=torch.device("cpu"),
+        )
+
+    full_attention.close.assert_called_once_with()
+
+
 def test_qwen35_fp8_expert_validation_uses_per_projection_weights():
     loaded_shards = {
         (expert_id, projection)

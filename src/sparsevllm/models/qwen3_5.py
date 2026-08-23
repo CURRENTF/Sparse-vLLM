@@ -1028,22 +1028,28 @@ class Qwen35ForCausalLM(nn.Module):
         device: torch.device,
         **_,
     ) -> dict:
+        full_attention_provider = build_mha_full_attention_provider(
+            config,
+            sparse_method=engine_config.vllm_sparse_method,
+            attention_tp_size=parallel_context.attention_tp_size,
+            device=device,
+            max_batch_size=engine_config.max_decoding_seqs,
+            cuda_graph=engine_config.decode_cuda_graph,
+            runtime_config=engine_config,
+        )
+        try:
+            gated_delta_rule_op = build_gated_delta_rule_op(
+                config,
+                attention_tp_size=parallel_context.attention_tp_size,
+                device=device,
+                cuda_graph=engine_config.decode_cuda_graph,
+            )
+        except BaseException:
+            full_attention_provider.close()
+            raise
         return {
-            "full_attention_provider": build_mha_full_attention_provider(
-                config,
-                sparse_method=engine_config.vllm_sparse_method,
-                attention_tp_size=parallel_context.attention_tp_size,
-                device=device,
-                max_batch_size=engine_config.max_decoding_seqs,
-                cuda_graph=engine_config.decode_cuda_graph,
-                runtime_config=engine_config,
-            ),
-            "gated_delta_rule_op": build_gated_delta_rule_op(
-                config,
-                attention_tp_size=parallel_context.attention_tp_size,
-                device=device,
-                cuda_graph=engine_config.decode_cuda_graph,
-            ),
+            "full_attention_provider": full_attention_provider,
+            "gated_delta_rule_op": gated_delta_rule_op,
         }
 
     def __init__(

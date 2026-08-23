@@ -690,27 +690,30 @@ class Gemma4ForCausalLM(nn.Module):
             )
         attention_contracts = tuple(sorted(contracts))
         head_dims = tuple(sorted({contract[2] for contract in attention_contracts}))
-        runtime_kwargs = {
-            "operator_provider": resolve_gemma4_provider(
-                Gemma4OpSpec(
-                    activation_dtype=model_activation_dtype(config),
-                    head_dims=head_dims,
-                    cuda_graph=bool(engine_config.decode_cuda_graph),
-                    attention_contracts=attention_contracts,
-                ),
-                device_index=device.index,
-            )
-        }
+        operator_provider = resolve_gemma4_provider(
+            Gemma4OpSpec(
+                activation_dtype=model_activation_dtype(config),
+                head_dims=head_dims,
+                cuda_graph=bool(engine_config.decode_cuda_graph),
+                attention_contracts=attention_contracts,
+            ),
+            device_index=device.index,
+        )
+        runtime_kwargs = {"operator_provider": operator_provider}
         if bool(config.enable_moe_block):
-            runtime_kwargs["router_provider"] = resolve_gemma4_router_provider(
-                Gemma4RouterOpSpec(
-                    activation_dtype=model_activation_dtype(config),
-                    num_experts=int(config.num_experts),
-                    top_k=int(config.top_k_experts),
-                    cuda_graph=bool(engine_config.decode_cuda_graph),
-                ),
-                device_index=device.index,
-            )
+            try:
+                runtime_kwargs["router_provider"] = resolve_gemma4_router_provider(
+                    Gemma4RouterOpSpec(
+                        activation_dtype=model_activation_dtype(config),
+                        num_experts=int(config.num_experts),
+                        top_k=int(config.top_k_experts),
+                        cuda_graph=bool(engine_config.decode_cuda_graph),
+                    ),
+                    device_index=device.index,
+                )
+            except BaseException:
+                operator_provider.close()
+                raise
         return runtime_kwargs
 
     def close_runtime_operators(self) -> None:

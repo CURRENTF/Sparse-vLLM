@@ -73,25 +73,49 @@ except ImportError:
     Gemma4ForCausalLM = None
 
 
+def _close_runtime_bindings(runtime_bindings: dict) -> None:
+    closed_ids: set[int] = set()
+    for binding in runtime_bindings.values():
+        if id(binding) in closed_ids:
+            continue
+        close = getattr(binding, "close", None)
+        if callable(close):
+            close()
+            closed_ids.add(id(binding))
+
+
 def _create_model(hf_config, model_spec: ModelSpec, **runtime_kwargs):
     class_name = model_spec.runtime_class_name
     model_class = globals().get(class_name)
     if model_class is None:
         raise ImportError(f"{class_name} is unavailable for {model_spec.name}.")
     builder = getattr(model_class, "build_runtime_kwargs", None)
-    model = model_class(
-        hf_config,
-        **(builder(hf_config, **runtime_kwargs) if callable(builder) else {}),
+    model_runtime_kwargs = (
+        builder(hf_config, **runtime_kwargs) if callable(builder) else {}
     )
-    engine_config = runtime_kwargs.get("engine_config")
-    configure_multimodal = getattr(model, "configure_multimodal", None)
-    if (
-        callable(configure_multimodal)
-        and bool(getattr(engine_config, "enable_multimodal", True))
-        and getattr(engine_config, "outer_hf_config", hf_config) is not hf_config
-    ):
-        configure_multimodal(engine_config.outer_hf_config)
-    return model
+    model = None
+    try:
+        model = model_class(hf_config, **model_runtime_kwargs)
+        engine_config = runtime_kwargs.get("engine_config")
+        configure_multimodal = getattr(model, "configure_multimodal", None)
+        if (
+            callable(configure_multimodal)
+            and bool(getattr(engine_config, "enable_multimodal", True))
+            and getattr(engine_config, "outer_hf_config", hf_config) is not hf_config
+        ):
+            configure_multimodal(engine_config.outer_hf_config)
+        return model
+    except BaseException:
+        close_runtime_operators = (
+            None
+            if model is None
+            else getattr(model, "close_runtime_operators", None)
+        )
+        if callable(close_runtime_operators):
+            close_runtime_operators()
+        else:
+            _close_runtime_bindings(model_runtime_kwargs)
+        raise
 
 
 TP_SHM_NAME_PREFIX = "sparsevllm_"

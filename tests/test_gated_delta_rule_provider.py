@@ -5,6 +5,9 @@ import pytest
 import torch
 from torch import nn
 
+from sparsevllm.kernels.external.flashinfer.gdn import (
+    flashinfer_sm90_gdn_prefill_support,
+)
 from sparsevllm.models.gdn_runtime import (
     bind_gated_delta_rule_op,
     build_gated_delta_rule_op,
@@ -80,6 +83,95 @@ def test_flashinfer_prefill_adapter_converts_log_gate_and_state_contract():
     )
     assert call.args[5].is_contiguous()
     assert call.args[6] is cu_seqlens
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0),
+    reason="requires CUDA SM90",
+)
+def test_flashinfer_prefill_matches_independent_triton_provider():
+    supported, reason = flashinfer_sm90_gdn_prefill_support()
+    if not supported:
+        pytest.skip(reason)
+
+    torch.manual_seed(20260824)
+    token_count, num_key_heads, num_value_heads, head_dim = 48, 2, 4, 128
+    q = torch.randn(
+        1,
+        token_count,
+        num_key_heads,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    ) * 0.2
+    k = torch.randn_like(q) * 0.2
+    v = torch.randn(
+        1,
+        token_count,
+        num_value_heads,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    ) * 0.2
+    g = -(
+        torch.rand(
+            1,
+            token_count,
+            num_value_heads,
+            device="cuda",
+            dtype=torch.float32,
+        )
+        * 0.2
+        + 0.01
+    )
+    beta = torch.sigmoid(torch.randn_like(g))
+    initial_state = torch.randn(
+        2,
+        num_value_heads,
+        head_dim,
+        head_dim,
+        device="cuda",
+        dtype=torch.float32,
+    ) * 0.01
+    cu_seqlens = torch.tensor(
+        [0, 17, token_count], device="cuda", dtype=torch.int32
+    )
+    spec = _spec(
+        num_key_heads=num_key_heads,
+        num_value_heads=num_value_heads,
+        key_head_dim=head_dim,
+        value_head_dim=head_dim,
+    )
+
+    actual_output, actual_state = (
+        FlashInferSm90GatedDeltaRuleProvider().run_prefill(
+            spec,
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            initial_state=initial_state.clone(),
+            cu_seqlens=cu_seqlens,
+        )
+    )
+    expected_output, expected_state = TritonGatedDeltaRuleProvider().run_prefill(
+        spec,
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        initial_state=initial_state.clone(),
+        cu_seqlens=cu_seqlens,
+    )
+
+    torch.testing.assert_close(
+        actual_output.float(), expected_output.float(), rtol=0.05, atol=2e-4
+    )
+    torch.testing.assert_close(
+        actual_state.float(), expected_state.float(), rtol=0.02, atol=2e-3
+    )
 
 
 def test_bound_decode_calls_fused_raw_gating_kernel_without_dispatch():
