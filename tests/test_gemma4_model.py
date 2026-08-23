@@ -35,6 +35,7 @@ from sparsevllm.models.gemma4 import (
 )
 from sparsevllm.models.layout import RuntimeLayout
 from sparsevllm.operators.gemma4 import (
+    Gemma4OpSpec,
     TorchGemma4OperatorProvider,
     TritonGemma4OperatorProvider,
 )
@@ -111,6 +112,52 @@ def test_gemma4_flashinfer_prefill_caches_alternating_attention_contracts():
 
     assert sum(wrapper.plan.call_count for wrapper in wrappers) == 2
     assert all(wrapper.plan.call_count == 1 for wrapper in wrappers)
+
+
+def test_gemma4_runtime_spec_counts_alternating_attention_contracts():
+    config = _config()
+    engine_config = SimpleNamespace(decode_cuda_graph=False)
+    captured = {}
+
+    def resolve(spec, *, device_index):
+        captured["spec"] = spec
+        captured["device_index"] = device_index
+        return Mock(name="provider")
+
+    with patch(
+        "sparsevllm.models.gemma4.resolve_gemma4_provider",
+        side_effect=resolve,
+    ):
+        Gemma4ForCausalLM.build_runtime_kwargs(
+            config,
+            engine_config=engine_config,
+            parallel_context=_parallel_context(),
+            device=torch.device("cuda", 0),
+        )
+
+    spec = captured["spec"]
+    assert isinstance(spec, Gemma4OpSpec)
+    assert spec.head_dims == (4, 8)
+    assert len(spec.attention_contracts) == 2
+    assert {contract[2:] for contract in spec.attention_contracts} == {
+        (4, 3),
+        (8, -1),
+    }
+    assert captured["device_index"] == 0
+
+
+def test_gemma4_close_runtime_operators_releases_provider():
+    operator_provider = Mock(name="operator_provider")
+    router_provider = Mock(name="router_provider")
+    model = SimpleNamespace(
+        operator_provider=operator_provider,
+        router_provider=router_provider,
+    )
+
+    Gemma4ForCausalLM.close_runtime_operators(model)
+
+    operator_provider.close.assert_called_once_with()
+    router_provider.close.assert_called_once_with()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

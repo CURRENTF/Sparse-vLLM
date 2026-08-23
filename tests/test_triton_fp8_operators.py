@@ -115,7 +115,7 @@ def test_resolved_sm120_fp8_linear_matches_reference_across_batch_sizes():
         output_features=5120,
     )
 
-    for tokens in (1, 512):
+    for tokens in (1, 512, 513, 515):
         inputs = torch.randn(
             tokens,
             2048,

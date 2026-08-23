@@ -246,6 +246,16 @@ def _append_jsonl(path: str | os.PathLike[str], record: dict[str, Any]) -> None:
         f.write("\n")
 
 
+def _write_json(path: str | os.PathLike[str], value: dict[str, Any]) -> None:
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
+    with open(temporary, "w", encoding="utf-8") as handle:
+        json.dump(value, handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+    os.replace(temporary, destination)
+
+
 def _artifact_paths(out_root: str) -> dict[str, str]:
     return {
         "raw": os.path.join(out_root, "raw_outputs.jsonl"),
@@ -266,14 +276,133 @@ def _write_run_status(
         record["error"] = repr(error)
         record["traceback"] = traceback_text
 
-    status_path = Path(out_root) / "run_status.json"
-    temporary_path = status_path.with_name(
-        f".{status_path.name}.{os.getpid()}.tmp"
+    _write_json(Path(out_root) / "run_status.json", record)
+
+
+def _worker_output_root(out_root: str, rank: int) -> str:
+    return os.path.join(out_root, f".worker_rank{int(rank)}")
+
+
+def _read_worker_jsonl(path: Path) -> list[dict[str, Any]]:
+    if not path.is_file():
+        return []
+    rows: list[dict[str, Any]] = []
+    for line_number, line in enumerate(
+        path.read_text(encoding="utf-8").splitlines(), start=1
+    ):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise RuntimeError(
+                f"Invalid worker JSONL {path}:{line_number}: {error}"
+            ) from error
+        if not isinstance(row, dict):
+            raise RuntimeError(
+                f"Worker JSONL {path}:{line_number} must contain an object."
+            )
+        rows.append(row)
+    return rows
+
+
+def _write_jsonl_atomic(path: Path, rows: list[dict[str, Any]]) -> None:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    with open(temporary, "w", encoding="utf-8") as handle:
+        for row in rows:
+            json.dump(row, handle, ensure_ascii=False)
+            handle.write("\n")
+    os.replace(temporary, path)
+
+
+def _merge_worker_outputs(
+    out_root: str,
+    *,
+    datasets: list[str],
+    world_size: int,
+) -> None:
+    artifact_names = [
+        *(f"{dataset}.jsonl" for dataset in datasets),
+        "raw_outputs.jsonl",
+        "parsed_outputs.jsonl",
+        "sample_results.jsonl",
+    ]
+    for artifact_name in artifact_names:
+        merged: list[dict[str, Any]] = []
+        observed: set[tuple[object, ...]] = set()
+        is_task = artifact_name not in {
+            "raw_outputs.jsonl",
+            "parsed_outputs.jsonl",
+            "sample_results.jsonl",
+        }
+        for rank in range(int(world_size)):
+            worker_path = Path(_worker_output_root(out_root, rank)) / artifact_name
+            for row in _read_worker_jsonl(worker_path):
+                source_idx = row.get("source_idx")
+                dataset = artifact_name.removesuffix(".jsonl") if is_task else row.get("dataset")
+                if not isinstance(source_idx, int) or not isinstance(dataset, str):
+                    raise RuntimeError(
+                        f"Worker artifact {worker_path} lacks dataset/source_idx identity: "
+                        f"{row}"
+                    )
+                key = (dataset, source_idx)
+                if key in observed:
+                    raise RuntimeError(
+                        f"Duplicate LongBench sample identity {key} while merging "
+                        f"{artifact_name}."
+                    )
+                observed.add(key)
+                merged.append(row)
+        merged.sort(
+            key=lambda row: (
+                artifact_name.removesuffix(".jsonl")
+                if is_task
+                else str(row["dataset"]),
+                int(row["source_idx"]),
+                int(row.get("sample_idx", -1)),
+            )
+        )
+        _write_jsonl_atomic(Path(out_root) / artifact_name, merged)
+
+
+def _write_operator_runtime_stats(*, generate_fn, out_root: str, rank: int) -> None:
+    llm = getattr(generate_fn, "_sparsevllm_llm", None)
+    if llm is None:
+        raise RuntimeError(
+            "SparseVLLM LongBench generation did not expose _sparsevllm_llm; "
+            "cannot record operator runtime stats."
+        )
+    _write_json(
+        Path(out_root) / f"operator_runtime_stats_rank{rank}.json",
+        {
+            "status": "success",
+            "launcher_rank": int(rank),
+            "world_ranks": llm.operator_runtime_stats(),
+        },
     )
-    with open(temporary_path, "w", encoding="utf-8") as handle:
-        json.dump(record, handle, ensure_ascii=False, indent=2)
-        handle.write("\n")
-    os.replace(temporary_path, status_path)
+
+
+def _merge_operator_runtime_stats(out_root: str, *, world_size: int) -> None:
+    world_ranks: list[dict[str, Any]] = []
+    for rank in range(int(world_size)):
+        path = Path(out_root) / f"operator_runtime_stats_rank{rank}.json"
+        if not path.is_file():
+            raise RuntimeError(f"Missing operator runtime stats for rank={rank}: {path}")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if payload.get("status") != "success" or not isinstance(
+            payload.get("world_ranks"), list
+        ):
+            raise RuntimeError(f"Invalid operator runtime stats for rank={rank}: {payload}")
+        for item in payload["world_ranks"]:
+            if not isinstance(item, dict):
+                raise RuntimeError(
+                    f"Invalid operator runtime rank record for launcher rank={rank}: {item!r}"
+                )
+            world_ranks.append({"launcher_rank": rank, **item})
+    _write_json(
+        Path(out_root) / "operator_runtime_stats.json",
+        {"status": "success", "world_ranks": world_ranks},
+    )
 
 
 def _try_write_failed_run_status(
@@ -645,6 +774,17 @@ def worker(
     max_length_limit,
     infer_config,
 ):
+    worker_out_root = (
+        _worker_output_root(out_root, rank) if world_size > 1 else out_root
+    )
+    os.makedirs(worker_out_root, exist_ok=True)
+    if world_size > 1:
+        for dataset in datasets:
+            Path(worker_out_root, f"{dataset}.jsonl").write_text(
+                "", encoding="utf-8"
+            )
+        for artifact in _artifact_paths(worker_out_root).values():
+            Path(artifact).write_text("", encoding="utf-8")
     seed_everything(args.seed)
     model, tokenizer, model_max_length, eos_token_ids = load_model_and_tokenizer(
         rank,
@@ -711,8 +851,8 @@ def worker(
                         "selection": selection_meta,
                     }
                     _write_sample_record(
-                        out_root=out_root,
-                        task_out_path=os.path.join(out_root, f"{dataset}.jsonl"),
+                        out_root=worker_out_root,
+                        task_out_path=os.path.join(worker_out_root, f"{dataset}.jsonl"),
                         record=skipped,
                     )
                 continue
@@ -734,8 +874,8 @@ def worker(
             'prompt_format': dataset2prompt[dataset],
             'max_gen': dataset2maxlen[dataset],
             'max_length': max_length_limit,
-            'out_path': os.path.join(out_root, f"{dataset}.jsonl"),
-            'out_root': out_root,
+            'out_path': os.path.join(worker_out_root, f"{dataset}.jsonl"),
+            'out_root': worker_out_root,
         }
         
         get_pred(
@@ -764,6 +904,11 @@ def worker(
         out_root=out_root,
         rank=rank,
         before=graph_status_before,
+    )
+    _write_operator_runtime_stats(
+        generate_fn=model,
+        out_root=out_root,
+        rank=rank,
     )
 
 
@@ -887,7 +1032,8 @@ def main() -> None:
                 f"{model_name}/{compressor_name}_{time_tag}",
             )
         os.makedirs(out_root, exist_ok=True)
-        _write_run_status(out_root, "running")
+        if args.worker_rank < 0:
+            _write_run_status(out_root, "running")
         print(f"Results will be saved in: {out_root}")
 
         if args.num_samples is not None and args.num_samples <= 0:
@@ -973,6 +1119,11 @@ def main() -> None:
             )
         elif args.ws > 1:
             launch_single_gpu_workers(args, out_root)
+            _merge_worker_outputs(
+                out_root,
+                datasets=datasets,
+                world_size=args.ws,
+            )
         else:
             worker(
                 0,
@@ -987,6 +1138,7 @@ def main() -> None:
             )
 
         if args.worker_rank < 0:
+            _merge_operator_runtime_stats(out_root, world_size=args.ws)
             phase = "metric"
             # 记录评测信息到日志文件
             log_path = os.path.join(out_root, "longbench_eval.log")
@@ -1028,23 +1180,25 @@ def main() -> None:
         failure_status = "metric_failed" if phase == "metric" else (
             "model_failed" if phase == "model" else "invalid_input"
         )
-        _try_write_failed_run_status(
-            out_root or (args.output_root if args is not None else None),
-            failure_status,
-            error,
-            traceback.format_exc(),
-        )
+        if args is None or args.worker_rank < 0:
+            _try_write_failed_run_status(
+                out_root or (args.output_root if args is not None else None),
+                failure_status,
+                error,
+                traceback.format_exc(),
+            )
         raise
     except Exception as error:
         failure_status = "model_failed" if phase == "model" else (
             "metric_failed" if phase == "metric" else "invalid_input"
         )
-        _try_write_failed_run_status(
-            out_root or (args.output_root if args is not None else None),
-            failure_status,
-            error,
-            traceback.format_exc(),
-        )
+        if args is None or args.worker_rank < 0:
+            _try_write_failed_run_status(
+                out_root or (args.output_root if args is not None else None),
+                failure_status,
+                error,
+                traceback.format_exc(),
+            )
         raise
 
 

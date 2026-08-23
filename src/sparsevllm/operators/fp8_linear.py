@@ -144,6 +144,7 @@ FP8_LINEAR_REGISTRY: OpRegistry[Fp8LinearSpec, Fp8LinearProvider] = OpRegistry(
 
 @dataclass(frozen=True, slots=True)
 class _Sm120ActivationWorkspace:
+    padded_inputs: torch.Tensor
     quantized: torch.Tensor
     scales: torch.Tensor
 
@@ -154,8 +155,13 @@ _SM120_ACTIVATION_WORKSPACES: dict[
 _SM120_ACTIVATION_WORKSPACE_LOCK = Lock()
 
 
-def _sm120_activation_workspace(inputs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    rows, features = map(int, inputs.shape)
+def _sm120_activation_buffers(
+    inputs: torch.Tensor,
+    *,
+    rows: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    input_rows, features = map(int, inputs.shape)
+    rows = input_rows if rows is None else int(rows)
     if rows <= 0:
         raise ValueError("SM120 FP8 Linear requires at least one activation row.")
     capacity = 1 << max(rows - 1, 0).bit_length()
@@ -171,6 +177,11 @@ def _sm120_activation_workspace(inputs: torch.Tensor) -> tuple[torch.Tensor, tor
             workspace = _SM120_ACTIVATION_WORKSPACES.get(key)
             if workspace is None:
                 workspace = _Sm120ActivationWorkspace(
+                    padded_inputs=torch.empty(
+                        (capacity, features),
+                        dtype=inputs.dtype,
+                        device=inputs.device,
+                    ),
                     quantized=torch.empty(
                         (capacity, features),
                         dtype=torch.float8_e4m3fn,
@@ -183,7 +194,21 @@ def _sm120_activation_workspace(inputs: torch.Tensor) -> tuple[torch.Tensor, tor
                     ),
                 )
                 _SM120_ACTIVATION_WORKSPACES[key] = workspace
-    return workspace.quantized[:rows], workspace.scales[:rows]
+    if workspace.padded_inputs.dtype != inputs.dtype:
+        raise TypeError(
+            "SM120 FP8 Linear activation workspace dtype changed after warmup: "
+            f"workspace={workspace.padded_inputs.dtype} inputs={inputs.dtype}."
+        )
+    return (
+        workspace.padded_inputs[:rows],
+        workspace.quantized[:rows],
+        workspace.scales[:rows],
+    )
+
+
+def _sm120_activation_workspace(inputs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    _, quantized, scales = _sm120_activation_buffers(inputs)
+    return quantized, scales
 
 _SM120_FP8_LINEAR_PROFILE_RESOURCE = "profiles/sm120_fp8_linear.json"
 
@@ -495,10 +520,21 @@ class FlashInferGroupwiseSm120Fp8LinearProvider(Fp8LinearProvider):
 
         original_shape = x.shape[:-1]
         inputs = x.reshape(-1, x.shape[-1]).contiguous()
-        quantized, scales = _sm120_activation_workspace(inputs)
+        rows = int(inputs.shape[0])
+        kernel_rows = (rows + 3) & ~3
+        padded_inputs, quantized, scales = _sm120_activation_buffers(
+            inputs,
+            rows=kernel_rows,
+        )
+        if kernel_rows != rows:
+            padded_inputs.zero_()
+            padded_inputs[:rows].copy_(inputs)
+            kernel_inputs = padded_inputs
+        else:
+            kernel_inputs = inputs
         fp8_info = torch.finfo(torch.float8_e4m3fn)
         sgl_per_token_group_quant_8bit(
-            inputs,
+            kernel_inputs,
             quantized,
             scales,
             128,
@@ -513,7 +549,7 @@ class FlashInferGroupwiseSm120Fp8LinearProvider(Fp8LinearProvider):
             scales,
             weight_scale_inv,
             out_dtype=torch.bfloat16,
-        )
+        )[:rows]
         if bias is not None:
             output.add_(bias)
         return output.reshape(*original_shape, weight.shape[0])

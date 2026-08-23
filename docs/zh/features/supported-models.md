@@ -8,14 +8,14 @@
 
 | 模型 | `model_type` | 精度 | TP | DP | EP |
 | --- | --- | --- | :---: | :---: | :---: |
-| Qwen2.5 | `qwen2` | BF16 / FP16 | ✅ | 仅支持 1 | 仅支持 1 |
+| Qwen2.5 | `qwen2` | BF16 / FP16 / 块级 FP8 | ✅ | 仅支持 1 | 仅支持 1 |
 | Qwen3 Dense | `qwen3` | BF16 / FP16 / 块级 FP8 | ✅（FP8：1/2/4/8） | 仅支持 1 | 仅支持 1 |
 | Qwen3MoE | `qwen3_moe` | BF16 / FP16 / 块级 FP8 | ✅（TP > 1 时模型 dtype 仅支持 BF16） | 仅支持 1 | ✅ |
 | Qwen3.5 / 3.6 / 3.8 | `qwen3_5` | BF16 / 块级 FP8 | ✅ | 仅支持 1 | 仅支持 1 |
 | Qwen3.6 MoE | `qwen3_5_moe` | BF16 / 块级 FP8 | ✅ | 仅支持 1 | ✅ |
 | GLM-4.7-Flash | `glm4_moe_lite` | BF16 | 1 / 2 / 4（仅 H100）⁵ | 仅支持 1 | 1 / 2 / 4⁵ |
 | Gemma 4 Dense / MoE | `gemma4` | BF16 / FP16 | ✅ | 仅支持 1 | ✅（仅 MoE） |
-| Llama 3 / 3.1 | `llama` | BF16 / FP16 | ✅ | 仅支持 1 | 仅支持 1 |
+| Llama 3 / 3.1 | `llama` | BF16 / FP16 / 块级 FP8 | ✅ | 仅支持 1 | 仅支持 1 |
 | MiniMax M2.7 | `minimax_m2` | 块级 FP8，非量化权重使用 BF16 | ✅ | 仅支持 1 | ✅ |
 
 TP 规模限制为 1 到 8，并且 checkpoint 维度（包括 attention head 数和 vocabulary 大小）必须能被所选 TP 规模整除。Qwen3MoE 的 EP 规模必须整除 `num_experts`；MiniMax M2.7 的 EP 规模必须整除 `num_local_experts`。
@@ -36,7 +36,9 @@ BF16；FP16 Qwen3MoE checkpoint 仅支持 `TP=1`。当 `TP=1` 时，原有 EP
 会记录每次 dispatch 实际执行的 atomic kernel path。
 
 块级 FP8 要求使用 E4M3 权重、动态激活量化以及 `128 x 128` 的权重块大小。
-Qwen3.5、Qwen3.6 和 Qwen3.8 Dense checkpoint 共享 `qwen3_5` 运行时架构，
+Llama、Qwen2 和 Qwen3 Dense FP8 checkpoint 还要求每个 TP-local dense
+projection 维度按 128 对齐，且非量化参数保持 BF16。Qwen3.5、Qwen3.6 和
+Qwen3.8 Dense checkpoint 共享 `qwen3_5` 运行时架构，
 因此具有相同的精度、并行方式、稀疏方法和多模态支持。Qwen3.6 MoE 使用
 `model_type=qwen3_5_moe`。
 

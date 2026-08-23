@@ -588,6 +588,10 @@ class ResolvedProvider(Generic[ProviderT]):
     report: BindingReport
 
 
+class NoProviderError(RuntimeError):
+    """No registered provider satisfies the requested semantic contract."""
+
+
 class OpResolver(Generic[SpecT, ProviderT]):
     def __init__(self, registry: OpRegistry[SpecT, ProviderT]) -> None:
         self.registry = registry
@@ -713,7 +717,7 @@ class OpResolver(Generic[SpecT, ProviderT]):
                 details = "; ".join(
                     f"{name}: {reason}" for name, reason in rejected
                 )
-                raise RuntimeError(
+                raise NoProviderError(
                     f"No {self.registry.family} provider supports spec={spec!r} on "
                     f"device={caps.device_name!r}: "
                     f"{details or 'no default portfolio providers registered'}."

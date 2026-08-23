@@ -608,6 +608,8 @@ class Gemma4ForCausalLM(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
+        self.operator_provider = operator_provider
+        self.router_provider = router_provider
         self.model = Gemma4Model(config, operator_provider, router_provider)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if config.tie_word_embeddings:
@@ -641,22 +643,60 @@ class Gemma4ForCausalLM(nn.Module):
     ) -> torch.Tensor:
         return self.model(input_ids, positions, inputs_embeds, multimodal_mask)
 
-    @classmethod
-    def build_runtime_kwargs(cls, config, *, device, **_):
-        head_dims = tuple(
-            sorted(
-                {
-                    int(config_layer_get(config, layer_idx, "head_dim"))
-                    for layer_idx in range(int(config.num_hidden_layers))
-                }
+    @staticmethod
+    def build_runtime_kwargs(
+        config,
+        *,
+        engine_config,
+        parallel_context,
+        device,
+        **_,
+    ):
+        tp_size = int(parallel_context.attention_tp_size)
+        contracts: set[tuple[int, int, int, int]] = set()
+        for layer_idx in range(int(config.num_hidden_layers)):
+            is_sliding = str(config.layer_types[layer_idx]) == "sliding_attention"
+            head_dim = int(
+                config_layer_get(
+                    config,
+                    layer_idx,
+                    "head_dim",
+                    "head_dim" if is_sliding else "global_head_dim",
+                )
             )
-        )
+            use_k_eq_v = bool(
+                getattr(config, "attention_k_eq_v", False) and not is_sliding
+            )
+            total_kv_heads = int(
+                config_layer_get(
+                    config,
+                    layer_idx,
+                    "num_key_value_heads",
+                    (
+                        "num_global_key_value_heads"
+                        if use_k_eq_v
+                        else "num_key_value_heads"
+                    ),
+                )
+            )
+            window_left = int(config.sliding_window) - 1 if is_sliding else -1
+            contracts.add(
+                (
+                    int(config.num_attention_heads) // tp_size,
+                    max(1, total_kv_heads // tp_size),
+                    head_dim,
+                    window_left,
+                )
+            )
+        attention_contracts = tuple(sorted(contracts))
+        head_dims = tuple(sorted({contract[2] for contract in attention_contracts}))
         runtime_kwargs = {
             "operator_provider": resolve_gemma4_provider(
                 Gemma4OpSpec(
                     activation_dtype=model_activation_dtype(config),
                     head_dims=head_dims,
-                    cuda_graph=bool(getattr(config, "decode_cuda_graph", False)),
+                    cuda_graph=bool(engine_config.decode_cuda_graph),
+                    attention_contracts=attention_contracts,
                 ),
                 device_index=device.index,
             )
@@ -667,11 +707,19 @@ class Gemma4ForCausalLM(nn.Module):
                     activation_dtype=model_activation_dtype(config),
                     num_experts=int(config.num_experts),
                     top_k=int(config.top_k_experts),
-                    cuda_graph=bool(getattr(config, "decode_cuda_graph", False)),
+                    cuda_graph=bool(engine_config.decode_cuda_graph),
                 ),
                 device_index=device.index,
             )
         return runtime_kwargs
+
+    def close_runtime_operators(self) -> None:
+        close = getattr(self.operator_provider, "close", None)
+        if callable(close):
+            close()
+        router_close = getattr(self.router_provider, "close", None)
+        if callable(router_close):
+            router_close()
 
     def map_weight_name(self, source_weight_name: str) -> str | None:
         match = _EXPERT_SOURCE_RE.match(source_weight_name)

@@ -405,12 +405,28 @@ class FlashInferPagedDecodeAttentionProvider(DecodeAttentionProvider):
                 "FlashInfer decode requires Q/K/V with the same dtype, got "
                 f"{q.dtype}/{payload.k_cache.dtype}/{payload.v_cache.dtype}."
             )
-        self._state.plan(
-            spec,
-            active_slots=meta.active_slots,
-            req_indices=meta.req_indices,
-            context_lens=meta.context_lens,
+        max_context_len = getattr(meta, "max_context_len", None)
+        if max_context_len is None:
+            raise RuntimeError(
+                "FlashInfer decode requires host-side max_context_len metadata."
+            )
+        context = get_context()
+        plan_key = (
+            context.attention_validation_scope,
+            meta.active_slots.data_ptr(),
+            meta.req_indices.data_ptr(),
+            meta.context_lens.data_ptr(),
+            int(max_context_len),
         )
+        if getattr(self._state, "plan_key", None) != plan_key:
+            self._state.plan(
+                spec,
+                active_slots=meta.active_slots,
+                req_indices=meta.req_indices,
+                context_lens=meta.context_lens,
+                max_context_len=int(max_context_len),
+            )
+            self._state.plan_key = plan_key
         output = torch.empty_like(q)
         return_softmax_lse = spec.kernel_request.requires_softmax_lse
         result = self._state.wrapper.run(
@@ -460,6 +476,7 @@ class _FlashInferPagedDecodeState:
             device=device,
         )
         self.wrapper = make_flashinfer_paged_decode_wrapper(self.workspace)
+        self.plan_key: tuple[object, ...] | None = None
 
     def plan(
         self,
@@ -468,6 +485,7 @@ class _FlashInferPagedDecodeState:
         active_slots: torch.Tensor,
         req_indices: torch.Tensor,
         context_lens: torch.Tensor,
+        max_context_len: int,
     ) -> None:
         if active_slots.dtype != torch.int32 or active_slots.ndim != 2:
             raise TypeError(
@@ -478,7 +496,7 @@ class _FlashInferPagedDecodeState:
         batch_size = int(context_lens.numel())
         if batch_size <= 0 or int(req_indices.numel()) != batch_size:
             raise ValueError("FlashInfer decode requires matched non-empty metadata.")
-        max_context_len = int(context_lens.max().item())
+        max_context_len = int(max_context_len)
         if max_context_len <= 0 or max_context_len > int(active_slots.shape[1]):
             raise ValueError(
                 "FlashInfer decode context is outside the active slot table: "

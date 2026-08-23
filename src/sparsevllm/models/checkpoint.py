@@ -60,15 +60,23 @@ def _validate_exclusions(
         )
 
 
-def _validate_qwen3_fp8(config: Any, topology: ParallelTopology) -> None:
-    _validate_architecture("Qwen3 FP8", config, "Qwen3ForCausalLM")
-    _validate_bf16("Qwen3 FP8", config, "BF16 non-quantized parameters")
+def _validate_dense_fp8(
+    config: Any,
+    topology: ParallelTopology,
+    *,
+    model_name: str,
+    architecture: str,
+) -> None:
+    _validate_architecture(model_name, config, architecture)
+    _validate_bf16(model_name, config, "BF16 non-quantized parameters")
+    num_heads = int(config_get(config, "num_attention_heads", 0) or 0)
     head_dim = int(config_get(config, "head_dim", 0) or 0)
+    if head_dim <= 0 and num_heads > 0:
+        head_dim = int(config_get(config, "hidden_size", 0) or 0) // num_heads
     dimensions = {
         "hidden_size": int(config_get(config, "hidden_size", 0) or 0),
         "intermediate_size": int(config_get(config, "intermediate_size", 0) or 0),
-        "query_size": int(config_get(config, "num_attention_heads", 0) or 0)
-        * head_dim,
+        "query_size": num_heads * head_dim,
         "key_value_size": int(
             config_get(config, "num_key_value_heads", 0) or 0
         )
@@ -82,9 +90,18 @@ def _validate_qwen3_fp8(config: Any, topology: ParallelTopology) -> None:
     }
     if invalid:
         raise ValueError(
-            "Qwen3 FP8 requires every TP-local dense projection dimension to be "
+            f"{model_name} requires every TP-local dense projection dimension to be "
             f"128-aligned; TP={topology.attention_tp_size}, invalid={invalid}."
         )
+
+
+def _validate_qwen3_fp8(config: Any, topology: ParallelTopology) -> None:
+    _validate_dense_fp8(
+        config,
+        topology,
+        model_name="Qwen3 FP8",
+        architecture="Qwen3ForCausalLM",
+    )
 
 
 def _validate_qwen3_moe_fp8(config: Any, raw_quantization_config: Any) -> None:
@@ -266,6 +283,26 @@ def _qwen3_checkpoint(_outer, config, _raw, quantization, topology) -> None:
         _validate_qwen3_fp8(config, topology)
 
 
+def _llama_checkpoint(_outer, config, _raw, quantization, topology) -> None:
+    if quantization.enabled:
+        _validate_dense_fp8(
+            config,
+            topology,
+            model_name="Llama FP8",
+            architecture="LlamaForCausalLM",
+        )
+
+
+def _qwen2_checkpoint(_outer, config, _raw, quantization, topology) -> None:
+    if quantization.enabled:
+        _validate_dense_fp8(
+            config,
+            topology,
+            model_name="Qwen2 FP8",
+            architecture="Qwen2ForCausalLM",
+        )
+
+
 def _qwen3_moe_checkpoint(_outer, config, raw, quantization, topology) -> None:
     _validate_qwen3_moe(config, raw, quantization, topology)
 
@@ -293,6 +330,8 @@ def _gemma4_checkpoint(outer, config, _raw, quantization, topology) -> None:
 
 
 CHECKPOINT_VALIDATORS = {
+    "llama": _llama_checkpoint,
+    "qwen2": _qwen2_checkpoint,
     "qwen3": _qwen3_checkpoint,
     "qwen3_moe": _qwen3_moe_checkpoint,
     "qwen3_5": _qwen35_checkpoint,

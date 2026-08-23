@@ -12,14 +12,14 @@ parallel size must use that value.
 
 | Model | `model_type` | Precision | TP | DP | EP |
 | --- | --- | --- | :---: | :---: | :---: |
-| Qwen2.5 | `qwen2` | BF16 / FP16 | ✅ | 1 only | 1 only |
+| Qwen2.5 | `qwen2` | BF16 / FP16 / block FP8 | ✅ | 1 only | 1 only |
 | Qwen3 Dense | `qwen3` | BF16 / FP16 / block FP8 | ✅ (FP8: 1/2/4/8) | 1 only | 1 only |
 | Qwen3MoE | `qwen3_moe` | BF16 / FP16 / block FP8 | ✅ (TP > 1: BF16 model dtype only) | 1 only | ✅ |
 | Qwen3.5 / 3.6 / 3.8 | `qwen3_5` | BF16 / block FP8 | ✅ | 1 only | 1 only |
 | Qwen3.6 MoE | `qwen3_5_moe` | BF16 / block FP8 | ✅ | 1 only | ✅ |
 | GLM-4.7-Flash | `glm4_moe_lite` | BF16 | 1 / 2 / 4 (H100 only)⁵ | 1 only | 1 / 2 / 4⁵ |
 | Gemma 4 Dense / MoE | `gemma4` | BF16 / FP16 | ✅ | 1 only | ✅ (MoE only) |
-| Llama 3 / 3.1 | `llama` | BF16 / FP16 | ✅ | 1 only | 1 only |
+| Llama 3 / 3.1 | `llama` | BF16 / FP16 / block FP8 | ✅ | 1 only | 1 only |
 | MiniMax M2.7 | `minimax_m2` | block FP8 with BF16 non-quantized weights | ✅ | 1 only | ✅ |
 
 TP is limited to sizes 1 through 8 and requires the checkpoint dimensions,
@@ -44,7 +44,9 @@ existing providers. Binding reports record the ranges and runtime operator
 statistics report the atomic kernel path used by each dispatch.
 
 Block FP8 support requires E4M3 weights, dynamic activation quantization, and
-a `128 x 128` weight block size. Qwen3.5, Qwen3.6, and Qwen3.8 dense
+a `128 x 128` weight block size. Llama, Qwen2, and Qwen3 dense FP8 checkpoints
+also require every TP-local dense projection dimension to be 128-aligned and
+keep non-quantized parameters in BF16. Qwen3.5, Qwen3.6, and Qwen3.8 dense
 checkpoints share the `qwen3_5` runtime architecture and therefore the same
 precision, parallelism, sparse-method, and multimodal support. Qwen3.6 MoE
 uses `model_type=qwen3_5_moe`.

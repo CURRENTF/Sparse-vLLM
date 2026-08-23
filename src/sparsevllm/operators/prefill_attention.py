@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
@@ -24,8 +24,8 @@ from sparsevllm.operators.attention_capabilities import (
 from sparsevllm.operators.registry import (
     OpRegistry,
     OpResolver,
+    NoProviderError,
     PortfolioPolicy,
-    ProfileMatch,
     ProviderRole,
     SupportResult,
 )
@@ -47,6 +47,7 @@ class PrefillAttentionOpSpec:
     varlen: bool = True
     cuda_graph: bool = False
     return_softmax_lse: bool = False
+    allow_softmax_lse_fallback: bool = False
 
     def __post_init__(self) -> None:
         if self.num_query_heads <= 0 or self.num_kv_heads <= 0:
@@ -131,8 +132,8 @@ PREFILL_ATTENTION_REGISTRY: OpRegistry[
             "flashinfer_paged_prefill_fa2_sm120",
         ),
         repo_portable=("triton_paged_prefill",),
+        repo_nonstandard=("tilelang_gqa_paged_prefill",),
     ),
-    profile_order=("h100_tilelang_scored_prefill_profile",),
 )
 
 
@@ -512,7 +513,6 @@ class SglFa3PagedPrefillAttentionProvider(PrefillAttentionProvider):
 
 @PREFILL_ATTENTION_REGISTRY.register_atomic(
     ProviderRole.REPO_NONSTANDARD,
-    profile_only=True,
 )
 class TilelangGqaPagedPrefillAttentionProvider(PrefillAttentionProvider):
     """Portable TileLang GQA paged prefill with fused score extraction."""
@@ -620,40 +620,6 @@ class TilelangGqaPagedPrefillAttentionProvider(PrefillAttentionProvider):
         )
 
 
-@PREFILL_ATTENTION_REGISTRY.register_profile
-class H100TilelangScoredPrefillProfile:
-    name = "h100_tilelang_scored_prefill_profile"
-
-    @classmethod
-    def atomic_provider_names(
-        cls,
-        spec: PrefillAttentionOpSpec,
-    ) -> tuple[str, ...]:
-        del spec
-        return ("tilelang_gqa_paged_prefill",)
-
-    @classmethod
-    def matches(
-        cls,
-        spec: PrefillAttentionOpSpec,
-        caps: DeviceCaps,
-    ) -> ProfileMatch:
-        if caps.device_name != "NVIDIA H100 80GB HBM3":
-            return ProfileMatch.no("requires profiled NVIDIA H100 80GB HBM3")
-        if spec.score_output is not AttentionScoreKind.RAW_QK_REDUCED:
-            return ProfileMatch.no("requires reduced scored-prefill semantics")
-        return ProfileMatch.yes("matched H100 TileLang scored-prefill profile")
-
-    @classmethod
-    def bind(cls, spec: PrefillAttentionOpSpec, caps: DeviceCaps, **kwargs):
-        del spec, caps
-        if kwargs:
-            raise TypeError(
-                f"{cls.name} does not accept provider arguments: {sorted(kwargs)}"
-            )
-        return TilelangGqaPagedPrefillAttentionProvider()
-
-
 @PREFILL_ATTENTION_REGISTRY.register_atomic(ProviderRole.REPO_PORTABLE)
 class TritonPagedPrefillAttentionProvider(PrefillAttentionProvider):
     name = "triton_paged_prefill"
@@ -741,22 +707,49 @@ class TritonPagedPrefillAttentionProvider(PrefillAttentionProvider):
         return output
 
 
-def resolve_prefill_attention_provider(
+def _resolve_prefill_attention_provider(
     spec: PrefillAttentionOpSpec,
     *,
     device_index: int | None = None,
-) -> PrefillAttentionProvider:
+) -> tuple[PrefillAttentionProvider, PrefillAttentionOpSpec]:
     platform = platforms.current_platform
     if device_index is None:
         device_index = torch.cuda.current_device() if platform.is_cuda_alike() else 0
     caps = platform.get_device_caps(int(device_index))
-    resolved = OpResolver(PREFILL_ATTENTION_REGISTRY).resolve(spec, caps)
+    execution_spec = spec
+    try:
+        resolved = OpResolver(PREFILL_ATTENTION_REGISTRY).resolve(
+            execution_spec, caps
+        )
+    except NoProviderError:
+        if not (spec.return_softmax_lse and spec.allow_softmax_lse_fallback):
+            raise
+        execution_spec = replace(spec, return_softmax_lse=False)
+        resolved = OpResolver(PREFILL_ATTENTION_REGISTRY).resolve(
+            execution_spec, caps
+        )
+        logger.info(
+            "No provider can return optional prefill softmax LSE; "
+            "resolved provider={} with method-owned posthoc scoring",
+            resolved.provider.name,
+        )
     logger.info(
         "Resolved MHA prefill provider={} rejected={}",
         resolved.provider.name,
         dict(resolved.rejected),
     )
-    return resolved.provider
+    return resolved.provider, execution_spec
+
+
+def resolve_prefill_attention_provider(
+    spec: PrefillAttentionOpSpec,
+    *,
+    device_index: int | None = None,
+) -> PrefillAttentionProvider:
+    provider, _ = _resolve_prefill_attention_provider(
+        spec, device_index=device_index
+    )
+    return provider
 
 
 class PreparedPrefillAttentionOp:
@@ -766,8 +759,11 @@ class PreparedPrefillAttentionOp:
         self,
         spec: PrefillAttentionOpSpec,
         provider: PrefillAttentionProvider,
+        *,
+        execution_spec: PrefillAttentionOpSpec | None = None,
     ) -> None:
         self.spec = spec
+        self.execution_spec = execution_spec or spec
         self.provider = provider
         self._closed = False
 
@@ -784,7 +780,7 @@ class PreparedPrefillAttentionOp:
                 "Prefill attention view violates the resolved score contract: "
                 f"resolved={self.spec.score_output.name} actual={actual_score.name}."
             )
-        return self.provider.run(self.spec, q, view, **kwargs)
+        return self.provider.run(self.execution_spec, q, view, **kwargs)
 
     def close(self) -> None:
         if self._closed:
@@ -798,6 +794,12 @@ def prepare_prefill_attention_op(
     *,
     device_index: int | None = None,
 ) -> PreparedPrefillAttentionOp:
-    provider = resolve_prefill_attention_provider(spec, device_index=device_index)
-    provider.prepare(spec, device_index=device_index)
-    return PreparedPrefillAttentionOp(spec, provider)
+    provider, execution_spec = _resolve_prefill_attention_provider(
+        spec, device_index=device_index
+    )
+    provider.prepare(execution_spec, device_index=device_index)
+    return PreparedPrefillAttentionOp(
+        spec,
+        provider,
+        execution_spec=execution_spec,
+    )

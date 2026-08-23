@@ -475,7 +475,6 @@ def _resolve_sparse_probe_protocol(
         hyper_params.setdefault("pool_kernel_size", 7)
     elif args.sparse_method == "h2o":
         hyper_params.setdefault("h2o_decode_budget", 4096)
-        hyper_params.setdefault("h2o_decode_eviction_interval", 128)
         hyper_params.setdefault("h2o_prefill_budget", 8192)
         hyper_params.setdefault("h2o_recent_ratio", 0.5)
         hyper_params.setdefault("h2o_prefill_score_window", 0)
@@ -532,9 +531,6 @@ def _resolve_sparse_probe_protocol(
             {
                 "score_window": int(hyper_params["h2o_prefill_score_window"]),
                 "decode_budget": int(hyper_params["h2o_decode_budget"]),
-                "decode_eviction_interval": int(
-                    hyper_params["h2o_decode_eviction_interval"]
-                ),
                 "prefill_budget": int(hyper_params["h2o_prefill_budget"]),
                 "recent_ratio": float(hyper_params["h2o_recent_ratio"]),
             }

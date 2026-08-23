@@ -27,6 +27,7 @@ class Gemma4OpSpec:
     activation_dtype: torch.dtype
     head_dims: tuple[int, ...]
     cuda_graph: bool
+    attention_contracts: tuple[tuple[int, int, int, int], ...] = ()
 
     def __post_init__(self) -> None:
         if not self.head_dims or any(int(value) <= 0 for value in self.head_dims):
@@ -79,6 +80,13 @@ class Gemma4OperatorProvider:
 
     def attention_backend(self, *, sliding_window: int | None):
         raise NotImplementedError
+
+    def close(self) -> None:
+        for backend in self._attention_backends:
+            close = getattr(backend, "close", None)
+            if callable(close):
+                close()
+        self._attention_backends.clear()
 
     def rmsnorm(
         self, x: torch.Tensor, weight: torch.Tensor | None, eps: float
@@ -234,7 +242,9 @@ class H20Gemma4OperatorProvider(TritonGemma4OperatorProvider):
             )
         return cls(
             device_index=caps.device_index,
-            max_prefill_contracts=len(spec.head_dims),
+            max_prefill_contracts=(
+                len(spec.attention_contracts) or len(spec.head_dims)
+            ),
         )
 
     def __init__(
@@ -274,8 +284,10 @@ class H20Gemma4OperatorProvider(TritonGemma4OperatorProvider):
         }
 
     def close(self) -> None:
-        self._prefill.close()
-        self._attention_backends.clear()
+        try:
+            self._prefill.close()
+        finally:
+            super().close()
 
     def attention_backend(self, *, sliding_window: int | None):
         from sparsevllm.operators.gemma4_attention import Gemma4AttentionBackend

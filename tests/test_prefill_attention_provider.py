@@ -36,9 +36,10 @@ from sparsevllm.operators.prefill_attention import (
     TilelangGqaPagedPrefillAttentionProvider,
     TritonPagedPrefillAttentionProvider,
     _FlashInferPagedPrefillState,
+    _resolve_prefill_attention_provider,
 )
 from sparsevllm.operators.attention_capabilities import AttentionScoreKind
-from sparsevllm.operators.registry import OpResolver
+from sparsevllm.operators.registry import NoProviderError, OpResolver
 from sparsevllm.platforms import DeviceCaps, PlatformEnum
 
 
@@ -66,6 +67,62 @@ def test_prefill_softmax_lse_requirement_is_part_of_kernel_contract():
         spec,
         _h100_caps(),
     ).supported
+
+
+@pytest.mark.parametrize(
+    ("device_kind", "head_dim", "activation_dtype"),
+    [
+        ("sm120", 128, torch.bfloat16),
+        ("sm120", 256, torch.bfloat16),
+        ("h100", 128, torch.float16),
+    ],
+)
+def test_optional_h2o_lse_falls_back_during_provider_resolution(
+    device_kind,
+    head_dim,
+    activation_dtype,
+):
+    caps = _sm120_caps() if device_kind == "sm120" else _h100_caps()
+    spec = _spec(
+        head_dim=head_dim,
+        softmax_scale=head_dim**-0.5,
+        activation_dtype=activation_dtype,
+        layer_varying_page_table=True,
+        return_softmax_lse=True,
+        allow_softmax_lse_fallback=True,
+    )
+    platform = SimpleNamespace(get_device_caps=lambda _index: caps)
+
+    with patch(
+        "sparsevllm.platforms.get_current_platform",
+        return_value=platform,
+    ):
+        provider, execution_spec = _resolve_prefill_attention_provider(
+            spec, device_index=0
+        )
+
+    assert provider.name == "triton_paged_prefill"
+    assert spec.return_softmax_lse
+    assert not execution_spec.return_softmax_lse
+
+
+def test_hard_prefill_lse_requirement_does_not_fall_back():
+    spec = _spec(
+        head_dim=256,
+        softmax_scale=256**-0.5,
+        layer_varying_page_table=True,
+        return_softmax_lse=True,
+    )
+    platform = SimpleNamespace(get_device_caps=lambda _index: _sm120_caps())
+
+    with (
+        patch(
+            "sparsevllm.platforms.get_current_platform",
+            return_value=platform,
+        ),
+        pytest.raises(NoProviderError),
+    ):
+        _resolve_prefill_attention_provider(spec, device_index=0)
 
 
 def _h100_caps(**overrides) -> DeviceCaps:
@@ -346,6 +403,35 @@ def test_tilelang_atomic_support_is_not_narrowed_to_the_profiled_h100(_support):
     )
 
     assert result.supported
+
+
+@patch(
+    "sparsevllm.kernels.tilelang.gqa.runtime.tilelang_gqa_device_support",
+    return_value=(True, "validated pair"),
+)
+def test_unprofiled_tilelang_score_provider_does_not_override_triton(_support):
+    resolved = OpResolver(PREFILL_ATTENTION_REGISTRY).resolve(
+        _spec(
+            num_query_heads=16,
+            num_kv_heads=2,
+            score_output=AttentionScoreKind.RAW_QK_REDUCED,
+            layer_varying_page_table=True,
+        ),
+        _h100_caps(),
+    )
+
+    assert resolved.provider.name == "triton_paged_prefill"
+    assert resolved.report.selected_profile is None
+
+
+def test_tilelang_installed_with_unvalidated_pair_is_broken(monkeypatch):
+    from sparsevllm.kernels.tilelang import support
+
+    versions = {"tilelang": "0.2.0", "apache-tvm-ffi": "0.1.10"}
+    monkeypatch.setattr(support.metadata, "version", versions.__getitem__)
+
+    with pytest.raises(ExternalKernelFamilyError, match="validated dependency pair"):
+        support.tilelang_dependency_support()
 
 
 def test_tilelang_support_probe_does_not_import_compiler(monkeypatch):

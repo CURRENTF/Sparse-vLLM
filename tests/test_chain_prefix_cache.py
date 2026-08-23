@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from sparsevllm.configs.sparse import _normalize_h2o
 from sparsevllm.engine.cache_manager.h2o import H2OCacheManager
 from sparsevllm.engine.cache_manager.snapkv import SnapKVCacheManager
 from sparsevllm.engine.chain_cache import (
@@ -30,6 +31,22 @@ from sparsevllm.sampling_params import SamplingParams
 
 
 FINGERPRINT = b"chain-test-fingerprint"
+
+
+def test_score_free_h2o_accepts_non_kernel_aligned_decode_budget():
+    config = SimpleNamespace(
+        h2o_decode_budget=16,
+        h2o_decode_eviction_interval=1,
+        h2o_prefill_budget=32,
+        h2o_recent_ratio=0.5,
+        h2o_prefill_score_window=0,
+        sparse_prefill_score_mode="probability",
+    )
+
+    _normalize_h2o(config)
+
+    assert config.h2o_decode_budget == 16
+    assert config.h2o_decode_eviction_interval == 1
 
 
 def _create_and_finish(
@@ -946,11 +963,10 @@ def _h2o_fingerprint_config(**overrides):
 
 
 @pytest.mark.parametrize(
-    ("field_name", "changed_value"),
-    [
-        ("h2o_decode_budget", 5),
-        ("h2o_decode_eviction_interval", 4),
-        ("h2o_prefill_budget", 9),
+        ("field_name", "changed_value"),
+        [
+            ("h2o_decode_budget", 5),
+            ("h2o_prefill_budget", 9),
         ("h2o_recent_ratio", 0.25),
         ("h2o_prefill_score_window", 8),
         ("sparse_attn_score_dtype", "float16"),

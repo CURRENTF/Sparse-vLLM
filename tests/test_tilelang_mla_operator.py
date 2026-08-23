@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
+from sparsevllm.kernels.external.support import ExternalKernelFamilyError
 from sparsevllm.engine.cache_manager import (
     AttentionViewMeta,
     DecodeComputeView,
@@ -131,7 +132,11 @@ def test_tilelang_support_version_boundary(version: str, supported: bool) -> Non
         return version if package == "tilelang" else "0.1.10"
 
     with patch.object(metadata, "version", side_effect=installed):
-        assert tilelang_mla_support()[0] is supported
+        if supported:
+            assert tilelang_mla_support()[0]
+        else:
+            with pytest.raises(ExternalKernelFamilyError, match="validated dependency pair"):
+                tilelang_mla_support()
 
 
 def test_tilelang_support_reports_missing_package() -> None:
@@ -150,10 +155,11 @@ def test_tilelang_support_rejects_unvalidated_dependency_pair() -> None:
             "apache-tvm-ffi": "0.1.13.post2",
         }[package]
 
-    with patch.object(metadata, "version", side_effect=version):
-        supported, reason = tilelang_mla_support()
-    assert not supported
-    assert "requires the validated TileLang dependency pair" in reason
+    with (
+        patch.object(metadata, "version", side_effect=version),
+        pytest.raises(ExternalKernelFamilyError, match="validated dependency pair"),
+    ):
+        tilelang_mla_support()
 
 
 @pytest.mark.parametrize(
@@ -171,7 +177,11 @@ def test_tvm_ffi_support_version_boundary(version: str, supported: bool) -> None
         return "0.1.9" if package == "tilelang" else version
 
     with patch.object(metadata, "version", side_effect=installed):
-        assert tilelang_mla_support()[0] is supported
+        if supported:
+            assert tilelang_mla_support()[0]
+        else:
+            with pytest.raises(ExternalKernelFamilyError, match="validated dependency pair"):
+                tilelang_mla_support()
 
 
 @pytest.mark.parametrize(("tp_size", "local_heads"), [(1, 20), (2, 10), (4, 5)])

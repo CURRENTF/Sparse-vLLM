@@ -156,6 +156,110 @@ def _read_jsonl(path: Path, errors: list[str]) -> list[dict[str, Any]] | None:
     return rows
 
 
+def _longbench_identity_map(
+    rows: list[dict[str, Any]],
+    *,
+    artifact: str,
+    default_dataset: str | None,
+    errors: list[str],
+) -> dict[tuple[str, int], str]:
+    identities: dict[tuple[str, int], str] = {}
+    for index, row in enumerate(rows):
+        dataset = default_dataset if default_dataset is not None else row.get("dataset")
+        source_idx = row.get("source_idx")
+        status = row.get("status")
+        if not isinstance(dataset, str) or not isinstance(source_idx, int):
+            errors.append(
+                f"invalid LongBench identity in {artifact}[{index}]: {row}"
+            )
+            continue
+        identity = (dataset, source_idx)
+        if identity in identities:
+            errors.append(f"duplicate LongBench identity in {artifact}: {identity}")
+            continue
+        if status != "success":
+            errors.append(
+                f"non-success LongBench sample in {artifact} for {identity}: {status!r}"
+            )
+        identities[identity] = str(status)
+    return identities
+
+
+def _validate_longbench_artifacts(
+    system_dir: Path,
+    *,
+    system: str,
+    tasks: list[str],
+    expected_count: int,
+    require_operator_stats: bool,
+    errors: list[str],
+) -> None:
+    run_status = _read_json(system_dir / "run_status.json", errors)
+    if run_status is not None and run_status.get("status") != "success":
+        errors.append(f"non-terminal LongBench run status for {system}: {run_status}")
+
+    expected_total = len(tasks) * int(expected_count)
+    identity_maps: dict[str, dict[tuple[str, int], str]] = {}
+    for artifact in (
+        "raw_outputs.jsonl",
+        "parsed_outputs.jsonl",
+        "sample_results.jsonl",
+    ):
+        rows = _read_jsonl(system_dir / artifact, errors)
+        if rows is None:
+            continue
+        if len(rows) != expected_total:
+            errors.append(
+                f"LongBench artifact coverage mismatch {system}/{artifact}: "
+                f"rows={len(rows)} expected={expected_total}"
+            )
+        identity_maps[artifact] = _longbench_identity_map(
+            rows,
+            artifact=f"{system}/{artifact}",
+            default_dataset=None,
+            errors=errors,
+        )
+
+    task_identities: dict[tuple[str, int], str] = {}
+    for task in tasks:
+        rows = _read_jsonl(system_dir / f"{task}.jsonl", errors)
+        if rows is None:
+            continue
+        current = _longbench_identity_map(
+            rows,
+            artifact=f"{system}/{task}.jsonl",
+            default_dataset=task,
+            errors=errors,
+        )
+        overlap = set(task_identities).intersection(current)
+        if overlap:
+            errors.append(
+                f"duplicate LongBench task identities for {system}: {sorted(overlap)}"
+            )
+        task_identities.update(current)
+
+    reference_name = next(iter(identity_maps), None)
+    if reference_name is not None:
+        reference = identity_maps[reference_name]
+        for artifact, identities in identity_maps.items():
+            if identities != reference:
+                errors.append(
+                    f"LongBench structured identities/statuses differ for {system}: "
+                    f"{reference_name} vs {artifact}"
+                )
+        if task_identities != reference:
+            errors.append(
+                f"LongBench task and structured identities/statuses differ for {system}"
+            )
+
+    if require_operator_stats:
+        _validate_sparse_operator_stats(
+            system_dir,
+            system=system,
+            errors=errors,
+        )
+
+
 def _validate_synthetic_rows(
     rows: list[dict[str, Any]],
     *,
@@ -386,6 +490,14 @@ def validate_suite(
                         f"LongBench prefix caching is missing or enabled for {system}: "
                         f"{prefix_enabled!r}"
                     )
+                _validate_longbench_artifacts(
+                    system_dir,
+                    system=system,
+                    tasks=tasks,
+                    expected_count=expected_count,
+                    require_operator_stats=(expected_engine == "sparsevllm"),
+                    errors=errors,
+                )
             if provenance is not None and (
                 actual_engine != expected_engine or actual_method != expected_method
             ):

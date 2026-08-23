@@ -26,6 +26,7 @@ from benchmark.efficiency.metrics_calculator import (
 from benchmark.efficiency.validate_unified_suite import validate_suite
 from benchmark.efficiency.workload import build_request_trace, derive_trace_seed
 from benchmark.long_bench.pred_vllm import _effective_num_samples, build_chat_prompt
+from benchmark.long_bench.pred import _merge_worker_outputs
 from benchmark.long_bench.prompt_budget import encode_prompt_with_generation_budget
 
 
@@ -721,9 +722,25 @@ def _write_valid_suite_fixture(root: Path, systems: list[str]) -> None:
                 (system_dir / "result.json").write_text(
                     json.dumps({"status": "success"}) + "\n"
                 )
+                sample = {
+                    "dataset": "task",
+                    "sample_idx": 0,
+                    "source_idx": 0,
+                    "status": "success",
+                }
+                task_sample = {"status": "success", "source_idx": 0}
                 (system_dir / "task.jsonl").write_text(
-                    json.dumps({"status": "success", "source_idx": 0}) + "\n"
+                    json.dumps(task_sample) + "\n"
                 )
+                (system_dir / "run_status.json").write_text(
+                    json.dumps({"status": "success"}) + "\n"
+                )
+                for artifact in (
+                    "raw_outputs.jsonl",
+                    "parsed_outputs.jsonl",
+                    "sample_results.jsonl",
+                ):
+                    (system_dir / artifact).write_text(json.dumps(sample) + "\n")
                 resolved = {
                     "backend": engine,
                     "args": {
@@ -749,6 +766,27 @@ def _write_valid_suite_fixture(root: Path, systems: list[str]) -> None:
                 (system_dir / "resolved_config.json").write_text(
                     json.dumps(resolved) + "\n"
                 )
+                if engine == "sparsevllm":
+                    (system_dir / "operator_runtime_stats.json").write_text(
+                        json.dumps(
+                            {
+                                "status": "success",
+                                "world_ranks": [
+                                    {
+                                        "world_rank": 0,
+                                        "bindings": [
+                                            {
+                                                "operator_type": "test",
+                                                "selected_provider": "test_provider",
+                                            }
+                                        ],
+                                        "operators": {},
+                                    }
+                                ],
+                            }
+                        )
+                        + "\n"
+                    )
 
 
 def test_unified_suite_validator_rejects_any_failed_system(tmp_path):
@@ -761,6 +799,56 @@ def test_unified_suite_validator_rejects_any_failed_system(tmp_path):
 
     assert report["status"] == "failed"
     assert any("failed stage scenario_a_synthetic/vllm-vanilla" in error for error in report["errors"])
+
+
+def test_longbench_worker_outputs_merge_without_shared_append(tmp_path):
+    for rank, source_idx in ((0, 2), (1, 1)):
+        worker_dir = tmp_path / f".worker_rank{rank}"
+        worker_dir.mkdir()
+        task_row = {"status": "success", "source_idx": source_idx}
+        structured = {
+            "dataset": "task",
+            "sample_idx": source_idx,
+            "source_idx": source_idx,
+            "status": "success",
+        }
+        (worker_dir / "task.jsonl").write_text(json.dumps(task_row) + "\n")
+        for artifact in (
+            "raw_outputs.jsonl",
+            "parsed_outputs.jsonl",
+            "sample_results.jsonl",
+        ):
+            (worker_dir / artifact).write_text(json.dumps(structured) + "\n")
+
+    _merge_worker_outputs(
+        str(tmp_path),
+        datasets=["task"],
+        world_size=2,
+    )
+
+    for artifact in (
+        "task.jsonl",
+        "raw_outputs.jsonl",
+        "parsed_outputs.jsonl",
+        "sample_results.jsonl",
+    ):
+        rows = [json.loads(line) for line in (tmp_path / artifact).read_text().splitlines()]
+        assert [row["source_idx"] for row in rows] == [1, 2]
+
+
+def test_unified_suite_validator_requires_longbench_structured_artifacts(tmp_path):
+    systems = ["svllm-vanilla"]
+    _write_valid_suite_fixture(tmp_path, systems)
+    missing = (
+        tmp_path
+        / "scenario_b_longbench/svllm-vanilla/raw_outputs.jsonl"
+    )
+    missing.unlink()
+
+    report = validate_suite(tmp_path, systems, ["task"], 1)
+
+    assert report["status"] == "failed"
+    assert any("raw_outputs.jsonl" in error for error in report["errors"])
 
 
 def test_unified_suite_validator_requires_matched_source_ids(tmp_path):

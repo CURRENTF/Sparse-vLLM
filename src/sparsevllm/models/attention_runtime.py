@@ -102,6 +102,11 @@ def build_mha_prefill_attention_spec(
             and getattr(score_config, "sparse_prefill_score_mode", "probability")
             == "probability"
         ),
+        allow_softmax_lse_fallback=(
+            normalized_method == "h2o"
+            and getattr(score_config, "sparse_prefill_score_mode", "probability")
+            == "probability"
+        ),
     )
 
 
