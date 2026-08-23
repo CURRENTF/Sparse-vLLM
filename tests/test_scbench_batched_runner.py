@@ -18,13 +18,6 @@ class FakeTokenizer:
         return "".join(chr(int(token_id)) for token_id in token_ids)
 
 
-def test_scbench_quality_defaults_to_standard_context_length():
-    manifest = load_manifest()
-
-    assert manifest["scbench"]["max_seq_length"] == 131_072
-    assert runner.DEFAULT_MAX_SEQ_LENGTH == 131_072
-
-
 def test_cache_trace_accepts_hit_beyond_planned_session_prefix():
     accounting = runner.cache_reuse_accounting(
         cached_tokens=16,

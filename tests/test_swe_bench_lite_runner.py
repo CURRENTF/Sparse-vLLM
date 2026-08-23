@@ -255,14 +255,6 @@ class SweBenchLiteRunnerTest(unittest.TestCase):
                 with self.assertRaisesRegex(RunnerError, "docker-writable-layer"):
                     SweBenchLiteRunner(args)
 
-    def test_docker_writable_layer_guard_defaults_to_four_gib(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            args = build_parser().parse_args(
-                ["--stage", "summarize", "--run-dir", tmp]
-            )
-
-        self.assertEqual(args.docker_writable_layer_limit_gib, 4.0)
-
     def test_validate_predictions_rejects_missing_and_extra_ids(self):
         with self.assertRaisesRegex(RunnerError, "missing=.*b.*extra=.*c"):
             validate_predictions(

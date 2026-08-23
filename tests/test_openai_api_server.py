@@ -1865,36 +1865,6 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["data"][0]["max_model_len"], 128000)
         self.assertNotIn("reasoning", payload["data"][0])
 
-    def test_create_app_disables_periodic_throughput_logs_by_default(self):
-        from sparsevllm.entrypoints.openai import api_server
-
-        class Engine:
-            config = type("Config", (), {"vllm_sparse_method": ""})()
-
-            def __init__(self, _model, **kwargs):
-                self.kwargs = kwargs
-
-            def exit(self):
-                pass
-
-        with patch.object(api_server, "LLM", Engine):
-            app = api_server.create_app("/tmp/model", served_model_name="model")
-            try:
-                self.assertEqual(app.state.dispatcher.engine.kwargs["throughput_log_interval_s"], 0.0)
-            finally:
-                app.state.dispatcher.close()
-
-        with patch.object(api_server, "LLM", Engine):
-            app = api_server.create_app(
-                "/tmp/model",
-                {"throughput_log_interval_s": 5.0},
-                served_model_name="model",
-            )
-            try:
-                self.assertEqual(app.state.dispatcher.engine.kwargs["throughput_log_interval_s"], 5.0)
-            finally:
-                app.state.dispatcher.close()
-
     async def test_cancel_during_admission_aborts_after_seq_id_exists(self):
         from sparsevllm.entrypoints.openai.api_server import AsyncEngineDispatcher
 
@@ -3324,59 +3294,6 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(streamed_text, "回答训练")
         self.assertEqual(final["text"], "回答训练")
         self.assertNotIn("结束", streamed_text)
-
-    async def test_streaming_finish_log_includes_tps_metrics(self):
-        from sparsevllm.entrypoints.openai import api_server
-
-        queue = asyncio.Queue()
-        await queue.put(
-            {
-                "type": "token",
-                "index": 0,
-                "text": "x",
-                "token_ids": [1, 2],
-                "token_logprobs": [None, None],
-                "top_logprobs": [None, None],
-            }
-        )
-        await queue.put(
-            {
-                "type": "final",
-                "index": 0,
-                "text": "x",
-                "finish_reason": "stop",
-                "prompt_tokens": 3,
-                "completion_tokens": 2,
-                "token_ids": [1, 2],
-                "token_logprobs": [None, None],
-                "top_logprobs": [None, None],
-            }
-        )
-        handle = api_server.RequestHandle(output_queue=queue, cancelled=threading.Event())
-
-        class Dispatcher:
-            def cancel(self, _handle):
-                raise AssertionError("finished stream should not be cancelled")
-
-        with patch.object(api_server.logger, "info") as log_info:
-            chunks = [
-                chunk
-                async for chunk in api_server._completion_stream(
-                    Dispatcher(),
-                    "cmpl-test",
-                    123,
-                    "model",
-                    [handle],
-                    started=time.perf_counter() - 1.0,
-                )
-            ]
-
-        self.assertEqual(chunks[-1], "data: [DONE]\n\n")
-        messages = [call.args[0] for call in log_info.call_args_list]
-        self.assertIn(
-            "request_finish id={} model={} stream=true prompt_tokens={} completion_tokens={} total_tokens={} elapsed_s={:.3f} completion_tps={:.2f} total_tps={:.2f}",
-            messages,
-        )
 
     async def test_dispatcher_stop_buffers_partial_stop_prefix(self):
         from sparsevllm.entrypoints.openai.api_server import AsyncEngineDispatcher, _ActiveRequest

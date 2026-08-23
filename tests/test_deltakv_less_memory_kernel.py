@@ -1,4 +1,3 @@
-import inspect
 import os
 import unittest
 
@@ -28,10 +27,6 @@ from sparsevllm.kernels.triton.quant import (
     triton_quantize_and_pack_along_last_dim,
     unpack_quantized_to_16bit,
 )
-
-
-def test_materialize_sparse_view_has_no_heads_per_program_parameter():
-    assert "heads_per_program" not in inspect.signature(deltakv_materialize_sparse_view).parameters
 
 
 def test_full_layer_kivi_decode_map_validation_rejects_unmapped_valid_token():

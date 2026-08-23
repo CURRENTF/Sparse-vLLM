@@ -47,7 +47,6 @@ def test_gemma4_rmsnorm_cuda_graph_matches_torch():
 
 
 def test_gemma4_provider_requires_supported_cuda_profile():
-    spec = Gemma4OpSpec(torch.bfloat16, (256, 512), cuda_graph=True)
     caps = DeviceCaps(
         platform=PlatformEnum.CUDA,
         device_type="cuda",
@@ -56,11 +55,6 @@ def test_gemma4_provider_requires_supported_cuda_profile():
         supports_graph_capture=True,
         supports_triton=True,
     )
-    assert isinstance(
-        OpResolver(GEMMA4_REGISTRY).resolve(spec, caps).provider,
-        TritonGemma4OperatorProvider,
-    )
-
     with pytest.raises(RuntimeError, match="requires attention head dimensions"):
         OpResolver(GEMMA4_REGISTRY).resolve(
             Gemma4OpSpec(torch.bfloat16, (128,), cuda_graph=True), caps

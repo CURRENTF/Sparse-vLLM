@@ -17,13 +17,11 @@ from sparsevllm.operators.mla_attention import (
     MLA_ATTENTION_REGISTRY,
     MlaAttentionOpSpec,
     MlaSglFa3Provider,
-    MlaTileLangScoreProvider,
     MlaTritonProvider,
 )
 from sparsevllm.operators.registry import OpResolver
 from sparsevllm.platforms import DeviceCaps, PlatformEnum
 from sparsevllm.kernels.triton.mla import (
-    GLM_MLA_MAX_WORKSPACE_CONFIG,
     MlaDecodeWorkspace,
 )
 
@@ -97,175 +95,6 @@ def test_mla_attention_scale_uses_qk_head_dimension() -> None:
 
 
 @pytest.mark.parametrize(
-    ("device_name", "tp_size"),
-    [("NVIDIA H100 80GB HBM3", 4), ("NVIDIA H20", 1), ("NVIDIA H20", 2)],
-)
-def test_mla_resolver_selects_sm90_triton_provider(
-    device_name: str, tp_size: int
-) -> None:
-    spec = _spec(tp_size=tp_size)
-    workspace = _cpu_workspace(batch_size=8, head_count=spec.local_q_heads)
-
-    with (
-        patch(
-            "sparsevllm.operators.mla_attention.sgl_fa3_device_support",
-            return_value=(False, "sglang-kernel is not installed"),
-        ),
-        patch(
-            "sparsevllm.operators.mla_attention.allocate_mla_decode_workspace",
-            return_value=workspace,
-        ) as allocate,
-    ):
-        resolved = OpResolver(MLA_ATTENTION_REGISTRY).resolve(
-            spec,
-            _h100_caps(device_name=device_name),
-            op_spec=spec,
-            device="cpu",
-            max_batch_size=8,
-        )
-
-    assert isinstance(resolved.provider, MlaTritonProvider)
-    tilelang_reason = (
-        "score-capable Composite is not required by this operation"
-        if device_name == "NVIDIA H100 80GB HBM3"
-        else "requires H100-validated TileLang MLA schedules"
-    )
-    assert resolved.rejected == (
-        ("sgl_fa3_sm90", "sglang-kernel is not installed"),
-        (
-            "tilelang_score_sgl_fa3_h100",
-            tilelang_reason,
-        ),
-    )
-    allocate.assert_called_once_with(
-        batch_size=8,
-        head_count=spec.local_q_heads,
-        device=torch.device("cpu"),
-        config=GLM_MLA_MAX_WORKSPACE_CONFIG,
-    )
-
-
-@pytest.mark.parametrize(
-    ("device_name", "tp_size", "tilelang_reason"),
-    [
-        (
-            "NVIDIA H100 80GB HBM3",
-            4,
-            "score-capable Composite is not required by this operation",
-        ),
-        ("NVIDIA H20", 1, "requires H100-validated TileLang MLA schedules"),
-        ("NVIDIA H20", 2, "requires H100-validated TileLang MLA schedules"),
-    ],
-)
-def test_mla_resolver_prefers_sgl_fa3_on_supported_sm90(
-    device_name: str, tp_size: int, tilelang_reason: str
-) -> None:
-    spec = _spec(tp_size=tp_size)
-    workspace = _cpu_workspace(batch_size=8, head_count=spec.local_q_heads)
-
-    with (
-        patch(
-            "sparsevllm.operators.mla_attention.sgl_fa3_device_support",
-            return_value=(True, "validated test API"),
-        ),
-        patch(
-            "sparsevllm.operators.mla_attention.tilelang_mla_support",
-            return_value=(False, "tilelang unavailable"),
-        ),
-        patch(
-            "sparsevllm.operators.mla_attention.allocate_mla_decode_workspace",
-            return_value=workspace,
-        ),
-        patch("sparsevllm.operators.mla_attention.SglFa3DecodeKernel"),
-    ):
-        resolved = OpResolver(MLA_ATTENTION_REGISTRY).resolve(
-            spec,
-            _h100_caps(device_name=device_name),
-            op_spec=spec,
-            device="cpu",
-            max_batch_size=8,
-        )
-
-    assert type(resolved.provider) is MlaSglFa3Provider
-    assert resolved.rejected == (
-        (
-            "tilelang_score_sgl_fa3_h100",
-            tilelang_reason,
-        ),
-    )
-
-
-def test_mla_resolver_accepts_cuda_graph_after_capture_gate() -> None:
-    spec = _spec(cuda_graph=True, may_require_attention_scores=True)
-    workspace = _cpu_workspace(batch_size=8, head_count=spec.local_q_heads)
-
-    with (
-        patch(
-            "sparsevllm.operators.mla_attention.sgl_fa3_device_support",
-            return_value=(True, "validated test API"),
-        ),
-        patch(
-            "sparsevllm.operators.mla_attention.tilelang_mla_support",
-            return_value=(True, "validated test API"),
-        ),
-        patch(
-            "sparsevllm.operators.mla_attention.allocate_mla_decode_workspace",
-            return_value=workspace,
-        ),
-        patch("sparsevllm.operators.mla_attention.SglFa3DecodeKernel"),
-        patch("sparsevllm.operators.mla_attention.TileMlaDecodeKernel"),
-    ):
-        resolved = OpResolver(MLA_ATTENTION_REGISTRY).resolve(
-            spec,
-            _h100_caps(),
-            op_spec=spec,
-            device="cpu",
-            max_batch_size=8,
-        )
-
-    assert type(resolved.provider) is MlaTileLangScoreProvider
-    assert resolved.rejected == (
-        (
-            "sgl_fa3_sm90",
-            "does not satisfy the prepared score-output contract",
-        ),
-    )
-
-
-def test_vanilla_mla_binds_atomic_sgl_instead_of_score_composite() -> None:
-    spec = _spec(cuda_graph=True, may_require_attention_scores=False)
-    workspace = _cpu_workspace(batch_size=8, head_count=spec.local_q_heads)
-
-    with (
-        patch(
-            "sparsevllm.operators.mla_attention.sgl_fa3_device_support",
-            return_value=(True, "validated test API"),
-        ),
-        patch(
-            "sparsevllm.operators.mla_attention.tilelang_mla_support"
-        ) as tilelang_support,
-        patch(
-            "sparsevllm.operators.mla_attention.allocate_mla_decode_workspace",
-            return_value=workspace,
-        ),
-        patch("sparsevllm.operators.mla_attention.SglFa3DecodeKernel"),
-    ):
-        resolved = OpResolver(MLA_ATTENTION_REGISTRY).resolve(
-            spec,
-            _h100_caps(),
-            op_spec=spec,
-            device="cpu",
-            max_batch_size=8,
-        )
-
-    assert type(resolved.provider) is MlaSglFa3Provider
-    assert dict(resolved.report.provider_metadata.items)[
-        "implementation_kind"
-    ] == "atomic_provider"
-    tilelang_support.assert_not_called()
-
-
-@pytest.mark.parametrize(
     ("spec_overrides", "caps_overrides", "reason"),
     [
         ({}, {"platform": PlatformEnum.CPU}, "requires platform"),
@@ -293,49 +122,6 @@ def test_mla_resolver_rejects_unvalidated_contracts(
             _spec(**spec_overrides),
             _h100_caps(**caps_overrides),
         )
-
-
-def test_repo_triton_mla_keeps_its_validated_h20_tp_boundary() -> None:
-    result = MlaTritonProvider.supports(
-        _spec(tp_size=4),
-        _h100_caps(device_name="NVIDIA H20"),
-    )
-
-    assert not result.supported
-    assert "H20 MLA currently requires tensor parallel size 1 or 2" in result.reason
-
-
-@pytest.mark.parametrize(
-    ("device_name", "tp_size"),
-    [("NVIDIA H100 PCIe", 2), ("NVIDIA H20", 4)],
-)
-def test_mla_upstream_provider_is_not_narrowed_to_repo_validated_domain(
-    device_name: str,
-    tp_size: int,
-) -> None:
-    spec = _spec(tp_size=tp_size)
-    workspace = _cpu_workspace(batch_size=8, head_count=spec.local_q_heads)
-    with (
-        patch(
-            "sparsevllm.operators.mla_attention.sgl_fa3_device_support",
-            return_value=(True, "upstream-declared device support"),
-        ),
-        patch(
-            "sparsevllm.operators.mla_attention.allocate_mla_decode_workspace",
-            return_value=workspace,
-        ),
-        patch("sparsevllm.operators.mla_attention.SglFa3DecodeKernel"),
-    ):
-        resolved = OpResolver(MLA_ATTENTION_REGISTRY).resolve(
-            spec,
-            _h100_caps(device_name=device_name),
-            op_spec=spec,
-            device="cpu",
-            max_batch_size=8,
-        )
-
-    assert type(resolved.provider) is MlaSglFa3Provider
-    assert resolved.report.selection_basis == "upstream_default"
 
 
 def test_mla_provider_rejects_explicit_kv_before_kernel() -> None:

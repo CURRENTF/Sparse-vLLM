@@ -25,7 +25,6 @@ from sparsevllm.engine.sequence import Sequence
 from sparsevllm.engine.sparse_controller import SparseController
 from sparsevllm.method_registry import (
     PREFILL_POLICY_ALL_CHUNKED,
-    get_default_prefill_schedule_policy,
 )
 from sparsevllm.operators.mla_attention import MlaTileLangScoreProvider
 from sparsevllm.utils.context import reset_context, set_context
@@ -278,10 +277,6 @@ def test_h2o_decode_does_not_request_scores_or_run_eviction():
 
     controller.activation_controller.post_forward.assert_called_once_with([], False)
     controller._h2o_decode_eviction.assert_not_called()
-
-
-def test_h2o_registry_defaults_to_chunked_prefill():
-    assert get_default_prefill_schedule_policy("h2o") == PREFILL_POLICY_ALL_CHUNKED
 
 
 def test_h2o_cache_manager_factory_routes_first_class_method():

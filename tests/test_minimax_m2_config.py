@@ -5,13 +5,6 @@ import pytest
 import torch
 
 from sparsevllm.config import Config
-from sparsevllm.distributed import ParallelMode, ParallelTopology
-from sparsevllm.method_registry import (
-    MINIMAX_M2_EP_COMPATIBILITY,
-    MINIMAX_M2_TP_EP_COMPATIBILITY,
-    MODEL_RUNTIME_COMPATIBILITY,
-    validate_model_runtime_compatibility,
-)
 
 
 def _quantization_config(**overrides):
@@ -72,23 +65,6 @@ def _make_config(tmp_path, hf_config=None, **kwargs):
         return Config(model=str(tmp_path), **kwargs)
 
 
-@pytest.mark.parametrize("expert_parallel_size", [1, 2, 4, 8])
-def test_minimax_config_accepts_first_milestone_runtime(
-    tmp_path,
-    expert_parallel_size,
-):
-    config = _make_config(
-        tmp_path,
-        expert_parallel_size=expert_parallel_size,
-        enable_prefix_caching=True,
-        decode_cuda_graph=True,
-    )
-
-    assert config.hf_config.model_type == "minimax_m2"
-    assert config.quantization_config.model_name == "MiniMax M2.7"
-    assert config.quantization_config.weight_block_size == (128, 128)
-
-
 @pytest.mark.parametrize(
     ("field_name", "invalid_value"),
     [
@@ -105,30 +81,6 @@ def test_minimax_config_rejects_unsupported_semantics(
     hf_config = _official_config(**{field_name: invalid_value})
     with pytest.raises(ValueError, match=field_name):
         _make_config(tmp_path, hf_config=hf_config)
-
-
-@pytest.mark.parametrize(
-    ("field_name", "value"),
-    [
-        ("vocab_size", 200192),
-        ("hidden_size", 4096),
-        ("num_hidden_layers", 48),
-        ("rotary_dim", 128),
-        ("max_position_embeddings", 262144),
-        ("num_mtp_modules", 0),
-    ],
-)
-def test_minimax_config_accepts_checkpoint_shape_variants(
-    tmp_path,
-    field_name,
-    value,
-):
-    config = _make_config(
-        tmp_path,
-        hf_config=_official_config(**{field_name: value}),
-    )
-
-    assert getattr(config.hf_config, field_name) == value
 
 
 def test_minimax_config_requires_all_fp8_exclusions(tmp_path):
@@ -155,168 +107,3 @@ def test_minimax_config_rejects_unvalidated_parallel_layout(
 ):
     with pytest.raises(ValueError, match="MiniMax M2.7|Outer-TP MoE"):
         _make_config(tmp_path, **parallel_kwargs)
-
-
-@pytest.mark.parametrize(
-    ("tensor_parallel_size", "expert_parallel_size", "moe_tensor_parallel_size"),
-    [(2, 1, 2), (4, 1, 4), (4, 2, 2)],
-)
-def test_minimax_config_accepts_outer_tp_layout(
-    tmp_path,
-    tensor_parallel_size,
-    expert_parallel_size,
-    moe_tensor_parallel_size,
-):
-    config = _make_config(
-        tmp_path,
-        tensor_parallel_size=tensor_parallel_size,
-        expert_parallel_size=expert_parallel_size,
-        decode_cuda_graph=True,
-    )
-
-    assert config.uses_outer_tp_moe_layout
-    assert config.world_size == tensor_parallel_size
-    assert config.moe_tensor_parallel_size == moe_tensor_parallel_size
-
-
-def _validate(method="", **overrides):
-    values = {
-        "model_type": "minimax_m2",
-        "sparse_method": method,
-        "tensor_parallel_size": 1,
-        "expert_parallel_size": 4,
-        "data_parallel_size": 1,
-        "decode_cuda_graph": True,
-        "enable_prefix_caching": True,
-    }
-    values.update(overrides)
-    tp_size = values.pop("tensor_parallel_size")
-    ep_size = values.pop("expert_parallel_size")
-    dp_size = values.pop("data_parallel_size")
-    values["topology"] = ParallelTopology(
-        tp_size,
-        ep_size,
-        dp_size,
-        ParallelMode.OUTER_TP_MOE if tp_size > 1 else ParallelMode.STANDARD,
-    )
-    return validate_model_runtime_compatibility(**values)
-
-
-def test_minimax_compatibility_matches_qwen3_moe_sparse_runtime():
-    assert (
-        MODEL_RUNTIME_COMPATIBILITY["minimax_m2", ParallelMode.STANDARD]
-        is MINIMAX_M2_EP_COMPATIBILITY
-    )
-    assert MINIMAX_M2_EP_COMPATIBILITY.sparse_methods == {
-        "",
-        "streamingllm",
-        "snapkv",
-        "h2o",
-        "pyramidkv",
-        "omnikv",
-        "quest",
-        "rkv",
-    }
-    assert MINIMAX_M2_EP_COMPATIBILITY.prefix_cache_methods == {
-        "",
-        "omnikv",
-        "quest",
-    }
-    assert (
-        MINIMAX_M2_EP_COMPATIBILITY.decode_cuda_graph_methods
-        == MINIMAX_M2_EP_COMPATIBILITY.sparse_methods
-    )
-    assert _validate() is MINIMAX_M2_EP_COMPATIBILITY
-
-
-def test_minimax_outer_tp_compatibility_preserves_sparse_matrix():
-    assert (
-        MINIMAX_M2_TP_EP_COMPATIBILITY.sparse_methods
-        == MINIMAX_M2_EP_COMPATIBILITY.sparse_methods
-    )
-    assert (
-        _validate(
-            tensor_parallel_size=4,
-            expert_parallel_size=2,
-            decode_cuda_graph=True,
-        )
-        is MINIMAX_M2_TP_EP_COMPATIBILITY
-    )
-
-
-@pytest.mark.parametrize("method", sorted(MINIMAX_M2_EP_COMPATIBILITY.sparse_methods))
-def test_minimax_compatibility_accepts_non_deltakv_sparse_methods(method):
-    assert (
-        _validate(method, decode_cuda_graph=False, enable_prefix_caching=False)
-        is MINIMAX_M2_EP_COMPATIBILITY
-    )
-
-
-@pytest.mark.parametrize("method", ["", "omnikv", "quest"])
-def test_minimax_compatibility_accepts_prefix_cache_methods(method):
-    assert (
-        _validate(method, decode_cuda_graph=False, enable_prefix_caching=True)
-        is MINIMAX_M2_EP_COMPATIBILITY
-    )
-
-
-@pytest.mark.parametrize(
-    "method",
-    ["streamingllm", "snapkv", "h2o", "pyramidkv", "rkv"],
-)
-def test_minimax_compatibility_rejects_unvalidated_prefix_cache_methods(method):
-    with pytest.raises(ValueError, match="prefix caching is validated only"):
-        _validate(method, decode_cuda_graph=False, enable_prefix_caching=True)
-
-
-@pytest.mark.parametrize("method", ["deltakv", "skipkv"])
-def test_minimax_compatibility_rejects_out_of_scope_sparse_methods(method):
-    with pytest.raises(ValueError, match="validated methods"):
-        _validate(method, decode_cuda_graph=False, enable_prefix_caching=False)
-
-
-@pytest.mark.parametrize(
-    "method",
-    [
-        "streamingllm",
-        "snapkv",
-        "h2o",
-        "pyramidkv",
-        "omnikv",
-        "quest",
-        "rkv",
-    ],
-)
-def test_minimax_config_accepts_non_deltakv_sparse_methods(tmp_path, method):
-    config = _make_config(
-        tmp_path,
-        vllm_sparse_method=method,
-        decode_cuda_graph=False,
-        enable_prefix_caching=False,
-    )
-
-    assert config.vllm_sparse_method == method
-
-
-@pytest.mark.parametrize(
-    "method",
-    [
-        "streamingllm",
-        "snapkv",
-        "h2o",
-        "pyramidkv",
-        "omnikv",
-        "quest",
-        "rkv",
-    ],
-)
-def test_minimax_sparse_methods_accept_decode_cuda_graph(tmp_path, method):
-    config = _make_config(
-        tmp_path,
-        vllm_sparse_method=method,
-        decode_cuda_graph=True,
-        enable_prefix_caching=False,
-    )
-
-    assert config.decode_cuda_graph is True
-    assert config.vllm_sparse_method == method

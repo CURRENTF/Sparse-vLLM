@@ -15,7 +15,6 @@ from sparsevllm.engine.cache_manager import (
 )
 from sparsevllm.kernels.tilelang.mla.runtime import (
     TileMlaDecodeKernel,
-    select_tile_mla_config,
     tilelang_mla_support,
 )
 from sparsevllm.kernels.triton.mla import MlaDecodeWorkspace
@@ -148,87 +147,6 @@ def test_tilelang_support_rejects_unvalidated_tvm_ffi() -> None:
         supported, reason = tilelang_mla_support()
     assert not supported
     assert "apache-tvm-ffi==0.1.10" in reason
-
-
-@pytest.mark.parametrize(
-    (
-        "heads",
-        "batch",
-        "context",
-        "need_score",
-        "expected",
-    ),
-    [
-        (10, 1, 1024, True, (16, 16, "direct")),
-        (10, 8, 65536, True, (32, 16, "direct")),
-        (5, 32, 32768, True, (8, 16, "direct")),
-        (20, 1, 1024, True, (16, 16, "atomic")),
-        (20, 1, 4096, True, (32, 16, "atomic")),
-        (20, 1, 8192, True, (32, 16, "partial")),
-        (20, 8, 16384, True, (16, 32, "direct")),
-        (20, 32, 32768, True, (8, 32, "direct")),
-        (20, 64, 131072, False, (8, 32, "direct")),
-    ],
-)
-def test_tilelang_config_selection_is_static(
-    heads: int,
-    batch: int,
-    context: int,
-    need_score: bool,
-    expected: tuple[int, int, str],
-) -> None:
-    config = select_tile_mla_config(
-        batch_size=batch,
-        context_capacity=context,
-        need_score=need_score,
-        local_q_heads=heads,
-    )
-    assert (config.num_split, config.block_h, config.score_mode) == expected
-
-
-@pytest.mark.parametrize("tp_size", [1, 2, 4])
-def test_tilelang_provider_supports_all_glm_tp_sizes(tp_size: int) -> None:
-    with (
-        patch(
-            "sparsevllm.operators.mla_attention.sgl_fa3_device_support",
-            return_value=(True, "sgl test"),
-        ),
-        patch(
-            "sparsevllm.operators.mla_attention.tilelang_mla_support",
-            return_value=(True, "tilelang test"),
-        ),
-    ):
-        assert MlaTileLangScoreProvider.supports(
-            _spec(tp_size=tp_size), _h100_caps()
-        ).supported
-
-
-def test_resolver_prefers_tilelang_score_provider_for_tp2() -> None:
-    workspace = _cpu_workspace()
-    with (
-        patch(
-            "sparsevllm.operators.mla_attention.sgl_fa3_device_support",
-            return_value=(True, "sgl test"),
-        ),
-        patch(
-            "sparsevllm.operators.mla_attention.tilelang_mla_support",
-            return_value=(True, "tilelang test"),
-        ),
-        patch(
-            "sparsevllm.operators.mla_attention.allocate_mla_decode_workspace",
-            return_value=workspace,
-        ),
-        patch("sparsevllm.operators.mla_attention.SglFa3DecodeKernel"),
-        patch("sparsevllm.operators.mla_attention.TileMlaDecodeKernel"),
-    ):
-        resolved = OpResolver(MLA_ATTENTION_REGISTRY).resolve(
-            _spec(),
-            _h100_caps(),
-            op_spec=_spec(),
-            device="cpu",
-            max_batch_size=2,
-        )
-    assert type(resolved.provider) is MlaTileLangScoreProvider
 
 
 @pytest.mark.parametrize(("tp_size", "local_heads"), [(1, 20), (2, 10), (4, 5)])

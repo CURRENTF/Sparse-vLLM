@@ -19,7 +19,6 @@ from sparsevllm.operators.registry import (
     ProviderRole,
     SupportResult,
     SupportStatus,
-    log_operator_implementations,
     operator_binding_report,
     operator_binding_reports,
     operator_runtime_stats,
@@ -57,42 +56,6 @@ def test_support_result_has_typed_atomic_eligibility() -> None:
         SupportResult.dependency_broken("ABI mismatch").status
         is SupportStatus.DEPENDENCY_BROKEN
     )
-
-
-def test_default_portfolio_prefers_upstream_standard() -> None:
-    registry = OpRegistry(
-        "_test",
-        portfolio=PortfolioPolicy(
-            upstream_standard=("upstream",),
-            repo_portable=("portable",),
-        ),
-    )
-
-    @registry.register_atomic(ProviderRole.REPO_PORTABLE)
-    class Portable:
-        name = "portable"
-
-        @classmethod
-        def supports(cls, spec, caps):
-            return SupportResult.yes()
-
-    @registry.register_atomic(ProviderRole.UPSTREAM_STANDARD)
-    class Upstream:
-        name = "upstream"
-
-        @classmethod
-        def supports(cls, spec, caps):
-            return SupportResult.yes("upstream-declared support")
-
-    resolved = OpResolver(registry).resolve(_Spec(), _caps())
-
-    assert resolved.provider.name == "upstream"
-    assert resolved.report.selection_basis == "upstream_default"
-    assert resolved.report.as_dict()["validation_evidence"] == {
-        "contract": "adapter_equivalence",
-        "kernel_support": "upstream_declared",
-        "performance": "upstream_default",
-    }
 
 
 def test_profile_overlay_is_separate_from_atomic_portfolio() -> None:
@@ -573,31 +536,6 @@ def test_resolver_uses_atomic_bind_hook() -> None:
 
     assert resolved.provider.spec == _Spec()
     assert resolved.provider.marker == "ready"
-
-
-def test_operator_organization_logs_live_bound_implementations() -> None:
-    class Provider:
-        def __init__(self, implementation_name):
-            self.implementation_name = implementation_name
-
-    attention = Provider("triton")
-    linear = Provider("flashinfer_sm90")
-    linear_fallback = Provider("triton")
-
-    with (
-        patch.dict(operator_registry._OPERATOR_BINDINGS, {}, clear=True),
-        patch("sparsevllm.operators.registry.logger.info") as log_info,
-    ):
-        record_operator_binding("Attention", attention)
-        record_operator_binding("block-scaled FP8 Linear", linear)
-        record_operator_binding("block-scaled FP8 Linear", linear_fallback)
-        log_operator_implementations()
-
-    log_info.assert_called_once_with(
-        "Operator implementations:\n{}",
-        "  Attention: triton\n"
-        "  block-scaled FP8 Linear: flashinfer_sm90, triton",
-    )
 
 
 def test_operator_runtime_stats_aggregate_live_provider_kernel_paths() -> None:

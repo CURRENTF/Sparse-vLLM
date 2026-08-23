@@ -248,11 +248,7 @@ def test_qwen3_moe_shares_and_closes_full_attention_provider():
     full_attention.close.assert_called_once_with()
 
 
-@pytest.mark.parametrize(
-    "method",
-    ["snapkv", "h2o", "pyramidkv", "omnikv", "quest", "rkv", "deltakv"],
-)
-def test_qwen3_sparse_methods_use_resolved_prefill_provider(method):
+def test_qwen3_sparse_prefill_uses_resolved_provider():
     prepared = SimpleNamespace(name="prepared")
     with patch(
         "sparsevllm.models.attention_runtime.prepare_prefill_attention_op",
@@ -260,7 +256,7 @@ def test_qwen3_sparse_methods_use_resolved_prefill_provider(method):
     ) as prepare:
         actual = build_qwen3_prefill_attention_op(
             _config(),
-            engine_config=SimpleNamespace(vllm_sparse_method=method),
+            engine_config=SimpleNamespace(vllm_sparse_method="snapkv"),
             parallel_context=_tp_context(0, 1),
             device=torch.device("cuda", 0),
         )
@@ -398,7 +394,6 @@ def test_moe_block_uses_bound_router_provider():
         ),
     ):
         block = Qwen3MoeSparseMoeBlock(config)
-    assert block.gate.provider.name == "test_router"
     assert block.gate.op_spec.num_experts == config.num_experts
     assert block.gate.op_spec.top_k == config.num_experts_per_tok
     hidden_states = torch.randn(3, config.hidden_size)

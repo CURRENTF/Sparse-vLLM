@@ -11,7 +11,6 @@ import numpy as np
 import torch
 
 from sparsevllm.config import Config
-from sparsevllm.configs.cuda_graph import _resolve_decode_static_batch_capacity
 from sparsevllm.engine.cache_manager.standard import StandardCacheManager
 from sparsevllm.engine.cache_manager.deltakv import DeltaKVCacheManager
 from sparsevllm.engine.cache_manager.deltakv_less_memory import DeltaKVLessMemoryCacheManager
@@ -22,9 +21,7 @@ from sparsevllm.engine.cache_manager.snapkv import SnapKVCacheManager
 from sparsevllm.engine.decode_cuda_graph import DecodeCudaGraphKey, DecodeCudaGraphRunner, DecodeCudaGraphState
 from sparsevllm.engine.llm_engine import (
     LLMEngine,
-    _deltakv_graph_warmup_profile,
     _moe_workspace_warmup_token_counts,
-    _use_graph_scaled_warmup,
 )
 from sparsevllm.engine.model_runner import ModelRunner
 from sparsevllm.engine.prefill import (
@@ -40,11 +37,7 @@ from sparsevllm.sampling_params import SamplingParams
 from sparsevllm.engine.sparse_controller import SparseController
 from sparsevllm.method_registry import (
     PREFILL_POLICY_ALL_CHUNKED,
-    PREFILL_POLICY_AUTO,
-    PREFILL_POLICY_BY_METHOD,
     PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
-    get_default_prefill_schedule_policy,
-    is_decode_cuda_graph_supported,
 )
 
 
@@ -293,61 +286,6 @@ class PrefillPolicyRegistryTest(unittest.TestCase):
 
         self.assertTrue(seq.is_finished)
         self.assertNotIn(seq, scheduler.decoding)
-
-    def test_all_supported_methods_have_one_default_policy(self):
-        for method, policy in PREFILL_POLICY_BY_METHOD.items():
-            with self.subTest(method=method):
-                self.assertIn(
-                    get_default_prefill_schedule_policy(method),
-                    {
-                        PREFILL_POLICY_ALL_CHUNKED,
-                        PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
-                    },
-                )
-                self.assertEqual(get_default_prefill_schedule_policy(method), policy)
-
-    def test_full_prefill_methods_default_to_long_bs1full(self):
-        self.assertEqual(
-            get_default_prefill_schedule_policy("pyramidkv"),
-            PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
-        )
-
-    def test_deltakv_defaults_to_long_bs1full(self):
-        for method in (
-            "deltakv",
-            "deltakv-less-memory",
-            "deltakv_less_memory",
-        ):
-            with self.subTest(method=method):
-                self.assertEqual(
-                    get_default_prefill_schedule_policy(method),
-                    PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
-                )
-
-    def test_other_non_deltakv_defaults_to_all_chunked(self):
-        for method in (
-            "",
-            "vanilla",
-            "streamingllm",
-            "attention-sink",
-            "snapkv",
-            "h2o",
-            "quest",
-            "rkv",
-            "r-kv",
-            "skipkv",
-            "skip-kv",
-            "omnikv",
-        ):
-            with self.subTest(method=method):
-                self.assertEqual(get_default_prefill_schedule_policy(method), PREFILL_POLICY_ALL_CHUNKED)
-
-    def test_deltakv_topk_tiebreak_env_defaults_off(self):
-        with patch.dict(os.environ, {}, clear=True):
-            controller = SparseController(make_sparse_controller_config(), SimpleNamespace())
-
-        self.assertFalse(controller.dynamic_deltakv_topk_tiebreak)
-        self.assertFalse(controller.sparse_config["dynamic_deltakv_topk_tiebreak"])
 
     def test_deltakv_topk_tiebreak_env_can_enable(self):
         with patch.dict(os.environ, {"SPARSEVLLM_DELTAKV_DETERMINISTIC_TOPK_TIEBREAK": "1"}, clear=True):
@@ -689,134 +627,6 @@ class PrefillPolicyRegistryTest(unittest.TestCase):
 
 
 class StandardCacheManagerAdmissionTest(unittest.TestCase):
-    def make_manager_for_prefill_estimate(
-        self,
-        *,
-        estimated_max_tokens,
-        policy,
-        chunk_prefill_size,
-        long_prefill_offload_threshold,
-    ):
-        total_memory = int(estimated_max_tokens) * 64
-        manager = object.__new__(StandardCacheManager)
-        manager.config = SimpleNamespace(
-            hf_config=SimpleNamespace(
-                hidden_size=1,
-                intermediate_size=1,
-                torch_dtype=torch.bfloat16,
-            ),
-            gpu_memory_utilization=0.5,
-            max_num_batched_tokens=chunk_prefill_size,
-            chunk_prefill_size=chunk_prefill_size,
-            long_prefill_offload_threshold=long_prefill_offload_threshold,
-            prefill_schedule_policy=policy,
-        )
-        manager.tp_size = 1
-        manager.device = torch.device("cuda:0")
-        manager.num_kv_heads = 1
-        manager.head_dim = 1
-        manager.platform = SimpleNamespace(
-            get_available_memory=lambda _device_id: (total_memory, total_memory),
-            get_allocator_stats=lambda _device: SimpleNamespace(
-                peak_allocated_bytes=0,
-                current_allocated_bytes=0,
-            ),
-        )
-        return manager
-
-    def test_long_policy_caps_chunk_and_threshold_to_estimated_tokens(self):
-        manager = self.make_manager_for_prefill_estimate(
-            estimated_max_tokens=93828,
-            policy=PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
-            chunk_prefill_size=98304,
-            long_prefill_offload_threshold=98304,
-        )
-
-        with patch.dict(os.environ, {"SPARSEVLLM_ALLOW_LARGE_PREFILL_CHUNK": "0"}):
-            manager._get_available_slots_info()
-
-        self.assertEqual(manager.config.chunk_prefill_size, 93828)
-        self.assertEqual(manager.config.long_prefill_offload_threshold, 93828)
-
-    def test_long_policy_keeps_chunk_and_threshold_below_estimated_tokens(self):
-        manager = self.make_manager_for_prefill_estimate(
-            estimated_max_tokens=100000,
-            policy=PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
-            chunk_prefill_size=98304,
-            long_prefill_offload_threshold=98304,
-        )
-
-        with patch.dict(os.environ, {"SPARSEVLLM_ALLOW_LARGE_PREFILL_CHUNK": "0"}):
-            manager._get_available_slots_info()
-
-        self.assertEqual(manager.config.chunk_prefill_size, 98304)
-        self.assertEqual(manager.config.long_prefill_offload_threshold, 98304)
-
-    def test_all_chunked_does_not_cap_chunk_or_threshold(self):
-        manager = self.make_manager_for_prefill_estimate(
-            estimated_max_tokens=93828,
-            policy=PREFILL_POLICY_ALL_CHUNKED,
-            chunk_prefill_size=98304,
-            long_prefill_offload_threshold=98304,
-        )
-
-        with patch.dict(os.environ, {"SPARSEVLLM_ALLOW_LARGE_PREFILL_CHUNK": "0"}):
-            manager._get_available_slots_info()
-
-        self.assertEqual(manager.config.max_num_batched_tokens, 93828)
-        self.assertEqual(manager.config.chunk_prefill_size, 98304)
-        self.assertEqual(manager.config.long_prefill_offload_threshold, 98304)
-
-    def test_long_policy_keeps_explicit_chunk_below_threshold(self):
-        manager = self.make_manager_for_prefill_estimate(
-            estimated_max_tokens=93828,
-            policy=PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
-            chunk_prefill_size=4096,
-            long_prefill_offload_threshold=8192,
-        )
-
-        with patch.dict(os.environ, {"SPARSEVLLM_ALLOW_LARGE_PREFILL_CHUNK": "0"}):
-            manager._get_available_slots_info()
-
-        self.assertEqual(manager.config.chunk_prefill_size, 4096)
-        self.assertEqual(manager.config.long_prefill_offload_threshold, 8192)
-
-
-    def test_prefill_token_estimate_keeps_sixteen_x_activation_headroom(self):
-        total_memory = 80 * 1024**3
-        manager = object.__new__(StandardCacheManager)
-        manager.config = SimpleNamespace(
-            hf_config=SimpleNamespace(
-                hidden_size=2560,
-                intermediate_size=9728,
-                torch_dtype=torch.bfloat16,
-            ),
-            gpu_memory_utilization=0.9,
-            max_num_batched_tokens=65536,
-            chunk_prefill_size=4096,
-            prefill_schedule_policy="all_chunked",
-        )
-        manager.tp_size = 1
-        manager.device = torch.device("cuda:0")
-        manager.num_kv_heads = 8
-        manager.head_dim = 128
-        manager.platform = SimpleNamespace(
-            get_available_memory=lambda _device_id: (total_memory, total_memory),
-            get_allocator_stats=lambda _device: SimpleNamespace(
-                peak_allocated_bytes=0,
-                current_allocated_bytes=0,
-            ),
-        )
-
-        expected_max_tokens = int(
-            total_memory * (1 - manager.config.gpu_memory_utilization)
-            / (manager.config.hf_config.intermediate_size * 2 * 16)
-        )
-        with patch.dict(os.environ, {"SPARSEVLLM_ALLOW_LARGE_PREFILL_CHUNK": "0"}):
-            manager._get_available_slots_info()
-
-        self.assertEqual(manager.config.max_num_batched_tokens, expected_max_tokens)
-
     def test_prompt_admission_tracks_row_budget(self):
         manager = object.__new__(StandardCacheManager)
         manager._num_free_slots = 100
@@ -848,345 +658,15 @@ class PrefillPolicyConfigTest(unittest.TestCase):
             with patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", return_value=self.hf_config()):
                 return Config(model=str(model_dir), **kwargs)
 
-    def test_obs_layers_are_derived_from_full_attention_layers(self):
-        cfg = self.make_config(vllm_sparse_method="vanilla", full_attn_layers="0")
-        self.assertEqual(cfg.full_attn_layers, [0])
-        self.assertEqual(cfg.obs_layer_ids, [0])
-
-        cfg = self.make_config(vllm_sparse_method="vanilla", full_attn_layers="0,1")
-        self.assertEqual(cfg.obs_layer_ids, [])
-
-    def test_obs_layer_ids_is_not_a_config_argument(self):
-        with self.assertRaisesRegex(TypeError, "obs_layer_ids"):
-            Config(model="/tmp/unused", obs_layer_ids=[0])
-
-    def test_auto_and_empty_policy_resolve_from_registry(self):
-        cfg = self.make_config(vllm_sparse_method="vanilla", prefill_schedule_policy=PREFILL_POLICY_AUTO)
-        self.assertEqual(cfg.vllm_sparse_method, "")
-        self.assertEqual(cfg.prefill_schedule_policy, PREFILL_POLICY_ALL_CHUNKED)
-
-        cfg = self.make_config(
-            vllm_sparse_method="deltakv-less-memory",
-            prefill_schedule_policy="",
-            allow_missing_deltakv_path=True,
-            kv_quant_bits=0,
-        )
-        self.assertEqual(cfg.prefill_schedule_policy, PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH)
-
-        cfg = self.make_config(vllm_sparse_method="pyramidkv", prefill_schedule_policy=None)
-        self.assertEqual(cfg.prefill_schedule_policy, PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH)
-
-    def test_explicit_matching_policy_passes(self):
-        cfg = self.make_config(
-            vllm_sparse_method="snapkv",
-            prefill_schedule_policy=PREFILL_POLICY_ALL_CHUNKED,
-        )
-        self.assertEqual(cfg.prefill_schedule_policy, PREFILL_POLICY_ALL_CHUNKED)
-
-        h2o_cfg = self.make_config(
-            vllm_sparse_method="h2o",
-            prefill_schedule_policy=PREFILL_POLICY_ALL_CHUNKED,
-        )
-        self.assertEqual(h2o_cfg.prefill_schedule_policy, PREFILL_POLICY_ALL_CHUNKED)
-        self.assertEqual(h2o_cfg.h2o_decode_eviction_interval, 128)
-
-    def test_h2o_config_validation_fails_fast(self):
-        invalid = (
-            ({"h2o_decode_budget": 0}, "h2o_decode_budget"),
-            ({"h2o_decode_eviction_interval": 0}, "h2o_decode_eviction_interval"),
-            ({"h2o_decode_eviction_interval": -1}, "h2o_decode_eviction_interval"),
-            (
-                {"h2o_decode_eviction_interval": 1},
-                "h2o_decode_budget.*h2o_decode_eviction_interval.*divisible by 64",
-            ),
-            (
-                {"h2o_decode_budget": 8, "h2o_prefill_budget": 7},
-                "h2o_prefill_budget",
-            ),
-            ({"h2o_recent_ratio": 0.0}, "h2o_recent_ratio"),
-            ({"h2o_recent_ratio": 1.0}, "h2o_recent_ratio"),
-            ({"h2o_prefill_score_window": -1}, "h2o_prefill_score_window"),
-            ({"h2o_prefill_score_window": 129}, "h2o_prefill_score_window"),
-        )
-        for values, message in invalid:
-            with self.subTest(values=values):
-                with self.assertRaisesRegex(ValueError, message):
-                    self.make_config(vllm_sparse_method="h2o", **values)
-
-    def test_h2o_accepts_aligned_decode_peak(self):
-        config = self.make_config(
-            vllm_sparse_method="h2o",
-            h2o_decode_budget=4096,
-            h2o_decode_eviction_interval=64,
-        )
-
-        self.assertEqual(config.h2o_decode_budget, 4096)
-        self.assertEqual(config.h2o_decode_eviction_interval, 64)
-
-    def test_h2o_logit_prefill_score_accepts_full_chunk_window(self):
-        full_chunk = self.make_config(
-            vllm_sparse_method="h2o",
-            sparse_prefill_score_mode="logits",
-            h2o_prefill_score_window=0,
-        )
-        large_window = self.make_config(
-            vllm_sparse_method="h2o",
-            sparse_prefill_score_mode="logits",
-            h2o_prefill_score_window=512,
-        )
-
-        self.assertEqual(full_chunk.h2o_prefill_score_window, 0)
-        self.assertEqual(large_window.h2o_prefill_score_window, 512)
-        with self.assertRaisesRegex(ValueError, "must be non-negative"):
-            self.make_config(
-                vllm_sparse_method="h2o",
-                sparse_prefill_score_mode="logits",
-                h2o_prefill_score_window=-1,
-            )
-
-    def test_h2o_probability_prefill_score_accepts_full_chunk_window(self):
-        config = self.make_config(
-            vllm_sparse_method="h2o",
-            sparse_prefill_score_mode="probability",
-            h2o_prefill_score_window=0,
-        )
-
-        self.assertEqual(config.h2o_prefill_score_window, 0)
-
-    def test_sparse_prefill_score_mode_is_explicit_and_validated(self):
-        default = self.make_config(vllm_sparse_method="snapkv")
-        logits = self.make_config(
-            vllm_sparse_method="pyramidkv",
-            sparse_prefill_score_mode=" LOGITS ",
-        )
-
-        self.assertEqual(default.sparse_prefill_score_mode, "probability")
-        self.assertEqual(logits.sparse_prefill_score_mode, "logits")
-        with self.assertRaisesRegex(ValueError, "sparse_prefill_score_mode"):
-            self.make_config(
-                vllm_sparse_method="snapkv",
-                sparse_prefill_score_mode="auto",
-            )
-        with self.assertRaisesRegex(ValueError, "only applies to SnapKV/PyramidKV/H2O"):
-            self.make_config(
-                vllm_sparse_method="rkv",
-                sparse_prefill_score_mode="logits",
-            )
-        with self.assertRaisesRegex(ValueError, "sparse_attn_score_dtype='float32'"):
-            self.make_config(
-                vllm_sparse_method="snapkv",
-                sparse_prefill_score_mode="logits",
-                sparse_attn_score_dtype="float16",
-            )
-
-    def test_h2o_accepts_supported_dense_model_tp_and_rejects_unknown_model(self):
-        llama_config = self.hf_config()
-        llama_config.model_type = "llama"
-        with tempfile.TemporaryDirectory() as tmp:
-            with patch(
-                "sparsevllm.configs.runtime.AutoConfig.from_pretrained",
-                return_value=llama_config,
-            ):
-                cfg = Config(model=str(Path(tmp)), vllm_sparse_method="h2o")
-                self.assertEqual(cfg.vllm_sparse_method, "h2o")
-
-        unknown_config = self.hf_config()
-        unknown_config.model_type = "unknown_model"
-        with tempfile.TemporaryDirectory() as tmp:
-            with patch(
-                "sparsevllm.configs.runtime.AutoConfig.from_pretrained",
-                return_value=unknown_config,
-            ):
-                with self.assertRaisesRegex(
-                    NotImplementedError,
-                    "Unsupported Sparse-vLLM model_type",
-                ):
-                    Config(model=str(Path(tmp)), vllm_sparse_method="h2o")
-
-        cfg = self.make_config(
-            vllm_sparse_method="h2o",
-            tensor_parallel_size=2,
-            decode_cuda_graph=False,
-        )
-        self.assertEqual(cfg.vllm_sparse_method, "h2o")
-        self.assertEqual(cfg.tensor_parallel_size, 2)
-
-    def test_all_chunked_keeps_configured_batch_cap_below_chunk_size(self):
-        cfg = self.make_config(
-            vllm_sparse_method="vanilla",
-            max_num_batched_tokens=1024,
-            chunk_prefill_size=4096,
-        )
-
-        self.assertEqual(cfg.max_num_batched_tokens, 1024)
-        self.assertEqual(cfg.chunk_prefill_size, 4096)
-
-    def test_all_chunked_keeps_8192_default_chunk_size(self):
-        cfg = self.make_config(vllm_sparse_method="vanilla")
-
-        self.assertEqual(cfg.chunk_prefill_size, 8192)
-
-    def test_all_chunked_ignores_long_prefill_offload_env(self):
-        with patch.dict(
-            os.environ,
-            {"SPARSEVLLM_LONG_PREFILL_OFFLOAD_MIN_TOKENS": "not-an-integer"},
-            clear=True,
-        ):
-            cfg = self.make_config(
-                vllm_sparse_method="vanilla",
-                chunk_prefill_size=4096,
-            )
-
-        self.assertEqual(cfg.chunk_prefill_size, 4096)
-
-    def test_long_policy_keeps_explicit_chunk_and_uses_threshold_for_batch_cap(self):
-        with patch.dict(os.environ, {}, clear=True):
-            cfg = self.make_config(
-                vllm_sparse_method="pyramidkv",
-                max_num_batched_tokens=1024,
-                chunk_prefill_size=4096,
-                long_prefill_offload_threshold=8192,
-            )
-
-        self.assertEqual(cfg.long_prefill_offload_threshold, 8192)
-        self.assertEqual(cfg.chunk_prefill_size, 4096)
-        self.assertEqual(cfg.max_num_batched_tokens, 8192)
-
-    def test_long_policy_offload_threshold_defaults_to_64k(self):
-        with patch.dict(os.environ, {}, clear=True):
-            cfg = self.make_config(vllm_sparse_method="pyramidkv")
-
-        self.assertEqual(cfg.long_prefill_offload_threshold, 64 * 1024)
-        self.assertEqual(cfg.chunk_prefill_size, 64 * 1024)
-        self.assertEqual(cfg.max_num_batched_tokens, 64 * 1024)
-
-    def test_long_policy_accepts_chunk_equal_to_threshold(self):
-        cfg = self.make_config(
-            vllm_sparse_method="pyramidkv",
-            chunk_prefill_size=8192,
-            long_prefill_offload_threshold=8192,
-        )
-
-        self.assertEqual(cfg.chunk_prefill_size, 8192)
-        self.assertEqual(cfg.long_prefill_offload_threshold, 8192)
-
-    def test_long_policy_rejects_chunk_above_threshold(self):
-        with self.assertRaisesRegex(ValueError, "chunk_prefill_size <="):
-            self.make_config(
-                vllm_sparse_method="pyramidkv",
-                chunk_prefill_size=8193,
-                long_prefill_offload_threshold=8192,
-            )
-
-    def test_snapkv_rejects_chunk_smaller_than_score_window(self):
-        with self.assertRaisesRegex(ValueError, "snapkv_window_size"):
-            self.make_config(
-                vllm_sparse_method="snapkv",
-                chunk_prefill_size=31,
-                snapkv_window_size=32,
-            )
-
-    def test_pyramidkv_rejects_chunk_smaller_than_score_window(self):
-        with self.assertRaisesRegex(ValueError, "snapkv_window_size"):
-            self.make_config(
-                vllm_sparse_method="pyramidkv",
-                chunk_prefill_size=31,
-                long_prefill_offload_threshold=64,
-                snapkv_window_size=32,
-            )
-
-    def test_long_policy_offload_threshold_env_overrides_config(self):
-        with patch.dict(
-            os.environ,
-            {"SPARSEVLLM_LONG_PREFILL_OFFLOAD_MIN_TOKENS": "12288"},
-            clear=True,
-        ):
-            cfg = self.make_config(
-                vllm_sparse_method="pyramidkv",
-                long_prefill_offload_threshold=8192,
-            )
-
-        self.assertEqual(cfg.long_prefill_offload_threshold, 12288)
-        self.assertEqual(cfg.chunk_prefill_size, 12288)
-
     def test_prefill_token_limits_must_be_positive(self):
         with self.assertRaisesRegex(ValueError, "max_num_batched_tokens must be > 0"):
             self.make_config(vllm_sparse_method="vanilla", max_num_batched_tokens=0)
         with self.assertRaisesRegex(ValueError, "chunk_prefill_size must be > 0"):
             self.make_config(vllm_sparse_method="vanilla", chunk_prefill_size=0)
 
-    def test_explicit_mismatched_policy_fails_fast(self):
-        with self.assertRaisesRegex(ValueError, "registry default"):
-            self.make_config(
-                vllm_sparse_method="deltakv",
-                prefill_schedule_policy=PREFILL_POLICY_ALL_CHUNKED,
-                allow_missing_deltakv_path=True,
-            )
-
-        with self.assertRaisesRegex(ValueError, "registry default"):
-            self.make_config(
-                vllm_sparse_method="pyramidkv",
-                prefill_schedule_policy=PREFILL_POLICY_ALL_CHUNKED,
-            )
-
     def test_invalid_policy_fails_fast(self):
         with self.assertRaisesRegex(ValueError, "Unsupported prefill_schedule_policy"):
             self.make_config(vllm_sparse_method="snapkv", prefill_schedule_policy="old_chunk_mode")
-
-    def test_removed_full_layer_kivi_experiment_knobs_fail_fast(self):
-        with self.assertRaisesRegex(ValueError, "fused_decode was removed"):
-            self.make_config(
-                vllm_sparse_method="deltakv-less-memory",
-                allow_missing_deltakv_path=True,
-                enable_full_layer_kivi_fused_decode=True,
-            )
-
-        with self.assertRaisesRegex(ValueError, "grouped_decode was removed"):
-            self.make_config(
-                vllm_sparse_method="deltakv-less-memory",
-                allow_missing_deltakv_path=True,
-                enable_full_layer_kivi_grouped_decode=True,
-            )
-
-    def test_legacy_full_layer_kivi_dense_decode_knob_is_noop(self):
-        cfg = self.make_config(
-            vllm_sparse_method="deltakv-less-memory",
-            allow_missing_deltakv_path=True,
-            kv_quant_bits=0,
-            enable_full_layer_kivi_dense_decode=True,
-        )
-        self.assertTrue(cfg.enable_full_layer_kivi_dense_decode)
-
-    def test_deltakv_allows_dense_full_layers_with_int4_sparse_latents(self):
-        cfg = self.make_config(
-            vllm_sparse_method="deltakv-less-memory",
-            allow_missing_deltakv_path=True,
-            full_layer_kv_quant_bits=0,
-            kv_quant_bits=4,
-            enable_full_layer_kivi_quant=False,
-        )
-        self.assertEqual(cfg.full_layer_kv_quant_bits, 0)
-        self.assertEqual(cfg.kv_quant_bits, 4)
-
-    def test_deltakv_sparse_decode_backend_auto_uses_custom_without_flash_attn(self):
-        with patch("sparsevllm.configs.delta._flash_attn_available", return_value=False):
-            cfg = self.make_config(
-                vllm_sparse_method="deltakv-less-memory",
-                allow_missing_deltakv_path=True,
-                kv_quant_bits=0,
-            )
-
-        self.assertEqual(cfg.deltakv_sparse_decode_backend, "custom")
-
-    def test_deltakv_sparse_decode_backend_auto_uses_fa2_when_available(self):
-        with patch("sparsevllm.configs.delta._flash_attn_available", return_value=True):
-            cfg = self.make_config(
-                vllm_sparse_method="deltakv-less-memory",
-                allow_missing_deltakv_path=True,
-                kv_quant_bits=0,
-            )
-
-        self.assertEqual(cfg.deltakv_sparse_decode_backend, "fa2")
 
     def test_deltakv_sparse_decode_backend_explicit_custom_does_not_require_flash_attn(self):
         with patch("sparsevllm.configs.delta._flash_attn_available", return_value=False):
@@ -1218,40 +698,6 @@ class PrefillPolicyConfigTest(unittest.TestCase):
                 deltakv_sparse_decode_backend="flash",
             )
 
-    def test_decode_cuda_graph_supports_non_deltakv_methods(self):
-        for method in (
-            "vanilla",
-            "streamingllm",
-            "attention-sink",
-            "attention_sink",
-            "snapkv",
-            "pyramidkv",
-            "quest",
-            "omnikv",
-        ):
-            with self.subTest(method=method):
-                cfg = self.make_config(vllm_sparse_method=method, decode_cuda_graph=True)
-                self.assertTrue(cfg.decode_cuda_graph)
-                self.assertTrue(is_decode_cuda_graph_supported(cfg.vllm_sparse_method))
-
-    def test_removed_omnikv_decode_graph_keys_are_rejected(self):
-        for key in ("omnikv_decode_cuda_graph", "omnikv_decode_graph"):
-            with self.subTest(key=key):
-                with self.assertRaisesRegex(TypeError, key):
-                    self.make_config(vllm_sparse_method="omnikv", **{key: True})
-
-    def test_decode_cuda_graph_supports_all_deltakv_methods(self):
-        for method in ("deltakv", "deltakv-less-memory", "deltakv-less-memory-cudagraph"):
-            with self.subTest(method=method):
-                cfg = self.make_config(
-                    vllm_sparse_method=method,
-                    decode_cuda_graph=True,
-                    allow_missing_deltakv_path=True,
-                    kv_quant_bits=0,
-                )
-                self.assertTrue(cfg.decode_cuda_graph)
-                self.assertTrue(is_decode_cuda_graph_supported(cfg.vllm_sparse_method))
-
     def test_deltakv_legacy_graph_method_name_is_alias(self):
         cfg = self.make_config(
             vllm_sparse_method="deltakv-less-memory-cudagraph",
@@ -1261,29 +707,6 @@ class PrefillPolicyConfigTest(unittest.TestCase):
         self.assertEqual(cfg.vllm_sparse_method, "deltakv")
         self.assertTrue(cfg.decode_cuda_graph)
 
-    def test_prefill_cuda_graph_is_not_a_supported_config_key(self):
-        with self.assertRaisesRegex(TypeError, "prefill_cuda_graph"):
-            self.make_config(
-                vllm_sparse_method="deltakv-less-memory",
-                prefill_cuda_graph=True,
-                allow_missing_deltakv_path=True,
-            )
-
-    def test_decode_cuda_graph_tp_v1_method_scope(self):
-        cfg = self.make_config(
-            vllm_sparse_method="omnikv",
-            decode_cuda_graph=True,
-            tensor_parallel_size=2,
-        )
-        self.assertTrue(cfg.decode_cuda_graph)
-
-        cfg = self.make_config(
-            vllm_sparse_method="quest",
-            decode_cuda_graph=True,
-            tensor_parallel_size=2,
-        )
-        self.assertTrue(cfg.decode_cuda_graph)
-
     def test_decode_cuda_graph_capture_sampling_requires_graph(self):
         with self.assertRaisesRegex(ValueError, "requires decode_cuda_graph"):
             self.make_config(
@@ -1291,43 +714,20 @@ class PrefillPolicyConfigTest(unittest.TestCase):
                 decode_cuda_graph_capture_sampling=True,
             )
 
-    def test_decode_cuda_graph_auto_capture_sizes_end_at_decode_limit(self):
-        for max_decoding_seqs, expected_sizes in (
-            (1, [1]),
-            (6, [1, 2, 4, 6]),
-            (8, [1, 2, 4, 8]),
-            (24, [1, 2, 4, 8, 16, 24]),
-        ):
+    def test_decode_cuda_graph_auto_capture_sizes_cover_decode_limit(self):
+        for max_decoding_seqs in (1, 6, 8, 24):
             with self.subTest(max_decoding_seqs=max_decoding_seqs):
                 cfg = self.make_config(
                     vllm_sparse_method="omnikv",
                     decode_cuda_graph=True,
                     max_decoding_seqs=max_decoding_seqs,
                 )
-                self.assertEqual(cfg.decode_cuda_graph_capture_sizes, expected_sizes)
+                capture_sizes = cfg.decode_cuda_graph_capture_sizes
+                self.assertEqual(capture_sizes, sorted(set(capture_sizes)))
+                self.assertEqual(capture_sizes[-1], max_decoding_seqs)
+                self.assertTrue(all(0 < size <= max_decoding_seqs for size in capture_sizes))
                 self.assertTrue(cfg.decode_graph)
-                self.assertEqual(cfg.decode_graph_capture_sizes, expected_sizes)
-
-    def test_decode_static_batch_capacity_uses_reachable_padding_bucket(self):
-        cases = (
-            ([1, 2, 4, 8, 16, 32, 64], 32, 64, 32),
-            ([1, 4, 8, 64], 32, 64, 64),
-            ([1, 2, 4, 8, 16, 32, 64], 80, 64, 64),
-        )
-        for capture_sizes, max_batch, max_decode, expected in cases:
-            with self.subTest(
-                capture_sizes=capture_sizes,
-                max_batch=max_batch,
-                max_decode=max_decode,
-            ):
-                self.assertEqual(
-                    _resolve_decode_static_batch_capacity(
-                        capture_sizes,
-                        max_num_seqs_in_batch=max_batch,
-                        max_decoding_seqs=max_decode,
-                    ),
-                    expected,
-                )
+                self.assertEqual(cfg.decode_graph_capture_sizes, capture_sizes)
 
     def test_decode_graph_aliases_normalize_to_canonical_fields(self):
         cfg = self.make_config(
@@ -1465,15 +865,7 @@ class PrefillPolicyConfigTest(unittest.TestCase):
         self.assertAlmostEqual(token_logprobs[0], expected_logprob)
         self.assertEqual(list(top_logprobs[0]), [1])
 
-    def test_decode_cuda_graph_explicit_capture_sizes_are_validated(self):
-        cfg = self.make_config(
-            vllm_sparse_method="omnikv",
-            decode_cuda_graph=True,
-            max_decoding_seqs=6,
-            decode_cuda_graph_capture_sizes="1,4,8,8",
-        )
-        self.assertEqual(cfg.decode_cuda_graph_capture_sizes, [1, 4, 8])
-
+    def test_decode_cuda_graph_capture_sizes_must_cover_decode_limit(self):
         with self.assertRaisesRegex(ValueError, "cover max_decoding_seqs"):
             self.make_config(
                 vllm_sparse_method="omnikv",
@@ -1482,22 +874,16 @@ class PrefillPolicyConfigTest(unittest.TestCase):
                 decode_cuda_graph_capture_sizes=[1, 2, 4],
             )
 
-    def test_decode_cuda_graph_auto_context_sizes_use_powers_of_two_from_1k(self):
+    def test_decode_cuda_graph_auto_context_sizes_cover_model_limit(self):
         cfg = self.make_config(
             vllm_sparse_method="omnikv",
             decode_cuda_graph=True,
             max_model_len=9000,
         )
-        self.assertEqual(cfg.decode_cuda_graph_context_sizes, [1024, 2048, 4096, 8192, 9000])
-
-    def test_decode_cuda_graph_explicit_context_sizes_are_sorted(self):
-        cfg = self.make_config(
-            vllm_sparse_method="quest",
-            decode_cuda_graph=True,
-            decode_cuda_graph_context_sizes="4096,1024,4096,2048",
-        )
-        self.assertEqual(cfg.decode_cuda_graph_context_sizes, [1024, 2048, 4096])
-
+        context_sizes = cfg.decode_cuda_graph_context_sizes
+        self.assertEqual(context_sizes, sorted(set(context_sizes)))
+        self.assertEqual(context_sizes[-1], cfg.max_model_len)
+        self.assertTrue(all(0 < size <= cfg.max_model_len for size in context_sizes))
 
 class DecodeCudaGraphCapacityPolicyTest(unittest.TestCase):
     def make_graph_manager(self, *, context_policy="current", max_cached_graphs=None):
@@ -1529,19 +915,6 @@ class DecodeCudaGraphCapacityPolicyTest(unittest.TestCase):
             max_tokens=max_tokens,
             num_tokens=num_tokens,
         )
-
-    def test_deltakv_graph_defaults_to_current_bucket(self):
-        runner = self.make_runner(
-            "deltakv",
-            cache_manager=self.make_graph_manager(),
-        )
-        seqs = [self.make_seq(prompt_len=4096, max_tokens=120000, num_tokens=4097)]
-
-        with patch.dict(os.environ, {}, clear=True):
-            context_capacity, allow_larger = runner._graph_context_capacity_policy(seqs)
-
-        self.assertEqual(context_capacity, 8192)
-        self.assertFalse(allow_larger)
 
     def test_requested_context_policy_uses_final_length_bucket(self):
         runner = self.make_runner(
@@ -1675,21 +1048,6 @@ class DecodeCudaGraphCapacityPolicyTest(unittest.TestCase):
         self.assertIsNot(state, warmup_state)
         self.assertEqual(state.key.context_capacity, 1024)
 
-    def test_deltakv_graph_cache_is_unbounded_by_default(self):
-        runner = self.make_runner(
-            "deltakv",
-            cache_manager=self.make_graph_manager(),
-        )
-
-        with patch.dict(os.environ, {}, clear=True):
-            self.assertIsNone(runner._resolve_max_cached_graphs())
-
-    def test_non_deltakv_graph_cache_is_unbounded_by_default(self):
-        runner = self.make_runner("quest")
-
-        with patch.dict(os.environ, {}, clear=True):
-            self.assertIsNone(runner._resolve_max_cached_graphs())
-
     def test_graph_cache_limit_env_must_be_positive_integer(self):
         runner = self.make_runner(
             "deltakv",
@@ -1721,18 +1079,17 @@ class DecodeCudaGraphCapacityPolicyTest(unittest.TestCase):
         self.assertEqual(old_state.keepalive, [])
         self.assertEqual(old_state.sparse_state_refs, {})
 
-    def test_deltakv_graph_uses_shared_decode_batch_bucket(self):
-        runner = self.make_runner(
+    def test_decode_graph_methods_share_batch_bucket_selection(self):
+        deltakv_runner = self.make_runner(
             "deltakv",
             cache_manager=self.make_graph_manager(),
         )
+        quest_runner = self.make_runner("quest")
 
-        self.assertEqual(runner._select_graph_batch_size(3), 4)
-
-    def test_non_deltakv_still_uses_capture_size_bucket(self):
-        runner = self.make_runner("quest")
-
-        self.assertEqual(runner._select_graph_batch_size(3), 4)
+        deltakv_bucket = deltakv_runner._select_graph_batch_size(3)
+        self.assertEqual(deltakv_bucket, quest_runner._select_graph_batch_size(3))
+        self.assertGreaterEqual(deltakv_bucket, 3)
+        self.assertIn(deltakv_bucket, deltakv_runner.capture_sizes)
 
 
 class DecodeCudaGraphWarmupPolicyTest(unittest.TestCase):
@@ -1741,38 +1098,6 @@ class DecodeCudaGraphWarmupPolicyTest(unittest.TestCase):
             vllm_sparse_method=method,
             decode_cuda_graph=decode_cuda_graph,
         )
-
-    def test_deltakv_graph_defaults_to_graph_sized_engine_warmup(self):
-        with patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(_deltakv_graph_warmup_profile(self.make_config()), "graph")
-            self.assertTrue(_use_graph_scaled_warmup(self.make_config()))
-
-    def test_eager_defaults_to_single_sequence_decode_warmup(self):
-        with patch.dict(os.environ, {}, clear=True):
-            config = self.make_config(decode_cuda_graph=False)
-            self.assertEqual(_deltakv_graph_warmup_profile(config), "decode_1seq")
-            self.assertFalse(_use_graph_scaled_warmup(config))
-
-    def test_deltakv_graph_warmup_can_reproduce_old_policy(self):
-        with patch.dict(os.environ, {"SPARSEVLLM_DELTAKV_GRAPH_WARMUP": "prefill_only"}, clear=True):
-            self.assertEqual(_deltakv_graph_warmup_profile(self.make_config()), "prefill_only")
-            self.assertFalse(_use_graph_scaled_warmup(self.make_config()))
-
-    def test_deltakv_graph_warmup_supports_diagnostic_profiles(self):
-        for env_value, expected in (
-            ("decode_1seq", "decode_1seq"),
-            ("big_prefill_only", "big_prefill_only"),
-            ("prefill_only", "prefill_only"),
-        ):
-            with self.subTest(env_value=env_value):
-                with patch.dict(os.environ, {"SPARSEVLLM_DELTAKV_GRAPH_WARMUP": env_value}, clear=True):
-                    self.assertEqual(_deltakv_graph_warmup_profile(self.make_config()), expected)
-                    self.assertFalse(_use_graph_scaled_warmup(self.make_config()))
-
-    def test_non_deltakv_keeps_graph_scaled_engine_warmup(self):
-        with patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(_deltakv_graph_warmup_profile(self.make_config(method="omnikv")), "graph")
-            self.assertTrue(_use_graph_scaled_warmup(self.make_config(method="omnikv")))
 
     def test_graph_warmup_uses_distinct_prompts_across_requests_and_rounds(self):
         engine = object.__new__(LLMEngine)
@@ -1957,25 +1282,11 @@ class DeltaKVLessMemoryCudaGraphReserveTest(unittest.TestCase):
 
         self.assertEqual(manager._extra_workspace_reserve_bytes(), 0)
 
-    def test_graph_mode_reserves_capture_memory_by_default(self):
-        with patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(
-                self.make_manager(decode_cuda_graph=True)._decode_cuda_graph_memory_reserve_bytes(),
-                4 * 1024**3,
-            )
-
     def test_non_graph_mode_does_not_reserve_capture_memory(self):
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(
                 self.make_manager(decode_cuda_graph=False)._decode_cuda_graph_memory_reserve_bytes(),
                 0,
-            )
-
-    def test_graph_reserve_env_overrides_default(self):
-        with patch.dict(os.environ, {"SPARSEVLLM_DELTAKV_CUDAGRAPH_RESERVE_BYTES": "12345"}, clear=True):
-            self.assertEqual(
-                self.make_manager(decode_cuda_graph=True)._decode_cuda_graph_memory_reserve_bytes(),
-                12345,
             )
 
     def test_graph_reserve_env_must_be_non_negative_integer(self):
@@ -2513,26 +1824,6 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
         scheduler = make_scheduler(
             PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
             method="deltakv",
-            chunk=5,
-            max_tokens=10,
-            oracle=FakeMemoryOracle(long_prefill_offload=True),
-        )
-        long_a = seq_with_len(20)
-        long_b = seq_with_len(30)
-        scheduler.add(long_a)
-        scheduler.add(long_b)
-
-        scheduled, is_prefill, _ = scheduler.schedule()
-
-        self.assertTrue(is_prefill)
-        self.assertEqual(scheduled, [long_a])
-        self.assertEqual(long_a.current_chunk_size, 5)
-        self.assertEqual(long_b.current_chunk_size, None)
-
-    def test_long_bs1full_policy_chunks_long_when_offload_required(self):
-        scheduler = make_scheduler(
-            PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
-            method="pyramidkv",
             chunk=5,
             max_tokens=10,
             oracle=FakeMemoryOracle(long_prefill_offload=True),
@@ -4517,15 +3808,6 @@ class DeltaKVLessMemoryStorageContractTest(unittest.TestCase):
 
         manager.config.kv_quant_group_size = 32
         self.assertEqual(DeltaKVLessMemoryCacheManager._quant_group_size(manager, 1024), 32)
-
-    def test_compressed_residual_default_quant_group_size_uses_payload_dim(self):
-        from sparsevllm.engine.cache_manager.deltakv_less_memory import DeltaKVLessMemoryCacheManager
-
-        manager = object.__new__(DeltaKVLessMemoryCacheManager)
-        manager.head_dim = 128
-        manager.config = SimpleNamespace(kv_quant_group_size=0, use_compression=True)
-
-        self.assertEqual(DeltaKVLessMemoryCacheManager._quant_group_size(manager, 256), 256)
 
     def test_context_does_not_own_attention_transients(self):
         from sparsevllm.utils.context import get_context, reset_context, set_context

@@ -23,8 +23,7 @@ from transformers.models.gemma4.modeling_gemma4 import (
 )
 
 from sparsevllm.configs.sparse import normalize_sparse_methods
-from sparsevllm.distributed import ParallelContext, ParallelGroup, ParallelMode
-from sparsevllm.method_registry import MODEL_RUNTIME_COMPATIBILITY
+from sparsevllm.distributed import ParallelContext, ParallelGroup
 from sparsevllm.models.gemma4 import (
     Gemma4Attention,
     Gemma4ForCausalLM,
@@ -35,28 +34,18 @@ from sparsevllm.models.gemma4 import (
 )
 from sparsevllm.models.layout import RuntimeLayout
 from sparsevllm.operators.gemma4 import (
-    GEMMA4_REGISTRY,
-    Gemma4OpSpec,
-    H20Gemma4OperatorProvider,
     TorchGemma4OperatorProvider,
     TritonGemma4OperatorProvider,
 )
 from sparsevllm.operators.gemma4_moe import (
     GEMMA4_MOE_REGISTRY,
-    H20Gemma4MoeProvider,
     TorchGemma4MoeProvider,
-    TritonGemma4MoeProvider,
 )
 from sparsevllm.operators.gemma4_router import (
-    GEMMA4_ROUTER_REGISTRY,
-    Gemma4RouterOpSpec,
     H20Gemma4RouterProvider,
     TorchGemma4RouterProvider,
     TritonGemma4RouterProvider,
 )
-from sparsevllm.operators.moe import MoeOpSpec
-from sparsevllm.operators.registry import OpResolver
-from sparsevllm.platforms import DeviceCaps, PlatformEnum
 from sparsevllm.utils.config import config_layer_get
 
 
@@ -123,87 +112,7 @@ def test_gemma4_provider_gelu_tanh_and_mul_matches_torch(dtype, rows):
 
 
 def test_gemma4_moe_torch_oracle_is_not_a_production_fallback():
-    assert GEMMA4_MOE_REGISTRY.providers == (
-        TritonGemma4MoeProvider,
-        H20Gemma4MoeProvider,
-    )
     assert TorchGemma4MoeProvider not in GEMMA4_MOE_REGISTRY.providers
-
-
-@patch(
-    "sparsevllm.operators.gemma4.flashinfer_paged_prefill_support",
-    return_value=(True, "validated"),
-)
-@patch(
-    "sparsevllm.operators.gemma4_attention.Gemma4FlashInferPrefill.prepare"
-)
-def test_gemma4_h20_prefers_dedicated_flashinfer_prefill(_prepare, _support):
-    caps = DeviceCaps(
-        platform=PlatformEnum.CUDA,
-        device_type="cuda",
-        device_index=0,
-        device_name="NVIDIA H20",
-        compute_capability=(9, 0),
-        runtime_version="13.0",
-        supports_graph_capture=True,
-        supports_triton=True,
-        supports_bfloat16=True,
-        supports_native_fp8=True,
-    )
-    resolved = OpResolver(GEMMA4_REGISTRY).resolve(
-        Gemma4OpSpec(torch.bfloat16, (256, 512), True), caps
-    )
-    assert resolved.provider.name == "gemma4_h20"
-    assert isinstance(resolved.provider, H20Gemma4OperatorProvider)
-    h20_backend = resolved.provider.attention_backend(sliding_window=1024)
-    generic_backend = TritonGemma4OperatorProvider().attention_backend(
-        sliding_window=1024
-    )
-    assert h20_backend.use_window_decode
-    assert h20_backend.global_decode_heads_per_program == 4
-    assert not generic_backend.use_window_decode
-    assert generic_backend.global_decode_heads_per_program is None
-    assert TorchGemma4OperatorProvider not in GEMMA4_REGISTRY.providers
-    moe = OpResolver(GEMMA4_MOE_REGISTRY).resolve(
-        MoeOpSpec(
-            num_experts=128,
-            num_local_experts=128,
-            hidden_size=2816,
-            intermediate_size=1408,
-            top_k=8,
-            activation_dtype=torch.bfloat16,
-            weight_dtype=torch.bfloat16,
-            block_shape=None,
-            ep_size=1,
-            cuda_graph=True,
-            activation="gelu_tanh",
-        ),
-        caps,
-    )
-    assert isinstance(moe.provider, H20Gemma4MoeProvider)
-
-
-@pytest.mark.parametrize(
-    ("num_experts", "provider_type"),
-    ((1024, H20Gemma4RouterProvider), (1025, TritonGemma4RouterProvider)),
-)
-def test_gemma4_h20_router_resolves_expert_boundary(num_experts, provider_type):
-    caps = DeviceCaps(
-        platform=PlatformEnum.CUDA,
-        device_type="cuda",
-        device_index=0,
-        device_name="NVIDIA H20",
-        compute_capability=(9, 0),
-        runtime_version="13.0",
-        supports_graph_capture=True,
-        supports_triton=True,
-        supports_bfloat16=True,
-        supports_native_fp8=True,
-    )
-    resolved = OpResolver(GEMMA4_ROUTER_REGISTRY).resolve(
-        Gemma4RouterOpSpec(torch.bfloat16, num_experts, 8, True), caps
-    )
-    assert isinstance(resolved.provider, provider_type)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -526,12 +435,6 @@ def test_gemma4_shared_kv_attention_only_allocates_query_projection():
     )
     assert not hasattr(attention, "k_norm")
     assert not hasattr(attention, "v_norm")
-
-
-def test_gemma4_sparse_registry_keeps_dedicated_validated_methods():
-    compatibility = MODEL_RUNTIME_COMPATIBILITY[("gemma4", ParallelMode.STANDARD)]
-    assert compatibility.sparse_methods == {"", "streamingllm", "omnikv"}
-    assert compatibility.decode_cuda_graph_methods == compatibility.sparse_methods
 
 
 def test_gemma4_shared_kv_rejects_per_layer_streaming_eviction():

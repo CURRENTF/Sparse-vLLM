@@ -141,19 +141,6 @@ def test_load_model_rejects_non_positive_thread_count(tmp_path):
         loader.load_model(_TwoShardModel(), str(tmp_path), num_threads=0)
 
 
-def test_load_model_can_disable_progress(tmp_path, capsys):
-    _write_two_shards(tmp_path)
-
-    loader.load_model(
-        _TwoShardModel(),
-        str(tmp_path),
-        num_threads=2,
-        show_progress=False,
-    )
-
-    assert "loading shards" not in capsys.readouterr().err.lower()
-
-
 def test_load_model_restores_checkpoint_buffers(tmp_path):
     save_file(
         {"weight": torch.ones(2), "clip_max": torch.tensor(3.5)},
@@ -164,19 +151,6 @@ def test_load_model_restores_checkpoint_buffers(tmp_path):
     loader.load_model(model, str(tmp_path), show_progress=False)
 
     torch.testing.assert_close(model.clip_max, torch.tensor(3.5))
-
-
-def test_load_model_labels_progress_rank(tmp_path, capsys):
-    _write_two_shards(tmp_path)
-
-    loader.load_model(
-        _TwoShardModel(),
-        str(tmp_path),
-        num_threads=2,
-        progress_rank=0,
-    )
-
-    assert "Multi-thread loading shards (rank 0)" in capsys.readouterr().err
 
 
 def test_load_model_reads_only_rank_local_tensor_slice(tmp_path):

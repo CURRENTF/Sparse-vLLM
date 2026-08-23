@@ -12,11 +12,8 @@ import torch.distributed as dist
 
 from sparsevllm.engine.model_runner import (
     ModelRunner,
-    PREFIX_CACHE_CONTROL_RPC_METHODS,
-    RECOVERABLE_TP_CONTROL_RPC_METHODS,
     TP_RUN_STATUS_FAILED,
     TP_RUN_STATUS_SUCCESS,
-    TP_RPC_STATUS_SYNC_METHODS,
     TP_SHM_NAME_PREFIX,
     _create_model,
     make_tp_shm_name,
@@ -121,12 +118,7 @@ def test_free_slots_batch_releases_each_seq_id():
     assert freed == [3, 5, 8]
 
 
-def test_prefix_offload_release_rpcs_use_failure_synchronized_world_path():
-    assert "free_slots" in TP_RPC_STATUS_SYNC_METHODS
-    assert "free_slots_batch" in TP_RPC_STATUS_SYNC_METHODS
-
-
-def test_operator_implementation_log_is_aligned_and_failure_synchronized():
+def test_operator_implementation_log_runs_only_on_rank_zero():
     rank_zero = object.__new__(ModelRunner)
     rank_zero.parallel_context = SimpleNamespace(world_rank=0)
     rank_one = object.__new__(ModelRunner)
@@ -136,7 +128,6 @@ def test_operator_implementation_log_is_aligned_and_failure_synchronized():
         ModelRunner.log_operator_implementations(rank_zero)
         ModelRunner.log_operator_implementations(rank_one)
 
-    assert "log_operator_implementations" in TP_RPC_STATUS_SYNC_METHODS
     log_implementations.assert_called_once_with()
 
 
@@ -209,11 +200,6 @@ def test_prefix_cache_control_rpc_reports_any_tp_worker_failure():
             assert "At least one world worker failed" in str(exc)
         else:
             raise AssertionError("expected worker failure to be surfaced on rank 0")
-
-
-def test_prefix_cache_match_uses_tp_failure_synchronized_control_path():
-    assert "prefix_cache_match" in PREFIX_CACHE_CONTROL_RPC_METHODS
-    assert "prefix_cache_match" in TP_RPC_STATUS_SYNC_METHODS
 
 
 def test_run_rpc_reports_any_tp_worker_failure():
@@ -323,14 +309,6 @@ def test_run_rpc_keeps_collective_status_without_decode_graph():
     assert calls == [("collective", "run", None)]
 
 
-def test_warmup_reset_uses_failure_synchronized_world_rpc():
-    assert "reset_after_warmup" in TP_RPC_STATUS_SYNC_METHODS
-
-
-def test_moe_workspace_warmup_uses_failure_synchronized_world_rpc():
-    assert "warmup_moe_workspace" in TP_RPC_STATUS_SYNC_METHODS
-
-
 def test_model_runner_moe_workspace_warmup_delegates_token_count():
     calls = []
     runner = object.__new__(ModelRunner)
@@ -341,10 +319,6 @@ def test_model_runner_moe_workspace_warmup_delegates_token_count():
     ModelRunner.warmup_moe_workspace(runner, 16_384)
 
     assert calls == [{"num_tokens": 16_384}]
-
-
-def test_prefix_cache_lookup_uses_failure_synchronized_world_rpc():
-    assert "refresh_prefix_cache_hit" in TP_RPC_STATUS_SYNC_METHODS
 
 
 def test_prefix_cache_lookup_rpc_checks_rank_results():
@@ -424,13 +398,7 @@ def test_model_runner_prefix_cache_lookup_returns_sequence_metadata():
     }
 
 
-def test_hidden_state_debug_uses_failure_synchronized_world_rpc():
-    assert "debug_hidden_states_cpu" in TP_RPC_STATUS_SYNC_METHODS
-    assert "debug_moe_states_cpu" in TP_RPC_STATUS_SYNC_METHODS
-
-
 def test_tp_worker_continues_after_multimodal_registration_failure():
-    assert "register_multimodal_shared" in RECOVERABLE_TP_CONTROL_RPC_METHODS
     runner = object.__new__(ModelRunner)
     commands = iter(
         [

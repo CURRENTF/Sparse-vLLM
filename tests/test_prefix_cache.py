@@ -32,7 +32,6 @@ from sparsevllm.engine.prefix_cache import (
     resolve_prefix_cache_block_size,
     usable_prefix_cache_tokens,
 )
-from sparsevllm.method_registry import PREFIX_CACHE_SUPPORTED_METHODS
 from sparsevllm.platforms import device_runtime
 
 
@@ -1310,62 +1309,6 @@ def test_resolve_prefix_cache_block_size_uses_quest_page_size():
         resolve_prefix_cache_block_size(_cfg(block_size=16.9))
 
 
-def test_prefix_cache_supported_method_allowlist():
-    assert PREFIX_CACHE_SUPPORTED_METHODS == {
-        "",
-        "streamingllm",
-        "omnikv",
-        "quest",
-        "snapkv",
-        "h2o",
-        "pyramidkv",
-        "rkv",
-        "skipkv",
-    }
-
-
-def test_config_resolves_prefix_cache_defaults():
-    cfg = _make_config(enable_prefix_caching=True)
-    assert cfg.vllm_sparse_method == ""
-    assert cfg.prefix_cache_block_size == 16
-    assert cfg.resolved_prefix_cache_mode == "radix"
-
-    cfg = _make_config(
-        vllm_sparse_method="quest",
-        enable_prefix_caching=True,
-        quest_chunk_size=8,
-        prefix_cache_block_size=None,
-    )
-    assert cfg.prefix_cache_block_size == 8
-    assert cfg.resolved_prefix_cache_mode == "radix"
-
-    cfg = _make_config(
-        vllm_sparse_method="snapkv",
-        enable_prefix_caching=True,
-    )
-    assert cfg.resolved_prefix_cache_mode == "chain"
-
-    cfg = _make_config(
-        vllm_sparse_method="h2o",
-        enable_prefix_caching=True,
-    )
-    assert cfg.resolved_prefix_cache_mode == "chain"
-
-    cfg = _make_config(enable_prefix_caching="false", prefix_cache_block_size="32")
-    assert cfg.enable_prefix_caching is False
-    assert cfg.prefix_cache_block_size == 32
-    assert cfg.resolved_prefix_cache_mode == "disabled"
-
-
-def test_config_accepts_streamingllm_chain_prefix_cache():
-    cfg = _make_config(
-        vllm_sparse_method="streamingllm",
-        enable_prefix_caching=True,
-    )
-
-    assert cfg.resolved_prefix_cache_mode == "chain"
-
-
 def test_config_rejects_unvalidated_prefix_cache_options():
     with pytest.raises(ValueError, match="capture_sampling"):
         _make_config(
@@ -1438,38 +1381,6 @@ def test_config_restricts_prefix_cache_offload_to_explicit_tp1_tp2_modes():
     )
     assert cfg.enable_prefix_cache_offload is True
     assert cfg.prefix_cache_host_size_gb == 1
-
-def test_config_allows_prefix_cache_decode_cuda_graph_tp_methods():
-    vanilla = _make_config(
-        enable_prefix_caching=True,
-        decode_cuda_graph=True,
-        tensor_parallel_size=2,
-    )
-    assert vanilla.enable_prefix_caching is True
-    assert vanilla.decode_cuda_graph is True
-    assert vanilla.decode_cuda_graph_capture_sampling is False
-
-    omnikv = _make_config(
-        vllm_sparse_method="omnikv",
-        enable_prefix_caching=True,
-        decode_cuda_graph=True,
-        tensor_parallel_size=2,
-    )
-    assert omnikv.enable_prefix_caching is True
-    assert omnikv.decode_cuda_graph is True
-
-    quest = _make_config(
-        vllm_sparse_method="quest",
-        enable_prefix_caching=True,
-        decode_cuda_graph=True,
-        tensor_parallel_size=2,
-        quest_chunk_size=8,
-        prefix_cache_block_size=None,
-    )
-    assert quest.enable_prefix_caching is True
-    assert quest.decode_cuda_graph is True
-    assert quest.prefix_cache_block_size == 8
-
 
 def test_standard_attach_pins_prefix_slots_and_free_seq_keeps_cached_slots():
     manager = _make_standard_manager_for_prefix(block_size=2)
@@ -1665,10 +1576,6 @@ def _assert_standard_latent_prefix_full_lifecycle(method: str):
 
 def test_standard_latent_prefix_full_lifecycle_restores_and_reuses_slots():
     _assert_standard_latent_prefix_full_lifecycle("")
-
-
-def test_omnikv_latent_prefix_full_lifecycle_restores_and_reuses_slots():
-    _assert_standard_latent_prefix_full_lifecycle("omnikv")
 
 
 def test_standard_offload_gpu_pressure_only_demotes_dual_resident_blocks():

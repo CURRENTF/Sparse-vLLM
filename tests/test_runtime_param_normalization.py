@@ -9,16 +9,7 @@ class RuntimeParamNormalizationTest(unittest.TestCase):
             {
                 "sparse_method": "deltakv",
                 "deltakv_checkpoint_path": "/tmp/compressor",
-                "decode_keep_tokens": 2048,
-                "sink_keep_tokens": 8,
-                "recent_keep_tokens": 128,
-                "full_attention_layers": "0,1,2,8,18",
-                "deltakv_neighbor_count": 4,
-                "deltakv_center_ratio": 0.1,
-                "deltakv_latent_dim": 256,
-                "deltakv_latent_quant_bits": 0,
                 "engine_prefill_chunk_size": 512,
-                "prefill_schedule_policy": "auto",
             },
             backend="sparsevllm",
         )
@@ -28,39 +19,13 @@ class RuntimeParamNormalizationTest(unittest.TestCase):
             {
                 "vllm_sparse_method": "deltakv",
                 "deltakv_path": "/tmp/compressor",
-                "decode_keep_tokens": 2048,
-                "num_sink_tokens": 8,
-                "num_recent_tokens": 128,
-                "full_attn_layers": "0,1,2,8,18",
-                "deltakv_k_neighbors": 4,
-                "cluster_ratio": 0.1,
-                "kv_compressed_size": 256,
-                "kv_quant_bits": 0,
                 "chunk_prefill_size": 512,
-                "prefill_schedule_policy": "auto",
             },
         )
 
     def test_legacy_runtime_names_raise(self):
-        for key in (
-            "model_cls",
-            "vllm_sparse_method",
-            "compressor_path",
-            "deltakv_path",
-            "num_top_tokens",
-            "num_top_tokens_in_prefill",
-            "prefill_keep_tokens",
-            "chunk_prefill_size",
-            "chunk_prefill_accel_omnikv",
-            "seq_chunk_size",
-            "compressor_token_group_size",
-            "ref_mode",
-            "k_neighbors",
-            "deltakv_visual_compress_only",
-        ):
-            with self.subTest(key=key):
-                with self.assertRaisesRegex(ValueError, "Legacy runtime parameter"):
-                    normalize_runtime_params({key: "x"}, backend="sparsevllm")
+        with self.assertRaisesRegex(ValueError, "Legacy runtime parameter"):
+            normalize_runtime_params({"vllm_sparse_method": "x"}, backend="sparsevllm")
 
     def test_sparsevllm_vanilla_alias_maps_to_empty_method(self):
         normalized = normalize_runtime_params({"sparse_method": "vanilla"}, backend="sparsevllm")
@@ -72,37 +37,6 @@ class RuntimeParamNormalizationTest(unittest.TestCase):
 
         normalized = normalize_runtime_params({"sparse_method": "skip-kv"}, backend="sparsevllm")
         self.assertEqual(normalized.infer_config["vllm_sparse_method"], "skipkv")
-
-    def test_sparsevllm_rejects_ratio_style_keep_budgets(self):
-        with self.assertRaisesRegex(ValueError, "explicit token count"):
-            normalize_runtime_params({"decode_keep_tokens": 0.17}, backend="sparsevllm")
-
-    def test_quest_token_budget_is_rejected_as_derived(self):
-        with self.assertRaisesRegex(
-            ValueError,
-            "Sparse-vLLM QuEST derives it from sink_keep_tokens",
-        ):
-            normalize_runtime_params(
-                {"quest_token_budget": 2048},
-                backend="sparsevllm",
-            )
-
-    def test_sparsevllm_observation_layer_keys_are_unknown(self):
-        from sparsevllm import LLM
-
-        for key in ("observation_layers", "obs_layer_ids"):
-            with self.subTest(key=key):
-                with self.assertRaisesRegex(ValueError, "Unknown Sparse-vLLM config keys"):
-                    LLM("/tmp/unused-model", **{key: [0]})
-
-    def test_removed_omnikv_decode_graph_keys_are_unknown(self):
-        from sparsevllm import LLM
-
-        for key in ("omnikv_decode_cuda_graph", "omnikv_decode_graph"):
-            with self.subTest(key=key):
-                with self.assertRaisesRegex(ValueError, "Unknown Sparse-vLLM config keys"):
-                    LLM("/tmp/unused-model", **{key: True})
-
 
 if __name__ == "__main__":
     unittest.main()

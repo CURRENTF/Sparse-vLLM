@@ -21,9 +21,6 @@ from sparsevllm.kernels.external.support import (
     KernelFamilyHealth,
     KernelFamilyState,
 )
-from sparsevllm.kernels.triton.context_flashattention_nopad import (
-    select_context_attention_launch_config,
-)
 from sparsevllm.layers.attention import Attention
 from sparsevllm.method_registry import (
     PrefillScoreCollectionKind,
@@ -96,20 +93,6 @@ def _mock_flashinfer_paged_prefill_contract():
         yield
 
 
-def test_head_dim_256_prefill_launch_uses_sm120_resource_safe_tile():
-    assert select_context_attention_launch_config(
-        256,
-        max_shared_memory=101_376,
-    ) == (64, 64, 8, 1)
-
-
-def test_head_dim_256_prefill_launch_keeps_h100_tile():
-    assert select_context_attention_launch_config(
-        256,
-        max_shared_memory=227_328,
-    ) == (128, 128, 8, 1)
-
-
 @pytest.mark.parametrize(
     ("method", "main_score", "collection"),
     [
@@ -143,59 +126,6 @@ def test_h2o_full_query_logits_request_fused_reduced_prefill_score():
         contract.score_collection
         is PrefillScoreCollectionKind.MAIN_ATTENTION_REDUCED
     )
-
-
-@patch(
-    "sparsevllm.operators.prefill_attention.sgl_fa3_device_support",
-    return_value=(False, "sglang-kernel is not installed"),
-)
-def test_resolver_prefers_flashinfer_for_profiled_minimax_shape(
-    _sgl,
-):
-    resolved = OpResolver(PREFILL_ATTENTION_REGISTRY).resolve(
-        _spec(), _h100_caps()
-    )
-    assert resolved.provider.name == "flashinfer_paged_prefill_fa3_sm90"
-
-
-def test_resolver_selects_profiled_flashinfer_fa2_on_sm120():
-    resolved = OpResolver(PREFILL_ATTENTION_REGISTRY).resolve(
-        _spec(
-            num_query_heads=24,
-            num_kv_heads=4,
-            head_dim=256,
-            softmax_scale=256**-0.5,
-        ),
-        _sm120_caps(),
-    )
-
-    assert resolved.provider.name == "flashinfer_paged_prefill_fa2_sm120"
-    assert resolved.report.as_dict()["provider_metadata"] == {
-        "implementation_kind": "atomic_provider",
-        "source": "flashinfer-python",
-        "backend": "fa2",
-        "kv_layout": "NHD",
-        "page_size": 1,
-    }
-
-
-@patch(
-    "sparsevllm.operators.prefill_attention.sgl_fa3_device_support",
-    return_value=(True, "available"),
-)
-@pytest.mark.parametrize(
-    ("query_heads", "kv_heads"),
-    [(32, 4), (16, 2), (12, 2)],
-)
-def test_resolver_prefers_sgl_fa3_for_supported_local_shapes(
-    _support, query_heads, kv_heads
-):
-    resolved = OpResolver(PREFILL_ATTENTION_REGISTRY).resolve(
-        _spec(num_query_heads=query_heads, num_kv_heads=kv_heads),
-        _h100_caps(),
-    )
-
-    assert resolved.provider.name == "sgl_fa3_paged_prefill_sm90"
 
 
 @pytest.mark.parametrize(
@@ -371,63 +301,10 @@ def test_resolver_falls_back_to_triton_for_variant_table_when_sgl_abi_rejected(
         _h100_caps(),
     )
 
-    assert resolved.provider.name == "triton_paged_prefill"
     assert (
         "sgl_fa3_paged_prefill_sm90",
         "unsupported sglang-kernel FA3 fwd schema",
     ) in resolved.rejected
-
-
-@patch(
-    "sparsevllm.kernels.tilelang.gqa.runtime.tilelang_gqa_device_support",
-    return_value=(True, "available"),
-)
-@patch(
-    "sparsevllm.operators.prefill_attention.sgl_fa3_device_support",
-    return_value=(True, "available"),
-)
-def test_resolver_prefers_tilelang_for_scored_prefill(_sgl, _tl):
-    resolved = OpResolver(PREFILL_ATTENTION_REGISTRY).resolve(
-        _spec(
-            num_query_heads=16,
-            num_kv_heads=2,
-            score_output=AttentionScoreKind.RAW_QK_REDUCED,
-        ),
-        _h100_caps(),
-    )
-    assert resolved.provider.name == "tilelang_gqa_paged_prefill_sm90"
-
-
-@patch(
-    "sparsevllm.kernels.tilelang.gqa.runtime.tilelang_gqa_device_support",
-    return_value=(True, "available"),
-)
-@patch(
-    "sparsevllm.operators.prefill_attention.sgl_fa3_device_support",
-    return_value=(False, "sglang-kernel is not installed"),
-)
-def test_resolver_prefers_upstream_flashinfer_when_sgl_not_installed(_sgl, _tl):
-    resolved = OpResolver(PREFILL_ATTENTION_REGISTRY).resolve(
-        _spec(num_query_heads=16, num_kv_heads=2),
-        _h100_caps(),
-    )
-    assert resolved.provider.name == "flashinfer_paged_prefill_fa3_sm90"
-
-
-@patch(
-    "sparsevllm.kernels.tilelang.gqa.runtime.tilelang_gqa_device_support",
-    return_value=(True, "available"),
-)
-@patch(
-    "sparsevllm.operators.prefill_attention.sgl_fa3_device_support",
-    return_value=(True, "available"),
-)
-def test_resolver_keeps_sgl_priority_when_tilelang_is_also_available(_sgl, _tl):
-    resolved = OpResolver(PREFILL_ATTENTION_REGISTRY).resolve(
-        _spec(num_query_heads=16, num_kv_heads=2),
-        _h100_caps(),
-    )
-    assert resolved.provider.name == "sgl_fa3_paged_prefill_sm90"
 
 
 def test_tilelang_provider_rejects_per_head_score_contract():
@@ -471,76 +348,6 @@ def test_tilelang_support_probe_does_not_import_compiler(monkeypatch):
     assert compiler_modules_after == compiler_modules_before
     assert "TMPDIR" not in os.environ
     assert tempfile.tempdir is original_tempdir
-
-
-@patch(
-    "sparsevllm.operators.prefill_attention.sgl_fa3_device_support",
-    return_value=(True, "available"),
-)
-def test_sgl_accepts_sm90_without_exact_device_name_and_cuda_12_3(_support):
-    result = SglFa3PagedPrefillAttentionProvider.supports(
-        _spec(num_query_heads=32, num_kv_heads=4),
-        _h100_caps(device_name="NVIDIA GH200", runtime_version="12.3"),
-    )
-
-    assert result.supported
-
-
-@patch(
-    "sparsevllm.operators.prefill_attention.sgl_fa3_device_support",
-    return_value=(True, "available"),
-)
-def test_sgl_accepts_h100_head_dim_256_after_real_kernel_validation(_support):
-    result = SglFa3PagedPrefillAttentionProvider.supports(
-        _spec(num_query_heads=16, num_kv_heads=2, head_dim=256),
-        _h100_caps(),
-    )
-
-    assert result.supported
-
-
-def test_resolver_falls_back_to_triton_on_non_sm90():
-    resolved = OpResolver(PREFILL_ATTENTION_REGISTRY).resolve(
-        _spec(num_query_heads=32, num_kv_heads=4),
-        _h100_caps(
-            compute_capability=(8, 0),
-            device_name="NVIDIA A100",
-        ),
-    )
-
-    assert resolved.provider.name == "triton_paged_prefill"
-
-
-def test_resolver_falls_back_to_triton_for_fp16():
-    resolved = OpResolver(PREFILL_ATTENTION_REGISTRY).resolve(
-        _spec(
-            num_query_heads=32,
-            num_kv_heads=4,
-            activation_dtype=torch.float16,
-        ),
-        _h100_caps(),
-    )
-
-    assert resolved.provider.name == "triton_paged_prefill"
-
-
-@pytest.mark.parametrize(
-    ("runtime_version", "supported"),
-    [("12.2", False), ("12.3", True), ("12.10", True)],
-)
-@patch(
-    "sparsevllm.operators.prefill_attention.sgl_fa3_device_support",
-    return_value=(True, "available"),
-)
-def test_sgl_uses_numeric_cuda_version_check(_support, runtime_version, supported):
-    result = SglFa3PagedPrefillAttentionProvider.supports(
-        _spec(num_query_heads=32, num_kv_heads=4),
-        _h100_caps(runtime_version=runtime_version),
-    )
-
-    assert result.supported is supported
-    if not supported:
-        assert "runtime >= 12.3" in result.reason
 
 
 @pytest.mark.parametrize(
@@ -600,26 +407,6 @@ def test_prepared_prefill_close_releases_provider_state():
     assert state_ref() is None
     with pytest.raises(RuntimeError, match="closed"):
         op.run(None, None)
-
-
-def test_flashinfer_fa2_sm120_prepare_binds_fa2_backend():
-    provider = FlashInferFa2Sm120PagedPrefillAttentionProvider()
-    spec = _spec(
-        num_query_heads=24,
-        num_kv_heads=4,
-        head_dim=256,
-        softmax_scale=256**-0.5,
-    )
-
-    with (
-        patch("torch.cuda.current_device", return_value=0),
-        patch(
-            "sparsevllm.operators.prefill_attention._FlashInferPagedPrefillState"
-        ) as state,
-    ):
-        provider.prepare(spec, device_index=0)
-
-    state.assert_called_once_with(torch.device("cuda", 0), backend="fa2")
 
 
 def test_flashinfer_prefill_passes_kv_cache_as_page_views_without_copying():

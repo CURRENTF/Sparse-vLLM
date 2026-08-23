@@ -1,5 +1,3 @@
-import tempfile
-from pathlib import Path
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -7,7 +5,7 @@ from unittest.mock import patch
 import numpy as np
 import torch
 
-from sparsevllm.config import Config, RuntimeLayout
+from sparsevllm.config import RuntimeLayout
 from sparsevllm.engine.cache_manager.base import (
     AttentionViewMeta,
     ExplicitKVPayload,
@@ -27,52 +25,9 @@ from sparsevllm.engine.sparse_controller import (
     LayerBatchSparseState,
     SparseController,
 )
-from sparsevllm.method_registry import (
-    get_default_prefill_schedule_policy,
-    normalize_sparse_method,
-    PREFILL_POLICY_ALL_CHUNKED,
-)
 
 
 class RKVSkipKVMethodTest(unittest.TestCase):
-    def _hf_config(self):
-        return SimpleNamespace(
-            model_type="qwen2",
-            torch_dtype=torch.float16,
-            max_position_embeddings=32768,
-            hidden_size=8,
-            intermediate_size=32,
-            num_hidden_layers=2,
-        )
-
-    def test_rkv_aliases_and_prefill_policy(self):
-        self.assertEqual(normalize_sparse_method("r-kv"), "rkv")
-        self.assertEqual(normalize_sparse_method("r_kv"), "rkv")
-        self.assertEqual(normalize_sparse_method("skip-kv"), "skipkv")
-        self.assertEqual(get_default_prefill_schedule_policy("r-kv"), PREFILL_POLICY_ALL_CHUNKED)
-        self.assertEqual(get_default_prefill_schedule_policy("skipkv"), PREFILL_POLICY_ALL_CHUNKED)
-
-    def test_rkv_config_warns_about_approximate_official_adaptation(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            model_dir = Path(tmp)
-            with (
-                patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", return_value=self._hf_config()),
-                patch("sparsevllm.configs.sparse.log_once") as log_once,
-            ):
-                Config(
-                    model=str(model_dir),
-                    vllm_sparse_method="rkv",
-                    max_model_len=32768,
-                    rkv_redundancy_window=64,
-                )
-
-        log_once.assert_called()
-        warning, level = log_once.call_args.args[0], log_once.call_args.kwargs["level"]
-        self.assertEqual(level, "WARNING")
-        self.assertIn("approximation of the official implementation", warning)
-        self.assertIn("per-KV-head token selection", warning)
-        self.assertIn("rkv_redundancy_window=64", warning)
-
     def test_rkv_redundancy_scoring_fails_fast_when_unbounded(self):
         keys = torch.randn(5, 1, 4)
         with self.assertRaisesRegex(RuntimeError, "rkv_max_redundancy_tokens"):
@@ -82,20 +37,6 @@ class RKVSkipKVMethodTest(unittest.TestCase):
                 recent_similar_keep=1,
                 max_tokens=4,
             )
-
-    def test_rkv_query_cache_is_skipped_when_eviction_cannot_trigger(self):
-        cfg = SimpleNamespace(
-            rkv_observation_tokens=8,
-            num_sink_tokens=64,
-            decode_keep_tokens=4096,
-            num_recent_tokens=512,
-            rkv_compression_interval=128,
-            max_model_len=4791,
-        )
-        self.assertFalse(RKVCacheManager._query_cache_needed_for_config(cfg))
-
-        cfg.max_model_len = 4800
-        self.assertTrue(RKVCacheManager._query_cache_needed_for_config(cfg))
 
     def test_rkv_joint_retention_score_uses_paper_lambda(self):
         importance = torch.tensor([0.2, 0.8], dtype=torch.float32)

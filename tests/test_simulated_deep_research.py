@@ -248,50 +248,6 @@ class SimulatedDeepResearchTest(unittest.TestCase):
             config = self._config(Path(tmp) / "run")
             self.assertEqual(run.required_model_len(config), 29)
 
-    def test_default_profile_is_long_tailed(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            config = run.BenchmarkConfig(
-                base_url="http://router.test/v1",
-                model="sim-model",
-                output_dir=Path(tmp) / "run",
-            )
-            self.assertEqual(
-                config.article_token_buckets,
-                (
-                    (60, 1_000, 8_000),
-                    (25, 8_001, 16_000),
-                    (10, 16_001, 32_000),
-                    (5, 32_001, 64_000),
-                ),
-            )
-            self.assertEqual(
-                config.subagent_output_token_buckets,
-                ((90, 100, 600), (10, 800, 1_500)),
-            )
-            self.assertEqual(config.request_timeout_s, 930.0)
-            self.assertEqual(config.router_timeout_margin_s, 30.0)
-            self.assertEqual(config.num_jobs, 1)
-            self.assertEqual(config.job_concurrency, 1)
-            self.assertIsNone(config.min_subagents_per_round)
-            self.assertIsNone(config.max_subagents_per_round)
-            self.assertEqual(run.required_model_len(config), 65_564)
-            cli_config = run.config_from_args(
-                run.build_arg_parser().parse_args(
-                    [
-                        "--model",
-                        "sim-model",
-                        "--output-dir",
-                        str(Path(tmp) / "cli-run"),
-                    ]
-                )
-            )
-            self.assertEqual(cli_config.request_timeout_s, 930.0)
-            self.assertEqual(cli_config.router_timeout_margin_s, 30.0)
-            self.assertEqual(cli_config.num_jobs, 1)
-            self.assertEqual(cli_config.job_concurrency, 1)
-            self.assertIsNone(cli_config.min_subagents_per_round)
-            self.assertIsNone(cli_config.max_subagents_per_round)
-
     def test_parses_random_subagent_count_range(self):
         with tempfile.TemporaryDirectory() as tmp:
             config = run.config_from_args(
@@ -623,19 +579,6 @@ class SimulatedDeepResearchTest(unittest.TestCase):
                 "must not exceed num_jobs",
             ):
                 run.validate_config(config)
-
-    def test_direct_server_allows_the_same_method_for_both_roles(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            config = self._config(Path(tmp) / "run")
-            config = run.BenchmarkConfig(
-                **{
-                    **config.__dict__,
-                    "subagent_methods": ("vanilla",),
-                    "main_agent_methods": ("vanilla",),
-                    "require_router": False,
-                }
-            )
-            run.validate_config(config)
 
     def test_runs_parallel_subagents_and_writes_auditable_artifacts(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2059,25 +2002,6 @@ class SimulatedDeepResearchTest(unittest.TestCase):
                         config,
                         get_fn=missing_block_size_get,
                     )
-                )
-
-    def test_preflight_rejects_default_workload_with_8192_prefix_blocks(self):
-        service = FakeService()
-        service.prefix_cache_block_size = 8_192
-
-        with tempfile.TemporaryDirectory() as tmp:
-            config = run.BenchmarkConfig(
-                base_url="http://router.test/v1",
-                model="sim-model",
-                output_dir=Path(tmp) / "run",
-            )
-            service.max_model_len = run.required_model_len(config)
-            with self.assertRaisesRegex(
-                ValueError,
-                "block_size=8192.*guaranteed_reusable_prefix_tokens=4736",
-            ):
-                asyncio.run(
-                    run.preflight(config, get_fn=service.get)
                 )
 
     def test_preflight_accepts_guaranteed_reusable_prefix_block_size(self):

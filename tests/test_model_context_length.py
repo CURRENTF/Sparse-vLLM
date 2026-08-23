@@ -120,7 +120,7 @@ def test_standard_cache_limits_auto_length_to_runtime_capacity():
     assert manager.attention_cache_storage.allocation["num_slots"] == 31
 
 
-def test_runtime_capacity_updates_auto_cuda_graph_context_sizes():
+def test_runtime_capacity_bounds_auto_cuda_graph_context_sizes():
     config = SimpleNamespace(
         max_model_len=262144,
         max_model_len_auto=True,
@@ -132,7 +132,10 @@ def test_runtime_capacity_updates_auto_cuda_graph_context_sizes():
     Config.limit_auto_max_model_len(config, 9000)
 
     assert config.max_model_len == 9000
-    assert config.decode_cuda_graph_context_sizes == [1024, 2048, 4096, 8192, 9000]
+    context_sizes = config.decode_cuda_graph_context_sizes
+    assert context_sizes == sorted(set(context_sizes))
+    assert context_sizes[-1] == config.max_model_len
+    assert all(0 < size <= config.max_model_len for size in context_sizes)
 
 
 def test_standard_cache_rejects_explicit_length_above_runtime_capacity():

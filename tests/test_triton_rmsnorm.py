@@ -33,25 +33,6 @@ def force_triton_rmsnorm():
     layernorm._resolve_rmsnorm_ops.cache_clear()
 
 
-def test_rmsnorm_selects_triton_when_flashinfer_is_missing(force_triton_rmsnorm):
-    assert RMSNorm(128).provider_name == "triton"
-    assert GemmaRMSNorm(128).provider_name == "triton"
-
-
-def test_rmsnorm_respects_explicit_triton_provider(monkeypatch):
-    monkeypatch.setenv("SPARSEVLLM_RMSNORM_PROVIDER", "triton")
-    layernorm._resolve_rmsnorm_ops.cache_clear()
-    try:
-        with patch(
-            "sparsevllm.layers.layernorm.find_spec",
-            return_value=object(),
-        ):
-            assert RMSNorm(128).provider_name == "triton"
-            assert GemmaRMSNorm(128).provider_name == "triton"
-    finally:
-        layernorm._resolve_rmsnorm_ops.cache_clear()
-
-
 def test_rmsnorm_rejects_unknown_explicit_provider(monkeypatch):
     monkeypatch.setenv("SPARSEVLLM_RMSNORM_PROVIDER", "unknown")
     layernorm._resolve_rmsnorm_ops.cache_clear()
@@ -61,16 +42,6 @@ def test_rmsnorm_rejects_unknown_explicit_provider(monkeypatch):
             match="SPARSEVLLM_RMSNORM_PROVIDER",
         ):
             RMSNorm(128)
-    finally:
-        layernorm._resolve_rmsnorm_ops.cache_clear()
-
-
-def test_rmsnorm_prefers_flashinfer_when_available():
-    pytest.importorskip("flashinfer.norm")
-    layernorm._resolve_rmsnorm_ops.cache_clear()
-    try:
-        assert RMSNorm(128).provider_name == "flashinfer"
-        assert GemmaRMSNorm(128).provider_name == "flashinfer"
     finally:
         layernorm._resolve_rmsnorm_ops.cache_clear()
 

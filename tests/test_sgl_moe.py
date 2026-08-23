@@ -8,7 +8,6 @@ import torch
 import torch.nn.functional as F
 
 from sparsevllm.kernels.external.sgl.moe import (
-    _FP8_GROUP_QUANT_ARGUMENTS,
     _sgl_fp8_group_quant_op,
     sgl_fp8_group_quantization_support,
     sgl_moe_align_block_size,
@@ -21,9 +20,7 @@ from sparsevllm.kernels.external.support import (
 )
 from sparsevllm.kernels.triton.moe import fused_moe, moe_align_block_size
 from sparsevllm.kernels.triton.sgl_fused_moe import (
-    resolve_sgl_moe_config,
     sgl_fused_moe,
-    sgl_moe_profile_metadata,
     sgl_moe_profile_support,
 )
 from sparsevllm.operators.moe import _sgl_moe_align_block_size
@@ -68,92 +65,14 @@ def _torch_local_moe(
     return output.to(dtype)
 
 
-@pytest.mark.parametrize(
-    ("num_tokens", "expected"),
-    [
-        (1, (16, 64, 64, 1, 4, 5)),
-        (4, (16, 64, 128, 1, 4, 2)),
-        (1024, (64, 128, 64, 32, 4, 3)),
-        (8192, (128, 256, 64, 16, 8, 4)),
-    ],
-)
-def test_sgl_qwen3_tp2_config_matches_upstream_profile(num_tokens, expected):
-    config = resolve_sgl_moe_config(
-        num_tokens=num_tokens,
-        top_k=8,
-        num_local_experts=128,
-        hidden_size=2048,
-        intermediate_size=384,
-        activation_dtype=torch.bfloat16,
-        weight_dtype=torch.bfloat16,
-        ep_size=1,
-        device_name="NVIDIA H100 80GB HBM3",
-        device_capability=(9, 0),
-    )
-
-    assert tuple(config.values()) == expected
-
-
-def test_sgl_moe_config_has_generic_shape_fallback():
-    assert resolve_sgl_moe_config(
-        num_tokens=3,
-        top_k=2,
-        num_local_experts=64,
-        hidden_size=2048,
-        intermediate_size=352,
-        activation_dtype=torch.bfloat16,
-        weight_dtype=torch.bfloat16,
-        ep_size=1,
-        device_name="NVIDIA H100 80GB HBM3",
-        device_capability=(9, 0),
-    ) == {
-        "BLOCK_SIZE_M": 16,
-        "BLOCK_SIZE_N": 128,
-        "BLOCK_SIZE_K": 32,
-        "GROUP_SIZE_M": 8,
-        "num_warps": 4,
-        "num_stages": 4,
-    }
-
-
-def test_sgl_moe_profile_records_upstream_provenance() -> None:
-    metadata = sgl_moe_profile_metadata()
-
-    assert metadata["profile_id"] == "sgl_h100_qwen3_bf16_24d6256_v1"
-    assert metadata["profile_status"] == "tuned"
-    assert metadata["kernel"] == "sgl_fused_moe_triton_v1"
-    assert metadata["profile_source"]["source_revision"] == (
-        "24d625698d44c78f6e8ab8b7c19f96f45bbaa90a"
-    )
-
-
 def test_sgl_moe_profile_rejects_unmatched_triton(monkeypatch) -> None:
     monkeypatch.setattr("triton.__version__", "4.0.0")
 
-    assert sgl_moe_profile_support() == (
-        False,
-        "profile sgl_h100_qwen3_bf16_24d6256_v1 requires Triton >=3.5,<4, "
-        "got 4.0.0",
-    )
-    assert resolve_sgl_moe_config(
-        num_tokens=1,
-        top_k=8,
-        num_local_experts=128,
-        hidden_size=2048,
-        intermediate_size=384,
-        activation_dtype=torch.bfloat16,
-        weight_dtype=torch.bfloat16,
-        ep_size=1,
-        device_name="NVIDIA H100 80GB HBM3",
-        device_capability=(9, 0),
-    ) == {
-        "BLOCK_SIZE_M": 16,
-        "BLOCK_SIZE_N": 128,
-        "BLOCK_SIZE_K": 32,
-        "GROUP_SIZE_M": 8,
-        "num_warps": 4,
-        "num_stages": 4,
-    }
+    supported, reason = sgl_moe_profile_support()
+
+    assert supported is False
+    assert "Triton" in reason
+    assert "4.0.0" in reason
 
 
 @pytest.mark.skipif(

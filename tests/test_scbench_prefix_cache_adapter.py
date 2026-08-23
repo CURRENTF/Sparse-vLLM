@@ -11,7 +11,6 @@ SCBENCH_DIR = REPO_ROOT / "benchmark" / "scbench"
 if str(SCBENCH_DIR) not in sys.path:
     sys.path.insert(0, str(SCBENCH_DIR))
 
-import args as scbench_args  # noqa: E402
 sys.modules.setdefault(
     "compute_scores",
     types.SimpleNamespace(compute_scores=lambda *args, **kwargs: {"stub": True}),
@@ -54,10 +53,6 @@ class _RecordingSparseVLLMSearch(run_scbench.SparseVLLMSCBenchSearch):
             }
         )
         return f"{mode}-{turn_idx}"
-
-
-def test_scbench_args_exposes_sparsevllm_backend():
-    assert "sparsevllm" in scbench_args.ATTN_TYPES
 
 
 def test_sparsevllm_scdq_keeps_shared_context_as_reusable_prefix():

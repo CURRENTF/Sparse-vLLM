@@ -5,9 +5,7 @@ import pytest
 import torch
 
 from scripts.debug.compare_decode_graph_eager_logits import (
-    METHOD_CHOICES,
     _build_method_trigger_evidence,
-    _build_parser,
     _compare_logits,
     _save_full_logits_artifact,
     _start_graph_measurement,
@@ -222,25 +220,3 @@ def test_full_logits_comparison_reports_tolerance_and_all_rows():
     assert result["within_tolerance"] is True
     assert result["shape"] == [2, 2]
     assert len(result["rows"]) == 2
-
-
-def test_cli_exposes_h2o_and_tolerance_options(tmp_path):
-    assert "h2o" in METHOD_CHOICES
-    args = _build_parser().parse_args(
-        [
-            "--model_path",
-            "/checkpoint",
-            "--method",
-            "h2o",
-            "--output",
-            str(tmp_path / "result.json"),
-            "--atol",
-            "0.1",
-            "--rtol",
-            "0.2",
-        ]
-    )
-
-    assert args.method == "h2o"
-    assert args.atol == 0.1
-    assert args.rtol == 0.2

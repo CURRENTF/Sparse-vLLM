@@ -72,6 +72,42 @@ This is a research codebase. The priority is trustworthy experimental results.
 8. Save enough run information to reproduce the experiment: config, command, model, dataset split, prompt, decoding parameters, seed, and sample count.
 9. Make the smallest correct change. Avoid unrelated refactors, new dependencies, and renamed interfaces.
 
+# Test Design Rules
+
+Tests in this LLM inference repository must protect an independent correctness,
+safety, or reproducibility contract. A test is not useful merely because it can
+run without a GPU.
+
+1. Do not add tests that only restate ordinary defaults, exact tuning constants,
+   bucket boundaries, model budgets, provider choices, supported-model lists,
+   registry contents, benchmark manifests, or source/AST shape. These values are
+   expected to change deliberately and their definitions are already the source
+   of truth.
+2. Do not copy a production table or condition into a test and assert that both
+   copies match. Prefer one authoritative definition plus validation at the
+   boundary that consumes it.
+3. CPU tests are appropriate only when the behavior is owned by CPU code or the
+   test supplies an independent oracle: scheduler/cache/allocator state
+   transitions, lifecycle and resource accounting, failure propagation,
+   serialization boundaries, or mathematically derived results. "Runs on CPU"
+   alone is not a reason to add a test.
+4. Prefer properties and invariants over literals: capacity is not exceeded,
+   failed admission does not mutate state, ordering is deterministic, resources
+   are released, and outputs match an independent reference implementation.
+5. Provider or kernel routing mocks may test explicit failure handling, but they
+   do not prove GPU correctness or performance. Numerical kernel behavior needs
+   a CUDA test with an independent numerical oracle; performance choices need a
+   reproducible matched benchmark, not a unit test that freezes the winner.
+6. Do not generate exhaustive parameter cross-products from declarative
+   registries unless each case exercises distinct behavior. Use representative
+   cases for shared behavior and focused tests for real exceptions.
+7. Every new test should name a realistic regression it catches and why existing
+   coverage would not catch it. Retain tests for public contracts, trust
+   boundaries, explicit failure states, and previously observed regressions.
+8. When a profile, threshold, budget, or provider decision is intentionally
+   retuned, update its authoritative config or benchmark artifact. Do not add or
+   preserve a unit test whose only purpose is to prevent that intentional change.
+
 # Git Rules
 
 ## Git Commit Messages Rules

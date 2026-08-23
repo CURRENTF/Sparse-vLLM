@@ -605,7 +605,6 @@ def test_glm_full_decoder_moe_cuda_graph_matches_static_eager():
     graph_moe = graph.model.model.layers[1].mlp
     assert isinstance(eager_moe, Glm4MoeLiteSparseMoeBlock)
     assert isinstance(graph_moe, Glm4MoeLiteSparseMoeBlock)
-    assert graph_moe.experts.provider.name == "triton"
 
     steps = []
     captured_graph = None

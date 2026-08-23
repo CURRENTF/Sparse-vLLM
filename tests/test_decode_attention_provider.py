@@ -12,7 +12,6 @@ from sparsevllm.kernels.external.sgl.fa3 import sgl_fa3_device_support
 from sparsevllm.method_registry import sparse_decode_attention_requires_scores
 from sparsevllm.models.attention_runtime import build_mha_decode_attention_spec
 from sparsevllm.operators.decode_attention import (
-    DECODE_ATTENTION_REGISTRY,
     DecodeAttentionRunResult,
     DecodeAttentionOpSpec,
     FlashInferPagedDecodeAttentionProvider,
@@ -20,7 +19,6 @@ from sparsevllm.operators.decode_attention import (
     SglFa3PagedDecodeAttentionProvider,
     TritonPagedDecodeAttentionProvider,
 )
-from sparsevllm.operators.registry import OpResolver
 from sparsevllm.platforms import DeviceCaps, PlatformEnum
 
 
@@ -88,10 +86,6 @@ def _cuda_caps(
     )
 
 
-def _h100_caps() -> DeviceCaps:
-    return _cuda_caps()
-
-
 def _spec(**overrides) -> DecodeAttentionOpSpec:
     values = {
         "num_query_heads": 32,
@@ -108,151 +102,6 @@ def _spec(**overrides) -> DecodeAttentionOpSpec:
     }
     values.update(overrides)
     return DecodeAttentionOpSpec(**values)
-
-
-@patch(
-    "sparsevllm.operators.decode_attention.sgl_fa3_device_support",
-    return_value=(True, "ready"),
-)
-def test_h100_score_free_decode_selects_sgl_fa3(_support):
-    resolved = OpResolver(DECODE_ATTENTION_REGISTRY).resolve(
-        _spec(),
-        _h100_caps(),
-    )
-
-    assert isinstance(resolved.provider, SglFa3PagedDecodeAttentionProvider)
-    assert resolved.report.provider_metadata.items
-
-
-@patch(
-    "sparsevllm.operators.decode_attention.sgl_fa3_device_support",
-    return_value=(True, "ready"),
-)
-def test_snapkv_score_free_decode_selects_sgl_fa3(_support):
-    resolved = OpResolver(DECODE_ATTENTION_REGISTRY).resolve(
-        _spec(
-            may_require_attention_scores=(
-                sparse_decode_attention_requires_scores("snapkv")
-            ),
-            layer_varying_page_table=True,
-        ),
-        _h100_caps(),
-    )
-
-    assert isinstance(resolved.provider, SglFa3PagedDecodeAttentionProvider)
-
-
-@patch(
-    "sparsevllm.operators.decode_attention.sgl_fa3_device_support",
-    return_value=(True, "ready"),
-)
-def test_h100_head_dim_256_decode_selects_sgl_fa3(_support):
-    resolved = OpResolver(DECODE_ATTENTION_REGISTRY).resolve(
-        _spec(num_query_heads=16, num_kv_heads=2, head_dim=256),
-        _h100_caps(),
-    )
-
-    assert isinstance(resolved.provider, SglFa3PagedDecodeAttentionProvider)
-
-
-@patch(
-    "sparsevllm.operators.decode_attention.sgl_fa3_device_support",
-    return_value=(True, "ready"),
-)
-def test_score_capable_decode_binds_triton_before_execution(_support):
-    spec = _spec(
-        may_require_attention_scores=True,
-        layer_varying_page_table=True,
-    )
-    sgl_support = SglFa3PagedDecodeAttentionProvider.supports(
-        spec,
-        _h100_caps(),
-    )
-    triton_support = TritonPagedDecodeAttentionProvider.supports(
-        spec,
-        _h100_caps(),
-    )
-    resolved = OpResolver(DECODE_ATTENTION_REGISTRY).resolve(
-        spec,
-        _h100_caps(),
-    )
-
-    assert not sgl_support.supported
-    assert "attention score" in sgl_support.reason
-    assert triton_support.supported
-    assert isinstance(resolved.provider, TritonPagedDecodeAttentionProvider)
-
-
-@pytest.mark.parametrize(
-    (
-        "device_name",
-        "compute_capability",
-        "activation_dtype",
-        "head_dim",
-        "cuda_graph",
-        "provider_type",
-    ),
-    [
-        (
-            "NVIDIA H100 PCIe",
-            (9, 0),
-            torch.bfloat16,
-            128,
-            True,
-            SglFa3PagedDecodeAttentionProvider,
-        ),
-        (
-            "NVIDIA RTX PRO 6000 Blackwell Server Edition",
-            (12, 0),
-            torch.bfloat16,
-            256,
-            False,
-            FlashInferPagedDecodeAttentionProvider,
-        ),
-    ],
-)
-def test_lse_decode_selects_upstream_attention_provider_by_capability(
-    device_name,
-    compute_capability,
-    activation_dtype,
-    head_dim,
-    cuda_graph,
-    provider_type,
-):
-    spec = _spec(
-        num_query_heads=16 if head_dim == 256 else 32,
-        num_kv_heads=2 if head_dim == 256 else 8,
-        activation_dtype=activation_dtype,
-        head_dim=head_dim,
-        softmax_scale=head_dim**-0.5,
-        may_require_attention_scores=True,
-        layer_varying_page_table=True,
-        cuda_graph=cuda_graph,
-        h2o_layerwise_probability_scores=True,
-    )
-    caps = _cuda_caps(
-        device_name=device_name,
-        compute_capability=compute_capability,
-    )
-    with (
-        patch(
-            "sparsevllm.operators.decode_attention.sgl_fa3_device_support",
-            return_value=(True, "ready"),
-        ),
-        patch(
-            "sparsevllm.operators.decode_attention.flashinfer_paged_decode_support",
-            return_value=(True, "ready"),
-        ),
-    ):
-        resolved = OpResolver(DECODE_ATTENTION_REGISTRY).resolve(spec, caps)
-
-    assert isinstance(resolved.provider, provider_type)
-    assert resolved.report.selected_profile is None
-    assert resolved.report.selected_role == "upstream_standard"
-    assert resolved.report.selection_basis == "upstream_default"
-    assert not TritonPagedDecodeAttentionProvider.supports(
-        spec, caps
-    ).supported
 
 
 def test_flashinfer_lse_decode_rejects_cuda_graph_before_dependency_probe():
@@ -274,30 +123,6 @@ def test_flashinfer_lse_decode_rejects_cuda_graph_before_dependency_probe():
     assert not result.supported
     assert "CUDA Graph" in result.reason
     support.assert_not_called()
-
-
-def test_lse_decode_uses_flashinfer_after_sgl_device_rejection():
-    spec = _spec(
-        may_require_attention_scores=True,
-        layer_varying_page_table=True,
-        cuda_graph=False,
-        h2o_layerwise_probability_scores=True,
-    )
-    caps = _h100_caps()
-
-    with (
-        patch(
-            "sparsevllm.operators.decode_attention.sgl_fa3_device_support",
-            return_value=(False, "sglang-kernel reports FA3 unsupported on cuda:0"),
-        ),
-        patch(
-            "sparsevllm.operators.decode_attention.flashinfer_paged_decode_support",
-            return_value=(True, "ready"),
-        ),
-    ):
-        resolved = OpResolver(DECODE_ATTENTION_REGISTRY).resolve(spec, caps)
-
-    assert isinstance(resolved.provider, FlashInferPagedDecodeAttentionProvider)
 
 
 def test_prepared_h2o_decode_applies_fixed_probability_scorer():

@@ -9,37 +9,12 @@ from sparsevllm.models.gdn_runtime import (
     bind_gated_delta_rule_op,
     build_gated_delta_rule_op,
 )
-from sparsevllm.kernels.external.flashinfer.gdn import (
-    flashinfer_sm90_gdn_prefill_support,
-)
-from sparsevllm.kernels.external.support import (
-    KernelFamilyHealth,
-    KernelFamilyState,
-)
 from sparsevllm.operators.gated_delta_rule import (
-    GATED_DELTA_RULE_REGISTRY,
     FlashInferSm90GatedDeltaRuleProvider,
     GatedDeltaRuleOpSpec,
     PreparedGatedDeltaRuleOp,
     TritonGatedDeltaRuleProvider,
 )
-from sparsevllm.operators.registry import OpResolver
-from sparsevllm.platforms import DeviceCaps, PlatformEnum
-
-
-def _caps(*, compute_capability=(9, 0)) -> DeviceCaps:
-    return DeviceCaps(
-        platform=PlatformEnum.CUDA,
-        device_type="cuda",
-        device_index=0,
-        device_name="NVIDIA H100 80GB HBM3",
-        compute_capability=compute_capability,
-        runtime_version="13.0",
-        supports_graph_capture=True,
-        supports_triton=True,
-        supports_bfloat16=True,
-        supports_native_fp8=True,
-    )
 
 
 def _spec(**overrides) -> GatedDeltaRuleOpSpec:
@@ -54,78 +29,6 @@ def _spec(**overrides) -> GatedDeltaRuleOpSpec:
     }
     values.update(overrides)
     return GatedDeltaRuleOpSpec(**values)
-
-
-@patch(
-    "sparsevllm.operators.gated_delta_rule.flashinfer_sm90_gdn_prefill_support",
-    return_value=(True, "validated"),
-)
-def test_h100_selects_fixed_flashinfer_prefill_triton_decode_plan(_support):
-    resolved = OpResolver(GATED_DELTA_RULE_REGISTRY).resolve(_spec(), _caps())
-
-    assert isinstance(resolved.provider, FlashInferSm90GatedDeltaRuleProvider)
-    metadata = resolved.report.as_dict()["provider_metadata"]
-    assert metadata["implementation_kind"] == "atomic_provider"
-    assert "flashinfer.gdn_prefill" in metadata["prefill_kernel_path"]
-    assert "fused_recurrent" in metadata["decode_kernel_path"]
-    assert metadata["runtime_state_layout"] == "k_major_hkv"
-    assert metadata["prefill_state_layout"] == "v_major_hvk"
-    assert metadata["state_layout_adapter"] == "transpose_last_two_dims"
-    assert "triton.qwen3_5.gated_rmsnorm" in metadata["auxiliary_kernel_paths"]
-
-
-def test_non_sm90_selects_repo_triton_plan_without_probing_flashinfer():
-    with patch(
-        "sparsevllm.operators.gated_delta_rule.flashinfer_sm90_gdn_prefill_support"
-    ) as support:
-        resolved = OpResolver(GATED_DELTA_RULE_REGISTRY).resolve(
-            _spec(),
-            _caps(compute_capability=(12, 0)),
-        )
-
-    support.assert_not_called()
-    assert isinstance(resolved.provider, TritonGatedDeltaRuleProvider)
-
-
-def test_sm90_old_flashinfer_version_is_a_local_provider_rejection():
-    health = KernelFamilyHealth(
-        "flashinfer-python",
-        KernelFamilyState.READY,
-        "0.6.15.post1",
-        "package family is ready",
-    )
-    with (
-        patch(
-            "sparsevllm.kernels.external.flashinfer.gdn.flashinfer_kernel_health",
-            return_value=health,
-        ),
-        patch(
-            "sparsevllm.kernels.external.flashinfer.gdn._gdn_prefill_op"
-        ) as operation,
-    ):
-        supported, reason = flashinfer_sm90_gdn_prefill_support()
-
-    assert not supported
-    assert ">= 0.6.17" in reason
-    operation.assert_not_called()
-
-
-def test_sm90_flashinfer_plan_rejects_old_cuda_without_feature_probe():
-    caps = _caps()
-    caps = DeviceCaps(
-        **{
-            **caps.__dict__,
-            "runtime_version": "12.7",
-        }
-    )
-    with patch(
-        "sparsevllm.operators.gated_delta_rule.flashinfer_sm90_gdn_prefill_support"
-    ) as support:
-        result = FlashInferSm90GatedDeltaRuleProvider.supports(_spec(), caps)
-
-    support.assert_not_called()
-    assert not result.supported
-    assert "runtime >= 12.8" in result.reason
 
 
 def test_flashinfer_prefill_adapter_converts_log_gate_and_state_contract():

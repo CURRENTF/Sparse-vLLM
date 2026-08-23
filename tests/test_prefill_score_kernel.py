@@ -1,10 +1,8 @@
 import unittest
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
-from sparsevllm.engine.cache_manager.snapkv import SnapKVCacheManager
 
 
 def _prefill_score_baseline(
@@ -107,51 +105,6 @@ def _raw_qk_score_baseline(
                     out[b, kv_pos] = torch.maximum(out[b, kv_pos], score)
     return out
 
-
-class PrefillScoreRoutingTest(unittest.TestCase):
-    def _inputs(self, *, head_dim=16, dtype=torch.float32):
-        meta = SimpleNamespace(
-            req_indices=torch.tensor([0], dtype=torch.int32),
-            context_lens=torch.tensor([1], dtype=torch.int32),
-            active_slots=torch.tensor([[0]], dtype=torch.int32),
-        )
-        return {
-            "q": torch.empty((1, 1, head_dim), dtype=dtype),
-            "k_cache": torch.empty((1, 1, head_dim), dtype=dtype),
-            "step_score": torch.zeros((1, 1), dtype=torch.float32),
-            "meta": meta,
-            "b_start_loc": torch.tensor([0], dtype=torch.int32),
-            "b_prompt_cache_len": torch.tensor([0], dtype=torch.int32),
-            "max_query_len": 1,
-            "score_starts": torch.tensor([0], dtype=torch.int32),
-            "score_ends": torch.tensor([1], dtype=torch.int32),
-            "candidate_start": 0,
-            "num_recent_tokens": 0,
-        }
-
-    def test_probability_mode_uses_the_validated_triton_semantics(self):
-        manager = object.__new__(SnapKVCacheManager)
-        manager.config = SimpleNamespace(sparse_prefill_score_mode="probability")
-
-        with patch(
-            "sparsevllm.engine.cache_manager.snapkv.prefill_score_fwd"
-        ) as score_kernel:
-            manager._run_prefill_score(**self._inputs())
-
-        score_kernel.assert_called_once()
-
-    def test_logits_mode_uses_shared_triton_scorer(self):
-        manager = object.__new__(SnapKVCacheManager)
-        manager.config = SimpleNamespace(sparse_prefill_score_mode="logits")
-        inputs = self._inputs(head_dim=128, dtype=torch.bfloat16)
-        with patch(
-            "sparsevllm.engine.cache_manager.snapkv.prefill_score_fwd"
-        ) as score_kernel:
-            manager._run_prefill_score(**inputs)
-
-        score_kernel.assert_called_once()
-        self.assertEqual(score_kernel.call_args.kwargs["score_mode"], "logits")
-        self.assertEqual(manager._prefill_score_initial_value(), -torch.inf)
 
     def test_tilelang_prefill_wrapper_rejects_per_head_score_tensor(self):
         try:

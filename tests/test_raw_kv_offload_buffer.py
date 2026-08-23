@@ -6,11 +6,6 @@ from sparsevllm.engine.cache_manager.raw_kv_offload import RawKVOffloadBuffer
 
 
 class RawKVOffloadBufferTest(unittest.TestCase):
-    def test_chunked_mode_is_default(self):
-        buffer = RawKVOffloadBuffer(pin_memory=False)
-
-        self.assertEqual(buffer.mode, "chunked")
-
     def test_put_and_copy_prefix_to_for_all_modes(self):
         for mode in ("chunked", "contiguous"):
             with self.subTest(mode=mode):

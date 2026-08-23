@@ -8,7 +8,7 @@ import torch
 
 import sparsevllm.platforms as platforms
 from sparsevllm.platforms import device_runtime
-from sparsevllm.config import Config, QuantizationConfig, RuntimeLayout
+from sparsevllm.config import Config, RuntimeLayout
 from sparsevllm.distributed import ParallelContext, ParallelGroup, ParallelTopology
 from sparsevllm.engine.cache_manager.base import (
     CacheManager,
@@ -46,11 +46,9 @@ from sparsevllm.models.qwen3_5 import (
     _get_rotary_dim,
 )
 from sparsevllm.models.qwen3_5_moe import (
-    Qwen35MoePackedExperts,
     Qwen35MoeRouter,
     Qwen35MoeSparseMoeBlock,
 )
-from sparsevllm.models.checkpoint import validate_checkpoint
 from sparsevllm.models.spec import resolve_model_spec
 from sparsevllm.platforms.cpu import CpuPlatform
 from sparsevllm.sampling_params import SamplingParams
@@ -60,22 +58,6 @@ from sparsevllm.utils.loader import _target_weight_name_for_model, _validate_all
 def _single_process_parallel_context() -> ParallelContext:
     group = ParallelGroup(process_group=None, ranks=(0,), rank=0, size=1)
     return ParallelContext(world=group, tensor=group, expert=group, data=group)
-
-
-def test_qwen35_fp8_expert_validation_uses_per_projection_weights():
-    experts = SimpleNamespace(
-        fp8_enabled=True,
-        local_expert_start=0,
-        local_expert_end=2,
-        _loaded_packed_projections=set(),
-        _loaded_expert_shards={
-            (expert_id, projection)
-            for expert_id in range(2)
-            for projection in ("gate_proj", "up_proj", "down_proj")
-        },
-    )
-
-    Qwen35MoePackedExperts.validate_loaded_weights(experts)
 
 
 def _qwen35_outer_config(*, num_layers: int = 64, full_layers: tuple[int, ...] | None = None):
@@ -118,36 +100,6 @@ def _qwen35_outer_config(*, num_layers: int = 64, full_layers: tuple[int, ...] |
 def _make_config(tmp_path, **kwargs):
     with patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", return_value=_qwen35_outer_config()):
         return Config(model=str(tmp_path), **kwargs)
-
-
-def test_qwen35_moe_checkpoint_validation_accepts_architecture_variants():
-    hf_config = SimpleNamespace(
-        vocab_size=32000,
-        hidden_size=1536,
-        num_hidden_layers=8,
-        num_experts=128,
-        num_experts_per_tok=4,
-        layer_types=["linear_attention", "full_attention"] * 4,
-        torch_dtype=torch.bfloat16,
-        hidden_act="silu",
-        attn_output_gate=True,
-        attention_bias=False,
-        partial_rotary_factor=0.25,
-        mamba_ssm_dtype="float32",
-        rms_norm_eps=1.0e-6,
-        tie_word_embeddings=False,
-    )
-
-    validate_checkpoint(
-        "qwen3_5_moe",
-        outer_config=SimpleNamespace(
-            architectures=["Qwen3_5MoeForConditionalGeneration"]
-        ),
-        config=hf_config,
-        raw_quantization_config=None,
-        quantization=QuantizationConfig.disabled(model_name="Qwen3.6 MoE"),
-        topology=ParallelTopology(1, 1, 1),
-    )
 
 
 def test_linear_attention_fuses_qkvz_and_ba_projections():
@@ -415,28 +367,6 @@ def _resident_scheduler_config():
     )
 
 
-def test_config_resolves_default_resident_sequence_capacity(tmp_path):
-    config = _make_config(
-        tmp_path,
-        max_num_seqs_in_batch=8,
-        max_decoding_seqs=8,
-    )
-
-    assert config.max_num_seqs_in_gpu == 24
-    assert config.recurrent_state_max_bytes is None
-
-
-def test_config_accepts_explicit_resident_sequence_capacity(tmp_path):
-    config = _make_config(
-        tmp_path,
-        max_num_seqs_in_batch=8,
-        max_decoding_seqs=12,
-        max_num_seqs_in_gpu=40,
-    )
-
-    assert config.max_num_seqs_in_gpu == 40
-
-
 @pytest.mark.parametrize(
     "kwargs",
     [
@@ -651,27 +581,6 @@ def test_recurrent_budget_accepts_deprecated_prefix_cache_alias(tmp_path):
 
     assert config.recurrent_state_max_bytes == 2 << 30
     assert config.prefix_cache_max_recurrent_bytes == 2 << 30
-    assert len(_deprecation_messages(mock_log_once)) == 1
-
-
-def test_recurrent_budget_accepts_new_name_without_deprecation(tmp_path):
-    with patch("sparsevllm.configs.prefix_cache.log_once") as mock_log_once:
-        config = _make_config(tmp_path, recurrent_state_max_bytes=3 << 30)
-
-    assert config.recurrent_state_max_bytes == 3 << 30
-    assert config.prefix_cache_max_recurrent_bytes is None
-    assert not _deprecation_messages(mock_log_once)
-
-
-def test_recurrent_budget_accepts_equal_new_and_deprecated_names(tmp_path):
-    with patch("sparsevllm.configs.prefix_cache.log_once") as mock_log_once:
-        config = _make_config(
-            tmp_path,
-            recurrent_state_max_bytes=2 << 30,
-            prefix_cache_max_recurrent_bytes=2 << 30,
-        )
-
-    assert config.recurrent_state_max_bytes == 2 << 30
     assert len(_deprecation_messages(mock_log_once)) == 1
 
 
@@ -1174,53 +1083,11 @@ def test_qwen35_pyramidkv_projects_legacy_transformer_layer_ratios(tmp_path):
     assert cfg.pyramid_layer_ratios == [legacy_ratios[3], legacy_ratios[7]]
 
 
-def test_qwen35_prefix_block_defaults_to_4096_and_rejects_unaligned(tmp_path):
-    cfg = _make_config(tmp_path, enable_prefix_caching=True, prefix_cache_block_size=None)
-    assert cfg.prefix_cache_block_size == 4096
-
+def test_qwen35_prefix_block_rejects_unaligned_sizes(tmp_path):
     with pytest.raises(ValueError, match="4096\\*N"):
         _make_config(tmp_path, enable_prefix_caching=True, prefix_cache_block_size=2048)
     with pytest.raises(ValueError, match="4096\\*N"):
         _make_config(tmp_path, enable_prefix_caching=True, prefix_cache_block_size=4097)
-
-
-def test_qwen35_chain_prefix_cache_does_not_require_radix_block_alignment(
-    tmp_path,
-):
-    cfg = _make_config(
-        tmp_path,
-        vllm_sparse_method="snapkv",
-        enable_prefix_caching=True,
-        prefix_cache_block_size=16,
-    )
-
-    assert cfg.resolved_prefix_cache_mode == "chain"
-    assert cfg.prefix_cache_block_size == 16
-
-
-def test_qwen35_quest_prefix_block_may_span_multiple_pages(tmp_path):
-    cfg = _make_config(
-        tmp_path,
-        vllm_sparse_method="quest",
-        enable_prefix_caching=True,
-        quest_chunk_size=16,
-    )
-
-    assert cfg.prefix_cache_block_size == 4096
-
-
-def test_qwen35_mixed_prefix_offload_allows_decode_graph(tmp_path):
-    cfg = _make_config(
-        tmp_path,
-        enable_prefix_caching=True,
-        enable_prefix_cache_offload=True,
-        prefix_cache_host_size_gb=1,
-        decode_cuda_graph=True,
-    )
-
-    assert cfg.enable_prefix_cache_offload is True
-    assert cfg.decode_cuda_graph is True
-    assert cfg.runtime_layout.linear_attention_layer_indices
 
 
 def test_qwen35_deltakv_requires_compatible_checkpoint_even_when_missing_allowed(tmp_path):
@@ -1252,19 +1119,6 @@ def test_qwen35_raw_config_fallback_when_transformers_autoconfig_is_unknown(tmp_
     assert cfg.outer_hf_config.model_type == "qwen3_5"
     assert cfg.hf_config.model_type == "qwen3_5_text"
     assert cfg.runtime_layout.num_kv_layers == 16
-
-
-def test_qwen35_accepts_unquantized_bf16_checkpoint(tmp_path):
-    outer_config = _qwen35_outer_config()
-    outer_config.text_config.torch_dtype = torch.bfloat16
-    outer_config.text_config.quantization_config = None
-
-    with patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", return_value=outer_config):
-        cfg = Config(model=str(tmp_path))
-
-    assert cfg.hf_config.torch_dtype == torch.bfloat16
-    assert cfg.quantization_config.enabled is False
-    assert cfg.hf_config.quantization_config.enabled is False
 
 
 def test_qwen35_rejects_unquantized_fp16_checkpoint(tmp_path):
