@@ -7,7 +7,7 @@ from torch.utils._python_dispatch import TorchDispatchMode
 
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.layers.sampler import Sampler
-from sparsevllm.sampling_params import SamplingParams
+from sparsevllm.sampling_params import DEFAULT_MAX_TOKENS, SamplingParams
 from sparsevllm.sampling_params import resolve_eos_token_ids
 
 
@@ -72,6 +72,7 @@ class SamplerTest(unittest.TestCase):
 
     def test_sampling_penalty_defaults_are_neutral(self):
         params = SamplingParams()
+        self.assertEqual(params.max_tokens, DEFAULT_MAX_TOKENS)
         self.assertEqual(params.presence_penalty, 0.0)
         self.assertEqual(params.repetition_penalty, 1.0)
 

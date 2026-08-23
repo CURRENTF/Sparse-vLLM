@@ -6,7 +6,7 @@ from pydantic import BaseModel
 from sparsevllm.entrypoints.openai.protocol.chat import ChatCompletionRequest
 from sparsevllm.entrypoints.openai.protocol.completion import CompletionRequest
 from sparsevllm.entrypoints.openai.protocol.responses import ResponseRequest
-from sparsevllm.sampling_params import SamplingParams
+from sparsevllm.sampling_params import DEFAULT_MAX_TOKENS, SamplingParams
 
 
 def _field_was_set(request: BaseModel, name: str) -> bool:
@@ -43,7 +43,11 @@ def _sampling_params_from_response_request(request: ResponseRequest) -> Sampling
         top_k=request.top_k,
         presence_penalty=request.presence_penalty,
         repetition_penalty=request.repetition_penalty,
-        max_tokens=request.max_output_tokens or 16,
+        max_tokens=(
+            DEFAULT_MAX_TOKENS
+            if request.max_output_tokens is None
+            else request.max_output_tokens
+        ),
     )
 
 

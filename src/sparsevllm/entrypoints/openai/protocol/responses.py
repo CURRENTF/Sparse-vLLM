@@ -5,6 +5,8 @@ from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
 
+from sparsevllm.sampling_params import DEFAULT_MAX_TOKENS
+
 
 class ResponseReasoning(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -20,7 +22,7 @@ class ResponseRequest(BaseModel):
     chain_id: str | None = None
     input: str | list[dict[str, Any]]
     instructions: str | None = None
-    max_output_tokens: int | None = Field(default=None, ge=1)
+    max_output_tokens: int | None = Field(default=DEFAULT_MAX_TOKENS, ge=1)
     temperature: float = Field(default=1.0, ge=0.0)
     top_p: float = Field(default=1.0, gt=0.0, le=1.0)
     top_k: int = Field(default=0, ge=0)

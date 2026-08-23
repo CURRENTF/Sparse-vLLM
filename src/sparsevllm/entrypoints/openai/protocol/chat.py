@@ -7,6 +7,8 @@ from pydantic import ConfigDict
 from pydantic import Field
 from pydantic import model_validator
 
+from sparsevllm.sampling_params import DEFAULT_MAX_TOKENS
+
 
 class ChatContentPart(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -61,7 +63,7 @@ class ChatCompletionRequest(BaseModel):
     chain_id: str | None = None
     chain_append_start: int | None = Field(default=None, ge=1)
     messages: list[ChatMessage]
-    max_tokens: int = Field(default=256, ge=1)
+    max_tokens: int = Field(default=DEFAULT_MAX_TOKENS, ge=1)
     max_completion_tokens: int | None = Field(default=None, ge=1)
     temperature: float = Field(default=1.0, ge=0.0)
     top_p: float = Field(default=1.0, gt=0.0, le=1.0)

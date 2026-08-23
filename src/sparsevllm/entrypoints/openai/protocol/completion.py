@@ -2,6 +2,8 @@ from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
 
+from sparsevllm.sampling_params import DEFAULT_MAX_TOKENS
+
 
 class CompletionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -9,7 +11,7 @@ class CompletionRequest(BaseModel):
     model: str
     chain_id: str | None = None
     prompt: str | list[int] | list[str] | list[list[int]]
-    max_tokens: int = Field(default=256, ge=1)
+    max_tokens: int = Field(default=DEFAULT_MAX_TOKENS, ge=1)
     temperature: float = Field(default=1.0, ge=0.0)
     top_p: float = Field(default=1.0, gt=0.0, le=1.0)
     top_k: int = Field(default=0, ge=0)

@@ -1102,6 +1102,7 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
             _sampling_params_from_request,
             _sampling_params_from_response_request,
         )
+        from sparsevllm.sampling_params import DEFAULT_MAX_TOKENS
 
         completion_params = _sampling_params_from_request(
             CompletionRequest(
@@ -1130,10 +1131,13 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(completion_params.presence_penalty, -0.5)
         self.assertEqual(completion_params.repetition_penalty, 0.8)
+        self.assertEqual(completion_params.max_tokens, DEFAULT_MAX_TOKENS)
         self.assertEqual(chat_params.presence_penalty, 0.75)
         self.assertEqual(chat_params.repetition_penalty, 1.2)
+        self.assertEqual(chat_params.max_tokens, DEFAULT_MAX_TOKENS)
         self.assertEqual(response_params.presence_penalty, 2.0)
         self.assertEqual(response_params.repetition_penalty, 1.5)
+        self.assertEqual(response_params.max_tokens, DEFAULT_MAX_TOKENS)
 
         for request_type, request_fields in (
             (CompletionRequest, {"prompt": "p"}),

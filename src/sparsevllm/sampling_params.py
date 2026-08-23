@@ -2,6 +2,9 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 
 
+DEFAULT_MAX_TOKENS = 8192
+
+
 def _as_eos_token_id_set(
     value: int | Iterable[int] | None,
 ) -> frozenset[int]:
@@ -39,7 +42,7 @@ class SamplingParams:
     top_k: int = 0
     presence_penalty: float = 0.0
     repetition_penalty: float = 1.0
-    max_tokens: int = 64
+    max_tokens: int = DEFAULT_MAX_TOKENS
     ignore_eos: bool = False
     eos_token_ids: int | list[int] | tuple[int, ...] | None = None
     logprobs: int | None = None
