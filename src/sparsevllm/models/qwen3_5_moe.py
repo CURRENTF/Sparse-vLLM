@@ -279,9 +279,19 @@ class Qwen35MoeSparseMoeBlock(nn.Module):
         topk_weights, topk_ids, shared_gate_logits = self.gate(hidden_states)
         local_output = self.experts(hidden_states, topk_ids, topk_weights)
         if self.parallel_context.world.size > 1:
-            local_output, shared_output = self.parallel_context.world_all_reduce(
-                torch.stack((local_output, shared_output))
-            )
+            if (
+                self.parallel_context.tensor.ranks
+                == self.parallel_context.world.ranks
+            ):
+                local_output, shared_output = self.parallel_context.world_all_reduce(
+                    torch.stack((local_output, shared_output))
+                )
+            else:
+                # Routed experts are partitioned across the full TP x EP world,
+                # while the shared expert is replicated across EP and sharded
+                # only across its tensor-parallel group.
+                local_output = self.parallel_context.world_all_reduce(local_output)
+                shared_output = self.parallel_context.tp_all_reduce(shared_output)
         return gated_shared_add(local_output, shared_output, shared_gate_logits)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:

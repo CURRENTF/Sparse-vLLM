@@ -84,6 +84,14 @@ def model_activation_dtype(config) -> torch.dtype:
     return torch.bfloat16
 
 
+def _silu_activation_support(spec: MoeOpSpec) -> SupportResult | None:
+    if spec.activation != "silu":
+        return SupportResult.unsupported(
+            f"requires SiLU activation, got {spec.activation}"
+        )
+    return None
+
+
 class MoeProvider:
     name = ""
     gate_up_order = "gate_up"
@@ -435,6 +443,9 @@ class SglAlignedTritonGlmMoeProvider(MoeProvider):
 
     @classmethod
     def supports(cls, spec: MoeOpSpec, caps: DeviceCaps) -> SupportResult:
+        activation = _silu_activation_support(spec)
+        if activation is not None:
+            return activation
         if caps.platform != PlatformEnum.CUDA or caps.compute_capability != (9, 0):
             return SupportResult.unsupported("requires CUDA SM90")
         if not caps.supports_triton:
@@ -501,6 +512,9 @@ class TritonMinimaxM2FusedMoeProvider(MoeProvider):
 
     @classmethod
     def supports(cls, spec: MoeOpSpec, caps: DeviceCaps) -> SupportResult:
+        activation = _silu_activation_support(spec)
+        if activation is not None:
+            return activation
         if spec.routing_method != "biased_sigmoid":
             return SupportResult.unsupported("requires biased-sigmoid routing")
         if caps.platform != PlatformEnum.CUDA or caps.compute_capability != (9, 0):
@@ -597,6 +611,9 @@ class FlashInferCutlassFp8MoeProvider(MoeProvider):
 
     @classmethod
     def supports(cls, spec: MoeOpSpec, caps: DeviceCaps) -> SupportResult:
+        activation = _silu_activation_support(spec)
+        if activation is not None:
+            return activation
         if spec.tp_size != 1:
             return SupportResult.unsupported("does not support tensor-parallel expert shards")
         if spec.weight_dtype != torch.float8_e4m3fn:
@@ -679,6 +696,9 @@ class TritonHopperFusedMoeProvider(MoeProvider):
 
     @classmethod
     def supports(cls, spec: MoeOpSpec, caps: DeviceCaps) -> SupportResult:
+        activation = _silu_activation_support(spec)
+        if activation is not None:
+            return activation
         if caps.platform != PlatformEnum.CUDA or caps.compute_capability != (9, 0):
             return SupportResult.unsupported(
                 f"requires CUDA SM90, got {caps.platform.name} {caps.compute_capability}"
@@ -745,6 +765,9 @@ class SglDerivedTritonMoeProvider(MoeProvider):
 
     @classmethod
     def supports(cls, spec: MoeOpSpec, caps: DeviceCaps) -> SupportResult:
+        activation = _silu_activation_support(spec)
+        if activation is not None:
+            return activation
         if caps.platform != PlatformEnum.CUDA or caps.compute_capability != (9, 0):
             return SupportResult.unsupported(
                 f"requires CUDA SM90, got {caps.platform.name} "
@@ -762,8 +785,6 @@ class SglDerivedTritonMoeProvider(MoeProvider):
             return SupportResult.unsupported(
                 "requires unquantized expert weights matching the activation dtype"
             )
-        if spec.activation != "silu":
-            return SupportResult.unsupported(f"requires SiLU activation, got {spec.activation}")
         if not caps.supports_bfloat16:
             return SupportResult.unsupported("device does not support BF16")
         from sparsevllm.kernels.external.sgl.moe import sgl_moe_alignment_support
@@ -993,6 +1014,9 @@ class TritonMoeProvider(MoeProvider):
 
     @classmethod
     def supports(cls, spec: MoeOpSpec, caps: DeviceCaps) -> SupportResult:
+        activation = _silu_activation_support(spec)
+        if activation is not None:
+            return activation
         if caps.platform != PlatformEnum.CUDA:
             return SupportResult.unsupported(f"requires CUDA, got {caps.platform.name}")
         if not caps.supports_triton:

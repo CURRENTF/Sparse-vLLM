@@ -30,7 +30,7 @@ from sparsevllm.operators.moe import (
     MoeOpSpec,
     SglDerivedTritonMoeProvider,
 )
-from sparsevllm.operators.registry import OpResolver
+from sparsevllm.operators.registry import NoProviderError, OpResolver
 from sparsevllm.platforms import DeviceCaps, PlatformEnum
 from sparsevllm.quantization.config import QuantizationConfig
 from sparsevllm.quantization.registry import QuantizationRegistry
@@ -163,6 +163,7 @@ def _moe_spec(
     routing_method="softmax",
     scale_dtype=None,
     cuda_graph=True,
+    activation="silu",
 ) -> MoeOpSpec:
     return MoeOpSpec(
         num_experts=num_experts,
@@ -178,6 +179,7 @@ def _moe_spec(
         tp_size=tp_size,
         routing_method=routing_method,
         scale_dtype=scale_dtype,
+        activation=activation,
     )
 
 
@@ -281,6 +283,14 @@ def test_moe_spec_rejects_inconsistent_semantics(overrides):
 
     with pytest.raises(ValueError):
         MoeOpSpec(**values)
+
+
+def test_generic_swiglu_moe_registry_rejects_gelu_tanh_contract():
+    with pytest.raises(NoProviderError, match="requires SiLU activation"):
+        OpResolver(MOE_REGISTRY).resolve(
+            _moe_spec(activation="gelu_tanh"),
+            _cuda_caps((9, 0)),
+        )
 
 
 @pytest.mark.parametrize(

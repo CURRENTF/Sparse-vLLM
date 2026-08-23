@@ -300,6 +300,8 @@ def test_qwen35_moe_reduces_routed_and_shared_outputs_together():
     block.experts = ReturnValue(local_output)
     block.parallel_context = Mock()
     block.parallel_context.world.size = 2
+    block.parallel_context.world.ranks = (0, 1)
+    block.parallel_context.tensor.ranks = (0, 1)
     block.parallel_context.world_all_reduce.side_effect = lambda outputs: outputs + 1
 
     with patch(
@@ -314,6 +316,40 @@ def test_qwen35_moe_reduces_routed_and_shared_outputs_together():
         actual,
         local_output + 1 + (shared_output + 1) * gate_logits.sigmoid(),
     )
+
+
+def test_qwen35_moe_does_not_sum_replicated_shared_expert_across_ep():
+    hidden_states = torch.randn(2, 4)
+    local_output = torch.full_like(hidden_states, 2.0)
+    shared_output = torch.full_like(hidden_states, 3.0)
+    gate_logits = torch.zeros(2, 1)
+    block = Qwen35MoeSparseMoeBlock.__new__(Qwen35MoeSparseMoeBlock)
+    torch.nn.Module.__init__(block)
+    block.shared_expert = Mock(return_value=shared_output)
+    block.gate = Mock(
+        return_value=(
+            torch.ones(2, 1),
+            torch.zeros(2, 1, dtype=torch.int32),
+            gate_logits,
+        )
+    )
+    block.experts = Mock(return_value=local_output)
+    block.parallel_context = Mock()
+    block.parallel_context.world.size = 2
+    block.parallel_context.world.ranks = (0, 1)
+    block.parallel_context.tensor.ranks = (0,)
+    block.parallel_context.world_all_reduce.return_value = local_output * 2
+    block.parallel_context.tp_all_reduce.return_value = shared_output
+
+    with patch(
+        "sparsevllm.models.qwen3_5_moe.gated_shared_add",
+        side_effect=lambda routed, shared, gate: routed + shared * gate.sigmoid(),
+    ):
+        actual = block._forward_chunk(hidden_states)
+
+    block.parallel_context.world_all_reduce.assert_called_once_with(local_output)
+    block.parallel_context.tp_all_reduce.assert_called_once_with(shared_output)
+    torch.testing.assert_close(actual, local_output * 2 + shared_output * 0.5)
 
 
 def test_qwen35_moe_skips_single_rank_output_packing():
