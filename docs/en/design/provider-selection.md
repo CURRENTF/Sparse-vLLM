@@ -27,6 +27,34 @@ Local benchmark coverage is not an atomic support status. In particular, an
 upstream implementation must not reject a shape merely because Sparse-vLLM did
 not benchmark that shape locally.
 
+## Portability Of Repository-Owned DSL Kernels
+
+`repo_nonstandard` describes ownership of a nonstandard operation contract; it
+does not imply a hardware-specialized implementation. For repository-owned
+kernels written with portable Triton or TileLang primitives, keep the atomic
+support domain broad. Derive it from semantics, tensor contracts, the DSL and
+toolchain, hardware features actually used, and known compiler limitations.
+Missing local validation for a GPU model or shape is not by itself a reason for
+a device-name whitelist, compute-capability whitelist, or atomic rejection.
+
+Sparse-vLLM is a research-oriented project and cannot pre-validate every
+hardware combination. On a device with no known incompatibility, the resolver
+may optimistically bind a portable DSL provider and attempt compilation during
+prepare, JIT, warmup, or first execution. Compilation or execution failures must
+surface the original actionable error. They must not trigger silent provider
+reselection, fabricated default outputs, or masked failures. After an
+incompatibility is confirmed, prefer an exclusion expressed by the required
+hardware feature, DSL capability, or known toolchain issue over a permanent
+device-model whitelist.
+
+Keep atomic eligibility separate from validation and performance evidence.
+`validation_evidence` records only the devices, shapes, dtypes, graph modes, and
+results actually tested; missing evidence does not automatically narrow a
+portable support domain. In contrast, performance profiles, default performance
+preferences, and cross-system performance claims must stay within reproducible
+measured evidence. A kernel may be eligible to run broadly while claiming
+validated correctness or superior performance only where evidence exists.
+
 ## Default Portfolio
 
 Every operator registry owns an explicit `PortfolioPolicy`. Standard upstream
@@ -49,7 +77,8 @@ or on the default portfolio.
 
 Profile precedence is an explicit registry-level order. A profile may override a
 default performance choice, but it must never define the support domain of a
-standard upstream operator.
+standard upstream operator or disable a portable repository-owned nonstandard
+path merely because local performance data is absent.
 
 ## Phase Composition
 
@@ -90,4 +119,7 @@ For standard operations, prefer upstream atomic providers and maintain only the
 adapter plus a portable repository baseline. Add a repository-owned production
 kernel only for new sparse semantics or a runtime contract that upstream cannot
 express. Local profiles can override default selection; they cannot narrow
-upstream support.
+upstream support. Prefer portable Triton or TileLang implementations for
+repository-owned nonstandard kernels: their semantics may be nonstandard, but
+limited local hardware access must not artificially narrow their hardware
+support domain.

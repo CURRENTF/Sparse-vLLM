@@ -164,7 +164,7 @@ class H2OCacheManager(SnapKVCacheManager):
         outstanding_reserved_rows: int = 0,
         needs_resident_row: bool,
     ) -> tuple[tuple[int, ...], int, tuple[int, ...], int]:
-        """Reserve H2O's physical prefill/decode peak for a chain turn."""
+        """Reserve H2O's prefill peak and score-free decode growth."""
         suffix_tokens = max(0, int(suffix_tokens))
         generated_kv_tokens = max(0, int(generation_tokens) - 1)
         chunk_size = max(1, int(self.config.chunk_prefill_size))
@@ -187,18 +187,7 @@ class H2OCacheManager(SnapKVCacheManager):
                 if suffix_tokens > 0
                 else existing
             )
-            decode_trigger = (
-                self.h2o_decode_budget + self.h2o_decode_eviction_interval
-            )
-            if generated_kv_tokens <= 0:
-                decode_peak = resident_after_prefill
-            elif resident_after_prefill >= decode_trigger:
-                decode_peak = resident_after_prefill + 1
-            else:
-                decode_peak = resident_after_prefill + min(
-                    generated_kv_tokens,
-                    decode_trigger - resident_after_prefill,
-                )
+            decode_peak = resident_after_prefill + generated_kv_tokens
             required_by_layer.append(
                 max(0, max(prefill_peak, decode_peak) - existing)
             )
@@ -247,14 +236,10 @@ class H2OCacheManager(SnapKVCacheManager):
         *,
         requested_context_capacity: int,
         current_context_capacity: int,
-    ) -> tuple[int, bool]:
-        """Capture H2O's periodic decode peak instead of logical prompt length."""
+    ) -> tuple[int, bool] | None:
+        """Use normal context buckets while H2O decode eviction is disabled."""
         del seqs, requested_context_capacity, current_context_capacity
-        capacity = min(
-            self.h2o_decode_budget + self.h2o_decode_eviction_interval,
-            int(self.config.max_model_len),
-        )
-        return max(1, capacity), False
+        return None
 
     @torch.no_grad()
     def prepare_decode_static(

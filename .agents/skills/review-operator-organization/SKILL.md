@@ -18,8 +18,8 @@ model semantic call
   -> local or external kernel
 ```
 
-Use the design in `dev_docs/plan/features/kernels.md` as additional context
-when it exists, but judge the executable code and tests.
+Use `docs/en/design/provider-selection.md` as the primary design context and
+keep its `docs/zh/` mirror aligned, but judge the executable code and tests.
 
 ## Inspect the Change
 
@@ -111,6 +111,22 @@ fallback path from model construction through execution.
   non-standard semantics that upstream providers cannot express, such as
   score production, custom cache layouts, state mutation, selection,
   compaction, compression, or reconstruction.
+- Treat `repo_nonstandard` as a semantic classification, not a hardware-scope
+  classification. Prefer portable-by-construction Triton or TileLang kernels
+  for repository-owned nonstandard contracts.
+- Derive a portable DSL provider's atomic support from its semantic and tensor
+  contract, DSL/toolchain availability, hardware features actually used, and
+  known compiler limitations. Do not add device-name or architecture
+  whitelists solely because local hardware or validation coverage is limited.
+- Permit optimistic binding on unvalidated devices when no incompatibility is
+  known. A prepare, JIT, warmup, or first-execution failure must preserve the
+  actionable error and must not trigger silent provider reselection. Once an
+  incompatibility is confirmed, prefer a feature- or toolchain-based exclusion
+  over a permanent device-model whitelist.
+- Keep broad portable eligibility separate from evidence. Record only tested
+  devices and shapes as validated, and make performance profiles and claims no
+  broader than reproducible measurements. Do not describe an unmeasured device
+  as performance-validated merely because the DSL kernel is eligible there.
 - Let matched local performance profiles override the upstream default only
   for their exact recorded device, contract, shape, topology, graph mode, and
   runtime bucket. A profile may add a dispatch route; it must not narrow an
@@ -172,10 +188,11 @@ Match validation to the changed selection surface:
 - Kernel tests: compare against an independent Torch oracle over boundary
   lengths, non-contiguous layouts, state mutation, padding, real model shapes,
   and every claimed dtype.
-- Hardware tests for repository-owned kernels and local performance overrides:
-  exercise every claimed architecture and exact profile domain on an idle
-  permitted device. Do not generalize a local SM90 result to another
-  architecture or unmeasured shape.
+- Hardware tests for repository-owned kernels: exercise available
+  representative architectures and record the exact tested domain. Lack of
+  access to another device is not by itself a reason to narrow a portable DSL
+  provider's atomic eligibility. Exact local performance overrides must still
+  be tested on every device, contract, shape, and runtime bucket they claim.
 - External-provider tests: use upstream-declared device support for atomic
   eligibility, validate the public API and Sparse-vLLM adapter on available
   representative hardware, and label the evidence honestly. Lack of local
@@ -198,13 +215,18 @@ package version can execute the real call.
 
 - P0: wrong output, corrupt state/cache, or incompatible physical weight
   layout that invalidates inference.
-- P1: a legal environment crashes, the resolver selects an unsupported
-  provider, runtime silently changes providers, or model semantics depend on a
-  backend layout. Also use P1 when local profile evidence narrows a standard
-  upstream atomic support domain or a broadly preferred repository kernel has
-  no evidence appropriate to that scope.
+- P1: a validated or explicitly guaranteed environment crashes, the resolver
+  selects a provider despite a known contract incompatibility, runtime silently
+  changes providers, or model semantics depend on a backend layout. Also use
+  P1 when local profile evidence narrows a standard upstream atomic support
+  domain or a broadly preferred repository kernel makes performance claims
+  without evidence appropriate to that scope.
 - P2: missing rejection coverage, incomplete observability, hot-path selection
-  overhead, or unverified claimed hardware/shape support.
+  overhead, or a confirmed portability gap in an otherwise portable DSL
+  provider. Do not classify a clear prepare/JIT failure on previously
+  unvalidated hardware as P1 solely because eligibility was optimistic, unless
+  the failure contradicts claimed validation, ignores a known incompatibility,
+  corrupts state, or is silently masked.
 - P3: naming or documentation clarity that does not change execution.
 
 Report the broken boundary, the concrete supported configuration that exposes

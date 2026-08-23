@@ -25,6 +25,27 @@ OpSpec
 本地 benchmark 覆盖不是 atomic support 状态。尤其不能因为 Sparse-vLLM 没有
 在本地测过某个 shape，就拒绝上游实现声明支持的 shape。
 
+## Repo-Owned DSL Kernel 的可移植性
+
+`repo_nonstandard` 描述的是 operation contract 的语义归属，不表示实现必须是
+硬件特化的。对于使用 Triton 或 TileLang portable primitives 实现的 repo-owned
+kernel，atomic support 应尽量宽，并由语义、tensor contract、DSL/toolchain、实际
+使用的硬件特性和已知编译器限制决定。缺少某个本地 GPU 型号或 shape 的验证，不能
+单独成为 device-name whitelist、compute-capability whitelist 或 atomic rejection
+的理由。
+
+Sparse-vLLM 是研究导向项目，无法为所有硬件组合提供预先验证。对于没有已知不兼容
+的设备，resolver 可以乐观绑定 portable DSL provider，并在 prepare、JIT、warmup
+或首次执行时尝试编译。无法编译或运行时必须保留清晰的原始错误；不得静默重选
+provider、伪造默认输出或掩盖失败。确认某项不兼容后，应优先用所需硬件特性、DSL
+能力或已知 toolchain 问题描述 exclusion，而不是长期维护具体设备型号白名单。
+
+Atomic eligibility 与验证、性能证据必须分开。`validation_evidence` 只记录实际验证
+过的设备、shape、dtype、graph mode 和结果；缺少记录不自动缩小 portable support。
+相反，性能 profile、默认性能优先级和跨系统性能结论必须严格限制在可复现的实测
+范围内。一个 kernel 可以在较宽设备范围内允许尝试，但只能在已有证据的范围内声称
+正确性已验证或性能占优。
+
 ## 默认 Portfolio
 
 每个 operator registry 都显式持有 `PortfolioPolicy`。标准上游 provider 排在
@@ -44,7 +65,8 @@ dispatch plan。Resolver 会先验证所有 atomic 路径的正确性资格，�
 matcher。Profile 未命中不会改变 atomic eligibility，也不会改变默认 portfolio。
 
 Profile 覆盖顺序由 operator registry 显式声明。Profile 可以覆盖默认性能选择，
-但不能定义标准上游算子的支持范围。
+但不能定义标准上游算子的支持范围，也不能因为缺少本地性能数据而关闭一个
+portable repo-owned nonstandard 路径。
 
 ## 依赖与证据
 
@@ -67,7 +89,8 @@ Profile 覆盖顺序由 operator registry 显式声明。Profile 可以覆盖默
 标准算子优先复用上游 atomic provider，repo 只维护 adapter 和 portable
 baseline。只有新增稀疏语义或上游无法表达的 runtime contract，才新增
 repo-owned production kernel。本地 profile 只能覆盖默认选择，不能缩小上游
-支持域。
+支持域。Repo-owned nonstandard kernel 应优先写成可移植的 Triton/TileLang
+实现；它的语义可以非标准，但硬件支持范围不应被有限的本地机器资源人为缩窄。
 
 ## Phase 组合
 

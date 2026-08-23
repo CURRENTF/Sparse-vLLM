@@ -182,7 +182,7 @@ def test_glm_topology_reuses_one_mla_object_and_qwen_dense_mlp() -> None:
         (None, False),
         ("streamingllm", False),
         ("rkv", False),
-        ("h2o", True),
+        ("h2o", False),
         ("omnikv", True),
     ],
 )

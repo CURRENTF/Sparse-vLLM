@@ -401,9 +401,6 @@ class SparseController:
                 omnikv_decode_score_specs,
                 fill_value=-1e20,
             )
-        if not is_prefill and self.sparse_method == "h2o":
-            self._prepare_h2o_decode_attn_score_buffer(seqs)
-
     def _h2o_kv_layer_indices(self) -> list[int]:
         return [
             layer_idx
@@ -489,10 +486,6 @@ class SparseController:
             if state.context_lens is None:
                 raise RuntimeError(
                     f"H2O decode state is missing context lengths: layer={layer_idx}."
-                )
-            if not self._needs_attn_score(layer_idx, False, seqs):
-                raise RuntimeError(
-                    f"H2O decode must collect raw scores for every KV layer: layer={layer_idx}."
                 )
             batch_sizes.append(int(state.context_lens.numel()))
             kv_indices.append(self._kv_layer_index(layer_idx))
@@ -606,6 +599,8 @@ class SparseController:
             if self._is_kv_layer(layer_idx)
             and isinstance(layer_refs.get("attn_score"), torch.Tensor)
         }
+        if not layer_tensors:
+            return False
         _layer_indices, reduced_scores = self._resolve_h2o_decode_attn_score_buffer(
             layer_tensors
         )
@@ -769,7 +764,7 @@ class SparseController:
         if not self._is_kv_layer(layer_idx):
             return
         ctx = get_context()
-        if not ctx.is_prefill and self.sparse_method in ("snapkv", "pyramidkv", "h2o"):
+        if not ctx.is_prefill and self.sparse_method in ("snapkv", "pyramidkv"):
             attn_score = self.layer_batch_sparse_states[layer_idx].attn_score
             if attn_score is not None and attn_score.dim() != 2:
                 raise RuntimeError(
@@ -777,8 +772,6 @@ class SparseController:
                     f"[B, L] score tensor: layer={layer_idx} "
                     f"shape={tuple(attn_score.shape)}."
                 )
-            # H2O providers write exact head-reduced probability mass for each
-            # layer; the cache manager accumulates all layer/batch rows together.
             return
         if not ctx.is_prefill or self.sparse_method != "pyramidkv":
             return
@@ -849,7 +842,6 @@ class SparseController:
             get_context().is_long_text is False
             and not self.is_deltakv_family
             and not short_snapkv_decode_has_scores
-            and self.sparse_method != "h2o"
         ):
             return
 
@@ -860,8 +852,8 @@ class SparseController:
         # eagerly and replaying score-free decode steps with CUDA Graphs.
         if not is_prefill and self.sparse_method == 'pyramidkv':
             self._snapkv_decode_eviction(seqs)
-        if not is_prefill and self.sparse_method == "h2o":
-            self._h2o_decode_eviction(seqs)
+        # TODO: Restore H2O decode eviction by running score-producing steps
+        # eagerly and replaying score-free decode steps with CUDA Graphs.
         if not is_prefill and self.sparse_method == "rkv":
             self._rkv_decode_eviction(seqs)
         if not is_prefill and self.sparse_method == "skipkv":
@@ -2042,8 +2034,8 @@ class SparseController:
         if self.sparse_method == "h2o":
             # Full-query logit scoring is fused into the selected prefill
             # attention provider. Other prefill modes retain their dedicated
-            # posthoc scorer. Decode always accumulates attention mass.
-            return h2o_uses_fused_prefill_score(self.config) if is_prefill else True
+            # posthoc scorer. Decode scoring is disabled with decode eviction.
+            return h2o_uses_fused_prefill_score(self.config) if is_prefill else False
         if self.sparse_method == "rkv":
             return False
         if self.sparse_method == "skipkv":

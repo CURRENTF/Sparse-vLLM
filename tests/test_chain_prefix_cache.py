@@ -742,12 +742,11 @@ def test_resumed_h2o_capacity_uses_chunked_physical_peak():
         )
     )
 
-    # Intermediate prefill peaks at prefill_budget + one chunk (12), so an
-    # already resident four-slot row needs eight more slots, not the 109
-    # logical suffix/decode tokens.
-    assert required == (8,)
+    # Intermediate prefill peaks at 12, then score-free decode grows from the
+    # four-token final-prefill row to 13. The resident row needs nine more slots.
+    assert required == (9,)
     assert required_rows == 0
-    assert deficits == (5,)
+    assert deficits == (6,)
     assert row_deficit == 0
 
 
@@ -859,13 +858,13 @@ def test_new_h2o_chain_capacity_reserves_row_and_outstanding_slots():
         )
     )
 
-    assert required == (12,)
+    assert required == (13,)
     assert required_rows == 1
-    assert deficits == (4,)
+    assert deficits == (5,)
     assert row_deficit == 0
 
 
-def test_h2o_chain_capacity_reserves_periodic_decode_peak():
+def test_h2o_chain_capacity_reserves_score_free_decode_growth():
     manager = object.__new__(H2OCacheManager)
     manager.config = SimpleNamespace(
         vllm_sparse_method="h2o",
@@ -887,9 +886,9 @@ def test_h2o_chain_capacity_reserves_periodic_decode_peak():
         )
     )
 
-    assert required == (3,)
+    assert required == (9,)
     assert required_rows == 0
-    assert deficits == (2,)
+    assert deficits == (8,)
     assert row_deficit == 0
 
 

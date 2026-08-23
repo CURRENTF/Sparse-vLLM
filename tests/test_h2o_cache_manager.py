@@ -256,6 +256,30 @@ def _seq(seq_id: int, prompt_len: int, *, prefilled: int, chunk: int) -> Sequenc
     return seq
 
 
+def test_h2o_decode_does_not_request_scores_or_run_eviction():
+    controller = object.__new__(SparseController)
+    controller.sparse_method = "h2o"
+    controller.is_deltakv_family = False
+    controller.config = SimpleNamespace(
+        vllm_sparse_method="h2o",
+        sparse_prefill_score_mode="logits",
+        h2o_prefill_score_window=0,
+    )
+    controller.activation_controller = Mock()
+    controller.layer_batch_sparse_states = {
+        0: SimpleNamespace(attn_score=None),
+    }
+    controller._h2o_decode_eviction = Mock()
+    set_context(is_prefill=False, is_long_text=True)
+
+    assert controller._needs_attn_score(0, False, []) is False
+    assert controller._needs_attn_score(0, True, []) is True
+    controller.post_forward([], is_prefill=False)
+
+    controller.activation_controller.post_forward.assert_called_once_with([], False)
+    controller._h2o_decode_eviction.assert_not_called()
+
+
 def test_h2o_registry_defaults_to_chunked_prefill():
     assert get_default_prefill_schedule_policy("h2o") == PREFILL_POLICY_ALL_CHUNKED
 
@@ -2019,13 +2043,13 @@ def test_h2o_capacity_hooks_reserve_prefill_peak_and_gate_chunk_with_real_free_s
         [seq],
         requested_context_capacity=128,
         current_context_capacity=64,
-    ) == (7, False)
+    ) is None
     manager.config.max_model_len = 6
     assert manager.decode_cuda_graph_context_capacity(
         [seq],
         requested_context_capacity=128,
         current_context_capacity=64,
-    ) == (6, False)
+    ) is None
 
     scheduler_config = SimpleNamespace(
         max_num_seqs_in_batch=4,

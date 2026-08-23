@@ -138,7 +138,9 @@ def build_mha_decode_attention_spec(
         attention_tp_size=attention_tp_size,
     )
     normalized_method = normalize_sparse_method(sparse_method)
-    score_config = config if runtime_config is None else runtime_config
+    requires_decode_scores = sparse_decode_attention_requires_scores(
+        normalized_method
+    )
     return DecodeAttentionOpSpec(
         num_query_heads=query_heads,
         num_kv_heads=kv_heads,
@@ -151,12 +153,12 @@ def build_mha_decode_attention_spec(
         # Score demand can change between decode steps for sparse methods.
         # Bind the score-capable implementation up front instead of
         # switching providers in the runtime path.
-        may_require_attention_scores=(
-            sparse_decode_attention_requires_scores(normalized_method)
-        ),
+        may_require_attention_scores=requires_decode_scores,
         layer_varying_page_table=bool(normalized_method),
         cuda_graph=bool(cuda_graph),
-        h2o_layerwise_probability_scores=(normalized_method == "h2o"),
+        h2o_layerwise_probability_scores=(
+            normalized_method == "h2o" and requires_decode_scores
+        ),
     )
 
 

@@ -22,6 +22,7 @@ class AttentionKernelRequest:
     head_dim: int
     page_size: int | None = None
     score_output: AttentionScoreKind | None = None
+    requires_softmax_lse: bool = False
     layer_varying_page_table: bool = False
     varlen: bool = True
     cuda_graph: bool = False
@@ -37,6 +38,7 @@ class AttentionKernelCapabilities:
     score_outputs: frozenset[AttentionScoreKind] = frozenset(
         {AttentionScoreKind.NONE}
     )
+    returns_softmax_lse: bool = False
     layer_varying_page_table: bool = False
     varlen: bool = True
     cuda_graph: bool = False
@@ -100,6 +102,8 @@ def match_attention_capabilities(
         return SupportResult.unsupported(
             f"does not produce attention score {request.score_output.name}"
         )
+    if request.requires_softmax_lse and not capabilities.returns_softmax_lse:
+        return SupportResult.unsupported("does not return softmax LSE")
     if request.layer_varying_page_table and not capabilities.layer_varying_page_table:
         return SupportResult.unsupported("does not support layer-varying page tables")
     if request.varlen and not capabilities.varlen:

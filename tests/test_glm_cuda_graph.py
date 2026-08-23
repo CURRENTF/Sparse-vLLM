@@ -209,6 +209,7 @@ def _make_glm_graph_lane(
     sequence = Sequence([5, 7, 11, 13])
     sequence.num_prefilled_tokens = sequence.num_prompt_tokens
     sequence.temperature = 0.0
+    sequence.max_tokens = 8
     manager.seq_id_to_row = {sequence.seq_id: 0}
     manager.free_rows = deque()
     manager.row_seq_lens = np.asarray([3], dtype=np.int32)
@@ -518,6 +519,7 @@ def _make_glm_full_graph_lane(
     sequence = Sequence([17, 19, 23, 29])
     sequence.num_prefilled_tokens = sequence.num_prompt_tokens
     sequence.temperature = 0.0
+    sequence.max_tokens = 8
     manager.seq_id_to_row = {sequence.seq_id: 0}
     manager.free_rows = deque()
     manager.row_seq_lens = np.asarray([3], dtype=np.int32)
@@ -737,7 +739,7 @@ def _glm_method_runtime_config(method: str, *, num_layers: int):
         decode_cuda_graph=True,
         decode_cuda_graph_context_policy="current",
         decode_cuda_graph_max_cached_graphs=None,
-        max_model_len=4 if method == "h2o" else 16,
+        max_model_len=16,
         max_num_seqs_in_batch=1,
         max_num_seqs_in_gpu=1,
         max_num_batched_tokens=16,
@@ -1155,15 +1157,7 @@ def _glm_method_trigger_state(lane, method: str) -> dict[str, object]:
     state: dict[str, object] = {
         "row_lens": _glm_method_row_lens(lane, method),
     }
-    if method == "h2o":
-        scores = lane.controller.layer_batch_sparse_states[0].attn_score
-        assert scores is not None
-        state.update(
-            score_ptr=int(scores.data_ptr()),
-            score_sha256=_tensor_sha256(scores),
-            written_score_count=int((scores > -1e19).sum().item()),
-        )
-    elif method == "snapkv":
+    if method in {"snapkv", "h2o"}:
         assert lane.controller.layer_batch_sparse_states[0].attn_score is None
         mapping = lane.manager.layer_batch_states[0].slot_mapping
         assert mapping is not None
@@ -1287,11 +1281,7 @@ def test_glm_sparse_method_decode_cuda_graph_triggers_runtime_path(method: str):
             atol=0,
         )
 
-        if method == "h2o":
-            assert graph_before["score_sha256"] == eager_before["score_sha256"]
-            pointer = int(graph_before["score_ptr"])
-            assert int(graph_before["written_score_count"]) > 0
-        elif method == "omnikv":
+        if method == "omnikv":
             assert graph_before["active_indices"] == eager_before["active_indices"]
             assert graph_before["active_slots"] == eager_before["active_slots"]
             assert graph_before["active_context_lens"] == [3]
@@ -1335,12 +1325,12 @@ def test_glm_sparse_method_decode_cuda_graph_triggers_runtime_path(method: str):
         eager.sequence.append_token(int(eager_token_ids.item()))
         graph.sequence.append_token(int(graph_token_ids.item()))
 
-    if method == "snapkv":
+    if method in {"snapkv", "h2o"}:
         assert trigger_count == 0
     else:
         assert trigger_count > 0
     if method == "h2o":
-        assert graph.manager._h2o_counters["decode_evictions"] == 4
+        assert graph.manager._h2o_counters["decode_evictions"] == 0
     evidence = {
         "method": method,
         "harness_scope": "tiny_random_sparse_method_component",

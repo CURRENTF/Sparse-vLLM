@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any
 
 import torch
 
 import sparsevllm.platforms as platforms
+from sparsevllm.kernels.external.flashinfer.decode import (
+    flashinfer_paged_decode_support,
+    make_flashinfer_paged_decode_wrapper,
+)
 from sparsevllm.kernels.external.sgl.fa3 import (
     SglFa3DecodeKernel,
     sgl_fa3_device_support,
@@ -92,6 +97,13 @@ class DecodeAttentionOpSpec:
             raise ValueError("Decode attention dimensions and capacity must be positive.")
         if self.softmax_scale <= 0:
             raise ValueError("Decode attention softmax_scale must be positive.")
+        if (
+            self.h2o_layerwise_probability_scores
+            and not self.may_require_attention_scores
+        ):
+            raise ValueError(
+                "H2O layer-wise probability scoring requires decode score output."
+            )
 
     @property
     def kernel_request(self) -> AttentionKernelRequest:
@@ -100,12 +112,12 @@ class DecodeAttentionOpSpec:
             head_dim=self.head_dim,
             page_size=self.page_size,
             score_output=(
-                AttentionScoreKind.ATTENTION_PROBABILITY_REDUCED
-                if self.h2o_layerwise_probability_scores
-                else AttentionScoreKind.RAW_QK_PER_HEAD
+                AttentionScoreKind.RAW_QK_PER_HEAD
                 if self.may_require_attention_scores
+                and not self.h2o_layerwise_probability_scores
                 else AttentionScoreKind.NONE
             ),
+            requires_softmax_lse=self.h2o_layerwise_probability_scores,
             layer_varying_page_table=self.layer_varying_page_table,
             varlen=True,
             cuda_graph=self.cuda_graph,
@@ -137,15 +149,23 @@ class DecodeAttentionProvider:
         raise NotImplementedError
 
 
+@dataclass(frozen=True)
+class DecodeAttentionRunResult:
+    output: torch.Tensor
+    softmax_lse: torch.Tensor
+
+
 DECODE_ATTENTION_REGISTRY: OpRegistry[
     DecodeAttentionOpSpec, DecodeAttentionProvider
 ] = OpRegistry(
     "paged decode attention",
     portfolio=PortfolioPolicy(
-        upstream_standard=("sgl_fa3_paged_decode_sm90",),
+        upstream_standard=(
+            "sgl_fa3_paged_decode_sm90",
+            "flashinfer_paged_decode",
+        ),
         repo_portable=("triton_paged_decode",),
     ),
-    profile_order=("h100_h2o_layerwise_probability_decode_profile",),
 )
 
 
@@ -159,6 +179,7 @@ class SglFa3PagedDecodeAttentionProvider(DecodeAttentionProvider):
         head_dims=frozenset({128, 256}),
         page_sizes=frozenset({1}),
         score_outputs=frozenset({AttentionScoreKind.NONE}),
+        returns_softmax_lse=True,
         layer_varying_page_table=True,
         varlen=True,
         cuda_graph=True,
@@ -223,9 +244,22 @@ class SglFa3PagedDecodeAttentionProvider(DecodeAttentionProvider):
         view: Any,
         **kwargs,
     ) -> torch.Tensor:
-        if view.meta.attn_score is not None:
+        return_softmax_lse = spec.kernel_request.requires_softmax_lse
+        if view.meta.attn_score is not None and not return_softmax_lse:
             raise RuntimeError("SGL FA3 decode does not produce attention scores.")
-        return self._run_sgl(spec, q, view, **kwargs)
+        result = self._run_sgl(
+            spec,
+            q,
+            view,
+            return_softmax_lse=return_softmax_lse,
+            **kwargs,
+        )
+        if not return_softmax_lse:
+            return result
+        if not isinstance(result, tuple):
+            raise RuntimeError("SGL FA3 decode did not return the requested softmax LSE.")
+        output, softmax_lse = result
+        return DecodeAttentionRunResult(output=output, softmax_lse=softmax_lse)
 
     def _run_sgl(
         self,
@@ -276,26 +310,74 @@ class SglFa3PagedDecodeAttentionProvider(DecodeAttentionProvider):
         )
 
 
-@DECODE_ATTENTION_REGISTRY.register_atomic(
-    ProviderRole.REPO_NONSTANDARD,
-    profile_only=True,
-)
-class SglFa3H2OLayerwiseDecodeProvider(SglFa3PagedDecodeAttentionProvider):
-    """Run FA3 and exact H2O probability scoring on every decode layer."""
-
-    name = "sgl_fa3_h2o_layerwise_probability_decode_sm90"
+@DECODE_ATTENTION_REGISTRY.register_atomic(ProviderRole.UPSTREAM_STANDARD)
+class FlashInferPagedDecodeAttentionProvider(DecodeAttentionProvider):
+    name = "flashinfer_paged_decode"
     capabilities = AttentionKernelCapabilities(
         platforms=frozenset({PlatformEnum.CUDA}),
-        compute_capabilities=frozenset({(9, 0)}),
-        activation_dtypes=frozenset({torch.bfloat16}),
-        head_dims=frozenset({128}),
+        activation_dtypes=frozenset({torch.bfloat16, torch.float16}),
         page_sizes=frozenset({1}),
-        score_outputs=frozenset({AttentionScoreKind.ATTENTION_PROBABILITY_REDUCED}),
+        score_outputs=frozenset({AttentionScoreKind.NONE}),
+        returns_softmax_lse=True,
         layer_varying_page_table=True,
         varlen=True,
-        cuda_graph=True,
-        minimum_runtime_version=(12, 3),
+        cuda_graph=False,
     )
+
+    def __init__(self) -> None:
+        self._state: _FlashInferPagedDecodeState | None = None
+
+    @classmethod
+    def supports(
+        cls,
+        spec: DecodeAttentionOpSpec,
+        caps: DeviceCaps,
+    ) -> SupportResult:
+        common = match_attention_capabilities(
+            spec.kernel_request,
+            caps,
+            cls.capabilities,
+        )
+        if not common.supported:
+            return common
+        if not spec.causal:
+            return SupportResult.unsupported("requires causal attention")
+        supported, reason = flashinfer_paged_decode_support()
+        return SupportResult.yes(reason) if supported else SupportResult.unsupported(reason)
+
+    def prepare(
+        self,
+        spec: DecodeAttentionOpSpec,
+        *,
+        device_index: int | None = None,
+    ) -> None:
+        del spec
+        if self._state is not None:
+            return
+        current_device = torch.cuda.current_device()
+        if device_index is None:
+            device_index = current_device
+        if int(device_index) != current_device:
+            raise RuntimeError(
+                "FlashInfer decode must be prepared on the selected CUDA device: "
+                f"selected={device_index} current={current_device}."
+            )
+        self._state = _FlashInferPagedDecodeState(
+            torch.device("cuda", int(device_index))
+        )
+
+    def close(self) -> None:
+        self._state = None
+
+    def binding_metadata(self) -> dict[str, object]:
+        return {
+            "implementation_kind": "atomic_provider",
+            "implementation_source": "flashinfer-python",
+            "kernel_path": "flashinfer.BatchDecodeWithPagedKVCacheWrapper",
+            "kv_layout": "NHD",
+            "page_size": 1,
+            "cuda_graph": False,
+        }
 
     def run(
         self,
@@ -303,68 +385,140 @@ class SglFa3H2OLayerwiseDecodeProvider(SglFa3PagedDecodeAttentionProvider):
         q: torch.Tensor,
         view: Any,
         **kwargs,
-    ) -> torch.Tensor:
-        score = view.meta.attn_score
-        if score is None or score.ndim != 2:
-            raise RuntimeError(
-                "Layer-wise H2O decode requires a reduced [batch, width] score."
-            )
-        result = self._run_sgl(
-            spec,
-            q,
-            view,
-            return_softmax_lse=True,
-            **kwargs,
-        )
-        if not isinstance(result, tuple):
-            raise RuntimeError("SGL FA3 decode did not return the requested softmax LSE.")
-        output, softmax_lse = result
-        from sparsevllm.kernels.triton.h2o_decode_score import (
-            h2o_probability_from_lse,
-        )
-
-        h2o_probability_from_lse(
-            q,
-            view.payload.k_cache,
-            softmax_lse,
-            view.meta.active_slots,
-            view.meta.req_indices,
-            view.meta.context_lens,
-            score,
-            softmax_scale=spec.softmax_scale,
-        )
-        return output
-
-
-@DECODE_ATTENTION_REGISTRY.register_profile
-class H100H2OLayerwiseProbabilityDecodeProfile:
-    name = "h100_h2o_layerwise_probability_decode_profile"
-
-    @classmethod
-    def atomic_provider_names(cls, spec: DecodeAttentionOpSpec) -> tuple[str, ...]:
-        del spec
-        return ("sgl_fa3_h2o_layerwise_probability_decode_sm90",)
-
-    @classmethod
-    def matches(
-        cls,
-        spec: DecodeAttentionOpSpec,
-        caps: DeviceCaps,
-    ) -> ProfileMatch:
-        if caps.device_name != "NVIDIA H100 80GB HBM3":
-            return ProfileMatch.no("requires profiled NVIDIA H100 80GB HBM3")
-        if not spec.h2o_layerwise_probability_scores:
-            return ProfileMatch.no("requires layer-wise H2O probability scores")
-        return ProfileMatch.yes("matched layer-wise H2O FA3 probability profile")
-
-    @classmethod
-    def bind(cls, spec: DecodeAttentionOpSpec, caps: DeviceCaps, **kwargs):
-        del spec, caps
+    ) -> torch.Tensor | DecodeAttentionRunResult:
+        kwargs.pop("decode_launch_op", None)
         if kwargs:
             raise TypeError(
-                f"{cls.name} does not accept provider arguments: {sorted(kwargs)}"
+                "FlashInfer decode received unsupported runtime arguments: "
+                f"{sorted(kwargs)}."
             )
-        return SglFa3H2OLayerwiseDecodeProvider()
+        if self._state is None:
+            raise RuntimeError("FlashInfer decode provider was not prepared.")
+        payload = view.payload
+        meta = view.meta
+        if q.dtype != spec.activation_dtype:
+            raise TypeError(
+                f"FlashInfer decode expected {spec.activation_dtype} Q, got {q.dtype}."
+            )
+        if payload.k_cache.dtype != q.dtype or payload.v_cache.dtype != q.dtype:
+            raise TypeError(
+                "FlashInfer decode requires Q/K/V with the same dtype, got "
+                f"{q.dtype}/{payload.k_cache.dtype}/{payload.v_cache.dtype}."
+            )
+        self._state.plan(
+            spec,
+            active_slots=meta.active_slots,
+            req_indices=meta.req_indices,
+            context_lens=meta.context_lens,
+        )
+        output = torch.empty_like(q)
+        return_softmax_lse = spec.kernel_request.requires_softmax_lse
+        result = self._state.wrapper.run(
+            q,
+            (
+                payload.k_cache.unsqueeze(1),
+                payload.v_cache.unsqueeze(1),
+            ),
+            out=output,
+            return_lse=return_softmax_lse,
+        )
+        if not return_softmax_lse:
+            if not isinstance(result, torch.Tensor) or (
+                result.data_ptr() != output.data_ptr()
+            ):
+                raise RuntimeError(
+                    "FlashInfer decode did not write to the supplied output."
+                )
+            return output
+        if not isinstance(result, tuple) or len(result) != 2:
+            raise RuntimeError(
+                "FlashInfer decode did not return the requested softmax LSE."
+            )
+        returned_output, softmax_lse_log2 = result
+        if returned_output.data_ptr() != output.data_ptr():
+            raise RuntimeError("FlashInfer decode did not write to the supplied output.")
+        expected_shape = (int(q.shape[0]), spec.num_query_heads)
+        if (
+            softmax_lse_log2.dtype != torch.float32
+            or tuple(softmax_lse_log2.shape) != expected_shape
+        ):
+            raise RuntimeError(
+                "FlashInfer decode returned an unexpected softmax LSE: "
+                f"shape={tuple(softmax_lse_log2.shape)} "
+                f"dtype={softmax_lse_log2.dtype} "
+                f"expected={expected_shape}/torch.float32."
+            )
+        softmax_lse = softmax_lse_log2.mul(math.log(2.0)).transpose(0, 1)
+        return DecodeAttentionRunResult(output=output, softmax_lse=softmax_lse)
+
+
+class _FlashInferPagedDecodeState:
+    def __init__(self, device: torch.device) -> None:
+        self.workspace = torch.empty(
+            128 * 1024 * 1024,
+            dtype=torch.uint8,
+            device=device,
+        )
+        self.wrapper = make_flashinfer_paged_decode_wrapper(self.workspace)
+
+    def plan(
+        self,
+        spec: DecodeAttentionOpSpec,
+        *,
+        active_slots: torch.Tensor,
+        req_indices: torch.Tensor,
+        context_lens: torch.Tensor,
+    ) -> None:
+        if active_slots.dtype != torch.int32 or active_slots.ndim != 2:
+            raise TypeError(
+                "FlashInfer decode requires a rank-2 int32 physical-slot page table."
+            )
+        if req_indices.dtype != torch.int32 or context_lens.dtype != torch.int32:
+            raise TypeError("FlashInfer decode requires int32 request metadata.")
+        batch_size = int(context_lens.numel())
+        if batch_size <= 0 or int(req_indices.numel()) != batch_size:
+            raise ValueError("FlashInfer decode requires matched non-empty metadata.")
+        max_context_len = int(context_lens.max().item())
+        if max_context_len <= 0 or max_context_len > int(active_slots.shape[1]):
+            raise ValueError(
+                "FlashInfer decode context is outside the active slot table: "
+                f"max_context_len={max_context_len} "
+                f"width={int(active_slots.shape[1])}."
+            )
+        rows = active_slots.index_select(0, req_indices.to(torch.long))[
+            :, :max_context_len
+        ]
+        positions = torch.arange(
+            max_context_len,
+            device=context_lens.device,
+            dtype=context_lens.dtype,
+        )
+        valid = positions.unsqueeze(0) < context_lens.unsqueeze(1)
+        indices = rows.masked_select(valid).to(torch.int32).contiguous()
+        indptr = torch.cat(
+            (
+                torch.zeros(1, device=context_lens.device, dtype=torch.int32),
+                context_lens.cumsum(0, dtype=torch.int32),
+            )
+        )
+        last_page_len = torch.ones(
+            batch_size,
+            device=context_lens.device,
+            dtype=torch.int32,
+        )
+        self.wrapper.plan(
+            indptr,
+            indices,
+            last_page_len,
+            num_qo_heads=spec.num_query_heads,
+            num_kv_heads=spec.num_kv_heads,
+            head_dim=spec.head_dim,
+            page_size=spec.page_size,
+            sm_scale=spec.softmax_scale,
+            q_data_type=spec.activation_dtype,
+            kv_data_type=spec.activation_dtype,
+            non_blocking=True,
+        )
 
 
 @DECODE_ATTENTION_REGISTRY.register_atomic(ProviderRole.REPO_PORTABLE)
@@ -526,7 +680,37 @@ class PreparedDecodeAttentionOp:
                 "Decode attention view requested scores after a score-free provider "
                 "was bound during model preparation."
             )
-        return self.provider.run(self.spec, q, view, **kwargs)
+        result = self.provider.run(self.spec, q, view, **kwargs)
+        if not self.spec.h2o_layerwise_probability_scores:
+            if isinstance(result, DecodeAttentionRunResult):
+                raise RuntimeError(
+                    "Decode provider returned an unrequested softmax LSE."
+                )
+            return result
+        if not isinstance(result, DecodeAttentionRunResult):
+            raise RuntimeError(
+                "H2O decode requested softmax LSE but the provider returned none."
+            )
+        score = view.meta.attn_score
+        if score is None or score.ndim != 2:
+            raise RuntimeError(
+                "Layer-wise H2O decode requires a reduced [batch, width] score."
+            )
+        from sparsevllm.kernels.triton.h2o_decode_score import (
+            h2o_probability_from_lse,
+        )
+
+        h2o_probability_from_lse(
+            q,
+            view.payload.k_cache,
+            result.softmax_lse,
+            view.meta.active_slots,
+            view.meta.req_indices,
+            view.meta.context_lens,
+            score,
+            softmax_scale=self.spec.softmax_scale,
+        )
+        return result.output
 
     def close(self) -> None:
         if self._closed:
