@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
@@ -87,6 +87,7 @@ class DecodeAttentionOpSpec:
     layer_varying_page_table: bool = False
     cuda_graph: bool = True
     h2o_layerwise_probability_scores: bool = False
+    context_independent_cuda_graph: bool = False
 
     def __post_init__(self) -> None:
         if self.num_query_heads <= 0 or self.num_kv_heads <= 0:
@@ -165,6 +166,7 @@ DECODE_ATTENTION_REGISTRY: OpRegistry[
             "flashinfer_paged_decode",
         ),
         repo_portable=("triton_paged_decode",),
+        repo_nonstandard=("triton_context_independent",),
     ),
 )
 
@@ -195,6 +197,8 @@ class SglFa3PagedDecodeAttentionProvider(DecodeAttentionProvider):
         spec: DecodeAttentionOpSpec,
         caps: DeviceCaps,
     ) -> SupportResult:
+        if spec.context_independent_cuda_graph:
+            return SupportResult.unsupported("launch topology depends on context length")
         common = match_attention_capabilities(
             spec.kernel_request,
             caps,
@@ -333,6 +337,8 @@ class FlashInferPagedDecodeAttentionProvider(DecodeAttentionProvider):
         spec: DecodeAttentionOpSpec,
         caps: DeviceCaps,
     ) -> SupportResult:
+        if spec.context_independent_cuda_graph:
+            return SupportResult.unsupported("planning depends on context length")
         common = match_attention_capabilities(
             spec.kernel_request,
             caps,
@@ -570,6 +576,8 @@ class TritonPagedDecodeAttentionProvider(DecodeAttentionProvider):
         spec: DecodeAttentionOpSpec,
         caps: DeviceCaps,
     ) -> SupportResult:
+        if spec.context_independent_cuda_graph:
+            return SupportResult.unsupported("split count depends on context length")
         return match_attention_capabilities(
             spec.kernel_request,
             caps,
@@ -674,6 +682,135 @@ class TritonPagedDecodeAttentionProvider(DecodeAttentionProvider):
         )
 
 
+@DECODE_ATTENTION_REGISTRY.register_atomic(ProviderRole.REPO_NONSTANDARD)
+class ContextIndependentTritonDecodeAttentionProvider(DecodeAttentionProvider):
+    """Fixed-grid Triton MHA/GQA decode provider for batch-only graphs."""
+
+    name = "triton_context_independent"
+    context_independent_cuda_graph = True
+    capabilities = replace(
+        TritonPagedDecodeAttentionProvider.capabilities,
+        returns_softmax_lse=True,
+    )
+
+    def __init__(self) -> None:
+        self._mid_o: torch.Tensor | None = None
+        self._mid_lse: torch.Tensor | None = None
+        self._softmax_lse: torch.Tensor | None = None
+        self.max_kv_splits = 16
+        self.target_tokens_per_split = 256
+
+    @classmethod
+    def supports(
+        cls, spec: DecodeAttentionOpSpec, caps: DeviceCaps
+    ) -> SupportResult:
+        if not spec.context_independent_cuda_graph:
+            return SupportResult.unsupported("reserved for batch-only CUDA Graph")
+        return match_attention_capabilities(
+            spec.kernel_request,
+            caps,
+            cls.capabilities,
+        )
+
+    def prepare(
+        self,
+        spec: DecodeAttentionOpSpec,
+        *,
+        device_index: int | None = None,
+    ) -> None:
+        if device_index is None:
+            device_index = torch.cuda.current_device()
+        device = torch.device("cuda", int(device_index))
+        self._mid_o = torch.empty(
+            (
+                spec.max_batch_size,
+                spec.num_query_heads,
+                self.max_kv_splits,
+                spec.head_dim,
+            ),
+            dtype=torch.float32,
+            device=device,
+        )
+        self._mid_lse = torch.empty(
+            (spec.max_batch_size, spec.num_query_heads, self.max_kv_splits),
+            dtype=torch.float32,
+            device=device,
+        )
+        self._softmax_lse = torch.empty(
+            (spec.num_query_heads, spec.max_batch_size),
+            dtype=torch.float32,
+            device=device,
+        )
+
+    def close(self) -> None:
+        self._mid_o = None
+        self._mid_lse = None
+        self._softmax_lse = None
+
+    def binding_metadata(self) -> dict[str, object]:
+        return {
+            "implementation_kind": "atomic_provider",
+            "implementation_source": "repo_triton_experimental",
+            "kernel_path": "context_independent_flash_decode",
+            "cuda_graph_shape_policy": "batch_only",
+        }
+
+    def run(
+        self,
+        spec: DecodeAttentionOpSpec,
+        q: torch.Tensor,
+        view: Any,
+        **kwargs,
+    ) -> torch.Tensor:
+        kwargs.pop("decode_launch_op", None)
+        if kwargs:
+            raise TypeError(
+                "Context-independent decode received unsupported arguments: "
+                f"{sorted(kwargs)}."
+            )
+        if (
+            self._mid_o is None
+            or self._mid_lse is None
+            or self._softmax_lse is None
+        ):
+            raise RuntimeError("Context-independent decode provider was not prepared.")
+        payload = view.payload
+        if getattr(payload, "backend", None) != "dense":
+            raise RuntimeError(
+                "Context-independent decode requires dense explicit KV storage."
+            )
+        batch_size = int(q.shape[0])
+        from sparsevllm.kernels.triton.context_independent_flash_decoding import (
+            context_independent_flash_decode,
+        )
+
+        result = context_independent_flash_decode(
+            q,
+            payload.k_cache,
+            payload.v_cache,
+            view.meta.active_slots,
+            view.meta.req_indices,
+            view.meta.context_lens,
+            self._mid_o[:batch_size],
+            self._mid_lse[:batch_size],
+            attn_score=(
+                None
+                if spec.h2o_layerwise_probability_scores
+                else view.meta.attn_score
+            ),
+            target_tokens_per_split=self.target_tokens_per_split,
+            block_n=128 if spec.head_dim == 256 else 64,
+            num_warps=4 if spec.head_dim == 256 else 2,
+            return_softmax_lse=spec.h2o_layerwise_probability_scores,
+            output_lse=self._softmax_lse[:, :batch_size],
+        )
+        if not spec.h2o_layerwise_probability_scores:
+            return result
+        if not isinstance(result, tuple):
+            raise RuntimeError("Context-independent decode did not return softmax LSE.")
+        return DecodeAttentionRunResult(output=result[0], softmax_lse=result[1])
+
+
 class PreparedDecodeAttentionOp:
     """One prepared decode provider shared by all compatible MHA layers."""
 
@@ -689,6 +826,10 @@ class PreparedDecodeAttentionOp:
     @property
     def name(self) -> str:
         return self.provider.name
+
+    @property
+    def context_independent_cuda_graph(self) -> bool:
+        return bool(self.spec.context_independent_cuda_graph)
 
     def run(self, q: torch.Tensor, view: Any, **kwargs) -> torch.Tensor:
         if self._closed:
@@ -754,6 +895,55 @@ def prepare_decode_attention_op(
     )
     resolved.provider.prepare(spec, device_index=device_index)
     return PreparedDecodeAttentionOp(spec, resolved.provider)
+
+
+def validate_context_independent_decode_graph_model(model: torch.nn.Module) -> int:
+    """Audit every semantic decode path after construction-time binding."""
+    from sparsevllm.layers.attention import Attention
+
+    validated = 0
+    for module in model.modules():
+        if isinstance(module, Attention):
+            decode_op = getattr(module, "decode_op", None)
+            implementation = (
+                decode_op
+                if decode_op is not None
+                else getattr(module, "attention_backend", None)
+            )
+            if not bool(
+                getattr(implementation, "context_independent_cuda_graph", False)
+            ):
+                raise RuntimeError(
+                    "batch-only decode CUDA Graph requires a context-independent "
+                    f"attention provider, got {type(implementation).__name__}."
+                )
+            validated += 1
+        if getattr(module, "is_gated_delta_rule_layer", False):
+            op = getattr(module, "gated_delta_rule_op", None)
+            if not bool(getattr(op, "context_independent_cuda_graph", False)):
+                raise RuntimeError(
+                    "batch-only decode CUDA Graph requires a context-independent "
+                    "GDN provider."
+                )
+            validated += 1
+
+    model_body = getattr(model, "model", None)
+    mla_attention = getattr(model_body, "mla_attention", None)
+    if mla_attention is not None:
+        provider = getattr(mla_attention, "provider", None)
+        if not bool(
+            getattr(provider, "context_independent_cuda_graph", False)
+        ):
+            raise RuntimeError(
+                "batch-only decode CUDA Graph requires a context-independent "
+                "MLA provider."
+            )
+        validated += 1
+    if validated == 0:
+        raise RuntimeError(
+            "batch-only decode CUDA Graph found no validated decode operator."
+        )
+    return validated
 
 
 @dataclass(frozen=True)

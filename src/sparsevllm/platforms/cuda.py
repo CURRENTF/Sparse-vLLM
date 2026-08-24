@@ -65,6 +65,15 @@ class CudaPlatform(Platform):
     def get_device_caps(self, device_index: int = 0) -> DeviceCaps:
         device_index = int(device_index)
         major, minor = torch.cuda.get_device_capability(device_index)
+        try:
+            multiprocessor_count = int(
+                torch.cuda.get_device_properties(device_index).multi_processor_count
+            )
+        except (AssertionError, RuntimeError):
+            # Capability-only unit tests may stub the public capability probes
+            # without initializing a CUDA driver. This optional performance
+            # fact is resolved on real devices and may remain unknown otherwise.
+            multiprocessor_count = None
         return DeviceCaps(
             platform=self.enum,
             device_type=self.device_type,
@@ -79,6 +88,7 @@ class CudaPlatform(Platform):
             supports_bfloat16=(int(major), int(minor)) >= (8, 0),
             # Ada (SM89), Hopper and Blackwell provide native FP8 tensor cores.
             supports_native_fp8=(int(major), int(minor)) >= (8, 9),
+            multiprocessor_count=multiprocessor_count,
         )
 
     def get_default_attention_backend(self) -> str:

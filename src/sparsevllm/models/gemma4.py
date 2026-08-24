@@ -696,6 +696,18 @@ class Gemma4ForCausalLM(nn.Module):
                 head_dims=head_dims,
                 cuda_graph=bool(engine_config.decode_graph),
                 attention_contracts=attention_contracts,
+                max_batch_size=int(getattr(engine_config, "max_decoding_seqs", 1)),
+                context_independent_cuda_graph=(
+                    bool(engine_config.decode_graph)
+                    and str(
+                        getattr(
+                            engine_config,
+                            "decode_graph_shape_policy",
+                            "bucketed",
+                        )
+                    )
+                    == "batch_only"
+                ),
             ),
             device_index=device.index,
         )
