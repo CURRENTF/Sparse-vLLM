@@ -33,8 +33,8 @@ class DeltaKVLessMemoryCudaGraphCacheManager(DeltaKVLessMemoryCacheManager):
     shared runner's bucket plan instead of DeltaKV-specific per-request policy.
     """
 
-    def decode_cuda_graph_max_cached_graphs(self) -> int | None:
-        config_limit = getattr(self.config, "decode_cuda_graph_max_cached_graphs", None)
+    def decode_graph_max_cached_graphs(self) -> int | None:
+        config_limit = getattr(self.config, "decode_graph_max_cached_graphs", None)
         if config_limit is not None:
             return int(config_limit)
         env_value = os.getenv("SPARSEVLLM_DELTAKV_MAX_CUDAGRAPHS")
@@ -60,7 +60,7 @@ class DeltaKVLessMemoryCudaGraphCacheManager(DeltaKVLessMemoryCacheManager):
         del real_batch_size, capture_sizes
         return None
 
-    def decode_cuda_graph_context_capacity(
+    def decode_graph_context_capacity(
         self,
         seqs: list[Sequence],
         *,
@@ -73,11 +73,11 @@ class DeltaKVLessMemoryCudaGraphCacheManager(DeltaKVLessMemoryCacheManager):
         del seqs, requested_context_capacity, current_context_capacity
         return None
 
-    def decode_cuda_graph_force_eager(self) -> bool:
+    def decode_graph_force_eager(self) -> bool:
         return _env_bool("SPARSEVLLM_DELTAKV_CUDAGRAPH_FORCE_EAGER", False)
 
     def _decode_cuda_graph_memory_reserve_bytes(self) -> int:
-        if not bool(getattr(self.config, "decode_cuda_graph", False)):
+        if not bool(getattr(self.config, "decode_graph", False)):
             return 0
 
         env_value = os.getenv("SPARSEVLLM_DELTAKV_CUDAGRAPH_RESERVE_BYTES")
@@ -126,7 +126,7 @@ class DeltaKVLessMemoryCudaGraphCacheManager(DeltaKVLessMemoryCacheManager):
         if value is not None:
             capacity = max(capacity, int(value))
 
-        capture_sizes = getattr(config, "decode_cuda_graph_capture_sizes", None) if config is not None else []
+        capture_sizes = getattr(config, "decode_graph_capture_sizes", None) if config is not None else []
         capture_sizes = capture_sizes or []
         if isinstance(capture_sizes, str):
             raw = capture_sizes.strip().lower()
@@ -141,7 +141,7 @@ class DeltaKVLessMemoryCudaGraphCacheManager(DeltaKVLessMemoryCacheManager):
     def _decode_graph_topk_width_capacity(self, requested_k_max: int) -> int:
         requested_k_max = max(0, int(requested_k_max))
         decode_keep = max(0, int(getattr(self.config, "decode_keep_tokens", requested_k_max) or 0))
-        sink = max(0, int(getattr(self.config, "num_sink_tokens", 0) or 0))
+        sink = max(0, int(getattr(self.config, "sink_keep_tokens", 0) or 0))
         static_cap = getattr(self, "_decode_static_max_context_len", None)
         if static_cap is None:
             graph_k_max = decode_keep
@@ -154,7 +154,7 @@ class DeltaKVLessMemoryCudaGraphCacheManager(DeltaKVLessMemoryCacheManager):
             return
 
         graph_batch_size = max(1, int(graph_batch_size))
-        sink = max(0, int(getattr(self.config, "num_sink_tokens", 0) or 0))
+        sink = max(0, int(getattr(self.config, "sink_keep_tokens", 0) or 0))
         top_k = self._decode_graph_topk_width_capacity(0)
         max_buffer = self._deltakv_decode_static_max_buffer()
 
@@ -504,8 +504,8 @@ class DeltaKVLessMemoryCudaGraphCacheManager(DeltaKVLessMemoryCacheManager):
             return int(getattr(self.config, "full_layer_kivi_decode_block_seq", default) or default)
         return super().get_decode_block_seq(layer_idx, default)
 
-    def decode_cuda_graph_keepalive_tensors(self) -> list[torch.Tensor]:
-        refs = super().decode_cuda_graph_keepalive_tensors()
+    def decode_graph_keepalive_tensors(self) -> list[torch.Tensor]:
+        refs = super().decode_graph_keepalive_tensors()
         for attr_name in (
             "_deltakv_postrope_dummy_slot",
             "_deltakv_graph_static_empty_temp_slots_by_shape",

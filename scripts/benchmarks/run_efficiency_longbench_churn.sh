@@ -123,15 +123,15 @@ for SYS in "${SYS_ARR[@]}"; do
     case "${SYS_TRIM}" in
       svllm-vanilla)
         SPARSE_METHOD="vanilla"
-        HPARAMS="{\"tensor_parallel_size\": ${TP_SIZE}, \"gpu_memory_utilization\": 0.85, \"decode_cuda_graph\": true}"
+        HPARAMS="{\"tensor_parallel_size\": ${TP_SIZE}, \"gpu_memory_utilization\": 0.85, \"decode_graph\": true}"
         ;;
       svllm-snapkv)
         SPARSE_METHOD="snapkv"
-        HPARAMS="{\"tensor_parallel_size\": ${TP_SIZE}, \"gpu_memory_utilization\": 0.85, \"snapkv_window_size\": 64, \"sparse_prefill_score_mode\": \"${SPARSE_PREFILL_SCORE_MODE}\", \"sink_keep_tokens\": 64, \"decode_keep_tokens\": 2048, \"recent_keep_tokens\": 64, \"pool_kernel_size\": 7, \"decode_cuda_graph\": true}"
+        HPARAMS="{\"tensor_parallel_size\": ${TP_SIZE}, \"gpu_memory_utilization\": 0.85, \"snapkv_window_size\": 64, \"sparse_prefill_score_mode\": \"${SPARSE_PREFILL_SCORE_MODE}\", \"sink_keep_tokens\": 64, \"decode_keep_tokens\": 2048, \"recent_keep_tokens\": 64, \"pool_kernel_size\": 7, \"decode_graph\": true}"
         ;;
       *)
         SPARSE_METHOD="${SYS_TRIM}"
-        HPARAMS="{\"tensor_parallel_size\": ${TP_SIZE}, \"gpu_memory_utilization\": 0.85, \"decode_cuda_graph\": true}"
+        HPARAMS="{\"tensor_parallel_size\": ${TP_SIZE}, \"gpu_memory_utilization\": 0.85, \"decode_graph\": true}"
         ;;
     esac
 

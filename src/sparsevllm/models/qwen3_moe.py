@@ -55,7 +55,7 @@ class Qwen3MoeRouter(nn.Module):
             top_k=self.top_k,
             activation_dtype=model_activation_dtype(config),
             norm_topk_prob=self.norm_topk_prob,
-            cuda_graph=bool(getattr(config, "decode_cuda_graph", False)),
+            cuda_graph=bool(getattr(config, "decode_graph", False)),
         )
         self.provider = resolve_moe_router_provider(self.op_spec)
         self.weight = nn.Parameter(torch.empty(self.num_experts, self.hidden_size))
@@ -84,7 +84,7 @@ class Qwen3MoePackedExperts(PackedMoeExperts):
                     False,
                 )
             ),
-            cuda_graph=bool(getattr(config, "decode_cuda_graph", False)),
+            cuda_graph=bool(getattr(config, "decode_graph", False)),
             model_label="Qwen3MoE",
             provider_resolver=resolve_moe_provider,
             parallel_context=get_parallel_context(),
@@ -219,11 +219,11 @@ class Qwen3MoeForCausalLM(nn.Module):
         return {
             "full_attention_provider": build_mha_full_attention_provider(
                 config,
-                sparse_method=engine_config.vllm_sparse_method,
+                sparse_method=engine_config.sparse_method,
                 attention_tp_size=parallel_context.attention_tp_size,
                 device=device,
                 max_batch_size=engine_config.max_decoding_seqs,
-                cuda_graph=engine_config.decode_cuda_graph,
+                cuda_graph=engine_config.decode_graph,
                 runtime_config=engine_config,
             ),
         }

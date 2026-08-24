@@ -87,7 +87,7 @@ def _base_hparams(args: argparse.Namespace, method: str, batch_size: int) -> dic
         "max_num_batched_tokens": args.max_num_batched_tokens,
         "max_num_seqs_in_batch": batch_size,
         "max_decoding_seqs": batch_size,
-        "decode_cuda_graph": not args.disable_decode_cuda_graph,
+        "decode_graph": not args.disable_decode_cuda_graph,
         "throughput_log_interval_s": 0.0,
     }
 
@@ -149,7 +149,7 @@ def _is_usable(row: dict[str, Any]) -> bool:
         row.get("status") == "SUCCESS"
         and bool(row.get("full_admission_reached", True))
         and int(row.get("scheduler_preemptions", 0) or 0) == 0
-        and (not bool(row.get("decode_cuda_graph_expected")) or bool(row.get("decode_cuda_graph_active")))
+        and (not bool(row.get("decode_graph_expected")) or bool(row.get("decode_graph_active")))
     )
 
 

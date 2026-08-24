@@ -254,8 +254,8 @@ conda run -n <CONDA_ENV> --no-capture-output \
   --output_root <OUTPUT_ROOT>
 ```
 
-Inspect `perf.jsonl` for `decode_cuda_graph_expected=true` and
-`decode_cuda_graph_active=true`.
+Inspect `perf.jsonl` for `decode_graph_expected=true` and
+`decode_graph_active=true`.
 
 ### Stress
 

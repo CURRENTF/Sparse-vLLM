@@ -9,7 +9,7 @@ controller、模型定义和 Triton kernel。
 Sparse-vLLM inference path：
 
 1. `sparsevllm.LLM(model, **kwargs)`
-2. `src/sparsevllm/configs/runtime_params.py` 规范 public runtime 参数名。
+2. `LLMEngine` 按规范 `Config` 字段校验 kwargs。
 3. `src/sparsevllm/config.py` 验证 engine config 和方法兼容性。
 4. `src/sparsevllm/engine/cache_manager/base.py` 选择 cache manager。
 5. `Scheduler`、`ModelRunner`、`SparseController`、kernel 和选中的 cache manager 执行 prefill 与 decode。
@@ -33,17 +33,17 @@ Prefill scheduling 是方法 contract 的一部分。默认 policy 位于 `src/s
 
 engine 当前支持：
 
-- `all_chunked`：所有 prefill request 都通过常规 scheduler limit 进行 chunking 和 batching，每个 sequence 每步最多调度 `chunk_prefill_size` 个 token。
-- `long_bs1full_short_batch`：在附加受支持的 prefix 后，residual token 数不超过 `long_prefill_offload_threshold` 的 request 使用 atomic full prefill，并且可以互相 batch；更大的 residual 单独运行 chunked RawKV offload prefill，每个 chunk 不超过 `chunk_prefill_size`。
+- `all_chunked`：所有 prefill request 都通过常规 scheduler limit 进行 chunking 和 batching，每个 sequence 每步最多调度 `engine_prefill_chunk_size` 个 token。
+- `long_bs1full_short_batch`：在附加受支持的 prefix 后，residual token 数不超过 `long_prefill_offload_threshold` 的 request 使用 atomic full prefill，并且可以互相 batch；更大的 residual 单独运行 chunked RawKV offload prefill，每个 chunk 不超过 `engine_prefill_chunk_size`。
 
-DeltaKV 和 PyramidKV 通过 `prefill_execution_mode()` 实现 long branch。threshold 默认是 `65536` token（64K）。未设置 `chunk_prefill_size` 时，`Config` 默认令其等于 threshold；显式设置时必须满足 `0 < chunk_prefill_size <= long_prefill_offload_threshold`。必要时，`Config` 会把 `max_num_batched_tokens` 提高到 threshold，使边界大小的 full prefill 保持 atomic。PyramidKV 根据 chain prefix attach 后的 residual 应用该边界。DeltaKV 不提供 prefix caching；如果 attached-prefix prefill 到达其 cache manager，会快速失败，因为其 compressed row state 没有 prefix residency contract。
+DeltaKV 和 PyramidKV 通过 `prefill_execution_mode()` 实现 long branch。threshold 默认是 `65536` token（64K）。未设置 `engine_prefill_chunk_size` 时，`Config` 默认令其等于 threshold；显式设置时必须满足 `0 < engine_prefill_chunk_size <= long_prefill_offload_threshold`。必要时，`Config` 会把 `max_num_batched_tokens` 提高到 threshold，使边界大小的 full prefill 保持 atomic。PyramidKV 根据 chain prefix attach 后的 residual 应用该边界。DeltaKV 不提供 prefix caching；如果 attached-prefix prefill 到达其 cache manager，会快速失败，因为其 compressed row state 没有 prefix residency contract。
 
 不要在 benchmark script 或一次性 config default 中编码某个方法的 prefill policy。应把 method-to-policy mapping 添加到 registry，并更新 `tests/test_prefill_schedule_policy.py`。
 
 ## 重要文件
 
-- `src/sparsevllm/configs/runtime_params.py`：public runtime 参数 alias 和 legacy key rejection。
-- `src/sparsevllm/config.py`：engine config default 和 validation。
+- `src/sparsevllm/configs/groups.py` 与 `runtime.py`：定义规范 runtime 字段、default 和 validation；public 与 internal 名称完全一致。
+- `src/sparsevllm/config.py`：`Config` 的 compatibility import facade。
 - `src/sparsevllm/method_registry.py`：支持的方法名和 prefill policy default。
 - `src/sparsevllm/engine/cache_manager/base.py`：method-to-cache-manager routing 和 shared cache-manager hook。
 - `src/sparsevllm/engine/scheduler.py`：prefill/decode scheduling 和 admission。

@@ -178,7 +178,7 @@ class DeltaKVLessMemoryKernelTest(unittest.TestCase):
             (),
             {
                 "cluster_metric": "l2",
-                "deltakv_k_neighbors": 3,
+                "deltakv_neighbor_count": 3,
                 "deltakv_cluster_gather_chunk_size": 5,
             },
         )()

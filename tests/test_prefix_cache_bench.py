@@ -4,7 +4,6 @@ import types
 
 import pytest
 
-from sparsevllm.configs.runtime_params import normalize_runtime_params
 from sparsevllm.config import Config
 from scripts.benchmarks import bench_prefix_cache as bench
 
@@ -29,10 +28,10 @@ def _summary_args():
         shared_suffix_len=1,
         history_update="generated",
         require_omnikv_prefill_path=False,
-        num_sink_tokens=0,
-        num_top_tokens=4,
-        num_recent_tokens=0,
-        chunk_prefill_size=4,
+        sink_keep_tokens=0,
+        decode_keep_tokens=4,
+        recent_keep_tokens=0,
+        engine_prefill_chunk_size=4,
         min_performance_prompt_len=0,
         min_cacheable_prefix_len=0,
     )
@@ -239,13 +238,13 @@ def test_prefix_cache_bench_engine_kwargs_are_sparsevllm_config_fields():
         gpu_memory_utilization=0.65,
         tensor_parallel_size=1,
         expert_parallel_size=2,
-        decode_cuda_graph=True,
+        decode_graph=True,
         max_active_requests=4,
         max_num_batched_tokens=8192,
-        chunk_prefill_size=4096,
-        num_sink_tokens=8,
-        num_recent_tokens=256,
-        num_top_tokens=2048,
+        engine_prefill_chunk_size=4096,
+        sink_keep_tokens=8,
+        recent_keep_tokens=256,
+        decode_keep_tokens=2048,
         require_omnikv_prefill_path=True,
         full_attention_layers="0,1,2,4,7,14",
         quest_chunk_size=16,
@@ -259,17 +258,16 @@ def test_prefix_cache_bench_engine_kwargs_are_sparsevllm_config_fields():
 
     kwargs = bench._case_engine_kwargs(args, "baseline_full", max_prompt_len=4096)
 
-    normalized = normalize_runtime_params(kwargs, backend="sparsevllm")
     config_fields = set(Config.__dataclass_fields__)
-    unknown = sorted(set(normalized.infer_config) - config_fields)
+    unknown = sorted(set(kwargs) - config_fields)
     assert unknown == []
-    assert normalized.infer_config["expert_parallel_size"] == 2
-    assert normalized.infer_config["decode_cuda_graph"] is True
+    assert kwargs["expert_parallel_size"] == 2
+    assert kwargs["decode_graph"] is True
 
 
 def test_prefix_cache_bench_requires_graph_capture_and_replay_on_every_rank():
     args = _summary_args()
-    args.decode_cuda_graph = True
+    args.decode_graph = True
     summary = bench._summarize_records(
         case_name="prefix_full",
         case_config=bench.CASE_PRESETS["prefix_full"],
@@ -302,8 +300,8 @@ def test_prefix_cache_bench_requires_graph_capture_and_replay_on_every_rank():
         ],
     )
 
-    assert summary["decode_cuda_graph_failures"] == []
-    assert summary["decode_cuda_graph_delta"] == [
+    assert summary["decode_graph_failures"] == []
+    assert summary["decode_graph_delta"] == [
         {
             "world_rank": rank,
             "capture_count": 1,
@@ -317,7 +315,7 @@ def test_prefix_cache_bench_requires_graph_capture_and_replay_on_every_rank():
 
 def test_prefix_cache_bench_accepts_warmup_capture_and_business_replay():
     args = _summary_args()
-    args.decode_cuda_graph = True
+    args.decode_graph = True
     counters = {
         "capture_count": 1,
         "eager_static_count": 0,
@@ -343,9 +341,9 @@ def test_prefix_cache_bench_accepts_warmup_capture_and_business_replay():
     )
 
     assert summary["status"] == "success"
-    assert summary["decode_cuda_graph_failures"] == []
-    assert summary["decode_cuda_graph_delta"][0]["capture_count"] == 0
-    assert summary["decode_cuda_graph_delta"][0]["replay_count"] == 4
+    assert summary["decode_graph_failures"] == []
+    assert summary["decode_graph_delta"][0]["capture_count"] == 0
+    assert summary["decode_graph_delta"][0]["replay_count"] == 4
 
 
 def test_prefix_cache_bench_trace_uses_resolved_sparse_budgets():
@@ -362,10 +360,10 @@ def test_prefix_cache_bench_trace_uses_resolved_sparse_budgets():
         shared_suffix_len=9,
         history_update="generated",
         require_omnikv_prefill_path=True,
-        num_sink_tokens=8,
-        num_top_tokens=2048,
-        num_recent_tokens=256,
-        chunk_prefill_size=16384,
+        sink_keep_tokens=8,
+        decode_keep_tokens=2048,
+        recent_keep_tokens=256,
+        engine_prefill_chunk_size=16384,
         min_performance_prompt_len=0,
         min_cacheable_prefix_len=0,
     )

@@ -202,14 +202,14 @@ def sample_decode_points(
     answer_query_token_id: int,
     random_points_per_sample: int,
     rng: random.Random,
-    num_sink_tokens: int,
-    num_recent_tokens: int,
+    sink_keep_tokens: int,
+    recent_keep_tokens: int,
     min_prefix_tokens: int,
 ) -> list[CalibrationPoint]:
     if random_points_per_sample < 0:
         raise ValueError(f"random_points_per_sample must be >= 0, got {random_points_per_sample}.")
     prompt_len = len(prompt_token_ids)
-    min_prefix = max(int(min_prefix_tokens), int(num_sink_tokens) + int(num_recent_tokens))
+    min_prefix = max(int(min_prefix_tokens), int(sink_keep_tokens) + int(recent_keep_tokens))
     max_prefix = prompt_len - 1
     if max_prefix < min_prefix:
         raise ValueError(
@@ -253,8 +253,8 @@ def topk_indices_from_decode_attentions(
     attentions: tuple[torch.Tensor, ...],
     *,
     topk: int,
-    num_sink_tokens: int,
-    num_recent_tokens: int,
+    sink_keep_tokens: int,
+    recent_keep_tokens: int,
 ) -> tuple[list[list[int]], int]:
     if not attentions:
         raise RuntimeError("Model did not return attentions for the decode point.")
@@ -273,12 +273,12 @@ def topk_indices_from_decode_attentions(
             )
         scores = attn[0, :, 0, :].detach().float().max(dim=0).values
         kv_len = int(scores.numel())
-        search_start = int(num_sink_tokens)
-        search_end = kv_len - int(num_recent_tokens)
+        search_start = int(sink_keep_tokens)
+        search_end = kv_len - int(recent_keep_tokens)
         if search_end <= search_start:
             raise RuntimeError(
                 "Decode point has no searchable history after sink/recent exclusion: "
-                f"kv_len={kv_len}, num_sink_tokens={num_sink_tokens}, num_recent_tokens={num_recent_tokens}."
+                f"kv_len={kv_len}, sink_keep_tokens={sink_keep_tokens}, recent_keep_tokens={recent_keep_tokens}."
             )
         search_scores = scores[search_start:search_end]
         cur_k = min(int(topk), int(search_scores.numel()))
@@ -434,8 +434,8 @@ def collect_sample_topk(
     prompt_token_ids: list[int],
     points: list[CalibrationPoint],
     topk: int,
-    num_sink_tokens: int,
-    num_recent_tokens: int,
+    sink_keep_tokens: int,
+    recent_keep_tokens: int,
     prefill_chunk_size: int,
     attention_layer_indices: list[int],
 ) -> tuple[list[dict[str, Any]], np.ndarray, list[dict[str, Any]]]:
@@ -475,8 +475,8 @@ def collect_sample_topk(
         layer_topk, k_eff = topk_indices_from_decode_attentions(
             outputs.attentions,
             topk=topk,
-            num_sink_tokens=num_sink_tokens,
-            num_recent_tokens=num_recent_tokens,
+            sink_keep_tokens=sink_keep_tokens,
+            recent_keep_tokens=recent_keep_tokens,
         )
         add_topk_to_pair_scores(pair_scores, layer_topk)
         record = asdict(point)
@@ -599,8 +599,8 @@ def run_calibration(args: argparse.Namespace) -> dict[str, Any]:
             answer_query_token_id=answer_token_id,
             random_points_per_sample=args.random_decode_points_per_sample,
             rng=rng,
-            num_sink_tokens=args.num_sink_tokens,
-            num_recent_tokens=args.num_recent_tokens,
+            sink_keep_tokens=args.sink_keep_tokens,
+            recent_keep_tokens=args.recent_keep_tokens,
             min_prefix_tokens=args.min_prefix_tokens,
         )
         point_records, sample_pair_scores, sample_topk = collect_sample_topk(
@@ -609,8 +609,8 @@ def run_calibration(args: argparse.Namespace) -> dict[str, Any]:
             prompt_token_ids=prompt_token_ids,
             points=points,
             topk=args.topk,
-            num_sink_tokens=args.num_sink_tokens,
-            num_recent_tokens=args.num_recent_tokens,
+            sink_keep_tokens=args.sink_keep_tokens,
+            recent_keep_tokens=args.recent_keep_tokens,
             prefill_chunk_size=args.prefill_chunk_size,
             attention_layer_indices=attention_layer_indices,
         )
@@ -662,8 +662,8 @@ def run_calibration(args: argparse.Namespace) -> dict[str, Any]:
         "num_full_layers": int(args.num_full_layers),
         "forced_full_layers": [attention_layer_indices[0]],
         "topk": int(args.topk),
-        "num_sink_tokens": int(args.num_sink_tokens),
-        "num_recent_tokens": int(args.num_recent_tokens),
+        "sink_keep_tokens": int(args.sink_keep_tokens),
+        "recent_keep_tokens": int(args.recent_keep_tokens),
         "dataset": args.dataset,
         "num_samples": int(args.num_samples),
         "random_decode_points_per_sample": int(args.random_decode_points_per_sample),

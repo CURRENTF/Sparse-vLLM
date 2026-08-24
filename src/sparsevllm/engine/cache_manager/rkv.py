@@ -62,9 +62,9 @@ class RKVCacheManager(SnapKVCacheManager):
         if obs <= 0:
             return False
         budget = (
-            int(getattr(config, "num_sink_tokens", 0) or 0)
+            int(getattr(config, "sink_keep_tokens", 0) or 0)
             + int(getattr(config, "decode_keep_tokens", 0) or 0)
-            + int(getattr(config, "num_recent_tokens", 0) or 0)
+            + int(getattr(config, "recent_keep_tokens", 0) or 0)
         )
         trigger_len = budget + int(getattr(config, "rkv_compression_interval", 0) or 0)
         return int(getattr(config, "max_model_len", 0) or 0) >= trigger_len
@@ -306,10 +306,10 @@ class RKVCacheManager(SnapKVCacheManager):
                         self._clear_rkv_query_cache_row(int(layer_idx), row_idx)
         return result
 
-    def decode_cuda_graph_keepalive_tensors(self) -> list[torch.Tensor]:
+    def decode_graph_keepalive_tensors(self) -> list[torch.Tensor]:
         if not self._is_rkv_query_cache_enabled():
-            return super().decode_cuda_graph_keepalive_tensors()
-        return super().decode_cuda_graph_keepalive_tensors() + list(self._rkv_query_cache) + list(self._rkv_query_positions)
+            return super().decode_graph_keepalive_tensors()
+        return super().decode_graph_keepalive_tensors() + list(self._rkv_query_cache) + list(self._rkv_query_positions)
 
     @torch.no_grad()
     def record_prefill_query(
@@ -401,7 +401,7 @@ class RKVCacheManager(SnapKVCacheManager):
         kv_len: int,
         *,
         candidate_start: int,
-        num_recent_tokens: int,
+        recent_keep_tokens: int,
     ) -> torch.Tensor:
         layer_idx = int(layer_idx)
         if not self._is_rkv_query_cache_enabled():
@@ -439,7 +439,7 @@ class RKVCacheManager(SnapKVCacheManager):
             candidate_start = max(0, int(candidate_start))
             candidate_end = max(
                 candidate_start,
-                kv_len - int(num_recent_tokens),
+                kv_len - int(recent_keep_tokens),
             )
             scores = torch.zeros(
                 (kv_len,),
@@ -499,7 +499,7 @@ class RKVCacheManager(SnapKVCacheManager):
             score_q_start,
             score_q_end,
             candidate_start=int(candidate_start),
-            num_recent_tokens=int(num_recent_tokens),
+            recent_keep_tokens=int(recent_keep_tokens),
         )
         return attn_score[0]
 
@@ -511,7 +511,7 @@ class RKVCacheManager(SnapKVCacheManager):
         kv_lens: list[int],
         *,
         candidate_start: int,
-        num_recent_tokens: int,
+        recent_keep_tokens: int,
     ) -> torch.Tensor:
         layer_idx = int(layer_idx)
         if not self._is_rkv_query_cache_enabled():
@@ -540,7 +540,7 @@ class RKVCacheManager(SnapKVCacheManager):
                     seq,
                     int(kv_len),
                     candidate_start=candidate_start,
-                    num_recent_tokens=num_recent_tokens,
+                    recent_keep_tokens=recent_keep_tokens,
                 )
                 scores[batch_idx, : int(kv_len)] = single
             return scores
@@ -609,7 +609,7 @@ class RKVCacheManager(SnapKVCacheManager):
             score_starts.to(torch.int32),
             score_ends.to(torch.int32),
             candidate_start=int(candidate_start),
-            num_recent_tokens=int(num_recent_tokens),
+            recent_keep_tokens=int(recent_keep_tokens),
         )
         return attn_score
 
@@ -720,8 +720,8 @@ class RKVCacheManager(SnapKVCacheManager):
         if kv_len <= budget:
             return torch.arange(kv_len, dtype=torch.long, device=importance_scores.device)
 
-        num_sink = min(int(self.config.num_sink_tokens), kv_len)
-        num_recent = min(int(self.config.num_recent_tokens), max(0, kv_len - num_sink))
+        num_sink = min(int(self.config.sink_keep_tokens), kv_len)
+        num_recent = min(int(self.config.recent_keep_tokens), max(0, kv_len - num_sink))
         recent_start = kv_len - num_recent
         candidate_start = num_sink
         candidate_end = max(candidate_start, recent_start)
@@ -790,8 +790,8 @@ class RKVCacheManager(SnapKVCacheManager):
             keep = torch.arange(kv_len, dtype=torch.long, device=importance_scores.device)
             return keep.unsqueeze(0).expand(len(seqs), -1).contiguous()
 
-        num_sink = min(int(self.config.num_sink_tokens), kv_len)
-        num_recent = min(int(self.config.num_recent_tokens), max(0, kv_len - num_sink))
+        num_sink = min(int(self.config.sink_keep_tokens), kv_len)
+        num_recent = min(int(self.config.recent_keep_tokens), max(0, kv_len - num_sink))
         recent_start = kv_len - num_recent
         candidate_start = num_sink
         candidate_end = max(candidate_start, recent_start)

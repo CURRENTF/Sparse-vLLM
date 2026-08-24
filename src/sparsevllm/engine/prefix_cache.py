@@ -34,7 +34,7 @@ def resolve_prefix_cache_block_size(config: Any) -> int:
     configured = getattr(config, "prefix_cache_block_size", None)
     if configured is not None and (isinstance(configured, bool) or not isinstance(configured, int)):
         raise ValueError(f"prefix_cache_block_size must be a positive integer, got {configured!r}.")
-    method = str(getattr(config, "vllm_sparse_method", "") or "")
+    method = str(getattr(config, "sparse_method", "") or "")
     if method == "quest":
         quest_chunk_size = int(getattr(config, "quest_chunk_size"))
         runtime_layout = getattr(config, "runtime_layout", None)
@@ -67,16 +67,16 @@ def build_prefix_cache_fingerprint(config: Any, block_size: int) -> bytes:
         "model_type": getattr(hf_config, "model_type", None),
         "dtype": str(getattr(hf_config, "torch_dtype", None)),
         "tp_size": int(getattr(config, "tensor_parallel_size", 1)),
-        "method": str(getattr(config, "vllm_sparse_method", "") or ""),
+        "method": str(getattr(config, "sparse_method", "") or ""),
         "block_size": int(block_size),
         "salt": str(getattr(config, "prefix_cache_salt", "") or ""),
         "decode_keep_tokens": _jsonable(getattr(config, "decode_keep_tokens", None)),
-        "num_sink_tokens": _jsonable(getattr(config, "num_sink_tokens", None)),
-        "num_recent_tokens": _jsonable(getattr(config, "num_recent_tokens", None)),
+        "sink_keep_tokens": _jsonable(getattr(config, "sink_keep_tokens", None)),
+        "recent_keep_tokens": _jsonable(getattr(config, "recent_keep_tokens", None)),
         "sparse_prefill_score_mode": _jsonable(
             getattr(config, "sparse_prefill_score_mode", None)
         ),
-        "full_attn_layers": _jsonable(getattr(config, "full_attn_layers", None)),
+        "full_attention_layers": _jsonable(getattr(config, "full_attention_layers", None)),
         "obs_layer_ids": _jsonable(getattr(config, "obs_layer_ids", None)),
         "quest_chunk_size": _jsonable(getattr(config, "quest_chunk_size", None)),
         "quest_skip_layers": _jsonable(getattr(config, "quest_skip_layers", None)),

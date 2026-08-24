@@ -242,11 +242,11 @@ class ModelRunner:
         setattr(hf_config, "mlp_chunk_size", config.mlp_chunk_size)
         setattr(
             hf_config,
-            "decode_cuda_graph",
-            bool(getattr(config, "decode_cuda_graph", False)),
+            "decode_graph",
+            bool(getattr(config, "decode_graph", False)),
         )
         decode_static_capture_sizes = _resolve_decode_cuda_graph_capture_sizes(
-            config.decode_cuda_graph_capture_sizes,
+            config.decode_graph_capture_sizes,
             config.max_decoding_seqs,
         )
         self.model = _create_model(
@@ -365,18 +365,18 @@ class ModelRunner:
         self.load_deltakv_compressors()
 
         decode_static_context_sizes = _resolve_decode_cuda_graph_context_sizes(
-            self.config.decode_cuda_graph_context_sizes,
+            self.config.decode_graph_context_sizes,
             self.config.max_model_len,
         )
-        self.cuda_graph_pool = torch.cuda.graph_pool_handle() if self.config.decode_cuda_graph else None
-        self.decode_cuda_graph_runner = DecodeCudaGraphRunner(
+        self.cuda_graph_pool = torch.cuda.graph_pool_handle() if self.config.decode_graph else None
+        self.decode_graph_runner = DecodeCudaGraphRunner(
             runtime_state=self.runtime_state,
             cache_manager=self.cache_manager,
             recurrent_state_manager=self.recurrent_state_manager,
             sparse_controller=self.sparse_controller,
             run_model=self.run_model,
             is_long_text_batch=self._is_long_text_batch,
-            method=self.config.vllm_sparse_method,
+            method=self.config.sparse_method,
             capture_sizes=decode_static_capture_sizes,
             context_sizes=decode_static_context_sizes,
             graph_pool=self.cuda_graph_pool,
@@ -407,8 +407,8 @@ class ModelRunner:
         # Graph replay is asynchronous on every rank. Drain and release captured
         # NCCL work before entering the shutdown barrier or destroying its group.
         self.platform.synchronize()
-        if self.config.decode_cuda_graph:
-            self.decode_cuda_graph_runner.clear_captured_graphs()
+        if self.config.decode_graph:
+            self.decode_graph_runner.clear_captured_graphs()
             self.platform.synchronize()
         close_runtime_operators = getattr(self.model, "close_runtime_operators", None)
         if callable(close_runtime_operators):
@@ -495,7 +495,7 @@ class ModelRunner:
                     result = method(*args)
             except BaseException as exc:
                 local_error = exc
-            if method_name == "run" and self.config.decode_cuda_graph:
+            if method_name == "run" and self.config.decode_graph:
                 self._sync_tp_run_status(local_error)
             else:
                 self._sync_tp_rpc_status(method_name, local_error)
@@ -626,14 +626,14 @@ class ModelRunner:
 
     def load_deltakv_compressors(self):
         """加载 DeltaKV 压缩器权重"""
-        method = str(self.config.vllm_sparse_method or "")
-        if not method.startswith('deltakv') or self.config.deltakv_path is None:
+        method = str(self.config.sparse_method or "")
+        if not method.startswith('deltakv') or self.config.deltakv_checkpoint_path is None:
             return
         
-        logger.info(f"Loading DeltaKV compressors from {self.config.deltakv_path}")
+        logger.info(f"Loading DeltaKV compressors from {self.config.deltakv_checkpoint_path}")
         from sparsevllm.utils.loader import load_deltakv_compressors_to_cache_manager
 
-        load_deltakv_compressors_to_cache_manager(self.cache_manager, self.config.deltakv_path)
+        load_deltakv_compressors_to_cache_manager(self.cache_manager, self.config.deltakv_checkpoint_path)
 
     def reset_after_warmup(self) -> None:
         reset_after_warmup = getattr(self.runtime_state, "reset_after_warmup", None)
@@ -649,7 +649,7 @@ class ModelRunner:
                     reset_prefix_cache()
 
         if os.getenv("SPARSEVLLM_DELTAKV_CLEAR_GRAPHS_AFTER_WARMUP", "0") == "1":
-            self.decode_cuda_graph_runner.clear_captured_graphs()
+            self.decode_graph_runner.clear_captured_graphs()
         if os.getenv("SPARSEVLLM_DELTAKV_CLEAR_ATTN_SCORE_BUFFERS_AFTER_WARMUP", "0") == "1":
             self.sparse_controller.clear_decode_attn_score_buffers()
 
@@ -900,11 +900,11 @@ class ModelRunner:
             state["mixed_prefix_cache"] = (
                 prefix_cache_coordinator.debug_state_summary()
             )
-        graph_runner = getattr(self, "decode_cuda_graph_runner", None)
+        graph_runner = getattr(self, "decode_graph_runner", None)
         graph_key = getattr(graph_runner, "last_state_key", None)
         graph_summary = {
             "enabled": bool(
-                getattr(config, "decode_cuda_graph", False)
+                getattr(config, "decode_graph", False)
             ),
             "capture_count": int(
                 getattr(graph_runner, "capture_count", 0)
@@ -966,7 +966,7 @@ class ModelRunner:
                 ),
             },
             "state": state,
-            "decode_cuda_graph": graph_summary,
+            "decode_graph": graph_summary,
             "last_logits": (
                 _debug_tensor_summary(self.debug_last_logits)
                 if hasattr(self, "debug_last_logits")
@@ -1147,12 +1147,12 @@ class ModelRunner:
 
     def _long_text_threshold(self, is_prefill: bool) -> int:
         del is_prefill
-        if self.config.vllm_sparse_method in ("streamingllm", "attention-sink", "attention_sink"):
-            base = self.config.num_sink_tokens + self.config.num_recent_tokens
+        if self.config.sparse_method in ("streamingllm", "attention-sink", "attention_sink"):
+            base = self.config.sink_keep_tokens + self.config.recent_keep_tokens
         else:
             base = (
-                self.config.num_sink_tokens
-                + self.config.num_recent_tokens
+                self.config.sink_keep_tokens
+                + self.config.recent_keep_tokens
                 + self.config.decode_keep_tokens
             )
         return base
@@ -1162,7 +1162,7 @@ class ModelRunner:
         # batch-level flag remains only for decode graph families.
         if not seqs:
             return False
-        if not self.config.vllm_sparse_method:
+        if not self.config.sparse_method:
             return False
         if is_prefill:
             return False
@@ -1215,13 +1215,13 @@ class ModelRunner:
     def _auto_capture_greedy_sampling(self, seqs: list[Sequence]) -> bool:
         if any(self._has_sampling_penalty(seq) for seq in seqs):
             return False
-        if self.config.decode_cuda_graph_capture_sampling:
+        if self.config.decode_graph_capture_sampling:
             return all(bool(getattr(seq, "should_publish_sample", True)) for seq in seqs)
         if self.config.tensor_parallel_size != 1:
             return False
         if self.config.enable_prefix_caching:
             return False
-        if str(self.config.vllm_sparse_method or "") not in {"", "omnikv"}:
+        if str(self.config.sparse_method or "") not in {"", "omnikv"}:
             return False
         return all(
             bool(getattr(seq, "should_publish_sample", True))
@@ -1339,7 +1339,7 @@ class ModelRunner:
         return token_logprobs, top_logprobs
 
     def set_decode_cuda_graph_max_context_len_override(self, max_context_len: int | None):
-        self.decode_cuda_graph_runner.set_max_context_len_override(max_context_len)
+        self.decode_graph_runner.set_max_context_len_override(max_context_len)
 
     def set_omnikv_decode_graph_max_context_len_override(self, max_context_len: int | None):
         self.set_decode_cuda_graph_max_context_len_override(max_context_len)
@@ -1383,7 +1383,7 @@ class ModelRunner:
                     self.sparse_controller.prepare_forward(seqs, is_prefill)
                 logits = self.run_model(input_ids, positions, is_prefill)
             else:
-                logits = self.decode_cuda_graph_runner.run_eager_static(seqs)
+                logits = self.decode_graph_runner.run_eager_static(seqs)
             with profiler.record("model_sparse_post"):
                 self.sparse_controller.post_forward(seqs, is_prefill)
             return logits if self.rank == 0 else None
@@ -1442,13 +1442,13 @@ class ModelRunner:
         with profiler.record(name):
             if not is_prefill:
                 try:
-                    if self.config.decode_cuda_graph:
-                        logits, graph_token_ids = self.decode_cuda_graph_runner.run(
+                    if self.config.decode_graph:
+                        logits, graph_token_ids = self.decode_graph_runner.run(
                             seqs,
                             capture_sampling=self._auto_capture_greedy_sampling(seqs),
                         )
                     else:
-                        logits = self.decode_cuda_graph_runner.run_eager_static(seqs)
+                        logits = self.decode_graph_runner.run_eager_static(seqs)
                         graph_token_ids = None
                     self._record_debug_logits(logits)
                     if self.rank != 0:

@@ -101,7 +101,7 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
         self._decode_static_index_buffers: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
 
         self.enable_prefix_caching = bool(
-            config.enable_prefix_caching and config.vllm_sparse_method in ("", "omnikv")
+            config.enable_prefix_caching and config.sparse_method in ("", "omnikv")
             and not getattr(getattr(config, "runtime_layout", None), "linear_attention_layer_indices", ())
         )
         self.prefix_cache_block_size = int(config.prefix_cache_block_size)
@@ -342,9 +342,9 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
     def prompt_admission_budgets(
         self,
         waiting_seqs: deque[Sequence],
-        chunk_prefill_size: int,
+        engine_prefill_chunk_size: int,
     ) -> dict[str, int]:
-        budgets = super().prompt_admission_budgets(waiting_seqs, chunk_prefill_size)
+        budgets = super().prompt_admission_budgets(waiting_seqs, engine_prefill_chunk_size)
         budgets["rows"] = int(self.num_free_rows)
         return budgets
 
@@ -388,7 +388,7 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
             return {
                 "supported": True,
                 "enabled": False,
-                "method": str(getattr(self.config, "vllm_sparse_method", "") or ""),
+                "method": str(getattr(self.config, "sparse_method", "") or ""),
                 "matched_tokens": 0,
                 "matched_blocks": 0,
                 "match_ratio": 0.0,
@@ -403,7 +403,7 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
         return {
             "supported": True,
             "enabled": True,
-            "method": str(getattr(self.config, "vllm_sparse_method", "") or ""),
+            "method": str(getattr(self.config, "sparse_method", "") or ""),
             "block_size": int(self.prefix_cache_block_size),
             "prompt_tokens": int(len(token_ids)),
             "usable_tokens": int(usable_tokens),
@@ -578,7 +578,7 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
         seq.prefix_cache_hit_block_count = int(hit_blocks)
         seq.prefix_cache_hit_last_block_id = last_block_id
         seq.prefix_cache_block_size = self.prefix_cache_block_size
-        seq.prefix_cache_method = str(self.config.vllm_sparse_method or "")
+        seq.prefix_cache_method = str(self.config.sparse_method or "")
 
     def _free_prefix_cache_blocks(self, blocks: list[PrefixCacheBlock]) -> None:
         pending = getattr(self, "_prefix_write_through_candidates", None)

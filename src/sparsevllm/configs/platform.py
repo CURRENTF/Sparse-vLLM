@@ -1,38 +1,8 @@
-"""Model-path, parallelism, and platform-alias normalization."""
+"""Model-path and parallelism validation."""
 
 import os
 
 from sparsevllm.configs.common import _coerce_bool_config
-
-
-def _normalize_platform_aliases(config) -> None:
-    if config.device_memory_utilization is not None:
-        config.gpu_memory_utilization = float(config.device_memory_utilization)
-    config.device_memory_utilization = float(config.gpu_memory_utilization)
-
-    if config.decode_graph is not None:
-        config.decode_cuda_graph = _coerce_bool_config("decode_graph", config.decode_graph)
-    else:
-        config.decode_cuda_graph = _coerce_bool_config(
-            "decode_cuda_graph",
-            config.decode_cuda_graph,
-        )
-    config.decode_graph = bool(config.decode_cuda_graph)
-
-    if config.decode_graph_capture_sampling is not None:
-        config.decode_cuda_graph_capture_sampling = _coerce_bool_config(
-            "decode_graph_capture_sampling",
-            config.decode_graph_capture_sampling,
-        )
-    else:
-        config.decode_cuda_graph_capture_sampling = _coerce_bool_config(
-            "decode_cuda_graph_capture_sampling",
-            config.decode_cuda_graph_capture_sampling,
-        )
-    config.decode_graph_capture_sampling = bool(config.decode_cuda_graph_capture_sampling)
-
-    if config.decode_graph_capture_sizes is not None:
-        config.decode_cuda_graph_capture_sizes = config.decode_graph_capture_sizes
 
 
 def normalize_platform(config) -> None:
@@ -57,4 +27,12 @@ def normalize_platform(config) -> None:
             "weight_loading_workers must be positive, "
             f"got {config.weight_loading_workers}."
         )
-    _normalize_platform_aliases(config)
+    config.gpu_memory_utilization = float(config.gpu_memory_utilization)
+    config.decode_graph = _coerce_bool_config(
+        "decode_graph",
+        config.decode_graph,
+    )
+    config.decode_graph_capture_sampling = _coerce_bool_config(
+        "decode_graph_capture_sampling",
+        config.decode_graph_capture_sampling,
+    )

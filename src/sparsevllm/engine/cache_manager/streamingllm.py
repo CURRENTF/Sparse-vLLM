@@ -22,11 +22,11 @@ class StreamingLLMCacheManager(SnapKVCacheManager):
         self._uniform_decode_metadata = True
 
     def prefill_batched_tokens_margin(self) -> int:
-        return int(self.config.num_recent_tokens)
+        return int(self.config.recent_keep_tokens)
 
     def remaining_prefill_tokens(self, seq: Sequence) -> int:
         remaining = int(seq.num_prompt_tokens - seq.num_prefilled_tokens)
-        recent = int(self.config.num_recent_tokens)
+        recent = int(self.config.recent_keep_tokens)
         if recent > 0 and remaining > recent:
             return remaining - recent
         return remaining
@@ -37,15 +37,15 @@ class StreamingLLMCacheManager(SnapKVCacheManager):
         seqs: list[Sequence],
         *,
         kv_len: int,
-        num_sink_tokens: int,
-        num_recent_tokens: int,
+        sink_keep_tokens: int,
+        recent_keep_tokens: int,
     ):
         super().free_prefix_recent_slots_batch_layers(
             layer_indices,
             seqs,
             kv_len=kv_len,
-            num_sink_tokens=num_sink_tokens,
-            num_recent_tokens=num_recent_tokens,
+            sink_keep_tokens=sink_keep_tokens,
+            recent_keep_tokens=recent_keep_tokens,
         )
         if layer_indices and len(layer_indices) == self.num_layers:
             self._uniform_decode_metadata = True

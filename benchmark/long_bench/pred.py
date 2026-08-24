@@ -27,7 +27,6 @@ from benchmark.long_bench.prompt_budget import encode_prompt_with_generation_bud
 from benchmark.sparsevllm_regression.manifest import (
     validate_omnikv_benchmark_config,
 )
-from sparsevllm.configs.runtime_params import normalize_runtime_params
 from datetime import datetime
 
 BASE_PATH = os.getenv("SPARSEVLLM_OUTPUT_DIR", str(REPO_ROOT / "outputs"))
@@ -203,12 +202,7 @@ def _requested_runtime_config(
     public["sparse_method"] = args.sparse_method
     if args.deltakv_checkpoint_path is not None:
         public["deltakv_checkpoint_path"] = args.deltakv_checkpoint_path
-    normalized = normalize_runtime_params(public, backend="sparsevllm")
-    return {
-        "public": public,
-        "normalized": normalized.infer_config,
-        "normalization_warnings": list(normalized.warnings),
-    }
+    return {"config": public}
 
 
 def _record_effective_runtime_config(
@@ -442,7 +436,7 @@ def _decode_cuda_graph_status(
         )
 
     runner = getattr(llm, "model_runner", None)
-    graph_runner = getattr(runner, "decode_cuda_graph_runner", None)
+    graph_runner = getattr(runner, "decode_graph_runner", None)
     graph_states = (
         getattr(graph_runner, "_graphs", {})
         if graph_runner is not None
@@ -455,7 +449,7 @@ def _decode_cuda_graph_status(
     graph_status = {
         "rank": int(rank),
         "configured": bool(
-            getattr(getattr(llm, "config", None), "decode_cuda_graph", False)
+            getattr(getattr(llm, "config", None), "decode_graph", False)
         ),
         "runner_initialized": graph_runner is not None,
         "state_count": int(len(graph_states)),
@@ -492,7 +486,7 @@ def _write_decode_cuda_graph_status(
         }
     status_path = os.path.join(
         out_root,
-        f"decode_cuda_graph_status_rank{rank}.json",
+        f"decode_graph_status_rank{rank}.json",
     )
     with open(status_path, "w", encoding="utf-8") as handle:
         json.dump(graph_status, handle, ensure_ascii=False, indent=2)

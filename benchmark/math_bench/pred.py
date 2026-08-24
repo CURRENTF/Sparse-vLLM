@@ -247,21 +247,21 @@ def _count_generated_text_tokens(tokenizer, texts: list[str]) -> int:
 
 def _decode_cuda_graph_status(generate_fn) -> dict:
     llm = getattr(generate_fn, "_sparsevllm_llm", None)
-    runner = getattr(getattr(llm, "model_runner", None), "decode_cuda_graph_runner", None)
+    runner = getattr(getattr(llm, "model_runner", None), "decode_graph_runner", None)
     states = getattr(runner, "_graphs", {}) if runner is not None else {}
     graph_count = sum(
         1
         for state in states.values()
         if getattr(state, "graph", None) is not None
     )
-    configured = bool(getattr(getattr(llm, "config", None), "decode_cuda_graph", False))
+    configured = bool(getattr(getattr(llm, "config", None), "decode_graph", False))
     return {
-        "decode_cuda_graph_configured": configured,
-        "decode_cuda_graph_runner_initialized": runner is not None,
-        "decode_cuda_graph_state_count": int(len(states)),
-        "decode_cuda_graph_graph_count": int(graph_count),
-        "decode_cuda_graph_last_state_key": str(getattr(runner, "last_state_key", None)) if runner is not None else None,
-        "decode_cuda_graph_active": bool(configured and graph_count > 0),
+        "decode_graph_configured": configured,
+        "decode_graph_runner_initialized": runner is not None,
+        "decode_graph_state_count": int(len(states)),
+        "decode_graph_graph_count": int(graph_count),
+        "decode_graph_last_state_key": str(getattr(runner, "last_state_key", None)) if runner is not None else None,
+        "decode_graph_active": bool(configured and graph_count > 0),
     }
 
 
@@ -465,11 +465,11 @@ def worker(rank: int, world_size: int, datasets: List[str], args, out_root: str)
         json.dump(perf_summary, f, ensure_ascii=False, indent=2)
     print(f"Wrote performance summary to: {perf_path}")
     if (
-        bool(perf_summary.get("decode_cuda_graph_configured"))
-        and not bool(perf_summary.get("decode_cuda_graph_active"))
+        bool(perf_summary.get("decode_graph_configured"))
+        and not bool(perf_summary.get("decode_graph_active"))
     ):
         raise RuntimeError(
-            "decode_cuda_graph=True was configured, but no active decode CUDA graph "
+            "decode_graph=True was configured, but no active decode CUDA graph "
             f"was observed. See {perf_path}."
         )
 

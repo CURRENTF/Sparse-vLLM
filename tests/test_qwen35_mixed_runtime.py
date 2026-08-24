@@ -64,11 +64,11 @@ def _single_process_parallel_context() -> ParallelContext:
 def test_qwen35_runtime_passes_h2o_score_contract_to_full_attention_builder():
     config = object()
     engine_config = SimpleNamespace(
-        vllm_sparse_method="h2o",
+        sparse_method="h2o",
         sparse_prefill_score_mode="logits",
         h2o_prefill_score_window=0,
         max_decoding_seqs=8,
-        decode_cuda_graph=False,
+        decode_graph=False,
     )
     context = SimpleNamespace(attention_tp_size=1)
     full_attention = object()
@@ -105,9 +105,9 @@ def test_qwen35_runtime_passes_h2o_score_contract_to_full_attention_builder():
 def test_qwen35_runtime_closes_attention_if_gdn_prepare_fails():
     config = object()
     engine_config = SimpleNamespace(
-        vllm_sparse_method="vanilla",
+        sparse_method="vanilla",
         max_decoding_seqs=8,
-        decode_cuda_graph=False,
+        decode_graph=False,
     )
     context = SimpleNamespace(attention_tp_size=1)
     full_attention = Mock(name="full_attention")
@@ -406,7 +406,7 @@ class _ResidentAdmissionCache:
     def complete_prefill_execution(self, seq):
         del seq
 
-    def reserved_prefill_slots(self, waiting, chunk_prefill_size):
+    def reserved_prefill_slots(self, waiting, engine_prefill_chunk_size):
         return 0
 
     def should_schedule_full_prefill(self, seq):
@@ -442,7 +442,7 @@ class _ResidentAdmissionCache:
     def prompt_admission_free_slots(self):
         return self.num_free_slots
 
-    def prompt_admission_budgets(self, waiting, chunk_prefill_size):
+    def prompt_admission_budgets(self, waiting, engine_prefill_chunk_size):
         return {"slots": self.num_free_slots}
 
     def prompt_admission_costs(self, seq):
@@ -485,14 +485,14 @@ def _resident_scheduler_config():
         max_num_batched_tokens=4,
         max_decoding_seqs=2,
         max_num_seqs_in_gpu=2,
-        chunk_prefill_size=2,
+        engine_prefill_chunk_size=2,
         prefill_schedule_policy="all_chunked",
         eos=-1,
         eos_token_ids=(),
-        num_sink_tokens=1,
-        num_recent_tokens=1,
+        sink_keep_tokens=1,
+        recent_keep_tokens=1,
         decode_keep_tokens=4,
-        vllm_sparse_method="",
+        sparse_method="",
     )
 
 
@@ -850,7 +850,7 @@ def _budget_test_manager(
         ),
         gpu_memory_utilization=0.9,
         max_num_batched_tokens=1,
-        chunk_prefill_size=1,
+        engine_prefill_chunk_size=1,
         long_prefill_offload_threshold=1,
         prefill_schedule_policy="long_bs1full_short_batch",
         enable_prefix_caching=prefix_on,
@@ -964,8 +964,8 @@ def test_model_runner_resets_inherited_allocator_peak_before_model_construction(
         parallel_topology=ParallelTopology(1, 1, 1),
         uses_outer_tp_moe_layout=False,
         mlp_chunk_size=16384,
-        decode_cuda_graph=False,
-        decode_cuda_graph_capture_sizes=None,
+        decode_graph=False,
+        decode_graph_capture_sizes=None,
         max_decoding_seqs=64,
         max_num_seqs_in_batch=32,
         hf_config=SimpleNamespace(model_type="qwen2", torch_dtype=torch.float32),
@@ -1067,8 +1067,8 @@ def test_omnikv_observation_layers_follow_compact_qwen_kv_order(tmp_path):
     with patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", return_value=outer_config):
         cfg = Config(
             model=str(tmp_path),
-            vllm_sparse_method="omnikv",
-            full_attn_layers="3,11,23,31,35,47,59",
+            sparse_method="omnikv",
+            full_attention_layers="3,11,23,31,35,47,59",
         )
 
     assert cfg.obs_layer_ids == [3, 11, 23, 35, 47, 59]
@@ -1079,7 +1079,7 @@ def test_qwen35_pyramidkv_ratios_follow_compact_kv_order(tmp_path):
     with patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", return_value=outer_config):
         cfg = Config(
             model=str(tmp_path),
-            vllm_sparse_method="pyramidkv",
+            sparse_method="pyramidkv",
             pyramidkv_start_ratio=0.5,
             pyramidkv_least_ratio=0.1,
         )
@@ -1100,7 +1100,7 @@ def test_qwen35_pyramidkv_allocates_slots_only_for_kv_layers(tmp_path):
     with patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", return_value=outer_config):
         cfg = Config(
             model=str(tmp_path),
-            vllm_sparse_method="pyramidkv",
+            sparse_method="pyramidkv",
             pyramidkv_start_ratio=0.5,
             pyramidkv_least_ratio=0.1,
         )
@@ -1133,7 +1133,7 @@ def test_qwen35_snapkv_initializes_compact_kv_metadata(tmp_path):
     with patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", return_value=outer_config):
         cfg = Config(
             model=str(tmp_path),
-            vllm_sparse_method="snapkv",
+            sparse_method="snapkv",
             max_num_seqs_in_batch=2,
             max_decoding_seqs=2,
         )
@@ -1205,7 +1205,7 @@ def test_qwen35_pyramidkv_projects_legacy_transformer_layer_ratios(tmp_path):
     with patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", return_value=outer_config):
         cfg = Config(
             model=str(tmp_path),
-            vllm_sparse_method="pyramidkv",
+            sparse_method="pyramidkv",
             pyramid_layer_ratios=legacy_ratios,
         )
 
@@ -1223,9 +1223,9 @@ def test_qwen35_deltakv_requires_compatible_checkpoint_even_when_missing_allowed
     with pytest.raises(ValueError, match="DeltaKV for Qwen3.5 requires"):
         _make_config(
             tmp_path,
-            vllm_sparse_method="deltakv",
+            sparse_method="deltakv",
             allow_missing_deltakv_path=True,
-            kv_quant_bits=0,
+            deltakv_latent_quant_bits=0,
         )
 
 
@@ -1981,7 +1981,7 @@ def test_mixed_prefix_warmup_reset_clears_dummy_blocks_and_accounting():
         model="test",
         hf_config=SimpleNamespace(model_type="test", torch_dtype=torch.float16),
         tensor_parallel_size=1,
-        vllm_sparse_method="",
+        sparse_method="",
         prefix_cache_salt="",
     )
     coordinator = PrefixCacheCoordinator(
@@ -2044,7 +2044,7 @@ def test_mixed_offload_reset_drains_and_rebinds_controller():
         model="test",
         hf_config=SimpleNamespace(model_type="test", torch_dtype=torch.float16),
         tensor_parallel_size=1,
-        vllm_sparse_method="",
+        sparse_method="",
         prefix_cache_salt="",
     )
     old_prefix_cache = RadixPrefixIndex(block_size=4, fingerprint=b"old", max_blocks=2)

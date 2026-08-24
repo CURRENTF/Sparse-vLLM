@@ -1,32 +1,36 @@
 # Runtime Parameter Semantics
 
 Sparse-vLLM has one inference backend: the native engine under
-`src/sparsevllm/`. Benchmark entrypoints normalize their public parameters and
-construct `sparsevllm.LLM`; this repository does not provide an HF DeltaKV
-backend or reference implementation.
+`src/sparsevllm/`. Runtime parameter names are identical in `LLM(...)`,
+`Config`, JSON configs, benchmark manifests, and internal code. The engine does
+not maintain a public-to-internal alias layer.
 
 ## Public names
 
 Use semantic public names in commands, JSON configs, and benchmark manifests:
 
-| Public name | Native engine field | Meaning |
-| --- | --- | --- |
-| `sparse_method` | `vllm_sparse_method` | Sparse method selector. |
-| `deltakv_checkpoint_path` | `deltakv_path` | DeltaKV compressor checkpoint path. |
-| `engine_prefill_chunk_size` | `chunk_prefill_size` | Maximum scheduled prefill chunk. |
-| `sink_keep_tokens` | `num_sink_tokens` | Fixed sink-token budget. |
-| `recent_keep_tokens` | `num_recent_tokens` | Recent-token budget. |
-| `full_attention_layers` | `full_attn_layers` | Comma-separated full-layer indices. |
-| `deltakv_neighbor_count` | `deltakv_k_neighbors` | Number of DeltaKV reference neighbors. |
-| `deltakv_center_ratio` | `cluster_ratio` | DeltaKV reference-center ratio. |
-| `deltakv_latent_dim` | `kv_compressed_size` | Compressor latent width. |
-| `deltakv_latent_quant_bits` | `kv_quant_bits` | Quantization bits for latent state. |
-| `deltakv_latent_quant_group_size` | `kv_quant_group_size` | Latent quantization group size. |
+| Canonical name | Meaning |
+| --- | --- |
+| `sparse_method` | Sparse method selector. |
+| `deltakv_checkpoint_path` | DeltaKV compressor checkpoint path. |
+| `engine_prefill_chunk_size` | Maximum scheduled prefill chunk. |
+| `sink_keep_tokens` | Fixed sink-token budget. |
+| `recent_keep_tokens` | Recent-token budget. |
+| `full_attention_layers` | Comma-separated full-layer indices. |
+| `deltakv_neighbor_count` | Number of DeltaKV reference neighbors. |
+| `deltakv_center_ratio` | DeltaKV reference-center ratio. |
+| `deltakv_latent_dim` | Compressor latent width. |
+| `deltakv_latent_quant_bits` | Quantization bits for latent state. |
+| `deltakv_latent_quant_group_size` | Latent quantization group size. |
+| `gpu_memory_utilization` | Fraction of GPU memory available to the engine. |
+| `decode_graph` | Enable decode CUDA Graph execution. |
 
-`src/sparsevllm/configs/runtime_params.py` performs this mapping at the engine
-boundary. Internal names such as `vllm_sparse_method`, `deltakv_path`, and
-`chunk_prefill_size` are rejected when supplied through the public normalizer.
-Conflicting aliases fail instead of silently choosing a value.
+Legacy aliases such as `sparse_method`, `deltakv_checkpoint_path`,
+`engine_prefill_chunk_size`, `sink_keep_tokens`, `recent_keep_tokens`,
+`full_attention_layers`, `deltakv_neighbor_count`, `deltakv_center_ratio`,
+`deltakv_latent_dim`, `deltakv_latent_quant_bits`, `deltakv_latent_quant_group_size`,
+`device_memory_utilization`, and `decode_graph*` are not accepted. Unknown
+names fail at the engine boundary instead of being rewritten.
 
 ## Token budgets
 

@@ -456,16 +456,16 @@ def test_runtime_chain_lru_reclaims_payload_before_reusing_capacity():
             self.freed.append(int(seq_id))
 
     config = SimpleNamespace(
-        vllm_sparse_method="snapkv",
+        sparse_method="snapkv",
         model="/models/test",
         hf_config=SimpleNamespace(model_type="test", torch_dtype="float16"),
         tensor_parallel_size=1,
         max_model_len=128,
         prefix_cache_salt="",
         chain_cache_max_tombstones=8,
-        full_attn_layers=[],
-        num_sink_tokens=1,
-        num_recent_tokens=1,
+        full_attention_layers=[],
+        sink_keep_tokens=1,
+        recent_keep_tokens=1,
         decode_keep_tokens=4,
         snapkv_window_size=2,
         snapkv_num_full_layers=0,
@@ -525,16 +525,16 @@ def test_runtime_warmup_reset_reclaims_chain_payload_before_metadata():
             self.freed.append(int(seq_id))
 
     config = SimpleNamespace(
-        vllm_sparse_method="snapkv",
+        sparse_method="snapkv",
         model="/models/test",
         hf_config=SimpleNamespace(model_type="test", torch_dtype="float16"),
         tensor_parallel_size=1,
         max_model_len=128,
         prefix_cache_salt="",
         chain_cache_max_tombstones=8,
-        full_attn_layers=[],
-        num_sink_tokens=1,
-        num_recent_tokens=1,
+        full_attention_layers=[],
+        sink_keep_tokens=1,
+        recent_keep_tokens=1,
         decode_keep_tokens=4,
         snapkv_window_size=2,
         snapkv_num_full_layers=0,
@@ -577,12 +577,12 @@ def test_runtime_warmup_reset_reclaims_chain_payload_before_metadata():
 def test_snapkv_resumed_prefill_score_uses_physical_coordinates():
     manager = object.__new__(SnapKVCacheManager)
     manager.config = SimpleNamespace(
-        vllm_sparse_method="snapkv",
+        sparse_method="snapkv",
         snapkv_num_full_layers=0,
         snapkv_window_size=8,
-        num_sink_tokens=2,
+        sink_keep_tokens=2,
         decode_keep_tokens=16,
-        num_recent_tokens=4,
+        recent_keep_tokens=4,
     )
     manager.kv_layer_index = lambda layer_idx: int(layer_idx)
     manager.chain_physical_kv_len = lambda layer_idx, seq_id: 30
@@ -604,12 +604,12 @@ def test_snapkv_resumed_prefill_score_uses_physical_coordinates():
 def test_snapkv_resumed_prefill_skips_score_below_physical_budget():
     manager = object.__new__(SnapKVCacheManager)
     manager.config = SimpleNamespace(
-        vllm_sparse_method="snapkv",
+        sparse_method="snapkv",
         snapkv_num_full_layers=0,
         snapkv_window_size=8,
-        num_sink_tokens=2,
+        sink_keep_tokens=2,
         decode_keep_tokens=16,
-        num_recent_tokens=4,
+        recent_keep_tokens=4,
     )
     manager.kv_layer_index = lambda layer_idx: int(layer_idx)
     manager.chain_physical_kv_len = lambda layer_idx, seq_id: 20
@@ -628,12 +628,12 @@ def test_snapkv_resumed_prefill_skips_score_below_physical_budget():
 def test_snapkv_recompute_replay_scores_the_full_prompt_window():
     manager = object.__new__(SnapKVCacheManager)
     manager.config = SimpleNamespace(
-        vllm_sparse_method="snapkv",
+        sparse_method="snapkv",
         snapkv_num_full_layers=0,
         snapkv_window_size=8,
-        num_sink_tokens=2,
+        sink_keep_tokens=2,
         decode_keep_tokens=16,
-        num_recent_tokens=4,
+        recent_keep_tokens=4,
     )
     manager.kv_layer_index = lambda layer_idx: int(layer_idx)
     seq = Sequence(
@@ -655,7 +655,7 @@ def test_snapkv_recompute_replay_scores_the_full_prompt_window():
 def test_pyramid_chain_resume_uses_residual_for_raw_offload():
     manager = object.__new__(SnapKVCacheManager)
     manager.config = SimpleNamespace(
-        vllm_sparse_method="pyramidkv",
+        sparse_method="pyramidkv",
         long_prefill_offload_threshold=5,
     )
     manager._pyramidkv_can_use_full_prefill_staging = lambda: True
@@ -674,9 +674,9 @@ def test_pyramid_chain_resume_uses_residual_for_raw_offload():
 def test_new_pyramid_chain_capacity_uses_materialized_layer_budgets():
     manager = object.__new__(SnapKVCacheManager)
     manager.config = SimpleNamespace(
-        vllm_sparse_method="pyramidkv",
-        num_sink_tokens=1,
-        num_recent_tokens=1,
+        sparse_method="pyramidkv",
+        sink_keep_tokens=1,
+        recent_keep_tokens=1,
     )
     manager.kv_transformer_layer_indices = lambda: [0, 1]
     manager.kv_layer_index = lambda layer_idx: int(layer_idx)
@@ -709,11 +709,11 @@ def test_new_pyramid_chain_capacity_uses_materialized_layer_budgets():
 def test_resumed_snapkv_capacity_reserves_score_free_decode_growth():
     manager = object.__new__(SnapKVCacheManager)
     manager.config = SimpleNamespace(
-        vllm_sparse_method="snapkv",
+        sparse_method="snapkv",
         snapkv_num_full_layers=0,
-        num_sink_tokens=1,
+        sink_keep_tokens=1,
         decode_keep_tokens=8,
-        num_recent_tokens=1,
+        recent_keep_tokens=1,
     )
     manager.kv_transformer_layer_indices = lambda: [0]
     manager.kv_layer_index = lambda layer_idx: int(layer_idx)
@@ -741,11 +741,11 @@ def test_resumed_snapkv_capacity_reserves_score_free_decode_growth():
 def test_resumed_snapkv_without_suffix_reserves_growth_from_existing_row():
     manager = object.__new__(SnapKVCacheManager)
     manager.config = SimpleNamespace(
-        vllm_sparse_method="snapkv",
+        sparse_method="snapkv",
         snapkv_num_full_layers=0,
-        num_sink_tokens=1,
+        sink_keep_tokens=1,
         decode_keep_tokens=8,
-        num_recent_tokens=1,
+        recent_keep_tokens=1,
     )
     manager.kv_transformer_layer_indices = lambda: [0]
     manager.kv_layer_index = lambda layer_idx: int(layer_idx)
@@ -770,11 +770,11 @@ def test_resumed_snapkv_without_suffix_reserves_growth_from_existing_row():
 def test_resumed_h2o_capacity_uses_chunked_physical_peak():
     manager = object.__new__(H2OCacheManager)
     manager.config = SimpleNamespace(
-        vllm_sparse_method="h2o",
+        sparse_method="h2o",
         h2o_decode_budget=4,
         h2o_decode_eviction_interval=3,
         h2o_prefill_budget=8,
-        chunk_prefill_size=4,
+        engine_prefill_chunk_size=4,
     )
     manager.kv_transformer_layer_indices = lambda: [0]
     manager._num_free_slots = [3]
@@ -800,11 +800,11 @@ def test_resumed_h2o_capacity_uses_chunked_physical_peak():
 def test_resumed_h2o_capacity_reserves_over_budget_first_prefill_chunk():
     manager = object.__new__(H2OCacheManager)
     manager.config = SimpleNamespace(
-        vllm_sparse_method="h2o",
+        sparse_method="h2o",
         h2o_decode_budget=4,
         h2o_decode_eviction_interval=3,
         h2o_prefill_budget=4,
-        chunk_prefill_size=4,
+        engine_prefill_chunk_size=4,
     )
     manager.kv_transformer_layer_indices = lambda: [0]
     manager._num_free_slots = [2]
@@ -828,11 +828,11 @@ def test_resumed_h2o_capacity_reserves_over_budget_first_prefill_chunk():
 def test_resumed_h2o_capacity_handles_small_suffix_and_outstanding_by_layer():
     manager = object.__new__(H2OCacheManager)
     manager.config = SimpleNamespace(
-        vllm_sparse_method="h2o",
+        sparse_method="h2o",
         h2o_decode_budget=4,
         h2o_decode_eviction_interval=3,
         h2o_prefill_budget=4,
-        chunk_prefill_size=4,
+        engine_prefill_chunk_size=4,
     )
     manager.kv_transformer_layer_indices = lambda: [0, 2]
     manager._num_free_slots = [3, 0, 4]
@@ -857,11 +857,11 @@ def test_resumed_h2o_capacity_handles_small_suffix_and_outstanding_by_layer():
 def test_resumed_h2o_capacity_without_suffix_starts_decode_from_existing_row():
     manager = object.__new__(H2OCacheManager)
     manager.config = SimpleNamespace(
-        vllm_sparse_method="h2o",
+        sparse_method="h2o",
         h2o_decode_budget=4,
         h2o_decode_eviction_interval=3,
         h2o_prefill_budget=4,
-        chunk_prefill_size=4,
+        engine_prefill_chunk_size=4,
     )
     manager.kv_transformer_layer_indices = lambda: [0]
     manager._num_free_slots = [0]
@@ -885,11 +885,11 @@ def test_resumed_h2o_capacity_without_suffix_starts_decode_from_existing_row():
 def test_new_h2o_chain_capacity_reserves_row_and_outstanding_slots():
     manager = object.__new__(H2OCacheManager)
     manager.config = SimpleNamespace(
-        vllm_sparse_method="h2o",
+        sparse_method="h2o",
         h2o_decode_budget=4,
         h2o_decode_eviction_interval=3,
         h2o_prefill_budget=8,
-        chunk_prefill_size=4,
+        engine_prefill_chunk_size=4,
     )
     manager.kv_transformer_layer_indices = lambda: [0]
     manager._num_free_slots = [16]
@@ -914,11 +914,11 @@ def test_new_h2o_chain_capacity_reserves_row_and_outstanding_slots():
 def test_h2o_chain_capacity_reserves_score_free_decode_growth():
     manager = object.__new__(H2OCacheManager)
     manager.config = SimpleNamespace(
-        vllm_sparse_method="h2o",
+        sparse_method="h2o",
         h2o_decode_budget=4,
         h2o_decode_eviction_interval=3,
         h2o_prefill_budget=8,
-        chunk_prefill_size=4,
+        engine_prefill_chunk_size=4,
     )
     manager.kv_transformer_layer_indices = lambda: [0]
     manager._num_free_slots = [1]
@@ -941,7 +941,7 @@ def test_h2o_chain_capacity_reserves_score_free_decode_growth():
 
 def _h2o_fingerprint_config(**overrides):
     values = {
-        "vllm_sparse_method": "h2o",
+        "sparse_method": "h2o",
         "model": "/models/test",
         "hf_config": SimpleNamespace(
             model_type="qwen2",
@@ -949,7 +949,7 @@ def _h2o_fingerprint_config(**overrides):
         ),
         "tensor_parallel_size": 1,
         "max_model_len": 128,
-        "full_attn_layers": [],
+        "full_attention_layers": [],
         "prefix_cache_salt": "",
         "h2o_decode_budget": 4,
         "h2o_decode_eviction_interval": 3,
@@ -985,18 +985,18 @@ def test_h2o_chain_fingerprint_covers_physical_state_config(
 
 def test_chain_admission_reserves_capacity_before_prefill_allocation():
     config = SimpleNamespace(
-        vllm_sparse_method="snapkv",
+        sparse_method="snapkv",
         model="/models/test",
         hf_config=SimpleNamespace(model_type="test", torch_dtype="float16"),
         tensor_parallel_size=1,
         max_model_len=128,
         prefix_cache_salt="",
         chain_cache_max_tombstones=8,
-        full_attn_layers=[],
+        full_attention_layers=[],
         snapkv_num_full_layers=0,
-        num_sink_tokens=1,
+        sink_keep_tokens=1,
         decode_keep_tokens=8,
-        num_recent_tokens=1,
+        recent_keep_tokens=1,
     )
     manager = object.__new__(SnapKVCacheManager)
     manager.config = config
@@ -1045,15 +1045,15 @@ def test_engine_chain_admission_reuses_resident_seq_and_logical_boundary():
     config = SimpleNamespace(
         resolved_prefix_cache_mode="chain",
         max_model_len=128,
-        vllm_sparse_method="snapkv",
+        sparse_method="snapkv",
         model="/models/test",
         hf_config=SimpleNamespace(model_type="test", torch_dtype="float16"),
         tensor_parallel_size=1,
         prefix_cache_salt="",
         chain_cache_max_tombstones=8,
-        full_attn_layers=[],
-        num_sink_tokens=1,
-        num_recent_tokens=1,
+        full_attention_layers=[],
+        sink_keep_tokens=1,
+        recent_keep_tokens=1,
         decode_keep_tokens=4,
         snapkv_window_size=2,
         snapkv_num_full_layers=0,

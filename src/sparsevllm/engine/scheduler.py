@@ -36,7 +36,7 @@ class Scheduler:
         logger.debug(f'set max_num_batched_tokens = {config.max_num_batched_tokens} in Scheduler')
         self.max_decoding_seqs = config.max_decoding_seqs
 
-        self.chunk_prefill_size = config.chunk_prefill_size
+        self.engine_prefill_chunk_size = config.engine_prefill_chunk_size
         self.prefill_schedule_policy = config.prefill_schedule_policy
         self.eos = config.eos
         self.eos_token_ids = resolve_eos_token_ids(
@@ -46,8 +46,8 @@ class Scheduler:
             fallback_eos_token_id=self.eos,
         )
 
-        self.num_sink_tokens = config.num_sink_tokens
-        self.num_recent_tokens = config.num_recent_tokens
+        self.sink_keep_tokens = config.sink_keep_tokens
+        self.recent_keep_tokens = config.recent_keep_tokens
         self.decode_keep_tokens = config.decode_keep_tokens
         
         # memory_oracle 引用 Rank 0 的 CacheManager，作为全局显存余量参考。
@@ -67,14 +67,14 @@ class Scheduler:
 
     def _long_text_threshold(self, is_prefill: bool) -> int:
         """Long-text boundary retained only for decode batch partitioning."""
-        if self.config.vllm_sparse_method in ("streamingllm", "attention-sink", "attention_sink"):
-            base = self.num_sink_tokens + self.num_recent_tokens
+        if self.config.sparse_method in ("streamingllm", "attention-sink", "attention_sink"):
+            base = self.sink_keep_tokens + self.recent_keep_tokens
         else:
-            base = self.num_sink_tokens + self.decode_keep_tokens + self.num_recent_tokens
+            base = self.sink_keep_tokens + self.decode_keep_tokens + self.recent_keep_tokens
         return base
 
     def _is_long_text(self, seq: Sequence, is_prefill: bool) -> bool:
-        if not self.config.vllm_sparse_method:
+        if not self.config.sparse_method:
             return False
         if is_prefill:
             raise ValueError(
@@ -211,7 +211,7 @@ class Scheduler:
         return False
 
     def _reserved_prefill_tokens(self) -> int:
-        return int(self.memory_oracle.reserved_prefill_slots(self.waiting, self.chunk_prefill_size))
+        return int(self.memory_oracle.reserved_prefill_slots(self.waiting, self.engine_prefill_chunk_size))
 
     def _can_continue_prefill_batch(
         self,
@@ -263,7 +263,7 @@ class Scheduler:
         }:
             return min(
                 remaining_prefill_tokens,
-                self.chunk_prefill_size,
+                self.engine_prefill_chunk_size,
                 self.max_num_batched_tokens - num_batched_tokens,
                 step_free_count,
             )
@@ -422,7 +422,7 @@ class Scheduler:
             admission_budgets = dict(
                 self.memory_oracle.prompt_admission_budgets(
                     self.waiting,
-                    self.chunk_prefill_size,
+                    self.engine_prefill_chunk_size,
                 )
             )
             margin_batched_tokens = (
@@ -711,7 +711,7 @@ class Scheduler:
                     f"cache_manager={type(self.memory_oracle).__name__} "
                     f"seq_id={seq.seq_id} prompt_len={seq.num_prompt_tokens} "
                     f"remaining_prefill_tokens={need} available_step_tokens={free} "
-                    f"chunk_prefill_size={self.chunk_prefill_size} "
+                    f"engine_prefill_chunk_size={self.engine_prefill_chunk_size} "
                     f"max_num_batched_tokens={self.max_num_batched_tokens}. "
                     "Increase the raw KV budget / max_num_batched_tokens or reduce short-batch size."
                 )

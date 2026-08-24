@@ -7,7 +7,7 @@ Use these checks for Sparse-vLLM's Python/Triton research engine.
 - Method-specific runtime state belongs in `src/sparsevllm/engine/cache_manager/`.
 - `src/sparsevllm/layers/attention.py` should stay generic and use hooks such as `on_kv_stored(...)` and `build_decode_view(...)`.
 - `SparseController` owns cross-layer observation, attention-score collection, and scheduler-facing coordination, not method-owned cache metadata.
-- Public APIs should use `sparse_method`; Sparse-vLLM normalizes to internal `vllm_sparse_method`.
+- Public APIs, `Config`, and internal consumers should all use `sparse_method` without a field-alias translation layer.
 - New first-class methods should update config, `method_registry.py`, cache-manager routing, exports, docs, and policy tests.
 - DeltaKV-family runtime behavior should stay cache-manager-first. Review method state in `src/sparsevllm/engine/cache_manager/`, not ad hoc branches in `attention.py`, `utils/`, or benchmark scripts.
 
@@ -25,7 +25,7 @@ Treat direct hardware-specific calls in common runtime code as an architecture i
 
 Prefill policy is registry-owned in `src/sparsevllm/method_registry.py`.
 
-- `all_chunked`: all prefill requests are capped by `chunk_prefill_size` and normal scheduler limits.
+- `all_chunked`: all prefill requests are capped by `engine_prefill_chunk_size` and normal scheduler limits.
 - `long_bs1full_short_batch`: long requests run one complete prefill with batch size 1; short requests remain chunked and batchable.
 
 Review long/short split carefully. Use `long_bs1full_short_batch` only for methods that need complete long-prefill before sparse/cache transformation, such as PyramidKV and DeltaKV-family methods. Policy, bucket, admission, or decode-priority changes need focused coverage in `tests/test_prefill_schedule_policy.py`.

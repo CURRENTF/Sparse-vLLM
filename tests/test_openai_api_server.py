@@ -799,7 +799,7 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
 
         class Engine:
             tokenizer = object()
-            config = type("Config", (), {"vllm_sparse_method": ""})()
+            config = type("Config", (), {"sparse_method": ""})()
 
             def exit(self):
                 pass
@@ -997,7 +997,7 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         from sparsevllm.entrypoints.openai.api_server import _validate_serving_method
 
         with self.assertRaisesRegex(ValueError, "not supported"):
-            _validate_serving_method({"vllm_sparse_method": "deltakv"})
+            _validate_serving_method({"sparse_method": "deltakv"})
         with self.assertRaisesRegex(ValueError, "not supported"):
             _validate_serving_method({"sparse_method": "deltakv-standalone"})
 
@@ -1915,7 +1915,7 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
 
         class Engine:
             tokenizer = Tokenizer()
-            config = type("Config", (), {"vllm_sparse_method": ""})()
+            config = type("Config", (), {"sparse_method": ""})()
 
             def prefix_cache_inspect(self, token_ids, include_subtree=False):
                 return {
@@ -1958,7 +1958,7 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
 
         class Engine:
             tokenizer = Tokenizer()
-            config = type("Config", (), {"vllm_sparse_method": ""})()
+            config = type("Config", (), {"sparse_method": ""})()
 
             def prefix_cache_match(self, token_ids):
                 return {
@@ -2011,7 +2011,7 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
 
         class Engine:
             tokenizer = Tokenizer()
-            config = type("Config", (), {"vllm_sparse_method": ""})()
+            config = type("Config", (), {"sparse_method": ""})()
 
             def prefix_cache_match(self, token_ids):
                 return {"token_ids": list(token_ids), "supported": True, "enabled": True}
@@ -2051,7 +2051,7 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
 
         class Engine:
             tokenizer = object()
-            config = type("Config", (), {"vllm_sparse_method": ""})()
+            config = type("Config", (), {"sparse_method": ""})()
 
             def worker_info(self, served_model_name=None, tags=None):
                 return {"served_model_name": served_model_name, "tags": list(tags or [])}
@@ -2139,7 +2139,7 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         release_step = threading.Event()
 
         class Engine:
-            config = type("Config", (), {"vllm_sparse_method": ""})()
+            config = type("Config", (), {"sparse_method": ""})()
 
             def __init__(self):
                 self.tokenizer = tokenizer
@@ -2310,7 +2310,7 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
                 return [0, 11] if add_special_tokens else [11]
 
         class Engine:
-            config = type("Config", (), {"vllm_sparse_method": ""})()
+            config = type("Config", (), {"sparse_method": ""})()
 
             def __init__(self):
                 self.tokenizer = Tokenizer()
@@ -2340,7 +2340,7 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
 
         class Engine:
             tokenizer = object()
-            config = type("Config", (), {"vllm_sparse_method": ""})()
+            config = type("Config", (), {"sparse_method": ""})()
 
             def exit(self):
                 pass
@@ -2368,7 +2368,7 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
 
         class Engine:
             tokenizer = Tokenizer()
-            config = type("Config", (), {"vllm_sparse_method": ""})()
+            config = type("Config", (), {"sparse_method": ""})()
 
             def prefix_cache_inspect(self, token_ids, include_subtree=False):
                 del token_ids, include_subtree
@@ -2400,7 +2400,7 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
 
         class Engine:
             tokenizer = Tokenizer()
-            config = type("Config", (), {"vllm_sparse_method": ""})()
+            config = type("Config", (), {"sparse_method": ""})()
 
             def __init__(self):
                 self.calls = []
@@ -2659,7 +2659,7 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
                 return "".join(str(token_id) for token_id in token_ids)
 
         class Engine:
-            config = type("Config", (), {"vllm_sparse_method": ""})()
+            config = type("Config", (), {"sparse_method": ""})()
 
             def __init__(self):
                 self.tokenizer = Tokenizer()
@@ -5839,7 +5839,7 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
 
         class Engine:
             tokenizer = test_tokenizer
-            config = type("Config", (), {"vllm_sparse_method": ""})()
+            config = type("Config", (), {"sparse_method": ""})()
             last_step_token_outputs = []
             last_step_logprob_outputs = []
 
@@ -6419,7 +6419,7 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
 
         class Engine:
             tokenizer = Tokenizer()
-            config = type("Config", (), {"vllm_sparse_method": ""})()
+            config = type("Config", (), {"sparse_method": ""})()
 
             def prefix_cache_match(self, token_ids):
                 return {"token_ids": list(token_ids), "supported": True, "enabled": True}
@@ -6450,7 +6450,7 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
 
         class Engine:
             tokenizer = object()
-            config = type("Config", (), {"vllm_sparse_method": ""})()
+            config = type("Config", (), {"sparse_method": ""})()
 
             def exit(self):
                 pass

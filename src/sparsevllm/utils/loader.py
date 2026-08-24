@@ -350,8 +350,8 @@ def _load_deltakv_state_dict(file: str, *, is_safetensors: bool) -> dict[str, to
 
 
 def sync_deltakv_config_from_checkpoint(config) -> bool:
-    path = getattr(config, "deltakv_path", None)
-    method = str(getattr(config, "vllm_sparse_method", "") or "")
+    path = getattr(config, "deltakv_checkpoint_path", None)
+    method = str(getattr(config, "sparse_method", "") or "")
     if not path or not method.startswith("deltakv"):
         return False
 
@@ -363,7 +363,7 @@ def sync_deltakv_config_from_checkpoint(config) -> bool:
             ckpt_cfg = json.load(f)
 
         for key in (
-            "kv_compressed_size",
+            "deltakv_latent_dim",
             "use_nonlinear_compressor",
             "compressor_intermediate_size",
             "compressor_linear_bias",
@@ -382,7 +382,7 @@ def sync_deltakv_config_from_checkpoint(config) -> bool:
             )
 
     missing_shape_keys = {
-        "kv_compressed_size",
+        "deltakv_latent_dim",
         "compressor_down_type",
         "compressor_up_type",
         "compressor_down_intermediate_size",
@@ -400,11 +400,11 @@ def sync_deltakv_config_from_checkpoint(config) -> bool:
             state_dict = None
 
         if state_dict is not None:
-            kv_compressed_size = _infer_kv_compressed_size(state_dict)
+            deltakv_latent_dim = _infer_kv_compressed_size(state_dict)
             down_kind, down_inter, down_bias, _ = _infer_single_compressor_spec(state_dict, "compress_down")
             up_kind, up_inter, up_bias, _ = _infer_single_compressor_spec(state_dict, "compress_up")
-            if kv_compressed_size is not None and "kv_compressed_size" not in updates:
-                updates["kv_compressed_size"] = kv_compressed_size
+            if deltakv_latent_dim is not None and "deltakv_latent_dim" not in updates:
+                updates["deltakv_latent_dim"] = deltakv_latent_dim
             if down_kind is not None and "compressor_down_type" not in updates:
                 updates["compressor_down_type"] = down_kind
             if up_kind is not None and "compressor_up_type" not in updates:

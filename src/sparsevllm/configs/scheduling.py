@@ -44,7 +44,7 @@ def normalize_scheduling(config) -> None:
     config.max_num_seqs_in_gpu = int(configured_max_num_seqs_in_gpu)
 
     config.prefill_schedule_policy = resolve_prefill_schedule_policy(
-        config.vllm_sparse_method,
+        config.sparse_method,
         config.prefill_schedule_policy,
     )
     config.max_num_batched_tokens = int(config.max_num_batched_tokens)
@@ -54,43 +54,43 @@ def normalize_scheduling(config) -> None:
             f"got {config.max_num_batched_tokens}."
         )
     configured_chunk_prefill_size = (
-        None if config.chunk_prefill_size is None else int(config.chunk_prefill_size)
+        None if config.engine_prefill_chunk_size is None else int(config.engine_prefill_chunk_size)
     )
     if config.prefill_schedule_policy == PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH:
         config.long_prefill_offload_threshold = _resolve_long_prefill_offload_threshold(
             config.long_prefill_offload_threshold
         )
-        config.chunk_prefill_size = (
+        config.engine_prefill_chunk_size = (
             int(config.long_prefill_offload_threshold)
             if configured_chunk_prefill_size is None
             else configured_chunk_prefill_size
         )
-        if config.chunk_prefill_size > config.long_prefill_offload_threshold:
+        if config.engine_prefill_chunk_size > config.long_prefill_offload_threshold:
             raise ValueError(
-                "long_bs1full_short_batch requires 0 < chunk_prefill_size <= "
+                "long_bs1full_short_batch requires 0 < engine_prefill_chunk_size <= "
                 "long_prefill_offload_threshold: "
-                f"chunk_prefill_size={config.chunk_prefill_size}, "
+                f"engine_prefill_chunk_size={config.engine_prefill_chunk_size}, "
                 f"long_prefill_offload_threshold={config.long_prefill_offload_threshold}."
             )
     else:
-        config.chunk_prefill_size = (
+        config.engine_prefill_chunk_size = (
             8192
             if configured_chunk_prefill_size is None
             else configured_chunk_prefill_size
         )
-    if config.chunk_prefill_size <= 0:
+    if config.engine_prefill_chunk_size <= 0:
         raise ValueError(
-            f"chunk_prefill_size must be > 0, got {config.chunk_prefill_size}."
+            f"engine_prefill_chunk_size must be > 0, got {config.engine_prefill_chunk_size}."
         )
-    score_window_method = normalize_sparse_method(config.vllm_sparse_method)
+    score_window_method = normalize_sparse_method(config.sparse_method)
     if score_window_method in {"snapkv", "pyramidkv"}:
         snapkv_window_size = int(config.snapkv_window_size)
-        if config.chunk_prefill_size < snapkv_window_size:
+        if config.engine_prefill_chunk_size < snapkv_window_size:
             raise ValueError(
-                f"{score_window_method} requires chunk_prefill_size >= "
+                f"{score_window_method} requires engine_prefill_chunk_size >= "
                 "snapkv_window_size so the "
                 "final score window fits in one prefill step: "
-                f"chunk_prefill_size={config.chunk_prefill_size}, "
+                f"engine_prefill_chunk_size={config.engine_prefill_chunk_size}, "
                 f"snapkv_window_size={snapkv_window_size}."
             )
     if (

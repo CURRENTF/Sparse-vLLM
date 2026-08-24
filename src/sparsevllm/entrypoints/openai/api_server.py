@@ -142,14 +142,14 @@ def create_app(
 
 def _validate_serving_method(engine_kwargs: dict[str, Any], engine: LLM | None = None):
     method = (
-        getattr(getattr(engine, "config", None), "vllm_sparse_method", "")
+        getattr(getattr(engine, "config", None), "sparse_method", "")
         if engine is not None
-        else engine_kwargs.get("sparse_method", engine_kwargs.get("vllm_sparse_method", ""))
+        else engine_kwargs.get("sparse_method", "")
     )
     method = normalize_sparse_method(method)
     if any(method.startswith(prefix) for prefix in UNSUPPORTED_SERVING_METHOD_PREFIXES):
         raise ValueError(
-            f"vllm_sparse_method={method!r} is not supported by the OpenAI API server yet. "
+            f"sparse_method={method!r} is not supported by the OpenAI API server yet. "
             "Run this method through the offline experiment entrypoints until serving support is validated."
         )
 

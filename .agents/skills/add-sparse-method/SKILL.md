@@ -41,7 +41,7 @@ Do not fill unknowns with permissive defaults. Unsupported combinations must be 
 
 Preserve these boundaries:
 
-- Normalize the public `sparse_method` API and reject legacy or conflicting inputs in `configs/runtime_params.py`. Keep composed config validation in the relevant config group, not the compatibility facade `config.py`.
+- Define canonical runtime fields in `configs/groups.py` or `configs/runtime.py`, use the same names in public and internal code, and reject unknown inputs at the engine boundary. Keep composed validation in the relevant config group, not the compatibility facade `config.py`.
 - Register static method capabilities, aliases, schedule defaults, score contracts, model/topology compatibility, prefix-cache support, graph support, and assets in `method_registry.py`.
 - Keep persistent cache-coupled method state, physical allocation, eviction/compaction, and attention-view materialization in `engine/cache_manager/`.
 - Keep per-step and cross-layer score/selection orchestration in `engine/sparse_controller.py`.
@@ -103,7 +103,7 @@ kernel dispatch.
 
 Implement the smallest vertical slice in this order:
 
-1. Public normalization and static registry contract.
+1. Canonical public configuration and static registry contract.
 2. Model/storage/topology validation.
 3. State ownership, allocation, and lifecycle operations.
 4. Score/selection orchestration and typed view construction.

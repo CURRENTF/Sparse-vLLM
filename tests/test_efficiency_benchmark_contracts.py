@@ -755,12 +755,12 @@ def _write_valid_suite_fixture(root: Path, systems: list[str]) -> None:
                     }
                 if method == "omnikv":
                     resolved["requested_runtime"] = {
-                        "normalized": {
-                            "full_attn_layers": "0,2,4,11,16,22",
+                        "config": {
+                            "full_attention_layers": "0,2,4,11,16,22",
                         },
                     }
                     resolved["effective_runtime"]["benchmark_config"] = {
-                        "full_attn_layers": [0, 2, 4, 11, 16, 22],
+                        "full_attention_layers": [0, 2, 4, 11, 16, 22],
                         "obs_layer_ids": [0, 2, 4, 11, 16, 22],
                     }
                 (system_dir / "resolved_config.json").write_text(
@@ -882,13 +882,13 @@ def test_unified_suite_validator_rejects_single_layer_omnikv_runtime(tmp_path):
     _write_valid_suite_fixture(tmp_path, systems)
     resolved_path = tmp_path / "scenario_b_longbench/svllm-omnikv/resolved_config.json"
     resolved = json.loads(resolved_path.read_text())
-    resolved["effective_runtime"]["benchmark_config"]["full_attn_layers"] = [0]
+    resolved["effective_runtime"]["benchmark_config"]["full_attention_layers"] = [0]
     resolved_path.write_text(json.dumps(resolved) + "\n")
 
     report = validate_suite(tmp_path, systems, ["task"], 1)
 
     assert report["status"] == "failed"
-    assert any("invalid OmniKV full_attn_layers" in error for error in report["errors"])
+    assert any("invalid OmniKV full_attention_layers" in error for error in report["errors"])
 
 
 def test_unified_suite_validator_rejects_omnikv_requested_effective_mismatch(
@@ -898,7 +898,7 @@ def test_unified_suite_validator_rejects_omnikv_requested_effective_mismatch(
     _write_valid_suite_fixture(tmp_path, systems)
     resolved_path = tmp_path / "scenario_b_longbench/svllm-omnikv/resolved_config.json"
     resolved = json.loads(resolved_path.read_text())
-    resolved["effective_runtime"]["benchmark_config"]["full_attn_layers"] = [
+    resolved["effective_runtime"]["benchmark_config"]["full_attention_layers"] = [
         0,
         3,
         9,

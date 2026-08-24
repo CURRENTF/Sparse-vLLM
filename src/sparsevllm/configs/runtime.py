@@ -59,13 +59,12 @@ class Config(
     max_decoding_seqs: int = 64
     max_num_seqs_in_gpu: int | None = None
 
-    chunk_prefill_size: int | None = None
+    engine_prefill_chunk_size: int | None = None
     long_prefill_offload_threshold: int = 64 * 1024
     mlp_chunk_size: int = 16384
     mla_prefill_workspace_bytes: int = 2 * 1024**3
     prefill_schedule_policy: str = PREFILL_POLICY_AUTO
     gpu_memory_utilization: float = 0.8
-    device_memory_utilization: float | None = None
     tensor_parallel_size: int = 1
     expert_parallel_size: int = 1
     data_parallel_size: int = 1
@@ -126,26 +125,20 @@ class Config(
             resolved,
         )
         self.max_model_len = resolved
-        if self.decode_cuda_graph and self.decode_cuda_graph_context_sizes_auto:
-            self.decode_cuda_graph_context_sizes = _resolve_decode_cuda_graph_context_sizes(
+        if self.decode_graph and self.decode_graph_context_sizes_auto:
+            self.decode_graph_context_sizes = _resolve_decode_cuda_graph_context_sizes(
                 "auto", resolved
             )
 
     def __post_init__(self):
         normalize_bootstrap(self)
-        legacy_deltakv_graph_method = normalize_sparse_method_name(self)
+        normalize_sparse_method_name(self)
         normalize_prefix_cache(self)
         normalize_scheduling(self)
         normalize_deltakv_storage(self)
         normalize_platform(self)
-        if legacy_deltakv_graph_method:
-            self.decode_cuda_graph = True
-            self.decode_graph = True
         load_and_validate_model(self)
-        normalize_decode_cuda_graph(
-            self,
-            legacy_deltakv_graph_method=legacy_deltakv_graph_method,
-        )
+        normalize_decode_cuda_graph(self)
         normalize_sparse_methods(self)
         finalize_prefix_cache(self)
         validate_deltakv_runtime(self)

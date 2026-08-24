@@ -42,13 +42,13 @@ def _cfg(method="", salt="", block_size=4):
         tensor_parallel_size=1,
         expert_parallel_size=1,
         data_parallel_size=1,
-        vllm_sparse_method=method,
+        sparse_method=method,
         prefix_cache_salt=salt,
         prefix_cache_block_size=block_size,
         decode_keep_tokens=64,
-        num_sink_tokens=4,
-        num_recent_tokens=8,
-        full_attn_layers=[0],
+        sink_keep_tokens=4,
+        recent_keep_tokens=8,
+        full_attention_layers=[0],
         obs_layer_ids=None,
         quest_chunk_size=4,
         quest_skip_layers=2,
@@ -346,7 +346,7 @@ def test_standard_prompt_admission_accounts_for_free_rows():
     manager.free_rows = deque([0])
     seq = Sequence([1, 2, 3])
 
-    budgets = manager.prompt_admission_budgets(deque(), chunk_prefill_size=4)
+    budgets = manager.prompt_admission_budgets(deque(), engine_prefill_chunk_size=4)
     costs = manager.prompt_admission_costs(seq)
 
     assert budgets["rows"] == 1
@@ -1313,12 +1313,12 @@ def test_config_rejects_unvalidated_prefix_cache_options():
     with pytest.raises(ValueError, match="capture_sampling"):
         _make_config(
             enable_prefix_caching=True,
-            decode_cuda_graph=True,
-            decode_cuda_graph_capture_sampling=True,
+            decode_graph=True,
+            decode_graph_capture_sampling=True,
         )
     with pytest.raises(ValueError, match="quest_chunk_size"):
         _make_config(
-            vllm_sparse_method="quest",
+            sparse_method="quest",
             enable_prefix_caching=True,
             quest_chunk_size=8,
             prefix_cache_block_size=16,
@@ -1343,14 +1343,14 @@ def test_config_restricts_prefix_cache_offload_to_explicit_tp1_tp2_modes():
             enable_prefix_cache_offload=True,
         )
     quest = _make_config(
-        vllm_sparse_method="quest",
+        sparse_method="quest",
         enable_prefix_caching=True,
         enable_prefix_cache_offload=True,
         prefix_cache_host_size_gb=1,
-        decode_cuda_graph=True,
+        decode_graph=True,
     )
     assert quest.enable_prefix_cache_offload is True
-    assert quest.decode_cuda_graph is True
+    assert quest.decode_graph is True
     tp2 = _make_config(
         enable_prefix_caching=True,
         enable_prefix_cache_offload=True,
@@ -1369,12 +1369,12 @@ def test_config_restricts_prefix_cache_offload_to_explicit_tp1_tp2_modes():
         enable_prefix_caching=True,
         enable_prefix_cache_offload=True,
         prefix_cache_host_size_gb=1,
-        decode_cuda_graph=True,
+        decode_graph=True,
     )
-    assert graph.decode_cuda_graph is True
+    assert graph.decode_graph is True
 
     cfg = _make_config(
-        vllm_sparse_method="omnikv",
+        sparse_method="omnikv",
         enable_prefix_caching=True,
         enable_prefix_cache_offload=True,
         prefix_cache_host_size_gb=1,

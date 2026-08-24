@@ -94,8 +94,8 @@ def _standard_manager(*, max_model_len, auto):
     config = SimpleNamespace(
         max_model_len=max_model_len,
         max_model_len_auto=auto,
-        decode_cuda_graph=False,
-        decode_cuda_graph_context_sizes_auto=False,
+        decode_graph=False,
+        decode_graph_context_sizes_auto=False,
         prefix_cache_max_blocks=None,
     )
     config.limit_auto_max_model_len = MethodType(Config.limit_auto_max_model_len, config)
@@ -124,15 +124,15 @@ def test_runtime_capacity_bounds_auto_cuda_graph_context_sizes():
     config = SimpleNamespace(
         max_model_len=262144,
         max_model_len_auto=True,
-        decode_cuda_graph=True,
-        decode_cuda_graph_context_sizes_auto=True,
-        decode_cuda_graph_context_sizes=[1024, 262144],
+        decode_graph=True,
+        decode_graph_context_sizes_auto=True,
+        decode_graph_context_sizes=[1024, 262144],
     )
 
     Config.limit_auto_max_model_len(config, 9000)
 
     assert config.max_model_len == 9000
-    context_sizes = config.decode_cuda_graph_context_sizes
+    context_sizes = config.decode_graph_context_sizes
     assert context_sizes == sorted(set(context_sizes))
     assert context_sizes[-1] == config.max_model_len
     assert all(0 < size <= config.max_model_len for size in context_sizes)

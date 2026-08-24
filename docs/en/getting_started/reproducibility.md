@@ -70,11 +70,12 @@ Use canonical public parameter names:
 - `full_attention_layers`
 - `engine_prefill_chunk_size`
 
-Do not use legacy public keys such as `chunk_prefill_size`,
-`vllm_sparse_method`, `model_cls`, `compressor_path`, `deltakv_path`,
-`num_top_tokens`, or `seq_chunk_size` in new commands. See
-[runtime-parameter-semantics.md](../configuration/runtime-parameter-semantics.md) for the full
-alias map and native behavior.
+Use these names unchanged in commands, manifests, `LLM(...)`, and internal
+configuration. Do not use legacy keys such as `engine_prefill_chunk_size`,
+`sparse_method`, `model_cls`, `compressor_path`, `deltakv_checkpoint_path`,
+`num_top_tokens`, or `seq_chunk_size`. See
+[runtime-parameter-semantics.md](../configuration/runtime-parameter-semantics.md)
+for the canonical contract.
 
 Sparse-vLLM requires explicit integer keep budgets. Do not pass ratios such as
 `decode_keep_tokens=0.17`; convert each policy to a token count first.

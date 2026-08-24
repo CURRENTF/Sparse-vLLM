@@ -14,7 +14,6 @@ from sparsevllm.utils.code_revision import code_revision_info
 from sparsevllm.utils.log import logger
 import sys
 
-from sparsevllm.configs.runtime_params import normalize_runtime_params
 
 from sparsevllm.config import Config
 from sparsevllm.sampling_params import SamplingParams
@@ -42,8 +41,8 @@ from sparsevllm.method_registry import normalize_sparse_method
 from sparsevllm.utils.profiler import profiler
 
 def _deltakv_graph_warmup_profile(config: Config) -> str:
-    graph_warmup = bool(getattr(config, "decode_cuda_graph", False))
-    method = normalize_sparse_method(getattr(config, "vllm_sparse_method", "") or "")
+    graph_warmup = bool(getattr(config, "decode_graph", False))
+    method = normalize_sparse_method(getattr(config, "sparse_method", "") or "")
     if not graph_warmup:
         return "decode_1seq"
     if method == "deltakv":
@@ -210,24 +209,14 @@ class LLMEngine:
 
     def __init__(self, model, **kwargs):
         # 1. 初始化配置
-        normalized_params = normalize_runtime_params(kwargs, backend="sparsevllm")
-        for warning in normalized_params.warnings:
-            logger.info(f"Runtime parameter normalization: {warning}")
-
         config_fields = {field.name for field in fields(Config) if field.init}
-        config_kwargs = {
-            k: v for k, v in normalized_params.infer_config.items() if k in config_fields
-        }
-        ignored_keys = sorted(set(normalized_params.infer_config) - config_fields)
+        config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
+        ignored_keys = sorted(set(kwargs) - config_fields)
         if ignored_keys:
-            if normalized_params.infer_config.get("allow_unknown_config_keys", False):
-                logger.warning(f"Ignoring unknown Sparse-vLLM config keys: {ignored_keys}")
-            else:
-                raise ValueError(
-                    f"Unknown Sparse-vLLM config keys: {ignored_keys}. "
-                    "Refusing to ignore possible experiment parameter typos. "
-                    "Set allow_unknown_config_keys=True only for explicitly validated compatibility runs."
-                )
+            raise ValueError(
+                f"Unknown Sparse-vLLM config keys: {ignored_keys}. "
+                "Runtime parameter aliases and unknown keys are not accepted."
+            )
         config = Config(model, **config_kwargs)
         self.config = config
         
@@ -371,7 +360,7 @@ class LLMEngine:
             ignore_eos=decode_warmup,
         )
         max_prompt_len = max(1, int(self.config.max_model_len) - int(sampling_params.max_tokens))
-        warmup_len = min(int(self.config.chunk_prefill_size), max_prompt_len)
+        warmup_len = min(int(self.config.engine_prefill_chunk_size), max_prompt_len)
         warmup_len_override = os.getenv("SPARSEVLLM_DELTAKV_GRAPH_WARMUP_PROMPT_LEN", "").strip().lower()
         if warmup_len_override:
             if warmup_len_override in {"max", "full", "max_model_len", "max-model-len"}:
@@ -765,7 +754,7 @@ class LLMEngine:
         seq.num_prefilled_tokens = int(plan.reused_tokens)
         seq.prefix_cache_enabled = True
         seq.prefix_cache_hit_len = int(plan.reused_tokens)
-        seq.prefix_cache_method = str(self.config.vllm_sparse_method or "")
+        seq.prefix_cache_method = str(self.config.sparse_method or "")
         try:
             self.scheduler.add(seq)
         except Exception:
@@ -992,12 +981,12 @@ class LLMEngine:
             "num_kvcache_slots",
             "max_num_batched_tokens",
             "prefill_schedule_policy",
-            "chunk_prefill_size",
+            "engine_prefill_chunk_size",
             "long_prefill_offload_threshold",
-            "num_sink_tokens",
-            "num_recent_tokens",
+            "sink_keep_tokens",
+            "recent_keep_tokens",
             "decode_keep_tokens",
-            "full_attn_layers",
+            "full_attention_layers",
             "obs_layer_ids",
             "snapkv_window_size",
             "snapkv_num_full_layers",
@@ -1016,17 +1005,17 @@ class LLMEngine:
             "quest_chunk_size",
             "quest_token_budget",
             "quest_skip_layers",
-            "deltakv_path",
-            "cluster_ratio",
-            "kv_compressed_size",
-            "kv_quant_bits",
-            "kv_quant_group_size",
-            "decode_cuda_graph",
-            "decode_cuda_graph_capture_sampling",
-            "decode_cuda_graph_capture_sizes",
-            "decode_cuda_graph_context_sizes",
-            "decode_cuda_graph_context_policy",
-            "decode_cuda_graph_max_cached_graphs",
+            "deltakv_checkpoint_path",
+            "deltakv_center_ratio",
+            "deltakv_latent_dim",
+            "deltakv_latent_quant_bits",
+            "deltakv_latent_quant_group_size",
+            "decode_graph",
+            "decode_graph_capture_sampling",
+            "decode_graph_capture_sizes",
+            "decode_graph_context_sizes",
+            "decode_graph_context_policy",
+            "decode_graph_max_cached_graphs",
             "enable_prefix_caching",
             "prefix_cache_mode",
             "resolved_prefix_cache_mode",
@@ -1070,7 +1059,7 @@ class LLMEngine:
             "vocab_size": int(
                 getattr(config.hf_config, "vocab_size", 0) or 0
             ),
-            "sparse_method": str(getattr(config, "vllm_sparse_method", "") or ""),
+            "sparse_method": str(getattr(config, "sparse_method", "") or ""),
             "world_size": int(getattr(config, "world_size", 1)),
             "tensor_parallel_size": int(getattr(config, "tensor_parallel_size", 1)),
             "expert_parallel_size": int(getattr(config, "expert_parallel_size", 1)),
@@ -1127,7 +1116,7 @@ class LLMEngine:
             if runtime_state.prefix_cache_coordinator is not None
             else runtime_state.cache_manager
         )
-        method = str(self.config.vllm_sparse_method or "")
+        method = str(self.config.sparse_method or "")
         prefix_cache = getattr(owner, "prefix_cache", None)
         if prefix_cache is not None:
             return prefix_cache.routing_snapshot(method)
@@ -1208,7 +1197,7 @@ class LLMEngine:
                 raise RuntimeError(
                     "Scheduler returned no runnable sequences and no preemptions; "
                     "this would hang the generation loop. "
-                    f"method={self.config.vllm_sparse_method} free_slots={self.model_runner.runtime_state.num_free_slots} "
+                    f"method={self.config.sparse_method} free_slots={self.model_runner.runtime_state.num_free_slots} "
                     f"waiting={len(self.scheduler.waiting)} decoding={len(self.scheduler.decoding)}"
                 )
                 

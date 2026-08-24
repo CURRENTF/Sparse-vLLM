@@ -27,8 +27,9 @@ Sparse-vLLM is an inference framework built with sparsity as the first design pr
 
 ## Key Runtime Principles
 
-- Public commands and `LLM(...)` kwargs should use `sparse_method`; Sparse-vLLM
-  normalizes it internally to `vllm_sparse_method`.
+- Runtime parameter names are identical across `LLM(...)`, `Config`, JSON
+  configs, benchmark manifests, and internal consumers. Use `sparse_method`
+  everywhere; legacy field aliases are not accepted.
 - Sparse method runtime state belongs in
   `src/sparsevllm/engine/cache_manager/`; `attention.py` should stay generic.
 - Prefill scheduling is method-specific and registry-owned. The source of

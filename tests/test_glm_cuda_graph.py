@@ -161,7 +161,7 @@ def _make_glm_graph_lane(
     storage.rope_cache[0, :3].copy_(initial_rope)
 
     runtime_config = SimpleNamespace(
-        vllm_sparse_method="",
+        sparse_method="",
         runtime_layout=RuntimeLayout.dense(1),
         hf_config=SimpleNamespace(
             num_hidden_layers=1,
@@ -171,15 +171,15 @@ def _make_glm_graph_lane(
             torch_dtype=torch.bfloat16,
         ),
         obs_layer_ids=[],
-        full_attn_layers=[],
-        num_sink_tokens=0,
-        num_recent_tokens=0,
+        full_attention_layers=[],
+        sink_keep_tokens=0,
+        recent_keep_tokens=0,
         decode_keep_tokens=0,
         sparse_attn_score_dtype="float32",
         tensor_parallel_size=1,
-        decode_cuda_graph=True,
-        decode_cuda_graph_context_policy="current",
-        decode_cuda_graph_max_cached_graphs=None,
+        decode_graph=True,
+        decode_graph_context_policy="current",
+        decode_graph_max_cached_graphs=None,
     )
     manager = object.__new__(StandardCacheManager)
     manager.config = runtime_config
@@ -362,7 +362,7 @@ def test_glm_vanilla_decode_cuda_graph_matches_static_eager():
         "capture_count": graph.runner.capture_count,
         "replay_count": graph.runner.replay_count,
         "eager_static_count": graph.runner.eager_static_count,
-        "force_eager": graph.manager.decode_cuda_graph_force_eager(),
+        "force_eager": graph.manager.decode_graph_force_eager(),
         "force_eager_count": graph.runner.force_eager_count,
         "fallback": graph.runner.force_eager_count > 0,
         "steps": step_evidence,
@@ -438,7 +438,7 @@ def _make_glm_full_graph_lane(
                 model_config,
                 mla_attention=mla_attention,
                 mlp_chunk_size=8,
-                decode_cuda_graph=True,
+                decode_graph=True,
             )
     finally:
         torch.set_default_dtype(previous_dtype)
@@ -477,19 +477,19 @@ def _make_glm_full_graph_lane(
 
     runtime_layout = RuntimeLayout.dense(num_layers)
     runtime_config = SimpleNamespace(
-        vllm_sparse_method="",
+        sparse_method="",
         runtime_layout=runtime_layout,
         hf_config=model_config,
         obs_layer_ids=[],
-        full_attn_layers=[],
-        num_sink_tokens=0,
-        num_recent_tokens=0,
+        full_attention_layers=[],
+        sink_keep_tokens=0,
+        recent_keep_tokens=0,
         decode_keep_tokens=0,
         sparse_attn_score_dtype="float32",
         tensor_parallel_size=1,
-        decode_cuda_graph=True,
-        decode_cuda_graph_context_policy="current",
-        decode_cuda_graph_max_cached_graphs=None,
+        decode_graph=True,
+        decode_graph_context_policy="current",
+        decode_graph_max_cached_graphs=None,
     )
     manager = object.__new__(StandardCacheManager)
     manager.config = runtime_config
@@ -725,24 +725,24 @@ def _glm_method_runtime_config(method: str, *, num_layers: int):
     )
     hf_config.rms_norm_eps = 1e-6
     return SimpleNamespace(
-        vllm_sparse_method=method,
+        sparse_method=method,
         runtime_layout=RuntimeLayout.dense(num_layers),
         hf_config=hf_config,
         obs_layer_ids=[0] if method == "omnikv" else [],
-        full_attn_layers=[0] if method == "omnikv" else [],
-        num_sink_tokens=1,
-        num_recent_tokens=1,
+        full_attention_layers=[0] if method == "omnikv" else [],
+        sink_keep_tokens=1,
+        recent_keep_tokens=1,
         decode_keep_tokens=1,
         sparse_attn_score_dtype="float32",
         tensor_parallel_size=1,
-        decode_cuda_graph=True,
-        decode_cuda_graph_context_policy="current",
-        decode_cuda_graph_max_cached_graphs=None,
+        decode_graph=True,
+        decode_graph_context_policy="current",
+        decode_graph_max_cached_graphs=None,
         max_model_len=16,
         max_num_seqs_in_batch=1,
         max_num_seqs_in_gpu=1,
         max_num_batched_tokens=16,
-        chunk_prefill_size=8,
+        engine_prefill_chunk_size=8,
         pyramid_layer_ratios=None,
         snapkv_num_full_layers=0,
         snapkv_window_size=2,

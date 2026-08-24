@@ -405,7 +405,7 @@ def _decode_cuda_graph_for_method(
     if int(tensor_parallel_size) > 1:
         if not is_tp_decode_cuda_graph_supported(method["sparse_method"]):
             raise ValueError(
-                "decode_cuda_graph with tensor_parallel_size > 1 is a v1 gate for "
+                "decode_graph with tensor_parallel_size > 1 is a v1 gate for "
                 "vanilla, streamingllm, snapkv, pyramidkv, omnikv, quest, rkv, and skipkv only; "
                 f"got sparse_method={method['sparse_method']!r}."
             )
@@ -426,9 +426,9 @@ def _quality_command(
     cfg = _method_config(method, model=model, model_id=model_id)
     tensor_parallel_size = _tensor_parallel_size_from_config(quality, performance)
     cfg["tensor_parallel_size"] = int(tensor_parallel_size)
-    cfg["decode_cuda_graph"] = _decode_cuda_graph_for_method(
+    cfg["decode_graph"] = _decode_cuda_graph_for_method(
         method,
-        bool((performance or {}).get("decode_cuda_graph", False)),
+        bool((performance or {}).get("decode_graph", False)),
         tensor_parallel_size=tensor_parallel_size,
     )
     _apply_prefix_cache_config(
@@ -440,7 +440,7 @@ def _quality_command(
     )
     _apply_profiler_config(cfg, quality, performance)
     if tensor_parallel_size > 1:
-        cfg["decode_cuda_graph_capture_sampling"] = False
+        cfg["decode_graph_capture_sampling"] = False
     if "sparsevllm_max_num_seqs_in_batch" in quality:
         cfg["max_num_seqs_in_batch"] = int(quality["sparsevllm_max_num_seqs_in_batch"])
     if "sparsevllm_max_decoding_seqs" in quality:
@@ -492,16 +492,16 @@ def _perf_command(
 ) -> list[str]:
     tensor_parallel_size = _tensor_parallel_size_from_config(performance)
     hyper_params = {
-        "decode_cuda_graph": _decode_cuda_graph_for_method(
+        "decode_graph": _decode_cuda_graph_for_method(
             method,
-            bool(performance["decode_cuda_graph"]),
+            bool(performance["decode_graph"]),
             tensor_parallel_size=tensor_parallel_size,
         ),
         "tensor_parallel_size": int(tensor_parallel_size),
         "throughput_log_interval_s": 0.0,
     }
     if tensor_parallel_size > 1:
-        hyper_params["decode_cuda_graph_capture_sampling"] = False
+        hyper_params["decode_graph_capture_sampling"] = False
     method_cfg = _method_config(method, model=model, model_id=model_id, include_method=False)
     hyper_params.update(method_cfg)
     _apply_prefix_cache_config(
@@ -548,9 +548,9 @@ def _stress_command(
     request_counts = [int(x) for x in stress["request_counts"]]
     tensor_parallel_size = _tensor_parallel_size_from_config(stress, performance)
     hyper_params = {
-        "decode_cuda_graph": _decode_cuda_graph_for_method(
+        "decode_graph": _decode_cuda_graph_for_method(
             method,
-            bool(performance.get("decode_cuda_graph", True)),
+            bool(performance.get("decode_graph", True)),
             tensor_parallel_size=tensor_parallel_size,
         ),
         "tensor_parallel_size": int(tensor_parallel_size),
@@ -559,7 +559,7 @@ def _stress_command(
         "max_decoding_seqs": int(stress.get("max_decoding_seqs", max(request_counts))),
     }
     if tensor_parallel_size > 1:
-        hyper_params["decode_cuda_graph_capture_sampling"] = False
+        hyper_params["decode_graph_capture_sampling"] = False
     method_cfg = _method_config(method, model=model, model_id=model_id, include_method=False)
     hyper_params.update(method_cfg)
     _apply_prefix_cache_config(
@@ -705,8 +705,8 @@ def _stress_v2_command(
         str(int(stress_v2["max_active_requests"])),
         "--max_num_batched_tokens",
         str(int(stress_v2["max_num_batched_tokens"])),
-        "--chunk_prefill_size",
-        str(int(method_cfg.get("engine_prefill_chunk_size", stress_v2["chunk_prefill_size"]))),
+        "--engine_prefill_chunk_size",
+        str(int(method_cfg.get("engine_prefill_chunk_size", stress_v2["engine_prefill_chunk_size"]))),
         "--max_model_len_margin",
         str(int(stress_v2["max_model_len_margin"])),
         "--prefix_cache_block_size",
@@ -715,12 +715,12 @@ def _stress_v2_command(
         str(stress_v2.get("prefix_cache_salt") or f"regression-stress-v2:{model_id}:{method_id}"),
         "--quest_chunk_size",
         str(int(method_cfg.get("quest_chunk_size", stress_v2["quest_chunk_size"]))),
-        "--num_sink_tokens",
-        str(int(method_cfg.get("sink_keep_tokens", stress_v2["num_sink_tokens"]))),
-        "--num_recent_tokens",
-        str(int(method_cfg.get("recent_keep_tokens", stress_v2["num_recent_tokens"]))),
-        "--num_top_tokens",
-        str(int(method_cfg.get("decode_keep_tokens", stress_v2["num_top_tokens"]))),
+        "--sink_keep_tokens",
+        str(int(method_cfg.get("sink_keep_tokens", stress_v2["sink_keep_tokens"]))),
+        "--recent_keep_tokens",
+        str(int(method_cfg.get("recent_keep_tokens", stress_v2["recent_keep_tokens"]))),
+        "--decode_keep_tokens",
+        str(int(method_cfg.get("decode_keep_tokens", stress_v2["decode_keep_tokens"]))),
         "--full_attention_layers",
         str(full_attention_layers),
         "--min_performance_prompt_len",
@@ -795,8 +795,8 @@ def _scbench_command(
         cmd.extend(["--context_max_tokens", str(int(scbench["context_max_tokens"]))])
     if "gpu_memory_utilization" in scbench:
         cmd.extend(["--gpu_memory_utilization", str(float(scbench["gpu_memory_utilization"]))])
-    if bool(scbench.get("decode_cuda_graph", False)):
-        cmd.append("--decode_cuda_graph")
+    if bool(scbench.get("decode_graph", False)):
+        cmd.append("--decode_graph")
     return cmd
 
 
@@ -1066,7 +1066,7 @@ def main() -> int:
 
     if args.scbench_decode_cuda_graph:
         scbench_cfg = dict(resolved.get("scbench") or {})
-        scbench_cfg["decode_cuda_graph"] = True
+        scbench_cfg["decode_graph"] = True
         resolved["scbench"] = scbench_cfg
     if args.enable_prefix_caching:
         for section in ("quality", "performance", "stress"):
@@ -1329,8 +1329,8 @@ def main() -> int:
                         )
                         grade = grade_perf(
                             decode_speedup,
-                            graph_expected=bool(row.get("decode_cuda_graph_expected")),
-                            graph_active=bool(row.get("decode_cuda_graph_active")),
+                            graph_expected=bool(row.get("decode_graph_expected")),
+                            graph_active=bool(row.get("decode_graph_active")),
                             require_speedup=tensor_parallel_size <= 1,
                             prefill_speedup=prefill_speedup,
                             minimum_prefill_speedup=method_performance.get(

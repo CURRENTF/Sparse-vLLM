@@ -201,10 +201,10 @@ class SnapKVCacheManager(CacheManager):
             self.row_seq_lens.append(np.zeros((self.max_buffer_rows,), dtype=np.int32))
 
     def _sparse_eviction_never_triggers(self) -> bool:
-        method = str(getattr(self.config, "vllm_sparse_method", "") or "")
+        method = str(getattr(self.config, "sparse_method", "") or "")
         max_model_len = int(getattr(self.config, "max_model_len", 0) or 0)
-        sink = int(getattr(self.config, "num_sink_tokens", 0) or 0)
-        recent = int(getattr(self.config, "num_recent_tokens", 0) or 0)
+        sink = int(getattr(self.config, "sink_keep_tokens", 0) or 0)
+        recent = int(getattr(self.config, "recent_keep_tokens", 0) or 0)
         decode_keep = int(getattr(self.config, "decode_keep_tokens", 0) or 0)
         if method in {"snapkv", "rkv", "skipkv"}:
             return max_model_len <= sink + decode_keep + recent
@@ -214,7 +214,7 @@ class SnapKVCacheManager(CacheManager):
 
     def _pyramidkv_can_use_full_prefill_staging(self) -> bool:
         return (
-            self.config.vllm_sparse_method == "pyramidkv"
+            self.config.sparse_method == "pyramidkv"
             and self.config.pyramid_layer_ratios is not None
             and self.config.prefill_schedule_policy == PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH
         )
@@ -534,7 +534,7 @@ class SnapKVCacheManager(CacheManager):
     def has_prefill_staging_view(self, layer_idx: int) -> bool:
         return bool(
             self._pyramidkv_prefill_staging_active
-            and self.config.vllm_sparse_method == "pyramidkv"
+            and self.config.sparse_method == "pyramidkv"
             and 0 <= int(layer_idx) < int(self.num_layers)
             and self.is_full_attention_layer(layer_idx)
         )
@@ -582,7 +582,7 @@ class SnapKVCacheManager(CacheManager):
         suffix_tokens = max(0, int(suffix_tokens))
         generated_kv_tokens = max(0, int(generation_tokens) - 1)
         layer_ids = self.kv_transformer_layer_indices()
-        method = str(self.config.vllm_sparse_method)
+        method = str(self.config.sparse_method)
         use_new_pyramid_staging = (
             needs_resident_row
             and method == "pyramidkv"
@@ -607,8 +607,8 @@ class SnapKVCacheManager(CacheManager):
                 budget = self._pyramidkv_layer_budget(layer_idx)
                 top_budget = (
                     int(budget)
-                    - int(self.config.num_sink_tokens)
-                    - int(self.config.num_recent_tokens)
+                    - int(self.config.sink_keep_tokens)
+                    - int(self.config.recent_keep_tokens)
                 )
                 trigger_len = max(
                     int(budget) + 1,
@@ -616,15 +616,15 @@ class SnapKVCacheManager(CacheManager):
                 )
             elif method == "snapkv" and not is_full_layer:
                 budget = (
-                    int(self.config.num_sink_tokens)
+                    int(self.config.sink_keep_tokens)
                     + int(self.config.decode_keep_tokens)
-                    + int(self.config.num_recent_tokens)
+                    + int(self.config.recent_keep_tokens)
                 )
             elif method in ("rkv", "skipkv"):
                 budget = (
-                    int(self.config.num_sink_tokens)
+                    int(self.config.sink_keep_tokens)
                     + int(self.config.decode_keep_tokens)
-                    + int(self.config.num_recent_tokens)
+                    + int(self.config.recent_keep_tokens)
                 )
                 interval = int(
                     getattr(
@@ -752,7 +752,7 @@ class SnapKVCacheManager(CacheManager):
         ratio = float(self.config.pyramid_layer_ratios[self.kv_layer_index(layer_idx)])
         base_ratio = float(self.config.pyramid_layer_ratios[0])
         scaled_top_tokens = int(decode_keep * ratio / base_ratio)
-        return int(self.config.num_sink_tokens) + scaled_top_tokens + int(self.config.num_recent_tokens)
+        return int(self.config.sink_keep_tokens) + scaled_top_tokens + int(self.config.recent_keep_tokens)
 
     def _pyramidkv_prompt_admission_cost(self, seq: Sequence) -> int:
         prompt_len = int(seq.num_prompt_tokens)
@@ -781,9 +781,9 @@ class SnapKVCacheManager(CacheManager):
             )
         return super().prompt_admission_free_slots()
 
-    def prompt_admission_budgets(self, waiting_seqs, chunk_prefill_size: int) -> dict[str, int]:
+    def prompt_admission_budgets(self, waiting_seqs, engine_prefill_chunk_size: int) -> dict[str, int]:
         if not self._pyramidkv_can_use_full_prefill_staging():
-            return super().prompt_admission_budgets(waiting_seqs, chunk_prefill_size)
+            return super().prompt_admission_budgets(waiting_seqs, engine_prefill_chunk_size)
         return {
             f"layer_{layer_idx}": int(self._num_free_slots[layer_idx])
             for layer_idx in self.kv_transformer_layer_indices()
@@ -809,7 +809,7 @@ class SnapKVCacheManager(CacheManager):
         return super().prefill_step_free_slots_for(seq)
 
     def min_final_prefill_chunk_size(self, seq: Sequence) -> int:
-        method = self.config.vllm_sparse_method
+        method = self.config.sparse_method
         if method not in {"snapkv", "pyramidkv"}:
             return 0
         window = int(getattr(self.config, "snapkv_window_size", 0) or 0)
@@ -841,9 +841,9 @@ class SnapKVCacheManager(CacheManager):
             )
         if method == "snapkv":
             budget = (
-                int(self.config.num_sink_tokens)
+                int(self.config.sink_keep_tokens)
                 + int(self.config.decode_keep_tokens)
-                + int(self.config.num_recent_tokens)
+                + int(self.config.recent_keep_tokens)
             )
             if is_chain_resume:
                 first_layer = int(self.kv_transformer_layer_indices()[0])
@@ -893,9 +893,9 @@ class SnapKVCacheManager(CacheManager):
             return 0
         return super().prefill_step_reservation_cost(seq, scheduled_tokens)
 
-    def reserved_prefill_slots(self, waiting_seqs, chunk_prefill_size: int) -> int:
+    def reserved_prefill_slots(self, waiting_seqs, engine_prefill_chunk_size: int) -> int:
         if not self._pyramidkv_can_use_full_prefill_staging():
-            return super().reserved_prefill_slots(waiting_seqs, chunk_prefill_size)
+            return super().reserved_prefill_slots(waiting_seqs, engine_prefill_chunk_size)
         reserved = 0
         for seq in waiting_seqs:
             if 0 < seq.num_prefilled_tokens < seq.num_prompt_tokens:
@@ -925,15 +925,15 @@ class SnapKVCacheManager(CacheManager):
     def _prefill_score_layer_budget(self, layer_idx: int) -> int | None:
         if self.kv_layer_index(layer_idx) < int(getattr(self.config, "snapkv_num_full_layers", 0) or 0):
             return None
-        if self.config.vllm_sparse_method == "pyramidkv":
+        if self.config.sparse_method == "pyramidkv":
             if self.config.pyramid_layer_ratios is None:
                 return None
             return self._pyramidkv_layer_budget(layer_idx)
-        if self.config.vllm_sparse_method == "snapkv":
+        if self.config.sparse_method == "snapkv":
             return (
-                int(self.config.num_sink_tokens)
+                int(self.config.sink_keep_tokens)
                 + int(self.config.decode_keep_tokens)
-                + int(self.config.num_recent_tokens)
+                + int(self.config.recent_keep_tokens)
             )
         return None
 
@@ -1065,7 +1065,7 @@ class SnapKVCacheManager(CacheManager):
         score_ends: torch.Tensor,
         *,
         candidate_start: int,
-        num_recent_tokens: int,
+        recent_keep_tokens: int,
         batch_indices: torch.Tensor | None = None,
     ) -> None:
         mode = getattr(self.config, "sparse_prefill_score_mode", "probability")
@@ -1083,7 +1083,7 @@ class SnapKVCacheManager(CacheManager):
                 score_starts,
                 score_ends,
                 candidate_start=candidate_start,
-                num_recent_tokens=num_recent_tokens,
+                recent_keep_tokens=recent_keep_tokens,
                 score_mode=mode,
                 workspace=getattr(self, "_prefill_score_workspace", None),
                 batch_indices=batch_indices,
@@ -1233,7 +1233,7 @@ class SnapKVCacheManager(CacheManager):
         ctx = get_context()
         if not ctx.is_prefill:
             return None
-        if self.config.vllm_sparse_method not in ("snapkv", "pyramidkv"):
+        if self.config.sparse_method not in ("snapkv", "pyramidkv"):
             return None
         seqs = getattr(ctx, "seqs", None)
         if seqs is None:
@@ -1290,8 +1290,8 @@ class SnapKVCacheManager(CacheManager):
             max_score_len,
             score_starts,
             score_ends,
-            candidate_start=int(self.config.num_sink_tokens),
-            num_recent_tokens=int(self.config.num_recent_tokens),
+            candidate_start=int(self.config.sink_keep_tokens),
+            recent_keep_tokens=int(self.config.recent_keep_tokens),
             batch_indices=score_batch_indices,
         )
 
@@ -2128,8 +2128,8 @@ class SnapKVCacheManager(CacheManager):
         seqs: list[Sequence],
         *,
         kv_len: int,
-        num_sink_tokens: int,
-        num_recent_tokens: int,
+        sink_keep_tokens: int,
+        recent_keep_tokens: int,
     ):
         if not layer_indices or not seqs:
             return
@@ -2138,8 +2138,8 @@ class SnapKVCacheManager(CacheManager):
             self.kv_layer_index(int(layer_idx))
         self._uniform_decode_metadata = False
         kv_len = int(kv_len)
-        sink_end = min(int(num_sink_tokens), kv_len)
-        recent_start = max(sink_end, kv_len - int(num_recent_tokens))
+        sink_end = min(int(sink_keep_tokens), kv_len)
+        recent_start = max(sink_end, kv_len - int(recent_keep_tokens))
         new_len = sink_end + (kv_len - recent_start)
         if new_len <= 0:
             raise RuntimeError("prefix/recent compaction cannot keep zero tokens.")

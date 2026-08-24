@@ -67,7 +67,7 @@ class Qwen35MoeRouter(nn.Module):
             top_k=self.top_k,
             activation_dtype=model_activation_dtype(config),
             norm_topk_prob=True,
-            cuda_graph=bool(getattr(config, "decode_cuda_graph", False)),
+            cuda_graph=bool(getattr(config, "decode_graph", False)),
         )
         self.provider = resolve_moe_router_provider(self.op_spec)
         self.weight = nn.Parameter(

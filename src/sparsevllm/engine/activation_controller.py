@@ -20,7 +20,7 @@ class ActivationController(ABC):
 
     @staticmethod
     def create(config: Config, cache_manager: CacheManager) -> "ActivationController":
-        if str(config.vllm_sparse_method or "") == "skipkv":
+        if str(config.sparse_method or "") == "skipkv":
             return SkipKVActivationController(config, cache_manager)
         return ActivationController(config, cache_manager)
 
@@ -48,7 +48,7 @@ class ActivationController(ABC):
     def post_forward(self, seqs: list[Sequence], is_prefill: bool):
         del seqs, is_prefill
 
-    def decode_cuda_graph_keepalive_tensors(self) -> list[torch.Tensor]:
+    def decode_graph_keepalive_tensors(self) -> list[torch.Tensor]:
         return []
 
 
@@ -221,7 +221,7 @@ class SkipKVActivationController(ActivationController):
             return
         updater(seqs[:real_batch], self._hidden_capture[:real_batch])
 
-    def decode_cuda_graph_keepalive_tensors(self) -> list[torch.Tensor]:
+    def decode_graph_keepalive_tensors(self) -> list[torch.Tensor]:
         tensors: list[torch.Tensor] = []
         if self._steering_vector is not None:
             tensors.append(self._steering_vector)

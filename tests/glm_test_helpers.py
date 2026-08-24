@@ -53,7 +53,7 @@ def _glm_config(*, hf_overrides=None, **overrides) -> Config:
         "model": str(Path(__file__).resolve().parents[1]),
         "max_model_len": 128,
         "max_num_batched_tokens": 64,
-        "chunk_prefill_size": 64,
+        "engine_prefill_chunk_size": 64,
     }
     kwargs.update(overrides)
     with patch(

@@ -464,7 +464,7 @@ def _resolve_sparse_probe_protocol(
     hyper_params = _parse_json_arg(args.hyper_params)
     hyper_params.setdefault("tensor_parallel_size", args.tensor_parallel_size)
     hyper_params.setdefault("gpu_memory_utilization", args.gpu_memory_utilization)
-    hyper_params.setdefault("decode_cuda_graph", True)
+    hyper_params.setdefault("decode_graph", True)
     hyper_params.setdefault("max_num_batched_tokens", args.max_num_batched_tokens)
     hyper_params.setdefault("engine_prefill_chunk_size", args.max_num_batched_tokens)
     if args.sparse_method == "snapkv":

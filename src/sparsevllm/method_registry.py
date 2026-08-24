@@ -27,7 +27,7 @@ METHOD_ALIASES = {
     "skip-kv": "skipkv",
     "skip_kv": "skipkv",
     # DeltaKV now has one public runtime.  The old names stay as aliases so old
-    # config files still load, but all code routes through vllm_sparse_method="deltakv".
+    # config files still load, but all code routes through sparse_method="deltakv".
     "deltakv-less-memory": "deltakv",
     "deltakv_less_memory": "deltakv",
     "deltakv-less-memory-cudagraph": "deltakv",
@@ -77,7 +77,7 @@ SKIPKV_ASSET_MODEL_NAMES = frozenset(
 class ModelRuntimeCompatibility:
     sparse_methods: frozenset[str]
     prefix_cache_methods: frozenset[str]
-    decode_cuda_graph_methods: frozenset[str] = frozenset()
+    decode_graph_methods: frozenset[str] = frozenset()
 
 
 class PrefillScoreCollectionKind(Enum):
@@ -136,7 +136,7 @@ def sparse_prefill_attention_contract(
 
 def h2o_uses_fused_prefill_score(config) -> bool:
     return (
-        normalize_sparse_method(getattr(config, "vllm_sparse_method", None)) == "h2o"
+        normalize_sparse_method(getattr(config, "sparse_method", None)) == "h2o"
         and str(getattr(config, "sparse_prefill_score_mode", "probability")).strip().lower()
         == "logits"
         and int(getattr(config, "h2o_prefill_score_window", 0)) == 0
@@ -159,7 +159,7 @@ _MOE_SPARSE_METHODS = frozenset(
 DENSE_MODEL_COMPATIBILITY = ModelRuntimeCompatibility(
     sparse_methods=frozenset(CANONICAL_SPARSE_METHODS),
     prefix_cache_methods=frozenset(PREFIX_CACHE_SUPPORTED_METHODS),
-    decode_cuda_graph_methods=frozenset(CANONICAL_SPARSE_METHODS),
+    decode_graph_methods=frozenset(CANONICAL_SPARSE_METHODS),
 )
 
 QWEN3_MOE_EP_COMPATIBILITY = ModelRuntimeCompatibility(
@@ -167,13 +167,13 @@ QWEN3_MOE_EP_COMPATIBILITY = ModelRuntimeCompatibility(
     prefix_cache_methods=frozenset(
         {"", "omnikv", "quest", "snapkv", "h2o", "pyramidkv", "rkv"}
     ),
-    decode_cuda_graph_methods=_MOE_SPARSE_METHODS,
+    decode_graph_methods=_MOE_SPARSE_METHODS,
 )
 
 QWEN3_MOE_TP_EP_COMPATIBILITY = ModelRuntimeCompatibility(
     sparse_methods=_MOE_SPARSE_METHODS,
     prefix_cache_methods=frozenset({""}),
-    decode_cuda_graph_methods=_MOE_SPARSE_METHODS,
+    decode_graph_methods=_MOE_SPARSE_METHODS,
 )
 
 QWEN3_MOE_TP_COMPATIBILITY = QWEN3_MOE_TP_EP_COMPATIBILITY
@@ -181,21 +181,21 @@ QWEN3_MOE_TP_COMPATIBILITY = QWEN3_MOE_TP_EP_COMPATIBILITY
 QWEN35_MOE_COMPATIBILITY = ModelRuntimeCompatibility(
     sparse_methods=QWEN3_MOE_TP_EP_COMPATIBILITY.sparse_methods,
     prefix_cache_methods=frozenset({""}),
-    decode_cuda_graph_methods=(
-        QWEN3_MOE_TP_EP_COMPATIBILITY.decode_cuda_graph_methods
+    decode_graph_methods=(
+        QWEN3_MOE_TP_EP_COMPATIBILITY.decode_graph_methods
     ),
 )
 
 MINIMAX_M2_EP_COMPATIBILITY = ModelRuntimeCompatibility(
     sparse_methods=_MOE_SPARSE_METHODS,
     prefix_cache_methods=frozenset({"", "omnikv", "quest"}),
-    decode_cuda_graph_methods=_MOE_SPARSE_METHODS,
+    decode_graph_methods=_MOE_SPARSE_METHODS,
 )
 
 MINIMAX_M2_TP_EP_COMPATIBILITY = ModelRuntimeCompatibility(
     sparse_methods=MINIMAX_M2_EP_COMPATIBILITY.sparse_methods,
     prefix_cache_methods=MINIMAX_M2_EP_COMPATIBILITY.prefix_cache_methods,
-    decode_cuda_graph_methods=MINIMAX_M2_EP_COMPATIBILITY.decode_cuda_graph_methods,
+    decode_graph_methods=MINIMAX_M2_EP_COMPATIBILITY.decode_graph_methods,
 )
 
 GLM4_MOE_LITE_EP_COMPATIBILITY = ModelRuntimeCompatibility(
@@ -205,7 +205,7 @@ GLM4_MOE_LITE_EP_COMPATIBILITY = ModelRuntimeCompatibility(
     prefix_cache_methods=frozenset(
         {"", "streamingllm", "snapkv", "h2o", "omnikv", "rkv"}
     ),
-    decode_cuda_graph_methods=frozenset(
+    decode_graph_methods=frozenset(
         {"", "streamingllm", "snapkv", "h2o", "omnikv", "rkv"}
     ),
 )
@@ -213,7 +213,7 @@ GLM4_MOE_LITE_EP_COMPATIBILITY = ModelRuntimeCompatibility(
 GEMMA4_COMPATIBILITY = ModelRuntimeCompatibility(
     sparse_methods=frozenset({"", "streamingllm", "omnikv"}),
     prefix_cache_methods=frozenset({"", "streamingllm", "omnikv"}),
-    decode_cuda_graph_methods=frozenset({"", "streamingllm", "omnikv"}),
+    decode_graph_methods=frozenset({"", "streamingllm", "omnikv"}),
 )
 
 MODEL_RUNTIME_COMPATIBILITY = {
@@ -312,7 +312,7 @@ def validate_model_runtime_compatibility(
     model_type: str,
     sparse_method: str | None,
     topology: ParallelTopology,
-    decode_cuda_graph: bool,
+    decode_graph: bool,
     enable_prefix_caching: bool,
 ) -> ModelRuntimeCompatibility:
     model_type = str(model_type or "").strip().lower()
@@ -324,13 +324,13 @@ def validate_model_runtime_compatibility(
             f"parallel mode={topology.mode.value!r}."
         )
 
-    if bool(decode_cuda_graph) and method not in compatibility.decode_cuda_graph_methods:
+    if bool(decode_graph) and method not in compatibility.decode_graph_methods:
         supported = ", ".join(
             "'vanilla'" if item == "" else repr(item)
-            for item in sorted(compatibility.decode_cuda_graph_methods)
+            for item in sorted(compatibility.decode_graph_methods)
         )
         raise ValueError(
-            f"{model_type} v1 decode_cuda_graph is validated only for {supported}; "
+            f"{model_type} v1 decode_graph is validated only for {supported}; "
             f"got method={method!r}."
         )
     if method not in compatibility.sparse_methods:
@@ -359,7 +359,7 @@ def get_default_prefill_schedule_policy(method: str | None) -> str:
         supported = ", ".join(repr(name) for name in sorted(CANONICAL_SPARSE_METHODS) if name)
         aliases = ", ".join(repr(name) for name in sorted(SUPPORTED_SPARSE_METHOD_ALIASES))
         raise ValueError(
-            f"Unsupported vllm_sparse_method={method!r}. Supported methods: '', {supported}. "
+            f"Unsupported sparse_method={method!r}. Supported methods: '', {supported}. "
             f"Supported aliases: {aliases}."
         )
     return _DEFAULT_PREFILL_POLICY_BY_METHOD[normalized]

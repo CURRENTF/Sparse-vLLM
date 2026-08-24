@@ -77,27 +77,27 @@ class H2OCacheManager(SnapKVCacheManager):
         self,
         resident_len: int,
         remaining_tokens: int,
-        chunk_prefill_size: int,
+        engine_prefill_chunk_size: int,
     ) -> int:
         """Reserve the append-before-evict peak for a resident H2O row."""
         resident_len = int(resident_len)
         remaining_tokens = max(0, int(remaining_tokens))
-        chunk_size = max(1, int(chunk_prefill_size))
+        chunk_size = max(1, int(engine_prefill_chunk_size))
         return min(
             resident_len + remaining_tokens,
             max(resident_len, self.h2o_prefill_budget) + chunk_size,
         )
 
-    def _prompt_prefill_peak(self, seq: Sequence, chunk_prefill_size: int) -> int:
+    def _prompt_prefill_peak(self, seq: Sequence, engine_prefill_chunk_size: int) -> int:
         """Peak physical row size needed to make chunked prefill progress."""
         return self._prefill_append_peak(
             0,
             int(seq.num_prompt_tokens),
-            chunk_prefill_size,
+            engine_prefill_chunk_size,
         )
 
     def prompt_admission_cost(self, seq: Sequence) -> int:
-        return self._prompt_prefill_peak(seq, int(self.config.chunk_prefill_size))
+        return self._prompt_prefill_peak(seq, int(self.config.engine_prefill_chunk_size))
 
     def prompt_admission_free_slots(self) -> int:
         return int(self.num_free_slots)
@@ -105,9 +105,9 @@ class H2OCacheManager(SnapKVCacheManager):
     def prompt_admission_budgets(
         self,
         waiting_seqs: deque[Sequence],
-        chunk_prefill_size: int,
+        engine_prefill_chunk_size: int,
     ) -> dict[str, int]:
-        reserved = self.reserved_prefill_slots(waiting_seqs, chunk_prefill_size)
+        reserved = self.reserved_prefill_slots(waiting_seqs, engine_prefill_chunk_size)
         return {"slots": max(0, int(self.num_free_slots) - int(reserved))}
 
     def prompt_admission_costs(self, seq: Sequence) -> dict[str, int]:
@@ -116,7 +116,7 @@ class H2OCacheManager(SnapKVCacheManager):
     def prompt_logical_reservation_cost(self, seq: Sequence) -> int:
         return self.prompt_admission_cost(seq)
 
-    def reserved_prefill_slots(self, waiting_seqs: deque[Sequence], chunk_prefill_size: int) -> int:
+    def reserved_prefill_slots(self, waiting_seqs: deque[Sequence], engine_prefill_chunk_size: int) -> int:
         reserved = 0
         first_layer = int(self.kv_transformer_layer_indices()[0])
         for seq in waiting_seqs:
@@ -127,7 +127,7 @@ class H2OCacheManager(SnapKVCacheManager):
             peak_len = self._prefill_append_peak(
                 physical_len,
                 remaining,
-                chunk_prefill_size,
+                engine_prefill_chunk_size,
             )
             reserved += max(0, peak_len - physical_len)
         return int(reserved)
@@ -167,7 +167,7 @@ class H2OCacheManager(SnapKVCacheManager):
         """Reserve H2O's prefill peak and score-free decode growth."""
         suffix_tokens = max(0, int(suffix_tokens))
         generated_kv_tokens = max(0, int(generation_tokens) - 1)
-        chunk_size = max(1, int(self.config.chunk_prefill_size))
+        chunk_size = max(1, int(self.config.engine_prefill_chunk_size))
         layer_ids = self.kv_transformer_layer_indices()
         required_by_layer = []
         for local_layer, _layer_idx in enumerate(layer_ids):
@@ -230,7 +230,7 @@ class H2OCacheManager(SnapKVCacheManager):
             row_deficit,
         )
 
-    def decode_cuda_graph_context_capacity(
+    def decode_graph_context_capacity(
         self,
         seqs: list[Sequence],
         *,
@@ -859,7 +859,7 @@ class H2OCacheManager(SnapKVCacheManager):
                     score_starts,
                     score_ends,
                     candidate_start=0,
-                    num_recent_tokens=0,
+                    recent_keep_tokens=0,
                 )
             else:
                 if self.config.sparse_prefill_score_mode != "probability":

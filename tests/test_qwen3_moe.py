@@ -200,7 +200,7 @@ def test_qwen3_moe_builds_real_prefill_shape_spec(
     ) as prepare:
         actual = build_qwen3_prefill_attention_op(
             config,
-            engine_config=SimpleNamespace(vllm_sparse_method=""),
+            engine_config=SimpleNamespace(sparse_method=""),
             parallel_context=_tp_context(0, tp_size),
             device=torch.device("cuda", 0),
         )
@@ -256,7 +256,7 @@ def test_qwen3_sparse_prefill_uses_resolved_provider():
     ) as prepare:
         actual = build_qwen3_prefill_attention_op(
             _config(),
-            engine_config=SimpleNamespace(vllm_sparse_method="snapkv"),
+            engine_config=SimpleNamespace(sparse_method="snapkv"),
             parallel_context=_tp_context(0, 1),
             device=torch.device("cuda", 0),
         )

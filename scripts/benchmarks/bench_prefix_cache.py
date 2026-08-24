@@ -471,17 +471,17 @@ def _case_engine_kwargs(args: argparse.Namespace, case_name: str, max_prompt_len
         "expert_parallel_size": int(
             getattr(args, "expert_parallel_size", 1)
         ),
-        "decode_cuda_graph": bool(
-            getattr(args, "decode_cuda_graph", False)
+        "decode_graph": bool(
+            getattr(args, "decode_graph", False)
         ),
         "max_num_seqs_in_batch": int(args.max_active_requests),
         "max_decoding_seqs": int(args.max_active_requests),
         "max_num_batched_tokens": int(args.max_num_batched_tokens),
-        "engine_prefill_chunk_size": int(args.chunk_prefill_size),
+        "engine_prefill_chunk_size": int(args.engine_prefill_chunk_size),
         "throughput_log_interval_s": 0.0,
-        "sink_keep_tokens": int(args.num_sink_tokens),
-        "recent_keep_tokens": int(args.num_recent_tokens),
-        "decode_keep_tokens": int(args.num_top_tokens),
+        "sink_keep_tokens": int(args.sink_keep_tokens),
+        "recent_keep_tokens": int(args.recent_keep_tokens),
+        "decode_keep_tokens": int(args.decode_keep_tokens),
         "full_attention_layers": args.full_attention_layers,
         "quest_chunk_size": int(args.quest_chunk_size),
         "prefix_cache_block_size": _case_block_size(args, case_name),
@@ -512,10 +512,10 @@ def _decode_graph_rank_summaries(llm: Any) -> list[dict[str, Any]]:
     summaries = llm.debug_sparse_state_summaries()
     graph_summaries: list[dict[str, Any]] = []
     for summary in summaries:
-        graph = summary.get("decode_cuda_graph")
+        graph = summary.get("decode_graph")
         if not isinstance(graph, dict):
             raise RuntimeError(
-                "Worker debug summary is missing decode_cuda_graph evidence: "
+                "Worker debug summary is missing decode_graph evidence: "
                 f"world_rank={summary.get('world_rank')}."
             )
         graph_summaries.append(
@@ -631,12 +631,12 @@ def _long_text_threshold(
 ) -> int:
     resolved = engine_kwargs or {}
     base = (
-        int(resolved.get("sink_keep_tokens", args.num_sink_tokens))
-        + int(resolved.get("decode_keep_tokens", args.num_top_tokens))
-        + int(resolved.get("recent_keep_tokens", args.num_recent_tokens))
+        int(resolved.get("sink_keep_tokens", args.sink_keep_tokens))
+        + int(resolved.get("decode_keep_tokens", args.decode_keep_tokens))
+        + int(resolved.get("recent_keep_tokens", args.recent_keep_tokens))
     )
     chunk_size = int(
-        resolved.get("engine_prefill_chunk_size", args.chunk_prefill_size)
+        resolved.get("engine_prefill_chunk_size", args.engine_prefill_chunk_size)
     )
     return base + (chunk_size if is_prefill else 0)
 
@@ -1156,7 +1156,7 @@ def _summarize_records(
         key: int(cache_stats_after.get(key, 0)) - int(cache_stats_before.get(key, 0))
         for key in sorted(set(cache_stats_before) | set(cache_stats_after))
     }
-    graph_required = bool(getattr(args, "decode_cuda_graph", False))
+    graph_required = bool(getattr(args, "decode_graph", False))
     graph_deltas = _decode_graph_rank_deltas(
         decode_graph_before or [],
         decode_graph_after or [],
@@ -1263,11 +1263,11 @@ def _summarize_records(
         "prefix_cache_stats_before": cache_stats_before,
         "prefix_cache_stats_after": cache_stats_after,
         "prefix_cache_stats_delta": stats_delta,
-        "decode_cuda_graph_required": graph_required,
-        "decode_cuda_graph_failures": graph_failures,
-        "decode_cuda_graph_before": decode_graph_before or [],
-        "decode_cuda_graph_after": decode_graph_after or [],
-        "decode_cuda_graph_delta": graph_deltas,
+        "decode_graph_required": graph_required,
+        "decode_graph_failures": graph_failures,
+        "decode_graph_before": decode_graph_before or [],
+        "decode_graph_after": decode_graph_after or [],
+        "decode_graph_delta": graph_deltas,
         "per_turn": per_turn,
     }
     return summary
@@ -1526,13 +1526,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tensor_parallel_size", type=int, default=1)
     parser.add_argument("--expert_parallel_size", type=int, default=1)
     parser.add_argument(
-        "--decode_cuda_graph",
+        "--decode_graph",
         action=argparse.BooleanOptionalAction,
         default=False,
     )
     parser.add_argument("--max_active_requests", type=int, default=4)
     parser.add_argument("--max_num_batched_tokens", type=int, default=8192)
-    parser.add_argument("--chunk_prefill_size", type=int, default=4096)
+    parser.add_argument("--engine_prefill_chunk_size", type=int, default=4096)
     parser.add_argument("--max_model_len_margin", type=int, default=64)
     parser.add_argument("--hyper_params", default="{}")
 
@@ -1540,13 +1540,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prefix_cache_max_blocks", type=int, default=None)
     parser.add_argument("--prefix_cache_salt", default="prefix-cache-bench-v1")
     parser.add_argument("--quest_chunk_size", type=int, default=16)
-    parser.add_argument("--num_sink_tokens", type=int, default=8)
-    parser.add_argument("--num_recent_tokens", type=int, default=256)
-    parser.add_argument("--num_top_tokens", type=int, default=2048)
+    parser.add_argument("--sink_keep_tokens", type=int, default=8)
+    parser.add_argument("--recent_keep_tokens", type=int, default=256)
+    parser.add_argument("--decode_keep_tokens", type=int, default=2048)
     parser.add_argument("--require_omnikv_prefill_path", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
         "--full_attention_layers",
-        "--full_attn_layers",
+        "--full_attention_layers",
         dest="full_attention_layers",
         default="0,1,2,4,7,14",
     )

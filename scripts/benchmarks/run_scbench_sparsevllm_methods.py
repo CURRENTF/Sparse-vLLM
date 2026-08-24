@@ -250,7 +250,7 @@ def method_runtime_config(
     gpu_memory_utilization: float | None,
     scbench_max_steps: int,
     prefix_cache_salt: str,
-    decode_cuda_graph: bool = False,
+    decode_graph: bool = False,
 ) -> dict[str, Any]:
     method = manifest["methods"][method_id]
     cfg = dict(method.get("config") or {})
@@ -260,9 +260,9 @@ def method_runtime_config(
     if compressor_path:
         cfg.setdefault("deltakv_checkpoint_path", compressor_path)
     cfg["enable_prefix_caching"] = method["sparse_method"] in {"vanilla", "omnikv", "quest"}
-    cfg["decode_cuda_graph"] = bool(decode_cuda_graph)
-    if decode_cuda_graph:
-        cfg["decode_cuda_graph_capture_sampling"] = False
+    cfg["decode_graph"] = bool(decode_graph)
+    if decode_graph:
+        cfg["decode_graph_capture_sampling"] = False
     cfg["max_model_len"] = int(max_seq_length)
     cfg["tensor_parallel_size"] = int(tensor_parallel_size)
     cfg["max_num_seqs_in_batch"] = int(batch_size)
@@ -577,22 +577,22 @@ def prefix_summary(trace_path: Path, summary_path: Path) -> dict[str, Any]:
     return summary
 
 
-def decode_cuda_graph_status(llm: Any) -> dict[str, Any]:
-    runner = getattr(getattr(llm, "model_runner", None), "decode_cuda_graph_runner", None)
+def decode_graph_status(llm: Any) -> dict[str, Any]:
+    runner = getattr(getattr(llm, "model_runner", None), "decode_graph_runner", None)
     states = getattr(runner, "_graphs", {}) if runner is not None else {}
     graph_count = sum(
         1
         for state in getattr(states, "values", lambda: [])()
         if getattr(state, "graph", None) is not None
     )
-    configured = bool(getattr(getattr(llm, "config", None), "decode_cuda_graph", False))
+    configured = bool(getattr(getattr(llm, "config", None), "decode_graph", False))
     return {
-        "decode_cuda_graph_configured": configured,
-        "decode_cuda_graph_runner_initialized": runner is not None,
-        "decode_cuda_graph_state_count": int(len(states)) if states is not None else 0,
-        "decode_cuda_graph_graph_count": int(graph_count),
-        "decode_cuda_graph_last_state_key": str(getattr(runner, "last_state_key", None)) if runner is not None else None,
-        "decode_cuda_graph_active": bool(configured and graph_count > 0),
+        "decode_graph_configured": configured,
+        "decode_graph_runner_initialized": runner is not None,
+        "decode_graph_state_count": int(len(states)) if states is not None else 0,
+        "decode_graph_graph_count": int(graph_count),
+        "decode_graph_last_state_key": str(getattr(runner, "last_state_key", None)) if runner is not None else None,
+        "decode_graph_active": bool(configured and graph_count > 0),
     }
 
 
@@ -908,7 +908,7 @@ def run_method(
         gpu_memory_utilization=args.gpu_memory_utilization,
         scbench_max_steps=int(args.scbench_max_steps),
         prefix_cache_salt=f"{args.prefix_cache_salt}:{model_id}:{method_id}",
-        decode_cuda_graph=bool(args.decode_cuda_graph),
+        decode_graph=bool(args.decode_graph),
     )
     write_json(method_dir / "runtime_config.json", runtime_cfg)
 
@@ -944,10 +944,10 @@ def run_method(
                 batch_size=int(args.batch_size),
                 model_name_tag=model_name_tag,
             )
-        graph_status = decode_cuda_graph_status(llm)
-        if bool(runtime_cfg.get("decode_cuda_graph")) and not bool(graph_status["decode_cuda_graph_active"]):
+        graph_status = decode_graph_status(llm)
+        if bool(runtime_cfg.get("decode_graph")) and not bool(graph_status["decode_graph_active"]):
             raise RuntimeError(
-                "decode_cuda_graph=True was configured for SCBench, but no active decode CUDA graph "
+                "decode_graph=True was configured for SCBench, but no active decode CUDA graph "
                 f"was captured. graph_status={graph_status}."
             )
     finally:
@@ -967,7 +967,7 @@ def run_method(
         "tasks": task_results,
         "elapsed_s": float(time.perf_counter() - started_s),
         "runtime_config_path": str(method_dir / "runtime_config.json"),
-        "decode_cuda_graph_status": graph_status,
+        "decode_graph_status": graph_status,
     }
     write_json(method_dir / "method_summary.json", result)
     return result
@@ -1011,8 +1011,8 @@ def child_command(args: argparse.Namespace, method_id: str) -> list[str]:
         str(int(args.context_max_tokens)),
         "--single_method_child",
     ]
-    if args.decode_cuda_graph:
-        cmd.append("--decode_cuda_graph")
+    if args.decode_graph:
+        cmd.append("--decode_graph")
     if args.gpu_memory_utilization is not None:
         cmd.extend(["--gpu_memory_utilization", str(float(args.gpu_memory_utilization))])
     if args.trust_remote_code:
@@ -1041,7 +1041,7 @@ def run_methods_in_subprocesses(
         "max_turns": int(args.max_turns),
         "max_seq_length": int(args.max_seq_length),
         "batch_size": int(args.batch_size),
-        "decode_cuda_graph": bool(args.decode_cuda_graph),
+        "decode_graph": bool(args.decode_graph),
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
         "scbench_local_data_dir": os.environ.get("SCBENCH_LOCAL_DATA_DIR"),
         "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -1090,7 +1090,7 @@ def run_methods_in_subprocesses(
                     "data_name": data_name,
                     "score": task_result["score"],
                     "prefix_summary": task_result["prefix_summary"],
-                    "decode_cuda_graph_status": method_result.get("decode_cuda_graph_status", {}),
+                    "decode_graph_status": method_result.get("decode_graph_status", {}),
                     "elapsed_s": method_result["elapsed_s"],
                 },
             )
@@ -1115,7 +1115,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prefix_cache_salt", default="scbench-regression")
     parser.add_argument("--gpu_memory_utilization", type=float, default=None)
     parser.add_argument("--scbench_max_steps", type=int, default=200_000)
-    parser.add_argument("--decode_cuda_graph", action="store_true")
+    parser.add_argument("--decode_graph", action="store_true")
     parser.add_argument("--context_min_tokens", type=int, default=-1)
     parser.add_argument("--context_max_tokens", type=int, default=-1)
     parser.add_argument("--trust_remote_code", action="store_true")
@@ -1162,7 +1162,7 @@ def main() -> int:
         "max_turns": int(args.max_turns),
         "max_seq_length": int(args.max_seq_length),
         "batch_size": int(args.batch_size),
-        "decode_cuda_graph": bool(args.decode_cuda_graph),
+        "decode_graph": bool(args.decode_graph),
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
         "scbench_local_data_dir": os.environ.get("SCBENCH_LOCAL_DATA_DIR"),
         "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -1196,7 +1196,7 @@ def main() -> int:
                     "data_name": data_name,
                     "score": task_result["score"],
                     "prefix_summary": task_result["prefix_summary"],
-                    "decode_cuda_graph_status": method_result.get("decode_cuda_graph_status", {}),
+                    "decode_graph_status": method_result.get("decode_graph_status", {}),
                     "elapsed_s": method_result["elapsed_s"],
                 },
             )

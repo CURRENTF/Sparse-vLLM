@@ -46,8 +46,8 @@ def create_compressor(is_down: bool, config, bias_override: Optional[bool] = Non
     
     # 计算输入输出维度
     kv_dim = head_dim * hf_config.num_key_value_heads * kv_factor
-    input_size = kv_dim if is_down else config.kv_compressed_size
-    output_size = config.kv_compressed_size if is_down else kv_dim
+    input_size = kv_dim if is_down else config.deltakv_latent_dim
+    output_size = config.deltakv_latent_dim if is_down else kv_dim
 
     # 支持 compressor_linear_bias 参数
     bias = getattr(config, 'compressor_linear_bias', True) if bias_override is None else bool(bias_override)

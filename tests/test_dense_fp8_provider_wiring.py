@@ -260,9 +260,9 @@ def test_dense_mha_models_build_and_bind_full_attention_provider(
     config = _dense_config(model_name)
     context = _parallel_context()
     context.attention_tp_size = 1
-    engine_config = SimpleNamespace(vllm_sparse_method="vanilla")
+    engine_config = SimpleNamespace(sparse_method="vanilla")
     engine_config.max_decoding_seqs = 64
-    engine_config.decode_cuda_graph = True
+    engine_config.decode_graph = True
     prepared_prefill = Mock(name="prepared_prefill")
     prepared_decode = Mock(name="prepared_decode")
     full_attention = Mock(name="full_attention")

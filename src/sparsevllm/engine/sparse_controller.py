@@ -58,7 +58,7 @@ class SparseController:
     稀疏策略控制器，管理 KV Cache 的逻辑视图 (Reading View) 和 压缩策略。
     """
     def __init__(self, config: Config, cache_manager: CacheManager):
-        self.sparse_method = config.vllm_sparse_method
+        self.sparse_method = config.sparse_method
         self.validate_runtime_invariants = bool(
             getattr(config, "validate_runtime_invariants", False)
         )
@@ -82,11 +82,11 @@ class SparseController:
         self.activation_controller = ActivationController.create(config, cache_manager)
 
         self.obs_layer_ids = self.config.obs_layer_ids
-        self.full_attn_layers = self.config.full_attn_layers
+        self.full_attention_layers = self.config.full_attention_layers
         self.num_layers = self.config.hf_config.num_hidden_layers
 
-        self.num_sink = self.config.num_sink_tokens
-        self.num_recent = self.config.num_recent_tokens
+        self.num_sink = self.config.sink_keep_tokens
+        self.num_recent = self.config.recent_keep_tokens
         self.decode_keep_tokens = self.config.decode_keep_tokens
         layout_dims = tuple(
             getattr(getattr(self.config, "runtime_layout", None), "kv_head_dims", ())
@@ -130,12 +130,12 @@ class SparseController:
 
         # 静态配置
         self.sparse_config = {
-            "vllm_sparse_method": self.sparse_method,
-            "num_sink_tokens": self.config.num_sink_tokens,
-            "num_recent_tokens": self.config.num_recent_tokens,
+            "sparse_method": self.sparse_method,
+            "sink_keep_tokens": self.config.sink_keep_tokens,
+            "recent_keep_tokens": self.config.recent_keep_tokens,
             "decode_keep_tokens": self.config.decode_keep_tokens,
             "obs_layer_ids": self.config.obs_layer_ids,
-            "full_attn_layers": self.config.full_attn_layers,
+            "full_attention_layers": self.config.full_attention_layers,
             "dynamic_deltakv_topk_tiebreak": self.dynamic_deltakv_topk_tiebreak,
         }
 
@@ -171,8 +171,8 @@ class SparseController:
         self._h2o_decode_attn_score_buffers.clear()
         self._active_h2o_decode_score_view = None
 
-    def decode_cuda_graph_keepalive_tensors(self) -> list[torch.Tensor]:
-        tensors = self.activation_controller.decode_cuda_graph_keepalive_tensors()
+    def decode_graph_keepalive_tensors(self) -> list[torch.Tensor]:
+        tensors = self.activation_controller.decode_graph_keepalive_tensors()
         if self._omnikv_decode_attn_score_buffer is not None:
             tensors.append(self._omnikv_decode_attn_score_buffer)
         for buffers in self._omnikv_decode_selection_buffers.values():
@@ -417,7 +417,7 @@ class SparseController:
             for layer_idx in layer_indices
         )
         required_width = max_len
-        if bool(getattr(self.config, "decode_cuda_graph", False)):
+        if bool(getattr(self.config, "decode_graph", False)):
             graph_capacity = getattr(
                 self.cache_manager,
                 "_decode_static_max_context_len",
@@ -446,7 +446,7 @@ class SparseController:
                 "H2O decode score buffer requires positive dimensions: "
                 f"shape={(num_kv_layers, batch_size, width)}."
             )
-        if bool(getattr(self.config, "decode_cuda_graph", False)):
+        if bool(getattr(self.config, "decode_graph", False)):
             key = (num_kv_layers, batch_size, width)
         else:
             key = (num_kv_layers,)
@@ -470,7 +470,7 @@ class SparseController:
         # CUDA Graph replay resets this stable buffer inside the captured
         # forward. Only initialize newly allocated storage here; eager decode
         # still resets on every prepare.
-        if needs_alloc or not bool(getattr(self.config, "decode_cuda_graph", False)):
+        if needs_alloc or not bool(getattr(self.config, "decode_graph", False)):
             view.fill_(-1e20)
         return view
 
@@ -736,7 +736,7 @@ class SparseController:
 
     def _snapkv_decode_score_width(self, state: LayerBatchSparseState) -> int:
         max_len = self._state_max_context_len(state)
-        if not bool(getattr(self.config, "decode_cuda_graph", False)):
+        if not bool(getattr(self.config, "decode_graph", False)):
             return max_len
         graph_capacity = getattr(
             self.cache_manager,
@@ -893,7 +893,7 @@ class SparseController:
         sparse_state = self.layer_batch_sparse_states[layer_idx]
         ctx = get_context()
         is_dynamic_deltakv = self.is_deltakv_family
-        if ((self.sparse_method == "omnikv" or is_dynamic_deltakv) and layer_idx in self.full_attn_layers) or \
+        if ((self.sparse_method == "omnikv" or is_dynamic_deltakv) and layer_idx in self.full_attention_layers) or \
             self.sparse_method in (
                 'snapkv',
                 'h2o',
@@ -909,7 +909,7 @@ class SparseController:
             return SparseSelection(
                 kind="full",
                 req_indices=sparse_state.global_req_indices
-                if is_dynamic_deltakv and layer_idx in self.full_attn_layers
+                if is_dynamic_deltakv and layer_idx in self.full_attention_layers
                 else sparse_state.req_indices,
                 context_lens=sparse_state.context_lens,
                 max_context_len=sparse_state.max_context_len,
@@ -917,7 +917,7 @@ class SparseController:
                 global_req_indices=sparse_state.global_req_indices,
             )
 
-        assert layer_idx not in self.full_attn_layers
+        assert layer_idx not in self.full_attention_layers
         if is_dynamic_deltakv:
             # active_compressed_indices: (B, Kmax), padded with -1; may be None (treated as K=0)
             active = sparse_state.active_compressed_indices
@@ -1048,13 +1048,13 @@ class SparseController:
             for j in range(layer_idx + 1, self.num_layers):
                 if not self._is_kv_layer(j):
                     continue
-                if j in self.full_attn_layers: break
+                if j in self.full_attention_layers: break
                 target_layers.append(j)
             if not target_layers:
                 raise RuntimeError(
                     "Dynamic sparse observation layer has no target KV layers: "
                     f"method={self.sparse_method} observation_layer={layer_idx} "
-                    f"full_attn_layers={self.full_attn_layers}."
+                    f"full_attention_layers={self.full_attention_layers}."
                 )
 
             self._update_dynamic_omnikv_indices(layer_idx, target_layers)
@@ -1487,7 +1487,7 @@ class SparseController:
                         [seq for _, seq, _ in triggered],
                         [kv_len for _, _, kv_len in triggered],
                         candidate_start=self.num_sink,
-                        num_recent_tokens=self.num_recent,
+                        recent_keep_tokens=self.num_recent,
                     )
                 batch_keep_indices = None
                 triggered_seqs = [seq for _, seq, _ in triggered]
@@ -1541,7 +1541,7 @@ class SparseController:
                                 seq,
                                 kv_len,
                                 candidate_start=self.num_sink,
-                                num_recent_tokens=self.num_recent,
+                                recent_keep_tokens=self.num_recent,
                             )
                         else:
                             importance_scores = attn_scores[b_idx, :kv_len]
@@ -1653,8 +1653,8 @@ class SparseController:
                         layer_indices,
                         group_seqs,
                         kv_len=kv_len,
-                        num_sink_tokens=self.num_sink,
-                        num_recent_tokens=self.num_recent,
+                        sink_keep_tokens=self.num_sink,
+                        recent_keep_tokens=self.num_recent,
                     )
             if pending_compactions:
                 for entries in pending_compactions.values():
@@ -1750,8 +1750,8 @@ class SparseController:
                         layer_indices,
                         group_seqs,
                         kv_len=kv_len,
-                        num_sink_tokens=self.num_sink,
-                        num_recent_tokens=self.num_recent,
+                        sink_keep_tokens=self.num_sink,
+                        recent_keep_tokens=self.num_recent,
                     )
             if pending_compactions:
                 for entries in pending_compactions.values():
@@ -2001,7 +2001,7 @@ class SparseController:
                     and bool(
                         getattr(
                             getattr(self, "config", None),
-                            "decode_cuda_graph",
+                            "decode_graph",
                             False,
                         )
                     )
@@ -2094,7 +2094,7 @@ class SparseController:
             if budget is None:
                 return False
             trigger_len = self._snapkv_decode_trigger_len(budget)
-            if bool(getattr(self.config, "decode_cuda_graph", False)):
+            if bool(getattr(self.config, "decode_graph", False)):
                 state = self.layer_batch_sparse_states[layer_idx]
                 graph_capacity = self._snapkv_decode_score_width(state)
                 if not bool(get_context().is_long_text):
@@ -2138,7 +2138,7 @@ class SparseController:
             budget = self._get_joint_decode_budget()
             if budget is None:
                 return False
-            if bool(getattr(self.config, "decode_cuda_graph", False)):
+            if bool(getattr(self.config, "decode_graph", False)):
                 # Graph replay reuses the tensors captured on the first decode
                 # step.  SkipKV eviction may trigger only after more tokens are
                 # generated, so capture the score path up front instead of

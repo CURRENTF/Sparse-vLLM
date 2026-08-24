@@ -30,9 +30,9 @@ class _Manager:
 def _make_controller():
     layers = 4
     config = SimpleNamespace(
-        vllm_sparse_method="omnikv",
+        sparse_method="omnikv",
         obs_layer_ids=[0, 2],
-        full_attn_layers=[0, 2],
+        full_attention_layers=[0, 2],
         runtime_layout=SimpleNamespace(
             is_full_attention=lambda layer_idx: 0 <= int(layer_idx) < layers,
             kv_layer_index=lambda layer_idx: int(layer_idx),
@@ -45,11 +45,11 @@ def _make_controller():
             torch_dtype=torch.float32,
         ),
         tensor_parallel_size=1,
-        num_sink_tokens=0,
-        num_recent_tokens=1,
+        sink_keep_tokens=0,
+        recent_keep_tokens=1,
         decode_keep_tokens=2,
         sparse_attn_score_dtype="float32",
-        decode_cuda_graph=True,
+        decode_graph=True,
     )
     manager = _Manager()
     controller = SparseController(config, manager)
@@ -124,7 +124,7 @@ def test_omnikv_graph_reset_and_keepalive_cover_the_shared_workspace():
     assert torch.all(shared == -1e20)
     assert any(
         tensor.untyped_storage().data_ptr() == shared.untyped_storage().data_ptr()
-        for tensor in controller.decode_cuda_graph_keepalive_tensors()
+        for tensor in controller.decode_graph_keepalive_tensors()
     )
 
     controller.clear_decode_attn_score_buffers()
@@ -168,6 +168,6 @@ def test_omnikv_decode_graph_reuses_selection_output_buffers():
     assert pointers[0] == pointers[1]
     keepalive_ptrs = {
         int(tensor.data_ptr())
-        for tensor in controller.decode_cuda_graph_keepalive_tensors()
+        for tensor in controller.decode_graph_keepalive_tensors()
     }
     assert set(pointers[0]).issubset(keepalive_ptrs)

@@ -694,7 +694,7 @@ class Gemma4ForCausalLM(nn.Module):
             Gemma4OpSpec(
                 activation_dtype=model_activation_dtype(config),
                 head_dims=head_dims,
-                cuda_graph=bool(engine_config.decode_cuda_graph),
+                cuda_graph=bool(engine_config.decode_graph),
                 attention_contracts=attention_contracts,
             ),
             device_index=device.index,
@@ -707,7 +707,7 @@ class Gemma4ForCausalLM(nn.Module):
                         activation_dtype=model_activation_dtype(config),
                         num_experts=int(config.num_experts),
                         top_k=int(config.top_k_experts),
-                        cuda_graph=bool(engine_config.decode_cuda_graph),
+                        cuda_graph=bool(engine_config.decode_graph),
                     ),
                     device_index=device.index,
                 )

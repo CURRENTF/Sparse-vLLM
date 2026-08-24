@@ -54,7 +54,7 @@ Benchmark 入口不假设 host-specific dataset path。缺少必需 data root �
 - `full_attention_layers`
 - `engine_prefill_chunk_size`
 
-新命令不要使用 `chunk_prefill_size`、`vllm_sparse_method`、`model_cls`、`compressor_path`、`deltakv_path`、`num_top_tokens` 或 `seq_chunk_size` 等 legacy public key。完整 alias map 和原生行为参见[运行时参数语义](../configuration/runtime-parameter-semantics.md)。
+命令、manifest、`LLM(...)` 与内部配置都应原样使用上述名称。不要再使用 `engine_prefill_chunk_size`、`sparse_method`、`model_cls`、`compressor_path`、`deltakv_checkpoint_path`、`num_top_tokens` 或 `seq_chunk_size` 等旧 key。规范 contract 参见[运行时参数语义](../configuration/runtime-parameter-semantics.md)。
 
 Sparse-vLLM 要求显式 integer keep budget；ratio 必须在启动前换算为 token count。
 

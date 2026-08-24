@@ -4,7 +4,7 @@ Use this map to decide which repo files must change when adding a new Sparse-vLL
 
 ## Always Review
 
-- `src/sparsevllm/config.py`
+- `src/sparsevllm/configs/groups.py` and `src/sparsevllm/configs/runtime.py`
 - `src/sparsevllm/engine/cache_manager/base.py`
 - `src/sparsevllm/layers/attention.py`
 - `src/sparsevllm/engine/sparse_controller.py`
@@ -12,9 +12,9 @@ Use this map to decide which repo files must change when adding a new Sparse-vLL
 
 ## Add a First-Class Method
 
-Touch these files when the method becomes a supported `vllm_sparse_method`.
+Touch these files when the method becomes a supported `sparse_method`.
 
-- `src/sparsevllm/config.py`
+- `src/sparsevllm/configs/groups.py` or `src/sparsevllm/configs/runtime.py`
   Add config fields, validation, and defaults.
 - `src/sparsevllm/engine/cache_manager/<method>.py`
   Put method state, metadata, cache layout, and decode-time hooks here.

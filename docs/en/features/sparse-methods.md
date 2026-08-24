@@ -20,8 +20,8 @@ Set `sparse_method` to one of the following method names.
 | `quest` | Query-aware page selection | QuEST selects token pages based on the decode query. Prefill stays dense, and sparse selection happens in decode through page/chunk budgets. | `quest_chunk_size`, `quest_skip_layers`, `sink_keep_tokens`, `decode_keep_tokens`, `recent_keep_tokens` |
 | `deltakv` | Hybrid compression | Slim compressor-backed DeltaKV runtime. Legacy `deltakv-less-memory*` names normalize here for older configs, but real benchmark runs still require a matching compressor checkpoint. | `deltakv_checkpoint_path`, `deltakv_latent_dim`, `deltakv_center_ratio`, `deltakv_neighbor_count`, `deltakv_latent_quant_bits`, `full_layer_kv_quant_bits` |
 
-Sparse-vLLM internally stores this as `vllm_sparse_method`, but public commands
-and `LLM(...)` kwargs should use `sparse_method`.
+Sparse-vLLM uses `sparse_method` unchanged in public commands, `LLM(...)`, the
+runtime config, and internal consumers.
 
 > [!NOTE]
 > Decode scoring and eviction for `snapkv` and `h2o` are future work. In the
@@ -49,8 +49,8 @@ should not redefine method semantics.
 
 | Policy | Runtime Semantics | Current Default Methods |
 | --- | --- | --- |
-| `all_chunked` | Every prefill request is capped by `chunk_prefill_size` and normal scheduler batch limits; `long_prefill_offload_threshold` is ignored. | `vanilla`, `streamingllm`, `attention-sink`, `snapkv`, `h2o`, `quest`, `omnikv` |
-| `long_bs1full_short_batch` | After supported prefix attachment, residuals at or below `long_prefill_offload_threshold` use atomic full prefill and may batch. Larger residuals are isolated and use RawKV offload chunks capped by `chunk_prefill_size`. | `pyramidkv` and DeltaKV-family methods |
+| `all_chunked` | Every prefill request is capped by `engine_prefill_chunk_size` and normal scheduler batch limits; `long_prefill_offload_threshold` is ignored. | `vanilla`, `streamingllm`, `attention-sink`, `snapkv`, `h2o`, `quest`, `omnikv` |
+| `long_bs1full_short_batch` | After supported prefix attachment, residuals at or below `long_prefill_offload_threshold` use atomic full prefill and may batch. Larger residuals are isolated and use RawKV offload chunks capped by `engine_prefill_chunk_size`. | `pyramidkv` and DeltaKV-family methods |
 
 DeltaKV-family methods and PyramidKV keep `long_bs1full_short_batch` as the only
 public policy. The threshold defaults to `65536` tokens (64K). If

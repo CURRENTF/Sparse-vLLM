@@ -125,11 +125,11 @@ llm.exit()
 
 ## Key Parameters
 
-Sparse-vLLM runtime knobs are defined in `src/sparsevllm/config.py` and can be
-passed as keyword args to `LLM(...)`. Use canonical public names; legacy names
-such as `chunk_prefill_size`, `vllm_sparse_method`, `num_top_tokens`,
-`model_cls`, and `compressor_path` are rejected at public runtime/API
-boundaries.
+Sparse-vLLM runtime knobs are defined in `src/sparsevllm/configs/groups.py` and
+`runtime.py` and can be passed unchanged as keyword args to `LLM(...)`.
+`sparse_method` and `engine_prefill_chunk_size` are canonical names. Legacy
+names such as `sparse_method`, `engine_prefill_chunk_size`, `num_top_tokens`,
+`model_cls`, and `compressor_path` are rejected at the runtime boundary.
 
 Common knobs:
 

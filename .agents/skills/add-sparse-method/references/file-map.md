@@ -6,7 +6,7 @@ Use this map to locate architectural owners. "Inspect" does not mean "edit": a n
 
 | Concern | Primary source | Expected use |
 | --- | --- | --- |
-| Public parameter normalization | `src/sparsevllm/configs/runtime_params.py` | Map public `sparse_method` to canonical internal state; reject legacy/conflicting fields. |
+| Canonical runtime fields | `src/sparsevllm/configs/groups.py`, `src/sparsevllm/configs/runtime.py` | Keep public and internal names identical; reject unknown fields at the engine boundary. |
 | Config composition | `src/sparsevllm/configs/groups.py` | Understand how focused config groups are assembled. |
 | Sparse semantics | `src/sparsevllm/configs/sparse.py` | Validate sparse-specific values and derived settings. |
 | Model/layout compatibility | `src/sparsevllm/configs/model.py` | Inspect model-derived storage and attention properties. |

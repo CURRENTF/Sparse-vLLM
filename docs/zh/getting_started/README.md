@@ -113,7 +113,7 @@ llm.exit()
 
 ## 关键参数
 
-Sparse-vLLM runtime 参数定义在 `src/sparsevllm/config.py` 中，可以作为 keyword argument 传给 `LLM(...)`。请使用规范 public name；`chunk_prefill_size`、`vllm_sparse_method`、`num_top_tokens`、`model_cls` 和 `compressor_path` 等 legacy name 会在 public runtime/API 边界被拒绝。
+Sparse-vLLM runtime 参数定义在 `src/sparsevllm/configs/groups.py` 和 `runtime.py` 中，可原样作为 keyword argument 传给 `LLM(...)`。`sparse_method` 与 `engine_prefill_chunk_size` 是规范名称；`sparse_method`、`engine_prefill_chunk_size`、`num_top_tokens`、`model_cls` 和 `compressor_path` 等旧名称会在 runtime boundary 被拒绝。
 
 常用参数：
 

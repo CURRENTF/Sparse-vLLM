@@ -24,7 +24,7 @@ from sparsevllm.engine.sparse_controller import SparseController
 def _latent_chain_manager(manager_type, method: str):
     capacity = 32
     config = SimpleNamespace(
-        vllm_sparse_method=method,
+        sparse_method=method,
         model="/models/glm-chain-test",
         hf_config=SimpleNamespace(
             model_type="glm4_moe_lite",
@@ -37,9 +37,9 @@ def _latent_chain_manager(manager_type, method: str):
         max_num_seqs_in_gpu=1,
         prefix_cache_salt="",
         chain_cache_max_tombstones=8,
-        full_attn_layers=[0],
-        num_sink_tokens=1,
-        num_recent_tokens=1,
+        full_attention_layers=[0],
+        sink_keep_tokens=1,
+        recent_keep_tokens=1,
         decode_keep_tokens=2,
         snapkv_window_size=2,
         snapkv_num_full_layers=0,
@@ -47,7 +47,7 @@ def _latent_chain_manager(manager_type, method: str):
         pool_kernel_size=1,
         pyramid_layer_ratios=None,
         prefill_schedule_policy="chunked",
-        chunk_prefill_size=8,
+        engine_prefill_chunk_size=8,
         h2o_decode_budget=4,
         h2o_decode_eviction_interval=3,
         h2o_prefill_budget=8,

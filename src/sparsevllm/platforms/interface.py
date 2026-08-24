@@ -146,7 +146,7 @@ class Platform:
         return None
 
     def validate_config(self, config: Any) -> None:
-        if getattr(config, "decode_graph", False) or getattr(config, "decode_cuda_graph", False):
+        if getattr(config, "decode_graph", False):
             if not self.supports_graph_capture():
                 raise RuntimeError(f"Platform {self.name!r} does not support decode graph capture.")
 

@@ -16,7 +16,7 @@ def _prefill_score_baseline(
     score_starts,
     score_ends,
     candidate_start,
-    num_recent_tokens,
+    recent_keep_tokens,
 ):
     batch = int(context_lens.numel())
     num_heads = int(q.shape[1])
@@ -32,7 +32,7 @@ def _prefill_score_baseline(
         score_end = int(score_ends[b].item())
         req_row = int(b_req_idx[b].item())
         cand_start = int(candidate_start)
-        cand_end = max(cand_start, context_len - int(num_recent_tokens))
+        cand_end = max(cand_start, context_len - int(recent_keep_tokens))
         q_scores = []
         for h in range(num_heads):
             kv_h = h // kv_group
@@ -71,7 +71,7 @@ def _raw_qk_score_baseline(
     score_starts,
     score_ends,
     candidate_start,
-    num_recent_tokens,
+    recent_keep_tokens,
 ):
     batch = int(context_lens.numel())
     num_heads = int(q.shape[1])
@@ -89,7 +89,7 @@ def _raw_qk_score_baseline(
         prompt_cache_len = int(prompt_cache_lens[b].item())
         context_len = int(context_lens[b].item())
         req_row = int(b_req_idx[b].item())
-        candidate_end = context_len - int(num_recent_tokens)
+        candidate_end = context_len - int(recent_keep_tokens)
         for q_pos in range(int(score_starts[b]), int(score_ends[b])):
             q_rel = q_pos - prompt_cache_len
             if q_rel < 0 or q_rel >= context_len - prompt_cache_len:
@@ -216,7 +216,7 @@ class PrefillScoreKernelTest(unittest.TestCase):
                     score_starts,
                     score_ends,
                     candidate_start=1,
-                    num_recent_tokens=1,
+                    recent_keep_tokens=1,
                     score_mode=mode,
                 )
                 expected = baseline(
@@ -230,7 +230,7 @@ class PrefillScoreKernelTest(unittest.TestCase):
                     score_starts,
                     score_ends,
                     candidate_start=1,
-                    num_recent_tokens=1,
+                    recent_keep_tokens=1,
                 )
                 torch.testing.assert_close(
                     actual, expected, rtol=2e-2, atol=2e-2
@@ -277,7 +277,7 @@ class PrefillScoreKernelTest(unittest.TestCase):
             score_starts,
             score_ends,
             candidate_start=1,
-            num_recent_tokens=1,
+            recent_keep_tokens=1,
             score_mode="logits",
         )
         torch.cuda.synchronize()
@@ -293,7 +293,7 @@ class PrefillScoreKernelTest(unittest.TestCase):
             score_starts,
             score_ends,
             candidate_start=1,
-            num_recent_tokens=1,
+            recent_keep_tokens=1,
         )
         torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
@@ -341,7 +341,7 @@ class PrefillScoreKernelTest(unittest.TestCase):
             score_starts,
             score_ends,
             candidate_start=1,
-            num_recent_tokens=1,
+            recent_keep_tokens=1,
             score_mode="logits",
         )
         expected = _raw_qk_score_baseline(
@@ -355,7 +355,7 @@ class PrefillScoreKernelTest(unittest.TestCase):
             score_starts,
             score_ends,
             candidate_start=1,
-            num_recent_tokens=1,
+            recent_keep_tokens=1,
         )
         torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
@@ -532,7 +532,7 @@ class PrefillScoreKernelTest(unittest.TestCase):
                     full_starts,
                     full_ends,
                     candidate_start=1,
-                    num_recent_tokens=1,
+                    recent_keep_tokens=1,
                     score_mode=mode,
                 )
                 prefill_score_fwd(
@@ -548,7 +548,7 @@ class PrefillScoreKernelTest(unittest.TestCase):
                     full_starts[1:],
                     full_ends[1:],
                     candidate_start=1,
-                    num_recent_tokens=1,
+                    recent_keep_tokens=1,
                     score_mode=mode,
                     batch_indices=batch_indices,
                 )
@@ -575,7 +575,7 @@ class PrefillScoreKernelTest(unittest.TestCase):
         score_starts = torch.tensor([8, 6], dtype=torch.int32, device=device)
         score_ends = torch.tensor([11, 8], dtype=torch.int32, device=device)
         candidate_start = 1
-        num_recent_tokens = 2
+        recent_keep_tokens = 2
 
         total_q = int(chunk_lens.sum().item())
         q = torch.randn((total_q, num_heads, head_dim), dtype=dtype, device=device)
@@ -595,7 +595,7 @@ class PrefillScoreKernelTest(unittest.TestCase):
             score_starts,
             score_ends,
             candidate_start=candidate_start,
-            num_recent_tokens=num_recent_tokens,
+            recent_keep_tokens=recent_keep_tokens,
         )
         torch.cuda.synchronize()
 
@@ -610,7 +610,7 @@ class PrefillScoreKernelTest(unittest.TestCase):
             score_starts,
             score_ends,
             candidate_start,
-            num_recent_tokens,
+            recent_keep_tokens,
         )
         torch.testing.assert_close(attn_score, expected, rtol=2e-2, atol=2e-2)
 
@@ -639,7 +639,7 @@ class PrefillScoreKernelTest(unittest.TestCase):
         score_starts = torch.tensor([score_start], dtype=torch.int32, device=device)
         score_ends = torch.tensor([score_end], dtype=torch.int32, device=device)
         candidate_start = 2
-        num_recent_tokens = 4
+        recent_keep_tokens = 4
         prefill_score_fwd(
             q,
             k_cache,
@@ -653,7 +653,7 @@ class PrefillScoreKernelTest(unittest.TestCase):
             score_starts,
             score_ends,
             candidate_start=candidate_start,
-            num_recent_tokens=num_recent_tokens,
+            recent_keep_tokens=recent_keep_tokens,
         )
         torch.cuda.synchronize()
 
@@ -668,7 +668,7 @@ class PrefillScoreKernelTest(unittest.TestCase):
             score_starts,
             score_ends,
             candidate_start,
-            num_recent_tokens,
+            recent_keep_tokens,
         )
         torch.testing.assert_close(acc, expected, rtol=2e-2, atol=2e-2)
 
@@ -695,7 +695,7 @@ class PrefillScoreKernelTest(unittest.TestCase):
         score_starts = torch.tensor([prompt_cache_len], dtype=torch.int32, device=device)
         score_ends = torch.tensor([prompt_len], dtype=torch.int32, device=device)
         candidate_start = 3
-        num_recent_tokens = 9
+        recent_keep_tokens = 9
 
         prefill_score_fwd(
             q,
@@ -710,7 +710,7 @@ class PrefillScoreKernelTest(unittest.TestCase):
             score_starts,
             score_ends,
             candidate_start=candidate_start,
-            num_recent_tokens=num_recent_tokens,
+            recent_keep_tokens=recent_keep_tokens,
         )
         torch.cuda.synchronize()
 
@@ -725,7 +725,7 @@ class PrefillScoreKernelTest(unittest.TestCase):
             score_starts,
             score_ends,
             candidate_start,
-            num_recent_tokens,
+            recent_keep_tokens,
         )
         torch.testing.assert_close(acc, expected, rtol=2e-2, atol=2e-2)
 

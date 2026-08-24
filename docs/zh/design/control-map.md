@@ -25,7 +25,7 @@ continuation 的准确 BPE identity 而保留紧凑逻辑 token ID；该历史�
 
 ```mermaid
 flowchart TD
-    A["LLM(..., **kwargs)"] --> B["normalize_runtime_params(..., backend='sparsevllm')"]
+    A["LLM(..., **kwargs)"] --> B["按 Config 字段校验 kwargs"]
     B --> C["Config.__post_init__: validate model, method, graph, budgets"]
     C --> D["ModelRunner: load model, create CacheManager, SparseController"]
     C --> E["Scheduler: waiting/decode queues and admission"]
@@ -48,7 +48,7 @@ flowchart TD
 
 | 路径 | 角色 | 所有权规则 |
 | --- | --- | --- |
-| `src/sparsevllm/config.py` | Runtime dataclass、validation、graph constraint、方法规范化 default。 | Public 参数行为必须同步到 `docs/zh/configuration/runtime-parameter-semantics.md`。 |
+| `src/sparsevllm/configs/groups.py`, `runtime.py` | 规范 runtime 字段、validation、graph constraint 与方法规范化 default。 | Public 与 internal 字段名必须一致；参数行为同步到 `docs/zh/configuration/runtime-parameter-semantics.md`。 |
 | `src/sparsevllm/method_registry.py` | 稀疏方法 alias 和默认 prefill policy。 | 新 method string 和 policy default 从这里开始。 |
 | `src/sparsevllm/engine/llm_engine.py` | Public engine lifecycle、tokenizer、scheduler loop、warmup、吞吐量 logging。 | 不应增加方法特定 runtime 逻辑。 |
 | `src/sparsevllm/engine/scheduler.py` | Prefill/decode batching、长短请求分离、prompt admission、preemption。 | 使用 cache-manager budget hook，不了解方法内部实现。 |
@@ -164,7 +164,7 @@ CUDA_VISIBLE_DEVICES=<GPU> PYTHONPATH=$PWD:$PWD/src python \
 
 以下任务用于恢复控制边界，不是紧急 correctness fix：
 
-1. 在 cache-manager 创建过程针对 DeltaKV variant 修改 `config.vllm_sparse_method` 之前，增加 immutable `requested_sparse_method` 或 run-info 字段，使 log 和 artifact 更易解释。
+1. 在 cache-manager 创建过程针对 DeltaKV variant 修改 `config.sparse_method` 之前，增加 immutable `requested_sparse_method` 或 run-info 字段，使 log 和 artifact 更易解释。
 2. 明确 cache manager 中的 RoPE 所有权。Qwen3 theta/dtype 修复说明 cache manager 需要清晰持有 RoPE 或相关 position module。
 3. 让仓库文档专注于稳定 contract 和 runbook，不要添加本地 experiment ledger。
 4. 在功能改动触及具体区域前，不要拆分巨大的 DeltaKV cache manager。拆分时，应分别保留 allocation、staging、graph metadata 和 reconstruction 测试。

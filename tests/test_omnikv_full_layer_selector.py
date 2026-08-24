@@ -103,8 +103,8 @@ class OmniKVFullLayerSelectorTest(unittest.TestCase):
             answer_query_token_id=999,
             random_points_per_sample=4,
             rng=random.Random(7),
-            num_sink_tokens=0,
-            num_recent_tokens=32,
+            sink_keep_tokens=0,
+            recent_keep_tokens=32,
             min_prefix_tokens=1,
         )
 

@@ -73,7 +73,7 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
         self._decode_static_index_buffers: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
         self.enable_prefix_caching = bool(
             config.enable_prefix_caching
-            and config.vllm_sparse_method == "quest"
+            and config.sparse_method == "quest"
             and not getattr(getattr(config, "runtime_layout", None), "linear_attention_layer_indices", ())
         )
         self.prefix_cache_block_size = int(config.prefix_cache_block_size)
@@ -368,7 +368,7 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
     def prompt_logical_reservation_cost(self, seq: Sequence) -> int:
         return int(self.prompt_admission_cost(seq))
 
-    def reserved_prefill_slots(self, waiting_seqs: deque[Sequence], chunk_prefill_size: int) -> int:
+    def reserved_prefill_slots(self, waiting_seqs: deque[Sequence], engine_prefill_chunk_size: int) -> int:
         reserved = 0
         for seq in waiting_seqs:
             if 0 < seq.num_prefilled_tokens < seq.num_prompt_tokens:
@@ -413,7 +413,7 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
             return {
                 "supported": True,
                 "enabled": False,
-                "method": str(getattr(self.config, "vllm_sparse_method", "") or ""),
+                "method": str(getattr(self.config, "sparse_method", "") or ""),
                 "matched_tokens": 0,
                 "matched_blocks": 0,
                 "match_ratio": 0.0,
@@ -428,7 +428,7 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
         return {
             "supported": True,
             "enabled": True,
-            "method": str(getattr(self.config, "vllm_sparse_method", "") or ""),
+            "method": str(getattr(self.config, "sparse_method", "") or ""),
             "block_size": int(self.prefix_cache_block_size),
             "prompt_tokens": int(len(token_ids)),
             "usable_tokens": int(usable_tokens),

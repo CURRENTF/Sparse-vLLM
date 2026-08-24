@@ -8,9 +8,9 @@ from sparsevllm.utils.loader import sync_deltakv_config_from_checkpoint
 
 def _base_config(tmp_path):
     return SimpleNamespace(
-        deltakv_path=str(tmp_path),
-        vllm_sparse_method="deltakv",
-        kv_compressed_size=128,
+        deltakv_checkpoint_path=str(tmp_path),
+        sparse_method="deltakv",
+        deltakv_latent_dim=128,
         use_nonlinear_compressor=True,
         compressor_intermediate_size=2048,
         compressor_linear_bias=True,
@@ -26,7 +26,7 @@ def test_syncs_from_checkpoint_config_json(tmp_path):
     (tmp_path / "config.json").write_text(
         json.dumps(
             {
-                "kv_compressed_size": 256,
+                "deltakv_latent_dim": 256,
                 "compressor_down_type": "mlp_swiglu",
                 "compressor_up_type": "linear",
                 "compressor_down_intermediate_size": 3072,
@@ -45,7 +45,7 @@ def test_syncs_from_checkpoint_config_json(tmp_path):
     changed = sync_deltakv_config_from_checkpoint(cfg)
 
     assert changed is True
-    assert cfg.kv_compressed_size == 256
+    assert cfg.deltakv_latent_dim == 256
     assert cfg.compressor_down_type == "mlp_swiglu"
     assert cfg.compressor_up_type == "linear"
     assert cfg.compressor_down_intermediate_size == 3072
@@ -67,7 +67,7 @@ def test_falls_back_to_weight_shape_when_config_missing(tmp_path):
     changed = sync_deltakv_config_from_checkpoint(cfg)
 
     assert changed is True
-    assert cfg.kv_compressed_size == 256
+    assert cfg.deltakv_latent_dim == 256
     assert cfg.compressor_down_type == "mlp_swiglu"
     assert cfg.compressor_up_type == "linear"
     assert cfg.compressor_down_intermediate_size == 3072

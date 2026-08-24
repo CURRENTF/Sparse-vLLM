@@ -243,7 +243,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
 
     def _full_layer_cluster_ratio(self) -> float:
         ratio = float(getattr(self.config, "full_layer_cluster_ratio", 0.0) or 0.0)
-        return ratio if ratio > 0.0 else float(self.config.cluster_ratio or 0.0)
+        return ratio if ratio > 0.0 else float(self.config.deltakv_center_ratio or 0.0)
 
     def _deltakv_reset_full_prefill_staging(self, *, clear_plans: bool = True):
         super()._deltakv_reset_full_prefill_staging(clear_plans=clear_plans)
@@ -349,19 +349,19 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         return payload_dim * dtype_size
 
     def _quant_group_size(self, payload_dim: int) -> int:
-        group_size = int(getattr(self.config, "kv_quant_group_size", 0) or 0)
+        group_size = int(getattr(self.config, "deltakv_latent_quant_group_size", 0) or 0)
         if group_size <= 0:
             group_size = int(payload_dim)
         if payload_dim % group_size != 0:
             raise ValueError(
-                "DeltaKV slim runtime requires payload_dim divisible by kv_quant_group_size; "
-                f"payload_dim={payload_dim}, kv_quant_group_size={group_size}."
+                "DeltaKV slim runtime requires payload_dim divisible by deltakv_latent_quant_group_size; "
+                f"payload_dim={payload_dim}, deltakv_latent_quant_group_size={group_size}."
             )
         return group_size
 
     def _sparse_payload_dim(self, kv_dim: int) -> int:
         del kv_dim
-        return int(self.config.kv_compressed_size)
+        return int(self.config.deltakv_latent_dim)
 
     @staticmethod
     def _resident_sparse_raw_overhead_slots(max_seqs: int, sink: int, recent: int) -> int:
@@ -429,7 +429,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         if is_capturing:
             raise RuntimeError(
                 "DeltaKV less-memory is not CUDA Graph capture-safe. "
-                "Use vllm_sparse_method='deltakv' with decode_cuda_graph=True for graph runs."
+                "Use sparse_method='deltakv' with decode_graph=True for graph runs."
             )
         else:
             if validate:
@@ -440,8 +440,8 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
 
     def _max_decode_scratch_seqs(self) -> int:
         max_seqs = max(int(self.config.max_num_seqs_in_batch), int(self.config.max_decoding_seqs))
-        if bool(getattr(self.config, "decode_cuda_graph", False)):
-            capture_sizes = getattr(self.config, "decode_cuda_graph_capture_sizes", None) or []
+        if bool(getattr(self.config, "decode_graph", False)):
+            capture_sizes = getattr(self.config, "decode_graph_capture_sizes", None) or []
             if capture_sizes:
                 max_seqs = max(max_seqs, max(int(size) for size in capture_sizes))
         return max_seqs
@@ -581,8 +581,8 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         self._debug_track_deltakv_full_slots(slots, "free_temp")
         return super().free_temp_deltakv_full(slots)
 
-    def decode_cuda_graph_keepalive_tensors(self) -> list[torch.Tensor]:
-        refs = super().decode_cuda_graph_keepalive_tensors()
+    def decode_graph_keepalive_tensors(self) -> list[torch.Tensor]:
+        refs = super().decode_graph_keepalive_tensors()
         attr_names = [
             "_full_layer_score_k_cache_fp32",
             "_full_layer_score_v_scratch_fp32",
@@ -635,8 +635,8 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         available_memory, slot_bytes_per_layer = self._get_available_slots_info()
         config = self.config
         dtype_size = torch.tensor([], dtype=self.hf_config.torch_dtype).element_size()
-        sink = int(config.num_sink_tokens)
-        recent = int(config.num_recent_tokens)
+        sink = int(config.sink_keep_tokens)
+        recent = int(config.recent_keep_tokens)
         max_seqs = self._max_decode_scratch_seqs()
         max_admission_seqs = int(config.max_num_seqs_in_gpu)
         max_model_len = int(config.max_model_len)
@@ -678,15 +678,15 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         assert num_deltakv_layers > 0, "DeltaKV less-memory requires at least one sparse layer."
 
         kv_dim = 2 * self.num_kv_heads * self.head_dim
-        quant_bits = int(config.kv_quant_bits or 0)
+        quant_bits = int(config.deltakv_latent_quant_bits or 0)
         if quant_bits not in (0, 4):
-            raise ValueError(f"DeltaKV slim runtime supports kv_quant_bits=0 or 4, got {quant_bits}.")
+            raise ValueError(f"DeltaKV slim runtime supports deltakv_latent_quant_bits=0 or 4, got {quant_bits}.")
 
         sparse_payload_dim = self._sparse_payload_dim(kv_dim)
         sparse_group_size = self._quant_group_size(sparse_payload_dim) if quant_bits else sparse_payload_dim
         latent_bytes = self._packed_residual_bytes(sparse_payload_dim, quant_bits, dtype_size, sparse_group_size)
 
-        cluster_ratio = max(0.0, float(config.cluster_ratio))
+        deltakv_center_ratio = max(0.0, float(config.deltakv_center_ratio))
         full_quant_bits = int(getattr(config, "full_layer_kv_quant_bits", 0) or 0)
         if full_quant_bits not in (0, 4):
             raise ValueError(f"DeltaKV slim runtime supports full_layer_kv_quant_bits=0 or 4, got {full_quant_bits}.")
@@ -711,17 +711,17 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         if full_quant_enabled:
             per_token_bytes = (
                 num_full_layers * (full_cluster_ratio * slot_bytes_per_layer + full_latent_bytes)
-                + num_deltakv_layers * (cluster_ratio * slot_bytes_per_layer + latent_bytes)
+                + num_deltakv_layers * (deltakv_center_ratio * slot_bytes_per_layer + latent_bytes)
             )
         elif full_kivi_enabled:
             per_token_bytes = (
                 num_full_layers * full_kivi_token_bytes
-                + num_deltakv_layers * (cluster_ratio * slot_bytes_per_layer + latent_bytes)
+                + num_deltakv_layers * (deltakv_center_ratio * slot_bytes_per_layer + latent_bytes)
             )
         else:
             per_token_bytes = (
                 num_full_layers * slot_bytes_per_layer
-                + num_deltakv_layers * (cluster_ratio * slot_bytes_per_layer + latent_bytes)
+                + num_deltakv_layers * (deltakv_center_ratio * slot_bytes_per_layer + latent_bytes)
             )
         if per_token_bytes <= 0:
             raise ValueError("Invalid DeltaKV less-memory allocation configuration.")
@@ -805,7 +805,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
 
             latent_index_bytes_per_slot = (
                 num_deltakv_layers
-                * int(config.deltakv_k_neighbors)
+                * int(config.deltakv_neighbor_count)
                 * 4
             )
             sparse_latent_bytes_per_slot = (
@@ -925,8 +925,8 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
                 f"deltakv_full_pool_reserve_ratio={reserve_ratio:.3f} "
                 "is not used to pre-shrink memory_max_tokens in this closed-loop path; "
                 f"sparse_payload_dim={sparse_payload_dim}; "
-                f"kv_quant_bits={quant_bits}; "
-                f"kv_quant_group_size={sparse_group_size}; "
+                f"deltakv_latent_quant_bits={quant_bits}; "
+                f"deltakv_latent_quant_group_size={sparse_group_size}; "
                 f"use_compression={bool(getattr(config, 'use_compression', True))}; "
                 f"full_layer_kivi_group_size={full_kivi_group_size}."
             )
@@ -942,8 +942,8 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
                 f"memory_capacity_tokens={memory_max_tokens}; configured_capacity_tokens={configured_token_capacity}; "
                 f"capacity_margin={capacity_margin}; center_capacity_margin={center_capacity_margin}; "
                 f"estimated_deltakv_centers_per_seq={estimated_deltakv_centers}; "
-                f"sparse_payload_dim={sparse_payload_dim}; kv_quant_bits={quant_bits}; "
-                f"kv_quant_group_size={sparse_group_size}; use_compression={bool(getattr(config, 'use_compression', True))}; "
+                f"sparse_payload_dim={sparse_payload_dim}; deltakv_latent_quant_bits={quant_bits}; "
+                f"deltakv_latent_quant_group_size={sparse_group_size}; use_compression={bool(getattr(config, 'use_compression', True))}; "
                 f"full_layer_kv_quant_bits={full_quant_bits}; full_layer_centers={full_center_capacity}; "
                 f"full_layer_kivi_blocks={self.full_layer_kivi_num_blocks}; "
                 f"full_layer_kivi_group_size={full_kivi_group_size}; "
@@ -1030,7 +1030,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
             self.deltakv_latent_mins = None
 
         self.deltakv_latent_to_full_slots = torch.full(
-            (num_deltakv_layers, self.deltakv_latent_num_slots, config.deltakv_k_neighbors),
+            (num_deltakv_layers, self.deltakv_latent_num_slots, config.deltakv_neighbor_count),
             -1,
             dtype=torch.int32,
             device=self.device,
@@ -1067,7 +1067,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
             )
             self.full_layer_latent_mins = torch.empty_like(self.full_layer_latent_scales)
             self.full_layer_latent_to_full_slots = torch.full(
-                (num_full_layers, self.full_layer_latent_num_slots, config.deltakv_k_neighbors),
+                (num_full_layers, self.full_layer_latent_num_slots, config.deltakv_neighbor_count),
                 -1,
                 dtype=torch.int32,
                 device=self.device,
@@ -1190,8 +1190,8 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
     def _init_compressor_modules(self, config, num_deltakv_layers: int):
         if not bool(getattr(config, "use_compression", True)):
             raise ValueError("DeltaKV slim runtime is compressor-only; set use_compression=True.")
-        if not getattr(config, "deltakv_path", None):
-            raise ValueError("DeltaKV compressor sparse layers require deltakv_path.")
+        if not getattr(config, "deltakv_checkpoint_path", None):
+            raise ValueError("DeltaKV compressor sparse layers require deltakv_checkpoint_path.")
         self.compress_down = []
         self.compress_up = []
         for _ in range(num_deltakv_layers):
@@ -1438,8 +1438,8 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         total_len = int(total_len)
         if not self._full_layer_quant_enabled():
             return total_len
-        sink = int(self.config.num_sink_tokens or 0)
-        recent = int(self.config.num_recent_tokens or 0)
+        sink = int(self.config.sink_keep_tokens or 0)
+        recent = int(self.config.recent_keep_tokens or 0)
         effective_end = max(sink, total_len - recent)
         if effective_end <= sink:
             return 0
@@ -1453,7 +1453,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
     def prompt_admission_cost(self, seq: Sequence) -> int:
         if self._full_layer_kivi_enabled():
             total_len = int(seq.num_prompt_tokens + (getattr(seq, "max_tokens", 0) or 0))
-            resident = int(self.config.num_sink_tokens) + int(
+            resident = int(self.config.sink_keep_tokens) + int(
                 getattr(self.config, "full_layer_kivi_residual_length", self._full_layer_kivi_group_size())
                 or self._full_layer_kivi_group_size()
             ) + 1
@@ -1461,11 +1461,11 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         if not self._full_layer_quant_enabled():
             return super().prompt_admission_cost(seq)
         total_len = int(seq.num_prompt_tokens + (getattr(seq, "max_tokens", 0) or 0))
-        resident = min(total_len, int(self.config.num_sink_tokens) + int(self.config.num_recent_tokens))
+        resident = min(total_len, int(self.config.sink_keep_tokens) + int(self.config.recent_keep_tokens))
         return resident + self._estimate_full_layer_centers_for_total_len(total_len)
 
-    def prompt_admission_budgets(self, waiting_seqs, chunk_prefill_size: int) -> dict[str, int]:
-        budgets = super().prompt_admission_budgets(waiting_seqs, chunk_prefill_size)
+    def prompt_admission_budgets(self, waiting_seqs, engine_prefill_chunk_size: int) -> dict[str, int]:
+        budgets = super().prompt_admission_budgets(waiting_seqs, engine_prefill_chunk_size)
         latent_reserved = int(getattr(self, "_deltakv_latent_reserved_total", 0) or 0)
         budgets["deltakv_latent"] = max(
             0,
@@ -1482,7 +1482,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
     def _estimate_full_layer_kivi_blocks_for_total_len(self, total_len: int) -> int:
         total_len = int(total_len)
         group_size = self._full_layer_kivi_group_size()
-        sink = min(int(self.config.num_sink_tokens), total_len)
+        sink = min(int(self.config.sink_keep_tokens), total_len)
         residual_length = int(getattr(self.config, "full_layer_kivi_residual_length", group_size) or group_size)
         quant_tokens = max(0, total_len - sink - residual_length)
         return quant_tokens // group_size
@@ -1496,7 +1496,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
             costs["full_layers"] = self.prompt_admission_cost(seq)
             costs["full_layer_kivi_blocks"] = self._estimate_full_layer_kivi_blocks_for_total_len(total_len)
         elif self._full_layer_quant_enabled():
-            resident = min(total_len, int(self.config.num_sink_tokens) + int(self.config.num_recent_tokens))
+            resident = min(total_len, int(self.config.sink_keep_tokens) + int(self.config.recent_keep_tokens))
             costs["full_layers"] = resident + self._estimate_full_layer_centers_for_total_len(total_len)
         return costs
 
@@ -1601,7 +1601,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
     ):
         total_len = int(total_len)
         group_size = self._full_layer_kivi_group_size()
-        sink = min(int(self.config.num_sink_tokens), total_len)
+        sink = min(int(self.config.sink_keep_tokens), total_len)
         residual_length = int(getattr(self.config, "full_layer_kivi_residual_length", group_size) or group_size)
         if residual_length <= 0:
             raise ValueError(f"full_layer_kivi_residual_length must be > 0, got {residual_length}.")
@@ -1978,7 +1978,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
 
     def _deltakv_long_prefill_restore_block_tokens(self) -> int:
         config = getattr(self, "config", None)
-        configured = int(getattr(config, "chunk_prefill_size", 65536) or 65536)
+        configured = int(getattr(config, "engine_prefill_chunk_size", 65536) or 65536)
         return max(1, min(configured, 65536))
 
     def _deltakv_restore_sparse_prefix_to_staging(self, layer_idx: int, start: int) -> None:
@@ -2149,10 +2149,10 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         ).squeeze(0).squeeze(0)
 
     def _quantize_residual(self, residual: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return self._quantize_residual_bits(residual, int(self.config.kv_quant_bits or 0))
+        return self._quantize_residual_bits(residual, int(self.config.deltakv_latent_quant_bits or 0))
 
     def _dequantize_residual(self, packed: torch.Tensor, scale: torch.Tensor, mn: torch.Tensor, kv_dim: int) -> torch.Tensor:
-        return self._dequantize_residual_bits(packed, scale, mn, kv_dim, int(self.config.kv_quant_bits or 0))
+        return self._dequantize_residual_bits(packed, scale, mn, kv_dim, int(self.config.deltakv_latent_quant_bits or 0))
 
     def _store_residual(self, l_idx: int, latent_slots: torch.Tensor, residual: torch.Tensor):
         if latent_slots.numel() != residual.shape[0]:
@@ -2170,7 +2170,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
                     "DeltaKV less-memory latent residual store got slot outside cache: "
                     f"cap={latent_cap}, bad={bad}."
                 )
-        if int(self.config.kv_quant_bits or 0) == 4:
+        if int(self.config.deltakv_latent_quant_bits or 0) == 4:
             packed, scale, mn = self._quantize_residual(residual)
             self.deltakv_latent_cache[l_idx, latent_slots] = packed.to(self.deltakv_latent_cache.dtype)
             self.deltakv_latent_scales[l_idx, latent_slots] = scale.to(self.deltakv_latent_scales.dtype)
@@ -2421,7 +2421,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         if num_centers == 0:
             raise RuntimeError("DeltaKV less-memory: no available reference centers.")
 
-        k_eff = min(int(self.config.deltakv_k_neighbors), num_centers)
+        k_eff = min(int(self.config.deltakv_neighbor_count), num_centers)
         if k_eff <= 0:
             raise RuntimeError("DeltaKV less-memory: no available centers to assign.")
         score_chunk_size = self._deltakv_score_chunk_size(num_centers)
@@ -2728,7 +2728,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         assert kv_states.dim() == 3 and kv_states.shape[0] == 1
         _, n, kv_dim = kv_states.shape
         l_idx = self.deltakv_layer_to_idx[layer_idx]
-        k_neighbors = int(self.config.deltakv_k_neighbors)
+        k_neighbors = int(self.config.deltakv_neighbor_count)
         existing_centers = (
             self._gather_sparse_ref_raw_kv_by_slots(
                 l_idx,
@@ -2840,7 +2840,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
 
     def _load_residual(self, l_idx: int, recon_latent: torch.Tensor, kv_dim: int) -> torch.Tensor:
         residual = self.deltakv_latent_cache[l_idx, recon_latent]
-        if int(self.config.kv_quant_bits or 0) == 4:
+        if int(self.config.deltakv_latent_quant_bits or 0) == 4:
             scales = self.deltakv_latent_scales[l_idx, recon_latent]
             mins = self.deltakv_latent_mins[l_idx, recon_latent]
             payload_dim = self._sparse_payload_dim(kv_dim)
@@ -2904,7 +2904,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         context_lens = context_lens[:bsz].to(torch.int32)
         compressed_lens = self.get_compressed_lens(req_indices).to(torch.int32)
 
-        sink = int(self.config.num_sink_tokens)
+        sink = int(self.config.sink_keep_tokens)
         max_buffer = self._deltakv_decode_static_max_buffer()
         max_s = sink + k_max + max_buffer
         temp_slots = self._ensure_decode_static_temp_slots(bsz, k_max)
@@ -3082,7 +3082,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
             self._full_layer_quant_out_slots = torch.arange(total_slots, dtype=torch.int32, device=self.device)
 
     def _deltakv_decode_static_max_buffer(self) -> int:
-        recent = int(self.config.num_recent_tokens)
+        recent = int(self.config.recent_keep_tokens)
         # Decode runs before post-forward eviction. DeltaKV evicts raw tail
         # tokens in recent-sized chunks, so the visible uncompressed tail can
         # include one recent window plus the next remainder/current token.
@@ -3137,7 +3137,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         assert kv_states.dim() == 3 and kv_states.shape[0] == 1
         _, n, kv_dim = kv_states.shape
-        k_neighbors = int(self.config.deltakv_k_neighbors)
+        k_neighbors = int(self.config.deltakv_neighbor_count)
         existing_centers = (
             self._gather_full_layer_raw_kv_by_slots(layer_idx, existing_center_slots).unsqueeze(0)
             if existing_center_slots.numel() > 0
@@ -3463,7 +3463,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         score_k = self._full_layer_score_k_cache_fp32
         score_v = self._full_layer_score_v_scratch_fp32
         l_idx = self.full_layer_to_idx[layer_idx]
-        sink = int(self.config.num_sink_tokens or 0)
+        sink = int(self.config.sink_keep_tokens or 0)
         rows = req_indices.detach().cpu().tolist()
         lens = compressed_lens.detach().cpu().tolist()
         for b, (row_raw, comp_raw) in enumerate(zip(rows, lens)):
@@ -3497,7 +3497,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
             return
         group_size = int(getattr(self.config, "full_layer_kivi_group_size", 32) or 32)
         residual_length = int(getattr(self.config, "full_layer_kivi_residual_length", group_size) or group_size)
-        sink = int(self.config.num_sink_tokens)
+        sink = int(self.config.sink_keep_tokens)
         if self.row_full_layer_kivi_quantized_lens is None:
             raise RuntimeError("Full-layer KIVI state was not initialized.")
 
@@ -3603,8 +3603,8 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         with profiler.record("deltakv_less_memory_evict_total"):
             if not self.deltakv_layer_ids:
                 return
-            sink = int(self.config.num_sink_tokens)
-            recent = int(self.config.num_recent_tokens)
+            sink = int(self.config.sink_keep_tokens)
+            recent = int(self.config.recent_keep_tokens)
             cluster_step = self._deltakv_base_cluster_step()
             cos_sin = self.cos_sin_cache[:, 0, :]
 
@@ -3783,8 +3783,8 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
             return
         if not self.full_layer_ids:
             return
-        sink = int(self.config.num_sink_tokens)
-        recent = int(self.config.num_recent_tokens)
+        sink = int(self.config.sink_keep_tokens)
+        recent = int(self.config.recent_keep_tokens)
         cos_sin = self.cos_sin_cache[:, 0, :]
 
         for seq in seqs:

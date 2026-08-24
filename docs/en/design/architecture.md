@@ -10,7 +10,7 @@ inference engine with its own scheduler,
 The Sparse-vLLM inference path is:
 
 1. `sparsevllm.LLM(model, **kwargs)`
-2. `src/sparsevllm/configs/runtime_params.py` normalizes public runtime names.
+2. `LLMEngine` validates kwargs against the canonical `Config` fields.
 3. `src/sparsevllm/config.py` validates engine config and method compatibility.
 4. `src/sparsevllm/engine/cache_manager/base.py` selects a cache manager.
 5. `Scheduler`, `ModelRunner`, `SparseController`, kernels, and the selected
@@ -46,16 +46,16 @@ and `src/sparsevllm/engine/scheduler.py` implements the scheduling behavior.
 The engine currently supports:
 
 - `all_chunked`: all prefill requests are chunked and batched through the normal
-  scheduler limits, with at most `chunk_prefill_size` tokens per sequence.
+  scheduler limits, with at most `engine_prefill_chunk_size` tokens per sequence.
 - `long_bs1full_short_batch`: after any supported prefix is attached, requests
   with at most `long_prefill_offload_threshold` residual tokens use atomic full
   prefill and may batch together. Larger residuals run alone as chunked RawKV
-  offload prefill, with chunks capped by `chunk_prefill_size`.
+  offload prefill, with chunks capped by `engine_prefill_chunk_size`.
 
 DeltaKV and PyramidKV implement the long branch through
 `prefill_execution_mode()`. The threshold defaults to `65536` tokens (64K).
-When `chunk_prefill_size` is omitted, `Config` defaults it to the threshold; an
-explicit chunk size must satisfy `0 < chunk_prefill_size <=
+When `engine_prefill_chunk_size` is omitted, `Config` defaults it to the threshold; an
+explicit chunk size must satisfy `0 < engine_prefill_chunk_size <=
 long_prefill_offload_threshold`. `Config` raises `max_num_batched_tokens` to the
 threshold when necessary so a boundary-sized full prefill remains atomic.
 PyramidKV applies the boundary to the residual after chain-prefix attachment.
@@ -69,9 +69,9 @@ defaults. Add the method-to-policy mapping to the registry and update
 
 ## Important Files
 
-- `src/sparsevllm/configs/runtime_params.py`: public runtime parameter aliases and
-  legacy-key rejection.
-- `src/sparsevllm/config.py`: engine config defaults and validation.
+- `src/sparsevllm/configs/groups.py` and `runtime.py`: canonical runtime fields,
+  defaults, and validation. Public and internal names are identical.
+- `src/sparsevllm/config.py`: compatibility import facade for `Config`.
 - `src/sparsevllm/method_registry.py`: supported method names and prefill policy
   defaults.
 - `src/sparsevllm/engine/cache_manager/base.py`: method-to-cache-manager

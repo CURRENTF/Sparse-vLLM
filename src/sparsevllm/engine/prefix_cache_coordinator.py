@@ -102,7 +102,7 @@ class PrefixCacheCoordinator:
             raise RuntimeError("Mixed prefix offload requires an enabled coordinator radix.")
         if int(getattr(self.config, "tensor_parallel_size", 1)) not in (1, 2):
             raise RuntimeError("Mixed prefix offload currently supports only TP=1 or TP=2.")
-        is_quest = str(getattr(self.config, "vllm_sparse_method", "") or "") == "quest"
+        is_quest = str(getattr(self.config, "sparse_method", "") or "") == "quest"
         if not device_runtime.supports_pin_memory() or not device_runtime.supports_streams(
             self.cache_manager.device
         ):
@@ -200,7 +200,7 @@ class PrefixCacheCoordinator:
             return {
                 "supported": True,
                 "enabled": False,
-                "method": str(getattr(self.config, "vllm_sparse_method", "") or ""),
+                "method": str(getattr(self.config, "sparse_method", "") or ""),
                 "matched_tokens": 0,
                 "matched_blocks": 0,
                 "match_ratio": 0.0,
@@ -215,7 +215,7 @@ class PrefixCacheCoordinator:
         return {
             "supported": True,
             "enabled": True,
-            "method": str(getattr(self.config, "vllm_sparse_method", "") or ""),
+            "method": str(getattr(self.config, "sparse_method", "") or ""),
             "block_size": int(self.block_size),
             "prompt_tokens": int(len(token_ids)),
             "usable_tokens": int(usable_tokens),
@@ -383,7 +383,7 @@ class PrefixCacheCoordinator:
         seq.prefix_cache_hit_block_count = int(hit_blocks)
         seq.prefix_cache_hit_last_block_id = last_block_id
         seq.prefix_cache_block_size = self.block_size
-        seq.prefix_cache_method = str(self.config.vllm_sparse_method or "")
+        seq.prefix_cache_method = str(self.config.sparse_method or "")
 
     def attach_prefix_cache_hits(self, seqs: list[Sequence]) -> None:
         if self.prefix_cache is None:

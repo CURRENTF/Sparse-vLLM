@@ -18,7 +18,6 @@ src_path = str(REPO_ROOT / "src")
 if src_path not in sys.path:
     sys.path.insert(0, src_path)
 
-from sparsevllm.configs.runtime_params import normalize_runtime_params
 from sparsevllm.method_registry import (
     CANONICAL_SPARSE_METHODS,
     PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
@@ -64,16 +63,12 @@ def _load_json_arg(value: str) -> dict[str, Any]:
 def _build_engine_hyper_params(args) -> dict[str, Any]:
     # Keep benchmark defaults stable (do not rely on sparsevllm.Config defaults).
     hyper_params: dict[str, Any] = {
-        "decode_cuda_graph": True,
+        "decode_graph": True,
         "gpu_memory_utilization": 0.8,
         "tensor_parallel_size": 1,
     }
 
     hyper_params.update(_load_json_arg(args.hyper_params))
-
-    normalized = normalize_runtime_params(hyper_params, backend="sparsevllm")
-    for warning in normalized.warnings:
-        print(f"[param-normalize] {warning}")
 
     return hyper_params
 
@@ -372,33 +367,33 @@ def _write_output_dir(args, rows: list[dict[str, Any]]) -> None:
 
 
 def _decode_cuda_graph_status(llm) -> dict[str, Any]:
-    runner = getattr(getattr(llm, "model_runner", None), "decode_cuda_graph_runner", None)
+    runner = getattr(getattr(llm, "model_runner", None), "decode_graph_runner", None)
     states = getattr(runner, "_graphs", {}) if runner is not None else {}
     graph_count = sum(
         1
         for state in states.values()
         if getattr(state, "graph", None) is not None
     )
-    configured = bool(getattr(getattr(llm, "config", None), "decode_cuda_graph", False))
+    configured = bool(getattr(getattr(llm, "config", None), "decode_graph", False))
     return {
-        "decode_cuda_graph_configured": configured,
-        "decode_cuda_graph_runner_initialized": runner is not None,
-        "decode_cuda_graph_state_count": int(len(states)),
-        "decode_cuda_graph_graph_count": int(graph_count),
-        "decode_cuda_graph_capture_count": int(
+        "decode_graph_configured": configured,
+        "decode_graph_runner_initialized": runner is not None,
+        "decode_graph_state_count": int(len(states)),
+        "decode_graph_graph_count": int(graph_count),
+        "decode_graph_capture_count": int(
             getattr(runner, "capture_count", 0)
         ),
-        "decode_cuda_graph_replay_count": int(
+        "decode_graph_replay_count": int(
             getattr(runner, "replay_count", 0)
         ),
-        "decode_cuda_graph_eager_static_count": int(
+        "decode_graph_eager_static_count": int(
             getattr(runner, "eager_static_count", 0)
         ),
-        "decode_cuda_graph_force_eager_count": int(
+        "decode_graph_force_eager_count": int(
             getattr(runner, "force_eager_count", 0)
         ),
-        "decode_cuda_graph_last_state_key": str(getattr(runner, "last_state_key", None)) if runner is not None else None,
-        "decode_cuda_graph_active": bool(configured and graph_count > 0),
+        "decode_graph_last_state_key": str(getattr(runner, "last_state_key", None)) if runner is not None else None,
+        "decode_graph_active": bool(configured and graph_count > 0),
     }
 
 
@@ -417,20 +412,20 @@ def _resolved_engine_config(llm) -> dict[str, Any]:
     if config is None:
         return {}
     keys = (
-        "vllm_sparse_method",
+        "sparse_method",
         "prefill_schedule_policy",
-        "chunk_prefill_size",
+        "engine_prefill_chunk_size",
         "long_prefill_offload_threshold",
-        "decode_cuda_graph",
-        "decode_cuda_graph_capture_sampling",
+        "decode_graph",
+        "decode_graph_capture_sampling",
         "deltakv_sparse_decode_backend",
         "deltakv_triton_materialize_block_tokens",
         "deltakv_triton_gather_heads_per_program",
         "deltakv_triton_reconstruct_heads_per_program",
         "full_layer_kv_quant_bits",
-        "kv_quant_bits",
-        "kv_quant_group_size",
-        "full_attn_layers",
+        "deltakv_latent_quant_bits",
+        "deltakv_latent_quant_group_size",
+        "full_attention_layers",
         "obs_layer_ids",
         "h2o_decode_budget",
         "h2o_prefill_budget",
@@ -504,7 +499,7 @@ def benchmark_task(method, length, bs, args, results_dict):
         if tensor_parallel_size > 1
         else is_decode_cuda_graph_supported(normalized_method)
     )
-    if bool(base_hyper_params.get("decode_cuda_graph")) and not graph_supported:
+    if bool(base_hyper_params.get("decode_graph")) and not graph_supported:
         results_dict[(method, length, bs)] = {
             "method": method,
             "sparse_method": normalized_method,
@@ -512,15 +507,15 @@ def benchmark_task(method, length, bs, args, results_dict):
             "batch_size": int(bs),
             "status": "SKIPPED_BY_POLICY",
             "reason": (
-                "decode_cuda_graph is not supported for "
+                "decode_graph is not supported for "
                 f"sparse_method={normalized_method!r}, tensor_parallel_size={tensor_parallel_size}."
             ),
-            "decode_cuda_graph_expected": True,
-            "decode_cuda_graph_active": False,
+            "decode_graph_expected": True,
+            "decode_graph_active": False,
             "synchronize_step_timing": synchronize_step_timing,
         }
         print(
-            f"[{method.upper()}] SKIPPED_BY_POLICY: decode_cuda_graph is not supported "
+            f"[{method.upper()}] SKIPPED_BY_POLICY: decode_graph is not supported "
             f"for sparse_method={normalized_method!r}, tensor_parallel_size={tensor_parallel_size}."
         )
         return
@@ -776,7 +771,7 @@ def benchmark_task(method, length, bs, args, results_dict):
             "synchronize_step_timing": synchronize_step_timing,
             "scheduler_preemptions": preemptions,
             "scheduler_recompute_replays": recompute_replays,
-            "decode_cuda_graph_expected": bool(base_hyper_params.get("decode_cuda_graph")),
+            "decode_graph_expected": bool(base_hyper_params.get("decode_graph")),
             **graph_status,
             "operator_runtime_stats": operator_runtime_stats,
             "prefix_cache_required": bool(getattr(args, "require_prefix_cache_hit", False)),

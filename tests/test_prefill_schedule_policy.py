@@ -104,7 +104,7 @@ class FakeMemoryOracle:
     def decode_step_reservation_cost(self, seq):
         return 1
 
-    def reserved_prefill_slots(self, waiting, chunk_prefill_size):
+    def reserved_prefill_slots(self, waiting, engine_prefill_chunk_size):
         return 0
 
     def remaining_prefill_tokens(self, seq):
@@ -134,7 +134,7 @@ class FakeMemoryOracle:
     def prefill_batched_tokens_margin(self):
         return 0
 
-    def prompt_admission_budgets(self, waiting, chunk_prefill_size):
+    def prompt_admission_budgets(self, waiting, engine_prefill_chunk_size):
         return {"slots": self._free_slots}
 
     def prompt_admission_free_slots(self):
@@ -198,14 +198,14 @@ def make_scheduler(policy, *, method="", chunk=5, max_tokens=10, oracle=None):
         max_num_seqs_in_batch=4,
         max_num_batched_tokens=max_tokens,
         max_decoding_seqs=16,
-        chunk_prefill_size=chunk,
+        engine_prefill_chunk_size=chunk,
         prefill_schedule_policy=policy,
         eos=-1,
-        num_sink_tokens=1,
-        num_recent_tokens=1,
+        sink_keep_tokens=1,
+        recent_keep_tokens=1,
         decode_keep_tokens=4,
         snapkv_window_size=2,
-        vllm_sparse_method=method,
+        sparse_method=method,
     )
     if oracle is None:
         oracle = FakeMemoryOracle(
@@ -220,16 +220,16 @@ def make_scheduler(policy, *, method="", chunk=5, max_tokens=10, oracle=None):
 
 def make_sparse_controller_config():
     return SimpleNamespace(
-        vllm_sparse_method="deltakv",
+        sparse_method="deltakv",
         obs_layer_ids=[0],
-        full_attn_layers=[0],
+        full_attention_layers=[0],
         hf_config=SimpleNamespace(
             num_hidden_layers=1,
             hidden_size=8,
             num_attention_heads=1,
         ),
-        num_sink_tokens=1,
-        num_recent_tokens=1,
+        sink_keep_tokens=1,
+        recent_keep_tokens=1,
         decode_keep_tokens=4,
         sparse_attn_score_dtype="float32",
     )
@@ -256,14 +256,14 @@ def make_scheduler_with_oracle(
         max_num_seqs_in_batch=4,
         max_num_batched_tokens=max_tokens,
         max_decoding_seqs=16,
-        chunk_prefill_size=chunk,
+        engine_prefill_chunk_size=chunk,
         prefill_schedule_policy=policy,
         eos=-1,
-        num_sink_tokens=1,
-        num_recent_tokens=1,
+        sink_keep_tokens=1,
+        recent_keep_tokens=1,
         decode_keep_tokens=4,
         snapkv_window_size=2,
-        vllm_sparse_method=method,
+        sparse_method=method,
     )
     return Scheduler(
         cfg,
@@ -301,9 +301,9 @@ class PrefillPolicyRegistryTest(unittest.TestCase):
 
     def test_pyramidkv_decode_trigger_includes_fixed_tokens(self):
         cfg = make_sparse_controller_config()
-        cfg.vllm_sparse_method = "pyramidkv"
-        cfg.num_sink_tokens = 64
-        cfg.num_recent_tokens = 512
+        cfg.sparse_method = "pyramidkv"
+        cfg.sink_keep_tokens = 64
+        cfg.recent_keep_tokens = 512
         cfg.decode_keep_tokens = 4096
         controller = SparseController(cfg, SimpleNamespace())
 
@@ -312,9 +312,9 @@ class PrefillPolicyRegistryTest(unittest.TestCase):
 
     def test_snapkv_decode_trigger_preserves_top_budget_rule(self):
         cfg = make_sparse_controller_config()
-        cfg.vllm_sparse_method = "snapkv"
-        cfg.num_sink_tokens = 64
-        cfg.num_recent_tokens = 512
+        cfg.sparse_method = "snapkv"
+        cfg.sink_keep_tokens = 64
+        cfg.recent_keep_tokens = 512
         cfg.decode_keep_tokens = 4096
         controller = SparseController(cfg, SimpleNamespace())
 
@@ -335,10 +335,10 @@ class PrefillPolicyRegistryTest(unittest.TestCase):
                 self.layer_calls.append((list(layer_indices), list(seqs), keep_indices.clone()))
 
         cfg = make_sparse_controller_config()
-        cfg.vllm_sparse_method = "streamingllm"
+        cfg.sparse_method = "streamingllm"
         cfg.hf_config.num_hidden_layers = 3
-        cfg.num_sink_tokens = 2
-        cfg.num_recent_tokens = 3
+        cfg.sink_keep_tokens = 2
+        cfg.recent_keep_tokens = 3
         manager = FakeStreamingManager()
         controller = SparseController(cfg, manager)
 
@@ -372,10 +372,10 @@ class PrefillPolicyRegistryTest(unittest.TestCase):
                 self.layer_calls.append((list(layer_indices), list(seqs), keep_indices.clone()))
 
         cfg = make_sparse_controller_config()
-        cfg.vllm_sparse_method = "streamingllm"
+        cfg.sparse_method = "streamingllm"
         cfg.hf_config.num_hidden_layers = 2
-        cfg.num_sink_tokens = 2
-        cfg.num_recent_tokens = 3
+        cfg.sink_keep_tokens = 2
+        cfg.recent_keep_tokens = 3
         manager = FakeStreamingManager()
         controller = SparseController(cfg, manager)
 
@@ -415,10 +415,10 @@ class PrefillPolicyRegistryTest(unittest.TestCase):
                 self.calls.append(([layer_idx], [seq], keep_indices[None, :].clone()))
 
         cfg = make_sparse_controller_config()
-        cfg.vllm_sparse_method = "streamingllm"
+        cfg.sparse_method = "streamingllm"
         cfg.hf_config.num_hidden_layers = 1
-        cfg.num_sink_tokens = 2
-        cfg.num_recent_tokens = 3
+        cfg.sink_keep_tokens = 2
+        cfg.recent_keep_tokens = 3
         manager = FakeStreamingManager()
         controller = SparseController(cfg, manager)
         final_seq = seq_with_len(12)
@@ -452,9 +452,9 @@ class PrefillPolicyRegistryTest(unittest.TestCase):
                 self.freed.append((layer_idx, seq.seq_id, keep_indices.clone()))
 
         cfg = make_sparse_controller_config()
-        cfg.vllm_sparse_method = "snapkv"
-        cfg.num_sink_tokens = 1
-        cfg.num_recent_tokens = 1
+        cfg.sparse_method = "snapkv"
+        cfg.sink_keep_tokens = 1
+        cfg.recent_keep_tokens = 1
         cfg.decode_keep_tokens = 3
         cfg.pool_kernel_size = 1
         cfg.snapkv_num_full_layers = 0
@@ -484,11 +484,11 @@ class PrefillPolicyRegistryTest(unittest.TestCase):
 
         manager = object.__new__(SnapKVCacheManager)
         manager.config = SimpleNamespace(
-            vllm_sparse_method="snapkv",
+            sparse_method="snapkv",
             sparse_prefill_score_mode="probability",
             sparse_attn_score_dtype="float32",
-            num_sink_tokens=1,
-            num_recent_tokens=1,
+            sink_keep_tokens=1,
+            recent_keep_tokens=1,
         )
         manager._prefill_attn_score_accumulators = {}
         manager._prefill_context_lens_cpu_by_layer = {0: (6,), 1: (6,)}
@@ -632,7 +632,7 @@ class StandardCacheManagerAdmissionTest(unittest.TestCase):
         manager._num_free_slots = 100
         manager.free_rows = deque([0, 1])
 
-        budgets = manager.prompt_admission_budgets(deque(), chunk_prefill_size=16)
+        budgets = manager.prompt_admission_budgets(deque(), engine_prefill_chunk_size=16)
         costs = manager.prompt_admission_costs(seq_with_len(10))
 
         self.assertEqual(budgets["slots"], 100)
@@ -660,20 +660,20 @@ class PrefillPolicyConfigTest(unittest.TestCase):
 
     def test_prefill_token_limits_must_be_positive(self):
         with self.assertRaisesRegex(ValueError, "max_num_batched_tokens must be > 0"):
-            self.make_config(vllm_sparse_method="vanilla", max_num_batched_tokens=0)
-        with self.assertRaisesRegex(ValueError, "chunk_prefill_size must be > 0"):
-            self.make_config(vllm_sparse_method="vanilla", chunk_prefill_size=0)
+            self.make_config(sparse_method="vanilla", max_num_batched_tokens=0)
+        with self.assertRaisesRegex(ValueError, "engine_prefill_chunk_size must be > 0"):
+            self.make_config(sparse_method="vanilla", engine_prefill_chunk_size=0)
 
     def test_invalid_policy_fails_fast(self):
         with self.assertRaisesRegex(ValueError, "Unsupported prefill_schedule_policy"):
-            self.make_config(vllm_sparse_method="snapkv", prefill_schedule_policy="old_chunk_mode")
+            self.make_config(sparse_method="snapkv", prefill_schedule_policy="old_chunk_mode")
 
     def test_deltakv_sparse_decode_backend_explicit_custom_does_not_require_flash_attn(self):
         with patch("sparsevllm.configs.delta._flash_attn_available", return_value=False):
             cfg = self.make_config(
-                vllm_sparse_method="deltakv-less-memory",
+                sparse_method="deltakv-less-memory",
                 allow_missing_deltakv_path=True,
-                kv_quant_bits=0,
+                deltakv_latent_quant_bits=0,
                 deltakv_sparse_decode_backend="custom",
             )
 
@@ -683,69 +683,76 @@ class PrefillPolicyConfigTest(unittest.TestCase):
         with patch("sparsevllm.configs.delta._flash_attn_available", return_value=False):
             with self.assertRaisesRegex(ValueError, "requires the flash_attn package"):
                 self.make_config(
-                    vllm_sparse_method="deltakv-less-memory",
+                    sparse_method="deltakv-less-memory",
                     allow_missing_deltakv_path=True,
-                    kv_quant_bits=0,
+                    deltakv_latent_quant_bits=0,
                     deltakv_sparse_decode_backend="fa2",
                 )
 
     def test_deltakv_sparse_decode_backend_rejects_unknown_value(self):
         with self.assertRaisesRegex(ValueError, "deltakv_sparse_decode_backend"):
             self.make_config(
-                vllm_sparse_method="deltakv-less-memory",
+                sparse_method="deltakv-less-memory",
                 allow_missing_deltakv_path=True,
-                kv_quant_bits=0,
+                deltakv_latent_quant_bits=0,
                 deltakv_sparse_decode_backend="flash",
             )
 
-    def test_deltakv_legacy_graph_method_name_is_alias(self):
+    def test_deltakv_legacy_graph_method_does_not_enable_graph(self):
         cfg = self.make_config(
-            vllm_sparse_method="deltakv-less-memory-cudagraph",
+            sparse_method="deltakv-less-memory-cudagraph",
             allow_missing_deltakv_path=True,
-            kv_quant_bits=0,
+            deltakv_latent_quant_bits=0,
         )
-        self.assertEqual(cfg.vllm_sparse_method, "deltakv")
-        self.assertTrue(cfg.decode_cuda_graph)
+        self.assertEqual(cfg.sparse_method, "deltakv")
+        self.assertFalse(cfg.decode_graph)
 
     def test_decode_cuda_graph_capture_sampling_requires_graph(self):
-        with self.assertRaisesRegex(ValueError, "requires decode_cuda_graph"):
+        with self.assertRaisesRegex(ValueError, "requires decode_graph"):
             self.make_config(
-                vllm_sparse_method="omnikv",
-                decode_cuda_graph_capture_sampling=True,
+                sparse_method="omnikv",
+                decode_graph_capture_sampling=True,
             )
 
     def test_decode_cuda_graph_auto_capture_sizes_cover_decode_limit(self):
         for max_decoding_seqs in (1, 6, 8, 24):
             with self.subTest(max_decoding_seqs=max_decoding_seqs):
                 cfg = self.make_config(
-                    vllm_sparse_method="omnikv",
-                    decode_cuda_graph=True,
+                    sparse_method="omnikv",
+                    decode_graph=True,
                     max_decoding_seqs=max_decoding_seqs,
                 )
-                capture_sizes = cfg.decode_cuda_graph_capture_sizes
+                capture_sizes = cfg.decode_graph_capture_sizes
                 self.assertEqual(capture_sizes, sorted(set(capture_sizes)))
                 self.assertEqual(capture_sizes[-1], max_decoding_seqs)
                 self.assertTrue(all(0 < size <= max_decoding_seqs for size in capture_sizes))
                 self.assertTrue(cfg.decode_graph)
                 self.assertEqual(cfg.decode_graph_capture_sizes, capture_sizes)
 
-    def test_decode_graph_aliases_normalize_to_canonical_fields(self):
+    def test_legacy_platform_aliases_are_not_config_fields(self):
+        fields = Config.__dataclass_fields__
+        for name in (
+            "decode_cuda_graph",
+            "decode_cuda_graph_capture_sizes",
+            "decode_cuda_graph_capture_sampling",
+            "device_memory_utilization",
+        ):
+            with self.subTest(name=name):
+                self.assertNotIn(name, fields)
+
+    def test_decode_graph_uses_canonical_fields(self):
         cfg = self.make_config(
-            vllm_sparse_method="omnikv",
+            sparse_method="omnikv",
             decode_graph=True,
             decode_graph_capture_sizes="1,4",
             decode_graph_capture_sampling=True,
             max_decoding_seqs=4,
-            device_memory_utilization=0.7,
+            gpu_memory_utilization=0.7,
         )
-        self.assertTrue(cfg.decode_cuda_graph)
         self.assertTrue(cfg.decode_graph)
-        self.assertTrue(cfg.decode_cuda_graph_capture_sampling)
         self.assertTrue(cfg.decode_graph_capture_sampling)
-        self.assertEqual(cfg.decode_cuda_graph_capture_sizes, [1, 4])
         self.assertEqual(cfg.decode_graph_capture_sizes, [1, 4])
         self.assertEqual(cfg.gpu_memory_utilization, 0.7)
-        self.assertEqual(cfg.device_memory_utilization, 0.7)
 
     def test_auto_capture_greedy_sampling_scope(self):
         runner = object.__new__(ModelRunner)
@@ -755,20 +762,20 @@ class PrefillPolicyConfigTest(unittest.TestCase):
         ]
 
         runner.config = SimpleNamespace(
-            decode_cuda_graph_capture_sampling=False,
+            decode_graph_capture_sampling=False,
             tensor_parallel_size=1,
             enable_prefix_caching=False,
-            vllm_sparse_method="",
+            sparse_method="",
         )
         self.assertTrue(runner._auto_capture_greedy_sampling(seqs))
 
-        runner.config.vllm_sparse_method = "omnikv"
+        runner.config.sparse_method = "omnikv"
         self.assertTrue(runner._auto_capture_greedy_sampling(seqs))
 
-        runner.config.vllm_sparse_method = "quest"
+        runner.config.sparse_method = "quest"
         self.assertFalse(runner._auto_capture_greedy_sampling(seqs))
 
-        runner.config.vllm_sparse_method = ""
+        runner.config.sparse_method = ""
         seqs[0].temperature = 0.7
         self.assertFalse(runner._auto_capture_greedy_sampling(seqs))
 
@@ -780,7 +787,7 @@ class PrefillPolicyConfigTest(unittest.TestCase):
         runner.config.tensor_parallel_size = 2
         self.assertFalse(runner._auto_capture_greedy_sampling(seqs))
 
-        runner.config.decode_cuda_graph_capture_sampling = True
+        runner.config.decode_graph_capture_sampling = True
         self.assertTrue(runner._auto_capture_greedy_sampling(seqs))
 
         seqs[0].presence_penalty = 0.1
@@ -868,19 +875,19 @@ class PrefillPolicyConfigTest(unittest.TestCase):
     def test_decode_cuda_graph_capture_sizes_must_cover_decode_limit(self):
         with self.assertRaisesRegex(ValueError, "cover max_decoding_seqs"):
             self.make_config(
-                vllm_sparse_method="omnikv",
-                decode_cuda_graph=True,
+                sparse_method="omnikv",
+                decode_graph=True,
                 max_decoding_seqs=6,
-                decode_cuda_graph_capture_sizes=[1, 2, 4],
+                decode_graph_capture_sizes=[1, 2, 4],
             )
 
     def test_decode_cuda_graph_auto_context_sizes_cover_model_limit(self):
         cfg = self.make_config(
-            vllm_sparse_method="omnikv",
-            decode_cuda_graph=True,
+            sparse_method="omnikv",
+            decode_graph=True,
             max_model_len=9000,
         )
-        context_sizes = cfg.decode_cuda_graph_context_sizes
+        context_sizes = cfg.decode_graph_context_sizes
         self.assertEqual(context_sizes, sorted(set(context_sizes)))
         self.assertEqual(context_sizes[-1], cfg.max_model_len)
         self.assertTrue(all(0 < size <= cfg.max_model_len for size in context_sizes))
@@ -889,9 +896,9 @@ class DecodeCudaGraphCapacityPolicyTest(unittest.TestCase):
     def make_graph_manager(self, *, context_policy="current", max_cached_graphs=None):
         manager = object.__new__(DeltaKVLessMemoryCudaGraphCacheManager)
         manager.config = SimpleNamespace(
-            decode_cuda_graph=True,
-            decode_cuda_graph_context_policy=context_policy,
-            decode_cuda_graph_max_cached_graphs=max_cached_graphs,
+            decode_graph=True,
+            decode_graph_context_policy=context_policy,
+            decode_graph_max_cached_graphs=max_cached_graphs,
         )
         return manager
 
@@ -956,7 +963,7 @@ class DecodeCudaGraphCapacityPolicyTest(unittest.TestCase):
             cache_manager=graph_manager,
         )
         runner.cache_manager = SimpleNamespace(
-            decode_cuda_graph_context_capacity=graph_manager.decode_cuda_graph_context_capacity,
+            decode_graph_context_capacity=graph_manager.decode_graph_context_capacity,
             select_decode_cuda_graph_batch_size=graph_manager.select_decode_cuda_graph_batch_size,
             set_decode_static_max_context_len=lambda value: setattr(runner, "last_static_max_context_len", value),
             prepare_decode_static=lambda seqs, input_ids, positions, slot_mapping, context_lens, req_indices: (
@@ -1093,18 +1100,18 @@ class DecodeCudaGraphCapacityPolicyTest(unittest.TestCase):
 
 
 class DecodeCudaGraphWarmupPolicyTest(unittest.TestCase):
-    def make_config(self, method="deltakv", decode_cuda_graph=True):
+    def make_config(self, method="deltakv", decode_graph=True):
         return SimpleNamespace(
-            vllm_sparse_method=method,
-            decode_cuda_graph=decode_cuda_graph,
+            sparse_method=method,
+            decode_graph=decode_graph,
         )
 
     def test_graph_warmup_uses_distinct_prompts_across_requests_and_rounds(self):
         engine = object.__new__(LLMEngine)
         engine.config = SimpleNamespace(
-            vllm_sparse_method="omnikv",
-            decode_cuda_graph=True,
-            chunk_prefill_size=8,
+            sparse_method="omnikv",
+            decode_graph=True,
+            engine_prefill_chunk_size=8,
             max_decoding_seqs=3,
             max_model_len=2048,
             hf_config=SimpleNamespace(vocab_size=32),
@@ -1149,9 +1156,9 @@ class DecodeCudaGraphWarmupPolicyTest(unittest.TestCase):
     def test_graph_warmup_propagates_failure(self):
         engine = object.__new__(LLMEngine)
         engine.config = SimpleNamespace(
-            vllm_sparse_method="omnikv",
-            decode_cuda_graph=True,
-            chunk_prefill_size=1,
+            sparse_method="omnikv",
+            decode_graph=True,
+            engine_prefill_chunk_size=1,
             max_decoding_seqs=2,
             max_model_len=2048,
             hf_config=SimpleNamespace(vocab_size=32),
@@ -1179,9 +1186,9 @@ class DecodeCudaGraphWarmupPolicyTest(unittest.TestCase):
     def test_graph_warmup_is_clamped_to_runtime_capacity(self):
         engine = object.__new__(LLMEngine)
         engine.config = SimpleNamespace(
-            vllm_sparse_method="omnikv",
-            decode_cuda_graph=True,
-            chunk_prefill_size=64,
+            sparse_method="omnikv",
+            decode_graph=True,
+            engine_prefill_chunk_size=64,
             max_decoding_seqs=3,
             max_model_len=2048,
             hf_config=SimpleNamespace(vocab_size=32),
@@ -1272,9 +1279,9 @@ class DecodeCudaGraphWarmupPolicyTest(unittest.TestCase):
 
 
 class DeltaKVLessMemoryCudaGraphReserveTest(unittest.TestCase):
-    def make_manager(self, decode_cuda_graph=True):
+    def make_manager(self, decode_graph=True):
         manager = object.__new__(DeltaKVLessMemoryCudaGraphCacheManager)
-        manager.config = SimpleNamespace(decode_cuda_graph=decode_cuda_graph)
+        manager.config = SimpleNamespace(decode_graph=decode_graph)
         return manager
 
     def test_regular_less_memory_has_no_graph_workspace_reserve(self):
@@ -1285,12 +1292,12 @@ class DeltaKVLessMemoryCudaGraphReserveTest(unittest.TestCase):
     def test_non_graph_mode_does_not_reserve_capture_memory(self):
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(
-                self.make_manager(decode_cuda_graph=False)._decode_cuda_graph_memory_reserve_bytes(),
+                self.make_manager(decode_graph=False)._decode_cuda_graph_memory_reserve_bytes(),
                 0,
             )
 
     def test_graph_reserve_env_must_be_non_negative_integer(self):
-        manager = self.make_manager(decode_cuda_graph=True)
+        manager = self.make_manager(decode_graph=True)
 
         for value in ("-1", "large"):
             with patch.dict(os.environ, {"SPARSEVLLM_DELTAKV_CUDAGRAPH_RESERVE_BYTES": value}, clear=True):
@@ -1302,10 +1309,10 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
     def test_pyramid_modes_use_attached_residual_at_boundary(self):
         pyramid = object.__new__(SnapKVCacheManager)
         pyramid.config = SimpleNamespace(
-            vllm_sparse_method="pyramidkv",
+            sparse_method="pyramidkv",
             pyramid_layer_ratios=[1.0],
             prefill_schedule_policy=PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
-            chunk_prefill_size=2,
+            engine_prefill_chunk_size=2,
             long_prefill_offload_threshold=5,
         )
         pyramid.pyramidkv_prefill_staging_kv_cache = torch.empty(
@@ -1331,7 +1338,7 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
         manager = object.__new__(DeltaKVLessMemoryCacheManager)
         manager.config = SimpleNamespace(
             prefill_schedule_policy=PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
-            chunk_prefill_size=2,
+            engine_prefill_chunk_size=2,
             long_prefill_offload_threshold=5,
         )
 
@@ -1350,10 +1357,10 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
         managers = []
         pyramid = object.__new__(SnapKVCacheManager)
         pyramid.config = SimpleNamespace(
-            vllm_sparse_method="pyramidkv",
+            sparse_method="pyramidkv",
             pyramid_layer_ratios=[1.0],
             prefill_schedule_policy=PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
-            chunk_prefill_size=2,
+            engine_prefill_chunk_size=2,
             long_prefill_offload_threshold=5,
             snapkv_window_size=0,
         )
@@ -1365,7 +1372,7 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
         deltakv = object.__new__(DeltaKVLessMemoryCacheManager)
         deltakv.config = SimpleNamespace(
             prefill_schedule_policy=PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
-            chunk_prefill_size=2,
+            engine_prefill_chunk_size=2,
             long_prefill_offload_threshold=5,
         )
         managers.append(("deltakv", deltakv))
@@ -1401,7 +1408,7 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
         manager = object.__new__(DeltaKVLessMemoryCacheManager)
         manager.config = SimpleNamespace(
             prefill_schedule_policy=PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
-            chunk_prefill_size=2,
+            engine_prefill_chunk_size=2,
             long_prefill_offload_threshold=5,
         )
         manager.row_seq_lens = np.array([10], dtype=np.int32)
@@ -1480,10 +1487,10 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
     def test_pyramidkv_separates_fresh_staged_and_resumed_resident_full_batches(self):
         manager = object.__new__(SnapKVCacheManager)
         manager.config = SimpleNamespace(
-            vllm_sparse_method="pyramidkv",
+            sparse_method="pyramidkv",
             pyramid_layer_ratios=[1.0],
             prefill_schedule_policy=PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
-            chunk_prefill_size=2,
+            engine_prefill_chunk_size=2,
             long_prefill_offload_threshold=5,
             snapkv_window_size=0,
         )
@@ -1520,10 +1527,10 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
         runner = object.__new__(ModelRunner)
         runner.config = SimpleNamespace(
             prefill_schedule_policy=PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
-            chunk_prefill_size=8192,
-            vllm_sparse_method="pyramidkv",
-            num_sink_tokens=64,
-            num_recent_tokens=128,
+            engine_prefill_chunk_size=8192,
+            sparse_method="pyramidkv",
+            sink_keep_tokens=64,
+            recent_keep_tokens=128,
             decode_keep_tokens=4096,
         )
 
@@ -1539,7 +1546,7 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
     def test_vanilla_model_runner_does_not_partition_long_and_short(self):
         runner = object.__new__(ModelRunner)
         runner.config = SimpleNamespace(
-            vllm_sparse_method="",
+            sparse_method="",
         )
         seqs = [seq_with_len(8), seq_with_len(20_000)]
 
@@ -1680,13 +1687,13 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
         manager = object.__new__(SnapKVCacheManager)
         manager.num_kv_layers = 2
         manager.config = SimpleNamespace(
-            vllm_sparse_method="snapkv",
+            sparse_method="snapkv",
             snapkv_window_size=2,
             snapkv_num_full_layers=0,
-            num_sink_tokens=1,
+            sink_keep_tokens=1,
             decode_keep_tokens=4,
-            num_recent_tokens=1,
-            chunk_prefill_size=5,
+            recent_keep_tokens=1,
+            engine_prefill_chunk_size=5,
         )
 
         self.assertEqual(manager.min_final_prefill_chunk_size(seq_with_len(12)), 2)
@@ -1696,7 +1703,7 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
         manager.config.snapkv_num_full_layers = 2
         self.assertEqual(manager.min_final_prefill_chunk_size(seq_with_len(12)), 0)
 
-        manager.config.vllm_sparse_method = "pyramidkv"
+        manager.config.sparse_method = "pyramidkv"
         manager.config.snapkv_num_full_layers = 0
         manager.config.pyramid_layer_ratios = [1.0, 0.5]
         manager.runtime_layout = identity_runtime_layout(2)
@@ -1707,16 +1714,16 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
         manager.num_kv_layers = 1
         manager.runtime_layout = identity_runtime_layout(1)
         manager.config = SimpleNamespace(
-            vllm_sparse_method="pyramidkv",
+            sparse_method="pyramidkv",
             pyramid_layer_ratios=[1.0],
             prefill_schedule_policy=PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
             long_prefill_offload_threshold=5,
-            chunk_prefill_size=4,
+            engine_prefill_chunk_size=4,
             snapkv_window_size=3,
             snapkv_num_full_layers=0,
-            num_sink_tokens=1,
+            sink_keep_tokens=1,
             decode_keep_tokens=4,
-            num_recent_tokens=1,
+            recent_keep_tokens=1,
         )
         manager.pyramidkv_prefill_staging_kv_cache = torch.empty(
             (2, 10, 1, 1), dtype=torch.float32
@@ -1746,16 +1753,16 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
         manager.num_kv_layers = 1
         manager.runtime_layout = identity_runtime_layout(1)
         manager.config = SimpleNamespace(
-            vllm_sparse_method="pyramidkv",
+            sparse_method="pyramidkv",
             pyramid_layer_ratios=[1.0],
             prefill_schedule_policy=PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
             long_prefill_offload_threshold=64,
-            chunk_prefill_size=32,
+            engine_prefill_chunk_size=32,
             snapkv_window_size=8,
             snapkv_num_full_layers=0,
-            num_sink_tokens=0,
+            sink_keep_tokens=0,
             decode_keep_tokens=100,
-            num_recent_tokens=0,
+            recent_keep_tokens=0,
         )
         manager.pyramidkv_prefill_staging_kv_cache = torch.empty(
             (2, 256, 1, 1), dtype=torch.float32
@@ -1796,12 +1803,12 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
         manager = object.__new__(SnapKVCacheManager)
         manager.runtime_layout = identity_runtime_layout(1)
         manager.config = SimpleNamespace(
-            vllm_sparse_method="snapkv",
+            sparse_method="snapkv",
             snapkv_window_size=32,
             snapkv_num_full_layers=0,
-            num_sink_tokens=64,
+            sink_keep_tokens=64,
             decode_keep_tokens=4_096,
-            num_recent_tokens=512,
+            recent_keep_tokens=512,
         )
 
         for prompt_len in (16_966, 15_056):
@@ -1915,12 +1922,12 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
             def prompt_admission_budgets(
                 self,
                 waiting,
-                chunk_prefill_size,
+                engine_prefill_chunk_size,
             ):
                 self.prompt_calls += 1
                 return super().prompt_admission_budgets(
                     waiting,
-                    chunk_prefill_size,
+                    engine_prefill_chunk_size,
                 )
 
             def prefill_step_free_slots(self):
@@ -1945,7 +1952,7 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
 
     def test_snapkv_remaining_prefill_no_longer_reserves_score_window_chunk(self):
         manager = object.__new__(SnapKVCacheManager)
-        manager.config = SimpleNamespace(chunk_prefill_size=5, snapkv_window_size=2, vllm_sparse_method="snapkv")
+        manager.config = SimpleNamespace(engine_prefill_chunk_size=5, snapkv_window_size=2, sparse_method="snapkv")
         seq = seq_with_len(20)
 
         self.assertEqual(SnapKVCacheManager.remaining_prefill_tokens(manager, seq), 20)
@@ -2106,8 +2113,8 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
             [0, 1],
             [seq_a, seq_b],
             kv_len=8,
-            num_sink_tokens=2,
-            num_recent_tokens=3,
+            sink_keep_tokens=2,
+            recent_keep_tokens=3,
         )
 
         self.assertFalse(manager._uniform_decode_metadata)
@@ -2184,7 +2191,7 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
     def test_pyramidkv_resumed_full_prefill_appends_to_physical_row(self):
         manager = object.__new__(SnapKVCacheManager)
         manager.runtime_layout = identity_runtime_layout(1)
-        manager.config = SimpleNamespace(vllm_sparse_method="pyramidkv")
+        manager.config = SimpleNamespace(sparse_method="pyramidkv")
         manager.device = torch.device("cpu")
         manager.num_layers = 1
         manager.max_model_len = 16
@@ -2225,7 +2232,7 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
     def test_pyramidkv_batch_materialize_updates_rows_and_kv(self):
         manager = object.__new__(SnapKVCacheManager)
         manager.runtime_layout = identity_runtime_layout(1)
-        manager.config = SimpleNamespace(vllm_sparse_method="pyramidkv")
+        manager.config = SimpleNamespace(sparse_method="pyramidkv")
         manager.device = torch.device("cpu")
         manager.num_layers = 1
         manager.num_kv_layers = 1
@@ -2330,10 +2337,10 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
     def test_pyramidkv_long_prefill_offload_candidate_uses_chunked_staging(self):
         manager = object.__new__(SnapKVCacheManager)
         manager.config = SimpleNamespace(
-            vllm_sparse_method="pyramidkv",
+            sparse_method="pyramidkv",
             pyramid_layer_ratios=[1.0],
             prefill_schedule_policy=PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
-            chunk_prefill_size=1024,
+            engine_prefill_chunk_size=1024,
             long_prefill_offload_threshold=1024,
             max_num_batched_tokens=2048,
         )
@@ -2350,10 +2357,10 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
     def test_long_prefill_offload_threshold_is_independent_from_chunk_size(self):
         pyramid = object.__new__(SnapKVCacheManager)
         pyramid.config = SimpleNamespace(
-            vllm_sparse_method="pyramidkv",
+            sparse_method="pyramidkv",
             pyramid_layer_ratios=[1.0],
             prefill_schedule_policy=PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
-            chunk_prefill_size=4096,
+            engine_prefill_chunk_size=4096,
             long_prefill_offload_threshold=8192,
             max_num_batched_tokens=128000,
         )
@@ -2363,7 +2370,7 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
         deltakv = object.__new__(DeltaKVCacheManager)
         deltakv.config = SimpleNamespace(
             prefill_schedule_policy=PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
-            chunk_prefill_size=4096,
+            engine_prefill_chunk_size=4096,
             long_prefill_offload_threshold=8192,
             max_num_batched_tokens=128000,
         )
@@ -2381,7 +2388,7 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
 
         manager = object.__new__(SnapKVCacheManager)
         manager.runtime_layout = identity_runtime_layout(1)
-        manager.config = SimpleNamespace(vllm_sparse_method="pyramidkv")
+        manager.config = SimpleNamespace(sparse_method="pyramidkv")
         manager.device = torch.device("cpu")
         manager.num_layers = 1
         manager.seq_id_to_row = [{10: 0}]
@@ -2412,7 +2419,7 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
 
         manager = object.__new__(SnapKVCacheManager)
         manager.runtime_layout = identity_runtime_layout(1)
-        manager.config = SimpleNamespace(vllm_sparse_method="pyramidkv")
+        manager.config = SimpleNamespace(sparse_method="pyramidkv")
         manager.device = torch.device("cpu")
         manager.num_layers = 1
         manager.seq_id_to_row = [{10: 0}]
@@ -2471,7 +2478,7 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
 
     def test_pyramidkv_long_prefill_offload_uses_staged_prefetch(self):
         manager = object.__new__(SnapKVCacheManager)
-        manager.config = SimpleNamespace(vllm_sparse_method="pyramidkv")
+        manager.config = SimpleNamespace(sparse_method="pyramidkv")
         manager.device = torch.device("cpu")
         manager.seq_id_to_row = [{10: 0}]
         manager.pyramidkv_prefill_staging_kv_cache = torch.zeros((2, 4, 1, 1), dtype=torch.float32)
@@ -3155,12 +3162,12 @@ class DeltaKVFullPrefillStagingTest(unittest.TestCase):
         manager.device = torch.device("cpu")
         manager.config = SimpleNamespace(
             prefill_schedule_policy=PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
-            chunk_prefill_size=2,
+            engine_prefill_chunk_size=2,
             long_prefill_offload_threshold=5,
             max_num_batched_tokens=16,
-            num_sink_tokens=1,
-            num_recent_tokens=1,
-            cluster_ratio=0.5,
+            sink_keep_tokens=1,
+            recent_keep_tokens=1,
+            deltakv_center_ratio=0.5,
         )
         manager.deltakv_layer_ids = [1]
         manager.deltakv_layer_to_idx = {1: 0}
@@ -3389,7 +3396,7 @@ class DeltaKVFullPrefillStagingTest(unittest.TestCase):
         manager = object.__new__(DeltaKVCacheManager)
         manager.config = SimpleNamespace(
             prefill_schedule_policy=PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
-            chunk_prefill_size=5,
+            engine_prefill_chunk_size=5,
             long_prefill_offload_threshold=5,
             max_num_batched_tokens=64,
         )
@@ -3404,7 +3411,7 @@ class DeltaKVFullPrefillStagingTest(unittest.TestCase):
         manager = object.__new__(DeltaKVCacheManager)
         manager.config = SimpleNamespace(
             prefill_schedule_policy=PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
-            chunk_prefill_size=8192,
+            engine_prefill_chunk_size=8192,
             long_prefill_offload_threshold=8192,
             max_num_batched_tokens=16384,
         )
@@ -3435,9 +3442,9 @@ class DeltaKVFullPrefillStagingTest(unittest.TestCase):
     def test_prompt_admission_counts_sparse_raw_keep_positions_after_graph_reserve(self):
         manager = object.__new__(DeltaKVCacheManager)
         manager.config = SimpleNamespace(
-            num_sink_tokens=8,
-            num_recent_tokens=128,
-            cluster_ratio=0.1,
+            sink_keep_tokens=8,
+            recent_keep_tokens=128,
+            deltakv_center_ratio=0.1,
         )
         manager._num_free_slots_full = 100_000
         manager._num_free_slots_deltakv_full = 16_988
@@ -3446,7 +3453,7 @@ class DeltaKVFullPrefillStagingTest(unittest.TestCase):
         manager._deltakv_centers_reserved_total = 0
 
         seq = seq_with_len(8192)
-        budgets = DeltaKVCacheManager.prompt_admission_budgets(manager, deque(), chunk_prefill_size=2048)
+        budgets = DeltaKVCacheManager.prompt_admission_budgets(manager, deque(), engine_prefill_chunk_size=2048)
         costs = DeltaKVCacheManager.prompt_admission_costs(manager, seq)
 
         self.assertEqual(costs["deltakv_raw"], 1050)
@@ -3454,16 +3461,16 @@ class DeltaKVFullPrefillStagingTest(unittest.TestCase):
         self.assertLess(budgets["deltakv_raw"], costs["deltakv_raw"])
 
         manager._deltakv_static_temp_slots_reserved_total = 12_000
-        budgets = DeltaKVCacheManager.prompt_admission_budgets(manager, deque(), chunk_prefill_size=2048)
+        budgets = DeltaKVCacheManager.prompt_admission_budgets(manager, deque(), engine_prefill_chunk_size=2048)
         self.assertEqual(budgets["deltakv_raw"], 12_604)
 
     def test_prompt_admission_reserves_full_layers_across_long_offload_chunks(self):
         manager = object.__new__(DeltaKVCacheManager)
         manager.device = torch.device("cpu")
         manager.config = SimpleNamespace(
-            num_sink_tokens=1,
-            num_recent_tokens=1,
-            cluster_ratio=0.5,
+            sink_keep_tokens=1,
+            recent_keep_tokens=1,
+            deltakv_center_ratio=0.5,
             max_model_len=64,
             max_num_seqs_in_batch=4,
         )
@@ -3497,7 +3504,7 @@ class DeltaKVFullPrefillStagingTest(unittest.TestCase):
         self.assertEqual(manager._full_layers_reserved_by_seq[seq.seq_id], 6)
         self.assertEqual(manager._full_layers_reserved_total, 6)
         seq.num_prefilled_tokens = 2
-        budgets = DeltaKVCacheManager.prompt_admission_budgets(manager, deque([seq]), chunk_prefill_size=2)
+        budgets = DeltaKVCacheManager.prompt_admission_budgets(manager, deque([seq]), engine_prefill_chunk_size=2)
         self.assertEqual(budgets["full_layers"], 4)
 
         DeltaKVCacheManager._release_prompt_admission_reservations(manager, seq.seq_id)
@@ -3659,7 +3666,7 @@ class DeltaKVLessMemoryStorageContractTest(unittest.TestCase):
     def test_long_prefill_offload_sparse_restore_applies_rope_helper(self):
         manager = object.__new__(DeltaKVLessMemoryCacheManager)
         manager.device = "cpu"
-        manager.config = SimpleNamespace(chunk_prefill_size=2)
+        manager.config = SimpleNamespace(engine_prefill_chunk_size=2)
         manager._deltakv_long_prefill_offload_step_active = True
         manager._deltakv_long_prefill_offload_start = 3
         manager._deltakv_long_prefill_offload_row_idx = 0
@@ -3802,11 +3809,11 @@ class DeltaKVLessMemoryStorageContractTest(unittest.TestCase):
 
         manager = object.__new__(DeltaKVLessMemoryCacheManager)
         manager.head_dim = 128
-        manager.config = SimpleNamespace(kv_quant_group_size=0, use_compression=True)
+        manager.config = SimpleNamespace(deltakv_latent_quant_group_size=0, use_compression=True)
 
         self.assertEqual(DeltaKVLessMemoryCacheManager._quant_group_size(manager, 1024), 1024)
 
-        manager.config.kv_quant_group_size = 32
+        manager.config.deltakv_latent_quant_group_size = 32
         self.assertEqual(DeltaKVLessMemoryCacheManager._quant_group_size(manager, 1024), 32)
 
     def test_context_does_not_own_attention_transients(self):
@@ -3832,7 +3839,7 @@ class DeltaKVLessMemoryStorageContractTest(unittest.TestCase):
         manager = object.__new__(DeltaKVLessMemoryCacheManager)
         manager.config = SimpleNamespace(
             prefill_schedule_policy=PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
-            chunk_prefill_size=32768,
+            engine_prefill_chunk_size=32768,
             long_prefill_offload_threshold=32768,
             enable_full_layer_kivi_quant=True,
             full_layer_kv_quant_bits=4,
@@ -3868,7 +3875,7 @@ class DeltaKVLessMemoryStorageContractTest(unittest.TestCase):
         manager = object.__new__(DeltaKVLessMemoryCacheManager)
         manager.config = SimpleNamespace(
             prefill_schedule_policy=PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
-            chunk_prefill_size=32768,
+            engine_prefill_chunk_size=32768,
             long_prefill_offload_threshold=32768,
             enable_full_layer_kivi_quant=True,
             full_layer_kv_quant_bits=4,
@@ -3897,7 +3904,7 @@ class DeltaKVLessMemoryStorageContractTest(unittest.TestCase):
         manager = object.__new__(DeltaKVLessMemoryCacheManager)
         manager.config = SimpleNamespace(
             prefill_schedule_policy=PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
-            chunk_prefill_size=1024,
+            engine_prefill_chunk_size=1024,
             long_prefill_offload_threshold=1024,
             max_num_batched_tokens=2048,
             enable_full_layer_kivi_quant=True,
@@ -4331,7 +4338,7 @@ class DeltaKVStaticDecodeRobustnessTest(unittest.TestCase):
         manager = object.__new__(DeltaKVLessMemoryCudaGraphCacheManager)
         manager.config = SimpleNamespace(
             max_decoding_seqs=16,
-            decode_cuda_graph_capture_sizes="auto",
+            decode_graph_capture_sizes="auto",
         )
 
         self.assertEqual(manager._decode_graph_capture_size_capacity(3), 16)
@@ -4340,7 +4347,7 @@ class DeltaKVStaticDecodeRobustnessTest(unittest.TestCase):
         manager = object.__new__(DeltaKVLessMemoryCacheManager)
         manager.config = SimpleNamespace(
             prefill_schedule_policy=PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
-            chunk_prefill_size=8192,
+            engine_prefill_chunk_size=8192,
             long_prefill_offload_threshold=8192,
         )
         manager.deltakv_layer_ids = [1]

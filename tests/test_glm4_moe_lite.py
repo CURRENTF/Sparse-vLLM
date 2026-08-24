@@ -69,7 +69,7 @@ def _config(**overrides) -> Glm4MoeLiteConfig:
     config = Glm4MoeLiteConfig(**values)
     config.mlp_chunk_size = 8
     config.quantization_config = QuantizationConfig.disabled()
-    config.decode_cuda_graph = False
+    config.decode_graph = False
     return config
 
 
@@ -160,7 +160,7 @@ def _model(config=None, *, tp_rank: int = 0, tp_size: int = 1):
             config,
             mla_attention=_fake_mla(tp_size),
             mlp_chunk_size=config.mlp_chunk_size,
-            decode_cuda_graph=config.decode_cuda_graph,
+            decode_graph=config.decode_graph,
         )
 
 
@@ -193,13 +193,13 @@ def test_glm_runtime_kwargs_bind_model_owned_operators(
     config = _config()
     context = _tp_context(tp_size=2)
     runtime = SimpleNamespace(
-        decode_cuda_graph=True,
+        decode_graph=True,
         max_num_seqs_in_batch=4,
         max_decoding_seqs=8,
         mla_prefill_workspace_bytes=1024,
         mlp_chunk_size=16,
         tiny_random=False,
-        vllm_sparse_method=sparse_method,
+        sparse_method=sparse_method,
     )
     mla = object()
     all_reduce = object()
@@ -224,7 +224,7 @@ def test_glm_runtime_kwargs_bind_model_owned_operators(
     assert kwargs == {
         "mla_attention": mla,
         "mlp_chunk_size": 16,
-        "decode_cuda_graph": True,
+        "decode_graph": True,
         "runtime_config": all_reduce,
     }
     build_mla.assert_called_once_with(
@@ -232,7 +232,7 @@ def test_glm_runtime_kwargs_bind_model_owned_operators(
         device=torch.device("cuda", 1),
         max_batch_size=8,
         prefill_workspace_bytes=1024,
-        decode_cuda_graph=True,
+        decode_graph=True,
         projection_chunk_size=16,
         may_require_attention_scores=requires_scores,
     )
@@ -409,7 +409,7 @@ def test_tiny_transformers_weights_load_through_strict_glm_mapping() -> None:
             config,
             mla_attention=_fake_mla(),
             mlp_chunk_size=config.mlp_chunk_size,
-            decode_cuda_graph=config.decode_cuda_graph,
+            decode_graph=config.decode_graph,
         )
         initialize_sparse_model(model, config, seed=29)
     reference = build_tiny_random_hf_model(config, seed=29)
@@ -448,7 +448,7 @@ def test_glm_ep_loader_keeps_only_local_experts(
             config,
             mla_attention=_fake_mla(),
             mlp_chunk_size=config.mlp_chunk_size,
-            decode_cuda_graph=config.decode_cuda_graph,
+            decode_graph=config.decode_graph,
         )
         initialize_sparse_model(model, config, seed=31)
 
@@ -561,7 +561,7 @@ def test_glm_hybrid_tp_ep_shared_expert_defers_reduction_to_moe_block() -> None:
         block = Glm4MoeLiteSparseMoeBlock(
             config,
             mlp_chunk_size=config.mlp_chunk_size,
-            decode_cuda_graph=False,
+            decode_graph=False,
         )
 
     assert block.shared_experts is not None

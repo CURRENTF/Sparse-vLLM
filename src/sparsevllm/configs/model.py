@@ -119,15 +119,15 @@ def _finalize_model_config(config, model_spec: ModelSpec) -> None:
 
 
 def load_and_validate_model(config) -> None:
-    validate_sparse_method_assets(config.vllm_sparse_method, config.model)
-    if isinstance(config.deltakv_path, str):
-        deltakv_path = config.deltakv_path.strip()
-        config.deltakv_path = (
+    validate_sparse_method_assets(config.sparse_method, config.model)
+    if isinstance(config.deltakv_checkpoint_path, str):
+        deltakv_checkpoint_path = config.deltakv_checkpoint_path.strip()
+        config.deltakv_checkpoint_path = (
             None
-            if deltakv_path.lower() in {"", "none", "null"}
-            else deltakv_path
+            if deltakv_checkpoint_path.lower() in {"", "none", "null"}
+            else deltakv_checkpoint_path
         )
-    if config.tiny_random and config.vllm_sparse_method == "deltakv":
+    if config.tiny_random and config.sparse_method == "deltakv":
         raise NotImplementedError(
             "Tiny random mode does not support DeltaKV compressor weights yet."
         )
@@ -195,9 +195,9 @@ def load_and_validate_model(config) -> None:
 
     validate_model_runtime_compatibility(
         model_type=model_type,
-        sparse_method=config.vllm_sparse_method,
+        sparse_method=config.sparse_method,
         topology=config.parallel_topology,
-        decode_cuda_graph=config.decode_cuda_graph,
+        decode_graph=config.decode_graph,
         enable_prefix_caching=config.enable_prefix_caching,
     )
     _finalize_model_config(config, model_spec)

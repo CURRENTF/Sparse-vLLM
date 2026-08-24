@@ -55,7 +55,7 @@ def test_graph_measurement_preserves_warmup_graph_pool_ownership():
 
     runner = Runner()
     llm = SimpleNamespace(
-        model_runner=SimpleNamespace(decode_cuda_graph_runner=runner)
+        model_runner=SimpleNamespace(decode_graph_runner=runner)
     )
 
     baseline = _start_graph_measurement(llm)

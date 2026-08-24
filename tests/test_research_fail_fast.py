@@ -441,19 +441,19 @@ class ResearchFailFastTest(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as tmp:
             with patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", return_value=hf_config):
-                with self.assertRaisesRegex(ValueError, "requires deltakv_path"):
-                    Config(model=tmp, vllm_sparse_method="deltakv")
-                with self.assertRaisesRegex(ValueError, "requires deltakv_path"):
-                    Config(model=tmp, vllm_sparse_method="deltakv", deltakv_path="none")
-                with self.assertRaisesRegex(ValueError, "requires deltakv_path"):
-                    Config(model=tmp, vllm_sparse_method="deltakv-less-memory")
+                with self.assertRaisesRegex(ValueError, "requires deltakv_checkpoint_path"):
+                    Config(model=tmp, sparse_method="deltakv")
+                with self.assertRaisesRegex(ValueError, "requires deltakv_checkpoint_path"):
+                    Config(model=tmp, sparse_method="deltakv", deltakv_checkpoint_path="none")
+                with self.assertRaisesRegex(ValueError, "requires deltakv_checkpoint_path"):
+                    Config(model=tmp, sparse_method="deltakv-less-memory")
                 cfg = Config(
                     model=tmp,
-                    vllm_sparse_method="deltakv-less-memory",
+                    sparse_method="deltakv-less-memory",
                     allow_missing_deltakv_path=True,
-                    kv_quant_bits=0,
+                    deltakv_latent_quant_bits=0,
                 )
-                self.assertEqual(cfg.vllm_sparse_method, "deltakv")
+                self.assertEqual(cfg.sparse_method, "deltakv")
 
     def test_sparsevllm_missing_model_dir_has_clear_error(self):
         missing = "/tmp/sparsevllm-definitely-missing-model-dir"

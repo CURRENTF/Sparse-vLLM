@@ -447,17 +447,17 @@ class _RecordingPrefillManager:
 
 def _controller_config(method: str, num_layers: int, ratios=None):
     return SimpleNamespace(
-        vllm_sparse_method=method,
+        sparse_method=method,
         validate_runtime_invariants=False,
         obs_layer_ids=[0],
-        full_attn_layers=[],
+        full_attention_layers=[],
         hf_config=SimpleNamespace(
             num_hidden_layers=num_layers,
             hidden_size=8,
             num_attention_heads=1,
         ),
-        num_sink_tokens=1,
-        num_recent_tokens=1,
+        sink_keep_tokens=1,
+        recent_keep_tokens=1,
         decode_keep_tokens=4,
         sparse_attn_score_dtype="float32",
         snapkv_num_full_layers=0,

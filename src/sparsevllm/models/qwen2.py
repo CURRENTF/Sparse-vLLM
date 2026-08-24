@@ -329,11 +329,11 @@ class Qwen2ForCausalLM(nn.Module):
         return {
             "full_attention_provider": build_mha_full_attention_provider(
                 config,
-                sparse_method=engine_config.vllm_sparse_method,
+                sparse_method=engine_config.sparse_method,
                 attention_tp_size=parallel_context.attention_tp_size,
                 device=device,
                 max_batch_size=engine_config.max_decoding_seqs,
-                cuda_graph=engine_config.decode_cuda_graph,
+                cuda_graph=engine_config.decode_graph,
                 runtime_config=engine_config,
             ),
         }

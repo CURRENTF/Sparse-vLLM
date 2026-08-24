@@ -196,8 +196,8 @@ class SparseVLLMRegressionGradingTest(unittest.TestCase):
                         "batch_size": batch_size,
                         "prefill_tp": 100.0,
                         "decode_tp": 100.0,
-                        "decode_cuda_graph_expected": True,
-                        "decode_cuda_graph_active": True,
+                        "decode_graph_expected": True,
+                        "decode_graph_active": True,
                         "synchronize_step_timing": True,
                     }
                     for length in (32000, 64000)
@@ -211,8 +211,8 @@ class SparseVLLMRegressionGradingTest(unittest.TestCase):
                         "batch_size": batch_size,
                         "prefill_tp": 99.0,
                         "decode_tp": 110.0,
-                        "decode_cuda_graph_expected": True,
-                        "decode_cuda_graph_active": True,
+                        "decode_graph_expected": True,
+                        "decode_graph_active": True,
                         "synchronize_step_timing": True,
                         "memory_accounting": {"observed_savings": 0.3},
                     }

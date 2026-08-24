@@ -22,21 +22,21 @@ def test_decode_cuda_graph_status_records_execution_counters():
         force_eager_count=1,
     )
     llm = SimpleNamespace(
-        model_runner=SimpleNamespace(decode_cuda_graph_runner=runner),
-        config=SimpleNamespace(decode_cuda_graph=True),
+        model_runner=SimpleNamespace(decode_graph_runner=runner),
+        config=SimpleNamespace(decode_graph=True),
     )
 
     assert _decode_cuda_graph_status(llm) == {
-        "decode_cuda_graph_configured": True,
-        "decode_cuda_graph_runner_initialized": True,
-        "decode_cuda_graph_state_count": 1,
-        "decode_cuda_graph_graph_count": 1,
-        "decode_cuda_graph_capture_count": 2,
-        "decode_cuda_graph_replay_count": 17,
-        "decode_cuda_graph_eager_static_count": 3,
-        "decode_cuda_graph_force_eager_count": 1,
-        "decode_cuda_graph_last_state_key": "bs4",
-        "decode_cuda_graph_active": True,
+        "decode_graph_configured": True,
+        "decode_graph_runner_initialized": True,
+        "decode_graph_state_count": 1,
+        "decode_graph_graph_count": 1,
+        "decode_graph_capture_count": 2,
+        "decode_graph_replay_count": 17,
+        "decode_graph_eager_static_count": 3,
+        "decode_graph_force_eager_count": 1,
+        "decode_graph_last_state_key": "bs4",
+        "decode_graph_active": True,
     }
 
 

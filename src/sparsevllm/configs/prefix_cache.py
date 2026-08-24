@@ -17,7 +17,7 @@ def normalize_prefix_cache(config) -> None:
     config.resolved_prefix_cache_mode = normalize_prefix_cache_mode(
         config.prefix_cache_mode,
         enabled=config.enable_prefix_caching,
-        method=config.vllm_sparse_method,
+        method=config.sparse_method,
     )
 
     config.prefix_cache_block_size = _coerce_optional_positive_int(
@@ -53,10 +53,10 @@ def normalize_prefix_cache(config) -> None:
             raise ValueError(
                 "enable_prefix_cache_offload requires enable_prefix_caching=True."
             )
-        if config.vllm_sparse_method not in ("", "omnikv", "quest"):
+        if config.sparse_method not in ("", "omnikv", "quest"):
             raise ValueError(
                 "prefix cache offload currently supports only vanilla, OmniKV, and QuEST; "
-                f"got vllm_sparse_method={config.vllm_sparse_method!r}."
+                f"got sparse_method={config.sparse_method!r}."
             )
         if int(config.tensor_parallel_size) not in (1, 2):
             raise ValueError(
@@ -94,7 +94,7 @@ def normalize_prefix_cache(config) -> None:
             )
         recurrent_state_max_bytes = config.prefix_cache_max_recurrent_bytes
     config.recurrent_state_max_bytes = recurrent_state_max_bytes
-    if config.enable_prefix_caching and config.vllm_sparse_method not in PREFIX_CACHE_SUPPORTED_METHODS:
+    if config.enable_prefix_caching and config.sparse_method not in PREFIX_CACHE_SUPPORTED_METHODS:
         raise ValueError(
             "prefix caching only supports vanilla, streamingllm, omnikv, quest, "
             "snapkv, h2o, pyramidkv, rkv, and skipkv."

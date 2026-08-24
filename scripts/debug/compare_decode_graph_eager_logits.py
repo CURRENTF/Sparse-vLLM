@@ -251,7 +251,7 @@ def _start_graph_measurement(llm) -> dict[str, int]:
     the warmup graphs and report business-request activity as counter deltas.
     """
 
-    runner = llm.model_runner.decode_cuda_graph_runner
+    runner = llm.model_runner.decode_graph_runner
     return _graph_counter_snapshot(runner)
 
 
@@ -261,7 +261,7 @@ def _graph_runtime_summary(
     use_graph: bool,
     counters_before: dict[str, int],
 ) -> dict[str, Any]:
-    runner = llm.model_runner.decode_cuda_graph_runner
+    runner = llm.model_runner.decode_graph_runner
     graph_states = [state for state in runner._graphs.values() if state.graph is not None]
     counters_after = _graph_counter_snapshot(runner)
     counter_delta = {
@@ -275,11 +275,11 @@ def _graph_runtime_summary(
     }
     return {
         "requested": bool(use_graph),
-        "config_enabled": bool(llm.config.decode_cuda_graph),
+        "config_enabled": bool(llm.config.decode_graph),
         "model": str(llm.config.model),
         "model_type": str(getattr(llm.config.hf_config, "model_type", "")),
         "configured_sparse_method": str(
-            getattr(llm.config, "vllm_sparse_method", "") or "vanilla"
+            getattr(llm.config, "sparse_method", "") or "vanilla"
         ),
         "runner_method": str(runner.method or "vanilla"),
         "graph_active": bool(graph_states),
@@ -312,7 +312,7 @@ def _validate_graph_runtime(summary: dict[str, Any]) -> None:
     failures = []
     delta = summary.get("counter_delta", summary)
     if not summary.get("config_enabled"):
-        failures.append("decode_cuda_graph config is disabled")
+        failures.append("decode_graph config is disabled")
     if not summary.get("graph_active") or int(summary.get("graph_count", 0)) <= 0:
         failures.append("no captured CUDA Graph is active")
     if int(summary.get("capture_count", 0)) <= 0:
@@ -333,7 +333,7 @@ def _validate_eager_runtime(summary: dict[str, Any]) -> None:
     failures = []
     delta = summary.get("counter_delta", summary)
     if summary.get("config_enabled"):
-        failures.append("eager control unexpectedly enabled decode_cuda_graph")
+        failures.append("eager control unexpectedly enabled decode_graph")
     if summary.get("graph_active") or int(summary.get("graph_count", 0)) != 0:
         failures.append("eager control retained a captured CUDA Graph")
     if int(delta.get("eager_static_count", 0)) <= 0:
@@ -583,8 +583,8 @@ def _run_decode_logits(
         "max_model_len": max(prompt_lens) + max_tokens + 100,
         "max_num_seqs_in_batch": batch_size,
         "max_decoding_seqs": batch_size,
-        "decode_cuda_graph": bool(use_graph),
-        "decode_cuda_graph_capture_sampling": False,
+        "decode_graph": bool(use_graph),
+        "decode_graph_capture_sampling": False,
         "throughput_log_interval_s": 0.0,
     }
     llm = LLM(model_path, **engine_kwargs)
@@ -606,10 +606,10 @@ def _run_decode_logits(
             return logits
 
         runner.run_model = wrapped_run_model
-        if runner.decode_cuda_graph_runner is not None:
-            runner.decode_cuda_graph_runner.run_model = wrapped_run_model
+        if runner.decode_graph_runner is not None:
+            runner.decode_graph_runner.run_model = wrapped_run_model
     else:
-        graph_runner = llm.model_runner.decode_cuda_graph_runner
+        graph_runner = llm.model_runner.decode_graph_runner
         original_graph_run = graph_runner.run
 
         def wrapped_graph_run(*args, **kwargs):

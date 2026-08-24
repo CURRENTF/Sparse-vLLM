@@ -28,7 +28,7 @@ class SkipKVConfigTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "requires skipkv_steering_vector_path"):
                     Config(
                         model=str(model_dir),
-                        vllm_sparse_method="skipkv",
+                        sparse_method="skipkv",
                         skipkv_enable_activation_steering=True,
                     )
 

@@ -1,42 +1,77 @@
 import unittest
+from dataclasses import fields
 
-from sparsevllm.configs.runtime_params import normalize_runtime_params
+from sparsevllm.config import Config
 
 
-class RuntimeParamNormalizationTest(unittest.TestCase):
-    def test_sparsevllm_normalizes_canonical_runtime_params(self):
-        normalized = normalize_runtime_params(
-            {
-                "sparse_method": "deltakv",
-                "deltakv_checkpoint_path": "/tmp/compressor",
-                "engine_prefill_chunk_size": 512,
-            },
-            backend="sparsevllm",
-        )
+class RuntimeParamNamingTest(unittest.TestCase):
+    def test_config_uses_public_runtime_parameter_names(self):
+        config_fields = {field.name for field in fields(Config) if field.init}
+        canonical = {
+            "sparse_method",
+            "deltakv_checkpoint_path",
+            "decode_keep_tokens",
+            "sink_keep_tokens",
+            "recent_keep_tokens",
+            "full_attention_layers",
+            "deltakv_neighbor_count",
+            "deltakv_center_ratio",
+            "deltakv_latent_dim",
+            "deltakv_latent_quant_bits",
+            "deltakv_latent_quant_group_size",
+            "engine_prefill_chunk_size",
+            "gpu_memory_utilization",
+            "decode_graph",
+            "decode_graph_capture_sampling",
+            "decode_graph_capture_sizes",
+        }
+        self.assertLessEqual(canonical, config_fields)
 
-        self.assertEqual(
-            normalized.infer_config,
-            {
-                "vllm_sparse_method": "deltakv",
-                "deltakv_path": "/tmp/compressor",
-                "chunk_prefill_size": 512,
-            },
-        )
+    def test_legacy_runtime_parameter_names_are_not_config_fields(self):
+        config_fields = {field.name for field in fields(Config) if field.init}
+        legacy = {
+            "model_cls",
+            "vllm_sparse_method",
+            "compressor_path",
+            "deltakv_path",
+            "num_top_tokens",
+            "num_sink_tokens",
+            "num_recent_tokens",
+            "full_attn_layers",
+            "deltakv_k_neighbors",
+            "cluster_ratio",
+            "kv_compressed_size",
+            "kv_quant_bits",
+            "kv_quant_group_size",
+            "chunk_prefill_size",
+            "decode_cuda_graph",
+            "decode_cuda_graph_capture_sampling",
+            "decode_cuda_graph_capture_sizes",
+            "device_memory_utilization",
+            "allow_unknown_config_keys",
+        }
+        self.assertTrue(config_fields.isdisjoint(legacy))
 
-    def test_legacy_runtime_names_raise(self):
-        with self.assertRaisesRegex(ValueError, "Legacy runtime parameter"):
-            normalize_runtime_params({"vllm_sparse_method": "x"}, backend="sparsevllm")
+    def test_unknown_runtime_parameter_fails_at_engine_boundary(self):
+        from sparsevllm import LLM
 
-    def test_sparsevllm_vanilla_alias_maps_to_empty_method(self):
-        normalized = normalize_runtime_params({"sparse_method": "vanilla"}, backend="sparsevllm")
-        self.assertEqual(normalized.infer_config["vllm_sparse_method"], "")
+        with self.assertRaisesRegex(ValueError, "Unknown Sparse-vLLM config keys"):
+            LLM("/tmp/unused-model", vllm_sparse_method="omnikv")
 
-    def test_sparsevllm_rkv_alias_maps_to_canonical_method(self):
-        normalized = normalize_runtime_params({"sparse_method": "r-kv"}, backend="sparsevllm")
-        self.assertEqual(normalized.infer_config["vllm_sparse_method"], "rkv")
+    def test_keep_token_budgets_reject_ratio_values(self):
+        from sparsevllm import LLM
 
-        normalized = normalize_runtime_params({"sparse_method": "skip-kv"}, backend="sparsevllm")
-        self.assertEqual(normalized.infer_config["vllm_sparse_method"], "skipkv")
+        with self.assertRaisesRegex(ValueError, "integer token count"):
+            LLM("/tmp/unused-model", decode_keep_tokens=0.17)
+
+    def test_internal_derived_fields_are_not_public_inputs(self):
+        from sparsevllm import LLM
+
+        for key in ("quest_token_budget", "observation_layers", "obs_layer_ids"):
+            with self.subTest(key=key):
+                with self.assertRaisesRegex(ValueError, "Unknown Sparse-vLLM config keys"):
+                    LLM("/tmp/unused-model", **{key: 1})
+
 
 if __name__ == "__main__":
     unittest.main()

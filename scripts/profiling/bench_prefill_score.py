@@ -20,7 +20,7 @@ def _make_case(
     head_dim: int,
     window: int,
     candidate_start: int,
-    num_recent_tokens: int,
+    recent_keep_tokens: int,
     dtype: torch.dtype,
     device: torch.device,
 ):
@@ -63,7 +63,7 @@ def _make_case(
         "window": window,
         "length": length,
         "candidate_start": candidate_start,
-        "num_recent_tokens": num_recent_tokens,
+        "recent_keep_tokens": recent_keep_tokens,
         "workspace": PrefillScoreWorkspace(),
         "probability_out": torch.empty(
             (batch, length), dtype=torch.float32, device=device
@@ -94,7 +94,7 @@ def _optimized_triton(
         case["score_starts"],
         case["score_ends"],
         candidate_start=int(case["candidate_start"]),
-        num_recent_tokens=int(case["num_recent_tokens"]),
+        recent_keep_tokens=int(case["recent_keep_tokens"]),
         score_mode=score_mode,
         workspace=case["workspace"],
     )
@@ -108,7 +108,7 @@ def _torch_expanded(case: dict[str, torch.Tensor | int]) -> torch.Tensor:
     length = int(case["length"])
     window = int(case["window"])
     candidate_start = int(case["candidate_start"])
-    candidate_end = max(candidate_start, length - int(case["num_recent_tokens"]))
+    candidate_end = max(candidate_start, length - int(case["recent_keep_tokens"]))
     batch = int(case["context_lens"].numel())
     out = torch.zeros((batch, length), dtype=torch.float32, device=q.device)
     if candidate_end <= candidate_start:
@@ -144,7 +144,7 @@ def _torch_grouped(case: dict[str, torch.Tensor | int]) -> torch.Tensor:
     length = int(case["length"])
     window = int(case["window"])
     candidate_start = int(case["candidate_start"])
-    candidate_end = max(candidate_start, length - int(case["num_recent_tokens"]))
+    candidate_end = max(candidate_start, length - int(case["recent_keep_tokens"]))
     batch = int(case["context_lens"].numel())
     out = torch.zeros((batch, length), dtype=torch.float32, device=q.device)
     if candidate_end <= candidate_start:
@@ -184,7 +184,7 @@ def _torch_logits(case: dict[str, torch.Tensor | int]) -> torch.Tensor:
     length = int(case["length"])
     window = int(case["window"])
     candidate_start = int(case["candidate_start"])
-    candidate_end = max(candidate_start, length - int(case["num_recent_tokens"]))
+    candidate_end = max(candidate_start, length - int(case["recent_keep_tokens"]))
     batch = int(case["context_lens"].numel())
     out = torch.full(
         (batch, length), -torch.inf, dtype=torch.float32, device=q.device
@@ -278,7 +278,7 @@ def main():
         "shape: "
         f"B={args.batch} Hq={args.num_heads} Hkv={args.num_kv_heads} "
         f"D={args.head_dim} W={args.window} dtype=bf16 "
-        f"candidate_start={args.candidate_start} num_recent_tokens={args.num_recent_tokens}"
+        f"candidate_start={args.candidate_start} recent_keep_tokens={args.recent_keep_tokens}"
     )
     print(f"gpu: {torch.cuda.get_device_name(device)}")
     print("| L | method | latency_ms | speedup_vs_grouped | peak_extra_mib | max_abs_diff_vs_grouped |")
@@ -292,7 +292,7 @@ def main():
             head_dim=args.head_dim,
             window=args.window,
             candidate_start=args.candidate_start,
-            num_recent_tokens=args.num_recent_tokens,
+            recent_keep_tokens=args.recent_keep_tokens,
             dtype=dtype,
             device=device,
         )

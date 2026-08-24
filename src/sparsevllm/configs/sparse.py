@@ -13,47 +13,39 @@ from sparsevllm.method_registry import (
 from sparsevllm.utils.log import logger, log_once
 
 
-def normalize_sparse_method_name(config) -> bool:
-    raw_sparse_method = config.vllm_sparse_method
-    raw_sparse_method_normalized = "" if raw_sparse_method is None else str(raw_sparse_method).strip().lower()
-    legacy_deltakv_graph_method = raw_sparse_method_normalized in {
-        "deltakv-less-memory-cudagraph",
-        "deltakv_less_memory_cudagraph",
-    }
-
-    config.vllm_sparse_method = normalize_sparse_method(config.vllm_sparse_method)
-    if config.vllm_sparse_method not in SUPPORTED_SPARSE_METHODS:
+def normalize_sparse_method_name(config) -> None:
+    config.sparse_method = normalize_sparse_method(config.sparse_method)
+    if config.sparse_method not in SUPPORTED_SPARSE_METHODS:
         supported = ", ".join(repr(method) for method in sorted(SUPPORTED_SPARSE_METHODS) if method)
         raise ValueError(
-            f"Unsupported vllm_sparse_method={config.vllm_sparse_method!r}. "
+            f"Unsupported sparse_method={config.sparse_method!r}. "
             f"Supported methods: '', {supported}."
         )
-    return legacy_deltakv_graph_method
+    for name in ("sink_keep_tokens", "decode_keep_tokens", "recent_keep_tokens"):
+        value = getattr(config, name)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(
+                f"{name} must be a non-negative integer token count, got {value!r}."
+            )
 
 def _normalize_quest(config) -> None:
-    if isinstance(config.full_attn_layers, str):
-        layers = config.full_attn_layers.strip()
-        config.full_attn_layers = [] if not layers else [int(x) for x in layers.split(",")]
+    if isinstance(config.full_attention_layers, str):
+        layers = config.full_attention_layers.strip()
+        config.full_attention_layers = [] if not layers else [int(x) for x in layers.split(",")]
 
     if config.quest_chunk_size <= 0:
         raise ValueError("quest_chunk_size 必须 > 0")
     config.quest_token_budget = 0
-    if config.vllm_sparse_method == "quest":
-        for name in ("num_sink_tokens", "decode_keep_tokens", "num_recent_tokens"):
-            value = getattr(config, name)
-            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-                raise ValueError(
-                    f"QuEST {name} must be a non-negative integer, got {value!r}."
-                )
+    if config.sparse_method == "quest":
         config.quest_token_budget = (
-            config.num_sink_tokens
+            config.sink_keep_tokens
             + config.decode_keep_tokens
-            + config.num_recent_tokens
+            + config.recent_keep_tokens
         )
         if config.quest_token_budget <= 0:
             raise ValueError(
                 "QuEST derived token budget must be > 0: "
-                "num_sink_tokens + decode_keep_tokens + num_recent_tokens "
+                "sink_keep_tokens + decode_keep_tokens + recent_keep_tokens "
                 f"= {config.quest_token_budget}."
             )
     if config.quest_skip_layers < 0:
@@ -97,14 +89,14 @@ def _normalize_sparse_prefill_score(config) -> None:
             "sparse_prefill_score_mode must be one of "
             f"{sorted(allowed)}, got {config.sparse_prefill_score_mode!r}."
         )
-    if mode != "probability" and config.vllm_sparse_method not in {
+    if mode != "probability" and config.sparse_method not in {
         "snapkv",
         "pyramidkv",
         "h2o",
     }:
         raise ValueError(
             "sparse_prefill_score_mode='logits' only applies to "
-            f"SnapKV/PyramidKV/H2O, got method={config.vllm_sparse_method!r}."
+            f"SnapKV/PyramidKV/H2O, got method={config.sparse_method!r}."
         )
     if mode == "logits" and config.sparse_attn_score_dtype != "float32":
         raise ValueError(
@@ -153,7 +145,7 @@ def _normalize_rkv(config) -> None:
             "rkv_redundancy_window must be <= rkv_max_redundancy_tokens, "
             f"got window={config.rkv_redundancy_window} max={config.rkv_max_redundancy_tokens}."
         )
-    if config.vllm_sparse_method == "rkv":
+    if config.sparse_method == "rkv":
         log_once(
             "R-KV support is an approximation of the official implementation: "
             "Sparse-VLLM uses one shared physical token index set across KV heads, "
@@ -214,7 +206,7 @@ def normalize_sparse_methods(config) -> None:
     if (
         getattr(config.hf_config, "model_type", "") == "gemma4_text"
         and int(getattr(config.hf_config, "num_kv_shared_layers", 0) or 0)
-        and config.vllm_sparse_method == "streamingllm"
+        and config.sparse_method == "streamingllm"
     ):
         raise NotImplementedError(
             "Gemma 4 StreamingLLM requires independent per-layer KV caches; "
@@ -229,17 +221,17 @@ def normalize_sparse_methods(config) -> None:
     _normalize_skipkv(config)
 
 def finalize_sparse_layout(config) -> None:
-    configured_full_layers = {int(layer) for layer in config.full_attn_layers}
+    configured_full_layers = {int(layer) for layer in config.full_attention_layers}
     kv_layers = tuple(int(layer) for layer in config.runtime_layout.kv_idx_to_layer_idx)
     kv_positions = {layer: index for index, layer in enumerate(kv_layers)}
     unknown_full_layers = sorted(configured_full_layers - set(kv_layers))
-    if unknown_full_layers and config.vllm_sparse_method in {"omnikv", "deltakv"}:
+    if unknown_full_layers and config.sparse_method in {"omnikv", "deltakv"}:
         raise ValueError(
-            "full_attn_layers must contain KV/full-attention layer indices for "
-            f"{config.vllm_sparse_method}; non-KV layers={unknown_full_layers}."
+            "full_attention_layers must contain KV/full-attention layer indices for "
+            f"{config.sparse_method}; non-KV layers={unknown_full_layers}."
         )
     config.obs_layer_ids = []
-    for layer in config.full_attn_layers:
+    for layer in config.full_attention_layers:
         layer = int(layer)
         kv_position = kv_positions.get(layer)
         if kv_position is None or kv_position + 1 >= len(kv_layers):
@@ -248,7 +240,7 @@ def finalize_sparse_layout(config) -> None:
             config.obs_layer_ids.append(layer)
 
     # PyramidKV 配置验证与智能生成
-    if 'pyramidkv' == config.vllm_sparse_method:
+    if 'pyramidkv' == config.sparse_method:
         num_layers = int(config.runtime_layout.num_layers)
         num_kv_layers = int(config.runtime_layout.num_kv_layers)
         if config.pyramid_layer_ratios is None:
@@ -291,8 +283,8 @@ def finalize_sparse_layout(config) -> None:
 
     if config.pyramid_layer_ratios is not None:
         # PyramidKV 模式自动启用 SnapKV 逻辑
-        if 'pyramidkv' != config.vllm_sparse_method:
-            raise ValueError('vllm_sparse_method 应为 pyramidkv')
+        if 'pyramidkv' != config.sparse_method:
+            raise ValueError('sparse_method 应为 pyramidkv')
 
         num_kv_layers = int(config.runtime_layout.num_kv_layers)
         if len(config.pyramid_layer_ratios) != num_kv_layers:

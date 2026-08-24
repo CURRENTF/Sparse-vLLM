@@ -113,7 +113,7 @@ def _prefill_score_partial_stats_kernel(
     QUERY_BLOCKS: tl.constexpr,
     USE_BATCH_INDICES: tl.constexpr,
     candidate_start: tl.constexpr,
-    num_recent_tokens: tl.constexpr,
+    recent_keep_tokens: tl.constexpr,
     sm_scale: tl.constexpr,
     NUM_BLOCKS: tl.constexpr,
     BLOCK_H: tl.constexpr,
@@ -169,7 +169,7 @@ def _prefill_score_partial_stats_kernel(
 
     start_n = cur_n_block * BLOCK_N
     kv_pos = start_n + offs_n
-    candidate_end = tl.maximum(candidate_start, context_len - num_recent_tokens)
+    candidate_end = tl.maximum(candidate_start, context_len - recent_keep_tokens)
     kv_in_candidate = (kv_pos >= candidate_start) & (kv_pos < candidate_end)
     kv_loc = tl.load(
         Req_to_tokens + stride_req_to_tokens_b * cur_batch_req_idx + stride_req_to_tokens_s * kv_pos,
@@ -258,7 +258,7 @@ def _prefill_score_final_kernel(
     QUERY_BLOCKS: tl.constexpr,
     USE_BATCH_INDICES: tl.constexpr,
     candidate_start: tl.constexpr,
-    num_recent_tokens: tl.constexpr,
+    recent_keep_tokens: tl.constexpr,
     sm_scale: tl.constexpr,
     NUM_BLOCKS: tl.constexpr,
     BLOCK_H: tl.constexpr,
@@ -315,7 +315,7 @@ def _prefill_score_final_kernel(
 
     start_n = cur_n_block * BLOCK_N
     kv_pos = start_n + offs_n
-    candidate_end = tl.maximum(candidate_start, context_len - num_recent_tokens)
+    candidate_end = tl.maximum(candidate_start, context_len - recent_keep_tokens)
     kv_in_candidate = (kv_pos >= candidate_start) & (kv_pos < candidate_end)
     kv_loc = tl.load(
         Req_to_tokens + stride_req_to_tokens_b * cur_batch_req_idx + stride_req_to_tokens_s * kv_pos,
@@ -544,7 +544,7 @@ def _prefill_logit_score_kernel(
     QUERY_BLOCKS: tl.constexpr,
     USE_BATCH_INDICES: tl.constexpr,
     candidate_start: tl.constexpr,
-    num_recent_tokens: tl.constexpr,
+    recent_keep_tokens: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_ROWS: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
@@ -597,7 +597,7 @@ def _prefill_logit_score_kernel(
     q = tl.load(Q + off_q, mask=q_row_valid[:, None], other=0.0)
 
     kv_pos = cur_n_block * BLOCK_N + offs_n
-    candidate_end = tl.maximum(candidate_start, context_len - num_recent_tokens)
+    candidate_end = tl.maximum(candidate_start, context_len - recent_keep_tokens)
     kv_in_candidate = (kv_pos >= candidate_start) & (kv_pos < candidate_end)
     kv_loc = tl.load(
         Req_to_tokens
@@ -642,7 +642,7 @@ def prefill_score_fwd(
     score_q_end: torch.Tensor,
     *,
     candidate_start: int = 0,
-    num_recent_tokens: int = 0,
+    recent_keep_tokens: int = 0,
     score_mode: str = "probability",
     workspace: PrefillScoreWorkspace | None = None,
     batch_indices: torch.Tensor | None = None,
@@ -748,7 +748,7 @@ def prefill_score_fwd(
             QUERY_BLOCKS=query_blocks,
             USE_BATCH_INDICES=batch_indices is not None,
             candidate_start=int(candidate_start),
-            num_recent_tokens=int(num_recent_tokens),
+            recent_keep_tokens=int(recent_keep_tokens),
             BLOCK_H=block_h,
             BLOCK_ROWS=block_rows,
             BLOCK_DMODEL=head_dim,
@@ -798,7 +798,7 @@ def prefill_score_fwd(
         QUERY_BLOCKS=query_blocks,
         USE_BATCH_INDICES=batch_indices is not None,
         candidate_start=int(candidate_start),
-        num_recent_tokens=int(num_recent_tokens),
+        recent_keep_tokens=int(recent_keep_tokens),
         sm_scale=float(head_dim) ** -0.5,
         NUM_BLOCKS=candidate_blocks,
         BLOCK_H=block_h,
@@ -852,7 +852,7 @@ def prefill_score_fwd(
         QUERY_BLOCKS=query_blocks,
         USE_BATCH_INDICES=batch_indices is not None,
         candidate_start=int(candidate_start),
-        num_recent_tokens=int(num_recent_tokens),
+        recent_keep_tokens=int(recent_keep_tokens),
         sm_scale=float(head_dim) ** -0.5,
         NUM_BLOCKS=candidate_blocks,
         BLOCK_H=block_h,

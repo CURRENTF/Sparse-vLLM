@@ -301,7 +301,7 @@ def test_run_rpc_uses_host_status_with_decode_graph():
     runner = object.__new__(ModelRunner)
     runner.world_size = 1
     runner.rank = 0
-    runner.config = SimpleNamespace(decode_cuda_graph=True)
+    runner.config = SimpleNamespace(decode_graph=True)
     runner.run = lambda seqs, is_prefill: (seqs, is_prefill)
     calls = []
     runner._sync_tp_run_status = lambda error: calls.append(("host", error))
@@ -319,7 +319,7 @@ def test_run_rpc_keeps_collective_status_without_decode_graph():
     runner = object.__new__(ModelRunner)
     runner.world_size = 1
     runner.rank = 0
-    runner.config = SimpleNamespace(decode_cuda_graph=False)
+    runner.config = SimpleNamespace(decode_graph=False)
     runner.run = lambda seqs, is_prefill: (seqs, is_prefill)
     calls = []
     runner._sync_tp_run_status = lambda error: calls.append(("host", error))
@@ -451,7 +451,7 @@ def test_model_runner_reset_after_warmup_resets_local_runtime_state():
     runner.runtime_state = SimpleNamespace(
         reset_after_warmup=lambda: calls.append("runtime")
     )
-    runner.decode_cuda_graph_runner = SimpleNamespace(
+    runner.decode_graph_runner = SimpleNamespace(
         clear_captured_graphs=lambda: calls.append("graphs")
     )
     runner.sparse_controller = SimpleNamespace(
@@ -477,8 +477,8 @@ def test_model_runner_exit_drains_graphs_before_barrier():
         synchronize=lambda: calls.append("sync"),
         barrier_device_ids=lambda rank: [rank],
     )
-    runner.config = SimpleNamespace(decode_cuda_graph=True)
-    runner.decode_cuda_graph_runner = SimpleNamespace(
+    runner.config = SimpleNamespace(decode_graph=True)
+    runner.decode_graph_runner = SimpleNamespace(
         clear_captured_graphs=lambda: calls.append("clear_graphs")
     )
     runner.model = SimpleNamespace(
@@ -525,8 +525,8 @@ def test_tp_worker_decode_skips_rank0_sampling_path():
 
     runner = object.__new__(ModelRunner)
     runner.rank = 1
-    runner.config = SimpleNamespace(decode_cuda_graph=False)
-    runner.decode_cuda_graph_runner = SimpleNamespace(
+    runner.config = SimpleNamespace(decode_graph=False)
+    runner.decode_graph_runner = SimpleNamespace(
         run_eager_static=lambda seqs: calls.append("decode") or None
     )
     runner.sparse_controller = SimpleNamespace(

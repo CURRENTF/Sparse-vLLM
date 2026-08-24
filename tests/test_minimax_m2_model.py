@@ -241,7 +241,7 @@ def test_model_construction_shares_explicit_runtime_operators_across_layers():
 def test_minimax_runtime_kwargs_bind_model_owned_operators():
     config = _config()
     context = _tp_context(0, 1)
-    runtime = SimpleNamespace(vllm_sparse_method="", decode_cuda_graph=True)
+    runtime = SimpleNamespace(sparse_method="", decode_graph=True)
     bound = object()
     with patch(
         "sparsevllm.models.minimax_m2.build_minimax_m2_runtime_config",

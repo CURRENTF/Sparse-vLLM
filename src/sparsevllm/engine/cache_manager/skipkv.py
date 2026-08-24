@@ -527,8 +527,8 @@ class SkipKVCacheManager(RKVCacheManager):
         if kv_len <= budget:
             return torch.arange(kv_len, dtype=torch.long, device=importance_scores.device)
 
-        num_sink = min(int(self.config.num_sink_tokens), kv_len)
-        num_recent = min(int(self.config.num_recent_tokens), max(0, kv_len - num_sink))
+        num_sink = min(int(self.config.sink_keep_tokens), kv_len)
+        num_recent = min(int(self.config.recent_keep_tokens), max(0, kv_len - num_sink))
         recent_start = kv_len - num_recent
         candidate_start = num_sink
         candidate_end = max(candidate_start, recent_start)
@@ -613,8 +613,8 @@ class SkipKVCacheManager(RKVCacheManager):
             keep = torch.arange(kv_len, dtype=torch.long, device=importance_scores.device)
             return keep.unsqueeze(0).expand(len(seqs), -1).contiguous()
 
-        num_sink = min(int(self.config.num_sink_tokens), kv_len)
-        num_recent = min(int(self.config.num_recent_tokens), max(0, kv_len - num_sink))
+        num_sink = min(int(self.config.sink_keep_tokens), kv_len)
+        num_recent = min(int(self.config.recent_keep_tokens), max(0, kv_len - num_sink))
         recent_start = kv_len - num_recent
         candidate_start = num_sink
         candidate_end = max(candidate_start, recent_start)

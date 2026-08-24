@@ -119,7 +119,7 @@ def build_glm4_moe_lite_mla_attention(
     device: torch.device | str,
     max_batch_size: int,
     prefill_workspace_bytes: int,
-    decode_cuda_graph: bool,
+    decode_graph: bool,
     projection_chunk_size: int,
     may_require_attention_scores: bool = False,
 ) -> MLAAttention:
@@ -136,7 +136,7 @@ def build_glm4_moe_lite_mla_attention(
         activation_dtype=activation_dtype,
         cache_dtype=activation_dtype,
         tp_size=int(parallel_context.attention_tp_size),
-        cuda_graph=bool(decode_cuda_graph),
+        cuda_graph=bool(decode_graph),
         may_require_attention_scores=bool(may_require_attention_scores),
     )
     return MLAAttention.bind(
@@ -340,7 +340,7 @@ class Glm4MoeLiteRouter(nn.Module):
             top_k=self.top_k,
             activation_dtype=torch.float32,
             norm_topk_prob=True,
-            cuda_graph=bool(getattr(config, "decode_cuda_graph", False)),
+            cuda_graph=bool(getattr(config, "decode_graph", False)),
             routing_method="biased_sigmoid",
         )
         self.provider = resolve_moe_router_provider(self.op_spec)
@@ -364,7 +364,7 @@ class Glm4MoeLitePackedExperts(PackedMoeExperts):
         self,
         config: Glm4MoeLiteConfig,
         *,
-        decode_cuda_graph: bool,
+        decode_graph: bool,
     ) -> None:
         parallel_context = get_parallel_context()
         self.routed_num_experts = int(config.n_routed_experts)
@@ -377,7 +377,7 @@ class Glm4MoeLitePackedExperts(PackedMoeExperts):
             intermediate_size=int(config.moe_intermediate_size),
             tp_size=int(parallel_context.moe_tp_size),
             ep_size=int(parallel_context.ep_size),
-            cuda_graph=decode_cuda_graph,
+            cuda_graph=decode_graph,
         )
         packed_num_experts = self.routed_num_experts + int(
             self.fuses_shared_decode
@@ -390,7 +390,7 @@ class Glm4MoeLitePackedExperts(PackedMoeExperts):
             top_k=packed_top_k,
             activation_dtype=model_activation_dtype(config),
             fp8_enabled=False,
-            cuda_graph=bool(decode_cuda_graph),
+            cuda_graph=bool(decode_graph),
             routing_method="biased_sigmoid",
             model_label="GLM-4.7-Flash",
             provider_resolver=resolve_moe_provider,
@@ -480,7 +480,7 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
         config: Glm4MoeLiteConfig,
         *,
         mlp_chunk_size: int,
-        decode_cuda_graph: bool,
+        decode_graph: bool,
         runtime_config: Glm4MoeLiteRuntimeConfig | None = None,
     ) -> None:
         super().__init__()
@@ -494,7 +494,7 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
         self.gate = Glm4MoeLiteRouter(config)
         self.experts = Glm4MoeLitePackedExperts(
             config,
-            decode_cuda_graph=decode_cuda_graph,
+            decode_graph=decode_graph,
         )
         self.shared_experts = (
             None
@@ -682,7 +682,7 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
         mla_attention: MLAAttention,
         *,
         mlp_chunk_size: int,
-        decode_cuda_graph: bool,
+        decode_graph: bool,
         runtime_config: Glm4MoeLiteRuntimeConfig | None = None,
     ) -> None:
         super().__init__()
@@ -717,7 +717,7 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
             self.mlp = Glm4MoeLiteSparseMoeBlock(
                 config,
                 mlp_chunk_size=mlp_chunk_size,
-                decode_cuda_graph=decode_cuda_graph,
+                decode_graph=decode_graph,
                 runtime_config=runtime_config,
             )
         else:
@@ -767,7 +767,7 @@ class Glm4MoeLiteModel(nn.Module):
         mla_attention: MLAAttention,
         *,
         mlp_chunk_size: int,
-        decode_cuda_graph: bool,
+        decode_graph: bool,
         runtime_config: Glm4MoeLiteRuntimeConfig | None = None,
     ) -> None:
         super().__init__()
@@ -797,7 +797,7 @@ class Glm4MoeLiteModel(nn.Module):
                     layer_idx,
                     mla_attention,
                     mlp_chunk_size=mlp_chunk_size,
-                    decode_cuda_graph=decode_cuda_graph,
+                    decode_graph=decode_graph,
                     runtime_config=runtime_config,
                 )
                 for layer_idx in range(int(config.num_hidden_layers))
@@ -881,7 +881,7 @@ class Glm4MoeLiteForCausalLM(nn.Module):
         device: torch.device,
         max_decode_tokens: int,
     ) -> dict:
-        decode_cuda_graph = bool(engine_config.decode_cuda_graph)
+        decode_graph = bool(engine_config.decode_graph)
         kwargs = {
             "mla_attention": build_glm4_moe_lite_mla_attention(
                 config,
@@ -891,23 +891,23 @@ class Glm4MoeLiteForCausalLM(nn.Module):
                     engine_config.max_decoding_seqs,
                 ),
                 prefill_workspace_bytes=engine_config.mla_prefill_workspace_bytes,
-                decode_cuda_graph=decode_cuda_graph,
+                decode_graph=decode_graph,
                 projection_chunk_size=engine_config.mlp_chunk_size,
                 may_require_attention_scores=(
                     sparse_decode_attention_requires_scores(
-                        engine_config.vllm_sparse_method
+                        engine_config.sparse_method
                     )
                 ),
             ),
             "mlp_chunk_size": engine_config.mlp_chunk_size,
-            "decode_cuda_graph": decode_cuda_graph,
+            "decode_graph": decode_graph,
         }
         if parallel_context.world_size > 1:
             kwargs["runtime_config"] = build_glm4_moe_lite_runtime_config(
                 config,
                 parallel_context,
                 max_decode_tokens=max_decode_tokens,
-                cuda_graph=decode_cuda_graph,
+                cuda_graph=decode_graph,
                 device_index=int(device.index or 0),
             )
         return kwargs
@@ -918,7 +918,7 @@ class Glm4MoeLiteForCausalLM(nn.Module):
         *,
         mla_attention: MLAAttention,
         mlp_chunk_size: int,
-        decode_cuda_graph: bool,
+        decode_graph: bool,
         runtime_config: Glm4MoeLiteRuntimeConfig | None = None,
     ) -> None:
         super().__init__()
@@ -929,7 +929,7 @@ class Glm4MoeLiteForCausalLM(nn.Module):
             config,
             mla_attention,
             mlp_chunk_size=mlp_chunk_size,
-            decode_cuda_graph=decode_cuda_graph,
+            decode_graph=decode_graph,
             runtime_config=runtime_config,
         )
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)

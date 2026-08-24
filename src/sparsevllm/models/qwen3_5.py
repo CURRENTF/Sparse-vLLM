@@ -889,7 +889,7 @@ class Qwen35MLP(nn.Module):
                 if self.gate_up_proj.quantized
                 else activation_dtype
             ),
-            cuda_graph=bool(getattr(config, "decode_cuda_graph", False)),
+            cuda_graph=bool(getattr(config, "decode_graph", False)),
         )
         self.gate_up_swiglu_provider = resolve_gate_up_swiglu_provider(
             self.gate_up_swiglu_spec
@@ -1030,11 +1030,11 @@ class Qwen35ForCausalLM(nn.Module):
     ) -> dict:
         full_attention_provider = build_mha_full_attention_provider(
             config,
-            sparse_method=engine_config.vllm_sparse_method,
+            sparse_method=engine_config.sparse_method,
             attention_tp_size=parallel_context.attention_tp_size,
             device=device,
             max_batch_size=engine_config.max_decoding_seqs,
-            cuda_graph=engine_config.decode_cuda_graph,
+            cuda_graph=engine_config.decode_graph,
             runtime_config=engine_config,
         )
         try:
@@ -1042,7 +1042,7 @@ class Qwen35ForCausalLM(nn.Module):
                 config,
                 attention_tp_size=parallel_context.attention_tp_size,
                 device=device,
-                cuda_graph=engine_config.decode_cuda_graph,
+                cuda_graph=engine_config.decode_graph,
             )
         except BaseException:
             full_attention_provider.close()

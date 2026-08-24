@@ -240,7 +240,7 @@ class Gemma4PackedExperts(PackedMoeExperts):
             top_k=config.top_k_experts,
             activation_dtype=model_activation_dtype(config),
             fp8_enabled=False,
-            cuda_graph=bool(getattr(config, "decode_cuda_graph", False)),
+            cuda_graph=bool(getattr(config, "decode_graph", False)),
             activation="gelu_tanh",
             model_label="Gemma4MoE",
             provider_resolver=resolve_gemma4_moe_provider,

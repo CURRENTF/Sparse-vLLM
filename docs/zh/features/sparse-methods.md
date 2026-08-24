@@ -18,7 +18,7 @@ Sparse-vLLM 围绕 cache-manager-first sparse runtime 构建。engine 支持 phy
 | `quest` | Query-aware page selection | QuEST 根据 decode query 选择 token page。prefill 保持 dense，decode 通过 page/chunk budget 执行 sparse selection。 | `quest_chunk_size`, `quest_skip_layers`, `sink_keep_tokens`, `decode_keep_tokens`, `recent_keep_tokens` |
 | `deltakv` | Hybrid compression | 依赖 compressor 的精简 DeltaKV runtime。旧配置中的 `deltakv-less-memory*` 名称会规范到此方法，但实际 benchmark run 仍需要匹配的 compressor checkpoint。 | `deltakv_checkpoint_path`, `deltakv_latent_dim`, `deltakv_center_ratio`, `deltakv_neighbor_count`, `deltakv_latent_quant_bits`, `full_layer_kv_quant_bits` |
 
-Sparse-vLLM 在内部将该值存为 `vllm_sparse_method`，但 public command 和 `LLM(...)` kwarg 应使用 `sparse_method`。
+Sparse-vLLM 在 public command、`LLM(...)`、runtime config 与内部消费者中统一使用 `sparse_method`。
 
 > [!NOTE]
 > `snapkv` 和 `h2o` 的 decode 评分与淘汰属于后续工作。当前 runtime 中，
@@ -42,8 +42,8 @@ Prefill scheduling 是方法 contract 的一部分，由 registry 管理。唯�
 
 | Policy | Runtime 语义 | 当前默认方法 |
 | --- | --- | --- |
-| `all_chunked` | 每个 prefill request 都受 `chunk_prefill_size` 和 scheduler 常规 batch 限制约束；忽略 `long_prefill_offload_threshold`。 | `vanilla`, `streamingllm`, `attention-sink`, `snapkv`, `h2o`, `quest`, `omnikv` |
-| `long_bs1full_short_batch` | 在附加受支持的 prefix 后，residual 不超过 `long_prefill_offload_threshold` 时使用 atomic full prefill，并且可以互相 batch；更大的 residual 被隔离，并使用不超过 `chunk_prefill_size` 的 RawKV offload chunk。 | `pyramidkv` 和 DeltaKV family 方法 |
+| `all_chunked` | 每个 prefill request 都受 `engine_prefill_chunk_size` 和 scheduler 常规 batch 限制约束；忽略 `long_prefill_offload_threshold`。 | `vanilla`, `streamingllm`, `attention-sink`, `snapkv`, `h2o`, `quest`, `omnikv` |
+| `long_bs1full_short_batch` | 在附加受支持的 prefix 后，residual 不超过 `long_prefill_offload_threshold` 时使用 atomic full prefill，并且可以互相 batch；更大的 residual 被隔离，并使用不超过 `engine_prefill_chunk_size` 的 RawKV offload chunk。 | `pyramidkv` 和 DeltaKV family 方法 |
 
 DeltaKV family 方法和 PyramidKV 只对外提供 `long_bs1full_short_batch` policy。threshold 默认是 `65536` token（64K）。未设置 `engine_prefill_chunk_size` 时，它默认等于 threshold；显式值必须为正数且不大于 threshold。必要时，`Config` 会提高 `max_num_batched_tokens`，使一个 threshold 大小的 full prefill 能够原子容纳。PyramidKV 根据 chain prefix attach 后的 residual 进行分类。DeltaKV 不支持 prefix caching，并会在修改 compressed 或 quantized row metadata 前拒绝 attached-prefix prefill。
 

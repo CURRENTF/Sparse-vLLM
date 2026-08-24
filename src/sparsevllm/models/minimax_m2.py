@@ -168,7 +168,7 @@ class MiniMaxM2Router(nn.Module):
             top_k=self.top_k,
             activation_dtype=torch.float32,
             norm_topk_prob=True,
-            cuda_graph=bool(getattr(config, "decode_cuda_graph", False)),
+            cuda_graph=bool(getattr(config, "decode_graph", False)),
             routing_method="biased_sigmoid",
         )
         self.provider = resolve_moe_router_provider(self.op_spec)
@@ -210,7 +210,7 @@ class MiniMaxM2PackedExperts(PackedMoeExperts):
             activation_dtype=model_activation_dtype(config),
             fp8_enabled=True,
             cuda_graph=(
-                bool(getattr(config, "decode_cuda_graph", False))
+                bool(getattr(config, "decode_graph", False))
                 if cuda_graph is None
                 else bool(cuda_graph)
             ),
@@ -443,9 +443,9 @@ class MiniMaxM2ForCausalLM(nn.Module):
             "runtime_config": build_minimax_m2_runtime_config(
                 config,
                 parallel_context,
-                sparse_method=engine_config.vllm_sparse_method,
+                sparse_method=engine_config.sparse_method,
                 max_decode_tokens=max_decode_tokens,
-                cuda_graph=engine_config.decode_cuda_graph,
+                cuda_graph=engine_config.decode_graph,
                 device=device,
                 engine_config=engine_config,
             )

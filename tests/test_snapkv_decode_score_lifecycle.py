@@ -17,7 +17,7 @@ class WorkerInfoTest(unittest.TestCase):
         engine.config = SimpleNamespace(
             model="model",
             hf_config=SimpleNamespace(model_type="test", vocab_size=32_000),
-            vllm_sparse_method="",
+            sparse_method="",
             enable_prefix_caching=True,
             prefix_cache_block_size=16,
             prefix_cache_max_blocks=4_096,
@@ -79,9 +79,9 @@ def make_controller(
         is_full_attention=lambda layer: 0 <= int(layer) < layers,
     )
     config = SimpleNamespace(
-        vllm_sparse_method=method,
+        sparse_method=method,
         obs_layer_ids=[],
-        full_attn_layers=[],
+        full_attention_layers=[],
         hf_config=SimpleNamespace(
             num_hidden_layers=layers,
             hidden_size=8,
@@ -89,8 +89,8 @@ def make_controller(
             torch_dtype=torch.float32,
         ),
         runtime_layout=layout,
-        num_sink_tokens=sink,
-        num_recent_tokens=recent,
+        sink_keep_tokens=sink,
+        recent_keep_tokens=recent,
         decode_keep_tokens=keep,
         sparse_attn_score_dtype=score_dtype,
         tensor_parallel_size=1,
@@ -100,7 +100,7 @@ def make_controller(
             if pyramid_ratios is not None
             else ([1.0] * layers if method == "pyramidkv" else None)
         ),
-        decode_cuda_graph=graph,
+        decode_graph=graph,
         pool_kernel_size=1,
     )
 
@@ -238,14 +238,14 @@ class SnapKVDecodeScoreLifecycleTest(unittest.TestCase):
                 torch.full((1, 16), -1e20),
             )
         )
-        keepalive = controller.decode_cuda_graph_keepalive_tensors()
+        keepalive = controller.decode_graph_keepalive_tensors()
         self.assertEqual(sum(tensor.dim() == 3 for tensor in keepalive), 0)
         self.assertEqual(sum(tensor.dim() == 2 for tensor in keepalive), 1)
         controller.layer_batch_sparse_states[0].attn_score = None
         runner._restore_sparse_state_refs(SimpleNamespace(sparse_state_refs=refs))
         self.assertIs(controller.layer_batch_sparse_states[0].attn_score, refs[0]["attn_score"])
 
-        controller.config.decode_cuda_graph = False
+        controller.config.decode_graph = False
         self.assertFalse(controller._needs_attn_score(0, False, seqs))
 
     def test_pyramid_short_graph_uses_layer_trigger_and_graph_capacity(self):

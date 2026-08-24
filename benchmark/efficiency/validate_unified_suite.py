@@ -50,25 +50,25 @@ def _validate_omnikv_runtime_config(
             "resolved_config.json must record worker_info benchmark_config"
         )
         return
-    full_layers = benchmark_config.get("full_attn_layers")
+    full_layers = benchmark_config.get("full_attention_layers")
     obs_layers = benchmark_config.get("obs_layer_ids")
     effective_layers = _layer_ids(full_layers)
     requested = config.get("requested_runtime")
-    normalized = (
-        requested.get("normalized") if isinstance(requested, dict) else None
+    requested_config = (
+        requested.get("config") if isinstance(requested, dict) else None
     )
     requested_layers = _layer_ids(
-        normalized.get("full_attn_layers")
-        if isinstance(normalized, dict)
+        requested_config.get("full_attention_layers")
+        if isinstance(requested_config, dict)
         else None
     )
     if effective_layers is None or len(effective_layers) <= 1:
         errors.append(
-            f"invalid OmniKV full_attn_layers for {system}: {full_layers!r}"
+            f"invalid OmniKV full_attention_layers for {system}: {full_layers!r}"
         )
     if requested_layers is None:
         errors.append(
-            f"missing requested OmniKV full_attn_layers for {system}: "
+            f"missing requested OmniKV full_attention_layers for {system}: "
             f"{requested!r}"
         )
     elif effective_layers is not None and requested_layers != effective_layers:

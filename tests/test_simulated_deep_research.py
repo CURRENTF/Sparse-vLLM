@@ -115,8 +115,8 @@ class FakeService:
                     "benchmark_config": {
                         "gpu_memory_utilization": 0.9,
                         "prefill_schedule_policy": "all_chunked",
-                        "chunk_prefill_size": 8192,
-                        "decode_cuda_graph": True,
+                        "engine_prefill_chunk_size": 8192,
+                        "decode_graph": True,
                         "enable_prefix_caching": method == "omnikv",
                         "prefix_cache_block_size": (
                             self.prefix_cache_block_size
@@ -463,7 +463,7 @@ class SimulatedDeepResearchTest(unittest.TestCase):
                         ),
                         "code_revision": CODE_REVISION,
                         "benchmark_config": {
-                            "decode_cuda_graph": True,
+                            "decode_graph": True,
                             "enable_prefix_caching": main_worker,
                         },
                     }
@@ -536,7 +536,7 @@ class SimulatedDeepResearchTest(unittest.TestCase):
                         "prefix_cache_block_size": 2,
                         "code_revision": CODE_REVISION,
                         "benchmark_config": {
-                            "decode_cuda_graph": True,
+                            "decode_graph": True,
                             "enable_prefix_caching": True,
                         },
                     }

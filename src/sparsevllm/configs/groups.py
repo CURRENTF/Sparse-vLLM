@@ -24,32 +24,26 @@ class PrefixCacheConfig:
 class DecodeCudaGraphConfig:
     """Decode CUDA Graph capture and compatibility settings."""
 
-    decode_cuda_graph: bool = False
-    decode_cuda_graph_capture_sampling: bool = False
-    decode_cuda_graph_capture_sizes: str | int | list[int] | tuple[int, ...] | None = "auto"
-    decode_cuda_graph_context_sizes: str | int | list[int] | tuple[int, ...] | None = "auto"
-    decode_cuda_graph_context_sizes_auto: bool = field(default=False, init=False)
-    decode_cuda_graph_context_policy: str = "current"
-    decode_cuda_graph_max_cached_graphs: int | None = None
+    decode_graph: bool = False
+    decode_graph_capture_sampling: bool = False
+    decode_graph_capture_sizes: str | int | list[int] | tuple[int, ...] | None = "auto"
+    decode_graph_context_sizes: str | int | list[int] | tuple[int, ...] | None = "auto"
+    decode_graph_context_sizes_auto: bool = field(default=False, init=False)
+    decode_graph_context_policy: str = "current"
+    decode_graph_max_cached_graphs: int | None = None
     sparse_attn_score_dtype: str = "float32"
-
-    # Deprecated aliases retained for config-file and CLI compatibility.
-    decode_graph: bool | None = None
-    decode_graph_capture_sampling: bool | None = None
-    decode_graph_capture_sizes: str | int | list[int] | tuple[int, ...] | None = None
-
 
 @dataclass(kw_only=True)
 class SparseMethodConfig:
     """Shared and method-specific sparse-attention settings."""
 
-    vllm_sparse_method: str = ""
-    num_sink_tokens: int = 64
-    num_recent_tokens: int = 512
+    sparse_method: str = ""
+    sink_keep_tokens: int = 64
+    recent_keep_tokens: int = 512
     decode_keep_tokens: int = 4096
 
     obs_layer_ids: list[int] = field(default=None, init=False)
-    full_attn_layers: str | list[int] = "0"
+    full_attention_layers: str | list[int] = "0"
 
     quest_chunk_size: int = 16
     quest_token_budget: int = field(init=False)
@@ -103,15 +97,15 @@ class SparseMethodConfig:
 class DeltaKVConfig:
     """DeltaKV compressor, quantization, and kernel settings."""
 
-    deltakv_path: str | None = None
-    deltakv_k_neighbors: int = 4
-    cluster_ratio: float = 0.1
+    deltakv_checkpoint_path: str | None = None
+    deltakv_neighbor_count: int = 4
+    deltakv_center_ratio: float = 0.1
     cluster_metric: str = "l2"
     cluster_on_kv: bool = True
     use_compression: bool = True
-    kv_compressed_size: int = 128
-    kv_quant_bits: int = 4
-    kv_quant_group_size: int = 0
+    deltakv_latent_dim: int = 128
+    deltakv_latent_quant_bits: int = 4
+    deltakv_latent_quant_group_size: int = 0
     enable_sparse_ref_fp8: bool = False
 
     full_layer_kv_quant_bits: int = 0
@@ -155,4 +149,3 @@ class ObservabilityConfig:
     enable_profiler: bool = False
     validate_runtime_invariants: bool = False
     throughput_log_interval_s: float = 10.0
-    allow_unknown_config_keys: bool = False

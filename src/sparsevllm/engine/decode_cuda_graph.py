@@ -40,7 +40,7 @@ def _normalize_context_buckets(value) -> list[int]:
         buckets = [int(item) for item in value]
     buckets = sorted(set(buckets))
     if not buckets or any(bucket <= 0 for bucket in buckets):
-        raise ValueError(f"decode_cuda_graph_context_sizes must contain positive integers, got {buckets}.")
+        raise ValueError(f"decode_graph_context_sizes must contain positive integers, got {buckets}.")
     return buckets
 
 
@@ -102,7 +102,7 @@ class DecodeCudaGraphRunner:
         self.platform = platforms.current_platform
         self.capture_sizes = sorted(set(int(size) for size in capture_sizes))
         if not self.capture_sizes or any(size <= 0 for size in self.capture_sizes):
-            raise ValueError(f"decode_cuda_graph capture_sizes must be positive, got {capture_sizes}.")
+            raise ValueError(f"decode_graph capture_sizes must be positive, got {capture_sizes}.")
         self.context_sizes = _normalize_context_buckets(context_sizes)
         self.max_context_len_override: int | None = None
         self._graphs: OrderedDict[DecodeCudaGraphKey, DecodeCudaGraphState] = OrderedDict()
@@ -116,7 +116,7 @@ class DecodeCudaGraphRunner:
         self.force_eager_count = 0
 
     def _resolve_max_cached_graphs(self) -> int | None:
-        resolver = getattr(self.cache_manager, "decode_cuda_graph_max_cached_graphs", None)
+        resolver = getattr(self.cache_manager, "decode_graph_max_cached_graphs", None)
         if resolver is None:
             return None
         max_cached_graphs = resolver()
@@ -124,7 +124,7 @@ class DecodeCudaGraphRunner:
             return None
         max_cached_graphs = int(max_cached_graphs)
         if max_cached_graphs <= 0:
-            raise ValueError(f"decode_cuda_graph_max_cached_graphs must be positive, got {max_cached_graphs}.")
+            raise ValueError(f"decode_graph_max_cached_graphs must be positive, got {max_cached_graphs}.")
         return max_cached_graphs
 
     def set_max_context_len_override(self, max_context_len: int | None):
@@ -186,7 +186,7 @@ class DecodeCudaGraphRunner:
             if int(bucket) >= context_len:
                 return int(bucket)
         raise ValueError(
-            "decode_cuda_graph_context_sizes do not cover current context length: "
+            "decode_graph_context_sizes do not cover current context length: "
             f"context_len={context_len}, context_sizes={list(buckets)}."
         )
 
@@ -271,7 +271,7 @@ class DecodeCudaGraphRunner:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         prepare_decode_static = getattr(self.runtime_state, "prepare_decode_static", None)
         if prepare_decode_static is None:
-            raise TypeError("decode_cuda_graph requires runtime_state.prepare_decode_static().")
+            raise TypeError("decode_graph requires runtime_state.prepare_decode_static().")
 
         assert state.input_ids is not None
         assert state.positions is not None
@@ -314,14 +314,14 @@ class DecodeCudaGraphRunner:
         if custom is not None:
             return custom
         policy = str(
-            getattr(getattr(self.cache_manager, "config", None), "decode_cuda_graph_context_policy", "current")
+            getattr(getattr(self.cache_manager, "config", None), "decode_graph_context_policy", "current")
             or "current"
         ).strip().lower()
         if policy in {"requested", "request", "final"}:
             return self._requested_context_capacity(seqs), False
         if policy not in {"current", "cur", "now"}:
             raise ValueError(
-                "decode_cuda_graph_context_policy must be 'current' or 'requested', "
+                "decode_graph_context_policy must be 'current' or 'requested', "
                 f"got {policy!r}."
             )
         return self._current_context_capacity(seqs), False
@@ -331,14 +331,14 @@ class DecodeCudaGraphRunner:
             "batch_sizes": list(self.capture_sizes),
             "context_sizes": list(self.context_sizes),
             "context_policy": str(
-                getattr(getattr(self.cache_manager, "config", None), "decode_cuda_graph_context_policy", "current")
+                getattr(getattr(self.cache_manager, "config", None), "decode_graph_context_policy", "current")
                 or "current"
             ),
             "max_cached_graphs": self.max_cached_graphs,
         }
 
     def _cache_manager_graph_context_capacity(self, seqs: list[Sequence]) -> tuple[int, bool] | None:
-        resolver = getattr(self.cache_manager, "decode_cuda_graph_context_capacity", None)
+        resolver = getattr(self.cache_manager, "decode_graph_context_capacity", None)
         if resolver is None:
             return None
         result = resolver(
@@ -412,12 +412,12 @@ class DecodeCudaGraphRunner:
         ctx = get_context()
         ctx.sparse_controller = self.sparse_controller
 
-        with profiler.record("decode_cuda_graph_warmup"):
+        with profiler.record("decode_graph_warmup"):
             self.sparse_controller.prepare_forward(seqs, is_prefill=False)
             logits = self.run_model(input_ids, positions, is_prefill=False)
             if state.key.capture_sampling:
                 if logits is None:
-                    raise RuntimeError("decode_cuda_graph capture_sampling requires rank-0 logits.")
+                    raise RuntimeError("decode_graph capture_sampling requires rank-0 logits.")
                 _ = logits.argmax(dim=-1)
         self.platform.synchronize()
 
@@ -425,7 +425,7 @@ class DecodeCudaGraphRunner:
         # storage scope. Establish a fresh scope for capture.
         self.cache_manager.validate_decode_cuda_graph_slot_mappings()
 
-        with profiler.record("decode_cuda_graph_capture"):
+        with profiler.record("decode_graph_capture"):
             self.sparse_controller.prepare_forward(seqs, is_prefill=False)
             # Dynamic score paths can replace Python state fields during the
             # captured forward. Keep both input and post-forward refs alive;
@@ -438,12 +438,12 @@ class DecodeCudaGraphRunner:
                     logits = self.run_model(input_ids, positions, is_prefill=False)
                     if state.key.capture_sampling:
                         if logits is None:
-                            raise RuntimeError("decode_cuda_graph capture_sampling requires rank-0 logits.")
+                            raise RuntimeError("decode_graph capture_sampling requires rank-0 logits.")
                         token_ids = logits.argmax(dim=-1)
                     else:
                         token_ids = None
             except Exception as exc:
-                raise RuntimeError(f"decode_cuda_graph capture failed: {exc!r}") from exc
+                raise RuntimeError(f"decode_graph capture failed: {exc!r}") from exc
 
         state.graph = graph
         state.logits = logits
@@ -468,8 +468,8 @@ class DecodeCudaGraphRunner:
                 for value in refs.values():
                     if isinstance(value, torch.Tensor):
                         keepalive.append(value)
-        keepalive.extend(self.cache_manager.decode_cuda_graph_keepalive_tensors())
-        sparse_keepalive = getattr(self.sparse_controller, "decode_cuda_graph_keepalive_tensors", None)
+        keepalive.extend(self.cache_manager.decode_graph_keepalive_tensors())
+        sparse_keepalive = getattr(self.sparse_controller, "decode_graph_keepalive_tensors", None)
         if sparse_keepalive is not None:
             keepalive.extend(sparse_keepalive())
         state.keepalive = keepalive
@@ -483,20 +483,20 @@ class DecodeCudaGraphRunner:
         capture_sampling: bool = False,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         if not seqs:
-            raise ValueError("decode_cuda_graph requires a non-empty decode batch.")
+            raise ValueError("decode_graph requires a non-empty decode batch.")
         if capture_sampling and any(seq.temperature > 1e-10 for seq in seqs):
-            raise ValueError("decode_cuda_graph capture_sampling currently supports greedy decode only.")
+            raise ValueError("decode_graph capture_sampling currently supports greedy decode only.")
         if capture_sampling and any(
             float(getattr(seq, "presence_penalty", 0.0)) != 0.0
             or float(getattr(seq, "repetition_penalty", 1.0)) != 1.0
             for seq in seqs
         ):
             raise ValueError(
-                "decode_cuda_graph capture_sampling cannot apply sampling penalties."
+                "decode_graph capture_sampling cannot apply sampling penalties."
             )
 
         real_batch_size = len(seqs)
-        force_eager = getattr(self.cache_manager, "decode_cuda_graph_force_eager", None)
+        force_eager = getattr(self.cache_manager, "decode_graph_force_eager", None)
         if force_eager is not None and force_eager():
             self.force_eager_count += 1
             return self.run_eager_static(seqs), None
@@ -519,7 +519,7 @@ class DecodeCudaGraphRunner:
         if state.graph is None:
             state = self._capture(state, seqs, input_ids, positions)
             self._restore_sparse_state_refs(state)
-            with profiler.record("decode_cuda_graph_replay_after_capture"):
+            with profiler.record("decode_graph_replay_after_capture"):
                 state.graph.replay()
             self.replay_count += 1
             logits = state.logits[:real_batch_size] if state.logits is not None else None
@@ -527,7 +527,7 @@ class DecodeCudaGraphRunner:
             return logits, token_ids
 
         self._restore_sparse_state_refs(state)
-        with profiler.record("decode_cuda_graph_replay"):
+        with profiler.record("decode_graph_replay"):
             state.graph.replay()
         self.replay_count += 1
         logits = state.logits[:real_batch_size] if state.logits is not None else None

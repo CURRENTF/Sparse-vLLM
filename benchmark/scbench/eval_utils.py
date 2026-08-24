@@ -1583,7 +1583,7 @@ class GreedySearch_InfLLM(GreedySearch):
                         "GreedySearch_InfLLM(use_sinkcache=True), but this "
                         "transformers version does not provide it."
                     )
-                past_key_values = SinkCache(window_length=3968, num_sink_tokens=128)
+                past_key_values = SinkCache(window_length=3968, sink_keep_tokens=128)
             else:
                 past_key_values = self.model.prepare_inputs_for_generation(input_ids)[
                     "past_key_values"

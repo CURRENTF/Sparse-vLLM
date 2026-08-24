@@ -238,7 +238,7 @@ conda run -n <CONDA_ENV> --no-capture-output \
   --output_root <OUTPUT_ROOT>
 ```
 
-检查 `perf.jsonl` 中的 `decode_cuda_graph_expected=true` 和 `decode_cuda_graph_active=true`。
+检查 `perf.jsonl` 中的 `decode_graph_expected=true` 和 `decode_graph_active=true`。
 
 ### Stress
 

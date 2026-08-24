@@ -46,12 +46,12 @@ class LongBenchDeltaKVContractsTest(unittest.TestCase):
         args = self._omnikv_args(config)
         infer_config = longbench_pred._build_infer_config(args)
         requested = longbench_pred._requested_runtime_config(args, infer_config)
-        normalized_layers = requested["normalized"]["full_attn_layers"]
-        self.assertTrue(normalized_layers)
+        requested_layers = requested["config"]["full_attention_layers"]
+        self.assertTrue(requested_layers)
 
         runtime_info = {
             "sparse_method": "omnikv",
-            "full_attn_layers": normalized_layers,
+            "full_attention_layers": requested_layers,
         }
         generate_fn = SimpleNamespace(
             _sparsevllm_llm=SimpleNamespace(
@@ -73,8 +73,8 @@ class LongBenchDeltaKVContractsTest(unittest.TestCase):
         self.assertEqual(recorded["requested"], requested)
         self.assertEqual(recorded["effective_runtime"], runtime_info)
         self.assertEqual(
-            recorded["requested"]["normalized"]["full_attn_layers"],
-            recorded["effective_runtime"]["full_attn_layers"],
+            recorded["requested"]["config"]["full_attention_layers"],
+            recorded["effective_runtime"]["full_attention_layers"],
         )
 
     def test_chat_template_policy_matches_regular_prompt_paths(self):
@@ -167,9 +167,9 @@ class LongBenchDeltaKVContractsTest(unittest.TestCase):
         )
         generate_fn = SimpleNamespace(
             _sparsevllm_llm=SimpleNamespace(
-                config=SimpleNamespace(decode_cuda_graph=True),
+                config=SimpleNamespace(decode_graph=True),
                 model_runner=SimpleNamespace(
-                    decode_cuda_graph_runner=graph_runner,
+                    decode_graph_runner=graph_runner,
                 ),
             )
         )
@@ -180,7 +180,7 @@ class LongBenchDeltaKVContractsTest(unittest.TestCase):
                 out_root=tmp,
                 rank=2,
             )
-            path = Path(tmp) / "decode_cuda_graph_status_rank2.json"
+            path = Path(tmp) / "decode_graph_status_rank2.json"
 
             self.assertEqual(status["rank"], 2)
             self.assertTrue(status["configured"])
@@ -207,9 +207,9 @@ class LongBenchDeltaKVContractsTest(unittest.TestCase):
         )
         generate_fn = SimpleNamespace(
             _sparsevllm_llm=SimpleNamespace(
-                config=SimpleNamespace(decode_cuda_graph=True),
+                config=SimpleNamespace(decode_graph=True),
                 model_runner=SimpleNamespace(
-                    decode_cuda_graph_runner=graph_runner,
+                    decode_graph_runner=graph_runner,
                 ),
             )
         )

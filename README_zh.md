@@ -27,7 +27,7 @@ Sparse-vLLM 是一个从设计之初就以稀疏性为核心原则的推理框�
 
 ## 核心运行原则
 
-- 对外命令和 `LLM(...)` 关键字参数应使用 `sparse_method`；Sparse-vLLM 会在内部将其规范化为 `vllm_sparse_method`。
+- `LLM(...)`、`Config`、JSON 配置、benchmark manifest 与内部代码使用完全相同的 runtime 参数名。统一使用 `sparse_method`；旧字段 alias 不再接受。
 - 稀疏方法的运行时状态应放在 `src/sparsevllm/engine/cache_manager/` 中；`attention.py` 应保持通用。
 - 预填充调度由各方法自行定义并通过注册表管理。其唯一事实来源是 `src/sparsevllm/method_registry.py`，而不是基准测试脚本。
 - Sparse-vLLM 当前使用两种预填充策略：`all_chunked` 和特殊的 `long_bs1full_short_batch` 策略。

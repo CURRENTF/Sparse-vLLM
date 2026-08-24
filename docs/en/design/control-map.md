@@ -35,7 +35,7 @@ history is capacity-bounded and is not part of the physical KV payload.
 
 ```mermaid
 flowchart TD
-    A["LLM(..., **kwargs)"] --> B["normalize_runtime_params(..., backend='sparsevllm')"]
+    A["LLM(..., **kwargs)"] --> B["validate kwargs against Config fields"]
     B --> C["Config.__post_init__: validate model, method, graph, budgets"]
     C --> D["ModelRunner: load model, create CacheManager, SparseController"]
     C --> E["Scheduler: waiting/decode queues and admission"]
@@ -58,7 +58,7 @@ flowchart TD
 
 | Path | Role | Ownership rule |
 | --- | --- | --- |
-| `src/sparsevllm/config.py` | Runtime dataclass, validation, graph constraints, method-normalized defaults. | Public knob behavior must be mirrored in `docs/en/configuration/runtime-parameter-semantics.md`. |
+| `src/sparsevllm/configs/groups.py`, `runtime.py` | Canonical runtime fields, validation, graph constraints, and method-normalized defaults. | Public and internal field names must stay identical; mirror knob behavior in `docs/en/configuration/runtime-parameter-semantics.md`. |
 | `src/sparsevllm/method_registry.py` | Sparse method aliases and default prefill policy. | New method strings and policy defaults start here. |
 | `src/sparsevllm/engine/llm_engine.py` | Public engine lifecycle, tokenizer, scheduler loop, warmup, throughput logging. | Should not grow method-specific runtime logic. |
 | `src/sparsevllm/engine/scheduler.py` | Prefill execution-mode batching, decode long/short separation, prompt admission, preemption. | Uses cache-manager mode and budget hooks instead of knowing method internals. |
@@ -193,7 +193,7 @@ CUDA_VISIBLE_DEVICES=<GPU> PYTHONPATH=$PWD:$PWD/src python \
 These are control-restoring tasks, not urgent correctness fixes:
 
 1. Add an immutable `requested_sparse_method` or run-info field before
-   cache-manager creation mutates `config.vllm_sparse_method` for DeltaKV
+   cache-manager creation mutates `config.sparse_method` for DeltaKV
    variants. This would make logs and artifacts easier to interpret.
 2. Make RoPE ownership explicit in cache managers. The Qwen3 theta/dtype fixes
    show why cache managers need clear ownership of RoPE or related position

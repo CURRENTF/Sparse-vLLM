@@ -86,23 +86,23 @@ class DeltaKVCacheManager(CacheManager):
         super().__init__(config, parallel_context)
         assert self.tp_size == 1, "DeltaKVCacheManager currently does not support TP compressors"
 
-        self.full_attn_layers = config.full_attn_layers
-        if not isinstance(self.full_attn_layers, list) or not all(
-            isinstance(layer_idx, int) for layer_idx in self.full_attn_layers
+        self.full_attention_layers = config.full_attention_layers
+        if not isinstance(self.full_attention_layers, list) or not all(
+            isinstance(layer_idx, int) for layer_idx in self.full_attention_layers
         ):
-            raise ValueError("DeltaKV full_attn_layers must be a list of transformer layer indices.")
-        if not self.full_attn_layers:
-            raise ValueError("DeltaKV requires at least one configured full_attn_layers entry.")
+            raise ValueError("DeltaKV full_attention_layers must be a list of transformer layer indices.")
+        if not self.full_attention_layers:
+            raise ValueError("DeltaKV requires at least one configured full_attention_layers entry.")
         kv_layer_ids = list(self.kv_transformer_layer_indices())
         kv_layer_set = set(kv_layer_ids)
-        invalid_full_layers = sorted(set(self.full_attn_layers) - kv_layer_set)
+        invalid_full_layers = sorted(set(self.full_attention_layers) - kv_layer_set)
         if invalid_full_layers:
             raise ValueError(
-                "DeltaKV full_attn_layers must refer to full-attention KV layers only; "
+                "DeltaKV full_attention_layers must refer to full-attention KV layers only; "
                 f"invalid_or_linear_layers={invalid_full_layers} kv_layers={kv_layer_ids}."
             )
-        self.deltakv_layer_ids = [i for i in kv_layer_ids if i not in self.full_attn_layers]
-        self.full_layer_ids = [i for i in kv_layer_ids if i in self.full_attn_layers]
+        self.deltakv_layer_ids = [i for i in kv_layer_ids if i not in self.full_attention_layers]
+        self.full_layer_ids = [i for i in kv_layer_ids if i in self.full_attention_layers]
         self.deltakv_layer_to_idx = {l: i for i, l in enumerate(self.deltakv_layer_ids)}
         self.full_layer_to_idx = {l: i for i, l in enumerate(self.full_layer_ids)}
 
@@ -234,7 +234,7 @@ class DeltaKVCacheManager(CacheManager):
         config = getattr(self, "config", None)
         if config is None:
             return True
-        return bool(getattr(config, "decode_cuda_graph", False)) or (
+        return bool(getattr(config, "decode_graph", False)) or (
             self._is_stream_capturing()
         )
 
@@ -243,20 +243,20 @@ class DeltaKVCacheManager(CacheManager):
 
     def _max_decode_scratch_seqs(self) -> int:
         max_seqs = max(int(self.config.max_num_seqs_in_batch), int(self.config.max_decoding_seqs))
-        if bool(getattr(self.config, "decode_cuda_graph", False)):
-            capture_sizes = getattr(self.config, "decode_cuda_graph_capture_sizes", None) or []
+        if bool(getattr(self.config, "decode_graph", False)):
+            capture_sizes = getattr(self.config, "decode_graph_capture_sizes", None) or []
             if capture_sizes:
                 max_seqs = max(max_seqs, max(int(size) for size in capture_sizes))
         return max_seqs
 
     def _deltakv_full_prefill_recent_tokens(self) -> int:
-        return int(self.config.num_recent_tokens)
+        return int(self.config.recent_keep_tokens)
 
     def _deltakv_base_cluster_step(self) -> int:
-        cluster_ratio = float(self.config.cluster_ratio or 0.0)
-        if cluster_ratio <= 0.0:
-            raise ValueError(f"DeltaKV cluster_ratio must be > 0, got {cluster_ratio}.")
-        return max(1, int(1.0 / max(1e-6, cluster_ratio)))
+        deltakv_center_ratio = float(self.config.deltakv_center_ratio or 0.0)
+        if deltakv_center_ratio <= 0.0:
+            raise ValueError(f"DeltaKV deltakv_center_ratio must be > 0, got {deltakv_center_ratio}.")
+        return max(1, int(1.0 / max(1e-6, deltakv_center_ratio)))
 
     @staticmethod
     def _deltakv_center_positions_cpu(
@@ -432,9 +432,9 @@ class DeltaKVCacheManager(CacheManager):
         )
 
     def _deltakv_latent_payload_dim(self) -> int:
-        payload_dim = int(getattr(self.config, "kv_compressed_size", 0) or 0)
+        payload_dim = int(getattr(self.config, "deltakv_latent_dim", 0) or 0)
         if payload_dim <= 0:
-            raise ValueError(f"DeltaKV kv_compressed_size must be positive, got {payload_dim}.")
+            raise ValueError(f"DeltaKV deltakv_latent_dim must be positive, got {payload_dim}.")
         return payload_dim
 
     def _store_deltakv_latent(self, l_idx: int, latent_slots: torch.Tensor, latent: torch.Tensor):
@@ -493,11 +493,11 @@ class DeltaKVCacheManager(CacheManager):
         # - a bounded full-KV pool: centers + uncompressed buffer (+ current chunk) + reconstructed top tokens.
         latent_payload_dim = self._deltakv_latent_payload_dim()
         latent_bytes = latent_payload_dim * dtype_size
-        cluster_ratio = max(0.0, float(config.cluster_ratio))
+        deltakv_center_ratio = max(0.0, float(config.deltakv_center_ratio))
 
         per_token_bytes = (
             num_full_layers * slot_bytes_per_layer
-            + num_deltakv_layers * (cluster_ratio * slot_bytes_per_layer + latent_bytes)
+            + num_deltakv_layers * (deltakv_center_ratio * slot_bytes_per_layer + latent_bytes)
         )
         if per_token_bytes <= 0:
             raise ValueError("Invalid KV cache allocation configuration.")
@@ -521,12 +521,12 @@ class DeltaKVCacheManager(CacheManager):
         if bytes_left <= 0:
             raise RuntimeError(
                 "Not enough GPU memory left for DeltaKV full-KV pool after allocating full layers + latent cache. "
-                "Try reducing max_model_len / gpu_memory_utilization / kv_compressed_size."
+                "Try reducing max_model_len / gpu_memory_utilization / deltakv_latent_dim."
             )
         max_deltakv_full_slots = max(1, int(bytes_left // (num_deltakv_layers * slot_bytes_per_layer)))
 
-        sink = int(config.num_sink_tokens)
-        recent = int(config.num_recent_tokens)
+        sink = int(config.sink_keep_tokens)
+        recent = int(config.recent_keep_tokens)
         # Sparse full-KV pool must cover:
         # - per-seq resident tokens: sink + (<=2*recent) uncompressed buffer
         # - current prefill step's chunk tokens across the whole batch
@@ -543,19 +543,19 @@ class DeltaKVCacheManager(CacheManager):
         # when chunks are full; cap by max_seqs to avoid over-estimation.
         max_prefill_seqs_by_tokens = max(
             1,
-            int(config.max_num_batched_tokens) // int(config.chunk_prefill_size),
+            int(config.max_num_batched_tokens) // int(config.engine_prefill_chunk_size),
         )
         max_prefill_seqs = min(max_admission_seqs, max_prefill_seqs_by_tokens)
         total_top_slots = max(max_seqs * top_tokens, max_prefill_seqs * top_tokens)
-        max_step_chunk = int(min(int(config.max_num_batched_tokens), max_prefill_seqs * int(config.chunk_prefill_size)))
+        max_step_chunk = int(min(int(config.max_num_batched_tokens), max_prefill_seqs * int(config.engine_prefill_chunk_size)))
         overhead_slots = max_admission_seqs * (sink + 2 * recent) + total_top_slots + max_step_chunk
         if max_deltakv_full_slots <= overhead_slots:
             raise RuntimeError(
                 f"DeltaKV full-KV pool too small: max={max_deltakv_full_slots}, required>={overhead_slots + 1}. "
-                "Reduce chunk_prefill_size/decode_keep_tokens/num_recent_tokens or increase gpu_memory_utilization."
+                "Reduce engine_prefill_chunk_size/decode_keep_tokens/recent_keep_tokens or increase gpu_memory_utilization."
             )
 
-        desired_centers = max(1, int(cluster_ratio * self.full_num_slots * 1.5))
+        desired_centers = max(1, int(deltakv_center_ratio * self.full_num_slots * 1.5))
         centers_capacity = min(desired_centers, max_deltakv_full_slots - overhead_slots)
         self.deltakv_full_num_slots = overhead_slots + centers_capacity
         self._deltakv_centers_capacity = int(centers_capacity)
@@ -616,7 +616,7 @@ class DeltaKVCacheManager(CacheManager):
             device=self.device,
         )
         self.deltakv_latent_to_full_slots = torch.full(
-            (num_deltakv_layers, self.deltakv_latent_num_slots, config.deltakv_k_neighbors),
+            (num_deltakv_layers, self.deltakv_latent_num_slots, config.deltakv_neighbor_count),
             -1,
             dtype=torch.int32,
             device=self.device,
@@ -629,7 +629,7 @@ class DeltaKVCacheManager(CacheManager):
         )
 
     def get_layer_batch_states(self, layer_idx: int) -> LayerBatchStates:
-        if layer_idx in self.full_attn_layers:
+        if layer_idx in self.full_attention_layers:
             return self.full_layer_batch_states
         else:
             return self.deltakv_layer_batch_states
@@ -1075,7 +1075,7 @@ class DeltaKVCacheManager(CacheManager):
             return 0
         return super().prefill_step_reservation_cost(seq, scheduled_tokens)
 
-    def reserved_prefill_slots(self, waiting_seqs: deque[Sequence], chunk_prefill_size: int) -> int:
+    def reserved_prefill_slots(self, waiting_seqs: deque[Sequence], engine_prefill_chunk_size: int) -> int:
         # DeltaKV can evict sparse-layer KV during long prefill; reserving the entire remaining
         # prompt is overly conservative and causes decode thrashing. Reserve at most one chunk
         # per in-progress prefill sequence.
@@ -1083,7 +1083,7 @@ class DeltaKVCacheManager(CacheManager):
         for seq in waiting_seqs:
             if 0 < seq.num_prefilled_tokens < seq.num_prompt_tokens:
                 remaining = int(seq.num_prompt_tokens - seq.num_prefilled_tokens)
-                reserved += min(remaining, int(chunk_prefill_size))
+                reserved += min(remaining, int(engine_prefill_chunk_size))
         return reserved
 
     def prompt_admission_free_slots(self) -> int:
@@ -1105,12 +1105,12 @@ class DeltaKVCacheManager(CacheManager):
     def prompt_admission_budgets(
         self,
         waiting_seqs: deque[Sequence],
-        chunk_prefill_size: int,
+        engine_prefill_chunk_size: int,
     ) -> dict[str, int]:
         # Gate on full-attention pool, future centers, and the sparse raw pool's
         # final keep-position representation. Decode-reconstruction scratch slots
         # live in the same sparse raw pool, so admission must not spend them.
-        reserved = int(self.reserved_prefill_slots(waiting_seqs, chunk_prefill_size))
+        reserved = int(self.reserved_prefill_slots(waiting_seqs, engine_prefill_chunk_size))
         centers_free = max(0, int(self._deltakv_centers_capacity) - int(self._deltakv_centers_reserved_total))
         temp_reserve = self._deltakv_unallocated_temp_full_reserve()
         raw_free = max(0, int(self._num_free_slots_deltakv_full) - temp_reserve - reserved)
@@ -1124,7 +1124,7 @@ class DeltaKVCacheManager(CacheManager):
     def _deltakv_plan_for_total_len_cpu(self, total_len: int) -> DeltaKVFullPrefillPlanCPU:
         return self._deltakv_full_prefill_plan_cpu(
             int(total_len),
-            sink=int(self.config.num_sink_tokens),
+            sink=int(self.config.sink_keep_tokens),
             recent=self._deltakv_full_prefill_recent_tokens(),
             cluster_step=self._deltakv_base_cluster_step(),
         )
@@ -1327,7 +1327,7 @@ class DeltaKVCacheManager(CacheManager):
             for item in value:
                 DeltaKVCacheManager._append_tensor_refs(out, item)
 
-    def decode_cuda_graph_keepalive_tensors(self) -> list[torch.Tensor]:
+    def decode_graph_keepalive_tensors(self) -> list[torch.Tensor]:
         refs: list[torch.Tensor] = []
         for attr_name in (
             "_deltakv_decode_static_slot_mapping",
@@ -1629,7 +1629,7 @@ class DeltaKVCacheManager(CacheManager):
             )
         plan_cpu = self._deltakv_full_prefill_plan_cpu(
             total_len,
-            sink=int(self.config.num_sink_tokens),
+            sink=int(self.config.sink_keep_tokens),
             recent=self._deltakv_full_prefill_recent_tokens(),
             cluster_step=self._deltakv_base_cluster_step(),
         )
@@ -2246,7 +2246,7 @@ class DeltaKVCacheManager(CacheManager):
         """
         assert kv_states.dim() == 3 and kv_states.shape[0] == 1
         _, n, kv_dim = kv_states.shape
-        k_neighbors = int(self.config.deltakv_k_neighbors)
+        k_neighbors = int(self.config.deltakv_neighbor_count)
 
         # Existing centers are always visible (from earlier blocks). New centers come from this block.
         with profiler.record("deltakv_cluster_existing_centers"):
@@ -2313,8 +2313,8 @@ class DeltaKVCacheManager(CacheManager):
     def _deltakv_evict_impl(self, seqs: list[Sequence]):
         if not self.deltakv_layer_ids:
             return
-        sink = int(self.config.num_sink_tokens)
-        recent = int(self.config.num_recent_tokens)
+        sink = int(self.config.sink_keep_tokens)
+        recent = int(self.config.recent_keep_tokens)
         cluster_step = self._deltakv_base_cluster_step()
 
         # Compress per sequence (long-text batches are typically small).
@@ -2716,7 +2716,7 @@ class DeltaKVCacheManager(CacheManager):
         return buffers
 
     def _deltakv_decode_static_max_buffer(self) -> int:
-        recent = int(self.config.num_recent_tokens)
+        recent = int(self.config.recent_keep_tokens)
         # Decode runs before post-forward eviction. DeltaKV evicts raw tail
         # tokens in recent-sized chunks, so the visible uncompressed tail can
         # include one recent window plus the next remainder/current token.
@@ -2745,7 +2745,7 @@ class DeltaKVCacheManager(CacheManager):
         context_lens = context_lens[:bsz].to(torch.int32)
         compressed_lens = self.get_compressed_lens(req_indices).to(torch.int32)
 
-        sink = int(self.config.num_sink_tokens)
+        sink = int(self.config.sink_keep_tokens)
         max_buffer = self._deltakv_decode_static_max_buffer()
         max_s = sink + k_max + max_buffer
         temp_slots = self._ensure_decode_static_temp_slots(bsz, k_max)
@@ -2857,7 +2857,7 @@ class DeltaKVCacheManager(CacheManager):
             return torch.empty((0, 0), device=self.device, dtype=torch.int32), empty0, empty0, empty0, empty0, empty0, empty0
 
         local_req = torch.arange(bsz, device=self.device, dtype=torch.int32)
-        sink = int(self.config.num_sink_tokens)
+        sink = int(self.config.sink_keep_tokens)
 
         with profiler.record("deltakv_build_view_read_lens"):
             req_indices_cpu = req_indices.cpu().numpy()
@@ -3134,8 +3134,8 @@ class DeltaKVCacheTritonManagerV4(DeltaKVCacheManager):
         with profiler.record("deltakv_evict_triton_total"):
             if not self.deltakv_layer_ids:
                 return
-            sink = int(self.config.num_sink_tokens)
-            recent = int(self.config.num_recent_tokens)
+            sink = int(self.config.sink_keep_tokens)
+            recent = int(self.config.recent_keep_tokens)
             cluster_step = self._deltakv_base_cluster_step()
 
             for seq in seqs:
@@ -3291,7 +3291,7 @@ class DeltaKVCacheTritonManagerV4(DeltaKVCacheManager):
 
         assert kv_states.dim() == 3 and kv_states.shape[0] == 1
         _, n, kv_dim = kv_states.shape
-        k_neighbors = int(self.config.deltakv_k_neighbors)
+        k_neighbors = int(self.config.deltakv_neighbor_count)
         cluster_step = max(1, int(cluster_step))
         is_capturing = self._is_stream_capturing()
 

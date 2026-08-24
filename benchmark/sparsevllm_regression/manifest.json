@@ -333,7 +333,7 @@
     "lengths": [32000, 64000],
     "batch_sizes": [4, 8],
     "output_len": 256,
-    "decode_cuda_graph": true
+    "decode_graph": true
   },
   "stress": {
     "length": 16000,
@@ -363,15 +363,15 @@
     "tensor_parallel_size": 1,
     "max_active_requests": 8,
     "max_num_batched_tokens": 8192,
-    "chunk_prefill_size": 4096,
+    "engine_prefill_chunk_size": 4096,
     "max_model_len_margin": 64,
     "prefix_cache_block_size": 16,
     "prefix_cache_salt": "stress-v2-regression",
     "prefix_cache_max_blocks": null,
     "quest_chunk_size": 16,
-    "num_sink_tokens": 8,
-    "num_recent_tokens": 256,
-    "num_top_tokens": 2048,
+    "sink_keep_tokens": 8,
+    "recent_keep_tokens": 256,
+    "decode_keep_tokens": 2048,
     "require_omnikv_prefill_path": true,
     "min_performance_prompt_len": 8192,
     "min_cacheable_prefix_len": 8192,

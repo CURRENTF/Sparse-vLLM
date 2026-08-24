@@ -4,8 +4,8 @@ Sparse-vLLM will support tensor-parallel decode CUDA graphs by having every TP r
 
 v1 is single-node TP only and supports `vanilla`, `streamingllm`, `snapkv`, `h2o`, `pyramidkv`, `omnikv`, `quest`, `rkv`, and `skipkv`. DeltaKV is excluded from v1. Sparse-method support means graph-on equivalence to the same tensor-parallel static/eager path under TP-local sparse selection, not equivalence to TP=1 or global-head sparse selection.
 
-Sparse methods use TP-local sparse selection: every rank selects important tokens from its own local heads or KV heads, without cross-rank sparse-index aggregation. The runtime warns when `decode_cuda_graph=True` and `tensor_parallel_size > 1` because this is not guaranteed algorithmically equivalent to TP=1 or global-head sparse selection.
+Sparse methods use TP-local sparse selection: every rank selects important tokens from its own local heads or KV heads, without cross-rank sparse-index aggregation. The runtime warns when `decode_graph=True` and `tensor_parallel_size > 1` because this is not guaranteed algorithmically equivalent to TP=1 or global-head sparse selection.
 
-TP decode CUDA graph disables `decode_cuda_graph_capture_sampling`. TP workers do not materialize rank-0 gathered logits from `ParallelLMHead`, so sampling remains outside graph capture in TP.
+TP decode CUDA graph disables `decode_graph_capture_sampling`. TP workers do not materialize rank-0 gathered logits from `ParallelLMHead`, so sampling remains outside graph capture in TP.
 
-Regression validation should use the regression suite quality and perf layers with `tensor_parallel_size=2`. Quality compares v1 sparse methods against TP vanilla in the same run and treats D grades or crashes as failures. Perf must record `decode_cuda_graph_expected=true` and `decode_cuda_graph_active=true`; v1 enablement records sparse-vs-vanilla throughput but does not require every sparse method to beat vanilla.
+Regression validation should use the regression suite quality and perf layers with `tensor_parallel_size=2`. Quality compares v1 sparse methods against TP vanilla in the same run and treats D grades or crashes as failures. Perf must record `decode_graph_expected=true` and `decode_graph_active=true`; v1 enablement records sparse-vs-vanilla throughput but does not require every sparse method to beat vanilla.

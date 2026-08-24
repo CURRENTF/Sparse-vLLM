@@ -116,7 +116,7 @@ def test_gemma4_flashinfer_prefill_caches_alternating_attention_contracts():
 
 def test_gemma4_runtime_spec_counts_alternating_attention_contracts():
     config = _config()
-    engine_config = SimpleNamespace(decode_cuda_graph=False)
+    engine_config = SimpleNamespace(decode_graph=False)
     captured = {}
 
     def resolve(spec, *, device_index):
@@ -176,7 +176,7 @@ def test_gemma4_runtime_closes_operator_if_router_prepare_fails():
     ):
         Gemma4ForCausalLM.build_runtime_kwargs(
             config,
-            engine_config=SimpleNamespace(decode_cuda_graph=False),
+            engine_config=SimpleNamespace(decode_graph=False),
             parallel_context=_parallel_context(),
             device=torch.device("cuda", 0),
         )
@@ -578,7 +578,7 @@ def test_gemma4_shared_kv_rejects_per_layer_streaming_eviction():
             model_type="gemma4_text",
             num_kv_shared_layers=18,
         ),
-        vllm_sparse_method="streamingllm",
+        sparse_method="streamingllm",
     )
     with pytest.raises(NotImplementedError, match="KV-sharing"):
         normalize_sparse_methods(config)

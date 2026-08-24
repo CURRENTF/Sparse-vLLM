@@ -65,7 +65,7 @@ def test_method_runtime_config_enables_prefix_cache_and_aligns_quest_blocks():
         prefix_cache_salt="unit",
     )
     assert vanilla_cfg["enable_prefix_caching"] is True
-    assert vanilla_cfg["decode_cuda_graph"] is False
+    assert vanilla_cfg["decode_graph"] is False
     assert vanilla_cfg["max_num_seqs_in_batch"] == 4
     assert vanilla_cfg["gpu_memory_utilization"] == 0.5
     assert vanilla_cfg["prefix_cache_block_size"] == 16
@@ -111,11 +111,11 @@ def test_method_runtime_config_enables_prefix_cache_and_aligns_quest_blocks():
         gpu_memory_utilization=0.5,
         scbench_max_steps=123,
         prefix_cache_salt="unit",
-        decode_cuda_graph=True,
+        decode_graph=True,
     )
     assert graph_cfg["enable_prefix_caching"] is True
-    assert graph_cfg["decode_cuda_graph"] is True
-    assert graph_cfg["decode_cuda_graph_capture_sampling"] is False
+    assert graph_cfg["decode_graph"] is True
+    assert graph_cfg["decode_graph_capture_sampling"] is False
 
 
 def test_build_turn_specs_reuses_multiturn_history_prefix():

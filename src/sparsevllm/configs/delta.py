@@ -65,12 +65,12 @@ def _normalize_deltakv_quantization(config) -> None:
     _normalize_float_attr(config, "full_layer_cluster_ratio", fallback=0.0)
     if config.full_layer_cluster_ratio < 0.0:
         raise ValueError(f"full_layer_cluster_ratio must be >= 0, got {config.full_layer_cluster_ratio}.")
-    _normalize_int_attr(config, "kv_quant_bits", fallback=0)
-    if config.kv_quant_bits not in (0, 2, 4):
-        raise ValueError(f"kv_quant_bits must be 0, 2, or 4, got {config.kv_quant_bits}.")
-    _normalize_int_attr(config, "kv_quant_group_size", fallback=0)
-    if config.kv_quant_group_size < 0:
-        raise ValueError(f"kv_quant_group_size must be >= 0, got {config.kv_quant_group_size}.")
+    _normalize_int_attr(config, "deltakv_latent_quant_bits", fallback=0)
+    if config.deltakv_latent_quant_bits not in (0, 2, 4):
+        raise ValueError(f"deltakv_latent_quant_bits must be 0, 2, or 4, got {config.deltakv_latent_quant_bits}.")
+    _normalize_int_attr(config, "deltakv_latent_quant_group_size", fallback=0)
+    if config.deltakv_latent_quant_group_size < 0:
+        raise ValueError(f"deltakv_latent_quant_group_size must be >= 0, got {config.deltakv_latent_quant_group_size}.")
 
 
 def _normalize_full_layer_kivi(config) -> None:
@@ -165,7 +165,7 @@ def validate_deltakv_runtime(config) -> None:
         v = str(v).strip().lower()
         setattr(config, attr, v if v else "auto")
 
-    if config.vllm_sparse_method == "deltakv":
+    if config.sparse_method == "deltakv":
         log_once(
             "DeltaKV support in Sparse-vLLM is still experimental and not fully mature; "
             "verify results carefully before treating them as final.",
@@ -173,34 +173,34 @@ def validate_deltakv_runtime(config) -> None:
         )
         checkpoint_model_types = config.model_spec.deltakv_checkpoint_model_types
         if checkpoint_model_types and not _checkpoint_targets_model(
-            config.deltakv_path,
+            config.deltakv_checkpoint_path,
             checkpoint_model_types,
         ):
             raise ValueError(
                 f"DeltaKV for {config.model_spec.name} requires a compatible "
-                "deltakv_path. Use vllm_sparse_method='' to run vanilla inference."
+                "deltakv_checkpoint_path. Use sparse_method='' to run vanilla inference."
             )
         if not bool(getattr(config, "use_compression", True)):
             raise ValueError("DeltaKV runtime is compressor-only; set use_compression=True.")
         if bool(getattr(config, "enable_sparse_ref_fp8", False)):
             raise ValueError("enable_sparse_ref_fp8 was removed from the slim DeltaKV runtime.")
-        if config.deltakv_path is None and not config.allow_missing_deltakv_path:
+        if config.deltakv_checkpoint_path is None and not config.allow_missing_deltakv_path:
             raise ValueError(
-                "DeltaKV requires deltakv_path for compressor sparse layers. "
+                "DeltaKV requires deltakv_checkpoint_path for compressor sparse layers. "
                 "Set allow_missing_deltakv_path=True only for construction-only tests."
             )
-        if config.kv_quant_bits not in (0, 4):
+        if config.deltakv_latent_quant_bits not in (0, 4):
             raise ValueError(
                 "DeltaKV slim runtime supports sparse compressor residual bits 0 or 4 only, "
-                f"got kv_quant_bits={config.kv_quant_bits}."
+                f"got deltakv_latent_quant_bits={config.deltakv_latent_quant_bits}."
             )
         if config.full_layer_kv_quant_bits not in (0, 4):
             raise ValueError(
                 "DeltaKV slim runtime supports full-layer storage bits 0 or 4 only, "
                 f"got full_layer_kv_quant_bits={config.full_layer_kv_quant_bits}."
             )
-        if config.kv_quant_bits == 4 and config.kv_quant_group_size == 0:
-            config.kv_quant_group_size = 32
+        if config.deltakv_latent_quant_bits == 4 and config.deltakv_latent_quant_group_size == 0:
+            config.deltakv_latent_quant_group_size = 32
         _normalize_positive_multiple(
             config,
             "deltakv_triton_materialize_block_tokens",
@@ -211,14 +211,14 @@ def validate_deltakv_runtime(config) -> None:
             config.deltakv_sparse_decode_backend
         )
         is_bf16_full_compressor_sparse = (
-            config.full_layer_kv_quant_bits == 0 and config.kv_quant_bits == 0
+            config.full_layer_kv_quant_bits == 0 and config.deltakv_latent_quant_bits == 0
         )
         is_bf16_full_int4_compressor_sparse = (
-            config.full_layer_kv_quant_bits == 0 and config.kv_quant_bits == 4
+            config.full_layer_kv_quant_bits == 0 and config.deltakv_latent_quant_bits == 4
         )
         is_kivi4_full_int4_compressor_sparse = (
             config.full_layer_kv_quant_bits == 4
-            and config.kv_quant_bits == 4
+            and config.deltakv_latent_quant_bits == 4
             and bool(getattr(config, "enable_full_layer_kivi_quant", True))
         )
         if not (
@@ -228,7 +228,7 @@ def validate_deltakv_runtime(config) -> None:
         ):
             raise ValueError(
                 "DeltaKV slim runtime supports exactly three paths: "
-                "(full_layer_kv_quant_bits=0, kv_quant_bits=0) and "
-                "(full_layer_kv_quant_bits=0, kv_quant_bits=4) and "
-                "(full_layer_kv_quant_bits=4, kv_quant_bits=4, enable_full_layer_kivi_quant=True)."
+                "(full_layer_kv_quant_bits=0, deltakv_latent_quant_bits=0) and "
+                "(full_layer_kv_quant_bits=0, deltakv_latent_quant_bits=4) and "
+                "(full_layer_kv_quant_bits=4, deltakv_latent_quant_bits=4, enable_full_layer_kivi_quant=True)."
             )

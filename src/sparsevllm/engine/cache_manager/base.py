@@ -328,9 +328,9 @@ class CacheManager(ABC):
 
     @staticmethod
     def create(config: Config, parallel_context: ParallelContext) -> "CacheManager":
-        sparse_method = normalize_sparse_method(config.vllm_sparse_method)
+        sparse_method = normalize_sparse_method(config.sparse_method)
         if sparse_method not in SUPPORTED_SPARSE_METHODS:
-            raise ValueError(f"Unsupported vllm_sparse_method={sparse_method!r}.")
+            raise ValueError(f"Unsupported sparse_method={sparse_method!r}.")
         if sparse_method == "deltakv":
             from .deltakv_runtime import DeltaKVCacheManager
 
@@ -392,18 +392,18 @@ class CacheManager(ABC):
                 "Estimated prefill token capacity must be positive: "
                 f"estimated_max_tokens={estimated_max_tokens}."
             )
-        chunk_prefill_size = int(config.chunk_prefill_size)
+        engine_prefill_chunk_size = int(config.engine_prefill_chunk_size)
         long_prefill_offload_threshold = int(
-            getattr(config, "long_prefill_offload_threshold", chunk_prefill_size)
+            getattr(config, "long_prefill_offload_threshold", engine_prefill_chunk_size)
         )
         if (
             prefill_policy == "long_bs1full_short_batch"
-            and not 0 < chunk_prefill_size <= long_prefill_offload_threshold
+            and not 0 < engine_prefill_chunk_size <= long_prefill_offload_threshold
         ):
             raise ValueError(
-                "long_bs1full_short_batch requires 0 < chunk_prefill_size <= "
+                "long_bs1full_short_batch requires 0 < engine_prefill_chunk_size <= "
                 "long_prefill_offload_threshold after normalization: "
-                f"chunk_prefill_size={chunk_prefill_size}, "
+                f"engine_prefill_chunk_size={engine_prefill_chunk_size}, "
                 f"long_prefill_offload_threshold={long_prefill_offload_threshold}."
             )
         if (
@@ -425,13 +425,13 @@ class CacheManager(ABC):
             else:
                 logger.warning(
                     "{}; capping long_prefill_offload_threshold to {} and "
-                    "chunk_prefill_size to at most that value to avoid OOM.",
+                    "engine_prefill_chunk_size to at most that value to avoid OOM.",
                     msg,
                     estimated_max_tokens,
                 )
                 config.long_prefill_offload_threshold = estimated_max_tokens
-                config.chunk_prefill_size = min(
-                    int(config.chunk_prefill_size),
+                config.engine_prefill_chunk_size = min(
+                    int(config.engine_prefill_chunk_size),
                     estimated_max_tokens,
                 )
 
@@ -1011,7 +1011,7 @@ class CacheManager(ABC):
         del layer_idx, temp_slots
         return None
 
-    def decode_cuda_graph_keepalive_tensors(self) -> list[torch.Tensor]:
+    def decode_graph_keepalive_tensors(self) -> list[torch.Tensor]:
         """Cache-manager-owned tensors captured by decode CUDA graphs."""
         return []
 
@@ -1042,12 +1042,12 @@ class CacheManager(ABC):
         with profiler.record("cache_validate_decode_slot_mappings"):
             storage.validate_slot_mappings(tuple(slot_mappings))
 
-    def decode_cuda_graph_max_cached_graphs(self) -> int | None:
+    def decode_graph_max_cached_graphs(self) -> int | None:
         """Optional bound for captured decode graph states.
 
         Applies to every sparse method; individual managers may still override it.
         """
-        value = getattr(self.config, "decode_cuda_graph_max_cached_graphs", None)
+        value = getattr(self.config, "decode_graph_max_cached_graphs", None)
         return None if value is None else int(value)
 
     def select_decode_cuda_graph_batch_size(
@@ -1062,7 +1062,7 @@ class CacheManager(ABC):
         del real_batch_size, capture_sizes
         return None
 
-    def decode_cuda_graph_context_capacity(
+    def decode_graph_context_capacity(
         self,
         seqs: list[Sequence],
         *,
@@ -1077,7 +1077,7 @@ class CacheManager(ABC):
         del seqs, requested_context_capacity, current_context_capacity
         return None
 
-    def decode_cuda_graph_force_eager(self) -> bool:
+    def decode_graph_force_eager(self) -> bool:
         """Whether this method should bypass graph replay for diagnostics."""
         return False
 
@@ -1288,7 +1288,7 @@ class CacheManager(ABC):
         del seq
         return None
 
-    def reserved_prefill_slots(self, waiting_seqs: deque[Sequence], chunk_prefill_size: int) -> int:
+    def reserved_prefill_slots(self, waiting_seqs: deque[Sequence], engine_prefill_chunk_size: int) -> int:
         """Persistent slots reserved by waiting/running prefills.
 
         This must not include temporary staging KV or decode reconstruction scratch.
@@ -1377,7 +1377,7 @@ class CacheManager(ABC):
     def prompt_admission_budgets(
         self,
         waiting_seqs: deque[Sequence],
-        chunk_prefill_size: int,
+        engine_prefill_chunk_size: int,
     ) -> dict[str, int]:
         """Return admission budgets used by Scheduler for new prompts.
 
@@ -1385,7 +1385,7 @@ class CacheManager(ABC):
         budget that gates new-prompt admission. This keeps the first budget
         check aligned with the later logical reservation accounting.
         """
-        reserved = int(self.reserved_prefill_slots(waiting_seqs, chunk_prefill_size))
+        reserved = int(self.reserved_prefill_slots(waiting_seqs, engine_prefill_chunk_size))
         free_slots = int(self.prompt_admission_free_slots())
         return {"slots": max(0, free_slots - reserved)}
 

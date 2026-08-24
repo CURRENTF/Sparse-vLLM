@@ -60,12 +60,12 @@ class QuantizationHelperTests(unittest.TestCase):
                 "torch_dtype": "fp16",
                 "bnb_4bit_compute_dtype": "bf16",
                 "quant_skip_modules": ["custom_head"],
-                "chunk_prefill_size": 4096,
+                "engine_prefill_chunk_size": 4096,
             },
             default_torch_dtype=torch.bfloat16,
         )
 
-        self.assertEqual(runtime_cfg, {"chunk_prefill_size": 4096})
+        self.assertEqual(runtime_cfg, {"engine_prefill_chunk_size": 4096})
         self.assertEqual(target_dtype, torch.float16)
         self.assertIn("quantization_config", load_kwargs)
         quant_cfg = load_kwargs["quantization_config"]
@@ -78,12 +78,12 @@ class QuantizationHelperTests(unittest.TestCase):
         runtime_cfg, load_kwargs, target_dtype = build_model_load_kwargs(
             {
                 "load_in_4bit": True,
-                "chunk_prefill_size": 204800000,
+                "engine_prefill_chunk_size": 204800000,
             },
             default_torch_dtype=torch.bfloat16,
         )
 
-        self.assertEqual(runtime_cfg["chunk_prefill_size"], 204800000)
+        self.assertEqual(runtime_cfg["engine_prefill_chunk_size"], 204800000)
         self.assertIn("quantization_config", load_kwargs)
         self.assertEqual(target_dtype, torch.bfloat16)
 

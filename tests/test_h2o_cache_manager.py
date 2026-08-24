@@ -51,7 +51,7 @@ def _manager_with_layer_rows(
     decode_budget=4,
     decode_eviction_interval=3,
     prefill_budget=8,
-    chunk_prefill_size=4,
+    engine_prefill_chunk_size=4,
     validate_runtime_invariants=False,
 ):
     if not lengths_by_layer:
@@ -66,7 +66,7 @@ def _manager_with_layer_rows(
     manager.num_kv_layers = len(lengths_by_layer)
     manager.runtime_layout = _layout(manager.num_layers)
     manager.config = SimpleNamespace(
-        vllm_sparse_method="h2o",
+        sparse_method="h2o",
         h2o_decode_budget=decode_budget,
         h2o_decode_eviction_interval=decode_eviction_interval,
         h2o_prefill_budget=prefill_budget,
@@ -79,7 +79,7 @@ def _manager_with_layer_rows(
         snapkv_num_full_layers=0,
         pyramid_layer_ratios=None,
         prefill_schedule_policy=PREFILL_POLICY_ALL_CHUNKED,
-        chunk_prefill_size=chunk_prefill_size,
+        engine_prefill_chunk_size=engine_prefill_chunk_size,
         validate_runtime_invariants=validate_runtime_invariants,
     )
     manager.validate_runtime_invariants = bool(validate_runtime_invariants)
@@ -144,14 +144,14 @@ def _manager_with_rows(
     decode_budget=4,
     decode_eviction_interval=3,
     prefill_budget=8,
-    chunk_prefill_size=4,
+    engine_prefill_chunk_size=4,
 ):
     return _manager_with_layer_rows(
         [lengths],
         decode_budget=decode_budget,
         decode_eviction_interval=decode_eviction_interval,
         prefill_budget=prefill_budget,
-        chunk_prefill_size=chunk_prefill_size,
+        engine_prefill_chunk_size=engine_prefill_chunk_size,
     )
 
 
@@ -260,7 +260,7 @@ def test_h2o_decode_does_not_request_scores_or_run_eviction():
     controller.sparse_method = "h2o"
     controller.is_deltakv_family = False
     controller.config = SimpleNamespace(
-        vllm_sparse_method="h2o",
+        sparse_method="h2o",
         sparse_prefill_score_mode="logits",
         h2o_prefill_score_window=0,
     )
@@ -282,7 +282,7 @@ def test_h2o_decode_does_not_request_scores_or_run_eviction():
 def test_h2o_cache_manager_factory_routes_first_class_method():
     expected = object()
     config = SimpleNamespace(
-        vllm_sparse_method="h2o",
+        sparse_method="h2o",
         hf_config=SimpleNamespace(model_type="qwen2"),
     )
     with patch(
@@ -451,7 +451,7 @@ def test_h2o_prefill_score_collection_accumulates_in_physical_coordinates():
         assert prompt_cache_lens.tolist() == [4]
         assert score_starts.tolist() == [4]
         assert score_ends.tolist() == [6]
-        assert kwargs == {"candidate_start": 0, "num_recent_tokens": 0}
+        assert kwargs == {"candidate_start": 0, "recent_keep_tokens": 0}
         attn_score[0, :6] = torch.tensor([0.1, 0.2, 0.3, 0.4, 0.5, 0.6])
 
     with patch.object(
@@ -1147,13 +1147,13 @@ def test_h2o_decode_pressure_reclaims_over_budget_row_before_interval():
             max_num_seqs_in_batch=1,
             max_num_batched_tokens=1,
             max_decoding_seqs=1,
-            chunk_prefill_size=1,
+            engine_prefill_chunk_size=1,
             prefill_schedule_policy=PREFILL_POLICY_ALL_CHUNKED,
             eos=-1,
-            num_sink_tokens=0,
-            num_recent_tokens=0,
+            sink_keep_tokens=0,
+            recent_keep_tokens=0,
             decode_keep_tokens=4,
-            vllm_sparse_method="h2o",
+            sparse_method="h2o",
         ),
         manager,
     )
@@ -1424,9 +1424,9 @@ def test_h2o_controller_batches_raw_decode_logits_for_cache_manager():
 
     manager = RecordingManager()
     config = SimpleNamespace(
-        vllm_sparse_method="h2o",
+        sparse_method="h2o",
         obs_layer_ids=[],
-        full_attn_layers=[],
+        full_attention_layers=[],
         runtime_layout=_layout(),
         hf_config=SimpleNamespace(
             num_hidden_layers=1,
@@ -1436,8 +1436,8 @@ def test_h2o_controller_batches_raw_decode_logits_for_cache_manager():
             torch_dtype=torch.float32,
         ),
         tensor_parallel_size=1,
-        num_sink_tokens=0,
-        num_recent_tokens=0,
+        sink_keep_tokens=0,
+        recent_keep_tokens=0,
         decode_keep_tokens=4,
         sparse_attn_score_dtype="float32",
     )
@@ -1459,9 +1459,9 @@ def test_h2o_controller_batches_raw_decode_logits_for_cache_manager():
 def test_h2o_prepare_uses_one_contiguous_snapkv_style_buffer_for_all_kv_layers():
     manager = SimpleNamespace(device=torch.device("cpu"))
     config = SimpleNamespace(
-        vllm_sparse_method="h2o",
+        sparse_method="h2o",
         obs_layer_ids=[],
-        full_attn_layers=[],
+        full_attention_layers=[],
         runtime_layout=_layout(2),
         hf_config=SimpleNamespace(
             num_hidden_layers=2,
@@ -1471,11 +1471,11 @@ def test_h2o_prepare_uses_one_contiguous_snapkv_style_buffer_for_all_kv_layers()
             torch_dtype=torch.float32,
         ),
         tensor_parallel_size=1,
-        num_sink_tokens=0,
-        num_recent_tokens=0,
+        sink_keep_tokens=0,
+        recent_keep_tokens=0,
         decode_keep_tokens=4,
         sparse_attn_score_dtype="float32",
-        decode_cuda_graph=False,
+        decode_graph=False,
     )
     controller = SparseController(config, manager)
     for layer_idx in range(2):
@@ -1521,9 +1521,9 @@ def test_h2o_aligned_graph_score_workspace_routes_mla_call_to_tilelang():
         _decode_static_max_context_len=64,
     )
     config = SimpleNamespace(
-        vllm_sparse_method="h2o",
+        sparse_method="h2o",
         obs_layer_ids=[],
-        full_attn_layers=[],
+        full_attention_layers=[],
         runtime_layout=_layout(),
         hf_config=SimpleNamespace(
             num_hidden_layers=1,
@@ -1533,11 +1533,11 @@ def test_h2o_aligned_graph_score_workspace_routes_mla_call_to_tilelang():
             torch_dtype=torch.float32,
         ),
         tensor_parallel_size=1,
-        num_sink_tokens=0,
-        num_recent_tokens=0,
+        sink_keep_tokens=0,
+        recent_keep_tokens=0,
         decode_keep_tokens=4,
         sparse_attn_score_dtype="float32",
-        decode_cuda_graph=True,
+        decode_graph=True,
     )
     controller = SparseController(config, manager)
     state = controller.layer_batch_sparse_states[0]
@@ -1581,9 +1581,9 @@ def test_h2o_aligned_graph_score_workspace_routes_mla_call_to_tilelang():
 def test_h2o_layer_end_keeps_fused_2d_logits_for_batched_normalization():
     manager = SimpleNamespace(device=torch.device("cpu"))
     config = SimpleNamespace(
-        vllm_sparse_method="h2o",
+        sparse_method="h2o",
         obs_layer_ids=[],
-        full_attn_layers=[],
+        full_attention_layers=[],
         runtime_layout=_layout(),
         hf_config=SimpleNamespace(
             num_hidden_layers=1,
@@ -1593,11 +1593,11 @@ def test_h2o_layer_end_keeps_fused_2d_logits_for_batched_normalization():
             torch_dtype=torch.float16,
         ),
         tensor_parallel_size=1,
-        num_sink_tokens=0,
-        num_recent_tokens=0,
+        sink_keep_tokens=0,
+        recent_keep_tokens=0,
         decode_keep_tokens=4,
         sparse_attn_score_dtype="float16",
-        decode_cuda_graph=False,
+        decode_graph=False,
     )
     controller = SparseController(config, manager)
     score = controller._get_h2o_decode_score_buffer(1, 1, 3)[0]
@@ -1823,9 +1823,9 @@ def test_h2o_multilayer_reduced_decode_context_bounds_are_checked_together():
 
     manager = RecordingManager()
     config = SimpleNamespace(
-        vllm_sparse_method="h2o",
+        sparse_method="h2o",
         obs_layer_ids=[],
-        full_attn_layers=[],
+        full_attention_layers=[],
         runtime_layout=_layout(2),
         hf_config=SimpleNamespace(
             num_hidden_layers=2,
@@ -1835,11 +1835,11 @@ def test_h2o_multilayer_reduced_decode_context_bounds_are_checked_together():
             torch_dtype=torch.float32,
         ),
         tensor_parallel_size=1,
-        num_sink_tokens=0,
-        num_recent_tokens=0,
+        sink_keep_tokens=0,
+        recent_keep_tokens=0,
         decode_keep_tokens=4,
         sparse_attn_score_dtype="float32",
-        decode_cuda_graph=False,
+        decode_graph=False,
         validate_runtime_invariants=True,
     )
     controller = SparseController(config, manager)
@@ -1905,9 +1905,9 @@ def test_h2o_contiguous_decode_buffer_handles_padded_graph_batch_and_low_dtype()
 
     manager = RecordingManager()
     config = SimpleNamespace(
-        vllm_sparse_method="h2o",
+        sparse_method="h2o",
         obs_layer_ids=[],
-        full_attn_layers=[],
+        full_attention_layers=[],
         runtime_layout=_layout(2),
         hf_config=SimpleNamespace(
             num_hidden_layers=2,
@@ -1917,11 +1917,11 @@ def test_h2o_contiguous_decode_buffer_handles_padded_graph_batch_and_low_dtype()
             torch_dtype=torch.float16,
         ),
         tensor_parallel_size=1,
-        num_sink_tokens=0,
-        num_recent_tokens=0,
+        sink_keep_tokens=0,
+        recent_keep_tokens=0,
         decode_keep_tokens=4,
         sparse_attn_score_dtype="float16",
-        decode_cuda_graph=True,
+        decode_graph=True,
     )
     controller = SparseController(config, manager)
     reduced_scores = controller._get_h2o_decode_score_buffer(2, 4, 4)
@@ -1959,7 +1959,7 @@ def test_h2o_contiguous_decode_buffer_handles_padded_graph_batch_and_low_dtype()
     assert manager.evicted
     assert any(
         tensor.data_ptr() == original_ptr
-        for tensor in controller.decode_cuda_graph_keepalive_tensors()
+        for tensor in controller.decode_graph_keepalive_tensors()
     )
 
     refs = {
@@ -2034,13 +2034,13 @@ def test_h2o_capacity_hooks_reserve_prefill_peak_and_gate_chunk_with_real_free_s
     assert manager.prefill_step_reservation_cost(seq, 4) == 4
     assert manager.decode_step_free_slots_for(seq) == 4
     assert manager.decode_step_reservation_cost(seq) == 1
-    assert manager.decode_cuda_graph_context_capacity(
+    assert manager.decode_graph_context_capacity(
         [seq],
         requested_context_capacity=128,
         current_context_capacity=64,
     ) is None
     manager.config.max_model_len = 6
-    assert manager.decode_cuda_graph_context_capacity(
+    assert manager.decode_graph_context_capacity(
         [seq],
         requested_context_capacity=128,
         current_context_capacity=64,
@@ -2050,13 +2050,13 @@ def test_h2o_capacity_hooks_reserve_prefill_peak_and_gate_chunk_with_real_free_s
         max_num_seqs_in_batch=4,
         max_num_batched_tokens=16,
         max_decoding_seqs=4,
-        chunk_prefill_size=16,
+        engine_prefill_chunk_size=16,
         prefill_schedule_policy=PREFILL_POLICY_ALL_CHUNKED,
         eos=-1,
-        num_sink_tokens=0,
-        num_recent_tokens=0,
+        sink_keep_tokens=0,
+        recent_keep_tokens=0,
         decode_keep_tokens=4,
-        vllm_sparse_method="h2o",
+        sparse_method="h2o",
     )
     scheduler = Scheduler(scheduler_config, manager)
     scheduler.waiting.append(seq)
@@ -2072,7 +2072,7 @@ def test_h2o_reserved_prefill_slots_keeps_over_budget_resume_headroom():
         decode_budget=4,
         decode_eviction_interval=3,
         prefill_budget=4,
-        chunk_prefill_size=4,
+        engine_prefill_chunk_size=4,
     )
     seq = _seq(0, 110, prefilled=100, chunk=0)
 
@@ -2084,7 +2084,7 @@ def test_h2o_scheduler_does_not_admit_partial_prefills_that_fill_all_slots():
         [0, 0, 0],
         decode_budget=4,
         prefill_budget=8,
-        chunk_prefill_size=4,
+        engine_prefill_chunk_size=4,
     )
     manager._num_free_slots = [12]
     seqs = [_seq(seq_id, 20, prefilled=0, chunk=0) for seq_id in range(3)]
@@ -2092,13 +2092,13 @@ def test_h2o_scheduler_does_not_admit_partial_prefills_that_fill_all_slots():
         max_num_seqs_in_batch=3,
         max_num_batched_tokens=12,
         max_decoding_seqs=3,
-        chunk_prefill_size=4,
+        engine_prefill_chunk_size=4,
         prefill_schedule_policy=PREFILL_POLICY_ALL_CHUNKED,
         eos=-1,
-        num_sink_tokens=0,
-        num_recent_tokens=0,
+        sink_keep_tokens=0,
+        recent_keep_tokens=0,
         decode_keep_tokens=4,
-        vllm_sparse_method="h2o",
+        sparse_method="h2o",
     )
     scheduler = Scheduler(scheduler_config, manager)
     scheduler.waiting.extend(seqs)
@@ -2143,7 +2143,7 @@ def test_h2o_scheduler_reserves_until_first_prefill_eviction_peak():
         [4, 0],
         decode_budget=50,
         prefill_budget=100,
-        chunk_prefill_size=4,
+        engine_prefill_chunk_size=4,
     )
     manager._num_free_slots = [108]
     first = _seq(0, 300, prefilled=4, chunk=0)
@@ -2152,13 +2152,13 @@ def test_h2o_scheduler_reserves_until_first_prefill_eviction_peak():
         max_num_seqs_in_batch=2,
         max_num_batched_tokens=8,
         max_decoding_seqs=2,
-        chunk_prefill_size=4,
+        engine_prefill_chunk_size=4,
         prefill_schedule_policy=PREFILL_POLICY_ALL_CHUNKED,
         eos=-1,
-        num_sink_tokens=0,
-        num_recent_tokens=0,
+        sink_keep_tokens=0,
+        recent_keep_tokens=0,
         decode_keep_tokens=50,
-        vllm_sparse_method="h2o",
+        sparse_method="h2o",
     )
     scheduler = Scheduler(scheduler_config, manager)
     scheduler.waiting.extend((first, second))

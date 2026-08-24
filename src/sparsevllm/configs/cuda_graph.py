@@ -68,14 +68,14 @@ def _resolve_decode_cuda_graph_capture_sizes(
 ) -> list[int]:
     sizes = _resolve_positive_sizes(
         value,
-        name="decode_cuda_graph_capture_sizes",
+        name="decode_graph_capture_sizes",
         default_factory=lambda: _default_decode_cuda_graph_capture_sizes(
             max_decoding_seqs
         ),
     )
     if sizes[-1] < int(max_decoding_seqs):
         raise ValueError(
-            "decode_cuda_graph_capture_sizes must cover max_decoding_seqs: "
+            "decode_graph_capture_sizes must cover max_decoding_seqs: "
             f"max capture size {sizes[-1]} < max_decoding_seqs {int(max_decoding_seqs)}."
         )
     return sizes
@@ -93,14 +93,14 @@ def _select_decode_cuda_graph_batch_size(
     sizes = sorted(set(int(size) for size in capture_sizes))
     if not sizes or any(size <= 0 for size in sizes):
         raise ValueError(
-            "decode_cuda_graph_capture_sizes must contain positive integers, "
+            "decode_graph_capture_sizes must contain positive integers, "
             f"got {sizes}."
         )
     for size in sizes:
         if size >= real_batch_size:
             return size
     raise ValueError(
-        "decode_cuda_graph capture sizes do not cover current decode batch: "
+        "decode_graph capture sizes do not cover current decode batch: "
         f"batch_size={real_batch_size}, capture_sizes={sizes}."
     )
 
@@ -144,7 +144,7 @@ def _resolve_decode_cuda_graph_context_sizes(
 ) -> list[int]:
     return _resolve_positive_sizes(
         value,
-        name="decode_cuda_graph_context_sizes",
+        name="decode_graph_context_sizes",
         default_factory=lambda: _default_decode_cuda_graph_context_sizes(max_model_len),
     )
 
@@ -157,75 +157,69 @@ def _normalize_decode_cuda_graph_context_policy(value: str | None) -> str:
         return "requested"
     if policy not in {"current", "requested"}:
         raise ValueError(
-            "decode_cuda_graph_context_policy must be 'current' or 'requested', "
+            "decode_graph_context_policy must be 'current' or 'requested', "
             f"got {policy!r}."
         )
     return policy
 
 
-def normalize_decode_cuda_graph(config, *, legacy_deltakv_graph_method: bool) -> None:
-    if legacy_deltakv_graph_method:
-        config.decode_cuda_graph = True
-        config.decode_graph = True
-    if config.decode_cuda_graph_max_cached_graphs is not None:
-        config.decode_cuda_graph_max_cached_graphs = int(config.decode_cuda_graph_max_cached_graphs)
-        if config.decode_cuda_graph_max_cached_graphs <= 0:
+def normalize_decode_cuda_graph(config) -> None:
+    if config.decode_graph_max_cached_graphs is not None:
+        config.decode_graph_max_cached_graphs = int(config.decode_graph_max_cached_graphs)
+        if config.decode_graph_max_cached_graphs <= 0:
             raise ValueError(
-                "decode_cuda_graph_max_cached_graphs must be a positive integer or None, "
-                f"got {config.decode_cuda_graph_max_cached_graphs}."
+                "decode_graph_max_cached_graphs must be a positive integer or None, "
+                f"got {config.decode_graph_max_cached_graphs}."
             )
-    if config.decode_cuda_graph_capture_sampling and not config.decode_cuda_graph:
-        raise ValueError("decode_cuda_graph_capture_sampling requires decode_cuda_graph=True.")
-    config.decode_cuda_graph_context_policy = _normalize_decode_cuda_graph_context_policy(
-        config.decode_cuda_graph_context_policy
+    if config.decode_graph_capture_sampling and not config.decode_graph:
+        raise ValueError("decode_graph_capture_sampling requires decode_graph=True.")
+    config.decode_graph_context_policy = _normalize_decode_cuda_graph_context_policy(
+        config.decode_graph_context_policy
     )
-    context_sizes = config.decode_cuda_graph_context_sizes
-    config.decode_cuda_graph_context_sizes_auto = context_sizes is None or (
+    context_sizes = config.decode_graph_context_sizes
+    config.decode_graph_context_sizes_auto = context_sizes is None or (
         isinstance(context_sizes, str) and context_sizes.strip().lower() in {"", "auto"}
     )
-    if config.decode_cuda_graph:
+    if config.decode_graph:
         if config.enable_prefix_caching:
-            if config.decode_cuda_graph_capture_sampling:
+            if config.decode_graph_capture_sampling:
                 raise ValueError(
-                    "prefix caching with decode_cuda_graph does not support "
-                    "decode_cuda_graph_capture_sampling=True yet."
+                    "prefix caching with decode_graph does not support "
+                    "decode_graph_capture_sampling=True yet."
                 )
         if config.tensor_parallel_size > 1:
-            if config.decode_cuda_graph_capture_sampling:
+            if config.decode_graph_capture_sampling:
                 raise ValueError(
-                    "decode_cuda_graph_capture_sampling is disabled when tensor_parallel_size > 1 "
+                    "decode_graph_capture_sampling is disabled when tensor_parallel_size > 1 "
                     "because TP workers do not materialize rank-0 gathered logits."
                 )
-            if not is_tp_decode_cuda_graph_supported(config.vllm_sparse_method):
+            if not is_tp_decode_cuda_graph_supported(config.sparse_method):
                 supported = ", ".join(
                     repr(method)
                     for method in sorted(DECODE_CUDA_GRAPH_SUPPORTED_METHODS)
                     if method and is_tp_decode_cuda_graph_supported(method)
                 )
                 raise ValueError(
-                    "decode_cuda_graph with tensor_parallel_size > 1 supports these methods only: "
+                    "decode_graph with tensor_parallel_size > 1 supports these methods only: "
                     f"'', {supported}. DeltaKV is not supported."
                 )
             log_once(
-                "decode_cuda_graph with tensor_parallel_size > 1 uses TP-local sparse selection: "
+                "decode_graph with tensor_parallel_size > 1 uses TP-local sparse selection: "
                 "each rank selects sparse tokens from its local heads/KV heads without cross-rank "
                 "sparse-index aggregation, so sparse behavior is not guaranteed equivalent to TP=1 "
                 "or global-head sparse selection.",
                 level="WARNING",
             )
-        elif not is_decode_cuda_graph_supported(config.vllm_sparse_method):
+        elif not is_decode_cuda_graph_supported(config.sparse_method):
             supported = ", ".join(
                 repr(method) for method in sorted(DECODE_CUDA_GRAPH_SUPPORTED_METHODS) if method
             )
-            raise ValueError(f"decode_cuda_graph supports these methods only: '', {supported}.")
-        config.decode_cuda_graph_capture_sizes = _resolve_decode_cuda_graph_capture_sizes(
-            config.decode_cuda_graph_capture_sizes,
+            raise ValueError(f"decode_graph supports these methods only: '', {supported}.")
+        config.decode_graph_capture_sizes = _resolve_decode_cuda_graph_capture_sizes(
+            config.decode_graph_capture_sizes,
             config.max_decoding_seqs,
         )
-        config.decode_cuda_graph_context_sizes = _resolve_decode_cuda_graph_context_sizes(
-            config.decode_cuda_graph_context_sizes,
+        config.decode_graph_context_sizes = _resolve_decode_cuda_graph_context_sizes(
+            config.decode_graph_context_sizes,
             config.max_model_len,
         )
-    config.decode_graph = bool(config.decode_cuda_graph)
-    config.decode_graph_capture_sampling = bool(config.decode_cuda_graph_capture_sampling)
-    config.decode_graph_capture_sizes = config.decode_cuda_graph_capture_sizes

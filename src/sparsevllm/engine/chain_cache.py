@@ -170,14 +170,14 @@ def normalize_prefix_cache_mode(
     if expected is None:
         raise ValueError(
             "prefix caching is not supported for "
-            f"vllm_sparse_method={method!r}."
+            f"sparse_method={method!r}."
         )
     if mode == "auto":
         return expected
     if mode != expected:
         raise ValueError(
             f"prefix_cache_mode={mode!r} is incompatible with "
-            f"vllm_sparse_method={method!r}; use {expected!r}."
+            f"sparse_method={method!r}; use {expected!r}."
         )
     return mode
 
@@ -194,15 +194,15 @@ def _jsonable(value: Any) -> Any:
 
 def build_chain_cache_fingerprint(config: Any) -> bytes:
     hf_config = getattr(config, "hf_config", None)
-    method = str(getattr(config, "vllm_sparse_method", "") or "")
+    method = str(getattr(config, "sparse_method", "") or "")
     method_fields = {
         "streamingllm": (
-            "num_sink_tokens",
-            "num_recent_tokens",
+            "sink_keep_tokens",
+            "recent_keep_tokens",
         ),
         "snapkv": (
-            "num_sink_tokens",
-            "num_recent_tokens",
+            "sink_keep_tokens",
+            "recent_keep_tokens",
             "decode_keep_tokens",
             "snapkv_window_size",
             "snapkv_num_full_layers",
@@ -219,8 +219,8 @@ def build_chain_cache_fingerprint(config: Any) -> bytes:
             "sparse_attn_score_dtype",
         ),
         "pyramidkv": (
-            "num_sink_tokens",
-            "num_recent_tokens",
+            "sink_keep_tokens",
+            "recent_keep_tokens",
             "decode_keep_tokens",
             "snapkv_window_size",
             "sparse_prefill_score_mode",
@@ -233,8 +233,8 @@ def build_chain_cache_fingerprint(config: Any) -> bytes:
             "pool_kernel_size",
         ),
         "rkv": (
-            "num_sink_tokens",
-            "num_recent_tokens",
+            "sink_keep_tokens",
+            "recent_keep_tokens",
             "decode_keep_tokens",
             "rkv_compression_interval",
             "rkv_observation_tokens",
@@ -245,8 +245,8 @@ def build_chain_cache_fingerprint(config: Any) -> bytes:
             "rkv_redundancy_window",
         ),
         "skipkv": (
-            "num_sink_tokens",
-            "num_recent_tokens",
+            "sink_keep_tokens",
+            "recent_keep_tokens",
             "decode_keep_tokens",
             "rkv_observation_tokens",
             "skipkv_compression_interval",
@@ -277,7 +277,7 @@ def build_chain_cache_fingerprint(config: Any) -> bytes:
         "tp_size": int(getattr(config, "tensor_parallel_size", 1)),
         "max_model_len": int(getattr(config, "max_model_len", 0)),
         "full_attention_layers": _jsonable(
-            getattr(config, "full_attn_layers", ())
+            getattr(config, "full_attention_layers", ())
         ),
         "method": method,
         "salt": str(getattr(config, "prefix_cache_salt", "") or ""),

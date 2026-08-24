@@ -192,7 +192,7 @@ class RKVSkipKVMethodTest(unittest.TestCase):
                 return 3
 
         config = SimpleNamespace(
-            vllm_sparse_method="skipkv",
+            sparse_method="skipkv",
             hf_config=SimpleNamespace(num_hidden_layers=28, torch_dtype=torch.float32, hidden_size=4),
             skipkv_sentence_embedding_layer=-1,
             skipkv_steering_layer=20,
@@ -281,8 +281,8 @@ class RKVSkipKVMethodTest(unittest.TestCase):
         manager = object.__new__(RKVCacheManager)
         manager.runtime_layout = RuntimeLayout.dense(1)
         manager.config = SimpleNamespace(
-            num_sink_tokens=1,
-            num_recent_tokens=1,
+            sink_keep_tokens=1,
+            recent_keep_tokens=1,
             rkv_similarity_threshold=0.8,
             rkv_recent_similar_keep=1,
             rkv_max_redundancy_tokens=16,
@@ -310,8 +310,8 @@ class RKVSkipKVMethodTest(unittest.TestCase):
         manager = object.__new__(RKVCacheManager)
         manager.runtime_layout = RuntimeLayout.dense(1)
         manager.config = SimpleNamespace(
-            num_sink_tokens=1,
-            num_recent_tokens=1,
+            sink_keep_tokens=1,
+            recent_keep_tokens=1,
             rkv_similarity_threshold=0.8,
             rkv_recent_similar_keep=1,
             rkv_max_redundancy_tokens=16,
@@ -345,8 +345,8 @@ class RKVSkipKVMethodTest(unittest.TestCase):
         manager = object.__new__(RKVCacheManager)
         manager.runtime_layout = RuntimeLayout.dense(1)
         manager.config = SimpleNamespace(
-            num_sink_tokens=1,
-            num_recent_tokens=1,
+            sink_keep_tokens=1,
+            recent_keep_tokens=1,
             rkv_similarity_threshold=0.8,
             rkv_recent_similar_keep=1,
             rkv_max_redundancy_tokens=16,
@@ -402,8 +402,8 @@ class RKVSkipKVMethodTest(unittest.TestCase):
         manager = object.__new__(SkipKVCacheManager)
         manager.runtime_layout = RuntimeLayout.dense(1)
         manager.config = SimpleNamespace(
-            num_sink_tokens=1,
-            num_recent_tokens=1,
+            sink_keep_tokens=1,
+            recent_keep_tokens=1,
             skipkv_alpha=0.1,
             skipkv_similarity_threshold=0.95,
             skipkv_segment_size=2,
@@ -584,7 +584,7 @@ class RKVSkipKVMethodTest(unittest.TestCase):
             seq,
             kv_len,
             candidate_start=1,
-            num_recent_tokens=1,
+            recent_keep_tokens=1,
         )
 
         candidate_positions = torch.arange(1, 5, dtype=torch.long)
@@ -621,8 +621,8 @@ class RKVSkipKVMethodTest(unittest.TestCase):
         manager = object.__new__(RKVCacheManager)
         manager.runtime_layout = RuntimeLayout.dense(1)
         manager.config = SimpleNamespace(
-            num_sink_tokens=1,
-            num_recent_tokens=1,
+            sink_keep_tokens=1,
+            recent_keep_tokens=1,
             rkv_redundancy_window=0,
             rkv_similarity_threshold=0.0,
             rkv_recent_similar_keep=0,
@@ -744,9 +744,9 @@ class RKVSkipKVMethodTest(unittest.TestCase):
             torch.int32
         )
         manager.config = SimpleNamespace(
-            num_sink_tokens=1,
+            sink_keep_tokens=1,
             decode_keep_tokens=2,
-            num_recent_tokens=1,
+            recent_keep_tokens=1,
             rkv_compression_interval=2,
             rkv_redundancy_window=4,
             rkv_similarity_threshold=0.0,
@@ -824,7 +824,7 @@ class RKVSkipKVMethodTest(unittest.TestCase):
         head_dim = 16
         observation_tokens = 2
         candidate_start = 1
-        num_recent_tokens = 1
+        recent_keep_tokens = 1
 
         seq = Sequence([1])
         manager = object.__new__(RKVCacheManager)
@@ -859,7 +859,7 @@ class RKVSkipKVMethodTest(unittest.TestCase):
             seq,
             kv_len,
             candidate_start=candidate_start,
-            num_recent_tokens=num_recent_tokens,
+            recent_keep_tokens=recent_keep_tokens,
         )
         torch.cuda.synchronize()
 
@@ -874,22 +874,22 @@ class RKVSkipKVMethodTest(unittest.TestCase):
             torch.tensor([kv_len - observation_tokens], dtype=torch.int32, device=device),
             torch.tensor([kv_len], dtype=torch.int32, device=device),
             candidate_start,
-            num_recent_tokens,
+            recent_keep_tokens,
         )[0, :kv_len]
         torch.testing.assert_close(scores, expected, rtol=2e-2, atol=2e-2)
 
         candidate_positions = torch.arange(
             candidate_start,
-            kv_len - num_recent_tokens,
+            kv_len - recent_keep_tokens,
             dtype=torch.long,
             device=device,
         )
         candidate_slots = manager.buffer_req_to_token_slots[0][
             0,
-            candidate_start : kv_len - num_recent_tokens,
+            candidate_start : kv_len - recent_keep_tokens,
         ].long()
         materialized = torch.zeros_like(scores)
-        materialized[candidate_start : kv_len - num_recent_tokens] = (
+        materialized[candidate_start : kv_len - recent_keep_tokens] = (
             RKVCacheManager.attention_scores_from_materialized_keys(
                 q_window,
                 k_cache.index_select(0, candidate_slots),
@@ -950,7 +950,7 @@ class RKVSkipKVMethodTest(unittest.TestCase):
             seqs,
             [kv_len, kv_len],
             candidate_start=1,
-            num_recent_tokens=1,
+            recent_keep_tokens=1,
         )
         single_scores = torch.stack(
             [
@@ -959,7 +959,7 @@ class RKVSkipKVMethodTest(unittest.TestCase):
                     seq,
                     kv_len,
                     candidate_start=1,
-                    num_recent_tokens=1,
+                    recent_keep_tokens=1,
                 )
                 for seq in seqs
             ],

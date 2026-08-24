@@ -1,30 +1,35 @@
 # 运行时参数语义
 
-Sparse-vLLM 只有一个推理后端：`src/sparsevllm/` 下的原生引擎。Benchmark
-入口会规范化 public 参数并构造 `sparsevllm.LLM`；本仓库不再提供 HF
-DeltaKV backend 或 reference implementation。
+Sparse-vLLM 只有一个推理后端：`src/sparsevllm/` 下的原生引擎。
+`LLM(...)`、`Config`、JSON 配置、benchmark manifest 与内部代码使用完全
+相同的 runtime 参数名；引擎不再维护 public-to-internal alias 层。
 
 ## Public 参数名
 
 命令、JSON 配置和 benchmark manifest 应使用语义化 public 名称：
 
-| Public 名称 | 原生引擎字段 | 含义 |
-| --- | --- | --- |
-| `sparse_method` | `vllm_sparse_method` | 稀疏方法选择器。 |
-| `deltakv_checkpoint_path` | `deltakv_path` | DeltaKV compressor checkpoint 路径。 |
-| `engine_prefill_chunk_size` | `chunk_prefill_size` | Prefill 最大调度 chunk。 |
-| `sink_keep_tokens` | `num_sink_tokens` | Sink token 预算。 |
-| `recent_keep_tokens` | `num_recent_tokens` | Recent token 预算。 |
-| `full_attention_layers` | `full_attn_layers` | 逗号分隔的 full-layer index。 |
-| `deltakv_neighbor_count` | `deltakv_k_neighbors` | DeltaKV reference neighbor 数量。 |
-| `deltakv_center_ratio` | `cluster_ratio` | DeltaKV reference center 比例。 |
-| `deltakv_latent_dim` | `kv_compressed_size` | Compressor latent 宽度。 |
-| `deltakv_latent_quant_bits` | `kv_quant_bits` | Latent state 量化位数。 |
-| `deltakv_latent_quant_group_size` | `kv_quant_group_size` | Latent 量化 group size。 |
+| 规范名称 | 含义 |
+| --- | --- |
+| `sparse_method` | 稀疏方法选择器。 |
+| `deltakv_checkpoint_path` | DeltaKV compressor checkpoint 路径。 |
+| `engine_prefill_chunk_size` | Prefill 最大调度 chunk。 |
+| `sink_keep_tokens` | Sink token 预算。 |
+| `recent_keep_tokens` | Recent token 预算。 |
+| `full_attention_layers` | 逗号分隔的 full-layer index。 |
+| `deltakv_neighbor_count` | DeltaKV reference neighbor 数量。 |
+| `deltakv_center_ratio` | DeltaKV reference center 比例。 |
+| `deltakv_latent_dim` | Compressor latent 宽度。 |
+| `deltakv_latent_quant_bits` | Latent state 量化位数。 |
+| `deltakv_latent_quant_group_size` | Latent 量化 group size。 |
+| `gpu_memory_utilization` | 引擎可使用的 GPU 显存比例。 |
+| `decode_graph` | 启用 decode CUDA Graph。 |
 
-`src/sparsevllm/configs/runtime_params.py` 在 engine boundary 完成映射。通过
-public normalizer 直接传入 `vllm_sparse_method`、`deltakv_path`、
-`chunk_prefill_size` 等 internal 名称会失败；相互冲突的 alias 也会直接报错。
+`sparse_method`、`deltakv_checkpoint_path`、`engine_prefill_chunk_size`、
+`sink_keep_tokens`、`recent_keep_tokens`、`full_attention_layers`、
+`deltakv_neighbor_count`、`deltakv_center_ratio`、`deltakv_latent_dim`、
+`deltakv_latent_quant_bits`、`deltakv_latent_quant_group_size`、`device_memory_utilization` 和
+`decode_graph*` 等旧 alias 不再接受。未知名称会在 engine boundary 直接失败，
+不会被重写。
 
 ## Token 预算
 
