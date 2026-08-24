@@ -102,14 +102,14 @@ def test_startup_graph_plan_keeps_max_context_when_mandatory_cannot_fit():
 
 def test_sparse_startup_graph_plan_covers_short_and_long_families():
     config = SimpleNamespace(
-        decode_cuda_graph_capture_sizes=list(range(1, 9)),
-        decode_cuda_graph_context_sizes=[1024, 2048, 4096, 8192, 16384, 32768],
-        decode_cuda_graph_startup_capture_limit=48,
-        decode_cuda_graph_max_cached_graphs=48,
-        vllm_sparse_method="snapkv",
-        num_sink_tokens=64,
+        decode_graph_capture_sizes=list(range(1, 9)),
+        decode_graph_context_sizes=[1024, 2048, 4096, 8192, 16384, 32768],
+        decode_graph_startup_capture_limit=48,
+        decode_graph_max_cached_graphs=48,
+        sparse_method="snapkv",
+        sink_keep_tokens=64,
         decode_keep_tokens=4096,
-        num_recent_tokens=512,
+        recent_keep_tokens=512,
         max_model_len=32768,
     )
 
@@ -131,14 +131,14 @@ def test_sparse_startup_graph_plan_covers_short_and_long_families():
 
 def test_h2o_startup_graph_plan_uses_normal_context_buckets():
     config = SimpleNamespace(
-        decode_cuda_graph_capture_sizes=[1, 2, 4],
-        decode_cuda_graph_context_sizes=[1024, 2048, 4096, 8192, 16384],
-        decode_cuda_graph_startup_capture_limit=48,
-        decode_cuda_graph_max_cached_graphs=48,
-        vllm_sparse_method="h2o",
-        num_sink_tokens=64,
+        decode_graph_capture_sizes=[1, 2, 4],
+        decode_graph_context_sizes=[1024, 2048, 4096, 8192, 16384],
+        decode_graph_startup_capture_limit=48,
+        decode_graph_max_cached_graphs=48,
+        sparse_method="h2o",
+        sink_keep_tokens=64,
         decode_keep_tokens=4096,
-        num_recent_tokens=512,
+        recent_keep_tokens=512,
         max_model_len=16384,
     )
 
@@ -162,14 +162,14 @@ def test_h2o_startup_graph_plan_uses_normal_context_buckets():
 def test_sparse_startup_graph_plan_covers_default_64_sequence_limit():
     batches = _default_decode_cuda_graph_capture_sizes(64)
     config = SimpleNamespace(
-        decode_cuda_graph_capture_sizes=batches,
-        decode_cuda_graph_context_sizes=[1024, 2048, 4096, 8192, 16384, 32768, 65536],
-        decode_cuda_graph_startup_capture_limit=48,
-        decode_cuda_graph_max_cached_graphs=48,
-        vllm_sparse_method="snapkv",
-        num_sink_tokens=64,
+        decode_graph_capture_sizes=batches,
+        decode_graph_context_sizes=[1024, 2048, 4096, 8192, 16384, 32768, 65536],
+        decode_graph_startup_capture_limit=48,
+        decode_graph_max_cached_graphs=48,
+        sparse_method="snapkv",
+        sink_keep_tokens=64,
         decode_keep_tokens=4096,
-        num_recent_tokens=512,
+        recent_keep_tokens=512,
         max_model_len=65536,
     )
 
@@ -207,7 +207,7 @@ def _make_glm_graph_lane(
         cache_dtype=torch.bfloat16,
         tp_size=1,
         cuda_graph=True,
-        may_require_attention_scores=sparse_decode_attention_requires_scores(method),
+        may_require_attention_scores=False,
     )
     mla_attention = MLAAttention.bind(
         spec=spec,
@@ -545,6 +545,7 @@ def _make_glm_full_graph_lane(
         cache_dtype=torch.bfloat16,
         tp_size=1,
         cuda_graph=True,
+        may_require_attention_scores=False,
     )
     mla_attention = MLAAttention.bind(
         spec=mla_spec,
@@ -1116,6 +1117,7 @@ def _make_glm_method_graph_lane(
         cache_dtype=torch.bfloat16,
         tp_size=1,
         cuda_graph=True,
+        may_require_attention_scores=sparse_decode_attention_requires_scores(method),
     )
     mla_attention = MLAAttention.bind(
         spec=spec,

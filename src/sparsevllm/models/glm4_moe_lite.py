@@ -138,6 +138,13 @@ def build_glm4_moe_lite_mla_attention(
         tp_size=int(parallel_context.attention_tp_size),
         cuda_graph=bool(decode_graph),
         may_require_attention_scores=bool(may_require_attention_scores),
+        context_independent_cuda_graph=(
+            bool(decode_graph)
+            and str(
+                getattr(config, "decode_graph_shape_policy", "bucketed")
+            )
+            == "batch_only"
+        ),
     )
     return MLAAttention.bind(
         spec=spec,

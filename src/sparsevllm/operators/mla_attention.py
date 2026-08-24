@@ -67,6 +67,7 @@ class MlaAttentionOpSpec:
     tp_size: int
     cuda_graph: bool
     may_require_attention_scores: bool = False
+    context_independent_cuda_graph: bool = False
 
     def __post_init__(self) -> None:
         dimensions = {
@@ -135,7 +136,7 @@ MLA_ATTENTION_REGISTRY: OpRegistry[
     "MLA attention",
     portfolio=PortfolioPolicy(
         upstream_standard=("sgl_fa3_sm90",),
-        repo_nonstandard=("triton_sm90",),
+        repo_nonstandard=("triton_sm90_context_independent", "triton_sm90"),
     ),
     profile_order=("tilelang_score_sgl_fa3_h100_profile",),
 )
@@ -248,6 +249,14 @@ class MlaTritonProvider(MlaAttentionProvider):
         spec: MlaAttentionOpSpec,
         caps: DeviceCaps,
     ) -> SupportResult:
+        is_context_provider = cls.name == "triton_sm90_context_independent"
+        if spec.context_independent_cuda_graph != is_context_provider:
+            reason = (
+                "reserved for batch-only CUDA Graph"
+                if is_context_provider
+                else "launch topology depends on context length"
+            )
+            return SupportResult.unsupported(reason)
         common = match_attention_capabilities(
             spec.kernel_request, caps, cls.capabilities
         )
@@ -486,6 +495,34 @@ class MlaTritonProvider(MlaAttentionProvider):
             config=launch_config,
             validate_metadata=False,
         )
+
+
+@MLA_ATTENTION_REGISTRY.register_atomic(ProviderRole.REPO_NONSTANDARD)
+class ContextIndependentMlaTritonProvider(MlaTritonProvider):
+    """MLA decode with a launch schedule determined only by batch and TP shape."""
+
+    name = "triton_sm90_context_independent"
+    context_independent_cuda_graph = True
+
+    def _launch_config_for(
+        self,
+        *,
+        batch_size: int,
+        max_context_len: int | None,
+        active_slot_width: int,
+    ) -> MlaDecodeLaunchConfig:
+        del max_context_len, active_slot_width
+        if self._fixed_launch_config is not None:
+            return self._fixed_launch_config
+        return select_glm_mla_decode_config(
+            batch_size=batch_size,
+            max_context_len=8193,
+            local_q_heads=self.spec.local_q_heads,
+        )
+
+    def binding_metadata(self) -> dict[str, object]:
+        metadata = super().binding_metadata()
+        return {**metadata, "cuda_graph_shape_policy": "batch_only"}
 
 
 @MLA_ATTENTION_REGISTRY.register_atomic(ProviderRole.UPSTREAM_STANDARD)
@@ -951,6 +988,7 @@ __all__ = [
     "MLA_ATTENTION_REGISTRY",
     "MlaAttentionOpSpec",
     "MlaAttentionProvider",
+    "ContextIndependentMlaTritonProvider",
     "MlaSglFa3Provider",
     "MlaTileLangScoreProvider",
     "MlaTritonProvider",

@@ -270,6 +270,14 @@ def decode_sparse_long_text_threshold(
     )
 
 
+def decode_graph_path_id(method: str, is_long_text: bool) -> str:
+    """Identify one graph-stable decode topology family."""
+    method = str(method or "")
+    if not method:
+        return "dense"
+    return "long" if is_long_text else "short"
+
+
 _DEFAULT_PREFILL_POLICY_BY_METHOD = {
     "": PREFILL_POLICY_ALL_CHUNKED,
     "streamingllm": PREFILL_POLICY_ALL_CHUNKED,

@@ -28,10 +28,14 @@ class Gemma4OpSpec:
     head_dims: tuple[int, ...]
     cuda_graph: bool
     attention_contracts: tuple[tuple[int, int, int, int], ...] = ()
+    max_batch_size: int = 1
+    context_independent_cuda_graph: bool = False
 
     def __post_init__(self) -> None:
         if not self.head_dims or any(int(value) <= 0 for value in self.head_dims):
             raise ValueError("Gemma 4 head dimensions must be positive.")
+        if self.max_batch_size <= 0:
+            raise ValueError("Gemma 4 max_batch_size must be positive.")
 
 
 class Gemma4OperatorProvider:
@@ -134,7 +138,9 @@ class Gemma4OperatorProvider:
 
 GEMMA4_REGISTRY: OpRegistry[Gemma4OpSpec, Gemma4OperatorProvider] = OpRegistry(
     "Gemma 4 model operations",
-    portfolio=PortfolioPolicy(repo_nonstandard=("triton",)),
+    portfolio=PortfolioPolicy(
+        repo_nonstandard=("triton_gemma4_context_independent", "triton")
+    ),
     profile_order=("gemma4_h20_profile",),
 )
 
@@ -145,6 +151,8 @@ class TritonGemma4OperatorProvider(Gemma4OperatorProvider):
 
     @classmethod
     def supports(cls, spec: Gemma4OpSpec, caps: DeviceCaps) -> SupportResult:
+        if spec.context_independent_cuda_graph:
+            return SupportResult.unsupported("decode topology depends on context length")
         if caps.platform != PlatformEnum.CUDA or not caps.supports_triton:
             return SupportResult.unsupported("requires CUDA with Triton")
         if spec.cuda_graph and not caps.supports_graph_capture:
@@ -373,6 +381,9 @@ class TorchGemma4OperatorProvider(Gemma4OperatorProvider):
 def resolve_gemma4_provider(
     spec: Gemma4OpSpec, *, device_index: int | None = None
 ) -> Gemma4OperatorProvider:
+    # Load the isolated experimental provider only when resolving this family.
+    from sparsevllm.operators import context_independent_gemma4_attention  # noqa: F401
+
     platform = platforms.current_platform
     if device_index is None:
         device_index = torch.cuda.current_device() if platform.is_cuda_alike() else 0

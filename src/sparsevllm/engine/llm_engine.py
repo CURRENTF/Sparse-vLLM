@@ -539,7 +539,11 @@ class LLMEngine:
             captured = {
                 (
                     int(key.batch_size),
-                    int(key.context_capacity),
+                    int(
+                        state.capture_context_capacity
+                        if key.shape_policy == "batch_only"
+                        else key.context_capacity
+                    ),
                     bool(key.is_long_text),
                 )
                 for key, state in graph_runner._graphs.items()
@@ -553,6 +557,7 @@ class LLMEngine:
                     "Startup decode CUDA Graph capture did not materialize its plan: "
                     f"missing={missing}."
                 )
+            self.model_runner.call("seal_decode_cuda_graph_startup_plan")
             logger.info(
                 "Startup decode CUDA Graph capture finished: cached={} "
                 "capture_count={} replay_count={}.",
@@ -1152,6 +1157,7 @@ class LLMEngine:
             "deltakv_latent_quant_bits",
             "deltakv_latent_quant_group_size",
             "decode_graph",
+            "decode_graph_shape_policy",
             "decode_graph_capture_sampling",
             "decode_graph_capture_sizes",
             "decode_graph_context_sizes",

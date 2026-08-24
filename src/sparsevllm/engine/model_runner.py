@@ -22,6 +22,9 @@ from sparsevllm.models.llama import LlamaForCausalLM
 from sparsevllm.layers.sampler import Sampler
 from sparsevllm.method_registry import decode_sparse_long_text_threshold
 from sparsevllm.operators import registry as operator_registry
+from sparsevllm.operators.decode_attention import (
+    validate_context_independent_decode_graph_model,
+)
 from sparsevllm.utils.context import set_context, get_context, reset_context
 from sparsevllm.utils.loader import load_model, sync_deltakv_config_from_checkpoint
 
@@ -247,6 +250,11 @@ class ModelRunner:
             "decode_graph",
             bool(getattr(config, "decode_graph", False)),
         )
+        setattr(
+            hf_config,
+            "decode_graph_shape_policy",
+            str(getattr(config, "decode_graph_shape_policy", "bucketed")),
+        )
         decode_static_capture_sizes = _resolve_decode_cuda_graph_capture_sizes(
             config.decode_graph_capture_sizes,
             config.max_decoding_seqs,
@@ -263,6 +271,8 @@ class ModelRunner:
                 max_decoding_seqs=config.max_decoding_seqs,
             ),
         )
+        if self.config.decode_graph_shape_policy == "batch_only":
+            validate_context_independent_decode_graph_model(self.model)
         if config.tiny_random:
             from sparsevllm.debug.tiny_random import initialize_sparse_model
 
@@ -385,6 +395,7 @@ class ModelRunner:
             method=self.config.sparse_method,
             capture_sizes=decode_static_capture_sizes,
             context_sizes=decode_static_context_sizes,
+            shape_policy=self.config.decode_graph_shape_policy,
             graph_pool=self.cuda_graph_pool,
         )
         torch.set_default_device("cpu")
@@ -1355,6 +1366,9 @@ class ModelRunner:
 
     def set_decode_cuda_graph_reuse_larger_context_graphs(self, enabled: bool):
         self.decode_cuda_graph_runner.set_reuse_larger_context_graphs(enabled)
+
+    def seal_decode_cuda_graph_startup_plan(self):
+        self.decode_cuda_graph_runner.seal_startup_plan()
 
     def capture_decode_cuda_graph_warmup(self, seqs: list[Sequence]) -> None:
         """Capture one planned graph without advancing scheduler sequence state."""
