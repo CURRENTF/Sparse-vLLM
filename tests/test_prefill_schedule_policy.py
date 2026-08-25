@@ -1613,6 +1613,22 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
             ModelRunner._is_long_text_batch(runner, seqs, is_prefill=False)
         )
 
+    def test_sparse_model_runner_rejects_mixed_decode_topology_batch(self):
+        runner = object.__new__(ModelRunner)
+        runner.config = SimpleNamespace(
+            sparse_method="quest",
+            sink_keep_tokens=1,
+            recent_keep_tokens=1,
+            decode_keep_tokens=4,
+        )
+
+        with self.assertRaisesRegex(ValueError, "Mixed long/short batch"):
+            ModelRunner._is_long_text_batch(
+                runner,
+                [seq_with_len(4), seq_with_len(20)],
+                is_prefill=False,
+            )
+
     def test_all_chunked_batches_sparse_mixed_lengths(self):
         scheduler = make_scheduler(
             PREFILL_POLICY_ALL_CHUNKED,
@@ -1645,6 +1661,29 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
 
         self.assertFalse(is_prefill)
         self.assertEqual(scheduled, [short_seq, long_seq])
+
+    def test_sparse_decode_schedules_short_and_long_topologies_separately(self):
+        scheduler = make_scheduler(
+            PREFILL_POLICY_ALL_CHUNKED,
+            method="quest",
+        )
+        short_seq = seq_with_len(4)
+        long_seq = seq_with_len(20)
+        short_seq.num_prefilled_tokens = short_seq.num_prompt_tokens
+        long_seq.num_prefilled_tokens = long_seq.num_prompt_tokens
+        scheduler.decoding.extend((short_seq, long_seq))
+
+        short_batch, is_prefill, _ = scheduler.schedule()
+
+        self.assertFalse(is_prefill)
+        self.assertEqual(short_batch, [short_seq])
+        self.assertIn(long_seq, scheduler.decoding)
+
+        scheduler.decoding.remove(short_seq)
+        long_batch, is_prefill_long, _ = scheduler.schedule()
+
+        self.assertFalse(is_prefill_long)
+        self.assertEqual(long_batch, [long_seq])
 
     def test_all_chunked_caps_each_prefill_by_chunk_size(self):
         scheduler = make_scheduler(PREFILL_POLICY_ALL_CHUNKED, method="", chunk=5, max_tokens=20)
