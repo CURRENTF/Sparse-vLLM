@@ -1,6 +1,6 @@
 # Decode Batch-Only CUDA Graph 原生支持计划
 
-状态：草案
+状态：阶段 1/2 收口中；阶段 3/4 未开始生产验收
 
 日期：2026-08-25
 
@@ -172,6 +172,40 @@ batch bucket count × declared topology path count × sampling topology count
 这张表是阶段 0 的初始清单，不是最终支持矩阵。实现前还需逐个 provider 审计是否存在
 `.item()`、`tolist()`、按真实长度分配、未预热 JIT、动态输出驱动的 Python 分支，以及
 context 相关的第三方 plan/cache key。
+
+### 4.1 阶段 1 provider/context 审计矩阵
+
+下表是当前分支的静态审计结论。“可绑定”只表示 provider 在 capture 前能满足执行
+contract；只有标记为“阶段 2 生产验证”的 Qwen3 dense MHA/GQA 组合具有当前阶段的
+真实模型和 matched performance 证据。
+
+| provider/path | 真实 context 对 host 拓扑的影响 | batch-only 决策 | 当前证据/后续 owner |
+| --- | --- | --- | --- |
+| SGL FA3 paged MHA decode | launch topology 依赖 context | `supports()` 在 batch-only 绑定时拒绝 | 保留 eager/bucketed |
+| FlashInfer paged MHA decode | plan key、indices/indptr 和 workspace 规划依赖 context | `supports()` 在 batch-only 绑定时拒绝 | 保留 eager/bucketed；固定 plan API 需单独验证 |
+| 通用 Triton paged MHA/GQA decode | host 依据 context 选 block/split 并取 workspace view | `supports()` 在 batch-only 绑定时拒绝 | 保留 eager/bucketed |
+| context-independent Triton MHA/GQA | tile/warp/max split/workspace 在 `prepare()` 前固定；真实长度只在 GPU 内决定有效 split/range | batch-only 默认原子 provider | 阶段 2 Qwen3-8B/H20 生产验证 |
+| MiniMax M2 H100 long-GQA profile | `32768` 阈值会改变 block/tile/warp/grid | batch-only 不绑定该 profile，而绑定上一行的静态 envelope | 阶段 3 补 MiniMax 模型、阈值边界和长上下文证据 |
+| context-independent MLA Triton | 固定 grid 原型可绑定 | 暂保留显式 batch-only 原型能力 | 阶段 3 移除魔数并完成 GLM/MLA 生产验收 |
+| TileLang/SGL MLA score path | score mode、JIT key 和部分 workspace/plan 尚未证明跨 context 稳定 | 不声明阶段 2 生产支持 | 阶段 3 得出明确支持或拒绝结论 |
+| Gemma4 context-independent decode | 固定 grid 原型可绑定，full/window range 由 device metadata 决定 | 暂保留显式 batch-only 原型能力 | 阶段 3 补生产 correctness 和 no-regression gate |
+
+静态审计还确认：新 MHA/GQA provider 的 forward 不执行 `.item()`/`.tolist()`、不重新进入
+resolver/plan，workspace 由 provider 持有；运行时 `context_lens` 不参与 Python grid、kernel variant 或
+workspace shape 选择。普通 bucketed provider 仍保留原来的 context 分支，两条路由静态 spec
+在模型构建时分开，forward 不会在两者之间 fallback。
+
+### 4.2 阶段 1 topology path 和 transition ownership 矩阵
+
+| method 范围 | 最大 path 数 | mixed-batch contract | short→long 分类/状态 owner | 当前阶段结论 |
+| --- | ---: | --- | --- | --- |
+| vanilla dense | 1：`dense` | 无 short/long 分区 | 无 transition | 阶段 2 已验证 strict batch-only |
+| `streamingllm`、`snapkv`、`h2o`、`pyramidkv`、`omnikv`、`quest`、`rkv`、`skipkv` | 2：`short`/`long`（只 capture 配置 context 内可达的 path） | scheduler 只从同一 path queue 取 decode batch；runner 在 cache mutation 前复核并 fail-fast | `method_registry` 定义共享阈值，scheduler 负责分类，方法 cache manager/`SparseController` 负责一次性私有状态准备 | 阶段 1 只冻结 contract；逐方法 transition/prefix/TP 证据属于阶段 4 |
+| `deltakv` | 设计上最大 2，当前为 0 个公开 batch-only path | 同上 | DeltaKV cache manager 和 `SparseController` | 配置层明确拒绝 batch-only，不用 bucketed 能力伪装支持 |
+
+path resolver 只使用共享算法阈值选择已启动捕获的有限 family；不查询 provider 调优表，
+不携带 context bucket，不允许 lazy capture。阶段 1 建立的 participant 边界只编排 cache/runtime
+state，没有把稀疏私有 metadata 的语义 ownership 移入 runner。
 
 ## 5. 目标架构
 

@@ -8,7 +8,12 @@ from sparsevllm.configs.cuda_graph import (
     build_decode_cuda_graph_batch_only_startup_plan,
 )
 from sparsevllm.engine.decode_cuda_graph import DecodeCudaGraphRunner
-from sparsevllm.engine.decode_graph_contract import DecodeGraphContract
+from sparsevllm.engine.decode_graph_contract import (
+    DecodeGraphContract,
+    DecodeGraphInputs,
+    DecodeGraphState,
+)
+from sparsevllm.engine.runtime_state import RuntimeState
 from sparsevllm.kernels.triton.context_independent_flash_decoding import (
     context_independent_flash_decode,
 )
@@ -136,6 +141,61 @@ def test_batch_only_state_identity_omits_context_capacity() -> None:
         )
 
 
+def test_typed_decode_graph_participant_delegates_to_cache_owner() -> None:
+    calls = []
+    private_keepalive = torch.empty(1)
+
+    class CacheOwner:
+        num_free_slots = 16
+
+        def init_decode_graph_state(self, contract, inputs):
+            calls.append(("init", contract.topology_path_id))
+            return SimpleNamespace(contract=contract, inputs=inputs)
+
+        def prepare_decode_graph_step(self, seqs, state):
+            calls.append(("prepare_out", len(seqs)))
+            state.inputs.input_ids.fill_(7)
+
+        def prepare_decode_graph_in(self, state):
+            calls.append(("prepare_in", state.contract.topology_path_id))
+
+        def decode_graph_state_keepalive_tensors(self, state):
+            calls.append(("keepalive", state.contract.topology_path_id))
+            return [private_keepalive]
+
+    contract = DecodeGraphContract(
+        method="",
+        shape_policy="batch_only",
+        topology_path_id="dense",
+        batch_capacity=2,
+        context_capacity=32,
+    )
+    graph_state = DecodeGraphState(
+        contract=contract,
+        inputs=DecodeGraphInputs.allocate(
+            contract,
+            device=torch.device("cpu"),
+            pin_memory=False,
+        ),
+    )
+    runtime = RuntimeState(SimpleNamespace(), CacheOwner())
+
+    participant = runtime.init_decode_graph_state(graph_state)
+    runtime.prepare_decode_graph_step([object()], graph_state)
+    participant.prepare_in_graph()
+    keepalive = graph_state.keepalive_tensors()
+
+    assert graph_state.runtime_state is participant
+    assert graph_state.inputs.input_ids.tolist() == [7, 7]
+    assert any(tensor is private_keepalive for tensor in keepalive)
+    assert calls == [
+        ("init", "dense"),
+        ("prepare_out", 1),
+        ("prepare_in", "dense"),
+        ("keepalive", "dense"),
+    ]
+
+
 def test_mha_resolver_contract_selects_only_context_independent_provider() -> None:
     spec = DecodeAttentionOpSpec(
         num_query_heads=8,
@@ -256,9 +316,12 @@ def _decode_reference(
 @pytest.mark.parametrize(
     ("dtype", "heads", "kv_heads", "head_dim"),
     [
+        (torch.bfloat16, 4, 4, 64),
+        (torch.float16, 8, 2, 64),
         (torch.bfloat16, 8, 2, 128),
-        (torch.float16, 4, 4, 64),
-        (torch.bfloat16, 4, 2, 256),
+        (torch.float16, 4, 4, 128),
+        (torch.bfloat16, 8, 2, 256),
+        (torch.float16, 4, 4, 256),
     ],
 )
 def test_context_independent_mha_matches_reference_and_replays_new_lengths(
@@ -311,6 +374,73 @@ def test_context_independent_mha_matches_reference_and_replays_new_lengths(
     graph.replay()
     expected_output, expected_lse = _decode_reference(
         q, k, v, slots, req_indices, lengths
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(graph_output, expected_output, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(graph_lse, expected_lse, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires idle CUDA GPU")
+def test_context_independent_gqa_replays_exact_context_capacity() -> None:
+    torch.manual_seed(29)
+    batch, heads, kv_heads, head_dim, capacity = 1, 8, 2, 128, 8352
+    device = torch.device("cuda")
+    q = torch.randn(batch, heads, head_dim, dtype=torch.bfloat16, device=device)
+    k = torch.randn(
+        capacity,
+        kv_heads,
+        head_dim,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    v = torch.randn_like(k)
+    slots = torch.arange(capacity, dtype=torch.int32, device=device).view(
+        batch,
+        capacity,
+    )
+    req_indices = torch.zeros(batch, dtype=torch.int32, device=device)
+    lengths = torch.tensor([4097], dtype=torch.int32, device=device)
+    mid_o = torch.empty(
+        batch,
+        heads,
+        16,
+        head_dim,
+        dtype=torch.float32,
+        device=device,
+    )
+    mid_lse = torch.empty(batch, heads, 16, dtype=torch.float32, device=device)
+    output_lse = torch.empty(heads, batch, dtype=torch.float32, device=device)
+
+    def run():
+        return context_independent_flash_decode(
+            q,
+            k,
+            v,
+            slots,
+            req_indices,
+            lengths,
+            mid_o,
+            mid_lse,
+            target_tokens_per_split=256,
+            return_softmax_lse=True,
+            output_lse=output_lse,
+        )
+
+    run()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_output, graph_lse = run()
+    lengths.fill_(capacity)
+    q.copy_(torch.randn_like(q))
+    graph.replay()
+    expected_output, expected_lse = _decode_reference(
+        q,
+        k,
+        v,
+        slots,
+        req_indices,
+        lengths,
     )
     torch.cuda.synchronize()
     torch.testing.assert_close(graph_output, expected_output, rtol=2e-2, atol=2e-2)
