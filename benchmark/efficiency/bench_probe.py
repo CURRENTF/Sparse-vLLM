@@ -901,7 +901,7 @@ def run_sparsevllm_churn(
         llm = LLM(args.model_path, **engine_kwargs)
         engine_init_s = time.perf_counter() - engine_init_started
         startup_graph_summary = llm.debug_sparse_state_summaries()[0][
-            "decode_cuda_graph"
+            "decode_graph"
         ]
         try:
             request_count = concurrency * args.churn_request_multiplier
@@ -943,7 +943,7 @@ def run_sparsevllm_churn(
                         for iteration in range(args.num_iters):
                             profiler.reset()
                             graph_before = llm.debug_sparse_state_summaries()[0][
-                                "decode_cuda_graph"
+                                "decode_graph"
                             ]
                             trace = _trace_for_iteration(
                                 args,
@@ -1008,7 +1008,7 @@ def run_sparsevllm_churn(
                                     generated_counts[seq_id] = len(token_ids)
                             elapsed_s = time.perf_counter() - started
                             graph_after = llm.debug_sparse_state_summaries()[0][
-                                "decode_cuda_graph"
+                                "decode_graph"
                             ]
 
                             expected_seq_ids = set(seq_to_request)
