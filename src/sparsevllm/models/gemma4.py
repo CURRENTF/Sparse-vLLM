@@ -697,7 +697,7 @@ class Gemma4ForCausalLM(nn.Module):
                 cuda_graph=bool(engine_config.decode_graph),
                 attention_contracts=attention_contracts,
                 max_batch_size=int(getattr(engine_config, "max_decoding_seqs", 1)),
-                context_independent_cuda_graph=(
+                batch_only_cuda_graph=(
                     bool(engine_config.decode_graph)
                     and str(
                         getattr(

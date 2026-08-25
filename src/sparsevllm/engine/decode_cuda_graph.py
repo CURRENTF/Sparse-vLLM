@@ -439,18 +439,18 @@ class DecodeCudaGraphRunner:
         else:
             resolver = getattr(
                 self.cache_manager,
-                "decode_graph_context_independent_capacity",
+                "decode_graph_batch_only_capacity",
                 None,
             )
             if not callable(resolver):
                 raise TypeError(
-                    "batch-only decode CUDA Graph requires a context-independent "
+                    "batch-only decode CUDA Graph requires a context-stable "
                     "capacity resolver."
                 )
             capacity = int(resolver(bool(is_long_text)))
         validator = getattr(
             self.cache_manager,
-            "validate_decode_graph_context_independent_capacity",
+            "validate_decode_graph_batch_only_capacity",
             None,
         )
         if callable(validator):

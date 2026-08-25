@@ -37,7 +37,7 @@ class GatedDeltaRuleOpSpec:
     state_layout_id: str = "k_major_hkv"
     varlen_prefill: bool = True
     cuda_graph_decode: bool = True
-    context_independent_cuda_graph: bool = False
+    batch_only_cuda_graph: bool = False
 
     def __post_init__(self) -> None:
         if self.num_key_heads <= 0 or self.num_value_heads <= 0:
@@ -381,8 +381,8 @@ class PreparedGatedDeltaRuleOp:
         return self.provider.name
 
     @property
-    def context_independent_cuda_graph(self) -> bool:
-        return bool(self.spec.context_independent_cuda_graph)
+    def supports_batch_only_cuda_graph(self) -> bool:
+        return bool(self.spec.batch_only_cuda_graph)
 
     def run_prefill(self, **kwargs) -> tuple[torch.Tensor, torch.Tensor]:
         if self._closed:

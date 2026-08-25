@@ -180,7 +180,6 @@ def _normalize_decode_graph_shape_policy(value: str | None) -> str:
         "context_bucketed": "bucketed",
         "batch": "batch_only",
         "bs_only": "batch_only",
-        "context_independent": "batch_only",
     }.get(policy, policy)
     if policy not in {"bucketed", "batch_only"}:
         raise ValueError(

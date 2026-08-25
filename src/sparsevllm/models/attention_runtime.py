@@ -164,7 +164,7 @@ def build_mha_decode_attention_spec(
         h2o_layerwise_probability_scores=(
             normalized_method == "h2o" and requires_decode_scores
         ),
-        context_independent_cuda_graph=(
+        batch_only_cuda_graph=(
             bool(cuda_graph)
             and str(
                 getattr(

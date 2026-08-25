@@ -24,7 +24,7 @@ from sparsevllm.method_registry import decode_sparse_long_text_threshold
 from sparsevllm.operators import registry as operator_registry
 from sparsevllm.operators.decode_attention import (
     collect_decode_graph_participants,
-    validate_context_independent_decode_graph_model,
+    validate_batch_only_decode_graph_model,
 )
 from sparsevllm.utils.context import set_context, get_context, reset_context
 from sparsevllm.utils.loader import load_model, sync_deltakv_config_from_checkpoint
@@ -273,7 +273,7 @@ class ModelRunner:
             ),
         )
         if self.config.decode_graph_shape_policy == "batch_only":
-            validate_context_independent_decode_graph_model(self.model)
+            validate_batch_only_decode_graph_model(self.model)
         if config.tiny_random:
             from sparsevllm.debug.tiny_random import initialize_sparse_model
 

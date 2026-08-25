@@ -493,7 +493,7 @@ def sglang_gemma4_decode(
     device_core_count: int,
     attn_score: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run SGLang's context-independent fixed-grid Gemma 4 decode."""
+    """Run SGLang's context-stable fixed-grid Gemma 4 decode."""
     _check_inputs(
         q,
         k,

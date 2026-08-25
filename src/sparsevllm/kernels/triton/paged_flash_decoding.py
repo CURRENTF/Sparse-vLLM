@@ -1,4 +1,4 @@
-"""Context-independent split-KV decode attention.
+"""Graph-stable split-KV paged decode attention.
 
 The stable decode kernels intentionally remain unchanged.  This variant fixes
 the CUDA launch grid and workspace split dimension while deriving the effective
@@ -15,7 +15,7 @@ import triton.language as tl
 
 
 @triton.jit
-def _context_independent_decode_stage1(
+def _paged_decode_stage1(
     Q,
     K,
     V,
@@ -127,7 +127,7 @@ def _context_independent_decode_stage1(
 
 
 @triton.jit
-def _context_independent_grouped_decode_stage1(
+def _paged_grouped_decode_stage1(
     Q,
     K,
     V,
@@ -263,7 +263,7 @@ def _context_independent_grouped_decode_stage1(
 
 
 @triton.jit
-def _context_independent_decode_stage2(
+def _paged_decode_stage2(
     B_Seqlen,
     Mid_O,
     Mid_Lse,
@@ -331,7 +331,7 @@ def _check_inputs(
 ) -> None:
     head_dim = int(q.shape[-1])
     if head_dim not in {16, 32, 64, 128, 256}:
-        raise ValueError(f"unsupported context-independent decode head_dim={head_dim}")
+        raise ValueError(f"unsupported context-stable decode head_dim={head_dim}")
     if q.dtype != k.dtype or k.dtype != v.dtype:
         raise TypeError("query, key, and value tensors must have the same dtype")
     if int(q.shape[1]) % int(k.shape[1]):
@@ -357,7 +357,7 @@ def _check_inputs(
 
 
 @torch.no_grad()
-def context_independent_flash_decode(
+def paged_flash_decode(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -453,7 +453,7 @@ def context_independent_flash_decode(
         num_stages=num_stages,
     )
     if group_size > 1:
-        _context_independent_grouped_decode_stage1[
+        _paged_grouped_decode_stage1[
             (batch, int(k.shape[1]), max_kv_splits)
         ](
             *stage1_args,
@@ -461,7 +461,7 @@ def context_independent_flash_decode(
             **stage1_meta,
         )
     else:
-        _context_independent_decode_stage1[(batch, num_heads, max_kv_splits)](
+        _paged_decode_stage1[(batch, num_heads, max_kv_splits)](
             *stage1_args,
             **stage1_meta,
         )
@@ -478,7 +478,7 @@ def context_independent_flash_decode(
         )
     if output_lse.dtype != torch.float32 or output_lse.device != q.device:
         raise TypeError("softmax LSE workspace must be FP32 on the query device")
-    _context_independent_decode_stage2[(batch, num_heads)](
+    _paged_decode_stage2[(batch, num_heads)](
         context_lens,
         mid_o,
         mid_lse,

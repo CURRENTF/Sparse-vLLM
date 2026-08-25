@@ -1167,7 +1167,7 @@ class CacheManager(ABC):
             bool(is_long_text),
         )
 
-    def decode_graph_context_independent_capacity(
+    def decode_graph_batch_only_capacity(
         self, is_long_text: bool
     ) -> int:
         method = str(getattr(self.config, "sparse_method", "") or "")
@@ -1182,7 +1182,7 @@ class CacheManager(ABC):
         )
         return min(max_model_len, int(threshold))
 
-    def validate_decode_graph_context_independent_capacity(
+    def validate_decode_graph_batch_only_capacity(
         self,
         seqs: list[Sequence],
         *,

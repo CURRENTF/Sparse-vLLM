@@ -280,7 +280,7 @@ def test_glm_batch_only_mla_spec_owns_context_capacity() -> None:
 
     assert actual is bound
     spec = bind.call_args.kwargs["spec"]
-    assert spec.context_independent_cuda_graph
+    assert spec.batch_only_cuda_graph
     assert spec.context_capacity == 32768
 
 

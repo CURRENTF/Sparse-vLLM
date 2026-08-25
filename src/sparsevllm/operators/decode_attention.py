@@ -87,7 +87,7 @@ class DecodeAttentionOpSpec:
     layer_varying_page_table: bool = False
     cuda_graph: bool = True
     h2o_layerwise_probability_scores: bool = False
-    context_independent_cuda_graph: bool = False
+    batch_only_cuda_graph: bool = False
     context_capacity: int | None = None
 
     def __post_init__(self) -> None:
@@ -162,7 +162,7 @@ class DecodeAttentionRunResult:
 
 @dataclass(frozen=True)
 class GraphStableDecodeLaunchPlan:
-    """Capture-time launch envelope for context-independent MHA/GQA decode."""
+    """Capture-time launch envelope for context-stable MHA/GQA decode."""
 
     plan_id: str
     context_capacity: int
@@ -210,7 +210,7 @@ def build_graph_stable_decode_launch_plan(
     del caps
     if spec.context_capacity is None:
         raise ValueError(
-            "Context-independent decode requires a static context_capacity."
+            "context-stable decode requires a static context_capacity."
         )
     if spec.head_dim == 256:
         block_n, stage1_warps, stage2_warps = 128, 4, 8
@@ -218,7 +218,7 @@ def build_graph_stable_decode_launch_plan(
         block_n, stage1_warps, stage2_warps = 64, 2, 4
     else:
         raise ValueError(
-            f"No context-independent decode launch plan for head_dim={spec.head_dim}."
+            f"No context-stable decode launch plan for head_dim={spec.head_dim}."
         )
 
     # The grid is derived from the configured capacity, never the current
@@ -229,7 +229,7 @@ def build_graph_stable_decode_launch_plan(
         max(16, math.ceil(int(spec.context_capacity) / 4096)),
     )
     return GraphStableDecodeLaunchPlan(
-        plan_id="portable_context_independent_v1",
+        plan_id="portable_fixed_grid_v1",
         context_capacity=int(spec.context_capacity),
         max_kv_splits=max_kv_splits,
         target_tokens_per_split=256,
@@ -250,8 +250,10 @@ DECODE_ATTENTION_REGISTRY: OpRegistry[
             "sgl_fa3_paged_decode_sm90",
             "flashinfer_paged_decode",
         ),
-        repo_portable=("triton_paged_decode",),
-        repo_nonstandard=("triton_context_independent",),
+        repo_portable=(
+            "triton_paged_decode",
+            "triton_fixed_grid_paged_decode",
+        ),
     ),
 )
 
@@ -259,7 +261,7 @@ DECODE_ATTENTION_REGISTRY: OpRegistry[
 @DECODE_ATTENTION_REGISTRY.register_atomic(ProviderRole.UPSTREAM_STANDARD)
 class SglFa3PagedDecodeAttentionProvider(DecodeAttentionProvider):
     name = "sgl_fa3_paged_decode_sm90"
-    context_independent_cuda_graph = True
+    supports_batch_only_cuda_graph = True
     capabilities = AttentionKernelCapabilities(
         platforms=frozenset({PlatformEnum.CUDA}),
         compute_capabilities=frozenset({(9, 0)}),
@@ -402,6 +404,7 @@ class SglFa3PagedDecodeAttentionProvider(DecodeAttentionProvider):
 class FlashInferPagedDecodeAttentionProvider(DecodeAttentionProvider):
     name = "flashinfer_paged_decode"
     decode_graph_lifecycle = True
+    supports_batch_only_cuda_graph = True
     capabilities = AttentionKernelCapabilities(
         platforms=frozenset({PlatformEnum.CUDA}),
         activation_dtypes=frozenset({torch.bfloat16, torch.float16}),
@@ -828,7 +831,7 @@ class TritonPagedDecodeAttentionProvider(DecodeAttentionProvider):
         spec: DecodeAttentionOpSpec,
         caps: DeviceCaps,
     ) -> SupportResult:
-        if spec.context_independent_cuda_graph:
+        if spec.batch_only_cuda_graph:
             return SupportResult.unsupported("split count depends on context length")
         return match_attention_capabilities(
             spec.kernel_request,
@@ -934,12 +937,12 @@ class TritonPagedDecodeAttentionProvider(DecodeAttentionProvider):
         )
 
 
-@DECODE_ATTENTION_REGISTRY.register_atomic(ProviderRole.REPO_NONSTANDARD)
-class ContextIndependentTritonDecodeAttentionProvider(DecodeAttentionProvider):
+@DECODE_ATTENTION_REGISTRY.register_atomic(ProviderRole.REPO_PORTABLE)
+class FixedGridTritonPagedDecodeAttentionProvider(DecodeAttentionProvider):
     """Fixed-grid Triton MHA/GQA decode provider for batch-only graphs."""
 
-    name = "triton_context_independent"
-    context_independent_cuda_graph = True
+    name = "triton_fixed_grid_paged_decode"
+    supports_batch_only_cuda_graph = True
     capabilities = replace(
         TritonPagedDecodeAttentionProvider.capabilities,
         activation_dtypes=frozenset({torch.bfloat16, torch.float16}),
@@ -963,10 +966,10 @@ class ContextIndependentTritonDecodeAttentionProvider(DecodeAttentionProvider):
         spec: DecodeAttentionOpSpec,
         caps: DeviceCaps,
         **provider_kwargs,
-    ) -> ContextIndependentTritonDecodeAttentionProvider:
+    ) -> FixedGridTritonPagedDecodeAttentionProvider:
         if provider_kwargs:
             raise TypeError(
-                "Context-independent Triton decode does not accept provider "
+                "Fixed-grid Triton decode does not accept provider "
                 f"arguments: {sorted(provider_kwargs)}."
             )
         return cls(launch_plan=build_graph_stable_decode_launch_plan(spec, caps))
@@ -975,7 +978,7 @@ class ContextIndependentTritonDecodeAttentionProvider(DecodeAttentionProvider):
     def supports(
         cls, spec: DecodeAttentionOpSpec, caps: DeviceCaps
     ) -> SupportResult:
-        if not spec.context_independent_cuda_graph:
+        if not spec.batch_only_cuda_graph:
             return SupportResult.unsupported("reserved for batch-only CUDA Graph")
         if spec.context_capacity is None:
             return SupportResult.unsupported("requires a static context capacity")
@@ -993,7 +996,7 @@ class ContextIndependentTritonDecodeAttentionProvider(DecodeAttentionProvider):
     ) -> None:
         if self.launch_plan.context_capacity != spec.context_capacity:
             raise RuntimeError(
-                "Context-independent decode launch plan does not match the operator "
+                "Fixed-grid decode launch plan does not match the operator "
                 f"capacity: plan={self.launch_plan.context_capacity} "
                 f"spec={spec.context_capacity}."
             )
@@ -1034,7 +1037,7 @@ class ContextIndependentTritonDecodeAttentionProvider(DecodeAttentionProvider):
         return {
             "implementation_kind": "atomic_provider",
             "implementation_source": "repo_triton",
-            "kernel_path": "context_independent_flash_decode",
+            "kernel_path": "paged_flash_decode",
             "cuda_graph_shape_policy": "batch_only",
             "launch_plan": self.launch_plan.as_dict(),
             "workspace_owner": "provider",
@@ -1050,7 +1053,7 @@ class ContextIndependentTritonDecodeAttentionProvider(DecodeAttentionProvider):
         kwargs.pop("decode_launch_op", None)
         if kwargs:
             raise TypeError(
-                "Context-independent decode received unsupported arguments: "
+                "Fixed-grid decode received unsupported arguments: "
                 f"{sorted(kwargs)}."
             )
         if (
@@ -1058,18 +1061,18 @@ class ContextIndependentTritonDecodeAttentionProvider(DecodeAttentionProvider):
             or self._mid_lse is None
             or self._softmax_lse is None
         ):
-            raise RuntimeError("Context-independent decode provider was not prepared.")
+            raise RuntimeError("Fixed-grid decode provider was not prepared.")
         payload = view.payload
         if getattr(payload, "backend", None) != "dense":
             raise RuntimeError(
-                "Context-independent decode requires dense explicit KV storage."
+                "Fixed-grid decode requires dense explicit KV storage."
             )
         batch_size = int(q.shape[0])
-        from sparsevllm.kernels.triton.context_independent_flash_decoding import (
-            context_independent_flash_decode,
+        from sparsevllm.kernels.triton.paged_flash_decoding import (
+            paged_flash_decode,
         )
 
-        result = context_independent_flash_decode(
+        result = paged_flash_decode(
             q,
             payload.k_cache,
             payload.v_cache,
@@ -1096,7 +1099,7 @@ class ContextIndependentTritonDecodeAttentionProvider(DecodeAttentionProvider):
         if not spec.h2o_layerwise_probability_scores:
             return result
         if not isinstance(result, tuple):
-            raise RuntimeError("Context-independent decode did not return softmax LSE.")
+            raise RuntimeError("Fixed-grid decode did not return softmax LSE.")
         return DecodeAttentionRunResult(output=result[0], softmax_lse=result[1])
 
 
@@ -1117,8 +1120,10 @@ class PreparedDecodeAttentionOp:
         return self.provider.name
 
     @property
-    def context_independent_cuda_graph(self) -> bool:
-        return bool(self.spec.context_independent_cuda_graph)
+    def supports_batch_only_cuda_graph(self) -> bool:
+        return bool(
+            getattr(self.provider, "supports_batch_only_cuda_graph", False)
+        )
 
     def run(self, q: torch.Tensor, view: Any, **kwargs) -> torch.Tensor:
         if self._closed:
@@ -1235,7 +1240,7 @@ def collect_decode_graph_participants(model: torch.nn.Module) -> tuple[object, .
     return tuple(participants)
 
 
-def validate_context_independent_decode_graph_model(model: torch.nn.Module) -> int:
+def validate_batch_only_decode_graph_model(model: torch.nn.Module) -> int:
     """Audit every semantic decode path after construction-time binding."""
     from sparsevllm.layers.attention import Attention
 
@@ -1249,18 +1254,18 @@ def validate_context_independent_decode_graph_model(model: torch.nn.Module) -> i
                 else getattr(module, "attention_backend", None)
             )
             if not bool(
-                getattr(implementation, "context_independent_cuda_graph", False)
+                getattr(implementation, "supports_batch_only_cuda_graph", False)
             ):
                 raise RuntimeError(
-                    "batch-only decode CUDA Graph requires a context-independent "
+                    "batch-only decode CUDA Graph requires a graph-stable "
                     f"attention provider, got {type(implementation).__name__}."
                 )
             validated += 1
         if getattr(module, "is_gated_delta_rule_layer", False):
             op = getattr(module, "gated_delta_rule_op", None)
-            if not bool(getattr(op, "context_independent_cuda_graph", False)):
+            if not bool(getattr(op, "supports_batch_only_cuda_graph", False)):
                 raise RuntimeError(
-                    "batch-only decode CUDA Graph requires a context-independent "
+                    "batch-only decode CUDA Graph requires a graph-stable "
                     "GDN provider."
                 )
             validated += 1
@@ -1270,10 +1275,10 @@ def validate_context_independent_decode_graph_model(model: torch.nn.Module) -> i
     if mla_attention is not None:
         provider = getattr(mla_attention, "provider", None)
         if not bool(
-            getattr(provider, "context_independent_cuda_graph", False)
+            getattr(provider, "supports_batch_only_cuda_graph", False)
         ):
             raise RuntimeError(
-                "batch-only decode CUDA Graph requires a context-independent "
+                "batch-only decode CUDA Graph requires a graph-stable "
                 "MLA provider."
             )
         validated += 1

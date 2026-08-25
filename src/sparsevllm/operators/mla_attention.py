@@ -68,7 +68,7 @@ class MlaAttentionOpSpec:
     tp_size: int
     cuda_graph: bool
     score_output: AttentionScoreKind = AttentionScoreKind.NONE
-    context_independent_cuda_graph: bool = False
+    batch_only_cuda_graph: bool = False
     context_capacity: int | None = None
 
     def __post_init__(self) -> None:
@@ -146,7 +146,7 @@ MLA_ATTENTION_REGISTRY: OpRegistry[
     "MLA attention",
     portfolio=PortfolioPolicy(
         upstream_standard=("sgl_fa3_sm90",),
-        repo_nonstandard=("triton_sm90_context_independent", "triton_sm90"),
+        repo_nonstandard=("triton_sm90",),
     ),
     profile_order=("tilelang_score_sgl_fa3_h100_profile",),
 )
@@ -157,6 +157,7 @@ class MlaTritonProvider(MlaAttentionProvider):
     """Portable SM90 provider with caller-independent decode workspace."""
 
     name = "triton_sm90"
+    supports_batch_only_cuda_graph = True
     capabilities = AttentionKernelCapabilities(
         platforms=frozenset({PlatformEnum.CUDA}),
         compute_capabilities=frozenset({(9, 0)}),
@@ -211,10 +212,18 @@ class MlaTritonProvider(MlaAttentionProvider):
         self._runtime_fallback_reasons: dict[str, int] = {}
 
     def binding_metadata(self) -> dict[str, object]:
-        return {
+        metadata = {
             "implementation_kind": "atomic_provider",
             "implementation_source": "repo_triton",
             "decode_kernel_path": "triton_mla_stage1_stage2",
+        }
+        if not self.spec.batch_only_cuda_graph:
+            return metadata
+        return {
+            **metadata,
+            "cuda_graph_shape_policy": "batch_only",
+            "context_capacity": self.spec.context_capacity,
+            "launch_plan_source": "batch_tp_heads_context_capacity",
         }
 
     def _record_runtime_kernel_path(self, path: str) -> None:
@@ -302,10 +311,8 @@ class MlaTritonProvider(MlaAttentionProvider):
         spec: MlaAttentionOpSpec,
         caps: DeviceCaps,
     ) -> SupportResult:
-        if spec.context_independent_cuda_graph:
-            return SupportResult.unsupported(
-                "launch configuration depends on runtime context length"
-            )
+        if spec.batch_only_cuda_graph and spec.context_capacity is None:
+            return SupportResult.unsupported("requires a static context capacity")
         return cls._common_contract_support(spec, caps)
 
     def _validate_run_inputs(
@@ -443,11 +450,18 @@ class MlaTritonProvider(MlaAttentionProvider):
     ) -> MlaDecodeLaunchConfig:
         if self._fixed_launch_config is not None:
             return self._fixed_launch_config
-        context_capacity = (
-            active_slot_width
-            if max_context_len is None
-            else int(max_context_len)
-        )
+        if self.spec.batch_only_cuda_graph:
+            if self.spec.context_capacity is None:
+                raise RuntimeError(
+                    "Batch-only MLA requires a static context capacity."
+                )
+            context_capacity = self.spec.context_capacity
+        else:
+            context_capacity = (
+                active_slot_width
+                if max_context_len is None
+                else int(max_context_len)
+            )
         return select_glm_mla_decode_config(
             batch_size=batch_size,
             context_capacity=context_capacity,
@@ -503,62 +517,13 @@ class MlaTritonProvider(MlaAttentionProvider):
         )
 
 
-@MLA_ATTENTION_REGISTRY.register_atomic(ProviderRole.REPO_NONSTANDARD)
-class ContextIndependentMlaTritonProvider(MlaTritonProvider):
-    """MLA decode planned from batch, TP shape, and static context capacity."""
-
-    name = "triton_sm90_context_independent"
-    context_independent_cuda_graph = True
-
-    @classmethod
-    def supports(
-        cls,
-        spec: MlaAttentionOpSpec,
-        caps: DeviceCaps,
-    ) -> SupportResult:
-        if not spec.context_independent_cuda_graph:
-            return SupportResult.unsupported("reserved for batch-only CUDA Graph")
-        if spec.context_capacity is None:
-            return SupportResult.unsupported("requires a static context capacity")
-        return cls._common_contract_support(spec, caps)
-
-    def _launch_config_for(
-        self,
-        *,
-        batch_size: int,
-        max_context_len: int | None,
-        active_slot_width: int,
-    ) -> MlaDecodeLaunchConfig:
-        del max_context_len, active_slot_width
-        if self._fixed_launch_config is not None:
-            return self._fixed_launch_config
-        if self.spec.context_capacity is None:
-            raise RuntimeError(
-                "Context-independent MLA requires a static context capacity."
-            )
-        return select_glm_mla_decode_config(
-            batch_size=batch_size,
-            context_capacity=self.spec.context_capacity,
-            local_q_heads=self.spec.local_q_heads,
-        )
-
-    def binding_metadata(self) -> dict[str, object]:
-        metadata = super().binding_metadata()
-        return {
-            **metadata,
-            "cuda_graph_shape_policy": "batch_only",
-            "context_capacity": self.spec.context_capacity,
-            "launch_plan_source": "batch_tp_heads_context_capacity",
-        }
-
-
 @MLA_ATTENTION_REGISTRY.register_atomic(ProviderRole.UPSTREAM_STANDARD)
 class MlaSglFa3Provider(MlaTritonProvider):
     """SGL FA3 decode with the score-producing Triton path kept explicit."""
 
     name = "sgl_fa3_sm90"
     supports_explicit_prefill = True
-    context_independent_cuda_graph = True
+    supports_batch_only_cuda_graph = True
 
     def __init__(
         self,
@@ -787,7 +752,7 @@ class MlaTileLangScoreProvider(MlaSglFa3Provider):
     """Score-aware Composite over FA3 and statically planned TileLang."""
 
     name = "tilelang_score_sgl_fa3_h100"
-    context_independent_cuda_graph = True
+    supports_batch_only_cuda_graph = True
 
     def __init__(
         self,
@@ -1027,7 +992,6 @@ __all__ = [
     "MLA_ATTENTION_REGISTRY",
     "MlaAttentionOpSpec",
     "MlaAttentionProvider",
-    "ContextIndependentMlaTritonProvider",
     "MlaSglFa3Provider",
     "MlaTileLangScoreProvider",
     "MlaTritonProvider",

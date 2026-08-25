@@ -24,7 +24,6 @@ from sparsevllm.kernels.tilelang.mla.runtime import (
 from sparsevllm.kernels.triton.mla import MlaDecodeWorkspace
 from sparsevllm.operators.attention_capabilities import AttentionScoreKind
 from sparsevllm.operators.mla_attention import (
-    ContextIndependentMlaTritonProvider,
     MLA_ATTENTION_REGISTRY,
     MlaAttentionOpSpec,
     MlaTileLangScoreProvider,
@@ -324,7 +323,7 @@ def test_tilelang_mla_exact_h100_profile_overrides_default_portfolio() -> None:
 def test_batch_only_score_contract_binds_static_tilelang_plan() -> None:
     spec = replace(
         _spec(),
-        context_independent_cuda_graph=True,
+        batch_only_cuda_graph=True,
     )
     workspace = _cpu_workspace()
     with (
@@ -352,7 +351,7 @@ def test_batch_only_score_contract_binds_static_tilelang_plan() -> None:
         )
 
     assert type(resolved.provider) is MlaTileLangScoreProvider
-    assert resolved.provider.context_independent_cuda_graph
+    assert resolved.provider.supports_batch_only_cuda_graph
     assert resolved.provider.tilelang_launch_plan.context_capacity == 65536
 
 
@@ -360,7 +359,7 @@ def test_batch_only_reduced_score_contract_binds_static_triton_provider() -> Non
     spec = replace(
         _spec(),
         score_output=AttentionScoreKind.RAW_QK_REDUCED,
-        context_independent_cuda_graph=True,
+        batch_only_cuda_graph=True,
     )
     with (
         patch(
@@ -384,7 +383,7 @@ def test_batch_only_reduced_score_contract_binds_static_triton_provider() -> Non
             max_batch_size=2,
         )
 
-    assert type(resolved.provider) is ContextIndependentMlaTritonProvider
+    assert type(resolved.provider) is MlaTritonProvider
     assert (
         "tilelang_score_sgl_fa3_h100",
         "requires the RAW_QK_PER_HEAD decode score contract",

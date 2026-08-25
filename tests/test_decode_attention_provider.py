@@ -91,7 +91,7 @@ def test_batch_only_decode_spec_carries_static_context_capacity():
         runtime_config=runtime_config,
     )
 
-    assert spec.context_independent_cuda_graph
+    assert spec.batch_only_cuda_graph
     assert spec.context_capacity == runtime_config.max_model_len
 
 
@@ -480,7 +480,7 @@ def test_flashinfer_graph_decode_replans_and_replays_new_metadata():
         softmax_scale=head_dim**-0.5,
         max_batch_size=batch,
         cuda_graph=True,
-        context_independent_cuda_graph=True,
+        batch_only_cuda_graph=True,
         context_capacity=capacity,
     )
     contract = DecodeGraphContract(
