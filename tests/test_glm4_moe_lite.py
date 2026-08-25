@@ -32,6 +32,7 @@ from sparsevllm.models.glm4_moe_lite import (
     build_glm4_moe_lite_mla_attention,
 )
 from sparsevllm.models.qwen3 import Qwen3MLP
+from sparsevllm.operators.attention_capabilities import AttentionScoreKind
 from sparsevllm.operators.mla_attention import MlaAttentionOpSpec
 from sparsevllm.operators.moe import TritonMoeProvider
 from sparsevllm.operators.moe_router import GlmBiasedSigmoidRouterProvider
@@ -238,7 +239,11 @@ def test_glm_runtime_kwargs_bind_model_owned_operators(
         decode_graph=True,
         context_capacity=32768,
         projection_chunk_size=16,
-        may_require_attention_scores=requires_scores,
+        score_output=(
+            AttentionScoreKind.RAW_QK_PER_HEAD
+            if requires_scores
+            else AttentionScoreKind.NONE
+        ),
     )
     build_all_reduce.assert_called_once_with(
         config,

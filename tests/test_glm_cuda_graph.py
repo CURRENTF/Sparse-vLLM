@@ -18,7 +18,7 @@ from sparsevllm.configs.cuda_graph import (
     build_decode_cuda_graph_startup_plan,
 )
 from sparsevllm.models.layout import resolve_attention_qk_head_dim
-from sparsevllm.method_registry import sparse_decode_attention_requires_scores
+from sparsevllm.method_registry import sparse_decode_attention_score_kind
 from sparsevllm.distributed import ParallelContext
 from sparsevllm.engine.cache_manager import LayerBatchStates
 from sparsevllm.engine.cache_manager.h2o import H2OCacheManager
@@ -207,7 +207,6 @@ def _make_glm_graph_lane(
         cache_dtype=torch.bfloat16,
         tp_size=1,
         cuda_graph=True,
-        may_require_attention_scores=False,
     )
     mla_attention = MLAAttention.bind(
         spec=spec,
@@ -545,7 +544,6 @@ def _make_glm_full_graph_lane(
         cache_dtype=torch.bfloat16,
         tp_size=1,
         cuda_graph=True,
-        may_require_attention_scores=False,
     )
     mla_attention = MLAAttention.bind(
         spec=mla_spec,
@@ -1117,7 +1115,7 @@ def _make_glm_method_graph_lane(
         cache_dtype=torch.bfloat16,
         tp_size=1,
         cuda_graph=True,
-        may_require_attention_scores=sparse_decode_attention_requires_scores(method),
+        score_output=sparse_decode_attention_score_kind(method),
     )
     mla_attention = MLAAttention.bind(
         spec=spec,

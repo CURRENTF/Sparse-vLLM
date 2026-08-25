@@ -102,11 +102,17 @@ def build_glm_mla_decode_kernel(
     VALID_BLOCK_H = min(block_H, kv_group_num)
     VALID_OUTPUT_HEADS = valid_output_heads
     HEAD_TILE_COUNT = h_q // VALID_BLOCK_H
-    SCORE_TILE_COUNT = HEAD_TILE_COUNT if score_mode == "partial" else 1
+    SCORE_TILE_COUNT = (
+        VALID_OUTPUT_HEADS
+        if score_mode == "per_head"
+        else HEAD_TILE_COUNT
+        if score_mode == "partial"
+        else 1
+    )
     assert h_kv == 1, "h_kv must be 1"
     assert h_q % VALID_BLOCK_H == 0, "h_q must use complete head tiles"
     assert 0 < VALID_OUTPUT_HEADS <= h_q, "valid output heads must fit h_q"
-    assert score_mode in ("direct", "atomic", "partial")
+    assert score_mode in ("direct", "atomic", "partial", "per_head")
     assert not need_score or score_mode != "direct" or HEAD_TILE_COUNT == 1
     assert block_size >= block_N and block_size % block_N == 0, (
         "block_size must be at least block_N and a multiple of block_N"
@@ -190,15 +196,20 @@ def build_glm_mla_decode_kernel(
                 for i, j in T.Parallel(block_H, block_N):
                     acc_s[i, j] = T.if_then_else(by * VALID_BLOCK_H + i >= VALID_OUTPUT_HEADS, -T.infinity(accum_dtype), acc_s[i, j])
                 if need_score:
-                    T.reduce_max(acc_s, token_scores, dim=0)
+                    if score_mode == "per_head":
+                        for i, j in T.Parallel(block_H, block_N):
+                            score_index = start + k * block_N + j
+                            global_head = by * VALID_BLOCK_H + i
+                            if score_index < cache_seqlens[bx]:
+                                if global_head < VALID_OUTPUT_HEADS:
+                                    AttnScore[bx, global_head, score_index] = acc_s[i, j]
+                    else:
+                        T.reduce_max(acc_s, token_scores, dim=0)
                     if score_mode == "direct":
                         for j in T.Parallel(block_N):
                             score_index = start + k * block_N + j
-                            AttnScore[bx, 0, score_index] = T.if_then_else(
-                                score_index < cache_seqlens[bx],
-                                token_scores[j],
-                                AttnScore[bx, 0, score_index],
-                            )
+                            if score_index < cache_seqlens[bx]:
+                                AttnScore[bx, 0, score_index] = token_scores[j]
                     elif score_mode == "atomic":
                         for j in T.Parallel(block_N):
                             score_index = start + k * block_N + j
@@ -207,7 +218,7 @@ def build_glm_mla_decode_kernel(
                                     AttnScore[bx, 0, score_index],
                                     token_scores[j],
                                 )
-                    else:
+                    elif score_mode == "partial":
                         for j in T.Parallel(block_N):
                             score_index = start + k * block_N + j
                             AttnScore[bx, by, score_index] = T.if_then_else(
@@ -351,15 +362,20 @@ def build_glm_mla_decode_kernel(
                 for i, j in T.Parallel(block_H, block_N):
                     acc_s[i, j] = T.if_then_else(by * VALID_BLOCK_H + i >= VALID_OUTPUT_HEADS, -T.infinity(accum_dtype), acc_s[i, j])
                 if need_score:
-                    T.reduce_max(acc_s, token_scores, dim=0)
+                    if score_mode == "per_head":
+                        for i, j in T.Parallel(block_H, block_N):
+                            score_index = k * block_N + j
+                            global_head = by * VALID_BLOCK_H + i
+                            if score_index < cache_seqlens[bx]:
+                                if global_head < VALID_OUTPUT_HEADS:
+                                    AttnScore[bx, global_head, score_index] = acc_s[i, j]
+                    else:
+                        T.reduce_max(acc_s, token_scores, dim=0)
                     if score_mode == "direct":
                         for j in T.Parallel(block_N):
                             score_index = k * block_N + j
-                            AttnScore[bx, 0, score_index] = T.if_then_else(
-                                score_index < cache_seqlens[bx],
-                                token_scores[j],
-                                AttnScore[bx, 0, score_index],
-                            )
+                            if score_index < cache_seqlens[bx]:
+                                AttnScore[bx, 0, score_index] = token_scores[j]
                     elif score_mode == "atomic":
                         for j in T.Parallel(block_N):
                             score_index = k * block_N + j
@@ -368,7 +384,7 @@ def build_glm_mla_decode_kernel(
                                     AttnScore[bx, 0, score_index],
                                     token_scores[j],
                                 )
-                    else:
+                    elif score_mode == "partial":
                         for j in T.Parallel(block_N):
                             score_index = k * block_N + j
                             AttnScore[bx, by, score_index] = T.if_then_else(

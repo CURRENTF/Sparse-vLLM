@@ -146,10 +146,26 @@ def h2o_uses_fused_prefill_score(config) -> bool:
 def sparse_decode_attention_requires_scores(method: str | None) -> bool:
     """Return whether a prepared decode implementation must support scores."""
 
+    return sparse_decode_attention_score_kind(method) is not AttentionScoreKind.NONE
+
+
+def sparse_decode_attention_score_kind(
+    method: str | None,
+) -> AttentionScoreKind:
+    """Return the score representation consumed by sparse decode logic.
+
+    Decode sparse methods currently normalize and reduce scores in
+    ``SparseController``.  Providers therefore produce raw per-head QK values;
+    a head-reduced raw maximum is not equivalent to normalizing each head and
+    then reducing the probabilities.
+    """
+
     normalized = normalize_sparse_method(method)
     if normalized not in CANONICAL_SPARSE_METHODS:
         raise ValueError(f"Unknown sparse method {normalized!r}.")
-    return normalized in _DECODE_ATTENTION_SCORE_METHODS
+    if normalized in _DECODE_ATTENTION_SCORE_METHODS:
+        return AttentionScoreKind.RAW_QK_PER_HEAD
+    return AttentionScoreKind.NONE
 
 
 _MOE_SPARSE_METHODS = frozenset(
