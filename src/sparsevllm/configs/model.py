@@ -153,7 +153,7 @@ def load_and_validate_model(config) -> None:
             config.hf_config,
             config.tiny_random_config,
             validate_standard_head_shape=(
-                model_spec.attention_cache_layout == "explicit_kv"
+                model_spec.tiny_random_requires_standard_head_shape
             ),
         )
         log_once(
@@ -178,7 +178,11 @@ def load_and_validate_model(config) -> None:
             or config_get(config.outer_hf_config, "torch_dtype", "bfloat16")
         ),
     )
-    if config.tiny_random and config.quantization_config.enabled:
+    if (
+        config.tiny_random
+        and config.quantization_config.enabled
+        and not model_spec.supports_quantized_tiny_random
+    ):
         raise NotImplementedError(
             "Tiny random mode does not support quantized model weights."
         )

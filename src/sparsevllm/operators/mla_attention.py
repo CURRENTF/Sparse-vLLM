@@ -68,6 +68,7 @@ class MlaAttentionOpSpec:
     cuda_graph: bool
     may_require_attention_scores: bool = False
     context_independent_cuda_graph: bool = False
+    context_capacity: int | None = None
 
     def __post_init__(self) -> None:
         dimensions = {
@@ -86,6 +87,8 @@ class MlaAttentionOpSpec:
                 "MLA query heads must be divisible by tensor parallel size: "
                 f"heads={self.num_q_heads} tp_size={self.tp_size}."
             )
+        if self.context_capacity is not None and self.context_capacity <= 0:
+            raise ValueError("MLA context_capacity must be positive.")
 
     @property
     def local_q_heads(self) -> int:
@@ -244,19 +247,11 @@ class MlaTritonProvider(MlaAttentionProvider):
         }
 
     @classmethod
-    def _contract_support(
+    def _common_contract_support(
         cls,
         spec: MlaAttentionOpSpec,
         caps: DeviceCaps,
     ) -> SupportResult:
-        is_context_provider = cls.name == "triton_sm90_context_independent"
-        if spec.context_independent_cuda_graph != is_context_provider:
-            reason = (
-                "reserved for batch-only CUDA Graph"
-                if is_context_provider
-                else "launch topology depends on context length"
-            )
-            return SupportResult.unsupported(reason)
         common = match_attention_capabilities(
             spec.kernel_request, caps, cls.capabilities
         )
@@ -300,7 +295,11 @@ class MlaTritonProvider(MlaAttentionProvider):
         spec: MlaAttentionOpSpec,
         caps: DeviceCaps,
     ) -> SupportResult:
-        return cls._contract_support(spec, caps)
+        if spec.context_independent_cuda_graph:
+            return SupportResult.unsupported(
+                "launch configuration depends on runtime context length"
+            )
+        return cls._common_contract_support(spec, caps)
 
     def _validate_run_inputs(
         self,
@@ -444,7 +443,7 @@ class MlaTritonProvider(MlaAttentionProvider):
         )
         return select_glm_mla_decode_config(
             batch_size=batch_size,
-            max_context_len=context_capacity,
+            context_capacity=context_capacity,
             local_q_heads=self.spec.local_q_heads,
         )
 
@@ -499,10 +498,22 @@ class MlaTritonProvider(MlaAttentionProvider):
 
 @MLA_ATTENTION_REGISTRY.register_atomic(ProviderRole.REPO_NONSTANDARD)
 class ContextIndependentMlaTritonProvider(MlaTritonProvider):
-    """MLA decode with a launch schedule determined only by batch and TP shape."""
+    """MLA decode planned from batch, TP shape, and static context capacity."""
 
     name = "triton_sm90_context_independent"
     context_independent_cuda_graph = True
+
+    @classmethod
+    def supports(
+        cls,
+        spec: MlaAttentionOpSpec,
+        caps: DeviceCaps,
+    ) -> SupportResult:
+        if not spec.context_independent_cuda_graph:
+            return SupportResult.unsupported("reserved for batch-only CUDA Graph")
+        if spec.context_capacity is None:
+            return SupportResult.unsupported("requires a static context capacity")
+        return cls._common_contract_support(spec, caps)
 
     def _launch_config_for(
         self,
@@ -514,15 +525,24 @@ class ContextIndependentMlaTritonProvider(MlaTritonProvider):
         del max_context_len, active_slot_width
         if self._fixed_launch_config is not None:
             return self._fixed_launch_config
+        if self.spec.context_capacity is None:
+            raise RuntimeError(
+                "Context-independent MLA requires a static context capacity."
+            )
         return select_glm_mla_decode_config(
             batch_size=batch_size,
-            max_context_len=8193,
+            context_capacity=self.spec.context_capacity,
             local_q_heads=self.spec.local_q_heads,
         )
 
     def binding_metadata(self) -> dict[str, object]:
         metadata = super().binding_metadata()
-        return {**metadata, "cuda_graph_shape_policy": "batch_only"}
+        return {
+            **metadata,
+            "cuda_graph_shape_policy": "batch_only",
+            "context_capacity": self.spec.context_capacity,
+            "launch_plan_source": "batch_tp_heads_context_capacity",
+        }
 
 
 @MLA_ATTENTION_REGISTRY.register_atomic(ProviderRole.UPSTREAM_STANDARD)
@@ -531,6 +551,7 @@ class MlaSglFa3Provider(MlaTritonProvider):
 
     name = "sgl_fa3_sm90"
     supports_explicit_prefill = True
+    context_independent_cuda_graph = True
 
     def __init__(
         self,
@@ -558,7 +579,7 @@ class MlaSglFa3Provider(MlaTritonProvider):
         spec: MlaAttentionOpSpec,
         caps: DeviceCaps,
     ) -> SupportResult:
-        base = cls._contract_support(spec, caps)
+        base = cls._common_contract_support(spec, caps)
         if not base.supported:
             return base
         if spec.may_require_attention_scores:
@@ -759,6 +780,7 @@ class MlaTileLangScoreProvider(MlaSglFa3Provider):
     """Explicit score-aware Composite over FA3, TileLang, and Triton."""
 
     name = "tilelang_score_sgl_fa3_h100"
+    context_independent_cuda_graph = False
 
     def __init__(
         self,
@@ -786,7 +808,11 @@ class MlaTileLangScoreProvider(MlaSglFa3Provider):
         spec: MlaAttentionOpSpec,
         caps: DeviceCaps,
     ) -> SupportResult:
-        base = cls._contract_support(spec, caps)
+        if spec.context_independent_cuda_graph:
+            return SupportResult.unsupported(
+                "batch-only CUDA Graph requires a fixed TileLang JIT/score route"
+            )
+        base = cls._common_contract_support(spec, caps)
         if not base.supported:
             return base
         if not spec.may_require_attention_scores:

@@ -5,6 +5,10 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
+from sparsevllm.engine.decode_graph_contract import (
+    DecodeGraphContract,
+    DecodeGraphInputs,
+)
 from sparsevllm.kernels.external.flashinfer.decode import (
     flashinfer_paged_decode_support,
 )
@@ -129,7 +133,7 @@ def _spec(**overrides) -> DecodeAttentionOpSpec:
     return DecodeAttentionOpSpec(**values)
 
 
-def test_flashinfer_lse_decode_rejects_cuda_graph_before_dependency_probe():
+def test_flashinfer_lse_decode_accepts_cuda_graph_contract():
     spec = _spec(
         may_require_attention_scores=True,
         layer_varying_page_table=True,
@@ -141,13 +145,13 @@ def test_flashinfer_lse_decode_rejects_cuda_graph_before_dependency_probe():
     )
 
     with patch(
-        "sparsevllm.operators.decode_attention.flashinfer_paged_decode_support"
+        "sparsevllm.operators.decode_attention.flashinfer_paged_decode_support",
+        return_value=(True, "available"),
     ) as support:
         result = FlashInferPagedDecodeAttentionProvider.supports(spec, caps)
 
-    assert not result.supported
-    assert "CUDA Graph" in result.reason
-    support.assert_not_called()
+    assert result.supported
+    support.assert_called_once_with()
 
 
 def test_prepared_h2o_decode_applies_fixed_probability_scorer():
@@ -460,6 +464,123 @@ def test_sgl_decode_provider_uses_prepared_explicit_kv_adapter():
         "return_softmax_lse": False,
     }
     decode_launch_op.launch_config.assert_not_called()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_flashinfer_graph_decode_replans_and_replays_new_metadata():
+    flashinfer_paged_decode_support()
+    torch.manual_seed(20260825)
+    device = torch.device("cuda")
+    batch, query_heads, kv_heads, head_dim, capacity = 2, 8, 2, 128, 17
+    spec = _spec(
+        num_query_heads=query_heads,
+        num_kv_heads=kv_heads,
+        head_dim=head_dim,
+        activation_dtype=torch.bfloat16,
+        softmax_scale=head_dim**-0.5,
+        max_batch_size=batch,
+        cuda_graph=True,
+        context_independent_cuda_graph=True,
+        context_capacity=capacity,
+    )
+    contract = DecodeGraphContract(
+        method="",
+        shape_policy="batch_only",
+        topology_path_id="dense",
+        batch_capacity=batch,
+        context_capacity=capacity,
+    )
+    inputs = DecodeGraphInputs.allocate(
+        contract,
+        device=device,
+        pin_memory=False,
+    )
+    q = torch.randn(
+        batch,
+        query_heads,
+        head_dim,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    slots = 3 * capacity
+    k_cache = torch.randn(
+        slots,
+        kv_heads,
+        head_dim,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    v_cache = torch.randn_like(k_cache)
+    page_table = torch.arange(
+        slots,
+        dtype=torch.int32,
+        device=device,
+    ).view(3, capacity)
+    view = SimpleNamespace(
+        payload=SimpleNamespace(k_cache=k_cache, v_cache=v_cache),
+        meta=SimpleNamespace(
+            active_slots=page_table,
+            req_indices=inputs.request_indices,
+            context_lens=inputs.context_lens,
+            attn_score=None,
+        ),
+    )
+    provider = FlashInferPagedDecodeAttentionProvider()
+    provider.prepare(spec, device_index=torch.cuda.current_device())
+    state = provider.init_decode_graph_state(spec, contract, inputs)
+
+    def update_metadata(lengths, rows) -> None:
+        inputs.host.context_lens.copy_(torch.tensor(lengths, dtype=torch.int32))
+        inputs.host.request_indices.copy_(torch.tensor(rows, dtype=torch.int32))
+        inputs.context_lens.copy_(inputs.host.context_lens)
+        inputs.request_indices.copy_(inputs.host.request_indices)
+        provider.prepare_decode_graph_out(state)
+        provider.prepare_decode_graph_in(state)
+
+    def reference() -> torch.Tensor:
+        expected = []
+        group_size = query_heads // kv_heads
+        for batch_idx in range(batch):
+            length = int(inputs.host.context_lens[batch_idx])
+            row = int(inputs.host.request_indices[batch_idx])
+            active = page_table[row, :length].long()
+            keys = k_cache[active].repeat_interleave(group_size, dim=1)
+            values = v_cache[active].repeat_interleave(group_size, dim=1)
+            logits = torch.einsum(
+                "hd,lhd->hl",
+                q[batch_idx].float(),
+                keys.float(),
+            ) * spec.softmax_scale
+            expected.append(
+                torch.einsum(
+                    "hl,lhd->hd",
+                    torch.softmax(logits, dim=-1),
+                    values.float(),
+                ).to(q.dtype)
+            )
+        return torch.stack(expected)
+
+    try:
+        update_metadata([17, 13], [2, 0])
+        provider.run(spec, q, view)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            graph_output = provider.run(spec, q, view)
+
+        update_metadata([9, 16], [1, 2])
+        expected = reference()
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            graph_output,
+            expected,
+            rtol=3e-2,
+            atol=3e-2,
+        )
+    finally:
+        provider.close_decode_graph_state(state)
+        provider.close()
 
 
 def test_triton_provider_owns_launch_config_and_workspace_preparation():

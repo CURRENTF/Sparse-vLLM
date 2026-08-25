@@ -67,7 +67,17 @@ def _paged_decode_wrapper_type():
         )
     _require_parameters(
         wrapper_type,
-        frozenset({"float_workspace_buffer", "kv_layout", "backend"}),
+        frozenset(
+            {
+                "float_workspace_buffer",
+                "kv_layout",
+                "use_cuda_graph",
+                "paged_kv_indptr_buffer",
+                "paged_kv_indices_buffer",
+                "paged_kv_last_page_len_buffer",
+                "backend",
+            }
+        ),
         feature=feature,
         entrypoint="BatchDecodeWithPagedKVCacheWrapper",
     )
@@ -110,11 +120,22 @@ def flashinfer_paged_decode_support() -> tuple[bool, str]:
     return True, reason
 
 
-def make_flashinfer_paged_decode_wrapper(workspace: torch.Tensor):
+def make_flashinfer_paged_decode_wrapper(
+    workspace: torch.Tensor,
+    *,
+    use_cuda_graph: bool = False,
+    paged_kv_indptr_buffer: torch.Tensor | None = None,
+    paged_kv_indices_buffer: torch.Tensor | None = None,
+    paged_kv_last_page_len_buffer: torch.Tensor | None = None,
+):
     wrapper_type, _ = _paged_decode_wrapper_type()
     return wrapper_type(
         workspace,
         kv_layout="NHD",
+        use_cuda_graph=use_cuda_graph,
+        paged_kv_indptr_buffer=paged_kv_indptr_buffer,
+        paged_kv_indices_buffer=paged_kv_indices_buffer,
+        paged_kv_last_page_len_buffer=paged_kv_last_page_len_buffer,
         backend="auto",
     )
 

@@ -131,6 +131,7 @@ class DecodeAttentionOpSpec:
 class DecodeAttentionProvider:
     name = ""
     capabilities: AttentionKernelCapabilities
+    decode_graph_lifecycle = False
 
     def prepare(
         self,
@@ -258,6 +259,7 @@ DECODE_ATTENTION_REGISTRY: OpRegistry[
 @DECODE_ATTENTION_REGISTRY.register_atomic(ProviderRole.UPSTREAM_STANDARD)
 class SglFa3PagedDecodeAttentionProvider(DecodeAttentionProvider):
     name = "sgl_fa3_paged_decode_sm90"
+    context_independent_cuda_graph = True
     capabilities = AttentionKernelCapabilities(
         platforms=frozenset({PlatformEnum.CUDA}),
         compute_capabilities=frozenset({(9, 0)}),
@@ -281,8 +283,6 @@ class SglFa3PagedDecodeAttentionProvider(DecodeAttentionProvider):
         spec: DecodeAttentionOpSpec,
         caps: DeviceCaps,
     ) -> SupportResult:
-        if spec.context_independent_cuda_graph:
-            return SupportResult.unsupported("launch topology depends on context length")
         common = match_attention_capabilities(
             spec.kernel_request,
             caps,
@@ -401,6 +401,7 @@ class SglFa3PagedDecodeAttentionProvider(DecodeAttentionProvider):
 @DECODE_ATTENTION_REGISTRY.register_atomic(ProviderRole.UPSTREAM_STANDARD)
 class FlashInferPagedDecodeAttentionProvider(DecodeAttentionProvider):
     name = "flashinfer_paged_decode"
+    decode_graph_lifecycle = True
     capabilities = AttentionKernelCapabilities(
         platforms=frozenset({PlatformEnum.CUDA}),
         activation_dtypes=frozenset({torch.bfloat16, torch.float16}),
@@ -409,7 +410,7 @@ class FlashInferPagedDecodeAttentionProvider(DecodeAttentionProvider):
         returns_softmax_lse=True,
         layer_varying_page_table=True,
         varlen=True,
-        cuda_graph=False,
+        cuda_graph=True,
     )
 
     def __init__(self) -> None:
@@ -421,8 +422,6 @@ class FlashInferPagedDecodeAttentionProvider(DecodeAttentionProvider):
         spec: DecodeAttentionOpSpec,
         caps: DeviceCaps,
     ) -> SupportResult:
-        if spec.context_independent_cuda_graph:
-            return SupportResult.unsupported("planning depends on context length")
         common = match_attention_capabilities(
             spec.kernel_request,
             caps,
@@ -441,7 +440,6 @@ class FlashInferPagedDecodeAttentionProvider(DecodeAttentionProvider):
         *,
         device_index: int | None = None,
     ) -> None:
-        del spec
         if self._state is not None:
             return
         current_device = torch.cuda.current_device()
@@ -452,12 +450,14 @@ class FlashInferPagedDecodeAttentionProvider(DecodeAttentionProvider):
                 "FlashInfer decode must be prepared on the selected CUDA device: "
                 f"selected={device_index} current={current_device}."
             )
-        self._state = _FlashInferPagedDecodeState(
-            torch.device("cuda", int(device_index))
-        )
+        if not spec.cuda_graph:
+            self._state = _FlashInferPagedDecodeState(
+                torch.device("cuda", int(device_index))
+            )
 
     def close(self) -> None:
         self._state = None
+        self._active_graph_state = None
 
     def binding_metadata(self) -> dict[str, object]:
         return {
@@ -466,8 +466,54 @@ class FlashInferPagedDecodeAttentionProvider(DecodeAttentionProvider):
             "kernel_path": "flashinfer.BatchDecodeWithPagedKVCacheWrapper",
             "kv_layout": "NHD",
             "page_size": 1,
-            "cuda_graph": False,
+            "cuda_graph": True,
+            "graph_metadata": "fixed buffers + graph-out plan + graph-in page packing",
         }
+
+    def init_decode_graph_state(
+        self,
+        spec: DecodeAttentionOpSpec,
+        contract,
+        inputs,
+    ) -> _FlashInferPagedDecodeGraphState:
+        if not spec.cuda_graph:
+            raise RuntimeError("FlashInfer graph state requires a CUDA Graph spec.")
+        if contract.batch_capacity > spec.max_batch_size:
+            raise ValueError(
+                "FlashInfer graph batch exceeds the prepared operator capacity: "
+                f"graph={contract.batch_capacity} operator={spec.max_batch_size}."
+            )
+        return _FlashInferPagedDecodeGraphState(
+            spec,
+            contract=contract,
+            inputs=inputs,
+        )
+
+    def prepare_decode_graph_out(
+        self,
+        state: _FlashInferPagedDecodeGraphState,
+    ) -> None:
+        self._active_graph_state = state
+        state.prepare_out_graph()
+
+    def prepare_decode_graph_in(
+        self,
+        state: _FlashInferPagedDecodeGraphState,
+    ) -> None:
+        self._active_graph_state = state
+
+    def decode_graph_keepalive_tensors(
+        self,
+        state: _FlashInferPagedDecodeGraphState,
+    ) -> list[torch.Tensor]:
+        return state.keepalive_tensors()
+
+    def close_decode_graph_state(
+        self,
+        state: _FlashInferPagedDecodeGraphState,
+    ) -> None:
+        if getattr(self, "_active_graph_state", None) is state:
+            self._active_graph_state = None
 
     def run(
         self,
@@ -482,8 +528,15 @@ class FlashInferPagedDecodeAttentionProvider(DecodeAttentionProvider):
                 "FlashInfer decode received unsupported runtime arguments: "
                 f"{sorted(kwargs)}."
             )
-        if self._state is None:
-            raise RuntimeError("FlashInfer decode provider was not prepared.")
+        graph_state = getattr(self, "_active_graph_state", None)
+        if spec.cuda_graph:
+            if not isinstance(graph_state, _FlashInferPagedDecodeGraphState):
+                raise RuntimeError("FlashInfer graph decode state is not active.")
+            state = graph_state
+        else:
+            if self._state is None:
+                raise RuntimeError("FlashInfer decode provider was not prepared.")
+            state = self._state
         payload = view.payload
         meta = view.meta
         if q.dtype != spec.activation_dtype:
@@ -495,31 +548,38 @@ class FlashInferPagedDecodeAttentionProvider(DecodeAttentionProvider):
                 "FlashInfer decode requires Q/K/V with the same dtype, got "
                 f"{q.dtype}/{payload.k_cache.dtype}/{payload.v_cache.dtype}."
             )
-        max_context_len = getattr(meta, "max_context_len", None)
-        if max_context_len is None:
-            raise RuntimeError(
-                "FlashInfer decode requires host-side max_context_len metadata."
-            )
-        context = get_context()
-        plan_key = (
-            context.attention_validation_scope,
-            meta.active_slots.data_ptr(),
-            meta.req_indices.data_ptr(),
-            meta.context_lens.data_ptr(),
-            int(max_context_len),
-        )
-        if getattr(self._state, "plan_key", None) != plan_key:
-            self._state.plan(
-                spec,
+        if spec.cuda_graph:
+            state.pack_page_indices(
                 active_slots=meta.active_slots,
                 req_indices=meta.req_indices,
                 context_lens=meta.context_lens,
-                max_context_len=int(max_context_len),
             )
-            self._state.plan_key = plan_key
+        else:
+            max_context_len = getattr(meta, "max_context_len", None)
+            if max_context_len is None:
+                raise RuntimeError(
+                    "FlashInfer decode requires host-side max_context_len metadata."
+                )
+            context = get_context()
+            plan_key = (
+                context.attention_validation_scope,
+                meta.active_slots.data_ptr(),
+                meta.req_indices.data_ptr(),
+                meta.context_lens.data_ptr(),
+                int(max_context_len),
+            )
+            if getattr(state, "plan_key", None) != plan_key:
+                state.plan(
+                    spec,
+                    active_slots=meta.active_slots,
+                    req_indices=meta.req_indices,
+                    context_lens=meta.context_lens,
+                    max_context_len=int(max_context_len),
+                )
+                state.plan_key = plan_key
         output = torch.empty_like(q)
         return_softmax_lse = spec.kernel_request.requires_softmax_lse
-        result = self._state.wrapper.run(
+        result = state.wrapper.run(
             q,
             (
                 payload.k_cache.unsqueeze(1),
@@ -627,6 +687,114 @@ class _FlashInferPagedDecodeState:
             kv_data_type=spec.activation_dtype,
             non_blocking=True,
         )
+
+
+class _FlashInferPagedDecodeGraphState:
+    def __init__(self, spec, *, contract, inputs) -> None:
+        self.spec = spec
+        self.contract = contract
+        self.inputs = inputs
+        device = inputs.context_lens.device
+        batch_size = int(contract.batch_capacity)
+        context_capacity = int(contract.context_capacity)
+        self.workspace = torch.empty(
+            128 * 1024 * 1024,
+            dtype=torch.uint8,
+            device=device,
+        )
+        self.indptr = torch.empty(
+            batch_size + 1,
+            dtype=torch.int32,
+            device=device,
+        )
+        self.indices = torch.empty(
+            batch_size * context_capacity,
+            dtype=torch.int32,
+            device=device,
+        )
+        self.last_page_len = torch.ones(
+            batch_size,
+            dtype=torch.int32,
+            device=device,
+        )
+        pin_memory = bool(inputs.host.context_lens.is_pinned())
+        self.host_indptr = torch.empty(
+            batch_size + 1,
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=pin_memory,
+        )
+        self.host_last_page_len = torch.ones(
+            batch_size,
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=pin_memory,
+        )
+        self.wrapper = make_flashinfer_paged_decode_wrapper(
+            self.workspace,
+            use_cuda_graph=True,
+            paged_kv_indptr_buffer=self.indptr,
+            paged_kv_indices_buffer=self.indices,
+            paged_kv_last_page_len_buffer=self.last_page_len,
+        )
+        self.planned = False
+
+    def prepare_out_graph(self) -> None:
+        context_lens = self.inputs.host.context_lens
+        if torch.any(context_lens <= 0):
+            raise ValueError("FlashInfer graph decode requires positive context lengths.")
+        if torch.any(context_lens > self.contract.context_capacity):
+            raise ValueError(
+                "FlashInfer graph decode context exceeds its captured capacity."
+            )
+        self.host_indptr[0] = 0
+        torch.cumsum(context_lens, dim=0, dtype=torch.int32, out=self.host_indptr[1:])
+        total_pages = int(self.host_indptr[-1])
+        self.wrapper.plan(
+            self.host_indptr,
+            self.indices[:total_pages],
+            self.host_last_page_len,
+            num_qo_heads=self.spec.num_query_heads,
+            num_kv_heads=self.spec.num_kv_heads,
+            head_dim=self.spec.head_dim,
+            page_size=self.spec.page_size,
+            sm_scale=self.spec.softmax_scale,
+            q_data_type=self.spec.activation_dtype,
+            kv_data_type=self.spec.activation_dtype,
+            non_blocking=True,
+        )
+        self.planned = True
+
+    def pack_page_indices(
+        self,
+        *,
+        active_slots: torch.Tensor,
+        req_indices: torch.Tensor,
+        context_lens: torch.Tensor,
+    ) -> None:
+        if not self.planned:
+            raise RuntimeError("FlashInfer graph decode was not planned before forward.")
+        from sparsevllm.kernels.triton.flashinfer_decode_metadata import (
+            pack_flashinfer_page_indices,
+        )
+
+        pack_flashinfer_page_indices(
+            active_slots,
+            req_indices,
+            context_lens,
+            self.indices,
+            context_capacity=int(self.contract.context_capacity),
+        )
+
+    def keepalive_tensors(self) -> list[torch.Tensor]:
+        return [
+            self.workspace,
+            self.indptr,
+            self.indices,
+            self.last_page_len,
+            self.host_indptr,
+            self.host_last_page_len,
+        ]
 
 
 @DECODE_ATTENTION_REGISTRY.register_atomic(ProviderRole.REPO_PORTABLE)
@@ -788,6 +956,20 @@ class ContextIndependentTritonDecodeAttentionProvider(DecodeAttentionProvider):
         self._mid_o: torch.Tensor | None = None
         self._mid_lse: torch.Tensor | None = None
         self._softmax_lse: torch.Tensor | None = None
+
+    @classmethod
+    def bind(
+        cls,
+        spec: DecodeAttentionOpSpec,
+        caps: DeviceCaps,
+        **provider_kwargs,
+    ) -> ContextIndependentTritonDecodeAttentionProvider:
+        if provider_kwargs:
+            raise TypeError(
+                "Context-independent Triton decode does not accept provider "
+                f"arguments: {sorted(provider_kwargs)}."
+            )
+        return cls(launch_plan=build_graph_stable_decode_launch_plan(spec, caps))
 
     @classmethod
     def supports(
@@ -978,6 +1160,30 @@ class PreparedDecodeAttentionOp:
         )
         return result.output
 
+    @property
+    def decode_graph_lifecycle(self) -> bool:
+        return bool(getattr(self.provider, "decode_graph_lifecycle", False))
+
+    def init_decode_graph_state(self, contract, inputs):
+        initializer = getattr(self.provider, "init_decode_graph_state", None)
+        if not callable(initializer):
+            raise TypeError(
+                f"Decode provider {self.provider.name!r} has no graph-state initializer."
+            )
+        return initializer(self.spec, contract, inputs)
+
+    def prepare_decode_graph_out(self, state) -> None:
+        self.provider.prepare_decode_graph_out(state)
+
+    def prepare_decode_graph_in(self, state) -> None:
+        self.provider.prepare_decode_graph_in(state)
+
+    def decode_graph_keepalive_tensors(self, state) -> list[torch.Tensor]:
+        return list(self.provider.decode_graph_keepalive_tensors(state))
+
+    def close_decode_graph_state(self, state) -> None:
+        self.provider.close_decode_graph_state(state)
+
     def close(self) -> None:
         if self._closed:
             return
@@ -994,16 +1200,9 @@ def prepare_decode_attention_op(
     if device_index is None:
         device_index = torch.cuda.current_device() if platform.is_cuda_alike() else 0
     caps = platform.get_device_caps(int(device_index))
-    provider_kwargs = {}
-    if spec.context_independent_cuda_graph:
-        provider_kwargs["launch_plan"] = build_graph_stable_decode_launch_plan(
-            spec,
-            caps,
-        )
     resolved = OpResolver(DECODE_ATTENTION_REGISTRY).resolve(
         spec,
         caps,
-        **provider_kwargs,
     )
     logger.info(
         "Resolved MHA decode provider={} rejected={}",
@@ -1012,6 +1211,28 @@ def prepare_decode_attention_op(
     )
     resolved.provider.prepare(spec, device_index=device_index)
     return PreparedDecodeAttentionOp(spec, resolved.provider)
+
+
+def collect_decode_graph_participants(model: torch.nn.Module) -> tuple[object, ...]:
+    """Collect unique prepared decode operators with graph-out lifecycle state."""
+
+    from sparsevllm.layers.attention import Attention
+
+    participants: list[object] = []
+    seen: set[int] = set()
+    for module in model.modules():
+        if not isinstance(module, Attention):
+            continue
+        participant = getattr(module, "decode_op", None)
+        if participant is None or not bool(
+            getattr(participant, "decode_graph_lifecycle", False)
+        ):
+            continue
+        identity = id(participant)
+        if identity not in seen:
+            seen.add(identity)
+            participants.append(participant)
+    return tuple(participants)
 
 
 def validate_context_independent_decode_graph_model(model: torch.nn.Module) -> int:

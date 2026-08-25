@@ -429,6 +429,40 @@ def test_sgl_fa3_decode_matches_torch_and_replays_cuda_graph() -> None:
         atol=3e-2,
     )
 
+    request_indices.copy_(
+        torch.tensor([1, 3, 0], device=device, dtype=torch.int32)
+    )
+    context_lens.copy_(
+        torch.tensor([3, 8, 6], device=device, dtype=torch.int32)
+    )
+    replay_rows = []
+    for batch_index in range(batch_size):
+        length = int(context_lens[batch_index].item())
+        row = int(request_indices[batch_index].item())
+        active = page_table[row, :length].long()
+        logits = q_rope[batch_index].float() @ rope_cache[active, 0].float().T
+        logits += q_latent[batch_index].float() @ latent_cache[active, 0].float().T
+        probs = torch.softmax(logits * (256**-0.5), dim=-1)
+        replay_rows.append(
+            (probs @ latent_cache[active, 0].float()).to(torch.bfloat16)
+        )
+    replay_expected = torch.stack(replay_rows)
+    graph.replay()
+    second_graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(
+        graph_output,
+        replay_expected,
+        rtol=3e-2,
+        atol=3e-2,
+    )
+    torch.testing.assert_close(
+        second_graph_output,
+        replay_expected,
+        rtol=3e-2,
+        atol=3e-2,
+    )
+
 
 @pytest.mark.skipif(
     not torch.cuda.is_available() or not sgl_fa3_support()[0],

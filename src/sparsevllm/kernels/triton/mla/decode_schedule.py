@@ -114,15 +114,15 @@ GLM_MLA_MAX_WORKSPACE_CONFIG = MlaDecodeLaunchConfig(
 def select_glm_mla_decode_config(
     *,
     batch_size: int,
-    max_context_len: int,
+    context_capacity: int,
     local_q_heads: int,
 ) -> MlaDecodeLaunchConfig:
-    """Select a graph-stable launch config from static decode dimensions."""
+    """Select a launch config from a capture-time context capacity."""
 
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
-    if max_context_len <= 0:
-        raise ValueError("max_context_len must be positive")
+    if context_capacity <= 0:
+        raise ValueError("context_capacity must be positive")
     if local_q_heads <= 0:
         raise ValueError("local_q_heads must be positive")
     if local_q_heads != 10:
@@ -131,7 +131,7 @@ def select_glm_mla_decode_config(
         return _GLM_MLA_TP2_SMALL_BATCH_CONFIG
     if batch_size <= 8:
         return _GLM_MLA_TP2_MEDIUM_BATCH_CONFIG
-    if max_context_len <= 1024:
+    if context_capacity <= 1024:
         return _GLM_MLA_TP2_SHORT_CONTEXT_CONFIG
     return _GLM_MLA_TP2_LARGE_BATCH_CONFIG
 

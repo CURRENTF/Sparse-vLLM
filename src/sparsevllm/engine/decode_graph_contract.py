@@ -216,6 +216,13 @@ class DecodeGraphState:
             tensors.extend(keepalive())
         return tensors
 
+    def close(self) -> None:
+        participant = self.runtime_state
+        close = getattr(participant, "close", None)
+        if callable(close):
+            close()
+        self.runtime_state = None
+
 
 @runtime_checkable
 class DecodeGraphParticipant(Protocol):

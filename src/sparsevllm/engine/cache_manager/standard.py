@@ -1688,6 +1688,20 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
                 req_indices[real_batch_size:].fill_(first_row_idx)
                 if active_mask is not None:
                     active_mask[real_batch_size:].fill_(padding_active)
+                if host_inputs is not None:
+                    host_inputs.input_ids[real_batch_size:].fill_(
+                        int(input_ids_list[0])
+                    )
+                    host_inputs.positions[real_batch_size:].fill_(
+                        int(positions_list[0])
+                    )
+                    host_inputs.context_lens[real_batch_size:].fill_(
+                        first_context_len
+                    )
+                    host_inputs.request_indices[real_batch_size:].fill_(
+                        first_row_idx
+                    )
+                    host_inputs.active_mask[real_batch_size:].fill_(padding_active)
 
             self.layer_batch_state.slot_mapping = slot_mapping
             self.layer_batch_state.context_lens = context_lens

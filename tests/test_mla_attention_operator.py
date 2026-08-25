@@ -14,6 +14,7 @@ from sparsevllm.engine.cache_manager import (
     PrefillComputeView,
 )
 from sparsevllm.operators.mla_attention import (
+    ContextIndependentMlaTritonProvider,
     MLA_ATTENTION_REGISTRY,
     MlaAttentionOpSpec,
     MlaSglFa3Provider,
@@ -37,6 +38,7 @@ def _spec(**overrides) -> MlaAttentionOpSpec:
         "cache_dtype": torch.bfloat16,
         "tp_size": 4,
         "cuda_graph": False,
+        "context_capacity": 65536,
     }
     values.update(overrides)
     return MlaAttentionOpSpec(**values)
@@ -80,6 +82,7 @@ def _cpu_workspace(batch_size: int, head_count: int) -> MlaDecodeWorkspace:
         {"value_head_dim": 0},
         {"tp_size": 0},
         {"num_q_heads": 20, "tp_size": 3},
+        {"context_capacity": 0},
     ],
 )
 def test_mla_attention_spec_rejects_invalid_dimensions(overrides) -> None:
@@ -101,6 +104,108 @@ def test_mla_triton_atomic_support_is_not_narrowed_by_device_name() -> None:
     )
 
     assert result.supported
+
+
+def test_context_independent_mla_requires_static_capacity() -> None:
+    spec = _spec(
+        cuda_graph=True,
+        context_independent_cuda_graph=True,
+        context_capacity=None,
+    )
+
+    result = ContextIndependentMlaTritonProvider.supports(spec, _h100_caps())
+
+    assert not result.supported
+    assert "static context capacity" in result.reason
+
+
+def test_context_independent_mla_launch_config_ignores_runtime_context() -> None:
+    spec = _spec(
+        tp_size=2,
+        cuda_graph=True,
+        context_independent_cuda_graph=True,
+        context_capacity=32768,
+    )
+    workspace = _cpu_workspace(batch_size=32, head_count=10)
+    with patch(
+        "sparsevllm.operators.mla_attention.allocate_mla_decode_workspace",
+        return_value=workspace,
+    ):
+        provider = ContextIndependentMlaTritonProvider(
+            op_spec=spec,
+            device="cpu",
+            max_batch_size=32,
+        )
+    launch_config = object()
+    with patch(
+        "sparsevllm.operators.mla_attention.select_glm_mla_decode_config",
+        return_value=launch_config,
+    ) as select:
+        first = provider._launch_config_for(
+            batch_size=32,
+            max_context_len=1,
+            active_slot_width=64,
+        )
+        second = provider._launch_config_for(
+            batch_size=32,
+            max_context_len=32000,
+            active_slot_width=65536,
+        )
+
+    assert first is launch_config
+    assert second is launch_config
+    assert select.call_count == 2
+    select.assert_called_with(
+        batch_size=32,
+        context_capacity=32768,
+        local_q_heads=10,
+    )
+
+
+def test_sgl_mla_accepts_batch_only_score_free_contract() -> None:
+    spec = _spec(
+        cuda_graph=True,
+        context_independent_cuda_graph=True,
+        context_capacity=32768,
+    )
+    with patch(
+        "sparsevllm.operators.mla_attention.sgl_fa3_device_support",
+        return_value=(True, "sgl test"),
+    ):
+        result = MlaSglFa3Provider.supports(spec, _h100_caps())
+
+    assert result.supported
+    assert MlaSglFa3Provider.context_independent_cuda_graph
+
+
+def test_batch_only_mla_resolver_prefers_sgl_fa3() -> None:
+    spec = _spec(
+        cuda_graph=True,
+        context_independent_cuda_graph=True,
+        context_capacity=32768,
+    )
+    workspace = _cpu_workspace(batch_size=8, head_count=5)
+    with (
+        patch(
+            "sparsevllm.operators.mla_attention.sgl_fa3_device_support",
+            return_value=(True, "sgl test"),
+        ),
+        patch(
+            "sparsevllm.operators.mla_attention.allocate_mla_decode_workspace",
+            return_value=workspace,
+        ),
+        patch("sparsevllm.operators.mla_attention.SglFa3DecodeKernel"),
+    ):
+        resolved = OpResolver(MLA_ATTENTION_REGISTRY).resolve(
+            spec,
+            _h100_caps(),
+            op_spec=spec,
+            device="cpu",
+            max_batch_size=8,
+        )
+
+    assert type(resolved.provider) is MlaSglFa3Provider
+    assert resolved.report.selection_basis == "upstream_default"
 
 
 @pytest.mark.parametrize(

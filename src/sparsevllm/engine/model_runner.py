@@ -23,6 +23,7 @@ from sparsevllm.layers.sampler import Sampler
 from sparsevllm.method_registry import decode_sparse_long_text_threshold
 from sparsevllm.operators import registry as operator_registry
 from sparsevllm.operators.decode_attention import (
+    collect_decode_graph_participants,
     validate_context_independent_decode_graph_model,
 )
 from sparsevllm.utils.context import set_context, get_context, reset_context
@@ -280,6 +281,7 @@ class ModelRunner:
                 self.model,
                 hf_config,
                 seed=config.tiny_random_seed,
+                quantized=config.quantization_config.enabled,
             )
         else:
             load_model(
@@ -360,6 +362,7 @@ class ModelRunner:
             self.recurrent_state_manager,
             self.prefix_cache_coordinator,
             self.chain_cache_coordinator,
+            decode_graph_participants=collect_decode_graph_participants(self.model),
         )
 
         # 初始化稀疏控制器

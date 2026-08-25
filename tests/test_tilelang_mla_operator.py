@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import subprocess
 import sys
 from importlib import metadata
@@ -20,6 +21,7 @@ from sparsevllm.kernels.tilelang.mla.runtime import (
 )
 from sparsevllm.kernels.triton.mla import MlaDecodeWorkspace
 from sparsevllm.operators.mla_attention import (
+    ContextIndependentMlaTritonProvider,
     MLA_ATTENTION_REGISTRY,
     MlaAttentionOpSpec,
     MlaSglFa3Provider,
@@ -42,6 +44,7 @@ def _spec(*, tp_size: int = 2) -> MlaAttentionOpSpec:
         tp_size=tp_size,
         cuda_graph=True,
         may_require_attention_scores=True,
+        context_capacity=65536,
     )
 
 
@@ -309,6 +312,41 @@ def test_tilelang_mla_exact_h100_profile_overrides_default_portfolio() -> None:
     assert type(resolved.provider) is MlaTileLangScoreProvider
     assert resolved.report.selected_profile == "tilelang_score_sgl_fa3_h100_profile"
     assert resolved.report.selection_basis == "profile_override"
+
+
+def test_batch_only_score_contract_rejects_tilelang_at_binding() -> None:
+    spec = replace(
+        _spec(),
+        context_independent_cuda_graph=True,
+    )
+    workspace = _cpu_workspace()
+    with (
+        patch(
+            "sparsevllm.operators.mla_attention.sgl_fa3_device_support",
+            return_value=(True, "sgl test"),
+        ),
+        patch(
+            "sparsevllm.operators.mla_attention.tilelang_mla_support",
+            return_value=(True, "tilelang test"),
+        ),
+        patch(
+            "sparsevllm.operators.mla_attention.allocate_mla_decode_workspace",
+            return_value=workspace,
+        ),
+    ):
+        resolved = OpResolver(MLA_ATTENTION_REGISTRY).resolve(
+            spec,
+            _h100_caps(),
+            op_spec=spec,
+            device="cpu",
+            max_batch_size=2,
+        )
+
+    assert type(resolved.provider) is ContextIndependentMlaTritonProvider
+    assert (
+        "tilelang_score_sgl_fa3_h100",
+        "batch-only CUDA Graph requires a fixed TileLang JIT/score route",
+    ) in resolved.rejected
 
 
 def _provider_with_mocks() -> tuple[MlaTileLangScoreProvider, Mock, Mock]:

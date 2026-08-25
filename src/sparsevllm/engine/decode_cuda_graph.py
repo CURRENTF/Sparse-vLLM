@@ -164,6 +164,8 @@ class DecodeCudaGraphRunner:
     @staticmethod
     def _release_graph_state(state: DecodeCudaGraphState):
         state.graph = None
+        if state.decode_state is not None:
+            state.decode_state.close()
         state.decode_state = None
         state.logits = None
         state.token_ids = None

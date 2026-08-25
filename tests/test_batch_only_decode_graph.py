@@ -20,9 +20,6 @@ from sparsevllm.kernels.triton.context_independent_flash_decoding import (
 from sparsevllm.kernels.triton.sglang_gemma4_decode_attention import (
     sglang_gemma4_decode,
 )
-from sparsevllm.operators.context_independent_gemma4_attention import (
-    ContextIndependentGemma4OperatorProvider,
-)
 from sparsevllm.operators.decode_attention import (
     ContextIndependentTritonDecodeAttentionProvider,
     DECODE_ATTENTION_REGISTRY,
@@ -144,6 +141,7 @@ def test_batch_only_state_identity_omits_context_capacity() -> None:
 def test_typed_decode_graph_participant_delegates_to_cache_owner() -> None:
     calls = []
     private_keepalive = torch.empty(1)
+    operator_keepalive = torch.empty(1)
 
     class CacheOwner:
         num_free_slots = 16
@@ -163,6 +161,24 @@ def test_typed_decode_graph_participant_delegates_to_cache_owner() -> None:
             calls.append(("keepalive", state.contract.topology_path_id))
             return [private_keepalive]
 
+    class OperatorOwner:
+        def init_decode_graph_state(self, contract, inputs):
+            calls.append(("operator_init", contract.batch_capacity))
+            return SimpleNamespace(contract=contract, inputs=inputs)
+
+        def prepare_decode_graph_out(self, state):
+            calls.append(("operator_out", state.contract.context_capacity))
+
+        def prepare_decode_graph_in(self, state):
+            calls.append(("operator_in", state.contract.topology_path_id))
+
+        def decode_graph_keepalive_tensors(self, state):
+            calls.append(("operator_keepalive", state.contract.topology_path_id))
+            return [operator_keepalive]
+
+        def close_decode_graph_state(self, state):
+            calls.append(("operator_close", state.contract.batch_capacity))
+
     contract = DecodeGraphContract(
         method="",
         shape_policy="batch_only",
@@ -178,7 +194,11 @@ def test_typed_decode_graph_participant_delegates_to_cache_owner() -> None:
             pin_memory=False,
         ),
     )
-    runtime = RuntimeState(SimpleNamespace(), CacheOwner())
+    runtime = RuntimeState(
+        SimpleNamespace(),
+        CacheOwner(),
+        decode_graph_participants=(OperatorOwner(),),
+    )
 
     participant = runtime.init_decode_graph_state(graph_state)
     runtime.prepare_decode_graph_step([object()], graph_state)
@@ -188,15 +208,22 @@ def test_typed_decode_graph_participant_delegates_to_cache_owner() -> None:
     assert graph_state.runtime_state is participant
     assert graph_state.inputs.input_ids.tolist() == [7, 7]
     assert any(tensor is private_keepalive for tensor in keepalive)
+    assert any(tensor is operator_keepalive for tensor in keepalive)
     assert calls == [
         ("init", "dense"),
+        ("operator_init", 2),
         ("prepare_out", 1),
+        ("operator_out", 32),
         ("prepare_in", "dense"),
+        ("operator_in", "dense"),
         ("keepalive", "dense"),
+        ("operator_keepalive", "dense"),
     ]
+    graph_state.close()
+    assert calls[-1] == ("operator_close", 2)
 
 
-def test_mha_resolver_contract_selects_only_context_independent_provider() -> None:
+def test_mha_resolver_prefers_sgl_fa3_for_batch_only_on_supported_sm90() -> None:
     spec = DecodeAttentionOpSpec(
         num_query_heads=8,
         num_kv_heads=2,
@@ -243,17 +270,47 @@ def test_mha_resolver_contract_selects_only_context_independent_provider() -> No
     assert plan.max_kv_splits > 0
     assert plan.target_tokens_per_split > 0
     assert plan.block_n > 0
-    resolved = OpResolver(DECODE_ATTENTION_REGISTRY).resolve(
-        spec,
-        caps,
-        launch_plan=plan,
+    from unittest.mock import patch
+
+    with patch(
+        "sparsevllm.operators.decode_attention.sgl_fa3_device_support",
+        return_value=(True, "available"),
+    ):
+        resolved = OpResolver(DECODE_ATTENTION_REGISTRY).resolve(spec, caps)
+    assert resolved.provider.name == "sgl_fa3_paged_decode_sm90"
+    assert resolved.report.selection_basis == "upstream_default"
+
+
+def test_mha_resolver_falls_back_to_fixed_grid_when_upstream_is_ineligible() -> None:
+    spec = DecodeAttentionOpSpec(
+        num_query_heads=8,
+        num_kv_heads=2,
+        head_dim=128,
+        activation_dtype=torch.bfloat16,
+        softmax_scale=128**-0.5,
+        max_batch_size=8,
+        context_independent_cuda_graph=True,
+        context_capacity=32768,
     )
+    caps = DeviceCaps(
+        **{
+            **_cuda_caps().__dict__,
+            "compute_capability": (8, 0),
+        }
+    )
+    from unittest.mock import patch
+
+    with patch(
+        "sparsevllm.operators.decode_attention.flashinfer_paged_decode_support",
+        return_value=(False, "unavailable"),
+    ):
+        resolved = OpResolver(DECODE_ATTENTION_REGISTRY).resolve(spec, caps)
     assert isinstance(
         resolved.provider,
         ContextIndependentTritonDecodeAttentionProvider,
     )
     metadata = resolved.report.as_dict()["provider_metadata"]
-    assert metadata["launch_plan"]["plan_id"] == plan.plan_id
+    assert metadata["launch_plan"]["plan_id"] == "portable_context_independent_v1"
 
 
 def test_mla_resolver_contract_selects_fixed_launch_provider() -> None:
@@ -268,6 +325,7 @@ def test_mla_resolver_contract_selects_fixed_launch_provider() -> None:
         tp_size=2,
         cuda_graph=True,
         context_independent_cuda_graph=True,
+        context_capacity=32768,
     )
     caps = _cuda_caps()
     assert ContextIndependentMlaTritonProvider.supports(spec, caps).supported
@@ -282,10 +340,15 @@ def test_gemma4_resolver_contract_selects_fixed_grid_provider() -> None:
         attention_contracts=((8, 2, 256, 1023), (8, 1, 512, -1)),
         max_batch_size=8,
         context_independent_cuda_graph=True,
+        context_capacity=32768,
     )
     caps = _cuda_caps()
-    assert ContextIndependentGemma4OperatorProvider.supports(spec, caps).supported
-    assert not TritonGemma4OperatorProvider.supports(spec, caps).supported
+    assert TritonGemma4OperatorProvider.supports(spec, caps).supported
+    provider = TritonGemma4OperatorProvider.bind(spec, caps)
+    assert provider.name == "triton"
+    assert provider.binding_metadata()["attention_dispatch"]["decode_routes"] == [
+        "sglang_fixed_grid"
+    ]
 
 
 def _decode_reference(
@@ -520,7 +583,7 @@ def test_context_independent_gqa_produces_raw_per_head_scores() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires idle CUDA GPU")
 @pytest.mark.parametrize("window", [None, 8])
-def test_context_independent_gemma4_matches_reference_and_graph(window) -> None:
+def test_gemma4_fixed_grid_matches_reference_and_graph(window) -> None:
     torch.manual_seed(19)
     device = torch.device("cuda")
     batch, heads, kv_heads, head_dim, capacity = 2, 4, 2, 256, 33

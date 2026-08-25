@@ -78,6 +78,12 @@ def _get_num_kv_splits(
     splits = tl.maximum(
         tl.cdiv(seq_lens, chunk_by_lengths), tl.cdiv(seq_lens, chunk_by_cores)
     )
+    # Every split consumed by stage2 must have at least one 32-token block.
+    # Otherwise stage1 leaves that split's workspace uninitialized.
+    splits = tl.maximum(
+        1,
+        tl.minimum(splits, tl.cdiv(seq_lens, _MIN_BLOCK_KV)),
+    )
     tl.store(num_kv_splits + offsets, splits, mask=mask)
 
 

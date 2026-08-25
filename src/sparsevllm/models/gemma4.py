@@ -708,6 +708,8 @@ class Gemma4ForCausalLM(nn.Module):
                     )
                     == "batch_only"
                 ),
+                context_capacity=int(getattr(engine_config, "max_model_len", 0) or 0)
+                or None,
             ),
             device_index=device.index,
         )

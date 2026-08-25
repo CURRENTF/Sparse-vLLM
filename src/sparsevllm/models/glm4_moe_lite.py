@@ -120,6 +120,7 @@ def build_glm4_moe_lite_mla_attention(
     max_batch_size: int,
     prefill_workspace_bytes: int,
     decode_graph: bool,
+    context_capacity: int,
     projection_chunk_size: int,
     may_require_attention_scores: bool = False,
 ) -> MLAAttention:
@@ -145,6 +146,7 @@ def build_glm4_moe_lite_mla_attention(
             )
             == "batch_only"
         ),
+        context_capacity=int(context_capacity),
     )
     return MLAAttention.bind(
         spec=spec,
@@ -899,6 +901,7 @@ class Glm4MoeLiteForCausalLM(nn.Module):
                 ),
                 prefill_workspace_bytes=engine_config.mla_prefill_workspace_bytes,
                 decode_graph=decode_graph,
+                context_capacity=int(engine_config.max_model_len),
                 projection_chunk_size=engine_config.mlp_chunk_size,
                 may_require_attention_scores=(
                     sparse_decode_attention_requires_scores(

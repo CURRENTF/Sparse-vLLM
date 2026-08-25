@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -91,6 +92,36 @@ def test_minimax_config_requires_all_fp8_exclusions(tmp_path):
     )
     with pytest.raises(ValueError, match="e_score_correction_bias"):
         _make_config(tmp_path, hf_config=hf_config)
+
+
+def test_minimax_config_supports_quantized_tiny_random(tmp_path):
+    tiny_config = tmp_path / "tiny.json"
+    tiny_config.write_text(
+        json.dumps(
+            {
+                "num_hidden_layers": 1,
+                "hidden_size": 3072,
+                "intermediate_size": 1536,
+                "num_attention_heads": 48,
+                "num_key_value_heads": 8,
+                "head_dim": 128,
+                "vocab_size": 256,
+                "max_position_embeddings": 512,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = _make_config(
+        tmp_path,
+        tiny_random=True,
+        tiny_random_config=str(tiny_config),
+        max_model_len=512,
+    )
+
+    assert config.tiny_random
+    assert config.quantization_config.enabled
+    assert config.hf_config.hidden_size == 3072
 
 
 @pytest.mark.parametrize(

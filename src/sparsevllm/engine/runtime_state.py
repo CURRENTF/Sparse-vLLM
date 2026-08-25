@@ -65,10 +65,13 @@ class RuntimeDecodeGraphState:
 
     owner: RuntimeState
     cache: CacheDecodeGraphState
+    operator_states: tuple[tuple[object, object], ...] = ()
 
     def prepare_out_graph(self, seqs: list[Sequence]) -> None:
         self.owner._evict_mixed_prefix_for_step(seqs, is_prefill=False)
         self.owner.cache_manager.prepare_decode_graph_step(seqs, self.cache)
+        for participant, state in self.operator_states:
+            participant.prepare_decode_graph_out(state)
         if self.owner.recurrent_state_manager is not None:
             inputs = self.cache.inputs
             self.owner.recurrent_state_manager.prepare_decode_static(
@@ -79,11 +82,20 @@ class RuntimeDecodeGraphState:
 
     def prepare_in_graph(self) -> None:
         self.owner.cache_manager.prepare_decode_graph_in(self.cache)
+        for participant, state in self.operator_states:
+            participant.prepare_decode_graph_in(state)
 
     def graph_keepalive_tensors(self) -> list[torch.Tensor]:
-        return self.owner.cache_manager.decode_graph_state_keepalive_tensors(
+        tensors = self.owner.cache_manager.decode_graph_state_keepalive_tensors(
             self.cache
         )
+        for participant, state in self.operator_states:
+            tensors.extend(participant.decode_graph_keepalive_tensors(state))
+        return tensors
+
+    def close(self) -> None:
+        for participant, state in reversed(self.operator_states):
+            participant.close_decode_graph_state(state)
 
 
 class RuntimeState:
@@ -96,12 +108,14 @@ class RuntimeState:
         recurrent_state_manager: RecurrentStateManager | None = None,
         prefix_cache_coordinator: PrefixCacheCoordinator | None = None,
         chain_cache_coordinator: ChainCacheCoordinator | None = None,
+        decode_graph_participants: tuple[object, ...] = (),
     ):
         self.config = config
         self.cache_manager = cache_manager
         self.recurrent_state_manager = recurrent_state_manager
         self.prefix_cache_coordinator = prefix_cache_coordinator
         self.chain_cache_coordinator = chain_cache_coordinator
+        self.decode_graph_participants = tuple(decode_graph_participants)
         self._resident_seq_ids: set[int] = set()
 
     @property
@@ -183,7 +197,27 @@ class RuntimeState:
             graph_state.contract,
             graph_state.inputs,
         )
-        state = RuntimeDecodeGraphState(owner=self, cache=cache_state)
+        operator_states: list[tuple[object, object]] = []
+        try:
+            for participant in self.decode_graph_participants:
+                operator_states.append(
+                    (
+                        participant,
+                        participant.init_decode_graph_state(
+                            graph_state.contract,
+                            graph_state.inputs,
+                        ),
+                    )
+                )
+        except BaseException:
+            for participant, state in reversed(operator_states):
+                participant.close_decode_graph_state(state)
+            raise
+        state = RuntimeDecodeGraphState(
+            owner=self,
+            cache=cache_state,
+            operator_states=tuple(operator_states),
+        )
         graph_state.runtime_state = state
         return state
 

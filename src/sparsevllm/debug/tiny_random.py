@@ -183,11 +183,20 @@ def initialize_sparse_model(
     hf_config: Any,
     *,
     seed: int,
+    quantized: bool = False,
 ) -> None:
     from sparsevllm.utils.loader import (
         _target_weight_name_for_model,
         default_weight_loader,
     )
+
+    if quantized:
+        _initialize_quantized_sparse_model(model, seed=seed)
+        print(
+            "Initialized quantized model weights from deterministic tiny random "
+            f"seed={int(seed)} without reading checkpoint tensors"
+        )
+        return
 
     reference = build_tiny_random_hf_model(hf_config, seed=seed)
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
@@ -241,3 +250,43 @@ def initialize_sparse_model(
         f"Initialized {loaded_count} model weights from deterministic tiny random "
         f"seed={int(seed)} without reading checkpoint tensors"
     )
+
+
+@torch.inference_mode()
+def _initialize_quantized_sparse_model(model: nn.Module, *, seed: int) -> None:
+    generators: dict[torch.device, torch.Generator] = {}
+
+    def generator_for(device: torch.device) -> torch.Generator:
+        generator = generators.get(device)
+        if generator is None:
+            generator = torch.Generator(device=device)
+            generator.manual_seed(int(seed))
+            generators[device] = generator
+        return generator
+
+    initialized = 0
+    for parameter in model.parameters():
+        if not parameter.dtype.is_floating_point:
+            parameter.zero_()
+            initialized += parameter.numel()
+            continue
+        values = torch.empty(
+            parameter.shape,
+            dtype=torch.float32,
+            device=parameter.device,
+        )
+        values.normal_(mean=0.0, std=0.02, generator=generator_for(parameter.device))
+        parameter.copy_(values.to(parameter.dtype))
+        initialized += parameter.numel()
+
+    for name, buffer in model.named_buffers():
+        if name.endswith("weight_scale_inv"):
+            buffer.fill_(1.0)
+
+    for module in model.modules():
+        if hasattr(module, "_quantized_weight_loaded"):
+            module._quantized_weight_loaded = True
+            module._quantized_loaded_ranges = [(0, int(module.weight.shape[0]))]
+
+    if initialized <= 0:
+        raise RuntimeError("Quantized tiny random initialization found no parameters.")
