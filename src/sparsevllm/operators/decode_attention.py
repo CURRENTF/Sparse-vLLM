@@ -88,6 +88,7 @@ class DecodeAttentionOpSpec:
     cuda_graph: bool = True
     h2o_layerwise_probability_scores: bool = False
     context_independent_cuda_graph: bool = False
+    context_capacity: int | None = None
 
     def __post_init__(self) -> None:
         if self.num_query_heads <= 0 or self.num_kv_heads <= 0:
@@ -105,6 +106,8 @@ class DecodeAttentionOpSpec:
             raise ValueError(
                 "H2O layer-wise probability scoring requires decode score output."
             )
+        if self.context_capacity is not None and self.context_capacity <= 0:
+            raise ValueError("Decode attention context_capacity must be positive.")
 
     @property
     def kernel_request(self) -> AttentionKernelRequest:
@@ -154,6 +157,87 @@ class DecodeAttentionProvider:
 class DecodeAttentionRunResult:
     output: torch.Tensor
     softmax_lse: torch.Tensor
+
+
+@dataclass(frozen=True)
+class GraphStableDecodeLaunchPlan:
+    """Capture-time launch envelope for context-independent MHA/GQA decode."""
+
+    plan_id: str
+    context_capacity: int
+    max_kv_splits: int
+    target_tokens_per_split: int
+    block_n: int
+    stage1_num_warps: int
+    stage1_num_stages: int
+    stage2_num_warps: int
+    stage2_num_stages: int
+
+    def __post_init__(self) -> None:
+        positive = (
+            self.context_capacity,
+            self.max_kv_splits,
+            self.target_tokens_per_split,
+            self.block_n,
+            self.stage1_num_warps,
+            self.stage1_num_stages,
+            self.stage2_num_warps,
+            self.stage2_num_stages,
+        )
+        if any(value <= 0 for value in positive):
+            raise ValueError(f"Decode launch plan values must be positive: {self}.")
+
+    def as_dict(self) -> dict[str, int | str]:
+        return {
+            "plan_id": self.plan_id,
+            "context_capacity": self.context_capacity,
+            "max_kv_splits": self.max_kv_splits,
+            "target_tokens_per_split": self.target_tokens_per_split,
+            "block_n": self.block_n,
+            "stage1_num_warps": self.stage1_num_warps,
+            "stage1_num_stages": self.stage1_num_stages,
+            "stage2_num_warps": self.stage2_num_warps,
+            "stage2_num_stages": self.stage2_num_stages,
+        }
+
+
+def build_graph_stable_decode_launch_plan(
+    spec: DecodeAttentionOpSpec,
+    caps: DeviceCaps,
+) -> GraphStableDecodeLaunchPlan:
+    """Resolve one context-invariant portable plan before provider preparation."""
+    del caps
+    if spec.context_capacity is None:
+        raise ValueError(
+            "Context-independent decode requires a static context_capacity."
+        )
+    if spec.head_dim == 256:
+        block_n, stage1_warps, stage2_warps = 128, 4, 8
+    elif spec.head_dim in {64, 128}:
+        block_n, stage1_warps, stage2_warps = 64, 2, 4
+    else:
+        raise ValueError(
+            f"No context-independent decode launch plan for head_dim={spec.head_dim}."
+        )
+
+    # The grid is derived from the configured capacity, never the current
+    # request length. Capping the envelope bounds workspace and empty programs;
+    # each replay derives its effective split count from device context_lens.
+    max_kv_splits = min(
+        64,
+        max(16, math.ceil(int(spec.context_capacity) / 4096)),
+    )
+    return GraphStableDecodeLaunchPlan(
+        plan_id="portable_context_independent_v1",
+        context_capacity=int(spec.context_capacity),
+        max_kv_splits=max_kv_splits,
+        target_tokens_per_split=256,
+        block_n=block_n,
+        stage1_num_warps=stage1_warps,
+        stage1_num_stages=2,
+        stage2_num_warps=stage2_warps,
+        stage2_num_stages=2,
+    )
 
 
 DECODE_ATTENTION_REGISTRY: OpRegistry[
@@ -690,15 +774,20 @@ class ContextIndependentTritonDecodeAttentionProvider(DecodeAttentionProvider):
     context_independent_cuda_graph = True
     capabilities = replace(
         TritonPagedDecodeAttentionProvider.capabilities,
+        activation_dtypes=frozenset({torch.bfloat16, torch.float16}),
+        head_dims=frozenset({64, 128, 256}),
         returns_softmax_lse=True,
     )
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        launch_plan: GraphStableDecodeLaunchPlan,
+    ) -> None:
+        self.launch_plan = launch_plan
         self._mid_o: torch.Tensor | None = None
         self._mid_lse: torch.Tensor | None = None
         self._softmax_lse: torch.Tensor | None = None
-        self.max_kv_splits = 16
-        self.target_tokens_per_split = 256
 
     @classmethod
     def supports(
@@ -706,6 +795,8 @@ class ContextIndependentTritonDecodeAttentionProvider(DecodeAttentionProvider):
     ) -> SupportResult:
         if not spec.context_independent_cuda_graph:
             return SupportResult.unsupported("reserved for batch-only CUDA Graph")
+        if spec.context_capacity is None:
+            return SupportResult.unsupported("requires a static context capacity")
         return match_attention_capabilities(
             spec.kernel_request,
             caps,
@@ -718,6 +809,12 @@ class ContextIndependentTritonDecodeAttentionProvider(DecodeAttentionProvider):
         *,
         device_index: int | None = None,
     ) -> None:
+        if self.launch_plan.context_capacity != spec.context_capacity:
+            raise RuntimeError(
+                "Context-independent decode launch plan does not match the operator "
+                f"capacity: plan={self.launch_plan.context_capacity} "
+                f"spec={spec.context_capacity}."
+            )
         if device_index is None:
             device_index = torch.cuda.current_device()
         device = torch.device("cuda", int(device_index))
@@ -725,14 +822,18 @@ class ContextIndependentTritonDecodeAttentionProvider(DecodeAttentionProvider):
             (
                 spec.max_batch_size,
                 spec.num_query_heads,
-                self.max_kv_splits,
+                self.launch_plan.max_kv_splits,
                 spec.head_dim,
             ),
             dtype=torch.float32,
             device=device,
         )
         self._mid_lse = torch.empty(
-            (spec.max_batch_size, spec.num_query_heads, self.max_kv_splits),
+            (
+                spec.max_batch_size,
+                spec.num_query_heads,
+                self.launch_plan.max_kv_splits,
+            ),
             dtype=torch.float32,
             device=device,
         )
@@ -750,9 +851,11 @@ class ContextIndependentTritonDecodeAttentionProvider(DecodeAttentionProvider):
     def binding_metadata(self) -> dict[str, object]:
         return {
             "implementation_kind": "atomic_provider",
-            "implementation_source": "repo_triton_experimental",
+            "implementation_source": "repo_triton",
             "kernel_path": "context_independent_flash_decode",
             "cuda_graph_shape_policy": "batch_only",
+            "launch_plan": self.launch_plan.as_dict(),
+            "workspace_owner": "provider",
         }
 
     def run(
@@ -798,9 +901,13 @@ class ContextIndependentTritonDecodeAttentionProvider(DecodeAttentionProvider):
                 if spec.h2o_layerwise_probability_scores
                 else view.meta.attn_score
             ),
-            target_tokens_per_split=self.target_tokens_per_split,
-            block_n=128 if spec.head_dim == 256 else 64,
-            num_warps=4 if spec.head_dim == 256 else 2,
+            softmax_scale=spec.softmax_scale,
+            target_tokens_per_split=self.launch_plan.target_tokens_per_split,
+            block_n=self.launch_plan.block_n,
+            num_warps=self.launch_plan.stage1_num_warps,
+            num_stages=self.launch_plan.stage1_num_stages,
+            stage2_num_warps=self.launch_plan.stage2_num_warps,
+            stage2_num_stages=self.launch_plan.stage2_num_stages,
             return_softmax_lse=spec.h2o_layerwise_probability_scores,
             output_lse=self._softmax_lse[:, :batch_size],
         )
@@ -887,7 +994,17 @@ def prepare_decode_attention_op(
     if device_index is None:
         device_index = torch.cuda.current_device() if platform.is_cuda_alike() else 0
     caps = platform.get_device_caps(int(device_index))
-    resolved = OpResolver(DECODE_ATTENTION_REGISTRY).resolve(spec, caps)
+    provider_kwargs = {}
+    if spec.context_independent_cuda_graph:
+        provider_kwargs["launch_plan"] = build_graph_stable_decode_launch_plan(
+            spec,
+            caps,
+        )
+    resolved = OpResolver(DECODE_ATTENTION_REGISTRY).resolve(
+        spec,
+        caps,
+        **provider_kwargs,
+    )
     logger.info(
         "Resolved MHA decode provider={} rejected={}",
         resolved.provider.name,

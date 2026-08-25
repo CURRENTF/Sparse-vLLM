@@ -2,18 +2,23 @@ from __future__ import annotations
 
 from collections import deque
 from contextlib import nullcontext
+from dataclasses import dataclass
 from typing import ContextManager
 from typing import Protocol
 
 import torch
 
 from sparsevllm.config import Config
-from sparsevllm.engine.prefix_cache_coordinator import PrefixCacheCoordinator
 from sparsevllm.engine.chain_cache import (
     ChainAdmissionPlan,
     ChainCacheCoordinator,
     ChainOwnerMismatchError,
 )
+from sparsevllm.engine.decode_graph_contract import (
+    CacheDecodeGraphState,
+    DecodeGraphState,
+)
+from sparsevllm.engine.prefix_cache_coordinator import PrefixCacheCoordinator
 from sparsevllm.engine.recurrent_state_manager import RecurrentStateManager
 from sparsevllm.engine.sequence import Sequence
 
@@ -52,6 +57,33 @@ class MemoryOracle(Protocol):
     def scheduler_capacity_snapshot(self) -> ContextManager[None]: ...
     def free_slot_stats(self) -> dict[str, int]: ...
     def debug_live_seq_slots(self) -> dict[int, int]: ...
+
+
+@dataclass
+class RuntimeDecodeGraphState:
+    """Per-graph runtime participant that delegates to semantic owners."""
+
+    owner: RuntimeState
+    cache: CacheDecodeGraphState
+
+    def prepare_out_graph(self, seqs: list[Sequence]) -> None:
+        self.owner._evict_mixed_prefix_for_step(seqs, is_prefill=False)
+        self.owner.cache_manager.prepare_decode_graph_step(seqs, self.cache)
+        if self.owner.recurrent_state_manager is not None:
+            inputs = self.cache.inputs
+            self.owner.recurrent_state_manager.prepare_decode_static(
+                seqs,
+                token_batch=inputs.batch_capacity,
+                device=inputs.input_ids.device,
+            )
+
+    def prepare_in_graph(self) -> None:
+        self.owner.cache_manager.prepare_decode_graph_in(self.cache)
+
+    def graph_keepalive_tensors(self) -> list[torch.Tensor]:
+        return self.owner.cache_manager.decode_graph_state_keepalive_tensors(
+            self.cache
+        )
 
 
 class RuntimeState:
@@ -140,6 +172,36 @@ class RuntimeState:
                 device=args[0].device,
             )
         return result
+
+    def init_decode_graph_state(
+        self,
+        graph_state: DecodeGraphState,
+    ) -> RuntimeDecodeGraphState:
+        if graph_state.runtime_state is not None:
+            raise RuntimeError("Decode graph runtime state was initialized twice.")
+        cache_state = self.cache_manager.init_decode_graph_state(
+            graph_state.contract,
+            graph_state.inputs,
+        )
+        state = RuntimeDecodeGraphState(owner=self, cache=cache_state)
+        graph_state.runtime_state = state
+        return state
+
+    def prepare_decode_graph_step(
+        self,
+        seqs: list[Sequence],
+        graph_state: DecodeGraphState,
+    ):
+        participant = graph_state.runtime_state
+        if participant is None:
+            participant = self.init_decode_graph_state(graph_state)
+        if not isinstance(participant, RuntimeDecodeGraphState):
+            raise TypeError(
+                "Decode graph runtime participant has an unexpected type: "
+                f"{type(participant).__name__}."
+            )
+        participant.prepare_out_graph(seqs)
+        return graph_state.inputs.input_ids, graph_state.inputs.positions, None
 
     def on_forward_end(self, seqs: list[Sequence], is_prefill: bool) -> None:
         self.cache_manager.on_forward_end(seqs, is_prefill)
