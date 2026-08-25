@@ -172,7 +172,7 @@ QWEN3_MOE_EP_COMPATIBILITY = ModelRuntimeCompatibility(
 
 QWEN3_MOE_TP_EP_COMPATIBILITY = ModelRuntimeCompatibility(
     sparse_methods=_MOE_SPARSE_METHODS,
-    prefix_cache_methods=frozenset({""}),
+    prefix_cache_methods=frozenset({"", "snapkv"}),
     decode_cuda_graph_methods=_MOE_SPARSE_METHODS,
 )
 
