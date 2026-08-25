@@ -1629,6 +1629,49 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
                 is_prefill=False,
             )
 
+    def test_sparse_decode_transition_and_prefix_restore_select_long_path(self):
+        runner = object.__new__(ModelRunner)
+        runner.config = SimpleNamespace(
+            sparse_method="omnikv",
+            sink_keep_tokens=1,
+            recent_keep_tokens=1,
+            decode_keep_tokens=4,
+        )
+        threshold = ModelRunner._long_text_threshold(
+            runner,
+            is_prefill=False,
+        )
+        sequence = seq_with_len(threshold)
+
+        self.assertFalse(
+            ModelRunner._is_long_text_batch(
+                runner,
+                [sequence],
+                is_prefill=False,
+            )
+        )
+        sequence.append_token(0)
+        self.assertTrue(
+            ModelRunner._is_long_text_batch(
+                runner,
+                [sequence],
+                is_prefill=False,
+            )
+        )
+
+        restored = seq_with_len(threshold + 1)
+        restored.prefix_cache_enabled = True
+        restored.prefix_cache_hit_len = threshold
+        restored.prefix_cache_hit_block_count = 1
+        restored.prefix_cache_hit_last_block_id = b"prefix"
+        self.assertTrue(
+            ModelRunner._is_long_text_batch(
+                runner,
+                [restored],
+                is_prefill=False,
+            )
+        )
+
     def test_all_chunked_batches_sparse_mixed_lengths(self):
         scheduler = make_scheduler(
             PREFILL_POLICY_ALL_CHUNKED,
