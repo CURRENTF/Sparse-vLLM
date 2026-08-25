@@ -5,32 +5,32 @@
       "family": "qwen2",
       "model_path_env": "DELTAKV_MODEL_QWEN25_7B",
       "tokenizer_path_env": "DELTAKV_TOKENIZER_QWEN25_7B",
-      "compressor_path_env": "DELTAKV_COMPRESSOR_QWEN25_7B"
+      "deltakv_checkpoint_path_env": "DELTAKV_COMPRESSOR_QWEN25_7B"
     },
     "qwen25_32b": {
       "family": "qwen2",
       "model_path_env": "DELTAKV_MODEL_QWEN25_32B",
       "tokenizer_path_env": "DELTAKV_TOKENIZER_QWEN25_32B",
-      "compressor_path_env": "DELTAKV_COMPRESSOR_QWEN25_32B"
+      "deltakv_checkpoint_path_env": "DELTAKV_COMPRESSOR_QWEN25_32B"
     },
     "qwen3_4b": {
       "family": "qwen3",
       "model_path_env": "DELTAKV_MODEL_QWEN3_4B",
       "tokenizer_path_env": "DELTAKV_TOKENIZER_QWEN3_4B",
-      "compressor_path_env": "DELTAKV_COMPRESSOR_QWEN3_4B"
+      "deltakv_checkpoint_path_env": "DELTAKV_COMPRESSOR_QWEN3_4B"
     },
     "qwen36": {
       "family": "qwen3_5",
       "mixed_attention": true,
       "model_path_env": "DELTAKV_MODEL_QWEN36",
       "tokenizer_path_env": "DELTAKV_TOKENIZER_QWEN36",
-      "compressor_path_env": "DELTAKV_COMPRESSOR_QWEN36"
+      "deltakv_checkpoint_path_env": "DELTAKV_COMPRESSOR_QWEN36"
     },
     "llama31_8b": {
       "family": "llama",
       "model_path_env": "DELTAKV_MODEL_LLAMA31_8B",
       "tokenizer_path_env": "DELTAKV_TOKENIZER_LLAMA31_8B",
-      "compressor_path_env": "DELTAKV_COMPRESSOR_LLAMA31_8B"
+      "deltakv_checkpoint_path_env": "DELTAKV_COMPRESSOR_LLAMA31_8B"
     }
   },
   "methods": {
@@ -195,7 +195,7 @@
     "deltakv": {
       "sparse_method": "deltakv",
       "requires_compressor": true,
-      "compressor_path_env": "DELTAKV_COMPRESSOR_PATH",
+      "deltakv_checkpoint_path_env": "DELTAKV_COMPRESSOR_PATH",
       "config": {
         "sparse_method": "deltakv",
         "long_prefill_offload_threshold": 65536,
@@ -236,7 +236,7 @@
     "deltakv-less-memory": {
       "sparse_method": "deltakv-less-memory",
       "requires_compressor": true,
-      "compressor_path_env": "DELTAKV_COMPRESSOR_PATH",
+      "deltakv_checkpoint_path_env": "DELTAKV_COMPRESSOR_PATH",
       "config": {
         "sparse_method": "deltakv-less-memory",
         "long_prefill_offload_threshold": 65536,
@@ -277,7 +277,7 @@
     "deltakv-less-memory-cudagraph": {
       "sparse_method": "deltakv-less-memory-cudagraph",
       "requires_compressor": true,
-      "compressor_path_env": "DELTAKV_COMPRESSOR_PATH",
+      "deltakv_checkpoint_path_env": "DELTAKV_COMPRESSOR_PATH",
       "config": {
         "sparse_method": "deltakv-less-memory-cudagraph",
         "long_prefill_offload_threshold": 65536,

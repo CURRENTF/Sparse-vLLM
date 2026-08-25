@@ -153,9 +153,11 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
             raise ManifestError(f"model {model_id!r} is missing model_path_env.")
         if "tokenizer_path_env" not in model:
             raise ManifestError(f"model {model_id!r} is missing tokenizer_path_env.")
-        compressor_env = model.get("compressor_path_env")
+        compressor_env = model.get("deltakv_checkpoint_path_env")
         if compressor_env is not None and not isinstance(compressor_env, str):
-            raise ManifestError(f"model {model_id!r} compressor_path_env must be a string.")
+            raise ManifestError(
+                f"model {model_id!r} deltakv_checkpoint_path_env must be a string."
+            )
         mixed_attention = model.get("mixed_attention", False)
         if not isinstance(mixed_attention, bool):
             raise ManifestError(f"model {model_id!r} mixed_attention must be a boolean.")
@@ -219,9 +221,11 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
         for bool_key in ("requires_compressor",):
             if bool_key not in method or not isinstance(method[bool_key], bool):
                 raise ManifestError(f"method {method_id!r} must define boolean {bool_key}.")
-        compressor_env = method.get("compressor_path_env")
+        compressor_env = method.get("deltakv_checkpoint_path_env")
         if compressor_env is not None and not isinstance(compressor_env, str):
-            raise ManifestError(f"method {method_id!r} compressor_path_env must be a string.")
+            raise ManifestError(
+                f"method {method_id!r} deltakv_checkpoint_path_env must be a string."
+            )
         performance_policy = method.get("performance")
         if performance_policy is not None:
             if not isinstance(performance_policy, dict):
@@ -248,11 +252,16 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
                     f"method {method_id!r} performance minimum_prefill_speedup "
                     "must be a positive number."
                 )
-        if method["requires_compressor"] and "compressor_path_env" not in method:
-            model_specific = [model_id for model_id, model in models.items() if model.get("compressor_path_env")]
+        if method["requires_compressor"] and "deltakv_checkpoint_path_env" not in method:
+            model_specific = [
+                model_id
+                for model_id, model in models.items()
+                if model.get("deltakv_checkpoint_path_env")
+            ]
             if not model_specific:
                 raise ManifestError(
-                    f"method {method_id!r} requires compressor but no model or method defines compressor_path_env."
+                    f"method {method_id!r} requires compressor but no model or method "
+                    "defines deltakv_checkpoint_path_env."
                 )
 
     outputs = manifest["outputs"]
@@ -412,24 +421,34 @@ def resolve_manifest_paths(manifest: dict[str, Any]) -> dict[str, Any]:
         model["model_path"] = os.getenv(model["model_path_env"])
         tokenizer_env = model["tokenizer_path_env"]
         model["tokenizer_path"] = os.getenv(tokenizer_env) or model["model_path"]
-        compressor_env = model.get("compressor_path_env")
-        model["compressor_path"] = os.getenv(compressor_env) if compressor_env else None
+        checkpoint_env = model.get("deltakv_checkpoint_path_env")
+        model["deltakv_checkpoint_path"] = (
+            os.getenv(checkpoint_env) if checkpoint_env else None
+        )
     for method in resolved["methods"].values():
-        env_key = method.get("compressor_path_env")
-        method["compressor_path"] = os.getenv(env_key) if env_key else None
+        env_key = method.get("deltakv_checkpoint_path_env")
+        method["deltakv_checkpoint_path"] = os.getenv(env_key) if env_key else None
     return resolved
 
 
-def compressor_path_for(model: dict[str, Any], method: dict[str, Any]) -> str | None:
+def deltakv_checkpoint_path_for(
+    model: dict[str, Any], method: dict[str, Any]
+) -> str | None:
     if not method.get("requires_compressor"):
         return None
-    if model.get("compressor_path_env"):
-        return model.get("compressor_path")
-    return model.get("compressor_path") or method.get("compressor_path")
+    if model.get("deltakv_checkpoint_path_env"):
+        return model.get("deltakv_checkpoint_path")
+    return model.get("deltakv_checkpoint_path") or method.get(
+        "deltakv_checkpoint_path"
+    )
 
 
-def compressor_env_for(model: dict[str, Any], method: dict[str, Any]) -> str:
-    return model.get("compressor_path_env") or method.get("compressor_path_env") or "compressor_path_env"
+def deltakv_checkpoint_env_for(model: dict[str, Any], method: dict[str, Any]) -> str:
+    return (
+        model.get("deltakv_checkpoint_path_env")
+        or method.get("deltakv_checkpoint_path_env")
+        or "deltakv_checkpoint_path_env"
+    )
 
 
 def missing_runtime_inputs(resolved: dict[str, Any], model_id: str, method_id: str) -> list[str]:
@@ -444,12 +463,12 @@ def missing_runtime_inputs(resolved: dict[str, Any], model_id: str, method_id: s
     if tokenizer_path and not Path(tokenizer_path).exists():
         missing.append(f"{model['tokenizer_path_env']}={tokenizer_path}")
     if method.get("requires_compressor"):
-        compressor_path = compressor_path_for(model, method)
-        compressor_env = compressor_env_for(model, method)
-        if not compressor_path:
-            missing.append(compressor_env)
-        elif not Path(compressor_path).exists():
-            missing.append(f"{compressor_env}={compressor_path}")
+        checkpoint_path = deltakv_checkpoint_path_for(model, method)
+        checkpoint_env = deltakv_checkpoint_env_for(model, method)
+        if not checkpoint_path:
+            missing.append(checkpoint_env)
+        elif not Path(checkpoint_path).exists():
+            missing.append(f"{checkpoint_env}={checkpoint_path}")
     return missing
 
 

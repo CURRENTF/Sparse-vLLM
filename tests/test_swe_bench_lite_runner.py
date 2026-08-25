@@ -13,6 +13,7 @@ from benchmark.swe_bench_lite.run import (
     _instance_image_names,
     _reject_secrets,
     _require_local_images,
+    _validate_local_server_manifest,
     assert_runtime_provenance_matches,
     build_parser,
     build_official_run_id,
@@ -51,6 +52,42 @@ def _write_trajectory(batch_dir: Path, instance_id: str, exit_status: str) -> No
 
 
 class SweBenchLiteRunnerTest(unittest.TestCase):
+    def test_local_server_manifest_requires_canonical_sparse_method_field(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "server_manifest.json"
+            manifest = {
+                "command": "python -m sparsevllm.entrypoints.openai.api_server",
+                "model_path": "/models/test",
+                "served_model_name": "test-model",
+                "cuda_visible_devices": "0",
+                "server_port": 18000,
+                "engine_kwargs": {
+                    "max_model_len": 4096,
+                    "sparse_method": "omnikv",
+                },
+            }
+            _write_json(path, manifest)
+
+            self.assertEqual(
+                _validate_local_server_manifest(
+                    path,
+                    api_base="http://127.0.0.1:18000/v1",
+                    served_model_name="test-model",
+                ),
+                manifest,
+            )
+
+            manifest["engine_kwargs"]["vllm_sparse_method"] = manifest[
+                "engine_kwargs"
+            ].pop("sparse_method")
+            _write_json(path, manifest)
+            with self.assertRaisesRegex(RunnerError, "record sparse_method"):
+                _validate_local_server_manifest(
+                    path,
+                    api_base="http://127.0.0.1:18000/v1",
+                    served_model_name="test-model",
+                )
+
     def test_instance_image_names_use_official_swebench_key_format(self):
         self.assertEqual(
             _instance_image_names([{"instance_id": "astropy__astropy-12907"}]),

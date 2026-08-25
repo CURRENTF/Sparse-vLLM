@@ -373,10 +373,8 @@ def _validate_local_server_manifest(
         raise RunnerError("server manifest engine_kwargs must record max_model_len")
     if not isinstance(engine_kwargs["max_model_len"], int) or engine_kwargs["max_model_len"] <= 0:
         raise RunnerError("server manifest max_model_len must be a positive integer")
-    if not ({"sparse_method", "sparse_method"} & set(engine_kwargs)):
-        raise RunnerError(
-            "server manifest engine_kwargs must record sparse_method or sparse_method"
-        )
+    if "sparse_method" not in engine_kwargs:
+        raise RunnerError("server manifest engine_kwargs must record sparse_method")
     if manifest["served_model_name"] != served_model_name:
         raise RunnerError(
             "server manifest served_model_name does not match --served-model-name: "

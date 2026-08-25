@@ -8,10 +8,32 @@ from pathlib import Path
 from unittest.mock import patch
 
 from benchmark.sparsevllm_regression import run_suite
-from benchmark.sparsevllm_regression.manifest import REQUIRED_ARTIFACTS
+from benchmark.sparsevllm_regression.manifest import (
+    REQUIRED_ARTIFACTS,
+    deltakv_checkpoint_path_for,
+    load_manifest,
+    resolve_manifest_paths,
+)
 
 
 class SparseVLLMRegressionSuiteTest(unittest.TestCase):
+    def test_deltakv_checkpoint_uses_canonical_manifest_field(self):
+        with patch.dict(
+            "os.environ",
+            {"DELTAKV_COMPRESSOR_QWEN25_7B": "/checkpoints/qwen25-7b"},
+            clear=False,
+        ):
+            resolved = resolve_manifest_paths(load_manifest())
+
+        model = resolved["models"]["qwen25_7b"]
+        method = resolved["methods"]["deltakv"]
+        self.assertEqual(
+            deltakv_checkpoint_path_for(model, method),
+            "/checkpoints/qwen25-7b",
+        )
+        self.assertNotIn("compressor_path", model)
+        self.assertNotIn("compressor_path", method)
+
     def test_validate_layer_runs_as_a_standard_test_and_writes_required_artifacts(self):
         # Keep the default tests on the cheap validate layer only. Full
         # quality/performance/stress regression runs require model paths,

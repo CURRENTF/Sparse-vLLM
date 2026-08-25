@@ -23,7 +23,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 DEFAULT_MODEL_PATH = os.getenv("SPARSEVLLM_MODEL_PATH")
-DEFAULT_COMPRESSOR_PATH = os.getenv("SPARSEVLLM_DELTAKV_CHECKPOINT_PATH")
+DEFAULT_DELTAKV_CHECKPOINT_PATH = os.getenv("SPARSEVLLM_DELTAKV_CHECKPOINT_PATH")
 DEFAULT_OUTPUT_ROOT = os.getenv(
     "SPARSEVLLM_OUTPUT_DIR",
     str(REPO_ROOT / "outputs" / "sparsevllm_max_batch_throughput"),
@@ -87,7 +87,7 @@ def _base_hparams(args: argparse.Namespace, method: str, batch_size: int) -> dic
         "max_num_batched_tokens": args.max_num_batched_tokens,
         "max_num_seqs_in_batch": batch_size,
         "max_decoding_seqs": batch_size,
-        "decode_graph": not args.disable_decode_cuda_graph,
+        "decode_graph": not args.disable_decode_graph,
         "throughput_log_interval_s": 0.0,
     }
 
@@ -122,7 +122,7 @@ def _base_hparams(args: argparse.Namespace, method: str, batch_size: int) -> dic
                 "sink_keep_tokens": args.deltakv_sink_keep_tokens,
                 "recent_keep_tokens": args.deltakv_recent_keep_tokens,
                 "decode_keep_tokens": args.deltakv_decode_keep_tokens,
-                "deltakv_checkpoint_path": args.compressor_path,
+                "deltakv_checkpoint_path": args.deltakv_checkpoint_path,
                 "deltakv_latent_dim": args.deltakv_latent_dim,
                 "deltakv_center_ratio": args.deltakv_center_ratio,
                 "deltakv_neighbor_count": args.deltakv_neighbor_count,
@@ -386,9 +386,9 @@ def parse_args() -> argparse.Namespace:
         required=DEFAULT_MODEL_PATH is None,
     )
     parser.add_argument(
-        "--compressor_path",
-        default=DEFAULT_COMPRESSOR_PATH,
-        required=DEFAULT_COMPRESSOR_PATH is None,
+        "--deltakv_checkpoint_path",
+        default=DEFAULT_DELTAKV_CHECKPOINT_PATH,
+        required=DEFAULT_DELTAKV_CHECKPOINT_PATH is None,
     )
     parser.add_argument("--methods", default=DEFAULT_METHODS)
     parser.add_argument("--lengths", default=DEFAULT_LENGTHS)
@@ -403,7 +403,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--engine_prefill_chunk_size", type=int, default=8192)
     parser.add_argument("--mlp_chunk_size", type=int, default=16384)
     parser.add_argument("--max_num_batched_tokens", type=int, default=65536)
-    parser.add_argument("--disable_decode_cuda_graph", action="store_true")
+    parser.add_argument("--disable_decode_graph", action="store_true")
     parser.add_argument("--master_port_base", type=int, default=29800)
     parser.add_argument("--full_attention_layers", default="0,2,4,11,16,22")
     parser.add_argument("--recent_keep_tokens", type=int, default=32)
@@ -439,7 +439,7 @@ def main() -> int:
     gpus = _parse_csv_ints(args.gpus)
     if args.max_batch_size < 1:
         raise ValueError("--max_batch_size must be >= 1")
-    for required_path in (args.model_path, args.compressor_path):
+    for required_path in (args.model_path, args.deltakv_checkpoint_path):
         if required_path and not Path(required_path).exists():
             raise FileNotFoundError(required_path)
 
@@ -457,7 +457,7 @@ def main() -> int:
         "git_status_short": _git_output(["status", "--short"], args.repo_root),
         "python": sys.executable,
         "model_path": args.model_path,
-        "compressor_path": args.compressor_path,
+        "deltakv_checkpoint_path": args.deltakv_checkpoint_path,
         "methods": methods,
         "lengths": lengths,
         "gpus": gpus,
