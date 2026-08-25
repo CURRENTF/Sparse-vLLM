@@ -8,7 +8,6 @@ from sparsevllm.method_registry import (
     sparse_decode_attention_requires_scores,
     sparse_prefill_attention_contract,
 )
-from sparsevllm.operators.moe import model_activation_dtype
 from sparsevllm.operators.decode_attention import (
     DecodeAttentionOpSpec,
     PreparedDecodeAttentionOp,
@@ -19,6 +18,7 @@ from sparsevllm.operators.full_attention import (
     FullAttentionProvider,
     prepare_full_attention_provider,
 )
+from sparsevllm.operators.moe import model_activation_dtype
 from sparsevllm.operators.prefill_attention import (
     PreparedPrefillAttentionOp,
     PrefillAttentionOpSpec,
@@ -175,6 +175,8 @@ def build_mha_decode_attention_spec(
             )
             == "batch_only"
         ),
+        context_capacity=int(getattr(runtime_config, "max_model_len", 0) or 0)
+        or None,
     )
 
 

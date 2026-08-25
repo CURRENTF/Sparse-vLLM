@@ -1018,7 +1018,14 @@ class DecodeCudaGraphCapacityPolicyTest(unittest.TestCase):
             ),
         )
         runner.runtime_state = SimpleNamespace(
-            prepare_decode_static=runner.cache_manager.prepare_decode_static,
+            prepare_decode_graph_step=lambda seqs, state: runner.cache_manager.prepare_decode_static(
+                seqs,
+                state.inputs.input_ids,
+                state.inputs.positions,
+                state.inputs.write_slot_mapping,
+                state.inputs.context_lens,
+                state.inputs.request_indices,
+            ),
         )
         runner.sparse_controller = SimpleNamespace(prepare_forward=lambda seqs, is_prefill: None)
         runner.is_long_text_batch = lambda seqs, is_prefill: False
@@ -1054,7 +1061,14 @@ class DecodeCudaGraphCapacityPolicyTest(unittest.TestCase):
             ),
         )
         runner.runtime_state = SimpleNamespace(
-            prepare_decode_static=runner.cache_manager.prepare_decode_static,
+            prepare_decode_graph_step=lambda seqs, state: runner.cache_manager.prepare_decode_static(
+                seqs,
+                state.inputs.input_ids,
+                state.inputs.positions,
+                state.inputs.write_slot_mapping,
+                state.inputs.context_lens,
+                state.inputs.request_indices,
+            ),
         )
         runner.sparse_controller = SimpleNamespace(
             prepare_forward=lambda seqs, is_prefill: calls.append(f"prepare:{is_prefill}")

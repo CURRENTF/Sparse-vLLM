@@ -21,7 +21,10 @@ from sparsevllm.engine.cache_manager.prefix_offload import (
     QuestPrefixOffloadController,
     StandardPrefixOffloadController,
 )
-from sparsevllm.engine.sequence import Sequence
+from sparsevllm.engine.decode_graph_contract import (
+    DecodeGraphContract,
+    DecodeGraphInputs,
+)
 from sparsevllm.engine.prefix_cache import (
     PrefixBlockResidency,
     PrefixCacheBlock,
@@ -32,6 +35,7 @@ from sparsevllm.engine.prefix_cache import (
     resolve_prefix_cache_block_size,
     usable_prefix_cache_tokens,
 )
+from sparsevllm.engine.sequence import Sequence
 from sparsevllm.platforms import device_runtime
 
 
@@ -2253,6 +2257,72 @@ def test_standard_static_decode_padding_does_not_materialize_padded_rows():
     assert block.token_ids == (1, 2, 3, 4)
     assert block.payload.token_slots.numel() == 4
     assert manager._num_free_slots == 86
+
+
+def test_standard_decode_graph_state_updates_stable_typed_inputs():
+    manager = _make_standard_manager_for_prefix(block_size=4)
+    seq = Sequence([1, 2, 3])
+    prompt_slots = manager._allocate(seq.seq_id, 3)
+    manager._record_prefix_materialization(seq, [1, 2, 3], prompt_slots)
+    seq.num_prefilled_tokens = seq.num_prompt_tokens
+    seq.append_token(4)
+
+    contract = DecodeGraphContract(
+        method="",
+        shape_policy="batch_only",
+        topology_path_id="dense",
+        batch_capacity=4,
+        context_capacity=16,
+    )
+    inputs = DecodeGraphInputs.allocate(
+        contract,
+        device=torch.device("cpu"),
+        pin_memory=False,
+    )
+    state = manager.init_decode_graph_state(contract, inputs)
+    pointers = inputs.data_ptrs()
+    assert contract.capability_level == "strict"
+
+    manager.prepare_decode_graph_step([seq], state)
+
+    assert inputs.data_ptrs() == pointers
+    assert inputs.input_ids.tolist() == [4, 4, 4, 4]
+    assert inputs.positions.tolist() == [3, 3, 3, 3]
+    assert inputs.write_slot_mapping.tolist()[1:] == [-1, -1, -1]
+    assert inputs.context_lens.tolist() == [4, 4, 4, 4]
+    assert inputs.request_indices.tolist() == [0, 0, 0, 0]
+    assert inputs.active_mask.tolist() == [True, False, False, False]
+    assert all(tensor.data_ptr() for tensor in inputs.keepalive_tensors())
+
+
+def test_standard_decode_graph_rejects_capacity_before_cache_mutation():
+    manager = _make_standard_manager_for_prefix(block_size=4)
+    seq = Sequence([1, 2, 3])
+    prompt_slots = manager._allocate(seq.seq_id, 3)
+    manager._record_prefix_materialization(seq, [1, 2, 3], prompt_slots)
+    seq.num_prefilled_tokens = seq.num_prompt_tokens
+    seq.append_token(4)
+    contract = DecodeGraphContract(
+        method="",
+        shape_policy="batch_only",
+        topology_path_id="dense",
+        batch_capacity=1,
+        context_capacity=3,
+    )
+    inputs = DecodeGraphInputs.allocate(
+        contract,
+        device=torch.device("cpu"),
+        pin_memory=False,
+    )
+    state = manager.init_decode_graph_state(contract, inputs)
+    free_slots_before = manager._num_free_slots
+    row_len_before = int(manager.row_seq_lens[manager.seq_id_to_row[seq.seq_id]])
+
+    with pytest.raises(ValueError, match="exceeded the captured graph context"):
+        manager.prepare_decode_graph_step([seq], state)
+
+    assert manager._num_free_slots == free_slots_before
+    assert int(manager.row_seq_lens[manager.seq_id_to_row[seq.seq_id]]) == row_len_before
 
 
 def test_standard_decode_materialized_block_can_seed_later_prefix_hit():

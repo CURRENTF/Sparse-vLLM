@@ -6,9 +6,14 @@ from typing import Callable
 
 import torch
 
-from sparsevllm.engine.sequence import Sequence
-from sparsevllm.configs.cuda_graph import _select_decode_cuda_graph_batch_size
 import sparsevllm.platforms as platforms
+from sparsevllm.configs.cuda_graph import _select_decode_cuda_graph_batch_size
+from sparsevllm.engine.decode_graph_contract import (
+    DecodeGraphContract,
+    DecodeGraphInputs,
+    DecodeGraphState,
+)
+from sparsevllm.engine.sequence import Sequence
 from sparsevllm.utils.context import get_context, set_context
 from sparsevllm.utils.profiler import profiler
 
@@ -59,12 +64,8 @@ class DecodeCudaGraphKey:
 class DecodeCudaGraphState:
     key: DecodeCudaGraphKey
     capture_context_capacity: int = 0
+    decode_state: DecodeGraphState | None = None
     graph: torch.cuda.CUDAGraph | None = None
-    input_ids: torch.Tensor | None = None
-    positions: torch.Tensor | None = None
-    slot_mapping: torch.Tensor | None = None
-    context_lens: torch.Tensor | None = None
-    req_indices: torch.Tensor | None = None
     logits: torch.Tensor | None = None
     token_ids: torch.Tensor | None = None
     keepalive: list[object] = field(default_factory=list)
@@ -163,11 +164,7 @@ class DecodeCudaGraphRunner:
     @staticmethod
     def _release_graph_state(state: DecodeCudaGraphState):
         state.graph = None
-        state.input_ids = None
-        state.positions = None
-        state.slot_mapping = None
-        state.context_lens = None
-        state.req_indices = None
+        state.decode_state = None
         state.logits = None
         state.token_ids = None
         state.keepalive.clear()
@@ -250,6 +247,9 @@ class DecodeCudaGraphRunner:
         allow_larger_context_capacity: bool = True,
     ) -> DecodeCudaGraphState:
         shape_policy = getattr(self, "shape_policy", "bucketed")
+        graph_path_id = str(graph_path_id) or (
+            "dense" if not method else ("long" if is_long_text else "short")
+        )
         candidates = [
             state
             for key, state in self._graphs.items()
@@ -291,7 +291,7 @@ class DecodeCudaGraphRunner:
             context_capacity=0 if shape_policy == "batch_only" else context_capacity,
             is_long_text=bool(is_long_text),
             capture_sampling=capture_sampling,
-            graph_path_id=str(graph_path_id),
+            graph_path_id=graph_path_id,
             shape_policy=shape_policy,
         )
         state = DecodeCudaGraphState(
@@ -303,11 +303,26 @@ class DecodeCudaGraphRunner:
             "device",
             torch.device("cuda" if torch.cuda.is_available() else "cpu"),
         )
-        state.input_ids = torch.empty((batch_size,), dtype=torch.int64, device=device)
-        state.positions = torch.empty((batch_size,), dtype=torch.int64, device=device)
-        state.slot_mapping = torch.empty((batch_size,), dtype=torch.int32, device=device)
-        state.context_lens = torch.empty((batch_size,), dtype=torch.int32, device=device)
-        state.req_indices = torch.empty((batch_size,), dtype=torch.int32, device=device)
+        contract = DecodeGraphContract(
+            method=str(method),
+            shape_policy=shape_policy,
+            topology_path_id=graph_path_id,
+            batch_capacity=int(batch_size),
+            context_capacity=int(context_capacity),
+            capture_sampling=bool(capture_sampling),
+        )
+        platform = getattr(self, "platform", None)
+        pin_memory = bool(
+            device.type != "cpu"
+            and platform is not None
+            and platform.supports_pin_memory()
+        )
+        inputs = DecodeGraphInputs.allocate(
+            contract,
+            device=device,
+            pin_memory=pin_memory,
+        )
+        state.decode_state = DecodeGraphState(contract=contract, inputs=inputs)
         self._graphs[key] = state
         self._evict_cached_graphs(key)
         return state
@@ -318,26 +333,26 @@ class DecodeCudaGraphRunner:
         seqs: list[Sequence],
         is_long_text: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        prepare_decode_static = getattr(self.runtime_state, "prepare_decode_static", None)
-        if prepare_decode_static is None:
-            raise TypeError("decode_graph requires runtime_state.prepare_decode_static().")
-
-        assert state.input_ids is not None
-        assert state.positions is not None
-        assert state.slot_mapping is not None
-        assert state.context_lens is not None
-        assert state.req_indices is not None
+        prepare_decode_graph_step = getattr(
+            self.runtime_state,
+            "prepare_decode_graph_step",
+            None,
+        )
+        if prepare_decode_graph_step is None:
+            raise TypeError(
+                "decode_graph requires runtime_state.prepare_decode_graph_step()."
+            )
+        graph_state = state.decode_state
+        if graph_state is None:
+            raise RuntimeError("Decode graph state was released before preparation.")
+        graph_state.inputs.validate(graph_state.contract)
 
         self.cache_manager.set_decode_static_max_context_len(
             int(state.capture_context_capacity)
         )
-        input_ids, positions, _ = prepare_decode_static(
+        input_ids, positions, _ = prepare_decode_graph_step(
             seqs,
-            state.input_ids,
-            state.positions,
-            state.slot_mapping,
-            state.context_lens,
-            state.req_indices,
+            graph_state,
         )
 
         set_context(
@@ -512,11 +527,17 @@ class DecodeCudaGraphRunner:
     ) -> DecodeCudaGraphState:
         if not self.platform.supports_graph_capture():
             raise RuntimeError(f"Platform {self.platform.name!r} does not support decode CUDA graph capture.")
+        graph_state = state.decode_state
+        if graph_state is None:
+            raise RuntimeError("Decode graph state was released before capture.")
         ctx = get_context()
         ctx.sparse_controller = self.sparse_controller
 
         with profiler.record("decode_graph_warmup"):
             self.sparse_controller.prepare_forward(seqs, is_prefill=False)
+            participant = graph_state.runtime_state
+            if participant is not None:
+                participant.prepare_in_graph()
             logits = self.run_model(input_ids, positions, is_prefill=False)
             if state.key.capture_sampling:
                 if logits is None:
@@ -537,6 +558,9 @@ class DecodeCudaGraphRunner:
             graph = torch.cuda.CUDAGraph()
             try:
                 with torch.cuda.graph(graph, pool=self.graph_pool):
+                    participant = graph_state.runtime_state
+                    if participant is not None:
+                        participant.prepare_in_graph()
                     self._reset_graph_input_attn_scores(graph_input_sparse_state_refs)
                     logits = self.run_model(input_ids, positions, is_prefill=False)
                     if state.key.capture_sampling:
@@ -558,12 +582,8 @@ class DecodeCudaGraphRunner:
             logits,
             ctx.decode_mid_o,
             ctx.decode_mid_o_logexpsum,
-            state.input_ids,
-            state.positions,
-            state.slot_mapping,
-            state.context_lens,
-            state.req_indices,
         ]
+        keepalive.extend(graph_state.keepalive_tensors())
         if token_ids is not None:
             keepalive.append(token_ids)
         for sparse_refs_by_layer in (graph_input_sparse_state_refs, state.sparse_state_refs):
@@ -571,7 +591,6 @@ class DecodeCudaGraphRunner:
                 for value in refs.values():
                     if isinstance(value, torch.Tensor):
                         keepalive.append(value)
-        keepalive.extend(self.cache_manager.decode_graph_keepalive_tensors())
         sparse_keepalive = getattr(self.sparse_controller, "decode_graph_keepalive_tensors", None)
         if sparse_keepalive is not None:
             keepalive.extend(sparse_keepalive())
@@ -682,11 +701,17 @@ class DecodeCudaGraphRunner:
         self.last_state_key = state.key
         self.last_real_batch_size = real_batch_size
         input_ids, positions = self._prepare_static_step(state, seqs, is_long_text)
+        graph_state = state.decode_state
+        if graph_state is None:
+            raise RuntimeError("Decode graph state was released before static execution.")
 
         ctx = get_context()
         ctx.sparse_controller = self.sparse_controller
         with profiler.record("model_sparse_prepare"):
             self.sparse_controller.prepare_forward(seqs, is_prefill=False)
+        participant = graph_state.runtime_state
+        if participant is not None:
+            participant.prepare_in_graph()
         logits = self.run_model(input_ids, positions, is_prefill=False)
         if logits is None:
             return None

@@ -8,6 +8,7 @@ from sparsevllm.configs.cuda_graph import (
     build_decode_cuda_graph_batch_only_startup_plan,
 )
 from sparsevllm.engine.decode_cuda_graph import DecodeCudaGraphRunner
+from sparsevllm.engine.decode_graph_contract import DecodeGraphContract
 from sparsevllm.kernels.triton.context_independent_flash_decoding import (
     context_independent_flash_decode,
 )
@@ -19,9 +20,12 @@ from sparsevllm.operators.context_independent_gemma4_attention import (
 )
 from sparsevllm.operators.decode_attention import (
     ContextIndependentTritonDecodeAttentionProvider,
+    DECODE_ATTENTION_REGISTRY,
     DecodeAttentionOpSpec,
     TritonPagedDecodeAttentionProvider,
+    build_graph_stable_decode_launch_plan,
 )
+from sparsevllm.operators.registry import OpResolver
 from sparsevllm.operators.gemma4 import Gemma4OpSpec, TritonGemma4OperatorProvider
 from sparsevllm.operators.mla_attention import (
     ContextIndependentMlaTritonProvider,
@@ -101,6 +105,25 @@ def test_batch_only_state_identity_omits_context_capacity() -> None:
     assert reused is state
     assert state.key.context_capacity == 0
     assert state.capture_context_capacity == 32768
+    assert state.decode_state is not None
+    assert state.decode_state.contract == DecodeGraphContract(
+        method="quest",
+        shape_policy="batch_only",
+        topology_path_id="long",
+        batch_capacity=4,
+        context_capacity=32768,
+    )
+    assert state.decode_state.inputs.batch_capacity == 4
+    assert state.decode_state.contract.capability_level == "path_scoped"
+
+    reused_with_default_path = runner._select_state(
+        method="quest",
+        batch_size=4,
+        context_capacity=16384,
+        is_long_text=True,
+        capture_sampling=False,
+    )
+    assert reused_with_default_path is state
 
     with pytest.raises(RuntimeError, match="exceeded captured path capacity"):
         runner._select_state(
@@ -122,6 +145,7 @@ def test_mha_resolver_contract_selects_only_context_independent_provider() -> No
         softmax_scale=128**-0.5,
         max_batch_size=8,
         context_independent_cuda_graph=True,
+        context_capacity=32768,
     )
     caps = _cuda_caps()
     assert ContextIndependentTritonDecodeAttentionProvider.supports(spec, caps).supported
@@ -137,10 +161,39 @@ def test_mha_resolver_contract_selects_only_context_independent_provider() -> No
         may_require_attention_scores=True,
         h2o_layerwise_probability_scores=True,
         context_independent_cuda_graph=True,
+        context_capacity=32768,
     )
     assert ContextIndependentTritonDecodeAttentionProvider.supports(
         h2o_spec, caps
     ).supported
+
+    unsupported = DecodeAttentionOpSpec(
+        **{
+            **spec.__dict__,
+            "activation_dtype": torch.float32,
+        }
+    )
+    assert not ContextIndependentTritonDecodeAttentionProvider.supports(
+        unsupported,
+        caps,
+    ).supported
+
+    plan = build_graph_stable_decode_launch_plan(spec, caps)
+    assert plan.context_capacity == spec.context_capacity
+    assert plan.max_kv_splits > 0
+    assert plan.target_tokens_per_split > 0
+    assert plan.block_n > 0
+    resolved = OpResolver(DECODE_ATTENTION_REGISTRY).resolve(
+        spec,
+        caps,
+        launch_plan=plan,
+    )
+    assert isinstance(
+        resolved.provider,
+        ContextIndependentTritonDecodeAttentionProvider,
+    )
+    metadata = resolved.report.as_dict()["provider_metadata"]
+    assert metadata["launch_plan"]["plan_id"] == plan.plan_id
 
 
 def test_mla_resolver_contract_selects_fixed_launch_provider() -> None:
@@ -200,13 +253,26 @@ def _decode_reference(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires idle CUDA GPU")
-def test_context_independent_mha_matches_reference_and_replays_new_lengths() -> None:
+@pytest.mark.parametrize(
+    ("dtype", "heads", "kv_heads", "head_dim"),
+    [
+        (torch.bfloat16, 8, 2, 128),
+        (torch.float16, 4, 4, 64),
+        (torch.bfloat16, 4, 2, 256),
+    ],
+)
+def test_context_independent_mha_matches_reference_and_replays_new_lengths(
+    dtype,
+    heads,
+    kv_heads,
+    head_dim,
+) -> None:
     torch.manual_seed(11)
-    batch, heads, kv_heads, head_dim, capacity = 2, 8, 2, 128, 257
+    batch, capacity = 2, 257
     device = torch.device("cuda")
-    q = torch.randn(batch, heads, head_dim, dtype=torch.bfloat16, device=device)
+    q = torch.randn(batch, heads, head_dim, dtype=dtype, device=device)
     k = torch.randn(
-        batch * capacity, kv_heads, head_dim, dtype=torch.bfloat16, device=device
+        batch * capacity, kv_heads, head_dim, dtype=dtype, device=device
     )
     v = torch.randn_like(k)
     slots = torch.arange(
@@ -249,6 +315,77 @@ def test_context_independent_mha_matches_reference_and_replays_new_lengths() -> 
     torch.cuda.synchronize()
     torch.testing.assert_close(graph_output, expected_output, rtol=2e-2, atol=2e-2)
     torch.testing.assert_close(graph_lse, expected_lse, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires idle CUDA GPU")
+def test_context_independent_gqa_produces_raw_per_head_scores() -> None:
+    torch.manual_seed(23)
+    batch, heads, kv_heads, head_dim, capacity = 2, 4, 2, 64, 33
+    device = torch.device("cuda")
+    q = torch.randn(batch, heads, head_dim, dtype=torch.bfloat16, device=device)
+    k = torch.randn(
+        batch * capacity,
+        kv_heads,
+        head_dim,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    v = torch.randn_like(k)
+    slots = torch.arange(
+        batch * capacity,
+        dtype=torch.int32,
+        device=device,
+    ).view(batch, capacity)
+    req_indices = torch.arange(batch, dtype=torch.int32, device=device)
+    lengths = torch.tensor([17, 29], dtype=torch.int32, device=device)
+    mid_o = torch.empty(
+        batch,
+        heads,
+        8,
+        head_dim,
+        dtype=torch.float32,
+        device=device,
+    )
+    mid_lse = torch.empty(batch, heads, 8, dtype=torch.float32, device=device)
+    scores = torch.full(
+        (batch, heads, capacity),
+        -torch.inf,
+        dtype=torch.float32,
+        device=device,
+    )
+
+    output = context_independent_flash_decode(
+        q,
+        k,
+        v,
+        slots,
+        req_indices,
+        lengths,
+        mid_o,
+        mid_lse,
+        attn_score=scores,
+        target_tokens_per_split=8,
+    )
+    expected, _ = _decode_reference(q, k, v, slots, req_indices, lengths)
+    torch.testing.assert_close(output, expected, rtol=2e-2, atol=2e-2)
+
+    group_size = heads // kv_heads
+    for batch_idx, length in enumerate(lengths.tolist()):
+        keys = k[slots[batch_idx, :length].long()].repeat_interleave(
+            group_size,
+            dim=1,
+        )
+        expected_scores = torch.einsum(
+            "hd,lhd->hl",
+            q[batch_idx].float(),
+            keys.float(),
+        )
+        torch.testing.assert_close(
+            scores[batch_idx, :, :length],
+            expected_scores,
+            rtol=2e-2,
+            atol=2e-2,
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires idle CUDA GPU")

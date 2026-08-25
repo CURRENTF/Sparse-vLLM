@@ -12,11 +12,16 @@ import torch.distributed as dist
 
 from sparsevllm.config import Config
 from sparsevllm.distributed import ParallelContext
-from sparsevllm.engine.sequence import Sequence
+from sparsevllm.engine.decode_graph_contract import (
+    CacheDecodeGraphState,
+    DecodeGraphContract,
+    DecodeGraphInputs,
+)
 from sparsevllm.engine.prefill import (
     PREFILL_EXECUTION_CHUNKED,
     PREFILL_EXECUTION_RAW_OFFLOAD,
 )
+from sparsevllm.engine.sequence import Sequence
 from sparsevllm.method_registry import (
     SUPPORTED_SPARSE_METHODS,
     decode_graph_path_id,
@@ -596,6 +601,46 @@ class CacheManager(ABC):
         if is_prefill:
             return self._prepare_prefill(seqs)
         return self._prepare_decode(seqs)
+
+    def init_decode_graph_state(
+        self,
+        contract: DecodeGraphContract,
+        inputs: DecodeGraphInputs,
+    ) -> CacheDecodeGraphState:
+        """Bind cache-owned metadata to one graph's stable public inputs."""
+        inputs.validate(contract)
+        return CacheDecodeGraphState(contract=contract, inputs=inputs)
+
+    def prepare_decode_graph_step(
+        self,
+        seqs: list[Sequence],
+        state: CacheDecodeGraphState,
+    ):
+        """Compatibility adapter while method-specific managers migrate."""
+        inputs = state.inputs
+        result = self.prepare_decode_static(
+            seqs,
+            inputs.input_ids,
+            inputs.positions,
+            inputs.write_slot_mapping,
+            inputs.context_lens,
+            inputs.request_indices,
+        )
+        real_batch_size = len(seqs)
+        inputs.active_mask[:real_batch_size].fill_(True)
+        inputs.active_mask[real_batch_size:].fill_(state.contract.padding.active)
+        return result
+
+    def prepare_decode_graph_in(self, state: CacheDecodeGraphState) -> None:
+        """Run fixed device-side cache metadata preparation during capture/replay."""
+        del state
+
+    def decode_graph_state_keepalive_tensors(
+        self,
+        state: CacheDecodeGraphState,
+    ) -> list[torch.Tensor]:
+        del state
+        return self.decode_graph_keepalive_tensors()
 
     @abstractmethod
     def allocate_kv_cache(self):

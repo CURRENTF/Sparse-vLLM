@@ -10,7 +10,10 @@ import torch
 
 from sparsevllm.config import Config
 from sparsevllm.distributed import ParallelContext
-from sparsevllm.engine.sequence import Sequence
+from sparsevllm.engine.decode_graph_contract import (
+    CacheDecodeGraphState,
+    DecodeGraphHostInputs,
+)
 from sparsevllm.engine.prefix_cache import (
     PrefixCacheBlock,
     PrefixTransferKind,
@@ -19,6 +22,7 @@ from sparsevllm.engine.prefix_cache import (
     select_write_through_candidates,
     usable_prefix_cache_tokens,
 )
+from sparsevllm.engine.sequence import Sequence
 from sparsevllm.utils.log import logger, log_level
 from sparsevllm.utils.profiler import profiler
 from sparsevllm.platforms import device_runtime
@@ -1520,6 +1524,54 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
         Used by CUDA Graph decode replay: tensor addresses must stay stable, so
         this avoids the ordinary per-step metadata tensor allocation path.
         """
+        return self._prepare_decode_graph_buffers(
+            seqs,
+            input_ids=input_ids,
+            positions=positions,
+            slot_mapping=slot_mapping,
+            context_lens=context_lens,
+            req_indices=req_indices,
+        )
+
+    def prepare_decode_graph_step(
+        self,
+        seqs: list[Sequence],
+        state: CacheDecodeGraphState,
+    ):
+        inputs = state.inputs
+        return self._prepare_decode_graph_buffers(
+            seqs,
+            input_ids=inputs.input_ids,
+            positions=inputs.positions,
+            slot_mapping=inputs.write_slot_mapping,
+            context_lens=inputs.context_lens,
+            req_indices=inputs.request_indices,
+            active_mask=inputs.active_mask,
+            host_inputs=inputs.host,
+            padding_write_slot=int(state.contract.padding.write_slot),
+            padding_active=bool(state.contract.padding.active),
+            mirror_first_real_row_for_reads=bool(
+                state.contract.padding.mirror_first_real_row_for_reads
+            ),
+            context_capacity=int(state.contract.context_capacity),
+        )
+
+    def _prepare_decode_graph_buffers(
+        self,
+        seqs: list[Sequence],
+        *,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        context_lens: torch.Tensor,
+        req_indices: torch.Tensor,
+        active_mask: torch.Tensor | None = None,
+        host_inputs: DecodeGraphHostInputs | None = None,
+        padding_write_slot: int = -1,
+        padding_active: bool = False,
+        mirror_first_real_row_for_reads: bool = True,
+        context_capacity: int | None = None,
+    ):
         with profiler.record("cache_prepare_decode"):
             self._poll_prefix_offload()
             self._prefix_offload_step_h2d_operations = []
@@ -1540,10 +1592,34 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
                     "Static decode graph batch is smaller than the real decode batch: "
                     f"graph={graph_batch_size}, real={real_batch_size}."
                 )
+            if active_mask is not None and active_mask.numel() != graph_batch_size:
+                raise ValueError(
+                    "Static decode active_mask must match the graph batch size."
+                )
+            if not mirror_first_real_row_for_reads:
+                raise ValueError(
+                    "StandardCacheManager requires padded read rows to mirror the "
+                    "first real request."
+                )
 
             input_ids_list = [seq.decode_input_token for seq in seqs]
             positions_list = [seq.decode_input_position for seq in seqs]
             seq_ids = [seq.seq_id for seq in seqs]
+
+            if context_capacity is not None:
+                prospective_rows = np.asarray(
+                    [self._get_free_row(seq_id) for seq_id in seq_ids],
+                    dtype=np.int64,
+                )
+                max_requested_context_len = int(
+                    (self.row_seq_lens[prospective_rows] + 1).max()
+                )
+                if max_requested_context_len > context_capacity:
+                    raise ValueError(
+                        "Decode request exceeded the captured graph context capacity: "
+                        f"requested={max_requested_context_len} "
+                        f"captured={context_capacity}."
+                    )
 
             new_slots_batch, real_context_lens, row_indices = self._allocate_decode_batch_static(
                 seq_ids,
@@ -1552,27 +1628,66 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
             for seq, slot in zip(seqs, new_slots_batch):
                 self._record_prefix_materialization(seq, [seq.decode_input_token], slot.reshape(1))
 
-            input_ids[:real_batch_size].copy_(torch.tensor(input_ids_list, dtype=torch.int64))
-            positions[:real_batch_size].copy_(torch.tensor(positions_list, dtype=torch.int64))
             slot_mapping[:real_batch_size].copy_(new_slots_batch)
-            context_lens[:real_batch_size].copy_(
-                torch.from_numpy(real_context_lens.astype(np.int32, copy=False))
-            )
-            req_indices[:real_batch_size].copy_(
-                torch.from_numpy(row_indices.astype(np.int32, copy=False))
-            )
+            if host_inputs is None:
+                input_ids[:real_batch_size].copy_(
+                    torch.tensor(input_ids_list, dtype=torch.int64)
+                )
+                positions[:real_batch_size].copy_(
+                    torch.tensor(positions_list, dtype=torch.int64)
+                )
+                context_lens[:real_batch_size].copy_(
+                    torch.from_numpy(real_context_lens.astype(np.int32, copy=False))
+                )
+                req_indices[:real_batch_size].copy_(
+                    torch.from_numpy(row_indices.astype(np.int32, copy=False))
+                )
+            else:
+                host_inputs.input_ids.numpy()[:real_batch_size] = input_ids_list
+                host_inputs.positions.numpy()[:real_batch_size] = positions_list
+                host_inputs.context_lens.numpy()[:real_batch_size] = (
+                    real_context_lens.astype(np.int32, copy=False)
+                )
+                host_inputs.request_indices.numpy()[:real_batch_size] = (
+                    row_indices.astype(np.int32, copy=False)
+                )
+                host_inputs.active_mask[:real_batch_size].fill_(True)
+                non_blocking = bool(host_inputs.input_ids.is_pinned())
+                input_ids[:real_batch_size].copy_(
+                    host_inputs.input_ids[:real_batch_size],
+                    non_blocking=non_blocking,
+                )
+                positions[:real_batch_size].copy_(
+                    host_inputs.positions[:real_batch_size],
+                    non_blocking=non_blocking,
+                )
+                context_lens[:real_batch_size].copy_(
+                    host_inputs.context_lens[:real_batch_size],
+                    non_blocking=non_blocking,
+                )
+                req_indices[:real_batch_size].copy_(
+                    host_inputs.request_indices[:real_batch_size],
+                    non_blocking=non_blocking,
+                )
+                assert active_mask is not None
+                active_mask[:real_batch_size].copy_(
+                    host_inputs.active_mask[:real_batch_size],
+                    non_blocking=non_blocking,
+                )
 
             if graph_batch_size > real_batch_size:
                 # CUDA Graph replay is shape-static. Padded rows mirror the first
-                # real request for read-only attention work, but use slot -1 so
-                # they never write KV or consume persistent cache capacity.
+                # real request for read-only work, but use the contract's safe
+                # write sentinel so they never consume persistent cache capacity.
                 first_context_len = int(real_context_lens[0])
                 first_row_idx = int(row_indices[0])
                 input_ids[real_batch_size:].fill_(int(input_ids_list[0]))
                 positions[real_batch_size:].fill_(int(positions_list[0]))
-                slot_mapping[real_batch_size:].fill_(-1)
+                slot_mapping[real_batch_size:].fill_(padding_write_slot)
                 context_lens[real_batch_size:].fill_(first_context_len)
                 req_indices[real_batch_size:].fill_(first_row_idx)
+                if active_mask is not None:
+                    active_mask[real_batch_size:].fill_(padding_active)
 
             self.layer_batch_state.slot_mapping = slot_mapping
             self.layer_batch_state.context_lens = context_lens

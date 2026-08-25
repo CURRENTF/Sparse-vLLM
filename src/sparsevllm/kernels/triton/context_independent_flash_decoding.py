@@ -1,4 +1,4 @@
-"""Experimental context-independent split-KV decode attention.
+"""Context-independent split-KV decode attention.
 
 The stable decode kernels intentionally remain unchanged.  This variant fixes
 the CUDA launch grid and workspace split dimension while deriving the effective
@@ -59,7 +59,7 @@ def _context_independent_decode_stage1(
     seq_len = tl.load(B_Seqlen + batch_id)
     requested_splits = tl.cdiv(seq_len, TARGET_TOKENS_PER_SPLIT)
     num_splits = tl.maximum(1, tl.minimum(requested_splits, MAX_EFFECTIVE_SPLITS))
-    split_tokens = tl.cdiv(tl.cdiv(seq_len, num_splits), BLOCK_N) * BLOCK_N
+    split_tokens = tl.cdiv(seq_len, num_splits)
     split_start = split_id * split_tokens
     split_end = tl.minimum(split_start + split_tokens, seq_len)
     split_valid = (split_id < num_splits) & (split_start < split_end)
@@ -82,7 +82,7 @@ def _context_independent_decode_stage1(
             Req_to_tokens + req_id * stride_req_b + positions * stride_req_s,
             mask=position_mask,
             other=0,
-        )
+        ).to(tl.int64)
         k_offsets = slots[:, None] * stride_kb + kv_head_id * stride_kh + offs_d[None, :]
         v_offsets = slots[:, None] * stride_vb + kv_head_id * stride_vh + offs_d[None, :]
         k = tl.load(K + k_offsets, mask=position_mask[:, None], other=0.0)
@@ -174,7 +174,7 @@ def _context_independent_grouped_decode_stage1(
     seq_len = tl.load(B_Seqlen + batch_id)
     requested_splits = tl.cdiv(seq_len, TARGET_TOKENS_PER_SPLIT)
     num_splits = tl.maximum(1, tl.minimum(requested_splits, MAX_EFFECTIVE_SPLITS))
-    split_tokens = tl.cdiv(tl.cdiv(seq_len, num_splits), BLOCK_N) * BLOCK_N
+    split_tokens = tl.cdiv(seq_len, num_splits)
     split_start = split_id * split_tokens
     split_end = tl.minimum(split_start + split_tokens, seq_len)
     split_valid = (split_id < num_splits) & (split_start < split_end)
@@ -198,7 +198,7 @@ def _context_independent_grouped_decode_stage1(
             Req_to_tokens + req_id * stride_req_b + positions * stride_req_s,
             mask=position_mask,
             other=0,
-        )
+        ).to(tl.int64)
         k_offsets = slots[None, :] * stride_kb + kv_head_id * stride_kh + offs_d[:, None]
         v_offsets = slots[:, None] * stride_vb + kv_head_id * stride_vh + offs_d[None, :]
         k = tl.load(K + k_offsets, mask=position_mask[None, :], other=0.0)
@@ -368,9 +368,13 @@ def context_independent_flash_decode(
     mid_lse: torch.Tensor,
     *,
     attn_score: torch.Tensor | None = None,
+    softmax_scale: float | None = None,
     target_tokens_per_split: int,
     block_n: int = 32,
     num_warps: int = 4,
+    num_stages: int = 2,
+    stage2_num_warps: int | None = None,
+    stage2_num_stages: int = 2,
     return_softmax_lse: bool = False,
     output_lse: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
@@ -391,8 +395,16 @@ def context_independent_flash_decode(
         raise ValueError("split count and target tokens per split must be positive")
     if block_n not in {16, 32, 64, 128}:
         raise ValueError(f"unsupported BLOCK_N={block_n}")
+    if num_warps <= 0 or num_stages <= 0 or stage2_num_stages <= 0:
+        raise ValueError("Triton launch warps/stages must be positive")
 
     batch, num_heads, head_dim = map(int, q.shape)
+    if softmax_scale is None:
+        softmax_scale = 1.0 / (head_dim**0.5)
+    if softmax_scale <= 0:
+        raise ValueError("softmax_scale must be positive")
+    if stage2_num_warps is None:
+        stage2_num_warps = 8 if head_dim == 256 else 4
     group_size = num_heads // int(k.shape[1])
     max_effective_splits = max_kv_splits
     score = mid_lse if attn_score is None else attn_score
@@ -406,7 +418,7 @@ def context_independent_flash_decode(
         q,
         k,
         v,
-        1.0 / (head_dim**0.5),
+        softmax_scale,
         active_slots,
         req_indices,
         context_lens,
@@ -438,7 +450,7 @@ def context_independent_flash_decode(
         TARGET_TOKENS_PER_SPLIT=target_tokens_per_split,
         SCORE_MODE=0 if attn_score is None else attn_score.dim(),
         num_warps=num_warps,
-        num_stages=2,
+        num_stages=num_stages,
     )
     if group_size > 1:
         _context_independent_grouped_decode_stage1[
@@ -486,7 +498,7 @@ def context_independent_flash_decode(
         MAX_KV_SPLITS=max_kv_splits,
         MAX_EFFECTIVE_SPLITS=max_effective_splits,
         TARGET_TOKENS_PER_SPLIT=target_tokens_per_split,
-        num_warps=8 if head_dim == 256 else 4,
-        num_stages=2,
+        num_warps=stage2_num_warps,
+        num_stages=stage2_num_stages,
     )
     return (output, output_lse) if return_softmax_lse else output

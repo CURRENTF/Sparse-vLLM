@@ -66,6 +66,31 @@ def test_h2o_runtime_decode_spec_is_score_free_while_eviction_is_disabled():
     assert not spec.kernel_request.requires_softmax_lse
 
 
+def test_batch_only_decode_spec_carries_static_context_capacity():
+    config = SimpleNamespace(
+        num_attention_heads=32,
+        num_key_value_heads=8,
+        head_dim=128,
+        torch_dtype=torch.bfloat16,
+    )
+    runtime_config = SimpleNamespace(
+        decode_graph_shape_policy="batch_only",
+        max_model_len=40960,
+    )
+
+    spec = build_mha_decode_attention_spec(
+        config,
+        sparse_method="vanilla",
+        attention_tp_size=1,
+        max_batch_size=8,
+        cuda_graph=True,
+        runtime_config=runtime_config,
+    )
+
+    assert spec.context_independent_cuda_graph
+    assert spec.context_capacity == runtime_config.max_model_len
+
+
 def _cuda_caps(
     *,
     device_name: str = "NVIDIA H100 80GB HBM3",
