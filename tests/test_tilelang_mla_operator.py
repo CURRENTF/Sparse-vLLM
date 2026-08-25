@@ -550,33 +550,40 @@ def test_score_capacity_may_include_padding_beyond_active_slots() -> None:
     tilelang.assert_called_once()
 
 
-@pytest.mark.parametrize("noncontiguous", ["active_slots", "attn_score"])
-def test_noncontiguous_tilelang_inputs_fail_instead_of_falling_back(
-    noncontiguous: str,
-) -> None:
+def test_noncontiguous_active_slots_fail_instead_of_falling_back() -> None:
     provider, fa3, tilelang = _provider_with_mocks()
-    score = torch.empty(2, 10, 128, dtype=torch.float32)[:, :, ::2]
-    view = _view(
-        score=(
-            score
-            if noncontiguous == "attn_score"
-            else torch.empty(2, 10, 64, dtype=torch.float32)
-        )
-    )
-    if noncontiguous == "active_slots":
-        backing = torch.full((3, 128), -1, dtype=torch.int32)
-        backing[2, :6:2] = torch.tensor([5, 2, 7], dtype=torch.int32)
-        object.__setattr__(view.meta, "active_slots", backing[:, ::2])
+    view = _view(score=torch.empty(2, 10, 64, dtype=torch.float32))
+    backing = torch.full((3, 128), -1, dtype=torch.int32)
+    backing[2, :6:2] = torch.tensor([5, 2, 7], dtype=torch.int32)
+    object.__setattr__(view.meta, "active_slots", backing[:, ::2])
     q_latent = torch.empty(2, 10, 512, dtype=torch.bfloat16)
     q_rope = torch.empty(2, 10, 64, dtype=torch.bfloat16)
     output = torch.empty_like(q_latent)
 
-    with pytest.raises(ValueError, match=f"noncontiguous:{noncontiguous}"):
+    with pytest.raises(ValueError, match="noncontiguous:active_slots"):
         provider.run(q_latent, q_rope, view, output)
 
     fa3.assert_not_called()
     tilelang.assert_not_called()
     assert provider.runtime_kernel_stats()["fallback_reasons"] == {}
+
+
+def test_noncontiguous_per_head_score_routes_to_tilelang_staging() -> None:
+    provider, fa3, tilelang = _provider_with_mocks()
+    score = torch.empty(2, 10, 128, dtype=torch.float32)[:, :, ::2]
+    view = _view(score=score)
+    q_latent = torch.empty(2, 10, 512, dtype=torch.bfloat16)
+    q_rope = torch.empty(2, 10, 64, dtype=torch.bfloat16)
+    output = torch.empty_like(q_latent)
+
+    with patch(
+        "sparsevllm.operators.mla_attention.validate_mla_decode_metadata"
+    ):
+        provider.run(q_latent, q_rope, view, output)
+
+    fa3.assert_not_called()
+    tilelang.assert_called_once()
+    assert tilelang.call_args.kwargs["attn_score"] is score
 
 
 def test_tilelang_runner_rejects_score_capacity_smaller_than_context() -> None:

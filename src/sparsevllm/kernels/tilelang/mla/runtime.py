@@ -524,7 +524,10 @@ class TileMlaDecodeKernel:
                     "TileLang MLA attn_score must be FP32 on the query device, "
                     f"got {attn_score.dtype} on {attn_score.device}."
                 )
-            if not attn_score.is_contiguous():
+            if (
+                not attn_score.is_contiguous()
+                and config.score_mode != "per_head"
+            ):
                 raise ValueError(
                     "TileLang MLA attn_score must be contiguous, got stride "
                     f"{tuple(attn_score.stride())}."
@@ -628,7 +631,10 @@ class TileMlaDecodeKernel:
             if config.score_mode == "partial":
                 score_output.fill_(-1e20)
             elif config.score_mode == "per_head":
-                score_output = attn_score
+                if attn_score.is_contiguous():
+                    score_output = attn_score
+                else:
+                    score_output.fill_(-1e20)
             else:
                 score_output = attn_score.unsqueeze(1)
         bound.call(
@@ -646,6 +652,12 @@ class TileMlaDecodeKernel:
         )
         if attn_score is not None and config.score_mode == "partial":
             torch.amax(score_output, dim=1, out=attn_score)
+        elif (
+            attn_score is not None
+            and config.score_mode == "per_head"
+            and score_output is not attn_score
+        ):
+            attn_score.copy_(score_output)
         return output
 
 

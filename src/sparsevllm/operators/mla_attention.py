@@ -903,7 +903,6 @@ class MlaTileLangScoreProvider(MlaSglFa3Provider):
             "active_slots": view.meta.active_slots,
             "request_indices": view.meta.req_indices,
             "context_lens": view.meta.context_lens,
-            "attn_score": view.meta.attn_score,
             "output": output,
         }
         rejected = [

@@ -251,9 +251,11 @@ def test_static_plan_replays_across_contexts_with_unaligned_capacity() -> None:
     request_indices = torch.zeros(1, dtype=torch.int32, device=device)
     context_lens = torch.full((1,), 31, dtype=torch.int32, device=device)
     output = torch.empty_like(q_latent)
-    score = torch.empty(
-        1, valid_heads, capacity, dtype=torch.float32, device=device
+    score_storage = torch.empty(
+        1, valid_heads, capacity + 1, dtype=torch.float32, device=device
     )
+    score = score_storage[:, :, :capacity]
+    assert not score.is_contiguous()
     plan = TileMlaLaunchPlan.build(
         context_capacity=8192,
         local_q_heads=valid_heads,
