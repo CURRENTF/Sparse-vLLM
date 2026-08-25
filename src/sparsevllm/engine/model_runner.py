@@ -1360,15 +1360,15 @@ class ModelRunner:
         self.decode_graph_runner.set_max_context_len_override(max_context_len)
 
     def set_decode_cuda_graph_reuse_larger_context_graphs(self, enabled: bool):
-        self.decode_cuda_graph_runner.set_reuse_larger_context_graphs(enabled)
+        self.decode_graph_runner.set_reuse_larger_context_graphs(enabled)
 
     def seal_decode_cuda_graph_startup_plan(self):
-        self.decode_cuda_graph_runner.seal_startup_plan()
+        self.decode_graph_runner.seal_startup_plan()
 
     def capture_decode_cuda_graph_warmup(self, seqs: list[Sequence]) -> None:
         """Capture one planned graph without advancing scheduler sequence state."""
         try:
-            self.decode_cuda_graph_runner.run(seqs, capture_sampling=False)
+            self.decode_graph_runner.run(seqs, capture_sampling=False)
         finally:
             reset_context()
 
