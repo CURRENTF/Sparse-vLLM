@@ -535,7 +535,7 @@ class LLMEngine:
                 "set_decode_cuda_graph_reuse_larger_context_graphs",
                 True,
             )
-            graph_runner = self.model_runner.decode_cuda_graph_runner
+            graph_runner = self.model_runner.decode_graph_runner
             captured = {
                 (
                     int(key.batch_size),
