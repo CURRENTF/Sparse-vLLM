@@ -96,12 +96,17 @@ _PREFILL_POSTHOC_SCORE_METHODS = frozenset(
     {"snapkv", "pyramidkv", "h2o", "rkv"}
 )
 
+_DECODE_ATTENTION_SCORE_KINDS = {
+    "pyramidkv": AttentionScoreKind.RAW_QK_REDUCED,
+    "omnikv": AttentionScoreKind.RAW_QK_PER_HEAD,
+    "skipkv": AttentionScoreKind.RAW_QK_PER_HEAD,
+    "deltakv": AttentionScoreKind.RAW_QK_PER_HEAD,
+}
+
 # These methods can request a score-producing decode launch on at least one
-# layer or decode step.  The answer is deliberately static so Provider
+# layer or decode step.  The answer is deliberately static so provider
 # selection happens before CUDA Graph capture and never changes in run().
-_DECODE_ATTENTION_SCORE_METHODS = frozenset(
-    {"pyramidkv", "omnikv", "skipkv", "deltakv"}
-)
+_DECODE_ATTENTION_SCORE_METHODS = frozenset(_DECODE_ATTENTION_SCORE_KINDS)
 
 
 def sparse_prefill_attention_contract(
@@ -154,18 +159,18 @@ def sparse_decode_attention_score_kind(
 ) -> AttentionScoreKind:
     """Return the score representation consumed by sparse decode logic.
 
-    Decode sparse methods currently normalize and reduce scores in
-    ``SparseController``.  Providers therefore produce raw per-head QK values;
-    a head-reduced raw maximum is not equivalent to normalizing each head and
-    then reducing the probabilities.
+    OmniKV, SkipKV, and DeltaKV normalize each head in ``SparseController``
+    before reducing across heads, so providers must preserve raw per-head QK.
+    PyramidKV consumes the existing fused head-reduced raw-QK representation.
     """
 
     normalized = normalize_sparse_method(method)
     if normalized not in CANONICAL_SPARSE_METHODS:
         raise ValueError(f"Unknown sparse method {normalized!r}.")
-    if normalized in _DECODE_ATTENTION_SCORE_METHODS:
-        return AttentionScoreKind.RAW_QK_PER_HEAD
-    return AttentionScoreKind.NONE
+    return _DECODE_ATTENTION_SCORE_KINDS.get(
+        normalized,
+        AttentionScoreKind.NONE,
+    )
 
 
 _MOE_SPARSE_METHODS = frozenset(

@@ -24,6 +24,7 @@ from sparsevllm.kernels.tilelang.mla.runtime import (
 from sparsevllm.kernels.triton.mla import MlaDecodeWorkspace
 from sparsevllm.operators.attention_capabilities import AttentionScoreKind
 from sparsevllm.operators.mla_attention import (
+    ContextIndependentMlaTritonProvider,
     MLA_ATTENTION_REGISTRY,
     MlaAttentionOpSpec,
     MlaTileLangScoreProvider,
@@ -353,6 +354,41 @@ def test_batch_only_score_contract_binds_static_tilelang_plan() -> None:
     assert type(resolved.provider) is MlaTileLangScoreProvider
     assert resolved.provider.context_independent_cuda_graph
     assert resolved.provider.tilelang_launch_plan.context_capacity == 65536
+
+
+def test_batch_only_reduced_score_contract_binds_static_triton_provider() -> None:
+    spec = replace(
+        _spec(),
+        score_output=AttentionScoreKind.RAW_QK_REDUCED,
+        context_independent_cuda_graph=True,
+    )
+    with (
+        patch(
+            "sparsevllm.operators.mla_attention.sgl_fa3_device_support",
+            return_value=(True, "sgl test"),
+        ),
+        patch(
+            "sparsevllm.operators.mla_attention.tilelang_mla_support",
+            return_value=(True, "tilelang test"),
+        ),
+        patch(
+            "sparsevllm.operators.mla_attention.allocate_mla_decode_workspace",
+            return_value=_cpu_workspace(),
+        ),
+    ):
+        resolved = OpResolver(MLA_ATTENTION_REGISTRY).resolve(
+            spec,
+            _h100_caps(),
+            op_spec=spec,
+            device="cpu",
+            max_batch_size=2,
+        )
+
+    assert type(resolved.provider) is ContextIndependentMlaTritonProvider
+    assert (
+        "tilelang_score_sgl_fa3_h100",
+        "requires the RAW_QK_PER_HEAD decode score contract",
+    ) in resolved.rejected
 
 
 def _provider_with_mocks() -> tuple[MlaTileLangScoreProvider, Mock, Mock]:

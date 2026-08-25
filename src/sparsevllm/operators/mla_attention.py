@@ -93,9 +93,11 @@ class MlaAttentionOpSpec:
         if self.score_output not in {
             AttentionScoreKind.NONE,
             AttentionScoreKind.RAW_QK_PER_HEAD,
+            AttentionScoreKind.RAW_QK_REDUCED,
         }:
             raise ValueError(
-                "MLA decode currently supports NONE or RAW_QK_PER_HEAD score "
+                "MLA decode currently supports NONE, RAW_QK_PER_HEAD, or "
+                "RAW_QK_REDUCED score "
                 f"contracts, got {self.score_output.name}."
             )
 

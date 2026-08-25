@@ -41,6 +41,7 @@ from sparsevllm.models.glm4_moe_lite import (
     Glm4MoeLiteForCausalLM,
     Glm4MoeLiteSparseMoeBlock,
 )
+from sparsevllm.operators.attention_capabilities import AttentionScoreKind
 from sparsevllm.operators.mla_attention import MlaAttentionOpSpec
 from sparsevllm.utils.context import get_context
 
@@ -49,6 +50,23 @@ from glm_test_helpers import (
     _single_rank_parallel_context,
     _tensor_sha256,
 )
+
+
+@pytest.mark.parametrize(
+    ("method", "expected"),
+    [
+        ("pyramidkv", AttentionScoreKind.RAW_QK_REDUCED),
+        ("omnikv", AttentionScoreKind.RAW_QK_PER_HEAD),
+        ("skipkv", AttentionScoreKind.RAW_QK_PER_HEAD),
+        ("deltakv", AttentionScoreKind.RAW_QK_PER_HEAD),
+        ("vanilla", AttentionScoreKind.NONE),
+    ],
+)
+def test_glm_sparse_method_declares_exact_decode_score_contract(
+    method,
+    expected,
+):
+    assert sparse_decode_attention_score_kind(method) is expected
 
 
 def test_startup_graph_plan_captures_complete_coarse_grid_when_it_fits():
