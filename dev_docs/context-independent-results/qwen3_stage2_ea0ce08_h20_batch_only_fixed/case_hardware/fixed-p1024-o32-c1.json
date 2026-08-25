@@ -1,0 +1,81 @@
+{
+  "summary": {
+    "duration_seconds": 0.645,
+    "total_samples": 5,
+    "sampling_interval_ms": 100,
+    "status": "success",
+    "collection_error_count": 0,
+    "last_collection_error": null,
+    "gpus": {
+      "gpu_0": {
+        "avg_compute_util_pct": 93.4,
+        "max_compute_util_pct": 99.0,
+        "avg_memory_io_activity_pct": 61.6,
+        "avg_power_w": 344.22,
+        "max_power_w": 359.68,
+        "energy_joules": 221.89,
+        "peak_vram_gb": 77.1,
+        "coarse_gpu_active_duty_pct": 100.0,
+        "coarse_gpu_idle_duty_pct": 0.0,
+        "utilization_distribution_pct": {
+          "0-20%": 0.0,
+          "20-40%": 0.0,
+          "40-60%": 0.0,
+          "60-80%": 0.0,
+          "80-100%": 100.0
+        }
+      }
+    },
+    "aggregate": {
+      "num_gpus": 1,
+      "mean_compute_util_pct": 93.4,
+      "mean_memory_io_activity_pct": 61.6,
+      "avg_total_power_w": 344.22,
+      "total_energy_joules": 221.89,
+      "mean_coarse_gpu_active_duty_pct": 100.0,
+      "mean_coarse_gpu_idle_duty_pct": 0.0
+    }
+  },
+  "timeline": [
+    {
+      "time_s": 0.0,
+      "gpu0_util": 93.0,
+      "gpu0_mem_util": 75.0,
+      "gpu0_mem_mb": 78947.0,
+      "gpu0_power_w": 324.87,
+      "gpu0_temp_c": 45.0
+    },
+    {
+      "time_s": 0.129,
+      "gpu0_util": 93.0,
+      "gpu0_mem_util": 75.0,
+      "gpu0_mem_mb": 78947.0,
+      "gpu0_power_w": 331.66,
+      "gpu0_temp_c": 46.0
+    },
+    {
+      "time_s": 0.258,
+      "gpu0_util": 99.0,
+      "gpu0_mem_util": 12.0,
+      "gpu0_mem_mb": 78947.0,
+      "gpu0_power_w": 348.61,
+      "gpu0_temp_c": 45.0
+    },
+    {
+      "time_s": 0.387,
+      "gpu0_util": 91.0,
+      "gpu0_mem_util": 73.0,
+      "gpu0_mem_mb": 78947.0,
+      "gpu0_power_w": 356.27,
+      "gpu0_temp_c": 46.0
+    },
+    {
+      "time_s": 0.515,
+      "gpu0_util": 91.0,
+      "gpu0_mem_util": 73.0,
+      "gpu0_mem_mb": 78947.0,
+      "gpu0_power_w": 359.68,
+      "gpu0_temp_c": 45.0
+    }
+  ]
+}

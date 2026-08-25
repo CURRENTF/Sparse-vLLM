@@ -1,0 +1,238 @@
+{
+  "status": "success",
+  "world_ranks": [
+    {
+      "world_rank": 0,
+      "bindings": [
+        {
+          "operator_type": "paged decode attention",
+          "spec_type": "DecodeAttentionOpSpec",
+          "spec": {
+            "num_query_heads": 32,
+            "num_kv_heads": 8,
+            "head_dim": 128,
+            "activation_dtype": "torch.bfloat16",
+            "softmax_scale": 0.08838834764831845,
+            "max_batch_size": 4,
+            "causal": true,
+            "page_size": 1,
+            "may_require_attention_scores": false,
+            "layer_varying_page_table": false,
+            "cuda_graph": false,
+            "h2o_layerwise_probability_scores": false,
+            "context_independent_cuda_graph": false,
+            "context_capacity": 8352
+          },
+          "device_caps": {
+            "platform": "CUDA",
+            "device_type": "cuda",
+            "device_index": 0,
+            "device_name": "NVIDIA H20",
+            "compute_capability": [
+              9,
+              0
+            ],
+            "runtime_version": "13.0",
+            "supports_graph_capture": true,
+            "supports_torch_compile": true,
+            "supports_triton": true,
+            "supports_pin_memory": true,
+            "supports_bfloat16": true,
+            "supports_native_fp8": true,
+            "multiprocessor_count": 78
+          },
+          "selected_provider": "sgl_fa3_paged_decode_sm90",
+          "selected_profile": null,
+          "selected_role": "upstream_standard",
+          "selection_basis": "upstream_default",
+          "selected_reason": "sglang-kernel 0.4.5 FA3 raw op is available",
+          "candidates": [
+            {
+              "provider": "flashinfer_paged_decode",
+              "role": "upstream_standard",
+              "portfolio_member": true,
+              "profile_only": false,
+              "status": "supported",
+              "supported": true,
+              "reason": "flashinfer-python 0.6.17 paged decode with softmax LSE is available"
+            },
+            {
+              "provider": "sgl_fa3_paged_decode_sm90",
+              "role": "upstream_standard",
+              "portfolio_member": true,
+              "profile_only": false,
+              "status": "supported",
+              "supported": true,
+              "reason": "sglang-kernel 0.4.5 FA3 raw op is available"
+            },
+            {
+              "provider": "triton_context_independent",
+              "role": "repo_nonstandard",
+              "portfolio_member": true,
+              "profile_only": false,
+              "status": "unsupported_contract",
+              "supported": false,
+              "reason": "reserved for batch-only CUDA Graph"
+            },
+            {
+              "provider": "triton_paged_decode",
+              "role": "repo_portable",
+              "portfolio_member": true,
+              "profile_only": false,
+              "status": "supported",
+              "supported": true,
+              "reason": "supported"
+            }
+          ],
+          "profiles": [],
+          "validation_evidence": {
+            "contract": "adapter_equivalence",
+            "kernel_support": "upstream_declared",
+            "performance": "upstream_default"
+          },
+          "provider_metadata": {
+            "implementation_kind": "atomic_provider",
+            "implementation_source": "sglang-kernel",
+            "kernel_path": "sgl_kernel.fa3.fwd"
+          },
+          "bound_provider_count": 1
+        },
+        {
+          "operator_type": "paged prefill attention",
+          "spec_type": "PrefillAttentionOpSpec",
+          "spec": {
+            "num_query_heads": 32,
+            "num_kv_heads": 8,
+            "head_dim": 128,
+            "activation_dtype": "torch.bfloat16",
+            "softmax_scale": 0.08838834764831845,
+            "causal": true,
+            "page_size": 1,
+            "score_output": "NONE",
+            "layer_varying_page_table": false,
+            "varlen": true,
+            "cuda_graph": false,
+            "return_softmax_lse": false,
+            "allow_softmax_lse_fallback": false
+          },
+          "device_caps": {
+            "platform": "CUDA",
+            "device_type": "cuda",
+            "device_index": 0,
+            "device_name": "NVIDIA H20",
+            "compute_capability": [
+              9,
+              0
+            ],
+            "runtime_version": "13.0",
+            "supports_graph_capture": true,
+            "supports_torch_compile": true,
+            "supports_triton": true,
+            "supports_pin_memory": true,
+            "supports_bfloat16": true,
+            "supports_native_fp8": true,
+            "multiprocessor_count": 78
+          },
+          "selected_provider": "sgl_fa3_paged_prefill_sm90",
+          "selected_profile": null,
+          "selected_role": "upstream_standard",
+          "selection_basis": "upstream_default",
+          "selected_reason": "sglang-kernel 0.4.5 FA3 raw op is available",
+          "candidates": [
+            {
+              "provider": "flashinfer_paged_prefill_fa2_sm120",
+              "role": "upstream_standard",
+              "portfolio_member": true,
+              "profile_only": false,
+              "status": "unsupported_contract",
+              "supported": false,
+              "reason": "requires compute capability in [(12, 0)], got (9, 0)"
+            },
+            {
+              "provider": "flashinfer_paged_prefill_fa3_sm90",
+              "role": "upstream_standard",
+              "portfolio_member": true,
+              "profile_only": false,
+              "status": "supported",
+              "supported": true,
+              "reason": "flashinfer-python 0.6.17 FA3 paged prefill is available"
+            },
+            {
+              "provider": "sgl_fa3_paged_prefill_sm90",
+              "role": "upstream_standard",
+              "portfolio_member": true,
+              "profile_only": false,
+              "status": "supported",
+              "supported": true,
+              "reason": "sglang-kernel 0.4.5 FA3 raw op is available"
+            },
+            {
+              "provider": "tilelang_gqa_paged_prefill",
+              "role": "repo_nonstandard",
+              "portfolio_member": true,
+              "profile_only": false,
+              "status": "supported",
+              "supported": true,
+              "reason": "tilelang 0.1.9, apache-tvm-ffi 0.1.10"
+            },
+            {
+              "provider": "triton_paged_prefill",
+              "role": "repo_portable",
+              "portfolio_member": true,
+              "profile_only": false,
+              "status": "supported",
+              "supported": true,
+              "reason": "supported"
+            }
+          ],
+          "profiles": [],
+          "validation_evidence": {
+            "contract": "adapter_equivalence",
+            "kernel_support": "upstream_declared",
+            "performance": "upstream_default"
+          },
+          "provider_metadata": {},
+          "bound_provider_count": 1
+        }
+      ],
+      "operators": {
+        "Attention": [
+          {
+            "implementation": "triton",
+            "bound_provider_count": 36,
+            "instrumented_provider_count": 0,
+            "kernel_paths": {},
+            "fallback_reasons": {}
+          }
+        ],
+        "RMSNorm": [
+          {
+            "implementation": "flashinfer",
+            "bound_provider_count": 145,
+            "instrumented_provider_count": 0,
+            "kernel_paths": {},
+            "fallback_reasons": {}
+          }
+        ],
+        "paged decode attention": [
+          {
+            "implementation": "sgl_fa3_paged_decode_sm90",
+            "bound_provider_count": 1,
+            "instrumented_provider_count": 0,
+            "kernel_paths": {},
+            "fallback_reasons": {}
+          }
+        ],
+        "paged prefill attention": [
+          {
+            "implementation": "sgl_fa3_paged_prefill_sm90",
+            "bound_provider_count": 1,
+            "instrumented_provider_count": 0,
+            "kernel_paths": {},
+            "fallback_reasons": {}
+          }
+        ]
+      }
+    }
+  ]
+}
