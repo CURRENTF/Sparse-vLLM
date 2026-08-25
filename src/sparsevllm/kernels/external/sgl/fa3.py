@@ -60,6 +60,7 @@ class _SchedulerMetadataPlan:
     context_lens: torch.Tensor
     cu_seqlens_q: torch.Tensor
     batch_size: int
+    total_q: int
     max_seqlen_q: int
     max_seqlen_k: int
     num_heads: int
@@ -77,6 +78,7 @@ class _SchedulerMetadataPlan:
         context_lens: torch.Tensor,
         cu_seqlens_q: torch.Tensor,
         batch_size: int,
+        total_q: int,
         max_seqlen_q: int,
         max_seqlen_k: int,
         num_heads: int,
@@ -84,13 +86,14 @@ class _SchedulerMetadataPlan:
         headdim: int,
         headdim_v: int,
         qkv_dtype: torch.dtype,
-        num_splits: int,
+        num_splits: int | None,
     ) -> bool:
         return (
             self.validation_scope is validation_scope
             and self.context_lens.data_ptr() == context_lens.data_ptr()
             and self.cu_seqlens_q.data_ptr() == cu_seqlens_q.data_ptr()
             and self.batch_size == int(batch_size)
+            and self.total_q == int(total_q)
             and self.max_seqlen_q == int(max_seqlen_q)
             and self.max_seqlen_k == int(max_seqlen_k)
             and self.num_heads == int(num_heads)
@@ -98,7 +101,7 @@ class _SchedulerMetadataPlan:
             and self.headdim == int(headdim)
             and self.headdim_v == int(headdim_v)
             and self.qkv_dtype == qkv_dtype
-            and self.num_splits == int(num_splits)
+            and (num_splits is None or self.num_splits == int(num_splits))
         )
 
 
@@ -236,10 +239,11 @@ class SglFa3DecodeKernel:
         max_seqlen_q: int,
         num_splits: int,
         validation_scope: object | None,
-    ) -> torch.Tensor | None:
+    ) -> tuple[torch.Tensor | None, int]:
         if self._scheduler_op is None:
-            return None
+            return None, int(num_splits)
         batch_size = int(context_lens.numel())
+        total_q = int(q.shape[0])
         max_seqlen_k = int(page_table.shape[1])
         num_heads = int(q.shape[1])
         num_heads_k = int(k_cache.shape[1])
@@ -262,6 +266,7 @@ class SglFa3DecodeKernel:
                     context_lens=context_lens,
                     cu_seqlens_q=cu_seqlens_q,
                     batch_size=batch_size,
+                    total_q=total_q,
                     max_seqlen_q=max_seqlen_q,
                     max_seqlen_k=max_seqlen_k,
                     num_heads=num_heads,
@@ -269,13 +274,21 @@ class SglFa3DecodeKernel:
                     headdim=headdim,
                     headdim_v=headdim_v,
                     qkv_dtype=q.dtype,
-                    num_splits=num_splits,
+                    # An automatic request may reuse the fixed split count
+                    # learned from this raw op's workspace on the first layer.
+                    num_splits=None if num_splits == 0 else num_splits,
                 )
             ),
             None,
         )
         if plan is not None:
-            return plan.metadata
+            return plan.metadata, plan.num_splits
+
+        # The metadata helper's automatic heuristic does not receive total_q,
+        # while fwd derives it from q.shape[0]. Let the first raw fwd resolve
+        # automatic mode, then cache metadata with that observed fixed count.
+        if num_splits == 0:
+            return None, 0
 
         metadata = self._scheduler_op(
             batch_size,
@@ -309,6 +322,7 @@ class SglFa3DecodeKernel:
                 context_lens=context_lens,
                 cu_seqlens_q=cu_seqlens_q,
                 batch_size=batch_size,
+                total_q=total_q,
                 max_seqlen_q=int(max_seqlen_q),
                 max_seqlen_k=max_seqlen_k,
                 num_heads=num_heads,
@@ -325,7 +339,49 @@ class SglFa3DecodeKernel:
                 self._captured_scheduler_plans.append(plan)
             else:
                 self._scheduler_plan = plan
-        return metadata
+        return metadata, int(num_splits)
+
+    @staticmethod
+    def _split_count_from_result(result: Sequence[torch.Tensor]) -> int:
+        """Read the static split count from FA3's returned workspace shape."""
+
+        if len(result) >= 3 and isinstance(result[2], torch.Tensor):
+            workspace = result[2]
+            if workspace.ndim >= 1 and int(workspace.shape[0]) > 0:
+                return int(workspace.shape[0])
+        return 1
+
+    def _cache_resolved_scheduler_metadata(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        page_table: torch.Tensor,
+        context_lens: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        result: Sequence[torch.Tensor],
+        *,
+        headdim_v: int,
+        max_seqlen_q: int,
+        requested_num_splits: int,
+        validation_scope: object | None,
+    ) -> None:
+        if (
+            requested_num_splits != 0
+            or validation_scope is None
+            or self._scheduler_op is None
+        ):
+            return
+        self._scheduler_metadata(
+            q,
+            k_cache,
+            page_table,
+            context_lens,
+            cu_seqlens_q,
+            headdim_v=headdim_v,
+            max_seqlen_q=max_seqlen_q,
+            num_splits=self._split_count_from_result(result),
+            validation_scope=validation_scope,
+        )
 
     def run_varlen(
         self,
@@ -348,7 +404,7 @@ class SglFa3DecodeKernel:
             raise ValueError(
                 f"FA3 num_splits must be non-negative, got {split_count}."
             )
-        scheduler_metadata = self._scheduler_metadata(
+        scheduler_metadata, split_count = self._scheduler_metadata(
             q_rope,
             rope_cache,
             page_table,
@@ -395,6 +451,20 @@ class SglFa3DecodeKernel:
         result: Sequence[torch.Tensor] = self._op(*args)
         if not result or result[0].data_ptr() != output.data_ptr():
             raise RuntimeError("sglang-kernel FA3 did not write to the supplied output")
+        self._cache_resolved_scheduler_metadata(
+            q_rope,
+            rope_cache,
+            page_table,
+            context_lens,
+            cu_seqlens_q,
+            result,
+            headdim_v=int(q_latent.shape[-1]),
+            max_seqlen_q=int(max_seqlen_q),
+            requested_num_splits=(
+                self.num_splits if num_splits is None else int(num_splits)
+            ),
+            validation_scope=validation_scope,
+        )
         return output
 
     def run_explicit_varlen(
@@ -414,7 +484,7 @@ class SglFa3DecodeKernel:
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Run causal varlen attention over page-size-one explicit KV."""
 
-        scheduler_metadata = self._scheduler_metadata(
+        scheduler_metadata, split_count = self._scheduler_metadata(
             q,
             k_cache,
             page_table,
@@ -457,11 +527,23 @@ class SglFa3DecodeKernel:
         ]
         args.append(0)
         args.extend(
-            (0.0, True, scheduler_metadata, self.num_splits, None, 0, None, None, False)
+            (0.0, True, scheduler_metadata, split_count, None, 0, None, None, False)
         )
         result: Sequence[torch.Tensor] = self._op(*args)
         if not result or result[0].data_ptr() != output.data_ptr():
             raise RuntimeError("sglang-kernel FA3 did not write to the supplied output")
+        self._cache_resolved_scheduler_metadata(
+            q,
+            k_cache,
+            page_table,
+            context_lens,
+            cu_seqlens_q,
+            result,
+            headdim_v=int(v_cache.shape[-1]),
+            max_seqlen_q=int(max_seqlen_q),
+            requested_num_splits=self.num_splits,
+            validation_scope=validation_scope,
+        )
         if return_softmax_lse:
             if len(result) < 2 or result[1] is None:
                 raise RuntimeError("sglang-kernel FA3 did not return softmax LSE")
