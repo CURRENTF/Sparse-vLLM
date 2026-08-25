@@ -321,3 +321,97 @@ def test_static_plan_replays_across_contexts_with_unaligned_capacity() -> None:
             metadata["compiled_variants"][0]["workspace_data_ptrs"]
             == workspace_ptrs
         )
+
+
+@CUDA_REQUIRED
+def test_static_plan_replays_representative_contexts_through_64k() -> None:
+    torch.manual_seed(20260825)
+    device = torch.device("cuda")
+    valid_heads = 5
+    capacity = 65536
+    q_latent = torch.randn(
+        1, valid_heads, 512, dtype=torch.bfloat16, device=device
+    )
+    q_rope = torch.randn(
+        1, valid_heads, 64, dtype=torch.bfloat16, device=device
+    )
+    latent_cache = torch.randn(
+        capacity, 1, 512, dtype=torch.bfloat16, device=device
+    )
+    rope_cache = torch.randn(
+        capacity, 1, 64, dtype=torch.bfloat16, device=device
+    )
+    active_slots = torch.arange(
+        capacity, dtype=torch.int32, device=device
+    ).unsqueeze(0)
+    request_indices = torch.zeros(1, dtype=torch.int32, device=device)
+    context_lens = torch.full((1,), 1024, dtype=torch.int32, device=device)
+    output = torch.empty_like(q_latent)
+    score = torch.empty(
+        1, valid_heads, capacity, dtype=torch.float32, device=device
+    )
+    plan = TileMlaLaunchPlan.build(
+        context_capacity=capacity,
+        local_q_heads=valid_heads,
+        max_batch_size=1,
+        need_score=True,
+        score_mode="per_head",
+    )
+    runner = TileMlaDecodeKernel(
+        device=device,
+        softmax_scale=256**-0.5,
+        valid_heads=valid_heads,
+        launch_plan=plan,
+    )
+
+    def run() -> None:
+        score.fill_(-1e20)
+        runner(
+            q_latent,
+            q_rope,
+            latent_cache,
+            rope_cache,
+            active_slots,
+            request_indices,
+            context_lens,
+            output,
+            attn_score=score,
+            max_context_len=capacity,
+        )
+
+    run()
+    torch.cuda.synchronize()
+    metadata = runner.runtime_metadata()
+    assert metadata["compiled_variant_count"] == 1
+    workspace_ptrs = metadata["compiled_variants"][0]["workspace_data_ptrs"]
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for context_len in (1024, 4096, 8192, 16384, 32768, capacity):
+        context_lens.fill_(context_len)
+        graph.replay()
+        torch.cuda.synchronize()
+        expected_output, expected_score, _ = _torch_oracle(
+            q_latent[0],
+            q_rope[0],
+            latent_cache,
+            rope_cache,
+            active_slots[0, :context_len],
+        )
+        torch.testing.assert_close(
+            output[0], expected_output, rtol=3e-2, atol=3e-2
+        )
+        torch.testing.assert_close(
+            score[0, :, :context_len],
+            expected_score,
+            rtol=3e-2,
+            atol=3e-2,
+        )
+        assert torch.all(score[0, :, context_len:] == -1e20)
+        metadata = runner.runtime_metadata()
+        assert metadata["compiled_variant_count"] == 1
+        assert (
+            metadata["compiled_variants"][0]["workspace_data_ptrs"]
+            == workspace_ptrs
+        )
