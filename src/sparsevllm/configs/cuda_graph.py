@@ -14,26 +14,26 @@ from sparsevllm.method_registry import (
 from sparsevllm.utils.log import log_once
 
 
-def _default_decode_cuda_graph_capture_sizes(max_decoding_seqs: int) -> list[int]:
+def _default_decode_cuda_graph_capture_sizes(max_batch_size: int) -> list[int]:
     """Return at most 32 batch buckets, dense where padding hurts most."""
-    max_decoding_seqs = int(max_decoding_seqs)
-    if max_decoding_seqs <= 0:
-        raise ValueError(f"max_decoding_seqs must be > 0, got {max_decoding_seqs}.")
+    max_batch_size = int(max_batch_size)
+    if max_batch_size <= 0:
+        raise ValueError(f"max_batch_size must be > 0, got {max_batch_size}.")
 
-    dense_limit = min(8, max_decoding_seqs)
+    dense_limit = min(8, max_batch_size)
     sizes = list(range(1, dense_limit + 1))
-    if max_decoding_seqs <= dense_limit:
+    if max_batch_size <= dense_limit:
         return sizes
 
     # Keep small decode batches exact, then use aligned, bounded-width buckets.
     # The adaptive stride caps the auto plan at 32 batch families even for a
     # very large scheduler limit; explicit capture sizes remain unrestricted.
     remaining_bucket_budget = 32 - dense_limit
-    span = max_decoding_seqs - dense_limit
+    span = max_batch_size - dense_limit
     stride = max(4, (span + remaining_bucket_budget - 1) // remaining_bucket_budget)
     stride = ((stride + 3) // 4) * 4
-    sizes.extend(range(dense_limit + stride, max_decoding_seqs, stride))
-    sizes.append(max_decoding_seqs)
+    sizes.extend(range(dense_limit + stride, max_batch_size, stride))
+    sizes.append(max_batch_size)
     return sizes
 
 
@@ -75,19 +75,19 @@ def _resolve_positive_sizes(
 
 def _resolve_decode_cuda_graph_capture_sizes(
     value: str | int | list[int] | tuple[int, ...] | None,
-    max_decoding_seqs: int,
+    max_real_batch_size: int,
 ) -> list[int]:
     sizes = _resolve_positive_sizes(
         value,
         name="decode_graph_capture_sizes",
         default_factory=lambda: _default_decode_cuda_graph_capture_sizes(
-            max_decoding_seqs
+            max_real_batch_size
         ),
     )
-    if sizes[-1] < int(max_decoding_seqs):
+    if sizes[-1] < int(max_real_batch_size):
         raise ValueError(
-            "decode_graph_capture_sizes must cover max_decoding_seqs: "
-            f"max capture size {sizes[-1]} < max_decoding_seqs {int(max_decoding_seqs)}."
+            "decode_graph_capture_sizes must cover the maximum reachable decode batch: "
+            f"max capture size {sizes[-1]} < reachable batch {int(max_real_batch_size)}."
         )
     return sizes
 
@@ -116,6 +116,16 @@ def _select_decode_cuda_graph_batch_size(
     )
 
 
+def _decode_cuda_graph_max_real_batch_size(
+    *,
+    max_num_seqs_in_batch: int,
+    max_decoding_seqs: int,
+) -> int:
+    """Return the largest decode batch that the scheduler can execute in one step."""
+
+    return min(int(max_num_seqs_in_batch), int(max_decoding_seqs))
+
+
 def _resolve_decode_static_batch_capacity(
     capture_sizes: list[int] | tuple[int, ...],
     *,
@@ -124,9 +134,9 @@ def _resolve_decode_static_batch_capacity(
 ) -> int:
     """Return the largest padded decode batch reachable by the scheduler."""
 
-    max_real_batch_size = min(
-        int(max_num_seqs_in_batch),
-        int(max_decoding_seqs),
+    max_real_batch_size = _decode_cuda_graph_max_real_batch_size(
+        max_num_seqs_in_batch=max_num_seqs_in_batch,
+        max_decoding_seqs=max_decoding_seqs,
     )
     return _select_decode_cuda_graph_batch_size(
         max_real_batch_size,
@@ -577,9 +587,13 @@ def normalize_decode_cuda_graph(config) -> None:
             isinstance(capture_sizes_setting, str)
             and capture_sizes_setting.strip().lower() in {"", "auto"}
         )
+        max_real_batch_size = _decode_cuda_graph_max_real_batch_size(
+            max_num_seqs_in_batch=config.max_num_seqs_in_batch,
+            max_decoding_seqs=config.max_decoding_seqs,
+        )
         config.decode_graph_capture_sizes = _resolve_decode_cuda_graph_capture_sizes(
             capture_sizes_setting,
-            config.max_decoding_seqs,
+            max_real_batch_size,
         )
         config.decode_graph_context_sizes = _resolve_decode_cuda_graph_context_sizes(
             config.decode_graph_context_sizes,

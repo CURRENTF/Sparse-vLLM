@@ -622,11 +622,15 @@ def run_sparsevllm_probe(
     sparse_kwargs: dict[str, Any] = {"sparse_method": args.sparse_method}
 
     max_len_needed = max(args.prompt_lens) + max(args.output_lens) + 128
+    max_concurrency = max(args.batch_sizes)
     engine_kwargs = {
         **hyper_params,
         "max_model_len": max_len_needed,
         "enable_prefix_caching": False,
         **sparse_kwargs,
+        "max_num_seqs_in_batch": max_concurrency,
+        "max_decoding_seqs": max_concurrency,
+        "max_num_seqs_in_gpu": max_concurrency,
     }
 
     print(f"[Sparse-vLLM Probe] Initializing LLM with method={args.sparse_method}, max_model_len={max_len_needed}...")

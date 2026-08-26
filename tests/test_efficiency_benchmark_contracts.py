@@ -58,6 +58,46 @@ def test_probe_cli_parser_builds_with_new_workload_options(monkeypatch):
     assert args.churn_request_multiplier == 4
 
 
+def test_fixed_probe_sets_engine_capacity_from_largest_batch_size(
+    monkeypatch,
+    tmp_path,
+):
+    import sparsevllm
+
+    captured = {}
+
+    class StopAfterEngineInit(Exception):
+        pass
+
+    def capture_engine_kwargs(model_path, **kwargs):
+        captured.update(kwargs)
+        raise StopAfterEngineInit(model_path)
+
+    monkeypatch.setattr(sparsevllm, "LLM", capture_engine_kwargs)
+    args = SimpleNamespace(
+        scenario="fixed",
+        output_dir=str(tmp_path),
+        hyper_params="{}",
+        tensor_parallel_size=1,
+        gpu_memory_utilization=0.8,
+        max_num_batched_tokens=8192,
+        model_path="model",
+        sparse_method="vanilla",
+        sparse_prefill_score_mode=None,
+        allow_single_omnikv_full_layer=False,
+        prompt_lens=[1024],
+        output_lens=[32],
+        batch_sizes=[4, 16, 8],
+    )
+
+    with pytest.raises(StopAfterEngineInit):
+        bench_probe.run_sparsevllm_probe(args, SimpleNamespace())
+
+    assert captured["max_num_seqs_in_batch"] == 16
+    assert captured["max_decoding_seqs"] == 16
+    assert captured["max_num_seqs_in_gpu"] == 16
+
+
 def test_physical_gpu_metadata_uses_nvidia_smi_without_cuda_init(monkeypatch):
     monkeypatch.setattr(
         bench_probe.subprocess,

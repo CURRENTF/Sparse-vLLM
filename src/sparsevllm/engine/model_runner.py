@@ -14,7 +14,10 @@ from sparsevllm.config import (
     _resolve_decode_cuda_graph_capture_sizes,
     _resolve_decode_cuda_graph_context_sizes,
 )
-from sparsevllm.configs.cuda_graph import _resolve_decode_static_batch_capacity
+from sparsevllm.configs.cuda_graph import (
+    _decode_cuda_graph_max_real_batch_size,
+    _resolve_decode_static_batch_capacity,
+)
 from sparsevllm.distributed import init_parallel_context, reset_parallel_context
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.models.qwen2 import Qwen2ForCausalLM
@@ -262,9 +265,13 @@ class ModelRunner:
                 )
             ),
         )
+        max_real_decode_batch_size = _decode_cuda_graph_max_real_batch_size(
+            max_num_seqs_in_batch=config.max_num_seqs_in_batch,
+            max_decoding_seqs=config.max_decoding_seqs,
+        )
         decode_static_capture_sizes = _resolve_decode_cuda_graph_capture_sizes(
             config.decode_graph_capture_sizes,
-            config.max_decoding_seqs,
+            max_real_decode_batch_size,
         )
         self.model = _create_model(
             hf_config,

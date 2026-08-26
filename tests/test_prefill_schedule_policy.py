@@ -718,23 +718,30 @@ class PrefillPolicyConfigTest(unittest.TestCase):
                 decode_graph_capture_sampling=True,
             )
 
-    def test_decode_cuda_graph_auto_capture_sizes_end_at_decode_limit(self):
-        for max_decoding_seqs, expected_sizes in (
-            (1, [1]),
-            (6, [1, 2, 3, 4, 5, 6]),
-            (8, [1, 2, 3, 4, 5, 6, 7, 8]),
-            (24, [1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 20, 24]),
+    def test_decode_cuda_graph_auto_capture_sizes_end_at_reachable_batch_limit(self):
+        for max_num_seqs_in_batch, max_decoding_seqs, expected_sizes in (
+            (1, 64, [1]),
+            (6, 64, [1, 2, 3, 4, 5, 6]),
+            (8, 64, [1, 2, 3, 4, 5, 6, 7, 8]),
+            (24, 64, [1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 20, 24]),
+            (32, 64, [1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 20, 24, 28, 32]),
+            (64, 16, [1, 2, 3, 4, 5, 6, 7, 8, 12, 16]),
         ):
-            with self.subTest(max_decoding_seqs=max_decoding_seqs):
+            with self.subTest(
+                max_num_seqs_in_batch=max_num_seqs_in_batch,
+                max_decoding_seqs=max_decoding_seqs,
+            ):
                 cfg = self.make_config(
                     sparse_method="omnikv",
                     decode_graph=True,
+                    max_num_seqs_in_batch=max_num_seqs_in_batch,
                     max_decoding_seqs=max_decoding_seqs,
                 )
                 capture_sizes = cfg.decode_graph_capture_sizes
+                reachable_batch = min(max_num_seqs_in_batch, max_decoding_seqs)
                 self.assertEqual(capture_sizes, sorted(set(capture_sizes)))
-                self.assertEqual(capture_sizes[-1], max_decoding_seqs)
-                self.assertTrue(all(0 < size <= max_decoding_seqs for size in capture_sizes))
+                self.assertEqual(capture_sizes[-1], reachable_batch)
+                self.assertTrue(all(0 < size <= reachable_batch for size in capture_sizes))
                 self.assertTrue(cfg.decode_graph)
                 self.assertEqual(cfg.decode_graph_capture_sizes, expected_sizes)
 
@@ -917,14 +924,24 @@ class PrefillPolicyConfigTest(unittest.TestCase):
         self.assertAlmostEqual(token_logprobs[0], expected_logprob)
         self.assertEqual(list(top_logprobs[0]), [1])
 
-    def test_decode_cuda_graph_capture_sizes_must_cover_decode_limit(self):
-        with self.assertRaisesRegex(ValueError, "cover max_decoding_seqs"):
+    def test_decode_cuda_graph_capture_sizes_must_cover_reachable_batch_limit(self):
+        with self.assertRaisesRegex(ValueError, "maximum reachable decode batch"):
             self.make_config(
                 sparse_method="omnikv",
                 decode_graph=True,
+                max_num_seqs_in_batch=6,
                 max_decoding_seqs=6,
                 decode_graph_capture_sizes=[1, 2, 4],
             )
+
+        cfg = self.make_config(
+            sparse_method="omnikv",
+            decode_graph=True,
+            max_num_seqs_in_batch=4,
+            max_decoding_seqs=64,
+            decode_graph_capture_sizes=[1, 2, 4],
+        )
+        self.assertEqual(cfg.decode_graph_capture_sizes, [1, 2, 4])
 
     def test_decode_cuda_graph_auto_context_sizes_cover_model_limit(self):
         cfg = self.make_config(
