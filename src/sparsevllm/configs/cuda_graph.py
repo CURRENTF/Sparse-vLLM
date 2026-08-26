@@ -175,7 +175,12 @@ def _normalize_decode_cuda_graph_context_policy(value: str | None) -> str:
 
 
 def _normalize_decode_graph_shape_policy(value: str | None) -> str:
-    policy = str(value or "bucketed").strip().lower().replace("-", "_")
+    policy = (
+        str(value or "batch_only")
+        .strip()
+        .lower()
+        .replace("-", "_")
+    )
     policy = {
         "context_bucketed": "bucketed",
         "batch": "batch_only",
@@ -358,7 +363,16 @@ def build_decode_cuda_graph_startup_plan(
 
 def build_decode_cuda_graph_startup_family_plan(config) -> list[tuple[int, int, bool]]:
     """Build graph keys largest-first so captures reuse the shared graph pool."""
-    if str(getattr(config, "decode_graph_shape_policy", "bucketed")) == "batch_only":
+    if (
+        str(
+            getattr(
+                config,
+                "decode_graph_shape_policy",
+                "batch_only",
+            )
+        )
+        == "batch_only"
+    ):
         return build_decode_cuda_graph_batch_only_startup_plan(config)
     batches = sorted(set(int(size) for size in config.decode_graph_capture_sizes))
     contexts = sorted(set(int(size) for size in config.decode_graph_context_sizes))
@@ -464,7 +478,11 @@ def build_decode_cuda_graph_startup_family_plan(config) -> list[tuple[int, int, 
 
 def normalize_decode_cuda_graph(config) -> None:
     config.decode_graph_shape_policy = _normalize_decode_graph_shape_policy(
-        getattr(config, "decode_graph_shape_policy", "bucketed")
+        getattr(
+            config,
+            "decode_graph_shape_policy",
+            "batch_only",
+        )
     )
     if config.decode_graph_max_cached_graphs is not None:
         config.decode_graph_max_cached_graphs = int(config.decode_graph_max_cached_graphs)

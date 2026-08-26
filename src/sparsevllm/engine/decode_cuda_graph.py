@@ -57,7 +57,7 @@ class DecodeCudaGraphKey:
     is_long_text: bool
     capture_sampling: bool
     graph_path_id: str = ""
-    shape_policy: str = "bucketed"
+    shape_policy: str = "batch_only"
 
 
 @dataclass
@@ -98,7 +98,7 @@ class DecodeCudaGraphRunner:
         method: str,
         capture_sizes: list[int],
         context_sizes: list[int] | tuple[int, ...] | str | int | None = None,
-        shape_policy: str = "bucketed",
+        shape_policy: str = "batch_only",
         graph_pool=None,
     ):
         self.runtime_state = runtime_state
@@ -151,7 +151,7 @@ class DecodeCudaGraphRunner:
         self.reuse_larger_context_graphs = bool(enabled)
 
     def seal_startup_plan(self):
-        if getattr(self, "shape_policy", "bucketed") == "batch_only":
+        if self.shape_policy == "batch_only":
             self.startup_plan_sealed = True
 
     def clear_captured_graphs(self):
@@ -248,7 +248,7 @@ class DecodeCudaGraphRunner:
         graph_path_id: str = "",
         allow_larger_context_capacity: bool = True,
     ) -> DecodeCudaGraphState:
-        shape_policy = getattr(self, "shape_policy", "bucketed")
+        shape_policy = self.shape_policy
         graph_path_id = str(graph_path_id) or (
             "dense" if not method else ("long" if is_long_text else "short")
         )
@@ -402,7 +402,7 @@ class DecodeCudaGraphRunner:
 
     def bucket_plan(self) -> dict[str, object]:
         return {
-            "shape_policy": getattr(self, "shape_policy", "bucketed"),
+            "shape_policy": self.shape_policy,
             "batch_sizes": list(self.capture_sizes),
             "context_sizes": list(self.context_sizes),
             "context_policy": str(
@@ -636,7 +636,7 @@ class DecodeCudaGraphRunner:
         graph_batch_size = self._select_graph_batch_size(real_batch_size)
         is_long_text = self.is_long_text_batch(seqs, False)
         graph_path_id = self._graph_path_id(is_long_text)
-        if getattr(self, "shape_policy", "bucketed") == "batch_only":
+        if self.shape_policy == "batch_only":
             context_capacity = self._batch_only_context_capacity(
                 seqs, is_long_text=is_long_text
             )
@@ -684,7 +684,7 @@ class DecodeCudaGraphRunner:
         graph_batch_size = self._select_graph_batch_size(real_batch_size)
         is_long_text = self.is_long_text_batch(seqs, False)
         graph_path_id = self._graph_path_id(is_long_text)
-        if getattr(self, "shape_policy", "bucketed") == "batch_only":
+        if self.shape_policy == "batch_only":
             context_capacity = self._batch_only_context_capacity(
                 seqs, is_long_text=is_long_text
             )

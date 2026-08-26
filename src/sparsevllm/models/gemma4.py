@@ -703,7 +703,7 @@ class Gemma4ForCausalLM(nn.Module):
                         getattr(
                             engine_config,
                             "decode_graph_shape_policy",
-                            "bucketed",
+                            "batch_only",
                         )
                     )
                     == "batch_only"

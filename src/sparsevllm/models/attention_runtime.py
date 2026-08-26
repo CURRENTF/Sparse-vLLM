@@ -170,7 +170,7 @@ def build_mha_decode_attention_spec(
                 getattr(
                     runtime_config,
                     "decode_graph_shape_policy",
-                    "bucketed",
+                    "batch_only",
                 )
             )
             == "batch_only"

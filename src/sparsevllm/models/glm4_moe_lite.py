@@ -143,7 +143,11 @@ def build_glm4_moe_lite_mla_attention(
         batch_only_cuda_graph=(
             bool(decode_graph)
             and str(
-                getattr(config, "decode_graph_shape_policy", "bucketed")
+                getattr(
+                    config,
+                    "decode_graph_shape_policy",
+                    "batch_only",
+                )
             )
             == "batch_only"
         ),

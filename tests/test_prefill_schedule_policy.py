@@ -950,6 +950,7 @@ class DecodeCudaGraphCapacityPolicyTest(unittest.TestCase):
     def make_runner(self, method="quest", cache_manager=None):
         runner = object.__new__(DecodeCudaGraphRunner)
         runner.method = method
+        runner.shape_policy = "bucketed"
         runner.cache_manager = cache_manager if cache_manager is not None else SimpleNamespace()
         runner.runtime_state = runner.cache_manager
         runner.recurrent_state_manager = None
@@ -1092,7 +1093,14 @@ class DecodeCudaGraphCapacityPolicyTest(unittest.TestCase):
 
     def test_exact_current_policy_does_not_reuse_larger_warmup_state(self):
         runner = self.make_runner("quest")
-        warmup_key = DecodeCudaGraphKey("quest", 1, 16384, False, False)
+        warmup_key = DecodeCudaGraphKey(
+            "quest",
+            1,
+            16384,
+            False,
+            False,
+            shape_policy="bucketed",
+        )
         warmup_state = DecodeCudaGraphState(key=warmup_key)
         runner._graphs[warmup_key] = warmup_state
         real_empty = torch.empty
@@ -1129,8 +1137,22 @@ class DecodeCudaGraphCapacityPolicyTest(unittest.TestCase):
         runner = self.make_runner("deltakv")
         runner.max_cached_graphs = 1
         runner._graphs = OrderedDict()
-        old_key = DecodeCudaGraphKey("deltakv", 1, 1024, False, False)
-        new_key = DecodeCudaGraphKey("deltakv", 1, 2048, False, False)
+        old_key = DecodeCudaGraphKey(
+            "deltakv",
+            1,
+            1024,
+            False,
+            False,
+            shape_policy="bucketed",
+        )
+        new_key = DecodeCudaGraphKey(
+            "deltakv",
+            1,
+            2048,
+            False,
+            False,
+            shape_policy="bucketed",
+        )
         old_state = DecodeCudaGraphState(key=old_key)
         old_state.keepalive.append(object())
         old_state.sparse_state_refs[0] = {"attn_score": object()}

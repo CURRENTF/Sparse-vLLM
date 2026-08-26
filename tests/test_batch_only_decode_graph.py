@@ -53,7 +53,7 @@ def _cuda_caps() -> DeviceCaps:
 
 def test_batch_only_policy_aliases_and_rejects_unknown_values() -> None:
     assert _normalize_decode_graph_shape_policy("batch") == "batch_only"
-    assert _normalize_decode_graph_shape_policy(None) == "bucketed"
+    assert _normalize_decode_graph_shape_policy(None) == "batch_only"
     with pytest.raises(ValueError, match="shape_policy"):
         _normalize_decode_graph_shape_policy("sequence_only")
 

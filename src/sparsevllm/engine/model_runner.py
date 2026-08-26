@@ -254,7 +254,13 @@ class ModelRunner:
         setattr(
             hf_config,
             "decode_graph_shape_policy",
-            str(getattr(config, "decode_graph_shape_policy", "bucketed")),
+            str(
+                getattr(
+                    config,
+                    "decode_graph_shape_policy",
+                    "batch_only",
+                )
+            ),
         )
         decode_static_capture_sizes = _resolve_decode_cuda_graph_capture_sizes(
             config.decode_graph_capture_sizes,
