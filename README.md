@@ -137,8 +137,10 @@ uv pip install flashinfer-cubin --index-url https://flashinfer.ai/whl
 
 Use `cu129` instead of `cu130` for CUDA 12.9.
 
-`einops`, `sglang-kernel`, and the training, benchmark, and test packages are all
-part of the main installation; no workflow-specific extras are required.
+`einops`, `sglang-kernel==0.4.5`, and the training, benchmark, and test packages
+are all part of the main installation; no workflow-specific extras are required.
+The SGL kernel package is pinned because its compiled operators must match the
+validated PyTorch/CUDA ABI; other versions are rejected during provider setup.
 
 Sparse-vLLM supports Qwen3.5/Qwen3.6/Qwen3.8 checkpoints in unquantized BF16
 and block-scaled FP8 formats. These releases share the `qwen3_5` runtime

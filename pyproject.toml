@@ -24,7 +24,7 @@ dependencies = [
     "pillow",
     "torchvision",
     "einops",
-    "sglang-kernel>=0.4.5,<0.5",
+    "sglang-kernel==0.4.5",
     "tqdm",
     "loguru",
     "fastapi>=0.100",
