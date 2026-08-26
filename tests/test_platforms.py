@@ -1,4 +1,5 @@
 import importlib
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -32,6 +33,11 @@ def test_cuda_device_caps_are_the_capability_source(monkeypatch):
 
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: (9, 0))
     monkeypatch.setattr(torch.cuda, "get_device_name", lambda _: "Test H100")
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _: SimpleNamespace(multi_processor_count=120),
+    )
     monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: True)
     platform = CudaPlatform()
 
@@ -40,6 +46,7 @@ def test_cuda_device_caps_are_the_capability_source(monkeypatch):
     assert caps.device_index == 7
     assert caps.device_name == "Test H100"
     assert caps.compute_capability == (9, 0)
+    assert caps.multi_processor_count == 120
     assert caps.supports_native_fp8
     assert platform.supports_fp8()
 

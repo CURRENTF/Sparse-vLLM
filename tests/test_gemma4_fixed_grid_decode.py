@@ -96,7 +96,7 @@ def _run(case, *, score=None):
         lse,
         splits,
         sliding_window=window,
-        device_core_count=torch.cuda.get_device_properties(0).multi_processor_count,
+        multi_processor_count=torch.cuda.get_device_properties(0).multi_processor_count,
         attn_score=score,
     )
 

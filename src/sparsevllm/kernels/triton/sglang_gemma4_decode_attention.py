@@ -37,7 +37,7 @@ def _get_num_kv_splits(
     num_heads: tl.constexpr,
     num_kv_heads: tl.constexpr,
     max_kv_splits: tl.constexpr,
-    device_core_count: tl.constexpr,
+    multi_processor_count: tl.constexpr,
     window: tl.constexpr,
     max_num_seq: tl.constexpr,
 ):
@@ -63,7 +63,7 @@ def _get_num_kv_splits(
 
     extended_len = tl.cast(max_seq_len, tl.float32) / 64.0
     extended_cores = tl.cast(
-        device_core_count * tl.maximum(tl.log2(extended_len), 1.0), tl.int32
+        multi_processor_count * tl.maximum(tl.log2(extended_len), 1.0), tl.int32
     )
     group_size: tl.constexpr = num_heads // num_kv_heads
     if group_size == 1:
@@ -490,7 +490,7 @@ def sglang_gemma4_decode(
     num_kv_splits: torch.Tensor,
     *,
     sliding_window: int | None,
-    device_core_count: int,
+    multi_processor_count: int,
     attn_score: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run SGLang's context-stable fixed-grid Gemma 4 decode."""
@@ -509,8 +509,10 @@ def sglang_gemma4_decode(
     batch, num_heads, head_dim = map(int, q.shape)
     num_kv_heads = int(k.shape[1])
     max_kv_splits = int(mid_output.shape[2])
-    if max_kv_splits <= 0 or int(device_core_count) <= 0:
-        raise ValueError("Gemma 4 split count and device core count must be positive.")
+    if max_kv_splits <= 0 or int(multi_processor_count) <= 0:
+        raise ValueError(
+            "Gemma 4 split count and multi-processor count must be positive."
+        )
     max_num_seq = 256 if batch < 256 else triton.next_power_of_2(batch)
     window = int(sliding_window or 0)
     _get_num_kv_splits[(1,)](
@@ -520,7 +522,7 @@ def sglang_gemma4_decode(
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,
         max_kv_splits=max_kv_splits,
-        device_core_count=int(device_core_count),
+        multi_processor_count=int(multi_processor_count),
         window=window,
         max_num_seq=max_num_seq,
     )

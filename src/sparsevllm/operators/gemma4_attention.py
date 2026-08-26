@@ -181,13 +181,17 @@ class Gemma4AttentionBackend(TritonAttentionBackend):
         sliding_window: int | None,
         flashinfer_prefill: Gemma4FlashInferPrefill | None = None,
         decode_workspace: Gemma4DecodeWorkspace | None = None,
-        device_core_count: int = 1,
+        multi_processor_count: int | None = None,
     ) -> None:
         super().__init__()
         self.sliding_window = None if sliding_window is None else int(sliding_window)
         self.flashinfer_prefill = flashinfer_prefill
         self.decode_workspace = decode_workspace
-        self.device_core_count = int(device_core_count)
+        self.multi_processor_count = (
+            None
+            if multi_processor_count is None
+            else int(multi_processor_count)
+        )
         self._runtime_kernel_path_counts: dict[str, dict[str, int]] = {}
 
     def get_decode_workspace(
@@ -201,6 +205,13 @@ class Gemma4AttentionBackend(TritonAttentionBackend):
         workspace = self.decode_workspace
         if workspace is None:
             raise RuntimeError("Gemma 4 decode backend has no prepared workspace.")
+        if (
+            self.multi_processor_count is None
+            or self.multi_processor_count <= 0
+        ):
+            raise RuntimeError(
+                "Gemma 4 decode backend requires a positive multi-processor count."
+            )
         if (
             batch_size > workspace.mid_output.shape[0]
             or num_heads != workspace.mid_output.shape[1]
@@ -349,6 +360,11 @@ class Gemma4AttentionBackend(TritonAttentionBackend):
         workspace = self.decode_workspace
         if workspace is None:
             raise RuntimeError("Gemma 4 decode backend has no prepared workspace.")
+        multi_processor_count = self.multi_processor_count
+        if multi_processor_count is None or multi_processor_count <= 0:
+            raise RuntimeError(
+                "Gemma 4 decode backend requires a positive multi-processor count."
+            )
         payload = _require_explicit_payload(view, operation="Gemma 4 decode")
         if payload.backend != "dense":
             raise RuntimeError("Gemma 4 fixed-grid decode requires dense explicit KV.")
@@ -369,7 +385,7 @@ class Gemma4AttentionBackend(TritonAttentionBackend):
             workspace.mid_lse[:batch_size],
             workspace.num_kv_splits[:batch_size],
             sliding_window=self.sliding_window,
-            device_core_count=self.device_core_count,
+            multi_processor_count=multi_processor_count,
             attn_score=view.meta.attn_score,
         )
 

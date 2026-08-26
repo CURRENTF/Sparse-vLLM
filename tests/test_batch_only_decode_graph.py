@@ -47,7 +47,7 @@ def _cuda_caps() -> DeviceCaps:
         supports_graph_capture=True,
         supports_triton=True,
         supports_bfloat16=True,
-        multiprocessor_count=120,
+        multi_processor_count=120,
     )
 
 
@@ -348,6 +348,32 @@ def test_gemma4_resolver_contract_selects_fixed_grid_provider() -> None:
     ]
 
 
+@pytest.mark.parametrize("multi_processor_count", [None, 0, -1])
+def test_gemma4_provider_rejects_missing_multi_processor_count(
+    multi_processor_count,
+) -> None:
+    spec = Gemma4OpSpec(
+        activation_dtype=torch.bfloat16,
+        head_dims=(256,),
+        cuda_graph=True,
+        attention_contracts=((8, 2, 256, -1),),
+        max_batch_size=8,
+        batch_only_cuda_graph=True,
+        context_capacity=32768,
+    )
+    caps = DeviceCaps(
+        **{
+            **_cuda_caps().__dict__,
+            "multi_processor_count": multi_processor_count,
+        }
+    )
+    result = TritonGemma4OperatorProvider.supports(spec, caps)
+    assert not result.supported
+    assert "multi-processor count" in result.reason
+    with pytest.raises(ValueError, match="multi-processor count"):
+        TritonGemma4OperatorProvider.bind(spec, caps)
+
+
 def _decode_reference(
     q, k, v, slots, req_indices, lengths, window=None, *, scale=True
 ):
@@ -612,7 +638,7 @@ def test_gemma4_fixed_grid_matches_reference_and_graph(window) -> None:
             mid_lse,
             splits,
             sliding_window=window,
-            device_core_count=120,
+            multi_processor_count=120,
         )
 
     run()

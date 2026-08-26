@@ -162,7 +162,11 @@ class TritonGemma4OperatorProvider(Gemma4OperatorProvider):
         super().__init__()
         self.spec = spec
         self.device = None if caps is None else torch.device("cuda", caps.device_index)
-        self.device_core_count = 1 if caps is None else int(caps.multiprocessor_count or 1)
+        self.multi_processor_count = (
+            None if caps is None else int(caps.multi_processor_count or 0)
+        )
+        if caps is not None and self.multi_processor_count <= 0:
+            raise ValueError("Gemma 4 requires a positive multi-processor count.")
         self._decode_workspaces: dict[tuple[int, int, int], object] = {}
 
     @classmethod
@@ -175,6 +179,13 @@ class TritonGemma4OperatorProvider(Gemma4OperatorProvider):
             return SupportResult.unsupported("requires BF16 or FP16 activations")
         if any(head_dim not in {256, 512} for head_dim in spec.head_dims):
             return SupportResult.unsupported("requires attention head dimensions 256 or 512")
+        if (
+            caps.multi_processor_count is None
+            or int(caps.multi_processor_count) <= 0
+        ):
+            return SupportResult.unsupported(
+                "requires a positive multi-processor count"
+            )
         return SupportResult.yes()
 
     @classmethod
@@ -194,7 +205,11 @@ class TritonGemma4OperatorProvider(Gemma4OperatorProvider):
             Gemma4DecodeWorkspace,
         )
 
-        if self.spec is None or self.device is None:
+        if (
+            self.spec is None
+            or self.device is None
+            or self.multi_processor_count is None
+        ):
             raise RuntimeError(
                 "Gemma 4 attention requires a provider bound from Gemma4OpSpec."
             )
@@ -242,7 +257,7 @@ class TritonGemma4OperatorProvider(Gemma4OperatorProvider):
             Gemma4AttentionBackend(
                 sliding_window=sliding_window,
                 decode_workspace=workspace,
-                device_core_count=self.device_core_count,
+                multi_processor_count=self.multi_processor_count,
             )
         )
 
