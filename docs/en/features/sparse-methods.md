@@ -17,7 +17,7 @@ Set `sparse_method` to one of the following method names.
 | `h2o` | Physical eviction | H2O maintains an independent cumulative attention-importance vector for every KV layer and physical row. Prefill scores and physically evicts after every chunk, and the final prefill chunk contracts to the decode budget. Decode scoring and periodic eviction are currently disabled: decode is score-free and its physical row grows with generated tokens. Prefill eviction retains heavy hitters plus a recent suffix. Sparse-vLLM v1 shares one selected token set across KV heads within a layer, but never shares scores or selected indices across layers. | `h2o_decode_budget`, `h2o_prefill_budget`, `h2o_recent_ratio`, `h2o_prefill_score_window`, `sparse_prefill_score_mode` |
 | `pyramidkv` | Physical eviction | PyramidKV-style layer-dependent KV retention. It allocates sparse budgets across layers and physically stores the selected context tokens. | `decode_keep_tokens`, `sink_keep_tokens`, `recent_keep_tokens`, `sparse_prefill_score_mode` |
 | `omnikv` | Logical masking | OmniKV keeps the physical cache available but constructs sparse attention views for selected layers. This is useful when the method should avoid rewriting cache storage while still reducing attention work. | `full_attention_layers`, `decode_keep_tokens`, `sink_keep_tokens`, `recent_keep_tokens` |
-| `quest` | Query-aware page selection | QuEST selects token pages based on the decode query. Prefill stays dense, and sparse selection happens in decode through page/chunk budgets. | `quest_chunk_size`, `quest_skip_layers`, `sink_keep_tokens`, `decode_keep_tokens`, `recent_keep_tokens` |
+| `quest` | Query-aware page selection | QuEST selects token pages from persistent min/max page summaries. Prefill stays dense. Explicit-KV models score in key coordinates; GLM-4.7-Flash scores the fused MLA latent/RoPE cache with the matching absorbed decode query while keeping the compute payload latent. | `quest_chunk_size`, `quest_skip_layers`, `sink_keep_tokens`, `decode_keep_tokens`, `recent_keep_tokens` |
 | `deltakv` | Hybrid compression | Slim compressor-backed DeltaKV runtime. Legacy `deltakv-less-memory*` names normalize here for older configs, but real benchmark runs still require a matching compressor checkpoint. | `deltakv_checkpoint_path`, `deltakv_latent_dim`, `deltakv_center_ratio`, `deltakv_neighbor_count`, `deltakv_latent_quant_bits`, `full_layer_kv_quant_bits` |
 
 Sparse-vLLM uses `sparse_method` unchanged in public commands, `LLM(...)`, the
@@ -71,6 +71,8 @@ compressed or quantized row metadata.
 `prefix_cache_mode=auto` chooses radix for vanilla/OmniKV/QuEST and a linear
 chain for SnapKV/H2O/PyramidKV/R-KV/SkipKV. `radix` and `chain` can be
 requested explicitly, but incompatible method/mode pairs fail fast.
+GLM-4.7-Flash QuEST is a storage-specific exception: its latent QuEST path does
+not yet support prefix caching or prefix offload, and configuration rejects both.
 
 The chain layout keeps one resident `seq_id` across turns and never branches.
 Callers send the complete logical context plus the returned `chain_id`; only

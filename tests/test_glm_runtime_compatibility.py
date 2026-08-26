@@ -16,17 +16,24 @@ def test_mla_prefill_workspace_budget_must_be_positive():
         _glm_config(mla_prefill_workspace_bytes=0)
 
 
-@pytest.mark.parametrize(
-    ("override", "error_type", "message"),
-    [
-        ({"sparse_method": "quest"}, ValueError, "Unsupported glm4_moe_lite"),
-    ],
-)
-def test_glm_config_rejects_unsupported_storage_combinations(
-    override, error_type, message
-):
-    with pytest.raises(error_type, match=message):
-        _glm_config(**override)
+def test_glm_config_accepts_latent_quest_without_prefix_cache():
+    config = _glm_config(
+        sparse_method="quest",
+        decode_graph=True,
+    )
+
+    assert config.attention_cache_layout == CacheLayout.MLA_LATENT.value
+    assert config.sparse_method == "quest"
+    assert config.decode_graph is True
+    assert config.enable_prefix_caching is False
+
+
+def test_glm_config_rejects_latent_quest_prefix_cache():
+    with pytest.raises(ValueError, match="prefix caching is validated only"):
+        _glm_config(
+            sparse_method="quest",
+            enable_prefix_caching=True,
+        )
 
 
 @pytest.mark.parametrize("expert_parallel_size", [2, 4])

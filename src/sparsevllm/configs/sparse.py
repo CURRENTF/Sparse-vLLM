@@ -51,6 +51,16 @@ def _normalize_quest(config) -> None:
     if config.quest_skip_layers < 0:
         raise ValueError("quest_skip_layers 不能 < 0")
 
+
+def _normalize_snapkv(config) -> None:
+    _normalize_int_attr(config, "snapkv_num_full_layers")
+    if config.snapkv_num_full_layers != 0:
+        raise ValueError(
+            "snapkv_num_full_layers is unsupported and must be 0, got "
+            f"{config.snapkv_num_full_layers}."
+        )
+
+
 def _normalize_h2o(config) -> None:
     _normalize_positive_int(config, "h2o_decode_budget", fallback=0)
     _normalize_positive_int(config, "h2o_decode_eviction_interval", fallback=0)
@@ -213,6 +223,7 @@ def normalize_sparse_methods(config) -> None:
             "KV-sharing variants support vanilla and OmniKV."
         )
     _normalize_quest(config)
+    _normalize_snapkv(config)
     # _normalize_sparse_prefill_score must run before _normalize_h2o to validate
     # and canonicalize config.sparse_prefill_score_mode before H2O window checks.
     _normalize_sparse_prefill_score(config)

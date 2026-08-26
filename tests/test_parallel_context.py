@@ -306,6 +306,26 @@ def test_qwen3_moe_parallel_config_validation(tmp_path):
             Config(model=str(tmp_path))
 
 
+def test_qwen3_moe_snapkv_tp_supports_chain_cache_with_decode_graph(tmp_path):
+    with patch(
+        "sparsevllm.configs.runtime.AutoConfig.from_pretrained",
+        return_value=_hf_config(),
+    ):
+        config = Config(
+            model=str(tmp_path),
+            sparse_method="snapkv",
+            tensor_parallel_size=2,
+            enable_prefix_caching=True,
+            prefix_cache_mode="chain",
+            decode_graph=True,
+            decode_graph_capture_sampling=False,
+        )
+
+    assert config.parallel_topology.mode is ParallelMode.OUTER_TP_MOE
+    assert config.resolved_prefix_cache_mode == "chain"
+    assert config.enable_prefix_caching is True
+
+
 def test_qwen3_moe_fp8_config_validation(tmp_path):
     hf_config = _hf_config()
     hf_config.architectures = ["Qwen3MoeForCausalLM"]

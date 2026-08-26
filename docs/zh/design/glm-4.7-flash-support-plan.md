@@ -51,6 +51,13 @@ Prefix Cache 的模式由稀疏方法决定：
 - vanilla 和 OmniKV 使用 radix prefix cache。
 - StreamingLLM、SnapKV、H2O 和 R-KV 使用 chain prefix cache。
 
+QuEST 使用独立的 latent-aware page contract：每个物理 page、每层保存
+融合 `[latent, RoPE]` 576 维 key 的逐通道 min/max；decode 使用
+`[absorbed NoPE query, RoPE query]` 在相同坐标中计算 sign-split upper bound，
+并在每个 TP rank 的本地 query head 间取均值后共享一套 page selection。
+Attention compute view 仍携带 `MlaLatentPayload`，不会持久化或伪装成展开后的
+显式 K/V。该路径当前不支持 Prefix Cache 或 Prefix offload。
+
 Prefix hit 只有在请求实际复用了 token、cache 状态和方法特定 metadata 时才算
 成功；仅完成请求不能证明 prefix 路径生效。
 
@@ -102,8 +109,8 @@ GLM parser 中加入模型特判。
 - H100 以外的 GPU、非 BF16 checkpoint 和量化权重。
 - `DP>1`、上述矩阵以外的 TP/EP 布局。
 - MTP/speculative decoding；loader 只精确跳过 checkpoint 中的 MTP 层。
-- Prefix offload。
-- PyramidKV、QuEST、SkipKV、DeltaKV，以及多个稀疏方法叠加。
+- Prefix offload，以及 QuEST 与 Prefix Cache 的组合。
+- PyramidKV、SkipKV、DeltaKV，以及多个稀疏方法叠加。
 - 128K/202K 长上下文容量或吞吐支持声明。
 
 ## 验证门禁

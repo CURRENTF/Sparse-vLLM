@@ -46,7 +46,9 @@ GLM-4.7-Flash 在 NVIDIA H100 80GB HBM3 上使用 BF16 latent MLA，要求
 `DP=1`。已验证的 `(TP, EP)` 布局为 `(1,1)`、
 `(2,1)`、`(4,1)`、`(1,2)`、`(1,4)`、`(2,2)`、`(4,2)` 和 `(4,4)`。
 在全部八种布局中，vanilla、StreamingLLM、SnapKV、H2O、OmniKV 和 R-KV
-均支持 decode CUDA Graph 与 Prefix Cache 的联合组合。Prefix Cache 对
+均支持 decode CUDA Graph 与 Prefix Cache 的联合组合。QuEST 提供
+latent-aware decode 路径并注册 decode CUDA Graph，但不支持 Prefix Cache
+或 Prefix offload。Prefix Cache 对
 vanilla 和 OmniKV 使用 radix 模式，对 StreamingLLM、SnapKV、H2O 和 R-KV
 使用 chain 模式。Prefix offload、量化和其他稀疏方法仍不支持。loader
 会有意跳过 checkpoint 中的 MTP 层。
@@ -60,7 +62,7 @@ vanilla 和 OmniKV 使用 radix 模式，对 StreamingLLM、SnapKV、H2O 和 R-K
 | Qwen3MoE | ✅ | ✅ | ✅ | 实验性⁴ | ✅ | ✅ | ✅ | ✅ | — | — |
 | Qwen3.5 / 3.6 / 3.8 | ✅ | ✅ | ✅ | 实验性⁴ | ✅ | ✅ | ✅ | ✅ | — | 匹配的 checkpoint³ |
 | Qwen3.6 MoE | ✅ | ✅ | ✅ | 实验性⁴ | ✅ | ✅ | ✅ | ✅ | — | — |
-| GLM-4.7-Flash | ✅⁵ | ✅⁵ | ✅⁵ | 实验性⁴⁵ | — | ✅⁵ | — | ✅⁵ | — | — |
+| GLM-4.7-Flash | ✅⁵ | ✅⁵ | ✅⁵ | 实验性⁴⁵ | — | ✅⁵ | 实验性⁵ | ✅⁵ | — | — |
 | Gemma 4 Dense / MoE | ✅ | ✅⁶ | — | — | — | ✅ | — | — | — | — |
 | Llama 3 / 3.1 | ✅ | ✅ | ✅ | 实验性⁴ | ✅ | ✅ | ✅ | ✅ | 指定 checkpoint¹ | 需要 compressor² |
 | MiniMax M2.7 | ✅ | ✅ | ✅ | 实验性⁴ | ✅ | ✅ | ✅ | ✅ | — | — |
@@ -80,7 +82,8 @@ TP、EP、DP 限制仍然适用。
 
 ⁵ GLM 支持限定为上文列出的八种 `(TP, EP)` 布局，且要求 `DP=1`。在
 `TP>1` 时，基于 head 评分的稀疏方法使用 TP-local selection，不跨 rank
-聚合 sparse index，因此其选择语义不保证与 `TP=1` 相同。
+聚合 sparse index，因此其选择语义不保证与 `TP=1` 相同。QuEST 表项仅表示
+代码已接入；GPU 数值正确性、CUDA Graph replay 与性能验证仍待完成。
 
 ⁶ 带共享 KV 层的 Gemma 4 checkpoint 不支持逐层 StreamingLLM eviction；
 Vanilla 和 OmniKV 仍受支持。

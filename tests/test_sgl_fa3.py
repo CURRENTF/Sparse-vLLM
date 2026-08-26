@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -106,6 +106,188 @@ def test_sgl_fa3_device_support_keeps_package_probe_and_device_probe_separate() 
     ):
         with pytest.raises(RuntimeError, match="ABI mismatch"):
             sgl_fa3_device_support(3)
+
+
+def _mock_fa3_kernel(*, workspace: torch.Tensor | None) -> tuple[
+    SglFa3DecodeKernel,
+    Mock,
+    Mock,
+    torch.Tensor,
+]:
+    raw_op = Mock()
+    raw_op.side_effect = lambda *args: (
+        args[_FWD_ARGUMENTS.index("out")],
+        torch.empty(12, 155, dtype=torch.float32),
+        workspace,
+        torch.empty(0),
+    )
+    metadata = torch.empty(17, dtype=torch.int32)
+    scheduler_op = Mock(return_value=metadata)
+    kernel = object.__new__(SglFa3DecodeKernel)
+    kernel._op = raw_op
+    kernel._scheduler_op = scheduler_op
+    kernel._scheduler_plan = None
+    kernel._captured_scheduler_plans = []
+    kernel.softmax_scale = 128**-0.5
+    kernel.num_splits = 0
+    return kernel, raw_op, scheduler_op, metadata
+
+
+def _call_arguments(call) -> dict[str, object]:
+    return dict(zip(_FWD_ARGUMENTS, call.args, strict=True))
+
+
+def test_sgl_fa3_ragged_prefill_binds_metadata_to_forward_split() -> None:
+    # MiniMax-M2.7 TP4 production contract: the real query total is 155, not
+    # batch * max_seqlen_q (278), and the 8192-wide table crosses the upstream
+    # automatic split heuristic boundary on a 132-SM H100.
+    kernel, raw_op, scheduler_op, metadata = _mock_fa3_kernel(
+        workspace=torch.empty(8, 1),
+    )
+    q = torch.empty(155, 12, 128, dtype=torch.bfloat16)
+    k_cache = torch.empty(1, 2, 128, dtype=torch.bfloat16)
+    v_cache = torch.empty_like(k_cache)
+    page_table = torch.empty(2, 8192, dtype=torch.int32)
+    request_indices = torch.tensor([0, 1], dtype=torch.int32)
+    context_lens = torch.tensor([256, 2048], dtype=torch.int32)
+    cu_seqlens_q = torch.tensor([0, 139, 155], dtype=torch.int32)
+    output = torch.empty_like(q)
+    scope = object()
+    assert q.shape[0] != context_lens.numel() * 139
+
+    with patch("torch.cuda.is_current_stream_capturing", return_value=False):
+        kernel.run_explicit_varlen(
+            q,
+            k_cache,
+            v_cache,
+            page_table,
+            request_indices,
+            context_lens,
+            output,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=139,
+            validation_scope=scope,
+        )
+        kernel.run_explicit_varlen(
+            q,
+            k_cache,
+            v_cache,
+            page_table,
+            request_indices,
+            context_lens,
+            output,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=139,
+            validation_scope=scope,
+        )
+
+    first_fwd = _call_arguments(raw_op.call_args_list[0])
+    second_fwd = _call_arguments(raw_op.call_args_list[1])
+    assert first_fwd["scheduler_metadata"] is None
+    assert first_fwd["num_splits"] == 0
+    assert scheduler_op.call_count == 1
+    assert scheduler_op.call_args.args[21] == 8
+    assert second_fwd["scheduler_metadata"] is metadata
+    assert second_fwd["num_splits"] == 8
+
+    # total_q participates in the cached plan contract even when every other
+    # metadata pointer and static maximum remains unchanged.
+    q_with_different_total = torch.empty(156, 12, 128, dtype=torch.bfloat16)
+    with patch("torch.cuda.is_current_stream_capturing", return_value=False):
+        kernel.run_explicit_varlen(
+            q_with_different_total,
+            k_cache,
+            v_cache,
+            page_table,
+            request_indices,
+            context_lens,
+            torch.empty_like(q_with_different_total),
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=139,
+            validation_scope=scope,
+        )
+    third_fwd = _call_arguments(raw_op.call_args_list[2])
+    assert third_fwd["scheduler_metadata"] is None
+    assert third_fwd["num_splits"] == 0
+    assert scheduler_op.call_count == 2
+
+
+def test_sgl_fa3_latent_varlen_resolves_missing_workspace_to_one_split() -> None:
+    kernel, raw_op, scheduler_op, metadata = _mock_fa3_kernel(workspace=None)
+    q_rope = torch.empty(155, 12, 64, dtype=torch.bfloat16)
+    q_latent = torch.empty(155, 12, 512, dtype=torch.bfloat16)
+    rope_cache = torch.empty(1, 1, 64, dtype=torch.bfloat16)
+    latent_cache = torch.empty(1, 1, 512, dtype=torch.bfloat16)
+    page_table = torch.empty(2, 8192, dtype=torch.int32)
+    request_indices = torch.tensor([0, 1], dtype=torch.int32)
+    context_lens = torch.tensor([256, 2048], dtype=torch.int32)
+    cu_seqlens_q = torch.tensor([0, 139, 155], dtype=torch.int32)
+    output = torch.empty_like(q_latent)
+    scope = object()
+
+    with patch("torch.cuda.is_current_stream_capturing", return_value=False):
+        for _ in range(2):
+            kernel.run_varlen(
+                q_rope,
+                q_latent,
+                rope_cache,
+                latent_cache,
+                page_table,
+                request_indices,
+                context_lens,
+                output,
+                cu_seqlens_q=cu_seqlens_q,
+                max_seqlen_q=139,
+                validation_scope=scope,
+            )
+
+    assert scheduler_op.call_count == 1
+    assert scheduler_op.call_args.args[21] == 1
+    second_fwd = _call_arguments(raw_op.call_args_list[1])
+    assert second_fwd["scheduler_metadata"] is metadata
+    assert second_fwd["num_splits"] == 1
+
+
+def test_sgl_fa3_capture_keeps_plans_separate_from_eager_plan() -> None:
+    kernel, _, scheduler_op, _ = _mock_fa3_kernel(workspace=None)
+    scheduler_op.side_effect = [
+        torch.empty(1, dtype=torch.int32),
+        torch.empty(2, dtype=torch.int32),
+        torch.empty(3, dtype=torch.int32),
+    ]
+    q = torch.empty(5, 12, 128, dtype=torch.bfloat16)
+    k_cache = torch.empty(1, 2, 128, dtype=torch.bfloat16)
+    page_table = torch.empty(2, 8, dtype=torch.int32)
+    context_lens = torch.tensor([5, 4], dtype=torch.int32)
+    cu_seqlens_q = torch.tensor([0, 3, 5], dtype=torch.int32)
+    scope = object()
+    kwargs = dict(
+        headdim_v=128,
+        max_seqlen_q=3,
+        validation_scope=scope,
+    )
+
+    with patch(
+        "torch.cuda.is_current_stream_capturing",
+        side_effect=[False, True, False, True],
+    ):
+        eager_metadata, _ = kernel._scheduler_metadata(
+            q, k_cache, page_table, context_lens, cu_seqlens_q, num_splits=2, **kwargs
+        )
+        captured_metadata, _ = kernel._scheduler_metadata(
+            q, k_cache, page_table, context_lens, cu_seqlens_q, num_splits=3, **kwargs
+        )
+        newer_eager_metadata, _ = kernel._scheduler_metadata(
+            q, k_cache, page_table, context_lens, cu_seqlens_q, num_splits=4, **kwargs
+        )
+        reused_capture, reused_split = kernel._scheduler_metadata(
+            q, k_cache, page_table, context_lens, cu_seqlens_q, num_splits=3, **kwargs
+        )
+
+    assert eager_metadata is not newer_eager_metadata
+    assert len(kernel._captured_scheduler_plans) == 1
+    assert captured_metadata is reused_capture
+    assert reused_split == 3
 
 
 @pytest.mark.skipif(
@@ -457,6 +639,115 @@ def test_sgl_fa3_varlen_explicit_prefill_matches_causal_torch() -> None:
         atol=3e-2,
     )
     torch.testing.assert_close(packed_output, output)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not sgl_fa3_support()[0],
+    reason="CUDA and a validated sglang-kernel are required",
+)
+def test_sgl_fa3_minimax_ragged_split_boundary_matches_torch() -> None:
+    device = torch.device("cuda")
+    properties = torch.cuda.get_device_properties(device)
+    if properties.multi_processor_count != 132:
+        pytest.skip("the regression requires a 132-SM Hopper GPU")
+
+    torch.manual_seed(20260825)
+    q_heads, kv_heads, head_dim = 12, 2, 128
+    chunk_lens = (139, 16)
+    context_values = (256, 2048)
+    total_q = sum(chunk_lens)
+    total_k = sum(context_values)
+    page_table_width = 8192
+    q = torch.randn(
+        total_q, q_heads, head_dim, device=device, dtype=torch.bfloat16
+    )
+    k_cache = torch.randn(
+        total_k, kv_heads, head_dim, device=device, dtype=torch.bfloat16
+    )
+    v_cache = torch.randn_like(k_cache)
+    page_table = torch.zeros(
+        2, page_table_width, device=device, dtype=torch.int32
+    )
+    page_table[0, : context_values[0]] = torch.arange(
+        context_values[0], device=device, dtype=torch.int32
+    )
+    page_table[1, : context_values[1]] = torch.arange(
+        context_values[0], total_k, device=device, dtype=torch.int32
+    )
+    request_indices = torch.tensor([0, 1], device=device, dtype=torch.int32)
+    context_lens = torch.tensor(context_values, device=device, dtype=torch.int32)
+    cu_seqlens_q = torch.tensor(
+        [0, chunk_lens[0], total_q], device=device, dtype=torch.int32
+    )
+    assert total_q != len(chunk_lens) * max(chunk_lens)
+
+    kernel = SglFa3DecodeKernel(
+        device=device,
+        max_batch_size=2,
+        softmax_scale=head_dim**-0.5,
+    )
+    raw_op = kernel._op
+    scheduler_op = kernel._scheduler_op
+    assert scheduler_op is not None
+    forward_splits = []
+    metadata_splits = []
+
+    def recorded_raw_op(*args):
+        forward_splits.append(int(args[_FWD_ARGUMENTS.index("num_splits")]))
+        return raw_op(*args)
+
+    def recorded_scheduler_op(*args):
+        metadata_splits.append(int(args[21]))
+        return scheduler_op(*args)
+
+    kernel._op = recorded_raw_op
+    kernel._scheduler_op = recorded_scheduler_op
+    validation_scope = object()
+    outputs = []
+    for _ in range(2):
+        output = torch.empty_like(q)
+        returned_output = kernel.run_explicit_varlen(
+            q,
+            k_cache,
+            v_cache,
+            page_table,
+            request_indices,
+            context_lens,
+            output,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=max(chunk_lens),
+            validation_scope=validation_scope,
+        )
+        outputs.append(returned_output)
+
+    assert forward_splits[0] == 0
+    assert len(metadata_splits) == 1
+    assert metadata_splits[0] > 1
+    assert forward_splits[1] == metadata_splits[0]
+
+    expected_rows = []
+    query_start = 0
+    group_size = q_heads // kv_heads
+    for batch_index, chunk_len in enumerate(chunk_lens):
+        context_len = context_values[batch_index]
+        for query_offset in range(chunk_len):
+            visible_len = context_len - chunk_len + query_offset + 1
+            active = page_table[batch_index, :visible_len].long()
+            query_index = query_start + query_offset
+            keys = k_cache[active].repeat_interleave(group_size, dim=1)
+            values = v_cache[active].repeat_interleave(group_size, dim=1)
+            logits = torch.einsum("hd,lhd->hl", q[query_index].float(), keys.float())
+            probabilities = torch.softmax(logits * (head_dim**-0.5), dim=-1)
+            expected_rows.append(
+                torch.einsum("hl,lhd->hd", probabilities, values.float()).to(
+                    torch.bfloat16
+                )
+            )
+        query_start += chunk_len
+    expected = torch.stack(expected_rows)
+
+    for output in outputs:
+        torch.testing.assert_close(output, expected, rtol=3e-2, atol=3e-2)
 
 
 @pytest.mark.parametrize("q_heads,kv_heads", [(32, 4), (16, 2), (12, 2)])

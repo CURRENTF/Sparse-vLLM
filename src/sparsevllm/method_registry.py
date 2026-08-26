@@ -172,7 +172,7 @@ QWEN3_MOE_EP_COMPATIBILITY = ModelRuntimeCompatibility(
 
 QWEN3_MOE_TP_EP_COMPATIBILITY = ModelRuntimeCompatibility(
     sparse_methods=_MOE_SPARSE_METHODS,
-    prefix_cache_methods=frozenset({""}),
+    prefix_cache_methods=frozenset({"", "snapkv"}),
     decode_graph_methods=_MOE_SPARSE_METHODS,
 )
 
@@ -188,7 +188,7 @@ QWEN35_MOE_COMPATIBILITY = ModelRuntimeCompatibility(
 
 MINIMAX_M2_EP_COMPATIBILITY = ModelRuntimeCompatibility(
     sparse_methods=_MOE_SPARSE_METHODS,
-    prefix_cache_methods=frozenset({"", "omnikv", "quest"}),
+    prefix_cache_methods=frozenset({"", "omnikv", "quest", "snapkv"}),
     decode_graph_methods=_MOE_SPARSE_METHODS,
 )
 
@@ -200,13 +200,15 @@ MINIMAX_M2_TP_EP_COMPATIBILITY = ModelRuntimeCompatibility(
 
 GLM4_MOE_LITE_EP_COMPATIBILITY = ModelRuntimeCompatibility(
     sparse_methods=frozenset(
-        {"", "streamingllm", "snapkv", "h2o", "omnikv", "rkv"}
+        {"", "streamingllm", "snapkv", "h2o", "omnikv", "quest", "rkv"}
     ),
     prefix_cache_methods=frozenset(
         {"", "streamingllm", "snapkv", "h2o", "omnikv", "rkv"}
     ),
+    # TODO: Validate GLM latent QuEST numerical correctness and interleaved
+    # CUDA Graph capture/replay on the supported TP/EP matrix.
     decode_graph_methods=frozenset(
-        {"", "streamingllm", "snapkv", "h2o", "omnikv", "rkv"}
+        {"", "streamingllm", "snapkv", "h2o", "omnikv", "quest", "rkv"}
     ),
 )
 

@@ -31,6 +31,29 @@ def _sequences(lengths: list[int]) -> list[Sequence]:
     return seqs
 
 
+def test_snapkv_graph_capacity_uses_physical_budget_not_logical_context():
+    manager = object.__new__(SnapKVCacheManager)
+    manager.config = SimpleNamespace(
+        sparse_method="snapkv",
+        num_sink_tokens=64,
+        decode_keep_tokens=8064,
+        num_recent_tokens=64,
+    )
+    seqs = [
+        SimpleNamespace(max_tokens=4096),
+        SimpleNamespace(max_tokens=1024),
+    ]
+
+    capacity, allow_larger = manager.decode_cuda_graph_context_capacity(
+        seqs,
+        requested_context_capacity=131072,
+        current_context_capacity=65536,
+    )
+
+    assert capacity == 12288
+    assert allow_larger is True
+
+
 def _page_table_manager(
     lengths_by_layer: list[list[int]],
     *,

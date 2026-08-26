@@ -739,6 +739,21 @@ class SnapKVCacheManager(CacheManager):
             for layer_idx in self.kv_transformer_layer_indices()
         )
 
+    def reset_after_warmup(self) -> None:
+        # TP workers do not run the rank-0 Scheduler, so their RuntimeState
+        # resident-sequence set cannot be the source of truth for warmup rows.
+        # Reclaim directly from each rank-local cache-manager ledger before
+        # serving the first real chain request.
+        resident_seq_ids = sorted(
+            {
+                int(seq_id)
+                for layer_idx in self.kv_transformer_layer_indices()
+                for seq_id in self.seq_id_to_row[layer_idx]
+            }
+        )
+        for seq_id in resident_seq_ids:
+            self.free_seq(seq_id)
+
     def chain_physical_kv_len(self, layer_idx: int, seq_id: int) -> int:
         row_idx = self.seq_id_to_row[int(layer_idx)].get(int(seq_id))
         if row_idx is None:
@@ -746,6 +761,27 @@ class SnapKVCacheManager(CacheManager):
                 f"Missing chain row for seq_id={seq_id} layer={layer_idx}."
             )
         return int(self.row_seq_lens[int(layer_idx)][row_idx])
+
+    def decode_cuda_graph_context_capacity(
+        self,
+        seqs: list[Sequence],
+        *,
+        requested_context_capacity: int,
+        current_context_capacity: int,
+    ) -> tuple[int, bool] | None:
+        del requested_context_capacity, current_context_capacity
+        if str(getattr(self.config, "sparse_method", "") or "") != "snapkv":
+            return None
+        # SnapKV compacts final-prefill rows to this physical budget and decode
+        # then grows without eviction.  Bucket graphs by the physical upper
+        # bound instead of the much larger logical conversation length.
+        physical_budget = (
+            int(self.config.num_sink_tokens)
+            + int(self.config.decode_keep_tokens)
+            + int(self.config.num_recent_tokens)
+        )
+        max_generation = max(int(seq.max_tokens) for seq in seqs)
+        return physical_budget + max_generation, True
 
     def _pyramidkv_layer_budget(self, layer_idx: int) -> int:
         decode_keep = int(self.config.decode_keep_tokens)
@@ -1877,6 +1913,7 @@ class SnapKVCacheManager(CacheManager):
             seq,
             keep_indices,
             keep_indices_sorted=keep_indices_sorted,
+            synchronize_validation=self.validate_runtime_invariants,
         )
         if log_level == 'DEBUG':
             keep_cnt = int(keep_indices.numel())
@@ -1944,6 +1981,7 @@ class SnapKVCacheManager(CacheManager):
             sort_dim=1,
             keep_indices_sorted=keep_indices_sorted,
             operation="free_part_slots_batch",
+            synchronize_validation=self.validate_runtime_invariants,
         )
         total_release_count = sum(
             int(cur_len) - int(keep_indices.shape[1]) for cur_len in cur_lens
@@ -2038,6 +2076,7 @@ class SnapKVCacheManager(CacheManager):
             sort_dim=2,
             keep_indices_sorted=keep_indices_sorted,
             operation="free_part_slots_batch_layers",
+            synchronize_validation=self.validate_runtime_invariants,
         )
         for local_layer, layer_idx in enumerate(layer_indices):
             release_count = int(

@@ -107,3 +107,28 @@ def test_minimax_config_rejects_unvalidated_parallel_layout(
 ):
     with pytest.raises(ValueError, match="MiniMax M2.7|Outer-TP MoE"):
         _make_config(tmp_path, **parallel_kwargs)
+
+
+def test_minimax_snapkv_tp_ep_supports_chain_cache_with_decode_graph(tmp_path):
+    config = _make_config(
+        tmp_path,
+        sparse_method="snapkv",
+        tensor_parallel_size=4,
+        expert_parallel_size=4,
+        enable_prefix_caching=True,
+        prefix_cache_mode="chain",
+        decode_graph=True,
+        decode_graph_capture_sampling=False,
+    )
+
+    assert config.resolved_prefix_cache_mode == "chain"
+    assert config.enable_prefix_caching is True
+
+
+def test_snapkv_rejects_full_attention_layers(tmp_path):
+    with pytest.raises(ValueError, match="snapkv_num_full_layers.*must be 0"):
+        _make_config(
+            tmp_path,
+            sparse_method="snapkv",
+            snapkv_num_full_layers=1,
+        )

@@ -445,6 +445,29 @@ def test_tp_worker_continues_after_multimodal_registration_failure():
     assert calls == ["register_multimodal_shared", "free_multimodal", "exit"]
 
 
+def test_tp_worker_continues_after_chain_admission_validation_failure():
+    runner = object.__new__(ModelRunner)
+    commands = iter(
+        [
+            ("chain_validate_admission_plan", []),
+            ("free_slots", []),
+            ("exit", []),
+        ]
+    )
+    calls = []
+    runner.read_shm = lambda: next(commands)
+
+    def call(method_name, *_args):
+        calls.append(method_name)
+        if method_name == "chain_validate_admission_plan":
+            raise ValueError("rank-local chain capacity rejected")
+
+    runner.call = call
+    ModelRunner.loop(runner)
+
+    assert calls == ["chain_validate_admission_plan", "free_slots", "exit"]
+
+
 def test_model_runner_reset_after_warmup_resets_local_runtime_state():
     calls = []
     runner = object.__new__(ModelRunner)

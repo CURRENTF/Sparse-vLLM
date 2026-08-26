@@ -999,15 +999,21 @@ class MLAAttention:
                 )
             else:
                 selection = sparse_controller.get_decode_selection(layer_idx, q)
+                q_nope_absorbed = absorb_query(q_nope)
+                selection_query = cache_manager.build_decode_selection_query(
+                    q,
+                    mla_latent=q_nope_absorbed,
+                    mla_rope=q_rope,
+                )
                 view = cache_manager.build_decode_compute_view(
                     layer_idx,
-                    q,
+                    selection_query,
                     selection,
                     num_heads=self.spec.local_q_heads,
                     num_kv_heads=1,
                 )
                 output = reconstruct_values(
-                    self.run_decode(absorb_query(q_nope), q_rope, view)
+                    self.run_decode(q_nope_absorbed, q_rope, view)
                 )
                 cache_manager.record_decode_query(layer_idx, q)
 
