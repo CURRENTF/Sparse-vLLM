@@ -56,7 +56,7 @@ def _prefill_score_baseline(
                     head_scores[pos] += prob / max(1, score_end - score_start)
             q_scores.append(head_scores)
         if q_scores:
-            out[b] = torch.stack(q_scores).sum(dim=0)
+            out[b] = torch.stack(q_scores).max(dim=0).values
     return out
 
 
@@ -366,8 +366,8 @@ class PrefillScoreKernelTest(unittest.TestCase):
         device = "cuda"
         prompt_len = 192
         query_len = 160
-        num_heads = 4
-        num_kv_heads = 2
+        num_heads = 3
+        num_kv_heads = 1
         head_dim = 16
         prompt_cache_len = prompt_len - query_len
         q = torch.randn(

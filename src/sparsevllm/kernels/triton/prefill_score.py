@@ -11,7 +11,7 @@ class PrefillScoreWorkspace:
         self._partial_l: torch.Tensor | None = None
         self._global_m: torch.Tensor | None = None
         self._global_l: torch.Tensor | None = None
-        self._score_partial: torch.Tensor | None = None
+        self._head_score: torch.Tensor | None = None
 
     @staticmethod
     def _reserve(
@@ -67,22 +67,22 @@ class PrefillScoreWorkspace:
             self._global_l[:global_elements].view(global_shape),
         )
 
-    def probability_score_buffer(
+    def probability_head_score_buffer(
         self,
         *,
         batch_size: int,
-        partial_groups: int,
+        query_heads: int,
         score_width: int,
         device: torch.device,
     ) -> torch.Tensor:
-        elements = int(batch_size) * int(partial_groups) * int(score_width)
-        self._score_partial = self._reserve(
-            self._score_partial,
+        elements = int(batch_size) * int(query_heads) * int(score_width)
+        self._head_score = self._reserve(
+            self._head_score,
             elements,
             device=device,
         )
-        return self._score_partial[:elements].view(
-            int(batch_size), int(partial_groups), int(score_width)
+        return self._head_score[:elements].view(
+            int(batch_size), int(query_heads), int(score_width)
         )
 
 @triton.jit
@@ -232,6 +232,7 @@ def _prefill_score_final_kernel(
     Q,
     K,
     Attn_Score,
+    Head_Score,
     Global_M,
     Global_L,
     B_Seqlen,
@@ -250,12 +251,16 @@ def _prefill_score_final_kernel(
     stride_kd,
     stride_asb,
     stride_asl,
+    stride_hsb,
+    stride_hsh,
+    stride_hsl,
     stride_req_to_tokens_b,
     stride_req_to_tokens_s,
     H_PER_KV: tl.constexpr,
     H_KV: tl.constexpr,
     HEAD_BLOCKS: tl.constexpr,
     QUERY_BLOCKS: tl.constexpr,
+    WRITE_PER_HEAD: tl.constexpr,
     USE_BATCH_INDICES: tl.constexpr,
     candidate_start: tl.constexpr,
     recent_keep_tokens: tl.constexpr,
@@ -299,6 +304,7 @@ def _prefill_score_final_kernel(
         + (offs_rows % BLOCK_M)
     )
     q_rel_pos = q_abs_pos - prompt_cache_len
+    row_head_in_block = offs_rows // BLOCK_M
     q_row_valid = (
         (local_head < H_PER_KV)
         & (q_abs_pos < score_q_end)
@@ -326,8 +332,11 @@ def _prefill_score_final_kernel(
     k = tl.load(K + off_k, mask=kv_in_candidate[None, :], other=0.0)
 
     qk = tl.dot(q, k) * sm_scale
-    causal_mask = q_abs_pos[:, None] >= kv_pos[None, :]
-    valid = q_row_valid[:, None] & kv_in_candidate[None, :] & causal_mask
+    valid = (
+        q_row_valid[:, None]
+        & kv_in_candidate[None, :]
+        & (q_abs_pos[:, None] >= kv_pos[None, :])
+    )
     qk = tl.where(valid, qk, -1.0e20)
 
     stats_offs = storage_group * BLOCK_ROWS + offs_rows
@@ -337,18 +346,31 @@ def _prefill_score_final_kernel(
     probs = tl.exp(qk - m_i[:, None]) / safe_l_i[:, None]
     probs = tl.where(valid, probs, 0.0)
 
-    # The physical row is shared by local heads, so accumulate their attention
-    # mass into one per-layer token vector. Dividing by query count keeps the
-    # existing chunk-weighted accumulator equivalent to a sum over queries.
-    # TODO: Validate matched downstream quality/performance for this shared
-    # probability reduction. Restore max reduction if summed head mass regresses
-    # R-KV, SnapKV, PyramidKV, or H2O behavior.
-    token_score = tl.sum(probs, axis=0) / (score_q_len * 1.0)
-    tl.atomic_add(
-        Attn_Score + cur_batch * stride_asb + kv_pos * stride_asl,
-        token_score,
-        mask=kv_in_candidate,
-    )
+    token_score = tl.zeros([BLOCK_N], dtype=tl.float32)
+    for head_idx in tl.static_range(0, BLOCK_H):
+        head_rows = row_head_in_block == head_idx
+        head_score = tl.sum(
+            tl.where(head_rows[:, None], probs, 0.0), axis=0
+        ) / (score_q_len * 1.0)
+        if WRITE_PER_HEAD:
+            output_local_head = cur_head_block * BLOCK_H + head_idx
+            output_head = cur_kv_head * H_PER_KV + output_local_head
+            tl.atomic_add(
+                Head_Score
+                + cur_batch * stride_hsb
+                + output_head * stride_hsh
+                + kv_pos * stride_hsl,
+                head_score,
+                mask=kv_in_candidate & (output_local_head < H_PER_KV),
+            )
+        else:
+            token_score = tl.maximum(token_score, head_score)
+    if not WRITE_PER_HEAD:
+        tl.atomic_max(
+            Attn_Score + cur_batch * stride_asb + kv_pos * stride_asl,
+            token_score,
+            mask=kv_in_candidate,
+        )
 
 
 @triton.jit
@@ -356,7 +378,8 @@ def _prefill_probability_from_lse_kernel(
     Q,
     K,
     Attention_LSE,
-    Partial_Score,
+    Attn_Score,
+    Head_Score,
     B_Seqlen,
     Req_to_tokens,
     B_req_idx,
@@ -372,15 +395,18 @@ def _prefill_probability_from_lse_kernel(
     stride_kd,
     stride_lseh,
     stride_lseq,
-    stride_psb,
-    stride_psg,
-    stride_psl,
+    stride_asb,
+    stride_asl,
+    stride_hsb,
+    stride_hsh,
+    stride_hsl,
     stride_req_to_tokens_b,
     stride_req_to_tokens_s,
     H_PER_KV: tl.constexpr,
     H_KV: tl.constexpr,
     HEAD_BLOCKS: tl.constexpr,
     QUERY_BLOCKS: tl.constexpr,
+    WRITE_PER_HEAD: tl.constexpr,
     SCORE_WIDTH: tl.constexpr,
     sm_scale: tl.constexpr,
     BLOCK_H: tl.constexpr,
@@ -397,11 +423,6 @@ def _prefill_probability_from_lse_kernel(
     cur_bkv = cur_group // HEAD_BLOCKS
     cur_batch = cur_bkv // H_KV
     cur_kv_head = cur_bkv % H_KV
-    partial_group = (
-        (cur_kv_head * HEAD_BLOCKS + cur_head_block) * QUERY_BLOCKS
-        + cur_query_block
-    )
-
     q_start = tl.load(B_Start_Loc + cur_batch)
     prompt_cache_len = tl.load(B_Prompt_Cache_Len + cur_batch)
     context_len = tl.load(B_Seqlen + cur_batch)
@@ -413,6 +434,7 @@ def _prefill_probability_from_lse_kernel(
     offs_n = tl.arange(0, BLOCK_N)
     local_head = cur_head_block * BLOCK_H + offs_rows // BLOCK_M
     q_head = cur_kv_head * H_PER_KV + local_head
+    row_head_in_block = offs_rows // BLOCK_M
     kv_pos = cur_n_block * BLOCK_N + offs_n
     kv_in_output = kv_pos < SCORE_WIDTH
     kv_valid = kv_pos < context_len
@@ -431,6 +453,7 @@ def _prefill_probability_from_lse_kernel(
         mask=kv_valid[None, :],
         other=0.0,
     )
+    score_q_len = tl.maximum(score_q_end - score_q_start, 1)
     q_abs_pos = (
         score_q_start
         + cur_query_block * BLOCK_M
@@ -465,52 +488,62 @@ def _prefill_probability_from_lse_kernel(
         tl.exp(logits - row_lse[:, None]),
         0.0,
     )
-    token_score = tl.sum(probabilities, axis=0)
-    tl.store(
-        Partial_Score
-        + cur_batch * stride_psb
-        + partial_group * stride_psg
-        + kv_pos * stride_psl,
-        token_score,
-        mask=kv_in_output,
-    )
+
+    token_score = tl.zeros([BLOCK_N], dtype=tl.float32)
+    for head_idx in tl.static_range(0, BLOCK_H):
+        head_rows = row_head_in_block == head_idx
+        head_score = tl.sum(
+            tl.where(head_rows[:, None], probabilities, 0.0), axis=0
+        ) / (score_q_len * 1.0)
+        if WRITE_PER_HEAD:
+            output_local_head = cur_head_block * BLOCK_H + head_idx
+            output_head = cur_kv_head * H_PER_KV + output_local_head
+            tl.atomic_add(
+                Head_Score
+                + cur_batch * stride_hsb
+                + output_head * stride_hsh
+                + kv_pos * stride_hsl,
+                head_score,
+                mask=kv_in_output & (output_local_head < H_PER_KV),
+            )
+        else:
+            token_score = tl.maximum(token_score, head_score)
+    if not WRITE_PER_HEAD:
+        tl.atomic_max(
+            Attn_Score + cur_batch * stride_asb + kv_pos * stride_asl,
+            token_score,
+            mask=kv_in_output,
+        )
 
 
 @triton.jit
-def _prefill_probability_reduce_kernel(
-    Partial_Score,
+def _prefill_probability_head_reduce_kernel(
+    Head_Score,
     Attn_Score,
-    Score_Q_Start,
-    Score_Q_End,
-    stride_psb,
-    stride_psg,
-    stride_psl,
+    stride_hsb,
+    stride_hsh,
+    stride_hsl,
     stride_asb,
     stride_asl,
-    PARTIAL_GROUPS: tl.constexpr,
-    REDUCE_GROUPS: tl.constexpr,
+    QUERY_HEADS: tl.constexpr,
+    REDUCE_HEADS: tl.constexpr,
     SCORE_WIDTH: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
     kv_pos = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
-    groups = tl.arange(0, REDUCE_GROUPS)
-    values = tl.load(
-        Partial_Score
-        + cur_batch * stride_psb
-        + groups[:, None] * stride_psg
-        + kv_pos[None, :] * stride_psl,
-        mask=(groups[:, None] < PARTIAL_GROUPS) & (kv_pos[None, :] < SCORE_WIDTH),
+    heads = tl.arange(0, REDUCE_HEADS)
+    scores = tl.load(
+        Head_Score
+        + cur_batch * stride_hsb
+        + heads[:, None] * stride_hsh
+        + kv_pos[None, :] * stride_hsl,
+        mask=(heads[:, None] < QUERY_HEADS) & (kv_pos[None, :] < SCORE_WIDTH),
         other=0.0,
-    )
-    score_q_len = tl.maximum(
-        tl.load(Score_Q_End + cur_batch)
-        - tl.load(Score_Q_Start + cur_batch),
-        1,
     )
     tl.store(
         Attn_Score + cur_batch * stride_asb + kv_pos * stride_asl,
-        tl.sum(values, axis=0) / (score_q_len * 1.0),
+        tl.max(scores, axis=0),
         mask=kv_pos < SCORE_WIDTH,
     )
 
@@ -692,6 +725,9 @@ def prefill_score_fwd(
     if score_mode == "logits":
         block_m = min(32, max(16, triton.next_power_of_2(max_score_len)))
         query_blocks = triton.cdiv(max_score_len, block_m)
+    elif max_score_len <= 128:
+        block_m = max(16, triton.next_power_of_2(max_score_len))
+        query_blocks = 1
     else:
         block_m = min(32, max(16, triton.next_power_of_2(max_score_len)))
         query_blocks = triton.cdiv(max_score_len, block_m)
@@ -765,6 +801,23 @@ def prefill_score_fwd(
         reduce_rows //= 2
 
     workspace = PrefillScoreWorkspace() if workspace is None else workspace
+    write_per_head = query_blocks > 1
+    if write_per_head:
+        head_score = workspace.probability_head_score_buffer(
+            batch_size=batch,
+            query_heads=head,
+            score_width=max_candidate_end,
+            device=q.device,
+        )
+        head_score.zero_()
+        head_score_strides = head_score.stride()
+    else:
+        head_score = attn_score
+        head_score_strides = (
+            attn_score.stride(0),
+            0,
+            attn_score.stride(1),
+        )
     partial_m, partial_l, global_m, global_l = workspace.probability_buffers(
         group_count=group_count,
         candidate_blocks=candidate_blocks,
@@ -826,6 +879,7 @@ def prefill_score_fwd(
         q,
         k,
         attn_score,
+        head_score,
         global_m,
         global_l,
         b_seq_len,
@@ -844,12 +898,14 @@ def prefill_score_fwd(
         k.stride(2),
         attn_score.stride(0),
         attn_score.stride(1),
+        *head_score_strides,
         req_to_token_indexs.stride(0),
         req_to_token_indexs.stride(1),
         H_PER_KV=kv_group_num,
         H_KV=kv_head,
         HEAD_BLOCKS=head_blocks,
         QUERY_BLOCKS=query_blocks,
+        WRITE_PER_HEAD=write_per_head,
         USE_BATCH_INDICES=batch_indices is not None,
         candidate_start=int(candidate_start),
         recent_keep_tokens=int(recent_keep_tokens),
@@ -863,6 +919,20 @@ def prefill_score_fwd(
         num_warps=dot_warps,
         num_stages=3,
     )
+    if write_per_head:
+        reduce_heads = triton.next_power_of_2(head)
+        _prefill_probability_head_reduce_kernel[(batch, candidate_blocks)](
+            head_score,
+            attn_score,
+            *head_score.stride(),
+            *attn_score.stride(),
+            QUERY_HEADS=head,
+            REDUCE_HEADS=reduce_heads,
+            SCORE_WIDTH=max_candidate_end,
+            BLOCK_N=block_n,
+            num_warps=8 if reduce_heads >= 64 else 4,
+            num_stages=3,
+        )
 
 
 @torch.no_grad()
@@ -930,8 +1000,12 @@ def prefill_score_from_lse_fwd(
             f"Query heads must be divisible by KV heads: {query_heads}/{kv_heads}."
         )
     heads_per_kv = query_heads // kv_heads
-    block_m = min(32, max(16, triton.next_power_of_2(max_score_len)))
-    query_blocks = triton.cdiv(max_score_len, block_m)
+    if max_score_len <= 128:
+        block_m = max(16, triton.next_power_of_2(max_score_len))
+        query_blocks = 1
+    else:
+        block_m = min(32, max(16, triton.next_power_of_2(max_score_len)))
+        query_blocks = triton.cdiv(max_score_len, block_m)
     block_n = 64 if head_dim >= 128 else 128
     candidate_blocks = triton.cdiv(int(attn_score.shape[1]), block_n)
     max_rows = 256
@@ -941,20 +1015,32 @@ def prefill_score_from_lse_fwd(
     )
     head_blocks = triton.cdiv(heads_per_kv, block_h)
     block_rows = block_h * block_m
-    partial_groups = kv_heads * head_blocks * query_blocks
-    group_count = batch * partial_groups
+    group_count = batch * kv_heads * head_blocks * query_blocks
     workspace = PrefillScoreWorkspace() if workspace is None else workspace
-    partial_score = workspace.probability_score_buffer(
-        batch_size=batch,
-        partial_groups=partial_groups,
-        score_width=int(attn_score.shape[1]),
-        device=q.device,
-    )
+    write_per_head = query_blocks > 1
+    if write_per_head:
+        head_score = workspace.probability_head_score_buffer(
+            batch_size=batch,
+            query_heads=query_heads,
+            score_width=int(attn_score.shape[1]),
+            device=q.device,
+        )
+        head_score.zero_()
+        head_score_strides = head_score.stride()
+    else:
+        head_score = attn_score
+        head_score_strides = (
+            attn_score.stride(0),
+            0,
+            attn_score.stride(1),
+        )
+    attn_score.zero_()
     _prefill_probability_from_lse_kernel[(group_count, candidate_blocks)](
         q,
         k,
         attention_lse,
-        partial_score,
+        attn_score,
+        head_score,
         b_seq_len,
         req_to_token_indexs,
         b_req_idx,
@@ -970,15 +1056,16 @@ def prefill_score_from_lse_fwd(
         k.stride(2),
         attention_lse.stride(0),
         attention_lse.stride(1),
-        partial_score.stride(0),
-        partial_score.stride(1),
-        partial_score.stride(2),
+        attn_score.stride(0),
+        attn_score.stride(1),
+        *head_score_strides,
         req_to_token_indexs.stride(0),
         req_to_token_indexs.stride(1),
         H_PER_KV=heads_per_kv,
         H_KV=kv_heads,
         HEAD_BLOCKS=head_blocks,
         QUERY_BLOCKS=query_blocks,
+        WRITE_PER_HEAD=write_per_head,
         SCORE_WIDTH=int(attn_score.shape[1]),
         sm_scale=float(head_dim) ** -0.5,
         BLOCK_H=block_h,
@@ -989,18 +1076,17 @@ def prefill_score_from_lse_fwd(
         num_warps=8 if block_rows >= 128 else 4,
         num_stages=3,
     )
-    reduce_groups = triton.next_power_of_2(partial_groups)
-    _prefill_probability_reduce_kernel[(batch, candidate_blocks)](
-        partial_score,
-        attn_score,
-        score_q_start,
-        score_q_end,
-        *partial_score.stride(),
-        *attn_score.stride(),
-        PARTIAL_GROUPS=partial_groups,
-        REDUCE_GROUPS=reduce_groups,
-        SCORE_WIDTH=int(attn_score.shape[1]),
-        BLOCK_N=block_n,
-        num_warps=8 if reduce_groups >= 64 else 4,
-        num_stages=3,
-    )
+    if write_per_head:
+        reduce_heads = triton.next_power_of_2(query_heads)
+        _prefill_probability_head_reduce_kernel[(batch, candidate_blocks)](
+            head_score,
+            attn_score,
+            *head_score.stride(),
+            *attn_score.stride(),
+            QUERY_HEADS=query_heads,
+            REDUCE_HEADS=reduce_heads,
+            SCORE_WIDTH=int(attn_score.shape[1]),
+            BLOCK_N=block_n,
+            num_warps=8 if reduce_heads >= 64 else 4,
+            num_stages=3,
+        )
