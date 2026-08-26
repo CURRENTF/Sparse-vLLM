@@ -762,7 +762,7 @@ class SnapKVCacheManager(CacheManager):
             )
         return int(self.row_seq_lens[int(layer_idx)][row_idx])
 
-    def decode_cuda_graph_context_capacity(
+    def decode_graph_context_capacity(
         self,
         seqs: list[Sequence],
         *,
@@ -776,9 +776,9 @@ class SnapKVCacheManager(CacheManager):
         # then grows without eviction.  Bucket graphs by the physical upper
         # bound instead of the much larger logical conversation length.
         physical_budget = (
-            int(self.config.num_sink_tokens)
+            int(self.config.sink_keep_tokens)
             + int(self.config.decode_keep_tokens)
-            + int(self.config.num_recent_tokens)
+            + int(self.config.recent_keep_tokens)
         )
         max_generation = max(int(seq.max_tokens) for seq in seqs)
         return physical_budget + max_generation, True

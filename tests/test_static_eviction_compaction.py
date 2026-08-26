@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from sparsevllm.config import RuntimeLayout
+from sparsevllm.configs.groups import SparseMethodConfig
 from sparsevllm.engine.cache_manager.h2o import H2OCacheManager
 from sparsevllm.engine.cache_manager.rkv import RKVCacheManager
 from sparsevllm.engine.cache_manager.skipkv import (
@@ -16,6 +17,7 @@ from sparsevllm.engine.cache_manager.skipkv import (
     SkipKVSequenceState,
 )
 from sparsevllm.engine.cache_manager.snapkv import SnapKVCacheManager
+from sparsevllm.engine.decode_cuda_graph import DecodeCudaGraphRunner
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.engine.sparse_controller import SparseController
 
@@ -31,24 +33,32 @@ def _sequences(lengths: list[int]) -> list[Sequence]:
     return seqs
 
 
-def test_snapkv_graph_capacity_uses_physical_budget_not_logical_context():
+def test_snapkv_graph_runner_uses_physical_budget_not_logical_context():
     manager = object.__new__(SnapKVCacheManager)
-    manager.config = SimpleNamespace(
+    manager.config = SparseMethodConfig(
         sparse_method="snapkv",
-        num_sink_tokens=64,
+        sink_keep_tokens=64,
         decode_keep_tokens=8064,
-        num_recent_tokens=64,
+        recent_keep_tokens=64,
     )
     seqs = [
-        SimpleNamespace(max_tokens=4096),
-        SimpleNamespace(max_tokens=1024),
+        SimpleNamespace(
+            num_prompt_tokens=65536,
+            num_tokens=65536,
+            max_tokens=4096,
+        ),
+        SimpleNamespace(
+            num_prompt_tokens=32768,
+            num_tokens=32768,
+            max_tokens=1024,
+        ),
     ]
+    runner = object.__new__(DecodeCudaGraphRunner)
+    runner.cache_manager = manager
+    runner.context_sizes = [32768, 65536, 131072]
+    runner.max_context_len_override = None
 
-    capacity, allow_larger = manager.decode_cuda_graph_context_capacity(
-        seqs,
-        requested_context_capacity=131072,
-        current_context_capacity=65536,
-    )
+    capacity, allow_larger = runner._graph_context_capacity_policy(seqs)
 
     assert capacity == 12288
     assert allow_larger is True
