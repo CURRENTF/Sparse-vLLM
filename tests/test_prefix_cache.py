@@ -2438,6 +2438,20 @@ def test_quest_attach_pins_pages_and_free_seq_keeps_cached_page():
     assert reused.tolist() == [10]
 
 
+def test_quest_prefill_replaces_stale_decode_graph_context_capacity():
+    """Catches post-capture prefill reusing decode-only context metadata."""
+
+    manager = _make_quest_manager_for_prefix(page_size=2)
+    manager.layer_batch_state.max_context_len = 4672
+    seq = Sequence([1, 2, 3, 4])
+    seq.current_chunk_size = 4
+
+    manager.prepare_step([seq], is_prefill=True)
+
+    assert manager.layer_batch_state.context_lens.tolist() == [4]
+    assert manager.layer_batch_state.max_context_len == 4
+
+
 def test_quest_free_seq_starts_atomic_write_through_after_last_release():
     manager = _make_quest_manager_for_prefix(page_size=2)
     controller = _FakePrefixOffloadController(manager.prefix_cache)

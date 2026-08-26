@@ -1599,6 +1599,7 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
 
             self.layer_batch_state.slot_mapping = slot_mapping
             self.layer_batch_state.context_lens = context_lens
+            self.layer_batch_state.max_context_len = max(context_lens_list, default=0)
             self.layer_batch_state.req_indices = req_indices_tensor
             self._prefill_metadata_full_pages = bool(metadata_full_pages)
 
