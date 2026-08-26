@@ -601,6 +601,18 @@ def test_snapkv_resumed_prefill_score_uses_physical_coordinates():
     assert rows == [(0, seq, 22, 30)]
 
 
+def test_snapkv_reset_after_warmup_releases_rank_local_rows_without_scheduler_state():
+    manager = object.__new__(SnapKVCacheManager)
+    manager.kv_transformer_layer_indices = lambda: [0, 1]
+    manager.seq_id_to_row = [{12: 0, 11: 1}, {11: 0, 12: 1}]
+    freed = []
+    manager.free_seq = lambda seq_id: freed.append(int(seq_id))
+
+    manager.reset_after_warmup()
+
+    assert freed == [11, 12]
+
+
 def test_snapkv_resumed_prefill_skips_score_below_physical_budget():
     manager = object.__new__(SnapKVCacheManager)
     manager.config = SimpleNamespace(

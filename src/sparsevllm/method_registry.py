@@ -188,7 +188,7 @@ QWEN35_MOE_COMPATIBILITY = ModelRuntimeCompatibility(
 
 MINIMAX_M2_EP_COMPATIBILITY = ModelRuntimeCompatibility(
     sparse_methods=_MOE_SPARSE_METHODS,
-    prefix_cache_methods=frozenset({"", "omnikv", "quest"}),
+    prefix_cache_methods=frozenset({"", "omnikv", "quest", "snapkv"}),
     decode_cuda_graph_methods=_MOE_SPARSE_METHODS,
 )
 

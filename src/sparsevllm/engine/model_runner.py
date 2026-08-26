@@ -131,6 +131,7 @@ PREFIX_CACHE_CONTROL_RPC_METHODS = {
     "prefix_cache_set_eviction_priority",
 }
 RECOVERABLE_TP_CONTROL_RPC_METHODS = PREFIX_CACHE_CONTROL_RPC_METHODS | {
+    "chain_validate_admission_plan",
     "finish_slots_batch",
     "free_multimodal",
     "free_slots",
@@ -368,7 +369,11 @@ class ModelRunner:
             self.config.decode_cuda_graph_context_sizes,
             self.config.max_model_len,
         )
-        self.cuda_graph_pool = torch.cuda.graph_pool_handle() if self.config.decode_cuda_graph else None
+        # Decode graph keys are captured lazily and replayed in workload order,
+        # which is not necessarily their capture order.  Do not force those
+        # independent graphs into one shared allocator pool: PyTorch only
+        # permits pool sharing when replay follows capture order.
+        self.cuda_graph_pool = None
         self.decode_cuda_graph_runner = DecodeCudaGraphRunner(
             runtime_state=self.runtime_state,
             cache_manager=self.cache_manager,
