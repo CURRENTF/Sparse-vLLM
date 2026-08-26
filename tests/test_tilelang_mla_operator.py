@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import subprocess
 import sys
 from importlib import metadata
@@ -16,13 +17,15 @@ from sparsevllm.engine.cache_manager import (
 )
 from sparsevllm.kernels.tilelang.mla.runtime import (
     TileMlaDecodeKernel,
+    TileMlaLaunchConfig,
+    TileMlaLaunchPlan,
     tilelang_mla_support,
 )
 from sparsevllm.kernels.triton.mla import MlaDecodeWorkspace
+from sparsevllm.operators.attention_capabilities import AttentionScoreKind
 from sparsevllm.operators.mla_attention import (
     MLA_ATTENTION_REGISTRY,
     MlaAttentionOpSpec,
-    MlaSglFa3Provider,
     MlaTileLangScoreProvider,
     MlaTritonProvider,
 )
@@ -41,7 +44,8 @@ def _spec(*, tp_size: int = 2) -> MlaAttentionOpSpec:
         cache_dtype=torch.bfloat16,
         tp_size=tp_size,
         cuda_graph=True,
-        may_require_attention_scores=True,
+        score_output=AttentionScoreKind.RAW_QK_PER_HEAD,
+        context_capacity=65536,
     )
 
 
@@ -206,11 +210,16 @@ def test_tilelang_provider_binds_rank_local_head_count(
             max_batch_size=2,
         )
 
-    tilelang_cls.assert_called_once_with(
-        device=torch.device("cpu"),
-        softmax_scale=256**-0.5,
-        valid_heads=local_heads,
-    )
+    tilelang_cls.assert_called_once()
+    kwargs = tilelang_cls.call_args.kwargs
+    assert kwargs["device"] == torch.device("cpu")
+    assert kwargs["softmax_scale"] == 256**-0.5
+    assert kwargs["valid_heads"] == local_heads
+    plan = kwargs["launch_plan"]
+    assert isinstance(plan, TileMlaLaunchPlan)
+    assert plan.context_capacity == 65536
+    assert plan.local_q_heads == local_heads
+    assert all(config.score_mode == "per_head" for config in plan.configs)
 
 
 def test_missing_tilelang_binds_score_capable_triton_provider() -> None:
@@ -311,9 +320,83 @@ def test_tilelang_mla_exact_h100_profile_overrides_default_portfolio() -> None:
     assert resolved.report.selection_basis == "profile_override"
 
 
+def test_batch_only_score_contract_binds_static_tilelang_plan() -> None:
+    spec = replace(
+        _spec(),
+        batch_only_cuda_graph=True,
+    )
+    workspace = _cpu_workspace()
+    with (
+        patch(
+            "sparsevllm.operators.mla_attention.sgl_fa3_device_support",
+            return_value=(True, "sgl test"),
+        ),
+        patch("sparsevllm.operators.mla_attention.SglFa3DecodeKernel"),
+        patch("sparsevllm.operators.mla_attention.TileMlaDecodeKernel"),
+        patch(
+            "sparsevllm.operators.mla_attention.tilelang_mla_support",
+            return_value=(True, "tilelang test"),
+        ),
+        patch(
+            "sparsevllm.operators.mla_attention.allocate_mla_decode_workspace",
+            return_value=workspace,
+        ),
+    ):
+        resolved = OpResolver(MLA_ATTENTION_REGISTRY).resolve(
+            spec,
+            _h100_caps(),
+            op_spec=spec,
+            device="cpu",
+            max_batch_size=2,
+        )
+
+    assert type(resolved.provider) is MlaTileLangScoreProvider
+    assert resolved.provider.supports_batch_only_cuda_graph
+    assert resolved.provider.tilelang_launch_plan.context_capacity == 65536
+
+
+def test_batch_only_reduced_score_contract_binds_static_triton_provider() -> None:
+    spec = replace(
+        _spec(),
+        score_output=AttentionScoreKind.RAW_QK_REDUCED,
+        batch_only_cuda_graph=True,
+    )
+    with (
+        patch(
+            "sparsevllm.operators.mla_attention.sgl_fa3_device_support",
+            return_value=(True, "sgl test"),
+        ),
+        patch(
+            "sparsevllm.operators.mla_attention.tilelang_mla_support",
+            return_value=(True, "tilelang test"),
+        ),
+        patch(
+            "sparsevllm.operators.mla_attention.allocate_mla_decode_workspace",
+            return_value=_cpu_workspace(),
+        ),
+    ):
+        resolved = OpResolver(MLA_ATTENTION_REGISTRY).resolve(
+            spec,
+            _h100_caps(),
+            op_spec=spec,
+            device="cpu",
+            max_batch_size=2,
+        )
+
+    assert type(resolved.provider) is MlaTritonProvider
+    assert (
+        "tilelang_score_sgl_fa3_h100",
+        "requires the RAW_QK_PER_HEAD decode score contract",
+    ) in resolved.rejected
+
+
 def _provider_with_mocks() -> tuple[MlaTileLangScoreProvider, Mock, Mock]:
     fa3 = Mock(return_value=torch.empty(2, 10, 512, dtype=torch.bfloat16))
     tilelang = Mock(return_value=torch.empty(2, 10, 512, dtype=torch.bfloat16))
+    tilelang.runtime_metadata.return_value = {
+        "compiled_variant_count": 1,
+        "compiled_variants": [],
+    }
     with (
         patch(
             "sparsevllm.operators.mla_attention.allocate_mla_decode_workspace",
@@ -336,9 +419,9 @@ def _provider_with_mocks() -> tuple[MlaTileLangScoreProvider, Mock, Mock]:
     return provider, fa3, tilelang
 
 
-def test_score_path_routes_to_tilelang_with_caller_owned_score() -> None:
+def test_per_head_score_path_routes_to_tilelang_with_caller_owned_score() -> None:
     provider, fa3, tilelang = _provider_with_mocks()
-    score = torch.full((2, 64), -1e20, dtype=torch.float32)
+    score = torch.full((2, 10, 64), -1e20, dtype=torch.float32)
     view = _view(score=score)
     q_latent = torch.empty(2, 10, 512, dtype=torch.bfloat16)
     q_rope = torch.empty(2, 10, 64, dtype=torch.bfloat16)
@@ -370,12 +453,16 @@ def test_score_path_routes_to_tilelang_with_caller_owned_score() -> None:
             }
         },
         "fallback_reasons": {},
+        "tilelang": {
+            "compiled_variant_count": 1,
+            "compiled_variants": [],
+        },
     }
 
 
 def test_noncontiguous_glm_queries_route_to_tilelang() -> None:
     provider, fa3, tilelang = _provider_with_mocks()
-    score = torch.full((2, 64), -1e20, dtype=torch.float32)
+    score = torch.full((2, 10, 64), -1e20, dtype=torch.float32)
     view = _view(score=score)
     q_latent = torch.empty(10, 2, 512, dtype=torch.bfloat16).transpose(0, 1)
     q_rope = torch.empty(10, 2, 64, dtype=torch.bfloat16).transpose(0, 1)
@@ -394,7 +481,7 @@ def test_noncontiguous_glm_queries_route_to_tilelang() -> None:
 
 def test_runtime_kernel_stats_distinguish_cuda_graph_capture() -> None:
     provider, _, tilelang = _provider_with_mocks()
-    view = _view(score=torch.empty(2, 64, dtype=torch.float32))
+    view = _view(score=torch.empty(2, 10, 64, dtype=torch.float32))
     q_latent = torch.empty(2, 10, 512, dtype=torch.bfloat16)
     q_rope = torch.empty(2, 10, 64, dtype=torch.bfloat16)
     output = torch.empty_like(q_latent)
@@ -435,51 +522,50 @@ def test_no_score_path_remains_fa3() -> None:
 
 
 @pytest.mark.parametrize(
-    "score",
+    ("score", "message"),
     [
-        torch.empty(2, 10, 64, dtype=torch.float32),
-        torch.empty(2, 64, dtype=torch.bfloat16),
-        torch.empty(2, 63, dtype=torch.float32),
+        (torch.empty(2, 64, dtype=torch.float32), "RAW_QK_PER_HEAD"),
+        (torch.empty(2, 10, 64, dtype=torch.bfloat16), "must use FP32"),
+        (torch.empty(2, 9, 64, dtype=torch.float32), "head count"),
     ],
 )
-def test_unsupported_score_contract_uses_explicit_triton_path(score) -> None:
+def test_unsupported_score_contract_fails_instead_of_falling_back(
+    score,
+    message: str,
+) -> None:
     provider, fa3, tilelang = _provider_with_mocks()
     view = _view(score=score)
     q_latent = torch.empty(2, 10, 512, dtype=torch.bfloat16)
     q_rope = torch.empty(2, 10, 64, dtype=torch.bfloat16)
     output = torch.empty_like(q_latent)
 
-    with patch.object(
-        MlaSglFa3Provider.__mro__[1], "run", return_value=output
-    ) as triton:
+    with pytest.raises((TypeError, ValueError), match=message):
         provider.run(q_latent, q_rope, view, output)
 
     fa3.assert_not_called()
     tilelang.assert_not_called()
-    triton.assert_called_once()
+    assert provider.runtime_kernel_stats()["fallback_reasons"] == {}
 
 
-def test_score_capacity_smaller_than_declared_context_uses_triton() -> None:
+def test_score_capacity_smaller_than_declared_context_fails() -> None:
     provider, fa3, tilelang = _provider_with_mocks()
-    view = _view(score=torch.empty(2, 64, dtype=torch.float32))
+    view = _view(score=torch.empty(2, 10, 64, dtype=torch.float32))
     object.__setattr__(view.meta, "max_context_len", 128)
     q_latent = torch.empty(2, 10, 512, dtype=torch.bfloat16)
     q_rope = torch.empty(2, 10, 64, dtype=torch.bfloat16)
     output = torch.empty_like(q_latent)
 
-    with patch.object(
-        MlaSglFa3Provider.__mro__[1], "run", return_value=output
-    ) as triton:
+    with pytest.raises(ValueError, match="must cover max_context_len"):
         provider.run(q_latent, q_rope, view, output)
 
     fa3.assert_not_called()
     tilelang.assert_not_called()
-    triton.assert_called_once()
+    assert provider.runtime_kernel_stats()["fallback_reasons"] == {}
 
 
-def test_score_capacity_larger_than_active_slots_uses_triton() -> None:
+def test_score_capacity_may_include_padding_beyond_active_slots() -> None:
     provider, fa3, tilelang = _provider_with_mocks()
-    view = _view(score=torch.empty(2, 64, dtype=torch.float32))
+    view = _view(score=torch.empty(2, 10, 64, dtype=torch.float32))
     object.__setattr__(
         view.meta,
         "active_slots",
@@ -490,52 +576,59 @@ def test_score_capacity_larger_than_active_slots_uses_triton() -> None:
     q_rope = torch.empty(2, 10, 64, dtype=torch.bfloat16)
     output = torch.empty_like(q_latent)
 
-    with patch.object(
-        MlaSglFa3Provider.__mro__[1], "run", return_value=output
-    ) as triton:
+    with patch(
+        "sparsevllm.operators.mla_attention.validate_mla_decode_metadata"
+    ):
         provider.run(q_latent, q_rope, view, output)
 
     fa3.assert_not_called()
-    tilelang.assert_not_called()
-    triton.assert_called_once()
+    tilelang.assert_called_once()
 
 
-@pytest.mark.parametrize("noncontiguous", ["active_slots", "attn_score"])
-def test_noncontiguous_tilelang_inputs_use_triton(noncontiguous: str) -> None:
+def test_noncontiguous_active_slots_fail_instead_of_falling_back() -> None:
     provider, fa3, tilelang = _provider_with_mocks()
-    score = torch.empty(2, 128, dtype=torch.float32)[:, ::2]
-    view = _view(
-        score=(
-            score
-            if noncontiguous == "attn_score"
-            else torch.empty(2, 64, dtype=torch.float32)
-        )
-    )
-    if noncontiguous == "active_slots":
-        backing = torch.full((3, 128), -1, dtype=torch.int32)
-        backing[2, :6:2] = torch.tensor([5, 2, 7], dtype=torch.int32)
-        object.__setattr__(view.meta, "active_slots", backing[:, ::2])
+    view = _view(score=torch.empty(2, 10, 64, dtype=torch.float32))
+    backing = torch.full((3, 128), -1, dtype=torch.int32)
+    backing[2, :6:2] = torch.tensor([5, 2, 7], dtype=torch.int32)
+    object.__setattr__(view.meta, "active_slots", backing[:, ::2])
     q_latent = torch.empty(2, 10, 512, dtype=torch.bfloat16)
     q_rope = torch.empty(2, 10, 64, dtype=torch.bfloat16)
     output = torch.empty_like(q_latent)
 
-    with patch.object(
-        MlaSglFa3Provider.__mro__[1], "run", return_value=output
-    ) as triton:
+    with pytest.raises(ValueError, match="noncontiguous:active_slots"):
         provider.run(q_latent, q_rope, view, output)
 
     fa3.assert_not_called()
     tilelang.assert_not_called()
-    triton.assert_called_once()
-    assert provider.runtime_kernel_stats()["fallback_reasons"] == {
-        f"noncontiguous:{noncontiguous}": 1
-    }
+    assert provider.runtime_kernel_stats()["fallback_reasons"] == {}
 
 
-def test_tilelang_runner_rejects_unaligned_score_capacity_before_import() -> None:
-    runner = TileMlaDecodeKernel(device="cpu", softmax_scale=0.0625)
-    view = _view(score=torch.empty(2, 63, dtype=torch.float32))
-    with pytest.raises(ValueError, match="multiple of 64"):
+def test_noncontiguous_per_head_score_routes_to_tilelang_staging() -> None:
+    provider, fa3, tilelang = _provider_with_mocks()
+    score = torch.empty(2, 10, 128, dtype=torch.float32)[:, :, ::2]
+    view = _view(score=score)
+    q_latent = torch.empty(2, 10, 512, dtype=torch.bfloat16)
+    q_rope = torch.empty(2, 10, 64, dtype=torch.bfloat16)
+    output = torch.empty_like(q_latent)
+
+    with patch(
+        "sparsevllm.operators.mla_attention.validate_mla_decode_metadata"
+    ):
+        provider.run(q_latent, q_rope, view, output)
+
+    fa3.assert_not_called()
+    tilelang.assert_called_once()
+    assert tilelang.call_args.kwargs["attn_score"] is score
+
+
+def test_tilelang_runner_rejects_score_capacity_smaller_than_context() -> None:
+    runner = TileMlaDecodeKernel(
+        device="cpu",
+        softmax_scale=0.0625,
+        fixed_config=TileMlaLaunchConfig(1, score_mode="per_head"),
+    )
+    view = _view(score=torch.empty(2, 10, 63, dtype=torch.float32))
+    with pytest.raises(ValueError, match="must fit"):
         runner(
             torch.empty(2, 10, 512, dtype=torch.bfloat16),
             torch.empty(2, 10, 64, dtype=torch.bfloat16),
@@ -546,7 +639,7 @@ def test_tilelang_runner_rejects_unaligned_score_capacity_before_import() -> Non
             view.meta.context_lens,
             torch.empty(2, 10, 512, dtype=torch.bfloat16),
             attn_score=view.meta.attn_score,
-            max_context_len=63,
+            max_context_len=64,
         )
 
 

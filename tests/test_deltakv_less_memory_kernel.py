@@ -21,6 +21,9 @@ from sparsevllm.kernels.triton.gqa_flash_decoding_stage1 import flash_decode_sta
 from sparsevllm.kernels.triton.gqa_flash_decoding_stage1 import (
     flash_decode_stage1_with_score as gqa_flash_decode_stage1_with_score,
 )
+from sparsevllm.kernels.triton.paged_flash_decoding import (
+    fixed_grid_flash_decode_stage2,
+)
 from sparsevllm.kernels.triton.quant import (
     triton_dequantize_2d_int4_grouped,
     triton_quantize_and_pack_2d_int4_grouped,
@@ -1267,6 +1270,107 @@ class DeltaKVLessMemoryKernelTest(unittest.TestCase):
         self.assertTrue(torch.allclose(mid_token_group, mid_ref, atol=3e-2, rtol=3e-2))
         self.assertTrue(torch.allclose(lse_token_group, lse_ref, atol=3e-2, rtol=3e-2))
         self.assertTrue(torch.allclose(score_token_group, score_ref, atol=3e-2, rtol=3e-2))
+
+        max_kv_splits = 4
+        target_tokens_per_split = 16
+        mid_fixed = torch.empty(
+            (batch, num_heads, max_kv_splits, head_dim),
+            device=device,
+            dtype=torch.float32,
+        )
+        lse_fixed = torch.empty(
+            (batch, num_heads, max_kv_splits),
+            device=device,
+            dtype=torch.float32,
+        )
+        out_fixed = torch.empty_like(q)
+        out_lse_fixed = torch.empty(
+            (num_heads, batch),
+            device=device,
+            dtype=torch.float32,
+        )
+        score_fixed = torch.full_like(score_ref, -1e20)
+
+        def run_fixed_grid():
+            full_layer_kivi_flash_decode_stage1(
+                q=q,
+                raw_k=raw_k,
+                raw_v=raw_v,
+                raw_slots_map=raw_slots_map,
+                kivi_block_slots_map=kivi_block_slots_map,
+                kivi_block_start_pos=kivi_block_start_pos,
+                key_packed=key_packed,
+                key_scales=key_scales,
+                key_mins=key_mins,
+                value_packed=value_packed,
+                value_scales=value_scales,
+                value_mins=value_mins,
+                req_indices=req_indices,
+                context_lens=context_lens,
+                max_len_in_batch=seq_len,
+                mid_out=mid_fixed,
+                mid_out_logsumexp=lse_fixed,
+                group_size=group_size,
+                block_seq=block_seq,
+                attn_score=score_fixed,
+                max_kv_splits=max_kv_splits,
+                target_tokens_per_split=target_tokens_per_split,
+            )
+            fixed_grid_flash_decode_stage2(
+                mid_fixed,
+                lse_fixed,
+                context_lens,
+                out_fixed,
+                out_lse_fixed,
+                target_tokens_per_split=target_tokens_per_split,
+            )
+
+        run_fixed_grid()
+        torch.cuda.synchronize()
+        output_ptr = out_fixed.data_ptr()
+        workspace_ptrs = (mid_fixed.data_ptr(), lse_fixed.data_ptr())
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run_fixed_grid()
+
+        context_lens.copy_(
+            torch.tensor([17, seq_len], device=device, dtype=torch.int32)
+        )
+        q.copy_(torch.randn_like(q))
+        graph.replay()
+        torch.cuda.synchronize()
+
+        expected = torch.empty_like(q)
+        for batch_idx, length in enumerate(context_lens.tolist()):
+            keys = dense_k[
+                batch_idx * seq_len : batch_idx * seq_len + length
+            ].repeat_interleave(num_heads // num_kv_heads, dim=1)
+            values = dense_v[
+                batch_idx * seq_len : batch_idx * seq_len + length
+            ].repeat_interleave(num_heads // num_kv_heads, dim=1)
+            logits = torch.einsum(
+                "hd,lhd->hl",
+                q[batch_idx].float(),
+                keys.float(),
+            )
+            expected[batch_idx] = torch.einsum(
+                "hl,lhd->hd",
+                (logits / head_dim**0.5).softmax(-1),
+                values.float(),
+            ).to(dtype)
+            torch.testing.assert_close(
+                score_fixed[batch_idx, :, :length],
+                logits,
+                atol=3e-2,
+                rtol=3e-2,
+            )
+
+        torch.testing.assert_close(out_fixed, expected, atol=3e-2, rtol=3e-2)
+        self.assertEqual(out_fixed.data_ptr(), output_ptr)
+        self.assertEqual(
+            (mid_fixed.data_ptr(), lse_fixed.data_ptr()),
+            workspace_ptrs,
+        )
 
     def test_full_layer_kivi_token_map_flash_decode_stage1_matches_dense_stage1(self):
         torch.manual_seed(8)

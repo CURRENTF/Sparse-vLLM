@@ -96,13 +96,14 @@ _PREFILL_POSTHOC_SCORE_METHODS = frozenset(
     {"snapkv", "pyramidkv", "h2o", "rkv"}
 )
 
-# These methods can request a score-producing decode launch on at least one
-# layer or decode step.  The answer is deliberately static so Provider
-# selection happens before CUDA Graph capture and never changes in run().
-_DECODE_ATTENTION_SCORE_METHODS = frozenset(
-    {"pyramidkv", "omnikv", "skipkv", "deltakv"}
-)
-
+# Static method score contracts let providers bind before CUDA Graph capture
+# instead of changing the score-producing implementation during replay.
+_DECODE_ATTENTION_SCORE_KINDS = {
+    "pyramidkv": AttentionScoreKind.RAW_QK_REDUCED,
+    "omnikv": AttentionScoreKind.RAW_QK_PER_HEAD,
+    "skipkv": AttentionScoreKind.RAW_QK_PER_HEAD,
+    "deltakv": AttentionScoreKind.RAW_QK_PER_HEAD,
+}
 
 def sparse_prefill_attention_contract(
     method: str | None,
@@ -146,10 +147,26 @@ def h2o_uses_fused_prefill_score(config) -> bool:
 def sparse_decode_attention_requires_scores(method: str | None) -> bool:
     """Return whether a prepared decode implementation must support scores."""
 
+    return sparse_decode_attention_score_kind(method) is not AttentionScoreKind.NONE
+
+
+def sparse_decode_attention_score_kind(
+    method: str | None,
+) -> AttentionScoreKind:
+    """Return the score representation consumed by sparse decode logic.
+
+    OmniKV, SkipKV, and DeltaKV normalize each head in ``SparseController``
+    before reducing across heads, so providers must preserve raw per-head QK.
+    PyramidKV consumes the existing fused head-reduced raw-QK representation.
+    """
+
     normalized = normalize_sparse_method(method)
     if normalized not in CANONICAL_SPARSE_METHODS:
         raise ValueError(f"Unknown sparse method {normalized!r}.")
-    return normalized in _DECODE_ATTENTION_SCORE_METHODS
+    return _DECODE_ATTENTION_SCORE_KINDS.get(
+        normalized,
+        AttentionScoreKind.NONE,
+    )
 
 
 _MOE_SPARSE_METHODS = frozenset(
@@ -248,6 +265,35 @@ TP_DECODE_CUDA_GRAPH_SUPPORTED_METHODS = {
     "rkv",
     "skipkv",
 }
+
+
+def decode_sparse_long_text_threshold(
+    method: str,
+    *,
+    num_sink_tokens: int,
+    decode_keep_tokens: int,
+    num_recent_tokens: int,
+) -> int:
+    """Return the shared decode boundary between short and sparse graph families."""
+    method = str(method or "")
+    if not method:
+        return 0
+    if method in {"streamingllm", "attention-sink", "attention_sink"}:
+        return int(num_sink_tokens) + int(num_recent_tokens)
+    return (
+        int(num_sink_tokens)
+        + int(decode_keep_tokens)
+        + int(num_recent_tokens)
+    )
+
+
+def decode_graph_path_id(method: str, is_long_text: bool) -> str:
+    """Identify one graph-stable decode topology family."""
+    method = str(method or "")
+    if not method:
+        return "dense"
+    return "long" if is_long_text else "short"
+
 
 _DEFAULT_PREFILL_POLICY_BY_METHOD = {
     "": PREFILL_POLICY_ALL_CHUNKED,

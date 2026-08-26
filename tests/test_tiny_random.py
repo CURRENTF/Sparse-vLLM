@@ -10,6 +10,7 @@ from transformers import Qwen3Config
 from sparsevllm.debug.tiny_random import (
     apply_tiny_random_overrides,
     build_tiny_random_hf_model,
+    initialize_sparse_model,
     load_tiny_random_overrides,
     resolve_tiny_random_settings,
 )
@@ -110,3 +111,25 @@ def test_normal_config_import_does_not_import_tiny_random_module():
         text=True,
     )
     assert completed.returncode == 0, completed.stderr
+
+
+def test_quantized_tiny_random_initializes_fp8_weights_and_scales():
+    class QuantizedModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(
+                torch.empty(128, 128, dtype=torch.float8_e4m3fn),
+                requires_grad=False,
+            )
+            self.register_buffer(
+                "weight_scale_inv",
+                torch.empty(1, 1, dtype=torch.float32),
+            )
+
+    first = QuantizedModel()
+    second = QuantizedModel()
+    initialize_sparse_model(first, None, seed=23, quantized=True)
+    initialize_sparse_model(second, None, seed=23, quantized=True)
+
+    assert torch.equal(first.weight, second.weight)
+    assert torch.equal(first.weight_scale_inv, torch.ones_like(first.weight_scale_inv))

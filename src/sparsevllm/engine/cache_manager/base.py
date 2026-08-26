@@ -12,12 +12,22 @@ import torch.distributed as dist
 
 from sparsevllm.config import Config
 from sparsevllm.distributed import ParallelContext
-from sparsevllm.engine.sequence import Sequence
+from sparsevllm.engine.decode_graph_contract import (
+    CacheDecodeGraphState,
+    DecodeGraphContract,
+    DecodeGraphInputs,
+)
 from sparsevllm.engine.prefill import (
     PREFILL_EXECUTION_CHUNKED,
     PREFILL_EXECUTION_RAW_OFFLOAD,
 )
-from sparsevllm.method_registry import SUPPORTED_SPARSE_METHODS, normalize_sparse_method
+from sparsevllm.engine.sequence import Sequence
+from sparsevllm.method_registry import (
+    SUPPORTED_SPARSE_METHODS,
+    decode_graph_path_id,
+    decode_sparse_long_text_threshold,
+    normalize_sparse_method,
+)
 from sparsevllm.kernels.triton.store_kvcache import store_kvcache
 import sparsevllm.platforms as platforms
 from sparsevllm.models.layout import resolve_attention_qk_head_dim
@@ -626,6 +636,46 @@ class CacheManager(ABC):
             return self._prepare_prefill(seqs)
         return self._prepare_decode(seqs)
 
+    def init_decode_graph_state(
+        self,
+        contract: DecodeGraphContract,
+        inputs: DecodeGraphInputs,
+    ) -> CacheDecodeGraphState:
+        """Bind cache-owned metadata to one graph's stable public inputs."""
+        inputs.validate(contract)
+        return CacheDecodeGraphState(contract=contract, inputs=inputs)
+
+    def prepare_decode_graph_step(
+        self,
+        seqs: list[Sequence],
+        state: CacheDecodeGraphState,
+    ):
+        """Compatibility adapter while method-specific managers migrate."""
+        inputs = state.inputs
+        result = self.prepare_decode_static(
+            seqs,
+            inputs.input_ids,
+            inputs.positions,
+            inputs.write_slot_mapping,
+            inputs.context_lens,
+            inputs.request_indices,
+        )
+        real_batch_size = len(seqs)
+        inputs.active_mask[:real_batch_size].fill_(True)
+        inputs.active_mask[real_batch_size:].fill_(state.contract.padding.active)
+        return result
+
+    def prepare_decode_graph_in(self, state: CacheDecodeGraphState) -> None:
+        """Run fixed device-side cache metadata preparation during capture/replay."""
+        del state
+
+    def decode_graph_state_keepalive_tensors(
+        self,
+        state: CacheDecodeGraphState,
+    ) -> list[torch.Tensor]:
+        del state
+        return self.decode_graph_keepalive_tensors()
+
     @abstractmethod
     def allocate_kv_cache(self):
         """自动计算并物理分配 KV Cache 张量"""
@@ -1111,6 +1161,42 @@ class CacheManager(ABC):
         del seqs, requested_context_capacity, current_context_capacity
         return None
 
+    def decode_graph_path_id(self, is_long_text: bool) -> str:
+        return decode_graph_path_id(
+            str(getattr(self.config, "sparse_method", "") or ""),
+            bool(is_long_text),
+        )
+
+    def decode_graph_batch_only_capacity(
+        self, is_long_text: bool
+    ) -> int:
+        method = str(getattr(self.config, "sparse_method", "") or "")
+        max_model_len = int(self.config.max_model_len)
+        if not method or is_long_text:
+            return max_model_len
+        threshold = decode_sparse_long_text_threshold(
+            method,
+            num_sink_tokens=self.config.sink_keep_tokens,
+            decode_keep_tokens=self.config.decode_keep_tokens,
+            num_recent_tokens=self.config.recent_keep_tokens,
+        )
+        return min(max_model_len, int(threshold))
+
+    def validate_decode_graph_batch_only_capacity(
+        self,
+        seqs: list[Sequence],
+        *,
+        capacity: int,
+        is_long_text: bool,
+    ) -> None:
+        actual = max(int(seq.num_tokens) for seq in seqs)
+        if int(capacity) < actual:
+            raise RuntimeError(
+                "batch-only decode CUDA Graph path capacity does not cover the "
+                f"request: capacity={capacity}, actual={actual}, "
+                f"is_long_text={is_long_text}."
+            )
+
     def decode_graph_force_eager(self) -> bool:
         """Whether this method should bypass graph replay for diagnostics."""
         return False
@@ -1506,6 +1592,13 @@ class CacheManager(ABC):
         """Return a small set of free-slot stats for logging/debugging."""
         return {"free_slots": int(self.num_free_slots)}
 
+    def _debug_token_slots_for_mapping(
+        self,
+        layer_idx: int | None,
+    ) -> torch.Tensor:
+        token_slots = getattr(self, "buffer_req_to_token_slots")
+        return token_slots if layer_idx is None else token_slots[layer_idx]
+
     def debug_state_summary(self) -> dict[str, Any]:
         """Return a synchronized-test snapshot without touching the inference hot path."""
         live_rows = {}
@@ -1519,10 +1612,9 @@ class CacheManager(ABC):
             if not isinstance(mapping, dict) or not mapping:
                 continue
             row_seq_lens = getattr(self, "row_seq_lens")
-            token_slots = getattr(self, "buffer_req_to_token_slots")
+            token_slots = self._debug_token_slots_for_mapping(layer_idx)
             if layer_idx is not None:
                 row_seq_lens = row_seq_lens[layer_idx]
-                token_slots = token_slots[layer_idx]
             records = []
             for seq_id, row_idx in sorted(mapping.items()):
                 row_len = int(row_seq_lens[row_idx])

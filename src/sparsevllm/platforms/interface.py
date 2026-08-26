@@ -37,6 +37,7 @@ class DeviceCaps:
     supports_pin_memory: bool = False
     supports_bfloat16: bool = False
     supports_native_fp8: bool = False
+    multi_processor_count: int | None = None
 
 
 class Platform:

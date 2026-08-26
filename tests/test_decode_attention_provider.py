@@ -5,6 +5,10 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
+from sparsevllm.engine.decode_graph_contract import (
+    DecodeGraphContract,
+    DecodeGraphInputs,
+)
 from sparsevllm.kernels.external.flashinfer.decode import (
     flashinfer_paged_decode_support,
 )
@@ -12,13 +16,17 @@ from sparsevllm.kernels.external.sgl.fa3 import sgl_fa3_device_support
 from sparsevllm.method_registry import sparse_decode_attention_requires_scores
 from sparsevllm.models.attention_runtime import build_mha_decode_attention_spec
 from sparsevllm.operators.decode_attention import (
+    DECODE_ATTENTION_REGISTRY,
+    DeltaKVFixedGridDecodeAttentionProvider,
     DecodeAttentionRunResult,
     DecodeAttentionOpSpec,
     FlashInferPagedDecodeAttentionProvider,
+    FixedGridTritonPagedDecodeAttentionProvider,
     PreparedDecodeAttentionOp,
     SglFa3PagedDecodeAttentionProvider,
     TritonPagedDecodeAttentionProvider,
 )
+from sparsevllm.operators.registry import OpResolver
 from sparsevllm.platforms import DeviceCaps, PlatformEnum
 
 
@@ -66,6 +74,134 @@ def test_h2o_runtime_decode_spec_is_score_free_while_eviction_is_disabled():
     assert not spec.kernel_request.requires_softmax_lse
 
 
+def test_batch_only_decode_spec_carries_static_context_capacity():
+    config = SimpleNamespace(
+        num_attention_heads=32,
+        num_key_value_heads=8,
+        head_dim=128,
+        torch_dtype=torch.bfloat16,
+    )
+    runtime_config = SimpleNamespace(
+        decode_graph_shape_policy="batch_only",
+        max_model_len=40960,
+    )
+
+    spec = build_mha_decode_attention_spec(
+        config,
+        sparse_method="vanilla",
+        attention_tp_size=1,
+        max_batch_size=8,
+        cuda_graph=True,
+        runtime_config=runtime_config,
+    )
+
+    assert spec.batch_only_cuda_graph
+    assert spec.context_capacity == runtime_config.max_model_len
+
+
+def test_deltakv_kivi_decode_spec_carries_mixed_storage_contract():
+    config = SimpleNamespace(
+        num_attention_heads=32,
+        num_key_value_heads=8,
+        head_dim=128,
+        torch_dtype=torch.bfloat16,
+    )
+    runtime_config = SimpleNamespace(
+        decode_graph_shape_policy="batch_only",
+        max_model_len=131072,
+        full_layer_kv_quant_bits=4,
+        enable_full_layer_kivi_quant=True,
+        full_layer_kivi_decode_block_seq=512,
+        full_layer_kivi_decode_block_n=32,
+        full_layer_kivi_decode_num_warps=4,
+        full_layer_kivi_decode_num_stages=2,
+    )
+
+    spec = build_mha_decode_attention_spec(
+        config,
+        sparse_method="deltakv",
+        attention_tp_size=1,
+        max_batch_size=32,
+        cuda_graph=True,
+        runtime_config=runtime_config,
+    )
+
+    assert spec.may_use_full_layer_kivi_int4
+    assert spec.full_layer_kivi_decode_block_seq == 512
+    assert spec.full_layer_kivi_decode_block_n == 32
+    assert spec.full_layer_kivi_decode_num_warps == 4
+    assert spec.full_layer_kivi_decode_num_stages == 2
+    assert spec.may_require_attention_scores
+    assert spec.layer_varying_page_table
+
+
+def test_deltakv_kivi_batch_only_resolves_nonstandard_fixed_grid_provider():
+    spec = _spec(
+        may_require_attention_scores=True,
+        layer_varying_page_table=True,
+        batch_only_cuda_graph=True,
+        context_capacity=131072,
+        may_use_full_layer_kivi_int4=True,
+        full_layer_kivi_decode_block_seq=512,
+        full_layer_kivi_decode_block_n=32,
+        full_layer_kivi_decode_num_warps=4,
+        full_layer_kivi_decode_num_stages=2,
+    )
+    caps = _cuda_caps()
+
+    resolved = OpResolver(DECODE_ATTENTION_REGISTRY).resolve(spec, caps)
+
+    assert isinstance(
+        resolved.provider,
+        DeltaKVFixedGridDecodeAttentionProvider,
+    )
+    assert resolved.report.selection_basis == "semantic_fallback"
+    assert not FixedGridTritonPagedDecodeAttentionProvider.supports(
+        spec,
+        caps,
+    ).supported
+    assert not SglFa3PagedDecodeAttentionProvider.supports(spec, caps).supported
+    assert not FlashInferPagedDecodeAttentionProvider.supports(spec, caps).supported
+
+
+def test_deltakv_kivi_bucketed_keeps_legacy_triton_baseline():
+    spec = _spec(
+        may_require_attention_scores=True,
+        layer_varying_page_table=True,
+        batch_only_cuda_graph=False,
+        context_capacity=131072,
+        may_use_full_layer_kivi_int4=True,
+    )
+
+    assert TritonPagedDecodeAttentionProvider.supports(spec, _cuda_caps()).supported
+    assert not DeltaKVFixedGridDecodeAttentionProvider.supports(
+        spec,
+        _cuda_caps(),
+    ).supported
+
+
+def test_deltakv_kivi_fixed_grid_rejects_unsupported_head_dim():
+    spec = _spec(
+        head_dim=256,
+        may_require_attention_scores=True,
+        layer_varying_page_table=True,
+        batch_only_cuda_graph=True,
+        context_capacity=131072,
+        may_use_full_layer_kivi_int4=True,
+        full_layer_kivi_decode_block_seq=512,
+        full_layer_kivi_decode_block_n=32,
+        full_layer_kivi_decode_num_warps=4,
+        full_layer_kivi_decode_num_stages=2,
+    )
+
+    support = DeltaKVFixedGridDecodeAttentionProvider.supports(
+        spec,
+        _cuda_caps(),
+    )
+
+    assert not support.supported
+
+
 def _cuda_caps(
     *,
     device_name: str = "NVIDIA H100 80GB HBM3",
@@ -104,7 +240,79 @@ def _spec(**overrides) -> DecodeAttentionOpSpec:
     return DecodeAttentionOpSpec(**values)
 
 
-def test_flashinfer_lse_decode_rejects_cuda_graph_before_dependency_probe():
+def test_deltakv_fixed_grid_graph_state_owns_per_graph_workspace():
+    spec = _spec(
+        max_batch_size=8,
+        may_require_attention_scores=True,
+        layer_varying_page_table=True,
+        batch_only_cuda_graph=True,
+        context_capacity=131072,
+        may_use_full_layer_kivi_int4=True,
+        full_layer_kivi_decode_block_seq=512,
+        full_layer_kivi_decode_block_n=32,
+        full_layer_kivi_decode_num_warps=4,
+        full_layer_kivi_decode_num_stages=2,
+    )
+    provider = DeltaKVFixedGridDecodeAttentionProvider.bind(spec, _cuda_caps())
+    long_contract = DecodeGraphContract(
+        method="deltakv",
+        shape_policy="batch_only",
+        topology_path_id="long",
+        batch_capacity=4,
+        context_capacity=131072,
+    )
+    short_contract = DecodeGraphContract(
+        method="deltakv",
+        shape_policy="batch_only",
+        topology_path_id="short",
+        batch_capacity=4,
+        context_capacity=8192,
+    )
+    long_inputs = DecodeGraphInputs.allocate(
+        long_contract,
+        device=torch.device("cpu"),
+        pin_memory=False,
+    )
+    short_inputs = DecodeGraphInputs.allocate(
+        short_contract,
+        device=torch.device("cpu"),
+        pin_memory=False,
+    )
+
+    long_state = provider.init_decode_graph_state(spec, long_contract, long_inputs)
+    short_state = provider.init_decode_graph_state(spec, short_contract, short_inputs)
+
+    assert long_state.launch_plan.context_capacity == 131072
+    assert short_state.launch_plan.context_capacity == 8192
+    assert long_state.kivi_launch_plan.target_tokens_per_split == 512
+    assert long_state.kivi_launch_plan.block_n == 32
+    assert long_state.kivi_launch_plan.stage1_num_warps == 4
+    assert long_state.kivi_launch_plan.stage1_num_stages == 2
+    assert long_state.launch_plan.max_kv_splits > short_state.launch_plan.max_kv_splits
+    assert (
+        long_state.kivi_launch_plan.max_kv_splits
+        >= short_state.kivi_launch_plan.max_kv_splits
+    )
+    assert (
+        long_state.kivi_mid_o.shape[2]
+        == long_state.kivi_launch_plan.max_kv_splits
+    )
+    assert (
+        short_state.kivi_mid_o.shape[2]
+        == short_state.kivi_launch_plan.max_kv_splits
+    )
+    assert long_state.mid_o.data_ptr() != short_state.mid_o.data_ptr()
+    assert long_state.kivi_mid_o.data_ptr() != long_state.mid_o.data_ptr()
+    assert len(provider.decode_graph_keepalive_tensors(long_state)) == 6
+    provider.prepare_decode_graph_out(long_state)
+    assert provider._active_graph_state is long_state
+    provider.prepare_decode_graph_in(short_state)
+    assert provider._active_graph_state is short_state
+    provider.close_decode_graph_state(short_state)
+    assert provider._active_graph_state is None
+
+
+def test_flashinfer_lse_decode_accepts_cuda_graph_contract():
     spec = _spec(
         may_require_attention_scores=True,
         layer_varying_page_table=True,
@@ -116,13 +324,13 @@ def test_flashinfer_lse_decode_rejects_cuda_graph_before_dependency_probe():
     )
 
     with patch(
-        "sparsevllm.operators.decode_attention.flashinfer_paged_decode_support"
+        "sparsevllm.operators.decode_attention.flashinfer_paged_decode_support",
+        return_value=(True, "available"),
     ) as support:
         result = FlashInferPagedDecodeAttentionProvider.supports(spec, caps)
 
-    assert not result.supported
-    assert "CUDA Graph" in result.reason
-    support.assert_not_called()
+    assert result.supported
+    support.assert_called_once_with()
 
 
 def test_prepared_h2o_decode_applies_fixed_probability_scorer():
@@ -435,6 +643,123 @@ def test_sgl_decode_provider_uses_prepared_explicit_kv_adapter():
         "return_softmax_lse": False,
     }
     decode_launch_op.launch_config.assert_not_called()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_flashinfer_graph_decode_replans_and_replays_new_metadata():
+    flashinfer_paged_decode_support()
+    torch.manual_seed(20260825)
+    device = torch.device("cuda")
+    batch, query_heads, kv_heads, head_dim, capacity = 2, 8, 2, 128, 17
+    spec = _spec(
+        num_query_heads=query_heads,
+        num_kv_heads=kv_heads,
+        head_dim=head_dim,
+        activation_dtype=torch.bfloat16,
+        softmax_scale=head_dim**-0.5,
+        max_batch_size=batch,
+        cuda_graph=True,
+        batch_only_cuda_graph=True,
+        context_capacity=capacity,
+    )
+    contract = DecodeGraphContract(
+        method="",
+        shape_policy="batch_only",
+        topology_path_id="dense",
+        batch_capacity=batch,
+        context_capacity=capacity,
+    )
+    inputs = DecodeGraphInputs.allocate(
+        contract,
+        device=device,
+        pin_memory=False,
+    )
+    q = torch.randn(
+        batch,
+        query_heads,
+        head_dim,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    slots = 3 * capacity
+    k_cache = torch.randn(
+        slots,
+        kv_heads,
+        head_dim,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    v_cache = torch.randn_like(k_cache)
+    page_table = torch.arange(
+        slots,
+        dtype=torch.int32,
+        device=device,
+    ).view(3, capacity)
+    view = SimpleNamespace(
+        payload=SimpleNamespace(k_cache=k_cache, v_cache=v_cache),
+        meta=SimpleNamespace(
+            active_slots=page_table,
+            req_indices=inputs.request_indices,
+            context_lens=inputs.context_lens,
+            attn_score=None,
+        ),
+    )
+    provider = FlashInferPagedDecodeAttentionProvider()
+    provider.prepare(spec, device_index=torch.cuda.current_device())
+    state = provider.init_decode_graph_state(spec, contract, inputs)
+
+    def update_metadata(lengths, rows) -> None:
+        inputs.host.context_lens.copy_(torch.tensor(lengths, dtype=torch.int32))
+        inputs.host.request_indices.copy_(torch.tensor(rows, dtype=torch.int32))
+        inputs.context_lens.copy_(inputs.host.context_lens)
+        inputs.request_indices.copy_(inputs.host.request_indices)
+        provider.prepare_decode_graph_out(state)
+        provider.prepare_decode_graph_in(state)
+
+    def reference() -> torch.Tensor:
+        expected = []
+        group_size = query_heads // kv_heads
+        for batch_idx in range(batch):
+            length = int(inputs.host.context_lens[batch_idx])
+            row = int(inputs.host.request_indices[batch_idx])
+            active = page_table[row, :length].long()
+            keys = k_cache[active].repeat_interleave(group_size, dim=1)
+            values = v_cache[active].repeat_interleave(group_size, dim=1)
+            logits = torch.einsum(
+                "hd,lhd->hl",
+                q[batch_idx].float(),
+                keys.float(),
+            ) * spec.softmax_scale
+            expected.append(
+                torch.einsum(
+                    "hl,lhd->hd",
+                    torch.softmax(logits, dim=-1),
+                    values.float(),
+                ).to(q.dtype)
+            )
+        return torch.stack(expected)
+
+    try:
+        update_metadata([17, 13], [2, 0])
+        provider.run(spec, q, view)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            graph_output = provider.run(spec, q, view)
+
+        update_metadata([9, 16], [1, 2])
+        expected = reference()
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            graph_output,
+            expected,
+            rtol=3e-2,
+            atol=3e-2,
+        )
+    finally:
+        provider.close_decode_graph_state(state)
+        provider.close()
 
 
 def test_triton_provider_owns_launch_config_and_workspace_preparation():

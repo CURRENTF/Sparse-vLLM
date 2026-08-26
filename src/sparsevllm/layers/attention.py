@@ -230,14 +230,27 @@ class Attention(nn.Module):
                     num_seq_blocks = (
                         max_len_in_batch + block_seq - 1
                     ) // block_seq
-                    mid_o, mid_o_logexpsum = get_decode_workspace(
-                        context,
-                        batch_size,
-                        self.num_heads,
-                        num_seq_blocks,
-                        self.head_dim,
-                        q.device,
+                    workspace_provider = getattr(
+                        self.attention_backend,
+                        "get_decode_workspace",
+                        None,
                     )
+                    if callable(workspace_provider):
+                        mid_o, mid_o_logexpsum = workspace_provider(
+                            batch_size=batch_size,
+                            num_heads=self.num_heads,
+                            head_dim=self.head_dim,
+                            device=q.device,
+                        )
+                    else:
+                        mid_o, mid_o_logexpsum = get_decode_workspace(
+                            context,
+                            batch_size,
+                            self.num_heads,
+                            num_seq_blocks,
+                            self.head_dim,
+                            q.device,
+                        )
                     o = self.attention_backend.run_decode(
                         q,
                         decode_view,

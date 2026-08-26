@@ -28,10 +28,19 @@ class Gemma4OpSpec:
     head_dims: tuple[int, ...]
     cuda_graph: bool
     attention_contracts: tuple[tuple[int, int, int, int], ...] = ()
+    max_batch_size: int = 1
+    batch_only_cuda_graph: bool = False
+    context_capacity: int | None = None
 
     def __post_init__(self) -> None:
         if not self.head_dims or any(int(value) <= 0 for value in self.head_dims):
             raise ValueError("Gemma 4 head dimensions must be positive.")
+        if self.max_batch_size <= 0:
+            raise ValueError("Gemma 4 max_batch_size must be positive.")
+        if self.context_capacity is not None and self.context_capacity <= 0:
+            raise ValueError("Gemma 4 context_capacity must be positive.")
+        if self.batch_only_cuda_graph and self.context_capacity is None:
+            raise ValueError("Gemma 4 batch-only decode requires context_capacity.")
 
 
 class Gemma4OperatorProvider:
@@ -54,8 +63,7 @@ class Gemma4OperatorProvider:
                     "triton_context",
                 ],
                 "decode_routes": [
-                    "triton_single_block",
-                    "triton_two_stage",
+                    "sglang_fixed_grid",
                 ],
             },
         }
@@ -134,7 +142,9 @@ class Gemma4OperatorProvider:
 
 GEMMA4_REGISTRY: OpRegistry[Gemma4OpSpec, Gemma4OperatorProvider] = OpRegistry(
     "Gemma 4 model operations",
-    portfolio=PortfolioPolicy(repo_nonstandard=("triton",)),
+    portfolio=PortfolioPolicy(
+        repo_nonstandard=("triton",)
+    ),
     profile_order=("gemma4_h20_profile",),
 )
 
@@ -142,6 +152,22 @@ GEMMA4_REGISTRY: OpRegistry[Gemma4OpSpec, Gemma4OperatorProvider] = OpRegistry(
 @GEMMA4_REGISTRY.register_atomic(ProviderRole.REPO_NONSTANDARD)
 class TritonGemma4OperatorProvider(Gemma4OperatorProvider):
     name = "triton"
+
+    def __init__(
+        self,
+        *,
+        spec: Gemma4OpSpec | None = None,
+        caps: DeviceCaps | None = None,
+    ) -> None:
+        super().__init__()
+        self.spec = spec
+        self.device = None if caps is None else torch.device("cuda", caps.device_index)
+        self.multi_processor_count = (
+            None if caps is None else int(caps.multi_processor_count or 0)
+        )
+        if caps is not None and self.multi_processor_count <= 0:
+            raise ValueError("Gemma 4 requires a positive multi-processor count.")
+        self._decode_workspaces: dict[tuple[int, int, int], object] = {}
 
     @classmethod
     def supports(cls, spec: Gemma4OpSpec, caps: DeviceCaps) -> SupportResult:
@@ -153,14 +179,91 @@ class TritonGemma4OperatorProvider(Gemma4OperatorProvider):
             return SupportResult.unsupported("requires BF16 or FP16 activations")
         if any(head_dim not in {256, 512} for head_dim in spec.head_dims):
             return SupportResult.unsupported("requires attention head dimensions 256 or 512")
+        if (
+            caps.multi_processor_count is None
+            or int(caps.multi_processor_count) <= 0
+        ):
+            return SupportResult.unsupported(
+                "requires a positive multi-processor count"
+            )
         return SupportResult.yes()
 
+    @classmethod
+    def bind(
+        cls,
+        spec: Gemma4OpSpec,
+        caps: DeviceCaps,
+        **kwargs,
+    ) -> TritonGemma4OperatorProvider:
+        if kwargs:
+            raise TypeError(f"Unexpected Gemma 4 bind arguments: {sorted(kwargs)}.")
+        return cls(spec=spec, caps=caps)
+
     def attention_backend(self, *, sliding_window: int | None):
-        from sparsevllm.operators.gemma4_attention import Gemma4AttentionBackend
+        from sparsevllm.operators.gemma4_attention import (
+            Gemma4AttentionBackend,
+            Gemma4DecodeWorkspace,
+        )
+
+        if (
+            self.spec is None
+            or self.device is None
+            or self.multi_processor_count is None
+        ):
+            raise RuntimeError(
+                "Gemma 4 attention requires a provider bound from Gemma4OpSpec."
+            )
+        window_left = -1 if sliding_window is None else int(sliding_window) - 1
+        matching = [
+            contract
+            for contract in self.spec.attention_contracts
+            if int(contract[3]) == window_left
+        ]
+        if len(matching) != 1:
+            raise RuntimeError(
+                "Gemma 4 provider requires one attention contract for "
+                f"window_left={window_left}, got {matching}."
+            )
+        query_heads, _, head_dim, _ = matching[0]
+        max_kv_splits = 8
+        signature = (int(query_heads), int(head_dim), max_kv_splits)
+        workspace = self._decode_workspaces.get(signature)
+        if workspace is None:
+            workspace = Gemma4DecodeWorkspace(
+                mid_output=torch.empty(
+                    (
+                        self.spec.max_batch_size,
+                        signature[0],
+                        signature[2],
+                        signature[1],
+                    ),
+                    dtype=torch.float32,
+                    device=self.device,
+                ),
+                mid_lse=torch.empty(
+                    (self.spec.max_batch_size, signature[0], signature[2]),
+                    dtype=torch.float32,
+                    device=self.device,
+                ),
+                num_kv_splits=torch.empty(
+                    (self.spec.max_batch_size,),
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+            )
+            self._decode_workspaces[signature] = workspace
 
         return self._register_attention_backend(
-            Gemma4AttentionBackend(sliding_window=sliding_window)
+            Gemma4AttentionBackend(
+                sliding_window=sliding_window,
+                decode_workspace=workspace,
+                multi_processor_count=self.multi_processor_count,
+            )
         )
+
+    def close(self) -> None:
+        super().close()
+        self._decode_workspaces.clear()
 
     def rmsnorm(self, x, weight, eps):
         from sparsevllm.kernels.triton.gemma4_rmsnorm import gemma4_rmsnorm
@@ -241,6 +344,8 @@ class H20Gemma4OperatorProvider(TritonGemma4OperatorProvider):
                 f"{cls.name} does not accept provider arguments: {sorted(kwargs)}"
             )
         return cls(
+            spec=spec,
+            caps=caps,
             device_index=caps.device_index,
             max_prefill_contracts=(
                 len(spec.attention_contracts) or len(spec.head_dims)
@@ -250,10 +355,12 @@ class H20Gemma4OperatorProvider(TritonGemma4OperatorProvider):
     def __init__(
         self,
         *,
+        spec: Gemma4OpSpec,
+        caps: DeviceCaps,
         device_index: int | None = None,
         max_prefill_contracts: int = 2,
     ) -> None:
-        super().__init__()
+        super().__init__(spec=spec, caps=caps)
         from sparsevllm.operators.gemma4_attention import Gemma4FlashInferPrefill
 
         self._prefill = Gemma4FlashInferPrefill()
@@ -273,10 +380,7 @@ class H20Gemma4OperatorProvider(TritonGemma4OperatorProvider):
                     "triton_context",
                 ],
                 "decode_routes": [
-                    "triton_window",
-                    "triton_single_block",
-                    "triton_global",
-                    "triton_two_stage",
+                    "sglang_fixed_grid",
                 ],
             },
             "flashinfer_backend": "fa2",
@@ -290,16 +394,9 @@ class H20Gemma4OperatorProvider(TritonGemma4OperatorProvider):
             super().close()
 
     def attention_backend(self, *, sliding_window: int | None):
-        from sparsevllm.operators.gemma4_attention import Gemma4AttentionBackend
-
-        return self._register_attention_backend(
-            Gemma4AttentionBackend(
-                sliding_window=sliding_window,
-                flashinfer_prefill=self._prefill,
-                use_window_decode=True,
-                global_decode_heads_per_program=4,
-            )
-        )
+        backend = super().attention_backend(sliding_window=sliding_window)
+        backend.flashinfer_prefill = self._prefill
+        return backend
 
 
 @GEMMA4_REGISTRY.register_profile

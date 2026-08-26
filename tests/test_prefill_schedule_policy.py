@@ -11,6 +11,10 @@ import numpy as np
 import torch
 
 from sparsevllm.config import Config
+from sparsevllm.configs.cuda_graph import (
+    _default_decode_cuda_graph_capture_sizes,
+    _resolve_decode_static_batch_capacity,
+)
 from sparsevllm.engine.cache_manager.standard import StandardCacheManager
 from sparsevllm.engine.cache_manager.deltakv import DeltaKVCacheManager
 from sparsevllm.engine.cache_manager.deltakv_less_memory import DeltaKVLessMemoryCacheManager
@@ -714,8 +718,13 @@ class PrefillPolicyConfigTest(unittest.TestCase):
                 decode_graph_capture_sampling=True,
             )
 
-    def test_decode_cuda_graph_auto_capture_sizes_cover_decode_limit(self):
-        for max_decoding_seqs in (1, 6, 8, 24):
+    def test_decode_cuda_graph_auto_capture_sizes_end_at_decode_limit(self):
+        for max_decoding_seqs, expected_sizes in (
+            (1, [1]),
+            (6, [1, 2, 3, 4, 5, 6]),
+            (8, [1, 2, 3, 4, 5, 6, 7, 8]),
+            (24, [1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 20, 24]),
+        ):
             with self.subTest(max_decoding_seqs=max_decoding_seqs):
                 cfg = self.make_config(
                     sparse_method="omnikv",
@@ -727,7 +736,37 @@ class PrefillPolicyConfigTest(unittest.TestCase):
                 self.assertEqual(capture_sizes[-1], max_decoding_seqs)
                 self.assertTrue(all(0 < size <= max_decoding_seqs for size in capture_sizes))
                 self.assertTrue(cfg.decode_graph)
-                self.assertEqual(cfg.decode_graph_capture_sizes, capture_sizes)
+                self.assertEqual(cfg.decode_graph_capture_sizes, expected_sizes)
+
+    def test_decode_cuda_graph_auto_capture_sizes_are_bounded_for_large_limits(self):
+        for max_decoding_seqs in (64, 80, 128, 256, 1024):
+            with self.subTest(max_decoding_seqs=max_decoding_seqs):
+                sizes = _default_decode_cuda_graph_capture_sizes(max_decoding_seqs)
+                self.assertLessEqual(len(sizes), 32)
+                self.assertEqual(sizes[:8], list(range(1, 9)))
+                self.assertEqual(sizes[-1], max_decoding_seqs)
+                self.assertEqual(sizes, sorted(set(sizes)))
+
+    def test_decode_static_batch_capacity_uses_reachable_padding_bucket(self):
+        cases = (
+            ([1, 2, 4, 8, 16, 32, 64], 32, 64, 32),
+            ([1, 4, 8, 64], 32, 64, 64),
+            ([1, 2, 4, 8, 16, 32, 64], 80, 64, 64),
+        )
+        for capture_sizes, max_batch, max_decode, expected in cases:
+            with self.subTest(
+                capture_sizes=capture_sizes,
+                max_batch=max_batch,
+                max_decode=max_decode,
+            ):
+                self.assertEqual(
+                    _resolve_decode_static_batch_capacity(
+                        capture_sizes,
+                        max_num_seqs_in_batch=max_batch,
+                        max_decoding_seqs=max_decode,
+                    ),
+                    expected,
+                )
 
     def test_legacy_platform_aliases_are_not_config_fields(self):
         fields = Config.__dataclass_fields__
@@ -767,10 +806,10 @@ class PrefillPolicyConfigTest(unittest.TestCase):
             enable_prefix_caching=False,
             sparse_method="",
         )
-        self.assertTrue(runner._auto_capture_greedy_sampling(seqs))
+        self.assertFalse(runner._auto_capture_greedy_sampling(seqs))
 
         runner.config.sparse_method = "omnikv"
-        self.assertTrue(runner._auto_capture_greedy_sampling(seqs))
+        self.assertFalse(runner._auto_capture_greedy_sampling(seqs))
 
         runner.config.sparse_method = "quest"
         self.assertFalse(runner._auto_capture_greedy_sampling(seqs))
@@ -788,7 +827,13 @@ class PrefillPolicyConfigTest(unittest.TestCase):
         self.assertFalse(runner._auto_capture_greedy_sampling(seqs))
 
         runner.config.decode_graph_capture_sampling = True
+        self.assertFalse(runner._auto_capture_greedy_sampling(seqs))
+        runner.config.tensor_parallel_size = 1
         self.assertTrue(runner._auto_capture_greedy_sampling(seqs))
+
+        seqs[0].temperature = 0.7
+        self.assertFalse(runner._auto_capture_greedy_sampling(seqs))
+        seqs[0].temperature = 0.0
 
         seqs[0].presence_penalty = 0.1
         self.assertFalse(runner._auto_capture_greedy_sampling(seqs))
@@ -905,6 +950,7 @@ class DecodeCudaGraphCapacityPolicyTest(unittest.TestCase):
     def make_runner(self, method="quest", cache_manager=None):
         runner = object.__new__(DecodeCudaGraphRunner)
         runner.method = method
+        runner.shape_policy = "bucketed"
         runner.cache_manager = cache_manager if cache_manager is not None else SimpleNamespace()
         runner.runtime_state = runner.cache_manager
         runner.recurrent_state_manager = None
@@ -973,7 +1019,14 @@ class DecodeCudaGraphCapacityPolicyTest(unittest.TestCase):
             ),
         )
         runner.runtime_state = SimpleNamespace(
-            prepare_decode_static=runner.cache_manager.prepare_decode_static,
+            prepare_decode_graph_step=lambda seqs, state: runner.cache_manager.prepare_decode_static(
+                seqs,
+                state.inputs.input_ids,
+                state.inputs.positions,
+                state.inputs.write_slot_mapping,
+                state.inputs.context_lens,
+                state.inputs.request_indices,
+            ),
         )
         runner.sparse_controller = SimpleNamespace(prepare_forward=lambda seqs, is_prefill: None)
         runner.is_long_text_batch = lambda seqs, is_prefill: False
@@ -1009,7 +1062,14 @@ class DecodeCudaGraphCapacityPolicyTest(unittest.TestCase):
             ),
         )
         runner.runtime_state = SimpleNamespace(
-            prepare_decode_static=runner.cache_manager.prepare_decode_static,
+            prepare_decode_graph_step=lambda seqs, state: runner.cache_manager.prepare_decode_static(
+                seqs,
+                state.inputs.input_ids,
+                state.inputs.positions,
+                state.inputs.write_slot_mapping,
+                state.inputs.context_lens,
+                state.inputs.request_indices,
+            ),
         )
         runner.sparse_controller = SimpleNamespace(
             prepare_forward=lambda seqs, is_prefill: calls.append(f"prepare:{is_prefill}")
@@ -1033,7 +1093,14 @@ class DecodeCudaGraphCapacityPolicyTest(unittest.TestCase):
 
     def test_exact_current_policy_does_not_reuse_larger_warmup_state(self):
         runner = self.make_runner("quest")
-        warmup_key = DecodeCudaGraphKey("quest", 1, 16384, False, False)
+        warmup_key = DecodeCudaGraphKey(
+            "quest",
+            1,
+            16384,
+            False,
+            False,
+            shape_policy="bucketed",
+        )
         warmup_state = DecodeCudaGraphState(key=warmup_key)
         runner._graphs[warmup_key] = warmup_state
         real_empty = torch.empty
@@ -1070,8 +1137,22 @@ class DecodeCudaGraphCapacityPolicyTest(unittest.TestCase):
         runner = self.make_runner("deltakv")
         runner.max_cached_graphs = 1
         runner._graphs = OrderedDict()
-        old_key = DecodeCudaGraphKey("deltakv", 1, 1024, False, False)
-        new_key = DecodeCudaGraphKey("deltakv", 1, 2048, False, False)
+        old_key = DecodeCudaGraphKey(
+            "deltakv",
+            1,
+            1024,
+            False,
+            False,
+            shape_policy="bucketed",
+        )
+        new_key = DecodeCudaGraphKey(
+            "deltakv",
+            1,
+            2048,
+            False,
+            False,
+            shape_policy="bucketed",
+        )
         old_state = DecodeCudaGraphState(key=old_key)
         old_state.keepalive.append(object())
         old_state.sparse_state_refs[0] = {"attn_score": object()}
@@ -1554,6 +1635,65 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
             ModelRunner._is_long_text_batch(runner, seqs, is_prefill=False)
         )
 
+    def test_sparse_model_runner_rejects_mixed_decode_topology_batch(self):
+        runner = object.__new__(ModelRunner)
+        runner.config = SimpleNamespace(
+            sparse_method="quest",
+            sink_keep_tokens=1,
+            recent_keep_tokens=1,
+            decode_keep_tokens=4,
+        )
+
+        with self.assertRaisesRegex(ValueError, "Mixed long/short batch"):
+            ModelRunner._is_long_text_batch(
+                runner,
+                [seq_with_len(4), seq_with_len(20)],
+                is_prefill=False,
+            )
+
+    def test_sparse_decode_transition_and_prefix_restore_select_long_path(self):
+        runner = object.__new__(ModelRunner)
+        runner.config = SimpleNamespace(
+            sparse_method="omnikv",
+            sink_keep_tokens=1,
+            recent_keep_tokens=1,
+            decode_keep_tokens=4,
+        )
+        threshold = ModelRunner._long_text_threshold(
+            runner,
+            is_prefill=False,
+        )
+        sequence = seq_with_len(threshold)
+
+        self.assertFalse(
+            ModelRunner._is_long_text_batch(
+                runner,
+                [sequence],
+                is_prefill=False,
+            )
+        )
+        sequence.append_token(0)
+        self.assertTrue(
+            ModelRunner._is_long_text_batch(
+                runner,
+                [sequence],
+                is_prefill=False,
+            )
+        )
+
+        restored = seq_with_len(threshold + 1)
+        restored.prefix_cache_enabled = True
+        restored.prefix_cache_hit_len = threshold
+        restored.prefix_cache_hit_block_count = 1
+        restored.prefix_cache_hit_last_block_id = b"prefix"
+        self.assertTrue(
+            ModelRunner._is_long_text_batch(
+                runner,
+                [restored],
+                is_prefill=False,
+            )
+        )
+
     def test_all_chunked_batches_sparse_mixed_lengths(self):
         scheduler = make_scheduler(
             PREFILL_POLICY_ALL_CHUNKED,
@@ -1586,6 +1726,29 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
 
         self.assertFalse(is_prefill)
         self.assertEqual(scheduled, [short_seq, long_seq])
+
+    def test_sparse_decode_schedules_short_and_long_topologies_separately(self):
+        scheduler = make_scheduler(
+            PREFILL_POLICY_ALL_CHUNKED,
+            method="quest",
+        )
+        short_seq = seq_with_len(4)
+        long_seq = seq_with_len(20)
+        short_seq.num_prefilled_tokens = short_seq.num_prompt_tokens
+        long_seq.num_prefilled_tokens = long_seq.num_prompt_tokens
+        scheduler.decoding.extend((short_seq, long_seq))
+
+        short_batch, is_prefill, _ = scheduler.schedule()
+
+        self.assertFalse(is_prefill)
+        self.assertEqual(short_batch, [short_seq])
+        self.assertIn(long_seq, scheduler.decoding)
+
+        scheduler.decoding.remove(short_seq)
+        long_batch, is_prefill_long, _ = scheduler.schedule()
+
+        self.assertFalse(is_prefill_long)
+        self.assertEqual(long_batch, [long_seq])
 
     def test_all_chunked_caps_each_prefill_by_chunk_size(self):
         scheduler = make_scheduler(PREFILL_POLICY_ALL_CHUNKED, method="", chunk=5, max_tokens=20)

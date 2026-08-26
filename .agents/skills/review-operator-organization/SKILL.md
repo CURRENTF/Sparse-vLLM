@@ -1,6 +1,6 @@
 ---
 name: review-operator-organization
-description: Review Sparse-vLLM operator architecture, provider selection, platform capability boundaries, kernel ownership, dependency compatibility, weight layouts, fallback semantics, and validation. Use for diffs touching src/sparsevllm/operators, src/sparsevllm/platforms, Triton or external kernels, model-to-operator call sites, quantized weight loading, CUDA Graph constraints, optional kernel dependencies, or backend removal and migration.
+description: Review Sparse-vLLM operator architecture, provider selection, platform capability boundaries, kernel ownership, dependency compatibility, weight layouts, batch-only CUDA Graph adaptation, fallback semantics, and validation. Use for diffs touching src/sparsevllm/operators, src/sparsevllm/platforms, Triton or external kernels, model-to-operator call sites, quantized weight loading, CUDA Graph constraints, optional kernel dependencies, or backend removal and migration.
 ---
 
 # Review Operator Organization
@@ -97,6 +97,18 @@ fallback path from model construction through execution.
   begun, do not catch a kernel failure and silently switch implementations.
 - Ensure one provider's build or JIT failure does not disable unrelated
   operators.
+
+### Decode CUDA Graph
+
+Batch-only is the only maintained decode CUDA Graph shape policy. For any
+review touching captured decode, graph input preparation, provider graph state,
+or sparse topology paths, read and enforce
+[references/batch-only-decode-graph.md](references/batch-only-decode-graph.md).
+That reference defines graph identity, static versus dynamic metadata, unified
+input ownership, participant lifecycles, external wrappers, validation, and
+finding severity. Eager may remain as a separate correctness path or for
+operators that do not support graph capture; do not preserve a second bucketed
+graph architecture.
 
 ### Kernel Portfolio
 

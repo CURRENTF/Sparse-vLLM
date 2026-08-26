@@ -17,6 +17,10 @@ class _PublicPagedDecodeWrapper:
         self,
         float_workspace_buffer,
         kv_layout="NHD",
+        use_cuda_graph=False,
+        paged_kv_indptr_buffer=None,
+        paged_kv_indices_buffer=None,
+        paged_kv_last_page_len_buffer=None,
         backend="auto",
     ):
         pass

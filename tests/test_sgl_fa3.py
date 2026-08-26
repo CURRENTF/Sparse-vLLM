@@ -28,8 +28,8 @@ def test_sgl_fa3_support_rejects_missing_package() -> None:
     assert "sglang-kernel is not installed" in str(exc_info.value)
 
 
-@pytest.mark.parametrize("version", ["0.4.4", "0.5.0"])
-def test_sgl_fa3_support_rejects_outside_declared_range(version: str) -> None:
+@pytest.mark.parametrize("version", ["0.4.4", "0.4.5.post1", "0.4.6.post1"])
+def test_sgl_fa3_support_rejects_unpinned_version(version: str) -> None:
     with (
         patch("importlib.util.find_spec", return_value=object()),
         patch("importlib.metadata.version", return_value=version),
@@ -38,11 +38,11 @@ def test_sgl_fa3_support_rejects_outside_declared_range(version: str) -> None:
             sgl_fa3_support()
 
     assert exc_info.value.health.state is KernelFamilyState.BROKEN
-    assert "sglang-kernel>=0.4.5,<0.5" in str(exc_info.value)
+    assert "sglang-kernel==0.4.5" in str(exc_info.value)
 
 
-@pytest.mark.parametrize("version", ["0.4.5", "0.4.6.post1"])
-def test_sgl_fa3_support_accepts_declared_range(version: str) -> None:
+def test_sgl_fa3_support_accepts_pinned_version() -> None:
+    version = "0.4.5"
     op = SimpleNamespace(
         _schema=SimpleNamespace(
             arguments=[
@@ -425,6 +425,40 @@ def test_sgl_fa3_decode_matches_torch_and_replays_cuda_graph() -> None:
     torch.testing.assert_close(
         second_graph_output,
         expected,
+        rtol=3e-2,
+        atol=3e-2,
+    )
+
+    request_indices.copy_(
+        torch.tensor([1, 3, 0], device=device, dtype=torch.int32)
+    )
+    context_lens.copy_(
+        torch.tensor([3, 8, 6], device=device, dtype=torch.int32)
+    )
+    replay_rows = []
+    for batch_index in range(batch_size):
+        length = int(context_lens[batch_index].item())
+        row = int(request_indices[batch_index].item())
+        active = page_table[row, :length].long()
+        logits = q_rope[batch_index].float() @ rope_cache[active, 0].float().T
+        logits += q_latent[batch_index].float() @ latent_cache[active, 0].float().T
+        probs = torch.softmax(logits * (256**-0.5), dim=-1)
+        replay_rows.append(
+            (probs @ latent_cache[active, 0].float()).to(torch.bfloat16)
+        )
+    replay_expected = torch.stack(replay_rows)
+    graph.replay()
+    second_graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(
+        graph_output,
+        replay_expected,
+        rtol=3e-2,
+        atol=3e-2,
+    )
+    torch.testing.assert_close(
+        second_graph_output,
+        replay_expected,
         rtol=3e-2,
         atol=3e-2,
     )

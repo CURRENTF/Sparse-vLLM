@@ -21,6 +21,13 @@ class _FlashInferState:
     plan_key: tuple[object, ...] | None = None
 
 
+@dataclass
+class Gemma4DecodeWorkspace:
+    mid_output: torch.Tensor
+    mid_lse: torch.Tensor
+    num_kv_splits: torch.Tensor
+
+
 class Gemma4FlashInferPrefill:
     """Shared FlashInfer plans for Gemma 4 text-prefill head shapes."""
 
@@ -166,35 +173,67 @@ class Gemma4AttentionBackend(TritonAttentionBackend):
     """Gemma 4 attention semantics isolated from the tuned generic kernels."""
 
     name = "triton_gemma4"
+    supports_batch_only_cuda_graph = True
 
     def __init__(
         self,
         *,
         sliding_window: int | None,
         flashinfer_prefill: Gemma4FlashInferPrefill | None = None,
-        use_window_decode: bool = False,
-        global_decode_heads_per_program: int | None = None,
+        decode_workspace: Gemma4DecodeWorkspace | None = None,
+        multi_processor_count: int | None = None,
     ) -> None:
         super().__init__()
         self.sliding_window = None if sliding_window is None else int(sliding_window)
         self.flashinfer_prefill = flashinfer_prefill
-        self.use_window_decode = bool(use_window_decode)
-        self.global_decode_heads_per_program = global_decode_heads_per_program
+        self.decode_workspace = decode_workspace
+        self.multi_processor_count = (
+            None
+            if multi_processor_count is None
+            else int(multi_processor_count)
+        )
         self._runtime_kernel_path_counts: dict[str, dict[str, int]] = {}
+
+    def get_decode_workspace(
+        self,
+        *,
+        batch_size: int,
+        num_heads: int,
+        head_dim: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        workspace = self.decode_workspace
+        if workspace is None:
+            raise RuntimeError("Gemma 4 decode backend has no prepared workspace.")
+        if (
+            self.multi_processor_count is None
+            or self.multi_processor_count <= 0
+        ):
+            raise RuntimeError(
+                "Gemma 4 decode backend requires a positive multi-processor count."
+            )
+        if (
+            batch_size > workspace.mid_output.shape[0]
+            or num_heads != workspace.mid_output.shape[1]
+            or head_dim != workspace.mid_output.shape[3]
+            or device != workspace.mid_output.device
+        ):
+            raise RuntimeError(
+                "Gemma 4 fixed-grid workspace does not match the decode contract: "
+                f"actual={(batch_size, num_heads, head_dim, device)} "
+                f"workspace={tuple(workspace.mid_output.shape)}/"
+                f"{workspace.mid_output.device}."
+            )
+        return workspace.mid_output[:batch_size], workspace.mid_lse[:batch_size]
 
     def binding_metadata(self) -> dict[str, object]:
         prefill_routes = ["triton_multimodal_context", "triton_context"]
         if self.flashinfer_prefill is not None:
             prefill_routes.insert(1, "flashinfer_paged_prefill_fa2")
-        decode_routes = ["triton_single_block", "triton_two_stage"]
-        if self.use_window_decode:
-            decode_routes.insert(0, "triton_window")
-        if self.global_decode_heads_per_program is not None:
-            decode_routes.insert(-1, "triton_global")
         return {
             "implementation_kind": "dispatch_plan",
             "prefill_routes": prefill_routes,
-            "decode_routes": decode_routes,
+            "decode_routes": ["sglang_fixed_grid"],
             "sliding_window": self.sliding_window,
         }
 
@@ -228,41 +267,6 @@ class Gemma4AttentionBackend(TritonAttentionBackend):
         if self.flashinfer_prefill is not None and view.meta.attn_score is None:
             return "flashinfer_paged_prefill_fa2"
         return "triton_context"
-
-    def _decode_route(
-        self,
-        q: torch.Tensor,
-        view,
-        *,
-        mid_o: torch.Tensor,
-        block_seq: int,
-        group_size: int,
-    ) -> str:
-        if (
-            self.use_window_decode
-            and self.sliding_window is not None
-            and view.meta.attn_score is None
-            and int(q.shape[-1]) == 256
-            and group_size in {2, 4}
-            and mid_o.shape[2]
-            >= (self.sliding_window + block_seq - 1) // block_seq
-        ):
-            return "triton_window"
-        if (
-            mid_o.shape[2] == 1
-            and view.meta.attn_score is None
-            and group_size in {2, 4, 8}
-        ):
-            return "triton_single_block"
-        if (
-            self.sliding_window is None
-            and view.meta.attn_score is None
-            and int(q.shape[-1]) == 512
-            and self.global_decode_heads_per_program is not None
-            and group_size % self.global_decode_heads_per_program == 0
-        ):
-            return "triton_global"
-        return "triton_two_stage"
 
     def run_prefill(
         self,
@@ -345,99 +349,49 @@ class Gemma4AttentionBackend(TritonAttentionBackend):
         gqa_block_n: int = 16,
         gqa_num_warps: int = 2,
     ) -> torch.Tensor:
-        del max_len_in_batch, num_heads, num_kv_heads, gqa_block_n, gqa_num_warps
+        del (
+            max_len_in_batch,
+            block_seq,
+            num_heads,
+            num_kv_heads,
+            gqa_block_n,
+            gqa_num_warps,
+        )
+        workspace = self.decode_workspace
+        if workspace is None:
+            raise RuntimeError("Gemma 4 decode backend has no prepared workspace.")
+        multi_processor_count = self.multi_processor_count
+        if multi_processor_count is None or multi_processor_count <= 0:
+            raise RuntimeError(
+                "Gemma 4 decode backend requires a positive multi-processor count."
+            )
         payload = _require_explicit_payload(view, operation="Gemma 4 decode")
-        from sparsevllm.kernels.triton.gemma4_decode_attention import (
-            gemma4_decode_stage1,
-            gemma4_decode_stage2,
+        if payload.backend != "dense":
+            raise RuntimeError("Gemma 4 fixed-grid decode requires dense explicit KV.")
+        from sparsevllm.kernels.triton.sglang_gemma4_decode_attention import (
+            sglang_gemma4_decode,
         )
 
-        group_size = int(q.shape[1]) // int(payload.k_cache.shape[1])
-        route = self._decode_route(
+        batch_size = int(q.shape[0])
+        self._record_kernel_path("sglang_fixed_grid")
+        return sglang_gemma4_decode(
             q,
-            view,
-            mid_o=mid_o,
-            block_seq=block_seq,
-            group_size=group_size,
-        )
-        self._record_kernel_path(route)
-        if route == "triton_window":
-            from sparsevllm.kernels.triton.gemma4_window_decode_attention import (
-                gemma4_window_decode,
-            )
-
-            output = torch.empty_like(q)
-            window_blocks = (self.sliding_window + block_seq - 1) // block_seq
-            gemma4_window_decode(
-                q,
-                payload.k_cache,
-                payload.v_cache,
-                view.meta.active_slots,
-                view.meta.req_indices,
-                view.meta.context_lens,
-                mid_o[:, :, :window_blocks],
-                mid_o_logexpsum[:, :, :window_blocks],
-                output,
-                block_seq=block_seq,
-                sliding_window=self.sliding_window,
-            )
-            return output
-        if route == "triton_single_block":
-            from sparsevllm.kernels.triton.gemma4_single_block_decode_attention import (
-                gemma4_single_block_decode,
-            )
-
-            output = torch.empty_like(q)
-            gemma4_single_block_decode(
-                q, payload.k_cache, payload.v_cache, view.meta.active_slots,
-                view.meta.req_indices, view.meta.context_lens, output,
-                block_seq=block_seq, sliding_window=self.sliding_window,
-            )
-            return output
-        if route == "triton_global":
-            from sparsevllm.kernels.triton.gemma4_global_decode_attention import (
-                gemma4_global_decode_stage1,
-            )
-
-            gemma4_global_decode_stage1(
-                q,
-                payload.k_cache,
-                payload.v_cache,
-                view.meta.active_slots,
-                view.meta.req_indices,
-                view.meta.context_lens,
-                mid_o,
-                mid_o_logexpsum,
-                block_seq=block_seq,
-                heads_per_program=self.global_decode_heads_per_program,
-            )
-            output = torch.empty_like(q)
-            gemma4_decode_stage2(
-                mid_o,
-                mid_o_logexpsum,
-                view.meta.context_lens,
-                output,
-                block_seq=block_seq,
-                sliding_window=None,
-            )
-            return output
-        gemma4_decode_stage1(
-            q, payload.k_cache, payload.v_cache, view.meta.active_slots,
-            view.meta.req_indices, view.meta.context_lens, mid_o,
-            mid_o_logexpsum, block_seq=block_seq,
+            payload.k_cache,
+            payload.v_cache,
+            view.meta.active_slots,
+            view.meta.req_indices,
+            view.meta.context_lens,
+            workspace.mid_output[:batch_size],
+            workspace.mid_lse[:batch_size],
+            workspace.num_kv_splits[:batch_size],
             sliding_window=self.sliding_window,
+            multi_processor_count=multi_processor_count,
             attn_score=view.meta.attn_score,
         )
-        output = torch.empty_like(q)
-        gemma4_decode_stage2(
-            mid_o,
-            mid_o_logexpsum,
-            view.meta.context_lens,
-            output,
-            block_seq=block_seq,
-            sliding_window=self.sliding_window,
-        )
-        return output
 
 
-__all__ = ["Gemma4AttentionBackend", "Gemma4FlashInferPrefill"]
+__all__ = [
+    "Gemma4AttentionBackend",
+    "Gemma4DecodeWorkspace",
+    "Gemma4FlashInferPrefill",
+]

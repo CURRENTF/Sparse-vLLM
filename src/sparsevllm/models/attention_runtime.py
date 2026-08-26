@@ -8,7 +8,6 @@ from sparsevllm.method_registry import (
     sparse_decode_attention_requires_scores,
     sparse_prefill_attention_contract,
 )
-from sparsevllm.operators.moe import model_activation_dtype
 from sparsevllm.operators.decode_attention import (
     DecodeAttentionOpSpec,
     PreparedDecodeAttentionOp,
@@ -19,6 +18,7 @@ from sparsevllm.operators.full_attention import (
     FullAttentionProvider,
     prepare_full_attention_provider,
 )
+from sparsevllm.operators.moe import model_activation_dtype
 from sparsevllm.operators.prefill_attention import (
     PreparedPrefillAttentionOp,
     PrefillAttentionOpSpec,
@@ -163,6 +163,42 @@ def build_mha_decode_attention_spec(
         cuda_graph=bool(cuda_graph),
         h2o_layerwise_probability_scores=(
             normalized_method == "h2o" and requires_decode_scores
+        ),
+        batch_only_cuda_graph=(
+            bool(cuda_graph)
+            and str(
+                getattr(
+                    runtime_config,
+                    "decode_graph_shape_policy",
+                    "batch_only",
+                )
+            )
+            == "batch_only"
+        ),
+        context_capacity=int(getattr(runtime_config, "max_model_len", 0) or 0)
+        or None,
+        may_use_full_layer_kivi_int4=(
+            normalized_method == "deltakv"
+            and int(
+                getattr(runtime_config, "full_layer_kv_quant_bits", 0) or 0
+            )
+            == 4
+            and bool(
+                getattr(runtime_config, "enable_full_layer_kivi_quant", True)
+            )
+        ),
+        full_layer_kivi_decode_block_seq=int(
+            getattr(runtime_config, "full_layer_kivi_decode_block_seq", 256)
+            or 256
+        ),
+        full_layer_kivi_decode_block_n=int(
+            getattr(runtime_config, "full_layer_kivi_decode_block_n", 16) or 16
+        ),
+        full_layer_kivi_decode_num_warps=int(
+            getattr(runtime_config, "full_layer_kivi_decode_num_warps", 2) or 2
+        ),
+        full_layer_kivi_decode_num_stages=int(
+            getattr(runtime_config, "full_layer_kivi_decode_num_stages", 3) or 3
         ),
     )
 

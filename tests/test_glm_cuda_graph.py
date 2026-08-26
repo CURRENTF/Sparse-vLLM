@@ -12,7 +12,13 @@ import torch
 from torch import nn
 
 from sparsevllm.config import RuntimeLayout
+from sparsevllm.configs.cuda_graph import (
+    _default_decode_cuda_graph_capture_sizes,
+    build_decode_cuda_graph_startup_family_plan,
+    build_decode_cuda_graph_startup_plan,
+)
 from sparsevllm.models.layout import resolve_attention_qk_head_dim
+from sparsevllm.method_registry import sparse_decode_attention_score_kind
 from sparsevllm.distributed import ParallelContext
 from sparsevllm.engine.cache_manager import LayerBatchStates
 from sparsevllm.engine.cache_manager.h2o import H2OCacheManager
@@ -35,6 +41,7 @@ from sparsevllm.models.glm4_moe_lite import (
     Glm4MoeLiteForCausalLM,
     Glm4MoeLiteSparseMoeBlock,
 )
+from sparsevllm.operators.attention_capabilities import AttentionScoreKind
 from sparsevllm.operators.mla_attention import MlaAttentionOpSpec
 from sparsevllm.utils.context import get_context
 
@@ -43,6 +50,154 @@ from glm_test_helpers import (
     _single_rank_parallel_context,
     _tensor_sha256,
 )
+
+
+@pytest.mark.parametrize(
+    ("method", "expected"),
+    [
+        ("pyramidkv", AttentionScoreKind.RAW_QK_REDUCED),
+        ("omnikv", AttentionScoreKind.RAW_QK_PER_HEAD),
+        ("skipkv", AttentionScoreKind.RAW_QK_PER_HEAD),
+        ("deltakv", AttentionScoreKind.RAW_QK_PER_HEAD),
+        ("vanilla", AttentionScoreKind.NONE),
+    ],
+)
+def test_glm_sparse_method_declares_exact_decode_score_contract(
+    method,
+    expected,
+):
+    assert sparse_decode_attention_score_kind(method) is expected
+
+
+def test_startup_graph_plan_captures_complete_coarse_grid_when_it_fits():
+    plan = build_decode_cuda_graph_startup_plan(
+        [1, 2, 4, 8],
+        [1024, 2048, 4096, 8192, 16384, 32768, 33280],
+        32,
+    )
+
+    assert len(plan) == 28
+    assert plan[0] == (1, 1024)
+    assert plan[-1] == (8, 33280)
+
+
+def test_startup_graph_plan_spreads_contexts_and_preserves_mandatory_graph():
+    plan = build_decode_cuda_graph_startup_plan(
+        [1, 2, 4, 8],
+        [1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144],
+        12,
+        mandatory=(8, 8192),
+    )
+
+    assert len(plan) == 12
+    assert {batch for batch, _ in plan} == {1, 2, 4, 8}
+    assert (8, 8192) in plan
+    assert all(any(context == 262144 for b, context in plan if b == batch) for batch in (1, 2, 4))
+
+
+def test_startup_graph_plan_prioritizes_dense_batch_coverage():
+    batches = list(range(1, 9))
+    contexts = [1024, 2048, 4096, 8192, 16384, 32768, 65536]
+
+    plan = build_decode_cuda_graph_startup_plan(batches, contexts, 32)
+
+    assert len(plan) == 32
+    assert {batch for batch, _ in plan} == set(batches)
+    assert all((batch, 65536) in plan for batch in batches)
+    assert all(len([pair for pair in plan if pair[0] == batch]) == 4 for batch in batches)
+
+
+def test_startup_graph_plan_keeps_max_context_when_mandatory_cannot_fit():
+    plan = build_decode_cuda_graph_startup_plan(
+        [1, 2, 3],
+        [1024, 2048, 4096],
+        3,
+        mandatory=(3, 1024),
+    )
+
+    assert plan == [(1, 4096), (2, 4096), (3, 4096)]
+
+
+def test_sparse_startup_graph_plan_covers_short_and_long_families():
+    config = SimpleNamespace(
+        decode_graph_capture_sizes=list(range(1, 9)),
+        decode_graph_context_sizes=[1024, 2048, 4096, 8192, 16384, 32768],
+        decode_graph_startup_capture_limit=48,
+        decode_graph_max_cached_graphs=48,
+        sparse_method="snapkv",
+        sink_keep_tokens=64,
+        decode_keep_tokens=4096,
+        recent_keep_tokens=512,
+        max_model_len=32768,
+    )
+
+    plan = build_decode_cuda_graph_startup_family_plan(config)
+
+    assert len(plan) == 48
+    assert {(batch, is_long) for batch, _, is_long in plan} == {
+        (batch, is_long)
+        for batch in range(1, 9)
+        for is_long in (False, True)
+    }
+    assert all(context > 4672 for _, context, is_long in plan if is_long)
+    assert all(
+        len([key for key in plan if key[0] == batch and key[2] == is_long]) == 3
+        for batch in range(1, 9)
+        for is_long in (False, True)
+    )
+
+
+def test_h2o_startup_graph_plan_uses_normal_context_buckets():
+    config = SimpleNamespace(
+        decode_graph_capture_sizes=[1, 2, 4],
+        decode_graph_context_sizes=[1024, 2048, 4096, 8192, 16384],
+        decode_graph_startup_capture_limit=48,
+        decode_graph_max_cached_graphs=48,
+        sparse_method="h2o",
+        sink_keep_tokens=64,
+        decode_keep_tokens=4096,
+        recent_keep_tokens=512,
+        max_model_len=16384,
+    )
+
+    plan = build_decode_cuda_graph_startup_family_plan(config)
+
+    assert plan == sorted(
+        [
+            (batch, context, False)
+            for batch in (1, 2, 4)
+            for context in (1024, 2048, 4096, 8192, 16384)
+        ]
+        + [
+            (batch, context, True)
+            for batch in (1, 2, 4)
+            for context in (8192, 16384)
+        ],
+        reverse=True,
+    )
+
+
+def test_sparse_startup_graph_plan_covers_default_64_sequence_limit():
+    batches = _default_decode_cuda_graph_capture_sizes(64)
+    config = SimpleNamespace(
+        decode_graph_capture_sizes=batches,
+        decode_graph_context_sizes=[1024, 2048, 4096, 8192, 16384, 32768, 65536],
+        decode_graph_startup_capture_limit=48,
+        decode_graph_max_cached_graphs=48,
+        sparse_method="snapkv",
+        sink_keep_tokens=64,
+        decode_keep_tokens=4096,
+        recent_keep_tokens=512,
+        max_model_len=65536,
+    )
+
+    plan = build_decode_cuda_graph_startup_family_plan(config)
+
+    assert len(batches) == 22
+    assert len(plan) == 48
+    assert {(batch, is_long) for batch, _, is_long in plan} == {
+        (batch, is_long) for batch in batches for is_long in (False, True)
+    }
 
 
 def _make_glm_graph_lane(
@@ -978,6 +1133,7 @@ def _make_glm_method_graph_lane(
         cache_dtype=torch.bfloat16,
         tp_size=1,
         cuda_graph=True,
+        score_output=sparse_decode_attention_score_kind(method),
     )
     mla_attention = MLAAttention.bind(
         spec=spec,

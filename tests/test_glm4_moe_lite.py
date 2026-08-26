@@ -29,8 +29,10 @@ from sparsevllm.models.glm4_moe_lite import (
     Glm4MoeLiteForCausalLM,
     Glm4MoeLiteRouter,
     Glm4MoeLiteSparseMoeBlock,
+    build_glm4_moe_lite_mla_attention,
 )
 from sparsevllm.models.qwen3 import Qwen3MLP
+from sparsevllm.operators.attention_capabilities import AttentionScoreKind
 from sparsevllm.operators.mla_attention import MlaAttentionOpSpec
 from sparsevllm.operators.moe import TritonMoeProvider
 from sparsevllm.operators.moe_router import GlmBiasedSigmoidRouterProvider
@@ -194,6 +196,8 @@ def test_glm_runtime_kwargs_bind_model_owned_operators(
     context = _tp_context(tp_size=2)
     runtime = SimpleNamespace(
         decode_graph=True,
+        decode_graph_shape_policy="batch_only",
+        max_model_len=32768,
         max_num_seqs_in_batch=4,
         max_decoding_seqs=8,
         mla_prefill_workspace_bytes=1024,
@@ -233,8 +237,13 @@ def test_glm_runtime_kwargs_bind_model_owned_operators(
         max_batch_size=8,
         prefill_workspace_bytes=1024,
         decode_graph=True,
+        context_capacity=32768,
         projection_chunk_size=16,
-        may_require_attention_scores=requires_scores,
+        score_output=(
+            AttentionScoreKind.RAW_QK_PER_HEAD
+            if requires_scores
+            else AttentionScoreKind.NONE
+        ),
     )
     build_all_reduce.assert_called_once_with(
         config,
@@ -243,6 +252,36 @@ def test_glm_runtime_kwargs_bind_model_owned_operators(
         cuda_graph=True,
         device_index=1,
     )
+
+
+def test_glm_batch_only_mla_spec_owns_context_capacity() -> None:
+    config = _config()
+    config.decode_graph_shape_policy = "batch_only"
+    bound = object()
+    with (
+        patch(
+            "sparsevllm.models.glm4_moe_lite.get_parallel_context",
+            return_value=_tp_context(tp_size=2),
+        ),
+        patch(
+            "sparsevllm.models.glm4_moe_lite.MLAAttention.bind",
+            return_value=bound,
+        ) as bind,
+    ):
+        actual = build_glm4_moe_lite_mla_attention(
+            config,
+            device="cpu",
+            max_batch_size=8,
+            prefill_workspace_bytes=1024,
+            decode_graph=True,
+            context_capacity=32768,
+            projection_chunk_size=16,
+        )
+
+    assert actual is bound
+    spec = bind.call_args.kwargs["spec"]
+    assert spec.batch_only_cuda_graph
+    assert spec.context_capacity == 32768
 
 
 def test_glm_interleaved_rope_matches_transformers() -> None:

@@ -18,6 +18,7 @@ from sparsevllm.kernels.external.sgl.fa3 import (
 )
 from sparsevllm.kernels.tilelang.mla.runtime import (
     TileMlaDecodeKernel,
+    TileMlaLaunchPlan,
     tilelang_mla_support,
 )
 from sparsevllm.kernels.triton.mla import (
@@ -66,7 +67,9 @@ class MlaAttentionOpSpec:
     cache_dtype: torch.dtype
     tp_size: int
     cuda_graph: bool
-    may_require_attention_scores: bool = False
+    score_output: AttentionScoreKind = AttentionScoreKind.NONE
+    batch_only_cuda_graph: bool = False
+    context_capacity: int | None = None
 
     def __post_init__(self) -> None:
         dimensions = {
@@ -85,6 +88,18 @@ class MlaAttentionOpSpec:
                 "MLA query heads must be divisible by tensor parallel size: "
                 f"heads={self.num_q_heads} tp_size={self.tp_size}."
             )
+        if self.context_capacity is not None and self.context_capacity <= 0:
+            raise ValueError("MLA context_capacity must be positive.")
+        if self.score_output not in {
+            AttentionScoreKind.NONE,
+            AttentionScoreKind.RAW_QK_PER_HEAD,
+            AttentionScoreKind.RAW_QK_REDUCED,
+        }:
+            raise ValueError(
+                "MLA decode currently supports NONE, RAW_QK_PER_HEAD, or "
+                "RAW_QK_REDUCED score "
+                f"contracts, got {self.score_output.name}."
+            )
 
     @property
     def local_q_heads(self) -> int:
@@ -99,11 +114,7 @@ class MlaAttentionOpSpec:
         return AttentionKernelRequest(
             activation_dtype=self.activation_dtype,
             head_dim=self.qk_head_dim,
-            score_output=(
-                AttentionScoreKind.RAW_QK_REDUCED
-                if self.may_require_attention_scores
-                else AttentionScoreKind.NONE
-            ),
+            score_output=self.score_output,
             layer_varying_page_table=True,
             varlen=True,
             cuda_graph=self.cuda_graph,
@@ -146,6 +157,7 @@ class MlaTritonProvider(MlaAttentionProvider):
     """Portable SM90 provider with caller-independent decode workspace."""
 
     name = "triton_sm90"
+    supports_batch_only_cuda_graph = True
     capabilities = AttentionKernelCapabilities(
         platforms=frozenset({PlatformEnum.CUDA}),
         compute_capabilities=frozenset({(9, 0)}),
@@ -200,10 +212,18 @@ class MlaTritonProvider(MlaAttentionProvider):
         self._runtime_fallback_reasons: dict[str, int] = {}
 
     def binding_metadata(self) -> dict[str, object]:
-        return {
+        metadata = {
             "implementation_kind": "atomic_provider",
             "implementation_source": "repo_triton",
             "decode_kernel_path": "triton_mla_stage1_stage2",
+        }
+        if not self.spec.batch_only_cuda_graph:
+            return metadata
+        return {
+            **metadata,
+            "cuda_graph_shape_policy": "batch_only",
+            "context_capacity": self.spec.context_capacity,
+            "launch_plan_source": "batch_tp_heads_context_capacity",
         }
 
     def _record_runtime_kernel_path(self, path: str) -> None:
@@ -243,7 +263,7 @@ class MlaTritonProvider(MlaAttentionProvider):
         }
 
     @classmethod
-    def _contract_support(
+    def _common_contract_support(
         cls,
         spec: MlaAttentionOpSpec,
         caps: DeviceCaps,
@@ -291,7 +311,9 @@ class MlaTritonProvider(MlaAttentionProvider):
         spec: MlaAttentionOpSpec,
         caps: DeviceCaps,
     ) -> SupportResult:
-        return cls._contract_support(spec, caps)
+        if spec.batch_only_cuda_graph and spec.context_capacity is None:
+            return SupportResult.unsupported("requires a static context capacity")
+        return cls._common_contract_support(spec, caps)
 
     def _validate_run_inputs(
         self,
@@ -428,14 +450,21 @@ class MlaTritonProvider(MlaAttentionProvider):
     ) -> MlaDecodeLaunchConfig:
         if self._fixed_launch_config is not None:
             return self._fixed_launch_config
-        context_capacity = (
-            active_slot_width
-            if max_context_len is None
-            else int(max_context_len)
-        )
+        if self.spec.batch_only_cuda_graph:
+            if self.spec.context_capacity is None:
+                raise RuntimeError(
+                    "Batch-only MLA requires a static context capacity."
+                )
+            context_capacity = self.spec.context_capacity
+        else:
+            context_capacity = (
+                active_slot_width
+                if max_context_len is None
+                else int(max_context_len)
+            )
         return select_glm_mla_decode_config(
             batch_size=batch_size,
-            max_context_len=context_capacity,
+            context_capacity=context_capacity,
             local_q_heads=self.spec.local_q_heads,
         )
 
@@ -494,6 +523,7 @@ class MlaSglFa3Provider(MlaTritonProvider):
 
     name = "sgl_fa3_sm90"
     supports_explicit_prefill = True
+    supports_batch_only_cuda_graph = True
 
     def __init__(
         self,
@@ -521,10 +551,10 @@ class MlaSglFa3Provider(MlaTritonProvider):
         spec: MlaAttentionOpSpec,
         caps: DeviceCaps,
     ) -> SupportResult:
-        base = cls._contract_support(spec, caps)
+        base = cls._common_contract_support(spec, caps)
         if not base.supported:
             return base
-        if spec.may_require_attention_scores:
+        if spec.score_output is not AttentionScoreKind.NONE:
             return SupportResult.unsupported(
                 "does not satisfy the prepared score-output contract"
             )
@@ -719,9 +749,10 @@ class MlaSglFa3Provider(MlaTritonProvider):
     profile_only=True,
 )
 class MlaTileLangScoreProvider(MlaSglFa3Provider):
-    """Explicit score-aware Composite over FA3, TileLang, and Triton."""
+    """Score-aware Composite over FA3 and statically planned TileLang."""
 
     name = "tilelang_score_sgl_fa3_h100"
+    supports_batch_only_cuda_graph = True
 
     def __init__(
         self,
@@ -737,10 +768,22 @@ class MlaTileLangScoreProvider(MlaSglFa3Provider):
             max_batch_size=max_batch_size,
             launch_config=launch_config,
         )
+        if self.spec.context_capacity is None:
+            raise ValueError(
+                "TileLang MLA requires a capture-time context capacity."
+            )
+        self.tilelang_launch_plan = TileMlaLaunchPlan.build(
+            context_capacity=self.spec.context_capacity,
+            local_q_heads=self.spec.local_q_heads,
+            max_batch_size=self.max_batch_size,
+            need_score=True,
+            score_mode="per_head",
+        )
         self.tilelang_score = TileMlaDecodeKernel(
             device=self.device,
             softmax_scale=self.spec.softmax_scale,
             valid_heads=self.spec.local_q_heads,
+            launch_plan=self.tilelang_launch_plan,
         )
 
     @classmethod
@@ -749,12 +792,16 @@ class MlaTileLangScoreProvider(MlaSglFa3Provider):
         spec: MlaAttentionOpSpec,
         caps: DeviceCaps,
     ) -> SupportResult:
-        base = cls._contract_support(spec, caps)
+        base = cls._common_contract_support(spec, caps)
         if not base.supported:
             return base
-        if not spec.may_require_attention_scores:
+        if spec.score_output is not AttentionScoreKind.RAW_QK_PER_HEAD:
             return SupportResult.unsupported(
-                "score-capable Composite is not required by this operation"
+                "requires the RAW_QK_PER_HEAD decode score contract"
+            )
+        if spec.context_capacity is None:
+            return SupportResult.unsupported(
+                "requires a capture-time context capacity"
             )
         supported, reason = sgl_fa3_device_support(caps.device_index)
         if not supported:
@@ -765,29 +812,49 @@ class MlaTileLangScoreProvider(MlaSglFa3Provider):
     def binding_metadata(self) -> dict[str, object]:
         return {
             "implementation_kind": "composite_provider",
-            "implementation_source": "sglang-kernel+tilelang+repo_triton",
+            "implementation_source": "sglang-kernel+tilelang",
             "routes": {
                 "score_free": "sgl_kernel.fa3.fwd",
-                "reduced_score": "tilelang_mla_decode",
-                "unsupported_score_contract": "triton_mla_stage1_stage2",
+                "raw_qk_per_head": "tilelang_mla_decode",
             },
+            "tilelang_launch_plan": self.tilelang_launch_plan.metadata(),
         }
 
-    @staticmethod
-    def _tilelang_score_shape_supported(
+    def runtime_kernel_stats(self) -> dict[str, object]:
+        return {
+            **super().runtime_kernel_stats(),
+            "tilelang": self.tilelang_score.runtime_metadata(),
+        }
+
+    def _validate_tilelang_score_contract(
+        self,
         attn_score: torch.Tensor,
         *,
         max_context_len: int | None,
-    ) -> bool:
-        score_capacity = int(attn_score.shape[1]) if attn_score.ndim >= 2 else 0
-        return (
-            attn_score.ndim == 2
-            and attn_score.dtype == torch.float32
-            and score_capacity > 0
-            and score_capacity % 64 == 0
-            and max_context_len is not None
-            and int(max_context_len) <= score_capacity
-        )
+    ) -> None:
+        if attn_score.ndim != 3:
+            raise ValueError(
+                "TileLang MLA RAW_QK_PER_HEAD score must have shape "
+                f"[batch, heads, capacity], got {tuple(attn_score.shape)}."
+            )
+        if int(attn_score.shape[1]) != self.spec.local_q_heads:
+            raise ValueError(
+                "TileLang MLA score head count does not match the bound TP "
+                f"shape: expected={self.spec.local_q_heads} "
+                f"got={attn_score.shape[1]}."
+            )
+        if attn_score.dtype != torch.float32:
+            raise TypeError(
+                "TileLang MLA RAW_QK_PER_HEAD score must use FP32, got "
+                f"{attn_score.dtype}."
+            )
+        if max_context_len is None or not 0 < int(max_context_len) <= int(
+            attn_score.shape[2]
+        ):
+            raise ValueError(
+                "TileLang MLA score capacity must cover max_context_len: "
+                f"max={max_context_len} capacity={attn_score.shape[2]}."
+            )
 
     @staticmethod
     def _tilelang_layout_rejection_reason(
@@ -797,19 +864,12 @@ class MlaTileLangScoreProvider(MlaSglFa3Provider):
         if not isinstance(view.payload, MlaLatentPayload):
             return "payload_type"
         attn_score = view.meta.attn_score
-        if (
-            attn_score is not None
-            and attn_score.ndim == 2
-            and int(attn_score.shape[1]) > int(view.meta.active_slots.shape[1])
-        ):
-            return "score_capacity_exceeds_active_slots"
         tensors = {
             "latent_cache": view.payload.latent_cache,
             "rope_cache": view.payload.rope_cache,
             "active_slots": view.meta.active_slots,
             "request_indices": view.meta.req_indices,
             "context_lens": view.meta.context_lens,
-            "attn_score": view.meta.attn_score,
             "output": output,
         }
         rejected = [
@@ -840,34 +900,15 @@ class MlaTileLangScoreProvider(MlaSglFa3Provider):
                 validation_scope=validation_scope,
                 valid_batch_size=valid_batch_size,
             )
-        # Per-head or non-tile-aligned score buffers remain on the existing
-        # Triton implementation.  This is a static shape dispatch before any
-        # TileLang kernel launch, not an exception-driven runtime fallback.
-        if not self._tilelang_score_shape_supported(
+        self._validate_tilelang_score_contract(
             attn_score,
             max_context_len=view.meta.max_context_len,
-        ):
-            self._record_runtime_fallback("unsupported_score_shape")
-            return MlaTritonProvider.run(
-                self,
-                q_nope_absorbed,
-                q_rope,
-                view,
-                output,
-                validation_scope=validation_scope,
-                valid_batch_size=valid_batch_size,
-            )
+        )
         layout_rejection = self._tilelang_layout_rejection_reason(view, output)
         if layout_rejection is not None:
-            self._record_runtime_fallback(layout_rejection)
-            return MlaTritonProvider.run(
-                self,
-                q_nope_absorbed,
-                q_rope,
-                view,
-                output,
-                validation_scope=validation_scope,
-                valid_batch_size=valid_batch_size,
+            raise ValueError(
+                "TileLang MLA runtime view violates the bound layout contract: "
+                f"{layout_rejection}."
             )
         payload = self._validate_run_inputs(
             q_nope_absorbed,

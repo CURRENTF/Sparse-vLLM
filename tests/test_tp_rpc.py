@@ -493,6 +493,36 @@ def test_model_runner_reset_after_warmup_resets_local_runtime_state():
     assert calls == ["runtime"]
 
 
+def test_model_runner_decode_graph_startup_controls_use_live_runner():
+    calls = []
+    runner = object.__new__(ModelRunner)
+    runner.decode_graph_runner = SimpleNamespace(
+        set_reuse_larger_context_graphs=lambda enabled: calls.append(
+            ("reuse", enabled)
+        ),
+        seal_startup_plan=lambda: calls.append(("seal",)),
+        run=lambda seqs, capture_sampling: calls.append(
+            ("capture", seqs, capture_sampling)
+        ),
+    )
+    seqs = [object()]
+
+    with patch(
+        "sparsevllm.engine.model_runner.reset_context",
+        side_effect=lambda: calls.append(("reset",)),
+    ):
+        ModelRunner.set_decode_cuda_graph_reuse_larger_context_graphs(runner, True)
+        ModelRunner.seal_decode_cuda_graph_startup_plan(runner)
+        ModelRunner.capture_decode_cuda_graph_warmup(runner, seqs)
+
+    assert calls == [
+        ("reuse", True),
+        ("seal",),
+        ("capture", seqs, False),
+        ("reset",),
+    ]
+
+
 def test_model_runner_exit_drains_graphs_before_barrier():
     calls = []
     runner = object.__new__(ModelRunner)

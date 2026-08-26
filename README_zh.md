@@ -119,6 +119,9 @@ uv pip install flashinfer-cubin --index-url https://flashinfer.ai/whl
 
 CUDA 12.9 环境将 `cu130` 换成 `cu129`。
 
+主依赖固定使用 `sglang-kernel==0.4.5`，因为其编译算子必须匹配已经验证的
+PyTorch/CUDA ABI；其他版本会在 Provider 准备阶段明确失败，不会静默 fallback。
+
 Sparse-vLLM 支持未量化 BF16 和 block-scaled FP8 格式的
 Qwen3.5/Qwen3.6/Qwen3.8 checkpoint。三者共享 `qwen3_5` 运行时架构，以及
 相同的精度、并行方式、稀疏方法和多模态支持。其 prefill causal Conv1D 和

@@ -34,8 +34,10 @@ MAX_JOBS=8 uv pip install flash-attn --no-build-isolation
 
 Use `cu129` instead of `cu130` for CUDA 12.9.
 
-`einops`, `sglang-kernel`, and the training, benchmark, and test packages are all
-runtime dependencies, so workflow-specific extras are not required.
+`einops`, `sglang-kernel==0.4.5`, and the training, benchmark, and test packages
+are runtime dependencies, so workflow-specific extras are not required. The SGL
+kernel package is pinned to the validated PyTorch/CUDA ABI; other versions fail
+provider setup instead of falling back silently.
 
 Sparse-vLLM supports Qwen3.5/Qwen3.6/Qwen3.8 checkpoints in unquantized BF16
 and block-scaled FP8 formats. All three share the `qwen3_5` runtime architecture

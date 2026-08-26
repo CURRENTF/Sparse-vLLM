@@ -15,6 +15,8 @@ class ModelSpec:
     mixed_attention: bool = False
     allow_raw_config: bool = False
     supports_tiny_random: bool = True
+    supports_quantized_tiny_random: bool = False
+    tiny_random_requires_standard_head_shape: bool = True
     supports_expert_parallel: bool = False
     supports_outer_tp_moe: bool = False
     outer_tp_moe_config_field: str | None = None
@@ -163,6 +165,8 @@ MODEL_SPECS.update(
         "minimax_m2": ModelSpec(
             "MiniMax M2.7",
             requires_fp8=True,
+            supports_quantized_tiny_random=True,
+            tiny_random_requires_standard_head_shape=False,
             supports_expert_parallel=True,
             supports_outer_tp_moe=True,
             runtime_class_name="MiniMaxM2ForCausalLM",
@@ -173,6 +177,7 @@ MODEL_SPECS.update(
         ),
         "glm4_moe_lite": ModelSpec(
             "GLM-4.7-Flash",
+            tiny_random_requires_standard_head_shape=False,
             supports_expert_parallel=True,
             supports_outer_tp_moe=True,
             runtime_class_name="Glm4MoeLiteForCausalLM",

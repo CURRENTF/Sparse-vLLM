@@ -1044,6 +1044,13 @@ class DeltaKVCacheManager(CacheManager):
             # most historical tokens are either compressed or reconstructed on-the-fly.
             raise NotImplementedError("DeltaKV sparse layers should use build_*_compute_view().")
 
+    def _debug_token_slots_for_mapping(
+        self,
+        layer_idx: int | None,
+    ) -> torch.Tensor:
+        del layer_idx
+        return self.full_layer_slots_map
+
     @property
     def num_free_slots(self) -> int:
         # Scheduling should be conservative: we must be able to allocate both

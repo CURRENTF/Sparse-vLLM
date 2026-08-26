@@ -3,7 +3,6 @@ from __future__ import annotations
 import importlib
 import importlib.metadata
 import importlib.util
-import re
 
 from sparsevllm.kernels.external.support import (
     ExternalKernelFamilyError,
@@ -11,9 +10,8 @@ from sparsevllm.kernels.external.support import (
     KernelFamilyState,
 )
 
-_MIN_VERSION = (0, 4, 5)
-_MAX_VERSION = (0, 5, 0)
 _DISTRIBUTION = "sglang-kernel"
+_REQUIRED_VERSION = "0.4.5"
 
 
 def sgl_kernel_health() -> KernelFamilyHealth:
@@ -43,14 +41,12 @@ def sgl_kernel_health() -> KernelFamilyHealth:
             None,
             f"{_DISTRIBUTION} package metadata is unavailable",
         )
-    match = re.match(r"^(\d+)\.(\d+)\.(\d+)", version)
-    parsed = tuple(map(int, match.groups())) if match else None
-    if parsed is None or not _MIN_VERSION <= parsed < _MAX_VERSION:
+    if version != _REQUIRED_VERSION:
         return KernelFamilyHealth(
             _DISTRIBUTION,
             KernelFamilyState.BROKEN,
             version,
-            f"requires {_DISTRIBUTION}>=0.4.5,<0.5, got {version}",
+            f"requires {_DISTRIBUTION}=={_REQUIRED_VERSION}, got {version}",
         )
     try:
         importlib.import_module("sgl_kernel")

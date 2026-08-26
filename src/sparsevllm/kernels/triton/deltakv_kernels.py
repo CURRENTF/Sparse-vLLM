@@ -739,6 +739,9 @@ def _full_layer_kivi_flash_decode_stage1_kernel(
     FEAT_PER_INT: tl.constexpr,
     QUANT_MASK: tl.constexpr,
     STORE_SCORE: tl.constexpr,
+    FIXED_GRID: tl.constexpr,
+    MAX_EFFECTIVE_SPLITS: tl.constexpr,
+    TARGET_TOKENS_PER_SPLIT: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
     cur_kv_head = tl.program_id(1)
@@ -750,8 +753,28 @@ def _full_layer_kivi_flash_decode_stage1_kernel(
 
     cur_batch_seq_len = tl.load(B_Seqlen + cur_batch)
     cur_row = tl.load(Req_Indices + cur_batch).to(tl.int32)
-    cur_batch_start_index = seq_start_block * BLOCK_SEQ
-    cur_batch_end_index = tl.minimum(cur_batch_seq_len, cur_batch_start_index + BLOCK_SEQ)
+    if FIXED_GRID:
+        requested_splits = tl.cdiv(cur_batch_seq_len, TARGET_TOKENS_PER_SPLIT)
+        num_splits = tl.maximum(
+            1,
+            tl.minimum(requested_splits, MAX_EFFECTIVE_SPLITS),
+        )
+        split_tokens = tl.where(
+            requested_splits <= MAX_EFFECTIVE_SPLITS,
+            TARGET_TOKENS_PER_SPLIT,
+            tl.cdiv(cur_batch_seq_len, num_splits),
+        )
+        cur_batch_start_index = seq_start_block * split_tokens
+        cur_batch_end_index = tl.minimum(
+            cur_batch_seq_len,
+            cur_batch_start_index + split_tokens,
+        )
+    else:
+        cur_batch_start_index = seq_start_block * BLOCK_SEQ
+        cur_batch_end_index = tl.minimum(
+            cur_batch_seq_len,
+            cur_batch_start_index + BLOCK_SEQ,
+        )
 
     off_q = cur_batch * stride_qbs + cur_q_head_range[:, None] * stride_qh + offs_d[None, :] * stride_qd
     q = tl.load(
@@ -995,6 +1018,8 @@ def full_layer_kivi_flash_decode_stage1(
     num_warps: int = 2,
     num_stages: int = 3,
     attn_score: torch.Tensor | None = None,
+    max_kv_splits: int | None = None,
+    target_tokens_per_split: int | None = None,
 ):
     assert q.is_cuda and raw_k.is_cuda and raw_v.is_cuda
     assert raw_slots_map.is_cuda and kivi_block_slots_map.is_cuda and kivi_block_start_pos.is_cuda
@@ -1064,7 +1089,36 @@ def full_layer_kivi_flash_decode_stage1(
     if int(q.shape[1]) % num_kv_heads != 0:
         raise ValueError(f"Q heads must be divisible by KV heads, got {q.shape[1]}/{num_kv_heads}.")
 
-    grid = (batch, num_kv_heads, triton.cdiv(max_len_in_batch, block_seq))
+    fixed_grid = max_kv_splits is not None
+    if fixed_grid:
+        max_kv_splits = int(max_kv_splits)
+        target_tokens_per_split = int(target_tokens_per_split or 0)
+        if max_kv_splits <= 0 or target_tokens_per_split <= 0:
+            raise ValueError(
+                "Full-layer KIVI fixed-grid decode requires positive split capacity "
+                "and target tokens per split."
+            )
+        if int(mid_out.shape[2]) != max_kv_splits or int(mid_out_logsumexp.shape[2]) != max_kv_splits:
+            raise ValueError(
+                "Full-layer KIVI fixed-grid workspace does not match the split envelope: "
+                f"mid_out={tuple(mid_out.shape)} mid_lse={tuple(mid_out_logsumexp.shape)} "
+                f"max_kv_splits={max_kv_splits}."
+            )
+        if req_indices.dtype != torch.int32 or req_indices.stride(0) != 1:
+            raise TypeError("Full-layer KIVI fixed-grid req_indices must be contiguous int32.")
+        if context_lens.dtype != torch.int32 or context_lens.stride(0) != 1:
+            raise TypeError("Full-layer KIVI fixed-grid context_lens must be contiguous int32.")
+        req_indices_i32 = req_indices
+        context_lens_i32 = context_lens
+        grid_splits = max_kv_splits
+    else:
+        max_kv_splits = 1
+        target_tokens_per_split = 1
+        req_indices_i32 = req_indices.to(torch.int32).contiguous()
+        context_lens_i32 = context_lens.to(torch.int32).contiguous()
+        grid_splits = triton.cdiv(max_len_in_batch, block_seq)
+
+    grid = (batch, num_kv_heads, grid_splits)
     gqa_group_size = int(q.shape[1]) // num_kv_heads
     score_arg = attn_score if attn_score is not None else mid_out_logsumexp
     score_stride_b = score_arg.stride(0) if attn_score is not None else 0
@@ -1083,8 +1137,8 @@ def full_layer_kivi_flash_decode_stage1(
         value_packed,
         value_scales,
         value_mins,
-        req_indices.to(torch.int32).contiguous(),
-        context_lens.to(torch.int32).contiguous(),
+        req_indices_i32,
+        context_lens_i32,
         mid_out,
         mid_out_logsumexp,
         score_arg,
@@ -1136,6 +1190,9 @@ def full_layer_kivi_flash_decode_stage1(
         FEAT_PER_INT=8,
         QUANT_MASK=15,
         STORE_SCORE=attn_score is not None,
+        FIXED_GRID=fixed_grid,
+        MAX_EFFECTIVE_SPLITS=max_kv_splits,
+        TARGET_TOKENS_PER_SPLIT=target_tokens_per_split,
         num_warps=num_warps,
         num_stages=num_stages,
     )

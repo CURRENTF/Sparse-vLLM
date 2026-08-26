@@ -13,6 +13,10 @@ from sparsevllm.engine.cache_manager import (
     MlaLatentPayload,
     PrefillComputeView,
 )
+from sparsevllm.kernels.external.sgl.fa3 import sgl_fa3_support
+from sparsevllm.kernels.triton.mla import (
+    MlaDecodeWorkspace,
+)
 from sparsevllm.operators.mla_attention import (
     MLA_ATTENTION_REGISTRY,
     MlaAttentionOpSpec,
@@ -21,9 +25,6 @@ from sparsevllm.operators.mla_attention import (
 )
 from sparsevllm.operators.registry import OpResolver
 from sparsevllm.platforms import DeviceCaps, PlatformEnum
-from sparsevllm.kernels.triton.mla import (
-    MlaDecodeWorkspace,
-)
 
 
 def _spec(**overrides) -> MlaAttentionOpSpec:
@@ -37,6 +38,7 @@ def _spec(**overrides) -> MlaAttentionOpSpec:
         "cache_dtype": torch.bfloat16,
         "tp_size": 4,
         "cuda_graph": False,
+        "context_capacity": 65536,
     }
     values.update(overrides)
     return MlaAttentionOpSpec(**values)
@@ -80,6 +82,7 @@ def _cpu_workspace(batch_size: int, head_count: int) -> MlaDecodeWorkspace:
         {"value_head_dim": 0},
         {"tp_size": 0},
         {"num_q_heads": 20, "tp_size": 3},
+        {"context_capacity": 0},
     ],
 )
 def test_mla_attention_spec_rejects_invalid_dimensions(overrides) -> None:
@@ -101,6 +104,108 @@ def test_mla_triton_atomic_support_is_not_narrowed_by_device_name() -> None:
     )
 
     assert result.supported
+
+
+def test_batch_only_mla_requires_static_capacity() -> None:
+    spec = _spec(
+        cuda_graph=True,
+        batch_only_cuda_graph=True,
+        context_capacity=None,
+    )
+
+    result = MlaTritonProvider.supports(spec, _h100_caps())
+
+    assert not result.supported
+    assert "static context capacity" in result.reason
+
+
+def test_batch_only_mla_launch_config_ignores_runtime_context() -> None:
+    spec = _spec(
+        tp_size=2,
+        cuda_graph=True,
+        batch_only_cuda_graph=True,
+        context_capacity=32768,
+    )
+    workspace = _cpu_workspace(batch_size=32, head_count=10)
+    with patch(
+        "sparsevllm.operators.mla_attention.allocate_mla_decode_workspace",
+        return_value=workspace,
+    ):
+        provider = MlaTritonProvider(
+            op_spec=spec,
+            device="cpu",
+            max_batch_size=32,
+        )
+    launch_config = object()
+    with patch(
+        "sparsevllm.operators.mla_attention.select_glm_mla_decode_config",
+        return_value=launch_config,
+    ) as select:
+        first = provider._launch_config_for(
+            batch_size=32,
+            max_context_len=1,
+            active_slot_width=64,
+        )
+        second = provider._launch_config_for(
+            batch_size=32,
+            max_context_len=32000,
+            active_slot_width=65536,
+        )
+
+    assert first is launch_config
+    assert second is launch_config
+    assert select.call_count == 2
+    select.assert_called_with(
+        batch_size=32,
+        context_capacity=32768,
+        local_q_heads=10,
+    )
+
+
+def test_sgl_mla_accepts_batch_only_score_free_contract() -> None:
+    spec = _spec(
+        cuda_graph=True,
+        batch_only_cuda_graph=True,
+        context_capacity=32768,
+    )
+    with patch(
+        "sparsevllm.operators.mla_attention.sgl_fa3_device_support",
+        return_value=(True, "sgl test"),
+    ):
+        result = MlaSglFa3Provider.supports(spec, _h100_caps())
+
+    assert result.supported
+    assert MlaSglFa3Provider.supports_batch_only_cuda_graph
+
+
+def test_batch_only_mla_resolver_prefers_sgl_fa3() -> None:
+    spec = _spec(
+        cuda_graph=True,
+        batch_only_cuda_graph=True,
+        context_capacity=32768,
+    )
+    workspace = _cpu_workspace(batch_size=8, head_count=5)
+    with (
+        patch(
+            "sparsevllm.operators.mla_attention.sgl_fa3_device_support",
+            return_value=(True, "sgl test"),
+        ),
+        patch(
+            "sparsevllm.operators.mla_attention.allocate_mla_decode_workspace",
+            return_value=workspace,
+        ),
+        patch("sparsevllm.operators.mla_attention.SglFa3DecodeKernel"),
+    ):
+        resolved = OpResolver(MLA_ATTENTION_REGISTRY).resolve(
+            spec,
+            _h100_caps(),
+            op_spec=spec,
+            device="cpu",
+            max_batch_size=8,
+        )
+
+    assert type(resolved.provider) is MlaSglFa3Provider
+    assert resolved.report.selection_basis == "upstream_default"
 
 
 @pytest.mark.parametrize(
@@ -467,3 +572,126 @@ def test_mla_provider_runs_static_padded_batch() -> None:
 
     torch.testing.assert_close(output[1], torch.zeros_like(output[1]))
     assert bool(torch.isfinite(output).all().item())
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not sgl_fa3_support()[0],
+    reason="CUDA and a validated sglang-kernel are required",
+)
+@torch.inference_mode()
+def test_glm_production_provider_replays_across_1k_boundary() -> None:
+    torch.manual_seed(20260825)
+    device = torch.device("cuda")
+    capacity = 1025
+    spec = _spec(
+        tp_size=1,
+        cuda_graph=True,
+        batch_only_cuda_graph=True,
+        context_capacity=capacity,
+    )
+    provider = MlaSglFa3Provider(
+        op_spec=spec,
+        device=device,
+        max_batch_size=1,
+    )
+
+    q_nope_absorbed = 0.125 * torch.randn(
+        1,
+        spec.local_q_heads,
+        spec.kv_lora_rank,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    q_rope = 0.125 * torch.randn(
+        1,
+        spec.local_q_heads,
+        spec.rope_dim,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    payload = MlaLatentPayload(
+        latent_cache=0.125
+        * torch.randn(
+            capacity,
+            1,
+            spec.kv_lora_rank,
+            dtype=torch.bfloat16,
+            device=device,
+        ),
+        rope_cache=0.125
+        * torch.randn(
+            capacity,
+            1,
+            spec.rope_dim,
+            dtype=torch.bfloat16,
+            device=device,
+        ),
+    )
+    active_slots = torch.arange(
+        capacity,
+        dtype=torch.int32,
+        device=device,
+    ).unsqueeze(0)
+    context_lens = torch.tensor([1023], dtype=torch.int32, device=device)
+    view = DecodeComputeView(
+        meta=AttentionViewMeta(
+            active_slots=active_slots,
+            req_indices=torch.zeros(1, dtype=torch.int32, device=device),
+            context_lens=context_lens,
+            max_context_len=capacity,
+        ),
+        payload=payload,
+    )
+    output = torch.empty_like(q_nope_absorbed)
+    validation_scope = object()
+
+    provider.run(
+        q_nope_absorbed,
+        q_rope,
+        view,
+        output,
+        validation_scope=validation_scope,
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        provider.run(
+            q_nope_absorbed,
+            q_rope,
+            view,
+            output,
+            validation_scope=validation_scope,
+        )
+
+    static_ptrs = {
+        "active_slots": active_slots.data_ptr(),
+        "context_lens": context_lens.data_ptr(),
+        "output": output.data_ptr(),
+    }
+    captured_plans = provider.fa3._captured_scheduler_plans
+    assert len(captured_plans) == 1
+    scheduler_metadata_ptr = captured_plans[0].metadata.data_ptr()
+
+    for context_len in (1023, 1024, 1025):
+        context_lens.fill_(context_len)
+        graph.replay()
+        torch.cuda.synchronize()
+
+        latent = payload.latent_cache[:context_len, 0].float()
+        rope = payload.rope_cache[:context_len, 0].float()
+        logits = torch.einsum(
+            "hd,ld->hl",
+            q_nope_absorbed[0].float(),
+            latent,
+        ) + torch.einsum("hd,ld->hl", q_rope[0].float(), rope)
+        probabilities = torch.softmax(logits * spec.softmax_scale, dim=-1)
+        expected = torch.einsum("hl,ld->hd", probabilities, latent).to(torch.bfloat16)
+        torch.testing.assert_close(output[0], expected, rtol=3e-2, atol=3e-2)
+
+        assert active_slots.data_ptr() == static_ptrs["active_slots"]
+        assert context_lens.data_ptr() == static_ptrs["context_lens"]
+        assert output.data_ptr() == static_ptrs["output"]
+        assert len(provider.fa3._captured_scheduler_plans) == 1
+        assert (
+            provider.fa3._captured_scheduler_plans[0].metadata.data_ptr()
+            == scheduler_metadata_ptr
+        )

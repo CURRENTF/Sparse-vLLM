@@ -17,7 +17,7 @@ from sparsevllm.kernels.tilelang.support import tilelang_dependency_support
 
 _VALID_SPLITS = (1, 2, 4, 8, 16, 32)
 _SUPPORTED_VALID_HEADS = (5, 10, 20)
-_SCORE_MODES = ("direct", "atomic", "partial")
+_SCORE_MODES = ("direct", "atomic", "partial", "per_head")
 _HEAD_TILE_SIZE = 16
 _LATENT_DIM = 512
 _ROPE_DIM = 64
@@ -97,6 +97,88 @@ class TileMlaLaunchConfig:
                 f"TileLang MLA score_mode must be one of {_SCORE_MODES}, "
                 f"got {self.score_mode!r}."
             )
+
+
+@dataclass(frozen=True, slots=True)
+class TileMlaLaunchPlan:
+    """Capture-time TileLang variants for one model/device envelope."""
+
+    context_capacity: int
+    local_q_heads: int
+    max_batch_size: int
+    need_score: bool
+    configs: tuple[TileMlaLaunchConfig, ...]
+
+    @classmethod
+    def build(
+        cls,
+        *,
+        context_capacity: int,
+        local_q_heads: int,
+        max_batch_size: int,
+        need_score: bool,
+        score_mode: str | None = None,
+    ) -> TileMlaLaunchPlan:
+        if min(context_capacity, max_batch_size) <= 0:
+            raise ValueError(
+                "TileLang MLA launch plan requires positive context and batch "
+                f"capacities, got context={context_capacity} "
+                f"batch={max_batch_size}."
+            )
+        configs = []
+        for batch_size in range(1, int(max_batch_size) + 1):
+            config = select_tile_mla_config(
+                batch_size=batch_size,
+                context_capacity=int(context_capacity),
+                need_score=bool(need_score),
+                local_q_heads=int(local_q_heads),
+            )
+            if score_mode is not None:
+                config = TileMlaLaunchConfig(
+                    num_split=config.num_split,
+                    block_n=config.block_n,
+                    block_h=config.block_h,
+                    score_mode=score_mode,
+                )
+            configs.append(config)
+        return cls(
+            context_capacity=int(context_capacity),
+            local_q_heads=int(local_q_heads),
+            max_batch_size=int(max_batch_size),
+            need_score=bool(need_score),
+            configs=tuple(configs),
+        )
+
+    def config_for(self, batch_size: int, *, need_score: bool) -> TileMlaLaunchConfig:
+        if bool(need_score) != self.need_score:
+            raise ValueError(
+                "TileLang MLA launch plan score contract changed after binding: "
+                f"planned={self.need_score} requested={bool(need_score)}."
+            )
+        if not 0 < int(batch_size) <= self.max_batch_size:
+            raise ValueError(
+                "TileLang MLA batch exceeds the static launch plan: "
+                f"batch={batch_size} max={self.max_batch_size}."
+            )
+        return self.configs[int(batch_size) - 1]
+
+    def metadata(self) -> dict[str, object]:
+        return {
+            "context_capacity": self.context_capacity,
+            "local_q_heads": self.local_q_heads,
+            "max_batch_size": self.max_batch_size,
+            "need_score": self.need_score,
+            "batch_configs": [
+                {
+                    "batch_size": batch_size,
+                    "num_split": config.num_split,
+                    "block_n": config.block_n,
+                    "block_h": config.block_h,
+                    "score_mode": config.score_mode,
+                }
+                for batch_size, config in enumerate(self.configs, start=1)
+            ],
+        }
 
 
 def select_tile_mla_config(
@@ -182,11 +264,21 @@ class TileMlaDecodeKernel:
         softmax_scale: float,
         valid_heads: int = 10,
         fixed_config: TileMlaLaunchConfig | None = None,
+        launch_plan: TileMlaLaunchPlan | None = None,
     ) -> None:
         self.device = torch.device(device)
         self.softmax_scale = float(softmax_scale)
         self.valid_heads = int(valid_heads)
         self.padded_heads = _padded_head_count(self.valid_heads)
+        if fixed_config is not None and launch_plan is not None:
+            raise ValueError(
+                "TileLang MLA accepts either fixed_config or launch_plan, not both."
+            )
+        if launch_plan is not None and launch_plan.local_q_heads != self.valid_heads:
+            raise ValueError(
+                "TileLang MLA launch plan head count does not match the runner: "
+                f"plan={launch_plan.local_q_heads} runner={self.valid_heads}."
+            )
         if fixed_config is not None:
             if self.padded_heads % fixed_config.block_h:
                 raise ValueError(
@@ -195,7 +287,43 @@ class TileMlaDecodeKernel:
                     f"block_h={fixed_config.block_h}."
                 )
         self.fixed_config = fixed_config
+        self.launch_plan = launch_plan
         self._kernels: dict[_KernelKey, _BoundKernel] = {}
+
+    def runtime_metadata(self) -> dict[str, object]:
+        variants = []
+        for key, bound in self._kernels.items():
+            workspace_tensors = (
+                bound.workspace.padded_latent,
+                bound.workspace.padded_rope,
+                bound.workspace.glse,
+                bound.workspace.partial_output,
+                bound.workspace.score,
+            )
+            variants.append(
+                {
+                    "batch_size": key.batch_size,
+                    "cache_slot_count": key.cache_slot_count,
+                    "active_slot_rows": key.active_slot_rows,
+                    "active_slot_width": key.active_slot_width,
+                    "score_capacity": key.score_capacity,
+                    "num_split": key.num_split,
+                    "block_h": key.block_h,
+                    "score_mode": key.score_mode,
+                    "need_score": key.need_score,
+                    "workspace_bytes": sum(
+                        tensor.numel() * tensor.element_size()
+                        for tensor in workspace_tensors
+                    ),
+                    "workspace_data_ptrs": [
+                        tensor.data_ptr() for tensor in workspace_tensors
+                    ],
+                }
+            )
+        return {
+            "compiled_variant_count": len(variants),
+            "compiled_variants": variants,
+        }
 
     def _config_for(
         self,
@@ -204,6 +332,17 @@ class TileMlaDecodeKernel:
         context_capacity: int,
         need_score: bool,
     ) -> TileMlaLaunchConfig:
+        if self.launch_plan is not None:
+            if context_capacity > self.launch_plan.context_capacity:
+                raise ValueError(
+                    "TileLang MLA runtime context exceeds the static launch plan: "
+                    f"runtime={context_capacity} "
+                    f"plan={self.launch_plan.context_capacity}."
+                )
+            return self.launch_plan.config_for(
+                batch_size,
+                need_score=need_score,
+            )
         if self.fixed_config is not None:
             return self.fixed_config
         return select_tile_mla_config(
@@ -285,9 +424,13 @@ class TileMlaDecodeKernel:
             ),
             score=torch.empty(
                 key.batch_size,
-                self.padded_heads // config.block_h
-                if config.score_mode == "partial"
-                else 1,
+                (
+                    self.valid_heads
+                    if config.score_mode == "per_head"
+                    else self.padded_heads // config.block_h
+                    if config.score_mode == "partial"
+                    else 1
+                ),
                 key.score_capacity,
                 dtype=torch.float32,
                 device=self.device,
@@ -307,6 +450,7 @@ class TileMlaDecodeKernel:
         output: torch.Tensor,
         attn_score: torch.Tensor | None,
         max_context_len: int,
+        config: TileMlaLaunchConfig,
     ) -> tuple[int, int]:
         batch_size = int(q_latent.shape[0])
         expected = {
@@ -361,10 +505,16 @@ class TileMlaDecodeKernel:
                 )
         score_capacity = int(active_slots.shape[1])
         if attn_score is not None:
-            if attn_score.ndim != 2 or int(attn_score.shape[0]) != batch_size:
+            expected_prefix = (
+                (batch_size, self.valid_heads)
+                if config.score_mode == "per_head"
+                else (batch_size,)
+            )
+            if tuple(attn_score.shape[:-1]) != expected_prefix:
                 raise ValueError(
-                    "TileLang MLA reduced attn_score must have shape "
-                    f"[batch, capacity], got {tuple(attn_score.shape)}."
+                    "TileLang MLA attn_score shape does not match the static "
+                    f"{config.score_mode!r} contract: expected prefix "
+                    f"{expected_prefix}, got {tuple(attn_score.shape)}."
                 )
             if (
                 attn_score.dtype != torch.float32
@@ -374,21 +524,24 @@ class TileMlaDecodeKernel:
                     "TileLang MLA attn_score must be FP32 on the query device, "
                     f"got {attn_score.dtype} on {attn_score.device}."
                 )
-            if not attn_score.is_contiguous():
+            if (
+                not attn_score.is_contiguous()
+                and config.score_mode != "per_head"
+            ):
                 raise ValueError(
                     "TileLang MLA attn_score must be contiguous, got stride "
                     f"{tuple(attn_score.stride())}."
                 )
-            score_capacity = int(attn_score.shape[1])
-        if score_capacity <= 0 or score_capacity % _BLOCK_N:
+            score_capacity = int(attn_score.shape[-1])
+        if score_capacity <= 0:
             raise ValueError(
-                "TileLang MLA context/score capacity must be a positive "
-                f"multiple of {_BLOCK_N}, got {score_capacity}."
+                "TileLang MLA context/score capacity must be positive, got "
+                f"{score_capacity}."
             )
-        if score_capacity > int(active_slots.shape[1]):
+        if int(max_context_len) > int(active_slots.shape[1]):
             raise ValueError(
-                "TileLang MLA score capacity exceeds active slot width: "
-                f"score={score_capacity} slots={active_slots.shape[1]}."
+                "TileLang MLA active slot width does not cover max_context_len: "
+                f"max={max_context_len} slots={active_slots.shape[1]}."
             )
         if not 0 < int(max_context_len) <= score_capacity:
             raise ValueError(
@@ -412,6 +565,13 @@ class TileMlaDecodeKernel:
         attn_score: torch.Tensor | None,
         max_context_len: int,
     ) -> torch.Tensor:
+        batch_size = int(q_latent.shape[0])
+        need_score = attn_score is not None
+        config = self._config_for(
+            batch_size=batch_size,
+            context_capacity=int(max_context_len),
+            need_score=need_score,
+        )
         batch_size, score_capacity = self._validate(
             q_latent,
             q_rope,
@@ -423,12 +583,7 @@ class TileMlaDecodeKernel:
             output,
             attn_score,
             max_context_len,
-        )
-        need_score = attn_score is not None
-        config = self._config_for(
-            batch_size=batch_size,
-            context_capacity=int(max_context_len),
-            need_score=need_score,
+            config,
         )
         key = _KernelKey(
             batch_size=batch_size,
@@ -475,6 +630,11 @@ class TileMlaDecodeKernel:
         if attn_score is not None:
             if config.score_mode == "partial":
                 score_output.fill_(-1e20)
+            elif config.score_mode == "per_head":
+                if attn_score.is_contiguous():
+                    score_output = attn_score
+                else:
+                    score_output.fill_(-1e20)
             else:
                 score_output = attn_score.unsqueeze(1)
         bound.call(
@@ -492,12 +652,19 @@ class TileMlaDecodeKernel:
         )
         if attn_score is not None and config.score_mode == "partial":
             torch.amax(score_output, dim=1, out=attn_score)
+        elif (
+            attn_score is not None
+            and config.score_mode == "per_head"
+            and score_output is not attn_score
+        ):
+            attn_score.copy_(score_output)
         return output
 
 
 __all__ = [
     "TileMlaDecodeKernel",
     "TileMlaLaunchConfig",
+    "TileMlaLaunchPlan",
     "TileMlaWorkspace",
     "select_tile_mla_config",
     "tilelang_mla_support",

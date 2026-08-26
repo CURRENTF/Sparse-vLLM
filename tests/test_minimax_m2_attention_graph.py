@@ -1,9 +1,23 @@
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+
 import pytest
 import torch
 
+from sparsevllm.engine.cache_manager import (
+    AttentionViewMeta,
+    DecodeComputeView,
+    ExplicitKVPayload,
+)
+from sparsevllm.kernels.external.sgl.fa3 import sgl_fa3_support
 from sparsevllm.kernels.triton.flash_decoding_stage2 import flash_decode_stage2
 from sparsevllm.kernels.triton.gqa_flash_decoding_stage1 import flash_decode_stage1
 from sparsevllm.kernels.triton.store_kvcache import store_kvcache
+from sparsevllm.operators.decode_attention import (
+    DecodeAttentionOpSpec,
+    SglFa3PagedDecodeAttentionProvider,
+    prepare_decode_attention_op,
+)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -130,3 +144,98 @@ def test_minimax_m2_gqa_decode_cuda_graph_replay():
         run_decode()
         torch.cuda.synchronize()
         assert torch.equal(graph_output, output)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not sgl_fa3_support()[0],
+    reason="CUDA and a validated sglang-kernel are required",
+)
+def test_minimax_m2_production_provider_replays_across_32k_boundary():
+    torch.manual_seed(20260825)
+    device = torch.device("cuda")
+    query_heads, kv_heads, head_dim = 12, 2, 128
+    capacity = 32769
+    spec = DecodeAttentionOpSpec(
+        num_query_heads=query_heads,
+        num_kv_heads=kv_heads,
+        head_dim=head_dim,
+        activation_dtype=torch.bfloat16,
+        softmax_scale=head_dim**-0.5,
+        max_batch_size=1,
+        batch_only_cuda_graph=True,
+        context_capacity=capacity,
+    )
+    prepared = prepare_decode_attention_op(spec, device_index=device.index or 0)
+    assert isinstance(prepared.provider, SglFa3PagedDecodeAttentionProvider)
+
+    q = 0.25 * torch.randn(
+        1,
+        query_heads,
+        head_dim,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    k_cache = 0.25 * torch.randn(
+        capacity,
+        kv_heads,
+        head_dim,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    v_cache = torch.randn_like(k_cache)
+    active_slots = torch.arange(
+        capacity,
+        dtype=torch.int32,
+        device=device,
+    ).unsqueeze(0)
+    context_lens = torch.tensor([32767], dtype=torch.int32, device=device)
+    view = DecodeComputeView(
+        meta=AttentionViewMeta(
+            active_slots=active_slots,
+            req_indices=torch.zeros(1, dtype=torch.int32, device=device),
+            context_lens=context_lens,
+            max_context_len=capacity,
+        ),
+        payload=ExplicitKVPayload(k_cache=k_cache, v_cache=v_cache),
+    )
+
+    launch_profile = Mock(name="context_dependent_launch_profile")
+    validation_scope = object()
+    with patch(
+        "sparsevllm.operators.decode_attention.get_context",
+        return_value=SimpleNamespace(attention_validation_scope=validation_scope),
+    ):
+        prepared.run(q, view, decode_launch_op=launch_profile)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            graph_output = prepared.run(q, view, decode_launch_op=launch_profile)
+
+    for context_len in (32767, 32768, 32769):
+        context_lens.fill_(context_len)
+        graph.replay()
+        torch.cuda.synchronize()
+
+        active = active_slots[0, :context_len].long()
+        group_size = query_heads // kv_heads
+        expanded_k = k_cache[active].repeat_interleave(group_size, dim=1)
+        expanded_v = v_cache[active].repeat_interleave(group_size, dim=1)
+        logits = torch.einsum(
+            "hd,lhd->hl",
+            q[0].float(),
+            expanded_k.float(),
+        )
+        probabilities = torch.softmax(logits * spec.softmax_scale, dim=-1)
+        expected = torch.einsum(
+            "hl,lhd->hd",
+            probabilities,
+            expanded_v.float(),
+        ).to(torch.bfloat16)
+        torch.testing.assert_close(
+            graph_output[0],
+            expected,
+            rtol=3e-2,
+            atol=3e-2,
+        )
+
+    launch_profile.launch_config.assert_not_called()
+    prepared.close()

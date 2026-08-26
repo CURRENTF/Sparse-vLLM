@@ -570,11 +570,16 @@ def _run_decode_logits(
     max_tokens: int,
     hyper_params: dict[str, Any],
     use_graph: bool,
+    same_provider_eager: bool = False,
     trace_selection: bool = False,
 ) -> tuple[torch.Tensor, list[dict[str, Any]], dict[str, Any]]:
     from sparsevllm import LLM, SamplingParams
 
-    if os.getenv("SPARSEVLLM_DEBUG_SKIP_ENGINE_WARMUP", "0") == "1":
+    construct_with_graph = bool(use_graph or same_provider_eager)
+    if (
+        os.getenv("SPARSEVLLM_DEBUG_SKIP_ENGINE_WARMUP", "0") == "1"
+        or (same_provider_eager and not use_graph)
+    ):
         LLM._warmup = lambda self: None
 
     engine_kwargs = {
@@ -583,11 +588,15 @@ def _run_decode_logits(
         "max_model_len": max(prompt_lens) + max_tokens + 100,
         "max_num_seqs_in_batch": batch_size,
         "max_decoding_seqs": batch_size,
-        "decode_graph": bool(use_graph),
+        "decode_graph": construct_with_graph,
         "decode_graph_capture_sampling": False,
         "throughput_log_interval_s": 0.0,
     }
     llm = LLM(model_path, **engine_kwargs)
+    if same_provider_eager and not use_graph:
+        # Keep the graph-selected provider, but execute every decode step through
+        # DecodeCudaGraphRunner.run_eager_static() as the graph-independent oracle.
+        llm.config.decode_graph = False
     graph_counters_before = _start_graph_measurement(llm)
     method_calls = _install_method_instrumentation(llm)
     captured: list[torch.Tensor] = []
@@ -779,6 +788,14 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--atol", type=float, default=0.05)
     parser.add_argument("--rtol", type=float, default=0.05)
     parser.add_argument("--trace_selection", action="store_true")
+    parser.add_argument(
+        "--same_provider_eager",
+        action="store_true",
+        help=(
+            "Construct the eager control with decode_graph enabled so it binds "
+            "the same provider, skip startup capture, then execute eager-static."
+        ),
+    )
     return parser
 
 
@@ -853,6 +870,7 @@ def main(argv: list[str] | None = None):
             max_tokens=args.max_tokens,
             hyper_params=hyper_params,
             use_graph=False,
+            same_provider_eager=args.same_provider_eager,
             trace_selection=args.trace_selection,
         )
         graph_logits, graph_trace, graph_runtime = _run_decode_logits_isolated(
@@ -863,6 +881,7 @@ def main(argv: list[str] | None = None):
             max_tokens=args.max_tokens,
             hyper_params=hyper_params,
             use_graph=True,
+            same_provider_eager=args.same_provider_eager,
             trace_selection=args.trace_selection,
         )
 
@@ -936,6 +955,7 @@ def main(argv: list[str] | None = None):
             "prompt_lens": prompt_lens,
             "batch_size": args.batch_size,
             "max_tokens": args.max_tokens,
+            "same_provider_eager": bool(args.same_provider_eager),
             "hyper_params": hyper_params,
             "comparison": comparison,
             "generated_token_ids": {
@@ -980,6 +1000,7 @@ def main(argv: list[str] | None = None):
                     {
                         "status": "failed",
                         "method": args.method,
+                        "same_provider_eager": bool(args.same_provider_eager),
                         "error": traceback.format_exc(),
                     },
                     indent=2,
