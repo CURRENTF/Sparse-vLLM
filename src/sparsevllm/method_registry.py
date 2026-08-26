@@ -96,18 +96,14 @@ _PREFILL_POSTHOC_SCORE_METHODS = frozenset(
     {"snapkv", "pyramidkv", "h2o", "rkv"}
 )
 
+# Static method score contracts let providers bind before CUDA Graph capture
+# instead of changing the score-producing implementation during replay.
 _DECODE_ATTENTION_SCORE_KINDS = {
     "pyramidkv": AttentionScoreKind.RAW_QK_REDUCED,
     "omnikv": AttentionScoreKind.RAW_QK_PER_HEAD,
     "skipkv": AttentionScoreKind.RAW_QK_PER_HEAD,
     "deltakv": AttentionScoreKind.RAW_QK_PER_HEAD,
 }
-
-# These methods can request a score-producing decode launch on at least one
-# layer or decode step.  The answer is deliberately static so provider
-# selection happens before CUDA Graph capture and never changes in run().
-_DECODE_ATTENTION_SCORE_METHODS = frozenset(_DECODE_ATTENTION_SCORE_KINDS)
-
 
 def sparse_prefill_attention_contract(
     method: str | None,
