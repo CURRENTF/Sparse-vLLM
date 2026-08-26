@@ -59,7 +59,11 @@ def _paged_decode_stage1(
     seq_len = tl.load(B_Seqlen + batch_id)
     requested_splits = tl.cdiv(seq_len, TARGET_TOKENS_PER_SPLIT)
     num_splits = tl.maximum(1, tl.minimum(requested_splits, MAX_EFFECTIVE_SPLITS))
-    split_tokens = tl.cdiv(seq_len, num_splits)
+    split_tokens = tl.where(
+        requested_splits <= MAX_EFFECTIVE_SPLITS,
+        TARGET_TOKENS_PER_SPLIT,
+        tl.cdiv(seq_len, num_splits),
+    )
     split_start = split_id * split_tokens
     split_end = tl.minimum(split_start + split_tokens, seq_len)
     split_valid = (split_id < num_splits) & (split_start < split_end)
@@ -174,7 +178,11 @@ def _paged_grouped_decode_stage1(
     seq_len = tl.load(B_Seqlen + batch_id)
     requested_splits = tl.cdiv(seq_len, TARGET_TOKENS_PER_SPLIT)
     num_splits = tl.maximum(1, tl.minimum(requested_splits, MAX_EFFECTIVE_SPLITS))
-    split_tokens = tl.cdiv(seq_len, num_splits)
+    split_tokens = tl.where(
+        requested_splits <= MAX_EFFECTIVE_SPLITS,
+        TARGET_TOKENS_PER_SPLIT,
+        tl.cdiv(seq_len, num_splits),
+    )
     split_start = split_id * split_tokens
     split_end = tl.minimum(split_start + split_tokens, seq_len)
     split_valid = (split_id < num_splits) & (split_start < split_end)
@@ -357,6 +365,77 @@ def _check_inputs(
 
 
 @torch.no_grad()
+def fixed_grid_flash_decode_stage2(
+    mid_o: torch.Tensor,
+    mid_lse: torch.Tensor,
+    context_lens: torch.Tensor,
+    output: torch.Tensor,
+    output_lse: torch.Tensor,
+    *,
+    target_tokens_per_split: int,
+    num_warps: int | None = None,
+    num_stages: int = 2,
+) -> None:
+    """Reduce a fixed split envelope using device-resident effective lengths."""
+    if mid_o.dim() != 4 or mid_lse.dim() != 3:
+        raise ValueError("fixed-grid decode workspaces must be rank 4 and rank 3")
+    if tuple(mid_o.shape[:3]) != tuple(mid_lse.shape):
+        raise ValueError(
+            "fixed-grid decode workspace shapes do not match: "
+            f"mid_o={tuple(mid_o.shape)} mid_lse={tuple(mid_lse.shape)}"
+        )
+    batch, num_heads, max_kv_splits, head_dim = map(int, mid_o.shape)
+    if tuple(output.shape) != (batch, num_heads, head_dim):
+        raise ValueError(
+            "fixed-grid decode output shape does not match its workspace: "
+            f"output={tuple(output.shape)} expected={(batch, num_heads, head_dim)}"
+        )
+    if tuple(output_lse.shape) != (num_heads, batch):
+        raise ValueError(
+            "fixed-grid decode LSE output must be [heads, batch], got "
+            f"{tuple(output_lse.shape)}."
+        )
+    if context_lens.dtype != torch.int32 or context_lens.stride(0) != 1:
+        raise TypeError("fixed-grid decode context_lens must be contiguous int32")
+    if int(context_lens.numel()) != batch:
+        raise ValueError("fixed-grid decode expects one context length per batch row")
+    if max_kv_splits <= 0 or int(target_tokens_per_split) <= 0:
+        raise ValueError("fixed-grid decode split envelope must be positive")
+    if head_dim not in {16, 32, 64, 128, 256}:
+        raise ValueError(f"unsupported fixed-grid decode head_dim={head_dim}")
+    if output_lse.dtype != torch.float32 or output_lse.device != output.device:
+        raise TypeError("fixed-grid decode LSE output must be FP32 on the output device")
+    if num_warps is None:
+        num_warps = 8 if head_dim == 256 else 4
+    if int(num_warps) <= 0 or int(num_stages) <= 0:
+        raise ValueError("fixed-grid decode stage2 warps/stages must be positive")
+
+    _paged_decode_stage2[(batch, num_heads)](
+        context_lens,
+        mid_o,
+        mid_lse,
+        output,
+        output_lse,
+        mid_o.stride(0),
+        mid_o.stride(1),
+        mid_o.stride(2),
+        mid_lse.stride(0),
+        mid_lse.stride(1),
+        mid_lse.stride(2),
+        output.stride(0),
+        output.stride(1),
+        output_lse.stride(0),
+        output_lse.stride(1),
+        HEAD_DIM=head_dim,
+        MAX_KV_SPLITS=max_kv_splits,
+        MAX_EFFECTIVE_SPLITS=max_kv_splits,
+        TARGET_TOKENS_PER_SPLIT=int(target_tokens_per_split),
+        num_warps=int(num_warps),
+        num_stages=int(num_stages),
+    )
+
+
+@torch.no_grad()
 def paged_flash_decode(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -377,6 +456,7 @@ def paged_flash_decode(
     stage2_num_stages: int = 2,
     return_softmax_lse: bool = False,
     output_lse: torch.Tensor | None = None,
+    output: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Run fixed-grid split-KV decode for MHA or GQA."""
     _check_inputs(
@@ -466,7 +546,15 @@ def paged_flash_decode(
             **stage1_meta,
         )
 
-    output = torch.empty_like(q)
+    if output is None:
+        output = torch.empty_like(q)
+    elif tuple(output.shape) != tuple(q.shape):
+        raise ValueError(
+            "decode output workspace must match Q shape, got "
+            f"output={tuple(output.shape)} q={tuple(q.shape)}"
+        )
+    elif output.dtype != q.dtype or output.device != q.device:
+        raise TypeError("decode output workspace must match Q dtype and device")
     if output_lse is None:
         output_lse = torch.empty(
             (num_heads, batch), dtype=torch.float32, device=q.device
@@ -478,26 +566,13 @@ def paged_flash_decode(
         )
     if output_lse.dtype != torch.float32 or output_lse.device != q.device:
         raise TypeError("softmax LSE workspace must be FP32 on the query device")
-    _paged_decode_stage2[(batch, num_heads)](
-        context_lens,
+    fixed_grid_flash_decode_stage2(
         mid_o,
         mid_lse,
+        context_lens,
         output,
         output_lse,
-        mid_o.stride(0),
-        mid_o.stride(1),
-        mid_o.stride(2),
-        mid_lse.stride(0),
-        mid_lse.stride(1),
-        mid_lse.stride(2),
-        output.stride(0),
-        output.stride(1),
-        output_lse.stride(0),
-        output_lse.stride(1),
-        HEAD_DIM=head_dim,
-        MAX_KV_SPLITS=max_kv_splits,
-        MAX_EFFECTIVE_SPLITS=max_effective_splits,
-        TARGET_TOKENS_PER_SPLIT=target_tokens_per_split,
+        target_tokens_per_split=target_tokens_per_split,
         num_warps=stage2_num_warps,
         num_stages=stage2_num_stages,
     )

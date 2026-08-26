@@ -177,6 +177,29 @@ def build_mha_decode_attention_spec(
         ),
         context_capacity=int(getattr(runtime_config, "max_model_len", 0) or 0)
         or None,
+        may_use_full_layer_kivi_int4=(
+            normalized_method == "deltakv"
+            and int(
+                getattr(runtime_config, "full_layer_kv_quant_bits", 0) or 0
+            )
+            == 4
+            and bool(
+                getattr(runtime_config, "enable_full_layer_kivi_quant", True)
+            )
+        ),
+        full_layer_kivi_decode_block_seq=int(
+            getattr(runtime_config, "full_layer_kivi_decode_block_seq", 256)
+            or 256
+        ),
+        full_layer_kivi_decode_block_n=int(
+            getattr(runtime_config, "full_layer_kivi_decode_block_n", 16) or 16
+        ),
+        full_layer_kivi_decode_num_warps=int(
+            getattr(runtime_config, "full_layer_kivi_decode_num_warps", 2) or 2
+        ),
+        full_layer_kivi_decode_num_stages=int(
+            getattr(runtime_config, "full_layer_kivi_decode_num_stages", 3) or 3
+        ),
     )
 
 

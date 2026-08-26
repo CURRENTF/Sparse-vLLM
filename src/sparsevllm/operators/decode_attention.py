@@ -89,6 +89,11 @@ class DecodeAttentionOpSpec:
     h2o_layerwise_probability_scores: bool = False
     batch_only_cuda_graph: bool = False
     context_capacity: int | None = None
+    may_use_full_layer_kivi_int4: bool = False
+    full_layer_kivi_decode_block_seq: int = 256
+    full_layer_kivi_decode_block_n: int = 16
+    full_layer_kivi_decode_num_warps: int = 2
+    full_layer_kivi_decode_num_stages: int = 3
 
     def __post_init__(self) -> None:
         if self.num_query_heads <= 0 or self.num_kv_heads <= 0:
@@ -108,6 +113,49 @@ class DecodeAttentionOpSpec:
             )
         if self.context_capacity is not None and self.context_capacity <= 0:
             raise ValueError("Decode attention context_capacity must be positive.")
+        if self.may_use_full_layer_kivi_int4 and not self.layer_varying_page_table:
+            raise ValueError(
+                "Full-layer KIVI decode requires a layer-varying KV view contract."
+            )
+        if (
+            self.may_use_full_layer_kivi_int4
+            and (
+                self.full_layer_kivi_decode_block_seq <= 0
+                or self.full_layer_kivi_decode_block_seq % 16
+            )
+        ):
+            raise ValueError(
+                "Full-layer KIVI decode block_seq must be a positive multiple "
+                f"of 16, got {self.full_layer_kivi_decode_block_seq}."
+            )
+        if self.may_use_full_layer_kivi_int4 and (
+            self.full_layer_kivi_decode_block_n <= 0
+            or self.full_layer_kivi_decode_block_n % 16
+            or self.full_layer_kivi_decode_block_seq
+            % self.full_layer_kivi_decode_block_n
+        ):
+            raise ValueError(
+                "Full-layer KIVI decode block_n must be a positive multiple of "
+                "16 and divide block_seq, got "
+                f"block_n={self.full_layer_kivi_decode_block_n}, "
+                f"block_seq={self.full_layer_kivi_decode_block_seq}."
+            )
+        if (
+            self.may_use_full_layer_kivi_int4
+            and self.full_layer_kivi_decode_num_warps not in {1, 2, 4, 8}
+        ):
+            raise ValueError(
+                "Full-layer KIVI decode num_warps must be one of 1, 2, 4, "
+                f"or 8, got {self.full_layer_kivi_decode_num_warps}."
+            )
+        if (
+            self.may_use_full_layer_kivi_int4
+            and self.full_layer_kivi_decode_num_stages <= 0
+        ):
+            raise ValueError(
+                "Full-layer KIVI decode num_stages must be positive, got "
+                f"{self.full_layer_kivi_decode_num_stages}."
+            )
 
     @property
     def kernel_request(self) -> AttentionKernelRequest:
@@ -241,6 +289,28 @@ def build_graph_stable_decode_launch_plan(
     )
 
 
+def build_deltakv_kivi_decode_launch_plan(
+    spec: DecodeAttentionOpSpec,
+    caps: DeviceCaps,
+) -> GraphStableDecodeLaunchPlan:
+    """Resolve the fixed split envelope for packed full-layer KIVI decode."""
+    base = build_graph_stable_decode_launch_plan(spec, caps)
+    target_tokens_per_split = int(spec.full_layer_kivi_decode_block_seq)
+    max_kv_splits = min(
+        64,
+        max(4, math.ceil(base.context_capacity / target_tokens_per_split)),
+    )
+    return replace(
+        base,
+        plan_id="deltakv_kivi_fixed_grid_v1",
+        max_kv_splits=max_kv_splits,
+        target_tokens_per_split=target_tokens_per_split,
+        block_n=int(spec.full_layer_kivi_decode_block_n),
+        stage1_num_warps=int(spec.full_layer_kivi_decode_num_warps),
+        stage1_num_stages=int(spec.full_layer_kivi_decode_num_stages),
+    )
+
+
 DECODE_ATTENTION_REGISTRY: OpRegistry[
     DecodeAttentionOpSpec, DecodeAttentionProvider
 ] = OpRegistry(
@@ -254,6 +324,7 @@ DECODE_ATTENTION_REGISTRY: OpRegistry[
             "triton_paged_decode",
             "triton_fixed_grid_paged_decode",
         ),
+        repo_nonstandard=("triton_deltakv_fixed_grid_decode",),
     ),
 )
 
@@ -285,6 +356,10 @@ class SglFa3PagedDecodeAttentionProvider(DecodeAttentionProvider):
         spec: DecodeAttentionOpSpec,
         caps: DeviceCaps,
     ) -> SupportResult:
+        if spec.may_use_full_layer_kivi_int4:
+            return SupportResult.unsupported(
+                "does not support mixed dense and full-layer KIVI int4 storage"
+            )
         common = match_attention_capabilities(
             spec.kernel_request,
             caps,
@@ -425,6 +500,10 @@ class FlashInferPagedDecodeAttentionProvider(DecodeAttentionProvider):
         spec: DecodeAttentionOpSpec,
         caps: DeviceCaps,
     ) -> SupportResult:
+        if spec.may_use_full_layer_kivi_int4:
+            return SupportResult.unsupported(
+                "does not support mixed dense and full-layer KIVI int4 storage"
+            )
         common = match_attention_capabilities(
             spec.kernel_request,
             caps,
@@ -980,6 +1059,10 @@ class FixedGridTritonPagedDecodeAttentionProvider(DecodeAttentionProvider):
     ) -> SupportResult:
         if not spec.batch_only_cuda_graph:
             return SupportResult.unsupported("reserved for batch-only CUDA Graph")
+        if spec.may_use_full_layer_kivi_int4:
+            return SupportResult.unsupported(
+                "full-layer KIVI int4 requires the DeltaKV fixed-grid provider"
+            )
         if spec.context_capacity is None:
             return SupportResult.unsupported("requires a static context capacity")
         return match_attention_capabilities(
@@ -1101,6 +1184,391 @@ class FixedGridTritonPagedDecodeAttentionProvider(DecodeAttentionProvider):
         if not isinstance(result, tuple):
             raise RuntimeError("Fixed-grid decode did not return softmax LSE.")
         return DecodeAttentionRunResult(output=result[0], softmax_lse=result[1])
+
+
+@dataclass
+class _DeltaKVFixedGridDecodeState:
+    batch_capacity: int
+    launch_plan: GraphStableDecodeLaunchPlan
+    kivi_launch_plan: GraphStableDecodeLaunchPlan
+    mid_o: torch.Tensor
+    mid_lse: torch.Tensor
+    kivi_mid_o: torch.Tensor
+    kivi_mid_lse: torch.Tensor
+    output: torch.Tensor
+    output_lse: torch.Tensor
+
+    @classmethod
+    def allocate(
+        cls,
+        spec: DecodeAttentionOpSpec,
+        caps: DeviceCaps,
+        *,
+        batch_capacity: int,
+        context_capacity: int,
+        device: torch.device,
+    ) -> _DeltaKVFixedGridDecodeState:
+        graph_spec = replace(
+            spec,
+            max_batch_size=int(batch_capacity),
+            context_capacity=int(context_capacity),
+        )
+        launch_plan = build_graph_stable_decode_launch_plan(graph_spec, caps)
+        kivi_launch_plan = build_deltakv_kivi_decode_launch_plan(graph_spec, caps)
+        return cls(
+            batch_capacity=int(batch_capacity),
+            launch_plan=launch_plan,
+            kivi_launch_plan=kivi_launch_plan,
+            mid_o=torch.empty(
+                (
+                    batch_capacity,
+                    spec.num_query_heads,
+                    launch_plan.max_kv_splits,
+                    spec.head_dim,
+                ),
+                dtype=torch.float32,
+                device=device,
+            ),
+            mid_lse=torch.empty(
+                (
+                    batch_capacity,
+                    spec.num_query_heads,
+                    launch_plan.max_kv_splits,
+                ),
+                dtype=torch.float32,
+                device=device,
+            ),
+            kivi_mid_o=torch.empty(
+                (
+                    batch_capacity,
+                    spec.num_query_heads,
+                    kivi_launch_plan.max_kv_splits,
+                    spec.head_dim,
+                ),
+                dtype=torch.float32,
+                device=device,
+            ),
+            kivi_mid_lse=torch.empty(
+                (
+                    batch_capacity,
+                    spec.num_query_heads,
+                    kivi_launch_plan.max_kv_splits,
+                ),
+                dtype=torch.float32,
+                device=device,
+            ),
+            output=torch.empty(
+                (batch_capacity, spec.num_query_heads, spec.head_dim),
+                dtype=spec.activation_dtype,
+                device=device,
+            ),
+            output_lse=torch.empty(
+                (spec.num_query_heads, batch_capacity),
+                dtype=torch.float32,
+                device=device,
+            ),
+        )
+
+    def keepalive_tensors(self) -> list[torch.Tensor]:
+        return [
+            self.mid_o,
+            self.mid_lse,
+            self.kivi_mid_o,
+            self.kivi_mid_lse,
+            self.output,
+            self.output_lse,
+        ]
+
+
+@DECODE_ATTENTION_REGISTRY.register_atomic(ProviderRole.REPO_NONSTANDARD)
+class DeltaKVFixedGridDecodeAttentionProvider(DecodeAttentionProvider):
+    """Batch-only provider for DeltaKV's dense and full-layer KIVI views."""
+
+    name = "triton_deltakv_fixed_grid_decode"
+    supports_batch_only_cuda_graph = True
+    decode_graph_lifecycle = True
+    capabilities = replace(
+        FixedGridTritonPagedDecodeAttentionProvider.capabilities,
+        head_dims=frozenset({64, 128}),
+    )
+
+    def __init__(
+        self,
+        *,
+        caps: DeviceCaps,
+        launch_plan: GraphStableDecodeLaunchPlan,
+        kivi_launch_plan: GraphStableDecodeLaunchPlan,
+    ) -> None:
+        self._caps = caps
+        self.launch_plan = launch_plan
+        self.kivi_launch_plan = kivi_launch_plan
+        self._active_graph_state: _DeltaKVFixedGridDecodeState | None = None
+
+    @classmethod
+    def bind(
+        cls,
+        spec: DecodeAttentionOpSpec,
+        caps: DeviceCaps,
+        **provider_kwargs,
+    ) -> DeltaKVFixedGridDecodeAttentionProvider:
+        if provider_kwargs:
+            raise TypeError(
+                "DeltaKV fixed-grid decode does not accept provider arguments: "
+                f"{sorted(provider_kwargs)}."
+            )
+        return cls(
+            caps=caps,
+            launch_plan=build_graph_stable_decode_launch_plan(spec, caps),
+            kivi_launch_plan=build_deltakv_kivi_decode_launch_plan(spec, caps),
+        )
+
+    @classmethod
+    def supports(
+        cls,
+        spec: DecodeAttentionOpSpec,
+        caps: DeviceCaps,
+    ) -> SupportResult:
+        if not spec.batch_only_cuda_graph:
+            return SupportResult.unsupported("reserved for batch-only CUDA Graph")
+        if not spec.may_use_full_layer_kivi_int4:
+            return SupportResult.unsupported(
+                "reserved for mixed dense and full-layer KIVI int4 storage"
+            )
+        if spec.context_capacity is None:
+            return SupportResult.unsupported("requires a static context capacity")
+        return match_attention_capabilities(
+            spec.kernel_request,
+            caps,
+            cls.capabilities,
+        )
+
+    def prepare(
+        self,
+        spec: DecodeAttentionOpSpec,
+        *,
+        device_index: int | None = None,
+    ) -> None:
+        del device_index
+        plans = (self.launch_plan, self.kivi_launch_plan)
+        if any(plan.context_capacity != spec.context_capacity for plan in plans):
+            raise RuntimeError(
+                "DeltaKV fixed-grid launch plans do not match the operator "
+                f"capacity: plans={[plan.context_capacity for plan in plans]} "
+                f"spec={spec.context_capacity}."
+            )
+
+    def close(self) -> None:
+        self._active_graph_state = None
+
+    def binding_metadata(self) -> dict[str, object]:
+        return {
+            "implementation_kind": "atomic_provider",
+            "implementation_source": "repo_triton",
+            "kernel_path": "paged_flash_decode + full_layer_kivi_flash_decode",
+            "cuda_graph_shape_policy": "batch_only",
+            "launch_plan": self.launch_plan.as_dict(),
+            "kivi_launch_plan": self.kivi_launch_plan.as_dict(),
+            "workspace_owner": "per_graph_provider_state",
+            "payload_routes": ["dense", "full_layer_kivi"],
+        }
+
+    def init_decode_graph_state(
+        self,
+        spec: DecodeAttentionOpSpec,
+        contract,
+        inputs,
+    ) -> _DeltaKVFixedGridDecodeState:
+        if contract.shape_policy != "batch_only":
+            raise ValueError("DeltaKV fixed-grid state requires a batch-only contract.")
+        if int(contract.batch_capacity) > int(spec.max_batch_size):
+            raise ValueError(
+                "DeltaKV graph batch exceeds the prepared operator capacity: "
+                f"graph={contract.batch_capacity} operator={spec.max_batch_size}."
+            )
+        if spec.context_capacity is None or int(contract.context_capacity) > int(
+            spec.context_capacity
+        ):
+            raise ValueError(
+                "DeltaKV graph context exceeds the prepared operator capacity: "
+                f"graph={contract.context_capacity} operator={spec.context_capacity}."
+            )
+        return _DeltaKVFixedGridDecodeState.allocate(
+            spec,
+            self._caps,
+            batch_capacity=int(contract.batch_capacity),
+            context_capacity=int(contract.context_capacity),
+            device=inputs.context_lens.device,
+        )
+
+    def prepare_decode_graph_out(
+        self,
+        state: _DeltaKVFixedGridDecodeState,
+    ) -> None:
+        self._active_graph_state = state
+
+    def prepare_decode_graph_in(
+        self,
+        state: _DeltaKVFixedGridDecodeState,
+    ) -> None:
+        self._active_graph_state = state
+
+    def decode_graph_keepalive_tensors(
+        self,
+        state: _DeltaKVFixedGridDecodeState,
+    ) -> list[torch.Tensor]:
+        return state.keepalive_tensors()
+
+    def close_decode_graph_state(
+        self,
+        state: _DeltaKVFixedGridDecodeState,
+    ) -> None:
+        if self._active_graph_state is state:
+            self._active_graph_state = None
+
+    def run(
+        self,
+        spec: DecodeAttentionOpSpec,
+        q: torch.Tensor,
+        view: Any,
+        **kwargs,
+    ) -> torch.Tensor:
+        kwargs.pop("decode_launch_op", None)
+        if kwargs:
+            raise TypeError(
+                "DeltaKV fixed-grid decode received unsupported arguments: "
+                f"{sorted(kwargs)}."
+            )
+        state = self._active_graph_state
+        if state is None:
+            raise RuntimeError(
+                "DeltaKV fixed-grid decode has no active graph participant state."
+            )
+        batch_size = int(q.shape[0])
+        if batch_size > state.batch_capacity:
+            raise RuntimeError(
+                "DeltaKV fixed-grid decode batch exceeds active state capacity: "
+                f"batch={batch_size} capacity={state.batch_capacity}."
+            )
+        payload = view.payload
+        backend = getattr(payload, "backend", None)
+        if backend == "dense":
+            return self._run_dense(spec, q, view, state, batch_size)
+        if backend == "full_layer_kivi":
+            return self._run_full_layer_kivi(q, view, state, batch_size)
+        raise RuntimeError(
+            "DeltaKV fixed-grid decode requires dense or full-layer KIVI storage, "
+            f"got {backend!r}."
+        )
+
+    @staticmethod
+    def _run_dense(
+        spec: DecodeAttentionOpSpec,
+        q: torch.Tensor,
+        view: Any,
+        state: _DeltaKVFixedGridDecodeState,
+        batch_size: int,
+    ) -> torch.Tensor:
+        from sparsevllm.kernels.triton.paged_flash_decoding import (
+            paged_flash_decode,
+        )
+
+        return paged_flash_decode(
+            q,
+            view.payload.k_cache,
+            view.payload.v_cache,
+            view.meta.active_slots,
+            view.meta.req_indices,
+            view.meta.context_lens,
+            state.mid_o[:batch_size],
+            state.mid_lse[:batch_size],
+            attn_score=view.meta.attn_score,
+            softmax_scale=spec.softmax_scale,
+            target_tokens_per_split=state.launch_plan.target_tokens_per_split,
+            block_n=state.launch_plan.block_n,
+            num_warps=state.launch_plan.stage1_num_warps,
+            num_stages=state.launch_plan.stage1_num_stages,
+            stage2_num_warps=state.launch_plan.stage2_num_warps,
+            stage2_num_stages=state.launch_plan.stage2_num_stages,
+            output_lse=state.output_lse[:, :batch_size],
+            output=state.output[:batch_size],
+        )
+
+    @staticmethod
+    def _run_full_layer_kivi(
+        q: torch.Tensor,
+        view: Any,
+        state: _DeltaKVFixedGridDecodeState,
+        batch_size: int,
+    ) -> torch.Tensor:
+        metadata = getattr(view.payload, "metadata", None)
+        if metadata is None:
+            raise RuntimeError("Full-layer KIVI decode view is missing metadata.")
+        required = (
+            "kivi_block_slots_map",
+            "kivi_block_start_pos",
+            "key_packed",
+            "key_scales",
+            "key_mins",
+            "value_packed",
+            "value_scales",
+            "value_mins",
+            "group_size",
+        )
+        missing = [name for name in required if name not in metadata]
+        if missing:
+            raise RuntimeError(
+                f"Full-layer KIVI decode view is missing metadata: {missing}."
+            )
+
+        from sparsevllm.kernels.triton.deltakv_kernels import (
+            full_layer_kivi_flash_decode_stage1,
+        )
+        from sparsevllm.kernels.triton.paged_flash_decoding import (
+            fixed_grid_flash_decode_stage2,
+        )
+
+        plan = state.kivi_launch_plan
+        mid_o = state.kivi_mid_o[:batch_size]
+        mid_lse = state.kivi_mid_lse[:batch_size]
+        full_layer_kivi_flash_decode_stage1(
+            q=q,
+            raw_k=view.payload.k_cache,
+            raw_v=view.payload.v_cache,
+            raw_slots_map=view.meta.active_slots,
+            kivi_block_slots_map=metadata["kivi_block_slots_map"],
+            kivi_block_start_pos=metadata["kivi_block_start_pos"],
+            key_packed=metadata["key_packed"],
+            key_scales=metadata["key_scales"],
+            key_mins=metadata["key_mins"],
+            value_packed=metadata["value_packed"],
+            value_scales=metadata["value_scales"],
+            value_mins=metadata["value_mins"],
+            req_indices=view.meta.req_indices,
+            context_lens=view.meta.context_lens,
+            max_len_in_batch=plan.context_capacity,
+            mid_out=mid_o,
+            mid_out_logsumexp=mid_lse,
+            group_size=int(metadata["group_size"]),
+            block_seq=plan.target_tokens_per_split,
+            block_n=plan.block_n,
+            num_warps=plan.stage1_num_warps,
+            num_stages=plan.stage1_num_stages,
+            attn_score=view.meta.attn_score,
+            max_kv_splits=plan.max_kv_splits,
+            target_tokens_per_split=plan.target_tokens_per_split,
+        )
+        output = state.output[:batch_size]
+        fixed_grid_flash_decode_stage2(
+            mid_o,
+            mid_lse,
+            view.meta.context_lens,
+            output,
+            state.output_lse[:, :batch_size],
+            target_tokens_per_split=plan.target_tokens_per_split,
+            num_warps=plan.stage2_num_warps,
+            num_stages=plan.stage2_num_stages,
+        )
+        return output
 
 
 class PreparedDecodeAttentionOp:

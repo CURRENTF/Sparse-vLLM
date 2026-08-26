@@ -272,7 +272,10 @@ class ModelRunner:
                 max_decoding_seqs=config.max_decoding_seqs,
             ),
         )
-        if self.config.decode_graph_shape_policy == "batch_only":
+        if (
+            self.config.decode_graph
+            and self.config.decode_graph_shape_policy == "batch_only"
+        ):
             validate_batch_only_decode_graph_model(self.model)
         if config.tiny_random:
             from sparsevllm.debug.tiny_random import initialize_sparse_model

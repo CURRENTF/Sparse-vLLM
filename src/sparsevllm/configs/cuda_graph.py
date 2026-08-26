@@ -520,12 +520,6 @@ def normalize_decode_cuda_graph(config) -> None:
         isinstance(context_sizes, str) and context_sizes.strip().lower() in {"", "auto"}
     )
     if config.decode_graph:
-        if config.decode_graph_shape_policy == "batch_only" and str(
-            config.sparse_method or ""
-        ) == "deltakv":
-            raise ValueError(
-                "DeltaKV batch-only decode CUDA Graph is not validated; use bucketed."
-            )
         if config.enable_prefix_caching:
             if config.decode_graph_capture_sampling:
                 raise ValueError(

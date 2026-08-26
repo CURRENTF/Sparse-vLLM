@@ -1592,6 +1592,13 @@ class CacheManager(ABC):
         """Return a small set of free-slot stats for logging/debugging."""
         return {"free_slots": int(self.num_free_slots)}
 
+    def _debug_token_slots_for_mapping(
+        self,
+        layer_idx: int | None,
+    ) -> torch.Tensor:
+        token_slots = getattr(self, "buffer_req_to_token_slots")
+        return token_slots if layer_idx is None else token_slots[layer_idx]
+
     def debug_state_summary(self) -> dict[str, Any]:
         """Return a synchronized-test snapshot without touching the inference hot path."""
         live_rows = {}
@@ -1605,10 +1612,9 @@ class CacheManager(ABC):
             if not isinstance(mapping, dict) or not mapping:
                 continue
             row_seq_lens = getattr(self, "row_seq_lens")
-            token_slots = getattr(self, "buffer_req_to_token_slots")
+            token_slots = self._debug_token_slots_for_mapping(layer_idx)
             if layer_idx is not None:
                 row_seq_lens = row_seq_lens[layer_idx]
-                token_slots = token_slots[layer_idx]
             records = []
             for seq_id, row_idx in sorted(mapping.items()):
                 row_len = int(row_seq_lens[row_idx])
