@@ -55,7 +55,9 @@ GLM-4.7-Flash uses BF16 latent MLA on NVIDIA H100 80GB HBM3 and requires
 `DP=1`. The validated `(TP, EP)` layouts are
 `(1,1)`, `(2,1)`, `(4,1)`, `(1,2)`, `(1,4)`, `(2,2)`, `(4,2)`, and `(4,4)`.
 Across all eight layouts, vanilla, StreamingLLM, SnapKV, H2O, OmniKV, and R-KV
-support decode CUDA Graph and prefix caching together. Prefix caching uses
+support decode CUDA Graph and prefix caching together. QuEST has a latent-aware
+decode path and decode CUDA Graph registration, but does not support prefix
+caching or prefix offload. Prefix caching uses
 radix mode for vanilla and OmniKV, and chain mode for StreamingLLM, SnapKV,
 H2O, and R-KV. Prefix offload, quantization, and the other sparse methods
 remain unsupported. The loader intentionally skips the checkpoint's MTP
@@ -70,7 +72,7 @@ layer.
 | Qwen3MoE | ✅ | ✅ | ✅ | Experimental⁴ | ✅ | ✅ | ✅ | ✅ | — | — |
 | Qwen3.5 / 3.6 / 3.8 | ✅ | ✅ | ✅ | Experimental⁴ | ✅ | ✅ | ✅ | ✅ | — | Matched checkpoint³ |
 | Qwen3.6 MoE | ✅ | ✅ | ✅ | Experimental⁴ | ✅ | ✅ | ✅ | ✅ | — | — |
-| GLM-4.7-Flash | ✅⁵ | ✅⁵ | ✅⁵ | Experimental⁴⁵ | — | ✅⁵ | — | ✅⁵ | — | — |
+| GLM-4.7-Flash | ✅⁵ | ✅⁵ | ✅⁵ | Experimental⁴⁵ | — | ✅⁵ | Experimental⁵ | ✅⁵ | — | — |
 | Gemma 4 Dense / MoE | ✅ | ✅⁶ | — | — | — | ✅ | — | — | — | — |
 | Llama 3 / 3.1 | ✅ | ✅ | ✅ | Experimental⁴ | ✅ | ✅ | ✅ | ✅ | Selected checkpoint¹ | Compressor required² |
 | MiniMax M2.7 | ✅ | ✅ | ✅ | Experimental⁴ | ✅ | ✅ | ✅ | ✅ | — | — |
@@ -92,7 +94,8 @@ global-head selection. Model-specific TP, EP, and DP restrictions still apply.
 ⁵ GLM support is limited to the eight `(TP, EP)` layouts listed above with
 `DP=1`. At `TP>1`, head-scored sparse methods use TP-local selection without
 cross-rank sparse-index aggregation, so their selection semantics are not
-guaranteed to match `TP=1`.
+guaranteed to match `TP=1`. The QuEST entry records code integration only;
+GPU numerical correctness, CUDA Graph replay, and performance validation are pending.
 
 ⁶ Gemma 4 checkpoints with shared KV layers reject per-layer StreamingLLM
 eviction. Vanilla and OmniKV remain supported.

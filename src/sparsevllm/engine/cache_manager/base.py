@@ -177,6 +177,40 @@ AttentionPayload = ExplicitKVPayload | MlaLatentPayload
 
 
 @dataclass(frozen=True)
+class MlaLatentSelectionQuery:
+    """Decode query expressed in the same coordinates as MLA latent storage."""
+
+    latent: torch.Tensor
+    rope: torch.Tensor
+
+    def fused(self) -> torch.Tensor:
+        if self.latent.ndim != 3 or self.rope.ndim != 3:
+            raise ValueError(
+                "MLA latent selection queries must have shape [batch, heads, dim], "
+                f"got latent={tuple(self.latent.shape)} rope={tuple(self.rope.shape)}."
+            )
+        if self.latent.shape[:2] != self.rope.shape[:2]:
+            raise ValueError(
+                "MLA latent and RoPE selection queries must share batch/head axes, "
+                f"got latent={tuple(self.latent.shape)} rope={tuple(self.rope.shape)}."
+            )
+        if self.latent.device != self.rope.device:
+            raise ValueError(
+                "MLA latent and RoPE selection queries must share a device, got "
+                f"latent={self.latent.device} rope={self.rope.device}."
+            )
+        if self.latent.dtype != self.rope.dtype:
+            raise TypeError(
+                "MLA latent and RoPE selection queries must share a dtype, got "
+                f"latent={self.latent.dtype} rope={self.rope.dtype}."
+            )
+        return torch.cat((self.latent, self.rope), dim=-1)
+
+
+AttentionSelectionQuery = torch.Tensor | MlaLatentSelectionQuery
+
+
+@dataclass(frozen=True)
 class ExplicitKVWrite:
     """Current-token key/value tensors to persist."""
 
@@ -1149,7 +1183,7 @@ class CacheManager(ABC):
     def build_decode_view(
         self,
         layer_idx: int,
-        q: torch.Tensor,
+        q: AttentionSelectionQuery,
         active_slots: torch.Tensor,
         req_indices: torch.Tensor,
         context_lens: torch.Tensor,
@@ -1160,10 +1194,21 @@ class CacheManager(ABC):
         """Optional method-specific decode-time logical view builder."""
         return active_slots, req_indices, context_lens
 
+    def build_decode_selection_query(
+        self,
+        q: torch.Tensor,
+        *,
+        mla_latent: torch.Tensor | None = None,
+        mla_rope: torch.Tensor | None = None,
+    ) -> AttentionSelectionQuery:
+        """Translate an attention query into this cache manager's score space."""
+        del mla_latent, mla_rope
+        return q
+
     def build_decode_compute_view(
         self,
         layer_idx: int,
-        q: torch.Tensor,
+        q: AttentionSelectionQuery,
         selection: SparseSelection,
         *,
         num_heads: int,
@@ -1195,13 +1240,19 @@ class CacheManager(ABC):
                 selection,
             )
         )
+        max_context_len = selection.max_context_len
+        if max_context_len is not None and active_slots.ndim >= 2:
+            max_context_len = min(
+                int(max_context_len),
+                int(active_slots.shape[1]),
+            )
         return DecodeComputeView(
             meta=AttentionViewMeta(
                 active_slots=active_slots,
                 req_indices=req_indices,
                 context_lens=context_lens,
                 attn_score=selection.attn_score,
-                max_context_len=selection.max_context_len,
+                max_context_len=max_context_len,
             ),
             payload=payload,
         )

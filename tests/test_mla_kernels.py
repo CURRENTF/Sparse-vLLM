@@ -28,6 +28,42 @@ CUDA_REQUIRED = pytest.mark.skipif(
 DECODE_CONTEXTS = (1, 31, 32, 33, 127, 128, 129, 255, 256, 257, 1024, 4096)
 
 
+class _CaptureMetadataTensor:
+    """CUDA-shaped metadata double that rejects graph-unsafe host reads."""
+
+    device = torch.device("cuda")
+    dtype = torch.int32
+
+    def __init__(self, shape: tuple[int, ...]):
+        self.shape = shape
+        self.ndim = len(shape)
+
+    def numel(self) -> int:
+        result = 1
+        for size in self.shape:
+            result *= size
+        return result
+
+    def tolist(self):
+        raise AssertionError("capture validation must not read CUDA values")
+
+
+def test_mla_decode_metadata_capture_validation_is_host_read_free(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "sparsevllm.kernels.triton.mla.decode_schedule.device_runtime.is_stream_capturing",
+        lambda: True,
+    )
+    validate_mla_decode_metadata(
+        _CaptureMetadataTensor((2, 32)),
+        _CaptureMetadataTensor((2,)),
+        _CaptureMetadataTensor((2,)),
+        cache_slot_count=64,
+        max_context_len=32,
+    )
+
+
 def _torch_mla_decode(
     q_latent: torch.Tensor,
     q_rope: torch.Tensor,

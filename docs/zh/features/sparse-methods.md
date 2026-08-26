@@ -15,7 +15,7 @@ Sparse-vLLM 围绕 cache-manager-first sparse runtime 构建。engine 支持 phy
 | `h2o` | Physical eviction | H2O 为每个 KV layer 和物理 row 分别维护累计 attention-importance vector。Prefill 每个 chunk 都评分并物理淘汰，最后一个 prefill chunk 收缩到 decode budget。当前关闭 decode 评分和周期淘汰：decode 保持 score-free，物理 row 随生成 token 增长。Prefill 淘汰保留 heavy hitter 与 recent 后缀。Sparse-vLLM v1 在单层内的 KV head 之间共享一套 token 选择，但绝不跨 layer 共享 score 或保留索引。 | `h2o_decode_budget`, `h2o_prefill_budget`, `h2o_recent_ratio`, `h2o_prefill_score_window`, `sparse_prefill_score_mode` |
 | `pyramidkv` | Physical eviction | PyramidKV 风格、依赖 layer 的 KV 保留方式。它在 layer 之间分配 sparse budget，并物理存储选中的 context token。 | `decode_keep_tokens`, `sink_keep_tokens`, `recent_keep_tokens`, `sparse_prefill_score_mode` |
 | `omnikv` | Logical masking | OmniKV 保留 physical cache，但为选定 layer 构建 sparse attention view。适用于不改写 cache storage、同时降低 attention 计算量的场景。 | `full_attention_layers`, `decode_keep_tokens`, `sink_keep_tokens`, `recent_keep_tokens` |
-| `quest` | Query-aware page selection | QuEST 根据 decode query 选择 token page。prefill 保持 dense，decode 通过 page/chunk budget 执行 sparse selection。 | `quest_chunk_size`, `quest_skip_layers`, `sink_keep_tokens`, `decode_keep_tokens`, `recent_keep_tokens` |
+| `quest` | Query-aware page selection | QuEST 根据持久化的 page min/max summary 选择 token page，prefill 保持 dense。显式 KV 模型在 key 坐标中评分；GLM-4.7-Flash 使用匹配的 absorbed decode query 对融合 MLA latent/RoPE cache 评分，同时 compute payload 继续保持 latent。 | `quest_chunk_size`, `quest_skip_layers`, `sink_keep_tokens`, `decode_keep_tokens`, `recent_keep_tokens` |
 | `deltakv` | Hybrid compression | 依赖 compressor 的精简 DeltaKV runtime。旧配置中的 `deltakv-less-memory*` 名称会规范到此方法，但实际 benchmark run 仍需要匹配的 compressor checkpoint。 | `deltakv_checkpoint_path`, `deltakv_latent_dim`, `deltakv_center_ratio`, `deltakv_neighbor_count`, `deltakv_latent_quant_bits`, `full_layer_kv_quant_bits` |
 
 Sparse-vLLM 在内部将该值存为 `vllm_sparse_method`，但 public command 和 `LLM(...)` kwarg 应使用 `sparse_method`。
@@ -55,6 +55,8 @@ DeltaKV family 方法和 PyramidKV 只对外提供 `long_bs1full_short_batch` po
 `prefix_cache_mode=auto` 为 vanilla/OmniKV/QuEST 选择 radix，为
 SnapKV/H2O/PyramidKV/R-KV/SkipKV 选择线性 chain。也可以显式请求 `radix`
 或 `chain`，但不兼容的方法/模式组合会快速失败。
+GLM-4.7-Flash QuEST 是 storage-specific 例外：当前 latent QuEST 路径不支持
+Prefix Cache 或 Prefix offload，配置会明确拒绝这两种组合。
 
 Chain 布局跨 turn 保留同一个驻留 `seq_id`，且永不分支。调用方发送完整逻辑
 上下文和服务端返回的 `chain_id`；服务端验证 processed boundary 后只转发新增

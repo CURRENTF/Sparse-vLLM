@@ -200,13 +200,15 @@ MINIMAX_M2_TP_EP_COMPATIBILITY = ModelRuntimeCompatibility(
 
 GLM4_MOE_LITE_EP_COMPATIBILITY = ModelRuntimeCompatibility(
     sparse_methods=frozenset(
-        {"", "streamingllm", "snapkv", "h2o", "omnikv", "rkv"}
+        {"", "streamingllm", "snapkv", "h2o", "omnikv", "quest", "rkv"}
     ),
     prefix_cache_methods=frozenset(
         {"", "streamingllm", "snapkv", "h2o", "omnikv", "rkv"}
     ),
+    # TODO: Validate GLM latent QuEST numerical correctness and interleaved
+    # CUDA Graph capture/replay on the supported TP/EP matrix.
     decode_cuda_graph_methods=frozenset(
-        {"", "streamingllm", "snapkv", "h2o", "omnikv", "rkv"}
+        {"", "streamingllm", "snapkv", "h2o", "omnikv", "quest", "rkv"}
     ),
 )
 

@@ -15,6 +15,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sparsevllm.platforms import device_runtime
+
 from .decode_stage1 import MLA_LATENT_DIM, decode_stage1
 from .decode_stage2 import decode_stage2
 
@@ -370,6 +372,12 @@ def validate_mla_decode_metadata(
             f"max_context_len={context_capacity} "
             f"active_slot_width={int(active_slots.shape[1])}."
         )
+
+    # Shape, dtype, device, and caller-owned capacity are graph-static and safe
+    # to validate during capture. Per-row value checks below require GPU-to-host
+    # reads and therefore remain eager-only.
+    if device_runtime.is_stream_capturing():
+        return
 
     request_rows = request_indices.tolist()
     lengths = context_lens.tolist()

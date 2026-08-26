@@ -21,13 +21,21 @@ from sparsevllm.platforms import device_runtime
 from sparsevllm.utils.context import get_context
 from sparsevllm.utils.profiler import profiler
 
-from .base import CacheManager, LayerBatchStates, SparseSelection
+from .base import (
+    AttentionCacheWrite,
+    AttentionPayload,
+    CacheManager,
+    LayerBatchStates,
+    MlaLatentSelectionQuery,
+    SparseSelection,
+)
 from .prefix_cache_mixin import PrefixCacheMixin
 from .prefix_offload import (
     PinnedQuestPrefixPool,
     PrefixH2DOperation,
     QuestPrefixOffloadController,
 )
+from .storage import ExplicitKVStorage, MlaLatentStorage, create_attention_cache_storage
 
 
 @dataclass
@@ -49,6 +57,26 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
         self.max_pages_per_row = (self.max_model_len + self.page_size - 1) // self.page_size
         self.page_offsets_i32 = torch.arange(self.page_size, dtype=torch.int32, device=self.device)
         self.page_offsets_i64 = self.page_offsets_i32.to(torch.int64)
+
+        self.attention_cache_storage = create_attention_cache_storage(
+            config,
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_dim,
+        )
+        if isinstance(self.attention_cache_storage, MlaLatentStorage):
+            self.metadata_num_heads = 1
+            self.metadata_head_dim = (
+                int(self.attention_cache_storage.kv_lora_rank)
+                + int(self.attention_cache_storage.rope_dim)
+            )
+        elif isinstance(self.attention_cache_storage, ExplicitKVStorage):
+            self.metadata_num_heads = self.num_kv_heads
+            self.metadata_head_dim = self.head_dim
+        else:
+            raise NotImplementedError(
+                "QuEST requires homogeneous explicit KV or MLA latent storage, got "
+                f"{type(self.attention_cache_storage).__name__}."
+            )
 
         self.allocate_kv_cache()
 
@@ -93,13 +121,14 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
         self.seq_id_to_cached_pages: dict[int, set[int]] = {}
         self._prefill_metadata_full_pages = False
 
-        # [2, L, P, H_kv, D] -> 0:max, 1:min
+        # [2, L, P, H_meta, D_meta] -> 0:max, 1:min. Explicit KV uses
+        # per-KV-head keys; MLA uses the fused [latent, RoPE] key coordinates.
         self.metadata_cache = torch.empty(
             2,
             self.num_kv_layers,
             self.num_pages,
-            self.num_kv_heads,
-            self.head_dim,
+            self.metadata_num_heads,
+            self.metadata_head_dim,
             dtype=self.hf_config.torch_dtype,
             device=self.device,
         )
@@ -174,23 +203,45 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
     def allocate_kv_cache(self):
         available_memory, slot_bytes_per_layer = self._get_available_slots_info()
 
-        # QuEST keeps one extra min/max page summary per physical page.
-        effective_slot_bytes = int(slot_bytes_per_layer * (1.0 + 1.0 / self.page_size))
-        total_token_slots = available_memory // (self.num_kv_layers * effective_slot_bytes)
-        total_token_slots = (total_token_slots // self.page_size) * self.page_size
+        page_bytes_per_layer = (
+            self.page_size * int(slot_bytes_per_layer)
+            + self._metadata_bytes_per_page_per_layer()
+        )
+        total_pages = available_memory // (
+            self.num_kv_layers * page_bytes_per_layer
+        )
+        total_token_slots = int(total_pages * self.page_size)
         assert total_token_slots > 0, "Available memory is insufficient for QuEST paged KV cache"
 
         self.config.num_kvcache_slots = total_token_slots
         self.num_pages = total_token_slots // self.page_size
 
-        self.kv_cache = torch.empty(
-            2,
-            self.num_kv_layers,
-            total_token_slots,
-            self.num_kv_heads,
-            self.head_dim,
-            dtype=self.hf_config.torch_dtype,
+        self.attention_cache_storage.allocate(
+            num_layers=self.num_kv_layers,
+            num_slots=total_token_slots,
             device=self.device,
+        )
+        self.kv_cache = getattr(self.attention_cache_storage, "cache", None)
+
+    def attention_cache_bytes_per_slot_per_layer(self) -> int:
+        storage = getattr(self, "attention_cache_storage", None)
+        if storage is None:
+            return super().attention_cache_bytes_per_slot_per_layer()
+        return int(storage.bytes_per_slot_per_layer())
+
+    def _metadata_bytes_per_page_per_layer(self) -> int:
+        dtype_size = torch.empty((), dtype=self.hf_config.torch_dtype).element_size()
+        metadata_num_heads = getattr(self, "metadata_num_heads", None)
+        metadata_head_dim = getattr(self, "metadata_head_dim", None)
+        if metadata_num_heads is None:
+            metadata_num_heads = self.num_kv_heads
+        if metadata_head_dim is None:
+            metadata_head_dim = self.head_dim
+        return int(
+            2
+            * int(metadata_num_heads)
+            * int(metadata_head_dim)
+            * dtype_size
         )
 
     def _kv_allocation_bytes_per_prefix_block(
@@ -212,7 +263,11 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
     ) -> int:
         page_count = int(token_count) // self.page_size
         token_kv_bytes = int(token_count) * self.num_kv_layers * int(slot_bytes_per_layer)
-        page_metadata_bytes = page_count * self.num_kv_layers * int(slot_bytes_per_layer)
+        page_metadata_bytes = (
+            page_count
+            * self.num_kv_layers
+            * self._metadata_bytes_per_page_per_layer()
+        )
         return int(token_kv_bytes + page_metadata_bytes)
 
     def get_layer_batch_states(self, layer_idx: int) -> LayerBatchStates:
@@ -220,11 +275,71 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
 
     def get_layer_kv_cache(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
         kv_idx = self.kv_layer_index(layer_idx)
-        return self.kv_cache[0, kv_idx], self.kv_cache[1, kv_idx]
+        payload = self.attention_cache_storage.layer_payload(kv_idx)
+        if not isinstance(self.attention_cache_storage, ExplicitKVStorage):
+            raise TypeError(
+                "get_layer_kv_cache requires explicit KV storage, got "
+                f"{type(self.attention_cache_storage).__name__}."
+            )
+        return payload.k_cache, payload.v_cache
 
     def get_layer_store_view(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        kv_idx = self.kv_layer_index(layer_idx)
-        return self.kv_cache[0, kv_idx], self.kv_cache[1, kv_idx], self.layer_batch_state.slot_mapping
+        k_cache, v_cache = self.get_layer_kv_cache(layer_idx)
+        return k_cache, v_cache, self.layer_batch_state.slot_mapping
+
+    def store_attention_payload(
+        self,
+        layer_idx: int,
+        payload: AttentionCacheWrite,
+    ) -> torch.Tensor:
+        slot_mapping = self.layer_batch_state.slot_mapping
+        if slot_mapping is None:
+            raise RuntimeError(
+                f"Attention cache store requires slot_mapping at layer={layer_idx}."
+            )
+        self.attention_cache_storage.store(
+            self.kv_layer_index(layer_idx),
+            slot_mapping,
+            payload,
+        )
+        return slot_mapping
+
+    def get_layer_compute_payload(
+        self,
+        layer_idx: int,
+        active_slots: torch.Tensor,
+        req_indices: torch.Tensor,
+        context_lens: torch.Tensor,
+        selection: SparseSelection | None = None,
+    ) -> tuple[AttentionPayload, torch.Tensor, torch.Tensor, torch.Tensor]:
+        del selection
+        return (
+            self.attention_cache_storage.layer_payload(
+                self.kv_layer_index(layer_idx)
+            ),
+            active_slots,
+            req_indices,
+            context_lens,
+        )
+
+    def get_prefill_compute_payload(
+        self,
+        layer_idx: int,
+        k_current: torch.Tensor,
+        v_current: torch.Tensor,
+        selection: SparseSelection,
+        active_slots: torch.Tensor,
+        req_indices: torch.Tensor,
+        context_lens: torch.Tensor,
+    ) -> tuple[AttentionPayload, torch.Tensor, torch.Tensor, torch.Tensor]:
+        del k_current, v_current
+        return self.get_layer_compute_payload(
+            layer_idx,
+            active_slots,
+            req_indices,
+            context_lens,
+            selection,
+        )
 
     def get_layer_compute_tensors(self, layer_idx: int, selection: SparseSelection | None = None):
         del selection
@@ -1605,6 +1720,52 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
             return input_ids, positions, None
 
     @torch.no_grad()
+    def _attention_metadata_keys(
+        self,
+        layer_idx: int,
+        slot_mapping: torch.Tensor,
+        current_keys: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        storage = self.attention_cache_storage
+        if isinstance(storage, ExplicitKVStorage):
+            if current_keys is not None:
+                keys = current_keys
+            else:
+                payload = storage.layer_payload(self.kv_layer_index(layer_idx))
+                keys = payload.k_cache.index_select(
+                    0,
+                    slot_mapping.to(device=payload.k_cache.device, dtype=torch.long),
+                )
+        elif isinstance(storage, MlaLatentStorage):
+            payload = storage.layer_payload(self.kv_layer_index(layer_idx))
+            slots = slot_mapping.to(
+                device=payload.latent_cache.device,
+                dtype=torch.long,
+            )
+            keys = torch.cat(
+                (
+                    payload.latent_cache.index_select(0, slots),
+                    payload.rope_cache.index_select(0, slots),
+                ),
+                dim=-1,
+            )
+        else:
+            raise AssertionError(
+                f"Unhandled QuEST storage {type(storage).__name__}."
+            )
+        expected_shape = (
+            int(slot_mapping.numel()),
+            self.metadata_num_heads,
+            self.metadata_head_dim,
+        )
+        if tuple(keys.shape) != expected_shape:
+            raise RuntimeError(
+                "QuEST metadata keys do not match the registered score space: "
+                f"layer={layer_idx} expected={expected_shape} got={tuple(keys.shape)}."
+            )
+        return keys
+
+    @torch.no_grad()
     def on_kv_stored(
         self,
         layer_idx: int,
@@ -1621,8 +1782,17 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
             # `on_forward_end()` refreshes completed pages after replay/eager
             # decode, before the next step can score previous pages.
             return
+        metadata_keys = self._attention_metadata_keys(
+            layer_idx,
+            slot_mapping,
+            current_keys=k,
+        )
         if self._is_stream_capturing():
-            self._on_kv_stored_prefill_capture(layer_idx, k, slot_mapping)
+            self._on_kv_stored_prefill_capture(
+                layer_idx,
+                metadata_keys,
+                slot_mapping,
+            )
             return
 
         with profiler.record("quest_update_metadata"):
@@ -1634,11 +1804,11 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
                     self.page_size,
                     rounding_mode="floor",
                 ).to(torch.long)
-                full_page_k = k.view(
+                full_page_k = metadata_keys.view(
                     -1,
                     self.page_size,
-                    self.num_kv_heads,
-                    self.head_dim,
+                    self.metadata_num_heads,
+                    self.metadata_head_dim,
                 )
                 page_min, page_max = torch.aminmax(full_page_k, dim=1)
                 page_max_cache.index_copy_(0, full_page_slots, page_max)
@@ -1650,7 +1820,6 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
             unique_pages, counts = torch.unique_consecutive(page_slots, return_counts=True)
             page_max_cache = self.metadata_cache[0, kv_idx]
             page_min_cache = self.metadata_cache[1, kv_idx]
-            k_cache = self.kv_cache[0, kv_idx]
             run_starts = counts.cumsum(0) - counts
             start_offsets = page_offsets.index_select(0, run_starts)
             end_offsets = start_offsets + counts
@@ -1660,11 +1829,14 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
                 full_run_starts = run_starts[full_page_mask].to(torch.int64)
                 full_page_slots = unique_pages[full_page_mask].to(torch.int64)
                 full_token_indices = full_run_starts[:, None] + self.page_offsets_i64[None, :]
-                full_page_k = k.index_select(0, full_token_indices.reshape(-1)).view(
+                full_page_k = metadata_keys.index_select(
+                    0,
+                    full_token_indices.reshape(-1),
+                ).view(
                     -1,
                     self.page_size,
-                    self.num_kv_heads,
-                    self.head_dim,
+                    self.metadata_num_heads,
+                    self.metadata_head_dim,
                 )
                 page_min, page_max = torch.aminmax(full_page_k, dim=1)
                 page_max_cache.index_copy_(0, full_page_slots, page_max)
@@ -1674,18 +1846,26 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
             if completed_page_mask.any():
                 completed_page_slots = unique_pages[completed_page_mask].to(torch.int64)
                 page_token_indices = completed_page_slots[:, None] * self.page_size + self.page_offsets_i64[None, :]
-                full_page_k = k_cache.index_select(0, page_token_indices.reshape(-1)).view(
+                full_page_k = self._attention_metadata_keys(
+                    layer_idx,
+                    page_token_indices.reshape(-1),
+                ).view(
                     -1,
                     self.page_size,
-                    self.num_kv_heads,
-                    self.head_dim,
+                    self.metadata_num_heads,
+                    self.metadata_head_dim,
                 )
                 page_min, page_max = torch.aminmax(full_page_k, dim=1)
                 page_max_cache.index_copy_(0, completed_page_slots, page_max)
                 page_min_cache.index_copy_(0, completed_page_slots, page_min)
 
     @torch.no_grad()
-    def _on_kv_stored_prefill_capture(self, layer_idx: int, k: torch.Tensor, slot_mapping: torch.Tensor):
+    def _on_kv_stored_prefill_capture(
+        self,
+        layer_idx: int,
+        metadata_keys: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ):
         """Update QuEST full-page metadata without dynamic shape ops during capture.
 
         Prefill graph capture is currently exercised for first-prefill chunks, so
@@ -1705,11 +1885,11 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
                 self.page_size,
                 rounding_mode="floor",
             ).to(torch.long)
-            full_page_k = k[:full_token_count].view(
+            full_page_k = metadata_keys[:full_token_count].view(
                 -1,
                 self.page_size,
-                self.num_kv_heads,
-                self.head_dim,
+                self.metadata_num_heads,
+                self.metadata_head_dim,
             )
             page_min, page_max = torch.aminmax(full_page_k, dim=1)
             page_max_cache.index_copy_(0, full_page_slots, page_max)
@@ -1721,7 +1901,10 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
         super().on_forward_end(seqs, is_prefill)
         if is_prefill or not seqs:
             return
-        if not hasattr(self, "metadata_cache") or getattr(self, "kv_cache", None) is None:
+        if not hasattr(self, "metadata_cache") or not hasattr(
+            self,
+            "attention_cache_storage",
+        ):
             return
 
         completed_rows: list[int] = []
@@ -1758,13 +1941,17 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
 
             page_token_indices = page_slots[:, None] * self.page_size + self.page_offsets_i64[None, :]
             flat_page_token_indices = page_token_indices.reshape(-1)
-            for kv_idx in range(self.num_kv_layers):
-                k_cache = self.kv_cache[0, kv_idx]
-                full_page_k = k_cache.index_select(0, flat_page_token_indices).view(
+            for kv_idx, layer_idx in enumerate(
+                self.kv_transformer_layer_indices()
+            ):
+                full_page_k = self._attention_metadata_keys(
+                    layer_idx,
+                    flat_page_token_indices,
+                ).view(
                     len(completed_rows),
                     self.page_size,
-                    self.num_kv_heads,
-                    self.head_dim,
+                    self.metadata_num_heads,
+                    self.metadata_head_dim,
                 )
                 page_min, page_max = torch.aminmax(full_page_k, dim=1)
                 self.metadata_cache[0, kv_idx].index_copy_(0, page_slots, page_max)
@@ -1775,11 +1962,11 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
         q_heads: torch.Tensor,
         page_max: torch.Tensor,
         page_min: torch.Tensor,
-        num_kv_heads: int,
+        num_metadata_heads: int,
     ) -> torch.Tensor:
         batch_size, num_heads, head_dim = q_heads.shape
         q_dtype = page_max.dtype
-        if num_heads == num_kv_heads:
+        if num_heads == num_metadata_heads:
             num_pages = page_max.shape[2]
             q_heads = q_heads.to(q_dtype)
             q_pos = q_heads.clamp_min(0).reshape(batch_size * num_heads, 1, head_dim)
@@ -1790,22 +1977,99 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
             page_scores += torch.bmm(q_neg, page_min_t).squeeze(1)
             return page_scores.view(batch_size, num_heads, num_pages).amax(dim=1)
 
-        group_size = num_heads // num_kv_heads
+        if num_heads % num_metadata_heads:
+            raise ValueError(
+                "QuEST selection-query heads must be divisible by metadata heads: "
+                f"query_heads={num_heads} metadata_heads={num_metadata_heads}."
+            )
+        group_size = num_heads // num_metadata_heads
         num_pages = page_max.shape[2]
-        q_grouped = q_heads.view(batch_size, num_kv_heads, group_size, head_dim).to(q_dtype)
-        q_pos = q_grouped.clamp_min(0).reshape(batch_size * num_kv_heads, group_size, head_dim)
-        q_neg = q_grouped.clamp_max(0).reshape(batch_size * num_kv_heads, group_size, head_dim)
-        page_max_t = page_max.reshape(batch_size * num_kv_heads, num_pages, head_dim).transpose(1, 2)
-        page_min_t = page_min.reshape(batch_size * num_kv_heads, num_pages, head_dim).transpose(1, 2)
+        q_grouped = q_heads.view(
+            batch_size,
+            num_metadata_heads,
+            group_size,
+            head_dim,
+        ).to(q_dtype)
+        q_pos = q_grouped.clamp_min(0).reshape(
+            batch_size * num_metadata_heads,
+            group_size,
+            head_dim,
+        )
+        q_neg = q_grouped.clamp_max(0).reshape(
+            batch_size * num_metadata_heads,
+            group_size,
+            head_dim,
+        )
+        page_max_t = page_max.reshape(
+            batch_size * num_metadata_heads,
+            num_pages,
+            head_dim,
+        ).transpose(1, 2)
+        page_min_t = page_min.reshape(
+            batch_size * num_metadata_heads,
+            num_pages,
+            head_dim,
+        ).transpose(1, 2)
         page_scores = torch.bmm(q_pos, page_max_t)
         page_scores += torch.bmm(q_neg, page_min_t)
-        return page_scores.view(batch_size, num_kv_heads, group_size, num_pages).amax(dim=2).amax(dim=1)
+        return page_scores.view(
+            batch_size,
+            num_metadata_heads,
+            group_size,
+            num_pages,
+        ).amax(dim=2).amax(dim=1)
+
+    def _selection_query_tensor(
+        self,
+        q: torch.Tensor | MlaLatentSelectionQuery,
+    ) -> torch.Tensor:
+        if isinstance(self.attention_cache_storage, MlaLatentStorage):
+            if not isinstance(q, MlaLatentSelectionQuery):
+                raise TypeError(
+                    "MLA QuEST decode requires MlaLatentSelectionQuery, got "
+                    f"{type(q).__name__}."
+                )
+            # MLA compute consumes one shared page set across all query heads.
+            # Match Vortex quest_mla by routing with the TP-local head-mean
+            # fused query, rather than taking the union/max of per-head bounds.
+            query = q.fused().mean(dim=1, keepdim=True)
+        else:
+            if not isinstance(q, torch.Tensor):
+                raise TypeError(
+                    "Explicit-KV QuEST decode requires a tensor query, got "
+                    f"{type(q).__name__}."
+                )
+            query = q
+        if query.ndim != 3 or int(query.shape[-1]) != self.metadata_head_dim:
+            raise ValueError(
+                "QuEST selection query does not match page metadata: "
+                f"query={tuple(query.shape)} metadata_dim={self.metadata_head_dim}."
+            )
+        return query
+
+    def build_decode_selection_query(
+        self,
+        q: torch.Tensor,
+        *,
+        mla_latent: torch.Tensor | None = None,
+        mla_rope: torch.Tensor | None = None,
+    ) -> torch.Tensor | MlaLatentSelectionQuery:
+        if not isinstance(self.attention_cache_storage, MlaLatentStorage):
+            return q
+        if mla_latent is None or mla_rope is None:
+            raise ValueError(
+                "MLA QuEST requires absorbed latent and RoPE decode queries."
+            )
+        return MlaLatentSelectionQuery(
+            latent=mla_latent,
+            rope=mla_rope,
+        )
 
     @torch.no_grad()
     def build_decode_view(
         self,
         layer_idx: int,
-        q: torch.Tensor,
+        q: torch.Tensor | MlaLatentSelectionQuery,
         active_slots: torch.Tensor,
         req_indices: torch.Tensor,
         context_lens: torch.Tensor,
@@ -1833,7 +2097,7 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
     def _build_decode_view_static(
         self,
         layer_idx: int,
-        q: torch.Tensor,
+        q: torch.Tensor | MlaLatentSelectionQuery,
         active_slots: torch.Tensor,
         req_indices: torch.Tensor,
         context_lens: torch.Tensor,
@@ -1843,6 +2107,13 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         with profiler.record("quest_build_decode_view_static"):
             kv_idx = self.kv_layer_index(layer_idx)
+            score_query = self._selection_query_tensor(q)
+            if int(num_kv_heads) != self.metadata_num_heads:
+                raise ValueError(
+                    "QuEST attention/metadata head contract is inconsistent: "
+                    f"attention_kv_heads={num_kv_heads} "
+                    f"metadata_heads={self.metadata_num_heads}."
+                )
             page_budget_base = max(3, int(token_budget) // self.page_size)
             max_keep = max(int(token_budget), page_budget_base * self.page_size, self.page_size)
             max_context_len = self.layer_batch_state.max_context_len
@@ -1852,7 +2123,7 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
             if max_context_len <= max_keep:
                 return active_slots, req_indices, context_lens
 
-            batch_size = q.shape[0]
+            batch_size = score_query.shape[0]
             max_pages = min(
                 self.max_pages_per_row,
                 (max_context_len + self.page_size - 1) // self.page_size,
@@ -1874,17 +2145,39 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
             prev_page_max = self.metadata_cache[0, kv_idx].index_select(
                 0,
                 safe_prev_page_slots.reshape(-1),
-            ).view(batch_size, max_pages - 1, num_kv_heads, self.head_dim).permute(0, 2, 1, 3)
+            ).view(
+                batch_size,
+                max_pages - 1,
+                self.metadata_num_heads,
+                self.metadata_head_dim,
+            ).permute(0, 2, 1, 3)
             prev_page_min = self.metadata_cache[1, kv_idx].index_select(
                 0,
                 safe_prev_page_slots.reshape(-1),
-            ).view(batch_size, max_pages - 1, num_kv_heads, self.head_dim).permute(0, 2, 1, 3)
-            page_scores = self._score_pages_batched(q, prev_page_max, prev_page_min, num_kv_heads)
+            ).view(
+                batch_size,
+                max_pages - 1,
+                self.metadata_num_heads,
+                self.metadata_head_dim,
+            ).permute(0, 2, 1, 3)
+            page_scores = self._score_pages_batched(
+                score_query,
+                prev_page_max,
+                prev_page_min,
+                self.metadata_num_heads,
+            )
             safe_num_pages = num_pages.to(torch.long).clamp_min(1)
-            valid_prev = torch.arange(max_pages - 1, device=q.device)[None, :] < (safe_num_pages - 1)[:, None]
+            valid_prev = torch.arange(
+                max_pages - 1,
+                device=score_query.device,
+            )[None, :] < (safe_num_pages - 1)[:, None]
             page_scores.masked_fill_(~valid_prev, -float("inf"))
 
-            top_prev = page_scores.topk(prev_budget, dim=-1, sorted=False).indices
+            top_prev = page_scores.topk(
+                prev_budget,
+                dim=-1,
+                sorted=False,
+            ).indices
             last_page = (safe_num_pages - 1)[:, None]
             selected_pages = torch.cat((top_prev, last_page), dim=1)
             selected_page_slots = row_page_slots.gather(1, selected_pages)
@@ -1895,12 +2188,18 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
             sparse_keep = int(sparse_slots.shape[1])
 
             last_page_len = context_lens - (num_pages - 1) * self.page_size
-            sparse_lens = (prev_budget * self.page_size + last_page_len).to(torch.int32)
+            sparse_lens = (
+                prev_budget * self.page_size + last_page_len
+            ).to(torch.int32)
             if is_long_text:
                 packed_slots = sparse_slots
                 local_context_lens = sparse_lens
             else:
-                packed_slots = torch.empty((batch_size, max_keep), dtype=torch.int32, device=q.device)
+                packed_slots = torch.empty(
+                    (batch_size, max_keep),
+                    dtype=torch.int32,
+                    device=score_query.device,
+                )
                 packed_slots[:, :sparse_keep] = torch.where(
                     dense_mask[:, None],
                     dense_slots[:, :sparse_keep],
@@ -1909,5 +2208,9 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
                 if max_keep > sparse_keep:
                     packed_slots[:, sparse_keep:] = dense_slots[:, sparse_keep:]
                 local_context_lens = torch.where(dense_mask, context_lens, sparse_lens)
-            local_req_indices = torch.arange(batch_size, dtype=torch.int32, device=q.device)
+            local_req_indices = torch.arange(
+                batch_size,
+                dtype=torch.int32,
+                device=score_query.device,
+            )
             return packed_slots, local_req_indices, local_context_lens
