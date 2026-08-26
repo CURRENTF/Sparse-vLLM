@@ -1635,7 +1635,9 @@ class PreparedDecodeAttentionOp:
 
     @property
     def decode_graph_lifecycle(self) -> bool:
-        return bool(getattr(self.provider, "decode_graph_lifecycle", False))
+        return self.spec.cuda_graph and bool(
+            getattr(self.provider, "decode_graph_lifecycle", False)
+        )
 
     def init_decode_graph_state(self, contract, inputs):
         initializer = getattr(self.provider, "init_decode_graph_state", None)

@@ -74,6 +74,18 @@ def test_h2o_runtime_decode_spec_is_score_free_while_eviction_is_disabled():
     assert not spec.kernel_request.requires_softmax_lse
 
 
+def test_eager_decode_does_not_register_provider_graph_lifecycle():
+    provider = Mock()
+    provider.name = "graph_aware_provider"
+    provider.decode_graph_lifecycle = True
+
+    eager = PreparedDecodeAttentionOp(_spec(cuda_graph=False), provider)
+    graph = PreparedDecodeAttentionOp(_spec(cuda_graph=True), provider)
+
+    assert not eager.decode_graph_lifecycle
+    assert graph.decode_graph_lifecycle
+
+
 def test_batch_only_decode_spec_carries_static_context_capacity():
     config = SimpleNamespace(
         num_attention_heads=32,
