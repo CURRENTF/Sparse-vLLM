@@ -332,6 +332,7 @@ def _make_glm_graph_lane(
         decode_keep_tokens=0,
         sparse_attn_score_dtype="float32",
         tensor_parallel_size=1,
+        max_model_len=128,
         decode_graph=True,
         decode_graph_context_policy="current",
         decode_graph_max_cached_graphs=None,
