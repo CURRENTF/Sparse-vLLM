@@ -25,6 +25,7 @@ from sparsevllm.operators.decode_attention import (
     PreparedDecodeAttentionOp,
     SglFa3PagedDecodeAttentionProvider,
     TritonPagedDecodeAttentionProvider,
+    _FlashInferPagedDecodeGraphState,
 )
 from sparsevllm.operators.registry import OpResolver
 from sparsevllm.platforms import DeviceCaps, PlatformEnum
@@ -468,6 +469,98 @@ def test_flashinfer_decode_reuses_plan_across_layers_in_one_step():
         provider.run(_spec(cuda_graph=False), q, view)
 
     assert state.plan.call_count == 2
+
+
+def test_flashinfer_graph_page_pack_reuses_identical_layer_metadata():
+    state = object.__new__(_FlashInferPagedDecodeGraphState)
+    state.planned = True
+    state.contract = SimpleNamespace(context_capacity=8)
+    state.indices = torch.empty(32, dtype=torch.int32)
+    state._eager_page_pack_key = None
+    state._captured_page_pack_key = None
+    state._capture_pack_started = False
+    active_slots = torch.empty((4, 8), dtype=torch.int32)
+    req_indices = torch.empty(4, dtype=torch.int32)
+    context_lens = torch.empty(4, dtype=torch.int32)
+
+    with (
+        patch(
+            "sparsevllm.kernels.triton.flashinfer_decode_metadata."
+            "pack_flashinfer_page_indices"
+        ) as pack,
+        patch("torch.cuda.is_current_stream_capturing", return_value=False),
+    ):
+        state.begin_graph_in()
+        assert state.pack_page_indices_once(
+            active_slots=active_slots,
+            req_indices=req_indices,
+            context_lens=context_lens,
+        )
+        assert not state.pack_page_indices_once(
+            active_slots=active_slots,
+            req_indices=req_indices,
+            context_lens=context_lens,
+        )
+        other_slots = active_slots.clone()
+        assert state.pack_page_indices_once(
+            active_slots=other_slots,
+            req_indices=req_indices,
+            context_lens=context_lens,
+        )
+        assert state.pack_page_indices_once(
+            active_slots=active_slots,
+            req_indices=req_indices,
+            context_lens=context_lens,
+        )
+
+    # The single destination contains B after A -> B, so A must be repacked.
+    assert pack.call_count == 3
+
+
+def test_flashinfer_graph_in_starts_one_page_pack_scope():
+    provider = FlashInferPagedDecodeAttentionProvider()
+    state = Mock(spec=_FlashInferPagedDecodeGraphState)
+
+    provider.prepare_decode_graph_in(state)
+
+    assert provider._active_graph_state is state
+    state.begin_graph_in.assert_called_once_with()
+
+
+def test_flashinfer_graph_page_pack_keeps_capture_separate_from_warmup():
+    state = object.__new__(_FlashInferPagedDecodeGraphState)
+    state.planned = True
+    state.contract = SimpleNamespace(context_capacity=8)
+    state.indices = torch.empty(32, dtype=torch.int32)
+    state._eager_page_pack_key = None
+    state._captured_page_pack_key = None
+    state._capture_pack_started = False
+    active_slots = torch.empty((4, 8), dtype=torch.int32)
+    req_indices = torch.empty(4, dtype=torch.int32)
+    context_lens = torch.empty(4, dtype=torch.int32)
+    kwargs = {
+        "active_slots": active_slots,
+        "req_indices": req_indices,
+        "context_lens": context_lens,
+    }
+
+    with (
+        patch(
+            "sparsevllm.kernels.triton.flashinfer_decode_metadata."
+            "pack_flashinfer_page_indices"
+        ) as pack,
+        patch(
+            "torch.cuda.is_current_stream_capturing",
+            side_effect=[False, False, True, True],
+        ),
+    ):
+        state.begin_graph_in()
+        assert state.pack_page_indices_once(**kwargs)
+        assert state.pack_page_indices_once(**kwargs)
+        assert not state.pack_page_indices_once(**kwargs)
+
+    # Warmup and capture each retain one packing launch.
+    assert pack.call_count == 2
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

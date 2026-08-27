@@ -583,6 +583,7 @@ class FlashInferPagedDecodeAttentionProvider(DecodeAttentionProvider):
         state: _FlashInferPagedDecodeGraphState,
     ) -> None:
         self._active_graph_state = state
+        state.begin_graph_in()
 
     def decode_graph_keepalive_tensors(
         self,
@@ -631,7 +632,7 @@ class FlashInferPagedDecodeAttentionProvider(DecodeAttentionProvider):
                 f"{q.dtype}/{payload.k_cache.dtype}/{payload.v_cache.dtype}."
             )
         if spec.cuda_graph:
-            state.pack_page_indices(
+            state.pack_page_indices_once(
                 active_slots=meta.active_slots,
                 req_indices=meta.req_indices,
                 context_lens=meta.context_lens,
@@ -820,6 +821,9 @@ class _FlashInferPagedDecodeGraphState:
             paged_kv_last_page_len_buffer=self.last_page_len,
         )
         self.planned = False
+        self._eager_page_pack_key: tuple[object, ...] | None = None
+        self._captured_page_pack_key: tuple[object, ...] | None = None
+        self._capture_pack_started = False
 
     def prepare_out_graph(self) -> None:
         context_lens = self.inputs.host.context_lens
@@ -847,15 +851,65 @@ class _FlashInferPagedDecodeGraphState:
         )
         self.planned = True
 
-    def pack_page_indices(
+    def begin_graph_in(self) -> None:
+        """Start one warmup/capture invocation and reset its deduplication scope."""
+
+        if torch.cuda.is_current_stream_capturing():
+            self._captured_page_pack_key = None
+            self._capture_pack_started = True
+        else:
+            self._eager_page_pack_key = None
+            self._capture_pack_started = False
+
+    @staticmethod
+    def _page_pack_key(
+        active_slots: torch.Tensor,
+        req_indices: torch.Tensor,
+        context_lens: torch.Tensor,
+    ) -> tuple[object, ...]:
+        return (
+            active_slots.device,
+            active_slots.dtype,
+            active_slots.data_ptr(),
+            tuple(active_slots.shape),
+            tuple(active_slots.stride()),
+            req_indices.device,
+            req_indices.dtype,
+            req_indices.data_ptr(),
+            tuple(req_indices.shape),
+            tuple(req_indices.stride()),
+            context_lens.device,
+            context_lens.dtype,
+            context_lens.data_ptr(),
+            tuple(context_lens.shape),
+            tuple(context_lens.stride()),
+        )
+
+    def pack_page_indices_once(
         self,
         *,
         active_slots: torch.Tensor,
         req_indices: torch.Tensor,
         context_lens: torch.Tensor,
-    ) -> None:
+    ) -> bool:
+        """Pack unless the shared destination already holds this exact view."""
+
         if not self.planned:
             raise RuntimeError("FlashInfer graph decode was not planned before forward.")
+        is_capturing = torch.cuda.is_current_stream_capturing()
+        if is_capturing:
+            if not self._capture_pack_started:
+                # Direct provider captures may not call prepare_decode_graph_in()
+                # from inside the graph context. Keep them correct as well.
+                self._captured_page_pack_key = None
+                self._capture_pack_started = True
+            last_key = self._captured_page_pack_key
+        else:
+            last_key = self._eager_page_pack_key
+        key = self._page_pack_key(active_slots, req_indices, context_lens)
+        if key == last_key:
+            return False
+
         from sparsevllm.kernels.triton.flashinfer_decode_metadata import (
             pack_flashinfer_page_indices,
         )
@@ -867,6 +921,11 @@ class _FlashInferPagedDecodeGraphState:
             self.indices,
             context_capacity=int(self.contract.context_capacity),
         )
+        if is_capturing:
+            self._captured_page_pack_key = key
+        else:
+            self._eager_page_pack_key = key
+        return True
 
     def keepalive_tensors(self) -> list[torch.Tensor]:
         return [
