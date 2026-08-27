@@ -613,6 +613,7 @@ class DecodeCudaGraphRunner:
         seqs: list[Sequence],
         *,
         capture_sampling: bool = False,
+        replay_after_capture: bool = True,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         if not seqs:
             raise ValueError("decode_graph requires a non-empty decode batch.")
@@ -659,12 +660,20 @@ class DecodeCudaGraphRunner:
         if state.graph is None:
             state = self._capture(state, seqs, input_ids, positions)
             self._restore_sparse_state_refs(state)
+            if not replay_after_capture:
+                return None, None
             with profiler.record("decode_graph_replay_after_capture"):
                 state.graph.replay()
             self.replay_count += 1
             logits = state.logits[:real_batch_size] if state.logits is not None else None
             token_ids = state.token_ids[:real_batch_size] if state.token_ids is not None else None
             return logits, token_ids
+
+        if not replay_after_capture:
+            raise RuntimeError(
+                "decode_graph capture-only warmup selected an already-captured graph: "
+                f"key={state.key}."
+            )
 
         self._restore_sparse_state_refs(state)
         with profiler.record("decode_graph_replay"):

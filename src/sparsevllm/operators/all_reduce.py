@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import os
 import re
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
@@ -73,6 +74,14 @@ class AllReduceProvider:
     def close(self) -> None:
         pass
 
+    def register_cuda_graph_buffers(
+        self,
+        spec: AllReduceOpSpec,
+        *,
+        group: dist.ProcessGroup | None,
+    ) -> None:
+        del spec, group
+
     def run(
         self,
         spec: AllReduceOpSpec,
@@ -88,8 +97,8 @@ ALL_REDUCE_REGISTRY: OpRegistry[AllReduceOpSpec, AllReduceProvider] = OpRegistry
     "all-reduce",
     portfolio=PortfolioPolicy(repo_portable=("torch_distributed",)),
     profile_order=(
-        "flashinfer_trtllm_sm90_profile",
         "flashinfer_vllm_sm90_profile",
+        "flashinfer_trtllm_sm90_profile",
     ),
 )
 
@@ -130,6 +139,21 @@ def _flashinfer_dependency_support() -> SupportResult:
     return SupportResult.yes(
         f"flashinfer-python {installed} communication family is available"
     )
+
+
+def _expandable_segments_enabled() -> bool:
+    """Return whether PyTorch's CUDA allocator uses expandable segments."""
+
+    for variable in ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF"):
+        for setting in os.getenv(variable, "").split(","):
+            key, separator, value = setting.partition(":")
+            if (
+                separator
+                and key.strip() == "expandable_segments"
+                and value.strip().lower() in {"1", "true", "yes", "on"}
+            ):
+                return True
+    return False
 
 
 @ALL_REDUCE_REGISTRY.register_atomic(
@@ -266,8 +290,8 @@ class FlashInferVllmAllReduceProvider(AllReduceProvider):
             return SupportResult.unsupported(
                 f"requires CUDA SM90, got {caps.platform.name} {caps.compute_capability}"
             )
-        if spec.cuda_graph:
-            return SupportResult.unsupported("requires eager execution")
+        if spec.cuda_graph and not caps.supports_graph_capture:
+            return SupportResult.unsupported("requires CUDA Graph capture support")
         if spec.backend != "nccl":
             return SupportResult.unsupported(f"requires NCCL, got {spec.backend}")
         if spec.dtype != torch.bfloat16:
@@ -297,9 +321,11 @@ class FlashInferVllmAllReduceProvider(AllReduceProvider):
             "create_shared_buffer",
             "vllm_all_reduce",
             "vllm_dispose",
+            "vllm_get_graph_buffer_ipc_meta",
             "vllm_init_custom_ar",
             "vllm_meta_size",
             "vllm_register_buffer",
+            "vllm_register_graph_buffers",
         )
         missing = [name for name in required if not hasattr(comm, name)]
         return (
@@ -319,8 +345,20 @@ class FlashInferVllmAllReduceProvider(AllReduceProvider):
         self._buffer_ptrs: list[int] = []
         self._handle = None
         self._cudart = None
+        self._graph_buffers_registered = False
+
+    def binding_metadata(self) -> dict[str, object]:
+        return {"cuda_graph_input_mode": "direct_ipc"}
 
     def prepare(self, spec, *, group, rank, device_index=None) -> None:
+        if spec.cuda_graph and _expandable_segments_enabled():
+            raise RuntimeError(
+                "FlashInfer vLLM all-reduce CUDA Graph capture requires "
+                "IPC-exportable graph allocations, but PyTorch expandable "
+                "segments are enabled. Unset expandable_segments in "
+                "PYTORCH_ALLOC_CONF/PYTORCH_CUDA_ALLOC_CONF before starting "
+                "the process."
+            )
         from flashinfer.comm import (
             CudaRTLibrary,
             create_shared_buffer,
@@ -375,21 +413,69 @@ class FlashInferVllmAllReduceProvider(AllReduceProvider):
         self._cudart = CudaRTLibrary()
 
     def run(self, spec, tensor, *, group) -> torch.Tensor:
-        del spec, group
+        del group
         if self._handle is None:
             raise RuntimeError("FlashInfer all-reduce provider was not prepared.")
         from flashinfer.comm import vllm_all_reduce
 
         output = torch.empty_like(tensor)
+        capturing = bool(
+            spec.cuda_graph and torch.cuda.is_current_stream_capturing()
+        )
         vllm_all_reduce(
             self._handle,
             tensor,
             output,
-            self._buffer_ptrs[self._rank],
-            self._max_size_bytes,
+            0 if capturing else self._buffer_ptrs[self._rank],
+            0 if capturing else self._max_size_bytes,
             self.num_ctas,
         )
         return output
+
+    def register_cuda_graph_buffers(self, spec, *, group) -> None:
+        if not spec.cuda_graph:
+            return
+        if self._handle is None or self._group is None:
+            raise RuntimeError("FlashInfer all-reduce provider was not prepared.")
+        if group is not self._group:
+            raise RuntimeError("FlashInfer all-reduce graph registration group changed.")
+        if self._graph_buffers_registered:
+            raise RuntimeError(
+                "FlashInfer all-reduce CUDA Graph buffers are already registered."
+            )
+        from flashinfer.comm import (
+            vllm_get_graph_buffer_ipc_meta,
+            vllm_register_graph_buffers,
+        )
+
+        local_handles, local_offsets = vllm_get_graph_buffer_ipc_meta(self._handle)
+        local_handles = list(local_handles)
+        local_offsets = list(local_offsets)
+        if not local_handles or not local_offsets:
+            raise RuntimeError(
+                "FlashInfer all-reduce captured no CUDA Graph buffer addresses."
+            )
+        gathered: list[tuple[list[int], list[int]] | None] = [
+            None for _ in range(spec.world_size)
+        ]
+        dist.all_gather_object(
+            gathered,
+            (local_handles, local_offsets),
+            group=self._group,
+        )
+        if any(item is None for item in gathered):
+            raise RuntimeError(
+                "FlashInfer all-reduce CUDA Graph buffer metadata is incomplete."
+            )
+        handles = [item[0] for item in gathered if item is not None]
+        offsets = [item[1] for item in gathered if item is not None]
+        if len({len(item) for item in offsets}) != 1:
+            raise RuntimeError(
+                "FlashInfer all-reduce ranks captured different graph buffer counts: "
+                f"{[len(item) for item in offsets]}."
+            )
+        vllm_register_graph_buffers(self._handle, handles, offsets)
+        self._graph_buffers_registered = True
 
     @staticmethod
     def _close_shared_buffer(pointers, group, rank, cudart) -> None:
@@ -415,6 +501,7 @@ class FlashInferVllmAllReduceProvider(AllReduceProvider):
 
         vllm_dispose(self._handle)
         self._handle = None
+        self._graph_buffers_registered = False
         self._close_shared_buffer(
             self._buffer_ptrs, self._group, self._rank, self._cudart
         )
@@ -578,6 +665,11 @@ class PreparedAllReduceOp:
                 f"input_device={tensor.device} output_device={output.device}."
             )
         return output
+
+    def register_cuda_graph_buffers(self) -> None:
+        if self._closed:
+            raise RuntimeError("All-reduce operator is closed.")
+        self.provider.register_cuda_graph_buffers(self.spec, group=self.group)
 
     def close(self) -> None:
         if self._closed:

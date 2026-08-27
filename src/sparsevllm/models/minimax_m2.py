@@ -66,6 +66,17 @@ class MiniMaxM2RuntimeConfig:
     cuda_graph: bool
     _closed: bool = False
 
+    def register_decode_cuda_graph_buffers(self) -> None:
+        seen: set[int] = set()
+        for op in (
+            self.attention_decode_all_reduce,
+            self.moe_decode_all_reduce,
+        ):
+            if id(op) in seen:
+                continue
+            seen.add(id(op))
+            op.register_cuda_graph_buffers()
+
     def close(self) -> None:
         if self._closed:
             return
@@ -473,6 +484,10 @@ class MiniMaxM2ForCausalLM(nn.Module):
     def close_runtime_operators(self) -> None:
         if self.runtime_config is not None:
             self.runtime_config.close()
+
+    def register_decode_cuda_graph_buffers(self) -> None:
+        if self.runtime_config is not None:
+            self.runtime_config.register_decode_cuda_graph_buffers()
 
     @torch.inference_mode()
     def warmup_moe(self, num_tokens: int = 1) -> None:

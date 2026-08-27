@@ -501,9 +501,12 @@ def test_model_runner_decode_graph_startup_controls_use_live_runner():
             ("reuse", enabled)
         ),
         seal_startup_plan=lambda: calls.append(("seal",)),
-        run=lambda seqs, capture_sampling: calls.append(
-            ("capture", seqs, capture_sampling)
+        run=lambda seqs, capture_sampling, replay_after_capture: calls.append(
+            ("capture", seqs, capture_sampling, replay_after_capture)
         ),
+    )
+    runner.model = SimpleNamespace(
+        register_decode_cuda_graph_buffers=lambda: calls.append(("register",))
     )
     seqs = [object()]
 
@@ -512,13 +515,15 @@ def test_model_runner_decode_graph_startup_controls_use_live_runner():
         side_effect=lambda: calls.append(("reset",)),
     ):
         ModelRunner.set_decode_cuda_graph_reuse_larger_context_graphs(runner, True)
+        ModelRunner.register_decode_cuda_graph_buffers(runner)
         ModelRunner.seal_decode_cuda_graph_startup_plan(runner)
         ModelRunner.capture_decode_cuda_graph_warmup(runner, seqs)
 
     assert calls == [
         ("reuse", True),
+        ("register",),
         ("seal",),
-        ("capture", seqs, False),
+        ("capture", seqs, False, False),
         ("reset",),
     ]
 

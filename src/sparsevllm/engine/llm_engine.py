@@ -557,6 +557,7 @@ class LLMEngine:
                     "Startup decode CUDA Graph capture did not materialize its plan: "
                     f"missing={missing}."
                 )
+            self.model_runner.call("register_decode_cuda_graph_buffers")
             self.model_runner.call("seal_decode_cuda_graph_startup_plan")
             logger.info(
                 "Startup decode CUDA Graph capture finished: cached={} "

@@ -74,6 +74,11 @@ class Glm4MoeLiteRuntimeConfig:
     moe_decode_all_reduce: PreparedAllReduceOp
     _closed: bool = False
 
+    def register_decode_cuda_graph_buffers(self) -> None:
+        ops = (self.attention_decode_all_reduce, self.moe_decode_all_reduce)
+        for op in {id(op): op for op in ops}.values():
+            op.register_cuda_graph_buffers()
+
     def close(self) -> None:
         if self._closed:
             return
@@ -976,6 +981,10 @@ class Glm4MoeLiteForCausalLM(nn.Module):
     def close_runtime_operators(self) -> None:
         if self.runtime_config is not None:
             self.runtime_config.close()
+
+    def register_decode_cuda_graph_buffers(self) -> None:
+        if self.runtime_config is not None:
+            self.runtime_config.register_decode_cuda_graph_buffers()
 
     def _sparse_block(self, layer_idx: int) -> Glm4MoeLiteSparseMoeBlock:
         if not 0 <= int(layer_idx) < len(self.model.layers):

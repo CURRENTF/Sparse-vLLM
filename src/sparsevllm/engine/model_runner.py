@@ -163,6 +163,7 @@ TP_RPC_STATUS_SYNC_METHODS = PREFIX_CACHE_CONTROL_RPC_METHODS | {
     "reset_after_warmup",
     "run",
     "register_multimodal_shared",
+    "register_decode_cuda_graph_buffers",
     "warmup_moe_workspace",
 }
 
@@ -1389,10 +1390,19 @@ class ModelRunner:
     def seal_decode_cuda_graph_startup_plan(self):
         self.decode_graph_runner.seal_startup_plan()
 
+    def register_decode_cuda_graph_buffers(self) -> None:
+        register = getattr(self.model, "register_decode_cuda_graph_buffers", None)
+        if callable(register):
+            register()
+
     def capture_decode_cuda_graph_warmup(self, seqs: list[Sequence]) -> None:
         """Capture one planned graph without advancing scheduler sequence state."""
         try:
-            self.decode_graph_runner.run(seqs, capture_sampling=False)
+            self.decode_graph_runner.run(
+                seqs,
+                capture_sampling=False,
+                replay_after_capture=False,
+            )
         finally:
             reset_context()
 
