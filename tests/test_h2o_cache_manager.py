@@ -20,6 +20,10 @@ from sparsevllm.engine.cache_manager.base import (
 from sparsevllm.engine.cache_manager.h2o import H2OCacheManager
 from sparsevllm.engine.cache_manager.snapkv import SnapKVCacheManager
 from sparsevllm.engine.cache_manager.storage import MlaLatentStorage
+from sparsevllm.engine.decode_graph_contract import (
+    DecodeGraphContract,
+    DecodeGraphInputs,
+)
 from sparsevllm.engine.scheduler import Scheduler
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.engine.sparse_controller import SparseController
@@ -1662,6 +1666,54 @@ def test_h2o_static_decode_reuses_uniform_rows_without_generic_metadata_rebuild(
     assert manager.layer_batch_states[0].slot_mapping.data_ptr() != slot_mapping.data_ptr()
     assert manager.layer_batch_states[0].max_context_len == 5
     assert manager.layer_batch_states[1].max_context_len == 5
+
+
+def test_snapkv_decode_graph_populates_host_mirrors_for_provider_planning():
+    manager = _manager_with_layer_rows([[4], [4]])
+    manager.max_buffer_rows = 1
+    manager.layer_batch_states = [LayerBatchStates(), LayerBatchStates()]
+    manager._decode_static_buffers = {}
+    manager._decode_static_index_buffers = {}
+    manager._decode_static_state_binding_key = None
+    manager._decode_static_max_context_len = 8
+    manager.free_slots_stack_tensor = torch.stack(
+        (
+            torch.arange(100, 132, dtype=torch.int32),
+            torch.arange(200, 232, dtype=torch.int32),
+        )
+    )
+    manager.free_slots_stack = [
+        manager.free_slots_stack_tensor[0],
+        manager.free_slots_stack_tensor[1],
+    ]
+    manager._num_free_slots = [32, 32]
+    seq = _seq(0, 5, prefilled=4, chunk=1)
+    contract = DecodeGraphContract(
+        method="h2o",
+        shape_policy="batch_only",
+        topology_path_id="short",
+        batch_capacity=4,
+        context_capacity=8,
+    )
+    inputs = DecodeGraphInputs.allocate(
+        contract,
+        device=torch.device("cpu"),
+        pin_memory=False,
+    )
+    inputs.host.context_lens.zero_()
+    inputs.host.request_indices.fill_(-1)
+    state = manager.init_decode_graph_state(contract, inputs)
+
+    manager.prepare_decode_graph_step([seq], state)
+
+    assert inputs.host.input_ids.tolist() == inputs.input_ids.tolist()
+    assert inputs.host.positions.tolist() == inputs.positions.tolist()
+    assert inputs.host.context_lens.tolist() == [5, 5, 5, 5]
+    assert inputs.host.context_lens.tolist() == inputs.context_lens.tolist()
+    assert inputs.host.request_indices.tolist() == [0, 0, 0, 0]
+    assert inputs.host.request_indices.tolist() == inputs.request_indices.tolist()
+    assert inputs.host.active_mask.tolist() == [True, False, False, False]
+    assert inputs.host.active_mask.tolist() == inputs.active_mask.tolist()
 
 
 def test_h2o_static_decode_rejects_divergent_layer_row_lengths_before_allocation():

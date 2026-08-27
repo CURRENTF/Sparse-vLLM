@@ -7,6 +7,7 @@ import torch
 
 from sparsevllm.config import Config
 from sparsevllm.distributed import ParallelContext
+from sparsevllm.engine.decode_graph_contract import CacheDecodeGraphState
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.engine.prefill import (
     PREFILL_EXECUTION_CHUNKED,
@@ -3315,6 +3316,44 @@ class SnapKVCacheManager(CacheManager):
         for layer_id in layer_ids:
             self.row_seq_lens[layer_id][row_indices[layer_id]] += 1
         return selected_slots, next_lens, row_indices, wrote_slot_output
+
+    @torch.no_grad()
+    def prepare_decode_graph_step(
+        self,
+        seqs: list[Sequence],
+        state: CacheDecodeGraphState,
+    ):
+        result = super().prepare_decode_graph_step(seqs, state)
+        inputs = state.inputs
+        host = inputs.host
+        real_batch_size = len(seqs)
+        graph_batch_size = int(inputs.batch_capacity)
+        first_layer = int(self.kv_transformer_layer_indices()[0])
+        row_indices = np.asarray(
+            [self.seq_id_to_row[first_layer][int(seq.seq_id)] for seq in seqs],
+            dtype=np.int32,
+        )
+        real_context_lens = self.row_seq_lens[first_layer][row_indices].astype(
+            np.int32,
+            copy=False,
+        )
+
+        host.input_ids.numpy()[:real_batch_size] = [
+            int(seq.decode_input_token) for seq in seqs
+        ]
+        host.positions.numpy()[:real_batch_size] = [
+            int(seq.decode_input_position) for seq in seqs
+        ]
+        host.context_lens.numpy()[:real_batch_size] = real_context_lens
+        host.request_indices.numpy()[:real_batch_size] = row_indices
+        host.active_mask[:real_batch_size].fill_(True)
+        if graph_batch_size > real_batch_size:
+            host.input_ids[real_batch_size:].fill_(int(seqs[0].decode_input_token))
+            host.positions[real_batch_size:].fill_(int(seqs[0].decode_input_position))
+            host.context_lens[real_batch_size:].fill_(int(real_context_lens[0]))
+            host.request_indices[real_batch_size:].fill_(int(row_indices[0]))
+            host.active_mask[real_batch_size:].fill_(state.contract.padding.active)
+        return result
 
     @torch.no_grad()
     def prepare_decode_static(
