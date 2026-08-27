@@ -15,6 +15,7 @@ from sparsevllm.configs.cuda_graph import (
     _default_decode_cuda_graph_capture_sizes,
     _resolve_decode_static_batch_capacity,
 )
+from sparsevllm.engine.cache_manager.base import LayerBatchStates
 from sparsevllm.engine.cache_manager.standard import StandardCacheManager
 from sparsevllm.engine.cache_manager.deltakv import DeltaKVCacheManager
 from sparsevllm.engine.cache_manager.deltakv_less_memory import DeltaKVLessMemoryCacheManager
@@ -281,6 +282,36 @@ def seq_with_len(n):
 
 
 class PrefillPolicyRegistryTest(unittest.TestCase):
+    def test_prefill_reuses_cache_manager_metadata_across_layers(self):
+        context_lens = torch.tensor([4, 7], dtype=torch.int32)
+        req_indices = torch.tensor([0, 1], dtype=torch.int32)
+        batch_state = LayerBatchStates(
+            context_lens=context_lens,
+            max_context_len=7,
+            req_indices=req_indices,
+        )
+
+        class SharedMetadataManager:
+            device = torch.device("cpu")
+
+            def get_layer_batch_states(self, layer_idx):
+                del layer_idx
+                return batch_state
+
+        cfg = make_sparse_controller_config()
+        cfg.sparse_method = ""
+        cfg.obs_layer_ids = []
+        cfg.full_attention_layers = [0, 1]
+        cfg.hf_config.num_hidden_layers = 2
+        controller = SparseController(cfg, SharedMetadataManager())
+
+        controller.prepare_forward([], is_prefill=True)
+
+        for layer_idx in range(2):
+            state = controller.layer_batch_sparse_states[layer_idx]
+            self.assertIs(state.context_lens, context_lens)
+            self.assertIs(state.req_indices, req_indices)
+
     def test_scheduler_stops_on_any_request_eos_token(self):
         scheduler = make_scheduler(PREFILL_POLICY_ALL_CHUNKED)
         seq = Sequence([1, 2], SamplingParams(max_tokens=8, eos_token_ids=(10, 11)))

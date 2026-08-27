@@ -326,14 +326,11 @@ class SparseController:
                 state.deltakv_free_temp_slots = False
                 continue
             batch_state = self.cache_manager.get_layer_batch_states(i)
-            
-            # 统一语义：context_lens 代表当前 attn 可见长度 （即使是动态稀疏方法）
-            if not is_prefill:
-                # CUDA Graph replay updates the cache-manager decode metadata in place;
-                # full/observation layers must read the stable tensor address captured here.
-                state.context_lens = batch_state.context_lens
-            else:
-                state.context_lens = batch_state.context_lens.clone()  # 虽然clone，但是感觉开销不大
+
+            # context_lens is read-only controller metadata. Preserve the cache
+            # manager's stable tensor identity so attention plans can be shared
+            # across layers and CUDA Graph replay observes in-place updates.
+            state.context_lens = batch_state.context_lens
             state.max_context_len = batch_state.max_context_len
             state.req_indices = batch_state.req_indices
             state.global_req_indices = batch_state.req_indices
