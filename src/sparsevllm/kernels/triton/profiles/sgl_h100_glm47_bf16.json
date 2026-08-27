@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "profile_id": "sgl_h100_glm47_bf16_triton_3_6_tuned_v1",
+  "profile_status": "tuned",
+  "provider": "sgl_triton_glm_bf16",
+  "kernel": "sgl_fused_moe_triton_v1",
+  "contract": {
+    "device_name": "H100",
+    "compute_capability": [9, 0],
+    "activation_dtype": "bfloat16",
+    "weight_dtype": "bfloat16",
+    "num_local_experts": 65,
+    "hidden_size": 2048,
+    "intermediate_size": 1536,
+    "top_k": 5,
+    "tp_size": 1,
+    "ep_size": 1,
+    "weight_layout_id": "packed_gate_up_v1",
+    "stages": ["w13", "w2"]
+  },
+  "toolchain": {
+    "triton": ">=3.5,<4"
+  },
+  "provenance": {
+    "kind": "local_offline_profile",
+    "source_repository": "vortex_torch",
+    "source_revision": "79800afe7e43c69444cbbbada65eae866b8eab17",
+    "source_paths": [
+      "third_party/sglang/v0.5.9/sglang/python/sglang/srt/layers/moe/fused_moe_triton/configs/triton_3_5_1/E=65,N=1536,device_name=NVIDIA_H100_80GB_HBM3.json",
+      "third_party/sglang/v0.5.9/sglang/python/sglang/srt/layers/moe/fused_moe_triton/configs/triton_3_5_1/E=65,N=1536,device_name=NVIDIA_H100_80GB_HBM3_down.json"
+    ],
+    "tuning_artifact": "benchmark/results/glm47_sgl_moe_tuning_20260827_165250",
+    "tuning_environment": {
+      "torch": "2.11.0+cu130",
+      "triton": "3.6.0",
+      "sgl_kernel": "0.4.5"
+    },
+    "selection_policy": "30-sample median; retain seed unless a repeatable candidate improves by at least 1%"
+  },
+  "tables": {
+    "1536": [
+      [1, 16, 64, 128, 1, 4, 5],
+      [8, 16, 64, 128, 1, 4, 5],
+      [16, 16, 64, 128, 1, 4, 5],
+      [32, 16, 64, 128, 1, 4, 5],
+      [64, 16, 64, 128, 1, 4, 5],
+      [128, 64, 64, 64, 1, 4, 3],
+      [256, 64, 128, 64, 1, 4, 3],
+      [512, 64, 64, 64, 1, 4, 3],
+      [1024, 128, 128, 64, 1, 8, 3],
+      [2048, 128, 256, 64, 1, 8, 4],
+      [4096, 128, 256, 64, 1, 8, 4],
+      [8192, 128, 256, 64, 1, 8, 4]
+    ]
+  }
+}

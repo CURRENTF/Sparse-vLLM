@@ -354,6 +354,7 @@ MOE_REGISTRY: OpRegistry[MoeOpSpec, MoeProvider] = OpRegistry(
         "hopper_qwen36_fp8_dispatch_plan",
         "triton_minimax_m2_profile",
         "qwen3_fp8_dispatch_plan",
+        "sgl_triton_glm_tp1_bf16_profile",
         "sgl_aligned_triton_glm_bf16_profile",
         "h20_qwen36_fused_bf16_profile",
         "hopper_fused_bf16_profile",
@@ -362,7 +363,13 @@ MOE_REGISTRY: OpRegistry[MoeOpSpec, MoeProvider] = OpRegistry(
 )
 
 _PACKED_SHARED_EXPERT_PROFILES = frozenset(
-    {(64, 1, 4, 2048, 1536, 2, 1)}
+    {
+        (64, 1, 4, 2048, 1536, 1, 1),
+        (64, 1, 4, 2048, 1536, 2, 1),
+    }
+)
+_PACKED_SHARED_PREFILL_PROFILES = frozenset(
+    {(64, 1, 4, 2048, 1536, 1, 1)}
 )
 
 
@@ -389,6 +396,29 @@ def use_packed_shared_experts(
         int(ep_size),
     )
     return bool(cuda_graph) and profile in _PACKED_SHARED_EXPERT_PROFILES
+
+
+def use_packed_shared_experts_in_prefill(
+    *,
+    num_routed_experts: int,
+    num_shared_experts: int,
+    top_k: int,
+    hidden_size: int,
+    intermediate_size: int,
+    tp_size: int,
+    ep_size: int,
+    cuda_graph: bool,
+) -> bool:
+    profile = (
+        int(num_routed_experts),
+        int(num_shared_experts),
+        int(top_k),
+        int(hidden_size),
+        int(intermediate_size),
+        int(tp_size),
+        int(ep_size),
+    )
+    return bool(cuda_graph) and profile in _PACKED_SHARED_PREFILL_PROFILES
 
 
 def append_shared_expert_route(
@@ -832,6 +862,26 @@ class SglDerivedTritonMoeProvider(MoeProvider):
         )
 
 
+@MOE_REGISTRY.register_atomic(
+    ProviderRole.REPO_PORTABLE,
+    profile_only=True,
+)
+class SglTritonGlmMoeProvider(SglDerivedTritonMoeProvider):
+    """Exact-profile GLM BF16 provider using the SGL Triton pipeline."""
+
+    name = "sgl_triton_glm_bf16"
+
+    def binding_metadata(self) -> dict[str, object]:
+        from sparsevllm.kernels.triton.sgl_fused_moe import (
+            sgl_glm47_moe_profile_metadata,
+        )
+
+        return {
+            **MoeProvider.binding_metadata(self),
+            **sgl_glm47_moe_profile_metadata(),
+        }
+
+
 @MOE_REGISTRY.register_profile
 class Qwen3Bf16MoeDispatchPlan(MoeDispatchPlan):
     """Prepared Qwen3 BF16 token ranges over two atomic Triton providers."""
@@ -955,6 +1005,38 @@ class SglAlignedTritonGlmMoeProfile(_SingleAtomicMoeProfile):
                 f"requires a profiled GLM TP2 MoE shape {expected}, got {actual}"
             )
         return ProfileMatch.yes("matched SGL-aligned GLM BF16 profile")
+
+
+@MOE_REGISTRY.register_profile
+class SglTritonGlmTp1MoeProfile(_SingleAtomicMoeProfile):
+    name = "sgl_triton_glm_tp1_bf16_profile"
+    atomic_provider_name = "sgl_triton_glm_bf16"
+
+    @classmethod
+    def matches(cls, spec: MoeOpSpec, caps: DeviceCaps) -> ProfileMatch:
+        expected = (65, 65, 2048, 1536, 5, 1, 1, "biased_sigmoid")
+        actual = (
+            spec.num_experts,
+            spec.num_local_experts,
+            spec.hidden_size,
+            spec.intermediate_size,
+            spec.top_k,
+            spec.tp_size,
+            spec.ep_size,
+            spec.routing_method,
+        )
+        if "H100" not in caps.device_name:
+            return ProfileMatch.no("requires profiled H100 hardware")
+        if actual != expected:
+            return ProfileMatch.no(
+                f"requires the GLM TP1 fused-shared shape {expected}, got {actual}"
+            )
+        from sparsevllm.kernels.triton.sgl_fused_moe import (
+            sgl_glm47_moe_profile_support,
+        )
+
+        supported, reason = sgl_glm47_moe_profile_support()
+        return ProfileMatch.yes(reason) if supported else ProfileMatch.no(reason)
 
 
 @MOE_REGISTRY.register_profile

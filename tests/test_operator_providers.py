@@ -29,6 +29,7 @@ from sparsevllm.operators.moe import (
     MOE_REGISTRY,
     MoeOpSpec,
     SglDerivedTritonMoeProvider,
+    SglTritonGlmMoeProvider,
 )
 from sparsevllm.operators.registry import NoProviderError, OpResolver
 from sparsevllm.platforms import DeviceCaps, PlatformEnum
@@ -535,6 +536,39 @@ def test_sgl_triton_moe_rejects_unsupported_specs(overrides, reason):
 
     assert not support.supported
     assert reason in support.reason
+
+
+@pytest.mark.parametrize(
+    "device_name",
+    ["NVIDIA H100 80GB HBM3", "NVIDIA H100 PCIe"],
+)
+def test_glm_tp1_fused_shared_profile_selects_sgl_triton(device_name) -> None:
+    spec = _moe_spec(
+        activation_dtype=torch.bfloat16,
+        weight_dtype=torch.bfloat16,
+        block_shape=None,
+        hidden_size=2048,
+        intermediate_size=1536,
+        num_local_experts=65,
+        num_experts=65,
+        top_k=5,
+        ep_size=1,
+        tp_size=1,
+        routing_method="biased_sigmoid",
+    )
+
+    resolved = OpResolver(MOE_REGISTRY).resolve(
+        spec,
+        _cuda_caps(
+            (9, 0),
+            native_fp8=False,
+            device_name=device_name,
+        ),
+    )
+
+    assert isinstance(resolved.provider, SglTritonGlmMoeProvider)
+    assert resolved.report.selected_profile == "sgl_triton_glm_tp1_bf16_profile"
+    assert resolved.report.selection_basis == "profile_override"
 
 
 def test_minimax_m2_fused_moe_rejects_graph_on_unsupported_device():

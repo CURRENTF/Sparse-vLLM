@@ -43,6 +43,7 @@ from sparsevllm.operators.moe import (
     model_activation_dtype,
     resolve_moe_provider,
     use_packed_shared_experts,
+    use_packed_shared_experts_in_prefill,
 )
 from sparsevllm.operators.moe_router import (
     MoeRouterOpSpec,
@@ -393,6 +394,18 @@ class Glm4MoeLitePackedExperts(PackedMoeExperts):
             ep_size=int(parallel_context.ep_size),
             cuda_graph=decode_graph,
         )
+        self.fuses_shared_prefill = use_packed_shared_experts_in_prefill(
+            num_routed_experts=self.routed_num_experts,
+            num_shared_experts=int(config.n_shared_experts),
+            top_k=self.routed_top_k,
+            hidden_size=int(config.hidden_size),
+            intermediate_size=int(config.moe_intermediate_size),
+            tp_size=int(parallel_context.moe_tp_size),
+            ep_size=int(parallel_context.ep_size),
+            cuda_graph=decode_graph,
+        )
+        if self.fuses_shared_prefill and not self.fuses_shared_decode:
+            raise RuntimeError("Prefill shared-expert fusion requires packed experts.")
         packed_num_experts = self.routed_num_experts + int(
             self.fuses_shared_decode
         )
@@ -559,14 +572,15 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
         if debug_enabled:
             self.debug_last_input = hidden_states.detach().clone()
         context = get_context()
+        experts = getattr(self, "experts", None)
+        fuse_shared_for_phase = getattr(
+            experts,
+            "fuses_shared_prefill" if context.is_prefill else "fuses_shared_decode",
+            False,
+        )
         if (
             not debug_enabled
-            and getattr(
-                getattr(self, "experts", None),
-                "fuses_shared_decode",
-                False,
-            )
-            and not context.is_prefill
+            and fuse_shared_for_phase
         ):
             if int(hidden_states.shape[0]) <= self.mlp_chunk_size:
                 local_output = self._routed_and_shared_chunk(hidden_states)
@@ -581,6 +595,8 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
                     ],
                     dim=0,
                 )
+            if context.is_prefill:
+                return self.parallel_context.world_all_reduce(local_output)
             if self.runtime_config is not None:
                 return self.runtime_config.moe_decode_all_reduce.run(local_output)
             return self.parallel_context.world_all_reduce(local_output)

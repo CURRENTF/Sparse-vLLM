@@ -21,6 +21,7 @@ from sparsevllm.kernels.external.support import (
 from sparsevllm.kernels.triton.moe import fused_moe, moe_align_block_size
 from sparsevllm.kernels.triton.sgl_fused_moe import (
     sgl_fused_moe,
+    sgl_glm47_moe_profile_support,
     sgl_moe_profile_support,
 )
 from sparsevllm.operators.moe import _sgl_moe_align_block_size
@@ -72,6 +73,25 @@ def test_sgl_moe_profile_rejects_unmatched_triton(monkeypatch) -> None:
 
     assert supported is False
     assert "Triton" in reason
+    assert "4.0.0" in reason
+
+
+def test_sgl_glm47_moe_profile_accepts_compatible_triton(monkeypatch) -> None:
+    monkeypatch.setattr("triton.__version__", "3.5.1")
+
+    supported, reason = sgl_glm47_moe_profile_support()
+
+    assert supported is True
+    assert "3.5.1" in reason
+
+
+def test_sgl_glm47_moe_profile_rejects_triton_4(monkeypatch) -> None:
+    monkeypatch.setattr("triton.__version__", "4.0.0")
+
+    supported, reason = sgl_glm47_moe_profile_support()
+
+    assert supported is False
+    assert ">=3.5,<4" in reason
     assert "4.0.0" in reason
 
 
@@ -265,6 +285,64 @@ def test_sgl_fused_moe_matches_qwen3_tp2_shape(num_tokens) -> None:
     torch.cuda.synchronize()
 
     assert torch.equal(actual, expected)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not sgl_moe_alignment_support()[0],
+    reason="CUDA and a validated sglang-kernel are required",
+)
+def test_sgl_fused_moe_matches_glm47_tp1_fused_shared_shape() -> None:
+    torch.manual_seed(20260827)
+    device = torch.device("cuda")
+    num_tokens = 2
+    hidden_states = torch.randn(
+        num_tokens, 2048, device=device, dtype=torch.bfloat16
+    ) * 0.02
+    w13_weight = torch.randn(
+        65, 3072, 2048, device=device, dtype=torch.bfloat16
+    ) * 0.02
+    w2_weight = torch.randn(
+        65, 2048, 1536, device=device, dtype=torch.bfloat16
+    ) * 0.02
+    routed_ids = torch.topk(
+        torch.rand(num_tokens, 64, device=device),
+        k=4,
+        dim=-1,
+    ).indices
+    topk_ids = torch.cat(
+        (routed_ids, torch.full((num_tokens, 1), 64, device=device)),
+        dim=-1,
+    )
+    routed_weights = torch.rand(
+        num_tokens, 4, device=device, dtype=torch.float32
+    )
+    routed_weights /= routed_weights.sum(dim=-1, keepdim=True)
+    topk_weights = torch.cat(
+        (routed_weights, torch.ones(num_tokens, 1, device=device)),
+        dim=-1,
+    )
+
+    expected = _torch_local_moe(
+        hidden_states,
+        w13_weight,
+        w2_weight,
+        topk_ids,
+        topk_weights,
+        0,
+    )
+    actual = sgl_fused_moe(
+        hidden_states,
+        w13_weight,
+        w2_weight,
+        topk_ids,
+        topk_weights,
+        num_experts=65,
+        local_expert_start=0,
+        alignment_impl=_sgl_moe_align_block_size,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.allclose(actual, expected, atol=3e-2, rtol=3e-2)
 
 
 def test_sgl_moe_support_rejects_missing_package() -> None:

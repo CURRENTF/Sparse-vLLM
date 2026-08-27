@@ -560,6 +560,33 @@ def test_glm_sparse_moe_reduces_pure_tp_over_world(
     )
 
 
+def test_glm_tp1_prefill_uses_fused_routed_and_shared_path() -> None:
+    context = _ep_context()
+    block = object.__new__(Glm4MoeLiteSparseMoeBlock)
+    nn.Module.__init__(block)
+    block.parallel_context = context
+    block.runtime_config = None
+    block.mlp_chunk_size = 8
+    block.experts = SimpleNamespace(
+        fuses_shared_prefill=True,
+        fuses_shared_decode=True,
+    )
+    block._routed_and_shared_chunk = lambda hidden_states: hidden_states * 3
+    block._routed_chunk = Mock(side_effect=AssertionError("routed-only path used"))
+    block._shared_chunk = Mock(side_effect=AssertionError("shared path used"))
+    hidden_states = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+
+    with patch(
+        "sparsevllm.models.glm4_moe_lite.get_context",
+        return_value=SimpleNamespace(is_prefill=True),
+    ):
+        output = block(hidden_states)
+
+    torch.testing.assert_close(output, hidden_states * 3)
+    block._routed_chunk.assert_not_called()
+    block._shared_chunk.assert_not_called()
+
+
 def test_glm_sparse_moe_reduces_hybrid_tp_ep_shards_over_outer_world() -> None:
     world_process_group = object()
     context = ParallelContext(

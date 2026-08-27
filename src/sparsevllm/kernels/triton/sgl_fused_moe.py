@@ -156,7 +156,8 @@ def _config(
     }
 
 
-_PROFILE_RESOURCE = "profiles/sgl_h100_qwen3_bf16.json"
+_QWEN3_PROFILE_RESOURCE = "profiles/sgl_h100_qwen3_bf16.json"
+_GLM47_PROFILE_RESOURCE = "profiles/sgl_h100_glm47_bf16.json"
 _PROFILE_CONFIG_KEYS = (
     "BLOCK_SIZE_M",
     "BLOCK_SIZE_N",
@@ -167,17 +168,18 @@ _PROFILE_CONFIG_KEYS = (
 )
 
 
-@lru_cache(maxsize=1)
-def _load_sgl_h100_qwen3_profile() -> tuple[
+def _load_sgl_profile_resource(
+    resource_name: str,
+) -> tuple[
     dict[str, object],
     dict[int, dict[int, dict[str, int]]],
 ]:
-    resource = files("sparsevllm.kernels.triton").joinpath(_PROFILE_RESOURCE)
+    resource = files("sparsevllm.kernels.triton").joinpath(resource_name)
     try:
         payload = json.loads(resource.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise RuntimeError(
-            f"Failed to load SGL MoE profile {_PROFILE_RESOURCE}: {error}"
+            f"Failed to load SGL MoE profile {resource_name}: {error}"
         ) from error
     if not isinstance(payload, dict):
         raise RuntimeError("SGL MoE profile root must be a mapping.")
@@ -191,31 +193,14 @@ def _load_sgl_h100_qwen3_profile() -> tuple[
     raw_tables = payload.get("tables")
     if not isinstance(contract, dict) or not isinstance(provenance, dict):
         raise RuntimeError("SGL MoE profile is missing contract or provenance.")
-    expected_contract = {
-        "device_name": "NVIDIA H100 80GB HBM3",
-        "compute_capability": [9, 0],
-        "activation_dtype": "bfloat16",
-        "weight_dtype": "bfloat16",
-        "num_local_experts": 128,
-        "hidden_size": 2048,
-        "top_k": 8,
-        "ep_size": 1,
-        "weight_layout_id": "packed_gate_up_v1",
-        "stages": ["w13", "w2"],
-        "tp_size_by_intermediate_size": {"768": 1, "384": 2, "192": 4},
-    }
-    mismatches = {
-        key: (contract.get(key), expected)
-        for key, expected in expected_contract.items()
-        if contract.get(key) != expected
-    }
-    if mismatches:
-        raise RuntimeError(f"SGL MoE profile contract mismatch: {mismatches}.")
     if not isinstance(payload.get("profile_id"), str) or not isinstance(
         payload.get("kernel"), str
     ):
         raise RuntimeError("SGL MoE profile must identify its profile and kernel.")
-    if payload.get("toolchain") != {"triton": ">=3.5,<4"}:
+    if payload.get("toolchain") not in (
+        {"triton": ">=3.5,<4"},
+        {"triton": "3.6.0"},
+    ):
         raise RuntimeError(
             f"Unsupported SGL MoE profile toolchain: {payload.get('toolchain')!r}."
         )
@@ -248,8 +233,90 @@ def _load_sgl_h100_qwen3_profile() -> tuple[
     return payload, tables
 
 
+def _validate_profile_contract(
+    payload: dict[str, object],
+    expected_contract: dict[str, object],
+) -> None:
+    contract = payload["contract"]
+    assert isinstance(contract, dict)
+    mismatches = {
+        key: (contract.get(key), expected)
+        for key, expected in expected_contract.items()
+        if contract.get(key) != expected
+    }
+    if mismatches:
+        raise RuntimeError(f"SGL MoE profile contract mismatch: {mismatches}.")
+
+
+@lru_cache(maxsize=1)
+def _load_sgl_h100_qwen3_profile() -> tuple[
+    dict[str, object],
+    dict[int, dict[int, dict[str, int]]],
+]:
+    payload, tables = _load_sgl_profile_resource(_QWEN3_PROFILE_RESOURCE)
+    _validate_profile_contract(
+        payload,
+        {
+            "device_name": "NVIDIA H100 80GB HBM3",
+            "compute_capability": [9, 0],
+            "activation_dtype": "bfloat16",
+            "weight_dtype": "bfloat16",
+            "num_local_experts": 128,
+            "hidden_size": 2048,
+            "top_k": 8,
+            "ep_size": 1,
+            "weight_layout_id": "packed_gate_up_v1",
+            "stages": ["w13", "w2"],
+            "tp_size_by_intermediate_size": {"768": 1, "384": 2, "192": 4},
+        },
+    )
+    return payload, tables
+
+
+@lru_cache(maxsize=1)
+def _load_sgl_h100_glm47_profile() -> tuple[
+    dict[str, object],
+    dict[int, dict[int, dict[str, int]]],
+]:
+    payload, tables = _load_sgl_profile_resource(_GLM47_PROFILE_RESOURCE)
+    _validate_profile_contract(
+        payload,
+        {
+            "device_name": "H100",
+            "compute_capability": [9, 0],
+            "activation_dtype": "bfloat16",
+            "weight_dtype": "bfloat16",
+            "num_local_experts": 65,
+            "hidden_size": 2048,
+            "intermediate_size": 1536,
+            "top_k": 5,
+            "tp_size": 1,
+            "ep_size": 1,
+            "weight_layout_id": "packed_gate_up_v1",
+            "stages": ["w13", "w2"],
+        },
+    )
+    return payload, tables
+
+
 def sgl_moe_profile_support() -> tuple[bool, str]:
     payload, _ = _load_sgl_h100_qwen3_profile()
+    raw_version = str(triton.__version__).split("+", 1)[0]
+    try:
+        major, minor = (int(part) for part in raw_version.split(".")[:2])
+    except (TypeError, ValueError):
+        return False, f"cannot parse Triton version {triton.__version__!r}"
+    if major != 3 or minor < 5:
+        return (
+            False,
+            f"profile {payload['profile_id']} requires Triton >=3.5,<4, "
+            f"got {triton.__version__}",
+        )
+    return True, f"profile {payload['profile_id']} matches Triton {triton.__version__}"
+
+
+def sgl_glm47_moe_profile_support() -> tuple[bool, str]:
+    payload, _ = _load_sgl_h100_glm47_profile()
     raw_version = str(triton.__version__).split("+", 1)[0]
     try:
         major, minor = (int(part) for part in raw_version.split(".")[:2])
@@ -280,6 +347,22 @@ def sgl_moe_profile_metadata() -> dict[str, object]:
     }
 
 
+def sgl_glm47_moe_profile_metadata() -> dict[str, object]:
+    payload, _ = _load_sgl_h100_glm47_profile()
+    provenance = payload["provenance"]
+    return {
+        "profile_id": payload["profile_id"],
+        "profile_status": payload["profile_status"],
+        "profile_source": {
+            "kind": provenance["kind"],
+            "source_repository": provenance["source_repository"],
+            "source_revision": provenance["source_revision"],
+            "source_paths": list(provenance["source_paths"]),
+        },
+        "kernel": payload["kernel"],
+    }
+
+
 def resolve_sgl_moe_config(
     *,
     num_tokens: int,
@@ -298,6 +381,25 @@ def resolve_sgl_moe_config(
     num_tokens = int(num_tokens)
     if num_tokens <= 0:
         raise ValueError(f"num_tokens must be positive, got {num_tokens}.")
+    glm_payload, glm_tables = _load_sgl_h100_glm47_profile()
+    glm_contract = glm_payload["contract"]
+    glm_profile_supported, _ = sgl_glm47_moe_profile_support()
+    if (
+        glm_profile_supported
+        and str(glm_contract["device_name"]) in device_name
+        and tuple(device_capability) == tuple(glm_contract["compute_capability"])
+        and activation_dtype == torch.bfloat16
+        and weight_dtype == torch.bfloat16
+        and int(ep_size) == int(glm_contract["ep_size"])
+        and int(top_k) == int(glm_contract["top_k"])
+        and int(num_local_experts) == int(glm_contract["num_local_experts"])
+        and int(hidden_size) == int(glm_contract["hidden_size"])
+        and int(intermediate_size) == int(glm_contract["intermediate_size"])
+    ):
+        table = glm_tables[int(intermediate_size)]
+        bucket = min(table, key=lambda value: abs(value - num_tokens))
+        return dict(table[bucket])
+
     payload, tables = _load_sgl_h100_qwen3_profile()
     contract = payload["contract"]
     profile_supported, _ = sgl_moe_profile_support()
@@ -460,6 +562,8 @@ def sgl_fused_moe(
 __all__ = [
     "resolve_sgl_moe_config",
     "sgl_fused_moe",
+    "sgl_glm47_moe_profile_metadata",
+    "sgl_glm47_moe_profile_support",
     "sgl_moe_profile_metadata",
     "sgl_moe_profile_support",
 ]
