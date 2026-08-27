@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
+from dataclasses import dataclass
 
 import numpy as np
 import torch
@@ -38,6 +39,18 @@ from .storage import ExplicitKVStorage, create_attention_cache_storage
 
 _INT32_BYTES = 4
 _PAGE_TABLE_COMPACTION_TILE_ELEMENTS = 256 * 1024
+
+
+@dataclass
+class SnapKVDecodeGraphState(CacheDecodeGraphState):
+    layer_slot_mapping: torch.Tensor
+    layer_free_starts: torch.Tensor
+    active_count: torch.Tensor
+    layer_fact_storage: torch.Tensor
+    host_layer_free_starts: torch.Tensor
+    host_active_count: torch.Tensor
+    host_layer_fact_storage: torch.Tensor
+    transformer_layer_ids: torch.Tensor
 
 
 def resolve_snapkv_cache_capacity(
@@ -212,6 +225,10 @@ class SnapKVCacheManager(CacheManager):
         if method == "pyramidkv" and self.config.pyramid_layer_ratios is None:
             return max_model_len <= sink + decode_keep + recent
         return False
+
+    def _decode_graph_metadata_always_uniform(self) -> bool:
+        """Whether every reachable decode state keeps rows aligned by layer."""
+        return self._sparse_eviction_never_triggers()
 
     def _pyramidkv_can_use_full_prefill_staging(self) -> bool:
         return (
@@ -3317,43 +3334,253 @@ class SnapKVCacheManager(CacheManager):
             self.row_seq_lens[layer_id][row_indices[layer_id]] += 1
         return selected_slots, next_lens, row_indices, wrote_slot_output
 
+    def init_decode_graph_state(
+        self,
+        contract,
+        inputs,
+    ) -> CacheDecodeGraphState:
+        inputs.validate(contract)
+        if (
+            self.free_slots_stack_tensor is None
+            or not self._decode_graph_metadata_always_uniform()
+        ):
+            return CacheDecodeGraphState(contract=contract, inputs=inputs)
+
+        num_layers = int(self.num_layers)
+        batch_capacity = int(contract.batch_capacity)
+        storage_elements = num_layers + 1
+        pin_memory = bool(inputs.host.input_ids.is_pinned())
+        host_storage = torch.empty(
+            storage_elements,
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=pin_memory,
+        )
+        device_storage = torch.empty(
+            storage_elements,
+            dtype=torch.int32,
+            device=self.device,
+        )
+
+        layer_free_starts = device_storage[:num_layers]
+        active_count = device_storage[-1:]
+        host_layer_free_starts = host_storage[:num_layers]
+        host_active_count = host_storage[-1:]
+        return SnapKVDecodeGraphState(
+            contract=contract,
+            inputs=inputs,
+            layer_slot_mapping=torch.empty(
+                (num_layers, batch_capacity),
+                dtype=torch.int32,
+                device=self.device,
+            ),
+            layer_free_starts=layer_free_starts,
+            active_count=active_count,
+            layer_fact_storage=device_storage,
+            host_layer_free_starts=host_layer_free_starts,
+            host_active_count=host_active_count,
+            host_layer_fact_storage=host_storage,
+            transformer_layer_ids=torch.tensor(
+                self.kv_transformer_layer_indices(),
+                dtype=torch.int32,
+                device=self.device,
+            ),
+        )
+
+    def _prepare_uniform_decode_graph_step(
+        self,
+        seqs: list[Sequence],
+        state: SnapKVDecodeGraphState,
+        seq_ids: np.ndarray,
+    ):
+        inputs = state.inputs
+        host = inputs.host
+        real_batch_size = len(seqs)
+        graph_batch_size = int(inputs.batch_capacity)
+        layer_ids = tuple(self.kv_transformer_layer_indices())
+        first_layer = int(layer_ids[0])
+        rows = np.asarray(
+            [self.seq_id_to_row[first_layer][int(seq_id)] for seq_id in seq_ids],
+            dtype=np.int32,
+        )
+        current = self.row_seq_lens[first_layer][rows]
+        next_lens = current + 1
+        if self.validate_runtime_invariants:
+            for layer_id in layer_ids[1:]:
+                layer_rows = np.asarray(
+                    [self.seq_id_to_row[layer_id].get(int(seq_id), -1) for seq_id in seq_ids],
+                    dtype=np.int32,
+                )
+                if not np.array_equal(layer_rows, rows):
+                    raise RuntimeError(
+                        "Uniform sparse graph decode requires identical request rows "
+                        f"across layers: first={rows.tolist()} "
+                        f"layer={layer_id} rows={layer_rows.tolist()}."
+                    )
+                if not np.array_equal(self.row_seq_lens[layer_id][layer_rows], current):
+                    raise RuntimeError(
+                        "Uniform sparse graph decode requires identical row lengths "
+                        f"across layers: first={current.tolist()} "
+                        f"layer={layer_id}."
+                    )
+
+        max_context_len = int(next_lens.max())
+        if max_context_len > int(state.contract.context_capacity):
+            raise RuntimeError(
+                "Sparse decode context exceeds captured graph capacity: "
+                f"real={max_context_len} capacity={state.contract.context_capacity}."
+            )
+        if max_context_len > int(self.max_model_len):
+            raise RuntimeError(
+                "Sparse decode context exceeds max_model_len: "
+                f"real={max_context_len} max_model_len={self.max_model_len}."
+            )
+        free_ptrs = tuple(int(self._num_free_slots[layer_id]) for layer_id in layer_ids)
+        if min(free_ptrs) < real_batch_size:
+            raise RuntimeError(
+                "Out of sparse KV cache slots during graph reservation: "
+                f"need={real_batch_size} free={min(free_ptrs)}."
+            )
+        if self.validate_runtime_invariants and any(
+            free_ptr != free_ptrs[0] for free_ptr in free_ptrs[1:]
+        ):
+            raise RuntimeError(
+                "Uniform sparse graph decode requires aligned free-stack pointers: "
+                f"layers={layer_ids} pointers={free_ptrs}."
+            )
+
+        state.host_active_count[0] = real_batch_size
+        for layer_id, free_ptr in zip(layer_ids, free_ptrs):
+            state.host_layer_free_starts[layer_id] = free_ptr - real_batch_size
+            self._num_free_slots[layer_id] -= real_batch_size
+            self.row_seq_lens[layer_id][rows] += 1
+
+        host.pack_cache_facts(
+            context_lens=next_lens,
+            request_indices=rows,
+            real_batch_size=real_batch_size,
+            padding_active=bool(state.contract.padding.active),
+        )
+        non_blocking = bool(host.input_ids.is_pinned())
+        inputs.input_ids.copy_(host.input_ids, non_blocking=non_blocking)
+        inputs.positions.copy_(host.positions, non_blocking=non_blocking)
+        inputs.context_lens.copy_(host.context_lens, non_blocking=non_blocking)
+        inputs.request_indices.copy_(host.request_indices, non_blocking=non_blocking)
+        inputs.active_mask.copy_(host.active_mask, non_blocking=non_blocking)
+        private_non_blocking = bool(state.host_layer_fact_storage.is_pinned())
+        state.layer_fact_storage.copy_(
+            state.host_layer_fact_storage,
+            non_blocking=private_non_blocking,
+        )
+
+        binding_key = (
+            graph_batch_size,
+            int(state.layer_slot_mapping.data_ptr()),
+            int(inputs.context_lens.data_ptr()),
+            int(inputs.request_indices.data_ptr()),
+        )
+        if self._decode_static_state_binding_key != binding_key:
+            for layer_id in layer_ids:
+                layer_state = self.layer_batch_states[layer_id]
+                layer_state.slot_mapping = state.layer_slot_mapping[layer_id]
+                layer_state.context_lens = inputs.context_lens
+                layer_state.req_indices = inputs.request_indices
+            self._decode_static_state_binding_key = binding_key
+        for layer_id in layer_ids:
+            self.layer_batch_states[layer_id].max_context_len = max_context_len
+        return inputs.input_ids, inputs.positions, None
+
     @torch.no_grad()
     def prepare_decode_graph_step(
         self,
         seqs: list[Sequence],
         state: CacheDecodeGraphState,
     ):
-        result = super().prepare_decode_graph_step(seqs, state)
+        if not isinstance(state, SnapKVDecodeGraphState):
+            result = super().prepare_decode_graph_step(seqs, state)
+            inputs = state.inputs
+            host = inputs.host
+            real_batch_size = len(seqs)
+            graph_batch_size = int(inputs.batch_capacity)
+            first_layer = int(self.kv_transformer_layer_indices()[0])
+            row_indices = np.asarray(
+                [self.seq_id_to_row[first_layer][int(seq.seq_id)] for seq in seqs],
+                dtype=np.int32,
+            )
+            real_context_lens = self.row_seq_lens[first_layer][row_indices].astype(
+                np.int32,
+                copy=False,
+            )
+            host.input_ids.numpy()[:real_batch_size] = [
+                int(seq.decode_input_token) for seq in seqs
+            ]
+            host.positions.numpy()[:real_batch_size] = [
+                int(seq.decode_input_position) for seq in seqs
+            ]
+            host.context_lens.numpy()[:real_batch_size] = real_context_lens
+            host.request_indices.numpy()[:real_batch_size] = row_indices
+            host.active_mask[:real_batch_size].fill_(True)
+            if graph_batch_size > real_batch_size:
+                host.input_ids[real_batch_size:].fill_(int(seqs[0].decode_input_token))
+                host.positions[real_batch_size:].fill_(
+                    int(seqs[0].decode_input_position)
+                )
+                host.context_lens[real_batch_size:].fill_(int(real_context_lens[0]))
+                host.request_indices[real_batch_size:].fill_(int(row_indices[0]))
+                host.active_mask[real_batch_size:].fill_(state.contract.padding.active)
+            return result
+
         inputs = state.inputs
         host = inputs.host
         real_batch_size = len(seqs)
         graph_batch_size = int(inputs.batch_capacity)
-        first_layer = int(self.kv_transformer_layer_indices()[0])
-        row_indices = np.asarray(
-            [self.seq_id_to_row[first_layer][int(seq.seq_id)] for seq in seqs],
-            dtype=np.int32,
-        )
-        real_context_lens = self.row_seq_lens[first_layer][row_indices].astype(
-            np.int32,
-            copy=False,
+        if real_batch_size <= 0 or real_batch_size > graph_batch_size:
+            raise ValueError(
+                "Sparse decode graph requires a non-empty active batch within capacity: "
+                f"real={real_batch_size} capacity={graph_batch_size}."
+            )
+        with profiler.record("cache_prepare_decode"):
+            seq_ids = host.pack_requests(seqs)
+            if not self._uniform_decode_metadata:
+                raise RuntimeError(
+                    "A layer-uniform decode graph cannot publish per-layer metadata."
+                )
+            return self._prepare_uniform_decode_graph_step(seqs, state, seq_ids)
+
+    def prepare_decode_graph_in(self, state: CacheDecodeGraphState) -> None:
+        if not isinstance(state, SnapKVDecodeGraphState):
+            return super().prepare_decode_graph_in(state)
+        from sparsevllm.kernels.triton.sparse_decode_graph_metadata import (
+            publish_uniform_sparse_decode_graph_slots,
         )
 
-        host.input_ids.numpy()[:real_batch_size] = [
-            int(seq.decode_input_token) for seq in seqs
-        ]
-        host.positions.numpy()[:real_batch_size] = [
-            int(seq.decode_input_position) for seq in seqs
-        ]
-        host.context_lens.numpy()[:real_batch_size] = real_context_lens
-        host.request_indices.numpy()[:real_batch_size] = row_indices
-        host.active_mask[:real_batch_size].fill_(True)
-        if graph_batch_size > real_batch_size:
-            host.input_ids[real_batch_size:].fill_(int(seqs[0].decode_input_token))
-            host.positions[real_batch_size:].fill_(int(seqs[0].decode_input_position))
-            host.context_lens[real_batch_size:].fill_(int(real_context_lens[0]))
-            host.request_indices[real_batch_size:].fill_(int(row_indices[0]))
-            host.active_mask[real_batch_size:].fill_(state.contract.padding.active)
-        return result
+        publish_uniform_sparse_decode_graph_slots(
+            self.free_slots_stack_tensor,
+            self.buffer_req_to_token_slots_tensor,
+            state.layer_slot_mapping,
+            state.inputs.write_slot_mapping,
+            state.inputs.context_lens,
+            state.inputs.request_indices,
+            state.layer_free_starts,
+            state.active_count,
+            state.transformer_layer_ids,
+        )
+
+    def decode_graph_state_keepalive_tensors(
+        self,
+        state: CacheDecodeGraphState,
+    ) -> list[torch.Tensor]:
+        tensors = super().decode_graph_state_keepalive_tensors(state)
+        if isinstance(state, SnapKVDecodeGraphState):
+            tensors.extend(
+                (
+                    state.layer_slot_mapping,
+                    state.layer_fact_storage,
+                    state.host_layer_fact_storage,
+                    state.transformer_layer_ids,
+                )
+            )
+        return tensors
 
     @torch.no_grad()
     def prepare_decode_static(

@@ -24,6 +24,9 @@ class StreamingLLMCacheManager(SnapKVCacheManager):
     def prefill_batched_tokens_margin(self) -> int:
         return int(self.config.recent_keep_tokens)
 
+    def _decode_graph_metadata_always_uniform(self) -> bool:
+        return True
+
     def remaining_prefill_tokens(self, seq: Sequence) -> int:
         remaining = int(seq.num_prompt_tokens - seq.num_prefilled_tokens)
         recent = int(self.config.recent_keep_tokens)

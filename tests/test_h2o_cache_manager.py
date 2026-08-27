@@ -1668,8 +1668,17 @@ def test_h2o_static_decode_reuses_uniform_rows_without_generic_metadata_rebuild(
     assert manager.layer_batch_states[1].max_context_len == 5
 
 
-def test_snapkv_decode_graph_populates_host_mirrors_for_provider_planning():
+@pytest.mark.parametrize("graph_publish", [False, True])
+def test_snapkv_decode_graph_populates_host_mirrors_for_provider_planning(
+    graph_publish,
+):
     manager = _manager_with_layer_rows([[4], [4]])
+    if graph_publish:
+        manager.config.sparse_method = "snapkv"
+        manager.config.sink_keep_tokens = 0
+        manager.config.decode_keep_tokens = manager.max_model_len
+        manager.config.recent_keep_tokens = 0
+        manager._uniform_decode_metadata = True
     manager.max_buffer_rows = 1
     manager.layer_batch_states = [LayerBatchStates(), LayerBatchStates()]
     manager._decode_static_buffers = {}
@@ -1689,7 +1698,7 @@ def test_snapkv_decode_graph_populates_host_mirrors_for_provider_planning():
     manager._num_free_slots = [32, 32]
     seq = _seq(0, 5, prefilled=4, chunk=1)
     contract = DecodeGraphContract(
-        method="h2o",
+        method=manager.config.sparse_method,
         shape_policy="batch_only",
         topology_path_id="short",
         batch_capacity=4,
@@ -1714,7 +1723,18 @@ def test_snapkv_decode_graph_populates_host_mirrors_for_provider_planning():
     assert inputs.host.request_indices.tolist() == inputs.request_indices.tolist()
     assert inputs.host.active_mask.tolist() == [True, False, False, False]
     assert inputs.host.active_mask.tolist() == inputs.active_mask.tolist()
+    expected_before_graph = [0, 0] if graph_publish else [131, 231]
+    assert (
+        manager.buffer_req_to_token_slots_tensor[:, 0, 4].tolist()
+        == expected_before_graph
+    )
 
+    manager.prepare_decode_graph_in(state)
+
+    assert manager.buffer_req_to_token_slots_tensor[:, 0, 4].tolist() == [131, 231]
+    assert inputs.write_slot_mapping.tolist() == [131, -1, -1, -1]
+    assert manager.layer_batch_states[0].slot_mapping.tolist() == [131, -1, -1, -1]
+    assert manager.layer_batch_states[1].slot_mapping.tolist() == [231, -1, -1, -1]
 
 def test_h2o_static_decode_rejects_divergent_layer_row_lengths_before_allocation():
     manager = _manager_with_layer_rows(
