@@ -2295,6 +2295,36 @@ def test_standard_decode_graph_state_updates_stable_typed_inputs():
     assert all(tensor.data_ptr() for tensor in inputs.keepalive_tensors())
 
 
+def test_standard_decode_graph_publishes_reserved_slot_in_graph_phase():
+    manager = _make_standard_manager_for_prefix(block_size=4)
+    seq = Sequence([1, 2, 3])
+    prompt_slots = manager._allocate(seq.seq_id, 3)
+    manager._record_prefix_materialization(seq, [1, 2, 3], prompt_slots)
+    seq.num_prefilled_tokens = seq.num_prompt_tokens
+    seq.append_token(4)
+    contract = DecodeGraphContract(
+        method="",
+        shape_policy="batch_only",
+        topology_path_id="dense",
+        batch_capacity=4,
+        context_capacity=16,
+    )
+    inputs = DecodeGraphInputs.allocate(
+        contract,
+        device=torch.device("cpu"),
+        pin_memory=False,
+    )
+    state = manager.init_decode_graph_state(contract, inputs)
+    row = manager.seq_id_to_row[seq.seq_id]
+
+    manager.prepare_decode_graph_step([seq], state)
+
+    reserved_slot = int(inputs.write_slot_mapping[0])
+    assert manager.buffer_req_to_token_slots[row, 3].item() == 0
+    manager.prepare_decode_graph_in(state)
+    assert manager.buffer_req_to_token_slots[row, 3].item() == reserved_slot
+
+
 def test_standard_decode_graph_rejects_capacity_before_cache_mutation():
     manager = _make_standard_manager_for_prefix(block_size=4)
     seq = Sequence([1, 2, 3])
@@ -2323,6 +2353,38 @@ def test_standard_decode_graph_rejects_capacity_before_cache_mutation():
 
     assert manager._num_free_slots == free_slots_before
     assert int(manager.row_seq_lens[manager.seq_id_to_row[seq.seq_id]]) == row_len_before
+
+
+def test_standard_decode_graph_capacity_failure_does_not_claim_new_rows():
+    manager = _make_standard_manager_for_prefix(block_size=4)
+    existing = Sequence([1, 2, 3])
+    manager._allocate(existing.seq_id, 3)
+    existing.num_prefilled_tokens = existing.num_prompt_tokens
+    existing.append_token(4)
+    newcomer = Sequence([11])
+    newcomer.num_prefilled_tokens = newcomer.num_prompt_tokens
+    newcomer.append_token(12)
+    contract = DecodeGraphContract(
+        method="",
+        shape_policy="batch_only",
+        topology_path_id="dense",
+        batch_capacity=2,
+        context_capacity=3,
+    )
+    inputs = DecodeGraphInputs.allocate(
+        contract,
+        device=torch.device("cpu"),
+        pin_memory=False,
+    )
+    state = manager.init_decode_graph_state(contract, inputs)
+    mappings_before = dict(manager.seq_id_to_row)
+    free_rows_before = tuple(manager.free_rows)
+
+    with pytest.raises(ValueError, match="exceeded the captured graph context"):
+        manager.prepare_decode_graph_step([newcomer, existing], state)
+
+    assert manager.seq_id_to_row == mappings_before
+    assert tuple(manager.free_rows) == free_rows_before
 
 
 def test_standard_decode_materialized_block_can_seed_later_prefix_hit():

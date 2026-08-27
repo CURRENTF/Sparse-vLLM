@@ -102,7 +102,6 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
         self.free_rows = deque(range(self.max_buffer_rows))
         self.row_seq_lens = np.zeros((self.max_buffer_rows,), dtype=np.int32)
         self.layer_batch_state = LayerBatchStates()
-        self._decode_static_index_buffers: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
 
         self.enable_prefix_caching = bool(
             config.enable_prefix_caching and config.sparse_method in ("", "omnikv")
@@ -1276,24 +1275,57 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
 
         return select_indices
 
-    def _get_decode_static_index_buffers(self, graph_batch_size: int) -> tuple[torch.Tensor, torch.Tensor]:
-        graph_batch_size = int(graph_batch_size)
-        if not hasattr(self, "_decode_static_index_buffers"):
-            self._decode_static_index_buffers = {}
-        buffers = self._decode_static_index_buffers.get(graph_batch_size)
-        if buffers is None:
-            buffers = (
-                torch.empty((graph_batch_size,), dtype=torch.long, device=self.device),
-                torch.empty((graph_batch_size,), dtype=torch.long, device=self.device),
+    def _plan_decode_rows(
+        self,
+        seq_ids: list[int] | np.ndarray,
+    ) -> tuple[np.ndarray, tuple[tuple[int, int], ...]]:
+        try:
+            rows = np.asarray(
+                [self.seq_id_to_row[seq_id] for seq_id in seq_ids],
+                dtype=np.int64,
             )
-            self._decode_static_index_buffers[graph_batch_size] = buffers
-        return buffers
+            return rows, ()
+        except KeyError:
+            pass
+
+        rows = np.empty(len(seq_ids), dtype=np.int64)
+        pending: list[tuple[int, int]] = []
+        free_rows = iter(self.free_rows)
+        for index, seq_id in enumerate(seq_ids):
+            row = self.seq_id_to_row.get(seq_id)
+            if row is None:
+                try:
+                    row = next(free_rows)
+                except StopIteration as error:
+                    raise RuntimeError(
+                        "No free rows for static decode batch: "
+                        f"need={len(pending) + 1} free={len(self.free_rows)}."
+                    ) from error
+                pending.append((int(seq_id), row))
+            rows[index] = row
+        return rows, tuple(pending)
+
+    def _commit_decode_rows(
+        self,
+        pending: tuple[tuple[int, int], ...],
+    ) -> None:
+        for seq_id, expected_row in pending:
+            if not self.free_rows or self.free_rows[0] != expected_row:
+                raise RuntimeError(
+                    "Static decode row plan changed before commit: "
+                    f"expected={expected_row} "
+                    f"actual={self.free_rows[0] if self.free_rows else None}."
+                )
+            row = self.free_rows.popleft()
+            self.seq_id_to_row[seq_id] = row
 
     @torch.no_grad()
     def _allocate_decode_batch_static(
         self,
         seq_ids: list[int],
-        graph_batch_size: int,
+        *,
+        row_indices: np.ndarray,
+        pending_rows: tuple[tuple[int, int], ...],
     ) -> tuple[torch.Tensor, np.ndarray, np.ndarray]:
         batch_size = len(seq_ids)
         self._evict_prefix_cache_until_free(batch_size)
@@ -1302,20 +1334,16 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
                 f"Out of KV cache slots: need {batch_size}, free {self._num_free_slots}"
             )
 
-        row_indices = np.asarray([self._get_free_row(sid) for sid in seq_ids], dtype=np.int64)
-        cur_lens = self.row_seq_lens[row_indices]
+        if row_indices.shape != (batch_size,):
+            raise ValueError(
+                "Static decode reservation rows must match the active batch: "
+                f"shape={row_indices.shape} batch={batch_size}."
+            )
 
+        self._commit_decode_rows(pending_rows)
         ptr = self._num_free_slots
         select_indices = self.free_slots_stack[ptr - batch_size: ptr]
         self._num_free_slots -= batch_size
-
-        rows_gpu, cols_gpu = self._get_decode_static_index_buffers(graph_batch_size)
-        rows_gpu[:batch_size].copy_(torch.from_numpy(row_indices))
-        cols_gpu[:batch_size].copy_(torch.from_numpy(cur_lens.astype(np.int64, copy=False)))
-        self.buffer_req_to_token_slots[
-            rows_gpu[:batch_size],
-            cols_gpu[:batch_size],
-        ] = select_indices
         self.row_seq_lens[row_indices] += 1
 
         return select_indices, self.row_seq_lens[row_indices], row_indices
@@ -1531,6 +1559,7 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
             slot_mapping=slot_mapping,
             context_lens=context_lens,
             req_indices=req_indices,
+            publish_slots_outside_graph=True,
         )
 
     def prepare_decode_graph_step(
@@ -1556,6 +1585,22 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
             context_capacity=int(state.contract.context_capacity),
         )
 
+    def prepare_decode_graph_in(self, state: CacheDecodeGraphState) -> None:
+        """Publish reservations before provider graph-in preparation consumes them."""
+
+        from sparsevllm.kernels.triton.decode_graph_metadata import (
+            publish_decode_graph_slots,
+        )
+
+        inputs = state.inputs
+        publish_decode_graph_slots(
+            self.buffer_req_to_token_slots,
+            inputs.request_indices,
+            inputs.context_lens,
+            inputs.write_slot_mapping,
+            inputs.active_mask,
+        )
+
     def _prepare_decode_graph_buffers(
         self,
         seqs: list[Sequence],
@@ -1571,6 +1616,7 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
         padding_active: bool = False,
         mirror_first_real_row_for_reads: bool = True,
         context_capacity: int | None = None,
+        publish_slots_outside_graph: bool = False,
     ):
         with profiler.record("cache_prepare_decode"):
             self._poll_prefix_offload()
@@ -1611,11 +1657,8 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
                 input_ids_list = None
                 positions_list = None
 
+            prospective_rows, pending_rows = self._plan_decode_rows(seq_ids)
             if context_capacity is not None:
-                prospective_rows = np.asarray(
-                    [self._get_free_row(seq_id) for seq_id in seq_ids],
-                    dtype=np.int64,
-                )
                 max_requested_context_len = int(
                     (self.row_seq_lens[prospective_rows] + 1).max()
                 )
@@ -1628,7 +1671,8 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
 
             new_slots_batch, real_context_lens, row_indices = self._allocate_decode_batch_static(
                 seq_ids,
-                graph_batch_size,
+                row_indices=prospective_rows,
+                pending_rows=pending_rows,
             )
             for seq, slot in zip(seqs, new_slots_batch):
                 self._record_prefix_materialization(seq, [seq.decode_input_token], slot.reshape(1))
@@ -1700,6 +1744,18 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
                 req_indices[real_batch_size:].fill_(first_row_idx)
                 if active_mask is not None:
                     active_mask[real_batch_size:].fill_(padding_active)
+
+            if publish_slots_outside_graph:
+                from sparsevllm.kernels.triton.decode_graph_metadata import (
+                    publish_decode_graph_slots,
+                )
+
+                publish_decode_graph_slots(
+                    self.buffer_req_to_token_slots,
+                    req_indices[:real_batch_size],
+                    context_lens[:real_batch_size],
+                    slot_mapping[:real_batch_size],
+                )
 
             self.layer_batch_state.slot_mapping = slot_mapping
             self.layer_batch_state.context_lens = context_lens
