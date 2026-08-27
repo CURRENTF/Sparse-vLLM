@@ -4,6 +4,7 @@ import torch
 
 from sparsevllm.kernels.triton.mla.copy_latent import (
     copy_latent_to_cache,
+    copy_latent_to_cache_with_quest_metadata,
     validate_copy_slot_mappings,
 )
 from sparsevllm.kernels.triton.mla.decode_stage1 import MLA_LATENT_DIM, MLA_ROPE_DIM
@@ -161,12 +162,9 @@ class MlaLatentStorage:
                 f"{type(payload).__name__}."
             )
         destination = self.layer_payload(layer_idx)
-        slot_mapping_key = self._slot_mapping_key(slot_mapping)
-        remaining = self._validated_store_calls_remaining.get(
-            slot_mapping_key,
-            0,
+        use_prevalidated_mapping = self._consume_prevalidated_mapping(
+            slot_mapping
         )
-        use_prevalidated_mapping = remaining > 0
         copy_latent_to_cache(
             payload.latent,
             payload.rope,
@@ -178,6 +176,17 @@ class MlaLatentStorage:
                 and not use_prevalidated_mapping
             ),
         )
+
+    def _consume_prevalidated_mapping(
+        self,
+        slot_mapping: torch.Tensor,
+    ) -> bool:
+        slot_mapping_key = self._slot_mapping_key(slot_mapping)
+        remaining = self._validated_store_calls_remaining.get(
+            slot_mapping_key,
+            0,
+        )
+        use_prevalidated_mapping = remaining > 0
         if use_prevalidated_mapping:
             if remaining == 1:
                 del self._validated_store_calls_remaining[slot_mapping_key]
@@ -185,6 +194,41 @@ class MlaLatentStorage:
                 self._validated_store_calls_remaining[slot_mapping_key] = (
                     remaining - 1
                 )
+        return use_prevalidated_mapping
+
+    def store_with_quest_metadata(
+        self,
+        layer_idx: int,
+        slot_mapping: torch.Tensor,
+        payload: AttentionCacheWrite,
+        page_max: torch.Tensor,
+        page_min: torch.Tensor,
+        *,
+        page_size: int,
+    ) -> None:
+        if not isinstance(payload, MlaLatentWrite):
+            raise TypeError(
+                "MlaLatentStorage.store_with_quest_metadata requires "
+                f"MlaLatentWrite, got {type(payload).__name__}."
+            )
+        destination = self.layer_payload(layer_idx)
+        use_prevalidated_mapping = self._consume_prevalidated_mapping(
+            slot_mapping
+        )
+        copy_latent_to_cache_with_quest_metadata(
+            payload.latent,
+            payload.rope,
+            slot_mapping,
+            destination.latent_cache,
+            destination.rope_cache,
+            page_max,
+            page_min,
+            page_size=page_size,
+            validate_slots=(
+                self.validate_runtime_invariants
+                and not use_prevalidated_mapping
+            ),
+        )
 
     def bytes_per_slot_per_layer(self) -> int:
         element_size = torch.tensor([], dtype=self.dtype).element_size()

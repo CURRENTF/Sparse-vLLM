@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import torch
 
-from sparsevllm.kernels.triton.store_kvcache import store_kvcache
+from sparsevllm.kernels.triton.store_kvcache import (
+    store_kvcache,
+    store_kvcache_with_quest_metadata,
+)
 
 from ..base import AttentionCacheWrite, ExplicitKVPayload, ExplicitKVWrite
 from .base import CacheLayout
@@ -104,6 +107,22 @@ class ExplicitKVStorage:
         slot_mapping: torch.Tensor,
         payload: AttentionCacheWrite,
     ) -> None:
+        destination = self._validate_store(layer_idx, slot_mapping, payload)
+        assert isinstance(payload, ExplicitKVWrite)
+        store_kvcache(
+            payload.key,
+            payload.value,
+            destination.k_cache,
+            destination.v_cache,
+            slot_mapping,
+        )
+
+    def _validate_store(
+        self,
+        layer_idx: int,
+        slot_mapping: torch.Tensor,
+        payload: AttentionCacheWrite,
+    ) -> ExplicitKVPayload:
         if not isinstance(payload, ExplicitKVWrite):
             raise TypeError(
                 "ExplicitKVStorage.store requires ExplicitKVWrite, got "
@@ -144,12 +163,29 @@ class ExplicitKVStorage:
                 f"value={payload.value.device} slots={slot_mapping.device}."
             )
         self.validate_slot_mapping(slot_mapping)
-        store_kvcache(
+        return destination
+
+    def store_with_quest_metadata(
+        self,
+        layer_idx: int,
+        slot_mapping: torch.Tensor,
+        payload: AttentionCacheWrite,
+        page_max: torch.Tensor,
+        page_min: torch.Tensor,
+        *,
+        page_size: int,
+    ) -> None:
+        destination = self._validate_store(layer_idx, slot_mapping, payload)
+        assert isinstance(payload, ExplicitKVWrite)
+        store_kvcache_with_quest_metadata(
             payload.key,
             payload.value,
             destination.k_cache,
             destination.v_cache,
             slot_mapping,
+            page_max,
+            page_min,
+            page_size=page_size,
         )
 
     def bytes_per_slot_per_layer(self) -> int:

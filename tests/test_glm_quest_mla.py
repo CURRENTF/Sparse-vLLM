@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-import numpy as np
 import torch
 
 from sparsevllm.config import RuntimeLayout
@@ -10,11 +9,15 @@ from sparsevllm.engine.cache_manager import (
     LayerBatchStates,
     MlaLatentPayload,
     MlaLatentSelectionQuery,
+    MlaLatentWrite,
     SparseSelection,
 )
 from sparsevllm.engine.cache_manager.quest import QuestCacheManager
 from sparsevllm.engine.cache_manager.storage import MlaLatentStorage
-from sparsevllm.engine.sequence import Sequence
+from sparsevllm.operators.quest_selection import (
+    QuestPageSelectionOpSpec,
+    TorchQuestPageSelectionProvider,
+)
 from sparsevllm.utils.context import reset_context, set_context
 
 
@@ -98,7 +101,11 @@ def _latent_quest_manager(*, page_size: int, num_pages: int):
     )
     manager.hf_config = SimpleNamespace(torch_dtype=torch.bfloat16)
     manager.device = torch.device("cpu")
-    manager.platform = SimpleNamespace(is_stream_capturing=lambda: False)
+    manager.validate_runtime_invariants = False
+    manager.platform = SimpleNamespace(
+        is_cuda_alike=lambda: False,
+        is_stream_capturing=lambda: False,
+    )
     manager.runtime_layout = RuntimeLayout.dense(1)
     manager.num_kv_layers = 1
     manager.page_size = page_size
@@ -107,6 +114,12 @@ def _latent_quest_manager(*, page_size: int, num_pages: int):
     manager.metadata_num_heads = 1
     manager.metadata_head_dim = 576
     manager.attention_cache_storage = storage
+    manager.quest_page_selector = TorchQuestPageSelectionProvider(
+        op_spec=QuestPageSelectionOpSpec(
+            score_dtype=torch.bfloat16,
+            cuda_graph=False,
+        )
+    )
     manager.kv_cache = None
     manager.metadata_cache = torch.empty(
         2, 1, num_pages, 1, 576, dtype=torch.bfloat16
@@ -247,37 +260,74 @@ def test_quest_mla_metadata_and_decode_view_keep_latent_payload_typed():
     assert view.meta.max_context_len == 3 * page_size
 
 
-def test_quest_mla_completed_decode_page_refreshes_metadata():
-    """Catches graph/eager replay leaving a completed latent page unscored."""
+def test_quest_mla_partial_prefill_initializes_page_metadata():
+    """Catches incremental decode reading uninitialized partial-page bounds."""
 
-    page_size, num_pages = 2, 3
+    page_size, num_pages = 4, 2
     manager, storage = _latent_quest_manager(
         page_size=page_size,
         num_pages=num_pages,
     )
-    physical_page = 2
-    page_slots = torch.tensor([4, 5], dtype=torch.long)
+    manager._prefill_metadata_full_pages = False
     payload = storage.layer_payload(0)
     payload.latent_cache.zero_()
     payload.rope_cache.zero_()
-    payload.latent_cache[page_slots, 0, 0] = torch.tensor(
-        [-2.0, 5.0], dtype=torch.bfloat16
+    payload.latent_cache[:2, 0, 0] = torch.tensor(
+        [-3.0, 7.0],
+        dtype=torch.bfloat16,
     )
     manager.metadata_cache.fill_(99)
-    manager.enable_prefix_caching = False
-    manager.seq_id_to_row = {17: 0}
-    manager.row_seq_lens = np.asarray([page_size], dtype=np.int32)
-    manager.buffer_req_to_page_slots_cpu = np.full(
-        (1, num_pages), -1, dtype=np.int32
+    slots = torch.tensor([0, 1], dtype=torch.int32)
+
+    set_context(True, cache_manager=manager)
+    try:
+        manager.on_kv_stored(
+            0,
+            torch.empty(2, 512, dtype=torch.bfloat16),
+            slots,
+        )
+    finally:
+        reset_context()
+
+    assert float(manager.metadata_cache[0, 0, 0, 0, 0]) == 7.0
+    assert float(manager.metadata_cache[1, 0, 0, 0, 0]) == -3.0
+
+
+def test_quest_decode_store_dispatches_fused_metadata_update(monkeypatch):
+    """Catches production decode bypassing the fused MLA metadata store."""
+
+    manager, storage = _latent_quest_manager(page_size=4, num_pages=2)
+    slots = torch.tensor([1], dtype=torch.int32)
+    manager.layer_batch_state.slot_mapping = slots
+    payload = MlaLatentWrite(
+        latent=torch.zeros(1, 1, 512, dtype=torch.bfloat16),
+        rope=torch.zeros(1, 1, 64, dtype=torch.bfloat16),
     )
-    manager.buffer_req_to_page_slots_cpu[0, 0] = physical_page
+    calls = []
 
-    seq = Sequence([11, 12])
-    seq.seq_id = 17
-    manager.on_forward_end([seq], is_prefill=False)
+    def record_fused_store(*args, **kwargs):
+        calls.append((args, kwargs))
 
-    assert float(manager.metadata_cache[0, 0, physical_page, 0, 0]) == 5.0
-    assert float(manager.metadata_cache[1, 0, physical_page, 0, 0]) == -2.0
+    monkeypatch.setattr(
+        storage,
+        "store_with_quest_metadata",
+        record_fused_store,
+    )
+    set_context(False, cache_manager=manager)
+    try:
+        returned_slots = manager.store_attention_payload(0, payload)
+    finally:
+        reset_context()
+
+    assert returned_slots is slots
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert args[0] == 0
+    assert args[1] is slots
+    assert args[2] is payload
+    assert args[3].data_ptr() == manager.metadata_cache[0, 0].data_ptr()
+    assert args[4].data_ptr() == manager.metadata_cache[1, 0].data_ptr()
+    assert kwargs == {"page_size": 4}
 
 
 def test_quest_mla_capacity_accounts_two_fused_summaries_per_page():

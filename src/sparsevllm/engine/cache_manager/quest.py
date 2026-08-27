@@ -17,6 +17,14 @@ from sparsevllm.engine.prefix_cache import (
     select_write_through_candidates,
     usable_prefix_cache_tokens,
 )
+from sparsevllm.kernels.triton.quest_decode_view import (
+    finalize_quest_decode_view,
+    score_quest_pages,
+)
+from sparsevllm.operators.quest_selection import (
+    QuestPageSelectionOpSpec,
+    resolve_quest_page_selection_provider,
+)
 from sparsevllm.platforms import device_runtime
 from sparsevllm.utils.context import get_context
 from sparsevllm.utils.profiler import profiler
@@ -77,6 +85,14 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
                 "QuEST requires homogeneous explicit KV or MLA latent storage, got "
                 f"{type(self.attention_cache_storage).__name__}."
             )
+
+        self.quest_page_selector = resolve_quest_page_selection_provider(
+            QuestPageSelectionOpSpec(
+                score_dtype=self.hf_config.torch_dtype,
+                cuda_graph=bool(config.decode_graph),
+            ),
+            device_index=self.device.index or 0,
+        )
 
         self.allocate_kv_cache()
 
@@ -297,11 +313,27 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
             raise RuntimeError(
                 f"Attention cache store requires slot_mapping at layer={layer_idx}."
             )
-        self.attention_cache_storage.store(
-            self.kv_layer_index(layer_idx),
-            slot_mapping,
-            payload,
-        )
+        kv_idx = self.kv_layer_index(layer_idx)
+        if not get_context().is_prefill:
+            storage = self.attention_cache_storage
+            if not isinstance(storage, (ExplicitKVStorage, MlaLatentStorage)):
+                raise AssertionError(
+                    f"Unhandled QuEST storage {type(storage).__name__}."
+                )
+            storage.store_with_quest_metadata(
+                kv_idx,
+                slot_mapping,
+                payload,
+                self.metadata_cache[0, kv_idx],
+                self.metadata_cache[1, kv_idx],
+                page_size=self.page_size,
+            )
+        else:
+            self.attention_cache_storage.store(
+                kv_idx,
+                slot_mapping,
+                payload,
+            )
         return slot_mapping
 
     def get_layer_compute_payload(
@@ -1777,11 +1809,7 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
         if slot_mapping is None or slot_mapping.numel() == 0:
             return
         if not get_context().is_prefill:
-            # Decode metadata is page-level. Updating it inside the captured
-            # decode graph would rescan one full page for every layer on every
-            # token, even though metadata only changes when a page is completed.
-            # `on_forward_end()` refreshes completed pages after replay/eager
-            # decode, before the next step can score previous pages.
+            # Decode stores update QuEST bounds in the same KV/MLA kernel.
             return
         metadata_keys = self._attention_metadata_keys(
             layer_idx,
@@ -1816,7 +1844,11 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
                 page_min_cache.index_copy_(0, full_page_slots, page_min)
                 return
 
-            page_slots = torch.div(slot_mapping, self.page_size, rounding_mode="floor")
+            page_slots = torch.div(
+                slot_mapping,
+                self.page_size,
+                rounding_mode="floor",
+            )
             page_offsets = torch.remainder(slot_mapping, self.page_size)
             unique_pages, counts = torch.unique_consecutive(page_slots, return_counts=True)
             page_max_cache = self.metadata_cache[0, kv_idx]
@@ -1824,41 +1856,34 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
             run_starts = counts.cumsum(0) - counts
             start_offsets = page_offsets.index_select(0, run_starts)
             end_offsets = start_offsets + counts
-
-            full_page_mask = (start_offsets == 0) & (counts == self.page_size)
-            if full_page_mask.any():
-                full_run_starts = run_starts[full_page_mask].to(torch.int64)
-                full_page_slots = unique_pages[full_page_mask].to(torch.int64)
-                full_token_indices = full_run_starts[:, None] + self.page_offsets_i64[None, :]
-                full_page_k = metadata_keys.index_select(
-                    0,
-                    full_token_indices.reshape(-1),
-                ).view(
-                    -1,
-                    self.page_size,
-                    self.metadata_num_heads,
-                    self.metadata_head_dim,
-                )
-                page_min, page_max = torch.aminmax(full_page_k, dim=1)
-                page_max_cache.index_copy_(0, full_page_slots, page_max)
-                page_min_cache.index_copy_(0, full_page_slots, page_min)
-
-            completed_page_mask = (end_offsets == self.page_size) & (~full_page_mask)
-            if completed_page_mask.any():
-                completed_page_slots = unique_pages[completed_page_mask].to(torch.int64)
-                page_token_indices = completed_page_slots[:, None] * self.page_size + self.page_offsets_i64[None, :]
-                full_page_k = self._attention_metadata_keys(
-                    layer_idx,
-                    page_token_indices.reshape(-1),
-                ).view(
-                    -1,
-                    self.page_size,
-                    self.metadata_num_heads,
-                    self.metadata_head_dim,
-                )
-                page_min, page_max = torch.aminmax(full_page_k, dim=1)
-                page_max_cache.index_copy_(0, completed_page_slots, page_max)
-                page_min_cache.index_copy_(0, completed_page_slots, page_min)
+            page_slots_i64 = unique_pages.to(torch.int64)
+            page_token_indices = (
+                page_slots_i64[:, None] * self.page_size
+                + self.page_offsets_i64[None, :]
+            )
+            page_keys = self._attention_metadata_keys(
+                layer_idx,
+                page_token_indices.reshape(-1),
+            ).view(
+                -1,
+                self.page_size,
+                self.metadata_num_heads,
+                self.metadata_head_dim,
+            )
+            valid_offsets = (
+                self.page_offsets_i64[None, :]
+                < end_offsets.to(torch.int64)[:, None]
+            )[:, :, None, None]
+            page_max = page_keys.masked_fill(
+                ~valid_offsets,
+                -float("inf"),
+            ).amax(dim=1)
+            page_min = page_keys.masked_fill(
+                ~valid_offsets,
+                float("inf"),
+            ).amin(dim=1)
+            page_max_cache.index_copy_(0, page_slots_i64, page_max)
+            page_min_cache.index_copy_(0, page_slots_i64, page_min)
 
     @torch.no_grad()
     def _on_kv_stored_prefill_capture(
@@ -1870,93 +1895,52 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
         """Update QuEST full-page metadata without dynamic shape ops during capture.
 
         Prefill graph capture is currently exercised for first-prefill chunks, so
-        touched pages begin at page offset 0. The trailing partial page is left
-        without metadata, matching the eager path until that page is completed.
+        touched pages begin at page offset 0.
         """
         with profiler.record("quest_update_metadata_capture"):
             kv_idx = self.kv_layer_index(layer_idx)
             full_token_count = (int(slot_mapping.numel()) // self.page_size) * self.page_size
-            if full_token_count <= 0:
-                return
-
             page_max_cache = self.metadata_cache[0, kv_idx]
             page_min_cache = self.metadata_cache[1, kv_idx]
-            full_page_slots = torch.div(
-                slot_mapping[:full_token_count:self.page_size],
-                self.page_size,
-                rounding_mode="floor",
-            ).to(torch.long)
-            full_page_k = metadata_keys[:full_token_count].view(
-                -1,
-                self.page_size,
-                self.metadata_num_heads,
-                self.metadata_head_dim,
-            )
-            page_min, page_max = torch.aminmax(full_page_k, dim=1)
-            page_max_cache.index_copy_(0, full_page_slots, page_max)
-            page_min_cache.index_copy_(0, full_page_slots, page_min)
-
-    @torch.no_grad()
-    def on_forward_end(self, seqs: list[Sequence], is_prefill: bool):
-        self._poll_prefix_offload()
-        super().on_forward_end(seqs, is_prefill)
-        if is_prefill or not seqs:
-            return
-        if not hasattr(self, "metadata_cache") or not hasattr(
-            self,
-            "attention_cache_storage",
-        ):
-            return
-
-        completed_rows: list[int] = []
-        completed_page_indices: list[int] = []
-        for seq in seqs:
-            row_idx = self.seq_id_to_row.get(seq.seq_id)
-            if row_idx is None:
-                continue
-            row_len = int(self.row_seq_lens[row_idx])
-            if row_len > 0 and row_len % self.page_size == 0:
-                completed_rows.append(int(row_idx))
-                completed_page_indices.append(row_len // self.page_size - 1)
-
-        if not completed_rows:
-            return
-
-        with profiler.record("quest_update_metadata_decode_pages"):
-            if self.enable_prefix_caching:
-                rows_gpu = torch.tensor(completed_rows, dtype=torch.long, device=self.device)
-                pages_gpu = torch.tensor(completed_page_indices, dtype=torch.long, device=self.device)
-                page_slots = self.buffer_req_to_page_slots[rows_gpu, pages_gpu].to(torch.long)
-            else:
-                page_slots_cpu = self.buffer_req_to_page_slots_cpu[
-                    np.asarray(completed_rows, dtype=np.int64),
-                    np.asarray(completed_page_indices, dtype=np.int64),
-                ]
-                page_slots = torch.from_numpy(page_slots_cpu.astype(np.int64, copy=False)).to(self.device)
-
-            if bool((page_slots < 0).any().item()):
-                raise RuntimeError(
-                    "QuEST decode completed a page with an invalid physical page slot: "
-                    f"rows={completed_rows}, page_indices={completed_page_indices}."
-                )
-
-            page_token_indices = page_slots[:, None] * self.page_size + self.page_offsets_i64[None, :]
-            flat_page_token_indices = page_token_indices.reshape(-1)
-            for kv_idx, layer_idx in enumerate(
-                self.kv_transformer_layer_indices()
-            ):
-                full_page_k = self._attention_metadata_keys(
-                    layer_idx,
-                    flat_page_token_indices,
-                ).view(
-                    len(completed_rows),
+            if full_token_count > 0:
+                full_page_slots = torch.div(
+                    slot_mapping[:full_token_count:self.page_size],
+                    self.page_size,
+                    rounding_mode="floor",
+                ).to(torch.long)
+                full_page_k = metadata_keys[:full_token_count].view(
+                    -1,
                     self.page_size,
                     self.metadata_num_heads,
                     self.metadata_head_dim,
                 )
                 page_min, page_max = torch.aminmax(full_page_k, dim=1)
-                self.metadata_cache[0, kv_idx].index_copy_(0, page_slots, page_max)
-                self.metadata_cache[1, kv_idx].index_copy_(0, page_slots, page_min)
+                page_max_cache.index_copy_(0, full_page_slots, page_max)
+                page_min_cache.index_copy_(0, full_page_slots, page_min)
+
+            if full_token_count < int(slot_mapping.numel()):
+                partial_page_slot = torch.div(
+                    slot_mapping[full_token_count],
+                    self.page_size,
+                    rounding_mode="floor",
+                ).to(torch.long)
+                partial_page_k = metadata_keys[full_token_count:]
+                page_min, page_max = torch.aminmax(partial_page_k, dim=0)
+                page_max_cache.index_copy_(
+                    0,
+                    partial_page_slot.reshape(1),
+                    page_max.unsqueeze(0),
+                )
+                page_min_cache.index_copy_(
+                    0,
+                    partial_page_slot.reshape(1),
+                    page_min.unsqueeze(0),
+                )
+
+    @torch.no_grad()
+    def on_forward_end(self, seqs: list[Sequence], is_prefill: bool):
+        self._poll_prefix_offload()
+        super().on_forward_end(seqs, is_prefill)
 
     @staticmethod
     def _score_pages_batched(
@@ -2140,78 +2124,58 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
                 dense_mask = (context_lens <= int(token_budget)) | (num_pages <= page_budget_base)
 
             row_page_slots = self.buffer_req_to_page_slots.index_select(0, req_indices.to(torch.long))[:, :max_pages]
-            prev_page_slots = row_page_slots[:, : max_pages - 1].to(torch.long)
-            safe_prev_page_slots = prev_page_slots.clamp_min_(0)
-
-            prev_page_max = self.metadata_cache[0, kv_idx].index_select(
-                0,
-                safe_prev_page_slots.reshape(-1),
-            ).view(
-                batch_size,
-                max_pages - 1,
-                self.metadata_num_heads,
-                self.metadata_head_dim,
-            ).permute(0, 2, 1, 3)
-            prev_page_min = self.metadata_cache[1, kv_idx].index_select(
-                0,
-                safe_prev_page_slots.reshape(-1),
-            ).view(
-                batch_size,
-                max_pages - 1,
-                self.metadata_num_heads,
-                self.metadata_head_dim,
-            ).permute(0, 2, 1, 3)
-            page_scores = self._score_pages_batched(
-                score_query,
-                prev_page_max,
-                prev_page_min,
-                self.metadata_num_heads,
-            )
-            safe_num_pages = num_pages.to(torch.long).clamp_min(1)
-            valid_prev = torch.arange(
-                max_pages - 1,
-                device=score_query.device,
-            )[None, :] < (safe_num_pages - 1)[:, None]
-            page_scores.masked_fill_(~valid_prev, -float("inf"))
-
-            top_prev = page_scores.topk(
-                prev_budget,
-                dim=-1,
-                sorted=False,
-            ).indices
-            last_page = (safe_num_pages - 1)[:, None]
-            selected_pages = torch.cat((top_prev, last_page), dim=1)
-            selected_page_slots = row_page_slots.gather(1, selected_pages)
-            sparse_slots = (
-                selected_page_slots[:, :, None] * self.page_size + self.page_offsets_i32[None, None, :]
-            ).reshape(batch_size, -1)
-
-            sparse_keep = int(sparse_slots.shape[1])
-
-            last_page_len = context_lens - (num_pages - 1) * self.page_size
-            sparse_lens = (
-                prev_budget * self.page_size + last_page_len
-            ).to(torch.int32)
-            if is_long_text:
-                packed_slots = sparse_slots
-                local_context_lens = sparse_lens
+            if self.platform.is_cuda_alike():
+                page_scores = score_quest_pages(
+                    score_query.contiguous(),
+                    self.metadata_cache[0, kv_idx],
+                    self.metadata_cache[1, kv_idx],
+                    row_page_slots.contiguous(),
+                )
             else:
-                packed_slots = torch.empty(
-                    (batch_size, max_keep),
-                    dtype=torch.int32,
-                    device=score_query.device,
+                safe_page_slots = row_page_slots.to(torch.long).clamp_min_(0)
+                prev_page_max = self.metadata_cache[0, kv_idx].index_select(
+                    0,
+                    safe_page_slots.reshape(-1),
+                ).view(
+                    batch_size,
+                    max_pages,
+                    self.metadata_num_heads,
+                    self.metadata_head_dim,
+                ).permute(0, 2, 1, 3)
+                prev_page_min = self.metadata_cache[1, kv_idx].index_select(
+                    0,
+                    safe_page_slots.reshape(-1),
+                ).view(
+                    batch_size,
+                    max_pages,
+                    self.metadata_num_heads,
+                    self.metadata_head_dim,
+                ).permute(0, 2, 1, 3)
+                page_scores = self._score_pages_batched(
+                    score_query,
+                    prev_page_max,
+                    prev_page_min,
+                    self.metadata_num_heads,
                 )
-                packed_slots[:, :sparse_keep] = torch.where(
-                    dense_mask[:, None],
-                    dense_slots[:, :sparse_keep],
-                    sparse_slots,
-                )
-                if max_keep > sparse_keep:
-                    packed_slots[:, sparse_keep:] = dense_slots[:, sparse_keep:]
-                local_context_lens = torch.where(dense_mask, context_lens, sparse_lens)
-            local_req_indices = torch.arange(
-                batch_size,
-                dtype=torch.int32,
-                device=score_query.device,
+            safe_num_pages = num_pages.to(torch.long).clamp_min(1)
+            selected_prev_page_slots = self.quest_page_selector.select(
+                page_scores.contiguous(),
+                row_page_slots.contiguous(),
+                (safe_num_pages - 1).to(torch.int32).contiguous(),
+                prev_budget,
             )
-            return packed_slots, local_req_indices, local_context_lens
+            output_width = (
+                (prev_budget + 1) * self.page_size
+                if is_long_text
+                else max_keep
+            )
+            return finalize_quest_decode_view(
+                selected_prev_page_slots,
+                row_page_slots,
+                num_pages.to(torch.int32).contiguous(),
+                context_lens,
+                None if is_long_text else dense_slots,
+                page_size=self.page_size,
+                token_budget=token_budget,
+                output_width=output_width,
+            )

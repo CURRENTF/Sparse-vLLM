@@ -21,6 +21,8 @@ def _copy_latent_kernel(
     slot_mapping,
     latent_cache,
     rope_cache,
+    page_max,
+    page_min,
     stride_latent_token,
     stride_latent_head,
     stride_latent_dim,
@@ -36,6 +38,8 @@ def _copy_latent_kernel(
     cache_slot_count,
     LATENT_DIM: tl.constexpr,
     ROPE_DIM: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    UPDATE_QUEST_METADATA: tl.constexpr,
 ):
     token_index = tl.program_id(0)
     latent_offsets = tl.arange(0, LATENT_DIM)
@@ -82,6 +86,53 @@ def _copy_latent_kernel(
         rope_values,
         mask=valid_slot,
     )
+    if UPDATE_QUEST_METADATA:
+        metadata_dim = LATENT_DIM + ROPE_DIM
+        page_slot = safe_slot // PAGE_SIZE
+        page_offset = safe_slot % PAGE_SIZE
+        metadata_base = page_slot * metadata_dim
+        update_mask = valid_slot & (page_offset != 0)
+        old_latent_max = tl.load(
+            page_max + metadata_base + latent_offsets,
+            mask=update_mask,
+            other=-float("inf"),
+        )
+        old_latent_min = tl.load(
+            page_min + metadata_base + latent_offsets,
+            mask=update_mask,
+            other=float("inf"),
+        )
+        rope_metadata_offsets = metadata_base + LATENT_DIM + rope_offsets
+        old_rope_max = tl.load(
+            page_max + rope_metadata_offsets,
+            mask=update_mask,
+            other=-float("inf"),
+        )
+        old_rope_min = tl.load(
+            page_min + rope_metadata_offsets,
+            mask=update_mask,
+            other=float("inf"),
+        )
+        tl.store(
+            page_max + metadata_base + latent_offsets,
+            tl.maximum(old_latent_max, latent_values),
+            mask=valid_slot,
+        )
+        tl.store(
+            page_min + metadata_base + latent_offsets,
+            tl.minimum(old_latent_min, latent_values),
+            mask=valid_slot,
+        )
+        tl.store(
+            page_max + rope_metadata_offsets,
+            tl.maximum(old_rope_max, rope_values),
+            mask=valid_slot,
+        )
+        tl.store(
+            page_min + rope_metadata_offsets,
+            tl.minimum(old_rope_min, rope_values),
+            mask=valid_slot,
+        )
 
 
 def _validate_copy_tensors(
@@ -252,6 +303,8 @@ def copy_latent_to_cache(
         slot_mapping,
         latent_cache,
         rope_cache,
+        latent_cache,
+        latent_cache,
         *latent.stride(),
         *rope.stride(),
         *latent_cache.stride(),
@@ -259,6 +312,88 @@ def copy_latent_to_cache(
         cache_slot_count=cache_slot_count,
         LATENT_DIM=MLA_LATENT_DIM,
         ROPE_DIM=MLA_ROPE_DIM,
+        PAGE_SIZE=1,
+        UPDATE_QUEST_METADATA=False,
+        num_warps=1,
+        num_stages=1,
+    )
+
+
+@torch.no_grad()
+def copy_latent_to_cache_with_quest_metadata(
+    latent: torch.Tensor,
+    rope: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    latent_cache: torch.Tensor,
+    rope_cache: torch.Tensor,
+    page_max: torch.Tensor,
+    page_min: torch.Tensor,
+    *,
+    page_size: int,
+    validate_slots: bool = True,
+) -> None:
+    """Copy decode MLA state and update its fused QuEST page bounds."""
+
+    _validate_copy_tensors(
+        latent,
+        rope,
+        slot_mapping,
+        latent_cache,
+        rope_cache,
+    )
+    metadata_dim = MLA_LATENT_DIM + MLA_ROPE_DIM
+    expected_tail = (1, metadata_dim)
+    if (
+        page_max.shape != page_min.shape
+        or page_max.ndim != 3
+        or tuple(page_max.shape[1:]) != expected_tail
+    ):
+        raise ValueError(
+            "MLA QuEST metadata must have matching [pages, 1, 576] shapes"
+        )
+    for name, tensor in {"page_max": page_max, "page_min": page_min}.items():
+        if tensor.dtype != torch.bfloat16:
+            raise TypeError(f"{name} must use torch.bfloat16, got {tensor.dtype}")
+        if tensor.device != latent.device:
+            raise ValueError(f"{name} must share the MLA cache device")
+        if not tensor.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
+    page_size = int(page_size)
+    if page_size <= 0:
+        raise ValueError("page_size must be positive")
+    expected_pages = (int(latent_cache.shape[0]) + page_size - 1) // page_size
+    if int(page_max.shape[0]) != expected_pages:
+        raise ValueError(
+            "MLA QuEST metadata capacity must cover the cache exactly: "
+            f"expected_pages={expected_pages} got={int(page_max.shape[0])}"
+        )
+    token_count = slot_mapping.numel()
+    if token_count == 0:
+        return
+    cache_slot_count = latent_cache.shape[0]
+    if validate_slots:
+        validate_copy_slot_mapping(
+            slot_mapping,
+            cache_slot_count=cache_slot_count,
+        )
+
+    _copy_latent_kernel[(token_count,)](
+        latent,
+        rope,
+        slot_mapping,
+        latent_cache,
+        rope_cache,
+        page_max,
+        page_min,
+        *latent.stride(),
+        *rope.stride(),
+        *latent_cache.stride(),
+        *rope_cache.stride(),
+        cache_slot_count=cache_slot_count,
+        LATENT_DIM=MLA_LATENT_DIM,
+        ROPE_DIM=MLA_ROPE_DIM,
+        PAGE_SIZE=page_size,
+        UPDATE_QUEST_METADATA=True,
         num_warps=1,
         num_stages=1,
     )
