@@ -6,6 +6,8 @@ from typing import Protocol, runtime_checkable
 
 import torch
 
+from sparsevllm.engine.decode_graph_staging import DecodeGraphHostInputs
+
 
 @dataclass(frozen=True)
 class DecodeGraphPaddingContract:
@@ -58,26 +60,6 @@ class DecodeGraphContract:
 
 
 @dataclass
-class DecodeGraphHostInputs:
-    """Persistent host mirrors for metadata copied before graph replay."""
-
-    input_ids: torch.Tensor
-    positions: torch.Tensor
-    context_lens: torch.Tensor
-    request_indices: torch.Tensor
-    active_mask: torch.Tensor
-
-    def tensors(self) -> tuple[torch.Tensor, ...]:
-        return (
-            self.input_ids,
-            self.positions,
-            self.context_lens,
-            self.request_indices,
-            self.active_mask,
-        )
-
-
-@dataclass
 class DecodeGraphInputs:
     """Typed, address-stable public inputs shared by decode participants."""
 
@@ -102,16 +84,6 @@ class DecodeGraphInputs:
         def device_buffer(dtype: torch.dtype) -> torch.Tensor:
             return torch.empty(batch, dtype=dtype, device=device)
 
-        def host_buffer(dtype: torch.dtype) -> torch.Tensor:
-            if pin_memory:
-                return torch.empty(
-                    batch,
-                    dtype=dtype,
-                    device="cpu",
-                    pin_memory=True,
-                )
-            return torch.empty(batch, dtype=dtype, device="cpu")
-
         inputs = cls(
             input_ids=device_buffer(torch.int64),
             positions=device_buffer(torch.int64),
@@ -119,12 +91,9 @@ class DecodeGraphInputs:
             request_indices=device_buffer(torch.int32),
             write_slot_mapping=device_buffer(torch.int32),
             active_mask=device_buffer(torch.bool),
-            host=DecodeGraphHostInputs(
-                input_ids=host_buffer(torch.int64),
-                positions=host_buffer(torch.int64),
-                context_lens=host_buffer(torch.int32),
-                request_indices=host_buffer(torch.int32),
-                active_mask=host_buffer(torch.bool),
+            host=DecodeGraphHostInputs.allocate(
+                batch,
+                pin_memory=pin_memory,
             ),
         )
         inputs.validate(contract)

@@ -1602,9 +1602,14 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
                     "first real request."
                 )
 
-            input_ids_list = [seq.decode_input_token for seq in seqs]
-            positions_list = [seq.decode_input_position for seq in seqs]
-            seq_ids = [seq.seq_id for seq in seqs]
+            if host_inputs is None:
+                input_ids_list = [seq.decode_input_token for seq in seqs]
+                positions_list = [seq.decode_input_position for seq in seqs]
+                seq_ids = [seq.seq_id for seq in seqs]
+            else:
+                seq_ids = host_inputs.pack_requests(seqs)
+                input_ids_list = None
+                positions_list = None
 
             if context_capacity is not None:
                 prospective_rows = np.asarray(
@@ -1630,6 +1635,8 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
 
             slot_mapping[:real_batch_size].copy_(new_slots_batch)
             if host_inputs is None:
+                assert input_ids_list is not None
+                assert positions_list is not None
                 input_ids[:real_batch_size].copy_(
                     torch.tensor(input_ids_list, dtype=torch.int64)
                 )
@@ -1643,15 +1650,12 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
                     torch.from_numpy(row_indices.astype(np.int32, copy=False))
                 )
             else:
-                host_inputs.input_ids.numpy()[:real_batch_size] = input_ids_list
-                host_inputs.positions.numpy()[:real_batch_size] = positions_list
-                host_inputs.context_lens.numpy()[:real_batch_size] = (
-                    real_context_lens.astype(np.int32, copy=False)
+                host_inputs.pack_cache_facts(
+                    context_lens=real_context_lens,
+                    request_indices=row_indices,
+                    real_batch_size=real_batch_size,
+                    padding_active=padding_active,
                 )
-                host_inputs.request_indices.numpy()[:real_batch_size] = (
-                    row_indices.astype(np.int32, copy=False)
-                )
-                host_inputs.active_mask[:real_batch_size].fill_(True)
                 non_blocking = bool(host_inputs.input_ids.is_pinned())
                 input_ids[:real_batch_size].copy_(
                     host_inputs.input_ids[:real_batch_size],
@@ -1681,27 +1685,21 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
                 # write sentinel so they never consume persistent cache capacity.
                 first_context_len = int(real_context_lens[0])
                 first_row_idx = int(row_indices[0])
-                input_ids[real_batch_size:].fill_(int(input_ids_list[0]))
-                positions[real_batch_size:].fill_(int(positions_list[0]))
+                if host_inputs is None:
+                    assert input_ids_list is not None
+                    assert positions_list is not None
+                    first_input_id = int(input_ids_list[0])
+                    first_position = int(positions_list[0])
+                else:
+                    first_input_id = int(host_inputs.input_ids[0])
+                    first_position = int(host_inputs.positions[0])
+                input_ids[real_batch_size:].fill_(first_input_id)
+                positions[real_batch_size:].fill_(first_position)
                 slot_mapping[real_batch_size:].fill_(padding_write_slot)
                 context_lens[real_batch_size:].fill_(first_context_len)
                 req_indices[real_batch_size:].fill_(first_row_idx)
                 if active_mask is not None:
                     active_mask[real_batch_size:].fill_(padding_active)
-                if host_inputs is not None:
-                    host_inputs.input_ids[real_batch_size:].fill_(
-                        int(input_ids_list[0])
-                    )
-                    host_inputs.positions[real_batch_size:].fill_(
-                        int(positions_list[0])
-                    )
-                    host_inputs.context_lens[real_batch_size:].fill_(
-                        first_context_len
-                    )
-                    host_inputs.request_indices[real_batch_size:].fill_(
-                        first_row_idx
-                    )
-                    host_inputs.active_mask[real_batch_size:].fill_(padding_active)
 
             self.layer_batch_state.slot_mapping = slot_mapping
             self.layer_batch_state.context_lens = context_lens
