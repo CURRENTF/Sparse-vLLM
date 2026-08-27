@@ -35,6 +35,21 @@ def test_explicit_occupied_master_port_fails(monkeypatch):
             select_master_port()
 
 
+def test_explicit_master_port_is_reusable_after_completed_connection(monkeypatch):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = listener.getsockname()[1]
+        with socket.create_connection(("127.0.0.1", port)) as client:
+            connection, _ = listener.accept()
+            connection.close()
+            client.recv(1)
+
+    monkeypatch.setenv("SPARSEVLLM_MASTER_PORT", str(port))
+    assert select_master_port() == port
+
+
 def test_occupied_default_master_port_uses_available_port(monkeypatch):
     monkeypatch.delenv("SPARSEVLLM_MASTER_PORT", raising=False)
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:

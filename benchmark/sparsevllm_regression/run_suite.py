@@ -445,7 +445,7 @@ def _quality_command(
         cfg["max_num_seqs_in_batch"] = int(quality["sparsevllm_max_num_seqs_in_batch"])
     if "sparsevllm_max_decoding_seqs" in quality:
         cfg["max_decoding_seqs"] = int(quality["sparsevllm_max_decoding_seqs"])
-    return [
+    cmd = [
         sys.executable,
         "benchmark/long_bench/pred.py",
         "--model",
@@ -474,11 +474,18 @@ def _quality_command(
         str(float(quality["top_p"])),
         "--top_k",
         str(int(quality["top_k"])),
-        "--hyper_param",
-        json.dumps(cfg, sort_keys=True),
-        "--output_root",
-        str(output_root),
     ]
+    if "max_model_len" in quality:
+        cmd.extend(["--max_model_len", str(int(quality["max_model_len"]))])
+    cmd.extend(
+        [
+            "--hyper_param",
+            json.dumps(cfg, sort_keys=True),
+            "--output_root",
+            str(output_root),
+        ]
+    )
+    return cmd
 
 
 def _perf_command(

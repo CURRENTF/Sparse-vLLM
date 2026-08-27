@@ -187,6 +187,11 @@ def select_master_port() -> int:
         port = DEFAULT_MASTER_PORT
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        # torch.distributed's TCPStore may leave the just-finished master port in
+        # TIME_WAIT. Match the store's reusable-listener semantics so a serial
+        # benchmark can safely reuse its explicitly assigned port, while an
+        # active listener still fails the bind below.
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             sock.bind(("127.0.0.1", port))
         except OSError as exc:
