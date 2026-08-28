@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -34,6 +35,32 @@ from sparsevllm.operators.mla_attention import (
     MlaTritonProvider,
 )
 from sparsevllm.platforms.interface import DeviceCaps, PlatformEnum
+
+
+def test_decode_graph_runner_blocks_replay_until_collectives_are_ready() -> None:
+    runner = object.__new__(DecodeCudaGraphRunner)
+    graph = SimpleNamespace(replay=Mock())
+    state = SimpleNamespace(key=object(), graph=graph, logits=None, token_ids=None)
+    runner.cache_manager = SimpleNamespace()
+    runner.method = ""
+    runner.shape_policy = "batch_only"
+    runner._select_graph_batch_size = lambda batch_size: batch_size
+    runner.is_long_text_batch = lambda seqs, is_prefill: False
+    runner._graph_path_id = lambda is_long_text: ""
+    runner._batch_only_context_capacity = lambda seqs, is_long_text: 128
+    runner._select_state = lambda **kwargs: state
+    runner._prepare_static_step = lambda state, seqs, is_long_text: (None, None)
+    runner._restore_sparse_state_refs = lambda state: None
+    runner.collective_runtime = SimpleNamespace(
+        assert_cuda_graph_replayable=Mock(
+            side_effect=RuntimeError("collectives are not replayable")
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="not replayable"):
+        runner.run([object()])
+
+    graph.replay.assert_not_called()
 
 
 def _cuda_caps() -> DeviceCaps:

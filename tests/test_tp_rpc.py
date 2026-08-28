@@ -333,6 +333,25 @@ def test_run_rpc_keeps_collective_status_without_decode_graph():
     assert calls == [("collective", "run", None)]
 
 
+def test_decode_graph_lifecycle_rpc_uses_host_status():
+    runner = object.__new__(ModelRunner)
+    runner.world_size = 1
+    runner.rank = 0
+    runner.config = SimpleNamespace(decode_graph=True)
+    runner.collect_decode_cuda_graph_metadata = lambda: None
+    calls = []
+    runner._sync_tp_host_status = lambda method, error: calls.append(
+        ("host", method, error)
+    )
+    runner._sync_tp_rpc_status = lambda method, error: calls.append(
+        ("collective", method, error)
+    )
+
+    ModelRunner.call(runner, "collect_decode_cuda_graph_metadata")
+
+    assert calls == [("host", "collect_decode_cuda_graph_metadata", None)]
+
+
 def test_model_runner_moe_workspace_warmup_delegates_token_count():
     calls = []
     runner = object.__new__(ModelRunner)
@@ -468,6 +487,28 @@ def test_tp_worker_continues_after_chain_admission_validation_failure():
     assert calls == ["chain_validate_admission_plan", "free_slots", "exit"]
 
 
+def test_tp_worker_can_exit_cleanly_after_graph_registration_failure():
+    runner = object.__new__(ModelRunner)
+    commands = iter(
+        [
+            ("register_decode_cuda_graph_buffers", []),
+            ("exit", []),
+        ]
+    )
+    calls = []
+    runner.read_shm = lambda: next(commands)
+
+    def call(method_name, *_args):
+        calls.append(method_name)
+        if method_name == "register_decode_cuda_graph_buffers":
+            raise RuntimeError("rank-local registration failure")
+
+    runner.call = call
+    ModelRunner.loop(runner)
+
+    assert calls == ["register_decode_cuda_graph_buffers", "exit"]
+
+
 def test_model_runner_reset_after_warmup_resets_local_runtime_state():
     calls = []
     runner = object.__new__(ModelRunner)
@@ -505,8 +546,12 @@ def test_model_runner_decode_graph_startup_controls_use_live_runner():
             ("capture", seqs, capture_sampling, replay_after_capture)
         ),
     )
-    runner.model = SimpleNamespace(
-        register_decode_cuda_graph_buffers=lambda: calls.append(("register",))
+    runner.collective_runtime = SimpleNamespace(
+        begin_cuda_graph_capture=lambda: calls.append(("begin",)),
+        collect_local_cuda_graph_metadata=lambda: calls.append(("collect",)),
+        exchange_cuda_graph_metadata=lambda: calls.append(("exchange",)),
+        register_cuda_graph_buffers=lambda: calls.append(("register",)),
+        mark_cuda_graph_replayable=lambda: calls.append(("replayable",)),
     )
     seqs = [object()]
 
@@ -515,13 +560,20 @@ def test_model_runner_decode_graph_startup_controls_use_live_runner():
         side_effect=lambda: calls.append(("reset",)),
     ):
         ModelRunner.set_decode_cuda_graph_reuse_larger_context_graphs(runner, True)
+        ModelRunner.begin_decode_cuda_graph_capture(runner)
+        ModelRunner.collect_decode_cuda_graph_metadata(runner)
+        ModelRunner.exchange_decode_cuda_graph_metadata(runner)
         ModelRunner.register_decode_cuda_graph_buffers(runner)
         ModelRunner.seal_decode_cuda_graph_startup_plan(runner)
         ModelRunner.capture_decode_cuda_graph_warmup(runner, seqs)
 
     assert calls == [
         ("reuse", True),
+        ("begin",),
+        ("collect",),
+        ("exchange",),
         ("register",),
+        ("replayable",),
         ("seal",),
         ("capture", seqs, False, False),
         ("reset",),
@@ -541,6 +593,9 @@ def test_model_runner_exit_drains_graphs_before_barrier():
     )
     runner.model = SimpleNamespace(
         close_runtime_operators=lambda: calls.append("close_ops")
+    )
+    runner.collective_runtime = SimpleNamespace(
+        close=lambda: calls.append("close_collectives")
     )
     runner.world_size = 2
     runner.rank = 0
@@ -569,6 +624,8 @@ def test_model_runner_exit_drains_graphs_before_barrier():
         "clear_graphs",
         "sync",
         "close_ops",
+        "sync",
+        "close_collectives",
         "sync",
         "close_shm",
         "barrier",

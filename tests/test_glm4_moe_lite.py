@@ -188,7 +188,7 @@ def test_glm_topology_reuses_one_mla_object_and_qwen_dense_mlp() -> None:
         ("omnikv", True),
     ],
 )
-def test_glm_runtime_kwargs_bind_model_owned_operators(
+def test_glm_runtime_kwargs_bind_shared_operators(
     sparse_method,
     requires_scores,
 ) -> None:
@@ -207,20 +207,17 @@ def test_glm_runtime_kwargs_bind_model_owned_operators(
     )
     mla = object()
     all_reduce = object()
-    with (
-        patch(
-            "sparsevllm.models.glm4_moe_lite.build_glm4_moe_lite_mla_attention",
-            return_value=mla,
-        ) as build_mla,
-        patch(
-            "sparsevllm.models.glm4_moe_lite.build_glm4_moe_lite_runtime_config",
-            return_value=all_reduce,
-        ) as build_all_reduce,
-    ):
+    collective_runtime = Mock()
+    collective_runtime.request_decode_collectives.return_value = all_reduce
+    with patch(
+        "sparsevllm.models.glm4_moe_lite.build_glm4_moe_lite_mla_attention",
+        return_value=mla,
+    ) as build_mla:
         kwargs = Glm4MoeLiteForCausalLM.build_runtime_kwargs(
             config,
             engine_config=runtime,
             parallel_context=context,
+            collective_runtime=collective_runtime,
             device=torch.device("cuda", 1),
             max_decode_tokens=8,
         )
@@ -229,7 +226,7 @@ def test_glm_runtime_kwargs_bind_model_owned_operators(
         "mla_attention": mla,
         "mlp_chunk_size": 16,
         "decode_graph": True,
-        "runtime_config": all_reduce,
+        "parallel_collectives": all_reduce,
     }
     build_mla.assert_called_once_with(
         config,
@@ -245,12 +242,11 @@ def test_glm_runtime_kwargs_bind_model_owned_operators(
             else AttentionScoreKind.NONE
         ),
     )
-    build_all_reduce.assert_called_once_with(
-        config,
-        context,
-        max_decode_tokens=8,
-        cuda_graph=True,
-        device_index=1,
+    collective_runtime.request_decode_collectives.assert_called_once_with(
+        attention_max_rows=8,
+        moe_max_rows=16,
+        hidden_size=64,
+        dtype=torch.bfloat16,
     )
 
 
@@ -504,7 +500,7 @@ def test_glm_sparse_moe_reduces_pure_ep_over_world(ep_size: int) -> None:
     block = object.__new__(Glm4MoeLiteSparseMoeBlock)
     nn.Module.__init__(block)
     block.parallel_context = context
-    block.runtime_config = None
+    block.parallel_collectives = None
     block.mlp_chunk_size = 8
     block.shared_experts = nn.Identity()
     block._routed_chunk = lambda hidden_states: hidden_states.clone()
@@ -537,7 +533,7 @@ def test_glm_sparse_moe_reduces_pure_tp_over_world(
     block = object.__new__(Glm4MoeLiteSparseMoeBlock)
     nn.Module.__init__(block)
     block.parallel_context = context
-    block.runtime_config = None
+    block.parallel_collectives = None
     block.mlp_chunk_size = 8
     block.shared_experts = nn.Identity()
     block._routed_chunk = lambda hidden_states: hidden_states.clone()
@@ -565,7 +561,7 @@ def test_glm_tp1_prefill_uses_fused_routed_and_shared_path() -> None:
     block = object.__new__(Glm4MoeLiteSparseMoeBlock)
     nn.Module.__init__(block)
     block.parallel_context = context
-    block.runtime_config = None
+    block.parallel_collectives = None
     block.mlp_chunk_size = 8
     block.experts = SimpleNamespace(
         fuses_shared_prefill=True,
@@ -599,7 +595,7 @@ def test_glm_sparse_moe_reduces_hybrid_tp_ep_shards_over_outer_world() -> None:
     block = object.__new__(Glm4MoeLiteSparseMoeBlock)
     nn.Module.__init__(block)
     block.parallel_context = context
-    block.runtime_config = None
+    block.parallel_collectives = None
     block.mlp_chunk_size = 8
     block.shared_experts = nn.Identity()
     block._routed_chunk = lambda hidden_states: hidden_states.clone()
@@ -639,7 +635,7 @@ def test_glm_moe_debug_contract_populates_model_runner_summaries() -> None:
     block = object.__new__(Glm4MoeLiteSparseMoeBlock)
     nn.Module.__init__(block)
     block.parallel_context = context
-    block.runtime_config = None
+    block.parallel_collectives = None
     block.mlp_chunk_size = 8
 
     class _Gate(nn.Module):
@@ -737,7 +733,7 @@ def test_glm_decoder_syncs_replicated_attention_before_post_norm(
     layer = object.__new__(Glm4MoeLiteDecoderLayer)
     nn.Module.__init__(layer)
     layer.parallel_context = context
-    layer.runtime_config = None
+    layer.parallel_collectives = None
 
     class _InputNorm(nn.Module):
         def forward(self, hidden_states, residual):

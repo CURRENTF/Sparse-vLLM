@@ -211,11 +211,14 @@ def test_model_construction_shares_explicit_runtime_operators_across_layers():
     full_attention.bind = bind
     decode_launch_op = SimpleNamespace(name="decode_launch")
     all_reduce_op = SimpleNamespace(name="all_reduce", run=Mock(), close=Mock())
+    parallel_collectives = SimpleNamespace(
+        attention=all_reduce_op,
+        moe=all_reduce_op,
+    )
     runtime_config = MiniMaxM2RuntimeConfig(
         full_attention_provider=full_attention,
         decode_launch_op=decode_launch_op,
-        attention_decode_all_reduce=all_reduce_op,
-        moe_decode_all_reduce=all_reduce_op,
+        parallel_collectives=parallel_collectives,
         cuda_graph=True,
     )
 
@@ -235,14 +238,15 @@ def test_model_construction_shares_explicit_runtime_operators_across_layers():
     model.close_runtime_operators()
     model.close_runtime_operators()
     full_attention.close.assert_called_once_with()
-    all_reduce_op.close.assert_called_once_with()
+    all_reduce_op.close.assert_not_called()
 
 
-def test_minimax_runtime_kwargs_bind_model_owned_operators():
+def test_minimax_runtime_kwargs_bind_shared_operators():
     config = _config()
     context = _tp_context(0, 1)
     runtime = SimpleNamespace(sparse_method="", decode_graph=True)
     bound = object()
+    collective_runtime = object()
     with patch(
         "sparsevllm.models.minimax_m2.build_minimax_m2_runtime_config",
         return_value=bound,
@@ -251,6 +255,7 @@ def test_minimax_runtime_kwargs_bind_model_owned_operators():
             config,
             engine_config=runtime,
             parallel_context=context,
+            collective_runtime=collective_runtime,
             device=torch.device("cuda", 1),
             max_decode_tokens=8,
         )
@@ -259,6 +264,7 @@ def test_minimax_runtime_kwargs_bind_model_owned_operators():
     build.assert_called_once_with(
         config,
         context,
+        collective_runtime,
         sparse_method="",
         max_decode_tokens=8,
         cuda_graph=True,

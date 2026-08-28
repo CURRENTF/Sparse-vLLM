@@ -8,6 +8,7 @@ import torch
 
 from sparsevllm.operators.all_reduce import (
     ALL_REDUCE_REGISTRY,
+    AllReduceGraphBufferMetadata,
     AllReduceOpSpec,
     FlashInferVllmAllReduceProvider,
     TorchDistributedAllReduceProvider,
@@ -128,25 +129,31 @@ def test_vllm_all_reduce_registers_captured_graph_buffers_across_ranks():
     provider._buffer_ptrs = [1000, 2000]
     provider._max_size_bytes = 4096
 
-    def gather(output, local, *, group):
-        assert group == "tp"
-        output[:] = [local, ([20, 21], [100, 200])]
-
     with (
         patch.dict(
             sys.modules,
             {"flashinfer": flashinfer, "flashinfer.comm": comm},
         ),
         patch.object(torch.cuda, "is_current_stream_capturing", return_value=True),
-        patch("sparsevllm.operators.all_reduce.dist.all_gather_object", side_effect=gather),
     ):
         output = provider.run(
             _spec((0, 1), cuda_graph=True),
             torch.ones((2, 2048), dtype=torch.bfloat16),
             group="tp",
         )
+        local_metadata = provider.collect_local_cuda_graph_metadata(
+            _spec((0, 1), cuda_graph=True),
+            group="tp",
+        )
         provider.register_cuda_graph_buffers(
             _spec((0, 1), cuda_graph=True),
+            [
+                local_metadata,
+                AllReduceGraphBufferMetadata(
+                    handles=(20, 21),
+                    offsets=(100, 200),
+                ),
+            ],
             group="tp",
         )
 
