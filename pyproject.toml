@@ -68,6 +68,7 @@ include = ["sparsevllm*"]
 
 [tool.setuptools.package-data]
 sparsevllm = [
+    "configs/profiles/*.json",
     "kernels/triton/profiles/*.json",
     "operators/profiles/*.json",
 ]

@@ -13,6 +13,9 @@ from sparsevllm.configs.delta import (
     normalize_deltakv_storage,
     validate_deltakv_runtime,
 )
+from sparsevllm.configs.full_attention_profiles import (
+    resolve_auto_full_attention_layers,
+)
 from sparsevllm.configs.groups import (
     DecodeCudaGraphConfig,
     DeltaKVConfig,
@@ -142,6 +145,7 @@ class Config(
         normalize_sparse_methods(self)
         finalize_prefix_cache(self)
         validate_deltakv_runtime(self)
+        resolve_auto_full_attention_layers(self)
         finalize_sparse_layout(self)
 
         logger.info(f"LLM Config: {self}".replace('\n', ' '))

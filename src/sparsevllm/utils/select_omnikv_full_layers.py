@@ -730,8 +730,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--topk", type=int, default=2048)
     parser.add_argument("--random-decode-points-per-sample", type=int, default=8)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--num-sink-tokens", type=int, default=0)
-    parser.add_argument("--num-recent-tokens", type=int, default=32)
+    parser.add_argument(
+        "--num-sink-tokens", dest="sink_keep_tokens", type=int, default=0
+    )
+    parser.add_argument(
+        "--num-recent-tokens", dest="recent_keep_tokens", type=int, default=32
+    )
     parser.add_argument("--min-prefix-tokens", type=int, default=1)
     parser.add_argument("--prefill-chunk-size", type=int, default=512)
     parser.add_argument("--max-length", type=int, default=None)

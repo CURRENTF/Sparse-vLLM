@@ -16,7 +16,7 @@ Use semantic public names in commands, JSON configs, and benchmark manifests:
 | `engine_prefill_chunk_size` | Maximum scheduled prefill chunk. |
 | `sink_keep_tokens` | Fixed sink-token budget. |
 | `recent_keep_tokens` | Recent-token budget. |
-| `full_attention_layers` | Comma-separated full-layer indices. |
+| `full_attention_layers` | `auto` (default), a comma-separated string, or a list of full-layer indices. `auto` resolves an exact method/model-name profile; catalog entries can be shared by OmniKV and DeltaKV or scoped to one method. |
 | `deltakv_neighbor_count` | Number of DeltaKV reference neighbors. |
 | `deltakv_center_ratio` | DeltaKV reference-center ratio. |
 | `deltakv_latent_dim` | Compressor latent width. |
@@ -24,6 +24,13 @@ Use semantic public names in commands, JSON configs, and benchmark manifests:
 | `deltakv_latent_quant_group_size` | Latent quantization group size. |
 | `gpu_memory_utilization` | Fraction of GPU memory available to the engine. |
 | `decode_graph` | Enable decode CUDA Graph execution. |
+
+The `auto` full-layer matcher compares the final model path/repository segment
+case-insensitively and also recognizes Hugging Face cache paths such as
+`models--org--model/snapshots/...`. It never uses substring matching. An
+unregistered OmniKV or DeltaKV model fails with an explicit calibration error.
+When a catalog entry lists both methods, they intentionally share the same
+full-layer anchors; an explicit layer list still overrides `auto`.
 
 Legacy aliases such as `sparse_method`, `deltakv_checkpoint_path`,
 `engine_prefill_chunk_size`, `sink_keep_tokens`, `recent_keep_tokens`,
@@ -65,16 +72,18 @@ does not silently enable debug work.
 
 ## DeltaKV
 
-Reportable DeltaKV inference requires a compatible compressor checkpoint:
+Reportable DeltaKV inference requires a compatible compressor checkpoint.
+For registered models, its default `full_attention_layers=auto` consumes the
+same model profile as OmniKV:
 
 ```python
 from sparsevllm import LLM
 
 llm = LLM(
-    "/path/to/model",
+    "/path/to/Qwen3-4B-Instruct-2507",
     sparse_method="deltakv",
     deltakv_checkpoint_path="/path/to/compressor",
-    full_attention_layers="0,1,3,9,13,16,21,28",
+    full_attention_layers="auto",
     decode_keep_tokens=2048,
     recent_keep_tokens=128,
     sink_keep_tokens=8,

@@ -80,9 +80,9 @@ flowchart TD
 | Dense | `vanilla` / `""` | Full KV cache, no sparse selection. | `standard.py`, generic attention path |
 | Streaming window | `streamingllm`, `attention-sink`, `attention_sink` | Physical eviction to sink + recent tokens. | `streamingllm.py`, `standard.py`-style mechanics |
 | SnapKV / PyramidKV | `snapkv`, `pyramidkv` | Physical eviction after score-based keep selection; PyramidKV changes per-layer budgets. | `snapkv.py`, `sparse_controller.py` |
-| OmniKV | `omnikv` | Logical masking/view building from observation-layer scores. Full layers should be model-calibrated with `python -m sparsevllm.utils.select_omnikv_full_layers` and then passed as `full_attention_layers`. | `omnikv.py`, `sparse_controller.py`, `omnikv_fused.py` |
+| OmniKV | `omnikv` | Logical masking/view building from observation-layer scores. `full_attention_layers=auto` resolves a model profile that may be shared with DeltaKV; unregistered models should be calibrated with `python -m sparsevllm.utils.select_omnikv_full_layers`. | `omnikv.py`, `sparse_controller.py`, `omnikv_fused.py` |
 | QuEST | `quest` | Query-aware decode page/chunk selection. | `quest.py` |
-| DeltaKV | `deltakv` | Compressor-backed hybrid cache: sparse full/reference pool plus compressed latent state. | `deltakv.py`, `deltakv_kernels.py` |
+| DeltaKV | `deltakv` | Compressor-backed hybrid cache: sparse full/reference pool plus compressed latent state. Registered models may share OmniKV's `full_attention_layers=auto` profile. | `deltakv.py`, `deltakv_kernels.py` |
 | DeltaKV | `deltakv` plus legacy `deltakv-less-memory*` aliases | Slim compressor-backed DeltaKV runtime with graph-stable decode metadata. | `deltakv_runtime.py`, `deltakv_less_memory*.py`, `deltakv_kernels.py` |
 
 ## State Ownership Contracts

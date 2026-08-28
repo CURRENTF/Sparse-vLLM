@@ -46,7 +46,8 @@ class SparseMethodConfig:
     decode_keep_tokens: int = 4096
 
     obs_layer_ids: list[int] = field(default=None, init=False)
-    full_attention_layers: str | list[int] = "0"
+    full_attention_layers: str | list[int] = "auto"
+    resolved_full_attention_profile: str | None = field(default=None, init=False)
 
     quest_chunk_size: int = 16
     quest_token_budget: int = field(init=False)

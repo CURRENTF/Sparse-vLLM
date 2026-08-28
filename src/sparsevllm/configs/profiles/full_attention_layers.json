@@ -1,0 +1,160 @@
+{
+  "schema_version": 1,
+  "profiles": [
+    {
+      "id": "omnikv-qwen2.5-7b-instruct-1m-full6",
+      "model_names": [
+        "Qwen2.5-7B-Instruct-1M"
+      ],
+      "sparse_methods": [
+        "omnikv",
+        "deltakv"
+      ],
+      "full_attention_layers": [0, 2, 4, 11, 16, 22],
+      "selection": {
+        "kind": "offline-dp-token-coverage",
+        "validation": "matched long-context agent workload"
+      }
+    },
+    {
+      "id": "omnikv-qwen2.5-32b-instruct-full9",
+      "model_names": [
+        "Qwen2.5-32B-Instruct"
+      ],
+      "sparse_methods": [
+        "omnikv",
+        "deltakv"
+      ],
+      "full_attention_layers": [0, 2, 7, 18, 24, 34, 40, 50, 56],
+      "selection": {
+        "kind": "offline-dp-token-coverage",
+        "dataset": "narrativeqa",
+        "num_samples": 8,
+        "decode_keep_tokens": 2048,
+        "validation": "selector artifact only"
+      }
+    },
+    {
+      "id": "omnikv-qwen3-4b-instruct-2507-full8",
+      "model_names": [
+        "Qwen3-4B-Instruct-2507"
+      ],
+      "sparse_methods": [
+        "omnikv",
+        "deltakv"
+      ],
+      "full_attention_layers": [0, 1, 3, 9, 13, 16, 21, 28],
+      "selection": {
+        "kind": "offline-dp-token-coverage",
+        "dataset": "narrativeqa",
+        "num_samples": 8,
+        "decode_keep_tokens": 2048,
+        "validation": "reproduced selector result and matched 1200-sample LongBench campaign"
+      }
+    },
+    {
+      "id": "omnikv-qwen3-4b-thinking-2507-full7",
+      "model_names": [
+        "Qwen3-4B-Thinking-2507"
+      ],
+      "sparse_methods": [
+        "omnikv",
+        "deltakv"
+      ],
+      "full_attention_layers": [0, 3, 9, 13, 16, 21, 28],
+      "selection": {
+        "kind": "offline-dp-token-coverage",
+        "dataset": "narrativeqa",
+        "num_samples": 8,
+        "decode_keep_tokens": 2048,
+        "validation": "selector artifact and Math500 runtime campaigns"
+      }
+    },
+    {
+      "id": "omnikv-llama-3.1-8b-instruct-full6",
+      "model_names": [
+        "Llama-3.1-8B-Instruct"
+      ],
+      "sparse_methods": [
+        "omnikv",
+        "deltakv"
+      ],
+      "full_attention_layers": [0, 2, 7, 13, 16, 26],
+      "selection": {
+        "kind": "canonical-regression-profile",
+        "decode_keep_tokens": 2048,
+        "validation": "canonical regression configuration",
+        "latest_selector_layers": [0, 2, 8, 13, 16, 26]
+      }
+    },
+    {
+      "id": "omnikv-glm-4.7-flash-full9",
+      "model_names": [
+        "GLM-4.7-Flash"
+      ],
+      "sparse_methods": [
+        "omnikv"
+      ],
+      "full_attention_layers": [0, 3, 8, 16, 19, 25, 31, 37, 44],
+      "selection": {
+        "kind": "offline-dp-token-coverage",
+        "dataset": "narrativeqa",
+        "num_samples": 8,
+        "decode_keep_tokens": 2048,
+        "normalized_token_coverage": 0.5966390005108241,
+        "validation": "selector completed; downstream quality validation pending",
+        "previous_quality_validated_layers": [0, 6, 12, 18, 24, 30, 36, 42, 46]
+      }
+    },
+    {
+      "id": "omnikv-minimax-m2.7-full7",
+      "model_names": [
+        "MiniMax-M2.7"
+      ],
+      "sparse_methods": [
+        "omnikv"
+      ],
+      "full_attention_layers": [0, 1, 3, 10, 17, 40, 58],
+      "selection": {
+        "kind": "offline-dp-token-coverage",
+        "dataset": "narrativeqa",
+        "num_samples": 8,
+        "decode_keep_tokens": 2048,
+        "validation": "selector completed; downstream 300-sample campaign incomplete"
+      }
+    },
+    {
+      "id": "omnikv-qwen3.6-27b-fp8-full3",
+      "model_names": [
+        "Qwen3.6-27B-FP8"
+      ],
+      "sparse_methods": [
+        "omnikv"
+      ],
+      "full_attention_layers": [3, 19, 35],
+      "selection": {
+        "kind": "offline-dp-token-coverage",
+        "dataset": "narrativeqa",
+        "num_samples": 8,
+        "decode_keep_tokens": 2048,
+        "validation": "matched 300-sample LongBench and CUDA Graph throughput"
+      }
+    },
+    {
+      "id": "omnikv-qwen3-30b-a3b-instruct-2507-full7",
+      "model_names": [
+        "Qwen3-30B-A3B-Instruct-2507",
+        "Qwen3-30B-A3B-Instruct-2507-FP8"
+      ],
+      "sparse_methods": [
+        "omnikv"
+      ],
+      "full_attention_layers": [0, 3, 9, 18, 22, 27, 43],
+      "selection": {
+        "kind": "offline-dp-token-coverage",
+        "decode_keep_tokens": 8192,
+        "validation": "matched 600-sample LongBench and CUDA Graph throughput"
+      }
+    }
+  ]
+}

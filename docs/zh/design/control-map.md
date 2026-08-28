@@ -70,9 +70,9 @@ flowchart TD
 | Dense | `vanilla` / `""` | 完整 KV cache，无 sparse selection。 | `standard.py`、通用 attention path |
 | Streaming window | `streamingllm`, `attention-sink`, `attention_sink` | 物理淘汰，只保留 sink 加 recent token。 | `streamingllm.py`、`standard.py` 风格机制 |
 | SnapKV / PyramidKV | `snapkv`, `pyramidkv` | 基于 score 的 keep selection 后执行 physical eviction；PyramidKV 改变 per-layer budget。 | `snapkv.py`, `sparse_controller.py` |
-| OmniKV | `omnikv` | 根据 observation-layer score 构建 logical mask/view。应使用 `python -m sparsevllm.utils.select_omnikv_full_layers` 针对模型校准 full layer，再通过 `full_attention_layers` 传入。 | `omnikv.py`, `sparse_controller.py`, `omnikv_fused.py` |
+| OmniKV | `omnikv` | 根据 observation-layer score 构建 logical mask/view。`full_attention_layers=auto` 会解析可与 DeltaKV 共享的模型 profile；未登记模型应使用 `python -m sparsevllm.utils.select_omnikv_full_layers` 校准。 | `omnikv.py`, `sparse_controller.py`, `omnikv_fused.py` |
 | QuEST | `quest` | Query-aware decode page/chunk selection。 | `quest.py` |
-| DeltaKV | `deltakv` | 基于 compressor 的 hybrid cache：sparse full/reference pool 加 compressed latent state。 | `deltakv.py`, `deltakv_kernels.py` |
+| DeltaKV | `deltakv` | 基于 compressor 的 hybrid cache：sparse full/reference pool 加 compressed latent state；已登记模型可与 OmniKV 共用 `full_attention_layers=auto` profile。 | `deltakv.py`, `deltakv_kernels.py` |
 | DeltaKV | `deltakv` 加 legacy `deltakv-less-memory*` alias | 基于 compressor 的精简 DeltaKV runtime，使用 graph-stable decode metadata。 | `deltakv_runtime.py`, `deltakv_less_memory*.py`, `deltakv_kernels.py` |
 
 ## 状态所有权 Contract

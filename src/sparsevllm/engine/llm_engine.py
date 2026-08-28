@@ -1137,6 +1137,7 @@ class LLMEngine:
             "recent_keep_tokens",
             "decode_keep_tokens",
             "full_attention_layers",
+            "resolved_full_attention_profile",
             "obs_layer_ids",
             "snapkv_window_size",
             "snapkv_num_full_layers",

@@ -22,6 +22,23 @@ from sparsevllm.utils.select_omnikv_full_layers import (
 
 
 class OmniKVFullLayerSelectorTest(unittest.TestCase):
+    def test_cli_maps_legacy_token_flags_to_runtime_field_names(self):
+        args = parse_args(
+            [
+                "--model-path",
+                "/model",
+                "--longbench-root",
+                "/longbench",
+                "--num-sink-tokens",
+                "8",
+                "--num-recent-tokens",
+                "128",
+            ]
+        )
+
+        self.assertEqual(args.sink_keep_tokens, 8)
+        self.assertEqual(args.recent_keep_tokens, 128)
+
     def test_remote_model_code_can_be_disabled(self):
         args = parse_args(
             [

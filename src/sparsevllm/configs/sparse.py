@@ -31,7 +31,10 @@ def normalize_sparse_method_name(config) -> None:
 def _normalize_quest(config) -> None:
     if isinstance(config.full_attention_layers, str):
         layers = config.full_attention_layers.strip()
-        config.full_attention_layers = [] if not layers else [int(x) for x in layers.split(",")]
+        if layers.lower() != "auto":
+            config.full_attention_layers = (
+                [] if not layers else [int(x) for x in layers.split(",")]
+            )
 
     if config.quest_chunk_size <= 0:
         raise ValueError("quest_chunk_size 必须 > 0")

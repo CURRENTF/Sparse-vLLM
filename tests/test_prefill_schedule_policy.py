@@ -688,6 +688,9 @@ class PrefillPolicyConfigTest(unittest.TestCase):
         )
 
     def make_config(self, **kwargs):
+        sparse_method = str(kwargs.get("sparse_method", ""))
+        if sparse_method.startswith(("omnikv", "deltakv")):
+            kwargs.setdefault("full_attention_layers", [0])
         with tempfile.TemporaryDirectory() as tmp:
             model_dir = Path(tmp)
             with patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", return_value=self.hf_config()):
@@ -1085,9 +1088,9 @@ class DecodeCudaGraphCapacityPolicyTest(unittest.TestCase):
         seqs = [self.make_seq(prompt_len=100, max_tokens=900, num_tokens=101)]
         real_empty = torch.empty
 
-        def empty_on_cpu(shape, *, dtype=None, device=None):
+        def empty_on_cpu(shape, *, dtype=None, device=None, pin_memory=False):
             del device
-            return real_empty(shape, dtype=dtype)
+            return real_empty(shape, dtype=dtype, pin_memory=pin_memory)
 
         with patch.dict(os.environ, {}, clear=True):
             with patch("sparsevllm.engine.decode_cuda_graph.torch.empty", side_effect=empty_on_cpu):
@@ -1129,9 +1132,9 @@ class DecodeCudaGraphCapacityPolicyTest(unittest.TestCase):
         seqs = [self.make_seq(prompt_len=8, max_tokens=4, num_tokens=9)]
         real_empty = torch.empty
 
-        def empty_on_cpu(shape, *, dtype=None, device=None):
+        def empty_on_cpu(shape, *, dtype=None, device=None, pin_memory=False):
             del device
-            return real_empty(shape, dtype=dtype)
+            return real_empty(shape, dtype=dtype, pin_memory=pin_memory)
 
         with patch("sparsevllm.engine.decode_cuda_graph.torch.empty", side_effect=empty_on_cpu):
             logits = runner.run_eager_static(seqs)
@@ -1153,9 +1156,9 @@ class DecodeCudaGraphCapacityPolicyTest(unittest.TestCase):
         runner._graphs[warmup_key] = warmup_state
         real_empty = torch.empty
 
-        def empty_on_cpu(shape, *, dtype=None, device=None):
+        def empty_on_cpu(shape, *, dtype=None, device=None, pin_memory=False):
             del device
-            return real_empty(shape, dtype=dtype)
+            return real_empty(shape, dtype=dtype, pin_memory=pin_memory)
 
         with patch("sparsevllm.engine.decode_cuda_graph.torch.empty", side_effect=empty_on_cpu):
             state = runner._select_state(

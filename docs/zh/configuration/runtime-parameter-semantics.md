@@ -15,7 +15,7 @@ Sparse-vLLM 只有一个推理后端：`src/sparsevllm/` 下的原生引擎。
 | `engine_prefill_chunk_size` | Prefill 最大调度 chunk。 |
 | `sink_keep_tokens` | Sink token 预算。 |
 | `recent_keep_tokens` | Recent token 预算。 |
-| `full_attention_layers` | 逗号分隔的 full-layer index。 |
+| `full_attention_layers` | `auto`（默认）、逗号分隔的字符串或 full-layer index 列表。`auto` 按方法和模型名精确匹配 profile；catalog 条目可以由 OmniKV 和 DeltaKV 共享，也可以限定到单一方法。 |
 | `deltakv_neighbor_count` | DeltaKV reference neighbor 数量。 |
 | `deltakv_center_ratio` | DeltaKV reference center 比例。 |
 | `deltakv_latent_dim` | Compressor latent 宽度。 |
@@ -23,6 +23,12 @@ Sparse-vLLM 只有一个推理后端：`src/sparsevllm/` 下的原生引擎。
 | `deltakv_latent_quant_group_size` | Latent 量化 group size。 |
 | `gpu_memory_utilization` | 引擎可使用的 GPU 显存比例。 |
 | `decode_graph` | 启用 decode CUDA Graph。 |
+
+`full_attention_layers=auto` 会对模型路径或仓库名的最后一段做不区分大小写的
+精确匹配，并识别 `models--org--model/snapshots/...` 形式的 Hugging Face cache
+路径；不会使用子串模糊匹配。未登记的 OmniKV 或 DeltaKV 模型会明确提示先
+校准。当 catalog 条目同时列出两个方法时，两者有意共享相同的 full-layer
+anchor；显式传入的层列表仍会覆盖 `auto`。
 
 `sparse_method`、`deltakv_checkpoint_path`、`engine_prefill_chunk_size`、
 `sink_keep_tokens`、`recent_keep_tokens`、`full_attention_layers`、
@@ -53,16 +59,17 @@ method、policy、chunk size、context length、batch size 和 checkpoint 路径
 
 ## DeltaKV
 
-可报告的 DeltaKV 推理必须使用兼容 compressor checkpoint：
+可报告的 DeltaKV 推理必须使用兼容 compressor checkpoint。对于已登记模型，
+默认的 `full_attention_layers=auto` 会与 OmniKV 共用模型 profile：
 
 ```python
 from sparsevllm import LLM
 
 llm = LLM(
-    "/path/to/model",
+    "/path/to/Qwen3-4B-Instruct-2507",
     sparse_method="deltakv",
     deltakv_checkpoint_path="/path/to/compressor",
-    full_attention_layers="0,1,3,9,13,16,21,28",
+    full_attention_layers="auto",
     decode_keep_tokens=2048,
     recent_keep_tokens=128,
     sink_keep_tokens=8,

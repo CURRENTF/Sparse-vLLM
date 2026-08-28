@@ -1379,6 +1379,7 @@ def test_config_restricts_prefix_cache_offload_to_explicit_tp1_tp2_modes():
 
     cfg = _make_config(
         sparse_method="omnikv",
+        full_attention_layers=[0],
         enable_prefix_caching=True,
         enable_prefix_cache_offload=True,
         prefix_cache_host_size_gb=1,

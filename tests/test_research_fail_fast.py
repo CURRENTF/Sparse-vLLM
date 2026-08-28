@@ -450,6 +450,7 @@ class ResearchFailFastTest(unittest.TestCase):
                 cfg = Config(
                     model=tmp,
                     sparse_method="deltakv-less-memory",
+                    full_attention_layers=[0],
                     allow_missing_deltakv_path=True,
                     deltakv_latent_quant_bits=0,
                 )

@@ -22,7 +22,7 @@ This repository includes repo-local Codex skills.
 
 # Task Running Rules
 
-1. Before running a task, check whether each device is idle. Select an idle device when one is available. If all devices are busy, wait first; if the wait becomes too long, report the situation instead of starting the task on a busy device.
+1. Before running a task, check whether each device is idle. Select an idle device when one is available. If all devices are busy, wait first; if the wait becomes too long, report the situation instead of starting the task on a busy device. Ignore the above requirements when the user indicates that the GPU can be shared with other processes.
 2. Do not hardcode private paths (including local machine paths and remote paths) in test scripts; pass them via variables or arguments instead. Scripts located under `scripts/tmp/` are exempt from this restriction.
 3. When using a conda environment, activate it or use `conda run`; invoking only its absolute `python` path does not expose environment-provided executables such as `ninja` to child processes.
 
